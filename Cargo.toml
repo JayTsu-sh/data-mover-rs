@@ -1,0 +1,91 @@
+[package]
+name = "data-mover"
+version = "0.2.0"
+edition = "2024"
+
+[patch.crates-io]
+nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git" }
+smb = { git = "https://github.com/JayTsu-sh/smb-rs.git" }
+
+[dependencies]
+async-channel = "2"
+arc-swap = "1.9.1"
+async-trait = "0.1"
+aws-config = "1.8.15"
+aws-credential-types = "1.2.14"
+aws-sdk-s3 = "1.129.0"
+aws-smithy-runtime-api = "1.11"
+aws-smithy-types = { version = "1.4", features = ["http-body-1-x"] }
+aws-types = "1.3.14"
+binrw = "0.15"
+blake3 = "1.8.4"
+bytes = { version = "1", features = ["serde"] }
+chrono = "0.4.44"
+filetime = "0.2.27"
+futures = "0.3.32"
+glob = "0.3.3"
+governor = "0.10.4"
+http-body = "1.0.1"
+dashmap = "6.1.0"
+tracing = "0.1.44"
+moka = { version = "0.12.15", features = ["sync"] }
+nfs-rs = "0.2.0"
+path-clean = "1.0.1"
+quick-xml = { version = "0.39.2", features = ["serialize"] }
+rayon = "1"
+remove_dir_all = { version = "1.0.0", features = ["parallel"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
+reqwest = { version = "0.13.2", default-features = false, features = [
+    "cookies",
+    "rustls",
+] }
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+serde = { version = "1", features = ["derive", "rc"] }
+smb = "0.11"
+soft-canonicalize = "0.5.5"
+thiserror = "2.0.18"
+tokio = { version = "1.51.1", features = ["full"] }
+tokio-util = "0.7"
+url = "2.5.8"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Foundation",
+    "Win32_System_SystemServices",
+    "Win32_System_Memory",
+] }
+
+[dev-dependencies]
+clap = { version = "4.6.0", features = ["derive"] }
+indicatif = "0.18.4"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+wildcard_imports = "allow"
+too_many_lines = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+significant_drop_tightening = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
