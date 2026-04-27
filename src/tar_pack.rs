@@ -44,7 +44,11 @@ pub(crate) fn build_ustar_header(
     write_octal(&mut header[124..136], size, 11);
 
     // mtime (136..148) — epoch seconds, 11 chars + NUL
-    let mtime_secs = if mtime > 0 { (mtime / 1_000_000_000) as u64 } else { 0 };
+    let mtime_secs = if mtime > 0 {
+        crate::time_util::nanos_to_secs(mtime) as u64
+    } else {
+        0
+    };
     write_octal(&mut header[136..148], mtime_secs, 11);
 
     // type_flag (156)

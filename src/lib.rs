@@ -23,6 +23,7 @@ pub mod s3;
 pub mod storage_enum;
 pub mod tar_pack;
 pub mod third_party;
+pub mod time_util;
 pub(crate) mod walk_scheduler;
 
 pub use checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};

@@ -4,11 +4,10 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, lchown};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 // 外部crate
 use bytes::{Bytes, BytesMut};
-use filetime::FileTime;
 use rayon::prelude::*;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -21,102 +20,62 @@ use crate::filter::{FilterExpression, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
+use crate::time_util;
 use crate::{
     DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, MB, NASEntry, Result, StorageEntryMessage,
     WalkDirAsyncIterator,
 };
 
-/// 从文件系统元数据构建 `NASEntry`
-fn build_nas_entry(
-    name: String, relative_path: PathBuf, extension: Option<String>, metadata: &std::fs::Metadata, is_symlink: bool,
-) -> NASEntry {
-    let mode = {
+impl NASEntry {
+    /// 从本地文件系统 `Metadata` 构建 `NASEntry`。
+    /// Unix 与 Windows 的差异封装在此函数内部。
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn from_local_metadata(
+        name: String, relative_path: PathBuf, extension: Option<String>, metadata: &std::fs::Metadata, is_symlink: bool,
+    ) -> Self {
         #[cfg(unix)]
-        {
-            metadata.permissions().mode()
-        }
+        let mode = metadata.permissions().mode();
         #[cfg(windows)]
-        {
-            if metadata.is_dir() {
-                0o755
-            } else if metadata.permissions().readonly() {
-                0o444
-            } else {
-                0o644
-            }
+        let mode = if metadata.is_dir() {
+            0o755
+        } else if metadata.permissions().readonly() {
+            0o444
+        } else {
+            0o644
+        };
+
+        #[cfg(unix)]
+        let (hard_links, uid, gid, ino) = (
+            Some(metadata.nlink() as u32),
+            Some(metadata.uid()),
+            Some(metadata.gid()),
+            Some(metadata.ino()),
+        );
+        #[cfg(windows)]
+        let (hard_links, uid, gid, ino) = (None, None, None, None);
+
+        Self {
+            name,
+            relative_path,
+            extension,
+            is_dir: metadata.is_dir(),
+            size: metadata.len(),
+            atime: time_util::system_time_to_nanos(metadata.accessed().unwrap_or(UNIX_EPOCH)),
+            ctime: time_util::system_time_to_nanos(metadata.created().unwrap_or(UNIX_EPOCH)),
+            mtime: time_util::system_time_to_nanos(metadata.modified().unwrap_or(UNIX_EPOCH)),
+            mode,
+            is_symlink,
+            hard_links,
+            file_handle: None,
+            uid,
+            gid,
+            ino,
+            acl: None,
+            owner: None,
+            owner_group: None,
+            xattrs: None,
         }
-    };
-    NASEntry {
-        name,
-        relative_path,
-        extension,
-        is_dir: metadata.is_dir(),
-        size: metadata.len(),
-        atime: system_time_to_i64(metadata.accessed().unwrap_or(UNIX_EPOCH)),
-        ctime: system_time_to_i64(metadata.created().unwrap_or(UNIX_EPOCH)),
-        mtime: system_time_to_i64(metadata.modified().unwrap_or(UNIX_EPOCH)),
-        mode,
-        is_symlink,
-        hard_links: {
-            #[cfg(unix)]
-            {
-                Some(metadata.nlink() as u32)
-            }
-            #[cfg(windows)]
-            {
-                None
-            }
-        },
-        file_handle: None,
-        uid: {
-            #[cfg(unix)]
-            {
-                Some(metadata.uid())
-            }
-            #[cfg(windows)]
-            {
-                None
-            }
-        },
-        gid: {
-            #[cfg(unix)]
-            {
-                Some(metadata.gid())
-            }
-            #[cfg(windows)]
-            {
-                None
-            }
-        },
-        ino: {
-            #[cfg(unix)]
-            {
-                Some(metadata.ino())
-            }
-            #[cfg(windows)]
-            {
-                None
-            }
-        },
-        acl: None,
-        owner: None,
-        owner_group: None,
-        xattrs: None,
     }
-}
-
-/// 将 `SystemTime` 转换为纳秒时间戳
-fn system_time_to_i64(time: SystemTime) -> i64 {
-    time.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
-}
-
-/// 将纳秒时间戳转换为 `FileTime`
-fn i64_to_file_time(timestamp: i64) -> FileTime {
-    let seconds = timestamp / 1_000_000_000;
-    let nanos = (timestamp % 1_000_000_000) as u32;
-    FileTime::from_unix_time(seconds, nanos)
 }
 
 /// 本地文件句柄包装
@@ -221,8 +180,8 @@ impl LocalStorage {
             }
 
             // 将纳秒时间戳转换为FileTime
-            let atime = i64_to_file_time(atime);
-            let mtime = i64_to_file_time(mtime);
+            let atime = time_util::nanos_to_filetime_local(atime);
+            let mtime = time_util::nanos_to_filetime_local(mtime);
 
             match tokio::task::spawn_blocking(move || filetime::set_symlink_file_times(&full_path, atime, mtime)).await
             {
@@ -305,7 +264,7 @@ impl LocalStorage {
         let metadata = tokio::fs::symlink_metadata(&full_path).await?;
         let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let is_symlink = metadata.is_symlink();
-        Ok(EntryEnum::NAS(build_nas_entry(name, path, None, &metadata, is_symlink)))
+        Ok(EntryEnum::NAS(NASEntry::from_local_metadata(name, path, None, &metadata, is_symlink)))
     }
 
     /// 更新文件元数据: 包括修改时间、访问时间、所有者UID、组ID和权限模式.
@@ -327,8 +286,8 @@ impl LocalStorage {
         if let (Some(atime), Some(mtime)) = (atime, mtime) {
             let path_clone = full_path.clone();
             tasks.push(tokio::spawn(async move {
-                let atime = i64_to_file_time(atime);
-                let mtime = i64_to_file_time(mtime);
+                let atime = time_util::nanos_to_filetime_local(atime);
+                let mtime = time_util::nanos_to_filetime_local(mtime);
 
                 tokio::task::spawn_blocking(move || filetime::set_file_times(&path_clone, atime, mtime))
                     .await
@@ -624,7 +583,7 @@ impl LocalStorage {
             }
 
             // 创建StorageEntry
-            let entry = EntryEnum::NAS(build_nas_entry(
+            let entry = EntryEnum::NAS(NASEntry::from_local_metadata(
                 file_name.clone(),
                 relative_path.clone(),
                 extension.map(str::to_string),
@@ -999,7 +958,8 @@ impl LocalStorage {
             if skip_entry {
                 // 目录被跳过但 continue_scan=true → 加入 subdirs 但 visible=false
                 if is_dir && continue_scan && (ctx.max_depth == 0 || ctx.current_depth + 1 < ctx.max_depth) {
-                    let nas = build_nas_entry(file_name, relative_path, extension_owned, &metadata, is_symlink);
+                    let nas =
+                        NASEntry::from_local_metadata(file_name, relative_path, extension_owned, &metadata, is_symlink);
                     subdirs.push(SubdirEntry {
                         entry: Arc::new(EntryEnum::NAS(nas)),
                         visible: false,
@@ -1009,7 +969,7 @@ impl LocalStorage {
                 continue;
             }
 
-            let nas = build_nas_entry(file_name, relative_path, extension_owned, &metadata, is_symlink);
+            let nas = NASEntry::from_local_metadata(file_name, relative_path, extension_owned, &metadata, is_symlink);
             let entry_enum = Arc::new(EntryEnum::NAS(nas));
 
             // 深度检查：超过 max_depth 的子目录不进入 subdirs（不递归），但仍作为 entry 记录

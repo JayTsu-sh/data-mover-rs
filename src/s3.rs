@@ -6,7 +6,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::SystemTime;
 
 // 外部crate
 use aws_config::timeout::TimeoutConfig;
@@ -287,15 +286,9 @@ const MAX_CONCURRENCY: usize = 5; // 最大并发上传数
 
 /// 转换时间戳为纳秒时间戳
 fn datatime_to_i64(timestamp: Option<&DateTime>) -> i64 {
-    timestamp.map_or_else(
-        || {
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0)
-        },
-        |t| (t.secs() * 1_000_000_000) + i64::from(t.subsec_nanos()),
-    )
+    timestamp.map_or_else(crate::time_util::now_nanos, |t| {
+        crate::time_util::combine_secs_nanos(t.secs(), t.subsec_nanos())
+    })
 }
 
 /// Zero-copy streaming body for multi-chunk singlepart S3 uploads.
@@ -2629,7 +2622,7 @@ impl S3Storage {
                                 Some(&file_name),
                                 Some(rel),
                                 Some("file"),
-                                Some(ts / 1_000_000_000),
+                                Some(crate::time_util::nanos_to_secs(ts)),
                                 Some(size),
                                 extension.as_deref().or(Some("")),
                             )
@@ -2755,7 +2748,7 @@ impl S3Storage {
                                 Some(&file_name),
                                 Some(rel),
                                 Some("file"),
-                                Some(mtime / 1_000_000_000),
+                                Some(crate::time_util::nanos_to_secs(mtime)),
                                 Some(size),
                                 extension.as_deref().or(Some("")),
                             )

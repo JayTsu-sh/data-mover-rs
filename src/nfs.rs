@@ -29,16 +29,92 @@ use crate::{
 
 /// 将 `nfs_rs::Time` 转换为纳秒时间戳
 fn time_to_i64(time: Time) -> i64 {
-    // 直接计算纳秒时间戳，避免通过SystemTime转换
-    (i64::from(time.seconds) * 1_000_000_000) + i64::from(time.nseconds)
+    crate::time_util::combine_secs_nanos(i64::from(time.seconds), time.nseconds)
 }
 
 /// 将纳秒时间戳转换为 `nfs_rs::Time`
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn i64_to_time(timestamp: i64) -> Time {
-    // 直接计算秒和纳秒，避免通过SystemTime转换
-    let seconds = (timestamp / 1_000_000_000) as u32;
-    let nseconds = (timestamp % 1_000_000_000) as u32;
-    Time { seconds, nseconds }
+    Time {
+        seconds: crate::time_util::nanos_to_secs(timestamp) as u32,
+        nseconds: crate::time_util::nanos_subsec(timestamp),
+    }
+}
+
+/// NFSv4 可选富化字段。
+///
+/// 不同站点对 ACL/owner/xattrs 的填充程度不同：
+/// - `lookup` 仅有 attrs 中携带的 ACL/owner，没有 xattrs；
+/// - `iterative_walkdir` 同时填充 ACL/owner 与从服务器读到的 xattrs；
+/// - `walkdir_2` 跳过的与可见的目录项都不填充。
+///
+/// 用此结构显式表达每站点的差异，避免在构造器签名中堆 `Option`。
+pub(crate) struct NfsEnrich {
+    pub acl: Option<nfs_rs::Acl>,
+    pub owner: Option<String>,
+    pub owner_group: Option<String>,
+    pub xattrs: Option<Vec<(String, Vec<u8>)>>,
+}
+
+impl Default for NfsEnrich {
+    /// 全部不填充。供 `walkdir_2` 系列站点使用。
+    fn default() -> Self {
+        Self { acl: None, owner: None, owner_group: None, xattrs: None }
+    }
+}
+
+impl NfsEnrich {
+
+    /// 从 `attr` 抽取 ACL/owner/owner_group（空字符串视为 None），xattrs 留 None。
+    /// 供 `lookup` / `iterative_walkdir` 使用；后者再链 `with_xattrs`。
+    pub fn from_attrs(attr: &nfs_rs::Attr) -> Self {
+        Self {
+            acl: attr.acl.clone(),
+            owner: if attr.owner.is_empty() { None } else { Some(attr.owner.clone()) },
+            owner_group: if attr.owner_group.is_empty() { None } else { Some(attr.owner_group.clone()) },
+            xattrs: None,
+        }
+    }
+
+    pub fn with_xattrs(mut self, xattrs: Option<Vec<(String, Vec<u8>)>>) -> Self {
+        self.xattrs = xattrs;
+        self
+    }
+}
+
+impl NASEntry {
+    /// 从 NFS `Attr` 构建 `NASEntry`。
+    ///
+    /// `file_handle` 由调用方提供（lookup 站点用 `obj.fh`，walkdir 用 `entry.handle.clone()`）。
+    /// 可选的 ACL/owner/xattrs 通过 [`NfsEnrich`] 显式注入。
+    pub(crate) fn from_nfs_attrs(
+        name: String, relative_path: PathBuf, extension: Option<String>, attrs: &nfs_rs::Attr, file_handle: Bytes,
+        enrich: NfsEnrich,
+    ) -> Self {
+        let is_dir = attrs.type_ == FType3::NF3DIR as u32;
+        let is_symlink = attrs.type_ == FType3::NF3LNK as u32;
+        Self {
+            name,
+            relative_path,
+            extension,
+            is_dir,
+            size: attrs.filesize,
+            mtime: time_to_i64(attrs.mtime),
+            atime: time_to_i64(attrs.atime),
+            ctime: time_to_i64(attrs.ctime),
+            mode: attrs.file_mode,
+            hard_links: Some(attrs.nlink),
+            is_symlink,
+            file_handle: Some(file_handle),
+            uid: Some(attrs.uid),
+            gid: Some(attrs.gid),
+            ino: Some(attrs.fsid),
+            acl: enrich.acl,
+            owner: enrich.owner,
+            owner_group: enrich.owner_group,
+            xattrs: enrich.xattrs,
+        }
+    }
 }
 
 /// 基于目录深度的缓存过期策略。
@@ -1470,39 +1546,14 @@ impl NFSStorage {
             .and_then(|ext| ext.to_str())
             .map(std::string::ToString::to_string);
 
-        // 检查是否为目录
-        let file_type = attrs.type_;
-        let is_dir = file_type == FType3::NF3DIR as u32;
-
-        let storage_entry = EntryEnum::NAS(NASEntry {
-            name: filename,
-            relative_path: relative_path.to_path_buf(),
-            is_dir,
-            size: attrs.filesize,
+        let storage_entry = EntryEnum::NAS(NASEntry::from_nfs_attrs(
+            filename,
+            relative_path.to_path_buf(),
             extension,
-            mtime: time_to_i64(attrs.mtime),
-            atime: time_to_i64(attrs.atime),
-            ctime: time_to_i64(attrs.ctime),
-            mode: attrs.file_mode,
-            hard_links: Some(attrs.nlink),
-            is_symlink: file_type == FType3::NF3LNK as u32,
-            file_handle: Some(obj.fh),
-            uid: Some(attrs.uid),
-            gid: Some(attrs.gid),
-            ino: Some(attrs.fsid),
-            acl: attrs.acl.clone(),
-            owner: if attrs.owner.is_empty() {
-                None
-            } else {
-                Some(attrs.owner.clone())
-            },
-            owner_group: if attrs.owner_group.is_empty() {
-                None
-            } else {
-                Some(attrs.owner_group.clone())
-            },
-            xattrs: None,
-        });
+            &attrs,
+            obj.fh,
+            NfsEnrich::from_attrs(&attrs),
+        ));
 
         Ok(storage_entry)
     }
@@ -1969,35 +2020,14 @@ impl NFSStorage {
                 None
             };
 
-            let storage_entry = EntryEnum::NAS(NASEntry {
-                name: entry.file_name,
-                relative_path: PathBuf::from(&relative_path),
-                is_dir,
-                size: attrs.filesize,
-                extension: extension.clone(),
-                mtime: time_to_i64(attrs.mtime),
-                atime: time_to_i64(attrs.atime),
-                ctime: time_to_i64(attrs.ctime),
-                mode: attrs.file_mode,
-                hard_links: Some(attrs.nlink),
-                is_symlink,
-                file_handle: Some(entry.handle.clone()),
-                uid: Some(attrs.uid),
-                gid: Some(attrs.gid),
-                ino: Some(attrs.fsid),
-                acl: attrs.acl.clone(),
-                owner: if attrs.owner.is_empty() {
-                    None
-                } else {
-                    Some(attrs.owner.clone())
-                },
-                owner_group: if attrs.owner_group.is_empty() {
-                    None
-                } else {
-                    Some(attrs.owner_group.clone())
-                },
-                xattrs,
-            });
+            let storage_entry = EntryEnum::NAS(NASEntry::from_nfs_attrs(
+                entry.file_name,
+                PathBuf::from(&relative_path),
+                extension.clone(),
+                &attrs,
+                entry.handle.clone(),
+                NfsEnrich::from_attrs(&attrs).with_xattrs(xattrs),
+            ));
 
             // packaged 模式：目录匹配 DirDate 条件时决定打包策略
             if !send_packaged
@@ -2474,27 +2504,14 @@ impl NFSStorage {
 
                 if skip_entry {
                     if is_dir && continue_scan && (ctx.max_depth == 0 || ctx.current_depth + 1 < ctx.max_depth) {
-                        let nas = NASEntry {
-                            name: entry.file_name,
-                            relative_path: PathBuf::from(&relative_path),
-                            is_dir,
-                            size: attrs.filesize,
+                        let nas = NASEntry::from_nfs_attrs(
+                            entry.file_name,
+                            PathBuf::from(&relative_path),
                             extension,
-                            mtime: time_to_i64(attrs.mtime),
-                            atime: time_to_i64(attrs.atime),
-                            ctime: time_to_i64(attrs.ctime),
-                            mode: attrs.file_mode,
-                            hard_links: Some(attrs.nlink),
-                            is_symlink,
-                            file_handle: Some(entry.handle.clone()),
-                            uid: Some(attrs.uid),
-                            gid: Some(attrs.gid),
-                            ino: Some(attrs.fsid),
-                            acl: None,
-                            owner: None,
-                            owner_group: None,
-                            xattrs: None,
-                        };
+                            &attrs,
+                            entry.handle.clone(),
+                            NfsEnrich::default(),
+                        );
                         subdirs.push(SubdirEntry {
                             entry: Arc::new(EntryEnum::NAS(nas)),
                             visible: false,
@@ -2504,27 +2521,14 @@ impl NFSStorage {
                     continue;
                 }
 
-                let nas = NASEntry {
-                    name: entry.file_name,
-                    relative_path: PathBuf::from(&relative_path),
-                    is_dir,
-                    size: attrs.filesize,
+                let nas = NASEntry::from_nfs_attrs(
+                    entry.file_name,
+                    PathBuf::from(&relative_path),
                     extension,
-                    mtime: time_to_i64(attrs.mtime),
-                    atime: time_to_i64(attrs.atime),
-                    ctime: time_to_i64(attrs.ctime),
-                    mode: attrs.file_mode,
-                    hard_links: Some(attrs.nlink),
-                    is_symlink,
-                    file_handle: Some(entry.handle.clone()),
-                    uid: Some(attrs.uid),
-                    gid: Some(attrs.gid),
-                    ino: Some(attrs.fsid),
-                    acl: None,
-                    owner: None,
-                    owner_group: None,
-                    xattrs: None,
-                };
+                    &attrs,
+                    entry.handle.clone(),
+                    NfsEnrich::default(),
+                );
                 let entry_enum = Arc::new(EntryEnum::NAS(nas));
 
                 if is_dir && ctx.max_depth > 0 && ctx.current_depth + 1 >= ctx.max_depth {

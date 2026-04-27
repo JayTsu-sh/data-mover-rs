@@ -28,20 +28,52 @@ use crate::{
     WalkDirAsyncIterator,
 };
 
-/// Windows FILETIME epoch (1601-01-01) 与 Unix epoch (1970-01-01) 之间的 100ns 间隔数
-const FILETIME_UNIX_EPOCH_DIFF: i64 = 116_444_736_000_000_000;
-
 /// 将 SMB `FileTime` (100ns since 1601-01-01) 转换为纳秒时间戳 (ns since Unix epoch)
+#[allow(clippy::cast_possible_wrap)]
 fn filetime_to_nanos(ft: FileTime) -> i64 {
     // FileTime Deref<Target=u64>，值是 100ns 间隔数
-    let raw = *ft as i64;
-    (raw - FILETIME_UNIX_EPOCH_DIFF) * 100
+    crate::time_util::smb_filetime_to_nanos(*ft as i64)
 }
 
 /// 将纳秒时间戳 (ns since Unix epoch) 转换为 SMB `FileTime`
+#[allow(clippy::cast_sign_loss)]
 fn nanos_to_filetime(ns: i64) -> FileTime {
-    let raw = (ns / 100 + FILETIME_UNIX_EPOCH_DIFF) as u64;
-    FileTime::from(raw)
+    FileTime::from(crate::time_util::nanos_to_smb_filetime(ns) as u64)
+}
+
+impl NASEntry {
+    /// 从 SMB 通用字段构建 `NASEntry`。
+    ///
+    /// `lookup`/`get_metadata` 站点通过 `FileBasicInformation` + `FileStandardInformation`
+    /// 提供字段，`process_dir` 站点通过 `FileDirectoryInformation` 提供。两类输入解构成
+    /// 同样的标准参数（size、三组 `FileTime`、属性位），因此共用同一个构造器。
+    #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+    pub(crate) fn from_smb_info(
+        name: String, relative_path: PathBuf, extension: Option<String>, size: u64, last_write_time: FileTime,
+        last_access_time: FileTime, creation_time: FileTime, is_dir: bool, is_symlink: bool, is_readonly: bool,
+    ) -> Self {
+        Self {
+            name,
+            relative_path,
+            extension,
+            is_dir,
+            size,
+            mtime: crate::time_util::smb_filetime_to_nanos(*last_write_time as i64),
+            atime: crate::time_util::smb_filetime_to_nanos(*last_access_time as i64),
+            ctime: crate::time_util::smb_filetime_to_nanos(*creation_time as i64),
+            mode: smb_attributes_to_mode(is_dir, is_readonly),
+            hard_links: None,
+            is_symlink,
+            file_handle: None,
+            uid: None,
+            gid: None,
+            ino: None,
+            acl: None,
+            owner: None,
+            owner_group: None,
+            xattrs: None,
+        }
+    }
 }
 
 /// 将 SMB 文件属性映射为 Unix mode 近似值
@@ -775,29 +807,20 @@ impl CifsStorage {
             .map(std::string::ToString::to_string);
 
         let is_readonly = basic_info.file_attributes.readonly();
-        let mode = smb_attributes_to_mode(is_dir, is_readonly);
+        let is_symlink = basic_info.file_attributes.reparse_point();
 
-        let entry = EntryEnum::NAS(NASEntry {
-            name: filename,
-            relative_path: relative_path.to_path_buf(),
-            is_dir,
-            size: standard_info.end_of_file,
+        let entry = EntryEnum::NAS(NASEntry::from_smb_info(
+            filename,
+            relative_path.to_path_buf(),
             extension,
-            mtime: filetime_to_nanos(basic_info.last_write_time),
-            atime: filetime_to_nanos(basic_info.last_access_time),
-            ctime: filetime_to_nanos(basic_info.creation_time),
-            mode,
-            hard_links: None,
-            is_symlink: basic_info.file_attributes.reparse_point(),
-            file_handle: None,
-            uid: None,
-            gid: None,
-            ino: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        });
+            standard_info.end_of_file,
+            basic_info.last_write_time,
+            basic_info.last_access_time,
+            basic_info.creation_time,
+            is_dir,
+            is_symlink,
+            is_readonly,
+        ));
 
         // 关闭资源
         match resource {
@@ -1156,7 +1179,7 @@ impl CifsStorage {
             let is_readonly = entry.file_attributes.readonly();
 
             // 过滤逻辑
-            let modified_epoch = Some(filetime_to_nanos(entry.last_write_time) / 1_000_000_000);
+            let modified_epoch = Some(crate::time_util::nanos_to_secs(filetime_to_nanos(entry.last_write_time)));
 
             let (skip_entry, continue_scan, need_submatch) = if skip_filter {
                 should_skip(
@@ -1204,28 +1227,18 @@ impl CifsStorage {
             }
 
             // 构建 NASEntry
-            let mode = smb_attributes_to_mode(is_dir, is_readonly);
-            let storage_entry = EntryEnum::NAS(NASEntry {
-                name: file_name_str.clone(),
-                relative_path: PathBuf::from(&relative_path),
+            let storage_entry = EntryEnum::NAS(NASEntry::from_smb_info(
+                file_name_str.clone(),
+                PathBuf::from(&relative_path),
+                extension.clone(),
+                entry.end_of_file as u64,
+                entry.last_write_time,
+                entry.last_access_time,
+                entry.creation_time,
                 is_dir,
-                size: entry.end_of_file as u64,
-                extension: extension.clone(),
-                mtime: filetime_to_nanos(entry.last_write_time),
-                atime: filetime_to_nanos(entry.last_access_time),
-                ctime: filetime_to_nanos(entry.creation_time),
-                mode,
-                hard_links: None,
                 is_symlink,
-                file_handle: None,
-                uid: None,
-                gid: None,
-                ino: None,
-                acl: None,
-                owner: None,
-                owner_group: None,
-                xattrs: None,
-            });
+                is_readonly,
+            ));
 
             // packaged 模式
             if !send_packaged
@@ -1531,7 +1544,7 @@ impl CifsStorage {
             let is_readonly = entry.file_attributes.readonly();
 
             // 过滤逻辑
-            let modified_epoch = Some(filetime_to_nanos(entry.last_write_time) / 1_000_000_000);
+            let modified_epoch = Some(crate::time_util::nanos_to_secs(filetime_to_nanos(entry.last_write_time)));
 
             let (skip_entry, continue_scan, need_submatch) = if ctx.apply_filter {
                 should_skip(
@@ -1556,11 +1569,14 @@ impl CifsStorage {
 
             if skip_entry {
                 if is_dir && continue_scan && (ctx.max_depth == 0 || ctx.current_depth + 1 < ctx.max_depth) {
-                    let nas = build_smb_nas_entry(
+                    let nas = NASEntry::from_smb_info(
                         file_name_str,
-                        relative_path,
+                        PathBuf::from(relative_path),
                         extension,
-                        &entry,
+                        entry.end_of_file,
+                        entry.last_write_time,
+                        entry.last_access_time,
+                        entry.creation_time,
                         true,
                         is_symlink,
                         is_readonly,
@@ -1574,11 +1590,14 @@ impl CifsStorage {
                 continue;
             }
 
-            let nas = build_smb_nas_entry(
+            let nas = NASEntry::from_smb_info(
                 file_name_str,
-                relative_path,
+                PathBuf::from(relative_path),
                 extension,
-                &entry,
+                entry.end_of_file,
+                entry.last_write_time,
+                entry.last_access_time,
+                entry.creation_time,
                 is_dir,
                 is_symlink,
                 is_readonly,
@@ -1657,34 +1676,6 @@ impl CifsStorage {
         tokio::spawn(run_dfs_driver(req_tx, out_tx, root_path, root_handle, base_ctx));
 
         Ok(crate::AsyncReceiver::new(out_rx))
-    }
-}
-
-/// 从 SMB `FileDirectoryInformation` 构建 `NASEntry`
-fn build_smb_nas_entry(
-    name: String, relative_path: String, extension: Option<String>, info: &FileDirectoryInformation, is_dir: bool,
-    is_symlink: bool, is_readonly: bool,
-) -> NASEntry {
-    NASEntry {
-        name,
-        relative_path: PathBuf::from(relative_path),
-        is_dir,
-        size: info.end_of_file,
-        extension,
-        mtime: filetime_to_nanos(info.last_write_time),
-        atime: filetime_to_nanos(info.last_access_time),
-        ctime: filetime_to_nanos(info.creation_time),
-        mode: smb_attributes_to_mode(is_dir, is_readonly),
-        hard_links: None,
-        is_symlink,
-        file_handle: None,
-        uid: None,
-        gid: None,
-        ino: None,
-        acl: None,
-        owner: None,
-        owner_group: None,
-        xattrs: None,
     }
 }
 

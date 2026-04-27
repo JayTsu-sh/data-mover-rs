@@ -1,6 +1,5 @@
 // 标准库
 use std::ops::{BitAnd, BitOr};
-use std::time::SystemTime;
 
 // 外部crate
 use glob::{MatchOptions, Pattern};
@@ -71,10 +70,7 @@ pub fn should_skip(
     );
 
     // 预计算 now_epoch，避免在 evaluate 中重复调用 SystemTime::now()
-    let now_epoch = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now_epoch = crate::time_util::now_secs();
 
     let is_dir = file_type == Some("dir");
 
@@ -1733,10 +1729,7 @@ mod tests {
         modified_epoch: Option<i64>, size: Option<u64>, extension: Option<&str>,
     ) -> MatchResult {
         let expr = FilterExpression::parse(expr_str).expect("Failed to parse expression");
-        let now_epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now_epoch = crate::time_util::now_secs();
         evaluate_filter(
             &expr,
             file_name,

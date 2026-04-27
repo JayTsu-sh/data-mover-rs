@@ -75,10 +75,7 @@ impl StorageEnum {
     /// 在存储上写入临时文件 → 读取 mtime → 删除 → 返回服务端时间戳（秒）。
     /// 本地存储返回 None（mtime 等于系统时钟，无校验意义）。
     pub async fn probe_server_time(&self) -> Result<Option<i64>> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
+        let nanos = crate::time_util::now_nanos();
         let tmp_name = format!(".~ts_{nanos:x}");
 
         match self {
