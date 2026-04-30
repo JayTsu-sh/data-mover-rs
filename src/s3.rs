@@ -1996,6 +1996,18 @@ impl S3Storage {
         let head_object_builder = self.client.head_object().bucket(&self.bucket_name).key(&key);
 
         let response = head_object_builder.send().await.map_err(|e| {
+            // HeadObject 404 → 以 FileNotFound 上报，让 integrity-check 区分"确实不存在"
+            // 与"瞬时错误"（连接断开/服务繁忙）。
+            // 双判定：SDK 把 404 解析为 ServiceError::NotFound 时走 is_not_found()；
+            // 罕见情况下未解析（如 Unhandled）则回退到原始 HTTP 状态。
+            let is_404 = matches!(
+                &e,
+                aws_sdk_s3::error::SdkError::ServiceError(svc) if svc.err().is_not_found()
+            ) || e.raw_response().is_some_and(|r| r.status().as_u16() == 404);
+            if is_404 {
+                debug!("S3 object not found: {}", key);
+                return StorageError::FileNotFound(key.clone());
+            }
             error!("Failed to get metadata for S3 object {}: {:?}", key, e);
             StorageError::S3Error(format!("Failed to get metadata for object {key}: {e:?}"))
         })?;

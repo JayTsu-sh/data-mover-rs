@@ -967,6 +967,17 @@ impl StorageEnum {
         matches!(self, StorageEnum::S3(storage) if storage.is_bucket_versioned)
     }
 
+    /// 后端是否拥有真实的目录对象（具有独立 inode/元数据）。
+    ///
+    /// - `true`：NFS / CIFS / Local — 目录是一等对象，可读写 mode/uid/gid/atime/mtime；
+    /// - `false`：S3 — 目录仅作为 key prefix 的隐式存在，没有自身元数据。
+    ///
+    /// 调用方（如 integrity-check 的目录元数据校验、tar_pack 的目录条目写入）
+    /// 据此决定是否跳过目录元数据相关步骤。
+    pub fn has_real_directory_objects(&self) -> bool {
+        !matches!(self, StorageEnum::S3(_))
+    }
+
     /// 从源端复制 ACL（非继承的显式 ACE + 继承保护状态）到目标端
     ///
     /// 支持组合：

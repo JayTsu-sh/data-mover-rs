@@ -202,7 +202,13 @@ const MAX_MOUNT_PORT_ATTEMPTS: u32 = 3;
 /// mount 内层重试的初始等待时间（毫秒），指数退避：1s、2s
 const MOUNT_PORT_RETRY_INITIAL_MS: u64 = 1000;
 
-/// 检查 NFS 错误是否为 NOENT（路径不存在）
+/// 检测"目标不存在"错误（NFS3ERR_NOENT / NFS4ERR_NOENT / MNT3ERR_NOENT / Io NotFound）。
+///
+/// 用途：
+/// - delete_*：幂等成功（删除已不存在的对象不报错）
+/// - lookup_fh：转换为 `DirectoryNotFound`/`FileNotFound` 返回给上层
+///
+/// 不参与 stale-handle 重试（语义上 NOENT 是终态，不是 cache 失效）。
 fn is_nfs_noent(err: &NfsError) -> bool {
     match err {
         NfsError::Nfs3(code) => matches!(code, nfs_rs::Nfs3ErrorCode::NFS3ERR_NOENT),
@@ -213,33 +219,71 @@ fn is_nfs_noent(err: &NfsError) -> bool {
     }
 }
 
-/// 直接匹配 `nfs_rs::NfsError` 的枚举变体，避免字符串解析
-/// 包括：
-/// - `NFS3ERR_STALE`: 文件句柄失效 ("NFS3 error: invalid file handle")
-/// - `NFS3ERR_BADHANDLE`: 非法文件句柄 ("NFS3 error: illegal NFS file handle")
-/// - `NFS3ERR_NOENT`: 目录不存在 ("NFS3 error: no such file or directory")，可能是暂时的缓存未同步
-fn is_retryable_nfs_error(err: &NfsError) -> bool {
+/// 检测"陈旧文件句柄"错误（NFS3ERR_STALE / NFS3ERR_BADHANDLE / NFS4ERR_STALE / NFS4ERR_BADHANDLE）。
+///
+/// 含义：缓存的 file handle 在服务端已失效（如服务端重启、export 重新生成）。
+/// 与 NFS4ERR_DELAY 区分：DELAY 是"服务端繁忙，稍后重试"，由 nfs-rs 层
+/// （`compound()` 中带退避的重试循环）处理，不在 data-mover 层重复处理。
+fn is_stale_handle(err: &NfsError) -> bool {
     match err {
-        // NFS3 协议错误：直接匹配 error code 枚举
         NfsError::Nfs3(code) => matches!(
             code,
-            nfs_rs::Nfs3ErrorCode::NFS3ERR_STALE
-                | nfs_rs::Nfs3ErrorCode::NFS3ERR_BADHANDLE
-                | nfs_rs::Nfs3ErrorCode::NFS3ERR_NOENT
+            nfs_rs::Nfs3ErrorCode::NFS3ERR_STALE | nfs_rs::Nfs3ErrorCode::NFS3ERR_BADHANDLE
         ),
-        // NFS4 协议错误（如果支持 NFSv4）
         NfsError::Nfs4(code) => matches!(
             code,
-            nfs_rs::Nfs4ErrorCode::NFS4ERR_STALE
-                | nfs_rs::Nfs4ErrorCode::NFS4ERR_BADHANDLE
-                | nfs_rs::Nfs4ErrorCode::NFS4ERR_NOENT
+            nfs_rs::Nfs4ErrorCode::NFS4ERR_STALE | nfs_rs::Nfs4ErrorCode::NFS4ERR_BADHANDLE
         ),
-        // MOUNT 协议错误
-        NfsError::Mount(code) => matches!(code, nfs_rs::Nfs3MountErrorCode::MNT3ERR_NOENT),
-        // Io 错误：无法结构化匹配，回退到字符串检查
-        NfsError::Io(io_err) => io_err.to_string().contains("no such file"),
         _ => false,
     }
+}
+
+/// 检测"服务端繁忙"错误（NFS4ERR_DELAY）。
+///
+/// 含义：服务端暂时繁忙，请稍后重试。nfs-rs 层在 `compound()` 中已对单条 RPC
+/// 做了带 jitter 的退避重试。本函数用于 **流式/迭代式操作**（如 `readdirplus`）
+/// 的**操作级重试**：当流式遍历中途某条 RPC 在 nfs-rs 重试耗尽后仍返回 DELAY，
+/// 重新从头开始整个 readdirplus 比"丢弃失败 entry 继续"安全得多
+/// （否则会出现统计计数偏低的 silent data loss）。
+///
+/// 与 [`is_stale_handle`] 的恢复策略不同：
+/// - stale handle: 刷新 root_fh + 清除路径缓存
+/// - server busy: 单纯延时再试（nfs-rs 已做，data-mover 在流操作中再试）
+fn is_server_busy(err: &NfsError) -> bool {
+    matches!(err, NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_DELAY))
+}
+
+/// 应用层 NFS4ERR_DELAY 退避：2s/4s/8s 指数延时，最多 3 次（额外 ~14s 容错）。
+///
+/// nfs-rs 在 `compound()` 中已对单条 RPC 做带 jitter 的退避重试（~75s）。
+/// 仍 DELAY 说明服务端持续高负载（如批量并发 create 后期）；
+/// 此函数提供应用层的二次延时，由调用方决定 return / continue 的控制流。
+async fn backoff_server_busy(op: &str, target: &(dyn std::fmt::Debug + Send + Sync), retries: u8) {
+    let sleep_ms = 2000u64 * (1u64 << u64::from(retries));
+    warn!(
+        "{}: server busy on {:?}, app-level retry {}/{} after {}ms",
+        op,
+        target,
+        retries + 1,
+        MAX_STALE_RETRIES,
+        sleep_ms
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+}
+
+/// 检测调用方可通过"清除路径缓存 + 刷新 root_fh + 重试"恢复的错误。
+///
+/// 包含：
+/// - **STALE / BADHANDLE**：文件句柄陈旧（[`is_stale_handle`]），刷新后可恢复。
+/// - **NOENT**（[`is_nfs_noent`]）：高并发场景下可能为瞬态——
+///   如 worker A 刚 `mkdir` 完成但 worker B 的 path 缓存尚未失效，
+///   B 此时 LOOKUP 会拿到 NOENT；清除缓存重试可恢复。
+///   若重试耗尽仍 NOENT，调用方应转换为 `FileNotFound`/`DirectoryNotFound`。
+///
+/// **不包含 NFS4ERR_DELAY**：DELAY 由 nfs-rs 层（`compound()` 退避重试）处理，
+/// data-mover 层若再叠加重试只会延长等待，无额外收益。
+fn is_retryable_with_invalidation(err: &NfsError) -> bool {
+    is_stale_handle(err) || is_nfs_noent(err)
 }
 
 /// 清除指定路径的所有前缀缓存条目（从根到完整路径）
@@ -742,7 +786,7 @@ impl NFSStorage {
                 }
                 Err(e) => {
                     // Stale handle：缓存的 fh 在 NFS 服务器侧已失效，刷新 root_fh 后从根重试
-                    if is_retryable_nfs_error(&e) && retries < MAX_STALE_RETRIES {
+                    if is_retryable_with_invalidation(&e) && retries < MAX_STALE_RETRIES {
                         debug!(
                             "Stale handle detected in lookup_fh for {:?}, refreshing root_fh and retrying",
                             relative_path
@@ -751,6 +795,10 @@ impl NFSStorage {
                         self.maybe_refresh_root_fh(stale_gen).await?;
                         let root_fh = self.get_root_fh();
                         invalidate_path_cache(&components, &root_fh);
+                        return Box::pin(self.lookup_fh_inner(relative_path, retries + 1)).await;
+                    }
+                    if is_server_busy(&e) && retries < MAX_STALE_RETRIES {
+                        backoff_server_busy("lookup_fh", &relative_path, retries).await;
                         return Box::pin(self.lookup_fh_inner(relative_path, retries + 1)).await;
                     }
                     // NOENT 重试耗尽：路径组件确实不存在，返回 DirectoryNotFound
@@ -801,7 +849,7 @@ impl NFSStorage {
             match self.mount.open(parent_fh, filename, access).await {
                 Ok(obj) => return Ok(NFSFileHandle::new(obj.fh, path.to_path_buf())),
                 Err(e) => {
-                    if is_retryable_nfs_error(&e) && attempt < MAX_STALE_RETRIES {
+                    if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!("Stale handle in open for {:?}, refreshing root_fh and retrying", path);
                         let stale_gen = self.refresh_generation.load(Ordering::Acquire);
                         self.maybe_refresh_root_fh(stale_gen).await?;
@@ -879,7 +927,7 @@ impl NFSStorage {
             {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    if is_retryable_nfs_error(&e) && attempt < MAX_STALE_RETRIES {
+                    if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
                             "Stale handle in truncate_file for {:?}, re-looking up and retrying",
                             file.path
@@ -952,7 +1000,7 @@ impl NFSStorage {
                         }
                         return Ok(handle);
                     }
-                    if is_retryable_nfs_error(&e) && attempt < MAX_STALE_RETRIES {
+                    if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
                             "Stale handle in create_file for {:?}, refreshing root_fh and retrying",
                             relative_path
@@ -962,6 +1010,10 @@ impl NFSStorage {
                         let root_fh = self.get_root_fh();
                         let components = Self::collect_components(relative_path)?;
                         invalidate_path_cache(&components, &root_fh);
+                        continue;
+                    }
+                    if is_server_busy(&e) && attempt < MAX_STALE_RETRIES {
+                        backoff_server_busy("create_file", &relative_path, attempt).await;
                         continue;
                     }
                     return Err(StorageError::NfsError(format!(
@@ -1009,7 +1061,7 @@ impl NFSStorage {
                         trace!("File {:?} already gone, treating as success", relative_path);
                         return Ok(());
                     }
-                    if is_retryable_nfs_error(&e) && attempt < MAX_STALE_RETRIES {
+                    if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
                             "Stale handle in delete_file for {:?}, refreshing root_fh and retrying",
                             relative_path
@@ -1122,7 +1174,7 @@ impl NFSStorage {
                             }
                             Err(e) => {
                                 let err_msg = format!("Failed to lookup directory {dirname}: {e}");
-                                if is_retryable_nfs_error(&e) && retries < MAX_STALE_RETRIES {
+                                if is_retryable_with_invalidation(&e) && retries < MAX_STALE_RETRIES {
                                     debug!(
                                         "Stale handle in create_dir_all lookup for {:?}, refreshing root_fh and retrying",
                                         relative_path
@@ -1137,7 +1189,7 @@ impl NFSStorage {
                                 return Err(StorageError::NfsError(err_msg));
                             }
                         }
-                    } else if is_retryable_nfs_error(&e) && retries < MAX_STALE_RETRIES {
+                    } else if is_retryable_with_invalidation(&e) && retries < MAX_STALE_RETRIES {
                         // Stale handle：缓存的 fh 在 NFS 服务器侧已失效，刷新 root_fh 后从根重试
                         debug!(
                             "Stale handle detected in create_dir_all for {:?}, refreshing root_fh and retrying",
@@ -1188,7 +1240,7 @@ impl NFSStorage {
                         trace!("Directory {:?} already gone, treating as success", relative_path);
                         return Ok(());
                     }
-                    if is_retryable_nfs_error(&e) && attempt < MAX_STALE_RETRIES {
+                    if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
                             "Stale handle in delete_dir for {:?}, refreshing root_fh and retrying",
                             relative_path
@@ -1387,7 +1439,7 @@ impl NFSStorage {
                             }
                         }
                     }
-                    if is_retryable_nfs_error(&e) && attempt < MAX_STALE_RETRIES {
+                    if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
                             "Stale handle in create_symlink for {:?}, refreshing root_fh and retrying",
                             relative_path
@@ -1489,7 +1541,7 @@ impl NFSStorage {
             {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    if is_retryable_nfs_error(&e) && attempt < MAX_STALE_RETRIES {
+                    if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
                             "Stale handle in rename from {:?} to {:?}, refreshing root_fh and retrying",
                             from, to
@@ -1602,7 +1654,7 @@ impl NFSStorage {
             {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    if is_retryable_nfs_error(&e) && attempt < MAX_STALE_RETRIES {
+                    if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
                             "Stale handle in set_metadata for {:?}, re-looking up and retrying",
                             file.path
@@ -1856,29 +1908,71 @@ impl NFSStorage {
         package_remaining: Option<usize>,
     ) -> Result<()> {
         // 调用readdirplus获取目录条目流 - 使用异步调用
-        let mount_clone = self.mount.clone();
-        let dir_fh_clone = dir_fh.clone();
-        let mut dir_stream = mount_clone.readdirplus(dir_fh_clone).await;
-
-        // 流式处理每个目录条目
-        while let Some(entry_result) = dir_stream.next().await {
-            let entry = match entry_result {
-                Ok(e) => e,
-                Err(e) => {
-                    error!(
-                        "[Producer {}] Failed to read entry in directory {}: {:?}",
-                        producer_id, dir_path, e
+        // 先把整个目录的 readdirplus 结果完整收集到 Vec，再处理。
+        // 这是为了在流中途遇到瞬时错误（NFS4ERR_DELAY 在 nfs-rs 内部重试耗尽，
+        // 或 STALE/BADHANDLE 等需 root_fh 刷新的错误）时可以**整体重试 readdirplus**
+        // 而不会向下游 channel 重复发送已发条目（流式直发 + 重试 = 重复 entry，
+        // 进而导致 ClickHouse 行数 / 统计计数偏离实际）。
+        //
+        // 内存代价：单目录 readdirplus 全部 entries 缓冲。典型 < 10k entry，
+        // 单 entry ~500B，最大 ~5MB/worker，可接受。
+        let entries: Vec<_> = {
+            let mount_clone = self.mount.clone();
+            let mut retries: u8 = 0;
+            loop {
+                let mut dir_stream = mount_clone.readdirplus(dir_fh.clone()).await;
+                let mut buf: Vec<nfs_rs::ReaddirplusEntry> = Vec::new();
+                let mut transient_err: Option<NfsError> = None;
+                while let Some(entry_result) = dir_stream.next().await {
+                    match entry_result {
+                        Ok(e) => buf.push(e),
+                        Err(e) => {
+                            // 流式 readdirplus 中途出错的重试条件（同 read_dir_sorted）
+                            if retries < MAX_STALE_RETRIES
+                                && (is_retryable_with_invalidation(&e) || is_server_busy(&e))
+                            {
+                                transient_err = Some(e);
+                                break;
+                            }
+                            // 非可重试错误：上报但不丢弃整个目录（保留部分结果向下游发送）
+                            error!(
+                                "[Producer {}] Failed to read entry in directory {}: {:?}",
+                                producer_id, dir_path, e
+                            );
+                            let _ = tx
+                                .send(StorageEntryMessage::Error {
+                                    event: ErrorEvent::Scan,
+                                    path: PathBuf::from(&dir_path),
+                                    reason: format!("Failed to read directory entry: {e}"),
+                                })
+                                .await;
+                        }
+                    }
+                }
+                drop(dir_stream);
+                if let Some(e) = transient_err {
+                    retries += 1;
+                    warn!(
+                        "[Producer {}] readdirplus on {} hit transient error (retry {}/{}): {}",
+                        producer_id, dir_path, retries, MAX_STALE_RETRIES, e
                     );
-                    let _ = tx
-                        .send(StorageEntryMessage::Error {
-                            event: ErrorEvent::Scan,
-                            path: PathBuf::from(&dir_path),
-                            reason: format!("Failed to read directory entry: {e}"),
-                        })
-                        .await;
+                    // STALE/BADHANDLE/NOENT 类需要刷新 root_fh；DELAY 类直接重试即可
+                    if is_retryable_with_invalidation(&e) {
+                        let stale_gen = self.refresh_generation.load(Ordering::Acquire);
+                        let _ = self.maybe_refresh_root_fh(stale_gen).await;
+                        // 注意：这里不刷新 dir_fh 本身（无父路径上下文），依赖 root_fh 刷新
+                        // 修复跨 export remount 场景，stale-handle 多次重试可能仍失败时由 errors 报告
+                    }
+                    // 给服务端一点缓冲时间
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue;
                 }
-            };
+                break buf;
+            }
+        };
+
+        // 流式处理每个目录条目（已完整收集，无重复风险）
+        for entry in entries {
             if entry.file_name == "." || entry.file_name == ".." {
                 continue;
             }
@@ -2457,7 +2551,14 @@ impl NFSStorage {
                     Ok(e) => e,
                     Err(e) => {
                         let err_msg = e.to_string();
-                        if retries < MAX_STALE_RETRIES && is_retryable_nfs_error(&e) {
+                        // 流式 readdirplus 中途出错的重试条件：
+                        //   - is_retryable_with_invalidation: STALE/BADHANDLE/NOENT，刷新 root_fh 后从头重试
+                        //   - is_server_busy: NFS4ERR_DELAY 在 nfs-rs 内部重试耗尽后仍未恢复，
+                        //                     此时延时后从头 readdirplus 比"丢弃失败 entry"安全
+                        //                     （后者导致计数 silent data loss）
+                        if retries < MAX_STALE_RETRIES
+                            && (is_retryable_with_invalidation(&e) || is_server_busy(&e))
+                        {
                             stale = true;
                             break;
                         }
@@ -2884,69 +2985,116 @@ mod tests {
         assert_eq!(join_nfs_paths("base///", "///suffix"), "base/suffix");
     }
 
-    // --- is_retryable_nfs_error 测试 ---
+    // --- is_stale_handle 测试（仅 STALE/BADHANDLE，不再包含 NOENT）---
 
     #[test]
-    fn test_is_retryable_nfs_error_nfs3err_stale() {
-        // NFS3ERR_STALE 应被视为可重试错误
+    fn test_is_stale_handle_nfs3err_stale() {
         let err = NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_STALE);
-        assert!(is_retryable_nfs_error(&err));
+        assert!(is_stale_handle(&err));
     }
 
     #[test]
-    fn test_is_retryable_nfs_error_nfs3err_badhandle() {
-        // NFS3ERR_BADHANDLE 应被视为可重试错误
+    fn test_is_stale_handle_nfs3err_badhandle() {
         let err = NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_BADHANDLE);
-        assert!(is_retryable_nfs_error(&err));
+        assert!(is_stale_handle(&err));
     }
 
     #[test]
-    fn test_is_retryable_nfs_error_nfs3err_noent() {
-        // NFS3ERR_NOENT 也应被视为可重试错误（可能是暂时的缓存未同步）
-        let err = NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_NOENT);
-        assert!(is_retryable_nfs_error(&err));
-    }
-
-    #[test]
-    fn test_is_retryable_nfs_error_nfs4err_stale() {
-        // NFS4ERR_STALE 应被视为可重试错误
+    fn test_is_stale_handle_nfs4err_stale() {
         let err = NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_STALE);
-        assert!(is_retryable_nfs_error(&err));
+        assert!(is_stale_handle(&err));
     }
 
     #[test]
-    fn test_is_retryable_nfs_error_mount_noent() {
-        // MNT3ERR_NOENT 应被视为可重试错误
+    fn test_is_stale_handle_nfs4err_badhandle() {
+        let err = NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_BADHANDLE);
+        assert!(is_stale_handle(&err));
+    }
+
+    #[test]
+    fn test_is_stale_handle_excludes_noent() {
+        // NOENT 不属于 stale handle（语义上是终态"对象不存在"，不是"句柄陈旧"）
+        let err = NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_NOENT);
+        assert!(!is_stale_handle(&err));
+        assert!(is_nfs_noent(&err));
+
+        let err = NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_NOENT);
+        assert!(!is_stale_handle(&err));
+        assert!(is_nfs_noent(&err));
+
         let err = NfsError::Mount(nfs_rs::Nfs3MountErrorCode::MNT3ERR_NOENT);
-        assert!(is_retryable_nfs_error(&err));
+        assert!(!is_stale_handle(&err));
+        assert!(is_nfs_noent(&err));
     }
 
     #[test]
-    fn test_is_retryable_nfs_error_unrelated_errors() {
-        // 非 stale handle 错误不应匹配
+    fn test_is_stale_handle_excludes_delay() {
+        // NFS4ERR_DELAY 由 nfs-rs 层（compound 重试循环）处理，不在 data-mover 层重试
+        let err = NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_DELAY);
+        assert!(!is_stale_handle(&err));
+        assert!(!is_nfs_noent(&err));
+    }
+
+    #[test]
+    fn test_is_stale_handle_unrelated_errors() {
         let err = NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_PERM);
-        assert!(!is_retryable_nfs_error(&err));
+        assert!(!is_stale_handle(&err));
 
         let err = NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_EXIST);
-        assert!(!is_retryable_nfs_error(&err));
+        assert!(!is_stale_handle(&err));
 
         let err = NfsError::Rpc("connection refused".to_string());
-        assert!(!is_retryable_nfs_error(&err));
+        assert!(!is_stale_handle(&err));
     }
 
     #[test]
-    fn test_is_retryable_nfs_error_io_noent() {
-        // Io 错误包含 "no such file" 应被视为可重试
+    fn test_is_nfs_noent_io_notfound() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file or directory");
         let err = NfsError::Io(io_err);
-        assert!(is_retryable_nfs_error(&err));
+        assert!(is_nfs_noent(&err));
+        assert!(!is_stale_handle(&err));
     }
 
     #[test]
-    fn test_is_retryable_nfs_error_io_other() {
-        // Io 错误不包含 "no such file" 不应被视为可重试
+    fn test_is_nfs_noent_io_other() {
         let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
         let err = NfsError::Io(io_err);
-        assert!(!is_retryable_nfs_error(&err));
+        assert!(!is_nfs_noent(&err));
+        assert!(!is_stale_handle(&err));
+    }
+
+    // --- is_retryable_with_invalidation 测试（STALE/BADHANDLE/NOENT 都参与重试）---
+
+    #[test]
+    fn test_is_retryable_with_invalidation_stale() {
+        let err = NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_STALE);
+        assert!(is_retryable_with_invalidation(&err));
+    }
+
+    #[test]
+    fn test_is_retryable_with_invalidation_noent_concurrency_race() {
+        // 高并发场景：worker A 刚 mkdir 完，worker B lookup cache 尚未失效，
+        // B 拿到 NOENT。清除缓存 + 重试可恢复。
+        let err = NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_NOENT);
+        assert!(is_retryable_with_invalidation(&err));
+
+        let err = NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_NOENT);
+        assert!(is_retryable_with_invalidation(&err));
+    }
+
+    #[test]
+    fn test_is_retryable_with_invalidation_excludes_delay() {
+        // DELAY 由 nfs-rs 层处理，不在 data-mover 层重复重试
+        let err = NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_DELAY);
+        assert!(!is_retryable_with_invalidation(&err));
+    }
+
+    #[test]
+    fn test_is_retryable_with_invalidation_excludes_unrelated() {
+        let err = NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_PERM);
+        assert!(!is_retryable_with_invalidation(&err));
+
+        let err = NfsError::Rpc("connection refused".to_string());
+        assert!(!is_retryable_with_invalidation(&err));
     }
 }

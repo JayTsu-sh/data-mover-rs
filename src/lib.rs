@@ -24,9 +24,11 @@ pub mod storage_enum;
 pub mod tar_pack;
 pub mod third_party;
 pub mod time_util;
+pub mod url_redact;
 pub(crate) mod walk_scheduler;
 
 pub use checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
+pub use url_redact::redact_storage_url;
 pub use cifs::CifsStorage;
 pub use filter::{
     FilterExpression, FilterFieldDef, FilterOperatorDef, dir_matches_date_filter, get_filter_field_definitions,
