@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use smb::binrw_util::file_time::FileTime;
 use smb::{
-    ACE, ACL, AclRevision, AdditionalInfo, Client, ClientConfig, CreateDisposition, CreateOptions, FileAccessMask,
+    ACE, ACL, AclRevision, AdditionalInfo, Client, ClientConfig, ConnectionConfig, CreateDisposition, CreateOptions, FileAccessMask,
     FileAttributes, FileBasicInformation, FileCreateArgs, FileIdExtdDirectoryInformation,
     FileIdFullDirectoryInformation, FileIdInformation, FileInternalInformation, FileStandardInformation, ReadAt,
     Resource, ResourceHandle, SecurityDescriptor, UncPath, WriteAt,
@@ -330,10 +330,8 @@ fn parse_smb_url(url_str: &str) -> Result<(String, u16, String, String, String, 
     // percent-decode 用户名和密码
     let username = url_decode(username_raw);
 
-    let password_raw = parsed
-        .password()
-        .ok_or_else(|| StorageError::CifsError(format!("Missing password in SMB URL: {}", redact_smb_url(url_str))))?;
-    let password = url_decode(password_raw);
+    // 允许空密码（匿名共享场景：smb://guest:@host/share）
+    let password = url_decode(parsed.password().unwrap_or(""));
 
     let host = parsed
         .host_str()
@@ -389,7 +387,14 @@ impl CifsStorage {
 
         info!("Connecting to SMB share \\\\{host}:{port}/{share}");
 
-        let client = Client::new(ClientConfig::default());
+        // 空密码表示匿名/guest 访问，需允许无签名消息
+        let client = Client::new(ClientConfig {
+            connection: ConnectionConfig {
+                allow_unsigned_guest_access: password.is_empty(),
+                ..ConnectionConfig::default()
+            },
+            ..ClientConfig::default()
+        });
         let unc = format!(r"\\{host}:{port}\{share}");
         let share_path = UncPath::from_str(&unc)
             .map_err(|e| StorageError::CifsError(format!("Failed to parse UNC path '{unc}': {e}")))?;
