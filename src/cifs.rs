@@ -307,7 +307,7 @@ fn redact_smb_url(url_str: &str) -> String {
 /// 密码支持 URL 编码（%40 = @, %3A = : 等）
 ///
 /// 返回 (server, port, share, `sub_path`, username, password)
-fn parse_smb_url(url_str: &str) -> Result<(String, u16, String, String, String, String)> {
+fn parse_smb_url(url_str: &str) -> Result<(String, u16, String, String, String, String, bool)> {
     if !url_str.starts_with("smb://") {
         return Err(StorageError::CifsError(format!(
             "Invalid SMB URL format, must start with smb://: {}",
@@ -362,7 +362,14 @@ fn parse_smb_url(url_str: &str) -> Result<(String, u16, String, String, String, 
         )));
     }
 
-    Ok((host, port, share, sub_path, username, password))
+    // 查询参数：smb2_only=false 可关闭（默认 true，跳过 SMB1 多协议探测帧）
+    let smb2_only = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "smb2_only")
+        .map(|(_, v)| v != "false")
+        .unwrap_or(true);
+
+    Ok((host, port, share, sub_path, username, password, smb2_only))
 }
 
 impl CifsStorage {
@@ -383,7 +390,7 @@ impl CifsStorage {
     ///
     /// 供 dest 路径在 root 可能缺失时使用：构造完成后再调 `ensure_root_exists`。
     async fn connect_only(url: &str, block_size: Option<u64>) -> Result<Self> {
-        let (host, port, share, sub_path, username, password) = parse_smb_url(url)?;
+        let (host, port, share, sub_path, username, password, smb2_only) = parse_smb_url(url)?;
 
         info!("Connecting to SMB share \\\\{host}:{port}/{share}");
 
@@ -391,6 +398,7 @@ impl CifsStorage {
         let client = Client::new(ClientConfig {
             connection: ConnectionConfig {
                 allow_unsigned_guest_access: password.is_empty(),
+                smb2_only_negotiate: smb2_only,
                 ..ConnectionConfig::default()
             },
             ..ClientConfig::default()
@@ -2168,18 +2176,20 @@ mod tests {
 
     #[test]
     fn test_parse_smb_url_basic() {
-        let (host, port, share, sub_path, user, pass) = parse_smb_url("smb://admin:password@nas01/shared").unwrap();
+        let (host, port, share, sub_path, user, pass, smb2_only) =
+            parse_smb_url("smb://admin:password@nas01/shared").unwrap();
         assert_eq!(host, "nas01");
         assert_eq!(port, 445);
         assert_eq!(share, "shared");
         assert_eq!(sub_path, "");
         assert_eq!(user, "admin");
         assert_eq!(pass, "password");
+        assert!(smb2_only);
     }
 
     #[test]
     fn test_parse_smb_url_with_port_and_path() {
-        let (host, port, share, sub_path, user, pass) =
+        let (host, port, share, sub_path, user, pass, smb2_only) =
             parse_smb_url("smb://user:P%40ss@server:4455/backup/data/2024").unwrap();
         assert_eq!(host, "server");
         assert_eq!(port, 4455);
@@ -2187,6 +2197,7 @@ mod tests {
         assert_eq!(sub_path, "data/2024");
         assert_eq!(user, "user");
         assert_eq!(pass, "P@ss");
+        assert!(smb2_only);
     }
 
     #[test]
@@ -2197,6 +2208,24 @@ mod tests {
     #[test]
     fn test_parse_smb_url_missing_share() {
         assert!(parse_smb_url("smb://user:pass@server").is_err());
+    }
+
+    #[test]
+    fn test_parse_smb_url_smb2_only_param() {
+        // 显式关闭：走多协议协商
+        let (_, _, _, _, _, _, smb2_only) =
+            parse_smb_url("smb://user:pass@server/share?smb2_only=false").unwrap();
+        assert!(!smb2_only);
+
+        // 显式开启
+        let (_, _, _, _, _, _, smb2_only) =
+            parse_smb_url("smb://user:pass@server/share?smb2_only=true").unwrap();
+        assert!(smb2_only);
+
+        // 默认（无参数）= true
+        let (_, _, _, _, _, _, smb2_only) =
+            parse_smb_url("smb://user:pass@server/share").unwrap();
+        assert!(smb2_only);
     }
 
     #[test]
