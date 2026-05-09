@@ -1,0 +1,12 @@
+{"ts":"2026-04-28T06:30:00Z","session":"S97","context":"data-mover-rs cifs.rs review","correction":"open_resource 后 ? propagate 错误时 handle 漏 close","applied_to":["src/cifs.rs"]}
+{"ts":"2026-05-05T16:30:00Z","session":"S99","context":"simplify cifs.rs","correction":"统一资源释放走 close_resource helper，不要散写 .close().await","applied_to":["src/cifs.rs"]}
+{"ts":"2026-05-05T16:35:00Z","session":"S99","context":"cifs write_file 失败排查","correction":"Samba 服务器在 CreateDisposition::Create 下报 STATUS_ACCESS_DENIED，必须用 OverwriteIf","applied_to":["src/cifs.rs:1820 (commit 4051)"]}
+{"ts":"2026-05-05T16:36:00Z","session":"S99","context":"cifs rename 行为不一致","correction":"FileRenameInformation 字段必须用 share-relative 路径不是 UNC 全路径","applied_to":["src/cifs.rs (commit 4052)"]}
+{"ts":"2026-05-05T16:40:00Z","session":"S100","context":"NFS retry 行为不对","correction":"split retry taxonomy: EACCES/EPERM → deny_list, EAGAIN/ECONNRESET → delay_backoff","applied_to":["src/nfs.rs (commit 7eb3046)"]}
+{"ts":"2026-05-05T16:40:00Z","session":"S100","context":"S3 404 走 retry 浪费","correction":"S3 GetObject/HeadObject 404 → FileNotFound (deny_list)","applied_to":["src/s3.rs (commit 7eb3046)"]}
+{"ts":"2026-05-05T16:42:00Z","session":"S101","context":"cifs file_id_class 设计","correction":"file_id_class 用 OnceCell + Mutex<()> 双层，热路径 lock-free 比 Mutex<Option> 快","applied_to":["src/cifs.rs (commit 4057)"]}
+{"ts":"2026-05-05T16:43:00Z","session":"S101","context":"cifs mkdir 已存在报错","correction":"mkdir_or_open 把 STATUS_OBJECT_NAME_COLLISION 当成功，节省 1 RT 每个已存在目录","applied_to":["src/cifs.rs (commit 4061)"]}
+{"ts":"2026-05-05T16:44:00Z","session":"S102","context":"cifs.rs simplify 后 review","correction":"build_nas_entry 抽出为 free function 让 get_metadata 更短","applied_to":["src/cifs.rs (commit 4064)"]}
+{"ts":"2026-05-09T15:30:00Z","session":"S103","context":"cifs SMB1 探测影响速度","correction":"smb2_only URL 参数默认 true，跳过 SMB1 多协议探测帧","applied_to":["src/cifs.rs (commit af0e017)"]}
+{"ts":"2026-05-09T15:35:00Z","session":"S103","context":"cifs 匿名 share","correction":"anon=true 关闭签名要求 + 允许空密码，否则 guest:@host 连不上","applied_to":["src/cifs.rs (commit 9b332aa)"]}
+{"ts":"2026-05-09T15:40:00Z","session":"S103","context":"cifs file_id 64-bit 不够","correction":"用 FileIdExtdDirectory (128-bit) 而不是 FileIdBothDirectory，info-class probe 探测","applied_to":["src/cifs.rs (commit b1b9db1)"]}

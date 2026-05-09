@@ -1,0 +1,16 @@
+# harness-run 矩阵定义
+# 每个 skill 的相对路径 + 是否需要外部环境
+
+no_network:
+  - e2e-local
+  - op-cancel
+  - op-filter-dsl
+  - quality-clippy
+  - quality-coverage
+  - quality-large-file-audit
+  - quality-dispatch-coverage
+
+network:
+  - e2e-cifs
+  - e2e-nfs
+  - e2e-s3

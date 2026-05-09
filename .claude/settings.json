@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'git commit'; then cd /root/rust/github/data-mover-rs && cargo fmt --all 2>&1 || echo '[hook] cargo fmt warning (non-blocking)'; fi"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qE '/root/rust/github/data-mover-rs/src/.+\\.rs'; then cd /root/rust/github/data-mover-rs && cargo check --quiet 2>&1 | tail -20 || true; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

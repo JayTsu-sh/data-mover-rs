@@ -1,0 +1,14 @@
+{
+  "_comment": "已知 dispatch holes baseline (2026-05-09). 这些是 S3 / 个别 backend 现实不实现某操作 (语义不适用或用其他名字) 的状态。新增 hole 才算回归。修复 hole 时同步删除本表条目。",
+  "holes": {
+    "check_connectivity": ["nfs.rs", "local.rs"],
+    "create_dir_all": ["s3.rs"],
+    "create_symlink": ["s3.rs"],
+    "delete_dir_all": ["cifs.rs", "s3.rs"],
+    "delete_file": ["s3.rs"],
+    "get_metadata": ["s3.rs"],
+    "read_symlink": ["s3.rs"],
+    "rename": ["s3.rs"],
+    "set_metadata": ["cifs.rs", "nfs.rs", "s3.rs"]
+  }
+}

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # 注: 暂不全局 RUSTFLAGS=-D warnings —— 项目当前 baseline ~173 条 clippy warnings
+  # (见 .claude/skills/quality-clippy/baseline_count.txt). quality-clippy skill 用
+  # baseline 化检查防回退. 长期目标 baseline=0 后再切回 -D warnings.
+
+jobs:
+  ci:
+    name: fmt + clippy + test + examples + e2e-local
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable, edition 2024)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Python (for skill runners)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (baseline-aware)
+        run: python3 .claude/skills/quality-clippy/scripts/run.py
+
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
+
+      - name: cargo build --examples
+        run: cargo build --examples
+
+      - name: e2e-local skill
+        run: python3 .claude/skills/e2e-local/scripts/run.py
+
+      - name: audit large files
+        run: python3 .claude/skills/quality-large-file-audit/scripts/run.py
+
+      - name: audit dispatch coverage
+        run: python3 .claude/skills/quality-dispatch-coverage/scripts/run.py
