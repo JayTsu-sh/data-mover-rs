@@ -1197,6 +1197,17 @@ impl CifsStorage {
         debug!("CIFS update_metadata {:?}", relative_path);
 
         let unc = self.build_unc_path(relative_path);
+
+        // Phase D fix: evict any deferred-close handle that an earlier
+        // `write_file` left behind for the same path. The lease grant
+        // (HandleCaching) keeps the wire Close pending, and on some
+        // servers (NetApp + Samba observed) the un-closed write handle
+        // shadows our subsequent SetInfo's mtime — QueryDirectory keeps
+        // returning the data-write timestamp, so integrity-check fires
+        // an mtime mismatch. evict_lease forces the old handle through
+        // its wire Close before we open a fresh one to SetInfo.
+        let _ = self.client.evict_lease(&unc).await;
+
         let args =
             FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_write(true).with_generic_read(true));
 
@@ -1255,6 +1266,14 @@ impl CifsStorage {
             }
             Resource::Pipe(_) => {}
         }
+
+        // Phase D fix: also evict at the end. The above close() goes
+        // through the lease's deferred-close path, so the SetInfo we
+        // just sent isn't committed to the on-disk view until the
+        // wire Close fires. Without this, the very-next walkdir on
+        // dest (e.g. integrity-check immediately after sync) reads
+        // stale mtime from QueryDirectory.
+        let _ = self.client.evict_lease(&unc).await;
 
         Ok(())
     }
