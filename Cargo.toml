@@ -5,7 +5,10 @@ edition = "2024"
 
 [patch.crates-io]
 nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git" }
-smb = { git = "https://github.com/JayTsu-sh/smb-rs.git" }
+# Phase D 本地开发：依赖 smb-rs 的 Handle Lease A–D 改动
+# (ClientConfig::default_lease_state, Client::evict_lease 等)。
+# Phase D 推上游 fork 后切回 git rev。
+smb = { path = "C:/Jay/rust/github/smb-rs/crates/smb" }
 
 [dependencies]
 async-channel = "2"
@@ -42,7 +45,7 @@ reqwest = { version = "0.13.2", default-features = false, features = [
 ] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 serde = { version = "1", features = ["derive", "rc"] }
-smb = "0.11"
+smb = "0.12"
 soft-canonicalize = "0.5.5"
 thiserror = "2.0.18"
 tokio = { version = "1.51.1", features = ["full"] }

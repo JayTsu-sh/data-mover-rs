@@ -11,8 +11,8 @@ use smb::binrw_util::file_time::FileTime;
 use smb::{
     ACE, ACL, AclRevision, AdditionalInfo, Client, ClientConfig, ConnectionConfig, CreateDisposition, CreateOptions, FileAccessMask,
     FileAttributes, FileBasicInformation, FileCreateArgs, FileIdExtdDirectoryInformation,
-    FileIdFullDirectoryInformation, FileIdInformation, FileInternalInformation, FileStandardInformation, ReadAt,
-    Resource, ResourceHandle, SecurityDescriptor, UncPath, WriteAt,
+    FileIdFullDirectoryInformation, FileIdInformation, FileInternalInformation, FileStandardInformation,
+    LeaseState, ReadAt, Resource, ResourceHandle, SecurityDescriptor, UncPath, WriteAt,
 };
 use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, trace, warn};
@@ -401,6 +401,20 @@ impl CifsStorage {
                 smb2_only_negotiate: smb2_only,
                 ..ConnectionConfig::default()
             },
+            // Phase D: opportunistically request ReadCaching+HandleCaching
+            // on every Create. Servers that don't advertise leasing
+            // silently drop the request context, so this is safe across
+            // server flavors. Servers that do support it cache the FileId
+            // in smb-rs's per-connection lease_table, and the next open
+            // against the same path hits the cache (0 RT instead of full
+            // Create+Close ≈ 2-4ms LAN). For the typical
+            // scan→sync→set_metadata pattern this saves 2 of every 3
+            // wire opens on each file.
+            default_lease_state: Some(
+                LeaseState::new()
+                    .with_read_caching(true)
+                    .with_handle_caching(true),
+            ),
             ..ClientConfig::default()
         });
         let unc = format!(r"\\{host}:{port}\{share}");
@@ -787,6 +801,9 @@ impl CifsStorage {
                 .with_file_write_attributes(true)
                 .with_delete(true)
                 .with_synchronize(true),
+            // Phase D: 让 ClientConfig::default_lease_state 决定是否注入 lease；
+            // 这里保持 None 与既有所有 make_overwrite() 调用语义一致。
+            ..Default::default()
         }
     }
 
@@ -901,6 +918,12 @@ impl CifsStorage {
         trace!("CIFS removing file {:?}", relative_path);
 
         let unc = self.build_unc_path(relative_path);
+
+        // Phase D: 删除前必须先 evict_lease——否则 smb-rs 端 lease_table 里
+        // 缓存的 FileId 在 server 删除路径后立刻失效，下一次 create_file 命中
+        // 缓存会拿到 stale FileId 并报 STATUS_FILE_CLOSED。evict 是幂等的，
+        // 没有 lease 时 cheap no-op。
+        let _ = self.client.evict_lease(&unc).await;
 
         // 打开文件并标记为删除
         let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_write(true).with_delete(true));
@@ -1057,6 +1080,15 @@ impl CifsStorage {
         }
 
         let from_unc = self.build_unc_path(from);
+        let to_unc_for_evict = self.build_unc_path(to);
+
+        // Phase D: rename 同时使 `from` 与 `to` 路径的 lease 缓存失效。
+        // `from` 的 FileId 在 rename 后指向已搬走的文件名，下次 create_file
+        // 命中缓存会得到 stale FileId；`to` 之前若存在同名 lease（被
+        // replace_if_exists 覆盖）也必须 evict。两次 evict 都幂等，无 lease 时
+        // 是 cheap no-op。
+        let _ = self.client.evict_lease(&from_unc).await;
+        let _ = self.client.evict_lease(&to_unc_for_evict).await;
         let to_unc = self.build_unc_path(to);
         // FileRenameInformation.file_name 必须是相对于 share 根的路径（反斜杠分隔），
         // 不能是完整 UNC（`\\host\share\...`）。否则 SMB 服务端返回 `Object Name Invalid (0xc0000033)`。
