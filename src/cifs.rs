@@ -1208,8 +1208,11 @@ impl CifsStorage {
         // its wire Close before we open a fresh one to SetInfo.
         let _ = self.client.evict_lease(&unc).await;
 
+        // P2.a：只请求 FILE_WRITE_ATTRIBUTES 这一项最小权限即可（MS-SMB2
+        // 2.2.13.1.1）。比 generic_write+generic_read 范围窄 → server 端
+        // ACL 检查通过率更高，且不再开 read 二次 handle。
         let args =
-            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_write(true).with_generic_read(true));
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_file_write_attributes(true));
 
         let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
             StorageError::CifsError(format!(
@@ -1218,38 +1221,20 @@ impl CifsStorage {
             ))
         })?;
 
-        // 构建 FileBasicInformation 来设置时间戳
-        // 只有在有值时才设置对应的时间字段
-        // 先读取当前的 FileBasicInformation，然后修改时间戳字段
-        let open_args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
-        let read_resource = self.client.create_file(&unc, &open_args).await.map_err(|e| {
-            StorageError::CifsError(format!(
-                "Failed to open {} for reading metadata: {e}",
-                relative_path.display()
-            ))
-        })?;
-
-        let mut basic = match &read_resource {
-            Resource::File(f) => f
-                .query_info::<FileBasicInformation>()
-                .await
-                .map_err(|e| StorageError::CifsError(format!("Failed to query basic info: {e}")))?,
-            Resource::Directory(d) => d
-                .query_info::<FileBasicInformation>()
-                .await
-                .map_err(|e| StorageError::CifsError(format!("Failed to query basic info: {e}")))?,
-            Resource::Pipe(_) => {
-                return Err(StorageError::CifsError("Unsupported resource type".to_string()));
-            }
+        // P2.a: 跳过 query_info，按 MS-FSCC 2.4.7 协议直接构造
+        // FileBasicInformation。语义：
+        // - FileTime == 0 → server 保留该字段当前值不变
+        // - FileAttributes == 0 → server 保留属性位不变
+        // 我们只关心 atime/mtime，creation_time / change_time / attrs 保留
+        // server 现状。消除 update_metadata 路径上的 open(read) + QueryInfo
+        // 共 2 个 wire RT/file。10.131.7.203 实测 integrity-check pass。
+        let basic = FileBasicInformation {
+            creation_time: FileTime::default(),
+            last_access_time: atime.map(nanos_to_filetime).unwrap_or_default(),
+            last_write_time: mtime.map(nanos_to_filetime).unwrap_or_default(),
+            change_time: FileTime::default(),
+            file_attributes: FileAttributes::default(),
         };
-        close_resource(read_resource).await;
-
-        if let Some(atime_ns) = atime {
-            basic.last_access_time = nanos_to_filetime(atime_ns);
-        }
-        if let Some(mtime_ns) = mtime {
-            basic.last_write_time = nanos_to_filetime(mtime_ns);
-        }
 
         match &resource {
             Resource::File(f) => {
