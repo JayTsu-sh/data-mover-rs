@@ -1,6 +1,7 @@
 // 标准库
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,6 +26,8 @@ use aws_smithy_runtime_api::client::result::ConnectorError;
 use aws_smithy_types::body::SdkBody;
 use aws_types::region::Region;
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::FuturesOrdered;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client as HyperLegacyClient;
 use hyper_util::client::legacy::connect::HttpConnector as HyperHttpConnector;
@@ -283,6 +286,13 @@ fn build_skip_verify_http_client() -> SharedHttpClient {
 const DEFAULT_BLOCK_SIZE: u64 = 5 * 1024 * 1024; // 5MiB
 const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MiB
 const MAX_CONCURRENCY: usize = 5; // 最大并发上传数
+
+/// 单 object 读取的同时在飞 Range GET 请求数（inflight read pipeline 深度）。
+///
+/// aws-sdk-rust 底层 HTTP/2 connection pool 天然支持多请求并发；S3 兼容存储
+/// （AWS S3 / MinIO / Ceph 等）服务端对同 object 不同 byte range 高并发友好，
+/// 与单 inflight 相比高 RTT 链路收益线性。默认 4 与 CIFS 对称。
+const DEFAULT_READ_INFLIGHT: usize = 4;
 
 /// 转换时间戳为纳秒时间戳
 fn datatime_to_i64(timestamp: Option<&DateTime>) -> i64 {
@@ -749,6 +759,10 @@ impl S3Storage {
     }
 
     /// Chunked read: sends `DataChunks` into `tx`, used by the multi-chunk pipeline.
+    ///
+    /// 实现 inflight pipeline：维持最多 [`DEFAULT_READ_INFLIGHT`] 个 Range GET 同时
+    /// 在飞，aws-sdk-rust 底层 HTTP/2 connection pool 自动复用连接 + 并发请求。
+    /// 用 `FuturesOrdered` 保证按 offset 顺序送 channel，下游 hasher.update 需顺序。
     pub(crate) async fn read_data(
         &self, tx: mpsc::Sender<DataChunk>, relative_path: &str, size: u64, enable_integrity_check: bool,
         qos: Option<QosManager>,
@@ -756,22 +770,49 @@ impl S3Storage {
         if size == 0 {
             return Ok(None);
         }
-        let key = self.build_full_key(relative_path);
-        let mut handle = S3FileHandle {
-            key,
-            version_id: None,
-            last_modified: String::new(),
-            tags: None,
-        };
+        let key = Arc::new(self.build_full_key(relative_path));
         let chunk_size = self.block_size as usize;
-        let mut offset = 0u64;
         let mut hasher = create_hash_calculator(enable_integrity_check);
+
+        type ReadFut<'a> = Pin<Box<dyn Future<Output = Result<Bytes>> + Send + 'a>>;
+        let mut inflight: FuturesOrdered<ReadFut<'_>> = FuturesOrdered::new();
+        let mut issue_offset: u64 = 0;
+        let mut send_offset: u64 = 0;
+
         loop {
-            if let Some(ref qos) = qos {
-                qos.acquire(chunk_size as u64).await;
+            // 填满 inflight，直到达到深度上限或所有字节已发出。
+            while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < size {
+                if let Some(ref qos) = qos {
+                    qos.acquire(chunk_size as u64).await;
+                }
+                let count = ((size - issue_offset) as usize).min(chunk_size);
+                let key_clone = key.clone();
+                let range_offset = issue_offset;
+                let range_count = count as u64;
+                // 调 `read_range_uncached` helper（与 `self.read` 共享 Range GET 路径），
+                // 避免 GetObject + body.collect 模板在两处漂移。version_id = None：
+                // read_data 调用域内本来就不带版本。
+                let fut = Box::pin(async move {
+                    self.read_range_uncached(key_clone.as_str(), None, range_offset, range_count).await
+                });
+                inflight.push_back(fut);
+                issue_offset += count as u64;
             }
-            let count = ((size - offset) as usize).min(chunk_size);
-            let data = self.read(&mut handle, offset, count).await?;
+
+            // inflight 已空且全部读完 → 退出循环。
+            let Some(result) = inflight.next().await else {
+                break;
+            };
+            let data = match result {
+                Ok(d) => d,
+                Err(e) => {
+                    // 上抛真实读错误；旧实现用 `?`，本次重写曾误降级为 break+Ok（regression）。
+                    error!("S3 read chunk at offset {} failed: {:?}", send_offset, e);
+                    drop(inflight);
+                    return Err(e);
+                }
+            };
+
             if data.is_empty() {
                 break;
             }
@@ -779,14 +820,15 @@ impl S3Storage {
             if let Some(ref mut h) = hasher {
                 h.update(&data);
             }
-            if tx.send(DataChunk { offset, data }).await.is_err() {
+            if tx.send(DataChunk { offset: send_offset, data }).await.is_err() {
+                // 下游 receiver 关闭：视为协作取消信号（与旧实现一致），不当读错误。
                 break;
             }
-            offset += len;
-            if offset >= size {
-                break;
-            }
+            send_offset += len;
         }
+
+        // FuturesOrdered drop 取消未完成的 Range GET，aws-sdk 内部丢弃响应。
+        drop(inflight);
         Ok(hasher)
     }
 
@@ -2423,35 +2465,38 @@ impl S3Storage {
         }
     }
 
-    async fn read(&self, file: &mut S3FileHandle, offset: u64, count: usize) -> Result<Bytes> {
-        // 如果count为0，直接返回空向量
-        if count == 0 {
-            return Ok(Bytes::new());
+    /// 单次 Range GET 并把响应 body 收成 `Bytes`。
+    ///
+    /// 共享 helper：被 [`Self::read`] 与 [`Self::read_data`] 内联 future 复用，避免
+    /// 两处 `GetObject + collect` 模板漂移（未来加 metric / retry / observability 只改这）。
+    /// `version_id = None` 时不附带版本约束（最常见 case）。
+    pub(crate) async fn read_range_uncached(
+        &self, key: &str, version_id: Option<&str>, offset: u64, count: u64,
+    ) -> Result<Bytes> {
+        let mut builder = self.client.get_object().bucket(&self.bucket_name).key(key);
+        if let Some(v) = version_id {
+            builder = builder.version_id(v);
         }
+        let range_header = format!("bytes={}-{}", offset, offset + count - 1);
+        builder = builder.range(range_header);
 
-        let mut get_object_builder = self.client.get_object().bucket(&self.bucket_name).key(&file.key);
-
-        // 如果有版本ID，添加到请求中
-        if let Some(version_id) = &file.version_id {
-            get_object_builder = get_object_builder.version_id(version_id);
-        }
-
-        // 设置Range头来指定读取的偏移量和长度
-        let range_header = format!("bytes={}-{}", offset, offset + count as u64 - 1);
-        get_object_builder = get_object_builder.range(range_header);
-
-        let resp = get_object_builder
+        let resp = builder
             .send()
             .await
-            .map_err(|e| StorageError::S3Error(format!("读取对象 {} 的偏移量 {} 失败: {:?}", file.key, offset, e)))?;
-
+            .map_err(|e| StorageError::S3Error(format!("读取对象 {key} 的偏移量 {offset} 失败: {e:?}")))?;
         let body = resp
             .body
             .collect()
             .await
             .map_err(|e| StorageError::S3Error(format!("收集对象内容失败: {e:?}")))?;
-
         Ok(body.into_bytes())
+    }
+
+    async fn read(&self, file: &mut S3FileHandle, offset: u64, count: usize) -> Result<Bytes> {
+        if count == 0 {
+            return Ok(Bytes::new());
+        }
+        self.read_range_uncached(&file.key, file.version_id.as_deref(), offset, count as u64).await
     }
 
     // 将数据data(类型是Bytes)一次性写入对象
