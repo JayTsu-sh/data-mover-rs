@@ -6,6 +6,8 @@ This module only holds protocol-level defaults.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 
 # ── CIFS / SMB ────────────────────────────────────────────────────────
 class CIFS:
@@ -49,4 +51,9 @@ COPY_PIPELINE_CAPACITY = 2  # storage_enum.rs 内置常数
 TAR_PIPELINE_CAPACITY = 16  # storage_enum.rs 内置常数
 
 CARGO_BIN = "cargo"
-PROJECT_ROOT = "/root/rust/github/data-mover-rs"
+# Resolve PROJECT_ROOT relative to this file's location so the same scripts
+# work both in local dev (Windows/Mac/Linux home checkouts) and on GitHub
+# Actions runners (where the repo lives under /home/runner/work/<repo>/<repo>/).
+# This file is at <repo>/.claude/skills/_shared/protocol_constants.py — go up
+# 4 levels to reach <repo>.
+PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
