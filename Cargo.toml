@@ -5,11 +5,9 @@ edition = "2024"
 
 [patch.crates-io]
 nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git" }
-# Handle Lease Phase A–D + P2.b compound (Client::compound_set_basic_info,
-# evict_lease, flush_idle_leases, default_lease_state) + code-review fix.
-# Tracking the JayTsu-sh fork's refactor/compound-set-basic-info branch
-# until the smb-rs upstream merges this work.
-smb = { git = "https://github.com/JayTsu-sh/smb-rs.git", branch = "refactor/compound-set-basic-info" }
+# Handle Lease Phase A–D + P2.b compound (PR #2 merged 2026-05-15).
+# Tracking fork main; run `cargo update -p smb` to pull the latest.
+smb = { git = "https://github.com/JayTsu-sh/smb-rs.git" }
 
 [dependencies]
 async-channel = "2"
