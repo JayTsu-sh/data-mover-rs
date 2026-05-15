@@ -1,5 +1,8 @@
 // 标准库
+use std::collections::BTreeSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -7,7 +10,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 // 外部 crate
 use bytes::Bytes;
 use futures::StreamExt;
+use parking_lot::RwLock;
+use futures::stream::{FuturesOrdered, FuturesUnordered};
 use smb::binrw_util::file_time::FileTime;
+use smb::connection::MultiChannelConfig;
 use smb::{
     ACE, ACL, AclRevision, AdditionalInfo, Client, ClientConfig, ConnectionConfig, CreateDisposition, CreateOptions, FileAccessMask,
     FileAttributes, FileBasicInformation, FileCreateArgs, FileIdExtdDirectoryInformation,
@@ -135,7 +141,115 @@ fn url_decode(s: &str) -> String {
     String::from_utf8(result).unwrap_or_else(|_| s.to_string())
 }
 
-const DEFAULT_BLOCK_SIZE: u64 = 2 * MB;
+/// CIFS 目录存在性缓存：`create_dir_all` 用它跳过已确认存在的层级，省去逐层 mkdir RT。
+///
+/// 内部以排序集合 `BTreeSet<String>` 存路径（统一用 `/` 分隔，无首尾斜杠），用
+/// [`BTreeSet::range`] 做前缀范围查询 → 失效复杂度从 DashSet 全表 `O(N)` 降到
+/// `O(log N + K')`，K' 为前缀连续范围大小。
+///
+/// 并发模型：内部 `parking_lot::RwLock` —— 多 worker 共享同一 `CifsStorage` clone 时，
+/// `contains()` 走 read lock 并行，`insert()` / `invalidate*()` 走 write lock 短串行。
+/// 实际瓶颈在 SMB RT (~ms)，本地临界区 (~μs) 远小于网络成本。
+///
+/// 容量上限：[`DirExistsCache::MAX_SIZE`] 条。超出后 `insert` 静默跳过 —— 行为退化为
+/// 不带 cache（每次都 mkdir_or_open，幂等），不会丢正确性，避免长 daemon session 下
+/// 的无界内存增长。10 万条 path × 平均 256 字节 ≈ 25 MB worst case，覆盖 99% 实际负载。
+pub(super) struct DirExistsCache {
+    inner: RwLock<BTreeSet<String>>,
+    cap: usize,
+}
+
+/// 生产环境缓存条目硬上限。命中此值后新 `insert` 不再增长（cache miss 走真实 RT，
+/// 正确但慢）。10 万条 path × 平均 256 字节 ≈ 25 MB worst case，覆盖 99% 实际负载。
+const DIR_EXISTS_CACHE_DEFAULT_CAP: usize = 100_000;
+
+impl DirExistsCache {
+    pub(super) fn new() -> Self {
+        Self::with_cap(DIR_EXISTS_CACHE_DEFAULT_CAP)
+    }
+
+    /// 显式指定上限的构造函数。仅测试使用小 cap 验证退化语义；生产走 [`Self::new`]。
+    pub(super) fn with_cap(cap: usize) -> Self {
+        Self {
+            inner: RwLock::new(BTreeSet::new()),
+            cap,
+        }
+    }
+
+    /// 查路径是否已确认存在。多 worker 并发安全（read lock）。
+    pub(super) fn contains(&self, path: &str) -> bool {
+        self.inner.read().contains(path)
+    }
+
+    /// 登记一条已存在的路径。满载时静默跳过（cap 见 [`Self::with_cap`]）。
+    pub(super) fn insert(&self, path: String) {
+        let mut guard = self.inner.write();
+        if guard.len() >= self.cap {
+            return;
+        }
+        guard.insert(path);
+    }
+
+    /// 驱逐 `path` 自身条目以及所有以 `path/` 为前缀的子条目。
+    ///
+    /// 算法：BTreeSet 排序后，所有 `starts_with(path)` 的 key 必连续。
+    /// - `take_while(starts_with(path))` 限定到该连续范围 —— 即便存在 `"path\0..."` 这类
+    ///   罕见字符（`\0` < `/` 的 ASCII 字节）也包含其中，不会提前终止遗漏后续命中。
+    /// - 范围内 `filter` 精准剔除 partial-prefix 兄弟 `"path<X>"`（如 `"a/bb"` vs 删 `"a/b"`）。
+    ///
+    /// 复杂度 `O(log N + K')`。
+    pub(super) fn invalidate(&self, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        let prefix = format!("{path}/");
+        let mut guard = self.inner.write();
+        // BTreeSet 没有 stable 的 extract_if，必须先 collect 命中再逐个 remove。
+        let to_remove: Vec<String> = guard
+            .range::<str, _>((std::ops::Bound::Included(path), std::ops::Bound::Unbounded))
+            .take_while(|p| p.starts_with(path))
+            .filter(|p| p.as_str() == path || p.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for k in to_remove {
+            guard.remove(&k);
+        }
+    }
+
+    /// `&Path` 版本：把 backslash 归一为 forward slash、剔除首尾 `/` 后委托 [`Self::invalidate`]。
+    pub(super) fn invalidate_path(&self, path: &Path) {
+        let s = path.to_string_lossy().replace('\\', "/");
+        let trimmed = s.trim_matches('/');
+        self.invalidate(trimmed);
+    }
+
+    /// 仅单测使用，避免在生产 API 暴露 size。
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.inner.read().len()
+    }
+}
+
+/// CIFS 块大小默认值（用户未显式配置时使用）。
+///
+/// 8 MiB 与现代 Windows Server / Samba 4.x 的 SMB3 协商上限对齐。
+/// 老 server（SMB 2.0/2.1，或某些企业 NAS）协商上限可能只有 1 MiB，
+/// 实际生效值会被 `min(user_cfg, max_read_size, max_write_size)` 兜底，
+/// 见 [`CifsStorage::connect_only`]。
+const DEFAULT_BLOCK_SIZE: u64 = 8 * MB;
+
+/// 单文件读取的同时在飞请求数（inflight read pipeline 深度）。
+///
+/// 默认 4：在常见 SMB credits（512+）和 chunk=8 MiB 配置下，与 BDP 对齐又不至于
+/// 让 server 端 read-ahead 失效。增大值在高 RTT 链路收益线性，超过 server credits
+/// 上限后失效。要调整时通过 [`CifsStorage::read_inflight_depth`] 暴露给上层。
+const DEFAULT_READ_INFLIGHT: usize = 4;
+
+/// 单文件写入的同时在飞请求数（inflight write pipeline 深度）。
+///
+/// 默认 4：与 read 对称。写入端 FuturesUnordered 允许乱序 ack，server 端 inode
+/// 级 lock 串行化在内存中代价低，wire 上仍受益于 pipeline。
+const DEFAULT_WRITE_INFLIGHT: usize = 4;
 
 /// 目录枚举使用的 SMB info class。
 ///
@@ -271,6 +385,15 @@ pub struct CifsStorage {
     ///   避免每个 first-caller 各自跑一遍 `Id128 → Internal64` 双探测。
     file_id_class: Arc<OnceCell<FileIdClass>>,
     file_id_probe_lock: Arc<Mutex<()>>,
+    /// 已确认存在的目录路径缓存（normalized 用 '/' 分隔，root sub-path 之外的相对路径）。
+    ///
+    /// **per-storage 持有，不跨 worker 共享** —— 与 terrasync-rs 端"per-worker 独立
+    /// Client"设计一致，避免跨 worker 锁竞争。同一 worker 处理一批同前缀文件时命中率
+    /// 高（典型 sync 任务 path 局部性强），把"逐级 mkdir RT"压成"首层探测 + 之后零网络"。
+    ///
+    /// 失效：delete / rename 改动到的路径必须显式驱逐（含子前缀），由
+    /// [`Self::invalidate_dir_cache`] 统一处理。
+    dir_exists_cache: Arc<DirExistsCache>,
 }
 
 impl std::fmt::Debug for CifsStorage {
@@ -395,10 +518,15 @@ impl CifsStorage {
         info!("Connecting to SMB share \\\\{host}:{port}/{share}");
 
         // 空密码表示匿名/guest 访问，需允许无签名消息
+        // multichannel: Auto —— 仅在 NEGOTIATE request 里声明 client 支持，让 server 能诚实
+        // 回答自身能力（SMB 协议要求双方都声明才协商成功；client 不声明则 server response 永远
+        // multi_channel=0，无法区分"不支持"与"未协商"）。即使 server 不支持或同网段无备用网卡，
+        // smb-rs 的 `_setup_multi_channel` 各分支都 `Ok(None)` 静默 fallback 单 channel，业务无影响。
         let client = Client::new(ClientConfig {
             connection: ConnectionConfig {
                 allow_unsigned_guest_access: password.is_empty(),
                 smb2_only_negotiate: smb2_only,
+                multichannel: MultiChannelConfig::Auto,
                 ..ConnectionConfig::default()
             },
             // Phase D: opportunistically request ReadCaching+HandleCaching
@@ -407,9 +535,12 @@ impl CifsStorage {
             // server flavors. Servers that do support it cache the FileId
             // in smb-rs's per-connection lease_table, and the next open
             // against the same path hits the cache (0 RT instead of full
-            // Create+Close ≈ 2-4ms LAN). For the typical
-            // scan→sync→set_metadata pattern this saves 2 of every 3
-            // wire opens on each file.
+            // Create+Close ≈ 2-4ms LAN).
+            //
+            // 注意：拿到 lease 后 close 是 deferred — 但对 SetInfo 元数据
+            // 写入路径（`update_metadata`）这会让 server 的 mtime apply
+            // 滞后于后续 QueryDirectory，导致 integrity-check 看到旧值。
+            // 必须在 set_info 之后调 `client.evict_lease` 强制 wire Close。
             default_lease_state: Some(
                 LeaseState::new()
                     .with_read_caching(true)
@@ -428,7 +559,45 @@ impl CifsStorage {
                 StorageError::CifsError(format!("Failed to connect to SMB share \\\\{host}:{port}/{share}: {e}"))
             })?;
 
-        let effective_block_size = block_size.unwrap_or(DEFAULT_BLOCK_SIZE).min(DEFAULT_BLOCK_SIZE);
+        // 从 SMB Negotiate Response 读取 server 协商上限。这些值在 share_connect 内部
+        // 已完成 Negotiate 后即就绪，无需任何额外网络往返。
+        let server_addr = format!("{host}:{port}");
+        let conn = client.get_connection(&server_addr).await.map_err(|e| {
+            StorageError::CifsError(format!("Failed to get connection for {server_addr}: {e}"))
+        })?;
+        let conn_info = conn.conn_info().ok_or_else(|| {
+            StorageError::CifsError(format!("SMB negotiation info unavailable for {server_addr}"))
+        })?;
+        let nego = &conn_info.negotiation;
+        // SMB read 与 write 上限可能不同，取较小值作为安全统一块大小。
+        let server_max = u64::from(std::cmp::min(nego.max_read_size, nego.max_write_size));
+
+        // 用户未配置则用 DEFAULT，配置了就用用户值；最终再取 `min(_, server_max)`
+        // 保证不超过服务端能接受的单次读写上限。
+        // 注意：与旧实现的差异 —— 不再无条件 `.min(DEFAULT_BLOCK_SIZE)` 压回，
+        // 用户配置 > 默认且 server 支持更大时，效益直接体现在更大的块上。
+        let requested = block_size.unwrap_or(DEFAULT_BLOCK_SIZE);
+        let effective_block_size = std::cmp::min(requested, server_max).max(1);
+        // 协商日志：server 端能力直接输出，便于判断是否开 multi-channel / lease / encryption
+        // 等下一步优化。这些值都来自 NEGOTIATE 响应，零额外网络开销。
+        info!(
+            "CIFS \\\\{host}:{port}/{share} negotiated: max_read={}, max_write={}, max_transact={}, \
+             dialect={:?}, multi_channel={}, leasing={}, directory_leasing={}, encryption={}, \
+             large_mtu={}, dfs={}, persistent_handles={}; effective block_size={} (requested={})",
+            nego.max_read_size,
+            nego.max_write_size,
+            nego.max_transact_size,
+            nego.dialect_rev,
+            nego.caps.multi_channel(),
+            nego.caps.leasing(),
+            nego.caps.directory_leasing(),
+            nego.caps.encryption(),
+            nego.caps.large_mtu(),
+            nego.caps.dfs(),
+            nego.caps.persistent_handles(),
+            effective_block_size,
+            requested
+        );
 
         Ok(CifsStorage {
             client: Arc::new(client),
@@ -440,6 +609,7 @@ impl CifsStorage {
             dir_info_class: Arc::new(OnceCell::new()),
             file_id_class: Arc::new(OnceCell::new()),
             file_id_probe_lock: Arc::new(Mutex::new(())),
+            dir_exists_cache: Arc::new(DirExistsCache::new()),
         })
     }
 
@@ -672,17 +842,26 @@ impl CifsStorage {
             )));
         };
 
-        let mut buf = vec![0u8; size as usize];
-        let bytes_read = file
-            .read_at(&mut buf, 0)
+        // 零拷贝读路径，避免分配并 zeroize `vec![0; size]` 再 `copy_from_slice`。
+        // 当 size > server `max_read_size` 时单次只读到 server 上限，与旧 `read_at` 行为一致；
+        // 调用方负责对小文件场景使用本函数（大文件请走 [`read_data`] 流式接口）。
+        //
+        // u32 边界：caller (`storage_enum` copy path) 已通过 `size <= block_size` 守门，
+        // 而 `block_size` 在 `connect_only` 中 `min(_, server_max <= u32::MAX)` 后存储 ——
+        // 此处再做显式 try_from 是为了把未来的不变量违反变成 fail-loud 而非静默截断。
+        let read_len = u32::try_from(size).map_err(|_| {
+            StorageError::CifsError(format!(
+                "read_file size {size} exceeds u32::MAX for {} — use streaming read_data instead",
+                path.display()
+            ))
+        })?;
+        let data = file
+            .read_block_bytes(read_len, 0, None, false)
             .await
             .map_err(|e| StorageError::CifsError(format!("Failed to read file {}: {e}", path.display())))?;
 
-        buf.truncate(bytes_read);
         let _ = file.close().await;
-
-        // Vec<u8> → Bytes 零拷贝转移所有权
-        Ok(Bytes::from(buf))
+        Ok(data)
     }
 
     /// 多块流式读取文件，通过 channel 发送 `DataChunk`
@@ -696,6 +875,14 @@ impl CifsStorage {
         }
 
         let chunk_size = self.calculate_chunk_size(size);
+        // 不变量：`chunk_size ≤ block_size`，而 `block_size` 在 `connect_only` 中已
+        // `min(_, u64::from(server_max))` clamp，必在 `u32::MAX` 内。提前在 file open
+        // 之前验证：若未来 block_size 失约束，立即报错且不泄漏 SMB handle。
+        if u32::try_from(chunk_size).is_err() {
+            return Err(StorageError::CifsError(format!(
+                "chunk_size {chunk_size} exceeds u32::MAX (block_size invariant violation)"
+            )));
+        }
         trace!(
             "Starting CIFS read_data for file {:?}, size: {}, chunk_size: {}",
             relative_path, size, chunk_size
@@ -715,49 +902,85 @@ impl CifsStorage {
             )));
         };
 
-        let mut offset = 0u64;
         let mut hasher = create_hash_calculator(enable_integrity_check);
 
+        // ── inflight read pipeline ──────────────────────────────────────────────
+        // 模型：维持最多 DEFAULT_READ_INFLIGHT 个 read_block_bytes 同时在飞。
+        // 用 FuturesOrdered 保证 send 到下游 channel 的 offset 严格升序（hasher
+        // 必须按 offset 顺序 update，否则校验和错；下游 write 端虽然可乱序，但
+        // sender 端保序更稳健）。
+        //
+        // 控制流：
+        // - issue_offset：已发出的总字节数（loop 不变量：issue_offset >= send_offset）。
+        // - send_offset：已通过 channel 送出的总字节数。
+        // - 内层 while 填满 inflight；外层 await 取最早完成的（FIFO）。
+        // - 出错或下游关闭时跳出，FuturesOrdered drop 会取消未完成的 future。
+        type ReadFut<'a> = Pin<Box<dyn Future<Output = std::io::Result<Bytes>> + Send + 'a>>;
+        let mut inflight: FuturesOrdered<ReadFut<'_>> = FuturesOrdered::new();
+        let mut issue_offset: u64 = 0;
+        let mut send_offset: u64 = 0;
+        // 读失败必须上抛 —— `Cancelled` 才是"静默结束"，IO 错误是真错误，
+        // 让上游 retry 引擎决策（见 .claude/docs/error-taxonomy.md）。
+        // 借用 `&file` 仍在 inflight 中，不能直接 `return Err`；先 break + cleanup + close。
+        let mut first_error: Option<StorageError> = None;
+
         loop {
-            if let Some(ref qos) = qos {
-                qos.acquire(chunk_size).await;
+            // 填满 inflight，直到达到深度上限或所有字节已发出。
+            while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < size {
+                if let Some(ref qos) = qos {
+                    qos.acquire(chunk_size).await;
+                }
+                let want = std::cmp::min(chunk_size, size - issue_offset);
+                // `want ≤ chunk_size ≤ u32::MAX`（函数入口已断言）→ cast 无截断风险。
+                #[allow(clippy::cast_possible_truncation)]
+                let read_len = want as u32;
+                let fut = Box::pin(file.read_block_bytes(read_len, issue_offset, None, false));
+                inflight.push_back(fut);
+                issue_offset += want;
             }
 
-            let read_size = std::cmp::min(chunk_size, size - offset) as usize;
-            let mut buf = vec![0u8; read_size];
-
-            let bytes_read = match file.read_at(&mut buf, offset).await {
-                Ok(n) => n,
+            // 全部读完且 inflight 已空 → 结束。
+            let Some(result) = inflight.next().await else {
+                break;
+            };
+            let data = match result {
+                Ok(b) => b,
                 Err(e) => {
-                    error!("Failed to read data chunk at offset {}: {:?}", offset, e);
+                    error!("Failed to read data chunk at offset {}: {:?}", send_offset, e);
+                    first_error = Some(StorageError::CifsError(format!(
+                        "Failed to read file {} at offset {send_offset}: {e}",
+                        relative_path.display()
+                    )));
                     break;
                 }
             };
 
+            let bytes_read = data.len();
             if bytes_read == 0 {
                 trace!("Reached end of file {:?}", relative_path);
                 break;
             }
 
-            buf.truncate(bytes_read);
-            let data = Bytes::from(buf);
-
             if let Some(ref mut h) = hasher {
                 h.update(&data);
             }
 
-            if tx.send(DataChunk { offset, data }).await.is_err() {
-                error!("Data channel closed for file {:?}", relative_path);
+            if tx.send(DataChunk { offset: send_offset, data }).await.is_err() {
+                // 下游 receiver 关闭：视为协作取消信号（与旧实现一致），不当读错误。
+                trace!("Data channel closed for file {:?}", relative_path);
                 break;
             }
 
-            offset += bytes_read as u64;
-            if offset >= size {
-                break;
-            }
+            send_offset += bytes_read as u64;
         }
 
+        // FuturesOrdered drop 会取消未 await 的 inflight；smb-rs 响应到达后丢弃。
+        drop(inflight);
         let _ = file.close().await;
+
+        if let Some(e) = first_error {
+            return Err(e);
+        }
         Ok(hasher)
     }
 
@@ -834,7 +1057,9 @@ impl CifsStorage {
             )));
         };
 
-        file.write_at(&data, 0)
+        // 零拷贝写路径：`Bytes` 直接 move 到 OutgoingMessage.additional_data，
+        // 省掉 `write_at` 内部的 `Bytes::copy_from_slice(buf)` 一次 size 大小 memcpy。
+        file.write_block_zc(data, 0, None)
             .await
             .map_err(|e| StorageError::CifsError(format!("Failed to write file {}: {e}", path.display())))?;
 
@@ -870,20 +1095,93 @@ impl CifsStorage {
             )));
         };
 
-        let mut reader = rx;
-        while let Some(chunk) = reader.recv().await {
-            let len = chunk.data.len() as u64;
-            file.write_at(&chunk.data, chunk.offset).await.map_err(|e| {
-                StorageError::CifsError(format!("Failed to write data at offset {}: {e}", chunk.offset))
-            })?;
+        // ── inflight write pipeline ─────────────────────────────────────────────
+        // 模型：维持最多 DEFAULT_WRITE_INFLIGHT 个 write_block_zc 同时在飞。
+        // 用 FuturesUnordered（不保序）—— write 端 server 各 offset 独立处理，
+        // 完成顺序与 issue 顺序无关；bytes_counter 是累加只看总量，不依赖顺序。
+        //
+        // 错误处理：drain 模式 —— 任意 inflight 报错时记录首个 error，继续 drain
+        // 完所有 inflight 后再返回，保证文件 close 路径正确执行。
+        type WriteFut<'a> = Pin<Box<dyn Future<Output = (u64, std::io::Result<usize>)> + Send + 'a>>;
+        let mut inflight: FuturesUnordered<WriteFut<'_>> = FuturesUnordered::new();
+        let mut first_error: Option<StorageError> = None;
 
-            if let Some(ref c) = bytes_counter {
-                c.fetch_add(len, Ordering::Relaxed);
+        let mut reader = rx;
+        loop {
+            // 接 chunk 之前若 inflight 已满，先 await 一个完成的释放槽位。
+            if inflight.len() >= DEFAULT_WRITE_INFLIGHT
+                && let Some((len, result)) = inflight.next().await
+            {
+                match result {
+                    Ok(_) => {
+                        if let Some(ref c) = bytes_counter {
+                            c.fetch_add(len, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(StorageError::CifsError(format!("Failed to write data: {e}")));
+                            // 通知 sender 立即停止：`reader.close()` 让后续 tx.send().await
+                            // 返回 SendError，sender 可早退，避免继续 read source 浪费 IO。
+                            // 已缓冲的 chunk 仍会 drain 完（用于 fall-through 到 channel-empty 退出）。
+                            reader.close();
+                        }
+                    }
+                }
+            }
+
+            // 取下一个 chunk；channel 关闭说明上游读完（或上面手动 close）。
+            let Some(chunk) = reader.recv().await else {
+                break;
+            };
+            let DataChunk { offset, data } = chunk;
+            let len = data.len() as u64;
+
+            // 出错后丢弃残留 buffered chunk（reader 已被 close，sender 不会再 push 新的）。
+            if first_error.is_some() {
+                continue;
+            }
+
+            // 借用 file 派发请求；Pin<Box<...> + '_> 生命周期与 file 一致。
+            // write_block_zc 是零拷贝（`Bytes` move 进 OutgoingMessage.additional_data）。
+            // 显式拿 `&file`：`async move` 会 move 块内引用的所有局部变量，把 `file_ref`
+            // 单独取出后 move 的只是引用（`&File` 是 Copy），原 file 留在外层 scope 供下次迭代。
+            let file_ref: &smb::File = &file;
+            let fut = Box::pin(async move {
+                let res = file_ref.write_block_zc(data, offset, None).await;
+                (len, res)
+            });
+            inflight.push(fut);
+        }
+
+        // Drain 剩余 inflight。
+        // bytes_counter 语义：操作成功路径上的 wire-acked 字节。`first_error` 已置位时
+        // 整个 write_data 会返回 Err，上游可能重试整文件 —— 若此处继续累加，drain 中
+        // 成功完成的 chunk 字节会被双计数。drain 中的成功 chunk 视作"在已失败的操作
+        // 中恰好被 server 接受"，不计入有效进度。
+        while let Some((len, result)) = inflight.next().await {
+            match result {
+                Ok(_) => {
+                    if first_error.is_none()
+                        && let Some(ref c) = bytes_counter
+                    {
+                        c.fetch_add(len, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(StorageError::CifsError(format!("Failed to write data: {e}")));
+                    }
+                }
             }
         }
 
         let _ = file.close().await;
         trace!("Finished CIFS write_data for file {:?}", relative_path);
+
+        if let Some(e) = first_error {
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -892,11 +1190,17 @@ impl CifsStorage {
     // ========================================================================
 
     /// 递归创建目录（逐级）
+    ///
+    /// 命中 `dir_exists_cache` 的层级直接跳过网络往返；mkdir 成功或
+    /// 服务端返回 `STATUS_OBJECT_NAME_COLLISION` 后把路径插入 cache。
     pub async fn create_dir_all(&self, relative_path: &Path) -> Result<()> {
         debug!("CIFS create_dir_all: {:?}", relative_path);
 
         let path_str = relative_path.to_string_lossy().replace('\\', "/");
         let components: Vec<&str> = path_str.split('/').filter(|s| !s.is_empty()).collect();
+        if components.is_empty() {
+            return Ok(());
+        }
 
         let mut current = String::new();
         for component in components {
@@ -905,24 +1209,44 @@ impl CifsStorage {
             } else {
                 current = format!("{current}/{component}");
             }
+            // 单层命中则跳过该层 RT；未命中走 mkdir_or_open 并缓存。
+            // 整路径命中等价于每层都命中：循环就是 N 次 RwLock::read + BTreeSet::contains，
+            // 与单独 short-circuit 整路径相比开销可忽略，但避免了路径 normalize 不一致的边界。
+            if self.dir_exists_cache.contains(&current) {
+                continue;
+            }
             let unc = self.build_unc_path(Path::new(&current));
             self.mkdir_or_open(&unc, &current).await?;
+            self.dir_exists_cache.insert(current.clone());
         }
         Ok(())
     }
 
+    /// 驱逐目录存在性缓存：清除 `relative_path` 自身条目以及所有以 `relative_path/`
+    /// 为前缀的子条目。调用时机：delete / rename / 任何使 cache 与真实状态不一致的操作。
+    fn invalidate_dir_cache_path(&self, relative_path: &Path) {
+        self.dir_exists_cache.invalidate_path(relative_path);
+    }
+
     /// 删除文件或目录
     ///
-    /// 通过 `set_info<FileDispositionInformation>` 标记删除，关闭时生效
+    /// 通过 `set_info<FileDispositionInformation>` 标记删除，关闭时生效。
+    /// 不区分文件/目录：均在网络操作前驱逐 `dir_exists_cache`，避免误把已删除的
+    /// 目录残留在缓存中导致后续 `create_dir_all` 跳过实际不存在的层级。
     pub async fn delete_file(&self, relative_path: &Path) -> Result<()> {
         trace!("CIFS removing file {:?}", relative_path);
+
+        // 驱逐放在请求前：即使 delete 失败，cache 失效不会造成多余风险（最多触发一次
+        // 真实 mkdir / open 探测，行为正确）。
+        self.invalidate_dir_cache_path(relative_path);
 
         let unc = self.build_unc_path(relative_path);
 
         // Phase D: 删除前必须先 evict_lease——否则 smb-rs 端 lease_table 里
         // 缓存的 FileId 在 server 删除路径后立刻失效，下一次 create_file 命中
         // 缓存会拿到 stale FileId 并报 STATUS_FILE_CLOSED。evict 是幂等的，
-        // 没有 lease 时 cheap no-op。
+        // 没有 lease 时 cheap no-op；保险起见放在 dir_cache 驱逐之后，open
+        // 之前，确保删除的 open 拿到的是新 FileId 而不是缓存项。
         let _ = self.client.evict_lease(&unc).await;
 
         // 打开文件并标记为删除
@@ -1072,6 +1396,9 @@ impl CifsStorage {
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         trace!("CIFS rename {:?} to {:?}", from, to);
 
+        // 源路径搬走后老条目不再有效，先驱逐 cache 防止后续误判存在。
+        self.invalidate_dir_cache_path(from);
+
         // 确保目标父目录存在
         if let Some(parent) = to.parent()
             && !parent.as_os_str().is_empty()
@@ -1090,6 +1417,14 @@ impl CifsStorage {
         let _ = self.client.evict_lease(&from_unc).await;
         let _ = self.client.evict_lease(&to_unc_for_evict).await;
         let to_unc = self.build_unc_path(to);
+
+        // Phase D: rename 同时使 `from` 与 `to` 路径的 lease 缓存失效。
+        // `from` 的 FileId 在 rename 后指向已搬走的文件名，下次 create_file
+        // 命中缓存会得到 stale FileId；`to` 之前若存在同名 lease（被
+        // replace_if_exists 覆盖）也必须 evict。两次 evict 都幂等，无 lease 时
+        // 是 cheap no-op。
+        let _ = self.client.evict_lease(&from_unc).await;
+        let _ = self.client.evict_lease(&to_unc).await;
         // FileRenameInformation.file_name 必须是相对于 share 根的路径（反斜杠分隔），
         // 不能是完整 UNC（`\\host\share\...`）。否则 SMB 服务端返回 `Object Name Invalid (0xc0000033)`。
         let to_path_str = to_unc.path().unwrap_or("").to_string();
@@ -2255,5 +2590,152 @@ mod tests {
         assert_eq!(smb_attributes_to_mode(true, true), 0o555);
         assert_eq!(smb_attributes_to_mode(false, false), 0o644);
         assert_eq!(smb_attributes_to_mode(false, true), 0o444);
+    }
+
+    // ── dir_exists_cache invalidation ───────────────────────────────────────
+    //
+    // 验证 `create_dir_all` 缓存的失效语义：前缀剪枝必须精准，避免误删兄弟
+    // 目录（"a/b" vs "a/bb"）或错过子树（"a/b" 在删时未带 "a/b/c"）。
+
+    fn make_cache(entries: &[&str]) -> DirExistsCache {
+        let cache = DirExistsCache::new();
+        for e in entries {
+            cache.insert((*e).to_string());
+        }
+        cache
+    }
+
+    #[test]
+    fn test_dir_cache_invalidate_empty_path_is_noop() {
+        let cache = make_cache(&["a", "a/b", "x"]);
+        cache.invalidate("");
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn test_dir_cache_invalidate_exact_match_removes_only_self() {
+        // "a/b" 删除时不能误删兄弟 "a/bb" 或父 "a"。
+        let cache = make_cache(&["a", "a/b", "a/bb", "a/b/c"]);
+        cache.invalidate("a/b");
+        assert!(cache.contains("a"));
+        assert!(cache.contains("a/bb"));
+        assert!(!cache.contains("a/b"));
+        assert!(!cache.contains("a/b/c"));
+    }
+
+    #[test]
+    fn test_dir_cache_invalidate_removes_full_subtree() {
+        // 删 "logs/2024/01" 必须级联删所有更深层。
+        let cache = make_cache(&[
+            "logs",
+            "logs/2024",
+            "logs/2024/01",
+            "logs/2024/01/15",
+            "logs/2024/01/15/data",
+            "logs/2024/02",
+        ]);
+        cache.invalidate("logs/2024/01");
+        assert!(cache.contains("logs"));
+        assert!(cache.contains("logs/2024"));
+        assert!(cache.contains("logs/2024/02"));
+        assert!(!cache.contains("logs/2024/01"));
+        assert!(!cache.contains("logs/2024/01/15"));
+        assert!(!cache.contains("logs/2024/01/15/data"));
+    }
+
+    #[test]
+    fn test_dir_cache_invalidate_no_partial_prefix_match() {
+        // "ab" 是 "abc" 的 byte 前缀但不是路径前缀，不应误删。
+        let cache = make_cache(&["ab", "abc", "ab/c"]);
+        cache.invalidate("ab");
+        assert!(cache.contains("abc")); // 不带 '/' 分隔，保留
+        assert!(!cache.contains("ab"));
+        assert!(!cache.contains("ab/c")); // "ab/" 前缀，正确删除
+    }
+
+    #[test]
+    fn test_dir_cache_invalidate_path_normalizes_backslash() {
+        // Windows 路径 backslash 必须归一为 '/' 才能匹配 cache key (cache 全用 '/')。
+        let cache = make_cache(&["a/b", "a/b/c"]);
+        cache.invalidate_path(Path::new(r"a\b"));
+        assert!(!cache.contains("a/b"));
+        assert!(!cache.contains("a/b/c"));
+    }
+
+    #[test]
+    fn test_dir_cache_invalidate_path_trims_leading_slash() {
+        // `/a/b` 与 `a/b` 应视为同一路径。
+        let cache = make_cache(&["a/b", "a/b/c", "a/bb"]);
+        cache.invalidate_path(Path::new("/a/b/"));
+        assert!(cache.contains("a/bb"));
+        assert!(!cache.contains("a/b"));
+        assert!(!cache.contains("a/b/c"));
+    }
+
+    #[test]
+    fn test_dir_cache_invalidate_path_empty_is_noop() {
+        let cache = make_cache(&["a", "a/b"]);
+        cache.invalidate_path(Path::new(""));
+        assert_eq!(cache.len(), 2);
+        // 只含分隔符的路径 trim 后为空，也应是 no-op，避免清空全表。
+        cache.invalidate_path(Path::new("///"));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_dir_cache_invalidate_with_nul_byte_boundary() {
+        // 边界回归：`\0` 字节 (0x00) < `/` (0x2F)，BTreeSet 排序时 `"a/b\0"` 会
+        // 插到 `"a/b"` 和 `"a/b/x"` 之间。若 `take_while` 用 `self_or_starts_with(prefix)`
+        // 单条件判断，遇到 `"a/b\0..."` 会提前终止 → 遗漏后续真实命中。
+        // 此 test 锁定 `take_while(starts_with(path))` + `filter` 双层结构的正确性。
+        let cache = make_cache(&["a/b", "a/b\0weird", "a/b/x", "a/b/y", "a/c"]);
+        cache.invalidate("a/b");
+        assert!(!cache.contains("a/b"));
+        assert!(!cache.contains("a/b/x"));
+        assert!(!cache.contains("a/b/y"));
+        // `"a/b\0weird"` 不是 "a/b/..." 子条目（中间是 \0 不是 /），不应被删。
+        assert!(cache.contains("a/b\0weird"));
+        // 兄弟保留。
+        assert!(cache.contains("a/c"));
+    }
+
+    #[test]
+    fn test_dir_cache_insert_respects_size_cap() {
+        // L1 回归：满载后 insert 不再增长，行为退化为"无 cache" (mkdir 幂等)。
+        // 用 with_cap(3) 模拟满载；invalidate 后 len 回落，新 insert 又可登记。
+        let cache = DirExistsCache::with_cap(3);
+        cache.insert("a".into());
+        cache.insert("a/b".into());
+        cache.insert("a/b/c".into());
+        assert_eq!(cache.len(), 3);
+
+        // 满载：第 4 条静默丢弃。
+        cache.insert("d".into());
+        assert_eq!(cache.len(), 3);
+        assert!(!cache.contains("d"));
+
+        // invalidate 后腾出空间，新条目可登记。
+        cache.invalidate("a/b");  // 删 "a/b" 和 "a/b/c"
+        assert_eq!(cache.len(), 1);
+        cache.insert("d".into());
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains("d"));
+    }
+
+    #[test]
+    fn test_dir_cache_invalidate_large_subtree_keeps_unrelated() {
+        // 性能 + 正确性回归：插入 10_000 条共同前缀 + 100 条无关路径，
+        // invalidate("prefix") 后前者全清、后者全留。主要验证前缀范围
+        // 在大规模数据下不会"溢出"扫到无关条目。
+        let mut entries: Vec<String> = (0..10_000).map(|i| format!("prefix/sub_{i:05}")).collect();
+        entries.extend((0..100).map(|i| format!("other_{i:03}")));
+        let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let cache = make_cache(&refs);
+        assert_eq!(cache.len(), 10_100);
+        cache.invalidate("prefix");
+        assert_eq!(cache.len(), 100);
+        for i in 0..100 {
+            assert!(cache.contains(&format!("other_{i:03}")));
+        }
     }
 }

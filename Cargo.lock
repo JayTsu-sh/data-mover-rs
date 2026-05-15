@@ -1344,6 +1344,7 @@ dependencies = [
  "indicatif",
  "moka",
  "nfs-rs",
+ "parking_lot",
  "path-clean",
  "quick-xml",
  "rayon",
