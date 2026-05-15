@@ -1198,36 +1198,24 @@ impl CifsStorage {
 
         let unc = self.build_unc_path(relative_path);
 
-        // Phase D fix: evict any deferred-close handle that an earlier
-        // `write_file` left behind for the same path. The lease grant
-        // (HandleCaching) keeps the wire Close pending, and on some
-        // servers (NetApp + Samba observed) the un-closed write handle
-        // shadows our subsequent SetInfo's mtime — QueryDirectory keeps
-        // returning the data-write timestamp, so integrity-check fires
-        // an mtime mismatch. evict_lease forces the old handle through
-        // its wire Close before we open a fresh one to SetInfo.
+        // Phase D fix retained: evict any deferred-close handle that an
+        // earlier `write_file` left behind for the same path. The lease
+        // grant (HandleCaching) keeps the wire Close pending, and on
+        // some servers (NetApp + Samba observed) the un-closed write
+        // handle's sticky LastWriteTime shadows our SetInfo's value
+        // until that handle finally closes — integrity-check would
+        // then see stale mtime. evict_lease forces the old handle
+        // through its wire Close before we issue the compound.
         let _ = self.client.evict_lease(&unc).await;
 
-        // P2.a：只请求 FILE_WRITE_ATTRIBUTES 这一项最小权限即可（MS-SMB2
-        // 2.2.13.1.1）。比 generic_write+generic_read 范围窄 → server 端
-        // ACL 检查通过率更高，且不再开 read 二次 handle。
-        let args =
-            FileCreateArgs::make_open_existing(FileAccessMask::new().with_file_write_attributes(true));
-
-        let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
-            StorageError::CifsError(format!(
-                "Failed to open {} for metadata update: {e}",
-                relative_path.display()
-            ))
-        })?;
-
-        // P2.a: 跳过 query_info，按 MS-FSCC 2.4.7 协议直接构造
-        // FileBasicInformation。语义：
-        // - FileTime == 0 → server 保留该字段当前值不变
-        // - FileAttributes == 0 → server 保留属性位不变
-        // 我们只关心 atime/mtime，creation_time / change_time / attrs 保留
-        // server 现状。消除 update_metadata 路径上的 open(read) + QueryInfo
-        // 共 2 个 wire RT/file。10.131.7.203 实测 integrity-check pass。
+        // P2.a + P2.b combined: build FileBasicInformation per
+        // MS-FSCC 2.4.7 (0 = "preserve current value on server"), then
+        // send Create + SetInfo + Close as one SMB2 compound chain.
+        //
+        // RT path from baseline to here:
+        //   pre-P2.a: open + open(read) + query_info + set_info + close*2 = 6 RT
+        //   P2.a:     evict-front + open + set_info + close + evict-back   = 4 RT
+        //   P2.b:     evict-front + compound(create+setinfo+close)         = 2 RT
         let basic = FileBasicInformation {
             creation_time: FileTime::default(),
             last_access_time: atime.map(nanos_to_filetime).unwrap_or_default(),
@@ -1236,30 +1224,19 @@ impl CifsStorage {
             file_attributes: FileAttributes::default(),
         };
 
-        match &resource {
-            Resource::File(f) => {
-                f.set_info(basic)
-                    .await
-                    .map_err(|e| StorageError::CifsError(format!("Failed to set metadata: {e}")))?;
-                let _ = f.close().await;
-            }
-            Resource::Directory(d) => {
-                d.set_info(basic)
-                    .await
-                    .map_err(|e| StorageError::CifsError(format!("Failed to set metadata: {e}")))?;
-                let _ = d.close().await;
-            }
-            Resource::Pipe(_) => {}
-        }
+        self.client
+            .compound_set_basic_info(&unc, basic)
+            .await
+            .map_err(|e| {
+                StorageError::CifsError(format!(
+                    "Failed to compound set basic info for {}: {e}",
+                    relative_path.display()
+                ))
+            })?;
 
-        // Phase D fix: also evict at the end. The above close() goes
-        // through the lease's deferred-close path, so the SetInfo we
-        // just sent isn't committed to the on-disk view until the
-        // wire Close fires. Without this, the very-next walkdir on
-        // dest (e.g. integrity-check immediately after sync) reads
-        // stale mtime from QueryDirectory.
-        let _ = self.client.evict_lease(&unc).await;
-
+        // No "evict-back" needed — compound's Close is part of the wire
+        // chain, so the SetInfo's mtime is committed to disk before
+        // this function returns. No deferred handle stays behind.
         Ok(())
     }
 
