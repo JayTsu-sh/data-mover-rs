@@ -3515,9 +3515,10 @@ mod tests {
 
     // --- get_file_info 测试 ---
 
+    // `S3Storage::get_file_info` is a static method, no instance needed.
+
     #[test]
     fn test_get_file_info_with_extension() {
-        let storage = make_test_storage(None);
         let (name, ext) = S3Storage::get_file_info("dir/file.txt");
         assert_eq!(name, "file.txt");
         assert_eq!(ext, Some("txt".to_string()));
@@ -3525,7 +3526,6 @@ mod tests {
 
     #[test]
     fn test_get_file_info_without_extension() {
-        let storage = make_test_storage(None);
         let (name, ext) = S3Storage::get_file_info("dir/file");
         assert_eq!(name, "file");
         assert_eq!(ext, None);
@@ -3533,7 +3533,6 @@ mod tests {
 
     #[test]
     fn test_get_file_info_compound_extension() {
-        let storage = make_test_storage(None);
         let (name, ext) = S3Storage::get_file_info("file.tar.gz");
         assert_eq!(name, "file.tar.gz");
         assert_eq!(ext, Some("gz".to_string()));
@@ -3541,7 +3540,6 @@ mod tests {
 
     #[test]
     fn test_get_file_info_root_level() {
-        let storage = make_test_storage(None);
         let (name, ext) = S3Storage::get_file_info("readme.md");
         assert_eq!(name, "readme.md");
         assert_eq!(ext, Some("md".to_string()));

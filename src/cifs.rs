@@ -18,8 +18,8 @@ use smb::{
     ACE, ACL, AclRevision, AdditionalInfo, Client, ClientConfig, ConnectionConfig,
     CreateDisposition, CreateOptions, FileAccessMask, FileAttributes, FileBasicInformation,
     FileCreateArgs, FileIdExtdDirectoryInformation, FileIdFullDirectoryInformation,
-    FileIdInformation, FileInternalInformation, FileStandardInformation, LeaseState, ReadAt,
-    Resource, ResourceHandle, SecurityDescriptor, UncPath, WriteAt,
+    FileIdInformation, FileInternalInformation, FileStandardInformation, LeaseState, Resource,
+    ResourceHandle, SecurityDescriptor, UncPath,
 };
 use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, trace, warn};
