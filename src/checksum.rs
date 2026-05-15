@@ -1,4 +1,3 @@
-
 use blake3::Hasher;
 use tracing::debug;
 
@@ -49,7 +48,9 @@ impl Default for HashCalculator {
 
 impl HashCalculator {
     pub fn new() -> Self {
-        Self { hasher: Hasher::new() }
+        Self {
+            hasher: Hasher::new(),
+        }
     }
 }
 

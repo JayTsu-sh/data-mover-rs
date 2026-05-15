@@ -60,13 +60,25 @@ enum ModifiedValue {
 /// 3. 最后处理无匹配表达式的情况
 #[allow(clippy::too_many_arguments)]
 pub fn should_skip(
-    match_expressions: Option<&FilterExpression>, exclude_expressions: Option<&FilterExpression>,
-    file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>, modified_epoch: Option<i64>,
-    size: Option<u64>, extension: Option<&str>,
+    match_expressions: Option<&FilterExpression>,
+    exclude_expressions: Option<&FilterExpression>,
+    file_name: Option<&str>,
+    file_path: Option<&str>,
+    file_type: Option<&str>,
+    modified_epoch: Option<i64>,
+    size: Option<u64>,
+    extension: Option<&str>,
 ) -> (bool, bool, bool) {
     trace!(
         "[filter::should_skip:FILTER-ENTRY] 开始检查: 匹配表达式= {:?}, 排除表达式={:?}, name={:?}, path={:?}, type={:?}, modified_epoch={:?}, size={:?}, extension={:?}",
-        match_expressions, exclude_expressions, file_name, file_path, file_type, modified_epoch, size, extension
+        match_expressions,
+        exclude_expressions,
+        file_name,
+        file_path,
+        file_type,
+        modified_epoch,
+        size,
+        extension
     );
 
     // 预计算 now_epoch，避免在 evaluate 中重复调用 SystemTime::now()
@@ -186,7 +198,8 @@ pub fn should_skip(
                 // Always continue scanning for partial matches if it's a directory
                 return (true, is_dir, true);
             }
-            MatchResult::LazyMatch => { /* 过滤表达式没有白名单适用条件，继续后续流程 */ }
+            MatchResult::LazyMatch => { /* 过滤表达式没有白名单适用条件，继续后续流程 */
+            }
         }
     }
 
@@ -202,7 +215,10 @@ pub fn should_skip(
 ///
 /// 仅在 packaged 模式下由 walkdir 调用。如果 `match_expressions` 为 None 或不包含
 /// `DirDate` 条件，返回 false。
-pub fn dir_matches_date_filter(match_expressions: Option<&FilterExpression>, dir_name: &str) -> bool {
+pub fn dir_matches_date_filter(
+    match_expressions: Option<&FilterExpression>,
+    dir_name: &str,
+) -> bool {
     match match_expressions {
         Some(expr) => expr.has_matching_dir_date(dir_name),
         None => false,
@@ -241,7 +257,12 @@ pub struct FilterFieldDef {
 }
 
 const GLOB_OPS: &[(&str, &str)] = &[("==", "匹配"), ("!=", "不匹配")];
-const CMP_OPS: &[(&str, &str)] = &[(">", "大于"), ("<", "小于"), (">=", "大于等于"), ("<=", "小于等于")];
+const CMP_OPS: &[(&str, &str)] = &[
+    (">", "大于"),
+    ("<", "小于"),
+    (">=", "大于等于"),
+    ("<=", "小于等于"),
+];
 const ALL_OPS: &[(&str, &str)] = &[
     ("==", "等于"),
     ("!=", "不等于"),
@@ -316,8 +337,14 @@ pub fn get_filter_field_definitions() -> Vec<FilterFieldDef> {
 /// 评估过滤表达式的辅助函数
 #[allow(clippy::too_many_arguments)]
 fn evaluate_filter(
-    expr: &FilterExpression, file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>,
-    modified_epoch: Option<i64>, size: Option<u64>, extension: Option<&str>, now_epoch: i64,
+    expr: &FilterExpression,
+    file_name: Option<&str>,
+    file_path: Option<&str>,
+    file_type: Option<&str>,
+    modified_epoch: Option<i64>,
+    size: Option<u64>,
+    extension: Option<&str>,
+    now_epoch: i64,
 ) -> MatchResult {
     expr.evaluate(
         file_name,
@@ -334,7 +361,10 @@ fn evaluate_filter(
 #[derive(Debug, Clone)]
 enum FilterCondition {
     /// Name matching with precompiled glob pattern
-    Name { operator: CompareOp, pattern: Pattern },
+    Name {
+        operator: CompareOp,
+        pattern: Pattern,
+    },
 
     /// Path matching with precompiled pattern and metadata
     Path {
@@ -354,13 +384,19 @@ enum FilterCondition {
     },
 
     /// Modification time
-    Modified { operator: CompareOp, value: ModifiedValue },
+    Modified {
+        operator: CompareOp,
+        value: ModifiedValue,
+    },
 
     /// File size (bytes)
     Size { operator: CompareOp, value: u64 },
 
     /// Extension matching with precompiled glob pattern
-    Extension { operator: CompareOp, pattern: Pattern },
+    Extension {
+        operator: CompareOp,
+        pattern: Pattern,
+    },
 
     /// Directory date matching: extracts date from directory name and compares
     DirDate { operator: CompareOp, epoch: i64 },
@@ -410,7 +446,9 @@ impl<'a> Lexer<'a> {
             }
 
             // 处理逻辑运算符
-            if (self.starts_with("and ") || self.peek_rest().starts_with("and)") || self.peek_rest() == "and")
+            if (self.starts_with("and ")
+                || self.peek_rest().starts_with("and)")
+                || self.peek_rest() == "and")
                 && self.position + 3 <= self.input.len()
             {
                 // 检查前面是否有条件或右括号
@@ -424,7 +462,9 @@ impl<'a> Lexer<'a> {
                 }
             }
 
-            if (self.starts_with("or ") || self.peek_rest().starts_with("or)") || self.peek_rest() == "or")
+            if (self.starts_with("or ")
+                || self.peek_rest().starts_with("or)")
+                || self.peek_rest() == "or")
                 && self.position + 2 <= self.input.len()
             {
                 // 检查前面是否有条件或右括号
@@ -497,15 +537,27 @@ impl<'a> Lexer<'a> {
                 }
 
                 // 检查是否到达字符串末尾
-                if self.position + 3 <= self.input.len() && &self.input[self.position..self.position + 3] == "and" {
-                    let next_char = self.input.as_bytes().get(self.position + 3).map(|&b| b as char);
+                if self.position + 3 <= self.input.len()
+                    && &self.input[self.position..self.position + 3] == "and"
+                {
+                    let next_char = self
+                        .input
+                        .as_bytes()
+                        .get(self.position + 3)
+                        .map(|&b| b as char);
                     if next_char.is_none_or(|c| c.is_whitespace() || c == ')') {
                         break;
                     }
                 }
 
-                if self.position + 2 <= self.input.len() && &self.input[self.position..self.position + 2] == "or" {
-                    let next_char = self.input.as_bytes().get(self.position + 2).map(|&b| b as char);
+                if self.position + 2 <= self.input.len()
+                    && &self.input[self.position..self.position + 2] == "or"
+                {
+                    let next_char = self
+                        .input
+                        .as_bytes()
+                        .get(self.position + 2)
+                        .map(|&b| b as char);
                     if next_char.is_none_or(|c| c.is_whitespace() || c == ')') {
                         break;
                     }
@@ -521,7 +573,10 @@ impl<'a> Lexer<'a> {
     }
 
     fn peek(&self) -> char {
-        self.input.as_bytes().get(self.position).map_or('\0', |&b| b as char)
+        self.input
+            .as_bytes()
+            .get(self.position)
+            .map_or('\0', |&b| b as char)
     }
 
     fn peek_rest(&self) -> &str {
@@ -564,14 +619,17 @@ impl<'a> Lexer<'a> {
                 let field = expr[..pos].trim();
                 let value = expr[pos + op.len()..].trim();
 
-                let compare_op = Self::parse_operator(op)
-                    .ok_or_else(|| StorageError::InvalidFilterExpression(format!("Unknown operator: {op}")))?;
+                let compare_op = Self::parse_operator(op).ok_or_else(|| {
+                    StorageError::InvalidFilterExpression(format!("Unknown operator: {op}"))
+                })?;
 
                 match field {
                     "name" => {
                         let value = Self::extract_quoted_value(value, "");
                         let pattern = Pattern::new(&value).map_err(|e| {
-                            StorageError::InvalidFilterExpression(format!("Invalid glob pattern '{value}': {e}"))
+                            StorageError::InvalidFilterExpression(format!(
+                                "Invalid glob pattern '{value}': {e}"
+                            ))
                         })?;
                         return Ok(Some(FilterCondition::Name {
                             operator: compare_op,
@@ -582,7 +640,9 @@ impl<'a> Lexer<'a> {
                         let value = Self::extract_quoted_value(value, "");
                         let raw_value = value.trim_end_matches('/').to_string();
                         let pattern = Pattern::new(&raw_value).map_err(|e| {
-                            StorageError::InvalidFilterExpression(format!("Invalid glob pattern '{raw_value}': {e}",))
+                            StorageError::InvalidFilterExpression(format!(
+                                "Invalid glob pattern '{raw_value}': {e}",
+                            ))
                         })?;
                         let pattern_parts: Vec<String> = raw_value
                             .split('/')
@@ -628,9 +688,9 @@ impl<'a> Lexer<'a> {
                         }));
                     }
                     "size" => {
-                        let value = value
-                            .parse::<u64>()
-                            .map_err(|e| StorageError::InvalidPath(format!("Failed to parse size value: {e}")))?;
+                        let value = value.parse::<u64>().map_err(|e| {
+                            StorageError::InvalidPath(format!("Failed to parse size value: {e}"))
+                        })?;
                         return Ok(Some(FilterCondition::Size {
                             operator: compare_op,
                             value,
@@ -639,7 +699,9 @@ impl<'a> Lexer<'a> {
                     "extension" => {
                         let value = Self::extract_quoted_value(value, "");
                         let pattern = Pattern::new(&value).map_err(|e| {
-                            StorageError::InvalidFilterExpression(format!("Invalid glob pattern '{value}': {e}"))
+                            StorageError::InvalidFilterExpression(format!(
+                                "Invalid glob pattern '{value}': {e}"
+                            ))
                         })?;
                         return Ok(Some(FilterCondition::Extension {
                             operator: compare_op,
@@ -703,17 +765,23 @@ impl<'a> Lexer<'a> {
                     .take_while(|c| c.is_ascii_digit() || *c == '.')
                     .collect();
                 num_str.parse::<f64>().map_err(|e| {
-                    StorageError::InvalidFilterExpression(format!("Failed to parse modified value: {e}"))
+                    StorageError::InvalidFilterExpression(format!(
+                        "Failed to parse modified value: {e}"
+                    ))
                 })?
             } else {
                 unquoted.parse::<f64>().map_err(|e| {
-                    StorageError::InvalidFilterExpression(format!("Failed to parse modified value: {e}"))
+                    StorageError::InvalidFilterExpression(format!(
+                        "Failed to parse modified value: {e}"
+                    ))
                 })?
             }
         } else {
-            unquoted
-                .parse::<f64>()
-                .map_err(|e| StorageError::InvalidFilterExpression(format!("Failed to parse modified value: {e}")))?
+            unquoted.parse::<f64>().map_err(|e| {
+                StorageError::InvalidFilterExpression(format!(
+                    "Failed to parse modified value: {e}"
+                ))
+            })?
         };
 
         // 相对天数不支持 == 操作符
@@ -768,12 +836,12 @@ fn parse_date_to_epoch(s: &str) -> Result<i64> {
         )));
     }
 
-    let year: i64 = date_parts[0]
-        .parse()
-        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid year in date '{s}'")))?;
-    let month: i64 = date_parts[1]
-        .parse()
-        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid month in date '{s}'")))?;
+    let year: i64 = date_parts[0].parse().map_err(|_| {
+        StorageError::InvalidFilterExpression(format!("Invalid year in date '{s}'"))
+    })?;
+    let month: i64 = date_parts[1].parse().map_err(|_| {
+        StorageError::InvalidFilterExpression(format!("Invalid month in date '{s}'"))
+    })?;
     let day: i64 = date_parts[2]
         .parse()
         .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid day in date '{s}'")))?;
@@ -785,15 +853,15 @@ fn parse_date_to_epoch(s: &str) -> Result<i64> {
                 "Invalid time format in '{s}', expected HH:MM:SS"
             )));
         }
-        let h: i64 = time_parts[0]
-            .parse()
-            .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid hour in date '{s}'")))?;
-        let m: i64 = time_parts[1]
-            .parse()
-            .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid minute in date '{s}'")))?;
-        let sec: i64 = time_parts[2]
-            .parse()
-            .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid second in date '{s}'")))?;
+        let h: i64 = time_parts[0].parse().map_err(|_| {
+            StorageError::InvalidFilterExpression(format!("Invalid hour in date '{s}'"))
+        })?;
+        let m: i64 = time_parts[1].parse().map_err(|_| {
+            StorageError::InvalidFilterExpression(format!("Invalid minute in date '{s}'"))
+        })?;
+        let sec: i64 = time_parts[2].parse().map_err(|_| {
+            StorageError::InvalidFilterExpression(format!("Invalid second in date '{s}'"))
+        })?;
         (h, m, sec)
     } else {
         (0, 0, 0)
@@ -810,15 +878,15 @@ fn parse_compact_date_to_epoch(s: &str) -> Result<i64> {
         )));
     }
 
-    let year: i64 = s[..4]
-        .parse()
-        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid year in compact date '{s}'")))?;
-    let month: i64 = s[4..6]
-        .parse()
-        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid month in compact date '{s}'")))?;
-    let day: i64 = s[6..8]
-        .parse()
-        .map_err(|_| StorageError::InvalidFilterExpression(format!("Invalid day in compact date '{s}'")))?;
+    let year: i64 = s[..4].parse().map_err(|_| {
+        StorageError::InvalidFilterExpression(format!("Invalid year in compact date '{s}'"))
+    })?;
+    let month: i64 = s[4..6].parse().map_err(|_| {
+        StorageError::InvalidFilterExpression(format!("Invalid month in compact date '{s}'"))
+    })?;
+    let day: i64 = s[6..8].parse().map_err(|_| {
+        StorageError::InvalidFilterExpression(format!("Invalid day in compact date '{s}'"))
+    })?;
 
     Ok(date_to_epoch(year, month, day, 0, 0, 0))
 }
@@ -948,13 +1016,19 @@ fn parse_dir_date_value(value: &str) -> Result<i64> {
 
     if digit_len == 6 {
         let yy: i64 = unquoted[..2].parse().map_err(|_| {
-            StorageError::InvalidFilterExpression(format!("Invalid dir_date value '{unquoted}': bad year"))
+            StorageError::InvalidFilterExpression(format!(
+                "Invalid dir_date value '{unquoted}': bad year"
+            ))
         })?;
         let mm: i64 = unquoted[2..4].parse().map_err(|_| {
-            StorageError::InvalidFilterExpression(format!("Invalid dir_date value '{unquoted}': bad month"))
+            StorageError::InvalidFilterExpression(format!(
+                "Invalid dir_date value '{unquoted}': bad month"
+            ))
         })?;
         let dd: i64 = unquoted[4..6].parse().map_err(|_| {
-            StorageError::InvalidFilterExpression(format!("Invalid dir_date value '{unquoted}': bad day"))
+            StorageError::InvalidFilterExpression(format!(
+                "Invalid dir_date value '{unquoted}': bad day"
+            ))
         })?;
         if !is_valid_date(mm, dd) {
             return Err(StorageError::InvalidFilterExpression(format!(
@@ -985,7 +1059,10 @@ struct FilterParser {
 
 impl FilterParser {
     fn new(tokens: Vec<Token>) -> Self {
-        FilterParser { tokens, position: 0 }
+        FilterParser {
+            tokens,
+            position: 0,
+        }
     }
 
     fn current_token(&self) -> Option<&Token> {
@@ -1085,7 +1162,10 @@ pub struct FilterExpression {
 impl FilterExpression {
     /// 解析过滤表达式字符串，构建逻辑表达式树
     fn parse(expr: &str) -> Result<Self> {
-        trace!("[FilterExpression::parse] parsing filter expression: {}", expr);
+        trace!(
+            "[FilterExpression::parse] parsing filter expression: {}",
+            expr
+        );
 
         let mut lexer = Lexer::new(expr);
         let tokens = lexer.tokenize()?;
@@ -1103,8 +1183,14 @@ impl FilterExpression {
     /// 评估过滤表达式对文件的匹配情况
     #[allow(clippy::too_many_arguments)]
     fn evaluate(
-        &self, file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>, modified_epoch: Option<i64>,
-        size: Option<u64>, extension: Option<&str>, now_epoch: i64,
+        &self,
+        file_name: Option<&str>,
+        file_path: Option<&str>,
+        file_type: Option<&str>,
+        modified_epoch: Option<i64>,
+        size: Option<u64>,
+        extension: Option<&str>,
+        now_epoch: i64,
     ) -> MatchResult {
         trace!(
             "[FilterExpression::evaluate] evaluating filter expression: {:?}, file_name: {:?}, file_path: {:?}, file_type: {:?}, modified_epoch: {:?}, size: {:?}, extension: {:?}",
@@ -1132,8 +1218,14 @@ impl FilterExpression {
     /// 递归评估过滤表达式树（含短路求值）
     #[allow(clippy::too_many_arguments)]
     fn evaluate_recursive(
-        ast_node: &FilterASTNode, file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>,
-        modified_epoch: Option<i64>, size: Option<u64>, extension: Option<&str>, now_epoch: i64,
+        ast_node: &FilterASTNode,
+        file_name: Option<&str>,
+        file_path: Option<&str>,
+        file_type: Option<&str>,
+        modified_epoch: Option<i64>,
+        size: Option<u64>,
+        extension: Option<&str>,
+        now_epoch: i64,
     ) -> MatchResult {
         match ast_node {
             FilterASTNode::Condition(condition) => Self::evaluate_condition(
@@ -1238,18 +1330,26 @@ impl FilterExpression {
     /// 评估单个过滤条件对文件的匹配情况
     #[allow(clippy::too_many_arguments)]
     fn evaluate_condition(
-        condition: &FilterCondition, file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>,
-        modified_epoch: Option<i64>, size: Option<u64>, extension: Option<&str>, now_epoch: i64,
+        condition: &FilterCondition,
+        file_name: Option<&str>,
+        file_path: Option<&str>,
+        file_type: Option<&str>,
+        modified_epoch: Option<i64>,
+        size: Option<u64>,
+        extension: Option<&str>,
+        now_epoch: i64,
     ) -> MatchResult {
         match condition {
-            FilterCondition::Name { operator, pattern } => file_name.map_or(MatchResult::LazyMatch, |file_name| {
-                let is_match = pattern.matches_with(file_name, GLOB_MATCH_OPTIONS);
-                MatchResult::from_bool(match operator {
-                    CompareOp::Eq => is_match,
-                    CompareOp::Ne => !is_match,
-                    _ => false,
+            FilterCondition::Name { operator, pattern } => {
+                file_name.map_or(MatchResult::LazyMatch, |file_name| {
+                    let is_match = pattern.matches_with(file_name, GLOB_MATCH_OPTIONS);
+                    MatchResult::from_bool(match operator {
+                        CompareOp::Eq => is_match,
+                        CompareOp::Ne => !is_match,
+                        _ => false,
+                    })
                 })
-            }),
+            }
             FilterCondition::Path {
                 operator,
                 raw_value,
@@ -1285,13 +1385,15 @@ impl FilterExpression {
                     _ => MatchResult::MisMatch(MisMatchAddon::Other),
                 }
             }),
-            FilterCondition::Type { operator, value } => file_type.map_or(MatchResult::LazyMatch, |file_type| {
-                MatchResult::from_bool(match operator {
-                    CompareOp::Eq => file_type == value,
-                    CompareOp::Ne => file_type != value,
-                    _ => false,
+            FilterCondition::Type { operator, value } => {
+                file_type.map_or(MatchResult::LazyMatch, |file_type| {
+                    MatchResult::from_bool(match operator {
+                        CompareOp::Eq => file_type == value,
+                        CompareOp::Ne => file_type != value,
+                        _ => false,
+                    })
                 })
-            }),
+            }
             FilterCondition::Modified { operator, value } => {
                 modified_epoch.map_or(MatchResult::LazyMatch, |file_epoch| match value {
                     ModifiedValue::RelativeDays(days) => {
@@ -1316,24 +1418,28 @@ impl FilterExpression {
                     }
                 })
             }
-            FilterCondition::Size { operator, value } => size.map_or(MatchResult::LazyMatch, |size| {
-                MatchResult::from_bool(match operator {
-                    CompareOp::Eq => size == *value,
-                    CompareOp::Lt => size < *value,
-                    CompareOp::Gt => size > *value,
-                    CompareOp::Le => size <= *value,
-                    CompareOp::Ge => size >= *value,
-                    CompareOp::Ne => false,
+            FilterCondition::Size { operator, value } => {
+                size.map_or(MatchResult::LazyMatch, |size| {
+                    MatchResult::from_bool(match operator {
+                        CompareOp::Eq => size == *value,
+                        CompareOp::Lt => size < *value,
+                        CompareOp::Gt => size > *value,
+                        CompareOp::Le => size <= *value,
+                        CompareOp::Ge => size >= *value,
+                        CompareOp::Ne => false,
+                    })
                 })
-            }),
-            FilterCondition::Extension { operator, pattern } => extension.map_or(MatchResult::LazyMatch, |extension| {
-                let is_match = pattern.matches_with(extension, GLOB_MATCH_OPTIONS);
-                MatchResult::from_bool(match operator {
-                    CompareOp::Eq => is_match,
-                    CompareOp::Ne => !is_match,
-                    _ => false,
+            }
+            FilterCondition::Extension { operator, pattern } => {
+                extension.map_or(MatchResult::LazyMatch, |extension| {
+                    let is_match = pattern.matches_with(extension, GLOB_MATCH_OPTIONS);
+                    MatchResult::from_bool(match operator {
+                        CompareOp::Eq => is_match,
+                        CompareOp::Ne => !is_match,
+                        _ => false,
+                    })
                 })
-            }),
+            }
             FilterCondition::DirDate { operator, epoch } => {
                 // 非目录条目：透明通过
                 if file_type != Some("dir") {
@@ -1389,20 +1495,24 @@ impl FilterExpression {
     /// 递归检查 AST 节点中的 `DirDate` 条件是否匹配给定的 `dir_epoch`
     fn check_dir_date_in_node(node: &FilterASTNode, dir_epoch: i64) -> bool {
         match node {
-            FilterASTNode::Condition(FilterCondition::DirDate { operator, epoch }) => match operator {
-                CompareOp::Eq => dir_epoch / 86400 == epoch / 86400,
-                CompareOp::Ne => dir_epoch / 86400 != epoch / 86400,
-                CompareOp::Lt => dir_epoch < *epoch,
-                CompareOp::Gt => dir_epoch > *epoch,
-                CompareOp::Le => dir_epoch <= *epoch,
-                CompareOp::Ge => dir_epoch >= *epoch,
-            },
+            FilterASTNode::Condition(FilterCondition::DirDate { operator, epoch }) => {
+                match operator {
+                    CompareOp::Eq => dir_epoch / 86400 == epoch / 86400,
+                    CompareOp::Ne => dir_epoch / 86400 != epoch / 86400,
+                    CompareOp::Lt => dir_epoch < *epoch,
+                    CompareOp::Gt => dir_epoch > *epoch,
+                    CompareOp::Le => dir_epoch <= *epoch,
+                    CompareOp::Ge => dir_epoch >= *epoch,
+                }
+            }
             FilterASTNode::Condition(_) => false, // 非 DirDate 条件，忽略
             FilterASTNode::And(left, right) => {
-                Self::check_dir_date_in_node(left, dir_epoch) && Self::check_dir_date_in_node(right, dir_epoch)
+                Self::check_dir_date_in_node(left, dir_epoch)
+                    && Self::check_dir_date_in_node(right, dir_epoch)
             }
             FilterASTNode::Or(left, right) => {
-                Self::check_dir_date_in_node(left, dir_epoch) || Self::check_dir_date_in_node(right, dir_epoch)
+                Self::check_dir_date_in_node(left, dir_epoch)
+                    || Self::check_dir_date_in_node(right, dir_epoch)
             }
         }
     }
@@ -1493,21 +1603,29 @@ impl BitAnd for MatchResult {
                 MatchResult::MisMatch(result_addon)
             }
             // 任一操作数为 MisMatch 的情况
-            (MatchResult::MisMatch(addon), _) | (_, MatchResult::MisMatch(addon)) => MatchResult::MisMatch(addon),
+            (MatchResult::MisMatch(addon), _) | (_, MatchResult::MisMatch(addon)) => {
+                MatchResult::MisMatch(addon)
+            }
             // 任一操作数为 PartialMatch 的情况
-            (MatchResult::PartialMatch, _) | (_, MatchResult::PartialMatch) => MatchResult::PartialMatch,
+            (MatchResult::PartialMatch, _) | (_, MatchResult::PartialMatch) => {
+                MatchResult::PartialMatch
+            }
             // 两个操作数均为 Match 的情况
             (MatchResult::Match(addon1), MatchResult::Match(addon2)) => {
                 // 合并 MatchAddon 标记，优先级：MixMatch > PathMatch > NonPathMatch
                 let result_addon = match (addon1, addon2) {
                     (MatchAddon::PathMatch, MatchAddon::PathMatch) => MatchAddon::PathMatch,
-                    (MatchAddon::NonPathMatch, MatchAddon::NonPathMatch) => MatchAddon::NonPathMatch,
+                    (MatchAddon::NonPathMatch, MatchAddon::NonPathMatch) => {
+                        MatchAddon::NonPathMatch
+                    }
                     _ => MatchAddon::MixMatch,
                 };
                 MatchResult::Match(result_addon)
             }
             // 任一操作数为 Match 的情况
-            (MatchResult::Match(addon), _) | (_, MatchResult::Match(addon)) => MatchResult::Match(addon),
+            (MatchResult::Match(addon), _) | (_, MatchResult::Match(addon)) => {
+                MatchResult::Match(addon)
+            }
             // 任一操作数为 LazyMatch 的情况
             (MatchResult::LazyMatch, MatchResult::LazyMatch) => MatchResult::LazyMatch,
         }
@@ -1528,16 +1646,22 @@ impl BitOr for MatchResult {
                 // 合并 MatchAddon 标记，优先级：MixMatch > PathMatch > NonPathMatch
                 let result_addon = match (addon1, addon2) {
                     (MatchAddon::PathMatch, MatchAddon::PathMatch) => MatchAddon::PathMatch,
-                    (MatchAddon::NonPathMatch, MatchAddon::NonPathMatch) => MatchAddon::NonPathMatch,
+                    (MatchAddon::NonPathMatch, MatchAddon::NonPathMatch) => {
+                        MatchAddon::NonPathMatch
+                    }
                     _ => MatchAddon::MixMatch,
                 };
                 MatchResult::Match(result_addon)
             }
             // 任一操作数为 Match 的情况
-            (MatchResult::Match(addon), _) | (_, MatchResult::Match(addon)) => MatchResult::Match(addon),
+            (MatchResult::Match(addon), _) | (_, MatchResult::Match(addon)) => {
+                MatchResult::Match(addon)
+            }
 
             // 任一操作数为 PartialMatch 的情况
-            (MatchResult::PartialMatch, _) | (_, MatchResult::PartialMatch) => MatchResult::PartialMatch,
+            (MatchResult::PartialMatch, _) | (_, MatchResult::PartialMatch) => {
+                MatchResult::PartialMatch
+            }
             // 两个操作数均为 MisMatch 的情况
             (MatchResult::MisMatch(addon1), MatchResult::MisMatch(addon2)) => {
                 // 优先保留 FullPathNotMatch 标记
@@ -1550,7 +1674,9 @@ impl BitOr for MatchResult {
                 MatchResult::MisMatch(result_addon)
             }
             // 任一操作数为 MisMatch 的情况
-            (MatchResult::MisMatch(addon), _) | (_, MatchResult::MisMatch(addon)) => MatchResult::MisMatch(addon),
+            (MatchResult::MisMatch(addon), _) | (_, MatchResult::MisMatch(addon)) => {
+                MatchResult::MisMatch(addon)
+            }
             // 两个操作数为 LazyMatch 的情况
             (MatchResult::LazyMatch, MatchResult::LazyMatch) => MatchResult::LazyMatch,
         }
@@ -1575,8 +1701,14 @@ impl BitOr for MatchResult {
 /// - `pattern_after_wildcard`: ** 之后的部分
 #[allow(clippy::too_many_arguments)]
 fn match_path_with_pattern(
-    file_path: &str, file_type: Option<&str>, pattern: &Pattern, raw_value: &str, pattern_parts: &[String],
-    pattern_depth: usize, has_double_wildcard: bool, pattern_after_wildcard: &[String],
+    file_path: &str,
+    file_type: Option<&str>,
+    pattern: &Pattern,
+    raw_value: &str,
+    pattern_parts: &[String],
+    pattern_depth: usize,
+    has_double_wildcard: bool,
+    pattern_after_wildcard: &[String],
 ) -> MatchResult {
     trace!(
         "[Filter:match_path_with_pattern] 开始匹配: pattern_value={}, file_path={}, file_type={:?}",
@@ -1725,8 +1857,13 @@ mod tests {
 
     /// Helper to parse a filter expression and evaluate it, returning MatchResult.
     fn eval(
-        expr_str: &str, file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>,
-        modified_epoch: Option<i64>, size: Option<u64>, extension: Option<&str>,
+        expr_str: &str,
+        file_name: Option<&str>,
+        file_path: Option<&str>,
+        file_type: Option<&str>,
+        modified_epoch: Option<i64>,
+        size: Option<u64>,
+        extension: Option<&str>,
     ) -> MatchResult {
         let expr = FilterExpression::parse(expr_str).expect("Failed to parse expression");
         let now_epoch = crate::time_util::now_secs();
@@ -1744,8 +1881,14 @@ mod tests {
 
     /// Helper to evaluate with explicit now_epoch (for deterministic modified tests).
     fn eval_with_now(
-        expr_str: &str, file_name: Option<&str>, file_path: Option<&str>, file_type: Option<&str>,
-        modified_epoch: Option<i64>, size: Option<u64>, extension: Option<&str>, now_epoch: i64,
+        expr_str: &str,
+        file_name: Option<&str>,
+        file_path: Option<&str>,
+        file_type: Option<&str>,
+        modified_epoch: Option<i64>,
+        size: Option<u64>,
+        extension: Option<&str>,
+        now_epoch: i64,
     ) -> MatchResult {
         let expr = FilterExpression::parse(expr_str).expect("Failed to parse expression");
         evaluate_filter(
@@ -1762,11 +1905,19 @@ mod tests {
 
     /// Helper to call should_skip with match/exclude expressions.
     fn skip(
-        match_expr: Option<&str>, exclude_expr: Option<&str>, file_name: Option<&str>, file_path: Option<&str>,
-        file_type: Option<&str>, modified_epoch: Option<i64>, size: Option<u64>, extension: Option<&str>,
+        match_expr: Option<&str>,
+        exclude_expr: Option<&str>,
+        file_name: Option<&str>,
+        file_path: Option<&str>,
+        file_type: Option<&str>,
+        modified_epoch: Option<i64>,
+        size: Option<u64>,
+        extension: Option<&str>,
     ) -> (bool, bool, bool) {
-        let match_parsed = match_expr.map(|e| FilterExpression::parse(e).expect("Failed to parse match expr"));
-        let exclude_parsed = exclude_expr.map(|e| FilterExpression::parse(e).expect("Failed to parse exclude expr"));
+        let match_parsed =
+            match_expr.map(|e| FilterExpression::parse(e).expect("Failed to parse match expr"));
+        let exclude_parsed =
+            exclude_expr.map(|e| FilterExpression::parse(e).expect("Failed to parse exclude expr"));
         should_skip(
             match_parsed.as_ref(),
             exclude_parsed.as_ref(),
@@ -1807,19 +1958,37 @@ mod tests {
 
     #[test]
     fn test_parse_parenthesized_expression() {
-        let expr = FilterExpression::parse("(name == \"*.txt\" or name == \"*.rs\") and type == file").unwrap();
+        let expr =
+            FilterExpression::parse("(name == \"*.txt\" or name == \"*.rs\") and type == file")
+                .unwrap();
         assert_eq!(expr.count_nodes(), 5);
     }
 
     #[test]
     fn test_basic_name_match() {
-        let r = eval("name == \"*.txt\"", Some("hello.txt"), None, None, None, None, None);
+        let r = eval(
+            "name == \"*.txt\"",
+            Some("hello.txt"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
     }
 
     #[test]
     fn test_basic_name_mismatch() {
-        let r = eval("name == \"*.txt\"", Some("hello.rs"), None, None, None, None, None);
+        let r = eval(
+            "name == \"*.txt\"",
+            Some("hello.rs"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r, MatchResult::MisMatch(MisMatchAddon::Other));
     }
 
@@ -1837,7 +2006,15 @@ mod tests {
 
     #[test]
     fn test_basic_extension_match() {
-        let r = eval("extension == \"rs\"", None, None, None, None, None, Some("rs"));
+        let r = eval(
+            "extension == \"rs\"",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("rs"),
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
     }
 
@@ -1861,7 +2038,15 @@ mod tests {
     #[test]
     fn test_glob_star_matches_single_component() {
         // path=="a/*/c" should match "a/x/c"
-        let r = eval("path == \"a/*/c\"", None, Some("a/x/c"), Some("file"), None, None, None);
+        let r = eval(
+            "path == \"a/*/c\"",
+            None,
+            Some("a/x/c"),
+            Some("file"),
+            None,
+            None,
+            None,
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
     }
 
@@ -1883,48 +2068,120 @@ mod tests {
     #[test]
     fn test_glob_doublestar_matches_zero_components() {
         // path=="a/**/c" should match "a/c"
-        let r = eval("path == \"a/**/c\"", None, Some("a/c"), Some("file"), None, None, None);
+        let r = eval(
+            "path == \"a/**/c\"",
+            None,
+            Some("a/c"),
+            Some("file"),
+            None,
+            None,
+            None,
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
     }
 
     #[test]
     fn test_glob_name_star_matches() {
         // name == "test_*" matches "test_hello"
-        let r = eval("name == \"test_*\"", Some("test_hello"), None, None, None, None, None);
+        let r = eval(
+            "name == \"test_*\"",
+            Some("test_hello"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
     }
 
     #[test]
     fn test_glob_name_star_no_match() {
-        let r = eval("name == \"test_*\"", Some("other_hello"), None, None, None, None, None);
+        let r = eval(
+            "name == \"test_*\"",
+            Some("other_hello"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r, MatchResult::MisMatch(MisMatchAddon::Other));
     }
 
     #[test]
     fn test_glob_name_question_mark() {
         // ? matches single character
-        let r = eval("name == \"test_?\"", Some("test_a"), None, None, None, None, None);
+        let r = eval(
+            "name == \"test_?\"",
+            Some("test_a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
 
-        let r2 = eval("name == \"test_?\"", Some("test_ab"), None, None, None, None, None);
+        let r2 = eval(
+            "name == \"test_?\"",
+            Some("test_ab"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r2, MatchResult::MisMatch(MisMatchAddon::Other));
     }
 
     #[test]
     fn test_glob_extension_star() {
-        let r = eval("extension == \"t*\"", None, None, None, None, None, Some("txt"));
+        let r = eval(
+            "extension == \"t*\"",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("txt"),
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
 
-        let r2 = eval("extension == \"t*\"", None, None, None, None, None, Some("rs"));
+        let r2 = eval(
+            "extension == \"t*\"",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("rs"),
+        );
         assert_eq!(r2, MatchResult::MisMatch(MisMatchAddon::Other));
     }
 
     #[test]
     fn test_glob_extension_question_mark() {
-        let r = eval("extension == \"r?\"", None, None, None, None, None, Some("rs"));
+        let r = eval(
+            "extension == \"r?\"",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("rs"),
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
 
-        let r2 = eval("extension == \"r?\"", None, None, None, None, None, Some("rust"));
+        let r2 = eval(
+            "extension == \"r?\"",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("rust"),
+        );
         assert_eq!(r2, MatchResult::MisMatch(MisMatchAddon::Other));
     }
 
@@ -2368,7 +2625,10 @@ mod tests {
             None,
             None,
         );
-        assert!(skip, "Blacklist should take priority, entry should be skipped");
+        assert!(
+            skip,
+            "Blacklist should take priority, entry should be skipped"
+        );
     }
 
     #[test]
@@ -2412,7 +2672,10 @@ mod tests {
     #[test]
     fn test_parse_modified_relative_days_numeric() {
         let expr = FilterExpression::parse("modified < 30");
-        assert!(expr.is_ok(), "Should parse relative days as plain number (<30 days)");
+        assert!(
+            expr.is_ok(),
+            "Should parse relative days as plain number (<30 days)"
+        );
     }
 
     #[test]
@@ -2424,7 +2687,10 @@ mod tests {
     #[test]
     fn test_parse_modified_eq_relative_days_error() {
         let expr = FilterExpression::parse("modified == 3d");
-        assert!(expr.is_err(), "Relative days should not support == operator");
+        assert!(
+            expr.is_err(),
+            "Relative days should not support == operator"
+        );
     }
 
     #[test]
@@ -2687,7 +2953,16 @@ mod tests {
         // modified < 3d, file modified 1 day ago -> match
         let now = 1000000;
         let file_epoch = now - 86400; // 1 day ago
-        let r = eval_with_now("modified < 3d", None, None, None, Some(file_epoch), None, None, now);
+        let r = eval_with_now(
+            "modified < 3d",
+            None,
+            None,
+            None,
+            Some(file_epoch),
+            None,
+            None,
+            now,
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
     }
 
@@ -2696,7 +2971,16 @@ mod tests {
         // modified > 3d, file modified 5 days ago -> match (file_days=5 > 3)
         let now = 1000000;
         let file_epoch = now - 86400 * 5;
-        let r = eval_with_now("modified > 3d", None, None, None, Some(file_epoch), None, None, now);
+        let r = eval_with_now(
+            "modified > 3d",
+            None,
+            None,
+            None,
+            Some(file_epoch),
+            None,
+            None,
+            now,
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
     }
 
@@ -2705,7 +2989,16 @@ mod tests {
         // modified < 3d, file modified 5 days ago -> no match (file_days=5 >= 3)
         let now = 1000000;
         let file_epoch = now - 86400 * 5;
-        let r = eval_with_now("modified < 3d", None, None, None, Some(file_epoch), None, None, now);
+        let r = eval_with_now(
+            "modified < 3d",
+            None,
+            None,
+            None,
+            Some(file_epoch),
+            None,
+            None,
+            now,
+        );
         assert_eq!(r, MatchResult::MisMatch(MisMatchAddon::Other));
     }
 
@@ -2804,19 +3097,51 @@ mod tests {
     #[test]
     fn test_precompiled_pattern_name() {
         // Verify precompiled pattern works correctly
-        let r1 = eval("name == \"hello_*\"", Some("hello_world"), None, None, None, None, None);
+        let r1 = eval(
+            "name == \"hello_*\"",
+            Some("hello_world"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r1, MatchResult::Match(MatchAddon::NonPathMatch));
 
-        let r2 = eval("name == \"hello_*\"", Some("goodbye"), None, None, None, None, None);
+        let r2 = eval(
+            "name == \"hello_*\"",
+            Some("goodbye"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r2, MatchResult::MisMatch(MisMatchAddon::Other));
     }
 
     #[test]
     fn test_precompiled_pattern_extension() {
-        let r1 = eval("extension == \"t?t\"", None, None, None, None, None, Some("txt"));
+        let r1 = eval(
+            "extension == \"t?t\"",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("txt"),
+        );
         assert_eq!(r1, MatchResult::Match(MatchAddon::NonPathMatch));
 
-        let r2 = eval("extension == \"t?t\"", None, None, None, None, None, Some("ts"));
+        let r2 = eval(
+            "extension == \"t?t\"",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("ts"),
+        );
         assert_eq!(r2, MatchResult::MisMatch(MisMatchAddon::Other));
     }
 
@@ -2836,10 +3161,26 @@ mod tests {
 
     #[test]
     fn test_name_ne_operator() {
-        let r = eval("name != \"*.tmp\"", Some("hello.rs"), None, None, None, None, None);
+        let r = eval(
+            "name != \"*.tmp\"",
+            Some("hello.rs"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
 
-        let r2 = eval("name != \"*.tmp\"", Some("data.tmp"), None, None, None, None, None);
+        let r2 = eval(
+            "name != \"*.tmp\"",
+            Some("data.tmp"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r2, MatchResult::MisMatch(MisMatchAddon::Other));
     }
 
@@ -3193,11 +3534,13 @@ mod tests {
             MatchResult::Match(MatchAddon::PathMatch)
         );
         assert_eq!(
-            MatchResult::Match(MatchAddon::PathMatch) & MatchResult::Match(MatchAddon::NonPathMatch),
+            MatchResult::Match(MatchAddon::PathMatch)
+                & MatchResult::Match(MatchAddon::NonPathMatch),
             MatchResult::Match(MatchAddon::MixMatch)
         );
         assert_eq!(
-            MatchResult::Match(MatchAddon::NonPathMatch) & MatchResult::Match(MatchAddon::NonPathMatch),
+            MatchResult::Match(MatchAddon::NonPathMatch)
+                & MatchResult::Match(MatchAddon::NonPathMatch),
             MatchResult::Match(MatchAddon::NonPathMatch)
         );
 
@@ -3227,7 +3570,8 @@ mod tests {
 
         // MisMatch & MisMatch (FullPathNotMatch priority)
         assert_eq!(
-            MatchResult::MisMatch(MisMatchAddon::Other) & MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch),
+            MatchResult::MisMatch(MisMatchAddon::Other)
+                & MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch),
             MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch)
         );
     }
@@ -3236,7 +3580,8 @@ mod tests {
     fn test_match_result_or_combinations() {
         // Match | Match
         assert_eq!(
-            MatchResult::Match(MatchAddon::PathMatch) | MatchResult::Match(MatchAddon::NonPathMatch),
+            MatchResult::Match(MatchAddon::PathMatch)
+                | MatchResult::Match(MatchAddon::NonPathMatch),
             MatchResult::Match(MatchAddon::MixMatch)
         );
 
@@ -3254,12 +3599,16 @@ mod tests {
 
         // MisMatch | MisMatch
         assert_eq!(
-            MatchResult::MisMatch(MisMatchAddon::Other) | MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch),
+            MatchResult::MisMatch(MisMatchAddon::Other)
+                | MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch),
             MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch)
         );
 
         // LazyMatch | LazyMatch
-        assert_eq!(MatchResult::LazyMatch | MatchResult::LazyMatch, MatchResult::LazyMatch);
+        assert_eq!(
+            MatchResult::LazyMatch | MatchResult::LazyMatch,
+            MatchResult::LazyMatch
+        );
 
         // MisMatch | LazyMatch
         assert_eq!(
@@ -3329,7 +3678,16 @@ mod tests {
 
     #[test]
     fn test_no_expressions_dir_default() {
-        let (skip, cont, check) = skip(None, None, Some("dir"), Some("a/dir"), Some("dir"), None, None, None);
+        let (skip, cont, check) = skip(
+            None,
+            None,
+            Some("dir"),
+            Some("a/dir"),
+            Some("dir"),
+            None,
+            None,
+            None,
+        );
         assert_eq!((skip, cont, check), (false, true, true));
     }
 
@@ -3602,7 +3960,16 @@ mod tests {
         // modified <= 3d, file modified 3 days ago -> file_days=3.0, 3.0 <= 3.0 -> match
         let now = 1000000i64;
         let file_epoch = now - 86400 * 3;
-        let r = eval_with_now("modified <= 3d", None, None, None, Some(file_epoch), None, None, now);
+        let r = eval_with_now(
+            "modified <= 3d",
+            None,
+            None,
+            None,
+            Some(file_epoch),
+            None,
+            None,
+            now,
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
     }
 
@@ -3611,7 +3978,16 @@ mod tests {
         // modified >= 3d, file modified 5 days ago -> file_days=5.0, 5.0 >= 3.0 -> match
         let now = 1000000i64;
         let file_epoch = now - 86400 * 5;
-        let r = eval_with_now("modified >= 3d", None, None, None, Some(file_epoch), None, None, now);
+        let r = eval_with_now(
+            "modified >= 3d",
+            None,
+            None,
+            None,
+            Some(file_epoch),
+            None,
+            None,
+            now,
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
     }
 
@@ -3678,10 +4054,26 @@ mod tests {
 
     #[test]
     fn test_extension_ne_operator() {
-        let r = eval("extension != \"tmp\"", None, None, None, None, None, Some("rs"));
+        let r = eval(
+            "extension != \"tmp\"",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("rs"),
+        );
         assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
 
-        let r2 = eval("extension != \"tmp\"", None, None, None, None, None, Some("tmp"));
+        let r2 = eval(
+            "extension != \"tmp\"",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("tmp"),
+        );
         assert_eq!(r2, MatchResult::MisMatch(MisMatchAddon::Other));
     }
 
@@ -3696,7 +4088,15 @@ mod tests {
         assert_eq!(r2, MatchResult::MisMatch(MisMatchAddon::Other));
 
         // Large size
-        let r3 = eval("size >= 1000000000", None, None, None, None, Some(1_000_000_000), None);
+        let r3 = eval(
+            "size >= 1000000000",
+            None,
+            None,
+            None,
+            None,
+            Some(1_000_000_000),
+            None,
+        );
         assert_eq!(r3, MatchResult::Match(MatchAddon::NonPathMatch));
     }
 
@@ -3739,7 +4139,10 @@ mod tests {
         );
         // path: MisMatch(Other) for dir "src" with pattern "**/test" (** + suffix check fails)
         // short-circuit on MisMatch -> return MisMatch
-        assert!(matches!(r, MatchResult::MisMatch(_) | MatchResult::LazyMatch));
+        assert!(matches!(
+            r,
+            MatchResult::MisMatch(_) | MatchResult::LazyMatch
+        ));
     }
 
     #[test]
@@ -3936,10 +4339,26 @@ mod tests {
     #[test]
     fn test_name_with_bracket_glob() {
         // name == "[abc].txt" should match "a.txt", "b.txt", "c.txt" but not "d.txt"
-        let r1 = eval("name == \"[abc].txt\"", Some("a.txt"), None, None, None, None, None);
+        let r1 = eval(
+            "name == \"[abc].txt\"",
+            Some("a.txt"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r1, MatchResult::Match(MatchAddon::NonPathMatch));
 
-        let r2 = eval("name == \"[abc].txt\"", Some("d.txt"), None, None, None, None, None);
+        let r2 = eval(
+            "name == \"[abc].txt\"",
+            Some("d.txt"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(r2, MatchResult::MisMatch(MisMatchAddon::Other));
     }
 
@@ -4774,18 +5193,34 @@ mod tests {
         let field_names: Vec<&str> = defs.iter().map(|d| d.name).collect();
 
         // FilterCondition 枚举的所有字段名
-        let expected = vec!["name", "size", "modified", "extension", "path", "type", "dir_date"];
+        let expected = vec![
+            "name",
+            "size",
+            "modified",
+            "extension",
+            "path",
+            "type",
+            "dir_date",
+        ];
         for name in &expected {
             assert!(field_names.contains(name), "缺少字段定义: {}", name);
         }
-        assert_eq!(defs.len(), expected.len(), "字段数量应与 FilterCondition 变体数一致");
+        assert_eq!(
+            defs.len(),
+            expected.len(),
+            "字段数量应与 FilterCondition 变体数一致"
+        );
     }
 
     #[test]
     fn test_field_definitions_operators_not_empty() {
         let defs = get_filter_field_definitions();
         for def in &defs {
-            assert!(!def.operators.is_empty(), "字段 {} 的操作符列表不应为空", def.name);
+            assert!(
+                !def.operators.is_empty(),
+                "字段 {} 的操作符列表不应为空",
+                def.name
+            );
         }
     }
 
@@ -4809,8 +5244,14 @@ mod tests {
     #[test]
     fn test_field_definitions_enum_field_has_values() {
         let defs = get_filter_field_definitions();
-        let type_def = defs.iter().find(|d| d.name == "type").expect("应有 type 字段");
-        let enum_values = type_def.enum_values.as_ref().expect("type 字段应有 enum_values");
+        let type_def = defs
+            .iter()
+            .find(|d| d.name == "type")
+            .expect("应有 type 字段");
+        let enum_values = type_def
+            .enum_values
+            .as_ref()
+            .expect("type 字段应有 enum_values");
         assert!(enum_values.contains(&"file"));
         assert!(enum_values.contains(&"dir"));
         assert!(enum_values.contains(&"symlink"));
@@ -4821,7 +5262,11 @@ mod tests {
         let defs = get_filter_field_definitions();
         for def in &defs {
             if def.name != "type" {
-                assert!(def.enum_values.is_none(), "非枚举字段 {} 不应有 enum_values", def.name);
+                assert!(
+                    def.enum_values.is_none(),
+                    "非枚举字段 {} 不应有 enum_values",
+                    def.name
+                );
             }
         }
     }
@@ -4836,13 +5281,22 @@ mod tests {
                     "glob" => "\"*.txt\"",
                     "bytes" => "1024",
                     "duration_or_date" => "3d",
-                    "enum" => def.enum_values.as_ref().and_then(|v| v.first()).unwrap_or(&"file"),
+                    "enum" => def
+                        .enum_values
+                        .as_ref()
+                        .and_then(|v| v.first())
+                        .unwrap_or(&"file"),
                     "date" => "\"20240101\"",
                     _ => "test",
                 };
                 let expr = format!("{} {} {}", def.name, op.value, test_value);
                 let result = parse_filter_expression(&expr);
-                assert!(result.is_ok(), "表达式解析失败: '{}', 错误: {:?}", expr, result.err());
+                assert!(
+                    result.is_ok(),
+                    "表达式解析失败: '{}', 错误: {:?}",
+                    expr,
+                    result.err()
+                );
             }
         }
     }

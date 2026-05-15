@@ -10,15 +10,16 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 // 外部 crate
 use bytes::Bytes;
 use futures::StreamExt;
-use parking_lot::RwLock;
 use futures::stream::{FuturesOrdered, FuturesUnordered};
+use parking_lot::RwLock;
 use smb::binrw_util::file_time::FileTime;
 use smb::connection::MultiChannelConfig;
 use smb::{
-    ACE, ACL, AclRevision, AdditionalInfo, Client, ClientConfig, ConnectionConfig, CreateDisposition, CreateOptions, FileAccessMask,
-    FileAttributes, FileBasicInformation, FileCreateArgs, FileIdExtdDirectoryInformation,
-    FileIdFullDirectoryInformation, FileIdInformation, FileInternalInformation, FileStandardInformation,
-    LeaseState, ReadAt, Resource, ResourceHandle, SecurityDescriptor, UncPath, WriteAt,
+    ACE, ACL, AclRevision, AdditionalInfo, Client, ClientConfig, ConnectionConfig,
+    CreateDisposition, CreateOptions, FileAccessMask, FileAttributes, FileBasicInformation,
+    FileCreateArgs, FileIdExtdDirectoryInformation, FileIdFullDirectoryInformation,
+    FileIdInformation, FileInternalInformation, FileStandardInformation, LeaseState, ReadAt,
+    Resource, ResourceHandle, SecurityDescriptor, UncPath, WriteAt,
 };
 use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, trace, warn};
@@ -31,8 +32,8 @@ use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
 use crate::{
-    DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, MB, NASEntry, Result, StorageEntryMessage,
-    WalkDirAsyncIterator,
+    DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, MB, NASEntry, Result,
+    StorageEntryMessage, WalkDirAsyncIterator,
 };
 
 /// 将 SMB `FileTime` (100ns since 1601-01-01) 转换为纳秒时间戳 (ns since Unix epoch)
@@ -82,8 +83,16 @@ impl NASEntry {
     /// 会落到 Path 模式。
     #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
     pub(crate) fn from_smb_info(
-        name: String, relative_path: PathBuf, extension: Option<String>, size: u64, last_write_time: FileTime,
-        last_access_time: FileTime, creation_time: FileTime, is_dir: bool, is_symlink: bool, is_readonly: bool,
+        name: String,
+        relative_path: PathBuf,
+        extension: Option<String>,
+        size: u64,
+        last_write_time: FileTime,
+        last_access_time: FileTime,
+        creation_time: FileTime,
+        is_dir: bool,
+        is_symlink: bool,
+        is_readonly: bool,
         file_id: Option<u128>,
     ) -> Self {
         Self {
@@ -444,8 +453,12 @@ fn parse_smb_url(url_str: &str) -> Result<(String, u16, String, String, String, 
 
     // url crate 不认识 smb scheme，替换为 http 来复用解析器
     let http_url = format!("http{}", &url_str[3..]);
-    let parsed = url::Url::parse(&http_url)
-        .map_err(|e| StorageError::CifsError(format!("Failed to parse SMB URL '{}': {e}", redact_smb_url(url_str))))?;
+    let parsed = url::Url::parse(&http_url).map_err(|e| {
+        StorageError::CifsError(format!(
+            "Failed to parse SMB URL '{}': {e}",
+            redact_smb_url(url_str)
+        ))
+    })?;
 
     let username_raw = parsed.username();
     if username_raw.is_empty() {
@@ -462,7 +475,12 @@ fn parse_smb_url(url_str: &str) -> Result<(String, u16, String, String, String, 
 
     let host = parsed
         .host_str()
-        .ok_or_else(|| StorageError::CifsError(format!("Missing host in SMB URL: {}", redact_smb_url(url_str))))?
+        .ok_or_else(|| {
+            StorageError::CifsError(format!(
+                "Missing host in SMB URL: {}",
+                redact_smb_url(url_str)
+            ))
+        })?
         .to_string();
 
     let port = parsed.port().unwrap_or(445);
@@ -553,14 +571,17 @@ impl CifsStorage {
             ..ClientConfig::default()
         });
         let unc = format!(r"\\{host}:{port}\{share}");
-        let share_path = UncPath::from_str(&unc)
-            .map_err(|e| StorageError::CifsError(format!("Failed to parse UNC path '{unc}': {e}")))?;
+        let share_path = UncPath::from_str(&unc).map_err(|e| {
+            StorageError::CifsError(format!("Failed to parse UNC path '{unc}': {e}"))
+        })?;
 
         client
             .share_connect(&share_path, &username, password)
             .await
             .map_err(|e| {
-                StorageError::CifsError(format!("Failed to connect to SMB share \\\\{host}:{port}/{share}: {e}"))
+                StorageError::CifsError(format!(
+                    "Failed to connect to SMB share \\\\{host}:{port}/{share}: {e}"
+                ))
             })?;
 
         // 从 SMB Negotiate Response 读取 server 协商上限。这些值在 share_connect 内部
@@ -570,7 +591,9 @@ impl CifsStorage {
             StorageError::CifsError(format!("Failed to get connection for {server_addr}: {e}"))
         })?;
         let conn_info = conn.conn_info().ok_or_else(|| {
-            StorageError::CifsError(format!("SMB negotiation info unavailable for {server_addr}"))
+            StorageError::CifsError(format!(
+                "SMB negotiation info unavailable for {server_addr}"
+            ))
         })?;
         let nego = &conn_info.negotiation;
         // SMB read 与 write 上限可能不同，取较小值作为安全统一块大小。
@@ -652,10 +675,13 @@ impl CifsStorage {
     /// `create_cifs_storage_ensuring_dir` → `ensure_root_exists` 处理。
     pub async fn check_connectivity(&self) -> Result<()> {
         let root_unc = self.build_unc_path(Path::new(""));
-        let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
-        let resource = self.client.create_file(&root_unc, &args).await.map_err(|e| {
-            StorageError::CifsError(format!("Connectivity check failed: {e}"))
-        })?;
+        let args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+        let resource = self
+            .client
+            .create_file(&root_unc, &args)
+            .await
+            .map_err(|e| StorageError::CifsError(format!("Connectivity check failed: {e}")))?;
         if let Resource::Directory(d) = resource {
             let _ = d.close().await;
         }
@@ -674,7 +700,8 @@ impl CifsStorage {
         }
         // 快速路径：root 已存在则直接返回，省掉对每个 component 的两次 RT。
         let root_unc = self.build_unc_path(Path::new(""));
-        let open_args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+        let open_args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
         if let Ok(resource) = self.client.create_file(&root_unc, &open_args).await {
             if let Resource::Directory(d) = resource {
                 let _ = d.close().await;
@@ -682,7 +709,10 @@ impl CifsStorage {
             return Ok(());
         }
 
-        debug!("CIFS root sub-path missing, creating root path: {}", self.root);
+        debug!(
+            "CIFS root sub-path missing, creating root path: {}",
+            self.root
+        );
         let path_norm = self.root.replace('\\', "/");
         let components: Vec<&str> = path_norm.split('/').filter(|s| !s.is_empty()).collect();
         let mut accumulated = String::new();
@@ -718,7 +748,9 @@ impl CifsStorage {
             }
             Err(ref e) if is_name_collision(e) => Ok(()),
             Err(create_err) => {
-                let open_args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+                let open_args = FileCreateArgs::make_open_existing(
+                    FileAccessMask::new().with_generic_read(true),
+                );
                 let resource = self.client.create_file(unc, &open_args).await.map_err(|open_err| {
                     StorageError::CifsError(format!(
                         "mkdir '{accumulated}' failed: {create_err}; open also failed: {open_err}"
@@ -736,17 +768,23 @@ impl CifsStorage {
     /// 其余等待结果。`STATUS_INVALID_INFO_CLASS` 或任何探测失败都降级到
     /// `Full64`，后续不再重试。
     async fn probe_dir_info_class(&self) -> DirInfoClass {
-        *self.dir_info_class.get_or_init(|| async { self.run_probe().await }).await
+        *self
+            .dir_info_class
+            .get_or_init(|| async { self.run_probe().await })
+            .await
     }
 
     /// 实际执行一次探测请求；独立函数以便 `get_or_init` 闭包调用。
     async fn run_probe(&self) -> DirInfoClass {
         let root_unc = self.build_unc_path(Path::new(""));
-        let open_args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+        let open_args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
         let resource = match self.client.create_file(&root_unc, &open_args).await {
             Ok(r) => r,
             Err(e) => {
-                warn!("CIFS probe: failed to open root for info-class probe: {e}; defaulting to Full64");
+                warn!(
+                    "CIFS probe: failed to open root for info-class probe: {e}; defaulting to Full64"
+                );
                 return DirInfoClass::Full64;
             }
         };
@@ -756,21 +794,22 @@ impl CifsStorage {
         };
         let dir_arc = Arc::new(d);
 
-        let class = match smb::Directory::query::<FileIdExtdDirectoryInformation>(&dir_arc, "*").await {
-            Ok(mut s) => match s.next().await {
-                None | Some(Ok(_)) => DirInfoClass::Extd128,
-                Some(Err(ref e)) if is_invalid_info_class(e) => DirInfoClass::Full64,
-                Some(Err(e)) => {
-                    warn!("CIFS probe: unexpected stream error: {e}; defaulting to Full64");
+        let class =
+            match smb::Directory::query::<FileIdExtdDirectoryInformation>(&dir_arc, "*").await {
+                Ok(mut s) => match s.next().await {
+                    None | Some(Ok(_)) => DirInfoClass::Extd128,
+                    Some(Err(ref e)) if is_invalid_info_class(e) => DirInfoClass::Full64,
+                    Some(Err(e)) => {
+                        warn!("CIFS probe: unexpected stream error: {e}; defaulting to Full64");
+                        DirInfoClass::Full64
+                    }
+                },
+                Err(ref e) if is_invalid_info_class(e) => DirInfoClass::Full64,
+                Err(e) => {
+                    warn!("CIFS probe: query failed: {e}; defaulting to Full64");
                     DirInfoClass::Full64
                 }
-            },
-            Err(ref e) if is_invalid_info_class(e) => DirInfoClass::Full64,
-            Err(e) => {
-                warn!("CIFS probe: query failed: {e}; defaulting to Full64");
-                DirInfoClass::Full64
-            }
-        };
+            };
 
         if let Ok(d) = Arc::try_unwrap(dir_arc) {
             let _ = d.close().await;
@@ -807,7 +846,8 @@ impl CifsStorage {
     /// - `Ok((entries, errs))`：流中逐条解析，单条 entry 失败不中断，错误描述
     ///   累积到 `errs`；调用方按各自的传播方式转发，保留部分成功结果。
     async fn collect_dir_entries(
-        &self, dir_arc: &Arc<smb::Directory>,
+        &self,
+        dir_arc: &Arc<smb::Directory>,
     ) -> std::result::Result<(Vec<RawDirEntry>, Vec<String>), smb::Error> {
         match self.probe_dir_info_class().await {
             DirInfoClass::Extd128 => drain_dir::<FileIdExtdDirectoryInformation>(dir_arc).await,
@@ -832,12 +872,11 @@ impl CifsStorage {
         }
 
         let unc = self.build_unc_path(path);
-        let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
-        let resource = self
-            .client
-            .create_file(&unc, &args)
-            .await
-            .map_err(|e| StorageError::CifsError(format!("Failed to open file {}: {e}", path.display())))?;
+        let args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+        let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
+            StorageError::CifsError(format!("Failed to open file {}: {e}", path.display()))
+        })?;
 
         let Resource::File(file) = resource else {
             return Err(StorageError::CifsError(format!(
@@ -862,7 +901,9 @@ impl CifsStorage {
         let data = file
             .read_block_bytes(read_len, 0, None, false)
             .await
-            .map_err(|e| StorageError::CifsError(format!("Failed to read file {}: {e}", path.display())))?;
+            .map_err(|e| {
+                StorageError::CifsError(format!("Failed to read file {}: {e}", path.display()))
+            })?;
 
         let _ = file.close().await;
         Ok(data)
@@ -870,7 +911,11 @@ impl CifsStorage {
 
     /// 多块流式读取文件，通过 channel 发送 `DataChunk`
     pub(crate) async fn read_data(
-        &self, tx: mpsc::Sender<DataChunk>, relative_path: &Path, size: u64, enable_integrity_check: bool,
+        &self,
+        tx: mpsc::Sender<DataChunk>,
+        relative_path: &Path,
+        size: u64,
+        enable_integrity_check: bool,
         qos: Option<QosManager>,
     ) -> Result<Option<HashCalculator>> {
         if size == 0 {
@@ -893,11 +938,14 @@ impl CifsStorage {
         );
 
         let unc = self.build_unc_path(relative_path);
-        let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
-        let resource =
-            self.client.create_file(&unc, &args).await.map_err(|e| {
-                StorageError::CifsError(format!("Failed to open file {}: {e}", relative_path.display()))
-            })?;
+        let args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+        let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
+            StorageError::CifsError(format!(
+                "Failed to open file {}: {e}",
+                relative_path.display()
+            ))
+        })?;
 
         let Resource::File(file) = resource else {
             return Err(StorageError::CifsError(format!(
@@ -950,7 +998,10 @@ impl CifsStorage {
             let data = match result {
                 Ok(b) => b,
                 Err(e) => {
-                    error!("Failed to read data chunk at offset {}: {:?}", send_offset, e);
+                    error!(
+                        "Failed to read data chunk at offset {}: {:?}",
+                        send_offset, e
+                    );
                     first_error = Some(StorageError::CifsError(format!(
                         "Failed to read file {} at offset {send_offset}: {e}",
                         relative_path.display()
@@ -969,7 +1020,14 @@ impl CifsStorage {
                 h.update(&data);
             }
 
-            if tx.send(DataChunk { offset: send_offset, data }).await.is_err() {
+            if tx
+                .send(DataChunk {
+                    offset: send_offset,
+                    data,
+                })
+                .await
+                .is_err()
+            {
                 // 下游 receiver 关闭：视为协作取消信号（与旧实现一致），不当读错误。
                 trace!("Data channel closed for file {:?}", relative_path);
                 break;
@@ -1001,7 +1059,8 @@ impl CifsStorage {
         const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
         const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
         match err {
-            smb::Error::ReceivedErrorMessage(code, _) | smb::Error::UnexpectedMessageStatus(code) => {
+            smb::Error::ReceivedErrorMessage(code, _)
+            | smb::Error::UnexpectedMessageStatus(code) => {
                 *code == STATUS_OBJECT_NAME_NOT_FOUND || *code == STATUS_OBJECT_PATH_NOT_FOUND
             }
             _ => false,
@@ -1036,7 +1095,12 @@ impl CifsStorage {
 
     /// 单块写入文件
     pub(crate) async fn write_file(
-        &self, path: &Path, data: Bytes, _uid: Option<u32>, _gid: Option<u32>, _mode: Option<u32>,
+        &self,
+        path: &Path,
+        data: Bytes,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _mode: Option<u32>,
     ) -> Result<()> {
         // 确保父目录存在
         if let Some(parent) = path.parent()
@@ -1048,11 +1112,12 @@ impl CifsStorage {
         let unc = self.build_unc_path(path);
         let args = Self::make_overwrite_args();
 
-        let resource = self
-            .client
-            .create_file(&unc, &args)
-            .await
-            .map_err(|e| StorageError::CifsError(format!("Failed to create/open file {}: {e}", path.display())))?;
+        let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
+            StorageError::CifsError(format!(
+                "Failed to create/open file {}: {e}",
+                path.display()
+            ))
+        })?;
 
         let Resource::File(file) = resource else {
             return Err(StorageError::CifsError(format!(
@@ -1063,9 +1128,9 @@ impl CifsStorage {
 
         // 零拷贝写路径：`Bytes` 直接 move 到 OutgoingMessage.additional_data，
         // 省掉 `write_at` 内部的 `Bytes::copy_from_slice(buf)` 一次 size 大小 memcpy。
-        file.write_block_zc(data, 0, None)
-            .await
-            .map_err(|e| StorageError::CifsError(format!("Failed to write file {}: {e}", path.display())))?;
+        file.write_block_zc(data, 0, None).await.map_err(|e| {
+            StorageError::CifsError(format!("Failed to write file {}: {e}", path.display()))
+        })?;
 
         let _ = file.close().await;
         Ok(())
@@ -1073,8 +1138,13 @@ impl CifsStorage {
 
     /// 多块流式写入文件
     pub(crate) async fn write_data(
-        &self, rx: mpsc::Receiver<DataChunk>, relative_path: &Path, _uid: Option<u32>, _gid: Option<u32>,
-        _mode: Option<u32>, bytes_counter: Option<Arc<AtomicU64>>,
+        &self,
+        rx: mpsc::Receiver<DataChunk>,
+        relative_path: &Path,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _mode: Option<u32>,
+        bytes_counter: Option<Arc<AtomicU64>>,
     ) -> Result<()> {
         trace!("Starting CIFS write_data for file {:?}", relative_path);
 
@@ -1089,7 +1159,10 @@ impl CifsStorage {
         let args = Self::make_overwrite_args();
 
         let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
-            StorageError::CifsError(format!("Failed to create/open file {}: {e}", relative_path.display()))
+            StorageError::CifsError(format!(
+                "Failed to create/open file {}: {e}",
+                relative_path.display()
+            ))
         })?;
 
         let Resource::File(file) = resource else {
@@ -1111,25 +1184,27 @@ impl CifsStorage {
         // 必然返回 Err，上游通常重试整文件；继续 fetch_add 会让重试的成功路径与本次
         // drain 期间的"侥幸成功" chunk 双计数。所以错误路径上的成功 chunk 不计入有效
         // 进度（无论发生在 fill 还是 drain 阶段）。
-        type WriteFut<'a> = Pin<Box<dyn Future<Output = (u64, std::io::Result<usize>)> + Send + 'a>>;
+        type WriteFut<'a> =
+            Pin<Box<dyn Future<Output = (u64, std::io::Result<usize>)> + Send + 'a>>;
         let mut inflight: FuturesUnordered<WriteFut<'_>> = FuturesUnordered::new();
         let mut first_error: Option<StorageError> = None;
-        let count_or_record_err = |len: u64,
-                                   result: std::io::Result<usize>,
-                                   first_error: &mut Option<StorageError>| {
-            match result {
-                Ok(_) if first_error.is_none() => {
-                    if let Some(ref c) = bytes_counter {
-                        c.fetch_add(len, Ordering::Relaxed);
+        let count_or_record_err =
+            |len: u64, result: std::io::Result<usize>, first_error: &mut Option<StorageError>| {
+                match result {
+                    Ok(_) if first_error.is_none() => {
+                        if let Some(ref c) = bytes_counter {
+                            c.fetch_add(len, Ordering::Relaxed);
+                        }
                     }
+                    Ok(_) => {} // 错误路径上的成功 chunk 不计入（见上 doc）
+                    Err(e) if first_error.is_none() => {
+                        *first_error = Some(StorageError::CifsError(format!(
+                            "Failed to write data: {e}"
+                        )));
+                    }
+                    Err(_) => {} // 已有 first_error，丢弃后续错误
                 }
-                Ok(_) => {} // 错误路径上的成功 chunk 不计入（见上 doc）
-                Err(e) if first_error.is_none() => {
-                    *first_error = Some(StorageError::CifsError(format!("Failed to write data: {e}")));
-                }
-                Err(_) => {} // 已有 first_error，丢弃后续错误
-            }
-        };
+            };
 
         let mut reader = rx;
         loop {
@@ -1251,7 +1326,11 @@ impl CifsStorage {
         let _ = self.client.evict_lease(&unc).await;
 
         // 打开文件并标记为删除
-        let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_write(true).with_delete(true));
+        let args = FileCreateArgs::make_open_existing(
+            FileAccessMask::new()
+                .with_generic_write(true)
+                .with_delete(true),
+        );
         let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
             // 把 SMB STATUS_OBJECT_PATH_NOT_FOUND / STATUS_OBJECT_NAME_NOT_FOUND
             // 标准化为 StorageError::FileNotFound，便于 orchestrator 的"幂等删除"路径
@@ -1259,7 +1338,10 @@ impl CifsStorage {
             if Self::is_not_found(&e) {
                 return StorageError::FileNotFound(relative_path.display().to_string());
             }
-            StorageError::CifsError(format!("Failed to open for deletion {}: {e}", relative_path.display()))
+            StorageError::CifsError(format!(
+                "Failed to open for deletion {}: {e}",
+                relative_path.display()
+            ))
         })?;
 
         // 使用 set_info 标记删除
@@ -1269,13 +1351,19 @@ impl CifsStorage {
         match &resource {
             Resource::File(f) => {
                 f.set_info(disposition).await.map_err(|e| {
-                    StorageError::CifsError(format!("Failed to delete {}: {e}", relative_path.display()))
+                    StorageError::CifsError(format!(
+                        "Failed to delete {}: {e}",
+                        relative_path.display()
+                    ))
                 })?;
                 let _ = f.close().await;
             }
             Resource::Directory(d) => {
                 d.set_info(disposition).await.map_err(|e| {
-                    StorageError::CifsError(format!("Failed to delete {}: {e}", relative_path.display()))
+                    StorageError::CifsError(format!(
+                        "Failed to delete {}: {e}",
+                        relative_path.display()
+                    ))
                 })?;
                 let _ = d.close().await;
             }
@@ -1298,7 +1386,9 @@ impl CifsStorage {
     ///
     /// 进度事件按删除顺序（深度倒序）通过迭代器返回。
     pub fn delete_dir_all_with_progress(
-        &self, relative_path: Option<&Path>, concurrency: usize,
+        &self,
+        relative_path: Option<&Path>,
+        concurrency: usize,
     ) -> Result<DeleteDirIterator> {
         let (tx, rx) = async_channel::bounded::<DeleteEvent>(1000);
         let concurrency = concurrency.clamp(1, 64);
@@ -1349,8 +1439,15 @@ impl CifsStorage {
                             }));
                         }
                     }
-                    StorageEntryMessage::Error { event, path, reason } => {
-                        error!("Walkdir error during delete [{}] {:?}: {}", event, path, reason);
+                    StorageEntryMessage::Error {
+                        event,
+                        path,
+                        reason,
+                    } => {
+                        error!(
+                            "Walkdir error during delete [{}] {:?}: {}",
+                            event, path, reason
+                        );
                     }
                     _ => {}
                 }
@@ -1430,12 +1527,21 @@ impl CifsStorage {
         // 不能是完整 UNC（`\\host\share\...`）。否则 SMB 服务端返回 `Object Name Invalid (0xc0000033)`。
         let to_path_str = to_unc.path().unwrap_or("").to_string();
 
-        let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_write(true).with_delete(true));
+        let args = FileCreateArgs::make_open_existing(
+            FileAccessMask::new()
+                .with_generic_write(true)
+                .with_delete(true),
+        );
         let resource = self
             .client
             .create_file(&from_unc, &args)
             .await
-            .map_err(|e| StorageError::CifsError(format!("Failed to open {} for rename: {e}", from.display())))?;
+            .map_err(|e| {
+                StorageError::CifsError(format!(
+                    "Failed to open {} for rename: {e}",
+                    from.display()
+                ))
+            })?;
 
         let rename_info = smb::FileRenameInformation {
             replace_if_exists: true.into(),
@@ -1446,13 +1552,21 @@ impl CifsStorage {
         match &resource {
             Resource::File(f) => {
                 f.set_info(rename_info).await.map_err(|e| {
-                    StorageError::CifsError(format!("Failed to rename {} to {}: {e}", from.display(), to.display()))
+                    StorageError::CifsError(format!(
+                        "Failed to rename {} to {}: {e}",
+                        from.display(),
+                        to.display()
+                    ))
                 })?;
                 let _ = f.close().await;
             }
             Resource::Directory(d) => {
                 d.set_info(rename_info).await.map_err(|e| {
-                    StorageError::CifsError(format!("Failed to rename {} to {}: {e}", from.display(), to.display()))
+                    StorageError::CifsError(format!(
+                        "Failed to rename {} to {}: {e}",
+                        from.display(),
+                        to.display()
+                    ))
                 })?;
                 let _ = d.close().await;
             }
@@ -1476,10 +1590,14 @@ impl CifsStorage {
         debug!("CIFS get_metadata {:?}", relative_path);
 
         let unc = self.build_unc_path(relative_path);
-        let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+        let args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
 
         let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
-            StorageError::CifsError(format!("Failed to open {} for metadata: {e}", relative_path.display()))
+            StorageError::CifsError(format!(
+                "Failed to open {} for metadata: {e}",
+                relative_path.display()
+            ))
         })?;
 
         let handle = match &resource {
@@ -1501,13 +1619,17 @@ impl CifsStorage {
                 handle
                     .query_info::<FileBasicInformation>()
                     .await
-                    .map_err(|e| StorageError::CifsError(format!("Failed to query basic info: {e}")))
+                    .map_err(|e| {
+                        StorageError::CifsError(format!("Failed to query basic info: {e}"))
+                    })
             },
             async {
                 handle
                     .query_info::<FileStandardInformation>()
                     .await
-                    .map_err(|e| StorageError::CifsError(format!("Failed to query standard info: {e}")))
+                    .map_err(|e| {
+                        StorageError::CifsError(format!("Failed to query standard info: {e}"))
+                    })
             },
             async { Ok::<_, StorageError>(self.query_file_id(handle).await) },
         );
@@ -1520,14 +1642,25 @@ impl CifsStorage {
         };
         close_resource(resource).await;
 
-        Ok(build_nas_entry(relative_path, &basic_info, &standard_info, is_dir, file_id_u128))
+        Ok(build_nas_entry(
+            relative_path,
+            &basic_info,
+            &standard_info,
+            is_dir,
+            file_id_u128,
+        ))
     }
 
     /// 更新文件的时间戳元数据
     ///
     /// 注意：SMB 不原生支持 Unix uid/gid/mode，仅设置时间戳
     pub async fn update_metadata(
-        &self, relative_path: &Path, atime: Option<i64>, mtime: Option<i64>, _uid: Option<u32>, _gid: Option<u32>,
+        &self,
+        relative_path: &Path,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
         _mode: Option<u32>,
     ) -> Result<()> {
         debug!("CIFS update_metadata {:?}", relative_path);
@@ -1585,7 +1718,12 @@ impl CifsStorage {
     /// SMB 通过 reparse point 支持符号链接。如果服务端不支持，静默返回 Ok(())
     #[allow(clippy::unused_async)]
     pub async fn create_symlink(
-        &self, _relative_path: &Path, _target_path: &Path, _atime: i64, _mtime: i64, _uid: Option<u32>,
+        &self,
+        _relative_path: &Path,
+        _target_path: &Path,
+        _atime: i64,
+        _mtime: i64,
+        _uid: Option<u32>,
         _gid: Option<u32>,
     ) -> Result<()> {
         // SMB 符号链接创建需要特殊权限（SeCreateSymbolicLinkPrivilege）
@@ -1613,8 +1751,14 @@ impl CifsStorage {
     /// 每个 worker 独立查询子目录，通过 bounded channel 控制内存。
     #[allow(clippy::too_many_arguments, clippy::unused_async)]
     pub async fn walkdir(
-        &self, sub_path: Option<&Path>, depth: Option<usize>, match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>, concurrency: usize, packaged: bool, package_depth: usize,
+        &self,
+        sub_path: Option<&Path>,
+        depth: Option<usize>,
+        match_expressions: Option<FilterExpression>,
+        exclude_expressions: Option<FilterExpression>,
+        concurrency: usize,
+        packaged: bool,
+        package_depth: usize,
     ) -> Result<WalkDirAsyncIterator> {
         let start_root = match sub_path {
             Some(p) if !p.as_os_str().is_empty() => {
@@ -1666,12 +1810,23 @@ impl CifsStorage {
     /// 迭代式目录遍历，使用工作窃取队列实现高效并发
     #[allow(clippy::too_many_arguments, clippy::ref_option)]
     async fn iterative_walkdir(
-        &self, root_path: &str, tx: async_channel::Sender<StorageEntryMessage>, max_depth: usize,
-        match_expressions: &Option<FilterExpression>, exclude_expressions: &Option<FilterExpression>,
-        concurrency: usize, total_file_count: Arc<AtomicUsize>, packaged: bool, package_depth: usize,
+        &self,
+        root_path: &str,
+        tx: async_channel::Sender<StorageEntryMessage>,
+        max_depth: usize,
+        match_expressions: &Option<FilterExpression>,
+        exclude_expressions: &Option<FilterExpression>,
+        concurrency: usize,
+        total_file_count: Arc<AtomicUsize>,
+        packaged: bool,
+        package_depth: usize,
     ) -> Result<()> {
         // task 类型: (dir_path: String, depth: usize, skip_filter: bool, package_remaining: Option<usize>)
-        let contexts = create_worker_contexts(concurrency, (root_path.to_string(), 0usize, true, None::<usize>)).await;
+        let contexts = create_worker_contexts(
+            concurrency,
+            (root_path.to_string(), 0usize, true, None::<usize>),
+        )
+        .await;
 
         let match_expr = Arc::new(match_expressions.clone());
         let exclude_expr = Arc::new(exclude_expressions.clone());
@@ -1722,11 +1877,19 @@ impl CifsStorage {
     /// 处理单个目录：查询条目、过滤、发送
     #[allow(clippy::too_many_arguments)]
     async fn process_dir(
-        &self, producer_id: usize, dir_path: String, current_depth: usize,
+        &self,
+        producer_id: usize,
+        dir_path: String,
+        current_depth: usize,
         tx: &async_channel::Sender<StorageEntryMessage>,
         ctx: &crate::walk_scheduler::WorkerContext<(String, usize, bool, Option<usize>)>,
-        match_expr: &Arc<Option<FilterExpression>>, exclude_expr: &Arc<Option<FilterExpression>>, max_depth: usize,
-        total_file_count: &Arc<AtomicUsize>, skip_filter: bool, packaged: bool, package_depth: usize,
+        match_expr: &Arc<Option<FilterExpression>>,
+        exclude_expr: &Arc<Option<FilterExpression>>,
+        max_depth: usize,
+        total_file_count: &Arc<AtomicUsize>,
+        skip_filter: bool,
+        packaged: bool,
+        package_depth: usize,
         package_remaining: Option<usize>,
     ) -> Result<()> {
         // 构建目录的 UNC 路径
@@ -1743,11 +1906,14 @@ impl CifsStorage {
         let unc = if dir_relative.is_empty() {
             (*self.share_path).clone()
         } else {
-            (*self.share_path).clone().with_path(&dir_relative.replace('/', "\\"))
+            (*self.share_path)
+                .clone()
+                .with_path(&dir_relative.replace('/', "\\"))
         };
 
         // 打开目录
-        let dir_args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+        let dir_args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
         let resource = match self.client.create_file(&unc, &dir_args).await {
             Ok(r) => r,
             Err(e) => {
@@ -1767,7 +1933,10 @@ impl CifsStorage {
         };
 
         let Resource::Directory(directory) = resource else {
-            warn!("[Producer {}] Path {} is not a directory", producer_id, dir_path);
+            warn!(
+                "[Producer {}] Path {} is not a directory",
+                producer_id, dir_path
+            );
             return Ok(());
         };
 
@@ -1827,7 +1996,9 @@ impl CifsStorage {
                 full_path.clone()
             };
 
-            let extension = file_name_str.rsplit_once('.').map(|(_, ext)| ext.to_string());
+            let extension = file_name_str
+                .rsplit_once('.')
+                .map(|(_, ext)| ext.to_string());
             let file_name = &file_name_str;
 
             let is_dir = entry.file_attributes.directory();
@@ -1835,7 +2006,9 @@ impl CifsStorage {
             let is_readonly = entry.file_attributes.readonly();
 
             // 过滤逻辑
-            let modified_epoch = Some(crate::time_util::nanos_to_secs(filetime_to_nanos(entry.last_write_time)));
+            let modified_epoch = Some(crate::time_util::nanos_to_secs(filetime_to_nanos(
+                entry.last_write_time,
+            )));
 
             let (skip_entry, continue_scan, need_submatch) = if skip_filter {
                 should_skip(
@@ -1867,8 +2040,13 @@ impl CifsStorage {
                     continue;
                 }
                 if remaining > 1 {
-                    ctx.push_task((full_path.clone(), current_depth + 1, false, Some(remaining - 1)))
-                        .await;
+                    ctx.push_task((
+                        full_path.clone(),
+                        current_depth + 1,
+                        false,
+                        Some(remaining - 1),
+                    ))
+                    .await;
                     continue;
                 }
                 send_packaged = true;
@@ -1907,8 +2085,13 @@ impl CifsStorage {
                     continue;
                 }
                 if package_depth > 0 {
-                    ctx.push_task((full_path.clone(), current_depth + 1, false, Some(package_depth)))
-                        .await;
+                    ctx.push_task((
+                        full_path.clone(),
+                        current_depth + 1,
+                        false,
+                        Some(package_depth),
+                    ))
+                    .await;
                     continue;
                 }
                 send_packaged = true;
@@ -1963,15 +2146,17 @@ impl CifsStorage {
     /// 返回 smb-rs `SecurityDescriptor`，包含：
     /// - `dacl`: 仅非继承的显式 ACE
     /// - `control.dacl_protected`: 继承保护位（`true`=禁用继承）
-    pub async fn get_security_descriptor(&self, relative_path: &Path) -> Result<SecurityDescriptor> {
+    pub async fn get_security_descriptor(
+        &self,
+        relative_path: &Path,
+    ) -> Result<SecurityDescriptor> {
         let unc = self.build_unc_path(relative_path);
         let access = FileAccessMask::new().with_read_control(true);
         let args = FileCreateArgs::make_open_existing(access);
-        let resource = self
-            .client
-            .create_file(&unc, &args)
-            .await
-            .map_err(|e| StorageError::CifsError(format!("Failed to open for ACL read: {e}")))?;
+        let resource =
+            self.client.create_file(&unc, &args).await.map_err(|e| {
+                StorageError::CifsError(format!("Failed to open for ACL read: {e}"))
+            })?;
         let handle = cifs_resource_handle(&resource);
 
         let info = AdditionalInfo::new().with_dacl_security_information(true);
@@ -1979,7 +2164,9 @@ impl CifsStorage {
             Ok(sd) => sd,
             Err(e) => {
                 let _ = handle.close().await;
-                return Err(StorageError::CifsError(format!("Failed to query security info: {e}")));
+                return Err(StorageError::CifsError(format!(
+                    "Failed to query security info: {e}"
+                )));
             }
         };
         let _ = handle.close().await;
@@ -2010,15 +2197,20 @@ impl CifsStorage {
     /// 2. 合并：源端显式 ACE + 目标端继承 ACE → 完整 DACL
     /// 3. 写入合并后的 DACL（`SMB2` `SET_INFO` 会替换整个 DACL，需保留继承 ACE）
     /// 4. 如果源/目标都无显式 ACE 且保护位相同 → 跳过
-    pub async fn set_security_descriptor(&self, relative_path: &Path, source_sd: &SecurityDescriptor) -> Result<()> {
+    pub async fn set_security_descriptor(
+        &self,
+        relative_path: &Path,
+        source_sd: &SecurityDescriptor,
+    ) -> Result<()> {
         let unc = self.build_unc_path(relative_path);
-        let access = FileAccessMask::new().with_read_control(true).with_write_dacl(true);
+        let access = FileAccessMask::new()
+            .with_read_control(true)
+            .with_write_dacl(true);
         let args = FileCreateArgs::make_open_existing(access);
-        let resource = self
-            .client
-            .create_file(&unc, &args)
-            .await
-            .map_err(|e| StorageError::CifsError(format!("Failed to open for ACL write: {e}")))?;
+        let resource =
+            self.client.create_file(&unc, &args).await.map_err(|e| {
+                StorageError::CifsError(format!("Failed to open for ACL write: {e}"))
+            })?;
         let handle = cifs_resource_handle(&resource);
 
         // 读取目标当前状态，检查是否需要更新
@@ -2042,7 +2234,8 @@ impl CifsStorage {
             .is_some_and(|d| d.ace.iter().any(|ace| !ace.ace_flags.inherited()));
 
         // 需要更新的情况：保护位不同、源端有显式 ACE 需要写入、或目标端有多余显式 ACE 需要清理
-        let needs_update = source_protected != target_protected || has_source_explicit || has_target_explicit;
+        let needs_update =
+            source_protected != target_protected || has_source_explicit || has_target_explicit;
 
         trace!(
             "set_security_descriptor {:?}: target current DACL:\n    {}",
@@ -2053,7 +2246,12 @@ impl CifsStorage {
         debug!(
             "set_security_descriptor {:?}: source_protected={}, target_protected={}, \
              has_source_explicit={}, has_target_explicit={}, needs_update={}",
-            relative_path, source_protected, target_protected, has_source_explicit, has_target_explicit, needs_update
+            relative_path,
+            source_protected,
+            target_protected,
+            has_source_explicit,
+            has_target_explicit,
+            needs_update
         );
 
         if needs_update {
@@ -2068,7 +2266,13 @@ impl CifsStorage {
 
             // 目标端继承 ACE（保留原有继承链）
             if let Some(ref tgt_dacl) = target_sd.dacl {
-                merged_aces.extend(tgt_dacl.ace.iter().filter(|ace| ace.ace_flags.inherited()).cloned());
+                merged_aces.extend(
+                    tgt_dacl
+                        .ace
+                        .iter()
+                        .filter(|ace| ace.ace_flags.inherited())
+                        .cloned(),
+                );
             }
 
             let source_explicit_count = source_sd.dacl.as_ref().map_or(0, |d| d.ace.len());
@@ -2101,7 +2305,9 @@ impl CifsStorage {
             let set_info = AdditionalInfo::new().with_dacl_security_information(true);
             if let Err(e) = handle.set_security_info(new_sd, set_info).await {
                 let _ = handle.close().await;
-                return Err(StorageError::CifsError(format!("Failed to set security info: {e}")));
+                return Err(StorageError::CifsError(format!(
+                    "Failed to set security info: {e}"
+                )));
             }
         } else {
             debug!(
@@ -2122,7 +2328,10 @@ impl CifsStorage {
     ///
     /// 由 Reader Worker 调用，通过 SMB2 `FileIdExtdDirectoryInformation` 查询目录内容。
     pub(crate) async fn read_dir_sorted(
-        &self, dir_path: &str, handle: &crate::dir_tree::DirHandle, ctx: &crate::dir_tree::ReadContext,
+        &self,
+        dir_path: &str,
+        handle: &crate::dir_tree::DirHandle,
+        ctx: &crate::dir_tree::ReadContext,
     ) -> Result<crate::dir_tree::ReadResult> {
         use crate::dir_tree::{DirHandle, ReadResult, SubdirEntry};
 
@@ -2142,7 +2351,8 @@ impl CifsStorage {
         let unc = self.build_unc_path(Path::new(cifs_dir_path));
 
         // 打开目录
-        let dir_args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+        let dir_args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
         let resource = match self.client.create_file(&unc, &dir_args).await {
             Ok(r) => r,
             Err(e) => {
@@ -2190,14 +2400,18 @@ impl CifsStorage {
             }
 
             let relative_path = Self::build_relative_path(dir_path, &file_name_str);
-            let extension = file_name_str.rsplit_once('.').map(|(_, ext)| ext.to_string());
+            let extension = file_name_str
+                .rsplit_once('.')
+                .map(|(_, ext)| ext.to_string());
 
             let is_dir = entry.file_attributes.directory();
             let is_symlink = entry.file_attributes.reparse_point();
             let is_readonly = entry.file_attributes.readonly();
 
             // 过滤逻辑
-            let modified_epoch = Some(crate::time_util::nanos_to_secs(filetime_to_nanos(entry.last_write_time)));
+            let modified_epoch = Some(crate::time_util::nanos_to_secs(filetime_to_nanos(
+                entry.last_write_time,
+            )));
 
             let (skip_entry, continue_scan, need_submatch) = if ctx.apply_filter {
                 should_skip(
@@ -2221,7 +2435,10 @@ impl CifsStorage {
             };
 
             if skip_entry {
-                if is_dir && continue_scan && (ctx.max_depth == 0 || ctx.current_depth + 1 < ctx.max_depth) {
+                if is_dir
+                    && continue_scan
+                    && (ctx.max_depth == 0 || ctx.current_depth + 1 < ctx.max_depth)
+                {
                     let nas = NASEntry::from_smb_info(
                         file_name_str,
                         PathBuf::from(relative_path),
@@ -2287,8 +2504,12 @@ impl CifsStorage {
     /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
     #[allow(clippy::unused_async)]
     pub async fn walkdir_2(
-        &self, sub_path: Option<&Path>, depth: Option<usize>, match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>, concurrency: usize,
+        &self,
+        sub_path: Option<&Path>,
+        depth: Option<usize>,
+        match_expressions: Option<FilterExpression>,
+        exclude_expressions: Option<FilterExpression>,
+        concurrency: usize,
     ) -> Result<crate::WalkDirAsyncIterator2> {
         use crate::dir_tree::{DirHandle, ReadContext, ReadRequest, run_dfs_driver};
 
@@ -2308,7 +2529,9 @@ impl CifsStorage {
             let rx = req_rx.clone();
             tokio::spawn(async move {
                 while let Ok(req) = rx.recv().await {
-                    let result = storage.read_dir_sorted(&req.dir_path, &req.handle, &req.ctx).await;
+                    let result = storage
+                        .read_dir_sorted(&req.dir_path, &req.handle, &req.ctx)
+                        .await;
                     let _ = req.reply.send(result);
                 }
             });
@@ -2328,7 +2551,13 @@ impl CifsStorage {
             is_versioned: false,
         };
 
-        tokio::spawn(run_dfs_driver(req_tx, out_tx, root_path, root_handle, base_ctx));
+        tokio::spawn(run_dfs_driver(
+            req_tx,
+            out_tx,
+            root_path,
+            root_handle,
+            base_ctx,
+        ));
 
         Ok(crate::AsyncReceiver::new(out_rx))
     }
@@ -2367,7 +2596,9 @@ fn format_ace_summary(ace: &ACE) -> String {
 
     // 提取 SID（AccessAllowed/AccessDenied 都有 sid 字段）
     let sid_str = match &ace.value {
-        smb::AceValue::AccessAllowed(a) | smb::AceValue::AccessDenied(a) | smb::AceValue::SystemAudit(a) => {
+        smb::AceValue::AccessAllowed(a)
+        | smb::AceValue::AccessDenied(a)
+        | smb::AceValue::SystemAudit(a) => {
             format!("{}", a.sid)
         }
         _ => format!("{ace_type:?}"),
@@ -2440,7 +2671,10 @@ async fn probe_file_id(handle: &ResourceHandle) -> (FileIdClass, Option<u128>) {
 
 /// 用 SMB query 出来的 basic/standard info 组装一个 `EntryEnum::NAS`。
 fn build_nas_entry(
-    relative_path: &Path, basic: &FileBasicInformation, standard: &FileStandardInformation, is_dir: bool,
+    relative_path: &Path,
+    basic: &FileBasicInformation,
+    standard: &FileStandardInformation,
+    is_dir: bool,
     file_id: Option<u128>,
 ) -> EntryEnum {
     let filename = if relative_path.as_os_str().is_empty() {
@@ -2486,9 +2720,15 @@ async fn close_resource(resource: Resource) {
 /// 流式消费一种具体 SMB 目录信息类，规整为 `(Vec<RawDirEntry>, Vec<String>)`。
 ///
 /// 单条 entry 解析失败不中断流；query 起始失败通过 `?` 返回外层 `Err`。
-async fn drain_dir<T>(dir_arc: &Arc<smb::Directory>) -> std::result::Result<(Vec<RawDirEntry>, Vec<String>), smb::Error>
+async fn drain_dir<T>(
+    dir_arc: &Arc<smb::Directory>,
+) -> std::result::Result<(Vec<RawDirEntry>, Vec<String>), smb::Error>
 where
-    T: smb::QueryDirectoryInfoValue + IntoRawDirEntry + Unpin + Send + for<'b> binrw::BinWrite<Args<'b> = ()>,
+    T: smb::QueryDirectoryInfoValue
+        + IntoRawDirEntry
+        + Unpin
+        + Send
+        + for<'b> binrw::BinWrite<Args<'b> = ()>,
 {
     let mut stream = smb::Directory::query::<T>(dir_arc, "*").await?;
     let mut out = Vec::new();
@@ -2513,7 +2753,10 @@ pub async fn create_cifs_storage(url: &str, block_size: Option<u64>) -> Result<S
 /// 仅在 dest 路径使用。区别于 `create_cifs_storage`：跳过只读的连通性检查，
 /// 改由 `ensure_root_exists` 缺失时按层 mkdir（直接对 share 根，避开
 /// `build_unc_path` 的 root 前缀双重拼接）。
-pub async fn create_cifs_storage_ensuring_dir(url: &str, block_size: Option<u64>) -> Result<StorageEnum> {
+pub async fn create_cifs_storage_ensuring_dir(
+    url: &str,
+    block_size: Option<u64>,
+) -> Result<StorageEnum> {
     let storage = CifsStorage::connect_only(url, block_size).await?;
     storage.ensure_root_exists().await?;
     Ok(StorageEnum::CIFS(storage))
@@ -2572,8 +2815,7 @@ mod tests {
         assert!(smb2_only);
 
         // 默认（无参数）= true
-        let (_, _, _, _, _, _, smb2_only) =
-            parse_smb_url("smb://user:pass@server/share").unwrap();
+        let (_, _, _, _, _, _, smb2_only) = parse_smb_url("smb://user:pass@server/share").unwrap();
         assert!(smb2_only);
     }
 
@@ -2716,7 +2958,7 @@ mod tests {
         assert!(!cache.contains("d"));
 
         // invalidate 后腾出空间，新条目可登记。
-        cache.invalidate("a/b");  // 删 "a/b" 和 "a/b/c"
+        cache.invalidate("a/b"); // 删 "a/b" 和 "a/b/c"
         assert_eq!(cache.len(), 1);
         cache.insert("d".into());
         assert_eq!(cache.len(), 2);

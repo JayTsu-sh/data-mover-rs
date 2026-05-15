@@ -49,7 +49,17 @@ async fn copy_file_returns_cancelled_when_token_pre_cancelled() {
     let token = CancellationToken::new();
     token.cancel();
 
-    let res = StorageEnum::copy_file_with_cancel(&src, &dst, &entry, None, false, true, None, Some(token)).await;
+    let res = StorageEnum::copy_file_with_cancel(
+        &src,
+        &dst,
+        &entry,
+        None,
+        false,
+        true,
+        None,
+        Some(token),
+    )
+    .await;
 
     assert!(
         matches!(res, Err(StorageError::Cancelled)),

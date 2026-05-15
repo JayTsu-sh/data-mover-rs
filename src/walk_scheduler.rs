@@ -66,7 +66,8 @@ impl<T: Send> WorkerContext<T> {
 
     /// 检查是否所有任务都已完成（无活跃任务且无活跃生产者）
     pub fn is_done(&self) -> bool {
-        self.active_tasks.load(Ordering::Acquire) == 0 && self.active_producers.load(Ordering::Acquire) == 0
+        self.active_tasks.load(Ordering::Acquire) == 0
+            && self.active_producers.load(Ordering::Acquire) == 0
     }
 
     /// 等待新任务通知，超时 100μs 后返回（避免忙等，同时防止通知丢失）
@@ -80,7 +81,10 @@ impl<T: Send> WorkerContext<T> {
 /// 创建 N 个 WorkerContext，初始任务放入 worker 0 的栈
 ///
 /// concurrency 会被 clamp 到 [1, 64] 范围
-pub(crate) async fn create_worker_contexts<T: Send>(concurrency: usize, initial_task: T) -> Vec<WorkerContext<T>> {
+pub(crate) async fn create_worker_contexts<T: Send>(
+    concurrency: usize,
+    initial_task: T,
+) -> Vec<WorkerContext<T>> {
     let concurrency = concurrency.clamp(1, 64);
 
     let stacks: Vec<Arc<Mutex<VecDeque<T>>>> = (0..concurrency)
@@ -120,8 +124,11 @@ pub(crate) async fn create_worker_contexts<T: Send>(concurrency: usize, initial_
 ///
 /// 每获取一个任务调用 `process_fn`，若返回 Err 则记录错误日志但不中断循环。
 /// `task_display` 用于错误日志中显示任务信息。
-pub(crate) async fn run_worker_loop<T, F, Fut, D>(ctx: &WorkerContext<T>, mut process_fn: F, task_display: D)
-where
+pub(crate) async fn run_worker_loop<T, F, Fut, D>(
+    ctx: &WorkerContext<T>,
+    mut process_fn: F,
+    task_display: D,
+) where
     T: Send,
     F: FnMut(T) -> Fut,
     Fut: std::future::Future<Output = crate::Result<()>>,
@@ -133,7 +140,10 @@ where
 
             let task_info = task_display(&task);
             if let Err(e) = process_fn(task).await {
-                error!("[Worker {}] Failed to process {}: {:?}", ctx.worker_id, task_info, e);
+                error!(
+                    "[Worker {}] Failed to process {}: {:?}",
+                    ctx.worker_id, task_info, e
+                );
             }
 
             ctx.end_processing();

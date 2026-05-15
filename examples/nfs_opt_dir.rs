@@ -12,7 +12,11 @@ async fn main() -> Result<()> {
 
     let entry = storage.get_metadata(path).await?;
     println!("{:?}", entry);
-    storage = NFSStorage::new("nfs://10.131.9.20/mnt/zfs/jay/dataset/source:dir1/dir2/", None).await?;
+    storage = NFSStorage::new(
+        "nfs://10.131.9.20/mnt/zfs/jay/dataset/source:dir1/dir2/",
+        None,
+    )
+    .await?;
     storage.delete_dir_all(None).await?;
 
     Ok(())

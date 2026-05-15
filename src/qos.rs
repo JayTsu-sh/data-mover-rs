@@ -112,8 +112,9 @@ fn build_bandwidth_limiter_inner(base_rate_bps: u64, burst_bytes: u64) -> Result
 
     // 基准速率换算为 cells/sec（1 cell = 1 KB）
     let cells_per_sec = (base_rate_bps / 1024).max(1);
-    let rate = NonZeroU32::new(cells_per_sec as u32)
-        .ok_or_else(|| StorageError::ConfigError("带宽速率过小，换算后为0 cells/sec".to_string()))?;
+    let rate = NonZeroU32::new(cells_per_sec as u32).ok_or_else(|| {
+        StorageError::ConfigError("带宽速率过小，换算后为0 cells/sec".to_string())
+    })?;
 
     // burst 容量（cells）
     let burst_cells = (burst_bytes / 1024).max(1);
@@ -137,21 +138,28 @@ fn build_bandwidth_limiter(bandwidth_str: &str, peak_rate: f32) -> Result<Bandwi
 
 /// 显式 burst 版本：用基准速率字符串 + burst 字节数。
 /// 仅供 `try_new_with_burst` / `update_bandwidth_with_burst` 内部使用。
-fn build_bandwidth_limiter_with_burst(bandwidth_str: &str, burst_bytes: u64) -> Result<BandwidthLimiter> {
+fn build_bandwidth_limiter_with_burst(
+    bandwidth_str: &str,
+    burst_bytes: u64,
+) -> Result<BandwidthLimiter> {
     let base_rate_bps = parse_bandwidth_string(bandwidth_str)?;
     build_bandwidth_limiter_inner(base_rate_bps, burst_bytes)
 }
 
 /// 构建 IOPS limiter（1 cell = 1 op）
 fn build_iops_limiter(iops: u32) -> Result<IopsLimiter> {
-    let rate = NonZeroU32::new(iops).ok_or_else(|| StorageError::ConfigError("IOPS 值必须大于 0".to_string()))?;
+    let rate = NonZeroU32::new(iops)
+        .ok_or_else(|| StorageError::ConfigError("IOPS 值必须大于 0".to_string()))?;
 
     // burst 允许 IOPS 的 10% 或至少 10 个操作的突发
     let burst_ops = (iops / 10).max(10).min(iops);
-    let burst =
-        NonZeroU32::new(burst_ops).ok_or_else(|| StorageError::ConfigError("IOPS burst 计算异常".to_string()))?;
+    let burst = NonZeroU32::new(burst_ops)
+        .ok_or_else(|| StorageError::ConfigError("IOPS burst 计算异常".to_string()))?;
 
-    debug!("[QoS] IOPS 限制: rate={} ops/s, burst={} ops", iops, burst_ops);
+    debug!(
+        "[QoS] IOPS 限制: rate={} ops/s, burst={} ops",
+        iops, burst_ops
+    );
 
     let quota = Quota::per_second(rate).allow_burst(burst);
     Ok(RateLimiter::direct(quota))
@@ -219,7 +227,11 @@ impl QosManager {
     /// // 16 MiB 文件至少需要 ~1.875s 完成（首块 1 MiB 立即过，剩余 15 MiB 走 8 MiB/s）。
     /// let qos = QosManager::try_new_with_burst("8MiB/s", 1024 * 1024, None)?;
     /// ```
-    pub fn try_new_with_burst(bandwidth: &str, burst_bytes: u64, iops: Option<u32>) -> Result<Self> {
+    pub fn try_new_with_burst(
+        bandwidth: &str,
+        burst_bytes: u64,
+        iops: Option<u32>,
+    ) -> Result<Self> {
         let limiter = build_bandwidth_limiter_with_burst(bandwidth, burst_bytes)?;
         let bandwidth_limiter = Some(Arc::new(ArcSwap::from_pointee(limiter)));
 

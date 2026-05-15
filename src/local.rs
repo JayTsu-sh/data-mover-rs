@@ -19,11 +19,11 @@ use crate::error::StorageError;
 use crate::filter::{FilterExpression, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
-use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
 use crate::time_util;
+use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
 use crate::{
-    DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, MB, NASEntry, Result, StorageEntryMessage,
-    WalkDirAsyncIterator,
+    DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, MB, NASEntry, Result,
+    StorageEntryMessage, WalkDirAsyncIterator,
 };
 
 impl NASEntry {
@@ -31,7 +31,11 @@ impl NASEntry {
     /// Unix 与 Windows 的差异封装在此函数内部。
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn from_local_metadata(
-        name: String, relative_path: PathBuf, extension: Option<String>, metadata: &std::fs::Metadata, is_symlink: bool,
+        name: String,
+        relative_path: PathBuf,
+        extension: Option<String>,
+        metadata: &std::fs::Metadata,
+        is_symlink: bool,
     ) -> Self {
         #[cfg(unix)]
         let mode = metadata.permissions().mode();
@@ -114,7 +118,9 @@ impl LocalStorage {
         Self {
             root_path: Arc::new(root.into()),
             config: StorageConfig {
-                block_size: block_size.map_or(DEFAULT_BLOCK_SIZE, |size| std::cmp::min(size, DEFAULT_BLOCK_SIZE)),
+                block_size: block_size.map_or(DEFAULT_BLOCK_SIZE, |size| {
+                    std::cmp::min(size, DEFAULT_BLOCK_SIZE)
+                }),
             },
         }
     }
@@ -132,7 +138,10 @@ impl LocalStorage {
     }
 
     async fn create_file(
-        &self, relative_path: &Path, #[allow(unused)] uid: Option<u32>, #[allow(unused)] gid: Option<u32>,
+        &self,
+        relative_path: &Path,
+        #[allow(unused)] uid: Option<u32>,
+        #[allow(unused)] gid: Option<u32>,
         #[allow(unused)] mode: Option<u32>,
     ) -> Result<LocalFileHandle> {
         let full_path = self.get_full_path(relative_path);
@@ -146,26 +155,38 @@ impl LocalStorage {
 
         let file = options.open(&full_path).await?;
 
-        self.set_metadata(relative_path, None, None, uid, gid, mode).await?;
+        self.set_metadata(relative_path, None, None, uid, gid, mode)
+            .await?;
 
         Ok(LocalFileHandle::new(file))
     }
 
     pub async fn delete_file(&self, relative_path: &Path) -> Result<()> {
         let full_path = self.get_full_path(relative_path);
-        tokio::fs::remove_file(&full_path).await.map_err(StorageError::IoError)
+        tokio::fs::remove_file(&full_path)
+            .await
+            .map_err(StorageError::IoError)
     }
 
     pub async fn create_symlink(
-        &self, #[allow(unused)] relative_path: &Path, #[allow(unused)] target: &Path, #[allow(unused)] atime: i64,
-        #[allow(unused)] mtime: i64, #[allow(unused)] uid: Option<u32>, #[allow(unused)] gid: Option<u32>,
+        &self,
+        #[allow(unused)] relative_path: &Path,
+        #[allow(unused)] target: &Path,
+        #[allow(unused)] atime: i64,
+        #[allow(unused)] mtime: i64,
+        #[allow(unused)] uid: Option<u32>,
+        #[allow(unused)] gid: Option<u32>,
     ) -> Result<()> {
         #[cfg(unix)]
         {
             let full_path = self.get_full_path(relative_path);
 
             // 安全校验：拒绝指向绝对路径或包含 ".." 的符号链接目标，防止路径穿越
-            if target.is_absolute() || target.components().any(|c| c == std::path::Component::ParentDir) {
+            if target.is_absolute()
+                || target
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+            {
                 return Err(StorageError::OperationError(format!(
                     "Unsafe symlink target rejected: {:?} (absolute paths and '..' are not allowed)",
                     target
@@ -183,7 +204,10 @@ impl LocalStorage {
             let atime = time_util::nanos_to_filetime_local(atime);
             let mtime = time_util::nanos_to_filetime_local(mtime);
 
-            match tokio::task::spawn_blocking(move || filetime::set_symlink_file_times(&full_path, atime, mtime)).await
+            match tokio::task::spawn_blocking(move || {
+                filetime::set_symlink_file_times(&full_path, atime, mtime)
+            })
+            .await
             {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(err)) => Err(StorageError::from(err)),
@@ -205,7 +229,9 @@ impl LocalStorage {
     pub async fn read_symlink(&self, relative_path: &Path) -> Result<PathBuf> {
         let full_path = self.get_full_path(relative_path);
 
-        tokio::fs::read_link(&full_path).await.map_err(StorageError::IoError)
+        tokio::fs::read_link(&full_path)
+            .await
+            .map_err(StorageError::IoError)
     }
 
     pub async fn create_dir_all(&self, relative_path: &Path) -> Result<()> {
@@ -223,7 +249,9 @@ impl LocalStorage {
     }
 
     pub fn delete_dir_all_with_progress(
-        &self, relative_path: Option<&Path>, concurrency: usize,
+        &self,
+        relative_path: Option<&Path>,
+        concurrency: usize,
     ) -> Result<DeleteDirIterator> {
         let full_path = match relative_path {
             Some(p) => self.get_full_path(p),
@@ -234,7 +262,10 @@ impl LocalStorage {
         let concurrency = concurrency.clamp(1, 64);
 
         tokio::task::spawn_blocking(move || {
-            let pool = match rayon::ThreadPoolBuilder::new().num_threads(concurrency).build() {
+            let pool = match rayon::ThreadPoolBuilder::new()
+                .num_threads(concurrency)
+                .build()
+            {
                 Ok(pool) => pool,
                 Err(e) => {
                     error!("Failed to build rayon thread pool: {}", e);
@@ -262,16 +293,27 @@ impl LocalStorage {
         let path = relative_path.to_path_buf();
         let full_path = self.get_full_path(relative_path);
         let metadata = tokio::fs::symlink_metadata(&full_path).await?;
-        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let is_symlink = metadata.is_symlink();
-        Ok(EntryEnum::NAS(NASEntry::from_local_metadata(name, path, None, &metadata, is_symlink)))
+        Ok(EntryEnum::NAS(NASEntry::from_local_metadata(
+            name, path, None, &metadata, is_symlink,
+        )))
     }
 
     /// 更新文件元数据: 包括修改时间、访问时间、所有者UID、组ID和权限模式.
     /// 该函数会同步更新文件和目录的元数据（不包含软链接）.
     pub async fn set_metadata(
-        &self, relative_path: &Path, atime: Option<i64>, mtime: Option<i64>, #[allow(unused)] uid: Option<u32>,
-        #[allow(unused)] gid: Option<u32>, #[allow(unused)] mode: Option<u32>,
+        &self,
+        relative_path: &Path,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+        #[allow(unused)] uid: Option<u32>,
+        #[allow(unused)] gid: Option<u32>,
+        #[allow(unused)] mode: Option<u32>,
     ) -> Result<()> {
         let full_path = self.get_full_path(relative_path);
 
@@ -289,10 +331,14 @@ impl LocalStorage {
                 let atime = time_util::nanos_to_filetime_local(atime);
                 let mtime = time_util::nanos_to_filetime_local(mtime);
 
-                tokio::task::spawn_blocking(move || filetime::set_file_times(&path_clone, atime, mtime))
-                    .await
-                    .map_err(|err| StorageError::from(std::io::Error::other(format!("Task spawn failed: {err:?}"))))?
-                    .map_err(StorageError::from)
+                tokio::task::spawn_blocking(move || {
+                    filetime::set_file_times(&path_clone, atime, mtime)
+                })
+                .await
+                .map_err(|err| {
+                    StorageError::from(std::io::Error::other(format!("Task spawn failed: {err:?}")))
+                })?
+                .map_err(StorageError::from)
             }));
         }
 
@@ -306,7 +352,9 @@ impl LocalStorage {
                     tokio::task::spawn_blocking(move || lchown(&path_clone, Some(uid), Some(gid)))
                         .await
                         .map_err(|err| {
-                            StorageError::from(std::io::Error::other(format!("Task spawn failed: {err:?}")))
+                            StorageError::from(std::io::Error::other(format!(
+                                "Task spawn failed: {err:?}"
+                            )))
                         })?
                         .map_err(StorageError::from)
                 }));
@@ -333,8 +381,14 @@ impl LocalStorage {
 
     #[allow(clippy::too_many_arguments, clippy::unused_async)]
     pub async fn walkdir(
-        &self, sub_path: Option<&Path>, depth: Option<usize>, match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>, concurrency: usize, packaged: bool, package_depth: usize,
+        &self,
+        sub_path: Option<&Path>,
+        depth: Option<usize>,
+        match_expressions: Option<FilterExpression>,
+        exclude_expressions: Option<FilterExpression>,
+        concurrency: usize,
+        packaged: bool,
+        package_depth: usize,
     ) -> Result<WalkDirAsyncIterator> {
         let (tx, rx) = async_channel::bounded(1000); // 缓冲区大小1000
 
@@ -385,12 +439,22 @@ impl LocalStorage {
     /// 迭代式目录遍历函数，使用工作窃取队列实现高效并发
     #[allow(clippy::too_many_arguments, clippy::ref_option)]
     async fn iterative_walkdir(
-        &self, root_path: &Path, tx: async_channel::Sender<StorageEntryMessage>, max_depth: usize,
-        match_expressions: &Option<FilterExpression>, exclude_expressions: &Option<FilterExpression>,
-        concurrency: usize, total_file_count: Arc<AtomicUsize>, packaged: bool, package_depth: usize,
+        &self,
+        root_path: &Path,
+        tx: async_channel::Sender<StorageEntryMessage>,
+        max_depth: usize,
+        match_expressions: &Option<FilterExpression>,
+        exclude_expressions: &Option<FilterExpression>,
+        concurrency: usize,
+        total_file_count: Arc<AtomicUsize>,
+        packaged: bool,
+        package_depth: usize,
     ) -> Result<()> {
-        let contexts =
-            create_worker_contexts(concurrency, (root_path.to_path_buf(), 0usize, true, None::<usize>)).await;
+        let contexts = create_worker_contexts(
+            concurrency,
+            (root_path.to_path_buf(), 0usize, true, None::<usize>),
+        )
+        .await;
         let match_expr = Arc::new(match_expressions.clone());
         let exclude_expr = Arc::new(exclude_expressions.clone());
 
@@ -440,11 +504,19 @@ impl LocalStorage {
     /// 处理单个目录，读取条目并过滤，发送符合条件的 `StorageEntry`
     #[allow(clippy::too_many_arguments)]
     async fn process_dir(
-        &self, producer_id: usize, dir_path: PathBuf, current_depth: usize,
+        &self,
+        producer_id: usize,
+        dir_path: PathBuf,
+        current_depth: usize,
         tx: &async_channel::Sender<StorageEntryMessage>,
         ctx: &crate::walk_scheduler::WorkerContext<(PathBuf, usize, bool, Option<usize>)>,
-        match_expr: &Arc<Option<FilterExpression>>, exclude_expr: &Arc<Option<FilterExpression>>, max_depth: usize,
-        total_file_count: &Arc<AtomicUsize>, skip_filter: bool, packaged: bool, package_depth: usize,
+        match_expr: &Arc<Option<FilterExpression>>,
+        exclude_expr: &Arc<Option<FilterExpression>>,
+        max_depth: usize,
+        total_file_count: &Arc<AtomicUsize>,
+        skip_filter: bool,
+        packaged: bool,
+        package_depth: usize,
         package_remaining: Option<usize>,
     ) -> Result<()> {
         // 使用tokio::fs::read_dir读取目录条目
@@ -471,7 +543,10 @@ impl LocalStorage {
 
             // 计算相对路径
             let Ok(relative_path) = full_path.strip_prefix(&*self.root_path) else {
-                error!("[Producer {}] Failed to strip prefix from {:?}", producer_id, full_path);
+                error!(
+                    "[Producer {}] Failed to strip prefix from {:?}",
+                    producer_id, full_path
+                );
                 let _ = tx
                     .send(StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
@@ -564,8 +639,13 @@ impl LocalStorage {
                     continue;
                 }
                 if remaining > 1 {
-                    ctx.push_task((full_path.clone(), current_depth + 1, false, Some(remaining - 1)))
-                        .await;
+                    ctx.push_task((
+                        full_path.clone(),
+                        current_depth + 1,
+                        false,
+                        Some(remaining - 1),
+                    ))
+                    .await;
                     continue;
                 }
                 // remaining <= 1：到达目标深度，标记发送 Packaged
@@ -578,7 +658,10 @@ impl LocalStorage {
                     ctx.push_task((full_path.clone(), current_depth + 1, need_submatch, None))
                         .await;
                 }
-                debug!("[Producer {}] Skipping entry {:?} (filter)", producer_id, relative_path);
+                debug!(
+                    "[Producer {}] Skipping entry {:?} (filter)",
+                    producer_id, relative_path
+                );
                 continue;
             }
 
@@ -592,14 +675,22 @@ impl LocalStorage {
             ));
 
             // packaged 模式：目录匹配 DirDate 条件时决定打包策略
-            if !send_packaged && packaged && is_dir && dir_matches_date_filter(match_expr.as_ref().as_ref(), &file_name)
+            if !send_packaged
+                && packaged
+                && is_dir
+                && dir_matches_date_filter(match_expr.as_ref().as_ref(), &file_name)
             {
                 if max_depth > 0 && entry_depth + package_depth > max_depth {
                     continue;
                 }
                 if package_depth > 0 {
-                    ctx.push_task((full_path.clone(), current_depth + 1, false, Some(package_depth)))
-                        .await;
+                    ctx.push_task((
+                        full_path.clone(),
+                        current_depth + 1,
+                        false,
+                        Some(package_depth),
+                    ))
+                    .await;
                     continue;
                 }
                 send_packaged = true;
@@ -611,8 +702,15 @@ impl LocalStorage {
                     "[Producer {}] Packaged dir {:?} (depth: {})",
                     producer_id, relative_path, entry_depth
                 );
-                if tx.send(StorageEntryMessage::Packaged(Arc::new(entry))).await.is_err() {
-                    error!("[Producer {}] Output channel closed, stopping processing", producer_id);
+                if tx
+                    .send(StorageEntryMessage::Packaged(Arc::new(entry)))
+                    .await
+                    .is_err()
+                {
+                    error!(
+                        "[Producer {}] Output channel closed, stopping processing",
+                        producer_id
+                    );
                     break;
                 }
                 total_file_count.fetch_add(1, Ordering::Relaxed);
@@ -627,8 +725,15 @@ impl LocalStorage {
                     producer_id, entry, entry_depth
                 );
                 // 发送StorageEntry到通道
-                if tx.send(StorageEntryMessage::Scanned(Arc::new(entry))).await.is_err() {
-                    error!("[Producer {}] Output channel closed, stopping processing", producer_id);
+                if tx
+                    .send(StorageEntryMessage::Scanned(Arc::new(entry)))
+                    .await
+                    .is_err()
+                {
+                    error!(
+                        "[Producer {}] Output channel closed, stopping processing",
+                        producer_id
+                    );
                     break;
                 }
 
@@ -653,7 +758,9 @@ impl LocalStorage {
         let mut remaining = count;
 
         while remaining > 0 {
-            file.inner.seek(std::io::SeekFrom::Start(current_offset)).await?;
+            file.inner
+                .seek(std::io::SeekFrom::Start(current_offset))
+                .await?;
             let read_bytes = file.inner.read_buf(&mut buffer).await? as u64;
 
             if read_bytes == 0 {
@@ -664,7 +771,10 @@ impl LocalStorage {
             remaining -= read_bytes;
         }
 
-        trace!("read {} bytes from file in local storage using tokio", buffer.len());
+        trace!(
+            "read {} bytes from file in local storage using tokio",
+            buffer.len()
+        );
         Ok(buffer.split().freeze())
     }
 
@@ -678,7 +788,10 @@ impl LocalStorage {
         let length = data.len();
 
         file.inner.seek(std::io::SeekFrom::Start(offset)).await?;
-        let written = file.inner.write_buf(&mut std::io::Cursor::new(data)).await?;
+        let written = file
+            .inner
+            .write_buf(&mut std::io::Cursor::new(data))
+            .await?;
 
         if written != length {
             return Err(StorageError::IoError(std::io::Error::new(
@@ -698,7 +811,12 @@ impl LocalStorage {
     }
 
     pub(crate) async fn write_file(
-        &self, path: &Path, data: Bytes, uid: Option<u32>, gid: Option<u32>, mode: Option<u32>,
+        &self,
+        path: &Path,
+        data: Bytes,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: Option<u32>,
     ) -> Result<()> {
         let mut handle = self.create_file(path, uid, gid, mode).await?;
         self.write(&mut handle, 0, data).await?;
@@ -715,7 +833,11 @@ impl LocalStorage {
     }
 
     pub(crate) async fn read_data(
-        &self, tx: Sender<DataChunk>, relative_path: &Path, size: u64, enable_integrity_check: bool,
+        &self,
+        tx: Sender<DataChunk>,
+        relative_path: &Path,
+        size: u64,
+        enable_integrity_check: bool,
         qos: Option<QosManager>,
     ) -> Result<Option<HashCalculator>> {
         // 如果文件大小为0，直接返回
@@ -755,7 +877,10 @@ impl LocalStorage {
             // 如果提供了 QoS 管理器，则进行带宽 + IOPS 限流
             if let Some(ref qos) = qos {
                 qos.acquire(chunk_size).await;
-                debug!("QoS acquired {} bytes for file {:?}", chunk_size, relative_path);
+                debug!(
+                    "QoS acquired {} bytes for file {:?}",
+                    chunk_size, relative_path
+                );
             }
 
             let data = match self.read(&mut source_file, offset, chunk_size).await {
@@ -818,8 +943,13 @@ impl LocalStorage {
     }
 
     pub(crate) async fn write_data(
-        &self, rx: tokio::sync::mpsc::Receiver<DataChunk>, relative_path: &Path, #[allow(unused)] uid: Option<u32>,
-        #[allow(unused)] gid: Option<u32>, #[allow(unused)] mode: Option<u32>, bytes_counter: Option<Arc<AtomicU64>>,
+        &self,
+        rx: tokio::sync::mpsc::Receiver<DataChunk>,
+        relative_path: &Path,
+        #[allow(unused)] uid: Option<u32>,
+        #[allow(unused)] gid: Option<u32>,
+        #[allow(unused)] mode: Option<u32>,
+        bytes_counter: Option<Arc<AtomicU64>>,
     ) -> Result<()> {
         trace!("Starting write_data_task for file {:?}", relative_path);
 
@@ -866,7 +996,10 @@ impl LocalStorage {
 impl LocalStorage {
     /// 读取单个目录，返回排序后的 files + subdirs。Reader Worker 调用此函数。
     pub(crate) async fn read_dir_sorted(
-        &self, dir_path: &str, handle: &crate::dir_tree::DirHandle, ctx: &crate::dir_tree::ReadContext,
+        &self,
+        dir_path: &str,
+        handle: &crate::dir_tree::DirHandle,
+        ctx: &crate::dir_tree::ReadContext,
     ) -> Result<crate::dir_tree::ReadResult> {
         use crate::dir_tree::{DirHandle, ReadResult, SubdirEntry};
 
@@ -906,7 +1039,10 @@ impl LocalStorage {
 
             let entry_full_path = entry.path();
             let Ok(relative_path) = entry_full_path.strip_prefix(&*self.root_path) else {
-                errors.push(format!("Failed to strip prefix: {}", entry_full_path.display()));
+                errors.push(format!(
+                    "Failed to strip prefix: {}",
+                    entry_full_path.display()
+                ));
                 continue;
             };
             let relative_path = relative_path.to_path_buf();
@@ -920,8 +1056,15 @@ impl LocalStorage {
             };
 
             let is_dir = metadata.is_dir();
-            let is_symlink = entry.file_type().await.map(|ft| ft.is_symlink()).unwrap_or(false);
-            let extension_owned = relative_path.extension().and_then(|e| e.to_str()).map(str::to_string);
+            let is_symlink = entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_symlink())
+                .unwrap_or(false);
+            let extension_owned = relative_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string);
 
             // 应用 filter（仅当 apply_filter=true 时）
             let (skip_entry, continue_scan, need_submatch) = if ctx.apply_filter {
@@ -957,9 +1100,17 @@ impl LocalStorage {
 
             if skip_entry {
                 // 目录被跳过但 continue_scan=true → 加入 subdirs 但 visible=false
-                if is_dir && continue_scan && (ctx.max_depth == 0 || ctx.current_depth + 1 < ctx.max_depth) {
-                    let nas =
-                        NASEntry::from_local_metadata(file_name, relative_path, extension_owned, &metadata, is_symlink);
+                if is_dir
+                    && continue_scan
+                    && (ctx.max_depth == 0 || ctx.current_depth + 1 < ctx.max_depth)
+                {
+                    let nas = NASEntry::from_local_metadata(
+                        file_name,
+                        relative_path,
+                        extension_owned,
+                        &metadata,
+                        is_symlink,
+                    );
                     subdirs.push(SubdirEntry {
                         entry: Arc::new(EntryEnum::NAS(nas)),
                         visible: false,
@@ -969,7 +1120,13 @@ impl LocalStorage {
                 continue;
             }
 
-            let nas = NASEntry::from_local_metadata(file_name, relative_path, extension_owned, &metadata, is_symlink);
+            let nas = NASEntry::from_local_metadata(
+                file_name,
+                relative_path,
+                extension_owned,
+                &metadata,
+                is_symlink,
+            );
             let entry_enum = Arc::new(EntryEnum::NAS(nas));
 
             // 深度检查：超过 max_depth 的子目录不进入 subdirs（不递归），但仍作为 entry 记录
@@ -1001,8 +1158,12 @@ impl LocalStorage {
     /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
     #[allow(clippy::unused_async)]
     pub async fn walkdir_2(
-        &self, sub_path: Option<&Path>, depth: Option<usize>, match_expressions: Option<crate::FilterExpression>,
-        exclude_expressions: Option<crate::FilterExpression>, concurrency: usize,
+        &self,
+        sub_path: Option<&Path>,
+        depth: Option<usize>,
+        match_expressions: Option<crate::FilterExpression>,
+        exclude_expressions: Option<crate::FilterExpression>,
+        concurrency: usize,
     ) -> Result<crate::WalkDirAsyncIterator2> {
         use crate::dir_tree::{DirHandle, ReadContext, ReadRequest, run_dfs_driver};
 
@@ -1021,7 +1182,9 @@ impl LocalStorage {
             let rx = req_rx.clone();
             tokio::spawn(async move {
                 while let Ok(req) = rx.recv().await {
-                    let result = storage.read_dir_sorted(&req.dir_path, &req.handle, &req.ctx).await;
+                    let result = storage
+                        .read_dir_sorted(&req.dir_path, &req.handle, &req.ctx)
+                        .await;
                     let _ = req.reply.send(result);
                 }
             });
@@ -1039,7 +1202,13 @@ impl LocalStorage {
             is_versioned: false,
         };
 
-        tokio::spawn(run_dfs_driver(req_tx, out_tx, root_path, root_handle, base_ctx));
+        tokio::spawn(run_dfs_driver(
+            req_tx,
+            out_tx,
+            root_path,
+            root_handle,
+            base_ctx,
+        ));
 
         Ok(crate::AsyncReceiver::new(out_rx))
     }
@@ -1048,8 +1217,9 @@ impl LocalStorage {
 /// 将用户输入路径规范化：canonicalize + Windows 长路径前缀处理
 /// 注意：canonicalize 要求路径已存在
 fn normalize_local_path(path: &str) -> Result<String> {
-    let canonical_path = std::fs::canonicalize(path)
-        .map_err(|e| StorageError::InvalidPath(format!("Failed to canonicalize path '{path}': {e}")))?;
+    let canonical_path = std::fs::canonicalize(path).map_err(|e| {
+        StorageError::InvalidPath(format!("Failed to canonicalize path '{path}': {e}"))
+    })?;
 
     #[cfg(windows)]
     {
@@ -1073,7 +1243,10 @@ fn normalize_local_path(path: &str) -> Result<String> {
 }
 
 /// 创建本地目标存储实例，如果目录不存在则自动创建
-pub fn create_local_storage_ensuring_dir(path: &str, block_size: Option<u64>) -> Result<StorageEnum> {
+pub fn create_local_storage_ensuring_dir(
+    path: &str,
+    block_size: Option<u64>,
+) -> Result<StorageEnum> {
     // create_dir_all 是幂等操作：目录已存在时不报错，不存在时递归创建
     std::fs::create_dir_all(path).map_err(StorageError::IoError)?;
     create_local_storage(path, block_size)

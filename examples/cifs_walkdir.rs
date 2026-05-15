@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
 use data_mover::storage_enum::create_storage;
 use data_mover::{EntryEnum, Result, StorageEntryMessage};
+use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
@@ -37,7 +37,11 @@ async fn main() -> Result<()> {
     let storage = create_storage(&args.url, None).await?;
 
     let start = Instant::now();
-    let depth = if args.depth == 0 { None } else { Some(args.depth) };
+    let depth = if args.depth == 0 {
+        None
+    } else {
+        Some(args.depth)
+    };
 
     let stats = Arc::new(Mutex::new(Stats {
         total_entries: 0,

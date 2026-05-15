@@ -37,7 +37,9 @@ pub fn nanos_subsec(nanos: i64) -> u32 {
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub fn system_time_to_nanos(st: SystemTime) -> i64 {
-    st.duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
+    st.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 #[inline]

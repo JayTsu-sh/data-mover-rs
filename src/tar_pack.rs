@@ -24,7 +24,14 @@ use crate::EntryEnum;
 /// - 265..512: 填零
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_ustar_header(
-    path: &str, size: u64, mtime: i64, mode: u32, uid: u32, gid: u32, type_flag: u8, link_name: &str,
+    path: &str,
+    size: u64,
+    mtime: i64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    type_flag: u8,
+    link_name: &str,
 ) -> [u8; 512] {
     let mut header = [0u8; 512];
 
@@ -117,7 +124,11 @@ pub fn calculate_tar_size(entries: &[Arc<EntryEnum>]) -> u64 {
 ///
 /// 自动判断条目类型（目录/symlink/普通文件）并设置对应的 `type_flag` 和 size。
 /// `tar_internal_path` 是条目在 tar 内的相对路径。
-pub(crate) fn build_header_for_entry(entry: &EntryEnum, tar_internal_path: &str, link_target: &str) -> Bytes {
+pub(crate) fn build_header_for_entry(
+    entry: &EntryEnum,
+    tar_internal_path: &str,
+    link_target: &str,
+) -> Bytes {
     let (type_flag, size) = if entry.get_is_dir() {
         (b'5', 0u64)
     } else if entry.get_is_symlink() {
@@ -172,7 +183,16 @@ mod tests {
 
     #[test]
     fn test_build_ustar_header_basic() {
-        let header = build_ustar_header("test.txt", 1024, 1_700_000_000_000_000_000, 0o644, 1000, 1000, b'0', "");
+        let header = build_ustar_header(
+            "test.txt",
+            1024,
+            1_700_000_000_000_000_000,
+            0o644,
+            1000,
+            1000,
+            b'0',
+            "",
+        );
 
         // magic
         assert_eq!(&header[257..263], b"ustar\0");
@@ -189,21 +209,43 @@ mod tests {
 
     #[test]
     fn test_build_ustar_header_directory() {
-        let header = build_ustar_header("mydir/", 0, 1_700_000_000_000_000_000, 0o755, 0, 0, b'5', "");
+        let header = build_ustar_header(
+            "mydir/",
+            0,
+            1_700_000_000_000_000_000,
+            0o755,
+            0,
+            0,
+            b'5',
+            "",
+        );
         assert_eq!(header[156], b'5');
         // size should be zero for directories
         // size field (124..136): "00000000000\0"
         let size_field = std::str::from_utf8(&header[124..135]).ok();
         assert!(size_field.is_some());
         assert_eq!(
-            u64::from_str_radix(size_field.map(|s| s.trim_start_matches('0')).unwrap_or("0"), 8).unwrap_or(0),
+            u64::from_str_radix(
+                size_field.map(|s| s.trim_start_matches('0')).unwrap_or("0"),
+                8
+            )
+            .unwrap_or(0),
             0
         );
     }
 
     #[test]
     fn test_checksum_correctness() {
-        let header = build_ustar_header("hello.txt", 5, 1_000_000_000_000_000_000, 0o644, 0, 0, b'0', "");
+        let header = build_ustar_header(
+            "hello.txt",
+            5,
+            1_000_000_000_000_000_000,
+            0o644,
+            0,
+            0,
+            b'0',
+            "",
+        );
 
         // 验证 checksum：将 checksum 字段视为空格，求所有字节的和
         let mut check_header = header;

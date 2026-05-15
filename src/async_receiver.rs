@@ -15,7 +15,9 @@ pub struct AsyncReceiver<T> {
 
 impl<T> Clone for AsyncReceiver<T> {
     fn clone(&self) -> Self {
-        Self { rx: self.rx.clone() }
+        Self {
+            rx: self.rx.clone(),
+        }
     }
 }
 

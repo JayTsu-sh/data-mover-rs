@@ -14,10 +14,11 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
-    AddAce, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetAce, GetAclInformation,
-    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorLength, INHERITED_ACE, InitializeAcl,
-    IsValidSecurityDescriptor, IsValidSid, LookupAccountSidW, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
+    ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
+    AclSizeInformation, AddAce, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetAce,
+    GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    GetSecurityDescriptorLength, INHERITED_ACE, InitializeAcl, IsValidSecurityDescriptor,
+    IsValidSid, LookupAccountSidW, OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
     SECURITY_DESCRIPTOR_CONTROL, SID, SID_NAME_USE, SetSecurityDescriptorControl,
 };
 use windows_sys::Win32::System::Memory::{LMEM_FIXED, LocalAlloc};
@@ -254,7 +255,11 @@ impl fmt::Display for AceInfo {
         write!(f, "Trustee: {}", self.trustee)?;
         write!(f, ", Type: {}", self.trustee_type)?;
         write!(f, ", Access Mode: {}", self.access_mode)?;
-        write!(f, ", Inherited: {}", if self.inherited { "Yes" } else { "No" })?;
+        write!(
+            f,
+            ", Inherited: {}",
+            if self.inherited { "Yes" } else { "No" }
+        )?;
         write!(f, ", ACE Type: 0x{:02X}", self.ace_type)?;
         write!(f, ", Mask: 0x{:08X}", self.mask)?;
         write!(
@@ -272,18 +277,29 @@ impl fmt::Display for SecurityInfo {
         write!(f, "Path: {}", self.path.display())?;
         write!(f, ", Owner: {}", self.owner)?;
         write!(f, ", Primary Group: {}", self.primary_group)?;
-        write!(f, ", Has DACL: {}", if self.has_dacl { "Yes" } else { "No" })?;
+        write!(
+            f,
+            ", Has DACL: {}",
+            if self.has_dacl { "Yes" } else { "No" }
+        )?;
         write!(
             f,
             ", Inheritance Enabled: {}",
-            if self.inheritance_enabled { "Yes" } else { "No" }
+            if self.inheritance_enabled {
+                "Yes"
+            } else {
+                "No"
+            }
         )?;
         write!(f, ", ACE Count: {}", self.aces.len())
     }
 }
 
 fn path_to_wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// 读取目录自身的ACE（不包括继承的ACE）
@@ -298,7 +314,11 @@ pub fn get_security_info(path: &Path) -> Result<SecurityInfo> {
         let sd_size = GetSecurityDescriptorLength(sd);
         let mut security_descriptor = Vec::with_capacity(sd_size as usize);
         security_descriptor.set_len(sd_size as usize);
-        std::ptr::copy_nonoverlapping(sd as *const u8, security_descriptor.as_mut_ptr(), sd_size as usize);
+        std::ptr::copy_nonoverlapping(
+            sd as *const u8,
+            security_descriptor.as_mut_ptr(),
+            sd_size as usize,
+        );
 
         // 获取所有者信息
         let owner = if !owner_sid.is_null() && IsValidSid(owner_sid) != 0 {
@@ -336,7 +356,9 @@ pub fn get_security_info(path: &Path) -> Result<SecurityInfo> {
         let mut dacl_defaulted: i32 = 0;
         let mut temp_dacl = std::ptr::null_mut();
 
-        let has_dacl = GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut temp_dacl, &mut dacl_defaulted) != 0;
+        let has_dacl =
+            GetSecurityDescriptorDacl(sd, &mut dacl_present, &mut temp_dacl, &mut dacl_defaulted)
+                != 0;
 
         // 解析DACL中的ACE
         let aces = if has_dacl && dacl_present != 0 && !temp_dacl.is_null() {
@@ -377,7 +399,9 @@ fn parse_dacl_entries(dacl: *mut ACL) -> Result<Vec<AceInfo>> {
             AclSizeInformation,
         ) == 0
         {
-            return Err(StorageError::WinAceError("Failed to get DACL information".to_string()));
+            return Err(StorageError::WinAceError(
+                "Failed to get DACL information".to_string(),
+            ));
         }
 
         let ace_count = acl_size_info.AceCount;
@@ -410,11 +434,19 @@ fn parse_ace(ace_header: *mut ACE_HEADER) -> Option<AceInfo> {
         let (mask, access_mode, sid_ptr) = match ace_type {
             ALLOWED_TYPE => {
                 let ace = ace_header as *mut ACCESS_ALLOWED_ACE;
-                ((*ace).Mask, "Allow", &(*ace).SidStart as *const _ as *mut SID)
+                (
+                    (*ace).Mask,
+                    "Allow",
+                    &(*ace).SidStart as *const _ as *mut SID,
+                )
             }
             DENIED_TYPE => {
                 let ace = ace_header as *mut ACCESS_DENIED_ACE;
-                ((*ace).Mask, "Deny", &(*ace).SidStart as *const _ as *mut SID)
+                (
+                    (*ace).Mask,
+                    "Deny",
+                    &(*ace).SidStart as *const _ as *mut SID,
+                )
             }
             // 对于其他类型的ACE，我们仍然尝试解析基本信息
             _ => (0u32, "other", (ace_header as *mut u8).offset(8) as *mut SID),
@@ -439,7 +471,13 @@ fn parse_ace_flags(ace_flags: u8) -> String {
     }
 }
 
-fn parse_ace_common(sid: *mut SID, access_mode: &str, ace_flags: u8, mask: u32, ace_type: u8) -> Option<AceInfo> {
+fn parse_ace_common(
+    sid: *mut SID,
+    access_mode: &str,
+    ace_flags: u8,
+    mask: u32,
+    ace_type: u8,
+) -> Option<AceInfo> {
     let trustee = lookup_sid_name(sid as PSID).unwrap_or_else(|_| "unknown trustee".to_string());
 
     let inherited = (ace_flags & INHERITED_ACE as u8) != 0;
@@ -515,10 +553,13 @@ fn sid_to_string(sid: PSID) -> Result<String> {
         }
 
         let mut sid_string_ptr: PWSTR = PWSTR(std::ptr::null_mut());
-        let result = ConvertSidToStringSidW(sid as *mut c_void, &mut sid_string_ptr.0 as *mut *mut u16);
+        let result =
+            ConvertSidToStringSidW(sid as *mut c_void, &mut sid_string_ptr.0 as *mut *mut u16);
 
         if result == 0 {
-            return Err(StorageError::WinAceError("Failed to convert SID to string".to_string()));
+            return Err(StorageError::WinAceError(
+                "Failed to convert SID to string".to_string(),
+            ));
         }
 
         let sid_string = match sid_string_ptr.to_string() {
@@ -579,7 +620,8 @@ pub fn set_inheritance_protect(path: &Path, inheritance_protect: bool) -> Result
         // 获取当前的控制标志
         let mut control: SECURITY_DESCRIPTOR_CONTROL = 0;
         let mut revision: u32 = 0;
-        let get_control_success = GetSecurityDescriptorControl(security_descriptor, &mut control, &mut revision);
+        let get_control_success =
+            GetSecurityDescriptorControl(security_descriptor, &mut control, &mut revision);
 
         if get_control_success == 0 {
             LocalFree(security_descriptor as *mut _);
@@ -599,8 +641,12 @@ pub fn set_inheritance_protect(path: &Path, inheritance_protect: bool) -> Result
         // 设置或清除SE_DACL_PROTECTED标志
         let set_control_success = SetSecurityDescriptorControl(
             security_descriptor,
-            SE_DACL_PROTECTED,                                       // 只修改SE_DACL_PROTECTED位
-            if inheritance_protect { SE_DACL_PROTECTED } else { 0 }, // 根据参数设置或清除标志
+            SE_DACL_PROTECTED, // 只修改SE_DACL_PROTECTED位
+            if inheritance_protect {
+                SE_DACL_PROTECTED
+            } else {
+                0
+            }, // 根据参数设置或清除标志
         );
 
         if set_control_success == 0 {
@@ -614,10 +660,17 @@ pub fn set_inheritance_protect(path: &Path, inheritance_protect: bool) -> Result
         // 再次检查控制标志是否设置成功
         let mut updated_control: SECURITY_DESCRIPTOR_CONTROL = 0;
         let mut updated_revision: u32 = 0;
-        let verify_success =
-            GetSecurityDescriptorControl(security_descriptor, &mut updated_control, &mut updated_revision);
+        let verify_success = GetSecurityDescriptorControl(
+            security_descriptor,
+            &mut updated_control,
+            &mut updated_revision,
+        );
 
-        let expected_state = if inheritance_protect { SE_DACL_PROTECTED } else { 0 };
+        let expected_state = if inheritance_protect {
+            SE_DACL_PROTECTED
+        } else {
+            0
+        };
         if verify_success == 0 || (updated_control & SE_DACL_PROTECTED) != expected_state {
             LocalFree(security_descriptor as *mut _);
             return Err(StorageError::WinAceError(
@@ -653,7 +706,9 @@ pub fn set_inheritance_protect(path: &Path, inheritance_protect: bool) -> Result
 }
 
 /// 获取安全描述符、所有者SID、组SID和DACL
-fn get_security_descriptor(path_wide: *const u16) -> Result<(*mut c_void, *mut c_void, *mut c_void, *mut ACL)> {
+fn get_security_descriptor(
+    path_wide: *const u16,
+) -> Result<(*mut c_void, *mut c_void, *mut c_void, *mut ACL)> {
     let mut sd: *mut c_void = ptr::null_mut();
     let mut owner_sid: *mut c_void = ptr::null_mut();
     let mut group_sid: *mut c_void = ptr::null_mut();
@@ -807,7 +862,8 @@ pub fn copy_acl(source_path: &Path, target_path: &Path) -> Result<()> {
         let (sd, _, _, _) = get_security_descriptor(target_path_wide.as_ptr())?;
         let target_inheritance_enabled = get_inheritance_enabled(sd)?;
 
-        let needs_update = source_inheritance_enabled != target_inheritance_enabled || ace_count_copied > 0;
+        let needs_update =
+            source_inheritance_enabled != target_inheritance_enabled || ace_count_copied > 0;
         if needs_update {
             if source_inheritance_enabled != target_inheritance_enabled {
                 let set_control_success = SetSecurityDescriptorControl(

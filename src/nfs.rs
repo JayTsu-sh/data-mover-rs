@@ -1,7 +1,7 @@
 // 标准库
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 // 外部crate
@@ -23,8 +23,8 @@ use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
 use crate::{
-    DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, MB, NASEntry, Result, StorageEntryMessage,
-    WalkDirAsyncIterator,
+    DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, MB, NASEntry, Result,
+    StorageEntryMessage, WalkDirAsyncIterator,
 };
 
 /// 将 `nfs_rs::Time` 转换为纳秒时间戳
@@ -59,19 +59,31 @@ pub(crate) struct NfsEnrich {
 impl Default for NfsEnrich {
     /// 全部不填充。供 `walkdir_2` 系列站点使用。
     fn default() -> Self {
-        Self { acl: None, owner: None, owner_group: None, xattrs: None }
+        Self {
+            acl: None,
+            owner: None,
+            owner_group: None,
+            xattrs: None,
+        }
     }
 }
 
 impl NfsEnrich {
-
     /// 从 `attr` 抽取 ACL/owner/owner_group（空字符串视为 None），xattrs 留 None。
     /// 供 `lookup` / `iterative_walkdir` 使用；后者再链 `with_xattrs`。
     pub fn from_attrs(attr: &nfs_rs::Attr) -> Self {
         Self {
             acl: attr.acl.clone(),
-            owner: if attr.owner.is_empty() { None } else { Some(attr.owner.clone()) },
-            owner_group: if attr.owner_group.is_empty() { None } else { Some(attr.owner_group.clone()) },
+            owner: if attr.owner.is_empty() {
+                None
+            } else {
+                Some(attr.owner.clone())
+            },
+            owner_group: if attr.owner_group.is_empty() {
+                None
+            } else {
+                Some(attr.owner_group.clone())
+            },
             xattrs: None,
         }
     }
@@ -88,7 +100,11 @@ impl NASEntry {
     /// `file_handle` 由调用方提供（lookup 站点用 `obj.fh`，walkdir 用 `entry.handle.clone()`）。
     /// 可选的 ACL/owner/xattrs 通过 [`NfsEnrich`] 显式注入。
     pub(crate) fn from_nfs_attrs(
-        name: String, relative_path: PathBuf, extension: Option<String>, attrs: &nfs_rs::Attr, file_handle: Bytes,
+        name: String,
+        relative_path: PathBuf,
+        extension: Option<String>,
+        attrs: &nfs_rs::Attr,
+        file_handle: Bytes,
         enrich: NfsEnrich,
     ) -> Self {
         let is_dir = attrs.type_ == FType3::NF3DIR as u32;
@@ -134,27 +150,39 @@ impl DepthAwareExpiry {
 
     /// 从缓存 key 的路径提取目录深度
     fn path_depth(path: &Path) -> usize {
-        path.components().filter(|c| matches!(c, Component::Normal(_))).count()
+        path.components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .count()
     }
 }
 
 impl moka::Expiry<(PathBuf, Bytes), Bytes> for DepthAwareExpiry {
     fn expire_after_create(
-        &self, key: &(PathBuf, Bytes), _value: &Bytes, _created_at: std::time::Instant,
+        &self,
+        key: &(PathBuf, Bytes),
+        _value: &Bytes,
+        _created_at: std::time::Instant,
     ) -> Option<Duration> {
         Some(Self::tti_for_depth(Self::path_depth(&key.0)))
     }
 
     fn expire_after_read(
-        &self, key: &(PathBuf, Bytes), _value: &Bytes, _read_at: std::time::Instant,
-        _duration_until_expiry: Option<Duration>, _last_modified_at: std::time::Instant,
+        &self,
+        key: &(PathBuf, Bytes),
+        _value: &Bytes,
+        _read_at: std::time::Instant,
+        _duration_until_expiry: Option<Duration>,
+        _last_modified_at: std::time::Instant,
     ) -> Option<Duration> {
         // 每次读取刷新 TTI（time-to-idle 语义）
         Some(Self::tti_for_depth(Self::path_depth(&key.0)))
     }
 
     fn expire_after_update(
-        &self, key: &(PathBuf, Bytes), _value: &Bytes, _updated_at: std::time::Instant,
+        &self,
+        key: &(PathBuf, Bytes),
+        _value: &Bytes,
+        _updated_at: std::time::Instant,
         _duration_until_expiry: Option<Duration>,
     ) -> Option<Duration> {
         Some(Self::tti_for_depth(Self::path_depth(&key.0)))
@@ -359,7 +387,11 @@ fn join_nfs_paths(base: &str, suffix: &str) -> String {
     } else if suffix.is_empty() {
         base.to_string()
     } else {
-        format!("{}/{}", base.trim_end_matches('/'), suffix.trim_start_matches('/'))
+        format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            suffix.trim_start_matches('/')
+        )
     }
 }
 
@@ -469,7 +501,9 @@ impl NFSStorage {
             |(s, p)| (s.to_string(), format!("/{p}")),
         );
 
-        let (path_part, query_part) = raw_path_part.split_once('?').unwrap_or((&raw_path_part, ""));
+        let (path_part, query_part) = raw_path_part
+            .split_once('?')
+            .unwrap_or((&raw_path_part, ""));
 
         // root_dir 去掉前后 '/'，使其成为相对路径前缀（空串表示挂载根）
         let (nfs_path, root_dir) = path_part.split_once(':').map_or_else(
@@ -505,7 +539,10 @@ impl NFSStorage {
     /// 返回 `(storage, root_dir)`，此时 `root_fh` 指向 mount 根，尚未解析 `root_dir`
     async fn mount_and_build(url: &str, block_size: Option<u64>) -> Result<(Self, String)> {
         let (nfs_url, root_dir) = Self::parse_nfs_url(url)?;
-        info!("Mounting NFS at: {:?} with root dir: {:?}", nfs_url, root_dir);
+        info!(
+            "Mounting NFS at: {:?} with root dir: {:?}",
+            nfs_url, root_dir
+        );
 
         // portmapper 端口冲突重试：Windows 上 nfs-rs 绑定特权端口 (<1024) 时，
         // 先前失败的连接会使端口进入 TIME_WAIT，导致后续 WSAEADDRINUSE (os error 10048)。
@@ -521,7 +558,8 @@ impl NFSStorage {
                         break;
                     }
                     Err(e) => {
-                        let is_portmapper_conflict = matches!(&e, NfsError::Rpc(msg) if msg.contains("portmapper"));
+                        let is_portmapper_conflict =
+                            matches!(&e, NfsError::Rpc(msg) if msg.contains("portmapper"));
                         if is_portmapper_conflict && attempt + 1 < MAX_MOUNT_PORT_ATTEMPTS {
                             let delay_ms = MOUNT_PORT_RETRY_INITIAL_MS * (1u64 << attempt);
                             warn!(
@@ -561,7 +599,9 @@ impl NFSStorage {
         let wsize = u64::from(mount.get_max_write_size());
         let max_transfer = std::cmp::min(rsize, wsize);
         let effective_block_size = block_size
-            .map_or(DEFAULT_BLOCK_SIZE, |size| std::cmp::min(size, DEFAULT_BLOCK_SIZE))
+            .map_or(DEFAULT_BLOCK_SIZE, |size| {
+                std::cmp::min(size, DEFAULT_BLOCK_SIZE)
+            })
             .min(max_transfer);
         info!(
             "NFS rsize={}, wsize={}, effective block_size={}",
@@ -647,9 +687,14 @@ impl NFSStorage {
         // 如果有 prefix（self.root 非空），逐级 lookup 得到真正的 root_fh
         if !self.root.is_empty() {
             for component in self.root.split('/').filter(|s| !s.is_empty()) {
-                let obj =
-                    self.mount.lookup(current_fh, component).await.map_err(|e| {
-                        StorageError::NfsError(format!("Failed to refresh root fh at '{component}': {e}"))
+                let obj = self
+                    .mount
+                    .lookup(current_fh, component)
+                    .await
+                    .map_err(|e| {
+                        StorageError::NfsError(format!(
+                            "Failed to refresh root fh at '{component}': {e}"
+                        ))
                     })?;
                 current_fh = obj.fh;
             }
@@ -694,7 +739,9 @@ impl NFSStorage {
                 if let Some(name_str) = dirname.to_str() {
                     components.push(name_str.to_string());
                 } else {
-                    return Err(StorageError::InvalidPath("Invalid directory name".to_string()));
+                    return Err(StorageError::InvalidPath(
+                        "Invalid directory name".to_string(),
+                    ));
                 }
             }
         }
@@ -830,7 +877,9 @@ impl NFSStorage {
     pub(crate) async fn open(&self, path: &Path, access: u32) -> Result<NFSFileHandle> {
         let components = Self::collect_components(path)?;
         if components.is_empty() {
-            return Err(StorageError::InvalidPath("Cannot open root as file".to_string()));
+            return Err(StorageError::InvalidPath(
+                "Cannot open root as file".to_string(),
+            ));
         }
 
         // components 非空已由上方 is_empty() 保证
@@ -850,7 +899,10 @@ impl NFSStorage {
                 Ok(obj) => return Ok(NFSFileHandle::new(obj.fh, path.to_path_buf())),
                 Err(e) => {
                     if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
-                        debug!("Stale handle in open for {:?}, refreshing root_fh and retrying", path);
+                        debug!(
+                            "Stale handle in open for {:?}, refreshing root_fh and retrying",
+                            path
+                        );
                         let stale_gen = self.refresh_generation.load(Ordering::Acquire);
                         self.maybe_refresh_root_fh(stale_gen).await?;
                         let root_fh = self.get_root_fh();
@@ -872,10 +924,9 @@ impl NFSStorage {
     /// 对 NFSv3：no-op（无状态协议）。
     /// 对 NFSv4.1：发送 CLOSE RPC，释放 stateid。
     pub(crate) async fn close(&self, file: &NFSFileHandle) -> Result<()> {
-        self.mount
-            .close(file.inner.fh.clone())
-            .await
-            .map_err(|e| StorageError::NfsError(format!("Failed to close {}: {e}", file.path.display())))
+        self.mount.close(file.inner.fh.clone()).await.map_err(|e| {
+            StorageError::NfsError(format!("Failed to close {}: {e}", file.path.display()))
+        })
     }
 
     pub(crate) async fn read_file(&self, path: &Path, size: u64) -> Result<Bytes> {
@@ -887,7 +938,12 @@ impl NFSStorage {
     }
 
     pub(crate) async fn write_file(
-        &self, path: &Path, data: Bytes, uid: Option<u32>, gid: Option<u32>, mode: Option<u32>,
+        &self,
+        path: &Path,
+        data: Bytes,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: Option<u32>,
     ) -> Result<()> {
         let len = data.len() as u32;
         let mut handle = self.create_file(path, uid, gid, mode).await?;
@@ -953,7 +1009,13 @@ impl NFSStorage {
     }
 
     /// 设置 uid/gid 后 re-lookup 刷新 handle（`set_metadata` 可能因 stale 重试更换了 fh）
-    async fn apply_ownership(&self, handle: &NFSFileHandle, path: &Path, uid: u32, gid: u32) -> Result<NFSFileHandle> {
+    async fn apply_ownership(
+        &self,
+        handle: &NFSFileHandle,
+        path: &Path,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NFSFileHandle> {
         self.set_metadata(handle, None, None, Some(uid), Some(gid), None)
             .await?;
         let fresh = self.lookup_fh(path).await?;
@@ -961,7 +1023,11 @@ impl NFSStorage {
     }
 
     pub(crate) async fn create_file(
-        &self, relative_path: &Path, uid: Option<u32>, gid: Option<u32>, mode: Option<u32>,
+        &self,
+        relative_path: &Path,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: Option<u32>,
     ) -> Result<NFSFileHandle> {
         // 提取文件名
         let filename = relative_path
@@ -1046,10 +1112,9 @@ impl NFSStorage {
                 self.lookup_fh(parent).await?
             } else {
                 trace!("Parent directory of {:?} is root directory", relative_path);
-                self.mount
-                    .lookup_path("/")
-                    .await
-                    .map_err(|e| StorageError::NfsError(format!("Failed to lookup root directory: {e}")))?
+                self.mount.lookup_path("/").await.map_err(|e| {
+                    StorageError::NfsError(format!("Failed to lookup root directory: {e}"))
+                })?
             };
 
             // 删除文件 - 使用父目录的file handle
@@ -1073,7 +1138,9 @@ impl NFSStorage {
                         invalidate_path_cache(&components, &root_fh);
                         continue;
                     }
-                    return Err(StorageError::NfsError(format!("Failed to remove file: {e}")));
+                    return Err(StorageError::NfsError(format!(
+                        "Failed to remove file: {e}"
+                    )));
                 }
             }
         }
@@ -1174,7 +1241,8 @@ impl NFSStorage {
                             }
                             Err(e) => {
                                 let err_msg = format!("Failed to lookup directory {dirname}: {e}");
-                                if is_retryable_with_invalidation(&e) && retries < MAX_STALE_RETRIES {
+                                if is_retryable_with_invalidation(&e) && retries < MAX_STALE_RETRIES
+                                {
                                     debug!(
                                         "Stale handle in create_dir_all lookup for {:?}, refreshing root_fh and retrying",
                                         relative_path
@@ -1183,7 +1251,10 @@ impl NFSStorage {
                                     self.maybe_refresh_root_fh(stale_gen).await?;
                                     let root_fh = self.get_root_fh();
                                     invalidate_path_cache(&components, &root_fh);
-                                    return Box::pin(self.create_dir_all_inner(relative_path, retries + 1)).await;
+                                    return Box::pin(
+                                        self.create_dir_all_inner(relative_path, retries + 1),
+                                    )
+                                    .await;
                                 }
                                 debug!("Error: {}", err_msg);
                                 return Err(StorageError::NfsError(err_msg));
@@ -1199,7 +1270,8 @@ impl NFSStorage {
                         self.maybe_refresh_root_fh(stale_gen).await?;
                         let root_fh = self.get_root_fh();
                         invalidate_path_cache(&components, &root_fh);
-                        return Box::pin(self.create_dir_all_inner(relative_path, retries + 1)).await;
+                        return Box::pin(self.create_dir_all_inner(relative_path, retries + 1))
+                            .await;
                     } else {
                         // 其他错误，直接返回
                         return Err(StorageError::NfsError(e.to_string()));
@@ -1237,7 +1309,10 @@ impl NFSStorage {
                 Err(e) => {
                     // 目录已不存在：幂等语义，视为成功
                     if e.is_not_found() {
-                        trace!("Directory {:?} already gone, treating as success", relative_path);
+                        trace!(
+                            "Directory {:?} already gone, treating as success",
+                            relative_path
+                        );
                         return Ok(());
                     }
                     if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
@@ -1252,7 +1327,9 @@ impl NFSStorage {
                         invalidate_path_cache(&components, &root_fh);
                         continue;
                     }
-                    return Err(StorageError::NfsError(format!("Failed to remove directory: {e}")));
+                    return Err(StorageError::NfsError(format!(
+                        "Failed to remove directory: {e}"
+                    )));
                 }
             }
         }
@@ -1266,7 +1343,9 @@ impl NFSStorage {
     }
 
     pub fn delete_dir_all_with_progress(
-        &self, relative_path: Option<&Path>, concurrency: usize,
+        &self,
+        relative_path: Option<&Path>,
+        concurrency: usize,
     ) -> Result<DeleteDirIterator> {
         let (tx, rx) = async_channel::bounded::<DeleteEvent>(1000);
         let concurrency = concurrency.clamp(1, 64);
@@ -1321,8 +1400,15 @@ impl NFSStorage {
                             }));
                         }
                     }
-                    StorageEntryMessage::Error { event, path, reason } => {
-                        error!("Walkdir error during delete [{}] {:?}: {}", event, path, reason);
+                    StorageEntryMessage::Error {
+                        event,
+                        path,
+                        reason,
+                    } => {
+                        error!(
+                            "Walkdir error during delete [{}] {:?}: {}",
+                            event, path, reason
+                        );
                     }
                     _ => {}
                 }
@@ -1367,7 +1453,13 @@ impl NFSStorage {
     }
 
     pub async fn create_symlink(
-        &self, relative_path: &Path, target_path: &Path, atime: i64, mtime: i64, uid: Option<u32>, gid: Option<u32>,
+        &self,
+        relative_path: &Path,
+        target_path: &Path,
+        atime: i64,
+        mtime: i64,
+        uid: Option<u32>,
+        gid: Option<u32>,
     ) -> Result<()> {
         // 提取链接文件名
         let link_filename = relative_path
@@ -1394,7 +1486,9 @@ impl NFSStorage {
                 self.mount
                     .lookup_path("/")
                     .await
-                    .map_err(|e| StorageError::NfsError(format!("Failed to lookup root directory: {e}")))?
+                    .map_err(|e| {
+                        StorageError::NfsError(format!("Failed to lookup root directory: {e}"))
+                    })?
                     .fh
             };
 
@@ -1414,7 +1508,10 @@ impl NFSStorage {
                     // NFS4ERR_EXIST / NFS3ERR_EXIST：目标同名条目已存在，
                     // 先 REMOVE 再重建（全量同步语义：覆盖已有条目）
                     if e.is_exist() {
-                        debug!("Symlink {:?} already exists, removing and recreating", relative_path);
+                        debug!(
+                            "Symlink {:?} already exists, removing and recreating",
+                            relative_path
+                        );
                         self.mount
                             .remove(parent_fh.clone(), &link_filename)
                             .await
@@ -1425,9 +1522,14 @@ impl NFSStorage {
                                 ))
                             })?;
                         // REMOVE 后直接重试创建
-                        match self.mount.symlink(&target_path_str, parent_fh, &link_filename).await {
+                        match self
+                            .mount
+                            .symlink(&target_path_str, parent_fh, &link_filename)
+                            .await
+                        {
                             Ok(symlink_obj) => {
-                                let handle = NFSFileHandle::new(symlink_obj.fh, relative_path.to_path_buf());
+                                let handle =
+                                    NFSFileHandle::new(symlink_obj.fh, relative_path.to_path_buf());
                                 return self
                                     .set_metadata(&handle, Some(atime), Some(mtime), uid, gid, None)
                                     .await;
@@ -1451,7 +1553,9 @@ impl NFSStorage {
                         invalidate_path_cache(&components, &root_fh);
                         continue;
                     }
-                    return Err(StorageError::NfsError(format!("Failed to create symlink: {e}")));
+                    return Err(StorageError::NfsError(format!(
+                        "Failed to create symlink: {e}"
+                    )));
                 }
             }
         }
@@ -1506,26 +1610,30 @@ impl NFSStorage {
         for attempt in 0..=MAX_STALE_RETRIES {
             // 查找源文件父目录
             let from_parent_obj = if let Some(parent) = from.parent() {
-                debug!("Looking up parent path for rename source {:?}: {:?}", from, parent);
+                debug!(
+                    "Looking up parent path for rename source {:?}: {:?}",
+                    from, parent
+                );
                 self.lookup_fh(parent).await?
             } else {
                 trace!("Source parent directory {:?} is root directory", from);
-                self.mount
-                    .lookup_path("/")
-                    .await
-                    .map_err(|e| StorageError::NfsError(format!("Failed to lookup root directory: {e}")))?
+                self.mount.lookup_path("/").await.map_err(|e| {
+                    StorageError::NfsError(format!("Failed to lookup root directory: {e}"))
+                })?
             };
 
             // 查找目标父目录
             let to_parent_obj = if let Some(parent) = to.parent() {
-                debug!("Looking up parent path for rename target {:?}: {:?}", to, parent);
+                debug!(
+                    "Looking up parent path for rename target {:?}: {:?}",
+                    to, parent
+                );
                 self.lookup_fh(parent).await?
             } else {
                 trace!("Target parent directory {:?} is root directory", to);
-                self.mount
-                    .lookup_path("/")
-                    .await
-                    .map_err(|e| StorageError::NfsError(format!("Failed to lookup root directory: {e}")))?
+                self.mount.lookup_path("/").await.map_err(|e| {
+                    StorageError::NfsError(format!("Failed to lookup root directory: {e}"))
+                })?
             };
 
             // 重命名文件
@@ -1555,7 +1663,11 @@ impl NFSStorage {
                         invalidate_path_cache(&to_components, &root_fh);
                         continue;
                     }
-                    let error_msg = format!("Failed to rename file from {} to {}: {e}", from.display(), to.display());
+                    let error_msg = format!(
+                        "Failed to rename file from {} to {}: {e}",
+                        from.display(),
+                        to.display()
+                    );
                     error!("{}", error_msg);
                     return Err(StorageError::NfsError(error_msg));
                 }
@@ -1576,7 +1688,9 @@ impl NFSStorage {
         let attrs = match mount_clone.getattr(obj_fh_clone).await {
             Ok(attr) => attr,
             Err(e) => {
-                return Err(StorageError::NfsError(format!("Failed to get file attributes: {e}")));
+                return Err(StorageError::NfsError(format!(
+                    "Failed to get file attributes: {e}"
+                )));
             }
         };
 
@@ -1613,19 +1727,30 @@ impl NFSStorage {
     /// 更新文件或目录的元数据
     /// Update metadata for a file by path (public wrapper around `set_metadata`).
     pub async fn update_metadata(
-        &self, relative_path: &Path, atime: Option<i64>, mtime: Option<i64>, uid: Option<u32>, gid: Option<u32>,
+        &self,
+        relative_path: &Path,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         mode: Option<u32>,
     ) -> Result<()> {
         // setattr 在 NFSv4.1 中不需要 open stateid，直接用 lookup 获取 fh 即可，
         // 避免不必要的 OPEN/CLOSE 往返
         let obj = self.lookup_fh(relative_path).await?;
         let handle = NFSFileHandle::new(obj.fh, relative_path.to_path_buf());
-        self.set_metadata(&handle, atime, mtime, uid, gid, mode).await
+        self.set_metadata(&handle, atime, mtime, uid, gid, mode)
+            .await
     }
 
     #[allow(clippy::similar_names)]
     pub(crate) async fn set_metadata(
-        &self, file: &NFSFileHandle, atime: Option<i64>, mtime: Option<i64>, uid: Option<u32>, gid: Option<u32>,
+        &self,
+        file: &NFSFileHandle,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         mode: Option<u32>,
     ) -> Result<()> {
         debug!("Setting metadata for {:?}", file.path);
@@ -1706,19 +1831,23 @@ impl NFSStorage {
     /// 获取文件/目录的 `NFSv4` ACL
     pub async fn get_acl(&self, relative_path: &Path) -> Result<nfs_rs::Acl> {
         let obj = self.lookup_fh(relative_path).await?;
-        self.mount
-            .getacl(obj.fh)
-            .await
-            .map_err(|e| StorageError::NfsError(format!("Failed to get ACL for {}: {e}", relative_path.display())))
+        self.mount.getacl(obj.fh).await.map_err(|e| {
+            StorageError::NfsError(format!(
+                "Failed to get ACL for {}: {e}",
+                relative_path.display()
+            ))
+        })
     }
 
     /// 设置文件/目录的 `NFSv4` ACL
     pub async fn set_acl(&self, relative_path: &Path, acl: &nfs_rs::Acl) -> Result<()> {
         let obj = self.lookup_fh(relative_path).await?;
-        self.mount
-            .setacl(obj.fh, acl)
-            .await
-            .map_err(|e| StorageError::NfsError(format!("Failed to set ACL for {}: {e}", relative_path.display())))
+        self.mount.setacl(obj.fh, acl).await.map_err(|e| {
+            StorageError::NfsError(format!(
+                "Failed to set ACL for {}: {e}",
+                relative_path.display()
+            ))
+        })
     }
 
     /// 查询服务器支持的 ACE 类型
@@ -1758,10 +1887,12 @@ impl NFSStorage {
     /// 列出所有 xattr 名称
     pub async fn list_xattr(&self, relative_path: &Path) -> Result<Vec<String>> {
         let obj = self.lookup_fh(relative_path).await?;
-        self.mount
-            .listxattr(obj.fh)
-            .await
-            .map_err(|e| StorageError::NfsError(format!("Failed to list xattr for {}: {e}", relative_path.display())))
+        self.mount.listxattr(obj.fh).await.map_err(|e| {
+            StorageError::NfsError(format!(
+                "Failed to list xattr for {}: {e}",
+                relative_path.display()
+            ))
+        })
     }
 
     /// 删除指定 xattr
@@ -1777,8 +1908,14 @@ impl NFSStorage {
 
     #[allow(clippy::too_many_arguments)]
     pub async fn walkdir(
-        &self, sub_path: Option<&Path>, depth: Option<usize>, match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>, concurrency: usize, packaged: bool, package_depth: usize,
+        &self,
+        sub_path: Option<&Path>,
+        depth: Option<usize>,
+        match_expressions: Option<FilterExpression>,
+        exclude_expressions: Option<FilterExpression>,
+        concurrency: usize,
+        packaged: bool,
+        package_depth: usize,
     ) -> Result<WalkDirAsyncIterator> {
         // 解析起始目录：sub_path 为 None 时从根开始，否则从子目录开始
         let (start_fh, start_root) = match sub_path {
@@ -1841,9 +1978,17 @@ impl NFSStorage {
     /// 迭代式目录遍历函数，使用工作窃取队列实现高效并发
     #[allow(clippy::too_many_arguments)]
     async fn iterative_walkdir(
-        &self, root_path: &str, root_fh: Bytes, tx: async_channel::Sender<StorageEntryMessage>, max_depth: usize,
-        match_expressions: Option<&FilterExpression>, exclude_expressions: Option<&FilterExpression>,
-        concurrency: usize, total_file_count: Arc<AtomicUsize>, packaged: bool, package_depth: usize,
+        &self,
+        root_path: &str,
+        root_fh: Bytes,
+        tx: async_channel::Sender<StorageEntryMessage>,
+        max_depth: usize,
+        match_expressions: Option<&FilterExpression>,
+        exclude_expressions: Option<&FilterExpression>,
+        concurrency: usize,
+        total_file_count: Arc<AtomicUsize>,
+        packaged: bool,
+        package_depth: usize,
     ) -> Result<()> {
         let contexts = create_worker_contexts(
             concurrency,
@@ -1900,11 +2045,20 @@ impl NFSStorage {
     /// 处理单个目录，读取条目并过滤，发送符合条件的StorageEntry
     #[allow(clippy::too_many_arguments)]
     async fn process_dir(
-        &self, producer_id: usize, dir_path: String, dir_fh: Bytes, current_depth: usize,
+        &self,
+        producer_id: usize,
+        dir_path: String,
+        dir_fh: Bytes,
+        current_depth: usize,
         tx: &async_channel::Sender<StorageEntryMessage>,
         ctx: &crate::walk_scheduler::WorkerContext<(String, Bytes, usize, bool, Option<usize>)>,
-        match_expr: &Arc<Option<FilterExpression>>, exclude_expr: &Arc<Option<FilterExpression>>, max_depth: usize,
-        total_file_count: &Arc<AtomicUsize>, skip_filter: bool, packaged: bool, package_depth: usize,
+        match_expr: &Arc<Option<FilterExpression>>,
+        exclude_expr: &Arc<Option<FilterExpression>>,
+        max_depth: usize,
+        total_file_count: &Arc<AtomicUsize>,
+        skip_filter: bool,
+        packaged: bool,
+        package_depth: usize,
         package_remaining: Option<usize>,
     ) -> Result<()> {
         // 调用readdirplus获取目录条目流 - 使用异步调用
@@ -1981,7 +2135,10 @@ impl NFSStorage {
             let relative_path = self.build_relative_path(&dir_path, &entry.file_name);
 
             // 提取扩展名（在 file_name 被 move 前提取）
-            let extension = entry.file_name.rsplit_once('.').map(|(_, ext)| ext.to_string());
+            let extension = entry
+                .file_name
+                .rsplit_once('.')
+                .map(|(_, ext)| ext.to_string());
 
             // 提取文件名（完整文件名）
             let file_name = &entry.file_name;
@@ -2158,7 +2315,10 @@ impl NFSStorage {
                     .await
                     .is_err()
                 {
-                    error!("[Producer {}] Output channel closed, stopping processing", producer_id);
+                    error!(
+                        "[Producer {}] Output channel closed, stopping processing",
+                        producer_id
+                    );
                     break;
                 }
                 continue;
@@ -2188,7 +2348,10 @@ impl NFSStorage {
                     .await
                     .is_err()
                 {
-                    error!("[Producer {}] Output channel closed, stopping processing", producer_id);
+                    error!(
+                        "[Producer {}] Output channel closed, stopping processing",
+                        producer_id
+                    );
                     break;
                 }
             }
@@ -2213,7 +2376,10 @@ impl NFSStorage {
             if let Err(StorageError::NfsError(msg)) = &result {
                 // 检查错误信息是否包含"invalid file handle"
                 if msg.contains("invalid file handle") {
-                    debug!("[read] File handle is invalid, refreshing for path: {:?}", file.path);
+                    debug!(
+                        "[read] File handle is invalid, refreshing for path: {:?}",
+                        file.path
+                    );
                     retry_count += 1;
 
                     // 重新lookup文件获取新的文件句柄
@@ -2222,7 +2388,10 @@ impl NFSStorage {
 
                     // 更新文件句柄
                     file.inner = Arc::new(obj);
-                    debug!("[read] Successfully refreshed file handle for path: {:?}", file.path);
+                    debug!(
+                        "[read] Successfully refreshed file handle for path: {:?}",
+                        file.path
+                    );
 
                     // 重新尝试读取
                     let mount = self.mount.clone();
@@ -2230,7 +2399,11 @@ impl NFSStorage {
                     result = mount
                         .read(file_fh, offset, count as u32)
                         .await
-                        .map_err(|e| StorageError::NfsError(format!("Failed to read file after refresh: {e}")));
+                        .map_err(|e| {
+                            StorageError::NfsError(format!(
+                                "Failed to read file after refresh: {e}"
+                            ))
+                        });
                 } else {
                     // 不是文件句柄无效的错误，直接返回原始错误
                     break;
@@ -2270,7 +2443,8 @@ impl NFSStorage {
                 let current_chunk_size = std::cmp::min(remaining_bytes, chunk_size);
 
                 // 直接使用slice操作，避免克隆
-                let chunk_data = data_ref.slice(data_index..data_index + current_chunk_size as usize);
+                let chunk_data =
+                    data_ref.slice(data_index..data_index + current_chunk_size as usize);
 
                 trace!(
                     "[write] Writing chunk of {} bytes to file {:?} at offset {}",
@@ -2358,7 +2532,11 @@ impl NFSStorage {
     }
 
     pub(crate) async fn read_data(
-        &self, tx: mpsc::Sender<DataChunk>, relative_path: &Path, size: u64, enable_integrity_check: bool,
+        &self,
+        tx: mpsc::Sender<DataChunk>,
+        relative_path: &Path,
+        size: u64,
+        enable_integrity_check: bool,
         qos: Option<QosManager>,
     ) -> Result<Option<HashCalculator>> {
         // 如果文件大小为0，直接返回
@@ -2384,7 +2562,9 @@ impl NFSStorage {
             }
             Err(e) => {
                 error!("Failed to open source file: {:?}", e);
-                return Err(StorageError::NfsError(format!("Failed to open source file: {e:?}")));
+                return Err(StorageError::NfsError(format!(
+                    "Failed to open source file: {e:?}"
+                )));
             }
         };
 
@@ -2398,7 +2578,10 @@ impl NFSStorage {
             // 如果提供了 QoS 管理器，则进行带宽 + IOPS 限流
             if let Some(ref qos) = qos {
                 qos.acquire(chunk_size).await;
-                trace!("QoS acquired {} bytes for file {:?}", chunk_size, relative_path);
+                trace!(
+                    "QoS acquired {} bytes for file {:?}",
+                    chunk_size, relative_path
+                );
             }
 
             let data = match self.read(&mut handler, offset, chunk_size as usize).await {
@@ -2465,8 +2648,13 @@ impl NFSStorage {
     }
 
     pub(crate) async fn write_data(
-        &self, rx: mpsc::Receiver<DataChunk>, relative_path: &Path, #[allow(unused)] uid: Option<u32>,
-        #[allow(unused)] gid: Option<u32>, #[allow(unused)] mode: Option<u32>, bytes_counter: Option<Arc<AtomicU64>>,
+        &self,
+        rx: mpsc::Receiver<DataChunk>,
+        relative_path: &Path,
+        #[allow(unused)] uid: Option<u32>,
+        #[allow(unused)] gid: Option<u32>,
+        #[allow(unused)] mode: Option<u32>,
+        bytes_counter: Option<Arc<AtomicU64>>,
     ) -> Result<()> {
         trace!("Starting write_data_task for file {:?}", relative_path);
 
@@ -2521,7 +2709,10 @@ impl NFSStorage {
 
     /// 读取单个 NFS 目录，返回排序后的 files + subdirs。
     pub(crate) async fn read_dir_sorted(
-        &self, dir_path: &str, handle: &crate::dir_tree::DirHandle, ctx: &crate::dir_tree::ReadContext,
+        &self,
+        dir_path: &str,
+        handle: &crate::dir_tree::DirHandle,
+        ctx: &crate::dir_tree::ReadContext,
     ) -> Result<crate::dir_tree::ReadResult> {
         use crate::dir_tree::{DirHandle, ReadResult, SubdirEntry};
 
@@ -2579,7 +2770,10 @@ impl NFSStorage {
                 let is_dir = attrs.type_ == FType3::NF3DIR as u32;
                 let is_symlink = attrs.type_ == FType3::NF3LNK as u32;
                 let relative_path = self.build_relative_path(&nfs_dir_path, &entry.file_name);
-                let extension = entry.file_name.rsplit_once('.').map(|(_, ext)| ext.to_string());
+                let extension = entry
+                    .file_name
+                    .rsplit_once('.')
+                    .map(|(_, ext)| ext.to_string());
 
                 // filter（仅当 apply_filter=true 时）
                 let (skip_entry, continue_scan, need_submatch) = if ctx.apply_filter {
@@ -2604,7 +2798,10 @@ impl NFSStorage {
                 };
 
                 if skip_entry {
-                    if is_dir && continue_scan && (ctx.max_depth == 0 || ctx.current_depth + 1 < ctx.max_depth) {
+                    if is_dir
+                        && continue_scan
+                        && (ctx.max_depth == 0 || ctx.current_depth + 1 < ctx.max_depth)
+                    {
                         let nas = NASEntry::from_nfs_attrs(
                             entry.file_name,
                             PathBuf::from(&relative_path),
@@ -2687,8 +2884,12 @@ impl NFSStorage {
 
     /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
     pub async fn walkdir_2(
-        &self, sub_path: Option<&Path>, depth: Option<usize>, match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>, concurrency: usize,
+        &self,
+        sub_path: Option<&Path>,
+        depth: Option<usize>,
+        match_expressions: Option<FilterExpression>,
+        exclude_expressions: Option<FilterExpression>,
+        concurrency: usize,
     ) -> Result<crate::WalkDirAsyncIterator2> {
         use crate::dir_tree::{DirHandle, ReadContext, ReadRequest, run_dfs_driver};
 
@@ -2712,7 +2913,9 @@ impl NFSStorage {
             let rx = req_rx.clone();
             tokio::spawn(async move {
                 while let Ok(req) = rx.recv().await {
-                    let result = storage.read_dir_sorted(&req.dir_path, &req.handle, &req.ctx).await;
+                    let result = storage
+                        .read_dir_sorted(&req.dir_path, &req.handle, &req.ctx)
+                        .await;
                     let _ = req.reply.send(result);
                 }
             });
@@ -2734,7 +2937,13 @@ impl NFSStorage {
             is_versioned: false,
         };
 
-        tokio::spawn(run_dfs_driver(req_tx, out_tx, root_path, root_handle, base_ctx));
+        tokio::spawn(run_dfs_driver(
+            req_tx,
+            out_tx,
+            root_path,
+            root_handle,
+            base_ctx,
+        ));
 
         Ok(crate::AsyncReceiver::new(out_rx))
     }
@@ -2757,7 +2966,10 @@ pub async fn create_nfs_storage(url: &str, block_size: Option<u64>) -> Result<St
 }
 
 /// 创建 NFS 目标存储实例，如果 prefix 目录不存在则自动创建
-pub async fn create_nfs_storage_ensuring_dir(url: &str, block_size: Option<u64>) -> Result<StorageEnum> {
+pub async fn create_nfs_storage_ensuring_dir(
+    url: &str,
+    block_size: Option<u64>,
+) -> Result<StorageEnum> {
     let (mut storage, root_dir) = NFSStorage::mount_and_build(url, block_size).await?;
 
     if !root_dir.is_empty() {
@@ -2768,10 +2980,11 @@ pub async fn create_nfs_storage_ensuring_dir(url: &str, block_size: Option<u64>)
         } else {
             // prefix 目录不存在，创建之
             info!("NFS prefix '{}' does not exist, creating it", root_dir);
-            let fh = storage
-                .create_dir_all(path)
-                .await
-                .map_err(|e| StorageError::OperationError(format!("Failed to create NFS prefix '{root_dir}': {e}")))?;
+            let fh = storage.create_dir_all(path).await.map_err(|e| {
+                StorageError::OperationError(format!(
+                    "Failed to create NFS prefix '{root_dir}': {e}"
+                ))
+            })?;
             *storage.root_fh.write().map_err(|_| root_fh_lock_err())? = fh;
             storage.root = Arc::new(root_dir);
         }
@@ -2816,7 +3029,8 @@ mod tests {
         assert_eq!(root_dir, "");
 
         // 测试带有查询参数的格式
-        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path:root_dir?foo=bar").unwrap();
+        let (nfs_url, root_dir) =
+            NFSStorage::parse_nfs_url("nfs://server/path:root_dir?foo=bar").unwrap();
         assert_eq!(nfs_url, "nfs://server/path?foo=bar&uid=0&gid=0");
         assert_eq!(root_dir, "root_dir");
 
@@ -2831,7 +3045,8 @@ mod tests {
         assert_eq!(root_dir, "");
 
         // 测试带有 uid 和 gid 参数的格式
-        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path?uid=1000&gid=1000").unwrap();
+        let (nfs_url, root_dir) =
+            NFSStorage::parse_nfs_url("nfs://server/path?uid=1000&gid=1000").unwrap();
         assert_eq!(nfs_url, "nfs://server/path?uid=1000&gid=1000");
         assert_eq!(root_dir, "");
 
@@ -2841,7 +3056,8 @@ mod tests {
         assert_eq!(root_dir, "");
 
         // 测试带前导斜杠的 root_dir
-        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path:/prefix/dir").unwrap();
+        let (nfs_url, root_dir) =
+            NFSStorage::parse_nfs_url("nfs://server/path:/prefix/dir").unwrap();
         assert_eq!(nfs_url, "nfs://server/path?uid=0&gid=0");
         assert_eq!(root_dir, "prefix/dir");
 

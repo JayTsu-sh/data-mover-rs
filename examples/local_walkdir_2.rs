@@ -1,15 +1,20 @@
 use std::time::{Duration, Instant};
 
-use indicatif::{ProgressBar, ProgressStyle};
 use data_mover::Result;
 use data_mover::dir_tree::NdxEvent;
 use data_mover::storage_enum::create_storage;
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // 参数：路径（默认 c:\jay\source）、并发数（默认 4）
-    let path = std::env::args().nth(1).unwrap_or_else(|| "c:\\jay\\source".to_string());
-    let concurrency: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "c:\\jay\\source".to_string());
+    let concurrency: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
 
     println!("walkdir_2: path={}, concurrency={}", path, concurrency);
 
@@ -30,7 +35,9 @@ async fn main() -> Result<()> {
     pb.enable_steady_tick(Duration::from_millis(100));
     let mut last_update = Instant::now();
 
-    let iter = storage.walkdir_2(None, None, None, None, concurrency, false).await?;
+    let iter = storage
+        .walkdir_2(None, None, None, None, concurrency, false)
+        .await?;
 
     while let Some(event) = iter.next().await {
         match event {
@@ -93,7 +100,10 @@ async fn main() -> Result<()> {
     println!("Max NDX: {}", max_ndx);
     println!("Scan time: {:?}", duration);
     if duration.as_secs_f64() > 0.0 {
-        println!("Pages/sec: {:.0}", total_pages as f64 / duration.as_secs_f64());
+        println!(
+            "Pages/sec: {:.0}",
+            total_pages as f64 / duration.as_secs_f64()
+        );
         println!(
             "Entries/sec: {:.0}",
             (total_files + total_dirs) as f64 / duration.as_secs_f64()

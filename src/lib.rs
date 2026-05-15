@@ -28,17 +28,20 @@ pub mod url_redact;
 pub(crate) mod walk_scheduler;
 
 pub use checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
-pub use url_redact::redact_storage_url;
 pub use cifs::CifsStorage;
 pub use filter::{
-    FilterExpression, FilterFieldDef, FilterOperatorDef, dir_matches_date_filter, get_filter_field_definitions,
+    FilterExpression, FilterFieldDef, FilterOperatorDef, dir_matches_date_filter,
+    get_filter_field_definitions,
 };
 pub use local::LocalStorage;
 pub use nfs::{NFSStorage, create_nfs_storage_ensuring_dir};
 pub use qos::QosManager;
 pub use s3::{MultipartUpload, S3BucketInfo, S3CompletedPart, S3Storage};
-pub use storage_enum::{StorageEnum, StorageType, create_storage, create_storage_for_dest, detect_storage_type};
+pub use storage_enum::{
+    StorageEnum, StorageType, create_storage, create_storage_for_dest, detect_storage_type,
+};
 pub use tar_pack::calculate_tar_size;
+pub use url_redact::redact_storage_url;
 
 /// 删除事件，表示一个文件或目录已被删除
 #[derive(Debug, Clone)]
@@ -73,7 +76,8 @@ pub fn canonicalize_path(path: &str) -> std::io::Result<String> {
 /// 将纳秒时间戳转换为YYYY-MM-DD HHMMSS格式的字符串
 pub fn datetime_to_string(time: i64) -> String {
     // 创建一个SystemTime对象，然后转换为chrono::DateTime
-    let system_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(time as u64);
+    let system_time =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(time as u64);
     let datetime: chrono::DateTime<chrono::Utc> = system_time.into();
     datetime.format("%Y-%m-%d %H:%M:%S%.9f").to_string()
 }
@@ -314,8 +318,9 @@ impl ChangeKind {
     #[must_use]
     pub fn from_entry_diff(from: &EntryEnum, to: &EntryEnum) -> Option<Self> {
         let data_changed = from.get_size() != to.get_size() || from.get_mtime() != to.get_mtime();
-        let meta_changed =
-            from.get_mode() != to.get_mode() || from.get_uid() != to.get_uid() || from.get_gid() != to.get_gid();
+        let meta_changed = from.get_mode() != to.get_mode()
+            || from.get_uid() != to.get_uid()
+            || from.get_gid() != to.get_gid();
         match (data_changed, meta_changed) {
             (true, true) => Some(Self::Both),
             (true, false) => Some(Self::DataOnly),
@@ -339,7 +344,10 @@ pub enum StorageEntryMessage {
     /// 新增文件
     New(Arc<EntryEnum>),
     /// 文件已变更（kind 区分 data/metadata/both）
-    Changed { entry: Arc<EntryEnum>, kind: ChangeKind },
+    Changed {
+        entry: Arc<EntryEnum>,
+        kind: ChangeKind,
+    },
     /// 文件已删除
     Deleted(Arc<EntryEnum>),
     /// 文件被重命名，(from, to)

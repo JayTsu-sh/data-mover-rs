@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
-use indicatif::{ProgressBar, ProgressStyle};
 use data_mover::storage_enum::create_storage;
 use data_mover::{EntryEnum, Result, StorageEntryMessage};
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -24,7 +24,9 @@ async fn main() -> Result<()> {
     // 记录上次更新时间
     let mut last_update = Instant::now();
 
-    let iter = storage.walkdir(None, None, None, None, 1, true, false, 0).await?;
+    let iter = storage
+        .walkdir(None, None, None, None, 1, true, false, 0)
+        .await?;
     while let Some(msg) = iter.next().await {
         match msg {
             StorageEntryMessage::Scanned(entry) => match &*entry {

@@ -12,7 +12,10 @@ fn test_local_windows_path() {
 
 #[test]
 fn test_nfs_url() {
-    assert_eq!(detect_storage_type("nfs://server:2049/export"), StorageType::Nfs);
+    assert_eq!(
+        detect_storage_type("nfs://server:2049/export"),
+        StorageType::Nfs
+    );
 }
 
 #[test]
@@ -25,17 +28,26 @@ fn test_s3_basic() {
 
 #[test]
 fn test_s3_https() {
-    assert_eq!(detect_storage_type("s3+https://bucket.host/data"), StorageType::S3);
+    assert_eq!(
+        detect_storage_type("s3+https://bucket.host/data"),
+        StorageType::S3
+    );
 }
 
 #[test]
 fn test_s3_http() {
-    assert_eq!(detect_storage_type("s3+http://bucket.host/data"), StorageType::S3);
+    assert_eq!(
+        detect_storage_type("s3+http://bucket.host/data"),
+        StorageType::S3
+    );
 }
 
 #[test]
 fn test_s3_hcp() {
-    assert_eq!(detect_storage_type("s3+hcp://bucket.host/data"), StorageType::S3);
+    assert_eq!(
+        detect_storage_type("s3+hcp://bucket.host/data"),
+        StorageType::S3
+    );
 }
 
 #[test]

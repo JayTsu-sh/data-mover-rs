@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
 use data_mover::storage_enum::create_storage;
 use data_mover::{EntryEnum, Result, StorageEntryMessage};
+use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]

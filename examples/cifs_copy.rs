@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
 use data_mover::storage_enum::{StorageEnum, create_storage, create_storage_for_dest};
 use data_mover::{EntryEnum, Result, StorageEntryMessage};
+use indicatif::{ProgressBar, ProgressStyle};
 
 /// CIFS/SMB 共享遍历 + 拷贝示例
 ///
@@ -91,7 +91,10 @@ async fn main() -> Result<()> {
     println!("  Files:        {}", file_count);
     println!("  Symlinks:     {}", symlink_count);
     println!("  Errors:       {}", error_count);
-    println!("  Total size:   {:.2} MB", total_size as f64 / (1024.0 * 1024.0));
+    println!(
+        "  Total size:   {:.2} MB",
+        total_size as f64 / (1024.0 * 1024.0)
+    );
     println!("  Scan time:    {:?}", scan_duration);
     println!();
 
@@ -106,7 +109,10 @@ async fn main() -> Result<()> {
     let bytes_counter = Arc::new(AtomicU64::new(0));
 
     let pb = ProgressBar::new(entries.len() as u64);
-    pb.set_style(ProgressStyle::with_template("{spinner} [{elapsed_precise}] [{bar:40}] {pos}/{len} {msg}").unwrap());
+    pb.set_style(
+        ProgressStyle::with_template("{spinner} [{elapsed_precise}] [{bar:40}] {pos}/{len} {msg}")
+            .unwrap(),
+    );
 
     // 先创建目录结构（按层级排序，确保父目录先创建）
     let mut dirs: Vec<_> = entries.iter().filter(|e| e.get_is_dir()).cloned().collect();
@@ -127,7 +133,11 @@ async fn main() -> Result<()> {
     }
 
     // 拷贝文件
-    let files: Vec<_> = entries.iter().filter(|e| e.get_is_regular_file()).cloned().collect();
+    let files: Vec<_> = entries
+        .iter()
+        .filter(|e| e.get_is_regular_file())
+        .cloned()
+        .collect();
     let mut copy_errors: u64 = 0;
 
     for entry in &files {
@@ -166,7 +176,11 @@ async fn main() -> Result<()> {
     }
 
     // 拷贝 symlink
-    let symlinks: Vec<_> = entries.iter().filter(|e| e.get_is_symlink()).cloned().collect();
+    let symlinks: Vec<_> = entries
+        .iter()
+        .filter(|e| e.get_is_symlink())
+        .cloned()
+        .collect();
     for entry in &symlinks {
         let rel_path = entry.get_relative_path();
         pb.set_message(format!("symlink {}", rel_path.display()));
@@ -192,7 +206,10 @@ async fn main() -> Result<()> {
 
     println!("  Copied files: {}", files.len());
     println!("  Copy errors:  {}", copy_errors);
-    println!("  Bytes copied: {:.2} MB", total_bytes as f64 / (1024.0 * 1024.0));
+    println!(
+        "  Bytes copied: {:.2} MB",
+        total_bytes as f64 / (1024.0 * 1024.0)
+    );
     println!("  Copy time:    {:?}", copy_duration);
     if copy_duration.as_secs() > 0 {
         println!(

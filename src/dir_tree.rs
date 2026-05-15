@@ -107,7 +107,9 @@ pub fn extract_dir_handle(entry: &EntryEnum, root_path: &Path, backend: BackendK
                     }
                 }
             }
-            BackendKind::Cifs => DirHandle::Cifs(nas.relative_path.to_string_lossy().replace('\\', "/")),
+            BackendKind::Cifs => {
+                DirHandle::Cifs(nas.relative_path.to_string_lossy().replace('\\', "/"))
+            }
             _ => DirHandle::Local(root_path.join(&nas.relative_path)),
         },
         EntryEnum::S3(s3) => DirHandle::S3Prefix(s3.relative_path.clone()),
@@ -210,7 +212,10 @@ impl DfsFrame {
 
     /// 预提交子目录读取，最多到窗口边界
     async fn prefetch_subdirs(
-        &mut self, req_tx: &async_channel::Sender<ReadRequest>, root_path: &Path, backend: BackendKind,
+        &mut self,
+        req_tx: &async_channel::Sender<ReadRequest>,
+        root_path: &Path,
+        backend: BackendKind,
         base_ctx: &ReadContext,
     ) {
         let window_end = (self.next_child + PREFETCH_WINDOW).min(self.subdirs.len());
@@ -238,7 +243,10 @@ impl DfsFrame {
 
     /// 消费一个子目录后，滑动窗口
     async fn advance_prefetch(
-        &mut self, req_tx: &async_channel::Sender<ReadRequest>, root_path: &Path, backend: BackendKind,
+        &mut self,
+        req_tx: &async_channel::Sender<ReadRequest>,
+        root_path: &Path,
+        backend: BackendKind,
         base_ctx: &ReadContext,
     ) {
         if self.next_prefetch < self.subdirs.len() {
@@ -277,7 +285,10 @@ fn has_more_visible_siblings(stack: &[DfsFrame]) -> bool {
     // 从直接父级到根，任一祖先还有未处理的可见子目录就返回 true
     for i in (0..stack.len().saturating_sub(1)).rev() {
         let ancestor = &stack[i];
-        if ancestor.subdirs[ancestor.next_child..].iter().any(|s| s.visible) {
+        if ancestor.subdirs[ancestor.next_child..]
+            .iter()
+            .any(|s| s.visible)
+        {
             return true;
         }
     }
@@ -286,8 +297,11 @@ fn has_more_visible_siblings(stack: &[DfsFrame]) -> bool {
 
 /// DFS 驱动器主循环，运行在单个 tokio task 中
 pub async fn run_dfs_driver(
-    req_tx: async_channel::Sender<ReadRequest>, out_tx: async_channel::Sender<NdxEvent>, root_path: PathBuf,
-    root_handle: DirHandle, base_ctx: ReadContext,
+    req_tx: async_channel::Sender<ReadRequest>,
+    out_tx: async_channel::Sender<NdxEvent>,
+    root_path: PathBuf,
+    root_handle: DirHandle,
+    base_ctx: ReadContext,
 ) {
     // 从 root_handle 推导后端类型，用于子目录 handle 构建
     let backend = root_handle.backend_kind();

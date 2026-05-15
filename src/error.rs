@@ -1,6 +1,4 @@
-
 use thiserror::Error;
-
 
 /// 存储操作的错误类型定义
 /// 使用thiserror库实现错误处理和转换
@@ -136,8 +134,12 @@ impl Clone for StorageError {
             StorageError::UnsupportedType(s) => StorageError::UnsupportedType(s.clone()),
             StorageError::OperationError(s) => StorageError::OperationError(s.clone()),
             StorageError::InvalidPath(s) => StorageError::InvalidPath(s.clone()),
-            StorageError::InvalidFilterExpression(s) => StorageError::InvalidFilterExpression(s.clone()),
-            StorageError::MismatchedParentheses(s) => StorageError::MismatchedParentheses(s.clone()),
+            StorageError::InvalidFilterExpression(s) => {
+                StorageError::InvalidFilterExpression(s.clone())
+            }
+            StorageError::MismatchedParentheses(s) => {
+                StorageError::MismatchedParentheses(s.clone())
+            }
             StorageError::InvalidToken(s) => StorageError::InvalidToken(*s),
             StorageError::UnexpectedEndOfToken(s) => StorageError::UnexpectedEndOfToken(s.clone()),
             StorageError::ChecksumError(s) => StorageError::ChecksumError(s.clone()),
