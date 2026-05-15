@@ -387,9 +387,13 @@ pub struct CifsStorage {
     file_id_probe_lock: Arc<Mutex<()>>,
     /// 已确认存在的目录路径缓存（normalized 用 '/' 分隔，root sub-path 之外的相对路径）。
     ///
-    /// **per-storage 持有，不跨 worker 共享** —— 与 terrasync-rs 端"per-worker 独立
-    /// Client"设计一致，避免跨 worker 锁竞争。同一 worker 处理一批同前缀文件时命中率
-    /// 高（典型 sync 任务 path 局部性强），把"逐级 mkdir RT"压成"首层探测 + 之后零网络"。
+    /// **共享语义**：`Arc<DirExistsCache>` —— `CifsStorage` 派生 `Clone`，
+    /// orchestrator 的 receiver/sender worker 都通过 clone 共享同一个底层 cache。
+    /// 因此实际是 **per-share** 而不是 per-worker；好处是某个 worker 一旦把目录
+    /// 探明，其它 worker 立刻享受 cache hit（典型 sync 任务 path 局部性强，多 worker
+    /// 在同一目录树下并发）。`parking_lot::RwLock` 保证并发安全；`contains()` 走 read
+    /// lock 真并行，`insert()` / `invalidate()` 短临界区。网络瓶颈 (~ms RT) 远大于
+    /// 本地 lock (~μs)，多 worker 共享 cache 的锁竞争代价可忽略。
     ///
     /// 失效：delete / rename 改动到的路径必须显式驱逐（含子前缀），由
     /// [`Self::invalidate_dir_cache`] 统一处理。
@@ -1102,9 +1106,30 @@ impl CifsStorage {
         //
         // 错误处理：drain 模式 —— 任意 inflight 报错时记录首个 error，继续 drain
         // 完所有 inflight 后再返回，保证文件 close 路径正确执行。
+        //
+        // bytes_counter 的"err 之后不累加"规则：first_error 已置位时本次 write_data
+        // 必然返回 Err，上游通常重试整文件；继续 fetch_add 会让重试的成功路径与本次
+        // drain 期间的"侥幸成功" chunk 双计数。所以错误路径上的成功 chunk 不计入有效
+        // 进度（无论发生在 fill 还是 drain 阶段）。
         type WriteFut<'a> = Pin<Box<dyn Future<Output = (u64, std::io::Result<usize>)> + Send + 'a>>;
         let mut inflight: FuturesUnordered<WriteFut<'_>> = FuturesUnordered::new();
         let mut first_error: Option<StorageError> = None;
+        let count_or_record_err = |len: u64,
+                                   result: std::io::Result<usize>,
+                                   first_error: &mut Option<StorageError>| {
+            match result {
+                Ok(_) if first_error.is_none() => {
+                    if let Some(ref c) = bytes_counter {
+                        c.fetch_add(len, Ordering::Relaxed);
+                    }
+                }
+                Ok(_) => {} // 错误路径上的成功 chunk 不计入（见上 doc）
+                Err(e) if first_error.is_none() => {
+                    *first_error = Some(StorageError::CifsError(format!("Failed to write data: {e}")));
+                }
+                Err(_) => {} // 已有 first_error，丢弃后续错误
+            }
+        };
 
         let mut reader = rx;
         loop {
@@ -1112,21 +1137,13 @@ impl CifsStorage {
             if inflight.len() >= DEFAULT_WRITE_INFLIGHT
                 && let Some((len, result)) = inflight.next().await
             {
-                match result {
-                    Ok(_) => {
-                        if let Some(ref c) = bytes_counter {
-                            c.fetch_add(len, Ordering::Relaxed);
-                        }
-                    }
-                    Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(StorageError::CifsError(format!("Failed to write data: {e}")));
-                            // 通知 sender 立即停止：`reader.close()` 让后续 tx.send().await
-                            // 返回 SendError，sender 可早退，避免继续 read source 浪费 IO。
-                            // 已缓冲的 chunk 仍会 drain 完（用于 fall-through 到 channel-empty 退出）。
-                            reader.close();
-                        }
-                    }
+                let was_no_error = first_error.is_none();
+                count_or_record_err(len, result, &mut first_error);
+                // 首次出错时主动 close reader，让 sender 立即停止派发新 chunk
+                // （后续 tx.send().await 返回 SendError），避免上游继续 read source
+                // 浪费 IO。已缓冲的 chunk 仍会 drain 完。
+                if was_no_error && first_error.is_some() {
+                    reader.close();
                 }
             }
 
@@ -1154,26 +1171,10 @@ impl CifsStorage {
             inflight.push(fut);
         }
 
-        // Drain 剩余 inflight。
-        // bytes_counter 语义：操作成功路径上的 wire-acked 字节。`first_error` 已置位时
-        // 整个 write_data 会返回 Err，上游可能重试整文件 —— 若此处继续累加，drain 中
-        // 成功完成的 chunk 字节会被双计数。drain 中的成功 chunk 视作"在已失败的操作
-        // 中恰好被 server 接受"，不计入有效进度。
+        // Drain 剩余 inflight。与 fill 路径共用 count_or_record_err；
+        // drain 阶段不需要再 reader.close()（reader 已 break/close）。
         while let Some((len, result)) = inflight.next().await {
-            match result {
-                Ok(_) => {
-                    if first_error.is_none()
-                        && let Some(ref c) = bytes_counter
-                    {
-                        c.fetch_add(len, Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    if first_error.is_none() {
-                        first_error = Some(StorageError::CifsError(format!("Failed to write data: {e}")));
-                    }
-                }
-            }
+            count_or_record_err(len, result, &mut first_error);
         }
 
         let _ = file.close().await;

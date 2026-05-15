@@ -2473,6 +2473,15 @@ impl S3Storage {
     pub(crate) async fn read_range_uncached(
         &self, key: &str, version_id: Option<&str>, offset: u64, count: u64,
     ) -> Result<Bytes> {
+        // Defensive: count = 0 would produce `bytes=N-(N-1)` which wraps to
+        // `bytes=N-18446744073709551615` (u64 underflow) and the server either
+        // returns 416 Requested Range Not Satisfiable or, worse, serves the
+        // entire object. Internal callers today gate count > 0 themselves,
+        // but with read_range_uncached now pub(crate) we make the contract
+        // explicit at the helper.
+        if count == 0 {
+            return Ok(Bytes::new());
+        }
         let mut builder = self.client.get_object().bucket(&self.bucket_name).key(key);
         if let Some(v) = version_id {
             builder = builder.version_id(v);
