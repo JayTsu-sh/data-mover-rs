@@ -4007,6 +4007,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smb"
 version = "0.12.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?branch=refactor%2Fcompound-set-basic-info#04e426d1e558a5adef4c5335ece3da704561bcb3"
 dependencies = [
  "aead",
  "aes",
@@ -4045,6 +4046,7 @@ dependencies = [
 [[package]]
 name = "smb-dtyp"
 version = "0.12.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?branch=refactor%2Fcompound-set-basic-info#04e426d1e558a5adef4c5335ece3da704561bcb3"
 dependencies = [
  "binrw",
  "modular-bitfield",
@@ -4057,6 +4059,7 @@ dependencies = [
 [[package]]
 name = "smb-dtyp-derive"
 version = "0.12.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?branch=refactor%2Fcompound-set-basic-info#04e426d1e558a5adef4c5335ece3da704561bcb3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4066,6 +4069,7 @@ dependencies = [
 [[package]]
 name = "smb-fscc"
 version = "0.12.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?branch=refactor%2Fcompound-set-basic-info#04e426d1e558a5adef4c5335ece3da704561bcb3"
 dependencies = [
  "binrw",
  "modular-bitfield",
@@ -4078,6 +4082,7 @@ dependencies = [
 [[package]]
 name = "smb-msg"
 version = "0.12.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?branch=refactor%2Fcompound-set-basic-info#04e426d1e558a5adef4c5335ece3da704561bcb3"
 dependencies = [
  "binrw",
  "modular-bitfield",
@@ -4092,6 +4097,7 @@ dependencies = [
 [[package]]
 name = "smb-msg-derive"
 version = "0.12.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?branch=refactor%2Fcompound-set-basic-info#04e426d1e558a5adef4c5335ece3da704561bcb3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4101,6 +4107,7 @@ dependencies = [
 [[package]]
 name = "smb-rpc"
 version = "0.12.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?branch=refactor%2Fcompound-set-basic-info#04e426d1e558a5adef4c5335ece3da704561bcb3"
 dependencies = [
  "binrw",
  "maybe-async",
@@ -4114,6 +4121,7 @@ dependencies = [
 [[package]]
 name = "smb-transport"
 version = "0.12.0"
+source = "git+https://github.com/JayTsu-sh/smb-rs.git?branch=refactor%2Fcompound-set-basic-info#04e426d1e558a5adef4c5335ece3da704561bcb3"
 dependencies = [
  "binrw",
  "bytes 1.11.1",

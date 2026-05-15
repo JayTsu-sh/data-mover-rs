@@ -5,10 +5,11 @@ edition = "2024"
 
 [patch.crates-io]
 nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git" }
-# Phase D 本地开发：依赖 smb-rs 的 Handle Lease A–D 改动
-# (ClientConfig::default_lease_state, Client::evict_lease 等)。
-# Phase D 推上游 fork 后切回 git rev。
-smb = { path = "C:/Jay/rust/github/smb-rs/crates/smb" }
+# Handle Lease Phase A–D + P2.b compound (Client::compound_set_basic_info,
+# evict_lease, flush_idle_leases, default_lease_state) + code-review fix.
+# Tracking the JayTsu-sh fork's refactor/compound-set-basic-info branch
+# until the smb-rs upstream merges this work.
+smb = { git = "https://github.com/JayTsu-sh/smb-rs.git", branch = "refactor/compound-set-basic-info" }
 
 [dependencies]
 async-channel = "2"
