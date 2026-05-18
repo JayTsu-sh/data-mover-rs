@@ -251,7 +251,8 @@ const DEFAULT_BLOCK_SIZE: u64 = 8 * MB;
 ///
 /// 默认 4：在常见 SMB credits（512+）和 chunk=8 MiB 配置下，与 BDP 对齐又不至于
 /// 让 server 端 read-ahead 失效。增大值在高 RTT 链路收益线性，超过 server credits
-/// 上限后失效。要调整时通过 [`CifsStorage::read_inflight_depth`] 暴露给上层。
+/// 上限后失效。目前为编译期常量；如需运行期 tunable，需新增 `CifsStorage`
+/// 方法暴露给上层（当前未实现）。
 const DEFAULT_READ_INFLIGHT: usize = 4;
 
 /// 单文件写入的同时在飞请求数（inflight write pipeline 深度）。
@@ -1505,15 +1506,6 @@ impl CifsStorage {
         }
 
         let from_unc = self.build_unc_path(from);
-        let to_unc_for_evict = self.build_unc_path(to);
-
-        // Phase D: rename 同时使 `from` 与 `to` 路径的 lease 缓存失效。
-        // `from` 的 FileId 在 rename 后指向已搬走的文件名，下次 create_file
-        // 命中缓存会得到 stale FileId；`to` 之前若存在同名 lease（被
-        // replace_if_exists 覆盖）也必须 evict。两次 evict 都幂等，无 lease 时
-        // 是 cheap no-op。
-        let _ = self.client.evict_lease(&from_unc).await;
-        let _ = self.client.evict_lease(&to_unc_for_evict).await;
         let to_unc = self.build_unc_path(to);
 
         // Phase D: rename 同时使 `from` 与 `to` 路径的 lease 缓存失效。

@@ -325,6 +325,9 @@ const MAX_CONCURRENCY: usize = 5; // 最大并发上传数
 /// aws-sdk-rust 底层 HTTP/2 connection pool 天然支持多请求并发；S3 兼容存储
 /// （AWS S3 / MinIO / Ceph 等）服务端对同 object 不同 byte range 高并发友好，
 /// 与单 inflight 相比高 RTT 链路收益线性。默认 4 与 CIFS 对称。
+///
+/// 目前为编译期常量；如需运行期 tunable（例如跨 region 25 MB BDP 链路需要
+/// 更高并发），需新增 `S3Storage` 方法暴露给上层（当前未实现）。
 const DEFAULT_READ_INFLIGHT: usize = 4;
 
 /// 转换时间戳为纳秒时间戳
