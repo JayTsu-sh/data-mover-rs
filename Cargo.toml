@@ -5,8 +5,6 @@ edition = "2024"
 
 [patch.crates-io]
 nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git" }
-# Handle Lease Phase A–D + P2.b compound (PR #2 merged 2026-05-15).
-# Tracking fork main; run `cargo update -p smb` to pull the latest.
 smb = { git = "https://github.com/JayTsu-sh/smb-rs.git" }
 
 [dependencies]
@@ -43,7 +41,7 @@ reqwest = { version = "0.13.2", default-features = false, features = [
     "cookies",
     "rustls",
 ] }
-rustls = { version = "0.23", features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive", "rc"] }
 smb = "0.12"
 soft-canonicalize = "0.5.5"
