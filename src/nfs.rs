@@ -1479,6 +1479,10 @@ impl NFSStorage {
             self.create_dir_all(parent).await?;
         }
 
+        // 把 i64 nanos 时间戳转成 nfs_rs::Time；retry 之间不变，提到循环外。
+        let atime_t = Some(i64_to_time(atime));
+        let mtime_t = Some(i64_to_time(mtime));
+
         for attempt in 0..=MAX_STALE_RETRIES {
             let parent_fh = if let Some(parent) = relative_path.parent() {
                 self.lookup_fh(parent).await?.fh
@@ -1492,17 +1496,32 @@ impl NFSStorage {
                     .fh
             };
 
-            // 创建符号链接
+            // 创建符号链接：把 CREATE(NF4LNK) 和 SETATTR 合并到一次调用里。
+            // - NFSv4.1 实现把两者塞进同一个 COMPOUND，省一次 RPC 往返
+            // - NFSv3 / 默认 trait 实现仍是 SYMLINK + SETATTR 两步
+            //
+            // 行为差异：相比旧的 `mount.symlink + self.set_metadata` 写法，
+            // post-CREATE 的 SETATTR 失去了 set_metadata 内部针对 stale FH 的
+            // 独立重试。极少触发的窗口（CREATE 与紧随其后的 SETATTR 之间
+            // FH 变 stale）由外层 create_symlink 的重试循环兜底：refresh
+            // root_fh + invalidate cache + 整体重试，代价是 EXIST 分支会
+            // REMOVE 后重建（symlink inode 变化，但属性最终正确）。
             match self
                 .mount
-                .symlink(&target_path_str, parent_fh.clone(), &link_filename)
+                .symlink_with_attrs(
+                    &target_path_str,
+                    parent_fh.clone(),
+                    &link_filename,
+                    uid,
+                    gid,
+                    atime_t,
+                    mtime_t,
+                )
                 .await
             {
-                Ok(symlink_obj) => {
-                    let handle = NFSFileHandle::new(symlink_obj.fh, relative_path.to_path_buf());
-                    return self
-                        .set_metadata(&handle, Some(atime), Some(mtime), uid, gid, None)
-                        .await;
+                Ok(_symlink_obj) => {
+                    // 属性已在同一次调用里写入，不再需要后续 set_metadata
+                    return Ok(());
                 }
                 Err(e) => {
                     // NFS4ERR_EXIST / NFS3ERR_EXIST：目标同名条目已存在，
@@ -1524,15 +1543,19 @@ impl NFSStorage {
                         // REMOVE 后直接重试创建
                         match self
                             .mount
-                            .symlink(&target_path_str, parent_fh, &link_filename)
+                            .symlink_with_attrs(
+                                &target_path_str,
+                                parent_fh,
+                                &link_filename,
+                                uid,
+                                gid,
+                                atime_t,
+                                mtime_t,
+                            )
                             .await
                         {
-                            Ok(symlink_obj) => {
-                                let handle =
-                                    NFSFileHandle::new(symlink_obj.fh, relative_path.to_path_buf());
-                                return self
-                                    .set_metadata(&handle, Some(atime), Some(mtime), uid, gid, None)
-                                    .await;
+                            Ok(_symlink_obj) => {
+                                return Ok(());
                             }
                             Err(e2) => {
                                 return Err(StorageError::NfsError(format!(
