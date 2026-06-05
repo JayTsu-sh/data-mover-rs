@@ -1452,6 +1452,23 @@ impl NFSStorage {
         Ok(DeleteDirIterator::new(rx))
     }
 
+    /// 创建符号链接，同时写入 ownership 与时间戳。
+    ///
+    /// 在 NFSv4.1 后端上，CREATE(NF4LNK) 与 SETATTR 合并到同一个 COMPOUND
+    /// 内，一次 RPC 完成；NFSv3 / 默认 trait 实现仍是 SYMLINK + SETATTR
+    /// 两步（行为等价于显式调用 `mount.symlink` 后接 `mount.setattr`）。
+    /// 父目录缺失时会自动 `create_dir_all`；同名条目存在时按全量同步语义
+    /// REMOVE 后重建。stale FH 触发外层重试循环（refresh + invalidate cache）。
+    ///
+    /// # 参数
+    /// - `relative_path`：目标 symlink 的相对路径
+    /// - `target_path`：symlink 指向的目标路径（原样写入 linkdata）
+    /// - `atime` / `mtime`：i64 纳秒时间戳；内部转 `nfs_rs::Time` 下发
+    /// - `uid` / `gid`：可选 ownership；`None` 表示不设置（保持服务端默认）
+    ///
+    /// # 返回值
+    /// - `Ok(())`：symlink 已存在且属性已应用
+    /// - `Err(StorageError)`：CREATE 或 SETATTR 任一环节失败
     pub async fn create_symlink(
         &self,
         relative_path: &Path,
@@ -1519,7 +1536,7 @@ impl NFSStorage {
                 )
                 .await
             {
-                Ok(_symlink_obj) => {
+                Ok(_) => {
                     // 属性已在同一次调用里写入，不再需要后续 set_metadata
                     return Ok(());
                 }
@@ -1541,8 +1558,7 @@ impl NFSStorage {
                                 ))
                             })?;
                         // REMOVE 后直接重试创建
-                        match self
-                            .mount
+                        self.mount
                             .symlink_with_attrs(
                                 &target_path_str,
                                 parent_fh,
@@ -1553,16 +1569,12 @@ impl NFSStorage {
                                 mtime_t,
                             )
                             .await
-                        {
-                            Ok(_symlink_obj) => {
-                                return Ok(());
-                            }
-                            Err(e2) => {
-                                return Err(StorageError::NfsError(format!(
+                            .map_err(|e2| {
+                                StorageError::NfsError(format!(
                                     "Failed to recreate symlink after remove: {e2}"
-                                )));
-                            }
-                        }
+                                ))
+                            })?;
+                        return Ok(());
                     }
                     if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
