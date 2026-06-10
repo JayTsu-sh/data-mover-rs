@@ -310,15 +310,10 @@ pub fn get_security_info(path: &Path) -> Result<SecurityInfo> {
     unsafe {
         let (sd, owner_sid, group_sid, dacl) = get_security_descriptor(path_wide.as_ptr())?;
 
-        // 保存安全描述符的副本
-        let sd_size = GetSecurityDescriptorLength(sd);
-        let mut security_descriptor = Vec::with_capacity(sd_size as usize);
-        security_descriptor.set_len(sd_size as usize);
-        std::ptr::copy_nonoverlapping(
-            sd as *const u8,
-            security_descriptor.as_mut_ptr(),
-            sd_size as usize,
-        );
+        // 保存安全描述符的副本。直接从 Win32 返回的指针构造 slice 再 to_vec 拷贝，
+        // 避免 with_capacity + set_len 暴露未初始化内存（clippy::uninit_vec）
+        let sd_size = GetSecurityDescriptorLength(sd) as usize;
+        let security_descriptor = std::slice::from_raw_parts(sd as *const u8, sd_size).to_vec();
 
         // 获取所有者信息
         let owner = if !owner_sid.is_null() && IsValidSid(owner_sid) != 0 {
