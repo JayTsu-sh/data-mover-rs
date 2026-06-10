@@ -365,7 +365,7 @@ impl NFSFileHandle {
     }
 }
 
-const DEFAULT_BLOCK_SIZE: u64 = 2 * MB;
+const DEFAULT_BLOCK_SIZE: u64 = MB; // 1MB
 
 /// 从 `relative_path` 中剥离 root 前缀，返回相对于 root 的路径。
 /// 使用 `Path::strip_prefix` 按组件比较，跨平台兼容，零字符串分配。
@@ -433,7 +433,7 @@ fn build_relative_path_impl(root: &str, dir_path: &str, entry_file_name: &str) -
 
 #[derive(Clone, Debug)]
 pub(crate) struct StorageConfig {
-    /// 块大小，默认2MB
+    /// 块大小，默认1MB
     pub block_size: u64,
 }
 
@@ -597,12 +597,12 @@ impl NFSStorage {
         // 确保每次 read/write 调用都走单次 RPC 零拷贝快路径
         let rsize = u64::from(mount.get_max_read_size());
         let wsize = u64::from(mount.get_max_write_size());
-        let max_transfer = std::cmp::min(rsize, wsize);
-        let effective_block_size = block_size
-            .map_or(DEFAULT_BLOCK_SIZE, |size| {
-                std::cmp::min(size, DEFAULT_BLOCK_SIZE)
-            })
-            .min(max_transfer);
+        // 取 {客户 block_size, rsize, wsize, DEFAULT} 的最小值；为 0 的候选项视为无效不参与，
+        // 避免协商失败或非法输入把块大小塌成 0。DEFAULT 恒非零作兜底，结果恒 > 0。
+        let effective_block_size = [block_size.unwrap_or(0), rsize, wsize]
+            .into_iter()
+            .filter(|&c| c > 0)
+            .fold(DEFAULT_BLOCK_SIZE, u64::min);
         info!(
             "NFS rsize={}, wsize={}, effective block_size={}",
             rsize, wsize, effective_block_size
