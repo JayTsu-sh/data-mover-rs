@@ -3009,19 +3009,32 @@ pub async fn create_nfs_storage_ensuring_dir(
 
     if !root_dir.is_empty() {
         let path = Path::new(&root_dir);
-        if let Ok(obj_res) = storage.lookup_fh(path).await {
-            *storage.root_fh.write().map_err(|_| root_fh_lock_err())? = obj_res.fh;
-            storage.root = Arc::new(root_dir);
-        } else {
-            // prefix 目录不存在，创建之
-            info!("NFS prefix '{}' does not exist, creating it", root_dir);
-            let fh = storage.create_dir_all(path).await.map_err(|e| {
-                StorageError::OperationError(format!(
-                    "Failed to create NFS prefix '{root_dir}': {e}"
-                ))
-            })?;
-            *storage.root_fh.write().map_err(|_| root_fh_lock_err())? = fh;
-            storage.root = Arc::new(root_dir);
+        match storage.lookup_fh(path).await {
+            Ok(obj_res) => {
+                // prefix 存在但不是目录时 root_fh 会指向文件，后续所有操作以怪异方式失败
+                if let Some(attr) = &obj_res.attr
+                    && attr.type_ != FType3::NF3DIR as u32
+                {
+                    return Err(StorageError::OperationError(format!(
+                        "NFS prefix '{root_dir}' exists but is not a directory"
+                    )));
+                }
+                *storage.root_fh.write().map_err(|_| root_fh_lock_err())? = obj_res.fh;
+                storage.root = Arc::new(root_dir);
+            }
+            Err(StorageError::DirectoryNotFound(_)) => {
+                // prefix 目录确实不存在（NOENT），创建之
+                info!("NFS prefix '{}' does not exist, creating it", root_dir);
+                let fh = storage.create_dir_all(path).await.map_err(|e| {
+                    StorageError::OperationError(format!(
+                        "Failed to create NFS prefix '{root_dir}': {e}"
+                    ))
+                })?;
+                *storage.root_fh.write().map_err(|_| root_fh_lock_err())? = fh;
+                storage.root = Arc::new(root_dir);
+            }
+            // 网络 / 权限等其他错误如实上抛，不能误判为"目录不存在"
+            Err(e) => return Err(e),
         }
     }
 
