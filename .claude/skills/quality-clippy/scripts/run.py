@@ -3,7 +3,8 @@
 
 策略：
 - 跑 cargo clippy --all-targets (不加 -D warnings)，捕获 warning + error 总数。
-- 与 baseline (.claude/skills/quality-clippy/baseline_count.txt) 比较。
+- 与 baseline 比较：存在 baseline_count.<sys.platform>.txt (如 win32) 时优先，
+  否则用 baseline_count.txt (Linux 口径)。
 - 总数 ≤ baseline → PASS (允许下降)。
 - 总数 > baseline → FAIL (警告新增 = 回归)。
 - 总数 < baseline-5 → 提示更新 baseline (clippy 修了，应该锁回去防回退)。
@@ -27,7 +28,12 @@ sys.path.insert(0, str(SHARED))
 
 from protocol_constants import PROJECT_ROOT  # noqa: E402
 
-BASELINE_FILE = SKILL_DIR / "baseline_count.txt"
+# baseline 按平台分口径：Windows 多出 cfg(windows) 路径的 pedantic 警告，
+# 与 Linux 录制的 baseline 不可比。存在 baseline_count.<platform>.txt 时优先。
+_PLATFORM_BASELINE = SKILL_DIR / f"baseline_count.{sys.platform}.txt"
+BASELINE_FILE = (
+    _PLATFORM_BASELINE if _PLATFORM_BASELINE.exists() else SKILL_DIR / "baseline_count.txt"
+)
 WARNING_RE = re.compile(r"^(warning|error):", re.MULTILINE)
 
 
@@ -35,8 +41,13 @@ def load_baseline() -> int:
     if not BASELINE_FILE.exists():
         return 0
     try:
-        return int(BASELINE_FILE.read_text(encoding="utf-8").strip())
+        # utf-8-sig: PowerShell 的 echo/重定向可能写出带 BOM 的文件
+        return int(BASELINE_FILE.read_text(encoding="utf-8-sig").strip())
     except ValueError:
+        print(
+            f"[skill quality-clippy] WARN: cannot parse {BASELINE_FILE}, treating baseline as 0",
+            file=sys.stderr,
+        )
         return 0
 
 
