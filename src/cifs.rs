@@ -683,15 +683,14 @@ impl CifsStorage {
             .create_file(&root_unc, &args)
             .await
             .map_err(|e| StorageError::CifsError(format!("Connectivity check failed: {e}")))?;
-        if let Resource::Directory(d) = resource {
-            let _ = d.close().await;
-        }
+        close_resource(resource).await;
         Ok(())
     }
 
     /// 确保 root sub-path 存在（缺失则按层创建）
     ///
     /// 仅供目标端 dest 路径在首次写入前调用。share 根为空（无 sub-path）时直接返回。
+    /// root 已存在但不是目录时返回 `OperationError`（与 NFS `attach_root` 的校验一致）。
     ///
     /// 注意：直接对 share 根逐层 mkdir，避开 `create_dir_all` 在 `build_unc_path`
     /// 中重复拼接 `self.root` 的问题（否则会创建 `<root>/<root>` 嵌套目录）。
@@ -704,8 +703,14 @@ impl CifsStorage {
         let open_args =
             FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
         if let Ok(resource) = self.client.create_file(&root_unc, &open_args).await {
-            if let Resource::Directory(d) = resource {
-                let _ = d.close().await;
+            let is_dir = matches!(resource, Resource::Directory(_));
+            close_resource(resource).await;
+            if !is_dir {
+                // root 存在但不是目录：放行会让后续所有写入以怪异方式失败
+                return Err(StorageError::OperationError(format!(
+                    "CIFS root sub-path '{}' exists but is not a directory",
+                    self.root
+                )));
             }
             return Ok(());
         }
