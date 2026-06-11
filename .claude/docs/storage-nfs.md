@@ -66,7 +66,9 @@ NFS 错误必须按 commit `7eb3046` 的分类映射：
 
 ## 公开导出
 
-- `create_nfs_storage_ensuring_dir` (commit `b11ce9d`) — 创建 NFSStorage 同时确保目标目录存在。在 lib.rs 顶层 `pub use`。
+- `create_nfs_storage(url, block_size, ensure_dir)` — 统一工厂。`ensure_dir = true` 时
+  prefix 目录不存在（NOENT）自动创建；其他 lookup 错误（网络/权限）如实上抛。
+  root 解析逻辑收敛在 `NFSStorage::attach_root`。
 
 ## 已知陷阱
 

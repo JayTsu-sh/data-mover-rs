@@ -42,8 +42,8 @@ async fn copy_file_returns_cancelled_when_token_pre_cancelled() {
     let blob = format!("{src_dir}/blob.bin");
     write_blob(&blob, 1024).await;
 
-    let src = create_storage(&src_dir, None).await.unwrap();
-    let dst = create_storage(&dst_dir, None).await.unwrap();
+    let src = create_storage(&src_dir, None, false).await.unwrap();
+    let dst = create_storage(&dst_dir, None, true).await.unwrap();
     let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
 
     let token = CancellationToken::new();
@@ -81,8 +81,8 @@ async fn copy_file_aborts_mid_transfer_on_token_cancel() {
     let blob = format!("{src_dir}/blob.bin");
     write_blob(&blob, 16 * 1024 * 1024).await;
 
-    let src = create_storage(&src_dir, None).await.unwrap();
-    let dst = create_storage(&dst_dir, None).await.unwrap();
+    let src = create_storage(&src_dir, None, false).await.unwrap();
+    let dst = create_storage(&dst_dir, None, true).await.unwrap();
     let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
 
     let qos = QosManager::try_new(Some("4MiB/s"), 1.0, None).unwrap();
@@ -131,8 +131,8 @@ async fn copy_file_without_cancel_still_works_via_compat_wrapper() {
     let blob = format!("{src_dir}/blob.bin");
     write_blob(&blob, 256 * 1024).await;
 
-    let src = create_storage(&src_dir, None).await.unwrap();
-    let dst = create_storage(&dst_dir, None).await.unwrap();
+    let src = create_storage(&src_dir, None, false).await.unwrap();
+    let dst = create_storage(&dst_dir, None, true).await.unwrap();
     let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
 
     // Old (unchanged) signature — must still work.

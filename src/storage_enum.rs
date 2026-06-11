@@ -19,11 +19,11 @@ use tracing::{debug, warn};
 #[cfg(windows)]
 use crate::acl;
 use crate::checksum::{ConsistencyCheck, HashCalculator};
-use crate::cifs::{CifsStorage, create_cifs_storage, create_cifs_storage_ensuring_dir};
+use crate::cifs::{CifsStorage, create_cifs_storage};
 use crate::error::StorageError;
 use crate::filter::FilterExpression;
-use crate::local::{LocalStorage, create_local_storage, create_local_storage_ensuring_dir};
-use crate::nfs::{NFSStorage, create_nfs_storage, create_nfs_storage_ensuring_dir};
+use crate::local::{LocalStorage, create_local_storage};
+use crate::nfs::{NFSStorage, create_nfs_storage};
 use crate::qos::QosManager;
 use crate::s3::{S3Storage, create_s3_storage};
 use crate::tar_pack::{build_header_for_entry, tar_eof_marker, tar_padding};
@@ -1512,37 +1512,25 @@ pub fn detect_storage_type(path: &str) -> StorageType {
     }
 }
 
-/// 创建目标存储实例，如果 prefix 目录不存在则自动创建
-pub async fn create_storage_for_dest(path: &str, block_size: Option<u64>) -> Result<StorageEnum> {
-    debug!("Creating destination storage for path: {}", path);
-    match detect_storage_type(path) {
-        StorageType::Cifs => create_cifs_storage_ensuring_dir(path, block_size).await,
-        StorageType::Nfs => create_nfs_storage_ensuring_dir(path, block_size).await,
-        StorageType::S3 => create_s3_storage(path, block_size).await,
-        StorageType::Local => create_local_storage_ensuring_dir(path, block_size),
-    }
-}
-
 /// 根据路径前缀创建对应的存储实例
-pub async fn create_storage(path: &str, block_size: Option<u64>) -> Result<StorageEnum> {
-    debug!("Creating storage for path: {}", path);
+///
+/// `ensure_dir = true` 用于目标端：prefix 目录不存在时自动创建；
+/// `ensure_dir = false` 用于源端：prefix 不存在时报错。
+/// S3 无目录概念，该参数对其无效果。
+pub async fn create_storage(
+    path: &str,
+    block_size: Option<u64>,
+    ensure_dir: bool,
+) -> Result<StorageEnum> {
     let storage_type = detect_storage_type(path);
+    debug!(
+        "Creating {:?} storage for path: {} (ensure_dir={})",
+        storage_type, path, ensure_dir
+    );
     match storage_type {
-        StorageType::Cifs => {
-            debug!("Creating CIFS storage");
-            create_cifs_storage(path, block_size).await
-        }
-        StorageType::Nfs => {
-            debug!("Creating NFS storage");
-            create_nfs_storage(path, block_size).await
-        }
-        StorageType::S3 => {
-            debug!("Creating S3 storage");
-            create_s3_storage(path, block_size).await
-        }
-        StorageType::Local => {
-            debug!("Creating local storage");
-            create_local_storage(path, block_size)
-        }
+        StorageType::Cifs => create_cifs_storage(path, block_size, ensure_dir).await,
+        StorageType::Nfs => create_nfs_storage(path, block_size, ensure_dir).await,
+        StorageType::S3 => create_s3_storage(path, block_size).await,
+        StorageType::Local => create_local_storage(path, block_size, ensure_dir),
     }
 }

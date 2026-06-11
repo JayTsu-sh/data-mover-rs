@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use data_mover::storage_enum::{StorageEnum, create_storage, create_storage_for_dest};
+use data_mover::storage_enum::{StorageEnum, create_storage};
 use data_mover::{EntryEnum, Result, StorageEntryMessage};
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -40,8 +40,8 @@ async fn main() -> Result<()> {
     println!();
 
     // 创建源和目标存储
-    let src_storage = Arc::new(create_storage(&args.src, None).await?);
-    let dst_storage = Arc::new(create_storage_for_dest(&args.dst, None).await?);
+    let src_storage = Arc::new(create_storage(&args.src, None, false).await?);
+    let dst_storage = Arc::new(create_storage(&args.dst, None, true).await?);
 
     // ── Phase 1: 遍历源共享 ──────────────────────────────────────────────────
     println!("=== Phase 1: Walkdir ===");

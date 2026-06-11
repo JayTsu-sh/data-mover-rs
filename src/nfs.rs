@@ -643,23 +643,49 @@ impl NFSStorage {
     }
 
     pub async fn new(url: &str, block_size: Option<u64>) -> Result<Self> {
-        let (mut storage, root_dir) = Self::mount_and_build(url, block_size).await?;
+        let (storage, root_dir) = Self::mount_and_build(url, block_size).await?;
+        storage.attach_root(root_dir, false).await
+    }
 
-        if !root_dir.is_empty() {
-            info!("Looking up file handler for root directory: {:?}", root_dir);
-            let path = Path::new(&root_dir);
-
-            let obj_res = storage.lookup_fh(path).await.map_err(|e| {
-                let msg = format!("Failed to lookup root directory {root_dir}: {e}");
-                error!("{}", msg);
-                StorageError::OperationError(msg)
-            })?;
-
-            *storage.root_fh.write().map_err(|_| root_fh_lock_err())? = obj_res.fh;
-            storage.root = Arc::new(root_dir);
+    /// 将解析出的 `root_dir` 装载到 storage：lookup root fh 后写入 `root_fh` + `root`。
+    ///
+    /// - `create_if_missing = true`（目标端）：prefix 不存在（NOENT）时自动逐级创建；
+    /// - `create_if_missing = false`（源端）：prefix 不存在直接报 `DirectoryNotFound`。
+    ///
+    /// 网络 / 权限等非 NOENT 错误一律如实上抛，不能误判为"目录不存在"。
+    async fn attach_root(mut self, root_dir: String, create_if_missing: bool) -> Result<Self> {
+        if root_dir.is_empty() {
+            return Ok(self);
         }
-
-        Ok(storage)
+        let path = Path::new(&root_dir);
+        let fh = match self.lookup_fh(path).await {
+            Ok(obj_res) => {
+                // prefix 存在但不是目录时 root_fh 会指向文件，后续所有操作以怪异方式失败
+                if let Some(attr) = &obj_res.attr
+                    && attr.type_ != FType3::NF3DIR as u32
+                {
+                    return Err(StorageError::OperationError(format!(
+                        "NFS prefix '{root_dir}' exists but is not a directory"
+                    )));
+                }
+                obj_res.fh
+            }
+            Err(StorageError::DirectoryNotFound(_)) if create_if_missing => {
+                info!("NFS prefix '{}' does not exist, creating it", root_dir);
+                self.create_dir_all(path).await.map_err(|e| {
+                    StorageError::OperationError(format!(
+                        "Failed to create NFS prefix '{root_dir}': {e}"
+                    ))
+                })?
+            }
+            Err(e) => {
+                error!("Failed to lookup NFS root directory {root_dir}: {e}");
+                return Err(e);
+            }
+        };
+        *self.root_fh.write().map_err(|_| root_fh_lock_err())? = fh;
+        self.root = Arc::new(root_dir);
+        Ok(self)
     }
 
     /// 返回用于 `GLOBAL_CACHE` key 的标识符：`server_id`(8B) + `root_fh`。
@@ -2984,61 +3010,21 @@ impl NFSStorage {
     }
 }
 
-/// 创建 NFS 存储实例
-///
-/// 该函数用于创建 NFS 存储实例，并包装为 `StorageEnum`。
+/// 创建 NFS 存储实例，并包装为 `StorageEnum`
 ///
 /// # 参数
 /// - `url`：NFS URL 字符串
 /// - `block_size`：可选的块大小，默认值为 2MB
-///
-/// # 返回值
-/// - `Ok(StorageEnum)`：创建成功，返回 `StorageEnum::NFS` 实例
-/// - `Err(StorageError)`：创建失败，返回错误信息
-pub async fn create_nfs_storage(url: &str, block_size: Option<u64>) -> Result<StorageEnum> {
-    let nfs_storage = NFSStorage::new(url, block_size).await?;
-    Ok(StorageEnum::NFS(nfs_storage))
-}
-
-/// 创建 NFS 目标存储实例，如果 prefix 目录不存在则自动创建
-pub async fn create_nfs_storage_ensuring_dir(
+/// - `ensure_dir`：true（目标端）时 prefix 目录不存在则自动创建；false（源端）时不存在报错
+pub async fn create_nfs_storage(
     url: &str,
     block_size: Option<u64>,
+    ensure_dir: bool,
 ) -> Result<StorageEnum> {
-    let (mut storage, root_dir) = NFSStorage::mount_and_build(url, block_size).await?;
-
-    if !root_dir.is_empty() {
-        let path = Path::new(&root_dir);
-        match storage.lookup_fh(path).await {
-            Ok(obj_res) => {
-                // prefix 存在但不是目录时 root_fh 会指向文件，后续所有操作以怪异方式失败
-                if let Some(attr) = &obj_res.attr
-                    && attr.type_ != FType3::NF3DIR as u32
-                {
-                    return Err(StorageError::OperationError(format!(
-                        "NFS prefix '{root_dir}' exists but is not a directory"
-                    )));
-                }
-                *storage.root_fh.write().map_err(|_| root_fh_lock_err())? = obj_res.fh;
-                storage.root = Arc::new(root_dir);
-            }
-            Err(StorageError::DirectoryNotFound(_)) => {
-                // prefix 目录确实不存在（NOENT），创建之
-                info!("NFS prefix '{}' does not exist, creating it", root_dir);
-                let fh = storage.create_dir_all(path).await.map_err(|e| {
-                    StorageError::OperationError(format!(
-                        "Failed to create NFS prefix '{root_dir}': {e}"
-                    ))
-                })?;
-                *storage.root_fh.write().map_err(|_| root_fh_lock_err())? = fh;
-                storage.root = Arc::new(root_dir);
-            }
-            // 网络 / 权限等其他错误如实上抛，不能误判为"目录不存在"
-            Err(e) => return Err(e),
-        }
-    }
-
-    Ok(StorageEnum::NFS(storage))
+    let (storage, root_dir) = NFSStorage::mount_and_build(url, block_size).await?;
+    Ok(StorageEnum::NFS(
+        storage.attach_root(root_dir, ensure_dir).await?,
+    ))
 }
 
 impl Drop for NFSStorage {

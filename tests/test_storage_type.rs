@@ -1,4 +1,4 @@
-use data_mover::storage_enum::{StorageType, detect_storage_type};
+use data_mover::storage_enum::{StorageType, create_storage, detect_storage_type};
 
 #[test]
 fn test_local_unix_path() {
@@ -58,4 +58,27 @@ fn test_relative_path() {
 #[test]
 fn test_empty_string() {
     assert_eq!(detect_storage_type(""), StorageType::Local);
+}
+
+#[tokio::test]
+async fn test_create_storage_ensure_dir_creates_missing_local_dir() {
+    let dir = std::env::temp_dir().join("data-mover-ensure-dir-true");
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().into_owned();
+
+    let storage = create_storage(&path, None, true).await;
+    assert!(storage.is_ok(), "ensure_dir=true 应自动创建缺失目录");
+    assert!(dir.is_dir());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_create_storage_no_ensure_dir_errors_on_missing_local_dir() {
+    let dir = std::env::temp_dir().join("data-mover-ensure-dir-false");
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.to_string_lossy().into_owned();
+
+    let storage = create_storage(&path, None, false).await;
+    assert!(storage.is_err(), "ensure_dir=false 时缺失目录应报错");
 }

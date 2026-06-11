@@ -42,9 +42,8 @@
 核心函数：
 - `canonicalize_path(path) -> String` — 自动检测 + 规范化。
 - `detect_storage_type(path) -> StorageType` — URL scheme 4 路判别。
-- `StorageEnum::create_storage(url) -> Result<Self>` — 工厂。
-- `StorageEnum::create_storage_for_dest(url) -> Result<Self>` — 目标端工厂 (含 ensure_dir 语义)。
-- `create_nfs_storage_ensuring_dir` — NFS 专用的目录确保入口 (commit `b11ce9d` export)。
+- `create_storage(url, block_size, ensure_dir) -> Result<StorageEnum>` — 统一工厂。
+  `ensure_dir = true` 为目标端语义 (prefix 不存在自动创建)，`false` 为源端语义。
 
 ## examples/ (9 个，手动验证入口)
 

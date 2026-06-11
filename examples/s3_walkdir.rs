@@ -9,6 +9,7 @@ async fn main() -> Result<()> {
     let storage = create_storage(
         "s3://H80NKRVS5DYOVE43U2HS:FBU8xNSKujskgO2bF6ctnd7dF2IeDodmoy3q6hNk@mbucket-src.10.128.137.245:8184",
         None,
+        false,
     )
     .await?;
 

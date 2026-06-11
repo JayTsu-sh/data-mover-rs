@@ -673,7 +673,7 @@ impl CifsStorage {
     ///
     /// 仅尝试打开 root（含 sub-path），打开后立即关闭句柄。失败即报错，不创建任何目录。
     /// 目标端首次写入需要自动建立 root sub-path 的场景，由
-    /// `create_cifs_storage_ensuring_dir` → `ensure_root_exists` 处理。
+    /// `create_cifs_storage(ensure_dir = true)` → `ensure_root_exists` 处理。
     pub async fn check_connectivity(&self) -> Result<()> {
         let root_unc = self.build_unc_path(Path::new(""));
         let args =
@@ -2735,22 +2735,23 @@ where
 }
 
 /// 创建 CIFS 存储实例
-pub async fn create_cifs_storage(url: &str, block_size: Option<u64>) -> Result<StorageEnum> {
-    let storage = CifsStorage::new(url, block_size).await?;
-    Ok(StorageEnum::CIFS(storage))
-}
-
-/// 创建 CIFS 目标存储实例，root sub-path 不存在时自动创建
 ///
-/// 仅在 dest 路径使用。区别于 `create_cifs_storage`：跳过只读的连通性检查，
-/// 改由 `ensure_root_exists` 缺失时按层 mkdir（直接对 share 根，避开
-/// `build_unc_path` 的 root 前缀双重拼接）。
-pub async fn create_cifs_storage_ensuring_dir(
+/// `ensure_dir = true`（目标端）：跳过只读的连通性检查，root sub-path 缺失时
+/// 由 `ensure_root_exists` 按层 mkdir（直接对 share 根，避开 `build_unc_path`
+/// 的 root 前缀双重拼接）。
+/// `ensure_dir = false`（源端）：走 `CifsStorage::new` 含连通性检查，路径不存在报错。
+pub async fn create_cifs_storage(
     url: &str,
     block_size: Option<u64>,
+    ensure_dir: bool,
 ) -> Result<StorageEnum> {
-    let storage = CifsStorage::connect_only(url, block_size).await?;
-    storage.ensure_root_exists().await?;
+    let storage = if ensure_dir {
+        let storage = CifsStorage::connect_only(url, block_size).await?;
+        storage.ensure_root_exists().await?;
+        storage
+    } else {
+        CifsStorage::new(url, block_size).await?
+    };
     Ok(StorageEnum::CIFS(storage))
 }
 

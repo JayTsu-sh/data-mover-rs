@@ -1242,18 +1242,18 @@ fn normalize_local_path(path: &str) -> Result<String> {
     }
 }
 
-/// 创建本地目标存储实例，如果目录不存在则自动创建
-pub fn create_local_storage_ensuring_dir(
+/// 创建本地存储实例
+///
+/// `ensure_dir = true`（目标端）时目录不存在则自动递归创建。
+pub fn create_local_storage(
     path: &str,
     block_size: Option<u64>,
+    ensure_dir: bool,
 ) -> Result<StorageEnum> {
-    // create_dir_all 是幂等操作：目录已存在时不报错，不存在时递归创建
-    std::fs::create_dir_all(path).map_err(StorageError::IoError)?;
-    create_local_storage(path, block_size)
-}
-
-/// 创建本地存储实例
-pub fn create_local_storage(path: &str, block_size: Option<u64>) -> Result<StorageEnum> {
+    if ensure_dir {
+        // create_dir_all 是幂等操作：目录已存在时不报错，不存在时递归创建
+        std::fs::create_dir_all(path).map_err(StorageError::IoError)?;
+    }
     debug!("In create local storage Raw path: {}", path);
 
     // canonicalize 要求路径已存在，路径不存在时会返回 InvalidPath 错误

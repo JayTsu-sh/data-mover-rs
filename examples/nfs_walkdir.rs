@@ -30,7 +30,7 @@ struct Stats {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let storage = create_storage(&args.url, None).await?;
+    let storage = create_storage(&args.url, None, false).await?;
 
     let start = Instant::now();
 

@@ -9,7 +9,7 @@ URL string
 detect_storage_type()   ── lib.rs ──  按 scheme 判别 4 backend
     │
     ▼
-StorageEnum::create_storage(url)
+create_storage(url, block_size, ensure_dir)
     │
     ├──→ Local(LocalStorage)
     ├──→ NFS(NFSStorage)

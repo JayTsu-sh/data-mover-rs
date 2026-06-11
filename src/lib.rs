@@ -34,12 +34,10 @@ pub use filter::{
     get_filter_field_definitions,
 };
 pub use local::LocalStorage;
-pub use nfs::{NFSStorage, create_nfs_storage_ensuring_dir};
+pub use nfs::NFSStorage;
 pub use qos::QosManager;
 pub use s3::{MultipartUpload, S3BucketInfo, S3CompletedPart, S3Storage};
-pub use storage_enum::{
-    StorageEnum, StorageType, create_storage, create_storage_for_dest, detect_storage_type,
-};
+pub use storage_enum::{StorageEnum, StorageType, create_storage, detect_storage_type};
 pub use tar_pack::calculate_tar_size;
 pub use url_redact::redact_storage_url;
 

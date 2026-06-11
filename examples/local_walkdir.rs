@@ -6,7 +6,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let storage = create_storage("c:\\jay\\source", None).await?;
+    let storage = create_storage("c:\\jay\\source", None, false).await?;
 
     let start = Instant::now();
     let mut total_entries = 0;

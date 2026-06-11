@@ -44,7 +44,6 @@ def main() -> int:
     excluded = {
         "new",
         "create_storage",
-        "create_storage_for_dest",
         "detect_storage_type",
         "from",
         "from_url",
