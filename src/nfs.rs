@@ -1255,15 +1255,50 @@ impl NFSStorage {
                         let current_fh_clone = current_fh.clone();
                         match mount_clone.lookup(current_fh_clone, dirname).await {
                             Ok(obj) => {
-                                // 找到目录，继续使用现有句柄
-                                current_fh = obj.fh.clone();
-                                // 将查询结果保存到缓存中
-                                trace!(
-                                    "Inserting into global cache: key={:?}, value_len={}",
-                                    cache_key,
-                                    obj.fh.len()
-                                );
-                                GLOBAL_CACHE.insert(cache_key, obj.fh.clone());
+                                // 目标端存在同名对象；无属性时按目录处理（保持原有行为）
+                                let is_dir = obj
+                                    .attr
+                                    .as_ref()
+                                    .map(|attr| attr.type_ == FType3::NF3DIR as u32)
+                                    .unwrap_or(true);
+                                if is_dir {
+                                    // 找到目录，继续使用现有句柄
+                                    current_fh = obj.fh.clone();
+                                    // 将查询结果保存到缓存中
+                                    trace!(
+                                        "Inserting into global cache: key={:?}, value_len={}",
+                                        cache_key,
+                                        obj.fh.len()
+                                    );
+                                    GLOBAL_CACHE.insert(cache_key, obj.fh.clone());
+                                } else {
+                                    // 同名非目录对象（残留文件/符号链接）挡住目录创建：
+                                    // 迁移语义按 rsync 风格处理——删除后重走 create_dir_all。
+                                    // 多个任务可能并发进入此分支，REMOVE 的 NOENT 视为
+                                    // 兄弟任务已先行删除；重建交给重试路径自然收敛。
+                                    warn!(
+                                        "create_dir_all: {:?} exists but is not a directory, replacing with directory",
+                                        current_path
+                                    );
+                                    if retries >= MAX_STALE_RETRIES {
+                                        return Err(StorageError::NfsError(format!(
+                                            "{dirname} exists but is not a directory (replace retries exhausted)"
+                                        )));
+                                    }
+                                    if let Err(e) =
+                                        self.mount.remove(current_fh.clone(), dirname).await
+                                    {
+                                        if !e.is_not_found() {
+                                            return Err(StorageError::NfsError(format!(
+                                                "Failed to remove non-directory {dirname} blocking directory creation: {e}"
+                                            )));
+                                        }
+                                    }
+                                    return Box::pin(
+                                        self.create_dir_all_inner(relative_path, retries + 1),
+                                    )
+                                    .await;
+                                }
                             }
                             Err(e) => {
                                 let err_msg = format!("Failed to lookup directory {dirname}: {e}");
