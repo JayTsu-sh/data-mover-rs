@@ -1,20 +1,24 @@
+use std::env;
 use std::time::{Duration, Instant};
 
+use data_mover::error::StorageError;
 use data_mover::storage_enum::create_storage;
 use data_mover::{EntryEnum, Result, StorageEntryMessage};
 use indicatif::{ProgressBar, ProgressStyle};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let storage = create_storage(
-        "s3://H80NKRVS5DYOVE43U2HS:FBU8xNSKujskgO2bF6ctnd7dF2IeDodmoy3q6hNk@mbucket-src.10.128.137.245:8184",
-        None,
-        false,
-    )
-    .await?;
+    // URL 从命令行传入（e2e-s3 skill 即此调用方式），不在源码里硬编码凭证
+    let url = env::args().nth(1).ok_or_else(|| {
+        StorageError::ConfigError(
+            "usage: s3_walkdir <s3://AK:SK@bucket.host:port/prefix>".to_string(),
+        )
+    })?;
+    let storage = create_storage(&url, None, false).await?;
 
     let start = Instant::now();
     let mut total_entries = 0;
+    let mut first_error: Option<String> = None;
 
     // 创建进度条
     let pb = ProgressBar::new_spinner();
@@ -44,6 +48,9 @@ async fn main() -> Result<()> {
             },
             StorageEntryMessage::Error { path, reason, .. } => {
                 println!("Error for {}: {}", path.display(), reason);
+                if first_error.is_none() {
+                    first_error = Some(format!("{}: {}", path.display(), reason));
+                }
             }
             _ => {}
         }
@@ -55,6 +62,13 @@ async fn main() -> Result<()> {
     let duration = start.elapsed();
     println!("Total entries: {}", total_entries);
     println!("Scan time: {:?}", duration);
+
+    // 遍历期间出现过错误则以非零退出，便于 e2e skill 断言
+    if let Some(reason) = first_error {
+        return Err(StorageError::OperationError(format!(
+            "walkdir reported errors, first: {reason}"
+        )));
+    }
 
     Ok(())
 }
