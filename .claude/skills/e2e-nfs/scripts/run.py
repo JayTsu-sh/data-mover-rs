@@ -21,7 +21,10 @@ from url_builder import nfs_url  # noqa: E402
 def run(label: str, cmd: list[str], expected: int = 0, capture: bool = False) -> tuple[int, str]:
     print(f"\n[skill e2e-nfs] $ {' '.join(cmd)}")
     if capture:
-        result = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True)
+        result = subprocess.run(
+            cmd, cwd=PROJECT_ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
         print(result.stdout)
         if result.stderr:
             print("[stderr]", result.stderr)

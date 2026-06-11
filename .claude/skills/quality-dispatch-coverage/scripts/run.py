@@ -27,7 +27,7 @@ def load_baseline() -> dict[str, set[str]]:
     bp = SKILL_DIR / "baseline_holes.json"
     if not bp.exists():
         return {}
-    data = json.loads(bp.read_text())
+    data = json.loads(bp.read_text(encoding="utf-8"))
     return {fn: set(backends) for fn, backends in data.get("holes", {}).items()}
 
 

@@ -35,7 +35,7 @@ def load_baseline() -> int:
     if not BASELINE_FILE.exists():
         return 0
     try:
-        return int(BASELINE_FILE.read_text().strip())
+        return int(BASELINE_FILE.read_text(encoding="utf-8").strip())
     except ValueError:
         return 0
 
@@ -43,8 +43,12 @@ def load_baseline() -> int:
 def main() -> int:
     cmd = ["cargo", "clippy", "--all-targets"]
     print(f"[skill quality-clippy] $ {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True)
-    output = result.stdout + result.stderr
+    # encoding 显式 UTF-8：Windows 默认 GBK 会在 cargo 输出含非 GBK 字节时崩
+    result = subprocess.run(
+        cmd, cwd=PROJECT_ROOT, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
+    output = (result.stdout or "") + (result.stderr or "")
     sys.stdout.write(output)
 
     count = len(WARNING_RE.findall(output))

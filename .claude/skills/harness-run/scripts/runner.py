@@ -43,7 +43,7 @@ def main() -> int:
     args = ap.parse_args()
 
     matrix_path = SCRIPT_DIR / "matrix.yaml"
-    matrix = yaml.safe_load(matrix_path.read_text())
+    matrix = yaml.safe_load(matrix_path.read_text(encoding="utf-8"))
 
     skills_to_run: list[str] = []
     if args.quick:

@@ -27,7 +27,10 @@ def main() -> int:
 
     cmd = ["cargo", "llvm-cov", "--workspace", "--json"]
     print(f"[skill quality-coverage] $ {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True)
+    result = subprocess.run(
+        cmd, cwd=PROJECT_ROOT, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
     if result.returncode != 0:
         print(result.stdout)
         print("[stderr]", result.stderr, file=sys.stderr)

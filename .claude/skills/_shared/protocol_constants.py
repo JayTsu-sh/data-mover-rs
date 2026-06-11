@@ -6,7 +6,14 @@ This module only holds protocol-level defaults.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+# Windows 控制台默认 GBK：skill 脚本输出含 ✓/◇ 等字符会 UnicodeEncodeError。
+# 所有 skill 脚本都 import 本模块，在这里统一把 stdout/stderr 切到 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 # ── CIFS / SMB ────────────────────────────────────────────────────────

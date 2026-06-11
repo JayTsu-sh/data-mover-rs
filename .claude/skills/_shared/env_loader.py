@@ -24,7 +24,7 @@ def load_env(skill_dir: Path) -> dict[str, str]:
     if not source.exists():
         return env
 
-    for raw in source.read_text().splitlines():
+    for raw in source.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
