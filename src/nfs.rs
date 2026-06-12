@@ -1,5 +1,7 @@
 // 标准库
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -8,6 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
+use futures::stream::{FuturesOrdered, FuturesUnordered};
 use moka::sync::Cache;
 // nfs_rs 错误类型，用于直接匹配 error code
 use nfs_rs::NfsError;
@@ -366,6 +369,22 @@ impl NFSFileHandle {
 }
 
 const DEFAULT_BLOCK_SIZE: u64 = MB; // 1MB
+
+/// 单文件读取的同时在飞请求数（inflight read pipeline 深度）。
+///
+/// NFS READ 多命中 server 端 cache，单请求延迟低且稳定。以实测链路
+/// （RTT 0.33ms + server ~1ms ≈ 1.3ms，64KB chunk）计：串行 ≈ 49MB/s，
+/// 4 深度理论 ≈ 196MB/s，已超过 1GbE 链路上限。与 cifs/s3 的深度对齐。
+/// v3 无并发上限；v4.1 受 session slot（64）约束，远未触及。
+const DEFAULT_READ_INFLIGHT: usize = 4;
+
+/// 单文件写入的同时在飞请求数（inflight write pipeline 深度）。
+///
+/// WRITE 以 FILE_SYNC 稳定级发送，server 落盘延迟比 READ 高且抖动大
+/// （WAFL/ext4 journal flush），取读侧 2 倍做余量：8×64KB = 512KB 在飞，
+/// 可吸收 ~4.6ms 的 server 端抖动。8 ≪ v4.1 的 64 slots，SlotTable 满时
+/// nfs-rs 内部排队等待而非报错，退化平滑。
+const DEFAULT_WRITE_INFLIGHT: usize = 8;
 
 /// 从 `relative_path` 中剥离 root 前缀，返回相对于 root 的路径。
 /// 使用 `Path::strip_prefix` 按组件比较，跨平台兼容，零字符串分配。
@@ -2643,75 +2662,163 @@ impl NFSStorage {
             }
         };
 
-        // 简单循环持续读取文件直到文件结束
-        let mut offset = 0;
-        let mut bytes_read: u64 = 0;
-
         let mut hasher = create_hash_calculator(enable_integrity_check);
 
+        // ── inflight read pipeline ──────────────────────────────────────────────
+        // 模型：维持最多 DEFAULT_READ_INFLIGHT 个 READ 同时在飞（RPC 层 xid 多路
+        // 复用；v4.1 额外受 session slot 约束，slot 满时 nfs-rs 内部排队）。
+        // 用 FuturesOrdered 保证结果按 issue（即 offset 升序）顺序弹出：hasher
+        // 必须按 offset 顺序 update，否则校验和错；下游 channel 发送同时保序。
+        //
+        // future 全部持有 owned 数据（Arc mount + Bytes fh，clone 仅动 refcount），
+        // 不借用 self / handler，因此主循环可对 handler 做 stale 刷新（&mut）
+        // 而无借用冲突。
+        //
+        // 错误处理：first_error + break + drop(inflight) 取消未完成 future，
+        // 保证 close 路径必然执行后再返回 Err（与 cifs 读侧语义一致；旧实现
+        // 读错误静默 break 返回 Ok，会掩盖目标文件不完整，已修正为上抛）。
+        type ReadFut = Pin<Box<dyn Future<Output = (u64, u32, nfs_rs::Result<Bytes>)> + Send>>;
+        let mut inflight: FuturesOrdered<ReadFut> = FuturesOrdered::new();
+        let mut issue_offset: u64 = 0;
+        let mut bytes_read: u64 = 0;
+        let mut first_error: Option<StorageError> = None;
+        // stale 句柄每文件最多刷新一次（保留旧 read() 的 max_retries=1 语义）
+        let mut fh_refreshed = false;
+
         loop {
-            // 如果提供了 QoS 管理器，则进行带宽 + IOPS 限流
-            if let Some(ref qos) = qos {
-                qos.acquire(chunk_size).await;
-                trace!(
-                    "QoS acquired {} bytes for file {:?}",
-                    chunk_size, relative_path
-                );
+            // 填满 inflight，直到达到深度上限或所有字节已派发。
+            while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < size {
+                // QoS 限流（带宽 + IOPS）作用在派发速率上
+                if let Some(ref qos) = qos {
+                    qos.acquire(chunk_size).await;
+                }
+                let want_u64 = std::cmp::min(chunk_size, size - issue_offset);
+                // chunk_size ≤ effective block_size ≤ 1MB，cast 无截断
+                #[allow(clippy::cast_possible_truncation)]
+                let want = want_u64 as u32;
+                let offset = issue_offset;
+                let mount = self.mount.clone();
+                let fh = handler.inner.fh.clone();
+                let fut: ReadFut = Box::pin(async move {
+                    let r = mount.read(fh, offset, want).await;
+                    (offset, want, r)
+                });
+                inflight.push_back(fut);
+                issue_offset += want_u64;
             }
 
-            let data = match self.read(&mut handler, offset, chunk_size as usize).await {
-                Ok(data) => data,
+            // 全部派发完且 inflight 已空 → 正常结束。
+            let Some((offset, want, result)) = inflight.next().await else {
+                trace!("Completed reading file {:?}", relative_path);
+                break;
+            };
+
+            let mut data = match result {
+                Ok(d) => d,
+                // stale 句柄：刷新 fh（每文件一次）后串行重读该 chunk 一次。
+                // 旧 fh 派发的其余 inflight 大概率也返回 stale，各自走到这里
+                // 串行重读；新派发的 chunk 自动使用刷新后的 fh。
+                Err(ref e) if is_stale_handle(e) => {
+                    if !fh_refreshed {
+                        debug!(
+                            "[read_data] stale handle, refreshing fh for {:?}",
+                            handler.path
+                        );
+                        match self.lookup_fh(&handler.path).await {
+                            Ok(obj) => {
+                                handler.inner = Arc::new(obj);
+                                fh_refreshed = true;
+                            }
+                            Err(e2) => {
+                                first_error = Some(e2);
+                                break;
+                            }
+                        }
+                    }
+                    match self
+                        .mount
+                        .read(handler.inner.fh.clone(), offset, want)
+                        .await
+                    {
+                        Ok(d) => d,
+                        Err(e2) => {
+                            first_error = Some(StorageError::NfsError(format!(
+                                "Failed to read file {:?} at offset {offset} after refresh: {e2}",
+                                relative_path
+                            )));
+                            break;
+                        }
+                    }
+                }
                 Err(e) => {
-                    error!(
-                        "Failed to read data chunk (offset: {}, chunk size: {}): {:?}",
-                        offset, chunk_size, e
-                    );
+                    first_error = Some(StorageError::NfsError(format!(
+                        "Failed to read file {relative_path:?} at offset {offset}: {e}"
+                    )));
                     break;
                 }
             };
 
-            let data_length = data.len() as u64;
-
-            if data.is_empty() {
-                trace!("Reached end of file {:?}", relative_path);
-                break;
-            }
-
-            // 如果启用了校验和检查，更新源文件哈希值
-            if let Some(ref mut hasher) = hasher {
-                hasher.update(&data);
-                trace!(
-                    "Updated hash calculation for file {:?}, offset: {}",
-                    relative_path, offset
-                );
-            }
-
-            // 直接发送DataChunk，不使用Box
-            if let Err(e) = tx.send(DataChunk { offset, data }).await {
-                error!("Failed to send data chunk: {:?}", e);
-                // 通道已关闭，退出循环
-                break;
-            }
-
-            bytes_read += data_length;
-            trace!(
-                "Read {} bytes from file {:?}, progress: {}/{} bytes",
-                data_length,
-                relative_path,
-                bytes_read.min(size),
-                size
-            );
-
-            // 更新偏移量
-            offset += data_length;
-            // 如果已经读取了整个文件，退出循环
-            if offset >= size {
-                trace!("Completed reading file {:?}", relative_path);
+            // 处理本 chunk（含 partial 短读的串行补读）：字节流必须连续推进，
+            // 否则已预派发的后续 chunk 的 offset 网格会错位。
+            let mut chunk_off = offset;
+            let chunk_end = offset + u64::from(want);
+            let chunk_done = loop {
+                if data.is_empty() {
+                    // offset < size 处读到 0 字节：文件在读取中被外部截断。
+                    // 保留旧实现的快照语义：视为提前 EOF，不算错误。
+                    warn!(
+                        "[read_data] premature EOF at offset {chunk_off} (expected size {size}) for {:?}, file truncated externally?",
+                        relative_path
+                    );
+                    break false;
+                }
+                let len = data.len() as u64;
+                if let Some(ref mut h) = hasher {
+                    h.update(&data);
+                }
+                if tx
+                    .send(DataChunk {
+                        offset: chunk_off,
+                        data,
+                    })
+                    .await
+                    .is_err()
+                {
+                    // 下游 receiver 关闭：协作取消信号（与旧实现一致），不算读错误。
+                    trace!("Data channel closed for file {:?}", relative_path);
+                    break false;
+                }
+                bytes_read += len;
+                chunk_off += len;
+                if chunk_off >= chunk_end {
+                    break true;
+                }
+                // partial 短读（罕见，server 资源压力）：串行补读剩余部分。
+                #[allow(clippy::cast_possible_truncation)]
+                let remaining = (chunk_end - chunk_off) as u32;
+                match self
+                    .mount
+                    .read(handler.inner.fh.clone(), chunk_off, remaining)
+                    .await
+                {
+                    Ok(d) => data = d,
+                    Err(e) => {
+                        first_error = Some(StorageError::NfsError(format!(
+                            "Failed to read file {relative_path:?} at offset {chunk_off}: {e}"
+                        )));
+                        break false;
+                    }
+                }
+            };
+            if !chunk_done {
                 break;
             }
         }
 
-        // 关闭文件（v3 no-op，v4.1 释放 stateid）
+        // drop 取消未完成的 inflight（nfs-rs 收到迟到响应后丢弃）。
+        drop(inflight);
+
+        // 关闭文件（v3 no-op，v4.1 释放 stateid），无论成败
         let _ = self.close(&handler).await;
 
         trace!(
@@ -2719,6 +2826,9 @@ impl NFSStorage {
             relative_path, bytes_read
         );
 
+        if let Some(e) = first_error {
+            return Err(e);
+        }
         Ok(hasher)
     }
 
@@ -2738,7 +2848,7 @@ impl NFSStorage {
         // 确保相对路径不包含 root 前缀
         let path_to_use = self.calculate_relative_path(relative_path);
 
-        let mut dest_file = self.create_file(&path_to_use, uid, gid, mode).await?;
+        let dest_file = self.create_file(&path_to_use, uid, gid, mode).await?;
 
         trace!("Opened destination file {:?} for writing", relative_path);
 
@@ -2750,32 +2860,119 @@ impl NFSStorage {
             return Err(e);
         }
 
-        // 用 async block 包裹写入循环，确保无论成功或失败都能执行 close
-        let write_result = async {
-            while let Some(chunk) = reader.recv().await {
-                let offset = chunk.offset;
-                let data = chunk.data;
+        // 上游 chunk 可能大于 NFS 协商的 wsize（跨协议拷贝，如 CIFS 读侧 8MB
+        // chunk），派发层按 chunk_size 零拷贝切分（slice 仅动 refcount），
+        // 使大 chunk 同样吃到 inflight 并发。同协议时 data.len() ≤ chunk_size
+        // 恒成立，切分循环单次通过、零开销。
+        // chunk_size ≤ effective block_size ≤ 1MB，cast 无截断。
+        #[allow(clippy::cast_possible_truncation)]
+        let chunk_size = self.config.block_size.max(1) as usize;
 
-                let length = data.len() as u64;
-                trace!(
-                    "Received chunk of {} bytes at offset {} for file {:?}",
-                    length, offset, relative_path
-                );
-
-                self.write(&mut dest_file, offset, data).await?;
-                if let Some(ref c) = bytes_counter {
-                    c.fetch_add(length, Ordering::Relaxed);
+        // ── inflight write pipeline ─────────────────────────────────────────────
+        // 模型：维持最多 DEFAULT_WRITE_INFLIGHT 个 WRITE 同时在飞。用
+        // FuturesUnordered（不保序）—— server 各 offset 独立处理，完成顺序与
+        // issue 顺序无关；bytes_counter 累加只看总量。WRITE 以 FILE_SYNC 稳定级
+        // 发送（server 降级时 nfs-rs 内部补 COMMIT），并发 WRITE 间无顺序约束
+        // （RFC 5661 允许同一 stateid 并发 WRITE；v3 无状态更宽松）。
+        //
+        // 错误处理：drain 模式 —— 任意 inflight 报错时记录首个 error，继续
+        // drain 完所有 inflight 后再 close（v4.1 stateid 仍被飞行 WRITE 使用，
+        // 必须先 drain 再 close），保证 close 路径正确执行。
+        //
+        // bytes_counter 的"err 之后不累加"规则：first_error 已置位时本次
+        // write_data 必然返回 Err，上游通常重试整文件；继续 fetch_add 会让重试
+        // 的成功路径与本次 drain 期间的"侥幸成功" chunk 双计数。
+        type WriteFut = Pin<Box<dyn Future<Output = (u64, u64, nfs_rs::Result<u32>)> + Send>>;
+        let mut inflight: FuturesUnordered<WriteFut> = FuturesUnordered::new();
+        let mut first_error: Option<StorageError> = None;
+        let count_or_record_err =
+            |(offset, len, result): (u64, u64, nfs_rs::Result<u32>),
+             first_error: &mut Option<StorageError>| {
+                match result {
+                    Ok(written) if first_error.is_none() => {
+                        if u64::from(written) < len {
+                            // FILE_SYNC 写正常必返回全量；真发生短写时明确报错，
+                            // 优于按 written 推进导致的静默数据空洞
+                            *first_error = Some(StorageError::NfsError(format!(
+                                "Short write at offset {offset}: {written} of {len} bytes"
+                            )));
+                        } else if let Some(ref c) = bytes_counter {
+                            c.fetch_add(len, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(_) => {} // 错误路径上的成功 chunk 不计入（见上 doc）
+                    Err(e) if first_error.is_none() => {
+                        *first_error = Some(StorageError::NfsError(format!(
+                            "Failed to write file at offset {offset}: {e}"
+                        )));
+                    }
+                    Err(_) => {} // 已有 first_error，丢弃后续错误
                 }
+            };
+
+        'recv: while let Some(chunk) = reader.recv().await {
+            let DataChunk { offset, data } = chunk;
+            trace!(
+                "Received chunk of {} bytes at offset {} for file {:?}",
+                data.len(),
+                offset,
+                relative_path
+            );
+
+            // 出错后丢弃残留 buffered chunk（reader 已被 close，上游不再 push 新的）。
+            if first_error.is_some() {
+                continue;
             }
-            Ok(())
+
+            // 零拷贝切分派发
+            let total = data.len();
+            let mut idx: usize = 0;
+            while idx < total {
+                // 派发前维持 inflight 上限：满则先收割一个完成的释放槽位。
+                if inflight.len() >= DEFAULT_WRITE_INFLIGHT
+                    && let Some(done) = inflight.next().await
+                {
+                    let was_no_error = first_error.is_none();
+                    count_or_record_err(done, &mut first_error);
+                    if was_no_error && first_error.is_some() {
+                        // 首次出错时主动 close reader，让上游立即停止派发新
+                        // chunk（后续 tx.send().await 返回 SendError），避免
+                        // 继续 read source 浪费 IO；已缓冲 chunk 仍会 drain 完。
+                        reader.close();
+                        // 放弃本 chunk 剩余 sub-chunk
+                        continue 'recv;
+                    }
+                }
+
+                let end = std::cmp::min(idx + chunk_size, total);
+                let sub = data.slice(idx..end);
+                let sub_offset = offset + idx as u64;
+                let len = (end - idx) as u64;
+                let mount = self.mount.clone();
+                let fh = dest_file.inner.fh.clone();
+                let fut: WriteFut = Box::pin(async move {
+                    let r = mount.write(fh, sub_offset, sub).await;
+                    (sub_offset, len, r)
+                });
+                inflight.push(fut);
+                idx = end;
+            }
         }
-        .await;
+
+        // Drain 剩余 inflight，与 fill 路径共用 count_or_record_err。
+        while let Some(done) = inflight.next().await {
+            count_or_record_err(done, &mut first_error);
+        }
 
         // 关闭文件（v3 no-op，v4.1 释放 stateid），无论写入是否成功
         let _ = self.close(&dest_file).await;
 
         trace!("Finished write_data_task for file {:?}", relative_path);
-        write_result
+
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        Ok(())
     }
 
     // ============================================================
