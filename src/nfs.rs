@@ -971,14 +971,14 @@ impl NFSStorage {
         gid: Option<u32>,
         mode: Option<u32>,
     ) -> Result<()> {
-        let len = data.len() as u32;
         let mut handle = self.create_file(path, uid, gid, mode).await?;
         let result = async {
             // Truncate file to 0 before writing to handle the case where new content is shorter than old content
             // This is critical for incremental sync where Changed files may have different sizes
             self.truncate_file(&handle).await?;
+            // FILE_SYNC 写返回即落稳定存储（nfs-rs 内部已兜底 COMMIT），无需再 COMMIT
             self.write(&mut handle, 0, data).await?;
-            self.commit(&handle, 0, len).await
+            Ok(())
         }
         .await;
         let _ = self.close(&handle).await;
@@ -1672,15 +1672,6 @@ impl NFSStorage {
 
         // 直接返回符号链接的原始目标路径，不进行路径验证
         Ok(PathBuf::from(target))
-    }
-
-    pub(crate) async fn commit(&self, file: &NFSFileHandle, offset: u64, count: u32) -> Result<()> {
-        // NFS通常没有单独的sync操作，直接使用FileHandle中存储的storage实例
-        self.mount
-            .commit(file.inner.fh.clone(), offset, count)
-            .await
-            .map_err(|e| StorageError::NfsError(format!("Failed to commit file: {e}")))?;
-        Ok(())
     }
 
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
@@ -2547,23 +2538,15 @@ impl NFSStorage {
                     current_chunk_size, file.path, current_offset
                 );
 
-                // 写入数据到NFS - 使用异步调用
+                // 写入数据到NFS - 使用异步调用。
+                // nfs-rs 的 write（v3/v4.1）以 FILE_SYNC 稳定级发送，server 降级时
+                // 其内部自动补 COMMIT，返回 Ok 即数据已落稳定存储，无需逐块 COMMIT
+                // （否则每块多付一次串行 RTT）。
                 let written = self
                     .mount
                     .write(file.inner.fh.clone(), current_offset, chunk_data)
                     .await
                     .map_err(|e| StorageError::NfsError(format!("Failed to write file: {e}")))?;
-
-                trace!(
-                    "[write] Committing chunk of {} bytes to file {:?} at offset {}",
-                    current_chunk_size, file.path, written
-                );
-
-                // Commit数据 - 使用异步调用
-                self.mount
-                    .commit(file.inner.fh.clone(), current_offset, written)
-                    .await
-                    .map_err(|e| StorageError::NfsError(format!("Failed to commit file: {e}")))?;
 
                 trace!(
                     "[write] Wrote split chunk of {} bytes to file {:?} at offset {}",
@@ -2582,17 +2565,13 @@ impl NFSStorage {
                 "[write] Writing {} bytes to file {:?} at offset {}",
                 length, file.path, offset
             );
+            // FILE_SYNC 写返回即落稳定存储（nfs-rs 内部已兜底 COMMIT），无需再 COMMIT
             let written = self
                 .mount
                 .write(file.inner.fh.clone(), offset, data)
                 .await
                 .map_err(|e| StorageError::NfsError(format!("Failed to write file: {e}")))?;
 
-            // Commit数据 - 使用异步调用
-            self.mount
-                .commit(file.inner.fh.clone(), offset, written as u32)
-                .await
-                .map_err(|e| StorageError::NfsError(format!("Failed to commit file: {e}")))?;
             trace!(
                 "[write] Wrote {} bytes to file {:?} at offset {}",
                 written, file.path, offset
