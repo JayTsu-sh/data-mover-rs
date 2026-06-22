@@ -2975,6 +2975,199 @@ impl NFSStorage {
         Ok(())
     }
 
+    // ========================================================
+    // 字节级断点续传变体（仅多块大文件）
+    // ========================================================
+
+    /// 只读取给定缺失区间的数据，按 `chunk.offset` 发送 `DataChunk`（inflight pipeline）。
+    ///
+    /// 与 `read_data` 区别：不读整文件，只读 `intervals` 覆盖部分；续传无需逐块 hash
+    /// （完整性走收尾的端到端校验），故返回 `()`。
+    pub(crate) async fn read_data_intervals(
+        &self,
+        tx: mpsc::Sender<DataChunk>,
+        relative_path: &Path,
+        intervals: &[(u64, u64)],
+        qos: Option<QosManager>,
+    ) -> Result<()> {
+        let path_to_use = self.calculate_relative_path(relative_path);
+        let total: u64 = intervals.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+        if total == 0 {
+            return Ok(());
+        }
+        let chunk_size = self.calculate_chunk_size(total);
+
+        let handler = self
+            .open(&path_to_use, OPEN_READ)
+            .await
+            .map_err(|e| StorageError::NfsError(format!("Failed to open source file: {e:?}")))?;
+
+        let result = async {
+            for &(start, end) in intervals {
+                let mut issue_offset = start;
+                type ReadFut =
+                    Pin<Box<dyn Future<Output = (u64, u32, nfs_rs::Result<Bytes>)> + Send>>;
+                let mut inflight: FuturesOrdered<ReadFut> = FuturesOrdered::new();
+                loop {
+                    while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < end {
+                        if let Some(ref qos) = qos {
+                            qos.acquire(chunk_size).await;
+                        }
+                        let want_u64 = std::cmp::min(chunk_size, end - issue_offset);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let want = want_u64 as u32;
+                        let offset = issue_offset;
+                        let mount = self.mount.clone();
+                        let fh = handler.inner.fh.clone();
+                        inflight.push_back(Box::pin(async move {
+                            let r = mount.read(fh, offset, want).await;
+                            (offset, want, r)
+                        }));
+                        issue_offset += want_u64;
+                    }
+                    let Some((offset, _want, result)) = inflight.next().await else {
+                        break;
+                    };
+                    let data = result.map_err(|e| {
+                        StorageError::NfsError(format!("Failed to read at offset {offset}: {e}"))
+                    })?;
+                    if data.is_empty() {
+                        break;
+                    }
+                    if tx.send(DataChunk { offset, data }).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        let _ = self.close(&handler).await;
+        result
+    }
+
+    /// 续写到 `.part` 文件：打开已存在文件**不截断**，按 `chunk.offset` 写入（inflight pipeline）。
+    ///
+    /// 正确性：NFS WRITE 以 FILE_SYNC 稳定级发送，返回即落盘，故每个 WRITE 成功完成后
+    /// 立即对该 chunk 触发 `on_committed`，进度记录不会超前于真实数据。
+    pub(crate) async fn write_data_resumable(
+        &self,
+        rx: mpsc::Receiver<DataChunk>,
+        part_path: &Path,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: Option<u32>,
+        bytes_counter: Option<Arc<AtomicU64>>,
+        on_committed: crate::CommitCallback,
+    ) -> Result<()> {
+        let mut reader = rx;
+        let path_to_use = self.calculate_relative_path(part_path);
+        // create_file 不截断：保留 .part 已写字节（续传基础）
+        let dest_file = self.create_file(&path_to_use, uid, gid, mode).await?;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let chunk_size = self.config.block_size.max(1) as usize;
+
+        type WriteFut = Pin<Box<dyn Future<Output = (u64, u64, nfs_rs::Result<u32>)> + Send>>;
+        let mut inflight: FuturesUnordered<WriteFut> = FuturesUnordered::new();
+        let mut first_error: Option<StorageError> = None;
+        let count = |(offset, len, result): (u64, u64, nfs_rs::Result<u32>),
+                     first_error: &mut Option<StorageError>| {
+            match result {
+                Ok(written) if first_error.is_none() => {
+                    if u64::from(written) < len {
+                        *first_error = Some(StorageError::NfsError(format!(
+                            "Short write at offset {offset}: {written} of {len} bytes"
+                        )));
+                    } else {
+                        if let Some(ref c) = bytes_counter {
+                            c.fetch_add(len, Ordering::Relaxed);
+                        }
+                        // FILE_SYNC 写返回即落盘 → 安全上报进度
+                        on_committed(offset, len);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) if first_error.is_none() => {
+                    *first_error = Some(StorageError::NfsError(format!(
+                        "Failed to write file at offset {offset}: {e}"
+                    )));
+                }
+                Err(_) => {}
+            }
+        };
+
+        'recv: while let Some(chunk) = reader.recv().await {
+            let DataChunk { offset, data } = chunk;
+            if first_error.is_some() {
+                continue;
+            }
+            let total = data.len();
+            let mut idx: usize = 0;
+            while idx < total {
+                if inflight.len() >= DEFAULT_WRITE_INFLIGHT
+                    && let Some(done) = inflight.next().await
+                {
+                    let was_ok = first_error.is_none();
+                    count(done, &mut first_error);
+                    if was_ok && first_error.is_some() {
+                        reader.close();
+                        continue 'recv;
+                    }
+                }
+                let end = std::cmp::min(idx + chunk_size, total);
+                let sub = data.slice(idx..end);
+                let sub_offset = offset + idx as u64;
+                let len = (end - idx) as u64;
+                let mount = self.mount.clone();
+                let fh = dest_file.inner.fh.clone();
+                inflight.push(Box::pin(async move {
+                    let r = mount.write(fh, sub_offset, sub).await;
+                    (sub_offset, len, r)
+                }));
+                idx = end;
+            }
+        }
+
+        while let Some(done) = inflight.next().await {
+            count(done, &mut first_error);
+        }
+
+        let _ = self.close(&dest_file).await;
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// 将文件长度规整为 `len`（截掉续传遗留尾部）：setattr 设 size。
+    pub(crate) async fn set_file_len(&self, relative_path: &Path, len: u64) -> Result<()> {
+        let path_to_use = self.calculate_relative_path(relative_path);
+        let handle = self.open(&path_to_use, OPEN_READ).await?;
+        let result = self
+            .mount
+            .setattr(
+                handle.inner.fh.clone(),
+                None,
+                None,
+                None,
+                None,
+                Some(len),
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| {
+                StorageError::NfsError(format!(
+                    "Failed to set length for {}: {e:?}",
+                    relative_path.display()
+                ))
+            });
+        let _ = self.close(&handle).await;
+        result
+    }
+
     // ============================================================
     // walkdir_2: 目录分页 + NDX 编号 + 并行预读
     // ============================================================

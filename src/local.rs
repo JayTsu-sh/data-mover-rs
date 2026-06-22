@@ -988,6 +988,96 @@ impl LocalStorage {
         trace!("Finished write_data_task for file {:?}", relative_path);
         Ok(())
     }
+
+    // ========================================================
+    // 字节级断点续传变体（仅多块大文件）
+    // ========================================================
+
+    /// 只读取给定缺失区间的数据，按 `chunk.offset` 发送 `DataChunk`。
+    ///
+    /// 与 `read_data` 的区别：不从 0 顺序读整文件，只读 `intervals` 覆盖的部分，
+    /// 续传时避免重读已完成的数据。
+    pub(crate) async fn read_data_intervals(
+        &self,
+        tx: Sender<DataChunk>,
+        relative_path: &Path,
+        intervals: &[(u64, u64)],
+        qos: Option<QosManager>,
+    ) -> Result<()> {
+        let chunk_size = self.config.block_size.max(1);
+        let mut source_file = self.open(relative_path).await?;
+        for &(start, end) in intervals {
+            let mut offset = start;
+            while offset < end {
+                let want = chunk_size.min(end - offset);
+                if let Some(ref qos) = qos {
+                    qos.acquire(want).await;
+                }
+                let data = self.read(&mut source_file, offset, want).await?;
+                if data.is_empty() {
+                    break;
+                }
+                let len = data.len() as u64;
+                if tx.send(DataChunk { offset, data }).await.is_err() {
+                    return Ok(());
+                }
+                offset += len;
+            }
+        }
+        Ok(())
+    }
+
+    /// 续写到 `.part` 文件：打开已存在文件**不截断**，按 `chunk.offset` 随机写。
+    ///
+    /// 正确性：每 `SYNC_BARRIER` 个 chunk 做一次 `sync_all` 落盘屏障，
+    /// **屏障之后才**对这批 chunk 触发 `on_committed` —— 保证回调上报的区间
+    /// 已确认落盘，进度记录永不超前于真实数据（崩溃时最坏丢一批、幂等重传）。
+    pub(crate) async fn write_data_resumable(
+        &self,
+        rx: tokio::sync::mpsc::Receiver<DataChunk>,
+        part_path: &Path,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: Option<u32>,
+        bytes_counter: Option<Arc<AtomicU64>>,
+        on_committed: crate::CommitCallback,
+    ) -> Result<()> {
+        const SYNC_BARRIER: usize = 16;
+        let mut reader = rx;
+        // create_file 不带 truncate：保留 .part 中已写字节（续传基础）
+        let mut dest_file = self.create_file(part_path, uid, gid, mode).await?;
+        let mut pending: Vec<(u64, u64)> = Vec::with_capacity(SYNC_BARRIER);
+
+        while let Some(chunk) = reader.recv().await {
+            let DataChunk { offset, data } = chunk;
+            let written = self.write(&mut dest_file, offset, data).await? as u64;
+            if let Some(ref c) = bytes_counter {
+                c.fetch_add(written, Ordering::Relaxed);
+            }
+            pending.push((offset, written));
+            if pending.len() >= SYNC_BARRIER {
+                dest_file.commit().await?;
+                for (o, l) in pending.drain(..) {
+                    on_committed(o, l);
+                }
+            }
+        }
+
+        // 收尾屏障：落盘后触发剩余回调
+        dest_file.commit().await?;
+        for (o, l) in pending.drain(..) {
+            on_committed(o, l);
+        }
+        Ok(())
+    }
+
+    /// 将文件长度规整为 `len`（截掉续传遗留的尾部多余字节），并落盘。
+    pub(crate) async fn set_file_len(&self, relative_path: &Path, len: u64) -> Result<()> {
+        let full_path = self.get_full_path(relative_path);
+        let file = OpenOptions::new().write(true).open(&full_path).await?;
+        file.set_len(len).await.map_err(StorageError::IoError)?;
+        file.sync_all().await.map_err(StorageError::IoError)
+    }
 }
 
 // ============================================================

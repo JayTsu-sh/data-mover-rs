@@ -92,6 +92,20 @@ pub struct DataChunk {
     pub data: Bytes,
 }
 
+/// 字节级断点续传的进度回调：参数 `(offset, len)` 表示 `[offset, offset+len)`
+/// 已**确认落盘**。回调内必须轻量（不得阻塞写管道热路径）。
+pub type CommitCallback = std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+/// 字节级断点续传上下文（仅多块大文件传入 `StorageEnum::copy_file_resumable`）。
+pub struct ResumeContext {
+    /// `.part` 临时文件的目标端相对路径（写这里，全部补齐后 rename 成最终文件）
+    pub part_relative_path: std::path::PathBuf,
+    /// 待传输的缺失 offset 区间 `[start, end)`（源端只读这些区间）
+    pub missing_intervals: Vec<(u64, u64)>,
+    /// 每个 chunk 确认落盘后触发的进度回调
+    pub on_committed: CommitCallback,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EntryEnum {
     NAS(NASEntry),

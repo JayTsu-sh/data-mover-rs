@@ -33,7 +33,8 @@ use crate::qos::QosManager;
 use crate::s3::{S3Storage, create_s3_storage};
 use crate::tar_pack::{build_header_for_entry, tar_eof_marker, tar_padding};
 use crate::{
-    DataChunk, DeleteDirIterator, EntryEnum, Result, WalkDirAsyncIterator, WalkDirAsyncIterator2,
+    DataChunk, DeleteDirIterator, EntryEnum, Result, ResumeContext, WalkDirAsyncIterator,
+    WalkDirAsyncIterator2,
 };
 
 /// 存储类型枚举
@@ -385,6 +386,18 @@ impl StorageEnum {
                 "S3 does not support rename".to_string(),
             )),
             StorageEnum::CIFS(s) => s.rename(from, to).await,
+        }
+    }
+
+    /// 将文件长度规整为 `len`（字节级续传收尾：截掉 `.part` 遗留尾部）。
+    pub async fn set_file_len(&self, relative_path: &Path, len: u64) -> Result<()> {
+        match self {
+            StorageEnum::Local(s) => s.set_file_len(relative_path, len).await,
+            StorageEnum::NFS(s) => s.set_file_len(relative_path, len).await,
+            StorageEnum::CIFS(s) => s.set_file_len(relative_path, len).await,
+            StorageEnum::S3(_) => Err(StorageError::OperationError(
+                "S3 does not support byte-level resume".to_string(),
+            )),
         }
     }
 
@@ -860,6 +873,139 @@ impl StorageEnum {
                 ));
             }
         }
+
+        if !is_source_reserved {
+            from.delete_file(entry).await?;
+        }
+
+        Ok(())
+    }
+
+    /// 字节级断点续传复制（仅多块大文件，NAS 后端：Local/NFS/CIFS）。
+    ///
+    /// 与 `copy_file` 的差异：
+    /// - 源端只读 `resume.missing_intervals` 覆盖的缺失区间；
+    /// - 目标端写到 `resume.part_relative_path`（`.part`），不截断已写字节；
+    /// - 每个 chunk 确认落盘后回调 `resume.on_committed`（供上层持久化进度）；
+    /// - 收尾规整 `.part` 长度 → 可选完整性校验 → 原子 rename 成最终文件。
+    ///
+    /// 进程中断时 `.part` 与进度状态保留，重跑时只补未完成区间。
+    pub async fn copy_file_resumable(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        qos: Option<QosManager>,
+        enable_integrity_check: bool,
+        is_source_reserved: bool,
+        bytes_counter: Option<Arc<AtomicU64>>,
+        resume: ResumeContext,
+    ) -> Result<()> {
+        let size = entry.get_size();
+        let ResumeContext {
+            part_relative_path,
+            missing_intervals,
+            on_committed,
+        } = resume;
+
+        // ── 源端：只读缺失区间 ──
+        let (tx, rx) = mpsc::channel::<DataChunk>(COPY_PIPELINE_CAPACITY);
+        let from_c = from.clone();
+        let entry_r = entry.clone();
+        let intervals = missing_intervals;
+        let qos_r = qos;
+        let read_task = tokio::spawn(async move {
+            match (&from_c, &entry_r) {
+                (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
+                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
+                        .await
+                }
+                (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
+                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
+                        .await
+                }
+                (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
+                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
+                        .await
+                }
+                _ => Err(StorageError::OperationError(format!(
+                    "resumable copy unsupported source/entry combination: {entry_r:?}"
+                ))),
+            }
+        });
+
+        // ── 目标端：续写 .part ──
+        let to_c = to.clone();
+        let entry_w = entry.clone();
+        let part = part_relative_path.clone();
+        let bytes_counter_w = bytes_counter;
+        let write_task = tokio::spawn(async move {
+            match (&to_c, &entry_w) {
+                (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
+                    s.write_data_resumable(
+                        rx,
+                        &part,
+                        e.uid,
+                        e.gid,
+                        Some(e.mode),
+                        bytes_counter_w,
+                        on_committed,
+                    )
+                    .await
+                }
+                (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
+                    s.write_data_resumable(
+                        rx,
+                        &part,
+                        e.uid,
+                        e.gid,
+                        Some(e.mode),
+                        bytes_counter_w,
+                        on_committed,
+                    )
+                    .await
+                }
+                (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
+                    s.write_data_resumable(
+                        rx,
+                        &part,
+                        e.uid,
+                        e.gid,
+                        Some(e.mode),
+                        bytes_counter_w,
+                        on_committed,
+                    )
+                    .await
+                }
+                _ => Err(StorageError::OperationError(format!(
+                    "resumable copy unsupported dest/entry combination: {entry_w:?}"
+                ))),
+            }
+        });
+
+        let read_res = read_task
+            .await
+            .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))?;
+        let write_res = write_task
+            .await
+            .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))?;
+        read_res?;
+        write_res?;
+
+        // ── 收尾：规整长度 → 校验 → rename ──
+        to.set_file_len(&part_relative_path, size).await?;
+
+        if enable_integrity_check {
+            let src_hash = from.compute_hash(entry.get_relative_path(), size).await?;
+            let dst_hash = to.compute_hash(&part_relative_path, size).await?;
+            if src_hash != dst_hash {
+                return Err(StorageError::OperationError(
+                    "integrity check failed: source and destination hashes differ".to_string(),
+                ));
+            }
+        }
+
+        to.rename(&part_relative_path, entry.get_relative_path())
+            .await?;
 
         if !is_source_reserved {
             from.delete_file(entry).await?;

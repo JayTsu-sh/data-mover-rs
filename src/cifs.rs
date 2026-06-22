@@ -17,9 +17,9 @@ use smb::connection::MultiChannelConfig;
 use smb::{
     ACE, ACL, AclRevision, AdditionalInfo, Client, ClientConfig, ConnectionConfig,
     CreateDisposition, CreateOptions, FileAccessMask, FileAttributes, FileBasicInformation,
-    FileCreateArgs, FileIdExtdDirectoryInformation, FileIdFullDirectoryInformation,
-    FileIdInformation, FileInternalInformation, FileStandardInformation, LeaseState, Resource,
-    ResourceHandle, SecurityDescriptor, UncPath,
+    FileCreateArgs, FileEndOfFileInformation, FileIdExtdDirectoryInformation,
+    FileIdFullDirectoryInformation, FileIdInformation, FileInternalInformation,
+    FileStandardInformation, LeaseState, Resource, ResourceHandle, SecurityDescriptor, UncPath,
 };
 use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, trace, warn};
@@ -1265,6 +1265,274 @@ impl CifsStorage {
             return Err(e);
         }
         Ok(())
+    }
+
+    // ========================================================
+    // 字节级断点续传变体（仅多块大文件）
+    // ========================================================
+
+    /// 打开已存在文件或创建（`OpenIf`，**不截断**），用于续写 `.part`。
+    /// access mask 与 `make_overwrite_args` 一致（最小可写权限）。
+    fn make_open_or_create_args() -> FileCreateArgs {
+        FileCreateArgs {
+            disposition: CreateDisposition::OpenIf,
+            attributes: FileAttributes::default(),
+            options: CreateOptions::default(),
+            desired_access: FileAccessMask::new()
+                .with_file_read_data(true)
+                .with_file_write_data(true)
+                .with_file_read_attributes(true)
+                .with_file_write_attributes(true)
+                .with_delete(true)
+                .with_synchronize(true),
+            ..Default::default()
+        }
+    }
+
+    /// 只读取给定缺失区间的数据，按 `chunk.offset` 发送 `DataChunk`（inflight pipeline）。
+    pub(crate) async fn read_data_intervals(
+        &self,
+        tx: mpsc::Sender<DataChunk>,
+        relative_path: &Path,
+        intervals: &[(u64, u64)],
+        qos: Option<QosManager>,
+    ) -> Result<()> {
+        let total: u64 = intervals.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+        if total == 0 {
+            return Ok(());
+        }
+        let chunk_size = self.calculate_chunk_size(total);
+        if u32::try_from(chunk_size).is_err() {
+            return Err(StorageError::CifsError(format!(
+                "chunk_size {chunk_size} exceeds u32::MAX (block_size invariant violation)"
+            )));
+        }
+
+        let unc = self.build_unc_path(relative_path);
+        let args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+        let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
+            StorageError::CifsError(format!(
+                "Failed to open file {}: {e}",
+                relative_path.display()
+            ))
+        })?;
+        let Resource::File(file) = resource else {
+            return Err(StorageError::CifsError(format!(
+                "Path {} is not a file",
+                relative_path.display()
+            )));
+        };
+
+        let mut first_error: Option<StorageError> = None;
+        'outer: for &(start, end) in intervals {
+            type ReadFut<'a> =
+                Pin<Box<dyn Future<Output = (u64, std::io::Result<Bytes>)> + Send + 'a>>;
+            let mut inflight: FuturesOrdered<ReadFut<'_>> = FuturesOrdered::new();
+            let mut issue_offset = start;
+            loop {
+                while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < end {
+                    if let Some(ref qos) = qos {
+                        qos.acquire(chunk_size).await;
+                    }
+                    let want = std::cmp::min(chunk_size, end - issue_offset);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let read_len = want as u32;
+                    let off = issue_offset;
+                    let file_ref: &smb::File = &file;
+                    inflight.push_back(Box::pin(async move {
+                        (
+                            off,
+                            file_ref.read_block_bytes(read_len, off, None, false).await,
+                        )
+                    }));
+                    issue_offset += want;
+                }
+                let Some((offset, result)) = inflight.next().await else {
+                    break;
+                };
+                let data = match result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        first_error = Some(StorageError::CifsError(format!(
+                            "Failed to read file {} at offset {offset}: {e}",
+                            relative_path.display()
+                        )));
+                        break 'outer;
+                    }
+                };
+                if data.is_empty() {
+                    break;
+                }
+                if tx.send(DataChunk { offset, data }).await.is_err() {
+                    break 'outer;
+                }
+            }
+        }
+
+        let _ = file.close().await;
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// 续写到 `.part` 文件：`OpenIf` 不截断，按 `chunk.offset` 写入（inflight pipeline）。
+    ///
+    /// 正确性：SMB WRITE 默认非 write-through，故每累计 `FLUSH_BARRIER` 个已完成写
+    /// 调用 `file.flush()` 落盘屏障，**屏障之后才**对这批 chunk 触发 `on_committed`，
+    /// 保证进度记录不超前于真实落盘数据。
+    pub(crate) async fn write_data_resumable(
+        &self,
+        rx: mpsc::Receiver<DataChunk>,
+        part_path: &Path,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _mode: Option<u32>,
+        bytes_counter: Option<Arc<AtomicU64>>,
+        on_committed: crate::CommitCallback,
+    ) -> Result<()> {
+        const FLUSH_BARRIER: usize = 16;
+
+        if let Some(parent) = part_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.create_dir_all(parent).await?;
+        }
+
+        let unc = self.build_unc_path(part_path);
+        let args = Self::make_open_or_create_args();
+        let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
+            StorageError::CifsError(format!(
+                "Failed to create/open file {}: {e}",
+                part_path.display()
+            ))
+        })?;
+        let Resource::File(file) = resource else {
+            return Err(StorageError::CifsError(format!(
+                "Path {} is not a file",
+                part_path.display()
+            )));
+        };
+
+        type WriteFut<'a> =
+            Pin<Box<dyn Future<Output = (u64, u64, std::io::Result<usize>)> + Send + 'a>>;
+        let mut inflight: FuturesUnordered<WriteFut<'_>> = FuturesUnordered::new();
+        let mut first_error: Option<StorageError> = None;
+        let mut pending: Vec<(u64, u64)> = Vec::with_capacity(FLUSH_BARRIER);
+
+        let record = |offset: u64,
+                      len: u64,
+                      result: std::io::Result<usize>,
+                      first_error: &mut Option<StorageError>,
+                      pending: &mut Vec<(u64, u64)>| {
+            match result {
+                Ok(_) if first_error.is_none() => {
+                    if let Some(ref c) = bytes_counter {
+                        c.fetch_add(len, Ordering::Relaxed);
+                    }
+                    pending.push((offset, len));
+                }
+                Ok(_) => {}
+                Err(e) if first_error.is_none() => {
+                    *first_error = Some(StorageError::CifsError(format!(
+                        "Failed to write data: {e}"
+                    )));
+                }
+                Err(_) => {}
+            }
+        };
+
+        let mut reader = rx;
+        loop {
+            if inflight.len() >= DEFAULT_WRITE_INFLIGHT
+                && let Some((offset, len, result)) = inflight.next().await
+            {
+                let was_ok = first_error.is_none();
+                record(offset, len, result, &mut first_error, &mut pending);
+                if was_ok && first_error.is_some() {
+                    reader.close();
+                }
+                // 落盘屏障：flush 后安全上报这批进度
+                if pending.len() >= FLUSH_BARRIER && first_error.is_none() {
+                    if let Err(e) = file.flush().await {
+                        first_error = Some(StorageError::CifsError(format!("flush failed: {e}")));
+                        reader.close();
+                    } else {
+                        for (o, l) in pending.drain(..) {
+                            on_committed(o, l);
+                        }
+                    }
+                }
+            }
+
+            let Some(chunk) = reader.recv().await else {
+                break;
+            };
+            let DataChunk { offset, data } = chunk;
+            let len = data.len() as u64;
+            if first_error.is_some() {
+                continue;
+            }
+            let file_ref: &smb::File = &file;
+            inflight.push(Box::pin(async move {
+                (
+                    offset,
+                    len,
+                    file_ref.write_block_zc(data, offset, None).await,
+                )
+            }));
+        }
+
+        while let Some((offset, len, result)) = inflight.next().await {
+            record(offset, len, result, &mut first_error, &mut pending);
+        }
+
+        // 收尾屏障：flush 落盘后触发剩余回调
+        if first_error.is_none() {
+            if let Err(e) = file.flush().await {
+                first_error = Some(StorageError::CifsError(format!("final flush failed: {e}")));
+            } else {
+                for (o, l) in pending.drain(..) {
+                    on_committed(o, l);
+                }
+            }
+        }
+
+        let _ = file.close().await;
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// 将文件长度规整为 `len`（截掉续传遗留尾部）：set_info `FileEndOfFileInformation`。
+    pub(crate) async fn set_file_len(&self, relative_path: &Path, len: u64) -> Result<()> {
+        let unc = self.build_unc_path(relative_path);
+        let args = Self::make_open_or_create_args();
+        let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
+            StorageError::CifsError(format!(
+                "Failed to open file {}: {e}",
+                relative_path.display()
+            ))
+        })?;
+        let Resource::File(file) = resource else {
+            return Err(StorageError::CifsError(format!(
+                "Path {} is not a file",
+                relative_path.display()
+            )));
+        };
+        let result = file
+            .set_info(FileEndOfFileInformation { end_of_file: len })
+            .await
+            .map_err(|e| {
+                StorageError::CifsError(format!(
+                    "Failed to set length for {}: {e}",
+                    relative_path.display()
+                ))
+            });
+        let _ = file.close().await;
+        result
     }
 
     // ========================================================================
