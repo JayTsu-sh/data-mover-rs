@@ -1,0 +1,44 @@
+name: Claude (Reviewer)
+
+# Reviewer 角色：PR 创建或更新时自动触发，Claude 按项目规范审查 diff 并留 review 评论。
+# contents: read 从机制上禁止 reviewer 改代码，与实现者角色彻底分离；
+# 放开的 Bash 仅限 gh pr comment/diff/view，只够发评论、读 PR，不能改代码。
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read         # 只读 —— 从机制上禁止 reviewer 改代码
+      pull-requests: write   # 留 review 评论
+      id-token: write        # v1 Action 走 OIDC 交换 GitHub App token，必需（不授予代码写权限）
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # track_progress 启用 review 流程：建跟踪评论 + 注入完整 PR 上下文
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            你是本仓库（data-mover-rs，多源数据迁移核心库）的资深 Rust 代码审查者（与提交者是不同角色）。审查本 PR 的 diff，重点：
+            1. 正确性：逻辑错误、错误处理路径、并发/async 竞态、取消语义（Cancelled ≠ Error）。
+            2. 项目规范（.claude/rules/*.md）：
+               - 禁止 unwrap/expect（仅 #[cfg(test)] 例外）；use 集中文件顶部、路径≤两层。
+               - 公开 API 返回 crate::Result；backend 错误必须映射到 StorageError 24 变体之一，不得 String/Box<dyn Error> 兜底。
+               - 改 StorageEnum 操作必须五处同步（storage_enum.rs + 对应 backend.rs + 可能 lib.rs + examples + tests），漏一处即行为分裂。
+               - 资源句柄走 close_resource helper，不要裸 .close()。
+               - 时间转换走 time_util；unsafe 默认 deny，新增需 SAFETY 注释 + 说明。
+               - 重构不得改语义；bug fix 与 refactor 应分开。
+            3. 安全与性能：热路径 clone/Mutex、async 中的同步 IO、unbounded channel、错误信息泄漏 ak/sk/密码（须走 url_redact）。
+
+            对具体问题用 inline 评论逐行指出；整体观察或无问题用顶层评论说明。全部用中文。
+          # 显式放开发评论 / 读 PR 的工具（默认不含）；这些是 reviewer 唯一需要的写操作
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"

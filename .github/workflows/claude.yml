@@ -1,0 +1,32 @@
+name: Claude (实现者)
+
+# 实现者/提交者角色：在 issue / PR 里 @claude 描述需求，Claude 改代码、提交、开 PR。
+# 人在回路、按需触发。认证走 Claude 订阅 OAuth token。
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+
+jobs:
+  claude:
+    # 只在评论/正文包含 @claude 时触发，避免无谓跑 Action
+    if: contains(github.event.comment.body, '@claude') || contains(github.event.issue.body, '@claude')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # 提交代码
+      pull-requests: write   # 开 PR / 评论
+      issues: write          # 回应 issue
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # CLAUDE.md 已被 Action 自动加载；此处再强调"提交者"职责与项目硬规则
+          claude_args: |
+            --append-system-prompt "你是本仓库的实现者。严格遵守 CLAUDE.md 与 .claude/rules/*.md：禁止 unwrap/expect（仅 #[cfg(test)] 例外）、use 语句集中文件顶部、公开 API 返回 crate::Result、backend 错误映射到 StorageError 24 变体之一、资源句柄走 close_resource helper、Cancelled 不当错误、时间转换走 time_util、unsafe 默认 deny。改 StorageEnum 操作必须五处同步（storage_enum.rs + 对应 backend.rs + 可能 lib.rs + examples + tests）。改完代码先 cargo fmt && cargo check && cargo clippy，再开 PR。commit 用 conventional commits + 中文描述，禁止 Co-Authored-By。"
