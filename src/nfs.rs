@@ -2167,74 +2167,109 @@ impl NFSStorage {
         package_depth: usize,
         package_remaining: Option<usize>,
     ) -> Result<()> {
-        // 调用readdirplus获取目录条目流 - 使用异步调用
-        // 先把整个目录的 readdirplus 结果完整收集到 Vec，再处理。
-        // 这是为了在流中途遇到瞬时错误（NFS4ERR_DELAY 在 nfs-rs 内部重试耗尽，
-        // 或 STALE/BADHANDLE 等需 root_fh 刷新的错误）时可以**整体重试 readdirplus**
-        // 而不会向下游 channel 重复发送已发条目（流式直发 + 重试 = 重复 entry，
-        // 进而导致 ClickHouse 行数 / 统计计数偏离实际）。
-        //
-        // 内存代价：单目录 readdirplus 全部 entries 缓冲。典型 < 10k entry，
-        // 单 entry ~500B，最大 ~5MB/worker，可接受。
-        let entries: Vec<_> = {
+        // Stream READDIRPLUS entries into the existing processing path instead
+        // of buffering a full directory. Retryable errors are retried only
+        // before any entry is processed; after that point, replaying the
+        // directory could duplicate downstream rows/counts or child-dir tasks.
+        let mut retries: u8 = 0;
+        let mut processed_any = false;
+        loop {
             let mount_clone = self.mount.clone();
-            let mut retries: u8 = 0;
-            loop {
-                let mut dir_stream = mount_clone.readdirplus(dir_fh.clone()).await;
-                let mut buf: Vec<nfs_rs::ReaddirplusEntry> = Vec::new();
-                let mut transient_err: Option<NfsError> = None;
-                while let Some(entry_result) = dir_stream.next().await {
-                    match entry_result {
-                        Ok(e) => buf.push(e),
-                        Err(e) => {
-                            // 流式 readdirplus 中途出错的重试条件（同 read_dir_sorted）
-                            if retries < MAX_STALE_RETRIES
-                                && (is_retryable_with_invalidation(&e) || is_server_busy(&e))
-                            {
-                                transient_err = Some(e);
-                                break;
-                            }
-                            // 非可重试错误：上报但不丢弃整个目录（保留部分结果向下游发送）
-                            error!(
-                                "[Producer {}] Failed to read entry in directory {}: {:?}",
-                                producer_id, dir_path, e
-                            );
-                            let _ = tx
-                                .send(StorageEntryMessage::Error {
-                                    event: ErrorEvent::Scan,
-                                    path: PathBuf::from(&dir_path),
-                                    reason: format!("Failed to read directory entry: {e}"),
-                                })
-                                .await;
+            let mut dir_stream = mount_clone.readdirplus(dir_fh.clone()).await;
+            let mut transient_err: Option<NfsError> = None;
+            while let Some(entry_result) = dir_stream.next().await {
+                match entry_result {
+                    Ok(entry) => {
+                        processed_any = true;
+                        if !self
+                            .process_readdir_entry(
+                                producer_id,
+                                &dir_path,
+                                entry,
+                                current_depth,
+                                tx,
+                                ctx,
+                                match_expr,
+                                exclude_expr,
+                                max_depth,
+                                total_file_count,
+                                skip_filter,
+                                packaged,
+                                package_depth,
+                                package_remaining,
+                            )
+                            .await?
+                        {
+                            return Ok(());
                         }
                     }
-                }
-                drop(dir_stream);
-                if let Some(e) = transient_err {
-                    retries += 1;
-                    warn!(
-                        "[Producer {}] readdirplus on {} hit transient error (retry {}/{}): {}",
-                        producer_id, dir_path, retries, MAX_STALE_RETRIES, e
-                    );
-                    // STALE/BADHANDLE/NOENT 类需要刷新 root_fh；DELAY 类直接重试即可
-                    if is_retryable_with_invalidation(&e) {
-                        let stale_gen = self.refresh_generation.load(Ordering::Acquire);
-                        let _ = self.maybe_refresh_root_fh(stale_gen).await;
-                        // 注意：这里不刷新 dir_fh 本身（无父路径上下文），依赖 root_fh 刷新
-                        // 修复跨 export remount 场景，stale-handle 多次重试可能仍失败时由 errors 报告
+                    Err(e)
+                        if !processed_any
+                            && retries < MAX_STALE_RETRIES
+                            && (is_retryable_with_invalidation(&e) || is_server_busy(&e)) =>
+                    {
+                        transient_err = Some(e);
+                        break;
                     }
-                    // 给服务端一点缓冲时间
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
+                    Err(e) => {
+                        error!(
+                            "[Producer {}] Failed to read entry in directory {}: {:?}",
+                            producer_id, dir_path, e
+                        );
+                        let _ = tx
+                            .send(StorageEntryMessage::Error {
+                                event: ErrorEvent::Scan,
+                                path: PathBuf::from(&dir_path),
+                                reason: format!("Failed to read directory entry: {e}"),
+                            })
+                            .await;
+                        return Ok(());
+                    }
                 }
-                break buf;
             }
-        };
+            drop(dir_stream);
+            let Some(e) = transient_err else {
+                break;
+            };
+            retries += 1;
+            warn!(
+                "[Producer {}] readdirplus on {} hit transient error before processing entries (retry {}/{}): {}",
+                producer_id, dir_path, retries, MAX_STALE_RETRIES, e
+            );
+            if is_retryable_with_invalidation(&e) {
+                let stale_gen = self.refresh_generation.load(Ordering::Acquire);
+                let _ = self.maybe_refresh_root_fh(stale_gen).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
 
-        // 流式处理每个目录条目（已完整收集，无重复风险）
-        for entry in entries {
+        Ok(())
+    }
+
+    /// Process one streamed READDIRPLUS entry.
+    ///
+    /// Returns `Ok(false)` when the downstream output channel is closed and the
+    /// caller should stop reading the directory.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_readdir_entry(
+        &self,
+        producer_id: usize,
+        dir_path: &str,
+        entry: nfs_rs::ReaddirplusEntry,
+        current_depth: usize,
+        tx: &async_channel::Sender<StorageEntryMessage>,
+        ctx: &crate::walk_scheduler::WorkerContext<(String, Bytes, usize, bool, Option<usize>)>,
+        match_expr: &Arc<Option<FilterExpression>>,
+        exclude_expr: &Arc<Option<FilterExpression>>,
+        max_depth: usize,
+        total_file_count: &Arc<AtomicUsize>,
+        skip_filter: bool,
+        packaged: bool,
+        package_depth: usize,
+        package_remaining: Option<usize>,
+    ) -> Result<bool> {
             if entry.file_name == "." || entry.file_name == ".." {
-                continue;
+                return Ok(true);
             }
 
             // 构建完整路径（使用 '/' 拼接，避免平台差异）
@@ -2271,7 +2306,7 @@ impl NFSStorage {
                                 reason: format!("[Producer {producer_id}] Missing file attributes: {relative_path}"),
                             })
                             .await;
-                        continue;
+                        return Ok(true);
                     }
                 }
             };
@@ -2316,7 +2351,7 @@ impl NFSStorage {
             // package 深度追踪模式：只处理目录，跳过文件和 filter
             if let Some(remaining) = package_remaining {
                 if !is_dir {
-                    continue;
+                    return Ok(true);
                 }
                 if remaining > 1 {
                     ctx.push_task((
@@ -2327,7 +2362,7 @@ impl NFSStorage {
                         Some(remaining - 1),
                     ))
                     .await;
-                    continue;
+                    return Ok(true);
                 }
                 send_packaged = true;
             }
@@ -2343,7 +2378,7 @@ impl NFSStorage {
                     ))
                     .await;
                 }
-                continue;
+                return Ok(true);
             }
 
             // 创建StorageEntry
@@ -2393,7 +2428,7 @@ impl NFSStorage {
                 && dir_matches_date_filter(match_expr.as_ref().as_ref(), storage_entry.get_name())
             {
                 if max_depth > 0 && entry_depth + package_depth > max_depth {
-                    continue;
+                    return Ok(true);
                 }
                 if package_depth > 0 {
                     ctx.push_task((
@@ -2404,7 +2439,7 @@ impl NFSStorage {
                         Some(package_depth),
                     ))
                     .await;
-                    continue;
+                    return Ok(true);
                 }
                 send_packaged = true;
             }
@@ -2425,9 +2460,9 @@ impl NFSStorage {
                         "[Producer {}] Output channel closed, stopping processing",
                         producer_id
                     );
-                    break;
+                    return Ok(false);
                 }
-                continue;
+                return Ok(true);
             }
 
             // 如果是目录且未达到最大深度，将其添加到任务队列
@@ -2458,12 +2493,11 @@ impl NFSStorage {
                         "[Producer {}] Output channel closed, stopping processing",
                         producer_id
                     );
-                    break;
+                    return Ok(false);
                 }
             }
-        }
 
-        Ok(())
+        Ok(true)
     }
 
     async fn read(&self, file: &mut NFSFileHandle, offset: u64, count: usize) -> Result<Bytes> {
