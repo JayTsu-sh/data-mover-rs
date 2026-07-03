@@ -881,15 +881,18 @@ impl StorageEnum {
         Ok(())
     }
 
-    /// 字节级断点续传复制（仅多块大文件，NAS 后端：Local/NFS/CIFS）。
+    /// 字节级断点续传复制（仅多块大文件，源端：Local/NFS/CIFS/S3，目标端：全部后端）。
     ///
     /// 与 `copy_file` 的差异：
-    /// - 源端只读 `resume.missing_intervals` 覆盖的缺失区间；
-    /// - 目标端写到 `resume.part_relative_path`（`.part`），不截断已写字节；
-    /// - 每个 chunk 确认落盘后回调 `resume.on_committed`（供上层持久化进度）；
-    /// - 收尾规整 `.part` 长度 → 可选完整性校验 → 原子 rename 成最终文件。
+    /// - 源端只读缺失的 offset 区间；
+    /// - NAS 目标端写到 `resume.part_relative_path`（`.part`），不截断已写字节；
+    ///   每个 chunk 确认落盘后回调 `resume.on_committed`（供上层持久化进度）；
+    ///   收尾规整 `.part` 长度 → 可选完整性校验 → 原子 rename 成最终文件。
+    /// - S3 目标端走 multipart part 粒度续传（见 [`Self::copy_file_resumable_to_s3`]），
+    ///   `.part`/rename/set_file_len 模型不适用于对象存储。
     ///
-    /// 进程中断时 `.part` 与进度状态保留，重跑时只补未完成区间。
+    /// 进程中断时进度保留（NAS 目标：`.part` + 上层状态文件；S3 目标：in-progress
+    /// multipart upload），重跑时只补未完成区间。
     pub async fn copy_file_resumable(
         from: &StorageEnum,
         to: &StorageEnum,
@@ -900,6 +903,20 @@ impl StorageEnum {
         bytes_counter: Option<Arc<AtomicU64>>,
         resume: ResumeContext,
     ) -> Result<()> {
+        if matches!(to, StorageEnum::S3(_)) {
+            return Self::copy_file_resumable_to_s3(
+                from,
+                to,
+                entry,
+                qos,
+                enable_integrity_check,
+                is_source_reserved,
+                bytes_counter,
+                resume.on_committed,
+            )
+            .await;
+        }
+
         let size = entry.get_size();
         let ResumeContext {
             part_relative_path,
@@ -924,6 +941,10 @@ impl StorageEnum {
                         .await
                 }
                 (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
+                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
+                        .await
+                }
+                (StorageEnum::S3(s), EntryEnum::S3(e)) => {
                     s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
                         .await
                 }
@@ -976,6 +997,43 @@ impl StorageEnum {
                     )
                     .await
                 }
+                // S3 → NAS：S3 对象无 uid/gid/mode，全部 None（与 copy_file 一致）
+                (StorageEnum::Local(s), EntryEnum::S3(_)) => {
+                    s.write_data_resumable(
+                        rx,
+                        &part,
+                        None,
+                        None,
+                        None,
+                        bytes_counter_w,
+                        on_committed,
+                    )
+                    .await
+                }
+                (StorageEnum::NFS(s), EntryEnum::S3(_)) => {
+                    s.write_data_resumable(
+                        rx,
+                        &part,
+                        None,
+                        None,
+                        None,
+                        bytes_counter_w,
+                        on_committed,
+                    )
+                    .await
+                }
+                (StorageEnum::CIFS(s), EntryEnum::S3(_)) => {
+                    s.write_data_resumable(
+                        rx,
+                        &part,
+                        None,
+                        None,
+                        None,
+                        bytes_counter_w,
+                        on_committed,
+                    )
+                    .await
+                }
                 _ => Err(StorageError::OperationError(format!(
                     "resumable copy unsupported dest/entry combination: {entry_w:?}"
                 ))),
@@ -1006,6 +1064,122 @@ impl StorageEnum {
 
         to.rename(&part_relative_path, entry.get_relative_path())
             .await?;
+
+        if !is_source_reserved {
+            from.delete_file(entry).await?;
+        }
+
+        Ok(())
+    }
+
+    /// S3 目标端字节级断点续传：multipart upload part 粒度。
+    ///
+    /// 进度真值是目标端 in-progress multipart upload 本身（ListParts 反推缺失区间），
+    /// 不使用上层状态文件传入的 `missing_intervals`——upload 可能被外部（lifecycle
+    /// 规则、手动 abort）清掉，且上层记录只可能滞后于真实进度，以目标端反推永远正确。
+    /// `on_committed` 仍逐 part 回调，供上层记录进度；`.part` 路径与
+    /// rename/set_file_len 不适用于对象存储，均不使用。
+    ///
+    /// 失败时**不 abort** upload，已上传 parts 即续传进度；成功时
+    /// `CompleteMultipartUpload` 原子生效，目标端不存在半截可见对象。
+    #[allow(clippy::too_many_arguments)]
+    async fn copy_file_resumable_to_s3(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        qos: Option<QosManager>,
+        enable_integrity_check: bool,
+        is_source_reserved: bool,
+        bytes_counter: Option<Arc<AtomicU64>>,
+        on_committed: crate::CommitCallback,
+    ) -> Result<()> {
+        let StorageEnum::S3(to_s3) = to else {
+            return Err(StorageError::OperationError(
+                "copy_file_resumable_to_s3 requires an S3 destination".to_string(),
+            ));
+        };
+        let size = entry.get_size();
+        // 目标 key 与 tags：S3→S3 透传对象 tags，NAS→S3 无 tags（与 copy_file 一致）
+        let (dst_rel, tags) = match entry {
+            EntryEnum::S3(e) => (e.relative_path.clone(), e.tags.clone()),
+            EntryEnum::NAS(e) => (path_to_s3_key(&e.relative_path).into_owned(), None),
+        };
+        let part_size = to_s3.resume_part_size(size);
+        let (upload_id, missing) = to_s3
+            .prepare_resumable_upload(&dst_rel, size, part_size, tags.as_ref())
+            .await?;
+
+        // ── 源端：只读缺失区间（以目标端 ListParts 反推为准）──
+        let (tx, rx) = mpsc::channel::<DataChunk>(COPY_PIPELINE_CAPACITY);
+        let from_c = from.clone();
+        let entry_r = entry.clone();
+        let intervals = missing;
+        let qos_r = qos;
+        let read_task = tokio::spawn(async move {
+            match (&from_c, &entry_r) {
+                (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
+                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
+                        .await
+                }
+                (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
+                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
+                        .await
+                }
+                (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
+                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
+                        .await
+                }
+                (StorageEnum::S3(s), EntryEnum::S3(e)) => {
+                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
+                        .await
+                }
+                _ => Err(StorageError::OperationError(format!(
+                    "resumable copy unsupported source/entry combination: {entry_r:?}"
+                ))),
+            }
+        });
+
+        // ── 目标端：缺失 parts 并发 UploadPart ──
+        let to_c = to_s3.clone();
+        let dst_rel_w = dst_rel.clone();
+        let upload_id_w = upload_id.clone();
+        let bytes_counter_w = bytes_counter;
+        let write_task = tokio::spawn(async move {
+            to_c.write_data_resumable(
+                rx,
+                &dst_rel_w,
+                size,
+                part_size,
+                &upload_id_w,
+                bytes_counter_w,
+                on_committed,
+            )
+            .await
+        });
+
+        let read_res = read_task
+            .await
+            .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))?;
+        let write_res = write_task
+            .await
+            .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))?;
+        read_res?;
+        write_res?;
+
+        // ── 收尾：校验 parts 全覆盖 → CompleteMultipartUpload ──
+        to_s3
+            .finalize_resumable_upload(&dst_rel, size, part_size, &upload_id)
+            .await?;
+
+        if enable_integrity_check {
+            let src_hash = from.compute_hash(entry.get_relative_path(), size).await?;
+            let dst_hash = to.compute_hash(entry.get_relative_path(), size).await?;
+            if src_hash != dst_hash {
+                return Err(StorageError::OperationError(
+                    "integrity check failed: source and destination hashes differ".to_string(),
+                ));
+            }
+        }
 
         if !is_source_reserved {
             from.delete_file(entry).await?;

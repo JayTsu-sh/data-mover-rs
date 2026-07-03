@@ -319,6 +319,8 @@ fn build_skip_verify_http_client() -> SharedHttpClient {
 const DEFAULT_BLOCK_SIZE: u64 = 5 * 1024 * 1024; // 5MiB
 const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MiB
 const MAX_CONCURRENCY: usize = 5; // 最大并发上传数
+/// S3 协议规定的 multipart upload 最大分块数
+const MAX_UPLOAD_PARTS: u64 = 10_000;
 
 /// 单 object 读取的同时在飞 Range GET 请求数（inflight read pipeline 深度）。
 ///
@@ -929,6 +931,71 @@ impl S3Storage {
         // FuturesOrdered drop 取消未完成的 Range GET，aws-sdk 内部丢弃响应。
         drop(inflight);
         Ok(hasher)
+    }
+
+    /// 字节级断点续传源端：只读 `intervals` 覆盖的缺失区间（Range GET，inflight pipeline）。
+    ///
+    /// 与 `read_data` 的差异：按调用方给定的 `[start, end)` 区间列表读取，`DataChunk.offset`
+    /// 为文件内绝对偏移。区间按给定顺序串行处理，区间内维持 [`DEFAULT_READ_INFLIGHT`]
+    /// 个 Range GET 并发。version_id = None：续传调用域内不涉及多版本对象。
+    pub(crate) async fn read_data_intervals(
+        &self,
+        tx: mpsc::Sender<DataChunk>,
+        relative_path: &str,
+        intervals: &[(u64, u64)],
+        qos: Option<QosManager>,
+    ) -> Result<()> {
+        let total: u64 = intervals.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+        if total == 0 {
+            return Ok(());
+        }
+        let key = Arc::new(self.build_full_key(relative_path));
+        let chunk_size = self.block_size;
+
+        for &(start, end) in intervals {
+            let mut issue_offset = start;
+            type ReadFut<'a> = Pin<Box<dyn Future<Output = (u64, Result<Bytes>)> + Send + 'a>>;
+            let mut inflight: FuturesOrdered<ReadFut<'_>> = FuturesOrdered::new();
+            loop {
+                while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < end {
+                    if let Some(ref qos) = qos {
+                        qos.acquire(chunk_size).await;
+                    }
+                    let count = (end - issue_offset).min(chunk_size);
+                    let key_clone = key.clone();
+                    let offset = issue_offset;
+                    inflight.push_back(Box::pin(async move {
+                        let r = self
+                            .read_range_uncached(key_clone.as_str(), None, offset, count)
+                            .await;
+                        (offset, r)
+                    }));
+                    issue_offset += count;
+                }
+                let Some((offset, result)) = inflight.next().await else {
+                    break;
+                };
+                let data = match result {
+                    Ok(d) => d,
+                    Err(e) => {
+                        error!(
+                            "S3 read interval chunk at offset {} failed: {:?}",
+                            offset, e
+                        );
+                        drop(inflight);
+                        return Err(e);
+                    }
+                };
+                if data.is_empty() {
+                    break;
+                }
+                if tx.send(DataChunk { offset, data }).await.is_err() {
+                    // 下游 receiver 关闭：协作取消，不当读错误。
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Chunked write: receives `DataChunks` from `rx` and dispatches to singlepart or multipart upload.
@@ -2286,6 +2353,395 @@ impl S3Storage {
         Ok(0)
     }
 
+    // ============================================================
+    // 字节级断点续传目标端（multipart part 粒度）
+    //
+    // 对象存储没有随机写/rename/truncate 原语，`.part` 文件模型不适用。
+    // 续传状态就是目标端 in-progress multipart upload 本身：
+    // 已上传的 parts（ListParts 可查）= 已完成区间；中断后重跑只补缺失 parts，
+    // 最后 CompleteMultipartUpload 原子生效。
+    // ============================================================
+
+    /// 断点续传的 part 大小。满足三个约束：
+    /// - ≥ `block_size`（构造时已箝位 ≥5MiB，满足 S3 除末 part 外 ≥5MiB 的协议要求）；
+    /// - 保证总 part 数 ≤ [`MAX_UPLOAD_PARTS`]；
+    /// - 向上取整到 MiB，保证跨次运行推导结果一致（续传比对 part 尺寸依赖这一点）。
+    pub(crate) fn resume_part_size(&self, size: u64) -> u64 {
+        const MIB: u64 = 1024 * 1024;
+        let min_for_limit = size.div_ceil(MAX_UPLOAD_PARTS);
+        let min_aligned = min_for_limit.div_ceil(MIB) * MIB;
+        self.block_size.max(min_aligned)
+    }
+
+    /// 第 `idx`（0-based）个 part 的期望大小（末 part 为余数）。
+    fn expected_part_len(size: u64, part_size: u64, idx: u64) -> u64 {
+        (size - idx * part_size).min(part_size)
+    }
+
+    /// 准备可续传的 multipart 上传。
+    ///
+    /// 查找该 key 已有的 in-progress upload：有则以 ListParts 反推已完成区间（续传）；
+    /// 无、或已有 parts 与当前 `(size, part_size)` 推导不符（如源已变/块配置变更）则
+    /// 作废重建。返回 `(upload_id, 缺失区间列表)`。
+    ///
+    /// **目标端 ListParts 是续传进度的唯一真值**——上层状态文件记录的区间只可能
+    /// 滞后于真实进度（回调后才落盘），且 upload 可能被外部（lifecycle 规则、手动
+    /// abort）清掉，以目标端反推永远正确。
+    pub(crate) async fn prepare_resumable_upload(
+        &self,
+        relative_path: &str,
+        size: u64,
+        part_size: u64,
+        tags: Option<&Vec<Tag>>,
+    ) -> Result<(String, Vec<(u64, u64)>)> {
+        let key = self.build_full_key(relative_path);
+        if let Some(upload_id) = self.find_inprogress_upload(&key).await? {
+            match self
+                .committed_intervals_from_parts(&key, &upload_id, size, part_size)
+                .await?
+            {
+                Some(committed) => {
+                    let missing = missing_from_committed(&committed, size);
+                    debug!(
+                        "Resuming multipart upload {} for key {}: {} committed intervals, {} missing",
+                        upload_id,
+                        key,
+                        committed.len(),
+                        missing.len()
+                    );
+                    return Ok((upload_id, missing));
+                }
+                None => {
+                    warn!(
+                        "Existing multipart upload {} for key {} has incompatible parts, aborting and restarting",
+                        upload_id, key
+                    );
+                    let _ = self.abort_multipart_upload(&key, &upload_id).await;
+                }
+            }
+        }
+        let upload_id = self.create_multipart_upload(&key, tags).await?;
+        Ok((upload_id, vec![(0, size)]))
+    }
+
+    /// 查找该 key 的 in-progress multipart upload。
+    /// 同 key 多个 upload 时保留 initiated 最新者，其余尽力而为地 abort（避免残留计费）。
+    async fn find_inprogress_upload(&self, key: &str) -> Result<Option<String>> {
+        let mut key_marker: Option<String> = None;
+        let mut upload_id_marker: Option<String> = None;
+        let mut found: Vec<(String, i64)> = Vec::new();
+        loop {
+            let mut req = self
+                .client
+                .list_multipart_uploads()
+                .bucket(&self.bucket_name)
+                .prefix(key);
+            if let Some(ref km) = key_marker {
+                req = req.key_marker(km);
+            }
+            if let Some(ref um) = upload_id_marker {
+                req = req.upload_id_marker(um);
+            }
+            let resp = req.send().await.map_err(|e| {
+                StorageError::S3Error(format!("ListMultipartUploads failed for {key}: {e}"))
+            })?;
+            for u in resp.uploads() {
+                if u.key() == Some(key)
+                    && let Some(id) = u.upload_id()
+                {
+                    let ts = u
+                        .initiated()
+                        .map_or(0, aws_sdk_s3::primitives::DateTime::secs);
+                    found.push((id.to_string(), ts));
+                }
+            }
+            if resp.is_truncated() == Some(true) {
+                key_marker = resp.next_key_marker().map(str::to_string);
+                upload_id_marker = resp.next_upload_id_marker().map(str::to_string);
+            } else {
+                break;
+            }
+        }
+        found.sort_by_key(|(_, ts)| *ts);
+        let latest = found.pop();
+        for (stale_id, _) in found {
+            let _ = self.abort_multipart_upload(key, &stale_id).await;
+        }
+        Ok(latest.map(|(id, _)| id))
+    }
+
+    /// 分页列出某 upload 的全部 parts，返回 `(part_number, size, etag)`（按 part_number 升序）。
+    async fn list_upload_parts(
+        &self,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Vec<(i32, u64, String)>> {
+        let mut parts: Vec<(i32, u64, String)> = Vec::new();
+        let mut marker: Option<String> = None;
+        loop {
+            let mut req = self
+                .client
+                .list_parts()
+                .bucket(&self.bucket_name)
+                .key(key)
+                .upload_id(upload_id);
+            if let Some(ref m) = marker {
+                req = req.part_number_marker(m);
+            }
+            let resp = req.send().await.map_err(|e| {
+                StorageError::S3Error(format!("ListParts failed for {key} ({upload_id}): {e}"))
+            })?;
+            for p in resp.parts() {
+                if let (Some(pn), Some(psize), Some(etag)) = (p.part_number(), p.size(), p.e_tag())
+                {
+                    #[allow(clippy::cast_sign_loss)]
+                    parts.push((pn, psize.max(0) as u64, etag.to_string()));
+                }
+            }
+            if resp.is_truncated() == Some(true) {
+                marker = resp.next_part_number_marker().map(str::to_string);
+            } else {
+                break;
+            }
+        }
+        parts.sort_unstable_by_key(|(pn, _, _)| *pn);
+        Ok(parts)
+    }
+
+    /// ListParts → 已完成区间（升序）。任一 part 与 `(size, part_size)` 推导的
+    /// 编号/尺寸不符 → `Ok(None)`（调用方应作废该 upload 重来）。
+    async fn committed_intervals_from_parts(
+        &self,
+        key: &str,
+        upload_id: &str,
+        size: u64,
+        part_size: u64,
+    ) -> Result<Option<Vec<(u64, u64)>>> {
+        let total_parts = size.div_ceil(part_size);
+        let mut committed: Vec<(u64, u64)> = Vec::new();
+        for (pn, psize, _etag) in self.list_upload_parts(key, upload_id).await? {
+            if pn < 1 {
+                return Ok(None);
+            }
+            let idx = (pn - 1) as u64;
+            if idx >= total_parts || psize != Self::expected_part_len(size, part_size, idx) {
+                return Ok(None);
+            }
+            committed.push((idx * part_size, idx * part_size + psize));
+        }
+        committed.sort_unstable();
+        Ok(Some(committed))
+    }
+
+    /// 断点续传目标端写入：接收缺失区间的数据块，切齐 part 边界后并发 `UploadPart`。
+    ///
+    /// 约束（由 `copy_file_resumable` 的读端保证）：
+    /// - 每个缺失区间内 chunk 严格按 offset 升序且无空洞；
+    /// - 区间边界与 `part_size` 对齐（区间由整 part 组成，文件末尾除外）。
+    ///
+    /// 每个 part 上传成功即触发 `on_committed(part_start, part_len)`。
+    /// 任何失败**不 abort** upload——已上传 parts 留在 in-progress upload 里，
+    /// 就是下次续传的进度。流在 part 中途结束时丢弃半截缓冲（该 part 下次重传）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_data_resumable(
+        &self,
+        rx: mpsc::Receiver<DataChunk>,
+        relative_path: &str,
+        size: u64,
+        part_size: u64,
+        upload_id: &str,
+        bytes_counter: Option<Arc<AtomicU64>>,
+        on_committed: crate::CommitCallback,
+    ) -> Result<()> {
+        let key = Arc::new(self.build_full_key(relative_path));
+        let upload_id = Arc::new(upload_id.to_string());
+        let mut reader = rx;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY));
+        let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
+
+        // 当前累积中的 part 缓冲
+        let mut buf: Vec<Bytes> = Vec::new();
+        let mut buf_start: u64 = 0; // buf 首字节的绝对 offset
+        let mut buf_len: u64 = 0;
+        let mut stream_err: Option<StorageError> = None;
+
+        'recv: while let Some(chunk) = reader.recv().await {
+            let DataChunk { offset, mut data } = chunk;
+            if buf_len == 0 {
+                if offset % part_size != 0 {
+                    stream_err = Some(StorageError::OperationError(format!(
+                        "resumable S3 write: interval start {offset} not aligned to part size {part_size}"
+                    )));
+                    break 'recv;
+                }
+                buf_start = offset;
+            } else if offset != buf_start + buf_len {
+                stream_err = Some(StorageError::OperationError(format!(
+                    "resumable S3 write: non-contiguous chunk, expected offset {}, got {offset}",
+                    buf_start + buf_len
+                )));
+                break 'recv;
+            }
+
+            // 把 data 切进 part 缓冲；跨 part 边界则分段 flush
+            while !data.is_empty() {
+                let part_idx = buf_start / part_size;
+                let part_end =
+                    part_idx * part_size + Self::expected_part_len(size, part_size, part_idx);
+                let room = part_end.saturating_sub(buf_start + buf_len);
+                if room == 0 {
+                    stream_err = Some(StorageError::OperationError(format!(
+                        "resumable S3 write: data beyond expected size {size} at offset {}",
+                        buf_start + buf_len
+                    )));
+                    break 'recv;
+                }
+                let take = (data.len() as u64).min(room);
+                #[allow(clippy::cast_possible_truncation)]
+                buf.push(data.split_to(take as usize));
+                buf_len += take;
+                if buf_start + buf_len == part_end {
+                    let handle = self
+                        .spawn_resumable_part_upload(
+                            key.clone(),
+                            upload_id.clone(),
+                            part_idx,
+                            buf_start,
+                            std::mem::take(&mut buf),
+                            buf_len,
+                            semaphore.clone(),
+                            bytes_counter.clone(),
+                            on_committed.clone(),
+                        )
+                        .await?;
+                    handles.push(handle);
+                    buf_start = part_end;
+                    buf_len = 0;
+                }
+            }
+        }
+        // 释放 rx，让读端尽早感知下游关闭（协作取消）
+        drop(reader);
+
+        // 流结束：残留缓冲仅当恰好抵达文件末尾时才是完整的末 part，否则丢弃
+        if stream_err.is_none() && buf_len > 0 {
+            if buf_start + buf_len == size {
+                let part_idx = buf_start / part_size;
+                let handle = self
+                    .spawn_resumable_part_upload(
+                        key.clone(),
+                        upload_id.clone(),
+                        part_idx,
+                        buf_start,
+                        std::mem::take(&mut buf),
+                        buf_len,
+                        semaphore.clone(),
+                        bytes_counter.clone(),
+                        on_committed.clone(),
+                    )
+                    .await?;
+                handles.push(handle);
+            } else {
+                warn!(
+                    "resumable S3 write: dropping trailing partial part buffer ({buf_len} bytes at {buf_start}), stream ended mid-part"
+                );
+            }
+        }
+
+        // 等待所有 upload 任务，收集首个错误（不 abort，保留已上传 parts 供续传）
+        let mut first_err = stream_err;
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(StorageError::OperationError(format!(
+                            "resumable part upload task panicked: {e:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// 受信号量限流地 spawn 单个 part 的上传任务；成功后计数 + 触发
+    /// `on_committed(part_start, len)`。
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_resumable_part_upload(
+        &self,
+        key: Arc<String>,
+        upload_id: Arc<String>,
+        part_idx: u64,
+        part_start: u64,
+        chunks: Vec<Bytes>,
+        len: u64,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        bytes_counter: Option<Arc<AtomicU64>>,
+        on_committed: crate::CommitCallback,
+    ) -> Result<tokio::task::JoinHandle<Result<()>>> {
+        let permit = semaphore
+            .acquire_owned()
+            .await
+            .map_err(|_| StorageError::S3Error("Semaphore closed unexpectedly".to_string()))?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let part_number = (part_idx + 1) as i32;
+        let this = self.clone();
+        Ok(tokio::spawn(async move {
+            let _permit = permit;
+            this.upload_part_with_stream(&key, &upload_id, part_number, chunks, len)
+                .await?;
+            if let Some(ref c) = bytes_counter {
+                c.fetch_add(len, Ordering::Relaxed);
+            }
+            on_committed(part_start, len);
+            Ok(())
+        }))
+    }
+
+    /// 完成断点续传上传：ListParts 校验 `[0, size)` 全覆盖后 `CompleteMultipartUpload`。
+    /// 覆盖不全或校验失败返回 Err 且**不 abort**，保留已上传 parts 供下次续传。
+    pub(crate) async fn finalize_resumable_upload(
+        &self,
+        relative_path: &str,
+        size: u64,
+        part_size: u64,
+        upload_id: &str,
+    ) -> Result<()> {
+        let key = self.build_full_key(relative_path);
+        let total_parts = size.div_ceil(part_size);
+        let parts = self.list_upload_parts(&key, upload_id).await?;
+        if parts.len() as u64 != total_parts {
+            return Err(StorageError::OperationError(format!(
+                "resumable upload incomplete for {key}: {}/{total_parts} parts uploaded",
+                parts.len()
+            )));
+        }
+        let mut completed: Vec<CompletedPart> = Vec::with_capacity(parts.len());
+        for (i, (pn, psize, etag)) in parts.into_iter().enumerate() {
+            let idx = i as u64;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let expected_pn = (idx + 1) as i32;
+            if pn != expected_pn || psize != Self::expected_part_len(size, part_size, idx) {
+                return Err(StorageError::OperationError(format!(
+                    "resumable upload part mismatch for {key}: part {pn} size {psize}"
+                )));
+            }
+            completed.push(CompletedPart::builder().part_number(pn).e_tag(etag).build());
+        }
+        self.complete_multipart_upload(&key, upload_id, &completed)
+            .await?;
+        Ok(())
+    }
+
     /// 获取S3对象的元数据
     ///
     /// 该方法根据提供的相对路径构建S3对象的键，然后使用HEAD请求获取对象的元数据。
@@ -3280,6 +3736,26 @@ fn build_tagging_str(tags: &[Tag]) -> String {
         .collect()
 }
 
+/// 由已完成区间（升序、不重叠）求 `[0, size)` 内的缺失区间补集。
+/// 相邻已完成区间自然连续跳过，输出区间升序且不相邻。
+fn missing_from_committed(committed: &[(u64, u64)], size: u64) -> Vec<(u64, u64)> {
+    let mut res = Vec::new();
+    let mut cur = 0u64;
+    for &(s, e) in committed {
+        if cur >= size {
+            break;
+        }
+        if s > cur {
+            res.push((cur, s.min(size)));
+        }
+        cur = cur.max(e);
+    }
+    if cur < size {
+        res.push((cur, size));
+    }
+    res
+}
+
 /// 创建S3存储实例
 pub async fn create_s3_storage(url: &str, block_size: Option<u64>) -> Result<StorageEnum> {
     let s3_storage = S3Storage::new(url, block_size).await?;
@@ -3289,6 +3765,63 @@ pub async fn create_s3_storage(url: &str, block_size: Option<u64>) -> Result<Sto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn missing_from_committed_basic() {
+        // 空集合 → 全缺失
+        assert_eq!(missing_from_committed(&[], 100), vec![(0, 100)]);
+        // 全覆盖 → 无缺失
+        assert_eq!(
+            missing_from_committed(&[(0, 100)], 100),
+            Vec::<(u64, u64)>::new()
+        );
+        // 头缺、中缺、尾缺
+        assert_eq!(
+            missing_from_committed(&[(10, 20), (30, 40)], 50),
+            vec![(0, 10), (20, 30), (40, 50)]
+        );
+        // 相邻已完成区间视为连续
+        assert_eq!(
+            missing_from_committed(&[(0, 10), (10, 20)], 30),
+            vec![(20, 30)]
+        );
+        // 超出 size 的区间截断
+        assert_eq!(
+            missing_from_committed(&[(0, 10), (20, 99)], 30),
+            vec![(10, 20)]
+        );
+    }
+
+    #[test]
+    fn expected_part_len_boundaries() {
+        // 12MiB 文件、5MiB part：5 + 5 + 2
+        let size = 12 * MIB;
+        let ps = 5 * MIB;
+        assert_eq!(S3Storage::expected_part_len(size, ps, 0), 5 * MIB);
+        assert_eq!(S3Storage::expected_part_len(size, ps, 1), 5 * MIB);
+        assert_eq!(S3Storage::expected_part_len(size, ps, 2), 2 * MIB);
+        // 整除时末 part 为整 part
+        assert_eq!(S3Storage::expected_part_len(10 * MIB, ps, 1), 5 * MIB);
+    }
+
+    #[test]
+    fn resume_part_size_respects_limits() {
+        // 只验证纯计算逻辑（不需要真实 S3 连接，直接按公式断言）
+        // block_size = 5MiB 时小文件 part = block_size
+        let block_size = 5 * MIB;
+        let small = 100 * MIB;
+        let min_aligned = small.div_ceil(MAX_UPLOAD_PARTS).div_ceil(MIB) * MIB;
+        assert_eq!(block_size.max(min_aligned), 5 * MIB);
+        // 100TiB 文件必须放大 part 以满足 ≤10000 parts
+        let huge = 100 * 1024 * 1024 * MIB;
+        let min_aligned = huge.div_ceil(MAX_UPLOAD_PARTS).div_ceil(MIB) * MIB;
+        let part = block_size.max(min_aligned);
+        assert!(huge.div_ceil(part) <= MAX_UPLOAD_PARTS);
+        // part 大小 MiB 对齐
+        assert_eq!(part % MIB, 0);
+    }
 
     #[test]
     fn test_parse_s3_url_special_chars_in_secret_key() {

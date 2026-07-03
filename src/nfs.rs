@@ -2268,205 +2268,109 @@ impl NFSStorage {
         package_depth: usize,
         package_remaining: Option<usize>,
     ) -> Result<bool> {
-            if entry.file_name == "." || entry.file_name == ".." {
-                return Ok(true);
-            }
+        if entry.file_name == "." || entry.file_name == ".." {
+            return Ok(true);
+        }
 
-            // 构建完整路径（使用 '/' 拼接，避免平台差异）
-            let relative_path = self.build_relative_path(&dir_path, &entry.file_name);
+        // 构建完整路径（使用 '/' 拼接，避免平台差异）
+        let relative_path = self.build_relative_path(&dir_path, &entry.file_name);
 
-            // 提取扩展名（在 file_name 被 move 前提取）
-            let extension = entry
-                .file_name
-                .rsplit_once('.')
-                .map(|(_, ext)| ext.to_string());
+        // 提取扩展名（在 file_name 被 move 前提取）
+        let extension = entry
+            .file_name
+            .rsplit_once('.')
+            .map(|(_, ext)| ext.to_string());
 
-            // 提取文件名（完整文件名）
-            let file_name = &entry.file_name;
+        // 提取文件名（完整文件名）
+        let file_name = &entry.file_name;
 
-            let attrs = if let Some(attr) = entry.attr {
-                attr
-            } else {
-                // Fallback: try standalone GETATTR when inline attrs from READDIRPLUS failed
-                warn!(
-                    "[Producer {}] Missing inline attrs for {}, trying fallback GETATTR",
-                    producer_id, relative_path
-                );
-                match self.mount.getattr_path(&relative_path).await {
-                    Ok(attr) => attr,
-                    Err(e) => {
-                        error!(
-                            "[Producer {}] Fallback GETATTR also failed for {}: {}",
-                            producer_id, relative_path, e
-                        );
-                        let _ = tx
-                            .send(StorageEntryMessage::Error {
-                                event: ErrorEvent::Scan,
-                                path: PathBuf::from(&relative_path),
-                                reason: format!("[Producer {producer_id}] Missing file attributes: {relative_path}"),
-                            })
-                            .await;
-                        return Ok(true);
-                    }
-                }
-            };
-
-            let file_type = attrs.type_;
-            let is_dir = file_type == FType3::NF3DIR as u32;
-            let is_symlink = file_type == FType3::NF3LNK as u32;
-
-            // 一次性过滤：基于文件名、路径、文件类型、大小和修改时间
-            let (skip_entry, continue_scan, need_submatch) = if skip_filter {
-                // 获取修改时间的 epoch seconds
-                let modified_epoch = Some(i64::from(attrs.mtime.seconds));
-
-                // root 已为空串或无前导 '/' 前缀，relative_path 直接就是相对路径
-                let normalized_path = &relative_path;
-                should_skip(
-                    match_expr.as_ref().as_ref(),
-                    exclude_expr.as_ref().as_ref(),
-                    Some(file_name),
-                    Some(normalized_path),
-                    Some(if is_symlink {
-                        "symlink"
-                    } else if is_dir {
-                        "dir"
-                    } else {
-                        "file"
-                    }),
-                    modified_epoch,
-                    Some(attrs.filesize),
-                    extension.as_deref().or(Some("")),
-                )
-            } else {
-                // skip_filter=false 表示父目录已匹配，子项无需过滤
-                // need_submatch=false 确保免过滤传递给所有后代
-                (false, true, false)
-            };
-
-            // 计算条目的实际深度：目录深度+1
-            let entry_depth = current_depth + 1;
-            let mut send_packaged = false;
-
-            // package 深度追踪模式：只处理目录，跳过文件和 filter
-            if let Some(remaining) = package_remaining {
-                if !is_dir {
-                    return Ok(true);
-                }
-                if remaining > 1 {
-                    ctx.push_task((
-                        relative_path.clone(),
-                        entry.handle.clone(),
-                        current_depth + 1,
-                        false,
-                        Some(remaining - 1),
-                    ))
-                    .await;
-                    return Ok(true);
-                }
-                send_packaged = true;
-            }
-
-            if !send_packaged && skip_entry {
-                if continue_scan && is_dir && (current_depth < max_depth || max_depth == 0) {
-                    ctx.push_task((
-                        relative_path.clone(),
-                        entry.handle.clone(),
-                        current_depth + 1,
-                        need_submatch,
-                        None,
-                    ))
-                    .await;
-                }
-                return Ok(true);
-            }
-
-            // 创建StorageEntry
-            // Read xattrs if supported (before consuming entry.file_name)
-            let xattrs = if self.supports_xattr() {
-                let path = Path::new(&relative_path);
-                match self.list_xattr(path).await {
-                    Ok(names) if !names.is_empty() => {
-                        let mut pairs = Vec::with_capacity(names.len());
-                        for name in &names {
-                            match self.get_xattr(path, name).await {
-                                Ok(value) => pairs.push((name.clone(), value.to_vec())),
-                                Err(e) => warn!(
-                                    "[Producer {}] Failed to read xattr '{}' for {}: {}",
-                                    producer_id, name, relative_path, e
-                                ),
-                            }
-                        }
-                        if pairs.is_empty() { None } else { Some(pairs) }
-                    }
-                    Ok(_) => None,
-                    Err(e) => {
-                        trace!(
-                            "[Producer {}] listxattr for {} failed: {}",
-                            producer_id, relative_path, e
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            let storage_entry = EntryEnum::NAS(NASEntry::from_nfs_attrs(
-                entry.file_name,
-                PathBuf::from(&relative_path),
-                extension.clone(),
-                &attrs,
-                entry.handle.clone(),
-                NfsEnrich::from_attrs(&attrs).with_xattrs(xattrs),
-            ));
-
-            // packaged 模式：目录匹配 DirDate 条件时决定打包策略
-            if !send_packaged
-                && packaged
-                && is_dir
-                && dir_matches_date_filter(match_expr.as_ref().as_ref(), storage_entry.get_name())
-            {
-                if max_depth > 0 && entry_depth + package_depth > max_depth {
-                    return Ok(true);
-                }
-                if package_depth > 0 {
-                    ctx.push_task((
-                        relative_path.clone(),
-                        entry.handle.clone(),
-                        current_depth + 1,
-                        false,
-                        Some(package_depth),
-                    ))
-                    .await;
-                    return Ok(true);
-                }
-                send_packaged = true;
-            }
-
-            // 统一的 Packaged 发送
-            if send_packaged {
-                debug!(
-                    "[Producer {}] Packaged dir {} (depth: {})",
-                    producer_id, relative_path, entry_depth
-                );
-                total_file_count.fetch_add(1, Ordering::Relaxed);
-                if tx
-                    .send(StorageEntryMessage::Packaged(Arc::new(storage_entry)))
-                    .await
-                    .is_err()
-                {
+        let attrs = if let Some(attr) = entry.attr {
+            attr
+        } else {
+            // Fallback: try standalone GETATTR when inline attrs from READDIRPLUS failed
+            warn!(
+                "[Producer {}] Missing inline attrs for {}, trying fallback GETATTR",
+                producer_id, relative_path
+            );
+            match self.mount.getattr_path(&relative_path).await {
+                Ok(attr) => attr,
+                Err(e) => {
                     error!(
-                        "[Producer {}] Output channel closed, stopping processing",
-                        producer_id
+                        "[Producer {}] Fallback GETATTR also failed for {}: {}",
+                        producer_id, relative_path, e
                     );
-                    return Ok(false);
+                    let _ = tx
+                        .send(StorageEntryMessage::Error {
+                            event: ErrorEvent::Scan,
+                            path: PathBuf::from(&relative_path),
+                            reason: format!(
+                                "[Producer {producer_id}] Missing file attributes: {relative_path}"
+                            ),
+                        })
+                        .await;
+                    return Ok(true);
                 }
+            }
+        };
+
+        let file_type = attrs.type_;
+        let is_dir = file_type == FType3::NF3DIR as u32;
+        let is_symlink = file_type == FType3::NF3LNK as u32;
+
+        // 一次性过滤：基于文件名、路径、文件类型、大小和修改时间
+        let (skip_entry, continue_scan, need_submatch) = if skip_filter {
+            // 获取修改时间的 epoch seconds
+            let modified_epoch = Some(i64::from(attrs.mtime.seconds));
+
+            // root 已为空串或无前导 '/' 前缀，relative_path 直接就是相对路径
+            let normalized_path = &relative_path;
+            should_skip(
+                match_expr.as_ref().as_ref(),
+                exclude_expr.as_ref().as_ref(),
+                Some(file_name),
+                Some(normalized_path),
+                Some(if is_symlink {
+                    "symlink"
+                } else if is_dir {
+                    "dir"
+                } else {
+                    "file"
+                }),
+                modified_epoch,
+                Some(attrs.filesize),
+                extension.as_deref().or(Some("")),
+            )
+        } else {
+            // skip_filter=false 表示父目录已匹配，子项无需过滤
+            // need_submatch=false 确保免过滤传递给所有后代
+            (false, true, false)
+        };
+
+        // 计算条目的实际深度：目录深度+1
+        let entry_depth = current_depth + 1;
+        let mut send_packaged = false;
+
+        // package 深度追踪模式：只处理目录，跳过文件和 filter
+        if let Some(remaining) = package_remaining {
+            if !is_dir {
                 return Ok(true);
             }
+            if remaining > 1 {
+                ctx.push_task((
+                    relative_path.clone(),
+                    entry.handle.clone(),
+                    current_depth + 1,
+                    false,
+                    Some(remaining - 1),
+                ))
+                .await;
+                return Ok(true);
+            }
+            send_packaged = true;
+        }
 
-            // 如果是目录且未达到最大深度，将其添加到任务队列
-            if is_dir && (current_depth < max_depth || max_depth == 0) {
+        if !send_packaged && skip_entry {
+            if continue_scan && is_dir && (current_depth < max_depth || max_depth == 0) {
                 ctx.push_task((
                     relative_path.clone(),
                     entry.handle.clone(),
@@ -2476,26 +2380,124 @@ impl NFSStorage {
                 ))
                 .await;
             }
+            return Ok(true);
+        }
 
-            // 检查深度限制：只有当条目深度在允许范围内时才发送
-            // 0表示无限深度
-            if max_depth == 0 || entry_depth <= max_depth {
-                // 更新全局文件计数器
-                total_file_count.fetch_add(1, Ordering::Relaxed);
-
-                // 发送StorageEntry到输出通道
-                if tx
-                    .send(StorageEntryMessage::Scanned(Arc::new(storage_entry)))
-                    .await
-                    .is_err()
-                {
-                    error!(
-                        "[Producer {}] Output channel closed, stopping processing",
-                        producer_id
+        // 创建StorageEntry
+        // Read xattrs if supported (before consuming entry.file_name)
+        let xattrs = if self.supports_xattr() {
+            let path = Path::new(&relative_path);
+            match self.list_xattr(path).await {
+                Ok(names) if !names.is_empty() => {
+                    let mut pairs = Vec::with_capacity(names.len());
+                    for name in &names {
+                        match self.get_xattr(path, name).await {
+                            Ok(value) => pairs.push((name.clone(), value.to_vec())),
+                            Err(e) => warn!(
+                                "[Producer {}] Failed to read xattr '{}' for {}: {}",
+                                producer_id, name, relative_path, e
+                            ),
+                        }
+                    }
+                    if pairs.is_empty() { None } else { Some(pairs) }
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    trace!(
+                        "[Producer {}] listxattr for {} failed: {}",
+                        producer_id, relative_path, e
                     );
-                    return Ok(false);
+                    None
                 }
             }
+        } else {
+            None
+        };
+
+        let storage_entry = EntryEnum::NAS(NASEntry::from_nfs_attrs(
+            entry.file_name,
+            PathBuf::from(&relative_path),
+            extension.clone(),
+            &attrs,
+            entry.handle.clone(),
+            NfsEnrich::from_attrs(&attrs).with_xattrs(xattrs),
+        ));
+
+        // packaged 模式：目录匹配 DirDate 条件时决定打包策略
+        if !send_packaged
+            && packaged
+            && is_dir
+            && dir_matches_date_filter(match_expr.as_ref().as_ref(), storage_entry.get_name())
+        {
+            if max_depth > 0 && entry_depth + package_depth > max_depth {
+                return Ok(true);
+            }
+            if package_depth > 0 {
+                ctx.push_task((
+                    relative_path.clone(),
+                    entry.handle.clone(),
+                    current_depth + 1,
+                    false,
+                    Some(package_depth),
+                ))
+                .await;
+                return Ok(true);
+            }
+            send_packaged = true;
+        }
+
+        // 统一的 Packaged 发送
+        if send_packaged {
+            debug!(
+                "[Producer {}] Packaged dir {} (depth: {})",
+                producer_id, relative_path, entry_depth
+            );
+            total_file_count.fetch_add(1, Ordering::Relaxed);
+            if tx
+                .send(StorageEntryMessage::Packaged(Arc::new(storage_entry)))
+                .await
+                .is_err()
+            {
+                error!(
+                    "[Producer {}] Output channel closed, stopping processing",
+                    producer_id
+                );
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+
+        // 如果是目录且未达到最大深度，将其添加到任务队列
+        if is_dir && (current_depth < max_depth || max_depth == 0) {
+            ctx.push_task((
+                relative_path.clone(),
+                entry.handle.clone(),
+                current_depth + 1,
+                need_submatch,
+                None,
+            ))
+            .await;
+        }
+
+        // 检查深度限制：只有当条目深度在允许范围内时才发送
+        // 0表示无限深度
+        if max_depth == 0 || entry_depth <= max_depth {
+            // 更新全局文件计数器
+            total_file_count.fetch_add(1, Ordering::Relaxed);
+
+            // 发送StorageEntry到输出通道
+            if tx
+                .send(StorageEntryMessage::Scanned(Arc::new(storage_entry)))
+                .await
+                .is_err()
+            {
+                error!(
+                    "[Producer {}] Output channel closed, stopping processing",
+                    producer_id
+                );
+                return Ok(false);
+            }
+        }
 
         Ok(true)
     }
