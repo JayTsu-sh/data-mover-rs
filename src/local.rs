@@ -786,23 +786,17 @@ impl LocalStorage {
             data.len()
         );
         let length = data.len();
+        let mut data = data;
 
         file.inner.seek(std::io::SeekFrom::Start(offset)).await?;
-        let written = file
-            .inner
-            .write_buf(&mut std::io::Cursor::new(data))
-            .await?;
+        // write_all_buf 循环写直到写完：tokio::fs::File 单次 write 最多推进其内部
+        // 缓冲上限（2MiB），单次 write_buf 对 >2MiB 的 chunk（如 S3 源 5MiB 块、
+        // CIFS 源 8MiB 块）必然短写。
+        file.inner.write_all_buf(&mut data).await?;
 
-        if written != length {
-            return Err(StorageError::IoError(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                format!("Incomplete write: expected {length} bytes, wrote {written} bytes"),
-            )));
-        }
+        trace!("Wrote {} bytes at offset {}", length, offset);
 
-        trace!("Wrote {} bytes at offset {}", written, offset);
-
-        Ok(written)
+        Ok(length)
     }
 
     pub(crate) async fn read_file(&self, path: &Path, size: u64) -> Result<Bytes> {
