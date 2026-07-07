@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 /// 哈希计算 / 大文件读取 pipeline 的 channel 容量（读写并行，4 个 chunk 缓冲）
@@ -33,8 +34,8 @@ use crate::qos::QosManager;
 use crate::s3::{S3Storage, create_s3_storage};
 use crate::tar_pack::{build_header_for_entry, tar_eof_marker, tar_padding};
 use crate::{
-    DataChunk, DeleteDirIterator, EntryEnum, Result, ResumeContext, WalkDirAsyncIterator,
-    WalkDirAsyncIterator2,
+    CommitCallback, DataChunk, DeleteDirIterator, EntryEnum, Result, ResumeContext,
+    WalkDirAsyncIterator, WalkDirAsyncIterator2,
 };
 
 /// 存储类型枚举
@@ -53,6 +54,23 @@ pub enum StorageEnum {
     NFS(NFSStorage),
     S3(S3Storage),
     CIFS(CifsStorage),
+}
+
+/// 字节级续传的目标端流式写句柄（issue #21：`resume_prepare` 产出，
+/// `write_chunk_stream`/`commit_chunk_stream` 消费）。跨 transport 传递
+/// （双进程场景下 Receiver 侧 prepare、由 Sender 侧对称使用同一份区间信息），
+/// 故派生 `Serialize`/`Deserialize`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StreamHandle {
+    /// NAS（Local/NFS/CIFS）目标端：写 `.part` 临时文件；
+    /// commit = `set_file_len` + `rename`。
+    Nas { part_path: PathBuf },
+    /// S3 目标端：写 in-progress multipart upload；commit = `CompleteMultipartUpload`。
+    S3 {
+        upload_id: String,
+        part_size: u64,
+        dst_key: String,
+    },
 }
 
 impl StorageEnum {
@@ -879,6 +897,297 @@ impl StorageEnum {
         }
 
         Ok(())
+    }
+
+    // ========================================================
+    // 字节级续传三段式 API（issue #21）：resume_prepare / read_chunk_stream /
+    // write_chunk_stream / commit_chunk_stream。
+    //
+    // 拆分动机：双进程场景下 Receiver 持目标端（负责 prepare 定缺失区间 +
+    // write 落盘）、Sender 持源端（负责按缺失区间 read），三段必须能独立
+    // 跨 transport 调用，不能像融合式 `copy_file_resumable` 那样揉在一个
+    // 进程内完成。内部全部复用各后端已有的 `write_data_resumable` /
+    // `prepare_resumable_upload` / `finalize_resumable_upload` /
+    // `set_file_len` / `rename`，不新写落盘逻辑；S3 内部实现零改动，仅在此
+    // 处新增公开壳做 dispatch。
+    // ========================================================
+
+    /// ① 准备：确定临时载体 + 反推/加载缺失区间。
+    ///
+    /// - S3 目标端：`resume` 参数无意义——S3 自身状态（ListParts）即续传进度
+    ///   真值，直接复用 `prepare_resumable_upload`（无 in-progress upload 时
+    ///   自动视为全新，等价于 `resume=false`）。
+    /// - NAS 目标端：`resume=false` 或 `.part` 不存在时，missing 为全量
+    ///   `[(0, size)]`；`.part` 存在时按其当前文件长度反推：
+    ///   `len < size` → `[(len, size)]`（续传剩余部分）；
+    ///   `len == size` → `[]`（已写满，无需再传）；
+    ///   `len > size` → `[(0, size)]`（残留脏数据，视为不可信，全量重写）。
+    pub async fn resume_prepare(
+        dest: &StorageEnum,
+        entry: &EntryEnum,
+        part_path: &Path,
+        resume: bool,
+    ) -> Result<(Vec<(u64, u64)>, StreamHandle)> {
+        let size = entry.get_size();
+
+        if let StorageEnum::S3(to_s3) = dest {
+            let (dst_rel, tags) = match entry {
+                EntryEnum::S3(e) => (e.relative_path.clone(), e.tags.clone()),
+                EntryEnum::NAS(e) => (path_to_s3_key(&e.relative_path).into_owned(), None),
+            };
+            let part_size = to_s3.resume_part_size(size);
+            let (upload_id, missing) = to_s3
+                .prepare_resumable_upload(&dst_rel, size, part_size, tags.as_ref())
+                .await?;
+            return Ok((
+                missing,
+                StreamHandle::S3 {
+                    upload_id,
+                    part_size,
+                    dst_key: dst_rel,
+                },
+            ));
+        }
+
+        let missing = if resume {
+            match dest.get_metadata(part_path).await {
+                Ok(existing) => {
+                    let existing_len = existing.get_size();
+                    match existing_len.cmp(&size) {
+                        std::cmp::Ordering::Less => vec![(existing_len, size)],
+                        std::cmp::Ordering::Equal => vec![],
+                        std::cmp::Ordering::Greater => vec![(0, size)],
+                    }
+                }
+                Err(_) => vec![(0, size)], // .part 不存在：视为全新
+            }
+        } else {
+            vec![(0, size)]
+        };
+
+        Ok((
+            missing,
+            StreamHandle::Nas {
+                part_path: part_path.to_path_buf(),
+            },
+        ))
+    }
+
+    /// ② 写：从 `rx` 收 `DataChunk` 写入临时载体（`.part` 或 multipart
+    /// upload），每 chunk/part 落盘确认后触发 `on_committed`。不做提交
+    /// （rename/Complete）、不做 hash 校验、不删源。
+    pub async fn write_chunk_stream(
+        dest: &StorageEnum,
+        entry: &EntryEnum,
+        rx: mpsc::Receiver<DataChunk>,
+        handle: &StreamHandle,
+        bytes_counter: Option<Arc<AtomicU64>>,
+        on_committed: CommitCallback,
+    ) -> Result<()> {
+        match handle {
+            StreamHandle::S3 {
+                upload_id,
+                part_size,
+                dst_key,
+            } => {
+                let StorageEnum::S3(to_s3) = dest else {
+                    return Err(StorageError::OperationError(
+                        "write_chunk_stream: S3 StreamHandle requires an S3 destination"
+                            .to_string(),
+                    ));
+                };
+                to_s3
+                    .write_data_resumable(
+                        rx,
+                        dst_key,
+                        entry.get_size(),
+                        *part_size,
+                        upload_id,
+                        bytes_counter,
+                        on_committed,
+                    )
+                    .await
+            }
+            StreamHandle::Nas { part_path } => match (dest, entry) {
+                (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
+                    s.write_data_resumable(
+                        rx,
+                        part_path,
+                        e.uid,
+                        e.gid,
+                        Some(e.mode),
+                        bytes_counter,
+                        on_committed,
+                    )
+                    .await
+                }
+                (StorageEnum::Local(s), EntryEnum::S3(_)) => {
+                    s.write_data_resumable(
+                        rx,
+                        part_path,
+                        None,
+                        None,
+                        None,
+                        bytes_counter,
+                        on_committed,
+                    )
+                    .await
+                }
+                (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
+                    s.write_data_resumable(
+                        rx,
+                        part_path,
+                        e.uid,
+                        e.gid,
+                        Some(e.mode),
+                        bytes_counter,
+                        on_committed,
+                    )
+                    .await
+                }
+                (StorageEnum::NFS(s), EntryEnum::S3(_)) => {
+                    s.write_data_resumable(
+                        rx,
+                        part_path,
+                        None,
+                        None,
+                        None,
+                        bytes_counter,
+                        on_committed,
+                    )
+                    .await
+                }
+                (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
+                    s.write_data_resumable(
+                        rx,
+                        part_path,
+                        e.uid,
+                        e.gid,
+                        Some(e.mode),
+                        bytes_counter,
+                        on_committed,
+                    )
+                    .await
+                }
+                (StorageEnum::CIFS(s), EntryEnum::S3(_)) => {
+                    s.write_data_resumable(
+                        rx,
+                        part_path,
+                        None,
+                        None,
+                        None,
+                        bytes_counter,
+                        on_committed,
+                    )
+                    .await
+                }
+                (StorageEnum::S3(_), _) => Err(StorageError::OperationError(
+                    "write_chunk_stream: Nas StreamHandle used with an S3 destination".to_string(),
+                )),
+            },
+        }
+    }
+
+    /// 对称只读：源端按缺失区间（`intervals=Some`，续传）或整文件（`intervals=None`，
+    /// 全量）分块读，`rx` 转发给 transport；`intervals=None` 时返回的
+    /// `JoinHandle` 收尾带上整文件 hash（`enable_integrity_check` 时）。
+    /// `intervals=Some` 时续传无需逐块 hash（完整性走收尾的端到端校验），
+    /// 恒返回 `None`。
+    pub fn read_chunk_stream(
+        from: &StorageEnum,
+        entry: &EntryEnum,
+        intervals: Option<Vec<(u64, u64)>>,
+        qos: Option<QosManager>,
+        enable_integrity_check: bool,
+        capacity: usize,
+    ) -> (
+        mpsc::Receiver<DataChunk>,
+        tokio::task::JoinHandle<Result<Option<HashCalculator>>>,
+    ) {
+        let (tx, rx) = mpsc::channel::<DataChunk>(capacity);
+        let from_c = from.clone();
+        let entry_c = entry.clone();
+        let handle = tokio::spawn(async move {
+            match intervals {
+                Some(ivals) => match (&from_c, &entry_c) {
+                    (StorageEnum::Local(s), EntryEnum::NAS(e)) => s
+                        .read_data_intervals(tx, &e.relative_path, &ivals, qos)
+                        .await
+                        .map(|()| None),
+                    (StorageEnum::NFS(s), EntryEnum::NAS(e)) => s
+                        .read_data_intervals(tx, &e.relative_path, &ivals, qos)
+                        .await
+                        .map(|()| None),
+                    (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => s
+                        .read_data_intervals(tx, &e.relative_path, &ivals, qos)
+                        .await
+                        .map(|()| None),
+                    (StorageEnum::S3(s), EntryEnum::S3(e)) => s
+                        .read_data_intervals(tx, &e.relative_path, &ivals, qos)
+                        .await
+                        .map(|()| None),
+                    _ => Err(StorageError::OperationError(format!(
+                        "read_chunk_stream: unsupported source/entry combination: {entry_c:?}"
+                    ))),
+                },
+                None => {
+                    let size = entry_c.get_size();
+                    match (&from_c, &entry_c) {
+                        (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
+                            s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
+                                .await
+                        }
+                        (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
+                            s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
+                                .await
+                        }
+                        (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
+                            s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
+                                .await
+                        }
+                        (StorageEnum::S3(s), EntryEnum::S3(e)) => {
+                            s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
+                                .await
+                        }
+                        _ => Err(StorageError::OperationError(format!(
+                            "read_chunk_stream: unsupported source/entry combination: {entry_c:?}"
+                        ))),
+                    }
+                }
+            }
+        });
+        (rx, handle)
+    }
+
+    /// ③ 提交：hash 校验通过后调用方触发原子提交（NAS `set_file_len` + `rename`；
+    /// S3 `CompleteMultipartUpload`）。
+    pub async fn commit_chunk_stream(
+        dest: &StorageEnum,
+        entry: &EntryEnum,
+        size: u64,
+        handle: StreamHandle,
+    ) -> Result<()> {
+        match handle {
+            StreamHandle::Nas { part_path } => {
+                dest.set_file_len(&part_path, size).await?;
+                dest.rename(&part_path, entry.get_relative_path()).await
+            }
+            StreamHandle::S3 {
+                upload_id,
+                part_size,
+                dst_key,
+            } => {
+                let StorageEnum::S3(to_s3) = dest else {
+                    return Err(StorageError::OperationError(
+                        "commit_chunk_stream: S3 StreamHandle requires an S3 destination"
+                            .to_string(),
+                    ));
+                };
+                to_s3
+                    .finalize_resumable_upload(&dst_key, size, part_size, &upload_id)
+                    .await
+            }
+        }
     }
 
     /// 字节级断点续传复制（仅多块大文件，源端：Local/NFS/CIFS/S3，目标端：全部后端）。

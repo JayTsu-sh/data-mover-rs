@@ -12,7 +12,7 @@ terrasync-rs PR#B 不在本计划内。
   write_pipeline_core），NFS/CIFS/Local 三个 write_data/write_data_resumable
   收薄为 sink + wrapper。T1（现有 test_copy_file_resume.rs/test_copy_file_cancel.rs
   全绿）
-- ⬜ step 3: feat(storage): storage_enum.rs 新增 StreamHandle(+Serde) /
+- ✅ step 3: feat(storage): storage_enum.rs 新增 StreamHandle(+Serde) /
   resume_prepare / write_chunk_stream / commit_chunk_stream / read_chunk_stream，
   复用现有 write_data_resumable/prepare_resumable_upload/finalize_resumable_upload/
   set_file_len/rename
