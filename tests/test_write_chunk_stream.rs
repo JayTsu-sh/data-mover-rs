@@ -4,6 +4,7 @@
 //! Local-only — no S3/NFS server required. S3 特有分支（part 对齐、
 //! non-contiguous 报错、`ListParts` 反推）与 NFS/CIFS 的落盘语义差异需要真实
 //! 存储环境，未在本地覆盖；由 issue #21 测试计划标注为需在有存储环境时补跑。
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};

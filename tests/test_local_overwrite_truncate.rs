@@ -6,6 +6,7 @@
 //! 残留旧内容的尾部字节（数据损坏）。
 //!
 //! Local-only — no S3/NFS server required.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::Path;
 
