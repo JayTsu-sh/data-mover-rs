@@ -16,7 +16,7 @@ terrasync-rs PR#B 不在本计划内。
   resume_prepare / write_chunk_stream / commit_chunk_stream / read_chunk_stream，
   复用现有 write_data_resumable/prepare_resumable_upload/finalize_resumable_upload/
   set_file_len/rename
-- ⬜ step 4: refactor: copy_file_resumable(+_to_s3) 重写在三段之上；
+- ✅ step 4: refactor: copy_file_resumable(+_to_s3) 重写在三段之上；
   copy_file/pack_files_to_tar 不动。T1 复跑确认仍绿
 - ⬜ step 5: 加 T2–T5 单测（write_chunk_stream 顺序写原子提交 / 乱序缺失重复 chunk /
   中途 drop rx 重跑续传 / hash mismatch 不提交）

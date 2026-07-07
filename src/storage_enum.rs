@@ -1232,135 +1232,42 @@ impl StorageEnum {
             missing_intervals,
             on_committed,
         } = resume;
+        // NAS 目标端：沿用调用方给定的 missing_intervals（不重新用 resume_prepare
+        // 推断——融合式 API 向后兼容，caller 的状态文件才是既有行为下的进度真值）。
+        let handle = StreamHandle::Nas {
+            part_path: part_relative_path.clone(),
+        };
 
-        // ── 源端：只读缺失区间 ──
-        let (tx, rx) = mpsc::channel::<DataChunk>(COPY_PIPELINE_CAPACITY);
-        let from_c = from.clone();
-        let entry_r = entry.clone();
-        let intervals = missing_intervals;
-        let qos_r = qos;
-        let read_task = tokio::spawn(async move {
-            match (&from_c, &entry_r) {
-                (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
-                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
-                        .await
-                }
-                (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
-                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
-                        .await
-                }
-                (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
-                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
-                        .await
-                }
-                (StorageEnum::S3(s), EntryEnum::S3(e)) => {
-                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
-                        .await
-                }
-                _ => Err(StorageError::OperationError(format!(
-                    "resumable copy unsupported source/entry combination: {entry_r:?}"
-                ))),
-            }
-        });
+        // ── 源端：只读缺失区间（read_chunk_stream 内部 spawn）──
+        let (rx, read_handle) = Self::read_chunk_stream(
+            from,
+            entry,
+            Some(missing_intervals),
+            qos,
+            false,
+            COPY_PIPELINE_CAPACITY,
+        );
 
         // ── 目标端：续写 .part ──
         let to_c = to.clone();
         let entry_w = entry.clone();
-        let part = part_relative_path.clone();
-        let bytes_counter_w = bytes_counter;
-        let write_task = tokio::spawn(async move {
-            match (&to_c, &entry_w) {
-                (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
-                    s.write_data_resumable(
-                        rx,
-                        &part,
-                        e.uid,
-                        e.gid,
-                        Some(e.mode),
-                        bytes_counter_w,
-                        on_committed,
-                    )
-                    .await
-                }
-                (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
-                    s.write_data_resumable(
-                        rx,
-                        &part,
-                        e.uid,
-                        e.gid,
-                        Some(e.mode),
-                        bytes_counter_w,
-                        on_committed,
-                    )
-                    .await
-                }
-                (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
-                    s.write_data_resumable(
-                        rx,
-                        &part,
-                        e.uid,
-                        e.gid,
-                        Some(e.mode),
-                        bytes_counter_w,
-                        on_committed,
-                    )
-                    .await
-                }
-                // S3 → NAS：S3 对象无 uid/gid/mode，全部 None（与 copy_file 一致）
-                (StorageEnum::Local(s), EntryEnum::S3(_)) => {
-                    s.write_data_resumable(
-                        rx,
-                        &part,
-                        None,
-                        None,
-                        None,
-                        bytes_counter_w,
-                        on_committed,
-                    )
-                    .await
-                }
-                (StorageEnum::NFS(s), EntryEnum::S3(_)) => {
-                    s.write_data_resumable(
-                        rx,
-                        &part,
-                        None,
-                        None,
-                        None,
-                        bytes_counter_w,
-                        on_committed,
-                    )
-                    .await
-                }
-                (StorageEnum::CIFS(s), EntryEnum::S3(_)) => {
-                    s.write_data_resumable(
-                        rx,
-                        &part,
-                        None,
-                        None,
-                        None,
-                        bytes_counter_w,
-                        on_committed,
-                    )
-                    .await
-                }
-                _ => Err(StorageError::OperationError(format!(
-                    "resumable copy unsupported dest/entry combination: {entry_w:?}"
-                ))),
-            }
+        let handle_w = handle.clone();
+        let write_handle = tokio::spawn(async move {
+            Self::write_chunk_stream(&to_c, &entry_w, rx, &handle_w, bytes_counter, on_committed)
+                .await
         });
 
-        let read_res = read_task
+        let read_res = read_handle
             .await
             .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))?;
-        let write_res = write_task
+        let write_res = write_handle
             .await
             .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))?;
         read_res?;
         write_res?;
 
-        // ── 收尾：规整长度 → 校验 → rename ──
-        to.set_file_len(&part_relative_path, size).await?;
-
+        // ── hash 比对（早于 commit：NAS `.part` 可独立读取，校验失败时最终路径
+        //    不会被 rename 污染，见 T5）──
         if enable_integrity_check {
             let src_hash = from.compute_hash(entry.get_relative_path(), size).await?;
             let dst_hash = to.compute_hash(&part_relative_path, size).await?;
@@ -1371,8 +1278,8 @@ impl StorageEnum {
             }
         }
 
-        to.rename(&part_relative_path, entry.get_relative_path())
-            .await?;
+        // ── 提交：规整长度 + 原子 rename ──
+        Self::commit_chunk_stream(to, entry, size, handle).await?;
 
         if !is_source_reserved {
             from.delete_file(entry).await?;
@@ -1383,14 +1290,19 @@ impl StorageEnum {
 
     /// S3 目标端字节级断点续传：multipart upload part 粒度。
     ///
-    /// 进度真值是目标端 in-progress multipart upload 本身（ListParts 反推缺失区间），
-    /// 不使用上层状态文件传入的 `missing_intervals`——upload 可能被外部（lifecycle
-    /// 规则、手动 abort）清掉，且上层记录只可能滞后于真实进度，以目标端反推永远正确。
-    /// `on_committed` 仍逐 part 回调，供上层记录进度；`.part` 路径与
-    /// rename/set_file_len 不适用于对象存储，均不使用。
+    /// 进度真值是目标端 in-progress multipart upload 本身（`resume_prepare` 内部
+    /// ListParts 反推缺失区间），不使用上层状态文件传入的 `missing_intervals`——
+    /// upload 可能被外部（lifecycle 规则、手动 abort）清掉，且上层记录只可能滞后
+    /// 于真实进度，以目标端反推永远正确。`on_committed` 仍逐 part 回调，供上层
+    /// 记录进度；`.part` 路径与 rename/set_file_len 不适用于对象存储，均不使用。
     ///
     /// 失败时**不 abort** upload，已上传 parts 即续传进度；成功时
     /// `CompleteMultipartUpload` 原子生效，目标端不存在半截可见对象。
+    ///
+    /// hash 比对晚于 `commit_chunk_stream`（`CompleteMultipartUpload`）——
+    /// in-progress multipart 的 parts 在 Complete 前不能作为一个连续对象读取，
+    /// 这是对象存储的固有限制，维持现状顺序（区别于 NAS 分支的「先 hash 后
+    /// commit」）。
     #[allow(clippy::too_many_arguments)]
     async fn copy_file_resumable_to_s3(
         from: &StorageEnum,
@@ -1402,83 +1314,48 @@ impl StorageEnum {
         bytes_counter: Option<Arc<AtomicU64>>,
         on_committed: crate::CommitCallback,
     ) -> Result<()> {
-        let StorageEnum::S3(to_s3) = to else {
+        if !matches!(to, StorageEnum::S3(_)) {
             return Err(StorageError::OperationError(
                 "copy_file_resumable_to_s3 requires an S3 destination".to_string(),
             ));
-        };
+        }
         let size = entry.get_size();
-        // 目标 key 与 tags：S3→S3 透传对象 tags，NAS→S3 无 tags（与 copy_file 一致）
-        let (dst_rel, tags) = match entry {
-            EntryEnum::S3(e) => (e.relative_path.clone(), e.tags.clone()),
-            EntryEnum::NAS(e) => (path_to_s3_key(&e.relative_path).into_owned(), None),
-        };
-        let part_size = to_s3.resume_part_size(size);
-        let (upload_id, missing) = to_s3
-            .prepare_resumable_upload(&dst_rel, size, part_size, tags.as_ref())
-            .await?;
+
+        // part_path 对 S3 分支无意义（resume_prepare 内部按 dest 类型分流，S3
+        // 分支不使用该参数），传入 entry 自身路径仅作占位。
+        let (missing, handle) =
+            Self::resume_prepare(to, entry, entry.get_relative_path(), true).await?;
 
         // ── 源端：只读缺失区间（以目标端 ListParts 反推为准）──
-        let (tx, rx) = mpsc::channel::<DataChunk>(COPY_PIPELINE_CAPACITY);
-        let from_c = from.clone();
-        let entry_r = entry.clone();
-        let intervals = missing;
-        let qos_r = qos;
-        let read_task = tokio::spawn(async move {
-            match (&from_c, &entry_r) {
-                (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
-                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
-                        .await
-                }
-                (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
-                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
-                        .await
-                }
-                (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
-                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
-                        .await
-                }
-                (StorageEnum::S3(s), EntryEnum::S3(e)) => {
-                    s.read_data_intervals(tx, &e.relative_path, &intervals, qos_r)
-                        .await
-                }
-                _ => Err(StorageError::OperationError(format!(
-                    "resumable copy unsupported source/entry combination: {entry_r:?}"
-                ))),
-            }
-        });
+        let (rx, read_handle) = Self::read_chunk_stream(
+            from,
+            entry,
+            Some(missing),
+            qos,
+            false,
+            COPY_PIPELINE_CAPACITY,
+        );
 
         // ── 目标端：缺失 parts 并发 UploadPart ──
-        let to_c = to_s3.clone();
-        let dst_rel_w = dst_rel.clone();
-        let upload_id_w = upload_id.clone();
-        let bytes_counter_w = bytes_counter;
-        let write_task = tokio::spawn(async move {
-            to_c.write_data_resumable(
-                rx,
-                &dst_rel_w,
-                size,
-                part_size,
-                &upload_id_w,
-                bytes_counter_w,
-                on_committed,
-            )
-            .await
+        let to_c = to.clone();
+        let entry_w = entry.clone();
+        let handle_w = handle.clone();
+        let write_handle = tokio::spawn(async move {
+            Self::write_chunk_stream(&to_c, &entry_w, rx, &handle_w, bytes_counter, on_committed)
+                .await
         });
 
-        let read_res = read_task
+        let read_res = read_handle
             .await
             .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))?;
-        let write_res = write_task
+        let write_res = write_handle
             .await
             .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))?;
         read_res?;
         write_res?;
 
-        // ── 收尾：校验 parts 全覆盖 → CompleteMultipartUpload ──
-        to_s3
-            .finalize_resumable_upload(&dst_rel, size, part_size, &upload_id)
-            .await?;
+        // ── 提交：校验 parts 全覆盖 → CompleteMultipartUpload ──
+        Self::commit_chunk_stream(to, entry, size, handle).await?;
 
         if enable_integrity_check {
             let src_hash = from.compute_hash(entry.get_relative_path(), size).await?;
