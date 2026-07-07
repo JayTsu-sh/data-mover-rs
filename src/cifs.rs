@@ -8,9 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 // 外部 crate
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use futures::stream::{FuturesOrdered, FuturesUnordered};
+use futures::stream::FuturesOrdered;
 use parking_lot::RwLock;
 use smb::binrw_util::file_time::FileTime;
 use smb::connection::MultiChannelConfig;
@@ -31,6 +32,7 @@ use crate::filter::{FilterExpression, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
+use crate::write_pipeline::{ChunkSink, CommitPolicy, write_pipeline_core};
 use crate::{
     DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, MB, NASEntry, Result,
     StorageEntryMessage, WalkDirAsyncIterator,
@@ -417,6 +419,42 @@ impl std::fmt::Debug for CifsStorage {
             .field("root", &self.root)
             .field("config", &self.config)
             .finish_non_exhaustive()
+    }
+}
+
+/// CIFS 的 `ChunkSink`：封装一个已打开的 `smb::File`。SMB WRITE 默认非
+/// write-through，`flush` 显式落盘屏障。
+pub(crate) struct CifsChunkSink {
+    file: smb::File,
+}
+
+impl CifsChunkSink {
+    fn new(file: smb::File) -> Self {
+        Self { file }
+    }
+
+    /// 取回内部的 `smb::File`，供调用方在 pipeline 结束后 `close()`。
+    fn into_file(self) -> smb::File {
+        self.file
+    }
+}
+
+#[async_trait]
+impl ChunkSink for CifsChunkSink {
+    async fn write_at(&self, offset: u64, data: Bytes) -> Result<u64> {
+        let len = data.len() as u64;
+        self.file
+            .write_block_zc(data, offset, None)
+            .await
+            .map(|_| len)
+            .map_err(|e| StorageError::CifsError(format!("Failed to write data: {e}")))
+    }
+
+    async fn flush(&self) -> Result<()> {
+        self.file
+            .flush()
+            .await
+            .map_err(|e| StorageError::CifsError(format!("flush failed: {e}")))
     }
 }
 
@@ -1179,92 +1217,26 @@ impl CifsStorage {
         };
 
         // ── inflight write pipeline ─────────────────────────────────────────────
-        // 模型：维持最多 DEFAULT_WRITE_INFLIGHT 个 write_block_zc 同时在飞。
-        // 用 FuturesUnordered（不保序）—— write 端 server 各 offset 独立处理，
-        // 完成顺序与 issue 顺序无关；bytes_counter 是累加只看总量，不依赖顺序。
-        //
-        // 错误处理：drain 模式 —— 任意 inflight 报错时记录首个 error，继续 drain
-        // 完所有 inflight 后再返回，保证文件 close 路径正确执行。
-        //
-        // bytes_counter 的"err 之后不累加"规则：first_error 已置位时本次 write_data
-        // 必然返回 Err，上游通常重试整文件；继续 fetch_add 会让重试的成功路径与本次
-        // drain 期间的"侥幸成功" chunk 双计数。所以错误路径上的成功 chunk 不计入有效
-        // 进度（无论发生在 fill 还是 drain 阶段）。
-        type WriteFut<'a> =
-            Pin<Box<dyn Future<Output = (u64, std::io::Result<usize>)> + Send + 'a>>;
-        let mut inflight: FuturesUnordered<WriteFut<'_>> = FuturesUnordered::new();
-        let mut first_error: Option<StorageError> = None;
-        let count_or_record_err =
-            |len: u64, result: std::io::Result<usize>, first_error: &mut Option<StorageError>| {
-                match result {
-                    Ok(_) if first_error.is_none() => {
-                        if let Some(ref c) = bytes_counter {
-                            c.fetch_add(len, Ordering::Relaxed);
-                        }
-                    }
-                    Ok(_) => {} // 错误路径上的成功 chunk 不计入（见上 doc）
-                    Err(e) if first_error.is_none() => {
-                        *first_error = Some(StorageError::CifsError(format!(
-                            "Failed to write data: {e}"
-                        )));
-                    }
-                    Err(_) => {} // 已有 first_error，丢弃后续错误
-                }
-            };
+        // 维持最多 DEFAULT_WRITE_INFLIGHT 个 write_block_zc 同时在飞
+        // （FuturesUnordered，不保序——write 端 server 各 offset 独立处理，
+        // 完成顺序与 issue 顺序无关）。SMB 无 wsize 切分需求，整块派发
+        // （`sub_chunk_size=None`）。由 `write_pipeline::write_pipeline_core`
+        // 统一处理 inflight 调度、错误 drain。
+        let sink = CifsChunkSink::new(file);
+        let result = write_pipeline_core(
+            rx,
+            &sink,
+            None,
+            DEFAULT_WRITE_INFLIGHT,
+            CommitPolicy::None,
+            bytes_counter,
+        )
+        .await;
 
-        let mut reader = rx;
-        loop {
-            // 接 chunk 之前若 inflight 已满，先 await 一个完成的释放槽位。
-            if inflight.len() >= DEFAULT_WRITE_INFLIGHT
-                && let Some((len, result)) = inflight.next().await
-            {
-                let was_no_error = first_error.is_none();
-                count_or_record_err(len, result, &mut first_error);
-                // 首次出错时主动 close reader，让 sender 立即停止派发新 chunk
-                // （后续 tx.send().await 返回 SendError），避免上游继续 read source
-                // 浪费 IO。已缓冲的 chunk 仍会 drain 完。
-                if was_no_error && first_error.is_some() {
-                    reader.close();
-                }
-            }
-
-            // 取下一个 chunk；channel 关闭说明上游读完（或上面手动 close）。
-            let Some(chunk) = reader.recv().await else {
-                break;
-            };
-            let DataChunk { offset, data } = chunk;
-            let len = data.len() as u64;
-
-            // 出错后丢弃残留 buffered chunk（reader 已被 close，sender 不会再 push 新的）。
-            if first_error.is_some() {
-                continue;
-            }
-
-            // 借用 file 派发请求；Pin<Box<...> + '_> 生命周期与 file 一致。
-            // write_block_zc 是零拷贝（`Bytes` move 进 OutgoingMessage.additional_data）。
-            // 显式拿 `&file`：`async move` 会 move 块内引用的所有局部变量，把 `file_ref`
-            // 单独取出后 move 的只是引用（`&File` 是 Copy），原 file 留在外层 scope 供下次迭代。
-            let file_ref: &smb::File = &file;
-            let fut = Box::pin(async move {
-                let res = file_ref.write_block_zc(data, offset, None).await;
-                (len, res)
-            });
-            inflight.push(fut);
-        }
-
-        // Drain 剩余 inflight。与 fill 路径共用 count_or_record_err；
-        // drain 阶段不需要再 reader.close()（reader 已 break/close）。
-        while let Some((len, result)) = inflight.next().await {
-            count_or_record_err(len, result, &mut first_error);
-        }
-
-        let _ = file.close().await;
+        let _ = sink.into_file().close().await;
         trace!("Finished CIFS write_data for file {:?}", relative_path);
 
-        if let Some(e) = first_error {
-            return Err(e);
-        }
-        Ok(())
+        result
     }
 
     // ========================================================
@@ -1415,95 +1387,24 @@ impl CifsStorage {
             )));
         };
 
-        type WriteFut<'a> =
-            Pin<Box<dyn Future<Output = (u64, u64, std::io::Result<usize>)> + Send + 'a>>;
-        let mut inflight: FuturesUnordered<WriteFut<'_>> = FuturesUnordered::new();
-        let mut first_error: Option<StorageError> = None;
-        let mut pending: Vec<(u64, u64)> = Vec::with_capacity(FLUSH_BARRIER);
+        // 落盘屏障：SMB WRITE 默认非 write-through，每累计 FLUSH_BARRIER 个已完成写
+        // 调用 file.flush()，屏障之后才批量上报这批 chunk 的 on_committed。
+        let sink = CifsChunkSink::new(file);
+        let result = write_pipeline_core(
+            rx,
+            &sink,
+            None,
+            DEFAULT_WRITE_INFLIGHT,
+            CommitPolicy::Barrier {
+                every: FLUSH_BARRIER,
+                cb: on_committed,
+            },
+            bytes_counter,
+        )
+        .await;
 
-        let record = |offset: u64,
-                      len: u64,
-                      result: std::io::Result<usize>,
-                      first_error: &mut Option<StorageError>,
-                      pending: &mut Vec<(u64, u64)>| {
-            match result {
-                Ok(_) if first_error.is_none() => {
-                    if let Some(ref c) = bytes_counter {
-                        c.fetch_add(len, Ordering::Relaxed);
-                    }
-                    pending.push((offset, len));
-                }
-                Ok(_) => {}
-                Err(e) if first_error.is_none() => {
-                    *first_error = Some(StorageError::CifsError(format!(
-                        "Failed to write data: {e}"
-                    )));
-                }
-                Err(_) => {}
-            }
-        };
-
-        let mut reader = rx;
-        loop {
-            if inflight.len() >= DEFAULT_WRITE_INFLIGHT
-                && let Some((offset, len, result)) = inflight.next().await
-            {
-                let was_ok = first_error.is_none();
-                record(offset, len, result, &mut first_error, &mut pending);
-                if was_ok && first_error.is_some() {
-                    reader.close();
-                }
-                // 落盘屏障：flush 后安全上报这批进度
-                if pending.len() >= FLUSH_BARRIER && first_error.is_none() {
-                    if let Err(e) = file.flush().await {
-                        first_error = Some(StorageError::CifsError(format!("flush failed: {e}")));
-                        reader.close();
-                    } else {
-                        for (o, l) in pending.drain(..) {
-                            on_committed(o, l);
-                        }
-                    }
-                }
-            }
-
-            let Some(chunk) = reader.recv().await else {
-                break;
-            };
-            let DataChunk { offset, data } = chunk;
-            let len = data.len() as u64;
-            if first_error.is_some() {
-                continue;
-            }
-            let file_ref: &smb::File = &file;
-            inflight.push(Box::pin(async move {
-                (
-                    offset,
-                    len,
-                    file_ref.write_block_zc(data, offset, None).await,
-                )
-            }));
-        }
-
-        while let Some((offset, len, result)) = inflight.next().await {
-            record(offset, len, result, &mut first_error, &mut pending);
-        }
-
-        // 收尾屏障：flush 落盘后触发剩余回调
-        if first_error.is_none() {
-            if let Err(e) = file.flush().await {
-                first_error = Some(StorageError::CifsError(format!("final flush failed: {e}")));
-            } else {
-                for (o, l) in pending.drain(..) {
-                    on_committed(o, l);
-                }
-            }
-        }
-
-        let _ = file.close().await;
-        if let Some(e) = first_error {
-            return Err(e);
-        }
-        Ok(())
+        let _ = sink.into_file().close().await;
+        result
     }
 
     /// 将文件长度规整为 `len`（截掉续传遗留尾部）：set_info `FileEndOfFileInformation`。

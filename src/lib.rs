@@ -26,6 +26,7 @@ pub mod third_party;
 pub mod time_util;
 pub mod url_redact;
 pub(crate) mod walk_scheduler;
+pub(crate) mod write_pipeline;
 
 pub use checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 pub use cifs::CifsStorage;

@@ -23,13 +23,17 @@ async fn reset_dirs(src: &str, dst: &str) {
 async fn write_pattern(path: &str, size: usize, seed: u8) {
     use tokio::io::AsyncWriteExt;
     let mut f = tokio::fs::File::create(path).await.unwrap();
-    let buf: Vec<u8> = (0..size).map(|i| ((i as u8).wrapping_add(seed)) % 251).collect();
+    let buf: Vec<u8> = (0..size)
+        .map(|i| ((i as u8).wrapping_add(seed)) % 251)
+        .collect();
     f.write_all(&buf).await.unwrap();
     f.flush().await.unwrap();
 }
 
 fn pattern_vec(size: usize, seed: u8) -> Vec<u8> {
-    (0..size).map(|i| ((i as u8).wrapping_add(seed)) % 251).collect()
+    (0..size)
+        .map(|i| ((i as u8).wrapping_add(seed)) % 251)
+        .collect()
 }
 
 /// T0：多块（> block_size）文件覆盖场景——10MB 源覆盖为 3MB 源后，目标应精确为 3MB
@@ -57,7 +61,9 @@ async fn overwrite_shorter_file_truncates_stale_tail_multi_chunk() {
     StorageEnum::copy_file(&src, &dst, &entry, None, false, true, None)
         .await
         .expect("first full copy");
-    let out = tokio::fs::read(format!("{dst_dir}/blob.bin")).await.unwrap();
+    let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
+        .await
+        .unwrap();
     assert_eq!(out.len(), BIG, "first copy should produce full-size file");
 
     // 用更短的新内容覆盖同一目标路径
@@ -67,7 +73,9 @@ async fn overwrite_shorter_file_truncates_stale_tail_multi_chunk() {
         .await
         .expect("overwrite copy with shorter file");
 
-    let out = tokio::fs::read(format!("{dst_dir}/blob.bin")).await.unwrap();
+    let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
+        .await
+        .unwrap();
     assert_eq!(
         out.len(),
         SMALL,
@@ -110,7 +118,17 @@ async fn overwrite_shorter_file_truncates_stale_tail_single_chunk() {
         .await
         .expect("overwrite copy with shorter file");
 
-    let out = tokio::fs::read(format!("{dst_dir}/blob.bin")).await.unwrap();
-    assert_eq!(out.len(), SMALL, "destination must be truncated (single-chunk write_file path)");
-    assert_eq!(out, pattern_vec(SMALL, 3), "destination content must match the new source exactly");
+    let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
+        .await
+        .unwrap();
+    assert_eq!(
+        out.len(),
+        SMALL,
+        "destination must be truncated (single-chunk write_file path)"
+    );
+    assert_eq!(
+        out,
+        pattern_vec(SMALL, 3),
+        "destination content must match the new source exactly"
+    );
 }

@@ -7,10 +7,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
 // 外部crate
+use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use rayon::prelude::*;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info, trace};
 
@@ -21,6 +23,7 @@ use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
 use crate::time_util;
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
+use crate::write_pipeline::{ChunkSink, CommitPolicy, write_pipeline_core};
 use crate::{
     DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, MB, NASEntry, Result,
     StorageEntryMessage, WalkDirAsyncIterator,
@@ -98,6 +101,42 @@ impl LocalFileHandle {
     }
 }
 
+/// Local 的 `ChunkSink`：单个文件句柄的 seek+write 需要 `&mut` 访问，用
+/// `tokio::sync::Mutex` 包裹提供 `&self` 接口。`write_pipeline_core` 以
+/// `inflight=1` 驱动时同一时刻只有一次写在途，锁无实际竞争。
+pub(crate) struct LocalChunkSink {
+    storage: LocalStorage,
+    file: AsyncMutex<LocalFileHandle>,
+}
+
+impl LocalChunkSink {
+    fn new(storage: LocalStorage, file: LocalFileHandle) -> Self {
+        Self {
+            storage,
+            file: AsyncMutex::new(file),
+        }
+    }
+}
+
+#[async_trait]
+impl ChunkSink for LocalChunkSink {
+    async fn write_at(&self, offset: u64, data: Bytes) -> Result<u64> {
+        let len = data.len() as u64;
+        let mut file = self.file.lock().await;
+        let written = self.storage.write(&mut file, offset, data).await? as u64;
+        if written < len {
+            return Err(StorageError::OperationError(format!(
+                "Short write at offset {offset}: {written} of {len} bytes"
+            )));
+        }
+        Ok(written)
+    }
+
+    async fn flush(&self) -> Result<()> {
+        self.file.lock().await.commit().await
+    }
+}
+
 const DEFAULT_BLOCK_SIZE: u64 = 2 * MB;
 
 #[derive(Clone, Debug)]
@@ -158,7 +197,11 @@ impl LocalStorage {
         }
 
         let mut options: OpenOptions = OpenOptions::new();
-        options.create(true).write(true).read(true).truncate(truncate);
+        options
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(truncate);
 
         let file = options.open(&full_path).await?;
 
@@ -954,37 +997,18 @@ impl LocalStorage {
     ) -> Result<()> {
         trace!("Starting write_data_task for file {:?}", relative_path);
 
-        let mut reader = rx;
-
         // 注意：这里需要重新创建目标文件，因为我们不能在线程间共享文件句柄
-        let mut dest_file = self.create_file(relative_path, uid, gid, mode, true).await?;
+        let dest_file = self
+            .create_file(relative_path, uid, gid, mode, true)
+            .await?;
         debug!(
             "Created destination file {:?} with mode: {:?}",
             relative_path,
             mode.map(|m| format!("{m:o}"))
         );
 
-        let mut current_offset = 0;
-
-        // 处理从通道接收的数据块
-        while let Some(chunk) = reader.recv().await {
-            let data = chunk.data;
-
-            trace!(
-                "Received chunk of {} bytes at offset {} for file {:?}",
-                data.len(),
-                chunk.offset,
-                relative_path
-            );
-
-            let written = self.write(&mut dest_file, current_offset, data).await? as u64;
-            if let Some(ref c) = bytes_counter {
-                c.fetch_add(written, Ordering::Relaxed);
-            }
-            trace!("Wrote {} bytes at offset {}", written, current_offset);
-            // 更新当前偏移量
-            current_offset += written;
-        }
+        let sink = LocalChunkSink::new(self.clone(), dest_file);
+        write_pipeline_core(rx, &sink, None, 1, CommitPolicy::None, bytes_counter).await?;
 
         trace!("Finished write_data_task for file {:?}", relative_path);
         Ok(())
@@ -1044,32 +1068,21 @@ impl LocalStorage {
         on_committed: crate::CommitCallback,
     ) -> Result<()> {
         const SYNC_BARRIER: usize = 16;
-        let mut reader = rx;
         // truncate=false：保留 .part 中已写字节（续传基础）
-        let mut dest_file = self.create_file(part_path, uid, gid, mode, false).await?;
-        let mut pending: Vec<(u64, u64)> = Vec::with_capacity(SYNC_BARRIER);
-
-        while let Some(chunk) = reader.recv().await {
-            let DataChunk { offset, data } = chunk;
-            let written = self.write(&mut dest_file, offset, data).await? as u64;
-            if let Some(ref c) = bytes_counter {
-                c.fetch_add(written, Ordering::Relaxed);
-            }
-            pending.push((offset, written));
-            if pending.len() >= SYNC_BARRIER {
-                dest_file.commit().await?;
-                for (o, l) in pending.drain(..) {
-                    on_committed(o, l);
-                }
-            }
-        }
-
-        // 收尾屏障：落盘后触发剩余回调
-        dest_file.commit().await?;
-        for (o, l) in pending.drain(..) {
-            on_committed(o, l);
-        }
-        Ok(())
+        let dest_file = self.create_file(part_path, uid, gid, mode, false).await?;
+        let sink = LocalChunkSink::new(self.clone(), dest_file);
+        write_pipeline_core(
+            rx,
+            &sink,
+            None,
+            1,
+            CommitPolicy::Barrier {
+                every: SYNC_BARRIER,
+                cb: on_committed,
+            },
+            bytes_counter,
+        )
+        .await
     }
 
     /// 将文件长度规整为 `len`（截掉续传遗留的尾部多余字节），并落盘。
