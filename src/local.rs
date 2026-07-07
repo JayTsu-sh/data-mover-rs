@@ -137,12 +137,19 @@ impl LocalStorage {
         Ok(LocalFileHandle { inner })
     }
 
+    /// 创建/打开目标文件。
+    ///
+    /// `truncate`：是否将已存在文件截断为 0 字节。覆盖写场景（`write_file`/
+    /// `write_data`）必须传 `true`，否则新内容比旧文件短时会残留旧文件的尾部
+    /// 字节（数据损坏）。断点续传写 `.part`（`write_data_resumable`）必须传
+    /// `false`，否则会截掉已写入的续传进度。
     async fn create_file(
         &self,
         relative_path: &Path,
         #[allow(unused)] uid: Option<u32>,
         #[allow(unused)] gid: Option<u32>,
         #[allow(unused)] mode: Option<u32>,
+        truncate: bool,
     ) -> Result<LocalFileHandle> {
         let full_path = self.get_full_path(relative_path);
 
@@ -151,7 +158,7 @@ impl LocalStorage {
         }
 
         let mut options: OpenOptions = OpenOptions::new();
-        options.create(true).write(true).read(true);
+        options.create(true).write(true).read(true).truncate(truncate);
 
         let file = options.open(&full_path).await?;
 
@@ -812,7 +819,7 @@ impl LocalStorage {
         gid: Option<u32>,
         mode: Option<u32>,
     ) -> Result<()> {
-        let mut handle = self.create_file(path, uid, gid, mode).await?;
+        let mut handle = self.create_file(path, uid, gid, mode, true).await?;
         self.write(&mut handle, 0, data).await?;
         handle.commit().await
     }
@@ -950,7 +957,7 @@ impl LocalStorage {
         let mut reader = rx;
 
         // 注意：这里需要重新创建目标文件，因为我们不能在线程间共享文件句柄
-        let mut dest_file = self.create_file(relative_path, uid, gid, mode).await?;
+        let mut dest_file = self.create_file(relative_path, uid, gid, mode, true).await?;
         debug!(
             "Created destination file {:?} with mode: {:?}",
             relative_path,
@@ -1038,8 +1045,8 @@ impl LocalStorage {
     ) -> Result<()> {
         const SYNC_BARRIER: usize = 16;
         let mut reader = rx;
-        // create_file 不带 truncate：保留 .part 中已写字节（续传基础）
-        let mut dest_file = self.create_file(part_path, uid, gid, mode).await?;
+        // truncate=false：保留 .part 中已写字节（续传基础）
+        let mut dest_file = self.create_file(part_path, uid, gid, mode, false).await?;
         let mut pending: Vec<(u64, u64)> = Vec::with_capacity(SYNC_BARRIER);
 
         while let Some(chunk) = reader.recv().await {

@@ -5,8 +5,8 @@ terrasync-rs PR#B 不在本计划内。
 
 ## 步骤
 
-- 🔄 step 0: 建执行计划文件，commit（本文件）
-- ⬜ step 1: fix(local): create_file 加 truncate: bool（write_file/write_data 传
+- ✅ step 0: 建执行计划文件，commit（本文件）
+- ✅ step 1: fix(local): create_file 加 truncate: bool（write_file/write_data 传
   true，write_data_resumable 传 false）+ T0（10MB→3MB 覆盖回归）
 - ⬜ step 2: refactor: 新建 src/write_pipeline.rs（ChunkSink + CommitPolicy +
   write_pipeline_core），NFS/CIFS/Local 三个 write_data/write_data_resumable
