@@ -793,6 +793,15 @@ impl LocalStorage {
         // 缓冲上限（2MiB），单次 write_buf 对 >2MiB 的 chunk（如 S3 源 5MiB 块、
         // CIFS 源 8MiB 块）必然短写。
         file.inner.write_all_buf(&mut data).await?;
+        // flush 等待后台写任务真正落盘：tokio::fs::File::poll_write 在单次调用
+        // 内推进完整个 chunk（≤ 内部 2MiB 缓冲上限）时，只是把写"派发"到阻塞线程池
+        // 就返回 Ready(Ok(n))，并不等待该阻塞任务真正执行完 write() 系统调用。
+        // 后续若紧跟一次 seek()，tokio 会在 seek 前隐式等待前一个挂起操作完成，
+        // 掩盖了这个问题；但序列中**最后一个** chunk 写完后没有后续 seek，函数
+        // 直接返回、文件句柄可能被 drop，此时后台写任务仍可能未执行完——测试中
+        // 表现为间歇性丢失文件末尾数据（无报错，纯 race）。显式 flush 等价于
+        // 等待挂起操作完成（不做额外 fsync，只是让"派发成功"变成"真正写完"）。
+        file.inner.flush().await?;
 
         trace!("Wrote {} bytes at offset {}", length, offset);
 
