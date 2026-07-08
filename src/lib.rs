@@ -26,6 +26,7 @@ pub mod third_party;
 pub mod time_util;
 pub mod url_redact;
 pub(crate) mod walk_scheduler;
+pub(crate) mod write_pipeline;
 
 pub use checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 pub use cifs::CifsStorage;
@@ -37,7 +38,9 @@ pub use local::LocalStorage;
 pub use nfs::NFSStorage;
 pub use qos::QosManager;
 pub use s3::{MultipartUpload, S3BucketInfo, S3CompletedPart, S3Storage};
-pub use storage_enum::{StorageEnum, StorageType, create_storage, detect_storage_type};
+pub use storage_enum::{
+    StorageEnum, StorageType, StreamHandle, create_storage, detect_storage_type,
+};
 pub use tar_pack::calculate_tar_size;
 pub use url_redact::redact_storage_url;
 
