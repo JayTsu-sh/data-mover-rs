@@ -3735,4 +3735,117 @@ mod tests {
         let err = NfsError::Rpc("connection refused".to_string());
         assert!(!is_retryable_with_invalidation(&err));
     }
+
+    // --- next_read_want 测试（issue terrasync#53 短读补读）---
+
+    /// 生成不重复模式的内容，偏移错位时字节比对必然失败
+    fn make_content(len: usize) -> Bytes {
+        (0..len).map(|i| (i % 251) as u8).collect::<Vec<u8>>().into()
+    }
+
+    /// 用假内容驱动 `next_read_want` 分段推进（镜像 `NFSStorage::read` 的
+    /// 内联循环，去掉 IO）：单次读从 content 的绝对 offset 取数据，最多返回
+    /// `max_per_call` 字节（模拟服务器 rsize 上限/资源压力短返回），按实际
+    /// 返回字节推进，0 字节视为 EOF 终止。
+    /// 返回 (累积结果, 每次单次读的 (offset, want) 调用序列)。
+    fn drive_read_loop(
+        content: &Bytes,
+        offset: u64,
+        count: usize,
+        block_size: u64,
+        max_per_call: usize,
+    ) -> (Bytes, Vec<(u64, u32)>) {
+        let end = offset + count as u64;
+        let mut cur = offset;
+        let mut out = BytesMut::new();
+        let mut calls = Vec::new();
+        while let Some(want) = next_read_want(cur, end, block_size) {
+            calls.push((cur, want));
+            let start = usize::min(cur as usize, content.len());
+            let len = usize::min(usize::min(want as usize, max_per_call), content.len() - start);
+            let data = content.slice(start..start + len);
+            if data.is_empty() {
+                break;
+            }
+            cur += data.len() as u64;
+            out.extend_from_slice(&data);
+        }
+        (out.freeze(), calls)
+    }
+
+    #[test]
+    fn test_read_want_exact_one_block() {
+        // size 恰好等于块边界：单次 RPC 读满
+        let content = make_content(1024);
+        let (got, calls) = drive_read_loop(&content, 0, 1024, 1024, usize::MAX);
+        assert_eq!(got, content);
+        assert_eq!(calls, vec![(0, 1024)]);
+    }
+
+    #[test]
+    fn test_read_want_multi_block_exact() {
+        // size 为块的整倍数：每段 want 不超过 block_size
+        let content = make_content(4096);
+        let (got, calls) = drive_read_loop(&content, 0, 4096, 1024, usize::MAX);
+        assert_eq!(got, content);
+        assert_eq!(
+            calls,
+            vec![(0, 1024), (1024, 1024), (2048, 1024), (3072, 1024)]
+        );
+    }
+
+    #[test]
+    fn test_read_want_one_block_plus_one() {
+        // 略大于一块：旧实现在此被截断为 rsize，新实现补读余下 1 字节
+        let content = make_content(1025);
+        let (got, calls) = drive_read_loop(&content, 0, 1025, 1024, usize::MAX);
+        assert_eq!(got, content);
+        assert_eq!(calls, vec![(0, 1024), (1024, 1)]);
+    }
+
+    #[test]
+    fn test_read_want_multi_block_with_remainder() {
+        // 多块 + 余数
+        let content = make_content(2600);
+        let (got, calls) = drive_read_loop(&content, 0, 2600, 1024, usize::MAX);
+        assert_eq!(got, content);
+        assert_eq!(calls, vec![(0, 1024), (1024, 1024), (2048, 552)]);
+    }
+
+    #[test]
+    fn test_read_want_short_return_refill() {
+        // 单次短返回（服务器资源压力）：按实际字节推进，下一轮 want 自动
+        // 收窄为剩余量，继续补读
+        let content = make_content(1024);
+        let (got, calls) = drive_read_loop(&content, 0, 1024, 1024, 400);
+        assert_eq!(got, content);
+        assert_eq!(calls, vec![(0, 1024), (400, 624), (800, 224)]);
+    }
+
+    #[test]
+    fn test_read_want_premature_eof() {
+        // 文件比请求短：读到 0 字节视为 EOF，返回实际字节，不算错误
+        let content = make_content(700);
+        let (got, calls) = drive_read_loop(&content, 0, 1024, 512, usize::MAX);
+        assert_eq!(got, content);
+        assert_eq!(calls, vec![(0, 512), (512, 512), (700, 324)]);
+    }
+
+    #[test]
+    fn test_read_want_nonzero_offset() {
+        // 非零 offset：分段推进的偏移网格必须以请求 offset 为基准
+        let content = make_content(8192);
+        let (got, calls) = drive_read_loop(&content, 4096, 2048, 1024, usize::MAX);
+        assert_eq!(got, content.slice(4096..6144));
+        assert_eq!(calls, vec![(4096, 1024), (5120, 1024)]);
+    }
+
+    #[test]
+    fn test_read_want_zero_count() {
+        // count == 0：不发 RPC，返回空
+        let content = make_content(16);
+        let (got, calls) = drive_read_loop(&content, 0, 0, 1024, usize::MAX);
+        assert!(got.is_empty());
+        assert!(calls.is_empty());
+    }
 }
