@@ -8,7 +8,7 @@ use std::time::Duration;
 
 // 外部crate
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
@@ -2538,14 +2538,51 @@ impl NFSStorage {
         Ok(true)
     }
 
+    /// 整读：按 effective `block_size` 分段循环读满 `count` 字节。
+    ///
+    /// 单次 READ RPC 服务器最多返回协商的 rsize，`count` 直接透传会被静默
+    /// 截断（terrasync issue #53）。这里镜像 `read_data` 的短读补读语义：
+    /// 分段循环补读直到读满，读到 0 字节视为 EOF 提前终止，返回实际读到的
+    /// 字节（文件比 `count` 短时语义与旧实现一致）。
+    ///
+    /// 循环与 `read_data`/`write()` 一样内联直调原语（分段推进的纯逻辑抽在
+    /// `next_read_want`），不引入泛型/异步闭包——future 为具体类型组合，
+    /// 避开 `AsyncFnMut` 高阶生命周期的 auto-trait（Send）推导缺陷破坏
+    /// 下游 `tokio::spawn`。
     async fn read(&self, file: &mut NFSFileHandle, offset: u64, count: usize) -> Result<Bytes> {
+        // block_size 在 mount 时已钳到 min(客户配置, rsize, wsize)，恒 > 0
+        let block_size = self.calculate_chunk_size(count as u64);
+        let end = offset + count as u64;
+        let mut cur = offset;
+        // 延迟分配：常见情形（count <= block_size 且一次读满）零拷贝直返
+        let mut buf: Option<BytesMut> = None;
+        while let Some(want) = next_read_want(cur, end, block_size) {
+            let data = self.read_once(file, cur, want).await?;
+            if data.is_empty() {
+                // offset < end 处读到 0 字节：文件比请求短，视为 EOF 不算错误
+                break;
+            }
+            cur += data.len() as u64;
+            if buf.is_none() && cur >= end {
+                // 快路径：首次调用即读满，零拷贝直返
+                return Ok(data);
+            }
+            buf.get_or_insert_with(|| BytesMut::with_capacity(count))
+                .extend_from_slice(&data);
+        }
+        Ok(buf.map_or_else(Bytes::new, BytesMut::freeze))
+    }
+
+    /// 单次读原语：一次 READ RPC，可能短返回（不超过服务器协商的 rsize），
+    /// 仅处理 stale 句柄的刷新重试；读满 `count` 由调用方 `read` 负责。
+    async fn read_once(&self, file: &mut NFSFileHandle, offset: u64, count: u32) -> Result<Bytes> {
         let mut retry_count = 0;
         let max_retries = 1;
         let mount = self.mount.clone();
         let file_fh = file.inner.fh.clone();
 
         let mut result = mount
-            .read(file_fh, offset, count as u32)
+            .read(file_fh, offset, count)
             .await
             .map_err(|e| StorageError::NfsError(format!("Failed to read file: {e}")));
 
@@ -2575,7 +2612,7 @@ impl NFSStorage {
                     let mount = self.mount.clone();
                     let file_fh = file.inner.fh.clone();
                     result = mount
-                        .read(file_fh, offset, count as u32)
+                        .read(file_fh, offset, count)
                         .await
                         .map_err(|e| {
                             StorageError::NfsError(format!(
@@ -3379,6 +3416,22 @@ impl Drop for NFSStorage {
             }
         }
     }
+}
+
+/// `NFSStorage::read` 整读循环的分段推进纯函数（issue terrasync#53）。
+///
+/// 给定当前绝对偏移 `cur`、读取窗口终点 `end`、单次读上限 `block_size`，
+/// 返回下一次单次读应请求的 `want`（`min(end - cur, block_size)`，即分段）；
+/// `cur >= end` 时返回 `None` 表示已读满。调用方以单次读实际返回的字节数
+/// 推进 `cur` 后再调用本函数，短返回时即自然补读剩余（与 `read_data` 的
+/// partial 补读语义一致）；单次返回 0 字节视为 EOF，由调用方提前终止。
+///
+/// 前置条件：`block_size >= 1`（`calculate_chunk_size` 保证）。
+fn next_read_want(cur: u64, end: u64, block_size: u64) -> Option<u32> {
+    if cur >= end {
+        return None;
+    }
+    Some(u64::min(end - cur, block_size) as u32)
 }
 
 #[cfg(test)]
