@@ -512,7 +512,7 @@ impl StorageEnum {
     }
 
     /// 与 [`Self::compute_hash`] 相同，但额外返回实际读回的字节数——integrity
-    /// 读回过程顺带取目标端 size（issue #58），不新增独立 get_metadata RPC。
+    /// 读回过程顺带取目标端 size（issue #58），不新增独立 `get_metadata` RPC。
     async fn compute_hash_and_len(&self, relative_path: &Path, size: u64) -> Result<(String, u64)> {
         if size == 0 {
             return Ok((String::new(), 0));
@@ -571,8 +571,8 @@ impl StorageEnum {
         if read_back != size {
             Self::cleanup_mismatched_dest(to, entry).await;
             return Err(StorageError::OperationError(format!(
-                "integrity check failed: destination read-back returned {read_back} bytes, expected {size}: {:?}",
-                entry.get_relative_path()
+                "integrity check failed: destination read-back returned {read_back} bytes, expected {size}: {}",
+                entry.get_relative_path().display()
             )));
         }
         if src_hash != dst_hash {
@@ -713,8 +713,8 @@ impl StorageEnum {
             let read_len = data.len() as u64;
             if read_len != size {
                 return Err(StorageError::OperationError(format!(
-                    "size check failed: read {read_len} bytes from source, expected {size}: {:?}",
-                    entry.get_relative_path()
+                    "size check failed: read {read_len} bytes from source, expected {size}: {}",
+                    entry.get_relative_path().display()
                 )));
             }
 
@@ -940,8 +940,8 @@ impl StorageEnum {
         if bytes_written != size {
             Self::cleanup_mismatched_dest(to, entry).await;
             return Err(StorageError::OperationError(format!(
-                "size check failed: wrote {bytes_written} bytes, expected {size}: {:?}",
-                entry.get_relative_path()
+                "size check failed: wrote {bytes_written} bytes, expected {size}: {}",
+                entry.get_relative_path().display()
             )));
         }
 
@@ -1442,8 +1442,8 @@ impl StorageEnum {
         let uploaded = session_bytes.load(Ordering::Relaxed);
         if uploaded != expected_session_bytes {
             return Err(StorageError::OperationError(format!(
-                "size check failed before multipart completion: session uploaded {uploaded} bytes, missing intervals require {expected_session_bytes}: {:?}",
-                entry.get_relative_path()
+                "size check failed before multipart completion: session uploaded {uploaded} bytes, missing intervals require {expected_session_bytes}: {}",
+                entry.get_relative_path().display()
             )));
         }
 
@@ -2164,7 +2164,9 @@ mod tests {
             .unwrap();
 
         let storage = create_storage(dir, None, false).await.unwrap();
-        let entry = storage.get_metadata(Path::new("blob.bin")).await.unwrap();
+        let entry = Box::pin(storage.get_metadata(Path::new("blob.bin")))
+            .await
+            .unwrap();
         let src_hash = storage
             .compute_hash(Path::new("good.bin"), 4096)
             .await
@@ -2193,7 +2195,9 @@ mod tests {
             .unwrap();
 
         let storage = create_storage(dir, None, false).await.unwrap();
-        let entry = storage.get_metadata(Path::new("blob.bin")).await.unwrap();
+        let entry = Box::pin(storage.get_metadata(Path::new("blob.bin")))
+            .await
+            .unwrap();
 
         // 期望 4096 字节但目标只有 3000：hash 读回顺带的字节数核对失败
         let err = StorageEnum::verify_dest_integrity(&storage, &entry, 4096, "irrelevant")
@@ -2219,7 +2223,9 @@ mod tests {
             .unwrap();
 
         let storage = create_storage(dir, None, false).await.unwrap();
-        let entry = storage.get_metadata(Path::new("blob.bin")).await.unwrap();
+        let entry = Box::pin(storage.get_metadata(Path::new("blob.bin")))
+            .await
+            .unwrap();
         let src_hash = storage
             .compute_hash(Path::new("blob.bin"), 4096)
             .await

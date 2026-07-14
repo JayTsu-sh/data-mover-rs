@@ -7,7 +7,7 @@
 //!
 //! Local-only — no S3/NFS server required. S3 multipart 续传的会话字节断言
 //! （Complete 前不提交）需要真实 S3 环境，未在本地覆盖。NAS 续传路径回归
-//! 由 tests/test_copy_file_resume.rs 既有用例保障。
+//! 由 `tests/test_copy_file_resume.rs` 既有用例保障。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::Path;
@@ -43,7 +43,7 @@ fn truncate_file(path: &str, len: u64) {
     f.set_len(len).unwrap();
 }
 
-/// 取 entry 后截断源文件再 copy_file，断言 Err + 目标端无残留。
+/// 取 entry 后截断源文件再 `copy_file`，断言 Err + 目标端无残留。
 async fn assert_truncated_copy_guarded(
     tag: &str,
     size: usize,
@@ -57,7 +57,9 @@ async fn assert_truncated_copy_guarded(
 
     let src = create_storage(&src_dir, Some(BLOCK), false).await.unwrap();
     let dst = create_storage(&dst_dir, Some(BLOCK), true).await.unwrap();
-    let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
+    let entry = Box::pin(src.get_metadata(Path::new("blob.bin")))
+        .await
+        .unwrap();
 
     // 注入：entry 已带原 size，此时截断源文件（模拟扫描后源被并发变更）
     truncate_file(&format!("{src_dir}/blob.bin"), truncated);
@@ -89,25 +91,49 @@ async fn assert_truncated_copy_guarded(
 /// 单块路径 + integrity 关闭：写前本地计数断言拦截，目标无残留。
 #[tokio::test(flavor = "multi_thread")]
 async fn single_chunk_truncated_source_no_integrity() {
-    assert_truncated_copy_guarded("single-noint", SINGLE_SIZE, 5 * 1024, false).await;
+    Box::pin(assert_truncated_copy_guarded(
+        "single-noint",
+        SINGLE_SIZE,
+        5 * 1024,
+        false,
+    ))
+    .await;
 }
 
 /// 单块路径 + integrity 开启：同样在写前拦截（断言不依赖开关）。
 #[tokio::test(flavor = "multi_thread")]
 async fn single_chunk_truncated_source_with_integrity() {
-    assert_truncated_copy_guarded("single-int", SINGLE_SIZE, 5 * 1024, true).await;
+    Box::pin(assert_truncated_copy_guarded(
+        "single-int",
+        SINGLE_SIZE,
+        5 * 1024,
+        true,
+    ))
+    .await;
 }
 
 /// 多块 pipeline + integrity 关闭：写端累计计数断言拦截并清理已落地坏文件。
 #[tokio::test(flavor = "multi_thread")]
 async fn multi_chunk_truncated_source_no_integrity() {
-    assert_truncated_copy_guarded("multi-noint", MULTI_SIZE, 150 * 1024, false).await;
+    Box::pin(assert_truncated_copy_guarded(
+        "multi-noint",
+        MULTI_SIZE,
+        150 * 1024,
+        false,
+    ))
+    .await;
 }
 
 /// 多块 pipeline + integrity 开启：计数断言先于 hash 读回拦截，目标被清理。
 #[tokio::test(flavor = "multi_thread")]
 async fn multi_chunk_truncated_source_with_integrity() {
-    assert_truncated_copy_guarded("multi-int", MULTI_SIZE, 150 * 1024, true).await;
+    Box::pin(assert_truncated_copy_guarded(
+        "multi-int",
+        MULTI_SIZE,
+        150 * 1024,
+        true,
+    ))
+    .await;
 }
 
 /// happy path 回归：新断言不影响正常拷贝（单块 + 多块，integrity 开启）。
@@ -121,7 +147,9 @@ async fn intact_copy_still_succeeds() {
 
         let src = create_storage(&src_dir, Some(BLOCK), false).await.unwrap();
         let dst = create_storage(&dst_dir, Some(BLOCK), true).await.unwrap();
-        let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
+        let entry = Box::pin(src.get_metadata(Path::new("blob.bin")))
+            .await
+            .unwrap();
 
         StorageEnum::copy_file(&src, &dst, &entry, None, true, true, None)
             .await
