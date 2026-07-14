@@ -1181,6 +1181,7 @@ impl CifsStorage {
     }
 
     /// 多块流式写入文件
+    /// 返回实际写入的累计字节数（写端本地计数，issue #58）。
     pub(crate) async fn write_data(
         &self,
         rx: mpsc::Receiver<DataChunk>,
@@ -1189,7 +1190,7 @@ impl CifsStorage {
         _gid: Option<u32>,
         _mode: Option<u32>,
         bytes_counter: Option<Arc<AtomicU64>>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         trace!("Starting CIFS write_data for file {:?}", relative_path);
 
         // 确保父目录存在
@@ -1404,7 +1405,7 @@ impl CifsStorage {
         .await;
 
         let _ = sink.into_file().close().await;
-        result
+        result.map(|_| ())
     }
 
     /// 将文件长度规整为 `len`（截掉续传遗留尾部）：set_info `FileEndOfFileInformation`。

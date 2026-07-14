@@ -999,6 +999,7 @@ impl S3Storage {
     }
 
     /// Chunked write: receives `DataChunks` from `rx` and dispatches to singlepart or multipart upload.
+    /// 返回实际写入的累计字节数（写端本地计数，issue #58）。
     pub(crate) async fn write_data(
         &self,
         rx: mpsc::Receiver<DataChunk>,
@@ -1007,7 +1008,7 @@ impl S3Storage {
         mtime: i64,
         tags: Option<Vec<Tag>>,
         bytes_counter: Option<Arc<AtomicU64>>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let written = if size <= MULTIPART_THRESHOLD {
             self.write_singlepart_data(rx, relative_path, mtime, tags)
                 .await?
@@ -1017,7 +1018,7 @@ impl S3Storage {
         if let Some(ref c) = bytes_counter {
             c.fetch_add(written as u64, Ordering::Relaxed);
         }
-        Ok(())
+        Ok(written as u64)
     }
 
     /// Server-side copy within the same S3-compatible endpoint.

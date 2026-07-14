@@ -2945,6 +2945,7 @@ impl NFSStorage {
         Ok(hasher)
     }
 
+    /// 返回实际写入的累计字节数（写端本地计数，issue #58）。
     pub(crate) async fn write_data(
         &self,
         rx: mpsc::Receiver<DataChunk>,
@@ -2953,7 +2954,7 @@ impl NFSStorage {
         #[allow(unused)] gid: Option<u32>,
         #[allow(unused)] mode: Option<u32>,
         bytes_counter: Option<Arc<AtomicU64>>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         trace!("Starting write_data_task for file {:?}", relative_path);
 
         // 确保相对路径不包含 root 前缀
@@ -3106,7 +3107,7 @@ impl NFSStorage {
         .await;
 
         let _ = self.close(&dest_file).await;
-        result
+        result.map(|_| ())
     }
 
     /// 将文件长度规整为 `len`（截掉续传遗留尾部）：setattr 设 size。

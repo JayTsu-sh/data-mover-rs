@@ -995,6 +995,7 @@ impl LocalStorage {
         Ok(hasher)
     }
 
+    /// 返回实际写入的累计字节数（写端本地计数，issue #58）。
     pub(crate) async fn write_data(
         &self,
         rx: tokio::sync::mpsc::Receiver<DataChunk>,
@@ -1003,7 +1004,7 @@ impl LocalStorage {
         #[allow(unused)] gid: Option<u32>,
         #[allow(unused)] mode: Option<u32>,
         bytes_counter: Option<Arc<AtomicU64>>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         trace!("Starting write_data_task for file {:?}", relative_path);
 
         // 注意：这里需要重新创建目标文件，因为我们不能在线程间共享文件句柄
@@ -1017,10 +1018,11 @@ impl LocalStorage {
         );
 
         let sink = LocalChunkSink::new(self.clone(), dest_file);
-        write_pipeline_core(rx, &sink, None, 1, CommitPolicy::None, bytes_counter).await?;
+        let written =
+            write_pipeline_core(rx, &sink, None, 1, CommitPolicy::None, bytes_counter).await?;
 
         trace!("Finished write_data_task for file {:?}", relative_path);
-        Ok(())
+        Ok(written)
     }
 
     // ========================================================
@@ -1092,6 +1094,7 @@ impl LocalStorage {
             bytes_counter,
         )
         .await
+        .map(|_| ())
     }
 
     /// 将文件长度规整为 `len`（截掉续传遗留的尾部多余字节），并落盘。

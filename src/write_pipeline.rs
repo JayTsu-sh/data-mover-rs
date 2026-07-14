@@ -62,7 +62,8 @@ pub(crate) enum CommitPolicy {
 
 type WriteFut<'a> = Pin<Box<dyn Future<Output = (u64, Result<u64>)> + Send + 'a>>;
 
-/// 处理一个已完成的写结果：累加 `bytes_counter`、按 `commit` 策略记录/上报进度。
+/// 处理一个已完成的写结果：累加 `bytes_counter` 与 `total_written`、按 `commit`
+/// 策略记录/上报进度。
 /// 返回 `true` 当且仅当本次调用令 `first_error` 从 `None` 变为 `Some`（首次出错）。
 async fn settle<S: ChunkSink>(
     done: (u64, Result<u64>),
@@ -71,6 +72,7 @@ async fn settle<S: ChunkSink>(
     first_error: &mut Option<StorageError>,
     pending: &mut Vec<(u64, u64)>,
     bytes_counter: &Option<Arc<AtomicU64>>,
+    total_written: &mut u64,
 ) -> bool {
     let was_ok = first_error.is_none();
     let (offset, res) = done;
@@ -79,6 +81,7 @@ async fn settle<S: ChunkSink>(
             if let Some(c) = bytes_counter {
                 c.fetch_add(written, Ordering::Relaxed);
             }
+            *total_written += written;
             match commit {
                 CommitPolicy::None => {}
                 CommitPolicy::PerChunk(cb) => cb(offset, written),
@@ -117,6 +120,8 @@ async fn settle<S: ChunkSink>(
 /// - 出错处理：记录首个错误、关闭 `rx`（协作取消上游 read 任务，其后续
 ///   `tx.send().await` 会收到 `SendError`）、丢弃已缓冲 chunk 剩余部分、
 ///   drain 完剩余 inflight 后返回该错误——与重构前 NFS/CIFS 手写版本一致。
+/// - 返回值：成功时为本次实际写入的累计字节数（issue #58 写端本地计数，供
+///   上层做 size 断言，零额外存储 RPC）。
 pub(crate) async fn write_pipeline_core<S: ChunkSink>(
     mut rx: mpsc::Receiver<DataChunk>,
     sink: &S,
@@ -124,11 +129,12 @@ pub(crate) async fn write_pipeline_core<S: ChunkSink>(
     inflight: usize,
     commit: CommitPolicy,
     bytes_counter: Option<Arc<AtomicU64>>,
-) -> Result<()> {
+) -> Result<u64> {
     let inflight = inflight.max(1);
     let mut inflight_set: FuturesUnordered<WriteFut<'_>> = FuturesUnordered::new();
     let mut first_error: Option<StorageError> = None;
     let mut pending: Vec<(u64, u64)> = Vec::new();
+    let mut total_written: u64 = 0;
 
     'recv: while let Some(chunk) = rx.recv().await {
         if first_error.is_some() {
@@ -174,6 +180,7 @@ pub(crate) async fn write_pipeline_core<S: ChunkSink>(
                     &mut first_error,
                     &mut pending,
                     &bytes_counter,
+                    &mut total_written,
                 )
                 .await
                 {
@@ -192,6 +199,7 @@ pub(crate) async fn write_pipeline_core<S: ChunkSink>(
             &mut first_error,
             &mut pending,
             &bytes_counter,
+            &mut total_written,
         )
         .await;
     }
@@ -213,6 +221,6 @@ pub(crate) async fn write_pipeline_core<S: ChunkSink>(
 
     match first_error {
         Some(e) => Err(e),
-        None => Ok(()),
+        None => Ok(total_written),
     }
 }
