@@ -506,8 +506,16 @@ impl StorageEnum {
 
     /// Compute BLAKE3 hash of a file by streaming it through the storage's `read_data`.
     pub async fn compute_hash(&self, relative_path: &Path, size: u64) -> Result<String> {
+        self.compute_hash_and_len(relative_path, size)
+            .await
+            .map(|(hash, _)| hash)
+    }
+
+    /// 与 [`Self::compute_hash`] 相同，但额外返回实际读回的字节数——integrity
+    /// 读回过程顺带取目标端 size（issue #58），不新增独立 get_metadata RPC。
+    async fn compute_hash_and_len(&self, relative_path: &Path, size: u64) -> Result<(String, u64)> {
         if size == 0 {
-            return Ok(String::new());
+            return Ok((String::new(), 0));
         }
         let (tx, mut rx) = mpsc::channel::<DataChunk>(HASH_CHANNEL_CAPACITY);
         let storage_c = self.clone();
@@ -523,12 +531,57 @@ impl StorageEnum {
                 }
             }
         });
-        // Drain channel so the producer can complete.
-        while rx.recv().await.is_some() {}
+        // Drain channel so the producer can complete（顺带累计读回字节数）。
+        let mut read_back: u64 = 0;
+        while let Some(chunk) = rx.recv().await {
+            read_back += chunk.data.len() as u64;
+        }
         let hasher = read_task
             .await
             .map_err(|e| StorageError::OperationError(format!("hash task panicked: {e:?}")))??;
-        Ok(hasher.map(ConsistencyCheck::finalize).unwrap_or_default())
+        Ok((
+            hasher.map(ConsistencyCheck::finalize).unwrap_or_default(),
+            read_back,
+        ))
+    }
+
+    /// size/hash mismatch 失败路径的 best-effort 目标端清理：删除已落地的
+    /// 坏文件/坏对象（issue #58）。清理失败只告警，不遮蔽原 mismatch 错误。
+    async fn cleanup_mismatched_dest(to: &StorageEnum, entry: &EntryEnum) {
+        if let Err(e) = to.delete_file(entry).await {
+            warn!(
+                "failed to clean up mismatched destination {:?}: {e}",
+                entry.get_relative_path()
+            );
+        }
+    }
+
+    /// integrity 读回校验（issue #58）：hash 读回过程顺带核对读回字节数
+    /// （零额外存储 RPC），再比对 BLAKE3。任一 mismatch → best-effort 清理
+    /// 目标端坏文件后返回 Err。
+    async fn verify_dest_integrity(
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        size: u64,
+        src_hash: &str,
+    ) -> Result<()> {
+        let (dst_hash, read_back) = to
+            .compute_hash_and_len(entry.get_relative_path(), size)
+            .await?;
+        if read_back != size {
+            Self::cleanup_mismatched_dest(to, entry).await;
+            return Err(StorageError::OperationError(format!(
+                "integrity check failed: destination read-back returned {read_back} bytes, expected {size}: {:?}",
+                entry.get_relative_path()
+            )));
+        }
+        if src_hash != dst_hash {
+            Self::cleanup_mismatched_dest(to, entry).await;
+            return Err(StorageError::OperationError(
+                "integrity check failed: source and destination hashes differ".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Copy a file with optional `QoS` rate limiting and integrity verification.
@@ -654,6 +707,17 @@ impl StorageEnum {
                 }
             };
 
+            // 写前断言（issue #58，无条件）：源读回字节数必须等于 entry 声明的
+            // size——源截断/扫描后并发变更防线。数据已在内存，纯本地比较，
+            // 零额外 IO；尚未写入目标端，无需清理。
+            let read_len = data.len() as u64;
+            if read_len != size {
+                return Err(StorageError::OperationError(format!(
+                    "size check failed: read {read_len} bytes from source, expected {size}: {:?}",
+                    entry.get_relative_path()
+                )));
+            }
+
             // Integrity: hash the data we just read from source.
             let source_hash = if enable_integrity_check && !data.is_empty() {
                 let mut h = HashCalculator::new();
@@ -704,12 +768,7 @@ impl StorageEnum {
             }
 
             if let Some(src_hash) = source_hash {
-                let dst_hash = to.compute_hash(entry.get_relative_path(), size).await?;
-                if src_hash != dst_hash {
-                    return Err(StorageError::OperationError(
-                        "integrity check failed: source and destination hashes differ".to_string(),
-                    ));
-                }
+                Self::verify_dest_integrity(to, entry, size, &src_hash).await?;
             }
             if !is_source_reserved {
                 from.delete_file(entry).await?;
@@ -872,8 +931,19 @@ impl StorageEnum {
 
         let source_hasher = read_res
             .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))??;
-        write_res
+        let bytes_written = write_res
             .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))??;
+
+        // 写端本地计数断言（issue #58，无条件）：实际写入字节数必须等于 entry
+        // 声明的 size——源截断时读端提前 EOF、写端静默少写的防线。纯本地比较，
+        // 零额外存储 RPC；不等则清理目标端残留坏文件后报错。
+        if bytes_written != size {
+            Self::cleanup_mismatched_dest(to, entry).await;
+            return Err(StorageError::OperationError(format!(
+                "size check failed: wrote {bytes_written} bytes, expected {size}: {:?}",
+                entry.get_relative_path()
+            )));
+        }
 
         // Final cancel check before integrity verification (which itself does IO).
         if let Some(ref token) = cancel
@@ -884,12 +954,7 @@ impl StorageEnum {
 
         if enable_integrity_check && let Some(src_h) = source_hasher {
             let src_hash = src_h.finalize();
-            let dst_hash = to.compute_hash(entry.get_relative_path(), size).await?;
-            if src_hash != dst_hash {
-                return Err(StorageError::OperationError(
-                    "integrity check failed: source and destination hashes differ".to_string(),
-                ));
-            }
+            Self::verify_dest_integrity(to, entry, size, &src_hash).await?;
         }
 
         if !is_source_reserved {
