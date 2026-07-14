@@ -47,19 +47,23 @@
 ## 步骤
 
 - [x] 1. 建立本执行计划 → 验证：文件落盘、单独 commit
-- [ ] 2. 写端计数基础：`write_pipeline_core`/四后端 `write_data` 返回
+- [x] 2. 写端计数基础：`write_pipeline_core`/四后端 `write_data` 返回
       `Result<u64>`，调用点适配 → 验证：`cargo check` 通过，行为零变化
-- [ ] 3. `copy_file_with_cancel` 单块/多块：写前断言 + 计数断言 +
+      （322 单测 + 24 集成全绿）
+- [x] 3. `copy_file_with_cancel` 单块/多块：写前断言 + 计数断言 +
       `compute_hash_and_len` + `verify_dest_integrity`/`cleanup_mismatched_dest`
       helper → 验证：`cargo check` + 存量测试全绿
-- [ ] 4. `copy_file_resumable_to_s3`：会话字节断言前移 + hash mismatch 清理
+- [x] 4. `copy_file_resumable_to_s3`：会话字节断言前移 + hash mismatch 清理
       → 验证：`cargo check`（S3 分支无本地环境，逻辑走查 + 断言纯本地）
-- [ ] 5. 测试：tests/test_copy_size_guard.rs 截断注入（单块/多块 ×
+- [x] 5. 测试：tests/test_copy_size_guard.rs 截断注入（单块/多块 ×
       integrity on/off → Err 且目标无残留）+ src/storage_enum.rs tests mod
       （`verify_dest_integrity`：hash mismatch、读回 size mismatch → 清理生效）
-      → 验证：新用例全绿
-- [ ] 6. 回归：`cargo test` 全套 + `cargo clippy --all-targets` 新代码零告警
-      → 验证：全绿后在本计划记录结果
+      → 验证：新用例 8 例全绿
+- [x] 6. 回归：`cargo test` 全套 + `cargo clippy --all-targets` 新代码零告警
+      → 验证：325 单测（322 存量 + 3 新）+ 29 集成（24 存量 + 5 新）全绿，
+      doctest 2 ignored 为存量；clippy 对比 origin/main 基线新代码零新增
+      告警位点（仅存量位点 future 尺寸漂移 22032→22096 / 24288→24352）；
+      NAS 续传回归由 tests/test_copy_file_resume.rs 存量用例证明
 
 ## 约束
 
