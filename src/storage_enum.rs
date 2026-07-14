@@ -2140,3 +2140,97 @@ pub async fn create_storage(
         StorageType::Local => create_local_storage(path, block_size, ensure_dir),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    async fn reset_dir(dir: &str) {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+        tokio::fs::create_dir_all(dir).await.unwrap();
+    }
+
+    /// hash mismatch（size 相同、内容不同）→ Err 且目标坏文件被清理（issue #58）。
+    #[tokio::test]
+    async fn verify_dest_integrity_hash_mismatch_cleans_dest() {
+        let dir = "/tmp/dm-verify-hash-mismatch";
+        reset_dir(dir).await;
+        tokio::fs::write(format!("{dir}/good.bin"), vec![0xAAu8; 4096])
+            .await
+            .unwrap();
+        tokio::fs::write(format!("{dir}/blob.bin"), vec![0xBBu8; 4096])
+            .await
+            .unwrap();
+
+        let storage = create_storage(dir, None, false).await.unwrap();
+        let entry = storage.get_metadata(Path::new("blob.bin")).await.unwrap();
+        let src_hash = storage
+            .compute_hash(Path::new("good.bin"), 4096)
+            .await
+            .unwrap();
+
+        let err = StorageEnum::verify_dest_integrity(&storage, &entry, 4096, &src_hash)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("hashes differ"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            tokio::fs::metadata(format!("{dir}/blob.bin")).await.is_err(),
+            "mismatched destination file should be cleaned up"
+        );
+    }
+
+    /// 读回字节数不足（目标比声明 size 短）→ Err 且目标被清理（issue #58）。
+    #[tokio::test]
+    async fn verify_dest_integrity_short_readback_cleans_dest() {
+        let dir = "/tmp/dm-verify-short-readback";
+        reset_dir(dir).await;
+        tokio::fs::write(format!("{dir}/blob.bin"), vec![0xCCu8; 3000])
+            .await
+            .unwrap();
+
+        let storage = create_storage(dir, None, false).await.unwrap();
+        let entry = storage.get_metadata(Path::new("blob.bin")).await.unwrap();
+
+        // 期望 4096 字节但目标只有 3000：hash 读回顺带的字节数核对失败
+        let err = StorageEnum::verify_dest_integrity(&storage, &entry, 4096, "irrelevant")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("read-back returned 3000"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            tokio::fs::metadata(format!("{dir}/blob.bin")).await.is_err(),
+            "short destination file should be cleaned up"
+        );
+    }
+
+    /// size/hash 全匹配 → Ok 且目标文件保留。
+    #[tokio::test]
+    async fn verify_dest_integrity_match_keeps_dest() {
+        let dir = "/tmp/dm-verify-match";
+        reset_dir(dir).await;
+        tokio::fs::write(format!("{dir}/blob.bin"), vec![0xDDu8; 4096])
+            .await
+            .unwrap();
+
+        let storage = create_storage(dir, None, false).await.unwrap();
+        let entry = storage.get_metadata(Path::new("blob.bin")).await.unwrap();
+        let src_hash = storage
+            .compute_hash(Path::new("blob.bin"), 4096)
+            .await
+            .unwrap();
+
+        StorageEnum::verify_dest_integrity(&storage, &entry, 4096, &src_hash)
+            .await
+            .unwrap();
+        assert!(
+            tokio::fs::metadata(format!("{dir}/blob.bin")).await.is_ok(),
+            "matching destination file must be kept"
+        );
+    }
+}
