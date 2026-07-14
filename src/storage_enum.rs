@@ -1363,6 +1363,8 @@ impl StorageEnum {
     ///
     /// 失败时**不 abort** upload，已上传 parts 即续传进度；成功时
     /// `CompleteMultipartUpload` 原子生效，目标端不存在半截可见对象。
+    /// Complete 之前有写端本地会话字节断言（issue #58）：本次确认上传的字节数
+    /// 不等于缺失区间总和（如源读截断）则不提交，坏对象根本不落地。
     ///
     /// hash 比对晚于 `commit_chunk_stream`（`CompleteMultipartUpload`）——
     /// in-progress multipart 的 parts 在 Complete 前不能作为一个连续对象读取，
@@ -1390,6 +1392,19 @@ impl StorageEnum {
         // 分支不使用该参数），传入 entry 自身路径仅作占位。
         let (missing, handle) =
             Self::resume_prepare(to, entry, entry.get_relative_path(), true).await?;
+
+        // 写端本地会话计数（issue #58）：wrap on_committed 累计本次确认上传的
+        // 字节数（零额外存储 RPC），供 CompleteMultipartUpload 前的 size 断言。
+        let expected_session_bytes: u64 = missing.iter().map(|(start, end)| end - start).sum();
+        let session_bytes = Arc::new(AtomicU64::new(0));
+        let on_committed: CommitCallback = {
+            let session_bytes = session_bytes.clone();
+            let inner = on_committed;
+            Arc::new(move |offset, len| {
+                session_bytes.fetch_add(len, Ordering::Relaxed);
+                inner(offset, len);
+            })
+        };
 
         // ── 源端：只读缺失区间（以目标端 ListParts 反推为准）──
         let (rx, read_handle) = Self::read_chunk_stream(
@@ -1419,6 +1434,19 @@ impl StorageEnum {
         read_res?;
         write_res?;
 
+        // 本地字节计数断言（issue #58，前移到 CompleteMultipartUpload 之前）：
+        // 本次会话确认上传的字节数必须恰好补齐全部缺失区间，不等则不提交——
+        // 坏对象根本不落地。沿用「失败不 abort」设计：已上传 parts 是合法续传
+        // 进度，保留供重试补齐（源 size 变更场景由 prepare_resumable_upload 的
+        // stale upload 处理收拾）。
+        let uploaded = session_bytes.load(Ordering::Relaxed);
+        if uploaded != expected_session_bytes {
+            return Err(StorageError::OperationError(format!(
+                "size check failed before multipart completion: session uploaded {uploaded} bytes, missing intervals require {expected_session_bytes}: {:?}",
+                entry.get_relative_path()
+            )));
+        }
+
         // ── 提交：校验 parts 全覆盖 → CompleteMultipartUpload ──
         Self::commit_chunk_stream(to, entry, size, handle).await?;
 
@@ -1426,6 +1454,8 @@ impl StorageEnum {
             let src_hash = from.compute_hash(entry.get_relative_path(), size).await?;
             let dst_hash = to.compute_hash(entry.get_relative_path(), size).await?;
             if src_hash != dst_hash {
+                // Complete 已提交，坏对象已可见：best-effort 清理（issue #58）。
+                Self::cleanup_mismatched_dest(to, entry).await;
                 return Err(StorageError::OperationError(
                     "integrity check failed: source and destination hashes differ".to_string(),
                 ));
