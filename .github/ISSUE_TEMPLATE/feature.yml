@@ -1,0 +1,45 @@
+name: Spec-driven change
+description: Propose a feature, protocol change, or cross-repository change
+title: "[spec] "
+labels: ["feature"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the observable problem and affected users.
+    validations:
+      required: true
+  - type: textarea
+    id: goals
+    attributes:
+      label: Goals and non-goals
+    validations:
+      required: true
+  - type: checkboxes
+    id: repos
+    attributes:
+      label: Affected repositories
+      options:
+        - label: nfs-rs
+        - label: data-mover-rs
+        - label: terrasync-rs
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List independently testable outcomes.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and migration
+      description: Cover APIs, protocols, configuration, and persisted state.
+  - type: textarea
+    id: testing
+    attributes:
+      label: Test strategy
+      description: Unit, contract, integration, failure, and performance tests.
+    validations:
+      required: true

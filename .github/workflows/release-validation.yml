@@ -1,0 +1,44 @@
+name: Release validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit or tag to validate
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terrasync-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: [self-hosted, linux, x64, terrasync-lab, data-mover-rs]
+    environment: release
+    timeout-minutes: 240
+    env:
+      RUN_ID: release-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: tests/lab/health-check.sh
+      - run: tests/lab/prepare-run.sh "$RUN_ID"
+      - run: cargo test --workspace --locked --no-fail-fast
+      - run: cargo build --release --locked
+      - run: cargo build --examples --release --locked
+      - name: Record dependency revisions
+        run: cargo metadata --locked --format-version 1 > dependency-metadata.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: data-mover-release-validation-${{ github.run_id }}
+          path: dependency-metadata.json
+      - name: Cleanup
+        if: always()
+        run: tests/lab/cleanup-run.sh "$RUN_ID"
