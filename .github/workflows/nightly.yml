@@ -32,7 +32,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
-      - run: cargo test --workspace --no-fail-fast
+      - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --no-fail-fast
       - run: cargo build --examples
       - name: cargo clippy (baseline-aware)
         run: python3 .claude/skills/quality-clippy/scripts/run.py
