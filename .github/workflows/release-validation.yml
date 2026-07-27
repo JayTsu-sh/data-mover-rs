@@ -23,7 +23,7 @@ jobs:
     env:
       RUN_ID: release-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
