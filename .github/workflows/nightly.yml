@@ -25,7 +25,7 @@ jobs:
       TERRASYNC_S3_SOURCE: http://10.10.1.12:9000
       TERRASYNC_S3_DEST: http://10.10.1.13:9000
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
