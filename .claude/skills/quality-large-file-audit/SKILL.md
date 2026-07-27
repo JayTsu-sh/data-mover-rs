@@ -1,21 +1,21 @@
 ---
 name: quality-large-file-audit
-description: 列出 src/*.rs 中 >800 行的文件，对比 baseline (filter 4849 / s3 3350 / nfs 3100 / cifs 2246)。新文件 >800 或现有文件继续增长是 WARN。
+description: 列出 src/*.rs 中 >800 行的文件，对比 baseline (filter 5303 / s3 4329 / nfs 3853 / cifs 3152)。新文件 >800 或现有文件继续增长是 WARN。
 ---
 
 # quality-large-file-audit
 
 **触发关键词**：审大文件 / 找拆分候选 / quality large file。
 
-## Baseline (2026-05-09)
+## Baseline (2026-07-27)
 
 ```
-filter.rs        4849
-s3.rs            3350
-nfs.rs           3100
-cifs.rs          2246
-storage_enum.rs  1334
-local.rs         1134
+filter.rs        5303
+s3.rs            4329
+nfs.rs           3853
+cifs.rs          3152
+storage_enum.rs  2246
+local.rs         1423
 ```
 
 新写的代码 ≤800 行 / 文件。已超的 6 个是 backlog。

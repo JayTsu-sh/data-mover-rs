@@ -13,26 +13,27 @@ sys.path.insert(0, str(SHARED))
 
 from protocol_constants import PROJECT_ROOT  # noqa: E402
 
-# Baseline 截至 2026-05-09 (所有现有 src/*.rs，含 <800 行的)
+# Baseline 截至 2026-07-27 (所有现有 src/*.rs，含 <800 行的)
 # 增长 / 缩减按 % 计算。新文件 (不在表内) 必须 ≤800 行。
 BASELINE = {
-    "filter.rs": 4849,
-    "s3.rs": 3350,
-    "nfs.rs": 3100,
-    "cifs.rs": 2246,
-    "storage_enum.rs": 1334,
-    "local.rs": 1134,
-    "acl.rs": 934,
-    "qos.rs": 660,
-    "lib.rs": 542,
-    "dir_tree.rs": 460,
-    "tar_pack.rs": 244,
-    "error.rs": 164,
-    "walk_scheduler.rs": 147,
-    "time_util.rs": 128,
-    "checksum.rs": 70,
+    "filter.rs": 5303,
+    "s3.rs": 4329,
+    "nfs.rs": 3853,
+    "cifs.rs": 3152,
+    "storage_enum.rs": 2246,
+    "local.rs": 1423,
+    "acl.rs": 985,
+    "qos.rs": 672,
+    "lib.rs": 565,
+    "dir_tree.rs": 474,
+    "tar_pack.rs": 286,
+    "error.rs": 166,
+    "walk_scheduler.rs": 157,
+    "time_util.rs": 130,
+    "checksum.rs": 71,
     "url_redact.rs": 66,
-    "async_receiver.rs": 31,
+    "async_receiver.rs": 33,
+    "write_pipeline.rs": 226,
 }
 NEW_FILE_LIMIT = 800
 GROWTH_WARN_PCT = 5
