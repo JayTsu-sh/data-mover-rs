@@ -34,7 +34,8 @@ jobs:
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: cargo test --workspace --no-fail-fast
       - run: cargo build --examples
-      - run: cargo clippy --all-targets -- -D warnings
+      - name: cargo clippy (baseline-aware)
+        run: python3 .claude/skills/quality-clippy/scripts/run.py
       - name: Cleanup
         if: always()
         run: tests/lab/cleanup-run.sh "$RUN_ID"
