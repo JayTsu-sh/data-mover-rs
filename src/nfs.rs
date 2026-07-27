@@ -2611,14 +2611,9 @@ impl NFSStorage {
                     // 重新尝试读取
                     let mount = self.mount.clone();
                     let file_fh = file.inner.fh.clone();
-                    result = mount
-                        .read(file_fh, offset, count)
-                        .await
-                        .map_err(|e| {
-                            StorageError::NfsError(format!(
-                                "Failed to read file after refresh: {e}"
-                            ))
-                        });
+                    result = mount.read(file_fh, offset, count).await.map_err(|e| {
+                        StorageError::NfsError(format!("Failed to read file after refresh: {e}"))
+                    });
                 } else {
                     // 不是文件句柄无效的错误，直接返回原始错误
                     break;
@@ -3741,7 +3736,10 @@ mod tests {
 
     /// 生成不重复模式的内容，偏移错位时字节比对必然失败
     fn make_content(len: usize) -> Bytes {
-        (0..len).map(|i| (i % 251) as u8).collect::<Vec<u8>>().into()
+        (0..len)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>()
+            .into()
     }
 
     /// 用假内容驱动 `next_read_want` 分段推进（镜像 `NFSStorage::read` 的
@@ -3763,7 +3761,10 @@ mod tests {
         while let Some(want) = next_read_want(cur, end, block_size) {
             calls.push((cur, want));
             let start = usize::min(cur as usize, content.len());
-            let len = usize::min(usize::min(want as usize, max_per_call), content.len() - start);
+            let len = usize::min(
+                usize::min(want as usize, max_per_call),
+                content.len() - start,
+            );
             let data = content.slice(start..start + len);
             if data.is_empty() {
                 break;

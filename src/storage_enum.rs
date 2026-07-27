@@ -2180,7 +2180,9 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(
-            tokio::fs::metadata(format!("{dir}/blob.bin")).await.is_err(),
+            tokio::fs::metadata(format!("{dir}/blob.bin"))
+                .await
+                .is_err(),
             "mismatched destination file should be cleaned up"
         );
     }
@@ -2208,7 +2210,9 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(
-            tokio::fs::metadata(format!("{dir}/blob.bin")).await.is_err(),
+            tokio::fs::metadata(format!("{dir}/blob.bin"))
+                .await
+                .is_err(),
             "short destination file should be cleaned up"
         );
     }

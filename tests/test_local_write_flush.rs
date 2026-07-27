@@ -45,7 +45,9 @@ async fn full_copy_no_tail_loss_under_repetition() {
             .await
             .unwrap();
 
-        let got = tokio::fs::read(format!("{dst_dir}/blob.bin")).await.unwrap();
+        let got = tokio::fs::read(format!("{dst_dir}/blob.bin"))
+            .await
+            .unwrap();
         assert_eq!(
             got.len(),
             expected.len(),
