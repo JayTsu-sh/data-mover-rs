@@ -14,7 +14,7 @@ def client(endpoint: str):
         aws_access_key_id=os.environ["LAB_S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["LAB_S3_SECRET_KEY"],
         region_name="us-east-1",
-        config=Config(s3={"addressing_style": "path"}),
+        config=Config(s3={"addressing_style": "path"}, proxies={}),
     )
 
 
