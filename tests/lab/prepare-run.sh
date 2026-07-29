@@ -11,7 +11,7 @@ done
 
 for host in "$LAB_SOURCE_MGMT" "$LAB_DEST_MGMT"; do
   ssh_lab "$host" \
-    "mkdir -p '$LAB_NFS3_EXPORT/ci/$run_id' '$LAB_NFS41_EXPORT/ci/$run_id'"
+    "mkdir -p '$LAB_NFS3_EXPORT/ci/$run_id' '$LAB_NFS41_EXPORT/ci/$run_id' && chmod 0777 '$LAB_NFS3_EXPORT/ci/$run_id' '$LAB_NFS41_EXPORT/ci/$run_id'"
 done
 
 echo "$run_id"

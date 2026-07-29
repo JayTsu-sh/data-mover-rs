@@ -4,7 +4,6 @@ version = "0.2.0"
 edition = "2024"
 
 [patch.crates-io]
-nfs-rs = { git = "https://github.com/JayTsu-sh/nfs-rs.git" }
 smb = { git = "https://github.com/JayTsu-sh/smb-rs.git" }
 
 [dependencies]
@@ -30,7 +29,7 @@ dashmap = "6.1.0"
 parking_lot = "0.12"
 tracing = "0.1.44"
 moka = { version = "0.12.15", features = ["sync"] }
-nfs-rs = "0.2.0"
+nfs-rs = "0.3.0"
 path-clean = "1.0.1"
 quick-xml = { version = "0.39.2", features = ["serialize"] }
 rayon = "1"

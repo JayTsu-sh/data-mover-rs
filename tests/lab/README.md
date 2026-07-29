@@ -14,3 +14,7 @@ identifier and call `cleanup-run.sh` from an `always()` step.
 
 Management traffic uses `10.131.9.0/20`. Test data uses `10.10.1.0/24`.
 Credentials are provisioned on the self-hosted runner and must not be committed.
+
+`run-e2e.sh` creates an isolated payload for the supplied run ID, copies it from
+the source server to the destination server through `data-mover`, and verifies
+the SHA-256 checksum on both NFSv3 and NFSv4.1.
