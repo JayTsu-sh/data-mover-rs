@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use clap::Parser;
-use data_mover::{Result, StorageEnum, create_storage};
+use data_mover::{EntryEnum, Result, StorageEnum, create_storage};
 
 #[derive(Debug, Parser)]
 #[command(about = "Copy one file between two data-mover storage URLs")]
@@ -36,9 +36,35 @@ async fn main() -> Result<()> {
             copied.get_size()
         )));
     }
+    if matches!((&entry, &copied), (EntryEnum::NAS(_), EntryEnum::NAS(_))) {
+        if copied.get_mtime() != entry.get_mtime() {
+            return Err(data_mover::error::StorageError::OperationError(format!(
+                "destination mtime mismatch: expected {}, got {}",
+                entry.get_mtime(),
+                copied.get_mtime()
+            )));
+        }
+        if copied.get_mode().map(|mode| mode & 0o7777) != entry.get_mode().map(|mode| mode & 0o7777)
+        {
+            return Err(data_mover::error::StorageError::OperationError(format!(
+                "destination mode mismatch: expected {:?}, got {:?}",
+                entry.get_mode().map(|mode| mode & 0o7777),
+                copied.get_mode().map(|mode| mode & 0o7777)
+            )));
+        }
+        if copied.get_uid() != entry.get_uid() || copied.get_gid() != entry.get_gid() {
+            return Err(data_mover::error::StorageError::OperationError(format!(
+                "destination ownership mismatch: expected {:?}:{:?}, got {:?}:{:?}",
+                entry.get_uid(),
+                entry.get_gid(),
+                copied.get_uid(),
+                copied.get_gid()
+            )));
+        }
+    }
 
     println!(
-        "copied and verified {} bytes: {}",
+        "copied and verified {} bytes and applicable metadata: {}",
         entry.get_size(),
         args.path
     );
