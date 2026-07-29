@@ -23,11 +23,13 @@ storage_url() {
     local) printf '%s/%s' "$local_root" "$role" ;;
     nfs3)
       export_path="$LAB_NFS3_EXPORT"
-      printf 'nfs://%s%s:/ci/%s' "$host" "$export_path" "$run_id"
+      printf 'nfs://%s%s:/ci/%s?version=3&noresvport=true' \
+        "$host" "$export_path" "$run_id"
       ;;
     nfs41)
       export_path="$LAB_NFS41_EXPORT"
-      printf 'nfs://%s%s:/ci/%s' "$host" "$export_path" "$run_id"
+      printf 'nfs://%s%s:/ci/%s?version=4.1&noresvport=true' \
+        "$host" "$export_path" "$run_id"
       ;;
     s3)
       printf 's3://%s:%s@%s.%s:9000/ci/%s/%s' \

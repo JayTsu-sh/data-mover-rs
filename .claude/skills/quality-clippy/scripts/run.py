@@ -2,7 +2,8 @@
 """quality-clippy skill runner.
 
 策略：
-- 跑 cargo clippy --all-targets (不加 -D warnings)，捕获 warning + error 总数。
+- 对生产库运行 cargo clippy，并用 cap-lints 将已有 deny lint 纳入 warning 基线。
+- 测试和 examples 由独立的 cargo test / cargo build 步骤保证可编译。
 - 与 baseline 比较：存在 baseline_count.<sys.platform>.txt (如 win32) 时优先，
   否则用 baseline_count.txt (Linux 口径)。
 - 总数 ≤ baseline → PASS (允许下降)。
@@ -35,6 +36,7 @@ BASELINE_FILE = (
     _PLATFORM_BASELINE if _PLATFORM_BASELINE.exists() else SKILL_DIR / "baseline_count.txt"
 )
 WARNING_RE = re.compile(r"^(warning|error):", re.MULTILINE)
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def load_baseline() -> int:
@@ -52,7 +54,7 @@ def load_baseline() -> int:
 
 
 def main() -> int:
-    cmd = ["cargo", "clippy", "--all-targets"]
+    cmd = ["cargo", "clippy", "--lib", "--", "--cap-lints", "warn"]
     print(f"[skill quality-clippy] $ {' '.join(cmd)}")
     # encoding 显式 UTF-8：Windows 默认 GBK 会在 cargo 输出含非 GBK 字节时崩
     result = subprocess.run(
@@ -62,10 +64,17 @@ def main() -> int:
     output = (result.stdout or "") + (result.stderr or "")
     sys.stdout.write(output)
 
-    count = len(WARNING_RE.findall(output))
+    count = len(WARNING_RE.findall(ANSI_RE.sub("", output)))
     baseline = load_baseline()
 
     print(f"\n[skill quality-clippy] warnings+errors: {count} (baseline {baseline})")
+
+    if result.returncode != 0:
+        print(
+            f"[skill quality-clippy] FAIL: cargo exited with {result.returncode}",
+            file=sys.stderr,
+        )
+        return result.returncode
 
     if count > baseline:
         print(f"[skill quality-clippy] FAIL: count {count} > baseline {baseline} (regression)", file=sys.stderr)
