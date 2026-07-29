@@ -11,6 +11,12 @@ LAB_DEST_DATA="${LAB_DEST_DATA:-10.10.1.13}"
 LAB_WORKER_DATA="${LAB_WORKER_DATA:-10.10.1.14}"
 LAB_NFS3_EXPORT="${LAB_NFS3_EXPORT:-/srv/nfs/v3}"
 LAB_NFS41_EXPORT="${LAB_NFS41_EXPORT:-/srv/nfs/v4}"
+LAB_S3_BUCKET="${LAB_S3_BUCKET:-terrasync-ci}"
+
+require_s3_credentials() {
+  : "${LAB_S3_ACCESS_KEY:?LAB_S3_ACCESS_KEY is required}"
+  : "${LAB_S3_SECRET_KEY:?LAB_S3_SECRET_KEY is required}"
+}
 
 ssh_lab() {
   local host="$1"

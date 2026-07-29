@@ -38,10 +38,8 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "copied {} bytes: {} -> {} ({})",
+        "copied and verified {} bytes: {}",
         entry.get_size(),
-        args.source,
-        args.destination,
         args.path
     );
     Ok(())
