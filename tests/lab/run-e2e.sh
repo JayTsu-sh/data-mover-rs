@@ -7,7 +7,7 @@ validate_run_id "$run_id"
 require_s3_credentials
 
 local_root="/tmp/data-mover-lab/$run_id"
-mkdir -p "$local_root/source" "$local_root/destination"
+mkdir -p "$local_root/source" "$local_root/destination" "$local_root/seed"
 
 storage_url() {
   local role="$1"
@@ -42,22 +42,16 @@ seed_source() {
   local backend="$1"
   local key="$2"
   local value="$3"
-  case "$backend" in
-    local) printf '%s' "$value" > "$local_root/source/$key" ;;
-    nfs3)
-      ssh_lab "$LAB_SOURCE_MGMT" \
-        "printf '%s' '$value' > '$LAB_NFS3_EXPORT/ci/$run_id/$key'"
-      ;;
-    nfs41)
-      ssh_lab "$LAB_SOURCE_MGMT" \
-        "printf '%s' '$value' > '$LAB_NFS41_EXPORT/ci/$run_id/$key'"
-      ;;
-    s3)
-      python3 "$(dirname "$0")/s3_helper.py" put \
-        --endpoint "$LAB_SOURCE_DATA" --bucket "$LAB_S3_BUCKET" \
-        --key "ci/$run_id/source/$key" --value "$value"
-      ;;
-  esac
+  printf '%s' "$value" > "$local_root/seed/$key"
+  if [[ "$backend" == "local" ]]; then
+    cp "$local_root/seed/$key" "$local_root/source/$key"
+    return
+  fi
+
+  cargo run --quiet --locked --example storage_copy -- \
+    --source "$local_root/seed" \
+    --destination "$(storage_url source "$backend")" \
+    --path "$key"
 }
 
 destination_hash() {
@@ -66,11 +60,11 @@ destination_hash() {
   case "$backend" in
     local) sha256sum "$local_root/destination/$key" | cut -d' ' -f1 ;;
     nfs3)
-      ssh_lab "$LAB_DEST_MGMT" \
+      ssh_lab_root "$LAB_DEST_MGMT" \
         "sha256sum '$LAB_NFS3_EXPORT/ci/$run_id/$key' | cut -d' ' -f1"
       ;;
     nfs41)
-      ssh_lab "$LAB_DEST_MGMT" \
+      ssh_lab_root "$LAB_DEST_MGMT" \
         "sha256sum '$LAB_NFS41_EXPORT/ci/$run_id/$key' | cut -d' ' -f1"
       ;;
     s3)

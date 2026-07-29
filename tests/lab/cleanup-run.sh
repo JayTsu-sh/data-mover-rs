@@ -19,6 +19,6 @@ fi
 rm -rf -- "/tmp/data-mover-lab/$run_id"
 
 for host in "$LAB_SOURCE_MGMT" "$LAB_DEST_MGMT"; do
-  ssh_lab "$host" \
+  ssh_lab_root "$host" \
     "rm -rf -- '$LAB_NFS3_EXPORT/ci/$run_id' '$LAB_NFS41_EXPORT/ci/$run_id'"
 done
