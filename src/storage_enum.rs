@@ -556,6 +556,14 @@ impl StorageEnum {
         }
     }
 
+    /// Apply source metadata after the destination data has been committed.
+    async fn apply_copied_metadata(to: &StorageEnum, entry: &EntryEnum) -> Result<()> {
+        match (to, entry) {
+            (StorageEnum::S3(_), _) | (_, EntryEnum::S3(_)) => Ok(()),
+            (_, EntryEnum::NAS(_)) => to.set_entry_metadata(entry).await,
+        }
+    }
+
     /// integrity 读回校验（issue #58）：hash 读回过程顺带核对读回字节数
     /// （零额外存储 RPC），再比对 BLAKE3。任一 mismatch → best-effort 清理
     /// 目标端坏文件后返回 Err。
@@ -762,6 +770,8 @@ impl StorageEnum {
                 }
             }
 
+            Self::apply_copied_metadata(to, entry).await?;
+
             // per-chunk 带宽统计：单块路径，写完后一次性增量
             if let Some(ref counter) = bytes_counter {
                 counter.fetch_add(size, Ordering::Relaxed);
@@ -944,6 +954,8 @@ impl StorageEnum {
                 entry.get_relative_path().display()
             )));
         }
+
+        Self::apply_copied_metadata(to, entry).await?;
 
         // Final cancel check before integrity verification (which itself does IO).
         if let Some(ref token) = cancel
@@ -2145,10 +2157,48 @@ pub async fn create_storage(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use filetime::FileTime;
 
     async fn reset_dir(dir: &str) {
         let _ = tokio::fs::remove_dir_all(dir).await;
         tokio::fs::create_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_file_preserves_local_mtime_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let src_dir = "/tmp/dm-copy-metadata-src";
+        let dst_dir = "/tmp/dm-copy-metadata-dst";
+        reset_dir(src_dir).await;
+        reset_dir(dst_dir).await;
+
+        let src_path = format!("{src_dir}/fixture.bin");
+        tokio::fs::write(&src_path, b"metadata fixture")
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&src_path, std::fs::Permissions::from_mode(0o640))
+            .await
+            .unwrap();
+        let expected_mtime = FileTime::from_unix_time(1_700_000_000, 123_456_789);
+        filetime::set_file_mtime(&src_path, expected_mtime).unwrap();
+
+        let source = create_storage(src_dir, None, false).await.unwrap();
+        let destination = create_storage(dst_dir, None, true).await.unwrap();
+        let entry = Box::pin(source.get_metadata(Path::new("fixture.bin")))
+            .await
+            .unwrap();
+        StorageEnum::copy_file(&source, &destination, &entry, None, true, true, None)
+            .await
+            .unwrap();
+
+        let copied = Box::pin(destination.get_metadata(Path::new("fixture.bin")))
+            .await
+            .unwrap();
+        assert_eq!(copied.get_mtime(), entry.get_mtime());
+        assert_eq!(copied.get_mode().map(|mode| mode & 0o7777), Some(0o640));
+        assert_eq!(copied.get_uid(), entry.get_uid());
+        assert_eq!(copied.get_gid(), entry.get_gid());
     }
 
     /// hash mismatch（size 相同、内容不同）→ Err 且目标坏文件被清理（issue #58）。

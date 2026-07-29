@@ -43,8 +43,11 @@ seed_source() {
   local key="$2"
   local value="$3"
   printf '%s' "$value" > "$local_root/seed/$key"
+  chmod 0640 "$local_root/seed/$key"
+  touch -m -d '@1700000000.123456789' "$local_root/seed/$key"
   if [[ "$backend" == "local" ]]; then
-    cp "$local_root/seed/$key" "$local_root/source/$key"
+    cp --preserve=mode,ownership,timestamps \
+      "$local_root/seed/$key" "$local_root/source/$key"
     return
   fi
 
