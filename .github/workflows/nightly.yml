@@ -26,7 +26,7 @@ jobs:
       TERRASYNC_S3_DEST: http://10.10.1.13:9000
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
       - run: tests/lab/health-check.sh
@@ -36,6 +36,8 @@ jobs:
       - name: cargo clippy (baseline-aware)
         run: python3 .claude/skills/quality-clippy/scripts/run.py
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+      - name: Resumable copy E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-resume-e2e.sh "$RUN_ID"
       - name: Cleanup
         if: always()
         run: tests/lab/cleanup-run.sh "$RUN_ID"

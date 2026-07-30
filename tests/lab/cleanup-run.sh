@@ -10,6 +10,10 @@ for host in "$LAB_SOURCE_MGMT" "$LAB_DEST_MGMT" "$LAB_WORKER_MGMT"; do
 done
 
 if [[ -n "${LAB_S3_ACCESS_KEY:-}" && -n "${LAB_S3_SECRET_KEY:-}" ]]; then
+  python3 "$(dirname "$0")/s3_helper.py" abort-multipart-prefix \
+    --endpoint "$LAB_SOURCE_DATA" --bucket "$LAB_S3_BUCKET" --prefix "ci/$run_id/"
+  python3 "$(dirname "$0")/s3_helper.py" abort-multipart-prefix \
+    --endpoint "$LAB_DEST_DATA" --bucket "$LAB_S3_BUCKET" --prefix "ci/$run_id/"
   python3 "$(dirname "$0")/s3_helper.py" delete-prefix \
     --endpoint "$LAB_SOURCE_DATA" --bucket "$LAB_S3_BUCKET" --prefix "ci/$run_id/"
   python3 "$(dirname "$0")/s3_helper.py" delete-prefix \
