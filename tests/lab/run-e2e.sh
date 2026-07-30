@@ -157,3 +157,34 @@ actual_hash="$(
   exit 1
 }
 echo "same-endpoint S3 special-key CopyObject verified: $actual_hash"
+
+# Exercise S3 object rename as a server-side CopyObject followed by deletion of
+# the source. Special characters also verify that rename uses the encoded
+# x-amz-copy-source path.
+s3_rename_source="rename source %?# 中文.txt"
+s3_rename_destination="renamed destination %?# 中文.txt"
+s3_rename_value="data-mover-$run_id-s3-small-object-rename"
+seed_source s3 "$s3_rename_source" "$s3_rename_value"
+
+cargo run --quiet --locked --example storage_rename -- \
+  --storage "$(storage_url source s3)" \
+  --from "$s3_rename_source" \
+  --to "$s3_rename_destination"
+
+expected_hash="$(printf '%s' "$s3_rename_value" | sha256sum | cut -d' ' -f1)"
+actual_hash="$(
+  python3 "$(dirname "$0")/s3_helper.py" sha256 \
+    --endpoint "$LAB_SOURCE_DATA" --bucket "$LAB_S3_BUCKET" \
+    --key "ci/$run_id/source/$s3_rename_destination"
+)"
+[[ "$actual_hash" == "$expected_hash" ]] || {
+  echo "S3 small-object rename checksum mismatch" >&2
+  exit 1
+}
+if python3 "$(dirname "$0")/s3_helper.py" exists \
+  --endpoint "$LAB_SOURCE_DATA" --bucket "$LAB_S3_BUCKET" \
+  --key "ci/$run_id/source/$s3_rename_source"; then
+  echo "S3 small-object rename left the source object behind" >&2
+  exit 1
+fi
+echo "S3 small-object rename verified: $actual_hash"

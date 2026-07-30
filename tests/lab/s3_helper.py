@@ -5,6 +5,7 @@ import os
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 
 def client(endpoint: str):
@@ -21,7 +22,14 @@ def client(endpoint: str):
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "command",
-    choices=["ensure-bucket", "put", "sha256", "delete-prefix", "abort-multipart-prefix"],
+    choices=[
+        "ensure-bucket",
+        "put",
+        "sha256",
+        "exists",
+        "delete-prefix",
+        "abort-multipart-prefix",
+    ],
 )
 parser.add_argument("--endpoint", required=True)
 parser.add_argument("--bucket", required=True)
@@ -41,6 +49,13 @@ elif args.command == "put":
 elif args.command == "sha256":
     body = s3.get_object(Bucket=args.bucket, Key=args.key)["Body"].read()
     print(hashlib.sha256(body).hexdigest())
+elif args.command == "exists":
+    try:
+        s3.head_object(Bucket=args.bucket, Key=args.key)
+    except ClientError as error:
+        if error.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+            raise SystemExit(1)
+        raise
 elif args.command == "delete-prefix":
     token = None
     while True:

@@ -2,7 +2,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -50,7 +50,7 @@ use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
 use crate::filter::{FilterExpression, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
-use crate::storage_enum::StorageEnum;
+use crate::storage_enum::{StorageEnum, path_to_s3_key};
 use crate::third_party::hcp::client::HCPRestClient;
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
 use crate::{
@@ -347,6 +347,8 @@ fn build_skip_verify_http_client() -> SharedHttpClient {
 const DEFAULT_BLOCK_SIZE: u64 = 5 * 1024 * 1024; // 5MiB
 const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MiB
 const MAX_CONCURRENCY: usize = 5; // 最大并发上传数
+/// Maximum source object size supported by a single S3 `CopyObject` request.
+const COPY_SINGLE_MAX: u64 = 5 * 1024 * 1024 * 1024;
 /// S3 协议规定的 multipart upload 最大分块数
 const MAX_UPLOAD_PARTS: u64 = 10_000;
 
@@ -1111,6 +1113,74 @@ impl S3Storage {
             .await
             .map_err(|e| StorageError::S3Error(format!("CopyObject failed: {e:?}")))?;
         Ok(())
+    }
+
+    /// Rename an object within this S3 storage using a server-side copy followed
+    /// by deletion of the source. Object data never passes through data-mover.
+    pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.rename_with_expected_size(from, to, None).await
+    }
+
+    /// Rename an object and optionally validate the destination size when an
+    /// interrupted copy-delete sequence is retried after the source was deleted.
+    pub async fn rename_with_expected_size(
+        &self,
+        from: &Path,
+        to: &Path,
+        expected_size: Option<u64>,
+    ) -> Result<()> {
+        let from_relative = path_to_s3_key(from);
+        let to_relative = path_to_s3_key(to);
+        let from_key = self.build_full_key(&from_relative);
+        let to_key = self.build_full_key(&to_relative);
+
+        let source = match self.get_metadata(&from_relative).await {
+            Ok(entry) => entry,
+            Err(StorageError::FileNotFound(_)) => {
+                return match self.get_metadata(&to_relative).await {
+                    Ok(destination) => match expected_size {
+                        Some(expected) if destination.get_size() != expected => {
+                            Err(StorageError::OperationError(format!(
+                                "S3 rename retry found destination {to_key} with size {}, \
+                                 expected {expected}, while source {from_key} is missing",
+                                destination.get_size()
+                            )))
+                        }
+                        _ => Ok(()),
+                    },
+                    Err(StorageError::FileNotFound(_)) => Err(StorageError::FileNotFound(from_key)),
+                    Err(error) => Err(error),
+                };
+            }
+            Err(error) => return Err(error),
+        };
+
+        if let Some(expected) = expected_size
+            && source.get_size() != expected
+        {
+            return Err(StorageError::OperationError(format!(
+                "S3 rename source {from_key} has size {}, expected {expected}",
+                source.get_size()
+            )));
+        }
+
+        // Renaming a path to itself is a successful no-op. In particular, do
+        // not issue CopyObject followed by DeleteObject for the same key.
+        if from_key == to_key {
+            return Ok(());
+        }
+
+        if source.get_size() > COPY_SINGLE_MAX {
+            return Err(StorageError::OperationError(format!(
+                "S3 rename source {from_key} is {} bytes; objects larger than \
+                 {COPY_SINGLE_MAX} bytes require multipart rename",
+                source.get_size()
+            )));
+        }
+
+        self.copy_object(&self.bucket_name, &from_key, &self.bucket_name, &to_key)
+            .await?;
+        self.delete_object(&from_key).await
     }
 
     /// Cross-endpoint streaming copy: pipes `GetObject` `ByteStream` directly into `PutObject` /
