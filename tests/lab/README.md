@@ -17,7 +17,10 @@ Credentials are provisioned on the self-hosted runner and must not be committed.
 
 `run-e2e.sh` exercises the complete directed copy matrix across Local, NFSv3,
 NFSv4.1, and S3: 4 same-protocol paths plus 12 cross-protocol paths. Every case
-uses an isolated payload and verifies the destination SHA-256 checksum.
+uses an isolated payload and verifies the destination SHA-256 checksum. A
+separate payload larger than 12 MiB is copied from NFSv4.1 to NFSv4.1 so normal
+copy exercises multiple negotiated read and write requests, including the
+session-limited effective `wsize`.
 
 `run-resume-e2e.sh` exercises eight representative paths in two independent
 processes: the four same-backend paths plus Local → S3, S3 → Local, NFSv3 → S3,

@@ -99,3 +99,37 @@ for source_backend in "${backends[@]}"; do
     echo "$source_backend -> $destination_backend verified: $actual_hash"
   done
 done
+
+# Exercise negotiated NFSv4.1 rsize/wsize with a payload larger than a single
+# session request. The small matrix fixtures above validate routing and
+# metadata, but are not large enough to detect an invalid effective wsize.
+nfs41_key="nfs41-large-copy.bin"
+nfs41_seed="$local_root/seed/$nfs41_key"
+python3 -c '
+import pathlib
+import sys
+size = 12 * 1024 * 1024 + 123
+chunk = bytes(range(251)) * 4096
+path = pathlib.Path(sys.argv[1])
+with path.open("wb") as output:
+    remaining = size
+    while remaining:
+        piece = chunk[:min(len(chunk), remaining)]
+        output.write(piece)
+        remaining -= len(piece)
+' "$nfs41_seed"
+ssh_lab_root "$LAB_SOURCE_MGMT" \
+  "cat > '$LAB_NFS41_EXPORT/ci/$run_id/$nfs41_key'" < "$nfs41_seed"
+
+cargo run --quiet --locked --example storage_copy -- \
+  --source "$(storage_url source nfs41)" \
+  --destination "$(storage_url destination nfs41)" \
+  --path "$nfs41_key"
+
+expected_hash="$(sha256sum "$nfs41_seed" | cut -d' ' -f1)"
+actual_hash="$(destination_hash nfs41 "$nfs41_key")"
+[[ "$actual_hash" == "$expected_hash" ]] || {
+  echo "large nfs41 -> nfs41 checksum mismatch" >&2
+  exit 1
+}
+echo "large nfs41 -> nfs41 verified: $actual_hash"
