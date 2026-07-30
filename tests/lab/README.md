@@ -14,6 +14,11 @@ identifier and call `cleanup-run.sh` from an `always()` step.
 
 Management traffic uses `10.131.9.0/20`. Test data uses `10.10.1.0/24`.
 Credentials are provisioned on the self-hosted runner and must not be committed.
+The runner image must preinstall `rustup`, Rust `1.95.0`, `clippy`, and
+`rustfmt` for the `github-runner` account, with
+`/home/github-runner/.cargo/bin` on `PATH`. Keeping these tools in the image
+avoids a runtime dependency on `sh.rustup.rs`; the workflow still selects the
+exact toolchain to keep builds reproducible.
 
 `run-e2e.sh` exercises the complete directed copy matrix across Local, NFSv3,
 NFSv4.1, and S3: 4 same-protocol paths plus 12 cross-protocol paths. Every case
