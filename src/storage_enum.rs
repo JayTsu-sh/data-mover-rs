@@ -19,6 +19,30 @@ const HASH_CHANNEL_CAPACITY: usize = 4;
 const COPY_PIPELINE_CAPACITY: usize = 4;
 /// TAR 打包 pipeline 的 channel 容量（多文件顺序读，适当放大缓冲）
 const TAR_PIPELINE_CAPACITY: usize = 16;
+
+// Takes ownership so it can be passed directly to Result::map_err.
+#[allow(clippy::needless_pass_by_value)]
+fn source_read_error(error: StorageError) -> StorageError {
+    StorageError::ReadError(format!("Source read failed: {error}"))
+}
+
+// Takes ownership so it can be passed directly to Result::map_err.
+#[allow(clippy::needless_pass_by_value)]
+fn destination_write_error(error: StorageError) -> StorageError {
+    StorageError::WriteError(format!("Destination write failed: {error}"))
+}
+
+/// 归并已经 join 完成的读写任务结果。
+///
+/// 目标端失败通常会关闭 receiver，使源端同时报告次生的 channel-closed 错误。
+/// 两端都失败时优先返回目标端错误，保留真正根因。
+fn resolve_copy_pipeline<R, W>(read_result: Result<R>, write_result: Result<W>) -> Result<(R, W)> {
+    match (read_result, write_result) {
+        (_, Err(error)) => Err(destination_write_error(error)),
+        (Err(error), Ok(_)) => Err(source_read_error(error)),
+        (Ok(read), Ok(written)) => Ok((read, written)),
+    }
+}
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -696,18 +720,22 @@ impl StorageEnum {
             }
 
             let data = match (from, entry) {
-                (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
-                    s.read_file(&e.relative_path, size).await?
-                }
-                (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
-                    s.read_file(&e.relative_path, size).await?
-                }
-                (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
-                    s.read_file(&e.relative_path, size).await?
-                }
-                (StorageEnum::S3(s), EntryEnum::S3(e)) => {
-                    s.read_file(&e.relative_path, size).await?
-                }
+                (StorageEnum::Local(s), EntryEnum::NAS(e)) => s
+                    .read_file(&e.relative_path, size)
+                    .await
+                    .map_err(source_read_error)?,
+                (StorageEnum::NFS(s), EntryEnum::NAS(e)) => s
+                    .read_file(&e.relative_path, size)
+                    .await
+                    .map_err(source_read_error)?,
+                (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => s
+                    .read_file(&e.relative_path, size)
+                    .await
+                    .map_err(source_read_error)?,
+                (StorageEnum::S3(s), EntryEnum::S3(e)) => s
+                    .read_file(&e.relative_path, size)
+                    .await
+                    .map_err(source_read_error)?,
                 _ => {
                     return Err(StorageError::OperationError(format!(
                         "unsupported source/entry combination for copy: {entry:?}"
@@ -738,35 +766,43 @@ impl StorageEnum {
             match (to, entry) {
                 (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
                     s.write_file(&e.relative_path, data, e.uid, e.gid, Some(e.mode))
-                        .await?;
+                        .await
+                        .map_err(destination_write_error)?;
                 }
                 (StorageEnum::Local(s), EntryEnum::S3(e)) => {
                     s.write_file(Path::new(&e.relative_path), data, None, None, None)
-                        .await?;
+                        .await
+                        .map_err(destination_write_error)?;
                 }
                 (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
                     s.write_file(&e.relative_path, data, e.uid, e.gid, Some(e.mode))
-                        .await?;
+                        .await
+                        .map_err(destination_write_error)?;
                 }
                 (StorageEnum::NFS(s), EntryEnum::S3(e)) => {
                     s.write_file(Path::new(&e.relative_path), data, None, None, None)
-                        .await?;
+                        .await
+                        .map_err(destination_write_error)?;
                 }
                 (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
                     s.write_file(&e.relative_path, data, e.uid, e.gid, Some(e.mode))
-                        .await?;
+                        .await
+                        .map_err(destination_write_error)?;
                 }
                 (StorageEnum::CIFS(s), EntryEnum::S3(e)) => {
                     s.write_file(Path::new(&e.relative_path), data, None, None, None)
-                        .await?;
+                        .await
+                        .map_err(destination_write_error)?;
                 }
                 (StorageEnum::S3(s), EntryEnum::S3(e)) => {
                     s.write_file(&e.relative_path, data, e.mtime, e.tags.clone())
-                        .await?;
+                        .await
+                        .map_err(destination_write_error)?;
                 }
                 (StorageEnum::S3(s), EntryEnum::NAS(e)) => {
                     s.write_file(&path_to_s3_key(&e.relative_path), data, e.mtime, None)
-                        .await?;
+                        .await
+                        .map_err(destination_write_error)?;
                 }
             }
 
@@ -939,10 +975,11 @@ impl StorageEnum {
             None => join_io.await,
         };
 
-        let source_hasher = read_res
-            .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))??;
-        let bytes_written = write_res
-            .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))??;
+        let read_res = read_res
+            .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))?;
+        let write_res = write_res
+            .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))?;
+        let (source_hasher, bytes_written) = resolve_copy_pipeline(read_res, write_res)?;
 
         // 写端本地计数断言（issue #58，无条件）：实际写入字节数必须等于 entry
         // 声明的 size——源截断时读端提前 EOF、写端静默少写的防线。纯本地比较，
@@ -1340,8 +1377,7 @@ impl StorageEnum {
         let write_res = write_handle
             .await
             .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))?;
-        read_res?;
-        write_res?;
+        resolve_copy_pipeline(read_res, write_res)?;
 
         // ── hash 比对（早于 commit：NAS `.part` 可独立读取，校验失败时最终路径
         //    不会被 rename 污染，见 T5）──
@@ -1443,8 +1479,7 @@ impl StorageEnum {
         let write_res = write_handle
             .await
             .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))?;
-        read_res?;
-        write_res?;
+        resolve_copy_pipeline(read_res, write_res)?;
 
         // 本地字节计数断言（issue #58，前移到 CompleteMultipartUpload 之前）：
         // 本次会话确认上传的字节数必须恰好补齐全部缺失区间，不等则不提交——

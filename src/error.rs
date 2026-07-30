@@ -124,6 +124,14 @@ pub enum StorageError {
     /// 与 SMB 服务交互时发生错误时触发
     #[error("CIFS error: {0}")]
     CifsError(String),
+
+    /// 从源存储读取文件数据失败
+    #[error("Read error: {0}")]
+    ReadError(String),
+
+    /// 向目标存储写入文件数据失败
+    #[error("Write error: {0}")]
+    WriteError(String),
 }
 
 impl Clone for StorageError {
@@ -157,6 +165,8 @@ impl Clone for StorageError {
             StorageError::WinAceError(s) => StorageError::WinAceError(s.clone()),
             StorageError::CifsError(s) => StorageError::CifsError(s.clone()),
             StorageError::Cancelled => StorageError::Cancelled,
+            StorageError::ReadError(s) => StorageError::ReadError(s.clone()),
+            StorageError::WriteError(s) => StorageError::WriteError(s.clone()),
         }
     }
 }
