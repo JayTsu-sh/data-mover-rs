@@ -58,6 +58,8 @@ use crate::{
     StorageEntryMessage, Tag, WalkDirAsyncIterator, datetime_to_string,
 };
 
+mod multipart_rename;
+
 /// S3 桶信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct S3BucketInfo {
@@ -349,6 +351,8 @@ const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MiB
 const MAX_CONCURRENCY: usize = 5; // 最大并发上传数
 /// Maximum source object size supported by a single S3 `CopyObject` request.
 const COPY_SINGLE_MAX: u64 = 5 * 1024 * 1024 * 1024;
+/// Default part size for server-side multipart copies.
+const COPY_PART_SIZE: u64 = 1024 * 1024 * 1024;
 /// S3 协议规定的 multipart upload 最大分块数
 const MAX_UPLOAD_PARTS: u64 = 10_000;
 
@@ -1129,6 +1133,24 @@ impl S3Storage {
         to: &Path,
         expected_size: Option<u64>,
     ) -> Result<()> {
+        self.rename_with_limits(from, to, expected_size, COPY_SINGLE_MAX, COPY_PART_SIZE)
+            .await
+    }
+
+    async fn rename_with_limits(
+        &self,
+        from: &Path,
+        to: &Path,
+        expected_size: Option<u64>,
+        single_max: u64,
+        part_size: u64,
+    ) -> Result<()> {
+        if part_size == 0 {
+            return Err(StorageError::OperationError(
+                "S3 multipart rename part size must be greater than zero".to_string(),
+            ));
+        }
+
         let from_relative = path_to_s3_key(from);
         let to_relative = path_to_s3_key(to);
         let from_key = self.build_full_key(&from_relative);
@@ -1170,16 +1192,25 @@ impl S3Storage {
             return Ok(());
         }
 
-        if source.get_size() > COPY_SINGLE_MAX {
-            return Err(StorageError::OperationError(format!(
-                "S3 rename source {from_key} is {} bytes; objects larger than \
-                 {COPY_SINGLE_MAX} bytes require multipart rename",
-                source.get_size()
-            )));
+        if source.get_size() <= single_max {
+            self.copy_object(&self.bucket_name, &from_key, &self.bucket_name, &to_key)
+                .await?;
+        } else {
+            // Multipart copy does not inherit tags, so retrieve them explicitly.
+            // A retrieval failure is fatal rather than silently losing metadata.
+            let tags = self
+                .get_object_tags(&self.bucket_name, &from_key, None)
+                .await?;
+            self.multipart_copy_object(
+                &from_key,
+                &to_key,
+                source.get_size(),
+                part_size,
+                tags.as_ref(),
+            )
+            .await?;
         }
 
-        self.copy_object(&self.bucket_name, &from_key, &self.bucket_name, &to_key)
-            .await?;
         self.delete_object(&from_key).await
     }
 
@@ -3939,6 +3970,105 @@ mod tests {
             build_copy_source("bucket", "中文"),
             "bucket/%E4%B8%AD%E6%96%87"
         );
+    }
+
+    #[test]
+    fn multipart_copy_ranges_are_closed_and_complete() {
+        assert!(multipart_rename::copy_part_ranges(0, 5).is_empty());
+        assert!(multipart_rename::copy_part_ranges(10, 0).is_empty());
+        assert_eq!(multipart_rename::copy_part_ranges(5, 5), vec![(0, 4)]);
+        assert_eq!(
+            multipart_rename::copy_part_ranges(6, 5),
+            vec![(0, 4), (5, 5)]
+        );
+        assert_eq!(
+            multipart_rename::copy_part_ranges(12, 5),
+            vec![(0, 4), (5, 9), (10, 11)]
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_rename_preserves_content_and_metadata_when_lab_is_configured() {
+        let Ok(url) = std::env::var("DM_S3_RENAME_TEST_URL") else {
+            eprintln!("skip: DM_S3_RENAME_TEST_URL is not configured");
+            return;
+        };
+        let storage = S3Storage::new(&url, None)
+            .await
+            .expect("connect to S3 rename test storage");
+        let source_relative = "multipart rename source %?# 中文.bin";
+        let destination_relative = "multipart renamed %?# 中文.bin";
+        let source_key = storage.build_full_key(source_relative);
+        let destination_key = storage.build_full_key(destination_relative);
+        let size = 20 * 1024 * 1024;
+        let body = vec![0x5a; size];
+
+        storage
+            .client
+            .put_object()
+            .bucket(&storage.bucket_name)
+            .key(&source_key)
+            .metadata("test-metadata", "preserved")
+            .tagging("test-tag=preserved")
+            .content_type("application/x-data-mover-test")
+            .body(aws_sdk_s3::primitives::ByteStream::from(body.clone()))
+            .send()
+            .await
+            .expect("seed multipart rename source");
+
+        storage
+            .rename_with_limits(
+                Path::new(source_relative),
+                Path::new(destination_relative),
+                Some(size as u64),
+                8 * 1024 * 1024,
+                5 * 1024 * 1024,
+            )
+            .await
+            .expect("multipart rename");
+
+        let destination = storage
+            .client
+            .get_object()
+            .bucket(&storage.bucket_name)
+            .key(&destination_key)
+            .send()
+            .await
+            .expect("get multipart rename destination");
+        assert_eq!(
+            destination.content_type(),
+            Some("application/x-data-mover-test")
+        );
+        assert_eq!(
+            destination
+                .metadata()
+                .and_then(|metadata| metadata.get("test-metadata"))
+                .map(String::as_str),
+            Some("preserved")
+        );
+        assert_eq!(
+            destination
+                .body
+                .collect()
+                .await
+                .expect("read multipart rename destination")
+                .into_bytes(),
+            body
+        );
+
+        let tags = storage
+            .get_object_tags(&storage.bucket_name, &destination_key, None)
+            .await
+            .expect("get multipart rename destination tags")
+            .unwrap_or_default();
+        assert!(
+            tags.iter()
+                .any(|tag| tag.key == "test-tag" && tag.value == "preserved")
+        );
+        assert!(matches!(
+            storage.get_metadata(source_relative).await,
+            Err(StorageError::FileNotFound(_))
+        ));
     }
 
     #[test]
