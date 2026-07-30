@@ -27,11 +27,7 @@ async fn main() -> Result<()> {
     let expected_size = source.get_size();
 
     storage
-        .rename_with_expected_size(
-            Path::new(&args.from),
-            Path::new(&args.to),
-            Some(expected_size),
-        )
+        .rename(Path::new(&args.from), Path::new(&args.to))
         .await?;
 
     let destination = storage.get_metadata(Path::new(&args.to)).await?;

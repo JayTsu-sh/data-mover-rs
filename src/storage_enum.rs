@@ -429,7 +429,7 @@ impl StorageEnum {
 
     /// Rename with an optional expected size for validating an idempotent S3
     /// retry. Filesystem backends perform an atomic rename and ignore the size.
-    pub async fn rename_with_expected_size(
+    async fn rename_with_expected_size(
         &self,
         from: &Path,
         to: &Path,

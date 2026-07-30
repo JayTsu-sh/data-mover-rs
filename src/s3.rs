@@ -1123,7 +1123,7 @@ impl S3Storage {
 
     /// Rename an object and optionally validate the destination size when an
     /// interrupted copy-delete sequence is retried after the source was deleted.
-    pub async fn rename_with_expected_size(
+    pub(crate) async fn rename_with_expected_size(
         &self,
         from: &Path,
         to: &Path,
