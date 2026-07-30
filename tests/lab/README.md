@@ -19,5 +19,15 @@ Credentials are provisioned on the self-hosted runner and must not be committed.
 NFSv4.1, and S3: 4 same-protocol paths plus 12 cross-protocol paths. Every case
 uses an isolated payload and verifies the destination SHA-256 checksum.
 
+`run-resume-e2e.sh` exercises eight representative paths in two independent
+processes: the four same-backend paths plus Local → S3, S3 → Local, NFSv3 → S3,
+and S3 → NFSv4.1. This covers every source interval reader, every destination
+resume writer, and the NAS ↔ S3 boundaries without duplicating the full copy
+matrix. The first process writes a durable prefix without committing it. The
+second process discovers the remaining range from the destination, transfers
+only that range, commits, and verifies the final hash. NAS destinations resume
+from a `.terrasync-part` file; S3 destinations resume the server-side multipart
+upload through `ListMultipartUploads` and `ListParts`.
+
 The self-hosted runner must provide `LAB_S3_ACCESS_KEY` and
 `LAB_S3_SECRET_KEY`. Credentials must not be committed or printed.
