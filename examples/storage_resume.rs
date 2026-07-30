@@ -23,7 +23,7 @@ struct Args {
     path: PathBuf,
     #[arg(long)]
     phase: Phase,
-    #[arg(long, default_value_t = 5 * 1024 * 1024)]
+    #[arg(long, default_value_t = 1024 * 1024)]
     block_size: u64,
 }
 

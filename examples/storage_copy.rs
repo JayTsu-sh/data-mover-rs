@@ -17,13 +17,17 @@ struct Args {
     /// Path relative to both storage roots.
     #[arg(long)]
     path: String,
+
+    /// Transfer block size in bytes. Backends may clamp this to protocol limits.
+    #[arg(long)]
+    block_size: Option<u64>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let source = create_storage(&args.source, None, false).await?;
-    let destination = create_storage(&args.destination, None, true).await?;
+    let source = create_storage(&args.source, args.block_size, false).await?;
+    let destination = create_storage(&args.destination, args.block_size, true).await?;
     let entry = source.get_metadata(Path::new(&args.path)).await?;
 
     StorageEnum::copy_file(&source, &destination, &entry, None, true, true, None).await?;

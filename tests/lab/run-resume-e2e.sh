@@ -65,7 +65,8 @@ with path.open("wb") as output:
   cargo run --quiet --locked --example storage_copy -- \
     --source "$local_root/seed" \
     --destination "$(storage_url source "$backend")" \
-    --path "$key"
+    --path "$key" \
+    --block-size $((1024 * 1024))
 }
 
 cases=(
