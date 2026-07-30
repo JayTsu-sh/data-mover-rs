@@ -188,3 +188,12 @@ if python3 "$(dirname "$0")/s3_helper.py" exists \
   exit 1
 fi
 echo "S3 small-object rename verified: $actual_hash"
+
+# Force the multipart S3 rename path with lab-sized limits. The test verifies
+# object bytes, user and system metadata, tags, special-character CopySource
+# encoding, and deletion of the source object.
+DM_S3_RENAME_TEST_URL="$(storage_url source s3)" \
+  cargo test --quiet --locked \
+    s3::tests::multipart_rename_preserves_content_and_metadata_when_lab_is_configured \
+    -- --exact
+echo "S3 multipart rename verified"
