@@ -12,6 +12,18 @@ Storage abstraction layer supporting Local, NFS, S3, and SMB/CIFS backends.
 | S3 (TLS) | `s3+https://access_key:secret_key@bucket.host/prefix` |
 | SMB/CIFS | `smb://user:password@host[:port]/share[/sub/path][?smb2_only=false]` |
 
+### S3 Timeout Environment Variables
+
+S3 client timeouts can be configured in seconds. The values are read when an S3
+client is created and apply to both bucket listing and normal data operations.
+Unset, invalid, or zero values use the documented defaults.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `S3_CONNECT_TIMEOUT` | `10` | Connection establishment timeout in seconds |
+| `S3_OPERATION_TIMEOUT` | `30` | Timeout for the complete S3 operation in seconds |
+| `S3_READ_TIMEOUT` | `20` | Timeout for an individual socket read in seconds |
+
 ### SMB/CIFS URL Parameters
 
 | Parameter | Default | Description |

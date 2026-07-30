@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 // 外部crate
 use aws_config::timeout::TimeoutConfig;
@@ -398,6 +399,62 @@ pub struct S3Storage {
     pub is_bucket_versioned: bool,
 }
 
+const S3_CONNECT_TIMEOUT_ENV: &str = "S3_CONNECT_TIMEOUT";
+const S3_OPERATION_TIMEOUT_ENV: &str = "S3_OPERATION_TIMEOUT";
+const S3_READ_TIMEOUT_ENV: &str = "S3_READ_TIMEOUT";
+const DEFAULT_S3_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_S3_OPERATION_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_S3_READ_TIMEOUT_SECS: u64 = 20;
+
+fn parse_s3_timeout_secs(name: &str, value: Option<&str>, default: u64) -> u64 {
+    let Some(value) = value else {
+        return default;
+    };
+
+    match value.parse::<u64>() {
+        Ok(seconds) if seconds > 0 => seconds,
+        _ => {
+            warn!(
+                variable = name,
+                value, default, "无效的 S3 超时配置，将使用默认值（秒）"
+            );
+            default
+        }
+    }
+}
+
+fn s3_timeout_config_from_values(
+    connect: Option<&str>,
+    operation: Option<&str>,
+    read: Option<&str>,
+) -> TimeoutConfig {
+    TimeoutConfig::builder()
+        .connect_timeout(Duration::from_secs(parse_s3_timeout_secs(
+            S3_CONNECT_TIMEOUT_ENV,
+            connect,
+            DEFAULT_S3_CONNECT_TIMEOUT_SECS,
+        )))
+        .operation_timeout(Duration::from_secs(parse_s3_timeout_secs(
+            S3_OPERATION_TIMEOUT_ENV,
+            operation,
+            DEFAULT_S3_OPERATION_TIMEOUT_SECS,
+        )))
+        .read_timeout(Duration::from_secs(parse_s3_timeout_secs(
+            S3_READ_TIMEOUT_ENV,
+            read,
+            DEFAULT_S3_READ_TIMEOUT_SECS,
+        )))
+        .build()
+}
+
+fn s3_timeout_config() -> TimeoutConfig {
+    let connect = std::env::var(S3_CONNECT_TIMEOUT_ENV).ok();
+    let operation = std::env::var(S3_OPERATION_TIMEOUT_ENV).ok();
+    let read = std::env::var(S3_READ_TIMEOUT_ENV).ok();
+
+    s3_timeout_config_from_values(connect.as_deref(), operation.as_deref(), read.as_deref())
+}
+
 impl S3Storage {
     /// 查询指定 S3 端点的桶列表
     ///
@@ -421,13 +478,7 @@ impl S3Storage {
             .region(Region::new(region.to_string()))
             .endpoint_url(endpoint)
             .credentials_provider(credentials_provider)
-            .timeout_config(
-                TimeoutConfig::builder()
-                    .connect_timeout(std::time::Duration::from_secs(10))
-                    .operation_timeout(std::time::Duration::from_secs(30))
-                    .read_timeout(std::time::Duration::from_secs(20))
-                    .build(),
-            );
+            .timeout_config(s3_timeout_config());
         if tls_skip_verify {
             warn!(
                 "S3 list_buckets: 使用 s3+https scheme，TLS 证书验证已跳过，仅用于受信任的私有环境"
@@ -503,13 +554,7 @@ impl S3Storage {
             .endpoint_url(endpoint.clone())
             .credentials_provider(credentials_provider)
             // 配置超时参数，避免连接挂起或不完整消息错误
-            .timeout_config(
-                TimeoutConfig::builder()
-                    .connect_timeout(std::time::Duration::from_secs(10))
-                    .operation_timeout(std::time::Duration::from_secs(30))
-                    .read_timeout(std::time::Duration::from_secs(20))
-                    .build(),
-            );
+            .timeout_config(s3_timeout_config());
         if tls_skip_verify {
             warn!(
                 "S3 Storage::new: 使用 s3+https scheme，TLS 证书验证已跳过，仅用于受信任的私有环境"
@@ -3766,8 +3811,45 @@ pub async fn create_s3_storage(url: &str, block_size: Option<u64>) -> Result<Sto
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn s3_timeout_config_uses_defaults() {
+        let config = s3_timeout_config_from_values(None, None, None);
+
+        assert_eq!(config.connect_timeout(), Some(Duration::from_secs(10)));
+        assert_eq!(config.operation_timeout(), Some(Duration::from_secs(30)));
+        assert_eq!(config.read_timeout(), Some(Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn s3_timeout_config_accepts_positive_second_overrides() {
+        let config = s3_timeout_config_from_values(Some("11"), Some("31"), Some("21"));
+
+        assert_eq!(config.connect_timeout(), Some(Duration::from_secs(11)));
+        assert_eq!(config.operation_timeout(), Some(Duration::from_secs(31)));
+        assert_eq!(config.read_timeout(), Some(Duration::from_secs(21)));
+    }
+
+    #[test]
+    fn s3_timeout_config_falls_back_for_invalid_values() {
+        let config = s3_timeout_config_from_values(Some("invalid"), Some("-1"), Some("0"));
+
+        assert_eq!(config.connect_timeout(), Some(Duration::from_secs(10)));
+        assert_eq!(config.operation_timeout(), Some(Duration::from_secs(30)));
+        assert_eq!(config.read_timeout(), Some(Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn s3_timeout_config_supports_partial_override() {
+        let config = s3_timeout_config_from_values(None, Some("45"), None);
+
+        assert_eq!(config.connect_timeout(), Some(Duration::from_secs(10)));
+        assert_eq!(config.operation_timeout(), Some(Duration::from_secs(45)));
+        assert_eq!(config.read_timeout(), Some(Duration::from_secs(20)));
+    }
 
     #[test]
     fn missing_from_committed_basic() {
