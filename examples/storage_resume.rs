@@ -23,8 +23,6 @@ struct Args {
     path: PathBuf,
     #[arg(long)]
     phase: Phase,
-    #[arg(long, default_value_t = 64 * 1024)]
-    block_size: u64,
 }
 
 fn operation_error(message: impl Into<String>) -> StorageError {
@@ -81,14 +79,14 @@ async fn transfer_intervals(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let source = create_storage(&args.source, Some(args.block_size), false).await?;
-    let destination = create_storage(&args.destination, Some(args.block_size), true).await?;
+    let source = create_storage(&args.source, None, false).await?;
+    let destination = create_storage(&args.destination, None, true).await?;
     let entry = source.get_metadata(&args.path).await?;
     let size = entry.get_size();
-    if size <= args.block_size {
+    if size == 0 {
         return Err(operation_error(format!(
-            "fixture must be larger than block size: size={size}, block_size={}",
-            args.block_size
+            "fixture must not be empty: {}",
+            args.path.display()
         )));
     }
 

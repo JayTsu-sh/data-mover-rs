@@ -62,11 +62,22 @@ with path.open("wb") as output:
     return
   fi
 
+  if [[ "$backend" == "nfs3" ]]; then
+    ssh_lab_root "$LAB_SOURCE_MGMT" \
+      "cat > '$LAB_NFS3_EXPORT/ci/$run_id/$key'" < "$seed_path"
+    return
+  fi
+
+  if [[ "$backend" == "nfs41" ]]; then
+    ssh_lab_root "$LAB_SOURCE_MGMT" \
+      "cat > '$LAB_NFS41_EXPORT/ci/$run_id/$key'" < "$seed_path"
+    return
+  fi
+
   cargo run --quiet --locked --example storage_copy -- \
     --source "$local_root/seed" \
     --destination "$(storage_url source "$backend")" \
-    --path "$key" \
-    --block-size $((64 * 1024))
+    --path "$key"
 }
 
 cases=(
