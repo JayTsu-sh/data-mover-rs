@@ -342,7 +342,15 @@ impl LocalStorage {
     pub async fn get_metadata(&self, relative_path: &Path) -> Result<EntryEnum> {
         let path = relative_path.to_path_buf();
         let full_path = self.get_full_path(relative_path);
-        let metadata = tokio::fs::symlink_metadata(&full_path).await?;
+        let metadata = tokio::fs::symlink_metadata(&full_path)
+            .await
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    StorageError::FileNotFound(relative_path.display().to_string())
+                } else {
+                    StorageError::IoError(error)
+                }
+            })?;
         let name = path
             .file_name()
             .unwrap_or_default()
