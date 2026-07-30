@@ -2622,8 +2622,9 @@ dependencies = [
 
 [[package]]
 name = "nfs-rs"
-version = "0.3.0"
-source = "git+https://github.com/JayTsu-sh/nfs-rs.git?rev=741ff01#741ff015f39cdd8185c57773c7f031be8beb2513"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfafb906891b2a373e2c113f7254cfe7fe2db4fdd545c13354291e1d08accad1"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -3251,7 +3252,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.3",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3410,7 +3411,7 @@ dependencies = [
  "libc",
  "normpath",
  "rayon",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3647,7 +3648,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4787,7 +4788,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
