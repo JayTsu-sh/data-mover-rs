@@ -133,3 +133,27 @@ actual_hash="$(destination_hash nfs41 "$nfs41_key")"
   exit 1
 }
 echo "large nfs41 -> nfs41 verified: $actual_hash"
+
+# Exercise the same-endpoint CopyObject fast path with a key that requires
+# x-amz-copy-source percent-encoding. The regular S3 matrix copies between two
+# endpoints and therefore uses the streaming path instead.
+s3_special_key="s3 special %?# 中文.txt"
+s3_special_value="data-mover-$run_id-same-endpoint-special-key"
+seed_source s3 "$s3_special_key" "$s3_special_value"
+same_endpoint_destination="s3://$LAB_S3_ACCESS_KEY:$LAB_S3_SECRET_KEY@$LAB_S3_BUCKET.$LAB_SOURCE_DATA:9000/ci/$run_id/same-endpoint-destination"
+cargo run --quiet --locked --example storage_copy -- \
+  --source "$(storage_url source s3)" \
+  --destination "$same_endpoint_destination" \
+  --path "$s3_special_key"
+
+expected_hash="$(printf '%s' "$s3_special_value" | sha256sum | cut -d' ' -f1)"
+actual_hash="$(
+  python3 "$(dirname "$0")/s3_helper.py" sha256 \
+    --endpoint "$LAB_SOURCE_DATA" --bucket "$LAB_S3_BUCKET" \
+    --key "ci/$run_id/same-endpoint-destination/$s3_special_key"
+)"
+[[ "$actual_hash" == "$expected_hash" ]] || {
+  echo "same-endpoint S3 special-key checksum mismatch" >&2
+  exit 1
+}
+echo "same-endpoint S3 special-key CopyObject verified: $actual_hash"

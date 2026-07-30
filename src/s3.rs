@@ -105,6 +105,29 @@ fn s3_http_scheme(scheme_str: &str) -> Result<&'static str> {
     }
 }
 
+/// Encode an object key for the `x-amz-copy-source` request header.
+///
+/// Path separators and RFC 3986 unreserved bytes remain readable. Every other
+/// byte, including each byte of a UTF-8 sequence, is percent-encoded. Encoding
+/// a literal `%` is important because object keys are not pre-encoded URLs.
+fn encode_copy_source_key(key: &str) -> String {
+    let mut encoded = String::with_capacity(key.len());
+    for &byte in key.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+    encoded
+}
+
 /// 解析不含 bucket 的 S3 端点 URL：`s3://ak:sk@host:port` 或 `s3+https://ak:sk@host:port`
 /// 返回 (`access_key`, `secret_key`, endpoint, `tls_skip_verify`)
 fn parse_s3_endpoint_url(url: &str) -> Result<(String, String, String, bool)> {
@@ -1074,7 +1097,7 @@ impl S3Storage {
         dst_bucket: &str,
         dst_key: &str,
     ) -> Result<()> {
-        let copy_source = format!("{src_bucket}/{src_key}");
+        let copy_source = format!("{src_bucket}/{}", encode_copy_source_key(src_key));
         self.client
             .copy_object()
             .copy_source(copy_source)
@@ -3814,6 +3837,23 @@ mod tests {
     use std::time::Duration;
 
     const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn copy_source_key_encoding_preserves_path_and_unreserved_bytes() {
+        assert_eq!(
+            encode_copy_source_key("prefix/a-b.c_d~9/file"),
+            "prefix/a-b.c_d~9/file"
+        );
+    }
+
+    #[test]
+    fn copy_source_key_encoding_escapes_reserved_and_utf8_bytes() {
+        assert_eq!(encode_copy_source_key("a b"), "a%20b");
+        assert_eq!(encode_copy_source_key("literal%20"), "literal%2520");
+        assert_eq!(encode_copy_source_key("query?v=1"), "query%3Fv%3D1");
+        assert_eq!(encode_copy_source_key("fragment#1"), "fragment%231");
+        assert_eq!(encode_copy_source_key("中文"), "%E4%B8%AD%E6%96%87");
+    }
 
     #[test]
     fn s3_timeout_config_uses_defaults() {
