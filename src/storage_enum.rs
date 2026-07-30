@@ -420,13 +420,25 @@ impl StorageEnum {
     }
 
     /// Rename a file or directory within the same storage.
+    ///
+    /// S3 implements object rename as a server-side copy followed by deletion
+    /// of the source. Object data does not pass through data-mover.
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.rename_with_expected_size(from, to, None).await
+    }
+
+    /// Rename with an optional expected size for validating an idempotent S3
+    /// retry. Filesystem backends perform an atomic rename and ignore the size.
+    async fn rename_with_expected_size(
+        &self,
+        from: &Path,
+        to: &Path,
+        expected_size: Option<u64>,
+    ) -> Result<()> {
         match self {
             StorageEnum::Local(s) => s.rename(from, to).await,
             StorageEnum::NFS(s) => s.rename(from, to).await,
-            StorageEnum::S3(_) => Err(StorageError::OperationError(
-                "S3 does not support rename".to_string(),
-            )),
+            StorageEnum::S3(s) => s.rename_with_expected_size(from, to, expected_size).await,
             StorageEnum::CIFS(s) => s.rename(from, to).await,
         }
     }
@@ -1284,7 +1296,12 @@ impl StorageEnum {
         match handle {
             StreamHandle::Nas { part_path } => {
                 dest.set_file_len(&part_path, size).await?;
-                dest.rename(&part_path, entry.get_relative_path()).await
+                dest.rename_with_expected_size(
+                    &part_path,
+                    entry.get_relative_path(),
+                    Some(entry.get_size()),
+                )
+                .await
             }
             StreamHandle::S3 {
                 upload_id,
@@ -2137,7 +2154,7 @@ fn deserialize_xattr(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
 /// 将 Path 转为 S3 兼容的字符串（正斜杠分隔）。
 /// Linux 上零开销（直接返回 `Cow::Borrowed`），Windows 上仅在含 `\` 时分配新 `String`。
 #[inline]
-fn path_to_s3_key(path: &Path) -> Cow<'_, str> {
+pub(crate) fn path_to_s3_key(path: &Path) -> Cow<'_, str> {
     let s = path.to_string_lossy();
     #[cfg(windows)]
     {
