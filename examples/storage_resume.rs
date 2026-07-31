@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::{Parser, ValueEnum};
 use data_mover::error::StorageError;
-use data_mover::{CommitCallback, Result, StorageEnum, StreamHandle, create_storage};
+use data_mover::{CommitCallback, EntryEnum, Result, StorageEnum, StreamHandle, create_storage};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Phase {
@@ -134,6 +134,18 @@ async fn main() -> Result<()> {
             if source_hash != destination_hash {
                 return Err(operation_error(format!(
                     "hash mismatch after resume: source={source_hash}, destination={destination_hash}"
+                )));
+            }
+            let destination_entry = destination.get_metadata(&args.path).await?;
+            if matches!(
+                (&entry, &destination_entry),
+                (EntryEnum::NAS(_) | EntryEnum::S3(_), EntryEnum::NAS(_))
+            ) && destination_entry.get_mtime() != entry.get_mtime()
+            {
+                return Err(operation_error(format!(
+                    "mtime mismatch after resume: source={:?}, destination={:?}",
+                    entry.get_mtime(),
+                    destination_entry.get_mtime()
                 )));
             }
             if destination.get_metadata(&part_path).await.is_ok() {
