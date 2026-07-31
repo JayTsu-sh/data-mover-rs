@@ -73,6 +73,91 @@ fn enabled_from_value(value: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use aws_credential_types::Credentials;
+    use aws_smithy_runtime_api::client::http::{
+        HttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+    use aws_smithy_runtime_api::client::result::ConnectorError;
+    use aws_smithy_runtime_api::http::StatusCode;
+    use aws_smithy_types::body::SdkBody;
+    use aws_types::region::Region;
+
+    #[derive(Clone, Debug)]
+    struct CapturingConnector {
+        uri: Arc<Mutex<Option<String>>>,
+    }
+
+    impl HttpConnector for CapturingConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            *self
+                .uri
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(request.uri().to_owned());
+
+            let response = StatusCode::try_from(200)
+                .map(|status| {
+                    HttpResponse::new(
+                        status,
+                        SdkBody::from(
+                            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Buckets/>
+</ListAllMyBucketsResult>"#,
+                        ),
+                    )
+                })
+                .map_err(|error| ConnectorError::other(Box::new(error), None));
+            HttpConnectorFuture::ready(response)
+        }
+    }
+
+    async fn captured_list_buckets_uri(storagegrid_compatibility: bool) -> String {
+        let captured_uri = Arc::new(Mutex::new(None));
+        let connector = CapturingConnector {
+            uri: Arc::clone(&captured_uri),
+        };
+        let http_client = http_client_fn(move |_settings, _components| {
+            SharedHttpConnector::new(connector.clone())
+        });
+
+        let builder = Builder::new()
+            .behavior_version_latest()
+            .credentials_provider(Credentials::new(
+                "access-key",
+                "secret-key",
+                None,
+                None,
+                "storagegrid-protocol-test",
+            ))
+            .region(Region::new("us-east-1"))
+            .endpoint_url("http://storagegrid.test")
+            .force_path_style(true)
+            .http_client(http_client);
+        let config = if storagegrid_compatibility {
+            configure(builder).build()
+        } else {
+            builder.build()
+        };
+
+        let result = aws_sdk_s3::Client::from_conf(config)
+            .list_buckets()
+            .send()
+            .await;
+        assert!(
+            result.is_ok(),
+            "mock S3 response should be accepted: {result:?}"
+        );
+
+        captured_uri
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default()
+    }
 
     #[test]
     fn fast_path_returns_none() {
@@ -108,5 +193,30 @@ mod tests {
         assert!(enabled_from_value(Some("TRUE")));
         assert!(!enabled_from_value(Some("0")));
         assert!(!enabled_from_value(Some("false")));
+    }
+
+    #[tokio::test]
+    async fn sdk_request_contains_x_id_without_storagegrid_compatibility() {
+        let uri = captured_list_buckets_uri(false).await;
+
+        assert!(
+            uri.split_once('?')
+                .is_some_and(|(_, query)| query.split('&').any(|pair| pair.starts_with("x-id="))),
+            "AWS SDK control request should contain x-id: {uri}"
+        );
+    }
+
+    #[tokio::test]
+    async fn storagegrid_compatibility_removes_x_id_from_transmitted_request() {
+        let uri = captured_list_buckets_uri(true).await;
+
+        assert!(
+            !uri.split_once('?').is_some_and(|(_, query)| {
+                query
+                    .split('&')
+                    .any(|pair| pair == "x-id" || pair.starts_with("x-id="))
+            }),
+            "StorageGRID request must not contain x-id: {uri}"
+        );
     }
 }
