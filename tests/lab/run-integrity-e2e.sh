@@ -70,56 +70,55 @@ expect_mismatch() {
   }
 }
 
+copy_local_fixture() {
+  local source_root="$1"
+  local role="$2"
+  local backend="$3"
+  local key="$4"
+
+  if [[ "$backend" == "local" ]]; then
+    cp "$source_root/$key" "$local_root/$role/$key"
+    return
+  fi
+
+  cargo run --quiet --locked --example storage_copy -- \
+    --source "$source_root" \
+    --destination "$(storage_url "$role" "$backend")" \
+    --path "$key"
+}
+
+seed_large_negative_case() {
+  local source_backend="$1"
+  local destination_backend="$2"
+  local key="$3"
+  local fixture_root="$4"
+
+  cp "$local_root/seed/nfs41-large-copy.bin" "$fixture_root/$key"
+  copy_local_fixture "$fixture_root" source "$source_backend" "$key"
+  cargo run --quiet --locked --example storage_copy -- \
+    --source "$(storage_url source "$source_backend")" \
+    --destination "$(storage_url destination "$destination_backend")" \
+    --path "$key"
+}
+
 replace_destination_byte() {
   local backend="$1"
   local key="$2"
-  local value="$3"
-  local replacement="${value:0:5}X${value:6}"
+  local fixture_root="$3"
+  local mismatch_offset="$4"
 
-  case "$backend" in
-    local)
-      printf 'X' | dd of="$local_root/destination/$key" \
-        bs=1 seek=5 conv=notrunc status=none
-      ;;
-    nfs3)
-      ssh_lab_root "$LAB_DEST_MGMT" \
-        "printf X | dd of='$LAB_NFS3_EXPORT/ci/$run_id/$key' bs=1 seek=5 conv=notrunc status=none"
-      ;;
-    nfs41)
-      ssh_lab_root "$LAB_DEST_MGMT" \
-        "printf X | dd of='$LAB_NFS41_EXPORT/ci/$run_id/$key' bs=1 seek=5 conv=notrunc status=none"
-      ;;
-    s3)
-      python3 "$(dirname "$0")/s3_helper.py" put \
-        --endpoint "$LAB_DEST_DATA" --bucket "$LAB_S3_BUCKET" \
-        --key "ci/$run_id/destination/$key" --value "$replacement"
-      ;;
-  esac
+  printf 'X' | dd of="$fixture_root/$key" \
+    bs=1 seek="$mismatch_offset" conv=notrunc status=none
+  copy_local_fixture "$fixture_root" destination "$backend" "$key"
 }
 
 append_destination_byte() {
   local backend="$1"
   local key="$2"
-  local value="$3"
+  local fixture_root="$3"
 
-  case "$backend" in
-    local)
-      printf 'Y' >> "$local_root/destination/$key"
-      ;;
-    nfs3)
-      ssh_lab_root "$LAB_DEST_MGMT" \
-        "printf Y >> '$LAB_NFS3_EXPORT/ci/$run_id/$key'"
-      ;;
-    nfs41)
-      ssh_lab_root "$LAB_DEST_MGMT" \
-        "printf Y >> '$LAB_NFS41_EXPORT/ci/$run_id/$key'"
-      ;;
-    s3)
-      python3 "$(dirname "$0")/s3_helper.py" put \
-        --endpoint "$LAB_DEST_DATA" --bucket "$LAB_S3_BUCKET" \
-        --key "ci/$run_id/destination/$key" --value "${value:0:5}X${value:6}Y"
-      ;;
-  esac
+  printf 'Y' >> "$fixture_root/$key"
+  copy_local_fixture "$fixture_root" destination "$backend" "$key"
 }
 
 # Re-read the complete directed matrix produced by run-e2e.sh. This covers all
@@ -149,9 +148,14 @@ expect_mismatch 'Content.*offset: 5' "local-same-size-content" \
   local local "$mismatch_key" full
 
 # Negative cross-protocol ring: every configured backend participates as both
-# an integrity reader and a mutated destination. Full must identify the first
-# corrupt byte in equal-sized files. After extending the destination, Quick
-# must reject the size mismatch without reading file data.
+# an integrity reader and a mutated destination. The 12 MiB + 123 byte fixtures
+# and an unaligned mismatch after 6 MiB cross the default NFS (1 MiB), Local
+# (2 MiB), and S3 (5 MiB) read boundaries. Full must identify the global offset
+# in equal-sized files. After extending the destination, Quick must reject the
+# size mismatch without reading file data.
+negative_fixture_root="$local_root/integrity-negative-fixtures"
+mkdir -p "$negative_fixture_root"
+mismatch_offset=$((6 * 1024 * 1024 + 17))
 negative_checks=(
   "local nfs3"
   "nfs3 s3"
@@ -160,15 +164,19 @@ negative_checks=(
 )
 for check in "${negative_checks[@]}"; do
   read -r source_backend destination_backend <<< "$check"
-  key="${source_backend}-to-${destination_backend}.txt"
-  value="data-mover-$run_id-$source_backend-to-$destination_backend"
+  key="integrity-negative-${source_backend}-to-${destination_backend}.bin"
   description="${source_backend}-to-${destination_backend}"
 
-  replace_destination_byte "$destination_backend" "$key" "$value"
-  expect_mismatch 'Content.*offset: 5' "$description-content" \
+  seed_large_negative_case \
+    "$source_backend" "$destination_backend" "$key" "$negative_fixture_root"
+  check_path "$source_backend" "$destination_backend" "$key" full
+
+  replace_destination_byte \
+    "$destination_backend" "$key" "$negative_fixture_root" "$mismatch_offset"
+  expect_mismatch "Content.*offset: $mismatch_offset" "$description-content" \
     "$source_backend" "$destination_backend" "$key" full
 
-  append_destination_byte "$destination_backend" "$key" "$value"
+  append_destination_byte "$destination_backend" "$key" "$negative_fixture_root"
   expect_mismatch 'Size.*src: [0-9]+, dest: [0-9]+' "$description-size" \
     "$source_backend" "$destination_backend" "$key" quick
 done
