@@ -1,5 +1,9 @@
 use thiserror::Error;
 
+use crate::integrity_check::{MismatchDataField, MismatchMetaField};
+
+mod clone;
+
 /// 存储操作的错误类型定义
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
@@ -132,43 +136,14 @@ pub enum StorageError {
     /// 向目标存储写入文件数据失败
     #[error("Write error: {0}")]
     WriteError(String),
-}
 
-impl Clone for StorageError {
-    fn clone(&self) -> Self {
-        match self {
-            StorageError::IoError(e) => StorageError::OperationError(e.to_string()),
-            StorageError::ConfigError(s) => StorageError::ConfigError(s.clone()),
-            StorageError::UnsupportedType(s) => StorageError::UnsupportedType(s.clone()),
-            StorageError::OperationError(s) => StorageError::OperationError(s.clone()),
-            StorageError::InvalidPath(s) => StorageError::InvalidPath(s.clone()),
-            StorageError::InvalidFilterExpression(s) => {
-                StorageError::InvalidFilterExpression(s.clone())
-            }
-            StorageError::MismatchedParentheses(s) => {
-                StorageError::MismatchedParentheses(s.clone())
-            }
-            StorageError::InvalidToken(s) => StorageError::InvalidToken(*s),
-            StorageError::UnexpectedEndOfToken(s) => StorageError::UnexpectedEndOfToken(s.clone()),
-            StorageError::ChecksumError(s) => StorageError::ChecksumError(s.clone()),
-            StorageError::S3Error(s) => StorageError::S3Error(s.clone()),
-            StorageError::NfsError(s) => StorageError::NfsError(s.clone()),
-            StorageError::FileNotFound(s) => StorageError::FileNotFound(s.clone()),
-            StorageError::DirectoryNotFound(s) => StorageError::DirectoryNotFound(s.clone()),
-            StorageError::PermissionDenied(s) => StorageError::PermissionDenied(s.clone()),
-            StorageError::MismatchedType => StorageError::MismatchedType,
-            StorageError::TaskJoinError(e) => StorageError::OperationError(e.to_string()),
-            StorageError::UrlParseError(s) => StorageError::UrlParseError(s.clone()),
-            StorageError::SerializationError(s) => StorageError::SerializationError(s.clone()),
-            StorageError::InsufficientSpace(s) => StorageError::InsufficientSpace(s.clone()),
-            StorageError::FileLockError(s) => StorageError::FileLockError(s.clone()),
-            StorageError::WinAceError(s) => StorageError::WinAceError(s.clone()),
-            StorageError::CifsError(s) => StorageError::CifsError(s.clone()),
-            StorageError::Cancelled => StorageError::Cancelled,
-            StorageError::ReadError(s) => StorageError::ReadError(s.clone()),
-            StorageError::WriteError(s) => StorageError::WriteError(s.clone()),
-        }
-    }
+    /// 文件内容或条目类型不匹配
+    #[error("Content mismatch: {0:?}")]
+    MismatchData(Vec<MismatchDataField>),
+
+    /// POSIX 元数据不匹配
+    #[error("Metadata mismatch: {0:?}")]
+    MismatchMeta(Vec<MismatchMetaField>),
 }
 
 /// 存储操作的结果类型别名
