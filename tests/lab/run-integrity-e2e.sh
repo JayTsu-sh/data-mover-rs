@@ -77,7 +77,7 @@ copy_local_fixture() {
   local key="$4"
 
   if [[ "$backend" == "local" ]]; then
-    cp "$source_root/$key" "$local_root/$role/$key"
+    cp --preserve=mode,timestamps "$source_root/$key" "$local_root/$role/$key"
     return
   fi
 
@@ -121,6 +121,56 @@ append_destination_byte() {
   copy_local_fixture "$fixture_root" destination "$backend" "$key"
 }
 
+create_nas_directory() {
+  local role="$1"
+  local backend="$2"
+  local key="$3"
+  local host export_path
+
+  if [[ "$role" == "source" ]]; then
+    host="$LAB_SOURCE_MGMT"
+  else
+    host="$LAB_DEST_MGMT"
+  fi
+
+  case "$backend" in
+    local)
+      mkdir -p "$local_root/$role/$key"
+      chmod 0750 "$local_root/$role/$key"
+      touch -m -d '@1700000200' "$local_root/$role/$key"
+      ;;
+    nfs3)
+      export_path="$LAB_NFS3_EXPORT"
+      ssh_lab_root "$host" \
+        "mkdir -p '$export_path/ci/$run_id/$key' && chmod 0750 '$export_path/ci/$run_id/$key' && touch -m -d '@1700000200' '$export_path/ci/$run_id/$key'"
+      ;;
+    nfs41)
+      export_path="$LAB_NFS41_EXPORT"
+      ssh_lab_root "$host" \
+        "mkdir -p '$export_path/ci/$run_id/$key' && chmod 0750 '$export_path/ci/$run_id/$key' && touch -m -d '@1700000200' '$export_path/ci/$run_id/$key'"
+      ;;
+  esac
+}
+
+change_destination_mtime() {
+  local backend="$1"
+  local key="$2"
+
+  case "$backend" in
+    local)
+      touch -m -d '@1700000300' "$local_root/destination/$key"
+      ;;
+    nfs3)
+      ssh_lab_root "$LAB_DEST_MGMT" \
+        "touch -m -d '@1700000300' '$LAB_NFS3_EXPORT/ci/$run_id/$key'"
+      ;;
+    nfs41)
+      ssh_lab_root "$LAB_DEST_MGMT" \
+        "touch -m -d '@1700000300' '$LAB_NFS41_EXPORT/ci/$run_id/$key'"
+      ;;
+  esac
+}
+
 # Re-read the complete directed matrix produced by run-e2e.sh. This covers all
 # four same-protocol paths and all twelve cross-protocol paths.
 backends=(local nfs3 nfs41 s3)
@@ -134,6 +184,53 @@ done
 # The existing large NFSv4.1 copy is bigger than one session request. Reading
 # it independently verifies negotiated effective rsize in the integrity path.
 check_path nfs41 nfs41 "nfs41-large-copy.bin"
+
+# Empty objects exercise the zero-size fast path through real metadata readers.
+# Missing destinations verify that each backend preserves its not-found error.
+edge_fixture_root="$local_root/integrity-edge-fixtures"
+mkdir -p "$edge_fixture_root"
+for backend in "${backends[@]}"; do
+  empty_key="integrity-empty-$backend.bin"
+  : > "$edge_fixture_root/$empty_key"
+  copy_local_fixture "$edge_fixture_root" source "$backend" "$empty_key"
+  copy_local_fixture "$edge_fixture_root" destination "$backend" "$empty_key"
+  check_path "$backend" "$backend" "$empty_key" quick
+  check_path "$backend" "$backend" "$empty_key" full
+
+  missing_key="integrity-missing-destination-$backend.bin"
+  printf 'source-only' > "$edge_fixture_root/$missing_key"
+  copy_local_fixture "$edge_fixture_root" source "$backend" "$missing_key"
+  expect_mismatch '(File not found|IO error:.*not found|NoSuchKey|NotFound)' \
+    "$backend-missing-destination" \
+    "$backend" "$backend" "$missing_key" quick
+done
+
+# Object stores do not expose real directories or POSIX metadata. Exercise
+# those contracts on every configured NAS backend instead.
+nas_backends=(local nfs3 nfs41)
+for backend in "${nas_backends[@]}"; do
+  directory_key="integrity-directory-$backend"
+  create_nas_directory source "$backend" "$directory_key"
+  create_nas_directory destination "$backend" "$directory_key"
+  check_path "$backend" "$backend" "$directory_key" quick
+
+  metadata_key="integrity-metadata-$backend.bin"
+  printf 'matching-data' > "$edge_fixture_root/$metadata_key"
+  touch -m -d '@1700000200' "$edge_fixture_root/$metadata_key"
+  copy_local_fixture "$edge_fixture_root" source "$backend" "$metadata_key"
+  copy_local_fixture "$edge_fixture_root" destination "$backend" "$metadata_key"
+  check_path "$backend" "$backend" "$metadata_key" quick
+  change_destination_mtime "$backend" "$metadata_key"
+  expect_mismatch 'Metadata mismatch:.*Mtime' "$backend-metadata-mismatch" \
+    "$backend" "$backend" "$metadata_key" quick
+
+  type_key="integrity-type-mismatch-$backend"
+  printf 'source-file' > "$edge_fixture_root/$type_key"
+  copy_local_fixture "$edge_fixture_root" source "$backend" "$type_key"
+  create_nas_directory destination "$backend" "$type_key"
+  expect_mismatch 'EntryKind.*File.*Directory' "$backend-entry-kind" \
+    "$backend" "$backend" "$type_key" quick
+done
 
 # Quick mode must not read content. Preserve metadata after corrupting one byte,
 # then require Quick to pass and Full to report the exact first bad offset.
