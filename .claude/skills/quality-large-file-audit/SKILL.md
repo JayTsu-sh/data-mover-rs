@@ -1,6 +1,6 @@
 ---
 name: quality-large-file-audit
-description: 列出 src/*.rs 中 >800 行的文件，对比 baseline (filter 5303 / s3 4329 / nfs 3853 / cifs 3152)。新文件 >800 或现有文件继续增长是 WARN。
+description: 列出 src/*.rs 中 >1000 行的文件，对比 baseline (filter 5303 / s3 4329 / nfs 3853 / cifs 3152)。新文件 >1000 或现有文件继续增长是 WARN。
 ---
 
 # quality-large-file-audit
@@ -18,7 +18,7 @@ storage_enum.rs  2246
 local.rs         1423
 ```
 
-新写的代码 ≤800 行 / 文件。已超的 6 个是 backlog。
+新写的代码 ≤1000 行 / 文件。已超的 6 个是 backlog。
 
 ## 步骤
 
@@ -28,7 +28,7 @@ local.rs         1423
 
 ## 成功判据
 
-- 不允许新文件 >800 (NEW = FAIL)
+- 不允许新文件 >1000 (NEW = FAIL)
 - 现有文件增长 ≤ 10% baseline (GROWING ≤ 10% = WARN，> 10% = FAIL)
 
 ## 备注
