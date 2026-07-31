@@ -1,8 +1,13 @@
 //! Independent integrity checks for objects that already exist on two storages.
 
+use std::io::ErrorKind;
+use std::path::Path;
+use std::time::Duration;
+
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::error::StorageError;
 use crate::storage_enum::StorageEnum;
@@ -71,6 +76,70 @@ pub enum IntegrityCheckMode {
 pub struct IntegrityCheck;
 
 impl IntegrityCheck {
+    /// Resolve both entries at `relative_path`, then compare them.
+    ///
+    /// Metadata reads run concurrently and retain their original backend error
+    /// variants. Confirmed missing paths and permanent errors are not retried.
+    pub async fn check_path(
+        src_storage: &StorageEnum,
+        dest_storage: &StorageEnum,
+        relative_path: &Path,
+        mode: IntegrityCheckMode,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<EntryEnum> {
+        let resolve = Box::pin(async {
+            tokio::try_join!(
+                get_metadata_with_retry(src_storage, relative_path, cancel),
+                get_metadata_with_retry(dest_storage, relative_path, cancel),
+            )
+        });
+        let (src_entry, dest_entry) = if let Some(token) = cancel {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => return Err(StorageError::Cancelled),
+                entries = resolve => entries?,
+            }
+        } else {
+            resolve.await?
+        };
+
+        Self::check(
+            src_storage,
+            dest_storage,
+            &src_entry,
+            &dest_entry,
+            mode,
+            cancel,
+        )
+        .await?;
+        Ok(src_entry)
+    }
+
+    /// Resolve only the destination entry and compare it with a known source.
+    pub async fn check_with_source_entry(
+        src_storage: &StorageEnum,
+        dest_storage: &StorageEnum,
+        src_entry: &EntryEnum,
+        mode: IntegrityCheckMode,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<()> {
+        let dest_entry = Box::pin(get_metadata_with_retry(
+            dest_storage,
+            src_entry.get_relative_path(),
+            cancel,
+        ))
+        .await?;
+        Self::check(
+            src_storage,
+            dest_storage,
+            src_entry,
+            &dest_entry,
+            mode,
+            cancel,
+        )
+        .await
+    }
+
     /// Compare two already-resolved entries.
     ///
     /// S3 destinations skip POSIX metadata because those fields cannot be
@@ -151,7 +220,98 @@ impl IntegrityCheck {
     }
 }
 
+const METADATA_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+];
 const COMPARE_CHANNEL_CAPACITY: usize = 2;
+
+fn is_missing(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_)
+    ) || matches!(error, StorageError::IoError(error) if error.kind() == ErrorKind::NotFound)
+}
+
+fn is_transient_metadata_error(error: &StorageError) -> bool {
+    match error {
+        StorageError::IoError(error) => matches!(
+            error.kind(),
+            ErrorKind::Interrupted
+                | ErrorKind::WouldBlock
+                | ErrorKind::TimedOut
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::ConnectionRefused
+                | ErrorKind::NotConnected
+                | ErrorKind::UnexpectedEof
+        ),
+        // These backends currently expose opaque protocol errors, so the
+        // integrity layer can only apply a short bounded retry.
+        StorageError::NfsError(_) | StorageError::CifsError(_) | StorageError::S3Error(_) => true,
+        _ => false,
+    }
+}
+
+async fn wait_retry(delay: Duration, cancel: Option<&CancellationToken>) -> Result<()> {
+    if let Some(token) = cancel {
+        tokio::select! {
+            biased;
+            () = token.cancelled() => Err(StorageError::Cancelled),
+            () = tokio::time::sleep(delay) => Ok(()),
+        }
+    } else {
+        tokio::time::sleep(delay).await;
+        Ok(())
+    }
+}
+
+async fn get_metadata_once(
+    storage: &StorageEnum,
+    relative_path: &Path,
+    cancel: Option<&CancellationToken>,
+) -> Result<EntryEnum> {
+    if let Some(token) = cancel {
+        tokio::select! {
+            biased;
+            () = token.cancelled() => Err(StorageError::Cancelled),
+            result = Box::pin(storage.get_metadata(relative_path)) => result,
+        }
+    } else {
+        Box::pin(storage.get_metadata(relative_path)).await
+    }
+}
+
+async fn get_metadata_with_retry(
+    storage: &StorageEnum,
+    relative_path: &Path,
+    cancel: Option<&CancellationToken>,
+) -> Result<EntryEnum> {
+    for (attempt, delay) in METADATA_RETRY_DELAYS.iter().enumerate() {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err(StorageError::Cancelled);
+        }
+        match Box::pin(get_metadata_once(storage, relative_path, cancel)).await {
+            Ok(entry) => return Ok(entry),
+            Err(error) if is_missing(&error) || !is_transient_metadata_error(&error) => {
+                return Err(error);
+            }
+            Err(error) => {
+                warn!(
+                    path = %relative_path.display(),
+                    attempt = attempt + 1,
+                    max_retries = METADATA_RETRY_DELAYS.len(),
+                    delay_ms = delay.as_millis(),
+                    %error,
+                    "transient integrity metadata read failed"
+                );
+                wait_retry(*delay, cancel).await?;
+            }
+        }
+    }
+    Box::pin(get_metadata_once(storage, relative_path, cancel)).await
+}
 
 async fn recv_chunk(
     rx: &mut mpsc::Receiver<DataChunk>,
@@ -404,253 +564,4 @@ fn collect_metadata_mismatches(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{LocalStorage, NASEntry};
-    use std::path::{Path, PathBuf};
-
-    fn nas_entry(path: &str, size: u64) -> EntryEnum {
-        EntryEnum::NAS(NASEntry {
-            name: path.to_string(),
-            relative_path: PathBuf::from(path),
-            extension: None,
-            is_dir: false,
-            size,
-            atime: 10,
-            ctime: 20,
-            mtime: 30,
-            mode: 0o100_640,
-            is_symlink: false,
-            hard_links: Some(1),
-            uid: Some(1000),
-            gid: Some(1000),
-            ino: None,
-            file_handle: None,
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        })
-    }
-
-    fn local(root: &Path) -> StorageEnum {
-        StorageEnum::Local(LocalStorage::new(root, None))
-    }
-
-    fn local_with_block(root: &Path, block_size: u64) -> StorageEnum {
-        StorageEnum::Local(LocalStorage::new(root, Some(block_size)))
-    }
-
-    fn test_roots(name: &str) -> (PathBuf, PathBuf) {
-        let nonce = crate::time_util::now_nanos();
-        let base = std::env::temp_dir().join(format!("data-mover-integrity-{name}-{nonce}"));
-        (base.join("src"), base.join("dest"))
-    }
-
-    #[tokio::test]
-    async fn quick_reports_entry_kind_before_metadata() {
-        let root = std::env::temp_dir();
-        let src = nas_entry("item", 0);
-        let mut dest = nas_entry("item", 0);
-        let EntryEnum::NAS(dest_fields) = &mut dest else {
-            unreachable!()
-        };
-        dest_fields.is_dir = true;
-
-        let result = IntegrityCheck::check(
-            &local(&root),
-            &local(&root),
-            &src,
-            &dest,
-            IntegrityCheckMode::Quick,
-            None,
-        )
-        .await;
-
-        assert!(matches!(
-            result,
-            Err(StorageError::MismatchData(fields))
-                if fields == vec![MismatchDataField::EntryKind {
-                    src: IntegrityEntryKind::File,
-                    dest: IntegrityEntryKind::Directory,
-                }]
-        ));
-    }
-
-    #[tokio::test]
-    async fn quick_reports_size_mismatch() {
-        let root = std::env::temp_dir();
-        let result = IntegrityCheck::check(
-            &local(&root),
-            &local(&root),
-            &nas_entry("item", 10),
-            &nas_entry("item", 11),
-            IntegrityCheckMode::Quick,
-            None,
-        )
-        .await;
-
-        assert!(matches!(
-            result,
-            Err(StorageError::MismatchData(fields))
-                if fields == vec![MismatchDataField::Size { src: 10, dest: 11 }]
-        ));
-    }
-
-    #[tokio::test]
-    async fn quick_reports_all_supported_metadata_mismatches() {
-        let root = std::env::temp_dir();
-        let src = nas_entry("item", 10);
-        let mut dest = nas_entry("item", 10);
-        let EntryEnum::NAS(dest_fields) = &mut dest else {
-            unreachable!()
-        };
-        dest_fields.mtime = 31;
-        dest_fields.uid = Some(1001);
-        dest_fields.gid = Some(1002);
-        dest_fields.mode = 0o100_600;
-
-        let result = IntegrityCheck::check(
-            &local(&root),
-            &local(&root),
-            &src,
-            &dest,
-            IntegrityCheckMode::Quick,
-            None,
-        )
-        .await;
-
-        assert!(matches!(
-            result,
-            Err(StorageError::MismatchMeta(fields)) if fields.len() == 4
-        ));
-    }
-
-    #[tokio::test]
-    async fn symlink_mode_is_not_compared() {
-        let root = std::env::temp_dir();
-        let mut src = nas_entry("link", 0);
-        let mut dest = nas_entry("link", 0);
-        let EntryEnum::NAS(src_fields) = &mut src else {
-            unreachable!()
-        };
-        let EntryEnum::NAS(dest_fields) = &mut dest else {
-            unreachable!()
-        };
-        src_fields.is_symlink = true;
-        dest_fields.is_symlink = true;
-        dest_fields.mode = 0o777;
-
-        let result = IntegrityCheck::check(
-            &local(&root),
-            &local(&root),
-            &src,
-            &dest,
-            IntegrityCheckMode::Quick,
-            None,
-        )
-        .await;
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn full_compares_streams_with_different_chunk_boundaries() {
-        let (src_root, dest_root) = test_roots("match");
-        std::fs::create_dir_all(&src_root).unwrap();
-        std::fs::create_dir_all(&dest_root).unwrap();
-        std::fs::write(src_root.join("item"), b"same bytes").unwrap();
-        std::fs::write(dest_root.join("item"), b"same bytes").unwrap();
-        let entry = nas_entry("item", 10);
-
-        let result = IntegrityCheck::check(
-            &local_with_block(&src_root, 3),
-            &local_with_block(&dest_root, 7),
-            &entry,
-            &entry,
-            IntegrityCheckMode::Full,
-            None,
-        )
-        .await;
-
-        assert!(result.is_ok());
-        std::fs::remove_dir_all(src_root.parent().unwrap()).unwrap();
-    }
-
-    #[tokio::test]
-    async fn full_reports_first_mismatching_offset() {
-        let (src_root, dest_root) = test_roots("mismatch");
-        std::fs::create_dir_all(&src_root).unwrap();
-        std::fs::create_dir_all(&dest_root).unwrap();
-        std::fs::write(src_root.join("item"), b"same-prefix").unwrap();
-        std::fs::write(dest_root.join("item"), b"same-Xrefix").unwrap();
-        let entry = nas_entry("item", 11);
-
-        let result = IntegrityCheck::check(
-            &local_with_block(&src_root, 3),
-            &local_with_block(&dest_root, 5),
-            &entry,
-            &entry,
-            IntegrityCheckMode::Full,
-            None,
-        )
-        .await;
-
-        assert!(matches!(
-            result,
-            Err(StorageError::MismatchData(fields))
-                if fields == vec![MismatchDataField::Content { offset: 5 }]
-        ));
-        std::fs::remove_dir_all(src_root.parent().unwrap()).unwrap();
-    }
-
-    #[tokio::test]
-    async fn full_rejects_equal_short_prefixes() {
-        let (src_root, dest_root) = test_roots("short");
-        std::fs::create_dir_all(&src_root).unwrap();
-        std::fs::create_dir_all(&dest_root).unwrap();
-        std::fs::write(src_root.join("item"), b"prefix").unwrap();
-        std::fs::write(dest_root.join("item"), b"prefix").unwrap();
-        let entry = nas_entry("item", 10);
-
-        let result = IntegrityCheck::check(
-            &local(&src_root),
-            &local(&dest_root),
-            &entry,
-            &entry,
-            IntegrityCheckMode::Full,
-            None,
-        )
-        .await;
-
-        assert!(matches!(
-            result,
-            Err(StorageError::MismatchData(fields))
-                if fields == vec![MismatchDataField::ReadLength {
-                    side: IntegritySide::Source,
-                    expected: 10,
-                    actual: 6,
-                }]
-        ));
-        std::fs::remove_dir_all(src_root.parent().unwrap()).unwrap();
-    }
-
-    #[tokio::test]
-    async fn cancelled_full_check_does_not_start_io() {
-        let root = std::env::temp_dir();
-        let token = CancellationToken::new();
-        token.cancel();
-
-        let result = IntegrityCheck::check(
-            &local(&root),
-            &local(&root),
-            &nas_entry("missing", 1),
-            &nas_entry("missing", 1),
-            IntegrityCheckMode::Full,
-            Some(&token),
-        )
-        .await;
-
-        assert!(matches!(result, Err(StorageError::Cancelled)));
-    }
-}
+mod tests;
