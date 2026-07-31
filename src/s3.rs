@@ -60,6 +60,7 @@ use crate::{
 };
 
 mod multipart_rename;
+mod storagegrid;
 
 /// S3 桶信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +352,17 @@ fn build_skip_verify_http_client() -> SharedHttpClient {
     http_client_fn(move |_settings, _components| SharedHttpConnector::new(skip_connector.clone()))
 }
 
+fn build_s3_config(sdk_config: &SdkConfig) -> aws_sdk_s3::Config {
+    let builder = aws_sdk_s3::config::Builder::from(sdk_config)
+        .force_path_style(true)
+        .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired);
+    if storagegrid::compatibility_enabled() {
+        storagegrid::configure(builder).build()
+    } else {
+        builder.build()
+    }
+}
+
 const DEFAULT_BLOCK_SIZE: u64 = 5 * 1024 * 1024; // 5MiB
 const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MiB
 const MAX_CONCURRENCY: usize = 5; // 最大并发上传数
@@ -525,14 +537,7 @@ impl S3Storage {
         }
         let sdk_config = sdk_builder.build();
 
-        let client = Client::from_conf(
-            aws_sdk_s3::config::Builder::from(&sdk_config)
-                .force_path_style(true)
-                .request_checksum_calculation(
-                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
-                )
-                .build(),
-        );
+        let client = Client::from_conf(build_s3_config(&sdk_config));
 
         let response = client
             .list_buckets()
@@ -604,14 +609,7 @@ impl S3Storage {
         // 创建 S3 客户端，强制使用路径样式以支持 FQDN 和自定义域名
         // 禁用自动 checksum 计算（WhenRequired），避免 SDK 对 UploadPart 等操作
         // 自动附加 trailing CRC32 + aws-chunked 编码，某些 S3 兼容存储不支持该编码
-        let client = Client::from_conf(
-            aws_sdk_s3::config::Builder::from(&sdk_config)
-                .force_path_style(true)
-                .request_checksum_calculation(
-                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
-                )
-                .build(),
-        );
+        let client = Client::from_conf(build_s3_config(&sdk_config));
 
         // 只有当prefix不为空时才设置
         let prefix_option = if prefix.is_empty() {
