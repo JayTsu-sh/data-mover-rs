@@ -519,6 +519,39 @@ impl StorageEnum {
                 )
                 .await
             }
+            (StorageEnum::Local(s), EntryEnum::S3(e)) => {
+                s.set_metadata(
+                    Path::new(&e.relative_path),
+                    Some(e.mtime),
+                    Some(e.mtime),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+            (StorageEnum::NFS(s), EntryEnum::S3(e)) => {
+                s.update_metadata(
+                    Path::new(&e.relative_path),
+                    Some(e.mtime),
+                    Some(e.mtime),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+            (StorageEnum::CIFS(s), EntryEnum::S3(e)) => {
+                s.update_metadata(
+                    Path::new(&e.relative_path),
+                    Some(e.mtime),
+                    Some(e.mtime),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
             _ => Ok(()),
         }
     }
@@ -595,8 +628,8 @@ impl StorageEnum {
     /// Apply source metadata after the destination data has been committed.
     async fn apply_copied_metadata(to: &StorageEnum, entry: &EntryEnum) -> Result<()> {
         match (to, entry) {
-            (StorageEnum::S3(_), _) | (_, EntryEnum::S3(_)) => Ok(()),
-            (_, EntryEnum::NAS(_)) => to.set_entry_metadata(entry).await,
+            (StorageEnum::S3(_), _) => Ok(()),
+            (_, EntryEnum::NAS(_) | EntryEnum::S3(_)) => to.set_entry_metadata(entry).await,
         }
     }
 
@@ -2209,6 +2242,7 @@ pub async fn create_storage(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::S3Entry;
     use filetime::FileTime;
 
     async fn reset_dir(dir: &str) {
@@ -2251,6 +2285,43 @@ mod tests {
         assert_eq!(copied.get_mode().map(|mode| mode & 0o7777), Some(0o640));
         assert_eq!(copied.get_uid(), entry.get_uid());
         assert_eq!(copied.get_gid(), entry.get_gid());
+    }
+
+    #[tokio::test]
+    async fn s3_entry_metadata_sets_local_timestamp_without_posix_attrs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dst_dir = "/tmp/dm-s3-mtime-dst";
+        reset_dir(dst_dir).await;
+        let dst_path = format!("{dst_dir}/fixture.bin");
+        tokio::fs::write(&dst_path, b"fixture").await.unwrap();
+        tokio::fs::set_permissions(&dst_path, std::fs::Permissions::from_mode(0o640))
+            .await
+            .unwrap();
+
+        let destination = create_storage(dst_dir, None, true).await.unwrap();
+        let expected_mtime = 1_700_000_000_123_000_000_i64;
+        let entry = EntryEnum::S3(S3Entry {
+            name: "fixture.bin".to_string(),
+            relative_path: "fixture.bin".to_string(),
+            extension: Some("bin".to_string()),
+            size: 7,
+            mtime: expected_mtime,
+            tags: None,
+            version_id: None,
+            is_latest: true,
+            is_delete_marker: false,
+            version_count: None,
+            is_dir: false,
+        });
+
+        destination.set_entry_metadata(&entry).await.unwrap();
+        let copied = destination
+            .get_metadata(Path::new("fixture.bin"))
+            .await
+            .unwrap();
+        assert_eq!(copied.get_mtime(), expected_mtime);
+        assert_eq!(copied.get_mode().map(|mode| mode & 0o7777), Some(0o640));
     }
 
     /// hash mismatch（size 相同、内容不同）→ Err 且目标坏文件被清理（issue #58）。
