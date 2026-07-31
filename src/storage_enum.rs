@@ -1319,7 +1319,7 @@ impl StorageEnum {
     }
 
     /// ③ 提交：hash 校验通过后调用方触发原子提交（NAS `set_file_len` + `rename`；
-    /// S3 `CompleteMultipartUpload`）。
+    /// S3 `CompleteMultipartUpload`），随后写回源条目的元数据。
     pub async fn commit_chunk_stream(
         dest: &StorageEnum,
         entry: &EntryEnum,
@@ -1351,7 +1351,9 @@ impl StorageEnum {
                     .finalize_resumable_upload(&dst_key, size, part_size, &upload_id)
                     .await
             }
-        }
+        }?;
+
+        Self::apply_copied_metadata(dest, entry).await
     }
 
     /// 字节级断点续传复制（仅多块大文件，源端：Local/NFS/CIFS/S3，目标端：全部后端）。

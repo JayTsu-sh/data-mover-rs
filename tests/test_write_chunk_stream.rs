@@ -126,6 +126,15 @@ async fn t2_write_chunk_stream_sequential_then_commit_is_atomic() {
         tokio::fs::metadata(&part_full_path).await.is_err(),
         ".part should be renamed away after commit"
     );
+    let final_entry = dst
+        .get_metadata(Path::new("blob.bin"))
+        .await
+        .expect("final metadata");
+    assert_eq!(
+        final_entry.get_mtime(),
+        entry.get_mtime(),
+        "commit should preserve source mtime"
+    );
 }
 
 /// T3：`write_chunk_stream` 对乱序、重复的 chunk 按 offset 幂等（NAS 随机写，
