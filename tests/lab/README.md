@@ -39,3 +39,13 @@ upload through `ListMultipartUploads` and `ListParts`.
 
 The self-hosted runner must provide `LAB_S3_ACCESS_KEY` and
 `LAB_S3_SECRET_KEY`. Credentials must not be committed or printed.
+
+Nightly and release validation set `AWS_S3_STORAGEGRID_COMPAT=true`. The lab
+does not currently contain a real StorageGRID system: request-level tests use a
+capturing Smithy connector to verify that the SDK normally generates `x-id`
+and that compatibility mode removes it from the transmitted URI. The S3 lab
+matrix then runs against the configured S3-compatible endpoints to detect
+copy, rename, multipart, and resumable-transfer regressions while the mode is
+enabled. These checks validate the workaround's protocol behavior and
+non-regression properties, but they are not a substitute for a smoke test on
+the target StorageGRID version.

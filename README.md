@@ -24,6 +24,30 @@ Unset, invalid, or zero values use the documented defaults.
 | `S3_OPERATION_TIMEOUT` | `30` | Timeout for the complete S3 operation in seconds |
 | `S3_READ_TIMEOUT` | `20` | Timeout for an individual socket read in seconds |
 
+### StorageGRID compatibility
+
+Some StorageGRID versions reject the AWS SDK's informational `x-id` query
+parameter. Enable the compatibility mode only for an affected StorageGRID
+endpoint:
+
+```bash
+export AWS_S3_STORAGEGRID_COMPAT=true
+```
+
+`1` and any ASCII case variation of `true` enable the mode. The variable is
+read when an S3 client is created; unset values and all other values leave the
+mode disabled.
+
+When enabled, data-mover removes the exact `x-id` query parameter immediately
+before SigV4 signing. Other query parameters and their encoded bytes are
+preserved. The setting applies to both bucket listing and normal S3 data
+operations. It does not change the endpoint, credentials, path-style
+addressing, TLS behavior, or checksum configuration.
+
+Do not enable this workaround for standard AWS S3 or compatible storage that
+already accepts `x-id`. After changing the variable, recreate the data-mover
+process or S3 client so that the new setting takes effect.
+
 ### SMB/CIFS URL Parameters
 
 | Parameter | Default | Description |
