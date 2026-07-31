@@ -29,6 +29,7 @@ use aws_smithy_runtime_api::client::orchestrator::{
 };
 use aws_smithy_runtime_api::client::result::ConnectorError;
 use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_types::region::Region;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -43,7 +44,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
@@ -105,6 +106,10 @@ fn s3_http_scheme(scheme_str: &str) -> Result<&'static str> {
             "无效的S3 URL格式,协议必须是s3://、s3+http://或s3+https://".to_string(),
         )),
     }
+}
+
+fn versioning_is_unsupported(error_code: Option<&str>, status: Option<u16>) -> bool {
+    matches!(error_code, Some("NotImplemented" | "UnsupportedOperation")) || status == Some(501)
 }
 
 /// Build the value for the `x-amz-copy-source` request header.
@@ -647,10 +652,18 @@ impl S3Storage {
                         is_versioned
                     }
                     Err(e) => {
-                        error!(
-                            "检查桶版本控制状态失败, bucket: {}, 错误: {:?}",
-                            bucket_name, e
-                        );
+                        let error_code = e.as_service_error().and_then(ProvideErrorMetadata::code);
+                        let status = e.raw_response().map(|response| response.status().as_u16());
+                        if versioning_is_unsupported(error_code, status) {
+                            info!(
+                                "S3 bucket {bucket_name} does not support versioning; \
+                                 treating it as disabled"
+                            );
+                        } else {
+                            error!(
+                                "Failed to get S3 bucket versioning status for {bucket_name}: {e:?}"
+                            );
+                        }
                         false
                     }
                 }
@@ -3942,6 +3955,18 @@ mod tests {
     use std::time::Duration;
 
     const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn versioning_unsupported_detection_is_narrow() {
+        assert!(versioning_is_unsupported(Some("NotImplemented"), None));
+        assert!(versioning_is_unsupported(
+            Some("UnsupportedOperation"),
+            None
+        ));
+        assert!(versioning_is_unsupported(None, Some(501)));
+        assert!(!versioning_is_unsupported(Some("AccessDenied"), Some(403)));
+        assert!(!versioning_is_unsupported(None, Some(500)));
+    }
 
     #[test]
     fn copy_source_builder_preserves_path_and_unreserved_bytes() {
