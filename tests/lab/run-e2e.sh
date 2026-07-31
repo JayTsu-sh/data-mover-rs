@@ -134,6 +134,18 @@ actual_hash="$(destination_hash nfs41 "$nfs41_key")"
 }
 echo "large nfs41 -> nfs41 verified: $actual_hash"
 
+# Verify the NFS delete contract on both protocol versions: the first delete
+# succeeds and a repeated delete remains observable as FileNotFound.
+for nfs_backend in nfs3 nfs41; do
+  delete_key="${nfs_backend}-delete-not-found.txt"
+  seed_source "$nfs_backend" "$delete_key" \
+    "data-mover-$run_id-$nfs_backend-delete-not-found"
+  cargo run --quiet --locked --example storage_delete_contract -- \
+    --storage "$(storage_url source "$nfs_backend")" \
+    --path "$delete_key"
+done
+echo "NFS repeated-delete FileNotFound contract verified"
+
 # Exercise the same-endpoint CopyObject fast path with a key that requires
 # x-amz-copy-source percent-encoding. The regular S3 matrix copies between two
 # endpoints and therefore uses the streaming path instead.

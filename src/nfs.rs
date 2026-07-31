@@ -238,7 +238,8 @@ const MOUNT_PORT_RETRY_INITIAL_MS: u64 = 1000;
 /// 检测"目标不存在"错误（NFS3ERR_NOENT / NFS4ERR_NOENT / MNT3ERR_NOENT / Io NotFound）。
 ///
 /// 用途：
-/// - delete_*：幂等成功（删除已不存在的对象不报错）
+/// - `delete_file`：转换为 `FileNotFound`，由调用方决定是否按幂等成功处理
+/// - `delete_dir`：幂等成功（删除已不存在的目录不报错）
 /// - lookup_fh：转换为 `DirectoryNotFound`/`FileNotFound` 返回给上层
 ///
 /// 不参与 stale-handle 重试（语义上 NOENT 是终态，不是 cache 失效）。
@@ -929,8 +930,8 @@ impl NFSStorage {
                         backoff_server_busy("lookup_fh", &relative_path, retries).await;
                         return Box::pin(self.lookup_fh_inner(relative_path, retries + 1)).await;
                     }
-                    // NOENT 重试耗尽：路径组件确实不存在，返回 DirectoryNotFound
-                    // 这使 delete_file/delete_symlink 的调用方可将其视为幂等成功
+                    // NOENT 重试耗尽：路径组件确实不存在，返回 DirectoryNotFound。
+                    // 删除调用方可根据自身语义决定是否将其视为幂等成功。
                     if is_nfs_noent(&e) {
                         return Err(StorageError::DirectoryNotFound(format!(
                             "Directory '{dirname}' not found: {e}"
@@ -1202,10 +1203,16 @@ impl NFSStorage {
             match self.mount.remove(parent_obj.fh.clone(), &filename).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    // 目标已不存在：幂等语义，视为成功
+                    // 目标已不存在：保留可观察的 FileNotFound 分类。
+                    // 需要幂等删除的调用方应显式将 FileNotFound 视为成功。
                     if e.is_not_found() {
-                        trace!("File {:?} already gone, treating as success", relative_path);
-                        return Ok(());
+                        trace!(
+                            "File {:?} already gone, returning FileNotFound",
+                            relative_path
+                        );
+                        return Err(StorageError::FileNotFound(
+                            relative_path.display().to_string(),
+                        ));
                     }
                     if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
