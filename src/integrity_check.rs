@@ -1,7 +1,9 @@
 //! Independent integrity checks for objects that already exist on two storages.
 
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::Path;
+use std::pin::Pin;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -288,11 +290,29 @@ async fn get_metadata_with_retry(
     relative_path: &Path,
     cancel: Option<&CancellationToken>,
 ) -> Result<EntryEnum> {
-    for (attempt, delay) in METADATA_RETRY_DELAYS.iter().enumerate() {
+    get_metadata_with_retry_by(
+        || Box::pin(get_metadata_once(storage, relative_path, cancel)),
+        relative_path,
+        &METADATA_RETRY_DELAYS,
+        cancel,
+    )
+    .await
+}
+
+async fn get_metadata_with_retry_by<'a, F>(
+    mut get_metadata: F,
+    relative_path: &Path,
+    retry_delays: &[Duration],
+    cancel: Option<&CancellationToken>,
+) -> Result<EntryEnum>
+where
+    F: FnMut() -> Pin<Box<dyn Future<Output = Result<EntryEnum>> + Send + 'a>>,
+{
+    for (attempt, delay) in retry_delays.iter().enumerate() {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err(StorageError::Cancelled);
         }
-        match Box::pin(get_metadata_once(storage, relative_path, cancel)).await {
+        match get_metadata().await {
             Ok(entry) => return Ok(entry),
             Err(error) if is_missing(&error) || !is_transient_metadata_error(&error) => {
                 return Err(error);
@@ -301,7 +321,7 @@ async fn get_metadata_with_retry(
                 warn!(
                     path = %relative_path.display(),
                     attempt = attempt + 1,
-                    max_retries = METADATA_RETRY_DELAYS.len(),
+                    max_retries = retry_delays.len(),
                     delay_ms = delay.as_millis(),
                     %error,
                     "transient integrity metadata read failed"
@@ -310,7 +330,7 @@ async fn get_metadata_with_retry(
             }
         }
     }
-    Box::pin(get_metadata_once(storage, relative_path, cancel)).await
+    get_metadata().await
 }
 
 async fn recv_chunk(
@@ -367,7 +387,7 @@ async fn compare_file_streams(
         return Err(StorageError::Cancelled);
     }
 
-    let (mut src_rx, src_task) = StorageEnum::read_chunk_stream(
+    let (src_rx, src_task) = StorageEnum::read_chunk_stream(
         src_storage,
         src_entry,
         None,
@@ -375,7 +395,7 @@ async fn compare_file_streams(
         false,
         COMPARE_CHANNEL_CAPACITY,
     );
-    let (mut dest_rx, dest_task) = StorageEnum::read_chunk_stream(
+    let (dest_rx, dest_task) = StorageEnum::read_chunk_stream(
         dest_storage,
         dest_entry,
         None,
@@ -384,6 +404,17 @@ async fn compare_file_streams(
         COMPARE_CHANNEL_CAPACITY,
     );
 
+    compare_chunk_streams(src_rx, src_task, dest_rx, dest_task, expected_size, cancel).await
+}
+
+async fn compare_chunk_streams(
+    mut src_rx: mpsc::Receiver<DataChunk>,
+    src_task: JoinHandle<Result<Option<crate::HashCalculator>>>,
+    mut dest_rx: mpsc::Receiver<DataChunk>,
+    dest_task: JoinHandle<Result<Option<crate::HashCalculator>>>,
+    expected_size: u64,
+    cancel: Option<&CancellationToken>,
+) -> Result<()> {
     let mut src_chunk = None;
     let mut dest_chunk = None;
     let mut src_task = Some(src_task);
@@ -567,7 +598,53 @@ fn collect_metadata_mismatches(
 mod tests {
     use super::*;
     use crate::{LocalStorage, NASEntry};
+    use bytes::Bytes;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    type TestReadTask = JoinHandle<Result<Option<crate::HashCalculator>>>;
+
+    fn test_stream(
+        chunks: Vec<DataChunk>,
+        result: Result<Option<crate::HashCalculator>>,
+    ) -> (mpsc::Receiver<DataChunk>, TestReadTask) {
+        let (tx, rx) = mpsc::channel(chunks.len().max(1));
+        let task = tokio::spawn(async move {
+            for chunk in chunks {
+                tx.send(chunk).await.map_err(|_| StorageError::Cancelled)?;
+            }
+            result
+        });
+        (rx, task)
+    }
+
+    fn chunk(offset: u64, data: &'static [u8]) -> DataChunk {
+        DataChunk {
+            offset,
+            data: Bytes::from_static(data),
+        }
+    }
+
+    struct AbortFlag(Arc<AtomicBool>);
+
+    impl Drop for AbortFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn pending_stream(aborted: Arc<AtomicBool>) -> (mpsc::Receiver<DataChunk>, TestReadTask) {
+        let (tx, rx) = mpsc::channel(1);
+        let abort_flag = AbortFlag(aborted);
+        let task = tokio::spawn(async move {
+            let _abort_flag = abort_flag;
+            let _keep_channel_open = tx;
+            std::future::pending::<()>().await;
+            unreachable!()
+        });
+        (rx, task)
+    }
 
     fn nas_entry(path: &str, size: u64) -> EntryEnum {
         EntryEnum::NAS(NASEntry {
@@ -805,6 +882,186 @@ mod tests {
                 }]
         ));
         std::fs::remove_dir_all(src_root.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_reports_source_stream_offset_mismatch() {
+        let (src_rx, src_task) = test_stream(vec![chunk(1, b"abc")], Ok(None));
+        let (dest_rx, dest_task) = test_stream(vec![chunk(0, b"abc")], Ok(None));
+
+        let result = compare_chunk_streams(src_rx, src_task, dest_rx, dest_task, 3, None).await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::MismatchData(fields))
+                if fields == vec![MismatchDataField::StreamOffset {
+                    side: IntegritySide::Source,
+                    expected: 0,
+                    actual: 1,
+                }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_reports_destination_stream_offset_mismatch() {
+        let (src_rx, src_task) = test_stream(vec![chunk(0, b"abc")], Ok(None));
+        let (dest_rx, dest_task) = test_stream(vec![chunk(1, b"abc")], Ok(None));
+
+        let result = compare_chunk_streams(src_rx, src_task, dest_rx, dest_task, 3, None).await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::MismatchData(fields))
+                if fields == vec![MismatchDataField::StreamOffset {
+                    side: IntegritySide::Destination,
+                    expected: 0,
+                    actual: 1,
+                }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_reports_destination_short_read() {
+        let (src_rx, src_task) = test_stream(vec![chunk(0, b"0123456789")], Ok(None));
+        let (dest_rx, dest_task) = test_stream(vec![chunk(0, b"012345")], Ok(None));
+
+        let result = compare_chunk_streams(src_rx, src_task, dest_rx, dest_task, 10, None).await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::MismatchData(fields))
+                if fields == vec![MismatchDataField::ReadLength {
+                    side: IntegritySide::Destination,
+                    expected: 10,
+                    actual: 6,
+                }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_preserves_backend_error_before_short_read() {
+        let backend_error = StorageError::OperationError("injected read failure".to_string());
+        let (src_rx, src_task) = test_stream(Vec::new(), Err(backend_error));
+        let (dest_rx, dest_task) = test_stream(Vec::new(), Ok(None));
+
+        let result = compare_chunk_streams(src_rx, src_task, dest_rx, dest_task, 10, None).await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::OperationError(message))
+                if message == "injected read failure"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_full_check_aborts_both_read_tasks() {
+        let src_aborted = Arc::new(AtomicBool::new(false));
+        let dest_aborted = Arc::new(AtomicBool::new(false));
+        let (src_rx, src_task) = pending_stream(Arc::clone(&src_aborted));
+        let (dest_rx, dest_task) = pending_stream(Arc::clone(&dest_aborted));
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancel.cancel();
+        });
+
+        let result =
+            compare_chunk_streams(src_rx, src_task, dest_rx, dest_task, 10, Some(&token)).await;
+
+        assert!(matches!(result, Err(StorageError::Cancelled)));
+        assert!(src_aborted.load(Ordering::SeqCst));
+        assert!(dest_aborted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn metadata_retry_succeeds_after_transient_failures() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+
+        let result = get_metadata_with_retry_by(
+            move || {
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if attempt < 2 {
+                        Err(StorageError::IoError(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            "injected timeout",
+                        )))
+                    } else {
+                        Ok(nas_entry("item", 10))
+                    }
+                })
+            },
+            Path::new("item"),
+            &[Duration::ZERO, Duration::ZERO],
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn metadata_retry_exhaustion_returns_final_error() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+
+        let result = get_metadata_with_retry_by(
+            move || {
+                let attempt = observed.fetch_add(1, Ordering::SeqCst) + 1;
+                Box::pin(async move {
+                    Err(StorageError::IoError(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        format!("injected timeout {attempt}"),
+                    )))
+                })
+            },
+            Path::new("item"),
+            &[Duration::ZERO, Duration::ZERO],
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::IoError(error))
+                if error.kind() == ErrorKind::TimedOut
+                    && error.to_string() == "injected timeout 3"
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_metadata_retry_wait_stops_retries() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancel.cancel();
+        });
+
+        let result = get_metadata_with_retry_by(
+            move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(StorageError::IoError(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "injected timeout",
+                    )))
+                })
+            },
+            Path::new("item"),
+            &[Duration::from_mins(1)],
+            Some(&token),
+        )
+        .await;
+
+        assert!(matches!(result, Err(StorageError::Cancelled)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
