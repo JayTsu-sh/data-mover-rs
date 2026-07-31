@@ -53,22 +53,83 @@ check_path() {
     --mode "$mode"
 }
 
-# Same-backend checks exercise every configured reader. Representative
-# cross-protocol checks cover NAS/S3 boundaries without repeating all 16 copies.
-checks=(
-  "local local"
-  "nfs3 nfs3"
-  "nfs41 nfs41"
-  "s3 s3"
-  "local s3"
-  "s3 local"
-  "nfs3 s3"
-  "s3 nfs41"
-)
-for check in "${checks[@]}"; do
-  read -r source_backend destination_backend <<< "$check"
-  key="${source_backend}-to-${destination_backend}.txt"
-  check_path "$source_backend" "$destination_backend" "$key"
+expect_mismatch() {
+  local expected_pattern="$1"
+  local description="$2"
+  shift 2
+  local log="$local_root/integrity-negative-${description}.log"
+
+  if check_path "$@" >"$log" 2>&1; then
+    echo "integrity check accepted $description" >&2
+    exit 1
+  fi
+  grep -Eq "$expected_pattern" "$log" || {
+    echo "integrity check reported the wrong result for $description" >&2
+    sed -n '1,40p' "$log" >&2
+    exit 1
+  }
+}
+
+replace_destination_byte() {
+  local backend="$1"
+  local key="$2"
+  local value="$3"
+  local replacement="${value:0:5}X${value:6}"
+
+  case "$backend" in
+    local)
+      printf 'X' | dd of="$local_root/destination/$key" \
+        bs=1 seek=5 conv=notrunc status=none
+      ;;
+    nfs3)
+      ssh_lab_root "$LAB_DEST_MGMT" \
+        "printf X | dd of='$LAB_NFS3_EXPORT/ci/$run_id/$key' bs=1 seek=5 conv=notrunc status=none"
+      ;;
+    nfs41)
+      ssh_lab_root "$LAB_DEST_MGMT" \
+        "printf X | dd of='$LAB_NFS41_EXPORT/ci/$run_id/$key' bs=1 seek=5 conv=notrunc status=none"
+      ;;
+    s3)
+      python3 "$(dirname "$0")/s3_helper.py" put \
+        --endpoint "$LAB_DEST_DATA" --bucket "$LAB_S3_BUCKET" \
+        --key "ci/$run_id/destination/$key" --value "$replacement"
+      ;;
+  esac
+}
+
+append_destination_byte() {
+  local backend="$1"
+  local key="$2"
+  local value="$3"
+
+  case "$backend" in
+    local)
+      printf 'Y' >> "$local_root/destination/$key"
+      ;;
+    nfs3)
+      ssh_lab_root "$LAB_DEST_MGMT" \
+        "printf Y >> '$LAB_NFS3_EXPORT/ci/$run_id/$key'"
+      ;;
+    nfs41)
+      ssh_lab_root "$LAB_DEST_MGMT" \
+        "printf Y >> '$LAB_NFS41_EXPORT/ci/$run_id/$key'"
+      ;;
+    s3)
+      python3 "$(dirname "$0")/s3_helper.py" put \
+        --endpoint "$LAB_DEST_DATA" --bucket "$LAB_S3_BUCKET" \
+        --key "ci/$run_id/destination/$key" --value "${value:0:5}X${value:6}Y"
+      ;;
+  esac
+}
+
+# Re-read the complete directed matrix produced by run-e2e.sh. This covers all
+# four same-protocol paths and all twelve cross-protocol paths.
+backends=(local nfs3 nfs41 s3)
+for source_backend in "${backends[@]}"; do
+  for destination_backend in "${backends[@]}"; do
+    key="${source_backend}-to-${destination_backend}.txt"
+    check_path "$source_backend" "$destination_backend" "$key"
+  done
 done
 
 # The existing large NFSv4.1 copy is bigger than one session request. Reading
@@ -84,15 +145,32 @@ printf 'X' | dd of="$destination_file" bs=1 seek=5 conv=notrunc status=none
 touch -r "$source_file" "$destination_file"
 check_path local local "$mismatch_key" quick
 
-mismatch_log="$local_root/integrity-mismatch.log"
-if check_path local local "$mismatch_key" full >"$mismatch_log" 2>&1; then
-  echo "Full integrity check accepted corrupted content" >&2
-  exit 1
-fi
-grep -Eq 'Content.*offset: 5' "$mismatch_log" || {
-  echo "Full integrity check did not report mismatch offset 5" >&2
-  sed -n '1,40p' "$mismatch_log" >&2
-  exit 1
-}
+expect_mismatch 'Content.*offset: 5' "local-same-size-content" \
+  local local "$mismatch_key" full
 
-echo "independent integrity checks verified across lab protocols"
+# Negative cross-protocol ring: every configured backend participates as both
+# an integrity reader and a mutated destination. Full must identify the first
+# corrupt byte in equal-sized files. After extending the destination, Quick
+# must reject the size mismatch without reading file data.
+negative_checks=(
+  "local nfs3"
+  "nfs3 s3"
+  "s3 nfs41"
+  "nfs41 local"
+)
+for check in "${negative_checks[@]}"; do
+  read -r source_backend destination_backend <<< "$check"
+  key="${source_backend}-to-${destination_backend}.txt"
+  value="data-mover-$run_id-$source_backend-to-$destination_backend"
+  description="${source_backend}-to-${destination_backend}"
+
+  replace_destination_byte "$destination_backend" "$key" "$value"
+  expect_mismatch 'Content.*offset: 5' "$description-content" \
+    "$source_backend" "$destination_backend" "$key" full
+
+  append_destination_byte "$destination_backend" "$key" "$value"
+  expect_mismatch 'Size.*src: [0-9]+, dest: [0-9]+' "$description-size" \
+    "$source_backend" "$destination_backend" "$key" quick
+done
+
+echo "positive and negative integrity checks verified across lab protocols"

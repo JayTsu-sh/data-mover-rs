@@ -37,13 +37,15 @@ only that range, commits, and verifies the final hash. NAS destinations resume
 from a `.terrasync-part` file; S3 destinations resume the server-side multipart
 upload through `ListMultipartUploads` and `ListParts`.
 
-`run-integrity-e2e.sh` independently re-reads copied data through Local,
-NFSv3, NFSv4.1, and S3. It covers all four same-backend paths plus four
-representative NAS/S3 crossings, checks the large NFSv4.1 fixture using the
-negotiated effective read size, proves that Quick mode does not read content,
-and requires Full mode to report the exact first corrupted byte offset. The
-lab has no CIFS endpoint, so CIFS remains covered by the shared stream contract
-tests until a real SMB service is added.
+`run-integrity-e2e.sh` independently re-reads the complete 4-by-4 directed
+matrix through Local, NFSv3, NFSv4.1, and S3: four same-backend paths plus all
+twelve cross-protocol paths. It checks the large NFSv4.1 fixture using the
+negotiated effective read size and proves that Quick mode does not read
+content. A cross-protocol negative ring mutates each configured destination
+backend in turn: Full must report the exact first corrupted byte in equal-sized
+files, while Quick must reject a destination size mismatch without reading
+content. The lab has no CIFS endpoint, so CIFS remains covered by the shared
+stream contract tests until a real SMB service is added.
 
 The self-hosted runner must provide `LAB_S3_ACCESS_KEY` and
 `LAB_S3_SECRET_KEY`. Credentials must not be committed or printed.
