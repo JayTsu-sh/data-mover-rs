@@ -13,7 +13,7 @@ sys.path.insert(0, str(SHARED))
 
 from protocol_constants import PROJECT_ROOT  # noqa: E402
 
-# Baseline 截至 2026-07-27 (所有现有 src/*.rs，含 <1000 行的)
+# Baseline 截至 2026-08-03 (所有现有 src/*.rs，含 <1000 行的)
 # 增长 / 缩减按 % 计算。新文件 (不在表内) 必须 ≤1000 行。
 BASELINE = {
     "filter.rs": 5303,
@@ -22,6 +22,9 @@ BASELINE = {
     "cifs.rs": 3152,
     "storage_enum.rs": 2246,
     "local.rs": 1423,
+    # Integrity tests intentionally stay next to the implementation so private
+    # stream/retry helpers can be exercised without widening the public API.
+    "integrity_check.rs": 1372,
     "acl.rs": 985,
     "qos.rs": 672,
     "lib.rs": 565,

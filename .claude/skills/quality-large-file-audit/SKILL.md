@@ -7,7 +7,7 @@ description: 列出 src/*.rs 中 >1000 行的文件，对比 baseline (filter 53
 
 **触发关键词**：审大文件 / 找拆分候选 / quality large file。
 
-## Baseline (2026-07-27)
+## Baseline (2026-08-03)
 
 ```
 filter.rs        5303
@@ -16,9 +16,11 @@ nfs.rs           3853
 cifs.rs          3152
 storage_enum.rs  2246
 local.rs         1423
+integrity_check.rs 1372
 ```
 
-新写的代码 ≤1000 行 / 文件。已超的 6 个是 backlog。
+新写的代码 ≤1000 行 / 文件。`integrity_check.rs` 的测试子模块按项目
+约定保持内联，基线登记后仍受 10% 增长上限约束。
 
 ## 步骤
 
