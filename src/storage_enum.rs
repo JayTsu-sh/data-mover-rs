@@ -225,7 +225,11 @@ impl StorageEnum {
 
     pub async fn delete_dir_all(&self, entry: &EntryEnum) -> Result<()> {
         let iter = self.delete_dir_all_with_progress(Some(entry.get_relative_path()), 4)?;
-        while iter.next().await.is_some() {}
+        while let Some(event) = iter.next().await {
+            if let Some(error) = event.error {
+                return Err(StorageError::OperationError(error));
+            }
+        }
         Ok(())
     }
 
@@ -2209,6 +2213,10 @@ pub fn detect_storage_type(path: &str) -> StorageType {
         p if p.starts_with("s3://")
             || p.starts_with("s3+http://")
             || p.starts_with("s3+https://")
+            || p.starts_with("s3+sg://")
+            || p.starts_with("s3+sg+https://")
+            || p.starts_with("s3+dxn://")
+            || p.starts_with("s3+dxn+https://")
             || p.starts_with("s3+hcp://") =>
         {
             StorageType::S3

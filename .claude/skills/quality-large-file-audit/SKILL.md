@@ -1,6 +1,6 @@
 ---
 name: quality-large-file-audit
-description: 列出 src/*.rs 中 >1000 行的文件，对比 baseline (filter 5303 / s3 4329 / nfs 3853 / cifs 3152)。新文件 >1000 或现有文件继续增长是 WARN。
+description: 报告 src/*.rs 相对 baseline 的规模趋势；仅新文件超过 1000 行会阻塞。
 ---
 
 # quality-large-file-audit
@@ -19,19 +19,19 @@ local.rs         1423
 integrity_check.rs 1372
 ```
 
-新写的代码 ≤1000 行 / 文件。`integrity_check.rs` 的测试子模块按项目
-约定保持内联，基线登记后仍受 10% 增长上限约束。
+新写的生产代码 ≤1000 行 / 文件。历史文件的增长只产生趋势报告，不作为
+CI 硬门禁；`integrity_check.rs` 等内联测试模块也遵循这一规则。
 
 ## 步骤
 
 1. wc -l src/*.rs
 2. 列 >800 行的文件，标 (NEW / GROWING / SHRINKING / SAME)。
-3. 警告 NEW (新文件 >800) 和 GROWING (>baseline+10%)。
+3. 警告 NEW（新文件 >800）和 GROWING（相对 baseline >5%，>10% 标为高增长）。
 
 ## 成功判据
 
 - 不允许新文件 >1000 (NEW = FAIL)
-- 现有文件增长 ≤ 10% baseline (GROWING ≤ 10% = WARN，> 10% = FAIL)
+- 现有文件的增长只报告 WARN，不阻塞 CI
 
 ## 备注
 

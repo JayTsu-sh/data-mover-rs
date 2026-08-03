@@ -57,12 +57,12 @@ contract tests until a real SMB service is added.
 The self-hosted runner must provide `LAB_S3_ACCESS_KEY` and
 `LAB_S3_SECRET_KEY`. Credentials must not be committed or printed.
 
-Nightly and release validation set `AWS_S3_STORAGEGRID_COMPAT=true`. The lab
-does not currently contain a real StorageGRID system: request-level tests use a
-capturing Smithy connector to verify that the SDK normally generates `x-id`
-and that compatibility mode removes it from the transmitted URI. The S3 lab
-matrix then runs against the configured S3-compatible endpoints to detect
-copy, rename, multipart, and resumable-transfer regressions while the mode is
-enabled. These checks validate the workaround's protocol behavior and
-non-regression properties, but they are not a substitute for a smoke test on
-the target StorageGRID version.
+The lab does not currently contain a real StorageGRID system. Request-level
+tests use a capturing Smithy connector to verify that standard S3 requests
+retain the SDK-generated `x-id` and StorageGRID requests remove it from the
+transmitted URI. They also verify that StorageGRID multi-object delete carries
+a body-matching, SigV4-signed `Content-MD5`. Dedicated `s3+sg://` smoke cases run against the
+configured S3-compatible endpoints while the main S3 matrix continues using
+standard `s3://`. These checks validate scheme selection, copy, rename, and
+non-regression behavior, but they are not a substitute for a smoke test on the
+target StorageGRID version.

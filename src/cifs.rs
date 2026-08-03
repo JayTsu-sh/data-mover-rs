@@ -1609,6 +1609,7 @@ impl CifsStorage {
                                         .send(DeleteEvent {
                                             relative_path: path,
                                             is_dir: false,
+                                            error: None,
                                         })
                                         .await;
                                 }
@@ -1642,6 +1643,7 @@ impl CifsStorage {
                         .send(DeleteEvent {
                             relative_path: path,
                             is_dir: true,
+                            error: None,
                         })
                         .await;
                 }
@@ -1655,6 +1657,7 @@ impl CifsStorage {
                         .send(DeleteEvent {
                             relative_path: root,
                             is_dir: true,
+                            error: None,
                         })
                         .await;
                 }

@@ -1412,6 +1412,7 @@ fn delete_recursive(path: &Path, root: &Path, tx: &async_channel::Sender<DeleteE
                     let _ = tx.send_blocking(DeleteEvent {
                         relative_path: rel.to_path_buf(),
                         is_dir: false,
+                        error: None,
                     });
                 }
             }
@@ -1426,6 +1427,7 @@ fn delete_recursive(path: &Path, root: &Path, tx: &async_channel::Sender<DeleteE
         let _ = tx.send_blocking(DeleteEvent {
             relative_path: rel.to_path_buf(),
             is_dir: true,
+            error: None,
         });
     }
 }

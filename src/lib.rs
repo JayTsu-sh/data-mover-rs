@@ -54,6 +54,26 @@ pub use url_redact::redact_storage_url;
 pub struct DeleteEvent {
     pub relative_path: PathBuf,
     pub is_dir: bool,
+    /// Background deletion failure. Successful progress events leave this unset.
+    pub error: Option<String>,
+}
+
+impl DeleteEvent {
+    fn success(relative_path: PathBuf, is_dir: bool) -> Self {
+        Self {
+            relative_path,
+            is_dir,
+            error: None,
+        }
+    }
+
+    fn failure(relative_path: PathBuf, error: impl Into<String>) -> Self {
+        Self {
+            relative_path,
+            is_dir: false,
+            error: Some(error.into()),
+        }
+    }
 }
 
 /// 删除进度迭代器，通过 channel 接收删除事件

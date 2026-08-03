@@ -59,6 +59,8 @@ use crate::{
     StorageEntryMessage, Tag, WalkDirAsyncIterator, datetime_to_string,
 };
 
+mod delete_objects_md5;
+mod dxn;
 mod multipart_rename;
 mod storagegrid;
 
@@ -98,13 +100,25 @@ fn extract_s3_credentials(url: &str) -> Result<(&str, String, String, &str)> {
     Ok((scheme_str, access_key, secret_key, host_and_rest))
 }
 
-/// 将 scheme 字符串映射为 HTTP 协议前缀（不含 HCP）
-fn s3_http_scheme(scheme_str: &str) -> Result<&'static str> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum S3Compatibility {
+    Standard,
+    StorageGrid,
+    Dxn,
+}
+
+/// 将 scheme 字符串映射为 HTTP 协议前缀和端点级兼容模式（不含 HCP）。
+fn s3_scheme(scheme_str: &str) -> Result<(&'static str, S3Compatibility)> {
     match scheme_str {
-        "s3" | "s3+http" => Ok("http"),
-        "s3+https" => Ok("https"),
+        "s3" | "s3+http" => Ok(("http", S3Compatibility::Standard)),
+        "s3+https" => Ok(("https", S3Compatibility::Standard)),
+        "s3+sg" => Ok(("http", S3Compatibility::StorageGrid)),
+        "s3+sg+https" => Ok(("https", S3Compatibility::StorageGrid)),
+        "s3+dxn" => Ok(("http", S3Compatibility::Dxn)),
+        "s3+dxn+https" => Ok(("https", S3Compatibility::Dxn)),
         _ => Err(StorageError::InvalidPath(
-            "无效的S3 URL格式,协议必须是s3://、s3+http://或s3+https://".to_string(),
+            "无效的S3 URL格式,协议必须是s3://、s3+http://、s3+https://、s3+sg://、s3+sg+https://、s3+dxn://或s3+dxn+https://"
+                .to_string(),
         )),
     }
 }
@@ -140,19 +154,25 @@ fn build_copy_source(bucket: &str, key: &str) -> String {
     copy_source
 }
 
-/// 解析不含 bucket 的 S3 端点 URL：`s3://ak:sk@host:port` 或 `s3+https://ak:sk@host:port`
-/// 返回 (`access_key`, `secret_key`, endpoint, `tls_skip_verify`)
-fn parse_s3_endpoint_url(url: &str) -> Result<(String, String, String, bool)> {
+/// 解析不含 bucket 的 S3 端点 URL。
+/// 返回 (`access_key`, `secret_key`, endpoint, `tls_skip_verify`, compatibility)
+fn parse_s3_endpoint_url(url: &str) -> Result<(String, String, String, bool, S3Compatibility)> {
     let (scheme_str, access_key, secret_key, host_and_port) = extract_s3_credentials(url)?;
-    let http_scheme = s3_http_scheme(scheme_str)?;
+    let (http_scheme, compatibility) = s3_scheme(scheme_str)?;
 
-    // s3+https scheme 即表示跳过 TLS 证书验证（用于自签名/私有 CA 部署）
+    // HTTPS schemes 表示跳过 TLS 证书验证（用于自签名/私有 CA 部署）。
     let tls_skip_verify = http_scheme == "https";
     let endpoint = format!("{}://{}", http_scheme, host_and_port.trim_end_matches('/'));
-    Ok((access_key, secret_key, endpoint, tls_skip_verify))
+    Ok((
+        access_key,
+        secret_key,
+        endpoint,
+        tls_skip_verify,
+        compatibility,
+    ))
 }
 
-// 使用url库解析S3 URL格式: s3://access_key:secret_key@bucket.host:port/prefix, s3+https://access_key:secret_key@bucket.host:port/prefix，或s3+hcp://access_key:secret_key@bucket.host:port/prefix
+// 使用 url 库解析标准 S3、StorageGRID 和 HCP URL。
 // 注意：secret_key 可能包含 `+`、`/` 等特殊字符（Base64 编码），直接传给 Url::parse 会导致解析错误，
 // 因此先手动提取凭据，再用占位凭据构建安全 URL 交给 url crate 解析 host/port/path。
 #[allow(clippy::type_complexity)]
@@ -167,6 +187,7 @@ fn parse_s3_url(
     String,
     StorageType,
     bool,
+    S3Compatibility,
 )> {
     let (scheme_str, access_key, secret_key, host_and_path) = extract_s3_credentials(url)?;
 
@@ -176,13 +197,18 @@ fn parse_s3_url(
         Url::parse(&safe_url).map_err(|e| StorageError::UrlParseError(e.to_string()))?;
 
     // 检查URL协议并确定使用的HTTP协议（含 HCP）
-    let (http_scheme, storage_type) = match parsed_url.scheme() {
-        "s3" | "s3+http" => ("http", StorageType::S3),
-        "s3+https" => ("https", StorageType::S3),
-        "s3+hcp" => ("http", StorageType::Hcp),
+    let (http_scheme, storage_type, compatibility) = match parsed_url.scheme() {
+        "s3" | "s3+http" => ("http", StorageType::S3, S3Compatibility::Standard),
+        "s3+https" => ("https", StorageType::S3, S3Compatibility::Standard),
+        "s3+sg" => ("http", StorageType::S3, S3Compatibility::StorageGrid),
+        "s3+sg+https" => ("https", StorageType::S3, S3Compatibility::StorageGrid),
+        "s3+dxn" => ("http", StorageType::S3, S3Compatibility::Dxn),
+        "s3+dxn+https" => ("https", StorageType::S3, S3Compatibility::Dxn),
+        "s3+hcp" => ("http", StorageType::Hcp, S3Compatibility::Standard),
         _ => {
             return Err(StorageError::InvalidPath(
-                "无效的S3 URL格式,协议必须是s3://、s3+http://、s3+https://或s3+hcp://".to_string(),
+                "无效的S3 URL格式,协议必须是s3://、s3+http://、s3+https://、s3+sg://、s3+sg+https://、s3+dxn://、s3+dxn+https://或s3+hcp://"
+                    .to_string(),
             ));
         }
     };
@@ -242,6 +268,7 @@ fn parse_s3_url(
         host_only,
         storage_type,
         tls_skip_verify,
+        compatibility,
     ))
 }
 
@@ -352,14 +379,14 @@ fn build_skip_verify_http_client() -> SharedHttpClient {
     http_client_fn(move |_settings, _components| SharedHttpConnector::new(skip_connector.clone()))
 }
 
-fn build_s3_config(sdk_config: &SdkConfig) -> aws_sdk_s3::Config {
+fn build_s3_config(sdk_config: &SdkConfig, compatibility: S3Compatibility) -> aws_sdk_s3::Config {
     let builder = aws_sdk_s3::config::Builder::from(sdk_config)
         .force_path_style(true)
         .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired);
-    if storagegrid::compatibility_enabled() {
-        storagegrid::configure(builder).build()
-    } else {
-        builder.build()
+    match compatibility {
+        S3Compatibility::Standard => builder.build(),
+        S3Compatibility::StorageGrid => storagegrid::configure(builder).build(),
+        S3Compatibility::Dxn => dxn::configure(builder).build(),
     }
 }
 
@@ -517,7 +544,8 @@ impl S3Storage {
     /// - `Ok(Vec<S3BucketInfo>)`：查询成功，返回桶列表
     /// - `Err(StorageError)`：查询失败，返回错误信息
     pub async fn list_buckets(url: &str) -> Result<Vec<S3BucketInfo>> {
-        let (access_key, secret_key, endpoint, tls_skip_verify) = parse_s3_endpoint_url(url)?;
+        let (access_key, secret_key, endpoint, tls_skip_verify, compatibility) =
+            parse_s3_endpoint_url(url)?;
 
         let region = "us-east-1";
         let credentials = Credentials::new(&access_key, &secret_key, None, None, "s3-list-buckets");
@@ -537,7 +565,7 @@ impl S3Storage {
         }
         let sdk_config = sdk_builder.build();
 
-        let client = Client::from_conf(build_s3_config(&sdk_config));
+        let client = Client::from_conf(build_s3_config(&sdk_config, compatibility));
 
         let response = client
             .list_buckets()
@@ -572,6 +600,7 @@ impl S3Storage {
             host,
             storage_type,
             tls_skip_verify,
+            compatibility,
         ) = parse_s3_url(url)?;
 
         let region = "us-east-1"; // MinIO 默认区域
@@ -609,7 +638,7 @@ impl S3Storage {
         // 创建 S3 客户端，强制使用路径样式以支持 FQDN 和自定义域名
         // 禁用自动 checksum 计算（WhenRequired），避免 SDK 对 UploadPart 等操作
         // 自动附加 trailing CRC32 + aws-chunked 编码，某些 S3 兼容存储不支持该编码
-        let client = Client::from_conf(build_s3_config(&sdk_config));
+        let client = Client::from_conf(build_s3_config(&sdk_config, compatibility));
 
         // 只有当prefix不为空时才设置
         let prefix_option = if prefix.is_empty() {
@@ -870,6 +899,11 @@ impl S3Storage {
                     Ok(r) => r,
                     Err(e) => {
                         error!("Failed to list objects for delete: {}", e);
+                        let event = DeleteEvent::failure(
+                            prefix.clone().into(),
+                            format!("Failed to list objects for delete: {e}"),
+                        );
+                        let _ = tx.send(event).await;
                         break;
                     }
                 };
@@ -886,21 +920,19 @@ impl S3Storage {
                             for key in deleted {
                                 // 将 full key 转为相对路径
                                 let rel = key.strip_prefix(&prefix).unwrap_or(&key);
-                                let _ = tx
-                                    .send(DeleteEvent {
-                                        relative_path: std::path::PathBuf::from(rel),
-                                        is_dir: false,
-                                    })
-                                    .await;
+                                let event = DeleteEvent::success(rel.into(), false);
+                                let _ = tx.send(event).await;
                             }
                         }
                         Err(e) => {
                             error!("Failed to delete objects batch: {:?}", e);
+                            let event = DeleteEvent::failure(prefix.clone().into(), e.to_string());
+                            let _ = tx.send(event).await;
+                            break;
                         }
                     }
                 }
 
-                // 检查是否还有更多对象
                 match resp.next_continuation_token() {
                     Some(token) => continuation_token = Some(token.to_string()),
                     None => break,
@@ -4189,7 +4221,7 @@ mod tests {
     fn test_parse_s3_url_special_chars_in_secret_key() {
         // SK 包含 + 和 /（Base64 编码常见字符）
         let url = "s3://X9HENFMKAC41MT11J14H:AsxLb0dEhjxXIlKfVnCSVhM+hjO80rbhRmPLp/UK@bucket.192.168.3.210:10444";
-        let (ak, sk, bucket, endpoint, prefix, host, storage_type, _tls_skip) =
+        let (ak, sk, bucket, endpoint, prefix, host, storage_type, _tls_skip, compatibility) =
             parse_s3_url(url).unwrap();
         assert_eq!(ak, "X9HENFMKAC41MT11J14H");
         assert_eq!(sk, "AsxLb0dEhjxXIlKfVnCSVhM+hjO80rbhRmPLp/UK");
@@ -4198,12 +4230,13 @@ mod tests {
         assert_eq!(prefix, "");
         assert_eq!(host, "192.168.3.210");
         assert!(matches!(storage_type, StorageType::S3));
+        assert_eq!(compatibility, S3Compatibility::Standard);
     }
 
     #[test]
     fn test_parse_s3_url_normal() {
         let url = "s3://myak:mysk@mybucket.minio.example.com:9000/data/prefix";
-        let (ak, sk, bucket, endpoint, prefix, host, storage_type, _tls_skip) =
+        let (ak, sk, bucket, endpoint, prefix, host, storage_type, _tls_skip, compatibility) =
             parse_s3_url(url).unwrap();
         assert_eq!(ak, "myak");
         assert_eq!(sk, "mysk");
@@ -4212,24 +4245,71 @@ mod tests {
         assert_eq!(prefix, "data/prefix/");
         assert_eq!(host, "minio.example.com");
         assert!(matches!(storage_type, StorageType::S3));
+        assert_eq!(compatibility, S3Compatibility::Standard);
     }
 
     #[test]
     fn test_parse_s3_url_https() {
         let url = "s3+https://ak:sk@bucket.host.com:443/prefix";
-        let (ak, sk, bucket, endpoint, _prefix, host, storage_type, _) = parse_s3_url(url).unwrap();
+        let (ak, sk, bucket, endpoint, _prefix, host, storage_type, _, compatibility) =
+            parse_s3_url(url).unwrap();
         assert_eq!(ak, "ak");
         assert_eq!(sk, "sk");
         assert_eq!(bucket, "bucket");
         assert_eq!(endpoint, "https://host.com:443");
         assert_eq!(host, "host.com");
         assert!(matches!(storage_type, StorageType::S3));
+        assert_eq!(compatibility, S3Compatibility::Standard);
+    }
+
+    #[test]
+    fn test_parse_storagegrid_url() {
+        let url = "s3+sg://ak:sk@bucket.storagegrid.example:8082/prefix";
+        let (ak, sk, bucket, endpoint, prefix, host, storage_type, tls_skip, compatibility) =
+            parse_s3_url(url).unwrap();
+        assert_eq!(ak, "ak");
+        assert_eq!(sk, "sk");
+        assert_eq!(bucket, "bucket");
+        assert_eq!(endpoint, "http://storagegrid.example:8082");
+        assert_eq!(prefix, "prefix/");
+        assert_eq!(host, "storagegrid.example");
+        assert!(matches!(storage_type, StorageType::S3));
+        assert!(!tls_skip);
+        assert_eq!(compatibility, S3Compatibility::StorageGrid);
+    }
+
+    #[test]
+    fn test_parse_storagegrid_https_url() {
+        let url = "s3+sg+https://ak:sk@bucket.storagegrid.example:443/prefix";
+        let (.., endpoint, _, _, _, tls_skip, compatibility) = parse_s3_url(url).unwrap();
+        assert_eq!(endpoint, "https://storagegrid.example:443");
+        assert!(tls_skip);
+        assert_eq!(compatibility, S3Compatibility::StorageGrid);
+    }
+
+    #[test]
+    fn test_parse_dxn_urls() {
+        let url = "s3+dxn://ak:sk@bucket.dxn.example:8184/prefix";
+        let (.., endpoint, prefix, host, storage_type, tls_skip, compatibility) =
+            parse_s3_url(url).unwrap();
+        assert_eq!(endpoint, "http://dxn.example:8184");
+        assert_eq!(prefix, "prefix/");
+        assert_eq!(host, "dxn.example");
+        assert!(matches!(storage_type, StorageType::S3));
+        assert!(!tls_skip);
+        assert_eq!(compatibility, S3Compatibility::Dxn);
+
+        let (.., endpoint, _, _, _, tls_skip, compatibility) =
+            parse_s3_url("s3+dxn+https://ak:sk@bucket.dxn.example:443/prefix").unwrap();
+        assert_eq!(endpoint, "https://dxn.example:443");
+        assert!(tls_skip);
+        assert_eq!(compatibility, S3Compatibility::Dxn);
     }
 
     #[test]
     fn test_parse_s3_url_no_prefix() {
         let url = "s3://ak:sk@bucket.host.com:9000";
-        let (ak, sk, bucket, endpoint, prefix, host, _, _) = parse_s3_url(url).unwrap();
+        let (ak, sk, bucket, endpoint, prefix, host, _, _, _) = parse_s3_url(url).unwrap();
         assert_eq!(ak, "ak");
         assert_eq!(sk, "sk");
         assert_eq!(bucket, "bucket");
@@ -4253,24 +4333,24 @@ mod tests {
     #[test]
     fn test_parse_s3_url_deep_prefix() {
         let url = "s3://ak:sk@bucket.host.com:9000/a/b/c";
-        let (.., prefix, _, _, _) = parse_s3_url(url).unwrap();
+        let (.., prefix, _, _, _, _) = parse_s3_url(url).unwrap();
         assert_eq!(prefix, "a/b/c/");
     }
 
     #[test]
     fn test_parse_s3_url_prefix_trailing_slash() {
         let url = "s3://ak:sk@bucket.host.com:9000/prefix/";
-        let (.., prefix, _, _, _) = parse_s3_url(url).unwrap();
+        let (.., prefix, _, _, _, _) = parse_s3_url(url).unwrap();
         assert_eq!(prefix, "prefix/");
     }
 
-    // --- tls_skip_verify 解析测试（s3+https scheme 自动跳过 TLS 验证）---
+    // --- tls_skip_verify 解析测试（HTTPS schemes 自动跳过 TLS 验证）---
 
     #[test]
     fn test_parse_s3_url_https_skips_tls() {
         // s3+https scheme 自动启用跳过验证
         let url = "s3+https://ak:sk@bucket.host.com:443/prefix";
-        let (.., tls_skip) = parse_s3_url(url).unwrap();
+        let (.., tls_skip, _) = parse_s3_url(url).unwrap();
         assert!(tls_skip);
     }
 
@@ -4278,7 +4358,7 @@ mod tests {
     fn test_parse_s3_url_http_no_tls_skip() {
         // s3:// (http) 不跳过验证
         let url = "s3://ak:sk@bucket.host.com:9000/prefix";
-        let (.., tls_skip) = parse_s3_url(url).unwrap();
+        let (.., tls_skip, _) = parse_s3_url(url).unwrap();
         assert!(!tls_skip);
     }
 
@@ -4286,17 +4366,49 @@ mod tests {
     fn test_parse_s3_endpoint_url_https_skips_tls() {
         // s3+https scheme 自动启用跳过验证
         let url = "s3+https://ak:sk@host.com:9000";
-        let (_, _, endpoint, tls_skip) = parse_s3_endpoint_url(url).unwrap();
+        let (_, _, endpoint, tls_skip, compatibility) = parse_s3_endpoint_url(url).unwrap();
         assert!(tls_skip);
         assert!(endpoint.starts_with("https://"));
+        assert_eq!(compatibility, S3Compatibility::Standard);
     }
 
     #[test]
     fn test_parse_s3_endpoint_url_http_no_tls_skip() {
         // s3:// (http) 不跳过验证
         let url = "s3://ak:sk@host.com:9000";
-        let (_, _, _, tls_skip) = parse_s3_endpoint_url(url).unwrap();
+        let (_, _, _, tls_skip, compatibility) = parse_s3_endpoint_url(url).unwrap();
         assert!(!tls_skip);
+        assert_eq!(compatibility, S3Compatibility::Standard);
+    }
+
+    #[test]
+    fn test_parse_storagegrid_endpoint_urls() {
+        let (_, _, endpoint, tls_skip, compatibility) =
+            parse_s3_endpoint_url("s3+sg://ak:sk@storagegrid.example:8082").unwrap();
+        assert_eq!(endpoint, "http://storagegrid.example:8082");
+        assert!(!tls_skip);
+        assert_eq!(compatibility, S3Compatibility::StorageGrid);
+
+        let (_, _, endpoint, tls_skip, compatibility) =
+            parse_s3_endpoint_url("s3+sg+https://ak:sk@storagegrid.example:443").unwrap();
+        assert_eq!(endpoint, "https://storagegrid.example:443");
+        assert!(tls_skip);
+        assert_eq!(compatibility, S3Compatibility::StorageGrid);
+    }
+
+    #[test]
+    fn test_parse_dxn_endpoint_urls() {
+        let (_, _, endpoint, tls_skip, compatibility) =
+            parse_s3_endpoint_url("s3+dxn://ak:sk@dxn.example:8184").unwrap();
+        assert_eq!(endpoint, "http://dxn.example:8184");
+        assert!(!tls_skip);
+        assert_eq!(compatibility, S3Compatibility::Dxn);
+
+        let (_, _, endpoint, tls_skip, compatibility) =
+            parse_s3_endpoint_url("s3+dxn+https://ak:sk@dxn.example:443").unwrap();
+        assert_eq!(endpoint, "https://dxn.example:443");
+        assert!(tls_skip);
+        assert_eq!(compatibility, S3Compatibility::Dxn);
     }
 
     // --- 构造测试用 S3Storage（不连接实际 S3 服务） ---
