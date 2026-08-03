@@ -51,6 +51,9 @@ destinations. Local, NFSv3, and NFSv4.1 additionally cover matching
 directories, file/directory type mismatches, and POSIX mtime mismatches. S3 is
 excluded from directory and POSIX metadata cases because it exposes prefixes
 rather than real directories and cannot faithfully represent those fields.
+Timestamp coverage also proves that comparison remains exact by default, that
+an explicit inclusive tolerance accepts a bounded difference, and that the
+opt-in automatic precision mode compares at the coarser apparent resolution.
 The lab has no CIFS endpoint, so CIFS remains covered by the shared stream
 contract tests until a real SMB service is added.
 

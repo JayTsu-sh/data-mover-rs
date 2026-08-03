@@ -36,8 +36,8 @@ pub use filter::{
     get_filter_field_definitions,
 };
 pub use integrity_check::{
-    IntegrityCheck, IntegrityCheckMode, IntegrityEntryKind, IntegritySide, MismatchDataField,
-    MismatchMetaField,
+    IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, IntegrityEntryKind, IntegritySide,
+    MismatchDataField, MismatchMetaField, MtimePrecision,
 };
 pub use local::LocalStorage;
 pub use nfs::NFSStorage;

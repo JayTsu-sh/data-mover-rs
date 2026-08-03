@@ -53,6 +53,21 @@ check_path() {
     --mode "$mode"
 }
 
+check_path_with_mtime_options() {
+  local source_backend="$1"
+  local destination_backend="$2"
+  local key="$3"
+  local tolerance_ms="$4"
+  shift 4
+  cargo run --quiet --locked --example storage_integrity_check -- \
+    --source "$(storage_url source "$source_backend")" \
+    --destination "$(storage_url destination "$destination_backend")" \
+    --path "$key" \
+    --mode quick \
+    --mtime-tolerance-ms "$tolerance_ms" \
+    "$@"
+}
+
 expect_mismatch() {
   local expected_pattern="$1"
   local description="$2"
@@ -231,6 +246,21 @@ for backend in "${nas_backends[@]}"; do
   expect_mismatch 'EntryKind.*File.*Directory' "$backend-entry-kind" \
     "$backend" "$backend" "$type_key" quick
 done
+
+# Timestamp comparison remains exact by default. Explicit options can accept a
+# bounded clock/precision difference without weakening existing callers.
+mtime_key="integrity-mtime-options-local.bin"
+printf 'mtime-options' > "$local_root/source/$mtime_key"
+cp "$local_root/source/$mtime_key" "$local_root/destination/$mtime_key"
+touch -m -d '@1700000400.000000000' "$local_root/source/$mtime_key"
+touch -m -d '@1700000400.005000000' "$local_root/destination/$mtime_key"
+expect_mismatch 'MismatchMeta.*Mtime' "local-mtime-exact-default" \
+  local local "$mtime_key" quick
+check_path_with_mtime_options local local "$mtime_key" 5
+
+touch -m -d '@1700000400.500000000' "$local_root/destination/$mtime_key"
+check_path_with_mtime_options local local "$mtime_key" 0 --mtime-auto-precision
+echo "mtime precision and tolerance options verified"
 
 # Quick mode must not read content. Preserve metadata after corrupting one byte,
 # then require Quick to pass and Full to report the exact first bad offset.
