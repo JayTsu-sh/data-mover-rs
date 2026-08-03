@@ -22,7 +22,6 @@ jobs:
     timeout-minutes: 240
     env:
       RUN_ID: release-${{ github.run_id }}-${{ github.run_attempt }}
-      AWS_S3_STORAGEGRID_COMPAT: "true"
     steps:
       - uses: actions/checkout@v5
         with:

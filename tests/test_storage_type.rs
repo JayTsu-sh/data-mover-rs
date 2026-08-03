@@ -51,6 +51,22 @@ fn test_s3_hcp() {
 }
 
 #[test]
+fn test_s3_storagegrid() {
+    assert_eq!(
+        detect_storage_type("s3+sg://bucket.host/data"),
+        StorageType::S3
+    );
+}
+
+#[test]
+fn test_s3_storagegrid_https() {
+    assert_eq!(
+        detect_storage_type("s3+sg+https://bucket.host/data"),
+        StorageType::S3
+    );
+}
+
+#[test]
 fn test_relative_path() {
     assert_eq!(detect_storage_type("./relative/path"), StorageType::Local);
 }

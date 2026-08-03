@@ -10,10 +10,6 @@ pub(super) fn configure(builder: Builder) -> Builder {
     builder.interceptor(StripXIdInterceptor)
 }
 
-pub(super) fn compatibility_enabled() -> bool {
-    enabled_from_value(std::env::var("AWS_S3_STORAGEGRID_COMPAT").ok().as_deref())
-}
-
 /// Remove the exact `x-id` query parameter from an encoded request URI.
 ///
 /// The common no-match path performs no allocation. A matching URI is scanned
@@ -64,10 +60,6 @@ impl Intercept for StripXIdInterceptor {
         }
         Ok(())
     }
-}
-
-fn enabled_from_value(value: Option<&str>) -> bool {
-    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 #[cfg(test)]
@@ -184,15 +176,6 @@ mod tests {
             strip_x_id_from_uri("https://s3.example/bucket/key?x-id=GetObject"),
             Some("https://s3.example/bucket/key".to_string())
         );
-    }
-
-    #[test]
-    fn compatibility_is_opt_in() {
-        assert!(!enabled_from_value(None));
-        assert!(enabled_from_value(Some("1")));
-        assert!(enabled_from_value(Some("TRUE")));
-        assert!(!enabled_from_value(Some("0")));
-        assert!(!enabled_from_value(Some("false")));
     }
 
     #[tokio::test]

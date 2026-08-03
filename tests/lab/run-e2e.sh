@@ -38,6 +38,13 @@ storage_url() {
   esac
 }
 
+storagegrid_url() {
+  local role="$1"
+  local standard_url
+  standard_url="$(storage_url "$role" s3)"
+  printf 's3+sg%s' "${standard_url#s3}"
+}
+
 seed_source() {
   local backend="$1"
   local key="$2"
@@ -99,6 +106,39 @@ for source_backend in "${backends[@]}"; do
     echo "$source_backend -> $destination_backend verified: $actual_hash"
   done
 done
+
+# The lab has no real StorageGRID endpoint, so retain the standard s3:// matrix
+# above and add focused s3+sg:// smoke cases against the compatible test
+# service. Request-capture unit tests separately prove that only this scheme
+# removes x-id before signing.
+sg_read_key="storagegrid-scheme-read.txt"
+sg_read_value="data-mover-$run_id-storagegrid-scheme-read"
+seed_source s3 "$sg_read_key" "$sg_read_value"
+cargo run --quiet --locked --example storage_copy -- \
+  --source "$(storagegrid_url source)" \
+  --destination "$(storage_url destination local)" \
+  --path "$sg_read_key"
+expected_hash="$(printf '%s' "$sg_read_value" | sha256sum | cut -d' ' -f1)"
+actual_hash="$(destination_hash local "$sg_read_key")"
+[[ "$actual_hash" == "$expected_hash" ]] || {
+  echo "StorageGRID scheme read checksum mismatch" >&2
+  exit 1
+}
+
+sg_write_key="storagegrid-scheme-write.txt"
+sg_write_value="data-mover-$run_id-storagegrid-scheme-write"
+printf '%s' "$sg_write_value" > "$local_root/seed/$sg_write_key"
+cargo run --quiet --locked --example storage_copy -- \
+  --source "$local_root/seed" \
+  --destination "$(storagegrid_url destination)" \
+  --path "$sg_write_key"
+expected_hash="$(printf '%s' "$sg_write_value" | sha256sum | cut -d' ' -f1)"
+actual_hash="$(destination_hash s3 "$sg_write_key")"
+[[ "$actual_hash" == "$expected_hash" ]] || {
+  echo "StorageGRID scheme write checksum mismatch" >&2
+  exit 1
+}
+echo "StorageGRID scheme read and write verified"
 
 # Exercise negotiated NFSv4.1 rsize/wsize with a payload larger than a single
 # session request. The small matrix fixtures above validate routing and
@@ -200,6 +240,33 @@ if python3 "$(dirname "$0")/s3_helper.py" exists \
   exit 1
 fi
 echo "S3 small-object rename verified: $actual_hash"
+
+# Exercise the same CopyObject/DeleteObject rename path through s3+sg://.
+sg_rename_source="storagegrid rename source.txt"
+sg_rename_destination="storagegrid rename destination.txt"
+sg_rename_value="data-mover-$run_id-storagegrid-scheme-rename"
+seed_source s3 "$sg_rename_source" "$sg_rename_value"
+cargo run --quiet --locked --example storage_rename -- \
+  --storage "$(storagegrid_url source)" \
+  --from "$sg_rename_source" \
+  --to "$sg_rename_destination"
+expected_hash="$(printf '%s' "$sg_rename_value" | sha256sum | cut -d' ' -f1)"
+actual_hash="$(
+  python3 "$(dirname "$0")/s3_helper.py" sha256 \
+    --endpoint "$LAB_SOURCE_DATA" --bucket "$LAB_S3_BUCKET" \
+    --key "ci/$run_id/source/$sg_rename_destination"
+)"
+[[ "$actual_hash" == "$expected_hash" ]] || {
+  echo "StorageGRID scheme rename checksum mismatch" >&2
+  exit 1
+}
+if python3 "$(dirname "$0")/s3_helper.py" exists \
+  --endpoint "$LAB_SOURCE_DATA" --bucket "$LAB_S3_BUCKET" \
+  --key "ci/$run_id/source/$sg_rename_source"; then
+  echo "StorageGRID scheme rename left the source object behind" >&2
+  exit 1
+fi
+echo "StorageGRID scheme rename verified: $actual_hash"
 
 # Force the multipart S3 rename path with lab-sized limits. The test verifies
 # object bytes, user and system metadata, tags, special-character CopySource

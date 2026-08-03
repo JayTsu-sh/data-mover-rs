@@ -46,6 +46,16 @@ mod tests {
     }
 
     #[test]
+    fn redacts_storagegrid_credentials() {
+        let out = redact_storage_url(
+            "s3+sg+https://AKIA1234:secretXYZ@bucket.storagegrid.example/prefix",
+        );
+        assert!(out.contains("***:***@"));
+        assert!(!out.contains("AKIA1234"));
+        assert!(!out.contains("secretXYZ"));
+    }
+
+    #[test]
     fn redacts_cifs_credentials() {
         let out = redact_storage_url("smb://user:pwd@host/share/path");
         assert!(out.contains("***:***@"));
