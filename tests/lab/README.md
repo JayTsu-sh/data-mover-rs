@@ -37,6 +37,23 @@ only that range, commits, and verifies the final hash. NAS destinations resume
 from a `.terrasync-part` file; S3 destinations resume the server-side multipart
 upload through `ListMultipartUploads` and `ListParts`.
 
+`run-integrity-e2e.sh` independently re-reads the complete 4-by-4 directed
+matrix through Local, NFSv3, NFSv4.1, and S3: four same-backend paths plus all
+twelve cross-protocol paths. It checks the large NFSv4.1 fixture using the
+negotiated effective read size and proves that Quick mode does not read
+content. A cross-protocol negative ring mutates each configured destination
+backend in turn. Each negative case uses a `12 MiB + 123 byte` fixture and
+places an equal-sized corruption at the unaligned offset `6 MiB + 17`, beyond
+the default NFS, Local, and S3 read boundaries. Full must report that exact
+global offset, while Quick must reject a one-byte destination size increase
+without reading content. All four backends also cover empty files and missing
+destinations. Local, NFSv3, and NFSv4.1 additionally cover matching
+directories, file/directory type mismatches, and POSIX mtime mismatches. S3 is
+excluded from directory and POSIX metadata cases because it exposes prefixes
+rather than real directories and cannot faithfully represent those fields.
+The lab has no CIFS endpoint, so CIFS remains covered by the shared stream
+contract tests until a real SMB service is added.
+
 The self-hosted runner must provide `LAB_S3_ACCESS_KEY` and
 `LAB_S3_SECRET_KEY`. Credentials must not be committed or printed.
 
