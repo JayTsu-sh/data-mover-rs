@@ -39,20 +39,14 @@ mod tests {
 
     #[test]
     fn redacts_s3_credentials() {
-        let out = redact_storage_url("s3://AKIA1234:secretXYZ@bucket.host:9000/prefix");
-        assert!(out.contains("***:***@"));
-        assert!(!out.contains("AKIA1234"));
-        assert!(!out.contains("secretXYZ"));
-    }
-
-    #[test]
-    fn redacts_storagegrid_credentials() {
-        let out = redact_storage_url(
+        for url in [
+            "s3://AKIA1234:secretXYZ@bucket.host:9000/prefix",
             "s3+sg+https://AKIA1234:secretXYZ@bucket.storagegrid.example/prefix",
-        );
-        assert!(out.contains("***:***@"));
-        assert!(!out.contains("AKIA1234"));
-        assert!(!out.contains("secretXYZ"));
+        ] {
+            let out = redact_storage_url(url);
+            assert!(out.contains("***:***@"));
+            assert!(!out.contains("AKIA1234") && !out.contains("secretXYZ"));
+        }
     }
 
     #[test]

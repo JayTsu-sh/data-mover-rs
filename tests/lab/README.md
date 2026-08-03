@@ -60,7 +60,8 @@ The self-hosted runner must provide `LAB_S3_ACCESS_KEY` and
 The lab does not currently contain a real StorageGRID system. Request-level
 tests use a capturing Smithy connector to verify that standard S3 requests
 retain the SDK-generated `x-id` and StorageGRID requests remove it from the
-transmitted URI. Dedicated `s3+sg://` smoke cases then run against the
+transmitted URI. They also verify that StorageGRID multi-object delete carries
+a body-matching, SigV4-signed `Content-MD5`. Dedicated `s3+sg://` smoke cases run against the
 configured S3-compatible endpoints while the main S3 matrix continues using
 standard `s3://`. These checks validate scheme selection, copy, rename, and
 non-regression behavior, but they are not a substitute for a smoke test on the

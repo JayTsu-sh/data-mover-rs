@@ -892,6 +892,11 @@ impl S3Storage {
                     Ok(r) => r,
                     Err(e) => {
                         error!("Failed to list objects for delete: {}", e);
+                        let event = DeleteEvent::failure(
+                            prefix.clone().into(),
+                            format!("Failed to list objects for delete: {e}"),
+                        );
+                        let _ = tx.send(event).await;
                         break;
                     }
                 };
@@ -908,21 +913,19 @@ impl S3Storage {
                             for key in deleted {
                                 // 将 full key 转为相对路径
                                 let rel = key.strip_prefix(&prefix).unwrap_or(&key);
-                                let _ = tx
-                                    .send(DeleteEvent {
-                                        relative_path: std::path::PathBuf::from(rel),
-                                        is_dir: false,
-                                    })
-                                    .await;
+                                let event = DeleteEvent::success(rel.into(), false);
+                                let _ = tx.send(event).await;
                             }
                         }
                         Err(e) => {
                             error!("Failed to delete objects batch: {:?}", e);
+                            let event = DeleteEvent::failure(prefix.clone().into(), e.to_string());
+                            let _ = tx.send(event).await;
+                            break;
                         }
                     }
                 }
 
-                // 检查是否还有更多对象
                 match resp.next_continuation_token() {
                     Some(token) => continuation_token = Some(token.to_string()),
                     None => break,

@@ -225,7 +225,11 @@ impl StorageEnum {
 
     pub async fn delete_dir_all(&self, entry: &EntryEnum) -> Result<()> {
         let iter = self.delete_dir_all_with_progress(Some(entry.get_relative_path()), 4)?;
-        while iter.next().await.is_some() {}
+        while let Some(event) = iter.next().await {
+            if let Some(error) = event.error {
+                return Err(StorageError::OperationError(error));
+            }
+        }
         Ok(())
     }
 

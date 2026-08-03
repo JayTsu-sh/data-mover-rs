@@ -44,7 +44,9 @@ For clients created from either StorageGRID scheme, data-mover removes the
 exact `x-id` query parameter immediately before SigV4 signing. Other query
 parameters and their encoded bytes are preserved. The scheme applies to both
 bucket listing and normal S3 data operations and does not change credentials,
-path-style addressing, or checksum configuration.
+path-style addressing, or general checksum configuration. For multi-object
+delete, it also supplies the legacy signed `Content-MD5` required by older
+StorageGRID releases.
 
 Standard `s3://`, `s3+http://`, and `s3+https://` clients never enable this
 workaround, so standard S3 and StorageGRID endpoints can safely coexist in one
