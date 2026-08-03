@@ -65,6 +65,22 @@ Standard S3 clients remain unchanged. The HTTPS form skips certificate
 verification and is intended only for trusted private deployments with
 self-signed certificates.
 
+#### Known DXN limitations
+
+- Multipart rename uses S3 `UploadPartCopy`. DXN returns `InvalidArgument`
+  when the source object key contains characters such as spaces, `%`, `?`,
+  `#`, or non-ASCII text. Small-object rename through `CopyObject` is not
+  affected. Data-mover currently reports the operation error and preserves
+  the source object; it does not fall back to client-side streaming.
+- DXN does not preserve the `x-amz-tagging` value supplied to
+  `CreateMultipartUpload`. A multipart rename can therefore copy object data,
+  content type, and user metadata while losing object tags. Callers that
+  require tag preservation should not use multipart rename on DXN until a
+  verified `PutObjectTagging` compatibility path is implemented.
+
+These limitations have been reproduced against the current DXN lab endpoint.
+They do not change standard S3 or StorageGRID behavior.
+
 ### SMB/CIFS URL Parameters
 
 | Parameter | Default | Description |
