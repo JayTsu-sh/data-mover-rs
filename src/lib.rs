@@ -16,6 +16,7 @@ pub mod cifs;
 pub mod dir_tree;
 pub mod error;
 pub mod filter;
+pub mod integrity_check;
 pub mod local;
 pub mod nfs;
 pub mod qos;
@@ -33,6 +34,10 @@ pub use cifs::CifsStorage;
 pub use filter::{
     FilterExpression, FilterFieldDef, FilterOperatorDef, dir_matches_date_filter,
     get_filter_field_definitions,
+};
+pub use integrity_check::{
+    IntegrityCheck, IntegrityCheckMode, IntegrityEntryKind, IntegritySide, MismatchDataField,
+    MismatchMetaField,
 };
 pub use local::LocalStorage;
 pub use nfs::NFSStorage;
@@ -289,6 +294,8 @@ pub enum ErrorEvent {
     SymlinkOp,
     /// 打包失败
     Pack,
+    /// 独立完整性检查失败
+    IntegrityCheck,
 }
 
 impl fmt::Display for ErrorEvent {
@@ -302,6 +309,7 @@ impl fmt::Display for ErrorEvent {
             ErrorEvent::Rename => write!(f, "rename"),
             ErrorEvent::SymlinkOp => write!(f, "symlink_op"),
             ErrorEvent::Pack => write!(f, "pack"),
+            ErrorEvent::IntegrityCheck => write!(f, "integrity_check"),
         }
     }
 }
