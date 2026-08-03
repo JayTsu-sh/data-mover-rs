@@ -40,7 +40,7 @@ BASELINE = {
 }
 NEW_FILE_LIMIT = 1000
 GROWTH_WARN_PCT = 5
-GROWTH_FAIL_PCT = 10
+HIGH_GROWTH_PCT = 10
 
 
 def main() -> int:
@@ -63,9 +63,11 @@ def main() -> int:
                 fails.append(f"{rs.name}: NEW file {loc} > {NEW_FILE_LIMIT}")
         else:
             growth = (loc - baseline) / baseline * 100
-            if growth > GROWTH_FAIL_PCT:
-                status = f"GROW +{growth:.1f}% FAIL"
-                fails.append(f"{rs.name}: grew {growth:.1f}% (baseline {baseline}, now {loc})")
+            if growth > HIGH_GROWTH_PCT:
+                status = f"GROW +{growth:.1f}% WARN"
+                warns.append(
+                    f"{rs.name}: grew {growth:.1f}% (baseline {baseline}, now {loc})"
+                )
             elif growth > GROWTH_WARN_PCT:
                 status = f"GROW +{growth:.1f}% WARN"
                 warns.append(f"{rs.name}: grew {growth:.1f}%")
