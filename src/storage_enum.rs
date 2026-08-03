@@ -2215,6 +2215,8 @@ pub fn detect_storage_type(path: &str) -> StorageType {
             || p.starts_with("s3+https://")
             || p.starts_with("s3+sg://")
             || p.starts_with("s3+sg+https://")
+            || p.starts_with("s3+dxn://")
+            || p.starts_with("s3+dxn+https://")
             || p.starts_with("s3+hcp://") =>
         {
             StorageType::S3

@@ -42,6 +42,7 @@ mod tests {
         for url in [
             "s3://AKIA1234:secretXYZ@bucket.host:9000/prefix",
             "s3+sg+https://AKIA1234:secretXYZ@bucket.storagegrid.example/prefix",
+            "s3+dxn://AKIA1234:secretXYZ@bucket.dxn.example/prefix",
         ] {
             let out = redact_storage_url(url);
             assert!(out.contains("***:***@"));

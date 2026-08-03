@@ -4,9 +4,6 @@ use aws_smithy_runtime_api::client::interceptors::Intercept;
 use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextMut;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::config_bag::ConfigBag;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use md5::{Digest, Md5};
 
 /// Register the `StorageGRID` compatibility interceptor.
 pub(super) fn configure(builder: Builder) -> Builder {
@@ -61,35 +58,9 @@ impl Intercept for StorageGridCompatibilityInterceptor {
         if let Some(uri) = strip_x_id_from_uri(request.uri()) {
             request.set_uri(uri)?;
         }
-        add_delete_objects_content_md5(request)?;
+        super::delete_objects_md5::add_content_md5(request)?;
         Ok(())
     }
-}
-
-/// `StorageGRID` 11.5 requires the legacy RFC 1864 checksum for multi-object
-/// delete and does not accept the newer `x-amz-checksum-*` headers instead.
-/// The SDK-generated XML body is buffered, so hashing borrows it without a
-/// body copy. This hook runs before `SigV4` signing so the header is signed.
-fn add_delete_objects_content_md5(
-    request: &mut aws_smithy_runtime_api::client::orchestrator::HttpRequest,
-) -> Result<(), BoxError> {
-    let is_delete_objects = request.method() == "POST"
-        && request
-            .uri()
-            .split_once('?')
-            .is_some_and(|(_, query)| query.split('&').any(|pair| pair == "delete"));
-    if !is_delete_objects || request.headers().contains_key("content-md5") {
-        return Ok(());
-    }
-
-    let body = request.body().bytes().ok_or_else(|| {
-        std::io::Error::other("StorageGRID DeleteObjects request body must be buffered")
-    })?;
-    let content_md5 = BASE64_STANDARD.encode(Md5::digest(body));
-    request
-        .headers_mut()
-        .try_insert("content-md5", content_md5)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -107,6 +78,9 @@ mod tests {
     use aws_smithy_runtime_api::http::StatusCode;
     use aws_smithy_types::body::SdkBody;
     use aws_types::region::Region;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use md5::{Digest, Md5};
 
     #[derive(Clone, Debug)]
     struct CapturingConnector {
@@ -176,7 +150,7 @@ mod tests {
         }
     }
 
-    async fn captured_list_buckets_uri(storagegrid_compatibility: bool) -> String {
+    async fn captured_list_buckets_uri(compatibility: super::super::S3Compatibility) -> String {
         let captured_uri = Arc::new(Mutex::new(None));
         let connector = CapturingConnector {
             uri: Arc::clone(&captured_uri),
@@ -198,10 +172,10 @@ mod tests {
             .endpoint_url("http://storagegrid.test")
             .force_path_style(true)
             .http_client(http_client);
-        let config = if storagegrid_compatibility {
-            configure(builder).build()
-        } else {
-            builder.build()
+        let config = match compatibility {
+            super::super::S3Compatibility::Standard => builder.build(),
+            super::super::S3Compatibility::StorageGrid => configure(builder).build(),
+            super::super::S3Compatibility::Dxn => super::super::dxn::configure(builder).build(),
         };
 
         let result = aws_sdk_s3::Client::from_conf(config)
@@ -221,7 +195,7 @@ mod tests {
     }
 
     async fn captured_delete_objects_request(
-        storagegrid_compatibility: bool,
+        compatibility: super::super::S3Compatibility,
     ) -> CapturedDeleteRequest {
         let captured_request = Arc::new(Mutex::new(None));
         let connector = CapturingDeleteConnector {
@@ -243,10 +217,10 @@ mod tests {
             .endpoint_url("http://storagegrid.test")
             .force_path_style(true)
             .http_client(http_client);
-        let config = if storagegrid_compatibility {
-            configure(builder).build()
-        } else {
-            builder.build()
+        let config = match compatibility {
+            super::super::S3Compatibility::Standard => builder.build(),
+            super::super::S3Compatibility::StorageGrid => configure(builder).build(),
+            super::super::S3Compatibility::Dxn => super::super::dxn::configure(builder).build(),
         };
         let object = ObjectIdentifier::builder()
             .key("prefix/object.txt")
@@ -304,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn sdk_request_contains_x_id_without_storagegrid_compatibility() {
-        let uri = captured_list_buckets_uri(false).await;
+        let uri = captured_list_buckets_uri(super::super::S3Compatibility::Standard).await;
 
         assert!(
             uri.split_once('?')
@@ -315,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn storagegrid_compatibility_removes_x_id_from_transmitted_request() {
-        let uri = captured_list_buckets_uri(true).await;
+        let uri = captured_list_buckets_uri(super::super::S3Compatibility::StorageGrid).await;
 
         assert!(
             !uri.split_once('?').is_some_and(|(_, query)| {
@@ -329,7 +303,8 @@ mod tests {
 
     #[tokio::test]
     async fn storagegrid_delete_objects_adds_signed_content_md5() {
-        let request = captured_delete_objects_request(true).await;
+        let request =
+            captured_delete_objects_request(super::super::S3Compatibility::StorageGrid).await;
         let expected = BASE64_STANDARD.encode(Md5::digest(&request.body));
 
         assert_eq!(request.content_md5.as_deref(), Some(expected.as_str()));
@@ -346,7 +321,26 @@ mod tests {
 
     #[tokio::test]
     async fn standard_s3_delete_objects_does_not_add_storagegrid_content_md5() {
-        let request = captured_delete_objects_request(false).await;
+        let request =
+            captured_delete_objects_request(super::super::S3Compatibility::Standard).await;
         assert!(request.content_md5.is_none());
+    }
+
+    #[tokio::test]
+    async fn dxn_delete_objects_adds_signed_content_md5_without_stripping_x_id() {
+        let request = captured_delete_objects_request(super::super::S3Compatibility::Dxn).await;
+        let expected = BASE64_STANDARD.encode(Md5::digest(&request.body));
+        let control_uri = captured_list_buckets_uri(super::super::S3Compatibility::Dxn).await;
+
+        assert_eq!(request.content_md5.as_deref(), Some(expected.as_str()));
+        assert!(control_uri.contains("x-id="));
+        assert!(
+            request
+                .authorization
+                .as_deref()
+                .is_some_and(|value| value.contains("content-md5")),
+            "Content-MD5 must be covered by SigV4: {:?}",
+            request.authorization
+        );
     }
 }

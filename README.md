@@ -12,6 +12,8 @@ Storage abstraction layer supporting Local, NFS, S3, and SMB/CIFS backends.
 | S3 (TLS) | `s3+https://access_key:secret_key@bucket.host/prefix` |
 | StorageGRID | `s3+sg://access_key:secret_key@bucket.host:port/prefix` |
 | StorageGRID (TLS) | `s3+sg+https://access_key:secret_key@bucket.host/prefix` |
+| DXN | `s3+dxn://access_key:secret_key@bucket.host:port/prefix` |
+| DXN (TLS) | `s3+dxn+https://access_key:secret_key@bucket.host/prefix` |
 | SMB/CIFS | `smb://user:password@host[:port]/share[/sub/path][?smb2_only=false]` |
 
 ### S3 Timeout Environment Variables
@@ -51,6 +53,17 @@ StorageGRID releases.
 Standard `s3://`, `s3+http://`, and `s3+https://` clients never enable this
 workaround, so standard S3 and StorageGRID endpoints can safely coexist in one
 process. There is no environment-variable override.
+
+### DXN compatibility
+
+Select DXN compatibility per endpoint with `s3+dxn://` for HTTP or
+`s3+dxn+https://` for HTTPS. DXN clients add a body-matching, SigV4-signed
+`Content-MD5` to multi-object delete requests. Unlike StorageGRID compatibility,
+DXN compatibility does not remove the AWS SDK's `x-id` query parameter.
+
+Standard S3 clients remain unchanged. The HTTPS form skips certificate
+verification and is intended only for trusted private deployments with
+self-signed certificates.
 
 ### SMB/CIFS URL Parameters
 
