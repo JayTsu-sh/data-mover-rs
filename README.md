@@ -81,6 +81,17 @@ self-signed certificates.
 These limitations have been reproduced against the current DXN lab endpoint.
 They do not change standard S3 or StorageGRID behavior.
 
+### Integrity-check timestamp options
+
+Integrity checks compare modification timestamps exactly by default. Callers
+that need to accommodate endpoints with coarser timestamp resolution can use
+`IntegrityCheckOptions` with `MtimePrecision::Auto` and an explicit
+`mtime_tolerance`. The tolerance is inclusive and represented as a Rust
+`Duration`; existing `IntegrityCheck` methods retain exact comparison.
+
+The `storage_integrity_check` example exposes the same behavior through
+`--mtime-auto-precision` and `--mtime-tolerance-ms`.
+
 ### SMB/CIFS URL Parameters
 
 | Parameter | Default | Description |

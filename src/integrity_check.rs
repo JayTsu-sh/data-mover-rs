@@ -74,6 +74,47 @@ pub enum IntegrityCheckMode {
     Full,
 }
 
+/// How modification timestamps are normalized before comparison.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MtimePrecision {
+    /// Compare the original nanosecond timestamps.
+    #[default]
+    Exact,
+    /// Infer each timestamp's apparent precision and compare at the coarser one.
+    Auto,
+}
+
+/// Options controlling an independent integrity check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegrityCheckOptions {
+    pub mode: IntegrityCheckMode,
+    pub mtime_precision: MtimePrecision,
+    pub mtime_tolerance: Duration,
+}
+
+impl IntegrityCheckOptions {
+    #[must_use]
+    pub const fn new(mode: IntegrityCheckMode) -> Self {
+        Self {
+            mode,
+            mtime_precision: MtimePrecision::Exact,
+            mtime_tolerance: Duration::ZERO,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_mtime_precision(mut self, precision: MtimePrecision) -> Self {
+        self.mtime_precision = precision;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_mtime_tolerance(mut self, tolerance: Duration) -> Self {
+        self.mtime_tolerance = tolerance;
+        self
+    }
+}
+
 /// Stateless independent integrity checker.
 pub struct IntegrityCheck;
 
@@ -87,6 +128,24 @@ impl IntegrityCheck {
         dest_storage: &StorageEnum,
         relative_path: &Path,
         mode: IntegrityCheckMode,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<EntryEnum> {
+        Self::check_path_with_options(
+            src_storage,
+            dest_storage,
+            relative_path,
+            IntegrityCheckOptions::new(mode),
+            cancel,
+        )
+        .await
+    }
+
+    /// Resolve both entries and compare them with explicit timestamp options.
+    pub async fn check_path_with_options(
+        src_storage: &StorageEnum,
+        dest_storage: &StorageEnum,
+        relative_path: &Path,
+        options: IntegrityCheckOptions,
         cancel: Option<&CancellationToken>,
     ) -> Result<EntryEnum> {
         let resolve = Box::pin(async {
@@ -105,12 +164,12 @@ impl IntegrityCheck {
             resolve.await?
         };
 
-        Self::check(
+        Self::check_with_options(
             src_storage,
             dest_storage,
             &src_entry,
             &dest_entry,
-            mode,
+            options,
             cancel,
         )
         .await?;
@@ -125,18 +184,36 @@ impl IntegrityCheck {
         mode: IntegrityCheckMode,
         cancel: Option<&CancellationToken>,
     ) -> Result<()> {
+        Self::check_with_source_entry_and_options(
+            src_storage,
+            dest_storage,
+            src_entry,
+            IntegrityCheckOptions::new(mode),
+            cancel,
+        )
+        .await
+    }
+
+    /// Resolve the destination and compare it with explicit timestamp options.
+    pub async fn check_with_source_entry_and_options(
+        src_storage: &StorageEnum,
+        dest_storage: &StorageEnum,
+        src_entry: &EntryEnum,
+        options: IntegrityCheckOptions,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<()> {
         let dest_entry = Box::pin(get_metadata_with_retry(
             dest_storage,
             src_entry.get_relative_path(),
             cancel,
         ))
         .await?;
-        Self::check(
+        Self::check_with_options(
             src_storage,
             dest_storage,
             src_entry,
             &dest_entry,
-            mode,
+            options,
             cancel,
         )
         .await
@@ -152,6 +229,26 @@ impl IntegrityCheck {
         src_entry: &EntryEnum,
         dest_entry: &EntryEnum,
         mode: IntegrityCheckMode,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<()> {
+        Self::check_with_options(
+            src_storage,
+            dest_storage,
+            src_entry,
+            dest_entry,
+            IntegrityCheckOptions::new(mode),
+            cancel,
+        )
+        .await
+    }
+
+    /// Compare two already-resolved entries with explicit timestamp options.
+    pub async fn check_with_options(
+        src_storage: &StorageEnum,
+        dest_storage: &StorageEnum,
+        src_entry: &EntryEnum,
+        dest_entry: &EntryEnum,
+        options: IntegrityCheckOptions,
         cancel: Option<&CancellationToken>,
     ) -> Result<()> {
         let src_kind = entry_kind(src_entry);
@@ -171,7 +268,7 @@ impl IntegrityCheck {
                 dest_storage,
                 src_entry,
                 dest_entry,
-                mode,
+                options.mode,
                 cancel,
             )
             .await?;
@@ -181,6 +278,8 @@ impl IntegrityCheck {
             src_entry,
             dest_entry,
             matches!(dest_storage, StorageEnum::S3(_)),
+            options.mtime_precision,
+            options.mtime_tolerance,
         );
         if metadata.is_empty() {
             Ok(())
@@ -570,13 +669,20 @@ fn collect_metadata_mismatches(
     src: &EntryEnum,
     dest: &EntryEnum,
     dest_is_s3: bool,
+    mtime_precision: MtimePrecision,
+    mtime_tolerance: Duration,
 ) -> Vec<MismatchMetaField> {
     if dest_is_s3 {
         return Vec::new();
     }
 
     let mut mismatches = Vec::new();
-    if src.get_mtime() != dest.get_mtime() {
+    if !mtime_matches(
+        src.get_mtime(),
+        dest.get_mtime(),
+        mtime_precision,
+        mtime_tolerance,
+    ) {
         mismatches.push(MismatchMetaField::Mtime {
             src: src.get_mtime(),
             dest: dest.get_mtime(),
@@ -602,6 +708,33 @@ fn collect_metadata_mismatches(
         }
     }
     mismatches
+}
+
+fn apparent_time_precision(timestamp_ns: i64) -> i64 {
+    const SECOND: i64 = 1_000_000_000;
+    const MILLISECOND: i64 = 1_000_000;
+    const MICROSECOND: i64 = 1_000;
+
+    if timestamp_ns != 0 && timestamp_ns % SECOND == 0 {
+        SECOND
+    } else if timestamp_ns != 0 && timestamp_ns % MILLISECOND == 0 {
+        MILLISECOND
+    } else if timestamp_ns != 0 && timestamp_ns % MICROSECOND == 0 {
+        MICROSECOND
+    } else {
+        1
+    }
+}
+
+fn mtime_matches(src: i64, dest: i64, precision: MtimePrecision, tolerance: Duration) -> bool {
+    let same_at_precision = match precision {
+        MtimePrecision::Exact => src == dest,
+        MtimePrecision::Auto => {
+            let resolution = apparent_time_precision(src).max(apparent_time_precision(dest));
+            src.div_euclid(resolution) == dest.div_euclid(resolution)
+        }
+    };
+    same_at_precision || u128::from(src.abs_diff(dest)) <= tolerance.as_nanos()
 }
 
 #[cfg(test)]
@@ -830,7 +963,110 @@ mod tests {
         dest_fields.gid = Some(1002);
         dest_fields.mode = 0o100_600;
 
-        assert!(collect_metadata_mismatches(&src, &dest, true).is_empty());
+        assert!(
+            collect_metadata_mismatches(&src, &dest, true, MtimePrecision::Exact, Duration::ZERO,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn exact_mtime_comparison_remains_the_default() {
+        assert!(!mtime_matches(
+            1_700_000_000_000_000_000,
+            1_700_000_000_000_000_001,
+            MtimePrecision::Exact,
+            Duration::ZERO,
+        ));
+    }
+
+    #[test]
+    fn automatic_mtime_precision_uses_the_coarser_apparent_resolution() {
+        let second = 1_700_000_000_000_000_000;
+        assert!(mtime_matches(
+            second,
+            second + 999_999_999,
+            MtimePrecision::Auto,
+            Duration::ZERO,
+        ));
+        assert!(!mtime_matches(
+            second,
+            second + 1_000_000_000,
+            MtimePrecision::Auto,
+            Duration::ZERO,
+        ));
+
+        let millisecond = second + 123_000_000;
+        assert!(mtime_matches(
+            millisecond,
+            millisecond + 999_999,
+            MtimePrecision::Auto,
+            Duration::ZERO,
+        ));
+    }
+
+    #[test]
+    fn mtime_tolerance_is_inclusive_and_overflow_safe() {
+        let src = 1_700_000_000_000_000_000;
+        assert!(mtime_matches(
+            src,
+            src + 5_000_000,
+            MtimePrecision::Exact,
+            Duration::from_millis(5),
+        ));
+        assert!(!mtime_matches(
+            src,
+            src + 5_000_001,
+            MtimePrecision::Exact,
+            Duration::from_millis(5),
+        ));
+        assert!(mtime_matches(
+            i64::MIN,
+            i64::MAX,
+            MtimePrecision::Exact,
+            Duration::from_secs(u64::MAX),
+        ));
+    }
+
+    #[test]
+    fn automatic_mtime_precision_handles_pre_epoch_timestamps() {
+        assert!(mtime_matches(
+            -2_000_000_000,
+            -1_000_000_001,
+            MtimePrecision::Auto,
+            Duration::ZERO,
+        ));
+        assert!(!mtime_matches(
+            -2_000_000_000,
+            -999_999_999,
+            MtimePrecision::Auto,
+            Duration::ZERO,
+        ));
+    }
+
+    #[tokio::test]
+    async fn configured_mtime_tolerance_applies_to_metadata_check() {
+        let root = std::env::temp_dir();
+        let src = nas_entry("item", 0);
+        let mut dest = src.clone();
+        let EntryEnum::NAS(dest_fields) = &mut dest else {
+            unreachable!()
+        };
+        dest_fields.mtime += 5_000_000;
+        let options = IntegrityCheckOptions::new(IntegrityCheckMode::Quick)
+            .with_mtime_tolerance(Duration::from_millis(5));
+
+        assert!(
+            IntegrityCheck::check_with_options(
+                &local(&root),
+                &local(&root),
+                &src,
+                &dest,
+                options,
+                None,
+            )
+            .await
+            .is_ok()
+        );
     }
 
     #[tokio::test]
