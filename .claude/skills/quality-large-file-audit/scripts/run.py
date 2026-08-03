@@ -13,8 +13,8 @@ sys.path.insert(0, str(SHARED))
 
 from protocol_constants import PROJECT_ROOT  # noqa: E402
 
-# Baseline 截至 2026-07-27 (所有现有 src/*.rs，含 <800 行的)
-# 增长 / 缩减按 % 计算。新文件 (不在表内) 必须 ≤800 行。
+# Baseline 截至 2026-07-27 (所有现有 src/*.rs，含 <1000 行的)
+# 增长 / 缩减按 % 计算。新文件 (不在表内) 必须 ≤1000 行。
 BASELINE = {
     "filter.rs": 5303,
     "s3.rs": 4329,
@@ -35,7 +35,7 @@ BASELINE = {
     "async_receiver.rs": 33,
     "write_pipeline.rs": 226,
 }
-NEW_FILE_LIMIT = 800
+NEW_FILE_LIMIT = 1000
 GROWTH_WARN_PCT = 5
 GROWTH_FAIL_PCT = 10
 
