@@ -327,6 +327,7 @@ const METADATA_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(1),
 ];
 const COMPARE_CHANNEL_CAPACITY: usize = 2;
+const FAST_COMPARE_BLOCK_SIZE: usize = 64 * 1024;
 
 fn is_missing(error: &StorageError) -> bool {
     matches!(
@@ -516,6 +517,36 @@ async fn compare_file_streams(
     compare_chunk_streams(src_rx, src_task, dest_rx, dest_task, expected_size, cancel).await
 }
 
+fn first_mismatch(left: &[u8], right: &[u8]) -> Option<usize> {
+    debug_assert_eq!(left.len(), right.len());
+
+    if left.len() <= FAST_COMPARE_BLOCK_SIZE {
+        return if left == right {
+            None
+        } else {
+            left.iter()
+                .zip(right)
+                .position(|(left, right)| left != right)
+        };
+    }
+
+    for block_start in (0..left.len()).step_by(FAST_COMPARE_BLOCK_SIZE) {
+        let block_end = (block_start + FAST_COMPARE_BLOCK_SIZE).min(left.len());
+        let left_block = &left[block_start..block_end];
+        let right_block = &right[block_start..block_end];
+
+        if left_block != right_block {
+            return left_block
+                .iter()
+                .zip(right_block)
+                .position(|(left, right)| left != right)
+                .map(|inner| block_start + inner);
+        }
+    }
+
+    None
+}
+
 async fn compare_chunk_streams(
     mut src_rx: mpsc::Receiver<DataChunk>,
     src_task: JoinHandle<Result<Option<crate::HashCalculator>>>,
@@ -592,11 +623,7 @@ async fn compare_chunk_streams(
                     let count = (src.data.len() - src_index).min(dest.data.len() - dest_index);
                     let src_bytes = &src.data[src_index..src_index + count];
                     let dest_bytes = &dest.data[dest_index..dest_index + count];
-                    if let Some(index) = src_bytes
-                        .iter()
-                        .zip(dest_bytes)
-                        .position(|(src, dest)| src != dest)
-                    {
+                    if let Some(index) = first_mismatch(src_bytes, dest_bytes) {
                         return Err(StorageError::MismatchData(vec![
                             MismatchDataField::Content {
                                 offset: src_read + index as u64,
@@ -857,6 +884,53 @@ mod tests {
         let mtime = filetime::FileTime::from_unix_time(1_700_000_000, 123_456_789);
         filetime::set_file_mtime(src, mtime).unwrap();
         filetime::set_file_mtime(dest, mtime).unwrap();
+    }
+
+    #[test]
+    fn fast_compare_accepts_equal_empty_small_boundary_and_large_slices() {
+        for size in [
+            0,
+            1,
+            FAST_COMPARE_BLOCK_SIZE - 1,
+            FAST_COMPARE_BLOCK_SIZE,
+            FAST_COMPARE_BLOCK_SIZE + 1,
+            2 * FAST_COMPARE_BLOCK_SIZE + 17,
+        ] {
+            let data = vec![0x5a; size];
+            assert_eq!(first_mismatch(&data, &data), None, "size {size}");
+        }
+    }
+
+    #[test]
+    fn fast_compare_reports_exact_offsets_across_block_boundaries() {
+        let size = 2 * FAST_COMPARE_BLOCK_SIZE + 17;
+        let source = vec![0x5a; size];
+
+        for offset in [
+            0,
+            FAST_COMPARE_BLOCK_SIZE - 1,
+            FAST_COMPARE_BLOCK_SIZE,
+            FAST_COMPARE_BLOCK_SIZE + 1,
+            size - 1,
+        ] {
+            let mut destination = source.clone();
+            destination[offset] ^= 0xff;
+            assert_eq!(
+                first_mismatch(&source, &destination),
+                Some(offset),
+                "offset {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_compare_reports_the_first_of_multiple_mismatches() {
+        let mut destination = vec![0x5a; 2 * FAST_COMPARE_BLOCK_SIZE];
+        let source = destination.clone();
+        destination[FAST_COMPARE_BLOCK_SIZE + 9] ^= 0xff;
+        destination[3] ^= 0xff;
+
+        assert_eq!(first_mismatch(&source, &destination), Some(3));
     }
 
     #[tokio::test]
