@@ -20,6 +20,31 @@ const COPY_PIPELINE_CAPACITY: usize = 4;
 /// TAR 打包 pipeline 的 channel 容量（多文件顺序读，适当放大缓冲）
 const TAR_PIPELINE_CAPACITY: usize = 16;
 
+#[derive(Debug, Clone)]
+pub struct WalkOptions {
+    pub depth: Option<usize>,
+    pub match_expressions: Option<FilterExpression>,
+    pub exclude_expressions: Option<FilterExpression>,
+    pub concurrency: usize,
+    pub include_tags: bool,
+    pub packaged: bool,
+    pub package_depth: usize,
+}
+
+impl Default for WalkOptions {
+    fn default() -> Self {
+        Self {
+            depth: None,
+            match_expressions: None,
+            exclude_expressions: None,
+            concurrency: 1,
+            include_tags: false,
+            packaged: false,
+            package_depth: 0,
+        }
+    }
+}
+
 // Takes ownership so it can be passed directly to Result::map_err.
 #[allow(clippy::needless_pass_by_value)]
 fn source_read_error(error: StorageError) -> StorageError {
@@ -301,18 +326,20 @@ impl StorageEnum {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn walkdir(
         &self,
         sub_path: Option<&Path>,
-        depth: Option<usize>,
-        match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>,
-        concurrency: usize,
-        include_tags: bool,
-        packaged: bool,
-        package_depth: usize,
+        options: WalkOptions,
     ) -> Result<WalkDirAsyncIterator> {
+        let WalkOptions {
+            depth,
+            match_expressions,
+            exclude_expressions,
+            concurrency,
+            include_tags,
+            packaged,
+            package_depth,
+        } = options;
         match self {
             StorageEnum::Local(s) => {
                 s.walkdir(

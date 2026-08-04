@@ -44,7 +44,7 @@ pub use nfs::NFSStorage;
 pub use qos::QosManager;
 pub use s3::{MultipartUpload, S3BucketInfo, S3CompletedPart, S3Storage};
 pub use storage_enum::{
-    StorageEnum, StorageType, StreamHandle, create_storage, detect_storage_type,
+    StorageEnum, StorageType, StreamHandle, WalkOptions, create_storage, detect_storage_type,
 };
 pub use tar_pack::calculate_tar_size;
 pub use url_redact::redact_storage_url;

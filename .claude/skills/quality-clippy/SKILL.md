@@ -1,6 +1,6 @@
 ---
 name: quality-clippy
-description: 跑 cargo clippy --all-targets，对比 baseline_count.txt — 允许下降，不允许新增。准备 PR 前必跑。最终目标 baseline = 0。
+description: 对 lib 执行关键 deny + warning baseline，并额外检查 tests/examples。准备 PR 前必跑。最终目标 baseline = 0。
 ---
 
 # quality-clippy
@@ -11,17 +11,19 @@ description: 跑 cargo clippy --all-targets，对比 baseline_count.txt — 允�
 
 项目当前有 ~173 条 clippy warnings/errors (大多 pedantic / doc 格式 / long literal)。强制 `-D warnings` 会让 CI 一直红，不可用。
 
-折衷：**baseline 化** — 总数 ≤ baseline 即 PASS。逐步下降，最终目标 = 0。届时把命令改回 `-D warnings`。
+折衷：生产库的存量普通 warning 做 **baseline 化**；unwrap/expect/dbg/todo/unimplemented
+始终为硬错误。tests/examples 运行 Clippy 并暂时只豁免 unwrap/expect，待其余存量
+清零后切换为 `-D warnings`。
 
 baseline 按平台分口径：Windows 多出 `cfg(windows)` 路径的 pedantic 警告，与 Linux 录制的数字不可比。
 存在 `baseline_count.<sys.platform>.txt`（如 `baseline_count.win32.txt`）时优先于 `baseline_count.txt`。
 
 ## 步骤
 
-1. cargo clippy --all-targets (不加 -D)
-2. 数 warning+error 数 (regex `^(warning|error):`)
-3. 对比 `baseline_count.txt`
-4. > baseline → FAIL；≤ baseline → PASS；明显下降 (≥ 5) → 提示更新 baseline。
+1. 对 lib 运行 Clippy，五类关键 lint 使用 `-D`。
+2. 统计 lib 的普通 warning+error 数，并对比 `baseline_count.txt`。
+3. > baseline → FAIL；≤ baseline → PASS；明显下降 (≥ 5) → 提示更新 baseline。
+4. 对 tests/examples 运行 Clippy，局部命令行豁免 unwrap/expect；Clippy 执行失败则 FAIL。
 
 ## 锁定下降 (推荐做法)
 
@@ -44,6 +46,7 @@ baseline = 0。届时：
 
 ## 备注
 
-- `unwrap_used` / `expect_used` 已是 deny — 这两个不进 baseline，新增直接编译失败。
-- `dbg_macro` / `todo` / `unimplemented` warn — 算入 baseline 数量。
+- 生产库的 `unwrap_used` / `expect_used` / `dbg_macro` / `todo` / `unimplemented`
+  不进 baseline，新增直接编译失败。
+- tests/examples 暂时允许 unwrap/expect，但仍运行其他 Clippy 检查。
 - pedantic 已 allow 部分 (module_name_repetitions / too_many_lines / cast_*) — 不会贡献 baseline。

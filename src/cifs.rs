@@ -28,7 +28,7 @@ use tracing::{debug, error, info, trace, warn};
 // 内部模块
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
-use crate::filter::{FilterExpression, dir_matches_date_filter, should_skip};
+use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
@@ -1886,7 +1886,7 @@ impl CifsStorage {
 
     /// 创建符号链接
     ///
-    /// SMB 通过 reparse point 支持符号链接。如果服务端不支持，静默返回 Ok(())
+    /// SMB reparse point support is not implemented by this backend.
     #[allow(clippy::unused_async)]
     pub async fn create_symlink(
         &self,
@@ -1897,19 +1897,17 @@ impl CifsStorage {
         _uid: Option<u32>,
         _gid: Option<u32>,
     ) -> Result<()> {
-        // SMB 符号链接创建需要特殊权限（SeCreateSymbolicLinkPrivilege）
-        // 大多数场景下不可用，静默跳过
-        warn!("CIFS symlink creation is not supported, skipping");
-        Ok(())
+        Err(StorageError::CifsError(
+            "CIFS symlink creation is not supported".to_string(),
+        ))
     }
 
     /// 读取符号链接目标
     #[allow(clippy::unused_async)]
     pub async fn read_symlink(&self, _relative_path: &Path) -> Result<PathBuf> {
-        // SMB 符号链接读取需要 FSCTL_GET_REPARSE_POINT
-        // 当前返回空路径
-        warn!("CIFS symlink reading is not supported");
-        Ok(PathBuf::new())
+        Err(StorageError::CifsError(
+            "CIFS symlink reading is not supported".to_string(),
+        ))
     }
 
     // ========================================================================
@@ -1955,8 +1953,8 @@ impl CifsStorage {
                     &start_root,
                     tx_clone.clone(),
                     max_depth,
-                    &match_expressions,
-                    &exclude_expressions,
+                    match_expressions.as_ref(),
+                    exclude_expressions.as_ref(),
                     concurrency,
                     total_file_count,
                     packaged,
@@ -1980,14 +1978,14 @@ impl CifsStorage {
     }
 
     /// 迭代式目录遍历，使用工作窃取队列实现高效并发
-    #[allow(clippy::too_many_arguments, clippy::ref_option)]
+    #[allow(clippy::too_many_arguments)]
     async fn iterative_walkdir(
         &self,
         root_path: &str,
         tx: async_channel::Sender<StorageEntryMessage>,
         max_depth: usize,
-        match_expressions: &Option<FilterExpression>,
-        exclude_expressions: &Option<FilterExpression>,
+        match_expressions: Option<&FilterExpression>,
+        exclude_expressions: Option<&FilterExpression>,
         concurrency: usize,
         total_file_count: Arc<AtomicUsize>,
         packaged: bool,
@@ -2000,8 +1998,8 @@ impl CifsStorage {
         )
         .await;
 
-        let match_expr = Arc::new(match_expressions.clone());
-        let exclude_expr = Arc::new(exclude_expressions.clone());
+        let match_expr = Arc::new(match_expressions.cloned());
+        let exclude_expr = Arc::new(exclude_expressions.cloned());
 
         info!("Creating {} CIFS producer tasks", contexts.len());
 
@@ -2189,18 +2187,20 @@ impl CifsStorage {
                 should_skip(
                     match_expr.as_ref().as_ref(),
                     exclude_expr.as_ref().as_ref(),
-                    Some(file_name),
-                    Some(&relative_path),
-                    Some(if is_symlink {
-                        "symlink"
-                    } else if is_dir {
-                        "dir"
-                    } else {
-                        "file"
-                    }),
-                    modified_epoch,
-                    Some(entry.end_of_file),
-                    extension.as_deref().or(Some("")),
+                    FilterInput {
+                        file_name: Some(file_name),
+                        file_path: Some(&relative_path),
+                        file_type: Some(if is_symlink {
+                            "symlink"
+                        } else if is_dir {
+                            "dir"
+                        } else {
+                            "file"
+                        }),
+                        modified_epoch,
+                        size: Some(entry.end_of_file),
+                        extension: extension.as_deref().or(Some("")),
+                    },
                 )
             } else {
                 (false, true, false)
@@ -2592,18 +2592,20 @@ impl CifsStorage {
                 should_skip(
                     ctx.match_expr.as_ref().as_ref(),
                     ctx.exclude_expr.as_ref().as_ref(),
-                    Some(&file_name_str),
-                    Some(&relative_path),
-                    Some(if is_symlink {
-                        "symlink"
-                    } else if is_dir {
-                        "dir"
-                    } else {
-                        "file"
-                    }),
-                    modified_epoch,
-                    Some(entry.end_of_file),
-                    extension.as_deref().or(Some("")),
+                    FilterInput {
+                        file_name: Some(&file_name_str),
+                        file_path: Some(&relative_path),
+                        file_type: Some(if is_symlink {
+                            "symlink"
+                        } else if is_dir {
+                            "dir"
+                        } else {
+                            "file"
+                        }),
+                        modified_epoch,
+                        size: Some(entry.end_of_file),
+                        extension: extension.as_deref().or(Some("")),
+                    },
                 )
             } else {
                 (false, true, false)

@@ -80,7 +80,14 @@ async fn main() -> Result<()> {
     });
 
     let iter = storage
-        .walkdir(None, depth, None, None, args.concurrency, false, false, 0)
+        .walkdir(
+            None,
+            data_mover::WalkOptions {
+                depth,
+                concurrency: args.concurrency,
+                ..Default::default()
+            },
+        )
         .await?;
 
     while let Some(msg) = iter.next().await {

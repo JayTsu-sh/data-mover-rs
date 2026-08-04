@@ -49,7 +49,7 @@ use url::Url;
 
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
-use crate::filter::{FilterExpression, dir_matches_date_filter, should_skip};
+use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
 use crate::storage_enum::{StorageEnum, path_to_s3_key};
 use crate::third_party::hcp::client::HCPRestClient;
@@ -175,20 +175,19 @@ fn parse_s3_endpoint_url(url: &str) -> Result<(String, String, String, bool, S3C
 // 使用 url 库解析标准 S3、StorageGRID 和 HCP URL。
 // 注意：secret_key 可能包含 `+`、`/` 等特殊字符（Base64 编码），直接传给 Url::parse 会导致解析错误，
 // 因此先手动提取凭据，再用占位凭据构建安全 URL 交给 url crate 解析 host/port/path。
-#[allow(clippy::type_complexity)]
-fn parse_s3_url(
-    url: &str,
-) -> Result<(
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    StorageType,
-    bool,
-    S3Compatibility,
-)> {
+struct ParsedS3Url {
+    access_key: String,
+    secret_key: String,
+    bucket_name: String,
+    endpoint: String,
+    prefix: String,
+    host: String,
+    storage_type: StorageType,
+    tls_skip_verify: bool,
+    compatibility: S3Compatibility,
+}
+
+fn parse_s3_url(url: &str) -> Result<ParsedS3Url> {
     let (scheme_str, access_key, secret_key, host_and_path) = extract_s3_credentials(url)?;
 
     // 用占位凭据构建安全 URL，让 url crate 解析 host/port/path
@@ -259,17 +258,17 @@ fn parse_s3_url(
         prefix.push('/');
     }
 
-    Ok((
+    Ok(ParsedS3Url {
         access_key,
         secret_key,
         bucket_name,
         endpoint,
         prefix,
-        host_only,
+        host: host_only,
         storage_type,
         tls_skip_verify,
         compatibility,
-    ))
+    })
 }
 
 /// TLS 证书验证跳过器（用于自签名/私有 CA 证书场景，通过 s3+https:// scheme 隐式启用）
@@ -399,6 +398,18 @@ const COPY_SINGLE_MAX: u64 = 5 * 1024 * 1024 * 1024;
 const COPY_PART_SIZE: u64 = 1024 * 1024 * 1024;
 /// S3 协议规定的 multipart upload 最大分块数
 const MAX_UPLOAD_PARTS: u64 = 10_000;
+
+fn multipart_part_number(part_idx: u64) -> Result<i32> {
+    let number = part_idx
+        .checked_add(1)
+        .filter(|number| *number <= MAX_UPLOAD_PARTS)
+        .ok_or_else(|| {
+            StorageError::S3Error(format!("invalid multipart part index: {part_idx}"))
+        })?;
+    i32::try_from(number).map_err(|_| {
+        StorageError::S3Error(format!("multipart part number is out of range: {number}"))
+    })
+}
 
 /// 单 object 读取的同时在飞 Range GET 请求数（inflight read pipeline 深度）。
 ///
@@ -591,7 +602,7 @@ impl S3Storage {
 
     pub async fn new(url: &str, block_size: Option<u64>) -> Result<Self> {
         // 解析URL
-        let (
+        let ParsedS3Url {
             access_key,
             secret_key,
             bucket_name,
@@ -601,7 +612,7 @@ impl S3Storage {
             storage_type,
             tls_skip_verify,
             compatibility,
-        ) = parse_s3_url(url)?;
+        } = parse_s3_url(url)?;
 
         let region = "us-east-1"; // MinIO 默认区域
 
@@ -1675,12 +1686,13 @@ impl S3Storage {
             should_skip(
                 match_expressions,
                 exclude_expressions,
-                Some(&dir_name),
-                Some(clean_relative_path),
-                Some("dir"),
-                None, // S3对象没有modified_epoch属性
-                Some(0),
-                None,
+                FilterInput {
+                    file_name: Some(&dir_name),
+                    file_path: Some(clean_relative_path),
+                    file_type: Some("dir"),
+                    size: Some(0),
+                    ..FilterInput::default()
+                },
             )
         } else {
             (false, true, false)
@@ -1838,12 +1850,14 @@ impl S3Storage {
             should_skip(
                 match_expressions,
                 exclude_expressions,
-                Some(&file_name),
-                Some(relative_path),
-                Some("file"),
-                None, // S3对象没有modified_epoch属性
-                Some(size),
-                extension.clone().or(Some(String::new())).as_deref(),
+                FilterInput {
+                    file_name: Some(&file_name),
+                    file_path: Some(relative_path),
+                    file_type: Some("file"),
+                    size: Some(size),
+                    extension: extension.as_deref().or(Some("")),
+                    ..FilterInput::default()
+                },
             )
         } else {
             (false, false, false)
@@ -1978,12 +1992,14 @@ impl S3Storage {
                             let (skip_entry, _, _) = should_skip(
                                 match_expressions,
                                 exclude_expressions,
-                                Some(&file_name),
-                                Some(relative_path),
-                                Some("file"),
-                                None, // S3对象没有modified_epoch属性
-                                Some(size),
-                                extension.clone().or(Some(String::new())).as_deref(),
+                                FilterInput {
+                                    file_name: Some(&file_name),
+                                    file_path: Some(relative_path),
+                                    file_type: Some("file"),
+                                    size: Some(size),
+                                    extension: extension.as_deref().or(Some("")),
+                                    ..FilterInput::default()
+                                },
                             );
 
                             if !skip_entry {
@@ -2909,8 +2925,7 @@ impl S3Storage {
             .acquire_owned()
             .await
             .map_err(|_| StorageError::S3Error("Semaphore closed unexpectedly".to_string()))?;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let part_number = (part_idx + 1) as i32;
+        let part_number = multipart_part_number(part_idx)?;
         let this = self.clone();
         Ok(tokio::spawn(async move {
             let _permit = permit;
@@ -2945,8 +2960,7 @@ impl S3Storage {
         let mut completed: Vec<CompletedPart> = Vec::with_capacity(parts.len());
         for (i, (pn, psize, etag)) in parts.into_iter().enumerate() {
             let idx = i as u64;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let expected_pn = (idx + 1) as i32;
+            let expected_pn = multipart_part_number(idx)?;
             if pn != expected_pn || psize != Self::expected_part_len(size, part_size, idx) {
                 return Err(StorageError::OperationError(format!(
                     "resumable upload part mismatch for {key}: part {pn} size {psize}"
@@ -3605,12 +3619,12 @@ impl S3Storage {
                             should_skip(
                                 ctx.match_expr.as_ref().as_ref(),
                                 ctx.exclude_expr.as_ref().as_ref(),
-                                Some(&dir_name),
-                                Some(clean_rel),
-                                Some("dir"),
-                                None,
-                                None,
-                                None,
+                                FilterInput {
+                                    file_name: Some(&dir_name),
+                                    file_path: Some(clean_rel),
+                                    file_type: Some("dir"),
+                                    ..FilterInput::default()
+                                },
                             )
                         } else {
                             (false, true, false)
@@ -3692,12 +3706,14 @@ impl S3Storage {
                             should_skip(
                                 ctx.match_expr.as_ref().as_ref(),
                                 ctx.exclude_expr.as_ref().as_ref(),
-                                Some(&file_name),
-                                Some(rel),
-                                Some("file"),
-                                Some(crate::time_util::nanos_to_secs(ts)),
-                                Some(size),
-                                extension.as_deref().or(Some("")),
+                                FilterInput {
+                                    file_name: Some(&file_name),
+                                    file_path: Some(rel),
+                                    file_type: Some("file"),
+                                    modified_epoch: Some(crate::time_util::nanos_to_secs(ts)),
+                                    size: Some(size),
+                                    extension: extension.as_deref().or(Some("")),
+                                },
                             )
                         } else {
                             (false, true, false)
@@ -3784,12 +3800,12 @@ impl S3Storage {
                             should_skip(
                                 ctx.match_expr.as_ref().as_ref(),
                                 ctx.exclude_expr.as_ref().as_ref(),
-                                Some(&dir_name),
-                                Some(clean_rel),
-                                Some("dir"),
-                                None,
-                                None,
-                                None,
+                                FilterInput {
+                                    file_name: Some(&dir_name),
+                                    file_path: Some(clean_rel),
+                                    file_type: Some("dir"),
+                                    ..FilterInput::default()
+                                },
                             )
                         } else {
                             (false, true, false)
@@ -3827,12 +3843,14 @@ impl S3Storage {
                             should_skip(
                                 ctx.match_expr.as_ref().as_ref(),
                                 ctx.exclude_expr.as_ref().as_ref(),
-                                Some(&file_name),
-                                Some(rel),
-                                Some("file"),
-                                Some(crate::time_util::nanos_to_secs(mtime)),
-                                Some(size),
-                                extension.as_deref().or(Some("")),
+                                FilterInput {
+                                    file_name: Some(&file_name),
+                                    file_path: Some(rel),
+                                    file_type: Some("file"),
+                                    modified_epoch: Some(crate::time_util::nanos_to_secs(mtime)),
+                                    size: Some(size),
+                                    extension: extension.as_deref().or(Some("")),
+                                },
                             )
                         } else {
                             (false, true, false)
@@ -4219,11 +4237,29 @@ mod tests {
     }
 
     #[test]
+    fn multipart_part_number_enforces_s3_bounds() {
+        assert_eq!(multipart_part_number(0).unwrap(), 1);
+        assert_eq!(multipart_part_number(MAX_UPLOAD_PARTS - 1).unwrap(), 10_000);
+        assert!(multipart_part_number(MAX_UPLOAD_PARTS).is_err());
+        assert!(multipart_part_number(u64::MAX).is_err());
+    }
+
+    #[test]
     fn test_parse_s3_url_special_chars_in_secret_key() {
         // SK 包含 + 和 /（Base64 编码常见字符）
         let url = "s3://X9HENFMKAC41MT11J14H:AsxLb0dEhjxXIlKfVnCSVhM+hjO80rbhRmPLp/UK@bucket.192.168.3.210:10444";
-        let (ak, sk, bucket, endpoint, prefix, host, storage_type, _tls_skip, compatibility) =
-            parse_s3_url(url).unwrap();
+        let parsed = parse_s3_url(url).unwrap();
+        let ParsedS3Url {
+            access_key: ak,
+            secret_key: sk,
+            bucket_name: bucket,
+            endpoint,
+            prefix,
+            host,
+            storage_type,
+            compatibility,
+            ..
+        } = parsed;
         assert_eq!(ak, "X9HENFMKAC41MT11J14H");
         assert_eq!(sk, "AsxLb0dEhjxXIlKfVnCSVhM+hjO80rbhRmPLp/UK");
         assert_eq!(bucket, "bucket");
@@ -4237,8 +4273,17 @@ mod tests {
     #[test]
     fn test_parse_s3_url_normal() {
         let url = "s3://myak:mysk@mybucket.minio.example.com:9000/data/prefix";
-        let (ak, sk, bucket, endpoint, prefix, host, storage_type, _tls_skip, compatibility) =
-            parse_s3_url(url).unwrap();
+        let ParsedS3Url {
+            access_key: ak,
+            secret_key: sk,
+            bucket_name: bucket,
+            endpoint,
+            prefix,
+            host,
+            storage_type,
+            compatibility,
+            ..
+        } = parse_s3_url(url).unwrap();
         assert_eq!(ak, "myak");
         assert_eq!(sk, "mysk");
         assert_eq!(bucket, "mybucket");
@@ -4252,8 +4297,16 @@ mod tests {
     #[test]
     fn test_parse_s3_url_https() {
         let url = "s3+https://ak:sk@bucket.host.com:443/prefix";
-        let (ak, sk, bucket, endpoint, _prefix, host, storage_type, _, compatibility) =
-            parse_s3_url(url).unwrap();
+        let ParsedS3Url {
+            access_key: ak,
+            secret_key: sk,
+            bucket_name: bucket,
+            endpoint,
+            host,
+            storage_type,
+            compatibility,
+            ..
+        } = parse_s3_url(url).unwrap();
         assert_eq!(ak, "ak");
         assert_eq!(sk, "sk");
         assert_eq!(bucket, "bucket");
@@ -4266,8 +4319,17 @@ mod tests {
     #[test]
     fn test_parse_storagegrid_url() {
         let url = "s3+sg://ak:sk@bucket.storagegrid.example:8082/prefix";
-        let (ak, sk, bucket, endpoint, prefix, host, storage_type, tls_skip, compatibility) =
-            parse_s3_url(url).unwrap();
+        let ParsedS3Url {
+            access_key: ak,
+            secret_key: sk,
+            bucket_name: bucket,
+            endpoint,
+            prefix,
+            host,
+            storage_type,
+            tls_skip_verify: tls_skip,
+            compatibility,
+        } = parse_s3_url(url).unwrap();
         assert_eq!(ak, "ak");
         assert_eq!(sk, "sk");
         assert_eq!(bucket, "bucket");
@@ -4282,7 +4344,12 @@ mod tests {
     #[test]
     fn test_parse_storagegrid_https_url() {
         let url = "s3+sg+https://ak:sk@bucket.storagegrid.example:443/prefix";
-        let (.., endpoint, _, _, _, tls_skip, compatibility) = parse_s3_url(url).unwrap();
+        let ParsedS3Url {
+            endpoint,
+            tls_skip_verify: tls_skip,
+            compatibility,
+            ..
+        } = parse_s3_url(url).unwrap();
         assert_eq!(endpoint, "https://storagegrid.example:443");
         assert!(tls_skip);
         assert_eq!(compatibility, S3Compatibility::StorageGrid);
@@ -4291,8 +4358,15 @@ mod tests {
     #[test]
     fn test_parse_dxn_urls() {
         let url = "s3+dxn://ak:sk@bucket.dxn.example:8184/prefix";
-        let (.., endpoint, prefix, host, storage_type, tls_skip, compatibility) =
-            parse_s3_url(url).unwrap();
+        let ParsedS3Url {
+            endpoint,
+            prefix,
+            host,
+            storage_type,
+            tls_skip_verify: tls_skip,
+            compatibility,
+            ..
+        } = parse_s3_url(url).unwrap();
         assert_eq!(endpoint, "http://dxn.example:8184");
         assert_eq!(prefix, "prefix/");
         assert_eq!(host, "dxn.example");
@@ -4300,8 +4374,12 @@ mod tests {
         assert!(!tls_skip);
         assert_eq!(compatibility, S3Compatibility::Dxn);
 
-        let (.., endpoint, _, _, _, tls_skip, compatibility) =
-            parse_s3_url("s3+dxn+https://ak:sk@bucket.dxn.example:443/prefix").unwrap();
+        let ParsedS3Url {
+            endpoint,
+            tls_skip_verify: tls_skip,
+            compatibility,
+            ..
+        } = parse_s3_url("s3+dxn+https://ak:sk@bucket.dxn.example:443/prefix").unwrap();
         assert_eq!(endpoint, "https://dxn.example:443");
         assert!(tls_skip);
         assert_eq!(compatibility, S3Compatibility::Dxn);
@@ -4310,7 +4388,15 @@ mod tests {
     #[test]
     fn test_parse_s3_url_no_prefix() {
         let url = "s3://ak:sk@bucket.host.com:9000";
-        let (ak, sk, bucket, endpoint, prefix, host, _, _, _) = parse_s3_url(url).unwrap();
+        let ParsedS3Url {
+            access_key: ak,
+            secret_key: sk,
+            bucket_name: bucket,
+            endpoint,
+            prefix,
+            host,
+            ..
+        } = parse_s3_url(url).unwrap();
         assert_eq!(ak, "ak");
         assert_eq!(sk, "sk");
         assert_eq!(bucket, "bucket");
@@ -4334,14 +4420,14 @@ mod tests {
     #[test]
     fn test_parse_s3_url_deep_prefix() {
         let url = "s3://ak:sk@bucket.host.com:9000/a/b/c";
-        let (.., prefix, _, _, _, _) = parse_s3_url(url).unwrap();
+        let ParsedS3Url { prefix, .. } = parse_s3_url(url).unwrap();
         assert_eq!(prefix, "a/b/c/");
     }
 
     #[test]
     fn test_parse_s3_url_prefix_trailing_slash() {
         let url = "s3://ak:sk@bucket.host.com:9000/prefix/";
-        let (.., prefix, _, _, _, _) = parse_s3_url(url).unwrap();
+        let ParsedS3Url { prefix, .. } = parse_s3_url(url).unwrap();
         assert_eq!(prefix, "prefix/");
     }
 
@@ -4351,7 +4437,10 @@ mod tests {
     fn test_parse_s3_url_https_skips_tls() {
         // s3+https scheme 自动启用跳过验证
         let url = "s3+https://ak:sk@bucket.host.com:443/prefix";
-        let (.., tls_skip, _) = parse_s3_url(url).unwrap();
+        let ParsedS3Url {
+            tls_skip_verify: tls_skip,
+            ..
+        } = parse_s3_url(url).unwrap();
         assert!(tls_skip);
     }
 
@@ -4359,7 +4448,10 @@ mod tests {
     fn test_parse_s3_url_http_no_tls_skip() {
         // s3:// (http) 不跳过验证
         let url = "s3://ak:sk@bucket.host.com:9000/prefix";
-        let (.., tls_skip, _) = parse_s3_url(url).unwrap();
+        let ParsedS3Url {
+            tls_skip_verify: tls_skip,
+            ..
+        } = parse_s3_url(url).unwrap();
         assert!(!tls_skip);
     }
 

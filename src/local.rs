@@ -18,7 +18,7 @@ use tracing::{debug, error, info, trace};
 
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
-use crate::filter::{FilterExpression, dir_matches_date_filter, should_skip};
+use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
 use crate::time_util;
@@ -471,8 +471,8 @@ impl LocalStorage {
                     &root_path,
                     tx_clone.clone(),
                     max_depth,
-                    &match_expressions,
-                    &exclude_expressions,
+                    match_expressions.as_ref(),
+                    exclude_expressions.as_ref(),
                     concurrency,
                     total_file_count,
                     packaged,
@@ -496,14 +496,14 @@ impl LocalStorage {
     }
 
     /// 迭代式目录遍历函数，使用工作窃取队列实现高效并发
-    #[allow(clippy::too_many_arguments, clippy::ref_option)]
+    #[allow(clippy::too_many_arguments)]
     async fn iterative_walkdir(
         &self,
         root_path: &Path,
         tx: async_channel::Sender<StorageEntryMessage>,
         max_depth: usize,
-        match_expressions: &Option<FilterExpression>,
-        exclude_expressions: &Option<FilterExpression>,
+        match_expressions: Option<&FilterExpression>,
+        exclude_expressions: Option<&FilterExpression>,
         concurrency: usize,
         total_file_count: Arc<AtomicUsize>,
         packaged: bool,
@@ -514,8 +514,8 @@ impl LocalStorage {
             (root_path.to_path_buf(), 0usize, true, None::<usize>),
         )
         .await;
-        let match_expr = Arc::new(match_expressions.clone());
-        let exclude_expr = Arc::new(exclude_expressions.clone());
+        let match_expr = Arc::new(match_expressions.cloned());
+        let exclude_expr = Arc::new(exclude_expressions.cloned());
 
         info!("Creating {} producer tasks", contexts.len());
 
@@ -660,25 +660,27 @@ impl LocalStorage {
                 should_skip(
                     match_expr.as_ref().as_ref(),
                     exclude_expr.as_ref().as_ref(),
-                    Some(&file_name),
-                    Some(&normalized_path),
-                    Some(if is_symlink {
-                        "symlink"
-                    } else if is_dir {
-                        "dir"
-                    } else {
-                        "file"
-                    }),
-                    Some(
-                        metadata
-                            .modified()
-                            .unwrap_or(UNIX_EPOCH)
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0),
-                    ),
-                    Some(metadata.len()),
-                    extension.or(Some("")),
+                    FilterInput {
+                        file_name: Some(&file_name),
+                        file_path: Some(&normalized_path),
+                        file_type: Some(if is_symlink {
+                            "symlink"
+                        } else if is_dir {
+                            "dir"
+                        } else {
+                            "file"
+                        }),
+                        modified_epoch: Some(
+                            metadata
+                                .modified()
+                                .unwrap_or(UNIX_EPOCH)
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0),
+                        ),
+                        size: Some(metadata.len()),
+                        extension: extension.or(Some("")),
+                    },
                 )
             } else {
                 // skip_filter=false 表示父目录已匹配，子项无需过滤
@@ -1203,22 +1205,24 @@ impl LocalStorage {
                 crate::filter::should_skip(
                     ctx.match_expr.as_ref().as_ref(),
                     ctx.exclude_expr.as_ref().as_ref(),
-                    Some(&file_name),
-                    Some(&normalized),
-                    Some(if is_symlink {
-                        "symlink"
-                    } else if is_dir {
-                        "dir"
-                    } else {
-                        "file"
-                    }),
-                    metadata
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64),
-                    Some(metadata.len()),
-                    extension_owned.as_deref().or(Some("")),
+                    FilterInput {
+                        file_name: Some(&file_name),
+                        file_path: Some(&normalized),
+                        file_type: Some(if is_symlink {
+                            "symlink"
+                        } else if is_dir {
+                            "dir"
+                        } else {
+                            "file"
+                        }),
+                        modified_epoch: metadata
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64),
+                        size: Some(metadata.len()),
+                        extension: extension_owned.as_deref().or(Some("")),
+                    },
                 )
             } else {
                 // 父目录已匹配，子项无需过滤

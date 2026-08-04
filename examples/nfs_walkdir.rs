@@ -71,7 +71,13 @@ async fn main() -> Result<()> {
     });
 
     let iter = storage
-        .walkdir(None, None, None, None, args.concurrency, false, false, 0)
+        .walkdir(
+            None,
+            data_mover::WalkOptions {
+                concurrency: args.concurrency,
+                ..Default::default()
+            },
+        )
         .await?;
     while let Some(msg) = iter.next().await {
         match msg {
