@@ -1243,8 +1243,8 @@ impl StorageEnum {
         let from_c = from.clone();
         let entry_c = entry.clone();
         let handle = tokio::spawn(async move {
-            match intervals {
-                Some(ivals) => match (&from_c, &entry_c) {
+            if let Some(ivals) = intervals {
+                match (&from_c, &entry_c) {
                     (StorageEnum::Local(s), EntryEnum::NAS(e)) => s
                         .read_data_intervals(tx, &e.relative_path, &ivals, qos)
                         .await
@@ -1264,30 +1264,29 @@ impl StorageEnum {
                     _ => Err(StorageError::OperationError(format!(
                         "read_chunk_stream: unsupported source/entry combination: {entry_c:?}"
                     ))),
-                },
-                None => {
-                    let size = entry_c.get_size();
-                    match (&from_c, &entry_c) {
-                        (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
-                            s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
-                                .await
-                        }
-                        (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
-                            s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
-                                .await
-                        }
-                        (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
-                            s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
-                                .await
-                        }
-                        (StorageEnum::S3(s), EntryEnum::S3(e)) => {
-                            s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
-                                .await
-                        }
-                        _ => Err(StorageError::OperationError(format!(
-                            "read_chunk_stream: unsupported source/entry combination: {entry_c:?}"
-                        ))),
+                }
+            } else {
+                let size = entry_c.get_size();
+                match (&from_c, &entry_c) {
+                    (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
+                        s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
+                            .await
                     }
+                    (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
+                        s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
+                            .await
+                    }
+                    (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
+                        s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
+                            .await
+                    }
+                    (StorageEnum::S3(s), EntryEnum::S3(e)) => {
+                        s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
+                            .await
+                    }
+                    _ => Err(StorageError::OperationError(format!(
+                        "read_chunk_stream: unsupported source/entry combination: {entry_c:?}"
+                    ))),
                 }
             }
         });
@@ -1340,7 +1339,7 @@ impl StorageEnum {
     ///   每个 chunk 确认落盘后回调 `resume.on_committed`（供上层持久化进度）；
     ///   收尾规整 `.part` 长度 → 可选完整性校验 → 原子 rename 成最终文件。
     /// - S3 目标端走 multipart part 粒度续传（见 [`Self::copy_file_resumable_to_s3`]），
-    ///   `.part`/rename/set_file_len 模型不适用于对象存储。
+    ///   `.part`/`rename/set_file_len` 模型不适用于对象存储。
     ///
     /// 进程中断时进度保留（NAS 目标：`.part` + 上层状态文件；S3 目标：in-progress
     /// multipart upload），重跑时只补未完成区间。
@@ -1434,10 +1433,10 @@ impl StorageEnum {
     /// S3 目标端字节级断点续传：multipart upload part 粒度。
     ///
     /// 进度真值是目标端 in-progress multipart upload 本身（`resume_prepare` 内部
-    /// ListParts 反推缺失区间），不使用上层状态文件传入的 `missing_intervals`——
+    /// `ListParts` 反推缺失区间），不使用上层状态文件传入的 `missing_intervals`——
     /// upload 可能被外部（lifecycle 规则、手动 abort）清掉，且上层记录只可能滞后
     /// 于真实进度，以目标端反推永远正确。`on_committed` 仍逐 part 回调，供上层
-    /// 记录进度；`.part` 路径与 rename/set_file_len 不适用于对象存储，均不使用。
+    /// 记录进度；`.part` 路径与 `rename/set_file_len` 不适用于对象存储，均不使用。
     ///
     /// 失败时**不 abort** upload，已上传 parts 即续传进度；成功时
     /// `CompleteMultipartUpload` 原子生效，目标端不存在半截可见对象。
@@ -1854,7 +1853,7 @@ impl StorageEnum {
     /// - `true`：NFS / CIFS / Local — 目录是一等对象，可读写 mode/uid/gid/atime/mtime；
     /// - `false`：S3 — 目录仅作为 key prefix 的隐式存在，没有自身元数据。
     ///
-    /// 调用方（如 integrity-check 的目录元数据校验、tar_pack 的目录条目写入）
+    /// 调用方（如 integrity-check `的目录元数据校验、tar_pack` 的目录条目写入）
     /// 据此决定是否跳过目录元数据相关步骤。
     pub fn has_real_directory_objects(&self) -> bool {
         !matches!(self, StorageEnum::S3(_))
@@ -1956,7 +1955,7 @@ impl StorageEnum {
             }
             StorageEnum::NFS(s) if s.supports_acl() => {
                 match s.get_acl(relative_path).await {
-                    Ok(acl) if !acl.aces.is_empty() => Ok(Some(serialize_nfs_acl(&acl))),
+                    Ok(acl) if !acl.aces.is_empty() => Ok(Some(serialize_nfs_acl(&acl)?)),
                     _ => Ok(None), // 空 ACL 或不支持时静默跳过
                 }
             }
@@ -2009,13 +2008,26 @@ impl StorageEnum {
                     _ => return Ok(None),
                 };
                 let mut buf = Vec::new();
-                buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
+                let count = u32::try_from(names.len()).map_err(|_| {
+                    StorageError::OperationError("too many xattrs to serialize".to_string())
+                })?;
+                buf.extend_from_slice(&count.to_le_bytes());
                 for name in &names {
                     let name_bytes = name.as_bytes();
-                    buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+                    let name_len = u32::try_from(name_bytes.len()).map_err(|_| {
+                        StorageError::OperationError(
+                            "xattr name is too long to serialize".to_string(),
+                        )
+                    })?;
+                    buf.extend_from_slice(&name_len.to_le_bytes());
                     buf.extend_from_slice(name_bytes);
                     let value = s.get_xattr(relative_path, name).await?;
-                    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                    let value_len = u32::try_from(value.len()).map_err(|_| {
+                        StorageError::OperationError(
+                            "xattr value is too large to serialize".to_string(),
+                        )
+                    })?;
+                    buf.extend_from_slice(&value_len.to_le_bytes());
                     buf.extend_from_slice(&value);
                 }
                 Ok(Some(buf))
@@ -2048,18 +2060,24 @@ impl StorageEnum {
 ///
 /// 格式：`[u32 ace_count] [ace...]`
 /// 每个 ace：`[u32 type] [u32 flags] [u32 mask] [u32 who_len] [who_bytes]`
-fn serialize_nfs_acl(acl: &nfs_rs::Acl) -> Vec<u8> {
+fn serialize_nfs_acl(acl: &nfs_rs::Acl) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    buf.extend_from_slice(&(acl.aces.len() as u32).to_le_bytes());
+    let ace_count = u32::try_from(acl.aces.len()).map_err(|_| {
+        StorageError::OperationError("too many NFS ACL entries to serialize".to_string())
+    })?;
+    buf.extend_from_slice(&ace_count.to_le_bytes());
     for ace in &acl.aces {
         buf.extend_from_slice(&(ace.ace_type as u32).to_le_bytes());
         buf.extend_from_slice(&ace.flags.0.to_le_bytes());
         buf.extend_from_slice(&ace.access_mask.0.to_le_bytes());
         let who_bytes = ace.who.as_bytes();
-        buf.extend_from_slice(&(who_bytes.len() as u32).to_le_bytes());
+        let who_len = u32::try_from(who_bytes.len()).map_err(|_| {
+            StorageError::OperationError("NFS ACL principal is too long to serialize".to_string())
+        })?;
+        buf.extend_from_slice(&who_len.to_le_bytes());
         buf.extend_from_slice(who_bytes);
     }
-    buf
+    Ok(buf)
 }
 
 /// 反序列化长度上限常量（防止恶意/损坏数据导致 OOM）

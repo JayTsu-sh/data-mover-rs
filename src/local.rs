@@ -302,8 +302,8 @@ impl LocalStorage {
                     .any(|c| c == std::path::Component::ParentDir)
             {
                 return Err(StorageError::OperationError(format!(
-                    "Unsafe symlink target rejected: {:?} (absolute paths and '..' are not allowed)",
-                    target
+                    "Unsafe symlink target rejected: {} (absolute paths and '..' are not allowed)",
+                    target.display()
                 )));
             }
 
@@ -738,8 +738,7 @@ impl LocalStorage {
                                 .modified()
                                 .unwrap_or(UNIX_EPOCH)
                                 .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_secs() as i64)
-                                .unwrap_or(0),
+                                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
                         ),
                         size: Some(metadata.len()),
                         extension: extension.or(Some("")),
@@ -879,7 +878,10 @@ impl LocalStorage {
     }
 
     async fn read(&self, file: &mut LocalFileHandle, offset: u64, count: u64) -> Result<Bytes> {
-        let mut buffer = BytesMut::with_capacity(count as usize);
+        let capacity = usize::try_from(count).map_err(|_| {
+            StorageError::OperationError(format!("read size {count} exceeds platform capacity"))
+        })?;
+        let mut buffer = BytesMut::with_capacity(capacity);
         let mut current_offset = offset;
         let mut remaining = count;
 
@@ -1153,11 +1155,11 @@ impl LocalStorage {
         mode: Option<u32>,
         progress: crate::storage_enum::WriteProgress,
     ) -> Result<()> {
+        const SYNC_BARRIER: usize = 16;
         let crate::storage_enum::WriteProgress {
             bytes_counter,
             on_committed,
         } = progress;
-        const SYNC_BARRIER: usize = 16;
         // truncate=false：保留 .part 中已写字节（续传基础）
         let dest_file = self.create_file(part_path, uid, gid, mode, false).await?;
         let sink = LocalChunkSink::new(self.clone(), dest_file);
@@ -1251,11 +1253,7 @@ impl LocalStorage {
             };
 
             let is_dir = metadata.is_dir();
-            let is_symlink = entry
-                .file_type()
-                .await
-                .map(|ft| ft.is_symlink())
-                .unwrap_or(false);
+            let is_symlink = entry.file_type().await.is_ok_and(|ft| ft.is_symlink());
             let extension_owned = relative_path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -1285,7 +1283,7 @@ impl LocalStorage {
                             .modified()
                             .ok()
                             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64),
+                            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
                         size: Some(metadata.len()),
                         extension: extension_owned.as_deref().or(Some("")),
                     },

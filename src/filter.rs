@@ -1283,7 +1283,7 @@ impl FilterExpression {
                 let match_result = match_path_with_pattern(
                     file_path,
                     file_type,
-                    PathPatternMatch {
+                    &PathPatternMatch {
                         pattern,
                         raw_value,
                         pattern_parts,
@@ -1319,6 +1319,10 @@ impl FilterExpression {
             FilterCondition::Modified { operator, value } => {
                 modified_epoch.map_or(MatchResult::LazyMatch, |file_epoch| match value {
                     ModifiedValue::RelativeDays(days) => {
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "day comparisons accept sub-second floating-point precision"
+                        )]
                         let file_days = (now_epoch - file_epoch) as f64 / 86400.0;
                         MatchResult::from_bool(match operator {
                             CompareOp::Lt => file_days < *days,
@@ -1628,7 +1632,7 @@ struct PathPatternMatch<'a> {
 fn match_path_with_pattern(
     file_path: &str,
     file_type: Option<&str>,
-    path_pattern: PathPatternMatch<'_>,
+    path_pattern: &PathPatternMatch<'_>,
 ) -> MatchResult {
     let PathPatternMatch {
         pattern,
@@ -1637,7 +1641,7 @@ fn match_path_with_pattern(
         pattern_depth,
         has_double_wildcard,
         pattern_after_wildcard,
-    } = path_pattern;
+    } = *path_pattern;
     trace!(
         "[Filter:match_path_with_pattern] 开始匹配: pattern_value={}, file_path={}, file_type={:?}",
         raw_value, file_path, file_type

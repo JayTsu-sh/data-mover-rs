@@ -1,6 +1,6 @@
 //! Storage URL 凭据脱敏（通用辅助函数）。
 //!
-//! Storage URL 可能在 userinfo 段包含 access_key:secret_key（S3）、
+//! Storage URL 可能在 userinfo 段包含 `access_key:secret_key（S3`）、
 //! username:password（CIFS、NFS over RPC-AUTH）等敏感信息。本模块提供
 //! 一个标准 URL 解析驱动的脱敏函数 [`redact_storage_url`]，供：
 //!

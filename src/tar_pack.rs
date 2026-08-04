@@ -33,7 +33,7 @@ struct UstarHeader<'a> {
     link_name: &'a str,
 }
 
-fn build_ustar_header(metadata: UstarHeader<'_>) -> [u8; 512] {
+fn build_ustar_header(metadata: &UstarHeader<'_>) -> [u8; 512] {
     let UstarHeader {
         path,
         size,
@@ -43,7 +43,7 @@ fn build_ustar_header(metadata: UstarHeader<'_>) -> [u8; 512] {
         gid,
         type_flag,
         link_name,
-    } = metadata;
+    } = *metadata;
     let mut header = [0u8; 512];
 
     // name (0..100)
@@ -63,7 +63,7 @@ fn build_ustar_header(metadata: UstarHeader<'_>) -> [u8; 512] {
 
     // mtime (136..148) — epoch seconds, 11 chars + NUL
     let mtime_secs = if mtime > 0 {
-        crate::time_util::nanos_to_secs(mtime) as u64
+        u64::try_from(crate::time_util::nanos_to_secs(mtime)).unwrap_or(0)
     } else {
         0
     };
@@ -155,7 +155,7 @@ pub(crate) fn build_header_for_entry(
         tar_internal_path.to_string()
     };
 
-    let header = build_ustar_header(UstarHeader {
+    let header = build_ustar_header(&UstarHeader {
         path: &path,
         size,
         mtime: entry.get_mtime(),
@@ -179,7 +179,10 @@ pub(crate) fn tar_padding(file_size: u64) -> Option<Bytes> {
         return None;
     }
     let padding_len = 512 - remainder;
-    let padding = BytesMut::zeroed(padding_len as usize).freeze();
+    let padding = BytesMut::zeroed(
+        usize::try_from(padding_len).unwrap_or_else(|_| unreachable!("padding is below 512")),
+    )
+    .freeze();
     Some(padding)
 }
 
@@ -194,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_build_ustar_header_basic() {
-        let header = build_ustar_header(UstarHeader {
+        let header = build_ustar_header(&UstarHeader {
             path: "test.txt",
             size: 1024,
             mtime: 1_700_000_000_000_000_000,
@@ -220,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_build_ustar_header_directory() {
-        let header = build_ustar_header(UstarHeader {
+        let header = build_ustar_header(&UstarHeader {
             path: "mydir/",
             size: 0,
             mtime: 1_700_000_000_000_000_000,
@@ -247,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_checksum_correctness() {
-        let header = build_ustar_header(UstarHeader {
+        let header = build_ustar_header(&UstarHeader {
             path: "hello.txt",
             size: 5,
             mtime: 1_000_000_000_000_000_000,

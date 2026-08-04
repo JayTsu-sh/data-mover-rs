@@ -46,7 +46,12 @@ impl QosStats {
     pub fn actual_bandwidth_mibps(&self) -> f64 {
         let elapsed = self.start_time.elapsed().as_secs_f64();
         if elapsed > 0.0 {
-            self.total_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0) / elapsed
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "telemetry is intentionally approximate"
+            )]
+            let bytes = self.total_bytes.load(Ordering::Relaxed) as f64;
+            bytes / (1024.0 * 1024.0) / elapsed
         } else {
             0.0
         }
@@ -56,7 +61,12 @@ impl QosStats {
     pub fn actual_iops(&self) -> f64 {
         let elapsed = self.start_time.elapsed().as_secs_f64();
         if elapsed > 0.0 {
-            self.total_iops.load(Ordering::Relaxed) as f64 / elapsed
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "telemetry is intentionally approximate"
+            )]
+            let operations = self.total_iops.load(Ordering::Relaxed) as f64;
+            operations / elapsed
         } else {
             0.0
         }
@@ -278,7 +288,13 @@ impl QosManager {
         let derived_peak_rate = if base_rate_bps == 0 {
             1.0
         } else {
-            (burst_bytes as f64 / base_rate_bps as f64) as f32
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                reason = "the ratio is a finite configuration metric stored as f32"
+            )]
+            let ratio = (burst_bytes as f64 / base_rate_bps as f64) as f32;
+            ratio
         };
         let config = QosConfig {
             bandwidth: Some(bandwidth.to_string()),

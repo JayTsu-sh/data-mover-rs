@@ -8,7 +8,8 @@ pub(super) fn copy_part_ranges(size: u64, part_size: u64) -> Vec<(u64, u64)> {
     if size == 0 || part_size == 0 {
         return Vec::new();
     }
-    let mut ranges = Vec::with_capacity(size.div_ceil(part_size) as usize);
+    let capacity = usize::try_from(size.div_ceil(part_size)).unwrap_or(0);
+    let mut ranges = Vec::with_capacity(capacity);
     let mut start = 0;
     while start < size {
         let end = (start + part_size).min(size) - 1;
@@ -36,7 +37,7 @@ impl S3Storage {
             )));
         }
         let ranges = copy_part_ranges(size, part_size);
-        if ranges.len() > MAX_COPY_PARTS as usize {
+        if u64::try_from(ranges.len()).unwrap_or(u64::MAX) > MAX_COPY_PARTS {
             return Err(StorageError::OperationError(format!(
                 "S3 multipart rename requires {} parts, exceeding the {MAX_COPY_PARTS} part limit",
                 ranges.len()

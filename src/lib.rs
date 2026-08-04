@@ -341,9 +341,9 @@ impl fmt::Display for ErrorEvent {
 
 /// 变更的维度：用于区分内容变更、元数据变更、或两者同时变更
 ///
-/// - `DataOnly`：size 或 mtime 不同（内容变了），属性 mode/uid/gid 未变 → 需 copy_file + set_metadata
-/// - `MetadataOnly`：size 和 mtime 相同，但 mode/uid/gid 至少一项不同（chmod/chown）→ 只需 set_metadata，跳过 copy_file
-/// - `Both`：内容和属性都变了 → 需 copy_file + set_metadata
+/// - `DataOnly`：size 或 mtime 不同（内容变了），属性 mode/uid/gid 未变 → 需 `copy_file` + `set_metadata`
+/// - `MetadataOnly`：size 和 mtime 相同，但 mode/uid/gid 至少一项不同（chmod/chown）→ 只需 `set_metadata，跳过` `copy_file`
+/// - `Both`：内容和属性都变了 → 需 `copy_file` + `set_metadata`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeKind {
     DataOnly,
@@ -588,6 +588,10 @@ pub fn days_between(now: SystemTime, time: SystemTime) -> f64 {
     };
 
     // 将持续时间转换为天数（f64）
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the public result is an approximate fractional day count"
+    )]
     let seconds = duration.as_secs() as f64;
     let nanoseconds = f64::from(duration.subsec_nanos());
     let total_seconds = seconds + nanoseconds / 1_000_000_000.0;

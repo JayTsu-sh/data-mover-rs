@@ -448,7 +448,7 @@ fn multipart_part_number(part_idx: u64) -> Result<i32> {
 /// 单 object 读取的同时在飞 Range GET 请求数（inflight read pipeline 深度）。
 ///
 /// aws-sdk-rust 底层 HTTP/2 connection pool 天然支持多请求并发；S3 兼容存储
-/// （AWS S3 / MinIO / Ceph 等）服务端对同 object 不同 byte range 高并发友好，
+/// （AWS S3 / `MinIO` / Ceph 等）服务端对同 object 不同 byte range 高并发友好，
 /// 与单 inflight 相比高 RTT 链路收益线性。默认 4 与 CIFS 对称。
 ///
 /// 目前为编译期常量；如需运行期 tunable（例如跨 region 25 MB BDP 链路需要
@@ -998,7 +998,10 @@ impl S3Storage {
             last_modified: String::new(),
             tags: None,
         };
-        self.read(&mut handle, 0, size as usize).await
+        let size = usize::try_from(size).map_err(|_| {
+            StorageError::OperationError("object is too large for this platform".to_string())
+        })?;
+        self.read(&mut handle, 0, size).await
     }
 
     /// Single-chunk write: uploads all bytes as one `PutObject` call.
@@ -1030,9 +1033,15 @@ impl S3Storage {
             return Ok(None);
         }
         let key = Arc::new(self.build_full_key(relative_path));
-        let chunk_size = self.block_size as usize;
+        let chunk_size = usize::try_from(self.block_size).map_err(|_| {
+            StorageError::OperationError("S3 block size exceeds platform capacity".to_string())
+        })?;
         let mut hasher = create_hash_calculator(enable_integrity_check);
 
+        #[expect(
+            clippy::items_after_statements,
+            reason = "the local future type belongs beside its scheduling queue"
+        )]
         type ReadFut<'a> = Pin<Box<dyn Future<Output = Result<Bytes>> + Send + 'a>>;
         let mut inflight: FuturesOrdered<ReadFut<'_>> = FuturesOrdered::new();
         let mut issue_offset: u64 = 0;
@@ -1044,7 +1053,8 @@ impl S3Storage {
                 if let Some(ref qos) = qos {
                     qos.acquire(chunk_size as u64).await;
                 }
-                let count = ((size - issue_offset) as usize).min(chunk_size);
+                let count = usize::try_from((size - issue_offset).min(self.block_size))
+                    .unwrap_or_else(|_| unreachable!("count is bounded by the checked block size"));
                 let key_clone = key.clone();
                 let range_offset = issue_offset;
                 let range_count = count as u64;
@@ -1103,7 +1113,7 @@ impl S3Storage {
     ///
     /// 与 `read_data` 的差异：按调用方给定的 `[start, end)` 区间列表读取，`DataChunk.offset`
     /// 为文件内绝对偏移。区间按给定顺序串行处理，区间内维持 [`DEFAULT_READ_INFLIGHT`]
-    /// 个 Range GET 并发。version_id = None：续传调用域内不涉及多版本对象。
+    /// 个 Range GET `并发。version_id` = None：续传调用域内不涉及多版本对象。
     pub(crate) async fn read_data_intervals(
         &self,
         tx: mpsc::Sender<DataChunk>,
@@ -1120,6 +1130,10 @@ impl S3Storage {
 
         for &(start, end) in intervals {
             let mut issue_offset = start;
+            #[expect(
+                clippy::items_after_statements,
+                reason = "the local future type belongs beside its scheduling queue"
+            )]
             type ReadFut<'a> = Pin<Box<dyn Future<Output = (u64, Result<Bytes>)> + Send + 'a>>;
             let mut inflight: FuturesOrdered<ReadFut<'_>> = FuturesOrdered::new();
             loop {
@@ -1324,7 +1338,10 @@ impl S3Storage {
                 .await
                 .map_err(|e| StorageError::S3Error(format!("GetObject failed: {e:?}")))?;
 
-            let content_length = resp.content_length().unwrap_or(size as i64);
+            let size_i64 = i64::try_from(size).map_err(|_| {
+                StorageError::OperationError("S3 object exceeds the SDK size limit".to_string())
+            })?;
+            let content_length = resp.content_length().unwrap_or(size_i64);
 
             let mut put_builder = dst
                 .client
@@ -1358,7 +1375,9 @@ impl S3Storage {
             // 计算实际的分片数量
             let total_parts = size.div_ceil(MULTIPART_THRESHOLD);
             // 限制并发上传的数量，不超过实际分片数量和最大并发数
-            let concurrency = std::cmp::min(total_parts as usize, MAX_CONCURRENCY);
+            let concurrency = usize::try_from(total_parts)
+                .unwrap_or(usize::MAX)
+                .min(MAX_CONCURRENCY);
             let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
             // 存储上传任务的句柄
@@ -1412,7 +1431,11 @@ impl S3Storage {
                         .key(&dst_key_clone)
                         .upload_id(&upload_id_clone)
                         .part_number(part_number_clone)
-                        .content_length(count_clone as i64)
+                        .content_length(i64::try_from(count_clone).map_err(|_| {
+                            StorageError::OperationError(
+                                "S3 multipart chunk exceeds the SDK size limit".to_string(),
+                            )
+                        })?)
                         .body(resp.body)
                         .send()
                         .await
@@ -1946,6 +1969,10 @@ impl S3Storage {
 
     /// 处理版本化对象条目，按对象分组并按时间排序
     async fn process_versioned_entries(&self, scan: VersionedScan<'_>) -> Result<()> {
+        enum VersionOrDeleteMarker {
+            Version(ObjectVersion),
+            DeleteMarker(DeleteMarkerEntry),
+        }
         let VersionedScan {
             tx,
             versions: version_entries,
@@ -1955,12 +1982,6 @@ impl S3Storage {
             exclude_expressions,
             total_file_count,
         } = scan;
-        // 定义一个枚举来表示版本或删除标记
-        enum VersionOrDeleteMarker {
-            Version(ObjectVersion),
-            DeleteMarker(DeleteMarkerEntry),
-        }
-
         // 创建一个HashMap来按对象key分组所有版本条目
         let mut object_versions: HashMap<String, Vec<(i64, VersionOrDeleteMarker)>> =
             HashMap::new();
@@ -1995,10 +2016,10 @@ impl S3Storage {
         for (_key, versions) in object_versions {
             // 按时间从旧到新排序
             let mut sorted_versions = versions;
-            sorted_versions.sort_by(|a, b| a.0.cmp(&b.0));
+            sorted_versions.sort_by_key(|a| a.0);
 
             // 计算该对象的版本总数
-            let version_count = sorted_versions.len() as u32;
+            let version_count = u32::try_from(sorted_versions.len()).unwrap_or(u32::MAX);
 
             // 检查最后一个版本是否是删除标记，如果是则跳过整个对象
             let should_skip_object = match sorted_versions.last() {
@@ -2022,7 +2043,10 @@ impl S3Storage {
                             // 计算相对路径：移除存储的基本前缀
                             let relative_path = self.calculate_relative_path(key_str);
                             let (file_name, extension) = Self::get_file_info(relative_path);
-                            let size = version.size().unwrap_or(0) as u64;
+                            let size = version
+                                .size()
+                                .and_then(|value| u64::try_from(value).ok())
+                                .unwrap_or(0);
 
                             // 检查是否应该跳过文件
                             let (skip_entry, _, _) = should_skip(
@@ -2247,7 +2271,9 @@ impl S3Storage {
             .bucket(&self.bucket_name)
             .key(&file.key)
             .body(stream)
-            .content_length(total_size as i64)
+            .content_length(i64::try_from(total_size).map_err(|_| {
+                StorageError::OperationError("S3 object exceeds the SDK size limit".to_string())
+            })?)
             .metadata("last-modified", file.last_modified.clone());
 
         if let Some(tags) = &file.tags
@@ -2264,7 +2290,9 @@ impl S3Storage {
             StorageError::S3Error(format!("写入对象 {} 失败: {:?}", file.key, e))
         })?;
 
-        Ok(total_size as usize)
+        usize::try_from(total_size).map_err(|_| {
+            StorageError::OperationError("written size exceeds platform capacity".to_string())
+        })
     }
 
     /// 写入数据到目标S3文件（`MULTIPART_THRESHOLD`以上的文件使用multipart上传）
@@ -2491,7 +2519,9 @@ impl S3Storage {
             "Successfully completed multipart upload for file {:?}",
             relative_path
         );
-        Ok(expected_offset as usize)
+        usize::try_from(expected_offset).map_err(|_| {
+            StorageError::OperationError("written size exceeds platform capacity".to_string())
+        })
     }
 
     /// 创建分块上传请求
@@ -2558,7 +2588,9 @@ impl S3Storage {
             .key(key)
             .upload_id(upload_id)
             .part_number(part_number)
-            .content_length(size as i64)
+            .content_length(i64::try_from(size).map_err(|_| {
+                StorageError::OperationError("S3 part exceeds the SDK size limit".to_string())
+            })?)
             .body(stream)
             .send()
             .await
@@ -2649,11 +2681,11 @@ impl S3Storage {
 
     /// 准备可续传的 multipart 上传。
     ///
-    /// 查找该 key 已有的 in-progress upload：有则以 ListParts 反推已完成区间（续传）；
+    /// 查找该 key 已有的 in-progress upload：有则以 `ListParts` 反推已完成区间（续传）；
     /// 无、或已有 parts 与当前 `(size, part_size)` 推导不符（如源已变/块配置变更）则
     /// 作废重建。返回 `(upload_id, 缺失区间列表)`。
     ///
-    /// **目标端 ListParts 是续传进度的唯一真值**——上层状态文件记录的区间只可能
+    /// **目标端 `ListParts` 是续传进度的唯一真值**——上层状态文件记录的区间只可能
     /// 滞后于真实进度（回调后才落盘），且 upload 可能被外部（lifecycle 规则、手动
     /// abort）清掉，以目标端反推永远正确。
     pub(crate) async fn prepare_resumable_upload(
@@ -2665,29 +2697,25 @@ impl S3Storage {
     ) -> Result<(String, Vec<(u64, u64)>)> {
         let key = self.build_full_key(relative_path);
         if let Some(upload_id) = self.find_inprogress_upload(&key).await? {
-            match self
+            if let Some(committed) = self
                 .committed_intervals_from_parts(&key, &upload_id, size, part_size)
                 .await?
             {
-                Some(committed) => {
-                    let missing = missing_from_committed(&committed, size);
-                    debug!(
-                        "Resuming multipart upload {} for key {}: {} committed intervals, {} missing",
-                        upload_id,
-                        key,
-                        committed.len(),
-                        missing.len()
-                    );
-                    return Ok((upload_id, missing));
-                }
-                None => {
-                    warn!(
-                        "Existing multipart upload {} for key {} has incompatible parts, aborting and restarting",
-                        upload_id, key
-                    );
-                    let _ = self.abort_multipart_upload(&key, &upload_id).await;
-                }
+                let missing = missing_from_committed(&committed, size);
+                debug!(
+                    "Resuming multipart upload {} for key {}: {} committed intervals, {} missing",
+                    upload_id,
+                    key,
+                    committed.len(),
+                    missing.len()
+                );
+                return Ok((upload_id, missing));
             }
+            warn!(
+                "Existing multipart upload {} for key {} has incompatible parts, aborting and restarting",
+                upload_id, key
+            );
+            let _ = self.abort_multipart_upload(&key, &upload_id).await;
         }
         let upload_id = self.create_multipart_upload(&key, tags).await?;
         Ok((upload_id, vec![(0, size)]))
@@ -2739,7 +2767,7 @@ impl S3Storage {
         Ok(latest.map(|(id, _)| id))
     }
 
-    /// 分页列出某 upload 的全部 parts，返回 `(part_number, size, etag)`（按 part_number 升序）。
+    /// 分页列出某 upload 的全部 parts，返回 `(part_number, size, etag)`（按 `part_number` 升序）。
     async fn list_upload_parts(
         &self,
         key: &str,
@@ -2776,7 +2804,7 @@ impl S3Storage {
         Ok(parts)
     }
 
-    /// ListParts → 已完成区间（升序）。任一 part 与 `(size, part_size)` 推导的
+    /// `ListParts` → 已完成区间（升序）。任一 part 与 `(size, part_size)` 推导的
     /// 编号/尺寸不符 → `Ok(None)`（调用方应作废该 upload 重来）。
     async fn committed_intervals_from_parts(
         &self,
@@ -2791,7 +2819,7 @@ impl S3Storage {
             if pn < 1 {
                 return Ok(None);
             }
-            let idx = (pn - 1) as u64;
+            let idx = u64::try_from(pn - 1).unwrap_or_else(|_| unreachable!("pn was checked"));
             if idx >= total_parts || psize != Self::expected_part_len(size, part_size, idx) {
                 return Ok(None);
             }
@@ -3063,7 +3091,10 @@ impl S3Storage {
         // 从相对路径计算文件名和扩展名（不使用含 prefix 的 full key）
         let (file_name, extension) = Self::get_file_info(relative_path);
 
-        let size = response.content_length().unwrap_or(0) as u64;
+        let size = response
+            .content_length()
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(0);
 
         let last_modified = datatime_to_i64(response.last_modified());
 
@@ -3432,7 +3463,10 @@ impl S3Storage {
                             continue;
                         }
 
-                        let size = obj.size().unwrap_or(0) as u64;
+                        let size = obj
+                            .size()
+                            .and_then(|value| u64::try_from(value).ok())
+                            .unwrap_or(0);
 
                         // 转换时间戳
                         let last_modified = datatime_to_i64(obj.last_modified());
@@ -3703,8 +3737,8 @@ impl S3Storage {
                         }
                     }
 
-                    versions.sort_by(|a, b| a.0.cmp(&b.0)); // 按 mtime 升序：旧版本在前（NDX 小）
-                    let version_count = versions.len() as u32;
+                    versions.sort_by_key(|a| a.0); // 按 mtime 升序：旧版本在前（NDX 小）
+                    let version_count = u32::try_from(versions.len()).unwrap_or(u32::MAX);
                     let last_idx = versions.len().saturating_sub(1);
 
                     for (i, (ts, ver)) in versions.into_iter().enumerate() {
@@ -3712,7 +3746,10 @@ impl S3Storage {
                         let (file_name, extension) = Self::get_file_info(rel);
                         let is_latest = i == last_idx; // 最后一个（mtime 最大）是 latest
                         let vid = ver.version_id().map(std::string::ToString::to_string);
-                        let size = ver.size().unwrap_or(0) as u64;
+                        let size = ver
+                            .size()
+                            .and_then(|value| u64::try_from(value).ok())
+                            .unwrap_or(0);
 
                         // filter（仅 apply_filter 时）
                         let (skip, _, _) = if ctx.apply_filter {
@@ -3848,7 +3885,10 @@ impl S3Storage {
 
                         let rel = self.calculate_relative_path(key);
                         let (file_name, extension) = Self::get_file_info(rel);
-                        let size = obj.size().unwrap_or(0) as u64;
+                        let size = obj
+                            .size()
+                            .and_then(|value| u64::try_from(value).ok())
+                            .unwrap_or(0);
                         let mtime = datatime_to_i64(obj.last_modified());
 
                         // filter
@@ -4761,7 +4801,7 @@ pub use aws_sdk_s3::types::CompletedPart as S3CompletedPart;
 /// # Drop 行为
 ///
 /// 如果未显式收尾即被 drop（例如 panic、提前 `?` early-return）：
-/// - 记录 `error!` 日志（带 key + upload_id），便于事后排查
+/// - 记录 `error!` 日志（带 key + `upload_id），便于事后排查`
 /// - 若当前线程持有 tokio runtime handle，会 `spawn` 一次 best-effort
 ///   abort 请求（不 await，仅减少 S3 上的"僵尸"未完成上传——这在 AWS
 ///   上会按 storage 计费）
@@ -4791,8 +4831,8 @@ pub struct MultipartUpload<'s> {
     finished: bool,
 }
 
-impl<'s> MultipartUpload<'s> {
-    /// 已分配的 upload_id（S3 端的句柄）。
+impl MultipartUpload<'_> {
+    /// 已分配的 `upload_id（S3` 端的句柄）。
     pub fn upload_id(&self) -> &str {
         &self.upload_id
     }
@@ -4810,7 +4850,7 @@ impl<'s> MultipartUpload<'s> {
     /// 上传一个 part。
     ///
     /// - `part_number`: 1-based，必须严格递增（S3 要求）。本方法不强制校验，
-    ///   由调用方保证；乱序在 [`complete`](Self::complete) 时会按 part_number
+    ///   由调用方保证；乱序在 [`complete`](Self::complete) 时会按 `part_number`
     ///   重新排序。
     /// - `data`: part 内容。S3 规则：除最后一段外，每 part ≥ 5 MiB；上限 5 GiB。
     ///   本方法不做 ≥ 5 MiB 检查（在某些场景如最后一段更小是合法的）。
@@ -4831,7 +4871,7 @@ impl<'s> MultipartUpload<'s> {
 
     /// 完成 multipart upload，对象在 S3 上变为可见。
     ///
-    /// 在调用前会按 part_number 升序排序，避免乱序上传导致 S3 拒绝。
+    /// 在调用前会按 `part_number` 升序排序，避免乱序上传导致 S3 拒绝。
     /// 调用成功或失败后 RAII 守卫不再触发。
     pub async fn complete(mut self) -> Result<()> {
         self.parts.sort_by_key(|p| p.part_number().unwrap_or(0));

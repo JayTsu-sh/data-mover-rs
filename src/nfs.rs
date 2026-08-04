@@ -63,7 +63,7 @@ fn i64_to_time(timestamp: i64) -> Result<Time> {
     })
 }
 
-/// NFSv4 可选富化字段。
+/// `NFSv4` 可选富化字段。
 ///
 /// 不同站点对 ACL/owner/xattrs 的填充程度不同：
 /// - `lookup` 仅有 attrs 中携带的 ACL/owner，没有 xattrs；
@@ -91,7 +91,7 @@ impl Default for NfsEnrich {
 }
 
 impl NfsEnrich {
-    /// 从 `attr` 抽取 ACL/owner/owner_group（空字符串视为 None），xattrs 留 None。
+    /// 从 `attr` 抽取 `ACL/owner/owner_group（空字符串视为` None），xattrs 留 None。
     /// 供 `lookup` / `iterative_walkdir` 使用；后者再链 `with_xattrs`。
     pub fn from_attrs(attr: &nfs_rs::Attr) -> Self {
         Self {
@@ -164,9 +164,9 @@ impl DepthAwareExpiry {
     /// 根据路径深度返回对应的 TTI
     fn tti_for_depth(depth: usize) -> Duration {
         match depth {
-            0..=2 => Duration::from_secs(7200), // 浅层：2h
-            3..=4 => Duration::from_secs(600),  // 中层：10min
-            _ => Duration::from_secs(10),       // 深层：10s
+            0..=2 => Duration::from_hours(2), // 浅层：2h
+            3..=4 => Duration::from_mins(10), // 中层：10min
+            _ => Duration::from_secs(10),     // 深层：10s
         }
     }
 
@@ -218,8 +218,8 @@ static GLOBAL_CACHE: LazyLock<Cache<(PathBuf, Bytes), Bytes>> = LazyLock::new(||
         .build()
 });
 
-/// nfs_url → server_id 映射表。
-/// 相同 NFS 端点的所有 worker 共享同一 server_id，从而共享 GLOBAL_CACHE 条目，
+/// `nfs_url` → `server_id` 映射表。
+/// 相同 NFS 端点的所有 worker 共享同一 `server_id，从而共享` `GLOBAL_CACHE` 条目，
 /// 消除重复 LOOKUP RPC。
 static SERVER_ID_REGISTRY: LazyLock<DashMap<String, u64>> = LazyLock::new(DashMap::new);
 
@@ -252,12 +252,12 @@ const MAX_MOUNT_PORT_ATTEMPTS: u32 = 3;
 /// mount 内层重试的初始等待时间（毫秒），指数退避：1s、2s
 const MOUNT_PORT_RETRY_INITIAL_MS: u64 = 1000;
 
-/// 检测"目标不存在"错误（NFS3ERR_NOENT / NFS4ERR_NOENT / MNT3ERR_NOENT / Io NotFound）。
+/// `检测"目标不存在"错误（NFS3ERR_NOENT` / `NFS4ERR_NOENT` / `MNT3ERR_NOENT` / Io `NotFound`）。
 ///
 /// 用途：
 /// - `delete_file`：转换为 `FileNotFound`，由调用方决定是否按幂等成功处理
 /// - `delete_dir`：幂等成功（删除已不存在的目录不报错）
-/// - lookup_fh：转换为 `DirectoryNotFound`/`FileNotFound` 返回给上层
+/// - `lookup_fh：转换为` `DirectoryNotFound`/`FileNotFound` 返回给上层
 ///
 /// 不参与 stale-handle 重试（语义上 NOENT 是终态，不是 cache 失效）。
 fn is_nfs_noent(err: &NfsError) -> bool {
@@ -270,10 +270,10 @@ fn is_nfs_noent(err: &NfsError) -> bool {
     }
 }
 
-/// 检测"陈旧文件句柄"错误（NFS3ERR_STALE / NFS3ERR_BADHANDLE / NFS4ERR_STALE / NFS4ERR_BADHANDLE）。
+/// `检测"陈旧文件句柄"错误（NFS3ERR_STALE` / `NFS3ERR_BADHANDLE` / `NFS4ERR_STALE` / `NFS4ERR_BADHANDLE`）。
 ///
 /// 含义：缓存的 file handle 在服务端已失效（如服务端重启、export 重新生成）。
-/// 与 NFS4ERR_DELAY 区分：DELAY 是"服务端繁忙，稍后重试"，由 nfs-rs 层
+/// 与 `NFS4ERR_DELAY` 区分：DELAY 是"服务端繁忙，稍后重试"，由 nfs-rs 层
 /// （`compound()` 中带退避的重试循环）处理，不在 data-mover 层重复处理。
 fn is_stale_handle(err: &NfsError) -> bool {
     match err {
@@ -289,7 +289,7 @@ fn is_stale_handle(err: &NfsError) -> bool {
     }
 }
 
-/// 检测"服务端繁忙"错误（NFS4ERR_DELAY）。
+/// `检测"服务端繁忙"错误（NFS4ERR_DELAY`）。
 ///
 /// 含义：服务端暂时繁忙，请稍后重试。nfs-rs 层在 `compound()` 中已对单条 RPC
 /// 做了带 jitter 的退避重试。本函数用于 **流式/迭代式操作**（如 `readdirplus`）
@@ -298,13 +298,13 @@ fn is_stale_handle(err: &NfsError) -> bool {
 /// （否则会出现统计计数偏低的 silent data loss）。
 ///
 /// 与 [`is_stale_handle`] 的恢复策略不同：
-/// - stale handle: 刷新 root_fh + 清除路径缓存
+/// - stale handle: 刷新 `root_fh` + 清除路径缓存
 /// - server busy: 单纯延时再试（nfs-rs 已做，data-mover 在流操作中再试）
 fn is_server_busy(err: &NfsError) -> bool {
     matches!(err, NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_DELAY))
 }
 
-/// 应用层 NFS4ERR_DELAY 退避：2s/4s/8s 指数延时，最多 3 次（额外 ~14s 容错）。
+/// 应用层 `NFS4ERR_DELAY` 退避：2s/4s/8s 指数延时，最多 3 次（额外 ~14s 容错）。
 ///
 /// nfs-rs 在 `compound()` 中已对单条 RPC 做带 jitter 的退避重试（~75s）。
 /// 仍 DELAY 说明服务端持续高负载（如批量并发 create 后期）；
@@ -322,7 +322,7 @@ async fn backoff_server_busy(op: &str, target: &(dyn std::fmt::Debug + Send + Sy
     tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 }
 
-/// 检测调用方可通过"清除路径缓存 + 刷新 root_fh + 重试"恢复的错误。
+/// 检测调用方可通过"清除路径缓存 + 刷新 `root_fh` + 重试"恢复的错误。
 ///
 /// 包含：
 /// - **STALE / BADHANDLE**：文件句柄陈旧（[`is_stale_handle`]），刷新后可恢复。
@@ -331,7 +331,7 @@ async fn backoff_server_busy(op: &str, target: &(dyn std::fmt::Debug + Send + Sy
 ///   B 此时 LOOKUP 会拿到 NOENT；清除缓存重试可恢复。
 ///   若重试耗尽仍 NOENT，调用方应转换为 `FileNotFound`/`DirectoryNotFound`。
 ///
-/// **不包含 NFS4ERR_DELAY**：DELAY 由 nfs-rs 层（`compound()` 退避重试）处理，
+/// **不包含 `NFS4ERR_DELAY`**：DELAY 由 nfs-rs 层（`compound()` 退避重试）处理，
 /// data-mover 层若再叠加重试只会延长等待，无额外收益。
 fn is_retryable_with_invalidation(err: &NfsError) -> bool {
     is_stale_handle(err) || is_nfs_noent(err)
@@ -389,7 +389,7 @@ impl NFSFileHandle {
 }
 
 /// NFS 的 `ChunkSink`：复用 `NFSStorage::write`（单次 WRITE RPC 原语），
-/// FILE_SYNC 稳定级写返回即落盘，`flush` 是 no-op。
+/// `FILE_SYNC` 稳定级写返回即落盘，`flush` 是 no-op。
 pub(crate) struct NfsChunkSink {
     storage: NFSStorage,
     handle: NFSFileHandle,
@@ -434,7 +434,7 @@ const DEFAULT_READ_INFLIGHT: usize = 4;
 
 /// 单文件写入的同时在飞请求数（inflight write pipeline 深度）。
 ///
-/// WRITE 以 FILE_SYNC 稳定级发送，server 落盘延迟比 READ 高且抖动大
+/// WRITE 以 `FILE_SYNC` 稳定级发送，server 落盘延迟比 READ 高且抖动大
 /// （WAFL/ext4 journal flush），取读侧 2 倍做余量：8×64KB = 512KB 在飞，
 /// 可吸收 ~4.6ms 的 server 端抖动。8 ≪ v4.1 的 64 slots，SlotTable 满时
 /// nfs-rs 内部排队等待而非报错，退化平滑。
@@ -1033,7 +1033,10 @@ impl NFSStorage {
 
     pub(crate) async fn read_file(&self, path: &Path, size: u64) -> Result<Bytes> {
         let mut handle = self.open(path, OPEN_READ).await?;
-        let result = self.read(&mut handle, 0, size as usize).await;
+        let size = usize::try_from(size).map_err(|_| {
+            StorageError::OperationError("file is too large for this platform".to_string())
+        })?;
+        let result = self.read(&mut handle, 0, size).await;
         // best-effort close，不覆盖 read 的错误
         let _ = self.close(&handle).await;
         result
@@ -1341,8 +1344,7 @@ impl NFSStorage {
                                 let is_dir = obj
                                     .attr
                                     .as_ref()
-                                    .map(|attr| attr.type_ == FType3::NF3DIR as u32)
-                                    .unwrap_or(true);
+                                    .is_none_or(|attr| attr.type_ == FType3::NF3DIR as u32);
                                 if is_dir {
                                     // 找到目录，继续使用现有句柄
                                     current_fh = obj.fh.clone();
@@ -1369,12 +1371,11 @@ impl NFSStorage {
                                     }
                                     if let Err(e) =
                                         self.mount.remove(current_fh.clone(), dirname).await
+                                        && !e.is_not_found()
                                     {
-                                        if !e.is_not_found() {
-                                            return Err(StorageError::NfsError(format!(
-                                                "Failed to remove non-directory {dirname} blocking directory creation: {e}"
-                                            )));
-                                        }
+                                        return Err(StorageError::NfsError(format!(
+                                            "Failed to remove non-directory {dirname} blocking directory creation: {e}"
+                                        )));
                                     }
                                     return Box::pin(
                                         self.create_dir_all_inner(relative_path, retries + 1),
@@ -1571,7 +1572,7 @@ impl NFSStorage {
             }
 
             // 3. 目录按深度降序排序 → 逐个删除（子目录）
-            dir_paths.sort_by(|a, b| b.1.cmp(&a.1));
+            dir_paths.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             for (path, _) in dir_paths {
                 if let Err(e) = storage.delete_dir(&path).await {
                     error!("Failed to delete dir {:?}: {:?}", path, e);
@@ -2328,7 +2329,7 @@ impl NFSStorage {
         }
 
         // 构建完整路径（使用 '/' 拼接，避免平台差异）
-        let relative_path = self.build_relative_path(&dir_path, &entry.file_name);
+        let relative_path = self.build_relative_path(dir_path, &entry.file_name);
 
         // 提取扩展名（在 file_name 被 move 前提取）
         let extension = entry
@@ -2679,8 +2680,9 @@ impl NFSStorage {
                 let current_chunk_size = std::cmp::min(remaining_bytes, chunk_size);
 
                 // 直接使用slice操作，避免克隆
-                let chunk_data =
-                    data_ref.slice(data_index..data_index + current_chunk_size as usize);
+                let current_chunk_size_usize = usize::try_from(current_chunk_size)
+                    .unwrap_or_else(|_| unreachable!("chunk size is bounded by the input buffer"));
+                let chunk_data = data_ref.slice(data_index..data_index + current_chunk_size_usize);
 
                 trace!(
                     "[write] Writing chunk of {} bytes to file {:?} at offset {}",
@@ -2807,6 +2809,10 @@ impl NFSStorage {
         // 错误处理：first_error + break + drop(inflight) 取消未完成 future，
         // 保证 close 路径必然执行后再返回 Err（与 cifs 读侧语义一致；旧实现
         // 读错误静默 break 返回 Ok，会掩盖目标文件不完整，已修正为上抛）。
+        #[expect(
+            clippy::items_after_statements,
+            reason = "the local future type belongs beside its scheduling queue"
+        )]
         type ReadFut = Pin<Box<dyn Future<Output = (u64, u32, nfs_rs::Result<Bytes>)> + Send>>;
         let mut inflight: FuturesOrdered<ReadFut> = FuturesOrdered::new();
         let mut issue_offset: u64 = 0;
@@ -2873,8 +2879,8 @@ impl NFSStorage {
                         Ok(d) => d,
                         Err(e2) => {
                             first_error = Some(StorageError::NfsError(format!(
-                                "Failed to read file {:?} at offset {offset} after refresh: {e2}",
-                                relative_path
+                                "Failed to read file {} at offset {offset} after refresh: {e2}",
+                                relative_path.display()
                             )));
                             break;
                         }
@@ -2882,7 +2888,8 @@ impl NFSStorage {
                 }
                 Err(e) => {
                     first_error = Some(StorageError::NfsError(format!(
-                        "Failed to read file {relative_path:?} at offset {offset}: {e}"
+                        "Failed to read file {} at offset {offset}: {e}",
+                        relative_path.display()
                     )));
                     break;
                 }
@@ -2935,7 +2942,8 @@ impl NFSStorage {
                     Ok(d) => data = d,
                     Err(e) => {
                         first_error = Some(StorageError::NfsError(format!(
-                            "Failed to read file {relative_path:?} at offset {chunk_off}: {e}"
+                            "Failed to read file {} at offset {chunk_off}: {e}",
+                            relative_path.display()
                         )));
                         break false;
                     }
@@ -3052,6 +3060,10 @@ impl NFSStorage {
         let result = async {
             for &(start, end) in intervals {
                 let mut issue_offset = start;
+                #[expect(
+                    clippy::items_after_statements,
+                    reason = "the local future type belongs beside its retry scheduling queue"
+                )]
                 type ReadFut =
                     Pin<Box<dyn Future<Output = (u64, u32, nfs_rs::Result<Bytes>)> + Send>>;
                 let mut inflight: FuturesOrdered<ReadFut> = FuturesOrdered::new();
@@ -3097,7 +3109,7 @@ impl NFSStorage {
 
     /// 续写到 `.part` 文件：打开已存在文件**不截断**，按 `chunk.offset` 写入（inflight pipeline）。
     ///
-    /// 正确性：NFS WRITE 以 FILE_SYNC 稳定级发送，返回即落盘，故每个 WRITE 成功完成后
+    /// 正确性：NFS WRITE 以 `FILE_SYNC` 稳定级发送，返回即落盘，故每个 WRITE 成功完成后
     /// 立即对该 chunk 触发 `on_committed`，进度记录不会超前于真实数据。
     pub(crate) async fn write_data_resumable(
         &self,
@@ -3456,7 +3468,7 @@ fn next_read_want(cur: u64, end: u64, block_size: u64) -> Option<u32> {
     if cur >= end {
         return None;
     }
-    Some(u64::min(end - cur, block_size) as u32)
+    Some(u32::try_from(u64::min(end - cur, block_size)).unwrap_or(u32::MAX))
 }
 
 #[cfg(test)]

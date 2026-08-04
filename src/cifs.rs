@@ -178,7 +178,7 @@ fn url_decode(s: &str) -> String {
 /// CIFS 目录存在性缓存：`create_dir_all` 用它跳过已确认存在的层级，省去逐层 mkdir RT。
 ///
 /// 内部以排序集合 `BTreeSet<String>` 存路径（统一用 `/` 分隔，无首尾斜杠），用
-/// [`BTreeSet::range`] 做前缀范围查询 → 失效复杂度从 DashSet 全表 `O(N)` 降到
+/// [`BTreeSet::range`] 做前缀范围查询 → 失效复杂度从 `DashSet` 全表 `O(N)` 降到
 /// `O(log N + K')`，K' 为前缀连续范围大小。
 ///
 /// 并发模型：内部 `parking_lot::RwLock` —— 多 worker 共享同一 `CifsStorage` clone 时，
@@ -186,7 +186,7 @@ fn url_decode(s: &str) -> String {
 /// 实际瓶颈在 SMB RT (~ms)，本地临界区 (~μs) 远小于网络成本。
 ///
 /// 容量上限：[`DirExistsCache::MAX_SIZE`] 条。超出后 `insert` 静默跳过 —— 行为退化为
-/// 不带 cache（每次都 mkdir_or_open，幂等），不会丢正确性，避免长 daemon session 下
+/// 不带 cache（每次都 `mkdir_or_open，幂等），不会丢正确性，避免长` daemon session 下
 /// 的无界内存增长。10 万条 path × 平均 256 字节 ≈ 25 MB worst case，覆盖 99% 实际负载。
 pub(super) struct DirExistsCache {
     inner: RwLock<BTreeSet<String>>,
@@ -282,7 +282,7 @@ const DEFAULT_READ_INFLIGHT: usize = 4;
 
 /// 单文件写入的同时在飞请求数（inflight write pipeline 深度）。
 ///
-/// 默认 4：与 read 对称。写入端 FuturesUnordered 允许乱序 ack，server 端 inode
+/// 默认 4：与 read 对称。写入端 `FuturesUnordered` 允许乱序 ack，server 端 inode
 /// 级 lock 串行化在内存中代价低，wire 上仍受益于 pipeline。
 const DEFAULT_WRITE_INFLIGHT: usize = 4;
 
@@ -573,8 +573,7 @@ fn parse_smb_url(url_str: &str) -> Result<(String, u16, String, String, String, 
     let smb2_only = parsed
         .query_pairs()
         .find(|(k, _)| k == "smb2_only")
-        .map(|(_, v)| v != "false")
-        .unwrap_or(true);
+        .is_none_or(|(_, v)| v != "false");
 
     Ok((host, port, share, sub_path, username, password, smb2_only))
 }
@@ -1034,6 +1033,10 @@ impl CifsStorage {
         // - send_offset：已通过 channel 送出的总字节数。
         // - 内层 while 填满 inflight；外层 await 取最早完成的（FIFO）。
         // - 出错或下游关闭时跳出，FuturesOrdered drop 会取消未完成的 future。
+        #[expect(
+            clippy::items_after_statements,
+            reason = "the local future type belongs beside its scheduling queue"
+        )]
         type ReadFut<'a> = Pin<Box<dyn Future<Output = std::io::Result<Bytes>> + Send + 'a>>;
         let mut inflight: FuturesOrdered<ReadFut<'_>> = FuturesOrdered::new();
         let mut issue_offset: u64 = 0;
@@ -1389,12 +1392,11 @@ impl CifsStorage {
         _mode: Option<u32>,
         progress: crate::storage_enum::WriteProgress,
     ) -> Result<()> {
+        const FLUSH_BARRIER: usize = 16;
         let crate::storage_enum::WriteProgress {
             bytes_counter,
             on_committed,
         } = progress;
-        const FLUSH_BARRIER: usize = 16;
-
         if let Some(parent) = part_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -1436,7 +1438,7 @@ impl CifsStorage {
         result.map(|_| ())
     }
 
-    /// 将文件长度规整为 `len`（截掉续传遗留尾部）：set_info `FileEndOfFileInformation`。
+    /// 将文件长度规整为 `len`（`截掉续传遗留尾部）：set_info` `FileEndOfFileInformation`。
     pub(crate) async fn set_file_len(&self, relative_path: &Path, len: u64) -> Result<()> {
         let unc = self.build_unc_path(relative_path);
         let args = Self::make_open_or_create_args();
@@ -1666,7 +1668,7 @@ impl CifsStorage {
                 let _ = h.await;
             }
 
-            dir_paths.sort_by(|a, b| b.1.cmp(&a.1));
+            dir_paths.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             for (path, _) in dir_paths {
                 if let Err(e) = storage.delete_dir(&path).await {
                     error!("Failed to delete dir {:?}: {:?}", path, e);
