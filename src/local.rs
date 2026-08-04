@@ -485,6 +485,7 @@ impl LocalStorage {
                     .send(StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
                         path: std::path::PathBuf::from(format!("{e:?}")),
+                        entry: None,
                         reason: format!("{e:?}"),
                     })
                     .await;
@@ -609,6 +610,7 @@ impl LocalStorage {
                     .send(StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
                         path: full_path.clone(),
+                        entry: None,
                         reason: "Failed to strip prefix".to_string(),
                     })
                     .await;
@@ -636,6 +638,7 @@ impl LocalStorage {
                         .send(StorageEntryMessage::Error {
                             event: ErrorEvent::Scan,
                             path: relative_path.clone(),
+                            entry: None,
                             reason: format!("Failed to get metadata: {e}"),
                         })
                         .await;
