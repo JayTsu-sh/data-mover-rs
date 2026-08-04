@@ -72,6 +72,27 @@ struct S3WalkRuntime<'a> {
     package_depth: usize,
 }
 
+struct S3PartUpload {
+    key: Arc<String>,
+    upload_id: Arc<String>,
+    part_idx: u64,
+    part_start: u64,
+    chunks: Vec<Bytes>,
+    len: u64,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    progress: crate::storage_enum::WriteProgress,
+}
+
+struct VersionedScan<'a> {
+    tx: &'a async_channel::Sender<StorageEntryMessage>,
+    versions: &'a [ObjectVersion],
+    delete_markers: &'a [DeleteMarkerEntry],
+    include_tags: bool,
+    match_expressions: Option<&'a FilterExpression>,
+    exclude_expressions: Option<&'a FilterExpression>,
+    total_file_count: Arc<AtomicUsize>,
+}
+
 mod delete_objects_md5;
 mod dxn;
 mod multipart_rename;
@@ -1631,7 +1652,10 @@ impl S3Storage {
     }
 
     /// 构建 `EntryEnum`
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "centralized S3 entry constructor mirrors the serialized S3Entry record"
+    )]
     fn build_entry(
         file_name: String,
         relative_path: &str,
@@ -1921,17 +1945,16 @@ impl S3Storage {
     }
 
     /// 处理版本化对象条目，按对象分组并按时间排序
-    #[allow(clippy::too_many_arguments)]
-    async fn process_versioned_entries(
-        &self,
-        tx: &async_channel::Sender<StorageEntryMessage>,
-        version_entries: &[ObjectVersion],
-        delete_marker_entries: &[DeleteMarkerEntry],
-        include_tags: bool,
-        match_expressions: Option<&FilterExpression>,
-        exclude_expressions: Option<&FilterExpression>,
-        total_file_count: Arc<AtomicUsize>,
-    ) -> Result<()> {
+    async fn process_versioned_entries(&self, scan: VersionedScan<'_>) -> Result<()> {
+        let VersionedScan {
+            tx,
+            versions: version_entries,
+            delete_markers: delete_marker_entries,
+            include_tags,
+            match_expressions,
+            exclude_expressions,
+            total_file_count,
+        } = scan;
         // 定义一个枚举来表示版本或删除标记
         enum VersionOrDeleteMarker {
             Version(ObjectVersion),
@@ -2740,8 +2763,7 @@ impl S3Storage {
             for p in resp.parts() {
                 if let (Some(pn), Some(psize), Some(etag)) = (p.part_number(), p.size(), p.e_tag())
                 {
-                    #[allow(clippy::cast_sign_loss)]
-                    parts.push((pn, psize.max(0) as u64, etag.to_string()));
+                    parts.push((pn, u64::try_from(psize).unwrap_or(0), etag.to_string()));
                 }
             }
             if resp.is_truncated() == Some(true) {
@@ -2788,7 +2810,6 @@ impl S3Storage {
     /// 每个 part 上传成功即触发 `on_committed(part_start, part_len)`。
     /// 任何失败**不 abort** upload——已上传 parts 留在 in-progress upload 里，
     /// 就是下次续传的进度。流在 part 中途结束时丢弃半截缓冲（该 part 下次重传）。
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_data_resumable(
         &self,
         rx: mpsc::Receiver<DataChunk>,
@@ -2796,9 +2817,12 @@ impl S3Storage {
         size: u64,
         part_size: u64,
         upload_id: &str,
-        bytes_counter: Option<Arc<AtomicU64>>,
-        on_committed: crate::CommitCallback,
+        progress: crate::storage_enum::WriteProgress,
     ) -> Result<()> {
+        let crate::storage_enum::WriteProgress {
+            bytes_counter,
+            on_committed,
+        } = progress;
         let key = Arc::new(self.build_full_key(relative_path));
         let upload_id = Arc::new(upload_id.to_string());
         let mut reader = rx;
@@ -2842,23 +2866,26 @@ impl S3Storage {
                     )));
                     break 'recv;
                 }
-                let take = (data.len() as u64).min(room);
-                #[allow(clippy::cast_possible_truncation)]
-                buf.push(data.split_to(take as usize));
-                buf_len += take;
+                let take_u64 = (data.len() as u64).min(room);
+                let take = usize::try_from(take_u64)
+                    .unwrap_or_else(|_| unreachable!("take is bounded by data.len()"));
+                buf.push(data.split_to(take));
+                buf_len += take_u64;
                 if buf_start + buf_len == part_end {
                     let handle = self
-                        .spawn_resumable_part_upload(
-                            key.clone(),
-                            upload_id.clone(),
+                        .spawn_resumable_part_upload(S3PartUpload {
+                            key: key.clone(),
+                            upload_id: upload_id.clone(),
                             part_idx,
-                            buf_start,
-                            std::mem::take(&mut buf),
-                            buf_len,
-                            semaphore.clone(),
-                            bytes_counter.clone(),
-                            on_committed.clone(),
-                        )
+                            part_start: buf_start,
+                            chunks: std::mem::take(&mut buf),
+                            len: buf_len,
+                            semaphore: semaphore.clone(),
+                            progress: crate::storage_enum::WriteProgress {
+                                bytes_counter: bytes_counter.clone(),
+                                on_committed: on_committed.clone(),
+                            },
+                        })
                         .await?;
                     handles.push(handle);
                     buf_start = part_end;
@@ -2874,17 +2901,19 @@ impl S3Storage {
             if buf_start + buf_len == size {
                 let part_idx = buf_start / part_size;
                 let handle = self
-                    .spawn_resumable_part_upload(
-                        key.clone(),
-                        upload_id.clone(),
+                    .spawn_resumable_part_upload(S3PartUpload {
+                        key: key.clone(),
+                        upload_id: upload_id.clone(),
                         part_idx,
-                        buf_start,
-                        std::mem::take(&mut buf),
-                        buf_len,
-                        semaphore.clone(),
-                        bytes_counter.clone(),
-                        on_committed.clone(),
-                    )
+                        part_start: buf_start,
+                        chunks: std::mem::take(&mut buf),
+                        len: buf_len,
+                        semaphore: semaphore.clone(),
+                        progress: crate::storage_enum::WriteProgress {
+                            bytes_counter: bytes_counter.clone(),
+                            on_committed: on_committed.clone(),
+                        },
+                    })
                     .await?;
                 handles.push(handle);
             } else {
@@ -2921,19 +2950,24 @@ impl S3Storage {
 
     /// 受信号量限流地 spawn 单个 part 的上传任务；成功后计数 + 触发
     /// `on_committed(part_start, len)`。
-    #[allow(clippy::too_many_arguments)]
     async fn spawn_resumable_part_upload(
         &self,
-        key: Arc<String>,
-        upload_id: Arc<String>,
-        part_idx: u64,
-        part_start: u64,
-        chunks: Vec<Bytes>,
-        len: u64,
-        semaphore: Arc<tokio::sync::Semaphore>,
-        bytes_counter: Option<Arc<AtomicU64>>,
-        on_committed: crate::CommitCallback,
+        upload: S3PartUpload,
     ) -> Result<tokio::task::JoinHandle<Result<()>>> {
+        let S3PartUpload {
+            key,
+            upload_id,
+            part_idx,
+            part_start,
+            chunks,
+            len,
+            semaphore,
+            progress:
+                crate::storage_enum::WriteProgress {
+                    bytes_counter,
+                    on_committed,
+                },
+        } = upload;
         let permit = semaphore
             .acquire_owned()
             .await
@@ -3296,15 +3330,15 @@ impl S3Storage {
                 }
 
                 // 处理版本对象和删除标记，按对象分组并按时间排序
-                self.process_versioned_entries(
+                self.process_versioned_entries(VersionedScan {
                     tx,
-                    &version_entries,
-                    &delete_marker_entries,
+                    versions: &version_entries,
+                    delete_markers: &delete_marker_entries,
                     include_tags,
                     match_expressions,
                     exclude_expressions,
-                    total_file_count.clone(),
-                )
+                    total_file_count: total_file_count.clone(),
+                })
                 .await?;
 
                 // 更新分页标记

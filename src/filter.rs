@@ -108,7 +108,7 @@ pub fn should_skip(
         );
 
         match match_result {
-            MatchResult::Match(MatchAddon::PathMatch | MatchAddon::MixMatch) => {
+            MatchResult::Match(MatchAddon::Path | MatchAddon::Mixed) => {
                 // 带路径条件完整匹配黑名单，跳过当前条目，不继续扫描子目录
                 trace!(
                     "[filter::should_skip:FILTER-EXCLUDE-MATCH] 带路径条件完整匹配黑名单，跳过当前条目，停止递归: name={:?}, path={:?}",
@@ -146,7 +146,7 @@ pub fn should_skip(
         );
 
         match match_result {
-            MatchResult::Match(MatchAddon::PathMatch) => {
+            MatchResult::Match(MatchAddon::Path) => {
                 // 完整匹配白名单，不跳过当前条目， 继续扫描子目录，又只有path匹配条件，子目录无需匹配
                 trace!(
                     "[filter::should_skip:FILTER-MATCH-FULL] 完整匹配白名单，保留当前条目，若是目录则继续递归子项(无需检查): name={:?}, path={:?}, is_dir={}",
@@ -1283,23 +1283,25 @@ impl FilterExpression {
                 let match_result = match_path_with_pattern(
                     file_path,
                     file_type,
-                    pattern,
-                    raw_value,
-                    pattern_parts,
-                    *pattern_depth,
-                    *has_double_wildcard,
-                    pattern_after_wildcard,
+                    PathPatternMatch {
+                        pattern,
+                        raw_value,
+                        pattern_parts,
+                        pattern_depth: *pattern_depth,
+                        has_double_wildcard: *has_double_wildcard,
+                        pattern_after_wildcard,
+                    },
                 );
                 match operator {
                     CompareOp::Eq => match_result,
                     CompareOp::Ne => match match_result {
-                        MatchResult::Match(MatchAddon::PathMatch | MatchAddon::MixMatch) => {
+                        MatchResult::Match(MatchAddon::Path | MatchAddon::Mixed) => {
                             MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch)
                         }
                         MatchResult::Match(_) | MatchResult::PartialMatch => {
                             MatchResult::MisMatch(MisMatchAddon::Other)
                         }
-                        MatchResult::MisMatch(_) => MatchResult::Match(MatchAddon::PathMatch),
+                        MatchResult::MisMatch(_) => MatchResult::Match(MatchAddon::Path),
                         MatchResult::LazyMatch => MatchResult::LazyMatch,
                     },
                     _ => MatchResult::MisMatch(MisMatchAddon::Other),
@@ -1363,12 +1365,12 @@ impl FilterExpression {
             FilterCondition::DirDate { operator, epoch } => {
                 // 非目录条目：透明通过
                 if file_type != Some("dir") {
-                    return MatchResult::Match(MatchAddon::NonPathMatch);
+                    return MatchResult::Match(MatchAddon::NonPath);
                 }
 
                 // 从目录名中提取日期
                 let Some(dir_name) = file_name else {
-                    return MatchResult::Match(MatchAddon::NonPathMatch);
+                    return MatchResult::Match(MatchAddon::NonPath);
                 };
 
                 match extract_date_from_dir_name(dir_name) {
@@ -1383,8 +1385,8 @@ impl FilterExpression {
                             CompareOp::Ge => dir_epoch >= *epoch,
                         };
                         if matches {
-                            // 日期匹配：PathMatch → 子项免检
-                            MatchResult::Match(MatchAddon::PathMatch)
+                            // 日期匹配：Path → 子项免检
+                            MatchResult::Match(MatchAddon::Path)
                         } else {
                             // 日期不匹配：FullPathNotMatch → 跳过 + 停止扫描子项
                             MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch)
@@ -1392,7 +1394,7 @@ impl FilterExpression {
                     }
                     None => {
                         // 目录名不含日期：透明通过
-                        MatchResult::Match(MatchAddon::NonPathMatch)
+                        MatchResult::Match(MatchAddon::NonPath)
                     }
                 }
             }
@@ -1457,14 +1459,13 @@ impl FilterExpression {
 
 /// 匹配附加信息枚举，用于标识匹配的类型
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::enum_variant_names)]
 enum MatchAddon {
     /// 只有路径条件的匹配
-    PathMatch,
+    Path,
     /// 没有路径条件的匹配
-    NonPathMatch,
+    NonPath,
     /// 既有路径条件又有非路径条件的匹配
-    MixMatch,
+    Mixed,
 }
 
 /// 不匹配附加信息枚举，用于标识不匹配的原因
@@ -1491,11 +1492,11 @@ enum MatchResult {
 
 impl MatchResult {
     /// Convert a boolean to `MatchResult`, only applied to Path condition
-    /// - When b is true: return `Match(MatchAddon::NonPathMatch)`
+    /// - When b is true: return `Match(MatchAddon::NonPath)`
     /// - When b is false: return `MisMatch(MisMatchAddon::Other)`
     fn from_bool(b: bool) -> Self {
         if b {
-            MatchResult::Match(MatchAddon::NonPathMatch)
+            MatchResult::Match(MatchAddon::NonPath)
         } else {
             MatchResult::MisMatch(MisMatchAddon::Other)
         }
@@ -1532,13 +1533,11 @@ impl BitAnd for MatchResult {
             }
             // 两个操作数均为 Match 的情况
             (MatchResult::Match(addon1), MatchResult::Match(addon2)) => {
-                // 合并 MatchAddon 标记，优先级：MixMatch > PathMatch > NonPathMatch
+                // 合并 MatchAddon 标记，优先级：Mixed > Path > NonPath
                 let result_addon = match (addon1, addon2) {
-                    (MatchAddon::PathMatch, MatchAddon::PathMatch) => MatchAddon::PathMatch,
-                    (MatchAddon::NonPathMatch, MatchAddon::NonPathMatch) => {
-                        MatchAddon::NonPathMatch
-                    }
-                    _ => MatchAddon::MixMatch,
+                    (MatchAddon::Path, MatchAddon::Path) => MatchAddon::Path,
+                    (MatchAddon::NonPath, MatchAddon::NonPath) => MatchAddon::NonPath,
+                    _ => MatchAddon::Mixed,
                 };
                 MatchResult::Match(result_addon)
             }
@@ -1563,13 +1562,11 @@ impl BitOr for MatchResult {
         match (self, other) {
             // 两个操作数均为 Match 的情况
             (MatchResult::Match(addon1), MatchResult::Match(addon2)) => {
-                // 合并 MatchAddon 标记，优先级：MixMatch > PathMatch > NonPathMatch
+                // 合并 MatchAddon 标记，优先级：Mixed > Path > NonPath
                 let result_addon = match (addon1, addon2) {
-                    (MatchAddon::PathMatch, MatchAddon::PathMatch) => MatchAddon::PathMatch,
-                    (MatchAddon::NonPathMatch, MatchAddon::NonPathMatch) => {
-                        MatchAddon::NonPathMatch
-                    }
-                    _ => MatchAddon::MixMatch,
+                    (MatchAddon::Path, MatchAddon::Path) => MatchAddon::Path,
+                    (MatchAddon::NonPath, MatchAddon::NonPath) => MatchAddon::NonPath,
+                    _ => MatchAddon::Mixed,
                 };
                 MatchResult::Match(result_addon)
             }
@@ -1619,17 +1616,28 @@ impl BitOr for MatchResult {
 /// - `pattern_depth`: pattern 段数
 /// - `has_double_wildcard`: 是否含 **
 /// - `pattern_after_wildcard`: ** 之后的部分
-#[allow(clippy::too_many_arguments)]
+struct PathPatternMatch<'a> {
+    pattern: &'a Pattern,
+    raw_value: &'a str,
+    pattern_parts: &'a [String],
+    pattern_depth: usize,
+    has_double_wildcard: bool,
+    pattern_after_wildcard: &'a [String],
+}
+
 fn match_path_with_pattern(
     file_path: &str,
     file_type: Option<&str>,
-    pattern: &Pattern,
-    raw_value: &str,
-    pattern_parts: &[String],
-    pattern_depth: usize,
-    has_double_wildcard: bool,
-    pattern_after_wildcard: &[String],
+    path_pattern: PathPatternMatch<'_>,
 ) -> MatchResult {
+    let PathPatternMatch {
+        pattern,
+        raw_value,
+        pattern_parts,
+        pattern_depth,
+        has_double_wildcard,
+        pattern_after_wildcard,
+    } = path_pattern;
     trace!(
         "[Filter:match_path_with_pattern] 开始匹配: pattern_value={}, file_path={}, file_type={:?}",
         raw_value, file_path, file_type
@@ -1641,7 +1649,7 @@ fn match_path_with_pattern(
             "[Filter:match_path_with_pattern] 全路径匹配成功: pattern_value={}, file_path={}",
             raw_value, file_path
         );
-        return MatchResult::Match(MatchAddon::PathMatch);
+        return MatchResult::Match(MatchAddon::Path);
     }
 
     // 祖先路径匹配：当 file_depth > pattern_depth 时，截取祖先路径用原始 pattern 匹配
@@ -1666,7 +1674,7 @@ fn match_path_with_pattern(
                         "[Filter:match_path_with_pattern] 祖先路径匹配成功(含**): pattern_value={}, file_path={}, ancestor={}",
                         raw_value, file_path, ancestor_path
                     );
-                    return MatchResult::Match(MatchAddon::PathMatch);
+                    return MatchResult::Match(MatchAddon::Path);
                 }
             }
         } else {
@@ -1677,7 +1685,7 @@ fn match_path_with_pattern(
                     "[Filter:match_path_with_pattern] 祖先路径匹配成功: pattern_value={}, file_path={}, ancestor={}",
                     raw_value, file_path, ancestor_path
                 );
-                return MatchResult::Match(MatchAddon::PathMatch);
+                return MatchResult::Match(MatchAddon::Path);
             }
         }
     }
@@ -1901,7 +1909,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -1921,13 +1929,13 @@ mod tests {
     #[test]
     fn test_basic_type_match() {
         let r = eval("type == file", None, None, Some("file"), None, None, None);
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
     fn test_basic_size_match() {
         let r = eval("size > 100", None, None, None, None, Some(200), None);
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -1941,7 +1949,7 @@ mod tests {
             None,
             Some("rs"),
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     // ==================== 7.2 glob * vs ** basic behavior ====================
@@ -1973,7 +1981,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
@@ -1988,7 +1996,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
@@ -2003,7 +2011,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
@@ -2018,7 +2026,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -2047,7 +2055,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
 
         let r2 = eval(
             "name == \"test_?\"",
@@ -2072,7 +2080,7 @@ mod tests {
             None,
             Some("txt"),
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
 
         let r2 = eval(
             "extension == \"t*\"",
@@ -2097,7 +2105,7 @@ mod tests {
             None,
             Some("rs"),
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
 
         let r2 = eval(
             "extension == \"r?\"",
@@ -2344,7 +2352,7 @@ mod tests {
             None,
             None,
         );
-        // PathMatch blacklist => skip, no continue, no check
+        // Path blacklist => skip, no continue, no check
         assert_eq!((skip, cont, check), (true, false, false));
     }
 
@@ -2430,7 +2438,7 @@ mod tests {
             None,
             None,
         );
-        // Full match blacklist with PathMatch -> skip, no continue
+        // Full match blacklist with Path -> skip, no continue
         assert_eq!((skip, cont, check), (true, false, false));
     }
 
@@ -2499,7 +2507,7 @@ mod tests {
             None,
             None,
         );
-        // PathMatch blacklist -> skip, no continue
+        // Path blacklist -> skip, no continue
         assert_eq!((skip, cont, check), (true, false, false));
     }
 
@@ -2645,7 +2653,7 @@ mod tests {
             None,
             target_epoch + 86400, // now doesn't matter for absolute ==
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -2662,7 +2670,7 @@ mod tests {
             None,
             file_epoch + 86400,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -2713,7 +2721,7 @@ mod tests {
             None,
             file_epoch + 86400,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     // Absolute time comparison operators
@@ -2731,7 +2739,7 @@ mod tests {
             None,
             file_epoch + 86400,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -2766,7 +2774,7 @@ mod tests {
             None,
             file_epoch + 86400 * 10,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -2783,7 +2791,7 @@ mod tests {
             None,
             file_epoch + 86400 * 10,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -2819,7 +2827,7 @@ mod tests {
             None,
             file_epoch + 86400 * 10,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     // Modified combination tests
@@ -2836,7 +2844,7 @@ mod tests {
             None,
             file_epoch + 86400,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -2853,7 +2861,7 @@ mod tests {
             None,
             file_epoch + 86400 * 30,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -2889,7 +2897,7 @@ mod tests {
             None,
             now,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -2907,7 +2915,7 @@ mod tests {
             None,
             now,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -2949,7 +2957,7 @@ mod tests {
     #[test]
     fn test_or_short_circuit_left_match() {
         // name == "*.txt" or size > 100
-        // name matches -> Or short-circuits, result is Match(NonPathMatch)
+        // name matches -> Or short-circuits, result is Match(NonPath)
         let r = eval(
             "name == \"*.txt\" or size > 100",
             Some("hello.txt"),
@@ -2959,7 +2967,7 @@ mod tests {
             Some(50),
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -2976,7 +2984,7 @@ mod tests {
             None,
             now,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     // ==================== 7.8 CompareOp / precompiled Pattern ====================
@@ -2996,23 +3004,23 @@ mod tests {
     fn test_compare_op_size_all_operators() {
         // Eq
         let r = eval("size == 100", None, None, None, None, Some(100), None);
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
 
         // Lt
         let r = eval("size < 100", None, None, None, None, Some(50), None);
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
 
         // Gt
         let r = eval("size > 100", None, None, None, None, Some(200), None);
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
 
         // Le
         let r = eval("size <= 100", None, None, None, None, Some(100), None);
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
 
         // Ge
         let r = eval("size >= 100", None, None, None, None, Some(100), None);
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
 
         // Ne (size doesn't support != in current implementation, returns MisMatch)
         let r = eval("size != 100", None, None, None, None, Some(200), None);
@@ -3032,7 +3040,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r1, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r1, MatchResult::Match(MatchAddon::NonPath));
 
         let r2 = eval(
             "name == \"hello_*\"",
@@ -3057,7 +3065,7 @@ mod tests {
             None,
             Some("txt"),
         );
-        assert_eq!(r1, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r1, MatchResult::Match(MatchAddon::NonPath));
 
         let r2 = eval(
             "extension == \"t?t\"",
@@ -3082,7 +3090,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
@@ -3096,7 +3104,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
 
         let r2 = eval(
             "name != \"*.tmp\"",
@@ -3161,8 +3169,8 @@ mod tests {
             None,
             None,
         );
-        // Match(PathMatch) & Match(NonPathMatch) => Match(MixMatch)
-        assert_eq!(r, MatchResult::Match(MatchAddon::MixMatch));
+        // Match(Path) & Match(NonPath) => Match(Mixed)
+        assert_eq!(r, MatchResult::Match(MatchAddon::Mixed));
     }
 
     #[test]
@@ -3285,7 +3293,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::MixMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Mixed));
     }
 
     #[test]
@@ -3301,7 +3309,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::MixMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Mixed));
     }
 
     #[test]
@@ -3333,7 +3341,7 @@ mod tests {
             Some(15),
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     // Blacklist + whitelist + compound conditions
@@ -3401,7 +3409,7 @@ mod tests {
     #[test]
     fn test_match_addon_and_path_nonpath_mix() {
         // path == "a/b" and name == "*.rs"
-        // file at path "a/b" with name "test.rs" -> Match(PathMatch) & Match(NonPathMatch) -> Match(MixMatch)
+        // file at path "a/b" with name "test.rs" -> Match(Path) & Match(NonPath) -> Match(Mixed)
         let r = eval(
             "path == \"a/b\" and name == \"*.rs\"",
             Some("test.rs"),
@@ -3411,14 +3419,14 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::MixMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Mixed));
     }
 
     #[test]
     fn test_match_addon_or_path_nonpath_mix() {
         // path == "a/b" or name == "*.rs"
         // file at path "a/b" with name "test.rs" -> both match
-        // Or short-circuits: left is Match(PathMatch) -> returns Match(PathMatch)
+        // Or short-circuits: left is Match(Path) -> returns Match(Path)
         let r = eval(
             "path == \"a/b\" or name == \"*.rs\"",
             Some("test.rs"),
@@ -3428,15 +3436,15 @@ mod tests {
             None,
             None,
         );
-        // Due to Or short-circuit, left Match(PathMatch) is returned directly
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        // Due to Or short-circuit, left Match(Path) is returned directly
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
     fn test_match_addon_or_right_only() {
         // path == "x/y" or name == "*.rs"
         // file at path "a/b" with name "test.rs"
-        // path doesn't match (MisMatch), name matches (Match(NonPathMatch))
+        // path doesn't match (MisMatch), name matches (Match(NonPath))
         let r = eval(
             "path == \"x/y\" or name == \"*.rs\"",
             Some("test.rs"),
@@ -3446,8 +3454,8 @@ mod tests {
             None,
             None,
         );
-        // MisMatch | Match(NonPathMatch) => Match(NonPathMatch)
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        // MisMatch | Match(NonPath) => Match(NonPath)
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     // ==================== MatchResult BitAnd / BitOr tests ====================
@@ -3456,36 +3464,34 @@ mod tests {
     fn test_match_result_and_combinations() {
         // Match & Match
         assert_eq!(
-            MatchResult::Match(MatchAddon::PathMatch) & MatchResult::Match(MatchAddon::PathMatch),
-            MatchResult::Match(MatchAddon::PathMatch)
+            MatchResult::Match(MatchAddon::Path) & MatchResult::Match(MatchAddon::Path),
+            MatchResult::Match(MatchAddon::Path)
         );
         assert_eq!(
-            MatchResult::Match(MatchAddon::PathMatch)
-                & MatchResult::Match(MatchAddon::NonPathMatch),
-            MatchResult::Match(MatchAddon::MixMatch)
+            MatchResult::Match(MatchAddon::Path) & MatchResult::Match(MatchAddon::NonPath),
+            MatchResult::Match(MatchAddon::Mixed)
         );
         assert_eq!(
-            MatchResult::Match(MatchAddon::NonPathMatch)
-                & MatchResult::Match(MatchAddon::NonPathMatch),
-            MatchResult::Match(MatchAddon::NonPathMatch)
+            MatchResult::Match(MatchAddon::NonPath) & MatchResult::Match(MatchAddon::NonPath),
+            MatchResult::Match(MatchAddon::NonPath)
         );
 
         // Match & PartialMatch
         assert_eq!(
-            MatchResult::Match(MatchAddon::PathMatch) & MatchResult::PartialMatch,
+            MatchResult::Match(MatchAddon::Path) & MatchResult::PartialMatch,
             MatchResult::PartialMatch
         );
 
         // Match & MisMatch
         assert_eq!(
-            MatchResult::Match(MatchAddon::PathMatch) & MatchResult::MisMatch(MisMatchAddon::Other),
+            MatchResult::Match(MatchAddon::Path) & MatchResult::MisMatch(MisMatchAddon::Other),
             MatchResult::MisMatch(MisMatchAddon::Other)
         );
 
         // Match & LazyMatch
         assert_eq!(
-            MatchResult::Match(MatchAddon::PathMatch) & MatchResult::LazyMatch,
-            MatchResult::Match(MatchAddon::PathMatch)
+            MatchResult::Match(MatchAddon::Path) & MatchResult::LazyMatch,
+            MatchResult::Match(MatchAddon::Path)
         );
 
         // PartialMatch & PartialMatch
@@ -3506,15 +3512,14 @@ mod tests {
     fn test_match_result_or_combinations() {
         // Match | Match
         assert_eq!(
-            MatchResult::Match(MatchAddon::PathMatch)
-                | MatchResult::Match(MatchAddon::NonPathMatch),
-            MatchResult::Match(MatchAddon::MixMatch)
+            MatchResult::Match(MatchAddon::Path) | MatchResult::Match(MatchAddon::NonPath),
+            MatchResult::Match(MatchAddon::Mixed)
         );
 
         // Match | MisMatch
         assert_eq!(
-            MatchResult::Match(MatchAddon::PathMatch) | MatchResult::MisMatch(MisMatchAddon::Other),
-            MatchResult::Match(MatchAddon::PathMatch)
+            MatchResult::Match(MatchAddon::Path) | MatchResult::MisMatch(MisMatchAddon::Other),
+            MatchResult::Match(MatchAddon::Path)
         );
 
         // PartialMatch | MisMatch
@@ -3629,7 +3634,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
@@ -3655,7 +3660,7 @@ mod tests {
     #[test]
     fn test_type_ne_operator() {
         let r = eval("type != file", None, None, Some("dir"), None, None, None);
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
 
         let r2 = eval("type != file", None, None, Some("file"), None, None, None);
         assert_eq!(r2, MatchResult::MisMatch(MisMatchAddon::Other));
@@ -3672,7 +3677,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         let r2 = eval(
             "path != \"src/**\"",
@@ -3722,7 +3727,7 @@ mod tests {
 
     #[test]
     fn test_should_skip_whitelist_match_path_only() {
-        // Whitelist: path == "src/**", file "src/test.rs" -> Match(PathMatch) -> no skip, check_children=false
+        // Whitelist: path == "src/**", file "src/test.rs" -> Match(Path) -> no skip, check_children=false
         let (skip, cont, check) = skip(
             Some("path == \"src/**\""),
             None,
@@ -3738,7 +3743,7 @@ mod tests {
 
     #[test]
     fn test_should_skip_whitelist_match_non_path() {
-        // Whitelist: name == "*.rs", file "test.rs" -> Match(NonPathMatch) -> no skip, check_children=true
+        // Whitelist: name == "*.rs", file "test.rs" -> Match(NonPath) -> no skip, check_children=true
         let (skip, cont, check) = skip(
             Some("name == \"*.rs\""),
             None,
@@ -3826,7 +3831,7 @@ mod tests {
             None,
             target_epoch + 86400,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -3861,7 +3866,7 @@ mod tests {
             None,
             file_epoch + 86400,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -3896,7 +3901,7 @@ mod tests {
             None,
             now,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -3914,7 +3919,7 @@ mod tests {
             None,
             now,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     // ==================== 7.7 Additional short-circuit tests ====================
@@ -3931,7 +3936,7 @@ mod tests {
             Some(200),
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -3946,7 +3951,7 @@ mod tests {
             Some(200),
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -3969,13 +3974,13 @@ mod tests {
     #[test]
     fn test_compare_op_type_eq_ne() {
         let r1 = eval("type == dir", None, None, Some("dir"), None, None, None);
-        assert_eq!(r1, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r1, MatchResult::Match(MatchAddon::NonPath));
 
         let r2 = eval("type == dir", None, None, Some("file"), None, None, None);
         assert_eq!(r2, MatchResult::MisMatch(MisMatchAddon::Other));
 
         let r3 = eval("type != dir", None, None, Some("file"), None, None, None);
-        assert_eq!(r3, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r3, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
@@ -3989,7 +3994,7 @@ mod tests {
             None,
             Some("rs"),
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
 
         let r2 = eval(
             "extension != \"tmp\"",
@@ -4007,7 +4012,7 @@ mod tests {
     fn test_size_boundary_values() {
         // Exact boundary: size == 0
         let r = eval("size == 0", None, None, None, None, Some(0), None);
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
 
         // size < 0 (no file can have size less than 0)
         let r2 = eval("size > 0", None, None, None, None, Some(0), None);
@@ -4023,7 +4028,7 @@ mod tests {
             Some(1_000_000_000),
             None,
         );
-        assert_eq!(r3, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r3, MatchResult::Match(MatchAddon::NonPath));
     }
 
     // ==================== 7.9 Additional compound filter conditions ====================
@@ -4044,8 +4049,8 @@ mod tests {
             None,
             now,
         );
-        // path matches (PathMatch), modified matches (NonPathMatch) -> MixMatch
-        assert_eq!(r, MatchResult::Match(MatchAddon::MixMatch));
+        // path matches (Path), modified matches (NonPath) -> Mixed
+        assert_eq!(r, MatchResult::Match(MatchAddon::Mixed));
     }
 
     #[test]
@@ -4121,7 +4126,7 @@ mod tests {
             None,
             None,
         );
-        // Blacklist PathMatch -> (true, false, false)
+        // Blacklist Path -> (true, false, false)
         assert_eq!((skip, cont, check), (true, false, false));
     }
 
@@ -4138,7 +4143,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
@@ -4153,15 +4158,15 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     // ==================== MatchAddon additional merge verification ====================
 
     #[test]
     fn test_match_addon_and_propagation_to_should_skip() {
-        // path == "a/b" and name == "*.rs" -> MixMatch
-        // In should_skip, Match(MixMatch) -> (false, is_dir, true)
+        // path == "a/b" and name == "*.rs" -> Mixed
+        // In should_skip, Match(Mixed) -> (false, is_dir, true)
         let (skip, cont, check) = skip(
             Some("path == \"a/b\" and name == \"*.rs\""),
             None,
@@ -4178,8 +4183,8 @@ mod tests {
 
     #[test]
     fn test_match_addon_path_only_propagation() {
-        // path == "src/**" only -> Match(PathMatch)
-        // In should_skip, Match(PathMatch) -> (false, is_dir, false)
+        // path == "src/**" only -> Match(Path)
+        // In should_skip, Match(Path) -> (false, is_dir, false)
         let (skip, cont, check) = skip(
             Some("path == \"src/**\""),
             None,
@@ -4207,7 +4212,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r1, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r1, MatchResult::Match(MatchAddon::Path));
 
         let r2 = eval(
             "path == \"a/*/c/*/e\"",
@@ -4233,7 +4238,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
@@ -4248,7 +4253,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         let r2 = eval(
             "path == \"src/main.rs\"",
@@ -4274,7 +4279,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r1, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r1, MatchResult::Match(MatchAddon::NonPath));
 
         let r2 = eval(
             "name == \"[abc].txt\"",
@@ -4339,7 +4344,7 @@ mod tests {
     #[test]
     fn test_blacklist_name_only_continues_scan() {
         // Blacklist with name-only condition (no path)
-        // Match(NonPathMatch) in blacklist -> skip entry, continue scan for dirs
+        // Match(NonPath) in blacklist -> skip entry, continue scan for dirs
         let (skip, cont, check) = skip(
             None,
             Some("name == \"*.tmp\""),
@@ -4366,7 +4371,7 @@ mod tests {
             None,
             None,
         );
-        // Match(NonPathMatch) for file -> skip, is_dir=false so cont=false, check=true
+        // Match(NonPath) for file -> skip, is_dir=false so cont=false, check=true
         assert_eq!((skip, cont, check), (true, false, true));
     }
 
@@ -4404,7 +4409,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         // dir1/file1.txt（文件，depth=2 > pattern_depth=1）→ 祖先 "dir1" 匹配
         let r = eval(
@@ -4416,7 +4421,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         // dir1/subdir1（目录，depth=2 > pattern_depth=1）→ 祖先 "dir1" 匹配
         let r = eval(
@@ -4430,7 +4435,7 @@ mod tests {
         );
         assert!(matches!(
             r,
-            MatchResult::Match(MatchAddon::PathMatch) | MatchResult::PartialMatch
+            MatchResult::Match(MatchAddon::Path) | MatchResult::PartialMatch
         ));
 
         // dir1/subdir1/file3.txt（文件，depth=3 > pattern_depth=1）→ 祖先 "dir1" 匹配
@@ -4443,7 +4448,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         // dir2/file5.txt 不应匹配
         let r = eval(
@@ -4484,7 +4489,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         let r = eval(
             "path == '*dir*'",
@@ -4495,7 +4500,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         let r = eval(
             "path == '*dir*'",
@@ -4506,7 +4511,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         // file8.txt 在根目录，不匹配
         let r = eval(
@@ -4536,7 +4541,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         // dir1/subdir1/file3.txt（depth=3 > pattern_depth=2）→ 祖先匹配
         let r = eval(
@@ -4548,7 +4553,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         // dir1/file1.txt（depth=2 == pattern_depth=2）但全路径不匹配
         let r = eval(
@@ -4577,7 +4582,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         let r = eval(
             "path == '*dir*/subdir*'",
@@ -4588,7 +4593,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         // dir1/file1.txt 不在 subdir 下，不应匹配
         let r = eval(
@@ -4618,7 +4623,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         // dir1/subdir1/file3.txt（depth=3）→ 祖先 "dir1/subdir1" 匹配 "**/subdir*"
         let r = eval(
@@ -4630,7 +4635,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         // dir2/subdir2/file6.txt → 祖先 "dir2/subdir2" 匹配
         let r = eval(
@@ -4642,7 +4647,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         // dir1/file1.txt → 无祖先匹配 "**/subdir*"
         let r = eval(
@@ -4672,7 +4677,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         // 不匹配的日期 20251119（月份不在 [123456] 范围内）
         let deep_path2 = "JA12833_AB/HZ/A3/SMT-AVI-0026/20251119/NG/C47533669B31ND4AD/file.jpg";
@@ -4703,7 +4708,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
 
         // JA12831_AB 开头的不应匹配
         let deep_path2 = "JA12831_AB/HZ/A3/SMT-AVI-0026/20250119/NG/C47533669B31ND4AD/file.jpg";
@@ -4816,7 +4821,7 @@ mod tests {
 
     #[test]
     fn test_dir_date_match_le() {
-        // dir_date <= 240301, dir named "20240101" → Match(PathMatch)
+        // dir_date <= 240301, dir named "20240101" → Match(Path)
         let r = eval(
             "dir_date <= 240301",
             Some("20240101"),
@@ -4826,7 +4831,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
@@ -4846,7 +4851,7 @@ mod tests {
 
     #[test]
     fn test_dir_date_no_date_dir() {
-        // dir_date <= 240301, dir named "nodate" → Match(NonPathMatch)
+        // dir_date <= 240301, dir named "nodate" → Match(NonPath)
         let r = eval(
             "dir_date <= 240301",
             Some("nodate"),
@@ -4856,12 +4861,12 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
     fn test_dir_date_file_transparent() {
-        // dir_date <= 240301 on a file → Match(NonPathMatch)
+        // dir_date <= 240301 on a file → Match(NonPath)
         let r = eval(
             "dir_date <= 240301",
             Some("test.txt"),
@@ -4871,12 +4876,12 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::NonPathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::NonPath));
     }
 
     #[test]
     fn test_dir_date_eq_day_granularity() {
-        // dir_date == "2024-03-01", dir named "20240301" → Match(PathMatch)
+        // dir_date == "2024-03-01", dir named "20240301" → Match(Path)
         let r = eval(
             "dir_date == \"2024-03-01\"",
             Some("20240301"),
@@ -4886,12 +4891,12 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
     fn test_dir_date_gt() {
-        // dir_date > 20240101, dir named "20240301" → Match(PathMatch)
+        // dir_date > 20240101, dir named "20240301" → Match(Path)
         let r = eval(
             "dir_date > 20240101",
             Some("20240301"),
@@ -4901,7 +4906,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
@@ -4921,7 +4926,7 @@ mod tests {
 
     #[test]
     fn test_dir_date_ne_different_date() {
-        // dir_date != "2024-03-01", dir named "20240501" → Match(PathMatch)
+        // dir_date != "2024-03-01", dir named "20240501" → Match(Path)
         let r = eval(
             "dir_date != \"2024-03-01\"",
             Some("20240501"),
@@ -4931,7 +4936,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
@@ -4946,7 +4951,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     #[test]
@@ -4961,7 +4966,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(r, MatchResult::Match(MatchAddon::PathMatch));
+        assert_eq!(r, MatchResult::Match(MatchAddon::Path));
     }
 
     // --- should_skip integration tests for dir_date ---

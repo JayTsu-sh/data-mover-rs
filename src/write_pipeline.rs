@@ -148,9 +148,9 @@ pub(crate) async fn write_pipeline_core<S: ChunkSink>(
         let DataChunk { offset, data } = chunk;
 
         let pieces: Vec<(u64, Bytes)> = match sub_chunk_size {
-            #[allow(clippy::cast_possible_truncation)]
             Some(n) if data.len() as u64 > n => {
-                let n = n as usize;
+                let n = usize::try_from(n)
+                    .unwrap_or_else(|_| unreachable!("n is smaller than data.len()"));
                 let total = data.len();
                 let mut v = Vec::with_capacity(total.div_ceil(n));
                 let mut idx = 0usize;

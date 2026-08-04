@@ -49,6 +49,20 @@ struct CifsWalkRuntime<'a> {
     package_depth: usize,
 }
 
+struct SmbEntryInfo {
+    name: String,
+    relative_path: PathBuf,
+    extension: Option<String>,
+    size: u64,
+    last_write_time: FileTime,
+    last_access_time: FileTime,
+    creation_time: FileTime,
+    is_dir: bool,
+    is_symlink: bool,
+    is_readonly: bool,
+    file_id: Option<u128>,
+}
+
 /// 将 SMB `FileTime` (100ns since 1601-01-01) 转换为纳秒时间戳 (ns since Unix epoch)
 fn filetime_to_nanos(ft: FileTime) -> i64 {
     // FileTime Deref<Target=u64>，值是 100ns 间隔数
@@ -92,20 +106,20 @@ impl NASEntry {
     /// `file_id` 在能拿到稳定 128-bit 文件 ID 时填入（NTFS `IndexNumber` 占低 64 位、
     /// `ReFS` 完整 128 位、Samba inode 占低 64 位）；拿不到（如 FAT 后端返回 0）时传 None，
     /// 会落到 Path 模式。
-    #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
-    pub(crate) fn from_smb_info(
-        name: String,
-        relative_path: PathBuf,
-        extension: Option<String>,
-        size: u64,
-        last_write_time: FileTime,
-        last_access_time: FileTime,
-        creation_time: FileTime,
-        is_dir: bool,
-        is_symlink: bool,
-        is_readonly: bool,
-        file_id: Option<u128>,
-    ) -> Self {
+    fn from_smb_info(info: SmbEntryInfo) -> Self {
+        let SmbEntryInfo {
+            name,
+            relative_path,
+            extension,
+            size,
+            last_write_time,
+            last_access_time,
+            creation_time,
+            is_dir,
+            is_symlink,
+            is_readonly,
+            file_id,
+        } = info;
         Self {
             name,
             relative_path,
@@ -1037,8 +1051,9 @@ impl CifsStorage {
                 }
                 let want = std::cmp::min(chunk_size, size - issue_offset);
                 // `want ≤ chunk_size ≤ u32::MAX`（函数入口已断言）→ cast 无截断风险。
-                #[allow(clippy::cast_possible_truncation)]
-                let read_len = want as u32;
+                let read_len = u32::try_from(want).unwrap_or_else(|_| {
+                    unreachable!("SMB read size is validated against u32::MAX")
+                });
                 let fut = Box::pin(file.read_block_bytes(read_len, issue_offset, None, false));
                 inflight.push_back(fut);
                 issue_offset += want;
@@ -1318,8 +1333,9 @@ impl CifsStorage {
                         qos.acquire(chunk_size).await;
                     }
                     let want = std::cmp::min(chunk_size, end - issue_offset);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let read_len = want as u32;
+                    let read_len = u32::try_from(want).unwrap_or_else(|_| {
+                        unreachable!("SMB read size is validated against u32::MAX")
+                    });
                     let off = issue_offset;
                     let file_ref: &smb::File = &file;
                     inflight.push_back(Box::pin(async move {
@@ -1371,9 +1387,12 @@ impl CifsStorage {
         _uid: Option<u32>,
         _gid: Option<u32>,
         _mode: Option<u32>,
-        bytes_counter: Option<Arc<AtomicU64>>,
-        on_committed: crate::CommitCallback,
+        progress: crate::storage_enum::WriteProgress,
     ) -> Result<()> {
+        let crate::storage_enum::WriteProgress {
+            bytes_counter,
+            on_committed,
+        } = progress;
         const FLUSH_BARRIER: usize = 16;
 
         if let Some(parent) = part_path.parent()
@@ -2233,19 +2252,19 @@ impl CifsStorage {
             }
 
             // 构建 NASEntry
-            let storage_entry = EntryEnum::NAS(NASEntry::from_smb_info(
-                file_name_str.clone(),
-                PathBuf::from(&relative_path),
-                extension.clone(),
-                entry.end_of_file,
-                entry.last_write_time,
-                entry.last_access_time,
-                entry.creation_time,
+            let storage_entry = EntryEnum::NAS(NASEntry::from_smb_info(SmbEntryInfo {
+                name: file_name_str.clone(),
+                relative_path: PathBuf::from(&relative_path),
+                extension: extension.clone(),
+                size: entry.end_of_file,
+                last_write_time: entry.last_write_time,
+                last_access_time: entry.last_access_time,
+                creation_time: entry.creation_time,
                 is_dir,
                 is_symlink,
                 is_readonly,
-                Some(entry.file_id),
-            ));
+                file_id: Some(entry.file_id),
+            }));
 
             // packaged 模式
             if !send_packaged
@@ -2613,19 +2632,19 @@ impl CifsStorage {
                     && continue_scan
                     && (ctx.max_depth == 0 || ctx.current_depth + 1 < ctx.max_depth)
                 {
-                    let nas = NASEntry::from_smb_info(
-                        file_name_str,
-                        PathBuf::from(relative_path),
+                    let nas = NASEntry::from_smb_info(SmbEntryInfo {
+                        name: file_name_str,
+                        relative_path: PathBuf::from(relative_path),
                         extension,
-                        entry.end_of_file,
-                        entry.last_write_time,
-                        entry.last_access_time,
-                        entry.creation_time,
-                        true,
+                        size: entry.end_of_file,
+                        last_write_time: entry.last_write_time,
+                        last_access_time: entry.last_access_time,
+                        creation_time: entry.creation_time,
+                        is_dir: true,
                         is_symlink,
                         is_readonly,
-                        Some(entry.file_id),
-                    );
+                        file_id: Some(entry.file_id),
+                    });
                     subdirs.push(SubdirEntry {
                         entry: Arc::new(EntryEnum::NAS(nas)),
                         visible: false,
@@ -2635,19 +2654,19 @@ impl CifsStorage {
                 continue;
             }
 
-            let nas = NASEntry::from_smb_info(
-                file_name_str,
-                PathBuf::from(relative_path),
+            let nas = NASEntry::from_smb_info(SmbEntryInfo {
+                name: file_name_str,
+                relative_path: PathBuf::from(relative_path),
                 extension,
-                entry.end_of_file,
-                entry.last_write_time,
-                entry.last_access_time,
-                entry.creation_time,
+                size: entry.end_of_file,
+                last_write_time: entry.last_write_time,
+                last_access_time: entry.last_access_time,
+                creation_time: entry.creation_time,
                 is_dir,
                 is_symlink,
                 is_readonly,
-                Some(entry.file_id),
-            );
+                file_id: Some(entry.file_id),
+            });
             let entry_enum = Arc::new(EntryEnum::NAS(nas));
 
             if is_dir && ctx.max_depth > 0 && ctx.current_depth + 1 >= ctx.max_depth {
@@ -2862,19 +2881,19 @@ fn build_nas_entry(
         .and_then(|ext| ext.to_str())
         .map(std::string::ToString::to_string);
 
-    EntryEnum::NAS(NASEntry::from_smb_info(
-        filename,
-        relative_path.to_path_buf(),
+    EntryEnum::NAS(NASEntry::from_smb_info(SmbEntryInfo {
+        name: filename,
+        relative_path: relative_path.to_path_buf(),
         extension,
-        standard.end_of_file,
-        basic.last_write_time,
-        basic.last_access_time,
-        basic.creation_time,
+        size: standard.end_of_file,
+        last_write_time: basic.last_write_time,
+        last_access_time: basic.last_access_time,
+        creation_time: basic.creation_time,
         is_dir,
-        basic.file_attributes.reparse_point(),
-        basic.file_attributes.readonly(),
+        is_symlink: basic.file_attributes.reparse_point(),
+        is_readonly: basic.file_attributes.readonly(),
         file_id,
-    ))
+    }))
 }
 
 /// 异步关闭一个 `Resource`，吞掉 close 错误（句柄反正即将被丢弃）。

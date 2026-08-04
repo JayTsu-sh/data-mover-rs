@@ -60,14 +60,26 @@ pub struct TarPackOptions {
     pub bytes_counter: Option<Arc<AtomicU64>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct WriteProgress {
+    pub bytes_counter: Option<Arc<AtomicU64>>,
+    pub on_committed: CommitCallback,
+}
+
 // Takes ownership so it can be passed directly to Result::map_err.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "owned callback can be passed directly to Result::map_err"
+)]
 fn source_read_error(error: StorageError) -> StorageError {
     StorageError::ReadError(format!("Source read failed: {error}"))
 }
 
 // Takes ownership so it can be passed directly to Result::map_err.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "owned callback can be passed directly to Result::map_err"
+)]
 fn destination_write_error(error: StorageError) -> StorageError {
     StorageError::WriteError(format!("Destination write failed: {error}"))
 }
@@ -1112,8 +1124,10 @@ impl StorageEnum {
                         entry.get_size(),
                         *part_size,
                         upload_id,
-                        bytes_counter,
-                        on_committed,
+                        WriteProgress {
+                            bytes_counter,
+                            on_committed,
+                        },
                     )
                     .await
             }
@@ -1125,8 +1139,10 @@ impl StorageEnum {
                         e.uid,
                         e.gid,
                         Some(e.mode),
-                        bytes_counter,
-                        on_committed,
+                        WriteProgress {
+                            bytes_counter,
+                            on_committed,
+                        },
                     )
                     .await
                 }
@@ -1137,8 +1153,10 @@ impl StorageEnum {
                         None,
                         None,
                         None,
-                        bytes_counter,
-                        on_committed,
+                        WriteProgress {
+                            bytes_counter,
+                            on_committed,
+                        },
                     )
                     .await
                 }
@@ -1149,8 +1167,10 @@ impl StorageEnum {
                         e.uid,
                         e.gid,
                         Some(e.mode),
-                        bytes_counter,
-                        on_committed,
+                        WriteProgress {
+                            bytes_counter,
+                            on_committed,
+                        },
                     )
                     .await
                 }
@@ -1161,8 +1181,10 @@ impl StorageEnum {
                         None,
                         None,
                         None,
-                        bytes_counter,
-                        on_committed,
+                        WriteProgress {
+                            bytes_counter,
+                            on_committed,
+                        },
                     )
                     .await
                 }
@@ -1173,8 +1195,10 @@ impl StorageEnum {
                         e.uid,
                         e.gid,
                         Some(e.mode),
-                        bytes_counter,
-                        on_committed,
+                        WriteProgress {
+                            bytes_counter,
+                            on_committed,
+                        },
                     )
                     .await
                 }
@@ -1185,8 +1209,10 @@ impl StorageEnum {
                         None,
                         None,
                         None,
-                        bytes_counter,
-                        on_committed,
+                        WriteProgress {
+                            bytes_counter,
+                            on_committed,
+                        },
                     )
                     .await
                 }

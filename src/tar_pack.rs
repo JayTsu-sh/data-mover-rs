@@ -22,17 +22,28 @@ use crate::EntryEnum;
 /// - 257..263: "ustar\0"
 /// - 263..265: "00"
 /// - 265..512: 填零
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_ustar_header(
-    path: &str,
+struct UstarHeader<'a> {
+    path: &'a str,
     size: u64,
     mtime: i64,
     mode: u32,
     uid: u32,
     gid: u32,
     type_flag: u8,
-    link_name: &str,
-) -> [u8; 512] {
+    link_name: &'a str,
+}
+
+fn build_ustar_header(metadata: UstarHeader<'_>) -> [u8; 512] {
+    let UstarHeader {
+        path,
+        size,
+        mtime,
+        mode,
+        uid,
+        gid,
+        type_flag,
+        link_name,
+    } = metadata;
     let mut header = [0u8; 512];
 
     // name (0..100)
@@ -144,16 +155,16 @@ pub(crate) fn build_header_for_entry(
         tar_internal_path.to_string()
     };
 
-    let header = build_ustar_header(
-        &path,
+    let header = build_ustar_header(UstarHeader {
+        path: &path,
         size,
-        entry.get_mtime(),
-        entry.get_mode().unwrap_or(0),
-        entry.get_uid().unwrap_or(0),
-        entry.get_gid().unwrap_or(0),
+        mtime: entry.get_mtime(),
+        mode: entry.get_mode().unwrap_or(0),
+        uid: entry.get_uid().unwrap_or(0),
+        gid: entry.get_gid().unwrap_or(0),
         type_flag,
-        link_target,
-    );
+        link_name: link_target,
+    });
 
     Bytes::copy_from_slice(&header)
 }
@@ -183,16 +194,16 @@ mod tests {
 
     #[test]
     fn test_build_ustar_header_basic() {
-        let header = build_ustar_header(
-            "test.txt",
-            1024,
-            1_700_000_000_000_000_000,
-            0o644,
-            1000,
-            1000,
-            b'0',
-            "",
-        );
+        let header = build_ustar_header(UstarHeader {
+            path: "test.txt",
+            size: 1024,
+            mtime: 1_700_000_000_000_000_000,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            type_flag: b'0',
+            link_name: "",
+        });
 
         // magic
         assert_eq!(&header[257..263], b"ustar\0");
@@ -209,16 +220,16 @@ mod tests {
 
     #[test]
     fn test_build_ustar_header_directory() {
-        let header = build_ustar_header(
-            "mydir/",
-            0,
-            1_700_000_000_000_000_000,
-            0o755,
-            0,
-            0,
-            b'5',
-            "",
-        );
+        let header = build_ustar_header(UstarHeader {
+            path: "mydir/",
+            size: 0,
+            mtime: 1_700_000_000_000_000_000,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            type_flag: b'5',
+            link_name: "",
+        });
         assert_eq!(header[156], b'5');
         // size should be zero for directories
         // size field (124..136): "00000000000\0"
@@ -236,16 +247,16 @@ mod tests {
 
     #[test]
     fn test_checksum_correctness() {
-        let header = build_ustar_header(
-            "hello.txt",
-            5,
-            1_000_000_000_000_000_000,
-            0o644,
-            0,
-            0,
-            b'0',
-            "",
-        );
+        let header = build_ustar_header(UstarHeader {
+            path: "hello.txt",
+            size: 5,
+            mtime: 1_000_000_000_000_000_000,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            type_flag: b'0',
+            link_name: "",
+        });
 
         // 验证 checksum：将 checksum 字段视为空格，求所有字节的和
         let mut check_header = header;

@@ -561,7 +561,10 @@ impl NFSStorage {
     /// # 返回值
     /// - `Ok((nfs_url, root_dir))`：解析成功，返回标准 NFS URL 和根目录路径
     /// - `Err(StorageError)`：解析失败，返回错误信息
-    #[allow(clippy::similar_names)]
+    #[expect(
+        clippy::similar_names,
+        reason = "parsed URL and raw path components are distinct protocol concepts"
+    )]
     fn parse_nfs_url(url: &str) -> Result<(String, String)> {
         let parsed_url = url.strip_prefix("nfs://").ok_or_else(|| {
             let msg = format!("Invalid NFS URL format: {url}");
@@ -1919,7 +1922,10 @@ impl NFSStorage {
             .await
     }
 
-    #[allow(clippy::similar_names)]
+    #[expect(
+        clippy::similar_names,
+        reason = "NFS atime and mtime names mirror protocol fields"
+    )]
     pub(crate) async fn set_metadata(
         &self,
         file: &NFSFileHandle,
@@ -2818,8 +2824,8 @@ impl NFSStorage {
                 }
                 let want_u64 = std::cmp::min(chunk_size, size - issue_offset);
                 // chunk_size ≤ effective block_size ≤ 1MB，cast 无截断
-                #[allow(clippy::cast_possible_truncation)]
-                let want = want_u64 as u32;
+                let want = u32::try_from(want_u64)
+                    .unwrap_or_else(|_| unreachable!("NFS read size is capped below u32::MAX"));
                 let offset = issue_offset;
                 let mount = self.mount.clone();
                 let fh = handler.inner.fh.clone();
@@ -2918,8 +2924,9 @@ impl NFSStorage {
                     break true;
                 }
                 // partial 短读（罕见，server 资源压力）：串行补读剩余部分。
-                #[allow(clippy::cast_possible_truncation)]
-                let remaining = (chunk_end - chunk_off) as u32;
+                let remaining = u32::try_from(chunk_end - chunk_off).unwrap_or_else(|_| {
+                    unreachable!("NFS chunk remainder is capped below u32::MAX")
+                });
                 match self
                     .mount
                     .read(handler.inner.fh.clone(), chunk_off, remaining)
@@ -2961,9 +2968,9 @@ impl NFSStorage {
         &self,
         rx: mpsc::Receiver<DataChunk>,
         relative_path: &Path,
-        #[allow(unused)] uid: Option<u32>,
-        #[allow(unused)] gid: Option<u32>,
-        #[allow(unused)] mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: Option<u32>,
         bytes_counter: Option<Arc<AtomicU64>>,
     ) -> Result<u64> {
         trace!("Starting write_data_task for file {:?}", relative_path);
@@ -3054,8 +3061,9 @@ impl NFSStorage {
                             qos.acquire(chunk_size).await;
                         }
                         let want_u64 = std::cmp::min(chunk_size, end - issue_offset);
-                        #[allow(clippy::cast_possible_truncation)]
-                        let want = want_u64 as u32;
+                        let want = u32::try_from(want_u64).unwrap_or_else(|_| {
+                            unreachable!("NFS read size is capped below u32::MAX")
+                        });
                         let offset = issue_offset;
                         let mount = self.mount.clone();
                         let fh = handler.inner.fh.clone();
@@ -3098,9 +3106,12 @@ impl NFSStorage {
         uid: Option<u32>,
         gid: Option<u32>,
         mode: Option<u32>,
-        bytes_counter: Option<Arc<AtomicU64>>,
-        on_committed: crate::CommitCallback,
+        progress: crate::storage_enum::WriteProgress,
     ) -> Result<()> {
+        let crate::storage_enum::WriteProgress {
+            bytes_counter,
+            on_committed,
+        } = progress;
         let path_to_use = self.calculate_relative_path(part_path);
         // create_file 不截断：保留 .part 已写字节（续传基础）
         let dest_file = self.create_file(&path_to_use, uid, gid, mode).await?;

@@ -43,7 +43,6 @@ struct LocalWalkRuntime<'a> {
 impl NASEntry {
     /// 从本地文件系统 `Metadata` 构建 `NASEntry`。
     /// Unix 与 Windows 的差异封装在此函数内部。
-    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn from_local_metadata(
         name: String,
         relative_path: PathBuf,
@@ -64,7 +63,7 @@ impl NASEntry {
 
         #[cfg(unix)]
         let (hard_links, uid, gid, ino) = (
-            Some(metadata.nlink() as u32),
+            Some(u32::try_from(metadata.nlink()).unwrap_or(u32::MAX)),
             Some(metadata.uid()),
             Some(metadata.gid()),
             Some(metadata.ino()),
@@ -196,9 +195,21 @@ impl LocalStorage {
     async fn create_file(
         &self,
         relative_path: &Path,
-        #[allow(unused)] uid: Option<u32>,
-        #[allow(unused)] gid: Option<u32>,
-        #[allow(unused)] mode: Option<u32>,
+        #[cfg_attr(
+            windows,
+            expect(unused_variables, reason = "POSIX ownership is unavailable on Windows")
+        )]
+        uid: Option<u32>,
+        #[cfg_attr(
+            windows,
+            expect(unused_variables, reason = "POSIX ownership is unavailable on Windows")
+        )]
+        gid: Option<u32>,
+        #[cfg_attr(
+            windows,
+            expect(unused_variables, reason = "POSIX mode is unavailable on Windows")
+        )]
+        mode: Option<u32>,
         truncate: bool,
     ) -> Result<LocalFileHandle> {
         let full_path = self.get_full_path(relative_path);
@@ -231,12 +242,54 @@ impl LocalStorage {
 
     pub async fn create_symlink(
         &self,
-        #[allow(unused)] relative_path: &Path,
-        #[allow(unused)] target: &Path,
-        #[allow(unused)] atime: i64,
-        #[allow(unused)] mtime: i64,
-        #[allow(unused)] uid: Option<u32>,
-        #[allow(unused)] gid: Option<u32>,
+        #[cfg_attr(
+            windows,
+            expect(
+                unused_variables,
+                reason = "symlink creation is unsupported on Windows"
+            )
+        )]
+        relative_path: &Path,
+        #[cfg_attr(
+            windows,
+            expect(
+                unused_variables,
+                reason = "symlink creation is unsupported on Windows"
+            )
+        )]
+        target: &Path,
+        #[cfg_attr(
+            windows,
+            expect(
+                unused_variables,
+                reason = "symlink creation is unsupported on Windows"
+            )
+        )]
+        atime: i64,
+        #[cfg_attr(
+            windows,
+            expect(
+                unused_variables,
+                reason = "symlink creation is unsupported on Windows"
+            )
+        )]
+        mtime: i64,
+        #[cfg_attr(
+            windows,
+            expect(
+                unused_variables,
+                reason = "symlink creation is unsupported on Windows"
+            )
+        )]
+        uid: Option<u32>,
+        #[cfg_attr(
+            windows,
+            expect(
+                unused_variables,
+                reason = "symlink creation is unsupported on Windows"
+            )
+        )]
+        gid: Option<u32>,
     ) -> Result<()> {
         #[cfg(unix)]
         {
@@ -380,9 +433,21 @@ impl LocalStorage {
         relative_path: &Path,
         atime: Option<i64>,
         mtime: Option<i64>,
-        #[allow(unused)] uid: Option<u32>,
-        #[allow(unused)] gid: Option<u32>,
-        #[allow(unused)] mode: Option<u32>,
+        #[cfg_attr(
+            windows,
+            expect(unused_variables, reason = "POSIX ownership is unavailable on Windows")
+        )]
+        uid: Option<u32>,
+        #[cfg_attr(
+            windows,
+            expect(unused_variables, reason = "POSIX ownership is unavailable on Windows")
+        )]
+        gid: Option<u32>,
+        #[cfg_attr(
+            windows,
+            expect(unused_variables, reason = "POSIX mode is unavailable on Windows")
+        )]
+        mode: Option<u32>,
     ) -> Result<()> {
         let full_path = self.get_full_path(relative_path);
 
@@ -1011,9 +1076,9 @@ impl LocalStorage {
         &self,
         rx: tokio::sync::mpsc::Receiver<DataChunk>,
         relative_path: &Path,
-        #[allow(unused)] uid: Option<u32>,
-        #[allow(unused)] gid: Option<u32>,
-        #[allow(unused)] mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: Option<u32>,
         bytes_counter: Option<Arc<AtomicU64>>,
     ) -> Result<u64> {
         trace!("Starting write_data_task for file {:?}", relative_path);
@@ -1086,9 +1151,12 @@ impl LocalStorage {
         uid: Option<u32>,
         gid: Option<u32>,
         mode: Option<u32>,
-        bytes_counter: Option<Arc<AtomicU64>>,
-        on_committed: crate::CommitCallback,
+        progress: crate::storage_enum::WriteProgress,
     ) -> Result<()> {
+        let crate::storage_enum::WriteProgress {
+            bytes_counter,
+            on_committed,
+        } = progress;
         const SYNC_BARRIER: usize = 16;
         // truncate=false：保留 .part 中已写字节（续传基础）
         let dest_file = self.create_file(part_path, uid, gid, mode, false).await?;
