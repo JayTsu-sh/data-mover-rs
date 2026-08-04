@@ -41,9 +41,17 @@ async fn full_copy_no_tail_loss_under_repetition() {
         let dst = create_storage(dst_dir, Some(BLOCK), true).await.unwrap();
         let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
 
-        StorageEnum::copy_file(&src, &dst, &entry, None, false, true, None)
-            .await
-            .unwrap();
+        StorageEnum::copy_file(
+            &src,
+            &dst,
+            &entry,
+            data_mover::CopyOptions {
+                is_source_reserved: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         let got = tokio::fs::read(format!("{dst_dir}/blob.bin"))
             .await

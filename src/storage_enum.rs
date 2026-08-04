@@ -45,6 +45,21 @@ impl Default for WalkOptions {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct CopyOptions {
+    pub qos: Option<QosManager>,
+    pub enable_integrity_check: bool,
+    pub is_source_reserved: bool,
+    pub bytes_counter: Option<Arc<AtomicU64>>,
+    pub cancel: Option<CancellationToken>,
+}
+
+#[derive(Clone, Default)]
+pub struct TarPackOptions {
+    pub qos: Option<QosManager>,
+    pub bytes_counter: Option<Arc<AtomicU64>>,
+}
+
 // Takes ownership so it can be passed directly to Result::map_err.
 #[allow(clippy::needless_pass_by_value)]
 fn source_read_error(error: StorageError) -> StorageError {
@@ -331,66 +346,14 @@ impl StorageEnum {
         sub_path: Option<&Path>,
         options: WalkOptions,
     ) -> Result<WalkDirAsyncIterator> {
-        let WalkOptions {
-            depth,
-            match_expressions,
-            exclude_expressions,
-            concurrency,
-            include_tags,
-            packaged,
-            package_depth,
-        } = options;
         match self {
-            StorageEnum::Local(s) => {
-                s.walkdir(
-                    sub_path,
-                    depth,
-                    match_expressions,
-                    exclude_expressions,
-                    concurrency,
-                    packaged,
-                    package_depth,
-                )
-                .await
-            }
-            StorageEnum::NFS(s) => {
-                s.walkdir(
-                    sub_path,
-                    depth,
-                    match_expressions,
-                    exclude_expressions,
-                    concurrency,
-                    packaged,
-                    package_depth,
-                )
-                .await
-            }
+            StorageEnum::Local(s) => s.walkdir(sub_path, options).await,
+            StorageEnum::NFS(s) => s.walkdir(sub_path, options).await,
             StorageEnum::S3(s) => {
                 let key = sub_path.map(|p| path_to_s3_key(p));
-                s.walkdir(
-                    key.as_deref(),
-                    depth,
-                    match_expressions,
-                    exclude_expressions,
-                    concurrency,
-                    include_tags,
-                    packaged,
-                    package_depth,
-                )
-                .await
+                s.walkdir(key.as_deref(), options).await
             }
-            StorageEnum::CIFS(s) => {
-                s.walkdir(
-                    sub_path,
-                    depth,
-                    match_expressions,
-                    exclude_expressions,
-                    concurrency,
-                    packaged,
-                    package_depth,
-                )
-                .await
-            }
+            StorageEnum::CIFS(s) => s.walkdir(sub_path, options).await,
         }
     }
 
@@ -704,49 +667,16 @@ impl StorageEnum {
         from: &StorageEnum,
         to: &StorageEnum,
         entry: &EntryEnum,
-        qos: Option<QosManager>,
-        enable_integrity_check: bool,
-        is_source_reserved: bool,
-        bytes_counter: Option<Arc<AtomicU64>>,
+        options: CopyOptions,
     ) -> Result<()> {
-        // Backwards-compatible wrapper: no cancellation.
-        Self::copy_file_with_cancel(
-            from,
-            to,
-            entry,
+        let CopyOptions {
             qos,
             enable_integrity_check,
             is_source_reserved,
             bytes_counter,
-            None,
-        )
-        .await
-    }
-
-    /// 与 [`copy_file`] 相同，但额外接受一个 [`CancellationToken`]：
-    /// - 当 token 在 chunk 边界被触发时，正在跑的 read/write 任务会被 abort，
-    ///   函数立即返回 [`StorageError::Cancelled`]。
-    /// - 已经写出的部分目标对象 **不会** 被回滚——调用方需要自己 `delete_file`
-    ///   清理（HSM copytool 通常通过 `llapi_hsm_action_end(rc=ECANCELED)` +
-    ///   后续 cleanup action 处理）。
-    /// - `cancel = None` 时行为与 [`copy_file`] 完全一致。
-    ///
-    /// 取消粒度：
-    /// - 单块路径（文件 ≤ block_size）：在 read 之前检查一次。已发起的 IO
-    ///   不会被打断。
-    /// - 多块管道：read_data / write_data 在独立 task 中运行，token 触发时通过
-    ///   `AbortHandle` 强制结束。chunk 边界响应延迟 ≤ 一个 chunk 的 IO 时间。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn copy_file_with_cancel(
-        from: &StorageEnum,
-        to: &StorageEnum,
-        entry: &EntryEnum,
-        qos: Option<QosManager>,
-        enable_integrity_check: bool,
-        is_source_reserved: bool,
-        bytes_counter: Option<Arc<AtomicU64>>,
-        cancel: Option<CancellationToken>,
-    ) -> Result<()> {
+            cancel,
+        } = options;
+        // cancel 在 chunk 边界触发时会终止读写 task；已经写出的目标数据不回滚。
         // Top-of-function cancel check: avoids issuing any IO if already cancelled.
         if let Some(ref token) = cancel
             && token.is_cancelled()
@@ -1403,25 +1333,21 @@ impl StorageEnum {
         from: &StorageEnum,
         to: &StorageEnum,
         entry: &EntryEnum,
-        qos: Option<QosManager>,
-        enable_integrity_check: bool,
-        is_source_reserved: bool,
-        bytes_counter: Option<Arc<AtomicU64>>,
+        options: CopyOptions,
         resume: ResumeContext,
     ) -> Result<()> {
         if matches!(to, StorageEnum::S3(_)) {
-            return Self::copy_file_resumable_to_s3(
-                from,
-                to,
-                entry,
-                qos,
-                enable_integrity_check,
-                is_source_reserved,
-                bytes_counter,
-                resume.on_committed,
-            )
-            .await;
+            return Self::copy_file_resumable_to_s3(from, to, entry, options, resume.on_committed)
+                .await;
         }
+
+        let CopyOptions {
+            qos,
+            enable_integrity_check,
+            is_source_reserved,
+            bytes_counter,
+            cancel: _,
+        } = options;
 
         let size = entry.get_size();
         let ResumeContext {
@@ -1501,17 +1427,20 @@ impl StorageEnum {
     /// in-progress multipart 的 parts 在 Complete 前不能作为一个连续对象读取，
     /// 这是对象存储的固有限制，维持现状顺序（区别于 NAS 分支的「先 hash 后
     /// commit」）。
-    #[allow(clippy::too_many_arguments)]
     async fn copy_file_resumable_to_s3(
         from: &StorageEnum,
         to: &StorageEnum,
         entry: &EntryEnum,
-        qos: Option<QosManager>,
-        enable_integrity_check: bool,
-        is_source_reserved: bool,
-        bytes_counter: Option<Arc<AtomicU64>>,
+        options: CopyOptions,
         on_committed: crate::CommitCallback,
     ) -> Result<()> {
+        let CopyOptions {
+            qos,
+            enable_integrity_check,
+            is_source_reserved,
+            bytes_counter,
+            cancel: _,
+        } = options;
         if !matches!(to, StorageEnum::S3(_)) {
             return Err(StorageError::OperationError(
                 "copy_file_resumable_to_s3 requires an S3 destination".to_string(),
@@ -1615,7 +1544,6 @@ impl StorageEnum {
     /// - `tar_mtime`: tar 文件的 mtime（通常取源端目录的 mtime）
     /// - `qos`: 可选的 `QoS` 限速管理器
     /// - `bytes_counter`: 可选的字节计数器
-    #[allow(clippy::too_many_arguments)]
     pub async fn pack_files_to_tar(
         from: &StorageEnum,
         to: &StorageEnum,
@@ -1623,9 +1551,9 @@ impl StorageEnum {
         tar_path: &Path,
         tar_size: u64,
         tar_mtime: i64,
-        qos: Option<QosManager>,
-        bytes_counter: Option<Arc<AtomicU64>>,
+        options: TarPackOptions,
     ) -> Result<()> {
+        let TarPackOptions { qos, bytes_counter } = options;
         // 从 tar_path 推导出被打包目录的路径（去掉 .tar 扩展名）
         let base_path = tar_path.with_extension("");
         let (tx, rx) = mpsc::channel::<DataChunk>(TAR_PIPELINE_CAPACITY);
@@ -2311,9 +2239,18 @@ mod tests {
         let entry = Box::pin(source.get_metadata(Path::new("fixture.bin")))
             .await
             .unwrap();
-        StorageEnum::copy_file(&source, &destination, &entry, None, true, true, None)
-            .await
-            .unwrap();
+        StorageEnum::copy_file(
+            &source,
+            &destination,
+            &entry,
+            CopyOptions {
+                enable_integrity_check: true,
+                is_source_reserved: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         let copied = Box::pin(destination.get_metadata(Path::new("fixture.bin")))
             .await

@@ -154,10 +154,11 @@ async fn main() -> Result<()> {
             &src_storage,
             &dst_storage,
             entry,
-            None,  // 不限速
-            false, // 不校验完整性
-            true,  // 保留源文件
-            Some(bytes_counter.clone()),
+            data_mover::CopyOptions {
+                is_source_reserved: true,
+                bytes_counter: Some(bytes_counter.clone()),
+                ..Default::default()
+            },
         )
         .await
         {

@@ -311,9 +311,18 @@ async fn t5_hash_mismatch_blocks_commit_and_preserves_partial() {
         on_committed: cb,
     };
 
-    let res =
-        StorageEnum::copy_file_resumable(&shape, &dst, &entry, None, true, true, None, resume)
-            .await;
+    let res = StorageEnum::copy_file_resumable(
+        &shape,
+        &dst,
+        &entry,
+        data_mover::CopyOptions {
+            enable_integrity_check: true,
+            is_source_reserved: true,
+            ..Default::default()
+        },
+        resume,
+    )
+    .await;
     assert!(
         matches!(res, Err(StorageError::OperationError(_))),
         "hash mismatch must surface as an error, got {res:?}"

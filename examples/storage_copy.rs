@@ -26,7 +26,17 @@ async fn main() -> Result<()> {
     let destination = create_storage(&args.destination, None, true).await?;
     let entry = source.get_metadata(Path::new(&args.path)).await?;
 
-    StorageEnum::copy_file(&source, &destination, &entry, None, true, true, None).await?;
+    StorageEnum::copy_file(
+        &source,
+        &destination,
+        &entry,
+        data_mover::CopyOptions {
+            enable_integrity_check: true,
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await?;
 
     let copied = destination.get_metadata(Path::new(&args.path)).await?;
     if copied.get_size() != entry.get_size() {

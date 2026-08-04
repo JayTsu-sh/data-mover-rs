@@ -63,10 +63,11 @@ async fn resumable_fresh_full_copy() {
         &src,
         &dst,
         &entry,
-        None,
-        false,
-        true,
-        Some(counter.clone()),
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            bytes_counter: Some(counter.clone()),
+            ..Default::default()
+        },
         resume,
     )
     .await
@@ -126,10 +127,11 @@ async fn resumable_continues_from_partial_part() {
         &src,
         &dst,
         &entry,
-        None,
-        false,
-        true,
-        Some(counter.clone()),
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            bytes_counter: Some(counter.clone()),
+            ..Default::default()
+        },
         resume,
     )
     .await
@@ -173,9 +175,18 @@ async fn resumable_truncates_leftover_tail() {
         on_committed: cb,
     };
 
-    StorageEnum::copy_file_resumable(&src, &dst, &entry, None, false, true, None, resume)
-        .await
-        .expect("resumable truncate copy");
+    StorageEnum::copy_file_resumable(
+        &src,
+        &dst,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+        resume,
+    )
+    .await
+    .expect("resumable truncate copy");
 
     let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
         .await

@@ -64,9 +64,18 @@ async fn assert_truncated_copy_guarded(
     // 注入：entry 已带原 size，此时截断源文件（模拟扫描后源被并发变更）
     truncate_file(&format!("{src_dir}/blob.bin"), truncated);
 
-    let err = StorageEnum::copy_file(&src, &dst, &entry, None, enable_integrity_check, true, None)
-        .await
-        .expect_err("truncated source must fail the copy");
+    let err = StorageEnum::copy_file(
+        &src,
+        &dst,
+        &entry,
+        data_mover::CopyOptions {
+            enable_integrity_check,
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("truncated source must fail the copy");
     assert!(
         err.to_string().contains("size check failed"),
         "unexpected error: {err}"
@@ -143,9 +152,18 @@ async fn intact_copy_still_succeeds() {
             .await
             .unwrap();
 
-        StorageEnum::copy_file(&src, &dst, &entry, None, true, true, None)
-            .await
-            .expect("intact copy must succeed");
+        StorageEnum::copy_file(
+            &src,
+            &dst,
+            &entry,
+            data_mover::CopyOptions {
+                enable_integrity_check: true,
+                is_source_reserved: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("intact copy must succeed");
         let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
             .await
             .unwrap();

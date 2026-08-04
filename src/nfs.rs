@@ -32,6 +32,19 @@ use crate::{
     StorageEntryMessage, WalkDirAsyncIterator,
 };
 
+type NfsWalkTask = (String, Bytes, usize, bool, Option<usize>);
+
+struct NfsWalkRuntime<'a> {
+    tx: &'a async_channel::Sender<StorageEntryMessage>,
+    scheduler: &'a crate::walk_scheduler::WorkerContext<NfsWalkTask>,
+    match_expr: &'a Arc<Option<FilterExpression>>,
+    exclude_expr: &'a Arc<Option<FilterExpression>>,
+    max_depth: usize,
+    total_file_count: &'a Arc<AtomicUsize>,
+    packaged: bool,
+    package_depth: usize,
+}
+
 /// 将 `nfs_rs::Time` 转换为纳秒时间戳
 fn time_to_i64(time: Time) -> i64 {
     crate::time_util::combine_secs_nanos(i64::from(time.seconds), time.nseconds)
@@ -1484,7 +1497,13 @@ impl NFSStorage {
         tokio::spawn(async move {
             // 1. 复用现有 walkdir 并行遍历（支持子目录）
             let walkdir_result = match storage
-                .walkdir(sub_path.as_deref(), None, None, None, concurrency, false, 0)
+                .walkdir(
+                    sub_path.as_deref(),
+                    crate::WalkOptions {
+                        concurrency,
+                        ..Default::default()
+                    },
+                )
                 .await
             {
                 Ok(iter) => iter,
@@ -2063,16 +2082,10 @@ impl NFSStorage {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn walkdir(
         &self,
         sub_path: Option<&Path>,
-        depth: Option<usize>,
-        match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>,
-        concurrency: usize,
-        packaged: bool,
-        package_depth: usize,
+        options: crate::WalkOptions,
     ) -> Result<WalkDirAsyncIterator> {
         // 解析起始目录：sub_path 为 None 时从根开始，否则从子目录开始
         let (start_fh, start_root) = match sub_path {
@@ -2092,8 +2105,6 @@ impl NFSStorage {
         // 创建全局文件计数器
         let total_file_count = Arc::new(AtomicUsize::new(0));
 
-        let max_depth = depth.unwrap_or(0);
-
         let total_file_count_clone = total_file_count.clone();
 
         let storage = self.clone();
@@ -2108,13 +2119,8 @@ impl NFSStorage {
                     &start_root,
                     start_fh,
                     tx_clone.clone(),
-                    max_depth,
-                    match_expressions.as_ref(),
-                    exclude_expressions.as_ref(),
-                    concurrency,
+                    options,
                     total_file_count_clone,
-                    packaged,
-                    package_depth,
                 )
                 .await
             {
@@ -2134,27 +2140,31 @@ impl NFSStorage {
     }
 
     /// 迭代式目录遍历函数，使用工作窃取队列实现高效并发
-    #[allow(clippy::too_many_arguments)]
     async fn iterative_walkdir(
         &self,
         root_path: &str,
         root_fh: Bytes,
         tx: async_channel::Sender<StorageEntryMessage>,
-        max_depth: usize,
-        match_expressions: Option<&FilterExpression>,
-        exclude_expressions: Option<&FilterExpression>,
-        concurrency: usize,
+        options: crate::WalkOptions,
         total_file_count: Arc<AtomicUsize>,
-        packaged: bool,
-        package_depth: usize,
     ) -> Result<()> {
+        let crate::WalkOptions {
+            depth,
+            match_expressions,
+            exclude_expressions,
+            concurrency,
+            packaged,
+            package_depth,
+            ..
+        } = options;
+        let max_depth = depth.unwrap_or(0);
         let contexts = create_worker_contexts(
             concurrency,
             (root_path.to_string(), root_fh, 0usize, true, None::<usize>),
         )
         .await;
-        let match_expr = Arc::new(match_expressions.cloned());
-        let exclude_expr = Arc::new(exclude_expressions.cloned());
+        let match_expr = Arc::new(match_expressions);
+        let exclude_expr = Arc::new(exclude_expressions);
 
         info!("Creating {} producer tasks", contexts.len());
 
@@ -2171,20 +2181,21 @@ impl NFSStorage {
                     &ctx,
                     |(dir_path, dir_fh, current_depth, skip_filter, package_remaining)| {
                         self_clone.process_dir(
-                            ctx.worker_id,
                             dir_path,
                             dir_fh,
                             current_depth,
-                            &tx_clone,
-                            &ctx,
-                            &match_expr_clone,
-                            &exclude_expr_clone,
-                            max_depth,
-                            &total_file_count_clone,
                             skip_filter,
-                            packaged,
-                            package_depth,
                             package_remaining,
+                            NfsWalkRuntime {
+                                tx: &tx_clone,
+                                scheduler: &ctx,
+                                match_expr: &match_expr_clone,
+                                exclude_expr: &exclude_expr_clone,
+                                max_depth,
+                                total_file_count: &total_file_count_clone,
+                                packaged,
+                                package_depth,
+                            },
                         )
                     },
                     |task| task.0.clone(),
@@ -2201,24 +2212,17 @@ impl NFSStorage {
     }
 
     /// 处理单个目录，读取条目并过滤，发送符合条件的StorageEntry
-    #[allow(clippy::too_many_arguments)]
     async fn process_dir(
         &self,
-        producer_id: usize,
         dir_path: String,
         dir_fh: Bytes,
         current_depth: usize,
-        tx: &async_channel::Sender<StorageEntryMessage>,
-        ctx: &crate::walk_scheduler::WorkerContext<(String, Bytes, usize, bool, Option<usize>)>,
-        match_expr: &Arc<Option<FilterExpression>>,
-        exclude_expr: &Arc<Option<FilterExpression>>,
-        max_depth: usize,
-        total_file_count: &Arc<AtomicUsize>,
         skip_filter: bool,
-        packaged: bool,
-        package_depth: usize,
         package_remaining: Option<usize>,
+        runtime: NfsWalkRuntime<'_>,
     ) -> Result<()> {
+        let producer_id = runtime.scheduler.worker_id;
+        let tx = runtime.tx;
         // Stream READDIRPLUS entries into the existing processing path instead
         // of buffering a full directory. Retryable errors are retried only
         // before any entry is processed; after that point, replaying the
@@ -2235,20 +2239,12 @@ impl NFSStorage {
                         processed_any = true;
                         if !self
                             .process_readdir_entry(
-                                producer_id,
                                 &dir_path,
                                 entry,
                                 current_depth,
-                                tx,
-                                ctx,
-                                match_expr,
-                                exclude_expr,
-                                max_depth,
-                                total_file_count,
                                 skip_filter,
-                                packaged,
-                                package_depth,
                                 package_remaining,
+                                &runtime,
                             )
                             .await?
                         {
@@ -2303,24 +2299,24 @@ impl NFSStorage {
     ///
     /// Returns `Ok(false)` when the downstream output channel is closed and the
     /// caller should stop reading the directory.
-    #[allow(clippy::too_many_arguments)]
     async fn process_readdir_entry(
         &self,
-        producer_id: usize,
         dir_path: &str,
         entry: nfs_rs::ReaddirplusEntry,
         current_depth: usize,
-        tx: &async_channel::Sender<StorageEntryMessage>,
-        ctx: &crate::walk_scheduler::WorkerContext<(String, Bytes, usize, bool, Option<usize>)>,
-        match_expr: &Arc<Option<FilterExpression>>,
-        exclude_expr: &Arc<Option<FilterExpression>>,
-        max_depth: usize,
-        total_file_count: &Arc<AtomicUsize>,
         skip_filter: bool,
-        packaged: bool,
-        package_depth: usize,
         package_remaining: Option<usize>,
+        runtime: &NfsWalkRuntime<'_>,
     ) -> Result<bool> {
+        let producer_id = runtime.scheduler.worker_id;
+        let tx = runtime.tx;
+        let ctx = runtime.scheduler;
+        let match_expr = runtime.match_expr;
+        let exclude_expr = runtime.exclude_expr;
+        let max_depth = runtime.max_depth;
+        let total_file_count = runtime.total_file_count;
+        let packaged = runtime.packaged;
+        let package_depth = runtime.package_depth;
         if entry.file_name == "." || entry.file_name == ".." {
             return Ok(true);
         }

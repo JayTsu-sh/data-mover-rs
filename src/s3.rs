@@ -59,6 +59,19 @@ use crate::{
     StorageEntryMessage, Tag, WalkDirAsyncIterator, datetime_to_string,
 };
 
+struct S3WalkRuntime<'a> {
+    tx: &'a async_channel::Sender<StorageEntryMessage>,
+    scheduler: &'a crate::walk_scheduler::WorkerContext<(String, usize, bool, Option<usize>)>,
+    match_expr: Option<&'a FilterExpression>,
+    exclude_expr: Option<&'a FilterExpression>,
+    depth_limit: Option<usize>,
+    include_tags: bool,
+    is_versioned: bool,
+    total_file_count: &'a Arc<AtomicUsize>,
+    packaged: bool,
+    package_depth: usize,
+}
+
 mod delete_objects_md5;
 mod dxn;
 mod multipart_rename;
@@ -1648,23 +1661,23 @@ impl S3Storage {
     }
 
     /// 处理目录条目
-    #[allow(clippy::too_many_arguments)]
     async fn process_directory(
         &self,
-        ctx: &crate::walk_scheduler::WorkerContext<(String, usize, bool, Option<usize>)>,
-        thread_id: usize,
         prefix_name: &str,
         current_depth: usize,
-        depth_limit: Option<usize>,
         skip_filter: bool,
-        match_expressions: Option<&FilterExpression>,
-        exclude_expressions: Option<&FilterExpression>,
-        packaged: bool,
-        package_depth: usize,
         package_remaining: Option<usize>,
-        tx: &async_channel::Sender<StorageEntryMessage>,
-        total_file_count: &Arc<AtomicUsize>,
+        runtime: &S3WalkRuntime<'_>,
     ) -> Result<()> {
+        let ctx = runtime.scheduler;
+        let thread_id = runtime.scheduler.worker_id;
+        let depth_limit = runtime.depth_limit;
+        let match_expressions = runtime.match_expr;
+        let exclude_expressions = runtime.exclude_expr;
+        let tx = runtime.tx;
+        let total_file_count = runtime.total_file_count;
+        let packaged = runtime.packaged;
+        let package_depth = runtime.package_depth;
         // 计算相对路径：移除存储的基本前缀和末尾斜杠
         let relative_path = self.calculate_relative_path(prefix_name);
         let clean_relative_path = relative_path.trim_end_matches('/');
@@ -1823,21 +1836,21 @@ impl S3Storage {
     }
 
     /// 处理文件条目
-    #[allow(clippy::too_many_arguments)]
     async fn process_object(
         &self,
-        tx: &async_channel::Sender<StorageEntryMessage>,
-        thread_id: usize,
         key: &str,
         size: u64,
         last_modified: i64,
         extension: Option<String>,
-        include_tags: bool,
         skip_filter: bool,
-        match_expressions: Option<&FilterExpression>,
-        exclude_expressions: Option<&FilterExpression>,
-        total_file_count: &Arc<AtomicUsize>,
+        runtime: &S3WalkRuntime<'_>,
     ) -> Result<()> {
+        let tx = runtime.tx;
+        let thread_id = runtime.scheduler.worker_id;
+        let include_tags = runtime.include_tags;
+        let match_expressions = runtime.match_expr;
+        let exclude_expressions = runtime.exclude_expr;
+        let total_file_count = runtime.total_file_count;
         // 构建路径信息
         let relative_path = self.calculate_relative_path(key);
         let path_buf = PathBuf::from(relative_path);
@@ -3043,19 +3056,13 @@ impl S3Storage {
         Ok(entry)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::unused_async)]
     pub async fn walkdir(
         &self,
         sub_path: Option<&str>,
-        depth: Option<usize>,
-        match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>,
-        concurrency: usize,
-        include_tags: bool,
-        packaged: bool,
-        package_depth: usize,
+        options: crate::WalkOptions,
     ) -> Result<WalkDirAsyncIterator> {
+        let concurrency = options.concurrency;
+        let depth = options.depth;
         debug!(
             "[S3] 开始执行walkdir，并发度: {}, bucket: {}, 深度: {:?}, sub_path: {:?}",
             concurrency, self.bucket_name, depth, sub_path
@@ -3077,15 +3084,9 @@ impl S3Storage {
             if let Err(e) = self_clone
                 .iterative_walkdir(
                     tx_clone.clone(),
-                    depth,
-                    match_expressions,
-                    exclude_expressions,
-                    concurrency,
-                    include_tags,
+                    options,
                     self_clone.is_bucket_versioned,
                     total_file_count,
-                    packaged,
-                    package_depth,
                 )
                 .await
             {
@@ -3105,20 +3106,22 @@ impl S3Storage {
     }
 
     /// 迭代式目录遍历函数，使用工作窃取队列实现高效并发
-    #[allow(clippy::too_many_arguments)]
     async fn iterative_walkdir(
         &self,
         tx: async_channel::Sender<StorageEntryMessage>,
-        depth: Option<usize>,
-        match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>,
-        concurrency: usize,
-        include_tags: bool,
+        options: crate::WalkOptions,
         is_versioned: bool,
         total_file_count: Arc<AtomicUsize>,
-        packaged: bool,
-        package_depth: usize,
     ) -> Result<()> {
+        let crate::WalkOptions {
+            depth,
+            match_expressions,
+            exclude_expressions,
+            concurrency,
+            include_tags,
+            packaged,
+            package_depth,
+        } = options;
         let start_prefix = self.prefix.clone().unwrap_or_default();
         debug!("[S3] 使用起始前缀: {:?}", start_prefix);
 
@@ -3139,21 +3142,22 @@ impl S3Storage {
                     &ctx,
                     |(prefix, current_depth, skip_filter, package_remaining)| {
                         self_clone.process_dir(
-                            ctx.worker_id,
                             prefix,
                             current_depth,
-                            &tx_clone,
-                            &ctx,
-                            match_expr_clone.as_ref(),
-                            exclude_expr_clone.as_ref(),
-                            depth,
-                            include_tags,
-                            is_versioned,
-                            &total_file_count_clone,
                             skip_filter,
-                            packaged,
-                            package_depth,
                             package_remaining,
+                            S3WalkRuntime {
+                                tx: &tx_clone,
+                                scheduler: &ctx,
+                                match_expr: match_expr_clone.as_ref(),
+                                exclude_expr: exclude_expr_clone.as_ref(),
+                                depth_limit: depth,
+                                include_tags,
+                                is_versioned,
+                                total_file_count: &total_file_count_clone,
+                                packaged,
+                                package_depth,
+                            },
                         )
                     },
                     |task| task.0.clone(),
@@ -3170,26 +3174,22 @@ impl S3Storage {
     }
 
     /// 处理单个目录（S3 中的前缀），读取条目并过滤，发送符合条件的EntryEnum
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::fn_params_excessive_bools)]
     async fn process_dir(
         &self,
-        producer_id: usize,
         prefix: String,
         current_depth: usize,
-        tx: &async_channel::Sender<StorageEntryMessage>,
-        ctx: &crate::walk_scheduler::WorkerContext<(String, usize, bool, Option<usize>)>,
-        match_expressions: Option<&FilterExpression>,
-        exclude_expressions: Option<&FilterExpression>,
-        depth_limit: Option<usize>,
-        include_tags: bool,
-        is_versioned: bool,
-        total_file_count: &Arc<AtomicUsize>,
         skip_filter: bool,
-        packaged: bool,
-        package_depth: usize,
         package_remaining: Option<usize>,
+        runtime: S3WalkRuntime<'_>,
     ) -> Result<()> {
+        let producer_id = runtime.scheduler.worker_id;
+        let tx = runtime.tx;
+        let match_expressions = runtime.match_expr;
+        let exclude_expressions = runtime.exclude_expr;
+        let depth_limit = runtime.depth_limit;
+        let include_tags = runtime.include_tags;
+        let is_versioned = runtime.is_versioned;
+        let total_file_count = runtime.total_file_count;
         debug!(
             "[S3 Producer {}] 开始处理前缀: {}, 当前深度: {}, skip_filter: {}",
             producer_id, prefix, current_depth, skip_filter
@@ -3262,19 +3262,11 @@ impl S3Storage {
                 for prefix_data in response.common_prefixes() {
                     if let Some(prefix_name) = prefix_data.prefix() {
                         self.process_directory(
-                            ctx,
-                            producer_id,
                             prefix_name,
                             current_depth,
-                            depth_limit,
                             skip_filter,
-                            match_expressions,
-                            exclude_expressions,
-                            packaged,
-                            package_depth,
                             package_remaining,
-                            tx,
-                            total_file_count,
+                            &runtime,
                         )
                         .await?;
                         subdir_count += 1;
@@ -3383,19 +3375,11 @@ impl S3Storage {
                 for prefix_data in response.common_prefixes() {
                     if let Some(prefix_name) = prefix_data.prefix() {
                         self.process_directory(
-                            ctx,
-                            producer_id,
                             prefix_name,
                             current_depth,
-                            depth_limit,
                             skip_filter,
-                            match_expressions,
-                            exclude_expressions,
-                            packaged,
-                            package_depth,
                             package_remaining,
-                            tx,
-                            total_file_count,
+                            &runtime,
                         )
                         .await?;
                         subdir_count += 1;
@@ -3424,17 +3408,12 @@ impl S3Storage {
                             .map(|ext| ext.to_string_lossy().to_string());
 
                         self.process_object(
-                            tx,
-                            producer_id,
                             key,
                             size,
                             last_modified,
                             extension,
-                            include_tags,
                             skip_filter,
-                            match_expressions,
-                            exclude_expressions,
-                            total_file_count,
+                            &runtime,
                         )
                         .await?;
 

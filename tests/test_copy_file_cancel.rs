@@ -49,15 +49,15 @@ async fn copy_file_returns_cancelled_when_token_pre_cancelled() {
     let token = CancellationToken::new();
     token.cancel();
 
-    let res = StorageEnum::copy_file_with_cancel(
+    let res = StorageEnum::copy_file(
         &src,
         &dst,
         &entry,
-        None,
-        false,
-        true,
-        None,
-        Some(token),
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            cancel: Some(token),
+            ..Default::default()
+        },
     )
     .await;
 
@@ -96,15 +96,17 @@ async fn copy_file_aborts_mid_transfer_on_token_cancel() {
     });
 
     let started = Instant::now();
-    let res = StorageEnum::copy_file_with_cancel(
+    let res = StorageEnum::copy_file(
         &src,
         &dst,
         &entry,
-        Some(qos),
-        false,
-        true,
-        Some(counter.clone()),
-        Some(token),
+        data_mover::CopyOptions {
+            qos: Some(qos),
+            is_source_reserved: true,
+            bytes_counter: Some(counter.clone()),
+            cancel: Some(token),
+            ..Default::default()
+        },
     )
     .await;
     let elapsed = started.elapsed();
@@ -136,8 +138,16 @@ async fn copy_file_without_cancel_still_works_via_compat_wrapper() {
     let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
 
     // Old (unchanged) signature — must still work.
-    StorageEnum::copy_file(&src, &dst, &entry, None, false, true, None)
-        .await
-        .expect("legacy copy_file path");
+    StorageEnum::copy_file(
+        &src,
+        &dst,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("legacy copy_file path");
     assert!(dst.get_metadata(Path::new("blob.bin")).await.is_ok());
 }

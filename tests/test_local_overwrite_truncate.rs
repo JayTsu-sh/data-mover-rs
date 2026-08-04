@@ -59,9 +59,17 @@ async fn overwrite_shorter_file_truncates_stale_tail_multi_chunk() {
     let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
 
     // 第一次拷贝：生成 10MB 目标文件
-    StorageEnum::copy_file(&src, &dst, &entry, None, false, true, None)
-        .await
-        .expect("first full copy");
+    StorageEnum::copy_file(
+        &src,
+        &dst,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("first full copy");
     let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
         .await
         .unwrap();
@@ -70,9 +78,17 @@ async fn overwrite_shorter_file_truncates_stale_tail_multi_chunk() {
     // 用更短的新内容覆盖同一目标路径
     write_pattern(&format!("{src_dir}/blob.bin"), SMALL, 7).await;
     let entry2 = src.get_metadata(Path::new("blob.bin")).await.unwrap();
-    StorageEnum::copy_file(&src, &dst, &entry2, None, false, true, None)
-        .await
-        .expect("overwrite copy with shorter file");
+    StorageEnum::copy_file(
+        &src,
+        &dst,
+        &entry2,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("overwrite copy with shorter file");
 
     let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
         .await
@@ -109,15 +125,31 @@ async fn overwrite_shorter_file_truncates_stale_tail_single_chunk() {
         .unwrap();
     let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
 
-    StorageEnum::copy_file(&src, &dst, &entry, None, false, true, None)
-        .await
-        .expect("first full copy");
+    StorageEnum::copy_file(
+        &src,
+        &dst,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("first full copy");
 
     write_pattern(&format!("{src_dir}/blob.bin"), SMALL, 3).await;
     let entry2 = src.get_metadata(Path::new("blob.bin")).await.unwrap();
-    StorageEnum::copy_file(&src, &dst, &entry2, None, false, true, None)
-        .await
-        .expect("overwrite copy with shorter file");
+    StorageEnum::copy_file(
+        &src,
+        &dst,
+        &entry2,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("overwrite copy with shorter file");
 
     let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
         .await
