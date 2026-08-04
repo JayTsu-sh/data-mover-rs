@@ -186,7 +186,7 @@ impl StorageEnum {
                 let tmp_path = PathBuf::from(&tmp_name);
                 s.write_file(&tmp_path, Bytes::from_static(b"\0"), None, None, None)
                     .await?;
-                let entry = s.get_metadata(&tmp_path).await?;
+                let entry = Box::pin(s.get_metadata(&tmp_path)).await?;
                 let mtime = entry.get_mtime();
                 let _ = s.delete_file(&tmp_path).await;
                 Ok(Some(mtime))
@@ -203,7 +203,7 @@ impl StorageEnum {
                 let tmp_path = PathBuf::from(&tmp_name);
                 s.write_file(&tmp_path, Bytes::from_static(b"\0"), None, None, None)
                     .await?;
-                let entry = s.get_metadata(&tmp_path).await?;
+                let entry = Box::pin(s.get_metadata(&tmp_path)).await?;
                 let mtime = entry.get_mtime();
                 let _ = s.delete_file(&tmp_path).await;
                 Ok(Some(mtime))
@@ -345,7 +345,7 @@ impl StorageEnum {
             StorageEnum::Local(storage) => storage.get_metadata(relative_path).await,
             StorageEnum::NFS(storage) => storage.get_metadata(relative_path).await,
             StorageEnum::S3(storage) => storage.get_metadata(&path_to_s3_key(relative_path)).await,
-            StorageEnum::CIFS(storage) => storage.get_metadata(relative_path).await,
+            StorageEnum::CIFS(storage) => Box::pin(storage.get_metadata(relative_path)).await,
         }
     }
 
@@ -1071,7 +1071,7 @@ impl StorageEnum {
         }
 
         let missing = if resume {
-            match dest.get_metadata(part_path).await {
+            match Box::pin(dest.get_metadata(part_path)).await {
                 Ok(existing) => {
                     let existing_len = existing.get_size();
                     match existing_len.cmp(&size) {
@@ -1352,8 +1352,14 @@ impl StorageEnum {
         resume: ResumeContext,
     ) -> Result<()> {
         if matches!(to, StorageEnum::S3(_)) {
-            return Self::copy_file_resumable_to_s3(from, to, entry, options, resume.on_committed)
-                .await;
+            return Box::pin(Self::copy_file_resumable_to_s3(
+                from,
+                to,
+                entry,
+                options,
+                resume.on_committed,
+            ))
+            .await;
         }
 
         let CopyOptions {
@@ -1465,8 +1471,13 @@ impl StorageEnum {
 
         // part_path 对 S3 分支无意义（resume_prepare 内部按 dest 类型分流，S3
         // 分支不使用该参数），传入 entry 自身路径仅作占位。
-        let (missing, handle) =
-            Self::resume_prepare(to, entry, entry.get_relative_path(), true).await?;
+        let (missing, handle) = Box::pin(Self::resume_prepare(
+            to,
+            entry,
+            entry.get_relative_path(),
+            true,
+        ))
+        .await?;
 
         // 写端本地会话计数（issue #58）：wrap on_committed 累计本次确认上传的
         // 字节数（零额外存储 RPC），供 CompleteMultipartUpload 前的 size 断言。
