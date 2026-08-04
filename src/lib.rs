@@ -412,6 +412,8 @@ pub enum StorageEntryMessage {
         event: ErrorEvent,
         /// 出错的文件或目录路径
         path: PathBuf,
+        /// 条目上下文；早期扫描错误尚未构造完整条目时为 `None`。
+        entry: Option<Arc<EntryEnum>>,
         /// 错误原因
         reason: String,
     },

@@ -1528,6 +1528,7 @@ impl NFSStorage {
                         event,
                         path,
                         reason,
+                        ..
                     } => {
                         error!(
                             "Walkdir error during delete [{}] {:?}: {}",
@@ -2118,6 +2119,7 @@ impl NFSStorage {
                     .send(StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
                         path: std::path::PathBuf::new(),
+                        entry: None,
                         reason: format!("{err}"),
                     })
                     .await;
@@ -2266,6 +2268,7 @@ impl NFSStorage {
                             .send(StorageEntryMessage::Error {
                                 event: ErrorEvent::Scan,
                                 path: PathBuf::from(&dir_path),
+                                entry: None,
                                 reason: format!("Failed to read directory entry: {e}"),
                             })
                             .await;
@@ -2349,6 +2352,7 @@ impl NFSStorage {
                         .send(StorageEntryMessage::Error {
                             event: ErrorEvent::Scan,
                             path: PathBuf::from(&relative_path),
+                            entry: None,
                             reason: format!(
                                 "[Producer {producer_id}] Missing file attributes: {relative_path}"
                             ),

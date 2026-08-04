@@ -3080,6 +3080,7 @@ impl S3Storage {
                     .send(StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
                         path: std::path::PathBuf::new(),
+                        entry: None,
                         reason: format!("{e:?}"),
                     })
                     .await;

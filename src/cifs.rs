@@ -1620,6 +1620,7 @@ impl CifsStorage {
                         event,
                         path,
                         reason,
+                        ..
                     } => {
                         error!(
                             "Walkdir error during delete [{}] {:?}: {}",
@@ -1968,6 +1969,7 @@ impl CifsStorage {
                     .send(StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
                         path: PathBuf::new(),
+                        entry: None,
                         reason: format!("{err}"),
                     })
                     .await;
@@ -2095,6 +2097,7 @@ impl CifsStorage {
                     .send(StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
                         path: PathBuf::from(&dir_path),
+                        entry: None,
                         reason: format!("Failed to open directory: {e}"),
                     })
                     .await;
@@ -2128,6 +2131,7 @@ impl CifsStorage {
                     .send(StorageEntryMessage::Error {
                         event: ErrorEvent::Scan,
                         path: PathBuf::from(&dir_path),
+                        entry: None,
                         reason: format!("Failed to query directory: {e}"),
                     })
                     .await;
@@ -2143,6 +2147,7 @@ impl CifsStorage {
                 .send(StorageEntryMessage::Error {
                     event: ErrorEvent::Scan,
                     path: PathBuf::from(&dir_path),
+                    entry: None,
                     reason,
                 })
                 .await;
