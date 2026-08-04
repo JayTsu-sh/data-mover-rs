@@ -112,14 +112,21 @@ fn build_bandwidth_limiter_inner(base_rate_bps: u64, burst_bytes: u64) -> Result
 
     // 基准速率换算为 cells/sec（1 cell = 1 KB）
     let cells_per_sec = (base_rate_bps / 1024).max(1);
-    let rate = NonZeroU32::new(cells_per_sec as u32).ok_or_else(|| {
-        StorageError::ConfigError("带宽速率过小，换算后为0 cells/sec".to_string())
-    })?;
+    let rate =
+        NonZeroU32::new(u32::try_from(cells_per_sec).map_err(|_| {
+            StorageError::ConfigError("带宽速率超过 limiter 支持的范围".to_string())
+        })?)
+        .ok_or_else(|| {
+            StorageError::ConfigError("带宽速率过小，换算后为0 cells/sec".to_string())
+        })?;
 
     // burst 容量（cells）
     let burst_cells = (burst_bytes / 1024).max(1);
-    let burst = NonZeroU32::new(burst_cells as u32)
-        .ok_or_else(|| StorageError::ConfigError("burst 过小，换算后为 0 cells".to_string()))?;
+    let burst = NonZeroU32::new(
+        u32::try_from(burst_cells)
+            .map_err(|_| StorageError::ConfigError("burst 超过 limiter 支持的范围".to_string()))?,
+    )
+    .ok_or_else(|| StorageError::ConfigError("burst 过小，换算后为 0 cells".to_string()))?;
 
     debug!(
         "[QoS] 带宽限制: base={}B/s ({}cells/s), burst={}B ({}cells)",
@@ -130,10 +137,33 @@ fn build_bandwidth_limiter_inner(base_rate_bps: u64, burst_bytes: u64) -> Result
     Ok(RateLimiter::direct(quota))
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "f64 has sufficient precision for configured bandwidth scaling and the result is range-checked"
+)]
 fn build_bandwidth_limiter(bandwidth_str: &str, peak_rate: f32) -> Result<BandwidthLimiter> {
     let base_rate_bps = parse_bandwidth_string(bandwidth_str)?;
-    let burst_bytes = (base_rate_bps as f64 * f64::from(peak_rate)).round() as u64;
+    let burst_bytes = checked_rounded_u64(base_rate_bps as f64 * f64::from(peak_rate), "burst")?;
     build_bandwidth_limiter_inner(base_rate_bps, burst_bytes)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "u64::MAX is used only as an inclusive floating-point range bound"
+)]
+fn checked_rounded_u64(value: f64, field: &str) -> Result<u64> {
+    if !value.is_finite() || value.is_sign_negative() || value > u64::MAX as f64 {
+        return Err(StorageError::ConfigError(format!(
+            "{field} 必须是 0..={} 范围内的有限数值",
+            u64::MAX
+        )));
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "value is finite, non-negative, rounded, and range-checked above"
+    )]
+    Ok(value.round() as u64)
 }
 
 /// 显式 burst 版本：用基准速率字符串 + burst 字节数。
@@ -421,7 +451,8 @@ pub fn parse_bandwidth_string(bandwidth: &str) -> Result<u64> {
             };
 
             // 计算最终的bps值
-            let bytes_per_second = (number * f64::from(*multiplier)).round() as u64;
+            let bytes_per_second =
+                checked_rounded_u64(number * f64::from(*multiplier), "bandwidth")?;
             return Ok(bytes_per_second);
         }
     }
@@ -470,6 +501,13 @@ mod tests {
             let result = parse_bandwidth_string(input);
             assert!(result.is_err(), "解析无效字符串'{}'应该失败", input);
         }
+    }
+
+    #[test]
+    fn bandwidth_rejects_negative_and_non_finite_values() {
+        assert!(parse_bandwidth_string("-1MiB/s").is_err());
+        assert!(parse_bandwidth_string("NaNMiB/s").is_err());
+        assert!(parse_bandwidth_string("infMiB/s").is_err());
     }
 
     #[test]

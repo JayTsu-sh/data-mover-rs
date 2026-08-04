@@ -38,12 +38,16 @@ fn time_to_i64(time: Time) -> i64 {
 }
 
 /// 将纳秒时间戳转换为 `nfs_rs::Time`
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-fn i64_to_time(timestamp: i64) -> Time {
-    Time {
-        seconds: crate::time_util::nanos_to_secs(timestamp) as u32,
+fn i64_to_time(timestamp: i64) -> Result<Time> {
+    let seconds = u32::try_from(crate::time_util::nanos_to_secs(timestamp)).map_err(|_| {
+        StorageError::OperationError(format!(
+            "NFS timestamp is outside the supported 1970..=2106 range: {timestamp}ns"
+        ))
+    })?;
+    Ok(Time {
+        seconds,
         nseconds: crate::time_util::nanos_subsec(timestamp),
-    }
+    })
 }
 
 /// NFSv4 可选富化字段。
@@ -1624,8 +1628,8 @@ impl NFSStorage {
         }
 
         // 把 i64 nanos 时间戳转成 nfs_rs::Time；retry 之间不变，提到循环外。
-        let atime_t = Some(i64_to_time(atime));
-        let mtime_t = Some(i64_to_time(mtime));
+        let atime_t = Some(i64_to_time(atime)?);
+        let mtime_t = Some(i64_to_time(mtime)?);
 
         for attempt in 0..=MAX_STALE_RETRIES {
             let parent_fh = if let Some(parent) = relative_path.parent() {
@@ -1909,8 +1913,8 @@ impl NFSStorage {
         debug!("Setting metadata for {:?}", file.path);
 
         // 转换纳秒时间戳到Time类型
-        let nfs_atime = atime.map(i64_to_time);
-        let nfs_mtime = mtime.map(i64_to_time);
+        let nfs_atime = atime.map(i64_to_time).transpose()?;
+        let nfs_mtime = mtime.map(i64_to_time).transpose()?;
 
         // set_metadata 在 stale 重试时需要 re-lookup 获取新 fh，用 current_fh 跟踪
         let mut current_fh = file.inner.fh.clone();

@@ -101,9 +101,13 @@ pub fn canonicalize_path(path: &str) -> std::io::Result<String> {
 
 /// 将纳秒时间戳转换为YYYY-MM-DD HHMMSS格式的字符串
 pub fn datetime_to_string(time: i64) -> String {
-    // 创建一个SystemTime对象，然后转换为chrono::DateTime
-    let system_time =
-        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(time as u64);
+    let magnitude = std::time::Duration::from_nanos(time.unsigned_abs());
+    let system_time = if time.is_negative() {
+        std::time::SystemTime::UNIX_EPOCH.checked_sub(magnitude)
+    } else {
+        std::time::SystemTime::UNIX_EPOCH.checked_add(magnitude)
+    }
+    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     let datetime: chrono::DateTime<chrono::Utc> = system_time.into();
     datetime.format("%Y-%m-%d %H:%M:%S%.9f").to_string()
 }

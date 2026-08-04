@@ -39,16 +39,14 @@ use crate::{
 };
 
 /// 将 SMB `FileTime` (100ns since 1601-01-01) 转换为纳秒时间戳 (ns since Unix epoch)
-#[allow(clippy::cast_possible_wrap)]
 fn filetime_to_nanos(ft: FileTime) -> i64 {
     // FileTime Deref<Target=u64>，值是 100ns 间隔数
-    crate::time_util::smb_filetime_to_nanos(*ft as i64)
+    crate::time_util::smb_filetime_to_nanos(*ft)
 }
 
 /// 将纳秒时间戳 (ns since Unix epoch) 转换为 SMB `FileTime`
-#[allow(clippy::cast_sign_loss)]
 fn nanos_to_filetime(ns: i64) -> FileTime {
-    FileTime::from(crate::time_util::nanos_to_smb_filetime(ns) as u64)
+    FileTime::from(crate::time_util::nanos_to_smb_filetime(ns))
 }
 
 /// 把 128-bit SMB 文件 ID 编码为 `file_handle`。
@@ -103,9 +101,9 @@ impl NASEntry {
             extension,
             is_dir,
             size,
-            mtime: crate::time_util::smb_filetime_to_nanos(*last_write_time as i64),
-            atime: crate::time_util::smb_filetime_to_nanos(*last_access_time as i64),
-            ctime: crate::time_util::smb_filetime_to_nanos(*creation_time as i64),
+            mtime: crate::time_util::smb_filetime_to_nanos(*last_write_time),
+            atime: crate::time_util::smb_filetime_to_nanos(*last_access_time),
+            ctime: crate::time_util::smb_filetime_to_nanos(*creation_time),
             mode: smb_attributes_to_mode(is_dir, is_readonly),
             hard_links: None,
             is_symlink,
