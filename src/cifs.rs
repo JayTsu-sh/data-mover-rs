@@ -1581,16 +1581,13 @@ impl CifsStorage {
         let sub_path = relative_path.map(PathBuf::from);
 
         tokio::spawn(async move {
-            let walkdir_result = match storage
-                .walkdir(
-                    sub_path.as_deref(),
-                    crate::WalkOptions {
-                        concurrency,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
+            let walkdir_result = match storage.walkdir(
+                sub_path.as_deref(),
+                crate::WalkOptions {
+                    concurrency,
+                    ..Default::default()
+                },
+            ) {
                 Ok(iter) => iter,
                 Err(e) => {
                     error!("Failed to start walkdir for delete: {:?}", e);
@@ -1902,8 +1899,7 @@ impl CifsStorage {
     /// 创建符号链接
     ///
     /// SMB reparse point support is not implemented by this backend.
-    #[allow(clippy::unused_async)]
-    pub async fn create_symlink(
+    pub fn create_symlink(
         &self,
         _relative_path: &Path,
         _target_path: &Path,
@@ -1918,8 +1914,7 @@ impl CifsStorage {
     }
 
     /// 读取符号链接目标
-    #[allow(clippy::unused_async)]
-    pub async fn read_symlink(&self, _relative_path: &Path) -> Result<PathBuf> {
+    pub fn read_symlink(&self, _relative_path: &Path) -> Result<PathBuf> {
         Err(StorageError::CifsError(
             "CIFS symlink reading is not supported".to_string(),
         ))
@@ -1933,7 +1928,7 @@ impl CifsStorage {
     ///
     /// 使用 work-stealing scheduler 实现高效并行目录遍历。
     /// 每个 worker 独立查询子目录，通过 bounded channel 控制内存。
-    pub async fn walkdir(
+    pub fn walkdir(
         &self,
         sub_path: Option<&Path>,
         options: crate::WalkOptions,
@@ -2681,8 +2676,7 @@ impl CifsStorage {
     }
 
     /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
-    #[allow(clippy::unused_async)]
-    pub async fn walkdir_2(
+    pub fn walkdir_2(
         &self,
         sub_path: Option<&Path>,
         depth: Option<usize>,

@@ -448,7 +448,7 @@ impl LocalStorage {
         Ok(())
     }
 
-    pub async fn walkdir(
+    pub fn walkdir(
         &self,
         sub_path: Option<&Path>,
         options: crate::WalkOptions,
@@ -1285,8 +1285,7 @@ impl LocalStorage {
     }
 
     /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
-    #[allow(clippy::unused_async)]
-    pub async fn walkdir_2(
+    pub fn walkdir_2(
         &self,
         sub_path: Option<&Path>,
         depth: Option<usize>,

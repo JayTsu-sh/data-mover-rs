@@ -301,18 +301,14 @@ impl StorageEnum {
                     )
                     .await
             }
-            (StorageEnum::CIFS(storage), EntryEnum::NAS(entry)) => {
-                storage
-                    .create_symlink(
-                        &entry.relative_path,
-                        target,
-                        entry.atime,
-                        entry.mtime,
-                        entry.uid,
-                        entry.gid,
-                    )
-                    .await
-            }
+            (StorageEnum::CIFS(storage), EntryEnum::NAS(entry)) => storage.create_symlink(
+                &entry.relative_path,
+                target,
+                entry.atime,
+                entry.mtime,
+                entry.uid,
+                entry.gid,
+            ),
             _ => Ok(()),
         }
     }
@@ -326,7 +322,7 @@ impl StorageEnum {
                 storage.read_symlink(&entry.relative_path).await
             }
             (StorageEnum::CIFS(storage), EntryEnum::NAS(entry)) => {
-                storage.read_symlink(&entry.relative_path).await
+                storage.read_symlink(&entry.relative_path)
             }
             _ => Ok(PathBuf::new()),
         }
@@ -347,13 +343,13 @@ impl StorageEnum {
         options: WalkOptions,
     ) -> Result<WalkDirAsyncIterator> {
         match self {
-            StorageEnum::Local(s) => s.walkdir(sub_path, options).await,
+            StorageEnum::Local(s) => s.walkdir(sub_path, options),
             StorageEnum::NFS(s) => s.walkdir(sub_path, options).await,
             StorageEnum::S3(s) => {
                 let key = sub_path.map(|p| path_to_s3_key(p));
-                s.walkdir(key.as_deref(), options).await
+                s.walkdir(key.as_deref(), options)
             }
-            StorageEnum::CIFS(s) => s.walkdir(sub_path, options).await,
+            StorageEnum::CIFS(s) => s.walkdir(sub_path, options),
         }
     }
 
@@ -368,16 +364,13 @@ impl StorageEnum {
         include_tags: bool,
     ) -> Result<WalkDirAsyncIterator2> {
         match self {
-            StorageEnum::Local(s) => {
-                s.walkdir_2(
-                    sub_path,
-                    depth,
-                    match_expressions,
-                    exclude_expressions,
-                    concurrency,
-                )
-                .await
-            }
+            StorageEnum::Local(s) => s.walkdir_2(
+                sub_path,
+                depth,
+                match_expressions,
+                exclude_expressions,
+                concurrency,
+            ),
             StorageEnum::NFS(s) => {
                 s.walkdir_2(
                     sub_path,
@@ -398,18 +391,14 @@ impl StorageEnum {
                     concurrency,
                     include_tags,
                 )
-                .await
             }
-            StorageEnum::CIFS(s) => {
-                s.walkdir_2(
-                    sub_path,
-                    depth,
-                    match_expressions,
-                    exclude_expressions,
-                    concurrency,
-                )
-                .await
-            }
+            StorageEnum::CIFS(s) => s.walkdir_2(
+                sub_path,
+                depth,
+                match_expressions,
+                exclude_expressions,
+                concurrency,
+            ),
         }
     }
 

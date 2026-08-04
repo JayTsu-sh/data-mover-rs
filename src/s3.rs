@@ -3056,7 +3056,7 @@ impl S3Storage {
         Ok(entry)
     }
 
-    pub async fn walkdir(
+    pub fn walkdir(
         &self,
         sub_path: Option<&str>,
         options: crate::WalkOptions,
@@ -3878,8 +3878,7 @@ impl S3Storage {
     }
 
     /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
-    #[allow(clippy::unused_async)]
-    pub async fn walkdir_2(
+    pub fn walkdir_2(
         &self,
         sub_path: Option<&str>,
         depth: Option<usize>,
