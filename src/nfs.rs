@@ -22,7 +22,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
-use crate::filter::{FilterExpression, dir_matches_date_filter, should_skip};
+use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
@@ -2377,18 +2377,20 @@ impl NFSStorage {
             should_skip(
                 match_expr.as_ref().as_ref(),
                 exclude_expr.as_ref().as_ref(),
-                Some(file_name),
-                Some(normalized_path),
-                Some(if is_symlink {
-                    "symlink"
-                } else if is_dir {
-                    "dir"
-                } else {
-                    "file"
-                }),
-                modified_epoch,
-                Some(attrs.filesize),
-                extension.as_deref().or(Some("")),
+                FilterInput {
+                    file_name: Some(file_name),
+                    file_path: Some(normalized_path),
+                    file_type: Some(if is_symlink {
+                        "symlink"
+                    } else if is_dir {
+                        "dir"
+                    } else {
+                        "file"
+                    }),
+                    modified_epoch,
+                    size: Some(attrs.filesize),
+                    extension: extension.as_deref().or(Some("")),
+                },
             )
         } else {
             // skip_filter=false 表示父目录已匹配，子项无需过滤
@@ -3223,18 +3225,20 @@ impl NFSStorage {
                     should_skip(
                         ctx.match_expr.as_ref().as_ref(),
                         ctx.exclude_expr.as_ref().as_ref(),
-                        Some(&entry.file_name),
-                        Some(&relative_path),
-                        Some(if is_symlink {
-                            "symlink"
-                        } else if is_dir {
-                            "dir"
-                        } else {
-                            "file"
-                        }),
-                        Some(i64::from(attrs.mtime.seconds)),
-                        Some(attrs.filesize),
-                        extension.as_deref().or(Some("")),
+                        FilterInput {
+                            file_name: Some(&entry.file_name),
+                            file_path: Some(&relative_path),
+                            file_type: Some(if is_symlink {
+                                "symlink"
+                            } else if is_dir {
+                                "dir"
+                            } else {
+                                "file"
+                            }),
+                            modified_epoch: Some(i64::from(attrs.mtime.seconds)),
+                            size: Some(attrs.filesize),
+                            extension: extension.as_deref().or(Some("")),
+                        },
                     )
                 } else {
                     (false, true, false)

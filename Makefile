@@ -14,7 +14,7 @@ help:
 	@echo "质量："
 	@echo "  fmt            cargo fmt --all -- --check"
 	@echo "  fmt-fix        cargo fmt --all"
-	@echo "  clippy         cargo clippy --all-targets (baseline 化, 见 .claude/skills/quality-clippy/)"
+	@echo "  clippy         lib 关键 deny + baseline，并检查 tests/examples"
 	@echo "  test           cargo test --workspace --no-fail-fast"
 	@echo "  coverage       cargo llvm-cov (需要 cargo-llvm-cov)"
 	@echo ""

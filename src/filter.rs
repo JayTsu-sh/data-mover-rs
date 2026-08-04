@@ -36,6 +36,16 @@ enum ModifiedValue {
     AbsoluteEpoch(i64),
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FilterInput<'a> {
+    pub file_name: Option<&'a str>,
+    pub file_path: Option<&'a str>,
+    pub file_type: Option<&'a str>,
+    pub modified_epoch: Option<i64>,
+    pub size: Option<u64>,
+    pub extension: Option<&'a str>,
+}
+
 /// 检查文件/目录是否应该被跳过的核心过滤函数
 ///
 /// # 参数说明
@@ -58,17 +68,19 @@ enum ModifiedValue {
 /// 1. 优先检查排除表达式（黑名单），匹配则跳过
 /// 2. 再检查匹配表达式（白名单），根据匹配结果决定是否跳过
 /// 3. 最后处理无匹配表达式的情况
-#[allow(clippy::too_many_arguments)]
 pub fn should_skip(
     match_expressions: Option<&FilterExpression>,
     exclude_expressions: Option<&FilterExpression>,
-    file_name: Option<&str>,
-    file_path: Option<&str>,
-    file_type: Option<&str>,
-    modified_epoch: Option<i64>,
-    size: Option<u64>,
-    extension: Option<&str>,
+    input: FilterInput<'_>,
 ) -> (bool, bool, bool) {
+    let FilterInput {
+        file_name,
+        file_path,
+        file_type,
+        modified_epoch,
+        size,
+        extension,
+    } = input;
     trace!(
         "[filter::should_skip:FILTER-ENTRY] 开始检查: 匹配表达式= {:?}, 排除表达式={:?}, name={:?}, path={:?}, type={:?}, modified_epoch={:?}, size={:?}, extension={:?}",
         match_expressions,
@@ -88,16 +100,7 @@ pub fn should_skip(
 
     // 排除条件检查：黑名单过滤
     if let Some(expr) = exclude_expressions {
-        let match_result = evaluate_filter(
-            expr,
-            file_name,
-            file_path,
-            file_type,
-            modified_epoch,
-            size,
-            extension,
-            now_epoch,
-        );
+        let match_result = evaluate_filter(expr, &input, now_epoch);
 
         trace!(
             "[filter::should_skip:FILTER-EXCLUDE] 黑名单匹配结果: expr={:?}, result={:?}",
@@ -135,16 +138,7 @@ pub fn should_skip(
 
     // 匹配条件检查：白名单过滤
     if let Some(expr) = match_expressions {
-        let match_result = evaluate_filter(
-            expr,
-            file_name,
-            file_path,
-            file_type,
-            modified_epoch,
-            size,
-            extension,
-            now_epoch,
-        );
+        let match_result = evaluate_filter(expr, &input, now_epoch);
 
         trace!(
             "[filter::should_skip:FILTER-MATCH] 白名单匹配结果: expr={:?}, result={:?}, is_dir={}",
@@ -335,26 +329,12 @@ pub fn get_filter_field_definitions() -> Vec<FilterFieldDef> {
 }
 
 /// 评估过滤表达式的辅助函数
-#[allow(clippy::too_many_arguments)]
 fn evaluate_filter(
     expr: &FilterExpression,
-    file_name: Option<&str>,
-    file_path: Option<&str>,
-    file_type: Option<&str>,
-    modified_epoch: Option<i64>,
-    size: Option<u64>,
-    extension: Option<&str>,
+    input: &FilterInput<'_>,
     now_epoch: i64,
 ) -> MatchResult {
-    expr.evaluate(
-        file_name,
-        file_path,
-        file_type,
-        modified_epoch,
-        size,
-        extension,
-        now_epoch,
-    )
+    expr.evaluate(input, now_epoch)
 }
 
 /// Individual filter condition
@@ -1181,32 +1161,19 @@ impl FilterExpression {
     }
 
     /// 评估过滤表达式对文件的匹配情况
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate(
-        &self,
-        file_name: Option<&str>,
-        file_path: Option<&str>,
-        file_type: Option<&str>,
-        modified_epoch: Option<i64>,
-        size: Option<u64>,
-        extension: Option<&str>,
-        now_epoch: i64,
-    ) -> MatchResult {
+    fn evaluate(&self, input: &FilterInput<'_>, now_epoch: i64) -> MatchResult {
         trace!(
             "[FilterExpression::evaluate] evaluating filter expression: {:?}, file_name: {:?}, file_path: {:?}, file_type: {:?}, modified_epoch: {:?}, size: {:?}, extension: {:?}",
-            self.root, file_name, file_path, file_type, modified_epoch, size, extension
+            self.root,
+            input.file_name,
+            input.file_path,
+            input.file_type,
+            input.modified_epoch,
+            input.size,
+            input.extension
         );
 
-        let result = Self::evaluate_recursive(
-            &self.root,
-            file_name,
-            file_path,
-            file_type,
-            modified_epoch,
-            size,
-            extension,
-            now_epoch,
-        );
+        let result = Self::evaluate_recursive(&self.root, input, now_epoch);
 
         trace!(
             "[FilterExpression::evaluate] evaluated filter expression result: {:?}",
@@ -1216,39 +1183,17 @@ impl FilterExpression {
     }
 
     /// 递归评估过滤表达式树（含短路求值）
-    #[allow(clippy::too_many_arguments)]
     fn evaluate_recursive(
         ast_node: &FilterASTNode,
-        file_name: Option<&str>,
-        file_path: Option<&str>,
-        file_type: Option<&str>,
-        modified_epoch: Option<i64>,
-        size: Option<u64>,
-        extension: Option<&str>,
+        input: &FilterInput<'_>,
         now_epoch: i64,
     ) -> MatchResult {
         match ast_node {
-            FilterASTNode::Condition(condition) => Self::evaluate_condition(
-                condition,
-                file_name,
-                file_path,
-                file_type,
-                modified_epoch,
-                size,
-                extension,
-                now_epoch,
-            ),
+            FilterASTNode::Condition(condition) => {
+                Self::evaluate_condition(condition, input, now_epoch)
+            }
             FilterASTNode::And(left, right) => {
-                let left_result = Self::evaluate_recursive(
-                    left,
-                    file_name,
-                    file_path,
-                    file_type,
-                    modified_epoch,
-                    size,
-                    extension,
-                    now_epoch,
-                );
+                let left_result = Self::evaluate_recursive(left, input, now_epoch);
 
                 // 短路求值：左侧 MisMatch 时直接返回
                 if let MatchResult::MisMatch(_) = &left_result {
@@ -1259,16 +1204,7 @@ impl FilterExpression {
                     return left_result;
                 }
 
-                let right_result = Self::evaluate_recursive(
-                    right,
-                    file_name,
-                    file_path,
-                    file_type,
-                    modified_epoch,
-                    size,
-                    extension,
-                    now_epoch,
-                );
+                let right_result = Self::evaluate_recursive(right, input, now_epoch);
 
                 trace!(
                     "\n[FilterExpression::evaluate_recursive] and(left: {:?} => {:?}, right: {:?} => {:?}) => {:?}",
@@ -1282,16 +1218,7 @@ impl FilterExpression {
                 left_result & right_result
             }
             FilterASTNode::Or(left, right) => {
-                let left_result = Self::evaluate_recursive(
-                    left,
-                    file_name,
-                    file_path,
-                    file_type,
-                    modified_epoch,
-                    size,
-                    extension,
-                    now_epoch,
-                );
+                let left_result = Self::evaluate_recursive(left, input, now_epoch);
 
                 // 短路求值：左侧 Match 时直接返回
                 if let MatchResult::Match(_) = &left_result {
@@ -1302,16 +1229,7 @@ impl FilterExpression {
                     return left_result;
                 }
 
-                let right_result = Self::evaluate_recursive(
-                    right,
-                    file_name,
-                    file_path,
-                    file_type,
-                    modified_epoch,
-                    size,
-                    extension,
-                    now_epoch,
-                );
+                let right_result = Self::evaluate_recursive(right, input, now_epoch);
 
                 trace!(
                     "\n[FilterExpression::evaluate_recursive] or(left: {:?} => {:?}, right: {:?} => {:?}) => {:?}",
@@ -1328,17 +1246,19 @@ impl FilterExpression {
     }
 
     /// 评估单个过滤条件对文件的匹配情况
-    #[allow(clippy::too_many_arguments)]
     fn evaluate_condition(
         condition: &FilterCondition,
-        file_name: Option<&str>,
-        file_path: Option<&str>,
-        file_type: Option<&str>,
-        modified_epoch: Option<i64>,
-        size: Option<u64>,
-        extension: Option<&str>,
+        input: &FilterInput<'_>,
         now_epoch: i64,
     ) -> MatchResult {
+        let FilterInput {
+            file_name,
+            file_path,
+            file_type,
+            modified_epoch,
+            size,
+            extension,
+        } = *input;
         match condition {
             FilterCondition::Name { operator, pattern } => {
                 file_name.map_or(MatchResult::LazyMatch, |file_name| {
@@ -1518,13 +1438,13 @@ impl FilterExpression {
     }
 
     /// 计算逻辑表达式树中的节点数量
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn count_nodes(&self) -> usize {
         Self::count_nodes_in_expr(&self.root)
     }
 
     /// 递归计算表达式树中的节点数量
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn count_nodes_in_expr(expr: &FilterASTNode) -> usize {
         match expr {
             FilterASTNode::Condition(_) => 1,
@@ -1869,12 +1789,14 @@ mod tests {
         let now_epoch = crate::time_util::now_secs();
         evaluate_filter(
             &expr,
-            file_name,
-            file_path,
-            file_type,
-            modified_epoch,
-            size,
-            extension,
+            &FilterInput {
+                file_name,
+                file_path,
+                file_type,
+                modified_epoch,
+                size,
+                extension,
+            },
             now_epoch,
         )
     }
@@ -1893,12 +1815,14 @@ mod tests {
         let expr = FilterExpression::parse(expr_str).expect("Failed to parse expression");
         evaluate_filter(
             &expr,
-            file_name,
-            file_path,
-            file_type,
-            modified_epoch,
-            size,
-            extension,
+            &FilterInput {
+                file_name,
+                file_path,
+                file_type,
+                modified_epoch,
+                size,
+                extension,
+            },
             now_epoch,
         )
     }
@@ -1921,12 +1845,14 @@ mod tests {
         should_skip(
             match_parsed.as_ref(),
             exclude_parsed.as_ref(),
-            file_name,
-            file_path,
-            file_type,
-            modified_epoch,
-            size,
-            extension,
+            FilterInput {
+                file_name,
+                file_path,
+                file_type,
+                modified_epoch,
+                size,
+                extension,
+            },
         )
     }
 

@@ -53,7 +53,13 @@ async fn main() -> Result<()> {
     pb.enable_steady_tick(Duration::from_millis(100));
 
     let iter = src_storage
-        .walkdir(None, None, None, None, args.concurrency, false, false, 0)
+        .walkdir(
+            None,
+            data_mover::WalkOptions {
+                concurrency: args.concurrency,
+                ..Default::default()
+            },
+        )
         .await?;
 
     let mut entries: Vec<Arc<EntryEnum>> = Vec::new();

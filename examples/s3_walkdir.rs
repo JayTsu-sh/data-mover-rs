@@ -30,7 +30,13 @@ async fn main() -> Result<()> {
     let mut last_update = Instant::now();
 
     let iter = storage
-        .walkdir(None, None, None, None, 1, true, false, 0)
+        .walkdir(
+            None,
+            data_mover::WalkOptions {
+                include_tags: true,
+                ..Default::default()
+            },
+        )
         .await?;
     while let Some(msg) = iter.next().await {
         match msg {

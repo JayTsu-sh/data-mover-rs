@@ -23,23 +23,23 @@ pub fn combine_secs_nanos(secs: i64, nsecs: u32) -> i64 {
 #[inline]
 #[must_use]
 pub fn nanos_to_secs(nanos: i64) -> i64 {
-    nanos / NANOS_PER_SEC
+    nanos.div_euclid(NANOS_PER_SEC)
 }
 
 #[inline]
 #[must_use]
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 pub fn nanos_subsec(nanos: i64) -> u32 {
-    (nanos % NANOS_PER_SEC) as u32
+    u32::try_from(nanos.rem_euclid(NANOS_PER_SEC))
+        .unwrap_or_else(|_| unreachable!("nanosecond remainder is always in u32 range"))
 }
 
 #[inline]
 #[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub fn system_time_to_nanos(st: SystemTime) -> i64 {
-    st.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
+    match st.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
+        Err(error) => i64::try_from(error.duration().as_nanos()).map_or(i64::MIN, |nanos| -nanos),
+    }
 }
 
 #[inline]
@@ -110,6 +110,14 @@ mod tests {
     fn system_time_to_nanos_epoch() {
         let nanos = system_time_to_nanos(UNIX_EPOCH);
         assert_eq!(nanos, 0);
+    }
+
+    #[test]
+    fn pre_epoch_time_keeps_signed_subsecond_components() {
+        let st = UNIX_EPOCH - std::time::Duration::from_nanos(1);
+        assert_eq!(system_time_to_nanos(st), -1);
+        assert_eq!(nanos_to_secs(-1), -1);
+        assert_eq!(nanos_subsec(-1), 999_999_999);
     }
 
     #[test]

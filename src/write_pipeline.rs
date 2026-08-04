@@ -130,6 +130,11 @@ pub(crate) async fn write_pipeline_core<S: ChunkSink>(
     commit: CommitPolicy,
     bytes_counter: Option<Arc<AtomicU64>>,
 ) -> Result<u64> {
+    if sub_chunk_size == Some(0) {
+        return Err(StorageError::OperationError(
+            "sub_chunk_size must be greater than zero".to_string(),
+        ));
+    }
     let inflight = inflight.max(1);
     let mut inflight_set: FuturesUnordered<WriteFut<'_>> = FuturesUnordered::new();
     let mut first_error: Option<StorageError> = None;
