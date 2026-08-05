@@ -163,6 +163,205 @@ pub struct LocalStorage {
 }
 
 impl LocalStorage {
+    async fn relative_entry_path(
+        &self,
+        full_path: &Path,
+        tx: &async_channel::Sender<StorageEntryMessage>,
+        producer_id: usize,
+    ) -> Option<PathBuf> {
+        if let Ok(path) = full_path.strip_prefix(&*self.root_path) {
+            return Some(path.to_path_buf());
+        }
+        error!("[Producer {producer_id}] Failed to strip prefix from {full_path:?}");
+        let _ = tx
+            .send(StorageEntryMessage::Error {
+                event: ErrorEvent::Scan,
+                path: full_path.to_path_buf(),
+                entry: None,
+                reason: "Failed to strip prefix".to_string(),
+            })
+            .await;
+        None
+    }
+
+    async fn entry_metadata(
+        full_path: &Path,
+        relative_path: &Path,
+        tx: &async_channel::Sender<StorageEntryMessage>,
+        producer_id: usize,
+    ) -> Option<std::fs::Metadata> {
+        match tokio::fs::symlink_metadata(full_path).await {
+            Ok(metadata) => Some(metadata),
+            Err(error) => {
+                error!(
+                    "[Producer {producer_id}] Failed to get metadata for {relative_path:?}: {error}"
+                );
+                let _ = tx
+                    .send(StorageEntryMessage::Error {
+                        event: ErrorEvent::Scan,
+                        path: relative_path.to_path_buf(),
+                        entry: None,
+                        reason: format!("Failed to get metadata: {error}"),
+                    })
+                    .await;
+                None
+            }
+        }
+    }
+
+    fn walk_filter_decision(
+        runtime: &LocalWalkRuntime<'_>,
+        skip_filter: bool,
+        file_name: &str,
+        relative_path: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> (bool, bool, bool) {
+        if !skip_filter {
+            return (false, true, false);
+        }
+        #[cfg(windows)]
+        let normalized_path = relative_path.to_string_lossy().replace('\\', "/");
+        #[cfg(not(windows))]
+        let normalized_path = relative_path.to_string_lossy();
+        let file_type = if metadata.is_symlink() {
+            "symlink"
+        } else if metadata.is_dir() {
+            "dir"
+        } else {
+            "file"
+        };
+        should_skip(
+            runtime.match_expr.as_ref().as_ref(),
+            runtime.exclude_expr.as_ref().as_ref(),
+            FilterInput {
+                file_name: Some(file_name),
+                file_path: Some(&normalized_path),
+                file_type: Some(file_type),
+                modified_epoch: Some(
+                    metadata
+                        .modified()
+                        .unwrap_or(UNIX_EPOCH)
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |duration| {
+                            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+                        }),
+                ),
+                size: Some(metadata.len()),
+                extension: relative_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .or(Some("")),
+            },
+        )
+    }
+
+    async fn track_package_depth(
+        runtime: &LocalWalkRuntime<'_>,
+        package_remaining: Option<usize>,
+        is_dir: bool,
+        full_path: &Path,
+        current_depth: usize,
+    ) -> Option<bool> {
+        let Some(remaining) = package_remaining else {
+            return Some(false);
+        };
+        if !is_dir {
+            return None;
+        }
+        if remaining <= 1 {
+            return Some(true);
+        }
+        runtime
+            .scheduler
+            .push_task((
+                full_path.to_path_buf(),
+                current_depth + 1,
+                false,
+                Some(remaining - 1),
+            ))
+            .await;
+        None
+    }
+
+    async fn packaged_filter_decision(
+        runtime: &LocalWalkRuntime<'_>,
+        send_packaged: bool,
+        is_dir: bool,
+        file_name: &str,
+        full_path: &Path,
+        current_depth: usize,
+        entry_depth: usize,
+    ) -> Option<bool> {
+        if send_packaged
+            || !runtime.packaged
+            || !is_dir
+            || !dir_matches_date_filter(runtime.match_expr.as_ref().as_ref(), file_name)
+        {
+            return Some(send_packaged);
+        }
+        if runtime.max_depth > 0 && entry_depth + runtime.package_depth > runtime.max_depth {
+            return None;
+        }
+        if runtime.package_depth == 0 {
+            return Some(true);
+        }
+        runtime
+            .scheduler
+            .push_task((
+                full_path.to_path_buf(),
+                current_depth + 1,
+                false,
+                Some(runtime.package_depth),
+            ))
+            .await;
+        None
+    }
+
+    async fn send_walk_entry(
+        runtime: &LocalWalkRuntime<'_>,
+        entry: EntryEnum,
+        packaged: bool,
+        producer_id: usize,
+    ) -> bool {
+        let message = if packaged {
+            StorageEntryMessage::Packaged(Arc::new(entry))
+        } else {
+            StorageEntryMessage::Scanned(Arc::new(entry))
+        };
+        if runtime.tx.send(message).await.is_err() {
+            error!("[Producer {producer_id}] Output channel closed, stopping processing");
+            return false;
+        }
+        runtime.total_file_count.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    async fn skip_filtered_entry(
+        runtime: &LocalWalkRuntime<'_>,
+        filter_decision: (bool, bool, bool),
+        is_dir: bool,
+        current_depth: usize,
+        full_path: &Path,
+    ) -> bool {
+        let (skip_entry, continue_scan, need_submatch) = filter_decision;
+        if !skip_entry {
+            return false;
+        }
+        if continue_scan && is_dir && (current_depth < runtime.max_depth || runtime.max_depth == 0)
+        {
+            runtime
+                .scheduler
+                .push_task((
+                    full_path.to_path_buf(),
+                    current_depth + 1,
+                    need_submatch,
+                    None,
+                ))
+                .await;
+        }
+        true
+    }
+
     pub fn new(root: impl Into<PathBuf>, block_size: Option<u64>) -> Self {
         Self {
             root_path: Arc::new(root.into()),
@@ -233,6 +432,10 @@ impl LocalStorage {
         Ok(LocalFileHandle::new(file))
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn delete_file(&self, relative_path: &Path) -> Result<()> {
         let full_path = self.get_full_path(relative_path);
         tokio::fs::remove_file(&full_path)
@@ -240,6 +443,10 @@ impl LocalStorage {
             .map_err(StorageError::IoError)
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn create_symlink(
         &self,
         #[cfg_attr(
@@ -340,6 +547,10 @@ impl LocalStorage {
     /// 读取符号链接的目标路径
     /// 如果符号链接的目标是self.root的子目录，则返回相对于self.root的路径
     /// 否则返回错误
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn read_symlink(&self, relative_path: &Path) -> Result<PathBuf> {
         let full_path = self.get_full_path(relative_path);
 
@@ -348,6 +559,10 @@ impl LocalStorage {
             .map_err(StorageError::IoError)
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn create_dir_all(&self, relative_path: &Path) -> Result<()> {
         let full_path = self.get_full_path(relative_path);
 
@@ -356,12 +571,20 @@ impl LocalStorage {
             .map_err(StorageError::IoError)
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn delete_dir_all(&self, relative_path: Option<&Path>) -> Result<()> {
         let iter = self.delete_dir_all_with_progress(relative_path, 4)?;
         while iter.next().await.is_some() {}
         Ok(())
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn delete_dir_all_with_progress(
         &self,
         relative_path: Option<&Path>,
@@ -395,6 +618,10 @@ impl LocalStorage {
         Ok(DeleteDirIterator::new(rx))
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         let from_full_path = self.get_full_path(from);
         let to_full_path = self.get_full_path(to);
@@ -403,6 +630,10 @@ impl LocalStorage {
             .map_err(StorageError::IoError)
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn get_metadata(&self, relative_path: &Path) -> Result<EntryEnum> {
         let path = relative_path.to_path_buf();
         let full_path = self.get_full_path(relative_path);
@@ -428,6 +659,10 @@ impl LocalStorage {
 
     /// 更新文件元数据: 包括修改时间、访问时间、所有者UID、组ID和权限模式.
     /// 该函数会同步更新文件和目录的元数据（不包含软链接）.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn set_metadata(
         &self,
         relative_path: &Path,
@@ -513,6 +748,10 @@ impl LocalStorage {
         Ok(())
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn walkdir(
         &self,
         sub_path: Option<&Path>,
@@ -635,12 +874,7 @@ impl LocalStorage {
         let producer_id = runtime.scheduler.worker_id;
         let tx = runtime.tx;
         let ctx = runtime.scheduler;
-        let match_expr = runtime.match_expr;
-        let exclude_expr = runtime.exclude_expr;
         let max_depth = runtime.max_depth;
-        let total_file_count = runtime.total_file_count;
-        let packaged = runtime.packaged;
-        let package_depth = runtime.package_depth;
         // 使用tokio::fs::read_dir读取目录条目
         let mut dir_entries = tokio::fs::read_dir(&dir_path).await?;
 
@@ -663,130 +897,53 @@ impl LocalStorage {
             // 构建完整路径
             let full_path = entry.path();
 
-            // 计算相对路径
-            let Ok(relative_path) = full_path.strip_prefix(&*self.root_path) else {
-                error!(
-                    "[Producer {}] Failed to strip prefix from {:?}",
-                    producer_id, full_path
-                );
-                let _ = tx
-                    .send(StorageEntryMessage::Error {
-                        event: ErrorEvent::Scan,
-                        path: full_path.clone(),
-                        entry: None,
-                        reason: "Failed to strip prefix".to_string(),
-                    })
-                    .await;
+            let Some(relative_path) = self.relative_entry_path(&full_path, tx, producer_id).await
+            else {
                 continue;
             };
-            // 确保相对路径不包含前导斜杠，与原始实现保持一致
-            let relative_path = relative_path.to_path_buf();
-            debug!(
-                "[Producer {}] Processing entry: {:?}, skip_filter={}",
-                producer_id, relative_path, skip_filter
-            );
-
             // 提取扩展名
             let extension = relative_path.extension().and_then(|ext| ext.to_str());
 
-            // symlink_metadata 对符号链接本身 lstat，同时提供 file_type，避免双重 syscall
-            let metadata = match tokio::fs::symlink_metadata(&full_path).await {
-                Ok(meta) => meta,
-                Err(e) => {
-                    error!(
-                        "[Producer {}] Failed to get metadata for {:?}: {}",
-                        producer_id, relative_path, e
-                    );
-                    let _ = tx
-                        .send(StorageEntryMessage::Error {
-                            event: ErrorEvent::Scan,
-                            path: relative_path.clone(),
-                            entry: None,
-                            reason: format!("Failed to get metadata: {e}"),
-                        })
-                        .await;
-                    continue;
-                }
+            let Some(metadata) =
+                Self::entry_metadata(&full_path, &relative_path, tx, producer_id).await
+            else {
+                continue;
             };
 
             let is_dir = metadata.is_dir();
             let is_symlink = metadata.is_symlink();
 
-            // 规范化路径分隔符：Windows 上将 '\' 转为 '/'，与 NFS/S3 及 FilterExpression 保持一致
-            #[cfg(windows)]
-            let normalized_path = relative_path.to_string_lossy().replace('\\', "/");
-            #[cfg(not(windows))]
-            let normalized_path = relative_path.to_string_lossy();
-
-            // 过滤：基于文件名、路径、文件类型、修改时间、大小和扩展名
-            let (skip_entry, continue_scan, need_submatch) = if skip_filter {
-                should_skip(
-                    match_expr.as_ref().as_ref(),
-                    exclude_expr.as_ref().as_ref(),
-                    FilterInput {
-                        file_name: Some(&file_name),
-                        file_path: Some(&normalized_path),
-                        file_type: Some(if is_symlink {
-                            "symlink"
-                        } else if is_dir {
-                            "dir"
-                        } else {
-                            "file"
-                        }),
-                        modified_epoch: Some(
-                            metadata
-                                .modified()
-                                .unwrap_or(UNIX_EPOCH)
-                                .duration_since(UNIX_EPOCH)
-                                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
-                        ),
-                        size: Some(metadata.len()),
-                        extension: extension.or(Some("")),
-                    },
-                )
-            } else {
-                // skip_filter=false 表示父目录已匹配，子项无需过滤
-                // need_submatch=false 确保免过滤传递给所有后代
-                (false, true, false)
-            };
-            debug!(
-                "[Producer {}] Filter result: skip={}, continue_scan={}, need_submatch={}",
-                producer_id, skip_entry, continue_scan, need_submatch
+            let (skip_entry, continue_scan, need_submatch) = Self::walk_filter_decision(
+                &runtime,
+                skip_filter,
+                &file_name,
+                &relative_path,
+                &metadata,
             );
-
             // 计算条目的实际深度：目录深度+1
             let entry_depth = current_depth + 1;
-            let mut send_packaged = false;
+            let Some(send_packaged) = Self::track_package_depth(
+                &runtime,
+                package_remaining,
+                is_dir,
+                &full_path,
+                current_depth,
+            )
+            .await
+            else {
+                continue;
+            };
 
-            // package 深度追踪模式：只处理目录，跳过文件和 filter
-            if let Some(remaining) = package_remaining {
-                if !is_dir {
-                    continue;
-                }
-                if remaining > 1 {
-                    ctx.push_task((
-                        full_path.clone(),
-                        current_depth + 1,
-                        false,
-                        Some(remaining - 1),
-                    ))
-                    .await;
-                    continue;
-                }
-                // remaining <= 1：到达目标深度，标记发送 Packaged
-                send_packaged = true;
-            }
-
-            if !send_packaged && skip_entry {
-                // 如果skip_entry为true，但continue_scan为true，且是目录，则继续扫描其子目录
-                if continue_scan && is_dir && (current_depth < max_depth || max_depth == 0) {
-                    ctx.push_task((full_path.clone(), current_depth + 1, need_submatch, None))
-                        .await;
-                }
-                debug!(
-                    "[Producer {}] Skipping entry {:?} (filter)",
-                    producer_id, relative_path
-                );
+            if !send_packaged
+                && Self::skip_filtered_entry(
+                    &runtime,
+                    (skip_entry, continue_scan, need_submatch),
+                    is_dir,
+                    current_depth,
+                    &full_path,
+                )
+                .await
+            {
                 continue;
             }
 
@@ -799,71 +956,34 @@ impl LocalStorage {
                 is_symlink,
             ));
 
-            // packaged 模式：目录匹配 DirDate 条件时决定打包策略
-            if !send_packaged
-                && packaged
-                && is_dir
-                && dir_matches_date_filter(match_expr.as_ref().as_ref(), &file_name)
-            {
-                if max_depth > 0 && entry_depth + package_depth > max_depth {
-                    continue;
-                }
-                if package_depth > 0 {
-                    ctx.push_task((
-                        full_path.clone(),
-                        current_depth + 1,
-                        false,
-                        Some(package_depth),
-                    ))
-                    .await;
-                    continue;
-                }
-                send_packaged = true;
-            }
+            let Some(send_packaged) = Self::packaged_filter_decision(
+                &runtime,
+                send_packaged,
+                is_dir,
+                &file_name,
+                &full_path,
+                current_depth,
+                entry_depth,
+            )
+            .await
+            else {
+                continue;
+            };
 
             // 统一的 Packaged 发送
             if send_packaged {
-                debug!(
-                    "[Producer {}] Packaged dir {:?} (depth: {})",
-                    producer_id, relative_path, entry_depth
-                );
-                if tx
-                    .send(StorageEntryMessage::Packaged(Arc::new(entry)))
-                    .await
-                    .is_err()
-                {
-                    error!(
-                        "[Producer {}] Output channel closed, stopping processing",
-                        producer_id
-                    );
+                if !Self::send_walk_entry(&runtime, entry, true, producer_id).await {
                     break;
                 }
-                total_file_count.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
             // 检查深度限制：只有当条目深度在允许范围内时才发送
             // 0表示无限深度
-            if max_depth == 0 || entry_depth <= max_depth {
-                trace!(
-                    "[Producer {}] Sending entry {:?} (depth: {})",
-                    producer_id, entry, entry_depth
-                );
-                // 发送StorageEntry到通道
-                if tx
-                    .send(StorageEntryMessage::Scanned(Arc::new(entry)))
-                    .await
-                    .is_err()
-                {
-                    error!(
-                        "[Producer {}] Output channel closed, stopping processing",
-                        producer_id
-                    );
-                    break;
-                }
-
-                // 更新全局文件计数器
-                total_file_count.fetch_add(1, Ordering::Relaxed);
+            if (max_depth == 0 || entry_depth <= max_depth)
+                && !Self::send_walk_entry(&runtime, entry, false, producer_id).await
+            {
+                break;
             }
 
             // 如果是目录且未达到最大深度，将其添加到任务队列
@@ -1198,7 +1318,7 @@ impl LocalStorage {
         handle: &crate::dir_tree::DirHandle,
         ctx: &crate::dir_tree::ReadContext,
     ) -> Result<crate::dir_tree::ReadResult> {
-        use crate::dir_tree::{DirHandle, ReadResult, SubdirEntry};
+        use crate::dir_tree::{DirHandle, SubdirEntry};
 
         let full_path = match handle {
             DirHandle::Local(p) => p.clone(),
@@ -1216,12 +1336,7 @@ impl LocalStorage {
         let mut dir = match tokio::fs::read_dir(&full_path).await {
             Ok(d) => d,
             Err(e) => {
-                return Ok(ReadResult {
-                    dir_path: dir_path.to_string(),
-                    files: Vec::new(),
-                    subdirs: Vec::new(),
-                    errors: vec![e.to_string()],
-                });
+                return Ok(Self::failed_directory_read(dir_path, &e));
             }
         };
 
@@ -1259,39 +1374,15 @@ impl LocalStorage {
                 .and_then(|e| e.to_str())
                 .map(str::to_string);
 
-            // 应用 filter（仅当 apply_filter=true 时）
-            let (skip_entry, continue_scan, need_submatch) = if ctx.apply_filter {
-                #[cfg(windows)]
-                let normalized = relative_path.to_string_lossy().replace('\\', "/");
-                #[cfg(not(windows))]
-                let normalized = relative_path.to_string_lossy();
-
-                crate::filter::should_skip(
-                    ctx.match_expr.as_ref().as_ref(),
-                    ctx.exclude_expr.as_ref().as_ref(),
-                    FilterInput {
-                        file_name: Some(&file_name),
-                        file_path: Some(&normalized),
-                        file_type: Some(if is_symlink {
-                            "symlink"
-                        } else if is_dir {
-                            "dir"
-                        } else {
-                            "file"
-                        }),
-                        modified_epoch: metadata
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
-                        size: Some(metadata.len()),
-                        extension: extension_owned.as_deref().or(Some("")),
-                    },
-                )
-            } else {
-                // 父目录已匹配，子项无需过滤
-                (false, true, false)
-            };
+            let (skip_entry, continue_scan, need_submatch) = Self::filter_decision(
+                ctx,
+                &relative_path,
+                &file_name,
+                &metadata,
+                is_dir,
+                is_symlink,
+                extension_owned.as_deref(),
+            );
 
             if skip_entry {
                 // 目录被跳过但 continue_scan=true → 加入 subdirs 但 visible=false
@@ -1324,33 +1415,114 @@ impl LocalStorage {
             );
             let entry_enum = Arc::new(EntryEnum::NAS(nas));
 
-            // 深度检查：超过 max_depth 的子目录不进入 subdirs（不递归），但仍作为 entry 记录
-            if is_dir && ctx.max_depth > 0 && ctx.current_depth + 1 >= ctx.max_depth {
-                files.push(entry_enum);
-            } else if is_dir {
-                subdirs.push(SubdirEntry {
-                    entry: entry_enum,
-                    visible: true,
-                    need_filter: need_submatch,
-                });
-            } else {
-                files.push(entry_enum);
-            }
+            Self::classify_visible_entry(
+                ctx,
+                is_dir,
+                need_submatch,
+                entry_enum,
+                &mut files,
+                &mut subdirs,
+            );
         }
 
-        // 排序
+        Ok(Self::finish_directory_read(
+            dir_path, files, subdirs, errors,
+        ))
+    }
+
+    fn finish_directory_read(
+        dir_path: &str,
+        mut files: Vec<Arc<EntryEnum>>,
+        mut subdirs: Vec<crate::dir_tree::SubdirEntry>,
+        errors: Vec<String>,
+    ) -> crate::dir_tree::ReadResult {
         files.sort_by(|a, b| a.get_name().cmp(b.get_name()));
         subdirs.sort_by(|a, b| a.entry.get_name().cmp(b.entry.get_name()));
-
-        Ok(ReadResult {
+        crate::dir_tree::ReadResult {
             dir_path: dir_path.to_string(),
             files,
             subdirs,
             errors,
-        })
+        }
+    }
+
+    fn failed_directory_read(
+        dir_path: &str,
+        error: &std::io::Error,
+    ) -> crate::dir_tree::ReadResult {
+        crate::dir_tree::ReadResult {
+            dir_path: dir_path.to_string(),
+            files: Vec::new(),
+            subdirs: Vec::new(),
+            errors: vec![error.to_string()],
+        }
+    }
+
+    fn filter_decision(
+        ctx: &crate::dir_tree::ReadContext,
+        relative_path: &Path,
+        file_name: &str,
+        metadata: &std::fs::Metadata,
+        is_dir: bool,
+        is_symlink: bool,
+        extension: Option<&str>,
+    ) -> (bool, bool, bool) {
+        if !ctx.apply_filter {
+            return (false, true, false);
+        }
+        #[cfg(windows)]
+        let normalized = relative_path.to_string_lossy().replace('\\', "/");
+        #[cfg(not(windows))]
+        let normalized = relative_path.to_string_lossy();
+        let file_type = if is_symlink {
+            "symlink"
+        } else if is_dir {
+            "dir"
+        } else {
+            "file"
+        };
+        crate::filter::should_skip(
+            ctx.match_expr.as_ref().as_ref(),
+            ctx.exclude_expr.as_ref().as_ref(),
+            FilterInput {
+                file_name: Some(file_name),
+                file_path: Some(&normalized),
+                file_type: Some(file_type),
+                modified_epoch: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)),
+                size: Some(metadata.len()),
+                extension: extension.or(Some("")),
+            },
+        )
+    }
+
+    fn classify_visible_entry(
+        ctx: &crate::dir_tree::ReadContext,
+        is_dir: bool,
+        need_filter: bool,
+        entry: Arc<EntryEnum>,
+        files: &mut Vec<Arc<EntryEnum>>,
+        subdirs: &mut Vec<crate::dir_tree::SubdirEntry>,
+    ) {
+        if !is_dir || ctx.max_depth > 0 && ctx.current_depth + 1 >= ctx.max_depth {
+            files.push(entry);
+        } else {
+            subdirs.push(crate::dir_tree::SubdirEntry {
+                entry,
+                visible: true,
+                need_filter,
+            });
+        }
     }
 
     /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn walkdir_2(
         &self,
         sub_path: Option<&Path>,
@@ -1439,6 +1611,10 @@ fn normalize_local_path(path: &str) -> Result<String> {
 /// 创建本地存储实例
 ///
 /// `ensure_dir = true`（目标端）时目录不存在则自动递归创建。
+///
+/// # Errors
+///
+/// Returns an error when the requested storage operation cannot be completed.
 pub fn create_local_storage(
     path: &str,
     block_size: Option<u64>,

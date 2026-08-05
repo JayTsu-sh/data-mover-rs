@@ -3,6 +3,7 @@ use std::ops::{BitAnd, BitOr};
 
 // 外部crate
 use glob::{MatchOptions, Pattern};
+use num_traits::ToPrimitive;
 use tracing::trace;
 
 // 内部模块
@@ -44,6 +45,27 @@ pub struct FilterInput<'a> {
     pub modified_epoch: Option<i64>,
     pub size: Option<u64>,
     pub extension: Option<&'a str>,
+}
+
+fn excluded_entry_decision(result: &MatchResult, is_dir: bool) -> Option<(bool, bool, bool)> {
+    match result {
+        MatchResult::Match(MatchAddon::Path | MatchAddon::Mixed) => Some((true, false, false)),
+        MatchResult::Match(_) => Some((true, is_dir, true)),
+        MatchResult::PartialMatch => Some((true, true, true)),
+        MatchResult::MisMatch(_) | MatchResult::LazyMatch => None,
+    }
+}
+
+fn included_entry_decision(result: &MatchResult, is_dir: bool) -> Option<(bool, bool, bool)> {
+    match result {
+        MatchResult::Match(MatchAddon::Path) => Some((false, is_dir, false)),
+        MatchResult::Match(_) => Some((false, is_dir, true)),
+        MatchResult::PartialMatch | MatchResult::MisMatch(MisMatchAddon::Other) => {
+            Some((true, is_dir, true))
+        }
+        MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch) => Some((true, false, false)),
+        MatchResult::LazyMatch => None,
+    }
 }
 
 /// 检查文件/目录是否应该被跳过的核心过滤函数
@@ -107,32 +129,8 @@ pub fn should_skip(
             expr, match_result
         );
 
-        match match_result {
-            MatchResult::Match(MatchAddon::Path | MatchAddon::Mixed) => {
-                // 带路径条件完整匹配黑名单，跳过当前条目，不继续扫描子目录
-                trace!(
-                    "[filter::should_skip:FILTER-EXCLUDE-MATCH] 带路径条件完整匹配黑名单，跳过当前条目，停止递归: name={:?}, path={:?}",
-                    file_name, file_path
-                );
-                return (true, false, false);
-            }
-            MatchResult::Match(_) => {
-                // 不带路径条件完整匹配黑名单，跳过当前条目，继续扫描子目录
-                trace!(
-                    "[filter::should_skip:FILTER-EXCLUDE-MATCH] 不带路径条件完整匹配黑名单，跳过当前条目，继续扫描子目录: name={:?}, path={:?}, is_dir={}",
-                    file_name, file_path, is_dir
-                );
-                return (true, is_dir, true);
-            }
-            MatchResult::PartialMatch => {
-                // 目录部分匹配黑名单(这意味着当前条目是目录)，跳过当前条目，但继续扫描子目录
-                trace!(
-                    "[filter::should_skip:FILTER-EXCLUDE-PARTIAL] 目录部分匹配黑名单，跳过当前条目，继续扫描子目录: name={:?}, path={:?}, is_dir={}",
-                    file_name, file_path, is_dir
-                );
-                return (true, true, true);
-            }
-            _ => { /*流转到白名单匹配*/ }
+        if let Some(decision) = excluded_entry_decision(&match_result, is_dir) {
+            return decision;
         }
     }
 
@@ -145,55 +143,8 @@ pub fn should_skip(
             expr, match_result, is_dir
         );
 
-        match match_result {
-            MatchResult::Match(MatchAddon::Path) => {
-                // 完整匹配白名单，不跳过当前条目， 继续扫描子目录，又只有path匹配条件，子目录无需匹配
-                trace!(
-                    "[filter::should_skip:FILTER-MATCH-FULL] 完整匹配白名单，保留当前条目，若是目录则继续递归子项(无需检查): name={:?}, path={:?}, is_dir={}",
-                    file_name, file_path, is_dir
-                );
-                return (false, is_dir, false);
-            }
-            MatchResult::Match(_) => {
-                // 完整匹配白名单，不跳过当前条目， 继续扫描子目录，子目录需匹配检查
-                trace!(
-                    "[filter::should_skip:FILTER-MATCH-FULL] 完整匹配白名单，保留当前条目，若是目录则继续递归子项(需要检查): name={:?}, path={:?}",
-                    file_name, file_path
-                );
-                return (false, is_dir, true);
-            }
-            MatchResult::PartialMatch => {
-                // 目录部分匹配白名单，跳过当前条目，但继续扫描子目录
-                trace!(
-                    "[filter::should_skip:FILTER-MATCH-PARTIAL] 白名单目录部分匹配，跳过当前条目，若是目录则继续递归检查子项: name={:?}, path={:?}, match_result={:?}, is_dir={}",
-                    file_name, file_path, match_result, is_dir
-                );
-
-                // Always continue scanning for partial matches if it's a directory
-                return (true, is_dir, true);
-            }
-            MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch) => {
-                // 完整路径不匹配白名单，跳过当前条目，也无需扫描子目录
-                trace!(
-                    "[filter::should_skip:FILTER-MATCH-PARTIAL] 白名单完整路径不匹配，跳过当前条目，也无需扫描子目录: name={:?}, path={:?}, match_result={:?}",
-                    file_name, file_path, match_result
-                );
-
-                // Always continue scanning for partial matches if it's a directory
-                return (true, false, false);
-            }
-            MatchResult::MisMatch(_) => {
-                // 其它原因不匹配白名单，跳过当前条目，继续扫描子目录
-                trace!(
-                    "[filter::should_skip:FILTER-MATCH-PARTIAL] 白名单其它原因不匹配，跳过当前条目，继续扫描子目录: name={:?}, path={:?}, match_result={:?}, is_dir={}",
-                    file_name, file_path, match_result, is_dir
-                );
-
-                // Always continue scanning for partial matches if it's a directory
-                return (true, is_dir, true);
-            }
-            MatchResult::LazyMatch => { /* 过滤表达式没有白名单适用条件，继续后续流程 */
-            }
+        if let Some(decision) = included_entry_decision(&match_result, is_dir) {
+            return decision;
         }
     }
 
@@ -209,6 +160,7 @@ pub fn should_skip(
 ///
 /// 仅在 packaged 模式下由 walkdir 调用。如果 `match_expressions` 为 None 或不包含
 /// `DirDate` 条件，返回 false。
+#[must_use]
 pub fn dir_matches_date_filter(
     match_expressions: Option<&FilterExpression>,
     dir_name: &str,
@@ -220,6 +172,10 @@ pub fn dir_matches_date_filter(
 }
 
 /// 解析过滤表达式的辅助函数
+///
+/// # Errors
+///
+/// Returns an error when the requested storage operation cannot be completed.
 pub fn parse_filter_expression(expr: &str) -> Result<FilterExpression> {
     FilterExpression::parse(expr)
 }
@@ -274,6 +230,7 @@ fn ops_from(defs: &[(&'static str, &'static str)]) -> Vec<FilterOperatorDef> {
 }
 
 /// 返回所有支持的过滤字段定义，与 `FilterCondition` 枚举保持同步。
+#[must_use]
 pub fn get_filter_field_definitions() -> Vec<FilterFieldDef> {
     vec![
         FilterFieldDef {
@@ -398,6 +355,7 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
+    #[must_use]
     pub fn new(input: &'a str) -> Self {
         Lexer { input, position: 0 }
     }
@@ -588,6 +546,39 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    fn parse_path_condition(value: &str, operator: CompareOp) -> Result<FilterCondition> {
+        let raw_value = Self::extract_quoted_value(value, "")
+            .trim_end_matches('/')
+            .to_string();
+        let pattern = Pattern::new(&raw_value).map_err(|error| {
+            StorageError::InvalidFilterExpression(format!(
+                "Invalid glob pattern '{raw_value}': {error}"
+            ))
+        })?;
+        let pattern_parts: Vec<String> = raw_value
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(std::string::ToString::to_string)
+            .collect();
+        let pattern_depth = pattern_parts.len();
+        let has_double_wildcard = pattern_parts.iter().any(|part| part == "**");
+        let pattern_after_wildcard = pattern_parts
+            .iter()
+            .skip_while(|part| part.as_str() != "**")
+            .skip(1)
+            .cloned()
+            .collect();
+        Ok(FilterCondition::Path {
+            operator,
+            raw_value,
+            pattern,
+            pattern_parts,
+            pattern_depth,
+            has_double_wildcard,
+            pattern_after_wildcard,
+        })
+    }
+
     /// Parse a single filter condition
     fn parse_condition(expr: &str) -> Result<Option<FilterCondition>> {
         let expr = expr.trim();
@@ -617,35 +608,7 @@ impl<'a> Lexer<'a> {
                         }));
                     }
                     "path" => {
-                        let value = Self::extract_quoted_value(value, "");
-                        let raw_value = value.trim_end_matches('/').to_string();
-                        let pattern = Pattern::new(&raw_value).map_err(|e| {
-                            StorageError::InvalidFilterExpression(format!(
-                                "Invalid glob pattern '{raw_value}': {e}",
-                            ))
-                        })?;
-                        let pattern_parts: Vec<String> = raw_value
-                            .split('/')
-                            .filter(|s| !s.is_empty())
-                            .map(std::string::ToString::to_string)
-                            .collect();
-                        let pattern_depth = pattern_parts.len();
-                        let has_double_wildcard = pattern_parts.iter().any(|p| p == "**");
-                        let pattern_after_wildcard: Vec<String> = pattern_parts
-                            .iter()
-                            .skip_while(|p| p.as_str() != "**")
-                            .skip(1)
-                            .cloned()
-                            .collect();
-                        return Ok(Some(FilterCondition::Path {
-                            operator: compare_op,
-                            raw_value,
-                            pattern,
-                            pattern_parts,
-                            pattern_depth,
-                            has_double_wildcard,
-                            pattern_after_wildcard,
-                        }));
+                        return Self::parse_path_condition(value, compare_op).map(Some);
                     }
                     "type" => {
                         let value = Self::extract_quoted_value(value, "");
@@ -1317,32 +1280,7 @@ impl FilterExpression {
                 })
             }
             FilterCondition::Modified { operator, value } => {
-                modified_epoch.map_or(MatchResult::LazyMatch, |file_epoch| match value {
-                    ModifiedValue::RelativeDays(days) => {
-                        #[expect(
-                            clippy::cast_precision_loss,
-                            reason = "day comparisons accept sub-second floating-point precision"
-                        )]
-                        let file_days = (now_epoch - file_epoch) as f64 / 86400.0;
-                        MatchResult::from_bool(match operator {
-                            CompareOp::Lt => file_days < *days,
-                            CompareOp::Gt => file_days > *days,
-                            CompareOp::Le => file_days <= *days,
-                            CompareOp::Ge => file_days >= *days,
-                            _ => false,
-                        })
-                    }
-                    ModifiedValue::AbsoluteEpoch(ts) => {
-                        MatchResult::from_bool(match operator {
-                            CompareOp::Eq => file_epoch / 86400 == ts / 86400, // 按天粒度比较
-                            CompareOp::Ne => file_epoch / 86400 != ts / 86400,
-                            CompareOp::Lt => file_epoch < *ts,
-                            CompareOp::Gt => file_epoch > *ts,
-                            CompareOp::Le => file_epoch <= *ts,
-                            CompareOp::Ge => file_epoch >= *ts,
-                        })
-                    }
-                })
+                Self::evaluate_modified(*operator, value, modified_epoch, now_epoch)
             }
             FilterCondition::Size { operator, value } => {
                 size.map_or(MatchResult::LazyMatch, |size| {
@@ -1367,41 +1305,68 @@ impl FilterExpression {
                 })
             }
             FilterCondition::DirDate { operator, epoch } => {
-                // 非目录条目：透明通过
-                if file_type != Some("dir") {
-                    return MatchResult::Match(MatchAddon::NonPath);
-                }
-
-                // 从目录名中提取日期
-                let Some(dir_name) = file_name else {
-                    return MatchResult::Match(MatchAddon::NonPath);
-                };
-
-                match extract_date_from_dir_name(dir_name) {
-                    Some(dir_epoch) => {
-                        // 目录包含日期，进行比较
-                        let matches = match operator {
-                            CompareOp::Eq => dir_epoch / 86400 == epoch / 86400, // 按天粒度
-                            CompareOp::Ne => dir_epoch / 86400 != epoch / 86400,
-                            CompareOp::Lt => dir_epoch < *epoch,
-                            CompareOp::Gt => dir_epoch > *epoch,
-                            CompareOp::Le => dir_epoch <= *epoch,
-                            CompareOp::Ge => dir_epoch >= *epoch,
-                        };
-                        if matches {
-                            // 日期匹配：Path → 子项免检
-                            MatchResult::Match(MatchAddon::Path)
-                        } else {
-                            // 日期不匹配：FullPathNotMatch → 跳过 + 停止扫描子项
-                            MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch)
-                        }
-                    }
-                    None => {
-                        // 目录名不含日期：透明通过
-                        MatchResult::Match(MatchAddon::NonPath)
-                    }
-                }
+                Self::evaluate_dir_date(*operator, *epoch, file_name, file_type)
             }
+        }
+    }
+
+    fn evaluate_modified(
+        operator: CompareOp,
+        value: &ModifiedValue,
+        modified_epoch: Option<i64>,
+        now_epoch: i64,
+    ) -> MatchResult {
+        modified_epoch.map_or(MatchResult::LazyMatch, |file_epoch| match value {
+            ModifiedValue::RelativeDays(days) => {
+                let fallback = if now_epoch >= file_epoch {
+                    f64::MAX
+                } else {
+                    f64::MIN
+                };
+                let file_days = (now_epoch - file_epoch).to_f64().unwrap_or(fallback) / 86_400.0;
+                MatchResult::from_bool(match operator {
+                    CompareOp::Lt => file_days < *days,
+                    CompareOp::Gt => file_days > *days,
+                    CompareOp::Le => file_days <= *days,
+                    CompareOp::Ge => file_days >= *days,
+                    CompareOp::Eq | CompareOp::Ne => false,
+                })
+            }
+            ModifiedValue::AbsoluteEpoch(timestamp) => MatchResult::from_bool(match operator {
+                CompareOp::Eq => file_epoch / 86_400 == timestamp / 86_400,
+                CompareOp::Ne => file_epoch / 86_400 != timestamp / 86_400,
+                CompareOp::Lt => file_epoch < *timestamp,
+                CompareOp::Gt => file_epoch > *timestamp,
+                CompareOp::Le => file_epoch <= *timestamp,
+                CompareOp::Ge => file_epoch >= *timestamp,
+            }),
+        })
+    }
+
+    fn evaluate_dir_date(
+        operator: CompareOp,
+        epoch: i64,
+        file_name: Option<&str>,
+        file_type: Option<&str>,
+    ) -> MatchResult {
+        if file_type != Some("dir") {
+            return MatchResult::Match(MatchAddon::NonPath);
+        }
+        let Some(dir_epoch) = file_name.and_then(extract_date_from_dir_name) else {
+            return MatchResult::Match(MatchAddon::NonPath);
+        };
+        let matches = match operator {
+            CompareOp::Eq => dir_epoch / 86_400 == epoch / 86_400,
+            CompareOp::Ne => dir_epoch / 86_400 != epoch / 86_400,
+            CompareOp::Lt => dir_epoch < epoch,
+            CompareOp::Gt => dir_epoch > epoch,
+            CompareOp::Le => dir_epoch <= epoch,
+            CompareOp::Ge => dir_epoch >= epoch,
+        };
+        if matches {
+            MatchResult::Match(MatchAddon::Path)
+        } else {
+            MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch)
         }
     }
 
@@ -1411,6 +1376,7 @@ impl FilterExpression {
     /// 递归遍历 AST，找到所有 `DirDate` 节点，提取目录名中的日期并比较。
     ///
     /// 返回 true 表示目录名中的日期满足至少一个 `DirDate` 条件。
+    #[must_use]
     pub fn has_matching_dir_date(&self, dir_name: &str) -> bool {
         let Some(dir_epoch) = extract_date_from_dir_name(dir_name) else {
             return false;
@@ -1629,18 +1595,86 @@ struct PathPatternMatch<'a> {
     pattern_after_wildcard: &'a [String],
 }
 
+fn matches_ancestor(file_parts: &[&str], path_pattern: &PathPatternMatch<'_>) -> bool {
+    if file_parts.len() <= path_pattern.pattern_depth {
+        return false;
+    }
+    if path_pattern.has_double_wildcard {
+        let prefix_count = path_pattern
+            .pattern_parts
+            .iter()
+            .position(|part| part == "**")
+            .unwrap_or(0);
+        let min_depth = prefix_count + path_pattern.pattern_after_wildcard.len();
+        (min_depth..file_parts.len()).any(|depth| {
+            path_pattern
+                .pattern
+                .matches_with(&file_parts[..depth].join("/"), GLOB_MATCH_OPTIONS)
+        })
+    } else {
+        path_pattern.pattern.matches_with(
+            &file_parts[..path_pattern.pattern_depth].join("/"),
+            GLOB_MATCH_OPTIONS,
+        )
+    }
+}
+
+fn match_directory_prefix(
+    file_path: &str,
+    file_parts: &[&str],
+    path_pattern: &PathPatternMatch<'_>,
+) -> MatchResult {
+    if !path_pattern.has_double_wildcard && file_parts.len() >= path_pattern.pattern_depth {
+        return MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch);
+    }
+    let mut new_parts = Vec::new();
+    let mut depth = 0;
+    let mut hit_double_wildcard = false;
+    for part in path_pattern.pattern_parts {
+        if depth >= file_parts.len() {
+            break;
+        }
+        new_parts.push(part.as_str());
+        if part == "**" {
+            depth = file_parts.len();
+            hit_double_wildcard = true;
+        } else {
+            depth += 1;
+        }
+    }
+    let matches_prefix = Pattern::new(&new_parts.join("/"))
+        .is_ok_and(|pattern| pattern.matches_with(file_path, GLOB_MATCH_OPTIONS));
+    if !matches_prefix {
+        return MatchResult::MisMatch(MisMatchAddon::Other);
+    }
+    if hit_double_wildcard && !path_pattern.pattern_after_wildcard.is_empty() {
+        let suffix_matches = path_pattern
+            .pattern_after_wildcard
+            .first()
+            .is_some_and(|suffix| {
+                Pattern::new(suffix).is_ok_and(|pattern| {
+                    pattern.matches_with(
+                        file_path.rsplit('/').next().unwrap_or(file_path),
+                        GLOB_MATCH_OPTIONS,
+                    )
+                })
+            });
+        return if suffix_matches {
+            MatchResult::PartialMatch
+        } else {
+            MatchResult::MisMatch(MisMatchAddon::Other)
+        };
+    }
+    MatchResult::PartialMatch
+}
+
 fn match_path_with_pattern(
     file_path: &str,
     file_type: Option<&str>,
     path_pattern: &PathPatternMatch<'_>,
 ) -> MatchResult {
     let PathPatternMatch {
-        pattern,
-        raw_value,
-        pattern_parts,
-        pattern_depth,
-        has_double_wildcard,
-        pattern_after_wildcard,
+        pattern, raw_value, ..
     } = *path_pattern;
     trace!(
         "[Filter:match_path_with_pattern] 开始匹配: pattern_value={}, file_path={}, file_type={:?}",
@@ -1660,38 +1694,8 @@ fn match_path_with_pattern(
     // 因为 require_literal_separator=true，* 只匹配单段，** 匹配多段，
     // pattern.matches_with() 本身已正确处理两种情况，无需截断 pattern
     let file_parts: Vec<&str> = file_path.split('/').filter(|s| !s.is_empty()).collect();
-    let file_depth = file_parts.len();
-
-    if file_depth > pattern_depth {
-        if has_double_wildcard {
-            // 有 **：pattern 结构为 [prefix]/**/[suffix]
-            // ** 必须是独立路径分量，prefix_count + suffix_count 是祖先最小深度
-            // 只需遍历 min_depth..file_depth，大幅收窄范围
-            let double_star_pos = pattern_parts.iter().position(|p| p == "**").unwrap_or(0);
-            let prefix_count = double_star_pos;
-            let suffix_count = pattern_after_wildcard.len();
-            let min_depth = prefix_count + suffix_count;
-            for depth in min_depth..file_depth {
-                let ancestor_path = file_parts[..depth].join("/");
-                if pattern.matches_with(&ancestor_path, GLOB_MATCH_OPTIONS) {
-                    trace!(
-                        "[Filter:match_path_with_pattern] 祖先路径匹配成功(含**): pattern_value={}, file_path={}, ancestor={}",
-                        raw_value, file_path, ancestor_path
-                    );
-                    return MatchResult::Match(MatchAddon::Path);
-                }
-            }
-        } else {
-            // 无 **：* 不跨 /，只有 depth=pattern_depth 的祖先可能匹配 → O(1)
-            let ancestor_path = file_parts[..pattern_depth].join("/");
-            if pattern.matches_with(&ancestor_path, GLOB_MATCH_OPTIONS) {
-                trace!(
-                    "[Filter:match_path_with_pattern] 祖先路径匹配成功: pattern_value={}, file_path={}, ancestor={}",
-                    raw_value, file_path, ancestor_path
-                );
-                return MatchResult::Match(MatchAddon::Path);
-            }
-        }
+    if matches_ancestor(&file_parts, path_pattern) {
+        return MatchResult::Match(MatchAddon::Path);
     }
 
     // 如果不是目录，且祖先路径也没命中，直接返回 MisMatch
@@ -1703,91 +1707,17 @@ fn match_path_with_pattern(
         return MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch);
     }
 
-    // 如果文件深度大于等于模式深度，无需目录部分匹配
-    if !has_double_wildcard && file_depth >= pattern_depth {
-        trace!(
-            "[Filter:match_path_with_pattern] 文件深度大于等于模式深度，无需目录部分匹配: file_path={}, file_depth={}, pattern_depth={}, has_double_wildcard={}, 返回NoMatch",
-            file_path, file_depth, pattern_depth, has_double_wildcard
-        );
-
-        // Return FullPathNotMatch regardless of wildcards
-        return MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch);
-    }
-
-    trace!(
-        "[Filter:match_path_with_pattern] 开始目录部分匹配检查: file_depth={}, pattern_depth={}, has_double_wildcard={}",
-        file_depth, pattern_depth, has_double_wildcard
-    );
-
-    // 统一截取策略：构建截断 pattern 并匹配
-    let mut new_parts = Vec::new();
-    let mut current_depth = 0;
-    let mut hit_double_wildcard = false;
-
-    for part in pattern_parts {
-        if current_depth >= file_depth {
-            break;
-        }
-
-        new_parts.push(part.as_str());
-
-        if part == "**" {
-            current_depth = file_depth;
-            hit_double_wildcard = true;
-        } else {
-            current_depth += 1;
-        }
-    }
-
-    let new_pattern = new_parts.join("/");
-    if let Ok(p) = Pattern::new(&new_pattern)
-        && p.matches_with(file_path, GLOB_MATCH_OPTIONS)
-    {
-        // ** 被命中且后面还有具体 pattern 时，需验证目录名是否匹配后缀
-        // 避免黑名单中 ** 开头的 pattern 过度跳过无关目录
-        if hit_double_wildcard && !pattern_after_wildcard.is_empty() {
-            if let Some(suffix) = pattern_after_wildcard.first()
-                && let Ok(sp) = Pattern::new(suffix)
-            {
-                let file_last = file_path.rsplit('/').next().unwrap_or(file_path);
-                if sp.matches_with(file_last, GLOB_MATCH_OPTIONS) {
-                    trace!(
-                        "[Filter:match_path_with_pattern] 含有double wildcard的目录部分匹配成功(后缀匹配): pattern_value={}, file_path={}",
-                        raw_value, file_path
-                    );
-                    return MatchResult::PartialMatch;
-                }
-            }
-            // 不匹配后缀 → 返回 MisMatch(Other) 让黑名单不跳过，但扫描继续
-            trace!(
-                "[Filter:match_path_with_pattern] double wildcard 后缀不匹配，返回MisMatch(Other): pattern_value={}, file_path={}",
-                raw_value, file_path
-            );
-            return MatchResult::MisMatch(MisMatchAddon::Other);
-        }
-
-        trace!(
-            "[Filter:match_path_with_pattern] 目录部分匹配成功: pattern_value={}, file_path={}",
-            raw_value, file_path
-        );
-        return MatchResult::PartialMatch;
-    }
-
-    // 匹配失败，返回NoMatch
-    trace!(
-        "[Filter:match_path_with_pattern] 匹配失败，返回NoMatch: pattern_value={}, file_path={}",
-        raw_value, file_path
-    );
-    MatchResult::MisMatch(MisMatchAddon::Other)
+    match_directory_prefix(file_path, &file_parts, path_pattern)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AssertTestValue;
 
     // ==================== Helper Functions ====================
 
-    /// Helper to parse a filter expression and evaluate it, returning MatchResult.
+    /// Helper to parse a filter expression and evaluate it, returning `MatchResult`.
     fn eval(
         expr_str: &str,
         file_name: Option<&str>,
@@ -1797,7 +1727,7 @@ mod tests {
         size: Option<u64>,
         extension: Option<&str>,
     ) -> MatchResult {
-        let expr = FilterExpression::parse(expr_str).expect("Failed to parse expression");
+        let expr = FilterExpression::parse(expr_str).assert_value("Failed to parse expression");
         let now_epoch = crate::time_util::now_secs();
         evaluate_filter(
             &expr,
@@ -1813,84 +1743,74 @@ mod tests {
         )
     }
 
-    /// Helper to evaluate with explicit now_epoch (for deterministic modified tests).
-    fn eval_with_now(
-        expr_str: &str,
-        file_name: Option<&str>,
-        file_path: Option<&str>,
-        file_type: Option<&str>,
-        modified_epoch: Option<i64>,
-        size: Option<u64>,
-        extension: Option<&str>,
-        now_epoch: i64,
-    ) -> MatchResult {
-        let expr = FilterExpression::parse(expr_str).expect("Failed to parse expression");
-        evaluate_filter(
-            &expr,
-            &FilterInput {
-                file_name,
-                file_path,
-                file_type,
-                modified_epoch,
-                size,
-                extension,
-            },
-            now_epoch,
-        )
+    macro_rules! eval_with_now {
+        ($expr:expr, $name:expr, $path:expr, $kind:expr, $modified:expr, $size:expr, $extension:expr, $now:expr $(,)?) => {{
+            let parsed = FilterExpression::parse($expr).assert_value("Failed to parse expression");
+            evaluate_filter(
+                &parsed,
+                &FilterInput {
+                    file_name: $name,
+                    file_path: $path,
+                    file_type: $kind,
+                    modified_epoch: $modified,
+                    size: $size,
+                    extension: $extension,
+                },
+                $now,
+            )
+        }};
     }
 
-    /// Helper to call should_skip with match/exclude expressions.
-    fn skip(
-        match_expr: Option<&str>,
-        exclude_expr: Option<&str>,
-        file_name: Option<&str>,
-        file_path: Option<&str>,
-        file_type: Option<&str>,
-        modified_epoch: Option<i64>,
-        size: Option<u64>,
-        extension: Option<&str>,
-    ) -> (bool, bool, bool) {
-        let match_parsed =
-            match_expr.map(|e| FilterExpression::parse(e).expect("Failed to parse match expr"));
-        let exclude_parsed =
-            exclude_expr.map(|e| FilterExpression::parse(e).expect("Failed to parse exclude expr"));
-        should_skip(
-            match_parsed.as_ref(),
-            exclude_parsed.as_ref(),
-            FilterInput {
-                file_name,
-                file_path,
-                file_type,
-                modified_epoch,
-                size,
-                extension,
-            },
-        )
+    macro_rules! skip {
+        ($match_expr:expr, $exclude_expr:expr, $name:expr, $path:expr, $kind:expr, $modified:expr, $size:expr, $extension:expr $(,)?) => {{
+            let match_parsed = $match_expr.map(|value| {
+                FilterExpression::parse(value).assert_value("Failed to parse match expr")
+            });
+            let exclude_parsed = $exclude_expr.map(|value| {
+                FilterExpression::parse(value).assert_value("Failed to parse exclude expr")
+            });
+            should_skip(
+                match_parsed.as_ref(),
+                exclude_parsed.as_ref(),
+                FilterInput {
+                    file_name: $name,
+                    file_path: $path,
+                    file_type: $kind,
+                    modified_epoch: $modified,
+                    size: $size,
+                    extension: $extension,
+                },
+            )
+        }};
     }
 
     // ==================== 7.1 Basic parsing / existing test updates ====================
 
     #[test]
     fn test_parse_basic_name_condition() {
-        let expr = FilterExpression::parse("name == \"*.txt\"").unwrap();
+        let expr = FilterExpression::parse("name == \"*.txt\"")
+            .assert_value("test value should be present");
         assert_eq!(expr.count_nodes(), 1);
     }
 
     #[test]
     fn test_parse_basic_path_condition() {
-        let expr = FilterExpression::parse("path == \"src/**\"").unwrap();
+        let expr = FilterExpression::parse("path == \"src/**\"")
+            .assert_value("test value should be present");
         assert_eq!(expr.count_nodes(), 1);
     }
 
     #[test]
     fn test_parse_and_expression() {
-        let expr = FilterExpression::parse("name == \"*.txt\" and size > 100").unwrap();
+        let expr = FilterExpression::parse("name == \"*.txt\" and size > 100")
+            .assert_value("test value should be present");
         assert_eq!(expr.count_nodes(), 3); // And + 2 conditions
     }
 
     #[test]
     fn test_parse_or_expression() {
-        let expr = FilterExpression::parse("name == \"*.txt\" or name == \"*.rs\"").unwrap();
+        let expr = FilterExpression::parse("name == \"*.txt\" or name == \"*.rs\"")
+            .assert_value("test value should be present");
         assert_eq!(expr.count_nodes(), 3);
     }
 
@@ -1898,7 +1818,7 @@ mod tests {
     fn test_parse_parenthesized_expression() {
         let expr =
             FilterExpression::parse("(name == \"*.txt\" or name == \"*.rs\") and type == file")
-                .unwrap();
+                .assert_value("test value should be present");
         assert_eq!(expr.count_nodes(), 5);
     }
 
@@ -2129,7 +2049,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_at_start_depth1_no_match() {
         // "src" (depth 1, dir) -> does not match "**/target", but could have descendants
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"**/target\""),
             None,
             Some("src"),
@@ -2145,7 +2065,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_at_start_full_match() {
         // "src/app/target" (depth 3, dir) -> full path matches "**/target"
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"**/target\""),
             None,
             Some("target"),
@@ -2162,7 +2082,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_in_middle_prefix_match() {
         // "src" (depth 1, dir) -> partial match prefix
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**/test\""),
             None,
             Some("src"),
@@ -2178,7 +2098,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_in_middle_consume() {
         // "src/app" (depth 2, dir) -> ** consumes
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**/test\""),
             None,
             Some("app"),
@@ -2194,7 +2114,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_in_middle_deep_match() {
         // "src/app/lib/test" (depth 4, dir) -> full path matches
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**/test\""),
             None,
             Some("test"),
@@ -2212,7 +2132,7 @@ mod tests {
         // "other" (depth 1, dir) -> prefix doesn't match "src"
         // MisMatch(Other) in whitelist -> skip entry, but continue scan for dirs (is_dir=true)
         // because MisMatch(Other) doesn't definitively exclude all descendants
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**/test\""),
             None,
             Some("other"),
@@ -2228,7 +2148,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_in_middle_zero_match() {
         // "src/test" (depth 2, dir) -> ** matches zero layers
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**/test\""),
             None,
             Some("test"),
@@ -2245,7 +2165,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_at_end_prefix() {
         // "src" (depth 1, dir) -> partial match
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**\""),
             None,
             Some("src"),
@@ -2261,7 +2181,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_at_end_match() {
         // "src/anything" (depth 2, file) -> full path matches
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**\""),
             None,
             Some("anything"),
@@ -2277,7 +2197,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_at_end_deep_match() {
         // "src/a/b/c" (depth 4, dir) -> full path matches
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**\""),
             None,
             Some("c"),
@@ -2294,7 +2214,7 @@ mod tests {
     fn test_whitelist_doublestar_at_end_no_match() {
         // "other" (depth 1, dir) -> doesn't match "src/**"
         // MisMatch(Other) in whitelist -> skip entry, but continue scan for dirs
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**\""),
             None,
             Some("other"),
@@ -2313,7 +2233,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_at_start_no_match() {
         // "data" (depth 1, dir) -> doesn't match temp*, should NOT be skipped by blacklist
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"**/temp*\""),
             Some("data"),
@@ -2330,7 +2250,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_at_start_nested_no_match() {
         // "data/logs" (depth 2, dir) -> doesn't match temp*
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"**/temp*\""),
             Some("logs"),
@@ -2346,7 +2266,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_at_start_full_match() {
         // "data/temp_cache" (depth 2, dir) -> full path matches "**/temp*"
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"**/temp*\""),
             Some("temp_cache"),
@@ -2363,7 +2283,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_at_start_root_match() {
         // "temp_dir" (depth 1, dir) -> matches "**/temp*"
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"**/temp*\""),
             Some("temp_dir"),
@@ -2379,7 +2299,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_at_start_deep_match() {
         // "a/b/c/temp_x" (depth 4, dir) -> matches "**/temp*"
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"**/temp*\""),
             Some("temp_x"),
@@ -2396,7 +2316,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_in_middle_prefix() {
         // "logs" (depth 1, dir) -> prefix matches blacklist
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"logs/**/debug\""),
             Some("logs"),
@@ -2415,7 +2335,7 @@ mod tests {
         // "logs/app" (depth 2, dir) -> truncated pattern "logs/**" matches "logs/app",
         // but pattern_after_wildcard=["debug"], file_last="app" doesn't match "debug"
         // -> MisMatch(Other) -> blacklist doesn't match -> flows to default (no whitelist)
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"logs/**/debug\""),
             Some("app"),
@@ -2432,7 +2352,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_in_middle_full_match() {
         // "logs/app/debug" (depth 3, dir) -> full path matches
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"logs/**/debug\""),
             Some("debug"),
@@ -2449,7 +2369,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_in_middle_prefix_no_match() {
         // "src" (depth 1, dir) -> prefix doesn't match "logs"
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"logs/**/debug\""),
             Some("src"),
@@ -2466,7 +2386,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_in_middle_not_match_suffix() {
         // "logs/app/info" (depth 3, dir) -> doesn't match "debug"
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"logs/**/debug\""),
             Some("info"),
@@ -2484,7 +2404,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_at_end_prefix() {
         // "tmp" (depth 1, dir) -> partial match
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"tmp/**\""),
             Some("tmp"),
@@ -2501,7 +2421,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_at_end_full_match() {
         // "tmp/anything" (depth 2, dir) -> full path matches
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"tmp/**\""),
             Some("anything"),
@@ -2518,7 +2438,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_at_end_deep_match() {
         // "tmp/a/b/c" (depth 4, dir) -> full path matches
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"tmp/**\""),
             Some("c"),
@@ -2534,7 +2454,7 @@ mod tests {
     #[test]
     fn test_blacklist_doublestar_at_end_no_match() {
         // "src" (depth 1, dir) -> doesn't match "tmp/**"
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("path == \"tmp/**\""),
             Some("src"),
@@ -2553,7 +2473,7 @@ mod tests {
     fn test_blacklist_priority_over_whitelist() {
         // match: path == "src/**", exclude: name == "*.tmp"
         // File "src/data.tmp" matches whitelist but also blacklist -> blacklist wins
-        let (skip, _cont, _check) = skip(
+        let (skip, _cont, _check) = skip!(
             Some("path == \"src/**\""),
             Some("name == \"*.tmp\""),
             Some("data.tmp"),
@@ -2573,7 +2493,7 @@ mod tests {
     fn test_whitelist_match_blacklist_no_match() {
         // match: path == "src/**", exclude: name == "*.tmp"
         // File "src/data.rs" matches whitelist, not blacklist -> keep
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**\""),
             Some("name == \"*.tmp\""),
             Some("data.rs"),
@@ -2647,7 +2567,7 @@ mod tests {
         // modified == "2025-01-15", file mtime = 2025-01-15 00:00:00 -> match
         let target_epoch = date_to_epoch(2025, 1, 15, 0, 0, 0);
         let file_epoch = date_to_epoch(2025, 1, 15, 0, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified == \"2025-01-15\"",
             None,
             None,
@@ -2664,7 +2584,7 @@ mod tests {
     fn test_modified_eq_absolute_same_day_end() {
         // modified == "2025-01-15", file mtime = 2025-01-15 23:59:59 -> match (same day)
         let file_epoch = date_to_epoch(2025, 1, 15, 23, 59, 59);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified == \"2025-01-15\"",
             None,
             None,
@@ -2681,7 +2601,7 @@ mod tests {
     fn test_modified_eq_absolute_next_day() {
         // modified == "2025-01-15", file mtime = 2025-01-16 00:00:00 -> no match
         let file_epoch = date_to_epoch(2025, 1, 16, 0, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified == \"2025-01-15\"",
             None,
             None,
@@ -2698,7 +2618,7 @@ mod tests {
     fn test_modified_eq_absolute_prev_day() {
         // modified == "2025-01-15", file mtime = 2025-01-14 23:59:59 -> no match
         let file_epoch = date_to_epoch(2025, 1, 14, 23, 59, 59);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified == \"2025-01-15\"",
             None,
             None,
@@ -2715,7 +2635,7 @@ mod tests {
     fn test_modified_eq_compact_format() {
         // modified == 20250115, same behavior as quoted
         let file_epoch = date_to_epoch(2025, 1, 15, 12, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified == 20250115",
             None,
             None,
@@ -2733,7 +2653,7 @@ mod tests {
     fn test_modified_gt_absolute() {
         // modified > "2025-01-15", file mtime = 2025-01-16 -> match
         let file_epoch = date_to_epoch(2025, 1, 16, 0, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified > \"2025-01-15\"",
             None,
             None,
@@ -2751,7 +2671,7 @@ mod tests {
         // modified > "2025-01-15", file mtime = 2025-01-15 00:00:00 -> no match (not strictly greater)
         let target_epoch = date_to_epoch(2025, 1, 15, 0, 0, 0);
         let file_epoch = date_to_epoch(2025, 1, 15, 0, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified > \"2025-01-15\"",
             None,
             None,
@@ -2768,7 +2688,7 @@ mod tests {
     fn test_modified_lt_absolute() {
         // modified < "2025-01-15", file mtime = 2025-01-14 -> match
         let file_epoch = date_to_epoch(2025, 1, 14, 0, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified < \"2025-01-15\"",
             None,
             None,
@@ -2785,7 +2705,7 @@ mod tests {
     fn test_modified_ge_absolute() {
         // modified >= "2025-01-15", file mtime = 2025-01-15 00:00:00 -> match
         let file_epoch = date_to_epoch(2025, 1, 15, 0, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified >= \"2025-01-15\"",
             None,
             None,
@@ -2803,7 +2723,7 @@ mod tests {
         // modified <= "2025-01-15", file mtime = 2025-01-15 23:59:59 -> match
         let file_epoch = date_to_epoch(2025, 1, 15, 23, 59, 59);
         let target_epoch = date_to_epoch(2025, 1, 15, 0, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified <= \"2025-01-15\"",
             None,
             None,
@@ -2821,7 +2741,7 @@ mod tests {
     fn test_modified_le_absolute_before() {
         // modified <= "2025-01-15", file mtime = 2025-01-14 -> match
         let file_epoch = date_to_epoch(2025, 1, 14, 23, 59, 59);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified <= \"2025-01-15\"",
             None,
             None,
@@ -2838,7 +2758,7 @@ mod tests {
     #[test]
     fn test_modified_absolute_and_size() {
         let file_epoch = date_to_epoch(2025, 1, 16, 0, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified > \"2025-01-15\" and size > 1000",
             None,
             None,
@@ -2855,7 +2775,7 @@ mod tests {
     fn test_modified_absolute_time_range() {
         // modified < "2025-03-01" and modified > "2025-01-01"
         let file_epoch = date_to_epoch(2025, 2, 15, 0, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified < \"2025-03-01\" and modified > \"2025-01-01\"",
             None,
             None,
@@ -2872,7 +2792,7 @@ mod tests {
     fn test_modified_absolute_time_range_outside() {
         // modified < "2025-03-01" and modified > "2025-01-01" but file is from 2024
         let file_epoch = date_to_epoch(2024, 6, 15, 0, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified < \"2025-03-01\" and modified > \"2025-01-01\"",
             None,
             None,
@@ -2889,9 +2809,9 @@ mod tests {
     #[test]
     fn test_modified_relative_days_less_than() {
         // modified < 3d, file modified 1 day ago -> match
-        let now = 1000000;
+        let now = 1_000_000;
         let file_epoch = now - 86400; // 1 day ago
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified < 3d",
             None,
             None,
@@ -2907,9 +2827,9 @@ mod tests {
     #[test]
     fn test_modified_relative_days_greater_than() {
         // modified > 3d, file modified 5 days ago -> match (file_days=5 > 3)
-        let now = 1000000;
+        let now = 1_000_000;
         let file_epoch = now - 86400 * 5;
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified > 3d",
             None,
             None,
@@ -2925,9 +2845,9 @@ mod tests {
     #[test]
     fn test_modified_relative_days_no_match() {
         // modified < 3d, file modified 5 days ago -> no match (file_days=5 >= 3)
-        let now = 1000000;
+        let now = 1_000_000;
         let file_epoch = now - 86400 * 5;
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified < 3d",
             None,
             None,
@@ -2977,8 +2897,8 @@ mod tests {
     #[test]
     fn test_and_short_circuit_left_not_support() {
         // name == "*.txt" and modified < 3d  (no modified_epoch provided -> LazyMatch)
-        let now = 1000000i64;
-        let r = eval_with_now(
+        let now = 1_000_000_i64;
+        let r = eval_with_now!(
             "name == \"*.txt\" and modified < 3d",
             Some("hello.txt"),
             None,
@@ -3355,7 +3275,7 @@ mod tests {
         // exclude: name == "*.tmp" or name == "*.log"
         // dir "data" -> whitelist partial match (path) & MisMatch (type!=file) -> MisMatch
         // blacklist: name "data" != "*.tmp" nor "*.log" -> MisMatch -> flows to whitelist
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"data/**\" and type == file"),
             Some("name == \"*.tmp\" or name == \"*.log\""),
             Some("data"),
@@ -3367,9 +3287,9 @@ mod tests {
         );
         // Blacklist doesn't match, whitelist evaluates:
         // PartialMatch & MisMatch -> MisMatch(Other) -> should_skip handles MisMatch(Other) for whitelist
-        assert_eq!(skip, true);
-        assert_eq!(cont, true); // is_dir
-        assert_eq!(check, true);
+        assert!(skip);
+        assert!(cont); // is_dir
+        assert!(check);
     }
 
     #[test]
@@ -3377,7 +3297,7 @@ mod tests {
         // match: path == "data/**" and type == file
         // exclude: name == "*.tmp" or name == "*.log"
         // file "data/report.tmp" -> blacklist matches "*.tmp" -> skip
-        let (skip, cont, _check) = skip(
+        let (skip, cont, _check) = skip!(
             Some("path == \"data/**\" and type == file"),
             Some("name == \"*.tmp\" or name == \"*.log\""),
             Some("report.tmp"),
@@ -3396,7 +3316,7 @@ mod tests {
         // match: path == "data/**" and type == file
         // exclude: name == "*.tmp" or name == "*.log"
         // file "data/report.csv" -> blacklist doesn't match, whitelist matches -> keep
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"data/**\" and type == file"),
             Some("name == \"*.tmp\" or name == \"*.log\""),
             Some("report.csv"),
@@ -3565,8 +3485,8 @@ mod tests {
         // 2025-01-15 00:00:00 UTC
         let epoch = date_to_epoch(2025, 1, 15, 0, 0, 0);
         // Verify it's a reasonable value (~55 years * 365.25 * 86400 ≈ 1736899200)
-        assert!(epoch > 1700000000, "Epoch should be after ~2023");
-        assert!(epoch < 1800000000, "Epoch should be before ~2027");
+        assert!(epoch > 1_700_000_000, "Epoch should be after ~2023");
+        assert!(epoch < 1_800_000_000, "Epoch should be before ~2027");
     }
 
     #[test]
@@ -3578,19 +3498,21 @@ mod tests {
 
     #[test]
     fn test_parse_date_to_epoch_iso() {
-        let epoch = parse_date_to_epoch("2025-01-15").unwrap();
+        let epoch = parse_date_to_epoch("2025-01-15").assert_value("test value should be present");
         assert_eq!(epoch, date_to_epoch(2025, 1, 15, 0, 0, 0));
     }
 
     #[test]
     fn test_parse_date_to_epoch_iso_with_time() {
-        let epoch = parse_date_to_epoch("2025-01-15T08:30:00").unwrap();
+        let epoch =
+            parse_date_to_epoch("2025-01-15T08:30:00").assert_value("test value should be present");
         assert_eq!(epoch, date_to_epoch(2025, 1, 15, 8, 30, 0));
     }
 
     #[test]
     fn test_parse_compact_date_to_epoch() {
-        let epoch = parse_compact_date_to_epoch("20250115").unwrap();
+        let epoch =
+            parse_compact_date_to_epoch("20250115").assert_value("test value should be present");
         assert_eq!(epoch, date_to_epoch(2025, 1, 15, 0, 0, 0));
     }
 
@@ -3598,7 +3520,7 @@ mod tests {
 
     #[test]
     fn test_no_expressions_default() {
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             None,
             Some("file.txt"),
@@ -3613,7 +3535,7 @@ mod tests {
 
     #[test]
     fn test_no_expressions_dir_default() {
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             None,
             Some("dir"),
@@ -3648,8 +3570,8 @@ mod tests {
         assert_eq!(r, MatchResult::LazyMatch);
 
         // modified condition with no modified_epoch -> LazyMatch
-        let now = 1000000i64;
-        let r = eval_with_now("modified < 3d", None, None, None, None, None, None, now);
+        let now = 1_000_000_i64;
+        let r = eval_with_now!("modified < 3d", None, None, None, None, None, None, now);
         assert_eq!(r, MatchResult::LazyMatch);
     }
 
@@ -3700,7 +3622,7 @@ mod tests {
     #[test]
     fn test_should_skip_whitelist_partial_match_for_dir() {
         // Whitelist: path == "a/b/c", dir "a" -> partial match -> skip entry, continue scan
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"a/b/c\""),
             None,
             Some("a"),
@@ -3716,7 +3638,7 @@ mod tests {
     #[test]
     fn test_should_skip_whitelist_full_path_not_match() {
         // Whitelist: path == "a/b", file "x/y" -> FullPathNotMatch -> skip, no continue
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"a/b\""),
             None,
             Some("y"),
@@ -3732,7 +3654,7 @@ mod tests {
     #[test]
     fn test_should_skip_whitelist_match_path_only() {
         // Whitelist: path == "src/**", file "src/test.rs" -> Match(Path) -> no skip, check_children=false
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**\""),
             None,
             Some("test.rs"),
@@ -3748,7 +3670,7 @@ mod tests {
     #[test]
     fn test_should_skip_whitelist_match_non_path() {
         // Whitelist: name == "*.rs", file "test.rs" -> Match(NonPath) -> no skip, check_children=true
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("name == \"*.rs\""),
             None,
             Some("test.rs"),
@@ -3766,7 +3688,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_at_start_depth2_no_match() {
         // "src/app" (depth 2, dir) -> doesn't match "**/target", but could have descendants
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"**/target\""),
             None,
             Some("app"),
@@ -3782,7 +3704,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_at_start_depth3_other() {
         // "src/app/other" (depth 3, dir) -> doesn't match "**/target", but ** means descendants could still match
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"**/target\""),
             None,
             Some("other"),
@@ -3798,7 +3720,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_in_middle_depth3_consume() {
         // "src/app/lib" (depth 3, dir) for pattern "src/**/test" -> ** continues consuming
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**/test\""),
             None,
             Some("lib"),
@@ -3825,7 +3747,7 @@ mod tests {
         // modified > "2025-01-15T08:30:00", file mtime = 2025-01-15 09:00:00 -> match
         let target_epoch = date_to_epoch(2025, 1, 15, 8, 30, 0);
         let file_epoch = date_to_epoch(2025, 1, 15, 9, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified > \"2025-01-15T08:30:00\"",
             None,
             None,
@@ -3843,7 +3765,7 @@ mod tests {
         // modified > "2025-01-15T08:30:00", file mtime = 2025-01-15 08:00:00 -> no match
         let target_epoch = date_to_epoch(2025, 1, 15, 8, 30, 0);
         let file_epoch = date_to_epoch(2025, 1, 15, 8, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified > \"2025-01-15T08:30:00\"",
             None,
             None,
@@ -3860,7 +3782,7 @@ mod tests {
     fn test_modified_ne_absolute() {
         // modified != "2025-01-15", file mtime on a different day -> match
         let file_epoch = date_to_epoch(2025, 1, 16, 12, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified != \"2025-01-15\"",
             None,
             None,
@@ -3877,7 +3799,7 @@ mod tests {
     fn test_modified_ne_absolute_same_day() {
         // modified != "2025-01-15", file mtime on the same day -> no match
         let file_epoch = date_to_epoch(2025, 1, 15, 12, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified != \"2025-01-15\"",
             None,
             None,
@@ -3893,9 +3815,9 @@ mod tests {
     #[test]
     fn test_modified_relative_le() {
         // modified <= 3d, file modified 3 days ago -> file_days=3.0, 3.0 <= 3.0 -> match
-        let now = 1000000i64;
+        let now = 1_000_000_i64;
         let file_epoch = now - 86400 * 3;
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified <= 3d",
             None,
             None,
@@ -3911,9 +3833,9 @@ mod tests {
     #[test]
     fn test_modified_relative_ge() {
         // modified >= 3d, file modified 5 days ago -> file_days=5.0, 5.0 >= 3.0 -> match
-        let now = 1000000i64;
+        let now = 1_000_000_i64;
         let file_epoch = now - 86400 * 5;
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified >= 3d",
             None,
             None,
@@ -4041,9 +3963,9 @@ mod tests {
     fn test_compound_path_and_modified() {
         // path == "**/test" and modified < 3d
         // Both conditions need file-level verification
-        let now = 1000000i64;
+        let now = 1_000_000_i64;
         let file_epoch = now - 86400; // 1 day ago
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "path == \"**/test\" and modified < 3d",
             Some("test"),
             Some("src/test"),
@@ -4061,8 +3983,8 @@ mod tests {
     fn test_compound_path_and_modified_dir_partial() {
         // path == "**/test" and modified < 3d
         // dir "src" -> path partial, modified not relevant for dir yet
-        let now = 1000000i64;
-        let r = eval_with_now(
+        let now = 1_000_000_i64;
+        let r = eval_with_now!(
             "path == \"**/test\" and modified < 3d",
             Some("src"),
             Some("src"),
@@ -4102,7 +4024,7 @@ mod tests {
         // White: path == "data/**", black: path == "**/temp*"
         // dir "data" -> blacklist: "data" doesn't match "temp*" -> flows to whitelist
         // whitelist: "data" partial matches "data/**" -> PartialMatch
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"data/**\""),
             Some("path == \"**/temp*\""),
             Some("data"),
@@ -4120,7 +4042,7 @@ mod tests {
     fn test_compound_blacklist_whitelist_both_match() {
         // White: path == "data/**", black: path == "**/temp*"
         // dir "data/temp_cache" -> blacklist full match -> skip, stop
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"data/**\""),
             Some("path == \"**/temp*\""),
             Some("temp_cache"),
@@ -4171,7 +4093,7 @@ mod tests {
     fn test_match_addon_and_propagation_to_should_skip() {
         // path == "a/b" and name == "*.rs" -> Mixed
         // In should_skip, Match(Mixed) -> (false, is_dir, true)
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"a/b\" and name == \"*.rs\""),
             None,
             Some("test.rs"),
@@ -4189,7 +4111,7 @@ mod tests {
     fn test_match_addon_path_only_propagation() {
         // path == "src/**" only -> Match(Path)
         // In should_skip, Match(Path) -> (false, is_dir, false)
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"src/**\""),
             None,
             Some("test.rs"),
@@ -4315,7 +4237,7 @@ mod tests {
     fn test_modified_eq_compact_different_day() {
         // modified == 20250116, file mtime = 2025-01-15 -> no match
         let file_epoch = date_to_epoch(2025, 1, 15, 12, 0, 0);
-        let r = eval_with_now(
+        let r = eval_with_now!(
             "modified == 20250116",
             None,
             None,
@@ -4331,7 +4253,7 @@ mod tests {
     #[test]
     fn test_whitelist_doublestar_at_start_file_match() {
         // "**/target" with file (not dir) at "src/target"
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("path == \"**/target\""),
             None,
             Some("target"),
@@ -4349,7 +4271,7 @@ mod tests {
     fn test_blacklist_name_only_continues_scan() {
         // Blacklist with name-only condition (no path)
         // Match(NonPath) in blacklist -> skip entry, continue scan for dirs
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("name == \"*.tmp\""),
             Some("test.tmp"),
@@ -4365,7 +4287,7 @@ mod tests {
     #[test]
     fn test_blacklist_name_only_file() {
         // Blacklist with name-only condition for a file
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             None,
             Some("name == \"*.tmp\""),
             Some("test.tmp"),
@@ -4978,7 +4900,7 @@ mod tests {
     #[test]
     fn test_skip_dir_date_match() {
         // 日期目录匹配 → 保留，扫描子目录，子项免检
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("dir_date <= 240301"),
             None,
             Some("20240101"),
@@ -4994,7 +4916,7 @@ mod tests {
     #[test]
     fn test_skip_dir_date_no_match() {
         // 日期目录不匹配 → 跳过，停止扫描
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("dir_date <= 240301"),
             None,
             Some("20240501"),
@@ -5010,7 +4932,7 @@ mod tests {
     #[test]
     fn test_skip_dir_date_non_date_dir() {
         // 非日期目录 → 保留，扫描子目录，子项需检查
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("dir_date <= 240301"),
             None,
             Some("project"),
@@ -5026,7 +4948,7 @@ mod tests {
     #[test]
     fn test_skip_dir_date_file() {
         // 文件 → 保留
-        let (skip, cont, check) = skip(
+        let (skip, cont, check) = skip!(
             Some("dir_date <= 240301"),
             None,
             Some("readme.txt"),
@@ -5042,7 +4964,7 @@ mod tests {
     #[test]
     fn test_skip_dir_date_and_path_combined_nondate_dir() {
         // 非日期目录 "project" → dir_date=Match(NonPath), path=PartialMatch → PartialMatch
-        let (s, c, ch) = skip(
+        let (s, c, ch) = skip!(
             Some("dir_date <= \"2024-03-01\" and path == \"project/*\""),
             None,
             Some("project"),
@@ -5058,7 +4980,7 @@ mod tests {
     #[test]
     fn test_skip_dir_date_and_path_combined_match() {
         // 日期子目录 "project/20240101" → dir_date=Match(Path), path=Match(Path) → Match(Path)
-        let (s, c, ch) = skip(
+        let (s, c, ch) = skip!(
             Some("dir_date <= \"2024-03-01\" and path == \"project/*\""),
             None,
             Some("20240101"),
@@ -5074,7 +4996,7 @@ mod tests {
     #[test]
     fn test_skip_dir_date_and_path_combined_no_match() {
         // 日期子目录不匹配 "project/20240501" → dir_date=MisMatch(Full), path=Match(Path) → MisMatch(Full)
-        let (s, c, ch) = skip(
+        let (s, c, ch) = skip!(
             Some("dir_date <= \"2024-03-01\" and path == \"project/*\""),
             None,
             Some("20240501"),
@@ -5090,7 +5012,7 @@ mod tests {
     #[test]
     fn test_skip_dir_date_range_match() {
         // dir_date >= 20240101 and dir_date <= 20240331
-        let (s, c, ch) = skip(
+        let (s, c, ch) = skip!(
             Some("dir_date >= 20240101 and dir_date <= 20240331"),
             None,
             Some("20240215"),
@@ -5106,7 +5028,7 @@ mod tests {
     #[test]
     fn test_skip_dir_date_range_no_match() {
         // 超出范围
-        let (s, c, ch) = skip(
+        let (s, c, ch) = skip!(
             Some("dir_date >= 20240101 and dir_date <= 20240331"),
             None,
             Some("20240501"),
@@ -5138,7 +5060,7 @@ mod tests {
             "dir_date",
         ];
         for name in &expected {
-            assert!(field_names.contains(name), "缺少字段定义: {}", name);
+            assert!(field_names.contains(name), "缺少字段定义: {name}");
         }
         assert_eq!(
             defs.len(),
@@ -5182,11 +5104,11 @@ mod tests {
         let type_def = defs
             .iter()
             .find(|d| d.name == "type")
-            .expect("应有 type 字段");
+            .assert_value("应有 type 字段");
         let enum_values = type_def
             .enum_values
             .as_ref()
-            .expect("type 字段应有 enum_values");
+            .assert_value("type 字段应有 enum_values");
         assert!(enum_values.contains(&"file"));
         assert!(enum_values.contains(&"dir"));
         assert!(enum_values.contains(&"symlink"));

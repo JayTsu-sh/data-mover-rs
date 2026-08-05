@@ -13,6 +13,8 @@
 use std::path::Path;
 
 use data_mover::{StorageEnum, create_storage};
+mod common;
+use common::AssertTestValue;
 
 const BLOCK: u64 = 64 * 1024;
 const SINGLE_SIZE: usize = 8 * 1024; // < BLOCK → 单块路径
@@ -21,26 +23,41 @@ const MULTI_SIZE: usize = 256 * 1024; // 4 blocks → 多块 pipeline
 async fn reset_dirs(src: &str, dst: &str) {
     let _ = tokio::fs::remove_dir_all(src).await;
     let _ = tokio::fs::remove_dir_all(dst).await;
-    tokio::fs::create_dir_all(src).await.unwrap();
-    tokio::fs::create_dir_all(dst).await.unwrap();
+    tokio::fs::create_dir_all(src)
+        .await
+        .assert_value("test value should be present");
+    tokio::fs::create_dir_all(dst)
+        .await
+        .assert_value("test value should be present");
 }
 
 /// 写一个内容可验证的 blob：byte i = (i % 251)。
 async fn write_pattern(path: &str, size: usize) {
     use tokio::io::AsyncWriteExt;
-    let mut f = tokio::fs::File::create(path).await.unwrap();
-    let buf: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-    f.write_all(&buf).await.unwrap();
-    f.flush().await.unwrap();
+    let mut f = tokio::fs::File::create(path)
+        .await
+        .assert_value("test value should be present");
+    let buf: Vec<u8> = (0..size)
+        .map(|i| u8::try_from(i % 251).unwrap_or_default())
+        .collect();
+    f.write_all(&buf)
+        .await
+        .assert_value("test value should be present");
+    f.flush().await.assert_value("test value should be present");
 }
 
 fn pattern_vec(size: usize) -> Vec<u8> {
-    (0..size).map(|i| (i % 251) as u8).collect()
+    (0..size)
+        .map(|i| u8::try_from(i % 251).unwrap_or_default())
+        .collect()
 }
 
 fn truncate_file(path: &str, len: u64) {
-    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-    f.set_len(len).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .assert_value("test value should be present");
+    f.set_len(len).assert_value("test value should be present");
 }
 
 /// 取 entry 后截断源文件再 `copy_file`，断言 Err + 目标端无残留。
@@ -55,11 +72,15 @@ async fn assert_truncated_copy_guarded(
     reset_dirs(&src_dir, &dst_dir).await;
     write_pattern(&format!("{src_dir}/blob.bin"), size).await;
 
-    let src = create_storage(&src_dir, Some(BLOCK), false).await.unwrap();
-    let dst = create_storage(&dst_dir, Some(BLOCK), true).await.unwrap();
+    let src = create_storage(&src_dir, Some(BLOCK), false)
+        .await
+        .assert_value("test value should be present");
+    let dst = create_storage(&dst_dir, Some(BLOCK), true)
+        .await
+        .assert_value("test value should be present");
     let entry = Box::pin(src.get_metadata(Path::new("blob.bin")))
         .await
-        .unwrap();
+        .assert_value("test value should be present");
 
     // 注入：entry 已带原 size，此时截断源文件（模拟扫描后源被并发变更）
     truncate_file(&format!("{src_dir}/blob.bin"), truncated);
@@ -146,11 +167,15 @@ async fn intact_copy_still_succeeds() {
         reset_dirs(&src_dir, &dst_dir).await;
         write_pattern(&format!("{src_dir}/blob.bin"), size).await;
 
-        let src = create_storage(&src_dir, Some(BLOCK), false).await.unwrap();
-        let dst = create_storage(&dst_dir, Some(BLOCK), true).await.unwrap();
+        let src = create_storage(&src_dir, Some(BLOCK), false)
+            .await
+            .assert_value("test value should be present");
+        let dst = create_storage(&dst_dir, Some(BLOCK), true)
+            .await
+            .assert_value("test value should be present");
         let entry = Box::pin(src.get_metadata(Path::new("blob.bin")))
             .await
-            .unwrap();
+            .assert_value("test value should be present");
 
         StorageEnum::copy_file(
             &src,
@@ -163,10 +188,10 @@ async fn intact_copy_still_succeeds() {
             },
         )
         .await
-        .expect("intact copy must succeed");
+        .assert_value("intact copy must succeed");
         let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
             .await
-            .unwrap();
+            .assert_value("test value should be present");
         assert_eq!(out, pattern_vec(size), "content mismatch for {tag}");
     }
 }

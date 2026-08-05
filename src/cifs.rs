@@ -279,6 +279,7 @@ const DEFAULT_BLOCK_SIZE: u64 = 8 * MB;
 /// 上限后失效。目前为编译期常量；如需运行期 tunable，需新增 `CifsStorage`
 /// 方法暴露给上层（当前未实现）。
 const DEFAULT_READ_INFLIGHT: usize = 4;
+type CifsReadFuture<'a> = Pin<Box<dyn Future<Output = std::io::Result<Bytes>> + Send + 'a>>;
 
 /// 单文件写入的同时在飞请求数（inflight write pipeline 深度）。
 ///
@@ -582,6 +583,10 @@ impl CifsStorage {
     /// 创建 `CifsStorage` 实例
     ///
     /// 解析 URL → 创建 Client → 连接共享 → 验证连通性
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn new(url: &str, block_size: Option<u64>) -> Result<Self> {
         let storage = Self::connect_only(url, block_size).await?;
         storage.check_connectivity().await?;
@@ -734,6 +739,10 @@ impl CifsStorage {
     /// 仅尝试打开 root（含 sub-path），打开后立即关闭句柄。失败即报错，不创建任何目录。
     /// 目标端首次写入需要自动建立 root sub-path 的场景，由
     /// `create_cifs_storage(ensure_dir = true)` → `ensure_root_exists` 处理。
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn check_connectivity(&self) -> Result<()> {
         let root_unc = self.build_unc_path(Path::new(""));
         let args =
@@ -754,6 +763,10 @@ impl CifsStorage {
     ///
     /// 注意：直接对 share 根逐层 mkdir，避开 `create_dir_all` 在 `build_unc_path`
     /// 中重复拼接 `self.root` 的问题（否则会创建 `<root>/<root>` 嵌套目录）。
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn ensure_root_exists(&self) -> Result<()> {
         if self.root.is_empty() {
             return Ok(());
@@ -1033,12 +1046,7 @@ impl CifsStorage {
         // - send_offset：已通过 channel 送出的总字节数。
         // - 内层 while 填满 inflight；外层 await 取最早完成的（FIFO）。
         // - 出错或下游关闭时跳出，FuturesOrdered drop 会取消未完成的 future。
-        #[expect(
-            clippy::items_after_statements,
-            reason = "the local future type belongs beside its scheduling queue"
-        )]
-        type ReadFut<'a> = Pin<Box<dyn Future<Output = std::io::Result<Bytes>> + Send + 'a>>;
-        let mut inflight: FuturesOrdered<ReadFut<'_>> = FuturesOrdered::new();
+        let mut inflight: FuturesOrdered<CifsReadFuture<'_>> = FuturesOrdered::new();
         let mut issue_offset: u64 = 0;
         let mut send_offset: u64 = 0;
         // 读失败必须上抛 —— `Cancelled` 才是"静默结束"，IO 错误是真错误，
@@ -1475,6 +1483,10 @@ impl CifsStorage {
     ///
     /// 命中 `dir_exists_cache` 的层级直接跳过网络往返；mkdir 成功或
     /// 服务端返回 `STATUS_OBJECT_NAME_COLLISION` 后把路径插入 cache。
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn create_dir_all(&self, relative_path: &Path) -> Result<()> {
         debug!("CIFS create_dir_all: {:?}", relative_path);
 
@@ -1515,6 +1527,10 @@ impl CifsStorage {
     /// 通过 `set_info<FileDispositionInformation>` 标记删除，关闭时生效。
     /// 不区分文件/目录：均在网络操作前驱逐 `dir_exists_cache`，避免误把已删除的
     /// 目录残留在缓存中导致后续 `create_dir_all` 跳过实际不存在的层级。
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn delete_file(&self, relative_path: &Path) -> Result<()> {
         trace!("CIFS removing file {:?}", relative_path);
 
@@ -1591,6 +1607,10 @@ impl CifsStorage {
     /// - `relative_path = None`：仅清空 share root 下的内容，不删除 share 根本身
     ///
     /// 进度事件按删除顺序（深度倒序）通过迭代器返回。
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn delete_dir_all_with_progress(
         &self,
         relative_path: Option<&Path>,
@@ -1704,6 +1724,10 @@ impl CifsStorage {
     /// 重命名文件或目录
     ///
     /// 通过 `set_info<FileRenameInformation>` 实现
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         trace!("CIFS rename {:?} to {:?}", from, to);
 
@@ -1790,6 +1814,10 @@ impl CifsStorage {
     // ========================================================================
 
     /// 获取文件或目录的元数据
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn get_metadata(&self, relative_path: &Path) -> Result<EntryEnum> {
         debug!("CIFS get_metadata {:?}", relative_path);
 
@@ -1858,6 +1886,10 @@ impl CifsStorage {
     /// 更新文件的时间戳元数据
     ///
     /// 注意：SMB 不原生支持 Unix uid/gid/mode，仅设置时间戳
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn update_metadata(
         &self,
         relative_path: &Path,
@@ -1920,6 +1952,10 @@ impl CifsStorage {
     /// 创建符号链接
     ///
     /// SMB reparse point support is not implemented by this backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn create_symlink(
         &self,
         _relative_path: &Path,
@@ -1935,6 +1971,10 @@ impl CifsStorage {
     }
 
     /// 读取符号链接目标
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn read_symlink(&self, _relative_path: &Path) -> Result<PathBuf> {
         Err(StorageError::CifsError(
             "CIFS symlink reading is not supported".to_string(),
@@ -1949,6 +1989,10 @@ impl CifsStorage {
     ///
     /// 使用 work-stealing scheduler 实现高效并行目录遍历。
     /// 每个 worker 独立查询子目录，通过 bounded channel 控制内存。
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn walkdir(
         &self,
         sub_path: Option<&Path>,
@@ -2071,106 +2115,17 @@ impl CifsStorage {
         package_remaining: Option<usize>,
         runtime: CifsWalkRuntime<'_>,
     ) -> Result<()> {
-        let producer_id = runtime.scheduler.worker_id;
-        let tx = runtime.tx;
         let ctx = runtime.scheduler;
         let match_expr = runtime.match_expr;
-        let exclude_expr = runtime.exclude_expr;
         let max_depth = runtime.max_depth;
-        let total_file_count = runtime.total_file_count;
         let packaged = runtime.packaged;
         let package_depth = runtime.package_depth;
-        // 构建目录的 UNC 路径
-        let dir_relative = if self.root.is_empty()
-            || dir_path.is_empty()
-            || dir_path == *self.root
-            || dir_path.starts_with(&*self.root)
-        {
-            dir_path.clone()
-        } else {
-            format!("{}/{dir_path}", self.root)
-        };
-
-        let unc = if dir_relative.is_empty() {
-            (*self.share_path).clone()
-        } else {
-            (*self.share_path)
-                .clone()
-                .with_path(&dir_relative.replace('/', "\\"))
-        };
-
-        // 打开目录
-        let dir_args =
-            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
-        let resource = match self.client.create_file(&unc, &dir_args).await {
-            Ok(r) => r,
-            Err(e) => {
-                error!(
-                    "[Producer {}] Failed to open directory {}: {}",
-                    producer_id, dir_path, e
-                );
-                let _ = tx
-                    .send(StorageEntryMessage::Error {
-                        event: ErrorEvent::Scan,
-                        path: PathBuf::from(&dir_path),
-                        entry: None,
-                        reason: format!("Failed to open directory: {e}"),
-                    })
-                    .await;
-                return Ok(());
-            }
-        };
-
-        let Resource::Directory(directory) = resource else {
-            warn!(
-                "[Producer {}] Path {} is not a directory",
-                producer_id, dir_path
-            );
+        let Some(entries) = self.collect_walk_entries(&dir_path, &runtime).await else {
             return Ok(());
         };
 
-        let dir_arc = Arc::new(directory);
-
-        // 通过协商出的 info class 收集条目（128-bit Extd 优先，旧服务器降级到 64-bit Full），
-        // 统一以 RawDirEntry 视图后续处理；所有路径都得到 file_id 用作 fh3 rename 比对键。
-        // query 起始失败 → 上报 ErrorEvent::Scan 并中止本目录；
-        // 单条 entry 失败 → 逐条上报 ErrorEvent::Scan 后继续处理剩余 entry，避免单点
-        // 失败丢弃整个目录（造成 silent count loss）。
-        let (entries, entry_errors) = match self.collect_dir_entries(&dir_arc).await {
-            Ok(v) => v,
-            Err(e) => {
-                error!(
-                    "[Producer {}] Failed to query directory {}: {}",
-                    producer_id, dir_path, e
-                );
-                let _ = tx
-                    .send(StorageEntryMessage::Error {
-                        event: ErrorEvent::Scan,
-                        path: PathBuf::from(&dir_path),
-                        entry: None,
-                        reason: format!("Failed to query directory: {e}"),
-                    })
-                    .await;
-                return Ok(());
-            }
-        };
-        for reason in entry_errors {
-            error!(
-                "[Producer {}] readdir entry error in {}: {}",
-                producer_id, dir_path, reason
-            );
-            let _ = tx
-                .send(StorageEntryMessage::Error {
-                    event: ErrorEvent::Scan,
-                    path: PathBuf::from(&dir_path),
-                    entry: None,
-                    reason,
-                })
-                .await;
-        }
-
         for entry in entries {
-            let file_name_str = entry.file_name;
+            let file_name_str = entry.file_name.clone();
 
             // 跳过 . 和 ..
             if file_name_str == "." || file_name_str == ".." {
@@ -2180,49 +2135,20 @@ impl CifsStorage {
             // 构建路径：去掉 root 前缀，保留相对于 root 的路径
             let full_path = Self::build_relative_path(&dir_path, &file_name_str);
             // 从 full_path 中去掉 root 前缀，得到纯相对路径
-            let relative_path = if !self.root.is_empty() && full_path.starts_with(&*self.root) {
-                let stripped = full_path.strip_prefix(&*self.root).unwrap_or(&full_path);
-                stripped.trim_start_matches('/').to_string()
-            } else {
-                full_path.clone()
-            };
+            let relative_path = self.strip_walk_root(&full_path);
 
             let extension = file_name_str
                 .rsplit_once('.')
                 .map(|(_, ext)| ext.to_string());
-            let file_name = &file_name_str;
-
             let is_dir = entry.file_attributes.directory();
-            let is_symlink = entry.file_attributes.reparse_point();
-            let is_readonly = entry.file_attributes.readonly();
-
-            // 过滤逻辑
-            let modified_epoch = Some(crate::time_util::nanos_to_secs(filetime_to_nanos(
-                entry.last_write_time,
-            )));
-
-            let (skip_entry, continue_scan, need_submatch) = if skip_filter {
-                should_skip(
-                    match_expr.as_ref().as_ref(),
-                    exclude_expr.as_ref().as_ref(),
-                    FilterInput {
-                        file_name: Some(file_name),
-                        file_path: Some(&relative_path),
-                        file_type: Some(if is_symlink {
-                            "symlink"
-                        } else if is_dir {
-                            "dir"
-                        } else {
-                            "file"
-                        }),
-                        modified_epoch,
-                        size: Some(entry.end_of_file),
-                        extension: extension.as_deref().or(Some("")),
-                    },
-                )
-            } else {
-                (false, true, false)
-            };
+            let (skip_entry, continue_scan, need_submatch) = Self::walk_filter_decision(
+                &runtime,
+                skip_filter,
+                &relative_path,
+                &file_name_str,
+                extension.as_deref(),
+                &entry,
+            );
 
             let entry_depth = current_depth + 1;
             let mut send_packaged = false;
@@ -2254,19 +2180,12 @@ impl CifsStorage {
             }
 
             // 构建 NASEntry
-            let storage_entry = EntryEnum::NAS(NASEntry::from_smb_info(SmbEntryInfo {
-                name: file_name_str.clone(),
-                relative_path: PathBuf::from(&relative_path),
-                extension: extension.clone(),
-                size: entry.end_of_file,
-                last_write_time: entry.last_write_time,
-                last_access_time: entry.last_access_time,
-                creation_time: entry.creation_time,
-                is_dir,
-                is_symlink,
-                is_readonly,
-                file_id: Some(entry.file_id),
-            }));
+            let storage_entry = EntryEnum::NAS(Self::nas_from_raw_entry(
+                &entry,
+                file_name_str,
+                relative_path.clone(),
+                extension,
+            ));
 
             // packaged 模式
             if !send_packaged
@@ -2292,17 +2211,7 @@ impl CifsStorage {
 
             // 统一的 Packaged 发送
             if send_packaged {
-                debug!(
-                    "[Producer {}] Packaged dir {} (depth: {})",
-                    producer_id, relative_path, entry_depth
-                );
-                total_file_count.fetch_add(1, Ordering::Relaxed);
-                if tx
-                    .send(StorageEntryMessage::Packaged(Arc::new(storage_entry)))
-                    .await
-                    .is_err()
-                {
-                    error!("[Producer {}] Output channel closed, stopping", producer_id);
+                if !Self::send_walk_entry(&runtime, storage_entry, true).await {
                     break;
                 }
                 continue;
@@ -2315,16 +2224,10 @@ impl CifsStorage {
             }
 
             // 发送 entry
-            if max_depth == 0 || entry_depth <= max_depth {
-                total_file_count.fetch_add(1, Ordering::Relaxed);
-                if tx
-                    .send(StorageEntryMessage::Scanned(Arc::new(storage_entry)))
-                    .await
-                    .is_err()
-                {
-                    error!("[Producer {}] Output channel closed, stopping", producer_id);
-                    break;
-                }
+            if (max_depth == 0 || entry_depth <= max_depth)
+                && !Self::send_walk_entry(&runtime, storage_entry, false).await
+            {
+                break;
             }
         }
 
@@ -2339,6 +2242,10 @@ impl CifsStorage {
     /// 返回 smb-rs `SecurityDescriptor`，包含：
     /// - `dacl`: 仅非继承的显式 ACE
     /// - `control.dacl_protected`: 继承保护位（`true`=禁用继承）
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn get_security_descriptor(
         &self,
         relative_path: &Path,
@@ -2390,6 +2297,10 @@ impl CifsStorage {
     /// 2. 合并：源端显式 ACE + 目标端继承 ACE → 完整 DACL
     /// 3. 写入合并后的 DACL（`SMB2` `SET_INFO` 会替换整个 DACL，需保留继承 ACE）
     /// 4. 如果源/目标都无显式 ACE 且保护位相同 → 跳过
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn set_security_descriptor(
         &self,
         relative_path: &Path,
@@ -2517,6 +2428,200 @@ impl CifsStorage {
     // walkdir_2（DFS Driver + Reader 池）
     // ========================================================================
 
+    fn read_filter_decision(
+        ctx: &crate::dir_tree::ReadContext,
+        relative_path: &str,
+        file_name: &str,
+        extension: Option<&str>,
+        entry: &RawDirEntry,
+    ) -> (bool, bool, bool) {
+        if !ctx.apply_filter {
+            return (false, true, false);
+        }
+        let is_dir = entry.file_attributes.directory();
+        let file_type = if entry.file_attributes.reparse_point() {
+            "symlink"
+        } else if is_dir {
+            "dir"
+        } else {
+            "file"
+        };
+        should_skip(
+            ctx.match_expr.as_ref().as_ref(),
+            ctx.exclude_expr.as_ref().as_ref(),
+            FilterInput {
+                file_name: Some(file_name),
+                file_path: Some(relative_path),
+                file_type: Some(file_type),
+                modified_epoch: Some(crate::time_util::nanos_to_secs(filetime_to_nanos(
+                    entry.last_write_time,
+                ))),
+                size: Some(entry.end_of_file),
+                extension: extension.or(Some("")),
+            },
+        )
+    }
+
+    fn nas_from_raw_entry(
+        entry: &RawDirEntry,
+        name: String,
+        relative_path: String,
+        extension: Option<String>,
+    ) -> NASEntry {
+        NASEntry::from_smb_info(SmbEntryInfo {
+            name,
+            relative_path: PathBuf::from(relative_path),
+            extension,
+            size: entry.end_of_file,
+            last_write_time: entry.last_write_time,
+            last_access_time: entry.last_access_time,
+            creation_time: entry.creation_time,
+            is_dir: entry.file_attributes.directory(),
+            is_symlink: entry.file_attributes.reparse_point(),
+            is_readonly: entry.file_attributes.readonly(),
+            file_id: Some(entry.file_id),
+        })
+    }
+
+    fn walk_filter_decision(
+        runtime: &CifsWalkRuntime<'_>,
+        skip_filter: bool,
+        relative_path: &str,
+        file_name: &str,
+        extension: Option<&str>,
+        entry: &RawDirEntry,
+    ) -> (bool, bool, bool) {
+        if !skip_filter {
+            return (false, true, false);
+        }
+        let file_type = if entry.file_attributes.reparse_point() {
+            "symlink"
+        } else if entry.file_attributes.directory() {
+            "dir"
+        } else {
+            "file"
+        };
+        should_skip(
+            runtime.match_expr.as_ref().as_ref(),
+            runtime.exclude_expr.as_ref().as_ref(),
+            FilterInput {
+                file_name: Some(file_name),
+                file_path: Some(relative_path),
+                file_type: Some(file_type),
+                modified_epoch: Some(crate::time_util::nanos_to_secs(filetime_to_nanos(
+                    entry.last_write_time,
+                ))),
+                size: Some(entry.end_of_file),
+                extension: extension.or(Some("")),
+            },
+        )
+    }
+
+    async fn report_walk_error(runtime: &CifsWalkRuntime<'_>, path: &str, reason: String) {
+        error!(
+            "[Producer {}] scan error in {}: {}",
+            runtime.scheduler.worker_id, path, reason
+        );
+        let _ = runtime
+            .tx
+            .send(StorageEntryMessage::Error {
+                event: ErrorEvent::Scan,
+                path: PathBuf::from(path),
+                entry: None,
+                reason,
+            })
+            .await;
+    }
+
+    async fn collect_walk_entries(
+        &self,
+        dir_path: &str,
+        runtime: &CifsWalkRuntime<'_>,
+    ) -> Option<Vec<RawDirEntry>> {
+        let relative = if self.root.is_empty()
+            || dir_path.is_empty()
+            || dir_path == *self.root
+            || dir_path.starts_with(&*self.root)
+        {
+            dir_path.to_string()
+        } else {
+            format!("{}/{dir_path}", self.root)
+        };
+        let unc = if relative.is_empty() {
+            (*self.share_path).clone()
+        } else {
+            (*self.share_path)
+                .clone()
+                .with_path(&relative.replace('/', "\\"))
+        };
+        let args =
+            FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+        let resource = match self.client.create_file(&unc, &args).await {
+            Ok(resource) => resource,
+            Err(error) => {
+                Self::report_walk_error(
+                    runtime,
+                    dir_path,
+                    format!("Failed to open directory: {error}"),
+                )
+                .await;
+                return None;
+            }
+        };
+        let Resource::Directory(directory) = resource else {
+            warn!("Path {dir_path} is not a directory");
+            return None;
+        };
+        let (entries, errors) = match self.collect_dir_entries(&Arc::new(directory)).await {
+            Ok(result) => result,
+            Err(error) => {
+                Self::report_walk_error(
+                    runtime,
+                    dir_path,
+                    format!("Failed to query directory: {error}"),
+                )
+                .await;
+                return None;
+            }
+        };
+        for reason in errors {
+            Self::report_walk_error(runtime, dir_path, reason).await;
+        }
+        Some(entries)
+    }
+
+    async fn send_walk_entry(
+        runtime: &CifsWalkRuntime<'_>,
+        entry: EntryEnum,
+        packaged: bool,
+    ) -> bool {
+        let message = if packaged {
+            StorageEntryMessage::Packaged(Arc::new(entry))
+        } else {
+            StorageEntryMessage::Scanned(Arc::new(entry))
+        };
+        if runtime.tx.send(message).await.is_err() {
+            error!(
+                "[Producer {}] Output channel closed, stopping",
+                runtime.scheduler.worker_id
+            );
+            return false;
+        }
+        runtime.total_file_count.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn strip_walk_root(&self, full_path: &str) -> String {
+        if self.root.is_empty() || !full_path.starts_with(&*self.root) {
+            return full_path.to_string();
+        }
+        full_path
+            .strip_prefix(&*self.root)
+            .unwrap_or(full_path)
+            .trim_start_matches('/')
+            .to_string()
+    }
+
     /// 读取单个目录内容，返回排序后的文件和子目录列表
     ///
     /// 由 Reader Worker 调用，通过 SMB2 `FileIdExtdDirectoryInformation` 查询目录内容。
@@ -2587,7 +2692,7 @@ impl CifsStorage {
         errors.extend(entry_errors);
 
         for entry in entries {
-            let file_name_str = entry.file_name;
+            let file_name_str = entry.file_name.clone();
             if file_name_str == "." || file_name_str == ".." {
                 continue;
             }
@@ -2598,78 +2703,33 @@ impl CifsStorage {
                 .map(|(_, ext)| ext.to_string());
 
             let is_dir = entry.file_attributes.directory();
-            let is_symlink = entry.file_attributes.reparse_point();
-            let is_readonly = entry.file_attributes.readonly();
-
-            // 过滤逻辑
-            let modified_epoch = Some(crate::time_util::nanos_to_secs(filetime_to_nanos(
-                entry.last_write_time,
+            let (skip_entry, continue_scan, need_submatch) = Self::read_filter_decision(
+                ctx,
+                &relative_path,
+                &file_name_str,
+                extension.as_deref(),
+                &entry,
+            );
+            let entry_enum = Arc::new(EntryEnum::NAS(Self::nas_from_raw_entry(
+                &entry,
+                file_name_str,
+                relative_path,
+                extension,
             )));
-
-            let (skip_entry, continue_scan, need_submatch) = if ctx.apply_filter {
-                should_skip(
-                    ctx.match_expr.as_ref().as_ref(),
-                    ctx.exclude_expr.as_ref().as_ref(),
-                    FilterInput {
-                        file_name: Some(&file_name_str),
-                        file_path: Some(&relative_path),
-                        file_type: Some(if is_symlink {
-                            "symlink"
-                        } else if is_dir {
-                            "dir"
-                        } else {
-                            "file"
-                        }),
-                        modified_epoch,
-                        size: Some(entry.end_of_file),
-                        extension: extension.as_deref().or(Some("")),
-                    },
-                )
-            } else {
-                (false, true, false)
-            };
 
             if skip_entry {
                 if is_dir
                     && continue_scan
                     && (ctx.max_depth == 0 || ctx.current_depth + 1 < ctx.max_depth)
                 {
-                    let nas = NASEntry::from_smb_info(SmbEntryInfo {
-                        name: file_name_str,
-                        relative_path: PathBuf::from(relative_path),
-                        extension,
-                        size: entry.end_of_file,
-                        last_write_time: entry.last_write_time,
-                        last_access_time: entry.last_access_time,
-                        creation_time: entry.creation_time,
-                        is_dir: true,
-                        is_symlink,
-                        is_readonly,
-                        file_id: Some(entry.file_id),
-                    });
                     subdirs.push(SubdirEntry {
-                        entry: Arc::new(EntryEnum::NAS(nas)),
+                        entry: entry_enum,
                         visible: false,
                         need_filter: need_submatch,
                     });
                 }
                 continue;
             }
-
-            let nas = NASEntry::from_smb_info(SmbEntryInfo {
-                name: file_name_str,
-                relative_path: PathBuf::from(relative_path),
-                extension,
-                size: entry.end_of_file,
-                last_write_time: entry.last_write_time,
-                last_access_time: entry.last_access_time,
-                creation_time: entry.creation_time,
-                is_dir,
-                is_symlink,
-                is_readonly,
-                file_id: Some(entry.file_id),
-            });
-            let entry_enum = Arc::new(EntryEnum::NAS(nas));
 
             if is_dir && ctx.max_depth > 0 && ctx.current_depth + 1 >= ctx.max_depth {
                 files.push(entry_enum);
@@ -2684,19 +2744,30 @@ impl CifsStorage {
             }
         }
 
-        // 排序
-        files.sort_by(|a, b| a.get_name().cmp(b.get_name()));
-        subdirs.sort_by(|a, b| a.entry.get_name().cmp(b.entry.get_name()));
+        Ok(Self::finish_read_dir(dir_path, files, subdirs, errors))
+    }
 
-        Ok(ReadResult {
+    fn finish_read_dir(
+        dir_path: &str,
+        mut files: Vec<Arc<EntryEnum>>,
+        mut subdirs: Vec<crate::dir_tree::SubdirEntry>,
+        errors: Vec<String>,
+    ) -> crate::dir_tree::ReadResult {
+        files.sort_by(|left, right| left.get_name().cmp(right.get_name()));
+        subdirs.sort_by(|left, right| left.entry.get_name().cmp(right.entry.get_name()));
+        crate::dir_tree::ReadResult {
             dir_path: dir_path.to_string(),
             files,
             subdirs,
             errors,
-        })
+        }
     }
 
     /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn walkdir_2(
         &self,
         sub_path: Option<&Path>,
@@ -2942,6 +3013,10 @@ where
 /// 由 `ensure_root_exists` 按层 mkdir（直接对 share 根，避开 `build_unc_path`
 /// 的 root 前缀双重拼接）。
 /// `ensure_dir = false`（源端）：走 `CifsStorage::new` 含连通性检查，路径不存在报错。
+///
+/// # Errors
+///
+/// Returns an error when the requested storage operation cannot be completed.
 pub async fn create_cifs_storage(
     url: &str,
     block_size: Option<u64>,
@@ -2960,11 +3035,13 @@ pub async fn create_cifs_storage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AssertTestValue;
 
     #[test]
     fn test_parse_smb_url_basic() {
         let (host, port, share, sub_path, user, pass, smb2_only) =
-            parse_smb_url("smb://admin:password@nas01/shared").unwrap();
+            parse_smb_url("smb://admin:password@nas01/shared")
+                .assert_value("test value should be present");
         assert_eq!(host, "nas01");
         assert_eq!(port, 445);
         assert_eq!(share, "shared");
@@ -2977,7 +3054,8 @@ mod tests {
     #[test]
     fn test_parse_smb_url_with_port_and_path() {
         let (host, port, share, sub_path, user, pass, smb2_only) =
-            parse_smb_url("smb://user:P%40ss@server:4455/backup/data/2024").unwrap();
+            parse_smb_url("smb://user:P%40ss@server:4455/backup/data/2024")
+                .assert_value("test value should be present");
         assert_eq!(host, "server");
         assert_eq!(port, 4455);
         assert_eq!(share, "backup");
@@ -3001,16 +3079,19 @@ mod tests {
     fn test_parse_smb_url_smb2_only_param() {
         // 显式关闭：走多协议协商
         let (_, _, _, _, _, _, smb2_only) =
-            parse_smb_url("smb://user:pass@server/share?smb2_only=false").unwrap();
+            parse_smb_url("smb://user:pass@server/share?smb2_only=false")
+                .assert_value("test value should be present");
         assert!(!smb2_only);
 
         // 显式开启
         let (_, _, _, _, _, _, smb2_only) =
-            parse_smb_url("smb://user:pass@server/share?smb2_only=true").unwrap();
+            parse_smb_url("smb://user:pass@server/share?smb2_only=true")
+                .assert_value("test value should be present");
         assert!(smb2_only);
 
         // 默认（无参数）= true
-        let (_, _, _, _, _, _, smb2_only) = parse_smb_url("smb://user:pass@server/share").unwrap();
+        let (_, _, _, _, _, _, smb2_only) = parse_smb_url("smb://user:pass@server/share")
+            .assert_value("test value should be present");
         assert!(smb2_only);
     }
 

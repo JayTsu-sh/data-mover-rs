@@ -15,6 +15,10 @@ pub struct HCPRestClient {
 }
 
 impl HCPRestClient {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn try_new(
         bucket_name: String,
         host: String,
@@ -45,6 +49,10 @@ impl HCPRestClient {
         })
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn get_tags(&self, path: &str) -> Result<Vec<Tag>> {
         let url = format!(
             "http://{}.{}/rest{}?type=custom-metadata&annotation=BPM",
@@ -117,6 +125,7 @@ pub struct MetaData {
 }
 
 impl MetaData {
+    #[must_use]
     pub fn parse_tags(xml: &str) -> Vec<Tag> {
         if let Ok(metadata) = from_str::<MetaData>(xml) {
             let mut tags = Vec::new();

@@ -33,7 +33,7 @@ jobs:
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --no-fail-fast
       - run: cargo build --examples
-      - name: cargo clippy (baseline-aware)
+      - name: cargo clippy (all targets, deny warnings)
         run: python3 .claude/skills/quality-clippy/scripts/run.py
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: Independent integrity check E2E

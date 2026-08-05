@@ -11,7 +11,7 @@ async fn main() -> Result<()> {
     storage.create_dir_all(path).await?;
 
     let entry = storage.get_metadata(path).await?;
-    println!("{:?}", entry);
+    println!("{entry:?}");
 
     storage.delete_dir_all(Some(Path::new("dir1"))).await?;
 

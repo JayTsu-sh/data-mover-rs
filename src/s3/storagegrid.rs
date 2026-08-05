@@ -66,6 +66,7 @@ impl Intercept for StorageGridCompatibilityInterceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AssertTestValue;
     use std::sync::{Arc, Mutex};
 
     use aws_credential_types::Credentials;
@@ -225,12 +226,12 @@ mod tests {
         let object = ObjectIdentifier::builder()
             .key("prefix/object.txt")
             .build()
-            .unwrap();
+            .assert_value("test value should be present");
         let delete = Delete::builder()
             .objects(object)
             .quiet(true)
             .build()
-            .unwrap();
+            .assert_value("test value should be present");
         let result = aws_sdk_s3::Client::from_conf(config)
             .delete_objects()
             .bucket("bucket")

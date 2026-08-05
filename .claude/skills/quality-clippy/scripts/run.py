@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """quality-clippy skill runner.
 
-策略：
-- 对生产库运行 cargo clippy，并把所有 warning 作为硬错误。
-- 对 tests 和 examples 额外运行 clippy。测试代码允许 unwrap/expect，其余 lint
-  暂按 warning 报告，待存量清零后切换为 -D warnings。
-baseline 已清零；文件仅保留为状态记录，不再用于放行生产告警。
+策略：对生产库、测试和 examples 统一运行 Clippy，并把所有 warning 作为硬错误。
+不为测试代码放宽 unwrap/expect，也不使用 warning baseline。
 """
 
 from __future__ import annotations
@@ -33,7 +30,7 @@ def run_clippy(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 
 def main() -> int:
     cmd = [
-        "cargo", "clippy", "--lib", "--",
+        "cargo", "clippy", "--all-targets", "--",
         "-D", "warnings",
         "-D", "clippy::unwrap_used",
         "-D", "clippy::expect_used",
@@ -52,23 +49,7 @@ def main() -> int:
         )
         return result.returncode
 
-    targets_cmd = [
-        "cargo", "clippy", "--tests", "--examples", "--",
-        "-A", "clippy::unwrap_used",
-        "-A", "clippy::expect_used",
-    ]
-    targets_result = run_clippy(targets_cmd)
-    targets_output = (targets_result.stdout or "") + (targets_result.stderr or "")
-    sys.stdout.write(targets_output)
-    if targets_result.returncode != 0:
-        print(
-            f"[skill quality-clippy] FAIL: tests/examples clippy exited with "
-            f"{targets_result.returncode}",
-            file=sys.stderr,
-        )
-        return targets_result.returncode
-
-    print("[skill quality-clippy] PASS (lib has zero warnings; tests/examples checked)")
+    print("[skill quality-clippy] PASS (all targets have zero warnings)")
     return 0
 
 

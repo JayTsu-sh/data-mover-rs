@@ -194,6 +194,7 @@ pub(crate) fn tar_eof_marker() -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AssertTestValue;
 
     #[test]
     fn test_build_ustar_header_basic() {
@@ -239,11 +240,8 @@ mod tests {
         let size_field = std::str::from_utf8(&header[124..135]).ok();
         assert!(size_field.is_some());
         assert_eq!(
-            u64::from_str_radix(
-                size_field.map(|s| s.trim_start_matches('0')).unwrap_or("0"),
-                8
-            )
-            .unwrap_or(0),
+            u64::from_str_radix(size_field.map_or("0", |s| s.trim_start_matches('0')), 8)
+                .unwrap_or(0),
             0
         );
     }
@@ -264,10 +262,10 @@ mod tests {
         // 验证 checksum：将 checksum 字段视为空格，求所有字节的和
         let mut check_header = header;
         check_header[148..156].copy_from_slice(b"        ");
-        let expected: u64 = check_header.iter().map(|&b| b as u64).sum();
+        let expected: u64 = check_header.iter().map(|&b| u64::from(b)).sum();
 
         // 从 header 读取写入的 checksum 值
-        let cksum_str = std::str::from_utf8(&header[148..154]).expect("valid utf8");
+        let cksum_str = std::str::from_utf8(&header[148..154]).assert_value("valid utf8");
         let stored_cksum = u64::from_str_radix(cksum_str.trim_start_matches('0'), 8).unwrap_or(0);
 
         assert_eq!(stored_cksum, expected);
@@ -284,10 +282,10 @@ mod tests {
         assert!(tar_padding(512).is_none());
         assert!(tar_padding(1024).is_none());
 
-        let padding = tar_padding(100).expect("should have padding");
+        let padding = tar_padding(100).assert_value("should have padding");
         assert_eq!(padding.len(), 412); // 512 - 100
 
-        let padding = tar_padding(513).expect("should have padding");
+        let padding = tar_padding(513).assert_value("should have padding");
         assert_eq!(padding.len(), 511); // 1024 - 513
     }
 

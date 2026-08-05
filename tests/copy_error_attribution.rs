@@ -36,11 +36,11 @@ impl Drop for TempDir {
     }
 }
 
-fn assert_read_error(result: data_mover::Result<()>) {
+fn assert_read_error(result: &data_mover::Result<()>) {
     assert!(
         matches!(
             result,
-            Err(StorageError::ReadError(ref message))
+            Err(StorageError::ReadError(message))
                 if message.starts_with("Source read failed: ")
                     && message.len() > "Source read failed: ".len()
         ),
@@ -48,11 +48,11 @@ fn assert_read_error(result: data_mover::Result<()>) {
     );
 }
 
-fn assert_write_error(result: data_mover::Result<()>) {
+fn assert_write_error(result: &data_mover::Result<()>) {
     assert!(
         matches!(
             result,
-            Err(StorageError::WriteError(ref message))
+            Err(StorageError::WriteError(message))
                 if message.starts_with("Destination write failed: ")
                     && message.len() > "Destination write failed: ".len()
         ),
@@ -94,7 +94,7 @@ async fn single_chunk_copy_attributes_source_read_error() -> Result<(), Box<dyn 
     )
     .await;
 
-    assert_read_error(result);
+    assert_read_error(&result);
     Ok(())
 }
 
@@ -121,7 +121,7 @@ async fn single_chunk_copy_attributes_destination_write_error()
     )
     .await;
 
-    assert_write_error(result);
+    assert_write_error(&result);
     Ok(())
 }
 
@@ -146,7 +146,7 @@ async fn multi_chunk_copy_attributes_source_read_error() -> Result<(), Box<dyn s
     )
     .await;
 
-    assert_read_error(result);
+    assert_read_error(&result);
     Ok(())
 }
 
@@ -173,7 +173,7 @@ async fn multi_chunk_copy_prefers_destination_error_when_both_sides_fail()
     )
     .await;
 
-    assert_write_error(result);
+    assert_write_error(&result);
     Ok(())
 }
 
@@ -204,7 +204,7 @@ async fn resumable_copy_attributes_source_read_error() -> Result<(), Box<dyn std
     )
     .await;
 
-    assert_read_error(result);
+    assert_read_error(&result);
     Ok(())
 }
 
@@ -237,6 +237,6 @@ async fn resumable_copy_prefers_destination_error_when_both_sides_fail()
     )
     .await;
 
-    assert_write_error(result);
+    assert_write_error(&result);
     Ok(())
 }

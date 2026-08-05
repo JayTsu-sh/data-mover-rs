@@ -21,6 +21,7 @@
 /// - `smb://user:pwd@host/share` → `smb://***:***@host/share`
 /// - `nfs://server:port/export:/prefix?uid=1000` → 原样返回（无 userinfo）
 /// - `/local/path` → 原样返回
+#[must_use]
 pub fn redact_storage_url(url: &str) -> String {
     let Ok(mut parsed) = url::Url::parse(url) else {
         return url.to_string();

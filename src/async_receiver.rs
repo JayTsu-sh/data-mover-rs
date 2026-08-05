@@ -22,6 +22,7 @@ impl<T> Clone for AsyncReceiver<T> {
 }
 
 impl<T> AsyncReceiver<T> {
+    #[must_use]
     pub fn new(rx: async_channel::Receiver<T>) -> Self {
         Self { rx }
     }

@@ -49,14 +49,13 @@ async fn main() -> Result<()> {
     if matches!(
         (&entry, &copied),
         (EntryEnum::NAS(_) | EntryEnum::S3(_), EntryEnum::NAS(_))
-    ) {
-        if copied.get_mtime() != entry.get_mtime() {
-            return Err(data_mover::error::StorageError::OperationError(format!(
-                "destination mtime mismatch: expected {}, got {}",
-                entry.get_mtime(),
-                copied.get_mtime()
-            )));
-        }
+    ) && copied.get_mtime() != entry.get_mtime()
+    {
+        return Err(data_mover::error::StorageError::OperationError(format!(
+            "destination mtime mismatch: expected {}, got {}",
+            entry.get_mtime(),
+            copied.get_mtime()
+        )));
     }
     if matches!((&entry, &copied), (EntryEnum::NAS(_), EntryEnum::NAS(_))) {
         if copied.get_mode().map(|mode| mode & 0o7777) != entry.get_mode().map(|mode| mode & 0o7777)

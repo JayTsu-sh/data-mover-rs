@@ -295,6 +295,77 @@ fn has_more_visible_siblings(stack: &[DfsFrame]) -> bool {
     false
 }
 
+fn assign_page_ndx(
+    files: Vec<Arc<EntryEnum>>,
+    subdirs: &[SubdirEntry],
+    next_ndx: &mut i32,
+) -> (i32, Vec<NdxEntry>, Vec<NdxEntry>) {
+    let ndx_start = *next_ndx;
+    let files = files
+        .into_iter()
+        .map(|entry| {
+            let ndx = *next_ndx;
+            *next_ndx += 1;
+            NdxEntry { ndx, entry }
+        })
+        .collect();
+    let subdirs = subdirs
+        .iter()
+        .filter(|subdir| subdir.visible)
+        .map(|subdir| {
+            let ndx = *next_ndx;
+            *next_ndx += 1;
+            NdxEntry {
+                ndx,
+                entry: subdir.entry.clone(),
+            }
+        })
+        .collect();
+    (ndx_start, files, subdirs)
+}
+
+async fn send_directory_errors(
+    out_tx: &async_channel::Sender<NdxEvent>,
+    path: &str,
+    errors: &[String],
+) {
+    for reason in errors {
+        let _ = out_tx
+            .send(NdxEvent::Error {
+                path: path.to_string(),
+                reason: reason.clone(),
+            })
+            .await;
+    }
+}
+
+fn allocate_gap_ndx(has_children: bool, has_siblings: bool, next_ndx: &mut i32) -> i32 {
+    if !has_children && !has_siblings {
+        return -1;
+    }
+    let gap_ndx = *next_ndx;
+    *next_ndx += 1;
+    gap_ndx
+}
+
+async fn request_root_directory(
+    req_tx: &async_channel::Sender<ReadRequest>,
+    root_handle: DirHandle,
+    base_ctx: &ReadContext,
+) -> Option<oneshot::Receiver<Result<ReadResult>>> {
+    let (reply, response) = oneshot::channel();
+    req_tx
+        .send(ReadRequest {
+            dir_path: String::new(),
+            handle: root_handle,
+            ctx: base_ctx.clone(),
+            reply,
+        })
+        .await
+        .ok()
+        .map(|()| response)
+}
+
 /// DFS 驱动器主循环，运行在单个 tokio task 中
 pub async fn run_dfs_driver(
     req_tx: async_channel::Sender<ReadRequest>,
@@ -306,21 +377,10 @@ pub async fn run_dfs_driver(
     // 从 root_handle 推导后端类型，用于子目录 handle 构建
     let backend = root_handle.backend_kind();
 
-    // 提交 root 目录读取
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if req_tx
-        .send(ReadRequest {
-            dir_path: String::new(),
-            handle: root_handle,
-            ctx: base_ctx.clone(),
-            reply: reply_tx,
-        })
-        .await
-        .is_err()
-    {
+    let Some(reply_rx) = request_root_directory(&req_tx, root_handle, &base_ctx).await else {
         let _ = out_tx.send(NdxEvent::Done).await;
         return;
-    }
+    };
 
     let mut stack: Vec<DfsFrame> = vec![DfsFrame::new_root(reply_rx)];
     let mut next_ndx: i32 = 0;
@@ -370,52 +430,16 @@ pub async fn run_dfs_driver(
                 .prefetch_subdirs(&req_tx, &root_path, backend, &base_ctx)
                 .await;
 
-            // 发送错误
-            for err in &result.errors {
-                let _ = out_tx
-                    .send(NdxEvent::Error {
-                        path: stack[frame_idx].dir_path.clone(),
-                        reason: err.clone(),
-                    })
-                    .await;
-            }
+            send_directory_errors(&out_tx, &stack[frame_idx].dir_path, &result.errors).await;
+            let (ndx_start, files, subdir_entries) =
+                assign_page_ndx(result.files, &stack[frame_idx].subdirs, &mut next_ndx);
 
-            // 分配 NDX：只给 visible 的 entry 分配
-            let ndx_start = next_ndx;
-            let files: Vec<NdxEntry> = result
-                .files
-                .into_iter()
-                .map(|e| {
-                    let ndx = next_ndx;
-                    next_ndx += 1;
-                    NdxEntry { ndx, entry: e }
-                })
-                .collect();
-            // 只给 visible=true 的子目录分配 NDX
-            let subdir_entries: Vec<NdxEntry> = stack[frame_idx]
-                .subdirs
-                .iter()
-                .filter(|s| s.visible)
-                .map(|s| {
-                    let ndx = next_ndx;
-                    next_ndx += 1;
-                    NdxEntry {
-                        ndx,
-                        entry: s.entry.clone(),
-                    }
-                })
-                .collect();
-
-            let has_visible_children = !subdir_entries.is_empty();
-            let has_any_children = !stack[frame_idx].subdirs.is_empty();
-            let has_siblings = has_more_visible_siblings(&stack);
-            let gap_ndx = if (has_visible_children || has_any_children) || has_siblings {
-                let g = next_ndx;
-                next_ndx += 1;
-                g
-            } else {
-                -1
-            };
+            let has_children = !subdir_entries.is_empty() || !stack[frame_idx].subdirs.is_empty();
+            let gap_ndx = allocate_gap_ndx(
+                has_children,
+                has_more_visible_siblings(&stack),
+                &mut next_ndx,
+            );
 
             // 只在有可见内容时发送 Page
             if (!files.is_empty() || !subdir_entries.is_empty())

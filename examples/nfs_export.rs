@@ -5,7 +5,7 @@ async fn main() -> Result<()> {
     let entries = NFSStorage::list_exports("10.131.9.20").await?;
 
     for entry in entries {
-        println!("{:?}", entry);
+        println!("{entry:?}");
     }
 
     Ok(())
