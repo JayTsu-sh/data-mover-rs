@@ -22,7 +22,10 @@ async fn main() -> Result<()> {
 
     // 创建进度条
     let pb = ProgressBar::new_spinner();
-    pb.set_style(ProgressStyle::with_template("{spinner} [{elapsed:.0}] {msg}").unwrap());
+    pb.set_style(
+        ProgressStyle::with_template("{spinner} [{elapsed:.0}] {msg}")
+            .map_err(|error| data_mover::error::StorageError::OperationError(error.to_string()))?,
+    );
     pb.set_message("Scanning files...");
     pb.enable_steady_tick(Duration::from_millis(100));
 
@@ -46,11 +49,11 @@ async fn main() -> Result<()> {
 
                     // 每两秒更新一次进度
                     if last_update.elapsed() > Duration::from_secs(2) {
-                        pb.set_message(format!("Scanning files... Total: {}", total_entries));
+                        pb.set_message(format!("Scanning files... Total: {total_entries}"));
                         last_update = Instant::now();
                     }
                 }
-                _ => continue,
+                EntryEnum::NAS(_) => {}
             },
             StorageEntryMessage::Error { path, reason, .. } => {
                 println!("Error for {}: {}", path.display(), reason);
@@ -66,8 +69,8 @@ async fn main() -> Result<()> {
     pb.finish_with_message("Scan completed");
 
     let duration = start.elapsed();
-    println!("Total entries: {}", total_entries);
-    println!("Scan time: {:?}", duration);
+    println!("Total entries: {total_entries}");
+    println!("Scan time: {duration:?}");
 
     // 遍历期间出现过错误则以非零退出，便于 e2e skill 断言
     if let Some(reason) = first_error {

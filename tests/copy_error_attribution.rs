@@ -36,11 +36,11 @@ impl Drop for TempDir {
     }
 }
 
-fn assert_read_error(result: data_mover::Result<()>) {
+fn assert_read_error(result: &data_mover::Result<()>) {
     assert!(
         matches!(
             result,
-            Err(StorageError::ReadError(ref message))
+            Err(StorageError::ReadError(message))
                 if message.starts_with("Source read failed: ")
                     && message.len() > "Source read failed: ".len()
         ),
@@ -48,11 +48,11 @@ fn assert_read_error(result: data_mover::Result<()>) {
     );
 }
 
-fn assert_write_error(result: data_mover::Result<()>) {
+fn assert_write_error(result: &data_mover::Result<()>) {
     assert!(
         matches!(
             result,
-            Err(StorageError::WriteError(ref message))
+            Err(StorageError::WriteError(message))
                 if message.starts_with("Destination write failed: ")
                     && message.len() > "Destination write failed: ".len()
         ),
@@ -83,10 +83,18 @@ async fn single_chunk_copy_attributes_source_read_error() -> Result<(), Box<dyn 
     let entry = source.get_metadata(Path::new("file")).await?;
     std::fs::remove_file(source_root.path().join("file"))?;
 
-    let result =
-        StorageEnum::copy_file(&source, &destination, &entry, None, false, true, None).await;
+    let result = StorageEnum::copy_file(
+        &source,
+        &destination,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await;
 
-    assert_read_error(result);
+    assert_read_error(&result);
     Ok(())
 }
 
@@ -102,10 +110,18 @@ async fn single_chunk_copy_attributes_destination_write_error()
     let destination = StorageEnum::Local(LocalStorage::new(destination_file, Some(8)));
     let entry = source.get_metadata(Path::new("file")).await?;
 
-    let result =
-        StorageEnum::copy_file(&source, &destination, &entry, None, false, true, None).await;
+    let result = StorageEnum::copy_file(
+        &source,
+        &destination,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await;
 
-    assert_write_error(result);
+    assert_write_error(&result);
     Ok(())
 }
 
@@ -119,10 +135,18 @@ async fn multi_chunk_copy_attributes_source_read_error() -> Result<(), Box<dyn s
     let entry = source.get_metadata(Path::new("file")).await?;
     std::fs::remove_file(source_root.path().join("file"))?;
 
-    let result =
-        StorageEnum::copy_file(&source, &destination, &entry, None, false, true, None).await;
+    let result = StorageEnum::copy_file(
+        &source,
+        &destination,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await;
 
-    assert_read_error(result);
+    assert_read_error(&result);
     Ok(())
 }
 
@@ -138,10 +162,18 @@ async fn multi_chunk_copy_prefers_destination_error_when_both_sides_fail()
     let destination = StorageEnum::Local(LocalStorage::new(destination_file, Some(4)));
     let entry = source.get_metadata(Path::new("file")).await?;
 
-    let result =
-        StorageEnum::copy_file(&source, &destination, &entry, None, false, true, None).await;
+    let result = StorageEnum::copy_file(
+        &source,
+        &destination,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await;
 
-    assert_write_error(result);
+    assert_write_error(&result);
     Ok(())
 }
 
@@ -164,15 +196,15 @@ async fn resumable_copy_attributes_source_read_error() -> Result<(), Box<dyn std
         &source,
         &destination,
         &entry,
-        None,
-        false,
-        true,
-        None,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
         resume,
     )
     .await;
 
-    assert_read_error(result);
+    assert_read_error(&result);
     Ok(())
 }
 
@@ -197,14 +229,14 @@ async fn resumable_copy_prefers_destination_error_when_both_sides_fail()
         &source,
         &destination,
         &entry,
-        None,
-        false,
-        true,
-        None,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
         resume,
     )
     .await;
 
-    assert_write_error(result);
+    assert_write_error(&result);
     Ok(())
 }

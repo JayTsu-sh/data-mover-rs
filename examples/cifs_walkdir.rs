@@ -5,12 +5,13 @@ use clap::Parser;
 use data_mover::storage_enum::create_storage;
 use data_mover::{EntryEnum, Result, StorageEntryMessage};
 use indicatif::{ProgressBar, ProgressStyle};
+use num_traits::ToPrimitive;
 use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "CIFS/SMB walkdir example", long_about = None)]
 struct Args {
-    /// SMB URL, e.g. smb://user:pass@server/share/path
+    /// SMB URL, e.g. <smb://user:pass@server/share/path>
     #[arg(short, long)]
     url: String,
 
@@ -52,7 +53,10 @@ async fn main() -> Result<()> {
     }));
 
     let pb = ProgressBar::new_spinner();
-    pb.set_style(ProgressStyle::with_template("{spinner} [{elapsed_precise}] {msg}").unwrap());
+    pb.set_style(
+        ProgressStyle::with_template("{spinner} [{elapsed_precise}] {msg}")
+            .map_err(|error| data_mover::error::StorageError::OperationError(error.to_string()))?,
+    );
     pb.set_message("Scanning CIFS share...");
     pb.enable_steady_tick(Duration::from_millis(100));
 
@@ -71,7 +75,7 @@ async fn main() -> Result<()> {
                     stats.total_entries,
                     stats.directories,
                     stats.files,
-                    stats.total_size as f64 / (1024.0 * 1024.0 * 1024.0)
+                    stats.total_size.to_f64().unwrap_or(f64::MAX) / (1024.0 * 1024.0 * 1024.0)
                 ));
                 last_update = Instant::now();
             }
@@ -103,7 +107,7 @@ async fn main() -> Result<()> {
                         stats.files += 1;
                     }
                 }
-                _ => continue,
+                EntryEnum::S3(_) => {}
             },
             StorageEntryMessage::Error { path, reason, .. } => {
                 eprintln!("Error for {}: {}", path.display(), reason);
@@ -123,13 +127,13 @@ async fn main() -> Result<()> {
     println!("Files:         {}", stats.files);
     println!(
         "Total size:    {:.2} GB",
-        stats.total_size as f64 / (1024.0 * 1024.0 * 1024.0)
+        stats.total_size.to_f64().unwrap_or(f64::MAX) / (1024.0 * 1024.0 * 1024.0)
     );
-    println!("Scan time:     {:?}", duration);
+    println!("Scan time:     {duration:?}");
     if duration.as_secs() > 0 {
         println!(
             "Throughput:    {:.0} entries/sec",
-            stats.total_entries as f64 / duration.as_secs_f64()
+            stats.total_entries.to_f64().unwrap_or(f64::MAX) / duration.as_secs_f64()
         );
     }
 

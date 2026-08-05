@@ -65,15 +65,23 @@ pub fn nanos_to_filetime_local(nanos: i64) -> FileTime {
 /// SMB 原始 FILETIME 值（u64 强转 i64，100ns 自 1601）→ 纳秒。
 #[inline]
 #[must_use]
-pub fn smb_filetime_to_nanos(raw: i64) -> i64 {
-    (raw - FILETIME_UNIX_EPOCH_DIFF) * 100
+pub fn smb_filetime_to_nanos(raw: u64) -> i64 {
+    let nanos = (i128::from(raw) - i128::from(FILETIME_UNIX_EPOCH_DIFF)) * 100;
+    i64::try_from(nanos).unwrap_or_else(|_| {
+        if nanos.is_negative() {
+            i64::MIN
+        } else {
+            i64::MAX
+        }
+    })
 }
 
 /// 纳秒 → SMB 原始 FILETIME 值（100ns 自 1601）。返回 i64，调用方按需 `as u64`。
 #[inline]
 #[must_use]
-pub fn nanos_to_smb_filetime(nanos: i64) -> i64 {
-    nanos / 100 + FILETIME_UNIX_EPOCH_DIFF
+pub fn nanos_to_smb_filetime(nanos: i64) -> u64 {
+    let raw = i128::from(nanos) / 100 + i128::from(FILETIME_UNIX_EPOCH_DIFF);
+    u64::try_from(raw).unwrap_or_else(|_| if raw.is_negative() { 0 } else { u64::MAX })
 }
 
 #[cfg(test)]
@@ -96,6 +104,12 @@ mod tests {
         let raw = nanos_to_smb_filetime(ns);
         let back = smb_filetime_to_nanos(raw);
         assert_eq!(ns, back);
+    }
+
+    #[test]
+    fn smb_filetime_extremes_saturate_instead_of_wrapping() {
+        assert_eq!(smb_filetime_to_nanos(u64::MAX), i64::MAX);
+        assert_eq!(nanos_to_smb_filetime(i64::MIN), 24_211_015_631_452_242);
     }
 
     #[test]

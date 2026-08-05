@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    CompletedPart, Result, S3Storage, StorageError, Tag, build_copy_source, build_tagging_str,
+    error,
+};
 
 const COPY_PART_MIN: u64 = 5 * 1024 * 1024;
 const COPY_PART_MAX: u64 = 5 * 1024 * 1024 * 1024;
@@ -8,7 +11,8 @@ pub(super) fn copy_part_ranges(size: u64, part_size: u64) -> Vec<(u64, u64)> {
     if size == 0 || part_size == 0 {
         return Vec::new();
     }
-    let mut ranges = Vec::with_capacity(size.div_ceil(part_size) as usize);
+    let capacity = usize::try_from(size.div_ceil(part_size)).unwrap_or(0);
+    let mut ranges = Vec::with_capacity(capacity);
     let mut start = 0;
     while start < size {
         let end = (start + part_size).min(size) - 1;
@@ -19,6 +23,54 @@ pub(super) fn copy_part_ranges(size: u64, part_size: u64) -> Vec<(u64, u64)> {
 }
 
 impl S3Storage {
+    async fn copy_multipart_ranges(
+        &self,
+        to_key: &str,
+        upload_id: &str,
+        copy_source: &str,
+        ranges: Vec<(u64, u64)>,
+    ) -> Result<Vec<CompletedPart>> {
+        let mut completed = Vec::with_capacity(ranges.len());
+        for (index, (start, end)) in ranges.into_iter().enumerate() {
+            let part_number = i32::try_from(index + 1).map_err(|_| {
+                StorageError::OperationError("S3 multipart part number overflow".to_string())
+            })?;
+            let response = self
+                .client
+                .upload_part_copy()
+                .bucket(&self.bucket_name)
+                .key(to_key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .copy_source(copy_source)
+                .copy_source_range(format!("bytes={start}-{end}"))
+                .send()
+                .await;
+            let part = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = self.abort_multipart_upload(to_key, upload_id).await;
+                    return Err(StorageError::S3Error(format!(
+                        "UploadPartCopy part {part_number} failed: {error:?}"
+                    )));
+                }
+            };
+            let Some(e_tag) = part.copy_part_result().and_then(|result| result.e_tag()) else {
+                let _ = self.abort_multipart_upload(to_key, upload_id).await;
+                return Err(StorageError::S3Error(format!(
+                    "UploadPartCopy part {part_number} response did not contain an ETag"
+                )));
+            };
+            completed.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(e_tag)
+                    .build(),
+            );
+        }
+        Ok(completed)
+    }
+
     /// Copy an object entirely inside S3 using `UploadPartCopy`.
     pub(super) async fn multipart_copy_object(
         &self,
@@ -36,7 +88,7 @@ impl S3Storage {
             )));
         }
         let ranges = copy_part_ranges(size, part_size);
-        if ranges.len() > MAX_COPY_PARTS as usize {
+        if u64::try_from(ranges.len()).unwrap_or(u64::MAX) > MAX_COPY_PARTS {
             return Err(StorageError::OperationError(format!(
                 "S3 multipart rename requires {} parts, exceeding the {MAX_COPY_PARTS} part limit",
                 ranges.len()
@@ -88,51 +140,9 @@ impl S3Storage {
             })?;
 
         let copy_source = build_copy_source(&self.bucket_name, from_key);
-        let mut completed = Vec::with_capacity(ranges.len());
-        for (index, (start, end)) in ranges.into_iter().enumerate() {
-            let part_number = i32::try_from(index + 1).map_err(|_| {
-                StorageError::OperationError("S3 multipart part number overflow".to_string())
-            })?;
-            let response = self
-                .client
-                .upload_part_copy()
-                .bucket(&self.bucket_name)
-                .key(to_key)
-                .upload_id(&upload_id)
-                .part_number(part_number)
-                .copy_source(&copy_source)
-                .copy_source_range(format!("bytes={start}-{end}"))
-                .send()
-                .await;
-
-            let part = match response {
-                Ok(response) => response,
-                Err(error) => {
-                    if let Err(abort_error) = self.abort_multipart_upload(to_key, &upload_id).await
-                    {
-                        error!(
-                            "Abort multipart S3 rename after part failure also failed: \
-                             {abort_error:?}"
-                        );
-                    }
-                    return Err(StorageError::S3Error(format!(
-                        "UploadPartCopy part {part_number} failed: {error:?}"
-                    )));
-                }
-            };
-            let Some(e_tag) = part.copy_part_result().and_then(|result| result.e_tag()) else {
-                let _ = self.abort_multipart_upload(to_key, &upload_id).await;
-                return Err(StorageError::S3Error(format!(
-                    "UploadPartCopy part {part_number} response did not contain an ETag"
-                )));
-            };
-            completed.push(
-                CompletedPart::builder()
-                    .part_number(part_number)
-                    .e_tag(e_tag)
-                    .build(),
-            );
-        }
+        let completed = self
+            .copy_multipart_ranges(to_key, &upload_id, &copy_source, ranges)
+            .await?;
 
         if let Err(error) = self
             .complete_multipart_upload(to_key, &upload_id, &completed)

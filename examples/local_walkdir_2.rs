@@ -4,6 +4,7 @@ use data_mover::Result;
 use data_mover::dir_tree::NdxEvent;
 use data_mover::storage_enum::create_storage;
 use indicatif::{ProgressBar, ProgressStyle};
+use num_traits::ToPrimitive;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,7 +17,7 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
 
-    println!("walkdir_2: path={}, concurrency={}", path, concurrency);
+    println!("walkdir_2: path={path}, concurrency={concurrency}");
 
     let storage = create_storage(&path, None, false).await?;
     let start = Instant::now();
@@ -71,15 +72,14 @@ async fn main() -> Result<()> {
 
                 if last_update.elapsed() > Duration::from_secs(2) {
                     pb.set_message(format!(
-                        "Pages: {}, Files: {}, Dirs: {}, Errors: {}",
-                        total_pages, total_files, total_dirs, total_errors
+                        "Pages: {total_pages}, Files: {total_files}, Dirs: {total_dirs}, Errors: {total_errors}"
                     ));
                     last_update = Instant::now();
                 }
             }
             NdxEvent::Error { path, reason } => {
                 total_errors += 1;
-                eprintln!("ERROR [{}]: {}", path, reason);
+                eprintln!("ERROR [{path}]: {reason}");
             }
             NdxEvent::Done => {
                 break;
@@ -91,22 +91,22 @@ async fn main() -> Result<()> {
 
     let duration = start.elapsed();
     println!("\n=== walkdir_2 Summary ===");
-    println!("Path: {}", path);
-    println!("Concurrency: {}", concurrency);
-    println!("Total pages (directories): {}", total_pages);
-    println!("Total files: {}", total_files);
-    println!("Total subdirs: {}", total_dirs);
-    println!("Total errors: {}", total_errors);
-    println!("Max NDX: {}", max_ndx);
-    println!("Scan time: {:?}", duration);
+    println!("Path: {path}");
+    println!("Concurrency: {concurrency}");
+    println!("Total pages (directories): {total_pages}");
+    println!("Total files: {total_files}");
+    println!("Total subdirs: {total_dirs}");
+    println!("Total errors: {total_errors}");
+    println!("Max NDX: {max_ndx}");
+    println!("Scan time: {duration:?}");
     if duration.as_secs_f64() > 0.0 {
         println!(
             "Pages/sec: {:.0}",
-            total_pages as f64 / duration.as_secs_f64()
+            total_pages.to_f64().unwrap_or(f64::MAX) / duration.as_secs_f64()
         );
         println!(
             "Entries/sec: {:.0}",
-            (total_files + total_dirs) as f64 / duration.as_secs_f64()
+            (total_files + total_dirs).to_f64().unwrap_or(f64::MAX) / duration.as_secs_f64()
         );
     }
 

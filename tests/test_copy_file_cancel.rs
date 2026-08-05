@@ -11,27 +11,51 @@ use data_mover::error::StorageError;
 use data_mover::{QosManager, StorageEnum, create_storage};
 use tokio_util::sync::CancellationToken;
 
+trait AssertTestValue {
+    type Value;
+    fn assert_value(self, context: &str) -> Self::Value;
+}
+
+impl<T, E: std::fmt::Debug> AssertTestValue for Result<T, E> {
+    type Value = T;
+
+    fn assert_value(self, context: &str) -> T {
+        match self {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error:?}"),
+        }
+    }
+}
+
 const SRC_DIR: &str = "/tmp/data-mover-cancel-src";
 const DST_DIR: &str = "/tmp/data-mover-cancel-dst";
 
 async fn reset_dirs(src: &str, dst: &str) {
     let _ = tokio::fs::remove_dir_all(src).await;
     let _ = tokio::fs::remove_dir_all(dst).await;
-    tokio::fs::create_dir_all(src).await.unwrap();
-    tokio::fs::create_dir_all(dst).await.unwrap();
+    tokio::fs::create_dir_all(src)
+        .await
+        .assert_value("test value should be present");
+    tokio::fs::create_dir_all(dst)
+        .await
+        .assert_value("test value should be present");
 }
 
 async fn write_blob(path: &str, size: usize) {
     use tokio::io::AsyncWriteExt;
-    let mut f = tokio::fs::File::create(path).await.unwrap();
+    let mut f = tokio::fs::File::create(path)
+        .await
+        .assert_value("test value should be present");
     let buf = vec![0xCDu8; 64 * 1024];
     let mut written = 0;
     while written < size {
         let n = (size - written).min(buf.len());
-        f.write_all(&buf[..n]).await.unwrap();
+        f.write_all(&buf[..n])
+            .await
+            .assert_value("test value should be present");
         written += n;
     }
-    f.flush().await.unwrap();
+    f.flush().await.assert_value("test value should be present");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -42,22 +66,29 @@ async fn copy_file_returns_cancelled_when_token_pre_cancelled() {
     let blob = format!("{src_dir}/blob.bin");
     write_blob(&blob, 1024).await;
 
-    let src = create_storage(&src_dir, None, false).await.unwrap();
-    let dst = create_storage(&dst_dir, None, true).await.unwrap();
-    let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
+    let src = create_storage(&src_dir, None, false)
+        .await
+        .assert_value("test value should be present");
+    let dst = create_storage(&dst_dir, None, true)
+        .await
+        .assert_value("test value should be present");
+    let entry = src
+        .get_metadata(Path::new("blob.bin"))
+        .await
+        .assert_value("test value should be present");
 
     let token = CancellationToken::new();
     token.cancel();
 
-    let res = StorageEnum::copy_file_with_cancel(
+    let res = StorageEnum::copy_file(
         &src,
         &dst,
         &entry,
-        None,
-        false,
-        true,
-        None,
-        Some(token),
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            cancel: Some(token),
+            ..Default::default()
+        },
     )
     .await;
 
@@ -81,11 +112,19 @@ async fn copy_file_aborts_mid_transfer_on_token_cancel() {
     let blob = format!("{src_dir}/blob.bin");
     write_blob(&blob, 16 * 1024 * 1024).await;
 
-    let src = create_storage(&src_dir, None, false).await.unwrap();
-    let dst = create_storage(&dst_dir, None, true).await.unwrap();
-    let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
+    let src = create_storage(&src_dir, None, false)
+        .await
+        .assert_value("test value should be present");
+    let dst = create_storage(&dst_dir, None, true)
+        .await
+        .assert_value("test value should be present");
+    let entry = src
+        .get_metadata(Path::new("blob.bin"))
+        .await
+        .assert_value("test value should be present");
 
-    let qos = QosManager::try_new(Some("4MiB/s"), 1.0, None).unwrap();
+    let qos =
+        QosManager::try_new(Some("4MiB/s"), 1.0, None).assert_value("test value should be present");
     let counter = Arc::new(AtomicU64::new(0));
     let token = CancellationToken::new();
 
@@ -96,15 +135,17 @@ async fn copy_file_aborts_mid_transfer_on_token_cancel() {
     });
 
     let started = Instant::now();
-    let res = StorageEnum::copy_file_with_cancel(
+    let res = StorageEnum::copy_file(
         &src,
         &dst,
         &entry,
-        Some(qos),
-        false,
-        true,
-        Some(counter.clone()),
-        Some(token),
+        data_mover::CopyOptions {
+            qos: Some(qos),
+            is_source_reserved: true,
+            bytes_counter: Some(counter.clone()),
+            cancel: Some(token),
+            ..Default::default()
+        },
     )
     .await;
     let elapsed = started.elapsed();
@@ -131,13 +172,28 @@ async fn copy_file_without_cancel_still_works_via_compat_wrapper() {
     let blob = format!("{src_dir}/blob.bin");
     write_blob(&blob, 256 * 1024).await;
 
-    let src = create_storage(&src_dir, None, false).await.unwrap();
-    let dst = create_storage(&dst_dir, None, true).await.unwrap();
-    let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
+    let src = create_storage(&src_dir, None, false)
+        .await
+        .assert_value("test value should be present");
+    let dst = create_storage(&dst_dir, None, true)
+        .await
+        .assert_value("test value should be present");
+    let entry = src
+        .get_metadata(Path::new("blob.bin"))
+        .await
+        .assert_value("test value should be present");
 
     // Old (unchanged) signature — must still work.
-    StorageEnum::copy_file(&src, &dst, &entry, None, false, true, None)
-        .await
-        .expect("legacy copy_file path");
+    StorageEnum::copy_file(
+        &src,
+        &dst,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .assert_value("legacy copy_file path");
     assert!(dst.get_metadata(Path::new("blob.bin")).await.is_ok());
 }

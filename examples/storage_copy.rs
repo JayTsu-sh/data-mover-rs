@@ -26,7 +26,17 @@ async fn main() -> Result<()> {
     let destination = create_storage(&args.destination, None, true).await?;
     let entry = source.get_metadata(Path::new(&args.path)).await?;
 
-    StorageEnum::copy_file(&source, &destination, &entry, None, true, true, None).await?;
+    StorageEnum::copy_file(
+        &source,
+        &destination,
+        &entry,
+        data_mover::CopyOptions {
+            enable_integrity_check: true,
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await?;
 
     let copied = destination.get_metadata(Path::new(&args.path)).await?;
     if copied.get_size() != entry.get_size() {
@@ -39,14 +49,13 @@ async fn main() -> Result<()> {
     if matches!(
         (&entry, &copied),
         (EntryEnum::NAS(_) | EntryEnum::S3(_), EntryEnum::NAS(_))
-    ) {
-        if copied.get_mtime() != entry.get_mtime() {
-            return Err(data_mover::error::StorageError::OperationError(format!(
-                "destination mtime mismatch: expected {}, got {}",
-                entry.get_mtime(),
-                copied.get_mtime()
-            )));
-        }
+    ) && copied.get_mtime() != entry.get_mtime()
+    {
+        return Err(data_mover::error::StorageError::OperationError(format!(
+            "destination mtime mismatch: expected {}, got {}",
+            entry.get_mtime(),
+            copied.get_mtime()
+        )));
     }
     if matches!((&entry, &copied), (EntryEnum::NAS(_), EntryEnum::NAS(_))) {
         if copied.get_mode().map(|mode| mode & 0o7777) != entry.get_mode().map(|mode| mode & 0o7777)

@@ -123,6 +123,10 @@ impl IntegrityCheck {
     ///
     /// Metadata reads run concurrently and retain their original backend error
     /// variants. Confirmed missing paths and permanent errors are not retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn check_path(
         src_storage: &StorageEnum,
         dest_storage: &StorageEnum,
@@ -141,6 +145,10 @@ impl IntegrityCheck {
     }
 
     /// Resolve both entries and compare them with explicit timestamp options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn check_path_with_options(
         src_storage: &StorageEnum,
         dest_storage: &StorageEnum,
@@ -177,6 +185,10 @@ impl IntegrityCheck {
     }
 
     /// Resolve only the destination entry and compare it with a known source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn check_with_source_entry(
         src_storage: &StorageEnum,
         dest_storage: &StorageEnum,
@@ -195,6 +207,10 @@ impl IntegrityCheck {
     }
 
     /// Resolve the destination and compare it with explicit timestamp options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn check_with_source_entry_and_options(
         src_storage: &StorageEnum,
         dest_storage: &StorageEnum,
@@ -223,6 +239,10 @@ impl IntegrityCheck {
     ///
     /// S3 destinations skip POSIX metadata because those fields cannot be
     /// represented faithfully. File type and content checks still apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn check(
         src_storage: &StorageEnum,
         dest_storage: &StorageEnum,
@@ -243,6 +263,10 @@ impl IntegrityCheck {
     }
 
     /// Compare two already-resolved entries with explicit timestamp options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn check_with_options(
         src_storage: &StorageEnum,
         dest_storage: &StorageEnum,
@@ -661,23 +685,23 @@ async fn compare_chunk_streams(
         finish_read_task(&mut src_task),
         finish_read_task(&mut dest_task)
     )?;
-    if src_read != expected_size {
-        return Err(StorageError::MismatchData(vec![
-            MismatchDataField::ReadLength {
-                side: IntegritySide::Source,
-                expected: expected_size,
-                actual: src_read,
-            },
-        ]));
-    }
-    if dest_read != expected_size {
-        return Err(StorageError::MismatchData(vec![
-            MismatchDataField::ReadLength {
-                side: IntegritySide::Destination,
-                expected: expected_size,
-                actual: dest_read,
-            },
-        ]));
+    validate_stream_lengths(src_read, dest_read, expected_size)
+}
+
+fn validate_stream_lengths(src_read: u64, dest_read: u64, expected: u64) -> Result<()> {
+    for (side, actual) in [
+        (IntegritySide::Source, src_read),
+        (IntegritySide::Destination, dest_read),
+    ] {
+        if actual != expected {
+            return Err(StorageError::MismatchData(vec![
+                MismatchDataField::ReadLength {
+                    side,
+                    expected,
+                    actual,
+                },
+            ]));
+        }
     }
     Ok(())
 }
@@ -767,6 +791,7 @@ fn mtime_matches(src: i64, dest: i64, precision: MtimePrecision, tolerance: Dura
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AssertTestValue;
     use crate::{LocalStorage, NASEntry};
     use bytes::Bytes;
     use std::path::{Path, PathBuf};
@@ -875,15 +900,15 @@ mod tests {
     }
 
     fn write_matching_files(src_root: &Path, dest_root: &Path, data: &[u8]) {
-        std::fs::create_dir_all(src_root).unwrap();
-        std::fs::create_dir_all(dest_root).unwrap();
+        std::fs::create_dir_all(src_root).assert_value("test value should be present");
+        std::fs::create_dir_all(dest_root).assert_value("test value should be present");
         let src = src_root.join("item");
         let dest = dest_root.join("item");
-        std::fs::write(&src, data).unwrap();
-        std::fs::write(&dest, data).unwrap();
+        std::fs::write(&src, data).assert_value("test value should be present");
+        std::fs::write(&dest, data).assert_value("test value should be present");
         let mtime = filetime::FileTime::from_unix_time(1_700_000_000, 123_456_789);
-        filetime::set_file_mtime(src, mtime).unwrap();
-        filetime::set_file_mtime(dest, mtime).unwrap();
+        filetime::set_file_mtime(src, mtime).assert_value("test value should be present");
+        filetime::set_file_mtime(dest, mtime).assert_value("test value should be present");
     }
 
     #[test]
@@ -1174,10 +1199,12 @@ mod tests {
     #[tokio::test]
     async fn full_compares_streams_with_different_chunk_boundaries() {
         let (src_root, dest_root) = test_roots("match");
-        std::fs::create_dir_all(&src_root).unwrap();
-        std::fs::create_dir_all(&dest_root).unwrap();
-        std::fs::write(src_root.join("item"), b"same bytes").unwrap();
-        std::fs::write(dest_root.join("item"), b"same bytes").unwrap();
+        std::fs::create_dir_all(&src_root).assert_value("test value should be present");
+        std::fs::create_dir_all(&dest_root).assert_value("test value should be present");
+        std::fs::write(src_root.join("item"), b"same bytes")
+            .assert_value("test value should be present");
+        std::fs::write(dest_root.join("item"), b"same bytes")
+            .assert_value("test value should be present");
         let entry = nas_entry("item", 10);
 
         let result = IntegrityCheck::check(
@@ -1191,16 +1218,23 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        std::fs::remove_dir_all(src_root.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(
+            src_root
+                .parent()
+                .assert_value("test value should be present"),
+        )
+        .assert_value("test value should be present");
     }
 
     #[tokio::test]
     async fn full_reports_first_mismatching_offset() {
         let (src_root, dest_root) = test_roots("mismatch");
-        std::fs::create_dir_all(&src_root).unwrap();
-        std::fs::create_dir_all(&dest_root).unwrap();
-        std::fs::write(src_root.join("item"), b"same-prefix").unwrap();
-        std::fs::write(dest_root.join("item"), b"same-Xrefix").unwrap();
+        std::fs::create_dir_all(&src_root).assert_value("test value should be present");
+        std::fs::create_dir_all(&dest_root).assert_value("test value should be present");
+        std::fs::write(src_root.join("item"), b"same-prefix")
+            .assert_value("test value should be present");
+        std::fs::write(dest_root.join("item"), b"same-Xrefix")
+            .assert_value("test value should be present");
         let entry = nas_entry("item", 11);
 
         let result = IntegrityCheck::check(
@@ -1218,16 +1252,23 @@ mod tests {
             Err(StorageError::MismatchData(fields))
                 if fields == vec![MismatchDataField::Content { offset: 5 }]
         ));
-        std::fs::remove_dir_all(src_root.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(
+            src_root
+                .parent()
+                .assert_value("test value should be present"),
+        )
+        .assert_value("test value should be present");
     }
 
     #[tokio::test]
     async fn full_rejects_equal_short_prefixes() {
         let (src_root, dest_root) = test_roots("short");
-        std::fs::create_dir_all(&src_root).unwrap();
-        std::fs::create_dir_all(&dest_root).unwrap();
-        std::fs::write(src_root.join("item"), b"prefix").unwrap();
-        std::fs::write(dest_root.join("item"), b"prefix").unwrap();
+        std::fs::create_dir_all(&src_root).assert_value("test value should be present");
+        std::fs::create_dir_all(&dest_root).assert_value("test value should be present");
+        std::fs::write(src_root.join("item"), b"prefix")
+            .assert_value("test value should be present");
+        std::fs::write(dest_root.join("item"), b"prefix")
+            .assert_value("test value should be present");
         let entry = nas_entry("item", 10);
 
         let result = IntegrityCheck::check(
@@ -1249,7 +1290,12 @@ mod tests {
                     actual: 6,
                 }]
         ));
-        std::fs::remove_dir_all(src_root.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(
+            src_root
+                .parent()
+                .assert_value("test value should be present"),
+        )
+        .assert_value("test value should be present");
     }
 
     #[tokio::test]
@@ -1359,11 +1405,7 @@ mod tests {
     async fn full_preserves_producer_join_error() {
         let (src_tx, src_rx) = mpsc::channel(1);
         drop(src_tx);
-        let src_task = tokio::spawn(async {
-            panic!("injected producer panic");
-            #[allow(unreachable_code)]
-            Ok(None)
-        });
+        let src_task: TestReadTask = tokio::spawn(async { panic!("injected producer panic") });
         let (dest_rx, dest_task) = test_stream(Vec::new(), Ok(None));
 
         let result = compare_chunk_streams(src_rx, src_task, dest_rx, dest_task, 0, None).await;
@@ -1617,7 +1659,12 @@ mod tests {
         .await;
 
         assert!(matches!(result, Ok(entry) if entry.get_size() == 8));
-        std::fs::remove_dir_all(src_root.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(
+            src_root
+                .parent()
+                .assert_value("test value should be present"),
+        )
+        .assert_value("test value should be present");
     }
 
     #[tokio::test]
@@ -1625,7 +1672,10 @@ mod tests {
         let (src_root, dest_root) = test_roots("source-entry");
         write_matching_files(&src_root, &dest_root, b"known source");
         let src_storage = local(&src_root);
-        let src_entry = src_storage.get_metadata(Path::new("item")).await.unwrap();
+        let src_entry = src_storage
+            .get_metadata(Path::new("item"))
+            .await
+            .assert_value("test value should be present");
 
         let result = IntegrityCheck::check_with_source_entry(
             &src_storage,
@@ -1637,14 +1687,19 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
-        std::fs::remove_dir_all(src_root.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(
+            src_root
+                .parent()
+                .assert_value("test value should be present"),
+        )
+        .assert_value("test value should be present");
     }
 
     #[tokio::test]
     async fn check_path_preserves_missing_error_without_retrying() {
         let (src_root, dest_root) = test_roots("missing");
-        std::fs::create_dir_all(&src_root).unwrap();
-        std::fs::create_dir_all(&dest_root).unwrap();
+        std::fs::create_dir_all(&src_root).assert_value("test value should be present");
+        std::fs::create_dir_all(&dest_root).assert_value("test value should be present");
 
         let result = IntegrityCheck::check_path(
             &local(&src_root),
@@ -1657,9 +1712,14 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(StorageError::FileNotFound(_)) | Err(StorageError::IoError(_))
+            Err(StorageError::FileNotFound(_) | StorageError::IoError(_))
         ));
-        std::fs::remove_dir_all(src_root.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(
+            src_root
+                .parent()
+                .assert_value("test value should be present"),
+        )
+        .assert_value("test value should be present");
     }
 
     #[tokio::test]

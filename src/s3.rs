@@ -17,8 +17,8 @@ use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::{
-    BucketVersioningStatus, CompletedPart, Delete, DeleteMarkerEntry, ObjectIdentifier,
-    ObjectVersion,
+    BucketVersioningStatus, CommonPrefix, CompletedPart, Delete, DeleteMarkerEntry,
+    ObjectIdentifier, ObjectVersion,
 };
 use aws_smithy_runtime_api::client::http::{
     HttpConnector as SdkHttpConnector, HttpConnectorFuture, SharedHttpClient, SharedHttpConnector,
@@ -58,6 +58,58 @@ use crate::{
     DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, Result, S3Entry,
     StorageEntryMessage, Tag, WalkDirAsyncIterator, datetime_to_string,
 };
+
+struct S3WalkRuntime<'a> {
+    tx: &'a async_channel::Sender<StorageEntryMessage>,
+    scheduler: &'a crate::walk_scheduler::WorkerContext<(String, usize, bool, Option<usize>)>,
+    match_expr: Option<&'a FilterExpression>,
+    exclude_expr: Option<&'a FilterExpression>,
+    depth_limit: Option<usize>,
+    include_tags: bool,
+    is_versioned: bool,
+    total_file_count: &'a Arc<AtomicUsize>,
+    packaged: bool,
+    package_depth: usize,
+}
+
+struct S3PartUpload {
+    key: Arc<String>,
+    upload_id: Arc<String>,
+    part_idx: u64,
+    part_start: u64,
+    chunks: Vec<Bytes>,
+    len: u64,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    progress: crate::storage_enum::WriteProgress,
+}
+
+struct BufferedPartUpload {
+    key: String,
+    upload_id: String,
+    part_number: i32,
+    chunks: Vec<Bytes>,
+    size: u64,
+    parts: Arc<Mutex<Vec<CompletedPart>>>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+struct VersionedScan<'a> {
+    tx: &'a async_channel::Sender<StorageEntryMessage>,
+    versions: &'a [ObjectVersion],
+    delete_markers: &'a [DeleteMarkerEntry],
+    include_tags: bool,
+    match_expressions: Option<&'a FilterExpression>,
+    exclude_expressions: Option<&'a FilterExpression>,
+    total_file_count: Arc<AtomicUsize>,
+}
+
+enum VersionOrDeleteMarker {
+    Version(ObjectVersion),
+    DeleteMarker(DeleteMarkerEntry),
+}
+
+type ReadVersionGroups = HashMap<String, Vec<(i64, ObjectVersion)>>;
+type ReadDeleteMarkers = HashMap<String, Vec<DeleteMarkerEntry>>;
 
 mod delete_objects_md5;
 mod dxn;
@@ -414,12 +466,33 @@ fn multipart_part_number(part_idx: u64) -> Result<i32> {
 /// 单 object 读取的同时在飞 Range GET 请求数（inflight read pipeline 深度）。
 ///
 /// aws-sdk-rust 底层 HTTP/2 connection pool 天然支持多请求并发；S3 兼容存储
-/// （AWS S3 / MinIO / Ceph 等）服务端对同 object 不同 byte range 高并发友好，
+/// （AWS S3 / `MinIO` / Ceph 等）服务端对同 object 不同 byte range 高并发友好，
 /// 与单 inflight 相比高 RTT 链路收益线性。默认 4 与 CIFS 对称。
 ///
 /// 目前为编译期常量；如需运行期 tunable（例如跨 region 25 MB BDP 链路需要
 /// 更高并发），需新增 `S3Storage` 方法暴露给上层（当前未实现）。
 const DEFAULT_READ_INFLIGHT: usize = 4;
+type S3ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<Bytes>> + Send + 'a>>;
+type S3OffsetReadFuture<'a> = Pin<Box<dyn Future<Output = (u64, Result<Bytes>)> + Send + 'a>>;
+
+macro_rules! build_s3_entry {
+    ($name:expr, $path:expr, $extension:expr, $size:expr, $mtime:expr, $tags:expr, $version_id:expr, $latest:expr, $delete_marker:expr, $version_count:expr, $is_dir:expr $(,)?) => {{
+        let version_id: Option<&str> = $version_id;
+        EntryEnum::S3(S3Entry {
+            name: $name,
+            relative_path: $path.to_string(),
+            extension: $extension,
+            size: $size,
+            mtime: $mtime,
+            tags: $tags,
+            version_id: version_id.map(std::string::ToString::to_string),
+            is_latest: $latest,
+            is_delete_marker: $delete_marker,
+            version_count: $version_count,
+            is_dir: $is_dir,
+        })
+    }};
+}
 
 /// 转换时间戳为纳秒时间戳
 fn datatime_to_i64(timestamp: Option<&DateTime>) -> i64 {
@@ -544,6 +617,43 @@ fn s3_timeout_config() -> TimeoutConfig {
 }
 
 impl S3Storage {
+    async fn detect_bucket_versioning(
+        client: &Client,
+        bucket_name: &str,
+        storage_type: &StorageType,
+    ) -> bool {
+        if matches!(storage_type, StorageType::Hcp) {
+            return true;
+        }
+        match client
+            .get_bucket_versioning()
+            .bucket(bucket_name)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                let enabled = status == Some(&BucketVersioningStatus::Enabled);
+                debug!("bucket {bucket_name} versioning status: {status:?}, enabled: {enabled}");
+                enabled
+            }
+            Err(error) => {
+                let code = error
+                    .as_service_error()
+                    .and_then(ProvideErrorMetadata::code);
+                let status = error
+                    .raw_response()
+                    .map(|response| response.status().as_u16());
+                if versioning_is_unsupported(code, status) {
+                    info!("S3 bucket {bucket_name} does not support versioning");
+                } else {
+                    error!("failed to get versioning status for {bucket_name}: {error:?}");
+                }
+                false
+            }
+        }
+    }
+
     /// 查询指定 S3 端点的桶列表
     ///
     /// 该方法不需要已有的 `S3Storage` 实例，类似于 NFS 的 `list_exports`。
@@ -554,6 +664,10 @@ impl S3Storage {
     /// # 返回值
     /// - `Ok(Vec<S3BucketInfo>)`：查询成功，返回桶列表
     /// - `Err(StorageError)`：查询失败，返回错误信息
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn list_buckets(url: &str) -> Result<Vec<S3BucketInfo>> {
         let (access_key, secret_key, endpoint, tls_skip_verify, compatibility) =
             parse_s3_endpoint_url(url)?;
@@ -600,6 +714,10 @@ impl S3Storage {
         Ok(buckets)
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn new(url: &str, block_size: Option<u64>) -> Result<Self> {
         // 解析URL
         let ParsedS3Url {
@@ -671,46 +789,8 @@ impl S3Storage {
         };
 
         // 检查桶是否启用了版本控制
-        let is_bucket_versioned = match storage_type {
-            StorageType::S3 => {
-                debug!("检查桶是否启用了版本控制, bucket: {}", bucket_name);
-                match client
-                    .get_bucket_versioning()
-                    .bucket(&bucket_name)
-                    .send()
-                    .await
-                {
-                    Ok(response) => {
-                        let status = response.status();
-                        let is_versioned = status == Some(&BucketVersioningStatus::Enabled);
-                        debug!(
-                            "桶 {} 的版本控制状态: {:?}, is_versioned: {}",
-                            bucket_name, status, is_versioned
-                        );
-                        is_versioned
-                    }
-                    Err(e) => {
-                        let error_code = e.as_service_error().and_then(ProvideErrorMetadata::code);
-                        let status = e.raw_response().map(|response| response.status().as_u16());
-                        if versioning_is_unsupported(error_code, status) {
-                            info!(
-                                "S3 bucket {bucket_name} does not support versioning; \
-                                 treating it as disabled"
-                            );
-                        } else {
-                            error!(
-                                "Failed to get S3 bucket versioning status for {bucket_name}: {e:?}"
-                            );
-                        }
-                        false
-                    }
-                }
-            }
-            StorageType::Hcp => {
-                debug!("HCP支持版本控制检查");
-                true
-            }
-        };
+        let is_bucket_versioned =
+            Self::detect_bucket_versioning(&client, &bucket_name, &storage_type).await;
 
         Ok(Self {
             storage_type,
@@ -727,6 +807,10 @@ impl S3Storage {
     }
 
     /// 验证 S3 连通性：尝试 `HeadBucket` 检查 bucket 是否可访问
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn check_connectivity(&self) -> Result<()> {
         self.client
             .head_bucket()
@@ -738,6 +822,7 @@ impl S3Storage {
     }
 
     /// 构建完整的S3 key，将prefix和相对路径结合起来
+    #[must_use]
     pub fn build_full_key(&self, relative_path: &str) -> String {
         if let Some(prefix) = &self.prefix {
             // 直接字符串连接，S3 key使用正斜杠
@@ -749,16 +834,22 @@ impl S3Storage {
     }
 
     /// Get the bucket name
+    #[must_use]
     pub fn bucket(&self) -> &str {
         &self.bucket_name
     }
 
     /// Get the endpoint URL
+    #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
     /// 删除单个 S3 对象
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn delete_object(&self, key: &str) -> Result<()> {
         self.client
             .delete_object()
@@ -879,6 +970,10 @@ impl S3Storage {
     }
 
     /// 分页列举 + 批量删除，返回进度迭代器
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn delete_dir_all_with_progress(
         &self,
         relative_path: Option<&str>,
@@ -964,7 +1059,10 @@ impl S3Storage {
             last_modified: String::new(),
             tags: None,
         };
-        self.read(&mut handle, 0, size as usize).await
+        let size = usize::try_from(size).map_err(|_| {
+            StorageError::OperationError("object is too large for this platform".to_string())
+        })?;
+        self.read(&mut handle, 0, size).await
     }
 
     /// Single-chunk write: uploads all bytes as one `PutObject` call.
@@ -996,11 +1094,12 @@ impl S3Storage {
             return Ok(None);
         }
         let key = Arc::new(self.build_full_key(relative_path));
-        let chunk_size = self.block_size as usize;
+        let chunk_size = usize::try_from(self.block_size).map_err(|_| {
+            StorageError::OperationError("S3 block size exceeds platform capacity".to_string())
+        })?;
         let mut hasher = create_hash_calculator(enable_integrity_check);
 
-        type ReadFut<'a> = Pin<Box<dyn Future<Output = Result<Bytes>> + Send + 'a>>;
-        let mut inflight: FuturesOrdered<ReadFut<'_>> = FuturesOrdered::new();
+        let mut inflight: FuturesOrdered<S3ReadFuture<'_>> = FuturesOrdered::new();
         let mut issue_offset: u64 = 0;
         let mut send_offset: u64 = 0;
 
@@ -1010,7 +1109,8 @@ impl S3Storage {
                 if let Some(ref qos) = qos {
                     qos.acquire(chunk_size as u64).await;
                 }
-                let count = ((size - issue_offset) as usize).min(chunk_size);
+                let count = usize::try_from((size - issue_offset).min(self.block_size))
+                    .unwrap_or_else(|_| unreachable!("count is bounded by the checked block size"));
                 let key_clone = key.clone();
                 let range_offset = issue_offset;
                 let range_count = count as u64;
@@ -1069,7 +1169,7 @@ impl S3Storage {
     ///
     /// 与 `read_data` 的差异：按调用方给定的 `[start, end)` 区间列表读取，`DataChunk.offset`
     /// 为文件内绝对偏移。区间按给定顺序串行处理，区间内维持 [`DEFAULT_READ_INFLIGHT`]
-    /// 个 Range GET 并发。version_id = None：续传调用域内不涉及多版本对象。
+    /// 个 Range GET `并发。version_id` = None：续传调用域内不涉及多版本对象。
     pub(crate) async fn read_data_intervals(
         &self,
         tx: mpsc::Sender<DataChunk>,
@@ -1086,8 +1186,7 @@ impl S3Storage {
 
         for &(start, end) in intervals {
             let mut issue_offset = start;
-            type ReadFut<'a> = Pin<Box<dyn Future<Output = (u64, Result<Bytes>)> + Send + 'a>>;
-            let mut inflight: FuturesOrdered<ReadFut<'_>> = FuturesOrdered::new();
+            let mut inflight: FuturesOrdered<S3OffsetReadFuture<'_>> = FuturesOrdered::new();
             loop {
                 while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < end {
                     if let Some(ref qos) = qos {
@@ -1175,6 +1274,10 @@ impl S3Storage {
 
     /// Rename an object within this S3 storage using a server-side copy followed
     /// by deletion of the source. Object data never passes through data-mover.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         self.rename_with_expected_size(from, to, None).await
     }
@@ -1280,38 +1383,8 @@ impl S3Storage {
         tags: Option<Vec<Tag>>,
     ) -> Result<()> {
         if size <= MULTIPART_THRESHOLD {
-            // ── single PutObject ──────────────────────────────────────────────────
-            let resp = self
-                .client
-                .get_object()
-                .bucket(&self.bucket_name)
-                .key(src_key)
-                .send()
+            self.stream_single_object_to(dst, src_key, dst_key, size, tags.as_deref())
                 .await
-                .map_err(|e| StorageError::S3Error(format!("GetObject failed: {e:?}")))?;
-
-            let content_length = resp.content_length().unwrap_or(size as i64);
-
-            let mut put_builder = dst
-                .client
-                .put_object()
-                .bucket(&dst.bucket_name)
-                .key(dst_key)
-                .body(resp.body)
-                .content_length(content_length);
-
-            if let Some(ref tags) = tags
-                && !tags.is_empty()
-            {
-                put_builder = put_builder.tagging(build_tagging_str(tags));
-            }
-
-            put_builder
-                .send()
-                .await
-                .map_err(|e| StorageError::S3Error(format!("PutObject failed: {e:?}")))?;
-
-            Ok(())
         } else {
             // ── multipart: ranged GetObject → UploadPart per chunk ────────────────
             let upload_id = dst.create_multipart_upload(dst_key, tags.as_ref()).await?;
@@ -1324,7 +1397,9 @@ impl S3Storage {
             // 计算实际的分片数量
             let total_parts = size.div_ceil(MULTIPART_THRESHOLD);
             // 限制并发上传的数量，不超过实际分片数量和最大并发数
-            let concurrency = std::cmp::min(total_parts as usize, MAX_CONCURRENCY);
+            let concurrency = usize::try_from(total_parts)
+                .unwrap_or(usize::MAX)
+                .min(MAX_CONCURRENCY);
             let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
             // 存储上传任务的句柄
@@ -1378,7 +1453,11 @@ impl S3Storage {
                         .key(&dst_key_clone)
                         .upload_id(&upload_id_clone)
                         .part_number(part_number_clone)
-                        .content_length(count_clone as i64)
+                        .content_length(i64::try_from(count_clone).map_err(|_| {
+                            StorageError::OperationError(
+                                "S3 multipart chunk exceeds the SDK size limit".to_string(),
+                            )
+                        })?)
                         .body(resp.body)
                         .send()
                         .await
@@ -1423,6 +1502,44 @@ impl S3Storage {
         }
     }
 
+    async fn stream_single_object_to(
+        &self,
+        dst: &S3Storage,
+        src_key: &str,
+        dst_key: &str,
+        size: u64,
+        tags: Option<&[Tag]>,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket_name)
+            .key(src_key)
+            .send()
+            .await
+            .map_err(|e| StorageError::S3Error(format!("GetObject failed: {e:?}")))?;
+        let fallback_length = i64::try_from(size).map_err(|_| {
+            StorageError::OperationError("S3 object exceeds the SDK size limit".to_string())
+        })?;
+        let mut request = dst
+            .client
+            .put_object()
+            .bucket(&dst.bucket_name)
+            .key(dst_key)
+            .content_length(response.content_length().unwrap_or(fallback_length))
+            .body(response.body);
+        if let Some(tags) = tags
+            && !tags.is_empty()
+        {
+            request = request.tagging(build_tagging_str(tags));
+        }
+        request
+            .send()
+            .await
+            .map_err(|e| StorageError::S3Error(format!("PutObject failed: {e:?}")))?;
+        Ok(())
+    }
+
     fn create(
         &self,
         relative_path: &str,
@@ -1445,6 +1562,10 @@ impl S3Storage {
     }
 
     /// 中止未完成的multipart upload
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
         debug!(
             "尝试中止multipart upload, key: {}, upload_id: {}",
@@ -1617,78 +1738,28 @@ impl S3Storage {
         (file_name, extension)
     }
 
-    /// 构建 `EntryEnum`
-    #[allow(clippy::too_many_arguments)]
-    fn build_entry(
-        file_name: String,
-        relative_path: &str,
-        extension: Option<String>,
-        size: u64,
-        last_modified: i64,
-        tags: Option<Vec<Tag>>,
-        version_id: Option<&str>,
-        is_latest: bool,
-        is_delete_marker: bool,
-        version_count: Option<u32>,
-        is_dir: bool,
-    ) -> EntryEnum {
-        EntryEnum::S3(S3Entry {
-            name: file_name,
-            relative_path: relative_path.to_string(),
-            extension,
-            size,
-            mtime: last_modified,
-            tags,
-            version_id: version_id.map(std::string::ToString::to_string),
-            is_latest,
-            is_delete_marker,
-            version_count,
-            is_dir,
-        })
-    }
-
-    /// 处理目录条目
-    #[allow(clippy::too_many_arguments)]
-    async fn process_directory(
+    fn directory_filter_decision(
         &self,
-        ctx: &crate::walk_scheduler::WorkerContext<(String, usize, bool, Option<usize>)>,
-        thread_id: usize,
         prefix_name: &str,
-        current_depth: usize,
-        depth_limit: Option<usize>,
         skip_filter: bool,
         match_expressions: Option<&FilterExpression>,
         exclude_expressions: Option<&FilterExpression>,
-        packaged: bool,
-        package_depth: usize,
-        package_remaining: Option<usize>,
-        tx: &async_channel::Sender<StorageEntryMessage>,
-        total_file_count: &Arc<AtomicUsize>,
-    ) -> Result<()> {
-        // 计算相对路径：移除存储的基本前缀和末尾斜杠
-        let relative_path = self.calculate_relative_path(prefix_name);
-        let clean_relative_path = relative_path.trim_end_matches('/');
-
-        // 获取目录名
-        let dir_name = PathBuf::from(clean_relative_path).file_name().map_or_else(
-            || {
-                let mut name = prefix_name.to_string();
-                if name.ends_with('/') {
-                    name.pop();
-                }
-                name
-            },
-            |f| f.to_string_lossy().into_owned(),
+    ) -> (String, String, bool, bool, bool) {
+        let clean_path = self
+            .calculate_relative_path(prefix_name)
+            .trim_end_matches('/')
+            .to_string();
+        let dir_name = PathBuf::from(&clean_path).file_name().map_or_else(
+            || prefix_name.trim_end_matches('/').to_string(),
+            |name| name.to_string_lossy().into_owned(),
         );
-
-        // 检查是否应该跳过目录
         let (skip_entry, continue_scan, need_submatch) = if skip_filter {
             should_skip(
                 match_expressions,
                 exclude_expressions,
                 FilterInput {
                     file_name: Some(&dir_name),
-                    file_path: Some(clean_relative_path),
+                    file_path: Some(&clean_path),
                     file_type: Some("dir"),
                     size: Some(0),
                     ..FilterInput::default()
@@ -1697,6 +1768,72 @@ impl S3Storage {
         } else {
             (false, true, false)
         };
+        (
+            dir_name,
+            clean_path,
+            skip_entry,
+            continue_scan,
+            need_submatch,
+        )
+    }
+
+    async fn send_directory_entry(
+        tx: &async_channel::Sender<StorageEntryMessage>,
+        total_file_count: &AtomicUsize,
+        dir_name: &str,
+        relative_path: &str,
+        packaged: bool,
+    ) -> Result<()> {
+        let entry = Arc::new(build_s3_entry!(
+            dir_name.to_string(),
+            relative_path,
+            None,
+            0,
+            0,
+            None,
+            None,
+            false,
+            false,
+            None,
+            true,
+        ));
+        let message = if packaged {
+            StorageEntryMessage::Packaged(entry)
+        } else {
+            StorageEntryMessage::Scanned(entry)
+        };
+        tx.send(message)
+            .await
+            .map_err(|_| StorageError::OperationError("接收端已关闭".to_string()))?;
+        total_file_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 处理目录条目
+    async fn process_directory(
+        &self,
+        prefix_name: &str,
+        current_depth: usize,
+        skip_filter: bool,
+        package_remaining: Option<usize>,
+        runtime: &S3WalkRuntime<'_>,
+    ) -> Result<()> {
+        let ctx = runtime.scheduler;
+        let thread_id = runtime.scheduler.worker_id;
+        let depth_limit = runtime.depth_limit;
+        let match_expressions = runtime.match_expr;
+        let exclude_expressions = runtime.exclude_expr;
+        let tx = runtime.tx;
+        let total_file_count = runtime.total_file_count;
+        let packaged = runtime.packaged;
+        let package_depth = runtime.package_depth;
+        let (dir_name, clean_relative_path, skip_entry, continue_scan, need_submatch) = self
+            .directory_filter_decision(
+                prefix_name,
+                skip_filter,
+                match_expressions,
+                exclude_expressions,
+            );
         debug!(
             "[S3] 线程 {} 处理目录 {}，skip_entry: {}, continue_scan: {}, need_submatch: {}",
             thread_id, clean_relative_path, skip_entry, continue_scan, need_submatch
@@ -1750,31 +1887,12 @@ impl S3Storage {
 
         // 统一的 Packaged 发送
         if send_packaged {
-            let entry = Self::build_entry(
-                dir_name,
-                clean_relative_path,
-                None,
-                0,
-                0,
-                None,
-                None,
-                false,
-                false,
-                None,
-                true,
-            );
             debug!(
                 "[S3] 线程 {} Packaged dir {} (depth: {})",
                 thread_id, clean_relative_path, current_depth
             );
-            if tx
-                .send(StorageEntryMessage::Packaged(Arc::new(entry)))
-                .await
-                .is_err()
-            {
-                return Err(StorageError::OperationError("接收端已关闭".to_string()));
-            }
-            total_file_count.fetch_add(1, Ordering::Relaxed);
+            Self::send_directory_entry(tx, total_file_count, &dir_name, &clean_relative_path, true)
+                .await?;
             return Ok(());
         }
 
@@ -1784,32 +1902,19 @@ impl S3Storage {
         };
         debug!(
             "[S3] 线程 {} 处理目录 {}，subdir_depth: {}, should_scan_subdir: {}",
-            thread_id, relative_path, subdir_depth, should_scan_subdir
+            thread_id, clean_relative_path, subdir_depth, should_scan_subdir
         );
 
         // 发送目录条目到 channel
         if !skip_entry {
-            let entry = Self::build_entry(
-                dir_name,
-                clean_relative_path,
-                None,
-                0,
-                0,
-                None,
-                None,
+            Self::send_directory_entry(
+                tx,
+                total_file_count,
+                &dir_name,
+                &clean_relative_path,
                 false,
-                false,
-                None,
-                true,
-            );
-            if tx
-                .send(StorageEntryMessage::Scanned(Arc::new(entry)))
-                .await
-                .is_err()
-            {
-                return Err(StorageError::OperationError("接收端已关闭".to_string()));
-            }
-            total_file_count.fetch_add(1, Ordering::Relaxed);
+            )
+            .await?;
         }
 
         // 处理子目录扫描逻辑：只要should_scan_subdir和continue_scan为true，就将子目录push到栈里
@@ -1823,21 +1928,21 @@ impl S3Storage {
     }
 
     /// 处理文件条目
-    #[allow(clippy::too_many_arguments)]
     async fn process_object(
         &self,
-        tx: &async_channel::Sender<StorageEntryMessage>,
-        thread_id: usize,
         key: &str,
         size: u64,
         last_modified: i64,
         extension: Option<String>,
-        include_tags: bool,
         skip_filter: bool,
-        match_expressions: Option<&FilterExpression>,
-        exclude_expressions: Option<&FilterExpression>,
-        total_file_count: &Arc<AtomicUsize>,
+        runtime: &S3WalkRuntime<'_>,
     ) -> Result<()> {
+        let tx = runtime.tx;
+        let thread_id = runtime.scheduler.worker_id;
+        let include_tags = runtime.include_tags;
+        let match_expressions = runtime.match_expr;
+        let exclude_expressions = runtime.exclude_expr;
+        let total_file_count = runtime.total_file_count;
         // 构建路径信息
         let relative_path = self.calculate_relative_path(key);
         let path_buf = PathBuf::from(relative_path);
@@ -1879,7 +1984,7 @@ impl S3Storage {
             };
 
             // 构建并发送EntryEnum
-            let entry = Self::build_entry(
+            let entry = build_s3_entry!(
                 file_name,
                 relative_path,
                 extension,
@@ -1908,61 +2013,26 @@ impl S3Storage {
     }
 
     /// 处理版本化对象条目，按对象分组并按时间排序
-    #[allow(clippy::too_many_arguments)]
-    async fn process_versioned_entries(
-        &self,
-        tx: &async_channel::Sender<StorageEntryMessage>,
-        version_entries: &[ObjectVersion],
-        delete_marker_entries: &[DeleteMarkerEntry],
-        include_tags: bool,
-        match_expressions: Option<&FilterExpression>,
-        exclude_expressions: Option<&FilterExpression>,
-        total_file_count: Arc<AtomicUsize>,
-    ) -> Result<()> {
-        // 定义一个枚举来表示版本或删除标记
-        enum VersionOrDeleteMarker {
-            Version(ObjectVersion),
-            DeleteMarker(DeleteMarkerEntry),
-        }
-
-        // 创建一个HashMap来按对象key分组所有版本条目
-        let mut object_versions: HashMap<String, Vec<(i64, VersionOrDeleteMarker)>> =
-            HashMap::new();
-
-        // 处理版本对象
-        for version in version_entries {
-            if let Some(key) = version.key() {
-                let key = key.to_string();
-                let last_modified = datatime_to_i64(version.last_modified());
-
-                object_versions.entry(key).or_default().push((
-                    last_modified,
-                    VersionOrDeleteMarker::Version(version.clone()),
-                ));
-            }
-        }
-
-        // 处理删除标记
-        for delete_marker in delete_marker_entries {
-            if let Some(key) = delete_marker.key() {
-                let key = key.to_string();
-                let last_modified = datatime_to_i64(delete_marker.last_modified());
-
-                object_versions.entry(key).or_default().push((
-                    last_modified,
-                    VersionOrDeleteMarker::DeleteMarker(delete_marker.clone()),
-                ));
-            }
-        }
+    async fn process_versioned_entries(&self, scan: VersionedScan<'_>) -> Result<()> {
+        let VersionedScan {
+            tx,
+            versions: version_entries,
+            delete_markers: delete_marker_entries,
+            include_tags,
+            match_expressions,
+            exclude_expressions,
+            total_file_count,
+        } = scan;
+        let object_versions = Self::group_object_versions(version_entries, delete_marker_entries);
 
         // 处理每个对象的所有版本
         for (_key, versions) in object_versions {
             // 按时间从旧到新排序
             let mut sorted_versions = versions;
-            sorted_versions.sort_by(|a, b| a.0.cmp(&b.0));
+            sorted_versions.sort_by_key(|a| a.0);
 
             // 计算该对象的版本总数
-            let version_count = sorted_versions.len() as u32;
+            let version_count = u32::try_from(sorted_versions.len()).unwrap_or(u32::MAX);
 
             // 检查最后一个版本是否是删除标记，如果是则跳过整个对象
             let should_skip_object = match sorted_versions.last() {
@@ -1986,7 +2056,10 @@ impl S3Storage {
                             // 计算相对路径：移除存储的基本前缀
                             let relative_path = self.calculate_relative_path(key_str);
                             let (file_name, extension) = Self::get_file_info(relative_path);
-                            let size = version.size().unwrap_or(0) as u64;
+                            let size = version
+                                .size()
+                                .and_then(|value| u64::try_from(value).ok())
+                                .unwrap_or(0);
 
                             // 检查是否应该跳过文件
                             let (skip_entry, _, _) = should_skip(
@@ -2020,7 +2093,7 @@ impl S3Storage {
                                 };
 
                                 // 构建并发送EntryEnum
-                                let entry = Self::build_entry(
+                                let entry = build_s3_entry!(
                                     file_name,
                                     relative_path,
                                     extension,
@@ -2053,43 +2126,8 @@ impl S3Storage {
                         }
                     }
                     VersionOrDeleteMarker::DeleteMarker(delete_marker) => {
-                        // 处理删除标记
-                        if let Some(key_str) = delete_marker.key() {
-                            // 计算相对路径
-                            let relative_path = self.calculate_relative_path(key_str);
-                            let (file_name, _) = Self::get_file_info(relative_path);
-
-                            // 转换时间戳
-                            let last_modified = datatime_to_i64(delete_marker.last_modified());
-
-                            // 构建并发送EntryEnum（删除标记）
-                            let entry = Self::build_entry(
-                                file_name,
-                                relative_path,
-                                None,
-                                0,
-                                last_modified,
-                                None,
-                                delete_marker.version_id(),
-                                delete_marker.is_latest().unwrap_or(false),
-                                true,
-                                Some(version_count),
-                                false,
-                            );
-
-                            trace!("[S3] 发送删除标记 EntryEnum : {:?}", entry,);
-
-                            // 发送条目
-                            if tx
-                                .send(StorageEntryMessage::Scanned(Arc::new(entry)))
-                                .await
-                                .is_err()
-                            {
-                                return Err(StorageError::OperationError(
-                                    "接收端已关闭".to_string(),
-                                ));
-                            }
-                        }
+                        self.send_delete_marker(tx, &delete_marker, version_count)
+                            .await?;
                     }
                 }
             }
@@ -2098,7 +2136,71 @@ impl S3Storage {
         Ok(())
     }
 
+    async fn send_delete_marker(
+        &self,
+        tx: &async_channel::Sender<StorageEntryMessage>,
+        marker: &DeleteMarkerEntry,
+        version_count: u32,
+    ) -> Result<()> {
+        let Some(key) = marker.key() else {
+            return Ok(());
+        };
+        let relative_path = self.calculate_relative_path(key);
+        let (file_name, _) = Self::get_file_info(relative_path);
+        let entry = build_s3_entry!(
+            file_name,
+            relative_path,
+            None,
+            0,
+            datatime_to_i64(marker.last_modified()),
+            None,
+            marker.version_id(),
+            marker.is_latest().unwrap_or(false),
+            true,
+            Some(version_count),
+            false,
+        );
+        trace!("[S3] 发送删除标记 EntryEnum : {:?}", entry);
+        tx.send(StorageEntryMessage::Scanned(Arc::new(entry)))
+            .await
+            .map_err(|_| StorageError::OperationError("接收端已关闭".to_string()))
+    }
+
+    fn group_object_versions(
+        versions: &[ObjectVersion],
+        delete_markers: &[DeleteMarkerEntry],
+    ) -> HashMap<String, Vec<(i64, VersionOrDeleteMarker)>> {
+        let mut grouped = HashMap::new();
+        for version in versions {
+            if let Some(key) = version.key() {
+                grouped
+                    .entry(key.to_string())
+                    .or_insert_with(Vec::new)
+                    .push((
+                        datatime_to_i64(version.last_modified()),
+                        VersionOrDeleteMarker::Version(version.clone()),
+                    ));
+            }
+        }
+        for marker in delete_markers {
+            if let Some(key) = marker.key() {
+                grouped
+                    .entry(key.to_string())
+                    .or_insert_with(Vec::new)
+                    .push((
+                        datatime_to_i64(marker.last_modified()),
+                        VersionOrDeleteMarker::DeleteMarker(marker.clone()),
+                    ));
+            }
+        }
+        grouped
+    }
+
     /// 通过rx接收到`DataChunk`, 并将其写入到目标S3文件中（`MULTIPART_THRESHOLD`以下的文件一次性写入整个文件）
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn write_singlepart_data(
         &self,
         rx: mpsc::Receiver<DataChunk>,
@@ -2211,7 +2313,9 @@ impl S3Storage {
             .bucket(&self.bucket_name)
             .key(&file.key)
             .body(stream)
-            .content_length(total_size as i64)
+            .content_length(i64::try_from(total_size).map_err(|_| {
+                StorageError::OperationError("S3 object exceeds the SDK size limit".to_string())
+            })?)
             .metadata("last-modified", file.last_modified.clone());
 
         if let Some(tags) = &file.tags
@@ -2228,10 +2332,16 @@ impl S3Storage {
             StorageError::S3Error(format!("写入对象 {} 失败: {:?}", file.key, e))
         })?;
 
-        Ok(total_size as usize)
+        usize::try_from(total_size).map_err(|_| {
+            StorageError::OperationError("written size exceeds platform capacity".to_string())
+        })
     }
 
     /// 写入数据到目标S3文件（`MULTIPART_THRESHOLD`以上的文件使用multipart上传）
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn write_multipart_data(
         &self,
         rx: mpsc::Receiver<DataChunk>,
@@ -2310,57 +2420,18 @@ impl S3Storage {
                     part_number, buffer_size
                 );
 
-                // 克隆必要的变量用于异步任务
-                let self_clone = self.clone();
-                let key_clone = key.clone();
-                let upload_id_clone = upload_id.clone();
-                let part_number_clone = part_number;
-                let buffer_chunks_clone = buffer_chunks;
-                let buffer_size_clone = buffer_size;
-                let parts_clone = parts.clone();
-                let semaphore_clone = semaphore.clone();
-
-                // 获取信号量许可
-                let permit = semaphore_clone.acquire_owned().await.map_err(|_| {
-                    StorageError::S3Error("Semaphore closed unexpectedly".to_string())
-                })?;
-
-                // 创建异步上传任务
-                let handle = tokio::spawn(async move {
-                    let _permit = permit;
-                    let etag = match self_clone
-                        .upload_part_with_stream(
-                            &key_clone,
-                            &upload_id_clone,
-                            part_number_clone,
-                            buffer_chunks_clone,
-                            buffer_size_clone,
-                        )
-                        .await
-                    {
-                        Ok(tag) => tag,
-                        Err(e) => {
-                            error!(
-                                "Failed to upload part {} for file: {:?}",
-                                part_number_clone, e
-                            );
-                            return Err(e);
-                        }
-                    };
-
-                    // 保存分块信息
-                    let mut parts = parts_clone.lock().await;
-                    parts.push(
-                        CompletedPart::builder()
-                            .part_number(part_number_clone)
-                            .e_tag(etag)
-                            .build(),
-                    );
-                    Ok(())
-                });
-
-                // 存储上传任务的句柄
-                upload_handles.push(handle);
+                upload_handles.push(
+                    self.spawn_buffered_part_upload(BufferedPartUpload {
+                        key: key.clone(),
+                        upload_id: upload_id.clone(),
+                        part_number,
+                        chunks: buffer_chunks,
+                        size: buffer_size,
+                        parts: parts.clone(),
+                        semaphore: semaphore.clone(),
+                    })
+                    .await?,
+                );
                 part_number += 1;
 
                 // 清空缓冲区，准备下一个分块
@@ -2376,76 +2447,25 @@ impl S3Storage {
                 part_number, buffer_size
             );
 
-            // 克隆必要的变量用于异步任务
-            let self_clone = self.clone();
-            let key_clone = key.clone();
-            let upload_id_clone = upload_id.clone();
-            let part_number_clone = part_number;
-            let buffer_chunks_clone = buffer_chunks;
-            let buffer_size_clone = buffer_size;
-            let parts_clone = parts.clone();
-            let semaphore_clone = semaphore.clone();
-
-            // 获取信号量许可
-            let permit = semaphore_clone
-                .acquire_owned()
-                .await
-                .map_err(|_| StorageError::S3Error("Semaphore closed unexpectedly".to_string()))?;
-
-            // 创建异步上传任务
-            let handle = tokio::spawn(async move {
-                let _permit = permit;
-                let etag = match self_clone
-                    .upload_part_with_stream(
-                        &key_clone,
-                        &upload_id_clone,
-                        part_number_clone,
-                        buffer_chunks_clone,
-                        buffer_size_clone,
-                    )
-                    .await
-                {
-                    Ok(tag) => tag,
-                    Err(e) => {
-                        error!(
-                            "Failed to upload final part {} for file: {:?}",
-                            part_number_clone, e
-                        );
-                        return Err(e);
-                    }
-                };
-
-                // 保存分块信息
-                let mut parts = parts_clone.lock().await;
-                parts.push(
-                    CompletedPart::builder()
-                        .part_number(part_number_clone)
-                        .e_tag(etag)
-                        .build(),
-                );
-                Ok(())
-            });
-
-            // 存储上传任务的句柄
-            upload_handles.push(handle);
+            upload_handles.push(
+                self.spawn_buffered_part_upload(BufferedPartUpload {
+                    key: key.clone(),
+                    upload_id: upload_id.clone(),
+                    part_number,
+                    chunks: buffer_chunks,
+                    size: buffer_size,
+                    parts: parts.clone(),
+                    semaphore: semaphore.clone(),
+                })
+                .await?,
+            );
         }
 
         // 检查数据是否有效（在完成上传前，但需先等待所有任务结束以避免泄漏）
         if !data_valid {
-            error!(
-                "File data is invalid due to non-contiguous chunks, aborting multipart upload for {:?}",
-                relative_path
-            );
-            // 等待所有进行中的上传任务结束，避免泄漏
-            for handle in upload_handles {
-                let _ = handle.await;
-            }
-            if let Err(abort_err) = self.abort_multipart_upload(&key, &upload_id).await {
-                error!("Failed to abort multipart upload: {:?}", abort_err);
-            }
-            return Err(StorageError::OperationError(
-                "Data chunks are not contiguous or in order".to_string(),
-            ));
+            return self
+                .reject_noncontiguous_upload(&key, &upload_id, upload_handles)
+                .await;
         }
 
         self.finish_multipart_upload(&key, &upload_id, upload_handles, parts)
@@ -2455,10 +2475,71 @@ impl S3Storage {
             "Successfully completed multipart upload for file {:?}",
             relative_path
         );
-        Ok(expected_offset as usize)
+        usize::try_from(expected_offset).map_err(|_| {
+            StorageError::OperationError("written size exceeds platform capacity".to_string())
+        })
+    }
+
+    async fn reject_noncontiguous_upload(
+        &self,
+        key: &str,
+        upload_id: &str,
+        handles: Vec<tokio::task::JoinHandle<Result<()>>>,
+    ) -> Result<usize> {
+        error!("File data is non-contiguous; aborting multipart upload for {key}");
+        for handle in handles {
+            let _ = handle.await;
+        }
+        if let Err(error) = self.abort_multipart_upload(key, upload_id).await {
+            error!("Failed to abort multipart upload: {error:?}");
+        }
+        Err(StorageError::OperationError(
+            "Data chunks are not contiguous or in order".to_string(),
+        ))
+    }
+
+    async fn spawn_buffered_part_upload(
+        &self,
+        upload: BufferedPartUpload,
+    ) -> Result<tokio::task::JoinHandle<Result<()>>> {
+        let BufferedPartUpload {
+            key,
+            upload_id,
+            part_number,
+            chunks,
+            size,
+            parts,
+            semaphore,
+        } = upload;
+        let permit = semaphore
+            .acquire_owned()
+            .await
+            .map_err(|_| StorageError::S3Error("Semaphore closed unexpectedly".to_string()))?;
+        let storage = self.clone();
+        Ok(tokio::spawn(async move {
+            let _permit = permit;
+            let etag = storage
+                .upload_part_with_stream(&key, &upload_id, part_number, chunks, size)
+                .await
+                .map_err(|error| {
+                    error!("Failed to upload part {part_number}: {error:?}");
+                    error
+                })?;
+            parts.lock().await.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(etag)
+                    .build(),
+            );
+            Ok(())
+        }))
     }
 
     /// 创建分块上传请求
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn create_multipart_upload(
         &self,
         key: &str,
@@ -2522,7 +2603,9 @@ impl S3Storage {
             .key(key)
             .upload_id(upload_id)
             .part_number(part_number)
-            .content_length(size as i64)
+            .content_length(i64::try_from(size).map_err(|_| {
+                StorageError::OperationError("S3 part exceeds the SDK size limit".to_string())
+            })?)
             .body(stream)
             .send()
             .await
@@ -2546,6 +2629,10 @@ impl S3Storage {
     }
 
     /// 完成分块上传
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn complete_multipart_upload(
         &self,
         key: &str,
@@ -2613,11 +2700,11 @@ impl S3Storage {
 
     /// 准备可续传的 multipart 上传。
     ///
-    /// 查找该 key 已有的 in-progress upload：有则以 ListParts 反推已完成区间（续传）；
+    /// 查找该 key 已有的 in-progress upload：有则以 `ListParts` 反推已完成区间（续传）；
     /// 无、或已有 parts 与当前 `(size, part_size)` 推导不符（如源已变/块配置变更）则
     /// 作废重建。返回 `(upload_id, 缺失区间列表)`。
     ///
-    /// **目标端 ListParts 是续传进度的唯一真值**——上层状态文件记录的区间只可能
+    /// **目标端 `ListParts` 是续传进度的唯一真值**——上层状态文件记录的区间只可能
     /// 滞后于真实进度（回调后才落盘），且 upload 可能被外部（lifecycle 规则、手动
     /// abort）清掉，以目标端反推永远正确。
     pub(crate) async fn prepare_resumable_upload(
@@ -2629,29 +2716,25 @@ impl S3Storage {
     ) -> Result<(String, Vec<(u64, u64)>)> {
         let key = self.build_full_key(relative_path);
         if let Some(upload_id) = self.find_inprogress_upload(&key).await? {
-            match self
+            if let Some(committed) = self
                 .committed_intervals_from_parts(&key, &upload_id, size, part_size)
                 .await?
             {
-                Some(committed) => {
-                    let missing = missing_from_committed(&committed, size);
-                    debug!(
-                        "Resuming multipart upload {} for key {}: {} committed intervals, {} missing",
-                        upload_id,
-                        key,
-                        committed.len(),
-                        missing.len()
-                    );
-                    return Ok((upload_id, missing));
-                }
-                None => {
-                    warn!(
-                        "Existing multipart upload {} for key {} has incompatible parts, aborting and restarting",
-                        upload_id, key
-                    );
-                    let _ = self.abort_multipart_upload(&key, &upload_id).await;
-                }
+                let missing = missing_from_committed(&committed, size);
+                debug!(
+                    "Resuming multipart upload {} for key {}: {} committed intervals, {} missing",
+                    upload_id,
+                    key,
+                    committed.len(),
+                    missing.len()
+                );
+                return Ok((upload_id, missing));
             }
+            warn!(
+                "Existing multipart upload {} for key {} has incompatible parts, aborting and restarting",
+                upload_id, key
+            );
+            let _ = self.abort_multipart_upload(&key, &upload_id).await;
         }
         let upload_id = self.create_multipart_upload(&key, tags).await?;
         Ok((upload_id, vec![(0, size)]))
@@ -2703,7 +2786,7 @@ impl S3Storage {
         Ok(latest.map(|(id, _)| id))
     }
 
-    /// 分页列出某 upload 的全部 parts，返回 `(part_number, size, etag)`（按 part_number 升序）。
+    /// 分页列出某 upload 的全部 parts，返回 `(part_number, size, etag)`（按 `part_number` 升序）。
     async fn list_upload_parts(
         &self,
         key: &str,
@@ -2727,8 +2810,7 @@ impl S3Storage {
             for p in resp.parts() {
                 if let (Some(pn), Some(psize), Some(etag)) = (p.part_number(), p.size(), p.e_tag())
                 {
-                    #[allow(clippy::cast_sign_loss)]
-                    parts.push((pn, psize.max(0) as u64, etag.to_string()));
+                    parts.push((pn, u64::try_from(psize).unwrap_or(0), etag.to_string()));
                 }
             }
             if resp.is_truncated() == Some(true) {
@@ -2741,7 +2823,7 @@ impl S3Storage {
         Ok(parts)
     }
 
-    /// ListParts → 已完成区间（升序）。任一 part 与 `(size, part_size)` 推导的
+    /// `ListParts` → 已完成区间（升序）。任一 part 与 `(size, part_size)` 推导的
     /// 编号/尺寸不符 → `Ok(None)`（调用方应作废该 upload 重来）。
     async fn committed_intervals_from_parts(
         &self,
@@ -2756,7 +2838,7 @@ impl S3Storage {
             if pn < 1 {
                 return Ok(None);
             }
-            let idx = (pn - 1) as u64;
+            let idx = u64::try_from(pn - 1).unwrap_or_else(|_| unreachable!("pn was checked"));
             if idx >= total_parts || psize != Self::expected_part_len(size, part_size, idx) {
                 return Ok(None);
             }
@@ -2775,7 +2857,6 @@ impl S3Storage {
     /// 每个 part 上传成功即触发 `on_committed(part_start, part_len)`。
     /// 任何失败**不 abort** upload——已上传 parts 留在 in-progress upload 里，
     /// 就是下次续传的进度。流在 part 中途结束时丢弃半截缓冲（该 part 下次重传）。
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_data_resumable(
         &self,
         rx: mpsc::Receiver<DataChunk>,
@@ -2783,9 +2864,12 @@ impl S3Storage {
         size: u64,
         part_size: u64,
         upload_id: &str,
-        bytes_counter: Option<Arc<AtomicU64>>,
-        on_committed: crate::CommitCallback,
+        progress: crate::storage_enum::WriteProgress,
     ) -> Result<()> {
+        let crate::storage_enum::WriteProgress {
+            bytes_counter,
+            on_committed,
+        } = progress;
         let key = Arc::new(self.build_full_key(relative_path));
         let upload_id = Arc::new(upload_id.to_string());
         let mut reader = rx;
@@ -2829,23 +2913,26 @@ impl S3Storage {
                     )));
                     break 'recv;
                 }
-                let take = (data.len() as u64).min(room);
-                #[allow(clippy::cast_possible_truncation)]
-                buf.push(data.split_to(take as usize));
-                buf_len += take;
+                let take_u64 = (data.len() as u64).min(room);
+                let take = usize::try_from(take_u64)
+                    .unwrap_or_else(|_| unreachable!("take is bounded by data.len()"));
+                buf.push(data.split_to(take));
+                buf_len += take_u64;
                 if buf_start + buf_len == part_end {
                     let handle = self
-                        .spawn_resumable_part_upload(
-                            key.clone(),
-                            upload_id.clone(),
+                        .spawn_resumable_part_upload(S3PartUpload {
+                            key: key.clone(),
+                            upload_id: upload_id.clone(),
                             part_idx,
-                            buf_start,
-                            std::mem::take(&mut buf),
-                            buf_len,
-                            semaphore.clone(),
-                            bytes_counter.clone(),
-                            on_committed.clone(),
-                        )
+                            part_start: buf_start,
+                            chunks: std::mem::take(&mut buf),
+                            len: buf_len,
+                            semaphore: semaphore.clone(),
+                            progress: crate::storage_enum::WriteProgress {
+                                bytes_counter: bytes_counter.clone(),
+                                on_committed: on_committed.clone(),
+                            },
+                        })
                         .await?;
                     handles.push(handle);
                     buf_start = part_end;
@@ -2861,17 +2948,19 @@ impl S3Storage {
             if buf_start + buf_len == size {
                 let part_idx = buf_start / part_size;
                 let handle = self
-                    .spawn_resumable_part_upload(
-                        key.clone(),
-                        upload_id.clone(),
+                    .spawn_resumable_part_upload(S3PartUpload {
+                        key: key.clone(),
+                        upload_id: upload_id.clone(),
                         part_idx,
-                        buf_start,
-                        std::mem::take(&mut buf),
-                        buf_len,
-                        semaphore.clone(),
-                        bytes_counter.clone(),
-                        on_committed.clone(),
-                    )
+                        part_start: buf_start,
+                        chunks: std::mem::take(&mut buf),
+                        len: buf_len,
+                        semaphore: semaphore.clone(),
+                        progress: crate::storage_enum::WriteProgress {
+                            bytes_counter: bytes_counter.clone(),
+                            on_committed: on_committed.clone(),
+                        },
+                    })
                     .await?;
                 handles.push(handle);
             } else {
@@ -2881,8 +2970,13 @@ impl S3Storage {
             }
         }
 
-        // 等待所有 upload 任务，收集首个错误（不 abort，保留已上传 parts 供续传）
-        let mut first_err = stream_err;
+        Self::await_resumable_uploads(handles, stream_err).await
+    }
+
+    async fn await_resumable_uploads(
+        handles: Vec<tokio::task::JoinHandle<Result<()>>>,
+        mut first_err: Option<StorageError>,
+    ) -> Result<()> {
         for handle in handles {
             match handle.await {
                 Ok(Ok(())) => {}
@@ -2908,19 +3002,24 @@ impl S3Storage {
 
     /// 受信号量限流地 spawn 单个 part 的上传任务；成功后计数 + 触发
     /// `on_committed(part_start, len)`。
-    #[allow(clippy::too_many_arguments)]
     async fn spawn_resumable_part_upload(
         &self,
-        key: Arc<String>,
-        upload_id: Arc<String>,
-        part_idx: u64,
-        part_start: u64,
-        chunks: Vec<Bytes>,
-        len: u64,
-        semaphore: Arc<tokio::sync::Semaphore>,
-        bytes_counter: Option<Arc<AtomicU64>>,
-        on_committed: crate::CommitCallback,
+        upload: S3PartUpload,
     ) -> Result<tokio::task::JoinHandle<Result<()>>> {
+        let S3PartUpload {
+            key,
+            upload_id,
+            part_idx,
+            part_start,
+            chunks,
+            len,
+            semaphore,
+            progress:
+                crate::storage_enum::WriteProgress {
+                    bytes_counter,
+                    on_committed,
+                },
+        } = upload;
         let permit = semaphore
             .acquire_owned()
             .await
@@ -3016,7 +3115,10 @@ impl S3Storage {
         // 从相对路径计算文件名和扩展名（不使用含 prefix 的 full key）
         let (file_name, extension) = Self::get_file_info(relative_path);
 
-        let size = response.content_length().unwrap_or(0) as u64;
+        let size = response
+            .content_length()
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(0);
 
         let last_modified = datatime_to_i64(response.last_modified());
 
@@ -3025,7 +3127,7 @@ impl S3Storage {
             .await
             .unwrap_or_default();
 
-        let entry = Self::build_entry(
+        let entry = build_s3_entry!(
             file_name,
             relative_path,
             extension,
@@ -3043,19 +3145,17 @@ impl S3Storage {
         Ok(entry)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::unused_async)]
-    pub async fn walkdir(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
+    pub fn walkdir(
         &self,
         sub_path: Option<&str>,
-        depth: Option<usize>,
-        match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>,
-        concurrency: usize,
-        include_tags: bool,
-        packaged: bool,
-        package_depth: usize,
+        options: crate::WalkOptions,
     ) -> Result<WalkDirAsyncIterator> {
+        let concurrency = options.concurrency;
+        let depth = options.depth;
         debug!(
             "[S3] 开始执行walkdir，并发度: {}, bucket: {}, 深度: {:?}, sub_path: {:?}",
             concurrency, self.bucket_name, depth, sub_path
@@ -3077,15 +3177,9 @@ impl S3Storage {
             if let Err(e) = self_clone
                 .iterative_walkdir(
                     tx_clone.clone(),
-                    depth,
-                    match_expressions,
-                    exclude_expressions,
-                    concurrency,
-                    include_tags,
+                    options,
                     self_clone.is_bucket_versioned,
                     total_file_count,
-                    packaged,
-                    package_depth,
                 )
                 .await
             {
@@ -3105,20 +3199,22 @@ impl S3Storage {
     }
 
     /// 迭代式目录遍历函数，使用工作窃取队列实现高效并发
-    #[allow(clippy::too_many_arguments)]
     async fn iterative_walkdir(
         &self,
         tx: async_channel::Sender<StorageEntryMessage>,
-        depth: Option<usize>,
-        match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>,
-        concurrency: usize,
-        include_tags: bool,
+        options: crate::WalkOptions,
         is_versioned: bool,
         total_file_count: Arc<AtomicUsize>,
-        packaged: bool,
-        package_depth: usize,
     ) -> Result<()> {
+        let crate::WalkOptions {
+            depth,
+            match_expressions,
+            exclude_expressions,
+            concurrency,
+            include_tags,
+            packaged,
+            package_depth,
+        } = options;
         let start_prefix = self.prefix.clone().unwrap_or_default();
         debug!("[S3] 使用起始前缀: {:?}", start_prefix);
 
@@ -3139,21 +3235,22 @@ impl S3Storage {
                     &ctx,
                     |(prefix, current_depth, skip_filter, package_remaining)| {
                         self_clone.process_dir(
-                            ctx.worker_id,
                             prefix,
                             current_depth,
-                            &tx_clone,
-                            &ctx,
-                            match_expr_clone.as_ref(),
-                            exclude_expr_clone.as_ref(),
-                            depth,
-                            include_tags,
-                            is_versioned,
-                            &total_file_count_clone,
                             skip_filter,
-                            packaged,
-                            package_depth,
                             package_remaining,
+                            S3WalkRuntime {
+                                tx: &tx_clone,
+                                scheduler: &ctx,
+                                match_expr: match_expr_clone.as_ref(),
+                                exclude_expr: exclude_expr_clone.as_ref(),
+                                depth_limit: depth,
+                                include_tags,
+                                is_versioned,
+                                total_file_count: &total_file_count_clone,
+                                packaged,
+                                package_depth,
+                            },
                         )
                     },
                     |task| task.0.clone(),
@@ -3170,308 +3267,188 @@ impl S3Storage {
     }
 
     /// 处理单个目录（S3 中的前缀），读取条目并过滤，发送符合条件的EntryEnum
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::fn_params_excessive_bools)]
+    async fn process_unversioned_prefix(
+        &self,
+        prefix: &str,
+        current_depth: usize,
+        skip_filter: bool,
+        package_remaining: Option<usize>,
+        runtime: &S3WalkRuntime<'_>,
+    ) -> Result<()> {
+        let mut continuation_token = None;
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket_name)
+                .delimiter("/")
+                .prefix(prefix);
+            if let Some(token) = &continuation_token {
+                request = request.continuation_token(token);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    error!("ListObjectsV2 failed for prefix {prefix}: {error:?}");
+                    return Ok(());
+                }
+            };
+            for common_prefix in response.common_prefixes() {
+                if let Some(prefix_name) = common_prefix.prefix() {
+                    self.process_directory(
+                        prefix_name,
+                        current_depth,
+                        skip_filter,
+                        package_remaining,
+                        runtime,
+                    )
+                    .await?;
+                }
+            }
+            for object in response.contents() {
+                let Some(key) = object.key() else {
+                    continue;
+                };
+                if prefix == key {
+                    continue;
+                }
+                let size = object
+                    .size()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or(0);
+                let extension = PathBuf::from(key)
+                    .extension()
+                    .map(|value| value.to_string_lossy().to_string());
+                self.process_object(
+                    key,
+                    size,
+                    datatime_to_i64(object.last_modified()),
+                    extension,
+                    skip_filter,
+                    runtime,
+                )
+                .await?;
+            }
+            continuation_token = response.next_continuation_token().map(str::to_string);
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_versioned_prefix(
+        &self,
+        prefix: &str,
+        current_depth: usize,
+        skip_filter: bool,
+        package_remaining: Option<usize>,
+        runtime: &S3WalkRuntime<'_>,
+    ) -> Result<()> {
+        let mut key_marker = None;
+        let mut version_id_marker = None;
+        loop {
+            let mut request = self
+                .client
+                .list_object_versions()
+                .bucket(&self.bucket_name)
+                .delimiter("/")
+                .prefix(prefix);
+            if let Some(marker) = &key_marker {
+                request = request.key_marker(marker);
+                if let Some(version_marker) = &version_id_marker {
+                    request = request.version_id_marker(version_marker);
+                }
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    error!("ListObjectVersions failed for prefix {prefix}: {error:?}");
+                    return Ok(());
+                }
+            };
+            for common_prefix in response.common_prefixes() {
+                if let Some(prefix_name) = common_prefix.prefix() {
+                    self.process_directory(
+                        prefix_name,
+                        current_depth,
+                        skip_filter,
+                        package_remaining,
+                        runtime,
+                    )
+                    .await?;
+                }
+            }
+            let versions = response
+                .versions()
+                .iter()
+                .filter(|version| version.key().is_some_and(|key| key != prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            let delete_markers = response
+                .delete_markers()
+                .iter()
+                .filter(|marker| marker.key().is_some_and(|key| key != prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            self.process_versioned_entries(VersionedScan {
+                tx: runtime.tx,
+                versions: &versions,
+                delete_markers: &delete_markers,
+                include_tags: runtime.include_tags,
+                match_expressions: runtime.match_expr,
+                exclude_expressions: runtime.exclude_expr,
+                total_file_count: runtime.total_file_count.clone(),
+            })
+            .await?;
+            key_marker = response.next_key_marker().map(str::to_string);
+            version_id_marker = response.next_version_id_marker().map(str::to_string);
+            if key_marker.is_none() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     async fn process_dir(
         &self,
-        producer_id: usize,
         prefix: String,
         current_depth: usize,
-        tx: &async_channel::Sender<StorageEntryMessage>,
-        ctx: &crate::walk_scheduler::WorkerContext<(String, usize, bool, Option<usize>)>,
-        match_expressions: Option<&FilterExpression>,
-        exclude_expressions: Option<&FilterExpression>,
-        depth_limit: Option<usize>,
-        include_tags: bool,
-        is_versioned: bool,
-        total_file_count: &Arc<AtomicUsize>,
         skip_filter: bool,
-        packaged: bool,
-        package_depth: usize,
         package_remaining: Option<usize>,
+        runtime: S3WalkRuntime<'_>,
     ) -> Result<()> {
+        let producer_id = runtime.scheduler.worker_id;
+        let depth_limit = runtime.depth_limit;
+        let is_versioned = runtime.is_versioned;
         debug!(
             "[S3 Producer {}] 开始处理前缀: {}, 当前深度: {}, skip_filter: {}",
             producer_id, prefix, current_depth, skip_filter
         );
 
         // 如果当前目录的深度大于等于限制深度，直接返回，不处理该目录下的内容
-        if depth_limit.is_some_and(|max_depth| {
-            if current_depth >= max_depth {
-                debug!(
-                    "[S3 Producer {}] 当前目录 {} 深度 {} >= 限制深度 {}, 直接返回",
-                    producer_id, prefix, current_depth, max_depth
-                );
-                true
-            } else {
-                false
-            }
-        }) {
+        if depth_limit.is_some_and(|max_depth| current_depth >= max_depth) {
             return Ok(());
         }
 
         if is_versioned {
-            // 处理版本化桶，使用list_object_versions API
-            let mut key_marker: Option<String> = None;
-            let mut version_id_marker: Option<String> = None;
-            let mut page_count = 0;
-
-            loop {
-                page_count += 1;
-                debug!(
-                    "[S3 Producer {}] 处理版本化桶 {} 前缀 {} 的第 {} 页，key_marker: {:?}, version_id_marker: {:?}",
-                    producer_id,
-                    self.bucket_name,
-                    prefix,
-                    page_count,
-                    key_marker,
-                    version_id_marker
-                );
-
-                // 构建请求
-                let mut request = self
-                    .client
-                    .list_object_versions()
-                    .bucket(&self.bucket_name)
-                    .delimiter("/")
-                    .prefix(&prefix);
-
-                if let Some(marker) = &key_marker {
-                    request = request.key_marker(marker);
-                    if let Some(version_marker) = &version_id_marker {
-                        request = request.version_id_marker(version_marker);
-                    }
-                }
-
-                // 发送请求并获取响应
-                debug!(
-                    "[S3 Producer {}] 发送S3 list_object_versions请求, 前缀: {}",
-                    producer_id, prefix
-                );
-                let response = match request.send().await {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        error!("[S3 Producer {}] 请求失败，错误: {:?}", producer_id, e);
-                        // 非致命错误，记录并继续
-                        return Ok(());
-                    }
-                };
-
-                // 处理公共前缀（目录）
-                let mut subdir_count = 0;
-                for prefix_data in response.common_prefixes() {
-                    if let Some(prefix_name) = prefix_data.prefix() {
-                        self.process_directory(
-                            ctx,
-                            producer_id,
-                            prefix_name,
-                            current_depth,
-                            depth_limit,
-                            skip_filter,
-                            match_expressions,
-                            exclude_expressions,
-                            packaged,
-                            package_depth,
-                            package_remaining,
-                            tx,
-                            total_file_count,
-                        )
-                        .await?;
-                        subdir_count += 1;
-                    }
-                }
-                debug!(
-                    "[S3 Producer {}] 共处理 {} 个子目录",
-                    producer_id, subdir_count
-                );
-
-                // 收集同一对象的所有版本和删除标记
-                let mut version_entries = Vec::new();
-                let mut delete_marker_entries = Vec::new();
-
-                // 收集版本对象
-                for version in response.versions() {
-                    if version.key().is_some_and(|key| key != prefix) {
-                        version_entries.push(version.clone());
-                    }
-                }
-
-                // 收集删除标记
-                for delete_marker in response.delete_markers() {
-                    if delete_marker.key().is_some_and(|key| key != prefix) {
-                        delete_marker_entries.push(delete_marker.clone());
-                    }
-                }
-
-                // 处理版本对象和删除标记，按对象分组并按时间排序
-                self.process_versioned_entries(
-                    tx,
-                    &version_entries,
-                    &delete_marker_entries,
-                    include_tags,
-                    match_expressions,
-                    exclude_expressions,
-                    total_file_count.clone(),
-                )
-                .await?;
-
-                // 更新分页标记
-                key_marker = response
-                    .next_key_marker()
-                    .map(std::string::ToString::to_string);
-                version_id_marker = response
-                    .next_version_id_marker()
-                    .map(std::string::ToString::to_string);
-
-                // 检查是否还有更多页面
-                if key_marker.is_none() {
-                    debug!(
-                        "[S3 Producer {}] 处理前缀 {} 完成，没有更多页面",
-                        producer_id, prefix
-                    );
-                    break; // 没有更多数据了，退出循环
-                }
-            }
-
-            debug!(
-                "[S3 Producer {}] 完成前缀 {} 的处理，全局累计处理 {} 个文件",
-                producer_id,
-                prefix,
-                total_file_count.load(Ordering::Relaxed),
-            );
-            Ok(())
+            self.process_versioned_prefix(
+                &prefix,
+                current_depth,
+                skip_filter,
+                package_remaining,
+                &runtime,
+            )
+            .await
         } else {
-            // 处理非版本化桶，使用传统的list_objects_v2 API
-            let mut continuation_token: Option<String> = None;
-            let mut page_count = 0;
-
-            loop {
-                page_count += 1;
-                debug!(
-                    "[S3 Producer {}] 处理桶 {} 前缀 {} 的第 {} 页，continuation_token: {:?}",
-                    producer_id, self.bucket_name, prefix, page_count, continuation_token
-                );
-
-                // 构建请求，增加批处理大小以减少请求次数
-                let mut request = self
-                    .client
-                    .list_objects_v2()
-                    .bucket(&self.bucket_name)
-                    .delimiter("/")
-                    .prefix(&prefix); // 增加每次请求的最大键数量
-
-                if let Some(token) = &continuation_token {
-                    request = request.continuation_token(token);
-                }
-
-                // 发送请求并获取响应
-                debug!(
-                    "[S3 Producer {}] 发送S3 list_objects_v2请求, 前缀: {}",
-                    producer_id, prefix
-                );
-                let response = match request.send().await {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        error!("[S3 Producer {}] 请求失败，错误: {:?}", producer_id, e);
-                        // 非致命错误，记录并继续
-                        return Ok(());
-                    }
-                };
-
-                // 处理当前响应页中的公共前缀（CommonPrefixes）
-                let mut subdir_count = 0;
-                for prefix_data in response.common_prefixes() {
-                    if let Some(prefix_name) = prefix_data.prefix() {
-                        self.process_directory(
-                            ctx,
-                            producer_id,
-                            prefix_name,
-                            current_depth,
-                            depth_limit,
-                            skip_filter,
-                            match_expressions,
-                            exclude_expressions,
-                            packaged,
-                            package_depth,
-                            package_remaining,
-                            tx,
-                            total_file_count,
-                        )
-                        .await?;
-                        subdir_count += 1;
-                    }
-                }
-                debug!(
-                    "[S3 Producer {}] 共处理 {} 个子目录",
-                    producer_id, subdir_count
-                );
-
-                // 处理当前响应页中的对象（Contents）并立即发送
-                let mut processed_files = 0;
-                for obj in response.contents() {
-                    if let Some(key) = obj.key() {
-                        if prefix == key {
-                            continue;
-                        }
-
-                        let size = obj.size().unwrap_or(0) as u64;
-
-                        // 转换时间戳
-                        let last_modified = datatime_to_i64(obj.last_modified());
-
-                        let extension = PathBuf::from(key)
-                            .extension()
-                            .map(|ext| ext.to_string_lossy().to_string());
-
-                        self.process_object(
-                            tx,
-                            producer_id,
-                            key,
-                            size,
-                            last_modified,
-                            extension,
-                            include_tags,
-                            skip_filter,
-                            match_expressions,
-                            exclude_expressions,
-                            total_file_count,
-                        )
-                        .await?;
-
-                        processed_files += 1;
-                    }
-                }
-                debug!(
-                    "[S3 Producer {}] 本页处理 {} 个文件，全局累计文件数: {}",
-                    producer_id,
-                    processed_files,
-                    total_file_count.load(Ordering::Relaxed)
-                );
-
-                // 检查是否还有更多页面
-                continuation_token = response
-                    .next_continuation_token()
-                    .map(std::string::ToString::to_string);
-                if continuation_token.is_none() {
-                    debug!(
-                        "[S3 Producer {}] 处理前缀 {} 完成，没有更多页面",
-                        producer_id, prefix
-                    );
-                    break; // 没有更多数据了，退出循环
-                }
-                debug!(
-                    "[S3 Producer {}] 将继续处理前缀 {} 的下一页",
-                    producer_id, prefix
-                );
-            }
-
-            debug!(
-                "[S3 Producer {}] 完成前缀 {} 的处理，全局累计处理 {} 个文件",
-                producer_id,
-                prefix,
-                total_file_count.load(Ordering::Relaxed),
-            );
-            Ok(())
+            self.process_unversioned_prefix(
+                &prefix,
+                current_depth,
+                skip_filter,
+                package_remaining,
+                &runtime,
+            )
+            .await
         }
     }
 
@@ -3558,6 +3535,243 @@ impl S3Storage {
     // walkdir_2: 目录分页 + NDX 编号 + 并行预读
     // ============================================================
 
+    fn append_common_prefixes(
+        &self,
+        prefixes: &[CommonPrefix],
+        ctx: &crate::dir_tree::ReadContext,
+        subdirs: &mut Vec<crate::dir_tree::SubdirEntry>,
+    ) {
+        for prefix in prefixes {
+            let Some(prefix) = prefix.prefix() else {
+                continue;
+            };
+            let relative_path = self.calculate_relative_path(prefix);
+            let clean_path = relative_path.trim_end_matches('/');
+            if clean_path.is_empty() {
+                continue;
+            }
+            let (dir_name, _) = Self::get_file_info(clean_path);
+            let (skip, continue_scan, need_filter) = if ctx.apply_filter {
+                should_skip(
+                    ctx.match_expr.as_ref().as_ref(),
+                    ctx.exclude_expr.as_ref().as_ref(),
+                    FilterInput {
+                        file_name: Some(&dir_name),
+                        file_path: Some(clean_path),
+                        file_type: Some("dir"),
+                        ..FilterInput::default()
+                    },
+                )
+            } else {
+                (false, true, false)
+            };
+            if skip && !continue_scan {
+                continue;
+            }
+            let entry = build_s3_entry!(
+                dir_name, clean_path, None, 0, 0, None, None, true, false, None, true,
+            );
+            subdirs.push(crate::dir_tree::SubdirEntry {
+                entry: Arc::new(entry),
+                visible: !skip,
+                need_filter,
+            });
+        }
+    }
+
+    async fn read_unversioned_dir(
+        &self,
+        prefix_key: &str,
+        ctx: &crate::dir_tree::ReadContext,
+        files: &mut Vec<Arc<EntryEnum>>,
+        subdirs: &mut Vec<crate::dir_tree::SubdirEntry>,
+        errors: &mut Vec<String>,
+    ) {
+        let mut continuation_token = None;
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket_name)
+                .prefix(prefix_key)
+                .delimiter("/");
+            if let Some(token) = &continuation_token {
+                request = request.continuation_token(token);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    errors.push(format!("list_objects_v2 failed: {error:?}"));
+                    break;
+                }
+            };
+            self.append_common_prefixes(response.common_prefixes(), ctx, subdirs);
+            for object in response.contents() {
+                let Some(key) = object.key() else {
+                    continue;
+                };
+                if key == prefix_key || key.ends_with('/') {
+                    continue;
+                }
+                let relative_path = self.calculate_relative_path(key);
+                let (file_name, extension) = Self::get_file_info(relative_path);
+                let size = object
+                    .size()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or(0);
+                let modified = datatime_to_i64(object.last_modified());
+                if Self::read_file_is_filtered(
+                    ctx,
+                    &file_name,
+                    relative_path,
+                    extension.as_deref(),
+                    size,
+                    modified,
+                ) {
+                    continue;
+                }
+                let tags = if ctx.include_tags {
+                    self.get_object_tags(&self.bucket_name, key, None)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                files.push(Arc::new(build_s3_entry!(
+                    file_name,
+                    relative_path,
+                    extension,
+                    size,
+                    modified,
+                    tags,
+                    None,
+                    true,
+                    false,
+                    None,
+                    false,
+                )));
+            }
+            continuation_token = response.next_continuation_token().map(str::to_string);
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+    }
+
+    fn read_file_is_filtered(
+        ctx: &crate::dir_tree::ReadContext,
+        file_name: &str,
+        relative_path: &str,
+        extension: Option<&str>,
+        size: u64,
+        modified: i64,
+    ) -> bool {
+        ctx.apply_filter
+            && should_skip(
+                ctx.match_expr.as_ref().as_ref(),
+                ctx.exclude_expr.as_ref().as_ref(),
+                FilterInput {
+                    file_name: Some(file_name),
+                    file_path: Some(relative_path),
+                    file_type: Some("file"),
+                    modified_epoch: Some(crate::time_util::nanos_to_secs(modified)),
+                    size: Some(size),
+                    extension: extension.or(Some("")),
+                },
+            )
+            .0
+    }
+
+    fn group_read_versions(
+        versions: &[ObjectVersion],
+        markers: &[DeleteMarkerEntry],
+    ) -> (ReadVersionGroups, ReadDeleteMarkers) {
+        let mut grouped_versions = HashMap::new();
+        for version in versions {
+            if let Some(key) = version.key() {
+                grouped_versions
+                    .entry(key.to_string())
+                    .or_insert_with(Vec::new)
+                    .push((datatime_to_i64(version.last_modified()), version.clone()));
+            }
+        }
+        let mut grouped_markers = HashMap::new();
+        for marker in markers {
+            if let Some(key) = marker.key() {
+                grouped_markers
+                    .entry(key.to_string())
+                    .or_insert_with(Vec::new)
+                    .push(marker.clone());
+            }
+        }
+        (grouped_versions, grouped_markers)
+    }
+
+    async fn append_object_versions(
+        &self,
+        key: &str,
+        mut versions: Vec<(i64, ObjectVersion)>,
+        markers: Option<&Vec<DeleteMarkerEntry>>,
+        ctx: &crate::dir_tree::ReadContext,
+        files: &mut Vec<Arc<EntryEnum>>,
+    ) {
+        let latest_marker = markers
+            .into_iter()
+            .flatten()
+            .filter_map(|marker| marker.last_modified())
+            .map(|time| datatime_to_i64(Some(time)))
+            .max()
+            .unwrap_or(0);
+        let latest_version = versions.iter().map(|(time, _)| *time).max().unwrap_or(0);
+        if latest_marker > latest_version {
+            return;
+        }
+        versions.sort_by_key(|(time, _)| *time);
+        let version_count = u32::try_from(versions.len()).unwrap_or(u32::MAX);
+        let latest_index = versions.len().saturating_sub(1);
+        for (index, (modified, version)) in versions.into_iter().enumerate() {
+            let relative_path = self.calculate_relative_path(key);
+            let (file_name, extension) = Self::get_file_info(relative_path);
+            let size = version
+                .size()
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0);
+            if Self::read_file_is_filtered(
+                ctx,
+                &file_name,
+                relative_path,
+                extension.as_deref(),
+                size,
+                modified,
+            ) {
+                continue;
+            }
+            let version_id = version.version_id().map(str::to_string);
+            let tags = if ctx.include_tags {
+                self.get_object_tags(&self.bucket_name, key, version_id.as_deref())
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            files.push(Arc::new(build_s3_entry!(
+                file_name,
+                relative_path,
+                extension,
+                size,
+                modified,
+                tags,
+                version_id.as_deref(),
+                index == latest_index,
+                false,
+                Some(version_count),
+                false,
+            )));
+        }
+    }
+
     /// 读取单个 S3 "目录"（prefix），返回排序后的 files + subdirs。
     pub(crate) async fn read_dir_sorted(
         &self,
@@ -3608,148 +3822,24 @@ impl S3Storage {
                     }
                 };
 
-                // common_prefixes → subdirs（带 filter 三元组处理）
-                for cp in response.common_prefixes() {
-                    if let Some(pfx) = cp.prefix() {
-                        let rel = self.calculate_relative_path(pfx);
-                        let clean_rel = rel.trim_end_matches('/');
-                        let (dir_name, _) = Self::get_file_info(clean_rel);
+                self.append_common_prefixes(response.common_prefixes(), ctx, &mut subdirs);
 
-                        let (skip_entry, continue_scan, need_submatch) = if ctx.apply_filter {
-                            should_skip(
-                                ctx.match_expr.as_ref().as_ref(),
-                                ctx.exclude_expr.as_ref().as_ref(),
-                                FilterInput {
-                                    file_name: Some(&dir_name),
-                                    file_path: Some(clean_rel),
-                                    file_type: Some("dir"),
-                                    ..FilterInput::default()
-                                },
-                            )
-                        } else {
-                            (false, true, false)
-                        };
-
-                        if skip_entry && !continue_scan {
-                            continue;
-                        }
-
-                        let entry = Self::build_entry(
-                            dir_name, clean_rel, None, 0, 0, None, None, true, false, None, true,
-                        );
-                        subdirs.push(SubdirEntry {
-                            entry: Arc::new(entry),
-                            visible: !skip_entry,
-                            need_filter: need_submatch,
-                        });
-                    }
-                }
-
-                // versions → 分组处理
-                let mut version_groups: HashMap<String, Vec<(i64, ObjectVersion)>> = HashMap::new();
-                for ver in response.versions() {
-                    if let Some(key) = ver.key() {
-                        let ts = datatime_to_i64(ver.last_modified());
-                        version_groups
-                            .entry(key.to_string())
-                            .or_default()
-                            .push((ts, ver.clone()));
-                    }
-                }
-
-                // delete markers
-                let mut delete_markers: HashMap<String, Vec<DeleteMarkerEntry>> = HashMap::new();
-                for dm in response.delete_markers() {
-                    if let Some(key) = dm.key() {
-                        delete_markers
-                            .entry(key.to_string())
-                            .or_default()
-                            .push(dm.clone());
-                    }
-                }
+                let (version_groups, delete_markers) =
+                    Self::group_read_versions(response.versions(), response.delete_markers());
 
                 // 处理每个 object 的版本
-                for (key, mut versions) in version_groups {
+                for (key, versions) in version_groups {
                     if key == prefix_key {
                         continue;
                     }
-                    // 检查最新版本是否是 delete marker
-                    if let Some(dms) = delete_markers.get(&key)
-                        && !dms.is_empty()
-                    {
-                        // 如果有 delete marker，检查是否是最新的
-                        let latest_dm_ts: i64 = dms
-                            .iter()
-                            .filter_map(|d| d.last_modified())
-                            .map(|t| datatime_to_i64(Some(t)))
-                            .max()
-                            .unwrap_or(0);
-                        let latest_ver_ts = versions.iter().map(|(ts, _)| *ts).max().unwrap_or(0);
-                        if latest_dm_ts > latest_ver_ts {
-                            continue; // 已删除，跳过
-                        }
-                    }
-
-                    versions.sort_by(|a, b| a.0.cmp(&b.0)); // 按 mtime 升序：旧版本在前（NDX 小）
-                    let version_count = versions.len() as u32;
-                    let last_idx = versions.len().saturating_sub(1);
-
-                    for (i, (ts, ver)) in versions.into_iter().enumerate() {
-                        let rel = self.calculate_relative_path(ver.key().unwrap_or_default());
-                        let (file_name, extension) = Self::get_file_info(rel);
-                        let is_latest = i == last_idx; // 最后一个（mtime 最大）是 latest
-                        let vid = ver.version_id().map(std::string::ToString::to_string);
-                        let size = ver.size().unwrap_or(0) as u64;
-
-                        // filter（仅 apply_filter 时）
-                        let (skip, _, _) = if ctx.apply_filter {
-                            should_skip(
-                                ctx.match_expr.as_ref().as_ref(),
-                                ctx.exclude_expr.as_ref().as_ref(),
-                                FilterInput {
-                                    file_name: Some(&file_name),
-                                    file_path: Some(rel),
-                                    file_type: Some("file"),
-                                    modified_epoch: Some(crate::time_util::nanos_to_secs(ts)),
-                                    size: Some(size),
-                                    extension: extension.as_deref().or(Some("")),
-                                },
-                            )
-                        } else {
-                            (false, true, false)
-                        };
-                        if skip {
-                            continue;
-                        }
-
-                        let tags = if ctx.include_tags {
-                            self.get_object_tags(
-                                &self.bucket_name,
-                                ver.key().unwrap_or_default(),
-                                vid.as_deref(),
-                            )
-                            .await
-                            .ok()
-                            .flatten()
-                        } else {
-                            None
-                        };
-
-                        let entry = Self::build_entry(
-                            file_name,
-                            rel,
-                            extension,
-                            size,
-                            ts,
-                            tags,
-                            vid.as_deref(),
-                            is_latest,
-                            false,
-                            Some(version_count),
-                            false,
-                        );
-                        files.push(Arc::new(entry));
-                    }
+                    self.append_object_versions(
+                        &key,
+                        versions,
+                        delete_markers.get(&key),
+                        ctx,
+                        &mut files,
+                    )
+                    .await;
                 }
 
                 key_marker = response
@@ -3763,126 +3853,8 @@ impl S3Storage {
                 }
             }
         } else {
-            // === 非 Versioned 模式 ===
-            let mut continuation_token: Option<String> = None;
-
-            loop {
-                let mut request = self
-                    .client
-                    .list_objects_v2()
-                    .bucket(&self.bucket_name)
-                    .prefix(&prefix_key)
-                    .delimiter("/");
-
-                if let Some(token) = &continuation_token {
-                    request = request.continuation_token(token);
-                }
-
-                let response = match request.send().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        errors.push(format!("list_objects_v2 failed: {e:?}"));
-                        break;
-                    }
-                };
-
-                // common_prefixes → subdirs（带 filter 三元组处理）
-                for cp in response.common_prefixes() {
-                    if let Some(pfx) = cp.prefix() {
-                        let rel = self.calculate_relative_path(pfx);
-                        let clean_rel = rel.trim_end_matches('/');
-                        if clean_rel.is_empty() {
-                            continue;
-                        }
-                        let (dir_name, _) = Self::get_file_info(clean_rel);
-
-                        let (skip_entry, continue_scan, need_submatch) = if ctx.apply_filter {
-                            should_skip(
-                                ctx.match_expr.as_ref().as_ref(),
-                                ctx.exclude_expr.as_ref().as_ref(),
-                                FilterInput {
-                                    file_name: Some(&dir_name),
-                                    file_path: Some(clean_rel),
-                                    file_type: Some("dir"),
-                                    ..FilterInput::default()
-                                },
-                            )
-                        } else {
-                            (false, true, false)
-                        };
-
-                        if skip_entry && !continue_scan {
-                            continue;
-                        }
-
-                        let entry = Self::build_entry(
-                            dir_name, clean_rel, None, 0, 0, None, None, true, false, None, true,
-                        );
-                        subdirs.push(SubdirEntry {
-                            entry: Arc::new(entry),
-                            visible: !skip_entry,
-                            need_filter: need_submatch,
-                        });
-                    }
-                }
-
-                // contents → files
-                for obj in response.contents() {
-                    if let Some(key) = obj.key() {
-                        if key == prefix_key || key.ends_with('/') {
-                            continue;
-                        }
-
-                        let rel = self.calculate_relative_path(key);
-                        let (file_name, extension) = Self::get_file_info(rel);
-                        let size = obj.size().unwrap_or(0) as u64;
-                        let mtime = datatime_to_i64(obj.last_modified());
-
-                        // filter
-                        let (skip, _, _) = if ctx.apply_filter {
-                            should_skip(
-                                ctx.match_expr.as_ref().as_ref(),
-                                ctx.exclude_expr.as_ref().as_ref(),
-                                FilterInput {
-                                    file_name: Some(&file_name),
-                                    file_path: Some(rel),
-                                    file_type: Some("file"),
-                                    modified_epoch: Some(crate::time_util::nanos_to_secs(mtime)),
-                                    size: Some(size),
-                                    extension: extension.as_deref().or(Some("")),
-                                },
-                            )
-                        } else {
-                            (false, true, false)
-                        };
-                        if skip {
-                            continue;
-                        }
-
-                        let tags = if ctx.include_tags {
-                            self.get_object_tags(&self.bucket_name, key, None)
-                                .await
-                                .ok()
-                                .flatten()
-                        } else {
-                            None
-                        };
-
-                        let entry = Self::build_entry(
-                            file_name, rel, extension, size, mtime, tags, None, true, false, None,
-                            false,
-                        );
-                        files.push(Arc::new(entry));
-                    }
-                }
-
-                continuation_token = response
-                    .next_continuation_token()
-                    .map(std::string::ToString::to_string);
-                if continuation_token.is_none() {
-                    break;
-                }
-            }
+            self.read_unversioned_dir(&prefix_key, ctx, &mut files, &mut subdirs, &mut errors)
+                .await;
         }
 
         // 排序：files 按 name（多版本已按 mtime 排好，同名不同版本保持 mtime 序）
@@ -3899,8 +3871,11 @@ impl S3Storage {
     }
 
     /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
-    #[allow(clippy::unused_async)]
-    pub async fn walkdir_2(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
+    pub fn walkdir_2(
         &self,
         sub_path: Option<&str>,
         depth: Option<usize>,
@@ -3993,14 +3968,211 @@ fn missing_from_committed(committed: &[(u64, u64)], size: u64) -> Vec<(u64, u64)
 }
 
 /// 创建S3存储实例
+///
+/// # Errors
+///
+/// Returns an error when the requested storage operation cannot be completed.
 pub async fn create_s3_storage(url: &str, block_size: Option<u64>) -> Result<StorageEnum> {
     let s3_storage = S3Storage::new(url, block_size).await?;
     Ok(StorageEnum::S3(s3_storage))
 }
 
+// ============================================================================
+// 公共细粒度 multipart 上传 API
+// ============================================================================
+//
+// 上层应用（HSM copytool / 自定义同步流水线）需要 part-level 控制：
+//   - 自己决定何时切 part（边界对齐文件 chunk、cancel 触发等）
+//   - 每 part 完成后单独上报进度
+//   - 失败时只重传该 part 而不是整个对象
+//   - cancel 时 abort 而不是 complete
+//
+// 现存的 `S3Storage::write_multipart_data` 一次性吞整流，进度回调粗，
+// 也无法在 part 失败时单独重试。这套 wrapper 把已有的内部 helper
+// （`create_multipart_upload` / `upload_part_with_stream` /
+// `complete_multipart_upload` / `abort_multipart_upload`）暴露成一个
+// 类型安全 + RAII 的 high-level 接口。
+
+/// 重新导出 aws-sdk 的 `CompletedPart`，便于直接调用 low-level
+/// `complete_multipart_upload(key, upload_id, parts)` 的用户构造 parts。
+pub use aws_sdk_s3::types::CompletedPart as S3CompletedPart;
+
+/// 一次进行中的 S3 multipart upload。
+///
+/// 通过 [`S3Storage::multipart_begin`] 创建，必须以 [`MultipartUpload::complete`]
+/// 或 [`MultipartUpload::abort`] 之一收尾。
+///
+/// # Drop 行为
+///
+/// 如果未显式收尾即被 drop（例如 panic、提前 `?` early-return）：
+/// - 记录 `error!` 日志（带 key + `upload_id），便于事后排查`
+/// - 若当前线程持有 tokio runtime handle，会 `spawn` 一次 best-effort
+///   abort 请求（不 await，仅减少 S3 上的"僵尸"未完成上传——这在 AWS
+///   上会按 storage 计费）
+/// - **无 runtime 时不会自动清理**，调用方应当用 [`abort`](Self::abort)
+///   显式收尾
+///
+/// # 示例
+///
+/// ```ignore
+/// use bytes::Bytes;
+/// use storage_v2::S3Storage;
+///
+/// let mut up = s3.multipart_begin("path/to/large.bin", None).await?;
+/// for (i, chunk) in chunks.into_iter().enumerate() {
+///     up.upload_part(i as i32 + 1, chunk).await?;        // 1-based
+///     // 上层在这里上报进度 / 检查 cancel token / ...
+/// }
+/// up.complete().await?;
+/// ```
+pub struct MultipartUpload<'s> {
+    storage: &'s S3Storage,
+    key: String,
+    upload_id: String,
+    parts: Vec<CompletedPart>,
+    /// `true` after `complete` / `abort` finished (success or fail).
+    /// Drop guard reads this to decide whether to fire the failsafe abort.
+    finished: bool,
+}
+
+impl MultipartUpload<'_> {
+    /// 已分配的 `upload_id（S3` 端的句柄）。
+    #[must_use]
+    pub fn upload_id(&self) -> &str {
+        &self.upload_id
+    }
+
+    /// 对象的 key。
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// 已成功上传的 part 数量。
+    #[must_use]
+    pub fn part_count(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// 上传一个 part。
+    ///
+    /// - `part_number`: 1-based，必须严格递增（S3 要求）。本方法不强制校验，
+    ///   由调用方保证；乱序在 [`complete`](Self::complete) 时会按 `part_number`
+    ///   重新排序。
+    /// - `data`: part 内容。S3 规则：除最后一段外，每 part ≥ 5 MiB；上限 5 GiB。
+    ///   本方法不做 ≥ 5 MiB 检查（在某些场景如最后一段更小是合法的）。
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
+    pub async fn upload_part(&mut self, part_number: i32, data: Bytes) -> Result<()> {
+        let size = data.len() as u64;
+        let etag = self
+            .storage
+            .upload_part_with_stream(&self.key, &self.upload_id, part_number, vec![data], size)
+            .await?;
+        self.parts.push(
+            CompletedPart::builder()
+                .part_number(part_number)
+                .e_tag(etag)
+                .build(),
+        );
+        Ok(())
+    }
+
+    /// 完成 multipart upload，对象在 S3 上变为可见。
+    ///
+    /// 在调用前会按 `part_number` 升序排序，避免乱序上传导致 S3 拒绝。
+    /// 调用成功或失败后 RAII 守卫不再触发。
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
+    pub async fn complete(mut self) -> Result<()> {
+        self.parts.sort_by_key(|p| p.part_number().unwrap_or(0));
+        let res = self
+            .storage
+            .complete_multipart_upload(&self.key, &self.upload_id, &self.parts)
+            .await
+            .map(|_| ());
+        self.finished = true;
+        res
+    }
+
+    /// 主动放弃这次上传（cancel / 错误恢复时调用）。
+    ///
+    /// 即便本调用失败，也会标记 `finished` 防止 Drop 重复 abort——失败路径
+    /// 留给调用方记录。
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
+    pub async fn abort(mut self) -> Result<()> {
+        let res = self
+            .storage
+            .abort_multipart_upload(&self.key, &self.upload_id)
+            .await;
+        self.finished = true;
+        res
+    }
+}
+
+impl Drop for MultipartUpload<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        error!(
+            "MultipartUpload dropped without complete/abort: key={}, upload_id={}, \
+             {} parts uploaded — leaking S3 multipart resources (you will be billed)",
+            self.key,
+            self.upload_id,
+            self.parts.len(),
+        );
+
+        // Best-effort failsafe: if there's a tokio runtime handle, spawn an abort.
+        // Cannot await in Drop, so we clone the necessary state and fire-and-forget.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let storage = self.storage.clone();
+            let key = std::mem::take(&mut self.key);
+            let upload_id = std::mem::take(&mut self.upload_id);
+            handle.spawn(async move {
+                if let Err(e) = storage.abort_multipart_upload(&key, &upload_id).await {
+                    error!("best-effort multipart abort failed: key={key}, upload_id={upload_id}, err={e}");
+                }
+            });
+        }
+    }
+}
+
+impl S3Storage {
+    /// 开始一次 multipart upload，返回 RAII 句柄。
+    ///
+    /// 详见 [`MultipartUpload`] 的文档。
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
+    pub async fn multipart_begin(
+        &self,
+        key: &str,
+        tags: Option<&Vec<Tag>>,
+    ) -> Result<MultipartUpload<'_>> {
+        let upload_id = self.create_multipart_upload(key, tags).await?;
+        Ok(MultipartUpload {
+            storage: self,
+            key: key.to_string(),
+            upload_id,
+            parts: Vec::new(),
+            finished: false,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AssertTestValue;
     use std::time::Duration;
 
     const MIB: u64 = 1024 * 1024;
@@ -4069,7 +4241,7 @@ mod tests {
         };
         let storage = S3Storage::new(&url, None)
             .await
-            .expect("connect to S3 rename test storage");
+            .assert_value("connect to S3 rename test storage");
         let source_relative = "multipart rename source %?# 中文.bin";
         let destination_relative = "multipart renamed %?# 中文.bin";
         let source_key = storage.build_full_key(source_relative);
@@ -4088,7 +4260,7 @@ mod tests {
             .body(aws_sdk_s3::primitives::ByteStream::from(body.clone()))
             .send()
             .await
-            .expect("seed multipart rename source");
+            .assert_value("seed multipart rename source");
 
         storage
             .rename_with_limits(
@@ -4099,7 +4271,7 @@ mod tests {
                 5 * 1024 * 1024,
             )
             .await
-            .expect("multipart rename");
+            .assert_value("multipart rename");
 
         let destination = storage
             .client
@@ -4108,7 +4280,7 @@ mod tests {
             .key(&destination_key)
             .send()
             .await
-            .expect("get multipart rename destination");
+            .assert_value("get multipart rename destination");
         assert_eq!(
             destination.content_type(),
             Some("application/x-data-mover-test")
@@ -4125,7 +4297,7 @@ mod tests {
                 .body
                 .collect()
                 .await
-                .expect("read multipart rename destination")
+                .assert_value("read multipart rename destination")
                 .into_bytes(),
             body
         );
@@ -4133,7 +4305,7 @@ mod tests {
         let tags = storage
             .get_object_tags(&storage.bucket_name, &destination_key, None)
             .await
-            .expect("get multipart rename destination tags")
+            .assert_value("get multipart rename destination tags")
             .unwrap_or_default();
         assert!(
             tags.iter()
@@ -4238,8 +4410,15 @@ mod tests {
 
     #[test]
     fn multipart_part_number_enforces_s3_bounds() {
-        assert_eq!(multipart_part_number(0).unwrap(), 1);
-        assert_eq!(multipart_part_number(MAX_UPLOAD_PARTS - 1).unwrap(), 10_000);
+        assert_eq!(
+            multipart_part_number(0).assert_value("test value should be present"),
+            1
+        );
+        assert_eq!(
+            multipart_part_number(MAX_UPLOAD_PARTS - 1)
+                .assert_value("test value should be present"),
+            10_000
+        );
         assert!(multipart_part_number(MAX_UPLOAD_PARTS).is_err());
         assert!(multipart_part_number(u64::MAX).is_err());
     }
@@ -4248,7 +4427,7 @@ mod tests {
     fn test_parse_s3_url_special_chars_in_secret_key() {
         // SK 包含 + 和 /（Base64 编码常见字符）
         let url = "s3://X9HENFMKAC41MT11J14H:AsxLb0dEhjxXIlKfVnCSVhM+hjO80rbhRmPLp/UK@bucket.192.168.3.210:10444";
-        let parsed = parse_s3_url(url).unwrap();
+        let parsed = parse_s3_url(url).assert_value("test value should be present");
         let ParsedS3Url {
             access_key: ak,
             secret_key: sk,
@@ -4283,7 +4462,7 @@ mod tests {
             storage_type,
             compatibility,
             ..
-        } = parse_s3_url(url).unwrap();
+        } = parse_s3_url(url).assert_value("test value should be present");
         assert_eq!(ak, "myak");
         assert_eq!(sk, "mysk");
         assert_eq!(bucket, "mybucket");
@@ -4306,7 +4485,7 @@ mod tests {
             storage_type,
             compatibility,
             ..
-        } = parse_s3_url(url).unwrap();
+        } = parse_s3_url(url).assert_value("test value should be present");
         assert_eq!(ak, "ak");
         assert_eq!(sk, "sk");
         assert_eq!(bucket, "bucket");
@@ -4329,7 +4508,7 @@ mod tests {
             storage_type,
             tls_skip_verify: tls_skip,
             compatibility,
-        } = parse_s3_url(url).unwrap();
+        } = parse_s3_url(url).assert_value("test value should be present");
         assert_eq!(ak, "ak");
         assert_eq!(sk, "sk");
         assert_eq!(bucket, "bucket");
@@ -4349,7 +4528,7 @@ mod tests {
             tls_skip_verify: tls_skip,
             compatibility,
             ..
-        } = parse_s3_url(url).unwrap();
+        } = parse_s3_url(url).assert_value("test value should be present");
         assert_eq!(endpoint, "https://storagegrid.example:443");
         assert!(tls_skip);
         assert_eq!(compatibility, S3Compatibility::StorageGrid);
@@ -4366,7 +4545,7 @@ mod tests {
             tls_skip_verify: tls_skip,
             compatibility,
             ..
-        } = parse_s3_url(url).unwrap();
+        } = parse_s3_url(url).assert_value("test value should be present");
         assert_eq!(endpoint, "http://dxn.example:8184");
         assert_eq!(prefix, "prefix/");
         assert_eq!(host, "dxn.example");
@@ -4379,7 +4558,8 @@ mod tests {
             tls_skip_verify: tls_skip,
             compatibility,
             ..
-        } = parse_s3_url("s3+dxn+https://ak:sk@bucket.dxn.example:443/prefix").unwrap();
+        } = parse_s3_url("s3+dxn+https://ak:sk@bucket.dxn.example:443/prefix")
+            .assert_value("test value should be present");
         assert_eq!(endpoint, "https://dxn.example:443");
         assert!(tls_skip);
         assert_eq!(compatibility, S3Compatibility::Dxn);
@@ -4396,7 +4576,7 @@ mod tests {
             prefix,
             host,
             ..
-        } = parse_s3_url(url).unwrap();
+        } = parse_s3_url(url).assert_value("test value should be present");
         assert_eq!(ak, "ak");
         assert_eq!(sk, "sk");
         assert_eq!(bucket, "bucket");
@@ -4420,14 +4600,16 @@ mod tests {
     #[test]
     fn test_parse_s3_url_deep_prefix() {
         let url = "s3://ak:sk@bucket.host.com:9000/a/b/c";
-        let ParsedS3Url { prefix, .. } = parse_s3_url(url).unwrap();
+        let ParsedS3Url { prefix, .. } =
+            parse_s3_url(url).assert_value("test value should be present");
         assert_eq!(prefix, "a/b/c/");
     }
 
     #[test]
     fn test_parse_s3_url_prefix_trailing_slash() {
         let url = "s3://ak:sk@bucket.host.com:9000/prefix/";
-        let ParsedS3Url { prefix, .. } = parse_s3_url(url).unwrap();
+        let ParsedS3Url { prefix, .. } =
+            parse_s3_url(url).assert_value("test value should be present");
         assert_eq!(prefix, "prefix/");
     }
 
@@ -4440,7 +4622,7 @@ mod tests {
         let ParsedS3Url {
             tls_skip_verify: tls_skip,
             ..
-        } = parse_s3_url(url).unwrap();
+        } = parse_s3_url(url).assert_value("test value should be present");
         assert!(tls_skip);
     }
 
@@ -4451,7 +4633,7 @@ mod tests {
         let ParsedS3Url {
             tls_skip_verify: tls_skip,
             ..
-        } = parse_s3_url(url).unwrap();
+        } = parse_s3_url(url).assert_value("test value should be present");
         assert!(!tls_skip);
     }
 
@@ -4459,7 +4641,8 @@ mod tests {
     fn test_parse_s3_endpoint_url_https_skips_tls() {
         // s3+https scheme 自动启用跳过验证
         let url = "s3+https://ak:sk@host.com:9000";
-        let (_, _, endpoint, tls_skip, compatibility) = parse_s3_endpoint_url(url).unwrap();
+        let (_, _, endpoint, tls_skip, compatibility) =
+            parse_s3_endpoint_url(url).assert_value("test value should be present");
         assert!(tls_skip);
         assert!(endpoint.starts_with("https://"));
         assert_eq!(compatibility, S3Compatibility::Standard);
@@ -4469,7 +4652,8 @@ mod tests {
     fn test_parse_s3_endpoint_url_http_no_tls_skip() {
         // s3:// (http) 不跳过验证
         let url = "s3://ak:sk@host.com:9000";
-        let (_, _, _, tls_skip, compatibility) = parse_s3_endpoint_url(url).unwrap();
+        let (_, _, _, tls_skip, compatibility) =
+            parse_s3_endpoint_url(url).assert_value("test value should be present");
         assert!(!tls_skip);
         assert_eq!(compatibility, S3Compatibility::Standard);
     }
@@ -4477,13 +4661,15 @@ mod tests {
     #[test]
     fn test_parse_storagegrid_endpoint_urls() {
         let (_, _, endpoint, tls_skip, compatibility) =
-            parse_s3_endpoint_url("s3+sg://ak:sk@storagegrid.example:8082").unwrap();
+            parse_s3_endpoint_url("s3+sg://ak:sk@storagegrid.example:8082")
+                .assert_value("test value should be present");
         assert_eq!(endpoint, "http://storagegrid.example:8082");
         assert!(!tls_skip);
         assert_eq!(compatibility, S3Compatibility::StorageGrid);
 
         let (_, _, endpoint, tls_skip, compatibility) =
-            parse_s3_endpoint_url("s3+sg+https://ak:sk@storagegrid.example:443").unwrap();
+            parse_s3_endpoint_url("s3+sg+https://ak:sk@storagegrid.example:443")
+                .assert_value("test value should be present");
         assert_eq!(endpoint, "https://storagegrid.example:443");
         assert!(tls_skip);
         assert_eq!(compatibility, S3Compatibility::StorageGrid);
@@ -4492,13 +4678,15 @@ mod tests {
     #[test]
     fn test_parse_dxn_endpoint_urls() {
         let (_, _, endpoint, tls_skip, compatibility) =
-            parse_s3_endpoint_url("s3+dxn://ak:sk@dxn.example:8184").unwrap();
+            parse_s3_endpoint_url("s3+dxn://ak:sk@dxn.example:8184")
+                .assert_value("test value should be present");
         assert_eq!(endpoint, "http://dxn.example:8184");
         assert!(!tls_skip);
         assert_eq!(compatibility, S3Compatibility::Dxn);
 
         let (_, _, endpoint, tls_skip, compatibility) =
-            parse_s3_endpoint_url("s3+dxn+https://ak:sk@dxn.example:443").unwrap();
+            parse_s3_endpoint_url("s3+dxn+https://ak:sk@dxn.example:443")
+                .assert_value("test value should be present");
         assert_eq!(endpoint, "https://dxn.example:443");
         assert!(tls_skip);
         assert_eq!(compatibility, S3Compatibility::Dxn);
@@ -4527,7 +4715,7 @@ mod tests {
             storage_type: StorageType::S3,
             endpoint: "http://localhost:9000".to_string(),
             bucket_name: "test-bucket".to_string(),
-            prefix: prefix.map(|s| s.to_string()),
+            prefix: prefix.map(std::string::ToString::to_string),
             client,
             hcp_client: None,
             block_size: DEFAULT_BLOCK_SIZE,
@@ -4718,178 +4906,5 @@ mod tests {
         }
         // Give the spawned best-effort abort a chance to run + fail quietly.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
-
-// ============================================================================
-// 公共细粒度 multipart 上传 API
-// ============================================================================
-//
-// 上层应用（HSM copytool / 自定义同步流水线）需要 part-level 控制：
-//   - 自己决定何时切 part（边界对齐文件 chunk、cancel 触发等）
-//   - 每 part 完成后单独上报进度
-//   - 失败时只重传该 part 而不是整个对象
-//   - cancel 时 abort 而不是 complete
-//
-// 现存的 `S3Storage::write_multipart_data` 一次性吞整流，进度回调粗，
-// 也无法在 part 失败时单独重试。这套 wrapper 把已有的内部 helper
-// （`create_multipart_upload` / `upload_part_with_stream` /
-// `complete_multipart_upload` / `abort_multipart_upload`）暴露成一个
-// 类型安全 + RAII 的 high-level 接口。
-
-/// 重新导出 aws-sdk 的 `CompletedPart`，便于直接调用 low-level
-/// `complete_multipart_upload(key, upload_id, parts)` 的用户构造 parts。
-pub use aws_sdk_s3::types::CompletedPart as S3CompletedPart;
-
-/// 一次进行中的 S3 multipart upload。
-///
-/// 通过 [`S3Storage::multipart_begin`] 创建，必须以 [`MultipartUpload::complete`]
-/// 或 [`MultipartUpload::abort`] 之一收尾。
-///
-/// # Drop 行为
-///
-/// 如果未显式收尾即被 drop（例如 panic、提前 `?` early-return）：
-/// - 记录 `error!` 日志（带 key + upload_id），便于事后排查
-/// - 若当前线程持有 tokio runtime handle，会 `spawn` 一次 best-effort
-///   abort 请求（不 await，仅减少 S3 上的"僵尸"未完成上传——这在 AWS
-///   上会按 storage 计费）
-/// - **无 runtime 时不会自动清理**，调用方应当用 [`abort`](Self::abort)
-///   显式收尾
-///
-/// # 示例
-///
-/// ```ignore
-/// use bytes::Bytes;
-/// use storage_v2::S3Storage;
-///
-/// let mut up = s3.multipart_begin("path/to/large.bin", None).await?;
-/// for (i, chunk) in chunks.into_iter().enumerate() {
-///     up.upload_part(i as i32 + 1, chunk).await?;        // 1-based
-///     // 上层在这里上报进度 / 检查 cancel token / ...
-/// }
-/// up.complete().await?;
-/// ```
-pub struct MultipartUpload<'s> {
-    storage: &'s S3Storage,
-    key: String,
-    upload_id: String,
-    parts: Vec<CompletedPart>,
-    /// `true` after `complete` / `abort` finished (success or fail).
-    /// Drop guard reads this to decide whether to fire the failsafe abort.
-    finished: bool,
-}
-
-impl<'s> MultipartUpload<'s> {
-    /// 已分配的 upload_id（S3 端的句柄）。
-    pub fn upload_id(&self) -> &str {
-        &self.upload_id
-    }
-
-    /// 对象的 key。
-    pub fn key(&self) -> &str {
-        &self.key
-    }
-
-    /// 已成功上传的 part 数量。
-    pub fn part_count(&self) -> usize {
-        self.parts.len()
-    }
-
-    /// 上传一个 part。
-    ///
-    /// - `part_number`: 1-based，必须严格递增（S3 要求）。本方法不强制校验，
-    ///   由调用方保证；乱序在 [`complete`](Self::complete) 时会按 part_number
-    ///   重新排序。
-    /// - `data`: part 内容。S3 规则：除最后一段外，每 part ≥ 5 MiB；上限 5 GiB。
-    ///   本方法不做 ≥ 5 MiB 检查（在某些场景如最后一段更小是合法的）。
-    pub async fn upload_part(&mut self, part_number: i32, data: Bytes) -> Result<()> {
-        let size = data.len() as u64;
-        let etag = self
-            .storage
-            .upload_part_with_stream(&self.key, &self.upload_id, part_number, vec![data], size)
-            .await?;
-        self.parts.push(
-            CompletedPart::builder()
-                .part_number(part_number)
-                .e_tag(etag)
-                .build(),
-        );
-        Ok(())
-    }
-
-    /// 完成 multipart upload，对象在 S3 上变为可见。
-    ///
-    /// 在调用前会按 part_number 升序排序，避免乱序上传导致 S3 拒绝。
-    /// 调用成功或失败后 RAII 守卫不再触发。
-    pub async fn complete(mut self) -> Result<()> {
-        self.parts.sort_by_key(|p| p.part_number().unwrap_or(0));
-        let res = self
-            .storage
-            .complete_multipart_upload(&self.key, &self.upload_id, &self.parts)
-            .await
-            .map(|_| ());
-        self.finished = true;
-        res
-    }
-
-    /// 主动放弃这次上传（cancel / 错误恢复时调用）。
-    ///
-    /// 即便本调用失败，也会标记 `finished` 防止 Drop 重复 abort——失败路径
-    /// 留给调用方记录。
-    pub async fn abort(mut self) -> Result<()> {
-        let res = self
-            .storage
-            .abort_multipart_upload(&self.key, &self.upload_id)
-            .await;
-        self.finished = true;
-        res
-    }
-}
-
-impl Drop for MultipartUpload<'_> {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        error!(
-            "MultipartUpload dropped without complete/abort: key={}, upload_id={}, \
-             {} parts uploaded — leaking S3 multipart resources (you will be billed)",
-            self.key,
-            self.upload_id,
-            self.parts.len(),
-        );
-
-        // Best-effort failsafe: if there's a tokio runtime handle, spawn an abort.
-        // Cannot await in Drop, so we clone the necessary state and fire-and-forget.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let storage = self.storage.clone();
-            let key = std::mem::take(&mut self.key);
-            let upload_id = std::mem::take(&mut self.upload_id);
-            handle.spawn(async move {
-                if let Err(e) = storage.abort_multipart_upload(&key, &upload_id).await {
-                    error!("best-effort multipart abort failed: key={key}, upload_id={upload_id}, err={e}");
-                }
-            });
-        }
-    }
-}
-
-impl S3Storage {
-    /// 开始一次 multipart upload，返回 RAII 句柄。
-    ///
-    /// 详见 [`MultipartUpload`] 的文档。
-    pub async fn multipart_begin(
-        &self,
-        key: &str,
-        tags: Option<&Vec<Tag>>,
-    ) -> Result<MultipartUpload<'_>> {
-        let upload_id = self.create_multipart_upload(key, tags).await?;
-        Ok(MultipartUpload {
-            storage: self,
-            key: key.to_string(),
-            upload_id,
-            parts: Vec::new(),
-            finished: false,
-        })
     }
 }

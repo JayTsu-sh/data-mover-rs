@@ -8,34 +8,65 @@ use std::sync::{Arc, Mutex};
 
 use data_mover::{CommitCallback, ResumeContext, StorageEnum, create_storage};
 
+trait AssertTestValue {
+    type Value;
+    fn assert_value(self, context: &str) -> Self::Value;
+}
+
+impl<T, E: std::fmt::Debug> AssertTestValue for Result<T, E> {
+    type Value = T;
+
+    fn assert_value(self, context: &str) -> T {
+        match self {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error:?}"),
+        }
+    }
+}
+
 const BLOCK: u64 = 64 * 1024;
 const SIZE: usize = 256 * 1024; // 4 blocks → multi-chunk
+type CommittedRanges = Arc<Mutex<Vec<(u64, u64)>>>;
 
 async fn reset_dirs(src: &str, dst: &str) {
     let _ = tokio::fs::remove_dir_all(src).await;
     let _ = tokio::fs::remove_dir_all(dst).await;
-    tokio::fs::create_dir_all(src).await.unwrap();
-    tokio::fs::create_dir_all(dst).await.unwrap();
+    tokio::fs::create_dir_all(src)
+        .await
+        .assert_value("test value should be present");
+    tokio::fs::create_dir_all(dst)
+        .await
+        .assert_value("test value should be present");
 }
 
 /// 写一个内容可验证的 blob：byte i = (i % 251)。
 async fn write_pattern(path: &str, size: usize) {
     use tokio::io::AsyncWriteExt;
-    let mut f = tokio::fs::File::create(path).await.unwrap();
-    let buf: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-    f.write_all(&buf).await.unwrap();
-    f.flush().await.unwrap();
+    let mut f = tokio::fs::File::create(path)
+        .await
+        .assert_value("test value should be present");
+    let buf: Vec<u8> = (0..size)
+        .map(|i| u8::try_from(i % 251).unwrap_or_default())
+        .collect();
+    f.write_all(&buf)
+        .await
+        .assert_value("test value should be present");
+    f.flush().await.assert_value("test value should be present");
 }
 
 fn pattern_vec(size: usize) -> Vec<u8> {
-    (0..size).map(|i| (i % 251) as u8).collect()
+    (0..size)
+        .map(|i| u8::try_from(i % 251).unwrap_or_default())
+        .collect()
 }
 
-fn collecting_callback() -> (CommitCallback, Arc<Mutex<Vec<(u64, u64)>>>) {
+fn collecting_callback() -> (CommitCallback, CommittedRanges) {
     let committed: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
     let c = committed.clone();
     let cb: CommitCallback = Arc::new(move |offset, len| {
-        c.lock().unwrap().push((offset, len));
+        c.lock()
+            .assert_value("test value should be present")
+            .push((offset, len));
     });
     (cb, committed)
 }
@@ -47,9 +78,16 @@ async fn resumable_fresh_full_copy() {
     reset_dirs(src_dir, dst_dir).await;
     write_pattern(&format!("{src_dir}/blob.bin"), SIZE).await;
 
-    let src = create_storage(src_dir, Some(BLOCK), false).await.unwrap();
-    let dst = create_storage(dst_dir, Some(BLOCK), true).await.unwrap();
-    let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
+    let src = create_storage(src_dir, Some(BLOCK), false)
+        .await
+        .assert_value("test value should be present");
+    let dst = create_storage(dst_dir, Some(BLOCK), true)
+        .await
+        .assert_value("test value should be present");
+    let entry = src
+        .get_metadata(Path::new("blob.bin"))
+        .await
+        .assert_value("test value should be present");
 
     let (cb, committed) = collecting_callback();
     let counter = Arc::new(AtomicU64::new(0));
@@ -63,19 +101,20 @@ async fn resumable_fresh_full_copy() {
         &src,
         &dst,
         &entry,
-        None,
-        false,
-        true,
-        Some(counter.clone()),
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            bytes_counter: Some(counter.clone()),
+            ..Default::default()
+        },
         resume,
     )
     .await
-    .expect("resumable full copy");
+    .assert_value("resumable full copy");
 
     // 最终文件存在且内容正确
     let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
         .await
-        .unwrap();
+        .assert_value("test value should be present");
     assert_eq!(out, pattern_vec(SIZE), "final content mismatch");
     // .part 已 rename 消失
     assert!(
@@ -87,7 +126,7 @@ async fn resumable_fresh_full_copy() {
     // 回调上报 (offset, len)，累计 len == 文件大小
     let total: u64 = committed
         .lock()
-        .unwrap()
+        .assert_value("test value should be present")
         .iter()
         .map(|(_offset, len)| len)
         .sum();
@@ -107,11 +146,18 @@ async fn resumable_continues_from_partial_part() {
     let full = pattern_vec(SIZE);
     tokio::fs::write(format!("{dst_dir}/blob.bin.terrasync-part"), &full[..half])
         .await
-        .unwrap();
+        .assert_value("test value should be present");
 
-    let src = create_storage(src_dir, Some(BLOCK), false).await.unwrap();
-    let dst = create_storage(dst_dir, Some(BLOCK), true).await.unwrap();
-    let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
+    let src = create_storage(src_dir, Some(BLOCK), false)
+        .await
+        .assert_value("test value should be present");
+    let dst = create_storage(dst_dir, Some(BLOCK), true)
+        .await
+        .assert_value("test value should be present");
+    let entry = src
+        .get_metadata(Path::new("blob.bin"))
+        .await
+        .assert_value("test value should be present");
 
     let (cb, _committed) = collecting_callback();
     let counter = Arc::new(AtomicU64::new(0));
@@ -126,19 +172,20 @@ async fn resumable_continues_from_partial_part() {
         &src,
         &dst,
         &entry,
-        None,
-        false,
-        true,
-        Some(counter.clone()),
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            bytes_counter: Some(counter.clone()),
+            ..Default::default()
+        },
         resume,
     )
     .await
-    .expect("resumable continue copy");
+    .assert_value("resumable continue copy");
 
     // 最终文件 = 完整内容（前半保留 + 后半续写）
     let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
         .await
-        .unwrap();
+        .assert_value("test value should be present");
     assert_eq!(out, full, "resumed file content mismatch");
     // 只写了后半段
     assert_eq!(
@@ -160,11 +207,18 @@ async fn resumable_truncates_leftover_tail() {
     longer.extend(std::iter::repeat_n(0xFFu8, 4096));
     tokio::fs::write(format!("{dst_dir}/blob.bin.terrasync-part"), &longer)
         .await
-        .unwrap();
+        .assert_value("test value should be present");
 
-    let src = create_storage(src_dir, Some(BLOCK), false).await.unwrap();
-    let dst = create_storage(dst_dir, Some(BLOCK), true).await.unwrap();
-    let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
+    let src = create_storage(src_dir, Some(BLOCK), false)
+        .await
+        .assert_value("test value should be present");
+    let dst = create_storage(dst_dir, Some(BLOCK), true)
+        .await
+        .assert_value("test value should be present");
+    let entry = src
+        .get_metadata(Path::new("blob.bin"))
+        .await
+        .assert_value("test value should be present");
 
     let (cb, _committed) = collecting_callback();
     let resume = ResumeContext {
@@ -173,13 +227,22 @@ async fn resumable_truncates_leftover_tail() {
         on_committed: cb,
     };
 
-    StorageEnum::copy_file_resumable(&src, &dst, &entry, None, false, true, None, resume)
-        .await
-        .expect("resumable truncate copy");
+    StorageEnum::copy_file_resumable(
+        &src,
+        &dst,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+        resume,
+    )
+    .await
+    .assert_value("resumable truncate copy");
 
     let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
         .await
-        .unwrap();
+        .assert_value("test value should be present");
     assert_eq!(
         out.len(),
         SIZE,

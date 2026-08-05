@@ -9,6 +9,7 @@ use arc_swap::ArcSwap;
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
+use num_traits::ToPrimitive;
 use tracing::debug;
 
 // 内部模块
@@ -46,7 +47,12 @@ impl QosStats {
     pub fn actual_bandwidth_mibps(&self) -> f64 {
         let elapsed = self.start_time.elapsed().as_secs_f64();
         if elapsed > 0.0 {
-            self.total_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0) / elapsed
+            let bytes = self
+                .total_bytes
+                .load(Ordering::Relaxed)
+                .to_f64()
+                .unwrap_or(f64::MAX);
+            bytes / (1024.0 * 1024.0) / elapsed
         } else {
             0.0
         }
@@ -56,7 +62,12 @@ impl QosStats {
     pub fn actual_iops(&self) -> f64 {
         let elapsed = self.start_time.elapsed().as_secs_f64();
         if elapsed > 0.0 {
-            self.total_iops.load(Ordering::Relaxed) as f64 / elapsed
+            let operations = self
+                .total_iops
+                .load(Ordering::Relaxed)
+                .to_f64()
+                .unwrap_or(f64::MAX);
+            operations / elapsed
         } else {
             0.0
         }
@@ -112,14 +123,21 @@ fn build_bandwidth_limiter_inner(base_rate_bps: u64, burst_bytes: u64) -> Result
 
     // 基准速率换算为 cells/sec（1 cell = 1 KB）
     let cells_per_sec = (base_rate_bps / 1024).max(1);
-    let rate = NonZeroU32::new(cells_per_sec as u32).ok_or_else(|| {
-        StorageError::ConfigError("带宽速率过小，换算后为0 cells/sec".to_string())
-    })?;
+    let rate =
+        NonZeroU32::new(u32::try_from(cells_per_sec).map_err(|_| {
+            StorageError::ConfigError("带宽速率超过 limiter 支持的范围".to_string())
+        })?)
+        .ok_or_else(|| {
+            StorageError::ConfigError("带宽速率过小，换算后为0 cells/sec".to_string())
+        })?;
 
     // burst 容量（cells）
     let burst_cells = (burst_bytes / 1024).max(1);
-    let burst = NonZeroU32::new(burst_cells as u32)
-        .ok_or_else(|| StorageError::ConfigError("burst 过小，换算后为 0 cells".to_string()))?;
+    let burst = NonZeroU32::new(
+        u32::try_from(burst_cells)
+            .map_err(|_| StorageError::ConfigError("burst 超过 limiter 支持的范围".to_string()))?,
+    )
+    .ok_or_else(|| StorageError::ConfigError("burst 过小，换算后为 0 cells".to_string()))?;
 
     debug!(
         "[QoS] 带宽限制: base={}B/s ({}cells/s), burst={}B ({}cells)",
@@ -132,8 +150,24 @@ fn build_bandwidth_limiter_inner(base_rate_bps: u64, burst_bytes: u64) -> Result
 
 fn build_bandwidth_limiter(bandwidth_str: &str, peak_rate: f32) -> Result<BandwidthLimiter> {
     let base_rate_bps = parse_bandwidth_string(bandwidth_str)?;
-    let burst_bytes = (base_rate_bps as f64 * f64::from(peak_rate)).round() as u64;
+    let base_rate = base_rate_bps
+        .to_f64()
+        .ok_or_else(|| StorageError::ConfigError("带宽速率无法转换为浮点数".to_string()))?;
+    let burst_bytes = checked_rounded_u64(base_rate * f64::from(peak_rate), "burst")?;
     build_bandwidth_limiter_inner(base_rate_bps, burst_bytes)
+}
+
+fn checked_rounded_u64(value: f64, field: &str) -> Result<u64> {
+    if !value.is_finite() || value.is_sign_negative() {
+        return Err(StorageError::ConfigError(format!(
+            "{field} 必须是 0..={} 范围内的有限数值",
+            u64::MAX
+        )));
+    }
+    value
+        .round()
+        .to_u64()
+        .ok_or_else(|| StorageError::ConfigError(format!("{field} 超过 u64 支持的范围")))
 }
 
 /// 显式 burst 版本：用基准速率字符串 + burst 字节数。
@@ -176,6 +210,10 @@ impl QosManager {
     ///   [`try_new_with_burst`](Self::try_new_with_burst) 指定一个小 burst
     ///   （例如等于一次 IO 的 chunk 大小）。
     /// - `iops`: IOPS 限制，None 则不限制
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn try_new(bandwidth: Option<&str>, peak_rate: f32, iops: Option<u32>) -> Result<Self> {
         let bandwidth_limiter = match bandwidth {
             Some(bw) => {
@@ -227,6 +265,10 @@ impl QosManager {
     /// // 16 MiB 文件至少需要 ~1.875s 完成（首块 1 MiB 立即过，剩余 15 MiB 走 8 MiB/s）。
     /// let qos = QosManager::try_new_with_burst("8MiB/s", 1024 * 1024, None)?;
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn try_new_with_burst(
         bandwidth: &str,
         burst_bytes: u64,
@@ -248,7 +290,15 @@ impl QosManager {
         let derived_peak_rate = if base_rate_bps == 0 {
             1.0
         } else {
-            (burst_bytes as f64 / base_rate_bps as f64) as f32
+            let burst = burst_bytes
+                .to_f64()
+                .ok_or_else(|| StorageError::ConfigError("burst 无法转换为浮点数".to_string()))?;
+            let base = base_rate_bps
+                .to_f64()
+                .ok_or_else(|| StorageError::ConfigError("带宽速率无法转换为浮点数".to_string()))?;
+            (burst / base).to_f32().ok_or_else(|| {
+                StorageError::ConfigError("peak rate 超过 f32 支持的范围".to_string())
+            })?
         };
         let config = QosConfig {
             bandwidth: Some(bandwidth.to_string()),
@@ -312,6 +362,10 @@ impl QosManager {
     }
 
     /// 热更新带宽限制（迁移任务不中断）
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn update_bandwidth(&self, new_rate: &str, peak_rate: f32) -> Result<()> {
         let new_limiter = build_bandwidth_limiter(new_rate, peak_rate)?;
         if let Some(bw) = &self.bandwidth_limiter {
@@ -326,6 +380,10 @@ impl QosManager {
     }
 
     /// 热更新 IOPS 限制
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn update_iops(&self, new_iops: u32) -> Result<()> {
         let new_limiter = build_iops_limiter(new_iops)?;
         if let Some(iops) = &self.iops_limiter {
@@ -339,16 +397,19 @@ impl QosManager {
     }
 
     /// 获取 `QoS` 统计信息
+    #[must_use]
     pub fn stats(&self) -> &QosStats {
         &self.stats
     }
 
     /// 获取当前配置
+    #[must_use]
     pub fn config(&self) -> Arc<QosConfig> {
         self.config.load_full()
     }
 
     /// 是否启用了任何 `QoS` 限制
+    #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.bandwidth_limiter.is_some() || self.iops_limiter.is_some()
     }
@@ -376,6 +437,7 @@ impl QosManager {
 ///
 /// # 返回值
 /// - 均分后的带宽字符串（如 "536870912b/s"），或 None
+#[must_use]
 pub fn divide_bandwidth(bandwidth: &Option<String>, divisor: usize) -> Option<String> {
     let bw_str = bandwidth.as_ref()?;
     let total_bps = parse_bandwidth_string(bw_str).ok()?;
@@ -384,6 +446,10 @@ pub fn divide_bandwidth(bandwidth: &Option<String>, divisor: usize) -> Option<St
 }
 
 // 解析带宽字符串，支持格式如"1GiB/s"或"200MiB/s"，大小写不敏感，数字和单位之间可带空格
+///
+/// # Errors
+///
+/// Returns an error when the requested storage operation cannot be completed.
 pub fn parse_bandwidth_string(bandwidth: &str) -> Result<u64> {
     // 去除字符串中的空格，转为小写以便统一处理
     let bandwidth = bandwidth.replace(' ', "").to_lowercase();
@@ -421,7 +487,8 @@ pub fn parse_bandwidth_string(bandwidth: &str) -> Result<u64> {
             };
 
             // 计算最终的bps值
-            let bytes_per_second = (number * f64::from(*multiplier)).round() as u64;
+            let bytes_per_second =
+                checked_rounded_u64(number * f64::from(*multiplier), "bandwidth")?;
             return Ok(bytes_per_second);
         }
     }
@@ -441,6 +508,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::AssertTestValue;
 
     #[test]
     fn test_bandwidth_string_parsing() {
@@ -454,22 +522,29 @@ mod tests {
             ("200MB/s", 200 * 1024 * 1024),
             ("1GiB", 1024 * 1024 * 1024),
             ("200MiB", 200 * 1024 * 1024),
-            ("1000000000", 1000000000),
+            ("1000000000", 1_000_000_000),
             ("1024", 1024),
         ];
 
-        for (input, expected) in test_cases.iter() {
-            let result = parse_bandwidth_string(input).unwrap();
-            assert_eq!(result, *expected, "解析'{}'失败", input);
+        for (input, expected) in &test_cases {
+            let result = parse_bandwidth_string(input).assert_value("test value should be present");
+            assert_eq!(result, *expected, "解析'{input}'失败");
         }
 
         // 测试错误情况
         let invalid_cases = ["invalid", "123XYZ", "abc GiB/s"];
 
-        for input in invalid_cases.iter() {
+        for input in &invalid_cases {
             let result = parse_bandwidth_string(input);
-            assert!(result.is_err(), "解析无效字符串'{}'应该失败", input);
+            assert!(result.is_err(), "解析无效字符串'{input}'应该失败");
         }
+    }
+
+    #[test]
+    fn bandwidth_rejects_negative_and_non_finite_values() {
+        assert!(parse_bandwidth_string("-1MiB/s").is_err());
+        assert!(parse_bandwidth_string("NaNMiB/s").is_err());
+        assert!(parse_bandwidth_string("infMiB/s").is_err());
     }
 
     #[test]
@@ -484,7 +559,8 @@ mod tests {
     #[tokio::test]
     async fn test_qos_manager_bandwidth_only() {
         // 测试仅带宽限制的 QosManager
-        let qos = QosManager::try_new(Some("10MiB/s"), 2.0, None).unwrap();
+        let qos = QosManager::try_new(Some("10MiB/s"), 2.0, None)
+            .assert_value("test value should be present");
         assert!(qos.is_enabled());
 
         // 执行几次 acquire，确保不会 panic 或死锁
@@ -499,7 +575,8 @@ mod tests {
     #[tokio::test]
     async fn test_qos_manager_iops_only() {
         // 测试仅 IOPS 限制的 QosManager
-        let qos = QosManager::try_new(None, 1.0, Some(1000)).unwrap();
+        let qos =
+            QosManager::try_new(None, 1.0, Some(1000)).assert_value("test value should be present");
         assert!(qos.is_enabled());
 
         // 执行几次 acquire_iops
@@ -514,7 +591,8 @@ mod tests {
     #[tokio::test]
     async fn test_qos_manager_both() {
         // 测试同时启用带宽和 IOPS 限制
-        let qos = QosManager::try_new(Some("100MiB/s"), 2.0, Some(5000)).unwrap();
+        let qos = QosManager::try_new(Some("100MiB/s"), 2.0, Some(5000))
+            .assert_value("test value should be present");
         assert!(qos.is_enabled());
 
         // 使用 acquire 同时限流
@@ -530,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn test_qos_manager_disabled() {
         // 测试不启用任何 QoS
-        let qos = QosManager::try_new(None, 1.0, None).unwrap();
+        let qos = QosManager::try_new(None, 1.0, None).assert_value("test value should be present");
         assert!(!qos.is_enabled());
 
         // acquire 应该立即返回
@@ -545,7 +623,8 @@ mod tests {
     #[tokio::test]
     async fn test_qos_manager_clone() {
         // 测试 clone 后共享状态
-        let qos = QosManager::try_new(Some("100MiB/s"), 2.0, Some(1000)).unwrap();
+        let qos = QosManager::try_new(Some("100MiB/s"), 2.0, Some(1000))
+            .assert_value("test value should be present");
         let qos2 = qos.clone();
 
         qos.acquire_bandwidth(1024).await;
@@ -559,16 +638,19 @@ mod tests {
     #[tokio::test]
     async fn test_qos_manager_hot_update() {
         // 测试热更新
-        let qos = QosManager::try_new(Some("100MiB/s"), 2.0, Some(1000)).unwrap();
+        let qos = QosManager::try_new(Some("100MiB/s"), 2.0, Some(1000))
+            .assert_value("test value should be present");
 
         // 更新带宽
-        qos.update_bandwidth("200MiB/s", 3.0).unwrap();
+        qos.update_bandwidth("200MiB/s", 3.0)
+            .assert_value("test value should be present");
         let config = qos.config();
         assert_eq!(config.bandwidth.as_deref(), Some("200MiB/s"));
-        assert_eq!(config.peak_rate, 3.0);
+        assert!((config.peak_rate - 3.0).abs() < f32::EPSILON);
 
         // 更新 IOPS
-        qos.update_iops(2000).unwrap();
+        qos.update_iops(2000)
+            .assert_value("test value should be present");
         let config = qos.config();
         assert_eq!(config.iops, Some(2000));
 
@@ -581,7 +663,8 @@ mod tests {
     async fn test_rate_limiting_effectiveness() {
         // 测试限速是否真正生效
         // 设置很低的速率：10 KB/s，然后尝试传输 50 KB
-        let qos = QosManager::try_new(Some("10KiB/s"), 1.0, None).unwrap();
+        let qos = QosManager::try_new(Some("10KiB/s"), 1.0, None)
+            .assert_value("test value should be present");
 
         let start = Instant::now();
 
@@ -595,8 +678,7 @@ mod tests {
         // burst=1 意味着第一次 acquire 可能立即通过，但后续需要等待
         assert!(
             elapsed >= Duration::from_millis(500),
-            "限速应该生效，实际耗时 {:?}",
-            elapsed
+            "限速应该生效，实际耗时 {elapsed:?}"
         );
 
         qos.shutdown();
@@ -614,7 +696,8 @@ mod tests {
     /// 这个行为，证明它不是 bug，而是 burst 容量决定的设计选择。
     #[tokio::test]
     async fn test_try_new_default_burst_bursty_behavior() {
-        let qos = QosManager::try_new(Some("8MiB/s"), 1.0, None).unwrap();
+        let qos = QosManager::try_new(Some("8MiB/s"), 1.0, None)
+            .assert_value("test value should be present");
         let start = Instant::now();
         // 整 8 MiB 一次性 acquire — 全在 burst 窗口内，应当瞬时完成
         qos.acquire_bandwidth(8 * 1024 * 1024).await;
@@ -631,7 +714,8 @@ mod tests {
     /// （首块 1 MiB 立即过，剩 7 块每块等 0.125 s 重生）。
     #[tokio::test]
     async fn test_try_new_with_burst_enforces_average_rate() {
-        let qos = QosManager::try_new_with_burst("8MiB/s", 1024 * 1024, None).unwrap();
+        let qos = QosManager::try_new_with_burst("8MiB/s", 1024 * 1024, None)
+            .assert_value("test value should be present");
         let start = Instant::now();
         for _ in 0..8 {
             qos.acquire_bandwidth(1024 * 1024).await;
@@ -656,7 +740,8 @@ mod tests {
     /// `try_new_with_burst` 不带 IOPS 限制时也能正常工作。
     #[tokio::test]
     async fn test_try_new_with_burst_iops_optional() {
-        let qos = QosManager::try_new_with_burst("100MiB/s", 4 * 1024 * 1024, Some(500)).unwrap();
+        let qos = QosManager::try_new_with_burst("100MiB/s", 4 * 1024 * 1024, Some(500))
+            .assert_value("test value should be present");
         qos.acquire(64 * 1024).await;
         let cfg = qos.config();
         assert_eq!(cfg.iops, Some(500));

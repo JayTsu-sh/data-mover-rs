@@ -15,7 +15,7 @@ use futures::stream::FuturesOrdered;
 use moka::sync::Cache;
 // nfs_rs 错误类型，用于直接匹配 error code
 use nfs_rs::NfsError;
-use nfs_rs::{ExportEntry, Mount, OPEN_READ, OPEN_WRITE, Time};
+use nfs_rs::{Attr, ExportEntry, Mount, OPEN_READ, OPEN_WRITE, Time};
 use path_clean::PathClean;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -32,21 +32,38 @@ use crate::{
     StorageEntryMessage, WalkDirAsyncIterator,
 };
 
+type NfsWalkTask = (String, Bytes, usize, bool, Option<usize>);
+
+struct NfsWalkRuntime<'a> {
+    tx: &'a async_channel::Sender<StorageEntryMessage>,
+    scheduler: &'a crate::walk_scheduler::WorkerContext<NfsWalkTask>,
+    match_expr: &'a Arc<Option<FilterExpression>>,
+    exclude_expr: &'a Arc<Option<FilterExpression>>,
+    max_depth: usize,
+    total_file_count: &'a Arc<AtomicUsize>,
+    packaged: bool,
+    package_depth: usize,
+}
+
 /// 将 `nfs_rs::Time` 转换为纳秒时间戳
 fn time_to_i64(time: Time) -> i64 {
     crate::time_util::combine_secs_nanos(i64::from(time.seconds), time.nseconds)
 }
 
 /// 将纳秒时间戳转换为 `nfs_rs::Time`
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-fn i64_to_time(timestamp: i64) -> Time {
-    Time {
-        seconds: crate::time_util::nanos_to_secs(timestamp) as u32,
+fn i64_to_time(timestamp: i64) -> Result<Time> {
+    let seconds = u32::try_from(crate::time_util::nanos_to_secs(timestamp)).map_err(|_| {
+        StorageError::OperationError(format!(
+            "NFS timestamp is outside the supported 1970..=2106 range: {timestamp}ns"
+        ))
+    })?;
+    Ok(Time {
+        seconds,
         nseconds: crate::time_util::nanos_subsec(timestamp),
-    }
+    })
 }
 
-/// NFSv4 可选富化字段。
+/// `NFSv4` 可选富化字段。
 ///
 /// 不同站点对 ACL/owner/xattrs 的填充程度不同：
 /// - `lookup` 仅有 attrs 中携带的 ACL/owner，没有 xattrs；
@@ -74,7 +91,7 @@ impl Default for NfsEnrich {
 }
 
 impl NfsEnrich {
-    /// 从 `attr` 抽取 ACL/owner/owner_group（空字符串视为 None），xattrs 留 None。
+    /// 从 `attr` 抽取 `ACL/owner/owner_group（空字符串视为` None），xattrs 留 None。
     /// 供 `lookup` / `iterative_walkdir` 使用；后者再链 `with_xattrs`。
     pub fn from_attrs(attr: &nfs_rs::Attr) -> Self {
         Self {
@@ -147,9 +164,9 @@ impl DepthAwareExpiry {
     /// 根据路径深度返回对应的 TTI
     fn tti_for_depth(depth: usize) -> Duration {
         match depth {
-            0..=2 => Duration::from_secs(7200), // 浅层：2h
-            3..=4 => Duration::from_secs(600),  // 中层：10min
-            _ => Duration::from_secs(10),       // 深层：10s
+            0..=2 => Duration::from_hours(2), // 浅层：2h
+            3..=4 => Duration::from_mins(10), // 中层：10min
+            _ => Duration::from_secs(10),     // 深层：10s
         }
     }
 
@@ -201,8 +218,8 @@ static GLOBAL_CACHE: LazyLock<Cache<(PathBuf, Bytes), Bytes>> = LazyLock::new(||
         .build()
 });
 
-/// nfs_url → server_id 映射表。
-/// 相同 NFS 端点的所有 worker 共享同一 server_id，从而共享 GLOBAL_CACHE 条目，
+/// `nfs_url` → `server_id` 映射表。
+/// 相同 NFS 端点的所有 worker 共享同一 `server_id，从而共享` `GLOBAL_CACHE` 条目，
 /// 消除重复 LOOKUP RPC。
 static SERVER_ID_REGISTRY: LazyLock<DashMap<String, u64>> = LazyLock::new(DashMap::new);
 
@@ -235,12 +252,12 @@ const MAX_MOUNT_PORT_ATTEMPTS: u32 = 3;
 /// mount 内层重试的初始等待时间（毫秒），指数退避：1s、2s
 const MOUNT_PORT_RETRY_INITIAL_MS: u64 = 1000;
 
-/// 检测"目标不存在"错误（NFS3ERR_NOENT / NFS4ERR_NOENT / MNT3ERR_NOENT / Io NotFound）。
+/// `检测"目标不存在"错误（NFS3ERR_NOENT` / `NFS4ERR_NOENT` / `MNT3ERR_NOENT` / Io `NotFound`）。
 ///
 /// 用途：
 /// - `delete_file`：转换为 `FileNotFound`，由调用方决定是否按幂等成功处理
 /// - `delete_dir`：幂等成功（删除已不存在的目录不报错）
-/// - lookup_fh：转换为 `DirectoryNotFound`/`FileNotFound` 返回给上层
+/// - `lookup_fh：转换为` `DirectoryNotFound`/`FileNotFound` 返回给上层
 ///
 /// 不参与 stale-handle 重试（语义上 NOENT 是终态，不是 cache 失效）。
 fn is_nfs_noent(err: &NfsError) -> bool {
@@ -253,10 +270,10 @@ fn is_nfs_noent(err: &NfsError) -> bool {
     }
 }
 
-/// 检测"陈旧文件句柄"错误（NFS3ERR_STALE / NFS3ERR_BADHANDLE / NFS4ERR_STALE / NFS4ERR_BADHANDLE）。
+/// `检测"陈旧文件句柄"错误（NFS3ERR_STALE` / `NFS3ERR_BADHANDLE` / `NFS4ERR_STALE` / `NFS4ERR_BADHANDLE`）。
 ///
 /// 含义：缓存的 file handle 在服务端已失效（如服务端重启、export 重新生成）。
-/// 与 NFS4ERR_DELAY 区分：DELAY 是"服务端繁忙，稍后重试"，由 nfs-rs 层
+/// 与 `NFS4ERR_DELAY` 区分：DELAY 是"服务端繁忙，稍后重试"，由 nfs-rs 层
 /// （`compound()` 中带退避的重试循环）处理，不在 data-mover 层重复处理。
 fn is_stale_handle(err: &NfsError) -> bool {
     match err {
@@ -272,7 +289,7 @@ fn is_stale_handle(err: &NfsError) -> bool {
     }
 }
 
-/// 检测"服务端繁忙"错误（NFS4ERR_DELAY）。
+/// `检测"服务端繁忙"错误（NFS4ERR_DELAY`）。
 ///
 /// 含义：服务端暂时繁忙，请稍后重试。nfs-rs 层在 `compound()` 中已对单条 RPC
 /// 做了带 jitter 的退避重试。本函数用于 **流式/迭代式操作**（如 `readdirplus`）
@@ -281,13 +298,13 @@ fn is_stale_handle(err: &NfsError) -> bool {
 /// （否则会出现统计计数偏低的 silent data loss）。
 ///
 /// 与 [`is_stale_handle`] 的恢复策略不同：
-/// - stale handle: 刷新 root_fh + 清除路径缓存
+/// - stale handle: 刷新 `root_fh` + 清除路径缓存
 /// - server busy: 单纯延时再试（nfs-rs 已做，data-mover 在流操作中再试）
 fn is_server_busy(err: &NfsError) -> bool {
     matches!(err, NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_DELAY))
 }
 
-/// 应用层 NFS4ERR_DELAY 退避：2s/4s/8s 指数延时，最多 3 次（额外 ~14s 容错）。
+/// 应用层 `NFS4ERR_DELAY` 退避：2s/4s/8s 指数延时，最多 3 次（额外 ~14s 容错）。
 ///
 /// nfs-rs 在 `compound()` 中已对单条 RPC 做带 jitter 的退避重试（~75s）。
 /// 仍 DELAY 说明服务端持续高负载（如批量并发 create 后期）；
@@ -305,7 +322,7 @@ async fn backoff_server_busy(op: &str, target: &(dyn std::fmt::Debug + Send + Sy
     tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
 }
 
-/// 检测调用方可通过"清除路径缓存 + 刷新 root_fh + 重试"恢复的错误。
+/// 检测调用方可通过"清除路径缓存 + 刷新 `root_fh` + 重试"恢复的错误。
 ///
 /// 包含：
 /// - **STALE / BADHANDLE**：文件句柄陈旧（[`is_stale_handle`]），刷新后可恢复。
@@ -314,7 +331,7 @@ async fn backoff_server_busy(op: &str, target: &(dyn std::fmt::Debug + Send + Sy
 ///   B 此时 LOOKUP 会拿到 NOENT；清除缓存重试可恢复。
 ///   若重试耗尽仍 NOENT，调用方应转换为 `FileNotFound`/`DirectoryNotFound`。
 ///
-/// **不包含 NFS4ERR_DELAY**：DELAY 由 nfs-rs 层（`compound()` 退避重试）处理，
+/// **不包含 `NFS4ERR_DELAY`**：DELAY 由 nfs-rs 层（`compound()` 退避重试）处理，
 /// data-mover 层若再叠加重试只会延长等待，无额外收益。
 fn is_retryable_with_invalidation(err: &NfsError) -> bool {
     is_stale_handle(err) || is_nfs_noent(err)
@@ -372,7 +389,7 @@ impl NFSFileHandle {
 }
 
 /// NFS 的 `ChunkSink`：复用 `NFSStorage::write`（单次 WRITE RPC 原语），
-/// FILE_SYNC 稳定级写返回即落盘，`flush` 是 no-op。
+/// `FILE_SYNC` 稳定级写返回即落盘，`flush` 是 no-op。
 pub(crate) struct NfsChunkSink {
     storage: NFSStorage,
     handle: NFSFileHandle,
@@ -414,10 +431,11 @@ const DEFAULT_BLOCK_SIZE: u64 = MB; // 1MB
 /// 4 深度理论 ≈ 196MB/s，已超过 1GbE 链路上限。与 cifs/s3 的深度对齐。
 /// v3 无并发上限；v4.1 受 session slot（64）约束，远未触及。
 const DEFAULT_READ_INFLIGHT: usize = 4;
+type NfsReadFuture = Pin<Box<dyn Future<Output = (u64, u32, nfs_rs::Result<Bytes>)> + Send>>;
 
 /// 单文件写入的同时在飞请求数（inflight write pipeline 深度）。
 ///
-/// WRITE 以 FILE_SYNC 稳定级发送，server 落盘延迟比 READ 高且抖动大
+/// WRITE 以 `FILE_SYNC` 稳定级发送，server 落盘延迟比 READ 高且抖动大
 /// （WAFL/ext4 journal flush），取读侧 2 倍做余量：8×64KB = 512KB 在飞，
 /// 可吸收 ~4.6ms 的 server 端抖动。8 ≪ v4.1 的 64 slots，SlotTable 满时
 /// nfs-rs 内部排队等待而非报错，退化平滑。
@@ -544,16 +562,15 @@ impl NFSStorage {
     /// # 返回值
     /// - `Ok((nfs_url, root_dir))`：解析成功，返回标准 NFS URL 和根目录路径
     /// - `Err(StorageError)`：解析失败，返回错误信息
-    #[allow(clippy::similar_names)]
     fn parse_nfs_url(url: &str) -> Result<(String, String)> {
-        let parsed_url = url.strip_prefix("nfs://").ok_or_else(|| {
+        let without_scheme = url.strip_prefix("nfs://").ok_or_else(|| {
             let msg = format!("Invalid NFS URL format: {url}");
             error!("{msg}");
             StorageError::OperationError(msg)
         })?;
 
-        let (server_part, raw_path_part) = parsed_url.split_once('/').map_or_else(
-            || (parsed_url.to_string(), "/".to_string()),
+        let (server_part, raw_path_part) = without_scheme.split_once('/').map_or_else(
+            || (without_scheme.to_string(), "/".to_string()),
             |(s, p)| (s.to_string(), format!("/{p}")),
         );
 
@@ -568,8 +585,8 @@ impl NFSStorage {
         );
 
         // 检查query_part是否包含uid和gid参数
-        let has_uid = query_part.contains("uid=");
-        let has_gid = query_part.contains("gid=");
+        let query_has_user = query_part.contains("uid=");
+        let query_has_group = query_part.contains("gid=");
 
         let query_suffix = if query_part.is_empty() {
             // 如果query_part为空，直接添加uid=0&gid=。主要考虑到windows环境下的使用便利性。
@@ -577,10 +594,10 @@ impl NFSStorage {
         } else {
             // 如果query_part不为空，检查是否需要添加uid和gid
             let mut parts = query_part.split('&').collect::<Vec<&str>>();
-            if !has_uid {
+            if !query_has_user {
                 parts.push("uid=0");
             }
-            if !has_gid {
+            if !query_has_group {
                 parts.push("gid=0");
             }
             format!("?{}", parts.join("&"))
@@ -692,12 +709,20 @@ impl NFSStorage {
     /// # 返回值
     /// - `Ok(Vec<ExportEntry>)`：查询成功，返回导出列表
     /// - `Err(StorageError)`：查询失败，返回错误信息
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn list_exports(host: &str) -> Result<Vec<ExportEntry>> {
         nfs_rs::list_exports(host)
             .await
             .map_err(|e| StorageError::NfsError(format!("Failed to list NFS exports: {e}")))
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn new(url: &str, block_size: Option<u64>) -> Result<Self> {
         let (storage, root_dir) = Self::mount_and_build(url, block_size).await?;
         storage.attach_root(root_dir, false).await
@@ -831,6 +856,10 @@ impl NFSStorage {
         Ok(components)
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn lookup_fh(&self, relative_path: &Path) -> Result<nfs_rs::ObjRes> {
         self.lookup_fh_inner(relative_path, 0).await
     }
@@ -1013,7 +1042,10 @@ impl NFSStorage {
 
     pub(crate) async fn read_file(&self, path: &Path, size: u64) -> Result<Bytes> {
         let mut handle = self.open(path, OPEN_READ).await?;
-        let result = self.read(&mut handle, 0, size as usize).await;
+        let size = usize::try_from(size).map_err(|_| {
+            StorageError::OperationError("file is too large for this platform".to_string())
+        })?;
+        let result = self.read(&mut handle, 0, size).await;
         // best-effort close，不覆盖 read 的错误
         let _ = self.close(&handle).await;
         result
@@ -1174,6 +1206,10 @@ impl NFSStorage {
         unreachable!("retry loop always returns")
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn delete_file(&self, relative_path: &Path) -> Result<()> {
         trace!("Removing file {:?}", relative_path);
 
@@ -1246,40 +1282,18 @@ impl NFSStorage {
     /// # 返回值
     /// - `Ok(Bytes)`：创建成功，返回最后一个目录的文件句柄
     /// - `Err(StorageError)`：创建失败，返回错误信息
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn create_dir_all(&self, relative_path: &Path) -> Result<Bytes> {
         self.create_dir_all_inner(relative_path, 0).await
     }
 
     async fn create_dir_all_inner(&self, relative_path: &Path, retries: u8) -> Result<Bytes> {
         debug!("create_dir_all: {:?}", relative_path);
-        // 收集目录组件
         let components = Self::collect_components(relative_path)?;
-
-        // 从根目录开始（RPC 用真实 FH）
-        let mut current_fh = self.rpc_root_fh();
-        let mut start_index = 0;
-
-        // 从最后一个组件开始匹配缓存，提高缓存查询效率
-        // 更深层次的目录路径更容易存在于缓存中
-        if !components.is_empty() {
-            let mut partial_path: PathBuf = components.iter().collect();
-            for i in (0..components.len()).rev() {
-                // 构建缓存键
-                let cache_key = (partial_path.clone(), self.get_root_fh());
-                debug!("create_dir_all: cache_key: {:?}", cache_key);
-
-                // 尝试从缓存中获取该路径的文件句柄
-                if let Some(fh) = GLOBAL_CACHE.get(&cache_key) {
-                    trace!("Global cache result for key={:?}: true", cache_key);
-                    current_fh = fh;
-                    start_index = i + 1;
-                    break;
-                }
-                trace!("Global cache result for key={:?}: false", cache_key);
-                // 移除最后一个组件，准备检查上一级目录
-                partial_path.pop();
-            }
-        }
+        let (mut current_fh, start_index) = self.deepest_cached_directory(&components);
 
         // 当前正在处理的路径
         let mut current_path: PathBuf = components[0..start_index].iter().collect();
@@ -1301,12 +1315,7 @@ impl NFSStorage {
                     // 目录创建成功，继续使用新句柄
                     current_fh = obj.fh.clone();
                     // 将创建的目录句柄保存到缓存中
-                    trace!(
-                        "Inserting into global cache: key={:?}, value_len={}",
-                        cache_key,
-                        obj.fh.len()
-                    );
-                    GLOBAL_CACHE.insert(cache_key, obj.fh);
+                    Self::cache_directory(cache_key, obj.fh);
                 }
                 Err(e) => {
                     debug!("Error: dir {} {}", dirname, e);
@@ -1321,18 +1330,12 @@ impl NFSStorage {
                                 let is_dir = obj
                                     .attr
                                     .as_ref()
-                                    .map(|attr| attr.type_ == FType3::NF3DIR as u32)
-                                    .unwrap_or(true);
+                                    .is_none_or(|attr| attr.type_ == FType3::NF3DIR as u32);
                                 if is_dir {
                                     // 找到目录，继续使用现有句柄
                                     current_fh = obj.fh.clone();
                                     // 将查询结果保存到缓存中
-                                    trace!(
-                                        "Inserting into global cache: key={:?}, value_len={}",
-                                        cache_key,
-                                        obj.fh.len()
-                                    );
-                                    GLOBAL_CACHE.insert(cache_key, obj.fh.clone());
+                                    Self::cache_directory(cache_key, obj.fh.clone());
                                 } else {
                                     // 同名非目录对象（残留文件/符号链接）挡住目录创建：
                                     // 迁移语义按 rsync 风格处理——删除后重走 create_dir_all。
@@ -1349,12 +1352,11 @@ impl NFSStorage {
                                     }
                                     if let Err(e) =
                                         self.mount.remove(current_fh.clone(), dirname).await
+                                        && !e.is_not_found()
                                     {
-                                        if !e.is_not_found() {
-                                            return Err(StorageError::NfsError(format!(
-                                                "Failed to remove non-directory {dirname} blocking directory creation: {e}"
-                                            )));
-                                        }
+                                        return Err(StorageError::NfsError(format!(
+                                            "Failed to remove non-directory {dirname} blocking directory creation: {e}"
+                                        )));
                                     }
                                     return Box::pin(
                                         self.create_dir_all_inner(relative_path, retries + 1),
@@ -1404,6 +1406,35 @@ impl NFSStorage {
         }
 
         Ok(current_fh)
+    }
+
+    fn deepest_cached_directory(&self, components: &[String]) -> (Bytes, usize) {
+        let mut current_fh = self.rpc_root_fh();
+        if components.is_empty() {
+            return (current_fh, 0);
+        }
+        let mut partial_path: PathBuf = components.iter().collect();
+        for index in (0..components.len()).rev() {
+            let cache_key = (partial_path.clone(), self.get_root_fh());
+            debug!("create_dir_all: cache_key: {:?}", cache_key);
+            if let Some(fh) = GLOBAL_CACHE.get(&cache_key) {
+                trace!("Global cache result for key={:?}: true", cache_key);
+                current_fh = fh;
+                return (current_fh, index + 1);
+            }
+            trace!("Global cache result for key={:?}: false", cache_key);
+            partial_path.pop();
+        }
+        (current_fh, 0)
+    }
+
+    fn cache_directory(cache_key: (PathBuf, Bytes), file_handle: Bytes) {
+        trace!(
+            "Inserting into global cache: key={:?}, value_len={}",
+            cache_key,
+            file_handle.len()
+        );
+        GLOBAL_CACHE.insert(cache_key, file_handle);
     }
 
     async fn delete_dir(&self, relative_path: &Path) -> Result<()> {
@@ -1459,12 +1490,20 @@ impl NFSStorage {
         unreachable!("retry loop always returns")
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn delete_dir_all(&self, relative_path: Option<&Path>) -> Result<()> {
         let iter = self.delete_dir_all_with_progress(relative_path, 4)?;
         while iter.next().await.is_some() {}
         Ok(())
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub fn delete_dir_all_with_progress(
         &self,
         relative_path: Option<&Path>,
@@ -1480,7 +1519,13 @@ impl NFSStorage {
         tokio::spawn(async move {
             // 1. 复用现有 walkdir 并行遍历（支持子目录）
             let walkdir_result = match storage
-                .walkdir(sub_path.as_deref(), None, None, None, concurrency, false, 0)
+                .walkdir(
+                    sub_path.as_deref(),
+                    crate::WalkOptions {
+                        concurrency,
+                        ..Default::default()
+                    },
+                )
                 .await
             {
                 Ok(iter) => iter,
@@ -1545,7 +1590,7 @@ impl NFSStorage {
             }
 
             // 3. 目录按深度降序排序 → 逐个删除（子目录）
-            dir_paths.sort_by(|a, b| b.1.cmp(&a.1));
+            dir_paths.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             for (path, _) in dir_paths {
                 if let Err(e) = storage.delete_dir(&path).await {
                     error!("Failed to delete dir {:?}: {:?}", path, e);
@@ -1596,6 +1641,10 @@ impl NFSStorage {
     /// # 返回值
     /// - `Ok(())`：symlink 已存在且属性已应用
     /// - `Err(StorageError)`：CREATE 或 SETATTR 任一环节失败
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn create_symlink(
         &self,
         relative_path: &Path,
@@ -1624,8 +1673,8 @@ impl NFSStorage {
         }
 
         // 把 i64 nanos 时间戳转成 nfs_rs::Time；retry 之间不变，提到循环外。
-        let atime_t = Some(i64_to_time(atime));
-        let mtime_t = Some(i64_to_time(mtime));
+        let atime_t = Some(i64_to_time(atime)?);
+        let mtime_t = Some(i64_to_time(mtime)?);
 
         for attempt in 0..=MAX_STALE_RETRIES {
             let parent_fh = if let Some(parent) = relative_path.parent() {
@@ -1724,6 +1773,10 @@ impl NFSStorage {
         unreachable!("retry loop always returns")
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn read_symlink(&self, relative_path: &Path) -> Result<PathBuf> {
         // 查找符号链接文件
         debug!("[read_link] Looking up symlink path: {:?}", relative_path);
@@ -1740,6 +1793,10 @@ impl NFSStorage {
         Ok(PathBuf::from(target))
     }
 
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         trace!("Rename {:?} to {:?}", from, to);
 
@@ -1830,6 +1887,10 @@ impl NFSStorage {
     }
 
     /// 获取文件元数据
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn get_metadata(&self, relative_path: &Path) -> Result<EntryEnum> {
         debug!("Looking up file path for metadata {:?}", relative_path);
         // 查找文件
@@ -1879,6 +1940,10 @@ impl NFSStorage {
 
     /// 更新文件或目录的元数据
     /// Update metadata for a file by path (public wrapper around `set_metadata`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn update_metadata(
         &self,
         relative_path: &Path,
@@ -1896,7 +1961,6 @@ impl NFSStorage {
             .await
     }
 
-    #[allow(clippy::similar_names)]
     pub(crate) async fn set_metadata(
         &self,
         file: &NFSFileHandle,
@@ -1909,8 +1973,8 @@ impl NFSStorage {
         debug!("Setting metadata for {:?}", file.path);
 
         // 转换纳秒时间戳到Time类型
-        let nfs_atime = atime.map(i64_to_time);
-        let nfs_mtime = mtime.map(i64_to_time);
+        let access_time_value = atime.map(i64_to_time).transpose()?;
+        let modification_time_value = mtime.map(i64_to_time).transpose()?;
 
         // set_metadata 在 stale 重试时需要 re-lookup 获取新 fh，用 current_fh 跟踪
         let mut current_fh = file.inner.fh.clone();
@@ -1920,13 +1984,13 @@ impl NFSStorage {
                 .mount
                 .setattr(
                     current_fh.clone(),
-                    None,      // 不设置guard_ctime
-                    mode,      // 设置mode
-                    uid,       // 设置uid
-                    gid,       // 设置gid
-                    None,      // 不设置size
-                    nfs_atime, // 设置atime
-                    nfs_mtime, // 设置mtime
+                    None,                    // 不设置guard_ctime
+                    mode,                    // 设置mode
+                    uid,                     // 设置uid
+                    gid,                     // 设置gid
+                    None,                    // 不设置size
+                    access_time_value,       // 设置atime
+                    modification_time_value, // 设置mtime
                 )
                 .await
             {
@@ -1962,11 +2026,13 @@ impl NFSStorage {
     // ============================================================
 
     /// 查询 NFS 版本
+    #[must_use]
     pub fn version(&self) -> nfs_rs::NFSVersion {
         self.mount.version()
     }
 
     /// 检测是否支持 ACL（仅 `NFSv4`+）
+    #[must_use]
     pub fn supports_acl(&self) -> bool {
         !matches!(
             self.mount.version(),
@@ -1977,11 +2043,16 @@ impl NFSStorage {
     /// 检测是否支持 xattr（RFC 8276，需要 `NFSv4`+）。
     /// 与 `supports_acl` 共享相同的版本下限检查；如果服务器声称 `NFSv4` 但不支持
     /// xattr 扩展，`list_xattr` 会返回 Unsupported 错误，`copy_xattr` 会静默跳过。
+    #[must_use]
     pub fn supports_xattr(&self) -> bool {
         self.supports_acl()
     }
 
     /// 获取文件/目录的 `NFSv4` ACL
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn get_acl(&self, relative_path: &Path) -> Result<nfs_rs::Acl> {
         let obj = self.lookup_fh(relative_path).await?;
         self.mount.getacl(obj.fh).await.map_err(|e| {
@@ -1993,6 +2064,10 @@ impl NFSStorage {
     }
 
     /// 设置文件/目录的 `NFSv4` ACL
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn set_acl(&self, relative_path: &Path, acl: &nfs_rs::Acl) -> Result<()> {
         let obj = self.lookup_fh(relative_path).await?;
         self.mount.setacl(obj.fh, acl).await.map_err(|e| {
@@ -2004,6 +2079,10 @@ impl NFSStorage {
     }
 
     /// 查询服务器支持的 ACE 类型
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn acl_support(&self) -> Result<nfs_rs::AclSupport> {
         self.mount
             .aclsupport(self.rpc_root_fh())
@@ -2016,6 +2095,10 @@ impl NFSStorage {
     // ============================================================
 
     /// 获取指定 xattr 的值
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn get_xattr(&self, relative_path: &Path, name: &str) -> Result<Bytes> {
         let obj = self.lookup_fh(relative_path).await?;
         self.mount.getxattr(obj.fh, name).await.map_err(|e| {
@@ -2027,6 +2110,10 @@ impl NFSStorage {
     }
 
     /// 设置 xattr 值
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn set_xattr(&self, relative_path: &Path, name: &str, value: Bytes) -> Result<()> {
         let obj = self.lookup_fh(relative_path).await?;
         self.mount.setxattr(obj.fh, name, value).await.map_err(|e| {
@@ -2038,6 +2125,10 @@ impl NFSStorage {
     }
 
     /// 列出所有 xattr 名称
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn list_xattr(&self, relative_path: &Path) -> Result<Vec<String>> {
         let obj = self.lookup_fh(relative_path).await?;
         self.mount.listxattr(obj.fh).await.map_err(|e| {
@@ -2049,6 +2140,10 @@ impl NFSStorage {
     }
 
     /// 删除指定 xattr
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn remove_xattr(&self, relative_path: &Path, name: &str) -> Result<()> {
         let obj = self.lookup_fh(relative_path).await?;
         self.mount.removexattr(obj.fh, name).await.map_err(|e| {
@@ -2059,16 +2154,14 @@ impl NFSStorage {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn walkdir(
         &self,
         sub_path: Option<&Path>,
-        depth: Option<usize>,
-        match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>,
-        concurrency: usize,
-        packaged: bool,
-        package_depth: usize,
+        options: crate::WalkOptions,
     ) -> Result<WalkDirAsyncIterator> {
         // 解析起始目录：sub_path 为 None 时从根开始，否则从子目录开始
         let (start_fh, start_root) = match sub_path {
@@ -2088,8 +2181,6 @@ impl NFSStorage {
         // 创建全局文件计数器
         let total_file_count = Arc::new(AtomicUsize::new(0));
 
-        let max_depth = depth.unwrap_or(0);
-
         let total_file_count_clone = total_file_count.clone();
 
         let storage = self.clone();
@@ -2104,13 +2195,8 @@ impl NFSStorage {
                     &start_root,
                     start_fh,
                     tx_clone.clone(),
-                    max_depth,
-                    match_expressions.as_ref(),
-                    exclude_expressions.as_ref(),
-                    concurrency,
+                    options,
                     total_file_count_clone,
-                    packaged,
-                    package_depth,
                 )
                 .await
             {
@@ -2130,27 +2216,31 @@ impl NFSStorage {
     }
 
     /// 迭代式目录遍历函数，使用工作窃取队列实现高效并发
-    #[allow(clippy::too_many_arguments)]
     async fn iterative_walkdir(
         &self,
         root_path: &str,
         root_fh: Bytes,
         tx: async_channel::Sender<StorageEntryMessage>,
-        max_depth: usize,
-        match_expressions: Option<&FilterExpression>,
-        exclude_expressions: Option<&FilterExpression>,
-        concurrency: usize,
+        options: crate::WalkOptions,
         total_file_count: Arc<AtomicUsize>,
-        packaged: bool,
-        package_depth: usize,
     ) -> Result<()> {
+        let crate::WalkOptions {
+            depth,
+            match_expressions,
+            exclude_expressions,
+            concurrency,
+            packaged,
+            package_depth,
+            ..
+        } = options;
+        let max_depth = depth.unwrap_or(0);
         let contexts = create_worker_contexts(
             concurrency,
             (root_path.to_string(), root_fh, 0usize, true, None::<usize>),
         )
         .await;
-        let match_expr = Arc::new(match_expressions.cloned());
-        let exclude_expr = Arc::new(exclude_expressions.cloned());
+        let match_expr = Arc::new(match_expressions);
+        let exclude_expr = Arc::new(exclude_expressions);
 
         info!("Creating {} producer tasks", contexts.len());
 
@@ -2167,20 +2257,21 @@ impl NFSStorage {
                     &ctx,
                     |(dir_path, dir_fh, current_depth, skip_filter, package_remaining)| {
                         self_clone.process_dir(
-                            ctx.worker_id,
                             dir_path,
                             dir_fh,
                             current_depth,
-                            &tx_clone,
-                            &ctx,
-                            &match_expr_clone,
-                            &exclude_expr_clone,
-                            max_depth,
-                            &total_file_count_clone,
                             skip_filter,
-                            packaged,
-                            package_depth,
                             package_remaining,
+                            NfsWalkRuntime {
+                                tx: &tx_clone,
+                                scheduler: &ctx,
+                                match_expr: &match_expr_clone,
+                                exclude_expr: &exclude_expr_clone,
+                                max_depth,
+                                total_file_count: &total_file_count_clone,
+                                packaged,
+                                package_depth,
+                            },
                         )
                     },
                     |task| task.0.clone(),
@@ -2197,24 +2288,17 @@ impl NFSStorage {
     }
 
     /// 处理单个目录，读取条目并过滤，发送符合条件的StorageEntry
-    #[allow(clippy::too_many_arguments)]
     async fn process_dir(
         &self,
-        producer_id: usize,
         dir_path: String,
         dir_fh: Bytes,
         current_depth: usize,
-        tx: &async_channel::Sender<StorageEntryMessage>,
-        ctx: &crate::walk_scheduler::WorkerContext<(String, Bytes, usize, bool, Option<usize>)>,
-        match_expr: &Arc<Option<FilterExpression>>,
-        exclude_expr: &Arc<Option<FilterExpression>>,
-        max_depth: usize,
-        total_file_count: &Arc<AtomicUsize>,
         skip_filter: bool,
-        packaged: bool,
-        package_depth: usize,
         package_remaining: Option<usize>,
+        runtime: NfsWalkRuntime<'_>,
     ) -> Result<()> {
+        let producer_id = runtime.scheduler.worker_id;
+        let tx = runtime.tx;
         // Stream READDIRPLUS entries into the existing processing path instead
         // of buffering a full directory. Retryable errors are retried only
         // before any entry is processed; after that point, replaying the
@@ -2231,20 +2315,12 @@ impl NFSStorage {
                         processed_any = true;
                         if !self
                             .process_readdir_entry(
-                                producer_id,
                                 &dir_path,
                                 entry,
                                 current_depth,
-                                tx,
-                                ctx,
-                                match_expr,
-                                exclude_expr,
-                                max_depth,
-                                total_file_count,
                                 skip_filter,
-                                packaged,
-                                package_depth,
                                 package_remaining,
+                                &runtime,
                             )
                             .await?
                         {
@@ -2299,30 +2375,202 @@ impl NFSStorage {
     ///
     /// Returns `Ok(false)` when the downstream output channel is closed and the
     /// caller should stop reading the directory.
-    #[allow(clippy::too_many_arguments)]
+    async fn readdir_entry_attrs(
+        &self,
+        relative_path: &str,
+        inline: Option<Attr>,
+        runtime: &NfsWalkRuntime<'_>,
+    ) -> Option<Attr> {
+        if inline.is_some() {
+            return inline;
+        }
+        warn!("Missing inline attrs for {relative_path}, trying fallback GETATTR");
+        match self.mount.getattr_path(relative_path).await {
+            Ok(attrs) => Some(attrs),
+            Err(error) => {
+                let producer_id = runtime.scheduler.worker_id;
+                error!("[Producer {producer_id}] fallback GETATTR failed: {error}");
+                let _ = runtime
+                    .tx
+                    .send(StorageEntryMessage::Error {
+                        event: ErrorEvent::Scan,
+                        path: PathBuf::from(relative_path),
+                        entry: None,
+                        reason: format!(
+                            "[Producer {producer_id}] Missing file attributes: {relative_path}"
+                        ),
+                    })
+                    .await;
+                None
+            }
+        }
+    }
+
+    async fn read_entry_xattrs(
+        &self,
+        relative_path: &str,
+        producer_id: usize,
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        if !self.supports_xattr() {
+            return None;
+        }
+        let path = Path::new(relative_path);
+        let names = match self.list_xattr(path).await {
+            Ok(names) => names,
+            Err(error) => {
+                trace!("[Producer {producer_id}] listxattr for {relative_path} failed: {error}");
+                return None;
+            }
+        };
+        let mut pairs = Vec::with_capacity(names.len());
+        for name in names {
+            match self.get_xattr(path, &name).await {
+                Ok(value) => pairs.push((name, value.to_vec())),
+                Err(error) => warn!(
+                    "[Producer {producer_id}] Failed to read xattr '{name}' for {relative_path}: {error}"
+                ),
+            }
+        }
+        (!pairs.is_empty()).then_some(pairs)
+    }
+
+    fn walk_entry_filter(
+        runtime: &NfsWalkRuntime<'_>,
+        skip_filter: bool,
+        file_name: &str,
+        relative_path: &str,
+        extension: Option<&str>,
+        attrs: &Attr,
+    ) -> (bool, bool, bool) {
+        if !skip_filter {
+            return (false, true, false);
+        }
+        let file_type = if attrs.type_ == FType3::NF3LNK as u32 {
+            "symlink"
+        } else if attrs.type_ == FType3::NF3DIR as u32 {
+            "dir"
+        } else {
+            "file"
+        };
+        should_skip(
+            runtime.match_expr.as_ref().as_ref(),
+            runtime.exclude_expr.as_ref().as_ref(),
+            FilterInput {
+                file_name: Some(file_name),
+                file_path: Some(relative_path),
+                file_type: Some(file_type),
+                modified_epoch: Some(i64::from(attrs.mtime.seconds)),
+                size: Some(attrs.filesize),
+                extension: extension.or(Some("")),
+            },
+        )
+    }
+
+    async fn send_walk_entry(
+        runtime: &NfsWalkRuntime<'_>,
+        entry: EntryEnum,
+        packaged: bool,
+    ) -> bool {
+        let message = if packaged {
+            StorageEntryMessage::Packaged(Arc::new(entry))
+        } else {
+            StorageEntryMessage::Scanned(Arc::new(entry))
+        };
+        if runtime.tx.send(message).await.is_err() {
+            error!(
+                "[Producer {}] Output channel closed, stopping processing",
+                runtime.scheduler.worker_id
+            );
+            return false;
+        }
+        runtime.total_file_count.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    async fn track_package_depth(
+        runtime: &NfsWalkRuntime<'_>,
+        remaining: Option<usize>,
+        is_dir: bool,
+        relative_path: &str,
+        handle: &Bytes,
+        current_depth: usize,
+    ) -> Option<bool> {
+        let Some(remaining) = remaining else {
+            return Some(false);
+        };
+        if !is_dir {
+            return None;
+        }
+        if remaining <= 1 {
+            return Some(true);
+        }
+        runtime
+            .scheduler
+            .push_task((
+                relative_path.to_string(),
+                handle.clone(),
+                current_depth + 1,
+                false,
+                Some(remaining - 1),
+            ))
+            .await;
+        None
+    }
+
+    async fn packaged_entry_decision(
+        runtime: &NfsWalkRuntime<'_>,
+        send_packaged: bool,
+        is_dir: bool,
+        name: &str,
+        relative_path: &str,
+        handle: &Bytes,
+        depths: (usize, usize),
+    ) -> Option<bool> {
+        if send_packaged
+            || !runtime.packaged
+            || !is_dir
+            || !dir_matches_date_filter(runtime.match_expr.as_ref().as_ref(), name)
+        {
+            return Some(send_packaged);
+        }
+        let (current_depth, entry_depth) = depths;
+        if runtime.max_depth > 0 && entry_depth + runtime.package_depth > runtime.max_depth {
+            return None;
+        }
+        if runtime.package_depth == 0 {
+            return Some(true);
+        }
+        runtime
+            .scheduler
+            .push_task((
+                relative_path.to_string(),
+                handle.clone(),
+                current_depth + 1,
+                false,
+                Some(runtime.package_depth),
+            ))
+            .await;
+        None
+    }
+
     async fn process_readdir_entry(
         &self,
-        producer_id: usize,
         dir_path: &str,
         entry: nfs_rs::ReaddirplusEntry,
         current_depth: usize,
-        tx: &async_channel::Sender<StorageEntryMessage>,
-        ctx: &crate::walk_scheduler::WorkerContext<(String, Bytes, usize, bool, Option<usize>)>,
-        match_expr: &Arc<Option<FilterExpression>>,
-        exclude_expr: &Arc<Option<FilterExpression>>,
-        max_depth: usize,
-        total_file_count: &Arc<AtomicUsize>,
         skip_filter: bool,
-        packaged: bool,
-        package_depth: usize,
         package_remaining: Option<usize>,
+        runtime: &NfsWalkRuntime<'_>,
     ) -> Result<bool> {
+        let producer_id = runtime.scheduler.worker_id;
+        let ctx = runtime.scheduler;
+        let max_depth = runtime.max_depth;
         if entry.file_name == "." || entry.file_name == ".." {
             return Ok(true);
         }
 
         // 构建完整路径（使用 '/' 拼接，避免平台差异）
-        let relative_path = self.build_relative_path(&dir_path, &entry.file_name);
+        let relative_path = self.build_relative_path(dir_path, &entry.file_name);
 
         // 提取扩展名（在 file_name 被 move 前提取）
         let extension = entry
@@ -2333,93 +2581,38 @@ impl NFSStorage {
         // 提取文件名（完整文件名）
         let file_name = &entry.file_name;
 
-        let attrs = if let Some(attr) = entry.attr {
-            attr
-        } else {
-            // Fallback: try standalone GETATTR when inline attrs from READDIRPLUS failed
-            warn!(
-                "[Producer {}] Missing inline attrs for {}, trying fallback GETATTR",
-                producer_id, relative_path
-            );
-            match self.mount.getattr_path(&relative_path).await {
-                Ok(attr) => attr,
-                Err(e) => {
-                    error!(
-                        "[Producer {}] Fallback GETATTR also failed for {}: {}",
-                        producer_id, relative_path, e
-                    );
-                    let _ = tx
-                        .send(StorageEntryMessage::Error {
-                            event: ErrorEvent::Scan,
-                            path: PathBuf::from(&relative_path),
-                            entry: None,
-                            reason: format!(
-                                "[Producer {producer_id}] Missing file attributes: {relative_path}"
-                            ),
-                        })
-                        .await;
-                    return Ok(true);
-                }
-            }
+        let Some(attrs) = self
+            .readdir_entry_attrs(&relative_path, entry.attr, runtime)
+            .await
+        else {
+            return Ok(true);
         };
 
         let file_type = attrs.type_;
         let is_dir = file_type == FType3::NF3DIR as u32;
-        let is_symlink = file_type == FType3::NF3LNK as u32;
-
-        // 一次性过滤：基于文件名、路径、文件类型、大小和修改时间
-        let (skip_entry, continue_scan, need_submatch) = if skip_filter {
-            // 获取修改时间的 epoch seconds
-            let modified_epoch = Some(i64::from(attrs.mtime.seconds));
-
-            // root 已为空串或无前导 '/' 前缀，relative_path 直接就是相对路径
-            let normalized_path = &relative_path;
-            should_skip(
-                match_expr.as_ref().as_ref(),
-                exclude_expr.as_ref().as_ref(),
-                FilterInput {
-                    file_name: Some(file_name),
-                    file_path: Some(normalized_path),
-                    file_type: Some(if is_symlink {
-                        "symlink"
-                    } else if is_dir {
-                        "dir"
-                    } else {
-                        "file"
-                    }),
-                    modified_epoch,
-                    size: Some(attrs.filesize),
-                    extension: extension.as_deref().or(Some("")),
-                },
-            )
-        } else {
-            // skip_filter=false 表示父目录已匹配，子项无需过滤
-            // need_submatch=false 确保免过滤传递给所有后代
-            (false, true, false)
-        };
+        let (skip_entry, continue_scan, need_submatch) = Self::walk_entry_filter(
+            runtime,
+            skip_filter,
+            file_name,
+            &relative_path,
+            extension.as_deref(),
+            &attrs,
+        );
 
         // 计算条目的实际深度：目录深度+1
         let entry_depth = current_depth + 1;
-        let mut send_packaged = false;
-
-        // package 深度追踪模式：只处理目录，跳过文件和 filter
-        if let Some(remaining) = package_remaining {
-            if !is_dir {
-                return Ok(true);
-            }
-            if remaining > 1 {
-                ctx.push_task((
-                    relative_path.clone(),
-                    entry.handle.clone(),
-                    current_depth + 1,
-                    false,
-                    Some(remaining - 1),
-                ))
-                .await;
-                return Ok(true);
-            }
-            send_packaged = true;
-        }
+        let Some(send_packaged) = Self::track_package_depth(
+            runtime,
+            package_remaining,
+            is_dir,
+            &relative_path,
+            &entry.handle,
+            current_depth,
+        )
+        .await
+        else {
+            return Ok(true);
+        };
 
         if !send_packaged && skip_entry {
             if continue_scan && is_dir && (current_depth < max_depth || max_depth == 0) {
@@ -2437,34 +2630,7 @@ impl NFSStorage {
 
         // 创建StorageEntry
         // Read xattrs if supported (before consuming entry.file_name)
-        let xattrs = if self.supports_xattr() {
-            let path = Path::new(&relative_path);
-            match self.list_xattr(path).await {
-                Ok(names) if !names.is_empty() => {
-                    let mut pairs = Vec::with_capacity(names.len());
-                    for name in &names {
-                        match self.get_xattr(path, name).await {
-                            Ok(value) => pairs.push((name.clone(), value.to_vec())),
-                            Err(e) => warn!(
-                                "[Producer {}] Failed to read xattr '{}' for {}: {}",
-                                producer_id, name, relative_path, e
-                            ),
-                        }
-                    }
-                    if pairs.is_empty() { None } else { Some(pairs) }
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    trace!(
-                        "[Producer {}] listxattr for {} failed: {}",
-                        producer_id, relative_path, e
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let xattrs = self.read_entry_xattrs(&relative_path, producer_id).await;
 
         let storage_entry = EntryEnum::NAS(NASEntry::from_nfs_attrs(
             entry.file_name,
@@ -2475,45 +2641,23 @@ impl NFSStorage {
             NfsEnrich::from_attrs(&attrs).with_xattrs(xattrs),
         ));
 
-        // packaged 模式：目录匹配 DirDate 条件时决定打包策略
-        if !send_packaged
-            && packaged
-            && is_dir
-            && dir_matches_date_filter(match_expr.as_ref().as_ref(), storage_entry.get_name())
-        {
-            if max_depth > 0 && entry_depth + package_depth > max_depth {
-                return Ok(true);
-            }
-            if package_depth > 0 {
-                ctx.push_task((
-                    relative_path.clone(),
-                    entry.handle.clone(),
-                    current_depth + 1,
-                    false,
-                    Some(package_depth),
-                ))
-                .await;
-                return Ok(true);
-            }
-            send_packaged = true;
-        }
+        let Some(send_packaged) = Self::packaged_entry_decision(
+            runtime,
+            send_packaged,
+            is_dir,
+            storage_entry.get_name(),
+            &relative_path,
+            &entry.handle,
+            (current_depth, entry_depth),
+        )
+        .await
+        else {
+            return Ok(true);
+        };
 
         // 统一的 Packaged 发送
         if send_packaged {
-            debug!(
-                "[Producer {}] Packaged dir {} (depth: {})",
-                producer_id, relative_path, entry_depth
-            );
-            total_file_count.fetch_add(1, Ordering::Relaxed);
-            if tx
-                .send(StorageEntryMessage::Packaged(Arc::new(storage_entry)))
-                .await
-                .is_err()
-            {
-                error!(
-                    "[Producer {}] Output channel closed, stopping processing",
-                    producer_id
-                );
+            if !Self::send_walk_entry(runtime, storage_entry, true).await {
                 return Ok(false);
             }
             return Ok(true);
@@ -2533,22 +2677,10 @@ impl NFSStorage {
 
         // 检查深度限制：只有当条目深度在允许范围内时才发送
         // 0表示无限深度
-        if max_depth == 0 || entry_depth <= max_depth {
-            // 更新全局文件计数器
-            total_file_count.fetch_add(1, Ordering::Relaxed);
-
-            // 发送StorageEntry到输出通道
-            if tx
-                .send(StorageEntryMessage::Scanned(Arc::new(storage_entry)))
-                .await
-                .is_err()
-            {
-                error!(
-                    "[Producer {}] Output channel closed, stopping processing",
-                    producer_id
-                );
-                return Ok(false);
-            }
+        if (max_depth == 0 || entry_depth <= max_depth)
+            && !Self::send_walk_entry(runtime, storage_entry, false).await
+        {
+            return Ok(false);
         }
 
         Ok(true)
@@ -2673,8 +2805,9 @@ impl NFSStorage {
                 let current_chunk_size = std::cmp::min(remaining_bytes, chunk_size);
 
                 // 直接使用slice操作，避免克隆
-                let chunk_data =
-                    data_ref.slice(data_index..data_index + current_chunk_size as usize);
+                let current_chunk_size_usize = usize::try_from(current_chunk_size)
+                    .unwrap_or_else(|_| unreachable!("chunk size is bounded by the input buffer"));
+                let chunk_data = data_ref.slice(data_index..data_index + current_chunk_size_usize);
 
                 trace!(
                     "[write] Writing chunk of {} bytes to file {:?} at offset {}",
@@ -2773,18 +2906,10 @@ impl NFSStorage {
         let path_to_use = self.calculate_relative_path(relative_path);
 
         // 通过 open 打开文件（v4.1 建立 stateid）
-        let mut handler = match self.open(&path_to_use, OPEN_READ).await {
-            Ok(handle) => {
-                trace!("Successfully opened source file: {:?}", path_to_use);
-                handle
-            }
-            Err(e) => {
-                error!("Failed to open source file: {:?}", e);
-                return Err(StorageError::NfsError(format!(
-                    "Failed to open source file: {e:?}"
-                )));
-            }
-        };
+        let mut handler = self.open(&path_to_use, OPEN_READ).await.map_err(|error| {
+            error!("Failed to open source file: {error:?}");
+            StorageError::NfsError(format!("Failed to open source file: {error:?}"))
+        })?;
 
         let mut hasher = create_hash_calculator(enable_integrity_check);
 
@@ -2801,8 +2926,7 @@ impl NFSStorage {
         // 错误处理：first_error + break + drop(inflight) 取消未完成 future，
         // 保证 close 路径必然执行后再返回 Err（与 cifs 读侧语义一致；旧实现
         // 读错误静默 break 返回 Ok，会掩盖目标文件不完整，已修正为上抛）。
-        type ReadFut = Pin<Box<dyn Future<Output = (u64, u32, nfs_rs::Result<Bytes>)> + Send>>;
-        let mut inflight: FuturesOrdered<ReadFut> = FuturesOrdered::new();
+        let mut inflight: FuturesOrdered<NfsReadFuture> = FuturesOrdered::new();
         let mut issue_offset: u64 = 0;
         let mut bytes_read: u64 = 0;
         let mut first_error: Option<StorageError> = None;
@@ -2810,26 +2934,15 @@ impl NFSStorage {
         let mut fh_refreshed = false;
 
         loop {
-            // 填满 inflight，直到达到深度上限或所有字节已派发。
-            while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < size {
-                // QoS 限流（带宽 + IOPS）作用在派发速率上
-                if let Some(ref qos) = qos {
-                    qos.acquire(chunk_size).await;
-                }
-                let want_u64 = std::cmp::min(chunk_size, size - issue_offset);
-                // chunk_size ≤ effective block_size ≤ 1MB，cast 无截断
-                #[allow(clippy::cast_possible_truncation)]
-                let want = want_u64 as u32;
-                let offset = issue_offset;
-                let mount = self.mount.clone();
-                let fh = handler.inner.fh.clone();
-                let fut: ReadFut = Box::pin(async move {
-                    let r = mount.read(fh, offset, want).await;
-                    (offset, want, r)
-                });
-                inflight.push_back(fut);
-                issue_offset += want_u64;
-            }
+            self.fill_read_pipeline(
+                &mut inflight,
+                &handler,
+                &mut issue_offset,
+                size,
+                chunk_size,
+                qos.as_ref(),
+            )
+            .await;
 
             // 全部派发完且 inflight 已空 → 正常结束。
             let Some((offset, want, result)) = inflight.next().await else {
@@ -2837,105 +2950,54 @@ impl NFSStorage {
                 break;
             };
 
-            let mut data = match result {
+            let data = match result {
                 Ok(d) => d,
                 // stale 句柄：刷新 fh（每文件一次）后串行重读该 chunk 一次。
                 // 旧 fh 派发的其余 inflight 大概率也返回 stale，各自走到这里
                 // 串行重读；新派发的 chunk 自动使用刷新后的 fh。
                 Err(ref e) if is_stale_handle(e) => {
-                    if !fh_refreshed {
-                        debug!(
-                            "[read_data] stale handle, refreshing fh for {:?}",
-                            handler.path
-                        );
-                        match self.lookup_fh(&handler.path).await {
-                            Ok(obj) => {
-                                handler.inner = Arc::new(obj);
-                                fh_refreshed = true;
-                            }
-                            Err(e2) => {
-                                first_error = Some(e2);
-                                break;
-                            }
-                        }
-                    }
                     match self
-                        .mount
-                        .read(handler.inner.fh.clone(), offset, want)
+                        .read_after_stale_refresh(
+                            &mut handler,
+                            relative_path,
+                            offset,
+                            want,
+                            &mut fh_refreshed,
+                        )
                         .await
                     {
-                        Ok(d) => d,
-                        Err(e2) => {
-                            first_error = Some(StorageError::NfsError(format!(
-                                "Failed to read file {:?} at offset {offset} after refresh: {e2}",
-                                relative_path
-                            )));
+                        Ok(data) => data,
+                        Err(error) => {
+                            first_error = Some(error);
                             break;
                         }
                     }
                 }
                 Err(e) => {
                     first_error = Some(StorageError::NfsError(format!(
-                        "Failed to read file {relative_path:?} at offset {offset}: {e}"
+                        "Failed to read file {} at offset {offset}: {e}",
+                        relative_path.display()
                     )));
                     break;
                 }
             };
 
-            // 处理本 chunk（含 partial 短读的串行补读）：字节流必须连续推进，
-            // 否则已预派发的后续 chunk 的 offset 网格会错位。
-            let mut chunk_off = offset;
-            let chunk_end = offset + u64::from(want);
-            let chunk_done = loop {
-                if data.is_empty() {
-                    // offset < size 处读到 0 字节：文件在读取中被外部截断。
-                    // 保留旧实现的快照语义：视为提前 EOF，不算错误。
-                    warn!(
-                        "[read_data] premature EOF at offset {chunk_off} (expected size {size}) for {:?}, file truncated externally?",
-                        relative_path
-                    );
-                    break false;
+            match self
+                .forward_read_chunk(
+                    (offset, want, data),
+                    (size, relative_path),
+                    &handler,
+                    &mut hasher,
+                    &tx,
+                )
+                .await
+            {
+                Ok(Some(length)) => bytes_read += length,
+                Ok(None) => break,
+                Err(error) => {
+                    first_error = Some(error);
+                    break;
                 }
-                let len = data.len() as u64;
-                if let Some(ref mut h) = hasher {
-                    h.update(&data);
-                }
-                if tx
-                    .send(DataChunk {
-                        offset: chunk_off,
-                        data,
-                    })
-                    .await
-                    .is_err()
-                {
-                    // 下游 receiver 关闭：协作取消信号（与旧实现一致），不算读错误。
-                    trace!("Data channel closed for file {:?}", relative_path);
-                    break false;
-                }
-                bytes_read += len;
-                chunk_off += len;
-                if chunk_off >= chunk_end {
-                    break true;
-                }
-                // partial 短读（罕见，server 资源压力）：串行补读剩余部分。
-                #[allow(clippy::cast_possible_truncation)]
-                let remaining = (chunk_end - chunk_off) as u32;
-                match self
-                    .mount
-                    .read(handler.inner.fh.clone(), chunk_off, remaining)
-                    .await
-                {
-                    Ok(d) => data = d,
-                    Err(e) => {
-                        first_error = Some(StorageError::NfsError(format!(
-                            "Failed to read file {relative_path:?} at offset {chunk_off}: {e}"
-                        )));
-                        break false;
-                    }
-                }
-            };
-            if !chunk_done {
-                break;
             }
         }
 
@@ -2956,14 +3018,115 @@ impl NFSStorage {
         Ok(hasher)
     }
 
+    async fn fill_read_pipeline(
+        &self,
+        inflight: &mut FuturesOrdered<NfsReadFuture>,
+        handler: &NFSFileHandle,
+        issue_offset: &mut u64,
+        size: u64,
+        chunk_size: u64,
+        qos: Option<&QosManager>,
+    ) {
+        while inflight.len() < DEFAULT_READ_INFLIGHT && *issue_offset < size {
+            if let Some(qos) = qos {
+                qos.acquire(chunk_size).await;
+            }
+            let length = chunk_size.min(size - *issue_offset);
+            let count = u32::try_from(length)
+                .unwrap_or_else(|_| unreachable!("NFS read size is capped below u32::MAX"));
+            let offset = *issue_offset;
+            let mount = self.mount.clone();
+            let file_handle = handler.inner.fh.clone();
+            inflight.push_back(Box::pin(async move {
+                let result = mount.read(file_handle, offset, count).await;
+                (offset, count, result)
+            }));
+            *issue_offset += length;
+        }
+    }
+
+    async fn forward_read_chunk(
+        &self,
+        chunk: (u64, u32, Bytes),
+        file: (u64, &Path),
+        handler: &NFSFileHandle,
+        hasher: &mut Option<HashCalculator>,
+        tx: &mpsc::Sender<DataChunk>,
+    ) -> Result<Option<u64>> {
+        let (mut offset, count, mut data) = chunk;
+        let (file_size, relative_path) = file;
+        let chunk_end = offset + u64::from(count);
+        let mut forwarded = 0;
+        loop {
+            if data.is_empty() {
+                warn!(
+                    "[read_data] premature EOF at offset {offset} (expected size {file_size}) for {relative_path:?}"
+                );
+                return Ok(None);
+            }
+            let length = data.len() as u64;
+            if let Some(hasher) = hasher {
+                hasher.update(&data);
+            }
+            if tx.send(DataChunk { offset, data }).await.is_err() {
+                trace!("Data channel closed for file {relative_path:?}");
+                return Ok(None);
+            }
+            forwarded += length;
+            offset += length;
+            if offset >= chunk_end {
+                return Ok(Some(forwarded));
+            }
+            let remaining = u32::try_from(chunk_end - offset)
+                .unwrap_or_else(|_| unreachable!("NFS chunk remainder is below u32::MAX"));
+            data = self
+                .mount
+                .read(handler.inner.fh.clone(), offset, remaining)
+                .await
+                .map_err(|error| {
+                    StorageError::NfsError(format!(
+                        "Failed to read file {} at offset {offset}: {error}",
+                        relative_path.display()
+                    ))
+                })?;
+        }
+    }
+
+    async fn read_after_stale_refresh(
+        &self,
+        handler: &mut NFSFileHandle,
+        relative_path: &Path,
+        offset: u64,
+        count: u32,
+        refreshed: &mut bool,
+    ) -> Result<Bytes> {
+        if !*refreshed {
+            debug!(
+                "[read_data] stale handle, refreshing fh for {:?}",
+                handler.path
+            );
+            handler.inner = Arc::new(self.lookup_fh(&handler.path).await?);
+            *refreshed = true;
+        }
+        self.mount
+            .read(handler.inner.fh.clone(), offset, count)
+            .await
+            .map_err(|error| {
+                StorageError::NfsError(format!(
+                    "Failed to read file {} at offset {offset} after refresh: {error}",
+                    relative_path.display()
+                ))
+            })
+    }
+
     /// 返回实际写入的累计字节数（写端本地计数，issue #58）。
     pub(crate) async fn write_data(
         &self,
         rx: mpsc::Receiver<DataChunk>,
         relative_path: &Path,
-        #[allow(unused)] uid: Option<u32>,
-        #[allow(unused)] gid: Option<u32>,
-        #[allow(unused)] mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: Option<u32>,
         bytes_counter: Option<Arc<AtomicU64>>,
     ) -> Result<u64> {
         trace!("Starting write_data_task for file {:?}", relative_path);
@@ -3045,17 +3208,16 @@ impl NFSStorage {
         let result = async {
             for &(start, end) in intervals {
                 let mut issue_offset = start;
-                type ReadFut =
-                    Pin<Box<dyn Future<Output = (u64, u32, nfs_rs::Result<Bytes>)> + Send>>;
-                let mut inflight: FuturesOrdered<ReadFut> = FuturesOrdered::new();
+                let mut inflight: FuturesOrdered<NfsReadFuture> = FuturesOrdered::new();
                 loop {
                     while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < end {
                         if let Some(ref qos) = qos {
                             qos.acquire(chunk_size).await;
                         }
                         let want_u64 = std::cmp::min(chunk_size, end - issue_offset);
-                        #[allow(clippy::cast_possible_truncation)]
-                        let want = want_u64 as u32;
+                        let want = u32::try_from(want_u64).unwrap_or_else(|_| {
+                            unreachable!("NFS read size is capped below u32::MAX")
+                        });
                         let offset = issue_offset;
                         let mount = self.mount.clone();
                         let fh = handler.inner.fh.clone();
@@ -3089,7 +3251,7 @@ impl NFSStorage {
 
     /// 续写到 `.part` 文件：打开已存在文件**不截断**，按 `chunk.offset` 写入（inflight pipeline）。
     ///
-    /// 正确性：NFS WRITE 以 FILE_SYNC 稳定级发送，返回即落盘，故每个 WRITE 成功完成后
+    /// 正确性：NFS WRITE 以 `FILE_SYNC` 稳定级发送，返回即落盘，故每个 WRITE 成功完成后
     /// 立即对该 chunk 触发 `on_committed`，进度记录不会超前于真实数据。
     pub(crate) async fn write_data_resumable(
         &self,
@@ -3098,9 +3260,12 @@ impl NFSStorage {
         uid: Option<u32>,
         gid: Option<u32>,
         mode: Option<u32>,
-        bytes_counter: Option<Arc<AtomicU64>>,
-        on_committed: crate::CommitCallback,
+        progress: crate::storage_enum::WriteProgress,
     ) -> Result<()> {
+        let crate::storage_enum::WriteProgress {
+            bytes_counter,
+            on_committed,
+        } = progress;
         let path_to_use = self.calculate_relative_path(part_path);
         // create_file 不截断：保留 .part 已写字节（续传基础）
         let dest_file = self.create_file(&path_to_use, uid, gid, mode).await?;
@@ -3152,6 +3317,82 @@ impl NFSStorage {
     // walkdir_2: 目录分页 + NDX 编号 + 并行预读
     // ============================================================
 
+    fn read_dir_filter_decision(
+        ctx: &crate::dir_tree::ReadContext,
+        file_name: &str,
+        relative_path: &str,
+        extension: Option<&str>,
+        attrs: &Attr,
+    ) -> (bool, bool, bool) {
+        if !ctx.apply_filter {
+            return (false, true, false);
+        }
+        let file_type = if attrs.type_ == FType3::NF3LNK as u32 {
+            "symlink"
+        } else if attrs.type_ == FType3::NF3DIR as u32 {
+            "dir"
+        } else {
+            "file"
+        };
+        should_skip(
+            ctx.match_expr.as_ref().as_ref(),
+            ctx.exclude_expr.as_ref().as_ref(),
+            FilterInput {
+                file_name: Some(file_name),
+                file_path: Some(relative_path),
+                file_type: Some(file_type),
+                modified_epoch: Some(i64::from(attrs.mtime.seconds)),
+                size: Some(attrs.filesize),
+                extension: extension.or(Some("")),
+            },
+        )
+    }
+
+    async fn refresh_read_dir_fh(&self, dir_path: &str) -> Result<Bytes> {
+        let generation = self.refresh_generation.load(Ordering::Acquire);
+        self.maybe_refresh_root_fh(generation).await?;
+        let root_fh = self.get_root_fh();
+        let components = dir_path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        invalidate_path_cache(&components, &root_fh);
+        self.lookup_fh(Path::new(dir_path))
+            .await
+            .map(|object| object.fh)
+    }
+
+    fn classify_read_entry(
+        ctx: &crate::dir_tree::ReadContext,
+        is_dir: bool,
+        need_filter: bool,
+        entry: Arc<EntryEnum>,
+        files: &mut Vec<Arc<EntryEnum>>,
+        subdirs: &mut Vec<crate::dir_tree::SubdirEntry>,
+    ) {
+        if !is_dir || ctx.max_depth > 0 && ctx.current_depth + 1 >= ctx.max_depth {
+            files.push(entry);
+        } else {
+            subdirs.push(crate::dir_tree::SubdirEntry {
+                entry,
+                visible: true,
+                need_filter,
+            });
+        }
+    }
+
+    fn should_retry_readdir(error: &NfsError, retries: u8, errors: &mut Vec<String>) -> bool {
+        if retries < MAX_STALE_RETRIES
+            && (is_retryable_with_invalidation(error) || is_server_busy(error))
+        {
+            true
+        } else {
+            errors.push(format!("readdirplus error: {error}"));
+            false
+        }
+    }
+
     /// 读取单个 NFS 目录，返回排序后的 files + subdirs。
     pub(crate) async fn read_dir_sorted(
         &self,
@@ -3159,7 +3400,7 @@ impl NFSStorage {
         handle: &crate::dir_tree::DirHandle,
         ctx: &crate::dir_tree::ReadContext,
     ) -> Result<crate::dir_tree::ReadResult> {
-        use crate::dir_tree::{DirHandle, ReadResult, SubdirEntry};
+        use crate::dir_tree::{DirHandle, SubdirEntry};
 
         let (fh, nfs_dir_path) = match handle {
             DirHandle::Nfs { fh, path } => (fh.clone(), path.clone()),
@@ -3186,19 +3427,10 @@ impl NFSStorage {
                 let entry = match entry_result {
                     Ok(e) => e,
                     Err(e) => {
-                        let err_msg = e.to_string();
-                        // 流式 readdirplus 中途出错的重试条件：
-                        //   - is_retryable_with_invalidation: STALE/BADHANDLE/NOENT，刷新 root_fh 后从头重试
-                        //   - is_server_busy: NFS4ERR_DELAY 在 nfs-rs 内部重试耗尽后仍未恢复，
-                        //                     此时延时后从头 readdirplus 比"丢弃失败 entry"安全
-                        //                     （后者导致计数 silent data loss）
-                        if retries < MAX_STALE_RETRIES
-                            && (is_retryable_with_invalidation(&e) || is_server_busy(&e))
-                        {
+                        if Self::should_retry_readdir(&e, retries, &mut errors) {
                             stale = true;
                             break;
                         }
-                        errors.push(format!("readdirplus error: {err_msg}"));
                         continue;
                     }
                 };
@@ -3213,52 +3445,35 @@ impl NFSStorage {
                 };
 
                 let is_dir = attrs.type_ == FType3::NF3DIR as u32;
-                let is_symlink = attrs.type_ == FType3::NF3LNK as u32;
                 let relative_path = self.build_relative_path(&nfs_dir_path, &entry.file_name);
                 let extension = entry
                     .file_name
                     .rsplit_once('.')
                     .map(|(_, ext)| ext.to_string());
 
-                // filter（仅当 apply_filter=true 时）
-                let (skip_entry, continue_scan, need_submatch) = if ctx.apply_filter {
-                    should_skip(
-                        ctx.match_expr.as_ref().as_ref(),
-                        ctx.exclude_expr.as_ref().as_ref(),
-                        FilterInput {
-                            file_name: Some(&entry.file_name),
-                            file_path: Some(&relative_path),
-                            file_type: Some(if is_symlink {
-                                "symlink"
-                            } else if is_dir {
-                                "dir"
-                            } else {
-                                "file"
-                            }),
-                            modified_epoch: Some(i64::from(attrs.mtime.seconds)),
-                            size: Some(attrs.filesize),
-                            extension: extension.as_deref().or(Some("")),
-                        },
-                    )
-                } else {
-                    (false, true, false)
-                };
+                let (skip_entry, continue_scan, need_submatch) = Self::read_dir_filter_decision(
+                    ctx,
+                    &entry.file_name,
+                    &relative_path,
+                    extension.as_deref(),
+                    &attrs,
+                );
+                let entry_enum = Arc::new(EntryEnum::NAS(NASEntry::from_nfs_attrs(
+                    entry.file_name,
+                    PathBuf::from(&relative_path),
+                    extension,
+                    &attrs,
+                    entry.handle,
+                    NfsEnrich::default(),
+                )));
 
                 if skip_entry {
                     if is_dir
                         && continue_scan
                         && (ctx.max_depth == 0 || ctx.current_depth + 1 < ctx.max_depth)
                     {
-                        let nas = NASEntry::from_nfs_attrs(
-                            entry.file_name,
-                            PathBuf::from(&relative_path),
-                            extension,
-                            &attrs,
-                            entry.handle.clone(),
-                            NfsEnrich::default(),
-                        );
                         subdirs.push(SubdirEntry {
-                            entry: Arc::new(EntryEnum::NAS(nas)),
+                            entry: entry_enum,
                             visible: false,
                             need_filter: need_submatch,
                         });
@@ -3266,43 +3481,21 @@ impl NFSStorage {
                     continue;
                 }
 
-                let nas = NASEntry::from_nfs_attrs(
-                    entry.file_name,
-                    PathBuf::from(&relative_path),
-                    extension,
-                    &attrs,
-                    entry.handle.clone(),
-                    NfsEnrich::default(),
+                Self::classify_read_entry(
+                    ctx,
+                    is_dir,
+                    need_submatch,
+                    entry_enum,
+                    &mut files,
+                    &mut subdirs,
                 );
-                let entry_enum = Arc::new(EntryEnum::NAS(nas));
-
-                if is_dir && ctx.max_depth > 0 && ctx.current_depth + 1 >= ctx.max_depth {
-                    files.push(entry_enum);
-                } else if is_dir {
-                    subdirs.push(SubdirEntry {
-                        entry: entry_enum,
-                        visible: true,
-                        need_filter: need_submatch,
-                    });
-                } else {
-                    files.push(entry_enum);
-                }
             }
 
             if stale && retries < MAX_STALE_RETRIES {
                 retries += 1;
-                let stale_gen = self.refresh_generation.load(Ordering::Acquire);
-                self.maybe_refresh_root_fh(stale_gen).await?;
-                let root_fh = self.get_root_fh();
-                let path_components: Vec<String> = nfs_dir_path
-                    .split('/')
-                    .filter(|s| !s.is_empty())
-                    .map(std::string::ToString::to_string)
-                    .collect();
-                invalidate_path_cache(&path_components, &root_fh);
-                match self.lookup_fh(Path::new(&nfs_dir_path)).await {
-                    Ok(obj) => {
-                        current_fh = obj.fh;
+                match self.refresh_read_dir_fh(&nfs_dir_path).await {
+                    Ok(file_handle) => {
+                        current_fh = file_handle;
                         files.clear();
                         subdirs.clear();
                         errors.clear();
@@ -3317,19 +3510,30 @@ impl NFSStorage {
             break;
         }
 
-        // 排序
-        files.sort_by(|a, b| a.get_name().cmp(b.get_name()));
-        subdirs.sort_by(|a, b| a.entry.get_name().cmp(b.entry.get_name()));
+        Ok(Self::finish_read_dir(dir_path, files, subdirs, errors))
+    }
 
-        Ok(ReadResult {
+    fn finish_read_dir(
+        dir_path: &str,
+        mut files: Vec<Arc<EntryEnum>>,
+        mut subdirs: Vec<crate::dir_tree::SubdirEntry>,
+        errors: Vec<String>,
+    ) -> crate::dir_tree::ReadResult {
+        files.sort_by(|left, right| left.get_name().cmp(right.get_name()));
+        subdirs.sort_by(|left, right| left.entry.get_name().cmp(right.entry.get_name()));
+        crate::dir_tree::ReadResult {
             dir_path: dir_path.to_string(),
             files,
             subdirs,
             errors,
-        })
+        }
     }
 
     /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested storage operation cannot be completed.
     pub async fn walkdir_2(
         &self,
         sub_path: Option<&Path>,
@@ -3402,6 +3606,10 @@ impl NFSStorage {
 /// - `url`：NFS URL 字符串
 /// - `block_size`：可选的块大小，默认值为 2MB
 /// - `ensure_dir`：true（目标端）时 prefix 目录不存在则自动创建；false（源端）时不存在报错
+///
+/// # Errors
+///
+/// Returns an error when the requested storage operation cannot be completed.
 pub async fn create_nfs_storage(
     url: &str,
     block_size: Option<u64>,
@@ -3445,55 +3653,61 @@ fn next_read_want(cur: u64, end: u64, block_size: u64) -> Option<u32> {
     if cur >= end {
         return None;
     }
-    Some(u64::min(end - cur, block_size) as u32)
+    Some(u32::try_from(u64::min(end - cur, block_size)).unwrap_or(u32::MAX))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AssertTestValue;
 
     #[test]
     fn test_parse_nfs_url() {
         // 测试标准格式：nfs://server/path:root_dir
-        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path:root_dir").unwrap();
+        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path:root_dir")
+            .assert_value("test value should be present");
         assert_eq!(nfs_url, "nfs://server/path?uid=0&gid=0");
         assert_eq!(root_dir, "root_dir");
 
         // 测试没有根目录的格式：nfs://server/path
-        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path").unwrap();
+        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path")
+            .assert_value("test value should be present");
         assert_eq!(nfs_url, "nfs://server/path?uid=0&gid=0");
         assert_eq!(root_dir, "");
 
         // 测试带有查询参数的格式
-        let (nfs_url, root_dir) =
-            NFSStorage::parse_nfs_url("nfs://server/path:root_dir?foo=bar").unwrap();
+        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path:root_dir?foo=bar")
+            .assert_value("test value should be present");
         assert_eq!(nfs_url, "nfs://server/path?foo=bar&uid=0&gid=0");
         assert_eq!(root_dir, "root_dir");
 
         // 测试带有 uid 参数的格式
-        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path?uid=1000").unwrap();
+        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path?uid=1000")
+            .assert_value("test value should be present");
         assert_eq!(nfs_url, "nfs://server/path?uid=1000&gid=0");
         assert_eq!(root_dir, "");
 
         // 测试带有 gid 参数的格式
-        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path?gid=1000").unwrap();
+        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path?gid=1000")
+            .assert_value("test value should be present");
         assert_eq!(nfs_url, "nfs://server/path?gid=1000&uid=0");
         assert_eq!(root_dir, "");
 
         // 测试带有 uid 和 gid 参数的格式
-        let (nfs_url, root_dir) =
-            NFSStorage::parse_nfs_url("nfs://server/path?uid=1000&gid=1000").unwrap();
+        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path?uid=1000&gid=1000")
+            .assert_value("test value should be present");
         assert_eq!(nfs_url, "nfs://server/path?uid=1000&gid=1000");
         assert_eq!(root_dir, "");
 
         // 测试没有路径的格式：nfs://server
-        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server").unwrap();
+        let (nfs_url, root_dir) =
+            NFSStorage::parse_nfs_url("nfs://server").assert_value("test value should be present");
         assert_eq!(nfs_url, "nfs://server/?uid=0&gid=0");
         assert_eq!(root_dir, "");
 
         // 测试带前导斜杠的 root_dir
-        let (nfs_url, root_dir) =
-            NFSStorage::parse_nfs_url("nfs://server/path:/prefix/dir").unwrap();
+        let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path:/prefix/dir")
+            .assert_value("test value should be present");
         assert_eq!(nfs_url, "nfs://server/path?uid=0&gid=0");
         assert_eq!(root_dir, "prefix/dir");
 
@@ -3755,7 +3969,7 @@ mod tests {
     /// 生成不重复模式的内容，偏移错位时字节比对必然失败
     fn make_content(len: usize) -> Bytes {
         (0..len)
-            .map(|i| (i % 251) as u8)
+            .map(|i| u8::try_from(i % 251).unwrap_or_default())
             .collect::<Vec<u8>>()
             .into()
     }
@@ -3778,7 +3992,9 @@ mod tests {
         let mut calls = Vec::new();
         while let Some(want) = next_read_want(cur, end, block_size) {
             calls.push((cur, want));
-            let start = usize::min(cur as usize, content.len());
+            let start = usize::try_from(cur)
+                .unwrap_or(usize::MAX)
+                .min(content.len());
             let len = usize::min(
                 usize::min(want as usize, max_per_call),
                 content.len() - start,

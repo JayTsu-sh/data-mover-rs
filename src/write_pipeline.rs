@@ -1,7 +1,7 @@
 //! NFS/CIFS/Local 写入管道消重（issue #21 PR#A）。
 //!
 //! `ChunkSink` 吸收三种后端的写原语与落盘屏障差异（Local `sync_all` /
-//! NFS FILE_SYNC no-op / CIFS `flush`），`write_pipeline_core` 统一 inflight
+//! NFS `FILE_SYNC` no-op / CIFS `flush`），`write_pipeline_core` 统一 inflight
 //! 并发调度、分块派发、错误处理与进度上报时序。三种后端各自的
 //! `write_data`/`write_data_resumable` 收薄为「开文件（截断/不截断）→ 构造
 //! sink → 调用 core → close」。
@@ -52,7 +52,7 @@ pub(crate) trait ChunkSink: Sync {
 pub(crate) enum CommitPolicy {
     /// 不上报进度（`write_data` 全量写：无续传状态需要维护）。
     None,
-    /// 每个 chunk 写完立即上报（NFS：FILE_SYNC 写返回即落盘，无需额外屏障）。
+    /// 每个 chunk `写完立即上报（NFS：FILE_SYNC` 写返回即落盘，无需额外屏障）。
     PerChunk(CommitCallback),
     /// 每累计 `every` 个已写 chunk 做一次 `flush` 落盘屏障，屏障之后才批量上报
     /// 这批 chunk（Local `sync_all` / CIFS `flush`：写本身不保证落盘，需要显式
@@ -71,7 +71,7 @@ async fn settle<S: ChunkSink>(
     commit: &CommitPolicy,
     first_error: &mut Option<StorageError>,
     pending: &mut Vec<(u64, u64)>,
-    bytes_counter: &Option<Arc<AtomicU64>>,
+    bytes_counter: Option<&Arc<AtomicU64>>,
     total_written: &mut u64,
 ) -> bool {
     let was_ok = first_error.is_none();
@@ -88,9 +88,8 @@ async fn settle<S: ChunkSink>(
                 CommitPolicy::Barrier { .. } => pending.push((offset, written)),
             }
         }
-        Ok(_) => {} // 出错之后的"侥幸成功" chunk 不计入有效进度
         Err(e) if was_ok => *first_error = Some(e),
-        Err(_) => {} // 已有 first_error，丢弃后续错误
+        Ok(_) | Err(_) => {} // 已出错后的完成结果不再影响首个错误或有效进度
     }
 
     // Barrier 策略：累计达到阈值时做一次落盘屏障，屏障后批量上报。
@@ -148,9 +147,9 @@ pub(crate) async fn write_pipeline_core<S: ChunkSink>(
         let DataChunk { offset, data } = chunk;
 
         let pieces: Vec<(u64, Bytes)> = match sub_chunk_size {
-            #[allow(clippy::cast_possible_truncation)]
             Some(n) if data.len() as u64 > n => {
-                let n = n as usize;
+                let n = usize::try_from(n)
+                    .unwrap_or_else(|_| unreachable!("n is smaller than data.len()"));
                 let total = data.len();
                 let mut v = Vec::with_capacity(total.div_ceil(n));
                 let mut idx = 0usize;
@@ -184,7 +183,7 @@ pub(crate) async fn write_pipeline_core<S: ChunkSink>(
                     &commit,
                     &mut first_error,
                     &mut pending,
-                    &bytes_counter,
+                    bytes_counter.as_ref(),
                     &mut total_written,
                 )
                 .await
@@ -203,7 +202,7 @@ pub(crate) async fn write_pipeline_core<S: ChunkSink>(
             &commit,
             &mut first_error,
             &mut pending,
-            &bytes_counter,
+            bytes_counter.as_ref(),
             &mut total_written,
         )
         .await;

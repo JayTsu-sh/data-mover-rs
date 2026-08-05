@@ -6,77 +6,106 @@
 //! 残留旧内容的尾部字节（数据损坏）。
 //!
 //! Local-only — no S3/NFS server required.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use std::path::Path;
 
 use data_mover::StorageEnum;
+mod common;
+use common::AssertTestValue;
 
 const BLOCK: u64 = 2 * 1024 * 1024; // 与 LocalStorage 默认 block_size 一致
 
 async fn reset_dirs(src: &str, dst: &str) {
     let _ = tokio::fs::remove_dir_all(src).await;
     let _ = tokio::fs::remove_dir_all(dst).await;
-    tokio::fs::create_dir_all(src).await.unwrap();
-    tokio::fs::create_dir_all(dst).await.unwrap();
+    tokio::fs::create_dir_all(src)
+        .await
+        .assert_value("test value should be present");
+    tokio::fs::create_dir_all(dst)
+        .await
+        .assert_value("test value should be present");
 }
 
 async fn write_pattern(path: &str, size: usize, seed: u8) {
     use tokio::io::AsyncWriteExt;
-    let mut f = tokio::fs::File::create(path).await.unwrap();
+    let mut f = tokio::fs::File::create(path)
+        .await
+        .assert_value("test value should be present");
     let buf: Vec<u8> = (0..size)
-        .map(|i| ((i as u8).wrapping_add(seed)) % 251)
+        .map(|i| (u8::try_from(i % 256).unwrap_or_default().wrapping_add(seed)) % 251)
         .collect();
-    f.write_all(&buf).await.unwrap();
-    f.flush().await.unwrap();
+    f.write_all(&buf)
+        .await
+        .assert_value("test value should be present");
+    f.flush().await.assert_value("test value should be present");
 }
 
 fn pattern_vec(size: usize, seed: u8) -> Vec<u8> {
     (0..size)
-        .map(|i| ((i as u8).wrapping_add(seed)) % 251)
+        .map(|i| (u8::try_from(i % 256).unwrap_or_default().wrapping_add(seed)) % 251)
         .collect()
 }
 
-/// T0：多块（> block_size）文件覆盖场景——10MB 源覆盖为 3MB 源后，目标应精确为 3MB
+/// T0：多块（> `block_size）文件覆盖场景——10MB` 源覆盖为 3MB 源后，目标应精确为 3MB
 /// 且内容与新源完全一致，不得残留旧文件的尾部字节。
 #[tokio::test(flavor = "multi_thread")]
 async fn overwrite_shorter_file_truncates_stale_tail_multi_chunk() {
+    const BIG: usize = 10 * 1024 * 1024;
+    const SMALL: usize = 3 * 1024 * 1024;
     let src_dir = "/tmp/dm-local-truncate-multi-src";
     let dst_dir = "/tmp/dm-local-truncate-multi-dst";
     reset_dirs(src_dir, dst_dir).await;
-
-    const BIG: usize = 10 * 1024 * 1024;
-    const SMALL: usize = 3 * 1024 * 1024;
 
     write_pattern(&format!("{src_dir}/blob.bin"), BIG, 0).await;
 
     let src = data_mover::create_storage(src_dir, Some(BLOCK), false)
         .await
-        .unwrap();
+        .assert_value("test value should be present");
     let dst = data_mover::create_storage(dst_dir, Some(BLOCK), true)
         .await
-        .unwrap();
-    let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
+        .assert_value("test value should be present");
+    let entry = src
+        .get_metadata(Path::new("blob.bin"))
+        .await
+        .assert_value("test value should be present");
 
     // 第一次拷贝：生成 10MB 目标文件
-    StorageEnum::copy_file(&src, &dst, &entry, None, false, true, None)
-        .await
-        .expect("first full copy");
+    StorageEnum::copy_file(
+        &src,
+        &dst,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .assert_value("first full copy");
     let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
         .await
-        .unwrap();
+        .assert_value("test value should be present");
     assert_eq!(out.len(), BIG, "first copy should produce full-size file");
 
     // 用更短的新内容覆盖同一目标路径
     write_pattern(&format!("{src_dir}/blob.bin"), SMALL, 7).await;
-    let entry2 = src.get_metadata(Path::new("blob.bin")).await.unwrap();
-    StorageEnum::copy_file(&src, &dst, &entry2, None, false, true, None)
+    let entry2 = src
+        .get_metadata(Path::new("blob.bin"))
         .await
-        .expect("overwrite copy with shorter file");
+        .assert_value("test value should be present");
+    StorageEnum::copy_file(
+        &src,
+        &dst,
+        &entry2,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .assert_value("overwrite copy with shorter file");
 
     let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
         .await
-        .unwrap();
+        .assert_value("test value should be present");
     assert_eq!(
         out.len(),
         SMALL,
@@ -89,39 +118,60 @@ async fn overwrite_shorter_file_truncates_stale_tail_multi_chunk() {
     );
 }
 
-/// 单块（<= block_size）文件覆盖场景，覆盖 `write_file` 直写路径（同样的 truncate bug）。
+/// 单块（<= `block_size）文件覆盖场景，覆盖` `write_file` 直写路径（同样的 truncate bug）。
 #[tokio::test(flavor = "multi_thread")]
 async fn overwrite_shorter_file_truncates_stale_tail_single_chunk() {
+    const BIG: usize = 512 * 1024;
+    const SMALL: usize = 128 * 1024;
     let src_dir = "/tmp/dm-local-truncate-single-src";
     let dst_dir = "/tmp/dm-local-truncate-single-dst";
     reset_dirs(src_dir, dst_dir).await;
-
-    const BIG: usize = 512 * 1024;
-    const SMALL: usize = 128 * 1024;
 
     write_pattern(&format!("{src_dir}/blob.bin"), BIG, 0).await;
 
     let src = data_mover::create_storage(src_dir, Some(BLOCK), false)
         .await
-        .unwrap();
+        .assert_value("test value should be present");
     let dst = data_mover::create_storage(dst_dir, Some(BLOCK), true)
         .await
-        .unwrap();
-    let entry = src.get_metadata(Path::new("blob.bin")).await.unwrap();
-
-    StorageEnum::copy_file(&src, &dst, &entry, None, false, true, None)
+        .assert_value("test value should be present");
+    let entry = src
+        .get_metadata(Path::new("blob.bin"))
         .await
-        .expect("first full copy");
+        .assert_value("test value should be present");
+
+    StorageEnum::copy_file(
+        &src,
+        &dst,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .assert_value("first full copy");
 
     write_pattern(&format!("{src_dir}/blob.bin"), SMALL, 3).await;
-    let entry2 = src.get_metadata(Path::new("blob.bin")).await.unwrap();
-    StorageEnum::copy_file(&src, &dst, &entry2, None, false, true, None)
+    let entry2 = src
+        .get_metadata(Path::new("blob.bin"))
         .await
-        .expect("overwrite copy with shorter file");
+        .assert_value("test value should be present");
+    StorageEnum::copy_file(
+        &src,
+        &dst,
+        &entry2,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .assert_value("overwrite copy with shorter file");
 
     let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
         .await
-        .unwrap();
+        .assert_value("test value should be present");
     assert_eq!(
         out.len(),
         SMALL,

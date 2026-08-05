@@ -8,9 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # 注: 暂不全局 RUSTFLAGS=-D warnings —— 项目当前 baseline ~173 条 clippy warnings
-  # (见 .claude/skills/quality-clippy/baseline_count.txt). quality-clippy skill 用
-  # baseline 化检查防回退. 长期目标 baseline=0 后再切回 -D warnings.
 
 jobs:
   ci:
@@ -43,7 +40,7 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy (baseline-aware)
+      - name: cargo clippy (all targets, deny warnings)
         run: python3 .claude/skills/quality-clippy/scripts/run.py
 
       - name: cargo test

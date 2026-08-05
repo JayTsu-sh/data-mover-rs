@@ -44,7 +44,10 @@ async fn main() -> Result<()> {
 
     // 创建进度条
     let pb = ProgressBar::new_spinner();
-    pb.set_style(ProgressStyle::with_template("{spinner} [{elapsed_precise}] {msg}").unwrap());
+    pb.set_style(
+        ProgressStyle::with_template("{spinner} [{elapsed_precise}] {msg}")
+            .map_err(|error| data_mover::error::StorageError::OperationError(error.to_string()))?,
+    );
     pb.set_message("Scanning files...");
     pb.enable_steady_tick(Duration::from_millis(100));
 
@@ -91,7 +94,7 @@ async fn main() -> Result<()> {
                         stats.files += 1;
                     }
                 }
-                _ => continue,
+                EntryEnum::S3(_) => {}
             },
             StorageEntryMessage::Error { path, reason, .. } => {
                 println!("Error for {}: {}", path.display(), reason);
@@ -111,7 +114,7 @@ async fn main() -> Result<()> {
     println!("Total entries: {}", stats.total_entries);
     println!("Directories: {}", stats.directories);
     println!("Files: {}", stats.files);
-    println!("Scan time: {:?}", duration);
+    println!("Scan time: {duration:?}");
 
     Ok(())
 }

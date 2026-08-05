@@ -1,3 +1,4 @@
+use num_traits::ToPrimitive;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,7 +45,8 @@ pub use nfs::NFSStorage;
 pub use qos::QosManager;
 pub use s3::{MultipartUpload, S3BucketInfo, S3CompletedPart, S3Storage};
 pub use storage_enum::{
-    StorageEnum, StorageType, StreamHandle, WalkOptions, create_storage, detect_storage_type,
+    CopyOptions, StorageEnum, StorageType, StreamHandle, TarPackOptions, WalkOptions,
+    create_storage, detect_storage_type,
 };
 pub use tar_pack::calculate_tar_size;
 pub use url_redact::redact_storage_url;
@@ -81,6 +83,56 @@ pub type DeleteDirIterator = AsyncReceiver<DeleteEvent>;
 
 pub type Result<T> = std::result::Result<T, error::StorageError>;
 
+#[cfg(test)]
+trait AssertTestValue {
+    type Value;
+
+    fn assert_value(self, context: &str) -> Self::Value;
+}
+
+#[cfg(test)]
+trait AssertTestError {
+    type Error;
+
+    fn assert_error(self, context: &str) -> Self::Error;
+}
+
+#[cfg(test)]
+impl<T, E> AssertTestError for std::result::Result<T, E> {
+    type Error = E;
+
+    fn assert_error(self, context: &str) -> E {
+        match self {
+            Ok(_) => panic!("{context}"),
+            Err(error) => error,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<T, E: std::fmt::Debug> AssertTestValue for std::result::Result<T, E> {
+    type Value = T;
+
+    fn assert_value(self, context: &str) -> T {
+        match self {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<T> AssertTestValue for Option<T> {
+    type Value = T;
+
+    fn assert_value(self, context: &str) -> T {
+        match self {
+            Some(value) => value,
+            None => panic!("{context}"),
+        }
+    }
+}
+
 /// `walkdir_2` 输出的异步迭代器类型
 pub type WalkDirAsyncIterator2 = AsyncReceiver<dir_tree::NdxEvent>;
 
@@ -89,6 +141,10 @@ pub const KB: u64 = 1024;
 pub const MB: u64 = 1024 * KB;
 
 /// 规范化路径：NFS/S3 路径原样返回，本地路径转换为绝对路径
+///
+/// # Errors
+///
+/// Returns an error when the requested storage operation cannot be completed.
 pub fn canonicalize_path(path: &str) -> std::io::Result<String> {
     match detect_storage_type(path) {
         StorageType::Nfs | StorageType::S3 | StorageType::Cifs => Ok(path.to_string()),
@@ -100,10 +156,15 @@ pub fn canonicalize_path(path: &str) -> std::io::Result<String> {
 }
 
 /// 将纳秒时间戳转换为YYYY-MM-DD HHMMSS格式的字符串
+#[must_use]
 pub fn datetime_to_string(time: i64) -> String {
-    // 创建一个SystemTime对象，然后转换为chrono::DateTime
-    let system_time =
-        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(time as u64);
+    let magnitude = std::time::Duration::from_nanos(time.unsigned_abs());
+    let system_time = if time.is_negative() {
+        std::time::SystemTime::UNIX_EPOCH.checked_sub(magnitude)
+    } else {
+        std::time::SystemTime::UNIX_EPOCH.checked_add(magnitude)
+    }
+    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     let datetime: chrono::DateTime<chrono::Utc> = system_time.into();
     datetime.format("%Y-%m-%d %H:%M:%S%.9f").to_string()
 }
@@ -336,9 +397,9 @@ impl fmt::Display for ErrorEvent {
 
 /// 变更的维度：用于区分内容变更、元数据变更、或两者同时变更
 ///
-/// - `DataOnly`：size 或 mtime 不同（内容变了），属性 mode/uid/gid 未变 → 需 copy_file + set_metadata
-/// - `MetadataOnly`：size 和 mtime 相同，但 mode/uid/gid 至少一项不同（chmod/chown）→ 只需 set_metadata，跳过 copy_file
-/// - `Both`：内容和属性都变了 → 需 copy_file + set_metadata
+/// - `DataOnly`：size 或 mtime 不同（内容变了），属性 mode/uid/gid 未变 → 需 `copy_file` + `set_metadata`
+/// - `MetadataOnly`：size 和 mtime 相同，但 mode/uid/gid 至少一项不同（chmod/chown）→ 只需 `set_metadata，跳过` `copy_file`
+/// - `Both`：内容和属性都变了 → 需 `copy_file` + `set_metadata`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeKind {
     DataOnly,
@@ -574,6 +635,7 @@ pub type WalkDirAsyncIterator = AsyncReceiver<StorageEntryMessage>;
 /// - 正数表示time晚于now
 /// - 负数表示time早于now
 /// - 0表示两个时间相同
+#[must_use]
 pub fn days_between(now: SystemTime, time: SystemTime) -> f64 {
     // 计算两个时间点之间的持续时间
     let duration = if now <= time {
@@ -583,7 +645,7 @@ pub fn days_between(now: SystemTime, time: SystemTime) -> f64 {
     };
 
     // 将持续时间转换为天数（f64）
-    let seconds = duration.as_secs() as f64;
+    let seconds = duration.as_secs().to_f64().unwrap_or(f64::MAX);
     let nanoseconds = f64::from(duration.subsec_nanos());
     let total_seconds = seconds + nanoseconds / 1_000_000_000.0;
 

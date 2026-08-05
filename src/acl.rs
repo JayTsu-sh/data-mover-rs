@@ -1,5 +1,4 @@
-// Windows ACL 操作需要大量 FFI 调用（SID/DACL 指针、LocalFree 等）
-#![allow(unsafe_code)]
+// Windows ACL operations require audited raw-pointer FFI at the individual call sites.
 
 // 标准库
 use std::ffi::c_void;
@@ -306,6 +305,7 @@ fn path_to_wide(path: &Path) -> Vec<u16> {
 pub fn get_security_info(path: &Path) -> Result<SecurityInfo> {
     let path_wide = path_to_wide(path);
 
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     unsafe {
         let (sd, owner_sid, group_sid, dacl) = get_security_descriptor(path_wide.as_ptr())?;
 
@@ -382,6 +382,7 @@ pub fn get_security_info(path: &Path) -> Result<SecurityInfo> {
 fn parse_dacl_entries(dacl: *mut ACL) -> Result<Vec<AceInfo>> {
     let mut aces = Vec::new();
 
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     unsafe {
         let mut acl_size_info: ACL_SIZE_INFORMATION = std::mem::zeroed();
 
@@ -415,6 +416,7 @@ fn parse_dacl_entries(dacl: *mut ACL) -> Result<Vec<AceInfo>> {
 }
 
 fn parse_ace(ace_header: *mut ACE_HEADER) -> Option<AceInfo> {
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     unsafe {
         let ace_type = (*ace_header).AceType;
         let ace_flags = (*ace_header).AceFlags;
@@ -474,6 +476,7 @@ fn parse_ace_common(
 
     let inherited = (ace_flags & INHERITED_ACE as u8) != 0;
 
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     let trustee_type = unsafe {
         if IsValidSid(sid as PSID) != 0 {
             // 这里可以进一步判断SID类型（用户、组等）
@@ -495,6 +498,7 @@ fn parse_ace_common(
 }
 
 fn lookup_sid_name(sid: PSID) -> Result<String> {
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     unsafe {
         let mut name_buffer = [0u16; MAX_PATH as usize];
         let mut domain_buffer = [0u16; MAX_PATH as usize];
@@ -536,6 +540,7 @@ fn lookup_sid_name(sid: PSID) -> Result<String> {
 }
 
 fn sid_to_string(sid: PSID) -> Result<String> {
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     unsafe {
         if IsValidSid(sid) == 0 {
             return Err(StorageError::WinAceError("Invalid SID".to_string()));
@@ -574,6 +579,7 @@ fn sid_to_string(sid: PSID) -> Result<String> {
 pub fn set_inheritance_protect(path: &Path, inheritance_protect: bool) -> Result<()> {
     let path_wide = path_to_wide(path);
 
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     let result = unsafe {
         // 获取当前的安全描述符
         let mut security_descriptor: *mut c_void = ptr::null_mut();
@@ -702,6 +708,7 @@ fn get_security_descriptor(
     let mut group_sid: *mut c_void = ptr::null_mut();
     let mut dacl: *mut ACL = ptr::null_mut();
 
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     unsafe {
         let result = GetNamedSecurityInfoW(
             path_wide,
@@ -730,6 +737,7 @@ fn get_inheritance_enabled(sd: *mut c_void) -> Result<bool> {
     let mut control: SECURITY_DESCRIPTOR_CONTROL = 0;
     let mut revision: u32 = 0;
 
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     unsafe {
         if GetSecurityDescriptorControl(sd, &mut control, &mut revision) == 0 {
             return Err(StorageError::WinAceError(
@@ -745,6 +753,7 @@ fn get_inheritance_enabled(sd: *mut c_void) -> Result<bool> {
 
 /// 获取非继承的ACE并创建新的ACL
 fn get_explicit_aces(dacl: *mut ACL) -> Result<(*mut ACL, u32)> {
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     unsafe {
         let mut acl_info: ACL_SIZE_INFORMATION = std::mem::zeroed();
         let acl_info_size = std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32;
@@ -824,6 +833,7 @@ pub fn copy_acl(source_path: &Path, target_path: &Path) -> Result<()> {
     let target_path_wide = path_to_wide(target_path);
 
     // Get source DACL and inheritance information
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     let (source_dacl, source_inheritance_enabled, ace_count_copied) = unsafe {
         let (sd, _, _, dacl) = get_security_descriptor(source_path_wide.as_ptr())?;
         if dacl.is_null() {
@@ -841,6 +851,7 @@ pub fn copy_acl(source_path: &Path, target_path: &Path) -> Result<()> {
         }
     };
 
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     unsafe {
         let (sd, _, _, _) = get_security_descriptor(target_path_wide.as_ptr())?;
         let target_inheritance_enabled = get_inheritance_enabled(sd)?;
@@ -903,6 +914,7 @@ pub fn copy_acl(source_path: &Path, target_path: &Path) -> Result<()> {
 pub fn get_acl_bytes(path: &Path) -> Result<Vec<u8>> {
     let path_wide = path_to_wide(path);
 
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     unsafe {
         let (sd, _, _, _) = get_security_descriptor(path_wide.as_ptr())?;
         if sd.is_null() {
@@ -929,6 +941,7 @@ pub fn set_acl_bytes(path: &Path, acl_data: &[u8]) -> Result<()> {
 
     let path_wide = path_to_wide(path);
 
+    #[expect(unsafe_code, reason = "Win32 ACL APIs require audited raw-pointer FFI")]
     unsafe {
         let sd_ptr = acl_data.as_ptr() as *mut c_void;
 

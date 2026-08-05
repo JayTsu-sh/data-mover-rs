@@ -4,8 +4,6 @@
 //! Local-only — no S3/NFS server required. S3 特有分支（part 对齐、
 //! non-contiguous 报错、`ListParts` 反推）与 NFS/CIFS 的落盘语义差异需要真实
 //! 存储环境，未在本地覆盖；由 issue #21 测试计划标注为需在有存储环境时补跑。
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,6 +11,9 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use data_mover::error::StorageError;
 use data_mover::{CommitCallback, DataChunk, ResumeContext, StorageEnum, create_storage};
+mod common;
+use common::AssertTestValue;
+type CommittedRanges = Arc<Mutex<Vec<(u64, u64)>>>;
 
 const BLOCK: u64 = 64 * 1024;
 const SIZE: usize = 256 * 1024; // 4 blocks → multi-chunk
@@ -20,21 +21,29 @@ const SIZE: usize = 256 * 1024; // 4 blocks → multi-chunk
 async fn reset_dirs(a: &str, b: &str) {
     let _ = tokio::fs::remove_dir_all(a).await;
     let _ = tokio::fs::remove_dir_all(b).await;
-    tokio::fs::create_dir_all(a).await.unwrap();
-    tokio::fs::create_dir_all(b).await.unwrap();
+    tokio::fs::create_dir_all(a)
+        .await
+        .assert_value("test value should be present");
+    tokio::fs::create_dir_all(b)
+        .await
+        .assert_value("test value should be present");
 }
 
 async fn write_pattern(path: &str, size: usize, seed: u8) {
     use tokio::io::AsyncWriteExt;
-    let mut f = tokio::fs::File::create(path).await.unwrap();
+    let mut f = tokio::fs::File::create(path)
+        .await
+        .assert_value("test value should be present");
     let buf = pattern_vec(size, seed);
-    f.write_all(&buf).await.unwrap();
-    f.flush().await.unwrap();
+    f.write_all(&buf)
+        .await
+        .assert_value("test value should be present");
+    f.flush().await.assert_value("test value should be present");
 }
 
 fn pattern_vec(size: usize, seed: u8) -> Vec<u8> {
     (0..size)
-        .map(|i| ((i as u8).wrapping_add(seed)) % 251)
+        .map(|i| (u8::try_from(i % 256).unwrap_or_default().wrapping_add(seed)) % 251)
         .collect()
 }
 
@@ -42,11 +51,13 @@ fn noop_callback() -> CommitCallback {
     Arc::new(|_offset, _len| {})
 }
 
-fn collecting_callback() -> (CommitCallback, Arc<Mutex<Vec<(u64, u64)>>>) {
+fn collecting_callback() -> (CommitCallback, CommittedRanges) {
     let committed: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
     let c = committed.clone();
     let cb: CommitCallback = Arc::new(move |offset, len| {
-        c.lock().unwrap().push((offset, len));
+        c.lock()
+            .assert_value("test value should be present")
+            .push((offset, len));
     });
     (cb, committed)
 }
@@ -55,8 +66,13 @@ fn collecting_callback() -> (CommitCallback, Arc<Mutex<Vec<(u64, u64)>>>) {
 /// 的源目录；测试里不通过它实际读取数据，DataChunk 由测试直接手工构造。
 async fn shape_entry(dir: &str, name: &str, size: usize, seed: u8) -> data_mover::EntryEnum {
     write_pattern(&format!("{dir}/{name}"), size, seed).await;
-    let storage = create_storage(dir, Some(BLOCK), false).await.unwrap();
-    storage.get_metadata(Path::new(name)).await.unwrap()
+    let storage = create_storage(dir, Some(BLOCK), false)
+        .await
+        .assert_value("test value should be present");
+    storage
+        .get_metadata(Path::new(name))
+        .await
+        .assert_value("test value should be present")
 }
 
 /// T2：`write_chunk_stream` 顺序写 → `commit_chunk_stream`（rename）原子提交生效。
@@ -67,12 +83,14 @@ async fn t2_write_chunk_stream_sequential_then_commit_is_atomic() {
     reset_dirs(shape_dir, dst_dir).await;
 
     let entry = shape_entry(shape_dir, "blob.bin", SIZE, 0).await;
-    let dst = create_storage(dst_dir, Some(BLOCK), true).await.unwrap();
+    let dst = create_storage(dst_dir, Some(BLOCK), true)
+        .await
+        .assert_value("test value should be present");
     let part_path = Path::new("blob.bin.terrasync-part");
 
     let (missing, handle) = StorageEnum::resume_prepare(&dst, &entry, part_path, false)
         .await
-        .expect("resume_prepare");
+        .assert_value("resume_prepare");
     assert_eq!(
         missing,
         vec![(0, SIZE as u64)],
@@ -87,30 +105,40 @@ async fn t2_write_chunk_stream_sequential_then_commit_is_atomic() {
         data: Bytes::copy_from_slice(&full[..half]),
     })
     .await
-    .unwrap();
+    .assert_value("test value should be present");
     tx.send(DataChunk {
         offset: half as u64,
         data: Bytes::copy_from_slice(&full[half..]),
     })
     .await
-    .unwrap();
+    .assert_value("test value should be present");
     drop(tx);
 
     let (cb, committed) = collecting_callback();
     StorageEnum::write_chunk_stream(&dst, &entry, rx, &handle, None, cb)
         .await
-        .expect("write_chunk_stream");
+        .assert_value("write_chunk_stream");
 
     let part_full_path = format!("{dst_dir}/blob.bin.terrasync-part");
     let final_full_path = format!("{dst_dir}/blob.bin");
 
     // 提交前：.part 内容已正确写完，最终路径尚不存在。
-    assert_eq!(tokio::fs::read(&part_full_path).await.unwrap(), full);
+    assert_eq!(
+        tokio::fs::read(&part_full_path)
+            .await
+            .assert_value("test value should be present"),
+        full
+    );
     assert!(
         tokio::fs::metadata(&final_full_path).await.is_err(),
         "final path must not exist before commit_chunk_stream"
     );
-    let total: u64 = committed.lock().unwrap().iter().map(|(_, l)| l).sum();
+    let total: u64 = committed
+        .lock()
+        .assert_value("test value should be present")
+        .iter()
+        .map(|(_, l)| l)
+        .sum();
     assert_eq!(
         total, SIZE as u64,
         "on_committed coverage should equal size"
@@ -118,10 +146,15 @@ async fn t2_write_chunk_stream_sequential_then_commit_is_atomic() {
 
     StorageEnum::commit_chunk_stream(&dst, &entry, SIZE as u64, handle)
         .await
-        .expect("commit_chunk_stream");
+        .assert_value("commit_chunk_stream");
 
     // 提交后：最终路径存在且内容正确，.part 因 rename 消失。
-    assert_eq!(tokio::fs::read(&final_full_path).await.unwrap(), full);
+    assert_eq!(
+        tokio::fs::read(&final_full_path)
+            .await
+            .assert_value("test value should be present"),
+        full
+    );
     assert!(
         tokio::fs::metadata(&part_full_path).await.is_err(),
         ".part should be renamed away after commit"
@@ -129,7 +162,7 @@ async fn t2_write_chunk_stream_sequential_then_commit_is_atomic() {
     let final_entry = dst
         .get_metadata(Path::new("blob.bin"))
         .await
-        .expect("final metadata");
+        .assert_value("final metadata");
     assert_eq!(
         final_entry.get_mtime(),
         entry.get_mtime(),
@@ -148,12 +181,14 @@ async fn t3_write_chunk_stream_out_of_order_and_duplicate_is_idempotent() {
     reset_dirs(shape_dir, dst_dir).await;
 
     let entry = shape_entry(shape_dir, "blob.bin", SIZE, 0).await;
-    let dst = create_storage(dst_dir, Some(BLOCK), true).await.unwrap();
+    let dst = create_storage(dst_dir, Some(BLOCK), true)
+        .await
+        .assert_value("test value should be present");
     let part_path = Path::new("blob.bin.terrasync-part");
 
     let (_missing, handle) = StorageEnum::resume_prepare(&dst, &entry, part_path, false)
         .await
-        .expect("resume_prepare");
+        .assert_value("resume_prepare");
 
     let full = pattern_vec(SIZE, 0);
     let half = SIZE / 2;
@@ -164,32 +199,32 @@ async fn t3_write_chunk_stream_out_of_order_and_duplicate_is_idempotent() {
         data: Bytes::copy_from_slice(&full[half..]),
     })
     .await
-    .unwrap();
+    .assert_value("test value should be present");
     tx.send(DataChunk {
         offset: 0,
         data: Bytes::copy_from_slice(&full[..half]),
     })
     .await
-    .unwrap();
+    .assert_value("test value should be present");
     tx.send(DataChunk {
         offset: 0,
         data: Bytes::copy_from_slice(&full[..half]),
     })
     .await
-    .unwrap();
+    .assert_value("test value should be present");
     drop(tx);
 
     StorageEnum::write_chunk_stream(&dst, &entry, rx, &handle, None, noop_callback())
         .await
-        .expect("write_chunk_stream with out-of-order + duplicate chunks");
+        .assert_value("write_chunk_stream with out-of-order + duplicate chunks");
 
     StorageEnum::commit_chunk_stream(&dst, &entry, SIZE as u64, handle)
         .await
-        .expect("commit_chunk_stream");
+        .assert_value("commit_chunk_stream");
 
     let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
         .await
-        .unwrap();
+        .assert_value("test value should be present");
     assert_eq!(
         out, full,
         "out-of-order + duplicate offset writes must not corrupt final content"
@@ -205,12 +240,14 @@ async fn t4_resume_after_partial_write_only_fills_missing_range() {
     reset_dirs(shape_dir, dst_dir).await;
 
     let entry = shape_entry(shape_dir, "blob.bin", SIZE, 0).await;
-    let dst = create_storage(dst_dir, Some(BLOCK), true).await.unwrap();
+    let dst = create_storage(dst_dir, Some(BLOCK), true)
+        .await
+        .assert_value("test value should be present");
     let part_path = Path::new("blob.bin.terrasync-part");
 
     let (missing1, handle1) = StorageEnum::resume_prepare(&dst, &entry, part_path, false)
         .await
-        .expect("first resume_prepare");
+        .assert_value("first resume_prepare");
     assert_eq!(missing1, vec![(0, SIZE as u64)]);
 
     let full = pattern_vec(SIZE, 0);
@@ -223,7 +260,7 @@ async fn t4_resume_after_partial_write_only_fills_missing_range() {
         data: Bytes::copy_from_slice(&full[..half]),
     })
     .await
-    .unwrap();
+    .assert_value("test value should be present");
     drop(tx);
 
     let counter1 = Arc::new(AtomicU64::new(0));
@@ -236,13 +273,13 @@ async fn t4_resume_after_partial_write_only_fills_missing_range() {
         noop_callback(),
     )
     .await
-    .expect("partial write_chunk_stream");
+    .assert_value("partial write_chunk_stream");
     assert_eq!(counter1.load(Ordering::Relaxed), half as u64);
 
     // 重跑 prepare：应只反推缺失的后半区间。
     let (missing2, handle2) = StorageEnum::resume_prepare(&dst, &entry, part_path, true)
         .await
-        .expect("second resume_prepare (resume=true)");
+        .assert_value("second resume_prepare (resume=true)");
     assert_eq!(
         missing2,
         vec![(half as u64, SIZE as u64)],
@@ -256,7 +293,7 @@ async fn t4_resume_after_partial_write_only_fills_missing_range() {
         data: Bytes::copy_from_slice(&full[half..]),
     })
     .await
-    .unwrap();
+    .assert_value("test value should be present");
     drop(tx2);
 
     let counter2 = Arc::new(AtomicU64::new(0));
@@ -269,7 +306,7 @@ async fn t4_resume_after_partial_write_only_fills_missing_range() {
         noop_callback(),
     )
     .await
-    .expect("resumed write_chunk_stream");
+    .assert_value("resumed write_chunk_stream");
     assert_eq!(
         counter2.load(Ordering::Relaxed),
         (SIZE - half) as u64,
@@ -278,11 +315,11 @@ async fn t4_resume_after_partial_write_only_fills_missing_range() {
 
     StorageEnum::commit_chunk_stream(&dst, &entry, SIZE as u64, handle2)
         .await
-        .expect("commit_chunk_stream");
+        .assert_value("commit_chunk_stream");
 
     let out = tokio::fs::read(format!("{dst_dir}/blob.bin"))
         .await
-        .unwrap();
+        .assert_value("test value should be present");
     assert_eq!(out, full, "final content must be complete after resume");
 }
 
@@ -295,14 +332,20 @@ async fn t5_hash_mismatch_blocks_commit_and_preserves_partial() {
     reset_dirs(shape_dir, dst_dir).await;
 
     let entry = shape_entry(shape_dir, "blob.bin", SIZE, 0).await;
-    let shape = create_storage(shape_dir, Some(BLOCK), false).await.unwrap();
-    let dst = create_storage(dst_dir, Some(BLOCK), true).await.unwrap();
+    let shape = create_storage(shape_dir, Some(BLOCK), false)
+        .await
+        .assert_value("test value should be present");
+    let dst = create_storage(dst_dir, Some(BLOCK), true)
+        .await
+        .assert_value("test value should be present");
 
     // 预置一个内容全错的 .part（模拟数据损坏/缺 chunk 后残留），但调用方
     // 误以为已经补齐（missing_intervals 为空）。
     let corrupted = vec![0xEEu8; SIZE];
     let part_full_path = format!("{dst_dir}/blob.bin.terrasync-part");
-    tokio::fs::write(&part_full_path, &corrupted).await.unwrap();
+    tokio::fs::write(&part_full_path, &corrupted)
+        .await
+        .assert_value("test value should be present");
 
     let (cb, _committed) = collecting_callback();
     let resume = ResumeContext {
@@ -311,9 +354,18 @@ async fn t5_hash_mismatch_blocks_commit_and_preserves_partial() {
         on_committed: cb,
     };
 
-    let res =
-        StorageEnum::copy_file_resumable(&shape, &dst, &entry, None, true, true, None, resume)
-            .await;
+    let res = StorageEnum::copy_file_resumable(
+        &shape,
+        &dst,
+        &entry,
+        data_mover::CopyOptions {
+            enable_integrity_check: true,
+            is_source_reserved: true,
+            ..Default::default()
+        },
+        resume,
+    )
+    .await;
     assert!(
         matches!(res, Err(StorageError::OperationError(_))),
         "hash mismatch must surface as an error, got {res:?}"
@@ -324,7 +376,9 @@ async fn t5_hash_mismatch_blocks_commit_and_preserves_partial() {
         tokio::fs::metadata(&final_full_path).await.is_err(),
         "final path must not exist: commit (rename) must not have happened"
     );
-    let part = tokio::fs::read(&part_full_path).await.unwrap();
+    let part = tokio::fs::read(&part_full_path)
+        .await
+        .assert_value("test value should be present");
     assert_eq!(
         part, corrupted,
         ".part must be preserved unchanged for a future retry, not deleted or renamed"

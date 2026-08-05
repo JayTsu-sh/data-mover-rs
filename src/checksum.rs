@@ -47,6 +47,7 @@ impl Default for HashCalculator {
 }
 
 impl HashCalculator {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             hasher: Hasher::new(),

@@ -1340,6 +1340,7 @@ dependencies = [
  "md-5 0.10.6",
  "moka",
  "nfs-rs",
+ "num-traits",
  "parking_lot",
  "path-clean",
  "quick-xml",
