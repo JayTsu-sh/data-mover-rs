@@ -8,8 +8,6 @@
 //! Local-only — no S3/NFS server required. S3 multipart 续传的会话字节断言
 //! （Complete 前不提交）需要真实 S3 环境，未在本地覆盖。NAS 续传路径回归
 //! 由 `tests/test_copy_file_resume.rs` 既有用例保障。
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use std::path::Path;
 
 use data_mover::{StorageEnum, create_storage};
@@ -85,7 +83,7 @@ async fn assert_truncated_copy_guarded(
     // 注入：entry 已带原 size，此时截断源文件（模拟扫描后源被并发变更）
     truncate_file(&format!("{src_dir}/blob.bin"), truncated);
 
-    let err = StorageEnum::copy_file(
+    let copy_result = StorageEnum::copy_file(
         &src,
         &dst,
         &entry,
@@ -95,8 +93,10 @@ async fn assert_truncated_copy_guarded(
             ..Default::default()
         },
     )
-    .await
-    .expect_err("truncated source must fail the copy");
+    .await;
+    let Err(err) = copy_result else {
+        panic!("truncated source must fail the copy");
+    };
     assert!(
         err.to_string().contains("size check failed"),
         "unexpected error: {err}"

@@ -5,8 +5,6 @@
 //! 这是压力式复现：单次全量拷贝一个「尾块很小」的文件、逐字节校验,循环多次以
 //! 稳定暴露该 race（修复前多次迭代内几乎必现；修复后恒过、确定性通过）。
 //! Local-only — 无需任何外部存储服务。
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use std::path::Path;
 
 use data_mover::{StorageEnum, create_storage};
