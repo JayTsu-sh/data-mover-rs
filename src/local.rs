@@ -161,7 +161,7 @@ impl ChunkSink for LocalChunkSink {
 }
 
 const DEFAULT_BLOCK_SIZE: u64 = 2 * MB;
-const DEFAULT_TRANSFER_CONCURRENCY: TransferConcurrency = TransferConcurrency::defaults(1, 8);
+const DEFAULT_TRANSFER_CONCURRENCY: TransferConcurrency = TransferConcurrency::defaults(4, 8);
 
 #[derive(Clone, Debug)]
 pub(crate) struct StorageConfig {

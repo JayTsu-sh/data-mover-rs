@@ -4,7 +4,7 @@ use crate::error::StorageError;
 /// Per-file data-transfer concurrency.
 ///
 /// Read and write depths are deliberately independent: sources and destinations
-/// have different latency and protocol limits. Values are always in `1..=64`.
+/// have different latency and protocol limits. Values are always in `1..=16`.
 ///
 /// Factory-created storage resolves each direction independently in this order:
 /// backend-specific environment variable, global environment variable, then the
@@ -17,13 +17,19 @@ pub struct TransferConcurrency {
 }
 
 impl TransferConcurrency {
-    pub const MAX: usize = 64;
+    /// Highest supported queue depth.
+    ///
+    /// The real-protocol lab shows sharply rising CPU and memory consumption
+    /// above the throughput knee at eight, with little aggregate benefit at
+    /// sixteen. Keeping the hard limit at the highest validated depth prevents
+    /// accidental resource exhaustion from a mistyped environment variable.
+    pub const MAX: usize = 16;
 
     /// Creates validated read/write queue depths.
     ///
     /// # Errors
     ///
-    /// Returns a configuration error when either value is outside `1..=64`.
+    /// Returns a configuration error when either value is outside `1..=16`.
     pub fn new(read: usize, write: usize) -> Result<Self> {
         validate("read", read)?;
         validate("write", write)?;
@@ -197,6 +203,10 @@ mod tests {
 
         let error = resolve(&[("DATA_MOVER_NFS_READ_INFLIGHT", "many")])
             .assert_error("non-number must fail");
+        assert!(matches!(error, StorageError::ConfigError(_)));
+
+        let error = resolve(&[("DATA_MOVER_NFS_READ_INFLIGHT", "17")])
+            .assert_error("value above the tested safe limit must fail");
         assert!(matches!(error, StorageError::ConfigError(_)));
     }
 }

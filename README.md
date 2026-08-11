@@ -31,12 +31,12 @@ Unset, invalid, or zero values use the documented defaults.
 ### Transfer concurrency
 
 Read and write pipelines are configured independently. Every value must be an
-integer in `1..=64`; an invalid value fails storage creation with a configuration
+integer in `1..=16`; an invalid value fails storage creation with a configuration
 error instead of being silently ignored.
 
 | Backend | Read default | Write default |
 |---------|--------------|---------------|
-| Local | `1` | `8` |
+| Local | `4` | `8` |
 | NFS | `4` | `8` |
 | SMB/CIFS | `4` | `4` |
 | S3 | `4` | `5` |
