@@ -26,6 +26,7 @@ parser.add_argument(
         "ensure-bucket",
         "put",
         "sha256",
+        "size",
         "exists",
         "delete-prefix",
         "abort-multipart-prefix",
@@ -49,6 +50,8 @@ elif args.command == "put":
 elif args.command == "sha256":
     body = s3.get_object(Bucket=args.bucket, Key=args.key)["Body"].read()
     print(hashlib.sha256(body).hexdigest())
+elif args.command == "size":
+    print(s3.head_object(Bucket=args.bucket, Key=args.key)["ContentLength"])
 elif args.command == "exists":
     try:
         s3.head_object(Bucket=args.bucket, Key=args.key)

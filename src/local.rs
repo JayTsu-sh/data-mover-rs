@@ -1,6 +1,10 @@
 // 标准库
 #[cfg(unix)]
+use std::os::unix::fs::FileExt as _;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, lchown};
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -8,11 +12,9 @@ use std::time::UNIX_EPOCH;
 
 // 外部crate
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use rayon::prelude::*;
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info, trace};
 
@@ -98,33 +100,36 @@ impl NASEntry {
 /// 本地文件句柄包装
 #[derive(Debug)]
 pub(crate) struct LocalFileHandle {
-    inner: tokio::fs::File,
+    // `FileExt::{read_at, write_at}` operate on `&File`, so clones of this
+    // handle can safely issue independent positional I/O concurrently.
+    inner: Arc<std::fs::File>,
 }
 
 impl LocalFileHandle {
-    fn new(file: tokio::fs::File) -> Self {
-        Self { inner: file }
+    async fn new(file: tokio::fs::File) -> Self {
+        Self {
+            inner: Arc::new(file.into_std().await),
+        }
     }
 
     async fn commit(&self) -> Result<()> {
-        self.inner.sync_all().await.map_err(StorageError::IoError)
+        let file = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || file.sync_all())
+            .await?
+            .map_err(StorageError::IoError)
     }
 }
 
-/// Local 的 `ChunkSink`：单个文件句柄的 seek+write 需要 `&mut` 访问，用
-/// `tokio::sync::Mutex` 包裹提供 `&self` 接口。`write_pipeline_core` 以
-/// `inflight=1` 驱动时同一时刻只有一次写在途，锁无实际竞争。
+/// Local 的 `ChunkSink`：通过位置写实现 `write_at`，不共享文件游标，因此多个
+/// chunk 可以安全地并发写入同一个文件。
 pub(crate) struct LocalChunkSink {
     storage: LocalStorage,
-    file: AsyncMutex<LocalFileHandle>,
+    file: LocalFileHandle,
 }
 
 impl LocalChunkSink {
     fn new(storage: LocalStorage, file: LocalFileHandle) -> Self {
-        Self {
-            storage,
-            file: AsyncMutex::new(file),
-        }
+        Self { storage, file }
     }
 }
 
@@ -132,8 +137,7 @@ impl LocalChunkSink {
 impl ChunkSink for LocalChunkSink {
     async fn write_at(&self, offset: u64, data: Bytes) -> Result<u64> {
         let len = data.len() as u64;
-        let mut file = self.file.lock().await;
-        let written = self.storage.write(&mut file, offset, data).await? as u64;
+        let written = self.storage.write(&self.file, offset, data).await? as u64;
         if written < len {
             return Err(StorageError::OperationError(format!(
                 "Short write at offset {offset}: {written} of {len} bytes"
@@ -143,11 +147,13 @@ impl ChunkSink for LocalChunkSink {
     }
 
     async fn flush(&self) -> Result<()> {
-        self.file.lock().await.commit().await
+        self.file.commit().await
     }
 }
 
 const DEFAULT_BLOCK_SIZE: u64 = 2 * MB;
+/// 位置写没有共享游标；适度并发可覆盖阻塞线程池调度及设备 I/O 延迟。
+const LOCAL_WRITE_INFLIGHT: usize = 8;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StorageConfig {
@@ -382,7 +388,7 @@ impl LocalStorage {
 
     pub(crate) async fn open(&self, relative_path: &Path) -> Result<LocalFileHandle> {
         let inner = tokio::fs::File::open(self.get_full_path(relative_path)).await?;
-        Ok(LocalFileHandle { inner })
+        Ok(LocalFileHandle::new(inner).await)
     }
 
     /// 创建/打开目标文件。
@@ -429,7 +435,7 @@ impl LocalStorage {
         self.set_metadata(relative_path, None, None, uid, gid, mode)
             .await?;
 
-        Ok(LocalFileHandle::new(file))
+        Ok(LocalFileHandle::new(file).await)
     }
 
     ///
@@ -997,59 +1003,69 @@ impl LocalStorage {
         Ok(())
     }
 
-    async fn read(&self, file: &mut LocalFileHandle, offset: u64, count: u64) -> Result<Bytes> {
+    async fn read(&self, file: &LocalFileHandle, offset: u64, count: u64) -> Result<Bytes> {
         let capacity = usize::try_from(count).map_err(|_| {
             StorageError::OperationError(format!("read size {count} exceeds platform capacity"))
         })?;
-        let mut buffer = BytesMut::with_capacity(capacity);
-        let mut current_offset = offset;
-        let mut remaining = count;
-
-        while remaining > 0 {
-            file.inner
-                .seek(std::io::SeekFrom::Start(current_offset))
-                .await?;
-            let read_bytes = file.inner.read_buf(&mut buffer).await? as u64;
-
-            if read_bytes == 0 {
-                break;
+        let file = Arc::clone(&file.inner);
+        let buffer = tokio::task::spawn_blocking(move || {
+            let mut buffer = vec![0_u8; capacity];
+            let mut filled = 0usize;
+            while filled < capacity {
+                let position = offset.checked_add(filled as u64).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "read offset overflow")
+                })?;
+                #[cfg(unix)]
+                let read = file.read_at(&mut buffer[filled..], position)?;
+                #[cfg(windows)]
+                let read = file.seek_read(&mut buffer[filled..], position)?;
+                if read == 0 {
+                    break;
+                }
+                filled += read;
             }
-
-            current_offset += read_bytes;
-            remaining -= read_bytes;
-        }
+            buffer.truncate(filled);
+            Ok::<_, std::io::Error>(buffer)
+        })
+        .await??;
 
         trace!(
-            "read {} bytes from file in local storage using tokio",
+            "read {} bytes from file in local storage using positional I/O",
             buffer.len()
         );
-        Ok(buffer.split().freeze())
+        Ok(Bytes::from(buffer))
     }
 
     /// 向文件句柄写入数据
-    async fn write(&self, file: &mut LocalFileHandle, offset: u64, data: Bytes) -> Result<usize> {
+    async fn write(&self, file: &LocalFileHandle, offset: u64, data: Bytes) -> Result<usize> {
         trace!(
             "write file in local storage: offset {}, data len {}",
             offset,
             data.len()
         );
         let length = data.len();
-        let mut data = data;
-
-        file.inner.seek(std::io::SeekFrom::Start(offset)).await?;
-        // write_all_buf 循环写直到写完：tokio::fs::File 单次 write 最多推进其内部
-        // 缓冲上限（2MiB），单次 write_buf 对 >2MiB 的 chunk（如 S3 源 5MiB 块、
-        // CIFS 源 8MiB 块）必然短写。
-        file.inner.write_all_buf(&mut data).await?;
-        // flush 等待后台写任务真正落盘：tokio::fs::File::poll_write 在单次调用
-        // 内推进完整个 chunk（≤ 内部 2MiB 缓冲上限）时，只是把写"派发"到阻塞线程池
-        // 就返回 Ready(Ok(n))，并不等待该阻塞任务真正执行完 write() 系统调用。
-        // 后续若紧跟一次 seek()，tokio 会在 seek 前隐式等待前一个挂起操作完成，
-        // 掩盖了这个问题；但序列中**最后一个** chunk 写完后没有后续 seek，函数
-        // 直接返回、文件句柄可能被 drop，此时后台写任务仍可能未执行完——测试中
-        // 表现为间歇性丢失文件末尾数据（无报错，纯 race）。显式 flush 等价于
-        // 等待挂起操作完成（不做额外 fsync，只是让"派发成功"变成"真正写完"）。
-        file.inner.flush().await?;
+        let file = Arc::clone(&file.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut written = 0usize;
+            while written < data.len() {
+                let position = offset.checked_add(written as u64).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "write offset overflow")
+                })?;
+                #[cfg(unix)]
+                let n = file.write_at(&data[written..], position)?;
+                #[cfg(windows)]
+                let n = file.seek_write(&data[written..], position)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write the complete local file chunk",
+                    ));
+                }
+                written += n;
+            }
+            Ok::<_, std::io::Error>(written)
+        })
+        .await??;
 
         trace!("Wrote {} bytes at offset {}", length, offset);
 
@@ -1057,8 +1073,8 @@ impl LocalStorage {
     }
 
     pub(crate) async fn read_file(&self, path: &Path, size: u64) -> Result<Bytes> {
-        let mut handle = self.open(path).await?;
-        self.read(&mut handle, 0, size).await
+        let handle = self.open(path).await?;
+        self.read(&handle, 0, size).await
     }
 
     pub(crate) async fn write_file(
@@ -1069,8 +1085,8 @@ impl LocalStorage {
         gid: Option<u32>,
         mode: Option<u32>,
     ) -> Result<()> {
-        let mut handle = self.create_file(path, uid, gid, mode, true).await?;
-        self.write(&mut handle, 0, data).await?;
+        let handle = self.create_file(path, uid, gid, mode, true).await?;
+        self.write(&handle, 0, data).await?;
         handle.commit().await
     }
 
@@ -1104,7 +1120,7 @@ impl LocalStorage {
         );
 
         // 打开一次文件，避免重复打开
-        let mut source_file = match self.open(relative_path).await {
+        let source_file = match self.open(relative_path).await {
             Ok(file) => {
                 debug!("Successfully opened source file: {:?}", relative_path);
                 file
@@ -1134,7 +1150,7 @@ impl LocalStorage {
                 );
             }
 
-            let data = match self.read(&mut source_file, offset, chunk_size).await {
+            let data = match self.read(&source_file, offset, chunk_size).await {
                 Ok(data) => data,
                 Err(e) => {
                     error!(
@@ -1216,8 +1232,15 @@ impl LocalStorage {
         );
 
         let sink = LocalChunkSink::new(self.clone(), dest_file);
-        let written =
-            write_pipeline_core(rx, &sink, None, 1, CommitPolicy::None, bytes_counter).await?;
+        let written = write_pipeline_core(
+            rx,
+            &sink,
+            None,
+            LOCAL_WRITE_INFLIGHT,
+            CommitPolicy::None,
+            bytes_counter,
+        )
+        .await?;
 
         trace!("Finished write_data_task for file {:?}", relative_path);
         Ok(written)
@@ -1239,7 +1262,7 @@ impl LocalStorage {
         qos: Option<QosManager>,
     ) -> Result<()> {
         let chunk_size = self.config.block_size.max(1);
-        let mut source_file = self.open(relative_path).await?;
+        let source_file = self.open(relative_path).await?;
         for &(start, end) in intervals {
             let mut offset = start;
             while offset < end {
@@ -1247,7 +1270,7 @@ impl LocalStorage {
                 if let Some(ref qos) = qos {
                     qos.acquire(want).await;
                 }
-                let data = self.read(&mut source_file, offset, want).await?;
+                let data = self.read(&source_file, offset, want).await?;
                 if data.is_empty() {
                     break;
                 }
@@ -1287,7 +1310,7 @@ impl LocalStorage {
             rx,
             &sink,
             None,
-            1,
+            LOCAL_WRITE_INFLIGHT,
             CommitPolicy::Barrier {
                 every: SYNC_BARRIER,
                 cb: on_committed,

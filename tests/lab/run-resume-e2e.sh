@@ -62,49 +62,32 @@ with path.open("wb") as output:
     return
   fi
 
-  if [[ "$backend" == "nfs3" ]]; then
-    ssh_lab_root "$LAB_SOURCE_MGMT" \
-      "cat > '$LAB_NFS3_EXPORT/ci/$run_id/$key'" < "$seed_path"
-    return
-  fi
-
-  if [[ "$backend" == "nfs41" ]]; then
-    ssh_lab_root "$LAB_SOURCE_MGMT" \
-      "cat > '$LAB_NFS41_EXPORT/ci/$run_id/$key'" < "$seed_path"
-    return
-  fi
-
+  # Seed remote sources through data-mover instead of writing exports as root.
+  # Root-owned NFS fixtures carry uid/gid 0 into NAS metadata; an NFS -> Local
+  # resume would then correctly attempt to preserve that ownership but fail on
+  # the unprivileged lab runner with EPERM before exercising the data path.
   cargo run --quiet --locked --example storage_copy -- \
     --source "$local_root/seed" \
     --destination "$(storage_url source "$backend")" \
     --path "$key"
 }
 
-cases=(
-  "local local"
-  "nfs3 nfs3"
-  "nfs41 nfs41"
-  "s3 s3"
-  "local s3"
-  "s3 local"
-  "nfs3 s3"
-  "s3 nfs41"
-)
+backends=(local nfs3 nfs41 s3)
+for source_backend in "${backends[@]}"; do
+  for destination_backend in "${backends[@]}"; do
+    key="resume-${source_backend}-to-${destination_backend}.bin"
+    seed_source "$source_backend" "$key"
 
-for case in "${cases[@]}"; do
-  read -r source_backend destination_backend <<< "$case"
-  key="resume-${source_backend}-to-${destination_backend}.bin"
-  seed_source "$source_backend" "$key"
+    common_args=(
+      --source "$(storage_url source "$source_backend")"
+      --destination "$(storage_url destination "$destination_backend")"
+      --path "$key"
+    )
+    cargo run --quiet --locked --example storage_resume -- \
+      "${common_args[@]}" --phase interrupt
+    cargo run --quiet --locked --example storage_resume -- \
+      "${common_args[@]}" --phase resume
 
-  common_args=(
-    --source "$(storage_url source "$source_backend")"
-    --destination "$(storage_url destination "$destination_backend")"
-    --path "$key"
-  )
-  cargo run --quiet --locked --example storage_resume -- \
-    "${common_args[@]}" --phase interrupt
-  cargo run --quiet --locked --example storage_resume -- \
-    "${common_args[@]}" --phase resume
-
-  echo "resume $source_backend -> $destination_backend verified"
+    echo "resume $source_backend -> $destination_backend verified"
+  done
 done

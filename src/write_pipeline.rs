@@ -11,16 +11,11 @@
 //! 套用统一 sink 只是假统一；且 S3 字节级续传刚落地，风险最高，维持独立实现
 //! （见 `s3.rs`）。
 //!
-//! ## Local 并入 core（inflight=1）的等价性说明
+//! ## Local 并入 core
 //!
-//! Local 历史实现是严格顺序写：收到一个 chunk → await 写完 → 再收下一个。
-//! 并入 `write_pipeline_core` 后用 `inflight=1` 表达同样的约束，但需要注意
-//! 调度细节：本模块把「派发新写 → 若已达 inflight 上限则等一个写完」的检查放在
-//! **派发之后**（而非 NFS/CIFS 原实现的「派发前先等一个」），这样 `inflight=1`
-//! 时每个 chunk 的写会在**下一个 chunk 被接收之前**就完整 await 完成，与
-//! Local 原有的严格顺序（无提前一个 chunk 的 pipeline 滞后）逐字节等价；
-//! 对 `inflight>1`（NFS/CIFS）而言，稳态并发窗口仍是 `inflight`，仅初始/收尾
-//! 阶段的逐出时机相差不超过一个槽位，不影响正确性与稳态吞吐。
+//! Local 使用不共享文件游标的位置写，可与 NFS/CIFS 一样安全地配置多个在途请求。
+//! 本模块把「派发新写 → 若已达 inflight 上限则等一个写完」的检查放在派发之后；
+//! 稳态并发窗口为 `inflight`，`inflight=1` 时仍表达严格顺序写。
 
 use std::future::Future;
 use std::pin::Pin;

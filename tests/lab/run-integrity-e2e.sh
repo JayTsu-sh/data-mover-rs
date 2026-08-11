@@ -196,6 +196,16 @@ for source_backend in "${backends[@]}"; do
   done
 done
 
+# Independently stream and compare every large object produced by run-e2e.sh.
+# This verifies content through each backend adapter instead of relying only on
+# the shell/S3-helper checksum used immediately after copying.
+for source_backend in "${backends[@]}"; do
+  key="large-from-${source_backend}.bin"
+  for destination_backend in "${backends[@]}"; do
+    check_path "$source_backend" "$destination_backend" "$key"
+  done
+done
+
 # The existing large NFSv4.1 copy is bigger than one session request. Reading
 # it independently verifies negotiated effective rsize in the integrity path.
 check_path nfs41 nfs41 "nfs41-large-copy.bin"
