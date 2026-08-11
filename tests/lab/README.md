@@ -22,26 +22,30 @@ exact toolchain to keep builds reproducible.
 
 `run-e2e.sh` exercises the complete directed copy matrix across Local, NFSv3,
 NFSv4.1, and S3: 4 same-protocol paths plus 12 cross-protocol paths. Every case
-uses an isolated payload and verifies the destination SHA-256 checksum. A
+uses an isolated payload and verifies the destination SHA-256 checksum. It also
+runs the complete 4-by-4 matrix with a `48 MiB + 137 byte` offset-derived
+fixture, large enough to exceed a queue depth of eight even for 5 MiB S3
+chunks. Every destination is reopened and checked for both exact size and
+SHA-256 digest; `storage_copy` additionally checks applicable metadata. A
 separate payload larger than 12 MiB is copied from NFSv4.1 to NFSv4.1 so normal
 copy exercises multiple negotiated read and write requests, including the
 session-limited effective `wsize`.
 
-`run-resume-e2e.sh` exercises eight representative paths in two independent
-processes: the four same-backend paths plus Local → S3, S3 → Local, NFSv3 → S3,
-and S3 → NFSv4.1. This covers every source interval reader, every destination
-resume writer, and the NAS ↔ S3 boundaries without duplicating the full copy
-matrix. The first process writes a durable prefix without committing it. The
-second process discovers the remaining range from the destination, transfers
-only that range, commits, and verifies the final hash. NAS destinations resume
+`run-resume-e2e.sh` exercises the complete 4-by-4 directed matrix in two
+independent processes. The first process writes a durable prefix without
+committing it. The second process discovers the remaining range from the
+destination, transfers only that range, commits, and verifies the final hash.
+This covers every source interval reader, every destination resume writer, and
+all NAS ↔ S3 directions. NAS destinations resume
 from a `.terrasync-part` file; S3 destinations resume the server-side multipart
 upload through `ListMultipartUploads` and `ListParts`.
 
-`run-integrity-e2e.sh` independently re-reads the complete 4-by-4 directed
-matrix through Local, NFSv3, NFSv4.1, and S3: four same-backend paths plus all
-twelve cross-protocol paths. It checks the large NFSv4.1 fixture using the
-negotiated effective read size and proves that Quick mode does not read
-content. A cross-protocol negative ring mutates each configured destination
+`run-integrity-e2e.sh` independently re-reads both the small and large complete
+4-by-4 directed matrices through Local, NFSv3, NFSv4.1, and S3: four
+same-backend paths plus all twelve cross-protocol paths in each matrix. It also
+checks the dedicated large NFSv4.1 fixture using the negotiated effective read
+size and proves that Quick mode does not read content. A cross-protocol negative
+ring mutates each configured destination
 backend in turn. Each negative case uses a `12 MiB + 123 byte` fixture and
 places an equal-sized corruption at the unaligned offset `6 MiB + 17`, beyond
 the default NFS, Local, and S3 read boundaries. Full must report that exact

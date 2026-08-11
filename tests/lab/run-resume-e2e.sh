@@ -80,31 +80,22 @@ with path.open("wb") as output:
     --path "$key"
 }
 
-cases=(
-  "local local"
-  "nfs3 nfs3"
-  "nfs41 nfs41"
-  "s3 s3"
-  "local s3"
-  "s3 local"
-  "nfs3 s3"
-  "s3 nfs41"
-)
+backends=(local nfs3 nfs41 s3)
+for source_backend in "${backends[@]}"; do
+  for destination_backend in "${backends[@]}"; do
+    key="resume-${source_backend}-to-${destination_backend}.bin"
+    seed_source "$source_backend" "$key"
 
-for case in "${cases[@]}"; do
-  read -r source_backend destination_backend <<< "$case"
-  key="resume-${source_backend}-to-${destination_backend}.bin"
-  seed_source "$source_backend" "$key"
+    common_args=(
+      --source "$(storage_url source "$source_backend")"
+      --destination "$(storage_url destination "$destination_backend")"
+      --path "$key"
+    )
+    cargo run --quiet --locked --example storage_resume -- \
+      "${common_args[@]}" --phase interrupt
+    cargo run --quiet --locked --example storage_resume -- \
+      "${common_args[@]}" --phase resume
 
-  common_args=(
-    --source "$(storage_url source "$source_backend")"
-    --destination "$(storage_url destination "$destination_backend")"
-    --path "$key"
-  )
-  cargo run --quiet --locked --example storage_resume -- \
-    "${common_args[@]}" --phase interrupt
-  cargo run --quiet --locked --example storage_resume -- \
-    "${common_args[@]}" --phase resume
-
-  echo "resume $source_backend -> $destination_backend verified"
+    echo "resume $source_backend -> $destination_backend verified"
+  done
 done

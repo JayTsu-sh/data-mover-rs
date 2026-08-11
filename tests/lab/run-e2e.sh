@@ -64,6 +64,25 @@ seed_source() {
     --path "$key"
 }
 
+seed_source_file() {
+  local backend="$1"
+  local key="$2"
+  local source_file="$3"
+  cp "$source_file" "$local_root/seed/$key"
+  chmod 0640 "$local_root/seed/$key"
+  touch -m -d '@1700000000.123456789' "$local_root/seed/$key"
+  if [[ "$backend" == "local" ]]; then
+    cp --preserve=mode,ownership,timestamps \
+      "$local_root/seed/$key" "$local_root/source/$key"
+    return
+  fi
+
+  cargo run --quiet --locked --example storage_copy -- \
+    --source "$local_root/seed" \
+    --destination "$(storage_url source "$backend")" \
+    --path "$key"
+}
+
 destination_hash() {
   local backend="$1"
   local key="$2"
@@ -79,6 +98,27 @@ destination_hash() {
       ;;
     s3)
       python3 "$(dirname "$0")/s3_helper.py" sha256 \
+        --endpoint "$LAB_DEST_DATA" --bucket "$LAB_S3_BUCKET" \
+        --key "ci/$run_id/destination/$key"
+      ;;
+  esac
+}
+
+destination_size() {
+  local backend="$1"
+  local key="$2"
+  case "$backend" in
+    local) stat -c '%s' "$local_root/destination/$key" ;;
+    nfs3)
+      ssh_lab_root "$LAB_DEST_MGMT" \
+        "stat -c '%s' '$LAB_NFS3_EXPORT/ci/$run_id/$key'"
+      ;;
+    nfs41)
+      ssh_lab_root "$LAB_DEST_MGMT" \
+        "stat -c '%s' '$LAB_NFS41_EXPORT/ci/$run_id/$key'"
+      ;;
+    s3)
+      python3 "$(dirname "$0")/s3_helper.py" size \
         --endpoint "$LAB_DEST_DATA" --bucket "$LAB_S3_BUCKET" \
         --key "ci/$run_id/destination/$key"
       ;;
@@ -104,6 +144,55 @@ for source_backend in "${backends[@]}"; do
       exit 1
     }
     echo "$source_backend -> $destination_backend verified: $actual_hash"
+  done
+done
+
+# Large 4-by-4 consistency matrix across every protocol available in the lab.
+# 48 MiB + 137 bytes exceeds eight 5-MiB S3 chunks, the largest source chunk
+# size in this lab, and the offset-derived fixture detects swapped or duplicated
+# chunks rather than merely checking byte count.
+large_seed="$local_root/seed/local-cross-protocol-large.bin"
+large_size=$((48 * 1024 * 1024 + 137))
+python3 -c '
+import pathlib
+import sys
+
+size = int(sys.argv[2])
+path = pathlib.Path(sys.argv[1])
+block_size = 1024 * 1024
+with path.open("wb") as output:
+    offset = 0
+    while offset < size:
+        length = min(block_size, size - offset)
+        block = bytes(
+            (((position * 0x9e3779b97f4a7c15) ^ 0xa5a55a5ad3c1b2e7) >>
+             ((position & 7) * 8)) & 0xff
+            for position in range(offset, offset + length)
+        )
+        output.write(block)
+        offset += length
+' "$large_seed" "$large_size"
+large_hash="$(sha256sum "$large_seed" | cut -d' ' -f1)"
+for source_backend in "${backends[@]}"; do
+  key="large-from-${source_backend}.bin"
+  seed_source_file "$source_backend" "$key" "$large_seed"
+  for destination_backend in "${backends[@]}"; do
+    cargo run --quiet --locked --example storage_copy -- \
+      --source "$(storage_url source "$source_backend")" \
+      --destination "$(storage_url destination "$destination_backend")" \
+      --path "$key"
+
+    actual_size="$(destination_size "$destination_backend" "$key")"
+    [[ "$actual_size" == "$large_size" ]] || {
+      echo "large $source_backend -> $destination_backend size mismatch: expected $large_size, got $actual_size" >&2
+      exit 1
+    }
+    actual_hash="$(destination_hash "$destination_backend" "$key")"
+    [[ "$actual_hash" == "$large_hash" ]] || {
+      echo "large $source_backend -> $destination_backend checksum mismatch" >&2
+      exit 1
+    }
+    echo "large $source_backend -> $destination_backend size + checksum verified: $actual_hash"
   done
 done
 
