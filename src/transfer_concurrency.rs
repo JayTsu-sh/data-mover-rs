@@ -36,11 +36,13 @@ impl TransferConcurrency {
         Ok(Self { read, write })
     }
 
+    /// Returns the maximum number of concurrent reads for one file transfer.
     #[must_use]
     pub const fn read(self) -> usize {
         self.read
     }
 
+    /// Returns the maximum number of concurrent writes for one file transfer.
     #[must_use]
     pub const fn write(self) -> usize {
         self.write

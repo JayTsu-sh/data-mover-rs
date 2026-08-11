@@ -621,6 +621,7 @@ fn s3_timeout_config() -> TimeoutConfig {
 }
 
 impl S3Storage {
+    /// Overrides the per-file read and write concurrency for this adapter.
     #[must_use]
     pub fn with_transfer_concurrency(mut self, concurrency: TransferConcurrency) -> Self {
         self.transfer_concurrency = concurrency;

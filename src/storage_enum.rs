@@ -1854,6 +1854,7 @@ impl StorageEnum {
         }
     }
 
+    /// Returns the configured per-file read and write concurrency.
     #[must_use]
     pub fn transfer_concurrency(&self) -> TransferConcurrency {
         match self {
@@ -1864,6 +1865,7 @@ impl StorageEnum {
         }
     }
 
+    /// Overrides the per-file read and write concurrency for any backend.
     #[must_use]
     pub fn with_transfer_concurrency(self, concurrency: TransferConcurrency) -> Self {
         match self {

@@ -50,6 +50,19 @@ default. The Rust API can override the resolved pair with
 `TransferConcurrency` and `StorageEnum::with_transfer_concurrency` (or the
 corresponding concrete-adapter builder).
 
+The upper bound is intentional: lab measurements across the complete Local,
+NFSv3, NFSv4.1, and S3 copy matrix showed that increasing inflight from 8 to 16
+provided only a small aggregate throughput gain while CPU and peak memory grew
+substantially. Values above 16 are rejected rather than clamped so the effective
+configuration never differs silently from what the operator requested.
+
+The defaults are the recommended general-purpose settings. For a high-latency
+NFS path with sufficient server session capacity, `read=8` and `write=16` can
+improve throughput. S3 normally reaches its throughput knee around 4 to 8, and
+Local reads normally reach it around 4; raising them to 16 is generally not a
+good CPU/memory tradeoff. CIFS keeps its conservative 4/4 default because the
+shared lab does not yet provide a real SMB endpoint for performance tuning.
+
 ### StorageGRID compatibility
 
 Some StorageGRID versions reject the AWS SDK's informational `x-id` query

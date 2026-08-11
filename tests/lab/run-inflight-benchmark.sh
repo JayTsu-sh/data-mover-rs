@@ -84,7 +84,6 @@ for backend in "${backends[@]}"; do
       --destination "$(storage_url source "$backend")" --path "$key"
   fi
 done
-
 printf '%s\n' \
   'source,destination,inflight,repeat,bytes,elapsed_s,user_s,system_s,max_rss_kib,cpu_percent,throughput_mib_s' \
   > "$output"
@@ -131,4 +130,3 @@ for source_backend in "${backends[@]}"; do
     done
   done
 done
-

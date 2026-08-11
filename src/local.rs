@@ -389,6 +389,7 @@ impl LocalStorage {
         }
     }
 
+    /// Overrides the per-file read and write concurrency for this adapter.
     #[must_use]
     pub fn with_transfer_concurrency(mut self, concurrency: TransferConcurrency) -> Self {
         self.config.transfer_concurrency = concurrency;
