@@ -101,7 +101,7 @@ use crate::s3::{S3Storage, create_s3_storage};
 use crate::tar_pack::{build_header_for_entry, tar_eof_marker, tar_padding};
 use crate::{
     CommitCallback, DataChunk, DeleteDirIterator, EntryEnum, Result, ResumeContext,
-    WalkDirAsyncIterator, WalkDirAsyncIterator2,
+    TransferConcurrency, WalkDirAsyncIterator, WalkDirAsyncIterator2,
 };
 
 /// 存储类型枚举
@@ -1851,6 +1851,26 @@ impl StorageEnum {
             StorageEnum::NFS(s) => s.config.block_size,
             StorageEnum::CIFS(s) => s.config.block_size,
             StorageEnum::S3(s) => s.block_size,
+        }
+    }
+
+    #[must_use]
+    pub fn transfer_concurrency(&self) -> TransferConcurrency {
+        match self {
+            Self::Local(storage) => storage.config.transfer_concurrency,
+            Self::NFS(storage) => storage.config.transfer_concurrency,
+            Self::CIFS(storage) => storage.config.transfer_concurrency,
+            Self::S3(storage) => storage.transfer_concurrency,
+        }
+    }
+
+    #[must_use]
+    pub fn with_transfer_concurrency(self, concurrency: TransferConcurrency) -> Self {
+        match self {
+            Self::Local(storage) => Self::Local(storage.with_transfer_concurrency(concurrency)),
+            Self::NFS(storage) => Self::NFS(storage.with_transfer_concurrency(concurrency)),
+            Self::CIFS(storage) => Self::CIFS(storage.with_transfer_concurrency(concurrency)),
+            Self::S3(storage) => Self::S3(storage.with_transfer_concurrency(concurrency)),
         }
     }
 

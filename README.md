@@ -28,6 +28,28 @@ Unset, invalid, or zero values use the documented defaults.
 | `S3_OPERATION_TIMEOUT` | `30` | Timeout for the complete S3 operation in seconds |
 | `S3_READ_TIMEOUT` | `20` | Timeout for an individual socket read in seconds |
 
+### Transfer concurrency
+
+Read and write pipelines are configured independently. Every value must be an
+integer in `1..=64`; an invalid value fails storage creation with a configuration
+error instead of being silently ignored.
+
+| Backend | Read default | Write default |
+|---------|--------------|---------------|
+| Local | `1` | `8` |
+| NFS | `4` | `8` |
+| SMB/CIFS | `4` | `4` |
+| S3 | `4` | `5` |
+
+`DATA_MOVER_READ_INFLIGHT` and `DATA_MOVER_WRITE_INFLIGHT` set global values.
+Use `DATA_MOVER_<BACKEND>_READ_INFLIGHT` or
+`DATA_MOVER_<BACKEND>_WRITE_INFLIGHT` for a backend-specific override, where
+`<BACKEND>` is `LOCAL`, `NFS`, `CIFS`, or `S3`. Each direction is resolved
+independently: backend-specific variable, global variable, then protocol
+default. The Rust API can override the resolved pair with
+`TransferConcurrency` and `StorageEnum::with_transfer_concurrency` (or the
+corresponding concrete-adapter builder).
+
 ### StorageGRID compatibility
 
 Some StorageGRID versions reject the AWS SDK's informational `x-id` query

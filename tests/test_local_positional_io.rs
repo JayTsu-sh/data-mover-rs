@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use data_mover::{CopyOptions, DataChunk, StorageEnum, create_storage};
+use data_mover::{CopyOptions, DataChunk, StorageEnum, TransferConcurrency, create_storage};
 
 mod common;
 use common::AssertTestValue;
@@ -65,7 +65,10 @@ async fn local_copy_beyond_write_queue_reopens_with_identical_size_and_digest() 
     let destination_url = destination_dir.to_string_lossy();
     let source = create_storage(&source_url, Some(BLOCK), false)
         .await
-        .assert_value("create source storage");
+        .assert_value("create source storage")
+        .with_transfer_concurrency(
+            TransferConcurrency::new(4, 8).assert_value("source concurrency"),
+        );
     let destination = create_storage(&destination_url, Some(BLOCK), true)
         .await
         .assert_value("create destination storage");

@@ -26,6 +26,7 @@ pub mod storage_enum;
 pub mod tar_pack;
 pub mod third_party;
 pub mod time_util;
+mod transfer_concurrency;
 pub mod url_redact;
 pub(crate) mod walk_scheduler;
 pub(crate) mod write_pipeline;
@@ -49,6 +50,7 @@ pub use storage_enum::{
     create_storage, detect_storage_type,
 };
 pub use tar_pack::calculate_tar_size;
+pub use transfer_concurrency::TransferConcurrency;
 pub use url_redact::redact_storage_url;
 
 /// 删除事件，表示一个文件或目录已被删除

@@ -53,6 +53,9 @@ use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, shou
 use crate::qos::QosManager;
 use crate::storage_enum::{StorageEnum, path_to_s3_key};
 use crate::third_party::hcp::client::HCPRestClient;
+use crate::transfer_concurrency::{
+    TransferBackend, TransferConcurrency, resolve_transfer_concurrency,
+};
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
 use crate::{
     DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, Result, S3Entry,
@@ -443,7 +446,7 @@ fn build_s3_config(sdk_config: &SdkConfig, compatibility: S3Compatibility) -> aw
 
 const DEFAULT_BLOCK_SIZE: u64 = 5 * 1024 * 1024; // 5MiB
 const MULTIPART_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MiB
-const MAX_CONCURRENCY: usize = 5; // 最大并发上传数
+const DEFAULT_OPERATION_CONCURRENCY: usize = 5;
 /// Maximum source object size supported by a single S3 `CopyObject` request.
 const COPY_SINGLE_MAX: u64 = 5 * 1024 * 1024 * 1024;
 /// Default part size for server-side multipart copies.
@@ -471,7 +474,7 @@ fn multipart_part_number(part_idx: u64) -> Result<i32> {
 ///
 /// 目前为编译期常量；如需运行期 tunable（例如跨 region 25 MB BDP 链路需要
 /// 更高并发），需新增 `S3Storage` 方法暴露给上层（当前未实现）。
-const DEFAULT_READ_INFLIGHT: usize = 4;
+const DEFAULT_TRANSFER_CONCURRENCY: TransferConcurrency = TransferConcurrency::defaults(4, 5);
 type S3ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<Bytes>> + Send + 'a>>;
 type S3OffsetReadFuture<'a> = Pin<Box<dyn Future<Output = (u64, Result<Bytes>)> + Send + 'a>>;
 
@@ -557,6 +560,7 @@ pub struct S3Storage {
     client: Client,
     hcp_client: Option<HCPRestClient>,
     pub block_size: u64,
+    pub(crate) transfer_concurrency: TransferConcurrency,
     pub is_bucket_versioned: bool,
 }
 
@@ -617,6 +621,11 @@ fn s3_timeout_config() -> TimeoutConfig {
 }
 
 impl S3Storage {
+    #[must_use]
+    pub fn with_transfer_concurrency(mut self, concurrency: TransferConcurrency) -> Self {
+        self.transfer_concurrency = concurrency;
+        self
+    }
     async fn detect_bucket_versioning(
         client: &Client,
         bucket_name: &str,
@@ -802,6 +811,11 @@ impl S3Storage {
             block_size: block_size.map_or(DEFAULT_BLOCK_SIZE, |size| {
                 std::cmp::max(size, DEFAULT_BLOCK_SIZE)
             }),
+            transfer_concurrency: resolve_transfer_concurrency(
+                TransferBackend::S3,
+                DEFAULT_TRANSFER_CONCURRENCY,
+                None,
+            )?,
             is_bucket_versioned,
         })
     }
@@ -870,7 +884,7 @@ impl S3Storage {
         }
 
         let chunks: Vec<&[String]> = keys.chunks(CHUNK_SIZE).collect();
-        let concurrency = std::cmp::min(chunks.len(), MAX_CONCURRENCY);
+        let concurrency = std::cmp::min(chunks.len(), DEFAULT_OPERATION_CONCURRENCY);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let all_succeeded = Arc::new(Mutex::new(Vec::new()));
         let mut handles = Vec::with_capacity(chunks.len());
@@ -1079,7 +1093,7 @@ impl S3Storage {
 
     /// Chunked read: sends `DataChunks` into `tx`, used by the multi-chunk pipeline.
     ///
-    /// 实现 inflight pipeline：维持最多 [`DEFAULT_READ_INFLIGHT`] 个 Range GET 同时
+    /// 实现 inflight pipeline：维持配置的 read inflight 个 Range GET 同时
     /// 在飞，aws-sdk-rust 底层 HTTP/2 connection pool 自动复用连接 + 并发请求。
     /// 用 `FuturesOrdered` 保证按 offset 顺序送 channel，下游 hasher.update 需顺序。
     pub(crate) async fn read_data(
@@ -1105,7 +1119,7 @@ impl S3Storage {
 
         loop {
             // 填满 inflight，直到达到深度上限或所有字节已发出。
-            while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < size {
+            while inflight.len() < self.transfer_concurrency.read() && issue_offset < size {
                 if let Some(ref qos) = qos {
                     qos.acquire(chunk_size as u64).await;
                 }
@@ -1168,7 +1182,7 @@ impl S3Storage {
     /// 字节级断点续传源端：只读 `intervals` 覆盖的缺失区间（Range GET，inflight pipeline）。
     ///
     /// 与 `read_data` 的差异：按调用方给定的 `[start, end)` 区间列表读取，`DataChunk.offset`
-    /// 为文件内绝对偏移。区间按给定顺序串行处理，区间内维持 [`DEFAULT_READ_INFLIGHT`]
+    /// 为文件内绝对偏移。区间按给定顺序串行处理，区间内维持配置的 read inflight
     /// 个 Range GET `并发。version_id` = None：续传调用域内不涉及多版本对象。
     pub(crate) async fn read_data_intervals(
         &self,
@@ -1188,7 +1202,7 @@ impl S3Storage {
             let mut issue_offset = start;
             let mut inflight: FuturesOrdered<S3OffsetReadFuture<'_>> = FuturesOrdered::new();
             loop {
-                while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < end {
+                while inflight.len() < self.transfer_concurrency.read() && issue_offset < end {
                     if let Some(ref qos) = qos {
                         qos.acquire(chunk_size).await;
                     }
@@ -1399,7 +1413,7 @@ impl S3Storage {
             // 限制并发上传的数量，不超过实际分片数量和最大并发数
             let concurrency = usize::try_from(total_parts)
                 .unwrap_or(usize::MAX)
-                .min(MAX_CONCURRENCY);
+                .min(dst.transfer_concurrency.write());
             let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
             // 存储上传任务的句柄
@@ -2380,7 +2394,7 @@ impl S3Storage {
         let mut buffer_size = 0;
 
         // 限制并发上传的数量
-        let concurrency = MAX_CONCURRENCY;
+        let concurrency = self.transfer_concurrency.write();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
         // 存储上传任务的句柄
@@ -2873,7 +2887,9 @@ impl S3Storage {
         let key = Arc::new(self.build_full_key(relative_path));
         let upload_id = Arc::new(upload_id.to_string());
         let mut reader = rx;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(
+            self.transfer_concurrency.write(),
+        ));
         let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
 
         // 当前累积中的 part 缓冲
@@ -4719,6 +4735,7 @@ mod tests {
             client,
             hcp_client: None,
             block_size: DEFAULT_BLOCK_SIZE,
+            transfer_concurrency: DEFAULT_TRANSFER_CONCURRENCY,
             is_bucket_versioned: false,
         }
     }

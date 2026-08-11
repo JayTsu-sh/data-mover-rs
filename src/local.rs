@@ -1,4 +1,5 @@
 // 标准库
+use std::future::Future;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt as _;
 #[cfg(unix)]
@@ -6,6 +7,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, lchown};
 #[cfg(windows)]
 use std::os::windows::fs::FileExt as _;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
@@ -13,6 +15,8 @@ use std::time::UNIX_EPOCH;
 // 外部crate
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::FuturesOrdered;
 use rayon::prelude::*;
 use tokio::fs::OpenOptions;
 use tokio::sync::mpsc::Sender;
@@ -24,6 +28,9 @@ use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, shou
 use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
 use crate::time_util;
+use crate::transfer_concurrency::{
+    TransferBackend, TransferConcurrency, resolve_transfer_concurrency,
+};
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
 use crate::write_pipeline::{ChunkSink, CommitPolicy, write_pipeline_core};
 use crate::{
@@ -41,6 +48,8 @@ struct LocalWalkRuntime<'a> {
     packaged: bool,
     package_depth: usize,
 }
+
+type LocalReadFuture<'a> = Pin<Box<dyn Future<Output = (u64, Result<Bytes>)> + Send + 'a>>;
 
 impl NASEntry {
     /// 从本地文件系统 `Metadata` 构建 `NASEntry`。
@@ -152,13 +161,13 @@ impl ChunkSink for LocalChunkSink {
 }
 
 const DEFAULT_BLOCK_SIZE: u64 = 2 * MB;
-/// 位置写没有共享游标；适度并发可覆盖阻塞线程池调度及设备 I/O 延迟。
-const LOCAL_WRITE_INFLIGHT: usize = 8;
+const DEFAULT_TRANSFER_CONCURRENCY: TransferConcurrency = TransferConcurrency::defaults(1, 8);
 
 #[derive(Clone, Debug)]
 pub(crate) struct StorageConfig {
     /// 块大小，默认2MB
     pub block_size: u64,
+    pub transfer_concurrency: TransferConcurrency,
 }
 
 /// 本地存储实现
@@ -375,8 +384,15 @@ impl LocalStorage {
                 block_size: block_size.map_or(DEFAULT_BLOCK_SIZE, |size| {
                     std::cmp::min(size, DEFAULT_BLOCK_SIZE)
                 }),
+                transfer_concurrency: DEFAULT_TRANSFER_CONCURRENCY,
             },
         }
+    }
+
+    #[must_use]
+    pub fn with_transfer_concurrency(mut self, concurrency: TransferConcurrency) -> Self {
+        self.config.transfer_concurrency = concurrency;
+        self
     }
 }
 
@@ -1134,35 +1150,36 @@ impl LocalStorage {
             }
         };
 
-        // 简单循环持续读取文件直到文件结束
-        let mut offset = 0;
+        let mut issue_offset = 0u64;
         let mut bytes_read: u64 = 0;
-
         let mut hasher = create_hash_calculator(enable_integrity_check);
+        let mut inflight: FuturesOrdered<LocalReadFuture<'_>> = FuturesOrdered::new();
 
         loop {
-            // 如果提供了 QoS 管理器，则进行带宽 + IOPS 限流
-            if let Some(ref qos) = qos {
-                qos.acquire(chunk_size).await;
-                debug!(
-                    "QoS acquired {} bytes for file {:?}",
-                    chunk_size, relative_path
-                );
+            while inflight.len() < self.config.transfer_concurrency.read() && issue_offset < size {
+                let want = chunk_size.min(size - issue_offset);
+                if let Some(ref qos) = qos {
+                    qos.acquire(want).await;
+                }
+                let offset = issue_offset;
+                let storage = self;
+                let file = &source_file;
+                inflight.push_back(Box::pin(async move {
+                    let result = storage.read(file, offset, want).await;
+                    (offset, result)
+                }));
+                issue_offset += want;
             }
 
-            let data = match self.read(&source_file, offset, chunk_size).await {
-                Ok(data) => data,
-                Err(e) => {
-                    error!(
-                        "Failed to read data chunk (offset: {}, chunk size: {}): {:?}",
-                        offset, chunk_size, e
-                    );
-                    break;
-                }
+            let Some((offset, result)) = inflight.next().await else {
+                break;
             };
+            let data = result.map_err(|error| {
+                error!("Failed to read data chunk at offset {offset}: {error:?}");
+                error
+            })?;
 
             let data_length = data.len() as u64;
-
             if data.is_empty() {
                 debug!("Reached end of file {:?}", relative_path);
                 break;
@@ -1177,9 +1194,7 @@ impl LocalStorage {
                 );
             }
             // 发送数据块到通道
-            if let Err(e) = tx.send(DataChunk { offset, data }).await {
-                error!("Failed to send data chunk: {:?}", e);
-                // 通道已关闭，退出循环
+            if tx.send(DataChunk { offset, data }).await.is_err() {
                 break;
             }
 
@@ -1191,14 +1206,6 @@ impl LocalStorage {
                 bytes_read.min(size),
                 size
             );
-
-            // 更新偏移量
-            offset += data_length;
-            // 如果已经读取了整个文件，退出循环
-            if offset >= size {
-                debug!("Completed reading file {:?}", relative_path);
-                break;
-            }
         }
 
         trace!(
@@ -1236,7 +1243,7 @@ impl LocalStorage {
             rx,
             &sink,
             None,
-            LOCAL_WRITE_INFLIGHT,
+            self.config.transfer_concurrency.write(),
             CommitPolicy::None,
             bytes_counter,
         )
@@ -1264,21 +1271,34 @@ impl LocalStorage {
         let chunk_size = self.config.block_size.max(1);
         let source_file = self.open(relative_path).await?;
         for &(start, end) in intervals {
-            let mut offset = start;
-            while offset < end {
-                let want = chunk_size.min(end - offset);
-                if let Some(ref qos) = qos {
-                    qos.acquire(want).await;
+            let mut issue_offset = start;
+            let mut inflight: FuturesOrdered<LocalReadFuture<'_>> = FuturesOrdered::new();
+            loop {
+                while inflight.len() < self.config.transfer_concurrency.read() && issue_offset < end
+                {
+                    let want = chunk_size.min(end - issue_offset);
+                    if let Some(ref qos) = qos {
+                        qos.acquire(want).await;
+                    }
+                    let offset = issue_offset;
+                    let storage = self;
+                    let file = &source_file;
+                    inflight.push_back(Box::pin(async move {
+                        let result = storage.read(file, offset, want).await;
+                        (offset, result)
+                    }));
+                    issue_offset += want;
                 }
-                let data = self.read(&source_file, offset, want).await?;
+                let Some((offset, result)) = inflight.next().await else {
+                    break;
+                };
+                let data = result?;
                 if data.is_empty() {
                     break;
                 }
-                let len = data.len() as u64;
                 if tx.send(DataChunk { offset, data }).await.is_err() {
                     return Ok(());
                 }
-                offset += len;
             }
         }
         Ok(())
@@ -1310,7 +1330,7 @@ impl LocalStorage {
             rx,
             &sink,
             None,
-            LOCAL_WRITE_INFLIGHT,
+            self.config.transfer_concurrency.write(),
             CommitPolicy::Barrier {
                 every: SYNC_BARRIER,
                 cb: on_committed,
@@ -1653,7 +1673,10 @@ pub fn create_local_storage(
     let local_path = normalize_local_path(path)?;
     debug!("In create local storage Normalized path: {}", local_path);
 
-    let local_storage = LocalStorage::new(&local_path, block_size);
+    let concurrency =
+        resolve_transfer_concurrency(TransferBackend::Local, DEFAULT_TRANSFER_CONCURRENCY, None)?;
+    let local_storage =
+        LocalStorage::new(&local_path, block_size).with_transfer_concurrency(concurrency);
     Ok(StorageEnum::Local(local_storage))
 }
 

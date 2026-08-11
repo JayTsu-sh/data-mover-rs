@@ -30,10 +30,22 @@ jobs:
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --locked --no-fail-fast
-      - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+      - name: Storage matrix E2E (protocol defaults)
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+      - name: Storage matrix E2E (high transfer concurrency)
+        env:
+          DATA_MOVER_READ_INFLIGHT: "8"
+          DATA_MOVER_WRITE_INFLIGHT: "16"
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: Independent integrity check E2E
+        env:
+          DATA_MOVER_READ_INFLIGHT: "8"
+          DATA_MOVER_WRITE_INFLIGHT: "16"
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-integrity-e2e.sh "$RUN_ID"
       - name: Resumable copy E2E
+        env:
+          DATA_MOVER_READ_INFLIGHT: "8"
+          DATA_MOVER_WRITE_INFLIGHT: "16"
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-resume-e2e.sh "$RUN_ID"
       - run: cargo build --release --locked
       - run: cargo build --examples --release --locked

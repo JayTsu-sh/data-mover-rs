@@ -25,6 +25,9 @@ use crate::error::StorageError;
 use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
+use crate::transfer_concurrency::{
+    TransferBackend, TransferConcurrency, resolve_transfer_concurrency,
+};
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
 use crate::write_pipeline::{ChunkSink, CommitPolicy, write_pipeline_core};
 use crate::{
@@ -430,16 +433,9 @@ const DEFAULT_BLOCK_SIZE: u64 = MB; // 1MB
 /// （RTT 0.33ms + server ~1ms ≈ 1.3ms，64KB chunk）计：串行 ≈ 49MB/s，
 /// 4 深度理论 ≈ 196MB/s，已超过 1GbE 链路上限。与 cifs/s3 的深度对齐。
 /// v3 无并发上限；v4.1 受 session slot（64）约束，远未触及。
-const DEFAULT_READ_INFLIGHT: usize = 4;
+/// 写默认 8：`FILE_SYNC` 的持久化延迟和抖动通常高于读，使用更深窗口。
+const DEFAULT_TRANSFER_CONCURRENCY: TransferConcurrency = TransferConcurrency::defaults(4, 8);
 type NfsReadFuture = Pin<Box<dyn Future<Output = (u64, u32, nfs_rs::Result<Bytes>)> + Send>>;
-
-/// 单文件写入的同时在飞请求数（inflight write pipeline 深度）。
-///
-/// WRITE 以 `FILE_SYNC` 稳定级发送，server 落盘延迟比 READ 高且抖动大
-/// （WAFL/ext4 journal flush），取读侧 2 倍做余量：8×64KB = 512KB 在飞，
-/// 可吸收 ~4.6ms 的 server 端抖动。8 ≪ v4.1 的 64 slots，SlotTable 满时
-/// nfs-rs 内部排队等待而非报错，退化平滑。
-const DEFAULT_WRITE_INFLIGHT: usize = 8;
 
 /// 从 `relative_path` 中剥离 root 前缀，返回相对于 root 的路径。
 /// 使用 `Path::strip_prefix` 按组件比较，跨平台兼容，零字符串分配。
@@ -509,6 +505,7 @@ fn build_relative_path_impl(root: &str, dir_path: &str, entry_file_name: &str) -
 pub(crate) struct StorageConfig {
     /// 块大小，默认1MB
     pub block_size: u64,
+    pub transfer_concurrency: TransferConcurrency,
 }
 
 /// 该结构体是 NFS v3 存储的核心实现，封装了 NFS 挂载、根文件句柄和根路径等信息。
@@ -551,6 +548,11 @@ fn build_cache_root_fh(server_id: u64, raw_fh: &Bytes) -> Bytes {
 }
 
 impl NFSStorage {
+    #[must_use]
+    pub fn with_transfer_concurrency(mut self, concurrency: TransferConcurrency) -> Self {
+        self.config.transfer_concurrency = concurrency;
+        self
+    }
     /// 解析 NFS URL
     ///
     /// 该方法将 NFS URL 解析为标准的 NFS 挂载 URL 和根目录路径。
@@ -689,6 +691,11 @@ impl NFSStorage {
             root: Arc::new(String::new()),
             config: StorageConfig {
                 block_size: effective_block_size,
+                transfer_concurrency: resolve_transfer_concurrency(
+                    TransferBackend::Nfs,
+                    DEFAULT_TRANSFER_CONCURRENCY,
+                    None,
+                )?,
             },
             refresh_generation: Arc::new(AtomicU64::new(0)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -2914,7 +2921,7 @@ impl NFSStorage {
         let mut hasher = create_hash_calculator(enable_integrity_check);
 
         // ── inflight read pipeline ──────────────────────────────────────────────
-        // 模型：维持最多 DEFAULT_READ_INFLIGHT 个 READ 同时在飞（RPC 层 xid 多路
+        // 模型：维持配置的 read_inflight 个 READ 同时在飞（RPC 层 xid 多路
         // 复用；v4.1 额外受 session slot 约束，slot 满时 nfs-rs 内部排队）。
         // 用 FuturesOrdered 保证结果按 issue（即 offset 升序）顺序弹出：hasher
         // 必须按 offset 顺序 update，否则校验和错；下游 channel 发送同时保序。
@@ -3027,7 +3034,7 @@ impl NFSStorage {
         chunk_size: u64,
         qos: Option<&QosManager>,
     ) {
-        while inflight.len() < DEFAULT_READ_INFLIGHT && *issue_offset < size {
+        while inflight.len() < self.config.transfer_concurrency.read() && *issue_offset < size {
             if let Some(qos) = qos {
                 qos.acquire(chunk_size).await;
             }
@@ -3152,7 +3159,7 @@ impl NFSStorage {
         // data.len() ≤ block_size 恒成立，切分循环单次通过、零开销。
         //
         // ── inflight write pipeline ─────────────────────────────────────────────
-        // 维持最多 DEFAULT_WRITE_INFLIGHT 个 WRITE 同时在飞（FuturesUnordered，
+        // 维持配置的 write_inflight 个 WRITE 同时在飞（FuturesUnordered，
         // 不保序——server 各 offset 独立处理，完成顺序与 issue 顺序无关）。
         // WRITE 以 FILE_SYNC 稳定级发送（server 降级时 nfs-rs 内部补 COMMIT），
         // 并发 WRITE 间无顺序约束（RFC 5661 允许同一 stateid 并发 WRITE；v3
@@ -3164,7 +3171,7 @@ impl NFSStorage {
             rx,
             &sink,
             Some(self.config.block_size.max(1)),
-            DEFAULT_WRITE_INFLIGHT,
+            self.config.transfer_concurrency.write(),
             CommitPolicy::None,
             bytes_counter,
         )
@@ -3210,7 +3217,9 @@ impl NFSStorage {
                 let mut issue_offset = start;
                 let mut inflight: FuturesOrdered<NfsReadFuture> = FuturesOrdered::new();
                 loop {
-                    while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < end {
+                    while inflight.len() < self.config.transfer_concurrency.read()
+                        && issue_offset < end
+                    {
                         if let Some(ref qos) = qos {
                             qos.acquire(chunk_size).await;
                         }
@@ -3276,7 +3285,7 @@ impl NFSStorage {
             rx,
             &sink,
             Some(self.config.block_size.max(1)),
-            DEFAULT_WRITE_INFLIGHT,
+            self.config.transfer_concurrency.write(),
             CommitPolicy::PerChunk(on_committed),
             bytes_counter,
         )
