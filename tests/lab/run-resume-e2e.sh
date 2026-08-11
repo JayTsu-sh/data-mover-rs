@@ -62,18 +62,10 @@ with path.open("wb") as output:
     return
   fi
 
-  if [[ "$backend" == "nfs3" ]]; then
-    ssh_lab_root "$LAB_SOURCE_MGMT" \
-      "cat > '$LAB_NFS3_EXPORT/ci/$run_id/$key'" < "$seed_path"
-    return
-  fi
-
-  if [[ "$backend" == "nfs41" ]]; then
-    ssh_lab_root "$LAB_SOURCE_MGMT" \
-      "cat > '$LAB_NFS41_EXPORT/ci/$run_id/$key'" < "$seed_path"
-    return
-  fi
-
+  # Seed remote sources through data-mover instead of writing exports as root.
+  # Root-owned NFS fixtures carry uid/gid 0 into NAS metadata; an NFS -> Local
+  # resume would then correctly attempt to preserve that ownership but fail on
+  # the unprivileged lab runner with EPERM before exercising the data path.
   cargo run --quiet --locked --example storage_copy -- \
     --source "$local_root/seed" \
     --destination "$(storage_url source "$backend")" \
