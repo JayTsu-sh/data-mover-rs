@@ -733,6 +733,7 @@ struct LocalFsIoPool {
     read_requests: Arc<tokio::sync::Semaphore>,
     write_requests: Arc<tokio::sync::Semaphore>,
     buffered_bytes: Arc<tokio::sync::Semaphore>,
+    metrics: PoolMetrics,
 }
 
 #[cfg(target_os = "linux")]
@@ -761,6 +762,50 @@ impl LocalFsIoPool {
             read_requests: Arc::new(tokio::sync::Semaphore::new(config.read_requests)),
             write_requests: Arc::new(tokio::sync::Semaphore::new(config.write_requests)),
             buffered_bytes: Arc::new(tokio::sync::Semaphore::new(config.buffered_bytes)),
+            metrics: PoolMetrics::default(),
+        }
+    }
+
+    fn record(
+        &self,
+        operation: PoolOperation,
+        bytes: usize,
+        failed: bool,
+        started: std::time::Instant,
+    ) {
+        let index = operation as usize;
+        self.metrics.requests[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.metrics.bytes[index].fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        if failed {
+            self.metrics.errors[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.metrics.latency_ns[index].fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn snapshot(&self) -> PoolMetricsSnapshot {
+        PoolMetricsSnapshot {
+            requests: std::array::from_fn(|i| {
+                self.metrics.requests[i].load(std::sync::atomic::Ordering::Relaxed)
+            }),
+            bytes: std::array::from_fn(|i| {
+                self.metrics.bytes[i].load(std::sync::atomic::Ordering::Relaxed)
+            }),
+            errors: std::array::from_fn(|i| {
+                self.metrics.errors[i].load(std::sync::atomic::Ordering::Relaxed)
+            }),
+            latency_ns: std::array::from_fn(|i| {
+                self.metrics.latency_ns[i].load(std::sync::atomic::Ordering::Relaxed)
+            }),
+            current_inflight: self.inflight.load(std::sync::atomic::Ordering::Acquire),
+            peak_inflight: self
+                .metrics
+                .peak_inflight
+                .load(std::sync::atomic::Ordering::Relaxed),
+            transitions: self.transitions.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -831,6 +876,10 @@ impl LocalFsIoPool {
                 PoolState::Uring => {
                     self.inflight
                         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let current = self.inflight.load(std::sync::atomic::Ordering::Acquire);
+                    self.metrics
+                        .peak_inflight
+                        .fetch_max(current, std::sync::atomic::Ordering::Relaxed);
                     if self.state() == PoolState::Uring {
                         return Ok(Some(PoolRequestGuard(Arc::clone(self))));
                     }
@@ -868,6 +917,11 @@ impl LocalFsIoPool {
         {
             self.transitions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                device = self.device,
+                state = "falling_back",
+                "local io_uring pool fallback started"
+            );
             while self.inflight.load(std::sync::atomic::Ordering::Acquire) != 0 {
                 self.changed.notified().await;
             }
@@ -876,6 +930,11 @@ impl LocalFsIoPool {
                 std::sync::atomic::Ordering::Release,
             );
             self.changed.notify_waiters();
+            tracing::warn!(
+                device = self.device,
+                state = "blocking",
+                "local io_uring pool fallback completed"
+            );
         } else {
             while self.state() == PoolState::FallingBack {
                 self.changed.notified().await;
@@ -884,11 +943,18 @@ impl LocalFsIoPool {
     }
 
     fn fail(&self) {
-        self.state.store(
-            PoolState::Failed as u8,
-            std::sync::atomic::Ordering::Release,
-        );
-        self.changed.notify_waiters();
+        let previous = self
+            .state
+            .swap(PoolState::Failed as u8, std::sync::atomic::Ordering::AcqRel);
+        if previous != PoolState::Failed as u8 {
+            tracing::error!(
+                device = self.device,
+                state = "failed",
+                replay_uncertain_write = false,
+                "local io_uring pool entered failed state"
+            );
+            self.changed.notify_waiters();
+        }
     }
 
     fn worker(
@@ -910,6 +976,38 @@ impl LocalFsIoPool {
         let index = affinity_index(device, inode, workers.len());
         Ok(workers[index].clone())
     }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum PoolOperation {
+    Read = 0,
+    Write = 1,
+    Fsync = 2,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default, Debug)]
+struct PoolMetrics {
+    requests: [std::sync::atomic::AtomicU64; 3],
+    bytes: [std::sync::atomic::AtomicU64; 3],
+    errors: [std::sync::atomic::AtomicU64; 3],
+    latency_ns: [std::sync::atomic::AtomicU64; 3],
+    peak_inflight: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct PoolMetricsSnapshot {
+    requests: [u64; 3],
+    bytes: [u64; 3],
+    errors: [u64; 3],
+    latency_ns: [u64; 3],
+    current_inflight: usize,
+    peak_inflight: usize,
+    transitions: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -1110,8 +1208,15 @@ impl UringLocalDataIo {
             let bytes = BlockingLocalDataIo.read_at(file, offset, count).await?;
             return Ok(with_byte_budget(bytes, buffer_permit));
         };
+        let started = std::time::Instant::now();
         let result = attached.worker.read(attached.token, offset, count).await;
         drop(guard);
+        tokens.pool.record(
+            PoolOperation::Read,
+            result.as_ref().map_or(0, Bytes::len),
+            result.is_err(),
+            started,
+        );
         match result {
             Ok(bytes) => Ok(with_byte_budget(bytes, buffer_permit)),
             Err(error) if is_explicitly_unsupported(&error) => {
@@ -1141,8 +1246,15 @@ impl UringLocalDataIo {
             return BlockingLocalDataIo.write_at(file, offset, data).await;
         };
         let retry_data = data.clone();
+        let started = std::time::Instant::now();
         let result = attached.worker.write(attached.token, offset, data).await;
         drop(guard);
+        tokens.pool.record(
+            PoolOperation::Write,
+            result.as_ref().copied().unwrap_or(0),
+            result.is_err(),
+            started,
+        );
         match result {
             Ok(written) => Ok(written),
             Err(error) if is_explicitly_unsupported(&error) => {
@@ -1169,8 +1281,12 @@ impl UringLocalDataIo {
         let Some(guard) = tokens.pool.begin().await? else {
             return BlockingLocalDataIo.sync_all(file).await;
         };
+        let started = std::time::Instant::now();
         let result = attached.worker.sync(attached.token).await;
         drop(guard);
+        tokens
+            .pool
+            .record(PoolOperation::Fsync, 0, result.is_err(), started);
         match result {
             Ok(()) => Ok(()),
             Err(error) if is_explicitly_unsupported(&error) => {
@@ -2135,6 +2251,36 @@ mod tests {
             .unwrap_or_else(|| std::io::Error::other("conflict unexpectedly succeeded"));
         assert!(error.to_string().contains("device 300"));
         drop(first);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn metrics_snapshot_counts_operations_without_double_counting() -> std::io::Result<()> {
+        use super::{LocalFsIoPool, LocalFsPoolConfig, PoolOperation};
+
+        let pool = Arc::new(LocalFsIoPool::new(301, LocalFsPoolConfig::default()));
+        let first = pool
+            .begin()
+            .await?
+            .unwrap_or_else(|| panic!("unexpected blocking pool"));
+        let second = pool
+            .begin()
+            .await?
+            .unwrap_or_else(|| panic!("unexpected blocking pool"));
+        assert_eq!(pool.snapshot().peak_inflight, 2);
+        drop(first);
+        drop(second);
+        pool.record(PoolOperation::Read, 11, false, std::time::Instant::now());
+        pool.record(PoolOperation::Write, 7, true, std::time::Instant::now());
+        pool.record(PoolOperation::Fsync, 0, false, std::time::Instant::now());
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.requests, [1, 1, 1]);
+        assert_eq!(snapshot.bytes, [11, 7, 0]);
+        assert_eq!(snapshot.errors, [0, 1, 0]);
+        assert_eq!(snapshot.current_inflight, 0);
+        assert!(snapshot.latency_ns.iter().all(|value| *value > 0));
+        assert_eq!(snapshot.transitions, 0);
+        Ok(())
     }
 
     #[test]
