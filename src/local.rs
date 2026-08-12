@@ -1157,20 +1157,15 @@ impl LocalStorage {
         let mut inflight: FuturesOrdered<LocalReadFuture<'_>> = FuturesOrdered::new();
 
         loop {
-            while inflight.len() < self.config.transfer_concurrency.read() && issue_offset < size {
-                let want = chunk_size.min(size - issue_offset);
-                if let Some(ref qos) = qos {
-                    qos.acquire(want).await;
-                }
-                let offset = issue_offset;
-                let storage = self;
-                let file = &source_file;
-                inflight.push_back(Box::pin(async move {
-                    let result = storage.read(file, offset, want).await;
-                    (offset, result)
-                }));
-                issue_offset += want;
-            }
+            self.fill_read_pipeline(
+                &mut inflight,
+                &source_file,
+                &mut issue_offset,
+                size,
+                chunk_size,
+                qos.as_ref(),
+            )
+            .await;
 
             let Some((offset, result)) = inflight.next().await else {
                 break;
@@ -1215,6 +1210,29 @@ impl LocalStorage {
         );
 
         Ok(hasher)
+    }
+
+    async fn fill_read_pipeline<'a>(
+        &'a self,
+        inflight: &mut FuturesOrdered<LocalReadFuture<'a>>,
+        file: &'a LocalFileHandle,
+        issue_offset: &mut u64,
+        end: u64,
+        chunk_size: u64,
+        qos: Option<&QosManager>,
+    ) {
+        while inflight.len() < self.config.transfer_concurrency.read() && *issue_offset < end {
+            let want = chunk_size.min(end - *issue_offset);
+            if let Some(qos) = qos {
+                qos.acquire(want).await;
+            }
+            let offset = *issue_offset;
+            inflight.push_back(Box::pin(async move {
+                let result = self.read(file, offset, want).await;
+                (offset, result)
+            }));
+            *issue_offset += want;
+        }
     }
 
     /// 返回实际写入的累计字节数（写端本地计数，issue #58）。
@@ -1275,21 +1293,15 @@ impl LocalStorage {
             let mut issue_offset = start;
             let mut inflight: FuturesOrdered<LocalReadFuture<'_>> = FuturesOrdered::new();
             loop {
-                while inflight.len() < self.config.transfer_concurrency.read() && issue_offset < end
-                {
-                    let want = chunk_size.min(end - issue_offset);
-                    if let Some(ref qos) = qos {
-                        qos.acquire(want).await;
-                    }
-                    let offset = issue_offset;
-                    let storage = self;
-                    let file = &source_file;
-                    inflight.push_back(Box::pin(async move {
-                        let result = storage.read(file, offset, want).await;
-                        (offset, result)
-                    }));
-                    issue_offset += want;
-                }
+                self.fill_read_pipeline(
+                    &mut inflight,
+                    &source_file,
+                    &mut issue_offset,
+                    end,
+                    chunk_size,
+                    qos.as_ref(),
+                )
+                .await;
                 let Some((offset, result)) = inflight.next().await else {
                     break;
                 };
