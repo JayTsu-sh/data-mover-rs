@@ -393,6 +393,12 @@ impl LocalStorage {
         self.config.transfer_concurrency = concurrency;
         self
     }
+
+    #[must_use]
+    pub fn with_local_io_config(mut self, config: &crate::LocalIoConfig) -> Self {
+        self.local_io = LocalDataIo::from_config(config);
+        self
+    }
 }
 
 impl LocalStorage {

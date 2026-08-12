@@ -43,6 +43,7 @@ pub use integrity_check::{
     MismatchDataField, MismatchMetaField, MtimePrecision,
 };
 pub use local::LocalStorage;
+pub use local_io::{LocalIoConfig, LocalIoConfigBuilder, LocalIoEngine};
 pub use nfs::NFSStorage;
 pub use qos::QosManager;
 pub use s3::{MultipartUpload, S3BucketInfo, S3CompletedPart, S3Storage};
