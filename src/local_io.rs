@@ -436,7 +436,7 @@ struct AttachedUringFile {
 struct UringFileTokens {
     read: Option<AttachedUringFile>,
     write: Option<AttachedUringFile>,
-    _pool: Arc<LocalFsIoPool>,
+    pool: Arc<LocalFsIoPool>,
 }
 
 #[cfg(target_os = "linux")]
@@ -483,6 +483,20 @@ struct LocalFsIoPool {
     config: LocalFsPoolConfig,
     read: std::sync::OnceLock<std::result::Result<Vec<UringWorker>, String>>,
     write: std::sync::OnceLock<std::result::Result<Vec<UringWorker>, String>>,
+    state: std::sync::atomic::AtomicU8,
+    inflight: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+    transitions: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum PoolState {
+    Uring = 0,
+    FallingBack = 1,
+    Blocking = 2,
+    Failed = 3,
 }
 
 #[cfg(target_os = "linux")]
@@ -494,7 +508,86 @@ impl LocalFsIoPool {
             config,
             read: std::sync::OnceLock::new(),
             write: std::sync::OnceLock::new(),
+            state: std::sync::atomic::AtomicU8::new(PoolState::Uring as u8),
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
+            transitions: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    fn state(&self) -> PoolState {
+        match self.state.load(std::sync::atomic::Ordering::Acquire) {
+            0 => PoolState::Uring,
+            1 => PoolState::FallingBack,
+            2 => PoolState::Blocking,
+            _ => PoolState::Failed,
+        }
+    }
+
+    async fn begin(self: &Arc<Self>) -> std::io::Result<Option<PoolRequestGuard>> {
+        loop {
+            match self.state() {
+                PoolState::Uring => {
+                    self.inflight
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if self.state() == PoolState::Uring {
+                        return Ok(Some(PoolRequestGuard(Arc::clone(self))));
+                    }
+                    self.finish_request();
+                }
+                PoolState::FallingBack => self.changed.notified().await,
+                PoolState::Blocking => return Ok(None),
+                PoolState::Failed => {
+                    return Err(std::io::Error::other("io_uring filesystem pool failed"));
+                }
+            }
+        }
+    }
+
+    fn finish_request(&self) {
+        if self
+            .inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.changed.notify_waiters();
+        }
+    }
+
+    async fn fallback(&self) {
+        if self
+            .state
+            .compare_exchange(
+                PoolState::Uring as u8,
+                PoolState::FallingBack as u8,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.transitions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            while self.inflight.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                self.changed.notified().await;
+            }
+            self.state.store(
+                PoolState::Blocking as u8,
+                std::sync::atomic::Ordering::Release,
+            );
+            self.changed.notify_waiters();
+        } else {
+            while self.state() == PoolState::FallingBack {
+                self.changed.notified().await;
+            }
+        }
+    }
+
+    fn fail(&self) {
+        self.state.store(
+            PoolState::Failed as u8,
+            std::sync::atomic::Ordering::Release,
+        );
+        self.changed.notify_waiters();
     }
 
     fn worker(
@@ -513,6 +606,16 @@ impl LocalFsIoPool {
             .map_err(|error| std::io::Error::other(error.clone()))?;
         let index = affinity_index(device, inode, workers.len());
         Ok(workers[index].clone())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PoolRequestGuard(Arc<LocalFsIoPool>);
+
+#[cfg(target_os = "linux")]
+impl Drop for PoolRequestGuard {
+    fn drop(&mut self) {
+        self.0.finish_request();
     }
 }
 
@@ -595,6 +698,23 @@ impl UringLocalDataIo {
             self.pools.lock().insert(device, Arc::clone(&pool));
             pool
         };
+        loop {
+            match pool.state() {
+                PoolState::Blocking => {
+                    return Ok(LocalIoFile {
+                        inner: Arc::new(standard),
+                        uring: None,
+                    });
+                }
+                PoolState::Failed => {
+                    return Err(StorageError::OperationError(
+                        "io_uring filesystem pool is in failed state".to_string(),
+                    ));
+                }
+                PoolState::FallingBack => pool.changed.notified().await,
+                PoolState::Uring => break,
+            }
+        }
         let attached = self
             .attach_to_pool(&standard, &pool, device, inode, direction)
             .await;
@@ -645,45 +765,104 @@ impl UringLocalDataIo {
         Ok(UringFileTokens {
             read,
             write,
-            _pool: Arc::clone(pool),
+            pool: Arc::clone(pool),
         })
     }
 
     async fn read_at(&self, file: &LocalIoFile, offset: u64, count: u64) -> Result<Bytes> {
-        if let Some(attached) = file.uring.as_ref().and_then(|tokens| tokens.read.as_ref()) {
-            attached
-                .worker
-                .read(attached.token, offset, count)
-                .await
-                .map_err(Into::into)
-        } else {
-            BlockingLocalDataIo.read_at(file, offset, count).await
+        let Some(tokens) = file.uring.as_ref() else {
+            return BlockingLocalDataIo.read_at(file, offset, count).await;
+        };
+        let Some(attached) = tokens.read.as_ref() else {
+            return BlockingLocalDataIo.read_at(file, offset, count).await;
+        };
+        let Some(guard) = tokens.pool.begin().await? else {
+            return BlockingLocalDataIo.read_at(file, offset, count).await;
+        };
+        let result = attached.worker.read(attached.token, offset, count).await;
+        drop(guard);
+        match result {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if is_explicitly_unsupported(&error) => {
+                tokens.pool.fallback().await;
+                BlockingLocalDataIo.read_at(file, offset, count).await
+            }
+            Err(error) if is_uncertain_worker_error(&error) => {
+                tokens.pool.fail();
+                Err(StorageError::OperationError(format!(
+                    "io_uring read completion is uncertain: {error}"
+                )))
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
     async fn write_at(&self, file: &LocalIoFile, offset: u64, data: Bytes) -> Result<usize> {
-        if let Some(attached) = file.uring.as_ref().and_then(|tokens| tokens.write.as_ref()) {
-            attached
-                .worker
-                .write(attached.token, offset, data)
-                .await
-                .map_err(Into::into)
-        } else {
-            BlockingLocalDataIo.write_at(file, offset, data).await
+        let Some(tokens) = file.uring.as_ref() else {
+            return BlockingLocalDataIo.write_at(file, offset, data).await;
+        };
+        let Some(attached) = tokens.write.as_ref() else {
+            return BlockingLocalDataIo.write_at(file, offset, data).await;
+        };
+        let Some(guard) = tokens.pool.begin().await? else {
+            return BlockingLocalDataIo.write_at(file, offset, data).await;
+        };
+        let retry_data = data.clone();
+        let result = attached.worker.write(attached.token, offset, data).await;
+        drop(guard);
+        match result {
+            Ok(written) => Ok(written),
+            Err(error) if is_explicitly_unsupported(&error) => {
+                tokens.pool.fallback().await;
+                BlockingLocalDataIo.write_at(file, offset, retry_data).await
+            }
+            Err(error) if is_uncertain_worker_error(&error) => {
+                tokens.pool.fail();
+                Err(StorageError::OperationError(format!(
+                    "io_uring write completion is uncertain; write was not replayed: {error}"
+                )))
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
     async fn sync_all(&self, file: &LocalIoFile) -> Result<()> {
-        if let Some(attached) = file.uring.as_ref().and_then(|tokens| tokens.write.as_ref()) {
-            attached
-                .worker
-                .sync(attached.token)
-                .await
-                .map_err(Into::into)
-        } else {
-            BlockingLocalDataIo.sync_all(file).await
+        let Some(tokens) = file.uring.as_ref() else {
+            return BlockingLocalDataIo.sync_all(file).await;
+        };
+        let Some(attached) = tokens.write.as_ref() else {
+            return BlockingLocalDataIo.sync_all(file).await;
+        };
+        let Some(guard) = tokens.pool.begin().await? else {
+            return BlockingLocalDataIo.sync_all(file).await;
+        };
+        let result = attached.worker.sync(attached.token).await;
+        drop(guard);
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if is_explicitly_unsupported(&error) => {
+                tokens.pool.fallback().await;
+                BlockingLocalDataIo.sync_all(file).await
+            }
+            Err(error) if is_uncertain_worker_error(&error) => {
+                tokens.pool.fail();
+                Err(StorageError::OperationError(format!(
+                    "io_uring fsync completion is uncertain: {error}"
+                )))
+            }
+            Err(error) => Err(error.into()),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn is_explicitly_unsupported(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(38 | 95))
+}
+
+#[cfg(target_os = "linux")]
+fn is_uncertain_worker_error(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::BrokenPipe
 }
 
 #[cfg(target_os = "linux")]
@@ -1347,6 +1526,79 @@ mod tests {
             task.await??;
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_fallback_drains_inflight_and_transitions_once() -> std::io::Result<()> {
+        use super::{LocalFsIoPool, LocalFsPoolConfig, PoolState};
+
+        let pool = Arc::new(LocalFsIoPool::new(99, LocalFsPoolConfig::default()));
+        let first = pool
+            .begin()
+            .await?
+            .unwrap_or_else(|| panic!("pool unexpectedly blocking"));
+        let second = pool
+            .begin()
+            .await?
+            .unwrap_or_else(|| panic!("pool unexpectedly blocking"));
+        let leader_pool = Arc::clone(&pool);
+        let leader = tokio::spawn(async move { leader_pool.fallback().await });
+        while pool.state() != PoolState::FallingBack {
+            tokio::task::yield_now().await;
+        }
+        let follower_pool = Arc::clone(&pool);
+        let follower = tokio::spawn(async move { follower_pool.fallback().await });
+        let waiter_pool = Arc::clone(&pool);
+        let waiter = tokio::spawn(async move { waiter_pool.begin().await });
+        tokio::task::yield_now().await;
+        assert!(!leader.is_finished());
+        assert!(!waiter.is_finished());
+
+        drop(first);
+        drop(second);
+        leader.await.map_err(std::io::Error::other)?;
+        follower.await.map_err(std::io::Error::other)?;
+        assert!(waiter.await.map_err(std::io::Error::other)??.is_none());
+        assert_eq!(pool.state(), PoolState::Blocking);
+        assert_eq!(pool.transitions.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_pool_rejects_new_requests() {
+        use super::{LocalFsIoPool, LocalFsPoolConfig, PoolState};
+
+        let pool = Arc::new(LocalFsIoPool::new(100, LocalFsPoolConfig::default()));
+        pool.fail();
+        assert_eq!(pool.state(), PoolState::Failed);
+        let error = pool.begin().await.err().unwrap_or_else(|| {
+            std::io::Error::other("failed pool unexpectedly accepted a request")
+        });
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_error_classification_is_narrow() {
+        for errno in [38, 95] {
+            assert!(super::is_explicitly_unsupported(
+                &std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+        for errno in [2, 5, 13, 22, 28] {
+            assert!(!super::is_explicitly_unsupported(
+                &std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+        assert!(super::is_uncertain_worker_error(&std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "worker stopped",
+        )));
+        assert!(!super::is_uncertain_worker_error(
+            &std::io::Error::from_raw_os_error(95)
+        ));
     }
 
     #[test]
