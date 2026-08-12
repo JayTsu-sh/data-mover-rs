@@ -60,7 +60,7 @@ jobs:
       - name: Inflight performance benchmark
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-inflight-benchmark.sh "$RUN_ID" inflight-benchmark.csv
       - name: Upload inflight benchmark
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: inflight-benchmark-${{ github.run_id }}
           path: inflight-benchmark.csv
