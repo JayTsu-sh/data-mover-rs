@@ -26,11 +26,20 @@ pub(crate) struct LocalDataIo {
 }
 
 impl LocalDataIo {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn attach(&self, file: tokio::fs::File) -> Result<LocalIoFile> {
+        self.attach_for(file, LocalIoDirection::Both).await
+    }
+
+    pub(crate) async fn attach_for(
+        &self,
+        file: tokio::fs::File,
+        direction: LocalIoDirection,
+    ) -> Result<LocalIoFile> {
         if let Some(error) = &self.selection.error {
             return Err(StorageError::ConfigError(error.clone()));
         }
-        self.adapter.attach(file).await
+        self.adapter.attach(file, direction).await
     }
 
     pub(crate) async fn read_at(
@@ -54,6 +63,14 @@ impl LocalDataIo {
     pub(crate) async fn sync_all(&self, file: &LocalIoFile) -> Result<()> {
         self.adapter.sync_all(file).await
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalIoDirection {
+    Read,
+    Write,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Both,
 }
 
 impl Default for LocalDataIo {
@@ -99,25 +116,23 @@ impl LocalDataIoAdapter {
         }
         #[cfg(target_os = "linux")]
         if selection.engine == SelectedEngine::Uring {
-            return match UringLocalDataIo::new() {
-                Ok(adapter) => Self::Uring(adapter),
-                Err(error) if selection.mode == LocalIoEngineMode::Auto => {
-                    tracing::debug!(%error, "io_uring worker initialization failed; using blocking I/O");
-                    Self::Blocking(BlockingLocalDataIo)
-                }
-                Err(error) => Self::Failed(Arc::new(format!(
-                    "forced io_uring worker initialization failed: {error}"
-                ))),
-            };
+            return Self::Uring(UringLocalDataIo::new(selection.mode.clone()));
         }
         Self::Blocking(BlockingLocalDataIo)
     }
 
-    async fn attach(&self, file: tokio::fs::File) -> Result<LocalIoFile> {
+    async fn attach(
+        &self,
+        file: tokio::fs::File,
+        direction: LocalIoDirection,
+    ) -> Result<LocalIoFile> {
         match self {
-            Self::Blocking(adapter) => Ok(adapter.attach(file).await),
+            Self::Blocking(adapter) => {
+                let _ = direction;
+                Ok(adapter.attach(file).await)
+            }
             #[cfg(target_os = "linux")]
-            Self::Uring(adapter) => adapter.attach(file).await,
+            Self::Uring(adapter) => adapter.attach(file, direction).await,
             Self::Failed(error) => Err(StorageError::ConfigError(error.to_string())),
         }
     }
@@ -410,65 +425,265 @@ pub(crate) struct LocalIoFile {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+struct AttachedUringFile {
+    worker: UringWorker,
+    token: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
 struct UringFileTokens {
-    read: u64,
-    write: u64,
+    read: Option<AttachedUringFile>,
+    write: Option<AttachedUringFile>,
+    _pool: Arc<LocalFsIoPool>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalFsPoolConfig {
+    read_rings: usize,
+    write_rings: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for LocalFsPoolConfig {
+    fn default() -> Self {
+        Self {
+            read_rings: 2,
+            write_rings: 2,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl LocalFsPoolConfig {
+    fn validate(self) -> std::io::Result<Self> {
+        if !(1..=4).contains(&self.read_rings) || !(1..=4).contains(&self.write_rings) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "io_uring worker count must be between 1 and 4 per direction",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum PoolDirection {
+    Read,
+    Write,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct LocalFsIoPool {
+    device: u64,
+    config: LocalFsPoolConfig,
+    read: std::sync::OnceLock<std::result::Result<Vec<UringWorker>, String>>,
+    write: std::sync::OnceLock<std::result::Result<Vec<UringWorker>, String>>,
+}
+
+#[cfg(target_os = "linux")]
+impl LocalFsIoPool {
+    fn new(device: u64, config: LocalFsPoolConfig) -> Self {
+        debug_assert!(config.validate().is_ok());
+        Self {
+            device,
+            config,
+            read: std::sync::OnceLock::new(),
+            write: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn worker(
+        &self,
+        direction: PoolDirection,
+        device: u64,
+        inode: u64,
+    ) -> std::io::Result<UringWorker> {
+        let (workers, count, label) = match direction {
+            PoolDirection::Read => (&self.read, self.config.read_rings, "read"),
+            PoolDirection::Write => (&self.write, self.config.write_rings, "write"),
+        };
+        let workers = workers.get_or_init(|| spawn_worker_group(self.device, label, count));
+        let workers = workers
+            .as_ref()
+            .map_err(|error| std::io::Error::other(error.clone()))?;
+        let index = affinity_index(device, inode, workers.len());
+        Ok(workers[index].clone())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_worker_group(
+    device: u64,
+    direction: &str,
+    count: usize,
+) -> std::result::Result<Vec<UringWorker>, String> {
+    (0..count)
+        .map(|index| {
+            UringWorker::spawn(&format!("data-mover-uring-{device}-{direction}-{index}"))
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn affinity_index(device: u64, inode: u64, worker_count: usize) -> usize {
+    let mixed = device.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ inode;
+    usize::try_from(mixed % worker_count as u64).unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct LocalFsRegistry {
+    pools: parking_lot::Mutex<std::collections::HashMap<u64, std::sync::Weak<LocalFsIoPool>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl LocalFsRegistry {
+    fn resolve(&self, device: u64, config: LocalFsPoolConfig) -> Arc<LocalFsIoPool> {
+        let mut pools = self.pools.lock();
+        if let Some(pool) = pools.get(&device).and_then(std::sync::Weak::upgrade) {
+            return pool;
+        }
+        let pool = Arc::new(LocalFsIoPool::new(device, config));
+        pools.insert(device, Arc::downgrade(&pool));
+        pool
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn global_fs_registry() -> &'static LocalFsRegistry {
+    static REGISTRY: std::sync::OnceLock<LocalFsRegistry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(LocalFsRegistry::default)
 }
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 struct UringLocalDataIo {
-    read: UringWorker,
-    write: UringWorker,
+    mode: LocalIoEngineMode,
+    pools: Arc<parking_lot::Mutex<std::collections::HashMap<u64, Arc<LocalFsIoPool>>>>,
 }
 
 #[cfg(target_os = "linux")]
 impl UringLocalDataIo {
-    fn new() -> std::io::Result<Self> {
-        Ok(Self {
-            read: UringWorker::spawn("data-mover-uring-read")?,
-            write: UringWorker::spawn("data-mover-uring-write")?,
+    fn new(mode: LocalIoEngineMode) -> Self {
+        Self {
+            mode,
+            pools: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    async fn attach(
+        &self,
+        file: tokio::fs::File,
+        direction: LocalIoDirection,
+    ) -> Result<LocalIoFile> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let standard = file.into_std().await;
+        let metadata = standard.metadata()?;
+        let device = metadata.dev();
+        let inode = metadata.ino();
+        let pool = if let Some(pool) = self.pools.lock().get(&device).cloned() {
+            pool
+        } else {
+            let pool = global_fs_registry().resolve(device, LocalFsPoolConfig::default());
+            self.pools.lock().insert(device, Arc::clone(&pool));
+            pool
+        };
+        let attached = self
+            .attach_to_pool(&standard, &pool, device, inode, direction)
+            .await;
+        let uring = match attached {
+            Ok(tokens) => Some(tokens),
+            Err(error) if self.mode == LocalIoEngineMode::Auto => {
+                tracing::debug!(%error, device, "io_uring pool initialization failed; using blocking I/O for file");
+                None
+            }
+            Err(error) => {
+                return Err(StorageError::ConfigError(format!(
+                    "forced io_uring pool initialization failed: {error}"
+                )));
+            }
+        };
+        Ok(LocalIoFile {
+            inner: Arc::new(standard),
+            uring,
         })
     }
 
-    async fn attach(&self, file: tokio::fs::File) -> Result<LocalIoFile> {
-        let standard = file.into_std().await;
-        let read_file = standard.try_clone()?;
-        let write_file = standard.try_clone()?;
-        let (read, write) =
-            tokio::try_join!(self.read.attach(read_file), self.write.attach(write_file),)?;
-        Ok(LocalIoFile {
-            inner: Arc::new(standard),
-            uring: Some(UringFileTokens { read, write }),
+    async fn attach_to_pool(
+        &self,
+        file: &std::fs::File,
+        pool: &Arc<LocalFsIoPool>,
+        device: u64,
+        inode: u64,
+        direction: LocalIoDirection,
+    ) -> std::io::Result<UringFileTokens> {
+        let read_worker = matches!(direction, LocalIoDirection::Read | LocalIoDirection::Both)
+            .then(|| pool.worker(PoolDirection::Read, device, inode))
+            .transpose()?;
+        let write_worker = matches!(direction, LocalIoDirection::Write | LocalIoDirection::Both)
+            .then(|| pool.worker(PoolDirection::Write, device, inode))
+            .transpose()?;
+        let read = if let Some(worker) = read_worker {
+            let token = worker.attach(file.try_clone()?).await?;
+            Some(AttachedUringFile { worker, token })
+        } else {
+            None
+        };
+        let write = if let Some(worker) = write_worker {
+            let token = worker.attach(file.try_clone()?).await?;
+            Some(AttachedUringFile { worker, token })
+        } else {
+            None
+        };
+        Ok(UringFileTokens {
+            read,
+            write,
+            _pool: Arc::clone(pool),
         })
     }
 
     async fn read_at(&self, file: &LocalIoFile, offset: u64, count: u64) -> Result<Bytes> {
-        let token = file.uring.ok_or_else(missing_uring_token)?.read;
-        self.read
-            .read(token, offset, count)
-            .await
-            .map_err(Into::into)
+        if let Some(attached) = file.uring.as_ref().and_then(|tokens| tokens.read.as_ref()) {
+            attached
+                .worker
+                .read(attached.token, offset, count)
+                .await
+                .map_err(Into::into)
+        } else {
+            BlockingLocalDataIo.read_at(file, offset, count).await
+        }
     }
 
     async fn write_at(&self, file: &LocalIoFile, offset: u64, data: Bytes) -> Result<usize> {
-        let token = file.uring.ok_or_else(missing_uring_token)?.write;
-        self.write
-            .write(token, offset, data)
-            .await
-            .map_err(Into::into)
+        if let Some(attached) = file.uring.as_ref().and_then(|tokens| tokens.write.as_ref()) {
+            attached
+                .worker
+                .write(attached.token, offset, data)
+                .await
+                .map_err(Into::into)
+        } else {
+            BlockingLocalDataIo.write_at(file, offset, data).await
+        }
     }
 
     async fn sync_all(&self, file: &LocalIoFile) -> Result<()> {
-        let token = file.uring.ok_or_else(missing_uring_token)?.write;
-        self.write.sync(token).await.map_err(Into::into)
+        if let Some(attached) = file.uring.as_ref().and_then(|tokens| tokens.write.as_ref()) {
+            attached
+                .worker
+                .sync(attached.token)
+                .await
+                .map_err(Into::into)
+        } else {
+            BlockingLocalDataIo.sync_all(file).await
+        }
     }
-}
-
-#[cfg(target_os = "linux")]
-fn missing_uring_token() -> StorageError {
-    StorageError::OperationError("local file is not attached to io_uring workers".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -499,6 +714,8 @@ enum UringCommand {
 #[derive(Clone, Debug)]
 struct UringWorker {
     sender: async_channel::Sender<UringCommand>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    id: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -507,6 +724,7 @@ impl UringWorker {
     const RING_ENTRIES: u32 = 64;
 
     fn spawn(name: &str) -> std::io::Result<Self> {
+        static NEXT_WORKER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (sender, receiver) = async_channel::bounded(Self::CHANNEL_CAPACITY);
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
@@ -527,7 +745,10 @@ impl UringWorker {
         started_rx.recv().map_err(|_| {
             std::io::Error::other("io_uring worker failed before runtime initialization")
         })?;
-        Ok(Self { sender })
+        Ok(Self {
+            sender,
+            id: NEXT_WORKER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        })
     }
 
     async fn send(&self, command: UringCommand) -> std::io::Result<()> {
@@ -805,14 +1026,16 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn uring_io() -> std::io::Result<LocalDataIo> {
-        Ok(LocalDataIo {
-            adapter: super::LocalDataIoAdapter::Uring(super::UringLocalDataIo::new()?),
+    fn uring_io() -> LocalDataIo {
+        LocalDataIo {
+            adapter: super::LocalDataIoAdapter::Uring(super::UringLocalDataIo::new(
+                LocalIoEngineMode::Uring,
+            )),
             selection: Arc::new(EngineSelection::uring(
                 LocalIoEngineMode::Uring,
                 Some("test".to_string()),
             )),
-        })
+        }
     }
 
     struct TempDir(PathBuf);
@@ -953,7 +1176,7 @@ mod tests {
         if super::probe_io_uring().is_err() {
             return Ok(());
         }
-        run_data_io_contract("uring-contract", uring_io()?).await
+        run_data_io_contract("uring-contract", uring_io()).await
     }
 
     #[cfg(target_os = "linux")]
@@ -961,13 +1184,169 @@ mod tests {
     async fn closed_uring_worker_returns_broken_pipe_without_waiting() {
         let (sender, receiver) = async_channel::bounded(1);
         receiver.close();
-        let worker = super::UringWorker { sender };
+        let worker = super::UringWorker { sender, id: 0 };
         let error = worker
             .read(1, 0, 1)
             .await
             .err()
             .unwrap_or_else(|| std::io::Error::other("closed worker unexpectedly succeeded"));
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pool_config_accepts_one_through_four_per_direction() {
+        use super::LocalFsPoolConfig;
+
+        for count in 1..=4 {
+            assert!(
+                LocalFsPoolConfig {
+                    read_rings: count,
+                    write_rings: count
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        for count in [0, 5] {
+            assert!(
+                LocalFsPoolConfig {
+                    read_rings: count,
+                    write_rings: 2
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                LocalFsPoolConfig {
+                    read_rings: 2,
+                    write_rings: count
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert_eq!(LocalFsPoolConfig::default().read_rings, 2);
+        assert_eq!(LocalFsPoolConfig::default().write_rings, 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registry_is_single_flight_per_device_and_weakly_reclaims_pools() {
+        use super::{LocalFsPoolConfig, LocalFsRegistry};
+
+        let registry = Arc::new(LocalFsRegistry::default());
+        let threads = (0..8)
+            .map(|_| {
+                let registry = Arc::clone(&registry);
+                std::thread::spawn(move || registry.resolve(42, LocalFsPoolConfig::default()))
+            })
+            .collect::<Vec<_>>();
+        let pools = threads
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .unwrap_or_else(|_| panic!("registry test thread panicked"))
+            })
+            .collect::<Vec<_>>();
+        assert!(pools.iter().all(|pool| Arc::ptr_eq(&pools[0], pool)));
+        let different = registry.resolve(43, LocalFsPoolConfig::default());
+        assert!(!Arc::ptr_eq(&pools[0], &different));
+
+        let weak = Arc::downgrade(&pools[0]);
+        drop(pools);
+        assert!(weak.upgrade().is_none());
+        let rebuilt = registry.resolve(42, LocalFsPoolConfig::default());
+        assert_eq!(rebuilt.device, 42);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pool_initializes_directions_lazily_and_affinity_is_stable() -> std::io::Result<()> {
+        use super::{LocalFsIoPool, LocalFsPoolConfig, PoolDirection};
+
+        if super::probe_io_uring().is_err() {
+            return Ok(());
+        }
+        let pool = LocalFsIoPool::new(7, LocalFsPoolConfig::default());
+        assert!(pool.read.get().is_none());
+        assert!(pool.write.get().is_none());
+        let first = pool.worker(PoolDirection::Read, 7, 100)?;
+        let repeated = pool.worker(PoolDirection::Read, 7, 100)?;
+        assert_eq!(first.id, repeated.id);
+        assert_eq!(
+            pool.read
+                .get()
+                .and_then(|result| result.as_ref().ok())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert!(pool.write.get().is_none());
+
+        let ids = (100..132)
+            .map(|inode| {
+                pool.worker(PoolDirection::Read, 7, inode)
+                    .map(|worker| worker.id)
+            })
+            .collect::<std::io::Result<std::collections::HashSet<_>>>()?;
+        assert_eq!(ids.len(), 2);
+        let write = pool.worker(PoolDirection::Write, 7, 100)?;
+        assert_ne!(write.id, first.id);
+        assert_eq!(
+            pool.write
+                .get()
+                .and_then(|result| result.as_ref().ok())
+                .map(Vec::len),
+            Some(2)
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pooled_uring_copies_eight_files_with_matching_digests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        if super::probe_io_uring().is_err() {
+            return Ok(());
+        }
+        let temp = TempDir::new("eight-files")?;
+        let io = uring_io();
+        let tasks = (0_u8..8)
+            .map(|index| {
+                let io = io.clone();
+                let path = temp.path().join(format!("file-{index}.bin"));
+                tokio::spawn(async move {
+                    let expected = (0..257_usize)
+                        .map(|position| index.wrapping_add(position.to_le_bytes()[0]))
+                        .collect::<Vec<_>>();
+                    let file = tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .read(true)
+                        .write(true)
+                        .open(&path)
+                        .await?;
+                    let file = io.attach(file).await?;
+                    for (chunk, data) in expected.chunks(37).enumerate() {
+                        io.write_at(&file, (chunk * 37) as u64, Bytes::copy_from_slice(data))
+                            .await?;
+                    }
+                    io.sync_all(&file).await?;
+                    let actual = io.read_at(&file, 0, 512).await?;
+                    if blake3::hash(&actual) != blake3::hash(&expected) {
+                        return Err(crate::error::StorageError::OperationError(
+                            "pooled copy digest mismatch".into(),
+                        ));
+                    }
+                    Ok::<_, crate::error::StorageError>(())
+                })
+            })
+            .collect::<Vec<_>>();
+        for task in tasks {
+            task.await??;
+        }
+        Ok(())
     }
 
     #[test]

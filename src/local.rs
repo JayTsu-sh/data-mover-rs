@@ -21,7 +21,7 @@ use tracing::{debug, error, info, trace};
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
 use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
-use crate::local_io::{LocalDataIo, LocalIoFile};
+use crate::local_io::{LocalDataIo, LocalIoDirection, LocalIoFile};
 use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
 use crate::time_util;
@@ -111,8 +111,12 @@ pub(crate) struct LocalFileHandle {
 }
 
 impl LocalFileHandle {
-    async fn new(io: LocalDataIo, file: tokio::fs::File) -> Result<Self> {
-        let file = io.attach(file).await?;
+    async fn new(
+        io: LocalDataIo,
+        file: tokio::fs::File,
+        direction: LocalIoDirection,
+    ) -> Result<Self> {
+        let file = io.attach_for(file, direction).await?;
         Ok(Self { io, file })
     }
 
@@ -399,7 +403,7 @@ impl LocalStorage {
 
     pub(crate) async fn open(&self, relative_path: &Path) -> Result<LocalFileHandle> {
         let inner = tokio::fs::File::open(self.get_full_path(relative_path)).await?;
-        LocalFileHandle::new(self.local_io.clone(), inner).await
+        LocalFileHandle::new(self.local_io.clone(), inner, LocalIoDirection::Read).await
     }
 
     /// 创建/打开目标文件。
@@ -446,7 +450,7 @@ impl LocalStorage {
         self.set_metadata(relative_path, None, None, uid, gid, mode)
             .await?;
 
-        LocalFileHandle::new(self.local_io.clone(), file).await
+        LocalFileHandle::new(self.local_io.clone(), file, LocalIoDirection::Write).await
     }
 
     ///
