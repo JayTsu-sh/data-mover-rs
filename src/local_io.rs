@@ -444,6 +444,9 @@ struct UringFileTokens {
 struct LocalFsPoolConfig {
     read_rings: usize,
     write_rings: usize,
+    read_requests: usize,
+    write_requests: usize,
+    buffered_bytes: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -452,6 +455,9 @@ impl Default for LocalFsPoolConfig {
         Self {
             read_rings: 2,
             write_rings: 2,
+            read_requests: 32,
+            write_requests: 64,
+            buffered_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -463,6 +469,18 @@ impl LocalFsPoolConfig {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "io_uring worker count must be between 1 and 4 per direction",
+            ));
+        }
+        if self.read_requests == 0 || self.write_requests == 0 || self.buffered_bytes == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "io_uring request and buffered-byte budgets must be greater than zero",
+            ));
+        }
+        if self.buffered_bytes > 512 * 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "io_uring buffered-byte budget exceeds semaphore capacity",
             ));
         }
         Ok(self)
@@ -487,6 +505,9 @@ struct LocalFsIoPool {
     inflight: std::sync::atomic::AtomicUsize,
     changed: tokio::sync::Notify,
     transitions: std::sync::atomic::AtomicUsize,
+    read_requests: Arc<tokio::sync::Semaphore>,
+    write_requests: Arc<tokio::sync::Semaphore>,
+    buffered_bytes: Arc<tokio::sync::Semaphore>,
 }
 
 #[cfg(target_os = "linux")]
@@ -512,7 +533,62 @@ impl LocalFsIoPool {
             inflight: std::sync::atomic::AtomicUsize::new(0),
             changed: tokio::sync::Notify::new(),
             transitions: std::sync::atomic::AtomicUsize::new(0),
+            read_requests: Arc::new(tokio::sync::Semaphore::new(config.read_requests)),
+            write_requests: Arc::new(tokio::sync::Semaphore::new(config.write_requests)),
+            buffered_bytes: Arc::new(tokio::sync::Semaphore::new(config.buffered_bytes)),
         }
+    }
+
+    async fn acquire_read_budget(
+        &self,
+        count: u64,
+    ) -> std::io::Result<(
+        tokio::sync::OwnedSemaphorePermit,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    )> {
+        let bytes = usize::try_from(count).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "read size exceeds platform capacity",
+            )
+        })?;
+        if bytes > self.config.buffered_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "read size {bytes} exceeds filesystem buffered-byte budget {}",
+                    self.config.buffered_bytes
+                ),
+            ));
+        }
+        let request = Arc::clone(&self.read_requests)
+            .acquire_owned()
+            .await
+            .map_err(|_| std::io::Error::other("read request budget closed"))?;
+        let buffer = if bytes == 0 {
+            None
+        } else {
+            let permits = u32::try_from(bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "read size exceeds byte permit capacity",
+                )
+            })?;
+            Some(
+                Arc::clone(&self.buffered_bytes)
+                    .acquire_many_owned(permits)
+                    .await
+                    .map_err(|_| std::io::Error::other("buffered-byte budget closed"))?,
+            )
+        };
+        Ok((request, buffer))
+    }
+
+    async fn acquire_write_budget(&self) -> std::io::Result<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.write_requests)
+            .acquire_owned()
+            .await
+            .map_err(|_| std::io::Error::other("write request budget closed"))
     }
 
     fn state(&self) -> PoolState {
@@ -776,16 +852,19 @@ impl UringLocalDataIo {
         let Some(attached) = tokens.read.as_ref() else {
             return BlockingLocalDataIo.read_at(file, offset, count).await;
         };
+        let (_request_permit, buffer_permit) = tokens.pool.acquire_read_budget(count).await?;
         let Some(guard) = tokens.pool.begin().await? else {
-            return BlockingLocalDataIo.read_at(file, offset, count).await;
+            let bytes = BlockingLocalDataIo.read_at(file, offset, count).await?;
+            return Ok(with_byte_budget(bytes, buffer_permit));
         };
         let result = attached.worker.read(attached.token, offset, count).await;
         drop(guard);
         match result {
-            Ok(bytes) => Ok(bytes),
+            Ok(bytes) => Ok(with_byte_budget(bytes, buffer_permit)),
             Err(error) if is_explicitly_unsupported(&error) => {
                 tokens.pool.fallback().await;
-                BlockingLocalDataIo.read_at(file, offset, count).await
+                let bytes = BlockingLocalDataIo.read_at(file, offset, count).await?;
+                Ok(with_byte_budget(bytes, buffer_permit))
             }
             Err(error) if is_uncertain_worker_error(&error) => {
                 tokens.pool.fail();
@@ -804,6 +883,7 @@ impl UringLocalDataIo {
         let Some(attached) = tokens.write.as_ref() else {
             return BlockingLocalDataIo.write_at(file, offset, data).await;
         };
+        let _request_permit = tokens.pool.acquire_write_budget().await?;
         let Some(guard) = tokens.pool.begin().await? else {
             return BlockingLocalDataIo.write_at(file, offset, data).await;
         };
@@ -852,6 +932,30 @@ impl UringLocalDataIo {
             }
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct BudgetedBytes {
+    data: Bytes,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[cfg(target_os = "linux")]
+impl AsRef<[u8]> for BudgetedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn with_byte_budget(bytes: Bytes, permit: Option<tokio::sync::OwnedSemaphorePermit>) -> Bytes {
+    match permit {
+        Some(permit) => Bytes::from_owner(BudgetedBytes {
+            data: bytes,
+            _permit: permit,
+        }),
+        None => bytes,
     }
 }
 
@@ -1381,7 +1485,8 @@ mod tests {
             assert!(
                 LocalFsPoolConfig {
                     read_rings: count,
-                    write_rings: count
+                    write_rings: count,
+                    ..LocalFsPoolConfig::default()
                 }
                 .validate()
                 .is_ok()
@@ -1391,7 +1496,8 @@ mod tests {
             assert!(
                 LocalFsPoolConfig {
                     read_rings: count,
-                    write_rings: 2
+                    write_rings: 2,
+                    ..LocalFsPoolConfig::default()
                 }
                 .validate()
                 .is_err()
@@ -1399,7 +1505,8 @@ mod tests {
             assert!(
                 LocalFsPoolConfig {
                     read_rings: 2,
-                    write_rings: count
+                    write_rings: count,
+                    ..LocalFsPoolConfig::default()
                 }
                 .validate()
                 .is_err()
@@ -1599,6 +1706,117 @@ mod tests {
         assert!(!super::is_uncertain_worker_error(
             &std::io::Error::from_raw_os_error(95)
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn small_budget_config() -> super::LocalFsPoolConfig {
+        super::LocalFsPoolConfig {
+            read_requests: 2,
+            write_requests: 3,
+            buffered_bytes: 8,
+            ..super::LocalFsPoolConfig::default()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn byte_permit_follows_bytes_clones_until_last_drop() -> std::io::Result<()> {
+        let pool = Arc::new(super::LocalFsIoPool::new(200, small_budget_config()));
+        let (request, permit) = pool.acquire_read_budget(6).await?;
+        assert_eq!(pool.read_requests.available_permits(), 1);
+        assert_eq!(pool.buffered_bytes.available_permits(), 2);
+        drop(request);
+        let bytes = super::with_byte_budget(Bytes::from_static(b"abcdef"), permit);
+        let clone = bytes.clone();
+        drop(bytes);
+        assert_eq!(pool.buffered_bytes.available_permits(), 2);
+        drop(clone);
+        assert_eq!(pool.buffered_bytes.available_permits(), 8);
+        assert_eq!(pool.read_requests.available_permits(), 2);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_request_budgets_bound_concurrency_and_return_to_zero_usage()
+    -> std::io::Result<()> {
+        let pool = Arc::new(super::LocalFsIoPool::new(201, small_budget_config()));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let pool = Arc::clone(&pool);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tasks.push(tokio::spawn(async move {
+                let (request, buffer) = pool.acquire_read_budget(4).await?;
+                let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+                peak.fetch_max(now, Ordering::AcqRel);
+                tokio::task::yield_now().await;
+                active.fetch_sub(1, Ordering::AcqRel);
+                drop(buffer);
+                drop(request);
+                Ok::<_, std::io::Error>(())
+            }));
+        }
+        for task in tasks {
+            task.await.map_err(std::io::Error::other)??;
+        }
+        assert!(peak.load(Ordering::Acquire) <= 2);
+        assert_eq!(pool.read_requests.available_permits(), 2);
+        assert_eq!(pool.buffered_bytes.available_permits(), 8);
+
+        let permits = futures::future::join_all((0..3).map(|_| pool.acquire_write_budget()))
+            .await
+            .into_iter()
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(pool.write_requests.available_permits(), 0);
+        drop(permits);
+        assert_eq!(pool.write_requests.available_permits(), 3);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn zero_and_oversized_reads_handle_byte_budget_without_waiting() -> std::io::Result<()> {
+        let pool = Arc::new(super::LocalFsIoPool::new(202, small_budget_config()));
+        let (request, bytes) = pool.acquire_read_budget(0).await?;
+        assert!(bytes.is_none());
+        assert_eq!(pool.buffered_bytes.available_permits(), 8);
+        drop(request);
+
+        let error = pool.acquire_read_budget(9).await.err().unwrap_or_else(|| {
+            std::io::Error::other("oversized read unexpectedly acquired budget")
+        });
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(pool.read_requests.available_permits(), 2);
+        assert_eq!(pool.buffered_bytes.available_permits(), 8);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn budget_config_rejects_zero_and_excessive_values() {
+        for config in [
+            super::LocalFsPoolConfig {
+                read_requests: 0,
+                ..small_budget_config()
+            },
+            super::LocalFsPoolConfig {
+                write_requests: 0,
+                ..small_budget_config()
+            },
+            super::LocalFsPoolConfig {
+                buffered_bytes: 0,
+                ..small_budget_config()
+            },
+            super::LocalFsPoolConfig {
+                buffered_bytes: 512 * 1024 * 1024 + 1,
+                ..small_budget_config()
+            },
+        ] {
+            assert!(config.validate().is_err());
+        }
     }
 
     #[test]
