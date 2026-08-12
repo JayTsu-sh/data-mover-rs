@@ -1337,6 +1337,7 @@ dependencies = [
  "hyper-rustls 0.27.9",
  "hyper-util",
  "indicatif",
+ "io-uring",
  "md-5 0.10.6",
  "moka",
  "nfs-rs",
@@ -2342,6 +2343,17 @@ checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
  "block-padding",
  "hybrid-array",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
+dependencies = [
+ "bitflags 2.11.1",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]

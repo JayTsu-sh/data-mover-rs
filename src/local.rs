@@ -111,9 +111,9 @@ pub(crate) struct LocalFileHandle {
 }
 
 impl LocalFileHandle {
-    async fn new(io: LocalDataIo, file: tokio::fs::File) -> Self {
-        let file = io.attach(file).await;
-        Self { io, file }
+    async fn new(io: LocalDataIo, file: tokio::fs::File) -> Result<Self> {
+        let file = io.attach(file).await?;
+        Ok(Self { io, file })
     }
 
     async fn commit(&self) -> Result<()> {
@@ -399,7 +399,7 @@ impl LocalStorage {
 
     pub(crate) async fn open(&self, relative_path: &Path) -> Result<LocalFileHandle> {
         let inner = tokio::fs::File::open(self.get_full_path(relative_path)).await?;
-        Ok(LocalFileHandle::new(self.local_io.clone(), inner).await)
+        LocalFileHandle::new(self.local_io.clone(), inner).await
     }
 
     /// 创建/打开目标文件。
@@ -446,7 +446,7 @@ impl LocalStorage {
         self.set_metadata(relative_path, None, None, uid, gid, mode)
             .await?;
 
-        Ok(LocalFileHandle::new(self.local_io.clone(), file).await)
+        LocalFileHandle::new(self.local_io.clone(), file).await
     }
 
     ///
