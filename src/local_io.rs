@@ -956,6 +956,20 @@ mod tests {
         run_data_io_contract("uring-contract", uring_io()?).await
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn closed_uring_worker_returns_broken_pipe_without_waiting() {
+        let (sender, receiver) = async_channel::bounded(1);
+        receiver.close();
+        let worker = super::UringWorker { sender };
+        let error = worker
+            .read(1, 0, 1)
+            .await
+            .err()
+            .unwrap_or_else(|| std::io::Error::other("closed worker unexpectedly succeeded"));
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
     #[test]
     fn parses_engine_modes_and_defaults_to_auto() {
         assert_eq!(mode_from_env_value(None), Ok(LocalIoEngineMode::Auto));
