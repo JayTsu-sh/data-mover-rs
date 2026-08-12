@@ -187,7 +187,7 @@ impl LocalDataIoAdapter {
 
 #[cfg(test)]
 fn mode_from_env_value(value: Option<&str>) -> std::result::Result<LocalIoEngineMode, String> {
-    value.map_or(Ok(LocalIoEngineMode::Auto), LocalIoEngineMode::parse)
+    value.map_or(Ok(LocalIoEngineMode::Blocking), LocalIoEngineMode::parse)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -327,7 +327,7 @@ impl LocalIoConfigBuilder {
             Some(value) => value,
             None => lookup(ENGINE_ENV)
                 .as_deref()
-                .map_or(Ok(LocalIoEngine::Auto), LocalIoEngine::parse)
+                .map_or(Ok(LocalIoEngine::Blocking), LocalIoEngine::parse)
                 .map_err(StorageError::ConfigError)?,
         };
         let pool = LocalFsPoolConfig {
@@ -2284,8 +2284,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_engine_modes_and_defaults_to_auto() {
-        assert_eq!(mode_from_env_value(None), Ok(LocalIoEngineMode::Auto));
+    fn parses_engine_modes_and_defaults_to_blocking() {
+        assert_eq!(mode_from_env_value(None), Ok(LocalIoEngineMode::Blocking));
         assert_eq!(
             LocalIoEngineMode::parse(" AuTo "),
             Ok(LocalIoEngineMode::Auto)
