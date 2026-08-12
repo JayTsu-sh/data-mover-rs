@@ -31,6 +31,20 @@ separate payload larger than 12 MiB is copied from NFSv4.1 to NFSv4.1 so normal
 copy exercises multiple negotiated read and write requests, including the
 session-limited effective `wsize`.
 
+The nightly workflow runs this matrix three times: with protocol defaults,
+strictly serial read/write pipelines, and higher read/write concurrency. Release
+validation runs the defaults and higher-concurrency profiles. The integrity and
+resumable-copy matrices also run with the higher-concurrency profile, so a
+release cannot pass by exercising configuration parsing without exercising the
+configured pipelines and verifying their final size and SHA-256 digest.
+
+`run-inflight-benchmark.sh` measures the complete 4-by-4 directed protocol
+matrix with a fixed 128 MiB payload at inflight depths 1, 2, 4, 8, and 16. It
+runs each case twice in opposite depth order and records elapsed time,
+throughput, user/system CPU time, process CPU percentage, and peak RSS. The
+timed command includes the production copy integrity check, so the CSV reports
+end-to-end copy-and-verify cost rather than an unchecked microbenchmark.
+
 `run-resume-e2e.sh` exercises the complete 4-by-4 directed matrix in two
 independent processes. The first process writes a durable prefix without
 committing it. The second process discovers the remaining range from the

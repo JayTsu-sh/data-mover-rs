@@ -31,6 +31,9 @@ use crate::error::StorageError;
 use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
+use crate::transfer_concurrency::{
+    TransferBackend, TransferConcurrency, resolve_transfer_concurrency,
+};
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
 use crate::write_pipeline::{ChunkSink, CommitPolicy, write_pipeline_core};
 use crate::{
@@ -277,15 +280,9 @@ const DEFAULT_BLOCK_SIZE: u64 = 8 * MB;
 /// 默认 4：在常见 SMB credits（512+）和 chunk=8 MiB 配置下，与 BDP 对齐又不至于
 /// 让 server 端 read-ahead 失效。增大值在高 RTT 链路收益线性，超过 server credits
 /// 上限后失效。目前为编译期常量；如需运行期 tunable，需新增 `CifsStorage`
-/// 方法暴露给上层（当前未实现）。
-const DEFAULT_READ_INFLIGHT: usize = 4;
+/// 方法暴露给上层（当前已通过统一传输配置提供）。写默认同样为 4。
+const DEFAULT_TRANSFER_CONCURRENCY: TransferConcurrency = TransferConcurrency::defaults(4, 4);
 type CifsReadFuture<'a> = Pin<Box<dyn Future<Output = std::io::Result<Bytes>> + Send + 'a>>;
-
-/// 单文件写入的同时在飞请求数（inflight write pipeline 深度）。
-///
-/// 默认 4：与 read 对称。写入端 `FuturesUnordered` 允许乱序 ack，server 端 inode
-/// 级 lock 串行化在内存中代价低，wire 上仍受益于 pipeline。
-const DEFAULT_WRITE_INFLIGHT: usize = 4;
 
 /// 目录枚举使用的 SMB info class。
 ///
@@ -393,6 +390,7 @@ impl IntoRawDirEntry for FileIdFullDirectoryInformation {
 #[derive(Clone, Debug)]
 pub(crate) struct StorageConfig {
     pub block_size: u64,
+    pub transfer_concurrency: TransferConcurrency,
 }
 
 /// SMB/CIFS 存储后端
@@ -580,6 +578,12 @@ fn parse_smb_url(url_str: &str) -> Result<(String, u16, String, String, String, 
 }
 
 impl CifsStorage {
+    /// Overrides the per-file read and write concurrency for this adapter.
+    #[must_use]
+    pub fn with_transfer_concurrency(mut self, concurrency: TransferConcurrency) -> Self {
+        self.config.transfer_concurrency = concurrency;
+        self
+    }
     /// 创建 `CifsStorage` 实例
     ///
     /// 解析 URL → 创建 Client → 连接共享 → 验证连通性
@@ -698,6 +702,11 @@ impl CifsStorage {
             root: Arc::new(sub_path),
             config: StorageConfig {
                 block_size: effective_block_size,
+                transfer_concurrency: resolve_transfer_concurrency(
+                    TransferBackend::Cifs,
+                    DEFAULT_TRANSFER_CONCURRENCY,
+                    None,
+                )?,
             },
             dir_info_class: Arc::new(OnceCell::new()),
             file_id_class: Arc::new(OnceCell::new()),
@@ -1036,7 +1045,7 @@ impl CifsStorage {
         let mut hasher = create_hash_calculator(enable_integrity_check);
 
         // ── inflight read pipeline ──────────────────────────────────────────────
-        // 模型：维持最多 DEFAULT_READ_INFLIGHT 个 read_block_bytes 同时在飞。
+        // 模型：维持配置的 read_inflight 个 read_block_bytes 同时在飞。
         // 用 FuturesOrdered 保证 send 到下游 channel 的 offset 严格升序（hasher
         // 必须按 offset 顺序 update，否则校验和错；下游 write 端虽然可乱序，但
         // sender 端保序更稳健）。
@@ -1056,7 +1065,7 @@ impl CifsStorage {
 
         loop {
             // 填满 inflight，直到达到深度上限或所有字节已发出。
-            while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < size {
+            while inflight.len() < self.config.transfer_concurrency.read() && issue_offset < size {
                 if let Some(ref qos) = qos {
                     qos.acquire(chunk_size).await;
                 }
@@ -1253,7 +1262,7 @@ impl CifsStorage {
         };
 
         // ── inflight write pipeline ─────────────────────────────────────────────
-        // 维持最多 DEFAULT_WRITE_INFLIGHT 个 write_block_zc 同时在飞
+        // 维持配置的 write_inflight 个 write_block_zc 同时在飞
         // （FuturesUnordered，不保序——write 端 server 各 offset 独立处理，
         // 完成顺序与 issue 顺序无关）。SMB 无 wsize 切分需求，整块派发
         // （`sub_chunk_size=None`）。由 `write_pipeline::write_pipeline_core`
@@ -1263,7 +1272,7 @@ impl CifsStorage {
             rx,
             &sink,
             None,
-            DEFAULT_WRITE_INFLIGHT,
+            self.config.transfer_concurrency.write(),
             CommitPolicy::None,
             bytes_counter,
         )
@@ -1339,7 +1348,8 @@ impl CifsStorage {
             let mut inflight: FuturesOrdered<ReadFut<'_>> = FuturesOrdered::new();
             let mut issue_offset = start;
             loop {
-                while inflight.len() < DEFAULT_READ_INFLIGHT && issue_offset < end {
+                while inflight.len() < self.config.transfer_concurrency.read() && issue_offset < end
+                {
                     if let Some(ref qos) = qos {
                         qos.acquire(chunk_size).await;
                     }
@@ -1433,7 +1443,7 @@ impl CifsStorage {
             rx,
             &sink,
             None,
-            DEFAULT_WRITE_INFLIGHT,
+            self.config.transfer_concurrency.write(),
             CommitPolicy::Barrier {
                 every: FLUSH_BARRIER,
                 cb: on_committed,

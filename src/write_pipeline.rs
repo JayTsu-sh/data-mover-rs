@@ -223,3 +223,100 @@ pub(crate) async fn write_pipeline_core<S: ChunkSink>(
         None => Ok(total_written),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bytes::Bytes;
+    use tokio::sync::{Semaphore, mpsc};
+
+    use super::*;
+    use crate::{AssertTestValue, DataChunk};
+
+    struct ConcurrencyProbeSink {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        started: mpsc::UnboundedSender<()>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ChunkSink for ConcurrencyProbeSink {
+        async fn write_at(&self, _offset: u64, data: Bytes) -> Result<u64> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            let _ = self.started.send(());
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .map_err(|_| StorageError::OperationError("probe gate closed".to_string()))?;
+            permit.forget();
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(data.len() as u64)
+        }
+
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn assert_write_window(inflight: usize) {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let sink = Arc::new(ConcurrencyProbeSink {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            started: started_tx,
+            release: release.clone(),
+        });
+        let (tx, rx) = mpsc::channel(inflight * 2);
+        for offset in 0..(inflight * 2) {
+            tx.send(DataChunk {
+                offset: offset as u64,
+                data: Bytes::from_static(b"x"),
+            })
+            .await
+            .assert_value("queue probe chunk");
+        }
+        drop(tx);
+
+        let task_sink = sink.clone();
+        let task = tokio::spawn(async move {
+            write_pipeline_core(
+                rx,
+                task_sink.as_ref(),
+                None,
+                inflight,
+                CommitPolicy::None,
+                None,
+            )
+            .await
+        });
+
+        for _ in 0..inflight {
+            tokio::time::timeout(std::time::Duration::from_secs(2), started_rx.recv())
+                .await
+                .assert_value("write window should fill")
+                .assert_value("probe sender should remain open");
+        }
+        assert_eq!(sink.max_active.load(Ordering::SeqCst), inflight);
+        release.add_permits(inflight * 2);
+        task.await
+            .assert_value("probe task should join")
+            .assert_value("probe pipeline should succeed");
+        assert_eq!(sink.max_active.load(Ordering::SeqCst), inflight);
+    }
+
+    #[tokio::test]
+    async fn write_pipeline_enforces_serial_window() {
+        assert_write_window(1).await;
+    }
+
+    #[tokio::test]
+    async fn write_pipeline_enforces_configured_parallel_window() {
+        assert_write_window(4).await;
+    }
+}

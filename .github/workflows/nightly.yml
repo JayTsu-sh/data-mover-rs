@@ -35,11 +35,35 @@ jobs:
       - run: cargo build --examples
       - name: cargo clippy (all targets, deny warnings)
         run: python3 .claude/skills/quality-clippy/scripts/run.py
-      - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+      - name: Storage matrix E2E (protocol defaults)
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+      - name: Storage matrix E2E (serial transfer pipelines)
+        env:
+          DATA_MOVER_READ_INFLIGHT: "1"
+          DATA_MOVER_WRITE_INFLIGHT: "1"
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
+      - name: Storage matrix E2E (high transfer concurrency)
+        env:
+          DATA_MOVER_READ_INFLIGHT: "8"
+          DATA_MOVER_WRITE_INFLIGHT: "16"
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: Independent integrity check E2E
+        env:
+          DATA_MOVER_READ_INFLIGHT: "8"
+          DATA_MOVER_WRITE_INFLIGHT: "16"
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-integrity-e2e.sh "$RUN_ID"
       - name: Resumable copy E2E
+        env:
+          DATA_MOVER_READ_INFLIGHT: "8"
+          DATA_MOVER_WRITE_INFLIGHT: "16"
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-resume-e2e.sh "$RUN_ID"
+      - name: Inflight performance benchmark
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-inflight-benchmark.sh "$RUN_ID" inflight-benchmark.csv
+      - name: Upload inflight benchmark
+        uses: actions/upload-artifact@v4
+        with:
+          name: inflight-benchmark-${{ github.run_id }}
+          path: inflight-benchmark.csv
       - name: Cleanup
         if: always()
         run: tests/lab/cleanup-run.sh "$RUN_ID"
