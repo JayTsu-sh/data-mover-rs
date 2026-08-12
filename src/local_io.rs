@@ -21,7 +21,7 @@ const ENGINE_ENV: &str = "DATA_MOVER_LOCAL_IO_ENGINE";
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalDataIo {
-    adapter: BlockingLocalDataIo,
+    adapter: LocalDataIoAdapter,
     selection: Arc<EngineSelection>,
 }
 
@@ -30,7 +30,7 @@ impl LocalDataIo {
         if let Some(error) = &self.selection.error {
             return Err(StorageError::ConfigError(error.clone()));
         }
-        Ok(self.adapter.attach(file).await)
+        self.adapter.attach(file).await
     }
 
     pub(crate) async fn read_at(
@@ -76,9 +76,76 @@ impl Default for LocalDataIo {
             error = ?selection.error,
             "selected local data I/O capability"
         );
+        let adapter = LocalDataIoAdapter::from_selection(&selection);
         Self {
-            adapter: BlockingLocalDataIo,
+            adapter,
             selection: Arc::new(selection),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum LocalDataIoAdapter {
+    Blocking(BlockingLocalDataIo),
+    #[cfg(target_os = "linux")]
+    Uring(UringLocalDataIo),
+    Failed(Arc<String>),
+}
+
+impl LocalDataIoAdapter {
+    fn from_selection(selection: &EngineSelection) -> Self {
+        if let Some(error) = &selection.error {
+            return Self::Failed(Arc::new(error.clone()));
+        }
+        #[cfg(target_os = "linux")]
+        if selection.engine == SelectedEngine::Uring {
+            return match UringLocalDataIo::new() {
+                Ok(adapter) => Self::Uring(adapter),
+                Err(error) if selection.mode == LocalIoEngineMode::Auto => {
+                    tracing::debug!(%error, "io_uring worker initialization failed; using blocking I/O");
+                    Self::Blocking(BlockingLocalDataIo)
+                }
+                Err(error) => Self::Failed(Arc::new(format!(
+                    "forced io_uring worker initialization failed: {error}"
+                ))),
+            };
+        }
+        Self::Blocking(BlockingLocalDataIo)
+    }
+
+    async fn attach(&self, file: tokio::fs::File) -> Result<LocalIoFile> {
+        match self {
+            Self::Blocking(adapter) => Ok(adapter.attach(file).await),
+            #[cfg(target_os = "linux")]
+            Self::Uring(adapter) => adapter.attach(file).await,
+            Self::Failed(error) => Err(StorageError::ConfigError(error.to_string())),
+        }
+    }
+
+    async fn read_at(&self, file: &LocalIoFile, offset: u64, count: u64) -> Result<Bytes> {
+        match self {
+            Self::Blocking(adapter) => adapter.read_at(file, offset, count).await,
+            #[cfg(target_os = "linux")]
+            Self::Uring(adapter) => adapter.read_at(file, offset, count).await,
+            Self::Failed(error) => Err(StorageError::ConfigError(error.to_string())),
+        }
+    }
+
+    async fn write_at(&self, file: &LocalIoFile, offset: u64, data: Bytes) -> Result<usize> {
+        match self {
+            Self::Blocking(adapter) => adapter.write_at(file, offset, data).await,
+            #[cfg(target_os = "linux")]
+            Self::Uring(adapter) => adapter.write_at(file, offset, data).await,
+            Self::Failed(error) => Err(StorageError::ConfigError(error.to_string())),
+        }
+    }
+
+    async fn sync_all(&self, file: &LocalIoFile) -> Result<()> {
+        match self {
+            Self::Blocking(adapter) => adapter.sync_all(file).await,
+            #[cfg(target_os = "linux")]
+            Self::Uring(adapter) => adapter.sync_all(file).await,
+            Self::Failed(error) => Err(StorageError::ConfigError(error.to_string())),
         }
     }
 }
@@ -338,6 +405,277 @@ fn probe_io_uring() -> std::result::Result<(), ProbeError> {
 #[derive(Debug)]
 pub(crate) struct LocalIoFile {
     inner: Arc<std::fs::File>,
+    #[cfg(target_os = "linux")]
+    uring: Option<UringFileTokens>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct UringFileTokens {
+    read: u64,
+    write: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct UringLocalDataIo {
+    read: UringWorker,
+    write: UringWorker,
+}
+
+#[cfg(target_os = "linux")]
+impl UringLocalDataIo {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            read: UringWorker::spawn("data-mover-uring-read")?,
+            write: UringWorker::spawn("data-mover-uring-write")?,
+        })
+    }
+
+    async fn attach(&self, file: tokio::fs::File) -> Result<LocalIoFile> {
+        let standard = file.into_std().await;
+        let read_file = standard.try_clone()?;
+        let write_file = standard.try_clone()?;
+        let (read, write) =
+            tokio::try_join!(self.read.attach(read_file), self.write.attach(write_file),)?;
+        Ok(LocalIoFile {
+            inner: Arc::new(standard),
+            uring: Some(UringFileTokens { read, write }),
+        })
+    }
+
+    async fn read_at(&self, file: &LocalIoFile, offset: u64, count: u64) -> Result<Bytes> {
+        let token = file.uring.ok_or_else(missing_uring_token)?.read;
+        self.read
+            .read(token, offset, count)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn write_at(&self, file: &LocalIoFile, offset: u64, data: Bytes) -> Result<usize> {
+        let token = file.uring.ok_or_else(missing_uring_token)?.write;
+        self.write
+            .write(token, offset, data)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn sync_all(&self, file: &LocalIoFile) -> Result<()> {
+        let token = file.uring.ok_or_else(missing_uring_token)?.write;
+        self.write.sync(token).await.map_err(Into::into)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn missing_uring_token() -> StorageError {
+    StorageError::OperationError("local file is not attached to io_uring workers".to_string())
+}
+
+#[cfg(target_os = "linux")]
+enum UringCommand {
+    Attach {
+        file: std::fs::File,
+        complete: tokio::sync::oneshot::Sender<std::io::Result<u64>>,
+    },
+    Read {
+        token: u64,
+        offset: u64,
+        count: u64,
+        complete: tokio::sync::oneshot::Sender<std::io::Result<Bytes>>,
+    },
+    Write {
+        token: u64,
+        offset: u64,
+        data: Bytes,
+        complete: tokio::sync::oneshot::Sender<std::io::Result<usize>>,
+    },
+    Sync {
+        token: u64,
+        complete: tokio::sync::oneshot::Sender<std::io::Result<()>>,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct UringWorker {
+    sender: async_channel::Sender<UringCommand>,
+}
+
+#[cfg(target_os = "linux")]
+impl UringWorker {
+    const CHANNEL_CAPACITY: usize = 64;
+    const RING_ENTRIES: u32 = 64;
+
+    fn spawn(name: &str) -> std::io::Result<Self> {
+        let (sender, receiver) = async_channel::bounded(Self::CHANNEL_CAPACITY);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tokio_uring::builder()
+                        .entries(Self::RING_ENTRIES)
+                        .start(async move {
+                            let _ = started_tx.send(());
+                            run_uring_worker(receiver).await;
+                        });
+                }));
+                if result.is_err() {
+                    tracing::debug!("io_uring worker runtime failed during startup or execution");
+                }
+            })?;
+        started_rx.recv().map_err(|_| {
+            std::io::Error::other("io_uring worker failed before runtime initialization")
+        })?;
+        Ok(Self { sender })
+    }
+
+    async fn send(&self, command: UringCommand) -> std::io::Result<()> {
+        self.sender.send(command).await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "io_uring worker stopped")
+        })
+    }
+
+    async fn attach(&self, file: std::fs::File) -> std::io::Result<u64> {
+        let (complete, receive) = tokio::sync::oneshot::channel();
+        self.send(UringCommand::Attach { file, complete }).await?;
+        receive.await.map_err(worker_completion_lost)?
+    }
+
+    async fn read(&self, token: u64, offset: u64, count: u64) -> std::io::Result<Bytes> {
+        let (complete, receive) = tokio::sync::oneshot::channel();
+        self.send(UringCommand::Read {
+            token,
+            offset,
+            count,
+            complete,
+        })
+        .await?;
+        receive.await.map_err(worker_completion_lost)?
+    }
+
+    async fn write(&self, token: u64, offset: u64, data: Bytes) -> std::io::Result<usize> {
+        let (complete, receive) = tokio::sync::oneshot::channel();
+        self.send(UringCommand::Write {
+            token,
+            offset,
+            data,
+            complete,
+        })
+        .await?;
+        receive.await.map_err(worker_completion_lost)?
+    }
+
+    async fn sync(&self, token: u64) -> std::io::Result<()> {
+        let (complete, receive) = tokio::sync::oneshot::channel();
+        self.send(UringCommand::Sync { token, complete }).await?;
+        receive.await.map_err(worker_completion_lost)?
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn worker_completion_lost(_: tokio::sync::oneshot::error::RecvError) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "io_uring worker stopped before completing request",
+    )
+}
+
+#[cfg(target_os = "linux")]
+async fn run_uring_worker(receiver: async_channel::Receiver<UringCommand>) {
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    let mut files = HashMap::<u64, Rc<tokio_uring::fs::File>>::new();
+    let mut next_token = 1_u64;
+    while let Ok(command) = receiver.recv().await {
+        match command {
+            UringCommand::Attach { file, complete } => {
+                let token = next_token;
+                next_token = next_token.wrapping_add(1).max(1);
+                files.insert(token, Rc::new(tokio_uring::fs::File::from_std(file)));
+                let _ = complete.send(Ok(token));
+            }
+            UringCommand::Read {
+                token,
+                offset,
+                count,
+                complete,
+            } => {
+                if let Some(file) = files.get(&token).cloned() {
+                    tokio_uring::spawn(async move {
+                        let _ = complete.send(uring_read_fully(&file, offset, count).await);
+                    });
+                } else {
+                    let _ = complete.send(Err(unknown_file_token(token)));
+                }
+            }
+            UringCommand::Write {
+                token,
+                offset,
+                data,
+                complete,
+            } => {
+                let length = data.len();
+                if let Some(file) = files.get(&token).cloned() {
+                    tokio_uring::spawn(async move {
+                        let (result, _) = file.write_all_at(data, offset).await;
+                        let _ = complete.send(result.map(|()| length));
+                    });
+                } else {
+                    let _ = complete.send(Err(unknown_file_token(token)));
+                }
+            }
+            UringCommand::Sync { token, complete } => {
+                if let Some(file) = files.get(&token).cloned() {
+                    tokio_uring::spawn(async move {
+                        let _ = complete.send(file.sync_all().await);
+                    });
+                } else {
+                    let _ = complete.send(Err(unknown_file_token(token)));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn uring_read_fully(
+    file: &tokio_uring::fs::File,
+    offset: u64,
+    count: u64,
+) -> std::io::Result<Bytes> {
+    use tokio_uring::buf::BoundedBuf as _;
+
+    let capacity = usize::try_from(count).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "read size exceeds platform capacity",
+        )
+    })?;
+    let mut buffer = vec![0_u8; capacity];
+    let mut filled = 0_usize;
+    while filled < capacity {
+        let position = offset.checked_add(filled as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "read offset overflow")
+        })?;
+        let (result, slice) = file.read_at(buffer.slice(filled..), position).await;
+        buffer = slice.into_inner();
+        match result? {
+            0 => break,
+            count => filled += count,
+        }
+    }
+    buffer.truncate(filled);
+    Ok(Bytes::from(buffer))
+}
+
+#[cfg(target_os = "linux")]
+fn unknown_file_token(token: u64) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("unknown io_uring file token {token}"),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -347,6 +685,8 @@ impl BlockingLocalDataIo {
     async fn attach(self, file: tokio::fs::File) -> LocalIoFile {
         LocalIoFile {
             inner: Arc::new(file.into_std().await),
+            #[cfg(target_os = "linux")]
+            uring: None,
         }
     }
 
@@ -440,6 +780,7 @@ fn write_fully_at(
 mod tests {
     use std::cell::Cell;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use bytes::Bytes;
@@ -451,6 +792,28 @@ mod tests {
     };
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn blocking_io() -> LocalDataIo {
+        LocalDataIo {
+            adapter: super::LocalDataIoAdapter::Blocking(super::BlockingLocalDataIo),
+            selection: Arc::new(EngineSelection::blocking(
+                LocalIoEngineMode::Blocking,
+                "test",
+                None,
+            )),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn uring_io() -> std::io::Result<LocalDataIo> {
+        Ok(LocalDataIo {
+            adapter: super::LocalDataIoAdapter::Uring(super::UringLocalDataIo::new()?),
+            selection: Arc::new(EngineSelection::uring(
+                LocalIoEngineMode::Uring,
+                Some("test".to_string()),
+            )),
+        })
+    }
 
     struct TempDir(PathBuf);
 
@@ -527,6 +890,70 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(blake3::hash(&actual), blake3::hash(expected));
         Ok(())
+    }
+
+    async fn run_data_io_contract(
+        label: &str,
+        io: LocalDataIo,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TempDir::new(label)?;
+        let path = temp.path().join("contract.bin");
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await?;
+        let file = io.attach(file).await?;
+        assert!(io.read_at(&file, 0, 0).await?.is_empty());
+
+        let chunks = [
+            (8, Bytes::from_static(b"ijklmnop")),
+            (0, Bytes::from_static(b"abcdefgh")),
+            (16, Bytes::from_static(b"qrstuvwxyz")),
+        ];
+        let (middle, head, tail) = tokio::join!(
+            io.write_at(&file, chunks[0].0, chunks[0].1.clone()),
+            io.write_at(&file, chunks[1].0, chunks[1].1.clone()),
+            io.write_at(&file, chunks[2].0, chunks[2].1.clone()),
+        );
+        assert_eq!((middle?, head?, tail?), (8, 8, 10));
+        io.sync_all(&file).await?;
+
+        let (head, middle, eof) = tokio::join!(
+            io.read_at(&file, 0, 8),
+            io.read_at(&file, 8, 8),
+            io.read_at(&file, 24, 16),
+        );
+        assert_eq!(head?.as_ref(), b"abcdefgh");
+        assert_eq!(middle?.as_ref(), b"ijklmnop");
+        assert_eq!(eof?.as_ref(), b"yz");
+        drop(file);
+
+        let actual = std::fs::read(path)?;
+        assert_eq!(actual, b"abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(
+            blake3::hash(&actual),
+            blake3::hash(b"abcdefghijklmnopqrstuvwxyz")
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocking_adapter_satisfies_data_io_contract() -> Result<(), Box<dyn std::error::Error>>
+    {
+        run_data_io_contract("blocking-contract", blocking_io()).await
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn real_uring_adapter_satisfies_data_io_contract_when_available()
+    -> Result<(), Box<dyn std::error::Error>> {
+        if super::probe_io_uring().is_err() {
+            return Ok(());
+        }
+        run_data_io_contract("uring-contract", uring_io()?).await
     }
 
     #[test]
