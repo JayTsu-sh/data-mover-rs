@@ -19,6 +19,7 @@ pub mod error;
 pub mod filter;
 pub mod integrity_check;
 pub mod local;
+mod local_io;
 pub mod nfs;
 pub mod qos;
 pub mod s3;

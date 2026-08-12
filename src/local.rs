@@ -1,11 +1,7 @@
 // 标准库
 use std::future::Future;
 #[cfg(unix)]
-use std::os::unix::fs::FileExt as _;
-#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt, lchown};
-#[cfg(windows)]
-use std::os::windows::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,6 +21,7 @@ use tracing::{debug, error, info, trace};
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
 use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
+use crate::local_io::{LocalDataIo, LocalIoFile};
 use crate::qos::QosManager;
 use crate::storage_enum::StorageEnum;
 use crate::time_util;
@@ -109,23 +106,18 @@ impl NASEntry {
 /// 本地文件句柄包装
 #[derive(Debug)]
 pub(crate) struct LocalFileHandle {
-    // `FileExt::{read_at, write_at}` operate on `&File`, so clones of this
-    // handle can safely issue independent positional I/O concurrently.
-    inner: Arc<std::fs::File>,
+    io: LocalDataIo,
+    file: LocalIoFile,
 }
 
 impl LocalFileHandle {
-    async fn new(file: tokio::fs::File) -> Self {
-        Self {
-            inner: Arc::new(file.into_std().await),
-        }
+    async fn new(io: LocalDataIo, file: tokio::fs::File) -> Self {
+        let file = io.attach(file).await;
+        Self { io, file }
     }
 
     async fn commit(&self) -> Result<()> {
-        let file = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || file.sync_all())
-            .await?
-            .map_err(StorageError::IoError)
+        self.io.sync_all(&self.file).await
     }
 }
 
@@ -175,6 +167,7 @@ pub(crate) struct StorageConfig {
 pub struct LocalStorage {
     pub root_path: Arc<PathBuf>,
     pub(crate) config: StorageConfig,
+    local_io: LocalDataIo,
 }
 
 impl LocalStorage {
@@ -386,6 +379,7 @@ impl LocalStorage {
                 }),
                 transfer_concurrency: DEFAULT_TRANSFER_CONCURRENCY,
             },
+            local_io: LocalDataIo::default(),
         }
     }
 
@@ -405,7 +399,7 @@ impl LocalStorage {
 
     pub(crate) async fn open(&self, relative_path: &Path) -> Result<LocalFileHandle> {
         let inner = tokio::fs::File::open(self.get_full_path(relative_path)).await?;
-        Ok(LocalFileHandle::new(inner).await)
+        Ok(LocalFileHandle::new(self.local_io.clone(), inner).await)
     }
 
     /// 创建/打开目标文件。
@@ -452,7 +446,7 @@ impl LocalStorage {
         self.set_metadata(relative_path, None, None, uid, gid, mode)
             .await?;
 
-        Ok(LocalFileHandle::new(file).await)
+        Ok(LocalFileHandle::new(self.local_io.clone(), file).await)
     }
 
     ///
@@ -1021,36 +1015,13 @@ impl LocalStorage {
     }
 
     async fn read(&self, file: &LocalFileHandle, offset: u64, count: u64) -> Result<Bytes> {
-        let capacity = usize::try_from(count).map_err(|_| {
-            StorageError::OperationError(format!("read size {count} exceeds platform capacity"))
-        })?;
-        let file = Arc::clone(&file.inner);
-        let buffer = tokio::task::spawn_blocking(move || {
-            let mut buffer = vec![0_u8; capacity];
-            let mut filled = 0usize;
-            while filled < capacity {
-                let position = offset.checked_add(filled as u64).ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "read offset overflow")
-                })?;
-                #[cfg(unix)]
-                let read = file.read_at(&mut buffer[filled..], position)?;
-                #[cfg(windows)]
-                let read = file.seek_read(&mut buffer[filled..], position)?;
-                if read == 0 {
-                    break;
-                }
-                filled += read;
-            }
-            buffer.truncate(filled);
-            Ok::<_, std::io::Error>(buffer)
-        })
-        .await??;
+        let buffer = file.io.read_at(&file.file, offset, count).await?;
 
         trace!(
             "read {} bytes from file in local storage using positional I/O",
             buffer.len()
         );
-        Ok(Bytes::from(buffer))
+        Ok(buffer)
     }
 
     /// 向文件句柄写入数据
@@ -1061,32 +1032,11 @@ impl LocalStorage {
             data.len()
         );
         let length = data.len();
-        let file = Arc::clone(&file.inner);
-        tokio::task::spawn_blocking(move || {
-            let mut written = 0usize;
-            while written < data.len() {
-                let position = offset.checked_add(written as u64).ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "write offset overflow")
-                })?;
-                #[cfg(unix)]
-                let n = file.write_at(&data[written..], position)?;
-                #[cfg(windows)]
-                let n = file.seek_write(&data[written..], position)?;
-                if n == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "failed to write the complete local file chunk",
-                    ));
-                }
-                written += n;
-            }
-            Ok::<_, std::io::Error>(written)
-        })
-        .await??;
+        let written = file.io.write_at(&file.file, offset, data).await?;
 
         trace!("Wrote {} bytes at offset {}", length, offset);
 
-        Ok(length)
+        Ok(written)
     }
 
     pub(crate) async fn read_file(&self, path: &Path, size: u64) -> Result<Bytes> {
