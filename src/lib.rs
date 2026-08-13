@@ -19,7 +19,6 @@ pub mod error;
 pub mod filter;
 pub mod integrity_check;
 pub mod local;
-mod local_io;
 pub mod nfs;
 pub mod qos;
 pub mod s3;
@@ -43,7 +42,6 @@ pub use integrity_check::{
     MismatchDataField, MismatchMetaField, MtimePrecision,
 };
 pub use local::LocalStorage;
-pub use local_io::{LocalIoConfig, LocalIoConfigBuilder, LocalIoEngine};
 pub use nfs::NFSStorage;
 pub use qos::QosManager;
 pub use s3::{MultipartUpload, S3BucketInfo, S3CompletedPart, S3Storage};
