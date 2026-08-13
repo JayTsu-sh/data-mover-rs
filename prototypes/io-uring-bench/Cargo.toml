@@ -1,0 +1,10 @@
+[package]
+name = "io-uring-bench-prototype"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+blake3 = "1.8.4"
+io-uring = "0.7.14"
+libc = "0.2"
