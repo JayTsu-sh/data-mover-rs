@@ -170,8 +170,12 @@ opt-in automatic precision mode compares at the coarser apparent resolution.
 The lab has no CIFS endpoint, so CIFS remains covered by the shared stream
 contract tests until a real SMB service is added.
 
-The self-hosted runner must provide `LAB_S3_ACCESS_KEY` and
-`LAB_S3_SECRET_KEY`. Credentials must not be committed or printed.
+The self-hosted runner may provide `LAB_S3_ACCESS_KEY` and
+`LAB_S3_SECRET_KEY`. When both are absent, the lab reads the active values from
+`/etc/default/rustfs` over the existing root SSH channel, verifies that source
+and destination use the same credentials, and exports them only to the current
+test process. A partially supplied pair is rejected. Credentials must not be
+committed, printed, or written to artifacts.
 
 The lab does not currently contain a real StorageGRID system. Request-level
 tests use a capturing Smithy connector to verify that standard S3 requests

@@ -26,7 +26,35 @@ LAB_HDFS_DATANODE2_HOST="${LAB_HDFS_DATANODE2_HOST:-10.131.9.32}"
 LAB_HDFS_DATANODE1_DATA="${LAB_HDFS_DATANODE1_DATA:-10.10.1.31}"
 LAB_HDFS_DATANODE2_DATA="${LAB_HDFS_DATANODE2_DATA:-10.10.1.32}"
 
+load_s3_credentials_from_rustfs() {
+  if [[ -n "${LAB_S3_ACCESS_KEY:-}" || -n "${LAB_S3_SECRET_KEY:-}" ]]; then
+    return
+  fi
+
+  local -a source_credentials destination_credentials
+  mapfile -t source_credentials < <(
+    ssh_lab_root "$LAB_SOURCE_MGMT" \
+      ". /etc/default/rustfs; printf '%s\\n%s\\n' \"\$RUSTFS_ACCESS_KEY\" \"\$RUSTFS_SECRET_KEY\""
+  )
+  mapfile -t destination_credentials < <(
+    ssh_lab_root "$LAB_DEST_MGMT" \
+      ". /etc/default/rustfs; printf '%s\\n%s\\n' \"\$RUSTFS_ACCESS_KEY\" \"\$RUSTFS_SECRET_KEY\""
+  )
+  [[ "${#source_credentials[@]}" == 2 && "${#destination_credentials[@]}" == 2 ]] || {
+    echo "failed to load complete RustFS credentials" >&2
+    return 2
+  }
+  [[ "${source_credentials[0]}" == "${destination_credentials[0]}" &&
+    "${source_credentials[1]}" == "${destination_credentials[1]}" ]] || {
+    echo "source and destination RustFS credentials differ" >&2
+    return 2
+  }
+  export LAB_S3_ACCESS_KEY="${source_credentials[0]}"
+  export LAB_S3_SECRET_KEY="${source_credentials[1]}"
+}
+
 require_s3_credentials() {
+  load_s3_credentials_from_rustfs
   : "${LAB_S3_ACCESS_KEY:?LAB_S3_ACCESS_KEY is required}"
   : "${LAB_S3_SECRET_KEY:?LAB_S3_SECRET_KEY is required}"
 }
