@@ -24,7 +24,7 @@ jobs:
       TERRASYNC_NFS41_DEST: 10.10.1.13:/srv/nfs/v4
       TERRASYNC_S3_SOURCE: http://10.10.1.12:9000
       TERRASYNC_S3_DEST: http://10.10.1.13:9000
-      LAB_SSH_KEY: /root/.ssh/id_ed25519
+      LAB_SSH_KEY: /home/github-runner/.ssh/terrasync_lab
       LAB_HDFS_LOCATION: hdfs://hdfs%2Fterrasync-runner%40HDFS.LOCAL@10.131.9.30:9000/
       LAB_HDFS_ADMIN_USER: hdfs/terrasync-runner@HDFS.LOCAL
       LAB_HDFS_CONFIG_DIR: /var/lib/data-mover-lab/hadoop
