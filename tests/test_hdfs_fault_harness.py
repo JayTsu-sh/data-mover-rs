@@ -22,6 +22,11 @@ def test_exact_lab_topology_is_validated_before_service_mutation() -> None:
     assert 'validate_hdfs_fault_target "$target"' in COMMON
 
 
+def test_pve_topology_check_uses_runner_scoped_ssh_credentials() -> None:
+    assert 'ssh_lab_root "$LAB_HDFS_PVE_HOST"' in COMMON
+    assert 'root@"$LAB_HDFS_PVE_HOST"' not in COMMON
+
+
 def test_harness_never_mutates_virtual_machines_or_unrelated_units() -> None:
     combined = COMMON + RUNNER
     for forbidden in ("qm stop", "qm shutdown", "qm reset", "pct stop", "poweroff"):
