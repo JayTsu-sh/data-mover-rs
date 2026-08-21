@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
 
     println!("walkdir_2: path={path}, concurrency={concurrency}");
 
-    let storage = create_storage(&path, None, false).await?;
+    let storage = create_storage(&path, data_mover::CreateStorageOptions::default()).await?;
     let start = Instant::now();
 
     let mut total_pages = 0u64;

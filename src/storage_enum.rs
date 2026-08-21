@@ -19,6 +19,44 @@ const HASH_CHANNEL_CAPACITY: usize = 4;
 const COPY_PIPELINE_CAPACITY: usize = 4;
 /// TAR 打包 pipeline 的 channel 容量（多文件顺序读，适当放大缓冲）
 const TAR_PIPELINE_CAPACITY: usize = 16;
+static NEXT_HDFS_FRESH_TEMP: AtomicU64 = AtomicU64::new(1);
+
+struct MultiCopyOptions {
+    qos: Option<QosManager>,
+    enable_integrity_check: bool,
+    is_source_reserved: bool,
+    bytes_counter: Option<Arc<AtomicU64>>,
+    cancel: Option<CancellationToken>,
+    hdfs_temp_path: Option<PathBuf>,
+}
+
+fn hdfs_fresh_temp_path(final_path: &Path) -> Result<PathBuf> {
+    let file_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            StorageError::InvalidPath("HDFS fresh destination must name a UTF-8 file".to_string())
+        })?;
+    let epoch_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| StorageError::OperationError(format!("system clock error: {error}")))?
+        .as_nanos();
+    let sequence = NEXT_HDFS_FRESH_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temp_name = format!(
+        ".{file_name}.data-mover-{}-{epoch_nanos}-{sequence}.part",
+        std::process::id()
+    );
+    Ok(final_path.with_file_name(temp_name))
+}
+
+fn validate_hdfs_resume_handle(prefix_len: u64, expected_size: u64, entry_size: u64) -> Result<()> {
+    if expected_size != entry_size || prefix_len > expected_size {
+        return Err(StorageError::OperationError(format!(
+            "invalid HDFS resume handle: prefix={prefix_len}, expected={expected_size}, entry={entry_size}"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct WalkOptions {
@@ -85,6 +123,34 @@ fn resolve_copy_pipeline<R, W>(read_result: Result<R>, write_result: Result<W>) 
         (Ok(read), Ok(written)) => Ok((read, written)),
     }
 }
+
+async fn await_copy_pipeline<R, W>(
+    read_task: tokio::task::JoinHandle<Result<R>>,
+    write_task: tokio::task::JoinHandle<Result<W>>,
+    cancel: Option<&CancellationToken>,
+) -> Result<(R, W)> {
+    let read_abort = read_task.abort_handle();
+    let write_abort = write_task.abort_handle();
+    let joined = async { (read_task.await, write_task.await) };
+    tokio::pin!(joined);
+    let (read_result, write_result) = match cancel {
+        Some(token) => tokio::select! {
+            result = &mut joined => result,
+            () = token.cancelled() => {
+                read_abort.abort();
+                write_abort.abort();
+                let _ = joined.await;
+                return Err(StorageError::Cancelled);
+            }
+        },
+        None => joined.await,
+    };
+    let read_result = read_result
+        .map_err(|error| StorageError::OperationError(format!("read task panicked: {error:?}")))?;
+    let write_result = write_result
+        .map_err(|error| StorageError::OperationError(format!("write task panicked: {error:?}")))?;
+    resolve_copy_pipeline(read_result, write_result)
+}
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -94,6 +160,7 @@ use crate::checksum::{ConsistencyCheck, HashCalculator};
 use crate::cifs::{CifsStorage, create_cifs_storage};
 use crate::error::StorageError;
 use crate::filter::FilterExpression;
+use crate::hdfs::{HDFSStorage, HdfsConfig, create_hdfs_storage};
 use crate::local::{LocalStorage, create_local_storage};
 use crate::nfs::{NFSStorage, create_nfs_storage};
 use crate::qos::QosManager;
@@ -111,6 +178,7 @@ pub enum StorageType {
     Nfs,
     S3,
     Cifs,
+    Hdfs,
 }
 
 /// 统一的存储枚举类型
@@ -120,13 +188,44 @@ pub enum StorageEnum {
     NFS(NFSStorage),
     S3(S3Storage),
     CIFS(CifsStorage),
+    HDFS(HDFSStorage),
+}
+
+/// Backend-specific creation configuration.
+///
+/// Concrete variants are added only when a backend has explicit configuration
+/// that does not belong in the storage location or common creation options.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum BackendConfig {
+    #[default]
+    Default,
+    Hdfs(HdfsConfig),
+}
+
+/// Typed options used by the unified storage factory.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CreateStorageOptions {
+    pub block_size: Option<u64>,
+    pub ensure_dir: bool,
+    pub backend: BackendConfig,
+}
+
+impl CreateStorageOptions {
+    #[must_use]
+    pub const fn new(block_size: Option<u64>, ensure_dir: bool) -> Self {
+        Self {
+            block_size,
+            ensure_dir,
+            backend: BackendConfig::Default,
+        }
+    }
 }
 
 /// 字节级续传的目标端流式写句柄（issue #21：`resume_prepare` 产出，
 /// `write_chunk_stream`/`commit_chunk_stream` 消费）。跨 transport 传递
 /// （双进程场景下 Receiver 侧 prepare、由 Sender 侧对称使用同一份区间信息），
 /// 故派生 `Serialize`/`Deserialize`。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum StreamHandle {
     /// NAS（Local/NFS/CIFS）目标端：写 `.part` 临时文件；
     /// commit = `set_file_len` + `rename`。
@@ -137,9 +236,20 @@ pub enum StreamHandle {
         part_size: u64,
         dst_key: String,
     },
+    /// HDFS tail-only resume state transferable to a separate receiver process.
+    Hdfs {
+        part_path: PathBuf,
+        prefix_len: u64,
+        expected_size: u64,
+    },
 }
 
 impl StorageEnum {
+    fn hdfs_unsupported(operation: &str) -> StorageError {
+        StorageError::UnsupportedType(format!(
+            "HDFS {operation} is not implemented by the current ticket"
+        ))
+    }
     /// 验证存储连通性
     ///
     /// - Local: 检查根路径是否存在且可访问
@@ -163,6 +273,12 @@ impl StorageEnum {
             StorageEnum::NFS(_) => Ok(()),
             StorageEnum::S3(storage) => storage.check_connectivity().await,
             StorageEnum::CIFS(storage) => storage.check_connectivity().await,
+            StorageEnum::HDFS(storage) => storage
+                .client()
+                .get_file_info(storage.location().root())
+                .await
+                .map(|_| ())
+                .map_err(|error| StorageError::OperationError(error.to_string())),
         }
     }
 
@@ -206,6 +322,7 @@ impl StorageEnum {
                 let _ = s.delete_file(&tmp_path).await;
                 Ok(Some(mtime))
             }
+            StorageEnum::HDFS(_) => Err(Self::hdfs_unsupported("server-time probe")),
         }
     }
 
@@ -241,6 +358,10 @@ impl StorageEnum {
                 let key = storage.build_full_key(&path_to_s3_key(&entry.relative_path));
                 storage.delete_object(&key).await
             }
+            (StorageEnum::HDFS(storage), entry) => {
+                storage.delete_file(entry.get_relative_path()).await
+            }
+            (_, EntryEnum::HDFS(_)) => Err(Self::hdfs_unsupported("cross-backend delete")),
         }
     }
 
@@ -250,6 +371,15 @@ impl StorageEnum {
     /// Returns an error when the requested storage operation cannot be completed.
     pub async fn create_dir_all(&self, entry: &EntryEnum) -> Result<()> {
         match (self, entry) {
+            (StorageEnum::HDFS(storage), entry) => {
+                let mode = entry.get_mode().unwrap_or(0o755) & 0o7777;
+                let mode = u16::try_from(mode).map_err(|_| {
+                    StorageError::InvalidPath(format!("invalid HDFS directory mode: {mode:o}"))
+                })?;
+                storage
+                    .create_dir_all(entry.get_relative_path(), mode)
+                    .await
+            }
             // local storage will create all dirs if it does not exist
             (StorageEnum::Local(storage), EntryEnum::NAS(entry)) => {
                 storage.create_dir_all(&entry.relative_path).await
@@ -276,8 +406,11 @@ impl StorageEnum {
                     .create_dir_all(Path::new(&entry.relative_path))
                     .await
             }
-            // s3 storage will has no dir concept, so we just return Ok(())
-            _ => Ok(()),
+            // s3 storage has no directory concept.
+            (StorageEnum::S3(_), _) => Ok(()),
+            (_, EntryEnum::HDFS(_)) => Err(Self::hdfs_unsupported(
+                "HDFS entry directory creation on this backend",
+            )),
         }
     }
 
@@ -286,6 +419,9 @@ impl StorageEnum {
     ///
     /// Returns an error when the requested storage operation cannot be completed.
     pub async fn delete_dir_all(&self, entry: &EntryEnum) -> Result<()> {
+        if let StorageEnum::HDFS(storage) = self {
+            return storage.delete_dir_all(entry.get_relative_path()).await;
+        }
         let iter = self.delete_dir_all_with_progress(Some(entry.get_relative_path()), 4)?;
         while let Some(event) = iter.next().await {
             if let Some(error) = event.error {
@@ -368,6 +504,10 @@ impl StorageEnum {
             StorageEnum::NFS(storage) => storage.get_metadata(relative_path).await,
             StorageEnum::S3(storage) => storage.get_metadata(&path_to_s3_key(relative_path)).await,
             StorageEnum::CIFS(storage) => Box::pin(storage.get_metadata(relative_path)).await,
+            StorageEnum::HDFS(storage) => storage
+                .get_metadata(relative_path)
+                .await
+                .map(EntryEnum::HDFS),
         }
     }
 
@@ -388,6 +528,7 @@ impl StorageEnum {
                 s.walkdir(key.as_deref(), options)
             }
             StorageEnum::CIFS(s) => s.walkdir(sub_path, options),
+            StorageEnum::HDFS(storage) => storage.walkdir(sub_path, options),
         }
     }
 
@@ -441,6 +582,13 @@ impl StorageEnum {
                 exclude_expressions,
                 concurrency,
             ),
+            StorageEnum::HDFS(storage) => storage.walkdir_2(
+                sub_path,
+                depth,
+                match_expressions,
+                exclude_expressions,
+                concurrency,
+            ),
         }
     }
 
@@ -469,6 +617,7 @@ impl StorageEnum {
             StorageEnum::NFS(s) => s.rename(from, to).await,
             StorageEnum::S3(s) => s.rename_with_expected_size(from, to, expected_size).await,
             StorageEnum::CIFS(s) => s.rename(from, to).await,
+            StorageEnum::HDFS(s) => s.rename(from, to).await,
         }
     }
 
@@ -485,6 +634,7 @@ impl StorageEnum {
             StorageEnum::S3(_) => Err(StorageError::OperationError(
                 "S3 does not support byte-level resume".to_string(),
             )),
+            StorageEnum::HDFS(_) => Err(Self::hdfs_unsupported("set_file_len")),
         }
     }
 
@@ -517,6 +667,7 @@ impl StorageEnum {
                     .await
             }
             StorageEnum::S3(_) => Ok(()),
+            StorageEnum::HDFS(_) => Err(Self::hdfs_unsupported("set_metadata")),
         }
     }
 
@@ -593,7 +744,66 @@ impl StorageEnum {
                 )
                 .await
             }
+            (StorageEnum::HDFS(s), EntryEnum::NAS(e)) => {
+                s.set_permission(&e.relative_path, e.mode & 0o7777).await?;
+                s.set_mtime(&e.relative_path, e.mtime).await
+            }
+            (StorageEnum::HDFS(s), EntryEnum::S3(e)) => {
+                s.set_mtime(Path::new(&e.relative_path), e.mtime).await
+            }
+            (storage, EntryEnum::HDFS(entry)) => storage.set_hdfs_entry_metadata(entry).await,
             _ => Ok(()),
+        }
+    }
+
+    async fn set_hdfs_entry_metadata(&self, entry: &crate::HDFSEntry) -> Result<()> {
+        match self {
+            StorageEnum::Local(storage) => {
+                storage
+                    .set_metadata(
+                        &entry.relative_path,
+                        None,
+                        Some(entry.mtime),
+                        None,
+                        None,
+                        Some(entry.mode & 0o7777),
+                    )
+                    .await
+            }
+            StorageEnum::NFS(storage) => {
+                storage
+                    .update_metadata(
+                        &entry.relative_path,
+                        None,
+                        Some(entry.mtime),
+                        None,
+                        None,
+                        Some(entry.mode & 0o7777),
+                    )
+                    .await
+            }
+            StorageEnum::CIFS(storage) => {
+                storage
+                    .update_metadata(
+                        &entry.relative_path,
+                        None,
+                        Some(entry.mtime),
+                        None,
+                        None,
+                        Some(entry.mode & 0o7777),
+                    )
+                    .await
+            }
+            StorageEnum::HDFS(storage) => {
+                storage
+                    .set_permission(&entry.relative_path, entry.mode)
+                    .await?;
+                storage.set_mtime(&entry.relative_path, entry.mtime).await?;
+                storage
+                    .set_owner_group(&entry.relative_path, Some(&entry.owner), Some(&entry.group))
+                    .await
+            }
+            StorageEnum::S3(_) => Ok(()),
         }
     }
 
@@ -615,6 +825,7 @@ impl StorageEnum {
                 let key = relative_path.map(|p| path_to_s3_key(p));
                 s.delete_dir_all_with_progress(key.as_deref(), concurrency)
             }
+            StorageEnum::HDFS(_) => Err(Self::hdfs_unsupported("recursive delete")),
         }
     }
 
@@ -647,6 +858,7 @@ impl StorageEnum {
                     let key = path_to_s3_key(&path);
                     s.read_data(tx, &key, size, true, None).await
                 }
+                StorageEnum::HDFS(s) => s.read_data(tx, &path, size, true, None).await,
             }
         });
         // Drain channel so the producer can complete（顺带累计读回字节数）。
@@ -676,9 +888,9 @@ impl StorageEnum {
 
     /// Apply source metadata after the destination data has been committed.
     async fn apply_copied_metadata(to: &StorageEnum, entry: &EntryEnum) -> Result<()> {
-        match (to, entry) {
-            (StorageEnum::S3(_), _) => Ok(()),
-            (_, EntryEnum::NAS(_) | EntryEnum::S3(_)) => to.set_entry_metadata(entry).await,
+        match to {
+            StorageEnum::S3(_) => Ok(()),
+            _ => to.set_entry_metadata(entry).await,
         }
     }
 
@@ -710,6 +922,57 @@ impl StorageEnum {
         Ok(())
     }
 
+    async fn cleanup_hdfs_fresh_temp(to: &StorageEnum, path: &Path) {
+        let StorageEnum::HDFS(storage) = to else {
+            return;
+        };
+        if let Err(error) = storage.delete_file(path).await
+            && !matches!(error, StorageError::FileNotFound(_))
+        {
+            warn!("failed to clean up HDFS fresh temporary file {path:?}: {error}");
+        }
+    }
+
+    async fn finalize_hdfs_fresh_copy(
+        to: &StorageEnum,
+        temp_path: &Path,
+        final_path: &Path,
+        expected_size: u64,
+        source_hash: Option<&str>,
+    ) -> Result<()> {
+        let StorageEnum::HDFS(storage) = to else {
+            return Err(StorageError::OperationError(
+                "HDFS fresh finalization requires an HDFS destination".to_string(),
+            ));
+        };
+        let result = async {
+            let metadata = storage.get_metadata(temp_path).await?;
+            if metadata.is_dir || metadata.size != expected_size {
+                return Err(StorageError::OperationError(format!(
+                    "HDFS temporary length check failed: got {}, expected {expected_size}: {}",
+                    metadata.size,
+                    temp_path.display()
+                )));
+            }
+            if let Some(source_hash) = source_hash {
+                let (destination_hash, read_back) =
+                    to.compute_hash_and_len(temp_path, expected_size).await?;
+                if read_back != expected_size || destination_hash != source_hash {
+                    return Err(StorageError::OperationError(format!(
+                        "integrity check failed for HDFS temporary file: {}",
+                        temp_path.display()
+                    )));
+                }
+            }
+            storage.rename(temp_path, final_path).await
+        }
+        .await;
+        if result.is_err() {
+            Self::cleanup_hdfs_fresh_temp(to, temp_path).await;
+        }
+        result
+    }
+
     async fn copy_single_chunk(
         from: &StorageEnum,
         to: &StorageEnum,
@@ -717,9 +980,6 @@ impl StorageEnum {
         size: u64,
         options: &CopyOptions,
     ) -> Result<()> {
-        if let Some(qos) = &options.qos {
-            qos.acquire(size).await;
-        }
         if options
             .cancel
             .as_ref()
@@ -727,9 +987,31 @@ impl StorageEnum {
         {
             return Err(StorageError::Cancelled);
         }
-        let data = Self::read_file_from(from, entry, size)
-            .await
-            .map_err(|error| source_read_error(&error))?;
+        let data = if let Some(qos) = options.qos.clone() {
+            let (mut chunks, read_task) = Self::read_chunk_stream(
+                from,
+                entry,
+                None,
+                Some(qos),
+                false,
+                COPY_PIPELINE_CAPACITY,
+            );
+            let mut collected = Vec::new();
+            while let Some(chunk) = chunks.recv().await {
+                collected.extend_from_slice(&chunk.data);
+            }
+            read_task
+                .await
+                .map_err(|error| {
+                    StorageError::OperationError(format!("read task panicked: {error:?}"))
+                })?
+                .map_err(|error| source_read_error(&error))?;
+            Bytes::from(collected)
+        } else {
+            Self::read_file_from(from, entry, size)
+                .await
+                .map_err(|error| source_read_error(&error))?
+        };
         let read_len = data.len() as u64;
         if read_len != size {
             return Err(StorageError::OperationError(format!(
@@ -744,16 +1026,42 @@ impl StorageEnum {
         } else {
             None
         };
-        Self::write_file_from_bytes(to, entry, data)
-            .await
-            .map_err(|error| destination_write_error(&error))?;
-        Self::apply_copied_metadata(to, entry).await?;
+        let temp_path = matches!(to, StorageEnum::HDFS(_))
+            .then(|| hdfs_fresh_temp_path(entry.get_relative_path()))
+            .transpose()?;
+        let write_path = temp_path
+            .as_deref()
+            .unwrap_or_else(|| entry.get_relative_path());
+        if let Err(error) = Self::write_file_from_bytes_at(to, entry, data, write_path).await {
+            if let Some(path) = temp_path.as_deref() {
+                Self::cleanup_hdfs_fresh_temp(to, path).await;
+            }
+            return Err(destination_write_error(&error));
+        }
         if let Some(counter) = &options.bytes_counter {
             counter.fetch_add(size, Ordering::Relaxed);
         }
-        if let Some(source_hash) = source_hash {
+        if let Some(path) = temp_path.as_deref() {
+            if options
+                .cancel
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                Self::cleanup_hdfs_fresh_temp(to, path).await;
+                return Err(StorageError::Cancelled);
+            }
+            Self::finalize_hdfs_fresh_copy(
+                to,
+                path,
+                entry.get_relative_path(),
+                size,
+                source_hash.as_deref(),
+            )
+            .await?;
+        } else if let Some(source_hash) = source_hash {
             Self::verify_dest_integrity(to, entry, size, &source_hash).await?;
         }
+        Self::apply_copied_metadata(to, entry).await?;
         if !options.is_source_reserved {
             from.delete_file(entry).await?;
         }
@@ -778,6 +1086,15 @@ impl StorageEnum {
         entry: &EntryEnum,
         options: CopyOptions,
     ) -> Result<()> {
+        Box::pin(Self::copy_file_inner(from, to, entry, options)).await
+    }
+
+    async fn copy_file_inner(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        options: CopyOptions,
+    ) -> Result<()> {
         let single_options = options.clone();
         let CopyOptions {
             qos,
@@ -795,6 +1112,9 @@ impl StorageEnum {
         }
 
         let size = entry.get_size();
+        let hdfs_temp_path = matches!(to, StorageEnum::HDFS(_))
+            .then(|| hdfs_fresh_temp_path(entry.get_relative_path()))
+            .transpose()?;
 
         // ── S3 → S3（无 QoS 时走原生路径；有 QoS 时 fall-through 到下方单块/多块逻辑）
         if let (StorageEnum::S3(src), StorageEnum::S3(dst), EntryEnum::S3(e)) = (from, to, entry)
@@ -826,86 +1146,160 @@ impl StorageEnum {
             return Self::copy_single_chunk(from, to, entry, size, &single_options).await;
         }
 
-        // ── Multi-chunk pipeline with QoS + integrity ─────────────────────────────
-        // read_data in Local/NFS already handles per-chunk QoS and hash computation.
-        let (tx, rx) = mpsc::channel::<DataChunk>(COPY_PIPELINE_CAPACITY);
+        Self::copy_multi_chunk(
+            from,
+            to,
+            entry,
+            size,
+            MultiCopyOptions {
+                qos,
+                enable_integrity_check,
+                is_source_reserved,
+                bytes_counter,
+                cancel,
+                hdfs_temp_path,
+            },
+        )
+        .await
+    }
 
-        let from_c = from.clone();
-        let to_c = to.clone();
-        let entry_r = entry.clone();
-        let entry_w = entry.clone();
-
-        let read_task = tokio::spawn(async move {
-            Self::read_data_from(&from_c, &entry_r, tx, size, enable_integrity_check, qos).await
-        });
-
-        let bytes_counter_w = bytes_counter.clone();
-        let write_task = tokio::spawn(async move {
-            Self::write_copy_data(&to_c, &entry_w, rx, size, bytes_counter_w).await
-        });
-
-        let read_abort = read_task.abort_handle();
-        let write_abort = write_task.abort_handle();
-
-        // Race the joined IO against the cancel token (if any). On cancel we abort
-        // the spawned tasks; their JoinHandles will then resolve with a Cancelled
-        // JoinError, which we discard in favour of returning StorageError::Cancelled.
-        let join_io = async {
-            let r = read_task.await;
-            let w = write_task.await;
-            (r, w)
-        };
-
-        let (read_res, write_res) = match cancel.as_ref() {
-            Some(token) => {
-                tokio::select! {
-                    pair = join_io => pair,
-                    () = token.cancelled() => {
-                        read_abort.abort();
-                        write_abort.abort();
-                        return Err(StorageError::Cancelled);
-                    }
-                }
-            }
-            None => join_io.await,
-        };
-
-        let read_res = read_res
-            .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))?;
-        let write_res = write_res
-            .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))?;
-        let (source_hasher, bytes_written) = resolve_copy_pipeline(read_res, write_res)?;
-
-        // 写端本地计数断言（issue #58，无条件）：实际写入字节数必须等于 entry
-        // 声明的 size——源截断时读端提前 EOF、写端静默少写的防线。纯本地比较，
-        // 零额外存储 RPC；不等则清理目标端残留坏文件后报错。
+    async fn copy_multi_chunk(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        size: u64,
+        options: MultiCopyOptions,
+    ) -> Result<()> {
+        let (source_hasher, bytes_written) =
+            Self::run_copy_pipeline(from, to, entry, size, &options).await?;
         if bytes_written != size {
-            Self::cleanup_mismatched_dest(to, entry).await;
+            if let Some(path) = options.hdfs_temp_path.as_deref() {
+                Self::cleanup_hdfs_fresh_temp(to, path).await;
+            } else {
+                Self::cleanup_mismatched_dest(to, entry).await;
+            }
             return Err(StorageError::OperationError(format!(
                 "size check failed: wrote {bytes_written} bytes, expected {size}: {}",
                 entry.get_relative_path().display()
             )));
         }
-
-        Self::apply_copied_metadata(to, entry).await?;
-
-        // Final cancel check before integrity verification (which itself does IO).
-        if let Some(ref token) = cancel
-            && token.is_cancelled()
+        if options
+            .cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
         {
+            if let Some(path) = options.hdfs_temp_path.as_deref() {
+                Self::cleanup_hdfs_fresh_temp(to, path).await;
+            }
             return Err(StorageError::Cancelled);
         }
-
-        if enable_integrity_check && let Some(src_h) = source_hasher {
-            let src_hash = src_h.finalize();
+        let source_hash = options
+            .enable_integrity_check
+            .then(|| source_hasher.map(ConsistencyCheck::finalize))
+            .flatten();
+        if let Some(path) = options.hdfs_temp_path.as_deref() {
+            Self::finalize_hdfs_fresh_copy(
+                to,
+                path,
+                entry.get_relative_path(),
+                size,
+                source_hash.as_deref(),
+            )
+            .await?;
+        } else if let Some(src_hash) = source_hash {
             Self::verify_dest_integrity(to, entry, size, &src_hash).await?;
         }
-
-        if !is_source_reserved {
+        Self::apply_copied_metadata(to, entry).await?;
+        if !options.is_source_reserved {
             from.delete_file(entry).await?;
         }
-
         Ok(())
+    }
+
+    async fn run_copy_pipeline(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        size: u64,
+        options: &MultiCopyOptions,
+    ) -> Result<(Option<HashCalculator>, u64)> {
+        let (tx, rx) = mpsc::channel::<DataChunk>(COPY_PIPELINE_CAPACITY);
+        let from_c = from.clone();
+        let to_c = to.clone();
+        let entry_r = entry.clone();
+        let entry_w = entry.clone();
+        let write_path = options
+            .hdfs_temp_path
+            .as_deref()
+            .unwrap_or_else(|| entry.get_relative_path())
+            .to_path_buf();
+        let qos = options.qos.clone();
+        let enable_integrity_check = options.enable_integrity_check;
+        let bytes_counter = options.bytes_counter.clone();
+        let read_task = tokio::spawn(async move {
+            Box::pin(Self::read_data_from(
+                &from_c,
+                &entry_r,
+                tx,
+                size,
+                enable_integrity_check,
+                qos,
+            ))
+            .await
+        });
+        let write_task = tokio::spawn(async move {
+            Self::write_copy_data(&to_c, &entry_w, &write_path, rx, size, bytes_counter).await
+        });
+        let read_abort = read_task.abort_handle();
+        let write_abort = write_task.abort_handle();
+        let join_io = async { (read_task.await, write_task.await) };
+        tokio::pin!(join_io);
+        let (read_res, write_res) = match options.cancel.as_ref() {
+            Some(token) => tokio::select! {
+                pair = &mut join_io => pair,
+                () = token.cancelled() => {
+                    read_abort.abort();
+                    write_abort.abort();
+                    let _ = join_io.await;
+                    if let Some(path) = options.hdfs_temp_path.as_deref() {
+                        Self::cleanup_hdfs_fresh_temp(to, path).await;
+                    }
+                    return Err(StorageError::Cancelled);
+                }
+            },
+            None => join_io.await,
+        };
+        let read_res = match read_res {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(path) = options.hdfs_temp_path.as_deref() {
+                    Self::cleanup_hdfs_fresh_temp(to, path).await;
+                }
+                return Err(StorageError::OperationError(format!(
+                    "read task panicked: {error:?}"
+                )));
+            }
+        };
+        let write_res = match write_res {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(path) = options.hdfs_temp_path.as_deref() {
+                    Self::cleanup_hdfs_fresh_temp(to, path).await;
+                }
+                return Err(StorageError::OperationError(format!(
+                    "write task panicked: {error:?}"
+                )));
+            }
+        };
+        match resolve_copy_pipeline(read_res, write_res) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                if let Some(path) = options.hdfs_temp_path.as_deref() {
+                    Self::cleanup_hdfs_fresh_temp(to, path).await;
+                }
+                Err(error)
+            }
+        }
     }
 
     // ========================================================
@@ -943,14 +1337,34 @@ impl StorageEnum {
     ) -> Result<(Vec<(u64, u64)>, StreamHandle)> {
         let size = entry.get_size();
 
+        if let StorageEnum::HDFS(storage) = dest {
+            let prefix_len = storage.prepare_tail_resume(part_path, size, resume).await?;
+            let missing = (prefix_len < size).then_some((prefix_len, size));
+            return Ok((
+                missing.into_iter().collect(),
+                StreamHandle::Hdfs {
+                    part_path: part_path.to_path_buf(),
+                    prefix_len,
+                    expected_size: size,
+                },
+            ));
+        }
+
         if let StorageEnum::S3(to_s3) = dest {
             let (dst_rel, tags) = match entry {
                 EntryEnum::S3(e) => (e.relative_path.clone(), e.tags.clone()),
                 EntryEnum::NAS(e) => (path_to_s3_key(&e.relative_path).into_owned(), None),
+                EntryEnum::HDFS(e) => (path_to_s3_key(&e.relative_path).into_owned(), None),
             };
             let part_size = to_s3.resume_part_size(size);
             let (upload_id, missing) = to_s3
-                .prepare_resumable_upload(&dst_rel, size, part_size, tags.as_ref())
+                .prepare_resumable_upload(
+                    &dst_rel,
+                    size,
+                    part_size,
+                    tags.as_ref(),
+                    Some(entry.get_mtime()),
+                )
                 .await?;
             return Ok((
                 missing,
@@ -1031,6 +1445,7 @@ impl StorageEnum {
                 let (uid, gid, mode) = match entry {
                     EntryEnum::NAS(entry) => (entry.uid, entry.gid, Some(entry.mode)),
                     EntryEnum::S3(_) => (None, None, None),
+                    EntryEnum::HDFS(entry) => (None, None, Some(entry.mode & 0o7777)),
                 };
                 let progress = WriteProgress {
                     bytes_counter,
@@ -1056,7 +1471,31 @@ impl StorageEnum {
                         "write_chunk_stream: Nas StreamHandle used with an S3 destination"
                             .to_string(),
                     )),
+                    StorageEnum::HDFS(_) => Err(Self::hdfs_unsupported("resumable write")),
                 }
+            }
+            StreamHandle::Hdfs {
+                part_path,
+                prefix_len,
+                expected_size,
+            } => {
+                let StorageEnum::HDFS(storage) = dest else {
+                    return Err(StorageError::OperationError(
+                        "write_chunk_stream: HDFS handle requires an HDFS destination".to_string(),
+                    ));
+                };
+                validate_hdfs_resume_handle(*prefix_len, *expected_size, entry.get_size())?;
+                storage
+                    .append_stream_with_progress(
+                        rx,
+                        part_path,
+                        *prefix_len,
+                        crate::hdfs::AppendCompletion::PartialUpTo(*expected_size),
+                        bytes_counter.as_ref(),
+                        Some(&on_committed),
+                    )
+                    .await
+                    .map(|_| ())
             }
         }
     }
@@ -1099,6 +1538,10 @@ impl StorageEnum {
                         .read_data_intervals(tx, &e.relative_path, &ivals, qos)
                         .await
                         .map(|()| None),
+                    (StorageEnum::HDFS(s), EntryEnum::HDFS(e)) => s
+                        .read_data_intervals(tx, &e.relative_path, &ivals, qos)
+                        .await
+                        .map(|()| None),
                     _ => Err(StorageError::OperationError(format!(
                         "read_chunk_stream: unsupported source/entry combination: {entry_c:?}"
                     ))),
@@ -1119,6 +1562,10 @@ impl StorageEnum {
                             .await
                     }
                     (StorageEnum::S3(s), EntryEnum::S3(e)) => {
+                        s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
+                            .await
+                    }
+                    (StorageEnum::HDFS(s), EntryEnum::HDFS(e)) => {
                         s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
                             .await
                     }
@@ -1168,6 +1615,26 @@ impl StorageEnum {
                     .finalize_resumable_upload(&dst_key, size, part_size, &upload_id)
                     .await
             }
+            StreamHandle::Hdfs {
+                part_path,
+                prefix_len,
+                expected_size,
+            } => {
+                let StorageEnum::HDFS(storage) = dest else {
+                    return Err(StorageError::OperationError(
+                        "commit_chunk_stream: HDFS handle requires an HDFS destination".to_string(),
+                    ));
+                };
+                validate_hdfs_resume_handle(prefix_len, expected_size, entry.get_size())?;
+                if size != expected_size {
+                    return Err(StorageError::OperationError(format!(
+                        "HDFS resume commit size {size} does not match handle size {expected_size}"
+                    )));
+                }
+                storage
+                    .commit_tail_resume(&part_path, entry.get_relative_path(), expected_size)
+                    .await
+            }
         }?;
 
         Self::apply_copied_metadata(dest, entry).await
@@ -1196,6 +1663,32 @@ impl StorageEnum {
         options: CopyOptions,
         resume: ResumeContext,
     ) -> Result<()> {
+        Box::pin(Self::copy_file_resumable_inner(
+            from, to, entry, options, resume,
+        ))
+        .await
+    }
+
+    async fn copy_file_resumable_inner(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        options: CopyOptions,
+        resume: ResumeContext,
+    ) -> Result<()> {
+        if options
+            .cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(StorageError::Cancelled);
+        }
+        if matches!(to, StorageEnum::HDFS(_)) {
+            return Box::pin(Self::copy_file_resumable_to_hdfs(
+                from, to, entry, options, resume,
+            ))
+            .await;
+        }
         if matches!(to, StorageEnum::S3(_)) {
             return Box::pin(Self::copy_file_resumable_to_s3(
                 from,
@@ -1212,7 +1705,7 @@ impl StorageEnum {
             enable_integrity_check,
             is_source_reserved,
             bytes_counter,
-            cancel: _,
+            cancel,
         } = options;
 
         let size = entry.get_size();
@@ -1246,13 +1739,11 @@ impl StorageEnum {
                 .await
         });
 
-        let read_res = read_handle
-            .await
-            .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))?;
-        let write_res = write_handle
-            .await
-            .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))?;
-        resolve_copy_pipeline(read_res, write_res)?;
+        await_copy_pipeline(read_handle, write_handle, cancel.as_ref()).await?;
+
+        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Err(StorageError::Cancelled);
+        }
 
         // ── hash 比对（早于 commit：NAS `.part` 可独立读取，校验失败时最终路径
         //    不会被 rename 污染，见 T5）──
@@ -1266,6 +1757,10 @@ impl StorageEnum {
             }
         }
 
+        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Err(StorageError::Cancelled);
+        }
+
         // ── 提交：规整长度 + 原子 rename ──
         Self::commit_chunk_stream(to, entry, size, handle).await?;
 
@@ -1273,6 +1768,104 @@ impl StorageEnum {
             from.delete_file(entry).await?;
         }
 
+        Ok(())
+    }
+
+    async fn copy_file_resumable_to_hdfs(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        options: CopyOptions,
+        resume: ResumeContext,
+    ) -> Result<()> {
+        if options
+            .cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(StorageError::Cancelled);
+        }
+        let size = entry.get_size();
+        let ResumeContext {
+            part_relative_path,
+            missing_intervals,
+            on_committed,
+        } = resume;
+        let (actual_missing, handle) =
+            Self::resume_prepare(to, entry, &part_relative_path, true).await?;
+        if missing_intervals != actual_missing {
+            return Err(StorageError::OperationError(format!(
+                "HDFS resume intervals do not match persistent tail: requested={missing_intervals:?}, actual={actual_missing:?}"
+            )));
+        }
+        let CopyOptions {
+            qos,
+            enable_integrity_check,
+            is_source_reserved,
+            bytes_counter,
+            cancel,
+        } = options;
+        let (rx, read_task) = Self::read_chunk_stream(
+            from,
+            entry,
+            Some(actual_missing),
+            qos,
+            false,
+            COPY_PIPELINE_CAPACITY,
+        );
+        let to_c = to.clone();
+        let entry_w = entry.clone();
+        let handle_w = handle.clone();
+        let write_task = tokio::spawn(async move {
+            Self::write_chunk_stream(&to_c, &entry_w, rx, &handle_w, bytes_counter, on_committed)
+                .await
+        });
+        let read_abort = read_task.abort_handle();
+        let write_abort = write_task.abort_handle();
+        let joined = async { (read_task.await, write_task.await) };
+        tokio::pin!(joined);
+        let (read_result, write_result) = match cancel.as_ref() {
+            Some(token) => tokio::select! {
+                result = &mut joined => result,
+                () = token.cancelled() => {
+                    read_abort.abort();
+                    write_abort.abort();
+                    let _ = joined.await;
+                    return Err(StorageError::Cancelled);
+                }
+            },
+            None => joined.await,
+        };
+        let read_result = read_result.map_err(|error| {
+            StorageError::OperationError(format!("read task panicked: {error:?}"))
+        })?;
+        let write_result = write_result.map_err(|error| {
+            StorageError::OperationError(format!("write task panicked: {error:?}"))
+        })?;
+        resolve_copy_pipeline(read_result, write_result)?;
+        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Err(StorageError::Cancelled);
+        }
+        if enable_integrity_check {
+            let source_hash = from.compute_hash(entry.get_relative_path(), size).await?;
+            let destination_hash = to.compute_hash(&part_relative_path, size).await?;
+            if source_hash != destination_hash {
+                if let StorageEnum::HDFS(storage) = to {
+                    let _ = storage.delete_file(&part_relative_path).await;
+                }
+                return Err(StorageError::OperationError(
+                    "integrity check failed: source and HDFS temporary hashes differ".to_string(),
+                ));
+            }
+        }
+        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Err(StorageError::Cancelled);
+        }
+        Self::commit_chunk_stream(to, entry, size, handle).await?;
+        Self::apply_copied_metadata(to, entry).await?;
+        if !is_source_reserved {
+            from.delete_file(entry).await?;
+        }
         Ok(())
     }
 
@@ -1300,12 +1893,19 @@ impl StorageEnum {
         options: CopyOptions,
         on_committed: crate::CommitCallback,
     ) -> Result<()> {
+        if options
+            .cancel
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(StorageError::Cancelled);
+        }
         let CopyOptions {
             qos,
             enable_integrity_check,
             is_source_reserved,
             bytes_counter,
-            cancel: _,
+            cancel,
         } = options;
         if !matches!(to, StorageEnum::S3(_)) {
             return Err(StorageError::OperationError(
@@ -1356,13 +1956,11 @@ impl StorageEnum {
                 .await
         });
 
-        let read_res = read_handle
-            .await
-            .map_err(|e| StorageError::OperationError(format!("read task panicked: {e:?}")))?;
-        let write_res = write_handle
-            .await
-            .map_err(|e| StorageError::OperationError(format!("write task panicked: {e:?}")))?;
-        resolve_copy_pipeline(read_res, write_res)?;
+        await_copy_pipeline(read_handle, write_handle, cancel.as_ref()).await?;
+
+        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Err(StorageError::Cancelled);
+        }
 
         // 本地字节计数断言（issue #58，前移到 CompleteMultipartUpload 之前）：
         // 本次会话确认上传的字节数必须恰好补齐全部缺失区间，不等则不提交——
@@ -1375,6 +1973,10 @@ impl StorageEnum {
                 "size check failed before multipart completion: session uploaded {uploaded} bytes, missing intervals require {expected_session_bytes}: {}",
                 entry.get_relative_path().display()
             )));
+        }
+
+        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Err(StorageError::Cancelled);
         }
 
         // ── 提交：校验 parts 全覆盖 → CompleteMultipartUpload ──
@@ -1390,6 +1992,10 @@ impl StorageEnum {
                     "integrity check failed: source and destination hashes differ".to_string(),
                 ));
             }
+        }
+
+        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Err(StorageError::Cancelled);
         }
 
         if !is_source_reserved {
@@ -1449,8 +2055,6 @@ impl StorageEnum {
 
         // ── Producer: iterate entries, send headers + data + padding ──
         let mut offset = 0u64;
-        let block_size = from.block_size();
-
         for entry in entries {
             let header_bytes = Self::build_tar_header(from, entry, &base_path).await;
             if tx
@@ -1471,53 +2075,35 @@ impl StorageEnum {
             if entry.get_is_regular_file() {
                 let file_size = entry.get_size();
                 if file_size > 0 {
-                    if file_size <= block_size {
-                        // 小文件：单块读取
-                        if let Some(ref qos_mgr) = qos {
-                            qos_mgr.acquire(file_size).await;
-                        }
-                        let data = Self::read_file_from(from, entry, file_size).await?;
-                        if tx.send(DataChunk { offset, data }).await.is_err() {
+                    let (sub_tx, mut sub_rx) = mpsc::channel(HASH_CHANNEL_CAPACITY);
+                    let read_task = Self::spawn_tar_read(
+                        from.clone(),
+                        entry.clone(),
+                        sub_tx,
+                        file_size,
+                        qos.clone(),
+                    );
+
+                    while let Some(chunk) = sub_rx.recv().await {
+                        let chunk_len = chunk.data.len() as u64;
+                        if tx
+                            .send(DataChunk {
+                                offset,
+                                data: chunk.data,
+                            })
+                            .await
+                            .is_err()
+                        {
                             return Err(StorageError::OperationError(
-                                "tar write channel closed during file data send".to_string(),
+                                "tar write channel closed during file transfer".to_string(),
                             ));
                         }
-                        offset += file_size;
-                    } else {
-                        // 大文件：read_data channel 分块转发
-                        let (sub_tx, mut sub_rx) =
-                            mpsc::channel::<DataChunk>(HASH_CHANNEL_CAPACITY);
-                        let from_c = from.clone();
-                        let entry_c = entry.clone();
-                        let qos_c = qos.clone();
-
-                        let read_task = tokio::spawn(async move {
-                            Self::read_tar_data(&from_c, &entry_c, sub_tx, file_size, qos_c).await
-                        });
-
-                        while let Some(chunk) = sub_rx.recv().await {
-                            let chunk_len = chunk.data.len() as u64;
-                            if tx
-                                .send(DataChunk {
-                                    offset,
-                                    data: chunk.data,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                return Err(StorageError::OperationError(
-                                    "tar write channel closed during large file transfer"
-                                        .to_string(),
-                                ));
-                            }
-                            offset += chunk_len;
-                        }
-
-                        // 等待读取任务完成并检查错误
-                        read_task.await.map_err(|e| {
-                            StorageError::OperationError(format!("read task panicked: {e:?}"))
-                        })??;
+                        offset += chunk_len;
                     }
+
+                    read_task.await.map_err(|e| {
+                        StorageError::OperationError(format!("read task panicked: {e:?}"))
+                    })??;
 
                     // 发送 padding
                     if let Some(padding) = tar_padding(file_size) {
@@ -1617,6 +2203,7 @@ impl StorageEnum {
                 s3.write_data(rx, &tar_key, tar_size, tar_mtime, None, bytes_counter)
                     .await
             }
+            StorageEnum::HDFS(_) => Err(Self::hdfs_unsupported("tar write")),
         }
     }
 
@@ -1631,6 +2218,7 @@ impl StorageEnum {
             (StorageEnum::NFS(s), EntryEnum::NAS(e)) => s.read_file(&e.relative_path, size).await,
             (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => s.read_file(&e.relative_path, size).await,
             (StorageEnum::S3(s), EntryEnum::S3(e)) => s.read_file(&e.relative_path, size).await,
+            (StorageEnum::HDFS(s), EntryEnum::HDFS(e)) => s.read_file(&e.relative_path, size).await,
             _ => Err(StorageError::OperationError(format!(
                 "unsupported source/entry combination for tar read: {entry:?}"
             ))),
@@ -1648,6 +2236,15 @@ impl StorageEnum {
         to: &StorageEnum,
         entry: &EntryEnum,
         data: Bytes,
+    ) -> Result<()> {
+        Self::write_file_from_bytes_at(to, entry, data, entry.get_relative_path()).await
+    }
+
+    async fn write_file_from_bytes_at(
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        data: Bytes,
+        destination_path: &Path,
     ) -> Result<()> {
         match (to, entry) {
             (StorageEnum::Local(s), EntryEnum::NAS(e)) => {
@@ -1678,8 +2275,38 @@ impl StorageEnum {
                 s.write_file(Path::new(&e.relative_path), data, None, None, None)
                     .await
             }
+            (StorageEnum::Local(s), EntryEnum::HDFS(e)) => {
+                s.write_file(&e.relative_path, data, None, None, Some(e.mode & 0o7777))
+                    .await
+            }
+            (StorageEnum::NFS(s), EntryEnum::HDFS(e)) => {
+                s.write_file(&e.relative_path, data, None, None, Some(e.mode & 0o7777))
+                    .await
+            }
+            (StorageEnum::CIFS(s), EntryEnum::HDFS(e)) => {
+                s.write_file(&e.relative_path, data, None, None, Some(e.mode & 0o7777))
+                    .await
+            }
             (StorageEnum::S3(s), EntryEnum::NAS(e)) => {
                 s.write_file(&path_to_s3_key(&e.relative_path), data, e.mtime, None)
+                    .await
+            }
+            (StorageEnum::S3(s), EntryEnum::HDFS(e)) => {
+                s.write_file(&path_to_s3_key(&e.relative_path), data, e.mtime, None)
+                    .await
+            }
+            (StorageEnum::HDFS(storage), entry) => {
+                let replication = match entry {
+                    EntryEnum::HDFS(entry) => entry.replication,
+                    EntryEnum::NAS(_) | EntryEnum::S3(_) => None,
+                };
+                storage
+                    .write_file(
+                        destination_path,
+                        data,
+                        entry.get_mode().unwrap_or(0o644),
+                        replication,
+                    )
                     .await
             }
         }
@@ -1688,6 +2315,7 @@ impl StorageEnum {
     async fn write_copy_data(
         to: &StorageEnum,
         entry: &EntryEnum,
+        destination_path: &Path,
         rx: mpsc::Receiver<DataChunk>,
         size: u64,
         bytes_counter: Option<Arc<AtomicU64>>,
@@ -1769,16 +2397,53 @@ impl StorageEnum {
                 Self::write_s3_copy_data(storage, entry, rx, size, bytes_counter).await
             }
             (StorageEnum::S3(storage), EntryEnum::NAS(entry)) => {
+                Self::write_s3_nas_copy_data(storage, entry, rx, size, bytes_counter).await
+            }
+            (StorageEnum::S3(storage), EntryEnum::HDFS(entry)) => {
+                Self::write_s3_hdfs_copy_data(storage, entry, rx, size, bytes_counter).await
+            }
+            (StorageEnum::HDFS(storage), entry) => {
+                Box::pin(Self::write_hdfs_copy_data(
+                    storage,
+                    entry,
+                    destination_path,
+                    rx,
+                    size,
+                    bytes_counter,
+                ))
+                .await
+            }
+            (storage, EntryEnum::HDFS(entry)) => {
+                Self::write_hdfs_copy_to_nas(storage, entry, rx, bytes_counter).await
+            }
+        }
+    }
+
+    async fn write_hdfs_copy_to_nas(
+        storage: &StorageEnum,
+        entry: &crate::HDFSEntry,
+        rx: mpsc::Receiver<DataChunk>,
+        bytes_counter: Option<Arc<AtomicU64>>,
+    ) -> Result<u64> {
+        let mode = Some(entry.mode & 0o7777);
+        match storage {
+            StorageEnum::Local(storage) => {
                 storage
-                    .write_data(
-                        rx,
-                        &path_to_s3_key(&entry.relative_path),
-                        size,
-                        entry.mtime,
-                        None,
-                        bytes_counter,
-                    )
+                    .write_data(rx, &entry.relative_path, None, None, mode, bytes_counter)
                     .await
+            }
+            StorageEnum::NFS(storage) => {
+                storage
+                    .write_data(rx, &entry.relative_path, None, None, mode, bytes_counter)
+                    .await
+            }
+            StorageEnum::CIFS(storage) => {
+                storage
+                    .write_data(rx, &entry.relative_path, None, None, mode, bytes_counter)
+                    .await
+            }
+            StorageEnum::S3(_) | StorageEnum::HDFS(_) => {
+                Err(Self::hdfs_unsupported("cross-backend streaming write"))
             }
         }
     }
@@ -1797,6 +2462,68 @@ impl StorageEnum {
                 size,
                 entry.mtime,
                 entry.tags.clone(),
+                bytes_counter,
+            )
+            .await
+    }
+
+    async fn write_s3_hdfs_copy_data(
+        storage: &crate::s3::S3Storage,
+        entry: &crate::HDFSEntry,
+        rx: mpsc::Receiver<DataChunk>,
+        size: u64,
+        bytes_counter: Option<Arc<AtomicU64>>,
+    ) -> Result<u64> {
+        storage
+            .write_data(
+                rx,
+                &path_to_s3_key(&entry.relative_path),
+                size,
+                entry.mtime,
+                None,
+                bytes_counter,
+            )
+            .await
+    }
+
+    async fn write_s3_nas_copy_data(
+        storage: &crate::s3::S3Storage,
+        entry: &crate::NASEntry,
+        rx: mpsc::Receiver<DataChunk>,
+        size: u64,
+        bytes_counter: Option<Arc<AtomicU64>>,
+    ) -> Result<u64> {
+        storage
+            .write_data(
+                rx,
+                &path_to_s3_key(&entry.relative_path),
+                size,
+                entry.mtime,
+                None,
+                bytes_counter,
+            )
+            .await
+    }
+
+    async fn write_hdfs_copy_data(
+        storage: &crate::hdfs::HDFSStorage,
+        entry: &EntryEnum,
+        destination_path: &Path,
+        rx: mpsc::Receiver<DataChunk>,
+        size: u64,
+        bytes_counter: Option<Arc<AtomicU64>>,
+    ) -> Result<u64> {
+        let replication = match entry {
+            EntryEnum::HDFS(entry) => entry.replication,
+            EntryEnum::NAS(_) | EntryEnum::S3(_) => None,
+        };
+        storage
+            .write_data(
+                rx,
+                destination_path,
+                size,
+                entry.get_mode().unwrap_or(0o644),
+                replication,
                 bytes_counter,
             )
             .await
@@ -1828,6 +2555,10 @@ impl StorageEnum {
                 s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
                     .await
             }
+            (StorageEnum::HDFS(s), EntryEnum::HDFS(e)) => {
+                s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
+                    .await
+            }
             _ => Err(StorageError::OperationError(format!(
                 "unsupported source/entry combination for tar read_data: {entry:?}"
             ))),
@@ -1841,7 +2572,19 @@ impl StorageEnum {
         size: u64,
         qos: Option<QosManager>,
     ) -> Result<Option<HashCalculator>> {
-        Self::read_data_from(from, entry, tx, size, false, qos).await
+        Box::pin(Self::read_data_from(from, entry, tx, size, false, qos)).await
+    }
+
+    fn spawn_tar_read(
+        from: StorageEnum,
+        entry: Arc<EntryEnum>,
+        tx: mpsc::Sender<DataChunk>,
+        size: u64,
+        qos: Option<QosManager>,
+    ) -> tokio::task::JoinHandle<Result<Option<HashCalculator>>> {
+        tokio::spawn(
+            async move { Box::pin(Self::read_tar_data(&from, &entry, tx, size, qos)).await },
+        )
     }
 
     #[must_use]
@@ -1851,6 +2594,7 @@ impl StorageEnum {
             StorageEnum::NFS(s) => s.config.block_size,
             StorageEnum::CIFS(s) => s.config.block_size,
             StorageEnum::S3(s) => s.block_size,
+            StorageEnum::HDFS(s) => s.block_size(),
         }
     }
 
@@ -1862,6 +2606,7 @@ impl StorageEnum {
             Self::NFS(storage) => storage.config.transfer_concurrency,
             Self::CIFS(storage) => storage.config.transfer_concurrency,
             Self::S3(storage) => storage.transfer_concurrency,
+            Self::HDFS(storage) => storage.transfer_concurrency(),
         }
     }
 
@@ -1873,6 +2618,7 @@ impl StorageEnum {
             Self::NFS(storage) => Self::NFS(storage.with_transfer_concurrency(concurrency)),
             Self::CIFS(storage) => Self::CIFS(storage.with_transfer_concurrency(concurrency)),
             Self::S3(storage) => Self::S3(storage.with_transfer_concurrency(concurrency)),
+            Self::HDFS(storage) => Self::HDFS(storage.with_transfer_concurrency(concurrency)),
         }
     }
 
@@ -2266,6 +3012,7 @@ pub(crate) fn path_to_s3_key(path: &Path) -> Cow<'_, str> {
 #[must_use]
 pub fn detect_storage_type(path: &str) -> StorageType {
     match path {
+        p if p.starts_with("hdfs://") => StorageType::Hdfs,
         p if p.starts_with("smb://") => StorageType::Cifs,
         p if p.starts_with("nfs://") => StorageType::Nfs,
         p if p.starts_with("s3://")
@@ -2292,12 +3039,27 @@ pub fn detect_storage_type(path: &str) -> StorageType {
 /// # Errors
 ///
 /// Returns an error when the requested storage operation cannot be completed.
-pub async fn create_storage(
-    path: &str,
-    block_size: Option<u64>,
-    ensure_dir: bool,
-) -> Result<StorageEnum> {
+pub async fn create_storage(path: &str, options: CreateStorageOptions) -> Result<StorageEnum> {
+    let CreateStorageOptions {
+        block_size,
+        ensure_dir,
+        backend,
+    } = options;
     let storage_type = detect_storage_type(path);
+    let hdfs_config = match (&storage_type, backend) {
+        (StorageType::Hdfs, BackendConfig::Hdfs(config)) => Some(config),
+        (StorageType::Hdfs, BackendConfig::Default) => {
+            return Err(StorageError::ConfigError(
+                "HDFS location requires BackendConfig::Hdfs".to_string(),
+            ));
+        }
+        (_, BackendConfig::Hdfs(_)) => {
+            return Err(StorageError::ConfigError(
+                "BackendConfig::Hdfs requires an hdfs:// location".to_string(),
+            ));
+        }
+        (_, BackendConfig::Default) => None,
+    };
     debug!(
         "Creating {:?} storage for path: {} (ensure_dir={})",
         storage_type, path, ensure_dir
@@ -2306,6 +3068,17 @@ pub async fn create_storage(
         StorageType::Cifs => create_cifs_storage(path, block_size, ensure_dir).await,
         StorageType::Nfs => create_nfs_storage(path, block_size, ensure_dir).await,
         StorageType::S3 => create_s3_storage(path, block_size).await,
+        StorageType::Hdfs => Ok(StorageEnum::HDFS(
+            create_hdfs_storage(
+                path,
+                hdfs_config
+                    .as_ref()
+                    .ok_or_else(|| StorageError::ConfigError("missing HDFS config".to_string()))?,
+                block_size,
+                ensure_dir,
+            )
+            .await?,
+        )),
         StorageType::Local => create_local_storage(path, block_size, ensure_dir),
     }
 }
@@ -2322,6 +3095,86 @@ mod tests {
         tokio::fs::create_dir_all(dir)
             .await
             .assert_value("test value should be present");
+    }
+
+    #[test]
+    fn hdfs_fresh_temp_paths_are_unique_siblings_and_preserve_unicode() {
+        let final_path = Path::new("目录/嵌套/文件.bin");
+        let first = hdfs_fresh_temp_path(final_path).assert_value("temporary path");
+        let second = hdfs_fresh_temp_path(final_path).assert_value("temporary path");
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), final_path.parent());
+        let name = first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .assert_value("UTF-8 temporary name");
+        assert!(name.starts_with(".文件.bin.data-mover-"));
+        assert!(
+            Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("part"))
+        );
+        assert!(hdfs_fresh_temp_path(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn hdfs_resume_handle_round_trips_across_process_serialization() {
+        let handle = StreamHandle::Hdfs {
+            part_path: PathBuf::from("目录/文件.bin.part"),
+            prefix_len: 123,
+            expected_size: 456,
+        };
+        let encoded = serde_json::to_vec(&handle).assert_value("serialize HDFS handle");
+        let decoded: StreamHandle =
+            serde_json::from_slice(&encoded).assert_value("deserialize HDFS handle");
+        assert_eq!(decoded, handle);
+    }
+
+    #[test]
+    fn hdfs_resume_handle_rejects_impossible_prefix_or_entry_size() {
+        assert!(validate_hdfs_resume_handle(4, 16, 16).is_ok());
+        assert!(validate_hdfs_resume_handle(17, 16, 16).is_err());
+        assert!(validate_hdfs_resume_handle(4, 16, 15).is_err());
+    }
+
+    #[tokio::test]
+    async fn hdfs_resume_handle_rejects_non_hdfs_destination() {
+        let directory = "/tmp/dm-hdfs-handle-mismatch";
+        reset_dir(directory).await;
+        tokio::fs::write(format!("{directory}/file.bin"), b"data")
+            .await
+            .assert_value("write shape file");
+        let storage = create_storage(directory, CreateStorageOptions::default())
+            .await
+            .assert_value("create local storage");
+        let entry = storage
+            .get_metadata(Path::new("file.bin"))
+            .await
+            .assert_value("read shape metadata");
+        let (sender, receiver) = mpsc::channel(1);
+        drop(sender);
+        let handle = StreamHandle::Hdfs {
+            part_path: PathBuf::from("file.bin.part"),
+            prefix_len: 0,
+            expected_size: 4,
+        };
+        assert!(
+            StorageEnum::write_chunk_stream(
+                &storage,
+                &entry,
+                receiver,
+                &handle,
+                None,
+                Arc::new(|_, _| {})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            StorageEnum::commit_chunk_stream(&storage, &entry, 4, handle)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2344,10 +3197,10 @@ mod tests {
         filetime::set_file_mtime(&src_path, expected_mtime)
             .assert_value("test value should be present");
 
-        let source = create_storage(src_dir, None, false)
+        let source = create_storage(src_dir, CreateStorageOptions::default())
             .await
             .assert_value("test value should be present");
-        let destination = create_storage(dst_dir, None, true)
+        let destination = create_storage(dst_dir, CreateStorageOptions::new(None, true))
             .await
             .assert_value("test value should be present");
         let entry = Box::pin(source.get_metadata(Path::new("fixture.bin")))
@@ -2389,7 +3242,7 @@ mod tests {
             .await
             .assert_value("test value should be present");
 
-        let destination = create_storage(dst_dir, None, true)
+        let destination = create_storage(dst_dir, CreateStorageOptions::new(None, true))
             .await
             .assert_value("test value should be present");
         let expected_mtime = 1_700_000_000_123_000_000_i64;
@@ -2431,7 +3284,7 @@ mod tests {
             .await
             .assert_value("test value should be present");
 
-        let storage = create_storage(dir, None, false)
+        let storage = create_storage(dir, CreateStorageOptions::default())
             .await
             .assert_value("test value should be present");
         let entry = Box::pin(storage.get_metadata(Path::new("blob.bin")))
@@ -2466,7 +3319,7 @@ mod tests {
             .await
             .assert_value("test value should be present");
 
-        let storage = create_storage(dir, None, false)
+        let storage = create_storage(dir, CreateStorageOptions::default())
             .await
             .assert_value("test value should be present");
         let entry = Box::pin(storage.get_metadata(Path::new("blob.bin")))
@@ -2498,7 +3351,7 @@ mod tests {
             .await
             .assert_value("test value should be present");
 
-        let storage = create_storage(dir, None, false)
+        let storage = create_storage(dir, CreateStorageOptions::default())
             .await
             .assert_value("test value should be present");
         let entry = Box::pin(storage.get_metadata(Path::new("blob.bin")))

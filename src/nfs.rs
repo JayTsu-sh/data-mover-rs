@@ -3036,10 +3036,14 @@ impl NFSStorage {
         qos: Option<&QosManager>,
     ) {
         while inflight.len() < self.config.transfer_concurrency.read() && *issue_offset < size {
-            if let Some(qos) = qos {
-                qos.acquire(chunk_size).await;
-            }
-            let length = chunk_size.min(size - *issue_offset);
+            let requested = chunk_size.min(size - *issue_offset);
+            let length = if let Some(qos) = qos {
+                let granted = qos.acquire_bandwidth_grant(requested).await;
+                qos.acquire_iops().await;
+                granted
+            } else {
+                requested
+            };
             let count = u32::try_from(length)
                 .unwrap_or_else(|_| unreachable!("NFS read size is capped below u32::MAX"));
             let offset = *issue_offset;
@@ -3221,10 +3225,14 @@ impl NFSStorage {
                     while inflight.len() < self.config.transfer_concurrency.read()
                         && issue_offset < end
                     {
-                        if let Some(ref qos) = qos {
-                            qos.acquire(chunk_size).await;
-                        }
-                        let want_u64 = std::cmp::min(chunk_size, end - issue_offset);
+                        let requested = std::cmp::min(chunk_size, end - issue_offset);
+                        let want_u64 = if let Some(ref qos) = qos {
+                            let granted = qos.acquire_bandwidth_grant(requested).await;
+                            qos.acquire_iops().await;
+                            granted
+                        } else {
+                            requested
+                        };
                         let want = u32::try_from(want_u64).unwrap_or_else(|_| {
                             unreachable!("NFS read size is capped below u32::MAX")
                         });

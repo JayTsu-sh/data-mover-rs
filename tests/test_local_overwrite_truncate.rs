@@ -57,12 +57,18 @@ async fn overwrite_shorter_file_truncates_stale_tail_multi_chunk() {
 
     write_pattern(&format!("{src_dir}/blob.bin"), BIG, 0).await;
 
-    let src = data_mover::create_storage(src_dir, Some(BLOCK), false)
-        .await
-        .assert_value("test value should be present");
-    let dst = data_mover::create_storage(dst_dir, Some(BLOCK), true)
-        .await
-        .assert_value("test value should be present");
+    let src = data_mover::create_storage(
+        src_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
+    )
+    .await
+    .assert_value("test value should be present");
+    let dst = data_mover::create_storage(
+        dst_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+    )
+    .await
+    .assert_value("test value should be present");
     let entry = src
         .get_metadata(Path::new("blob.bin"))
         .await
@@ -129,12 +135,18 @@ async fn overwrite_shorter_file_truncates_stale_tail_single_chunk() {
 
     write_pattern(&format!("{src_dir}/blob.bin"), BIG, 0).await;
 
-    let src = data_mover::create_storage(src_dir, Some(BLOCK), false)
-        .await
-        .assert_value("test value should be present");
-    let dst = data_mover::create_storage(dst_dir, Some(BLOCK), true)
-        .await
-        .assert_value("test value should be present");
+    let src = data_mover::create_storage(
+        src_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
+    )
+    .await
+    .assert_value("test value should be present");
+    let dst = data_mover::create_storage(
+        dst_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+    )
+    .await
+    .assert_value("test value should be present");
     let entry = src
         .get_metadata(Path::new("blob.bin"))
         .await

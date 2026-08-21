@@ -25,9 +25,11 @@ parser.add_argument(
     choices=[
         "ensure-bucket",
         "put",
+        "put-file",
         "sha256",
         "size",
         "exists",
+        "metadata",
         "delete-prefix",
         "abort-multipart-prefix",
     ],
@@ -37,6 +39,8 @@ parser.add_argument("--bucket", required=True)
 parser.add_argument("--key")
 parser.add_argument("--prefix")
 parser.add_argument("--value")
+parser.add_argument("--file")
+parser.add_argument("--metadata-key")
 args = parser.parse_args()
 s3 = client(args.endpoint)
 
@@ -47,6 +51,8 @@ if args.command == "ensure-bucket":
         s3.create_bucket(Bucket=args.bucket)
 elif args.command == "put":
     s3.put_object(Bucket=args.bucket, Key=args.key, Body=args.value.encode())
+elif args.command == "put-file":
+    s3.upload_file(args.file, args.bucket, args.key)
 elif args.command == "sha256":
     body = s3.get_object(Bucket=args.bucket, Key=args.key)["Body"].read()
     print(hashlib.sha256(body).hexdigest())
@@ -59,6 +65,13 @@ elif args.command == "exists":
         if error.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
             raise SystemExit(1)
         raise
+elif args.command == "metadata":
+    value = s3.head_object(Bucket=args.bucket, Key=args.key)["Metadata"].get(
+        args.metadata_key
+    )
+    if value is None:
+        raise SystemExit(1)
+    print(value)
 elif args.command == "delete-prefix":
     token = None
     while True:

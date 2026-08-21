@@ -63,15 +63,19 @@ async fn local_copy_beyond_write_queue_reopens_with_identical_size_and_digest() 
 
     let source_url = source_dir.to_string_lossy();
     let destination_url = destination_dir.to_string_lossy();
-    let source = create_storage(&source_url, Some(BLOCK), false)
-        .await
-        .assert_value("create source storage")
-        .with_transfer_concurrency(
-            TransferConcurrency::new(4, 8).assert_value("source concurrency"),
-        );
-    let destination = create_storage(&destination_url, Some(BLOCK), true)
-        .await
-        .assert_value("create destination storage");
+    let source = create_storage(
+        &source_url,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
+    )
+    .await
+    .assert_value("create source storage")
+    .with_transfer_concurrency(TransferConcurrency::new(4, 8).assert_value("source concurrency"));
+    let destination = create_storage(
+        &destination_url,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+    )
+    .await
+    .assert_value("create destination storage");
     let entry = source
         .get_metadata(Path::new("blob.bin"))
         .await
@@ -145,16 +149,19 @@ async fn local_destination_accepts_cross_protocol_chunk_shapes_out_of_order() {
         .assert_value("write entry-shape fixture");
     let shape_url = shape_dir.to_string_lossy();
     let destination_url = destination_dir.to_string_lossy();
-    let shape_storage = create_storage(&shape_url, None, false)
+    let shape_storage = create_storage(&shape_url, data_mover::CreateStorageOptions::default())
         .await
         .assert_value("create shape storage");
     let entry = shape_storage
         .get_metadata(Path::new("blob.bin"))
         .await
         .assert_value("read shape metadata");
-    let destination = create_storage(&destination_url, None, true)
-        .await
-        .assert_value("create destination storage");
+    let destination = create_storage(
+        &destination_url,
+        data_mover::CreateStorageOptions::new(None, true),
+    )
+    .await
+    .assert_value("create destination storage");
     let part_path = Path::new("blob.bin.terrasync-part");
     let (_missing, handle) = StorageEnum::resume_prepare(&destination, &entry, part_path, false)
         .await

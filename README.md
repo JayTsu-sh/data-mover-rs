@@ -63,6 +63,51 @@ Local reads normally reach it around 4; raising them to 16 is generally not a
 good CPU/memory tradeoff. CIFS keeps its conservative 4/4 default because the
 shared lab does not yet provide a real SMB endpoint for performance tuning.
 
+### QoS semantics
+
+`QosManager` limits source-side migration traffic. Payload bytes are charged
+once when they are read from the source; destination writes do not charge the
+same bytes again. Consequently, copying 1 GiB consumes 1 GiB of bandwidth
+quota rather than 2 GiB.
+
+```rust,ignore
+// Sustained 8 MiB/s, hard peak 16 MiB/s.
+let qos = QosManager::try_new(Some("8MiB/s"), 2.0, Some(500))?;
+
+// Sustained and hard peak 8 MiB/s, with a 1 MiB token bucket / source IO cap.
+let strict = QosManager::try_new_with_burst("8MiB/s", 1024 * 1024, Some(500))?;
+```
+
+`peak_rate` is a hard peak multiplier over the configured sustained bandwidth.
+Peak traffic is paced in 10 ms quanta, so a full initial token bucket cannot
+make a small file pass instantaneously. `burst_bytes` must be greater than zero.
+When a non-streaming source request is larger than the burst or peak quantum,
+the source adapter splits it before issuing the storage read.
+
+Bandwidth permits and IOPS permits represent different resources. Bandwidth is
+charged for payload slices; IOPS is charged once for each real source protocol
+request. All clones of one `QosManager` share the same schedules and counters.
+
+| Source backend | Bandwidth pacing | IOPS accounting |
+|----------------|------------------|-----------------|
+| Local | Split positional reads at the QoS grant | One per actual read syscall |
+| NFS | Split reads below the negotiated `rsize` when required | One per NFS READ |
+| SMB/CIFS | Split reads below the negotiated server maximum when required | One per SMB READ |
+| HDFS | Pace reads from the open HDFS file stream | One per client read |
+| S3 | Keep block-sized Range GETs and pace/slice each response `ByteStream` | One per GET/Range GET, not per in-memory slice |
+
+For S3, a small burst therefore does not create thousands of small Range GETs.
+The SDK response body is consumed incrementally; stopping body polling applies
+backpressure while zero-copy `Bytes` slices are forwarded to the copy pipeline.
+HTTP/TCP and SDK buffers may already contain a limited amount of in-flight data,
+so the hard guarantee applies at the application stream/pipeline seam. It does
+not claim that every microsecond observed at the network interface is below the
+configured rate.
+
+Very small non-zero bursts are honored, but Local/NFS/SMB/HDFS may perform many
+small reads and therefore achieve less throughput when an IOPS limit is also
+enabled. For S3, bandwidth slicing does not increase request IOPS.
+
 ### StorageGRID compatibility
 
 Some StorageGRID versions reject the AWS SDK's informational `x-id` query

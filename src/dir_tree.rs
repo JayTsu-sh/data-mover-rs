@@ -60,6 +60,7 @@ pub enum BackendKind {
     Nfs,
     S3,
     Cifs,
+    Hdfs,
 }
 
 /// 后端特定的目录句柄，Reader Worker 用它来"打开"一个目录
@@ -73,6 +74,8 @@ pub enum DirHandle {
     S3Prefix(String),
     /// CIFS/SMB: 相对路径（相对于 root）
     Cifs(String),
+    /// HDFS: path relative to the configured root.
+    Hdfs(PathBuf),
 }
 
 impl DirHandle {
@@ -83,6 +86,7 @@ impl DirHandle {
             DirHandle::Nfs { .. } => BackendKind::Nfs,
             DirHandle::S3Prefix(_) => BackendKind::S3,
             DirHandle::Cifs(_) => BackendKind::Cifs,
+            DirHandle::Hdfs(_) => BackendKind::Hdfs,
         }
     }
 }
@@ -113,6 +117,7 @@ pub fn extract_dir_handle(entry: &EntryEnum, root_path: &Path, backend: BackendK
             _ => DirHandle::Local(root_path.join(&nas.relative_path)),
         },
         EntryEnum::S3(s3) => DirHandle::S3Prefix(s3.relative_path.clone()),
+        EntryEnum::HDFS(hdfs) => DirHandle::Hdfs(hdfs.relative_path.clone()),
     }
 }
 

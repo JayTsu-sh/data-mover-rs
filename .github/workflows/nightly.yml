@@ -24,6 +24,23 @@ jobs:
       TERRASYNC_NFS41_DEST: 10.10.1.13:/srv/nfs/v4
       TERRASYNC_S3_SOURCE: http://10.10.1.12:9000
       TERRASYNC_S3_DEST: http://10.10.1.13:9000
+      LAB_SSH_KEY: /home/github-runner/.ssh/terrasync_lab
+      LAB_HDFS_LOCATION: hdfs://hdfs%2Fterrasync-runner%40HDFS.LOCAL@10.131.9.30:9000/
+      LAB_HDFS_ADMIN_USER: hdfs/terrasync-runner@HDFS.LOCAL
+      LAB_HDFS_CONFIG_DIR: /var/lib/data-mover-lab/hadoop
+      LAB_HDFS_KEYTAB: /var/lib/data-mover-lab/terrasync-runner.keytab
+      LAB_HDFS_HA_LOCATION: hdfs://hdfs%2Fterrasync-runner%40HDFS.LOCAL@hdfs-ha/tmp/data-mover-nightly/nightly-${{ github.run_id }}-${{ github.run_attempt }}/hdfs/ha
+      LAB_HDFS_HA_CONFIG_DIR: /var/lib/data-mover-lab/hadoop
+      LAB_HDFS_HA_NAMENODE1_ID: nn1
+      LAB_HDFS_HA_NAMENODE1_HOST: 10.131.9.30
+      LAB_HDFS_HA_NAMENODE1_VMID: "301"
+      LAB_HDFS_HA_NAMENODE1_NAME: hdfs-namenode
+      LAB_HDFS_HA_NAMENODE1_SERVICE: hadoop-namenode.service
+      LAB_HDFS_HA_NAMENODE2_ID: nn2
+      LAB_HDFS_HA_NAMENODE2_HOST: 10.131.9.33
+      LAB_HDFS_HA_NAMENODE2_VMID: "304"
+      LAB_HDFS_HA_NAMENODE2_NAME: hdfs-namenode2
+      LAB_HDFS_HA_NAMENODE2_SERVICE: hadoop-namenode.service
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -35,6 +52,8 @@ jobs:
       - run: cargo build --examples
       - name: cargo clippy (all targets, deny warnings)
         run: python3 .claude/skills/quality-clippy/scripts/run.py
+      - name: Rolling hdfs-native contract and real HDFS lab
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock python3 tests/hdfs_upstream_contract.py --nightly --run-id "$RUN_ID"
       - name: Storage matrix E2E (protocol defaults)
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: Storage matrix E2E (serial transfer pipelines)
@@ -57,6 +76,14 @@ jobs:
           DATA_MOVER_READ_INFLIGHT: "8"
           DATA_MOVER_WRITE_INFLIGHT: "16"
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-resume-e2e.sh "$RUN_ID"
+      - name: Real-backend source QoS E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-qos-e2e.sh "$RUN_ID" qos-e2e.csv
+      - name: Upload QoS measurements
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: qos-e2e-${{ github.run_id }}
+          path: qos-e2e.csv
       - name: Inflight performance benchmark
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-inflight-benchmark.sh "$RUN_ID" inflight-benchmark.csv
       - name: Upload inflight benchmark
@@ -64,6 +91,24 @@ jobs:
         with:
           name: inflight-benchmark-${{ github.run_id }}
           path: inflight-benchmark.csv
+      - name: HDFS multi-GiB bounded-memory gate
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-memory-e2e.sh "$RUN_ID" hdfs-memory.csv
+      - name: HDFS service fault recovery
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-fault-e2e.sh "$RUN_ID" hdfs-fault.log
+      - name: Conditional HDFS HA acceptance
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-ha-e2e.sh "$RUN_ID"
+      - name: Upload HDFS fault diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: hdfs-fault-${{ github.run_id }}
+          path: hdfs-fault.log
+      - name: Upload HDFS memory measurements
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: hdfs-memory-${{ github.run_id }}
+          path: hdfs-memory.csv
       - name: Cleanup
         if: always()
         run: tests/lab/cleanup-run.sh "$RUN_ID"

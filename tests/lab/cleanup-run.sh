@@ -4,6 +4,9 @@ source "$(dirname "$0")/common.sh"
 
 run_id="${1:?run id required}"
 validate_run_id "$run_id"
+prepare_hdfs_kerberos "$run_id"
+export LAB_HDFS_RUN_ROOT
+LAB_HDFS_RUN_ROOT="$(hdfs_run_root "$run_id")"
 
 for host in "$LAB_SOURCE_MGMT" "$LAB_DEST_MGMT" "$LAB_WORKER_MGMT"; do
   ssh_lab "$host" "rm -rf -- '/var/lib/terrasync-ci/$run_id'"
@@ -21,6 +24,9 @@ if [[ -n "${LAB_S3_ACCESS_KEY:-}" && -n "${LAB_S3_SECRET_KEY:-}" ]]; then
 fi
 
 rm -rf -- "/tmp/data-mover-lab/$run_id"
+
+cargo test --test hdfs_native_contract nightly_lab_cleanup_confined_run_root -- \
+  --ignored --exact --test-threads=1
 
 for host in "$LAB_SOURCE_MGMT" "$LAB_DEST_MGMT"; do
   ssh_lab_root "$host" \

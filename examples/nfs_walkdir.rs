@@ -30,7 +30,7 @@ struct Stats {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let storage = create_storage(&args.url, None, false).await?;
+    let storage = create_storage(&args.url, data_mover::CreateStorageOptions::default()).await?;
 
     let start = Instant::now();
 
@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
                         stats.files += 1;
                     }
                 }
-                EntryEnum::S3(_) => {}
+                EntryEnum::S3(_) | EntryEnum::HDFS(_) => {}
             },
             StorageEntryMessage::Error { path, reason, .. } => {
                 println!("Error for {}: {}", path.display(), reason);

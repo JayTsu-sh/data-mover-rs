@@ -1,6 +1,48 @@
+use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::integrity_check::{MismatchDataField, MismatchMetaField};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HdfsErrorKind {
+    AlreadyExists,
+    BlocksMissing,
+    DataTransfer,
+    Directory,
+    ErasureCoding,
+    Io,
+    Rpc,
+    Authentication,
+    Unsupported,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HdfsOperationError {
+    pub operation: &'static str,
+    pub relative_path: Option<PathBuf>,
+    pub kind: HdfsErrorKind,
+    pub hadoop_class: Option<String>,
+    pub diagnostic: &'static str,
+    pub retryable: bool,
+}
+
+impl std::fmt::Display for HdfsOperationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "HDFS {} failed ({:?})",
+            self.operation, self.kind
+        )?;
+        if let Some(path) = &self.relative_path {
+            write!(formatter, " at {}", path.display())?;
+        }
+        if let Some(class) = &self.hadoop_class {
+            write!(formatter, " [{class}]")?;
+        }
+        write!(formatter, ": {}", self.diagnostic)
+    }
+}
 
 mod clone;
 
@@ -8,6 +50,8 @@ mod clone;
 /// 使用thiserror库实现错误处理和转换
 #[derive(Error, Debug)]
 pub enum StorageError {
+    #[error("{0}")]
+    HdfsOperation(HdfsOperationError),
     /// IO操作错误
     /// 文件读写、目录操作等IO失败时触发
     #[error("IO error: {0}")]

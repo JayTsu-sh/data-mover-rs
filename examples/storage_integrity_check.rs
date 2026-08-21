@@ -54,8 +54,12 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let source = create_storage(&args.source, None, false).await?;
-    let destination = create_storage(&args.destination, None, false).await?;
+    let source = create_storage(&args.source, data_mover::CreateStorageOptions::default()).await?;
+    let destination = create_storage(
+        &args.destination,
+        data_mover::CreateStorageOptions::default(),
+    )
+    .await?;
     let precision = if args.mtime_auto_precision {
         MtimePrecision::Auto
     } else {

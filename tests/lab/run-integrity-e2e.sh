@@ -4,6 +4,7 @@ source "$(dirname "$0")/common.sh"
 
 run_id="${1:?run id required}"
 validate_run_id "$run_id"
+prepare_hdfs_kerberos "$run_id"
 require_s3_credentials
 
 local_root="/tmp/data-mover-lab/$run_id"

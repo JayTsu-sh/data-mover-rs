@@ -49,12 +49,18 @@ async fn full_copy_no_tail_loss_under_repetition() {
             .assert_value("test value should be present");
         write_pattern(&format!("{src_dir}/blob.bin"), SIZE).await;
 
-        let src = create_storage(src_dir, Some(BLOCK), false)
-            .await
-            .assert_value("test value should be present");
-        let dst = create_storage(dst_dir, Some(BLOCK), true)
-            .await
-            .assert_value("test value should be present");
+        let src = create_storage(
+            src_dir,
+            data_mover::CreateStorageOptions::new(Some(BLOCK), false),
+        )
+        .await
+        .assert_value("test value should be present");
+        let dst = create_storage(
+            dst_dir,
+            data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+        )
+        .await
+        .assert_value("test value should be present");
         let entry = src
             .get_metadata(Path::new("blob.bin"))
             .await

@@ -6,7 +6,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let storage = create_storage("c:\\jay\\source", None, false).await?;
+    let storage = create_storage(
+        "c:\\jay\\source",
+        data_mover::CreateStorageOptions::default(),
+    )
+    .await?;
 
     let start = Instant::now();
     let mut total_entries = 0;
@@ -47,7 +51,7 @@ async fn main() -> Result<()> {
                         last_update = Instant::now();
                     }
                 }
-                EntryEnum::S3(_) => {}
+                EntryEnum::S3(_) | EntryEnum::HDFS(_) => {}
             },
             StorageEntryMessage::Error { path, reason, .. } => {
                 println!("Error for {}: {}", path.display(), reason);

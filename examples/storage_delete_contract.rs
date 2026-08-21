@@ -19,7 +19,8 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let storage = create_storage(&args.storage, None, false).await?;
+    let storage =
+        create_storage(&args.storage, data_mover::CreateStorageOptions::default()).await?;
     let entry = storage.get_metadata(Path::new(&args.path)).await?;
 
     storage.delete_file(&entry).await?;
