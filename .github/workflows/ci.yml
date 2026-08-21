@@ -73,7 +73,7 @@ jobs:
         run: python3 tests/hdfs_upstream_contract.py
 
       - name: HDFS directed matrix contract
-        run: tests/lab/run-e2e.sh nightly-contract-${{ github.run_id }} --contract-only
+        run: python3 tests/test_hdfs_directed_matrix.py
 
       - name: HDFS memory budget contract
         run: python3 tests/test_hdfs_memory_budget.py

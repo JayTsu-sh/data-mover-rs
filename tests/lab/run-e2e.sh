@@ -4,7 +4,6 @@ source "$(dirname "$0")/common.sh"
 
 run_id="${1:?run id required}"
 validate_run_id "$run_id"
-prepare_hdfs_kerberos "$run_id"
 export LAB_HDFS_RUN_ROOT
 LAB_HDFS_RUN_ROOT="$(hdfs_run_root "$run_id")"
 
@@ -64,6 +63,7 @@ if [[ "${2:-}" == "--contract-only" ]]; then
   exit 0
 fi
 
+prepare_hdfs_kerberos "$run_id"
 require_s3_credentials
 mkdir -p "$local_root/source" "$local_root/destination" "$local_root/seed"
 
