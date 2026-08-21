@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
             "usage: s3_walkdir <s3://AK:SK@bucket.host:port/prefix>".to_string(),
         )
     })?;
-    let storage = create_storage(&url, None, false).await?;
+    let storage = create_storage(&url, data_mover::CreateStorageOptions::default()).await?;
 
     let start = Instant::now();
     let mut total_entries = 0;
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
                         last_update = Instant::now();
                     }
                 }
-                EntryEnum::NAS(_) => {}
+                EntryEnum::NAS(_) | EntryEnum::HDFS(_) => {}
             },
             StorageEntryMessage::Error { path, reason, .. } => {
                 println!("Error for {}: {}", path.display(), reason);

@@ -5,11 +5,14 @@ source "$(dirname "$0")/common.sh"
 run_id="${1:?run id required}"
 output="${2:-inflight-benchmark.csv}"
 validate_run_id "$run_id"
+prepare_hdfs_kerberos "$run_id"
 require_s3_credentials
 
 local_root="/tmp/data-mover-lab/$run_id"
 fixture="$local_root/seed/inflight-benchmark.bin"
-binary="target/release/examples/storage_copy"
+target_directory="$(cargo metadata --locked --no-deps --format-version 1 | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+binary="$target_directory/release/examples/storage_copy"
 size=$((128 * 1024 * 1024 + 137))
 mkdir -p "$local_root/source" "$local_root/destination" "$local_root/seed"
 [[ -x "$binary" ]] || cargo build --release --locked --example storage_copy

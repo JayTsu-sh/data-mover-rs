@@ -4,10 +4,11 @@ source "$(dirname "$0")/common.sh"
 
 run_id="${1:?run id required}"
 validate_run_id "$run_id"
-require_s3_credentials
+prepare_hdfs_kerberos "$run_id"
+export LAB_HDFS_RUN_ROOT
+LAB_HDFS_RUN_ROOT="$(hdfs_run_root "$run_id")"
 
 local_root="/tmp/data-mover-lab/$run_id"
-mkdir -p "$local_root/source" "$local_root/destination" "$local_root/seed"
 
 storage_url() {
   local role="$1"
@@ -35,8 +36,36 @@ storage_url() {
       printf 's3://%s:%s@%s.%s:9000/ci/%s/%s' \
         "$LAB_S3_ACCESS_KEY" "$LAB_S3_SECRET_KEY" "$LAB_S3_BUCKET" "$host" "$run_id" "$role"
       ;;
+    hdfs) printf '%s/matrix/%s' "$LAB_HDFS_RUN_ROOT" "$role" ;;
   esac
 }
+
+inspect_storage() {
+  cargo run --quiet --locked --example storage_inspect -- \
+    --storage "$1" --path "$2"
+}
+
+backends=(local nfs3 nfs41 s3 hdfs)
+pair_count=0
+hdfs_pair_count=0
+for contract_source in "${backends[@]}"; do
+  for contract_destination in "${backends[@]}"; do
+    ((pair_count += 1))
+    if [[ "$contract_source" == "hdfs" || "$contract_destination" == "hdfs" ]]; then
+      ((hdfs_pair_count += 1))
+    fi
+  done
+done
+[[ "$pair_count" == "25" && "$hdfs_pair_count" == "9" ]]
+[[ "$(storage_url source hdfs)" == "$LAB_HDFS_RUN_ROOT/matrix/source" ]]
+[[ "$(storage_url destination hdfs)" == "$LAB_HDFS_RUN_ROOT/matrix/destination" ]]
+if [[ "${2:-}" == "--contract-only" ]]; then
+  echo "5x5 matrix contract verified: 25 directed pairs, 9 involving HDFS"
+  exit 0
+fi
+
+require_s3_credentials
+mkdir -p "$local_root/source" "$local_root/destination" "$local_root/seed"
 
 storagegrid_url() {
   local role="$1"
@@ -101,6 +130,9 @@ destination_hash() {
         --endpoint "$LAB_DEST_DATA" --bucket "$LAB_S3_BUCKET" \
         --key "ci/$run_id/destination/$key"
       ;;
+    hdfs)
+      inspect_storage "$(storage_url destination hdfs)" "$key" | cut -f2
+      ;;
   esac
 }
 
@@ -122,10 +154,12 @@ destination_size() {
         --endpoint "$LAB_DEST_DATA" --bucket "$LAB_S3_BUCKET" \
         --key "ci/$run_id/destination/$key"
       ;;
+    hdfs)
+      inspect_storage "$(storage_url destination hdfs)" "$key" | cut -f1
+      ;;
   esac
 }
 
-backends=(local nfs3 nfs41 s3)
 for source_backend in "${backends[@]}"; do
   for destination_backend in "${backends[@]}"; do
     key="${source_backend}-to-${destination_backend}.txt"
@@ -138,16 +172,65 @@ for source_backend in "${backends[@]}"; do
       --destination "$(storage_url destination "$destination_backend")" \
       --path "$key"
 
+    if [[ "$destination_backend" == "hdfs" ]]; then
+      expected_hash="$(inspect_storage "$local_root/seed" "$key" | cut -f2)"
+    fi
     actual_hash="$(destination_hash "$destination_backend" "$key")"
     [[ "$actual_hash" == "$expected_hash" ]] || {
       echo "$source_backend -> $destination_backend checksum mismatch" >&2
       exit 1
     }
+    if [[ "$source_backend" == "hdfs" ]]; then
+      inspect_storage "$(storage_url source hdfs)" "$key" >/dev/null
+    fi
     echo "$source_backend -> $destination_backend verified: $actual_hash"
   done
 done
 
-# Large 4-by-4 consistency matrix across every protocol available in the lab.
+# Representative successful source deletion in both HDFS roles. The ordinary
+# matrix above separately proves HDFS sources are retained by default.
+delete_hdfs_source_key="delete-hdfs-source-to-local.bin"
+seed_source hdfs "$delete_hdfs_source_key" "delete-hdfs-source-after-commit"
+cargo run --quiet --locked --example storage_copy -- \
+  --source "$(storage_url source hdfs)" \
+  --destination "$(storage_url destination local)" \
+  --path "$delete_hdfs_source_key" --delete-source
+if inspect_storage "$(storage_url source hdfs)" "$delete_hdfs_source_key" >/dev/null 2>&1; then
+  echo "HDFS source remained after requested successful deletion" >&2
+  exit 1
+fi
+
+delete_local_source_key="delete-local-source-to-hdfs.bin"
+seed_source local "$delete_local_source_key" "delete-local-source-after-hdfs-commit"
+cargo run --quiet --locked --example storage_copy -- \
+  --source "$(storage_url source local)" \
+  --destination "$(storage_url destination hdfs)" \
+  --path "$delete_local_source_key" --delete-source
+[[ ! -e "$local_root/source/$delete_local_source_key" ]]
+inspect_storage "$(storage_url destination hdfs)" "$delete_local_source_key" >/dev/null
+echo "HDFS source retention and bidirectional successful source deletion verified"
+
+# Empty-file coverage for every directed pair involving HDFS. The independent
+# inspector must observe exact size zero after reopening each HDFS destination.
+for source_backend in "${backends[@]}"; do
+  for destination_backend in "${backends[@]}"; do
+    if [[ "$source_backend" != "hdfs" && "$destination_backend" != "hdfs" ]]; then
+      continue
+    fi
+    key="empty-${source_backend}-to-${destination_backend}.bin"
+    seed_source "$source_backend" "$key" ""
+    cargo run --quiet --locked --example storage_copy -- \
+      --source "$(storage_url source "$source_backend")" \
+      --destination "$(storage_url destination "$destination_backend")" \
+      --path "$key"
+    [[ "$(destination_size "$destination_backend" "$key")" == "0" ]] || {
+      echo "empty $source_backend -> $destination_backend size mismatch" >&2
+      exit 1
+    }
+  done
+done
+
+# Large 5-by-5 consistency matrix across every protocol available in the lab.
 # 48 MiB + 137 bytes exceeds eight 5-MiB S3 chunks, the largest source chunk
 # size in this lab, and the offset-derived fixture detects swapped or duplicated
 # chunks rather than merely checking byte count.
@@ -173,6 +256,7 @@ with path.open("wb") as output:
         offset += length
 ' "$large_seed" "$large_size"
 large_hash="$(sha256sum "$large_seed" | cut -d' ' -f1)"
+large_blake3="$(inspect_storage "$local_root/seed" "$(basename "$large_seed")" | cut -f2)"
 for source_backend in "${backends[@]}"; do
   key="large-from-${source_backend}.bin"
   seed_source_file "$source_backend" "$key" "$large_seed"
@@ -187,8 +271,12 @@ for source_backend in "${backends[@]}"; do
       echo "large $source_backend -> $destination_backend size mismatch: expected $large_size, got $actual_size" >&2
       exit 1
     }
+    expected_large_hash="$large_hash"
+    if [[ "$destination_backend" == "hdfs" ]]; then
+      expected_large_hash="$large_blake3"
+    fi
     actual_hash="$(destination_hash "$destination_backend" "$key")"
-    [[ "$actual_hash" == "$large_hash" ]] || {
+    [[ "$actual_hash" == "$expected_large_hash" ]] || {
       echo "large $source_backend -> $destination_backend checksum mismatch" >&2
       exit 1
     }

@@ -10,6 +10,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  windows-hdfs-contract:
+    name: windows HDFS Simple-mode compile contract
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (1.95.0)
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Compile library, HDFS contracts, and examples
+        run: cargo check --locked --lib --test hdfs_native_contract --examples
+
   ci:
     name: fmt + clippy + test + examples + e2e-local
     runs-on: ubuntu-latest
@@ -45,6 +68,21 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --no-fail-fast
+
+      - name: hdfs-native rolling contract
+        run: python3 tests/hdfs_upstream_contract.py
+
+      - name: HDFS directed matrix contract
+        run: tests/lab/run-e2e.sh nightly-contract-${{ github.run_id }} --contract-only
+
+      - name: HDFS memory budget contract
+        run: python3 tests/test_hdfs_memory_budget.py
+
+      - name: HDFS fault harness safety contract
+        run: python3 tests/test_hdfs_fault_harness.py
+
+      - name: Conditional HDFS HA gate contract
+        run: python3 tests/test_hdfs_ha_gate.py
 
       - name: cargo build --examples
         run: cargo build --examples

@@ -66,9 +66,12 @@ fn collecting_callback() -> (CommitCallback, CommittedRanges) {
 /// 的源目录；测试里不通过它实际读取数据，DataChunk 由测试直接手工构造。
 async fn shape_entry(dir: &str, name: &str, size: usize, seed: u8) -> data_mover::EntryEnum {
     write_pattern(&format!("{dir}/{name}"), size, seed).await;
-    let storage = create_storage(dir, Some(BLOCK), false)
-        .await
-        .assert_value("test value should be present");
+    let storage = create_storage(
+        dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
+    )
+    .await
+    .assert_value("test value should be present");
     storage
         .get_metadata(Path::new(name))
         .await
@@ -83,9 +86,12 @@ async fn t2_write_chunk_stream_sequential_then_commit_is_atomic() {
     reset_dirs(shape_dir, dst_dir).await;
 
     let entry = shape_entry(shape_dir, "blob.bin", SIZE, 0).await;
-    let dst = create_storage(dst_dir, Some(BLOCK), true)
-        .await
-        .assert_value("test value should be present");
+    let dst = create_storage(
+        dst_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+    )
+    .await
+    .assert_value("test value should be present");
     let part_path = Path::new("blob.bin.terrasync-part");
 
     let (missing, handle) = StorageEnum::resume_prepare(&dst, &entry, part_path, false)
@@ -181,9 +187,12 @@ async fn t3_write_chunk_stream_out_of_order_and_duplicate_is_idempotent() {
     reset_dirs(shape_dir, dst_dir).await;
 
     let entry = shape_entry(shape_dir, "blob.bin", SIZE, 0).await;
-    let dst = create_storage(dst_dir, Some(BLOCK), true)
-        .await
-        .assert_value("test value should be present");
+    let dst = create_storage(
+        dst_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+    )
+    .await
+    .assert_value("test value should be present");
     let part_path = Path::new("blob.bin.terrasync-part");
 
     let (_missing, handle) = StorageEnum::resume_prepare(&dst, &entry, part_path, false)
@@ -240,9 +249,12 @@ async fn t4_resume_after_partial_write_only_fills_missing_range() {
     reset_dirs(shape_dir, dst_dir).await;
 
     let entry = shape_entry(shape_dir, "blob.bin", SIZE, 0).await;
-    let dst = create_storage(dst_dir, Some(BLOCK), true)
-        .await
-        .assert_value("test value should be present");
+    let dst = create_storage(
+        dst_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+    )
+    .await
+    .assert_value("test value should be present");
     let part_path = Path::new("blob.bin.terrasync-part");
 
     let (missing1, handle1) = StorageEnum::resume_prepare(&dst, &entry, part_path, false)
@@ -332,12 +344,18 @@ async fn t5_hash_mismatch_blocks_commit_and_preserves_partial() {
     reset_dirs(shape_dir, dst_dir).await;
 
     let entry = shape_entry(shape_dir, "blob.bin", SIZE, 0).await;
-    let shape = create_storage(shape_dir, Some(BLOCK), false)
-        .await
-        .assert_value("test value should be present");
-    let dst = create_storage(dst_dir, Some(BLOCK), true)
-        .await
-        .assert_value("test value should be present");
+    let shape = create_storage(
+        shape_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
+    )
+    .await
+    .assert_value("test value should be present");
+    let dst = create_storage(
+        dst_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+    )
+    .await
+    .assert_value("test value should be present");
 
     // 预置一个内容全错的 .part（模拟数据损坏/缺 chunk 后残留），但调用方
     // 误以为已经补齐（missing_intervals 为空）。

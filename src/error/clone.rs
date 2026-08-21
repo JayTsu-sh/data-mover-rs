@@ -3,6 +3,7 @@ use super::StorageError;
 impl Clone for StorageError {
     fn clone(&self) -> Self {
         match self {
+            StorageError::HdfsOperation(value) => StorageError::HdfsOperation(value.clone()),
             StorageError::IoError(error) => StorageError::OperationError(error.to_string()),
             StorageError::ConfigError(value) => StorageError::ConfigError(value.clone()),
             StorageError::UnsupportedType(value) => StorageError::UnsupportedType(value.clone()),

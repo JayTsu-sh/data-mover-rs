@@ -126,17 +126,23 @@ async fn copy_symlinks(
     errors
 }
 
+fn print_endpoints(args: &Args) {
+    println!("Source: {}\nTarget: {}\n", args.src, args.dst);
+}
+
+async fn create_endpoints(args: &Args) -> Result<(Arc<StorageEnum>, Arc<StorageEnum>)> {
+    let source = create_storage(&args.src, data_mover::CreateStorageOptions::default()).await?;
+    let destination =
+        create_storage(&args.dst, data_mover::CreateStorageOptions::new(None, true)).await?;
+    Ok((Arc::new(source), Arc::new(destination)))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    print_endpoints(&args);
 
-    println!("Source: {}", args.src);
-    println!("Target: {}", args.dst);
-    println!();
-
-    // 创建源和目标存储
-    let src_storage = Arc::new(create_storage(&args.src, None, false).await?);
-    let dst_storage = Arc::new(create_storage(&args.dst, None, true).await?);
+    let (src_storage, dst_storage) = create_endpoints(&args).await?;
 
     // ── Phase 1: 遍历源共享 ──────────────────────────────────────────────────
     println!("=== Phase 1: Walkdir ===");

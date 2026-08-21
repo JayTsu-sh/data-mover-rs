@@ -1066,10 +1066,14 @@ impl CifsStorage {
         loop {
             // 填满 inflight，直到达到深度上限或所有字节已发出。
             while inflight.len() < self.config.transfer_concurrency.read() && issue_offset < size {
-                if let Some(ref qos) = qos {
-                    qos.acquire(chunk_size).await;
-                }
-                let want = std::cmp::min(chunk_size, size - issue_offset);
+                let requested = std::cmp::min(chunk_size, size - issue_offset);
+                let want = if let Some(ref qos) = qos {
+                    let granted = qos.acquire_bandwidth_grant(requested).await;
+                    qos.acquire_iops().await;
+                    granted
+                } else {
+                    requested
+                };
                 // `want ≤ chunk_size ≤ u32::MAX`（函数入口已断言）→ cast 无截断风险。
                 let read_len = u32::try_from(want).unwrap_or_else(|_| {
                     unreachable!("SMB read size is validated against u32::MAX")
@@ -1350,10 +1354,14 @@ impl CifsStorage {
             loop {
                 while inflight.len() < self.config.transfer_concurrency.read() && issue_offset < end
                 {
-                    if let Some(ref qos) = qos {
-                        qos.acquire(chunk_size).await;
-                    }
-                    let want = std::cmp::min(chunk_size, end - issue_offset);
+                    let requested = std::cmp::min(chunk_size, end - issue_offset);
+                    let want = if let Some(ref qos) = qos {
+                        let granted = qos.acquire_bandwidth_grant(requested).await;
+                        qos.acquire_iops().await;
+                        granted
+                    } else {
+                        requested
+                    };
                     let read_len = u32::try_from(want).unwrap_or_else(|_| {
                         unreachable!("SMB read size is validated against u32::MAX")
                     });

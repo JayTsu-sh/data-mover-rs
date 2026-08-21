@@ -478,6 +478,68 @@ const DEFAULT_TRANSFER_CONCURRENCY: TransferConcurrency = TransferConcurrency::d
 type S3ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<Bytes>> + Send + 'a>>;
 type S3OffsetReadFuture<'a> = Pin<Box<dyn Future<Output = (u64, Result<Bytes>)> + Send + 'a>>;
 
+#[derive(Clone, Copy)]
+struct S3RangeSpec<'a> {
+    key: &'a str,
+    version_id: Option<&'a str>,
+    offset: u64,
+    count: u64,
+}
+
+async fn forward_byte_stream_with_qos(
+    mut body: aws_sdk_s3::primitives::ByteStream,
+    tx: &mpsc::Sender<DataChunk>,
+    range: S3RangeSpec<'_>,
+    qos: &QosManager,
+    hasher: &mut Option<HashCalculator>,
+) -> Result<bool> {
+    let mut emitted = 0_u64;
+    while let Some(network_chunk) = body.try_next().await.map_err(|error| {
+        StorageError::S3Error(format!("读取对象 {} 的响应流失败: {error:?}", range.key))
+    })? {
+        let mut consumed = 0_usize;
+        while consumed < network_chunk.len() {
+            if emitted >= range.count {
+                return Err(StorageError::OperationError(format!(
+                    "S3 Range GET returned more than {} bytes for {}",
+                    range.count, range.key
+                )));
+            }
+            let available = (network_chunk.len() - consumed) as u64;
+            let requested = available.min(range.count - emitted);
+            let granted = qos.acquire_bandwidth_grant(requested).await;
+            let granted = usize::try_from(granted).map_err(|_| {
+                StorageError::OperationError(
+                    "S3 QoS bandwidth grant exceeds platform capacity".to_string(),
+                )
+            })?;
+            let data = network_chunk.slice(consumed..consumed + granted);
+            if let Some(hash) = hasher.as_mut() {
+                hash.update(&data);
+            }
+            if tx
+                .send(DataChunk {
+                    offset: range.offset + emitted,
+                    data,
+                })
+                .await
+                .is_err()
+            {
+                return Ok(false);
+            }
+            consumed += granted;
+            emitted += granted as u64;
+        }
+    }
+    if emitted != range.count {
+        return Err(StorageError::OperationError(format!(
+            "S3 Range GET size mismatch for {}: received {emitted}, expected {}",
+            range.key, range.count
+        )));
+    }
+    Ok(true)
+}
+
 macro_rules! build_s3_entry {
     ($name:expr, $path:expr, $extension:expr, $size:expr, $mtime:expr, $tags:expr, $version_id:expr, $latest:expr, $delete_marker:expr, $version_count:expr, $is_dir:expr $(,)?) => {{
         let version_id: Option<&str> = $version_id;
@@ -1094,9 +1156,8 @@ impl S3Storage {
 
     /// Chunked read: sends `DataChunks` into `tx`, used by the multi-chunk pipeline.
     ///
-    /// 实现 inflight pipeline：维持配置的 read inflight 个 Range GET 同时
-    /// 在飞，aws-sdk-rust 底层 HTTP/2 connection pool 自动复用连接 + 并发请求。
-    /// 用 `FuturesOrdered` 保证按 offset 顺序送 channel，下游 hasher.update 需顺序。
+    /// 无 `QoS` 时维持配置数量的 Range GET 并发；有 `QoS` 时保持 block-sized Range GET，
+    /// 顺序消费每个响应 `ByteStream`，在 body 内按 bandwidth grant 切片并施加反压。
     pub(crate) async fn read_data(
         &self,
         tx: mpsc::Sender<DataChunk>,
@@ -1109,10 +1170,32 @@ impl S3Storage {
             return Ok(None);
         }
         let key = Arc::new(self.build_full_key(relative_path));
-        let chunk_size = usize::try_from(self.block_size).map_err(|_| {
-            StorageError::OperationError("S3 block size exceeds platform capacity".to_string())
-        })?;
         let mut hasher = create_hash_calculator(enable_integrity_check);
+
+        if let Some(qos) = qos.as_ref() {
+            let mut offset = 0_u64;
+            while offset < size {
+                let count = (size - offset).min(self.block_size);
+                if !self
+                    .stream_range_with_qos(
+                        &tx,
+                        S3RangeSpec {
+                            key: key.as_str(),
+                            version_id: None,
+                            offset,
+                            count,
+                        },
+                        qos,
+                        &mut hasher,
+                    )
+                    .await?
+                {
+                    return Ok(hasher);
+                }
+                offset += count;
+            }
+            return Ok(hasher);
+        }
 
         let mut inflight: FuturesOrdered<S3ReadFuture<'_>> = FuturesOrdered::new();
         let mut issue_offset: u64 = 0;
@@ -1121,11 +1204,12 @@ impl S3Storage {
         loop {
             // 填满 inflight，直到达到深度上限或所有字节已发出。
             while inflight.len() < self.transfer_concurrency.read() && issue_offset < size {
-                if let Some(ref qos) = qos {
-                    qos.acquire(chunk_size as u64).await;
-                }
-                let count = usize::try_from((size - issue_offset).min(self.block_size))
-                    .unwrap_or_else(|_| unreachable!("count is bounded by the checked block size"));
+                let requested = (size - issue_offset).min(self.block_size);
+                let count = usize::try_from(requested).map_err(|_| {
+                    StorageError::OperationError(
+                        "S3 block read exceeds platform capacity".to_string(),
+                    )
+                })?;
                 let key_clone = key.clone();
                 let range_offset = issue_offset;
                 let range_count = count as u64;
@@ -1183,8 +1267,9 @@ impl S3Storage {
     /// 字节级断点续传源端：只读 `intervals` 覆盖的缺失区间（Range GET，inflight pipeline）。
     ///
     /// 与 `read_data` 的差异：按调用方给定的 `[start, end)` 区间列表读取，`DataChunk.offset`
-    /// 为文件内绝对偏移。区间按给定顺序串行处理，区间内维持配置的 read inflight
-    /// 个 Range GET `并发。version_id` = None：续传调用域内不涉及多版本对象。
+    /// 为文件内绝对偏移。无 `QoS` 时区间内维持配置的 Range GET 并发；有 `QoS` 时
+    /// 每个 block-sized Range GET 的响应 body 在内存分片层做 bandwidth pacing。
+    /// `version_id` = None：续传调用域内不涉及多版本对象。
     pub(crate) async fn read_data_intervals(
         &self,
         tx: mpsc::Sender<DataChunk>,
@@ -1199,15 +1284,41 @@ impl S3Storage {
         let key = Arc::new(self.build_full_key(relative_path));
         let chunk_size = self.block_size;
 
+        if let Some(qos) = qos.as_ref() {
+            let mut no_hasher = None;
+            for &(start, end) in intervals {
+                let mut offset = start;
+                while offset < end {
+                    let count = (end - offset).min(chunk_size);
+                    if !self
+                        .stream_range_with_qos(
+                            &tx,
+                            S3RangeSpec {
+                                key: key.as_str(),
+                                version_id: None,
+                                offset,
+                                count,
+                            },
+                            qos,
+                            &mut no_hasher,
+                        )
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                    offset += count;
+                }
+            }
+            return Ok(());
+        }
+
         for &(start, end) in intervals {
             let mut issue_offset = start;
             let mut inflight: FuturesOrdered<S3OffsetReadFuture<'_>> = FuturesOrdered::new();
             loop {
                 while inflight.len() < self.transfer_concurrency.read() && issue_offset < end {
-                    if let Some(ref qos) = qos {
-                        qos.acquire(chunk_size).await;
-                    }
-                    let count = (end - issue_offset).min(chunk_size);
+                    let requested = (end - issue_offset).min(chunk_size);
+                    let count = requested;
                     let key_clone = key.clone();
                     let offset = issue_offset;
                     inflight.push_back(Box::pin(async move {
@@ -1259,7 +1370,8 @@ impl S3Storage {
             self.write_singlepart_data(rx, relative_path, mtime, tags)
                 .await?
         } else {
-            self.write_multipart_data(rx, relative_path, tags).await?
+            self.write_multipart_data(rx, relative_path, mtime, tags)
+                .await?
         };
         if let Some(ref c) = bytes_counter {
             c.fetch_add(written as u64, Ordering::Relaxed);
@@ -2361,6 +2473,7 @@ impl S3Storage {
         &self,
         rx: mpsc::Receiver<DataChunk>,
         relative_path: &str,
+        mtime: i64,
         tags: Option<Vec<Tag>>,
     ) -> Result<usize> {
         debug!(
@@ -2373,16 +2486,9 @@ impl S3Storage {
         let key = self.build_full_key(relative_path);
 
         // 创建multipart上传
-        let upload_id = match self.create_multipart_upload(&key, tags.as_ref()).await {
-            Ok(id) => id,
-            Err(e) => {
-                error!(
-                    "Failed to create multipart upload for file {:?}: {:?}",
-                    relative_path, e
-                );
-                return Err(e);
-            }
-        };
+        let upload_id = self
+            .start_multipart_write(&key, tags.as_ref(), mtime, relative_path)
+            .await?;
 
         // 用于存储已上传分块的信息
         let parts = Arc::new(Mutex::new(Vec::new()));
@@ -2560,6 +2666,16 @@ impl S3Storage {
         key: &str,
         tags: Option<&Vec<Tag>>,
     ) -> Result<String> {
+        self.create_multipart_upload_with_mtime(key, tags, None)
+            .await
+    }
+
+    async fn create_multipart_upload_with_mtime(
+        &self,
+        key: &str,
+        tags: Option<&Vec<Tag>>,
+        mtime: Option<i64>,
+    ) -> Result<String> {
         debug!("Creating multipart upload for key: {}", key);
 
         let client = self.client.clone();
@@ -2576,6 +2692,10 @@ impl S3Storage {
             create_multipart_upload_builder =
                 create_multipart_upload_builder.tagging(build_tagging_str(tags));
         }
+        if let Some(mtime) = mtime {
+            create_multipart_upload_builder = create_multipart_upload_builder
+                .metadata("last-modified", datetime_to_string(mtime));
+        }
 
         let response = create_multipart_upload_builder.send().await.map_err(|e| {
             error!("Failed to create multipart upload: {}", e);
@@ -2588,6 +2708,23 @@ impl S3Storage {
 
         debug!("Created multipart upload with ID: {}", upload_id);
         Ok(upload_id)
+    }
+
+    async fn start_multipart_write(
+        &self,
+        key: &str,
+        tags: Option<&Vec<Tag>>,
+        mtime: i64,
+        relative_path: &str,
+    ) -> Result<String> {
+        self.create_multipart_upload_with_mtime(key, tags, Some(mtime))
+            .await
+            .inspect_err(|error| {
+                error!(
+                    "Failed to create multipart upload for file {:?}: {:?}",
+                    relative_path, error
+                );
+            })
     }
 
     async fn upload_part_with_stream(
@@ -2728,6 +2865,7 @@ impl S3Storage {
         size: u64,
         part_size: u64,
         tags: Option<&Vec<Tag>>,
+        mtime: Option<i64>,
     ) -> Result<(String, Vec<(u64, u64)>)> {
         let key = self.build_full_key(relative_path);
         if let Some(upload_id) = self.find_inprogress_upload(&key).await? {
@@ -2751,7 +2889,9 @@ impl S3Storage {
             );
             let _ = self.abort_multipart_upload(&key, &upload_id).await;
         }
-        let upload_id = self.create_multipart_upload(&key, tags).await?;
+        let upload_id = self
+            .create_multipart_upload_with_mtime(&key, tags, mtime)
+            .await?;
         Ok((upload_id, vec![(0, size)]))
     }
 
@@ -3469,6 +3609,40 @@ impl S3Storage {
         }
     }
 
+    async fn open_range_body(
+        &self,
+        range: S3RangeSpec<'_>,
+    ) -> Result<aws_sdk_s3::primitives::ByteStream> {
+        let mut builder = self
+            .client
+            .get_object()
+            .bucket(&self.bucket_name)
+            .key(range.key);
+        if let Some(version) = range.version_id {
+            builder = builder.version_id(version);
+        }
+        let range_header = format!("bytes={}-{}", range.offset, range.offset + range.count - 1);
+        let response = builder.range(range_header).send().await.map_err(|error| {
+            StorageError::S3Error(format!(
+                "读取对象 {} 的偏移量 {} 失败: {error:?}",
+                range.key, range.offset
+            ))
+        })?;
+        Ok(response.body)
+    }
+
+    async fn stream_range_with_qos(
+        &self,
+        tx: &mpsc::Sender<DataChunk>,
+        range: S3RangeSpec<'_>,
+        qos: &QosManager,
+        hasher: &mut Option<HashCalculator>,
+    ) -> Result<bool> {
+        qos.acquire_iops().await;
+        let body = self.open_range_body(range).await?;
+        forward_byte_stream_with_qos(body, tx, range, qos, hasher).await
+    }
+
     /// 单次 Range GET 并把响应 body 收成 `Bytes`。
     ///
     /// 共享 helper：被 [`Self::read`] 与 [`Self::read_data`] 内联 future 复用，避免
@@ -3490,18 +3664,14 @@ impl S3Storage {
         if count == 0 {
             return Ok(Bytes::new());
         }
-        let mut builder = self.client.get_object().bucket(&self.bucket_name).key(key);
-        if let Some(v) = version_id {
-            builder = builder.version_id(v);
-        }
-        let range_header = format!("bytes={}-{}", offset, offset + count - 1);
-        builder = builder.range(range_header);
-
-        let resp = builder.send().await.map_err(|e| {
-            StorageError::S3Error(format!("读取对象 {key} 的偏移量 {offset} 失败: {e:?}"))
-        })?;
-        let body = resp
-            .body
+        let body = self
+            .open_range_body(S3RangeSpec {
+                key,
+                version_id,
+                offset,
+                count,
+            })
+            .await?
             .collect()
             .await
             .map_err(|e| StorageError::S3Error(format!("收集对象内容失败: {e:?}")))?;
@@ -4193,6 +4363,48 @@ mod tests {
     use std::time::Duration;
 
     const MIB: u64 = 1024 * 1024;
+
+    #[tokio::test]
+    async fn streamed_range_body_splits_bandwidth_without_multiplying_iops() {
+        let qos = QosManager::try_new_with_burst("100MiB/s", 8 * 1024, Some(1000))
+            .assert_value("create qos");
+        qos.acquire_iops().await;
+        let body = aws_sdk_s3::primitives::ByteStream::from(vec![0x5a; 128 * 1024]);
+        let (tx, mut rx) = mpsc::channel(32);
+        let sender = tokio::spawn({
+            let qos = qos.clone();
+            async move {
+                forward_byte_stream_with_qos(
+                    body,
+                    &tx,
+                    S3RangeSpec {
+                        key: "fixture",
+                        version_id: None,
+                        offset: 0,
+                        count: 128 * 1024,
+                    },
+                    &qos,
+                    &mut None,
+                )
+                .await
+            }
+        });
+        let mut chunks = 0_u64;
+        let mut bytes = 0_u64;
+        while let Some(chunk) = rx.recv().await {
+            chunks += 1;
+            bytes += chunk.data.len() as u64;
+        }
+        assert!(
+            sender
+                .await
+                .assert_value("join sender")
+                .assert_value("stream body")
+        );
+        assert_eq!(bytes, 128 * 1024);
+        assert!(chunks >= 16);
+        assert_eq!(qos.stats().total_iops.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn versioning_unsupported_detection_is_narrow() {

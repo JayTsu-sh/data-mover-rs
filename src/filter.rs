@@ -475,27 +475,15 @@ impl<'a> Lexer<'a> {
                 }
 
                 // 检查是否到达字符串末尾
-                if self.position + 3 <= self.input.len()
-                    && &self.input[self.position..self.position + 3] == "and"
-                {
-                    let next_char = self
-                        .input
-                        .as_bytes()
-                        .get(self.position + 3)
-                        .map(|&b| b as char);
+                if self.peek_rest().starts_with("and") {
+                    let next_char = self.peek_rest()[3..].chars().next();
                     if next_char.is_none_or(|c| c.is_whitespace() || c == ')') {
                         break;
                     }
                 }
 
-                if self.position + 2 <= self.input.len()
-                    && &self.input[self.position..self.position + 2] == "or"
-                {
-                    let next_char = self
-                        .input
-                        .as_bytes()
-                        .get(self.position + 2)
-                        .map(|&b| b as char);
+                if self.peek_rest().starts_with("or") {
+                    let next_char = self.peek_rest()[2..].chars().next();
                     if next_char.is_none_or(|c| c.is_whitespace() || c == ')') {
                         break;
                     }
@@ -511,10 +499,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn peek(&self) -> char {
-        self.input
-            .as_bytes()
-            .get(self.position)
-            .map_or('\0', |&b| b as char)
+        self.input[self.position..].chars().next().unwrap_or('\0')
     }
 
     fn peek_rest(&self) -> &str {
@@ -526,7 +511,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn consume(&mut self) {
-        self.position += 1;
+        self.position += self.peek().len_utf8();
     }
 
     fn consume_n(&mut self, n: usize) {

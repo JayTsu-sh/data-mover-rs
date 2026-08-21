@@ -82,6 +82,39 @@ async fn local_get_metadata_returns_existing_file() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+#[tokio::test]
+async fn local_selective_timestamp_updates_preserve_the_omitted_side()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TempDir::new("selective-timestamps")?;
+    let relative = Path::new("file.txt");
+    let path = root.path().join(relative);
+    std::fs::write(&path, b"content")?;
+    filetime::set_file_times(
+        &path,
+        filetime::FileTime::from_unix_time(1_610_000_000, 123_000_000),
+        filetime::FileTime::from_unix_time(1_620_000_000, 456_000_000),
+    )?;
+    let storage = StorageEnum::Local(LocalStorage::new(root.path(), None));
+    let initial = storage.get_metadata(relative).await?;
+
+    let replacement_modified = 1_730_000_000_789_000_000;
+    storage
+        .set_metadata(relative, None, Some(replacement_modified), None, None, None)
+        .await?;
+    let modified_result = storage.get_metadata(relative).await?;
+    assert_eq!(modified_result.get_atime(), initial.get_atime());
+    assert_eq!(modified_result.get_mtime(), replacement_modified);
+
+    let replacement_accessed = 1_740_000_000_321_000_000;
+    storage
+        .set_metadata(relative, Some(replacement_accessed), None, None, None, None)
+        .await?;
+    let accessed_result = storage.get_metadata(relative).await?;
+    assert_eq!(accessed_result.get_atime(), replacement_accessed);
+    assert_eq!(accessed_result.get_mtime(), replacement_modified);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn local_get_metadata_returns_dangling_symlink() -> Result<(), Box<dyn std::error::Error>> {

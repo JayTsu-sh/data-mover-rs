@@ -72,6 +72,7 @@ pub(crate) enum TransferBackend {
     Nfs,
     Cifs,
     S3,
+    Hdfs,
 }
 
 impl TransferBackend {
@@ -81,6 +82,7 @@ impl TransferBackend {
             Self::Nfs => "DATA_MOVER_NFS",
             Self::Cifs => "DATA_MOVER_CIFS",
             Self::S3 => "DATA_MOVER_S3",
+            Self::Hdfs => "DATA_MOVER_HDFS",
         }
     }
 }
@@ -210,5 +212,22 @@ mod tests {
         let error = resolve(&[("DATA_MOVER_NFS_READ_INFLIGHT", "17")])
             .assert_error("value above the tested safe limit must fail");
         assert!(matches!(error, StorageError::ConfigError(_)));
+    }
+
+    #[test]
+    fn hdfs_backend_uses_backend_specific_inflight_values() {
+        let values = HashMap::from([
+            ("DATA_MOVER_HDFS_READ_INFLIGHT", "8"),
+            ("DATA_MOVER_HDFS_WRITE_INFLIGHT", "1"),
+        ]);
+        let resolved = resolve_with(
+            TransferBackend::Hdfs,
+            TransferConcurrency::defaults(4, 1),
+            None,
+            |name| values.get(name).map(|value| (*value).to_string()),
+        )
+        .assert_value("HDFS-specific concurrency");
+        assert_eq!(resolved.read(), 8);
+        assert_eq!(resolved.write(), 1);
     }
 }

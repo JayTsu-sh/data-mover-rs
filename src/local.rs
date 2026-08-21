@@ -716,14 +716,20 @@ impl LocalStorage {
 
         let mut tasks = Vec::new();
 
-        // 处理时间戳更新
-        if let (Some(atime), Some(mtime)) = (atime, mtime) {
+        // 处理时间戳更新；未提供的一侧保留目标文件当前值。
+        if atime.is_some() || mtime.is_some() {
             let path_clone = full_path.clone();
             tasks.push(tokio::spawn(async move {
-                let atime = time_util::nanos_to_filetime_local(atime);
-                let mtime = time_util::nanos_to_filetime_local(mtime);
-
                 tokio::task::spawn_blocking(move || {
+                    let metadata = std::fs::metadata(&path_clone)?;
+                    let atime = atime.map_or_else(
+                        || filetime::FileTime::from_last_access_time(&metadata),
+                        time_util::nanos_to_filetime_local,
+                    );
+                    let mtime = mtime.map_or_else(
+                        || filetime::FileTime::from_last_modification_time(&metadata),
+                        time_util::nanos_to_filetime_local,
+                    );
                     filetime::set_file_times(&path_clone, atime, mtime)
                 })
                 .await
@@ -1222,10 +1228,14 @@ impl LocalStorage {
         qos: Option<&QosManager>,
     ) {
         while inflight.len() < self.config.transfer_concurrency.read() && *issue_offset < end {
-            let want = chunk_size.min(end - *issue_offset);
-            if let Some(qos) = qos {
-                qos.acquire(want).await;
-            }
+            let requested = chunk_size.min(end - *issue_offset);
+            let want = if let Some(qos) = qos {
+                let granted = qos.acquire_bandwidth_grant(requested).await;
+                qos.acquire_iops().await;
+                granted
+            } else {
+                requested
+            };
             let offset = *issue_offset;
             inflight.push_back(Box::pin(async move {
                 let result = self.read(file, offset, want).await;

@@ -63,6 +63,8 @@ pub enum MismatchMetaField {
     Uid { src: u32, dest: u32 },
     Gid { src: u32, dest: u32 },
     Mode { src: u32, dest: u32 },
+    HdfsOwner { src: String, dest: String },
+    HdfsGroup { src: String, dest: String },
 }
 
 /// Amount of data validation performed by [`IntegrityCheck`].
@@ -301,7 +303,6 @@ impl IntegrityCheck {
         let metadata = collect_metadata_mismatches(
             src_entry,
             dest_entry,
-            matches!(dest_storage, StorageEnum::S3(_)),
             options.mtime_precision,
             options.mtime_tolerance,
         );
@@ -719,11 +720,10 @@ fn entry_kind(entry: &EntryEnum) -> IntegrityEntryKind {
 fn collect_metadata_mismatches(
     src: &EntryEnum,
     dest: &EntryEnum,
-    dest_is_s3: bool,
     mtime_precision: MtimePrecision,
     mtime_tolerance: Duration,
 ) -> Vec<MismatchMetaField> {
-    if dest_is_s3 {
+    if matches!(dest, EntryEnum::S3(_)) {
         return Vec::new();
     }
 
@@ -739,21 +739,41 @@ fn collect_metadata_mismatches(
             dest: dest.get_mtime(),
         });
     }
-    if let (Some(src), Some(dest)) = (src.get_uid(), dest.get_uid())
-        && src != dest
-    {
-        mismatches.push(MismatchMetaField::Uid { src, dest });
-    }
-    if let (Some(src), Some(dest)) = (src.get_gid(), dest.get_gid())
-        && src != dest
-    {
-        mismatches.push(MismatchMetaField::Gid { src, dest });
+    match (src, dest) {
+        (EntryEnum::NAS(src), EntryEnum::NAS(dest)) => {
+            if let (Some(src), Some(dest)) = (src.uid, dest.uid)
+                && src != dest
+            {
+                mismatches.push(MismatchMetaField::Uid { src, dest });
+            }
+            if let (Some(src), Some(dest)) = (src.gid, dest.gid)
+                && src != dest
+            {
+                mismatches.push(MismatchMetaField::Gid { src, dest });
+            }
+        }
+        (EntryEnum::HDFS(src), EntryEnum::HDFS(dest)) => {
+            if src.owner != dest.owner {
+                mismatches.push(MismatchMetaField::HdfsOwner {
+                    src: src.owner.clone(),
+                    dest: dest.owner.clone(),
+                });
+            }
+            if src.group != dest.group {
+                mismatches.push(MismatchMetaField::HdfsGroup {
+                    src: src.group.clone(),
+                    dest: dest.group.clone(),
+                });
+            }
+        }
+        _ => {}
     }
     if !src.get_is_symlink()
+        && !dest.get_is_symlink()
         && let (Some(src), Some(dest)) = (src.get_mode(), dest.get_mode())
     {
-        let src = src & 0o777;
-        let dest = dest & 0o777;
+        let src = src & 0o7777;
+        let dest = dest & 0o7777;
         if src != dest {
             mismatches.push(MismatchMetaField::Mode { src, dest });
         }
@@ -792,7 +812,7 @@ fn mtime_matches(src: i64, dest: i64, precision: MtimePrecision, tolerance: Dura
 mod tests {
     use super::*;
     use crate::AssertTestValue;
-    use crate::{LocalStorage, NASEntry};
+    use crate::{HDFSEntry, LocalStorage, NASEntry, S3Entry};
     use bytes::Bytes;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -882,6 +902,39 @@ mod tests {
             owner: None,
             owner_group: None,
             xattrs: None,
+        })
+    }
+
+    fn hdfs_entry(path: &str, size: u64) -> EntryEnum {
+        EntryEnum::HDFS(HDFSEntry {
+            name: path.to_string(),
+            relative_path: PathBuf::from(path),
+            is_dir: false,
+            size,
+            mtime: 30,
+            atime: 40,
+            mode: 0o640,
+            owner: "hdfs-owner".to_string(),
+            group: "hdfs-group".to_string(),
+            replication: Some(3),
+            block_size: Some(128 * 1024 * 1024),
+            extension: None,
+        })
+    }
+
+    fn s3_entry(path: &str, size: u64) -> EntryEnum {
+        EntryEnum::S3(S3Entry {
+            name: path.to_string(),
+            relative_path: path.to_string(),
+            extension: None,
+            size,
+            mtime: 99,
+            tags: None,
+            version_id: None,
+            is_latest: true,
+            is_delete_marker: false,
+            version_count: None,
+            is_dir: false,
         })
     }
 
@@ -1051,20 +1104,134 @@ mod tests {
     }
 
     #[test]
-    fn s3_destination_skips_posix_metadata_mismatches() {
+    fn s3_destination_skips_metadata_mismatches() {
         let src = nas_entry("item", 10);
+        let dest = s3_entry("item", 10);
+
+        assert!(
+            collect_metadata_mismatches(&src, &dest, MtimePrecision::Exact, Duration::ZERO,)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hdfs_to_nas_compares_only_mtime_and_mode() {
+        let src = hdfs_entry("item", 10);
         let mut dest = nas_entry("item", 10);
         let EntryEnum::NAS(dest_fields) = &mut dest else {
             unreachable!()
         };
         dest_fields.mtime = 31;
-        dest_fields.uid = Some(1001);
-        dest_fields.gid = Some(1002);
         dest_fields.mode = 0o100_600;
+        dest_fields.uid = Some(77);
+        dest_fields.gid = Some(88);
+
+        assert_eq!(
+            collect_metadata_mismatches(&src, &dest, MtimePrecision::Exact, Duration::ZERO),
+            vec![
+                MismatchMetaField::Mtime { src: 30, dest: 31 },
+                MismatchMetaField::Mode {
+                    src: 0o640,
+                    dest: 0o600,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn hdfs_to_hdfs_compares_string_identity_but_not_hdfs_only_layout_fields() {
+        let src = hdfs_entry("item", 10);
+        let mut dest = hdfs_entry("item", 10);
+        let EntryEnum::HDFS(dest_fields) = &mut dest else {
+            unreachable!()
+        };
+        dest_fields.owner = "other-owner".to_string();
+        dest_fields.group = "other-group".to_string();
+        dest_fields.atime = 999;
+        dest_fields.replication = Some(1);
+        dest_fields.block_size = Some(64 * 1024 * 1024);
+
+        assert_eq!(
+            collect_metadata_mismatches(&src, &dest, MtimePrecision::Exact, Duration::ZERO),
+            vec![
+                MismatchMetaField::HdfsOwner {
+                    src: "hdfs-owner".to_string(),
+                    dest: "other-owner".to_string(),
+                },
+                MismatchMetaField::HdfsGroup {
+                    src: "hdfs-group".to_string(),
+                    dest: "other-group".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn nas_to_hdfs_does_not_compare_numeric_and_string_identities() {
+        let mut src = nas_entry("item", 10);
+        let EntryEnum::NAS(src_fields) = &mut src else {
+            unreachable!()
+        };
+        src_fields.uid = Some(77);
+        src_fields.gid = Some(88);
+        src_fields.mode = 0o104_640;
+        let mut dest = hdfs_entry("item", 10);
+        let EntryEnum::HDFS(dest_fields) = &mut dest else {
+            unreachable!()
+        };
+        dest_fields.mode = 0o4_640;
+        dest_fields.owner = "unmapped-owner".to_string();
+        dest_fields.group = "unmapped-group".to_string();
 
         assert!(
-            collect_metadata_mismatches(&src, &dest, true, MtimePrecision::Exact, Duration::ZERO,)
+            collect_metadata_mismatches(&src, &dest, MtimePrecision::Exact, Duration::ZERO)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn s3_to_hdfs_compares_mtime_only() {
+        let src = s3_entry("item", 10);
+        let mut dest = hdfs_entry("item", 10);
+        let EntryEnum::HDFS(dest_fields) = &mut dest else {
+            unreachable!()
+        };
+        dest_fields.mtime = 100;
+        dest_fields.mode = 0;
+        dest_fields.owner.clear();
+        dest_fields.group.clear();
+
+        assert_eq!(
+            collect_metadata_mismatches(&src, &dest, MtimePrecision::Exact, Duration::ZERO),
+            vec![MismatchMetaField::Mtime { src: 99, dest: 100 }]
+        );
+    }
+
+    #[test]
+    fn hdfs_millisecond_mtime_obeys_precision_and_tolerance() {
+        let mut src = hdfs_entry("item", 10);
+        let EntryEnum::HDFS(src_fields) = &mut src else {
+            unreachable!()
+        };
+        src_fields.mtime = 1_700_000_000_123_000_000;
+        let mut dest = hdfs_entry("item", 10);
+        let EntryEnum::HDFS(dest_fields) = &mut dest else {
+            unreachable!()
+        };
+        dest_fields.mtime = 1_700_000_000_123_999_999;
+
+        assert!(
+            collect_metadata_mismatches(&src, &dest, MtimePrecision::Auto, Duration::ZERO)
+                .is_empty()
+        );
+        assert!(
+            collect_metadata_mismatches(
+                &src,
+                &dest,
+                MtimePrecision::Exact,
+                Duration::from_millis(1),
+            )
+            .is_empty()
         );
     }
 
@@ -1124,6 +1291,19 @@ mod tests {
             MtimePrecision::Exact,
             Duration::from_secs(u64::MAX),
         ));
+    }
+
+    #[test]
+    fn integrity_layer_does_not_retry_hdfs_adapter_exhaustion() {
+        let error = StorageError::HdfsOperation(crate::HdfsOperationError {
+            operation: "get metadata",
+            relative_path: Some(PathBuf::from("item")),
+            kind: crate::HdfsErrorKind::Io,
+            hadoop_class: None,
+            diagnostic: "I/O operation failed",
+            retryable: true,
+        });
+        assert!(!is_transient_metadata_error(&error));
     }
 
     #[test]

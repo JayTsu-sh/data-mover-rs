@@ -14,6 +14,40 @@ identifier and call `cleanup-run.sh` from an `always()` step.
 
 Management traffic uses `10.131.9.0/20`. Test data uses `10.10.1.0/24`.
 Credentials are provisioned on the self-hosted runner and must not be committed.
+
+`run-hdfs-smoke.sh <run-id>` exercises the HDFS dependency and backend contract.
+For a Kerberized cluster, `LAB_HDFS_LOCATION` contains the percent-encoded
+principal in its username, while `LAB_HDFS_CONFIG_DIR` and `LAB_HDFS_KEYTAB`
+provide client-scoped configuration for that backend. The keytab must be mounted
+into the process running the test and is never embedded in the URL. Stateful HDFS
+cases run with one test thread so concurrent creates, appends, block deletion,
+and lease recovery do not compete for the two shared lab DataNodes.
+Root lifecycle cases use `LAB_HDFS_ADMIN_USER` (default
+`hdfs/hdfs-namenode@HDFS.LOCAL`) only to create
+and remove their isolated `/tmp/data-mover-nightly` namespace; read-only smoke
+coverage continues to use the user embedded in `LAB_HDFS_LOCATION`.
+Regular CI also runs a native `windows-latest` compile gate for the library,
+the cluster-free HDFS contract target, and all examples. This establishes
+Windows build support for explicit Simple mode without silently skipping a
+missing cross target. It does not claim real Windows-to-HDFS runtime support;
+that requires a separately provisioned Windows lab before becoming a gate.
+`tests/hdfs_upstream_contract.py` is the acceptance entry point for the rolling
+`hdfs-native` Git dependency. It verifies that `Cargo.toml` remains unpinned,
+prints the full `Cargo.lock`-resolved commit (and the previous commit when it
+changed), then runs the cluster-free API/config/error contracts. Nightly invokes
+the same entry point with `--nightly --run-id "$RUN_ID"`, which additionally
+runs the complete real HDFS lab. A new resolved commit is accepted only after those contracts, bounded
+streaming tests, the Windows build job, and the real lab all pass.
+Both HDFS runners require a validated `nightly-*` or `release-*` identifier and
+derive exactly one remote root at
+`/tmp/data-mover-{nightly|release}/<run-id>/hdfs`. Every HDFS fixture is a
+validated child of that root, and an EXIT trap performs idempotent exact-root
+cleanup. Manual runs must therefore supply their own unique safe ID, for
+example `nightly-local-$(date +%s)-$$`; no shared fallback namespace exists.
+`run-hdfs-s3-metadata.sh <run-id>` adds the real S3-to-HDFS metadata contract using the
+standard `LAB_S3_ACCESS_KEY`, `LAB_S3_SECRET_KEY`, and `LAB_S3_BUCKET` secrets.
+It creates a unique S3 prefix, exercises S3-to-HDFS and HDFS-to-S3, verifies
+single-part and multipart source-mtime metadata, and removes the prefix on exit.
 The runner image must preinstall `rustup`, Rust `1.95.0`, `clippy`, and
 `rustfmt` for the `github-runner` account, with
 `/home/github-runner/.cargo/bin` on `PATH`. Keeping these tools in the image
@@ -21,12 +55,16 @@ avoids a runtime dependency on `sh.rustup.rs`; the workflow still selects the
 exact toolchain to keep builds reproducible.
 
 `run-e2e.sh` exercises the complete directed copy matrix across Local, NFSv3,
-NFSv4.1, and S3: 4 same-protocol paths plus 12 cross-protocol paths. Every case
-uses an isolated payload and verifies the destination SHA-256 checksum. It also
-runs the complete 4-by-4 matrix with a `48 MiB + 137 byte` offset-derived
+NFSv4.1, S3, and HDFS: 5 same-protocol paths plus 20 cross-protocol paths. Every
+case uses an isolated payload and independently reopens the destination to
+verify its exact size and full content hash. HDFS destinations use the bounded
+`storage_inspect` reader in a separate process because the runner does not
+require an HDFS CLI. The script also runs the complete 5-by-5 matrix with a
+`48 MiB + 137 byte` offset-derived
 fixture, large enough to exceed a queue depth of eight even for 5 MiB S3
-chunks. Every destination is reopened and checked for both exact size and
-SHA-256 digest; `storage_copy` additionally checks applicable metadata. A
+chunks. Every destination is reopened and checked for both exact size and a
+full digest; `storage_copy` additionally checks capability-aware metadata,
+including HDFS's millisecond timestamp boundary. A
 separate payload larger than 12 MiB is copied from NFSv4.1 to NFSv4.1 so normal
 copy exercises multiple negotiated read and write requests, including the
 session-limited effective `wsize`.
@@ -45,14 +83,71 @@ throughput, user/system CPU time, process CPU percentage, and peak RSS. The
 timed command includes the production copy integrity check, so the CSV reports
 end-to-end copy-and-verify cost rather than an unchecked microbenchmark.
 
-`run-resume-e2e.sh` exercises the complete 4-by-4 directed matrix in two
-independent processes. The first process writes a durable prefix without
-committing it. The second process discovers the remaining range from the
-destination, transfers only that range, commits, and verifies the final hash.
-This covers every source interval reader, every destination resume writer, and
-all NAS ↔ S3 directions. NAS destinations resume
+`run-qos-e2e.sh <run-id> [output.csv]` is the real-backend source-QoS gate for
+Local, NFSv3, NFSv4.1, S3, and HDFS. It first measures each unthrottled source
+and requires that baseline to exceed the configured limit by 25%; a naturally
+slow backend therefore fails as inconclusive instead of producing a false QoS
+pass. It then copies a `16 MiB + 137 byte` fixture at 8 MiB/s with a 64 KiB
+burst, checks the hard wall-clock lower bound, independently verifies the copy,
+and requires the reported source payload bytes to equal the file size exactly.
+For Local/NFS/HDFS, source IOPS must equal the number of burst-sized real reads.
+For S3 it must equal the number of 5 MiB Range GETs, proving that pacing slices
+inside one response do not inflate request IOPS. The CSV preserves baseline and
+limited measurements for diagnosing lab drift.
+
+`run-hdfs-memory-e2e.sh` is the bounded-memory acceptance gate. It generates
+fully written deterministic `256 MiB + 137 byte` and `2 GiB + 137 byte`
+fixtures with a 1 MiB producer buffer, then measures only the release
+`storage_copy` process for Local→HDFS, HDFS→HDFS and HDFS→Local under
+serial/default/high inflight profiles. A separate `storage_inspect` process
+reopens and fully hashes every destination. The CSV records sizes, profile,
+windows, chunk/channel/file concurrency, duration, throughput and peak RSS.
+The budget is `(3×read + write + channel[4] + active[2]) × 2 MiB × concurrent
+files + 96 MiB`; it accounts for DataNode packet storage, `hdfs-native` range
+aggregation, published chunks, the copy channel and destination write window.
+The HDFS file block size remains independently configured at 8 MiB. The 2 GiB
+sample may grow by at most 64 MiB
+over its 256 MiB peer. Nightly and release validation upload the CSV artifact and fail on either
+an absolute-budget or size-dependent-growth violation.
+
+`run-resume-e2e.sh` exercises the complete 5-by-5 Local/NFSv3/NFSv4.1/S3/HDFS
+directed matrix in independent processes. The first process writes a durable
+prefix, publishes a machine-readable receiver state and is then killed with
+`SIGKILL` without committing. The second process rejects a changed source,
+rediscovers the remaining range from destination truth, transfers only that
+range, commits, and verifies the final hash. Representative HDFS-source and
+HDFS-destination cases delete the source only after verification. This covers
+every source interval reader and destination resume writer. NAS destinations resume
 from a `.terrasync-part` file; S3 destinations resume the server-side multipart
-upload through `ListMultipartUploads` and `ListParts`.
+upload through `ListMultipartUploads` and `ListParts`; HDFS destinations accept
+only a durable contiguous prefix and append its missing tail sequentially.
+
+`run-hdfs-fault-e2e.sh` is the destructive HDFS service-recovery gate. Before
+every mutation it verifies that PVE VM 301/302/303 still map to the expected
+NameNode and two DataNodes by VM name, configured IP, guest hostname and exact
+systemd unit. It stops only `hadoop-namenode.service` or
+`hadoop-datanode.service`, never a VM. An EXIT trap restores all three units and
+waits for SafeMode to be off with two live DataNodes before exact run-root
+cleanup. The gate proves replica failover with one DataNode down, bounded and
+root-relative failure with both replicas down, bounded NameNode failure, and
+successful independent reopen/hash verification after each recovery. Its
+artifact contains structured redacted diagnostics only.
+
+`run-hdfs-ha-e2e.sh` is a separate, opt-in HA acceptance gate. The current
+10.131.9.30/31/32 lab has one NameNode and two DataNodes, so it is not an HA
+topology and this gate visibly reports `NOT RUN`; that result is not HA
+acceptance. A real run requires an all-or-none set of
+`LAB_HDFS_HA_LOCATION`, `LAB_HDFS_HA_CONFIG_DIR`, and
+`LAB_HDFS_HA_NAMENODE{1,2}_{ID,HOST,VMID,NAME,SERVICE}`. The location must be a
+password-free logical NameService URL whose path is the exact run-scoped HDFS
+root, and the configuration directory must contain the matching Hadoop client
+XML files. When configured, the runner validates both PVE guests and exact
+NameNode services, discovers active/standby state, streams a fixture through
+the logical NameService, stops only the validated active service, verifies that
+the former standby becomes active and independently reopens and hashes the
+fixture, then restores both services and deletes the run root from an EXIT
+trap. Hadoop XML contents and credentials must be provisioned outside the
+repository and must not be printed or uploaded.
 
 `run-integrity-e2e.sh` independently re-reads both the small and large complete
 4-by-4 directed matrices through Local, NFSv3, NFSv4.1, and S3: four

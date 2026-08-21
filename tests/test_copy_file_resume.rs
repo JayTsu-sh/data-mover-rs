@@ -78,12 +78,18 @@ async fn resumable_fresh_full_copy() {
     reset_dirs(src_dir, dst_dir).await;
     write_pattern(&format!("{src_dir}/blob.bin"), SIZE).await;
 
-    let src = create_storage(src_dir, Some(BLOCK), false)
-        .await
-        .assert_value("test value should be present");
-    let dst = create_storage(dst_dir, Some(BLOCK), true)
-        .await
-        .assert_value("test value should be present");
+    let src = create_storage(
+        src_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
+    )
+    .await
+    .assert_value("test value should be present");
+    let dst = create_storage(
+        dst_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+    )
+    .await
+    .assert_value("test value should be present");
     let entry = src
         .get_metadata(Path::new("blob.bin"))
         .await
@@ -148,12 +154,18 @@ async fn resumable_continues_from_partial_part() {
         .await
         .assert_value("test value should be present");
 
-    let src = create_storage(src_dir, Some(BLOCK), false)
-        .await
-        .assert_value("test value should be present");
-    let dst = create_storage(dst_dir, Some(BLOCK), true)
-        .await
-        .assert_value("test value should be present");
+    let src = create_storage(
+        src_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
+    )
+    .await
+    .assert_value("test value should be present");
+    let dst = create_storage(
+        dst_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+    )
+    .await
+    .assert_value("test value should be present");
     let entry = src
         .get_metadata(Path::new("blob.bin"))
         .await
@@ -209,12 +221,18 @@ async fn resumable_truncates_leftover_tail() {
         .await
         .assert_value("test value should be present");
 
-    let src = create_storage(src_dir, Some(BLOCK), false)
-        .await
-        .assert_value("test value should be present");
-    let dst = create_storage(dst_dir, Some(BLOCK), true)
-        .await
-        .assert_value("test value should be present");
+    let src = create_storage(
+        src_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
+    )
+    .await
+    .assert_value("test value should be present");
+    let dst = create_storage(
+        dst_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+    )
+    .await
+    .assert_value("test value should be present");
     let entry = src
         .get_metadata(Path::new("blob.bin"))
         .await

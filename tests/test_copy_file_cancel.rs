@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use data_mover::error::StorageError;
-use data_mover::{QosManager, StorageEnum, create_storage};
+use data_mover::{QosManager, ResumeContext, StorageEnum, create_storage};
 use tokio_util::sync::CancellationToken;
 
 trait AssertTestValue {
@@ -66,10 +66,10 @@ async fn copy_file_returns_cancelled_when_token_pre_cancelled() {
     let blob = format!("{src_dir}/blob.bin");
     write_blob(&blob, 1024).await;
 
-    let src = create_storage(&src_dir, None, false)
+    let src = create_storage(&src_dir, data_mover::CreateStorageOptions::default())
         .await
         .assert_value("test value should be present");
-    let dst = create_storage(&dst_dir, None, true)
+    let dst = create_storage(&dst_dir, data_mover::CreateStorageOptions::new(None, true))
         .await
         .assert_value("test value should be present");
     let entry = src
@@ -112,10 +112,10 @@ async fn copy_file_aborts_mid_transfer_on_token_cancel() {
     let blob = format!("{src_dir}/blob.bin");
     write_blob(&blob, 16 * 1024 * 1024).await;
 
-    let src = create_storage(&src_dir, None, false)
+    let src = create_storage(&src_dir, data_mover::CreateStorageOptions::default())
         .await
         .assert_value("test value should be present");
-    let dst = create_storage(&dst_dir, None, true)
+    let dst = create_storage(&dst_dir, data_mover::CreateStorageOptions::new(None, true))
         .await
         .assert_value("test value should be present");
     let entry = src
@@ -172,10 +172,10 @@ async fn copy_file_without_cancel_still_works_via_compat_wrapper() {
     let blob = format!("{src_dir}/blob.bin");
     write_blob(&blob, 256 * 1024).await;
 
-    let src = create_storage(&src_dir, None, false)
+    let src = create_storage(&src_dir, data_mover::CreateStorageOptions::default())
         .await
         .assert_value("test value should be present");
-    let dst = create_storage(&dst_dir, None, true)
+    let dst = create_storage(&dst_dir, data_mover::CreateStorageOptions::new(None, true))
         .await
         .assert_value("test value should be present");
     let entry = src
@@ -196,4 +196,59 @@ async fn copy_file_without_cancel_still_works_via_compat_wrapper() {
     .await
     .assert_value("legacy copy_file path");
     assert!(dst.get_metadata(Path::new("blob.bin")).await.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resumable_nas_copy_returns_cancelled_before_touching_destination() {
+    let src_dir = format!("{SRC_DIR}-resume-pre");
+    let dst_dir = format!("{DST_DIR}-resume-pre");
+    reset_dirs(&src_dir, &dst_dir).await;
+    let blob = format!("{src_dir}/blob.bin");
+    write_blob(&blob, 1024).await;
+    tokio::fs::write(format!("{dst_dir}/blob.bin"), b"old-final")
+        .await
+        .assert_value("seed final destination");
+
+    let src = create_storage(&src_dir, data_mover::CreateStorageOptions::default())
+        .await
+        .assert_value("create resume source");
+    let dst = create_storage(&dst_dir, data_mover::CreateStorageOptions::new(None, true))
+        .await
+        .assert_value("create resume destination");
+    let entry = src
+        .get_metadata(Path::new("blob.bin"))
+        .await
+        .assert_value("read resume source metadata");
+    let token = CancellationToken::new();
+    token.cancel();
+
+    let result = StorageEnum::copy_file_resumable(
+        &src,
+        &dst,
+        &entry,
+        data_mover::CopyOptions {
+            is_source_reserved: true,
+            cancel: Some(token),
+            ..Default::default()
+        },
+        ResumeContext {
+            part_relative_path: "blob.bin.part".into(),
+            missing_intervals: vec![(0, entry.get_size())],
+            on_committed: Arc::new(|_, _| {}),
+        },
+    )
+    .await;
+
+    assert!(matches!(result, Err(StorageError::Cancelled)));
+    assert_eq!(
+        tokio::fs::read(format!("{dst_dir}/blob.bin"))
+            .await
+            .assert_value("read preserved final destination"),
+        b"old-final"
+    );
+    assert!(
+        tokio::fs::metadata(format!("{dst_dir}/blob.bin.part"))
+            .await
+            .is_err()
+    );
 }

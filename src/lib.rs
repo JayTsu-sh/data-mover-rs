@@ -16,7 +16,9 @@ pub mod checksum;
 pub mod cifs;
 pub mod dir_tree;
 pub mod error;
+pub use error::{HdfsErrorKind, HdfsOperationError};
 pub mod filter;
+pub mod hdfs;
 pub mod integrity_check;
 pub mod local;
 pub mod nfs;
@@ -37,6 +39,10 @@ pub use filter::{
     FilterExpression, FilterFieldDef, FilterOperatorDef, dir_matches_date_filter,
     get_filter_field_definitions,
 };
+pub use hdfs::{
+    HDFSStorage, HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation,
+    build_hdfs_client, create_hdfs_storage,
+};
 pub use integrity_check::{
     IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, IntegrityEntryKind, IntegritySide,
     MismatchDataField, MismatchMetaField, MtimePrecision,
@@ -46,8 +52,8 @@ pub use nfs::NFSStorage;
 pub use qos::QosManager;
 pub use s3::{MultipartUpload, S3BucketInfo, S3CompletedPart, S3Storage};
 pub use storage_enum::{
-    CopyOptions, StorageEnum, StorageType, StreamHandle, TarPackOptions, WalkOptions,
-    create_storage, detect_storage_type,
+    BackendConfig, CopyOptions, CreateStorageOptions, StorageEnum, StorageType, StreamHandle,
+    TarPackOptions, WalkOptions, create_storage, detect_storage_type,
 };
 pub use tar_pack::calculate_tar_size;
 pub use transfer_concurrency::TransferConcurrency;
@@ -149,7 +155,9 @@ pub const MB: u64 = 1024 * KB;
 /// Returns an error when the requested storage operation cannot be completed.
 pub fn canonicalize_path(path: &str) -> std::io::Result<String> {
     match detect_storage_type(path) {
-        StorageType::Nfs | StorageType::S3 | StorageType::Cifs => Ok(path.to_string()),
+        StorageType::Nfs | StorageType::S3 | StorageType::Cifs | StorageType::Hdfs => {
+            Ok(path.to_string())
+        }
         StorageType::Local => {
             let abs = soft_canonicalize(path)?;
             Ok(abs.to_string_lossy().to_string())
@@ -201,6 +209,7 @@ pub struct ResumeContext {
 pub enum EntryEnum {
     NAS(NASEntry),
     S3(S3Entry),
+    HDFS(HDFSEntry),
 }
 
 impl EntryEnum {
@@ -208,6 +217,7 @@ impl EntryEnum {
         match self {
             EntryEnum::NAS(entry) => entry.size,
             EntryEnum::S3(entry) => entry.size,
+            EntryEnum::HDFS(entry) => entry.size,
         }
     }
 
@@ -215,6 +225,7 @@ impl EntryEnum {
         match self {
             EntryEnum::NAS(entry) => entry.relative_path.as_path(),
             EntryEnum::S3(entry) => Path::new(&entry.relative_path),
+            EntryEnum::HDFS(entry) => entry.relative_path.as_path(),
         }
     }
 
@@ -222,6 +233,7 @@ impl EntryEnum {
         match self {
             EntryEnum::NAS(entry) => &entry.name,
             EntryEnum::S3(entry) => &entry.name,
+            EntryEnum::HDFS(entry) => &entry.name,
         }
     }
 
@@ -229,13 +241,14 @@ impl EntryEnum {
         match self {
             EntryEnum::NAS(entry) => entry.is_dir,
             EntryEnum::S3(entry) => entry.is_dir,
+            EntryEnum::HDFS(entry) => entry.is_dir,
         }
     }
 
     pub fn get_is_symlink(&self) -> bool {
         match self {
             EntryEnum::NAS(entry) => entry.is_symlink,
-            EntryEnum::S3(_) => false,
+            EntryEnum::S3(_) | EntryEnum::HDFS(_) => false,
         }
     }
 
@@ -243,6 +256,7 @@ impl EntryEnum {
         match self {
             EntryEnum::NAS(entry) => !entry.is_dir && !entry.is_symlink,
             EntryEnum::S3(entry) => !entry.is_dir,
+            EntryEnum::HDFS(entry) => !entry.is_dir,
         }
     }
 
@@ -250,6 +264,7 @@ impl EntryEnum {
         match self {
             EntryEnum::NAS(entry) => entry.mtime,
             EntryEnum::S3(entry) => entry.mtime,
+            EntryEnum::HDFS(entry) => entry.mtime,
         }
     }
 
@@ -257,6 +272,7 @@ impl EntryEnum {
         match self {
             EntryEnum::NAS(entry) => entry.atime,
             EntryEnum::S3(entry) => entry.mtime,
+            EntryEnum::HDFS(entry) => entry.atime,
         }
     }
 
@@ -264,6 +280,7 @@ impl EntryEnum {
         match self {
             EntryEnum::NAS(entry) => entry.ctime,
             EntryEnum::S3(entry) => entry.mtime,
+            EntryEnum::HDFS(entry) => entry.mtime,
         }
     }
 
@@ -271,6 +288,7 @@ impl EntryEnum {
         match self {
             EntryEnum::NAS(entry) => Some(entry.mode),
             EntryEnum::S3(_) => None,
+            EntryEnum::HDFS(entry) => Some(entry.mode),
         }
     }
 
@@ -278,75 +296,76 @@ impl EntryEnum {
         match self {
             EntryEnum::NAS(entry) => entry.extension.as_deref(),
             EntryEnum::S3(entry) => entry.extension.as_deref(),
+            EntryEnum::HDFS(entry) => entry.extension.as_deref(),
         }
     }
 
     pub fn get_hard_links(&self) -> Option<u32> {
         match self {
             EntryEnum::NAS(entry) => entry.hard_links,
-            EntryEnum::S3(_) => None,
+            EntryEnum::S3(_) | EntryEnum::HDFS(_) => None,
         }
     }
 
     pub fn get_uid(&self) -> Option<u32> {
         match self {
             EntryEnum::NAS(entry) => entry.uid,
-            EntryEnum::S3(_) => None,
+            EntryEnum::S3(_) | EntryEnum::HDFS(_) => None,
         }
     }
 
     pub fn get_gid(&self) -> Option<u32> {
         match self {
             EntryEnum::NAS(entry) => entry.gid,
-            EntryEnum::S3(_) => None,
+            EntryEnum::S3(_) | EntryEnum::HDFS(_) => None,
         }
     }
 
     pub fn get_ino(&self) -> Option<u64> {
         match self {
             EntryEnum::NAS(entry) => entry.ino,
-            EntryEnum::S3(_) => None,
+            EntryEnum::S3(_) | EntryEnum::HDFS(_) => None,
         }
     }
 
     pub fn get_file_handle(&self) -> Option<&Bytes> {
         match self {
             EntryEnum::NAS(entry) => entry.file_handle.as_ref(),
-            EntryEnum::S3(_) => None,
+            EntryEnum::S3(_) | EntryEnum::HDFS(_) => None,
         }
     }
 
     pub fn get_version_id(&self) -> Option<&str> {
         match self {
-            EntryEnum::NAS(_) => None,
+            EntryEnum::NAS(_) | EntryEnum::HDFS(_) => None,
             EntryEnum::S3(entry) => entry.version_id.as_deref(),
         }
     }
 
     pub fn get_tags(&self) -> Option<&Vec<Tag>> {
         match self {
-            EntryEnum::NAS(_) => None,
+            EntryEnum::NAS(_) | EntryEnum::HDFS(_) => None,
             EntryEnum::S3(entry) => entry.tags.as_ref(),
         }
     }
 
     pub fn get_version_count(&self) -> Option<u32> {
         match self {
-            EntryEnum::NAS(_) => None,
+            EntryEnum::NAS(_) | EntryEnum::HDFS(_) => None,
             EntryEnum::S3(entry) => entry.version_count,
         }
     }
 
     pub fn get_is_latest(&self) -> bool {
         match self {
-            EntryEnum::NAS(_) => true,
+            EntryEnum::NAS(_) | EntryEnum::HDFS(_) => true,
             EntryEnum::S3(entry) => entry.is_latest,
         }
     }
 
     pub fn get_is_delete_marker(&self) -> bool {
         match self {
-            EntryEnum::NAS(_) => false,
+            EntryEnum::NAS(_) | EntryEnum::HDFS(_) => false,
             EntryEnum::S3(entry) => entry.is_delete_marker,
         }
     }
@@ -356,6 +375,25 @@ impl EntryEnum {
             entry.version_count = Some(count);
         }
     }
+}
+
+/// HDFS-native metadata without invented NAS or object-store semantics.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct HDFSEntry {
+    pub name: String,
+    pub relative_path: PathBuf,
+    pub is_dir: bool,
+    pub size: u64,
+    /// Nanoseconds since the Unix epoch.
+    pub mtime: i64,
+    /// Nanoseconds since the Unix epoch.
+    pub atime: i64,
+    pub mode: u32,
+    pub owner: String,
+    pub group: String,
+    pub replication: Option<u32>,
+    pub block_size: Option<u64>,
+    pub extension: Option<String>,
 }
 
 /// 失败事件类型，用于区分不同场景下的错误

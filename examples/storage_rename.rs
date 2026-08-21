@@ -22,7 +22,8 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let storage = create_storage(&args.storage, None, false).await?;
+    let storage =
+        create_storage(&args.storage, data_mover::CreateStorageOptions::default()).await?;
     let source = storage.get_metadata(Path::new(&args.from)).await?;
     let expected_size = source.get_size();
 

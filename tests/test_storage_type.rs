@@ -1,4 +1,7 @@
-use data_mover::storage_enum::{StorageType, create_storage, detect_storage_type};
+use data_mover::HdfsConfig;
+use data_mover::storage_enum::{
+    BackendConfig, CreateStorageOptions, StorageType, create_storage, detect_storage_type,
+};
 
 #[test]
 fn test_local_unix_path() {
@@ -16,6 +19,34 @@ fn test_nfs_url() {
         detect_storage_type("nfs://server:2049/export"),
         StorageType::Nfs
     );
+}
+
+#[test]
+fn test_hdfs_url() {
+    assert_eq!(
+        detect_storage_type("hdfs://user@namenode:9000/root"),
+        StorageType::Hdfs
+    );
+}
+
+#[tokio::test]
+async fn hdfs_factory_requires_matching_typed_configuration() {
+    let missing = create_storage(
+        "hdfs://user@127.0.0.1:9000/root",
+        CreateStorageOptions::default(),
+    )
+    .await;
+    assert!(missing.is_err());
+
+    let mismatched = create_storage(
+        "/tmp",
+        CreateStorageOptions {
+            backend: BackendConfig::Hdfs(HdfsConfig::default()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(mismatched.is_err());
 }
 
 #[test]
@@ -98,7 +129,7 @@ async fn test_create_storage_ensure_dir_creates_missing_local_dir() {
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.to_string_lossy().into_owned();
 
-    let storage = create_storage(&path, None, true).await;
+    let storage = create_storage(&path, CreateStorageOptions::new(None, true)).await;
     assert!(storage.is_ok(), "ensure_dir=true 应自动创建缺失目录");
     assert!(dir.is_dir());
 
@@ -111,6 +142,18 @@ async fn test_create_storage_no_ensure_dir_errors_on_missing_local_dir() {
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.to_string_lossy().into_owned();
 
-    let storage = create_storage(&path, None, false).await;
+    let storage = create_storage(&path, CreateStorageOptions::new(None, false)).await;
     assert!(storage.is_err(), "ensure_dir=false 时缺失目录应报错");
+}
+
+#[test]
+fn create_storage_options_default_to_backend_defaults_without_side_effects() {
+    assert_eq!(
+        CreateStorageOptions::default(),
+        CreateStorageOptions {
+            block_size: None,
+            ensure_dir: false,
+            backend: BackendConfig::Default,
+        }
+    );
 }

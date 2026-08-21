@@ -70,12 +70,18 @@ async fn assert_truncated_copy_guarded(
     reset_dirs(&src_dir, &dst_dir).await;
     write_pattern(&format!("{src_dir}/blob.bin"), size).await;
 
-    let src = create_storage(&src_dir, Some(BLOCK), false)
-        .await
-        .assert_value("test value should be present");
-    let dst = create_storage(&dst_dir, Some(BLOCK), true)
-        .await
-        .assert_value("test value should be present");
+    let src = create_storage(
+        &src_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), false),
+    )
+    .await
+    .assert_value("test value should be present");
+    let dst = create_storage(
+        &dst_dir,
+        data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+    )
+    .await
+    .assert_value("test value should be present");
     let entry = Box::pin(src.get_metadata(Path::new("blob.bin")))
         .await
         .assert_value("test value should be present");
@@ -167,12 +173,18 @@ async fn intact_copy_still_succeeds() {
         reset_dirs(&src_dir, &dst_dir).await;
         write_pattern(&format!("{src_dir}/blob.bin"), size).await;
 
-        let src = create_storage(&src_dir, Some(BLOCK), false)
-            .await
-            .assert_value("test value should be present");
-        let dst = create_storage(&dst_dir, Some(BLOCK), true)
-            .await
-            .assert_value("test value should be present");
+        let src = create_storage(
+            &src_dir,
+            data_mover::CreateStorageOptions::new(Some(BLOCK), false),
+        )
+        .await
+        .assert_value("test value should be present");
+        let dst = create_storage(
+            &dst_dir,
+            data_mover::CreateStorageOptions::new(Some(BLOCK), true),
+        )
+        .await
+        .assert_value("test value should be present");
         let entry = Box::pin(src.get_metadata(Path::new("blob.bin")))
             .await
             .assert_value("test value should be present");
