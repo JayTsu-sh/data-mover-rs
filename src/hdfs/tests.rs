@@ -924,8 +924,9 @@ mod tests {
     #[test]
     fn kerberos_keytab_uses_url_principal_and_redacts_secret_path() {
         let config = HdfsConfig {
-            kerberos_credentials: Some(HdfsKerberosCredentials::Keytab {
-                keytab: "/run/secrets/source.keytab".into(),
+            kerberos_credentials: Some(HdfsKerberosCredentials {
+                keytab: Some("/run/secrets/source.keytab".into()),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -936,7 +937,8 @@ mod tests {
         drop(client);
         assert_eq!(parsed.user(), "source/client@SOURCE.EXAMPLE");
         let debug = format!("{config:?}");
-        assert!(debug.contains("Keytab"));
+        assert!(debug.contains("HdfsKerberosCredentials"));
+        assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("/run/secrets/source.keytab"));
     }
 
@@ -947,8 +949,9 @@ mod tests {
                 "hadoop.security.authentication".to_string(),
                 "simple".to_string(),
             )]),
-            kerberos_credentials: Some(HdfsKerberosCredentials::CredentialCache {
-                cache: "FILE:/run/krb5/source.ccache".to_string(),
+            kerberos_credentials: Some(HdfsKerberosCredentials {
+                cache: Some("FILE:/run/krb5/source.ccache".to_string()),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -956,6 +959,49 @@ mod tests {
             HdfsLocation::parse_configured("hdfs://source@namenode:9000/root", &config).is_err()
         );
         assert!(!format!("{config:?}").contains("/run/krb5/source.ccache"));
+    }
+
+    #[test]
+    fn kerberos_credentials_redact_keytab_and_cache_together() {
+        let credentials = HdfsKerberosCredentials {
+            principal: Some("source/client@SOURCE.EXAMPLE".to_string()),
+            keytab: Some("/run/secrets/source.keytab".into()),
+            cache: Some("FILE:/run/krb5/source.ccache".to_string()),
+        };
+
+        let debug = format!("{credentials:?}");
+        assert!(debug.contains("source/client@SOURCE.EXAMPLE"));
+        assert!(!debug.contains("/run/secrets/source.keytab"));
+        assert!(!debug.contains("/run/krb5/source.ccache"));
+    }
+
+    #[test]
+    fn kerberos_credentials_require_keytab_or_cache() {
+        let config = HdfsConfig {
+            kerberos_credentials: Some(HdfsKerberosCredentials {
+                principal: Some("source/client@SOURCE.EXAMPLE".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = build_hdfs_client("hdfs://source@namenode:9000/root", &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn combined_keytab_and_cache_are_accepted() {
+        let config = HdfsConfig {
+            kerberos_credentials: Some(HdfsKerberosCredentials {
+                keytab: Some("/run/secrets/source.keytab".into()),
+                cache: Some("FILE:/run/krb5/source.ccache".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = build_hdfs_client("hdfs://source@namenode:9000/root", &config);
+        assert!(result.is_ok());
     }
 
     #[test]

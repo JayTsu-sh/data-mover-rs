@@ -26,8 +26,7 @@ validate_hdfs_fault_target() {
     datanode1) expected_name=hdfs-datanode1 ;;
     datanode2) expected_name=hdfs-datanode2 ;;
   esac
-  config="$(ssh -o BatchMode=yes -o ConnectTimeout=10 root@"$LAB_HDFS_PVE_HOST" \
-    "qm config '$vmid'")"
+  config="$(ssh_lab_root "$LAB_HDFS_PVE_HOST" "qm config '$vmid'")"
   grep -Fxq "name: $expected_name" <<<"$config"
   grep -Eq "^ipconfig0: .*ip=${host//./\\.}/" <<<"$config"
   ssh_hdfs "$host" \

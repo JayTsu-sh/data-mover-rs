@@ -20,7 +20,7 @@ use crate::HDFSEntry;
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
 use crate::filter::{FilterInput, should_skip};
-use hdfs_native::{Client, ClientBuilder, KerberosCredentials};
+use hdfs_native::{Client, ClientBuilder};
 
 const DEFAULT_BLOCK_SIZE: u64 = 8 * crate::MB;
 const MAX_TRANSFER_CHUNK_SIZE: u64 = 2 * crate::MB;
@@ -170,24 +170,24 @@ pub struct HdfsConfig {
 ///
 /// The principal is parsed from the HDFS location URL so source and destination
 /// backends in the same process can use independent identities.
-#[derive(Clone, Eq, PartialEq)]
-pub enum HdfsKerberosCredentials {
-    CredentialCache { cache: String },
-    Keytab { keytab: PathBuf },
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct HdfsKerberosCredentials {
+    /// Kerberos principal to acquire. When omitted, the user in the HDFS URL is used.
+    pub principal: Option<String>,
+    /// Keytab from which initiator credentials are acquired.
+    pub keytab: Option<PathBuf>,
+    /// Kerberos credential cache to read from or populate.
+    pub cache: Option<String>,
 }
 
 impl fmt::Debug for HdfsKerberosCredentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CredentialCache { .. } => formatter
-                .debug_struct("CredentialCache")
-                .field("cache", &"<redacted>")
-                .finish(),
-            Self::Keytab { .. } => formatter
-                .debug_struct("Keytab")
-                .field("keytab", &"<redacted>")
-                .finish(),
-        }
+        formatter
+            .debug_struct("HdfsKerberosCredentials")
+            .field("principal", &self.principal)
+            .field("keytab", &self.keytab.as_ref().map(|_| "<redacted>"))
+            .field("cache", &self.cache.as_ref().map(|_| "<redacted>"))
+            .finish()
     }
 }
 
@@ -360,23 +360,30 @@ pub fn build_hdfs_client(
         .with_config_dir(config_dir.to_string_lossy())
         .with_config(overrides);
     if let Some(credentials) = &config.kerberos_credentials {
-        let principal = parsed.user().to_string();
-        let credentials = match credentials {
-            HdfsKerberosCredentials::CredentialCache { cache } => {
-                KerberosCredentials::CredentialCache {
-                    principal,
-                    cache: cache.clone(),
-                }
-            }
-            HdfsKerberosCredentials::Keytab { keytab } => {
-                let keytab = keytab
+        let principal = credentials
+            .principal
+            .clone()
+            .unwrap_or_else(|| parsed.user().to_string());
+        if credentials.keytab.is_none() && credentials.cache.is_none() {
+            return Err(config_error(
+                "HDFS Kerberos credentials require a keytab or credential cache",
+            ));
+        }
+        let keytab = credentials
+            .keytab
+            .as_deref()
+            .map(|keytab| {
+                keytab
                     .to_str()
-                    .ok_or_else(|| config_error("HDFS keytab path must be valid UTF-8"))?
-                    .to_string();
-                KerberosCredentials::Keytab { principal, keytab }
-            }
-        };
-        builder = builder.with_kerberos_credentials(credentials);
+                    .ok_or_else(|| config_error("HDFS keytab path must be valid UTF-8"))
+                    .map(str::to_string)
+            })
+            .transpose()?;
+        builder = builder.with_kerberos_credentials(
+            Some(principal),
+            keytab,
+            credentials.cache.clone(),
+        );
     } else {
         builder = builder.with_user(parsed.user());
     }
