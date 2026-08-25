@@ -80,9 +80,13 @@ run_expect_failure() {
 }
 
 wait_for_hdfs_write() {
-  for _ in {1..60}; do
+  local attempt readiness_path
+  for attempt in {1..60}; do
+    # An outage can leave the previous probe path waiting for lease recovery.
+    # Use a fresh path so this checks whether new writes work after recovery.
+    readiness_path="readiness-${BASHPID}-${attempt}.bin"
     if timeout 15s "$mutation_binary" --storage "$hdfs_storage" \
-      --path readiness.bin --phase seed >/dev/null 2>&1; then
+      --path "$readiness_path" --phase seed >/dev/null 2>&1; then
       return 0
     fi
     sleep 1

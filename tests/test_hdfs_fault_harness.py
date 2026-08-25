@@ -80,7 +80,8 @@ def test_kerberos_checks_use_the_instance_credential_probe() -> None:
 
 def test_cluster_recovery_is_followed_by_a_real_write_probe() -> None:
     assert "wait_for_hdfs_write()" in RUNNER
-    assert '--path readiness.bin --phase seed' in RUNNER
+    assert 'readiness_path="readiness-${BASHPID}-${attempt}.bin"' in RUNNER
+    assert '--path "$readiness_path" --phase seed' in RUNNER
     assert RUNNER.count("wait_for_hdfs_write") >= 4
 
 
