@@ -246,8 +246,7 @@ wait_hdfs_service namenode inactive
 run_expect_failure "NameNode unavailable" 35 "$local_root/namenode.log" \
   "$inspect_binary" --storage "$hdfs_storage" --path replicated.bin
 hdfs_service_action start namenode
-wait_hdfs_service namenode active
-wait_hdfs_cluster_ready
+restore_hdfs_services
 wait_for_hdfs_write
 actual="$(timeout 90s "$inspect_binary" --storage "$hdfs_storage" --path replicated.bin)"
 [[ "$actual" == "$expected" ]]

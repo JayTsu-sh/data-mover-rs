@@ -55,6 +55,7 @@ def test_ha_restore_restarts_zkfc_and_returns_the_direct_namenode_to_active() ->
     assert "systemctl start hadoop-zkfc.service" in COMMON
     assert "-failover '$secondary_id' '$primary_id'" in COMMON
     assert "restore_hdfs_ha_primary || status=1" in COMMON
+    assert "hdfs_service_action start namenode\nrestore_hdfs_services" in RUNNER
 
 
 def test_failure_commands_must_finish_before_their_deadline() -> None:
