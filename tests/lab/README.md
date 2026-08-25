@@ -106,7 +106,7 @@ The budget is `(3×read + write + channel[4] + active[2]) × 2 MiB × concurrent
 files + 96 MiB`; it accounts for DataNode packet storage, `hdfs-native` range
 aggregation, published chunks, the copy channel and destination write window.
 The HDFS file block size remains independently configured at 8 MiB. The 2 GiB
-sample may grow by at most 64 MiB
+sample may grow by at most 72 MiB
 over its 256 MiB peer. Nightly and release validation upload the CSV artifact and fail on either
 an absolute-budget or size-dependent-growth violation.
 

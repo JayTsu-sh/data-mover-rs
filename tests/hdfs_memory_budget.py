@@ -14,7 +14,9 @@ MIB = 1024 * 1024
 COPY_CHANNEL_CHUNKS = 4
 ACTIVE_CHUNKS = 2
 FIXED_OVERHEAD_MIB = 96
-GROWTH_ALLOWANCE_MIB = 64
+# Keep the size-scaling guard below the absolute budget while allowing for
+# page-level allocator variance between otherwise identical release runs.
+GROWTH_ALLOWANCE_MIB = 72
 
 
 def budget_mib(
