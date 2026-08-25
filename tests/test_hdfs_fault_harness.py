@@ -49,6 +49,14 @@ def test_exit_path_restores_health_before_confined_cleanup() -> None:
     assert "dfsadmin" not in COMMON
 
 
+def test_ha_restore_restarts_zkfc_and_returns_the_direct_namenode_to_active() -> None:
+    assert "restore_hdfs_ha_primary()" in COMMON
+    assert "systemctl reset-failed hadoop-zkfc.service" in COMMON
+    assert "systemctl start hadoop-zkfc.service" in COMMON
+    assert "-failover '$secondary_id' '$primary_id'" in COMMON
+    assert "restore_hdfs_ha_primary || status=1" in COMMON
+
+
 def test_failure_commands_must_finish_before_their_deadline() -> None:
     assert "status == 124" in RUNNER
     assert "did not return within" in RUNNER
