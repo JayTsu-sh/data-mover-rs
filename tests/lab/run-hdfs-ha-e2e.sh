@@ -44,8 +44,7 @@ validate_ha_node() {
   host="$(node_value "$number" HOST)"
   name="$(node_value "$number" NAME)"
   service="$(node_value "$number" SERVICE)"
-  config="$(ssh -o BatchMode=yes -o ConnectTimeout=10 root@"$LAB_HDFS_PVE_HOST" \
-    "qm config '$vmid'")"
+  config="$(ssh_lab_root "$LAB_HDFS_PVE_HOST" "qm config '$vmid'")"
   grep -Fxq "name: $name" <<<"$config"
   grep -Eq "^ipconfig0: .*ip=${host//./\\.}/" <<<"$config"
   ssh_hdfs "$host" \

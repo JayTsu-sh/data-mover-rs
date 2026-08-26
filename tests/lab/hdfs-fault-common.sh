@@ -26,8 +26,7 @@ validate_hdfs_fault_target() {
     datanode1) expected_name=hdfs-datanode1 ;;
     datanode2) expected_name=hdfs-datanode2 ;;
   esac
-  config="$(ssh -o BatchMode=yes -o ConnectTimeout=10 root@"$LAB_HDFS_PVE_HOST" \
-    "qm config '$vmid'")"
+  config="$(ssh_lab_root "$LAB_HDFS_PVE_HOST" "qm config '$vmid'")"
   grep -Fxq "name: $expected_name" <<<"$config"
   grep -Eq "^ipconfig0: .*ip=${host//./\\.}/" <<<"$config"
   ssh_hdfs "$host" \
@@ -73,6 +72,42 @@ wait_hdfs_cluster_ready() {
   return 1
 }
 
+restore_hdfs_ha_primary() {
+  [[ -n "${LAB_HDFS_HA_NAMENODE2_HOST:-}" ]] || return 0
+
+  local primary_host="$LAB_HDFS_HA_NAMENODE1_HOST"
+  local secondary_host="$LAB_HDFS_HA_NAMENODE2_HOST"
+  local primary_id="$LAB_HDFS_HA_NAMENODE1_ID"
+  local secondary_id="$LAB_HDFS_HA_NAMENODE2_ID"
+  local primary_name="$LAB_HDFS_HA_NAMENODE1_NAME"
+  local secondary_name="$LAB_HDFS_HA_NAMENODE2_NAME"
+  local remote_cache="/tmp/data-mover-fault-ha-restore-${RUN_ID}.ccache"
+
+  ssh_hdfs "$primary_host" \
+    "test \"\$(hostname)\" = '$primary_name' && \
+     sudo -n systemctl cat hadoop-zkfc.service >/dev/null && \
+     sudo -n systemctl reset-failed hadoop-zkfc.service && \
+     sudo -n systemctl start hadoop-zkfc.service"
+  ssh_hdfs "$secondary_host" \
+    "test \"\$(hostname)\" = '$secondary_name' && \
+     sudo -n systemctl cat hadoop-zkfc.service >/dev/null && \
+     sudo -n systemctl reset-failed hadoop-zkfc.service && \
+     sudo -n systemctl start hadoop-zkfc.service"
+
+  ssh_hdfs "$primary_host" \
+    "sudo -n -u hdfs env JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
+      HADOOP_CONF_DIR=/etc/hadoop HADOOP_LOG_DIR=/var/log/hadoop \
+      KRB5CCNAME='FILE:$remote_cache' bash -c \
+      'trap \"kdestroy >/dev/null 2>&1 || true\" EXIT; \
+       principal=\"\$(/opt/hadoop/bin/hdfs getconf -confKey dfs.namenode.kerberos.principal)\"; \
+       nameservice=\"\$(/opt/hadoop/bin/hdfs getconf -confKey dfs.nameservices)\"; \
+       kinit -kt /etc/security/keytabs/hdfs.service.keytab \"\$principal\"; \
+       state=\"\$(/opt/hadoop/bin/hdfs haadmin -ns \"\$nameservice\" -getServiceState '$primary_id')\"; \
+       [[ \"\$state\" == active ]] || \
+         /opt/hadoop/bin/hdfs haadmin -ns \"\$nameservice\" -failover '$secondary_id' '$primary_id''" \
+    >/dev/null
+}
+
 restore_hdfs_services() {
   local status=0
   for target in namenode datanode1 datanode2; do
@@ -81,6 +116,7 @@ restore_hdfs_services() {
   for target in namenode datanode1 datanode2; do
     wait_hdfs_service "$target" active || status=1
   done
+  restore_hdfs_ha_primary || status=1
   wait_hdfs_cluster_ready || status=1
   return "$status"
 }

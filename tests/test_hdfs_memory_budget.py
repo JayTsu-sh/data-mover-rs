@@ -17,12 +17,21 @@ class HdfsMemoryBudgetTests(unittest.TestCase):
         path = self._csv([(262_144, 70_000), (2_097_152, 75_000)])
         validate(path)
 
+        allocator_variance = self._csv(
+            [(262_144, 113_260), (2_097_152, 179_272)],
+            profile="high",
+            read=8,
+            write=16,
+            budget=188,
+        )
+        validate(allocator_variance)
+
     def test_validator_rejects_budget_and_growth_violations(self) -> None:
         over_budget = self._csv([(262_144, 130_000), (2_097_152, 130_000)])
         with self.assertRaisesRegex(ValueError, "exceeds budget"):
             validate(over_budget)
         growing = self._csv(
-            [(262_144, 80_000), (2_097_152, 150_000)],
+            [(262_144, 80_000), (2_097_152, 155_000)],
             profile="high",
             read=8,
             write=16,

@@ -30,7 +30,10 @@ fn options(config_dir: PathBuf, keytab: PathBuf) -> CreateStorageOptions {
         ensure_dir: true,
         backend: BackendConfig::Hdfs(HdfsConfig {
             config_dir: Some(config_dir),
-            kerberos_credentials: Some(HdfsKerberosCredentials::Keytab { keytab }),
+            kerberos_credentials: Some(HdfsKerberosCredentials {
+                keytab: Some(keytab),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         ..Default::default()

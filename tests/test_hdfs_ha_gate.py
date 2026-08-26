@@ -82,6 +82,8 @@ class HaGateTests(unittest.TestCase):
         )
         self.assertIn("trap 'cleanup_ha_run $?' EXIT", runner)
         self.assertIn('service_action stop "$active"', runner)
+        self.assertIn('ssh_lab_root "$LAB_HDFS_PVE_HOST"', runner)
+        self.assertNotIn('root@"$LAB_HDFS_PVE_HOST"', runner)
         self.assertNotIn("qm stop", runner)
         self.assertNotIn("qm shutdown", runner)
         self.assertIn('[[ "$(ha_state "$remaining_active" || true)" == active ]]', runner)

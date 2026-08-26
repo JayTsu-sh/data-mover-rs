@@ -22,6 +22,11 @@ def test_exact_lab_topology_is_validated_before_service_mutation() -> None:
     assert 'validate_hdfs_fault_target "$target"' in COMMON
 
 
+def test_pve_topology_check_uses_runner_scoped_ssh_credentials() -> None:
+    assert 'ssh_lab_root "$LAB_HDFS_PVE_HOST"' in COMMON
+    assert 'root@"$LAB_HDFS_PVE_HOST"' not in COMMON
+
+
 def test_harness_never_mutates_virtual_machines_or_unrelated_units() -> None:
     combined = COMMON + RUNNER
     for forbidden in ("qm stop", "qm shutdown", "qm reset", "pct stop", "poweroff"):
@@ -42,6 +47,15 @@ def test_exit_path_restores_health_before_confined_cleanup() -> None:
     assert 'bean["FSState"]' in COMMON
     assert 'bean["NumLiveDataNodes"]' in COMMON
     assert "dfsadmin" not in COMMON
+
+
+def test_ha_restore_restarts_zkfc_and_returns_the_direct_namenode_to_active() -> None:
+    assert "restore_hdfs_ha_primary()" in COMMON
+    assert "systemctl reset-failed hadoop-zkfc.service" in COMMON
+    assert "systemctl start hadoop-zkfc.service" in COMMON
+    assert "-failover '$secondary_id' '$primary_id'" in COMMON
+    assert "restore_hdfs_ha_primary || status=1" in COMMON
+    assert "hdfs_service_action start namenode\nrestore_hdfs_services" in RUNNER
 
 
 def test_failure_commands_must_finish_before_their_deadline() -> None:
@@ -75,7 +89,8 @@ def test_kerberos_checks_use_the_instance_credential_probe() -> None:
 
 def test_cluster_recovery_is_followed_by_a_real_write_probe() -> None:
     assert "wait_for_hdfs_write()" in RUNNER
-    assert '--path readiness.bin --phase seed' in RUNNER
+    assert 'readiness_path="readiness-${BASHPID}-${attempt}.bin"' in RUNNER
+    assert '--path "$readiness_path" --phase seed' in RUNNER
     assert RUNNER.count("wait_for_hdfs_write") >= 4
 
 
