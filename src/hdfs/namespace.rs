@@ -171,6 +171,41 @@ impl HDFSStorage {
             .map_err(|error| hdfs_operation_error("set times", Some(relative_path), &error))
     }
 
+    /// Selectively update HDFS timestamps and permission bits.
+    ///
+    /// Omitted timestamps retain their current values. HDFS identities are
+    /// string-valued, so numeric uid/gid translation remains the caller's
+    /// responsibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid timestamps or permissions, paths outside
+    /// the configured root, metadata lookup failures, or upstream mutations.
+    pub async fn set_metadata(
+        &self,
+        relative_path: &std::path::Path,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+        mode: Option<u32>,
+    ) -> Result<(), StorageError> {
+        if atime.is_some() || mtime.is_some() {
+            let current = self.get_metadata(relative_path).await?;
+            let atime = nanos_to_millis(atime.unwrap_or(current.atime))?;
+            let mtime = nanos_to_millis(mtime.unwrap_or(current.mtime))?;
+            let path = self.resolve_mutation_path(relative_path)?;
+            self.client
+                .set_times(&path, mtime, atime)
+                .await
+                .map_err(|error| {
+                    hdfs_operation_error("set times", Some(relative_path), &error)
+                })?;
+        }
+        if let Some(mode) = mode {
+            self.set_permission(relative_path, mode & 0o7777).await?;
+        }
+        Ok(())
+    }
+
     /// Set HDFS string owner and/or group, leaving omitted values unchanged.
     ///
     /// Empty identity strings are treated as omitted. No numeric or `NFSv4`

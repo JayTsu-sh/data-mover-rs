@@ -245,11 +245,6 @@ pub enum StreamHandle {
 }
 
 impl StorageEnum {
-    fn hdfs_unsupported(operation: &str) -> StorageError {
-        StorageError::UnsupportedType(format!(
-            "HDFS {operation} is not implemented by the current ticket"
-        ))
-    }
     /// 验证存储连通性
     ///
     /// - Local: 检查根路径是否存在且可访问
@@ -322,7 +317,20 @@ impl StorageEnum {
                 let _ = s.delete_file(&tmp_path).await;
                 Ok(Some(mtime))
             }
-            StorageEnum::HDFS(_) => Err(Self::hdfs_unsupported("server-time probe")),
+            StorageEnum::HDFS(s) => {
+                let tmp_path = PathBuf::from(&tmp_name);
+                s.write_file(&tmp_path, Bytes::from_static(b"\0"), 0o600, None)
+                    .await?;
+                let result = s
+                    .get_metadata(&tmp_path)
+                    .await
+                    .map(|entry| Some(entry.mtime));
+                let cleanup = s.delete_file(&tmp_path).await;
+                match (result, cleanup) {
+                    (Ok(mtime), Ok(())) => Ok(mtime),
+                    (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                }
+            }
         }
     }
 
@@ -361,7 +369,19 @@ impl StorageEnum {
             (StorageEnum::HDFS(storage), entry) => {
                 storage.delete_file(entry.get_relative_path()).await
             }
-            (_, EntryEnum::HDFS(_)) => Err(Self::hdfs_unsupported("cross-backend delete")),
+            (StorageEnum::Local(storage), EntryEnum::HDFS(entry)) => {
+                storage.delete_file(&entry.relative_path).await
+            }
+            (StorageEnum::NFS(storage), EntryEnum::HDFS(entry)) => {
+                storage.delete_file(&entry.relative_path).await
+            }
+            (StorageEnum::CIFS(storage), EntryEnum::HDFS(entry)) => {
+                storage.delete_file(&entry.relative_path).await
+            }
+            (StorageEnum::S3(storage), EntryEnum::HDFS(entry)) => {
+                let key = storage.build_full_key(&path_to_s3_key(&entry.relative_path));
+                storage.delete_object(&key).await
+            }
         }
     }
 
@@ -408,9 +428,16 @@ impl StorageEnum {
             }
             // s3 storage has no directory concept.
             (StorageEnum::S3(_), _) => Ok(()),
-            (_, EntryEnum::HDFS(_)) => Err(Self::hdfs_unsupported(
-                "HDFS entry directory creation on this backend",
-            )),
+            (StorageEnum::Local(storage), EntryEnum::HDFS(entry)) => {
+                storage.create_dir_all(&entry.relative_path).await
+            }
+            (StorageEnum::NFS(storage), EntryEnum::HDFS(entry)) => storage
+                .create_dir_all(&entry.relative_path)
+                .await
+                .map(|_| ()),
+            (StorageEnum::CIFS(storage), EntryEnum::HDFS(entry)) => {
+                storage.create_dir_all(&entry.relative_path).await
+            }
         }
     }
 
@@ -634,7 +661,10 @@ impl StorageEnum {
             StorageEnum::S3(_) => Err(StorageError::OperationError(
                 "S3 does not support byte-level resume".to_string(),
             )),
-            StorageEnum::HDFS(_) => Err(Self::hdfs_unsupported("set_file_len")),
+            StorageEnum::HDFS(_) => Err(StorageError::UnsupportedType(
+                "HDFS cannot provide general POSIX set_file_len semantics; the current client also does not expose truncate"
+                    .to_string(),
+            )),
         }
     }
 
@@ -667,7 +697,15 @@ impl StorageEnum {
                     .await
             }
             StorageEnum::S3(_) => Ok(()),
-            StorageEnum::HDFS(_) => Err(Self::hdfs_unsupported("set_metadata")),
+            StorageEnum::HDFS(s) => {
+                if uid.is_some() || gid.is_some() {
+                    return Err(StorageError::UnsupportedType(
+                        "HDFS uses string owner/group identities and cannot map numeric uid/gid without an identity mapper"
+                            .to_string(),
+                    ));
+                }
+                s.set_metadata(relative_path, atime, mtime, mode).await
+            }
         }
     }
 
@@ -825,7 +863,32 @@ impl StorageEnum {
                 let key = relative_path.map(|p| path_to_s3_key(p));
                 s.delete_dir_all_with_progress(key.as_deref(), concurrency)
             }
-            StorageEnum::HDFS(_) => Err(Self::hdfs_unsupported("recursive delete")),
+            StorageEnum::HDFS(storage) => {
+                let Some(path) = relative_path.map(Path::to_path_buf) else {
+                    return Err(StorageError::InvalidPath(
+                        "HDFS progress deletion requires an explicit path below the storage root"
+                            .to_string(),
+                    ));
+                };
+                let storage = storage.clone();
+                let event_path = path.clone();
+                let (tx, rx) = async_channel::bounded(1);
+                tokio::spawn(async move {
+                    let error = storage
+                        .delete_dir_all(&path)
+                        .await
+                        .err()
+                        .map(|error| error.to_string());
+                    let _ = tx
+                        .send(crate::DeleteEvent {
+                            relative_path: event_path,
+                            is_dir: true,
+                            error,
+                        })
+                        .await;
+                });
+                Ok(DeleteDirIterator::new(rx))
+            }
         }
     }
 
@@ -1471,7 +1534,7 @@ impl StorageEnum {
                         "write_chunk_stream: Nas StreamHandle used with an S3 destination"
                             .to_string(),
                     )),
-                    StorageEnum::HDFS(_) => Err(Self::hdfs_unsupported("resumable write")),
+                    StorageEnum::HDFS(_) => Err(StorageError::MismatchedType),
                 }
             }
             StreamHandle::Hdfs {
@@ -2203,7 +2266,10 @@ impl StorageEnum {
                 s3.write_data(rx, &tar_key, tar_size, tar_mtime, None, bytes_counter)
                     .await
             }
-            StorageEnum::HDFS(_) => Err(Self::hdfs_unsupported("tar write")),
+            StorageEnum::HDFS(hdfs) => {
+                hdfs.write_data(rx, tar_path, tar_size, 0o644, None, bytes_counter)
+                    .await
+            }
         }
     }
 
@@ -2442,9 +2508,7 @@ impl StorageEnum {
                     .write_data(rx, &entry.relative_path, None, None, mode, bytes_counter)
                     .await
             }
-            StorageEnum::S3(_) | StorageEnum::HDFS(_) => {
-                Err(Self::hdfs_unsupported("cross-backend streaming write"))
-            }
+            StorageEnum::S3(_) | StorageEnum::HDFS(_) => Err(StorageError::MismatchedType),
         }
     }
 
@@ -3086,8 +3150,8 @@ pub async fn create_storage(path: &str, options: CreateStorageOptions) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::S3Entry;
     use crate::{AssertTestError, AssertTestValue};
+    use crate::{HDFSEntry, S3Entry};
     use filetime::FileTime;
 
     async fn reset_dir(dir: &str) {
@@ -3095,6 +3159,49 @@ mod tests {
         tokio::fs::create_dir_all(dir)
             .await
             .assert_value("test value should be present");
+    }
+
+    fn hdfs_entry(relative_path: &str, is_dir: bool) -> EntryEnum {
+        EntryEnum::HDFS(HDFSEntry {
+            name: relative_path.to_string(),
+            relative_path: PathBuf::from(relative_path),
+            is_dir,
+            size: 0,
+            mtime: 0,
+            atime: 0,
+            mode: if is_dir { 0o750 } else { 0o640 },
+            owner: "hdfs-owner".to_string(),
+            group: "hdfs-group".to_string(),
+            replication: Some(2),
+            block_size: Some(128 * 1024 * 1024),
+            extension: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn hdfs_entries_map_to_local_create_and_delete_operations() {
+        let directory = "/tmp/dm-hdfs-entry-local-dispatch";
+        reset_dir(directory).await;
+        let storage = create_storage(directory, CreateStorageOptions::default())
+            .await
+            .assert_value("create local storage");
+
+        let directory_entry = hdfs_entry("nested/created", true);
+        storage
+            .create_dir_all(&directory_entry)
+            .await
+            .assert_value("create directory from HDFS entry");
+        assert!(Path::new(directory).join("nested/created").is_dir());
+
+        let file_path = Path::new(directory).join("nested/file.bin");
+        tokio::fs::write(&file_path, b"fixture")
+            .await
+            .assert_value("create deletion fixture");
+        storage
+            .delete_file(&hdfs_entry("nested/file.bin", false))
+            .await
+            .assert_value("delete file from HDFS entry");
+        assert!(!file_path.exists());
     }
 
     #[test]
