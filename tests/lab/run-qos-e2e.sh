@@ -198,9 +198,12 @@ for backend in "${backends[@]}"; do
       }
   fi
 
-  qos_args=(--qos-bandwidth "${soft_rate_mib}MiB/s" --qos-burst-bytes "$burst_bytes")
+  qos_args=(
+    --qos-bandwidth "${soft_rate_mib}MiB/s"
+    --qos-burst-bytes "$burst_bytes"
+    --qos-iops "$iops_limit"
+  )
   if [[ "$profile" == "iops" ]]; then
-    qos_args+=(--qos-iops "$iops_limit")
     if ((hard_iops_limit > iops_limit)); then
       qos_args+=(
         --qos-hard-iops "$hard_iops_limit"
