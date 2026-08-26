@@ -14,6 +14,10 @@ identifier and call `cleanup-run.sh` from an `always()` step.
 
 Management traffic uses `10.131.9.0/20`. Test data uses `10.10.1.0/24`.
 Credentials are provisioned on the self-hosted runner and must not be committed.
+The runner must resolve the canonical Kerberos HDFS hostnames to their lab
+management/data addresses. `health-check.sh` verifies the NameNode and both
+DataNode mappings (plus the second NameNode when HA is configured) before any
+long-running test starts.
 
 `run-hdfs-smoke.sh <run-id>` exercises the HDFS dependency and backend contract.
 For a Kerberized cluster, `LAB_HDFS_LOCATION` contains the percent-encoded
@@ -90,10 +94,18 @@ slow backend therefore fails as inconclusive instead of producing a false QoS
 pass. It then copies a `16 MiB + 137 byte` fixture at 8 MiB/s with a 64 KiB
 burst, checks the hard wall-clock lower bound, independently verifies the copy,
 and requires the reported source payload bytes to equal the file size exactly.
+Set `QOS_LAB_PROFILE=iops` for protocol-operation shaping and
+`QOS_LAB_IOPS_MODE=soft-hard` for dual-rate IOPS. Nightly and release validation
+run strict bandwidth, soft/hard bandwidth, strict IOPS, and soft/hard IOPS as
+four separate gates and upload their measurement CSV files.
 For Local/NFS/HDFS, source IOPS must equal the number of burst-sized real reads.
 For S3 it must equal the number of 5 MiB Range GETs, proving that pacing slices
 inside one response do not inflate request IOPS. The CSV preserves baseline and
-limited measurements for diagnosing lab drift.
+limited measurements for diagnosing lab drift. The default strict case has
+soft and hard rates both set to 8 MiB/s. Set `QOS_LAB_SOFT_RATE_MIB`,
+`QOS_LAB_HARD_RATE_MIB`, and `QOS_LAB_PEAK_DURATION_MS` to exercise a dual-rate
+soft-credit scenario; for example `8`, `12`, and `500` derive a 2 MiB credit
+capacity.
 
 `run-hdfs-memory-e2e.sh` is the bounded-memory acceptance gate. It generates
 fully written deterministic `256 MiB + 137 byte` and `2 GiB + 137 byte`

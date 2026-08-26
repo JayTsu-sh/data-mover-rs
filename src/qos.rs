@@ -1,5 +1,4 @@
 // 标准库
-use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -15,23 +14,39 @@ use tracing::debug;
 // 内部模块
 use crate::error::{Result, StorageError};
 
-/// Governor 内部的 `RateLimiter` 类型别名
-type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
-
-/// 带宽 limiter（cell 大小按配置速率自适应）
-type BandwidthLimiter = DirectRateLimiter;
-/// IOPS limiter（1 cell = 1 op）
-type IopsLimiter = DirectRateLimiter;
-
 const PEAK_SHAPING_WINDOW: Duration = Duration::from_millis(10);
+type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 #[derive(Debug)]
 struct BandwidthController {
-    sustained: BandwidthLimiter,
-    cell_bytes: u64,
-    burst_cells: u32,
+    soft_bytes_per_second: u64,
+    hard_bytes_per_second: u64,
+    credit_capacity_bytes: u64,
     max_io_bytes: u64,
-    peak_bytes_per_second: u64,
+    state: tokio::sync::Mutex<BandwidthState>,
+}
+
+#[derive(Debug)]
+struct BandwidthState {
+    credit_bytes: f64,
+    credit_updated_at: tokio::time::Instant,
+    last_soft_release_at: tokio::time::Instant,
+    last_release_at: tokio::time::Instant,
+}
+
+#[derive(Debug)]
+struct IopsController {
+    soft_iops: u32,
+    credit_capacity: f64,
+    hard_limiter: DirectRateLimiter,
+    state: tokio::sync::Mutex<IopsState>,
+}
+
+#[derive(Debug)]
+struct IopsState {
+    credit: f64,
+    credit_updated_at: tokio::time::Instant,
+    last_soft_release_at: tokio::time::Instant,
 }
 
 /// `QoS` 统计信息，使用原子计数器避免锁竞争
@@ -90,122 +105,119 @@ impl QosStats {
 pub struct QosConfig {
     /// 带宽限制字符串（如 "200MiB/s"）
     pub bandwidth: Option<String>,
+    /// 硬带宽上限字符串。
+    pub hard_bandwidth: Option<String>,
     /// 硬峰值速率倍数
     pub peak_rate: f32,
-    /// sustained token bucket 容量，也是非零时的单次源端 IO 上限
+    /// 兼容字段：旧构造入口提供的 burst/source IO 参数。
     pub burst_bytes: Option<u64>,
+    /// 满信用时允许维持硬峰值的时间。
+    pub peak_duration: Option<Duration>,
+    /// 由 `(hard - soft) × peak_duration` 推导出的软信用容量。
+    pub credit_capacity_bytes: Option<u64>,
+    /// 单次非流式源端 IO 的额外上限；实际 grant 还受硬整形量子约束。
+    pub max_io_bytes: Option<u64>,
     /// IOPS 限制
     pub iops: Option<u32>,
+    /// IOPS 硬峰值限制。
+    pub hard_iops: Option<u32>,
+    /// 满信用时允许维持硬 IOPS 峰值的时间。
+    pub iops_peak_duration: Option<Duration>,
+    /// `(hard_iops - soft_iops) × peak_duration` 推导出的操作信用容量。
+    pub iops_credit_capacity: Option<f64>,
 }
 
 /// `QoS` 管理器
 ///
-/// 封装带宽和 IOPS 两个 Governor `RateLimiter`，支持 `ArcSwap` 热更新。
+/// 封装软 Token Bucket、硬 Leaky Bucket 和 IOPS limiter，支持 `ArcSwap` 热更新。
 /// `Clone + Send + Sync`，可直接 clone 传递，无需外层 Mutex。
 #[derive(Clone, Debug)]
 pub struct QosManager {
     bandwidth_limiter: Option<Arc<ArcSwap<BandwidthController>>>,
-    iops_limiter: Option<Arc<ArcSwap<IopsLimiter>>>,
-    peak_next_at: Arc<tokio::sync::Mutex<tokio::time::Instant>>,
+    iops_limiter: Option<Arc<ArcSwap<IopsController>>>,
     stats: Arc<QosStats>,
     config: Arc<ArcSwap<QosConfig>>,
 }
 
-/// 将字节数按 limiter 的自适应粒度转换为 cells，最小为 1。
-fn bytes_to_cells(bytes: u64, cell_bytes: u64) -> NonZeroU32 {
-    let cells = u32::try_from(bytes.div_ceil(cell_bytes).max(1)).unwrap_or(u32::MAX);
-    // cells 至少为 1，NonZeroU32::new 不会返回 None
-    NonZeroU32::new(cells).unwrap_or(NonZeroU32::MIN)
-}
-
-/// 构建持续带宽 token bucket + 硬峰值 pacer。
+/// 构建软 Token Bucket + 硬 Leaky Bucket。
 const MIN_PEAK_RATE_BPS: u64 = 2 * 1024 * 1024; // 2MB/s
+const DEFAULT_PEAK_DURATION: Duration = Duration::from_secs(1);
 
 /// 用基准速率 + 显式 burst（字节数）构建一个 governor `BandwidthLimiter`。
 ///
 /// 这是带宽 limiter 的"内核"——`build_bandwidth_limiter` 通过 `peak_rate`
 /// 算出 burst 后调本函数，`build_bandwidth_limiter_with_burst` 直接传 burst。
 fn build_bandwidth_limiter_inner(
-    base_rate_bps: u64,
-    peak_rate: f32,
-    burst_bytes: u64,
+    soft_rate_bps: u64,
+    hard_rate_bps: u64,
+    peak_duration: Duration,
+    max_io_bytes: u64,
 ) -> Result<BandwidthController> {
-    if burst_bytes == 0 {
+    if max_io_bytes == 0 {
         return Err(StorageError::ConfigError(
-            "burst_bytes 必须大于 0".to_string(),
+            "max_io_bytes 必须大于 0".to_string(),
         ));
     }
-    if burst_bytes < MIN_PEAK_RATE_BPS {
+    if soft_rate_bps == 0 || hard_rate_bps == 0 {
+        return Err(StorageError::ConfigError(
+            "软、硬带宽必须大于 0".to_string(),
+        ));
+    }
+    if hard_rate_bps < soft_rate_bps {
+        return Err(StorageError::ConfigError(
+            "硬带宽不能小于软带宽".to_string(),
+        ));
+    }
+    if max_io_bytes < MIN_PEAK_RATE_BPS {
         debug!(
-            "[QoS] burst 容量较小 ({burst_bytes} B)，对于大于 burst 的单次 IO 会被分批限流；\
+            "[QoS] 单次 IO 上限较小 ({max_io_bytes} B)，大请求会被分批整形；\
              如这是有意为之（严格平均速率），可忽略。"
         );
     }
-
-    // 常规速率使用 1 byte/cell；仅当速率超过 governor 的 u32 cell 上限时
-    // 扩大 cell，避免极小 burst 被固定 1 KiB 粒度严重过度计费。
-    let cell_bytes = base_rate_bps
-        .max(burst_bytes)
-        .div_ceil(u64::from(u32::MAX))
-        .max(1);
-    let cells_per_sec = base_rate_bps.div_ceil(cell_bytes).max(1);
-    let rate =
-        NonZeroU32::new(u32::try_from(cells_per_sec).map_err(|_| {
-            StorageError::ConfigError("带宽速率超过 limiter 支持的范围".to_string())
-        })?)
-        .ok_or_else(|| {
-            StorageError::ConfigError("带宽速率过小，换算后为0 cells/sec".to_string())
-        })?;
-
-    // burst 容量（cells）
-    let burst_cells = burst_bytes.div_ceil(cell_bytes).max(1);
-    let burst_cells_u32 = u32::try_from(burst_cells)
-        .map_err(|_| StorageError::ConfigError("burst 超过 limiter 支持的范围".to_string()))?;
-    let burst = NonZeroU32::new(burst_cells_u32)
-        .ok_or_else(|| StorageError::ConfigError("burst 过小，换算后为 0 cells".to_string()))?;
-
-    debug!(
-        "[QoS] 带宽限制: base={}B/s ({}cells/s), burst={}B ({}cells)",
-        base_rate_bps, cells_per_sec, burst_bytes, burst_cells
-    );
-
-    let peak_bytes_per_second = checked_rounded_u64(
-        base_rate_bps
-            .to_f64()
-            .ok_or_else(|| StorageError::ConfigError("带宽速率无法转换为浮点数".to_string()))?
-            * f64::from(peak_rate),
-        "peak bandwidth",
-    )?;
-    if peak_bytes_per_second == 0 {
-        return Err(StorageError::ConfigError(
-            "peak bandwidth 必须大于 0".to_string(),
-        ));
-    }
     let peak_quantum = u64::try_from(
-        u128::from(peak_bytes_per_second)
+        u128::from(hard_rate_bps)
             .saturating_mul(PEAK_SHAPING_WINDOW.as_nanos())
             .div_ceil(1_000_000_000),
     )
     .unwrap_or(u64::MAX)
     .max(1);
-    let max_io_bytes = peak_quantum.min(burst_bytes);
-    let sustained = RateLimiter::direct(Quota::per_second(rate).allow_burst(burst));
+    let max_io_bytes = peak_quantum.min(max_io_bytes);
+    let credit_capacity_bytes = u64::try_from(
+        u128::from(hard_rate_bps - soft_rate_bps)
+            .saturating_mul(peak_duration.as_nanos())
+            .div_ceil(1_000_000_000),
+    )
+    .map_err(|_| StorageError::ConfigError("软带宽信用容量超过 u64 范围".to_string()))?;
+    let now = tokio::time::Instant::now();
     Ok(BandwidthController {
-        sustained,
-        cell_bytes,
-        burst_cells: burst_cells_u32,
+        soft_bytes_per_second: soft_rate_bps,
+        hard_bytes_per_second: hard_rate_bps,
+        credit_capacity_bytes,
         max_io_bytes,
-        peak_bytes_per_second,
+        state: tokio::sync::Mutex::new(BandwidthState {
+            credit_bytes: 0.0,
+            credit_updated_at: now,
+            last_soft_release_at: now,
+            last_release_at: now,
+        }),
     })
 }
 
 fn build_bandwidth_limiter(bandwidth_str: &str, peak_rate: f32) -> Result<BandwidthController> {
     let base_rate_bps = parse_bandwidth_string(bandwidth_str)?;
-    let base_rate = base_rate_bps
-        .to_f64()
-        .ok_or_else(|| StorageError::ConfigError("带宽速率无法转换为浮点数".to_string()))?;
-    let burst_bytes = checked_rounded_u64(base_rate * f64::from(peak_rate), "burst")?;
-    build_bandwidth_limiter_inner(base_rate_bps, peak_rate, burst_bytes)
+    let hard_rate_bps = checked_rounded_u64(
+        base_rate_bps
+            .to_f64()
+            .ok_or_else(|| StorageError::ConfigError("带宽速率无法转换为浮点数".to_string()))?
+            * f64::from(peak_rate),
+        "hard bandwidth",
+    )?;
+    build_bandwidth_limiter_inner(
+        base_rate_bps,
+        hard_rate_bps,
+        DEFAULT_PEAK_DURATION,
+        hard_rate_bps,
+    )
 }
 
 fn checked_rounded_u64(value: f64, field: &str) -> Result<u64> {
@@ -228,35 +240,53 @@ fn build_bandwidth_limiter_with_burst(
     burst_bytes: u64,
 ) -> Result<BandwidthController> {
     let base_rate_bps = parse_bandwidth_string(bandwidth_str)?;
-    build_bandwidth_limiter_inner(base_rate_bps, 1.0, burst_bytes)
+    build_bandwidth_limiter_inner(base_rate_bps, base_rate_bps, Duration::ZERO, burst_bytes)
 }
 
-/// 构建 IOPS limiter（1 cell = 1 op）
-fn build_iops_limiter(iops: u32) -> Result<IopsLimiter> {
-    let rate = NonZeroU32::new(iops)
-        .ok_or_else(|| StorageError::ConfigError("IOPS 值必须大于 0".to_string()))?;
-
-    // 硬 IOPS 上限不预留多操作 burst；所有 clone 共享同一个 limiter。
-    let burst_ops = 1;
-    let burst = NonZeroU32::new(burst_ops)
+fn build_iops_limiter(
+    soft_iops: u32,
+    hard_iops: u32,
+    peak_duration: Duration,
+) -> Result<IopsController> {
+    if soft_iops == 0 || hard_iops == 0 {
+        return Err(StorageError::ConfigError(
+            "软、硬 IOPS 必须大于 0".to_string(),
+        ));
+    }
+    if hard_iops < soft_iops {
+        return Err(StorageError::ConfigError(
+            "硬 IOPS 不能小于软 IOPS".to_string(),
+        ));
+    }
+    let credit_capacity = f64::from(hard_iops - soft_iops) * peak_duration.as_secs_f64();
+    if !credit_capacity.is_finite() {
+        return Err(StorageError::ConfigError(
+            "IOPS 信用容量超过支持范围".to_string(),
+        ));
+    }
+    let now = tokio::time::Instant::now();
+    let hard_rate = std::num::NonZeroU32::new(hard_iops)
+        .ok_or_else(|| StorageError::ConfigError("硬 IOPS 必须大于 0".to_string()))?;
+    let hard_burst = std::num::NonZeroU32::new(1)
         .ok_or_else(|| StorageError::ConfigError("IOPS burst 计算异常".to_string()))?;
-
-    debug!(
-        "[QoS] IOPS 限制: rate={} ops/s, burst={} ops",
-        iops, burst_ops
-    );
-
-    let quota = Quota::per_second(rate).allow_burst(burst);
-    Ok(RateLimiter::direct(quota))
+    Ok(IopsController {
+        soft_iops,
+        credit_capacity,
+        hard_limiter: RateLimiter::direct(Quota::per_second(hard_rate).allow_burst(hard_burst)),
+        state: tokio::sync::Mutex::new(IopsState {
+            credit: 0.0,
+            credit_updated_at: now,
+            last_soft_release_at: now,
+        }),
+    })
 }
 
 impl QosManager {
     /// 创建新的 `QoS` 管理器（基于 `peak_rate` 倍数）
     ///
     /// - `bandwidth`: 带宽限制字符串，如 "200MiB/s"，None 则不限速
-    /// - `peak_rate`: 相对基准速率的硬峰值倍数。持续 token bucket 容量为
-    ///   `base_rate × peak_rate × 1秒`，但实际源端 IO 仍按 10 ms 量子以
-    ///   `base_rate × peak_rate` pacing，不允许初始 bucket 造成瞬时穿透。
+    /// - `peak_rate`: 相对软带宽的硬峰值倍数。软信用按一秒峰值持续时间推导，
+    ///   初始为零；实际源端 IO 按 10 ms 硬漏桶量子 pacing。
     /// - `iops`: IOPS 限制，None 则不限制
     ///
     /// # Errors
@@ -273,7 +303,7 @@ impl QosManager {
 
         let iops_limiter = match iops {
             Some(iops_val) if iops_val > 0 => {
-                let limiter = build_iops_limiter(iops_val)?;
+                let limiter = build_iops_limiter(iops_val, iops_val, Duration::ZERO)?;
                 Some(Arc::new(ArcSwap::from_pointee(limiter)))
             }
             _ => None,
@@ -285,15 +315,32 @@ impl QosManager {
         });
         let config = QosConfig {
             bandwidth: bandwidth.map(std::string::ToString::to_string),
+            hard_bandwidth: bandwidth.and_then(|bw| {
+                let base = parse_bandwidth_string(bw).ok()?.to_f64()?;
+                checked_rounded_u64(base * f64::from(peak_rate), "hard bandwidth")
+                    .ok()
+                    .map(|rate| format!("{rate}B/s"))
+            }),
             peak_rate,
             burst_bytes: configured_burst,
+            peak_duration: bandwidth.map(|_| DEFAULT_PEAK_DURATION),
+            credit_capacity_bytes: bandwidth.and_then(|bw| {
+                let soft = parse_bandwidth_string(bw).ok()?;
+                let hard =
+                    checked_rounded_u64(soft.to_f64()? * f64::from(peak_rate), "hard bandwidth")
+                        .ok()?;
+                Some(hard.saturating_sub(soft))
+            }),
+            max_io_bytes: configured_burst,
             iops,
+            hard_iops: iops,
+            iops_peak_duration: iops.map(|_| Duration::ZERO),
+            iops_credit_capacity: iops.map(|_| 0.0),
         };
 
         Ok(Self {
             bandwidth_limiter,
             iops_limiter,
-            peak_next_at: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
             stats: Arc::new(QosStats::new()),
             config: Arc::new(ArcSwap::from_pointee(config)),
         })
@@ -307,8 +354,8 @@ impl QosManager {
     /// - 自动测试需要可预测的 wall-clock 行为
     ///
     /// - `bandwidth`: 带宽限制字符串，如 "200MiB/s"
-    /// - `burst_bytes`: token bucket 容量，同时作为单次源端 IO 上限。
-    ///   小于 storage chunk 时自动拆分；必须大于 0。
+    /// - `burst_bytes`: 兼容名称，表示单次源端 IO 上限。软、硬速率相等，
+    ///   因此不产生软突发信用；小于 storage chunk 时自动拆分；必须大于 0。
     /// - `iops`: IOPS 限制，None 则不限制
     ///
     /// # 示例
@@ -332,7 +379,7 @@ impl QosManager {
 
         let iops_limiter = match iops {
             Some(iops_val) if iops_val > 0 => {
-                let l = build_iops_limiter(iops_val)?;
+                let l = build_iops_limiter(iops_val, iops_val, Duration::ZERO)?;
                 Some(Arc::new(ArcSwap::from_pointee(l)))
             }
             _ => None,
@@ -340,17 +387,149 @@ impl QosManager {
 
         let config = QosConfig {
             bandwidth: Some(bandwidth.to_string()),
+            hard_bandwidth: Some(bandwidth.to_string()),
             peak_rate: 1.0,
             burst_bytes: Some(burst_bytes),
+            peak_duration: Some(Duration::ZERO),
+            credit_capacity_bytes: Some(0),
+            max_io_bytes: Some(burst_bytes),
             iops,
+            hard_iops: iops,
+            iops_peak_duration: iops.map(|_| Duration::ZERO),
+            iops_credit_capacity: iops.map(|_| 0.0),
         };
 
         Ok(Self {
             bandwidth_limiter,
             iops_limiter,
-            peak_next_at: Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now())),
             stats: Arc::new(QosStats::new()),
             config: Arc::new(ArcSwap::from_pointee(config)),
+        })
+    }
+
+    /// 创建软平均带宽 + 硬峰值带宽的双层整形器。
+    ///
+    /// 软信用容量自动按 `(hard - soft) × peak_duration` 推导；初始信用为 0。
+    /// `max_io_bytes` 是协议请求上限，实际 grant 还会被 10 ms 硬整形量子截断。
+    ///
+    /// # Errors
+    ///
+    /// 软、硬带宽格式无效、硬带宽小于软带宽、最大 IO 为零或推导容量溢出时返回错误。
+    pub fn try_new_with_limits(
+        soft_bandwidth: &str,
+        hard_bandwidth: &str,
+        peak_duration: Duration,
+        max_io_bytes: u64,
+        iops: Option<u32>,
+    ) -> Result<Self> {
+        let soft_rate = parse_bandwidth_string(soft_bandwidth)?;
+        let hard_rate = parse_bandwidth_string(hard_bandwidth)?;
+        let limiter =
+            build_bandwidth_limiter_inner(soft_rate, hard_rate, peak_duration, max_io_bytes)?;
+        let credit_capacity = limiter.credit_capacity_bytes;
+        let peak_rate = hard_rate
+            .to_f32()
+            .ok_or_else(|| StorageError::ConfigError("硬带宽无法转换为浮点数".to_string()))?
+            / soft_rate
+                .to_f32()
+                .ok_or_else(|| StorageError::ConfigError("软带宽无法转换为浮点数".to_string()))?;
+        let iops_limiter =
+            match iops {
+                Some(value) if value > 0 => Some(Arc::new(ArcSwap::from_pointee(
+                    build_iops_limiter(value, value, Duration::ZERO)?,
+                ))),
+                _ => None,
+            };
+        Ok(Self {
+            bandwidth_limiter: Some(Arc::new(ArcSwap::from_pointee(limiter))),
+            iops_limiter,
+            stats: Arc::new(QosStats::new()),
+            config: Arc::new(ArcSwap::from_pointee(QosConfig {
+                bandwidth: Some(soft_bandwidth.to_string()),
+                hard_bandwidth: Some(hard_bandwidth.to_string()),
+                peak_rate,
+                burst_bytes: Some(credit_capacity),
+                peak_duration: Some(peak_duration),
+                credit_capacity_bytes: Some(credit_capacity),
+                max_io_bytes: Some(max_io_bytes),
+                iops,
+                hard_iops: iops,
+                iops_peak_duration: iops.map(|_| Duration::ZERO),
+                iops_credit_capacity: iops.map(|_| 0.0),
+            })),
+        })
+    }
+
+    /// 创建带宽和 IOPS 都具有软持续速率、硬峰值及峰值持续时间的整形器。
+    ///
+    /// # Errors
+    ///
+    /// 任一速率为零、硬限制小于软限制、带宽格式无效或最大 IO 为零时返回错误。
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_full_limits(
+        soft_bandwidth: &str,
+        hard_bandwidth: &str,
+        bandwidth_peak_duration: Duration,
+        max_io_bytes: u64,
+        soft_iops: Option<u32>,
+        hard_iops: Option<u32>,
+        iops_peak_duration: Duration,
+    ) -> Result<Self> {
+        if soft_iops.is_none() != hard_iops.is_none() {
+            return Err(StorageError::ConfigError(
+                "软、硬 IOPS 必须同时配置".to_string(),
+            ));
+        }
+        let mut manager = Self::try_new_with_limits(
+            soft_bandwidth,
+            hard_bandwidth,
+            bandwidth_peak_duration,
+            max_io_bytes,
+            None,
+        )?;
+        if let (Some(soft), Some(hard)) = (soft_iops, hard_iops) {
+            let limiter = build_iops_limiter(soft, hard, iops_peak_duration)?;
+            let credit_capacity = limiter.credit_capacity;
+            manager.iops_limiter = Some(Arc::new(ArcSwap::from_pointee(limiter)));
+            let mut config = (**manager.config.load()).clone();
+            config.iops = Some(soft);
+            config.hard_iops = Some(hard);
+            config.iops_peak_duration = Some(iops_peak_duration);
+            config.iops_credit_capacity = Some(credit_capacity);
+            manager.config.store(Arc::new(config));
+        }
+        Ok(manager)
+    }
+
+    /// 创建仅包含软持续 IOPS 和硬峰值 IOPS 的双层漏桶整形器。
+    ///
+    /// # Errors
+    ///
+    /// 任一速率为零或硬 IOPS 小于软 IOPS 时返回错误。
+    pub fn try_new_with_iops_limits(
+        soft_iops: u32,
+        hard_iops: u32,
+        peak_duration: Duration,
+    ) -> Result<Self> {
+        let limiter = build_iops_limiter(soft_iops, hard_iops, peak_duration)?;
+        let credit_capacity = limiter.credit_capacity;
+        Ok(Self {
+            bandwidth_limiter: None,
+            iops_limiter: Some(Arc::new(ArcSwap::from_pointee(limiter))),
+            stats: Arc::new(QosStats::new()),
+            config: Arc::new(ArcSwap::from_pointee(QosConfig {
+                bandwidth: None,
+                hard_bandwidth: None,
+                peak_rate: 1.0,
+                burst_bytes: None,
+                peak_duration: None,
+                credit_capacity_bytes: None,
+                max_io_bytes: None,
+                iops: Some(soft_iops),
+                hard_iops: Some(hard_iops),
+                iops_peak_duration: Some(peak_duration),
+                iops_credit_capacity: Some(credit_capacity),
+            })),
         })
     }
 
@@ -381,32 +560,61 @@ impl QosManager {
         }
         let controller = bw.load_full();
         let granted = requested_bytes.min(controller.max_io_bytes);
-        let mut remaining_cells = bytes_to_cells(granted, controller.cell_bytes).get();
-        while remaining_cells > 0 {
-            let batch = remaining_cells.min(controller.burst_cells);
-            if let Some(cells) = NonZeroU32::new(batch) {
-                controller
-                    .sustained
-                    .until_n_ready(cells)
-                    .await
-                    .unwrap_or_else(|_| unreachable!("batch is bounded by limiter burst"));
-            }
-            remaining_cells -= batch;
-        }
-
-        let nanos = u128::from(granted)
+        let hard_nanos = u128::from(granted)
             .saturating_mul(1_000_000_000)
-            .div_ceil(u128::from(controller.peak_bytes_per_second));
-        let pacing = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
-        let deadline = {
-            let mut next_at = self.peak_next_at.lock().await;
-            let now = tokio::time::Instant::now();
-            let start = (*next_at).max(now);
-            let deadline = start + pacing;
-            *next_at = deadline;
-            deadline
+            .div_ceil(u128::from(controller.hard_bytes_per_second));
+        let hard_interval = Duration::from_nanos(u64::try_from(hard_nanos).unwrap_or(u64::MAX));
+        let mut state = controller.state.lock().await;
+        let now = tokio::time::Instant::now();
+
+        let elapsed = now.saturating_duration_since(state.credit_updated_at);
+        let soft_rate = controller
+            .soft_bytes_per_second
+            .to_f64()
+            .unwrap_or(f64::MAX);
+        let credit_capacity = controller
+            .credit_capacity_bytes
+            .to_f64()
+            .unwrap_or(f64::MAX);
+        let granted_f64 = granted.to_f64().unwrap_or(f64::MAX);
+        let refilled = elapsed.as_secs_f64() * soft_rate;
+        state.credit_bytes = (state.credit_bytes + refilled).min(credit_capacity);
+        state.credit_updated_at = now;
+
+        let soft_deadline = if controller.credit_capacity_bytes == 0 {
+            let nanos = u128::from(granted)
+                .saturating_mul(1_000_000_000)
+                .div_ceil(u128::from(controller.soft_bytes_per_second));
+            let interval = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
+            let nominal = state.last_soft_release_at + interval;
+            if now <= nominal {
+                nominal
+            } else {
+                now + interval
+            }
+        } else if state.credit_bytes >= granted_f64 {
+            state.credit_bytes -= granted_f64;
+            now
+        } else {
+            let deficit = granted_f64 - state.credit_bytes;
+            state.credit_bytes = 0.0;
+            now + Duration::from_secs_f64(deficit / soft_rate)
         };
+
+        let nominal_hard_deadline = state.last_release_at + hard_interval;
+        let hard_deadline = if now <= nominal_hard_deadline {
+            nominal_hard_deadline
+        } else {
+            now + hard_interval
+        };
+        let deadline = soft_deadline.max(hard_deadline);
+        state.credit_updated_at = soft_deadline;
+        if controller.credit_capacity_bytes == 0 {
+            state.last_soft_release_at = deadline;
+        }
+        state.last_release_at = deadline;
         tokio::time::sleep_until(deadline).await;
+        drop(state);
         self.stats.total_bytes.fetch_add(granted, Ordering::Relaxed);
         granted
     }
@@ -425,10 +633,37 @@ impl QosManager {
     /// 获取 IOPS 限流（每个 IO 操作前调用）
     pub async fn acquire_iops(&self) {
         if let Some(iops) = &self.iops_limiter {
-            let limiter = iops.load();
-            limiter.until_ready().await;
+            let controller = iops.load_full();
+            let mut state = controller.state.lock().await;
+            let now = tokio::time::Instant::now();
+            let elapsed = now.saturating_duration_since(state.credit_updated_at);
+            state.credit = (state.credit + elapsed.as_secs_f64() * f64::from(controller.soft_iops))
+                .min(controller.credit_capacity);
+            state.credit_updated_at = now;
 
-            // 更新统计
+            let soft_deadline = if controller.credit_capacity == 0.0 {
+                let interval = Duration::from_secs_f64(1.0 / f64::from(controller.soft_iops));
+                let nominal = state.last_soft_release_at + interval;
+                if now <= nominal {
+                    nominal
+                } else {
+                    now + interval
+                }
+            } else if state.credit >= 1.0 {
+                state.credit -= 1.0;
+                now
+            } else {
+                let deficit = 1.0 - state.credit;
+                state.credit = 0.0;
+                now + Duration::from_secs_f64(deficit / f64::from(controller.soft_iops))
+            };
+            state.credit_updated_at = soft_deadline;
+            if controller.credit_capacity == 0.0 {
+                state.last_soft_release_at = soft_deadline;
+            }
+            tokio::time::sleep_until(soft_deadline).await;
+            drop(state);
+            controller.hard_limiter.until_ready().await;
             self.stats.total_iops.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -456,12 +691,17 @@ impl QosManager {
         new_config.bandwidth = Some(new_rate.to_string());
         new_config.peak_rate = peak_rate;
         let base = parse_bandwidth_string(new_rate)?;
-        new_config.burst_bytes = Some(checked_rounded_u64(
+        let hard = checked_rounded_u64(
             base.to_f64()
                 .ok_or_else(|| StorageError::ConfigError("带宽速率无法转换为浮点数".to_string()))?
                 * f64::from(peak_rate),
-            "burst",
-        )?);
+            "hard bandwidth",
+        )?;
+        new_config.hard_bandwidth = Some(format!("{hard}B/s"));
+        new_config.burst_bytes = Some(hard);
+        new_config.peak_duration = Some(DEFAULT_PEAK_DURATION);
+        new_config.credit_capacity_bytes = Some(hard.saturating_sub(base));
+        new_config.max_io_bytes = Some(hard);
         self.config.store(Arc::new(new_config));
         Ok(())
     }
@@ -472,13 +712,16 @@ impl QosManager {
     ///
     /// Returns an error when the requested storage operation cannot be completed.
     pub fn update_iops(&self, new_iops: u32) -> Result<()> {
-        let new_limiter = build_iops_limiter(new_iops)?;
+        let new_limiter = build_iops_limiter(new_iops, new_iops, Duration::ZERO)?;
         if let Some(iops) = &self.iops_limiter {
             iops.store(Arc::new(new_limiter));
         }
         // 更新配置快照
         let mut new_config = (**self.config.load()).clone();
         new_config.iops = Some(new_iops);
+        new_config.hard_iops = Some(new_iops);
+        new_config.iops_peak_duration = Some(Duration::ZERO);
+        new_config.iops_credit_capacity = Some(0.0);
         self.config.store(Arc::new(new_config));
         Ok(())
     }
@@ -632,15 +875,6 @@ mod tests {
         assert!(parse_bandwidth_string("-1MiB/s").is_err());
         assert!(parse_bandwidth_string("NaNMiB/s").is_err());
         assert!(parse_bandwidth_string("infMiB/s").is_err());
-    }
-
-    #[test]
-    fn test_bytes_to_cells() {
-        assert_eq!(bytes_to_cells(0, 1).get(), 1);
-        assert_eq!(bytes_to_cells(1, 1).get(), 1);
-        assert_eq!(bytes_to_cells(1024, 1).get(), 1024);
-        assert_eq!(bytes_to_cells(1025, 1024).get(), 2);
-        assert_eq!(bytes_to_cells(2 * 1024 * 1024, 1024).get(), 2048);
     }
 
     #[tokio::test]
@@ -854,6 +1088,110 @@ mod tests {
         assert!(matches!(result, Err(StorageError::ConfigError(_))));
     }
 
+    #[test]
+    fn explicit_soft_hard_limits_derive_credit_capacity() {
+        let qos = QosManager::try_new_with_limits(
+            "100MiB/s",
+            "150MiB/s",
+            Duration::from_millis(500),
+            2 * 1024 * 1024,
+            None,
+        )
+        .assert_value("create dual-rate qos");
+
+        let config = qos.config();
+        assert_eq!(config.bandwidth.as_deref(), Some("100MiB/s"));
+        assert_eq!(config.hard_bandwidth.as_deref(), Some("150MiB/s"));
+        assert_eq!(config.peak_duration, Some(Duration::from_millis(500)));
+        assert_eq!(config.credit_capacity_bytes, Some(25 * 1024 * 1024));
+        assert_eq!(config.max_io_bytes, Some(2 * 1024 * 1024));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_leaky_bucket_splits_large_chunks_at_the_shaping_quantum() {
+        let qos = QosManager::try_new_with_limits(
+            "100MiB/s",
+            "150MiB/s",
+            Duration::from_millis(500),
+            8 * 1024 * 1024,
+            None,
+        )
+        .assert_value("create dual-rate qos");
+
+        // 150 MiB/s × 10 ms = 1.5 MiB. Initial credit is zero, so the first
+        // grant is governed by the 100 MiB/s soft rate and takes 15 ms.
+        let started = tokio::time::Instant::now();
+        let granted = qos.acquire_bandwidth_grant(8 * 1024 * 1024).await;
+        assert_eq!(granted, 1536 * 1024);
+        assert_eq!(started.elapsed(), Duration::from_millis(15));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_time_accumulates_soft_credit_but_never_bypasses_the_hard_rate() {
+        let qos = QosManager::try_new_with_limits(
+            "100MiB/s",
+            "150MiB/s",
+            Duration::from_millis(500),
+            8 * 1024 * 1024,
+            None,
+        )
+        .assert_value("create dual-rate qos");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            qos.acquire_bandwidth_grant(8 * 1024 * 1024).await,
+            1536 * 1024
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(10),
+            "full soft credit may reach, but never bypass, the 150 MiB/s hard schedule"
+        );
+    }
+
+    #[test]
+    fn dual_rate_qos_rejects_inverted_rates_and_zero_io_size() {
+        assert!(
+            QosManager::try_new_with_limits(
+                "150MiB/s",
+                "100MiB/s",
+                Duration::from_millis(500),
+                1024,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            QosManager::try_new_with_limits(
+                "100MiB/s",
+                "150MiB/s",
+                Duration::from_millis(500),
+                0,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leaky_bucket_absorbs_protocol_latency_before_the_next_slot() {
+        let qos = QosManager::try_new_with_burst("1MiB/s", 4 * 1024, None)
+            .assert_value("create strict qos");
+        let started = tokio::time::Instant::now();
+
+        assert_eq!(qos.acquire_bandwidth_grant(4 * 1024).await, 4 * 1024);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(qos.acquire_bandwidth_grant(4 * 1024).await, 4 * 1024);
+
+        // Two 4 KiB releases at 1 MiB/s occupy 7.8125 ms in total. The 1 ms
+        // protocol delay fits inside that schedule and must not be added again.
+        assert!(
+            started.elapsed() <= Duration::from_millis(8),
+            "the 1 ms protocol delay must fit inside the two release slots"
+        );
+    }
+
     #[tokio::test]
     async fn iops_limit_has_no_multi_operation_initial_burst() {
         let qos = QosManager::try_new(None, 1.0, Some(100)).assert_value("create IOPS qos");
@@ -886,6 +1224,40 @@ mod tests {
             started.elapsed() >= Duration::from_millis(25),
             "four shared operations at 100 IOPS must span about 30 ms"
         );
+    }
+
+    #[tokio::test]
+    async fn soft_iops_credit_bursts_only_up_to_the_governor_hard_limit() {
+        let qos = QosManager::try_new_with_iops_limits(20, 100, Duration::from_millis(100))
+            .assert_value("create dual-rate IOPS qos");
+
+        // Initial credit is zero, so the first operation is paced by soft IOPS.
+        let cold_started = Instant::now();
+        qos.acquire_iops().await;
+        assert!(cold_started.elapsed() >= Duration::from_millis(45));
+
+        // Idle time fills at most eight operation credits. Those operations
+        // must still traverse governor's 100 IOPS hard leaky bucket.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let burst_started = Instant::now();
+        for _ in 0..8 {
+            qos.acquire_iops().await;
+        }
+        let burst_elapsed = burst_started.elapsed();
+        assert!(burst_elapsed >= Duration::from_millis(65));
+        assert!(burst_elapsed < Duration::from_millis(180));
+
+        // Once credit is consumed, the schedule returns to the 20 IOPS soft rate.
+        let sustained_started = Instant::now();
+        for _ in 0..4 {
+            qos.acquire_iops().await;
+        }
+        assert!(sustained_started.elapsed() >= Duration::from_millis(120));
+    }
+
+    #[test]
+    fn dual_iops_rejects_hard_rate_below_soft_rate() {
+        assert!(QosManager::try_new_with_iops_limits(101, 100, Duration::from_secs(1)).is_err());
     }
 
     /// 非法配置（带宽串解析失败）应当返回错误。

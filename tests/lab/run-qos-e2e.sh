@@ -9,8 +9,19 @@ validate_run_id "$run_id"
 # Keep these values deliberately small enough for a nightly gate, while making
 # the payload span multiple storage chunks and the burst smaller than every
 # backend's normal source-read chunk.
-rate_mib=8
-rate_bytes=$((rate_mib * 1024 * 1024))
+soft_rate_mib="${QOS_LAB_SOFT_RATE_MIB:-8}"
+hard_rate_mib="${QOS_LAB_HARD_RATE_MIB:-$soft_rate_mib}"
+peak_duration_ms="${QOS_LAB_PEAK_DURATION_MS:-500}"
+profile="${QOS_LAB_PROFILE:-bandwidth}"
+iops_mode="${QOS_LAB_IOPS_MODE:-strict}"
+[[ "$profile" == "bandwidth" || "$profile" == "iops" ]]
+[[ "$iops_mode" == "strict" || "$iops_mode" == "soft-hard" ]]
+[[ "$soft_rate_mib" =~ ^[1-9][0-9]*$ ]]
+[[ "$hard_rate_mib" =~ ^[1-9][0-9]*$ ]]
+[[ "$peak_duration_ms" =~ ^[0-9]+$ ]]
+((hard_rate_mib >= soft_rate_mib))
+soft_rate_bytes=$((soft_rate_mib * 1024 * 1024))
+hard_rate_bytes=$((hard_rate_mib * 1024 * 1024))
 burst_bytes=$((64 * 1024))
 iops_limit=10000
 size=$((16 * 1024 * 1024 + 137))
@@ -18,7 +29,7 @@ size=$((16 * 1024 * 1024 + 137))
 if [[ "${2:-}" == "--contract-only" ]]; then
   [[ "$burst_bytes" -lt $((2 * 1024 * 1024)) ]]
   [[ "$size" -gt $((3 * 5 * 1024 * 1024)) ]]
-  echo "QoS lab contract verified: 5 source backends, sub-chunk burst, multi-range payload"
+  echo "QoS lab contract verified: bandwidth and IOPS profiles, 5 source backends, sub-chunk burst, multi-range payload"
   exit 0
 fi
 
@@ -115,7 +126,7 @@ for backend in "${backends[@]}"; do
 done
 
 printf '%s\n' \
-  'source,bytes,baseline_seconds,baseline_mibps,qos_seconds,qos_mibps,qos_total_bytes,qos_total_iops,expected_iops' \
+  'profile,source,soft_mibps,hard_mibps,bandwidth_peak_duration_ms,soft_iops,hard_iops,iops_peak_duration_ms,bytes,baseline_seconds,baseline_mibps,baseline_iops,qos_seconds,qos_mibps,qos_total_bytes,qos_total_iops,qos_actual_iops,expected_iops' \
   > "$output"
 
 for backend in "${backends[@]}"; do
@@ -137,19 +148,75 @@ for backend in "${backends[@]}"; do
   baseline_mibps="$(awk -v bytes="$size" -v elapsed="$baseline_seconds" \
     'BEGIN { printf "%.6f", bytes / 1048576 / elapsed }')"
 
-  # A slow source can satisfy a wall-clock upper bound without QoS doing any
-  # work. Treat that environment as inconclusive instead of a false pass.
-  awk -v measured="$baseline_mibps" -v configured="$rate_mib" \
-    'BEGIN { exit !(measured >= configured * 1.25) }' || {
-      echo "$backend baseline ${baseline_mibps} MiB/s is too slow to validate ${rate_mib} MiB/s QoS" >&2
-      exit 1
-    }
+  if [[ "$backend" == "s3" ]]; then
+    expected_iops=$(((size + 5 * 1024 * 1024 - 1) / (5 * 1024 * 1024)))
+  else
+    expected_iops=$(((size + burst_bytes - 1) / burst_bytes))
+  fi
+  baseline_iops="$(awk -v operations="$expected_iops" -v elapsed="$baseline_seconds" \
+    'BEGIN { printf "%.6f", operations / elapsed }')"
 
+  if [[ "$profile" == "iops" ]]; then
+    # The high bandwidth ceiling keeps bandwidth shaping out of the critical
+    # path. The small request cap gives stream/file backends enough protocol
+    # operations to measure; S3 deliberately retains its natural 5 MiB GETs.
+    soft_rate_mib=256
+    hard_rate_mib=256
+    peak_duration_ms=0
+    if [[ "$backend" == "s3" ]]; then
+      iops_limit=2
+    else
+      iops_limit=128
+    fi
+    hard_iops_limit="$iops_limit"
+    iops_peak_duration_ms=0
+    if [[ "$iops_mode" == "soft-hard" ]]; then
+      hard_iops_limit=$((iops_limit * 2))
+      iops_peak_duration_ms=500
+    fi
+  else
+    iops_limit=10000
+    hard_iops_limit="$iops_limit"
+    iops_peak_duration_ms=0
+  fi
+  soft_rate_bytes=$((soft_rate_mib * 1024 * 1024))
+  hard_rate_bytes=$((hard_rate_mib * 1024 * 1024))
+
+  # A slow source can satisfy a QoS wall-clock bound without the limiter doing
+  # any work. Treat that environment as inconclusive instead of a false pass.
+  if [[ "$profile" == "bandwidth" ]]; then
+    awk -v measured="$baseline_mibps" -v configured="$hard_rate_mib" \
+      'BEGIN { exit !(measured >= configured * 1.25) }' || {
+        echo "$backend baseline ${baseline_mibps} MiB/s is too slow to validate ${hard_rate_mib} MiB/s hard QoS" >&2
+        exit 1
+      }
+  else
+    awk -v measured="$baseline_iops" -v configured="$iops_limit" \
+      'BEGIN { exit !(measured >= configured * 1.25) }' || {
+        echo "$backend baseline ${baseline_iops} IOPS is too slow to validate ${iops_limit} IOPS QoS" >&2
+        exit 1
+      }
+  fi
+
+  qos_args=(--qos-bandwidth "${soft_rate_mib}MiB/s" --qos-burst-bytes "$burst_bytes")
+  if [[ "$profile" == "iops" ]]; then
+    qos_args+=(--qos-iops "$iops_limit")
+    if ((hard_iops_limit > iops_limit)); then
+      qos_args+=(
+        --qos-hard-iops "$hard_iops_limit"
+        --qos-iops-peak-duration-ms "$iops_peak_duration_ms"
+      )
+    fi
+  elif ((hard_rate_mib > soft_rate_mib)); then
+    qos_args+=(
+      --qos-hard-bandwidth "${hard_rate_mib}MiB/s"
+      --qos-peak-duration-ms "$peak_duration_ms"
+    )
+  fi
   if ! /usr/bin/time -o "$qos_metrics" -f '%e' \
     "$binary" --source "$(storage_url source "$backend")" \
       --destination "$(storage_url destination local)" --path "$key" \
-      --qos-bandwidth "${rate_mib}MiB/s" \
-      --qos-burst-bytes "$burst_bytes" --qos-iops "$iops_limit" \
+      "${qos_args[@]}" \
       >"$qos_log" 2>&1; then
     echo "$backend QoS copy failed" >&2
     cat "$qos_log" >&2
@@ -162,12 +229,6 @@ for backend in "${backends[@]}"; do
   qos_mibps="$(awk -v bytes="$size" -v elapsed="$qos_seconds" \
     'BEGIN { printf "%.6f", bytes / 1048576 / elapsed }')"
   destination_hash="$(sha256sum "$local_root/destination/$key" | cut -d' ' -f1)"
-
-  if [[ "$backend" == "s3" ]]; then
-    expected_iops=$(((size + 5 * 1024 * 1024 - 1) / (5 * 1024 * 1024)))
-  else
-    expected_iops=$(((size + burst_bytes - 1) / burst_bytes))
-  fi
 
   [[ "$qos_total_bytes" == "$size" ]] || {
     echo "$backend source byte count mismatch: expected $size, got $qos_total_bytes" >&2
@@ -182,21 +243,37 @@ for backend in "${backends[@]}"; do
     cat "$qos_log" >&2
     exit 1
   }
-  # External elapsed time includes setup and destination verification, so it
-  # may be slower but must never imply throughput above the hard source limit.
-  awk -v elapsed="$qos_seconds" -v bytes="$size" -v rate="$rate_bytes" \
-    'BEGIN { minimum = bytes / rate; exit !(elapsed + 0.02 >= minimum) }'
-  awk -v elapsed="$qos_seconds" -v bytes="$size" -v rate="$rate_bytes" \
-    'BEGIN { expected = bytes / rate; exit !(elapsed <= expected * 3 + 5) }' || {
-      echo "$backend QoS run was unexpectedly slow (${qos_seconds}s)" >&2
-      exit 1
-    }
+  qos_actual_iops="$(awk -v operations="$qos_total_iops" -v elapsed="$qos_seconds" \
+    'BEGIN { printf "%.6f", operations / elapsed }')"
+  if [[ "$profile" == "bandwidth" ]]; then
+    # External elapsed time includes setup and destination verification, so it
+    # may be slower but must never imply throughput above the hard source limit.
+    awk -v elapsed="$qos_seconds" -v bytes="$size" -v rate="$hard_rate_bytes" \
+      'BEGIN { minimum = bytes / rate; exit !(elapsed + 0.02 >= minimum) }'
+    awk -v elapsed="$qos_seconds" -v bytes="$size" -v rate="$soft_rate_bytes" \
+      'BEGIN { expected = bytes / rate; exit !(elapsed <= expected * 3 + 5) }' || {
+        echo "$backend bandwidth QoS run was unexpectedly slow (${qos_seconds}s)" >&2
+        exit 1
+      }
+  else
+    # The first operation is immediately available; every later protocol
+    # operation occupies one strict IOPS schedule slot.
+    awk -v elapsed="$qos_seconds" -v operations="$qos_total_iops" -v rate="$hard_iops_limit" \
+      'BEGIN { minimum = (operations - 1) / rate; exit !(elapsed + 0.02 >= minimum) }'
+    awk -v elapsed="$qos_seconds" -v operations="$qos_total_iops" -v rate="$iops_limit" \
+      'BEGIN { expected = (operations - 1) / rate; exit !(elapsed <= expected * 3 + 5) }' || {
+        echo "$backend IOPS QoS run was unexpectedly slow (${qos_seconds}s)" >&2
+        exit 1
+      }
+  fi
 
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-    "$backend" "$size" "$baseline_seconds" "$baseline_mibps" \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$profile" "$backend" "$soft_rate_mib" "$hard_rate_mib" "$peak_duration_ms" \
+    "$iops_limit" "$hard_iops_limit" "$iops_peak_duration_ms" "$size" \
+    "$baseline_seconds" "$baseline_mibps" "$baseline_iops" \
     "$qos_seconds" "$qos_mibps" "$qos_total_bytes" "$qos_total_iops" \
-    "$expected_iops" | tee -a "$output"
+    "$qos_actual_iops" "$expected_iops" | tee -a "$output"
   rm -f "$baseline_metrics" "$baseline_log" "$qos_metrics" "$qos_log"
 done
 
-echo "real-backend source QoS verified; measurements: $output"
+echo "real-backend source $profile QoS verified; measurements: $output"

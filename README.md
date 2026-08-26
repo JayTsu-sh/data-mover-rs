@@ -71,22 +71,51 @@ same bytes again. Consequently, copying 1 GiB consumes 1 GiB of bandwidth
 quota rather than 2 GiB.
 
 ```rust,ignore
-// Sustained 8 MiB/s, hard peak 16 MiB/s.
-let qos = QosManager::try_new(Some("8MiB/s"), 2.0, Some(500))?;
+// Soft average 100 MiB/s, hard peak 150 MiB/s. After 500 ms idle the
+// derived credit capacity is (150 - 100) × 0.5 = 25 MiB.
+let qos = QosManager::try_new_with_limits(
+    "100MiB/s",
+    "150MiB/s",
+    std::time::Duration::from_millis(500),
+    2 * 1024 * 1024,
+    Some(500),
+)?;
 
-// Sustained and hard peak 8 MiB/s, with a 1 MiB token bucket / source IO cap.
+// Compatibility shorthand: soft and hard are both 8 MiB/s, with a 1 MiB
+// source request cap. There is no soft burst credit in this strict form.
 let strict = QosManager::try_new_with_burst("8MiB/s", 1024 * 1024, Some(500))?;
 ```
 
-`peak_rate` is a hard peak multiplier over the configured sustained bandwidth.
-Peak traffic is paced in 10 ms quanta, so a full initial token bucket cannot
-make a small file pass instantaneously. `burst_bytes` must be greater than zero.
-When a non-streaming source request is larger than the burst or peak quantum,
-the source adapter splits it before issuing the storage read.
+The soft limit is a Token Bucket refill rate. It controls long-term average
+bandwidth and permits idle capacity to be used later. The hard limit is a Leaky
+Bucket schedule with no accumulated hard credit and no catch-up after a missed
+slot. Soft credit starts at zero and is capped at
+`(hard - soft) × peak_duration`; every soft permit must still pass through the
+hard schedule. `hard < soft` and a zero maximum IO size are invalid.
+
+Hard traffic is shaped in 10 ms quanta. The actual non-streaming source request
+is `min(remaining chunk, hard rate × 10 ms, max_io_bytes)`, rounded up to at
+least one byte. A large storage chunk is therefore split before the real source
+read. The packetized guarantee is that a measured interval cannot exceed
+`hard_rate × interval` by more than one shaping quantum; application IO cannot
+provide a meaningful zero-byte tolerance at an arbitrarily small time scale.
+
+`try_new(bandwidth, peak_rate, iops)` remains as a compatibility shorthand. It
+uses `bandwidth` as the soft rate, `bandwidth × peak_rate` as the hard rate and
+a one-second peak duration. New callers should prefer
+`try_new_with_limits` because its soft rate, hard rate and peak duration are
+explicit.
 
 Bandwidth permits and IOPS permits represent different resources. Bandwidth is
 charged for payload slices; IOPS is charged once for each real source protocol
 request. All clones of one `QosManager` share the same schedules and counters.
+IOPS uses the same dual-rate model as bandwidth: soft IOPS accumulates bounded
+idle credit, while every operation must pass through a governor GCRA hard
+leaky bucket with a one-operation burst. `--qos-iops` alone remains a strict
+single-rate shorthand. Add `--qos-hard-iops` and
+`--qos-iops-peak-duration-ms` to configure the sustained and peak rates
+explicitly; soft credit starts at zero and is capped at
+`(hard_iops - soft_iops) × peak_duration`.
 
 | Source backend | Bandwidth pacing | IOPS accounting |
 |----------------|------------------|-----------------|
