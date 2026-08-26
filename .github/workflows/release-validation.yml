@@ -66,13 +66,28 @@ jobs:
           DATA_MOVER_READ_INFLIGHT: "8"
           DATA_MOVER_WRITE_INFLIGHT: "16"
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-resume-e2e.sh "$RUN_ID"
-      - name: Real-backend source QoS E2E
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-qos-e2e.sh "$RUN_ID" qos-e2e.csv
+      - name: Real-backend strict bandwidth QoS E2E
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-qos-e2e.sh "$RUN_ID" qos-bandwidth-strict.csv
+      - name: Real-backend soft and hard bandwidth QoS E2E
+        env:
+          QOS_LAB_SOFT_RATE_MIB: "8"
+          QOS_LAB_HARD_RATE_MIB: "12"
+          QOS_LAB_PEAK_DURATION_MS: "500"
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-qos-e2e.sh "$RUN_ID" qos-bandwidth-soft-hard.csv
+      - name: Real-backend strict IOPS QoS E2E
+        env:
+          QOS_LAB_PROFILE: iops
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-qos-e2e.sh "$RUN_ID" qos-iops-strict.csv
+      - name: Real-backend soft and hard IOPS QoS E2E
+        env:
+          QOS_LAB_PROFILE: iops
+          QOS_LAB_IOPS_MODE: soft-hard
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-qos-e2e.sh "$RUN_ID" qos-iops-soft-hard.csv
       - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: qos-e2e-release-${{ github.run_id }}
-          path: qos-e2e.csv
+          path: qos-*.csv
       - name: HDFS multi-GiB bounded-memory gate
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-memory-e2e.sh "$RUN_ID" hdfs-memory.csv
       - name: HDFS service fault recovery

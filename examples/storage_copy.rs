@@ -59,6 +59,39 @@ mod tests {
     }
 
     #[test]
+    fn qos_cli_accepts_soft_hard_limits_and_peak_duration() {
+        let args = Args::try_parse_from([
+            "storage_copy",
+            "--source",
+            "/source",
+            "--destination",
+            "/destination",
+            "--path",
+            "payload.bin",
+            "--qos-bandwidth",
+            "100MiB/s",
+            "--qos-hard-bandwidth",
+            "150MiB/s",
+            "--qos-peak-duration-ms",
+            "500",
+            "--qos-burst-bytes",
+            "2097152",
+            "--qos-iops",
+            "100",
+            "--qos-hard-iops",
+            "150",
+            "--qos-iops-peak-duration-ms",
+            "500",
+        ])
+        .expect("dual-rate QoS arguments should parse");
+
+        assert_eq!(args.qos_hard_bandwidth.as_deref(), Some("150MiB/s"));
+        assert_eq!(args.qos_peak_duration_ms, Some(500));
+        assert_eq!(args.qos_hard_iops, Some(150));
+        assert_eq!(args.qos_iops_peak_duration_ms, Some(500));
+    }
+
+    #[test]
     fn qos_burst_requires_bandwidth() {
         let error = Args::try_parse_from([
             "storage_copy",
@@ -161,6 +194,14 @@ struct Args {
     #[arg(long)]
     qos_bandwidth: Option<String>,
 
+    /// Hard source-side peak bandwidth; requires `--qos-bandwidth`.
+    #[arg(long, requires = "qos_bandwidth")]
+    qos_hard_bandwidth: Option<String>,
+
+    /// Duration that a full soft-credit bucket may sustain the hard peak.
+    #[arg(long, requires = "qos_hard_bandwidth")]
+    qos_peak_duration_ms: Option<u64>,
+
     /// Hard source-read burst/request cap in bytes; requires `--qos-bandwidth`.
     #[arg(long, requires = "qos_bandwidth")]
     qos_burst_bytes: Option<u64>,
@@ -168,20 +209,70 @@ struct Args {
     /// Hard source-side protocol operation limit in operations per second.
     #[arg(long)]
     qos_iops: Option<u32>,
+
+    /// Hard source-side peak IOPS; requires the sustained `--qos-iops` rate.
+    #[arg(long, requires = "qos_iops")]
+    qos_hard_iops: Option<u32>,
+
+    /// Duration that a full soft-IOPS credit bucket may sustain the hard peak.
+    #[arg(long, requires = "qos_hard_iops")]
+    qos_iops_peak_duration_ms: Option<u64>,
+}
+
+fn qos_from_args(args: &Args) -> Result<Option<data_mover::QosManager>> {
+    if let (Some(soft_iops), Some(hard_iops)) = (args.qos_iops, args.qos_hard_iops) {
+        let iops_peak =
+            std::time::Duration::from_millis(args.qos_iops_peak_duration_ms.unwrap_or(500));
+        if let Some(soft_bandwidth) = &args.qos_bandwidth {
+            let hard_bandwidth = args.qos_hard_bandwidth.as_deref().unwrap_or(soft_bandwidth);
+            let bandwidth_peak = if args.qos_hard_bandwidth.is_some() {
+                std::time::Duration::from_millis(args.qos_peak_duration_ms.unwrap_or(500))
+            } else {
+                std::time::Duration::ZERO
+            };
+            return Ok(Some(data_mover::QosManager::try_new_with_full_limits(
+                soft_bandwidth,
+                hard_bandwidth,
+                bandwidth_peak,
+                args.qos_burst_bytes.unwrap_or(u64::MAX),
+                Some(soft_iops),
+                Some(hard_iops),
+                iops_peak,
+            )?));
+        }
+        return Ok(Some(data_mover::QosManager::try_new_with_iops_limits(
+            soft_iops, hard_iops, iops_peak,
+        )?));
+    }
+    match (
+        &args.qos_bandwidth,
+        &args.qos_hard_bandwidth,
+        args.qos_burst_bytes,
+        args.qos_iops,
+    ) {
+        (Some(soft), Some(hard), max_io_bytes, iops) => {
+            Ok(Some(data_mover::QosManager::try_new_with_limits(
+                soft,
+                hard,
+                std::time::Duration::from_millis(args.qos_peak_duration_ms.unwrap_or(500)),
+                max_io_bytes.unwrap_or(u64::MAX),
+                iops,
+            )?))
+        }
+        (Some(bandwidth), None, Some(burst_bytes), iops) => Ok(Some(
+            data_mover::QosManager::try_new_with_burst(bandwidth, burst_bytes, iops)?,
+        )),
+        (bandwidth, None, None, iops) if bandwidth.is_some() || iops.is_some() => Ok(Some(
+            data_mover::QosManager::try_new(bandwidth.as_deref(), 1.0, iops)?,
+        )),
+        _ => Ok(None),
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let qos = match (&args.qos_bandwidth, args.qos_burst_bytes, args.qos_iops) {
-        (Some(bandwidth), Some(burst_bytes), iops) => Some(
-            data_mover::QosManager::try_new_with_burst(bandwidth, burst_bytes, iops)?,
-        ),
-        (bandwidth, None, iops) if bandwidth.is_some() || iops.is_some() => Some(
-            data_mover::QosManager::try_new(bandwidth.as_deref(), 1.0, iops)?,
-        ),
-        _ => None,
-    };
+    let qos = qos_from_args(&args)?;
     let source = create_storage(&args.source, creation_options(&args.source, false)).await?;
     let destination =
         create_storage(&args.destination, creation_options(&args.destination, true)).await?;
