@@ -67,7 +67,7 @@ impl StorageEnum {
             cancel.as_ref(),
         )
         .await?;
-        Self::verify_hdfs_partial_integrity(
+        let integrity_matches = Self::hdfs_partial_integrity_matches(
             from,
             to,
             entry,
@@ -75,11 +75,50 @@ impl StorageEnum {
             enable_integrity_check,
         )
         .await?;
+        if !integrity_matches {
+            revalidate_recoverable_source(from, entry, &request, cancel.as_ref()).await?;
+            let _ = destination.delete_file(state.part_path()).await;
+            return Err(StorageError::OperationError(
+                "integrity check failed: source and HDFS partial hashes differ".to_string(),
+            ));
+        }
+        revalidate_recoverable_source(from, entry, &request, cancel.as_ref()).await?;
         ensure_not_cancelled(cancel.as_ref())?;
         destination
             .commit_prepared_tail(&state, request.final_path())
             .await?;
         Self::complete_copied_entry(from, to, entry, is_source_reserved).await
+    }
+}
+
+async fn revalidate_recoverable_source(
+    source: &StorageEnum,
+    entry: &EntryEnum,
+    request: &HdfsTransferRequest,
+    cancel: Option<&CancellationToken>,
+) -> Result<()> {
+    ensure_not_cancelled(cancel)?;
+    let current_source = source_metadata_for_revalidation(source, entry).await;
+    ensure_not_cancelled(cancel)?;
+    request.validate_source_fingerprint(&crate::hdfs_source_fingerprint(&current_source?))
+}
+
+async fn source_metadata_for_revalidation(
+    source: &StorageEnum,
+    entry: &EntryEnum,
+) -> Result<EntryEnum> {
+    match (source, entry) {
+        (StorageEnum::S3(storage), EntryEnum::S3(entry)) => {
+            let version_id = if entry.is_latest {
+                None
+            } else {
+                entry.version_id.as_deref()
+            };
+            storage
+                .get_metadata_version(&entry.relative_path, version_id)
+                .await
+        }
+        _ => source.get_metadata(entry.get_relative_path()).await,
     }
 }
 
@@ -151,10 +190,25 @@ fn ensure_not_cancelled(cancel: Option<&CancellationToken>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
     use crate::{CreateStorageOptions, HDFSEntry, create_storage};
+
+    static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn test_directory(name: &str) -> std::path::PathBuf {
+        let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "data-mover-hdfs-revalidation-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|error| panic!("create source root: {error}"));
+        path
+    }
 
     #[tokio::test]
     async fn explicit_hdfs_recoverable_copy_rejects_other_destinations() {
@@ -186,5 +240,69 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(StorageError::OperationError(_))));
+    }
+
+    #[tokio::test]
+    async fn source_revalidation_preserves_metadata_read_failure() {
+        let root = test_directory("metadata-failure");
+        let source_path = root.join("source.bin");
+        tokio::fs::write(&source_path, b"source")
+            .await
+            .unwrap_or_else(|error| panic!("write source: {error}"));
+        let source = create_storage(
+            root.to_str()
+                .unwrap_or_else(|| panic!("source root is not UTF-8")),
+            CreateStorageOptions::new(None, false),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("create source storage: {error}"));
+        let entry = source
+            .get_metadata(Path::new("source.bin"))
+            .await
+            .unwrap_or_else(|error| panic!("read source metadata: {error}"));
+        let request =
+            crate::hdfs_transfer_request(&entry, "transfer", Path::new("source.bin").into())
+                .unwrap_or_else(|error| panic!("create transfer request: {error}"));
+        tokio::fs::remove_file(source_path)
+            .await
+            .unwrap_or_else(|error| panic!("remove source: {error}"));
+
+        let result = revalidate_recoverable_source(&source, &entry, &request, None).await;
+
+        assert!(matches!(result, Err(StorageError::FileNotFound(_))));
+        std::fs::remove_dir_all(root).unwrap_or_else(|error| panic!("remove source root: {error}"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_precedes_source_metadata_read_failure() {
+        let root = test_directory("cancelled");
+        let source_path = root.join("source.bin");
+        tokio::fs::write(&source_path, b"source")
+            .await
+            .unwrap_or_else(|error| panic!("write source: {error}"));
+        let source = create_storage(
+            root.to_str()
+                .unwrap_or_else(|| panic!("source root is not UTF-8")),
+            CreateStorageOptions::new(None, false),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("create source storage: {error}"));
+        let entry = source
+            .get_metadata(Path::new("source.bin"))
+            .await
+            .unwrap_or_else(|error| panic!("read source metadata: {error}"));
+        let request =
+            crate::hdfs_transfer_request(&entry, "transfer", Path::new("source.bin").into())
+                .unwrap_or_else(|error| panic!("create transfer request: {error}"));
+        tokio::fs::remove_file(source_path)
+            .await
+            .unwrap_or_else(|error| panic!("remove source: {error}"));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = revalidate_recoverable_source(&source, &entry, &request, Some(&cancel)).await;
+
+        assert!(matches!(result, Err(StorageError::Cancelled)));
+        std::fs::remove_dir_all(root).unwrap_or_else(|error| panic!("remove source root: {error}"));
     }
 }

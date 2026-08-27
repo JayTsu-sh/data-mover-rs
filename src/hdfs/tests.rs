@@ -309,6 +309,53 @@ mod tests {
     }
 
     #[test]
+    fn stable_transfer_request_revalidates_the_bound_source_fingerprint() {
+        let baseline = super::HdfsSourceFingerprint::new(
+            16,
+            123,
+            Some(super::HdfsStableSourceFact::ObjectVersion("v1")),
+        );
+        let request = super::HdfsTransferRequest::new(
+            "transfer",
+            baseline.clone(),
+            std::path::PathBuf::from("file.bin"),
+            16,
+            0o644,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("valid stable HDFS transfer request was rejected: {error}"));
+
+        assert!(request.validate_source_fingerprint(&baseline).is_ok());
+        assert!(
+            request
+                .validate_source_fingerprint(&super::HdfsSourceFingerprint::new(
+                    17,
+                    123,
+                    Some(super::HdfsStableSourceFact::ObjectVersion("v1")),
+                ))
+                .is_err()
+        );
+        assert!(
+            request
+                .validate_source_fingerprint(&super::HdfsSourceFingerprint::new(
+                    16,
+                    124,
+                    Some(super::HdfsStableSourceFact::ObjectVersion("v1")),
+                ))
+                .is_err()
+        );
+        assert!(
+            request
+                .validate_source_fingerprint(&super::HdfsSourceFingerprint::new(
+                    16,
+                    123,
+                    Some(super::HdfsStableSourceFact::ObjectVersion("v2")),
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn staged_resume_modes_choose_the_expected_partial_action() {
         use super::HdfsPartialObservation::{Directory, File, Missing};
 

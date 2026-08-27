@@ -207,6 +207,25 @@ impl HdfsTransferRequest {
         self.expected_size
     }
 
+    /// Confirm that current source facts still match the source bound at prepare time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operation error when the source size, modification time, or
+    /// typed stable fact has changed.
+    pub fn validate_source_fingerprint(
+        &self,
+        current: &HdfsSourceFingerprint,
+    ) -> Result<(), StorageError> {
+        if self.source_fingerprint == *current {
+            Ok(())
+        } else {
+            Err(StorageError::OperationError(
+                "HDFS recoverable copy source changed after preparation".to_string(),
+            ))
+        }
+    }
+
     /// Return the requested HDFS permission bits.
     #[must_use]
     pub const fn mode(&self) -> u32 {

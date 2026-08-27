@@ -580,6 +580,67 @@ async fn assert_common_recoverable_hdfs_copy(
     Ok(())
 }
 
+async fn assert_changed_source_is_not_published(
+    destination: &StorageEnum,
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local_root = hdfs_lab_local_path("changed-source")?;
+    tokio::fs::create_dir_all(&local_root).await?;
+    let source_path = local_root.join("changed-source.bin");
+    tokio::fs::write(&source_path, b"original-source").await?;
+    let source = create_storage(
+        local_root.to_str().ok_or("invalid local lab path")?,
+        CreateStorageOptions::new(None, true),
+    )
+    .await?;
+    let entry = source
+        .get_metadata(std::path::Path::new("changed-source.bin"))
+        .await?;
+    let request = data_mover::hdfs_transfer_request(
+        &entry,
+        "nightly-changed-source",
+        entry.get_relative_path().to_path_buf(),
+    )?;
+    let callback_path = source_path.clone();
+    let callback: data_mover::CommitCallback = Arc::new(move |_, _| {
+        std::fs::write(&callback_path, b"changed-source-content")
+            .unwrap_or_else(|error| panic!("change source after HDFS append: {error}"));
+    });
+
+    let result = StorageEnum::copy_file_hdfs_recoverable(
+        &source,
+        destination,
+        &entry,
+        CopyOptions {
+            is_source_reserved: false,
+            ..Default::default()
+        },
+        data_mover::HdfsRecoverableCopyOptions::new("nightly-changed-source", callback),
+    )
+    .await;
+
+    let Err(error) = result else {
+        panic!("changed source was unexpectedly published");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("source changed after preparation")
+    );
+    assert!(source_path.exists());
+    assert_eq!(
+        hdfs.get_metadata(request.partial_path()).await?.size,
+        entry.get_size()
+    );
+    assert!(
+        hdfs.get_metadata(std::path::Path::new("changed-source.bin"))
+            .await
+            .is_err()
+    );
+    tokio::fs::remove_dir_all(local_root).await?;
+    Ok(())
+}
+
 async fn assert_hdfs_overwrite_rename(
     storage: &StorageEnum,
     hdfs: &data_mover::HDFSStorage,
@@ -1397,6 +1458,7 @@ async fn nightly_lab_prepares_persistent_hdfs_tail_resume_state()
     Box::pin(assert_hdfs_staged_resume_modes(hdfs, &entry)).await?;
     Box::pin(assert_zero_byte_staged_commit(hdfs)).await?;
     Box::pin(assert_common_recoverable_hdfs_copy(&storage, hdfs)).await?;
+    Box::pin(assert_changed_source_is_not_published(&storage, hdfs)).await?;
     hdfs.delete_storage_root().await?;
     Ok(())
 }

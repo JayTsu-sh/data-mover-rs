@@ -986,13 +986,7 @@ impl StorageEnum {
         part_path: &Path,
         enabled: bool,
     ) -> Result<()> {
-        if !enabled {
-            return Ok(());
-        }
-        let size = entry.get_size();
-        let source_hash = from.compute_hash(entry.get_relative_path(), size).await?;
-        let destination_hash = to.compute_hash(part_path, size).await?;
-        if source_hash == destination_hash {
+        if Self::hdfs_partial_integrity_matches(from, to, entry, part_path, enabled).await? {
             return Ok(());
         }
         if let StorageEnum::HDFS(destination) = to {
@@ -1001,6 +995,38 @@ impl StorageEnum {
         Err(StorageError::OperationError(
             "integrity check failed: source and HDFS partial hashes differ".to_string(),
         ))
+    }
+
+    pub(crate) async fn hdfs_partial_integrity_matches(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        part_path: &Path,
+        enabled: bool,
+    ) -> Result<bool> {
+        if !enabled {
+            return Ok(true);
+        }
+        let size = entry.get_size();
+        let source_hash = Self::compute_entry_hash(from, entry).await?;
+        let destination_hash = to.compute_hash(part_path, size).await?;
+        if source_hash == destination_hash {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn compute_entry_hash(storage: &StorageEnum, entry: &EntryEnum) -> Result<String> {
+        if entry.get_size() == 0 {
+            return Ok(String::new());
+        }
+        let (mut receiver, read_task) =
+            Self::read_chunk_stream(storage, entry, None, None, true, HASH_CHANNEL_CAPACITY);
+        while receiver.recv().await.is_some() {}
+        let hasher = read_task.await.map_err(|error| {
+            StorageError::OperationError(format!("hash task panicked: {error:?}"))
+        })??;
+        Ok(hasher.map(ConsistencyCheck::finalize).unwrap_or_default())
     }
 
     /// integrity 读回校验（issue #58）：hash 读回过程顺带核对读回字节数
@@ -1641,7 +1667,13 @@ impl StorageEnum {
                         .await
                         .map(|()| None),
                     (StorageEnum::S3(s), EntryEnum::S3(e)) => s
-                        .read_data_intervals(tx, &e.relative_path, &ivals, qos)
+                        .read_data_intervals_version(
+                            tx,
+                            &e.relative_path,
+                            e.version_id.as_deref(),
+                            &ivals,
+                            qos,
+                        )
                         .await
                         .map(|()| None),
                     (StorageEnum::HDFS(s), EntryEnum::HDFS(e)) => s
@@ -1668,8 +1700,15 @@ impl StorageEnum {
                             .await
                     }
                     (StorageEnum::S3(s), EntryEnum::S3(e)) => {
-                        s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
-                            .await
+                        s.read_data_version(
+                            tx,
+                            &e.relative_path,
+                            e.version_id.as_deref(),
+                            size,
+                            enable_integrity_check,
+                            qos,
+                        )
+                        .await
                     }
                     (StorageEnum::HDFS(s), EntryEnum::HDFS(e)) => {
                         s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
