@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -45,7 +45,6 @@ struct SequentialWriteContext<'a> {
     expected_size: u64,
     require_final_size: bool,
     bytes_counter: Option<&'a Arc<AtomicU64>>,
-    on_committed: Option<&'a crate::CommitCallback>,
 }
 pub(crate) enum AppendCompletion {
     Complete(u64),

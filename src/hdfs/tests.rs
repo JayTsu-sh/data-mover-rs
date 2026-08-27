@@ -25,6 +25,422 @@ mod tests {
         assert_eq!(super::DEFAULT_BLOCK_SIZE, 8 * crate::MB);
     }
 
+    #[test]
+    fn confirmed_append_range_reports_one_persisted_session() {
+        let Ok(confirmed) = super::confirmed_append_range(4, 16, 16) else {
+            panic!("confirmed append range failed");
+        };
+        assert_eq!(confirmed, Some((4, 12)));
+        let Ok(empty) = super::confirmed_append_range(16, 16, 16) else {
+            panic!("empty append range failed");
+        };
+        assert_eq!(empty, None);
+    }
+
+    #[test]
+    fn confirmed_append_range_rejects_unconfirmed_length() {
+        let result = super::confirmed_append_range(4, 16, 12);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn append_progress_requires_successful_write_and_persisted_length() {
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let callback_count = callbacks.clone();
+        let callback: crate::CommitCallback = Arc::new(move |_, _| {
+            callback_count.fetch_add(1, Ordering::Relaxed);
+        });
+        let close_failure = super::settle_append_progress(
+            4,
+            Err(StorageError::OperationError("close failed".to_string())),
+            None,
+            Some(&callback),
+        );
+        assert!(close_failure.is_err());
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+
+        let length_mismatch =
+            super::settle_append_progress(4, Ok(16), Some(12), Some(&callback));
+        assert!(length_mismatch.is_err());
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+
+        let confirmed = super::settle_append_progress(4, Ok(16), Some(16), Some(&callback));
+        assert_eq!(confirmed.ok(), Some(16));
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn prepared_tail_transfer_preserves_validated_state() {
+        let state = super::HdfsPreparedTransfer::new(
+            std::path::PathBuf::from("dir/file.part"),
+            4,
+            16,
+            16,
+            0o620,
+            Some(3),
+        );
+        let Ok(state) = state else {
+            panic!("valid HDFS prepared state was rejected");
+        };
+        assert_eq!(state.part_path(), std::path::Path::new("dir/file.part"));
+        assert_eq!(state.prefix_len(), 4);
+        assert_eq!(state.expected_size(), 16);
+        assert_eq!(state.mode(), 0o620);
+        assert_eq!(state.replication(), Some(3));
+    }
+
+    #[test]
+    fn prepared_tail_transfer_rejects_invalid_wire_state() {
+        assert!(
+            super::HdfsPreparedTransfer::new(
+                std::path::PathBuf::from("file.part"),
+                17,
+                16,
+                16,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            super::HdfsPreparedTransfer::new(
+                std::path::PathBuf::from("file.part"),
+                4,
+                16,
+                15,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            super::HdfsPreparedTransfer::new(
+                std::path::PathBuf::new(),
+                0,
+                16,
+                16,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            super::HdfsPreparedTransfer::new(
+                std::path::PathBuf::from("../file.part"),
+                0,
+                16,
+                16,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            super::HdfsPreparedTransfer::new(
+                std::path::PathBuf::from("/tmp/file.part"),
+                0,
+                16,
+                16,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn prepared_tail_transfer_rejects_a_stale_prefix() {
+        let state = super::HdfsPreparedTransfer::new(
+            std::path::PathBuf::from("file.part"),
+            4,
+            16,
+            16,
+            0o644,
+            None,
+        );
+        let Ok(state) = state else {
+            panic!("valid HDFS prepared state was rejected");
+        };
+        assert!(state.validate_current_prefix(4).is_ok());
+        assert!(state.validate_current_prefix(5).is_err());
+    }
+
+    #[test]
+    fn stable_transfer_request_derives_a_safe_deterministic_partial_path() {
+        let fingerprint = super::HdfsSourceFingerprint::new(
+            16,
+            1_725_000_000_123,
+            Some(super::HdfsStableSourceFact::ObjectVersion("v1")),
+        );
+        let request = super::HdfsTransferRequest::new(
+            "job/secret-transfer-42",
+            fingerprint,
+            std::path::PathBuf::from("目录/very-long-文件.bin"),
+            16,
+            0o620,
+            Some(3),
+        );
+        let Ok(request) = request else {
+            panic!("valid stable HDFS transfer request was rejected");
+        };
+        let first = request.partial_path();
+        let second = request.partial_path();
+        assert_eq!(first, second);
+        assert_eq!(first.parent(), Some(std::path::Path::new("目录")));
+        assert_eq!(
+            first,
+            std::path::Path::new("目录/.data-mover-214ae8b5607c29e15a68bdd77904a0e8.part")
+        );
+        let name = first.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        assert!(name.starts_with(".data-mover-"));
+        assert!(
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("part"))
+        );
+        assert!(!name.contains("secret-transfer"));
+        assert!(name.len() <= 255);
+
+        let changed_identity = super::HdfsTransferRequest::new(
+            "job/other-transfer",
+            super::HdfsSourceFingerprint::new(
+                16,
+                1_725_000_000_123,
+                Some(super::HdfsStableSourceFact::ObjectVersion("v1")),
+            ),
+            std::path::PathBuf::from("目录/very-long-文件.bin"),
+            16,
+            0o620,
+            Some(3),
+        )
+        .unwrap_or_else(|error| panic!("changed identity was rejected: {error}"));
+        let changed_source = super::HdfsTransferRequest::new(
+            "job/secret-transfer-42",
+            super::HdfsSourceFingerprint::new(
+                16,
+                1_725_000_000_124,
+                Some(super::HdfsStableSourceFact::ObjectVersion("v1")),
+            ),
+            std::path::PathBuf::from("目录/very-long-文件.bin"),
+            16,
+            0o620,
+            Some(3),
+        )
+        .unwrap_or_else(|error| panic!("changed source was rejected: {error}"));
+        assert_ne!(request.partial_path(), changed_identity.partial_path());
+        assert_ne!(request.partial_path(), changed_source.partial_path());
+    }
+
+    #[test]
+    fn stable_transfer_request_rejects_invalid_identity_path_and_size() {
+        let fingerprint = super::HdfsSourceFingerprint::new(16, 123, None);
+        for identity in ["", &"x".repeat(257)] {
+            assert!(
+                super::HdfsTransferRequest::new(
+                    identity,
+                    fingerprint.clone(),
+                    std::path::PathBuf::from("file.bin"),
+                    16,
+                    0o644,
+                    None,
+                )
+                .is_err()
+            );
+        }
+        let overlong_name = "x".repeat(256);
+        for path in ["", "/file.bin", "../file.bin", &overlong_name] {
+            assert!(
+                super::HdfsTransferRequest::new(
+                    "transfer",
+                    fingerprint.clone(),
+                    std::path::PathBuf::from(path),
+                    16,
+                    0o644,
+                    None,
+                )
+                .is_err()
+            );
+        }
+        let overlong_parent = format!("{overlong_name}/file.bin");
+        assert!(
+            super::HdfsTransferRequest::new(
+                "transfer",
+                fingerprint.clone(),
+                std::path::PathBuf::from(overlong_parent),
+                16,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            super::HdfsTransferRequest::new(
+                "transfer",
+                fingerprint,
+                std::path::PathBuf::from("file.bin"),
+                15,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn source_fingerprint_separates_absent_file_and_object_facts() {
+        let absent = super::HdfsSourceFingerprint::new(16, 123, None);
+        let empty_file = super::HdfsSourceFingerprint::new(
+            16,
+            123,
+            Some(super::HdfsStableSourceFact::FileIdentity(b"")),
+        );
+        let file = super::HdfsSourceFingerprint::new(
+            16,
+            123,
+            Some(super::HdfsStableSourceFact::FileIdentity(b"same")),
+        );
+        let object = super::HdfsSourceFingerprint::new(
+            16,
+            123,
+            Some(super::HdfsStableSourceFact::ObjectVersion("same")),
+        );
+        assert_ne!(absent, empty_file);
+        assert_ne!(file, object);
+    }
+
+    #[test]
+    fn stable_transfer_request_revalidates_the_bound_source_fingerprint() {
+        let baseline = super::HdfsSourceFingerprint::new(
+            16,
+            123,
+            Some(super::HdfsStableSourceFact::ObjectVersion("v1")),
+        );
+        let request = super::HdfsTransferRequest::new(
+            "transfer",
+            baseline.clone(),
+            std::path::PathBuf::from("file.bin"),
+            16,
+            0o644,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("valid stable HDFS transfer request was rejected: {error}"));
+
+        assert!(request.validate_source_fingerprint(&baseline).is_ok());
+        assert!(
+            request
+                .validate_source_fingerprint(&super::HdfsSourceFingerprint::new(
+                    17,
+                    123,
+                    Some(super::HdfsStableSourceFact::ObjectVersion("v1")),
+                ))
+                .is_err()
+        );
+        assert!(
+            request
+                .validate_source_fingerprint(&super::HdfsSourceFingerprint::new(
+                    16,
+                    124,
+                    Some(super::HdfsStableSourceFact::ObjectVersion("v1")),
+                ))
+                .is_err()
+        );
+        assert!(
+            request
+                .validate_source_fingerprint(&super::HdfsSourceFingerprint::new(
+                    16,
+                    123,
+                    Some(super::HdfsStableSourceFact::ObjectVersion("v2")),
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn staged_resume_modes_choose_the_expected_partial_action() {
+        use super::HdfsPartialObservation::{Directory, File, Missing};
+
+        assert_eq!(super::HdfsResumeMode::default(), super::HdfsResumeMode::Auto);
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Auto, Missing, 16),
+            Ok(super::HdfsPrepareAction::Rebuild)
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Auto, File(4), 16),
+            Ok(super::HdfsPrepareAction::Resume(4))
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Auto, File(0), 16),
+            Ok(super::HdfsPrepareAction::Resume(0))
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Auto, File(16), 16),
+            Ok(super::HdfsPrepareAction::Resume(16))
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Auto, File(17), 16),
+            Ok(super::HdfsPrepareAction::Rebuild)
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Restart, File(4), 16),
+            Ok(super::HdfsPrepareAction::Rebuild)
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Restart, Missing, 16),
+            Ok(super::HdfsPrepareAction::Rebuild)
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Restart, File(17), 16),
+            Ok(super::HdfsPrepareAction::Rebuild)
+        ));
+        assert!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Require, Missing, 16).is_err()
+        );
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Require, File(0), 16),
+            Ok(super::HdfsPrepareAction::Resume(0))
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Require, File(16), 16),
+            Ok(super::HdfsPrepareAction::Resume(16))
+        ));
+        assert!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Require, File(17), 16).is_err()
+        );
+        for mode in [
+            super::HdfsResumeMode::Auto,
+            super::HdfsResumeMode::Restart,
+            super::HdfsResumeMode::Require,
+        ] {
+            assert!(super::plan_staged_prepare(mode, Directory, 16).is_err());
+        }
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Auto, Missing, 0),
+            Ok(super::HdfsPrepareAction::Rebuild)
+        ));
+    }
+
+    #[test]
+    fn stable_prepared_state_keeps_source_and_destination_binding() {
+        let request = super::HdfsTransferRequest::new(
+            "transfer",
+            super::HdfsSourceFingerprint::new(16, 123, None),
+            std::path::PathBuf::from("final.bin"),
+            16,
+            0o600,
+            Some(2),
+        )
+        .unwrap_or_else(|error| panic!("valid request was rejected: {error}"));
+        let state = super::HdfsPreparedTransfer::from_stable_request(&request, 4)
+            .unwrap_or_else(|error| panic!("valid stable state was rejected: {error}"));
+        assert_eq!(state.part_path(), request.partial_path());
+        assert!(state.validate_final_path(request.final_path()).is_ok());
+        assert!(
+            state
+                .validate_final_path(std::path::Path::new("other.bin"))
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn adapter_retry_is_bounded_and_eventually_succeeds() {
         assert_eq!(super::HDFS_ADAPTER_MAX_ATTEMPTS, 5);

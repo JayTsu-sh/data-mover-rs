@@ -16,7 +16,7 @@ const HASH_CHANNEL_CAPACITY: usize = 4;
 /// 之间的解耦缓冲：容量 2 时写端一次落盘抖动即填满 channel、反压打空读端
 /// 流水线；4 可吸收单次抖动。内存上界 = 容量 × chunk 大小 × 并发文件数
 /// （NFS chunk ≤ 1MB；CIFS chunk 可达 8MB，增大容量时需关注）。
-const COPY_PIPELINE_CAPACITY: usize = 4;
+pub(crate) const COPY_PIPELINE_CAPACITY: usize = 4;
 /// TAR 打包 pipeline 的 channel 容量（多文件顺序读，适当放大缓冲）
 const TAR_PIPELINE_CAPACITY: usize = 16;
 static NEXT_HDFS_FRESH_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -47,15 +47,6 @@ fn hdfs_fresh_temp_path(final_path: &Path) -> Result<PathBuf> {
         std::process::id()
     );
     Ok(final_path.with_file_name(temp_name))
-}
-
-fn validate_hdfs_resume_handle(prefix_len: u64, expected_size: u64, entry_size: u64) -> Result<()> {
-    if expected_size != entry_size || prefix_len > expected_size {
-        return Err(StorageError::OperationError(format!(
-            "invalid HDFS resume handle: prefix={prefix_len}, expected={expected_size}, entry={entry_size}"
-        )));
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +115,7 @@ fn resolve_copy_pipeline<R, W>(read_result: Result<R>, write_result: Result<W>) 
     }
 }
 
-async fn await_copy_pipeline<R, W>(
+pub(crate) async fn await_copy_pipeline<R, W>(
     read_task: tokio::task::JoinHandle<Result<R>>,
     write_task: tokio::task::JoinHandle<Result<W>>,
     cancel: Option<&CancellationToken>,
@@ -160,7 +151,8 @@ use crate::checksum::{ConsistencyCheck, HashCalculator};
 use crate::cifs::{CifsStorage, create_cifs_storage};
 use crate::error::StorageError;
 use crate::filter::FilterExpression;
-use crate::hdfs::{HDFSStorage, HdfsConfig, create_hdfs_storage};
+use crate::hdfs::{HDFSStorage, HdfsConfig, HdfsPreparedTransfer, create_hdfs_storage};
+use crate::hdfs_transfer_mapping::hdfs_write_options;
 use crate::local::{LocalStorage, create_local_storage};
 use crate::nfs::{NFSStorage, create_nfs_storage};
 use crate::qos::QosManager;
@@ -242,6 +234,23 @@ pub enum StreamHandle {
         prefix_len: u64,
         expected_size: u64,
     },
+}
+
+fn hdfs_prepared_from_handle(
+    part_path: PathBuf,
+    prefix_len: u64,
+    expected_size: u64,
+    entry: &EntryEnum,
+) -> Result<HdfsPreparedTransfer> {
+    let (mode, replication) = hdfs_write_options(entry);
+    HdfsPreparedTransfer::new(
+        part_path,
+        prefix_len,
+        expected_size,
+        entry.get_size(),
+        mode,
+        replication,
+    )
 }
 
 impl StorageEnum {
@@ -950,11 +959,74 @@ impl StorageEnum {
     }
 
     /// Apply source metadata after the destination data has been committed.
-    async fn apply_copied_metadata(to: &StorageEnum, entry: &EntryEnum) -> Result<()> {
+    pub(crate) async fn apply_copied_metadata(to: &StorageEnum, entry: &EntryEnum) -> Result<()> {
         match to {
             StorageEnum::S3(_) => Ok(()),
             _ => to.set_entry_metadata(entry).await,
         }
+    }
+
+    pub(crate) async fn complete_copied_entry(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        is_source_reserved: bool,
+    ) -> Result<()> {
+        Self::apply_copied_metadata(to, entry).await?;
+        if !is_source_reserved {
+            from.delete_file(entry).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn verify_hdfs_partial_integrity(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        part_path: &Path,
+        enabled: bool,
+    ) -> Result<()> {
+        if Self::hdfs_partial_integrity_matches(from, to, entry, part_path, enabled).await? {
+            return Ok(());
+        }
+        if let StorageEnum::HDFS(destination) = to {
+            let _ = destination.delete_file(part_path).await;
+        }
+        Err(StorageError::OperationError(
+            "integrity check failed: source and HDFS partial hashes differ".to_string(),
+        ))
+    }
+
+    pub(crate) async fn hdfs_partial_integrity_matches(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        part_path: &Path,
+        enabled: bool,
+    ) -> Result<bool> {
+        if !enabled {
+            return Ok(true);
+        }
+        let size = entry.get_size();
+        let source_hash = Self::compute_entry_hash(from, entry).await?;
+        let destination_hash = to.compute_hash(part_path, size).await?;
+        if source_hash == destination_hash {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn compute_entry_hash(storage: &StorageEnum, entry: &EntryEnum) -> Result<String> {
+        if entry.get_size() == 0 {
+            return Ok(String::new());
+        }
+        let (mut receiver, read_task) =
+            Self::read_chunk_stream(storage, entry, None, None, true, HASH_CHANNEL_CAPACITY);
+        while receiver.recv().await.is_some() {}
+        let hasher = read_task.await.map_err(|error| {
+            StorageError::OperationError(format!("hash task panicked: {error:?}"))
+        })??;
+        Ok(hasher.map(ConsistencyCheck::finalize).unwrap_or_default())
     }
 
     /// integrity 读回校验（issue #58）：hash 读回过程顺带核对读回字节数
@@ -1124,11 +1196,7 @@ impl StorageEnum {
         } else if let Some(source_hash) = source_hash {
             Self::verify_dest_integrity(to, entry, size, &source_hash).await?;
         }
-        Self::apply_copied_metadata(to, entry).await?;
-        if !options.is_source_reserved {
-            from.delete_file(entry).await?;
-        }
-        Ok(())
+        Self::complete_copied_entry(from, to, entry, options.is_source_reserved).await
     }
 
     /// Copy a file with optional `QoS` rate limiting and integrity verification.
@@ -1401,14 +1469,17 @@ impl StorageEnum {
         let size = entry.get_size();
 
         if let StorageEnum::HDFS(storage) = dest {
-            let prefix_len = storage.prepare_tail_resume(part_path, size, resume).await?;
-            let missing = (prefix_len < size).then_some((prefix_len, size));
+            let (mode, replication) = hdfs_write_options(entry);
+            let state = storage
+                .prepare_tail_transfer(part_path, size, resume, mode, replication)
+                .await?;
+            let missing = (state.prefix_len() < size).then_some((state.prefix_len(), size));
             return Ok((
                 missing.into_iter().collect(),
                 StreamHandle::Hdfs {
-                    part_path: part_path.to_path_buf(),
-                    prefix_len,
-                    expected_size: size,
+                    part_path: state.part_path().to_path_buf(),
+                    prefix_len: state.prefix_len(),
+                    expected_size: state.expected_size(),
                 },
             ));
         }
@@ -1547,16 +1618,14 @@ impl StorageEnum {
                         "write_chunk_stream: HDFS handle requires an HDFS destination".to_string(),
                     ));
                 };
-                validate_hdfs_resume_handle(*prefix_len, *expected_size, entry.get_size())?;
+                let state = hdfs_prepared_from_handle(
+                    part_path.clone(),
+                    *prefix_len,
+                    *expected_size,
+                    entry,
+                )?;
                 storage
-                    .append_stream_with_progress(
-                        rx,
-                        part_path,
-                        *prefix_len,
-                        crate::hdfs::AppendCompletion::PartialUpTo(*expected_size),
-                        bytes_counter.as_ref(),
-                        Some(&on_committed),
-                    )
+                    .append_prepared_tail(rx, &state, bytes_counter.as_ref(), Some(&on_committed))
                     .await
                     .map(|_| ())
             }
@@ -1598,7 +1667,13 @@ impl StorageEnum {
                         .await
                         .map(|()| None),
                     (StorageEnum::S3(s), EntryEnum::S3(e)) => s
-                        .read_data_intervals(tx, &e.relative_path, &ivals, qos)
+                        .read_data_intervals_version(
+                            tx,
+                            &e.relative_path,
+                            e.version_id.as_deref(),
+                            &ivals,
+                            qos,
+                        )
                         .await
                         .map(|()| None),
                     (StorageEnum::HDFS(s), EntryEnum::HDFS(e)) => s
@@ -1625,8 +1700,15 @@ impl StorageEnum {
                             .await
                     }
                     (StorageEnum::S3(s), EntryEnum::S3(e)) => {
-                        s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
-                            .await
+                        s.read_data_version(
+                            tx,
+                            &e.relative_path,
+                            e.version_id.as_deref(),
+                            size,
+                            enable_integrity_check,
+                            qos,
+                        )
+                        .await
                     }
                     (StorageEnum::HDFS(s), EntryEnum::HDFS(e)) => {
                         s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
@@ -1688,14 +1770,14 @@ impl StorageEnum {
                         "commit_chunk_stream: HDFS handle requires an HDFS destination".to_string(),
                     ));
                 };
-                validate_hdfs_resume_handle(prefix_len, expected_size, entry.get_size())?;
+                let state = hdfs_prepared_from_handle(part_path, prefix_len, expected_size, entry)?;
                 if size != expected_size {
                     return Err(StorageError::OperationError(format!(
                         "HDFS resume commit size {size} does not match handle size {expected_size}"
                     )));
                 }
                 storage
-                    .commit_tail_resume(&part_path, entry.get_relative_path(), expected_size)
+                    .commit_prepared_tail(&state, entry.get_relative_path())
                     .await
             }
         }?;
@@ -1909,23 +1991,18 @@ impl StorageEnum {
         if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return Err(StorageError::Cancelled);
         }
-        if enable_integrity_check {
-            let source_hash = from.compute_hash(entry.get_relative_path(), size).await?;
-            let destination_hash = to.compute_hash(&part_relative_path, size).await?;
-            if source_hash != destination_hash {
-                if let StorageEnum::HDFS(storage) = to {
-                    let _ = storage.delete_file(&part_relative_path).await;
-                }
-                return Err(StorageError::OperationError(
-                    "integrity check failed: source and HDFS temporary hashes differ".to_string(),
-                ));
-            }
-        }
+        Self::verify_hdfs_partial_integrity(
+            from,
+            to,
+            entry,
+            &part_relative_path,
+            enable_integrity_check,
+        )
+        .await?;
         if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return Err(StorageError::Cancelled);
         }
         Self::commit_chunk_stream(to, entry, size, handle).await?;
-        Self::apply_copied_metadata(to, entry).await?;
         if !is_source_reserved {
             from.delete_file(entry).await?;
         }
@@ -3235,13 +3312,25 @@ mod tests {
         let decoded: StreamHandle =
             serde_json::from_slice(&encoded).assert_value("deserialize HDFS handle");
         assert_eq!(decoded, handle);
+
+        let legacy_fixture =
+            r#"{"Hdfs":{"part_path":"目录/文件.bin.part","prefix_len":123,"expected_size":456}}"#;
+        let decoded_fixture: StreamHandle = serde_json::from_slice(legacy_fixture.as_bytes())
+            .assert_value("deserialize legacy HDFS handle fixture");
+        assert_eq!(decoded_fixture, handle);
     }
 
     #[test]
     fn hdfs_resume_handle_rejects_impossible_prefix_or_entry_size() {
-        assert!(validate_hdfs_resume_handle(4, 16, 16).is_ok());
-        assert!(validate_hdfs_resume_handle(17, 16, 16).is_err());
-        assert!(validate_hdfs_resume_handle(4, 16, 15).is_err());
+        let mut entry = hdfs_entry("file.bin", false);
+        let EntryEnum::HDFS(hdfs) = &mut entry else {
+            panic!("expected HDFS entry");
+        };
+        hdfs.size = 16;
+
+        assert!(hdfs_prepared_from_handle(PathBuf::from("file.part"), 4, 16, &entry).is_ok());
+        assert!(hdfs_prepared_from_handle(PathBuf::from("file.part"), 17, 16, &entry).is_err());
+        assert!(hdfs_prepared_from_handle(PathBuf::from("file.part"), 4, 15, &entry).is_err());
     }
 
     #[tokio::test]

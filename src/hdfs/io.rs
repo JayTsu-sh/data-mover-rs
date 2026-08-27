@@ -202,7 +202,6 @@ impl HDFSStorage {
                     expected_size,
                     require_final_size: true,
                     bytes_counter: bytes_counter.as_ref(),
-                    on_committed: None,
                 },
             )
             .await;
@@ -232,8 +231,10 @@ impl HDFSStorage {
     ) -> Result<u64, StorageError> {
         self.append_stream_with_progress(
             receiver,
-            relative_path,
-            start_offset,
+            HdfsAppendTarget::Raw {
+                path: relative_path,
+                prefix_len: start_offset,
+            },
             AppendCompletion::Complete(expected_final_size),
             None,
             None,
@@ -244,12 +245,13 @@ impl HDFSStorage {
     pub(crate) async fn append_stream_with_progress(
         &self,
         mut receiver: tokio::sync::mpsc::Receiver<crate::DataChunk>,
-        relative_path: &std::path::Path,
-        start_offset: u64,
+        target: HdfsAppendTarget<'_>,
         completion: AppendCompletion,
         bytes_counter: Option<&Arc<AtomicU64>>,
         on_committed: Option<&crate::CommitCallback>,
     ) -> Result<u64, StorageError> {
+        let relative_path = target.path();
+        let start_offset = target.prefix_len();
         let (expected_final_size, require_final_size) = match completion {
             AppendCompletion::Complete(size) => (size, true),
             AppendCompletion::PartialUpTo(size) => (size, false),
@@ -266,13 +268,7 @@ impl HDFSStorage {
                 relative_path.display()
             )));
         }
-        if metadata.size != start_offset {
-            return Err(StorageError::OperationError(format!(
-                "stale HDFS append offset {start_offset}, current length is {}: {}",
-                metadata.size,
-                relative_path.display()
-            )));
-        }
+        target.validate_current_prefix(metadata.size)?;
         if start_offset == expected_final_size {
             receiver.close();
             return Ok(start_offset);
@@ -282,7 +278,8 @@ impl HDFSStorage {
             self.client.append(&path).await.map_err(|error| {
                 hdfs_operation_error("append file", Some(relative_path), &error)
             })?;
-        self.consume_sequential_chunks(
+        let write_result = self
+            .consume_sequential_chunks(
             &mut writer,
             &mut receiver,
             SequentialWriteContext {
@@ -291,49 +288,45 @@ impl HDFSStorage {
                 expected_size: expected_final_size,
                 require_final_size,
                 bytes_counter,
-                on_committed,
             },
         )
-        .await
+        .await;
+        let written_end = match write_result {
+            Ok(written_end) => written_end,
+            Err(error) => {
+                return settle_append_progress(start_offset, Err(error), None, on_committed);
+            }
+        };
+        let persisted_size = self.get_metadata(relative_path).await?.size;
+        settle_append_progress(
+            start_offset,
+            Ok(written_end),
+            Some(persisted_size),
+            on_committed,
+        )
     }
 
-    /// Prepare a trusted HDFS temporary file for tail-only resume.
-    ///
-    /// Returns the validated contiguous prefix length. Missing and explicitly
-    /// fresh state is created as an empty file; overlong state is rebuilt.
+    /// Append one contiguous session to a validated prepared transfer.
     ///
     /// # Errors
     ///
-    /// Returns an error for a root/escaping path, directory state, inaccessible
-    /// metadata, or failure to rebuild the temporary file.
-    pub async fn prepare_tail_resume(
+    /// Returns an error for stale state, malformed chunks, native append/write/
+    /// close failures, or unconfirmed persisted length.
+    pub async fn append_prepared_tail(
         &self,
-        part_path: &std::path::Path,
-        expected_size: u64,
-        resume: bool,
+        receiver: tokio::sync::mpsc::Receiver<crate::DataChunk>,
+        state: &HdfsPreparedTransfer,
+        bytes_counter: Option<&Arc<AtomicU64>>,
+        on_committed: Option<&crate::CommitCallback>,
     ) -> Result<u64, StorageError> {
-        if part_path.file_name().is_none() {
-            return Err(StorageError::InvalidPath(
-                "HDFS resume temporary path must name a file".to_string(),
-            ));
-        }
-        self.resolve_path(part_path)?;
-        if !resume {
-            self.rebuild_resume_file(part_path).await?;
-            return Ok(0);
-        }
-        match self.get_metadata(part_path).await {
-            Ok(metadata) if metadata.is_dir => Err(StorageError::InvalidPath(format!(
-                "HDFS resume temporary path is a directory: {}",
-                part_path.display()
-            ))),
-            Ok(metadata) if metadata.size <= expected_size => Ok(metadata.size),
-            Ok(_) | Err(StorageError::FileNotFound(_)) => {
-                self.rebuild_resume_file(part_path).await?;
-                Ok(0)
-            }
-            Err(error) => Err(error),
-        }
+        self.append_stream_with_progress(
+            receiver,
+            HdfsAppendTarget::Prepared(state),
+            AppendCompletion::PartialUpTo(state.expected_size()),
+            bytes_counter,
+            on_committed,
+        )
+        .await
     }
 
     /// Atomically publish one completed HDFS resume temporary file.
@@ -359,16 +352,19 @@ impl HDFSStorage {
         self.rename(part_path, final_path).await
     }
 
-    async fn rebuild_resume_file(&self, part_path: &std::path::Path) -> Result<(), StorageError> {
-        if let Ok(metadata) = self.get_metadata(part_path).await
-            && metadata.is_dir
-        {
-            return Err(StorageError::InvalidPath(format!(
-                "HDFS resume temporary path is a directory: {}",
-                part_path.display()
-            )));
-        }
-        self.write_file(part_path, bytes::Bytes::new(), 0o644, None)
+    /// Publish a validated prepared transfer at its bound final path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a mismatched bound path, incomplete partial file,
+    /// directory state, or native rename failure.
+    pub async fn commit_prepared_tail(
+        &self,
+        state: &HdfsPreparedTransfer,
+        final_path: &std::path::Path,
+    ) -> Result<(), StorageError> {
+        state.validate_final_path(final_path)?;
+        self.commit_tail_resume(state.part_path(), final_path, state.expected_size())
             .await
     }
 
@@ -582,9 +578,6 @@ impl HDFSStorage {
                 if let Some(counter) = context.bytes_counter {
                     counter.fetch_add(length, Ordering::Relaxed);
                 }
-                if let Some(callback) = context.on_committed {
-                    callback(next_offset - length, length);
-                }
             }
             if pending.len() > window {
                 return Err(StorageError::OperationError(format!(
@@ -653,4 +646,43 @@ impl HDFSStorage {
             }
         }
     }
+}
+
+fn confirmed_append_range(
+    start_offset: u64,
+    written_end: u64,
+    persisted_size: u64,
+) -> Result<Option<(u64, u64)>, StorageError> {
+    if persisted_size != written_end {
+        return Err(StorageError::OperationError(format!(
+            "HDFS append persisted length {persisted_size} does not match written end {written_end}"
+        )));
+    }
+    let length = written_end.checked_sub(start_offset).ok_or_else(|| {
+        StorageError::OperationError(
+            "HDFS append written end cannot precede its starting offset".to_string(),
+        )
+    })?;
+    Ok((length > 0).then_some((start_offset, length)))
+}
+
+fn settle_append_progress(
+    start_offset: u64,
+    write_result: Result<u64, StorageError>,
+    persisted_size: Option<u64>,
+    on_committed: Option<&crate::CommitCallback>,
+) -> Result<u64, StorageError> {
+    let written_end = write_result?;
+    let persisted_size = persisted_size.ok_or_else(|| {
+        StorageError::OperationError(
+            "HDFS append completed without persisted length confirmation".to_string(),
+        )
+    })?;
+    if let Some((offset, length)) =
+        confirmed_append_range(start_offset, written_end, persisted_size)?
+        && let Some(callback) = on_committed
+    {
+        callback(offset, length);
+    }
+    Ok(written_end)
 }

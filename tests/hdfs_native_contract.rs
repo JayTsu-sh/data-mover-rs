@@ -1,3 +1,7 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use data_mover::dir_tree::NdxEvent;
 use data_mover::dir_tree::{DirHandle, ReadContext};
 use data_mover::hdfs::HdfsScanEvent;
@@ -232,6 +236,29 @@ async fn write_hdfs_resume_tail(
     handle: &StreamHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    let ranges = Arc::new(Mutex::new(Vec::new()));
+    let callback_ranges = ranges.clone();
+    let callback: data_mover::CommitCallback = Arc::new(move |offset, length| {
+        if let Ok(mut ranges) = callback_ranges.lock() {
+            ranges.push((offset, length));
+        }
+    });
+    let counter = Arc::new(AtomicU64::new(0));
+    let storage = storage.clone();
+    let entry = entry.clone();
+    let handle = handle.clone();
+    let counter_for_writer = counter.clone();
+    let writer = tokio::spawn(async move {
+        StorageEnum::write_chunk_stream(
+            &storage,
+            &entry,
+            receiver,
+            &handle,
+            Some(counter_for_writer),
+            callback,
+        )
+        .await
+    });
     sender
         .send(data_mover::DataChunk {
             offset: 8,
@@ -244,31 +271,29 @@ async fn write_hdfs_resume_tail(
             data: bytes::Bytes::from_static(b"4567"),
         })
         .await?;
-    drop(sender);
-    let ranges = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let callback_ranges = ranges.clone();
-    let callback: data_mover::CommitCallback = std::sync::Arc::new(move |offset, length| {
-        if let Ok(mut ranges) = callback_ranges.lock() {
-            ranges.push((offset, length));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while counter.load(Ordering::Relaxed) != 12 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    });
-    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    Box::pin(StorageEnum::write_chunk_stream(
-        storage,
-        entry,
-        receiver,
-        handle,
-        Some(counter.clone()),
-        callback,
-    ))
-    .await?;
-    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 12);
+    })
+    .await
+    .map_err(|_| "HDFS resume writer did not consume the open session")?;
+    assert!(
+        ranges
+            .lock()
+            .map_err(|_| "callback ranges poisoned")?
+            .is_empty(),
+        "HDFS resume progress must wait for writer close"
+    );
+    drop(sender);
+    writer.await??;
+    assert_eq!(counter.load(Ordering::Relaxed), 12);
     assert_eq!(
         ranges
             .lock()
             .map_err(|_| "callback ranges poisoned")?
             .as_slice(),
-        &[(4, 4), (8, 8)]
+        &[(4, 12)]
     );
     Ok(())
 }
@@ -329,6 +354,290 @@ async fn complete_and_commit_hdfs_resume(
         hdfs.read_at(&committed, 0, 16).await?,
         b"0123456789abcdef"[..]
     );
+    Ok(())
+}
+
+async fn assert_stable_hdfs_resume_binding(
+    hdfs: &data_mover::HDFSStorage,
+    entry: &data_mover::EntryEnum,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stable_request = data_mover::hdfs_transfer_request(
+        entry,
+        "nightly-resume-transfer",
+        std::path::PathBuf::from("稳定/最终.bin"),
+    )?;
+    let stable = hdfs
+        .prepare_stable_tail_transfer(&stable_request, true)
+        .await?;
+    assert_eq!(stable.prefix_len(), 0);
+    create_hdfs_file(
+        hdfs,
+        stable
+            .part_path()
+            .to_str()
+            .ok_or("stable HDFS partial path is not UTF-8")?,
+        bytes::Bytes::from_static(b"0123"),
+    )
+    .await?;
+    let resumed = hdfs
+        .prepare_stable_tail_transfer(&stable_request, true)
+        .await?;
+    assert_eq!(resumed.prefix_len(), 4);
+
+    let changed_source = data_mover::hdfs::HdfsTransferRequest::new(
+        "nightly-resume-transfer",
+        data_mover::hdfs::HdfsSourceFingerprint::new(16, entry.get_mtime() + 1, None),
+        std::path::PathBuf::from("稳定/最终.bin"),
+        16,
+        0o640,
+        Some(2),
+    )?;
+    assert_ne!(stable_request.partial_path(), changed_source.partial_path());
+    let changed = hdfs
+        .prepare_stable_tail_transfer(&changed_source, true)
+        .await?;
+    assert_eq!(changed.prefix_len(), 0);
+    Ok(())
+}
+
+async fn assert_hdfs_staged_resume_modes(
+    hdfs: &data_mover::HDFSStorage,
+    entry: &data_mover::EntryEnum,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use data_mover::hdfs::HdfsResumeMode;
+
+    let request = data_mover::hdfs_transfer_request(
+        entry,
+        "nightly-mode-transfer",
+        std::path::PathBuf::from("模式/最终.bin"),
+    )?;
+    assert!(
+        hdfs.prepare_staged_tail_transfer(&request, HdfsResumeMode::Require)
+            .await
+            .is_err()
+    );
+    let initial = hdfs
+        .prepare_staged_tail_transfer(&request, HdfsResumeMode::Auto)
+        .await?;
+    assert_eq!(initial.prefix_len(), 0);
+    create_hdfs_file(
+        hdfs,
+        initial.part_path().to_str().ok_or("invalid partial path")?,
+        bytes::Bytes::from_static(b"0123"),
+    )
+    .await?;
+    let automatic = hdfs
+        .prepare_staged_tail_transfer(&request, HdfsResumeMode::Auto)
+        .await?;
+    assert_staged_tail_commit(hdfs, &request, automatic, b"0123456789abcdef").await?;
+
+    let restarted = hdfs
+        .prepare_staged_tail_transfer(&request, HdfsResumeMode::Restart)
+        .await?;
+    assert_eq!(restarted.prefix_len(), 0);
+    assert_staged_tail_commit(hdfs, &request, restarted, b"0123456789abcdef").await?;
+
+    create_hdfs_file(
+        hdfs,
+        request
+            .partial_path()
+            .to_str()
+            .ok_or("invalid partial path")?,
+        bytes::Bytes::from_static(b"0123"),
+    )
+    .await?;
+    let required = hdfs
+        .prepare_staged_tail_transfer(&request, HdfsResumeMode::Require)
+        .await?;
+    assert_eq!(required.prefix_len(), 4);
+    assert_staged_tail_commit(hdfs, &request, required, b"0123456789abcdef").await?;
+
+    create_hdfs_file(
+        hdfs,
+        request
+            .partial_path()
+            .to_str()
+            .ok_or("invalid partial path")?,
+        bytes::Bytes::from_static(b"0123456789abcdefx"),
+    )
+    .await?;
+    assert!(
+        hdfs.prepare_staged_tail_transfer(&request, HdfsResumeMode::Require)
+            .await
+            .is_err()
+    );
+    assert_eq!(hdfs.get_metadata(request.partial_path()).await?.size, 17);
+    let recovered = hdfs
+        .prepare_staged_tail_transfer(&request, HdfsResumeMode::Auto)
+        .await?;
+    assert_eq!(recovered.prefix_len(), 0);
+    hdfs.delete_file(request.partial_path()).await?;
+    hdfs.create_dir_all(request.partial_path(), 0o755).await?;
+    for mode in [
+        HdfsResumeMode::Auto,
+        HdfsResumeMode::Restart,
+        HdfsResumeMode::Require,
+    ] {
+        assert!(
+            hdfs.prepare_staged_tail_transfer(&request, mode)
+                .await
+                .is_err()
+        );
+        assert!(hdfs.get_metadata(request.partial_path()).await?.is_dir);
+    }
+    Ok(())
+}
+
+async fn assert_staged_tail_commit(
+    hdfs: &data_mover::HDFSStorage,
+    request: &data_mover::hdfs::HdfsTransferRequest,
+    state: data_mover::hdfs::HdfsPreparedTransfer,
+    payload: &'static [u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prefix = usize::try_from(state.prefix_len())?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    if prefix < payload.len() {
+        sender
+            .send(data_mover::DataChunk {
+                offset: state.prefix_len(),
+                data: bytes::Bytes::from_static(&payload[prefix..]),
+            })
+            .await?;
+    }
+    drop(sender);
+    hdfs.append_prepared_tail(receiver, &state, None, None)
+        .await?;
+    hdfs.commit_prepared_tail(&state, request.final_path())
+        .await?;
+    let handle = hdfs.open_file(request.final_path()).await?;
+    assert_eq!(
+        hdfs.read_at(&handle, 0, payload.len() as u64).await?,
+        payload
+    );
+    Ok(())
+}
+
+async fn assert_zero_byte_staged_commit(
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = data_mover::hdfs::HdfsTransferRequest::new(
+        "nightly-zero-transfer",
+        data_mover::hdfs::HdfsSourceFingerprint::new(0, 0, None),
+        std::path::PathBuf::from("模式/zero.bin"),
+        0,
+        0o640,
+        Some(2),
+    )?;
+    let state = hdfs
+        .prepare_staged_tail_transfer(&request, data_mover::hdfs::HdfsResumeMode::Auto)
+        .await?;
+    assert_eq!(state.missing_tail(), None);
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    drop(sender);
+    hdfs.append_prepared_tail(receiver, &state, None, None)
+        .await?;
+    hdfs.commit_prepared_tail(&state, request.final_path())
+        .await?;
+    assert_eq!(hdfs.get_metadata(request.final_path()).await?.size, 0);
+    Ok(())
+}
+
+async fn assert_common_recoverable_hdfs_copy(
+    destination: &StorageEnum,
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local_root = hdfs_lab_local_path("recoverable-copy")?;
+    tokio::fs::create_dir_all(&local_root).await?;
+    let payload = b"common recoverable HDFS copy";
+    tokio::fs::write(local_root.join("common.bin"), payload).await?;
+    let source = create_storage(
+        local_root.to_str().ok_or("invalid local lab path")?,
+        CreateStorageOptions::new(None, true),
+    )
+    .await?;
+    let entry = source
+        .get_metadata(std::path::Path::new("common.bin"))
+        .await?;
+    let callback: data_mover::CommitCallback = Arc::new(|_, _| {});
+    StorageEnum::copy_file_hdfs_recoverable(
+        &source,
+        destination,
+        &entry,
+        CopyOptions {
+            enable_integrity_check: true,
+            is_source_reserved: true,
+            ..Default::default()
+        },
+        data_mover::HdfsRecoverableCopyOptions::new("nightly-common-copy", callback),
+    )
+    .await?;
+    let handle = hdfs.open_file(std::path::Path::new("common.bin")).await?;
+    assert_eq!(
+        hdfs.read_at(&handle, 0, payload.len() as u64).await?,
+        &payload[..]
+    );
+    tokio::fs::remove_dir_all(local_root).await?;
+    Ok(())
+}
+
+async fn assert_changed_source_is_not_published(
+    destination: &StorageEnum,
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local_root = hdfs_lab_local_path("changed-source")?;
+    tokio::fs::create_dir_all(&local_root).await?;
+    let source_path = local_root.join("changed-source.bin");
+    tokio::fs::write(&source_path, b"original-source").await?;
+    let source = create_storage(
+        local_root.to_str().ok_or("invalid local lab path")?,
+        CreateStorageOptions::new(None, true),
+    )
+    .await?;
+    let entry = source
+        .get_metadata(std::path::Path::new("changed-source.bin"))
+        .await?;
+    let request = data_mover::hdfs_transfer_request(
+        &entry,
+        "nightly-changed-source",
+        entry.get_relative_path().to_path_buf(),
+    )?;
+    let callback_path = source_path.clone();
+    let callback: data_mover::CommitCallback = Arc::new(move |_, _| {
+        std::fs::write(&callback_path, b"changed-source-content")
+            .unwrap_or_else(|error| panic!("change source after HDFS append: {error}"));
+    });
+
+    let result = StorageEnum::copy_file_hdfs_recoverable(
+        &source,
+        destination,
+        &entry,
+        CopyOptions {
+            is_source_reserved: false,
+            ..Default::default()
+        },
+        data_mover::HdfsRecoverableCopyOptions::new("nightly-changed-source", callback),
+    )
+    .await;
+
+    let Err(error) = result else {
+        panic!("changed source was unexpectedly published");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("source changed after preparation")
+    );
+    assert!(source_path.exists());
+    assert_eq!(
+        hdfs.get_metadata(request.partial_path()).await?.size,
+        entry.get_size()
+    );
+    assert!(
+        hdfs.get_metadata(std::path::Path::new("changed-source.bin"))
+            .await
+            .is_err()
+    );
+    tokio::fs::remove_dir_all(local_root).await?;
     Ok(())
 }
 
@@ -1102,8 +1411,10 @@ async fn nightly_lab_prepares_persistent_hdfs_tail_resume_state()
     .await?;
     let (missing, handle) = StorageEnum::resume_prepare(&storage, &entry, part, true).await?;
     assert_eq!(missing, vec![(4, 16)]);
-    let encoded = serde_json::to_vec(&handle)?;
-    let handle: StreamHandle = serde_json::from_slice(&encoded)?;
+    assert_hdfs_resume_handle(handle, "临时/最终.bin.part", 4, 16)?;
+    let legacy_fixture =
+        r#"{"Hdfs":{"part_path":"临时/最终.bin.part","prefix_len":4,"expected_size":16}}"#;
+    let handle: StreamHandle = serde_json::from_str(legacy_fixture)?;
     assert_hdfs_resume_handle(handle.clone(), "临时/最终.bin.part", 4, 16)?;
     Box::pin(complete_and_commit_hdfs_resume(
         &storage, hdfs, &entry, &handle,
@@ -1142,6 +1453,12 @@ async fn nightly_lab_prepares_persistent_hdfs_tail_resume_state()
             .get_size(),
         16
     );
+
+    Box::pin(assert_stable_hdfs_resume_binding(hdfs, &entry)).await?;
+    Box::pin(assert_hdfs_staged_resume_modes(hdfs, &entry)).await?;
+    Box::pin(assert_zero_byte_staged_commit(hdfs)).await?;
+    Box::pin(assert_common_recoverable_hdfs_copy(&storage, hdfs)).await?;
+    Box::pin(assert_changed_source_is_not_published(&storage, hdfs)).await?;
     hdfs.delete_storage_root().await?;
     Ok(())
 }
@@ -2288,6 +2605,20 @@ async fn assert_hdfs_to_hdfs_resume(
     let entry = source
         .get_metadata(std::path::Path::new("hdfs-source.bin"))
         .await?;
+    let fresh_part = std::path::Path::new("fresh-options.part");
+    let (fresh_missing, _) =
+        StorageEnum::resume_prepare(&destination, &entry, fresh_part, false).await?;
+    assert_eq!(fresh_missing, vec![(0, u64::try_from(data.len())?)]);
+    let fresh_metadata = destination_hdfs.get_metadata(fresh_part).await?;
+    assert_eq!(
+        fresh_metadata.mode,
+        entry.get_mode().ok_or("missing HDFS mode")? & 0o7777
+    );
+    let data_mover::EntryEnum::HDFS(source_entry) = &entry else {
+        return Err("HDFS source did not produce an HDFS entry".into());
+    };
+    assert_eq!(fresh_metadata.replication, source_entry.replication);
+    destination_hdfs.delete_file(fresh_part).await?;
     let split = 1_300_000;
     create_hdfs_file(
         destination_hdfs,
@@ -3031,7 +3362,7 @@ async fn nightly_lab_retains_hdfs_source_when_copy_metadata_fails()
     // rejected deterministically, independent of the authenticated user's
     // superuser status, so this remains valid for both Simple and Kerberos labs.
     hdfs_entry.mtime = -1;
-    let result = StorageEnum::copy_file(
+    let result = Box::pin(StorageEnum::copy_file_resumable(
         &source,
         &destination,
         &entry,
@@ -3040,7 +3371,8 @@ async fn nightly_lab_retains_hdfs_source_when_copy_metadata_fails()
             enable_integrity_check: true,
             ..Default::default()
         },
-    )
+        resume_context("failure.bin.part", vec![(0, u64::try_from(payload.len())?)]),
+    ))
     .await;
     assert!(
         matches!(

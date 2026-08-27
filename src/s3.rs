@@ -1166,6 +1166,19 @@ impl S3Storage {
         enable_integrity_check: bool,
         qos: Option<QosManager>,
     ) -> Result<Option<HashCalculator>> {
+        self.read_data_version(tx, relative_path, None, size, enable_integrity_check, qos)
+            .await
+    }
+
+    pub(crate) async fn read_data_version(
+        &self,
+        tx: mpsc::Sender<DataChunk>,
+        relative_path: &str,
+        version_id: Option<&str>,
+        size: u64,
+        enable_integrity_check: bool,
+        qos: Option<QosManager>,
+    ) -> Result<Option<HashCalculator>> {
         if size == 0 {
             return Ok(None);
         }
@@ -1181,7 +1194,7 @@ impl S3Storage {
                         &tx,
                         S3RangeSpec {
                             key: key.as_str(),
-                            version_id: None,
+                            version_id,
                             offset,
                             count,
                         },
@@ -1217,8 +1230,13 @@ impl S3Storage {
                 // 避免 GetObject + body.collect 模板在两处漂移。version_id = None：
                 // read_data 调用域内本来就不带版本。
                 let fut = Box::pin(async move {
-                    self.read_range_uncached(key_clone.as_str(), None, range_offset, range_count)
-                        .await
+                    self.read_range_uncached(
+                        key_clone.as_str(),
+                        version_id,
+                        range_offset,
+                        range_count,
+                    )
+                    .await
                 });
                 inflight.push_back(fut);
                 issue_offset += count as u64;
@@ -1269,11 +1287,12 @@ impl S3Storage {
     /// 与 `read_data` 的差异：按调用方给定的 `[start, end)` 区间列表读取，`DataChunk.offset`
     /// 为文件内绝对偏移。无 `QoS` 时区间内维持配置的 Range GET 并发；有 `QoS` 时
     /// 每个 block-sized Range GET 的响应 body 在内存分片层做 bandwidth pacing。
-    /// `version_id` = None：续传调用域内不涉及多版本对象。
-    pub(crate) async fn read_data_intervals(
+    /// `version_id` binds every range read to the same object version when supplied.
+    pub(crate) async fn read_data_intervals_version(
         &self,
         tx: mpsc::Sender<DataChunk>,
         relative_path: &str,
+        version_id: Option<&str>,
         intervals: &[(u64, u64)],
         qos: Option<QosManager>,
     ) -> Result<()> {
@@ -1295,7 +1314,7 @@ impl S3Storage {
                             &tx,
                             S3RangeSpec {
                                 key: key.as_str(),
-                                version_id: None,
+                                version_id,
                                 offset,
                                 count,
                             },
@@ -1323,7 +1342,7 @@ impl S3Storage {
                     let offset = issue_offset;
                     inflight.push_back(Box::pin(async move {
                         let r = self
-                            .read_range_uncached(key_clone.as_str(), None, offset, count)
+                            .read_range_uncached(key_clone.as_str(), version_id, offset, count)
                             .await;
                         (offset, r)
                     }));
@@ -3240,17 +3259,29 @@ impl S3Storage {
     /// # 返回值
     /// - `Result<EntryEnum>`: 包含S3对象元数据的`EntryEnum`结构体
     pub(crate) async fn get_metadata(&self, relative_path: &str) -> Result<EntryEnum> {
+        self.get_metadata_version(relative_path, None).await
+    }
+
+    /// Fetch metadata for one exact object version when a version is supplied.
+    pub(crate) async fn get_metadata_version(
+        &self,
+        relative_path: &str,
+        version_id: Option<&str>,
+    ) -> Result<EntryEnum> {
         debug!("Getting metadata for S3 object: {:?}", relative_path);
 
         let key = self.build_full_key(relative_path);
 
         debug!("Constructed S3 key: {}", key);
 
-        let head_object_builder = self
+        let mut head_object_builder = self
             .client
             .head_object()
             .bucket(&self.bucket_name)
             .key(&key);
+        if let Some(version_id) = version_id {
+            head_object_builder = head_object_builder.version_id(version_id);
+        }
 
         let response = head_object_builder.send().await.map_err(|e| {
             // HeadObject 404 → 以 FileNotFound 上报，让 integrity-check 区分"确实不存在"
@@ -3278,9 +3309,13 @@ impl S3Storage {
             .unwrap_or(0);
 
         let last_modified = datatime_to_i64(response.last_modified());
+        let observed_version_id = response
+            .version_id()
+            .map(str::to_string)
+            .or_else(|| version_id.map(str::to_string));
 
         let tags = self
-            .get_object_tags(&self.bucket_name, &key, None)
+            .get_object_tags(&self.bucket_name, &key, observed_version_id.as_deref())
             .await
             .unwrap_or_default();
 
@@ -3291,8 +3326,8 @@ impl S3Storage {
             size,
             last_modified,
             tags,
-            None,
-            false,
+            observed_version_id.as_deref(),
+            version_id.is_none(),
             false,
             None,
             false,
