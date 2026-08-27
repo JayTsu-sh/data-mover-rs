@@ -1,4 +1,19 @@
 impl HDFSStorage {
+    /// Delete only the validated partial represented by this prepared transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request-scoped partial cannot be deleted.
+    pub async fn discard_prepared_tail(
+        &self,
+        state: &HdfsPreparedTransfer,
+    ) -> Result<(), StorageError> {
+        match self.delete_file(state.part_path()).await {
+            Ok(()) | Err(StorageError::FileNotFound(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Prepare a trusted HDFS temporary file for tail-only resume.
     ///
     /// Returns the validated contiguous prefix length. Missing and explicitly

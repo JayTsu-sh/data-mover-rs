@@ -1,5 +1,15 @@
 const MAX_TRANSFER_ID_BYTES: usize = 256;
 
+/// What an explicit recoverable copy does with its trusted partial on cancellation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HdfsCancellationDisposition {
+    /// Keep confirmed progress so a later `Auto` attempt can resume it.
+    #[default]
+    Preserve,
+    /// Delete only the deterministic partial bound to the current request.
+    Discard,
+}
+
 /// Preparation policy for one stable HDFS staged transfer.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HdfsResumeMode {
