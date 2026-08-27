@@ -1127,8 +1127,10 @@ async fn nightly_lab_prepares_persistent_hdfs_tail_resume_state()
     .await?;
     let (missing, handle) = StorageEnum::resume_prepare(&storage, &entry, part, true).await?;
     assert_eq!(missing, vec![(4, 16)]);
-    let encoded = serde_json::to_vec(&handle)?;
-    let handle: StreamHandle = serde_json::from_slice(&encoded)?;
+    assert_hdfs_resume_handle(handle, "临时/最终.bin.part", 4, 16)?;
+    let legacy_fixture =
+        r#"{"Hdfs":{"part_path":"临时/最终.bin.part","prefix_len":4,"expected_size":16}}"#;
+    let handle: StreamHandle = serde_json::from_str(legacy_fixture)?;
     assert_hdfs_resume_handle(handle.clone(), "临时/最终.bin.part", 4, 16)?;
     Box::pin(complete_and_commit_hdfs_resume(
         &storage, hdfs, &entry, &handle,

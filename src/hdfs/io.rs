@@ -231,8 +231,10 @@ impl HDFSStorage {
     ) -> Result<u64, StorageError> {
         self.append_stream_with_progress(
             receiver,
-            relative_path,
-            start_offset,
+            HdfsAppendTarget::Raw {
+                path: relative_path,
+                prefix_len: start_offset,
+            },
             AppendCompletion::Complete(expected_final_size),
             None,
             None,
@@ -243,12 +245,13 @@ impl HDFSStorage {
     pub(crate) async fn append_stream_with_progress(
         &self,
         mut receiver: tokio::sync::mpsc::Receiver<crate::DataChunk>,
-        relative_path: &std::path::Path,
-        start_offset: u64,
+        target: HdfsAppendTarget<'_>,
         completion: AppendCompletion,
         bytes_counter: Option<&Arc<AtomicU64>>,
         on_committed: Option<&crate::CommitCallback>,
     ) -> Result<u64, StorageError> {
+        let relative_path = target.path();
+        let start_offset = target.prefix_len();
         let (expected_final_size, require_final_size) = match completion {
             AppendCompletion::Complete(size) => (size, true),
             AppendCompletion::PartialUpTo(size) => (size, false),
@@ -265,13 +268,7 @@ impl HDFSStorage {
                 relative_path.display()
             )));
         }
-        if metadata.size != start_offset {
-            return Err(StorageError::OperationError(format!(
-                "stale HDFS append offset {start_offset}, current length is {}: {}",
-                metadata.size,
-                relative_path.display()
-            )));
-        }
+        target.validate_current_prefix(metadata.size)?;
         if start_offset == expected_final_size {
             receiver.close();
             return Ok(start_offset);
@@ -324,40 +321,81 @@ impl HDFSStorage {
         expected_size: u64,
         resume: bool,
     ) -> Result<u64, StorageError> {
-        self.prepare_tail_resume_with_options(part_path, expected_size, resume, 0o644, None)
+        self.prepare_tail_transfer(part_path, expected_size, resume, 0o644, None)
             .await
+            .map(|state| state.prefix_len())
     }
 
-    pub(crate) async fn prepare_tail_resume_with_options(
+    pub(crate) async fn prepare_tail_transfer(
         &self,
         part_path: &std::path::Path,
         expected_size: u64,
         resume: bool,
         mode: u32,
         replication: Option<u32>,
-    ) -> Result<u64, StorageError> {
-        if part_path.file_name().is_none() {
-            return Err(StorageError::InvalidPath(
-                "HDFS resume temporary path must name a file".to_string(),
-            ));
-        }
-        self.resolve_path(part_path)?;
-        if !resume {
-            self.rebuild_resume_file(part_path, mode, replication).await?;
-            return Ok(0);
-        }
-        match self.get_metadata(part_path).await {
-            Ok(metadata) if metadata.is_dir => Err(StorageError::InvalidPath(format!(
-                "HDFS resume temporary path is a directory: {}",
-                part_path.display()
-            ))),
-            Ok(metadata) if metadata.size <= expected_size => Ok(metadata.size),
-            Ok(_) | Err(StorageError::FileNotFound(_)) => {
-                self.rebuild_resume_file(part_path, mode, replication).await?;
-                Ok(0)
+    ) -> Result<HdfsPreparedTransfer, StorageError> {
+        let requested = HdfsPreparedTransfer::new(
+            part_path.to_path_buf(),
+            0,
+            expected_size,
+            expected_size,
+            mode,
+            replication,
+        )?;
+        self.resolve_path(requested.part_path())?;
+        let prefix_len = if resume {
+            match self.get_metadata(requested.part_path()).await {
+                Ok(metadata) if metadata.is_dir => Err(StorageError::InvalidPath(format!(
+                    "HDFS resume temporary path is a directory: {}",
+                    requested.part_path().display()
+                ))),
+                Ok(metadata) if metadata.size <= expected_size => Ok(metadata.size),
+                Ok(_) | Err(StorageError::FileNotFound(_)) => {
+                    self.rebuild_resume_file(
+                        requested.part_path(),
+                        requested.mode(),
+                        requested.replication(),
+                    )
+                    .await?;
+                    Ok(0)
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        }
+            ?
+        } else {
+            self.rebuild_resume_file(
+                requested.part_path(),
+                requested.mode(),
+                requested.replication(),
+            )
+            .await?;
+            0
+        };
+        HdfsPreparedTransfer::new(
+            requested.part_path().to_path_buf(),
+            prefix_len,
+            requested.expected_size(),
+            requested.expected_size(),
+            requested.mode(),
+            requested.replication(),
+        )
+    }
+
+    pub(crate) async fn append_prepared_tail(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<crate::DataChunk>,
+        state: &HdfsPreparedTransfer,
+        bytes_counter: Option<&Arc<AtomicU64>>,
+        on_committed: Option<&crate::CommitCallback>,
+    ) -> Result<u64, StorageError> {
+        self.append_stream_with_progress(
+            receiver,
+            HdfsAppendTarget::Prepared(state),
+            AppendCompletion::PartialUpTo(state.expected_size()),
+            bytes_counter,
+            on_committed,
+        )
+        .await
     }
 
     /// Atomically publish one completed HDFS resume temporary file.
@@ -381,6 +419,15 @@ impl HDFSStorage {
             )));
         }
         self.rename(part_path, final_path).await
+    }
+
+    pub(crate) async fn commit_prepared_tail(
+        &self,
+        state: &HdfsPreparedTransfer,
+        final_path: &std::path::Path,
+    ) -> Result<(), StorageError> {
+        self.commit_tail_resume(state.part_path(), final_path, state.expected_size())
+            .await
     }
 
     async fn rebuild_resume_file(

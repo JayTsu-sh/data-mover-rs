@@ -4,6 +4,7 @@
 //! responsibility without exposing internal coordination details to callers.
 
 include!("hdfs/config.rs");
+include!("hdfs/transfer.rs");
 include!("hdfs/namespace.rs");
 include!("hdfs/io.rs");
 include!("hdfs/support.rs");

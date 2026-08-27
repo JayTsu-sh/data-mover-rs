@@ -69,6 +69,102 @@ mod tests {
         assert_eq!(callbacks.load(Ordering::Relaxed), 1);
     }
 
+    #[test]
+    fn prepared_tail_transfer_preserves_validated_state() {
+        let state = super::HdfsPreparedTransfer::new(
+            std::path::PathBuf::from("dir/file.part"),
+            4,
+            16,
+            16,
+            0o620,
+            Some(3),
+        );
+        let Ok(state) = state else {
+            panic!("valid HDFS prepared state was rejected");
+        };
+        assert_eq!(state.part_path(), std::path::Path::new("dir/file.part"));
+        assert_eq!(state.prefix_len(), 4);
+        assert_eq!(state.expected_size(), 16);
+        assert_eq!(state.mode(), 0o620);
+        assert_eq!(state.replication(), Some(3));
+    }
+
+    #[test]
+    fn prepared_tail_transfer_rejects_invalid_wire_state() {
+        assert!(
+            super::HdfsPreparedTransfer::new(
+                std::path::PathBuf::from("file.part"),
+                17,
+                16,
+                16,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            super::HdfsPreparedTransfer::new(
+                std::path::PathBuf::from("file.part"),
+                4,
+                16,
+                15,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            super::HdfsPreparedTransfer::new(
+                std::path::PathBuf::new(),
+                0,
+                16,
+                16,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            super::HdfsPreparedTransfer::new(
+                std::path::PathBuf::from("../file.part"),
+                0,
+                16,
+                16,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            super::HdfsPreparedTransfer::new(
+                std::path::PathBuf::from("/tmp/file.part"),
+                0,
+                16,
+                16,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn prepared_tail_transfer_rejects_a_stale_prefix() {
+        let state = super::HdfsPreparedTransfer::new(
+            std::path::PathBuf::from("file.part"),
+            4,
+            16,
+            16,
+            0o644,
+            None,
+        );
+        let Ok(state) = state else {
+            panic!("valid HDFS prepared state was rejected");
+        };
+        assert!(state.validate_current_prefix(4).is_ok());
+        assert!(state.validate_current_prefix(5).is_err());
+    }
+
     #[tokio::test]
     async fn adapter_retry_is_bounded_and_eventually_succeeds() {
         assert_eq!(super::HDFS_ADAPTER_MAX_ATTEMPTS, 5);
