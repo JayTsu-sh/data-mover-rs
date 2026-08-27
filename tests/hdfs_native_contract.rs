@@ -918,6 +918,18 @@ async fn nightly_lab_renames_files_and_directories_atomically()
     .await?;
     storage
         .rename(
+            std::path::Path::new("源目录"),
+            std::path::Path::new("源目录"),
+        )
+        .await?;
+    assert!(
+        storage
+            .get_metadata(std::path::Path::new("源目录/嵌套/data.bin"))
+            .await?
+            .get_is_regular_file()
+    );
+    storage
+        .rename(
             std::path::Path::new("源目录/嵌套/data.bin"),
             std::path::Path::new("新父目录/renamed.bin"),
         )
@@ -2854,6 +2866,116 @@ async fn nightly_lab_mutates_hdfs_native_metadata_safely() -> Result<(), Box<dyn
 
     hdfs.delete_storage_root().await?;
     assert!(admin_client.delete(&outside, true).await?);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the nightly lab HDFS cluster"]
+async fn nightly_lab_storage_enum_metadata_and_progress_delete()
+-> Result<(), Box<dyn std::error::Error>> {
+    let location = hdfs_lab_location("enum-operations")?;
+    let storage = create_storage(
+        &location,
+        CreateStorageOptions {
+            ensure_dir: true,
+            backend: BackendConfig::Hdfs(hdfs_lab_config()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let StorageEnum::HDFS(hdfs) = &storage else {
+        return Err("factory did not return HDFS storage".into());
+    };
+    hdfs.create_dir_all(std::path::Path::new("delete-me/nested"), 0o755)
+        .await?;
+    let file_path = format!("{}/empty", hdfs.location().root().trim_end_matches('/'));
+    let mut writer = hdfs
+        .client()
+        .create(&file_path, WriteOptions::default().permission(0o600))
+        .await?;
+    Box::pin(writer.close()).await?;
+
+    storage
+        .set_metadata(
+            std::path::Path::new("empty"),
+            Some(1_725_000_000_123_999_999),
+            Some(1_735_000_000_456_999_999),
+            None,
+            None,
+            Some(0o640),
+        )
+        .await?;
+    let metadata = hdfs.get_metadata(std::path::Path::new("empty")).await?;
+    assert_eq!(metadata.atime, 1_725_000_000_123_000_000);
+    assert_eq!(metadata.mtime, 1_735_000_000_456_000_000);
+    assert_eq!(metadata.mode, 0o640);
+    assert!(
+        storage
+            .set_metadata(
+                std::path::Path::new("empty"),
+                None,
+                None,
+                Some(1000),
+                None,
+                None,
+            )
+            .await
+            .is_err()
+    );
+
+    let events =
+        storage.delete_dir_all_with_progress(Some(std::path::Path::new("delete-me")), 4)?;
+    let event = events.next().await.ok_or("missing HDFS delete event")?;
+    assert_eq!(event.relative_path, std::path::Path::new("delete-me"));
+    assert!(event.is_dir);
+    assert_eq!(event.error, None);
+    assert!(events.next().await.is_none());
+    assert!(matches!(
+        hdfs.get_metadata(std::path::Path::new("delete-me")).await,
+        Err(data_mover::error::StorageError::FileNotFound(_))
+    ));
+
+    hdfs.delete_storage_root().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the nightly lab HDFS cluster"]
+async fn nightly_lab_storage_enum_server_time_and_tar_write()
+-> Result<(), Box<dyn std::error::Error>> {
+    let location = hdfs_lab_location("enum-streams")?;
+    let storage = create_storage(
+        &location,
+        CreateStorageOptions {
+            ensure_dir: true,
+            backend: BackendConfig::Hdfs(hdfs_lab_config()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let StorageEnum::HDFS(hdfs) = &storage else {
+        return Err("factory did not return HDFS storage".into());
+    };
+
+    assert!(storage.probe_server_time().await?.is_some());
+    StorageEnum::pack_files_to_tar(
+        &storage,
+        &storage,
+        &[],
+        std::path::Path::new("empty.tar"),
+        1024,
+        0,
+        data_mover::TarPackOptions::default(),
+    )
+    .await?;
+    assert_eq!(
+        hdfs.get_metadata(std::path::Path::new("empty.tar"))
+            .await?
+            .size,
+        1024
+    );
+
+    hdfs.delete_storage_root().await?;
     Ok(())
 }
 

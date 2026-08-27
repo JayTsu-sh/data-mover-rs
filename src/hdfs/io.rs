@@ -490,15 +490,15 @@ impl HDFSStorage {
         let from_path = self.resolve_path(from)?;
         let to_path = self.resolve_path(to)?;
         let source = self.get_metadata(from).await?;
+        if from == to {
+            return Ok(());
+        }
         if source.is_dir && to.starts_with(from) {
             return Err(StorageError::InvalidPath(format!(
                 "HDFS cannot rename a directory into its own subtree: {} -> {}",
                 from.display(),
                 to.display()
             )));
-        }
-        if from == to {
-            return Ok(());
         }
         if let Some(parent) = to.parent()
             && !parent.as_os_str().is_empty()
