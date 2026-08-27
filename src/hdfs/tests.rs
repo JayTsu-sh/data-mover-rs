@@ -309,6 +309,70 @@ mod tests {
     }
 
     #[test]
+    fn staged_resume_modes_choose_the_expected_partial_action() {
+        use super::HdfsPartialObservation::{Directory, File, Missing};
+
+        assert_eq!(super::HdfsResumeMode::default(), super::HdfsResumeMode::Auto);
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Auto, Missing, 16),
+            Ok(super::HdfsPrepareAction::Rebuild)
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Auto, File(4), 16),
+            Ok(super::HdfsPrepareAction::Resume(4))
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Auto, File(0), 16),
+            Ok(super::HdfsPrepareAction::Resume(0))
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Auto, File(16), 16),
+            Ok(super::HdfsPrepareAction::Resume(16))
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Auto, File(17), 16),
+            Ok(super::HdfsPrepareAction::Rebuild)
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Restart, File(4), 16),
+            Ok(super::HdfsPrepareAction::Rebuild)
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Restart, Missing, 16),
+            Ok(super::HdfsPrepareAction::Rebuild)
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Restart, File(17), 16),
+            Ok(super::HdfsPrepareAction::Rebuild)
+        ));
+        assert!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Require, Missing, 16).is_err()
+        );
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Require, File(0), 16),
+            Ok(super::HdfsPrepareAction::Resume(0))
+        ));
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Require, File(16), 16),
+            Ok(super::HdfsPrepareAction::Resume(16))
+        ));
+        assert!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Require, File(17), 16).is_err()
+        );
+        for mode in [
+            super::HdfsResumeMode::Auto,
+            super::HdfsResumeMode::Restart,
+            super::HdfsResumeMode::Require,
+        ] {
+            assert!(super::plan_staged_prepare(mode, Directory, 16).is_err());
+        }
+        assert!(matches!(
+            super::plan_staged_prepare(super::HdfsResumeMode::Auto, Missing, 0),
+            Ok(super::HdfsPrepareAction::Rebuild)
+        ));
+    }
+
+    #[test]
     fn stable_prepared_state_keeps_source_and_destination_binding() {
         let request = super::HdfsTransferRequest::new(
             "transfer",

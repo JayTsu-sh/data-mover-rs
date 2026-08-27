@@ -16,7 +16,7 @@ const HASH_CHANNEL_CAPACITY: usize = 4;
 /// 之间的解耦缓冲：容量 2 时写端一次落盘抖动即填满 channel、反压打空读端
 /// 流水线；4 可吸收单次抖动。内存上界 = 容量 × chunk 大小 × 并发文件数
 /// （NFS chunk ≤ 1MB；CIFS chunk 可达 8MB，增大容量时需关注）。
-const COPY_PIPELINE_CAPACITY: usize = 4;
+pub(crate) const COPY_PIPELINE_CAPACITY: usize = 4;
 /// TAR 打包 pipeline 的 channel 容量（多文件顺序读，适当放大缓冲）
 const TAR_PIPELINE_CAPACITY: usize = 16;
 static NEXT_HDFS_FRESH_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -115,7 +115,7 @@ fn resolve_copy_pipeline<R, W>(read_result: Result<R>, write_result: Result<W>) 
     }
 }
 
-async fn await_copy_pipeline<R, W>(
+pub(crate) async fn await_copy_pipeline<R, W>(
     read_task: tokio::task::JoinHandle<Result<R>>,
     write_task: tokio::task::JoinHandle<Result<W>>,
     cancel: Option<&CancellationToken>,
@@ -959,11 +959,48 @@ impl StorageEnum {
     }
 
     /// Apply source metadata after the destination data has been committed.
-    async fn apply_copied_metadata(to: &StorageEnum, entry: &EntryEnum) -> Result<()> {
+    pub(crate) async fn apply_copied_metadata(to: &StorageEnum, entry: &EntryEnum) -> Result<()> {
         match to {
             StorageEnum::S3(_) => Ok(()),
             _ => to.set_entry_metadata(entry).await,
         }
+    }
+
+    pub(crate) async fn complete_copied_entry(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        is_source_reserved: bool,
+    ) -> Result<()> {
+        Self::apply_copied_metadata(to, entry).await?;
+        if !is_source_reserved {
+            from.delete_file(entry).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn verify_hdfs_partial_integrity(
+        from: &StorageEnum,
+        to: &StorageEnum,
+        entry: &EntryEnum,
+        part_path: &Path,
+        enabled: bool,
+    ) -> Result<()> {
+        if !enabled {
+            return Ok(());
+        }
+        let size = entry.get_size();
+        let source_hash = from.compute_hash(entry.get_relative_path(), size).await?;
+        let destination_hash = to.compute_hash(part_path, size).await?;
+        if source_hash == destination_hash {
+            return Ok(());
+        }
+        if let StorageEnum::HDFS(destination) = to {
+            let _ = destination.delete_file(part_path).await;
+        }
+        Err(StorageError::OperationError(
+            "integrity check failed: source and HDFS partial hashes differ".to_string(),
+        ))
     }
 
     /// integrity 读回校验（issue #58）：hash 读回过程顺带核对读回字节数
@@ -1133,11 +1170,7 @@ impl StorageEnum {
         } else if let Some(source_hash) = source_hash {
             Self::verify_dest_integrity(to, entry, size, &source_hash).await?;
         }
-        Self::apply_copied_metadata(to, entry).await?;
-        if !options.is_source_reserved {
-            from.delete_file(entry).await?;
-        }
-        Ok(())
+        Self::complete_copied_entry(from, to, entry, options.is_source_reserved).await
     }
 
     /// Copy a file with optional `QoS` rate limiting and integrity verification.
@@ -1919,18 +1952,14 @@ impl StorageEnum {
         if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return Err(StorageError::Cancelled);
         }
-        if enable_integrity_check {
-            let source_hash = from.compute_hash(entry.get_relative_path(), size).await?;
-            let destination_hash = to.compute_hash(&part_relative_path, size).await?;
-            if source_hash != destination_hash {
-                if let StorageEnum::HDFS(storage) = to {
-                    let _ = storage.delete_file(&part_relative_path).await;
-                }
-                return Err(StorageError::OperationError(
-                    "integrity check failed: source and HDFS temporary hashes differ".to_string(),
-                ));
-            }
-        }
+        Self::verify_hdfs_partial_integrity(
+            from,
+            to,
+            entry,
+            &part_relative_path,
+            enable_integrity_check,
+        )
+        .await?;
         if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return Err(StorageError::Cancelled);
         }

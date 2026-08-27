@@ -1,5 +1,67 @@
 const MAX_TRANSFER_ID_BYTES: usize = 256;
 
+/// Preparation policy for one stable HDFS staged transfer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HdfsResumeMode {
+    /// Resume a valid partial and create/rebuild missing or overlong state.
+    #[default]
+    Auto,
+    /// Rebuild the matching partial and copy from byte zero.
+    Restart,
+    /// Require an existing valid partial without modifying invalid state.
+    Require,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HdfsPrepareAction {
+    Rebuild,
+    Resume(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HdfsPartialObservation {
+    Missing,
+    File(u64),
+    Directory,
+}
+
+pub(crate) fn plan_staged_prepare(
+    mode: HdfsResumeMode,
+    partial: HdfsPartialObservation,
+    expected_size: u64,
+) -> Result<HdfsPrepareAction, StorageError> {
+    match (mode, partial) {
+        (_, HdfsPartialObservation::Directory) => Err(StorageError::InvalidPath(
+            "HDFS transfer partial path is a directory".to_string(),
+        )),
+        (
+            HdfsResumeMode::Auto | HdfsResumeMode::Require,
+            HdfsPartialObservation::File(size),
+        )
+            if size <= expected_size =>
+        {
+            Ok(HdfsPrepareAction::Resume(size))
+        }
+        (HdfsResumeMode::Restart, _)
+        | (
+            HdfsResumeMode::Auto,
+            HdfsPartialObservation::Missing | HdfsPartialObservation::File(_),
+        ) => {
+            Ok(HdfsPrepareAction::Rebuild)
+        }
+        (HdfsResumeMode::Require, HdfsPartialObservation::Missing) => {
+            Err(StorageError::FileNotFound(
+            "required HDFS transfer partial is missing".to_string(),
+            ))
+        }
+        (HdfsResumeMode::Require, HdfsPartialObservation::File(size)) => {
+            Err(StorageError::OperationError(format!(
+                "required HDFS transfer partial is overlong: size={size}, expected={expected_size}"
+            )))
+        }
+    }
+}
+
 /// A backend-neutral stable source fact available in addition to size and mtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HdfsStableSourceFact<'a> {
@@ -277,6 +339,16 @@ impl HdfsPreparedTransfer {
     #[must_use]
     pub const fn expected_size(&self) -> u64 {
         self.expected_size
+    }
+
+    /// Return the single missing tail range, or `None` when data is complete.
+    #[must_use]
+    pub const fn missing_tail(&self) -> Option<(u64, u64)> {
+        if self.prefix_len < self.expected_size {
+            Some((self.prefix_len, self.expected_size))
+        } else {
+            None
+        }
     }
 
     pub(crate) const fn mode(&self) -> u32 {

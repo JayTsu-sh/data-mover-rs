@@ -306,97 +306,6 @@ impl HDFSStorage {
         )
     }
 
-    /// Prepare a trusted HDFS temporary file for tail-only resume.
-    ///
-    /// Returns the validated contiguous prefix length. Missing and explicitly
-    /// fresh state is created as an empty file; overlong state is rebuilt.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a root/escaping path, directory state, inaccessible
-    /// metadata, or failure to rebuild the temporary file.
-    pub async fn prepare_tail_resume(
-        &self,
-        part_path: &std::path::Path,
-        expected_size: u64,
-        resume: bool,
-    ) -> Result<u64, StorageError> {
-        self.prepare_tail_transfer(part_path, expected_size, resume, 0o644, None)
-            .await
-            .map(|state| state.prefix_len())
-    }
-
-    pub(crate) async fn prepare_tail_transfer(
-        &self,
-        part_path: &std::path::Path,
-        expected_size: u64,
-        resume: bool,
-        mode: u32,
-        replication: Option<u32>,
-    ) -> Result<HdfsPreparedTransfer, StorageError> {
-        let requested = HdfsPreparedTransfer::new(
-            part_path.to_path_buf(),
-            0,
-            expected_size,
-            expected_size,
-            mode,
-            replication,
-        )?;
-        self.prepare_requested_tail_transfer(requested, resume).await
-    }
-
-    /// Prepare a deterministic, source-bound HDFS tail transfer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the derived partial path is unsafe, inaccessible,
-    /// a directory, or cannot be rebuilt for this request.
-    pub async fn prepare_stable_tail_transfer(
-        &self,
-        request: &HdfsTransferRequest,
-        resume: bool,
-    ) -> Result<HdfsPreparedTransfer, StorageError> {
-        let requested = HdfsPreparedTransfer::from_stable_request(request, 0)?;
-        self.prepare_requested_tail_transfer(requested, resume).await
-    }
-
-    async fn prepare_requested_tail_transfer(
-        &self,
-        requested: HdfsPreparedTransfer,
-        resume: bool,
-    ) -> Result<HdfsPreparedTransfer, StorageError> {
-        self.resolve_path(requested.part_path())?;
-        let prefix_len = if resume {
-            match self.get_metadata(requested.part_path()).await {
-                Ok(metadata) if metadata.is_dir => Err(StorageError::InvalidPath(format!(
-                    "HDFS resume temporary path is a directory: {}",
-                    requested.part_path().display()
-                ))),
-                Ok(metadata) if metadata.size <= requested.expected_size() => Ok(metadata.size),
-                Ok(_) | Err(StorageError::FileNotFound(_)) => {
-                    self.rebuild_resume_file(
-                        requested.part_path(),
-                        requested.mode(),
-                        requested.replication(),
-                    )
-                    .await?;
-                    Ok(0)
-                }
-                Err(error) => Err(error),
-            }
-            ?
-        } else {
-            self.rebuild_resume_file(
-                requested.part_path(),
-                requested.mode(),
-                requested.replication(),
-            )
-            .await?;
-            0
-        };
-        requested.with_prefix(prefix_len)
-    }
-
     /// Append one contiguous session to a validated prepared transfer.
     ///
     /// # Errors
@@ -456,24 +365,6 @@ impl HDFSStorage {
     ) -> Result<(), StorageError> {
         state.validate_final_path(final_path)?;
         self.commit_tail_resume(state.part_path(), final_path, state.expected_size())
-            .await
-    }
-
-    async fn rebuild_resume_file(
-        &self,
-        part_path: &std::path::Path,
-        mode: u32,
-        replication: Option<u32>,
-    ) -> Result<(), StorageError> {
-        if let Ok(metadata) = self.get_metadata(part_path).await
-            && metadata.is_dir
-        {
-            return Err(StorageError::InvalidPath(format!(
-                "HDFS resume temporary path is a directory: {}",
-                part_path.display()
-            )));
-        }
-        self.write_file(part_path, bytes::Bytes::new(), mode, replication)
             .await
     }
 

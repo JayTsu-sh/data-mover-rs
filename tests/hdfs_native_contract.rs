@@ -400,6 +400,186 @@ async fn assert_stable_hdfs_resume_binding(
     Ok(())
 }
 
+async fn assert_hdfs_staged_resume_modes(
+    hdfs: &data_mover::HDFSStorage,
+    entry: &data_mover::EntryEnum,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use data_mover::hdfs::HdfsResumeMode;
+
+    let request = data_mover::hdfs_transfer_request(
+        entry,
+        "nightly-mode-transfer",
+        std::path::PathBuf::from("模式/最终.bin"),
+    )?;
+    assert!(
+        hdfs.prepare_staged_tail_transfer(&request, HdfsResumeMode::Require)
+            .await
+            .is_err()
+    );
+    let initial = hdfs
+        .prepare_staged_tail_transfer(&request, HdfsResumeMode::Auto)
+        .await?;
+    assert_eq!(initial.prefix_len(), 0);
+    create_hdfs_file(
+        hdfs,
+        initial.part_path().to_str().ok_or("invalid partial path")?,
+        bytes::Bytes::from_static(b"0123"),
+    )
+    .await?;
+    let automatic = hdfs
+        .prepare_staged_tail_transfer(&request, HdfsResumeMode::Auto)
+        .await?;
+    assert_staged_tail_commit(hdfs, &request, automatic, b"0123456789abcdef").await?;
+
+    let restarted = hdfs
+        .prepare_staged_tail_transfer(&request, HdfsResumeMode::Restart)
+        .await?;
+    assert_eq!(restarted.prefix_len(), 0);
+    assert_staged_tail_commit(hdfs, &request, restarted, b"0123456789abcdef").await?;
+
+    create_hdfs_file(
+        hdfs,
+        request
+            .partial_path()
+            .to_str()
+            .ok_or("invalid partial path")?,
+        bytes::Bytes::from_static(b"0123"),
+    )
+    .await?;
+    let required = hdfs
+        .prepare_staged_tail_transfer(&request, HdfsResumeMode::Require)
+        .await?;
+    assert_eq!(required.prefix_len(), 4);
+    assert_staged_tail_commit(hdfs, &request, required, b"0123456789abcdef").await?;
+
+    create_hdfs_file(
+        hdfs,
+        request
+            .partial_path()
+            .to_str()
+            .ok_or("invalid partial path")?,
+        bytes::Bytes::from_static(b"0123456789abcdefx"),
+    )
+    .await?;
+    assert!(
+        hdfs.prepare_staged_tail_transfer(&request, HdfsResumeMode::Require)
+            .await
+            .is_err()
+    );
+    assert_eq!(hdfs.get_metadata(request.partial_path()).await?.size, 17);
+    let recovered = hdfs
+        .prepare_staged_tail_transfer(&request, HdfsResumeMode::Auto)
+        .await?;
+    assert_eq!(recovered.prefix_len(), 0);
+    hdfs.delete_file(request.partial_path()).await?;
+    hdfs.create_dir_all(request.partial_path(), 0o755).await?;
+    for mode in [
+        HdfsResumeMode::Auto,
+        HdfsResumeMode::Restart,
+        HdfsResumeMode::Require,
+    ] {
+        assert!(
+            hdfs.prepare_staged_tail_transfer(&request, mode)
+                .await
+                .is_err()
+        );
+        assert!(hdfs.get_metadata(request.partial_path()).await?.is_dir);
+    }
+    Ok(())
+}
+
+async fn assert_staged_tail_commit(
+    hdfs: &data_mover::HDFSStorage,
+    request: &data_mover::hdfs::HdfsTransferRequest,
+    state: data_mover::hdfs::HdfsPreparedTransfer,
+    payload: &'static [u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prefix = usize::try_from(state.prefix_len())?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    if prefix < payload.len() {
+        sender
+            .send(data_mover::DataChunk {
+                offset: state.prefix_len(),
+                data: bytes::Bytes::from_static(&payload[prefix..]),
+            })
+            .await?;
+    }
+    drop(sender);
+    hdfs.append_prepared_tail(receiver, &state, None, None)
+        .await?;
+    hdfs.commit_prepared_tail(&state, request.final_path())
+        .await?;
+    let handle = hdfs.open_file(request.final_path()).await?;
+    assert_eq!(
+        hdfs.read_at(&handle, 0, payload.len() as u64).await?,
+        payload
+    );
+    Ok(())
+}
+
+async fn assert_zero_byte_staged_commit(
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = data_mover::hdfs::HdfsTransferRequest::new(
+        "nightly-zero-transfer",
+        data_mover::hdfs::HdfsSourceFingerprint::new(0, 0, None),
+        std::path::PathBuf::from("模式/zero.bin"),
+        0,
+        0o640,
+        Some(2),
+    )?;
+    let state = hdfs
+        .prepare_staged_tail_transfer(&request, data_mover::hdfs::HdfsResumeMode::Auto)
+        .await?;
+    assert_eq!(state.missing_tail(), None);
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    drop(sender);
+    hdfs.append_prepared_tail(receiver, &state, None, None)
+        .await?;
+    hdfs.commit_prepared_tail(&state, request.final_path())
+        .await?;
+    assert_eq!(hdfs.get_metadata(request.final_path()).await?.size, 0);
+    Ok(())
+}
+
+async fn assert_common_recoverable_hdfs_copy(
+    destination: &StorageEnum,
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local_root = hdfs_lab_local_path("recoverable-copy")?;
+    tokio::fs::create_dir_all(&local_root).await?;
+    let payload = b"common recoverable HDFS copy";
+    tokio::fs::write(local_root.join("common.bin"), payload).await?;
+    let source = create_storage(
+        local_root.to_str().ok_or("invalid local lab path")?,
+        CreateStorageOptions::new(None, true),
+    )
+    .await?;
+    let entry = source
+        .get_metadata(std::path::Path::new("common.bin"))
+        .await?;
+    let callback: data_mover::CommitCallback = Arc::new(|_, _| {});
+    StorageEnum::copy_file_hdfs_recoverable(
+        &source,
+        destination,
+        &entry,
+        CopyOptions {
+            enable_integrity_check: true,
+            is_source_reserved: true,
+            ..Default::default()
+        },
+        data_mover::HdfsRecoverableCopyOptions::new("nightly-common-copy", callback),
+    )
+    .await?;
+    let handle = hdfs.open_file(std::path::Path::new("common.bin")).await?;
+    assert_eq!(
+        hdfs.read_at(&handle, 0, payload.len() as u64).await?,
+        &payload[..]
+    );
+    tokio::fs::remove_dir_all(local_root).await?;
+    Ok(())
+}
+
 async fn assert_hdfs_overwrite_rename(
     storage: &StorageEnum,
     hdfs: &data_mover::HDFSStorage,
@@ -1214,6 +1394,9 @@ async fn nightly_lab_prepares_persistent_hdfs_tail_resume_state()
     );
 
     Box::pin(assert_stable_hdfs_resume_binding(hdfs, &entry)).await?;
+    Box::pin(assert_hdfs_staged_resume_modes(hdfs, &entry)).await?;
+    Box::pin(assert_zero_byte_staged_commit(hdfs)).await?;
+    Box::pin(assert_common_recoverable_hdfs_copy(&storage, hdfs)).await?;
     hdfs.delete_storage_root().await?;
     Ok(())
 }

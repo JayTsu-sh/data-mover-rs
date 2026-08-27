@@ -19,6 +19,7 @@ pub mod error;
 pub use error::{HdfsErrorKind, HdfsOperationError};
 pub mod filter;
 pub mod hdfs;
+mod hdfs_recoverable_copy;
 mod hdfs_transfer_mapping;
 pub mod integrity_check;
 pub mod local;
@@ -44,6 +45,7 @@ pub use hdfs::{
     HDFSStorage, HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation,
     build_hdfs_client, create_hdfs_storage,
 };
+pub use hdfs_recoverable_copy::HdfsRecoverableCopyOptions;
 pub use hdfs_transfer_mapping::{hdfs_source_fingerprint, hdfs_transfer_request};
 pub use integrity_check::{
     IntegrityCheck, IntegrityCheckMode, IntegrityCheckOptions, IntegrityEntryKind, IntegritySide,
