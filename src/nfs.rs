@@ -518,6 +518,7 @@ pub struct NFSStorage {
     root_fh: Arc<std::sync::RwLock<Bytes>>,
     /// 根路径（NFS 路径始终用 '/' 分隔，不依赖平台 `PathBuf`）
     root: Arc<String>,
+    namespace_identity: Arc<String>,
     /// 存储配置
     pub(crate) config: StorageConfig,
     /// `root_fh` 刷新代数，每次成功刷新 +1，用于合并并发刷新
@@ -548,6 +549,9 @@ fn build_cache_root_fh(server_id: u64, raw_fh: &Bytes) -> Bytes {
 }
 
 impl NFSStorage {
+    pub(crate) fn transfer_namespace(&self) -> &str {
+        &self.namespace_identity
+    }
     /// Overrides the per-file read and write concurrency for this adapter.
     #[must_use]
     pub fn with_transfer_concurrency(mut self, concurrency: TransferConcurrency) -> Self {
@@ -690,6 +694,7 @@ impl NFSStorage {
             root_fh: Arc::new(std::sync::RwLock::new(mount_fh)),
             mount: Arc::new(mount),
             root: Arc::new(String::new()),
+            namespace_identity: Arc::new(format!("{nfs_url}#{root_dir}")),
             config: StorageConfig {
                 block_size: effective_block_size,
                 transfer_concurrency: resolve_transfer_concurrency(

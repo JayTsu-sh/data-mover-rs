@@ -922,6 +922,15 @@ impl S3Storage {
         &self.endpoint
     }
 
+    pub(crate) fn transfer_namespace(&self) -> String {
+        format!(
+            "{}/{}/{}",
+            self.endpoint,
+            self.bucket_name,
+            self.prefix.as_deref().unwrap_or_default()
+        )
+    }
+
     /// 删除单个 S3 对象
     ///
     /// # Errors

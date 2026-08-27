@@ -34,7 +34,7 @@ impl HdfsRecoverableCopyOptions {
 impl StorageEnum {
     /// Copy one file through the stable HDFS staged lifecycle.
     ///
-    /// This opt-in entry point does not change the behavior of [`Self::copy_file`].
+    /// [`Self::copy_file`] uses this lifecycle in `Auto` mode for HDFS destinations.
     ///
     /// # Errors
     ///

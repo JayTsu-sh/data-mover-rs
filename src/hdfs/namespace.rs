@@ -8,6 +8,9 @@ pub struct HDFSStorage {
 }
 
 impl HDFSStorage {
+    pub(crate) fn transfer_namespace(&self) -> String {
+        format!("{}{}", self.location.endpoint(), self.location.root())
+    }
     #[must_use]
     pub const fn client(&self) -> &Client {
         &self.client

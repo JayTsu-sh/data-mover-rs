@@ -405,6 +405,7 @@ pub struct CifsStorage {
     share_path: Arc<UncPath>,
     /// 共享内的子目录前缀（相对路径）
     root: Arc<String>,
+    namespace_identity: Arc<String>,
     /// 存储配置
     pub(crate) config: StorageConfig,
     /// 目录枚举使用的 SMB info class，首次扫描时通过 `OnceCell::get_or_init`
@@ -578,6 +579,9 @@ fn parse_smb_url(url_str: &str) -> Result<(String, u16, String, String, String, 
 }
 
 impl CifsStorage {
+    pub(crate) fn transfer_namespace(&self) -> &str {
+        &self.namespace_identity
+    }
     /// Overrides the per-file read and write concurrency for this adapter.
     #[must_use]
     pub fn with_transfer_concurrency(mut self, concurrency: TransferConcurrency) -> Self {
@@ -696,10 +700,12 @@ impl CifsStorage {
             requested
         );
 
+        let namespace_identity = format!("{host}:{port}/{share}/{sub_path}");
         Ok(CifsStorage {
             client: Arc::new(client),
             share_path: Arc::new(share_path),
             root: Arc::new(sub_path),
+            namespace_identity: Arc::new(namespace_identity),
             config: StorageConfig {
                 block_size: effective_block_size,
                 transfer_concurrency: resolve_transfer_concurrency(

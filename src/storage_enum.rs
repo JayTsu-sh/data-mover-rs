@@ -19,34 +19,12 @@ const HASH_CHANNEL_CAPACITY: usize = 4;
 pub(crate) const COPY_PIPELINE_CAPACITY: usize = 4;
 /// TAR 打包 pipeline 的 channel 容量（多文件顺序读，适当放大缓冲）
 const TAR_PIPELINE_CAPACITY: usize = 16;
-static NEXT_HDFS_FRESH_TEMP: AtomicU64 = AtomicU64::new(1);
-
 struct MultiCopyOptions {
     qos: Option<QosManager>,
     enable_integrity_check: bool,
     is_source_reserved: bool,
     bytes_counter: Option<Arc<AtomicU64>>,
     cancel: Option<CancellationToken>,
-    hdfs_temp_path: Option<PathBuf>,
-}
-
-fn hdfs_fresh_temp_path(final_path: &Path) -> Result<PathBuf> {
-    let file_name = final_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            StorageError::InvalidPath("HDFS fresh destination must name a UTF-8 file".to_string())
-        })?;
-    let epoch_nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| StorageError::OperationError(format!("system clock error: {error}")))?
-        .as_nanos();
-    let sequence = NEXT_HDFS_FRESH_TEMP.fetch_add(1, Ordering::Relaxed);
-    let temp_name = format!(
-        ".{file_name}.data-mover-{}-{epoch_nanos}-{sequence}.part",
-        std::process::id()
-    );
-    Ok(final_path.with_file_name(temp_name))
 }
 
 #[derive(Debug, Clone)]
@@ -1057,57 +1035,6 @@ impl StorageEnum {
         Ok(())
     }
 
-    async fn cleanup_hdfs_fresh_temp(to: &StorageEnum, path: &Path) {
-        let StorageEnum::HDFS(storage) = to else {
-            return;
-        };
-        if let Err(error) = storage.delete_file(path).await
-            && !matches!(error, StorageError::FileNotFound(_))
-        {
-            warn!("failed to clean up HDFS fresh temporary file {path:?}: {error}");
-        }
-    }
-
-    async fn finalize_hdfs_fresh_copy(
-        to: &StorageEnum,
-        temp_path: &Path,
-        final_path: &Path,
-        expected_size: u64,
-        source_hash: Option<&str>,
-    ) -> Result<()> {
-        let StorageEnum::HDFS(storage) = to else {
-            return Err(StorageError::OperationError(
-                "HDFS fresh finalization requires an HDFS destination".to_string(),
-            ));
-        };
-        let result = async {
-            let metadata = storage.get_metadata(temp_path).await?;
-            if metadata.is_dir || metadata.size != expected_size {
-                return Err(StorageError::OperationError(format!(
-                    "HDFS temporary length check failed: got {}, expected {expected_size}: {}",
-                    metadata.size,
-                    temp_path.display()
-                )));
-            }
-            if let Some(source_hash) = source_hash {
-                let (destination_hash, read_back) =
-                    to.compute_hash_and_len(temp_path, expected_size).await?;
-                if read_back != expected_size || destination_hash != source_hash {
-                    return Err(StorageError::OperationError(format!(
-                        "integrity check failed for HDFS temporary file: {}",
-                        temp_path.display()
-                    )));
-                }
-            }
-            storage.rename(temp_path, final_path).await
-        }
-        .await;
-        if result.is_err() {
-            Self::cleanup_hdfs_fresh_temp(to, temp_path).await;
-        }
-        result
-    }
-
     async fn copy_single_chunk(
         from: &StorageEnum,
         to: &StorageEnum,
@@ -1161,39 +1088,15 @@ impl StorageEnum {
         } else {
             None
         };
-        let temp_path = matches!(to, StorageEnum::HDFS(_))
-            .then(|| hdfs_fresh_temp_path(entry.get_relative_path()))
-            .transpose()?;
-        let write_path = temp_path
-            .as_deref()
-            .unwrap_or_else(|| entry.get_relative_path());
-        if let Err(error) = Self::write_file_from_bytes_at(to, entry, data, write_path).await {
-            if let Some(path) = temp_path.as_deref() {
-                Self::cleanup_hdfs_fresh_temp(to, path).await;
-            }
+        if let Err(error) =
+            Self::write_file_from_bytes_at(to, entry, data, entry.get_relative_path()).await
+        {
             return Err(destination_write_error(&error));
         }
         if let Some(counter) = &options.bytes_counter {
             counter.fetch_add(size, Ordering::Relaxed);
         }
-        if let Some(path) = temp_path.as_deref() {
-            if options
-                .cancel
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
-            {
-                Self::cleanup_hdfs_fresh_temp(to, path).await;
-                return Err(StorageError::Cancelled);
-            }
-            Self::finalize_hdfs_fresh_copy(
-                to,
-                path,
-                entry.get_relative_path(),
-                size,
-                source_hash.as_deref(),
-            )
-            .await?;
-        } else if let Some(source_hash) = source_hash {
+        if let Some(source_hash) = source_hash {
             Self::verify_dest_integrity(to, entry, size, &source_hash).await?;
         }
         Self::complete_copied_entry(from, to, entry, options.is_source_reserved).await
@@ -1226,6 +1129,13 @@ impl StorageEnum {
         entry: &EntryEnum,
         options: CopyOptions,
     ) -> Result<()> {
+        if matches!(to, StorageEnum::HDFS(_)) {
+            let recovery = crate::HdfsRecoverableCopyOptions::new(
+                crate::hdfs_transfer_mapping::hdfs_default_transfer_identity(from, entry),
+                Arc::new(|_, _| {}),
+            );
+            return Self::copy_file_hdfs_recoverable(from, to, entry, options, recovery).await;
+        }
         let single_options = options.clone();
         let CopyOptions {
             qos,
@@ -1243,10 +1153,6 @@ impl StorageEnum {
         }
 
         let size = entry.get_size();
-        let hdfs_temp_path = matches!(to, StorageEnum::HDFS(_))
-            .then(|| hdfs_fresh_temp_path(entry.get_relative_path()))
-            .transpose()?;
-
         // ── S3 → S3（无 QoS 时走原生路径；有 QoS 时 fall-through 到下方单块/多块逻辑）
         if let (StorageEnum::S3(src), StorageEnum::S3(dst), EntryEnum::S3(e)) = (from, to, entry)
             && qos.is_none()
@@ -1288,7 +1194,6 @@ impl StorageEnum {
                 is_source_reserved,
                 bytes_counter,
                 cancel,
-                hdfs_temp_path,
             },
         )
         .await
@@ -1304,11 +1209,7 @@ impl StorageEnum {
         let (source_hasher, bytes_written) =
             Self::run_copy_pipeline(from, to, entry, size, &options).await?;
         if bytes_written != size {
-            if let Some(path) = options.hdfs_temp_path.as_deref() {
-                Self::cleanup_hdfs_fresh_temp(to, path).await;
-            } else {
-                Self::cleanup_mismatched_dest(to, entry).await;
-            }
+            Self::cleanup_mismatched_dest(to, entry).await;
             return Err(StorageError::OperationError(format!(
                 "size check failed: wrote {bytes_written} bytes, expected {size}: {}",
                 entry.get_relative_path().display()
@@ -1319,25 +1220,13 @@ impl StorageEnum {
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
         {
-            if let Some(path) = options.hdfs_temp_path.as_deref() {
-                Self::cleanup_hdfs_fresh_temp(to, path).await;
-            }
             return Err(StorageError::Cancelled);
         }
         let source_hash = options
             .enable_integrity_check
             .then(|| source_hasher.map(ConsistencyCheck::finalize))
             .flatten();
-        if let Some(path) = options.hdfs_temp_path.as_deref() {
-            Self::finalize_hdfs_fresh_copy(
-                to,
-                path,
-                entry.get_relative_path(),
-                size,
-                source_hash.as_deref(),
-            )
-            .await?;
-        } else if let Some(src_hash) = source_hash {
+        if let Some(src_hash) = source_hash {
             Self::verify_dest_integrity(to, entry, size, &src_hash).await?;
         }
         Self::apply_copied_metadata(to, entry).await?;
@@ -1359,11 +1248,7 @@ impl StorageEnum {
         let to_c = to.clone();
         let entry_r = entry.clone();
         let entry_w = entry.clone();
-        let write_path = options
-            .hdfs_temp_path
-            .as_deref()
-            .unwrap_or_else(|| entry.get_relative_path())
-            .to_path_buf();
+        let write_path = entry.get_relative_path().to_path_buf();
         let qos = options.qos.clone();
         let enable_integrity_check = options.enable_integrity_check;
         let bytes_counter = options.bytes_counter.clone();
@@ -1392,9 +1277,6 @@ impl StorageEnum {
                     read_abort.abort();
                     write_abort.abort();
                     let _ = join_io.await;
-                    if let Some(path) = options.hdfs_temp_path.as_deref() {
-                        Self::cleanup_hdfs_fresh_temp(to, path).await;
-                    }
                     return Err(StorageError::Cancelled);
                 }
             },
@@ -1403,9 +1285,6 @@ impl StorageEnum {
         let read_res = match read_res {
             Ok(result) => result,
             Err(error) => {
-                if let Some(path) = options.hdfs_temp_path.as_deref() {
-                    Self::cleanup_hdfs_fresh_temp(to, path).await;
-                }
                 return Err(StorageError::OperationError(format!(
                     "read task panicked: {error:?}"
                 )));
@@ -1414,23 +1293,12 @@ impl StorageEnum {
         let write_res = match write_res {
             Ok(result) => result,
             Err(error) => {
-                if let Some(path) = options.hdfs_temp_path.as_deref() {
-                    Self::cleanup_hdfs_fresh_temp(to, path).await;
-                }
                 return Err(StorageError::OperationError(format!(
                     "write task panicked: {error:?}"
                 )));
             }
         };
-        match resolve_copy_pipeline(read_res, write_res) {
-            Ok(result) => Ok(result),
-            Err(error) => {
-                if let Some(path) = options.hdfs_temp_path.as_deref() {
-                    Self::cleanup_hdfs_fresh_temp(to, path).await;
-                }
-                Err(error)
-            }
-        }
+        resolve_copy_pipeline(read_res, write_res)
     }
 
     // ========================================================
@@ -3279,26 +3147,6 @@ mod tests {
             .await
             .assert_value("delete file from HDFS entry");
         assert!(!file_path.exists());
-    }
-
-    #[test]
-    fn hdfs_fresh_temp_paths_are_unique_siblings_and_preserve_unicode() {
-        let final_path = Path::new("目录/嵌套/文件.bin");
-        let first = hdfs_fresh_temp_path(final_path).assert_value("temporary path");
-        let second = hdfs_fresh_temp_path(final_path).assert_value("temporary path");
-        assert_ne!(first, second);
-        assert_eq!(first.parent(), final_path.parent());
-        let name = first
-            .file_name()
-            .and_then(|name| name.to_str())
-            .assert_value("UTF-8 temporary name");
-        assert!(name.starts_with(".文件.bin.data-mover-"));
-        assert!(
-            Path::new(name)
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("part"))
-        );
-        assert!(hdfs_fresh_temp_path(Path::new("")).is_err());
     }
 
     #[test]
