@@ -45,7 +45,6 @@ struct SequentialWriteContext<'a> {
     expected_size: u64,
     require_final_size: bool,
     bytes_counter: Option<&'a Arc<AtomicU64>>,
-    on_committed: Option<&'a crate::CommitCallback>,
 }
 pub(crate) enum AppendCompletion {
     Complete(u64),

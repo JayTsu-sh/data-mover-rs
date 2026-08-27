@@ -1401,7 +1401,14 @@ impl StorageEnum {
         let size = entry.get_size();
 
         if let StorageEnum::HDFS(storage) = dest {
-            let prefix_len = storage.prepare_tail_resume(part_path, size, resume).await?;
+            let (mode, replication) = match entry {
+                EntryEnum::NAS(entry) => (entry.mode & 0o7777, None),
+                EntryEnum::S3(_) => (0o644, None),
+                EntryEnum::HDFS(entry) => (entry.mode & 0o7777, entry.replication),
+            };
+            let prefix_len = storage
+                .prepare_tail_resume_with_options(part_path, size, resume, mode, replication)
+                .await?;
             let missing = (prefix_len < size).then_some((prefix_len, size));
             return Ok((
                 missing.into_iter().collect(),
@@ -1925,7 +1932,6 @@ impl StorageEnum {
             return Err(StorageError::Cancelled);
         }
         Self::commit_chunk_stream(to, entry, size, handle).await?;
-        Self::apply_copied_metadata(to, entry).await?;
         if !is_source_reserved {
             from.delete_file(entry).await?;
         }

@@ -1,3 +1,7 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use data_mover::dir_tree::NdxEvent;
 use data_mover::dir_tree::{DirHandle, ReadContext};
 use data_mover::hdfs::HdfsScanEvent;
@@ -232,6 +236,29 @@ async fn write_hdfs_resume_tail(
     handle: &StreamHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    let ranges = Arc::new(Mutex::new(Vec::new()));
+    let callback_ranges = ranges.clone();
+    let callback: data_mover::CommitCallback = Arc::new(move |offset, length| {
+        if let Ok(mut ranges) = callback_ranges.lock() {
+            ranges.push((offset, length));
+        }
+    });
+    let counter = Arc::new(AtomicU64::new(0));
+    let storage = storage.clone();
+    let entry = entry.clone();
+    let handle = handle.clone();
+    let counter_for_writer = counter.clone();
+    let writer = tokio::spawn(async move {
+        StorageEnum::write_chunk_stream(
+            &storage,
+            &entry,
+            receiver,
+            &handle,
+            Some(counter_for_writer),
+            callback,
+        )
+        .await
+    });
     sender
         .send(data_mover::DataChunk {
             offset: 8,
@@ -244,31 +271,29 @@ async fn write_hdfs_resume_tail(
             data: bytes::Bytes::from_static(b"4567"),
         })
         .await?;
-    drop(sender);
-    let ranges = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let callback_ranges = ranges.clone();
-    let callback: data_mover::CommitCallback = std::sync::Arc::new(move |offset, length| {
-        if let Ok(mut ranges) = callback_ranges.lock() {
-            ranges.push((offset, length));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while counter.load(Ordering::Relaxed) != 12 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    });
-    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    Box::pin(StorageEnum::write_chunk_stream(
-        storage,
-        entry,
-        receiver,
-        handle,
-        Some(counter.clone()),
-        callback,
-    ))
-    .await?;
-    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 12);
+    })
+    .await
+    .map_err(|_| "HDFS resume writer did not consume the open session")?;
+    assert!(
+        ranges
+            .lock()
+            .map_err(|_| "callback ranges poisoned")?
+            .is_empty(),
+        "HDFS resume progress must wait for writer close"
+    );
+    drop(sender);
+    writer.await??;
+    assert_eq!(counter.load(Ordering::Relaxed), 12);
     assert_eq!(
         ranges
             .lock()
             .map_err(|_| "callback ranges poisoned")?
             .as_slice(),
-        &[(4, 4), (8, 8)]
+        &[(4, 12)]
     );
     Ok(())
 }
@@ -2288,6 +2313,20 @@ async fn assert_hdfs_to_hdfs_resume(
     let entry = source
         .get_metadata(std::path::Path::new("hdfs-source.bin"))
         .await?;
+    let fresh_part = std::path::Path::new("fresh-options.part");
+    let (fresh_missing, _) =
+        StorageEnum::resume_prepare(&destination, &entry, fresh_part, false).await?;
+    assert_eq!(fresh_missing, vec![(0, u64::try_from(data.len())?)]);
+    let fresh_metadata = destination_hdfs.get_metadata(fresh_part).await?;
+    assert_eq!(
+        fresh_metadata.mode,
+        entry.get_mode().ok_or("missing HDFS mode")? & 0o7777
+    );
+    let data_mover::EntryEnum::HDFS(source_entry) = &entry else {
+        return Err("HDFS source did not produce an HDFS entry".into());
+    };
+    assert_eq!(fresh_metadata.replication, source_entry.replication);
+    destination_hdfs.delete_file(fresh_part).await?;
     let split = 1_300_000;
     create_hdfs_file(
         destination_hdfs,
@@ -3031,7 +3070,7 @@ async fn nightly_lab_retains_hdfs_source_when_copy_metadata_fails()
     // rejected deterministically, independent of the authenticated user's
     // superuser status, so this remains valid for both Simple and Kerberos labs.
     hdfs_entry.mtime = -1;
-    let result = StorageEnum::copy_file(
+    let result = Box::pin(StorageEnum::copy_file_resumable(
         &source,
         &destination,
         &entry,
@@ -3040,7 +3079,8 @@ async fn nightly_lab_retains_hdfs_source_when_copy_metadata_fails()
             enable_integrity_check: true,
             ..Default::default()
         },
-    )
+        resume_context("failure.bin.part", vec![(0, u64::try_from(payload.len())?)]),
+    ))
     .await;
     assert!(
         matches!(

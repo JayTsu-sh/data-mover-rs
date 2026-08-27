@@ -25,6 +25,50 @@ mod tests {
         assert_eq!(super::DEFAULT_BLOCK_SIZE, 8 * crate::MB);
     }
 
+    #[test]
+    fn confirmed_append_range_reports_one_persisted_session() {
+        let Ok(confirmed) = super::confirmed_append_range(4, 16, 16) else {
+            panic!("confirmed append range failed");
+        };
+        assert_eq!(confirmed, Some((4, 12)));
+        let Ok(empty) = super::confirmed_append_range(16, 16, 16) else {
+            panic!("empty append range failed");
+        };
+        assert_eq!(empty, None);
+    }
+
+    #[test]
+    fn confirmed_append_range_rejects_unconfirmed_length() {
+        let result = super::confirmed_append_range(4, 16, 12);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn append_progress_requires_successful_write_and_persisted_length() {
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let callback_count = callbacks.clone();
+        let callback: crate::CommitCallback = Arc::new(move |_, _| {
+            callback_count.fetch_add(1, Ordering::Relaxed);
+        });
+        let close_failure = super::settle_append_progress(
+            4,
+            Err(StorageError::OperationError("close failed".to_string())),
+            None,
+            Some(&callback),
+        );
+        assert!(close_failure.is_err());
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+
+        let length_mismatch =
+            super::settle_append_progress(4, Ok(16), Some(12), Some(&callback));
+        assert!(length_mismatch.is_err());
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+
+        let confirmed = super::settle_append_progress(4, Ok(16), Some(16), Some(&callback));
+        assert_eq!(confirmed.ok(), Some(16));
+        assert_eq!(callbacks.load(Ordering::Relaxed), 1);
+    }
+
     #[tokio::test]
     async fn adapter_retry_is_bounded_and_eventually_succeeds() {
         assert_eq!(super::HDFS_ADAPTER_MAX_ATTEMPTS, 5);
