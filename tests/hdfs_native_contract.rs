@@ -558,19 +558,47 @@ async fn assert_common_recoverable_hdfs_copy(
     let entry = source
         .get_metadata(std::path::Path::new("common.bin"))
         .await?;
-    let callback: data_mover::CommitCallback = Arc::new(|_, _| {});
-    StorageEnum::copy_file_hdfs_recoverable(
+    let mut identity_hasher = blake3::Hasher::new();
+    identity_hasher.update(b"data-mover:hdfs-default-copy-identity:v1\0");
+    identity_hasher.update(b"local\0");
+    identity_hasher.update(local_root.to_string_lossy().as_bytes());
+    identity_hasher.update(b"\0common.bin");
+    let identity_digest = identity_hasher.finalize().to_hex();
+    let identity = format!("default-copy-{}", &identity_digest[..32]);
+    let request = data_mover::hdfs_transfer_request(
+        &entry,
+        &identity,
+        entry.get_relative_path().to_path_buf(),
+    )?;
+    let split = 9_usize;
+    create_hdfs_file(
+        hdfs,
+        request
+            .partial_path()
+            .to_str()
+            .ok_or("invalid deterministic partial path")?,
+        bytes::Bytes::copy_from_slice(&payload[..split]),
+    )
+    .await?;
+    assert!(hdfs.get_metadata(request.final_path()).await.is_err());
+    let bytes_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    StorageEnum::copy_file(
         &source,
         destination,
         &entry,
         CopyOptions {
             enable_integrity_check: true,
             is_source_reserved: true,
+            bytes_counter: Some(bytes_counter.clone()),
             ..Default::default()
         },
-        data_mover::HdfsRecoverableCopyOptions::new("nightly-common-copy", callback),
     )
     .await?;
+    assert_eq!(
+        bytes_counter.load(std::sync::atomic::Ordering::Relaxed),
+        u64::try_from(payload.len() - split)?
+    );
+    assert!(hdfs.get_metadata(request.partial_path()).await.is_err());
     let handle = hdfs.open_file(std::path::Path::new("common.bin")).await?;
     assert_eq!(
         hdfs.read_at(&handle, 0, payload.len() as u64).await?,
@@ -2287,12 +2315,19 @@ async fn assert_failed_fresh_copy_is_isolated(
             .get_size(),
         0
     );
-    assert!(
-        hdfs.list_directory(std::path::Path::new(""))
-            .await?
-            .iter()
-            .all(|entry| !entry.name.contains("data-mover-"))
-    );
+    let recoverable_partials = hdfs
+        .list_directory(std::path::Path::new(""))
+        .await?
+        .into_iter()
+        .filter(|entry| {
+            entry.name.contains("data-mover-")
+                && std::path::Path::new(&entry.name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("part"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recoverable_partials.len(), 1);
+    assert_eq!(recoverable_partials[0].size, 1_100_000);
     Ok(())
 }
 
@@ -2324,13 +2359,21 @@ async fn assert_nas_metadata_failure_retains_source(
     .await;
     assert!(result.is_err());
     assert!(tokio::fs::metadata(&source_path).await.is_ok());
-    let committed = hdfs.open_file(relative).await?;
-    assert_eq!(hdfs.read_at(&committed, 0, 64).await?, payload);
-    assert!(
-        hdfs.list_directory(std::path::Path::new(""))
-            .await?
-            .iter()
-            .all(|entry| !entry.name.contains("data-mover-"))
+    assert!(hdfs.get_metadata(relative).await.is_err());
+    let mut identity_hasher = blake3::Hasher::new();
+    identity_hasher.update(b"data-mover:hdfs-default-copy-identity:v1\0");
+    identity_hasher.update(b"local\0");
+    identity_hasher.update(local_root.to_string_lossy().as_bytes());
+    identity_hasher.update(b"\0metadata-failure.bin");
+    let identity_digest = identity_hasher.finalize().to_hex();
+    let request = data_mover::hdfs_transfer_request(
+        &entry,
+        &format!("default-copy-{}", &identity_digest[..32]),
+        relative.to_path_buf(),
+    )?;
+    assert_eq!(
+        hdfs.get_metadata(request.partial_path()).await?.size,
+        u64::try_from(payload.len())?
     );
     Ok(())
 }
