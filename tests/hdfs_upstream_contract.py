@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and exercise the hdfs-native PR dependency contract."""
+"""Validate and exercise the rolling upstream hdfs-native dependency contract."""
 
 from __future__ import annotations
 
@@ -13,12 +13,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK_SOURCE = re.compile(
-    r"^git\+https://github\.com/JayTsu-sh/hdfs-native\?branch="
-    r"feature%2Fper-client-kerberos-credentials#([0-9a-f]{40})$"
+    r"^git\+https://github\.com/Kimahriman/hdfs-native\?branch=master"
+    r"#([0-9a-f]{40})$"
 )
 EXPECTED_DEPENDENCY = {
-    "git": "https://github.com/JayTsu-sh/hdfs-native",
-    "branch": "feature/per-client-kerberos-credentials",
+    "git": "https://github.com/Kimahriman/hdfs-native",
+    "branch": "master",
 }
 
 
@@ -39,7 +39,7 @@ def validate_manifest() -> None:
     dependency = manifest["dependencies"]["hdfs-native"]
     if dependency != EXPECTED_DEPENDENCY:
         raise ValueError(
-            "hdfs-native must follow the per-client Kerberos credentials PR branch"
+            "hdfs-native must follow the official upstream master branch"
         )
 
 
