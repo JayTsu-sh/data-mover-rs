@@ -10,6 +10,17 @@ pub enum HdfsCancellationDisposition {
     Discard,
 }
 
+/// Non-destructive observation of one request-bound recoverable partial.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HdfsRecoverableState {
+    /// The deterministic partial does not exist.
+    Missing,
+    /// The partial contains this trusted contiguous-prefix length.
+    Partial(u64),
+    /// The partial has the exact expected length and can be verified and committed.
+    CommitReady,
+}
+
 /// Preparation policy for one stable HDFS staged transfer.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HdfsResumeMode {
@@ -33,6 +44,27 @@ pub(crate) enum HdfsPartialObservation {
     Missing,
     File(u64),
     Directory,
+}
+
+pub(crate) fn classify_recoverable_state(
+    partial: HdfsPartialObservation,
+    expected_size: u64,
+) -> Result<HdfsRecoverableState, StorageError> {
+    match partial {
+        HdfsPartialObservation::Missing => Ok(HdfsRecoverableState::Missing),
+        HdfsPartialObservation::Directory => Err(StorageError::InvalidPath(
+            "HDFS transfer partial path is a directory".to_string(),
+        )),
+        HdfsPartialObservation::File(size) if size == expected_size => {
+            Ok(HdfsRecoverableState::CommitReady)
+        }
+        HdfsPartialObservation::File(size) if size < expected_size => {
+            Ok(HdfsRecoverableState::Partial(size))
+        }
+        HdfsPartialObservation::File(size) => Err(StorageError::OperationError(format!(
+            "HDFS transfer partial is overlong: size={size}, expected={expected_size}"
+        ))),
+    }
 }
 
 pub(crate) fn plan_staged_prepare(
