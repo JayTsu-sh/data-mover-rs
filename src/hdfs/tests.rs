@@ -420,6 +420,34 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_state_observation_classifies_only_valid_prefixes() {
+        use super::HdfsPartialObservation::{Directory, File, Missing};
+
+        assert_eq!(
+            super::classify_recoverable_state(Missing, 16)
+                .unwrap_or_else(|error| panic!("missing state was rejected: {error}")),
+            super::HdfsRecoverableState::Missing
+        );
+        assert_eq!(
+            super::classify_recoverable_state(File(0), 16)
+                .unwrap_or_else(|error| panic!("empty partial was rejected: {error}")),
+            super::HdfsRecoverableState::Partial(0)
+        );
+        assert_eq!(
+            super::classify_recoverable_state(File(15), 16)
+                .unwrap_or_else(|error| panic!("partial prefix was rejected: {error}")),
+            super::HdfsRecoverableState::Partial(15)
+        );
+        assert_eq!(
+            super::classify_recoverable_state(File(16), 16)
+                .unwrap_or_else(|error| panic!("commit-ready state was rejected: {error}")),
+            super::HdfsRecoverableState::CommitReady
+        );
+        assert!(super::classify_recoverable_state(File(17), 16).is_err());
+        assert!(super::classify_recoverable_state(Directory, 16).is_err());
+    }
+
+    #[test]
     fn stable_prepared_state_keeps_source_and_destination_binding() {
         let request = super::HdfsTransferRequest::new(
             "transfer",

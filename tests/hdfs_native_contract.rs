@@ -542,6 +542,111 @@ async fn assert_zero_byte_staged_commit(
     Ok(())
 }
 
+async fn assert_request_scoped_recoverable_state_gc(
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    hdfs.create_dir_all(std::path::Path::new("gc"), 0o750)
+        .await?;
+    let request = data_mover::hdfs::HdfsTransferRequest::new(
+        "nightly-gc-state",
+        data_mover::hdfs::HdfsSourceFingerprint::new(16, 123, None),
+        std::path::PathBuf::from("gc/final.bin"),
+        16,
+        0o640,
+        None,
+    )?;
+    assert_eq!(
+        hdfs.observe_recoverable_state(&request).await?,
+        data_mover::hdfs::HdfsRecoverableState::Missing
+    );
+    create_hdfs_file(
+        hdfs,
+        request
+            .partial_path()
+            .to_str()
+            .ok_or("invalid GC partial path")?,
+        bytes::Bytes::from_static(b"0123"),
+    )
+    .await?;
+    assert_eq!(
+        hdfs.observe_recoverable_state(&request).await?,
+        data_mover::hdfs::HdfsRecoverableState::Partial(4)
+    );
+    assert_eq!(hdfs.get_metadata(request.partial_path()).await?.size, 4);
+    create_hdfs_file(
+        hdfs,
+        request
+            .partial_path()
+            .to_str()
+            .ok_or("invalid GC partial path")?,
+        bytes::Bytes::from_static(b"0123456789abcdef"),
+    )
+    .await?;
+    assert_eq!(
+        hdfs.observe_recoverable_state(&request).await?,
+        data_mover::hdfs::HdfsRecoverableState::CommitReady
+    );
+    create_hdfs_file(hdfs, "gc/final.bin", bytes::Bytes::from_static(b"final")).await?;
+    create_hdfs_file(
+        hdfs,
+        "gc/sibling.part",
+        bytes::Bytes::from_static(b"sibling"),
+    )
+    .await?;
+    hdfs.discard_recoverable_state(&request).await?;
+    hdfs.discard_recoverable_state(&request).await?;
+    assert_eq!(
+        hdfs.observe_recoverable_state(&request).await?,
+        data_mover::hdfs::HdfsRecoverableState::Missing
+    );
+    assert_eq!(hdfs.get_metadata(request.final_path()).await?.size, 5);
+    assert_eq!(
+        hdfs.get_metadata(std::path::Path::new("gc/sibling.part"))
+            .await?
+            .size,
+        7
+    );
+    assert_invalid_recoverable_state_is_non_destructive(hdfs).await
+}
+
+async fn assert_invalid_recoverable_state_is_non_destructive(
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (identity, final_path, directory) in [
+        ("nightly-gc-directory", "gc/directory.bin", true),
+        ("nightly-gc-overlong", "gc/overlong.bin", false),
+    ] {
+        let request = data_mover::hdfs::HdfsTransferRequest::new(
+            identity,
+            data_mover::hdfs::HdfsSourceFingerprint::new(16, 123, None),
+            std::path::PathBuf::from(final_path),
+            16,
+            0o640,
+            None,
+        )?;
+        if directory {
+            hdfs.create_dir_all(request.partial_path(), 0o750).await?;
+        } else {
+            create_hdfs_file(
+                hdfs,
+                request
+                    .partial_path()
+                    .to_str()
+                    .ok_or("invalid overlong partial path")?,
+                bytes::Bytes::from_static(b"0123456789abcdefx"),
+            )
+            .await?;
+        }
+        assert!(hdfs.observe_recoverable_state(&request).await.is_err());
+        let metadata = hdfs.get_metadata(request.partial_path()).await?;
+        assert_eq!(metadata.is_dir, directory);
+        if !directory {
+            assert_eq!(metadata.size, 17);
+        }
+    }
+    Ok(())
+}
+
 async fn assert_common_recoverable_hdfs_copy(
     destination: &StorageEnum,
     hdfs: &data_mover::HDFSStorage,
@@ -1685,6 +1790,7 @@ async fn nightly_lab_prepares_persistent_hdfs_tail_resume_state()
     Box::pin(assert_stable_hdfs_resume_binding(hdfs, &entry)).await?;
     Box::pin(assert_hdfs_staged_resume_modes(hdfs, &entry)).await?;
     Box::pin(assert_zero_byte_staged_commit(hdfs)).await?;
+    Box::pin(assert_request_scoped_recoverable_state_gc(hdfs)).await?;
     Box::pin(assert_common_recoverable_hdfs_copy(&storage, hdfs)).await?;
     Box::pin(assert_cancelled_hdfs_partial_disposition(&storage, hdfs)).await?;
     Box::pin(assert_public_copy_preserves_mid_transfer_cancellation(

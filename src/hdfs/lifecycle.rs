@@ -1,4 +1,34 @@
 impl HDFSStorage {
+    /// Observe one request-bound recoverable partial without modifying it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a directory, overlong partial, inaccessible state,
+    /// or an unsafe request path.
+    pub async fn observe_recoverable_state(
+        &self,
+        request: &HdfsTransferRequest,
+    ) -> Result<HdfsRecoverableState, StorageError> {
+        let partial = self.observe_partial_path(request.partial_path()).await?;
+        classify_recoverable_state(partial, request.expected_size())
+    }
+
+    /// Idempotently delete only the deterministic partial bound to `request`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request path is unsafe or its partial cannot be deleted.
+    pub async fn discard_recoverable_state(
+        &self,
+        request: &HdfsTransferRequest,
+    ) -> Result<(), StorageError> {
+        self.resolve_path(request.partial_path())?;
+        match self.delete_file(request.partial_path()).await {
+            Ok(()) | Err(StorageError::FileNotFound(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Delete only the validated partial represented by this prepared transfer.
     ///
     /// # Errors
@@ -97,13 +127,7 @@ impl HDFSStorage {
         requested: HdfsPreparedTransfer,
         mode: HdfsResumeMode,
     ) -> Result<HdfsPreparedTransfer, StorageError> {
-        self.resolve_path(requested.part_path())?;
-        let partial = match self.get_metadata(requested.part_path()).await {
-            Ok(metadata) if metadata.is_dir => HdfsPartialObservation::Directory,
-            Ok(metadata) => HdfsPartialObservation::File(metadata.size),
-            Err(StorageError::FileNotFound(_)) => HdfsPartialObservation::Missing,
-            Err(error) => return Err(error),
-        };
+        let partial = self.observe_partial_path(requested.part_path()).await?;
         let prefix_len = match plan_staged_prepare(mode, partial, requested.expected_size())? {
             HdfsPrepareAction::Resume(prefix_len) => prefix_len,
             HdfsPrepareAction::Rebuild => {
@@ -117,6 +141,19 @@ impl HDFSStorage {
             }
         };
         requested.with_prefix(prefix_len)
+    }
+
+    async fn observe_partial_path(
+        &self,
+        part_path: &Path,
+    ) -> Result<HdfsPartialObservation, StorageError> {
+        self.resolve_path(part_path)?;
+        match self.get_metadata(part_path).await {
+            Ok(metadata) if metadata.is_dir => Ok(HdfsPartialObservation::Directory),
+            Ok(metadata) => Ok(HdfsPartialObservation::File(metadata.size)),
+            Err(StorageError::FileNotFound(_)) => Ok(HdfsPartialObservation::Missing),
+            Err(error) => Err(error),
+        }
     }
 
     async fn create_empty_resume_file(
