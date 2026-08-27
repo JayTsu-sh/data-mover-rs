@@ -608,6 +608,205 @@ async fn assert_common_recoverable_hdfs_copy(
     Ok(())
 }
 
+async fn assert_cancelled_hdfs_partial_disposition(
+    destination: &StorageEnum,
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local_root = hdfs_lab_local_path("cancel-disposition")?;
+    tokio::fs::create_dir_all(&local_root).await?;
+    let source = create_storage(
+        local_root.to_str().ok_or("invalid local lab path")?,
+        CreateStorageOptions::new(None, true),
+    )
+    .await?;
+    for (name, disposition, partial_exists) in [
+        (
+            "cancel-preserve.bin",
+            data_mover::hdfs::HdfsCancellationDisposition::Preserve,
+            true,
+        ),
+        (
+            "cancel-discard.bin",
+            data_mover::hdfs::HdfsCancellationDisposition::Discard,
+            false,
+        ),
+    ] {
+        let payload = b"cancel after HDFS writer close";
+        tokio::fs::write(local_root.join(name), payload).await?;
+        let entry = source.get_metadata(std::path::Path::new(name)).await?;
+        let identity = format!("nightly-{name}");
+        let request = data_mover::hdfs_transfer_request(
+            &entry,
+            &identity,
+            entry.get_relative_path().to_path_buf(),
+        )?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let callback_cancel = cancel.clone();
+        let callback: data_mover::CommitCallback = Arc::new(move |_, _| {
+            callback_cancel.cancel();
+        });
+        let result = StorageEnum::copy_file_hdfs_recoverable(
+            &source,
+            destination,
+            &entry,
+            CopyOptions {
+                cancel: Some(cancel),
+                is_source_reserved: true,
+                ..Default::default()
+            },
+            data_mover::HdfsRecoverableCopyOptions::new(identity, callback)
+                .with_cancellation_disposition(disposition),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(data_mover::error::StorageError::Cancelled)
+        ));
+        assert!(hdfs.get_metadata(request.final_path()).await.is_err());
+        assert_eq!(
+            hdfs.get_metadata(request.partial_path()).await.is_ok(),
+            partial_exists
+        );
+        let sibling = std::path::Path::new("unrelated-transfer.part");
+        if hdfs.get_metadata(sibling).await.is_err() {
+            create_hdfs_file(
+                hdfs,
+                "unrelated-transfer.part",
+                bytes::Bytes::from_static(b"keep"),
+            )
+            .await?;
+        }
+        assert_eq!(hdfs.get_metadata(sibling).await?.size, 4);
+    }
+    assert_prepared_state_survives_preparation_cancellation(
+        &local_root,
+        &source,
+        destination,
+        hdfs,
+    )
+    .await?;
+    tokio::fs::remove_dir_all(local_root).await?;
+    Ok(())
+}
+
+async fn assert_prepared_state_survives_preparation_cancellation(
+    local_root: &std::path::Path,
+    source: &StorageEnum,
+    destination: &StorageEnum,
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = "cancel-before-prepare.bin";
+    let payload = b"existing state must survive pre-prepare cancellation";
+    tokio::fs::write(local_root.join(name), payload).await?;
+    let entry = source.get_metadata(std::path::Path::new(name)).await?;
+    let identity = "nightly-cancel-before-prepare";
+    let request = data_mover::hdfs_transfer_request(
+        &entry,
+        identity,
+        entry.get_relative_path().to_path_buf(),
+    )?;
+    create_hdfs_file(
+        hdfs,
+        request
+            .partial_path()
+            .to_str()
+            .ok_or("invalid cancellation partial path")?,
+        bytes::Bytes::copy_from_slice(payload),
+    )
+    .await?;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    let callback: data_mover::CommitCallback = Arc::new(|_, _| {});
+    let result = StorageEnum::copy_file_hdfs_recoverable(
+        source,
+        destination,
+        &entry,
+        CopyOptions {
+            cancel: Some(cancel),
+            is_source_reserved: true,
+            ..Default::default()
+        },
+        data_mover::HdfsRecoverableCopyOptions::new(identity, callback)
+            .with_cancellation_disposition(data_mover::hdfs::HdfsCancellationDisposition::Discard),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(data_mover::error::StorageError::Cancelled)
+    ));
+    assert_eq!(
+        hdfs.get_metadata(request.partial_path()).await?.size,
+        u64::try_from(payload.len())?
+    );
+    Ok(())
+}
+
+async fn assert_public_copy_preserves_mid_transfer_cancellation(
+    destination: &StorageEnum,
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local_root = hdfs_lab_local_path("public-cancel-preserve")?;
+    tokio::fs::create_dir_all(&local_root).await?;
+    let name = "public-cancel.bin";
+    tokio::fs::write(local_root.join(name), vec![0x5a; 4 * 1024 * 1024]).await?;
+    let source = create_storage(
+        local_root.to_str().ok_or("invalid local lab path")?,
+        CreateStorageOptions::new(Some(64 * 1024), true),
+    )
+    .await?;
+    let entry = source.get_metadata(std::path::Path::new(name)).await?;
+    let mut identity_hasher = blake3::Hasher::new();
+    identity_hasher.update(b"data-mover:hdfs-default-copy-identity:v1\0local\0");
+    identity_hasher.update(local_root.to_string_lossy().as_bytes());
+    identity_hasher.update(b"\0public-cancel.bin");
+    let identity_digest = identity_hasher.finalize().to_hex();
+    let request = data_mover::hdfs_transfer_request(
+        &entry,
+        &format!("default-copy-{}", &identity_digest[..32]),
+        entry.get_relative_path().to_path_buf(),
+    )?;
+    create_hdfs_file(
+        hdfs,
+        request
+            .partial_path()
+            .to_str()
+            .ok_or("invalid public cancellation partial path")?,
+        bytes::Bytes::from_static(b"trusted-prefix"),
+    )
+    .await?;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let copy_cancel = cancel.clone();
+    let source_copy = source.clone();
+    let destination_copy = destination.clone();
+    let entry_copy = entry.clone();
+    let copy = tokio::spawn(async move {
+        StorageEnum::copy_file(
+            &source_copy,
+            &destination_copy,
+            &entry_copy,
+            CopyOptions {
+                qos: Some(data_mover::QosManager::try_new_with_burst(
+                    "64KiB/s", 4096, None,
+                )?),
+                cancel: Some(copy_cancel),
+                is_source_reserved: true,
+                ..Default::default()
+            },
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    cancel.cancel();
+    assert!(matches!(
+        copy.await?,
+        Err(data_mover::error::StorageError::Cancelled)
+    ));
+    assert!(hdfs.get_metadata(request.final_path()).await.is_err());
+    assert!(hdfs.get_metadata(request.partial_path()).await?.size >= 14);
+    tokio::fs::remove_dir_all(local_root).await?;
+    Ok(())
+}
+
 async fn assert_changed_source_is_not_published(
     destination: &StorageEnum,
     hdfs: &data_mover::HDFSStorage,
@@ -643,7 +842,8 @@ async fn assert_changed_source_is_not_published(
             is_source_reserved: false,
             ..Default::default()
         },
-        data_mover::HdfsRecoverableCopyOptions::new("nightly-changed-source", callback),
+        data_mover::HdfsRecoverableCopyOptions::new("nightly-changed-source", callback)
+            .with_cancellation_disposition(data_mover::hdfs::HdfsCancellationDisposition::Discard),
     )
     .await;
 
@@ -1486,6 +1686,11 @@ async fn nightly_lab_prepares_persistent_hdfs_tail_resume_state()
     Box::pin(assert_hdfs_staged_resume_modes(hdfs, &entry)).await?;
     Box::pin(assert_zero_byte_staged_commit(hdfs)).await?;
     Box::pin(assert_common_recoverable_hdfs_copy(&storage, hdfs)).await?;
+    Box::pin(assert_cancelled_hdfs_partial_disposition(&storage, hdfs)).await?;
+    Box::pin(assert_public_copy_preserves_mid_transfer_cancellation(
+        &storage, hdfs,
+    ))
+    .await?;
     Box::pin(assert_changed_source_is_not_published(&storage, hdfs)).await?;
     hdfs.delete_storage_root().await?;
     Ok(())

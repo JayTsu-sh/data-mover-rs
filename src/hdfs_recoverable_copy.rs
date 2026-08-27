@@ -1,6 +1,9 @@
 use tokio_util::sync::CancellationToken;
 
-use crate::hdfs::{HDFSStorage, HdfsPreparedTransfer, HdfsResumeMode, HdfsTransferRequest};
+use crate::hdfs::{
+    HDFSStorage, HdfsCancellationDisposition, HdfsPreparedTransfer, HdfsResumeMode,
+    HdfsTransferRequest,
+};
 use crate::storage_enum::{COPY_PIPELINE_CAPACITY, await_copy_pipeline};
 use crate::{CommitCallback, CopyOptions, EntryEnum, Result, StorageEnum, error::StorageError};
 
@@ -9,6 +12,7 @@ use crate::{CommitCallback, CopyOptions, EntryEnum, Result, StorageEnum, error::
 pub struct HdfsRecoverableCopyOptions {
     transfer_identity: String,
     resume_mode: HdfsResumeMode,
+    cancellation_disposition: HdfsCancellationDisposition,
     on_committed: CommitCallback,
 }
 
@@ -19,6 +23,7 @@ impl HdfsRecoverableCopyOptions {
         Self {
             transfer_identity: transfer_identity.into(),
             resume_mode: HdfsResumeMode::Auto,
+            cancellation_disposition: HdfsCancellationDisposition::Preserve,
             on_committed,
         }
     }
@@ -28,6 +33,22 @@ impl HdfsRecoverableCopyOptions {
     pub const fn with_resume_mode(mut self, resume_mode: HdfsResumeMode) -> Self {
         self.resume_mode = resume_mode;
         self
+    }
+
+    /// Select how cancellation treats the current request's trusted partial.
+    #[must_use]
+    pub const fn with_cancellation_disposition(
+        mut self,
+        disposition: HdfsCancellationDisposition,
+    ) -> Self {
+        self.cancellation_disposition = disposition;
+        self
+    }
+
+    /// Return the selected cancellation disposition.
+    #[must_use]
+    pub const fn cancellation_disposition(&self) -> HdfsCancellationDisposition {
+        self.cancellation_disposition
     }
 }
 
@@ -56,39 +77,67 @@ impl StorageEnum {
             bytes_counter,
             cancel,
         } = copy_options;
-        run_recoverable_pipeline(
-            from,
-            entry,
-            &destination,
-            &state,
-            qos,
-            bytes_counter,
-            &recovery.on_committed,
-            cancel.as_ref(),
-        )
-        .await?;
-        let integrity_matches = Self::hdfs_partial_integrity_matches(
-            from,
-            to,
-            entry,
-            state.part_path(),
-            enable_integrity_check,
-        )
-        .await?;
-        if !integrity_matches {
-            revalidate_recoverable_source(from, entry, &request, cancel.as_ref()).await?;
-            let _ = destination.delete_file(state.part_path()).await;
-            return Err(StorageError::OperationError(
-                "integrity check failed: source and HDFS partial hashes differ".to_string(),
-            ));
-        }
-        revalidate_recoverable_source(from, entry, &request, cancel.as_ref()).await?;
-        ensure_not_cancelled(cancel.as_ref())?;
-        destination
-            .commit_prepared_tail(&state, request.final_path())
+        let result = async {
+            run_recoverable_pipeline(
+                from,
+                entry,
+                &destination,
+                &state,
+                qos,
+                bytes_counter,
+                &recovery.on_committed,
+                cancel.as_ref(),
+            )
             .await?;
-        Self::complete_copied_entry(from, to, entry, is_source_reserved).await
+            let integrity_matches = Self::hdfs_partial_integrity_matches(
+                from,
+                to,
+                entry,
+                state.part_path(),
+                enable_integrity_check,
+            )
+            .await?;
+            if !integrity_matches {
+                revalidate_recoverable_source(from, entry, &request, cancel.as_ref()).await?;
+                let _ = destination.delete_file(state.part_path()).await;
+                return Err(StorageError::OperationError(
+                    "integrity check failed: source and HDFS partial hashes differ".to_string(),
+                ));
+            }
+            revalidate_recoverable_source(from, entry, &request, cancel.as_ref()).await?;
+            ensure_not_cancelled(cancel.as_ref())?;
+            destination
+                .commit_prepared_tail(&state, request.final_path())
+                .await?;
+            Self::complete_copied_entry(from, to, entry, is_source_reserved).await
+        }
+        .await;
+        if matches!(result, Err(StorageError::Cancelled))
+            && recovery.cancellation_disposition == HdfsCancellationDisposition::Discard
+        {
+            return preserve_cancellation_after_discard(
+                result,
+                destination.discard_prepared_tail(&state).await,
+                state.part_path(),
+            );
+        }
+        result
     }
+}
+
+fn preserve_cancellation_after_discard(
+    cancellation: Result<()>,
+    discard: Result<()>,
+    partial_path: &std::path::Path,
+) -> Result<()> {
+    if let Err(error) = discard {
+        tracing::warn!(
+            partial = %partial_path.display(),
+            %error,
+            "failed to discard cancelled HDFS transfer partial"
+        );
+    }
+    cancellation
 }
 
 async fn revalidate_recoverable_source(
@@ -198,6 +247,33 @@ mod tests {
     use crate::{CreateStorageOptions, HDFSEntry, create_storage};
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn recoverable_copy_preserves_cancelled_state_unless_discard_is_explicit() {
+        let callback: CommitCallback = Arc::new(|_, _| {});
+        let default = HdfsRecoverableCopyOptions::new("transfer", callback.clone());
+        assert_eq!(
+            default.cancellation_disposition(),
+            crate::hdfs::HdfsCancellationDisposition::Preserve
+        );
+
+        let discard = HdfsRecoverableCopyOptions::new("transfer", callback)
+            .with_cancellation_disposition(crate::hdfs::HdfsCancellationDisposition::Discard);
+        assert_eq!(
+            discard.cancellation_disposition(),
+            crate::hdfs::HdfsCancellationDisposition::Discard
+        );
+    }
+
+    #[test]
+    fn discard_failure_never_masks_cancellation() {
+        let result = preserve_cancellation_after_discard(
+            Err(StorageError::Cancelled),
+            Err(StorageError::OperationError("delete failed".to_string())),
+            Path::new(".data-mover-request.part"),
+        );
+        assert!(matches!(result, Err(StorageError::Cancelled)));
+    }
 
     fn test_directory(name: &str) -> std::path::PathBuf {
         let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
