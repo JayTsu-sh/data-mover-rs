@@ -379,11 +379,13 @@ pub fn build_hdfs_client(
                     .map(str::to_string)
             })
             .transpose()?;
-        builder = builder.with_kerberos_credentials(
-            Some(principal),
-            keytab,
-            credentials.cache.clone(),
-        );
+        builder = builder.with_kerberos_principal(principal);
+        if let Some(keytab) = keytab {
+            builder = builder.with_kerberos_keytab(keytab);
+        }
+        if let Some(cache) = &credentials.cache {
+            builder = builder.with_kerberos_cache(cache);
+        }
     } else {
         builder = builder.with_user(parsed.user());
     }
