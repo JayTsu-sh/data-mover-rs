@@ -152,6 +152,7 @@ use crate::cifs::{CifsStorage, create_cifs_storage};
 use crate::error::StorageError;
 use crate::filter::FilterExpression;
 use crate::hdfs::{HDFSStorage, HdfsConfig, HdfsPreparedTransfer, create_hdfs_storage};
+use crate::hdfs_transfer_mapping::hdfs_write_options;
 use crate::local::{LocalStorage, create_local_storage};
 use crate::nfs::{NFSStorage, create_nfs_storage};
 use crate::qos::QosManager;
@@ -233,14 +234,6 @@ pub enum StreamHandle {
         prefix_len: u64,
         expected_size: u64,
     },
-}
-
-fn hdfs_write_options(entry: &EntryEnum) -> (u32, Option<u32>) {
-    match entry {
-        EntryEnum::NAS(entry) => (entry.mode & 0o7777, None),
-        EntryEnum::S3(_) => (0o644, None),
-        EntryEnum::HDFS(entry) => (entry.mode & 0o7777, entry.replication),
-    }
 }
 
 fn hdfs_prepared_from_handle(

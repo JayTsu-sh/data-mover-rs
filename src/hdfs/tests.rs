@@ -165,6 +165,171 @@ mod tests {
         assert!(state.validate_current_prefix(5).is_err());
     }
 
+    #[test]
+    fn stable_transfer_request_derives_a_safe_deterministic_partial_path() {
+        let fingerprint = super::HdfsSourceFingerprint::new(
+            16,
+            1_725_000_000_123,
+            Some(super::HdfsStableSourceFact::ObjectVersion("v1")),
+        );
+        let request = super::HdfsTransferRequest::new(
+            "job/secret-transfer-42",
+            fingerprint,
+            std::path::PathBuf::from("目录/very-long-文件.bin"),
+            16,
+            0o620,
+            Some(3),
+        );
+        let Ok(request) = request else {
+            panic!("valid stable HDFS transfer request was rejected");
+        };
+        let first = request.partial_path();
+        let second = request.partial_path();
+        assert_eq!(first, second);
+        assert_eq!(first.parent(), Some(std::path::Path::new("目录")));
+        assert_eq!(
+            first,
+            std::path::Path::new("目录/.data-mover-214ae8b5607c29e15a68bdd77904a0e8.part")
+        );
+        let name = first.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        assert!(name.starts_with(".data-mover-"));
+        assert!(
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("part"))
+        );
+        assert!(!name.contains("secret-transfer"));
+        assert!(name.len() <= 255);
+
+        let changed_identity = super::HdfsTransferRequest::new(
+            "job/other-transfer",
+            super::HdfsSourceFingerprint::new(
+                16,
+                1_725_000_000_123,
+                Some(super::HdfsStableSourceFact::ObjectVersion("v1")),
+            ),
+            std::path::PathBuf::from("目录/very-long-文件.bin"),
+            16,
+            0o620,
+            Some(3),
+        )
+        .unwrap_or_else(|error| panic!("changed identity was rejected: {error}"));
+        let changed_source = super::HdfsTransferRequest::new(
+            "job/secret-transfer-42",
+            super::HdfsSourceFingerprint::new(
+                16,
+                1_725_000_000_124,
+                Some(super::HdfsStableSourceFact::ObjectVersion("v1")),
+            ),
+            std::path::PathBuf::from("目录/very-long-文件.bin"),
+            16,
+            0o620,
+            Some(3),
+        )
+        .unwrap_or_else(|error| panic!("changed source was rejected: {error}"));
+        assert_ne!(request.partial_path(), changed_identity.partial_path());
+        assert_ne!(request.partial_path(), changed_source.partial_path());
+    }
+
+    #[test]
+    fn stable_transfer_request_rejects_invalid_identity_path_and_size() {
+        let fingerprint = super::HdfsSourceFingerprint::new(16, 123, None);
+        for identity in ["", &"x".repeat(257)] {
+            assert!(
+                super::HdfsTransferRequest::new(
+                    identity,
+                    fingerprint.clone(),
+                    std::path::PathBuf::from("file.bin"),
+                    16,
+                    0o644,
+                    None,
+                )
+                .is_err()
+            );
+        }
+        let overlong_name = "x".repeat(256);
+        for path in ["", "/file.bin", "../file.bin", &overlong_name] {
+            assert!(
+                super::HdfsTransferRequest::new(
+                    "transfer",
+                    fingerprint.clone(),
+                    std::path::PathBuf::from(path),
+                    16,
+                    0o644,
+                    None,
+                )
+                .is_err()
+            );
+        }
+        let overlong_parent = format!("{overlong_name}/file.bin");
+        assert!(
+            super::HdfsTransferRequest::new(
+                "transfer",
+                fingerprint.clone(),
+                std::path::PathBuf::from(overlong_parent),
+                16,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            super::HdfsTransferRequest::new(
+                "transfer",
+                fingerprint,
+                std::path::PathBuf::from("file.bin"),
+                15,
+                0o644,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn source_fingerprint_separates_absent_file_and_object_facts() {
+        let absent = super::HdfsSourceFingerprint::new(16, 123, None);
+        let empty_file = super::HdfsSourceFingerprint::new(
+            16,
+            123,
+            Some(super::HdfsStableSourceFact::FileIdentity(b"")),
+        );
+        let file = super::HdfsSourceFingerprint::new(
+            16,
+            123,
+            Some(super::HdfsStableSourceFact::FileIdentity(b"same")),
+        );
+        let object = super::HdfsSourceFingerprint::new(
+            16,
+            123,
+            Some(super::HdfsStableSourceFact::ObjectVersion("same")),
+        );
+        assert_ne!(absent, empty_file);
+        assert_ne!(file, object);
+    }
+
+    #[test]
+    fn stable_prepared_state_keeps_source_and_destination_binding() {
+        let request = super::HdfsTransferRequest::new(
+            "transfer",
+            super::HdfsSourceFingerprint::new(16, 123, None),
+            std::path::PathBuf::from("final.bin"),
+            16,
+            0o600,
+            Some(2),
+        )
+        .unwrap_or_else(|error| panic!("valid request was rejected: {error}"));
+        let state = super::HdfsPreparedTransfer::from_stable_request(&request, 4)
+            .unwrap_or_else(|error| panic!("valid stable state was rejected: {error}"));
+        assert_eq!(state.part_path(), request.partial_path());
+        assert!(state.validate_final_path(request.final_path()).is_ok());
+        assert!(
+            state
+                .validate_final_path(std::path::Path::new("other.bin"))
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn adapter_retry_is_bounded_and_eventually_succeeds() {
         assert_eq!(super::HDFS_ADAPTER_MAX_ATTEMPTS, 5);

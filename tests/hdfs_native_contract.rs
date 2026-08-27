@@ -357,6 +357,49 @@ async fn complete_and_commit_hdfs_resume(
     Ok(())
 }
 
+async fn assert_stable_hdfs_resume_binding(
+    hdfs: &data_mover::HDFSStorage,
+    entry: &data_mover::EntryEnum,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stable_request = data_mover::hdfs_transfer_request(
+        entry,
+        "nightly-resume-transfer",
+        std::path::PathBuf::from("稳定/最终.bin"),
+    )?;
+    let stable = hdfs
+        .prepare_stable_tail_transfer(&stable_request, true)
+        .await?;
+    assert_eq!(stable.prefix_len(), 0);
+    create_hdfs_file(
+        hdfs,
+        stable
+            .part_path()
+            .to_str()
+            .ok_or("stable HDFS partial path is not UTF-8")?,
+        bytes::Bytes::from_static(b"0123"),
+    )
+    .await?;
+    let resumed = hdfs
+        .prepare_stable_tail_transfer(&stable_request, true)
+        .await?;
+    assert_eq!(resumed.prefix_len(), 4);
+
+    let changed_source = data_mover::hdfs::HdfsTransferRequest::new(
+        "nightly-resume-transfer",
+        data_mover::hdfs::HdfsSourceFingerprint::new(16, entry.get_mtime() + 1, None),
+        std::path::PathBuf::from("稳定/最终.bin"),
+        16,
+        0o640,
+        Some(2),
+    )?;
+    assert_ne!(stable_request.partial_path(), changed_source.partial_path());
+    let changed = hdfs
+        .prepare_stable_tail_transfer(&changed_source, true)
+        .await?;
+    assert_eq!(changed.prefix_len(), 0);
+    Ok(())
+}
+
 async fn assert_hdfs_overwrite_rename(
     storage: &StorageEnum,
     hdfs: &data_mover::HDFSStorage,
@@ -1169,6 +1212,8 @@ async fn nightly_lab_prepares_persistent_hdfs_tail_resume_state()
             .get_size(),
         16
     );
+
+    Box::pin(assert_stable_hdfs_resume_binding(hdfs, &entry)).await?;
     hdfs.delete_storage_root().await?;
     Ok(())
 }

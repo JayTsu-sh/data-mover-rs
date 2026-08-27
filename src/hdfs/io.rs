@@ -342,6 +342,29 @@ impl HDFSStorage {
             mode,
             replication,
         )?;
+        self.prepare_requested_tail_transfer(requested, resume).await
+    }
+
+    /// Prepare a deterministic, source-bound HDFS tail transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the derived partial path is unsafe, inaccessible,
+    /// a directory, or cannot be rebuilt for this request.
+    pub async fn prepare_stable_tail_transfer(
+        &self,
+        request: &HdfsTransferRequest,
+        resume: bool,
+    ) -> Result<HdfsPreparedTransfer, StorageError> {
+        let requested = HdfsPreparedTransfer::from_stable_request(request, 0)?;
+        self.prepare_requested_tail_transfer(requested, resume).await
+    }
+
+    async fn prepare_requested_tail_transfer(
+        &self,
+        requested: HdfsPreparedTransfer,
+        resume: bool,
+    ) -> Result<HdfsPreparedTransfer, StorageError> {
         self.resolve_path(requested.part_path())?;
         let prefix_len = if resume {
             match self.get_metadata(requested.part_path()).await {
@@ -349,7 +372,7 @@ impl HDFSStorage {
                     "HDFS resume temporary path is a directory: {}",
                     requested.part_path().display()
                 ))),
-                Ok(metadata) if metadata.size <= expected_size => Ok(metadata.size),
+                Ok(metadata) if metadata.size <= requested.expected_size() => Ok(metadata.size),
                 Ok(_) | Err(StorageError::FileNotFound(_)) => {
                     self.rebuild_resume_file(
                         requested.part_path(),
@@ -371,17 +394,16 @@ impl HDFSStorage {
             .await?;
             0
         };
-        HdfsPreparedTransfer::new(
-            requested.part_path().to_path_buf(),
-            prefix_len,
-            requested.expected_size(),
-            requested.expected_size(),
-            requested.mode(),
-            requested.replication(),
-        )
+        requested.with_prefix(prefix_len)
     }
 
-    pub(crate) async fn append_prepared_tail(
+    /// Append one contiguous session to a validated prepared transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale state, malformed chunks, native append/write/
+    /// close failures, or unconfirmed persisted length.
+    pub async fn append_prepared_tail(
         &self,
         receiver: tokio::sync::mpsc::Receiver<crate::DataChunk>,
         state: &HdfsPreparedTransfer,
@@ -421,11 +443,18 @@ impl HDFSStorage {
         self.rename(part_path, final_path).await
     }
 
-    pub(crate) async fn commit_prepared_tail(
+    /// Publish a validated prepared transfer at its bound final path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a mismatched bound path, incomplete partial file,
+    /// directory state, or native rename failure.
+    pub async fn commit_prepared_tail(
         &self,
         state: &HdfsPreparedTransfer,
         final_path: &std::path::Path,
     ) -> Result<(), StorageError> {
+        state.validate_final_path(final_path)?;
         self.commit_tail_resume(state.part_path(), final_path, state.expected_size())
             .await
     }
