@@ -341,14 +341,8 @@ impl HDFSStorage {
         final_path: &std::path::Path,
         expected_size: u64,
     ) -> Result<(), StorageError> {
-        let metadata = self.get_metadata(part_path).await?;
-        if metadata.is_dir || metadata.size != expected_size {
-            return Err(StorageError::OperationError(format!(
-                "HDFS resume temporary file is not commit-ready: size={}, expected={expected_size}: {}",
-                metadata.size,
-                part_path.display()
-            )));
-        }
+        self.validate_tail_commit_ready(part_path, expected_size)
+            .await?;
         self.rename(part_path, final_path).await
     }
 
@@ -366,6 +360,43 @@ impl HDFSStorage {
         state.validate_final_path(final_path)?;
         self.commit_tail_resume(state.part_path(), final_path, state.expected_size())
             .await
+    }
+
+    /// Publish a validated prepared transfer only when the final path is absent.
+    ///
+    /// The native non-overwrite rename makes the absence check atomic with
+    /// publication. A conflicting final leaves the prepared partial intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched state, an incomplete partial, or a
+    /// native rename failure including an existing destination.
+    pub async fn commit_prepared_tail_if_absent(
+        &self,
+        state: &HdfsPreparedTransfer,
+        final_path: &std::path::Path,
+    ) -> Result<(), StorageError> {
+        state.validate_final_path(final_path)?;
+        self.validate_tail_commit_ready(state.part_path(), state.expected_size())
+            .await?;
+        self.rename_with_overwrite(state.part_path(), final_path, false)
+            .await
+    }
+
+    async fn validate_tail_commit_ready(
+        &self,
+        part_path: &std::path::Path,
+        expected_size: u64,
+    ) -> Result<(), StorageError> {
+        let metadata = self.get_metadata(part_path).await?;
+        if metadata.is_dir || metadata.size != expected_size {
+            return Err(StorageError::OperationError(format!(
+                "HDFS resume temporary file is not commit-ready: size={}, expected={expected_size}: {}",
+                metadata.size,
+                part_path.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Stream a fresh HDFS file from bounded chunks using one sequential writer.
@@ -478,6 +509,15 @@ impl HDFSStorage {
         from: &std::path::Path,
         to: &std::path::Path,
     ) -> Result<(), StorageError> {
+        self.rename_with_overwrite(from, to, true).await
+    }
+
+    async fn rename_with_overwrite(
+        &self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+        overwrite: bool,
+    ) -> Result<(), StorageError> {
         if from.as_os_str().is_empty() || to.as_os_str().is_empty() {
             return Err(StorageError::InvalidPath(
                 "HDFS rename cannot use the configured storage root".to_string(),
@@ -502,7 +542,7 @@ impl HDFSStorage {
             self.create_dir_all(parent, 0o755).await?;
         }
         self.client
-            .rename(&from_path, &to_path, true)
+            .rename(&from_path, &to_path, overwrite)
             .await
             .map_err(|error| hdfs_operation_error("rename", Some(from), &error))
     }

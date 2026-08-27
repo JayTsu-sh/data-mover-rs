@@ -1,8 +1,8 @@
 use tokio_util::sync::CancellationToken;
 
 use crate::hdfs::{
-    HDFSStorage, HdfsCancellationDisposition, HdfsPreparedTransfer, HdfsResumeMode,
-    HdfsTransferRequest,
+    HDFSStorage, HdfsCancellationDisposition, HdfsExistingFinalPolicy, HdfsPreparedTransfer,
+    HdfsResumeMode, HdfsTransferRequest,
 };
 use crate::storage_enum::{COPY_PIPELINE_CAPACITY, await_copy_pipeline};
 use crate::{CommitCallback, CopyOptions, EntryEnum, Result, StorageEnum, error::StorageError};
@@ -13,7 +13,35 @@ pub struct HdfsRecoverableCopyOptions {
     transfer_identity: String,
     resume_mode: HdfsResumeMode,
     cancellation_disposition: HdfsCancellationDisposition,
+    existing_final_policy: HdfsExistingFinalPolicy,
     on_committed: CommitCallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingFinalDecision {
+    Continue,
+    Accept,
+    Conflict,
+}
+
+fn decide_existing_final(
+    policy: HdfsExistingFinalPolicy,
+    final_size: Option<u64>,
+    expected_size: u64,
+    integrity_matches: bool,
+) -> ExistingFinalDecision {
+    match (policy, final_size) {
+        (HdfsExistingFinalPolicy::Overwrite, _) | (_, None) => ExistingFinalDecision::Continue,
+        (HdfsExistingFinalPolicy::VerifyOrConflict, Some(size))
+            if size == expected_size && integrity_matches =>
+        {
+            ExistingFinalDecision::Accept
+        }
+        (
+            HdfsExistingFinalPolicy::FailIfExists | HdfsExistingFinalPolicy::VerifyOrConflict,
+            Some(_),
+        ) => ExistingFinalDecision::Conflict,
+    }
 }
 
 impl HdfsRecoverableCopyOptions {
@@ -24,6 +52,7 @@ impl HdfsRecoverableCopyOptions {
             transfer_identity: transfer_identity.into(),
             resume_mode: HdfsResumeMode::Auto,
             cancellation_disposition: HdfsCancellationDisposition::Preserve,
+            existing_final_policy: HdfsExistingFinalPolicy::Overwrite,
             on_committed,
         }
     }
@@ -50,6 +79,19 @@ impl HdfsRecoverableCopyOptions {
     pub const fn cancellation_disposition(&self) -> HdfsCancellationDisposition {
         self.cancellation_disposition
     }
+
+    /// Select how an existing final path is handled.
+    #[must_use]
+    pub const fn with_existing_final_policy(mut self, policy: HdfsExistingFinalPolicy) -> Self {
+        self.existing_final_policy = policy;
+        self
+    }
+
+    /// Return the selected existing-final policy.
+    #[must_use]
+    pub const fn existing_final_policy(&self) -> HdfsExistingFinalPolicy {
+        self.existing_final_policy
+    }
 }
 
 impl StorageEnum {
@@ -69,7 +111,23 @@ impl StorageEnum {
         recovery: HdfsRecoverableCopyOptions,
     ) -> Result<()> {
         ensure_not_cancelled(copy_options.cancel.as_ref())?;
-        let (destination, request, state) = prepare_recoverable(to, entry, &recovery).await?;
+        let (destination, request) = recoverable_request(to, entry, &recovery)?;
+        if try_complete_existing_final(
+            from,
+            to,
+            entry,
+            &destination,
+            &request,
+            &recovery,
+            &copy_options,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let state = destination
+            .prepare_staged_tail_transfer(&request, recovery.resume_mode)
+            .await?;
         let CopyOptions {
             qos,
             enable_integrity_check,
@@ -106,9 +164,37 @@ impl StorageEnum {
             }
             revalidate_recoverable_source(from, entry, &request, cancel.as_ref()).await?;
             ensure_not_cancelled(cancel.as_ref())?;
-            destination
-                .commit_prepared_tail(&state, request.final_path())
-                .await?;
+            let commit = commit_prepared_by_policy(
+                &destination,
+                &state,
+                &request,
+                recovery.existing_final_policy,
+            )
+            .await;
+            if let Err(commit_error) = commit {
+                if resolve_existing_final(
+                    from,
+                    to,
+                    entry,
+                    &request,
+                    recovery.existing_final_policy,
+                    enable_integrity_check,
+                )
+                .await?
+                {
+                    revalidate_recoverable_source(from, entry, &request, cancel.as_ref()).await?;
+                    return complete_matching_existing_final(
+                        from,
+                        to,
+                        entry,
+                        &destination,
+                        &request,
+                        is_source_reserved,
+                    )
+                    .await;
+                }
+                return Err(commit_error);
+            }
             Self::complete_copied_entry(from, to, entry, is_source_reserved).await
         }
         .await;
@@ -122,6 +208,77 @@ impl StorageEnum {
             );
         }
         result
+    }
+}
+
+async fn try_complete_existing_final(
+    from: &StorageEnum,
+    to: &StorageEnum,
+    entry: &EntryEnum,
+    destination: &HDFSStorage,
+    request: &HdfsTransferRequest,
+    recovery: &HdfsRecoverableCopyOptions,
+    copy_options: &CopyOptions,
+) -> Result<bool> {
+    if !resolve_existing_final(
+        from,
+        to,
+        entry,
+        request,
+        recovery.existing_final_policy,
+        copy_options.enable_integrity_check,
+    )
+    .await?
+    {
+        return Ok(false);
+    }
+    revalidate_recoverable_source(from, entry, request, copy_options.cancel.as_ref()).await?;
+    ensure_not_cancelled(copy_options.cancel.as_ref())?;
+    complete_matching_existing_final(
+        from,
+        to,
+        entry,
+        destination,
+        request,
+        copy_options.is_source_reserved,
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn complete_matching_existing_final(
+    from: &StorageEnum,
+    to: &StorageEnum,
+    entry: &EntryEnum,
+    destination: &HDFSStorage,
+    request: &HdfsTransferRequest,
+    is_source_reserved: bool,
+) -> Result<()> {
+    StorageEnum::apply_copied_metadata(to, entry).await?;
+    destination.discard_recoverable_state(request).await?;
+    if !is_source_reserved {
+        from.delete_file(entry).await?;
+    }
+    Ok(())
+}
+
+async fn commit_prepared_by_policy(
+    destination: &HDFSStorage,
+    state: &HdfsPreparedTransfer,
+    request: &HdfsTransferRequest,
+    policy: HdfsExistingFinalPolicy,
+) -> Result<()> {
+    match policy {
+        HdfsExistingFinalPolicy::Overwrite => {
+            destination
+                .commit_prepared_tail(state, request.final_path())
+                .await
+        }
+        HdfsExistingFinalPolicy::VerifyOrConflict | HdfsExistingFinalPolicy::FailIfExists => {
+            destination
+                .commit_prepared_tail_if_absent(state, request.final_path())
+                .await
+        }
     }
 }
 
@@ -171,11 +328,11 @@ async fn source_metadata_for_revalidation(
     }
 }
 
-async fn prepare_recoverable(
+fn recoverable_request(
     to: &StorageEnum,
     entry: &EntryEnum,
     recovery: &HdfsRecoverableCopyOptions,
-) -> Result<(HDFSStorage, HdfsTransferRequest, HdfsPreparedTransfer)> {
+) -> Result<(HDFSStorage, HdfsTransferRequest)> {
     let StorageEnum::HDFS(destination) = to else {
         return Err(StorageError::OperationError(
             "copy_file_hdfs_recoverable requires an HDFS destination".to_string(),
@@ -186,10 +343,64 @@ async fn prepare_recoverable(
         &recovery.transfer_identity,
         entry.get_relative_path().to_path_buf(),
     )?;
-    let state = destination
-        .prepare_staged_tail_transfer(&request, recovery.resume_mode)
-        .await?;
-    Ok((destination.clone(), request, state))
+    Ok((destination.clone(), request))
+}
+
+async fn resolve_existing_final(
+    from: &StorageEnum,
+    to: &StorageEnum,
+    entry: &EntryEnum,
+    request: &HdfsTransferRequest,
+    policy: HdfsExistingFinalPolicy,
+    enable_integrity_check: bool,
+) -> Result<bool> {
+    if policy == HdfsExistingFinalPolicy::Overwrite {
+        return Ok(false);
+    }
+    let StorageEnum::HDFS(destination) = to else {
+        return Err(StorageError::OperationError(
+            "existing-final resolution requires an HDFS destination".to_string(),
+        ));
+    };
+    let final_metadata = match destination.get_metadata(request.final_path()).await {
+        Ok(metadata) => metadata,
+        Err(StorageError::FileNotFound(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if final_metadata.is_dir {
+        return Err(existing_final_conflict(request));
+    }
+    let integrity_matches = if policy == HdfsExistingFinalPolicy::VerifyOrConflict
+        && final_metadata.size == request.expected_size()
+    {
+        StorageEnum::hdfs_partial_integrity_matches(
+            from,
+            to,
+            entry,
+            request.final_path(),
+            enable_integrity_check,
+        )
+        .await?
+    } else {
+        false
+    };
+    match decide_existing_final(
+        policy,
+        Some(final_metadata.size),
+        request.expected_size(),
+        integrity_matches,
+    ) {
+        ExistingFinalDecision::Accept => Ok(true),
+        ExistingFinalDecision::Conflict => Err(existing_final_conflict(request)),
+        ExistingFinalDecision::Continue => Ok(false),
+    }
+}
+
+fn existing_final_conflict(request: &HdfsTransferRequest) -> StorageError {
+    StorageError::OperationError(format!(
+        "HDFS final path conflicts with recoverable transfer: {}",
+        request.final_path().display()
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -262,6 +473,59 @@ mod tests {
         assert_eq!(
             discard.cancellation_disposition(),
             crate::hdfs::HdfsCancellationDisposition::Discard
+        );
+    }
+
+    #[test]
+    fn recoverable_copy_overwrites_existing_final_unless_another_policy_is_selected() {
+        let callback: CommitCallback = Arc::new(|_, _| {});
+        let default = HdfsRecoverableCopyOptions::new("transfer", callback.clone());
+        assert_eq!(
+            default.existing_final_policy(),
+            crate::hdfs::HdfsExistingFinalPolicy::Overwrite
+        );
+
+        let conflict = HdfsRecoverableCopyOptions::new("transfer", callback)
+            .with_existing_final_policy(crate::hdfs::HdfsExistingFinalPolicy::FailIfExists);
+        assert_eq!(
+            conflict.existing_final_policy(),
+            crate::hdfs::HdfsExistingFinalPolicy::FailIfExists
+        );
+    }
+
+    #[test]
+    fn existing_final_policy_decision_matrix_is_explicit() {
+        use ExistingFinalDecision::{Accept, Conflict, Continue};
+        use HdfsExistingFinalPolicy::{FailIfExists, Overwrite, VerifyOrConflict};
+
+        assert_eq!(decide_existing_final(Overwrite, None, 8, false), Continue);
+        assert_eq!(
+            decide_existing_final(Overwrite, Some(99), 8, false),
+            Continue
+        );
+        assert_eq!(
+            decide_existing_final(FailIfExists, None, 8, false),
+            Continue
+        );
+        assert_eq!(
+            decide_existing_final(FailIfExists, Some(8), 8, true),
+            Conflict
+        );
+        assert_eq!(
+            decide_existing_final(VerifyOrConflict, None, 8, false),
+            Continue
+        );
+        assert_eq!(
+            decide_existing_final(VerifyOrConflict, Some(7), 8, true),
+            Conflict
+        );
+        assert_eq!(
+            decide_existing_final(VerifyOrConflict, Some(8), 8, false),
+            Conflict
+        );
+        assert_eq!(
+            decide_existing_final(VerifyOrConflict, Some(8), 8, true),
+            Accept
         );
     }
 

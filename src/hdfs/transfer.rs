@@ -1,5 +1,17 @@
 const MAX_TRANSFER_ID_BYTES: usize = 256;
 
+/// Policy for a final HDFS path that already exists when publishing a transfer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HdfsExistingFinalPolicy {
+    /// Atomically replace the existing final path.
+    #[default]
+    Overwrite,
+    /// Accept an equivalent final file, otherwise report a conflict.
+    VerifyOrConflict,
+    /// Report a conflict without changing the existing final path.
+    FailIfExists,
+}
+
 /// What an explicit recoverable copy does with its trusted partial on cancellation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HdfsCancellationDisposition {

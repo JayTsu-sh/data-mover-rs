@@ -713,6 +713,332 @@ async fn assert_common_recoverable_hdfs_copy(
     Ok(())
 }
 
+async fn assert_hdfs_existing_final_policies(
+    destination: &StorageEnum,
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local_root = hdfs_lab_local_path("existing-final-policy")?;
+    tokio::fs::create_dir_all(&local_root).await?;
+    let source = create_storage(
+        local_root.to_str().ok_or("invalid local lab path")?,
+        CreateStorageOptions::new(None, true),
+    )
+    .await?;
+    let callback: data_mover::CommitCallback = Arc::new(|_, _| {});
+
+    for (name, policy, final_data, expect_ok, expect_written, expected_bytes) in [
+        (
+            "overwrite.bin",
+            data_mover::hdfs::HdfsExistingFinalPolicy::Overwrite,
+            b"old-content".as_slice(),
+            true,
+            b"new-content".as_slice(),
+            11,
+        ),
+        (
+            "fail.bin",
+            data_mover::hdfs::HdfsExistingFinalPolicy::FailIfExists,
+            b"old-content".as_slice(),
+            false,
+            b"old-content".as_slice(),
+            0,
+        ),
+        (
+            "verify-match.bin",
+            data_mover::hdfs::HdfsExistingFinalPolicy::VerifyOrConflict,
+            b"new-content".as_slice(),
+            true,
+            b"new-content".as_slice(),
+            0,
+        ),
+        (
+            "verify-mismatch.bin",
+            data_mover::hdfs::HdfsExistingFinalPolicy::VerifyOrConflict,
+            b"bad-content".as_slice(),
+            false,
+            b"bad-content".as_slice(),
+            0,
+        ),
+    ] {
+        tokio::fs::write(local_root.join(name), b"new-content").await?;
+        let entry = source.get_metadata(std::path::Path::new(name)).await?;
+        let identity = format!("nightly-existing-final-{name}");
+        let request = data_mover::hdfs_transfer_request(
+            &entry,
+            &identity,
+            entry.get_relative_path().to_path_buf(),
+        )?;
+        create_hdfs_file(hdfs, name, bytes::Bytes::copy_from_slice(final_data)).await?;
+        if policy != data_mover::hdfs::HdfsExistingFinalPolicy::Overwrite {
+            create_hdfs_file(
+                hdfs,
+                request
+                    .partial_path()
+                    .to_str()
+                    .ok_or("invalid partial path")?,
+                bytes::Bytes::from_static(b"keep"),
+            )
+            .await?;
+        }
+        let bytes_counter = Arc::new(AtomicU64::new(0));
+        let options = CopyOptions {
+            enable_integrity_check: true,
+            is_source_reserved: true,
+            bytes_counter: Some(bytes_counter.clone()),
+            ..Default::default()
+        };
+        let result = if policy == data_mover::hdfs::HdfsExistingFinalPolicy::Overwrite {
+            StorageEnum::copy_file(&source, destination, &entry, options).await
+        } else {
+            StorageEnum::copy_file_hdfs_recoverable(
+                &source,
+                destination,
+                &entry,
+                options,
+                data_mover::HdfsRecoverableCopyOptions::new(identity, callback.clone())
+                    .with_existing_final_policy(policy),
+            )
+            .await
+        };
+        assert_eq!(
+            result.is_ok(),
+            expect_ok,
+            "unexpected result for {name}: {result:?}"
+        );
+        assert_eq!(bytes_counter.load(Ordering::Relaxed), expected_bytes);
+        assert_hdfs_file_bytes(hdfs, std::path::Path::new(name), expect_written).await?;
+        if expect_ok {
+            assert!(hdfs.get_metadata(request.partial_path()).await.is_err());
+        } else {
+            assert_eq!(hdfs.get_metadata(request.partial_path()).await?.size, 4);
+        }
+    }
+
+    assert_hdfs_non_overwrite_commit_preserves_conflict(hdfs).await?;
+    tokio::fs::remove_dir_all(local_root).await?;
+    Ok(())
+}
+
+async fn assert_hdfs_file_bytes(
+    hdfs: &data_mover::HDFSStorage,
+    path: &std::path::Path,
+    expected: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let handle = hdfs.open_file(path).await?;
+    assert_eq!(
+        hdfs.read_at(&handle, 0, u64::try_from(expected.len())?)
+            .await?,
+        expected
+    );
+    Ok(())
+}
+
+async fn assert_hdfs_non_overwrite_commit_preserves_conflict(
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let race_request = data_mover::hdfs::HdfsTransferRequest::new(
+        "nightly-existing-final-race",
+        data_mover::hdfs::HdfsSourceFingerprint::new(4, 0, None),
+        std::path::PathBuf::from("race.bin"),
+        4,
+        0o640,
+        None,
+    )?;
+    let race_state = hdfs
+        .prepare_staged_tail_transfer(&race_request, data_mover::hdfs::HdfsResumeMode::Auto)
+        .await?;
+    create_hdfs_file(
+        hdfs,
+        race_request
+            .partial_path()
+            .to_str()
+            .ok_or("invalid race partial")?,
+        bytes::Bytes::from_static(b"ours"),
+    )
+    .await?;
+    create_hdfs_file(hdfs, "race.bin", bytes::Bytes::from_static(b"theirs")).await?;
+    assert!(
+        hdfs.commit_prepared_tail_if_absent(&race_state, race_request.final_path())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        hdfs.get_metadata(race_request.partial_path()).await?.size,
+        4
+    );
+    let handle = hdfs.open_file(race_request.final_path()).await?;
+    assert_eq!(hdfs.read_at(&handle, 0, 6).await?.as_ref(), b"theirs");
+    Ok(())
+}
+
+async fn assert_hdfs_recoverable_race_policies(
+    destination: &StorageEnum,
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local_root = hdfs_lab_local_path("existing-final-race")?;
+    tokio::fs::create_dir_all(&local_root).await?;
+    let source = create_storage(
+        local_root.to_str().ok_or("invalid local lab path")?,
+        CreateStorageOptions::new(None, true),
+    )
+    .await?;
+    for (name, policy, raced_data, expect_ok) in [
+        (
+            "fail-race.bin",
+            data_mover::hdfs::HdfsExistingFinalPolicy::FailIfExists,
+            b"raced-final".as_slice(),
+            false,
+        ),
+        (
+            "verify-match-race.bin",
+            data_mover::hdfs::HdfsExistingFinalPolicy::VerifyOrConflict,
+            b"source-data".as_slice(),
+            true,
+        ),
+        (
+            "verify-conflict-race.bin",
+            data_mover::hdfs::HdfsExistingFinalPolicy::VerifyOrConflict,
+            b"raced-final".as_slice(),
+            false,
+        ),
+    ] {
+        tokio::fs::write(local_root.join(name), b"source-data").await?;
+        let entry = source.get_metadata(std::path::Path::new(name)).await?;
+        let identity = format!("nightly-race-{name}");
+        let request = data_mover::hdfs_transfer_request(
+            &entry,
+            &identity,
+            entry.get_relative_path().to_path_buf(),
+        )?;
+        let callback_hdfs = hdfs.clone();
+        let callback_path = name.to_string();
+        let callback_data = bytes::Bytes::copy_from_slice(raced_data);
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_fired = fired.clone();
+        let start = Arc::new(tokio::sync::Notify::new());
+        let task_start = start.clone();
+        let (done_sender, done_receiver) = std::sync::mpsc::sync_channel(1);
+        let creator = tokio::spawn(async move {
+            task_start.notified().await;
+            let result = create_hdfs_file(&callback_hdfs, &callback_path, callback_data).await;
+            let _ = done_sender.send(result.map_err(|error| error.to_string()));
+        });
+        let callback_done = Arc::new(Mutex::new(done_receiver));
+        let callback: data_mover::CommitCallback = Arc::new(move |_, _| {
+            if callback_fired.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            start.notify_one();
+            callback_done
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|error| panic!("wait for concurrent HDFS final: {error}"))
+                .unwrap_or_else(|error| panic!("create concurrent HDFS final: {error}"));
+        });
+        let result = StorageEnum::copy_file_hdfs_recoverable(
+            &source,
+            destination,
+            &entry,
+            CopyOptions {
+                enable_integrity_check: true,
+                is_source_reserved: true,
+                ..Default::default()
+            },
+            data_mover::HdfsRecoverableCopyOptions::new(identity, callback)
+                .with_existing_final_policy(policy),
+        )
+        .await;
+        creator.await?;
+        assert!(fired.load(Ordering::Relaxed));
+        assert_eq!(
+            result.is_ok(),
+            expect_ok,
+            "unexpected race result: {result:?}"
+        );
+        assert_eq!(
+            hdfs.get_metadata(request.partial_path()).await.is_ok(),
+            !expect_ok
+        );
+    }
+    tokio::fs::remove_dir_all(local_root).await?;
+    Ok(())
+}
+
+async fn assert_matching_final_metadata_precedes_source_delete(
+    destination: &StorageEnum,
+    hdfs: &data_mover::HDFSStorage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local_root = hdfs_lab_local_path("matching-final-completion")?;
+    tokio::fs::create_dir_all(&local_root).await?;
+    let source = create_storage(
+        local_root.to_str().ok_or("invalid local lab path")?,
+        CreateStorageOptions::new(None, true),
+    )
+    .await?;
+    for (name, invalid_mtime, expect_ok) in [
+        ("move-success.bin", false, true),
+        ("metadata-failure.bin", true, false),
+    ] {
+        let payload = b"already-complete";
+        tokio::fs::write(local_root.join(name), payload).await?;
+        if invalid_mtime {
+            filetime::set_file_mtime(
+                local_root.join(name),
+                filetime::FileTime::from_unix_time(-1, 0),
+            )?;
+        }
+        let entry = source.get_metadata(std::path::Path::new(name)).await?;
+        let identity = format!("nightly-matching-completion-{name}");
+        let request = data_mover::hdfs_transfer_request(
+            &entry,
+            &identity,
+            entry.get_relative_path().to_path_buf(),
+        )?;
+        create_hdfs_file(hdfs, name, bytes::Bytes::from_static(payload)).await?;
+        create_hdfs_file(
+            hdfs,
+            request
+                .partial_path()
+                .to_str()
+                .ok_or("invalid partial path")?,
+            bytes::Bytes::from_static(b"keep"),
+        )
+        .await?;
+        let callback: data_mover::CommitCallback = Arc::new(|_, _| {});
+        let result = StorageEnum::copy_file_hdfs_recoverable(
+            &source,
+            destination,
+            &entry,
+            CopyOptions {
+                enable_integrity_check: true,
+                is_source_reserved: false,
+                ..Default::default()
+            },
+            data_mover::HdfsRecoverableCopyOptions::new(identity, callback)
+                .with_existing_final_policy(
+                    data_mover::hdfs::HdfsExistingFinalPolicy::VerifyOrConflict,
+                ),
+        )
+        .await;
+        assert_eq!(
+            result.is_ok(),
+            expect_ok,
+            "unexpected completion result: {result:?}"
+        );
+        assert_eq!(
+            tokio::fs::try_exists(local_root.join(name)).await?,
+            !expect_ok
+        );
+        assert_eq!(
+            hdfs.get_metadata(request.partial_path()).await.is_ok(),
+            !expect_ok
+        );
+    }
+    tokio::fs::remove_dir_all(local_root).await?;
+    Ok(())
+}
+
 async fn assert_cancelled_hdfs_partial_disposition(
     destination: &StorageEnum,
     hdfs: &data_mover::HDFSStorage,
@@ -1705,7 +2031,7 @@ async fn nightly_lab_appends_only_a_validated_contiguous_tail()
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the nightly lab HDFS cluster"]
 async fn nightly_lab_prepares_persistent_hdfs_tail_resume_state()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1792,6 +2118,12 @@ async fn nightly_lab_prepares_persistent_hdfs_tail_resume_state()
     Box::pin(assert_zero_byte_staged_commit(hdfs)).await?;
     Box::pin(assert_request_scoped_recoverable_state_gc(hdfs)).await?;
     Box::pin(assert_common_recoverable_hdfs_copy(&storage, hdfs)).await?;
+    Box::pin(assert_hdfs_existing_final_policies(&storage, hdfs)).await?;
+    Box::pin(assert_hdfs_recoverable_race_policies(&storage, hdfs)).await?;
+    Box::pin(assert_matching_final_metadata_precedes_source_delete(
+        &storage, hdfs,
+    ))
+    .await?;
     Box::pin(assert_cancelled_hdfs_partial_disposition(&storage, hdfs)).await?;
     Box::pin(assert_public_copy_preserves_mid_transfer_cancellation(
         &storage, hdfs,
