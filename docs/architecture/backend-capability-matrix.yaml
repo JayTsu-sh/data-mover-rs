@@ -1,0 +1,297 @@
+schema_version: 1
+authority: backend-capability-facts
+backend_kinds: [local, nfs, cifs, s3, hdfs]
+states: [required, unsupported, uncertified, not_applicable]
+
+semantics:
+  required: Target capability that must pass its named gate before ReleaseReady.
+  unsupported: Deliberate target boundary that must fail typed preflight.
+  uncertified: Implementable capability disabled in production until its named gate passes.
+  not_applicable: Semantic does not exist for this profile.
+
+profiles:
+  local:
+    backend_kind: local
+    environment: runner-local-filesystem
+    gates: [DM-LOCAL-CONTRACT, TS-LOCAL-SINGLE, TS-LOCAL-REMOTE]
+    capabilities:
+      connectivity: required
+      traversal_complete: required
+      sequential_read: required
+      range_read: required
+      staged_destination: required
+      ordered_write: required
+      out_of_order_write: required
+      truncate_overwrite: required
+      durable_checkpoint: {state: required, mechanism: durable_contiguous_prefix}
+      resume: required
+      restart_upload: required
+      publication: {state: required, guarantee: filesystem_rename_replace}
+      cancellation: required
+      native_transfer: unsupported
+      content_readback: required
+      directory: required
+      symlink: required
+      hardlink_topology: unsupported
+      rename: required
+      delete: required
+      acl: required
+      xattr: required
+      tags: not_applicable
+      uid_gid_mode: required
+      timestamps: required
+      backend_fact_reconstruction: {state: required, source: persisted_snapshot_only}
+      safe_protocol_retry: {state: required, scope: idempotent_local_operations}
+
+  nfs3:
+    backend_kind: nfs
+    protocol: "3"
+    environment: shared-real-nfs3
+    gates: [DM-NFS3-CONTRACT, TS-NFS3-SINGLE, TS-NFS3-REMOTE]
+    capabilities:
+      connectivity: required
+      traversal_complete: required
+      sequential_read: required
+      range_read: required
+      staged_destination: required
+      ordered_write: required
+      out_of_order_write: required
+      truncate_overwrite: required
+      durable_checkpoint: {state: required, mechanism: stable_write_contiguous_prefix}
+      resume: required
+      restart_upload: required
+      publication: {state: required, guarantee: nfs_rename_replace}
+      cancellation: required
+      native_transfer: unsupported
+      content_readback: required
+      directory: required
+      symlink: required
+      hardlink_topology: unsupported
+      rename: required
+      delete: required
+      acl: required
+      xattr: required
+      tags: not_applicable
+      uid_gid_mode: required
+      timestamps: required
+      backend_fact_reconstruction: {state: required, source: persisted_snapshot_only}
+      safe_protocol_retry: {state: required, scope: rpc_operations_with_proven_replay_safety}
+
+  nfs40:
+    backend_kind: nfs
+    protocol: "4.0"
+    environment: shared-real-nfs40
+    gates: [DM-NFS40-CONTRACT, TS-NFS40-SINGLE, TS-NFS40-REMOTE]
+    capabilities:
+      connectivity: required
+      traversal_complete: required
+      sequential_read: required
+      range_read: required
+      staged_destination: required
+      ordered_write: required
+      out_of_order_write: required
+      truncate_overwrite: required
+      durable_checkpoint: {state: required, mechanism: stable_write_contiguous_prefix}
+      resume: required
+      restart_upload: required
+      publication: {state: required, guarantee: nfs_rename_replace}
+      cancellation: required
+      native_transfer: unsupported
+      content_readback: required
+      directory: required
+      symlink: required
+      hardlink_topology: unsupported
+      rename: required
+      delete: required
+      acl: required
+      xattr: required
+      tags: not_applicable
+      uid_gid_mode: required
+      timestamps: required
+      backend_fact_reconstruction: {state: required, source: persisted_snapshot_only}
+      safe_protocol_retry: {state: required, scope: nfs4_sequence_and_operation_safety}
+
+  nfs41:
+    backend_kind: nfs
+    protocol: "4.1"
+    environment: shared-real-nfs41
+    gates: [DM-NFS41-CONTRACT, TS-NFS41-SINGLE, TS-NFS41-REMOTE]
+    capabilities:
+      connectivity: required
+      traversal_complete: required
+      sequential_read: required
+      range_read: required
+      staged_destination: required
+      ordered_write: required
+      out_of_order_write: required
+      truncate_overwrite: required
+      durable_checkpoint: {state: required, mechanism: stable_write_contiguous_prefix}
+      resume: required
+      restart_upload: required
+      publication: {state: required, guarantee: nfs_rename_replace}
+      cancellation: required
+      native_transfer: unsupported
+      content_readback: required
+      directory: required
+      symlink: required
+      hardlink_topology: unsupported
+      rename: required
+      delete: required
+      acl: required
+      xattr: required
+      tags: not_applicable
+      uid_gid_mode: required
+      timestamps: required
+      backend_fact_reconstruction: {state: required, source: persisted_snapshot_only}
+      safe_protocol_retry: {state: required, scope: nfs41_session_and_operation_safety}
+
+  cifs_fas2750:
+    backend_kind: cifs
+    protocol: smb3.1.1
+    environment: ontap-fas2750-ontap_lisaauto_cifs
+    gates: [SMB-FAS2750-NEGOTIATE, DM-CIFS-CONTRACT, TS-CIFS-SINGLE, TS-CIFS-REMOTE]
+    capabilities:
+      connectivity: {state: uncertified, gate: SMB-FAS2750-NEGOTIATE}
+      traversal_complete: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      sequential_read: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      range_read: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      staged_destination: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      ordered_write: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      out_of_order_write: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      truncate_overwrite: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      durable_checkpoint: {state: uncertified, gate: DM-CIFS-CONTRACT, mechanism: flushed_contiguous_prefix}
+      resume: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      restart_upload: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      publication: {state: uncertified, gate: DM-CIFS-CONTRACT, guarantee: smb_rename_replace}
+      cancellation: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      native_transfer: unsupported
+      content_readback: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      directory: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      symlink: unsupported
+      hardlink_topology: unsupported
+      rename: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      delete: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      acl: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      xattr: unsupported
+      tags: not_applicable
+      uid_gid_mode: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      timestamps: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      backend_fact_reconstruction: {state: required, source: persisted_snapshot_only}
+      safe_protocol_retry: {state: uncertified, gate: DM-CIFS-CONTRACT, scope: smb_operation_replay_safety}
+
+  s3_standard:
+    backend_kind: s3
+    environment: shared-standard-compatible-s3
+    gates: [DM-S3-CONTRACT, TS-S3-SINGLE, TS-S3-REMOTE]
+    capabilities:
+      connectivity: required
+      traversal_complete: required
+      sequential_read: required
+      range_read: required
+      staged_destination: required
+      ordered_write: required
+      out_of_order_write: {state: required, mechanism: multipart_parts}
+      truncate_overwrite: {state: required, mechanism: object_replacement}
+      durable_checkpoint: {state: required, mechanism: service_enumerated_multipart_parts}
+      resume: required
+      restart_upload: required
+      publication: {state: required, guarantee: complete_multipart_object_visibility}
+      cancellation: required
+      native_transfer: {state: required, applicability: connected_pair_planner_only}
+      content_readback: required
+      directory: unsupported
+      symlink: unsupported
+      hardlink_topology: not_applicable
+      rename: {state: required, guarantee: copy_then_delete_not_atomic}
+      delete: required
+      acl: unsupported
+      xattr: not_applicable
+      tags: required
+      uid_gid_mode: not_applicable
+      timestamps: {state: required, semantics: object_last_modified}
+      backend_fact_reconstruction: {state: required, source: persisted_snapshot_only}
+      safe_protocol_retry: {state: required, scope: idempotent_or_token_bound_s3_requests}
+
+  s3_dxn:
+    backend_kind: s3
+    environment: shared-real-dxn
+    gates: [DM-DXN-CONTRACT, TS-DXN-SINGLE, TS-DXN-REMOTE]
+    capabilities:
+      connectivity: required
+      traversal_complete: required
+      sequential_read: required
+      range_read: required
+      staged_destination: required
+      ordered_write: required
+      out_of_order_write: {state: required, mechanism: multipart_parts}
+      truncate_overwrite: {state: required, mechanism: object_replacement}
+      durable_checkpoint: {state: required, mechanism: service_enumerated_multipart_parts}
+      resume: required
+      restart_upload: required
+      publication: {state: required, guarantee: complete_multipart_object_visibility}
+      cancellation: required
+      native_transfer: {state: required, applicability: connected_dxn_pair_planner_only}
+      content_readback: required
+      directory: unsupported
+      symlink: unsupported
+      hardlink_topology: not_applicable
+      rename: {state: unsupported, reason: dxn_verified_semantic_limit}
+      delete: {state: required, semantics: dxn_checksum_request_contract}
+      acl: unsupported
+      xattr: not_applicable
+      tags: {state: unsupported, reason: dxn_verified_semantic_limit}
+      uid_gid_mode: not_applicable
+      timestamps: {state: required, semantics: object_last_modified}
+      backend_fact_reconstruction: {state: required, source: persisted_snapshot_only}
+      safe_protocol_retry: {state: required, scope: dxn_verified_request_replay_safety}
+
+  hdfs:
+    backend_kind: hdfs
+    environment: shared-real-hdfs-ha-kerberos
+    gates: [DM-HDFS-CONTRACT, DM-HDFS-HA, DM-HDFS-KERBEROS, TS-HDFS-SINGLE, TS-HDFS-REMOTE]
+    capabilities:
+      connectivity: required
+      traversal_complete: required
+      sequential_read: required
+      range_read: required
+      staged_destination: required
+      ordered_write: required
+      out_of_order_write: {state: required, mechanism: backend_reorders_to_continuous_tail_append}
+      truncate_overwrite: required
+      durable_checkpoint: {state: required, mechanism: verified_continuous_partial}
+      resume: required
+      restart_upload: required
+      publication: {state: required, guarantee: hdfs_rename_replace}
+      cancellation: required
+      native_transfer: unsupported
+      content_readback: required
+      directory: required
+      symlink: unsupported
+      hardlink_topology: unsupported
+      rename: required
+      delete: required
+      acl: required
+      xattr: required
+      tags: not_applicable
+      uid_gid_mode: required
+      timestamps: required
+      backend_fact_reconstruction: {state: required, source: persisted_snapshot_only}
+      safe_protocol_retry: {state: required, scope: hdfs_ha_and_operation_replay_safety}
+
+device_compatibility_overlays:
+  storagegrid:
+    backend_kind: s3
+    matrix_profile: false
+    reason: no_durable_shared_real_environment
+    required_gate: DM-STORAGEGRID-REQUEST-CONTRACT
+    semantics: [exact_x_id_removal, delete_content_md5]
+  dxn:
+    backend_kind: s3
+    matrix_profile: true
+    semantics: [delete_checksum, rename_limit, tag_limit, multipart_restart]
+  fas2750:
+    backend_kind: cifs
+    matrix_profile: true
+    endpoints: [10.128.61.200, 10.128.61.201]
+    share: ontap_lisaauto_cifs
+    secrets: ci_secret_only
