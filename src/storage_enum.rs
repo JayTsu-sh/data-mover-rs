@@ -129,8 +129,7 @@ use crate::checksum::{ConsistencyCheck, HashCalculator};
 use crate::cifs::{CifsStorage, create_cifs_storage};
 use crate::error::StorageError;
 use crate::filter::FilterExpression;
-use crate::hdfs::{HDFSStorage, HdfsConfig, HdfsPreparedTransfer, create_hdfs_storage};
-use crate::hdfs_transfer_mapping::hdfs_write_options;
+use crate::hdfs::{HDFSStorage, HdfsConfig, create_hdfs_storage};
 use crate::local::{LocalStorage, create_local_storage};
 use crate::nfs::{NFSStorage, create_nfs_storage};
 use crate::qos::QosManager;
@@ -212,23 +211,6 @@ pub enum StreamHandle {
         prefix_len: u64,
         expected_size: u64,
     },
-}
-
-fn hdfs_prepared_from_handle(
-    part_path: PathBuf,
-    prefix_len: u64,
-    expected_size: u64,
-    entry: &EntryEnum,
-) -> Result<HdfsPreparedTransfer> {
-    let (mode, replication) = hdfs_write_options(entry);
-    HdfsPreparedTransfer::new(
-        part_path,
-        prefix_len,
-        expected_size,
-        entry.get_size(),
-        mode,
-        replication,
-    )
 }
 
 impl StorageEnum {
@@ -957,44 +939,10 @@ impl StorageEnum {
         Ok(())
     }
 
-    pub(crate) async fn verify_hdfs_partial_integrity(
-        from: &StorageEnum,
-        to: &StorageEnum,
+    pub(crate) async fn compute_entry_hash(
+        storage: &StorageEnum,
         entry: &EntryEnum,
-        part_path: &Path,
-        enabled: bool,
-    ) -> Result<()> {
-        if Self::hdfs_partial_integrity_matches(from, to, entry, part_path, enabled).await? {
-            return Ok(());
-        }
-        if let StorageEnum::HDFS(destination) = to {
-            let _ = destination.delete_file(part_path).await;
-        }
-        Err(StorageError::OperationError(
-            "integrity check failed: source and HDFS partial hashes differ".to_string(),
-        ))
-    }
-
-    pub(crate) async fn hdfs_partial_integrity_matches(
-        from: &StorageEnum,
-        to: &StorageEnum,
-        entry: &EntryEnum,
-        part_path: &Path,
-        enabled: bool,
-    ) -> Result<bool> {
-        if !enabled {
-            return Ok(true);
-        }
-        let size = entry.get_size();
-        let source_hash = Self::compute_entry_hash(from, entry).await?;
-        let destination_hash = to.compute_hash(part_path, size).await?;
-        if source_hash == destination_hash {
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    async fn compute_entry_hash(storage: &StorageEnum, entry: &EntryEnum) -> Result<String> {
+    ) -> Result<String> {
         if entry.get_size() == 0 {
             return Ok(String::new());
         }
@@ -1337,19 +1285,7 @@ impl StorageEnum {
         let size = entry.get_size();
 
         if let StorageEnum::HDFS(storage) = dest {
-            let (mode, replication) = hdfs_write_options(entry);
-            let state = storage
-                .prepare_tail_transfer(part_path, size, resume, mode, replication)
-                .await?;
-            let missing = (state.prefix_len() < size).then_some((state.prefix_len(), size));
-            return Ok((
-                missing.into_iter().collect(),
-                StreamHandle::Hdfs {
-                    part_path: state.part_path().to_path_buf(),
-                    prefix_len: state.prefix_len(),
-                    expected_size: state.expected_size(),
-                },
-            ));
+            return crate::hdfs_legacy_resume::prepare(storage, entry, part_path, resume).await;
         }
 
         if let StorageEnum::S3(to_s3) = dest {
@@ -1486,16 +1422,19 @@ impl StorageEnum {
                         "write_chunk_stream: HDFS handle requires an HDFS destination".to_string(),
                     ));
                 };
-                let state = hdfs_prepared_from_handle(
-                    part_path.clone(),
-                    *prefix_len,
-                    *expected_size,
+                crate::hdfs_legacy_resume::write(
+                    storage,
                     entry,
-                )?;
-                storage
-                    .append_prepared_tail(rx, &state, bytes_counter.as_ref(), Some(&on_committed))
-                    .await
-                    .map(|_| ())
+                    rx,
+                    StreamHandle::Hdfs {
+                        part_path: part_path.clone(),
+                        prefix_len: *prefix_len,
+                        expected_size: *expected_size,
+                    },
+                    bytes_counter,
+                    on_committed,
+                )
+                .await
             }
         }
     }
@@ -1633,20 +1572,22 @@ impl StorageEnum {
                 prefix_len,
                 expected_size,
             } => {
-                let StorageEnum::HDFS(storage) = dest else {
+                let StorageEnum::HDFS(_) = dest else {
                     return Err(StorageError::OperationError(
                         "commit_chunk_stream: HDFS handle requires an HDFS destination".to_string(),
                     ));
                 };
-                let state = hdfs_prepared_from_handle(part_path, prefix_len, expected_size, entry)?;
-                if size != expected_size {
-                    return Err(StorageError::OperationError(format!(
-                        "HDFS resume commit size {size} does not match handle size {expected_size}"
-                    )));
-                }
-                storage
-                    .commit_prepared_tail(&state, entry.get_relative_path())
-                    .await
+                return crate::hdfs_legacy_resume::commit(
+                    dest,
+                    entry,
+                    size,
+                    StreamHandle::Hdfs {
+                        part_path,
+                        prefix_len,
+                        expected_size,
+                    },
+                )
+                .await;
             }
         }?;
 
@@ -1697,7 +1638,7 @@ impl StorageEnum {
             return Err(StorageError::Cancelled);
         }
         if matches!(to, StorageEnum::HDFS(_)) {
-            return Box::pin(Self::copy_file_resumable_to_hdfs(
+            return Box::pin(crate::hdfs_legacy_resume::copy_file_resumable(
                 from, to, entry, options, resume,
             ))
             .await;
@@ -1781,99 +1722,6 @@ impl StorageEnum {
             from.delete_file(entry).await?;
         }
 
-        Ok(())
-    }
-
-    async fn copy_file_resumable_to_hdfs(
-        from: &StorageEnum,
-        to: &StorageEnum,
-        entry: &EntryEnum,
-        options: CopyOptions,
-        resume: ResumeContext,
-    ) -> Result<()> {
-        if options
-            .cancel
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return Err(StorageError::Cancelled);
-        }
-        let size = entry.get_size();
-        let ResumeContext {
-            part_relative_path,
-            missing_intervals,
-            on_committed,
-        } = resume;
-        let (actual_missing, handle) =
-            Self::resume_prepare(to, entry, &part_relative_path, true).await?;
-        if missing_intervals != actual_missing {
-            return Err(StorageError::OperationError(format!(
-                "HDFS resume intervals do not match persistent tail: requested={missing_intervals:?}, actual={actual_missing:?}"
-            )));
-        }
-        let CopyOptions {
-            qos,
-            enable_integrity_check,
-            is_source_reserved,
-            bytes_counter,
-            cancel,
-        } = options;
-        let (rx, read_task) = Self::read_chunk_stream(
-            from,
-            entry,
-            Some(actual_missing),
-            qos,
-            false,
-            COPY_PIPELINE_CAPACITY,
-        );
-        let to_c = to.clone();
-        let entry_w = entry.clone();
-        let handle_w = handle.clone();
-        let write_task = tokio::spawn(async move {
-            Self::write_chunk_stream(&to_c, &entry_w, rx, &handle_w, bytes_counter, on_committed)
-                .await
-        });
-        let read_abort = read_task.abort_handle();
-        let write_abort = write_task.abort_handle();
-        let joined = async { (read_task.await, write_task.await) };
-        tokio::pin!(joined);
-        let (read_result, write_result) = match cancel.as_ref() {
-            Some(token) => tokio::select! {
-                result = &mut joined => result,
-                () = token.cancelled() => {
-                    read_abort.abort();
-                    write_abort.abort();
-                    let _ = joined.await;
-                    return Err(StorageError::Cancelled);
-                }
-            },
-            None => joined.await,
-        };
-        let read_result = read_result.map_err(|error| {
-            StorageError::OperationError(format!("read task panicked: {error:?}"))
-        })?;
-        let write_result = write_result.map_err(|error| {
-            StorageError::OperationError(format!("write task panicked: {error:?}"))
-        })?;
-        resolve_copy_pipeline(read_result, write_result)?;
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return Err(StorageError::Cancelled);
-        }
-        Self::verify_hdfs_partial_integrity(
-            from,
-            to,
-            entry,
-            &part_relative_path,
-            enable_integrity_check,
-        )
-        .await?;
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return Err(StorageError::Cancelled);
-        }
-        Self::commit_chunk_stream(to, entry, size, handle).await?;
-        if !is_source_reserved {
-            from.delete_file(entry).await?;
-        }
         Ok(())
     }
 
@@ -3166,19 +3014,6 @@ mod tests {
         let decoded_fixture: StreamHandle = serde_json::from_slice(legacy_fixture.as_bytes())
             .assert_value("deserialize legacy HDFS handle fixture");
         assert_eq!(decoded_fixture, handle);
-    }
-
-    #[test]
-    fn hdfs_resume_handle_rejects_impossible_prefix_or_entry_size() {
-        let mut entry = hdfs_entry("file.bin", false);
-        let EntryEnum::HDFS(hdfs) = &mut entry else {
-            panic!("expected HDFS entry");
-        };
-        hdfs.size = 16;
-
-        assert!(hdfs_prepared_from_handle(PathBuf::from("file.part"), 4, 16, &entry).is_ok());
-        assert!(hdfs_prepared_from_handle(PathBuf::from("file.part"), 17, 16, &entry).is_err());
-        assert!(hdfs_prepared_from_handle(PathBuf::from("file.part"), 4, 15, &entry).is_err());
     }
 
     #[tokio::test]
