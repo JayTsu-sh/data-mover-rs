@@ -29,6 +29,7 @@ pub mod nfs;
 pub mod qos;
 pub mod s3;
 pub mod storage_enum;
+pub mod storage_options;
 pub mod tar_pack;
 pub mod third_party;
 pub mod time_util;
@@ -58,8 +59,10 @@ pub use nfs::NFSStorage;
 pub use qos::QosManager;
 pub use s3::{MultipartUpload, S3BucketInfo, S3CompletedPart, S3Storage};
 pub use storage_enum::{
-    BackendConfig, CopyOptions, CreateStorageOptions, StorageEnum, StorageType, StreamHandle,
-    TarPackOptions, WalkOptions, create_storage, detect_storage_type,
+    StorageEnum, StorageType, StreamHandle, create_storage, detect_storage_type,
+};
+pub use storage_options::{
+    BackendConfig, CopyOptions, CreateStorageOptions, TarPackOptions, WalkOptions,
 };
 pub use tar_pack::calculate_tar_size;
 pub use transfer_concurrency::TransferConcurrency;
