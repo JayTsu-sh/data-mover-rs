@@ -1,37 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-
-async fn copy_s3_to_s3_native(
-    src: &S3Storage,
-    dst: &S3Storage,
-    entry: &crate::S3Entry,
-    source: &StorageEnum,
-    source_entry: &EntryEnum,
-    bytes_counter: Option<&Arc<AtomicU64>>,
-    is_source_reserved: bool,
-) -> Result<()> {
-    let src_key = src.build_full_key(&entry.relative_path);
-    let dst_key = dst.build_full_key(&entry.relative_path);
-    if src.endpoint == dst.endpoint {
-        src.copy_object(src.bucket(), &src_key, dst.bucket(), &dst_key)
-            .await?;
-    } else {
-        src.stream_copy_to(dst, &src_key, &dst_key, entry.size, entry.tags.clone())
-            .await?;
-    }
-    if let Some(counter) = bytes_counter {
-        counter.fetch_add(source_entry.get_size(), Ordering::Relaxed);
-    }
-    if !is_source_reserved {
-        source.delete_file(source_entry).await?;
-    }
-    Ok(())
-}
 
 use crate::checksum::HashCalculator;
 use crate::cifs::CifsStorage;
@@ -612,7 +585,7 @@ impl StorageEnum {
         if let (StorageEnum::S3(src), StorageEnum::S3(dst), EntryEnum::S3(e)) = (from, to, entry)
             && options.qos.is_none()
         {
-            return Box::pin(copy_s3_to_s3_native(
+            return Box::pin(crate::storage_copy_pipeline::copy_s3_to_s3_native(
                 src,
                 dst,
                 e,

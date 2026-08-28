@@ -13,7 +13,34 @@ use crate::checksum::{ConsistencyCheck, HashCalculator};
 use crate::error::StorageError;
 use crate::qos::QosManager;
 use crate::storage_enum::path_to_s3_key;
-use crate::{CopyOptions, DataChunk, EntryEnum, Result, StorageEnum};
+use crate::{CopyOptions, DataChunk, EntryEnum, Result, S3Entry, S3Storage, StorageEnum};
+
+pub(crate) async fn copy_s3_to_s3_native(
+    src: &S3Storage,
+    dst: &S3Storage,
+    entry: &S3Entry,
+    source: &StorageEnum,
+    source_entry: &EntryEnum,
+    bytes_counter: Option<&Arc<AtomicU64>>,
+    is_source_reserved: bool,
+) -> Result<()> {
+    let src_key = src.build_full_key(&entry.relative_path);
+    let dst_key = dst.build_full_key(&entry.relative_path);
+    if src.endpoint == dst.endpoint {
+        src.copy_object(src.bucket(), &src_key, dst.bucket(), &dst_key)
+            .await?;
+    } else {
+        src.stream_copy_to(dst, &src_key, &dst_key, entry.size, entry.tags.clone())
+            .await?;
+    }
+    if let Some(counter) = bytes_counter {
+        counter.fetch_add(source_entry.get_size(), Ordering::Relaxed);
+    }
+    if !is_source_reserved {
+        source.delete_file(source_entry).await?;
+    }
+    Ok(())
+}
 
 /// 哈希计算 / 大文件读取 pipeline 的 channel 容量（读写并行，4 个 chunk 缓冲）
 pub(crate) const HASH_CHANNEL_CAPACITY: usize = 4;
