@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::checksum::HashCalculator;
@@ -19,6 +18,7 @@ use crate::s3::S3Storage;
 pub use crate::storage_options::{
     BackendConfig, CopyOptions, CreateStorageOptions, TarPackOptions, WalkOptions,
 };
+pub use crate::stream_handle::StreamHandle;
 use crate::{
     CommitCallback, DataChunk, DeleteDirIterator, EntryEnum, Result, ResumeContext,
     TransferConcurrency, WalkDirAsyncIterator, WalkDirAsyncIterator2,
@@ -43,29 +43,6 @@ pub enum StorageEnum {
     S3(S3Storage),
     CIFS(CifsStorage),
     HDFS(HDFSStorage),
-}
-
-/// 字节级续传的目标端流式写句柄（issue #21：`resume_prepare` 产出，
-/// `write_chunk_stream`/`commit_chunk_stream` 消费）。跨 transport 传递
-/// （双进程场景下 Receiver 侧 prepare、由 Sender 侧对称使用同一份区间信息），
-/// 故派生 `Serialize`/`Deserialize`。
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub enum StreamHandle {
-    /// NAS（Local/NFS/CIFS）目标端：写 `.part` 临时文件；
-    /// commit = `set_file_len` + `rename`。
-    Nas { part_path: PathBuf },
-    /// S3 目标端：写 in-progress multipart upload；commit = `CompleteMultipartUpload`。
-    S3 {
-        upload_id: String,
-        part_size: u64,
-        dst_key: String,
-    },
-    /// HDFS tail-only resume state transferable to a separate receiver process.
-    Hdfs {
-        part_path: PathBuf,
-        prefix_len: u64,
-        expected_size: u64,
-    },
 }
 
 impl StorageEnum {
@@ -1173,25 +1150,6 @@ mod tests {
             .await
             .assert_value("delete file from HDFS entry");
         assert!(!file_path.exists());
-    }
-
-    #[test]
-    fn hdfs_resume_handle_round_trips_across_process_serialization() {
-        let handle = StreamHandle::Hdfs {
-            part_path: PathBuf::from("目录/文件.bin.part"),
-            prefix_len: 123,
-            expected_size: 456,
-        };
-        let encoded = serde_json::to_vec(&handle).assert_value("serialize HDFS handle");
-        let decoded: StreamHandle =
-            serde_json::from_slice(&encoded).assert_value("deserialize HDFS handle");
-        assert_eq!(decoded, handle);
-
-        let legacy_fixture =
-            r#"{"Hdfs":{"part_path":"目录/文件.bin.part","prefix_len":123,"expected_size":456}}"#;
-        let decoded_fixture: StreamHandle = serde_json::from_slice(legacy_fixture.as_bytes())
-            .assert_value("deserialize legacy HDFS handle fixture");
-        assert_eq!(decoded_fixture, handle);
     }
 
     #[tokio::test]

@@ -1,8 +1,7 @@
 //! Compatibility orchestration for the legacy HDFS resume and wire APIs.
 //!
-//! The public entry points and `StreamHandle` wire type remain in
-//! `storage_enum`; this module owns the HDFS tail-transfer invariants used to
-//! implement those compatibility surfaces.
+//! The public entry points remain on `StorageEnum`; this module owns the HDFS
+//! tail-transfer invariants used to implement those compatibility surfaces.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
