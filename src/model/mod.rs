@@ -3,6 +3,14 @@
 use std::fmt;
 use std::str::FromStr;
 
+pub(crate) const MAX_MODEL_FIELD_BYTES: usize = 16 * 1024 * 1024;
+
+pub(crate) mod observation;
+pub use observation::{
+    EntryIdentityKey, EntrySnapshot, IdentityStrength, MetadataObservations, ObservedEntry,
+    SnapshotDecodeError, SourceIdentity,
+};
+
 /// A failure to construct a neutral model value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModelValueError {
@@ -48,6 +56,8 @@ fn required(
         Err(ModelValueError::new(field, "must not be blank"))
     } else if value.contains('\0') {
         Err(ModelValueError::new(field, "must not contain NUL"))
+    } else if value.len() > MAX_MODEL_FIELD_BYTES {
+        Err(ModelValueError::new(field, "exceeds model field limit"))
     } else {
         Ok(RedactedString(value))
     }
@@ -136,7 +146,7 @@ impl LocalConfig {
     /// Creates a local configuration.
     ///
     /// # Errors
-    /// Returns an error when the root is blank or contains NUL.
+    /// Returns an error when the root is blank, contains NUL, or exceeds the model field limit.
     pub fn new(root: impl Into<String>) -> Result<Self, ModelValueError> {
         Ok(Self {
             root: required(root, "root")?,
@@ -158,7 +168,7 @@ impl NfsConfig {
     /// Creates an NFS configuration with an explicit dialect.
     ///
     /// # Errors
-    /// Returns an error when a required endpoint field is blank or contains NUL.
+    /// Returns an error when a required field is blank, contains NUL, or exceeds the model field limit.
     pub fn new(
         server: impl Into<String>,
         export: impl Into<String>,
@@ -191,7 +201,7 @@ impl CifsConfig {
     /// Creates a CIFS configuration.
     ///
     /// # Errors
-    /// Returns an error when the server or share is blank or contains NUL.
+    /// Returns an error when a required field is blank, contains NUL, or exceeds the model field limit.
     pub fn new(
         server: impl Into<String>,
         share: impl Into<String>,
@@ -217,7 +227,7 @@ impl S3Config {
     /// Creates an S3 configuration.
     ///
     /// # Errors
-    /// Returns an error when a required endpoint field is blank or contains NUL.
+    /// Returns an error when a required field is blank, contains NUL, or exceeds the model field limit.
     pub fn new(
         endpoint: impl Into<String>,
         bucket: impl Into<String>,
@@ -244,7 +254,7 @@ impl HdfsConfig {
     /// Creates an HDFS configuration.
     ///
     /// # Errors
-    /// Returns an error when the namenode or root is blank or contains NUL.
+    /// Returns an error when a required field is blank, contains NUL, or exceeds the model field limit.
     pub fn new(
         namenode: impl Into<String>,
         root: impl Into<String>,
@@ -304,11 +314,17 @@ impl StoragePath {
     /// Creates an opaque root-relative path.
     ///
     /// # Errors
-    /// Returns an error when the path contains NUL.
+    /// Returns an error when the path contains NUL or exceeds the model field limit.
     pub fn new(value: impl Into<String>) -> Result<Self, ModelValueError> {
         let value = value.into();
         if value.contains('\0') {
             return Err(ModelValueError::new("storage_path", "must not contain NUL"));
+        }
+        if value.len() > MAX_MODEL_FIELD_BYTES {
+            return Err(ModelValueError::new(
+                "storage_path",
+                "exceeds model field limit",
+            ));
         }
         Ok(Self(value))
     }
@@ -337,7 +353,7 @@ impl BackendIdentity {
     /// Creates an identity from a backend-produced stable identifier.
     ///
     /// # Errors
-    /// Returns an error when the stable identifier is blank or contains NUL.
+    /// Returns an error when the stable identifier is blank, contains NUL, or exceeds the model field limit.
     pub fn new(kind: BackendKind, stable_id: impl Into<String>) -> Result<Self, ModelValueError> {
         Ok(Self {
             kind,
@@ -549,7 +565,7 @@ impl EntryOperationFailure {
     /// Creates an entry-scoped failure from an already-redacted diagnostic.
     ///
     /// # Errors
-    /// Returns an error when the diagnostic is blank or contains NUL.
+    /// Returns an error when the diagnostic is blank, contains NUL, or exceeds the model field limit.
     pub fn new(
         path: StoragePath,
         operation: Operation,
@@ -600,7 +616,7 @@ impl BackendSessionFailure {
     /// Creates a session-scoped failure from an already-redacted diagnostic.
     ///
     /// # Errors
-    /// Returns an error when the diagnostic is blank or contains NUL.
+    /// Returns an error when the diagnostic is blank, contains NUL, or exceeds the model field limit.
     pub fn new(
         operation: Operation,
         class: FailureClass,
