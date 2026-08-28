@@ -27,46 +27,6 @@ struct MultiCopyOptions {
     cancel: Option<CancellationToken>,
 }
 
-#[derive(Debug, Clone)]
-pub struct WalkOptions {
-    pub depth: Option<usize>,
-    pub match_expressions: Option<FilterExpression>,
-    pub exclude_expressions: Option<FilterExpression>,
-    pub concurrency: usize,
-    pub include_tags: bool,
-    pub packaged: bool,
-    pub package_depth: usize,
-}
-
-impl Default for WalkOptions {
-    fn default() -> Self {
-        Self {
-            depth: None,
-            match_expressions: None,
-            exclude_expressions: None,
-            concurrency: 1,
-            include_tags: false,
-            packaged: false,
-            package_depth: 0,
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct CopyOptions {
-    pub qos: Option<QosManager>,
-    pub enable_integrity_check: bool,
-    pub is_source_reserved: bool,
-    pub bytes_counter: Option<Arc<AtomicU64>>,
-    pub cancel: Option<CancellationToken>,
-}
-
-#[derive(Clone, Default)]
-pub struct TarPackOptions {
-    pub qos: Option<QosManager>,
-    pub bytes_counter: Option<Arc<AtomicU64>>,
-}
-
 #[derive(Clone)]
 pub(crate) struct WriteProgress {
     pub bytes_counter: Option<Arc<AtomicU64>>,
@@ -129,11 +89,14 @@ use crate::checksum::{ConsistencyCheck, HashCalculator};
 use crate::cifs::{CifsStorage, create_cifs_storage};
 use crate::error::StorageError;
 use crate::filter::FilterExpression;
-use crate::hdfs::{HDFSStorage, HdfsConfig, create_hdfs_storage};
+use crate::hdfs::{HDFSStorage, create_hdfs_storage};
 use crate::local::{LocalStorage, create_local_storage};
 use crate::nfs::{NFSStorage, create_nfs_storage};
 use crate::qos::QosManager;
 use crate::s3::{S3Storage, create_s3_storage};
+pub use crate::storage_options::{
+    BackendConfig, CopyOptions, CreateStorageOptions, TarPackOptions, WalkOptions,
+};
 use crate::tar_pack::{build_header_for_entry, tar_eof_marker, tar_padding};
 use crate::{
     CommitCallback, DataChunk, DeleteDirIterator, EntryEnum, Result, ResumeContext,
@@ -158,36 +121,6 @@ pub enum StorageEnum {
     S3(S3Storage),
     CIFS(CifsStorage),
     HDFS(HDFSStorage),
-}
-
-/// Backend-specific creation configuration.
-///
-/// Concrete variants are added only when a backend has explicit configuration
-/// that does not belong in the storage location or common creation options.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub enum BackendConfig {
-    #[default]
-    Default,
-    Hdfs(HdfsConfig),
-}
-
-/// Typed options used by the unified storage factory.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CreateStorageOptions {
-    pub block_size: Option<u64>,
-    pub ensure_dir: bool,
-    pub backend: BackendConfig,
-}
-
-impl CreateStorageOptions {
-    #[must_use]
-    pub const fn new(block_size: Option<u64>, ensure_dir: bool) -> Self {
-        Self {
-            block_size,
-            ensure_dir,
-            backend: BackendConfig::Default,
-        }
-    }
 }
 
 /// 字节级续传的目标端流式写句柄（issue #21：`resume_prepare` 产出，
