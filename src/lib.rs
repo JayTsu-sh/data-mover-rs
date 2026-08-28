@@ -36,6 +36,7 @@ mod storage_metadata;
 pub mod storage_options;
 mod storage_read_pipeline;
 mod storage_resume_compat;
+mod stream_handle;
 pub mod tar_pack;
 pub mod third_party;
 pub mod time_util;
@@ -64,12 +65,11 @@ pub use local::LocalStorage;
 pub use nfs::NFSStorage;
 pub use qos::QosManager;
 pub use s3::{MultipartUpload, S3BucketInfo, S3CompletedPart, S3Storage};
-pub use storage_enum::{
-    StorageEnum, StorageType, StreamHandle, create_storage, detect_storage_type,
-};
+pub use storage_enum::{StorageEnum, StorageType, create_storage, detect_storage_type};
 pub use storage_options::{
     BackendConfig, CopyOptions, CreateStorageOptions, TarPackOptions, WalkOptions,
 };
+pub use stream_handle::StreamHandle;
 pub use tar_pack::calculate_tar_size;
 pub use transfer_concurrency::TransferConcurrency;
 pub use url_redact::redact_storage_url;
