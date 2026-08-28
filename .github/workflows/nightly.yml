@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 concurrency:
   group: terrasync-lab
@@ -41,6 +44,7 @@ jobs:
       LAB_HDFS_HA_NAMENODE2_VMID: "304"
       LAB_HDFS_HA_NAMENODE2_NAME: hdfs-namenode2
       LAB_HDFS_HA_NAMENODE2_SERVICE: hadoop-namenode.service
+      PERF_HARDWARE_ID: terrasync-lab-v1
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -99,13 +103,17 @@ jobs:
         with:
           name: qos-e2e-${{ github.run_id }}
           path: qos-*.csv
-      - name: Inflight performance benchmark
-        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-inflight-benchmark.sh "$RUN_ID" inflight-benchmark.csv
-      - name: Upload inflight benchmark
+      - name: Reproducible performance baseline
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-performance-baseline.sh "$RUN_ID" performance-baseline.csv performance-baseline.json
+      - name: Sign performance baseline provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: performance-baseline.*
+      - name: Upload performance baseline
         uses: actions/upload-artifact@v6
         with:
-          name: inflight-benchmark-${{ github.run_id }}
-          path: inflight-benchmark.csv
+          name: performance-baseline-${{ github.run_id }}
+          path: performance-baseline.*
       - name: HDFS multi-GiB bounded-memory gate
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-memory-e2e.sh "$RUN_ID" hdfs-memory.csv
       - name: HDFS service fault recovery

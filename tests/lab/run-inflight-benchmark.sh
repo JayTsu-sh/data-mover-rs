@@ -14,6 +14,7 @@ target_directory="$(cargo metadata --locked --no-deps --format-version 1 | \
   python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 binary="$target_directory/release/examples/storage_copy"
 size=$((128 * 1024 * 1024 + 137))
+chunk_bytes=$((2 * 1024 * 1024))
 mkdir -p "$local_root/source" "$local_root/destination" "$local_root/seed"
 [[ -x "$binary" ]] || cargo build --release --locked --example storage_copy
 
@@ -84,7 +85,8 @@ for backend in "${backends[@]}"; do
     cp "$fixture" "$local_root/source/$key"
   else
     "$binary" --source "$local_root/seed" \
-      --destination "$(storage_url source "$backend")" --path "$key"
+      --destination "$(storage_url source "$backend")" --path "$key" \
+      --chunk-bytes "$chunk_bytes"
   fi
 done
 printf '%s\n' \
@@ -106,7 +108,7 @@ run_case() {
     env "$read_var=$depth" "$write_var=$depth" \
     "$binary" --source "$(storage_url source "$source_backend")" \
       --destination "$(storage_url destination "$destination_backend")" \
-      --path "$key" > "$log" 2>&1; then
+      --path "$key" --chunk-bytes "$chunk_bytes" > "$log" 2>&1; then
     cat "$log" >&2
     rm -f "$metrics" "$log"
     return 1

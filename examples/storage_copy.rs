@@ -186,6 +186,10 @@ struct Args {
     #[arg(long)]
     path: String,
 
+    /// Requested transfer chunk size. Backends may negotiate a lower safe value.
+    #[arg(long, default_value_t = 2 * 1024 * 1024)]
+    chunk_bytes: u64,
+
     /// Delete the source only after destination publish, metadata and integrity succeed.
     #[arg(long)]
     delete_source: bool,
@@ -273,9 +277,12 @@ fn qos_from_args(args: &Args) -> Result<Option<data_mover::QosManager>> {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let qos = qos_from_args(&args)?;
-    let source = create_storage(&args.source, creation_options(&args.source, false)).await?;
-    let destination =
-        create_storage(&args.destination, creation_options(&args.destination, true)).await?;
+    let mut source_options = creation_options(&args.source, false);
+    source_options.block_size = Some(args.chunk_bytes);
+    let mut destination_options = creation_options(&args.destination, true);
+    destination_options.block_size = Some(args.chunk_bytes);
+    let source = create_storage(&args.source, source_options).await?;
+    let destination = create_storage(&args.destination, destination_options).await?;
     let entry = source.get_metadata(Path::new(&args.path)).await?;
 
     StorageEnum::copy_file(

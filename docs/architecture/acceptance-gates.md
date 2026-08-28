@@ -286,6 +286,13 @@ source/Sender side only and remains consistent with QUIC backpressure.
 
 ## 11. Performance gates
 
+The pre-refactor reference is produced by
+`tests/lab/run-performance-baseline.sh`. Its raw samples and JSON summary form
+one evidence unit bound by `samples_sha256`; the reporter rejects mixed commit,
+hardware, dataset, concurrency, requested chunk, or inflight conditions. The
+nightly workflow signs both files with a Sigstore-backed GitHub artifact
+attestation; a bare SHA-256 digest is not accepted as signed baseline evidence.
+
 Before refactoring, capture a signed baseline on the same hardware, datasets, profile,
 concurrency, chunk size, and inflight budget. `PERF-RELEASE` compares the exact candidate:
 

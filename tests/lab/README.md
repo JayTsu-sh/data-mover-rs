@@ -87,6 +87,27 @@ throughput, user/system CPU time, process CPU percentage, and peak RSS. The
 timed command includes the production copy integrity check, so the CSV reports
 end-to-end copy-and-verify cost rather than an unchecked microbenchmark.
 
+`run-performance-baseline.sh` freezes the pre-refactor performance evidence.
+It requires a stable `PERF_HARDWARE_ID`, records the exact Git commit, dataset,
+single-file concurrency, requested 2 MiB chunk and inflight depth 8, and emits
+both raw CSV samples and a SHA-256-bound JSON summary. The baseline contains
+the depth-8 4-by-4 large-copy matrix plus five public-seam Local scan and copy
+runs over 100 fixed small files. Its report includes throughput, entries/s,
+p95 entry scheduling latency and peak RSS; mixed hardware or incomplete measurements
+are rejected instead of being summarized. Nightly uploads the CSV and JSON as
+one artifact and signs their SLSA provenance with GitHub artifact attestations,
+so later architecture gates can compare like-for-like evidence. Verify a
+downloaded baseline with `gh attestation verify performance-baseline.csv
+--repo JayTsu-sh/data-mover-rs` (and repeat for the JSON file).
+
+At this public batch seam, scan scheduling latency is the interval between
+successive entry delivery events. Copy scheduling latency is the time from
+admitting the fixed batch to the bounded, concurrency-one queue until each
+entry starts `StorageEnum::copy_file`; copy service time remains represented in
+entries/s and end-to-end elapsed time rather than being mislabeled as queueing.
+Scheduling latency is deliberately null for the single-entry large-copy rows,
+where throughput and elapsed time are the applicable metrics.
+
 `run-qos-e2e.sh <run-id> [output.csv]` is the real-backend source-QoS gate for
 Local, NFSv3, NFSv4.1, S3, and HDFS. It first measures each unthrottled source
 and requires that baseline to exceed the configured limit by 25%; a naturally
