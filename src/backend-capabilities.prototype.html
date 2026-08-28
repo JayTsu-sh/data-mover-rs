@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PROTOTYPE — Storage backend capability seam</title>
+  <style>
+    :root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #172033; background: #f4f6f9; }
+    body { max-width: 1100px; margin: 0 auto; padding: 32px 20px 64px; }
+    h1, h2 { margin: 0 0 12px; } h1 { font-size: 28px; } h2 { font-size: 18px; margin-top: 28px; }
+    p { line-height: 1.6; } .note { color: #526075; }
+    .panel { background: white; border: 1px solid #dce2ea; border-radius: 12px; padding: 18px; margin: 14px 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .field { background: #f7f9fc; border-radius: 8px; padding: 12px; }
+    .field small { display: block; color: #66748a; margin-bottom: 5px; }
+    button { border: 1px solid #b8c4d4; background: white; color: #172033; border-radius: 8px; padding: 9px 12px; cursor: pointer; margin: 4px; }
+    button:hover { border-color: #315bd6; } button.primary { background: #315bd6; color: white; border-color: #315bd6; }
+    button.done { opacity: .45; } button:disabled { cursor: default; }
+    .ok { color: #157347; } .warn { color: #a15c00; } .no { color: #b42318; }
+    .result { border-left: 4px solid #315bd6; padding-left: 14px; }
+    code { background: #eef2f7; padding: 2px 5px; border-radius: 4px; }
+    .tabs button.active { background: #172033; color: white; }
+    .hidden { display: none; } ul { line-height: 1.55; }
+  </style>
+</head>
+<body>
+  <h1>PROTOTYPE — backend capability seam</h1>
+  <p><strong>问题：</strong>如果 <code>StorageEnum</code> 只负责选择 runtime backend，而协调层只向 backend 索取明确能力，能否诚实表达“不支持”“尚未认证”和协议内快速路径，同时避免 backend 名称分支？</p>
+  <p class="note">这是一次性逻辑原型，不是生产接口。所有状态只存在于当前页面内。</p>
+
+  <h2>当前状态</h2>
+  <div id="state" class="panel"></div>
+
+  <h2>自由尝试</h2>
+  <div class="panel">
+    <div><strong>选择源端：</strong><span id="source-buttons"></span></div>
+    <div><strong>选择目标端：</strong><span id="destination-buttons"></span></div>
+    <div><strong>请求：</strong><span id="request-buttons"></span></div>
+    <div><button class="primary" data-action="resolve">解析所需能力</button><button data-action="reset">重置</button></div>
+  </div>
+
+  <h2>引导场景</h2>
+  <div class="panel">
+    <div class="tabs" id="tabs"></div>
+    <div id="scenario"></div>
+  </div>
+
+  <script>
+    // Pure prototype module: no DOM dependencies.
+    const CapabilityModel = (() => {
+      const backends = {
+        Local: { source: ['ReadRange'], destination: ['StagedWrite', 'DurablePrefix', 'AtomicPublish'], extras: ['Namespace', 'PosixMetadata'], certified: [] },
+        NFS: { source: ['ReadRange'], destination: ['StagedWrite', 'DurablePrefix', 'AtomicPublish'], extras: ['Namespace', 'PosixMetadata', 'AclMetadata', 'XattrMetadata'], certified: [] },
+        CIFS: { source: ['ReadRange'], destination: ['StagedWrite', 'DurablePrefix', 'AtomicPublish'], extras: ['Namespace', 'AclMetadata'], certified: ['DurablePrefix:FAS2750 pending'] },
+        S3: { source: ['ReadRange'], destination: ['StagedWrite', 'EnumerableParts', 'AtomicPublish'], extras: ['ObjectMetadata', 'ServerSideCopy'], certified: [] },
+        HDFS: { source: ['ReadRange'], destination: ['StagedWrite', 'DurablePrefix', 'AtomicPublish'], extras: ['Namespace', 'HdfsMetadata'], certified: [] }
+      };
+
+      const requirements = {
+        StreamCopy: { source: ['ReadRange'], destination: ['StagedWrite', 'AtomicPublish'], extras: [] },
+        Resume: { source: ['ReadRange'], destinationAny: ['DurablePrefix', 'EnumerableParts'], extras: [] },
+        Symlink: { source: [], destination: [], extras: ['Namespace:Symlink'] },
+        PreserveAcl: { source: [], destination: [], extras: ['AclMetadata'] },
+        ServerCopy: { source: [], destination: [], extras: ['ServerSideCopy'] }
+      };
+
+      const initial = () => ({ source: 'Local', destination: 'S3', request: 'StreamCopy', outcome: null, history: [] });
+      const has = (backend, name) => [...backend.source, ...backend.destination, ...backend.extras].includes(name);
+
+      function resolve(state) {
+        const src = backends[state.source], dst = backends[state.destination], req = requirements[state.request];
+        const missing = [];
+        for (const cap of req.source || []) if (!src.source.includes(cap)) missing.push(`源端缺少 ${cap}`);
+        for (const cap of req.destination || []) if (!dst.destination.includes(cap)) missing.push(`目标端缺少 ${cap}`);
+        if (req.destinationAny && !req.destinationAny.some(cap => dst.destination.includes(cap))) missing.push(`目标端缺少 ${req.destinationAny.join(' 或 ')}`);
+        for (const raw of req.extras || []) {
+          if (raw === 'Namespace:Symlink') {
+            if (!['Local', 'NFS', 'HDFS'].includes(state.destination)) missing.push('目标端 Namespace 不提供 Symlink');
+          } else if (!has(dst, raw)) missing.push(`目标端缺少 ${raw}`);
+        }
+        const certification = dst.certified.filter(note => note.startsWith('DurablePrefix') && state.request === 'Resume');
+        let status = missing.length ? 'Unsupported' : certification.length ? 'NotCertified' : 'Supported';
+        let seam = state.request === 'ServerCopy' ? '目标 backend 的可选 FastPath 能力' : state.request === 'PreserveAcl' ? '目标 backend 的 Metadata 能力' : state.request === 'Symlink' ? '目标 backend 的 Namespace 能力' : 'Source + StagedDestination 能力组合';
+        if (state.request === 'ServerCopy' && !(state.source === 'S3' && state.destination === 'S3')) {
+          status = 'Unsupported'; missing.push('快速路径拒绝该 source/destination 配对');
+        }
+        return { status, missing, certification, seam, dispatch: `StorageEnum(${state.source}) / StorageEnum(${state.destination}) 只完成能力借用，不选择协议算法` };
+      }
+
+      function reduce(state, action) {
+        if (action.type === 'reset') return initial();
+        const next = { ...state, history: [...state.history] };
+        if (action.type === 'source') next.source = action.value;
+        if (action.type === 'destination') next.destination = action.value;
+        if (action.type === 'request') next.request = action.value;
+        if (action.type === 'resolve') {
+          next.outcome = resolve(next);
+          next.history.push(`${next.source} → ${next.destination}: ${next.request} = ${next.outcome.status}`);
+          return next;
+        }
+        next.outcome = null;
+        return next;
+      }
+      return { backends, requirements, initial, reduce };
+    })();
+
+    let state = CapabilityModel.initial();
+    const scenarios = [
+      { name: '普通流式复制', description: 'Local → S3 只组合读取、暂存写入和发布能力；协调层不需要知道 S3。', steps: [['source','Local'], ['destination','S3'], ['request','StreamCopy'], ['resolve']] },
+      { name: 'CIFS 尚未认证', description: '模型能区分“设计上有能力”和“FAS2750 尚未通过真实验证”，而不是假装支持或返回通用错误。', steps: [['source','NFS'], ['destination','CIFS'], ['request','Resume'], ['resolve']] },
+      { name: '不支持的语义', description: 'S3 目标不提供 symlink；失败发生在执行前，且由能力缺失解释。', steps: [['source','Local'], ['destination','S3'], ['request','Symlink'], ['resolve']] },
+      { name: '协议内快速路径', description: 'S3 → S3 可借用目标 backend 的快速路径；协调层只看到可选能力。', steps: [['source','S3'], ['destination','S3'], ['request','ServerCopy'], ['resolve']] }
+    ];
+    let activeScenario = 0, completedSteps = new Set();
+
+    const dispatch = action => { state = CapabilityModel.reduce(state, action); render(); };
+    const buttons = (values, type, selected) => values.map(v => `<button class="${v===selected?'primary':''}" data-type="${type}" data-value="${v}">${v}</button>`).join('');
+    function render() {
+      const outcome = state.outcome;
+      document.querySelector('#state').innerHTML = `
+        <div class="grid"><div class="field"><small>源端 runtime backend</small>${state.source}</div><div class="field"><small>目标端 runtime backend</small>${state.destination}</div><div class="field"><small>调用方意图</small>${state.request}</div><div class="field"><small>解析结果</small>${outcome ? `<span class="${outcome.status==='Supported'?'ok':outcome.status==='NotCertified'?'warn':'no'}">${outcome.status}</span>` : '尚未解析'}</div></div>
+        ${outcome ? `<div class="result"><p><strong>穿过的 seam：</strong>${outcome.seam}</p><p><strong>StorageEnum：</strong>${outcome.dispatch}</p>${outcome.missing.length?`<p class="no"><strong>缺失：</strong>${outcome.missing.join('；')}</p>`:''}${outcome.certification.length?`<p class="warn"><strong>认证门槛：</strong>${outcome.certification.join('；')}</p>`:''}</div>`:''}
+        <p class="note"><strong>历史：</strong>${state.history.length ? state.history.join(' → ') : '无'}</p>`;
+      document.querySelector('#source-buttons').innerHTML = buttons(Object.keys(CapabilityModel.backends), 'source', state.source);
+      document.querySelector('#destination-buttons').innerHTML = buttons(Object.keys(CapabilityModel.backends), 'destination', state.destination);
+      document.querySelector('#request-buttons').innerHTML = buttons(Object.keys(CapabilityModel.requirements), 'request', state.request);
+      document.querySelector('#tabs').innerHTML = scenarios.map((s,i)=>`<button class="${i===activeScenario?'active':''}" data-tab="${i}">${s.name}</button>`).join('');
+      const s=scenarios[activeScenario];
+      document.querySelector('#scenario').innerHTML = `<p>${s.description}</p><ol>${s.steps.map((step,i)=>`<li><button class="${completedSteps.has(i)?'done':''}" data-step="${i}" ${completedSteps.has(i)?'disabled':''}>${step[0]==='resolve'?'解析所需能力':`设置 ${step[0]} = ${step[1]}`}</button></li>`).join('')}</ol>`;
+    }
+    document.addEventListener('click', e => {
+      const b=e.target.closest('button'); if(!b) return;
+      if(b.dataset.type) dispatch({type:b.dataset.type,value:b.dataset.value});
+      else if(b.dataset.action) dispatch({type:b.dataset.action});
+      else if(b.dataset.tab) { activeScenario=Number(b.dataset.tab); completedSteps=new Set(); state=CapabilityModel.initial(); render(); }
+      else if(b.dataset.step) { const i=Number(b.dataset.step), step=scenarios[activeScenario].steps[i]; dispatch({type:step[0],value:step[1]}); completedSteps.add(i); render(); }
+    });
+    render();
+  </script>
+</body>
+</html>
