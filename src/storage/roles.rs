@@ -1,0 +1,253 @@
+use std::ops::Range;
+use std::pin::Pin;
+use std::{error::Error, fmt};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::Stream;
+use tokio_util::sync::CancellationToken;
+
+use crate::model::{
+    BackendSessionFailure, EntryKind, EntryOperationFailure, MetadataObservations, SourceIdentity,
+    StoragePath,
+};
+
+/// A bounded payload stream. Implementations own request sizing and backpressure.
+pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, StorageRoleFailure>> + Send>>;
+
+/// A stable neutral source description.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceDescriptor {
+    pub path: StoragePath,
+    pub kind: EntryKind,
+    pub size: Option<u64>,
+    pub source_identity: SourceIdentity,
+}
+
+/// One bounded sequential or range read.
+#[derive(Clone, Debug)]
+pub struct ReadRequest {
+    pub path: StoragePath,
+    pub range: Option<Range<u64>>,
+    pub cancel: CancellationToken,
+}
+
+/// Backend-neutral failure scope for a role operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StorageRoleFailure {
+    Entry(EntryOperationFailure),
+    Session(BackendSessionFailure),
+}
+
+impl fmt::Display for StorageRoleFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Entry(error) => error.fmt(formatter),
+            Self::Session(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for StorageRoleFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Entry(error) => Some(error),
+            Self::Session(error) => Some(error),
+        }
+    }
+}
+
+/// Source streaming role. Protocol handles and retry details remain behind this interface.
+#[async_trait]
+pub trait ReadSource: Send + Sync {
+    async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure>;
+    async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure>;
+}
+
+/// Request to prepare unpublished destination state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrepareRequest {
+    pub final_destination: FinalDestination,
+    pub source: SourceDescriptor,
+}
+
+/// A typed destination that remains unchanged until publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalDestination(StoragePath);
+
+impl FinalDestination {
+    #[must_use]
+    pub const fn new(path: StoragePath) -> Self {
+        Self(path)
+    }
+    #[must_use]
+    pub const fn path(&self) -> &StoragePath {
+        &self.0
+    }
+}
+
+/// Opaque linear prepared destination state bound to one backend and final destination.
+#[derive(Eq, PartialEq)]
+pub struct PreparedStage {
+    pub(crate) owner: crate::model::BackendIdentity,
+    pub(crate) final_destination: FinalDestination,
+    pub(crate) token: Bytes,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StageBindingError;
+
+#[allow(dead_code)]
+impl PreparedStage {
+    pub(crate) fn new(
+        owner: crate::model::BackendIdentity,
+        final_destination: FinalDestination,
+        token: Bytes,
+    ) -> Self {
+        Self {
+            owner,
+            final_destination,
+            token,
+        }
+    }
+
+    pub(crate) fn validate_owner(
+        &self,
+        owner: &crate::model::BackendIdentity,
+    ) -> Result<(), StageBindingError> {
+        if &self.owner == owner {
+            Ok(())
+        } else {
+            Err(StageBindingError)
+        }
+    }
+}
+
+impl fmt::Debug for PreparedStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedStage")
+            .field("owner", &self.owner)
+            .field("final_destination", &self.final_destination)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Evidence returned after backend persistence barriers complete.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WriteEvidence {
+    pub persisted_bytes: u64,
+}
+
+/// Backend-observed reusable work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointObservation {
+    pub durable_prefix: u64,
+}
+
+/// Requested staged-content verification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifyRequest {
+    pub expected_size: u64,
+}
+
+/// Evidence that staged content passed verification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerificationEvidence {
+    pub verified_bytes: u64,
+}
+
+/// Evidence that verified staged state was published.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicationEvidence {
+    pub final_destination: StoragePath,
+}
+
+/// Destination role owning prepare, write, checkpoint, verify, publish, and discard.
+#[async_trait]
+pub trait StagedDestination: Send + Sync {
+    async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure>;
+    async fn write(
+        &self,
+        stage: &PreparedStage,
+        input: ByteStream,
+    ) -> Result<WriteEvidence, StorageRoleFailure>;
+    async fn observe_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<CheckpointObservation, StorageRoleFailure>;
+    async fn verify(
+        &self,
+        stage: &PreparedStage,
+        request: VerifyRequest,
+    ) -> Result<VerificationEvidence, StorageRoleFailure>;
+    async fn publish(
+        &self,
+        stage: PreparedStage,
+    ) -> Result<PublicationEvidence, StorageRoleFailure>;
+    async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure>;
+}
+
+/// One coherent namespace operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NamespaceRequest {
+    Stat(StoragePath),
+    List(StoragePath),
+    CreateDirectory(StoragePath),
+    Delete(StoragePath),
+    Rename { from: StoragePath, to: StoragePath },
+}
+
+/// Neutral namespace result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NamespaceResult {
+    Completed,
+    Entries(Vec<SourceDescriptor>),
+}
+
+/// Coherent namespace role with typed verb availability behind one interface.
+#[async_trait]
+pub trait Namespace: Send + Sync {
+    async fn execute(
+        &self,
+        request: NamespaceRequest,
+    ) -> Result<NamespaceResult, StorageRoleFailure>;
+}
+
+/// Metadata observation and application role. It never implicitly refetches omitted facts.
+#[async_trait]
+pub trait Metadata: Send + Sync {
+    async fn observe(&self, path: &StoragePath)
+    -> Result<MetadataObservations, StorageRoleFailure>;
+    async fn apply(
+        &self,
+        path: &StoragePath,
+        observations: &MetadataObservations,
+    ) -> Result<(), StorageRoleFailure>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{BackendIdentity, BackendKind};
+
+    #[test]
+    fn prepared_stage_binds_owner_and_final_destination() -> Result<(), Box<dyn Error>> {
+        let owner = BackendIdentity::new(BackendKind::S3, "destination")?;
+        let other = BackendIdentity::new(BackendKind::S3, "other")?;
+        let destination = FinalDestination::new(StoragePath::new("bucket/key")?);
+        let stage = PreparedStage::new(
+            owner.clone(),
+            destination.clone(),
+            Bytes::from_static(b"secret-token"),
+        );
+
+        assert_eq!(stage.final_destination, destination);
+        assert!(stage.validate_owner(&owner).is_ok());
+        assert!(stage.validate_owner(&other).is_err());
+        assert!(!format!("{stage:?}").contains("secret-token"));
+        Ok(())
+    }
+}
