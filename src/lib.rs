@@ -8,6 +8,13 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use soft_canonicalize::soft_canonicalize;
 pub mod async_receiver;
+pub mod integrity;
+pub mod metadata;
+pub mod model;
+pub(crate) mod runtime;
+pub mod storage;
+pub mod transfer;
+pub mod traversal;
 pub use async_receiver::AsyncReceiver;
 
 #[cfg(windows)]

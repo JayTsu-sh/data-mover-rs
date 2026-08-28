@@ -63,6 +63,11 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
+      - name: Architecture dependency guard
+        run: |
+          python3 tests/validate_architecture_dependencies.py .
+          python3 -m unittest tests/test_architecture_dependencies.py
+
       - name: cargo clippy (all targets, deny warnings)
         run: python3 .claude/skills/quality-clippy/scripts/run.py
 

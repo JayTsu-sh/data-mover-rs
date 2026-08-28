@@ -1,0 +1,1 @@
+//! HDFS adapter facade.

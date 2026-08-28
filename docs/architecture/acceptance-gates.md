@@ -12,6 +12,11 @@ capabilities.
 eight profiles. It records current passed, failed, and missing evidence only; it is
 non-normative and cannot create a compatibility or support requirement.
 
+The target module tree and one-way dependency rules are enforced on every pull request by
+`python3 tests/validate_architecture_dependencies.py .`. The guard covers public versus
+crate-private visibility, backend-facade isolation, runtime direction, backend-neutral
+transfer/traversal orchestration, and product-term leakage.
+
 ## 1. Acceptance levels
 
 ### ArchitectureReady

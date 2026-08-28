@@ -1,0 +1,1 @@
+//! Local-filesystem adapter facade.
