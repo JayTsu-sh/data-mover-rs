@@ -7,9 +7,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
-  attestations: write
-  artifact-metadata: write
 
 concurrency:
   group: terrasync-lab
@@ -105,24 +102,6 @@ jobs:
           path: qos-*.csv
       - name: Reproducible performance baseline
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-performance-baseline.sh "$RUN_ID" performance-baseline.csv performance-baseline.json
-      - name: Sign performance baseline provenance (attempt 1)
-        id: attest-performance-1
-        continue-on-error: true
-        uses: actions/attest@v4
-        with:
-          subject-path: performance-baseline.*
-      - name: Sign performance baseline provenance (attempt 2)
-        id: attest-performance-2
-        if: steps.attest-performance-1.outcome == 'failure'
-        continue-on-error: true
-        uses: actions/attest@v4
-        with:
-          subject-path: performance-baseline.*
-      - name: Sign performance baseline provenance (attempt 3)
-        if: steps.attest-performance-1.outcome == 'failure' && steps.attest-performance-2.outcome == 'failure'
-        uses: actions/attest@v4
-        with:
-          subject-path: performance-baseline.*
       - name: Upload performance baseline
         if: always()
         uses: actions/upload-artifact@v6
@@ -150,3 +129,22 @@ jobs:
       - name: Cleanup
         if: always()
         run: tests/lab/cleanup-run.sh "$RUN_ID"
+
+  attest-performance-baseline:
+    needs: storage-contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download performance baseline
+        uses: actions/download-artifact@v8
+        with:
+          name: performance-baseline-${{ github.run_id }}
+      - name: Sign performance baseline provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: performance-baseline.*

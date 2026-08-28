@@ -25,13 +25,21 @@ class PerformanceBaselineTest(unittest.TestCase):
         self.assertIn("run-inflight-benchmark.sh", runner)
         self.assertIn("performance_baseline.py summarize", runner)
 
-    def test_nightly_retries_transient_signing_and_always_retains_evidence(self):
+    def test_nightly_signs_off_lab_runner_and_always_retains_evidence(self):
         workflow = NIGHTLY.read_text()
-        self.assertEqual(workflow.count("uses: actions/attest@v4"), 3)
-        self.assertIn("steps.attest-performance-1.outcome == 'failure'", workflow)
-        self.assertIn("steps.attest-performance-2.outcome == 'failure'", workflow)
+        self.assertEqual(workflow.count("uses: actions/attest@v4"), 1)
         upload = workflow.index("- name: Upload performance baseline")
         self.assertIn("if: always()", workflow[upload : upload + 160])
+        signing_job = workflow.index("attest-performance-baseline:")
+        signing = workflow[signing_job:]
+        self.assertNotIn("id-token: write", workflow[:signing_job])
+        self.assertIn("needs: storage-contracts", signing)
+        self.assertIn("runs-on: ubuntu-latest", signing)
+        self.assertIn("id-token: write", signing)
+        self.assertIn("attestations: write", signing)
+        self.assertIn("artifact-metadata: write", signing)
+        self.assertIn("uses: actions/download-artifact@v8", signing)
+        self.assertIn("uses: actions/attest@v4", signing)
 
     def write_samples(self, directory: Path, *, hardware_id: str = "fas2750-lab") -> Path:
         path = directory / "samples.csv"

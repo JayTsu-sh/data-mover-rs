@@ -107,10 +107,11 @@ entry starts `StorageEnum::copy_file`; copy service time remains represented in
 entries/s and end-to-end elapsed time rather than being mislabeled as queueing.
 Scheduling latency is deliberately null for the single-entry large-copy rows,
 where throughput and elapsed time are the applicable metrics.
-The workflow retries signing up to three times because Fulcio certificate
-issuance is an external network operation, and it uploads the raw evidence even
-when all signing attempts fail so the failure remains diagnosable. Unsigned
-evidence still does not satisfy the release gate.
+The self-hosted lab uploads raw evidence before the remaining HDFS gates. A
+dependent GitHub-hosted job downloads those exact files and signs them, keeping
+Fulcio traffic away from the lab proxy. Signing failure still fails the overall
+workflow, while uploaded raw evidence remains available for diagnosis. Unsigned
+evidence does not satisfy the release gate.
 
 `run-qos-e2e.sh <run-id> [output.csv]` is the real-backend source-QoS gate for
 Local, NFSv3, NFSv4.1, S3, and HDFS. It first measures each unthrottled source
