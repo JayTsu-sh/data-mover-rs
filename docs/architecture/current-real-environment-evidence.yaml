@@ -1,0 +1,122 @@
+schema_version: 1
+captured_at: "2026-08-29T06:43:04+08:00"
+policy:
+  normative: false
+  does_not_create_compatibility_requirement: true
+  meaning: Historical observations describe only the named commit and environment. Target support remains governed by the capability and directed-transfer matrices.
+
+shared_success: &nightly_success
+  evidence_kind: gate_result
+  repository: JayTsu-sh/data-mover-rs
+  exact_commit: cedd275dd3ee3de69cf41611467d508b84f124e5
+  dependency_commits: {}
+  run_id: "33214953626"
+  mode: real-nightly
+  fixture_set: nightly-existing-contracts-v1
+  started_at: "2026-08-29T05:59:58+08:00"
+  completed_at: "2026-08-29T06:43:04+08:00"
+  outcome: passed
+  artifact_links:
+    - https://github.com/JayTsu-sh/data-mover-rs/actions/runs/33214953626
+
+profiles:
+  local:
+    status: passed
+    environment_fingerprint: vm102-data-mover-rs/local-filesystem
+    evidence:
+      - <<: *nightly_success
+        gate_id: DM-CURRENT-LOCAL
+        source_profile: local
+        destination_profile: local
+        environment_fingerprint: vm102-data-mover-rs/local-filesystem
+    verified_scope: [connectivity, traversal, copy, integrity, resume, qos, overwrite]
+    gaps: [target ACL/xattr architecture contract not yet implemented]
+
+  nfs3:
+    status: passed
+    environment_fingerprint: shared-nfs3/10.10.1.12-to-10.10.1.13
+    evidence:
+      - <<: *nightly_success
+        gate_id: DM-CURRENT-NFS3
+        source_profile: nfs3
+        destination_profile: nfs3
+        environment_fingerprint: shared-nfs3/10.10.1.12-to-10.10.1.13
+    verified_scope: [mount, traversal, copy, integrity, resume, qos]
+    gaps: [target ACL/xattr and recovery architecture contracts not yet implemented]
+
+  nfs40:
+    status: missing
+    environment_fingerprint: real-nfs40-dxn/not-wired-to-current-nightly
+    evidence: []
+    verified_scope: []
+    gaps: [real endpoint exists but no current-commit NFSv4.0 gate or durable report has run]
+
+  nfs41:
+    status: passed
+    environment_fingerprint: shared-nfs41/10.10.1.12-to-10.10.1.13
+    evidence:
+      - <<: *nightly_success
+        gate_id: DM-CURRENT-NFS41
+        source_profile: nfs41
+        destination_profile: nfs41
+        environment_fingerprint: shared-nfs41/10.10.1.12-to-10.10.1.13
+    verified_scope: [mount, traversal, copy, integrity, resume, qos]
+    gaps: [target ACL/xattr and recovery architecture contracts not yet implemented]
+
+  cifs_fas2750:
+    status: failed
+    environment_fingerprint: fas2750/10.128.61.200+10.128.61.201/ontap_lisaauto_cifs
+    evidence:
+      - evidence_kind: device_observation
+        observation_id: SMB-FAS2750-NEGOTIATE
+        repository: JayTsu-sh/data-mover-rs
+        exact_commit: b2a6bea13fee8a07af2463d48636ce539f8cf34f
+        recorded_at: "2026-08-28T16:58:22+08:00"
+        source_profile: cifs_fas2750
+        destination_profile: cifs_fas2750
+        mode: read-only-device-probe
+        fixture_set: authenticated-share-root-listing
+        outcome: failed
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/100#issuecomment-5450524920
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/142
+        environment_fingerprint: fas2750/10.128.61.200+10.128.61.201/ontap_lisaauto_cifs
+        limitations: [recorded_at is the durable issue-comment time; smb-rs dependency SHA and probe timing were not captured, so this is not an acceptance-gate result]
+    verified_scope: [service reachable, system client authenticated read]
+    gaps: [smb-rs SMB 3.1.1 negotiate parsing fails before authentication, no data-mover transfer gate]
+
+  s3_standard:
+    status: passed
+    environment_fingerprint: shared-standard-s3/10.10.1.12-to-10.10.1.13
+    evidence:
+      - <<: *nightly_success
+        gate_id: DM-CURRENT-S3-STANDARD
+        source_profile: s3_standard
+        destination_profile: s3_standard
+        environment_fingerprint: shared-standard-s3/10.10.1.12-to-10.10.1.13
+    verified_scope: [connectivity, traversal, copy, integrity, resume, qos]
+    gaps: [target native-transfer and metadata architecture contracts not yet implemented]
+
+  s3_dxn:
+    status: missing
+    environment_fingerprint: real-dxn/not-wired-to-current-nightly
+    evidence: []
+    verified_scope: []
+    gaps: [request-level automated tests exist but no current-commit real DXN durable report]
+
+  hdfs:
+    status: passed
+    environment_fingerprint: hdfs-ha-kerberos/10.131.9.30+10.131.9.33
+    evidence:
+      - <<: *nightly_success
+        gate_id: DM-CURRENT-HDFS
+        source_profile: hdfs
+        destination_profile: hdfs
+        fixture_set: nightly-hdfs-contracts-memory-fault-ha-v1
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/actions/runs/33214953626
+          - artifact:hdfs-memory-33214953626
+          - artifact:hdfs-fault-33214953626
+        environment_fingerprint: hdfs-ha-kerberos/10.131.9.30+10.131.9.33
+    verified_scope: [kerberos, copy, resume, bounded-memory, datanode-faults, namenode-faults, ha]
+    gaps: [target neutral observation and metadata architecture contracts not yet implemented]

@@ -8,6 +8,10 @@ Authorities: `storage-transfer-architecture.md`, `backend-capability-matrix.yaml
 This document defines how a claim becomes evidence. It does not redefine architecture or
 capabilities.
 
+`current-real-environment-evidence.yaml` is a machine-validated historical ledger for the
+eight profiles. It records current passed, failed, and missing evidence only; it is
+non-normative and cannot create a compatibility or support requirement.
+
 ## 1. Acceptance levels
 
 ### ArchitectureReady
