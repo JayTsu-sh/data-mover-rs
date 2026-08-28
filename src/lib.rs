@@ -32,6 +32,7 @@ mod storage_copy_pipeline;
 pub mod storage_enum;
 mod storage_metadata;
 pub mod storage_options;
+mod storage_resume_compat;
 pub mod tar_pack;
 pub mod third_party;
 pub mod time_util;

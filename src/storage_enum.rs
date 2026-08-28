@@ -66,7 +66,6 @@ use crate::local::{LocalStorage, create_local_storage};
 use crate::nfs::{NFSStorage, create_nfs_storage};
 use crate::qos::QosManager;
 use crate::s3::{S3Storage, create_s3_storage};
-use crate::storage_copy_pipeline::await_copy_pipeline;
 pub use crate::storage_options::{
     BackendConfig, CopyOptions, CreateStorageOptions, TarPackOptions, WalkOptions,
 };
@@ -508,7 +507,7 @@ impl StorageEnum {
 
     /// Rename with an optional expected size for validating an idempotent S3
     /// retry. Filesystem backends perform an atomic rename and ignore the size.
-    async fn rename_with_expected_size(
+    pub(crate) async fn rename_with_expected_size(
         &self,
         from: &Path,
         to: &Path,
@@ -683,60 +682,14 @@ impl StorageEnum {
         part_path: &Path,
         resume: bool,
     ) -> Result<(Vec<(u64, u64)>, StreamHandle)> {
-        let size = entry.get_size();
-
         if let StorageEnum::HDFS(storage) = dest {
             return crate::hdfs_legacy_resume::prepare(storage, entry, part_path, resume).await;
         }
 
         if let StorageEnum::S3(to_s3) = dest {
-            let (dst_rel, tags) = match entry {
-                EntryEnum::S3(e) => (e.relative_path.clone(), e.tags.clone()),
-                EntryEnum::NAS(e) => (path_to_s3_key(&e.relative_path).into_owned(), None),
-                EntryEnum::HDFS(e) => (path_to_s3_key(&e.relative_path).into_owned(), None),
-            };
-            let part_size = to_s3.resume_part_size(size);
-            let (upload_id, missing) = to_s3
-                .prepare_resumable_upload(
-                    &dst_rel,
-                    size,
-                    part_size,
-                    tags.as_ref(),
-                    Some(entry.get_mtime()),
-                )
-                .await?;
-            return Ok((
-                missing,
-                StreamHandle::S3 {
-                    upload_id,
-                    part_size,
-                    dst_key: dst_rel,
-                },
-            ));
+            return crate::storage_resume_compat::prepare_s3(to_s3, entry).await;
         }
-
-        let missing = if resume {
-            match Box::pin(dest.get_metadata(part_path)).await {
-                Ok(existing) => {
-                    let existing_len = existing.get_size();
-                    match existing_len.cmp(&size) {
-                        std::cmp::Ordering::Less => vec![(existing_len, size)],
-                        std::cmp::Ordering::Equal => vec![],
-                        std::cmp::Ordering::Greater => vec![(0, size)],
-                    }
-                }
-                Err(_) => vec![(0, size)], // .part 不存在：视为全新
-            }
-        } else {
-            vec![(0, size)]
-        };
-
-        Ok((
-            missing,
-            StreamHandle::Nas {
-                part_path: part_path.to_path_buf(),
-            },
-        ))
+        crate::storage_resume_compat::prepare_nas(dest, entry, part_path, resume).await
     }
 
     /// ② 写：从 `rx` 收 `DataChunk` 写入临时载体（`.part` 或 multipart
@@ -766,52 +719,30 @@ impl StorageEnum {
                             .to_string(),
                     ));
                 };
-                to_s3
-                    .write_data_resumable(
-                        rx,
-                        dst_key,
-                        entry.get_size(),
-                        *part_size,
-                        upload_id,
-                        WriteProgress {
-                            bytes_counter,
-                            on_committed,
-                        },
-                    )
-                    .await
+                crate::storage_resume_compat::write_s3(
+                    to_s3,
+                    entry,
+                    rx,
+                    upload_id,
+                    *part_size,
+                    dst_key,
+                    WriteProgress {
+                        bytes_counter,
+                        on_committed,
+                    },
+                )
+                .await
             }
             StreamHandle::Nas { part_path } => {
-                let (uid, gid, mode) = match entry {
-                    EntryEnum::NAS(entry) => (entry.uid, entry.gid, Some(entry.mode)),
-                    EntryEnum::S3(_) => (None, None, None),
-                    EntryEnum::HDFS(entry) => (None, None, Some(entry.mode & 0o7777)),
-                };
-                let progress = WriteProgress {
+                crate::storage_resume_compat::write_nas(
+                    dest,
+                    entry,
+                    rx,
+                    part_path,
                     bytes_counter,
                     on_committed,
-                };
-                match dest {
-                    StorageEnum::Local(storage) => {
-                        storage
-                            .write_data_resumable(rx, part_path, uid, gid, mode, progress)
-                            .await
-                    }
-                    StorageEnum::NFS(storage) => {
-                        storage
-                            .write_data_resumable(rx, part_path, uid, gid, mode, progress)
-                            .await
-                    }
-                    StorageEnum::CIFS(storage) => {
-                        storage
-                            .write_data_resumable(rx, part_path, uid, gid, mode, progress)
-                            .await
-                    }
-                    StorageEnum::S3(_) => Err(StorageError::OperationError(
-                        "write_chunk_stream: Nas StreamHandle used with an S3 destination"
-                            .to_string(),
-                    )),
-                    StorageEnum::HDFS(_) => Err(StorageError::MismatchedType),
-                }
+                )
+                .await
             }
             StreamHandle::Hdfs {
                 part_path,
@@ -945,13 +876,8 @@ impl StorageEnum {
     ) -> Result<()> {
         match handle {
             StreamHandle::Nas { part_path } => {
-                dest.set_file_len(&part_path, size).await?;
-                dest.rename_with_expected_size(
-                    &part_path,
-                    entry.get_relative_path(),
-                    Some(entry.get_size()),
-                )
-                .await
+                return crate::storage_resume_compat::commit_nas(dest, entry, size, &part_path)
+                    .await;
             }
             StreamHandle::S3 {
                 upload_id,
@@ -964,9 +890,10 @@ impl StorageEnum {
                             .to_string(),
                     ));
                 };
-                to_s3
-                    .finalize_resumable_upload(&dst_key, size, part_size, &upload_id)
-                    .await
+                return crate::storage_resume_compat::commit_s3(
+                    to_s3, dest, entry, size, &upload_id, part_size, &dst_key,
+                )
+                .await;
             }
             StreamHandle::Hdfs {
                 part_path,
@@ -990,9 +917,7 @@ impl StorageEnum {
                 )
                 .await;
             }
-        }?;
-
-        Self::apply_copied_metadata(dest, entry).await
+        }
     }
 
     /// 字节级断点续传复制（仅多块大文件，源端：Local/NFS/CIFS/S3，目标端：全部后端）。
@@ -1002,7 +927,7 @@ impl StorageEnum {
     /// - NAS 目标端写到 `resume.part_relative_path`（`.part`），不截断已写字节；
     ///   每个 chunk 确认落盘后回调 `resume.on_committed`（供上层持久化进度）；
     ///   收尾规整 `.part` 长度 → 可选完整性校验 → 原子 rename 成最终文件。
-    /// - S3 目标端走 multipart part 粒度续传（见 [`Self::copy_file_resumable_to_s3`]），
+    /// - S3 目标端走 compatibility 模块中的 multipart part 粒度续传，
     ///   `.part`/`rename/set_file_len` 模型不适用于对象存储。
     ///
     /// 进程中断时进度保留（NAS 目标：`.part` + 上层状态文件；S3 目标：in-progress
@@ -1012,19 +937,6 @@ impl StorageEnum {
     ///
     /// Returns an error when the requested storage operation cannot be completed.
     pub async fn copy_file_resumable(
-        from: &StorageEnum,
-        to: &StorageEnum,
-        entry: &EntryEnum,
-        options: CopyOptions,
-        resume: ResumeContext,
-    ) -> Result<()> {
-        Box::pin(Self::copy_file_resumable_inner(
-            from, to, entry, options, resume,
-        ))
-        .await
-    }
-
-    async fn copy_file_resumable_inner(
         from: &StorageEnum,
         to: &StorageEnum,
         entry: &EntryEnum,
@@ -1045,7 +957,7 @@ impl StorageEnum {
             .await;
         }
         if matches!(to, StorageEnum::S3(_)) {
-            return Box::pin(Self::copy_file_resumable_to_s3(
+            return Box::pin(crate::storage_resume_compat::copy_s3(
                 from,
                 to,
                 entry,
@@ -1054,212 +966,10 @@ impl StorageEnum {
             ))
             .await;
         }
-
-        let CopyOptions {
-            qos,
-            enable_integrity_check,
-            is_source_reserved,
-            bytes_counter,
-            cancel,
-        } = options;
-
-        let size = entry.get_size();
-        let ResumeContext {
-            part_relative_path,
-            missing_intervals,
-            on_committed,
-        } = resume;
-        // NAS 目标端：沿用调用方给定的 missing_intervals（不重新用 resume_prepare
-        // 推断——融合式 API 向后兼容，caller 的状态文件才是既有行为下的进度真值）。
-        let handle = StreamHandle::Nas {
-            part_path: part_relative_path.clone(),
-        };
-
-        // ── 源端：只读缺失区间（read_chunk_stream 内部 spawn）──
-        let (rx, read_handle) = Self::read_chunk_stream(
-            from,
-            entry,
-            Some(missing_intervals),
-            qos,
-            false,
-            COPY_PIPELINE_CAPACITY,
-        );
-
-        // ── 目标端：续写 .part ──
-        let to_c = to.clone();
-        let entry_w = entry.clone();
-        let handle_w = handle.clone();
-        let write_handle = tokio::spawn(async move {
-            Self::write_chunk_stream(&to_c, &entry_w, rx, &handle_w, bytes_counter, on_committed)
-                .await
-        });
-
-        await_copy_pipeline(read_handle, write_handle, cancel.as_ref()).await?;
-
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return Err(StorageError::Cancelled);
-        }
-
-        // ── hash 比对（早于 commit：NAS `.part` 可独立读取，校验失败时最终路径
-        //    不会被 rename 污染，见 T5）──
-        if enable_integrity_check {
-            let src_hash = from.compute_hash(entry.get_relative_path(), size).await?;
-            let dst_hash = to.compute_hash(&part_relative_path, size).await?;
-            if src_hash != dst_hash {
-                return Err(StorageError::OperationError(
-                    "integrity check failed: source and destination hashes differ".to_string(),
-                ));
-            }
-        }
-
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return Err(StorageError::Cancelled);
-        }
-
-        // ── 提交：规整长度 + 原子 rename ──
-        Self::commit_chunk_stream(to, entry, size, handle).await?;
-
-        if !is_source_reserved {
-            from.delete_file(entry).await?;
-        }
-
-        Ok(())
-    }
-
-    /// S3 目标端字节级断点续传：multipart upload part 粒度。
-    ///
-    /// 进度真值是目标端 in-progress multipart upload 本身（`resume_prepare` 内部
-    /// `ListParts` 反推缺失区间），不使用上层状态文件传入的 `missing_intervals`——
-    /// upload 可能被外部（lifecycle 规则、手动 abort）清掉，且上层记录只可能滞后
-    /// 于真实进度，以目标端反推永远正确。`on_committed` 仍逐 part 回调，供上层
-    /// 记录进度；`.part` 路径与 `rename/set_file_len` 不适用于对象存储，均不使用。
-    ///
-    /// 失败时**不 abort** upload，已上传 parts 即续传进度；成功时
-    /// `CompleteMultipartUpload` 原子生效，目标端不存在半截可见对象。
-    /// Complete 之前有写端本地会话字节断言（issue #58）：本次确认上传的字节数
-    /// 不等于缺失区间总和（如源读截断）则不提交，坏对象根本不落地。
-    ///
-    /// hash 比对晚于 `commit_chunk_stream`（`CompleteMultipartUpload`）——
-    /// in-progress multipart 的 parts 在 Complete 前不能作为一个连续对象读取，
-    /// 这是对象存储的固有限制，维持现状顺序（区别于 NAS 分支的「先 hash 后
-    /// commit」）。
-    async fn copy_file_resumable_to_s3(
-        from: &StorageEnum,
-        to: &StorageEnum,
-        entry: &EntryEnum,
-        options: CopyOptions,
-        on_committed: crate::CommitCallback,
-    ) -> Result<()> {
-        if options
-            .cancel
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return Err(StorageError::Cancelled);
-        }
-        let CopyOptions {
-            qos,
-            enable_integrity_check,
-            is_source_reserved,
-            bytes_counter,
-            cancel,
-        } = options;
-        if !matches!(to, StorageEnum::S3(_)) {
-            return Err(StorageError::OperationError(
-                "copy_file_resumable_to_s3 requires an S3 destination".to_string(),
-            ));
-        }
-        let size = entry.get_size();
-
-        // part_path 对 S3 分支无意义（resume_prepare 内部按 dest 类型分流，S3
-        // 分支不使用该参数），传入 entry 自身路径仅作占位。
-        let (missing, handle) = Box::pin(Self::resume_prepare(
-            to,
-            entry,
-            entry.get_relative_path(),
-            true,
+        Box::pin(crate::storage_resume_compat::copy_nas(
+            from, to, entry, options, resume,
         ))
-        .await?;
-
-        // 写端本地会话计数（issue #58）：wrap on_committed 累计本次确认上传的
-        // 字节数（零额外存储 RPC），供 CompleteMultipartUpload 前的 size 断言。
-        let expected_session_bytes: u64 = missing.iter().map(|(start, end)| end - start).sum();
-        let session_bytes = Arc::new(AtomicU64::new(0));
-        let on_committed: CommitCallback = {
-            let session_bytes = session_bytes.clone();
-            let inner = on_committed;
-            Arc::new(move |offset, len| {
-                session_bytes.fetch_add(len, Ordering::Relaxed);
-                inner(offset, len);
-            })
-        };
-
-        // ── 源端：只读缺失区间（以目标端 ListParts 反推为准）──
-        let (rx, read_handle) = Self::read_chunk_stream(
-            from,
-            entry,
-            Some(missing),
-            qos,
-            false,
-            COPY_PIPELINE_CAPACITY,
-        );
-
-        // ── 目标端：缺失 parts 并发 UploadPart ──
-        let to_c = to.clone();
-        let entry_w = entry.clone();
-        let handle_w = handle.clone();
-        let write_handle = tokio::spawn(async move {
-            Self::write_chunk_stream(&to_c, &entry_w, rx, &handle_w, bytes_counter, on_committed)
-                .await
-        });
-
-        await_copy_pipeline(read_handle, write_handle, cancel.as_ref()).await?;
-
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return Err(StorageError::Cancelled);
-        }
-
-        // 本地字节计数断言（issue #58，前移到 CompleteMultipartUpload 之前）：
-        // 本次会话确认上传的字节数必须恰好补齐全部缺失区间，不等则不提交——
-        // 坏对象根本不落地。沿用「失败不 abort」设计：已上传 parts 是合法续传
-        // 进度，保留供重试补齐（源 size 变更场景由 prepare_resumable_upload 的
-        // stale upload 处理收拾）。
-        let uploaded = session_bytes.load(Ordering::Relaxed);
-        if uploaded != expected_session_bytes {
-            return Err(StorageError::OperationError(format!(
-                "size check failed before multipart completion: session uploaded {uploaded} bytes, missing intervals require {expected_session_bytes}: {}",
-                entry.get_relative_path().display()
-            )));
-        }
-
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return Err(StorageError::Cancelled);
-        }
-
-        // ── 提交：校验 parts 全覆盖 → CompleteMultipartUpload ──
-        Self::commit_chunk_stream(to, entry, size, handle).await?;
-
-        if enable_integrity_check {
-            let src_hash = from.compute_hash(entry.get_relative_path(), size).await?;
-            let dst_hash = to.compute_hash(entry.get_relative_path(), size).await?;
-            if src_hash != dst_hash {
-                // Complete 已提交，坏对象已可见：best-effort 清理（issue #58）。
-                Self::cleanup_mismatched_dest(to, entry).await;
-                return Err(StorageError::OperationError(
-                    "integrity check failed: source and destination hashes differ".to_string(),
-                ));
-            }
-        }
-
-        if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
-            return Err(StorageError::Cancelled);
-        }
-
-        if !is_source_reserved {
-            from.delete_file(entry).await?;
-        }
-
-        Ok(())
+        .await
     }
 
     /// 将多个源端文件打包为一个 tar 文件写入目标端。
