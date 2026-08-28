@@ -1339,10 +1339,10 @@ impl LocalStorage {
         uid: Option<u32>,
         gid: Option<u32>,
         mode: Option<u32>,
-        progress: crate::storage_enum::WriteProgress,
+        progress: crate::pipeline_primitives::WriteProgress,
     ) -> Result<()> {
         const SYNC_BARRIER: usize = 16;
-        let crate::storage_enum::WriteProgress {
+        let crate::pipeline_primitives::WriteProgress {
             bytes_counter,
             on_committed,
         } = progress;

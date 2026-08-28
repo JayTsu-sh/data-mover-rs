@@ -8,9 +8,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::StorageError;
+use crate::pipeline_primitives::WriteProgress;
 use crate::s3::S3Storage;
+use crate::storage_copy_pipeline::COPY_PIPELINE_CAPACITY;
 use crate::storage_copy_pipeline::await_copy_pipeline;
-use crate::storage_enum::{COPY_PIPELINE_CAPACITY, WriteProgress, path_to_s3_key};
+use crate::storage_enum::path_to_s3_key;
 use crate::{
     CommitCallback, CopyOptions, DataChunk, EntryEnum, Result, ResumeContext, StorageEnum,
     StreamHandle,

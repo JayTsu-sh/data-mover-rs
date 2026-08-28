@@ -8,22 +8,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-/// 哈希计算 / 大文件读取 pipeline 的 channel 容量（读写并行，4 个 chunk 缓冲）
-pub(crate) const HASH_CHANNEL_CAPACITY: usize = 4;
-/// 文件拷贝 read→write pipeline 的 channel 容量。
-///
-/// 读写两端各自有 inflight pipeline（如 NFS 读 4 / 写 8），channel 是两级
-/// 之间的解耦缓冲：容量 2 时写端一次落盘抖动即填满 channel、反压打空读端
-/// 流水线；4 可吸收单次抖动。内存上界 = 容量 × chunk 大小 × 并发文件数
-/// （NFS chunk ≤ 1MB；CIFS chunk 可达 8MB，增大容量时需关注）。
-pub(crate) const COPY_PIPELINE_CAPACITY: usize = 4;
 /// TAR 打包 pipeline 的 channel 容量（多文件顺序读，适当放大缓冲）
 const TAR_PIPELINE_CAPACITY: usize = 16;
-#[derive(Clone)]
-pub(crate) struct WriteProgress {
-    pub bytes_counter: Option<Arc<AtomicU64>>,
-    pub on_committed: CommitCallback,
-}
 
 async fn copy_s3_to_s3_native(
     src: &S3Storage,
@@ -64,8 +50,10 @@ use crate::filter::FilterExpression;
 use crate::hdfs::{HDFSStorage, create_hdfs_storage};
 use crate::local::{LocalStorage, create_local_storage};
 use crate::nfs::{NFSStorage, create_nfs_storage};
+use crate::pipeline_primitives::WriteProgress;
 use crate::qos::QosManager;
 use crate::s3::{S3Storage, create_s3_storage};
+use crate::storage_copy_pipeline::HASH_CHANNEL_CAPACITY;
 pub use crate::storage_options::{
     BackendConfig, CopyOptions, CreateStorageOptions, TarPackOptions, WalkOptions,
 };
