@@ -28,6 +28,7 @@ pub mod local;
 pub mod nfs;
 pub mod qos;
 pub mod s3;
+mod storage_copy_pipeline;
 pub mod storage_enum;
 mod storage_metadata;
 pub mod storage_options;
