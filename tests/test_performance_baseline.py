@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REPORTER = ROOT / "tests" / "lab" / "performance_baseline.py"
 RUNNER = ROOT / "tests" / "lab" / "run-performance-baseline.sh"
+NIGHTLY = ROOT / ".github" / "workflows" / "nightly.yml"
 
 
 class PerformanceBaselineTest(unittest.TestCase):
@@ -23,6 +24,14 @@ class PerformanceBaselineTest(unittest.TestCase):
         self.assertIn("--operation \"$operation\"", runner)
         self.assertIn("run-inflight-benchmark.sh", runner)
         self.assertIn("performance_baseline.py summarize", runner)
+
+    def test_nightly_retries_transient_signing_and_always_retains_evidence(self):
+        workflow = NIGHTLY.read_text()
+        self.assertEqual(workflow.count("uses: actions/attest@v4"), 3)
+        self.assertIn("steps.attest-performance-1.outcome == 'failure'", workflow)
+        self.assertIn("steps.attest-performance-2.outcome == 'failure'", workflow)
+        upload = workflow.index("- name: Upload performance baseline")
+        self.assertIn("if: always()", workflow[upload : upload + 160])
 
     def write_samples(self, directory: Path, *, hardware_id: str = "fas2750-lab") -> Path:
         path = directory / "samples.csv"
