@@ -26,6 +26,7 @@ mod hdfs_transfer_mapping;
 pub mod integrity_check;
 pub mod local;
 pub mod nfs;
+mod pipeline_primitives;
 pub mod qos;
 pub mod s3;
 mod storage_copy_pipeline;

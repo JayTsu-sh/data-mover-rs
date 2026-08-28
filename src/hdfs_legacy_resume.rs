@@ -14,8 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::StorageError;
 use crate::hdfs::{HDFSStorage, HdfsPreparedTransfer};
 use crate::hdfs_transfer_mapping::hdfs_write_options;
-use crate::storage_copy_pipeline::await_copy_pipeline;
-use crate::storage_enum::COPY_PIPELINE_CAPACITY;
+use crate::storage_copy_pipeline::{COPY_PIPELINE_CAPACITY, await_copy_pipeline};
 use crate::{
     CommitCallback, CopyOptions, DataChunk, EntryEnum, Result, ResumeContext, StorageEnum,
     StreamHandle,

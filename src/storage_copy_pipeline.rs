@@ -12,8 +12,18 @@ use tracing::warn;
 use crate::checksum::{ConsistencyCheck, HashCalculator};
 use crate::error::StorageError;
 use crate::qos::QosManager;
-use crate::storage_enum::{COPY_PIPELINE_CAPACITY, HASH_CHANNEL_CAPACITY, path_to_s3_key};
+use crate::storage_enum::path_to_s3_key;
 use crate::{CopyOptions, DataChunk, EntryEnum, Result, StorageEnum};
+
+/// 哈希计算 / 大文件读取 pipeline 的 channel 容量（读写并行，4 个 chunk 缓冲）
+pub(crate) const HASH_CHANNEL_CAPACITY: usize = 4;
+/// 文件拷贝 read→write pipeline 的 channel 容量。
+///
+/// 读写两端各自有 inflight pipeline（如 NFS 读 4 / 写 8），channel 是两级
+/// 之间的解耦缓冲：容量 2 时写端一次落盘抖动即填满 channel、反压打空读端
+/// 流水线；4 可吸收单次抖动。内存上界 = 容量 × chunk 大小 × 并发文件数
+/// （NFS chunk ≤ 1MB；CIFS chunk 可达 8MB，增大容量时需关注）。
+pub(crate) const COPY_PIPELINE_CAPACITY: usize = 4;
 
 struct MultiCopyOptions {
     qos: Option<QosManager>,

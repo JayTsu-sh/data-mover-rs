@@ -1422,10 +1422,10 @@ impl CifsStorage {
         _uid: Option<u32>,
         _gid: Option<u32>,
         _mode: Option<u32>,
-        progress: crate::storage_enum::WriteProgress,
+        progress: crate::pipeline_primitives::WriteProgress,
     ) -> Result<()> {
         const FLUSH_BARRIER: usize = 16;
-        let crate::storage_enum::WriteProgress {
+        let crate::pipeline_primitives::WriteProgress {
             bytes_counter,
             on_committed,
         } = progress;

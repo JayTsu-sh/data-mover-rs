@@ -83,7 +83,7 @@ struct S3PartUpload {
     chunks: Vec<Bytes>,
     len: u64,
     semaphore: Arc<tokio::sync::Semaphore>,
-    progress: crate::storage_enum::WriteProgress,
+    progress: crate::pipeline_primitives::WriteProgress,
 }
 
 struct BufferedPartUpload {
@@ -3047,9 +3047,9 @@ impl S3Storage {
         size: u64,
         part_size: u64,
         upload_id: &str,
-        progress: crate::storage_enum::WriteProgress,
+        progress: crate::pipeline_primitives::WriteProgress,
     ) -> Result<()> {
-        let crate::storage_enum::WriteProgress {
+        let crate::pipeline_primitives::WriteProgress {
             bytes_counter,
             on_committed,
         } = progress;
@@ -3113,7 +3113,7 @@ impl S3Storage {
                             chunks: std::mem::take(&mut buf),
                             len: buf_len,
                             semaphore: semaphore.clone(),
-                            progress: crate::storage_enum::WriteProgress {
+                            progress: crate::pipeline_primitives::WriteProgress {
                                 bytes_counter: bytes_counter.clone(),
                                 on_committed: on_committed.clone(),
                             },
@@ -3141,7 +3141,7 @@ impl S3Storage {
                         chunks: std::mem::take(&mut buf),
                         len: buf_len,
                         semaphore: semaphore.clone(),
-                        progress: crate::storage_enum::WriteProgress {
+                        progress: crate::pipeline_primitives::WriteProgress {
                             bytes_counter: bytes_counter.clone(),
                             on_committed: on_committed.clone(),
                         },
@@ -3200,7 +3200,7 @@ impl S3Storage {
             len,
             semaphore,
             progress:
-                crate::storage_enum::WriteProgress {
+                crate::pipeline_primitives::WriteProgress {
                     bytes_counter,
                     on_committed,
                 },
