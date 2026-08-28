@@ -4,7 +4,8 @@ use crate::hdfs::{
     HDFSStorage, HdfsCancellationDisposition, HdfsExistingFinalPolicy, HdfsPreparedTransfer,
     HdfsResumeMode, HdfsTransferRequest,
 };
-use crate::storage_enum::{COPY_PIPELINE_CAPACITY, await_copy_pipeline};
+use crate::storage_copy_pipeline::await_copy_pipeline;
+use crate::storage_enum::COPY_PIPELINE_CAPACITY;
 use crate::{CommitCallback, CopyOptions, EntryEnum, Result, StorageEnum, error::StorageError};
 
 /// HDFS-specific inputs for the explicit recoverable-copy entry point.
