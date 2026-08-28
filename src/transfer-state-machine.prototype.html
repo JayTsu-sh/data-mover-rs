@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PROTOTYPE — Unified transfer state machine</title>
+  <style>
+    :root{font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:#182238;background:#f5f7fa}body{max-width:1120px;margin:auto;padding:32px 20px 64px}h1{font-size:28px;margin:0 0 10px}h2{font-size:18px;margin:28px 0 10px}p{line-height:1.55}.muted{color:#657187}.panel{background:#fff;border:1px solid #dbe2ec;border-radius:12px;padding:18px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.field{background:#f7f9fc;border-radius:8px;padding:11px}.field small{display:block;color:#68758a;margin-bottom:5px}.state{font-size:20px;font-weight:700;color:#2855c5}.ok{color:#137447}.warn{color:#a35c00}.bad{color:#b42318}button{border:1px solid #b8c4d2;background:#fff;border-radius:8px;padding:8px 11px;margin:4px;cursor:pointer}button:hover{border-color:#2855c5}button.primary,.tabs .active{background:#2855c5;color:#fff;border-color:#2855c5}button:disabled{opacity:.38;cursor:default}.event{border-left:4px solid #2855c5;padding-left:12px}.history{max-height:150px;overflow:auto;font-family:ui-monospace,monospace;font-size:12px}.tabs{margin-bottom:10px}code{background:#eef2f7;padding:2px 5px;border-radius:4px}select{padding:7px;border:1px solid #b8c4d2;border-radius:7px}
+  </style>
+</head>
+<body>
+  <h1>PROTOTYPE — unified transfer state machine</h1>
+  <p><strong>问题：</strong>一个公开的 <code>transfer(request)</code> 与 terrasync 使用的专家级流式接缝，能否共享同一套 preflight → prepare/recover → transfer → verify → publish → metadata 状态机，并在取消、重启、快速路径和提交后失败时给出不含糊的结果？</p>
+  <p class="muted">一次性逻辑原型；不访问存储，所有状态只在内存中。</p>
+
+  <h2>当前完整状态</h2><div id="state" class="panel"></div>
+  <h2>策略</h2><div class="panel" id="policies"></div>
+  <h2>自由尝试</h2><div class="panel" id="actions"></div>
+  <h2>引导场景</h2><div class="panel"><div class="tabs" id="tabs"></div><div id="scenario"></div></div>
+
+  <script>
+    const TransferMachine=(()=>{
+      const initial=()=>({phase:'Created',attempt:1,mode:'Unplanned',prepareFact:null,bytesDurable:0,bytesExpected:100,recoveryIdentity:null,finalVisible:false,metadataApplied:false,outcome:null,error:null,lastEvent:'Transfer request created',history:[] ,policy:{recovery:'ResumeOrRestart',verification:'Content',metadata:'BestEffort',cancel:'Preserve'}});
+      const terminal=s=>['Completed','AlreadyCommitted','Cancelled','Failed','CommittedWithWarnings'].includes(s.phase);
+      const allowed=(s,a)=>({
+        preflight:['Created'],nativePlan:['Preflighted'],streamPlan:['Preflighted'],fresh:['Planned'],resume:['Planned'],invalidCheckpoint:['Planned'],commitReady:['Planned'],alreadyCommitted:['Planned'],write:['Prepared','Transferring'],checkpoint:['Transferring'],verify:['Prepared','Transferring','CommitReady'],verifyFail:['Prepared','Transferring','CommitReady'],publish:['Verified'],metadataOk:['Published'],metadataFail:['Published'],cancel:['Prepared','Transferring','CommitReady','Verified'],restart:['Cancelled','Failed'],reset:['*']
+      }[a]||[]).some(x=>x==='*'||x===s.phase);
+      const reject=(s,a)=>({...s,lastEvent:`非法动作：${a} 不能从 ${s.phase} 执行`,history:[...s.history,`REJECT ${s.phase} × ${a}`]});
+      const step=(s,a)=>{
+        if(a.type==='policy')return terminal(s)?reject(s,'policy change after terminal'):{...s,policy:{...s.policy,[a.key]:a.value},lastEvent:`策略 ${a.key} = ${a.value}`};
+        if(!allowed(s,a.type))return reject(s,a.type);
+        let n={...s,history:[...s.history,`${s.phase} —${a.type}→`],error:null};
+        switch(a.type){
+          case'reset':return initial();
+          case'preflight':return{...n,phase:'Preflighted',lastEvent:'能力、source identity、final policy 已预检；尚无远端副作用'};
+          case'nativePlan':return{...n,phase:'Planned',mode:'Native',lastEvent:'backend fast-path planner 接受完整 transfer guarantee'};
+          case'streamPlan':return{...n,phase:'Planned',mode:'Streaming',lastEvent:'选择通用 streaming pipeline'};
+          case'fresh':return{...n,phase:'Prepared',prepareFact:'Fresh',recoveryIdentity:'opaque:v1:fresh',lastEvent:'建立全新 staged destination'};
+          case'resume':return{...n,phase:'Prepared',prepareFact:'Resumable',bytesDurable:40,recoveryIdentity:'opaque:v1:resume',lastEvent:'backend 验证 checkpoint；从 durable 40 继续'};
+          case'invalidCheckpoint':
+            if(s.policy.recovery==='RequireResume')return{...n,phase:'Failed',outcome:'InvalidCheckpoint',error:{stage:'Prepare',recoverable:false,finalChanged:false},lastEvent:'RequireResume 保留现场并失败'};
+            return{...n,phase:'Prepared',prepareFact:'Restarted',bytesDurable:0,recoveryIdentity:'opaque:v1:restart',lastEvent:'无效 checkpoint 已安全隔离；从零重新上传'};
+          case'commitReady':return{...n,phase:'CommitReady',prepareFact:'CommitReady',bytesDurable:100,recoveryIdentity:'opaque:v1:ready',lastEvent:'无需传输；staged destination 已完整'};
+          case'alreadyCommitted':return{...n,phase:'AlreadyCommitted',prepareFact:'AlreadyCommitted',finalVisible:true,outcome:'AlreadyCommitted',lastEvent:'final 已证明等价；无副作用完成'};
+          case'write':{const durable=Math.min(100,s.bytesDurable+20);return{...n,phase:'Transferring',bytesDurable:durable,recoveryIdentity:'opaque:v1:progress',lastEvent:`backend 持久化屏障后 durable bytes = ${durable}`}}
+          case'checkpoint':return{...n,phase:'Transferring',lastEvent:`返回可持久化 recovery identity；durable=${s.bytesDurable}`};
+          case'verify':if(s.bytesDurable<100)return reject(s,'verify before complete');else return{...n,phase:'Verified',lastEvent:`通过 ${s.policy.verification} verification；final 尚不可见`};
+          case'verifyFail':return{...n,phase:'Failed',outcome:'VerificationFailed',error:{stage:'Verify',recoverable:true,finalChanged:false},lastEvent:'校验失败；旧 final 保持不变，staged 可诊断/恢复'};
+          case'publish':return{...n,phase:'Published',finalVisible:true,recoveryIdentity:null,lastEvent:'原子或等价 publish 完成；checkpoint 生命周期结束'};
+          case'metadataOk':return{...n,phase:'Completed',metadataApplied:true,outcome:'Completed',lastEvent:'要求的 metadata 已应用'};
+          case'metadataFail':
+            if(s.policy.metadata==='Required')return{...n,phase:'Failed',outcome:'CommittedButMetadataFailed',error:{stage:'Metadata',recoverable:false,finalChanged:true},lastEvent:'数据已发布，metadata 必需项失败；不能伪装成未提交'};
+            return{...n,phase:'CommittedWithWarnings',outcome:'CompletedWithWarnings',error:{stage:'Metadata',recoverable:false,finalChanged:true},lastEvent:'数据已发布；best-effort metadata 失败作为 warning'};
+          case'cancel':{
+            const keep=s.policy.cancel==='Preserve'&&s.bytesDurable>0;
+            return{...n,phase:'Cancelled',outcome:'Cancelled',recoveryIdentity:keep?s.recoveryIdentity:null,error:{stage:s.phase,recoverable:keep,finalChanged:false},lastEvent:keep?'安全取消；返回 recovery identity':'安全取消；当前 transfer staged work 已丢弃'} }
+          case'restart':return{...initial(),attempt:s.attempt+1,policy:s.policy,lastEvent:'调用方开始新的 attempt；job retry 不由状态机自动触发'};
+        }
+      };
+      return{initial,step,allowed,terminal};
+    })();
+
+    let state=TransferMachine.initial(),active=0,done=new Set();
+    const scenarios=[
+      {name:'新传输成功',desc:'普通 streaming 从预检到发布；final 只在校验后出现。',steps:['preflight','streamPlan','fresh','write','write','write','write','write','verify','publish','metadataOk']},
+      {name:'取消后恢复',desc:'写入并形成 durable checkpoint，取消保留 identity；新的 attempt 恢复而不是信任旧进度。',steps:['preflight','streamPlan','fresh','write','write','checkpoint','cancel','restart','preflight','streamPlan','resume','write','write','write','verify','publish','metadataOk']},
+      {name:'无效 checkpoint',desc:'ResumeOrRestart 隔离无效状态并显式返回 Restarted preparation fact。',steps:['preflight','streamPlan','invalidCheckpoint','write','write','write','write','write','verify','publish','metadataOk']},
+      {name:'快速路径也校验',desc:'native fast path 不绕开 verify/publish；失败前 final 不变化。',steps:['preflight','nativePlan','fresh','write','write','write','write','write','verifyFail']},
+      {name:'提交后 metadata 失败',desc:'观察数据已经发布后，Required metadata 失败为什么必须报告 CommittedButMetadataFailed。',policy:{metadata:'Required'},steps:['preflight','streamPlan','fresh','write','write','write','write','write','verify','publish','metadataFail']}
+    ];
+    const names={preflight:'预检能力与身份',nativePlan:'选择 native fast path',streamPlan:'选择 streaming',fresh:'准备 fresh staged',resume:'恢复有效 checkpoint',invalidCheckpoint:'发现无效 checkpoint',commitReady:'发现 commit-ready staged',alreadyCommitted:'发现 final 已等价',write:'持久化 20 bytes',checkpoint:'读取 checkpoint',verify:'校验通过',verifyFail:'校验失败',publish:'发布 final',metadataOk:'metadata 成功',metadataFail:'metadata 失败',cancel:'取消',restart:'开始新 attempt',reset:'重置'};
+    const actions=Object.keys(names);
+    const dispatch=a=>{state=TransferMachine.step(state,a);render()};
+    function render(){
+      const e=state.error;
+      document.querySelector('#state').innerHTML=`<div class="grid"><div class="field"><small>Phase</small><span class="state">${state.phase}</span></div><div class="field"><small>Attempt</small>${state.attempt}</div><div class="field"><small>Data path</small>${state.mode}</div><div class="field"><small>Prepare fact</small>${state.prepareFact||'—'}</div><div class="field"><small>Durable / Expected</small>${state.bytesDurable} / ${state.bytesExpected}</div><div class="field"><small>Final visible</small>${state.finalVisible?'是':'否'}</div><div class="field"><small>Recovery identity</small>${state.recoveryIdentity||'—'}</div><div class="field"><small>Outcome</small>${state.outcome||'—'}</div></div><p class="event"><strong>刚发生：</strong>${state.lastEvent}</p>${e?`<p class="${e.finalChanged?'warn':'bad'}"><strong>Error attribution：</strong>stage=${e.stage}, recoverable=${e.recoverable}, finalChanged=${e.finalChanged}</p>`:''}<div class="history">${state.history.join('<br>')}</div>`;
+      const opts=(key,vals)=>`<label>${key}: <select data-policy="${key}">${vals.map(v=>`<option ${state.policy[key]===v?'selected':''}>${v}</option>`).join('')}</select></label>`;
+      document.querySelector('#policies').innerHTML=[opts('recovery',['ResumeOrRestart','RequireResume','Restart']),opts('verification',['Size','BackendChecksum','Content']),opts('metadata',['BestEffort','Required']),opts('cancel',['Preserve','Discard'])].join(' &nbsp; ');
+      document.querySelector('#actions').innerHTML=actions.map(a=>`<button class="${a==='preflight'?'primary':''}" data-action="${a}">${names[a]}</button>`).join('');
+      document.querySelector('#tabs').innerHTML=scenarios.map((s,i)=>`<button class="${i===active?'active':''}" data-tab="${i}">${s.name}</button>`).join('');
+      const sc=scenarios[active];document.querySelector('#scenario').innerHTML=`<p>${sc.desc}</p><ol>${sc.steps.map((a,i)=>`<li><button data-step="${i}" ${done.has(i)?'disabled':''}>${names[a]}</button></li>`).join('')}</ol>`;
+    }
+    document.addEventListener('change',e=>{if(e.target.dataset.policy)dispatch({type:'policy',key:e.target.dataset.policy,value:e.target.value})});
+    document.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;if(b.dataset.action)dispatch({type:b.dataset.action});else if(b.dataset.tab){active=Number(b.dataset.tab);done=new Set();state=TransferMachine.initial();if(scenarios[active].policy)state={...state,policy:{...state.policy,...scenarios[active].policy}};render()}else if(b.dataset.step){const i=Number(b.dataset.step);dispatch({type:scenarios[active].steps[i]});done.add(i);render()}});
+    render();
+  </script>
+</body>
+</html>
