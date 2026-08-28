@@ -31,6 +31,7 @@ pub mod qos;
 pub mod s3;
 mod storage_copy_pipeline;
 pub mod storage_enum;
+mod storage_factory;
 mod storage_metadata;
 pub mod storage_options;
 mod storage_resume_compat;
