@@ -147,7 +147,7 @@ impl StorageEnum {
                 cancel.as_ref(),
             )
             .await?;
-            let integrity_matches = Self::hdfs_partial_integrity_matches(
+            let integrity_matches = crate::hdfs_transfer_integrity::partial_matches(
                 from,
                 to,
                 entry,
@@ -373,7 +373,7 @@ async fn resolve_existing_final(
     let integrity_matches = if policy == HdfsExistingFinalPolicy::VerifyOrConflict
         && final_metadata.size == request.expected_size()
     {
-        StorageEnum::hdfs_partial_integrity_matches(
+        crate::hdfs_transfer_integrity::partial_matches(
             from,
             to,
             entry,
