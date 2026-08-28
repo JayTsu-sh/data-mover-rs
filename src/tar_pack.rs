@@ -65,7 +65,7 @@ pub(crate) async fn pack_files_to_tar(
                 let entry_c = entry.clone();
                 let qos_c = qos.clone();
                 let read_task = tokio::spawn(async move {
-                    Box::pin(StorageEnum::read_data_from(
+                    Box::pin(crate::storage_read_pipeline::read_data_from(
                         &from_c, &entry_c, sub_tx, file_size, false, qos_c,
                     ))
                     .await

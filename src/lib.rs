@@ -34,6 +34,7 @@ pub mod storage_enum;
 mod storage_factory;
 mod storage_metadata;
 pub mod storage_options;
+mod storage_read_pipeline;
 mod storage_resume_compat;
 pub mod tar_pack;
 pub mod third_party;

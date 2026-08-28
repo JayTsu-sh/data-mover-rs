@@ -589,7 +589,7 @@ impl StorageEnum {
         let enable_integrity_check = options.enable_integrity_check;
         let bytes_counter = options.bytes_counter.clone();
         let read_task = tokio::spawn(async move {
-            Box::pin(Self::read_data_from(
+            Box::pin(crate::storage_read_pipeline::read_data_from(
                 &from_c,
                 &entry_r,
                 tx,
