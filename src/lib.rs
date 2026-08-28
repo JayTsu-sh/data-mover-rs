@@ -29,6 +29,7 @@ pub mod nfs;
 pub mod qos;
 pub mod s3;
 pub mod storage_enum;
+mod storage_metadata;
 pub mod storage_options;
 pub mod tar_pack;
 pub mod third_party;
