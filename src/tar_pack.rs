@@ -1,11 +1,196 @@
 // 标准库
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 // 外部crate
 use bytes::{Bytes, BytesMut};
+use tokio::sync::mpsc;
+use tracing::warn;
 
 // 内部模块
-use crate::EntryEnum;
+use crate::error::StorageError;
+use crate::storage_copy_pipeline::HASH_CHANNEL_CAPACITY;
+use crate::storage_enum::{StorageEnum, path_to_s3_key};
+use crate::{DataChunk, EntryEnum, Result, TarPackOptions};
+
+/// TAR 打包 pipeline 的 channel 容量（多文件顺序读，适当放大缓冲）
+const TAR_PIPELINE_CAPACITY: usize = 16;
+
+pub(crate) async fn pack_files_to_tar(
+    from: &StorageEnum,
+    to: &StorageEnum,
+    entries: &[Arc<EntryEnum>],
+    tar_path: &Path,
+    tar_size: u64,
+    tar_mtime: i64,
+    options: TarPackOptions,
+) -> Result<()> {
+    let TarPackOptions { qos, bytes_counter } = options;
+    let base_path = tar_path.with_extension("");
+    let (tx, rx) = mpsc::channel::<DataChunk>(TAR_PIPELINE_CAPACITY);
+    let to_c = to.clone();
+    let tar_path_buf = tar_path.to_path_buf();
+    let bytes_counter_w = bytes_counter.clone();
+    let write_task = tokio::spawn(async move {
+        write_tar_stream(
+            &to_c,
+            rx,
+            &tar_path_buf,
+            tar_size,
+            tar_mtime,
+            bytes_counter_w,
+        )
+        .await
+    });
+
+    let mut offset = 0u64;
+    for entry in entries {
+        let header_bytes = build_tar_header(from, entry, &base_path).await;
+        tx.send(DataChunk {
+            offset,
+            data: header_bytes,
+        })
+        .await
+        .map_err(|_| {
+            StorageError::OperationError("tar write channel closed during header send".to_string())
+        })?;
+        offset += 512;
+
+        if entry.get_is_regular_file() {
+            let file_size = entry.get_size();
+            if file_size > 0 {
+                let (sub_tx, mut sub_rx) = mpsc::channel(HASH_CHANNEL_CAPACITY);
+                let from_c = from.clone();
+                let entry_c = entry.clone();
+                let qos_c = qos.clone();
+                let read_task = tokio::spawn(async move {
+                    Box::pin(StorageEnum::read_data_from(
+                        &from_c, &entry_c, sub_tx, file_size, false, qos_c,
+                    ))
+                    .await
+                });
+
+                while let Some(chunk) = sub_rx.recv().await {
+                    let chunk_len = chunk.data.len() as u64;
+                    tx.send(DataChunk {
+                        offset,
+                        data: chunk.data,
+                    })
+                    .await
+                    .map_err(|_| {
+                        StorageError::OperationError(
+                            "tar write channel closed during file transfer".to_string(),
+                        )
+                    })?;
+                    offset += chunk_len;
+                }
+
+                read_task.await.map_err(|error| {
+                    StorageError::OperationError(format!("read task panicked: {error:?}"))
+                })??;
+
+                if let Some(padding) = tar_padding(file_size) {
+                    let padding_len = padding.len() as u64;
+                    tx.send(DataChunk {
+                        offset,
+                        data: padding,
+                    })
+                    .await
+                    .map_err(|_| {
+                        StorageError::OperationError(
+                            "tar write channel closed during padding send".to_string(),
+                        )
+                    })?;
+                    offset += padding_len;
+                }
+            }
+        }
+    }
+
+    finish_tar_stream(tx, offset, write_task).await
+}
+
+async fn finish_tar_stream(
+    tx: mpsc::Sender<DataChunk>,
+    offset: u64,
+    write_task: tokio::task::JoinHandle<Result<u64>>,
+) -> Result<()> {
+    tx.send(DataChunk {
+        offset,
+        data: tar_eof_marker(),
+    })
+    .await
+    .map_err(|_| {
+        StorageError::OperationError("tar write channel closed during EOF send".to_string())
+    })?;
+    drop(tx);
+    write_task.await.map_err(|error| {
+        StorageError::OperationError(format!("tar write task panicked: {error:?}"))
+    })??;
+    Ok(())
+}
+
+async fn build_tar_header(storage: &StorageEnum, entry: &EntryEnum, base_path: &Path) -> Bytes {
+    let link_target = if entry.get_is_symlink() {
+        storage.read_symlink(entry).await.map_or_else(
+            |error| {
+                warn!(
+                    "Failed to read symlink target for {:?}: {}",
+                    entry.get_relative_path(),
+                    error
+                );
+                String::new()
+            },
+            |target| target.to_string_lossy().to_string(),
+        )
+    } else {
+        String::new()
+    };
+    let internal_path = entry
+        .get_relative_path()
+        .strip_prefix(base_path)
+        .unwrap_or(entry.get_relative_path())
+        .iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    build_header_for_entry(entry, &internal_path, &link_target)
+}
+
+async fn write_tar_stream(
+    storage: &StorageEnum,
+    rx: mpsc::Receiver<DataChunk>,
+    tar_path: &Path,
+    tar_size: u64,
+    tar_mtime: i64,
+    bytes_counter: Option<Arc<AtomicU64>>,
+) -> Result<u64> {
+    match storage {
+        StorageEnum::Local(local) => {
+            local
+                .write_data(rx, tar_path, None, None, None, bytes_counter)
+                .await
+        }
+        StorageEnum::NFS(nfs) => {
+            nfs.write_data(rx, tar_path, None, None, None, bytes_counter)
+                .await
+        }
+        StorageEnum::CIFS(cifs) => {
+            cifs.write_data(rx, tar_path, None, None, None, bytes_counter)
+                .await
+        }
+        StorageEnum::S3(s3) => {
+            let tar_key = path_to_s3_key(tar_path);
+            s3.write_data(rx, &tar_key, tar_size, tar_mtime, None, bytes_counter)
+                .await
+        }
+        StorageEnum::HDFS(hdfs) => {
+            hdfs.write_data(rx, tar_path, tar_size, 0o644, None, bytes_counter)
+                .await
+        }
+    }
+}
 
 /// 构建 512 字节的 ustar header
 ///

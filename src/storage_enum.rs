@@ -8,9 +8,6 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-/// TAR 打包 pipeline 的 channel 容量（多文件顺序读，适当放大缓冲）
-const TAR_PIPELINE_CAPACITY: usize = 16;
-
 async fn copy_s3_to_s3_native(
     src: &S3Storage,
     dst: &S3Storage,
@@ -53,11 +50,9 @@ use crate::nfs::{NFSStorage, create_nfs_storage};
 use crate::pipeline_primitives::WriteProgress;
 use crate::qos::QosManager;
 use crate::s3::{S3Storage, create_s3_storage};
-use crate::storage_copy_pipeline::HASH_CHANNEL_CAPACITY;
 pub use crate::storage_options::{
     BackendConfig, CopyOptions, CreateStorageOptions, TarPackOptions, WalkOptions,
 };
-use crate::tar_pack::{build_header_for_entry, tar_eof_marker, tar_padding};
 use crate::{
     CommitCallback, DataChunk, DeleteDirIterator, EntryEnum, Result, ResumeContext,
     TransferConcurrency, WalkDirAsyncIterator, WalkDirAsyncIterator2,
@@ -989,180 +984,10 @@ impl StorageEnum {
         tar_mtime: i64,
         options: TarPackOptions,
     ) -> Result<()> {
-        let TarPackOptions { qos, bytes_counter } = options;
-        // 从 tar_path 推导出被打包目录的路径（去掉 .tar 扩展名）
-        let base_path = tar_path.with_extension("");
-        let (tx, rx) = mpsc::channel::<DataChunk>(TAR_PIPELINE_CAPACITY);
-        let to_c = to.clone();
-        let tar_path_buf = tar_path.to_path_buf();
-        let bytes_counter_w = bytes_counter.clone();
-        let write_task = tokio::spawn(async move {
-            Self::write_tar_stream(
-                &to_c,
-                rx,
-                &tar_path_buf,
-                tar_size,
-                tar_mtime,
-                bytes_counter_w,
-            )
-            .await
-        });
-
-        // ── Producer: iterate entries, send headers + data + padding ──
-        let mut offset = 0u64;
-        for entry in entries {
-            let header_bytes = Self::build_tar_header(from, entry, &base_path).await;
-            if tx
-                .send(DataChunk {
-                    offset,
-                    data: header_bytes,
-                })
-                .await
-                .is_err()
-            {
-                return Err(StorageError::OperationError(
-                    "tar write channel closed during header send".to_string(),
-                ));
-            }
-            offset += 512;
-
-            // 发送文件数据（仅普通文件）
-            if entry.get_is_regular_file() {
-                let file_size = entry.get_size();
-                if file_size > 0 {
-                    let (sub_tx, mut sub_rx) = mpsc::channel(HASH_CHANNEL_CAPACITY);
-                    let read_task = Self::spawn_tar_read(
-                        from.clone(),
-                        entry.clone(),
-                        sub_tx,
-                        file_size,
-                        qos.clone(),
-                    );
-
-                    while let Some(chunk) = sub_rx.recv().await {
-                        let chunk_len = chunk.data.len() as u64;
-                        if tx
-                            .send(DataChunk {
-                                offset,
-                                data: chunk.data,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return Err(StorageError::OperationError(
-                                "tar write channel closed during file transfer".to_string(),
-                            ));
-                        }
-                        offset += chunk_len;
-                    }
-
-                    read_task.await.map_err(|e| {
-                        StorageError::OperationError(format!("read task panicked: {e:?}"))
-                    })??;
-
-                    // 发送 padding
-                    if let Some(padding) = tar_padding(file_size) {
-                        let padding_len = padding.len() as u64;
-                        if tx
-                            .send(DataChunk {
-                                offset,
-                                data: padding,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return Err(StorageError::OperationError(
-                                "tar write channel closed during padding send".to_string(),
-                            ));
-                        }
-                        offset += padding_len;
-                    }
-                }
-            }
-        }
-
-        Self::finish_tar_stream(tx, offset, write_task).await
-    }
-
-    async fn finish_tar_stream(
-        tx: mpsc::Sender<DataChunk>,
-        offset: u64,
-        write_task: tokio::task::JoinHandle<Result<u64>>,
-    ) -> Result<()> {
-        tx.send(DataChunk {
-            offset,
-            data: tar_eof_marker(),
-        })
+        crate::tar_pack::pack_files_to_tar(
+            from, to, entries, tar_path, tar_size, tar_mtime, options,
+        )
         .await
-        .map_err(|_| {
-            StorageError::OperationError("tar write channel closed during EOF send".to_string())
-        })?;
-        drop(tx);
-        write_task.await.map_err(|error| {
-            StorageError::OperationError(format!("tar write task panicked: {error:?}"))
-        })??;
-        Ok(())
-    }
-
-    async fn build_tar_header(storage: &StorageEnum, entry: &EntryEnum, base_path: &Path) -> Bytes {
-        let link_target = if entry.get_is_symlink() {
-            storage.read_symlink(entry).await.map_or_else(
-                |error| {
-                    warn!(
-                        "Failed to read symlink target for {:?}: {}",
-                        entry.get_relative_path(),
-                        error
-                    );
-                    String::new()
-                },
-                |target| target.to_string_lossy().to_string(),
-            )
-        } else {
-            String::new()
-        };
-        let internal_path = entry
-            .get_relative_path()
-            .strip_prefix(base_path)
-            .unwrap_or(entry.get_relative_path())
-            .iter()
-            .map(|component| component.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        build_header_for_entry(entry, &internal_path, &link_target)
-    }
-
-    async fn write_tar_stream(
-        storage: &StorageEnum,
-        rx: mpsc::Receiver<DataChunk>,
-        tar_path: &Path,
-        tar_size: u64,
-        tar_mtime: i64,
-        bytes_counter: Option<Arc<AtomicU64>>,
-    ) -> Result<u64> {
-        match storage {
-            StorageEnum::Local(local) => {
-                local
-                    .write_data(rx, tar_path, None, None, None, bytes_counter)
-                    .await
-            }
-            StorageEnum::NFS(nfs) => {
-                nfs.write_data(rx, tar_path, None, None, None, bytes_counter)
-                    .await
-            }
-            StorageEnum::CIFS(cifs) => {
-                cifs.write_data(rx, tar_path, None, None, None, bytes_counter)
-                    .await
-            }
-            StorageEnum::S3(s3) => {
-                let tar_key = path_to_s3_key(tar_path);
-                s3.write_data(rx, &tar_key, tar_size, tar_mtime, None, bytes_counter)
-                    .await
-            }
-            StorageEnum::HDFS(hdfs) => {
-                hdfs.write_data(rx, tar_path, tar_size, 0o644, None, bytes_counter)
-                    .await
-            }
-        }
     }
 
     /// 读取文件完整内容（单块读取，适用于小文件或需要全量数据的场景）
@@ -1519,28 +1344,6 @@ impl StorageEnum {
                 "unsupported source/entry combination for tar read_data: {entry:?}"
             ))),
         }
-    }
-
-    async fn read_tar_data(
-        from: &StorageEnum,
-        entry: &EntryEnum,
-        tx: mpsc::Sender<DataChunk>,
-        size: u64,
-        qos: Option<QosManager>,
-    ) -> Result<Option<HashCalculator>> {
-        Box::pin(Self::read_data_from(from, entry, tx, size, false, qos)).await
-    }
-
-    fn spawn_tar_read(
-        from: StorageEnum,
-        entry: Arc<EntryEnum>,
-        tx: mpsc::Sender<DataChunk>,
-        size: u64,
-        qos: Option<QosManager>,
-    ) -> tokio::task::JoinHandle<Result<Option<HashCalculator>>> {
-        tokio::spawn(
-            async move { Box::pin(Self::read_tar_data(&from, &entry, tx, size, qos)).await },
-        )
     }
 
     #[must_use]
