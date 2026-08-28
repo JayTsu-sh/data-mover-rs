@@ -52,6 +52,221 @@ pub(crate) const HASH_CHANNEL_CAPACITY: usize = 4;
 /// （NFS chunk ≤ 1MB；CIFS chunk 可达 8MB，增大容量时需关注）。
 pub(crate) const COPY_PIPELINE_CAPACITY: usize = 4;
 
+pub(crate) async fn write_copy_data(
+    to: &StorageEnum,
+    entry: &EntryEnum,
+    destination_path: &Path,
+    rx: mpsc::Receiver<DataChunk>,
+    size: u64,
+    bytes_counter: Option<Arc<AtomicU64>>,
+) -> Result<u64> {
+    match (to, entry) {
+        (StorageEnum::Local(storage), EntryEnum::NAS(entry)) => {
+            storage
+                .write_data(
+                    rx,
+                    &entry.relative_path,
+                    entry.uid,
+                    entry.gid,
+                    Some(entry.mode),
+                    bytes_counter,
+                )
+                .await
+        }
+        (StorageEnum::Local(storage), EntryEnum::S3(entry)) => {
+            storage
+                .write_data(
+                    rx,
+                    Path::new(&entry.relative_path),
+                    None,
+                    None,
+                    None,
+                    bytes_counter,
+                )
+                .await
+        }
+        (StorageEnum::NFS(storage), EntryEnum::NAS(entry)) => {
+            storage
+                .write_data(
+                    rx,
+                    &entry.relative_path,
+                    entry.uid,
+                    entry.gid,
+                    Some(entry.mode),
+                    bytes_counter,
+                )
+                .await
+        }
+        (StorageEnum::NFS(storage), EntryEnum::S3(entry)) => {
+            storage
+                .write_data(
+                    rx,
+                    Path::new(&entry.relative_path),
+                    None,
+                    None,
+                    None,
+                    bytes_counter,
+                )
+                .await
+        }
+        (StorageEnum::CIFS(storage), EntryEnum::NAS(entry)) => {
+            storage
+                .write_data(
+                    rx,
+                    &entry.relative_path,
+                    entry.uid,
+                    entry.gid,
+                    Some(entry.mode),
+                    bytes_counter,
+                )
+                .await
+        }
+        (StorageEnum::CIFS(storage), EntryEnum::S3(entry)) => {
+            storage
+                .write_data(
+                    rx,
+                    Path::new(&entry.relative_path),
+                    None,
+                    None,
+                    None,
+                    bytes_counter,
+                )
+                .await
+        }
+        (StorageEnum::S3(storage), EntryEnum::S3(entry)) => {
+            write_s3_copy_data(storage, entry, rx, size, bytes_counter).await
+        }
+        (StorageEnum::S3(storage), EntryEnum::NAS(entry)) => {
+            write_s3_nas_copy_data(storage, entry, rx, size, bytes_counter).await
+        }
+        (StorageEnum::S3(storage), EntryEnum::HDFS(entry)) => {
+            write_s3_hdfs_copy_data(storage, entry, rx, size, bytes_counter).await
+        }
+        (StorageEnum::HDFS(storage), entry) => {
+            Box::pin(write_hdfs_copy_data(
+                storage,
+                entry,
+                destination_path,
+                rx,
+                size,
+                bytes_counter,
+            ))
+            .await
+        }
+        (storage, EntryEnum::HDFS(entry)) => {
+            write_hdfs_copy_to_nas(storage, entry, rx, bytes_counter).await
+        }
+    }
+}
+
+async fn write_hdfs_copy_to_nas(
+    storage: &StorageEnum,
+    entry: &crate::HDFSEntry,
+    rx: mpsc::Receiver<DataChunk>,
+    bytes_counter: Option<Arc<AtomicU64>>,
+) -> Result<u64> {
+    let mode = Some(entry.mode & 0o7777);
+    match storage {
+        StorageEnum::Local(storage) => {
+            storage
+                .write_data(rx, &entry.relative_path, None, None, mode, bytes_counter)
+                .await
+        }
+        StorageEnum::NFS(storage) => {
+            storage
+                .write_data(rx, &entry.relative_path, None, None, mode, bytes_counter)
+                .await
+        }
+        StorageEnum::CIFS(storage) => {
+            storage
+                .write_data(rx, &entry.relative_path, None, None, mode, bytes_counter)
+                .await
+        }
+        StorageEnum::S3(_) | StorageEnum::HDFS(_) => Err(StorageError::MismatchedType),
+    }
+}
+
+async fn write_s3_copy_data(
+    storage: &crate::s3::S3Storage,
+    entry: &crate::S3Entry,
+    rx: mpsc::Receiver<DataChunk>,
+    size: u64,
+    bytes_counter: Option<Arc<AtomicU64>>,
+) -> Result<u64> {
+    storage
+        .write_data(
+            rx,
+            &entry.relative_path,
+            size,
+            entry.mtime,
+            entry.tags.clone(),
+            bytes_counter,
+        )
+        .await
+}
+
+async fn write_s3_hdfs_copy_data(
+    storage: &crate::s3::S3Storage,
+    entry: &crate::HDFSEntry,
+    rx: mpsc::Receiver<DataChunk>,
+    size: u64,
+    bytes_counter: Option<Arc<AtomicU64>>,
+) -> Result<u64> {
+    storage
+        .write_data(
+            rx,
+            &path_to_s3_key(&entry.relative_path),
+            size,
+            entry.mtime,
+            None,
+            bytes_counter,
+        )
+        .await
+}
+
+async fn write_s3_nas_copy_data(
+    storage: &crate::s3::S3Storage,
+    entry: &crate::NASEntry,
+    rx: mpsc::Receiver<DataChunk>,
+    size: u64,
+    bytes_counter: Option<Arc<AtomicU64>>,
+) -> Result<u64> {
+    storage
+        .write_data(
+            rx,
+            &path_to_s3_key(&entry.relative_path),
+            size,
+            entry.mtime,
+            None,
+            bytes_counter,
+        )
+        .await
+}
+
+async fn write_hdfs_copy_data(
+    storage: &crate::hdfs::HDFSStorage,
+    entry: &EntryEnum,
+    destination_path: &Path,
+    rx: mpsc::Receiver<DataChunk>,
+    size: u64,
+    bytes_counter: Option<Arc<AtomicU64>>,
+) -> Result<u64> {
+    let replication = match entry {
+        EntryEnum::HDFS(entry) => entry.replication,
+        EntryEnum::NAS(_) | EntryEnum::S3(_) => None,
+    };
+    storage
+        .write_data(
+            rx,
+            destination_path,
+            size,
+            entry.get_mode().unwrap_or(0o644),
+            replication,
+            bytes_counter,
+        )
+        .await
+}
+
 struct MultiCopyOptions {
     qos: Option<QosManager>,
     enable_integrity_check: bool,
@@ -385,7 +600,7 @@ impl StorageEnum {
             .await
         });
         let write_task = tokio::spawn(async move {
-            Self::write_copy_data(&to_c, &entry_w, &write_path, rx, size, bytes_counter).await
+            write_copy_data(&to_c, &entry_w, &write_path, rx, size, bytes_counter).await
         });
         await_copy_pipeline(read_task, write_task, options.cancel.as_ref()).await
     }
