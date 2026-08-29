@@ -6,7 +6,9 @@ use std::num::NonZeroUsize;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{BackendSessionFailure, EntryOperationFailure, ObservedEntry, StoragePath};
+use crate::model::{
+    BackendSessionFailure, EntryOperationFailure, ObservationPlan, ObservedEntry, StoragePath,
+};
 
 #[allow(dead_code)]
 pub(crate) mod local;
@@ -24,13 +26,14 @@ pub struct TraversalRequest {
     pub order: TraversalOrder,
     pub max_inflight_operations: NonZeroUsize,
     pub max_buffered_items: NonZeroUsize,
+    pub observation_plan: ObservationPlan,
     pub cancel: CancellationToken,
 }
 
 /// One ordered traversal item. Entry failures do not terminate the session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TraversalItem {
-    Entry(ObservedEntry),
+    Entry(Box<ObservedEntry>),
     EntryFailure(EntryOperationFailure),
 }
 

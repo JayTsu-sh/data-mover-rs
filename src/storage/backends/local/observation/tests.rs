@@ -1,8 +1,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
-use crate::model::BackendKind;
 use crate::model::observation::PrivateBackendEntryFacts;
+use crate::model::{
+    BackendKind, MetadataObservation, MetadataProvenance, ObservationMode, ObservationPlan,
+};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -58,6 +60,202 @@ async fn observes_file_directory_and_stable_identity() -> io::Result<()> {
     assert_eq!(first.identity_key(), second.identity_key());
     assert_eq!(directory.kind(), EntryKind::Directory);
     assert_eq!(directory.size(), None);
+    assert!(matches!(
+        first.metadata().acl(),
+        MetadataObservation::NotRequested
+    ));
+    assert!(matches!(
+        first.metadata().xattrs(),
+        MetadataObservation::NotRequested
+    ));
+    assert_eq!(adapter.optional_call_count(), 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inline_plan_uses_stat_facts_without_optional_storage_calls() -> io::Result<()> {
+    let root = TestRoot::new()?;
+    std::fs::write(root.0.join("file"), b"value")?;
+    let adapter = adapter(&root.0).map_err(io::Error::other)?;
+    let plan = ObservationPlan::default()
+        .with_acl(ObservationMode::InlineOnly)
+        .with_xattrs(ObservationMode::InlineOnly)
+        .with_ownership_mode(ObservationMode::InlineOnly)
+        .with_timestamps(ObservationMode::InlineOnly);
+
+    let observed = adapter
+        .observe_with_plan(StoragePath::new("file").map_err(io::Error::other)?, plan)
+        .await
+        .map_err(io::Error::other)?;
+
+    assert!(matches!(
+        observed.metadata().acl(),
+        MetadataObservation::Unsupported
+    ));
+    assert!(matches!(
+        observed.metadata().xattrs(),
+        MetadataObservation::Unsupported
+    ));
+    assert!(matches!(
+        observed.metadata().ownership_mode(),
+        MetadataObservation::Value {
+            provenance: MetadataProvenance::Inline,
+            ..
+        }
+    ));
+    assert!(matches!(
+        observed.metadata().timestamps(),
+        MetadataObservation::Value {
+            provenance: MetadataProvenance::Inline,
+            ..
+        }
+    ));
+    assert_eq!(adapter.optional_call_count(), 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn best_effort_records_optional_failure_but_required_fails_entry() -> io::Result<()> {
+    let root = TestRoot::new()?;
+    std::fs::write(root.0.join("file"), b"value")?;
+    let adapter = adapter(&root.0).map_err(io::Error::other)?;
+    adapter.fail_optional_calls();
+    let path = StoragePath::new("file").map_err(io::Error::other)?;
+    let best_effort = ObservationPlan::default()
+        .with_acl(ObservationMode::BestEffort)
+        .with_xattrs(ObservationMode::BestEffort);
+
+    let observed = adapter
+        .observe_with_plan(path.clone(), best_effort)
+        .await
+        .map_err(io::Error::other)?;
+    assert!(matches!(
+        observed.metadata().acl(),
+        MetadataObservation::Failed {
+            class: FailureClass::PermissionDenied,
+            ..
+        }
+    ));
+    assert!(matches!(
+        observed.metadata().xattrs(),
+        MetadataObservation::Failed {
+            class: FailureClass::PermissionDenied,
+            ..
+        }
+    ));
+    assert_eq!(adapter.optional_call_count(), 2);
+
+    let required = ObservationPlan::default().with_acl(ObservationMode::Required);
+    assert!(matches!(
+        adapter.observe_with_plan(path, required).await,
+        Err(StorageRoleFailure::Entry(error))
+            if error.operation() == Operation::Observe
+                && error.class() == FailureClass::PermissionDenied
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn best_effort_does_not_demote_backend_session_failure() -> io::Result<()> {
+    let root = TestRoot::new()?;
+    std::fs::write(root.0.join("file"), b"value")?;
+    let adapter = adapter(&root.0).map_err(io::Error::other)?;
+    adapter.fail_optional_calls_with(io::ErrorKind::NotConnected);
+    let plan = ObservationPlan::default().with_acl(ObservationMode::BestEffort);
+
+    assert!(matches!(
+        adapter
+            .observe_with_plan(StoragePath::new("file").map_err(io::Error::other)?, plan)
+            .await,
+        Err(StorageRoleFailure::Session(error)) if error.operation() == Operation::Observe
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn required_xattrs_capture_empty_and_nonempty_values() -> io::Result<()> {
+    let root = TestRoot::new()?;
+    let file = root.0.join("file");
+    std::fs::write(&file, b"value")?;
+    xattr::set(&file, "user.empty", b"")?;
+    xattr::set(&file, "user.value", b"metadata")?;
+    let adapter = adapter(&root.0).map_err(io::Error::other)?;
+    let plan = ObservationPlan::default().with_xattrs(ObservationMode::Required);
+
+    let observed = adapter
+        .observe_with_plan(StoragePath::new("file").map_err(io::Error::other)?, plan)
+        .await
+        .map_err(io::Error::other)?;
+    let attributes = observed
+        .metadata()
+        .xattrs()
+        .value()
+        .ok_or_else(|| io::Error::other("xattrs were not observed"))?;
+
+    assert_eq!(attributes.len(), 2);
+    assert_eq!(attributes[0].name(), b"user.empty");
+    assert_eq!(attributes[0].value(), b"");
+    assert_eq!(attributes[1].name(), b"user.value");
+    assert_eq!(attributes[1].value(), b"metadata");
+    let snapshot = observed.encode_snapshot();
+    std::fs::remove_file(file)?;
+    let rebuilt = ObservedEntry::decode_snapshot(snapshot.as_bytes()).map_err(io::Error::other)?;
+    assert_eq!(rebuilt.metadata(), observed.metadata());
+    Ok(())
+}
+
+#[cfg(unix)]
+fn posix_acl_blob() -> Vec<u8> {
+    let mut bytes = 2_u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in [
+        (0x01_u16, 7_u16, u32::MAX),
+        (0x02, 4, 0),
+        (0x04, 5, u32::MAX),
+        (0x10, 5, u32::MAX),
+        (0x20, 0, u32::MAX),
+    ] {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&permissions.to_le_bytes());
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    bytes
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn required_acl_captures_access_and_directory_default_losslessly() -> io::Result<()> {
+    let root = TestRoot::new()?;
+    let directory = root.0.join("directory");
+    std::fs::create_dir(&directory)?;
+    let acl = posix_acl_blob();
+    xattr::set(&directory, "system.posix_acl_access", &acl)?;
+    xattr::set(&directory, "system.posix_acl_default", &acl)?;
+    let adapter = adapter(&root.0).map_err(io::Error::other)?;
+    let plan = ObservationPlan::default().with_acl(ObservationMode::Required);
+
+    let observed = adapter
+        .observe_with_plan(
+            StoragePath::new("directory").map_err(io::Error::other)?,
+            plan,
+        )
+        .await
+        .map_err(io::Error::other)?;
+    let value = observed
+        .metadata()
+        .acl()
+        .value()
+        .ok_or_else(|| io::Error::other("ACL was not observed"))?;
+
+    assert_eq!(value.access(), Some(acl.as_slice()));
+    assert_eq!(value.default_acl(), Some(acl.as_slice()));
+    let snapshot = observed.encode_snapshot();
+    std::fs::remove_dir(directory)?;
+    let rebuilt = ObservedEntry::decode_snapshot(snapshot.as_bytes()).map_err(io::Error::other)?;
+    assert_eq!(rebuilt.metadata().acl(), observed.metadata().acl());
     Ok(())
 }
 
@@ -96,6 +294,62 @@ async fn observes_symlink_without_following_target() -> io::Result<()> {
             assert_eq!(rebuilt.symlink_target(), observed.symlink_target());
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn optional_metadata_marks_symlinks_not_applicable_without_calls() -> io::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let root = TestRoot::new()?;
+    symlink("missing", root.0.join("dangling"))?;
+    let adapter = adapter(&root.0).map_err(io::Error::other)?;
+    let plan = ObservationPlan::default()
+        .with_acl(ObservationMode::Required)
+        .with_xattrs(ObservationMode::Required);
+    let observed = adapter
+        .observe_with_plan(
+            StoragePath::new("dangling").map_err(io::Error::other)?,
+            plan,
+        )
+        .await
+        .map_err(io::Error::other)?;
+
+    assert!(matches!(
+        observed.metadata().acl(),
+        MetadataObservation::NotApplicable
+    ));
+    assert!(matches!(
+        observed.metadata().xattrs(),
+        MetadataObservation::NotApplicable
+    ));
+    assert_eq!(adapter.optional_call_count(), 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn optional_metadata_never_follows_a_symlink_target() -> io::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let root = TestRoot::new()?;
+    let outside = TestRoot::new()?;
+    std::fs::write(outside.0.join("secret"), b"secret")?;
+    symlink(outside.0.join("secret"), root.0.join("link"))?;
+    let adapter = adapter(&root.0).map_err(io::Error::other)?;
+    let plan = ObservationPlan::default()
+        .with_acl(ObservationMode::Required)
+        .with_xattrs(ObservationMode::Required);
+
+    let result = adapter
+        .observe_with_plan(StoragePath::new("link").map_err(io::Error::other)?, plan)
+        .await;
+    assert!(matches!(
+        result,
+        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::PermissionDenied
+    ));
+    assert_eq!(adapter.optional_call_count(), 0);
     Ok(())
 }
 

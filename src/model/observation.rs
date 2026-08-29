@@ -1,12 +1,12 @@
 use std::fmt;
 
 use super::{
-    BackendIdentity, BackendKind, EntryKind, MAX_MODEL_FIELD_BYTES, ModelValueError,
-    SpecialFileKind, StoragePath, StorageTimestamp, TimePrecision,
+    BackendIdentity, BackendKind, EntryKind, MAX_MODEL_FIELD_BYTES, MetadataObservations,
+    ModelValueError, SpecialFileKind, StoragePath, StorageTimestamp, TimePrecision,
 };
 
 const MAGIC: &[u8; 4] = b"DMES";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 /// How strongly a source identity survives namespace changes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,12 +117,6 @@ impl fmt::Debug for EntryIdentityKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("EntryIdentityKey(<opaque-32-bytes>)")
     }
-}
-
-/// Metadata observation container reserved for the metadata-plan ticket.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MetadataObservations {
-    schema_version: u8,
 }
 
 /// Lossless protocol-neutral symlink payload captured without following the link.
@@ -314,6 +308,11 @@ impl ObservedEntry {
         Ok(self)
     }
 
+    pub(crate) fn with_metadata(mut self, metadata: MetadataObservations) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
     /// Lends private facts only to crate-internal backend/native implementations.
     #[allow(dead_code)]
     pub(crate) const fn backend_facts(&self) -> &PrivateBackendEntryFacts {
@@ -389,7 +388,8 @@ impl ObservedEntry {
             self.source_identity.backend.stable_id().as_bytes(),
         );
         put_bytes(&mut output, &self.source_identity.stable_bytes);
-        output.push(self.metadata.schema_version);
+        output.push(1);
+        super::metadata_observation::encode(&self.metadata, &mut output);
         self.backend_fact.encode(&mut output);
         output.extend_from_slice(self.identity_key.as_bytes());
         EntrySnapshot(output)
@@ -445,12 +445,12 @@ impl fmt::Display for SnapshotDecodeError {
 
 impl std::error::Error for SnapshotDecodeError {}
 
-struct Cursor<'a> {
+pub(super) struct Cursor<'a> {
     bytes: &'a [u8],
     offset: usize,
 }
 impl<'a> Cursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(super) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
     fn take(&mut self, len: usize) -> Result<&'a [u8], SnapshotDecodeError> {
@@ -465,15 +465,15 @@ impl<'a> Cursor<'a> {
         self.offset = end;
         Ok(value)
     }
-    fn byte(&mut self) -> Result<u8, SnapshotDecodeError> {
+    pub(super) fn byte(&mut self) -> Result<u8, SnapshotDecodeError> {
         Ok(self.take(1)?[0])
     }
-    fn u32(&mut self) -> Result<u32, SnapshotDecodeError> {
+    pub(super) fn u32(&mut self) -> Result<u32, SnapshotDecodeError> {
         let mut value = [0; 4];
         value.copy_from_slice(self.take(4)?);
         Ok(u32::from_le_bytes(value))
     }
-    fn bytes(&mut self) -> Result<&'a [u8], SnapshotDecodeError> {
+    pub(super) fn bytes(&mut self) -> Result<&'a [u8], SnapshotDecodeError> {
         let len = self.u32()? as usize;
         if len > MAX_MODEL_FIELD_BYTES {
             return Err(SnapshotDecodeError::FieldTooLarge);
@@ -519,12 +519,11 @@ fn decode_snapshot(bytes: &[u8]) -> Result<ObservedEntry, SnapshotDecodeError> {
         .map_err(|_| SnapshotDecodeError::Malformed)?;
     let source_identity = SourceIdentity::new(backend, strength, cursor.bytes()?)
         .map_err(|_| SnapshotDecodeError::Malformed)?;
-    let metadata = MetadataObservations {
-        schema_version: cursor.byte()?,
-    };
-    if metadata.schema_version != 0 {
+    let schema_version = cursor.byte()?;
+    if schema_version != 1 {
         return Err(SnapshotDecodeError::Malformed);
     }
+    let metadata = super::metadata_observation::decode(&mut cursor)?;
     let backend_fact = decode_facts(&mut cursor, backend_kind)?;
     let mut encoded_key = [0; 32];
     encoded_key.copy_from_slice(cursor.take(32)?);
@@ -549,7 +548,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<ObservedEntry, SnapshotDecodeError> {
     })
 }
 
-fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
+pub(super) fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     let Ok(len) = u32::try_from(bytes.len()) else {
         unreachable!("model field invariant limits encoded lengths");
     };
@@ -619,7 +618,7 @@ fn decode_size(cursor: &mut Cursor<'_>) -> Result<Option<u64>, SnapshotDecodeErr
         _ => Err(SnapshotDecodeError::Malformed),
     }
 }
-fn encode_time(output: &mut Vec<u8>, time: Option<StorageTimestamp>) {
+pub(super) fn encode_time(output: &mut Vec<u8>, time: Option<StorageTimestamp>) {
     match time {
         Some(value) => {
             output.push(1);
@@ -634,7 +633,9 @@ fn encode_time(output: &mut Vec<u8>, time: Option<StorageTimestamp>) {
         None => output.push(0),
     }
 }
-fn decode_time(cursor: &mut Cursor<'_>) -> Result<Option<StorageTimestamp>, SnapshotDecodeError> {
+pub(super) fn decode_time(
+    cursor: &mut Cursor<'_>,
+) -> Result<Option<StorageTimestamp>, SnapshotDecodeError> {
     match cursor.byte()? {
         0 => Ok(None),
         1 => {

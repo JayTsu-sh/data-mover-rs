@@ -5,10 +5,15 @@ use std::str::FromStr;
 
 pub(crate) const MAX_MODEL_FIELD_BYTES: usize = 16 * 1024 * 1024;
 
+mod metadata_observation;
 pub(crate) mod observation;
+pub use metadata_observation::{
+    AclEncoding, AclMetadata, ExtendedAttribute, MetadataObservation, MetadataObservations,
+    MetadataProvenance, ObservationMode, ObservationPlan, OwnershipMode, TimestampMetadata,
+};
 pub use observation::{
-    EntryIdentityKey, EntrySnapshot, IdentityStrength, MetadataObservations, ObservedEntry,
-    SnapshotDecodeError, SourceIdentity, SymlinkTarget, SymlinkTargetEncoding,
+    EntryIdentityKey, EntrySnapshot, IdentityStrength, ObservedEntry, SnapshotDecodeError,
+    SourceIdentity, SymlinkTarget, SymlinkTargetEncoding,
 };
 
 /// A failure to construct a neutral model value.

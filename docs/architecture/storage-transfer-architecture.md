@@ -236,6 +236,13 @@ No optional family is fetched unconditionally. Each result is explicitly `Value`
 absence. An omitted or failed observation cannot be lazily fetched by later metadata
 application.
 
+The Local implementation obtains ownership/mode and timestamps from the entry's existing stat
+result. POSIX access/default ACL and xattr requests use separate capability-opened file-descriptor
+calls and therefore run only for `BestEffort` or `Required`; ACL storage attributes are excluded
+from the general xattr family. Optional metadata never follows a symlink target.
+The observation plan is carried once by the traversal request and applies to every admitted entry.
+All states, provenance, empty values, and failures are retained in the opaque entry snapshot.
+
 ### Traversal contract
 
 There is one bounded, cancellable, backpressured item stream paired with mandatory completion

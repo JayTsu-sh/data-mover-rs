@@ -40,6 +40,7 @@ fn request(cancel: CancellationToken, inflight: usize, buffered: usize) -> Trave
             .unwrap_or_else(|| unreachable!("test limit is nonzero")),
         max_buffered_items: NonZeroUsize::new(buffered)
             .unwrap_or_else(|| unreachable!("test limit is nonzero")),
+        observation_plan: crate::model::ObservationPlan::default(),
         cancel,
     }
 }
@@ -78,6 +79,31 @@ async fn traverses_recursively_and_returns_positive_completion() -> io::Result<(
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn traversal_applies_one_optional_metadata_plan_to_each_entry() -> io::Result<()> {
+    use crate::model::{MetadataObservation, MetadataProvenance, ObservationMode};
+
+    let root = TestRoot::new()?;
+    std::fs::write(root.0.join("file"), b"value")?;
+    let source = source(&root.0);
+    let mut request = request(CancellationToken::new(), 1, 1);
+    request.observation_plan =
+        crate::model::ObservationPlan::default().with_ownership_mode(ObservationMode::InlineOnly);
+    let mut session = source.traverse(request);
+
+    let items = drain(&mut session).await;
+    let _ = completed(session.finish().await.map_err(io::Error::other)?)?;
+    assert!(matches!(
+        items.as_slice(),
+        [TraversalItem::Entry(entry)] if matches!(
+            entry.metadata().ownership_mode(),
+            MetadataObservation::Value { provenance: MetadataProvenance::Inline, .. }
+        )
+    ));
+    Ok(())
+}
+
 #[tokio::test]
 async fn cancellation_is_a_terminal_not_an_entry_failure() -> io::Result<()> {
     let root = TestRoot::new()?;
@@ -92,6 +118,34 @@ async fn cancellation_is_a_terminal_not_an_entry_failure() -> io::Result<()> {
 
     assert!(items.is_empty());
     assert_eq!(session.finish().await, Ok(TraversalOutcome::Cancelled));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_preempts_optional_metadata_observation() -> io::Result<()> {
+    let root = TestRoot::new()?;
+    std::fs::write(root.0.join("file"), b"value")?;
+    let source = source(&root.0);
+    source
+        .observer
+        .delay_optional_calls(std::time::Duration::from_millis(200));
+    let cancel = CancellationToken::new();
+    let mut request = request(cancel.clone(), 1, 1);
+    request.observation_plan =
+        crate::model::ObservationPlan::default().with_acl(crate::model::ObservationMode::Required);
+    let mut session = source.traverse(request);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(source.observer.optional_call_count(), 1);
+    cancel.cancel();
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        let _ = drain(&mut session).await;
+        session.finish().await
+    })
+    .await
+    .map_err(io::Error::other)?;
+    assert_eq!(outcome, Ok(TraversalOutcome::Cancelled));
     Ok(())
 }
 

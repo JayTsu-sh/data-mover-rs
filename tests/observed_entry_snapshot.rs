@@ -1,5 +1,6 @@
 use data_mover::model::{
-    BackendIdentity, BackendKind, EntryKind, IdentityStrength, ObservedEntry, SnapshotDecodeError,
+    BackendIdentity, BackendKind, EntryKind, IdentityStrength, MetadataObservation,
+    MetadataProvenance, ObservationMode, ObservationPlan, ObservedEntry, SnapshotDecodeError,
     SourceIdentity, StoragePath, StorageTimestamp, TimePrecision,
 };
 
@@ -9,6 +10,27 @@ fn source(kind: BackendKind, value: &[u8]) -> Result<SourceIdentity, Box<dyn std
         IdentityStrength::StableWithinBackend,
         value,
     )?)
+}
+
+#[test]
+fn optional_metadata_plan_is_omitted_by_default_and_selective() {
+    let default = ObservationPlan::default();
+    assert_eq!(default.acl(), ObservationMode::Omit);
+    assert_eq!(default.xattrs(), ObservationMode::Omit);
+    assert_eq!(default.ownership_mode(), ObservationMode::Omit);
+    assert_eq!(default.timestamps(), ObservationMode::Omit);
+
+    let selective = default
+        .with_acl(ObservationMode::Required)
+        .with_timestamps(ObservationMode::InlineOnly);
+    assert_eq!(selective.acl(), ObservationMode::Required);
+    assert_eq!(selective.xattrs(), ObservationMode::Omit);
+    assert_eq!(selective.timestamps(), ObservationMode::InlineOnly);
+    let value = MetadataObservation::Value {
+        value: 42_u32,
+        provenance: MetadataProvenance::Inline,
+    };
+    assert_eq!(value.value(), Some(&42));
 }
 
 #[test]

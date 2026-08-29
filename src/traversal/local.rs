@@ -88,8 +88,10 @@ impl LocalTraversalSource {
         root: impl AsRef<Path>,
         identity: BackendIdentity,
     ) -> Result<Self, BackendSessionFailure> {
+        let root_path = std::fs::canonicalize(root.as_ref())
+            .map_err(|error| session_failure(Operation::Connect, &error))?;
         let root = Arc::new(
-            Dir::open_ambient_dir(root, ambient_authority())
+            Dir::open_ambient_dir(&root_path, ambient_authority())
                 .map_err(|error| session_failure(Operation::Connect, &error))?,
         );
         let observer = Arc::new(LocalObservationAdapter::from_root(
@@ -357,7 +359,7 @@ async fn drive_observers(
     items: &mpsc::Sender<TraversalItem>,
     tasks: &mut ObserverTasks,
 ) -> ObserverState {
-    let mut state = ObserverState::new();
+    let mut state = ObserverState::new(request.observation_plan);
     loop {
         if state.terminal.is_some() || request.cancel.is_cancelled() {
             break;
@@ -395,7 +397,8 @@ fn handle_candidate(
     match candidate {
         Some(Candidate::Path { sequence, path }) => {
             let observer = Arc::clone(observer);
-            tasks.spawn(async move { (sequence, observer.observe(path).await) });
+            let plan = state.observation_plan;
+            tasks.spawn(async move { (sequence, observer.observe_with_plan(path, plan).await) });
             true
         }
         Some(Candidate::EntryFailure { sequence, error }) => {
@@ -448,10 +451,11 @@ struct ObserverState {
     pending: BTreeMap<u64, TraversalItem>,
     terminal: Option<TraversalTerminalFailure>,
     enumeration_complete: bool,
+    observation_plan: crate::model::ObservationPlan,
 }
 
 impl ObserverState {
-    fn new() -> Self {
+    fn new(observation_plan: crate::model::ObservationPlan) -> Self {
         Self {
             next: 0,
             observed: 0,
@@ -459,6 +463,7 @@ impl ObserverState {
             pending: BTreeMap::new(),
             terminal: None,
             enumeration_complete: false,
+            observation_plan,
         }
     }
 }
@@ -475,7 +480,9 @@ async fn settle_one(
     };
     match result {
         Some(Ok((sequence, Ok(entry)))) => {
-            state.pending.insert(sequence, TraversalItem::Entry(entry));
+            state
+                .pending
+                .insert(sequence, TraversalItem::Entry(Box::new(entry)));
         }
         Some(Ok((sequence, Err(StorageRoleFailure::Entry(error))))) => {
             state

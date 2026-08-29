@@ -253,6 +253,9 @@ produce `failed`, never semantic loss.
 defined by the traversal request, entry failures as items, and backend-session termination.
 EOF is not completion evidence: the gate also requires a positive `TraversalCompletion`, while
 session failure, cancellation, and internal producer loss remain distinct terminal outcomes.
+For Local, the gate separately proves inline ownership/timestamp capture, no-call `InlineOnly`
+behavior for ACL/xattr, `BestEffort` failure recording, `Required` entry failure, empty xattr
+preservation, root confinement, and metadata snapshot reconstruction without backend access.
 
 Terrasync gates additionally verify:
 

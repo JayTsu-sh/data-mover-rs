@@ -8,8 +8,8 @@ use futures::Stream;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    BackendSessionFailure, EntryKind, EntryOperationFailure, MetadataObservations, SourceIdentity,
-    StoragePath,
+    BackendSessionFailure, EntryKind, EntryOperationFailure, MetadataObservations, ObservationPlan,
+    SourceIdentity, StoragePath,
 };
 
 /// A bounded payload stream. Implementations own request sizing and backpressure.
@@ -219,8 +219,11 @@ pub trait Namespace: Send + Sync {
 /// Metadata observation and application role. It never implicitly refetches omitted facts.
 #[async_trait]
 pub trait Metadata: Send + Sync {
-    async fn observe(&self, path: &StoragePath)
-    -> Result<MetadataObservations, StorageRoleFailure>;
+    async fn observe(
+        &self,
+        path: &StoragePath,
+        plan: ObservationPlan,
+    ) -> Result<MetadataObservations, StorageRoleFailure>;
     async fn apply(
         &self,
         path: &StoragePath,
