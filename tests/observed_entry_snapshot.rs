@@ -36,7 +36,7 @@ fn snapshot_roundtrip_reconstructs_without_backend_access() -> Result<(), Box<dy
             TimePrecision::Seconds,
         )?),
         source(BackendKind::Nfs, b"nfs-file-handle")?,
-    );
+    )?;
     let encoded = observed.encode_snapshot();
     let rebuilt = ObservedEntry::decode_snapshot(encoded.as_bytes())?;
     assert_eq!(rebuilt.identity_key(), observed.identity_key());
@@ -57,7 +57,7 @@ fn decoder_rejects_unknown_truncated_tampered_and_trailing_data()
         Some(1),
         None,
         source(BackendKind::Local, b"inode:1")?,
-    );
+    )?;
     let valid = observed.encode_snapshot().as_bytes().to_vec();
 
     let mut unknown_version = valid.clone();

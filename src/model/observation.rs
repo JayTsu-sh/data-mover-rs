@@ -6,7 +6,7 @@ use super::{
 };
 
 const MAGIC: &[u8; 4] = b"DMES";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 /// How strongly a source identity survives namespace changes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +125,55 @@ pub struct MetadataObservations {
     schema_version: u8,
 }
 
+/// Lossless protocol-neutral symlink payload captured without following the link.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SymlinkTargetEncoding {
+    /// Unix/NFS-style uninterpreted pathname bytes.
+    UnixBytes,
+    /// Windows pathname encoded as little-endian UTF-16 code units.
+    WindowsWide,
+}
+
+/// Exact target bytes together with their pathname encoding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SymlinkTarget {
+    encoding: SymlinkTargetEncoding,
+    bytes: Vec<u8>,
+}
+
+impl SymlinkTarget {
+    /// Creates a bounded opaque link target.
+    ///
+    /// # Errors
+    /// Returns an error when the target is empty or exceeds the model field limit.
+    pub fn new(
+        encoding: SymlinkTargetEncoding,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Result<Self, ModelValueError> {
+        let bytes = bytes.into();
+        let malformed_wide = encoding == SymlinkTargetEncoding::WindowsWide && bytes.len() % 2 != 0;
+        if bytes.is_empty() || bytes.len() > MAX_MODEL_FIELD_BYTES || malformed_wide {
+            return Err(ModelValueError::new(
+                "symlink_target",
+                "target bytes must be non-empty and bounded",
+            ));
+        }
+        Ok(Self { encoding, bytes })
+    }
+
+    /// Returns the exact target payload.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns how the exact target bytes must be interpreted.
+    #[must_use]
+    pub const fn encoding(&self) -> SymlinkTargetEncoding {
+        self.encoding
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) enum PrivateBackendEntryFacts {
     None,
@@ -177,6 +226,7 @@ pub struct ObservedEntry {
     kind: EntryKind,
     size: Option<u64>,
     modified: Option<StorageTimestamp>,
+    symlink_target: Option<SymlinkTarget>,
     source_identity: SourceIdentity,
     metadata: MetadataObservations,
     backend_fact: PrivateBackendEntryFacts,
@@ -184,27 +234,62 @@ pub struct ObservedEntry {
 
 impl ObservedEntry {
     /// Creates an observation containing only neutral facts.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns an error for symlinks, which require [`Self::new_symlink`].
     pub fn new(
         path: StoragePath,
         kind: EntryKind,
         size: Option<u64>,
         modified: Option<StorageTimestamp>,
         source_identity: SourceIdentity,
-    ) -> Self {
+    ) -> Result<Self, ModelValueError> {
+        if kind == EntryKind::Symlink {
+            return Err(ModelValueError::new(
+                "kind",
+                "symlinks require an observed target",
+            ));
+        }
         let identity_key = source_identity.identity_key();
         let backend_kind = source_identity.backend.kind();
-        Self {
+        Ok(Self {
             identity_key,
             backend_kind,
             path,
             kind,
             size,
             modified,
+            symlink_target: None,
             source_identity,
             metadata: MetadataObservations::default(),
             backend_fact: PrivateBackendEntryFacts::None,
-        }
+        })
+    }
+
+    /// Creates a complete symlink observation with its exact target.
+    ///
+    /// # Errors
+    /// Returns an error when model fields violate their bounds.
+    pub fn new_symlink(
+        path: StoragePath,
+        modified: Option<StorageTimestamp>,
+        source_identity: SourceIdentity,
+        target: SymlinkTarget,
+    ) -> Result<Self, ModelValueError> {
+        let identity_key = source_identity.identity_key();
+        let backend_kind = source_identity.backend.kind();
+        Ok(Self {
+            identity_key,
+            backend_kind,
+            path,
+            kind: EntryKind::Symlink,
+            size: None,
+            modified,
+            symlink_target: Some(target),
+            source_identity,
+            metadata: MetadataObservations::default(),
+            backend_fact: PrivateBackendEntryFacts::None,
+        })
     }
 
     /// Attaches backend-owned facts without exposing their encoding publicly.
@@ -265,6 +350,11 @@ impl ObservedEntry {
     pub const fn modified(&self) -> Option<StorageTimestamp> {
         self.modified
     }
+    /// Returns the exact symlink target when this observation is a link.
+    #[must_use]
+    pub const fn symlink_target(&self) -> Option<&SymlinkTarget> {
+        self.symlink_target.as_ref()
+    }
     /// Returns metadata observations captured by the same enumeration.
     #[must_use]
     pub const fn metadata(&self) -> &MetadataObservations {
@@ -280,6 +370,17 @@ impl ObservedEntry {
         output.push(backend_tag(self.backend_kind));
         put_bytes(&mut output, self.path.as_str().as_bytes());
         encode_kind(&mut output, self.kind);
+        match &self.symlink_target {
+            Some(target) => {
+                output.push(1);
+                output.push(match target.encoding() {
+                    SymlinkTargetEncoding::UnixBytes => 0,
+                    SymlinkTargetEncoding::WindowsWide => 1,
+                });
+                put_bytes(&mut output, target.as_bytes());
+            }
+            None => output.push(0),
+        }
         encode_size(&mut output, self.size);
         encode_time(&mut output, self.modified);
         output.push(self.source_identity.strength.tag());
@@ -393,6 +494,21 @@ fn decode_snapshot(bytes: &[u8]) -> Result<ObservedEntry, SnapshotDecodeError> {
     let path = std::str::from_utf8(cursor.bytes()?).map_err(|_| SnapshotDecodeError::Malformed)?;
     let path = StoragePath::new(path).map_err(|_| SnapshotDecodeError::Malformed)?;
     let kind = decode_kind(&mut cursor)?;
+    let symlink_target = match cursor.byte()? {
+        0 if kind != EntryKind::Symlink => None,
+        1 if kind == EntryKind::Symlink => {
+            let encoding = match cursor.byte()? {
+                0 => SymlinkTargetEncoding::UnixBytes,
+                1 => SymlinkTargetEncoding::WindowsWide,
+                _ => return Err(SnapshotDecodeError::Malformed),
+            };
+            Some(
+                SymlinkTarget::new(encoding, cursor.bytes()?.to_vec())
+                    .map_err(|_| SnapshotDecodeError::Malformed)?,
+            )
+        }
+        _ => return Err(SnapshotDecodeError::Malformed),
+    };
     let size = decode_size(&mut cursor)?;
     let modified = decode_time(&mut cursor)?;
     let strength =
@@ -426,6 +542,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<ObservedEntry, SnapshotDecodeError> {
         kind,
         size,
         modified,
+        symlink_target,
         source_identity,
         metadata,
         backend_fact,
@@ -564,7 +681,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let source = SourceIdentity::new(backend, IdentityStrength::StableWithinBackend, b"fh")
             .unwrap_or_else(|error| panic!("{error}"));
-        let entry = ObservedEntry::new(StoragePath::root(), EntryKind::File, None, None, source);
+        let entry = ObservedEntry::new(StoragePath::root(), EntryKind::File, None, None, source)
+            .unwrap_or_else(|error| panic!("{error}"));
         let entry = entry
             .with_backend_fact_bytes(vec![0, 1, 255])
             .unwrap_or_else(|error| panic!("{error}"));
@@ -572,5 +690,31 @@ mod tests {
         let rebuilt = ObservedEntry::decode_snapshot(entry.encode_snapshot().as_bytes())
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(rebuilt.backend_fact, entry.backend_fact);
+    }
+
+    #[test]
+    fn symlink_without_target_is_rejected_at_construction_and_decode() {
+        let backend = BackendIdentity::new(BackendKind::Local, "local")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let source = SourceIdentity::new(backend, IdentityStrength::StableWithinBackend, b"inode")
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            ObservedEntry::new(
+                StoragePath::root(),
+                EntryKind::Symlink,
+                None,
+                None,
+                source.clone(),
+            )
+            .is_err()
+        );
+        let file = ObservedEntry::new(StoragePath::root(), EntryKind::File, None, None, source)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let mut malformed = file.encode_snapshot().as_bytes().to_vec();
+        malformed[10] = 2;
+        assert_eq!(
+            ObservedEntry::decode_snapshot(&malformed),
+            Err(SnapshotDecodeError::Malformed)
+        );
     }
 }

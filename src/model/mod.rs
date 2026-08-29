@@ -8,7 +8,7 @@ pub(crate) const MAX_MODEL_FIELD_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) mod observation;
 pub use observation::{
     EntryIdentityKey, EntrySnapshot, IdentityStrength, MetadataObservations, ObservedEntry,
-    SnapshotDecodeError, SourceIdentity,
+    SnapshotDecodeError, SourceIdentity, SymlinkTarget, SymlinkTargetEncoding,
 };
 
 /// A failure to construct a neutral model value.
