@@ -1,5 +1,5 @@
 schema_version: 1
-captured_at: "2026-08-29T15:31:47+08:00"
+captured_at: "2026-08-29T15:53:20+08:00"
 policy:
   normative: false
   does_not_create_compatibility_requirement: true
@@ -62,16 +62,16 @@ profiles:
       - evidence_kind: gate_result
         gate_id: DM-NFS40-CONTRACT
         repository: JayTsu-sh/data-mover-rs
-        exact_commit: 9cee83c1b3ba2167a67dc3ddb6749809ac8318ce
+        exact_commit: c42bea15cfd7e12554b4e89ad2f6969b51f9f567
         dependency_commits: {}
-        run_id: release-9cee83c-nfs40-20260829
+        run_id: release-c42bea1-nfs40-20260829
         mode: real-release
-        fixture_set: architecture-ready-nfs40-contract-v1
-        started_at: "2026-08-29T15:31:26+08:00"
-        completed_at: "2026-08-29T15:31:47+08:00"
+        fixture_set: architecture-ready-nfs40-contract-v2
+        started_at: "2026-08-29T15:53:19+08:00"
+        completed_at: "2026-08-29T15:53:20+08:00"
         outcome: passed
         artifact_links:
-          - https://github.com/JayTsu-sh/data-mover-rs/issues/127#issuecomment-5461074819
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/127#issuecomment-5461159217
         source_profile: nfs40
         destination_profile: nfs40
         environment_fingerprint: dxn-nfs40/10.131.7.201/jay_nfs
