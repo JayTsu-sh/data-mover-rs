@@ -175,6 +175,27 @@ impl HdfsProtocol for MemoryHdfs {
         Ok(())
     }
 
+    async fn claim_stage(
+        &self,
+        from: &StoragePath,
+        claimed: &StoragePath,
+    ) -> Result<(), StorageRoleFailure> {
+        let mut objects = self.objects.lock().await;
+        if objects.contains_key(claimed.as_str()) {
+            return Err(entry_failure(
+                claimed,
+                Operation::Prepare,
+                FailureClass::Conflict,
+                Transience::Permanent,
+            ));
+        }
+        let value = objects
+            .remove(from.as_str())
+            .ok_or_else(|| Self::missing(from, Operation::Prepare))?;
+        objects.insert(claimed.as_str().into(), value);
+        Ok(())
+    }
+
     async fn create_empty_stage_exclusive(
         &self,
         path: &StoragePath,
@@ -370,4 +391,24 @@ async fn append_stage_preserves_each_durable_chunk_after_input_failure() {
         storage.get("partial").await,
         Some(Bytes::from_static(b"abcdef"))
     );
+}
+
+#[tokio::test]
+async fn claim_stage_failures_are_prepare_operations() {
+    let storage = MemoryHdfs::default();
+    let base = StoragePath::new("base").unwrap_or_else(|error| panic!("{error}"));
+    let claimed = StoragePath::new("claimed").unwrap_or_else(|error| panic!("{error}"));
+    storage.insert("claimed", Bytes::new()).await;
+
+    let conflict = storage.claim_stage(&base, &claimed).await;
+    assert!(matches!(conflict, Err(StorageRoleFailure::Entry(error))
+        if error.operation() == Operation::Prepare && error.class() == FailureClass::Conflict));
+
+    storage
+        .delete(&claimed, EntryKind::File)
+        .await
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    let missing = storage.claim_stage(&base, &claimed).await;
+    assert!(matches!(missing, Err(StorageRoleFailure::Entry(error))
+        if error.operation() == Operation::Prepare && error.class() == FailureClass::NotFound));
 }

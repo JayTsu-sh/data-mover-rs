@@ -20,22 +20,36 @@ const RECOVERY_MAGIC: &[u8] = b"hdfs-recovery-v1\0";
 
 struct HdfsStageToken {
     expected_size: u64,
+    nonce: [u8; 16],
+    base_path: StoragePath,
     partial_path: StoragePath,
 }
 
 struct HdfsRecoveryToken {
     binding: [u8; 32],
     expected_size: u64,
+    nonce: [u8; 16],
     base_path: StoragePath,
     final_hash: [u8; 32],
 }
 
 impl HdfsStageToken {
-    fn encode(&self) -> Bytes {
+    fn encode(&self) -> Result<Bytes, StorageRoleFailure> {
         let mut value = BytesMut::from(STAGE_TOKEN_MAGIC);
         value.extend_from_slice(&self.expected_size.to_le_bytes());
+        value.extend_from_slice(&self.nonce);
+        let base = self.base_path.as_str().as_bytes();
+        let base_len = u16::try_from(base.len()).map_err(|_| {
+            failure(
+                &self.base_path,
+                Operation::Prepare,
+                FailureClass::InvalidInput,
+            )
+        })?;
+        value.extend_from_slice(&base_len.to_le_bytes());
+        value.extend_from_slice(base);
         value.extend_from_slice(self.partial_path.as_str().as_bytes());
-        value.freeze()
+        Ok(value.freeze())
     }
 
     fn decode(stage: &PreparedStage) -> Result<Self, StorageRoleFailure> {
@@ -46,7 +60,7 @@ impl HdfsStageToken {
                 FailureClass::Protocol,
             )
         })?;
-        let (size, path) = payload.split_at_checked(size_of::<u64>()).ok_or_else(|| {
+        let (size, payload) = payload.split_at_checked(size_of::<u64>()).ok_or_else(|| {
             failure(
                 stage.final_destination.path(),
                 Operation::Prepare,
@@ -60,19 +74,39 @@ impl HdfsStageToken {
                 FailureClass::Protocol,
             )
         })?);
-        let partial_path =
-            StoragePath::new(String::from_utf8_lossy(path).as_ref()).map_err(|_| {
-                failure(
-                    stage.final_destination.path(),
-                    Operation::Prepare,
-                    FailureClass::Protocol,
-                )
-            })?;
+        let (nonce, payload) = take(payload, 16, stage.final_destination.path())?;
+        let (base_path, partial_path) =
+            decode_stage_paths(payload, stage.final_destination.path())?;
         Ok(Self {
             expected_size,
+            nonce: array(nonce, stage.final_destination.path())?,
+            base_path,
             partial_path,
         })
     }
+}
+
+fn decode_stage_paths(
+    payload: &[u8],
+    diagnostic: &StoragePath,
+) -> Result<(StoragePath, StoragePath), StorageRoleFailure> {
+    let (base_len, payload) = take(payload, 2, diagnostic)?;
+    let base_len = usize::from(u16::from_le_bytes(array(base_len, diagnostic)?));
+    let (base, partial) = take(payload, base_len, diagnostic)?;
+    Ok((
+        decode_stage_path(base, diagnostic)?,
+        decode_stage_path(partial, diagnostic)?,
+    ))
+}
+
+fn decode_stage_path(
+    bytes: &[u8],
+    diagnostic: &StoragePath,
+) -> Result<StoragePath, StorageRoleFailure> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| failure(diagnostic, Operation::Prepare, FailureClass::Protocol))?;
+    StoragePath::new(text)
+        .map_err(|_| failure(diagnostic, Operation::Prepare, FailureClass::Protocol))
 }
 
 impl HdfsRecoveryToken {
@@ -88,6 +122,7 @@ impl HdfsRecoveryToken {
         let mut value = BytesMut::from(RECOVERY_MAGIC);
         value.extend_from_slice(&self.binding);
         value.extend_from_slice(&self.expected_size.to_le_bytes());
+        value.extend_from_slice(&self.nonce);
         value.extend_from_slice(&path_len.to_le_bytes());
         value.extend_from_slice(path);
         value.extend_from_slice(&self.final_hash);
@@ -125,6 +160,7 @@ fn decode_recovery_payload(
         .ok_or_else(|| failure(path, Operation::Prepare, FailureClass::Corruption))?;
     let (binding, payload) = take(payload, 32, path)?;
     let (expected, payload) = take(payload, 8, path)?;
+    let (nonce, payload) = take(payload, 16, path)?;
     let (path_len, payload) = take(payload, 2, path)?;
     let path_len = usize::from(u16::from_le_bytes(array(path_len, path)?));
     let (base_path, payload) = take(payload, path_len, path)?;
@@ -135,8 +171,12 @@ fn decode_recovery_payload(
     Ok(HdfsRecoveryToken {
         binding: array(binding, path)?,
         expected_size: u64::from_le_bytes(array(expected, path)?),
-        base_path: StoragePath::new(String::from_utf8_lossy(base_path).as_ref())
-            .map_err(|_| failure(path, Operation::Prepare, FailureClass::Corruption))?,
+        nonce: array(nonce, path)?,
+        base_path: StoragePath::new(
+            std::str::from_utf8(base_path)
+                .map_err(|_| failure(path, Operation::Prepare, FailureClass::Corruption))?,
+        )
+        .map_err(|_| failure(path, Operation::Prepare, FailureClass::Corruption))?,
         final_hash: array(final_hash, path)?,
     })
 }
@@ -192,21 +232,19 @@ impl StagedDestination for HdfsStagedDestination {
                 FailureClass::Unsupported,
             )
         })?;
-        let nonce = uuid::Uuid::new_v4();
-        let part = partial_path(
-            &request.final_destination,
-            request.recovery_binding,
-            nonce.as_bytes(),
-        )?;
+        let nonce = *uuid::Uuid::new_v4().as_bytes();
+        let part = partial_path(&request.final_destination, request.recovery_binding, &nonce)?;
         self.protocol.create_empty_stage_exclusive(&part).await?;
         Ok(PreparedStage::new(
             self.identity.clone(),
             request.final_destination,
             HdfsStageToken {
                 expected_size: expected,
+                nonce,
+                base_path: part.clone(),
                 partial_path: part,
             }
-            .encode(),
+            .encode()?,
             request.recovery_binding,
             0,
             None,
@@ -317,7 +355,8 @@ fn encode_recovery(
     HdfsRecoveryToken {
         binding: stage.recovery_binding,
         expected_size: token.expected_size,
-        base_path: token.partial_path.clone(),
+        nonce: token.nonce,
+        base_path: token.base_path.clone(),
         final_hash: *blake3::hash(stage.final_destination.path().as_str().as_bytes()).as_bytes(),
     }
     .encode()
@@ -330,18 +369,29 @@ async fn recover(
     let token = HdfsRecoveryToken::decode(&request.identity, request.final_destination.path())?;
     validate_recovery(&token, &request)?;
     let claimed = claimed_path(&token.base_path, request.claim_token)?;
-    let size = match observe_prefix(adapter, &claimed, token.expected_size).await? {
-        Some(size) => size,
-        None => claim_base(adapter, &token, &claimed).await?,
+    let claimed_size = observe_prefix(adapter, &claimed, token.expected_size).await?;
+    let base_size = observe_prefix(adapter, &token.base_path, token.expected_size).await?;
+    let size = match (base_size, claimed_size) {
+        (None, Some(size)) => size,
+        (Some(_), None) => claim_base(adapter, &token, &claimed).await?,
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(failure(
+                &claimed,
+                Operation::Prepare,
+                FailureClass::Conflict,
+            ));
+        }
     };
     Ok(PreparedStage::new(
         adapter.identity.clone(),
         request.final_destination,
         HdfsStageToken {
             expected_size: token.expected_size,
+            nonce: token.nonce,
+            base_path: token.base_path,
             partial_path: claimed,
         }
-        .encode(),
+        .encode()?,
         request.recovery_binding,
         size,
         None,
@@ -353,9 +403,15 @@ fn validate_recovery(
     request: &RecoverRequest,
 ) -> Result<(), StorageRoleFailure> {
     let final_hash = blake3::hash(request.final_destination.path().as_str().as_bytes());
+    let expected_base = partial_path(
+        &request.final_destination,
+        request.recovery_binding,
+        &token.nonce,
+    )?;
     if token.binding != request.recovery_binding
         || token.final_hash != *final_hash.as_bytes()
         || request.source.size != Some(token.expected_size)
+        || token.base_path != expected_base
     {
         return Err(failure(
             request.final_destination.path(),
@@ -371,17 +427,21 @@ async fn claim_base(
     token: &HdfsRecoveryToken,
     claimed: &StoragePath,
 ) -> Result<u64, StorageRoleFailure> {
-    let Some(_) = observe_prefix(adapter, &token.base_path, token.expected_size).await? else {
-        return Err(failure(claimed, Operation::Prepare, FailureClass::Conflict));
-    };
     if let Err(rename_error) = adapter
         .protocol
-        .rename(&token.base_path, claimed, false)
+        .claim_stage(&token.base_path, claimed)
         .await
     {
-        return match observe_prefix(adapter, claimed, token.expected_size).await? {
-            Some(size) => Ok(size),
-            None => Err(rename_error),
+        let base = observe_prefix(adapter, &token.base_path, token.expected_size).await?;
+        let claimed = observe_prefix(adapter, claimed, token.expected_size).await?;
+        return match (base, claimed) {
+            (None, Some(size)) => Ok(size),
+            (Some(_), Some(_)) => Err(failure(
+                &token.base_path,
+                Operation::Prepare,
+                FailureClass::Conflict,
+            )),
+            _ => Err(rename_error),
         };
     }
     observe_prefix(adapter, claimed, token.expected_size)
@@ -601,6 +661,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::model::{BackendKind, IdentityStrength, SourceIdentity};
 
     #[test]
     fn deterministic_partial_is_same_directory_and_binding_scoped()
@@ -610,6 +671,33 @@ mod tests {
         assert_eq!(first, partial_path(&destination, [1; 32], b"attempt-1")?);
         assert_ne!(first, partial_path(&destination, [1; 32], b"attempt-2")?);
         assert_eq!(Path::new(first.as_str()).parent(), Some(Path::new("dir")));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_a_validly_encoded_foreign_base_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let backend = BackendIdentity::new(BackendKind::Hdfs, "test")?;
+        let request = RecoverRequest {
+            identity: RecoveryIdentity::from_bytes(Bytes::from_static(b"unused"))?,
+            final_destination: FinalDestination::new(StoragePath::new("dir/final.bin")?),
+            source: crate::storage::SourceDescriptor::new(
+                StoragePath::new("source.bin")?,
+                EntryKind::File,
+                Some(7),
+                SourceIdentity::new(backend, IdentityStrength::PathScoped, b"source")?,
+            ),
+            recovery_binding: [4; 32],
+            claim_token: [5; 32],
+        };
+        let token = HdfsRecoveryToken {
+            binding: request.recovery_binding,
+            expected_size: 7,
+            nonce: [6; 16],
+            base_path: StoragePath::new("source.bin")?,
+            final_hash: *blake3::hash(b"dir/final.bin").as_bytes(),
+        };
+        assert!(validate_recovery(&token, &request).is_err());
         Ok(())
     }
 }

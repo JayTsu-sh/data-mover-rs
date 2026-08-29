@@ -40,6 +40,11 @@ pub(crate) trait HdfsProtocol: Send + Sync {
         to: &StoragePath,
         overwrite: bool,
     ) -> Result<(), StorageRoleFailure>;
+    async fn claim_stage(
+        &self,
+        from: &StoragePath,
+        claimed: &StoragePath,
+    ) -> Result<(), StorageRoleFailure>;
     async fn create_empty_stage_exclusive(
         &self,
         path: &StoragePath,

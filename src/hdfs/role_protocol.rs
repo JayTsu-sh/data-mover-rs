@@ -98,6 +98,16 @@ impl RoleHdfsProtocol for HDFSStorage {
             .map_err(|error| hdfs_role_error(from, RoleOperation::Publish, error))
     }
 
+    async fn claim_stage(
+        &self,
+        from: &RoleStoragePath,
+        claimed: &RoleStoragePath,
+    ) -> Result<(), RoleFailure> {
+        self.rename_with_overwrite(Path::new(from.as_str()), Path::new(claimed.as_str()), false)
+            .await
+            .map_err(|error| hdfs_role_error(from, RoleOperation::Prepare, error))
+    }
+
     async fn create_empty_stage_exclusive(
         &self,
         path: &RoleStoragePath,
@@ -155,9 +165,10 @@ impl RoleHdfsProtocol for HDFSStorage {
             expected_size,
         );
         let (feed_result, append_result) = tokio::join!(feed, append);
-        feed_result?;
-        append_result
-            .map_err(|error| hdfs_role_error(path, RoleOperation::Write, error))
+        resolve_stage_append(
+            feed_result,
+            append_result.map_err(|error| hdfs_role_error(path, RoleOperation::Write, error)),
+        )
     }
 
     async fn set_mapped_ownership(
@@ -213,20 +224,84 @@ async fn feed_stage_chunks(
     start_offset: u64,
     mut input: RoleByteStream,
     sender: role_mpsc::Sender<RoleDataChunk>,
-) -> Result<(), RoleFailure> {
+) -> Result<StageFeedOutcome, RoleFailure> {
     let mut offset = start_offset;
     while let Some(value) = input.next().await {
         let data = value?;
         let length = checked_stage_chunk_length(&path, &data)?;
-        sender
-            .send(RoleDataChunk { offset, data })
-            .await
-            .map_err(|_| cancelled_stage_feed(&path))?;
+        if sender.send(RoleDataChunk { offset, data }).await.is_err() {
+            return Ok(StageFeedOutcome::ReceiverClosed);
+        }
         offset = offset
             .checked_add(length)
             .ok_or_else(|| invalid_stage_chunk(&path))?;
     }
-    Ok(())
+    Ok(StageFeedOutcome::Complete)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StageFeedOutcome {
+    Complete,
+    ReceiverClosed,
+}
+
+fn resolve_stage_append(
+    feed: Result<StageFeedOutcome, RoleFailure>,
+    append: Result<u64, RoleFailure>,
+) -> Result<u64, RoleFailure> {
+    match feed {
+        Err(input_error) => Err(input_error),
+        Ok(StageFeedOutcome::Complete | StageFeedOutcome::ReceiverClosed) => append,
+    }
+}
+
+#[cfg(test)]
+mod stage_bridge_tests {
+    use super::*;
+
+    fn path() -> RoleStoragePath {
+        RoleStoragePath::new("partial").unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[test]
+    fn receiver_closure_preserves_real_destination_failure() {
+        let path = path();
+        for class in [RoleFailureClass::Conflict, RoleFailureClass::Connectivity] {
+            let destination = hdfs_role_entry(
+                &path,
+                RoleOperation::Write,
+                class,
+                RoleTransience::Transient,
+            );
+            let result =
+                resolve_stage_append(Ok(StageFeedOutcome::ReceiverClosed), Err(destination));
+            assert!(matches!(result, Err(RoleFailure::Entry(error))
+                if error.operation() == RoleOperation::Write && error.class() == class));
+        }
+    }
+
+    #[test]
+    fn real_input_cancellation_wins_over_destination_failure() {
+        let path = path();
+        let input = hdfs_role_entry(
+            &path,
+            RoleOperation::Read,
+            RoleFailureClass::Cancelled,
+            RoleTransience::Transient,
+        );
+        let destination = hdfs_role_entry(
+            &path,
+            RoleOperation::Write,
+            RoleFailureClass::Connectivity,
+            RoleTransience::Transient,
+        );
+
+        let result = resolve_stage_append(Err(input), Err(destination));
+
+        assert!(matches!(result, Err(RoleFailure::Entry(error))
+            if error.operation() == RoleOperation::Read
+                && error.class() == RoleFailureClass::Cancelled));
+    }
 }
 
 fn checked_stage_chunk_length(
@@ -245,15 +320,6 @@ fn invalid_stage_chunk(path: &RoleStoragePath) -> RoleFailure {
         RoleOperation::Write,
         RoleFailureClass::InvalidInput,
         RoleTransience::Permanent,
-    )
-}
-
-fn cancelled_stage_feed(path: &RoleStoragePath) -> RoleFailure {
-    hdfs_role_entry(
-        path,
-        RoleOperation::Write,
-        RoleFailureClass::Cancelled,
-        RoleTransience::Transient,
     )
 }
 
