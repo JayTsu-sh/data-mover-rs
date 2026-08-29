@@ -163,7 +163,7 @@ trait StagedDestination: Send + Sync {
     async fn write(&self, stage: &PreparedStage, input: ByteStream) -> Result<WriteEvidence, DestinationFailure>;
     async fn observe_checkpoint(&self, stage: &PreparedStage) -> Result<CheckpointObservation, DestinationFailure>;
     async fn verify(&self, stage: &PreparedStage, request: VerifyRequest) -> Result<VerificationEvidence, DestinationFailure>;
-    async fn publish(&self, stage: PreparedStage, final_destination: FinalDestination) -> Result<PublicationEvidence, DestinationFailure>;
+    async fn publish(&self, stage: &PreparedStage, request: PublishRequest) -> Result<PublicationEvidence, DestinationFailure>;
     async fn discard(&self, stage: PreparedStage) -> Result<(), DestinationFailure>;
 }
 ```
@@ -362,6 +362,8 @@ the described source size; the staged file remains unpublished for verification 
 Copy-time generic transfer computes source BLAKE3 during the initial complete sequential
 read, then sequentially rereads the complete durable staged destination and compares its
 BLAKE3 before publication. Recovery includes reused content in the complete verification.
+The Local implementation performs both passes through bounded buffers, checks cancellation
+between staged reads, and returns a recoverable unpublished stage on verification failure.
 Backend-native success is evidence only when the adapter declares `NativeStorageGuarantee`;
 size and ETag alone are insufficient. Standalone content validation compares two byte
 streams and stops on the first mismatch or read failure, cancelling the other reader.
@@ -374,6 +376,15 @@ incapable destinations fail preflight and outcomes report the actual guarantee. 
 destination policy is `Overwrite` (default), `VerifyOrSkip`, or `FailIfExists`.
 `VerifyOrSkip` requires content-equivalence evidence, not path/time/size. Existing final
 content remains unchanged until successful publication.
+Local `Overwrite` publishes with a capability-confined atomic rename, while `FailIfExists` uses
+an atomic create/link boundary. `VerifyOrSkip` hard-links the observed final into staging, hashes
+that stable inode with cancellation checks, then atomically rebinds the verified inode to the
+final path; a concurrent path replacement therefore cannot invalidate the equivalence evidence.
+Publication failures explicitly distinguish pre-commit recoverable staged state from failures
+after the final path changed. Post-commit cleanup or durability failures never claim that the
+stage is recoverable or that `FinalDestination` is unchanged; they retain a separate idempotent
+cleanup handle for staged artifacts. Temporary equivalence guards are removed on every
+pre-commit exit and by discard/recovery cleanup after a process interruption.
 
 ### Cancellation and failure
 

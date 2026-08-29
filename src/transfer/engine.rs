@@ -14,8 +14,8 @@ use crate::runtime::inflight::{
 };
 use crate::storage::{
     CheckpointObservation, FinalDestination, PreflightPolicy, PrepareRequest, PreparedStage,
-    ReadRequest, ReadSource, SourceDescriptor, StagedDestination, StorageRoleFailure,
-    WriteEvidence,
+    PublicationDisposition, PublicationEvidence, PublishRequest, ReadRequest, ReadSource,
+    SourceDescriptor, StagedDestination, StorageRoleFailure, VerifyRequest, WriteEvidence,
 };
 
 /// Lifecycle stage at which one transfer attempt stopped.
@@ -26,6 +26,8 @@ pub enum TransferPhase {
     Prepare,
     Transfer,
     Checkpoint,
+    Verify,
+    Publish,
 }
 
 /// Side responsible for a transfer failure.
@@ -57,6 +59,8 @@ pub struct TransferFailure {
     message: &'static str,
     role: Option<Box<StorageRoleFailure>>,
     failed_stage: Option<Box<FailedStage>>,
+    committed_cleanup: Option<Box<FailedStage>>,
+    final_destination_changed: bool,
 }
 
 struct FailedStage {
@@ -78,6 +82,8 @@ impl TransferFailure {
             message: "storage role failed",
             role: Some(Box::new(role)),
             failed_stage: None,
+            committed_cleanup: None,
+            final_destination_changed: false,
         }
     }
 
@@ -88,6 +94,8 @@ impl TransferFailure {
             message,
             role: None,
             failed_stage: None,
+            committed_cleanup: None,
+            final_destination_changed: false,
         }
     }
 
@@ -98,11 +106,22 @@ impl TransferFailure {
             message,
             role: None,
             failed_stage: None,
+            committed_cleanup: None,
+            final_destination_changed: false,
         }
     }
 
     fn with_stage(mut self, destination: Arc<dyn StagedDestination>, stage: PreparedStage) -> Self {
         self.failed_stage = Some(Box::new(FailedStage { destination, stage }));
+        self
+    }
+
+    fn with_committed_cleanup(
+        mut self,
+        destination: Arc<dyn StagedDestination>,
+        stage: PreparedStage,
+    ) -> Self {
+        self.committed_cleanup = Some(Box::new(FailedStage { destination, stage }));
         self
     }
 
@@ -116,16 +135,48 @@ impl TransferFailure {
         self.side
     }
 
-    pub(crate) const fn has_recoverable_stage(&self) -> bool {
+    /// Whether the failed attempt retains unpublished staged state that may be discarded.
+    #[must_use]
+    pub const fn has_recoverable_stage(&self) -> bool {
         self.failed_stage.is_some()
     }
 
-    pub(crate) async fn discard_stage(mut self) -> Result<(), StorageRoleFailure> {
+    /// Whether publication committed but staged artifacts still require cleanup.
+    #[must_use]
+    pub const fn has_pending_cleanup(&self) -> bool {
+        self.committed_cleanup.is_some()
+    }
+
+    /// Whether publication crossed its atomic commit point before failing.
+    #[must_use]
+    pub const fn final_destination_changed(&self) -> bool {
+        self.final_destination_changed
+    }
+
+    /// Consumes this failure and discards its recoverable unpublished stage.
+    ///
+    /// # Errors
+    /// Returns a storage-role failure if no recoverable stage exists or cleanup fails.
+    pub async fn discard_stage(mut self) -> Result<(), StorageRoleFailure> {
         let failed = self
             .failed_stage
             .take()
             .ok_or_else(|| source_failure(&StoragePath::root(), FailureClass::InvalidInput))?;
         failed.destination.discard(failed.stage).await
+    }
+
+    /// Consumes a post-commit failure and idempotently removes staged artifacts only.
+    ///
+    /// This never removes or rolls back the published final destination.
+    ///
+    /// # Errors
+    /// Returns a storage-role failure if no committed cleanup is pending or cleanup fails.
+    pub async fn cleanup_published_stage(mut self) -> Result<(), StorageRoleFailure> {
+        let pending = self
+            .committed_cleanup
+            .take()
+            .ok_or_else(|| source_failure(&StoragePath::root(), FailureClass::InvalidInput))?;
+        pending.destination.discard(pending.stage).await
     }
 }
 
@@ -156,6 +207,113 @@ pub(crate) struct Transferred {
     #[allow(dead_code)]
     source: SourceDescriptor,
     data_path: TransferDataPath,
+    source_blake3: [u8; 32],
+}
+
+/// Successful final outcome of one transfer attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferOutcome {
+    pub final_destination: StoragePath,
+    pub disposition: PublicationDisposition,
+    pub transferred_bytes: u64,
+    pub blake3: [u8; 32],
+}
+
+/// Transfers, verifies, and publishes one request.
+///
+/// # Errors
+/// Returns a phase- and side-attributed failure while retaining an owned staged state whenever
+/// publication has not completed.
+pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, TransferFailure> {
+    let cancel = request.cancel.clone();
+    let policy = request.existing_destination;
+    let transferred = run_until_transferred(request).await?;
+    if cancel.is_cancelled() {
+        return Err(TransferFailure::orchestration(
+            TransferPhase::Verify,
+            "transfer was cancelled before verification",
+        )
+        .with_stage(Arc::clone(&transferred.destination), transferred.stage));
+    }
+    let verification_result = transferred
+        .destination
+        .verify(
+            &transferred.stage,
+            VerifyRequest {
+                expected_size: transferred.checkpoint.durable_prefix,
+                expected_blake3: transferred.source_blake3,
+                cancel: cancel.clone(),
+            },
+        )
+        .await;
+    let verification = match verification_result {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return Err(TransferFailure::role(
+                TransferPhase::Verify,
+                TransferSide::Destination,
+                error,
+            )
+            .with_stage(Arc::clone(&transferred.destination), transferred.stage));
+        }
+    };
+    if verification.verified_bytes != transferred.checkpoint.durable_prefix
+        || verification.blake3 != transferred.source_blake3
+    {
+        return Err(TransferFailure::orchestration(
+            TransferPhase::Verify,
+            "destination verification evidence differs from source evidence",
+        )
+        .with_stage(Arc::clone(&transferred.destination), transferred.stage));
+    }
+    if cancel.is_cancelled() {
+        return Err(TransferFailure::orchestration(
+            TransferPhase::Verify,
+            "transfer was cancelled before publication",
+        )
+        .with_stage(Arc::clone(&transferred.destination), transferred.stage));
+    }
+    let expected_size = verification.verified_bytes;
+    let blake3 = verification.blake3;
+    let publication = transferred
+        .destination
+        .publish(
+            &transferred.stage,
+            PublishRequest {
+                policy,
+                expected_size,
+                expected_blake3: blake3,
+                cancel,
+            },
+        )
+        .await;
+    let PublicationEvidence {
+        final_destination,
+        disposition,
+    } = match publication {
+        Ok(evidence) => evidence,
+        Err(publication) => {
+            let mut failure = TransferFailure::role(
+                TransferPhase::Publish,
+                TransferSide::Destination,
+                publication.error,
+            );
+            failure.final_destination_changed = publication.final_destination_changed;
+            if publication.final_destination_changed {
+                return Err(failure.with_committed_cleanup(
+                    Arc::clone(&transferred.destination),
+                    transferred.stage,
+                ));
+            }
+            return Err(failure.with_stage(Arc::clone(&transferred.destination), transferred.stage));
+        }
+    };
+    Ok(TransferOutcome {
+        final_destination,
+        disposition,
+        transferred_bytes: expected_size,
+        blake3,
+    })
 }
 
 impl Transferred {
@@ -218,6 +376,7 @@ pub(crate) async fn run_until_transferred(
             checkpoint: evidence.checkpoint,
             source: descriptor,
             data_path: plan.data_path,
+            source_blake3: evidence.source_blake3,
         }),
         Err(error) => Err(error.with_stage(destination, stage)),
     }
@@ -290,7 +449,8 @@ async fn transfer_stage(
         size: plan.source_size,
     }));
     let stream = ordered_stream(ordered, source_failure, descriptor.path.clone());
-    let write = settle_transfer(destination.write(stage, stream).await, producer).await?;
+    let (write, source_blake3) =
+        settle_transfer(destination.write(stage, stream).await, producer).await?;
     let checkpoint = destination
         .observe_checkpoint(stage)
         .await
@@ -303,18 +463,23 @@ async fn transfer_stage(
             "durable bytes differ from source size",
         ));
     }
-    Ok(TransferEvidence { write, checkpoint })
+    Ok(TransferEvidence {
+        write,
+        checkpoint,
+        source_blake3,
+    })
 }
 
 struct TransferEvidence {
     write: WriteEvidence,
     checkpoint: CheckpointObservation,
+    source_blake3: [u8; 32],
 }
 
 async fn settle_transfer(
     write: Result<WriteEvidence, StorageRoleFailure>,
-    producer: tokio::task::JoinHandle<Result<(), TransferFailure>>,
-) -> Result<WriteEvidence, TransferFailure> {
+    producer: tokio::task::JoinHandle<Result<[u8; 32], TransferFailure>>,
+) -> Result<(WriteEvidence, [u8; 32]), TransferFailure> {
     let write = match write {
         Ok(write) => write,
         Err(error) => {
@@ -330,8 +495,8 @@ async fn settle_transfer(
     let producer_result = producer.await.map_err(|_| {
         TransferFailure::orchestration(TransferPhase::Transfer, "source producer stopped")
     })?;
-    producer_result?;
-    Ok(write)
+    let digest = producer_result?;
+    Ok((write, digest))
 }
 
 fn inflight_channel(
@@ -358,7 +523,8 @@ struct ProducerRequest {
     size: u64,
 }
 
-async fn produce(request: ProducerRequest) -> Result<(), TransferFailure> {
+async fn produce(request: ProducerRequest) -> Result<[u8; 32], TransferFailure> {
+    let mut hasher = blake3::Hasher::new();
     let ranges = SequentialRanges::new(0, request.size, request.chunk_bytes).map_err(|_| {
         TransferFailure::orchestration(TransferPhase::Preflight, "invalid source range")
     })?;
@@ -377,10 +543,13 @@ async fn produce(request: ProducerRequest) -> Result<(), TransferFailure> {
         )
         .await;
         match bytes {
-            Ok(bytes) => admission
-                .complete(bytes)
-                .await
-                .map_err(|error| inflight_transfer_failure(&error, &request.path))?,
+            Ok(bytes) => {
+                hasher.update(&bytes);
+                admission
+                    .complete(bytes)
+                    .await
+                    .map_err(|error| inflight_transfer_failure(&error, &request.path))?;
+            }
             Err(error) => {
                 *request
                     .failure
@@ -395,7 +564,7 @@ async fn produce(request: ProducerRequest) -> Result<(), TransferFailure> {
             }
         }
     }
-    Ok(())
+    Ok(*hasher.finalize().as_bytes())
 }
 
 async fn read_exact_range(

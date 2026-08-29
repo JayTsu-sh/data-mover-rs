@@ -11,8 +11,9 @@ pub use capability::{
 };
 pub use handle::Storage;
 pub use roles::{
-    ByteStream, CheckpointObservation, FinalDestination, Metadata, Namespace, NamespaceRequest,
-    NamespaceResult, PrepareRequest, PreparedStage, PublicationEvidence, ReadRequest, ReadSource,
-    SourceDescriptor, StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest,
-    WriteEvidence,
+    ByteStream, CheckpointObservation, ExistingDestinationPolicy, FinalDestination, Metadata,
+    Namespace, NamespaceRequest, NamespaceResult, PrepareRequest, PreparedStage,
+    PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest, ReadRequest,
+    ReadSource, SourceDescriptor, StagedDestination, StorageRoleFailure, VerificationEvidence,
+    VerifyRequest, WriteEvidence,
 };

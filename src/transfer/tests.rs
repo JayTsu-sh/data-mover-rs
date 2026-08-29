@@ -2,12 +2,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::engine::{TransferDataPath, TransferPhase, TransferSide, run_until_transferred};
-use super::{InflightLimits, TransferIdentity, TransferRequest};
+use super::{
+    ExistingDestinationPolicy, InflightLimits, TransferIdentity, TransferRequest, transfer,
+};
 use crate::model::StoragePath;
+use crate::storage::PublicationDisposition;
 use crate::storage::Storage;
 use crate::storage::backends::local::{
-    source::LocalReadSource, test_destination_storage, test_source_storage,
-    test_unsupported_storage,
+    source::LocalReadSource, test_destination_storage, test_destination_storage_with_role,
+    test_source_storage, test_unsupported_storage,
 };
 
 #[test]
@@ -18,6 +21,191 @@ fn transfer_inputs_reject_ambiguous_identity_and_unbounded_limits() {
     assert!(InflightLimits::new(2, 0, 1).is_err());
     assert!(InflightLimits::new(2, 64 * 1024, 0).is_err());
     assert!(InflightLimits::new(2, 64 * 1024, 1).is_ok());
+}
+
+#[tokio::test]
+async fn local_transfer_verifies_blake3_then_atomically_overwrites_final()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = TestRoot::new("publish-source")?;
+    let destination_root = TestRoot::new("publish-destination")?;
+    let payload = vec![0x37; 192 * 1024 + 11];
+    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(destination_root.path().join("final.bin"), b"old-final")?;
+
+    let outcome = transfer(transfer_request(
+        local_source(source_root.path())?,
+        local_destination(destination_root.path())?,
+        tokio_util::sync::CancellationToken::new(),
+    )?)
+    .await?;
+
+    assert_eq!(outcome.disposition, PublicationDisposition::Published);
+    assert_eq!(outcome.transferred_bytes, payload.len() as u64);
+    assert_eq!(outcome.blake3, *blake3::hash(&payload).as_bytes());
+    assert_eq!(
+        std::fs::read(destination_root.path().join("final.bin"))?,
+        payload
+    );
+    assert_eq!(staging_entry_count(destination_root.path())?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn verification_mismatch_fast_fails_without_changing_final()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = TestRoot::new("verify-failure-source")?;
+    let destination_root = TestRoot::new("verify-failure-destination")?;
+    std::fs::write(source_root.path().join("source.bin"), vec![0x22; 64 * 1024])?;
+    std::fs::write(destination_root.path().join("final.bin"), b"old-final")?;
+    let (destination, role) =
+        test_destination_storage_with_role(destination_root.path(), "verify-failure-destination")?;
+    role.corrupt_before_verify();
+
+    let result = transfer(transfer_request(
+        local_source(source_root.path())?,
+        destination,
+        tokio_util::sync::CancellationToken::new(),
+    )?)
+    .await;
+    let Err(error) = result else {
+        return Err("corrupt staged content unexpectedly published".into());
+    };
+
+    assert_eq!(error.phase(), TransferPhase::Verify);
+    assert!(error.has_recoverable_stage());
+    assert_eq!(
+        std::fs::read(destination_root.path().join("final.bin"))?,
+        b"old-final"
+    );
+    error.discard_stage().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn existing_destination_policies_are_enforced_at_publication()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = TestRoot::new("policy-source")?;
+    std::fs::write(source_root.path().join("source.bin"), b"same-content")?;
+
+    let skip_root = TestRoot::new("policy-skip")?;
+    std::fs::write(skip_root.path().join("final.bin"), b"same-content")?;
+    std::fs::write(skip_root.path().join("replacement.bin"), b"raced-content")?;
+    let (skip_destination, skip_role) =
+        test_destination_storage_with_role(skip_root.path(), "policy-skip-destination")?;
+    skip_role.replace_final_during_skip();
+    let skip = transfer(
+        transfer_request(
+            local_source(source_root.path())?,
+            skip_destination,
+            tokio_util::sync::CancellationToken::new(),
+        )?
+        .with_existing_destination_policy(ExistingDestinationPolicy::VerifyOrSkip),
+    )
+    .await?;
+    assert_eq!(skip.disposition, PublicationDisposition::ExistingEquivalent);
+    assert_eq!(
+        std::fs::read(skip_root.path().join("final.bin"))?,
+        b"same-content"
+    );
+    assert_eq!(staging_entry_count(skip_root.path())?, 0);
+
+    let conflict_root = TestRoot::new("policy-conflict")?;
+    std::fs::write(conflict_root.path().join("final.bin"), b"keep")?;
+    let result = transfer(
+        transfer_request(
+            local_source(source_root.path())?,
+            local_destination(conflict_root.path())?,
+            tokio_util::sync::CancellationToken::new(),
+        )?
+        .with_existing_destination_policy(ExistingDestinationPolicy::FailIfExists),
+    )
+    .await;
+    let Err(error) = result else {
+        return Err("FailIfExists unexpectedly replaced an existing final".into());
+    };
+    assert_eq!(error.phase(), TransferPhase::Publish);
+    assert!(error.has_recoverable_stage());
+    assert_eq!(
+        std::fs::read(conflict_root.path().join("final.bin"))?,
+        b"keep"
+    );
+    error.discard_stage().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failure_after_atomic_publication_reports_changed_final_not_recoverable_stage()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = TestRoot::new("post-commit-source")?;
+    let destination_root = TestRoot::new("post-commit-destination")?;
+    std::fs::write(source_root.path().join("source.bin"), b"new-final")?;
+    std::fs::write(destination_root.path().join("final.bin"), b"old-final")?;
+    let (destination, role) =
+        test_destination_storage_with_role(destination_root.path(), "post-commit-destination")?;
+    role.fail_after_publication_commit();
+
+    let result = transfer(transfer_request(
+        local_source(source_root.path())?,
+        destination,
+        tokio_util::sync::CancellationToken::new(),
+    )?)
+    .await;
+    let Err(error) = result else {
+        return Err("injected post-commit failure unexpectedly succeeded".into());
+    };
+    assert_eq!(error.phase(), TransferPhase::Publish);
+    assert!(error.final_destination_changed());
+    assert!(!error.has_recoverable_stage());
+    assert!(error.has_pending_cleanup());
+    assert_eq!(
+        std::fs::read(destination_root.path().join("final.bin"))?,
+        b"new-final"
+    );
+    error.cleanup_published_stage().await?;
+    assert_eq!(staging_entry_count(destination_root.path())?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_during_existing_final_verification_preserves_stage_and_final()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = TestRoot::new("skip-cancel-source")?;
+    let destination_root = TestRoot::new("skip-cancel-destination")?;
+    let payload = vec![0x41; 8 * 1024 * 1024];
+    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    std::fs::write(destination_root.path().join("final.bin"), &payload)?;
+    let (destination, role) =
+        test_destination_storage_with_role(destination_root.path(), "skip-cancel-destination")?;
+    role.slow_existing_verify();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let request = transfer_request(
+        local_source(source_root.path())?,
+        destination,
+        cancel.clone(),
+    )?
+    .with_existing_destination_policy(ExistingDestinationPolicy::VerifyOrSkip);
+    let task = tokio::spawn(transfer(request));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !role.existing_verify_started() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    cancel.cancel();
+
+    let result = task.await?;
+    let Err(error) = result else {
+        return Err("cancelled existing-final verification unexpectedly succeeded".into());
+    };
+    assert_eq!(error.phase(), TransferPhase::Publish);
+    assert!(!error.final_destination_changed());
+    assert!(error.has_recoverable_stage());
+    assert_eq!(
+        std::fs::read(destination_root.path().join("final.bin"))?,
+        payload
+    );
+    error.discard_stage().await?;
+    Ok(())
 }
 
 #[tokio::test]

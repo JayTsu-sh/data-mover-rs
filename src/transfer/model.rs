@@ -3,7 +3,7 @@ use std::fmt;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::StoragePath;
-use crate::storage::Storage;
+use crate::storage::{ExistingDestinationPolicy, Storage};
 
 const MAX_IDENTITY_BYTES: usize = 1024;
 
@@ -89,6 +89,7 @@ pub struct TransferRequest {
     pub(crate) final_path: StoragePath,
     pub(crate) inflight: InflightLimits,
     pub(crate) cancel: CancellationToken,
+    pub(crate) existing_destination: ExistingDestinationPolicy,
 }
 
 impl TransferRequest {
@@ -111,6 +112,14 @@ impl TransferRequest {
             final_path,
             inflight,
             cancel,
+            existing_destination: ExistingDestinationPolicy::default(),
         }
+    }
+
+    /// Selects how publication handles an existing destination.
+    #[must_use]
+    pub fn with_existing_destination_policy(mut self, policy: ExistingDestinationPolicy) -> Self {
+        self.existing_destination = policy;
+        self
     }
 }

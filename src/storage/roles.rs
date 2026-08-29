@@ -149,21 +149,60 @@ pub struct CheckpointObservation {
 }
 
 /// Requested staged-content verification.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct VerifyRequest {
     pub expected_size: u64,
+    pub expected_blake3: [u8; 32],
+    pub cancel: CancellationToken,
+}
+
+/// Policy for a destination path that already exists at publication time.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExistingDestinationPolicy {
+    /// Atomically replace an existing destination.
+    #[default]
+    Overwrite,
+    /// Keep equivalent existing content, otherwise fail.
+    VerifyOrSkip,
+    /// Fail without changing an existing destination.
+    FailIfExists,
 }
 
 /// Evidence that staged content passed verification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VerificationEvidence {
     pub verified_bytes: u64,
+    pub blake3: [u8; 32],
+}
+
+/// Inputs required to publish verified staged content.
+#[derive(Clone, Debug)]
+pub struct PublishRequest {
+    pub policy: ExistingDestinationPolicy,
+    pub expected_size: u64,
+    pub expected_blake3: [u8; 32],
+    pub cancel: CancellationToken,
+}
+
+/// Publication failure with an explicit atomic commit boundary.
+#[derive(Clone, Debug)]
+pub struct PublicationFailure {
+    pub error: StorageRoleFailure,
+    pub final_destination_changed: bool,
+}
+
+/// Result of publication when equivalent existing content may be retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationDisposition {
+    Published,
+    ExistingEquivalent,
 }
 
 /// Evidence that verified staged state was published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicationEvidence {
     pub final_destination: StoragePath,
+    pub disposition: PublicationDisposition,
 }
 
 /// Destination role owning prepare, write, checkpoint, verify, publish, and discard.
@@ -186,8 +225,9 @@ pub trait StagedDestination: Send + Sync {
     ) -> Result<VerificationEvidence, StorageRoleFailure>;
     async fn publish(
         &self,
-        stage: PreparedStage,
-    ) -> Result<PublicationEvidence, StorageRoleFailure>;
+        stage: &PreparedStage,
+        request: PublishRequest,
+    ) -> Result<PublicationEvidence, PublicationFailure>;
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure>;
 }
 

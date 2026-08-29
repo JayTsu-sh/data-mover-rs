@@ -44,20 +44,35 @@ pub(crate) fn test_destination_storage(
     root: &std::path::Path,
     name: &str,
 ) -> Result<crate::storage::Storage, Box<dyn std::error::Error>> {
+    test_destination_storage_with_role(root, name).map(|(storage, _)| storage)
+}
+
+#[cfg(test)]
+pub(crate) fn test_destination_storage_with_role(
+    root: &std::path::Path,
+    name: &str,
+) -> Result<
+    (
+        crate::storage::Storage,
+        std::sync::Arc<staged::LocalStagedDestination>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let identity = test_identity(name);
     let destination = std::sync::Arc::new(staged::LocalStagedDestination::new(
         root,
         identity.clone(),
         2,
     )?);
-    Ok(crate::storage::Storage::connected(
+    let storage = crate::storage::Storage::connected(
         identity,
         test_capabilities(false, true)?,
         None,
-        Some(destination),
+        Some(destination.clone()),
         None,
         None,
-    )?)
+    )?;
+    Ok((storage, destination))
 }
 
 #[cfg(test)]
