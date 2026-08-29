@@ -73,6 +73,11 @@ separate payload larger than 12 MiB is copied from NFSv4.1 to NFSv4.1 so normal
 copy exercises multiple negotiated read and write requests, including the
 session-limited effective `wsize`.
 
+`run-nfs3-contract.sh <run-id>` is the dedicated `DM-NFS3-CONTRACT` gate. It bypasses
+the legacy storage enum and validates the public NFS role handle, protocol-neutral traversal,
+typed unsupported NFSv3 ACL/xattr observations, streaming overwrite publication, and recovery
+of a remotely re-observed durable prefix after a fresh mount.
+
 The nightly workflow runs this matrix three times: with protocol defaults,
 strictly serial read/write pipelines, and higher read/write concurrency. Release
 validation runs the defaults and higher-concurrency profiles. The integrity and

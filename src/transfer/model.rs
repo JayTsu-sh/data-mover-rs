@@ -113,6 +113,7 @@ pub struct TransferRequest {
     pub(crate) existing_destination: ExistingDestinationPolicy,
     pub(crate) recovery_policy: RecoveryPolicy,
     pub(crate) recovery_identity: Option<RecoveryIdentity>,
+    pub(crate) recovery_claim: [u8; 32],
     pub(crate) source_qos: Option<SourceQosGroup>,
     pub(crate) payload_shaping: PayloadShapingPolicy,
 }
@@ -140,6 +141,7 @@ impl TransferRequest {
             existing_destination: ExistingDestinationPolicy::default(),
             recovery_policy: RecoveryPolicy::default(),
             recovery_identity: None,
+            recovery_claim: *blake3::hash(uuid::Uuid::new_v4().as_bytes()).as_bytes(),
             source_qos: None,
             payload_shaping: PayloadShapingPolicy::default(),
         }
@@ -161,6 +163,13 @@ impl TransferRequest {
     ) -> Self {
         self.recovery_policy = policy;
         self.recovery_identity = identity;
+        self
+    }
+
+    /// Supplies the caller-persisted identity for an idempotent recovery attempt.
+    #[must_use]
+    pub const fn with_recovery_claim(mut self, claim: [u8; 32]) -> Self {
+        self.recovery_claim = claim;
         self
     }
 

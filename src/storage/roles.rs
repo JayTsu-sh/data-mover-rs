@@ -12,7 +12,7 @@ use crate::runtime::qos::SourceQosBudget;
 use crate::model::{
     AclMetadata, BackendSessionFailure, EntryKind, EntryOperationFailure, ExtendedAttribute,
     MappedOwnership, MetadataObservations, ObjectTag, ObservationPlan, OwnershipMode,
-    SourceIdentity, StoragePath, TimestampMetadata,
+    SourceIdentity, StoragePath, SymlinkTarget, TimestampMetadata,
 };
 
 /// A bounded payload stream. Implementations own request sizing and backpressure.
@@ -127,6 +127,8 @@ pub struct RecoverRequest {
     pub final_destination: FinalDestination,
     pub source: SourceDescriptor,
     pub recovery_binding: [u8; 32],
+    /// Caller-persisted identity for one recovery attempt, stable across process restart.
+    pub claim_token: [u8; 32],
 }
 
 /// A typed destination that remains unchanged until publication.
@@ -316,6 +318,7 @@ pub trait StagedDestination: Send + Sync {
 pub enum NamespaceRequest {
     Stat(StoragePath),
     List(StoragePath),
+    ReadLink(StoragePath),
     CreateDirectory(StoragePath),
     Delete(StoragePath),
     Rename { from: StoragePath, to: StoragePath },
@@ -326,6 +329,7 @@ pub enum NamespaceRequest {
 pub enum NamespaceResult {
     Completed,
     Entries(Vec<SourceDescriptor>),
+    LinkTarget(SymlinkTarget),
 }
 
 /// Coherent namespace role with typed verb availability behind one interface.

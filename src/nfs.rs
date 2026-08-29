@@ -574,6 +574,25 @@ impl NfsNamespaceProtocol for NFSStorage {
             .collect()
     }
 
+    async fn read_link(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<Bytes, NfsProtocolFailure> {
+        let target = self
+            .read_symlink(Path::new(path.as_str()))
+            .await
+            .map_err(classify_role_error)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            Ok(Bytes::copy_from_slice(target.as_os_str().as_bytes()))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Bytes::copy_from_slice(target.to_string_lossy().as_bytes()))
+        }
+    }
+
     async fn create_directory(
         &self,
         path: &crate::model::StoragePath,
@@ -820,7 +839,9 @@ impl NfsStagedProtocol for NFSStorage {
             Err(error) => return Err(classify_role_error(error)),
         }
         let handle = self
-            .create_file(native, None, None, None)
+            // Staged files must remain readable after publication. Passing `None` lets the
+            // NFSv3 CREATE default to mode 000 on the certified servers.
+            .create_file(native, None, None, Some(0o600))
             .await
             .map_err(classify_role_error)?;
         if let Err(error) = self.truncate_file(&handle).await {

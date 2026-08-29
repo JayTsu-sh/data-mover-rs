@@ -55,7 +55,8 @@ data-mover-rs ──must not know──> terrasync-rs
 - tar manifests, NDX/tree synchronization, and product events;
 - credential sourcing/rotation and selection of neutral data-mover policies.
 
-terrasync may persist an opaque snapshot and `RecoveryIdentity`. It must not parse or
+terrasync may persist an opaque snapshot, `RecoveryIdentity`, and its opaque recovery-claim
+token. It must not parse or
 mutate backend facts, staged paths, file handles, upload IDs, parts, offsets, hashes, or
 checkpoint ranges.
 
@@ -433,9 +434,12 @@ staged file has crossed a persistence barrier. Resume rereads the complete sourc
 for BLAKE3 but emits writes only after the re-observed durable prefix. `RequireResume` refuses a
 missing or invalid identity; `ResumeOrRestart` falls back to a distinct stage without deleting
 unknown state; `Restart` discards an old stage only after full ownership validation. Exporting a
-recovery identity consumes the in-process failed-stage authority. A persistent per-stage claim
-file is held under an exclusive OS file lock for every active `PreparedStage`, so cloned identities
-and independent processes cannot acquire concurrent lifecycle ownership.
+recovery identity consumes the in-process failed-stage authority. Local holds a persistent
+per-stage claim file under an exclusive OS file lock. NFS recovery additionally requires a
+caller-persisted, per-attempt claim token: the adapter derives a deterministic claimed path from
+the opaque identity and token, then atomically renames the old stage. The same token makes a
+lost result idempotently re-enterable after process restart; different tokens ensure competing
+processes cannot acquire the same lifecycle authority.
 
 Backend mechanisms:
 

@@ -146,8 +146,11 @@ before prepare and during an active source read.
 - `TS-NFS3-SINGLE`
 - `TS-NFS3-REMOTE`
 
-The gate covers mount/reconnect, stable-write durability, file handles, ACL/xattr, symlink,
-rename/replace, safe RPC retry, and checkpoint recovery.
+The gate uses the public role-based storage, traversal, and transfer seams. It covers
+mount/reconnect, stable-write durability, file handles, symlink observation, streaming
+rename/replace, safe RPC retry, and checkpoint recovery after reconnect. The current NFSv3
+protocol adapter reports ACL and xattr as typed `Unsupported`; the gate verifies that truth
+without issuing unavailable enrichment calls.
 
 ### NFSv4.0
 

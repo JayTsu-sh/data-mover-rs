@@ -182,6 +182,7 @@ async fn discard_keeps_recovery_claim_until_owned_contents_are_removed() -> io::
             final_destination: prepare.final_destination,
             source: prepare.source,
             recovery_binding: prepare.recovery_binding,
+            claim_token: [1; 32],
         })
         .await;
     assert!(recovery.is_err());

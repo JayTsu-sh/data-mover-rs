@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use super::source::{NfsProtocolFailure, entry_failure, role_failure};
 use crate::model::{
     BackendIdentity, EntryKind, FailureClass, IdentityStrength, Operation, SourceIdentity,
-    StoragePath, Transience,
+    StoragePath, SymlinkTarget, SymlinkTargetEncoding, Transience,
 };
 use crate::storage::{
     Namespace, NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure,
@@ -32,6 +32,7 @@ pub(crate) trait NfsNamespaceProtocol: Send + Sync {
         &self,
         path: &StoragePath,
     ) -> Result<Vec<NfsNamespaceObservation>, NfsProtocolFailure>;
+    async fn read_link(&self, path: &StoragePath) -> Result<bytes::Bytes, NfsProtocolFailure>;
     async fn create_directory(&self, path: &StoragePath) -> Result<(), NfsProtocolFailure>;
     async fn delete(&self, path: &StoragePath, kind: EntryKind) -> Result<(), NfsProtocolFailure>;
     async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), NfsProtocolFailure>;
@@ -75,6 +76,17 @@ impl Namespace for NfsNamespaceAdapter {
                     .map(|entry| descriptor(&self.identity, entry.path.clone(), entry))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(NamespaceResult::Entries(values))
+            }
+            NamespaceRequest::ReadLink(path) => {
+                checked(&path)?;
+                let target = self
+                    .protocol
+                    .read_link(&path)
+                    .await
+                    .map_err(|error| role_failure(&path, Operation::Namespace, error))?;
+                let target = SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, target.to_vec())
+                    .map_err(|_| invalid(&path))?;
+                Ok(NamespaceResult::LinkTarget(target))
             }
             NamespaceRequest::CreateDirectory(path) => {
                 checked(&path)?;

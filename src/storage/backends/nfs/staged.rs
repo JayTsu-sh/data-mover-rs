@@ -41,8 +41,8 @@ pub(crate) trait NfsStagedProtocol: Send + Sync {
 }
 
 pub(crate) struct NfsStagedDestinationAdapter {
-    protocol: Arc<dyn NfsStagedProtocol>,
-    identity: BackendIdentity,
+    pub(super) protocol: Arc<dyn NfsStagedProtocol>,
+    pub(super) identity: BackendIdentity,
     owned_stages: Mutex<HashSet<Bytes>>,
 }
 
@@ -63,21 +63,7 @@ impl NfsStagedDestinationAdapter {
                 Transience::Permanent,
             )
         })?;
-        let token = std::str::from_utf8(&stage.token).map_err(|_| {
-            failure(
-                stage.final_destination.path(),
-                FailureClass::Corruption,
-                Transience::Permanent,
-            )
-        })?;
-        let path = PathBuf::from(token);
-        if !path.starts_with(STAGING_DIR) || path.components().count() != 2 {
-            return Err(failure(
-                stage.final_destination.path(),
-                FailureClass::Conflict,
-                Transience::Permanent,
-            ));
-        }
+        let path = Self::validate_token_shape(&stage.token, stage.final_destination.path())?;
         if !self
             .owned_stages
             .lock()
@@ -90,16 +76,35 @@ impl NfsStagedDestinationAdapter {
                 Transience::Permanent,
             ));
         }
-        StoragePath::new(path.to_string_lossy()).map_err(|_| {
-            failure(
-                stage.final_destination.path(),
-                FailureClass::Corruption,
-                Transience::Permanent,
-            )
-        })
+        Ok(path)
     }
 
-    fn release(&self, stage: &PreparedStage) {
+    pub(super) fn validate_token_shape(
+        token: &Bytes,
+        final_path: &StoragePath,
+    ) -> Result<StoragePath, StorageRoleFailure> {
+        let token = std::str::from_utf8(token)
+            .map_err(|_| failure(final_path, FailureClass::Corruption, Transience::Permanent))?;
+        let path = PathBuf::from(token);
+        if !path.starts_with(STAGING_DIR) || path.components().count() != 2 {
+            return Err(failure(
+                final_path,
+                FailureClass::Conflict,
+                Transience::Permanent,
+            ));
+        }
+        StoragePath::new(path.to_string_lossy())
+            .map_err(|_| failure(final_path, FailureClass::Corruption, Transience::Permanent))
+    }
+
+    pub(super) fn claim_authority(&self, token: Bytes) -> bool {
+        self.owned_stages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(token)
+    }
+
+    pub(super) fn release_authority(&self, stage: &PreparedStage) {
         self.owned_stages
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -112,6 +117,13 @@ impl NfsStagedDestinationAdapter {
             .size(&path)
             .await
             .map_err(|error| role_failure(stage.final_destination.path(), Operation::Write, error))
+    }
+
+    pub(super) async fn reobserve_checkpoint(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<u64, StorageRoleFailure> {
+        self.size(stage).await
     }
 
     async fn hash(
@@ -188,7 +200,7 @@ impl NfsStagedDestinationAdapter {
                 ..
             }) => {
                 if final_equivalent {
-                    self.release(stage);
+                    self.release_authority(stage);
                     Ok(PublicationEvidence {
                         final_destination: stage.final_destination.path().clone(),
                         disposition: PublicationDisposition::Published,
@@ -216,7 +228,7 @@ impl NfsStagedDestinationAdapter {
                         ),
                         final_destination_changed: true,
                     })?;
-                self.release(stage);
+                self.release_authority(stage);
                 Ok(PublicationEvidence {
                     final_destination: stage.final_destination.path().clone(),
                     disposition: PublicationDisposition::ExistingEquivalent,
@@ -258,10 +270,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
         self.protocol.create_empty(&native).await.map_err(|error| {
             role_failure(request.final_destination.path(), Operation::Prepare, error)
         })?;
-        self.owned_stages
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(Bytes::copy_from_slice(token.as_bytes()));
+        let _ = self.claim_authority(Bytes::copy_from_slice(token.as_bytes()));
         Ok(PreparedStage::new(
             self.identity.clone(),
             request.final_destination,
@@ -276,19 +285,11 @@ impl StagedDestination for NfsStagedDestinationAdapter {
         &self,
         stage: &PreparedStage,
     ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        Err(failure(
-            stage.final_destination.path(),
-            FailureClass::Unsupported,
-            Transience::Permanent,
-        ))
+        super::recovery::export(self, stage).await
     }
 
     async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(failure(
-            request.final_destination.path(),
-            FailureClass::Unsupported,
-            Transience::Permanent,
-        ))
+        super::recovery::recover(self, request).await
     }
 
     async fn write(
@@ -415,7 +416,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
                                 final_destination_changed: false,
                             }
                         })?;
-                        self.release(stage);
+                        self.release_authority(stage);
                         return Ok(PublicationEvidence {
                             final_destination: stage.final_destination.path().clone(),
                             disposition: PublicationDisposition::ExistingEquivalent,
@@ -441,7 +442,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
                 .reconcile_rename_failure(stage, final_path, &request, rename_error)
                 .await;
         }
-        self.release(stage);
+        self.release_authority(stage);
         Ok(PublicationEvidence {
             final_destination: stage.final_destination.path().clone(),
             disposition: PublicationDisposition::Published,
@@ -464,7 +465,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
                 ));
             }
         }
-        self.release(&stage);
+        self.release_authority(&stage);
         Ok(())
     }
 }
@@ -508,352 +509,4 @@ fn publication_failure(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity};
-    use crate::storage::{FinalDestination, SourceDescriptor};
-    use futures::stream;
-
-    #[derive(Default)]
-    struct FakeProtocol {
-        files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-        closes: Arc<std::sync::atomic::AtomicU64>,
-        rename_mode: std::sync::atomic::AtomicU8,
-    }
-
-    struct FakeFile {
-        path: String,
-        files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-        closes: Arc<std::sync::atomic::AtomicU64>,
-    }
-
-    #[async_trait]
-    impl NfsStageFile for FakeFile {
-        async fn read_at(
-            &mut self,
-            offset: u64,
-            count: usize,
-        ) -> Result<Bytes, NfsProtocolFailure> {
-            let files = self
-                .files
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let value = files
-                .get(&self.path)
-                .ok_or_else(NfsProtocolFailure::protocol)?;
-            let start = usize::try_from(offset).map_err(|_| NfsProtocolFailure::protocol())?;
-            let end = start
-                .checked_add(count)
-                .ok_or_else(NfsProtocolFailure::protocol)?;
-            Ok(Bytes::copy_from_slice(
-                value
-                    .get(start..end)
-                    .ok_or_else(NfsProtocolFailure::protocol)?,
-            ))
-        }
-
-        async fn write_at(&mut self, offset: u64, data: Bytes) -> Result<u64, NfsProtocolFailure> {
-            let mut files = self
-                .files
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let value = files
-                .get_mut(&self.path)
-                .ok_or_else(NfsProtocolFailure::protocol)?;
-            let start = usize::try_from(offset).map_err(|_| NfsProtocolFailure::protocol())?;
-            let end = start
-                .checked_add(data.len())
-                .ok_or_else(NfsProtocolFailure::protocol)?;
-            value.resize(end, 0);
-            value[start..end].copy_from_slice(&data);
-            Ok(data.len() as u64)
-        }
-
-        async fn close(self: Box<Self>) -> Result<(), NfsProtocolFailure> {
-            self.closes
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl NfsStagedProtocol for FakeProtocol {
-        async fn create_empty(&self, path: &StoragePath) -> Result<(), NfsProtocolFailure> {
-            let mut files = self
-                .files
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if files.insert(path.as_str().to_owned(), Vec::new()).is_some() {
-                return Err(NfsProtocolFailure {
-                    class: FailureClass::Conflict,
-                    transience: Transience::Permanent,
-                });
-            }
-            Ok(())
-        }
-
-        async fn open_read(
-            &self,
-            path: &StoragePath,
-        ) -> Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
-            self.open_write(path).await
-        }
-
-        async fn open_write(
-            &self,
-            path: &StoragePath,
-        ) -> Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
-            if !self
-                .files
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(path.as_str())
-            {
-                return Err(NfsProtocolFailure::protocol());
-            }
-            Ok(Box::new(FakeFile {
-                path: path.as_str().to_owned(),
-                files: Arc::clone(&self.files),
-                closes: Arc::clone(&self.closes),
-            }))
-        }
-
-        async fn size(&self, path: &StoragePath) -> Result<u64, NfsProtocolFailure> {
-            self.files
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(path.as_str())
-                .map(|value| value.len() as u64)
-                .ok_or(NfsProtocolFailure {
-                    class: FailureClass::NotFound,
-                    transience: Transience::Permanent,
-                })
-        }
-
-        async fn rename(
-            &self,
-            from: &StoragePath,
-            to: &StoragePath,
-        ) -> Result<(), NfsProtocolFailure> {
-            let mut files = self
-                .files
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let value = files
-                .remove(from.as_str())
-                .ok_or_else(NfsProtocolFailure::protocol)?;
-            match self.rename_mode.load(std::sync::atomic::Ordering::SeqCst) {
-                2 => Err(NfsProtocolFailure::protocol()),
-                3 => {
-                    files.insert(to.as_str().to_owned(), b"wrong".to_vec());
-                    Err(NfsProtocolFailure::protocol())
-                }
-                _ => {
-                    files.insert(to.as_str().to_owned(), value);
-                    Ok(())
-                }
-            }
-        }
-
-        async fn delete(&self, path: &StoragePath) -> Result<(), NfsProtocolFailure> {
-            self.files
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(path.as_str())
-                .map(|_| ())
-                .ok_or(NfsProtocolFailure {
-                    class: FailureClass::NotFound,
-                    transience: Transience::Permanent,
-                })
-        }
-    }
-
-    fn adapter() -> (
-        NfsStagedDestinationAdapter,
-        Arc<FakeProtocol>,
-        BackendIdentity,
-    ) {
-        let protocol = Arc::new(FakeProtocol::default());
-        let identity = BackendIdentity::new(BackendKind::Nfs, "test-nfs")
-            .unwrap_or_else(|error| panic!("{error:?}"));
-        (
-            NfsStagedDestinationAdapter::new(protocol.clone(), identity.clone()),
-            protocol,
-            identity,
-        )
-    }
-
-    fn prepare_request(identity: &BackendIdentity) -> PrepareRequest {
-        PrepareRequest {
-            final_destination: FinalDestination::new(
-                StoragePath::new("final.bin").unwrap_or_else(|error| panic!("{error}")),
-            ),
-            source: SourceDescriptor {
-                path: StoragePath::new("source.bin").unwrap_or_else(|error| panic!("{error}")),
-                kind: EntryKind::File,
-                size: Some(6),
-                source_identity: SourceIdentity::new(
-                    identity.clone(),
-                    IdentityStrength::StableWithinBackend,
-                    b"source",
-                )
-                .unwrap_or_else(|error| panic!("{error}")),
-            },
-            recovery_binding: [7; 32],
-        }
-    }
-
-    #[test]
-    fn final_and_stage_paths_are_confined() {
-        assert!(
-            checked_final(&StoragePath::new("file").unwrap_or_else(|error| panic!("{error}")))
-                .is_ok()
-        );
-        assert!(checked_final(&StoragePath::root()).is_err());
-        assert!(
-            checked_final(&StoragePath::new("../escape").unwrap_or_else(|error| panic!("{error}")))
-                .is_err()
-        );
-        assert!(
-            checked_final(
-                &StoragePath::new(".data-mover-staging/forged")
-                    .unwrap_or_else(|error| panic!("{error}"))
-            )
-            .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn staged_lifecycle_writes_verifies_publishes_and_closes_handles() {
-        let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare(prepare_request(&identity))
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        let input: ByteStream = Box::pin(stream::iter([
-            Ok(Bytes::from_static(b"abc")),
-            Ok(Bytes::from_static(b"def")),
-        ]));
-        assert_eq!(
-            adapter
-                .write(&stage, input)
-                .await
-                .unwrap_or_else(|error| panic!("{error}"))
-                .persisted_bytes,
-            6
-        );
-        assert_eq!(
-            adapter
-                .observe_checkpoint(&stage)
-                .await
-                .unwrap_or_else(|error| panic!("{error}"))
-                .durable_prefix,
-            6
-        );
-        let hash = *blake3::hash(b"abcdef").as_bytes();
-        assert_eq!(
-            adapter
-                .verify(
-                    &stage,
-                    VerifyRequest {
-                        expected_size: 6,
-                        expected_blake3: hash,
-                        cancel: tokio_util::sync::CancellationToken::new()
-                    }
-                )
-                .await
-                .unwrap_or_else(|error| panic!("{error}"))
-                .blake3,
-            hash
-        );
-        let published = adapter
-            .publish(
-                &stage,
-                PublishRequest {
-                    policy: ExistingDestinationPolicy::Overwrite,
-                    expected_size: 6,
-                    expected_blake3: hash,
-                    cancel: tokio_util::sync::CancellationToken::new(),
-                },
-            )
-            .await
-            .unwrap_or_else(|error| panic!("{error:?}"));
-        assert_eq!(published.disposition, PublicationDisposition::Published);
-        assert_eq!(
-            protocol
-                .files
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get("final.bin"),
-            Some(&b"abcdef".to_vec())
-        );
-        assert_eq!(protocol.closes.load(std::sync::atomic::Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn recovery_and_precancel_boundaries_fail_without_remote_mutation() {
-        let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare(prepare_request(&identity))
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert!(adapter.recovery_identity(&stage).await.is_err());
-        let cancel = tokio_util::sync::CancellationToken::new();
-        cancel.cancel();
-        assert!(
-            adapter
-                .verify(
-                    &stage,
-                    VerifyRequest {
-                        expected_size: 0,
-                        expected_blake3: *blake3::hash(b"").as_bytes(),
-                        cancel
-                    }
-                )
-                .await
-                .is_err()
-        );
-        assert_eq!(protocol.closes.load(std::sync::atomic::Ordering::SeqCst), 0);
-        adapter
-            .discard(stage)
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-    }
-
-    #[tokio::test]
-    async fn missing_stage_makes_rename_failure_ambiguous_when_final_is_missing_or_mismatched() {
-        for mode in [2, 3] {
-            let (adapter, protocol, identity) = adapter();
-            let stage = adapter
-                .prepare(prepare_request(&identity))
-                .await
-                .unwrap_or_else(|error| panic!("{error}"));
-            protocol
-                .rename_mode
-                .store(mode, std::sync::atomic::Ordering::SeqCst);
-            let result = adapter
-                .publish(
-                    &stage,
-                    PublishRequest {
-                        policy: ExistingDestinationPolicy::Overwrite,
-                        expected_size: 0,
-                        expected_blake3: *blake3::hash(b"").as_bytes(),
-                        cancel: tokio_util::sync::CancellationToken::new(),
-                    },
-                )
-                .await;
-            let failure = match result {
-                Ok(evidence) => panic!("unexpected publication: {evidence:?}"),
-                Err(failure) => failure,
-            };
-            assert!(failure.final_destination_changed);
-            adapter
-                .discard(stage)
-                .await
-                .unwrap_or_else(|error| panic!("cleanup authority failed: {error}"));
-        }
-    }
-}
+include!("staged_tests.rs");

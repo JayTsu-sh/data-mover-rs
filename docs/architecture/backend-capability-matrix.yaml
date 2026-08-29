@@ -69,8 +69,8 @@ profiles:
       hardlink_topology: unsupported
       rename: required
       delete: required
-      acl: required
-      xattr: required
+      acl: {state: unsupported, reason: current_nfs3_protocol_adapter_has_no_acl_operation}
+      xattr: {state: unsupported, reason: current_nfs3_protocol_adapter_has_no_xattr_operation}
       tags: not_applicable
       uid_gid_mode: required
       timestamps: required

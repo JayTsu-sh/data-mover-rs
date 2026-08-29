@@ -88,7 +88,9 @@ prepare_hdfs_kerberos() {
 ssh_lab() {
   local host="$1"
   shift
-  ssh -i "$LAB_SSH_KEY" \
+  local -a identity=()
+  [[ -r "$LAB_SSH_KEY" ]] && identity=(-i "$LAB_SSH_KEY")
+  ssh "${identity[@]}" \
     -o BatchMode=yes \
     -o ConnectTimeout=10 \
     -o StrictHostKeyChecking=accept-new \
@@ -98,7 +100,9 @@ ssh_lab() {
 ssh_lab_root() {
   local host="$1"
   shift
-  ssh -i "$LAB_SSH_KEY" \
+  local -a identity=()
+  [[ -r "$LAB_SSH_KEY" ]] && identity=(-i "$LAB_SSH_KEY")
+  ssh "${identity[@]}" \
     -o BatchMode=yes \
     -o ConnectTimeout=10 \
     -o StrictHostKeyChecking=accept-new \
@@ -108,7 +112,9 @@ ssh_lab_root() {
 ssh_hdfs() {
   local host="$1"
   shift
-  ssh -i "$LAB_SSH_KEY" \
+  local -a identity=()
+  [[ -r "$LAB_SSH_KEY" ]] && identity=(-i "$LAB_SSH_KEY")
+  ssh "${identity[@]}" \
     -o BatchMode=yes \
     -o ConnectTimeout=10 \
     -o StrictHostKeyChecking=accept-new \

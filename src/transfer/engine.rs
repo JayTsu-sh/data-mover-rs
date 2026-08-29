@@ -483,6 +483,7 @@ async fn select_stage(
                 final_destination: FinalDestination::new(request.final_path.clone()),
                 source: descriptor.clone(),
                 recovery_binding,
+                claim_token: request.recovery_claim,
             })
             .await;
         match (request.recovery_policy, recovered) {

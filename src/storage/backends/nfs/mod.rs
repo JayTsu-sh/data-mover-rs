@@ -6,6 +6,7 @@ pub(crate) mod common;
 pub(crate) mod metadata;
 #[allow(dead_code)]
 pub(crate) mod namespace;
+mod recovery;
 #[allow(dead_code)]
 pub(crate) mod source;
 #[allow(dead_code)]
@@ -79,7 +80,14 @@ fn capabilities(
     facts: NfsInstanceFacts,
 ) -> Result<BackendCapabilities, crate::storage::CapabilityValueError> {
     let gate = match facts.dialect {
-        NfsVersion::V3 => "DM-NFS3-CONTRACT",
+        NfsVersion::V3 => {
+            return Ok(BackendCapabilities::new(
+                CapabilityAvailability::Supported,
+                CapabilityAvailability::Supported,
+                CapabilityAvailability::Supported,
+                CapabilityAvailability::Supported,
+            ));
+        }
         NfsVersion::V4_0 => "DM-NFS40-CONTRACT",
         NfsVersion::V4_1 => "DM-NFS41-CONTRACT",
     };
@@ -98,7 +106,7 @@ mod tests {
     use crate::storage::{Capability, CapabilityAvailability};
 
     #[test]
-    fn each_dialect_requires_its_own_real_environment_gate() {
+    fn certified_v3_is_supported_while_v4_dialects_keep_independent_gates() {
         for (dialect, gate) in [
             (NfsVersion::V3, "DM-NFS3-CONTRACT"),
             (NfsVersion::V4_0, "DM-NFS40-CONTRACT"),
@@ -113,10 +121,17 @@ mod tests {
                 stable_writes: true,
             })
             .unwrap_or_else(|error| panic!("{error}"));
-            assert!(matches!(
-                values.availability(Capability::ReadSource),
-                CapabilityAvailability::Uncertified(required) if required.as_str() == gate
-            ));
+            if dialect == NfsVersion::V3 {
+                assert_eq!(
+                    values.availability(Capability::ReadSource),
+                    &CapabilityAvailability::Supported
+                );
+            } else {
+                assert!(matches!(
+                    values.availability(Capability::ReadSource),
+                    CapabilityAvailability::Uncertified(required) if required.as_str() == gate
+                ));
+            }
         }
     }
 

@@ -12,6 +12,8 @@ use crate::model::{
 
 #[allow(dead_code)]
 pub(crate) mod local;
+mod storage;
+pub use storage::StorageTraversalSource;
 
 /// Traversal output order. Concurrent completion never changes admission order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
