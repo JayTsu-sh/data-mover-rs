@@ -6,9 +6,11 @@ mod model;
 
 pub use crate::storage::ExistingDestinationPolicy;
 pub use crate::storage::RecoveryIdentity;
+pub use crate::storage::{SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError};
 pub use engine::{TransferFailure, TransferOutcome, transfer};
 pub use model::{
-    InflightLimits, RecoveryPolicy, TransferIdentity, TransferRequest, TransferValueError,
+    InflightLimits, PayloadShapingPolicy, RecoveryPolicy, TransferIdentity, TransferRequest,
+    TransferValueError,
 };
 
 #[cfg(test)]

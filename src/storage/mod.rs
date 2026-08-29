@@ -5,6 +5,9 @@ mod capability;
 mod handle;
 mod roles;
 
+pub use crate::runtime::qos::{
+    SourceQosBudget, SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError,
+};
 pub use capability::{
     BackendCapabilities, Capability, CapabilityAvailability, CapabilityUnavailable,
     CapabilityValueError, PreflightPolicy, UnsupportedReason, ValidationGate,

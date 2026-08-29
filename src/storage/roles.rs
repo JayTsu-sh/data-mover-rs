@@ -7,6 +7,8 @@ use bytes::Bytes;
 use futures::Stream;
 use tokio_util::sync::CancellationToken;
 
+use crate::runtime::qos::SourceQosBudget;
+
 use crate::model::{
     BackendSessionFailure, EntryKind, EntryOperationFailure, MetadataObservations, ObservationPlan,
     SourceIdentity, StoragePath,
@@ -31,6 +33,7 @@ pub struct ReadRequest {
     pub range: Option<Range<u64>>,
     pub expected_source: Option<SourceIdentity>,
     pub cancel: CancellationToken,
+    pub source_qos: Option<SourceQosBudget>,
 }
 
 /// Backend-neutral failure scope for a role operation.

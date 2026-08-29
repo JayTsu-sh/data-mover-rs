@@ -439,6 +439,19 @@ policy; data-mover enforces it at actual source reads. It supports soft average 
 hard ceiling, bounded peak credit/duration, source-read IOPS, fairness, and cancellation-aware
 waits. Historical constructors and unevidenced hot update are removed.
 
+During the ordered migration, the target transfer seam never calls the historical `QosManager`.
+That legacy manager remains confined to the old copy/convenience surface until the post-matrix
+removal ticket #150 deletes those public paths, as required by the parent migration sequence; no
+adapter bridges it into `SourceQosGroup` and no new caller may depend on it.
+
+The public seam is an immutable `SourceQosPolicy` held by a cloneable `SourceQosGroup`.
+Each `TransferRequest` may join one group and receives a private per-attempt meter while all
+clones contend on the same FIFO admission scheduler. `ReadRequest` carries that private budget
+to the source adapter; the adapter may reduce a protocol read to the admitted sub-range and
+records bytes only after the source returns them. Cancellation while queued releases the waiter
+without charging an operation or payload. Neither the destination role nor verification receives
+the source budget.
+
 Rules:
 
 - newly client-streamed payload is bandwidth-charged once at source admission;
@@ -452,6 +465,10 @@ S3 native copy remains allowed with QoS enabled. Server-internal payload is not 
 Outcomes distinguish logical payload, client-streamed shaped bytes, native bytes, source read
 operations, and native requests, and explicitly report native payload as unshaped. A caller
 requiring client-shaped payload explicitly disables native transfer.
+The same accounting snapshot is available on `TransferFailure`, so cancellation and later-phase
+failures report the source work already performed. Resume and restart create new per-attempt
+meters against the shared group; every source reread required for BLAKE3 verification is charged,
+while reuse of the destination durable prefix never creates destination-side QoS charges.
 
 ## 12. Failure taxonomy
 

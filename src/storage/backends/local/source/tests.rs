@@ -23,6 +23,7 @@ async fn role_describes_and_reads_an_exact_local_range() -> Result<(), Box<dyn s
             range: Some(3..8),
             expected_source: None,
             cancel: tokio_util::sync::CancellationToken::new(),
+            source_qos: None,
         })
         .await?;
 
@@ -47,6 +48,7 @@ async fn role_splits_large_ranges_into_bounded_chunks() -> Result<(), Box<dyn st
             range: None,
             expected_source: None,
             cancel: tokio_util::sync::CancellationToken::new(),
+            source_qos: None,
         })
         .await?;
     let mut rebuilt = Vec::new();
@@ -78,6 +80,7 @@ async fn one_stream_remains_bound_to_the_file_opened_at_read_start()
             range: None,
             expected_source: None,
             cancel: tokio_util::sync::CancellationToken::new(),
+            source_qos: None,
         })
         .await?;
     let first = stream
@@ -115,6 +118,7 @@ async fn expected_identity_rejects_replacement_between_describe_and_read()
             range: None,
             expected_source: Some(descriptor.source_identity),
             cancel: tokio_util::sync::CancellationToken::new(),
+            source_qos: None,
         })
         .await;
 

@@ -15,7 +15,8 @@ use crate::runtime::inflight::{
 use crate::storage::{
     CheckpointObservation, FinalDestination, PreflightPolicy, PrepareRequest, PreparedStage,
     PublicationDisposition, PublicationEvidence, PublishRequest, ReadRequest, ReadSource,
-    SourceDescriptor, StagedDestination, StorageRoleFailure, VerifyRequest, WriteEvidence,
+    SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination, StorageRoleFailure,
+    VerifyRequest, WriteEvidence,
 };
 
 /// Lifecycle stage at which one transfer attempt stopped.
@@ -61,6 +62,7 @@ pub struct TransferFailure {
     failed_stage: Option<Box<FailedStage>>,
     committed_cleanup: Option<Box<FailedStage>>,
     final_destination_changed: bool,
+    source_qos: SourceQosStats,
 }
 
 struct FailedStage {
@@ -84,6 +86,7 @@ impl TransferFailure {
             failed_stage: None,
             committed_cleanup: None,
             final_destination_changed: false,
+            source_qos: SourceQosStats::default(),
         }
     }
 
@@ -96,6 +99,7 @@ impl TransferFailure {
             failed_stage: None,
             committed_cleanup: None,
             final_destination_changed: false,
+            source_qos: SourceQosStats::default(),
         }
     }
 
@@ -108,6 +112,7 @@ impl TransferFailure {
             failed_stage: None,
             committed_cleanup: None,
             final_destination_changed: false,
+            source_qos: SourceQosStats::default(),
         }
     }
 
@@ -151,6 +156,17 @@ impl TransferFailure {
     #[must_use]
     pub const fn final_destination_changed(&self) -> bool {
         self.final_destination_changed
+    }
+
+    /// Actual source work charged before this attempt failed.
+    #[must_use]
+    pub const fn source_qos(&self) -> SourceQosStats {
+        self.source_qos
+    }
+
+    fn with_source_qos(mut self, source_qos: SourceQosStats) -> Self {
+        self.source_qos = source_qos;
+        self
     }
 
     /// Consumes this failure and discards its recoverable unpublished stage.
@@ -226,6 +242,7 @@ pub(crate) struct Transferred {
     source: SourceDescriptor,
     data_path: TransferDataPath,
     source_blake3: [u8; 32],
+    source_qos: Option<SourceQosBudget>,
 }
 
 /// Successful final outcome of one transfer attempt.
@@ -235,6 +252,7 @@ pub struct TransferOutcome {
     pub disposition: PublicationDisposition,
     pub transferred_bytes: u64,
     pub blake3: [u8; 32],
+    pub source_qos: SourceQosStats,
 }
 
 /// Transfers, verifies, and publishes one request.
@@ -246,12 +264,14 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
     let cancel = request.cancel.clone();
     let policy = request.existing_destination;
     let transferred = run_until_transferred(request).await?;
+    let source_qos = transferred_source_qos(&transferred);
     if cancel.is_cancelled() {
         return Err(TransferFailure::orchestration(
             TransferPhase::Verify,
             "transfer was cancelled before verification",
         )
-        .with_stage(Arc::clone(&transferred.destination), transferred.stage));
+        .with_stage(Arc::clone(&transferred.destination), transferred.stage)
+        .with_source_qos(source_qos));
     }
     let verification_result = transferred
         .destination
@@ -272,7 +292,8 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
                 TransferSide::Destination,
                 error,
             )
-            .with_stage(Arc::clone(&transferred.destination), transferred.stage));
+            .with_stage(Arc::clone(&transferred.destination), transferred.stage)
+            .with_source_qos(source_qos));
         }
     };
     if verification.verified_bytes != transferred.checkpoint.durable_prefix
@@ -282,14 +303,16 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
             TransferPhase::Verify,
             "destination verification evidence differs from source evidence",
         )
-        .with_stage(Arc::clone(&transferred.destination), transferred.stage));
+        .with_stage(Arc::clone(&transferred.destination), transferred.stage)
+        .with_source_qos(source_qos));
     }
     if cancel.is_cancelled() {
         return Err(TransferFailure::orchestration(
             TransferPhase::Verify,
             "transfer was cancelled before publication",
         )
-        .with_stage(Arc::clone(&transferred.destination), transferred.stage));
+        .with_stage(Arc::clone(&transferred.destination), transferred.stage)
+        .with_source_qos(source_qos));
     }
     let expected_size = verification.verified_bytes;
     let blake3 = verification.blake3;
@@ -318,12 +341,13 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
             );
             failure.final_destination_changed = publication.final_destination_changed;
             if publication.final_destination_changed {
-                return Err(failure.with_committed_cleanup(
-                    Arc::clone(&transferred.destination),
-                    transferred.stage,
-                ));
+                return Err(failure
+                    .with_committed_cleanup(Arc::clone(&transferred.destination), transferred.stage)
+                    .with_source_qos(source_qos));
             }
-            return Err(failure.with_stage(Arc::clone(&transferred.destination), transferred.stage));
+            return Err(failure
+                .with_stage(Arc::clone(&transferred.destination), transferred.stage)
+                .with_source_qos(source_qos));
         }
     };
     Ok(TransferOutcome {
@@ -331,7 +355,18 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
         disposition,
         transferred_bytes: expected_size,
         blake3,
+        source_qos,
     })
+}
+
+fn transferred_source_qos(transferred: &Transferred) -> SourceQosStats {
+    transferred.source_qos.as_ref().map_or(
+        SourceQosStats {
+            logical_bytes: transferred.checkpoint.durable_prefix,
+            ..SourceQosStats::default()
+        },
+        SourceQosBudget::stats,
+    )
 }
 
 impl Transferred {
@@ -350,6 +385,22 @@ impl Transferred {
 
 pub(crate) async fn run_until_transferred(
     request: TransferRequest,
+) -> Result<Transferred, TransferFailure> {
+    let source_qos = request
+        .source_qos
+        .as_ref()
+        .map(crate::runtime::qos::SourceQosGroup::transfer_budget);
+    run_until_transferred_inner(request, source_qos.clone())
+        .await
+        .map_err(|failure| match source_qos {
+            Some(budget) => failure.with_source_qos(budget.stats()),
+            None => failure,
+        })
+}
+
+async fn run_until_transferred_inner(
+    request: TransferRequest,
+    source_qos: Option<SourceQosBudget>,
 ) -> Result<Transferred, TransferFailure> {
     let TransferRoles {
         source,
@@ -375,17 +426,29 @@ pub(crate) async fn run_until_transferred(
         .map_err(|error| {
             TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
         })?;
+    if let (Some(budget), Some(size)) = (&source_qos, descriptor.size) {
+        budget.set_logical_bytes(size);
+    }
     if request.cancel.is_cancelled() {
         return Err(TransferFailure::orchestration(
             TransferPhase::Describe,
             "transfer was cancelled before prepare",
         ));
     }
-    let plan = plan_transfer(&descriptor, request.inflight)?;
+    let plan = plan_transfer(&descriptor, request.inflight, request.payload_shaping)?;
     let recovery_binding = recovery_binding(&request, &descriptor);
     let stage = select_stage(&request, &destination, &descriptor, recovery_binding).await?;
     let identity = request.identity.clone();
-    let result = transfer_stage(&request, source, &destination, &descriptor, &stage, plan).await;
+    let result = transfer_stage(
+        &request,
+        source,
+        &destination,
+        &descriptor,
+        &stage,
+        plan,
+        source_qos.clone(),
+    )
+    .await;
     match result {
         Ok(evidence) => Ok(Transferred {
             identity,
@@ -396,6 +459,7 @@ pub(crate) async fn run_until_transferred(
             source: descriptor,
             data_path: plan.data_path,
             source_blake3: evidence.source_blake3,
+            source_qos,
         }),
         Err(error) => Err(error.with_stage(destination, stage)),
     }
@@ -505,6 +569,7 @@ fn lend_transfer_roles(request: &TransferRequest) -> Result<TransferRoles, Trans
 fn plan_transfer(
     descriptor: &SourceDescriptor,
     limits: super::InflightLimits,
+    _payload_shaping: super::PayloadShapingPolicy,
 ) -> Result<TransferPlan, TransferFailure> {
     if descriptor.kind != EntryKind::File {
         return Err(TransferFailure::orchestration(
@@ -529,6 +594,7 @@ async fn transfer_stage(
     descriptor: &SourceDescriptor,
     stage: &PreparedStage,
     plan: TransferPlan,
+    source_qos: Option<SourceQosBudget>,
 ) -> Result<TransferEvidence, TransferFailure> {
     let write_start = stage.write_offset;
     if write_start > plan.source_size {
@@ -554,6 +620,7 @@ async fn transfer_stage(
         failure: Arc::clone(&source_failure),
         size: plan.source_size,
         write_start,
+        source_qos,
     }));
     let stream = ordered_stream(ordered, source_failure, descriptor.path.clone());
     let (write, source_blake3) =
@@ -630,6 +697,7 @@ struct ProducerRequest {
     failure: Arc<Mutex<Option<StorageRoleFailure>>>,
     size: u64,
     write_start: u64,
+    source_qos: Option<SourceQosBudget>,
 }
 
 async fn produce(request: ProducerRequest) -> Result<[u8; 32], TransferFailure> {
@@ -643,6 +711,7 @@ async fn produce(request: ProducerRequest) -> Result<[u8; 32], TransferFailure> 
             &request.path,
             &request.source_identity,
             &request.cancel,
+            request.source_qos.clone(),
             range,
         )
         .await;
@@ -693,6 +762,7 @@ async fn read_exact_range(
     path: &StoragePath,
     source_identity: &SourceIdentity,
     cancel: &tokio_util::sync::CancellationToken,
+    source_qos: Option<SourceQosBudget>,
     range: ReadRange,
 ) -> Result<Bytes, StorageRoleFailure> {
     let mut stream = source
@@ -701,6 +771,7 @@ async fn read_exact_range(
             range: Some(range.offset..range.offset + range.length as u64),
             expected_source: Some(source_identity.clone()),
             cancel: cancel.clone(),
+            source_qos,
         })
         .await?;
     let mut output = BytesMut::with_capacity(range.length);

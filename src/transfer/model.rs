@@ -3,8 +3,7 @@ use std::fmt;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::StoragePath;
-use crate::storage::RecoveryIdentity;
-use crate::storage::{ExistingDestinationPolicy, Storage};
+use crate::storage::{ExistingDestinationPolicy, RecoveryIdentity, SourceQosGroup, Storage};
 
 const MAX_IDENTITY_BYTES: usize = 1024;
 
@@ -68,6 +67,14 @@ pub enum RecoveryPolicy {
     Restart,
 }
 
+/// Whether a planner may select a server-internal, unshaped native payload path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PayloadShapingPolicy {
+    #[default]
+    AllowUnshapedNative,
+    RequireClientShaped,
+}
+
 impl InflightLimits {
     /// Creates non-zero bounded inflight limits.
     ///
@@ -106,6 +113,8 @@ pub struct TransferRequest {
     pub(crate) existing_destination: ExistingDestinationPolicy,
     pub(crate) recovery_policy: RecoveryPolicy,
     pub(crate) recovery_identity: Option<RecoveryIdentity>,
+    pub(crate) source_qos: Option<SourceQosGroup>,
+    pub(crate) payload_shaping: PayloadShapingPolicy,
 }
 
 impl TransferRequest {
@@ -131,6 +140,8 @@ impl TransferRequest {
             existing_destination: ExistingDestinationPolicy::default(),
             recovery_policy: RecoveryPolicy::default(),
             recovery_identity: None,
+            source_qos: None,
+            payload_shaping: PayloadShapingPolicy::default(),
         }
     }
 
@@ -150,6 +161,20 @@ impl TransferRequest {
     ) -> Self {
         self.recovery_policy = policy;
         self.recovery_identity = identity;
+        self
+    }
+
+    /// Joins this attempt to one immutable shared source-read `QoS` group.
+    #[must_use]
+    pub fn with_source_qos(mut self, group: SourceQosGroup) -> Self {
+        self.source_qos = Some(group);
+        self
+    }
+
+    /// Selects whether server-internal native payload is eligible.
+    #[must_use]
+    pub fn with_payload_shaping(mut self, policy: PayloadShapingPolicy) -> Self {
+        self.payload_shaping = policy;
         self
     }
 }

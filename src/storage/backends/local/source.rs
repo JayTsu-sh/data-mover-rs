@@ -16,7 +16,9 @@ use crate::model::{
     BackendIdentity, EntryOperationFailure, FailureClass, Operation, SourceIdentity, StoragePath,
     Transience,
 };
-use crate::storage::{ByteStream, ReadRequest, ReadSource, SourceDescriptor, StorageRoleFailure};
+use crate::storage::{
+    ByteStream, ReadRequest, ReadSource, SourceDescriptor, SourceQosBudget, StorageRoleFailure,
+};
 
 const MAX_READ_CHUNK: u64 = 1024 * 1024;
 
@@ -134,6 +136,7 @@ impl ReadSource for LocalReadSource {
             next: range.start,
             end: range.end,
             cancel: request.cancel,
+            source_qos: request.source_qos,
             #[cfg(test)]
             probe: Arc::clone(&self.probe),
         };
@@ -177,6 +180,7 @@ struct LocalReadState {
     next: u64,
     end: u64,
     cancel: tokio_util::sync::CancellationToken,
+    source_qos: Option<SourceQosBudget>,
     #[cfg(test)]
     probe: Arc<ReadProbe>,
 }
@@ -188,7 +192,15 @@ async fn read_next_chunk(
         return Ok(None);
     }
     let start = state.next;
-    let end = start + (state.end - start).min(MAX_READ_CHUNK);
+    let requested = (state.end - start).min(MAX_READ_CHUNK);
+    let granted = if let Some(qos) = &state.source_qos {
+        qos.admit_read(requested, &state.cancel)
+            .await
+            .map_err(|_| failure(&state.path, FailureClass::Cancelled, Transience::Transient))?
+    } else {
+        requested
+    };
+    let end = start + granted;
     #[cfg(test)]
     {
         state
@@ -222,6 +234,9 @@ async fn read_next_chunk(
             .map_err(|_| failure(&path, FailureClass::Internal, Transience::Unknown))?
             .map_err(|error| io_failure(&path, &error))?,
     };
+    if let Some(qos) = &state.source_qos {
+        qos.record_read_bytes(bytes.len() as u64);
+    }
     state.next = end;
     Ok(Some((bytes, state)))
 }

@@ -1,10 +1,11 @@
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use super::engine::{TransferDataPath, TransferPhase, TransferSide, run_until_transferred};
 use super::{
-    ExistingDestinationPolicy, InflightLimits, RecoveryIdentity, RecoveryPolicy, TransferIdentity,
-    TransferRequest, transfer,
+    ExistingDestinationPolicy, InflightLimits, RecoveryIdentity, RecoveryPolicy, SourceQosGroup,
+    SourceQosPolicy, TransferIdentity, TransferRequest, transfer,
 };
 use crate::model::StoragePath;
 use crate::storage::PublicationDisposition;
@@ -26,6 +27,116 @@ fn transfer_inputs_reject_ambiguous_identity_and_unbounded_limits() {
     let opaque = RecoveryIdentity::from_bytes(bytes::Bytes::from_static(b"secret-stage"))
         .unwrap_or_else(|error| panic!("unexpected recovery identity failure: {error}"));
     assert_eq!(format!("{opaque:?}"), "RecoveryIdentity(<opaque>)");
+}
+
+#[tokio::test]
+async fn source_qos_shapes_local_reads_once_and_reports_truthful_work()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = TestRoot::new("qos-source")?;
+    let destination_root = TestRoot::new("qos-destination")?;
+    let payload = vec![0x5a; 100 * 1024];
+    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 16 * 1024, None)?);
+
+    let outcome = transfer(
+        transfer_request(
+            local_source(source_root.path())?,
+            local_destination(destination_root.path())?,
+            tokio_util::sync::CancellationToken::new(),
+        )?
+        .with_source_qos(qos),
+    )
+    .await?;
+
+    assert_eq!(outcome.source_qos.logical_bytes, payload.len() as u64);
+    assert_eq!(
+        outcome.source_qos.client_streamed_shaped_bytes,
+        payload.len() as u64
+    );
+    assert_eq!(outcome.source_qos.source_read_operations, 7);
+    assert_eq!(outcome.source_qos.native_bytes, 0);
+    assert_eq!(outcome.source_qos.native_requests, 0);
+    assert!(!outcome.source_qos.native_payload_shaped);
+    assert_eq!(
+        std::fs::read(destination_root.path().join("final.bin"))?,
+        payload
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn source_qos_cancellation_wait_is_fast_and_does_not_charge_an_unissued_read()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = TestRoot::new("qos-cancel-source")?;
+    let destination_root = TestRoot::new("qos-cancel-destination")?;
+    std::fs::write(source_root.path().join("source.bin"), b"payload")?;
+    let qos = SourceQosGroup::new(SourceQosPolicy::new(Some((1, 1, Duration::ZERO)), 1, None)?);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let request = transfer_request(
+        local_source(source_root.path())?,
+        local_destination(destination_root.path())?,
+        cancel.clone(),
+    )?
+    .with_source_qos(qos);
+    let started = std::time::Instant::now();
+    let attempt = tokio::spawn(transfer(request));
+    let staging = destination_root.path().join(".data-mover-staging");
+    for _ in 0..100 {
+        if staging.exists() && std::fs::read_dir(&staging)?.next().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    cancel.cancel();
+    let result = attempt.await?;
+    let Err(error) = result else {
+        return Err("cancelled QoS transfer unexpectedly succeeded".into());
+    };
+
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(error.source_qos().logical_bytes, 7);
+    assert_eq!(error.source_qos().client_streamed_shaped_bytes, 0);
+    assert_eq!(error.source_qos().source_read_operations, 0);
+    assert!(error.has_recoverable_stage());
+    error.discard_stage().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_public_transfers_share_one_source_qos_group_without_starvation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = TestRoot::new("qos-shared-source")?;
+    let first_destination = TestRoot::new("qos-shared-first")?;
+    let second_destination = TestRoot::new("qos-shared-second")?;
+    std::fs::write(source_root.path().join("source.bin"), b"x")?;
+    let group = SourceQosGroup::new(SourceQosPolicy::new(
+        None,
+        1,
+        Some((20, 20, Duration::ZERO)),
+    )?);
+    let first = transfer_request(
+        local_source(source_root.path())?,
+        local_destination(first_destination.path())?,
+        tokio_util::sync::CancellationToken::new(),
+    )?
+    .with_source_qos(group.clone());
+    let second = transfer_request(
+        local_source(source_root.path())?,
+        local_destination(second_destination.path())?,
+        tokio_util::sync::CancellationToken::new(),
+    )?
+    .with_source_qos(group);
+
+    let started = std::time::Instant::now();
+    let (first, second) = tokio::join!(transfer(first), transfer(second));
+    let first = first?;
+    let second = second?;
+    assert!(started.elapsed() >= Duration::from_millis(90));
+    assert_eq!(first.source_qos.source_read_operations, 1);
+    assert_eq!(second.source_qos.source_read_operations, 1);
+    assert_eq!(first.source_qos.client_streamed_shaped_bytes, 1);
+    assert_eq!(second.source_qos.client_streamed_shaped_bytes, 1);
+    Ok(())
 }
 
 #[tokio::test]
@@ -66,11 +177,15 @@ async fn verification_mismatch_fast_fails_without_changing_final()
         test_destination_storage_with_role(destination_root.path(), "verify-failure-destination")?;
     role.corrupt_before_verify();
 
-    let result = transfer(transfer_request(
-        local_source(source_root.path())?,
-        destination,
-        tokio_util::sync::CancellationToken::new(),
-    )?)
+    let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 16 * 1024, None)?);
+    let result = transfer(
+        transfer_request(
+            local_source(source_root.path())?,
+            destination,
+            tokio_util::sync::CancellationToken::new(),
+        )?
+        .with_source_qos(qos),
+    )
     .await;
     let Err(error) = result else {
         return Err("corrupt staged content unexpectedly published".into());
@@ -78,6 +193,9 @@ async fn verification_mismatch_fast_fails_without_changing_final()
 
     assert_eq!(error.phase(), TransferPhase::Verify);
     assert!(error.has_recoverable_stage());
+    assert_eq!(error.source_qos().logical_bytes, 64 * 1024);
+    assert_eq!(error.source_qos().client_streamed_shaped_bytes, 64 * 1024);
+    assert_eq!(error.source_qos().source_read_operations, 4);
     assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,
         b"old-final"
@@ -381,6 +499,7 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
         .map_err(|(_, error)| error)?;
     let writes_before = destination_role.write_completion_count();
     assert_eq!(writes_before, 1);
+    let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 64 * 1024, None)?);
 
     let outcome = transfer(
         transfer_request(
@@ -388,11 +507,18 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
             destination,
             tokio_util::sync::CancellationToken::new(),
         )?
-        .with_recovery(RecoveryPolicy::RequireResume, Some(recovery)),
+        .with_recovery(RecoveryPolicy::RequireResume, Some(recovery))
+        .with_source_qos(qos),
     )
     .await?;
     assert_eq!(outcome.transferred_bytes, payload.len() as u64);
     assert_eq!(destination_role.write_completion_count() - writes_before, 2);
+    assert_eq!(outcome.source_qos.logical_bytes, payload.len() as u64);
+    assert_eq!(
+        outcome.source_qos.client_streamed_shaped_bytes,
+        payload.len() as u64
+    );
+    assert_eq!(outcome.source_qos.source_read_operations, 3);
     assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,
         payload
@@ -428,17 +554,24 @@ async fn restart_discards_only_a_validated_owned_stage_then_uploads_from_zero()
         .map_err(|(_, error)| error)?;
     let writes_before = role.write_completion_count();
 
-    transfer(
+    let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 64 * 1024, None)?);
+    let outcome = transfer(
         transfer_request(
             local_source(source_root.path())?,
             destination,
             tokio_util::sync::CancellationToken::new(),
         )?
-        .with_recovery(RecoveryPolicy::Restart, Some(recovery)),
+        .with_recovery(RecoveryPolicy::Restart, Some(recovery))
+        .with_source_qos(qos),
     )
     .await?;
 
     assert_eq!(role.write_completion_count() - writes_before, 2);
+    assert_eq!(
+        outcome.source_qos.client_streamed_shaped_bytes,
+        payload.len() as u64
+    );
+    assert_eq!(outcome.source_qos.source_read_operations, 2);
     assert_eq!(staging_entry_count(destination_root.path())?, 0);
     assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,
