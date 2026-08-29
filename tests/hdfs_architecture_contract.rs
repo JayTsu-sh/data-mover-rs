@@ -1,3 +1,4 @@
+use std::env;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
@@ -21,8 +22,8 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn lab_config() -> HdfsConfig {
     HdfsConfig {
-        config_dir: std::env::var_os("LAB_HDFS_CONFIG_DIR").map(Into::into),
-        kerberos_credentials: std::env::var_os("LAB_HDFS_KEYTAB").map(|keytab| {
+        config_dir: env::var_os("LAB_HDFS_CONFIG_DIR").map(Into::into),
+        kerberos_credentials: env::var_os("LAB_HDFS_KEYTAB").map(|keytab| {
             HdfsKerberosCredentials {
                 keytab: Some(keytab.into()),
                 ..Default::default()
@@ -33,7 +34,7 @@ fn lab_config() -> HdfsConfig {
 }
 
 fn lab_location(case: &str) -> TestResult<String> {
-    let root = HdfsLocation::parse(&std::env::var("LAB_HDFS_RUN_ROOT")?)?;
+    let root = HdfsLocation::parse(&env::var("LAB_HDFS_RUN_ROOT")?)?;
     let endpoint = root
         .endpoint()
         .strip_prefix("hdfs://")
