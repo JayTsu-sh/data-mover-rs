@@ -2,6 +2,7 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 
 use crate::model::{FailureClass, ObjectTag, Transience};
 
@@ -48,6 +49,7 @@ impl S3ProtocolFailure {
 }
 
 pub(crate) type S3Result<T> = Result<T, S3ProtocolFailure>;
+pub(crate) const S3_NATIVE_COPY_SINGLE_MAX: u64 = 5 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct S3ObjectFacts {
@@ -62,6 +64,30 @@ pub(crate) struct S3PartFacts {
     pub size: u64,
     pub etag: String,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct S3NativeCopySource {
+    pub bucket: String,
+    pub key: String,
+    pub etag: String,
+    pub version_id: Option<String>,
+    pub size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct S3NativeCopyEvidence {
+    pub bytes: u64,
+    pub requests: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct S3NativeCopyFailure {
+    pub error: S3ProtocolFailure,
+    pub bytes: u64,
+    pub requests: u64,
+}
+
+pub(crate) type S3NativeCopyResult = Result<S3NativeCopyEvidence, S3NativeCopyFailure>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum S3ClaimOutcome {
@@ -91,6 +117,13 @@ pub(crate) trait S3Protocol: Send + Sync {
     async fn abort_multipart(&self, key: &str, upload_id: &str) -> S3Result<()>;
     async fn list_parts(&self, key: &str, upload_id: &str) -> S3Result<Vec<S3PartFacts>>;
     async fn copy_object(&self, from: &str, to: &str) -> S3Result<()>;
+    async fn native_copy(
+        &self,
+        source: &S3NativeCopySource,
+        to: &str,
+        multipart_upload_id: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> S3NativeCopyResult;
     async fn delete_object(&self, key: &str) -> S3Result<()>;
     async fn get_tags(&self, key: &str) -> S3Result<Vec<ObjectTag>>;
     async fn put_tags(&self, key: &str, tags: &[ObjectTag]) -> S3Result<()>;

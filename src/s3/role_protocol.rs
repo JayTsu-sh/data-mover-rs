@@ -3,6 +3,12 @@ use super::{
     build_copy_source,
 };
 use bytes::Bytes;
+use tokio_util::sync::CancellationToken;
+
+use crate::storage::backends::s3::{
+    S3NativeCopyEvidence, S3NativeCopyFailure, S3NativeCopyResult, S3NativeCopySource,
+    S3ProtocolFailure, S3Result,
+};
 
 macro_rules! classify_sdk {
     ($error:expr, $diagnostic:literal) => {
@@ -25,6 +31,8 @@ macro_rules! classify_sdk {
         }
     };
 }
+
+mod native;
 
 fn decode_parts(
     parts: &[aws_sdk_s3::types::Part],
@@ -294,6 +302,16 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         }
     }
 
+    async fn native_copy(
+        &self,
+        source: &S3NativeCopySource,
+        to: &str,
+        multipart_upload_id: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> S3NativeCopyResult {
+        native::copy(self, source, to, multipart_upload_id, cancel).await
+    }
+
     async fn delete_object(&self, key: &str) -> crate::storage::backends::s3::S3Result<()> {
         self.client
             .delete_object()
@@ -559,6 +577,51 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = prepare_invalid_manifest_fixture().await?;
         assert_restartable_after_rejection(fixture).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the shared standard S3 lab"]
+    async fn standard_s3_native_multipart_copy_uses_owned_upload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let backend = S3Storage::new(&std::env::var("LAB_S3_ARCHITECTURE_URL")?, None).await?;
+        let source_path = std::env::var("LAB_S3_ARCHITECTURE_KEY")?;
+        let destination = format!("{source_path}.native-multipart");
+        let facts = backend
+            .head(&source_path)
+            .await
+            .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
+        let source = S3NativeCopySource {
+            bucket: backend.bucket_name.clone(),
+            key: backend.build_full_key(&source_path),
+            etag: facts.etag,
+            version_id: facts.version_id,
+            size: facts.size,
+        };
+        let upload_id = backend
+            .begin_multipart(&destination)
+            .await
+            .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
+        let result = native::copy_multipart_with_part_size(
+            &backend,
+            &source,
+            &destination,
+            &upload_id,
+            5 * 1024 * 1024,
+            &CancellationToken::new(),
+        )
+        .await
+        .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
+        assert!(result.requests > 3);
+        let copied = backend
+            .head(&destination)
+            .await
+            .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
+        assert_eq!(copied.size, source.size);
+        backend
+            .delete_object(&destination)
+            .await
+            .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
+        Ok(())
     }
 
     struct InvalidManifestFixture {

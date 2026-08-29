@@ -238,7 +238,11 @@ committed, printed, or written to artifacts.
 `run-s3-architecture-contract.sh` is the `DM-S3-CONTRACT` gate for the
 ArchitectureReady roles. It exercises multipart staging, interruption and
 reconnect resume, stale-upload restart, verification, publication, tags,
-cancellation, and range readback through standard `s3://` requests and removes
+cancellation, range readback, connected-pair native CopyObject into an unpublished stage,
+copy-time BLAKE3 verification, unshaped native QoS reporting, and strict client-shaped streaming
+fallback through standard `s3://` requests. Automated request contracts fix the 5 GiB strategy
+boundary, and the real gate forces multi-part `UploadPartCopy` over the contract fixture with a
+5 MiB test part size while retaining the production 1 GiB part size. The gate removes
 both published objects and unfinished multipart uploads on exit. A successful
 legacy S3 copy run does not certify this gate: the configured service must
 accept CreateMultipartUpload and the complete multipart lifecycle.

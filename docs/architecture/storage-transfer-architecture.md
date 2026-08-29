@@ -198,7 +198,13 @@ This role is crate-private. Its planner receives neutral source/destination desc
 required guarantees and returns `Planned`, `NotApplicable`, or `Rejected`. Currently only a
 conditional S3-to-S3 `CopyObject`/multipart-copy adapter may implement it. Availability is
 per connected pair, not per `BackendKind::S3`. All other backends use streaming and provide
-no empty native adapter.
+no empty native adapter. Standard S3 pairs compare an opaque affinity derived from the connected
+endpoint and compatibility profile; buckets and prefixes remain protocol-owned source/destination
+facts. Eligible copies bind the observed ETag/version, copy into an unpublished backend stage,
+then use the ordinary BLAKE3 verification and publication lifecycle. Strict client-shaped payload,
+supplied recovery state, a different endpoint, or a non-standard S3 profile selects streaming
+before remote mutation. A native operation failure retains stage cleanup authority and is never
+silently retried through streaming.
 
 ## 6. Observation model and traversal
 

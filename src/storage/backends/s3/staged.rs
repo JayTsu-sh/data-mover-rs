@@ -15,6 +15,9 @@ use crate::storage::{
 
 use super::source::{cancelled, classified_entry, entry, role_failure};
 
+mod native;
+#[cfg(test)]
+mod native_tests;
 mod publication;
 use super::{S3ClaimOutcome, S3Protocol, S3ProtocolFailure};
 
@@ -160,14 +163,35 @@ fn cleanup_result(
 }
 
 impl<P: S3Protocol> S3StagedDestination<P> {
+    async fn stage_state(
+        &self,
+        stage: &PreparedStage,
+        operation: Operation,
+    ) -> Result<StageState, StorageRoleFailure> {
+        self.states
+            .lock()
+            .await
+            .get(stage.token.as_ref())
+            .cloned()
+            .ok_or_else(|| {
+                entry(
+                    stage.final_destination.path(),
+                    operation,
+                    "S3 stage is not claimed",
+                )
+            })
+    }
+
     fn validated_recovery(
         request: &RecoverRequest,
     ) -> Result<(Bytes, String, String), StorageRoleFailure> {
         let token = Bytes::copy_from_slice(request.identity.as_bytes());
         let (key, upload_id) = Self::decode_token(&token).map_err(|()| {
-            entry(
+            classified_entry(
                 request.final_destination.path(),
                 Operation::Prepare,
+                FailureClass::Corruption,
+                Transience::Permanent,
                 "invalid S3 recovery identity",
             )
         })?;
@@ -177,9 +201,11 @@ impl<P: S3Protocol> S3StagedDestination<P> {
             recovery_binding: request.recovery_binding,
         });
         if key != expected {
-            return Err(entry(
+            return Err(classified_entry(
                 request.final_destination.path(),
                 Operation::Prepare,
+                FailureClass::Corruption,
+                Transience::Permanent,
                 "S3 recovery identity does not match destination binding",
             ));
         }
@@ -628,6 +654,10 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 self.protocol
                     .abort_multipart(&key, &stage_state.upload_id)
                     .await,
+            )?;
+            cleanup_result(
+                stage.final_destination.path(),
+                self.protocol.delete_object(&key).await,
             )?;
         }
         if let Some(claim_key) = stage_state.claim_key {

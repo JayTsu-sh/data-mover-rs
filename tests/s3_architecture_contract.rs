@@ -6,6 +6,10 @@ use data_mover::storage::{
     ExistingDestinationPolicy, FinalDestination, MetadataMutation, PreflightPolicy, PrepareRequest,
     PublishRequest, ReadRequest, RecoverRequest, SourceDescriptor, Storage, VerifyRequest,
 };
+use data_mover::transfer::{
+    InflightLimits, PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferIdentity,
+    TransferRequest, transfer,
+};
 use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -27,7 +31,49 @@ async fn standard_s3_architecture_roles_stage_publish_and_read_back() -> TestRes
     let (storage, stage) = stage_with_reconnect(&url, &path, &identity, &payload).await?;
     verify_publish_and_tag(&storage, &stage, &path, &payload).await?;
     verify_range_and_cancellation(&storage, &path, &payload).await?;
+    verify_native_and_shaped_fallback(&storage, &path, &payload).await?;
     verify_stale_upload_restart(&url, &path, &identity, payload.len()).await
+}
+
+async fn verify_native_and_shaped_fallback(
+    storage: &Storage,
+    source: &StoragePath,
+    payload: &Bytes,
+) -> TestResult {
+    let native_path = StoragePath::new(format!("{}.native", source.as_str()))?;
+    let request = transfer_request(storage, source, native_path, "native")?;
+    let qos = SourceQosGroup::new(SourceQosPolicy::new(None, u64::try_from(PART_SIZE)?, None)?);
+    let native = transfer(request.with_source_qos(qos)).await?;
+    assert_eq!(native.blake3, *blake3::hash(payload).as_bytes());
+    assert_eq!(native.source_qos.native_bytes, payload.len() as u64);
+    assert_eq!(native.source_qos.native_requests, 1);
+    assert!(!native.source_qos.native_payload_shaped);
+
+    let shaped_path = StoragePath::new(format!("{}.shaped", source.as_str()))?;
+    let shaped = transfer(
+        transfer_request(storage, source, shaped_path, "shaped")?
+            .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped),
+    )
+    .await?;
+    assert_eq!(shaped.source_qos.native_requests, 0);
+    Ok(())
+}
+
+fn transfer_request(
+    storage: &Storage,
+    source: &StoragePath,
+    final_path: StoragePath,
+    identity: &str,
+) -> TestResult<TransferRequest> {
+    Ok(TransferRequest::new(
+        TransferIdentity::new(format!("s3-contract-{identity}"))?,
+        storage.clone(),
+        source.clone(),
+        storage.clone(),
+        final_path,
+        InflightLimits::new(4, PART_SIZE, 4)?,
+        CancellationToken::new(),
+    ))
 }
 
 async fn verify_stale_upload_restart(

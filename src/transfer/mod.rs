@@ -14,4 +14,6 @@ pub use model::{
 };
 
 #[cfg(test)]
+mod s3_native_tests;
+#[cfg(test)]
 mod tests;

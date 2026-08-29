@@ -616,6 +616,7 @@ enum StorageType {
 #[derive(Clone, Debug)]
 pub struct S3Storage {
     storage_type: StorageType,
+    compatibility: S3Compatibility,
     pub(crate) endpoint: String,
     bucket_name: String,
     prefix: Option<String>,
@@ -691,7 +692,15 @@ impl S3Storage {
         &self,
         identity: crate::model::BackendIdentity,
     ) -> std::result::Result<crate::storage::Storage, Box<dyn std::error::Error>> {
-        crate::storage::backends::s3::connect(Arc::new(self.clone()), identity)
+        let native = (self.compatibility == S3Compatibility::Standard).then(|| {
+            crate::storage::backends::s3::S3NativeContext::new(
+                &self.endpoint,
+                "standard",
+                self.bucket_name.clone(),
+                self.prefix.clone(),
+            )
+        });
+        crate::storage::backends::s3::connect(Arc::new(self.clone()), identity, native)
     }
 
     /// Overrides the per-file read and write concurrency for this adapter.
@@ -877,6 +886,7 @@ impl S3Storage {
 
         Ok(Self {
             storage_type,
+            compatibility,
             endpoint,
             bucket_name,
             prefix: prefix_option,
@@ -4999,6 +5009,7 @@ mod tests {
         );
         S3Storage {
             storage_type: StorageType::S3,
+            compatibility: S3Compatibility::Standard,
             endpoint: "http://localhost:9000".to_string(),
             bucket_name: "test-bucket".to_string(),
             prefix: prefix.map(std::string::ToString::to_string),

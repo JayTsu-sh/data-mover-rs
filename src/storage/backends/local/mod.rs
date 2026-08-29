@@ -35,6 +35,7 @@ pub(crate) fn test_source_storage(
         None,
         None,
         None,
+        None,
     )?;
     Ok((storage, source))
 }
@@ -71,6 +72,7 @@ pub(crate) fn test_destination_storage_with_role(
         Some(destination.clone()),
         None,
         None,
+        None,
     )?;
     Ok((storage, destination))
 }
@@ -82,6 +84,7 @@ pub(crate) fn test_unsupported_storage(
     Ok(crate::storage::Storage::connected(
         test_identity(name),
         test_capabilities(false, false)?,
+        None,
         None,
         None,
         None,

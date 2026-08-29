@@ -4,8 +4,8 @@ use std::{error::Error, fmt};
 use crate::model::{BackendIdentity, BackendKind};
 
 use super::{
-    BackendCapabilities, Capability, CapabilityUnavailable, Metadata, Namespace, PreflightPolicy,
-    ReadSource, SourceDescriptor, StagedDestination,
+    BackendCapabilities, Capability, CapabilityUnavailable, Metadata, Namespace, NativeEndpoint,
+    NativePair, PreflightPolicy, ReadSource, StagedDestination,
 };
 
 #[derive(Clone, Default)]
@@ -14,6 +14,7 @@ struct BackendRoles {
     staged_destination: Option<Arc<dyn StagedDestination>>,
     namespace: Option<Arc<dyn Namespace>>,
     metadata: Option<Arc<dyn Metadata>>,
+    native: Option<Arc<dyn NativeEndpoint>>,
 }
 
 #[derive(Clone)]
@@ -72,12 +73,14 @@ impl Storage {
         staged_destination: Option<Arc<dyn StagedDestination>>,
         namespace: Option<Arc<dyn Namespace>>,
         metadata: Option<Arc<dyn Metadata>>,
+        native: Option<Arc<dyn NativeEndpoint>>,
     ) -> Result<Self, StorageBuildError> {
         let roles = BackendRoles {
             read_source,
             staged_destination,
             namespace,
             metadata,
+            native,
         };
         for (capability, present) in [
             (Capability::ReadSource, roles.read_source.is_some()),
@@ -187,41 +190,13 @@ impl Storage {
             .map(Arc::clone)
             .ok_or_else(|| CapabilityUnavailable::missing_role(Capability::Metadata))
     }
-}
 
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GuaranteeRequirement {
-    Required,
-    NotRequired,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RequiredGuarantees {
-    pub independent_verification: GuaranteeRequirement,
-    pub preserve_metadata: GuaranteeRequirement,
-    pub client_shaped_qos: GuaranteeRequirement,
-    pub recoverable: GuaranteeRequirement,
-    pub atomic_publication: GuaranteeRequirement,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum NativePlan {
-    Planned { native_requests: u32 },
-    NotApplicable,
-    Rejected { reason: &'static str },
-}
-
-#[allow(dead_code)]
-pub(crate) trait NativeTransfer: Send + Sync {
-    fn plan(
-        &self,
-        source: &SourceDescriptor,
-        destination: &Storage,
-        required: RequiredGuarantees,
-    ) -> NativePlan;
+    pub(crate) fn native_pair(&self, destination: &Self) -> Option<NativePair> {
+        NativePair::new(
+            Arc::clone(self.backend.roles().native.as_ref()?),
+            Arc::clone(destination.backend.roles().native.as_ref()?),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -230,29 +205,11 @@ mod tests {
 
     use super::*;
     use crate::storage::{
-        ByteStream, CapabilityAvailability, ReadRequest, StorageRoleFailure, UnsupportedReason,
+        ByteStream, CapabilityAvailability, ReadRequest, SourceDescriptor, StorageRoleFailure,
+        UnsupportedReason,
     };
 
     struct DummyRead;
-
-    struct GuaranteeAwareNativePlanner;
-
-    impl NativeTransfer for GuaranteeAwareNativePlanner {
-        fn plan(
-            &self,
-            _source: &SourceDescriptor,
-            _destination: &Storage,
-            required: RequiredGuarantees,
-        ) -> NativePlan {
-            if required.client_shaped_qos == GuaranteeRequirement::Required {
-                NativePlan::Rejected {
-                    reason: "native path cannot preserve client-shaped QoS",
-                }
-            } else {
-                NativePlan::Planned { native_requests: 1 }
-            }
-        }
-    }
 
     #[async_trait]
     impl ReadSource for DummyRead {
@@ -293,6 +250,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )?;
             assert_eq!(storage.kind(), kind);
             assert!(storage.read_source(&PreflightPolicy::production()).is_ok());
@@ -324,69 +282,13 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let Err(error) = result else {
             return Err("supported source capability without a role was accepted".into());
         };
 
         assert_eq!(error.capability, Capability::ReadSource);
-        Ok(())
-    }
-
-    #[test]
-    fn native_planner_must_account_for_required_guarantees()
-    -> Result<(), Box<dyn std::error::Error>> {
-        use crate::model::{EntryKind, IdentityStrength, SourceIdentity, StoragePath};
-
-        let unsupported =
-            CapabilityAvailability::Unsupported(UnsupportedReason::new("not supplied")?);
-        let destination = Storage::connected(
-            BackendIdentity::new(BackendKind::S3, "destination")?,
-            BackendCapabilities::new(
-                CapabilityAvailability::Supported,
-                unsupported.clone(),
-                unsupported.clone(),
-                unsupported,
-            ),
-            Some(Arc::new(DummyRead)),
-            None,
-            None,
-            None,
-        )?;
-        let source_backend = BackendIdentity::new(BackendKind::S3, "source")?;
-        let source = SourceDescriptor {
-            path: StoragePath::new("bucket/key")?,
-            kind: EntryKind::File,
-            size: Some(1),
-            source_identity: SourceIdentity::new(
-                source_backend,
-                IdentityStrength::StableWithinBackend,
-                b"etag",
-            )?,
-        };
-        let baseline = RequiredGuarantees {
-            independent_verification: GuaranteeRequirement::Required,
-            preserve_metadata: GuaranteeRequirement::Required,
-            client_shaped_qos: GuaranteeRequirement::NotRequired,
-            recoverable: GuaranteeRequirement::Required,
-            atomic_publication: GuaranteeRequirement::Required,
-        };
-
-        assert_eq!(
-            GuaranteeAwareNativePlanner.plan(&source, &destination, baseline),
-            NativePlan::Planned { native_requests: 1 }
-        );
-        assert!(matches!(
-            GuaranteeAwareNativePlanner.plan(
-                &source,
-                &destination,
-                RequiredGuarantees {
-                    client_shaped_qos: GuaranteeRequirement::Required,
-                    ..baseline
-                }
-            ),
-            NativePlan::Rejected { .. }
-        ));
         Ok(())
     }
 }

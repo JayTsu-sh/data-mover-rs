@@ -114,13 +114,16 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
                 if cancel.is_cancelled() {
                     return Err(cancelled(&path, Operation::Read));
                 }
-                let end = (offset + chunk_size).min(limit);
-                if let Some(budget) = &qos {
+                let requested = (offset + chunk_size).min(limit) - offset;
+                let granted = if let Some(budget) = &qos {
                     budget
-                        .admit_read(end - offset, &cancel)
+                        .admit_read(requested, &cancel)
                         .await
-                        .map_err(|_| cancelled(&path, Operation::Read))?;
-                }
+                        .map_err(|_| cancelled(&path, Operation::Read))?
+                } else {
+                    requested
+                };
+                let end = offset + granted;
                 let bytes = protocol
                     .get_range(path.as_str(), offset..end)
                     .await

@@ -3,7 +3,13 @@
 pub(crate) mod backends;
 mod capability;
 mod handle;
+mod native;
 mod roles;
+
+pub(crate) use native::{
+    NativeAffinity, NativeEndpoint, NativePair, NativeSourceBinding, NativeStageEvidence,
+    NativeStageFailure,
+};
 
 pub use crate::runtime::qos::{
     SourceQosBudget, SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError,

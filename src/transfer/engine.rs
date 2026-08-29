@@ -13,11 +13,13 @@ use crate::runtime::inflight::{
     InflightConfig, InflightFailure, InflightRuntime, OrderedChunks, ReadRange, SequentialRanges,
 };
 use crate::storage::{
-    CheckpointObservation, FinalDestination, PreflightPolicy, PrepareRequest, PreparedStage,
-    PublicationDisposition, PublicationEvidence, PublishRequest, ReadRequest, ReadSource,
-    SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination, StorageRoleFailure,
-    VerifyRequest, WriteEvidence,
+    CheckpointObservation, FinalDestination, NativePair, PreflightPolicy, PrepareRequest,
+    PreparedStage, PublicationDisposition, PublicationEvidence, PublishRequest, ReadRequest,
+    ReadSource, SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination,
+    StorageRoleFailure, VerifyRequest, WriteEvidence,
 };
+
+mod native;
 
 /// Lifecycle stage at which one transfer attempt stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +45,7 @@ pub enum TransferSide {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TransferDataPath {
     Streaming,
+    Native,
 }
 
 #[derive(Clone, Copy)]
@@ -243,6 +246,8 @@ pub(crate) struct Transferred {
     data_path: TransferDataPath,
     source_blake3: [u8; 32],
     source_qos: Option<SourceQosBudget>,
+    native_bytes: u64,
+    native_requests: u64,
 }
 
 /// Successful final outcome of one transfer attempt.
@@ -363,6 +368,8 @@ fn transferred_source_qos(transferred: &Transferred) -> SourceQosStats {
     transferred.source_qos.as_ref().map_or(
         SourceQosStats {
             logical_bytes: transferred.checkpoint.durable_prefix,
+            native_bytes: transferred.native_bytes,
+            native_requests: transferred.native_requests,
             ..SourceQosStats::default()
         },
         SourceQosBudget::stats,
@@ -435,8 +442,24 @@ async fn run_until_transferred_inner(
             "transfer was cancelled before prepare",
         ));
     }
-    let plan = plan_transfer(&descriptor, request.inflight, request.payload_shaping)?;
+    let native_pair = native::eligible_native_pair(&request);
+    let plan = plan_transfer(&descriptor, request.inflight, native_pair.is_some())?;
     let recovery_binding = recovery_binding(&request, &descriptor);
+    if let Some(pair) = native_pair {
+        return native::transfer_native(
+            &request,
+            native::NativeTransferInput {
+                source,
+                destination,
+                descriptor,
+                pair,
+                recovery_binding,
+                source_qos,
+                plan,
+            },
+        )
+        .await;
+    }
     let stage = select_stage(&request, &destination, &descriptor, recovery_binding).await?;
     let identity = request.identity.clone();
     let result = transfer_stage(
@@ -460,6 +483,8 @@ async fn run_until_transferred_inner(
             data_path: plan.data_path,
             source_blake3: evidence.source_blake3,
             source_qos,
+            native_bytes: 0,
+            native_requests: 0,
         }),
         Err(error) => Err(error.with_stage(destination, stage)),
     }
@@ -570,7 +595,7 @@ fn lend_transfer_roles(request: &TransferRequest) -> Result<TransferRoles, Trans
 fn plan_transfer(
     descriptor: &SourceDescriptor,
     limits: super::InflightLimits,
-    _payload_shaping: super::PayloadShapingPolicy,
+    native: bool,
 ) -> Result<TransferPlan, TransferFailure> {
     if descriptor.kind != EntryKind::File {
         return Err(TransferFailure::orchestration(
@@ -582,7 +607,11 @@ fn plan_transfer(
         TransferFailure::orchestration(TransferPhase::Describe, "source has no byte size")
     })?;
     Ok(TransferPlan {
-        data_path: TransferDataPath::Streaming,
+        data_path: if native {
+            TransferDataPath::Native
+        } else {
+            TransferDataPath::Streaming
+        },
         source_size,
         chunk_bytes: limits.bytes,
     })

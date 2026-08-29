@@ -197,7 +197,7 @@ profiles:
       restart_upload: required
       publication: {state: required, guarantee: complete_multipart_object_visibility}
       cancellation: required
-      native_transfer: {state: required, applicability: connected_pair_planner_only}
+      native_transfer: {state: required, applicability: standard_s3_connected_pair_only, mechanism: conditional_copyobject_or_multipart_copy_to_unpublished_stage, fallback: streaming_before_mutation}
       content_readback: required
       directory: unsupported
       symlink: unsupported

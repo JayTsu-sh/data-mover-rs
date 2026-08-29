@@ -1,6 +1,7 @@
 //! Standard S3 roles for the `ArchitectureReady` storage seam.
 
 mod metadata;
+mod native;
 mod protocol;
 #[cfg(test)]
 mod recovery_tests;
@@ -13,12 +14,17 @@ use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
 
 pub(crate) use protocol::{
-    S3ClaimOutcome, S3ObjectFacts, S3PartFacts, S3Protocol, S3ProtocolFailure, S3Result,
+    S3_NATIVE_COPY_SINGLE_MAX, S3ClaimOutcome, S3NativeCopyEvidence, S3NativeCopyFailure,
+    S3NativeCopyResult, S3NativeCopySource, S3ObjectFacts, S3PartFacts, S3Protocol,
+    S3ProtocolFailure, S3Result,
 };
+
+pub(crate) use native::S3NativeContext;
 
 pub(crate) fn connect<P>(
     protocol: Arc<P>,
     identity: BackendIdentity,
+    native_context: Option<S3NativeContext>,
 ) -> Result<Storage, Box<dyn std::error::Error>>
 where
     P: S3Protocol + 'static,
@@ -34,6 +40,14 @@ where
         protocol.clone(),
         identity.clone(),
     ));
+    let native = native_context.map(|context| {
+        Arc::new(native::S3NativeEndpoint::new(
+            protocol.clone(),
+            staged.clone(),
+            identity.clone(),
+            context,
+        )) as Arc<dyn crate::storage::NativeEndpoint>
+    });
     let metadata = Arc::new(metadata::S3Metadata::new(protocol));
     Storage::connected(
         identity,
@@ -49,13 +63,14 @@ where
         Some(staged),
         None,
         Some(metadata),
+        native,
     )
     .map_err(Into::into)
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::ops::Range;
     use std::sync::Arc;
@@ -77,8 +92,8 @@ pub(super) mod tests {
     pub(super) type UploadParts = HashMap<String, (String, Vec<(i32, Bytes)>)>;
 
     #[derive(Default)]
-    pub(super) struct MemoryS3 {
-        objects: Mutex<HashMap<String, Bytes>>,
+    pub(crate) struct MemoryS3 {
+        pub(crate) objects: Mutex<HashMap<String, Bytes>>,
         pub(super) uploads: Mutex<UploadParts>,
         tags: Mutex<HashMap<String, Vec<ObjectTag>>>,
         tag_reads: Mutex<u32>,
@@ -87,6 +102,8 @@ pub(super) mod tests {
         head_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
         pub(super) claims: Mutex<HashMap<String, [u8; 32]>>,
         copy_commits_then_fails: Mutex<bool>,
+        pub(crate) native_copies: Mutex<u64>,
+        pub(crate) native_failure: Mutex<Option<S3ProtocolFailure>>,
     }
 
     #[async_trait]
@@ -226,6 +243,62 @@ pub(super) mod tests {
                 Ok(())
             }
         }
+        async fn native_copy(
+            &self,
+            source: &S3NativeCopySource,
+            to: &str,
+            _multipart_upload_id: Option<&str>,
+            cancel: &CancellationToken,
+        ) -> S3NativeCopyResult {
+            if let Some(failure) = self.native_failure.lock().await.clone() {
+                return Err(S3NativeCopyFailure {
+                    error: failure,
+                    bytes: 0,
+                    requests: 1,
+                });
+            }
+            if cancel.is_cancelled() {
+                return Err(S3NativeCopyFailure {
+                    error: S3ProtocolFailure::entry(
+                        crate::model::FailureClass::Cancelled,
+                        crate::model::Transience::Permanent,
+                        "native copy cancelled",
+                    ),
+                    bytes: 0,
+                    requests: 0,
+                });
+            }
+            let bytes = self
+                .objects
+                .lock()
+                .await
+                .get(&source.key)
+                .cloned()
+                .ok_or_else(|| S3NativeCopyFailure {
+                    error: S3ProtocolFailure::protocol("not found"),
+                    bytes: 0,
+                    requests: 1,
+                })?;
+            if blake3::hash(&bytes).to_hex().as_str() != source.etag
+                || bytes.len() as u64 != source.size
+            {
+                return Err(S3NativeCopyFailure {
+                    error: S3ProtocolFailure::entry(
+                        crate::model::FailureClass::Conflict,
+                        crate::model::Transience::Permanent,
+                        "native source changed",
+                    ),
+                    bytes: 0,
+                    requests: 1,
+                });
+            }
+            self.objects.lock().await.insert(to.to_string(), bytes);
+            *self.native_copies.lock().await += 1;
+            Ok(S3NativeCopyEvidence {
+                bytes: source.size,
+                requests: 1,
+            })
+        }
         async fn delete_object(&self, key: &str) -> S3Result<()> {
             self.objects.lock().await.remove(key);
             Ok(())
@@ -258,7 +331,7 @@ pub(super) mod tests {
         }
     }
 
-    pub(super) fn identity() -> BackendIdentity {
+    pub(crate) fn identity() -> BackendIdentity {
         BackendIdentity::new(BackendKind::S3, "memory-bucket").expect("valid identity")
     }
 
@@ -266,10 +339,18 @@ pub(super) mod tests {
         crate::storage::PreflightPolicy::production()
     }
 
+    pub(crate) fn native_context() -> S3NativeContext {
+        S3NativeContext::new("memory://s3", "standard", "memory".into(), None)
+    }
+
     #[test]
     fn certified_standard_s3_roles_are_available_in_production()
     -> Result<(), Box<dyn std::error::Error>> {
-        let storage = connect(Arc::new(MemoryS3::default()), identity())?;
+        let storage = connect(
+            Arc::new(MemoryS3::default()),
+            identity(),
+            Some(native_context()),
+        )?;
         assert!(storage.read_source(&validation_policy()).is_ok());
         assert!(storage.staged_destination(&validation_policy()).is_ok());
         assert!(storage.metadata(&validation_policy()).is_ok());
@@ -291,7 +372,7 @@ pub(super) mod tests {
             .lock()
             .await
             .insert("source".into(), Bytes::from_static(b"0123456789"));
-        let storage = connect(protocol.clone(), identity())?;
+        let storage = connect(protocol.clone(), identity(), Some(native_context()))?;
         let policy = validation_policy();
         let source = storage.read_source(&policy)?;
         let descriptor = source.describe(&StoragePath::new("source")?).await?;
@@ -357,7 +438,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn tags_are_lazy_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let protocol = Arc::new(MemoryS3::default());
-        let storage = connect(protocol.clone(), identity())?;
+        let storage = connect(protocol.clone(), identity(), Some(native_context()))?;
         let metadata = storage.metadata(&validation_policy())?;
         let path = StoragePath::new("tagged")?;
         let omitted = metadata.observe(&path, ObservationPlan::default()).await?;
@@ -386,7 +467,7 @@ pub(super) mod tests {
     async fn failed_input_preserves_checkpoint_until_explicit_discard()
     -> Result<(), Box<dyn std::error::Error>> {
         let protocol = Arc::new(MemoryS3::default());
-        let storage = connect(protocol.clone(), identity())?;
+        let storage = connect(protocol.clone(), identity(), Some(native_context()))?;
         let destination = storage.staged_destination(&validation_policy())?;
         let path = StoragePath::new("final")?;
         let source_identity = crate::model::SourceIdentity::new(
@@ -433,7 +514,7 @@ pub(super) mod tests {
             .lock()
             .await
             .insert("source".into(), Bytes::from_static(b"payload"));
-        let storage = connect(protocol, identity())?;
+        let storage = connect(protocol, identity(), Some(native_context()))?;
         let source = storage.read_source(&validation_policy())?;
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -465,7 +546,7 @@ pub(super) mod tests {
     async fn destination_head_session_failure_never_means_absent()
     -> Result<(), Box<dyn std::error::Error>> {
         let protocol = Arc::new(MemoryS3::default());
-        let storage = connect(protocol.clone(), identity())?;
+        let storage = connect(protocol.clone(), identity(), Some(native_context()))?;
         let destination = storage.staged_destination(&validation_policy())?;
         let path = StoragePath::new("final")?;
         let source_identity = crate::model::SourceIdentity::new(
@@ -528,7 +609,7 @@ pub(super) mod tests {
     async fn multipart_checkpoint_is_reobserved_and_resumed_after_reconnect()
     -> Result<(), Box<dyn std::error::Error>> {
         let protocol = Arc::new(MemoryS3::default());
-        let first_storage = connect(protocol.clone(), identity())?;
+        let first_storage = connect(protocol.clone(), identity(), Some(native_context()))?;
         let policy = validation_policy();
         let destination = first_storage.staged_destination(&policy)?;
         let final_path = StoragePath::new("resumed-final")?;
@@ -568,7 +649,7 @@ pub(super) mod tests {
         let checkpoint = destination.observe_checkpoint(&stage).await?.durable_prefix;
         assert_eq!(checkpoint, part.len() as u64);
 
-        let second_storage = connect(protocol.clone(), identity())?;
+        let second_storage = connect(protocol.clone(), identity(), Some(native_context()))?;
         let resumed_destination = second_storage.staged_destination(&policy)?;
         let persisted_recovery = recovery.as_bytes().clone();
         let resumed = resumed_destination
@@ -587,7 +668,8 @@ pub(super) mod tests {
                 .durable_prefix,
             checkpoint
         );
-        let competing = connect(protocol.clone(), identity())?.staged_destination(&policy)?;
+        let competing = connect(protocol.clone(), identity(), Some(native_context()))?
+            .staged_destination(&policy)?;
         let conflict = competing
             .recover(crate::storage::RecoverRequest {
                 identity: crate::storage::RecoveryIdentity::from_bytes(persisted_recovery)?,
@@ -650,7 +732,7 @@ pub(super) mod tests {
     async fn publication_reconciles_a_committed_copy_with_a_lost_response()
     -> Result<(), Box<dyn std::error::Error>> {
         let protocol = Arc::new(MemoryS3::default());
-        let storage = connect(protocol.clone(), identity())?;
+        let storage = connect(protocol.clone(), identity(), Some(native_context()))?;
         let policy = validation_policy();
         let destination = storage.staged_destination(&policy)?;
         let payload = Bytes::from_static(b"ambiguous publication payload");

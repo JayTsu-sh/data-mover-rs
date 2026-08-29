@@ -136,6 +136,8 @@ struct SourceQosCounters {
     logical_bytes: AtomicU64,
     shaped_bytes: AtomicU64,
     source_read_operations: AtomicU64,
+    native_bytes: AtomicU64,
+    native_requests: AtomicU64,
 }
 
 /// Per-transfer accounting handle backed by a shared group scheduler.
@@ -168,9 +170,9 @@ impl SourceQosBudget {
         SourceQosStats {
             logical_bytes: self.stats.logical_bytes.load(Ordering::Relaxed),
             client_streamed_shaped_bytes: self.stats.shaped_bytes.load(Ordering::Relaxed),
-            native_bytes: 0,
+            native_bytes: self.stats.native_bytes.load(Ordering::Relaxed),
             source_read_operations: self.stats.source_read_operations.load(Ordering::Relaxed),
-            native_requests: 0,
+            native_requests: self.stats.native_requests.load(Ordering::Relaxed),
             native_payload_shaped: false,
         }
     }
@@ -234,6 +236,13 @@ impl SourceQosBudget {
 
     pub(crate) fn record_read_bytes(&self, bytes: u64) {
         self.stats.shaped_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_native(&self, bytes: u64, requests: u64) {
+        self.stats.native_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.stats
+            .native_requests
+            .fetch_add(requests, Ordering::Relaxed);
     }
 }
 

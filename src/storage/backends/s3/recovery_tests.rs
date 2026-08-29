@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::tests::{MemoryS3, identity, validation_policy};
+use super::tests::{MemoryS3, identity, native_context, validation_policy};
 use super::{S3ProtocolFailure, connect};
 use crate::model::{
     EntryKind, FailureClass, IdentityStrength, SourceIdentity, StoragePath, Transience,
@@ -23,8 +23,8 @@ struct Fixture {
 
 async fn fixture(name: &str, binding: [u8; 32]) -> TestResult<Fixture> {
     let protocol = Arc::new(MemoryS3::default());
-    let destination =
-        connect(protocol.clone(), identity())?.staged_destination(&validation_policy())?;
+    let destination = connect(protocol.clone(), identity(), Some(native_context()))?
+        .staged_destination(&validation_policy())?;
     let source = SourceDescriptor {
         path: StoragePath::new("source")?,
         kind: EntryKind::File,
@@ -100,8 +100,8 @@ async fn invalid_manifest_is_owned_cleaned_and_rejected() -> TestResult {
         .recovery_identity(&fixture.stage)
         .await?;
     let upload_id = inject_gap(&fixture).await?;
-    let reconnected =
-        connect(fixture.protocol.clone(), identity())?.staged_destination(&validation_policy())?;
+    let reconnected = connect(fixture.protocol.clone(), identity(), Some(native_context()))?
+        .staged_destination(&validation_policy())?;
     let result = reconnected
         .recover(recover_request(recovery, &fixture.prepare, [7; 32]))
         .await;
@@ -128,8 +128,8 @@ async fn missing_upload_releases_claim_and_allows_fresh_prepare() -> TestResult 
         .recovery_identity(&fixture.stage)
         .await?;
     fixture.protocol.uploads.lock().await.clear();
-    let reconnected =
-        connect(fixture.protocol.clone(), identity())?.staged_destination(&validation_policy())?;
+    let reconnected = connect(fixture.protocol.clone(), identity(), Some(native_context()))?
+        .staged_destination(&validation_policy())?;
     let result = reconnected
         .recover(recover_request(recovery, &fixture.prepare, [2; 32]))
         .await;
@@ -156,8 +156,8 @@ async fn invalid_cleanup_failure_retains_claim_and_upload() -> TestResult {
         .await?;
     let upload_id = inject_gap(&fixture).await?;
     *fixture.protocol.abort_failure.lock().await = Some(abort_failure());
-    let reconnected =
-        connect(fixture.protocol.clone(), identity())?.staged_destination(&validation_policy())?;
+    let reconnected = connect(fixture.protocol.clone(), identity(), Some(native_context()))?
+        .staged_destination(&validation_policy())?;
     let result = reconnected
         .recover(recover_request(recovery, &fixture.prepare, [3; 32]))
         .await;
@@ -187,8 +187,8 @@ async fn discard_failure_can_reconnect_and_retry_cleanup() -> TestResult {
         Err(StorageRoleFailure::Session(_))
     ));
     *fixture.protocol.abort_failure.lock().await = None;
-    let reconnected =
-        connect(fixture.protocol.clone(), identity())?.staged_destination(&validation_policy())?;
+    let reconnected = connect(fixture.protocol.clone(), identity(), Some(native_context()))?
+        .staged_destination(&validation_policy())?;
     let recovered = reconnected
         .recover(recover_request(recovery, &fixture.prepare, [6; 32]))
         .await?;
