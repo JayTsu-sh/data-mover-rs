@@ -86,6 +86,13 @@ claims. ACL operations are exercised rather than inferred from a capability bit:
 observed and SETACL must fail as typed permanent `Unsupported`; named attributes are also typed
 `Unsupported`.
 
+`run-nfs41-contract.sh <run-id>` is the independent `DM-NFS41-CONTRACT` gate across the source
+and destination Linux NFS servers using exact `version=4.1` URLs. It replaces a source directory
+after the role has cached its old file handle, then covers ACL operation results, traversal,
+streaming integrity, in-flight cancellation, restart upload, reconnect recovery, and competing
+recovery claims. Named attributes must return typed `Unsupported` until the adapter implements
+that operation.
+
 The nightly workflow runs this matrix three times: with protocol defaults,
 strictly serial read/write pipelines, and higher read/write concurrency. Release
 validation runs the defaults and higher-concurrency profiles. The integrity and

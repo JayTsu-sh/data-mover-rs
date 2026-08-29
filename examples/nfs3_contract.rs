@@ -55,6 +55,7 @@ struct Args {
 enum ContractDialect {
     Nfs3,
     Nfs40,
+    Nfs41,
 }
 
 async fn validate_stale_retry(
@@ -107,7 +108,7 @@ fn nonzero(value: usize) -> ContractResult<NonZeroUsize> {
         .ok_or_else(|| std::io::Error::other("contract bound must be nonzero").into())
 }
 
-async fn probe_v40_acl(
+async fn probe_nfs4_acl(
     mount: &dyn nfs_rs::Mount,
     file: &str,
     expect_setacl_unsupported: bool,
@@ -129,7 +130,7 @@ async fn probe_v40_acl(
     }
 }
 
-async fn seed_v40_fixture(
+async fn seed_nfs4_fixture(
     mount_url: &str,
     root: &str,
     expect_setacl_unsupported: bool,
@@ -193,7 +194,7 @@ async fn seed_v40_fixture(
     let _ = mount.remove_path(&link).await;
     mount.symlink_path("fixture.bin", &link).await?;
     eprintln!("contract stage: probe raw nfs-rs ACL operations");
-    probe_v40_acl(
+    probe_nfs4_acl(
         mount.as_ref(),
         &format!("{root}/fixture.bin"),
         expect_setacl_unsupported,
@@ -204,7 +205,7 @@ async fn seed_v40_fixture(
     Ok(())
 }
 
-async fn validate_v40_stale_retry(
+async fn validate_nfs4_stale_retry(
     source: &Storage,
     mount_url: &str,
     root: &str,
@@ -270,8 +271,10 @@ fn validate_fixture_metadata(
         ContractDialect::Nfs3 if !matches!(acl, MetadataObservation::Unsupported) => {
             return Err(format!("NFSv3 ACL was not typed unsupported: {acl:?}").into());
         }
-        ContractDialect::Nfs40 if !matches!(acl, MetadataObservation::Value { .. }) => {
-            return Err(format!("NFSv4.0 GETACL did not return a value: {acl:?}").into());
+        ContractDialect::Nfs40 | ContractDialect::Nfs41
+            if !matches!(acl, MetadataObservation::Value { .. }) =>
+        {
+            return Err(format!("NFSv4 GETACL did not return a value: {acl:?}").into());
         }
         _ => {}
     }
@@ -285,7 +288,7 @@ async fn validate_traversal(source: &Storage, dialect: ContractDialect) -> Contr
     let traversal = StorageTraversalSource::new(source)?;
     let acl_mode = match dialect {
         ContractDialect::Nfs3 => ObservationMode::Required,
-        ContractDialect::Nfs40 => ObservationMode::BestEffort,
+        ContractDialect::Nfs40 | ContractDialect::Nfs41 => ObservationMode::BestEffort,
     };
     let mut session = traversal.traverse(TraversalRequest {
         root: StoragePath::root(),
@@ -331,8 +334,8 @@ fn assert_acl_set_result<T>(
             Ok(())
         }
         (Ok(_), false) => Ok(()),
-        (Ok(_), true) => Err("NFSv4.0 SETACL succeeded but Unsupported was required".into()),
-        (Err(error), _) => Err(format!("unexpected NFSv4.0 ACL result: {error:?}").into()),
+        (Ok(_), true) => Err("NFSv4 SETACL succeeded but Unsupported was required".into()),
+        (Err(error), _) => Err(format!("unexpected NFSv4 ACL result: {error:?}").into()),
     }
 }
 
@@ -546,7 +549,7 @@ async fn validate_recovery(source: &Storage, destination: Storage, url: &str) ->
 async fn main() -> ContractResult {
     let args = Args::parse();
     if let (Some(mount), Some(root)) = (&args.seed_mount, &args.seed_root) {
-        seed_v40_fixture(mount, root, args.expect_setacl_unsupported).await?;
+        seed_nfs4_fixture(mount, root, args.expect_setacl_unsupported).await?;
     }
     eprintln!("contract stage: connect production role handles");
     let source = data_mover::nfs::create_nfs_role_storage(
@@ -569,23 +572,23 @@ async fn main() -> ContractResult {
         args.stale_go_file.as_deref(),
     )
     .await?;
-    if args.dialect == ContractDialect::Nfs40 {
+    if args.dialect != ContractDialect::Nfs3 && args.stale_ready_file.is_none() {
         let mount = args
             .seed_mount
             .as_deref()
-            .ok_or("NFSv4.0 contract requires --seed-mount")?;
+            .ok_or("NFSv4 contract requires --seed-mount")?;
         let root = args
             .seed_root
             .as_deref()
-            .ok_or("NFSv4.0 contract requires --seed-root")?;
-        validate_v40_stale_retry(&source, mount, root, args.require_stale_identity_change).await?;
+            .ok_or("NFSv4 contract requires --seed-root")?;
+        validate_nfs4_stale_retry(&source, mount, root, args.require_stale_identity_change).await?;
     }
     eprintln!("contract stage: traversal and metadata");
     validate_traversal(&source, args.dialect).await?;
     validate_acl(&source, args.dialect, args.expect_setacl_unsupported).await?;
     eprintln!("contract stage: streaming transfer");
     validate_streaming_copy(&source, &destination).await?;
-    if args.dialect == ContractDialect::Nfs40 {
+    if args.dialect != ContractDialect::Nfs3 {
         eprintln!("contract stage: cancellation and restart upload");
         validate_cancel_and_restart(&source, &destination).await?;
     }
@@ -596,6 +599,7 @@ async fn main() -> ContractResult {
         match args.dialect {
             ContractDialect::Nfs3 => "DM-NFS3-CONTRACT",
             ContractDialect::Nfs40 => "DM-NFS40-CONTRACT",
+            ContractDialect::Nfs41 => "DM-NFS41-CONTRACT",
         }
     );
     Ok(())

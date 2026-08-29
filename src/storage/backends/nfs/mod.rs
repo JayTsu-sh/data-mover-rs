@@ -15,9 +15,8 @@ pub(crate) mod staged;
 
 use std::sync::Arc;
 
-use crate::model::{BackendIdentity, BackendKind, NfsVersion};
-use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage, ValidationGate};
-use common::NfsInstanceFacts;
+use crate::model::{BackendIdentity, BackendKind};
+use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
 
 #[allow(dead_code)]
 pub(crate) fn connect<P>(
@@ -33,8 +32,8 @@ where
         + 'static,
 {
     validate_identity(&identity)?;
-    let facts = protocol.instance_facts()?;
-    let capabilities = capabilities(facts)?;
+    protocol.instance_facts()?;
+    let capabilities = capabilities();
     let source = Arc::new(source::NfsReadSourceAdapter::new(
         protocol.clone(),
         identity.clone(),
@@ -77,27 +76,13 @@ impl std::fmt::Display for NfsConnectError {
 
 impl std::error::Error for NfsConnectError {}
 
-fn capabilities(
-    facts: NfsInstanceFacts,
-) -> Result<BackendCapabilities, crate::storage::CapabilityValueError> {
-    let gate = match facts.dialect {
-        NfsVersion::V3 | NfsVersion::V4_0 => {
-            return Ok(BackendCapabilities::new(
-                CapabilityAvailability::Supported,
-                CapabilityAvailability::Supported,
-                CapabilityAvailability::Supported,
-                CapabilityAvailability::Supported,
-            ));
-        }
-        NfsVersion::V4_1 => "DM-NFS41-CONTRACT",
-    };
-    let availability = CapabilityAvailability::Uncertified(ValidationGate::new(gate)?);
-    Ok(BackendCapabilities::new(
-        availability.clone(),
-        availability.clone(),
-        availability.clone(),
-        availability,
-    ))
+fn capabilities() -> BackendCapabilities {
+    BackendCapabilities::new(
+        CapabilityAvailability::Supported,
+        CapabilityAvailability::Supported,
+        CapabilityAvailability::Supported,
+        CapabilityAvailability::Supported,
+    )
 }
 
 #[cfg(test)]
@@ -106,33 +91,12 @@ mod tests {
     use crate::storage::{Capability, CapabilityAvailability};
 
     #[test]
-    fn certified_v3_and_v40_are_supported_while_v41_keeps_its_independent_gate() {
-        for (dialect, gate) in [
-            (NfsVersion::V3, "DM-NFS3-CONTRACT"),
-            (NfsVersion::V4_0, "DM-NFS40-CONTRACT"),
-            (NfsVersion::V4_1, "DM-NFS41-CONTRACT"),
-        ] {
-            let values = capabilities(NfsInstanceFacts {
-                dialect,
-                max_read_size: 65_536,
-                max_write_size: 65_536,
-                acl: dialect != NfsVersion::V3,
-                xattrs: dialect != NfsVersion::V3,
-                stable_writes: true,
-            })
-            .unwrap_or_else(|error| panic!("{error}"));
-            if matches!(dialect, NfsVersion::V3 | NfsVersion::V4_0) {
-                assert_eq!(
-                    values.availability(Capability::ReadSource),
-                    &CapabilityAvailability::Supported
-                );
-            } else {
-                assert!(matches!(
-                    values.availability(Capability::ReadSource),
-                    CapabilityAvailability::Uncertified(required) if required.as_str() == gate
-                ));
-            }
-        }
+    fn certified_nfs_roles_are_supported() {
+        let values = capabilities();
+        assert_eq!(
+            values.availability(Capability::ReadSource),
+            &CapabilityAvailability::Supported,
+        );
     }
 
     #[test]

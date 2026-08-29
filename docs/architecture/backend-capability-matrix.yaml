@@ -138,7 +138,7 @@ profiles:
       rename: required
       delete: required
       acl: required
-      xattr: required
+      xattr: {state: unsupported, reason: current_nfs41_protocol_adapter_has_no_named_attribute_operation}
       tags: not_applicable
       uid_gid_mode: required
       timestamps: required

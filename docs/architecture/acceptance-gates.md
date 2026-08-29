@@ -172,7 +172,9 @@ cannot substitute.
 - `TS-NFS41-REMOTE`
 
 The gate independently covers v4.1 sessions/state, file handles, reconnect, stable writes,
-ACL/xattr, rename/replace, replay safety, and recovery.
+operation-result ACL behavior, rename/replace, replay safety, in-flight cancellation, restart
+upload, and recovery. Named attributes are typed `Unsupported` by the current adapter and are
+requested by the gate so the result cannot be inferred from the NFS minor version.
 
 ### CIFS / ONTAP FAS2750
 

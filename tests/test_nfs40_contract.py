@@ -42,7 +42,7 @@ class Nfs40ContractTest(unittest.TestCase):
 
     def test_contract_replaces_a_real_v40_file_handle(self):
         contract = (ROOT / "examples/nfs3_contract.rs").read_text()
-        self.assertIn("validate_v40_stale_retry", contract)
+        self.assertIn("validate_nfs4_stale_retry", contract)
         self.assertIn("stale fixture did not replace the file identity", contract)
         self.assertIn("MetadataMutation::NumericOwnership", contract)
 
