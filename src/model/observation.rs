@@ -6,7 +6,7 @@ use super::{
 };
 
 const MAGIC: &[u8; 4] = b"DMES";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
 /// How strongly a source identity survives namespace changes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -391,7 +391,7 @@ impl ObservedEntry {
             self.source_identity.backend.stable_id().as_bytes(),
         );
         put_bytes(&mut output, &self.source_identity.stable_bytes);
-        output.push(1);
+        output.push(2);
         super::metadata_observation::encode(&self.metadata, &mut output);
         self.backend_fact.encode(&mut output);
         output.extend_from_slice(self.identity_key.as_bytes());
@@ -523,7 +523,7 @@ fn decode_snapshot(bytes: &[u8]) -> Result<ObservedEntry, SnapshotDecodeError> {
     let source_identity = SourceIdentity::new(backend, strength, cursor.bytes()?)
         .map_err(|_| SnapshotDecodeError::Malformed)?;
     let schema_version = cursor.byte()?;
-    if schema_version != 1 {
+    if schema_version != 2 {
         return Err(SnapshotDecodeError::Malformed);
     }
     let metadata = super::metadata_observation::decode(&mut cursor)?;

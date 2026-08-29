@@ -250,6 +250,9 @@ returning an error does not satisfy the gate.
 `preserved`/`mapped` result positively. `dropped_with_loss`, `unsupported`, and
 `not_applicable` receive negative/preflight and loss-report tests. Application failures must
 produce `failed`, never semantic loss.
+The stable metadata seam must also prove that exact plans apply all requested families,
+known timestamp loss is rejected or reported by policy, external principal mapping is
+explicit, cancellation causes no later mutation, and a target failure returns partial outcomes.
 
 `DM-TRAVERSAL-CONTRACT` verifies bounded backpressure, cancellation, optional
 `ObservationPlan` modes, no default extra ACL/xattr/tag calls, ordered result delivery as

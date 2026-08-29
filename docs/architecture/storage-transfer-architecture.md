@@ -282,6 +282,13 @@ target backend's `Metadata` request. The mapping decision is `Exact`, `Lossy(los
 `RequiresExternalMapping`, or `Unsupported`. Terrasync may supply a `PrincipalMapper` for
 enterprise identity mappings; data-mover never guesses across numeric IDs, names, or SIDs.
 The immutable metadata plan is compiled before target side effects.
+`compile_metadata_plan` consumes only the captured `MetadataObservations`, an explicit
+`MetadataTarget` capability description, family policies, and an optional mapper. It never
+re-reads source storage and contains no backend-name or protocol-pair switch. The resulting
+`MetadataPlan` holds backend-neutral `MetadataMutation` values; applying it invokes the target
+`Metadata` role once per planned family and stops on cancellation or the first storage failure.
+The partial `MetadataApplicationReport` therefore remains distinct from the compile-time
+`LossReport`.
 
 The directed matrix classifies the intended preservation result of each family as:
 
@@ -296,7 +303,8 @@ Actual application outcomes are `Applied`, `PreservedByNativeTransfer`, `Omitted
 conflated. Data-mover returns a structured loss report; terrasync selects `RequireExact`,
 `AllowKnownLoss`, `BestEffort`, or `Omit`. Destination-side metadata reads return native
 observations and require no terrasync conversion. S3 prefixes are not called directories,
-and hardlink topology is outside this architecture.
+and hardlink topology is outside this architecture. Object tags are a first-class bounded,
+redacted observation family in snapshot schema v4; they are not encoded as xattrs.
 
 ## 8. Transfer interfaces
 

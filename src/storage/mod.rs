@@ -15,7 +15,7 @@ pub use capability::{
 pub use handle::Storage;
 pub use roles::{
     ByteStream, CheckpointObservation, ExistingDestinationPolicy, FinalDestination, Metadata,
-    Namespace, NamespaceRequest, NamespaceResult, PrepareRequest, PreparedStage,
+    MetadataMutation, Namespace, NamespaceRequest, NamespaceResult, PrepareRequest, PreparedStage,
     PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest, ReadRequest,
     ReadSource, RecoverRequest, RecoveryIdentity, RecoveryValueError, SourceDescriptor,
     StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,

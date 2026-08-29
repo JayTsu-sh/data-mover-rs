@@ -2,6 +2,7 @@ use super::observation::{Cursor, SnapshotDecodeError, decode_time, encode_time, 
 use super::{FailureClass, MAX_MODEL_FIELD_BYTES, ModelValueError, StorageTimestamp, Transience};
 
 const MAX_XATTR_COUNT: usize = 4_096;
+const MAX_TAG_COUNT: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ObservationMode {
@@ -16,6 +17,7 @@ pub enum ObservationMode {
 pub struct ObservationPlan {
     acl: ObservationMode,
     xattrs: ObservationMode,
+    tags: ObservationMode,
     ownership_mode: ObservationMode,
     timestamps: ObservationMode,
 }
@@ -28,6 +30,10 @@ impl ObservationPlan {
     #[must_use]
     pub const fn xattrs(self) -> ObservationMode {
         self.xattrs
+    }
+    #[must_use]
+    pub const fn tags(self) -> ObservationMode {
+        self.tags
     }
     #[must_use]
     pub const fn ownership_mode(self) -> ObservationMode {
@@ -45,6 +51,11 @@ impl ObservationPlan {
     #[must_use]
     pub const fn with_xattrs(mut self, mode: ObservationMode) -> Self {
         self.xattrs = mode;
+        self
+    }
+    #[must_use]
+    pub const fn with_tags(mut self, mode: ObservationMode) -> Self {
+        self.tags = mode;
         self
     }
     #[must_use]
@@ -163,6 +174,52 @@ pub struct ExtendedAttribute {
     value: Vec<u8>,
 }
 
+/// One bounded UTF-8 object tag.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ObjectTag {
+    key: String,
+    value: String,
+}
+
+impl ObjectTag {
+    /// Creates one tag without exposing its value through `Debug`.
+    ///
+    /// # Errors
+    /// Rejects empty or unbounded keys and unbounded values.
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Result<Self, ModelValueError> {
+        let key = key.into();
+        let value = value.into();
+        if key.is_empty()
+            || key.contains('\0')
+            || value.contains('\0')
+            || key.len() > MAX_MODEL_FIELD_BYTES
+            || value.len() > MAX_MODEL_FIELD_BYTES
+        {
+            return Err(ModelValueError::new(
+                "tag",
+                "key/value is invalid or unbounded",
+            ));
+        }
+        Ok(Self { key, value })
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl std::fmt::Debug for ObjectTag {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ObjectTag(<redacted>)")
+    }
+}
+
 impl ExtendedAttribute {
     /// Creates one bounded, lossless extended attribute.
     ///
@@ -197,6 +254,63 @@ pub struct OwnershipMode {
     pub mode: u32,
 }
 
+/// Explicit externally mapped owner and group for a non-numeric target.
+#[derive(Clone, Eq, PartialEq)]
+pub struct MappedOwnership {
+    owner: String,
+    group: String,
+    pub mode: u32,
+}
+
+impl MappedOwnership {
+    /// Creates one bounded mapping result.
+    ///
+    /// # Errors
+    /// Rejects blank, NUL-containing, or unbounded principal values.
+    pub fn new(
+        owner: impl Into<String>,
+        group: impl Into<String>,
+        mode: u32,
+    ) -> Result<Self, ModelValueError> {
+        let owner = owner.into();
+        let group = group.into();
+        if owner.trim().is_empty()
+            || group.trim().is_empty()
+            || owner.contains('\0')
+            || group.contains('\0')
+            || owner.len() > MAX_MODEL_FIELD_BYTES
+            || group.len() > MAX_MODEL_FIELD_BYTES
+        {
+            return Err(ModelValueError::new(
+                "principal",
+                "is blank, invalid, or unbounded",
+            ));
+        }
+        Ok(Self { owner, group, mode })
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    #[must_use]
+    pub fn group(&self) -> &str {
+        &self.group
+    }
+}
+
+impl std::fmt::Debug for MappedOwnership {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MappedOwnership")
+            .field("owner", &"<redacted>")
+            .field("group", &"<redacted>")
+            .field("mode", &self.mode)
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimestampMetadata {
     pub accessed: Option<StorageTimestamp>,
@@ -208,6 +322,7 @@ pub struct TimestampMetadata {
 pub struct MetadataObservations {
     pub(crate) acl: MetadataObservation<AclMetadata>,
     pub(crate) xattrs: MetadataObservation<Vec<ExtendedAttribute>>,
+    pub(crate) tags: MetadataObservation<Vec<ObjectTag>>,
     pub(crate) ownership_mode: MetadataObservation<OwnershipMode>,
     pub(crate) timestamps: MetadataObservation<TimestampMetadata>,
 }
@@ -217,6 +332,7 @@ impl Default for MetadataObservations {
         Self {
             acl: MetadataObservation::NotRequested,
             xattrs: MetadataObservation::NotRequested,
+            tags: MetadataObservation::NotRequested,
             ownership_mode: MetadataObservation::NotRequested,
             timestamps: MetadataObservation::NotRequested,
         }
@@ -227,13 +343,15 @@ impl MetadataObservations {
     pub(crate) fn new(
         acl: MetadataObservation<AclMetadata>,
         xattrs: MetadataObservation<Vec<ExtendedAttribute>>,
+        tags: MetadataObservation<Vec<ObjectTag>>,
         ownership_mode: MetadataObservation<OwnershipMode>,
         timestamps: MetadataObservation<TimestampMetadata>,
     ) -> Result<Self, ModelValueError> {
-        validate_payload(&acl, &xattrs)?;
+        validate_payload(&acl, &xattrs, &tags)?;
         Ok(Self {
             acl,
             xattrs,
+            tags,
             ownership_mode,
             timestamps,
         })
@@ -245,6 +363,10 @@ impl MetadataObservations {
     #[must_use]
     pub const fn xattrs(&self) -> &MetadataObservation<Vec<ExtendedAttribute>> {
         &self.xattrs
+    }
+    #[must_use]
+    pub const fn tags(&self) -> &MetadataObservation<Vec<ObjectTag>> {
+        &self.tags
     }
     #[must_use]
     pub const fn ownership_mode(&self) -> &MetadataObservation<OwnershipMode> {
@@ -259,10 +381,15 @@ impl MetadataObservations {
 fn validate_payload(
     acl: &MetadataObservation<AclMetadata>,
     xattrs: &MetadataObservation<Vec<ExtendedAttribute>>,
+    tags: &MetadataObservation<Vec<ObjectTag>>,
 ) -> Result<(), ModelValueError> {
     let attributes = xattrs.value().map_or(&[][..], Vec::as_slice);
     if attributes.len() > MAX_XATTR_COUNT {
         return Err(ModelValueError::new("xattrs", "too many attributes"));
+    }
+    let tags = tags.value().map_or(&[][..], Vec::as_slice);
+    if tags.len() > MAX_TAG_COUNT {
+        return Err(ModelValueError::new("tags", "too many tags"));
     }
     let acl_size = acl.value().map_or(0, |value| {
         value.access.as_ref().map_or(0, Vec::len) + value.default.as_ref().map_or(0, Vec::len)
@@ -271,6 +398,13 @@ fn validate_payload(
         total
             .checked_add(value.name.len())?
             .checked_add(value.value.len())
+    });
+    let total = total.and_then(|total| {
+        tags.iter().try_fold(total, |total, tag| {
+            total
+                .checked_add(tag.key.len())?
+                .checked_add(tag.value.len())
+        })
     });
     if total.is_none_or(|total| total > MAX_MODEL_FIELD_BYTES) {
         return Err(ModelValueError::new(
@@ -298,6 +432,16 @@ pub(crate) fn encode(metadata: &MetadataObservations, output: &mut Vec<u8>) {
         for value in values {
             put_bytes(output, &value.name);
             put_bytes(output, &value.value);
+        }
+    }
+    if let Some(values) = encode_state(&metadata.tags, output) {
+        let Ok(count) = u32::try_from(values.len()) else {
+            unreachable!("metadata observation count exceeds snapshot encoding")
+        };
+        output.extend_from_slice(&count.to_le_bytes());
+        for value in values {
+            put_bytes(output, value.key.as_bytes());
+            put_bytes(output, value.value.as_bytes());
         }
     }
     if let Some(value) = encode_state(&metadata.ownership_mode, output) {
@@ -372,12 +516,33 @@ pub(crate) fn decode(cursor: &mut Cursor<'_>) -> Result<MetadataObservations, Sn
     let acl = finish(acl_state, || decode_acl(cursor, &mut budget))?;
     let xattr_state = decode_state(cursor)?;
     let xattrs = finish(xattr_state, || decode_xattrs(cursor, &mut budget))?;
+    let tag_state = decode_state(cursor)?;
+    let tags = finish(tag_state, || decode_tags(cursor, &mut budget))?;
     let owner_state = decode_state(cursor)?;
     let ownership = finish(owner_state, || decode_ownership(cursor))?;
     let time_state = decode_state(cursor)?;
     let timestamps = finish(time_state, || decode_timestamps(cursor))?;
-    MetadataObservations::new(acl, xattrs, ownership, timestamps)
+    MetadataObservations::new(acl, xattrs, tags, ownership, timestamps)
         .map_err(|_| SnapshotDecodeError::FieldTooLarge)
+}
+
+fn decode_tags(
+    cursor: &mut Cursor<'_>,
+    budget: &mut DecodeBudget,
+) -> Result<Vec<ObjectTag>, SnapshotDecodeError> {
+    let count = cursor.u32()? as usize;
+    if count > MAX_TAG_COUNT {
+        return Err(SnapshotDecodeError::FieldTooLarge);
+    }
+    (0..count)
+        .map(|_| {
+            let key = String::from_utf8(budgeted_bytes(cursor, budget)?)
+                .map_err(|_| SnapshotDecodeError::Malformed)?;
+            let value = String::from_utf8(budgeted_bytes(cursor, budget)?)
+                .map_err(|_| SnapshotDecodeError::Malformed)?;
+            ObjectTag::new(key, value).map_err(|_| SnapshotDecodeError::Malformed)
+        })
+        .collect()
 }
 
 fn decode_acl(
@@ -541,86 +706,5 @@ const fn failure_from_tag(tag: u8) -> Option<FailureClass> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn observed_xattrs(
-        values: Vec<ExtendedAttribute>,
-    ) -> MetadataObservation<Vec<ExtendedAttribute>> {
-        MetadataObservation::Value {
-            value: values,
-            provenance: MetadataProvenance::AdditionalCall,
-        }
-    }
-
-    #[test]
-    fn model_rejects_excessive_xattr_count() {
-        let attribute = ExtendedAttribute::new(vec![b'n'], Vec::new())
-            .unwrap_or_else(|error| panic!("valid test attribute: {error}"));
-        let attributes = vec![attribute; MAX_XATTR_COUNT + 1];
-
-        assert!(
-            MetadataObservations::new(
-                MetadataObservation::NotRequested,
-                observed_xattrs(attributes),
-                MetadataObservation::NotRequested,
-                MetadataObservation::NotRequested,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn model_rejects_excessive_aggregate_payload() {
-        let attribute = ExtendedAttribute::new(vec![b'n'], vec![0; MAX_MODEL_FIELD_BYTES])
-            .unwrap_or_else(|error| panic!("valid bounded test attribute: {error}"));
-
-        assert!(
-            MetadataObservations::new(
-                MetadataObservation::NotRequested,
-                observed_xattrs(vec![attribute]),
-                MetadataObservation::NotRequested,
-                MetadataObservation::NotRequested,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn maximum_aggregate_payload_round_trips() {
-        let attribute = ExtendedAttribute::new(vec![b'n'], vec![0; MAX_MODEL_FIELD_BYTES - 1])
-            .unwrap_or_else(|error| panic!("valid bounded test attribute: {error}"));
-        let metadata = MetadataObservations::new(
-            MetadataObservation::NotRequested,
-            observed_xattrs(vec![attribute]),
-            MetadataObservation::NotRequested,
-            MetadataObservation::NotRequested,
-        )
-        .unwrap_or_else(|error| panic!("valid maximum metadata payload: {error}"));
-        let mut bytes = Vec::new();
-        encode(&metadata, &mut bytes);
-
-        let mut cursor = Cursor::new(&bytes);
-        assert_eq!(decode(&mut cursor), Ok(metadata));
-    }
-
-    #[test]
-    fn decoder_rejects_excessive_xattr_count_before_allocation() {
-        let mut bytes = vec![0, 4, 0];
-        bytes.extend_from_slice(&4_097_u32.to_le_bytes());
-        let mut cursor = Cursor::new(&bytes);
-        assert_eq!(decode(&mut cursor), Err(SnapshotDecodeError::FieldTooLarge));
-    }
-
-    #[test]
-    fn decoder_enforces_one_total_payload_budget() {
-        let mut bytes = vec![4, 0, 0, 1];
-        let size = u32::try_from(MAX_MODEL_FIELD_BYTES)
-            .unwrap_or_else(|_| unreachable!("test model limit fits u32"));
-        bytes.extend_from_slice(&size.to_le_bytes());
-        bytes.resize(bytes.len() + MAX_MODEL_FIELD_BYTES, 0);
-        bytes.extend_from_slice(&[1, 1, 0, 0, 0, 0]);
-        let mut cursor = Cursor::new(&bytes);
-        assert_eq!(decode(&mut cursor), Err(SnapshotDecodeError::FieldTooLarge));
-    }
-}
+#[path = "metadata_observation_tests.rs"]
+mod tests;

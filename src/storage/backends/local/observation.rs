@@ -244,7 +244,8 @@ impl LocalObservationAdapter {
         let timestamps = inline_timestamps(plan.timestamps(), metadata);
         let acl = self.observe_acl(path, kind, plan.acl()).await?;
         let xattrs = self.observe_xattrs(path, kind, plan.xattrs()).await?;
-        MetadataObservations::new(acl, xattrs, ownership, timestamps)
+        let tags = optional_not_applicable(plan.tags());
+        MetadataObservations::new(acl, xattrs, tags, ownership, timestamps)
             .map_err(|_| failure(path, FailureClass::Internal))
     }
 

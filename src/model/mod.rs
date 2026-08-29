@@ -8,8 +8,9 @@ pub(crate) const MAX_MODEL_FIELD_BYTES: usize = 16 * 1024 * 1024;
 mod metadata_observation;
 pub(crate) mod observation;
 pub use metadata_observation::{
-    AclEncoding, AclMetadata, ExtendedAttribute, MetadataObservation, MetadataObservations,
-    MetadataProvenance, ObservationMode, ObservationPlan, OwnershipMode, TimestampMetadata,
+    AclEncoding, AclMetadata, ExtendedAttribute, MappedOwnership, MetadataObservation,
+    MetadataObservations, MetadataProvenance, ObjectTag, ObservationMode, ObservationPlan,
+    OwnershipMode, TimestampMetadata,
 };
 pub use observation::{
     EntryIdentityKey, EntrySnapshot, IdentityStrength, ObservedEntry, SnapshotDecodeError,
@@ -380,7 +381,7 @@ impl BackendIdentity {
 }
 
 /// Resolution known for a storage timestamp.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum TimePrecision {
     /// Whole seconds.
     Seconds,

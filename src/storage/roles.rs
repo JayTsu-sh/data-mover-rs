@@ -10,8 +10,9 @@ use tokio_util::sync::CancellationToken;
 use crate::runtime::qos::SourceQosBudget;
 
 use crate::model::{
-    BackendSessionFailure, EntryKind, EntryOperationFailure, MetadataObservations, ObservationPlan,
-    SourceIdentity, StoragePath,
+    AclMetadata, BackendSessionFailure, EntryKind, EntryOperationFailure, ExtendedAttribute,
+    MappedOwnership, MetadataObservations, ObjectTag, ObservationPlan, OwnershipMode,
+    SourceIdentity, StoragePath, TimestampMetadata,
 };
 
 /// A bounded payload stream. Implementations own request sizing and backpressure.
@@ -347,8 +348,20 @@ pub trait Metadata: Send + Sync {
     async fn apply(
         &self,
         path: &StoragePath,
-        observations: &MetadataObservations,
+        mutation: MetadataMutation,
+        cancel: CancellationToken,
     ) -> Result<(), StorageRoleFailure>;
+}
+
+/// One backend-neutral metadata mutation compiled before target side effects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MetadataMutation {
+    Acl(AclMetadata),
+    Xattrs(Vec<ExtendedAttribute>),
+    Tags(Vec<ObjectTag>),
+    NumericOwnership(OwnershipMode),
+    MappedOwnership(MappedOwnership),
+    Timestamps(TimestampMetadata),
 }
 
 #[cfg(test)]
