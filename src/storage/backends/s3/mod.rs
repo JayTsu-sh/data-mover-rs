@@ -2,6 +2,8 @@
 
 mod metadata;
 mod protocol;
+#[cfg(test)]
+mod recovery_tests;
 mod source;
 mod staged;
 
@@ -53,7 +55,7 @@ where
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
+pub(super) mod tests {
     use std::collections::HashMap;
     use std::ops::Range;
     use std::sync::Arc;
@@ -72,17 +74,18 @@ mod tests {
         VerifyRequest,
     };
 
-    type UploadParts = HashMap<String, (String, Vec<(i32, Bytes)>)>;
+    pub(super) type UploadParts = HashMap<String, (String, Vec<(i32, Bytes)>)>;
 
     #[derive(Default)]
-    struct MemoryS3 {
+    pub(super) struct MemoryS3 {
         objects: Mutex<HashMap<String, Bytes>>,
-        uploads: Mutex<UploadParts>,
+        pub(super) uploads: Mutex<UploadParts>,
         tags: Mutex<HashMap<String, Vec<ObjectTag>>>,
         tag_reads: Mutex<u32>,
-        aborts: Mutex<u32>,
+        pub(super) aborts: Mutex<u32>,
+        pub(super) abort_failure: Mutex<Option<S3ProtocolFailure>>,
         head_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
-        claims: Mutex<HashMap<String, [u8; 32]>>,
+        pub(super) claims: Mutex<HashMap<String, [u8; 32]>>,
         copy_commits_then_fails: Mutex<bool>,
     }
 
@@ -175,6 +178,9 @@ mod tests {
             Ok(())
         }
         async fn abort_multipart(&self, _key: &str, id: &str) -> S3Result<()> {
+            if let Some(failure) = self.abort_failure.lock().await.clone() {
+                return Err(failure);
+            }
             self.uploads.lock().await.remove(id);
             *self.aborts.lock().await += 1;
             Ok(())
@@ -185,7 +191,13 @@ mod tests {
                 .lock()
                 .await
                 .get(id)
-                .ok_or_else(|| S3ProtocolFailure::protocol("missing upload"))?
+                .ok_or_else(|| {
+                    S3ProtocolFailure::entry(
+                        crate::model::FailureClass::NotFound,
+                        crate::model::Transience::Permanent,
+                        "missing upload",
+                    )
+                })?
                 .1
                 .iter()
                 .map(|(number, bytes)| S3PartFacts {
@@ -246,11 +258,11 @@ mod tests {
         }
     }
 
-    fn identity() -> BackendIdentity {
+    pub(super) fn identity() -> BackendIdentity {
         BackendIdentity::new(BackendKind::S3, "memory-bucket").expect("valid identity")
     }
 
-    fn validation_policy() -> crate::storage::PreflightPolicy {
+    pub(super) fn validation_policy() -> crate::storage::PreflightPolicy {
         crate::storage::PreflightPolicy::production()
     }
 
@@ -338,6 +350,7 @@ mod tests {
             .await
             .map_err(|failure| failure.error)?;
         assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
+        assert!(destination.observe_checkpoint(&stage).await.is_err());
         Ok(())
     }
 

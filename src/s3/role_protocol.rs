@@ -505,6 +505,7 @@ pub(super) fn s3_role_remote_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::backends::s3::S3Protocol as _;
     use crate::storage::backends::s3::S3ProtocolFailure;
 
     #[test]
@@ -550,5 +551,124 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the shared standard S3 lab"]
+    async fn standard_s3_invalid_manifest_is_aborted_and_restartable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = prepare_invalid_manifest_fixture().await?;
+        assert_restartable_after_rejection(fixture).await
+    }
+
+    struct InvalidManifestFixture {
+        backend: S3Storage,
+        identity: crate::model::BackendIdentity,
+        prepare: crate::storage::PrepareRequest,
+        recovery: crate::storage::RecoveryIdentity,
+        key: String,
+    }
+
+    async fn prepare_invalid_manifest_fixture()
+    -> Result<InvalidManifestFixture, Box<dyn std::error::Error>> {
+        use crate::model::{
+            BackendIdentity, BackendKind, EntryKind, IdentityStrength, SourceIdentity, StoragePath,
+        };
+        use crate::storage::{FinalDestination, PreflightPolicy, PrepareRequest, SourceDescriptor};
+        let backend = S3Storage::new(&std::env::var("LAB_S3_ARCHITECTURE_URL")?, None).await?;
+        let identity = BackendIdentity::new(BackendKind::S3, "standard-s3-invalid-recovery")?;
+        let storage = backend.architecture_storage(identity.clone())?;
+        let destination = storage.staged_destination(&PreflightPolicy::production())?;
+        let source = SourceDescriptor {
+            path: StoragePath::new("generated-source")?,
+            kind: EntryKind::File,
+            size: None,
+            source_identity: SourceIdentity::new(
+                identity,
+                IdentityStrength::PathScoped,
+                b"invalid-source",
+            )?,
+        };
+        let path = StoragePath::new(format!(
+            "{}.manifest",
+            std::env::var("LAB_S3_ARCHITECTURE_KEY")?
+        ))?;
+        let prepare = PrepareRequest {
+            final_destination: FinalDestination::new(path),
+            source: source.clone(),
+            recovery_binding: [7; 32],
+        };
+        let stage = destination.prepare(prepare.clone()).await?;
+        let recovery = destination.recovery_identity(&stage).await?;
+        let (key, upload_id) = split_recovery(&recovery)?;
+        backend
+            .upload_part_with_stream(
+                &backend.build_full_key(&key),
+                &upload_id,
+                2,
+                vec![Bytes::from(vec![3; 8 * 1024 * 1024])],
+                8 * 1024 * 1024,
+            )
+            .await?;
+        Ok(InvalidManifestFixture {
+            backend,
+            identity: storage.identity().clone(),
+            prepare,
+            recovery,
+            key,
+        })
+    }
+
+    async fn assert_restartable_after_rejection(
+        fixture: InvalidManifestFixture,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::{PreflightPolicy, RecoverRequest};
+        let reconnected = fixture
+            .backend
+            .architecture_storage(fixture.identity)?
+            .staged_destination(&PreflightPolicy::production())?;
+        let result = reconnected
+            .recover(RecoverRequest {
+                identity: fixture.recovery,
+                final_destination: fixture.prepare.final_destination.clone(),
+                source: fixture.prepare.source.clone(),
+                recovery_binding: fixture.prepare.recovery_binding,
+                claim_token: [1; 32],
+            })
+            .await;
+        assert!(
+            matches!(result, Err(crate::storage::StorageRoleFailure::Entry(ref failure))
+            if failure.class() == crate::model::FailureClass::Corruption)
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .claim(&format!("{}.claim", fixture.key), [2; 32])
+                .await
+                .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?,
+            crate::storage::backends::s3::S3ClaimOutcome::Acquired
+        );
+        fixture
+            .backend
+            .release_claim(&format!("{}.claim", fixture.key))
+            .await
+            .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
+        let fresh = reconnected.prepare(fixture.prepare).await?;
+        reconnected.discard(fresh).await?;
+        Ok(())
+    }
+
+    fn split_recovery(
+        identity: &crate::storage::RecoveryIdentity,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        let split = identity
+            .as_bytes()
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or("missing recovery separator")?;
+        Ok((
+            String::from_utf8(identity.as_bytes()[..split].to_vec())?,
+            String::from_utf8(identity.as_bytes()[split + 1..].to_vec())?,
+        ))
     }
 }

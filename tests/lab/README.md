@@ -236,8 +236,9 @@ test process. A partially supplied pair is rejected. Credentials must not be
 committed, printed, or written to artifacts.
 
 `run-s3-architecture-contract.sh` is the `DM-S3-CONTRACT` gate for the
-ArchitectureReady roles. It exercises multipart staging, verification,
-publication, and range readback through standard `s3://` requests and removes
+ArchitectureReady roles. It exercises multipart staging, interruption and
+reconnect resume, stale-upload restart, verification, publication, tags,
+cancellation, and range readback through standard `s3://` requests and removes
 both published objects and unfinished multipart uploads on exit. A successful
 legacy S3 copy run does not certify this gate: the configured service must
 accept CreateMultipartUpload and the complete multipart lifecycle.

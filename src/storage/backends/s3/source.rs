@@ -215,3 +215,22 @@ pub(super) fn entry(
         }),
     )
 }
+
+pub(super) fn classified_entry(
+    path: &crate::model::StoragePath,
+    operation: Operation,
+    class: FailureClass,
+    transience: Transience,
+    diagnostic: impl Into<String>,
+) -> StorageRoleFailure {
+    match crate::model::EntryOperationFailure::new(
+        path.clone(),
+        operation,
+        class,
+        transience,
+        diagnostic,
+    ) {
+        Ok(failure) => StorageRoleFailure::Entry(failure),
+        Err(_) => entry(path, operation, "invalid adapter diagnostic"),
+    }
+}

@@ -182,6 +182,7 @@ async fn cleanup<P: S3Protocol>(
                 final_destination_changed: changed,
             })?;
     }
+    adapter.states.lock().await.remove(stage.token.as_ref());
     Ok(())
 }
 

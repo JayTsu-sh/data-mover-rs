@@ -26,7 +26,46 @@ async fn standard_s3_architecture_roles_stage_publish_and_read_back() -> TestRes
     let payload = Bytes::from(vec![0x5a; PART_SIZE * 5 + 137]);
     let (storage, stage) = stage_with_reconnect(&url, &path, &identity, &payload).await?;
     verify_publish_and_tag(&storage, &stage, &path, &payload).await?;
-    verify_range_and_cancellation(&storage, &path, &payload).await
+    verify_range_and_cancellation(&storage, &path, &payload).await?;
+    verify_stale_upload_restart(&url, &path, &identity, payload.len()).await
+}
+
+async fn verify_stale_upload_restart(
+    url: &str,
+    path: &StoragePath,
+    identity: &BackendIdentity,
+    size: usize,
+) -> TestResult {
+    let restart_path = StoragePath::new(format!("{}.restart", path.as_str()))?;
+    let source = source_descriptor(identity, size)?;
+    let prepare = PrepareRequest {
+        final_destination: FinalDestination::new(restart_path),
+        source: source.clone(),
+        recovery_binding: [9; 32],
+    };
+    let storage = connected(url, identity.clone()).await?;
+    let destination = storage.staged_destination(&PreflightPolicy::production())?;
+    let stale = destination.prepare(prepare.clone()).await?;
+    let recovery = destination.recovery_identity(&stale).await?;
+    destination.discard(stale).await?;
+    let storage = connected(url, identity.clone()).await?;
+    let destination = storage.staged_destination(&PreflightPolicy::production())?;
+    let result = destination
+        .recover(RecoverRequest {
+            identity: recovery,
+            final_destination: prepare.final_destination.clone(),
+            source,
+            recovery_binding: prepare.recovery_binding,
+            claim_token: [8; 32],
+        })
+        .await;
+    assert!(
+        matches!(result, Err(data_mover::storage::StorageRoleFailure::Entry(ref failure))
+        if failure.class() == data_mover::model::FailureClass::NotFound)
+    );
+    let fresh = destination.prepare(prepare).await?;
+    destination.discard(fresh).await?;
+    Ok(())
 }
 
 async fn stage_with_reconnect(

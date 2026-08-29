@@ -6,14 +6,14 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use tokio::sync::Mutex;
 
-use crate::model::{BackendIdentity, Operation};
+use crate::model::{BackendIdentity, FailureClass, Operation, Transience};
 use crate::storage::{
     ByteStream, CheckpointObservation, PrepareRequest, PreparedStage, PublicationEvidence,
     PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity, StagedDestination,
     StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
-use super::source::{cancelled, entry, role_failure};
+use super::source::{cancelled, classified_entry, entry, role_failure};
 
 mod publication;
 use super::{S3ClaimOutcome, S3Protocol, S3ProtocolFailure};
@@ -116,20 +116,15 @@ fn resumable_parts(
         part.number == i32::try_from(index + 1).unwrap_or(i32::MAX) && part.size == PART_SIZE as u64
     });
     if !valid {
-        return Err(entry(
+        return Err(invalid_manifest(
             path,
-            Operation::Prepare,
             "S3 multipart manifest is not a contiguous durable prefix",
         ));
     }
     let persisted = observed.iter().try_fold(0_u64, |total, part| {
-        total.checked_add(part.size).ok_or_else(|| {
-            entry(
-                path,
-                Operation::Prepare,
-                "S3 multipart prefix size overflow",
-            )
-        })
+        total
+            .checked_add(part.size)
+            .ok_or_else(|| invalid_manifest(path, "S3 multipart prefix size overflow"))
     })?;
     Ok((
         persisted,
@@ -138,6 +133,30 @@ fn resumable_parts(
             .map(|part| (part.number, part.etag))
             .collect(),
     ))
+}
+
+fn invalid_manifest(path: &crate::model::StoragePath, diagnostic: &str) -> StorageRoleFailure {
+    classified_entry(
+        path,
+        Operation::Prepare,
+        FailureClass::Corruption,
+        Transience::Permanent,
+        diagnostic,
+    )
+}
+
+fn cleanup_result(
+    path: &crate::model::StoragePath,
+    result: super::S3Result<()>,
+) -> Result<(), StorageRoleFailure> {
+    match result {
+        Ok(())
+        | Err(S3ProtocolFailure::Entry {
+            class: FailureClass::NotFound,
+            ..
+        }) => Ok(()),
+        Err(failure) => Err(role_failure(path, Operation::Namespace, failure)),
+    }
 }
 
 impl<P: S3Protocol> S3StagedDestination<P> {
@@ -224,6 +243,35 @@ impl<P: S3Protocol> S3StagedDestination<P> {
                 failure,
             )),
         }
+    }
+
+    async fn remove_invalid_upload(
+        &self,
+        request: &RecoverRequest,
+        key: &str,
+        upload_id: &str,
+        claim_key: &str,
+    ) -> Result<(), StorageRoleFailure> {
+        self.protocol
+            .abort_multipart(key, upload_id)
+            .await
+            .map_err(|failure| {
+                role_failure(
+                    request.final_destination.path(),
+                    Operation::Prepare,
+                    failure,
+                )
+            })?;
+        self.protocol
+            .release_claim(claim_key)
+            .await
+            .map_err(|failure| {
+                role_failure(
+                    request.final_destination.path(),
+                    Operation::Prepare,
+                    failure,
+                )
+            })
     }
 
     async fn content_matches(
@@ -313,8 +361,31 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
     async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
         let (token, key, upload_id) = Self::validated_recovery(&request)?;
         let claim_key = self.claim_recovery(&request, &key).await?;
-        let (persisted, parts, completed) =
-            self.recovered_state(&request, &key, &upload_id).await?;
+        let observed = self.recovered_state(&request, &key, &upload_id).await;
+        let (persisted, parts, completed) = match observed {
+            Ok(state) => state,
+            Err(error)
+                if matches!(&error, StorageRoleFailure::Entry(failure)
+                    if failure.class() == FailureClass::Corruption) =>
+            {
+                self.remove_invalid_upload(&request, &key, &upload_id, &claim_key)
+                    .await?;
+                return Err(error);
+            }
+            Err(error) => {
+                self.protocol
+                    .release_claim(&claim_key)
+                    .await
+                    .map_err(|failure| {
+                        role_failure(
+                            request.final_destination.path(),
+                            Operation::Prepare,
+                            failure,
+                        )
+                    })?;
+                return Err(error);
+            }
+        };
         self.states.lock().await.insert(
             token.to_vec(),
             StageState {
@@ -537,7 +608,8 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
             .states
             .lock()
             .await
-            .remove(stage.token.as_ref())
+            .get(stage.token.as_ref())
+            .cloned()
             .ok_or_else(|| {
                 entry(
                     stage.final_destination.path(),
@@ -546,16 +618,17 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 )
             })?;
         if stage_state.completed {
-            self.protocol.delete_object(&key).await.map_err(|e| {
-                role_failure(stage.final_destination.path(), Operation::Namespace, e)
-            })?;
+            cleanup_result(
+                stage.final_destination.path(),
+                self.protocol.delete_object(&key).await,
+            )?;
         } else {
-            self.protocol
-                .abort_multipart(&key, &stage_state.upload_id)
-                .await
-                .map_err(|e| {
-                    role_failure(stage.final_destination.path(), Operation::Namespace, e)
-                })?;
+            cleanup_result(
+                stage.final_destination.path(),
+                self.protocol
+                    .abort_multipart(&key, &stage_state.upload_id)
+                    .await,
+            )?;
         }
         if let Some(claim_key) = stage_state.claim_key {
             self.protocol
@@ -569,6 +642,7 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                     )
                 })?;
         }
+        self.states.lock().await.remove(stage.token.as_ref());
         Ok(())
     }
 }

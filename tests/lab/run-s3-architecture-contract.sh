@@ -15,3 +15,4 @@ cleanup() {
 }
 trap 'cleanup $?' EXIT
 cargo test --test s3_architecture_contract standard_s3_architecture_roles_stage_publish_and_read_back -- --ignored --exact --test-threads=1
+cargo test --lib s3::role_protocol::tests::standard_s3_invalid_manifest_is_aborted_and_restartable -- --ignored --exact --test-threads=1
