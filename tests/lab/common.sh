@@ -59,6 +59,12 @@ require_s3_credentials() {
   load_s3_credentials_from_rustfs
   : "${LAB_S3_ACCESS_KEY:?LAB_S3_ACCESS_KEY is required}"
   : "${LAB_S3_SECRET_KEY:?LAB_S3_SECRET_KEY is required}"
+
+  # S3 lab traffic uses private data-plane addresses and must not traverse the
+  # runner's optional outbound HTTP proxy.
+  local lab_no_proxy="$LAB_SOURCE_DATA,$LAB_DEST_DATA,$LAB_WORKER_DATA"
+  export no_proxy="${no_proxy:+$no_proxy,}$lab_no_proxy"
+  export NO_PROXY="${NO_PROXY:+$NO_PROXY,}$lab_no_proxy"
 }
 
 require_hdfs_kerberos_credentials() {

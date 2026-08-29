@@ -133,7 +133,9 @@ profiles:
         destination_profile: s3_standard
         environment_fingerprint: shared-standard-s3/10.10.1.12-to-10.10.1.13
     verified_scope: [connectivity, traversal, copy, integrity, resume, qos]
-    gaps: [target native-transfer and metadata architecture contracts not yet implemented]
+    gaps:
+      - target native-transfer and metadata architecture contracts not yet implemented
+      - DM-S3-CONTRACT remains uncertified until a current-commit gate result is recorded
 
   s3_dxn:
     status: missing

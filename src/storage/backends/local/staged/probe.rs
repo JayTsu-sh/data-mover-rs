@@ -53,6 +53,14 @@ impl WriteProbe {
             while !self.later_write_started.load(Ordering::SeqCst) {
                 std::thread::yield_now();
             }
+            while self
+                .completion_order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                std::thread::yield_now();
+            }
         } else if offset > 0 {
             self.later_write_started.store(true, Ordering::SeqCst);
         }

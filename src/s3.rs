@@ -683,6 +683,17 @@ fn s3_timeout_config() -> TimeoutConfig {
 }
 
 impl S3Storage {
+    /// Builds the `ArchitectureReady` role handle for this connected standard S3 backend.
+    ///
+    /// # Errors
+    /// Returns an error when the identity is not S3 or connected roles contradict capabilities.
+    pub fn architecture_storage(
+        &self,
+        identity: crate::model::BackendIdentity,
+    ) -> std::result::Result<crate::storage::Storage, Box<dyn std::error::Error>> {
+        crate::storage::backends::s3::connect(Arc::new(self.clone()), identity)
+    }
+
     /// Overrides the per-file read and write concurrency for this adapter.
     #[must_use]
     pub fn with_transfer_concurrency(mut self, concurrency: TransferConcurrency) -> Self {
@@ -2727,7 +2738,7 @@ impl S3Storage {
 
         let response = create_multipart_upload_builder.send().await.map_err(|e| {
             error!("Failed to create multipart upload: {}", e);
-            StorageError::S3Error(format!("Failed to create multipart upload: {e}"))
+            StorageError::S3Error(format!("Failed to create multipart upload: {e:?}"))
         })?;
 
         let upload_id = response
@@ -4207,6 +4218,8 @@ pub async fn create_s3_storage(url: &str, block_size: Option<u64>) -> Result<Sto
     let s3_storage = S3Storage::new(url, block_size).await?;
     Ok(StorageEnum::S3(s3_storage))
 }
+
+mod role_protocol;
 
 // ============================================================================
 // 公共细粒度 multipart 上传 API

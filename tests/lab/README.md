@@ -235,6 +235,13 @@ and destination use the same credentials, and exports them only to the current
 test process. A partially supplied pair is rejected. Credentials must not be
 committed, printed, or written to artifacts.
 
+`run-s3-architecture-contract.sh` is the `DM-S3-CONTRACT` gate for the
+ArchitectureReady roles. It exercises multipart staging, verification,
+publication, and range readback through standard `s3://` requests and removes
+both published objects and unfinished multipart uploads on exit. A successful
+legacy S3 copy run does not certify this gate: the configured service must
+accept CreateMultipartUpload and the complete multipart lifecycle.
+
 The lab does not currently contain a real StorageGRID system. Request-level
 tests use a capturing Smithy connector to verify that standard S3 requests
 retain the SDK-generated `x-id` and StorageGRID requests remove it from the
