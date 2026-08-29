@@ -40,14 +40,14 @@ pub(crate) trait HdfsProtocol: Send + Sync {
         to: &StoragePath,
         overwrite: bool,
     ) -> Result<(), StorageRoleFailure>;
-    async fn prepare_stage(
+    async fn create_empty_stage_exclusive(
         &self,
         path: &StoragePath,
-        expected_size: u64,
     ) -> Result<(), StorageRoleFailure>;
-    async fn write_stage(
+    async fn append_stage(
         &self,
         path: &StoragePath,
+        start_offset: u64,
         expected_size: u64,
         input: ByteStream,
     ) -> Result<u64, StorageRoleFailure>;

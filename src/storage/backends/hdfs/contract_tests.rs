@@ -37,6 +37,10 @@ impl MemoryHdfs {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    pub(crate) fn allow_writes(&self) {
+        self.fail_write.store(false, Ordering::SeqCst);
+    }
+
     pub(crate) fn fail_rename_after_commit(&self) {
         self.fail_rename_after_commit.store(true, Ordering::SeqCst);
     }
@@ -171,25 +175,31 @@ impl HdfsProtocol for MemoryHdfs {
         Ok(())
     }
 
-    async fn prepare_stage(
+    async fn create_empty_stage_exclusive(
         &self,
         path: &StoragePath,
-        _expected_size: u64,
     ) -> Result<(), StorageRoleFailure> {
-        self.objects
-            .lock()
-            .await
-            .insert(path.as_str().into(), Bytes::new());
+        let mut objects = self.objects.lock().await;
+        if objects.contains_key(path.as_str()) {
+            return Err(entry_failure(
+                path,
+                Operation::Prepare,
+                FailureClass::Conflict,
+                Transience::Permanent,
+            ));
+        }
+        objects.insert(path.as_str().into(), Bytes::new());
         Ok(())
     }
 
-    async fn write_stage(
+    async fn append_stage(
         &self,
         path: &StoragePath,
+        start_offset: u64,
         expected_size: u64,
         mut input: ByteStream,
     ) -> Result<u64, StorageRoleFailure> {
-        if self.fail_write.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.fail_write.load(Ordering::SeqCst) {
             return Err(entry_failure(
                 path,
                 Operation::Write,
@@ -197,11 +207,74 @@ impl HdfsProtocol for MemoryHdfs {
                 Transience::Transient,
             ));
         }
-        let mut value = BytesMut::new();
-        while let Some(chunk) = input.next().await {
-            value.extend_from_slice(&chunk?);
+        if expected_size < start_offset {
+            return Err(entry_failure(
+                path,
+                Operation::Write,
+                FailureClass::InvalidInput,
+                Transience::Permanent,
+            ));
         }
-        if value.len() as u64 != expected_size {
+        let initial_len = self
+            .objects
+            .lock()
+            .await
+            .get(path.as_str())
+            .ok_or_else(|| Self::missing(path, Operation::Write))?
+            .len() as u64;
+        if initial_len != start_offset {
+            return Err(entry_failure(
+                path,
+                Operation::Write,
+                FailureClass::Conflict,
+                Transience::Permanent,
+            ));
+        }
+        let mut offset = start_offset;
+        while let Some(chunk) = input.next().await {
+            let chunk = chunk?;
+            let length = u64::try_from(chunk.len()).map_err(|_| {
+                entry_failure(
+                    path,
+                    Operation::Write,
+                    FailureClass::InvalidInput,
+                    Transience::Permanent,
+                )
+            })?;
+            let next = offset.checked_add(length).ok_or_else(|| {
+                entry_failure(
+                    path,
+                    Operation::Write,
+                    FailureClass::InvalidInput,
+                    Transience::Permanent,
+                )
+            })?;
+            if next > expected_size {
+                return Err(entry_failure(
+                    path,
+                    Operation::Write,
+                    FailureClass::Corruption,
+                    Transience::Permanent,
+                ));
+            }
+            let mut objects = self.objects.lock().await;
+            let value = objects
+                .get_mut(path.as_str())
+                .ok_or_else(|| Self::missing(path, Operation::Write))?;
+            if value.len() as u64 != offset {
+                return Err(entry_failure(
+                    path,
+                    Operation::Write,
+                    FailureClass::Conflict,
+                    Transience::Permanent,
+                ));
+            }
+            let mut appended = BytesMut::from(value.as_ref());
+            appended.extend_from_slice(&chunk);
+            *value = appended.freeze();
+            offset = next;
+        }
+        if offset != expected_size {
             return Err(entry_failure(
                 path,
                 Operation::Write,
@@ -209,10 +282,6 @@ impl HdfsProtocol for MemoryHdfs {
                 Transience::Permanent,
             ));
         }
-        self.objects
-            .lock()
-            .await
-            .insert(path.as_str().into(), value.freeze());
         Ok(expected_size)
     }
 
@@ -242,4 +311,63 @@ impl HdfsProtocol for MemoryHdfs {
             .push(format!("timestamps:{}:{atime:?}:{mtime:?}", path.as_str()));
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn exclusive_stage_creation_preserves_existing_partial() {
+    let storage = MemoryHdfs::default();
+    let path = StoragePath::new("partial").unwrap_or_else(|error| panic!("{error}"));
+
+    storage
+        .create_empty_stage_exclusive(&path)
+        .await
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    let conflict = storage.create_empty_stage_exclusive(&path).await;
+
+    assert!(conflict.is_err());
+    assert_eq!(storage.get("partial").await, Some(Bytes::new()));
+}
+
+#[tokio::test]
+async fn append_stage_requires_current_prefix_and_exact_final_size() {
+    let storage = MemoryHdfs::default();
+    let path = StoragePath::new("partial").unwrap_or_else(|error| panic!("{error}"));
+    storage.insert("partial", Bytes::from_static(b"abc")).await;
+    let input: ByteStream = Box::pin(futures::stream::iter([Ok(Bytes::from_static(b"def"))]));
+
+    let written = storage
+        .append_stage(&path, 3, 6, input)
+        .await
+        .unwrap_or_else(|error| panic!("{error:?}"));
+
+    assert_eq!(written, 6);
+    assert_eq!(
+        storage.get("partial").await,
+        Some(Bytes::from_static(b"abcdef"))
+    );
+    let stale: ByteStream = Box::pin(futures::stream::empty());
+    assert!(storage.append_stage(&path, 3, 3, stale).await.is_err());
+}
+
+#[tokio::test]
+async fn append_stage_preserves_each_durable_chunk_after_input_failure() {
+    let storage = MemoryHdfs::default();
+    let path = StoragePath::new("partial").unwrap_or_else(|error| panic!("{error}"));
+    storage.insert("partial", Bytes::from_static(b"abc")).await;
+    let failure = entry_failure(
+        &path,
+        Operation::Read,
+        FailureClass::Connectivity,
+        Transience::Transient,
+    );
+    let input: ByteStream = Box::pin(futures::stream::iter([
+        Ok(Bytes::from_static(b"def")),
+        Err(failure),
+    ]));
+
+    assert!(storage.append_stage(&path, 3, 9, input).await.is_err());
+    assert_eq!(
+        storage.get("partial").await,
+        Some(Bytes::from_static(b"abcdef"))
+    );
 }

@@ -456,9 +456,12 @@ Backend mechanisms:
 The HDFS architecture adapter is split at a protocol boundary: `storage/backends/hdfs`
 owns neutral facts, traversal, range reads, staged publication, and metadata semantics,
 while the existing `HDFSStorage` owns Hadoop clients, Kerberos/HA configuration, and
-protocol error translation. Ordinary transfer uses a deterministic same-directory
-partial, bounded chunks, BLAKE3 readback, and rename publication. Durable identity
-reconstruction and continuous-prefix resume remain the next recovery layer. HDFS
+protocol error translation. Each transfer attempt uses an isolated, deterministic-after-
+creation same-directory partial, bounded chunks, BLAKE3 readback, and rename publication.
+An opaque recovery identity binds that partial to the source, destination, and expected
+size. Recovery atomically renames it to a claim-token-derived path, re-observes the HDFS
+continuous durable prefix, and appends only the remaining tail. Invalid identities may
+fall back to a distinct restart stage without deleting unknown state. HDFS
 string owner/group, replication, block size, and mode are persisted as backend facts;
 the current neutral ownership observation cannot yet expose string principals. ACL
 and xattr are reported unsupported until public dependency APIs are bound, rather

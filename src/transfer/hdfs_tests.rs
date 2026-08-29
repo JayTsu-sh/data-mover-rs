@@ -6,10 +6,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::{InflightLimits, RecoveryPolicy, TransferIdentity, TransferRequest, transfer};
 use crate::model::{
-    FailureClass, MappedOwnership, ObservationMode, ObservationPlan, StoragePath, StorageTimestamp,
-    TimePrecision, TimestampMetadata,
+    FailureClass, MappedOwnership, ObservationMode, ObservationPlan, Operation, StoragePath,
+    StorageTimestamp, TimePrecision, TimestampMetadata,
 };
 use crate::storage::backends::hdfs::contract_tests::MemoryHdfs;
+use crate::storage::backends::hdfs::protocol::cancelled;
 use crate::storage::backends::hdfs::{connect, test_identity};
 use crate::storage::{
     ExistingDestinationPolicy, FinalDestination, MetadataMutation, PreflightPolicy, PrepareRequest,
@@ -112,22 +113,13 @@ async fn cancelled_transfer_stops_before_hdfs_stage_creation() -> TestResult {
 }
 
 #[tokio::test]
-async fn ordinary_hdfs_stage_reports_restart_only_recovery_boundary() -> TestResult {
+async fn hdfs_stage_exports_and_recovers_an_observed_prefix() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     protocol
         .insert("source", Bytes::from_static(b"restart"))
         .await;
     let (destination, stage) = prepared_stage(protocol, "final").await?;
-    let error = destination
-        .recovery_identity(&stage)
-        .await
-        .err()
-        .ok_or("recovery succeeded")?;
-    assert!(
-        matches!(error, crate::storage::StorageRoleFailure::Entry(ref value)
-        if value.class() == FailureClass::Unsupported)
-    );
-    let recovery = RecoveryIdentity::from_bytes(Bytes::from_static(b"hdfs-restart-only"))?;
+    let recovery = destination.recovery_identity(&stage).await?;
     let source = crate::storage::SourceDescriptor::new(
         StoragePath::new("source")?,
         crate::model::EntryKind::File,
@@ -138,31 +130,161 @@ async fn ordinary_hdfs_stage_reports_restart_only_recovery_boundary() -> TestRes
             b"source",
         )?,
     );
-    assert!(
+    let recover = || RecoverRequest {
+        identity: recovery.clone(),
+        final_destination: FinalDestination::new(
+            StoragePath::new("final").unwrap_or_else(|error| panic!("{error}")),
+        ),
+        source: source.clone(),
+        recovery_binding: [8; 32],
+        claim_token: [1; 32],
+    };
+    let recovered = destination.recover(recover()).await?;
+    assert_eq!(
         destination
-            .recover(RecoverRequest {
-                identity: recovery,
-                final_destination: FinalDestination::new(StoragePath::new("final")?),
-                source,
-                recovery_binding: [8; 32],
-                claim_token: [1; 32],
-            })
-            .await
-            .is_err()
+            .observe_checkpoint(&recovered)
+            .await?
+            .durable_prefix,
+        0
     );
-    destination.discard(stage).await?;
+    let reentered = destination.recover(recover()).await?;
+    assert_eq!(
+        destination
+            .observe_checkpoint(&reentered)
+            .await?
+            .durable_prefix,
+        0
+    );
+    destination.discard(recovered).await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn resume_or_restart_reuploads_when_hdfs_recovery_is_unsupported() -> TestResult {
+async fn interrupted_hdfs_stage_recovers_only_the_durable_tail() -> TestResult {
+    let protocol = Arc::new(MemoryHdfs::default());
+    protocol
+        .insert("source", Bytes::from_static(b"abcdef"))
+        .await;
+    let source = connect(protocol.clone(), test_identity("partial-source")?)?;
+    let destination = connect(protocol.clone(), test_identity("partial-destination")?)?;
+    let descriptor = source
+        .read_source(&PreflightPolicy::production())?
+        .describe(&StoragePath::new("source")?)
+        .await?;
+    let staged = destination.staged_destination(&PreflightPolicy::production())?;
+    let stage = staged
+        .prepare(PrepareRequest {
+            final_destination: FinalDestination::new(StoragePath::new("final")?),
+            source: descriptor.clone(),
+            recovery_binding: [4; 32],
+        })
+        .await?;
+    let interrupted = Box::pin(stream::iter([
+        Ok(Bytes::from_static(b"abc")),
+        Err(cancelled(&StoragePath::new("source")?, Operation::Read)),
+    ]));
+    assert!(staged.write(&stage, interrupted).await.is_err());
+    assert_eq!(staged.observe_checkpoint(&stage).await?.durable_prefix, 3);
+    let identity = staged.recovery_identity(&stage).await?;
+    let recovered = staged
+        .recover(RecoverRequest {
+            identity,
+            final_destination: FinalDestination::new(StoragePath::new("final")?),
+            source: descriptor,
+            recovery_binding: [4; 32],
+            claim_token: [5; 32],
+        })
+        .await?;
+    let evidence = staged
+        .write(
+            &recovered,
+            Box::pin(stream::iter([Ok(Bytes::from_static(b"def"))])),
+        )
+        .await?;
+    assert_eq!(evidence.persisted_bytes, 6);
+    assert_eq!(
+        staged.observe_checkpoint(&recovered).await?.durable_prefix,
+        6
+    );
+    staged.discard(recovered).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn hdfs_recovery_rejects_tampering_and_competing_claims_without_mutation() -> TestResult {
+    let protocol = Arc::new(MemoryHdfs::default());
+    protocol
+        .insert("source", Bytes::from_static(b"claim"))
+        .await;
+    let source = connect(protocol.clone(), test_identity("claim-source")?)?;
+    let destination = connect(protocol.clone(), test_identity("claim-destination")?)?;
+    let descriptor = source
+        .read_source(&PreflightPolicy::production())?
+        .describe(&StoragePath::new("source")?)
+        .await?;
+    let staged = destination.staged_destination(&PreflightPolicy::production())?;
+    let prepare = PrepareRequest {
+        final_destination: FinalDestination::new(StoragePath::new("final")?),
+        source: descriptor.clone(),
+        recovery_binding: [6; 32],
+    };
+    let stage = staged.prepare(prepare.clone()).await?;
+    let identity = staged.recovery_identity(&stage).await?;
+    let mut bytes = identity.as_bytes().to_vec();
+    let last = bytes
+        .len()
+        .checked_sub(1)
+        .ok_or("empty recovery identity")?;
+    bytes[last] ^= 1;
+    let tampered = RecoveryIdentity::from_bytes(bytes)?;
+    let recover = |identity, claim_token| RecoverRequest {
+        identity,
+        final_destination: prepare.final_destination.clone(),
+        source: descriptor.clone(),
+        recovery_binding: prepare.recovery_binding,
+        claim_token,
+    };
+    assert!(staged.recover(recover(tampered, [1; 32])).await.is_err());
+    assert_eq!(protocol.len().await, 2);
+    let winner = staged.recover(recover(identity.clone(), [2; 32])).await?;
+    let loser = staged.recover(recover(identity, [3; 32])).await;
+    assert!(
+        matches!(loser, Err(crate::storage::StorageRoleFailure::Entry(error))
+        if error.class() == FailureClass::Conflict)
+    );
+    assert_eq!(protocol.len().await, 2);
+    staged.discard(winner).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_or_restart_preserves_unknown_hdfs_stage_and_reuploads() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     protocol
         .insert("source", Bytes::from_static(b"restart"))
         .await;
     let source = connect(protocol.clone(), test_identity("restart-source")?)?;
     let destination = connect(protocol.clone(), test_identity("restart-destination")?)?;
-    let recovery = RecoveryIdentity::from_bytes(Bytes::from_static(b"unsupported-hdfs-state"))?;
+    let descriptor = source
+        .read_source(&PreflightPolicy::production())?
+        .describe(&StoragePath::new("source")?)
+        .await?;
+    let staged = destination.staged_destination(&PreflightPolicy::production())?;
+    let unknown = staged
+        .prepare(PrepareRequest {
+            final_destination: FinalDestination::new(StoragePath::new("final")?),
+            source: descriptor,
+            recovery_binding: [7; 32],
+        })
+        .await?;
+    let recovery = staged.recovery_identity(&unknown).await?;
+    let mut bytes = recovery.as_bytes().to_vec();
+    let last = bytes
+        .len()
+        .checked_sub(1)
+        .ok_or("empty recovery identity")?;
+    bytes[last] ^= 1;
+    let recovery = RecoveryIdentity::from_bytes(bytes)?;
     let outcome = transfer(
         request(source, destination)?
             .with_recovery(RecoveryPolicy::ResumeOrRestart, Some(recovery)),
@@ -172,6 +294,39 @@ async fn resume_or_restart_reuploads_when_hdfs_recovery_is_unsupported() -> Test
     assert_eq!(
         protocol.get("final").await.as_deref(),
         Some(b"restart".as_slice())
+    );
+    assert_eq!(protocol.len().await, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn require_resume_reclaims_hdfs_stage_before_reupload() -> TestResult {
+    let protocol = Arc::new(MemoryHdfs::default());
+    protocol
+        .insert("source", Bytes::from_static(b"resume"))
+        .await;
+    protocol.fail_writes();
+    let source = connect(protocol.clone(), test_identity("require-source")?)?;
+    let destination = connect(protocol.clone(), test_identity("require-destination")?)?;
+    let failure = transfer(request(source, destination)?)
+        .await
+        .err()
+        .ok_or("injected HDFS failure succeeded")?;
+    let identity = failure
+        .into_recovery_identity()
+        .await
+        .map_err(|(_, error)| error)?;
+    protocol.allow_writes();
+    let source = connect(protocol.clone(), test_identity("require-source")?)?;
+    let destination = connect(protocol.clone(), test_identity("require-destination")?)?;
+    let outcome = transfer(
+        request(source, destination)?.with_recovery(RecoveryPolicy::RequireResume, Some(identity)),
+    )
+    .await?;
+    assert_eq!(outcome.transferred_bytes, 6);
+    assert_eq!(
+        protocol.get("final").await.as_deref(),
+        Some(b"resume".as_slice())
     );
     Ok(())
 }

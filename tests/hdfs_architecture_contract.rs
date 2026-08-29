@@ -3,8 +3,15 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use bytes::Bytes;
-use data_mover::model::{BackendIdentity, BackendKind, ObservationPlan, StoragePath};
-use data_mover::storage::Storage;
+use data_mover::model::{
+    BackendIdentity, BackendKind, EntryOperationFailure, FailureClass, ObservationPlan, Operation,
+    StoragePath, Transience,
+};
+use data_mover::storage::{
+    ByteStream, ExistingDestinationPolicy, FinalDestination, PreflightPolicy, PrepareRequest,
+    PublishRequest, RecoverRequest, RecoveryIdentity, SourceDescriptor, Storage,
+    StorageRoleFailure, VerifyRequest,
+};
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest, TraversalSource as _,
@@ -103,6 +110,20 @@ async fn transfer_and_assert(
     Ok(())
 }
 
+fn interrupted_input(prefix: Bytes) -> TestResult<ByteStream> {
+    let failure = EntryOperationFailure::new(
+        StoragePath::new("source")?,
+        Operation::Read,
+        FailureClass::Cancelled,
+        Transience::Transient,
+        "injected HDFS recovery interruption",
+    )?;
+    Ok(Box::pin(futures::stream::iter([
+        Ok(prefix),
+        Err(StorageRoleFailure::Entry(failure)),
+    ])))
+}
+
 #[tokio::test]
 #[ignore = "requires the nightly lab HDFS cluster"]
 async fn architecture_roles_traverse_stream_verify_and_overwrite() -> TestResult {
@@ -187,5 +208,101 @@ async fn native_writer_reorders_bounded_out_of_order_chunks() -> TestResult {
         payload
     );
     storage.delete_storage_root().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the nightly lab HDFS cluster"]
+async fn architecture_stage_recovers_durable_prefix_after_reconnect() -> TestResult {
+    let location = lab_location("architecture-recovery")?;
+    let backend = create_hdfs_storage(&location, &lab_config(), None, true).await?;
+    let payload = Bytes::from(vec![0x6d; 2 * 1024 * 1024]);
+    create_file(&backend, "source.bin", payload.clone()).await?;
+    let (identity, descriptor) = interrupt_and_export_recovery(&backend, &payload).await?;
+    drop(backend);
+    recover_tail_and_publish(&location, payload, identity, descriptor).await
+}
+
+async fn interrupt_and_export_recovery(
+    backend: &HDFSStorage,
+    payload: &Bytes,
+) -> TestResult<(RecoveryIdentity, SourceDescriptor)> {
+    let storage =
+        backend.architecture_storage(BackendIdentity::new(BackendKind::Hdfs, "recovery")?)?;
+    let descriptor = storage
+        .read_source(&PreflightPolicy::production())?
+        .describe(&StoragePath::new("source.bin")?)
+        .await?;
+    let staged = storage.staged_destination(&PreflightPolicy::production())?;
+    let stage = staged
+        .prepare(PrepareRequest {
+            final_destination: FinalDestination::new(StoragePath::new("final.bin")?),
+            source: descriptor.clone(),
+            recovery_binding: [0x34; 32],
+        })
+        .await?;
+    assert!(
+        staged
+            .write(&stage, interrupted_input(payload.slice(..1024 * 1024))?)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        staged.observe_checkpoint(&stage).await?.durable_prefix,
+        1024 * 1024
+    );
+    let identity = staged.recovery_identity(&stage).await?;
+    Ok((identity, descriptor))
+}
+
+async fn recover_tail_and_publish(
+    location: &str,
+    payload: Bytes,
+    identity: RecoveryIdentity,
+    descriptor: SourceDescriptor,
+) -> TestResult {
+    let reconnected = create_hdfs_storage(location, &lab_config(), None, true).await?;
+    let roles =
+        reconnected.architecture_storage(BackendIdentity::new(BackendKind::Hdfs, "recovery")?)?;
+    let staged = roles.staged_destination(&PreflightPolicy::production())?;
+    let recovered = staged
+        .recover(RecoverRequest {
+            identity,
+            final_destination: FinalDestination::new(StoragePath::new("final.bin")?),
+            source: descriptor,
+            recovery_binding: [0x34; 32],
+            claim_token: [0x51; 32],
+        })
+        .await?;
+    staged
+        .write(
+            &recovered,
+            Box::pin(futures::stream::iter([Ok(payload.slice(1024 * 1024..))])),
+        )
+        .await?;
+    let digest = *blake3::hash(&payload).as_bytes();
+    staged
+        .verify(
+            &recovered,
+            VerifyRequest {
+                expected_size: payload.len() as u64,
+                expected_blake3: digest,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await?;
+    staged
+        .publish(
+            &recovered,
+            PublishRequest {
+                policy: ExistingDestinationPolicy::default(),
+                expected_size: payload.len() as u64,
+                expected_blake3: digest,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .map_err(|failure| failure.error)?;
+    reconnected.delete_storage_root().await?;
     Ok(())
 }
