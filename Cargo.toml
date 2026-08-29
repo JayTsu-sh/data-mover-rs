@@ -20,6 +20,7 @@ base64 = "0.22"
 binrw = "0.15"
 blake3 = "1.8.4"
 bytes = { version = "1", features = ["serde"] }
+cap-std = "4.0.2"
 chrono = "0.4.44"
 filetime = "0.2.27"
 futures = "0.3.32"
