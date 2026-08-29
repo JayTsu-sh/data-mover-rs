@@ -36,13 +36,24 @@ profiles:
     status: passed
     environment_fingerprint: shared-nfs3/10.10.1.12-to-10.10.1.13
     evidence:
-      - <<: *nightly_success
-        gate_id: DM-CURRENT-NFS3
+      - evidence_kind: gate_result
+        gate_id: DM-NFS3-CONTRACT
+        repository: JayTsu-sh/data-mover-rs
+        exact_commit: e91d3f22b09f97d8bf9670be17c3688a630790a3
+        dependency_commits: {}
+        run_id: release-e91d3f2-nfs3-20260829
+        mode: real-release
+        fixture_set: architecture-ready-nfs3-contract-v1
+        started_at: "2026-08-29T14:56:57+08:00"
+        completed_at: "2026-08-29T14:57:01+08:00"
+        outcome: passed
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/126#issuecomment-5460934176
         source_profile: nfs3
         destination_profile: nfs3
         environment_fingerprint: shared-nfs3/10.10.1.12-to-10.10.1.13
-    verified_scope: [mount, traversal, copy, integrity, resume, qos]
-    gaps: [target ACL/xattr and recovery architecture contracts not yet implemented]
+    verified_scope: [mount, traversal, streaming_copy, integrity, reconnect_recovery, concurrent_claim, stale_handle_retry, source_qos, metadata_unsupported_truth]
+    gaps: [terrasync single-process and remote-process gates remain independently required]
 
   nfs40:
     status: missing
