@@ -57,7 +57,7 @@ jobs:
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock python3 tests/hdfs_upstream_contract.py --nightly --run-id "$RUN_ID"
       - name: ArchitectureReady NFSv3 contract
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-nfs3-contract.sh "$RUN_ID"
-      - name: ArchitectureReady NFSv4.0 DXN contract
+      - name: ArchitectureReady NFSv4.0 contract
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-nfs40-contract.sh "$RUN_ID"
       - name: Storage matrix E2E (protocol defaults)
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"

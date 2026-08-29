@@ -42,6 +42,12 @@ struct Args {
     stale_ready_file: Option<PathBuf>,
     #[arg(long, requires = "stale_ready_file")]
     stale_go_file: Option<PathBuf>,
+    /// Require the real share to return nfs-rs `Unsupported` from SETACL.
+    #[arg(long)]
+    expect_setacl_unsupported: bool,
+    /// Require delete/recreate to produce a distinct server-side file identity.
+    #[arg(long)]
+    require_stale_identity_change: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -100,8 +106,36 @@ fn nonzero(value: usize) -> ContractResult<NonZeroUsize> {
         .ok_or_else(|| std::io::Error::other("contract bound must be nonzero").into())
 }
 
-async fn seed_v40_fixture(mount_url: &str, root: &str) -> ContractResult {
+async fn probe_v40_acl(
+    mount: &dyn nfs_rs::Mount,
+    file: &str,
+    expect_setacl_unsupported: bool,
+) -> ContractResult {
+    let object = mount.lookup_path(file).await?;
+    let acl = mount.getacl(object.fh.clone()).await?;
+    eprintln!("nfs-rs GETACL returned {} ACE(s)", acl.aces.len());
+    match mount.setacl(object.fh, &acl).await {
+        Err(nfs_rs::NfsError::Unsupported(detail)) if expect_setacl_unsupported => {
+            eprintln!("nfs-rs SETACL returned Unsupported: {detail}");
+            Ok(())
+        }
+        Ok(()) if !expect_setacl_unsupported => {
+            eprintln!("nfs-rs SETACL succeeded");
+            Ok(())
+        }
+        Err(error) => Err(format!("unexpected nfs-rs SETACL result: {error:?}").into()),
+        Ok(()) => Err("nfs-rs SETACL succeeded but Unsupported was required".into()),
+    }
+}
+
+async fn seed_v40_fixture(
+    mount_url: &str,
+    root: &str,
+    expect_setacl_unsupported: bool,
+) -> ContractResult {
+    eprintln!("contract stage: mount fixture export");
     let mount = nfs_rs::parse_url_and_mount(mount_url).await?;
+    eprintln!("contract stage: seed isolated fixture root");
     let mut prefix = String::new();
     for component in root.trim_matches('/').split('/') {
         if !prefix.is_empty() {
@@ -141,11 +175,24 @@ async fn seed_v40_fixture(mount_url: &str, root: &str) -> ContractResult {
     let link = format!("{root}/fixture.link");
     let _ = mount.remove_path(&link).await;
     mount.symlink_path("fixture.bin", &link).await?;
+    eprintln!("contract stage: probe raw nfs-rs ACL operations");
+    probe_v40_acl(
+        mount.as_ref(),
+        &format!("{root}/fixture.bin"),
+        expect_setacl_unsupported,
+    )
+    .await?;
     mount.umount().await?;
+    eprintln!("contract stage: fixture ready");
     Ok(())
 }
 
-async fn validate_v40_stale_retry(source: &Storage, mount_url: &str, root: &str) -> ContractResult {
+async fn validate_v40_stale_retry(
+    source: &Storage,
+    mount_url: &str,
+    root: &str,
+    require_identity_change: bool,
+) -> ContractResult {
     let metadata = source.metadata(&PreflightPolicy::production())?;
     let stale = path("stale/fixture.bin")?;
     metadata
@@ -166,7 +213,10 @@ async fn validate_v40_stale_retry(source: &Storage, mount_url: &str, root: &str)
     mount.close(replacement.fh).await?;
     let fresh = mount.lookup_path(&native).await?;
     if old.attr.as_ref().map(|attr| attr.fileid) == fresh.attr.as_ref().map(|attr| attr.fileid) {
-        return Err("DXN stale fixture did not replace the file identity".into());
+        if require_identity_change {
+            return Err("NFS stale fixture did not replace the file identity".into());
+        }
+        eprintln!("NFS server reused fileid; stale-handle evidence is inconclusive");
     }
     mount.umount().await?;
 
@@ -192,6 +242,26 @@ async fn connect_destination(url: &str) -> ContractResult<Storage> {
         identity("nfs3-contract-destination")?,
     )
     .await?)
+}
+
+fn validate_fixture_metadata(
+    dialect: ContractDialect,
+    acl: &MetadataObservation<data_mover::model::AclMetadata>,
+    xattrs: &MetadataObservation<Vec<data_mover::model::ExtendedAttribute>>,
+) -> ContractResult {
+    match dialect {
+        ContractDialect::Nfs3 if !matches!(acl, MetadataObservation::Unsupported) => {
+            return Err(format!("NFSv3 ACL was not typed unsupported: {acl:?}").into());
+        }
+        ContractDialect::Nfs40 if !matches!(acl, MetadataObservation::Value { .. }) => {
+            return Err(format!("NFSv4.0 GETACL did not return a value: {acl:?}").into());
+        }
+        _ => {}
+    }
+    if !matches!(xattrs, MetadataObservation::Unsupported) {
+        return Err(format!("NFS named attributes were not typed unsupported: {xattrs:?}").into());
+    }
+    Ok(())
 }
 
 async fn validate_traversal(source: &Storage, dialect: ContractDialect) -> ContractResult {
@@ -221,25 +291,7 @@ async fn validate_traversal(source: &Storage, dialect: ContractDialect) -> Contr
         saw_fixture |= entry.path().as_str() == "fixture.bin";
         saw_link |= entry.path().as_str() == "fixture.link" && entry.symlink_target().is_some();
         if entry.path().as_str() == "fixture.bin" {
-            match dialect {
-                ContractDialect::Nfs3 => assert!(matches!(
-                    entry.metadata().acl(),
-                    MetadataObservation::Unsupported
-                )),
-                ContractDialect::Nfs40 => {
-                    if !matches!(entry.metadata().acl(), MetadataObservation::Value { .. }) {
-                        return Err(format!(
-                            "DXN NFSv4.0 GETACL observation was not typed unsupported: {:?}",
-                            entry.metadata().acl()
-                        )
-                        .into());
-                    }
-                }
-            }
-            assert!(matches!(
-                entry.metadata().xattrs(),
-                MetadataObservation::Unsupported
-            ));
+            validate_fixture_metadata(dialect, entry.metadata().acl(), entry.metadata().xattrs())?;
         }
     }
     assert!(saw_fixture && saw_link);
@@ -250,20 +302,28 @@ async fn validate_traversal(source: &Storage, dialect: ContractDialect) -> Contr
     Ok(())
 }
 
-fn assert_acl_set_unsupported<T>(result: Result<T, StorageRoleFailure>) -> ContractResult {
-    match result {
-        Err(StorageRoleFailure::Entry(error))
+fn assert_acl_set_result<T>(
+    result: Result<T, StorageRoleFailure>,
+    expect_unsupported: bool,
+) -> ContractResult {
+    match (result, expect_unsupported) {
+        (Err(StorageRoleFailure::Entry(error)), true)
             if error.class() == FailureClass::Unsupported
                 && error.transience() == Transience::Permanent =>
         {
             Ok(())
         }
-        Ok(_) => Err("DXN NFSv4.0 unexpectedly accepted an ACL operation".into()),
-        Err(error) => Err(format!("unexpected DXN NFSv4.0 ACL result: {error:?}").into()),
+        (Ok(_), false) => Ok(()),
+        (Ok(_), true) => Err("NFSv4.0 SETACL succeeded but Unsupported was required".into()),
+        (Err(error), _) => Err(format!("unexpected NFSv4.0 ACL result: {error:?}").into()),
     }
 }
 
-async fn validate_acl_negative(source: &Storage, dialect: ContractDialect) -> ContractResult {
+async fn validate_acl(
+    source: &Storage,
+    dialect: ContractDialect,
+    expect_setacl_unsupported: bool,
+) -> ContractResult {
     if dialect == ContractDialect::Nfs3 {
         return Ok(());
     }
@@ -278,11 +338,11 @@ async fn validate_acl_negative(source: &Storage, dialect: ContractDialect) -> Co
     let acl_to_set = match observed {
         Ok(observations) => match observations.acl() {
             MetadataObservation::Value { value, .. } => value.clone(),
-            other => return Err(format!("unexpected DXN GETACL observation: {other:?}").into()),
+            other => return Err(format!("unexpected GETACL observation: {other:?}").into()),
         },
-        Err(error) => return Err(format!("unexpected DXN GETACL failure: {error:?}").into()),
+        Err(error) => return Err(format!("unexpected GETACL failure: {error:?}").into()),
     };
-    assert_acl_set_unsupported(
+    assert_acl_set_result(
         metadata
             .apply(
                 &fixture,
@@ -290,6 +350,7 @@ async fn validate_acl_negative(source: &Storage, dialect: ContractDialect) -> Co
                 CancellationToken::new(),
             )
             .await,
+        expect_setacl_unsupported,
     )?;
     Ok(())
 }
@@ -417,8 +478,9 @@ async fn validate_recovery(source: &Storage, destination: Storage, url: &str) ->
 async fn main() -> ContractResult {
     let args = Args::parse();
     if let (Some(mount), Some(root)) = (&args.seed_mount, &args.seed_root) {
-        seed_v40_fixture(mount, root).await?;
+        seed_v40_fixture(mount, root, args.expect_setacl_unsupported).await?;
     }
+    eprintln!("contract stage: connect production role handles");
     let source = data_mover::nfs::create_nfs_role_storage(
         &args.source,
         Some(64 * 1024),
@@ -448,11 +510,14 @@ async fn main() -> ContractResult {
             .seed_root
             .as_deref()
             .ok_or("NFSv4.0 contract requires --seed-root")?;
-        validate_v40_stale_retry(&source, mount, root).await?;
+        validate_v40_stale_retry(&source, mount, root, args.require_stale_identity_change).await?;
     }
+    eprintln!("contract stage: traversal and metadata");
     validate_traversal(&source, args.dialect).await?;
-    validate_acl_negative(&source, args.dialect).await?;
+    validate_acl(&source, args.dialect, args.expect_setacl_unsupported).await?;
+    eprintln!("contract stage: streaming transfer");
     validate_streaming_copy(&source, &destination).await?;
+    eprintln!("contract stage: durable recovery");
     validate_recovery(&source, destination, &args.destination).await?;
     println!(
         "{} passed",

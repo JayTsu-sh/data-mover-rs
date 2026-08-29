@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static safety and wiring contract for the real DXN NFSv4.0 gate."""
+"""Static safety and wiring contract for the real NFSv4.0 gate."""
 
 import unittest
 from pathlib import Path
@@ -17,10 +17,10 @@ class Nfs40ContractTest(unittest.TestCase):
         self.assertIn('run_root="data-mover-ci/$run_id"', runner)
         self.assertIn("--dialect nfs40", runner)
 
-    def test_dxn_endpoint_has_explicit_defaults(self):
+    def test_endpoint_has_explicit_defaults(self):
         common = (ROOT / "tests/lab/common.sh").read_text()
-        self.assertIn('LAB_DXN_V40_DATA="${LAB_DXN_V40_DATA:-10.131.7.201}"', common)
-        self.assertIn('LAB_DXN_V40_EXPORT="${LAB_DXN_V40_EXPORT:-/jay_nfs}"', common)
+        self.assertIn('LAB_NFS40_DATA="${LAB_NFS40_DATA:-10.131.7.201}"', common)
+        self.assertIn('LAB_NFS40_EXPORT="${LAB_NFS40_EXPORT:-/jay_nfs}"', common)
 
     def test_contract_exercises_acl_operations_and_typed_unsupported(self):
         contract = (ROOT / "examples/nfs3_contract.rs").read_text()
@@ -29,6 +29,9 @@ class Nfs40ContractTest(unittest.TestCase):
         self.assertIn("MetadataMutation::Acl", contract)
         self.assertIn("FailureClass::Unsupported", contract)
         self.assertIn("Transience::Permanent", contract)
+        self.assertIn("nfs_rs::NfsError::Unsupported", contract)
+        self.assertIn("mount.getacl", contract)
+        self.assertIn("mount.setacl", contract)
 
     def test_contract_replaces_a_real_v40_file_handle(self):
         contract = (ROOT / "examples/nfs3_contract.rs").read_text()
@@ -38,7 +41,7 @@ class Nfs40ContractTest(unittest.TestCase):
 
     def test_nightly_runs_the_dedicated_gate(self):
         nightly = (ROOT / ".github/workflows/nightly.yml").read_text()
-        self.assertIn("ArchitectureReady NFSv4.0 DXN contract", nightly)
+        self.assertIn("ArchitectureReady NFSv4.0 contract", nightly)
         self.assertIn('tests/lab/run-nfs40-contract.sh "$RUN_ID"', nightly)
 
 

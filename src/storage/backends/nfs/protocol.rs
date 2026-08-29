@@ -38,6 +38,16 @@ pub(crate) fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
         nfs_rs::NfsError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
             (FailureClass::NotFound, Transience::Permanent)
         }
+        nfs_rs::NfsError::Io(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            (FailureClass::Connectivity, Transience::Transient)
+        }
         nfs_rs::NfsError::Io(_) | nfs_rs::NfsError::Rpc(_) => {
             (FailureClass::Connectivity, Transience::Unknown)
         }
@@ -85,7 +95,7 @@ mod tests {
                     "connection reset",
                 )),
                 FailureClass::Connectivity,
-                Transience::Unknown,
+                Transience::Transient,
             ),
         ] {
             let failure = classify_error(error);
