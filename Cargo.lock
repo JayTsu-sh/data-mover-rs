@@ -2890,9 +2890,9 @@ dependencies = [
 
 [[package]]
 name = "nfs-rs"
-version = "0.3.1"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfafb906891b2a373e2c113f7254cfe7fe2db4fdd545c13354291e1d08accad1"
+checksum = "72b400c87842f0daca0845a00118528eb7eafbb583b65e065f5994e06ff85f56"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -2902,6 +2902,7 @@ dependencies = [
  "nix",
  "path-clean",
  "rand 0.9.4",
+ "serde_json",
  "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",

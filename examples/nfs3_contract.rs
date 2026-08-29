@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bytes::Bytes;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use data_mover::model::{
     BackendIdentity, BackendKind, FailureClass, MetadataObservation, ObservationMode,
-    ObservationPlan, OwnershipMode, StoragePath,
+    ObservationPlan, OwnershipMode, StoragePath, Transience,
 };
 use data_mover::storage::{
     ByteStream, ExistingDestinationPolicy, FinalDestination, MetadataMutation, PreflightPolicy,
@@ -26,16 +26,28 @@ use tokio_util::sync::CancellationToken;
 type ContractResult<T = ()> = Result<T, Box<dyn Error>>;
 
 #[derive(Debug, Parser)]
-#[command(about = "Run the ArchitectureReady NFSv3 contract against two real exports")]
+#[command(about = "Run an ArchitectureReady NFS dialect contract against two real roots")]
 struct Args {
+    #[arg(long, value_enum, default_value_t = ContractDialect::Nfs3)]
+    dialect: ContractDialect,
     #[arg(long)]
     source: String,
     #[arg(long)]
     destination: String,
+    #[arg(long, requires = "seed_root")]
+    seed_mount: Option<String>,
+    #[arg(long, requires = "seed_mount")]
+    seed_root: Option<String>,
     #[arg(long, requires = "stale_go_file")]
     stale_ready_file: Option<PathBuf>,
     #[arg(long, requires = "stale_ready_file")]
     stale_go_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ContractDialect {
+    Nfs3,
+    Nfs40,
 }
 
 async fn validate_stale_retry(
@@ -88,6 +100,90 @@ fn nonzero(value: usize) -> ContractResult<NonZeroUsize> {
         .ok_or_else(|| std::io::Error::other("contract bound must be nonzero").into())
 }
 
+async fn seed_v40_fixture(mount_url: &str, root: &str) -> ContractResult {
+    let mount = nfs_rs::parse_url_and_mount(mount_url).await?;
+    let mut prefix = String::new();
+    for component in root.trim_matches('/').split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        if mount.lookup_path(&prefix).await.is_err() {
+            mount.mkdir_path(&prefix, 0o700).await?;
+        }
+    }
+    for relative in ["dir", "stale"] {
+        let directory = format!("{root}/{relative}");
+        if mount.lookup_path(&directory).await.is_err() {
+            mount.mkdir_path(&directory, 0o700).await?;
+        }
+    }
+    for (relative, payload) in [
+        (
+            "fixture.bin",
+            b"architecture-ready-nfs40-fixture".as_slice(),
+        ),
+        ("dir/nested.bin", b"nested".as_slice()),
+        ("stale/fixture.bin", b"stale-handle-fixture".as_slice()),
+    ] {
+        let file = format!("{root}/{relative}");
+        let _ = mount.remove_path(&file).await;
+        let created = mount.create_path(&file, Some(0o600)).await?;
+        let count = mount
+            .write(created.fh.clone(), 0, Bytes::copy_from_slice(payload))
+            .await?;
+        if usize::try_from(count)? != payload.len() {
+            return Err("NFSv4.0 fixture write was short".into());
+        }
+        mount.commit(created.fh.clone(), 0, count).await?;
+        mount.close(created.fh).await?;
+    }
+    let link = format!("{root}/fixture.link");
+    let _ = mount.remove_path(&link).await;
+    mount.symlink_path("fixture.bin", &link).await?;
+    mount.umount().await?;
+    Ok(())
+}
+
+async fn validate_v40_stale_retry(source: &Storage, mount_url: &str, root: &str) -> ContractResult {
+    let metadata = source.metadata(&PreflightPolicy::production())?;
+    let stale = path("stale/fixture.bin")?;
+    metadata
+        .observe(
+            &stale,
+            ObservationPlan::default().with_ownership_mode(ObservationMode::InlineOnly),
+        )
+        .await?;
+
+    let mount = nfs_rs::parse_url_and_mount(mount_url).await?;
+    let native = format!("{root}/stale/fixture.bin");
+    let old = mount.lookup_path(&native).await?;
+    mount.remove_path(&native).await?;
+    let replacement = mount.create_path(&native, Some(0o600)).await?;
+    let payload = Bytes::from_static(b"stale-handle-fixture");
+    let count = mount.write(replacement.fh.clone(), 0, payload).await?;
+    mount.commit(replacement.fh.clone(), 0, count).await?;
+    mount.close(replacement.fh).await?;
+    let fresh = mount.lookup_path(&native).await?;
+    if old.attr.as_ref().map(|attr| attr.fileid) == fresh.attr.as_ref().map(|attr| attr.fileid) {
+        return Err("DXN stale fixture did not replace the file identity".into());
+    }
+    mount.umount().await?;
+
+    metadata
+        .apply(
+            &stale,
+            MetadataMutation::NumericOwnership(OwnershipMode {
+                uid: 0,
+                gid: 0,
+                mode: 0o644,
+            }),
+            CancellationToken::new(),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn connect_destination(url: &str) -> ContractResult<Storage> {
     Ok(data_mover::nfs::create_nfs_role_storage(
         url,
@@ -98,15 +194,19 @@ async fn connect_destination(url: &str) -> ContractResult<Storage> {
     .await?)
 }
 
-async fn validate_traversal(source: &Storage) -> ContractResult {
+async fn validate_traversal(source: &Storage, dialect: ContractDialect) -> ContractResult {
     let traversal = StorageTraversalSource::new(source)?;
+    let acl_mode = match dialect {
+        ContractDialect::Nfs3 => ObservationMode::Required,
+        ContractDialect::Nfs40 => ObservationMode::BestEffort,
+    };
     let mut session = traversal.traverse(TraversalRequest {
         root: StoragePath::root(),
         order: TraversalOrder::Admission,
         max_inflight_operations: nonzero(4)?,
         max_buffered_items: nonzero(2)?,
         observation_plan: ObservationPlan::default()
-            .with_acl(ObservationMode::Required)
+            .with_acl(acl_mode)
             .with_xattrs(ObservationMode::Required)
             .with_ownership_mode(ObservationMode::InlineOnly)
             .with_timestamps(ObservationMode::InlineOnly),
@@ -121,10 +221,21 @@ async fn validate_traversal(source: &Storage) -> ContractResult {
         saw_fixture |= entry.path().as_str() == "fixture.bin";
         saw_link |= entry.path().as_str() == "fixture.link" && entry.symlink_target().is_some();
         if entry.path().as_str() == "fixture.bin" {
-            assert!(matches!(
-                entry.metadata().acl(),
-                MetadataObservation::Unsupported
-            ));
+            match dialect {
+                ContractDialect::Nfs3 => assert!(matches!(
+                    entry.metadata().acl(),
+                    MetadataObservation::Unsupported
+                )),
+                ContractDialect::Nfs40 => {
+                    if !matches!(entry.metadata().acl(), MetadataObservation::Value { .. }) {
+                        return Err(format!(
+                            "DXN NFSv4.0 GETACL observation was not typed unsupported: {:?}",
+                            entry.metadata().acl()
+                        )
+                        .into());
+                    }
+                }
+            }
             assert!(matches!(
                 entry.metadata().xattrs(),
                 MetadataObservation::Unsupported
@@ -136,6 +247,50 @@ async fn validate_traversal(source: &Storage) -> ContractResult {
         session.finish().await?,
         TraversalOutcome::Completed(_)
     ));
+    Ok(())
+}
+
+fn assert_acl_set_unsupported<T>(result: Result<T, StorageRoleFailure>) -> ContractResult {
+    match result {
+        Err(StorageRoleFailure::Entry(error))
+            if error.class() == FailureClass::Unsupported
+                && error.transience() == Transience::Permanent =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err("DXN NFSv4.0 unexpectedly accepted an ACL operation".into()),
+        Err(error) => Err(format!("unexpected DXN NFSv4.0 ACL result: {error:?}").into()),
+    }
+}
+
+async fn validate_acl_negative(source: &Storage, dialect: ContractDialect) -> ContractResult {
+    if dialect == ContractDialect::Nfs3 {
+        return Ok(());
+    }
+    let metadata = source.metadata(&PreflightPolicy::production())?;
+    let fixture = path("fixture.bin")?;
+    let observed = metadata
+        .observe(
+            &fixture,
+            ObservationPlan::default().with_acl(ObservationMode::Required),
+        )
+        .await;
+    let acl_to_set = match observed {
+        Ok(observations) => match observations.acl() {
+            MetadataObservation::Value { value, .. } => value.clone(),
+            other => return Err(format!("unexpected DXN GETACL observation: {other:?}").into()),
+        },
+        Err(error) => return Err(format!("unexpected DXN GETACL failure: {error:?}").into()),
+    };
+    assert_acl_set_unsupported(
+        metadata
+            .apply(
+                &fixture,
+                MetadataMutation::Acl(acl_to_set),
+                CancellationToken::new(),
+            )
+            .await,
+    )?;
     Ok(())
 }
 
@@ -261,6 +416,9 @@ async fn validate_recovery(source: &Storage, destination: Storage, url: &str) ->
 #[tokio::main]
 async fn main() -> ContractResult {
     let args = Args::parse();
+    if let (Some(mount), Some(root)) = (&args.seed_mount, &args.seed_root) {
+        seed_v40_fixture(mount, root).await?;
+    }
     let source = data_mover::nfs::create_nfs_role_storage(
         &args.source,
         Some(64 * 1024),
@@ -281,9 +439,27 @@ async fn main() -> ContractResult {
         args.stale_go_file.as_deref(),
     )
     .await?;
-    validate_traversal(&source).await?;
+    if args.dialect == ContractDialect::Nfs40 {
+        let mount = args
+            .seed_mount
+            .as_deref()
+            .ok_or("NFSv4.0 contract requires --seed-mount")?;
+        let root = args
+            .seed_root
+            .as_deref()
+            .ok_or("NFSv4.0 contract requires --seed-root")?;
+        validate_v40_stale_retry(&source, mount, root).await?;
+    }
+    validate_traversal(&source, args.dialect).await?;
+    validate_acl_negative(&source, args.dialect).await?;
     validate_streaming_copy(&source, &destination).await?;
     validate_recovery(&source, destination, &args.destination).await?;
-    println!("DM-NFS3-CONTRACT passed");
+    println!(
+        "{} passed",
+        match args.dialect {
+            ContractDialect::Nfs3 => "DM-NFS3-CONTRACT",
+            ContractDialect::Nfs40 => "DM-NFS40-CONTRACT",
+        }
+    );
     Ok(())
 }

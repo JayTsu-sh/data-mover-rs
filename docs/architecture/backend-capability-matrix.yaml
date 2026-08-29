@@ -103,8 +103,8 @@ profiles:
       hardlink_topology: unsupported
       rename: required
       delete: required
-      acl: required
-      xattr: required
+      acl: {state: instance_operation_result, dxn: {get: supported, set: unsupported}, fas2750: supported}
+      xattr: {state: unsupported, reason: current_nfs40_protocol_adapter_has_no_named_attribute_operation}
       tags: not_applicable
       uid_gid_mode: required
       timestamps: required

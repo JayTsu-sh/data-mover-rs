@@ -6,6 +6,7 @@ pub(crate) mod common;
 pub(crate) mod metadata;
 #[allow(dead_code)]
 pub(crate) mod namespace;
+pub(crate) mod protocol;
 mod recovery;
 #[allow(dead_code)]
 pub(crate) mod source;
@@ -80,7 +81,7 @@ fn capabilities(
     facts: NfsInstanceFacts,
 ) -> Result<BackendCapabilities, crate::storage::CapabilityValueError> {
     let gate = match facts.dialect {
-        NfsVersion::V3 => {
+        NfsVersion::V3 | NfsVersion::V4_0 => {
             return Ok(BackendCapabilities::new(
                 CapabilityAvailability::Supported,
                 CapabilityAvailability::Supported,
@@ -88,7 +89,6 @@ fn capabilities(
                 CapabilityAvailability::Supported,
             ));
         }
-        NfsVersion::V4_0 => "DM-NFS40-CONTRACT",
         NfsVersion::V4_1 => "DM-NFS41-CONTRACT",
     };
     let availability = CapabilityAvailability::Uncertified(ValidationGate::new(gate)?);
@@ -106,7 +106,7 @@ mod tests {
     use crate::storage::{Capability, CapabilityAvailability};
 
     #[test]
-    fn certified_v3_is_supported_while_v4_dialects_keep_independent_gates() {
+    fn certified_v3_and_v40_are_supported_while_v41_keeps_its_independent_gate() {
         for (dialect, gate) in [
             (NfsVersion::V3, "DM-NFS3-CONTRACT"),
             (NfsVersion::V4_0, "DM-NFS40-CONTRACT"),
@@ -121,7 +121,7 @@ mod tests {
                 stable_writes: true,
             })
             .unwrap_or_else(|error| panic!("{error}"));
-            if dialect == NfsVersion::V3 {
+            if matches!(dialect, NfsVersion::V3 | NfsVersion::V4_0) {
                 assert_eq!(
                     values.availability(Capability::ReadSource),
                     &CapabilityAvailability::Supported

@@ -159,7 +159,11 @@ without issuing unavailable enrichment calls.
 - `TS-NFS40-REMOTE`
 
 The gate independently covers v4.0 state/reconnect, file handles, stable writes, ACL/xattr,
-rename/replace, replay safety, and recovery. NFSv3 or v4.1 evidence cannot substitute.
+rename/replace, replay safety, and recovery. ACL support is determined by the actual GETACL and
+SETACL results, not by a backend-name branch or a capability short-circuit: the current DXN
+fixture permits GETACL and returns typed `Unsupported` for SETACL, while FAS2750 may support both.
+Named attributes are typed `Unsupported` on the current v4.0 adapter. NFSv3 or v4.1 evidence
+cannot substitute.
 
 ### NFSv4.1
 

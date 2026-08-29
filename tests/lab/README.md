@@ -78,6 +78,14 @@ the legacy storage enum and validates the public NFS role handle, protocol-neutr
 typed unsupported NFSv3 ACL/xattr observations, streaming overwrite publication, and recovery
 of a remotely re-observed durable prefix after a fresh mount.
 
+`run-nfs40-contract.sh <run-id>` is the independent `DM-NFS40-CONTRACT` gate against the
+DXN `10.131.7.201:/jay_nfs` fixture using the exact `version=4.0` selector. It seeds an isolated
+run root through NFSv4.0, then validates the production role seam for traversal, stateful file
+handles, streaming copy, source-only QoS accounting, reconnect recovery, and atomic recovery
+claims. ACL operations are exercised rather than inferred from a capability bit: DXN GETACL is
+observed and SETACL must fail as typed permanent `Unsupported`; named attributes are also typed
+`Unsupported`.
+
 The nightly workflow runs this matrix three times: with protocol defaults,
 strictly serial read/write pipelines, and higher read/write concurrency. Release
 validation runs the defaults and higher-concurrency profiles. The integrity and

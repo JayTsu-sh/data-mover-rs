@@ -34,7 +34,7 @@ percent-encoding = "2"
 tracing = "0.1.44"
 moka = { version = "0.12.15", features = ["sync"] }
 md-5 = "0.10"
-nfs-rs = "0.3.1"
+nfs-rs = "0.5.1"
 num-traits = "0.2.19"
 path-clean = "1.0.1"
 quick-xml = { version = "0.39.2", features = ["serialize"] }

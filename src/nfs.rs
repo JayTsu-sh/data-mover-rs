@@ -665,9 +665,25 @@ impl NfsMetadataProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<nfs_rs::Acl, NfsProtocolFailure> {
-        NFSStorage::get_acl(self, Path::new(path.as_str()))
-            .await
-            .map_err(classify_role_error)
+        let native = Path::new(path.as_str());
+        for attempt in 0..=MAX_STALE_RETRIES {
+            let object = self.lookup_fh(native).await.map_err(classify_role_error)?;
+            let generation = self.refresh_generation.load(Ordering::Acquire);
+            match self.mount.getacl(object.fh).await {
+                Ok(acl) => return Ok(acl),
+                Err(error)
+                    if is_retryable_with_invalidation(&error) && attempt < MAX_STALE_RETRIES =>
+                {
+                    self.invalidate_acl_lookup(native, generation).await?;
+                }
+                Err(error) => {
+                    return Err(crate::storage::backends::nfs::protocol::classify_error(
+                        error,
+                    ));
+                }
+            }
+        }
+        unreachable!("bounded ACL retry loop always returns")
     }
 
     async fn get_xattrs(
@@ -695,9 +711,25 @@ impl NfsMetadataProtocol for NFSStorage {
         path: &crate::model::StoragePath,
         acl: &nfs_rs::Acl,
     ) -> std::result::Result<(), NfsProtocolFailure> {
-        NFSStorage::set_acl(self, Path::new(path.as_str()), acl)
-            .await
-            .map_err(classify_role_error)
+        let native = Path::new(path.as_str());
+        for attempt in 0..=MAX_STALE_RETRIES {
+            let object = self.lookup_fh(native).await.map_err(classify_role_error)?;
+            let generation = self.refresh_generation.load(Ordering::Acquire);
+            match self.mount.setacl(object.fh, acl).await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if is_retryable_with_invalidation(&error) && attempt < MAX_STALE_RETRIES =>
+                {
+                    self.invalidate_acl_lookup(native, generation).await?;
+                }
+                Err(error) => {
+                    return Err(crate::storage::backends::nfs::protocol::classify_error(
+                        error,
+                    ));
+                }
+            }
+        }
+        unreachable!("bounded ACL retry loop always returns")
     }
 
     async fn set_xattr(
@@ -1083,23 +1115,19 @@ fn build_cache_root_fh(server_id: u64, raw_fh: &Bytes) -> Bytes {
 
 impl NFSStorage {
     pub(crate) fn instance_facts(&self) -> Result<NfsInstanceFacts> {
-        let dialect = match self.mount.version() {
-            nfs_rs::NFSVersion::NFSv3 => crate::model::NfsVersion::V3,
-            nfs_rs::NFSVersion::NFSv4 => crate::model::NfsVersion::V4_0,
-            nfs_rs::NFSVersion::NFSv4p1 => crate::model::NfsVersion::V4_1,
-            nfs_rs::NFSVersion::NFSv4p2 | nfs_rs::NFSVersion::Unknown => {
-                return Err(StorageError::NfsError(
-                    "NFS server did not negotiate a supported dialect".to_owned(),
-                ));
-            }
-        };
-        let rich_metadata = dialect != crate::model::NfsVersion::V3;
+        let dialect = crate::storage::backends::nfs::protocol::dialect(self.mount.version())
+            .map_err(|_| {
+                StorageError::NfsError(
+                    "NFS server did not negotiate a supported exact dialect".to_owned(),
+                )
+            })?;
+        let negotiated = self.mount.capabilities();
         NfsInstanceFacts {
             dialect,
             max_read_size: self.mount.get_max_read_size(),
             max_write_size: self.mount.get_max_write_size(),
-            acl: rich_metadata,
-            xattrs: rich_metadata,
+            acl: negotiated.acl,
+            xattrs: negotiated.named_attributes,
             stable_writes: true,
         }
         .validate()
@@ -2600,21 +2628,30 @@ impl NFSStorage {
         self.mount.version()
     }
 
-    /// 检测是否支持 ACL（仅 `NFSv4`+）
+    /// 返回当前已协商实例报告的 ACL 能力。
     #[must_use]
     pub fn supports_acl(&self) -> bool {
-        !matches!(
-            self.mount.version(),
-            nfs_rs::NFSVersion::NFSv3 | nfs_rs::NFSVersion::Unknown
-        )
+        self.mount.capabilities().acl
     }
 
-    /// 检测是否支持 xattr（RFC 8276，需要 `NFSv4`+）。
-    /// 与 `supports_acl` 共享相同的版本下限检查；如果服务器声称 `NFSv4` 但不支持
-    /// xattr 扩展，`list_xattr` 会返回 Unsupported 错误，`copy_xattr` 会静默跳过。
+    async fn invalidate_acl_lookup(
+        &self,
+        path: &Path,
+        observed_generation: u64,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        self.maybe_refresh_root_fh(observed_generation)
+            .await
+            .map_err(classify_role_error)?;
+        let cache_root = self.get_root_fh();
+        let components = Self::collect_components(path).map_err(classify_role_error)?;
+        invalidate_path_cache(&components, &cache_root);
+        Ok(())
+    }
+
+    /// 返回当前已协商实例报告的 named-attribute 能力。
     #[must_use]
     pub fn supports_xattr(&self) -> bool {
-        self.supports_acl()
+        self.mount.capabilities().named_attributes
     }
 
     /// 获取文件/目录的 `NFSv4` ACL

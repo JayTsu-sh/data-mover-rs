@@ -149,6 +149,9 @@ impl Metadata for NfsMetadataAdapter {
                 self.protocol.set_acl(path, &value).await
             }
             MetadataMutation::Xattrs(values) => {
+                if !self.protocol.supports_xattrs() {
+                    return Err(unsupported(path));
+                }
                 for value in values {
                     if cancel.is_cancelled() {
                         return Err(super::source::cancelled(path));
@@ -183,6 +186,15 @@ impl Metadata for NfsMetadataAdapter {
             super::source::role_failure(path, crate::model::Operation::Metadata, error)
         })
     }
+}
+
+fn unsupported(path: &StoragePath) -> StorageRoleFailure {
+    super::source::entry_failure(
+        path,
+        crate::model::Operation::Metadata,
+        crate::model::FailureClass::Unsupported,
+        crate::model::Transience::Permanent,
+    )
 }
 
 fn timestamp(value: i64) -> Option<StorageTimestamp> {
@@ -257,6 +269,7 @@ mod tests {
     struct CancellingProtocol {
         cancel: tokio_util::sync::CancellationToken,
         sets: AtomicUsize,
+        xattrs_supported: bool,
     }
 
     #[async_trait]
@@ -268,7 +281,7 @@ mod tests {
             true
         }
         fn supports_xattrs(&self) -> bool {
-            true
+            self.xattrs_supported
         }
         async fn get_acl(&self, _path: &StoragePath) -> Result<nfs_rs::Acl, NfsProtocolFailure> {
             Err(NfsProtocolFailure::protocol())
@@ -375,6 +388,7 @@ mod tests {
         let protocol = Arc::new(CancellingProtocol {
             cancel: cancel.clone(),
             sets: AtomicUsize::new(0),
+            xattrs_supported: true,
         });
         let adapter = NfsMetadataAdapter::new(protocol.clone());
         let values = vec![
