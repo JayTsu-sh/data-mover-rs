@@ -151,6 +151,15 @@ impl LocalObservationAdapter {
     }
 
     #[cfg(test)]
+    pub(crate) fn delay_observation(&self, path: &str, delay: Duration) {
+        self.probe
+            .delays
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_owned(), delay);
+    }
+
+    #[cfg(test)]
     pub(crate) fn optional_call_count(&self) -> usize {
         self.probe.optional_call_count()
     }
@@ -566,7 +575,7 @@ fn entry_kind(metadata: &Metadata) -> Option<EntryKind> {
 }
 
 #[cfg(unix)]
-fn source_identity(
+pub(crate) fn source_identity(
     backend: &BackendIdentity,
     _path: &StoragePath,
     metadata: &Metadata,
@@ -680,6 +689,7 @@ pub(crate) fn classify_io(kind: io::ErrorKind) -> (FailureClass, Transience) {
         io::ErrorKind::NotFound => (FailureClass::NotFound, Transience::Permanent),
         io::ErrorKind::PermissionDenied => (FailureClass::PermissionDenied, Transience::Permanent),
         io::ErrorKind::InvalidInput => (FailureClass::InvalidInput, Transience::Permanent),
+        io::ErrorKind::AlreadyExists => (FailureClass::Conflict, Transience::Permanent),
         io::ErrorKind::Unsupported => (FailureClass::Unsupported, Transience::Permanent),
         io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
             (FailureClass::Protocol, Transience::Transient)

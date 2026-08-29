@@ -136,6 +136,9 @@ matrix cell.
 
 The gate covers positional inflight writes, flush durability, rename/replace, ACL/xattr,
 symlink, cancellation, resume, restart, and overwrite truncation.
+It also exercises unified Local-to-Local preflight, neutral streaming planning, bounded source
+ranges, durable unpublished completion, capability refusal before mutation, and cancellation
+before prepare and during an active source read.
 
 ### NFSv3
 

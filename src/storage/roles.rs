@@ -29,6 +29,7 @@ pub struct SourceDescriptor {
 pub struct ReadRequest {
     pub path: StoragePath,
     pub range: Option<Range<u64>>,
+    pub expected_source: Option<SourceIdentity>,
     pub cancel: CancellationToken,
 }
 

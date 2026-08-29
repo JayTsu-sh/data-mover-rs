@@ -324,6 +324,9 @@ impl ObservedEntry {
     pub const fn identity_key(&self) -> EntryIdentityKey {
         self.identity_key
     }
+    pub(crate) const fn source_identity(&self) -> &SourceIdentity {
+        &self.source_identity
+    }
     /// Returns the owning backend kind.
     #[must_use]
     pub const fn backend_kind(&self) -> BackendKind {

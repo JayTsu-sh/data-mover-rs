@@ -351,6 +351,12 @@ The default path reads sequentially and may write out of order through bounded i
 buffers. Buffer count and bytes are explicit. Queued, read, or gap-separated bytes are
 progress only. A staged destination remains invisible as `FinalDestination`.
 
+The Local streaming implementation lends both roles before source description or destination
+mutation, selects the backend-neutral `Streaming` data path, and admits sequential ranges through
+the shared chunk/byte/operation inflight runtime. Local range streams independently cap each
+emitted chunk at 1 MiB. Completion at this stage requires a re-observed durable prefix equal to
+the described source size; the staged file remains unpublished for verification and publication.
+
 ### Verification
 
 Copy-time generic transfer computes source BLAKE3 during the initial complete sequential
