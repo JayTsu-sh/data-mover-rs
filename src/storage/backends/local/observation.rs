@@ -2,6 +2,8 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::{collections::HashMap, time::Duration};
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, Metadata};
@@ -16,6 +18,75 @@ use crate::storage::StorageRoleFailure;
 pub(crate) struct LocalObservationAdapter {
     root: Arc<Dir>,
     identity: BackendIdentity,
+    #[cfg(test)]
+    probe: Arc<ObservationProbe>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct ObservationProbe {
+    first_delayed: std::sync::atomic::AtomicBool,
+    started: std::sync::Mutex<Vec<String>>,
+    completed: std::sync::Mutex<Vec<String>>,
+    delays: std::sync::Mutex<HashMap<String, Duration>>,
+}
+
+#[cfg(test)]
+impl ObservationProbe {
+    async fn enter(self: &Arc<Self>, path: &StoragePath) -> ObservationProbeGuard {
+        let path = path.as_str().to_owned();
+        self.started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(path.clone());
+        let configured = self
+            .delays
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&path)
+            .copied();
+        let first = self
+            .first_delayed
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(delay) = configured.or((!first).then_some(Duration::from_millis(60))) {
+            tokio::time::sleep(delay).await;
+        }
+        ObservationProbeGuard {
+            probe: Arc::clone(self),
+            path,
+        }
+    }
+
+    pub(super) fn orders(&self) -> (Vec<String>, Vec<String>) {
+        let started = self
+            .started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let completed = self
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (started, completed)
+    }
+}
+
+#[cfg(test)]
+struct ObservationProbeGuard {
+    probe: Arc<ObservationProbe>,
+    path: String,
+}
+
+#[cfg(test)]
+impl Drop for ObservationProbeGuard {
+    fn drop(&mut self) {
+        self.probe
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(self.path.clone());
+    }
 }
 
 impl LocalObservationAdapter {
@@ -28,13 +99,31 @@ impl LocalObservationAdapter {
         Ok(Self {
             root: Arc::new(root),
             identity,
+            #[cfg(test)]
+            probe: Arc::new(ObservationProbe::default()),
         })
+    }
+
+    pub(crate) fn from_root(root: Arc<Dir>, identity: BackendIdentity) -> Self {
+        Self {
+            root,
+            identity,
+            #[cfg(test)]
+            probe: Arc::new(ObservationProbe::default()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn probe_orders(&self) -> (Vec<String>, Vec<String>) {
+        self.probe.orders()
     }
 
     pub(crate) async fn observe(
         &self,
         path: StoragePath,
     ) -> Result<ObservedEntry, StorageRoleFailure> {
+        #[cfg(test)]
+        let _probe = self.probe.enter(&path).await;
         let relative = checked_relative(&path)?;
         let root = Arc::clone(&self.root);
         let metadata = tokio::task::spawn_blocking(move || root.symlink_metadata(relative))
@@ -281,7 +370,7 @@ fn session_failure(operation: Operation, error: &io::Error) -> StorageRoleFailur
     StorageRoleFailure::Session(failure)
 }
 
-fn classify_io(kind: io::ErrorKind) -> (FailureClass, Transience) {
+pub(crate) fn classify_io(kind: io::ErrorKind) -> (FailureClass, Transience) {
     match kind {
         io::ErrorKind::NotFound => (FailureClass::NotFound, Transience::Permanent),
         io::ErrorKind::PermissionDenied => (FailureClass::PermissionDenied, Transience::Permanent),

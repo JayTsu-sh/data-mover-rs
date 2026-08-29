@@ -238,15 +238,24 @@ application.
 
 ### Traversal contract
 
-There is one bounded, cancellable, backpressured stream:
+There is one bounded, cancellable, backpressured item stream paired with mandatory completion
+evidence:
 
 ```rust
 Stream<Item = Result<ObservedEntry, EntryOperationFailure>>
 ```
 
 An entry-operation failure is an item and includes entry identity/path and operation. A
-backend-session failure terminates the stream. Paging and backend concurrency are hidden in
-the traversal implementation.
+backend-session failure terminates the stream. Cancellation is a distinct terminal outcome, not
+an entry or backend error. EOF alone never proves that enumeration was complete: callers must
+await the session completion and receive `Ok(TraversalCompletion)` before committing a complete
+generation or enabling deletion. Paging and backend concurrency are hidden in the traversal
+implementation.
+
+The default `Admission` order emits results in the sequence assigned by the backend enumerator.
+Concurrent observation may finish out of order, but cannot change delivery order. Both the
+admission window and item channel are bounded, so a slow consumer backpressures enumeration
+without allowing the reorder buffer to grow without limit.
 
 Terrasync projects this same stream in three ways:
 

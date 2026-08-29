@@ -251,6 +251,8 @@ produce `failed`, never semantic loss.
 `DM-TRAVERSAL-CONTRACT` verifies bounded backpressure, cancellation, optional
 `ObservationPlan` modes, no default extra ACL/xattr/tag calls, ordered result delivery as
 defined by the traversal request, entry failures as items, and backend-session termination.
+EOF is not completion evidence: the gate also requires a positive `TraversalCompletion`, while
+session failure, cancellation, and internal producer loss remain distinct terminal outcomes.
 
 Terrasync gates additionally verify:
 

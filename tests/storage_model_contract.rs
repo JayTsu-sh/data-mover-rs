@@ -1,9 +1,10 @@
 use std::str::FromStr;
 
 use data_mover::model::{
-    BackendConfig, BackendIdentity, BackendKind, BackendSessionFailure, CifsConfig, EntryKind,
-    EntryOperationFailure, FailureClass, HdfsConfig, LocalConfig, NfsConfig, NfsVersion, Operation,
-    S3Config, SpecialFileKind, StoragePath, StorageTimestamp, TimePrecision, Transience,
+    BackendConfig, BackendIdentity, BackendKind, BackendSessionFailure, CifsConfig,
+    EntryFailureIdentity, EntryKind, EntryOperationFailure, FailureClass, HdfsConfig, LocalConfig,
+    NfsConfig, NfsVersion, Operation, S3Config, SpecialFileKind, StoragePath, StorageTimestamp,
+    TimePrecision, Transience,
 };
 
 #[test]
@@ -103,6 +104,21 @@ fn identity_time_and_entry_kind_are_protocol_neutral() -> Result<(), Box<dyn std
         EntryKind::Special(SpecialFileKind::Fifo),
     ];
     assert_eq!(kinds.len(), 4);
+    Ok(())
+}
+
+#[test]
+fn failed_entry_identity_is_backend_bound_and_opaque() -> Result<(), Box<dyn std::error::Error>> {
+    let local = BackendIdentity::new(BackendKind::Local, "same-stable-id")?;
+    let nfs = BackendIdentity::new(BackendKind::Nfs, "same-stable-id")?;
+    let local_identity = EntryFailureIdentity::derive(&local, b"same-entry");
+    let nfs_identity = EntryFailureIdentity::derive(&nfs, b"same-entry");
+
+    assert_ne!(local_identity, nfs_identity);
+    assert_eq!(
+        format!("{local_identity:?}"),
+        "EntryFailureIdentity(<opaque-32-bytes>)"
+    );
     Ok(())
 }
 

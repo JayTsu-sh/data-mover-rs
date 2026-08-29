@@ -555,6 +555,7 @@ macro_rules! failure_accessors {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntryOperationFailure {
     path: StoragePath,
+    identity: Option<EntryFailureIdentity>,
     operation: Operation,
     class: FailureClass,
     transience: Transience,
@@ -575,6 +576,7 @@ impl EntryOperationFailure {
     ) -> Result<Self, ModelValueError> {
         Ok(Self {
             path,
+            identity: None,
             operation,
             class,
             transience,
@@ -586,6 +588,19 @@ impl EntryOperationFailure {
     #[must_use]
     pub const fn path(&self) -> &StoragePath {
         &self.path
+    }
+
+    /// Attaches an opaque identity when a path alone cannot identify the failed entry.
+    #[must_use]
+    pub fn with_identity(mut self, identity: EntryFailureIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    /// Returns the opaque failed-entry identity when the adapter supplied one.
+    #[must_use]
+    pub const fn identity(&self) -> Option<EntryFailureIdentity> {
+        self.identity
     }
 
     failure_accessors!();
@@ -602,6 +617,40 @@ impl fmt::Display for EntryOperationFailure {
 }
 
 impl std::error::Error for EntryOperationFailure {}
+
+/// Opaque comparison identity for an entry that could not be fully observed.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct EntryFailureIdentity([u8; 32]);
+
+impl EntryFailureIdentity {
+    /// Derives a backend-bound identity from lossless adapter bytes.
+    #[must_use]
+    pub fn derive(backend: &BackendIdentity, bytes: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"data-mover/entry-failure-identity/v1\0");
+        let kind = backend.kind().as_str().as_bytes();
+        let stable_id = backend.stable_id().as_bytes();
+        hasher.update(&(kind.len() as u64).to_le_bytes());
+        hasher.update(kind);
+        hasher.update(&(stable_id.len() as u64).to_le_bytes());
+        hasher.update(stable_id);
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    /// Returns the opaque identity bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl fmt::Debug for EntryFailureIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EntryFailureIdentity(<opaque-32-bytes>)")
+    }
+}
 
 /// A session-wide failure that terminates the affected operation stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
