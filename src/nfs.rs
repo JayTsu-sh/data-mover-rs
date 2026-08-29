@@ -24,6 +24,16 @@ use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
 use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
+use crate::storage::backends::nfs::common::{
+    NfsFactsError, NfsFactsProvider, NfsFailureCode, NfsInstanceFacts, NfsRetryAction,
+    NfsRetryPolicy,
+};
+use crate::storage::backends::nfs::metadata::{NfsMetadataInline, NfsMetadataProtocol};
+use crate::storage::backends::nfs::namespace::{NfsNamespaceObservation, NfsNamespaceProtocol};
+use crate::storage::backends::nfs::source::{
+    NfsProtocolFailure, NfsReadCursor, NfsSourceObservation, NfsSourceProtocol,
+};
+use crate::storage::backends::nfs::staged::{NfsStageFile, NfsStagedProtocol};
 use crate::storage_enum::StorageEnum;
 use crate::transfer_concurrency::{
     TransferBackend, TransferConcurrency, resolve_transfer_concurrency,
@@ -337,7 +347,14 @@ async fn backoff_server_busy(op: &str, target: &(dyn std::fmt::Debug + Send + Sy
 /// **不包含 `NFS4ERR_DELAY`**：DELAY 由 nfs-rs 层（`compound()` 退避重试）处理，
 /// data-mover 层若再叠加重试只会延长等待，无额外收益。
 fn is_retryable_with_invalidation(err: &NfsError) -> bool {
-    is_stale_handle(err) || is_nfs_noent(err)
+    let code = match err {
+        NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_BADHANDLE)
+        | NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_BADHANDLE) => NfsFailureCode::BadHandle,
+        error if is_stale_handle(error) => NfsFailureCode::StaleHandle,
+        error if is_nfs_noent(error) => NfsFailureCode::ConcurrentLookupMiss,
+        _ => return false,
+    };
+    NfsRetryPolicy::new(MAX_STALE_RETRIES).action(code, 0) == NfsRetryAction::InvalidateAndRetry
 }
 
 /// 清除指定路径的所有前缀缓存条目（从根到完整路径）
@@ -388,6 +405,501 @@ impl NFSFileHandle {
             inner: Arc::new(nfs_rs::ObjRes { fh, attr: None }),
             path,
         }
+    }
+}
+
+struct NfsRoleReadCursor {
+    storage: NFSStorage,
+    handle: Option<NFSFileHandle>,
+}
+
+impl Drop for NfsRoleReadCursor {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let storage = self.storage.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = storage.close(&handle).await;
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl NfsReadCursor for NfsRoleReadCursor {
+    async fn read_at(
+        &mut self,
+        offset: u64,
+        count: usize,
+    ) -> std::result::Result<Bytes, NfsProtocolFailure> {
+        self.storage
+            .read(
+                self.handle
+                    .as_mut()
+                    .ok_or_else(NfsProtocolFailure::protocol)?,
+                offset,
+                count,
+            )
+            .await
+            .map_err(classify_role_error)
+    }
+}
+
+#[async_trait]
+impl NfsSourceProtocol for NFSStorage {
+    async fn describe(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<NfsSourceObservation, NfsProtocolFailure> {
+        let entry = self
+            .get_metadata(&PathBuf::from(path.as_str()))
+            .await
+            .map_err(classify_role_error)?;
+        let file_handle = entry
+            .get_file_handle()
+            .cloned()
+            .ok_or_else(NfsProtocolFailure::protocol)?;
+        let kind = if entry.get_is_symlink() {
+            crate::model::EntryKind::Symlink
+        } else if entry.get_is_dir() {
+            crate::model::EntryKind::Directory
+        } else {
+            crate::model::EntryKind::File
+        };
+        Ok(NfsSourceObservation {
+            kind,
+            size: (kind == crate::model::EntryKind::File).then(|| entry.get_size()),
+            file_handle,
+        })
+    }
+
+    async fn open(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<(Box<dyn NfsReadCursor>, Bytes), NfsProtocolFailure> {
+        let handle = self
+            .open(&PathBuf::from(path.as_str()), nfs_rs::OPEN_READ)
+            .await
+            .map_err(classify_role_error)?;
+        let identity = handle.inner.fh.clone();
+        Ok((
+            Box::new(NfsRoleReadCursor {
+                storage: self.clone(),
+                handle: Some(handle),
+            }),
+            identity,
+        ))
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn classify_role_error(error: StorageError) -> NfsProtocolFailure {
+    let (class, transience) = match error {
+        StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_) => (
+            crate::model::FailureClass::NotFound,
+            crate::model::Transience::Permanent,
+        ),
+        StorageError::PermissionDenied(_) => (
+            crate::model::FailureClass::PermissionDenied,
+            crate::model::Transience::Permanent,
+        ),
+        StorageError::InvalidPath(_) => (
+            crate::model::FailureClass::InvalidInput,
+            crate::model::Transience::Permanent,
+        ),
+        StorageError::Cancelled => (
+            crate::model::FailureClass::Cancelled,
+            crate::model::Transience::Transient,
+        ),
+        StorageError::IoError(_) => (
+            crate::model::FailureClass::Connectivity,
+            crate::model::Transience::Unknown,
+        ),
+        _ => (
+            crate::model::FailureClass::Protocol,
+            crate::model::Transience::Unknown,
+        ),
+    };
+    NfsProtocolFailure { class, transience }
+}
+
+fn role_observation(
+    entry: &EntryEnum,
+) -> std::result::Result<NfsNamespaceObservation, NfsProtocolFailure> {
+    let file_handle = entry
+        .get_file_handle()
+        .cloned()
+        .ok_or_else(NfsProtocolFailure::protocol)?;
+    let kind = if entry.get_is_symlink() {
+        crate::model::EntryKind::Symlink
+    } else if entry.get_is_dir() {
+        crate::model::EntryKind::Directory
+    } else {
+        crate::model::EntryKind::File
+    };
+    let path = crate::model::StoragePath::new(entry.get_relative_path().to_string_lossy())
+        .map_err(|_| NfsProtocolFailure::protocol())?;
+    Ok(NfsNamespaceObservation {
+        path,
+        kind,
+        size: (kind == crate::model::EntryKind::File).then(|| entry.get_size()),
+        file_handle,
+    })
+}
+
+#[async_trait]
+impl NfsNamespaceProtocol for NFSStorage {
+    async fn stat(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<NfsNamespaceObservation, NfsProtocolFailure> {
+        let entry = self
+            .get_metadata(&PathBuf::from(path.as_str()))
+            .await
+            .map_err(classify_role_error)?;
+        role_observation(&entry)
+    }
+
+    async fn list(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<Vec<NfsNamespaceObservation>, NfsProtocolFailure> {
+        self.list_role_entries(&PathBuf::from(path.as_str()))
+            .await
+            .map_err(classify_role_error)?
+            .iter()
+            .map(role_observation)
+            .collect()
+    }
+
+    async fn create_directory(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        self.create_dir_all(Path::new(path.as_str()))
+            .await
+            .map(|_| ())
+            .map_err(classify_role_error)
+    }
+
+    async fn delete(
+        &self,
+        path: &crate::model::StoragePath,
+        kind: crate::model::EntryKind,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        let native = PathBuf::from(path.as_str());
+        if kind == crate::model::EntryKind::Directory {
+            self.delete_dir_all(Some(&native))
+                .await
+                .map_err(classify_role_error)
+        } else {
+            self.delete_file(&native).await.map_err(classify_role_error)
+        }
+    }
+
+    async fn rename(
+        &self,
+        from: &crate::model::StoragePath,
+        to: &crate::model::StoragePath,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        self.rename(Path::new(from.as_str()), Path::new(to.as_str()))
+            .await
+            .map_err(classify_role_error)
+    }
+}
+
+#[async_trait]
+impl NfsMetadataProtocol for NFSStorage {
+    async fn stat(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<NfsMetadataInline, NfsProtocolFailure> {
+        let entry = self
+            .get_metadata(Path::new(path.as_str()))
+            .await
+            .map_err(classify_role_error)?;
+        let EntryEnum::NAS(entry) = entry else {
+            return Err(NfsProtocolFailure::protocol());
+        };
+        Ok(NfsMetadataInline {
+            symlink: entry.is_symlink,
+            uid: entry.uid,
+            gid: entry.gid,
+            mode: entry.mode,
+            atime: entry.atime,
+            mtime: entry.mtime,
+            ctime: entry.ctime,
+        })
+    }
+
+    fn supports_acl(&self) -> bool {
+        NFSStorage::supports_acl(self)
+    }
+
+    fn supports_xattrs(&self) -> bool {
+        NFSStorage::supports_xattr(self)
+    }
+
+    async fn get_acl(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<nfs_rs::Acl, NfsProtocolFailure> {
+        NFSStorage::get_acl(self, Path::new(path.as_str()))
+            .await
+            .map_err(classify_role_error)
+    }
+
+    async fn get_xattrs(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<Vec<crate::model::ExtendedAttribute>, NfsProtocolFailure> {
+        let native = Path::new(path.as_str());
+        let names = self.list_xattr(native).await.map_err(classify_role_error)?;
+        let mut values = Vec::with_capacity(names.len());
+        for name in names {
+            let value = self
+                .get_xattr(native, &name)
+                .await
+                .map_err(classify_role_error)?;
+            values.push(
+                crate::model::ExtendedAttribute::new(name.into_bytes(), value.to_vec())
+                    .map_err(|_| NfsProtocolFailure::protocol())?,
+            );
+        }
+        Ok(values)
+    }
+
+    async fn set_acl(
+        &self,
+        path: &crate::model::StoragePath,
+        acl: &nfs_rs::Acl,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        NFSStorage::set_acl(self, Path::new(path.as_str()), acl)
+            .await
+            .map_err(classify_role_error)
+    }
+
+    async fn set_xattr(
+        &self,
+        path: &crate::model::StoragePath,
+        value: &crate::model::ExtendedAttribute,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        let name = std::str::from_utf8(value.name()).map_err(|_| NfsProtocolFailure::protocol())?;
+        NFSStorage::set_xattr(
+            self,
+            Path::new(path.as_str()),
+            name,
+            Bytes::copy_from_slice(value.value()),
+        )
+        .await
+        .map_err(classify_role_error)
+    }
+
+    async fn set_numeric_ownership(
+        &self,
+        path: &crate::model::StoragePath,
+        value: crate::model::OwnershipMode,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        self.update_metadata(
+            Path::new(path.as_str()),
+            None,
+            None,
+            Some(value.uid),
+            Some(value.gid),
+            Some(value.mode),
+        )
+        .await
+        .map_err(classify_role_error)
+    }
+
+    async fn set_timestamps(
+        &self,
+        path: &crate::model::StoragePath,
+        value: crate::model::TimestampMetadata,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        let atime = value
+            .accessed
+            .map(|time| i64::try_from(time.unix_nanos()))
+            .transpose()
+            .map_err(|_| NfsProtocolFailure::protocol())?;
+        let mtime = value
+            .modified
+            .map(|time| i64::try_from(time.unix_nanos()))
+            .transpose()
+            .map_err(|_| NfsProtocolFailure::protocol())?;
+        self.update_metadata(Path::new(path.as_str()), atime, mtime, None, None, None)
+            .await
+            .map_err(classify_role_error)
+    }
+}
+
+struct NfsRoleStageFile {
+    storage: NFSStorage,
+    handle: Option<NFSFileHandle>,
+}
+
+impl Drop for NfsRoleStageFile {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let storage = self.storage.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = storage.close(&handle).await;
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl NfsStageFile for NfsRoleStageFile {
+    async fn read_at(
+        &mut self,
+        offset: u64,
+        count: usize,
+    ) -> std::result::Result<Bytes, NfsProtocolFailure> {
+        self.storage
+            .read(
+                self.handle
+                    .as_mut()
+                    .ok_or_else(NfsProtocolFailure::protocol)?,
+                offset,
+                count,
+            )
+            .await
+            .map_err(classify_role_error)
+    }
+
+    async fn write_at(
+        &mut self,
+        offset: u64,
+        data: Bytes,
+    ) -> std::result::Result<u64, NfsProtocolFailure> {
+        self.storage
+            .write(
+                self.handle
+                    .as_ref()
+                    .ok_or_else(NfsProtocolFailure::protocol)?,
+                offset,
+                data,
+            )
+            .await
+            .map_err(classify_role_error)
+    }
+
+    async fn close(mut self: Box<Self>) -> std::result::Result<(), NfsProtocolFailure> {
+        let handle = self
+            .handle
+            .take()
+            .ok_or_else(NfsProtocolFailure::protocol)?;
+        self.storage
+            .close(&handle)
+            .await
+            .map_err(classify_role_error)
+    }
+}
+
+#[async_trait]
+impl NfsStagedProtocol for NFSStorage {
+    async fn create_empty(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        let native = Path::new(path.as_str());
+        match self.get_metadata(native).await {
+            Ok(_) => {
+                return Err(NfsProtocolFailure {
+                    class: crate::model::FailureClass::Conflict,
+                    transience: crate::model::Transience::Permanent,
+                });
+            }
+            Err(StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_)) => {}
+            Err(error) => return Err(classify_role_error(error)),
+        }
+        let handle = self
+            .create_file(native, None, None, None)
+            .await
+            .map_err(classify_role_error)?;
+        if let Err(error) = self.truncate_file(&handle).await {
+            let primary = classify_role_error(error);
+            let close_failure = self.close(&handle).await.err().map(classify_role_error);
+            let cleanup_failure = self
+                .delete_file(native)
+                .await
+                .err()
+                .map(classify_role_error);
+            return Err(cleanup_failure.or(close_failure).unwrap_or(primary));
+        }
+        if let Err(error) = self.close(&handle).await {
+            let primary = classify_role_error(error);
+            let cleanup_failure = self
+                .delete_file(native)
+                .await
+                .err()
+                .map(classify_role_error);
+            return Err(cleanup_failure.unwrap_or(primary));
+        }
+        Ok(())
+    }
+
+    async fn open_read(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
+        let handle = self
+            .open(Path::new(path.as_str()), OPEN_READ)
+            .await
+            .map_err(classify_role_error)?;
+        Ok(Box::new(NfsRoleStageFile {
+            storage: self.clone(),
+            handle: Some(handle),
+        }))
+    }
+
+    async fn open_write(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
+        let handle = self
+            .open(Path::new(path.as_str()), OPEN_WRITE)
+            .await
+            .map_err(classify_role_error)?;
+        Ok(Box::new(NfsRoleStageFile {
+            storage: self.clone(),
+            handle: Some(handle),
+        }))
+    }
+
+    async fn size(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<u64, NfsProtocolFailure> {
+        self.get_metadata(Path::new(path.as_str()))
+            .await
+            .map(|entry| entry.get_size())
+            .map_err(classify_role_error)
+    }
+
+    async fn rename(
+        &self,
+        from: &crate::model::StoragePath,
+        to: &crate::model::StoragePath,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        NFSStorage::rename(self, Path::new(from.as_str()), Path::new(to.as_str()))
+            .await
+            .map_err(classify_role_error)
+    }
+
+    async fn delete(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        self.delete_file(Path::new(path.as_str()))
+            .await
+            .map_err(classify_role_error)
     }
 }
 
@@ -549,6 +1061,29 @@ fn build_cache_root_fh(server_id: u64, raw_fh: &Bytes) -> Bytes {
 }
 
 impl NFSStorage {
+    pub(crate) fn instance_facts(&self) -> Result<NfsInstanceFacts> {
+        let dialect = match self.mount.version() {
+            nfs_rs::NFSVersion::NFSv3 => crate::model::NfsVersion::V3,
+            nfs_rs::NFSVersion::NFSv4 => crate::model::NfsVersion::V4_0,
+            nfs_rs::NFSVersion::NFSv4p1 => crate::model::NfsVersion::V4_1,
+            nfs_rs::NFSVersion::NFSv4p2 | nfs_rs::NFSVersion::Unknown => {
+                return Err(StorageError::NfsError(
+                    "NFS server did not negotiate a supported dialect".to_owned(),
+                ));
+            }
+        };
+        let rich_metadata = dialect != crate::model::NfsVersion::V3;
+        NfsInstanceFacts {
+            dialect,
+            max_read_size: self.mount.get_max_read_size(),
+            max_write_size: self.mount.get_max_write_size(),
+            acl: rich_metadata,
+            xattrs: rich_metadata,
+            stable_writes: true,
+        }
+        .validate()
+        .map_err(|_| StorageError::NfsError("invalid negotiated NFS facts".to_owned()))
+    }
     pub(crate) fn transfer_namespace(&self) -> &str {
         &self.namespace_identity
     }
@@ -2710,7 +3245,12 @@ impl NFSStorage {
     /// `next_read_want`），不引入泛型/异步闭包——future 为具体类型组合，
     /// 避开 `AsyncFnMut` 高阶生命周期的 auto-trait（Send）推导缺陷破坏
     /// 下游 `tokio::spawn`。
-    async fn read(&self, file: &mut NFSFileHandle, offset: u64, count: usize) -> Result<Bytes> {
+    pub(crate) async fn read(
+        &self,
+        file: &mut NFSFileHandle,
+        offset: u64,
+        count: usize,
+    ) -> Result<Bytes> {
         // block_size 在 mount 时已钳到 min(客户配置, rsize, wsize)，恒 > 0
         let block_size = self.calculate_chunk_size(count as u64);
         let end = offset + count as u64;
@@ -2792,7 +3332,12 @@ impl NFSStorage {
     /// `write_pipeline::ChunkSink::write_at`——负责）。`&NFSFileHandle`（非
     /// `&mut`）：函数体只读 `file.path`/`file.inner.fh`，不修改句柄本身，放宽
     /// 为不可变借用以便多个并发写共享同一 handle（改善类型签名，无行为变化）。
-    async fn write(&self, file: &NFSFileHandle, offset: u64, data: Bytes) -> Result<u64> {
+    pub(crate) async fn write(
+        &self,
+        file: &NFSFileHandle,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<u64> {
         let length = data.len() as u64;
         let chunk_size = self.calculate_chunk_size(length);
         let mut total_written = 0;
@@ -3536,6 +4081,40 @@ impl NFSStorage {
         Ok(Self::finish_read_dir(dir_path, files, subdirs, errors))
     }
 
+    /// Lists exactly one directory for the storage Namespace role.
+    pub(crate) async fn list_role_entries(&self, relative_path: &Path) -> Result<Vec<EntryEnum>> {
+        let directory = self.lookup_fh(relative_path).await?;
+        let mount = self.mount.clone();
+        let mut stream = mount.readdirplus(directory.fh).await;
+        let mut entries = Vec::new();
+        while let Some(result) = stream.next().await {
+            let entry = result.map_err(|error| {
+                StorageError::NfsError(format!("NFS directory listing failed: {error}"))
+            })?;
+            if entry.file_name == "." || entry.file_name == ".." {
+                continue;
+            }
+            let attrs = entry.attr.ok_or_else(|| {
+                StorageError::NfsError("NFS directory entry omitted attributes".to_owned())
+            })?;
+            let child = relative_path.join(&entry.file_name);
+            let extension = child
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_owned);
+            entries.push(EntryEnum::NAS(NASEntry::from_nfs_attrs(
+                entry.file_name,
+                child,
+                extension,
+                &attrs,
+                entry.handle,
+                NfsEnrich::from_attrs(&attrs),
+            )));
+        }
+        entries.sort_by(|left, right| left.get_relative_path().cmp(right.get_relative_path()));
+        Ok(entries)
+    }
+
     fn finish_read_dir(
         dir_path: &str,
         mut files: Vec<Arc<EntryEnum>>,
@@ -3623,6 +4202,12 @@ impl NFSStorage {
     }
 }
 
+impl NfsFactsProvider for NFSStorage {
+    fn instance_facts(&self) -> std::result::Result<NfsInstanceFacts, NfsFactsError> {
+        NFSStorage::instance_facts(self).map_err(|_| NfsFactsError)
+    }
+}
+
 /// 创建 NFS 存储实例，并包装为 `StorageEnum`
 ///
 /// # 参数
@@ -3639,9 +4224,25 @@ pub async fn create_nfs_storage(
     ensure_dir: bool,
 ) -> Result<StorageEnum> {
     let (storage, root_dir) = NFSStorage::mount_and_build(url, block_size).await?;
-    Ok(StorageEnum::NFS(
-        storage.attach_root(root_dir, ensure_dir).await?,
-    ))
+    let storage = storage.attach_root(root_dir, ensure_dir).await?;
+    storage.instance_facts()?;
+    Ok(StorageEnum::NFS(storage))
+}
+
+/// Builds the `ArchitectureReady` NFS role handle without routing through the legacy enum.
+///
+/// # Errors
+/// Returns an error when mount, root attachment, fact validation, or role construction fails.
+pub async fn create_nfs_role_storage(
+    url: &str,
+    block_size: Option<u64>,
+    ensure_dir: bool,
+    identity: crate::model::BackendIdentity,
+) -> Result<crate::storage::Storage> {
+    let (storage, root_dir) = NFSStorage::mount_and_build(url, block_size).await?;
+    let storage = storage.attach_root(root_dir, ensure_dir).await?;
+    crate::storage::backends::nfs::connect(Arc::new(storage), identity)
+        .map_err(|error| StorageError::ConfigError(error.to_string()))
 }
 
 impl Drop for NFSStorage {

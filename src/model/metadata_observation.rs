@@ -165,6 +165,7 @@ impl AclMetadata {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AclEncoding {
     Posix,
+    NfsV4,
     WindowsSecurityDescriptor,
 }
 
@@ -419,7 +420,8 @@ pub(crate) fn encode(metadata: &MetadataObservations, output: &mut Vec<u8>) {
     if let Some(value) = encode_state(&metadata.acl, output) {
         output.push(match value.encoding {
             AclEncoding::Posix => 0,
-            AclEncoding::WindowsSecurityDescriptor => 1,
+            AclEncoding::NfsV4 => 1,
+            AclEncoding::WindowsSecurityDescriptor => 2,
         });
         encode_optional_bytes(output, value.access.as_deref());
         encode_optional_bytes(output, value.default.as_deref());
@@ -551,7 +553,8 @@ fn decode_acl(
 ) -> Result<AclMetadata, SnapshotDecodeError> {
     let encoding = match cursor.byte()? {
         0 => AclEncoding::Posix,
-        1 => AclEncoding::WindowsSecurityDescriptor,
+        1 => AclEncoding::NfsV4,
+        2 => AclEncoding::WindowsSecurityDescriptor,
         _ => return Err(SnapshotDecodeError::Malformed),
     };
     let access = decode_optional_bytes(cursor, budget)?;

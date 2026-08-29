@@ -1481,6 +1481,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "uuid",
  "windows",
  "windows-sys 0.61.2",
  "xattr",

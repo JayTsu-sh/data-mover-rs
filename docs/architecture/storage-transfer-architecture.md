@@ -171,6 +171,14 @@ trait StagedDestination: Send + Sync {
 The adapter decides ordered versus out-of-order writes, persistence barriers, staged naming,
 and publication mechanics. `FinalDestination` is never a partial-write target.
 
+For NFS, the common adapter consumes the dialect and negotiated `rsize`/`wsize` facts from
+`nfs-rs`. Mount/session concurrency, protocol request scheduling, and protocol-level retry remain
+owned by `nfs-rs`; data-mover adds no second mount semaphore or blanket request retry. The adapter
+only bounds transfer chunks, applies source QoS/cancellation, and invalidates cached handles for
+the explicitly classified stale-handle, bad-handle, and concurrent-lookup cases. NFSv3, v4.0, and
+v4.1 retain independent capability evidence and real-environment gates. NFSv4 ACLs use a private,
+versioned, lossless codec under the NFS metadata adapter.
+
 ### Namespace
 
 Owns coherent namespace semantics: stat/list, create/delete, rename, and supported link
