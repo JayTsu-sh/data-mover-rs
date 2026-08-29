@@ -1,5 +1,5 @@
 schema_version: 1
-captured_at: "2026-08-29T18:28:06+08:00"
+captured_at: "2026-08-29T19:18:10+08:00"
 policy:
   normative: false
   does_not_create_compatibility_requirement: true
@@ -135,21 +135,21 @@ profiles:
       - evidence_kind: gate_result
         gate_id: DM-S3-CONTRACT
         repository: JayTsu-sh/data-mover-rs
-        exact_commit: 99a01d5e07a195f8201b118e470a3474632e1547
+        exact_commit: 0ed01934c8004e7ad07abf965ecdce42d5744ddd
         dependency_commits: {}
-        run_id: release-99a01d5-s3-recovery-20260829
+        run_id: release-0ed0193-s3-native-20260829
         mode: real-release
-        fixture_set: architecture-ready-standard-s3-contract-v3
-        started_at: "2026-08-29T18:27:49+08:00"
-        completed_at: "2026-08-29T18:28:06+08:00"
+        fixture_set: architecture-ready-standard-s3-contract-v4
+        started_at: "2026-08-29T19:17:54+08:00"
+        completed_at: "2026-08-29T19:18:10+08:00"
         outcome: passed
         artifact_links:
-          - https://github.com/JayTsu-sh/data-mover-rs/issues/131#issuecomment-5461799963
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/132#issuecomment-5462042601
         source_profile: s3_standard
         destination_profile: s3_standard
         environment_fingerprint: shared-standard-s3/10.10.1.12-to-10.10.1.13
-    verified_scope: [connectivity, traversal, copy, integrity, resume, qos, multipart_interruption, reconnect_recovery, invalid_manifest_restart, safe_cleanup_retry, claim_release, publication, tags, range_read, cancellation]
-    gaps: [target native-transfer architecture contract not yet implemented]
+    verified_scope: [connectivity, traversal, copy, integrity, resume, qos, multipart_interruption, reconnect_recovery, invalid_manifest_restart, safe_cleanup_retry, claim_release, publication, tags, range_read, cancellation, native_transfer, multipart_copy, shaped_fallback, native_qos]
+    gaps: []
 
   s3_dxn:
     status: missing
