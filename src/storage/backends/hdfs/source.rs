@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
+use futures::stream::try_unfold;
+use tokio_util::sync::CancellationToken;
 
 use super::protocol::{HdfsEntryFacts, HdfsProtocol, cancelled, entry_failure};
 use crate::model::{
@@ -84,7 +86,7 @@ impl ReadSource for HdfsReadSource {
             cancel: request.cancel,
             qos: request.source_qos,
         };
-        Ok(Box::pin(futures::stream::try_unfold(state, read_next)))
+        Ok(Box::pin(try_unfold(state, read_next)))
     }
 }
 
@@ -93,7 +95,7 @@ struct ReadState {
     path: StoragePath,
     next: u64,
     end: u64,
-    cancel: tokio_util::sync::CancellationToken,
+    cancel: CancellationToken,
     qos: Option<SourceQosBudget>,
 }
 

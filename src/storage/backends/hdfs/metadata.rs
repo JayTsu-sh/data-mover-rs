@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use super::protocol::{HdfsProtocol, cancelled, entry_failure};
 use crate::model::{
@@ -47,7 +48,7 @@ impl Metadata for HdfsMetadata {
         &self,
         path: &StoragePath,
         mutation: MetadataMutation,
-        cancel: tokio_util::sync::CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
         if cancel.is_cancelled() {
             return Err(cancelled(path, Operation::Metadata));

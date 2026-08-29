@@ -1,4 +1,7 @@
+use std::ops::Range as RoleRange;
+
 use bytes::Bytes as RoleBytes;
+use tokio::sync::mpsc as role_mpsc;
 
 use crate::DataChunk as RoleDataChunk;
 use crate::error::HdfsErrorKind as RoleHdfsErrorKind;
@@ -42,7 +45,7 @@ impl RoleHdfsProtocol for HDFSStorage {
     async fn read_range(
         &self,
         path: &RoleStoragePath,
-        range: std::ops::Range<u64>,
+        range: RoleRange<u64>,
     ) -> Result<RoleBytes, RoleFailure> {
         let native = Path::new(path.as_str());
         let file = self.open_file(native).await
@@ -96,7 +99,7 @@ impl RoleHdfsProtocol for HDFSStorage {
         mut input: RoleByteStream,
     ) -> Result<u64, RoleFailure> {
         let capacity = self.transfer_concurrency().write().max(1);
-        let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+        let (sender, receiver) = role_mpsc::channel(capacity);
         let feed = async move {
             let mut offset = 0;
             while let Some(value) = input.next().await {

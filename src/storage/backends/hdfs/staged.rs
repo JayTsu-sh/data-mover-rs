@@ -2,10 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use blake3::Hasher;
 use bytes::{Bytes, BytesMut};
+use tokio_util::sync::CancellationToken;
 
 use super::protocol::{HdfsProtocol, cancelled, entry_failure};
-use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath, Transience};
+use crate::model::{BackendIdentity, EntryKind, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{
     ByteStream, CheckpointObservation, ExistingDestinationPolicy, FinalDestination, PrepareRequest,
     PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
@@ -195,7 +197,7 @@ impl StagedDestination for HdfsStagedDestination {
 
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
         self.protocol
-            .delete(&self.part(&stage)?, crate::model::EntryKind::File)
+            .delete(&self.part(&stage)?, EntryKind::File)
             .await
     }
 }
@@ -205,10 +207,10 @@ async fn hash_file(
     native: &StoragePath,
     diagnostic_path: &StoragePath,
     size: u64,
-    cancel: &tokio_util::sync::CancellationToken,
+    cancel: &CancellationToken,
 ) -> Result<[u8; 32], StorageRoleFailure> {
     let mut offset = 0;
-    let mut hasher = blake3::Hasher::new();
+    let mut hasher = Hasher::new();
     while offset < size {
         if cancel.is_cancelled() {
             return Err(cancelled(diagnostic_path, Operation::Verify));
@@ -302,7 +304,7 @@ async fn publish_or_skip(
             }
             adapter
                 .protocol
-                .delete(part, crate::model::EntryKind::File)
+                .delete(part, EntryKind::File)
                 .await
                 .map_err(publication_failure)?;
             Ok(PublicationDisposition::ExistingEquivalent)

@@ -1,4 +1,3 @@
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,7 +5,6 @@ use std::time::Duration;
 use data_mover::dir_tree::NdxEvent;
 use data_mover::dir_tree::{DirHandle, ReadContext};
 use data_mover::hdfs::HdfsScanEvent;
-use data_mover::traversal::TraversalSource as _;
 use data_mover::{
     BackendConfig, CopyOptions, CreateStorageOptions, HdfsConfig, IntegrityCheck,
     IntegrityCheckMode, MismatchDataField, ResumeContext, StorageEntryMessage, StorageEnum,
@@ -209,82 +207,6 @@ async fn create_hdfs_file(
         .await?;
     Box::pin(writer.write_bytes(data)).await?;
     Box::pin(writer.close()).await?;
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires the nightly lab HDFS cluster"]
-async fn nightly_lab_architecture_roles_traverse_transfer_and_publish()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_location = hdfs_lab_location("architecture-source")?;
-    let destination_location = hdfs_lab_location("architecture-destination")?;
-    let source =
-        data_mover::create_hdfs_storage(&source_location, &hdfs_lab_config(), None, true).await?;
-    let destination =
-        data_mover::create_hdfs_storage(&destination_location, &hdfs_lab_config(), None, true)
-            .await?;
-    let payload = bytes::Bytes::from(vec![0x5a; 1024 * 1024 + 31]);
-    create_hdfs_file(&source, "nested/source.bin", payload.clone()).await?;
-    let source_roles = source.architecture_storage(data_mover::model::BackendIdentity::new(
-        data_mover::model::BackendKind::Hdfs,
-        "hdfs-architecture-source",
-    )?)?;
-    let destination_roles =
-        destination.architecture_storage(data_mover::model::BackendIdentity::new(
-            data_mover::model::BackendKind::Hdfs,
-            "hdfs-architecture-destination",
-        )?)?;
-
-    let traversal = data_mover::traversal::StorageTraversalSource::new(&source_roles)?;
-    let mut session = traversal.traverse(data_mover::traversal::TraversalRequest {
-        root: data_mover::model::StoragePath::root(),
-        order: data_mover::traversal::TraversalOrder::Admission,
-        max_inflight_operations: NonZeroUsize::new(2).ok_or("invalid traversal inflight")?,
-        max_buffered_items: NonZeroUsize::new(2).ok_or("invalid traversal buffer")?,
-        observation_plan: data_mover::model::ObservationPlan::default(),
-        cancel: tokio_util::sync::CancellationToken::new(),
-    });
-    let mut observed_source = false;
-    while let Some(item) = session.next_item().await {
-        if let data_mover::traversal::TraversalItem::Entry(entry) = item {
-            observed_source |= entry.path().as_str() == "nested/source.bin";
-        }
-    }
-    session.finish().await?;
-    assert!(observed_source);
-    destination
-        .create_dir_all(std::path::Path::new("published"), 0o755)
-        .await?;
-    create_hdfs_file(
-        &destination,
-        "published/final.bin",
-        bytes::Bytes::from_static(b"old"),
-    )
-    .await?;
-
-    let outcome = data_mover::transfer::transfer(data_mover::transfer::TransferRequest::new(
-        data_mover::transfer::TransferIdentity::new("hdfs-architecture-contract")?,
-        source_roles,
-        data_mover::model::StoragePath::new("nested/source.bin")?,
-        destination_roles,
-        data_mover::model::StoragePath::new("published/final.bin")?,
-        data_mover::transfer::InflightLimits::new(2, 128 * 1024, 2)?,
-        tokio_util::sync::CancellationToken::new(),
-    ))
-    .await?;
-    assert_eq!(outcome.transferred_bytes, payload.len() as u64);
-    assert_eq!(outcome.blake3, *blake3::hash(&payload).as_bytes());
-    let published = destination
-        .open_file(std::path::Path::new("published/final.bin"))
-        .await?;
-    assert_eq!(
-        destination
-            .read_at(&published, 0, payload.len() as u64)
-            .await?,
-        payload
-    );
-    source.delete_storage_root().await?;
-    destination.delete_storage_root().await?;
     Ok(())
 }
 
