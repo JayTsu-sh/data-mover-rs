@@ -11,7 +11,7 @@ macro_rules! classify_sdk {
             aws_smithy_runtime_api::client::result::SdkError::TimeoutError(_)
                 | aws_smithy_runtime_api::client::result::SdkError::DispatchFailure(_)
         ) {
-            s3_role_session($diagnostic.to_string())
+            s3_role_transport_failure($diagnostic)
         } else {
             s3_role_remote_failure(
                 $error
@@ -93,17 +93,7 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .key(&full_key)
             .send()
             .await
-            .map_err(|error| {
-                s3_role_remote_failure(
-                    error
-                        .raw_response()
-                        .map(|response| response.status().as_u16()),
-                    error
-                        .as_service_error()
-                        .and_then(ProvideErrorMetadata::code),
-                    "S3 HeadObject request failed",
-                )
-            })?;
+            .map_err(|error| classify_sdk!(error, "S3 HeadObject request failed"))?;
         let size = response
             .content_length()
             .and_then(|n| u64::try_from(n).ok())
@@ -255,17 +245,7 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
                 .set_part_number_marker(marker.clone())
                 .send()
                 .await
-                .map_err(|error| {
-                    s3_role_remote_failure(
-                        error
-                            .raw_response()
-                            .map(|response| response.status().as_u16()),
-                        error
-                            .as_service_error()
-                            .and_then(ProvideErrorMetadata::code),
-                        "S3 ListParts request failed",
-                    )
-                })?;
+                .map_err(|error| classify_sdk!(error, "S3 ListParts request failed"))?;
             parts.extend(decode_parts(response.parts())?);
             let Some(next) = continuation_marker(&response, marker.as_deref())? else {
                 return Ok(parts);
@@ -449,6 +429,12 @@ fn s3_role_session(diagnostic: String) -> crate::storage::backends::s3::S3Protoc
     )
 }
 
+fn s3_role_transport_failure(
+    diagnostic: &'static str,
+) -> crate::storage::backends::s3::S3ProtocolFailure {
+    s3_role_session(diagnostic.to_string())
+}
+
 fn s3_role_legacy_failure(diagnostic: String) -> crate::storage::backends::s3::S3ProtocolFailure {
     crate::storage::backends::s3::S3ProtocolFailure::session(
         crate::model::FailureClass::Protocol,
@@ -553,6 +539,14 @@ mod tests {
             S3ProtocolFailure::Session {
                 class: FailureClass::Authentication,
                 transience: Transience::Permanent,
+                ..
+            }
+        ));
+        assert!(matches!(
+            s3_role_transport_failure("timeout"),
+            S3ProtocolFailure::Session {
+                class: FailureClass::Connectivity,
+                transience: Transience::Transient,
                 ..
             }
         ));
