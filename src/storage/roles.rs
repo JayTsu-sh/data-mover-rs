@@ -25,6 +25,31 @@ pub struct SourceDescriptor {
     pub kind: EntryKind,
     pub size: Option<u64>,
     pub source_identity: SourceIdentity,
+    pub(crate) backend_fact: Option<Bytes>,
+}
+
+impl SourceDescriptor {
+    /// Creates a neutral source descriptor without backend-private facts.
+    #[must_use]
+    pub fn new(
+        path: StoragePath,
+        kind: EntryKind,
+        size: Option<u64>,
+        source_identity: SourceIdentity,
+    ) -> Self {
+        Self {
+            path,
+            kind,
+            size,
+            source_identity,
+            backend_fact: None,
+        }
+    }
+
+    pub(crate) fn with_backend_fact(mut self, fact: Bytes) -> Self {
+        self.backend_fact = Some(fact);
+        self
+    }
 }
 
 /// One bounded sequential or range read.

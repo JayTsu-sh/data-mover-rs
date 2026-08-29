@@ -91,6 +91,7 @@ impl NfsReadSourceAdapter {
             kind: observed.kind,
             size: observed.size,
             source_identity,
+            backend_fact: None,
         })
     }
 }

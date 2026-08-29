@@ -189,6 +189,7 @@ async fn observe(
     descriptor: SourceDescriptor,
     plan: crate::model::ObservationPlan,
 ) -> Result<crate::model::ObservedEntry, StorageRoleFailure> {
+    let backend_fact = descriptor.backend_fact.clone();
     let metadata = metadata_role.observe(&descriptor.path, plan).await?;
     let modified = modified(&metadata);
     let entry = if descriptor.kind == EntryKind::Symlink {
@@ -219,7 +220,13 @@ async fn observe(
     .map_err(|_| {
         StorageRoleFailure::Entry(entry_failure(&descriptor.path, FailureClass::Protocol))
     })?;
-    Ok(entry.with_metadata(metadata))
+    let entry = entry.with_metadata(metadata);
+    match backend_fact {
+        Some(fact) => entry.with_backend_fact_bytes(fact.to_vec()).map_err(|_| {
+            StorageRoleFailure::Entry(entry_failure(&descriptor.path, FailureClass::Protocol))
+        }),
+        None => Ok(entry),
+    }
 }
 
 fn modified(metadata: &MetadataObservations) -> Option<crate::model::StorageTimestamp> {
@@ -348,6 +355,7 @@ mod tests {
                 value.as_bytes(),
             )
             .unwrap_or_else(|error| panic!("{error}")),
+            backend_fact: None,
         }
     }
 

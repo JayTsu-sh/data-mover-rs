@@ -512,7 +512,7 @@ impl HDFSStorage {
         self.rename_with_overwrite(from, to, true).await
     }
 
-    async fn rename_with_overwrite(
+    pub(crate) async fn rename_with_overwrite(
         &self,
         from: &std::path::Path,
         to: &std::path::Path,

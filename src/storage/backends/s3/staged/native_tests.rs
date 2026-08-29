@@ -24,6 +24,7 @@ fn native_prepare() -> TestResult<PrepareRequest> {
                 IdentityStrength::PathScoped,
                 b"large-etag",
             )?,
+            backend_fact: None,
         },
         recovery_binding: [5; 32],
     })

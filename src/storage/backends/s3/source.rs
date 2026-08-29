@@ -53,6 +53,7 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             kind: EntryKind::File,
             size: Some(facts.size),
             source_identity,
+            backend_fact: None,
         })
     }
 

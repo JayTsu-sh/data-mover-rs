@@ -545,7 +545,10 @@ fn invalid_recovery_identity(error: &StorageRoleFailure) -> bool {
     matches!(
         error,
         StorageRoleFailure::Entry(error)
-            if matches!(error.class(), FailureClass::Corruption | FailureClass::NotFound)
+            if matches!(
+                error.class(),
+                FailureClass::Corruption | FailureClass::NotFound | FailureClass::Unsupported
+            )
                 || (error.class() == FailureClass::Conflict
                     && error.transience() == Transience::Permanent)
     )

@@ -453,6 +453,17 @@ Backend mechanisms:
 - S3/DXN: service-enumerated multipart parts named by the validated upload identity;
 - HDFS: deterministic request-bound partial and continuous verified tail append.
 
+The HDFS architecture adapter is split at a protocol boundary: `storage/backends/hdfs`
+owns neutral facts, traversal, range reads, staged publication, and metadata semantics,
+while the existing `HDFSStorage` owns Hadoop clients, Kerberos/HA configuration, and
+protocol error translation. Ordinary transfer uses a deterministic same-directory
+partial, bounded chunks, BLAKE3 readback, and rename publication. Durable identity
+reconstruction and continuous-prefix resume remain the next recovery layer. HDFS
+string owner/group, replication, block size, and mode are persisted as backend facts;
+the current neutral ownership observation cannot yet expose string principals. ACL
+and xattr are reported unsupported until public dependency APIs are bound, rather
+than triggering unconditional scan-time calls or claiming unevidenced support.
+
 All destinations support restart. Resume is advertised only for combinations with reliable
 source positioning and validated backend checkpoint truth. CIFS resume remains Uncertified
 until smb-rs passes the FAS2750 gate. Unknown staged ownership is report-only and never

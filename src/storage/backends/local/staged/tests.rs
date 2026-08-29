@@ -48,6 +48,7 @@ fn request(identity: &BackendIdentity, destination: &str) -> PrepareRequest {
                 IdentityStrength::StableWithinBackend,
                 b"source-file",
             )),
+            backend_fact: None,
         },
         recovery_binding: [7; 32],
     }

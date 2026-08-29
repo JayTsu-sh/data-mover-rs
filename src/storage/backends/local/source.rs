@@ -107,6 +107,7 @@ impl ReadSource for LocalReadSource {
             kind: observed.kind(),
             size: observed.size(),
             source_identity: observed.source_identity().clone(),
+            backend_fact: None,
         })
     }
 

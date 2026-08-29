@@ -8,6 +8,17 @@ pub struct HDFSStorage {
 }
 
 impl HDFSStorage {
+    /// Builds the architecture-ready role handle for this connected HDFS backend.
+    ///
+    /// # Errors
+    /// Returns an error when the identity is not HDFS or roles contradict capabilities.
+    pub fn architecture_storage(
+        &self,
+        identity: crate::model::BackendIdentity,
+    ) -> Result<crate::storage::Storage, Box<dyn std::error::Error>> {
+        crate::storage::backends::hdfs::connect(Arc::new(self.clone()), identity)
+    }
+
     pub(crate) fn transfer_namespace(&self) -> String {
         format!("{}{}", self.location.endpoint(), self.location.root())
     }

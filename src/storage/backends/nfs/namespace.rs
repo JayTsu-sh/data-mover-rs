@@ -134,6 +134,7 @@ fn descriptor(
         kind: entry.kind,
         size: entry.size,
         source_identity,
+        backend_fact: None,
     })
 }
 

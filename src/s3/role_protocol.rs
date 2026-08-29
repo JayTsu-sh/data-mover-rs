@@ -651,6 +651,7 @@ mod tests {
                 IdentityStrength::PathScoped,
                 b"invalid-source",
             )?,
+            backend_fact: None,
         };
         let path = StoragePath::new(format!(
             "{}.manifest",

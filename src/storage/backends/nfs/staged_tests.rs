@@ -198,6 +198,7 @@ mod tests {
                     b"source",
                 )
                 .unwrap_or_else(|error| panic!("{error}")),
+                backend_fact: None,
             },
             recovery_binding: [7; 32],
         }

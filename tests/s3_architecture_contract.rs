@@ -162,16 +162,16 @@ async fn stage_with_reconnect(
 }
 
 fn source_descriptor(identity: &BackendIdentity, size: usize) -> TestResult<SourceDescriptor> {
-    Ok(SourceDescriptor {
-        path: StoragePath::new("generated-source")?,
-        kind: EntryKind::File,
-        size: Some(size as u64),
-        source_identity: SourceIdentity::new(
+    Ok(SourceDescriptor::new(
+        StoragePath::new("generated-source")?,
+        EntryKind::File,
+        Some(size as u64),
+        SourceIdentity::new(
             identity.clone(),
             IdentityStrength::PathScoped,
             b"generated-source-v1",
         )?,
-    })
+    ))
 }
 
 fn interrupted_input(

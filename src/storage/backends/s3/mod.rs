@@ -483,6 +483,7 @@ pub(crate) mod tests {
                     kind: crate::model::EntryKind::File,
                     size: None,
                     source_identity,
+                    backend_fact: None,
                 },
                 recovery_binding: [9; 32],
             })
@@ -562,6 +563,7 @@ pub(crate) mod tests {
                     kind: crate::model::EntryKind::File,
                     size: Some(7),
                     source_identity,
+                    backend_fact: None,
                 },
                 recovery_binding: [4; 32],
             })
@@ -622,6 +624,7 @@ pub(crate) mod tests {
                 crate::model::IdentityStrength::PathScoped,
                 b"stable-source",
             )?,
+            backend_fact: None,
         };
         let prepare = PrepareRequest {
             final_destination: FinalDestination::new(final_path.clone()),
@@ -749,6 +752,7 @@ pub(crate) mod tests {
                         crate::model::IdentityStrength::PathScoped,
                         b"source",
                     )?,
+                    backend_fact: None,
                 },
                 recovery_binding: [2; 32],
             })

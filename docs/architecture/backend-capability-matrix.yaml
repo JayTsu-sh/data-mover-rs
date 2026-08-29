@@ -35,10 +35,10 @@ profiles:
       hardlink_topology: unsupported
       rename: required
       delete: required
-      acl: required
-      xattr: required
+      acl: {state: required, current_adapter: unsupported_pending_public_protocol_binding}
+      xattr: {state: required, current_adapter: unsupported_pending_dependency_api}
       tags: not_applicable
-      uid_gid_mode: required
+      uid_gid_mode: {state: required, current_adapter: string_principals_preserved_in_backend_facts_and_target_apply_only}
       timestamps: required
       backend_fact_reconstruction: {state: required, source: persisted_snapshot_only}
       safe_protocol_retry: {state: required, scope: idempotent_local_operations}

@@ -14,6 +14,8 @@ use crate::model::{
 pub(crate) mod local;
 mod storage;
 pub use storage::StorageTraversalSource;
+#[cfg(test)]
+mod hdfs_tests;
 
 /// Traversal output order. Concurrent completion never changes admission order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
