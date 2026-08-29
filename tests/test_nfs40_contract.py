@@ -33,6 +33,13 @@ class Nfs40ContractTest(unittest.TestCase):
         self.assertIn("mount.getacl", contract)
         self.assertIn("mount.setacl", contract)
 
+    def test_contract_exercises_real_cancellation_and_restart_upload(self):
+        contract = (ROOT / "examples/nfs3_contract.rs").read_text()
+        self.assertIn("validate_cancel_and_restart", contract)
+        self.assertIn("RecoveryPolicy::Restart", contract)
+        self.assertIn("has_recoverable_stage", contract)
+        self.assertIn("cancel.cancel()", contract)
+
     def test_contract_replaces_a_real_v40_file_handle(self):
         contract = (ROOT / "examples/nfs3_contract.rs").read_text()
         self.assertIn("validate_v40_stale_retry", contract)

@@ -14,7 +14,8 @@ use data_mover::storage::{
     PrepareRequest, PublishRequest, RecoverRequest, Storage, StorageRoleFailure, VerifyRequest,
 };
 use data_mover::transfer::{
-    InflightLimits, SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferRequest, transfer,
+    InflightLimits, RecoveryPolicy, SourceQosGroup, SourceQosPolicy, TransferIdentity,
+    TransferRequest, transfer,
 };
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest,
@@ -172,6 +173,22 @@ async fn seed_v40_fixture(
         mount.commit(created.fh.clone(), 0, count).await?;
         mount.close(created.fh).await?;
     }
+    let cancellation_file = format!("{root}/cancellation.bin");
+    let _ = mount.remove_path(&cancellation_file).await;
+    let created = mount.create_path(&cancellation_file, Some(0o600)).await?;
+    let chunk = Bytes::from(vec![0x5a; 64 * 1024]);
+    for index in 0..8_u64 {
+        let offset = index * chunk.len() as u64;
+        let count = mount
+            .write(created.fh.clone(), offset, chunk.clone())
+            .await?;
+        if usize::try_from(count)? != chunk.len() {
+            return Err("NFSv4.0 cancellation fixture write was short".into());
+        }
+    }
+    let fixture_size = 8 * u32::try_from(chunk.len())?;
+    mount.commit(created.fh.clone(), 0, fixture_size).await?;
+    mount.close(created.fh).await?;
     let link = format!("{root}/fixture.link");
     let _ = mount.remove_path(&link).await;
     mount.symlink_path("fixture.bin", &link).await?;
@@ -383,6 +400,57 @@ async fn validate_streaming_copy(source: &Storage, destination: &Storage) -> Con
     Ok(())
 }
 
+async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) -> ContractResult {
+    let cancel = CancellationToken::new();
+    let request = TransferRequest::new(
+        TransferIdentity::new("nfs-contract-cancel")?,
+        source.clone(),
+        path("cancellation.bin")?,
+        destination.clone(),
+        path("restarted.bin")?,
+        InflightLimits::new(1, 64 * 1024, 1)?,
+        cancel.clone(),
+    )
+    .with_source_qos(SourceQosGroup::new(SourceQosPolicy::new(
+        Some((64 * 1024, 64 * 1024, Duration::ZERO)),
+        64 * 1024,
+        None,
+    )?));
+    let task = tokio::spawn(transfer(request));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    cancel.cancel();
+    let result = task.await?;
+    let Err(failure) = result else {
+        return Err("in-flight cancellation unexpectedly succeeded".into());
+    };
+    if !failure.has_recoverable_stage() {
+        return Err("in-flight cancellation did not preserve a recoverable stage".into());
+    }
+    let recovery = failure
+        .into_recovery_identity()
+        .await
+        .map_err(|(_, error)| error)?;
+
+    let outcome = transfer(
+        TransferRequest::new(
+            TransferIdentity::new("nfs-contract-restart")?,
+            source.clone(),
+            path("cancellation.bin")?,
+            destination.clone(),
+            path("restarted.bin")?,
+            InflightLimits::new(4, 256 * 1024, 4)?,
+            CancellationToken::new(),
+        )
+        .with_recovery(RecoveryPolicy::Restart, Some(recovery))
+        .with_existing_destination_policy(ExistingDestinationPolicy::Overwrite),
+    )
+    .await?;
+    if outcome.transferred_bytes != 8 * 64 * 1024 {
+        return Err("restart upload did not publish the complete source".into());
+    }
+    Ok(())
+}
+
 async fn validate_recovery(source: &Storage, destination: Storage, url: &str) -> ContractResult {
     let policy = PreflightPolicy::production();
     let descriptor = source
@@ -517,6 +585,10 @@ async fn main() -> ContractResult {
     validate_acl(&source, args.dialect, args.expect_setacl_unsupported).await?;
     eprintln!("contract stage: streaming transfer");
     validate_streaming_copy(&source, &destination).await?;
+    if args.dialect == ContractDialect::Nfs40 {
+        eprintln!("contract stage: cancellation and restart upload");
+        validate_cancel_and_restart(&source, &destination).await?;
+    }
     eprintln!("contract stage: durable recovery");
     validate_recovery(&source, destination, &args.destination).await?;
     println!(
