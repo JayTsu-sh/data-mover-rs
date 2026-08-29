@@ -1,5 +1,5 @@
 schema_version: 1
-captured_at: "2026-08-29T15:19:06+08:00"
+captured_at: "2026-08-29T15:31:47+08:00"
 policy:
   normative: false
   does_not_create_compatibility_requirement: true
@@ -56,11 +56,27 @@ profiles:
     gaps: [terrasync single-process and remote-process gates remain independently required]
 
   nfs40:
-    status: missing
-    environment_fingerprint: real-nfs40-dxn/not-wired-to-current-nightly
-    evidence: []
-    verified_scope: []
-    gaps: [real endpoint exists but no current-commit NFSv4.0 gate or durable report has run]
+    status: passed
+    environment_fingerprint: dxn-nfs40/10.131.7.201/jay_nfs
+    evidence:
+      - evidence_kind: gate_result
+        gate_id: DM-NFS40-CONTRACT
+        repository: JayTsu-sh/data-mover-rs
+        exact_commit: 9cee83c1b3ba2167a67dc3ddb6749809ac8318ce
+        dependency_commits: {}
+        run_id: release-9cee83c-nfs40-20260829
+        mode: real-release
+        fixture_set: architecture-ready-nfs40-contract-v1
+        started_at: "2026-08-29T15:31:26+08:00"
+        completed_at: "2026-08-29T15:31:47+08:00"
+        outcome: passed
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/127#issuecomment-5461074819
+        source_profile: nfs40
+        destination_profile: nfs40
+        environment_fingerprint: dxn-nfs40/10.131.7.201/jay_nfs
+    verified_scope: [mount, traversal, file_handle, stale_handle_retry, streaming_copy, integrity, reconnect_recovery, concurrent_claim, source_qos, acl_get, acl_set_unsupported, xattr_unsupported]
+    gaps: [terrasync single-process and remote-process gates remain independently required, DXN SETACL remains unsupported while FAS2750 ACL behavior is independently environment-specific]
 
   nfs41:
     status: passed
