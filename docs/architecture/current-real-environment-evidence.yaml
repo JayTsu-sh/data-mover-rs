@@ -1,5 +1,5 @@
 schema_version: 1
-captured_at: "2026-08-29T16:02:37+08:00"
+captured_at: "2026-08-29T16:11:11+08:00"
 policy:
   normative: false
   does_not_create_compatibility_requirement: true
@@ -82,13 +82,24 @@ profiles:
     status: passed
     environment_fingerprint: shared-nfs41/10.10.1.12-to-10.10.1.13
     evidence:
-      - <<: *nightly_success
-        gate_id: DM-CURRENT-NFS41
+      - evidence_kind: gate_result
+        gate_id: DM-NFS41-CONTRACT
+        repository: JayTsu-sh/data-mover-rs
+        exact_commit: 40cd5a5d676d413e96b34ae4b3a0a9149d1b19a9
+        dependency_commits: {}
+        run_id: release-40cd5a5-nfs41-20260829
+        mode: real-release
+        fixture_set: architecture-ready-nfs41-contract-v1
+        started_at: "2026-08-29T16:10:56+08:00"
+        completed_at: "2026-08-29T16:11:11+08:00"
+        outcome: passed
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/129#issuecomment-5461231922
         source_profile: nfs41
         destination_profile: nfs41
         environment_fingerprint: shared-nfs41/10.10.1.12-to-10.10.1.13
-    verified_scope: [mount, traversal, copy, integrity, resume, qos]
-    gaps: [target ACL/xattr and recovery architecture contracts not yet implemented]
+    verified_scope: [mount, session_state, traversal, file_handle, stale_handle_retry, streaming_copy, integrity, cancellation, restart_upload, reconnect_recovery, concurrent_claim, source_qos, acl_get, acl_set, xattr_unsupported]
+    gaps: [terrasync single-process and remote-process gates remain independently required]
 
   cifs_fas2750:
     status: failed
