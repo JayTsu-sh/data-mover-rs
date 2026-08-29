@@ -14,6 +14,6 @@ pub use roles::{
     ByteStream, CheckpointObservation, ExistingDestinationPolicy, FinalDestination, Metadata,
     Namespace, NamespaceRequest, NamespaceResult, PrepareRequest, PreparedStage,
     PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest, ReadRequest,
-    ReadSource, SourceDescriptor, StagedDestination, StorageRoleFailure, VerificationEvidence,
-    VerifyRequest, WriteEvidence,
+    ReadSource, RecoverRequest, RecoveryIdentity, RecoveryValueError, SourceDescriptor,
+    StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };

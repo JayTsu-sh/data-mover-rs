@@ -1,4 +1,4 @@
-use data_mover::transfer::TransferFailure;
+use data_mover::transfer::{RecoveryIdentity, RecoveryPolicy, TransferFailure};
 
 #[allow(dead_code)]
 fn public_failure_state(error: &TransferFailure) -> (bool, bool, bool) {
@@ -19,8 +19,14 @@ async fn public_committed_cleanup(error: TransferFailure) {
     let _result = error.cleanup_published_stage().await;
 }
 
+#[allow(dead_code)]
+async fn public_recovery_export(error: TransferFailure) -> Option<RecoveryIdentity> {
+    error.into_recovery_identity().await.ok()
+}
+
 #[test]
 fn transfer_failure_cleanup_contract_is_public() {
     let state: fn(&TransferFailure) -> (bool, bool, bool) = public_failure_state;
     let _ = state;
+    assert_eq!(RecoveryPolicy::default(), RecoveryPolicy::ResumeOrRestart);
 }

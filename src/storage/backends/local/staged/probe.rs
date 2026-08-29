@@ -28,6 +28,10 @@ pub(super) struct WriteProbe {
     pub(super) slow_existing_verify: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(super) existing_verify_started: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(super) slow_discard_before_release: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(super) discard_contents_removed: std::sync::atomic::AtomicBool,
 }
 
 impl WriteProbe {
@@ -75,5 +79,58 @@ impl WriteProbe {
             .push(offset);
         #[cfg(not(test))]
         let _ = offset;
+    }
+}
+
+#[cfg(test)]
+impl super::LocalStagedDestination {
+    pub(crate) fn corrupt_before_verify(&self) {
+        self.write_probe
+            .corrupt_before_verify
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn fail_after_publication_commit(&self) {
+        self.write_probe
+            .fail_after_publication_commit
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn replace_final_during_skip(&self) {
+        self.write_probe
+            .replace_final_during_skip
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn slow_existing_verify(&self) {
+        self.write_probe
+            .slow_existing_verify
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn existing_verify_started(&self) -> bool {
+        self.write_probe
+            .existing_verify_started
+            .load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn write_completion_count(&self) -> usize {
+        self.write_probe
+            .completion_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    pub(crate) fn slow_discard_before_release(&self) {
+        self.write_probe
+            .slow_discard_before_release
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn discard_contents_removed(&self) -> bool {
+        self.write_probe
+            .discard_contents_removed
+            .load(Ordering::SeqCst)
     }
 }

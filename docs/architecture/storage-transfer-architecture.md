@@ -411,6 +411,16 @@ same transfer/source/destination, independently observes reusable bytes or parts
 the requested verification guarantee. `RecoveryIdentity` is versioned, integrity-checked,
 opaque, and validated before any destructive action.
 
+The Local identity binds the transfer identity, source identity/path/size, destination backend
+identity, final destination, stage token, and checkpoint record. Its checkpoint records only a contiguous prefix after the
+staged file has crossed a persistence barrier. Resume rereads the complete source sequentially
+for BLAKE3 but emits writes only after the re-observed durable prefix. `RequireResume` refuses a
+missing or invalid identity; `ResumeOrRestart` falls back to a distinct stage without deleting
+unknown state; `Restart` discards an old stage only after full ownership validation. Exporting a
+recovery identity consumes the in-process failed-stage authority. A persistent per-stage claim
+file is held under an exclusive OS file lock for every active `PreparedStage`, so cloned identities
+and independent processes cannot acquire concurrent lifecycle ownership.
+
 Backend mechanisms:
 
 - Local/NFS/CIFS: persisted contiguous durable prefix; writes beyond a gap are not reusable;

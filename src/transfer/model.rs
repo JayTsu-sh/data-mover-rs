@@ -3,6 +3,7 @@ use std::fmt;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::StoragePath;
+use crate::storage::RecoveryIdentity;
 use crate::storage::{ExistingDestinationPolicy, Storage};
 
 const MAX_IDENTITY_BYTES: usize = 1024;
@@ -38,6 +39,10 @@ impl TransferIdentity {
             Ok(Self(value))
         }
     }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
 }
 
 impl fmt::Debug for TransferIdentity {
@@ -52,6 +57,15 @@ pub struct InflightLimits {
     pub(crate) chunks: usize,
     pub(crate) bytes: usize,
     pub(crate) operations: usize,
+}
+
+/// Recovery behavior for one transfer attempt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecoveryPolicy {
+    #[default]
+    ResumeOrRestart,
+    RequireResume,
+    Restart,
 }
 
 impl InflightLimits {
@@ -90,6 +104,8 @@ pub struct TransferRequest {
     pub(crate) inflight: InflightLimits,
     pub(crate) cancel: CancellationToken,
     pub(crate) existing_destination: ExistingDestinationPolicy,
+    pub(crate) recovery_policy: RecoveryPolicy,
+    pub(crate) recovery_identity: Option<RecoveryIdentity>,
 }
 
 impl TransferRequest {
@@ -113,6 +129,8 @@ impl TransferRequest {
             inflight,
             cancel,
             existing_destination: ExistingDestinationPolicy::default(),
+            recovery_policy: RecoveryPolicy::default(),
+            recovery_identity: None,
         }
     }
 
@@ -120,6 +138,18 @@ impl TransferRequest {
     #[must_use]
     pub fn with_existing_destination_policy(mut self, policy: ExistingDestinationPolicy) -> Self {
         self.existing_destination = policy;
+        self
+    }
+
+    /// Selects recovery behavior and supplies an optional persisted opaque identity.
+    #[must_use]
+    pub fn with_recovery(
+        mut self,
+        policy: RecoveryPolicy,
+        identity: Option<RecoveryIdentity>,
+    ) -> Self {
+        self.recovery_policy = policy;
+        self.recovery_identity = identity;
         self
     }
 }

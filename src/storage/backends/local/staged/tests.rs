@@ -49,6 +49,7 @@ fn request(identity: &BackendIdentity, destination: &str) -> PrepareRequest {
                 b"source-file",
             )),
         },
+        recovery_binding: [7; 32],
     }
 }
 
@@ -156,6 +157,40 @@ async fn prepare_write_flush_checkpoint_and_discard_leave_final_unchanged() -> i
 }
 
 #[tokio::test]
+async fn discard_keeps_recovery_claim_until_owned_contents_are_removed() -> io::Result<()> {
+    let root = TestRoot::new().await?;
+    let backend = identity("local-discard-recover-race-test");
+    let adapter = Arc::new(ok(LocalStagedDestination::new(&root.0, backend.clone(), 1)));
+    let prepare = request(&backend, "final.bin");
+    let stage = ok(adapter.prepare(prepare.clone()).await);
+    ok(adapter.write(&stage, bytes(&[b"partial"])).await);
+    let recovery_identity = ok(adapter.recovery_identity(&stage).await);
+    adapter.slow_discard_before_release();
+
+    let discarding = {
+        let adapter = Arc::clone(&adapter);
+        tokio::spawn(async move { adapter.discard(stage).await })
+    };
+    while !adapter.discard_contents_removed() {
+        tokio::task::yield_now().await;
+    }
+
+    let contender = ok(LocalStagedDestination::new(&root.0, backend, 1));
+    let recovery = contender
+        .recover(RecoverRequest {
+            identity: recovery_identity,
+            final_destination: prepare.final_destination,
+            source: prepare.source,
+            recovery_binding: prepare.recovery_binding,
+        })
+        .await;
+    assert!(recovery.is_err());
+    ok(discarding.await.map_err(io::Error::other)?);
+    assert!(staging_is_empty(&root.0)?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn restart_prepares_distinct_empty_state_without_touching_final() -> io::Result<()> {
     let root = TestRoot::new().await?;
     tokio::fs::write(root.0.join("final.bin"), b"keep").await?;
@@ -245,7 +280,7 @@ async fn entry_failure_and_cancellation_preserve_unpublished_stage() -> io::Resu
     assert!(ok(adapter.stage_full_path(&stage, Operation::Verify)).exists());
     assert_eq!(
         ok(adapter.observe_checkpoint(&stage).await).durable_prefix,
-        0
+        7
     );
     let staged_path = ok(adapter.stage_full_path(&stage, Operation::Verify));
     let staged_len = tokio::fs::metadata(&staged_path).await?.len();
@@ -277,6 +312,9 @@ async fn paths_and_stage_ownership_are_confined_to_the_backend_root() -> io::Res
         identity("foreign-local"),
         FinalDestination::new(ok(StoragePath::new("final.bin"))),
         Bytes::from_static(b".data-mover-staging/foreign.stage"),
+        [0; 32],
+        0,
+        None,
     );
     assert!(adapter.observe_checkpoint(&foreign).await.is_err());
 
@@ -285,6 +323,9 @@ async fn paths_and_stage_ownership_are_confined_to_the_backend_root() -> io::Res
         backend,
         FinalDestination::new(ok(StoragePath::new("victim.bin"))),
         Bytes::from_static(b"victim.bin"),
+        [0; 32],
+        0,
+        None,
     );
     assert!(adapter.discard(forged).await.is_err());
     assert_eq!(tokio::fs::read(root.0.join("victim.bin")).await?, b"keep");

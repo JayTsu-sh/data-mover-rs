@@ -70,6 +70,59 @@ pub trait ReadSource: Send + Sync {
 pub struct PrepareRequest {
     pub final_destination: FinalDestination,
     pub source: SourceDescriptor,
+    pub recovery_binding: [u8; 32],
+}
+
+/// Failure to reconstruct an opaque recovery identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryValueError;
+
+impl fmt::Display for RecoveryValueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("recovery identity must be non-empty and bounded")
+    }
+}
+
+impl Error for RecoveryValueError {}
+
+/// Versioned opaque backend recovery identity persisted without interpretation.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RecoveryIdentity(Bytes);
+
+impl RecoveryIdentity {
+    /// Reconstructs a bounded identity from persisted bytes.
+    ///
+    /// # Errors
+    /// Returns an error for empty or oversized identities.
+    pub fn from_bytes(bytes: impl Into<Bytes>) -> Result<Self, RecoveryValueError> {
+        let bytes = bytes.into();
+        if bytes.is_empty() || bytes.len() > 4096 {
+            Err(RecoveryValueError)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    /// Returns opaque bytes for persistence.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &Bytes {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RecoveryIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RecoveryIdentity(<opaque>)")
+    }
+}
+
+/// Inputs used by a backend to revalidate one recovery identity.
+#[derive(Clone, Debug)]
+pub struct RecoverRequest {
+    pub identity: RecoveryIdentity,
+    pub final_destination: FinalDestination,
+    pub source: SourceDescriptor,
+    pub recovery_binding: [u8; 32],
 }
 
 /// A typed destination that remains unchanged until publication.
@@ -88,11 +141,13 @@ impl FinalDestination {
 }
 
 /// Opaque linear prepared destination state bound to one backend and final destination.
-#[derive(Eq, PartialEq)]
 pub struct PreparedStage {
     pub(crate) owner: crate::model::BackendIdentity,
     pub(crate) final_destination: FinalDestination,
     pub(crate) token: Bytes,
+    pub(crate) recovery_binding: [u8; 32],
+    pub(crate) write_offset: u64,
+    pub(crate) claim: std::sync::Mutex<Option<std::fs::File>>,
 }
 
 #[allow(dead_code)]
@@ -105,11 +160,17 @@ impl PreparedStage {
         owner: crate::model::BackendIdentity,
         final_destination: FinalDestination,
         token: Bytes,
+        recovery_binding: [u8; 32],
+        write_offset: u64,
+        claim: Option<std::fs::File>,
     ) -> Self {
         Self {
             owner,
             final_destination,
             token,
+            recovery_binding,
+            write_offset,
+            claim: std::sync::Mutex::new(claim),
         }
     }
 
@@ -123,6 +184,13 @@ impl PreparedStage {
             Err(StageBindingError)
         }
     }
+
+    pub(crate) fn release_claim(&self) {
+        self.claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
 }
 
 impl fmt::Debug for PreparedStage {
@@ -132,6 +200,9 @@ impl fmt::Debug for PreparedStage {
             .field("owner", &self.owner)
             .field("final_destination", &self.final_destination)
             .field("token", &"<redacted>")
+            .field("recovery_binding", &"<redacted>")
+            .field("write_offset", &self.write_offset)
+            .field("claim", &"<exclusive-lock>")
             .finish()
     }
 }
@@ -209,6 +280,11 @@ pub struct PublicationEvidence {
 #[async_trait]
 pub trait StagedDestination: Send + Sync {
     async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure>;
+    async fn recovery_identity(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<RecoveryIdentity, StorageRoleFailure>;
+    async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure>;
     async fn write(
         &self,
         stage: &PreparedStage,
@@ -286,6 +362,9 @@ mod tests {
             owner.clone(),
             destination.clone(),
             Bytes::from_static(b"secret-token"),
+            [0; 32],
+            0,
+            None,
         );
 
         assert_eq!(stage.final_destination, destination);
