@@ -1,5 +1,5 @@
 schema_version: 1
-captured_at: "2026-08-29T16:11:11+08:00"
+captured_at: "2026-08-29T18:05:37+08:00"
 policy:
   normative: false
   does_not_create_compatibility_requirement: true
@@ -132,10 +132,24 @@ profiles:
         source_profile: s3_standard
         destination_profile: s3_standard
         environment_fingerprint: shared-standard-s3/10.10.1.12-to-10.10.1.13
-    verified_scope: [connectivity, traversal, copy, integrity, resume, qos]
-    gaps:
-      - target native-transfer and metadata architecture contracts not yet implemented
-      - DM-S3-CONTRACT remains uncertified until a current-commit gate result is recorded
+      - evidence_kind: gate_result
+        gate_id: DM-S3-CONTRACT
+        repository: JayTsu-sh/data-mover-rs
+        exact_commit: eab68633ce9cbd330e56dce4d6ba88a48c2f88b1
+        dependency_commits: {}
+        run_id: release-eab6863-s3-20260829
+        mode: real-release
+        fixture_set: architecture-ready-standard-s3-contract-v2
+        started_at: "2026-08-29T18:05:29+08:00"
+        completed_at: "2026-08-29T18:05:37+08:00"
+        outcome: passed
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/130#issuecomment-5461703497
+        source_profile: s3_standard
+        destination_profile: s3_standard
+        environment_fingerprint: shared-standard-s3/10.10.1.12-to-10.10.1.13
+    verified_scope: [connectivity, traversal, copy, integrity, resume, qos, multipart_interruption, reconnect_recovery, publication, tags, range_read, cancellation]
+    gaps: [target native-transfer architecture contract not yet implemented]
 
   s3_dxn:
     status: missing
