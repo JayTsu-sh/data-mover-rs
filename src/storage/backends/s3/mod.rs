@@ -19,12 +19,26 @@ pub(crate) use protocol::{
     S3ProtocolFailure, S3Result,
 };
 
+pub(crate) use metadata::S3TagSupport;
 pub(crate) use native::S3NativeContext;
 
+#[cfg(test)]
 pub(crate) fn connect<P>(
     protocol: Arc<P>,
     identity: BackendIdentity,
     native_context: Option<S3NativeContext>,
+) -> Result<Storage, Box<dyn std::error::Error>>
+where
+    P: S3Protocol + 'static,
+{
+    connect_with_tag_support(protocol, identity, native_context, S3TagSupport::Supported)
+}
+
+pub(crate) fn connect_with_tag_support<P>(
+    protocol: Arc<P>,
+    identity: BackendIdentity,
+    native_context: Option<S3NativeContext>,
+    tag_support: S3TagSupport,
 ) -> Result<Storage, Box<dyn std::error::Error>>
 where
     P: S3Protocol + 'static,
@@ -48,7 +62,7 @@ where
             context,
         )) as Arc<dyn crate::storage::NativeEndpoint>
     });
-    let metadata = Arc::new(metadata::S3Metadata::new(protocol));
+    let metadata = Arc::new(metadata::S3Metadata::new(protocol, tag_support));
     Storage::connected(
         identity,
         BackendCapabilities::new(
@@ -464,6 +478,41 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_profile_tags_never_call_the_service()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let protocol = Arc::new(MemoryS3::default());
+        let storage = connect_with_tag_support(
+            protocol.clone(),
+            identity(),
+            Some(native_context()),
+            S3TagSupport::Unsupported,
+        )?;
+        let metadata = storage.metadata(&validation_policy())?;
+        let path = StoragePath::new("untagged")?;
+        let observed = metadata
+            .observe(
+                &path,
+                ObservationPlan::default().with_tags(ObservationMode::Required),
+            )
+            .await?;
+        assert!(matches!(observed.tags(), MetadataObservation::Unsupported));
+        let result = metadata
+            .apply(
+                &path,
+                MetadataMutation::Tags(vec![ObjectTag::new("class", "gold")?]),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(crate::storage::StorageRoleFailure::Entry(ref failure))
+            if failure.class() == crate::model::FailureClass::Unsupported)
+        );
+        assert_eq!(*protocol.tag_reads.lock().await, 0);
+        assert!(protocol.tags.lock().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn failed_input_preserves_checkpoint_until_explicit_discard()
     -> Result<(), Box<dyn std::error::Error>> {
         let protocol = Arc::new(MemoryS3::default());
@@ -650,7 +699,7 @@ pub(crate) mod tests {
                 .is_err()
         );
         let checkpoint = destination.observe_checkpoint(&stage).await?.durable_prefix;
-        assert_eq!(checkpoint, part.len() as u64);
+        assert_eq!(checkpoint, (part.len() * 4) as u64);
 
         let second_storage = connect(protocol.clone(), identity(), Some(native_context()))?;
         let resumed_destination = second_storage.staged_destination(&policy)?;

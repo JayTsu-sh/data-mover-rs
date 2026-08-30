@@ -29,7 +29,21 @@ async fn standard_s3_architecture_roles_stage_publish_and_read_back() -> TestRes
     let identity = BackendIdentity::new(BackendKind::S3, "standard-s3-contract")?;
     let payload = Bytes::from(vec![0x5a; PART_SIZE * 5 + 137]);
     let (storage, stage) = stage_with_reconnect(&url, &path, &identity, &payload).await?;
-    verify_publish_and_tag(&storage, &stage, &path, &payload).await?;
+    verify_publish_and_metadata(&storage, &stage, &path, &payload, true).await?;
+    verify_range_and_cancellation(&storage, &path, &payload).await?;
+    verify_native_and_shaped_fallback(&storage, &path, &payload).await?;
+    verify_stale_upload_restart(&url, &path, &identity, payload.len()).await
+}
+
+#[tokio::test]
+#[ignore = "requires the shared DXN S3 lab"]
+async fn dxn_s3_architecture_roles_and_known_limits() -> TestResult {
+    let url = std::env::var("LAB_DXN_S3_ARCHITECTURE_URL")?;
+    let path = StoragePath::new(std::env::var("LAB_DXN_S3_ARCHITECTURE_KEY")?)?;
+    let identity = BackendIdentity::new(BackendKind::S3, "dxn-s3-contract")?;
+    let payload = Bytes::from(vec![0x6b; PART_SIZE * 5 + 137]);
+    let (storage, stage) = stage_with_reconnect(&url, &path, &identity, &payload).await?;
+    verify_publish_and_metadata(&storage, &stage, &path, &payload, false).await?;
     verify_range_and_cancellation(&storage, &path, &payload).await?;
     verify_native_and_shaped_fallback(&storage, &path, &payload).await?;
     verify_stale_upload_restart(&url, &path, &identity, payload.len()).await
@@ -120,6 +134,7 @@ async fn stage_with_reconnect(
     identity: &BackendIdentity,
     payload: &Bytes,
 ) -> TestResult<(Storage, data_mover::storage::PreparedStage)> {
+    eprintln!("S3 contract stage: prepare multipart destination");
     let storage = connected(url, identity.clone()).await?;
     let destination = storage.staged_destination(&PreflightPolicy::production())?;
     let source = source_descriptor(identity, payload.len())?;
@@ -136,11 +151,13 @@ async fn stage_with_reconnect(
             .await
             .is_err()
     );
+    eprintln!("S3 contract stage: observe interrupted multipart checkpoint");
     let checkpoint = destination.observe_checkpoint(&stage).await?.durable_prefix;
     assert!((PART_SIZE as u64..=(PART_SIZE * 4) as u64).contains(&checkpoint));
     assert_eq!(checkpoint % PART_SIZE as u64, 0);
     let storage = connected(url, identity.clone()).await?;
     let destination = storage.staged_destination(&PreflightPolicy::production())?;
+    eprintln!("S3 contract stage: recover multipart destination after reconnect");
     let resumed = destination
         .recover(RecoverRequest {
             identity: recovery,
@@ -150,12 +167,16 @@ async fn stage_with_reconnect(
             claim_token: [4; 32],
         })
         .await?;
+    let resumed_checkpoint = destination
+        .observe_checkpoint(&resumed)
+        .await?
+        .durable_prefix;
+    assert!(resumed_checkpoint >= checkpoint);
+    let resumed_offset = usize::try_from(resumed_checkpoint)?;
     destination
         .write(
             &resumed,
-            Box::pin(futures::stream::iter([Ok(
-                payload.slice(usize::try_from(checkpoint)?..)
-            )])),
+            Box::pin(futures::stream::iter([Ok(payload.slice(resumed_offset..))])),
         )
         .await?;
     Ok((storage, resumed))
@@ -194,11 +215,12 @@ fn interrupted_input(
     ])))
 }
 
-async fn verify_publish_and_tag(
+async fn verify_publish_and_metadata(
     storage: &Storage,
     stage: &data_mover::storage::PreparedStage,
     path: &StoragePath,
     payload: &Bytes,
+    supports_tags: bool,
 ) -> TestResult {
     let policy = PreflightPolicy::production();
     let destination = storage.staged_destination(&policy)?;
@@ -227,6 +249,31 @@ async fn verify_publish_and_tag(
         .map_err(|failure| failure.error)?;
     let tag = data_mover::model::ObjectTag::new("contract", "standard-s3")?;
     let metadata = storage.metadata(&policy)?;
+    if !supports_tags {
+        let observed = metadata
+            .observe(
+                path,
+                data_mover::model::ObservationPlan::default()
+                    .with_tags(data_mover::model::ObservationMode::Required),
+            )
+            .await?;
+        assert!(matches!(
+            observed.tags(),
+            data_mover::model::MetadataObservation::Unsupported
+        ));
+        let result = metadata
+            .apply(
+                path,
+                MetadataMutation::Tags(vec![tag]),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(data_mover::storage::StorageRoleFailure::Entry(ref failure))
+            if failure.class() == data_mover::model::FailureClass::Unsupported)
+        );
+        return Ok(());
+    }
     metadata
         .apply(
             path,

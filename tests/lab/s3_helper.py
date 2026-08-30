@@ -9,9 +9,10 @@ from botocore.exceptions import ClientError
 
 
 def client(endpoint: str):
+    endpoint_url = endpoint if "://" in endpoint else f"http://{endpoint}:9000"
     return boto3.client(
         "s3",
-        endpoint_url=f"http://{endpoint}:9000",
+        endpoint_url=endpoint_url,
         aws_access_key_id=os.environ["LAB_S3_ACCESS_KEY"],
         aws_secret_access_key=os.environ["LAB_S3_SECRET_KEY"],
         region_name="us-east-1",

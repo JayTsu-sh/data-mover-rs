@@ -187,6 +187,13 @@ self-signed certificates.
   require tag preservation should not use multipart rename on DXN until a
   verified `PutObjectTagging` compatibility path is implemented.
 
+The ArchitectureReady DXN adapter therefore reports tags as unsupported
+without issuing an extra storage request. It still exposes conditional native
+transfer for a connected DXN pair. Multipart recovery always re-observes the
+service manifest after reconnect; callers resume from that latest durable
+prefix because already-issued inflight requests may settle after an earlier
+checkpoint observation.
+
 These limitations have been reproduced against the current DXN lab endpoint.
 They do not change standard S3 or StorageGRID behavior.
 

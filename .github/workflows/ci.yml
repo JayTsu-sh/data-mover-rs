@@ -76,6 +76,11 @@ jobs:
       - name: DM-STORAGEGRID-REQUEST-CONTRACT
         run: cargo test s3::storagegrid::tests --locked
 
+      - name: DM-DXN-REQUEST-CONTRACT
+        run: |
+          cargo test s3::storagegrid::tests::standard_s3_delete_objects_does_not_add_storagegrid_content_md5 --locked -- --exact
+          cargo test s3::storagegrid::tests::dxn_delete_objects_adds_signed_content_md5_without_stripping_x_id --locked -- --exact
+
       - name: hdfs-native rolling contract
         run: python3 tests/hdfs_upstream_contract.py
 

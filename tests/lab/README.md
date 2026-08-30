@@ -256,6 +256,19 @@ both published objects and unfinished multipart uploads on exit. A successful
 legacy S3 copy run does not certify this gate: the configured service must
 accept CreateMultipartUpload and the complete multipart lifecycle.
 
+`run-dxn-s3-contract.sh` is the independent `DM-DXN-CONTRACT` gate. It uses
+the `s3+dxn://` profile and requires `LAB_DXN_S3_ACCESS_KEY` plus
+`LAB_DXN_S3_SECRET_KEY`; the endpoint and bucket default to the shared DXN lab
+but can be overridden with `LAB_DXN_S3_ENDPOINT` and `LAB_DXN_S3_BUCKET`.
+Credentials remain process-local. The gate covers multipart interruption,
+service-enumerated recovery after outstanding requests settle, restart,
+readback, cancellation, conditional native transfer, client-shaped fallback,
+the explicit tag-unsupported result, the DXN delete checksum contract, and a
+standard-S3 isolation control.
+Every run writes `dxn-s3-evidence.json`, including the exact candidate SHA,
+run ID, environment fingerprint, timestamps, gate ID, and outcome. Nightly and
+release workflows upload this report even when the gate fails.
+
 The lab does not currently contain a real StorageGRID system. Request-level
 tests use a capturing Smithy connector to verify that standard S3 requests
 retain the SDK-generated `x-id` and StorageGRID requests remove it from the

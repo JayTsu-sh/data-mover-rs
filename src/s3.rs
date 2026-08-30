@@ -114,6 +114,7 @@ enum VersionOrDeleteMarker {
 type ReadVersionGroups = HashMap<String, Vec<(i64, ObjectVersion)>>;
 type ReadDeleteMarkers = HashMap<String, Vec<DeleteMarkerEntry>>;
 
+mod architecture;
 mod delete_objects_md5;
 mod dxn;
 mod multipart_rename;
@@ -692,15 +693,7 @@ impl S3Storage {
         &self,
         identity: crate::model::BackendIdentity,
     ) -> std::result::Result<crate::storage::Storage, Box<dyn std::error::Error>> {
-        let native = (self.compatibility == S3Compatibility::Standard).then(|| {
-            crate::storage::backends::s3::S3NativeContext::new(
-                &self.endpoint,
-                "standard",
-                self.bucket_name.clone(),
-                self.prefix.clone(),
-            )
-        });
-        crate::storage::backends::s3::connect(Arc::new(self.clone()), identity, native)
+        architecture::connect(self, identity)
     }
 
     /// Overrides the per-file read and write concurrency for this adapter.

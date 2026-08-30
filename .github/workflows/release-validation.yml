@@ -54,6 +54,16 @@ jobs:
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock python3 tests/hdfs_upstream_contract.py --nightly --run-id "$RUN_ID"
       - name: ArchitectureReady standard S3 contract
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-s3-architecture-contract.sh "$RUN_ID"
+      - name: DM-DXN-CONTRACT
+        env:
+          LAB_DXN_S3_ACCESS_KEY: ${{ secrets.LAB_DXN_S3_ACCESS_KEY }}
+          LAB_DXN_S3_SECRET_KEY: ${{ secrets.LAB_DXN_S3_SECRET_KEY }}
+        run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-dxn-s3-contract.sh "$RUN_ID"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: dxn-s3-evidence-${{ github.run_id }}
+          path: dxn-s3-evidence.json
       - name: Storage matrix E2E (protocol defaults)
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-e2e.sh "$RUN_ID"
       - name: Storage matrix E2E (high transfer concurrency)

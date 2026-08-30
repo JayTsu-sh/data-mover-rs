@@ -463,7 +463,14 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         let result: Result<u64, StorageRoleFailure> = async {
             let mut inflight = futures::stream::FuturesUnordered::new();
             while let Some(chunk) = input.next().await {
-                buffered.extend_from_slice(&chunk?);
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(input_failure) => {
+                        while inflight.next().await.is_some() {}
+                        return Err(input_failure);
+                    }
+                };
+                buffered.extend_from_slice(&chunk);
                 while buffered.len() >= PART_SIZE {
                     let part = buffered.split_to(PART_SIZE).freeze();
                     inflight.push(upload(
