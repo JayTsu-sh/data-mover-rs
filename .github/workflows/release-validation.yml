@@ -48,6 +48,8 @@ jobs:
       - run: tests/lab/health-check.sh
       - run: tests/lab/prepare-run.sh "$RUN_ID"
       - run: flock --wait 10800 /tmp/terrasync-lab-tests.lock cargo test --workspace --locked --no-fail-fast
+      - name: DM-STORAGEGRID-REQUEST-CONTRACT
+        run: cargo test s3::storagegrid::tests --locked
       - name: Rolling hdfs-native contract and real HDFS lab
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock python3 tests/hdfs_upstream_contract.py --nightly --run-id "$RUN_ID"
       - name: ArchitectureReady standard S3 contract

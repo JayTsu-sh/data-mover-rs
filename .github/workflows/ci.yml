@@ -73,6 +73,8 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --no-fail-fast
+      - name: DM-STORAGEGRID-REQUEST-CONTRACT
+        run: cargo test s3::storagegrid::tests --locked
 
       - name: hdfs-native rolling contract
         run: python3 tests/hdfs_upstream_contract.py

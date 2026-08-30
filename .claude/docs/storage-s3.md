@@ -11,6 +11,8 @@
 ```
 s3://[ak[:sk]@]bucket.host[:port]/[prefix]
 s3+https://[ak[:sk]@]bucket.host/[prefix]
+s3+sg://[ak[:sk]@]bucket.host[:port]/[prefix]
+s3+sg+https://[ak[:sk]@]bucket.host/[prefix]
 ```
 
 示例：
@@ -24,6 +26,9 @@ s3://my-bucket.s3.amazonaws.com/data/      # 用 IAM credential
 scheme：
 - `s3://` — HTTP (默认 endpoint port 80)。
 - `s3+https://` — HTTPS (默认 port 443，自签证书允许)。
+- `s3+sg://` / `s3+sg+https://` — StorageGRID endpoint overlay；仍属于 S3 backend，
+  仅在签名前精确删除 `x-id`，并为 multi-object delete 添加 body-matching、
+  SigV4-signed `Content-MD5`，不新增 validation profile。
 
 ## 关键行为
 
@@ -78,6 +83,9 @@ match aws_sdk_s3::operation::get_object::GetObjectError::from(...) {
 - `examples/s3_walkdir.rs` — bucket 列表。
 - skill：`.claude/skills/e2e-s3/` (需要 `.env` 含 endpoint/bucket/ak/sk)。
 - skill 内置一个"读不存在的 key 应返回 FileNotFound"的回归测试。
+- `DM-STORAGEGRID-REQUEST-CONTRACT`：
+  `cargo test s3::storagegrid::tests --locked`，在 capturing Smithy connector seam
+  验证 StorageGRID 请求变换及 standard S3/DXN 隔离；PR 与 release workflow 均独立执行。
 
 ## 改 S3 时
 
