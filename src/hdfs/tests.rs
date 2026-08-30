@@ -15,6 +15,22 @@ mod tests {
     use crate::error::StorageError;
 
     #[test]
+    fn append_open_waits_only_for_a_bounded_lease_recovery_window() {
+        let lease = hdfs_native::HdfsError::AlreadyExists("lease is still owned".to_string());
+        assert_eq!(
+            super::append_open_retry_delay(&lease, 0),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            super::append_open_retry_delay(&lease, 5),
+            Some(std::time::Duration::from_secs(32))
+        );
+        assert_eq!(super::append_open_retry_delay(&lease, 6), None);
+        let missing = hdfs_native::HdfsError::FileNotFound("missing".to_string());
+        assert_eq!(super::append_open_retry_delay(&missing, 0), None);
+    }
+
+    #[test]
     fn transfer_chunks_are_positive_and_do_not_change_hdfs_block_size() {
         assert_eq!(super::transfer_chunk_size(0), 1);
         assert_eq!(super::transfer_chunk_size(crate::MB), crate::MB);

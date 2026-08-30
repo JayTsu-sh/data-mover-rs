@@ -274,10 +274,7 @@ impl HDFSStorage {
             return Ok(start_offset);
         }
         let path = self.resolve_path(relative_path)?;
-        let mut writer =
-            self.client.append(&path).await.map_err(|error| {
-                hdfs_operation_error("append file", Some(relative_path), &error)
-            })?;
+        let mut writer = open_append_after_lease_recovery(&self.client, &path, relative_path).await?;
         let write_result = self
             .consume_sequential_chunks(
             &mut writer,
@@ -686,6 +683,37 @@ impl HDFSStorage {
             }
         }
     }
+}
+
+async fn open_append_after_lease_recovery(
+    client: &hdfs_native::Client,
+    path: &str,
+    relative_path: &std::path::Path,
+) -> Result<hdfs_native::file::FileWriter, StorageError> {
+    for attempt in 0..7 {
+        match client.append(path).await {
+            Ok(writer) => return Ok(writer),
+            Err(error) => {
+                if let Some(delay) = append_open_retry_delay(&error, attempt) {
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(hdfs_operation_error(
+                    "append file",
+                    Some(relative_path),
+                    &error,
+                ));
+            }
+        }
+    }
+    unreachable!("bounded append-open retry loop always returns")
+}
+
+fn append_open_retry_delay(error: &hdfs_native::HdfsError, attempt: u32) -> Option<Duration> {
+    if attempt >= 6 || hdfs_structured_attributes(error).0 != crate::HdfsErrorKind::AlreadyExists {
+        return None;
+    }
+    Some(Duration::from_secs(1_u64 << attempt))
 }
 
 fn confirmed_append_range(
