@@ -686,16 +686,16 @@ impl HDFSStorage {
 }
 
 async fn open_append_after_lease_recovery(
-    client: &hdfs_native::Client,
+    client: &Client,
     path: &str,
-    relative_path: &std::path::Path,
-) -> Result<hdfs_native::file::FileWriter, StorageError> {
+    relative_path: &Path,
+) -> Result<FileWriter, StorageError> {
     for attempt in 0..7 {
         match client.append(path).await {
             Ok(writer) => return Ok(writer),
             Err(error) => {
                 if let Some(delay) = append_open_retry_delay(&error, attempt) {
-                    tokio::time::sleep(delay).await;
+                    sleep(delay).await;
                     continue;
                 }
                 return Err(hdfs_operation_error(
@@ -709,12 +709,12 @@ async fn open_append_after_lease_recovery(
     unreachable!("bounded append-open retry loop always returns")
 }
 
-fn append_open_retry_delay(error: &hdfs_native::HdfsError, attempt: u32) -> Option<Duration> {
+fn append_open_retry_delay(error: &HdfsError, attempt: u32) -> Option<Duration> {
     let lease_recovery = match error {
-        hdfs_native::HdfsError::RPCError(class, _) => {
+        HdfsError::RPCError(class, _) => {
             class_has_suffix(class, &["RecoveryInProgressException"])
         }
-        _ => hdfs_structured_attributes(error).0 == crate::HdfsErrorKind::AlreadyExists,
+        _ => hdfs_structured_attributes(error).0 == HdfsErrorKind::AlreadyExists,
     };
     if attempt >= 6 || !lease_recovery {
         return None;

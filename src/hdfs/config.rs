@@ -13,14 +13,16 @@ use futures::StreamExt as _;
 use futures::stream::FuturesOrdered;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use crate::HDFSEntry;
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
-use crate::error::StorageError;
+use crate::error::{HdfsErrorKind, StorageError};
 use crate::filter::{FilterInput, should_skip};
-use hdfs_native::{Client, ClientBuilder};
+use hdfs_native::file::FileWriter;
+use hdfs_native::{Client, ClientBuilder, HdfsError};
 
 const DEFAULT_BLOCK_SIZE: u64 = 128 * crate::MB;
 const MAX_TRANSFER_CHUNK_SIZE: u64 = 2 * crate::MB;
