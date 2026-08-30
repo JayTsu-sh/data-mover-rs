@@ -167,6 +167,13 @@ The HDFS file block size remains independently configured at 8 MiB. The 2 GiB
 sample may grow by at most 72 MiB
 over its 256 MiB peer. Nightly and release validation upload the CSV artifact and fail on either
 an absolute-budget or size-dependent-growth violation.
+The same run also preloads sparse deterministic zero fixtures into HDFS, then
+measures one representative `high` HDFS→HDFS scale pair at `1 GiB + 137 bytes`
+and `100 GiB + 137 bytes`. Both transfers use identical inflight, chunk,
+channel and file-concurrency settings, reopen and hash the complete destination,
+and must keep peak RSS within 10%. The CSV binds every row to one run id and
+full candidate commit; the validator rejects a missing or approximate 100 GiB
+sample.
 
 `run-resume-e2e.sh` exercises the complete 5-by-5 Local/NFSv3/NFSv4.1/S3/HDFS
 directed matrix in independent processes. The first process writes a durable

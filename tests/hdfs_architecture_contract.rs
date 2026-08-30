@@ -41,7 +41,7 @@ fn lab_config() -> HdfsConfig {
 }
 
 fn lab_location(case: &str) -> TestResult<String> {
-    let root = HdfsLocation::parse(&env::var("LAB_HDFS_RUN_ROOT")?)?;
+    let root = HdfsLocation::parse_configured(&env::var("LAB_HDFS_RUN_ROOT")?, &lab_config())?;
     let endpoint = root
         .endpoint()
         .strip_prefix("hdfs://")

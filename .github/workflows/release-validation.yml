@@ -90,7 +90,7 @@ jobs:
         with:
           name: qos-e2e-release-${{ github.run_id }}
           path: qos-*.csv
-      - name: HDFS multi-GiB bounded-memory gate
+      - name: HDFS 1 GiB to 100 GiB bounded-memory gate
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-memory-e2e.sh "$RUN_ID" hdfs-memory.csv
       - name: HDFS service fault recovery
         run: flock --wait 10800 /tmp/terrasync-lab-tests.lock tests/lab/run-hdfs-fault-e2e.sh "$RUN_ID" hdfs-fault.log
