@@ -246,10 +246,15 @@ async fn hdfs_recovery_rejects_tampering_and_competing_claims_without_mutation()
     };
     assert!(staged.recover(recover(tampered, [1; 32])).await.is_err());
     assert_eq!(protocol.len().await, 2);
-    let winner = staged.recover(recover(identity.clone(), [2; 32])).await?;
-    let loser = staged.recover(recover(identity, [3; 32])).await;
+    let (first, second) = tokio::join!(
+        staged.recover(recover(identity.clone(), [2; 32])),
+        staged.recover(recover(identity, [3; 32]))
+    );
+    let ((Ok(winner), Err(loser)) | (Err(loser), Ok(winner))) = (first, second) else {
+        return Err("claim race did not produce exactly one winner".into());
+    };
     assert!(
-        matches!(loser, Err(crate::storage::StorageRoleFailure::Entry(error))
+        matches!(loser, crate::storage::StorageRoleFailure::Entry(error)
         if error.class() == FailureClass::Conflict)
     );
     assert_eq!(protocol.len().await, 2);
