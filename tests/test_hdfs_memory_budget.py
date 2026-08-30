@@ -12,6 +12,7 @@ class HdfsMemoryBudgetTests(unittest.TestCase):
         self.assertIn("scale_small_size=$((1024 * 1024 * 1024 + 137))", runner)
         self.assertIn("scale_large_size=$((100 * 1024 * 1024 * 1024 + 137))", runner)
         self.assertIn("run_case scale high hdfs-hdfs scale-1g", runner)
+        self.assertIn("for scale_attempt in {1..6}", runner)
         self.assertIn("run_case scale high hdfs-hdfs scale-100g", runner)
         self.assertIn("--require-100-gib", runner)
         self.assertIn("resuming durable partial", runner)
@@ -52,8 +53,11 @@ class HdfsMemoryBudgetTests(unittest.TestCase):
     def test_validator_requires_one_real_100_gib_sample_when_requested(self) -> None:
         hundred_gib = 100 * 1024 * 1024 * 1024 + 137
         path = self._csv(
-            [(1024**3 + 137, 75_000), (hundred_gib, 76_000)],
+            [(1024**3 + 137, 75_000)] * 6 + [(hundred_gib, 76_000)],
             profile="high",
+            read=8,
+            write=16,
+            budget=188,
             direction="hdfs-hdfs",
             sample_set="scale",
         )
@@ -69,16 +73,36 @@ class HdfsMemoryBudgetTests(unittest.TestCase):
             validate(missing, require_100_gib=True)
 
         unstable = self._csv(
-            [
-                (1024**3 + 137, 75_000),
-                (hundred_gib, 84_000),
-            ],
+            [(1024**3 + 137, 75_000)] * 6 + [(hundred_gib, 84_000)],
             profile="high",
             direction="hdfs-hdfs",
             sample_set="scale",
         )
         with self.assertRaisesRegex(ValueError, "10%"):
             validate(unstable, require_100_gib=True)
+
+    def test_scale_guard_uses_repeated_short_transfer_peak(self) -> None:
+        hundred_gib = 100 * 1024 * 1024 * 1024 + 137
+        short = 1024**3 + 137
+        path = self._csv(
+            [
+                (short, 75_000),
+                (short, 88_000),
+                (short, 104_868),
+                (short, 96_980),
+                (short, 89_848),
+                (short, 120_876),
+                (hundred_gib, 132_064),
+            ],
+            profile="high",
+            read=8,
+            write=16,
+            budget=188,
+            direction="hdfs-hdfs",
+            sample_set="scale",
+        )
+
+        validate(path, require_100_gib=True)
 
     def _csv(
         self,

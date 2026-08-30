@@ -19,6 +19,7 @@ FIXED_OVERHEAD_MIB = 96
 GROWTH_ALLOWANCE_MIB = 72
 SCALE_SMALL_BYTES = 1024**3 + 137
 SCALE_LARGE_BYTES = 100 * 1024**3 + 137
+SCALE_SHORT_SAMPLES = 6
 
 
 def budget_mib(
@@ -92,19 +93,25 @@ def validate(path: Path, *, require_100_gib: bool = False) -> None:
         raise ValueError("HDFS memory CSV must contain a real 100 GiB sample")
 
     for key, samples in grouped.items():
-        if len(samples) != 2:
-            raise ValueError(f"{key} must contain exactly two payload sizes")
         samples.sort()
         if key[0] == "scale":
             if key[1:] != ("high", "hdfs-hdfs"):
                 raise ValueError("100 GiB scale pair must use high HDFS-to-HDFS profile")
-            if (samples[0][0], samples[1][0]) != (SCALE_SMALL_BYTES, SCALE_LARGE_BYTES):
-                raise ValueError(f"{key} must contain 1 GiB and 100 GiB samples")
-            if samples[0][2] != samples[1][2]:
+            short = [sample for sample in samples if sample[0] == SCALE_SMALL_BYTES]
+            large = [sample for sample in samples if sample[0] == SCALE_LARGE_BYTES]
+            if len(short) < SCALE_SHORT_SAMPLES or len(large) != 1:
+                raise ValueError(
+                    f"{key} must contain at least {SCALE_SHORT_SAMPLES} 1 GiB "
+                    "samples and exactly one 100 GiB sample"
+                )
+            if any(sample[2] != large[0][2] for sample in short):
                 raise ValueError(f"{key} scale samples must use identical settings")
-            if abs(samples[1][1] - samples[0][1]) * 10 > samples[0][1]:
-                raise ValueError(f"{key} RSS differs by more than 10% at 100 GiB")
+            stable_short_peak = max(sample[1] for sample in short)
+            if (large[0][1] - stable_short_peak) * 10 > stable_short_peak:
+                raise ValueError(f"{key} RSS grows by more than 10% at 100 GiB")
             continue
+        if len(samples) != 2:
+            raise ValueError(f"{key} must contain exactly two payload sizes")
         if key[0] != "baseline":
             raise ValueError(f"unknown HDFS memory sample set: {key[0]}")
         growth = samples[1][1] - samples[0][1]

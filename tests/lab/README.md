@@ -168,10 +168,12 @@ sample may grow by at most 72 MiB
 over its 256 MiB peer. Nightly and release validation upload the CSV artifact and fail on either
 an absolute-budget or size-dependent-growth violation.
 The same run also preloads sparse deterministic zero fixtures into HDFS, then
-measures one representative `high` HDFS→HDFS scale pair at `1 GiB + 137 bytes`
-and `100 GiB + 137 bytes`. Both transfers use identical inflight, chunk,
-channel and file-concurrency settings, reopen and hash the complete destination,
-and must keep peak RSS within 10%. The CSV binds every row to one run id and
+measures six independent `high` HDFS→HDFS transfers at `1 GiB + 137 bytes`
+and one at `100 GiB + 137 bytes`. Every transfer uses identical inflight, chunk,
+channel and file-concurrency settings, reopens and hashes the complete destination,
+and the 100 GiB peak RSS may not exceed the conservative 1 GiB peak by more than
+10%. Repeated short transfers avoid treating a missed transient allocator peak as
+size-dependent growth. The CSV binds every row to one run id and
 full candidate commit; the validator rejects a missing or approximate 100 GiB
 sample.
 

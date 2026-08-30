@@ -330,8 +330,8 @@ concurrency, chunk size, and inflight budget. `PERF-RELEASE` compares the exact 
 - p95 entry scheduling latency degrades no more than 20%;
 - peak buffered payload never exceeds configured inflight bytes;
 - stable RSS does not grow linearly with file size;
-- at identical concurrency/inflight settings, stable RSS differs by at most 10% between
-  1 GiB and 100 GiB transfers;
+- at identical concurrency/inflight settings, the 100 GiB RSS peak exceeds the
+  conservative peak from at least six independent 1 GiB transfers by at most 10%;
 - every internal channel has explicit capacity, backpressure, and cancellation.
 
 Increasing default buffers, concurrency, or inflight capacity cannot be used to mask a

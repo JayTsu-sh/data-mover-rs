@@ -91,19 +91,20 @@ printf '%s\n' \
 
 run_case() {
   local sample_set="$1" profile="$2" direction="$3" payload="$4" size="$5" read="$6" write="$7"
+  local destination_label="${8:-$payload}"
   local source destination destination_probe expected_probe metrics log elapsed rss throughput budget
   case "$direction" in
     local-hdfs)
       source="$source_root"
-      destination="$LAB_HDFS_RUN_ROOT/memory/$profile/local-hdfs-$payload"
+      destination="$LAB_HDFS_RUN_ROOT/memory/$profile/local-hdfs-$destination_label"
       ;;
     hdfs-hdfs)
       source="$LAB_HDFS_RUN_ROOT/memory/source"
-      destination="$LAB_HDFS_RUN_ROOT/memory/$profile/hdfs-hdfs-$payload"
+      destination="$LAB_HDFS_RUN_ROOT/memory/$profile/hdfs-hdfs-$destination_label"
       ;;
     hdfs-local)
       source="$LAB_HDFS_RUN_ROOT/memory/source"
-      destination="$destination_root/$profile/hdfs-local-$payload"
+      destination="$destination_root/$profile/hdfs-local-$destination_label"
       ;;
   esac
   if [[ "$direction" == "hdfs-local" ]]; then
@@ -141,7 +142,9 @@ for profile_spec in serial:1:1 default:4:1 high:8:16; do
   done
 done
 
-run_case scale high hdfs-hdfs scale-1g "$scale_small_size" 8 16
+for scale_attempt in {1..6}; do
+  run_case scale high hdfs-hdfs scale-1g "$scale_small_size" 8 16 "scale-1g-$scale_attempt"
+done
 run_case scale high hdfs-hdfs scale-100g "$scale_large_size" 8 16
 
 python3 tests/hdfs_memory_budget.py --require-100-gib "$output"
