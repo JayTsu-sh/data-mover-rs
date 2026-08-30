@@ -1,5 +1,5 @@
 schema_version: 1
-captured_at: "2026-08-29T19:18:10+08:00"
+captured_at: "2026-08-30T17:14:09+08:00"
 policy:
   normative: false
   does_not_create_compatibility_requirement: true
@@ -152,11 +152,27 @@ profiles:
     gaps: []
 
   s3_dxn:
-    status: missing
-    environment_fingerprint: real-dxn/not-wired-to-current-nightly
-    evidence: []
-    verified_scope: []
-    gaps: [request-level automated tests exist but no current-commit real DXN durable report]
+    status: passed
+    environment_fingerprint: shared-real-dxn/http://10.131.7.201:8184
+    evidence:
+      - evidence_kind: gate_result
+        gate_id: DM-DXN-CONTRACT
+        repository: JayTsu-sh/data-mover-rs
+        exact_commit: ce0a6128a6296d89101d1fdbc835c337a1800e8f
+        dependency_commits: {}
+        run_id: release-ce0a612-dxn
+        mode: real-release
+        fixture_set: architecture-ready-dxn-s3-contract-v1
+        started_at: "2026-08-30T17:13:25+08:00"
+        completed_at: "2026-08-30T17:14:09+08:00"
+        outcome: passed
+        artifact_links:
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/137#issuecomment-5467829058
+        source_profile: s3_dxn
+        destination_profile: s3_dxn
+        environment_fingerprint: shared-real-dxn/http://10.131.7.201:8184
+    verified_scope: [connectivity, multipart_interruption, bounded_inflight_settlement, reconnect_recovery, service_enumerated_checkpoint, restart_upload, publication, content_readback, range_read, cancellation, native_transfer, shaped_fallback, tags_unsupported_without_call, multipart_rename_negative_source_preserved, delete_checksum, standard_s3_isolation]
+    gaps: [TS-DXN-SINGLE and TS-DXN-REMOTE remain independently required]
 
   hdfs:
     status: passed

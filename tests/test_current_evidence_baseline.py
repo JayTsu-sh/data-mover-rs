@@ -113,12 +113,13 @@ class CurrentEvidenceBaselineTest(unittest.TestCase):
         self.assertIn("malformed HTTPS link", result.stderr)
 
     def test_rejects_scope_that_contradicts_status(self):
-        for profile, scope, expected in (
-            ("s3_dxn", ["copy"], "empty verified_scope"),
-            ("local", [], "non-empty verified_scope"),
+        for profile, status, scope, expected in (
+            ("s3_dxn", "missing", ["copy"], "empty verified_scope"),
+            ("local", "passed", [], "non-empty verified_scope"),
         ):
             with self.subTest(profile=profile):
                 document = yaml.safe_load(BASELINE.read_text())
+                document["profiles"][profile]["status"] = status
                 document["profiles"][profile]["verified_scope"] = scope
                 with tempfile.TemporaryDirectory() as temporary:
                     path = Path(temporary) / "evidence.yaml"
