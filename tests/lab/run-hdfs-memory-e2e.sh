@@ -9,7 +9,7 @@ prepare_hdfs_kerberos "$run_id"
 export LAB_HDFS_RUN_ROOT
 LAB_HDFS_RUN_ROOT="$(hdfs_run_root "$run_id")"
 
-local_root="/tmp/data-mover-lab/$run_id/hdfs-memory"
+local_root="${RUNNER_TEMP:-/tmp}/data-mover-lab/$run_id/hdfs-memory"
 source_root="$local_root/source"
 destination_root="$local_root/destination"
 target_directory="$(cargo metadata --locked --no-deps --format-version 1 | \
