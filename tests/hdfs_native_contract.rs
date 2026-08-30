@@ -69,6 +69,13 @@ fn valid_hdfs_lab_run_id(run_id: &str) -> bool {
 }
 
 fn validated_hdfs_lab_root(location: &str) -> Result<data_mover::HdfsLocation, String> {
+    validated_hdfs_lab_root_with_config(location, &HdfsConfig::default())
+}
+
+fn validated_hdfs_lab_root_with_config(
+    location: &str,
+    config: &HdfsConfig,
+) -> Result<data_mover::HdfsLocation, String> {
     let authority_end = location
         .find("://")
         .and_then(|offset| {
@@ -80,7 +87,8 @@ fn validated_hdfs_lab_root(location: &str) -> Result<data_mover::HdfsLocation, S
     if location[authority_end..].contains("//") {
         return Err("HDFS lab root must not contain empty path components".to_string());
     }
-    let parsed = data_mover::HdfsLocation::parse(location).map_err(|error| error.to_string())?;
+    let parsed = data_mover::HdfsLocation::parse_configured(location, config)
+        .map_err(|error| error.to_string())?;
     let components = parsed
         .root()
         .split('/')
@@ -104,7 +112,7 @@ fn validated_hdfs_lab_root(location: &str) -> Result<data_mover::HdfsLocation, S
 
 fn hdfs_lab_root() -> Result<data_mover::HdfsLocation, Box<dyn std::error::Error>> {
     let location = std::env::var("LAB_HDFS_RUN_ROOT")?;
-    validated_hdfs_lab_root(&location).map_err(Into::into)
+    validated_hdfs_lab_root_with_config(&location, &hdfs_lab_config()).map_err(Into::into)
 }
 
 fn hdfs_lab_config() -> HdfsConfig {

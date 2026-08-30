@@ -28,7 +28,7 @@ jobs:
       LAB_HDFS_CONFIG_DIR: /var/lib/data-mover-lab/hadoop
       LAB_HDFS_KEYTAB: /var/lib/data-mover-lab/terrasync-runner.keytab
       LAB_HDFS_HA_LOCATION: hdfs://hdfs%2Fterrasync-runner%40HDFS.LOCAL@hdfs-ha/tmp/data-mover-release/release-${{ github.run_id }}-${{ github.run_attempt }}/hdfs/ha
-      LAB_HDFS_MEMORY_LOCATION: hdfs://hdfs%2Fterrasync-runner%40HDFS.LOCAL@hdfs-ha/tmp/data-mover-release/release-${{ github.run_id }}-${{ github.run_attempt }}/hdfs/memory
+      LAB_HDFS_MEMORY_LOCATION: hdfs://hdfs%2Fterrasync-runner%40HDFS.LOCAL@hdfs-ha/tmp/data-mover-release/release-${{ github.run_id }}-${{ github.run_attempt }}/hdfs
       LAB_HDFS_HA_CONFIG_DIR: /var/lib/data-mover-lab/hadoop
       LAB_HDFS_HA_NAMENODE1_ID: nn1
       LAB_HDFS_HA_NAMENODE1_HOST: 10.131.9.30

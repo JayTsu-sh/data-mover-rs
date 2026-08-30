@@ -14,6 +14,7 @@ class HdfsMemoryBudgetTests(unittest.TestCase):
         self.assertIn("run_case scale high hdfs-hdfs scale-1g", runner)
         self.assertIn("run_case scale high hdfs-hdfs scale-100g", runner)
         self.assertIn("--require-100-gib", runner)
+        self.assertIn("resuming durable partial", runner)
 
     def test_budget_is_derived_from_windows_chunks_and_file_concurrency(self) -> None:
         self.assertEqual(budget_mib(1, 2, 1, 1), 116)

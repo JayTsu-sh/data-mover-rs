@@ -58,20 +58,31 @@ with path.open("wb") as output:
 PY
 }
 
+preload_fixture() {
+  local label="$1" attempt
+  for attempt in 1 2 3; do
+    if "$binary" --source "$source_root" \
+      --destination "$LAB_HDFS_RUN_ROOT/memory/source" --path "$label.bin"; then
+      return 0
+    fi
+    echo "HDFS fixture preload $label failed on attempt $attempt; resuming durable partial" >&2
+    sleep "$attempt"
+  done
+  return 1
+}
+
 for specification in "small:$small_size" "large:$large_size"; do
   label="${specification%%:*}"
   size="${specification#*:}"
   generate_fixture "$source_root/$label.bin" "$size"
-  "$binary" --source "$source_root" \
-    --destination "$LAB_HDFS_RUN_ROOT/memory/source" --path "$label.bin"
+  preload_fixture "$label"
 done
 
 for specification in "scale-1g:$scale_small_size" "scale-100g:$scale_large_size"; do
   label="${specification%%:*}"
   size="${specification#*:}"
   truncate -s "$size" "$source_root/$label.bin"
-  "$binary" --source "$source_root" \
-    --destination "$LAB_HDFS_RUN_ROOT/memory/source" --path "$label.bin"
+  preload_fixture "$label"
 done
 
 printf '%s\n' \
