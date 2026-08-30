@@ -7,7 +7,16 @@ output="${2:-hdfs-memory.csv}"
 validate_run_id "$run_id"
 prepare_hdfs_kerberos "$run_id"
 export LAB_HDFS_RUN_ROOT
-LAB_HDFS_RUN_ROOT="$(hdfs_run_root "$run_id")"
+LAB_HDFS_RUN_ROOT="${LAB_HDFS_MEMORY_LOCATION:-$(hdfs_run_root "$run_id")}"
+
+cleanup_memory_run() {
+  local original_status="$1" cleanup_status=0
+  cargo test --test hdfs_native_contract nightly_lab_cleanup_confined_run_root -- \
+    --ignored --exact --test-threads=1 || cleanup_status=1
+  if (( original_status != 0 )); then exit "$original_status"; fi
+  exit "$cleanup_status"
+}
+trap 'cleanup_memory_run $?' EXIT
 
 local_root="${RUNNER_TEMP:-/tmp}/data-mover-lab/$run_id/hdfs-memory"
 source_root="$local_root/source"
