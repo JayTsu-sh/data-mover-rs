@@ -9,8 +9,8 @@ use data_mover::model::{
 };
 use data_mover::storage::{
     ByteStream, ExistingDestinationPolicy, FinalDestination, PreflightPolicy, PrepareRequest,
-    PublishRequest, RecoverRequest, RecoveryIdentity, SourceDescriptor, Storage,
-    StorageRoleFailure, VerifyRequest,
+    PreparedStage, PublishRequest, RecoverRequest, RecoveryIdentity, SourceDescriptor,
+    StagedDestination, Storage, StorageRoleFailure, VerifyRequest,
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
@@ -291,18 +291,28 @@ async fn recover_tail_and_publish(
             },
         )
         .await?;
+    publish_recovered(staged.as_ref(), &recovered, payload.len() as u64, digest).await?;
+    reconnected.delete_storage_root().await?;
+    Ok(())
+}
+
+async fn publish_recovered(
+    staged: &dyn StagedDestination,
+    recovered: &PreparedStage,
+    expected_size: u64,
+    expected_blake3: [u8; 32],
+) -> Result<(), StorageRoleFailure> {
     staged
         .publish(
-            &recovered,
+            recovered,
             PublishRequest {
                 policy: ExistingDestinationPolicy::default(),
-                expected_size: payload.len() as u64,
-                expected_blake3: digest,
+                expected_size,
+                expected_blake3,
                 cancel: CancellationToken::new(),
             },
         )
         .await
-        .map_err(|failure| failure.error)?;
-    reconnected.delete_storage_root().await?;
-    Ok(())
+        .map(|_| ())
+        .map_err(|failure| failure.error)
 }

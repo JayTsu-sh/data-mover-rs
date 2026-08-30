@@ -436,12 +436,12 @@ async fn claim_base(
         let claimed = observe_prefix(adapter, claimed, token.expected_size).await?;
         return match (base, claimed) {
             (None, Some(size)) => Ok(size),
-            (Some(_), Some(_)) => Err(failure(
+            (Some(_), Some(_)) | (None, None) => Err(failure(
                 &token.base_path,
                 Operation::Prepare,
                 FailureClass::Conflict,
             )),
-            _ => Err(rename_error),
+            (Some(_), None) => Err(rename_error),
         };
     }
     observe_prefix(adapter, claimed, token.expected_size)
