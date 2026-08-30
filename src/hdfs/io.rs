@@ -710,7 +710,13 @@ async fn open_append_after_lease_recovery(
 }
 
 fn append_open_retry_delay(error: &hdfs_native::HdfsError, attempt: u32) -> Option<Duration> {
-    if attempt >= 6 || hdfs_structured_attributes(error).0 != crate::HdfsErrorKind::AlreadyExists {
+    let lease_recovery = match error {
+        hdfs_native::HdfsError::RPCError(class, _) => {
+            class_has_suffix(class, &["RecoveryInProgressException"])
+        }
+        _ => hdfs_structured_attributes(error).0 == crate::HdfsErrorKind::AlreadyExists,
+    };
+    if attempt >= 6 || !lease_recovery {
         return None;
     }
     Some(Duration::from_secs(1_u64 << attempt))

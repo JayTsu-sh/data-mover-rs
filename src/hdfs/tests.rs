@@ -26,6 +26,14 @@ mod tests {
             Some(std::time::Duration::from_secs(32))
         );
         assert_eq!(super::append_open_retry_delay(&lease, 6), None);
+        let recovering = hdfs_native::HdfsError::RPCError(
+            "org.apache.hadoop.hdfs.protocol.RecoveryInProgressException".to_string(),
+            "redacted".to_string(),
+        );
+        assert_eq!(
+            super::append_open_retry_delay(&recovering, 1),
+            Some(std::time::Duration::from_secs(2))
+        );
         let missing = hdfs_native::HdfsError::FileNotFound("missing".to_string());
         assert_eq!(super::append_open_retry_delay(&missing, 0), None);
     }

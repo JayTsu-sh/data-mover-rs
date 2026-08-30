@@ -60,7 +60,7 @@ PY
 
 preload_fixture() {
   local label="$1" attempt
-  for attempt in 1 2 3; do
+  for attempt in 1 2 3 4 5 6 7 8; do
     if "$binary" --source "$source_root" \
       --destination "$LAB_HDFS_RUN_ROOT/memory/source" --path "$label.bin"; then
       return 0
