@@ -46,7 +46,7 @@ mod tests {
             super::transfer_chunk_size(super::DEFAULT_BLOCK_SIZE),
             super::MAX_TRANSFER_CHUNK_SIZE
         );
-        assert_eq!(super::DEFAULT_BLOCK_SIZE, 8 * crate::MB);
+        assert_eq!(super::DEFAULT_BLOCK_SIZE, 128 * crate::MB);
     }
 
     #[test]

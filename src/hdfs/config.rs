@@ -22,7 +22,7 @@ use crate::error::StorageError;
 use crate::filter::{FilterInput, should_skip};
 use hdfs_native::{Client, ClientBuilder};
 
-const DEFAULT_BLOCK_SIZE: u64 = 8 * crate::MB;
+const DEFAULT_BLOCK_SIZE: u64 = 128 * crate::MB;
 const MAX_TRANSFER_CHUNK_SIZE: u64 = 2 * crate::MB;
 
 fn transfer_chunk_size(block_size: u64) -> u64 {

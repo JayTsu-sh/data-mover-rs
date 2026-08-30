@@ -278,9 +278,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let qos = qos_from_args(&args)?;
     let mut source_options = creation_options(&args.source, false);
-    source_options.block_size = Some(args.chunk_bytes);
+    if !args.source.starts_with("hdfs://") {
+        source_options.block_size = Some(args.chunk_bytes);
+    }
     let mut destination_options = creation_options(&args.destination, true);
-    destination_options.block_size = Some(args.chunk_bytes);
+    if !args.destination.starts_with("hdfs://") {
+        destination_options.block_size = Some(args.chunk_bytes);
+    }
     let source = create_storage(&args.source, source_options).await?;
     let destination = create_storage(&args.destination, destination_options).await?;
     let entry = source.get_metadata(Path::new(&args.path)).await?;
