@@ -1,5 +1,12 @@
 //! Local-filesystem adapter facade.
 
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::model::{BackendIdentity, BackendKind};
+use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage, UnsupportedReason};
+
 #[allow(dead_code)]
 pub(crate) mod observation;
 
@@ -8,6 +15,39 @@ pub(crate) mod source;
 
 #[allow(dead_code)]
 pub(crate) mod staged;
+
+pub(crate) fn connect_transfer(
+    root: PathBuf,
+    identity: BackendIdentity,
+    write_concurrency: NonZeroUsize,
+) -> Result<Storage, Box<dyn std::error::Error>> {
+    if identity.kind() != BackendKind::Local {
+        return Err("Local roles require a Local backend identity".into());
+    }
+    let source = Arc::new(source::LocalReadSource::new(&root, identity.clone())?);
+    let staged = Arc::new(staged::LocalStagedDestination::new(
+        root,
+        identity.clone(),
+        write_concurrency.get(),
+    )?);
+    let unsupported = CapabilityAvailability::Unsupported(UnsupportedReason::new(
+        "role is not supplied by the Local transfer-only endpoint",
+    )?);
+    Ok(Storage::connected(
+        identity,
+        BackendCapabilities::new(
+            CapabilityAvailability::Supported,
+            CapabilityAvailability::Supported,
+            unsupported.clone(),
+            unsupported,
+        ),
+        Some(source),
+        Some(staged),
+        None,
+        None,
+        None,
+    )?)
+}
 
 #[cfg(test)]
 pub(crate) fn test_identity(name: &str) -> crate::model::BackendIdentity {

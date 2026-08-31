@@ -2,6 +2,7 @@
 
 pub(crate) mod backends;
 mod capability;
+mod factory;
 mod handle;
 mod native;
 mod roles;
@@ -17,6 +18,10 @@ pub use crate::runtime::qos::{
 pub use capability::{
     BackendCapabilities, Capability, CapabilityAvailability, CapabilityUnavailable,
     CapabilityValueError, PreflightPolicy, UnsupportedReason, ValidationGate,
+};
+pub use factory::{
+    BackendConfig, BackendConnectError, CifsBackendConfig, HdfsBackendConfig, LocalBackendConfig,
+    NfsBackendConfig, S3BackendConfig, connect_backend,
 };
 pub use handle::Storage;
 pub use roles::{
