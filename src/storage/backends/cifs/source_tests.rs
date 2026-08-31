@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt as _;
+use futures::TryStreamExt as _;
 use futures::stream;
 
 use super::namespace::{CifsNamespace, CifsNamespaceProtocol};
@@ -393,77 +394,101 @@ async fn real_share_exercises_domain_roles_without_wire_api()
 #[ignore = "requires an explicitly configured writable CIFS share on two LIFs"]
 async fn real_share_recovers_durable_prefix_across_lifs() -> Result<(), Box<dyn std::error::Error>>
 {
-    let first_server = std::env::var("CIFS_REAL_SERVER")?;
-    let second_server = std::env::var("CIFS_REAL_SECOND_SERVER")?;
-    let share_name = std::env::var("CIFS_REAL_SHARE")?;
-    let username = std::env::var("CIFS_REAL_USER")?;
-    let password = std::env::var("CIFS_REAL_PASS")?;
-    let root = std::env::var("CIFS_REAL_ROOT").ok();
-    let cleanup_root = root.clone();
-    let identity = BackendIdentity::new(BackendKind::Cifs, format!("fas2750/{share_name}"))?;
-    let final_path = StoragePath::new(format!(
-        "data-mover-recovery-{}.bin",
-        uuid::Uuid::new_v4().simple()
-    ))?;
-    let payload = Bytes::from_static(b"durable-prefix-across-fas2750-lifs");
-    let split = 16_usize;
-
-    let first_client = smb_domain::Client::new();
-    let first_share = first_client
-        .connect_share(
-            &smb_domain::ShareTarget::new(&first_server, &share_name)?,
-            smb_domain::Credentials::ntlm(username.clone(), password.clone()),
-        )
-        .await?;
-    let first_storage =
-        crate::cifs::create_cifs_role_storage(first_share, root.clone(), identity.clone())?;
+    let config = RealCifsConfig::from_env()?;
+    let fixture = RecoveryFixture::new(&config.identity)?;
+    let first = config.connect(&config.first_server).await?;
+    let second = config.connect(&config.second_server).await?;
     let policy = crate::storage::PreflightPolicy::production();
-    let destination = first_storage.staged_destination(&policy)?;
-    let source = real_source_descriptor(&identity, payload.len() as u64)?;
-    let stage = destination
-        .prepare(crate::storage::PrepareRequest {
-            final_destination: crate::storage::FinalDestination::new(final_path.clone()),
-            source: source.clone(),
-            recovery_binding: [11; 32],
-        })
-        .await?;
-    destination
-        .write(
-            &stage,
-            Box::pin(stream::iter(vec![Ok(payload.slice(..split))])),
-        )
-        .await?;
-    assert_eq!(
-        destination.observe_checkpoint(&stage).await?.durable_prefix,
-        split as u64
-    );
-    let recovery_identity = destination.recovery_identity(&stage).await?;
-    drop(first_storage);
-    let _ = first_client.close().await;
+    let recovery = write_durable_prefix(&first.storage, &policy, &fixture).await;
+    first.close().await;
+    let result = match recovery {
+        Ok(identity) => run_recovered_half(&second.storage, &policy, &fixture, identity).await,
+        Err(error) => Err(error),
+    };
+    let cleanup = cleanup_real_fixture(&second.share, config.root.as_deref(), &fixture).await;
+    second.close().await;
+    result?;
+    cleanup
+}
 
-    let second_client = smb_domain::Client::new();
-    let second_share = second_client
-        .connect_share(
-            &smb_domain::ShareTarget::new(&second_server, &share_name)?,
-            smb_domain::Credentials::ntlm(username, password),
-        )
-        .await?;
-    let cleanup_share = second_share.clone();
-    let second_storage = crate::cifs::create_cifs_role_storage(second_share, root, identity)?;
-    complete_recovered_copy(
-        &second_storage,
-        &policy,
-        source,
-        final_path.clone(),
-        recovery_identity,
-        payload.clone(),
-        split,
-    )
-    .await?;
-    round_trip_acl(&second_storage, &policy, &final_path).await?;
-    delete_real_file(&cleanup_share, cleanup_root.as_deref(), &final_path).await?;
-    let _ = second_client.close().await;
-    Ok(())
+struct RealCifsConfig {
+    first_server: String,
+    second_server: String,
+    share_name: String,
+    username: String,
+    password: String,
+    root: Option<String>,
+    identity: BackendIdentity,
+}
+
+impl RealCifsConfig {
+    fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let share_name = std::env::var("CIFS_REAL_SHARE")?;
+        Ok(Self {
+            first_server: std::env::var("CIFS_REAL_SERVER")?,
+            second_server: std::env::var("CIFS_REAL_SECOND_SERVER")?,
+            username: std::env::var("CIFS_REAL_USER")?,
+            password: std::env::var("CIFS_REAL_PASS")?,
+            root: std::env::var("CIFS_REAL_ROOT").ok(),
+            identity: BackendIdentity::new(BackendKind::Cifs, format!("fas2750/{share_name}"))?,
+            share_name,
+        })
+    }
+
+    async fn connect(&self, server: &str) -> Result<RealConnection, Box<dyn std::error::Error>> {
+        let client = smb_domain::Client::new();
+        let share = client
+            .connect_share(
+                &smb_domain::ShareTarget::new(server, &self.share_name)?,
+                smb_domain::Credentials::ntlm(self.username.clone(), self.password.clone()),
+            )
+            .await?;
+        let storage = crate::cifs::create_cifs_role_storage(
+            share.clone(),
+            self.root.clone(),
+            self.identity.clone(),
+        )?;
+        Ok(RealConnection {
+            client,
+            share,
+            storage,
+        })
+    }
+}
+
+struct RealConnection {
+    client: smb_domain::Client,
+    share: smb_domain::Share,
+    storage: crate::storage::Storage,
+}
+
+impl RealConnection {
+    async fn close(self) {
+        drop(self.storage);
+        let _ = self.client.close().await;
+    }
+}
+
+struct RecoveryFixture {
+    final_path: StoragePath,
+    payload: Bytes,
+    split: usize,
+    source: crate::storage::SourceDescriptor,
+}
+
+impl RecoveryFixture {
+    fn new(identity: &BackendIdentity) -> Result<Self, Box<dyn std::error::Error>> {
+        let payload = Bytes::from_static(b"durable-prefix-across-fas2750-lifs");
+        Ok(Self {
+            final_path: StoragePath::new(format!(
+                "data-mover-recovery-{}.bin",
+                uuid::Uuid::new_v4().simple()
+            ))?,
+            split: 16,
+            source: real_source_descriptor(identity, payload.len() as u64)?,
+            payload,
+        })
+    }
 }
 
 fn real_source_descriptor(
@@ -482,56 +507,63 @@ fn real_source_descriptor(
     ))
 }
 
-async fn complete_recovered_copy(
+async fn write_durable_prefix(
     storage: &crate::storage::Storage,
     policy: &crate::storage::PreflightPolicy,
-    source: crate::storage::SourceDescriptor,
-    final_path: StoragePath,
-    recovery_identity: crate::storage::RecoveryIdentity,
-    payload: Bytes,
-    split: usize,
+    fixture: &RecoveryFixture,
+) -> Result<crate::storage::RecoveryIdentity, Box<dyn std::error::Error>> {
+    let destination = storage.staged_destination(policy)?;
+    let stage = destination
+        .prepare(crate::storage::PrepareRequest {
+            final_destination: crate::storage::FinalDestination::new(fixture.final_path.clone()),
+            source: fixture.source.clone(),
+            recovery_binding: [11; 32],
+        })
+        .await?;
+    destination
+        .write(
+            &stage,
+            Box::pin(stream::iter(vec![Ok(fixture
+                .payload
+                .slice(..fixture.split))])),
+        )
+        .await?;
+    assert_eq!(
+        destination.observe_checkpoint(&stage).await?.durable_prefix,
+        fixture.split as u64
+    );
+    Ok(destination.recovery_identity(&stage).await?)
+}
+
+async fn run_recovered_half(
+    storage: &crate::storage::Storage,
+    policy: &crate::storage::PreflightPolicy,
+    fixture: &RecoveryFixture,
+    identity: crate::storage::RecoveryIdentity,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let destination = storage.staged_destination(policy)?;
     let stage = destination
         .recover(crate::storage::RecoverRequest {
-            identity: recovery_identity,
-            final_destination: crate::storage::FinalDestination::new(final_path.clone()),
-            source,
+            identity,
+            final_destination: crate::storage::FinalDestination::new(fixture.final_path.clone()),
+            source: fixture.source.clone(),
             recovery_binding: [11; 32],
             claim_token: [12; 32],
         })
         .await?;
-    assert_eq!(stage.write_offset, split as u64);
+    assert_eq!(stage.write_offset, fixture.split as u64);
     destination
         .write(
             &stage,
-            Box::pin(stream::iter(vec![Ok(payload.slice(split..))])),
+            Box::pin(stream::iter(vec![Ok(fixture
+                .payload
+                .slice(fixture.split..))])),
         )
         .await?;
-    let hash = *blake3::hash(&payload).as_bytes();
-    destination
-        .verify(
-            &stage,
-            crate::storage::VerifyRequest {
-                expected_size: payload.len() as u64,
-                expected_blake3: hash,
-                cancel: tokio_util::sync::CancellationToken::new(),
-            },
-        )
-        .await?;
-    destination
-        .publish(
-            &stage,
-            crate::storage::PublishRequest {
-                policy: crate::storage::ExistingDestinationPolicy::FailIfExists,
-                expected_size: payload.len() as u64,
-                expected_blake3: hash,
-                cancel: tokio_util::sync::CancellationToken::new(),
-            },
-        )
-        .await
-        .map_err(|failure| failure.error)?;
-    assert_real_payload(storage, policy, &final_path, &payload).await
+    verify_and_publish(destination.as_ref(), &stage, fixture).await?;
+    assert_real_payload(storage, policy, &fixture.final_path, &fixture.payload).await?;
+    round_trip_acl(storage, policy, &fixture.final_path).await?;
+    assert_real_failure_isolation(storage, policy, fixture).await
 }
 
 async fn assert_real_payload(
@@ -557,6 +589,70 @@ async fn assert_real_payload(
     }
     assert_eq!(actual, expected.as_ref());
     Ok(())
+}
+
+async fn verify_and_publish(
+    destination: &dyn crate::storage::StagedDestination,
+    stage: &crate::storage::PreparedStage,
+    fixture: &RecoveryFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let hash = *blake3::hash(&fixture.payload).as_bytes();
+    destination
+        .verify(
+            stage,
+            crate::storage::VerifyRequest {
+                expected_size: fixture.payload.len() as u64,
+                expected_blake3: hash,
+                cancel: tokio_util::sync::CancellationToken::new(),
+            },
+        )
+        .await?;
+    destination
+        .publish(
+            stage,
+            crate::storage::PublishRequest {
+                policy: crate::storage::ExistingDestinationPolicy::FailIfExists,
+                expected_size: fixture.payload.len() as u64,
+                expected_blake3: hash,
+                cancel: tokio_util::sync::CancellationToken::new(),
+            },
+        )
+        .await
+        .map_err(|failure| failure.error)?;
+    Ok(())
+}
+
+async fn assert_real_failure_isolation(
+    storage: &crate::storage::Storage,
+    policy: &crate::storage::PreflightPolicy,
+    fixture: &RecoveryFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = storage.read_source(policy)?;
+    let missing = source
+        .describe(&StoragePath::new("data-mover-missing-entry")?)
+        .await;
+    assert!(matches!(
+        missing,
+        Err(crate::storage::StorageRoleFailure::Entry(error))
+            if error.class() == crate::model::FailureClass::NotFound
+    ));
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    let cancelled = source
+        .read(ReadRequest {
+            path: fixture.final_path.clone(),
+            range: None,
+            expected_source: None,
+            cancel,
+            source_qos: None,
+        })
+        .await;
+    assert!(matches!(
+        cancelled,
+        Err(crate::storage::StorageRoleFailure::Entry(error))
+            if error.class() == crate::model::FailureClass::Cancelled
+    ));
+    assert_real_payload(storage, policy, &fixture.final_path, &fixture.payload).await
 }
 
 async fn round_trip_acl(
@@ -586,25 +682,94 @@ async fn round_trip_acl(
     Ok(())
 }
 
-async fn delete_real_file(
+async fn cleanup_real_fixture(
     share: &smb_domain::Share,
     root: Option<&str>,
-    path: &StoragePath,
+    fixture: &RecoveryFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let relative = path.as_str().replace('/', "\\");
-    let share_path = match root.filter(|value| !value.is_empty()) {
-        Some(root) => format!("{}\\{relative}", root.replace('/', "\\")),
-        None => relative,
+    delete_real_path_if_present(share, root, fixture.final_path.as_str()).await?;
+    let directory = match share
+        .open_directory(
+            &real_share_path(root, ".data-mover-staging")?,
+            smb_domain::DirectoryOpenOptions::open_existing(),
+        )
+        .await
+    {
+        Ok(directory) => directory,
+        Err(error) if real_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
     };
-    let file = share
+    let entries = directory.entries("*").try_collect::<Vec<_>>().await;
+    close_real_directory(directory).await?;
+    let digest = blake3::hash(fixture.final_path.as_str().as_bytes()).to_hex();
+    let prefix = &digest[..16];
+    for entry in entries? {
+        if entry.name().starts_with(prefix) {
+            let path = format!(".data-mover-staging/{}", entry.name());
+            delete_real_path_if_present(share, root, &path).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn delete_real_path_if_present(
+    share: &smb_domain::Share,
+    root: Option<&str>,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = match share
         .open_file(
-            &smb_domain::SharePath::new(share_path)?,
+            &real_share_path(root, path)?,
             smb_domain::FileOpenOptions::open_existing(),
         )
-        .await?;
+        .await
+    {
+        Ok(file) => file,
+        Err(error) if real_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     file.delete().await?;
-    match file.close().await? {
+    close_real_file(file).await
+}
+
+fn real_share_path(
+    root: Option<&str>,
+    path: &str,
+) -> Result<smb_domain::SharePath, Box<dyn std::error::Error>> {
+    let relative = path.replace('/', "\\");
+    let value = root.filter(|value| !value.is_empty()).map_or_else(
+        || relative.clone(),
+        |root| format!("{}\\{relative}", root.replace('/', "\\")),
+    );
+    Ok(smb_domain::SharePath::new(value)?)
+}
+
+async fn close_real_file(file: smb_domain::File) -> Result<(), Box<dyn std::error::Error>> {
+    require_real_close(file.close().await?)
+}
+
+async fn close_real_directory(
+    directory: smb_domain::Directory,
+) -> Result<(), Box<dyn std::error::Error>> {
+    require_real_close(directory.close().await?)
+}
+
+fn require_real_close(outcome: smb_domain::CloseOutcome) -> Result<(), Box<dyn std::error::Error>> {
+    match outcome {
         smb_domain::CloseOutcome::Confirmed | smb_domain::CloseOutcome::AlreadyClosed => Ok(()),
         smb_domain::CloseOutcome::OutcomeUnknown => Err("cleanup close outcome unknown".into()),
+    }
+}
+
+fn real_not_found(error: &smb_domain::Error) -> bool {
+    match error {
+        smb_domain::Error::NotFound(_) => true,
+        smb_domain::Error::ReceivedErrorMessage(status, _)
+        | smb_domain::Error::UnexpectedMessageStatus(status) => matches!(
+            smb_domain::protocol::Status::try_from(*status),
+            Ok(smb_domain::protocol::Status::ObjectNameNotFound
+                | smb_domain::protocol::Status::ObjectPathNotFound)
+        ),
+        _ => false,
     }
 }
