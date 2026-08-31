@@ -1,5 +1,12 @@
 //! Local-filesystem adapter facade.
 
+use std::sync::Arc;
+
+use crate::storage::{
+    BackendCapabilities, CapabilityAvailability, LocalTransferConfig, LocalTransferConnectError,
+    Storage, UnsupportedReason,
+};
+
 #[allow(dead_code)]
 pub(crate) mod observation;
 
@@ -8,6 +15,43 @@ pub(crate) mod source;
 
 #[allow(dead_code)]
 pub(crate) mod staged;
+
+pub(crate) fn connect_transfer(
+    config: LocalTransferConfig,
+) -> Result<Storage, LocalTransferConnectError> {
+    let source = Arc::new(
+        source::LocalReadSource::new(&config.root, config.identity.clone())
+            .map_err(LocalTransferConnectError::Source)?,
+    );
+    let destination = Arc::new(
+        staged::LocalStagedDestination::new(
+            config.root,
+            config.identity.clone(),
+            config.write_concurrency.get(),
+        )
+        .map_err(LocalTransferConnectError::Destination)?,
+    );
+    let unsupported = CapabilityAvailability::Unsupported(
+        UnsupportedReason::new("role is not part of the Local transfer endpoint")
+            .map_err(LocalTransferConnectError::Capability)?,
+    );
+    let capabilities = BackendCapabilities::new(
+        CapabilityAvailability::Supported,
+        CapabilityAvailability::Supported,
+        unsupported.clone(),
+        unsupported,
+    );
+    Storage::connected(
+        config.identity,
+        capabilities,
+        Some(source),
+        Some(destination),
+        None,
+        None,
+        None,
+    )
+    .map_err(|_| LocalTransferConnectError::Invariant)
+}
 
 #[cfg(test)]
 pub(crate) fn test_identity(name: &str) -> crate::model::BackendIdentity {
