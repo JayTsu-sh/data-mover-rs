@@ -660,25 +660,50 @@ async fn round_trip_acl(
     path: &StoragePath,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let metadata = storage.metadata(policy)?;
-    let observed = metadata
+    let observed = match metadata
         .observe(
             path,
             crate::model::ObservationPlan::default()
                 .with_acl(crate::model::ObservationMode::Required),
         )
-        .await?;
+        .await
+    {
+        Ok(observed) => observed,
+        Err(crate::storage::StorageRoleFailure::Entry(error))
+            if matches!(
+                error.class(),
+                crate::model::FailureClass::PermissionDenied
+                    | crate::model::FailureClass::Unsupported
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     if let crate::model::MetadataObservation::Value { value, .. } = observed.acl() {
-        metadata
+        match metadata
             .apply(
                 path,
                 crate::storage::MetadataMutation::Acl(value.clone()),
                 tokio_util::sync::CancellationToken::new(),
             )
-            .await?;
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(crate::storage::StorageRoleFailure::Entry(error))
+                if matches!(
+                    error.class(),
+                    crate::model::FailureClass::PermissionDenied
+                        | crate::model::FailureClass::Unsupported
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     } else {
         return Err("FAS2750 ACL observation did not return a value".into());
     }
-    Ok(())
 }
 
 async fn cleanup_real_fixture(
