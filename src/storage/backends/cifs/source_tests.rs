@@ -14,6 +14,9 @@ use crate::model::{BackendIdentity, BackendKind, EntryKind, StoragePath};
 use crate::storage::{Namespace, NamespaceRequest, NamespaceResult, ReadRequest, ReadSource};
 use crate::storage::{SourceQosGroup, SourceQosPolicy};
 
+const REAL_RECOVERY_BINDING: [u8; 32] = [11; 32];
+const REAL_RECOVERY_CLAIM: [u8; 32] = [12; 32];
+
 struct MemoryCifs {
     payload: Bytes,
     reads: Arc<Mutex<Vec<(u64, usize)>>>,
@@ -517,7 +520,7 @@ async fn write_durable_prefix(
         .prepare(crate::storage::PrepareRequest {
             final_destination: crate::storage::FinalDestination::new(fixture.final_path.clone()),
             source: fixture.source.clone(),
-            recovery_binding: [11; 32],
+            recovery_binding: REAL_RECOVERY_BINDING,
         })
         .await?;
     destination
@@ -547,8 +550,8 @@ async fn run_recovered_half(
             identity,
             final_destination: crate::storage::FinalDestination::new(fixture.final_path.clone()),
             source: fixture.source.clone(),
-            recovery_binding: [11; 32],
-            claim_token: [12; 32],
+            recovery_binding: REAL_RECOVERY_BINDING,
+            claim_token: REAL_RECOVERY_CLAIM,
         })
         .await?;
     assert_eq!(stage.write_offset, fixture.split as u64);
