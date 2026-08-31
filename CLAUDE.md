@@ -49,7 +49,10 @@
 - **Cargo.toml `[lints.clippy]`**：`pedantic = warn` + `unwrap_used = deny` + `expect_used = deny` + `dbg_macro / todo / unimplemented = warn`。
 - **`[lints.rust]`**：`unsafe_code = deny`。新增 unsafe 必须有 SAFETY 注释 + PR 说明。
 - **异步**：tokio (full)。**错误**：thiserror。**日志**：tracing。
-- **依赖管理**：全 crates.io，无 git patch (与 terrasync-rs 不同)。升级 `smb` / `nfs-rs` / `aws-sdk-s3` 是真实风险。
+- **依赖管理**：默认全 crates.io，无 git patch (与 terrasync-rs 不同)。升级 `smb` / `nfs-rs` / `aws-sdk-s3` 是真实风险。
+  CIFS 架构迁移经项目授权允许固定 smb-rs commit：domain facade 固定 `main` 已验证提交；
+  历史 API 固定旧提交且仅可用于待 #150 删除的 `src/cifs.rs` 路径。不得使用浮动 branch，
+  不得让旧 API 进入 `src/storage/backends/cifs/`，#150 完成时删除旧提交依赖与本例外。
 
 ## 文件大小现状 (backlog，不是新增红线)
 

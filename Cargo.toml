@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 
 [patch.crates-io]
-smb = { git = "https://github.com/JayTsu-sh/smb-rs.git" }
+smb = { git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "c3ecf0007a5477cfd954d4e6dda65c7abd765e71" }
 
 [dependencies]
 async-channel = "2"
@@ -49,6 +49,7 @@ reqwest = { version = "0.13.2", default-features = false, features = [
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive", "rc"] }
 smb = "0.12"
+smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "44cad000cf596a473b20f890506c9522fa665fd0" }
 soft-canonicalize = "0.5.5"
 thiserror = "2.0.18"
 tokio = { version = "1.51.1", features = ["full"] }

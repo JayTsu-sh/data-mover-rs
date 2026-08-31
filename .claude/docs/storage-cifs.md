@@ -1,10 +1,16 @@
 # CIFS / SMB Backend
 
-## 底层依赖
+## 底层依赖与边界
 
-- **crate**：`smb` (0.11，crates.io)。**不是 patched git**。
-- 升级 smb crate 是真实风险 — API 不稳定，绑定 0.11。
-- 协议解析用 `binrw` 0.15 (FileTime / 目录条目 SerializeBounded)。
+- Architecture-ready backend 使用 smb-rs domain facade：`Client → Session → Share → File / Directory`。
+- data-mover 不得重新依赖 smb-rs 的 connection、runtime、wire create/query/set 类型或协议 handle。
+- `smb::protocol` 只允许用于 lossless ACL codec 等明确的协议值边界，普通 I/O 不使用。
+- `src/cifs.rs` 是待 #150 删除的历史公共路径；新功能只进入
+  `src/storage/backends/cifs/`。迁移期间的双版本依赖不是兼容承诺。
+- 经项目授权，新 domain facade 固定到 smb-rs `main` 已验证提交
+  `44cad000cf596a473b20f890506c9522fa665fd0`；历史路径固定旧提交
+  `c3ecf0007a5477cfd954d4e6dda65c7abd765e71`。两者都不得改成浮动 branch，
+  旧提交及此迁移例外随 #150 删除。
 
 ## URL 形式
 
@@ -35,7 +41,8 @@ smb://guest:@nas01/public                 # 匿名 (空密码)
 
 ### 资源句柄管理
 
-**所有 SMB 资源句柄走 `close_resource` helper**，不要裸 `.close()`。
+所有 domain resource 在成功、失败和取消路径都必须显式 close。通用 `Resource` 走
+`protocol::close_resource`；流式 File cursor 在 EOF 或终止边界关闭。
 
 S99 教训：早期 `get_metadata` 在 error path 漏 close → 句柄泄漏 → 长 session 句柄耗尽。
 
@@ -52,7 +59,32 @@ close_resource(&h).await;  // 总是 close
 result
 ```
 
-### CreateDisposition
+### Staged destination 与恢复
+
+- 未发布文件位于 backend root 下的 `.data-mover-staging/`，FinalDestination 在 publish 前不变。
+- 每个完整写流执行 `flush`；只有重新观察到的连续文件长度才是 durable prefix。
+- recovery identity 是 opaque envelope；恢复时先把 stage 原子 rename 到 claim-token 派生路径，
+  再重新观察 durable prefix，不能信任调用方进度。
+- publish 使用 smb-rs `File::rename_replace`。响应丢失时必须重新观察 stage/final 并比较
+  size + BLAKE3，不能盲目重试 rename。
+- `VerifyOrSkip` 仅在既有 FinalDestination 内容等价时保留目标并删除 stage。
+
+### Source read 与 QoS
+
+- 每条 source stream 只持有一个 File handle，顺序发出 positioned reads。
+- 每次请求不超过 smb-rs 协商的 `maximum_read_chunk`，最后一块精确收缩；短读是 corruption。
+- source QoS 在真实 READ 前准入并只记录源端带宽/IOPS，目标 WRITE 不计入。
+- describe 后到 open 之间必须重新构造 source identity；变化时在首个 READ 前 fast-fail。
+
+### Metadata observation
+
+- timestamps 来自 inline metadata。
+- ACL 需要额外 storage call，因此 `Omit`/`InlineOnly` 不调用服务器；只有
+  `BestEffort`/`Required` 才 query security descriptor。
+- CIFS xattr、tags、numeric ownership 当前按 typed not-applicable/unsupported 体现，
+  不通过 storage enum 做协议配对分支。
+
+### 历史 CreateDisposition
 
 - **写文件用 `CreateDisposition::OverwriteIf`** (commit `4051`)。
 - 早期用 Create + 追加，触发 Samba 服务器的 `STATUS_ACCESS_DENIED`。

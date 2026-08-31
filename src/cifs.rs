@@ -3056,6 +3056,18 @@ pub async fn create_cifs_storage(
     Ok(StorageEnum::CIFS(storage))
 }
 
+/// Builds the architecture-ready CIFS role handle from a connected smb-rs share.
+///
+/// # Errors
+/// Returns an error when the identity is not CIFS or connected roles contradict capabilities.
+pub fn create_cifs_role_storage(
+    share: smb_domain::Share,
+    root: Option<String>,
+    identity: crate::model::BackendIdentity,
+) -> std::result::Result<crate::storage::Storage, Box<dyn std::error::Error>> {
+    crate::storage::backends::cifs::connect(share, root, identity)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
