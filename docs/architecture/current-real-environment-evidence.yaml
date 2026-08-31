@@ -1,5 +1,5 @@
 schema_version: 1
-captured_at: "2026-08-31T11:12:51+08:00"
+captured_at: "2026-08-31T11:20:19+08:00"
 policy:
   normative: false
   does_not_create_compatibility_requirement: true
@@ -108,19 +108,19 @@ profiles:
       - evidence_kind: gate_result
         gate_id: DM-CIFS-CONTRACT
         repository: JayTsu-sh/data-mover-rs
-        exact_commit: 579626bc6a9e2581901898b5251d3a9dabe020dd
+        exact_commit: 0a4be15f3509b1d4c816cac75ec6b354209e2eb0
         dependency_commits:
           smb-rs: 44cad000cf596a473b20f890506c9522fa665fd0
         run_id: fas2750-cifs-recovery-20260831
-        started_at: "2026-08-31T11:11:00+08:00"
-        completed_at: "2026-08-31T11:12:00+08:00"
+        started_at: "2026-08-31T11:19:00+08:00"
+        completed_at: "2026-08-31T11:20:00+08:00"
         source_profile: cifs_fas2750
         destination_profile: cifs_fas2750
         mode: real-device
         fixture_set: architecture-ready-cifs-recovery-v1
         outcome: passed
         artifact_links:
-          - https://github.com/JayTsu-sh/data-mover-rs/issues/141#issuecomment-5473227329
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/141#issuecomment-5473277635
         environment_fingerprint: fas2750/10.128.61.200+10.128.61.201/data_mover_e2e
     verified_scope: [smb311_negotiate, authentication, dual_lif, traversal, sequential_read, staged_inflight_write, flush, durable_checkpoint, reconnect_recovery, resume, blake3_verify, atomic_publication, readback, acl_get, acl_set, failure_isolation, fixture_cleanup]
     gaps: [terrasync single-process and remote-process gates remain independently required, full directed matrix remains required by issue 151]
