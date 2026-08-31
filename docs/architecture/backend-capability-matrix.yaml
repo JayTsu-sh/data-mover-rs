@@ -1,13 +1,14 @@
 schema_version: 1
 authority: backend-capability-facts
 backend_kinds: [local, nfs, cifs, s3, hdfs]
-states: [required, unsupported, uncertified, not_applicable]
+states: [required, unsupported, uncertified, not_applicable, instance_operation_result]
 
 semantics:
   required: Target capability that must pass its named gate before ReleaseReady.
   unsupported: Deliberate target boundary that must fail typed preflight.
   uncertified: Implementable capability disabled in production until its named gate passes.
   not_applicable: Semantic does not exist for this profile.
+  instance_operation_result: Capability is decided by the typed result of the requested backend operation for the named instance.
 
 profiles:
   local:

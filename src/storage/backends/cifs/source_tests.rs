@@ -322,7 +322,7 @@ async fn real_share_exercises_domain_roles_without_wire_api()
     let share = client
         .connect_share(&target, smb_domain::Credentials::ntlm(username, password))
         .await?;
-    let storage = crate::cifs::create_cifs_role_storage(
+    let storage = super::connect(
         share,
         root,
         BackendIdentity::new(BackendKind::Cifs, format!("{server}/{share_name}"))?,
@@ -446,11 +446,7 @@ impl RealCifsConfig {
                 smb_domain::Credentials::ntlm(self.username.clone(), self.password.clone()),
             )
             .await?;
-        let storage = crate::cifs::create_cifs_role_storage(
-            share.clone(),
-            self.root.clone(),
-            self.identity.clone(),
-        )?;
+        let storage = super::connect(share.clone(), self.root.clone(), self.identity.clone())?;
         Ok(RealConnection {
             client,
             share,

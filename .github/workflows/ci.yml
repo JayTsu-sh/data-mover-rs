@@ -49,6 +49,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install Python contract dependencies
+        run: python3 -m pip install PyYAML==6.0.2
+
       - name: Cache cargo registry + target
         uses: actions/cache@v4
         with:
@@ -67,6 +70,15 @@ jobs:
         run: |
           python3 tests/validate_architecture_dependencies.py .
           python3 -m unittest tests/test_architecture_dependencies.py
+
+      - name: DM-MATRIX-SCHEMA
+        run: |
+          python3 tests/validate_architecture_matrix.py \
+            docs/architecture/backend-capability-matrix.yaml \
+            docs/architecture/directed-transfer-matrix.yaml \
+            docs/architecture/current-real-environment-evidence.yaml
+          python3 -m unittest tests/test_architecture_matrix.py
+          python3 -m unittest tests/test_current_evidence_baseline.py
 
       - name: cargo clippy (all targets, deny warnings)
         run: python3 .claude/skills/quality-clippy/scripts/run.py
