@@ -1,5 +1,5 @@
 schema_version: 1
-captured_at: "2026-08-30T17:14:09+08:00"
+captured_at: "2026-08-31T11:12:51+08:00"
 policy:
   normative: false
   does_not_create_compatibility_requirement: true
@@ -102,26 +102,28 @@ profiles:
     gaps: [terrasync single-process and remote-process gates remain independently required]
 
   cifs_fas2750:
-    status: failed
-    environment_fingerprint: fas2750/10.128.61.200+10.128.61.201/ontap_lisaauto_cifs
+    status: passed
+    environment_fingerprint: fas2750/10.128.61.200+10.128.61.201/data_mover_e2e
     evidence:
-      - evidence_kind: device_observation
-        observation_id: SMB-FAS2750-NEGOTIATE
+      - evidence_kind: gate_result
+        gate_id: DM-CIFS-CONTRACT
         repository: JayTsu-sh/data-mover-rs
-        exact_commit: b2a6bea13fee8a07af2463d48636ce539f8cf34f
-        recorded_at: "2026-08-28T16:58:22+08:00"
+        exact_commit: 579626bc6a9e2581901898b5251d3a9dabe020dd
+        dependency_commits:
+          smb-rs: 44cad000cf596a473b20f890506c9522fa665fd0
+        run_id: fas2750-cifs-recovery-20260831
+        started_at: "2026-08-31T11:11:00+08:00"
+        completed_at: "2026-08-31T11:12:00+08:00"
         source_profile: cifs_fas2750
         destination_profile: cifs_fas2750
-        mode: read-only-device-probe
-        fixture_set: authenticated-share-root-listing
-        outcome: failed
+        mode: real-device
+        fixture_set: architecture-ready-cifs-recovery-v1
+        outcome: passed
         artifact_links:
-          - https://github.com/JayTsu-sh/data-mover-rs/issues/100#issuecomment-5450524920
-          - https://github.com/JayTsu-sh/data-mover-rs/issues/142
-        environment_fingerprint: fas2750/10.128.61.200+10.128.61.201/ontap_lisaauto_cifs
-        limitations: [recorded_at is the durable issue-comment time; smb-rs dependency SHA and probe timing were not captured, so this is not an acceptance-gate result]
-    verified_scope: [service reachable, system client authenticated read]
-    gaps: [smb-rs SMB 3.1.1 negotiate parsing fails before authentication, no data-mover transfer gate]
+          - https://github.com/JayTsu-sh/data-mover-rs/issues/141#issuecomment-5473227329
+        environment_fingerprint: fas2750/10.128.61.200+10.128.61.201/data_mover_e2e
+    verified_scope: [smb311_negotiate, authentication, dual_lif, traversal, sequential_read, staged_inflight_write, flush, durable_checkpoint, reconnect_recovery, resume, blake3_verify, atomic_publication, readback, acl_get, acl_set, failure_isolation, fixture_cleanup]
+    gaps: [terrasync single-process and remote-process gates remain independently required, full directed matrix remains required by issue 151]
 
   s3_standard:
     status: passed
