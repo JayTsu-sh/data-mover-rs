@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use super::{PrepareRequest, PreparedStage, StorageRoleFailure, WriteEvidence};
+use super::{PreparedStage, StorageRoleFailure, WriteEvidence};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct NativeAffinity([u8; 32]);
@@ -34,8 +34,13 @@ pub(crate) struct NativeSourceBinding {
     pub size: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeRecoveryMode {
+    Atomic,
+    Checkpointed,
+}
+
 pub(crate) struct NativeStageEvidence {
-    pub stage: PreparedStage,
     pub write: WriteEvidence,
     pub native_bytes: u64,
     pub native_requests: u64,
@@ -43,7 +48,6 @@ pub(crate) struct NativeStageEvidence {
 
 pub(crate) struct NativeStageFailure {
     pub error: StorageRoleFailure,
-    pub stage: Option<PreparedStage>,
     pub native_bytes: u64,
     pub native_requests: u64,
 }
@@ -52,15 +56,17 @@ pub(crate) struct NativeStageFailure {
 pub(crate) trait NativeEndpoint: Send + Sync {
     fn affinity(&self) -> NativeAffinity;
 
+    fn recovery_mode(&self, source_size: u64) -> NativeRecoveryMode;
+
     async fn bind_source(
         &self,
         source: &super::SourceDescriptor,
     ) -> Result<NativeSourceBinding, StorageRoleFailure>;
 
-    async fn copy_to_stage(
+    async fn copy_into_stage(
         &self,
         source: NativeSourceBinding,
-        request: PrepareRequest,
+        stage: &PreparedStage,
         cancel: CancellationToken,
     ) -> Result<NativeStageEvidence, NativeStageFailure>;
 }
@@ -88,14 +94,18 @@ impl NativePair {
         self.source.bind_source(source).await
     }
 
-    pub(crate) async fn copy_to_stage(
+    pub(crate) fn recovery_mode(&self, source_size: u64) -> NativeRecoveryMode {
+        self.destination.recovery_mode(source_size)
+    }
+
+    pub(crate) async fn copy_into_stage(
         &self,
         source: NativeSourceBinding,
-        request: PrepareRequest,
+        stage: &PreparedStage,
         cancel: CancellationToken,
     ) -> Result<NativeStageEvidence, NativeStageFailure> {
         self.destination
-            .copy_to_stage(source, request, cancel)
+            .copy_into_stage(source, stage, cancel)
             .await
     }
 }

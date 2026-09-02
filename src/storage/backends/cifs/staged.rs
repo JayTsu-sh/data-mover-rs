@@ -9,10 +9,10 @@ use futures::StreamExt as _;
 use super::source::{classify, entry_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath};
 use crate::storage::{
-    ByteStream, CheckpointObservation, ExistingDestinationPolicy, PrepareRequest, PreparedStage,
-    PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
-    RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure, VerificationEvidence,
-    VerifyRequest, WriteEvidence,
+    ByteStream, CheckpointObservation, ExistingDestinationPolicy, Metadata, MetadataMutation,
+    PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure,
+    PublishRequest, RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure,
+    VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 const STAGING_DIRECTORY: &str = ".data-mover-staging";
@@ -47,6 +47,7 @@ pub(super) struct CifsStagedDestination {
     protocol: Arc<dyn CifsStagedProtocol>,
     identity: BackendIdentity,
     owned: Mutex<HashSet<Bytes>>,
+    metadata: Option<Arc<dyn Metadata>>,
 }
 
 impl CifsStagedDestination {
@@ -58,7 +59,13 @@ impl CifsStagedDestination {
             protocol,
             identity,
             owned: Mutex::new(HashSet::new()),
+            metadata: None,
         }
+    }
+
+    pub(super) fn with_metadata(mut self, metadata: Arc<dyn Metadata>) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 
     fn stage_path(&self, stage: &PreparedStage) -> Result<StoragePath, StorageRoleFailure> {
@@ -401,6 +408,23 @@ impl StagedDestination for CifsStagedDestination {
             verified_bytes: size,
             blake3: hash,
         })
+    }
+
+    async fn apply_metadata(
+        &self,
+        stage: &PreparedStage,
+        mutation: MetadataMutation,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        let path = self.stage_path(stage)?;
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            entry_failure(
+                stage.final_destination.path(),
+                Operation::Metadata,
+                FailureClass::Unsupported,
+            )
+        })?;
+        metadata.apply(&path, mutation, cancel).await
     }
 
     async fn publish(

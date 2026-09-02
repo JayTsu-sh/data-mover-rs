@@ -304,6 +304,8 @@ async fn verify_range_and_cancellation(
             path: path.clone(),
             range: Some(13..PART_SIZE as u64 + 21),
             expected_source: Some(observed.source_identity.clone()),
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 4,
             cancel: CancellationToken::new(),
             source_qos: None,
         })
@@ -320,6 +322,8 @@ async fn verify_range_and_cancellation(
             path: path.clone(),
             range: None,
             expected_source: Some(observed.source_identity),
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 4,
             cancel,
             source_qos: None,
         })

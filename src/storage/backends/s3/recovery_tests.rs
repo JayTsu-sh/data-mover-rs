@@ -85,6 +85,22 @@ async fn inject_gap(fixture: &Fixture) -> TestResult<String> {
     Ok(upload_id)
 }
 
+async fn inject_native_prefix(fixture: &Fixture) -> TestResult<u64> {
+    let upload_id = upload_id(&fixture.stage)?;
+    let native_part = Bytes::from(vec![9; 16 * 1024 * 1024]);
+    let native_size = native_part.len() as u64;
+    fixture
+        .protocol
+        .uploads
+        .lock()
+        .await
+        .get_mut(&upload_id)
+        .ok_or("missing upload")?
+        .1
+        .push((1, native_part));
+    Ok(native_size)
+}
+
 fn abort_failure() -> S3ProtocolFailure {
     S3ProtocolFailure::session(
         FailureClass::Connectivity,
@@ -118,6 +134,26 @@ async fn invalid_manifest_is_owned_cleaned_and_rejected() -> TestResult {
     );
     assert!(fixture.protocol.claims.lock().await.is_empty());
     assert_eq!(*fixture.protocol.aborts.lock().await, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_reuses_a_contiguous_native_copy_prefix() -> TestResult {
+    let fixture = fixture("native-prefix-final", [6; 32]).await?;
+    let recovery = fixture
+        .destination
+        .recovery_identity(&fixture.stage)
+        .await?;
+    let native_size = inject_native_prefix(&fixture).await?;
+    let reconnected = connect(fixture.protocol.clone(), identity(), Some(native_context()))?
+        .staged_destination(&validation_policy())?;
+
+    let recovered = reconnected
+        .recover(recover_request(recovery, &fixture.prepare, [8; 32]))
+        .await?;
+
+    assert_eq!(recovered.write_offset, native_size);
+    reconnected.discard(recovered).await?;
     Ok(())
 }
 

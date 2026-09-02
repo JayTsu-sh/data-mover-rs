@@ -4,7 +4,10 @@ use bytes::Bytes;
 use futures::stream;
 use tokio_util::sync::CancellationToken;
 
-use super::{InflightLimits, RecoveryPolicy, TransferIdentity, TransferRequest, transfer};
+use super::{
+    InflightLimits, RecoveryContext, RecoveryProvider, RecoveryRegistrar,
+    RecoveryRegistrationFailure, Resumability, TransferIdentity, TransferRequest, transfer,
+};
 use crate::model::{
     FailureClass, MappedOwnership, ObservationMode, ObservationPlan, Operation, StoragePath,
     StorageTimestamp, TimePrecision, TimestampMetadata,
@@ -18,6 +21,43 @@ use crate::storage::{
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+struct AcceptingRecoveryRegistrar;
+
+#[async_trait::async_trait]
+impl RecoveryRegistrar for AcceptingRecoveryRegistrar {
+    async fn register(
+        &self,
+        _identity: RecoveryIdentity,
+    ) -> Result<(), RecoveryRegistrationFailure> {
+        Ok(())
+    }
+}
+
+struct HdfsRecoveryProvider {
+    identity: Option<RecoveryIdentity>,
+}
+
+#[async_trait::async_trait]
+impl RecoveryProvider for HdfsRecoveryProvider {
+    async fn open(&self) -> Result<RecoveryContext, RecoveryRegistrationFailure> {
+        Ok(RecoveryContext::new(
+            self.identity.clone(),
+            [7; 32],
+            Arc::new(AcceptingRecoveryRegistrar),
+        ))
+    }
+}
+
+fn recoverable_request(
+    request: TransferRequest,
+    identity: Option<RecoveryIdentity>,
+) -> TransferRequest {
+    request.with_recovery(
+        Resumability::Enabled,
+        Some(Arc::new(HdfsRecoveryProvider { identity })),
+    )
+}
 
 fn request(source: Storage, destination: Storage) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
@@ -87,7 +127,8 @@ async fn write_failure_retains_discard_authority_and_final_is_unchanged() -> Tes
     let Err(failure) = transfer(request(source, destination)?).await else {
         return Err("injected HDFS write failure succeeded".into());
     };
-    assert!(failure.has_recoverable_stage());
+    assert!(!failure.has_recoverable_stage());
+    assert!(failure.has_unpublished_stage());
     assert!(!failure.final_destination_changed());
     failure.discard_stage().await?;
     assert!(protocol.get("final").await.is_none());
@@ -263,11 +304,10 @@ async fn hdfs_recovery_rejects_tampering_and_competing_claims_without_mutation()
 }
 
 #[tokio::test]
-async fn resume_or_restart_preserves_unknown_hdfs_stage_and_reuploads() -> TestResult {
+async fn invalid_identity_preserves_unknown_hdfs_stage_without_reupload() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
-    protocol
-        .insert("source", Bytes::from_static(b"restart"))
-        .await;
+    let payload = Bytes::from(vec![0x72; 128 * 1024]);
+    protocol.insert("source", payload).await;
     let source = connect(protocol.clone(), test_identity("restart-source")?)?;
     let destination = connect(protocol.clone(), test_identity("restart-destination")?)?;
     let descriptor = source
@@ -290,30 +330,26 @@ async fn resume_or_restart_preserves_unknown_hdfs_stage_and_reuploads() -> TestR
         .ok_or("empty recovery identity")?;
     bytes[last] ^= 1;
     let recovery = RecoveryIdentity::from_bytes(bytes)?;
-    let outcome = transfer(
-        request(source, destination)?
-            .with_recovery(RecoveryPolicy::ResumeOrRestart, Some(recovery)),
-    )
-    .await?;
-    assert_eq!(outcome.transferred_bytes, 7);
-    assert_eq!(
-        protocol.get("final").await.as_deref(),
-        Some(b"restart".as_slice())
-    );
-    assert_eq!(protocol.len().await, 3);
+    let result = transfer(recoverable_request(
+        request(source, destination)?,
+        Some(recovery),
+    ))
+    .await;
+    assert!(result.is_err());
+    assert!(protocol.get("final").await.is_none());
+    assert_eq!(protocol.len().await, 2);
     Ok(())
 }
 
 #[tokio::test]
 async fn require_resume_reclaims_hdfs_stage_before_reupload() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
-    protocol
-        .insert("source", Bytes::from_static(b"resume"))
-        .await;
+    let payload = Bytes::from(vec![0x72; 64 * 1024]);
+    protocol.insert("source", payload.clone()).await;
     protocol.fail_writes();
     let source = connect(protocol.clone(), test_identity("require-source")?)?;
     let destination = connect(protocol.clone(), test_identity("require-destination")?)?;
-    let failure = transfer(request(source, destination)?)
+    let failure = transfer(recoverable_request(request(source, destination)?, None))
         .await
         .err()
         .ok_or("injected HDFS failure succeeded")?;
@@ -324,14 +360,15 @@ async fn require_resume_reclaims_hdfs_stage_before_reupload() -> TestResult {
     protocol.allow_writes();
     let source = connect(protocol.clone(), test_identity("require-source")?)?;
     let destination = connect(protocol.clone(), test_identity("require-destination")?)?;
-    let outcome = transfer(
-        request(source, destination)?.with_recovery(RecoveryPolicy::RequireResume, Some(identity)),
-    )
+    let outcome = transfer(recoverable_request(
+        request(source, destination)?,
+        Some(identity),
+    ))
     .await?;
-    assert_eq!(outcome.transferred_bytes, 6);
+    assert_eq!(outcome.transferred_bytes, payload.len() as u64);
     assert_eq!(
         protocol.get("final").await.as_deref(),
-        Some(b"resume".as_slice())
+        Some(payload.as_ref())
     );
     Ok(())
 }

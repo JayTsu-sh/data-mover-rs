@@ -2,8 +2,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::Operation;
 use crate::storage::{
-    NativeStageEvidence, NativeStageFailure, PrepareRequest, PreparedStage, StagedDestination,
-    StorageRoleFailure, WriteEvidence,
+    NativeStageEvidence, NativeStageFailure, PreparedStage, StorageRoleFailure, WriteEvidence,
 };
 
 use super::super::source::{cancelled, entry, role_failure};
@@ -19,27 +18,14 @@ struct NativeFillFailure {
 }
 
 impl<P: S3Protocol + 'static> S3StagedDestination<P> {
-    pub(in crate::storage::backends::s3) async fn prepare_native(
+    pub(in crate::storage::backends::s3) async fn fill_native(
         &self,
-        request: PrepareRequest,
+        stage: &PreparedStage,
         source: S3NativeCopySource,
         cancel: CancellationToken,
     ) -> Result<NativeStageEvidence, NativeStageFailure> {
-        let stage = self
-            .prepare(request.clone())
-            .await
-            .map_err(|error| NativeStageFailure {
-                error,
-                stage: None,
-                native_bytes: 0,
-                native_requests: 0,
-            })?;
-        match self
-            .fill_native_stage(&stage, &request, &source, &cancel)
-            .await
-        {
+        match self.fill_native_stage(stage, &source, &cancel).await {
             Ok(copy) => Ok(NativeStageEvidence {
-                stage,
                 write: WriteEvidence {
                     persisted_bytes: copy.bytes,
                 },
@@ -48,7 +34,6 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             }),
             Err(failure) => Err(NativeStageFailure {
                 error: failure.error,
-                stage: Some(stage),
                 native_bytes: failure.bytes,
                 native_requests: failure.requests,
             }),
@@ -58,32 +43,22 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     async fn fill_native_stage(
         &self,
         stage: &PreparedStage,
-        request: &PrepareRequest,
         source: &S3NativeCopySource,
         cancel: &CancellationToken,
     ) -> Result<S3NativeCopyEvidence, NativeFillFailure> {
         let baseline = u64::from(source.size > S3_NATIVE_COPY_SINGLE_MAX);
         let (key, upload_id) = self
-            .prepare_native_ownership(stage, request, source, cancel, baseline)
+            .prepare_native_ownership(stage, source, cancel, baseline)
             .await?;
         let copy = self
-            .invoke_native_copy(
-                request,
-                source,
-                &key,
-                upload_id.as_deref(),
-                cancel,
-                baseline,
-            )
+            .invoke_native_copy(stage, source, &key, upload_id.as_deref(), cancel, baseline)
             .await?;
-        self.complete_native_state(stage, request, source, copy)
-            .await
+        self.complete_native_state(stage, source, copy).await
     }
 
     async fn prepare_native_ownership(
         &self,
         stage: &PreparedStage,
-        request: &PrepareRequest,
         source: &S3NativeCopySource,
         cancel: &CancellationToken,
         baseline: u64,
@@ -96,14 +71,14 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             .map_err(map)?;
         if cancel.is_cancelled() {
             return Err(map(cancelled(
-                request.final_destination.path(),
+                stage.final_destination.path(),
                 Operation::Write,
             )));
         }
         let multipart = source.size > S3_NATIVE_COPY_SINGLE_MAX;
         if !multipart {
             cleanup_result(
-                request.final_destination.path(),
+                stage.final_destination.path(),
                 self.protocol.abort_multipart(&key, &record.upload_id).await,
             )
             .map_err(map)?;
@@ -119,7 +94,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
 
     async fn invoke_native_copy(
         &self,
-        request: &PrepareRequest,
+        stage: &PreparedStage,
         source: &S3NativeCopySource,
         key: &str,
         upload_id: Option<&str>,
@@ -135,7 +110,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             })
             .map_err(|failure| NativeFillFailure {
                 error: role_failure(
-                    request.final_destination.path(),
+                    stage.final_destination.path(),
                     Operation::Write,
                     failure.error,
                 ),
@@ -147,14 +122,13 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     async fn complete_native_state(
         &self,
         stage: &PreparedStage,
-        request: &PrepareRequest,
         source: &S3NativeCopySource,
         copy: S3NativeCopyEvidence,
     ) -> Result<S3NativeCopyEvidence, NativeFillFailure> {
         if copy.bytes != source.size {
             return Err(NativeFillFailure {
                 error: entry(
-                    request.final_destination.path(),
+                    stage.final_destination.path(),
                     Operation::Write,
                     "native S3 copy reported an unexpected size",
                 ),

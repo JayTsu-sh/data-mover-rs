@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
+use futures::StreamExt as _;
+use futures::stream::FuturesOrdered;
 
 use super::observation::{LocalObservationAdapter, classify_io, source_identity};
 use crate::model::{
@@ -20,12 +22,22 @@ use crate::storage::{
     ByteStream, ReadRequest, ReadSource, SourceDescriptor, SourceQosBudget, StorageRoleFailure,
 };
 
-const MAX_READ_CHUNK: u64 = 1024 * 1024;
+/// Backend capability ceiling for one Local positional read.
+///
+/// The runtime may negotiate a smaller value from its byte budget or `QoS`, but Local does not
+/// internally subdivide a granted range below this ceiling. A short `read_at` is completed by
+/// reading only the missing suffix.
+const LOCAL_MAX_READ_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
+type LocalReadFuture = tokio::task::JoinHandle<(u64, u64, io::Result<Bytes>)>;
+
+/// One-open local source whose positional reads may complete out of order while the stream emits
+/// them in ascending offset order.
 pub(crate) struct LocalReadSource {
     root: Arc<Dir>,
     identity: BackendIdentity,
     observer: LocalObservationAdapter,
+    read_concurrency: usize,
     #[cfg(test)]
     probe: Arc<ReadProbe>,
 }
@@ -33,15 +45,46 @@ pub(crate) struct LocalReadSource {
 #[cfg(test)]
 #[derive(Default)]
 struct ReadProbe {
+    streams: std::sync::atomic::AtomicUsize,
     calls: std::sync::atomic::AtomicUsize,
     delay: std::sync::Mutex<Option<std::time::Duration>>,
+    gates: std::sync::Mutex<std::collections::HashMap<u64, Arc<ReadGate>>>,
+    active: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    completion_order: std::sync::Mutex<Vec<u64>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ReadGate {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ReadGate {
+    pub(crate) async fn wait_started(&self) {
+        self.started.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl LocalReadSource {
     pub(crate) fn new(
         root: impl AsRef<Path>,
         identity: BackendIdentity,
+        read_concurrency: usize,
     ) -> Result<Self, StorageRoleFailure> {
+        if read_concurrency == 0 {
+            return Err(failure(
+                &StoragePath::root(),
+                FailureClass::InvalidInput,
+                Transience::Permanent,
+            ));
+        }
         let root_path = std::fs::canonicalize(root).map_err(|error| session_failure(&error))?;
         let root = Arc::new(
             Dir::open_ambient_dir(root_path, ambient_authority())
@@ -51,6 +94,7 @@ impl LocalReadSource {
             observer: LocalObservationAdapter::from_root(Arc::clone(&root), identity.clone()),
             root,
             identity,
+            read_concurrency,
             #[cfg(test)]
             probe: Arc::new(ReadProbe::default()),
         })
@@ -68,6 +112,36 @@ impl LocalReadSource {
     #[cfg(test)]
     pub(crate) fn read_call_count(&self) -> usize {
         self.probe.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_stream_count(&self) -> usize {
+        self.probe.streams.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_read_at(&self, offset: u64) -> Arc<ReadGate> {
+        let gate = Arc::new(ReadGate::default());
+        self.probe
+            .gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(offset, Arc::clone(&gate));
+        gate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_read_concurrency(&self) -> usize {
+        self.probe.peak.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_completion_order(&self) -> Vec<u64> {
+        self.probe
+            .completion_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     #[cfg(test)]
@@ -100,6 +174,10 @@ impl LocalReadSource {
 
 #[async_trait]
 impl ReadSource for LocalReadSource {
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        LOCAL_MAX_READ_CHUNK_BYTES
+    }
+
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         let observed = self.observer.observe(path.clone()).await?;
         Ok(SourceDescriptor {
@@ -119,6 +197,17 @@ impl ReadSource for LocalReadSource {
                 Transience::Transient,
             ));
         }
+        if request.maximum_chunk_bytes == 0 || request.read_inflight == 0 {
+            return Err(failure(
+                &request.path,
+                FailureClass::InvalidInput,
+                Transience::Permanent,
+            ));
+        }
+        #[cfg(test)]
+        self.probe
+            .streams
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let range = self.resolve_range(&request).await?;
         if range.end < range.start {
             return Err(failure(
@@ -134,8 +223,12 @@ impl ReadSource for LocalReadSource {
         let state = LocalReadState {
             file,
             path: request.path,
-            next: range.start,
+            next_issue: range.start,
+            next_emit: range.start,
             end: range.end,
+            maximum_chunk_bytes: request.maximum_chunk_bytes.min(LOCAL_MAX_READ_CHUNK_BYTES),
+            read_concurrency: self.read_concurrency.min(request.read_inflight),
+            inflight: FuturesOrdered::new(),
             cancel: request.cancel,
             source_qos: request.source_qos,
             #[cfg(test)]
@@ -178,8 +271,12 @@ impl LocalReadSource {
 struct LocalReadState {
     file: Arc<std::fs::File>,
     path: StoragePath,
-    next: u64,
+    next_issue: u64,
+    next_emit: u64,
     end: u64,
+    maximum_chunk_bytes: usize,
+    read_concurrency: usize,
+    inflight: FuturesOrdered<LocalReadFuture>,
     cancel: tokio_util::sync::CancellationToken,
     source_qos: Option<SourceQosBudget>,
     #[cfg(test)]
@@ -189,57 +286,144 @@ struct LocalReadState {
 async fn read_next_chunk(
     mut state: LocalReadState,
 ) -> Result<Option<(Bytes, LocalReadState)>, StorageRoleFailure> {
-    if state.next == state.end {
+    fill_read_pipeline(&mut state).await?;
+    if state.inflight.is_empty() {
         return Ok(None);
     }
-    let start = state.next;
-    let requested = (state.end - start).min(MAX_READ_CHUNK);
-    let granted = if let Some(qos) = &state.source_qos {
-        qos.admit_read(requested, &state.cancel)
-            .await
-            .map_err(|_| failure(&state.path, FailureClass::Cancelled, Transience::Transient))?
-    } else {
-        requested
-    };
-    let end = start + granted;
-    #[cfg(test)]
-    {
-        state
-            .probe
-            .calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let delay = *state
-            .probe
-            .delay
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(delay) = delay {
-            tokio::select! {
-                biased;
-                () = state.cancel.cancelled() => {
-                    return Err(failure(&state.path, FailureClass::Cancelled, Transience::Transient));
-                }
-                () = tokio::time::sleep(delay) => {}
-            }
-        }
-    }
-    let file = Arc::clone(&state.file);
-    let path = state.path.clone();
-    let read = tokio::task::spawn_blocking(move || read_file_range(&file, start..end));
-    let bytes = tokio::select! {
+    let next = tokio::select! {
         biased;
         () = state.cancel.cancelled() => {
             return Err(failure(&state.path, FailureClass::Cancelled, Transience::Transient));
         }
-        result = read => result
-            .map_err(|_| failure(&path, FailureClass::Internal, Transience::Unknown))?
-            .map_err(|error| io_failure(&path, &error))?,
+        result = state.inflight.next() => result,
     };
+    let joined = next
+        .ok_or_else(|| failure(&state.path, FailureClass::Internal, Transience::Unknown))?
+        .map_err(|_| failure(&state.path, FailureClass::Internal, Transience::Unknown))?;
+    let (start, requested, result) = joined;
+    if start != state.next_emit {
+        return Err(failure(
+            &state.path,
+            FailureClass::Internal,
+            Transience::Unknown,
+        ));
+    }
+    let bytes = result.map_err(|error| io_failure(&state.path, &error))?;
+    if bytes.len() as u64 != requested {
+        return Err(failure(
+            &state.path,
+            FailureClass::Corruption,
+            Transience::Unknown,
+        ));
+    }
     if let Some(qos) = &state.source_qos {
         qos.record_read_bytes(bytes.len() as u64);
     }
-    state.next = end;
+    state.next_emit = state
+        .next_emit
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| {
+            failure(
+                &state.path,
+                FailureClass::InvalidInput,
+                Transience::Permanent,
+            )
+        })?;
     Ok(Some((bytes, state)))
+}
+
+async fn fill_read_pipeline(state: &mut LocalReadState) -> Result<(), StorageRoleFailure> {
+    while state.inflight.len() < state.read_concurrency && state.next_issue < state.end {
+        if state.cancel.is_cancelled() {
+            return Err(failure(
+                &state.path,
+                FailureClass::Cancelled,
+                Transience::Transient,
+            ));
+        }
+        let requested = (state.end - state.next_issue).min(state.maximum_chunk_bytes as u64);
+        let granted = if let Some(qos) = &state.source_qos {
+            qos.admit_read(requested, &state.cancel)
+                .await
+                .map_err(|_| failure(&state.path, FailureClass::Cancelled, Transience::Transient))?
+        } else {
+            requested
+        };
+        if granted == 0 {
+            return Err(failure(
+                &state.path,
+                FailureClass::Internal,
+                Transience::Unknown,
+            ));
+        }
+        let start = state.next_issue;
+        let end = start.checked_add(granted).ok_or_else(|| {
+            failure(
+                &state.path,
+                FailureClass::InvalidInput,
+                Transience::Permanent,
+            )
+        })?;
+        let file = Arc::clone(&state.file);
+        let cancel = state.cancel.clone();
+        #[cfg(test)]
+        let probe = Arc::clone(&state.probe);
+        state.inflight.push_back(tokio::spawn(async move {
+            #[cfg(test)]
+            probe.before_read(start).await;
+            let read = tokio::task::spawn_blocking(move || read_file_range(&file, start..end));
+            let result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                joined = read => joined
+                    .map_err(io::Error::other)
+                    .and_then(std::convert::identity),
+            };
+            #[cfg(test)]
+            probe.after_read(start);
+            (start, granted, result)
+        }));
+        state.next_issue = end;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+impl ReadProbe {
+    async fn before_read(&self, offset: u64) {
+        use std::sync::atomic::Ordering;
+
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(active, Ordering::SeqCst);
+        let gate = self
+            .gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&offset)
+            .cloned();
+        if let Some(gate) = gate {
+            gate.started.notify_one();
+            gate.release.notified().await;
+        }
+        let common = *self
+            .delay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(delay) = common {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    fn after_read(&self, offset: u64) {
+        use std::sync::atomic::Ordering;
+
+        self.completion_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(offset);
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn checked_relative(path: &StoragePath) -> Result<PathBuf, StorageRoleFailure> {
@@ -286,6 +470,9 @@ fn role_to_io(error: StorageRoleFailure) -> io::Error {
 }
 
 fn io_failure(path: &StoragePath, error: &io::Error) -> StorageRoleFailure {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        return failure(path, FailureClass::Corruption, Transience::Unknown);
+    }
     let (class, transience) = classify_io(error.kind());
     failure(path, class, transience)
 }

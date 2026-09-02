@@ -8,8 +8,8 @@ mod native;
 mod roles;
 
 pub(crate) use native::{
-    NativeAffinity, NativeEndpoint, NativePair, NativeSourceBinding, NativeStageEvidence,
-    NativeStageFailure,
+    NativeAffinity, NativeEndpoint, NativePair, NativeRecoveryMode, NativeSourceBinding,
+    NativeStageEvidence, NativeStageFailure,
 };
 
 pub use crate::runtime::qos::{

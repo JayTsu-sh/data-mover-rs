@@ -8,7 +8,9 @@ use crate::model::{
     AclEncoding, MappedOwnership, MetadataObservation, MetadataObservations, OwnershipMode,
     StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata,
 };
-use crate::storage::{Metadata, MetadataMutation, StorageRoleFailure};
+use crate::storage::{
+    Metadata, MetadataMutation, PreparedStage, StagedDestination, StorageRoleFailure,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MetadataFamily {
@@ -249,6 +251,11 @@ impl MetadataPlan {
         &self.losses
     }
 
+    #[must_use]
+    pub fn has_mutations(&self) -> bool {
+        !self.mutations.is_empty()
+    }
+
     /// Applies the immutable plan in family order and stops at the first failure.
     ///
     /// # Errors
@@ -257,6 +264,25 @@ impl MetadataPlan {
         &self,
         target: &dyn Metadata,
         path: &StoragePath,
+        cancel: CancellationToken,
+    ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
+        self.apply_to(ApplicationTarget::Published { target, path }, cancel)
+            .await
+    }
+
+    pub(crate) async fn apply_to_stage(
+        &self,
+        target: &dyn StagedDestination,
+        stage: &PreparedStage,
+        cancel: CancellationToken,
+    ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
+        self.apply_to(ApplicationTarget::Stage { target, stage }, cancel)
+            .await
+    }
+
+    async fn apply_to(
+        &self,
+        target: ApplicationTarget<'_>,
         cancel: CancellationToken,
     ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
         let mut outcomes = self
@@ -280,7 +306,7 @@ impl MetadataPlan {
                     report: MetadataApplicationReport { outcomes },
                 });
             }
-            if let Err(error) = target.apply(path, mutation.clone(), cancel.clone()).await {
+            if let Err(error) = target.apply(mutation.clone(), cancel.clone()).await {
                 set_outcome(&mut outcomes, *family, ApplicationOutcome::Failed);
                 return Err(MetadataApplicationFailure {
                     family: *family,
@@ -291,6 +317,30 @@ impl MetadataPlan {
             set_outcome(&mut outcomes, *family, ApplicationOutcome::Applied);
         }
         Ok(MetadataApplicationReport { outcomes })
+    }
+}
+
+enum ApplicationTarget<'a> {
+    Published {
+        target: &'a dyn Metadata,
+        path: &'a StoragePath,
+    },
+    Stage {
+        target: &'a dyn StagedDestination,
+        stage: &'a PreparedStage,
+    },
+}
+
+impl ApplicationTarget<'_> {
+    async fn apply(
+        &self,
+        mutation: MetadataMutation,
+        cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        match self {
+            Self::Published { target, path } => target.apply(path, mutation, cancel).await,
+            Self::Stage { target, stage } => target.apply_metadata(stage, mutation, cancel).await,
+        }
     }
 }
 

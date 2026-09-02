@@ -50,10 +50,12 @@ where
         protocol.clone(),
         identity.clone(),
     ));
-    let staged = Arc::new(staged::S3StagedDestination::new(
-        protocol.clone(),
-        identity.clone(),
-    ));
+    let metadata: Arc<dyn crate::storage::Metadata> =
+        Arc::new(metadata::S3Metadata::new(protocol.clone(), tag_support));
+    let staged = Arc::new(
+        staged::S3StagedDestination::new(protocol.clone(), identity.clone())
+            .with_metadata(Arc::clone(&metadata)),
+    );
     let native = native_context.map(|context| {
         Arc::new(native::S3NativeEndpoint::new(
             protocol.clone(),
@@ -62,7 +64,7 @@ where
             context,
         )) as Arc<dyn crate::storage::NativeEndpoint>
     });
-    let metadata = Arc::new(metadata::S3Metadata::new(protocol, tag_support));
+    drop(protocol);
     Storage::connected(
         identity,
         BackendCapabilities::new(
@@ -395,6 +397,8 @@ pub(crate) mod tests {
                 path: StoragePath::new("source")?,
                 range: Some(2..8),
                 expected_source: Some(descriptor.clone().source_identity),
+                maximum_chunk_bytes: 1024 * 1024,
+                read_inflight: 4,
                 cancel: CancellationToken::new(),
                 source_qos: None,
             })
@@ -573,6 +577,8 @@ pub(crate) mod tests {
                 path: StoragePath::new("source")?,
                 range: None,
                 expected_source: None,
+                maximum_chunk_bytes: 1024 * 1024,
+                read_inflight: 4,
                 cancel,
                 source_qos: None,
             })

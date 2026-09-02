@@ -1,13 +1,12 @@
 use super::{
-    Arc, FinalDestination, NativePair, PrepareRequest, ReadSource, SequentialRanges,
-    SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination, TransferFailure,
-    TransferPhase, TransferPlan, TransferRequest, TransferSide, Transferred, read_exact_range,
+    Arc, NativePair, ReadSource, RecoveryContext, SequentialRanges, SourceDescriptor,
+    SourceQosBudget, SourceQosStats, StagedDestination, TransferFailure, TransferPhase,
+    TransferPlan, TransferRequest, TransferSide, Transferred, read_exact_range,
+    register_prepared_stage, select_stage,
 };
 
 pub(super) fn eligible_native_pair(request: &TransferRequest) -> Option<NativePair> {
-    if request.payload_shaping == super::super::PayloadShapingPolicy::RequireClientShaped
-        || request.recovery_identity.is_some()
-    {
+    if request.payload_shaping == super::super::PayloadShapingPolicy::RequireClientShaped {
         None
     } else {
         request.source.native_pair(&request.destination)
@@ -22,6 +21,7 @@ pub(super) struct NativeTransferInput {
     pub recovery_binding: [u8; 32],
     pub source_qos: Option<SourceQosBudget>,
     pub plan: TransferPlan,
+    pub recovery: Option<RecoveryContext>,
 }
 
 pub(super) async fn transfer_native(
@@ -43,14 +43,23 @@ pub(super) async fn transfer_native(
         input.source_qos.clone(),
     )
     .await?;
-    let prepare = PrepareRequest {
-        final_destination: FinalDestination::new(request.final_path.clone()),
-        source: input.descriptor.clone(),
-        recovery_binding: input.recovery_binding,
-    };
+    let stage = select_stage(
+        request,
+        &input.destination,
+        &input.descriptor,
+        input.recovery_binding,
+        input.plan.recovery_enabled,
+        input.recovery.as_ref(),
+    )
+    .await?;
+    if let Err(error) =
+        register_prepared_stage(request, &input.destination, &stage, input.recovery.as_ref()).await
+    {
+        return Err(error.with_stage(input.destination, stage));
+    }
     let native = match input
         .pair
-        .copy_to_stage(binding, prepare, request.cancel.clone())
+        .copy_into_stage(binding, &stage, request.cancel.clone())
         .await
     {
         Ok(native) => native,
@@ -67,18 +76,19 @@ pub(super) async fn transfer_native(
                     ..SourceQosStats::default()
                 },
             };
-            return Err(native_failure(failure, &input.destination, stats));
+            return Err(native_failure(failure, &input.destination, stage, stats));
         }
     };
     if let Some(qos) = &input.source_qos {
         qos.record_native(native.native_bytes, native.native_requests);
     }
-    finish_native(request, input, native, digest).await
+    finish_native(request, input, stage, native, digest).await
 }
 
 fn native_failure(
     failure: crate::storage::NativeStageFailure,
     destination: &Arc<dyn StagedDestination>,
+    stage: crate::storage::PreparedStage,
     stats: SourceQosStats,
 ) -> TransferFailure {
     let transfer = TransferFailure::role(
@@ -87,15 +97,13 @@ fn native_failure(
         failure.error,
     )
     .with_source_qos(stats);
-    match failure.stage {
-        Some(stage) => transfer.with_stage(Arc::clone(destination), stage),
-        None => transfer,
-    }
+    transfer.with_stage(Arc::clone(destination), stage)
 }
 
 async fn finish_native(
     request: &TransferRequest,
     input: NativeTransferInput,
+    stage: crate::storage::PreparedStage,
     native: crate::storage::NativeStageEvidence,
     digest: [u8; 32],
 ) -> Result<Transferred, TransferFailure> {
@@ -105,16 +113,22 @@ async fn finish_native(
         native_requests: native.native_requests,
         ..SourceQosStats::default()
     };
-    let checkpoint = match input.destination.observe_checkpoint(&native.stage).await {
-        Ok(checkpoint) => checkpoint,
-        Err(error) => {
-            return Err(TransferFailure::role(
-                TransferPhase::Checkpoint,
-                TransferSide::Destination,
-                error,
-            )
-            .with_stage(input.destination, native.stage)
-            .with_source_qos(native_stats));
+    let checkpoint = if input.plan.recovery_enabled {
+        match input.destination.observe_checkpoint(&stage).await {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                return Err(TransferFailure::role(
+                    TransferPhase::Checkpoint,
+                    TransferSide::Destination,
+                    error,
+                )
+                .with_stage(input.destination, stage)
+                .with_source_qos(native_stats));
+            }
+        }
+    } else {
+        crate::storage::CheckpointObservation {
+            durable_prefix: native.write.persisted_bytes,
         }
     };
     if checkpoint.durable_prefix != input.plan.source_size {
@@ -122,13 +136,13 @@ async fn finish_native(
             TransferPhase::Checkpoint,
             "native durable bytes differ from source size",
         )
-        .with_stage(input.destination, native.stage)
+        .with_stage(input.destination, stage)
         .with_source_qos(native_stats));
     }
     Ok(Transferred {
         identity: request.identity.clone(),
         destination: input.destination,
-        stage: native.stage,
+        stage,
         write: native.write,
         checkpoint,
         source: input.descriptor,

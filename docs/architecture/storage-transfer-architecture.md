@@ -164,13 +164,16 @@ trait StagedDestination: Send + Sync {
     async fn write(&self, stage: &PreparedStage, input: ByteStream) -> Result<WriteEvidence, DestinationFailure>;
     async fn observe_checkpoint(&self, stage: &PreparedStage) -> Result<CheckpointObservation, DestinationFailure>;
     async fn verify(&self, stage: &PreparedStage, request: VerifyRequest) -> Result<VerificationEvidence, DestinationFailure>;
+    async fn apply_metadata(&self, stage: &PreparedStage, mutation: MetadataMutation, cancel: CancellationToken) -> Result<(), DestinationFailure>;
     async fn publish(&self, stage: &PreparedStage, request: PublishRequest) -> Result<PublicationEvidence, DestinationFailure>;
     async fn discard(&self, stage: PreparedStage) -> Result<(), DestinationFailure>;
 }
 ```
 
 The adapter decides ordered versus out-of-order writes, persistence barriers, staged naming,
-and publication mechanics. `FinalDestination` is never a partial-write target.
+metadata mutation of unpublished state, and publication mechanics. Its private stage path, file
+handle, or object key never leaves the backend. `FinalDestination` is never a partial-write or
+metadata-mutation target.
 
 For NFS, the common adapter consumes the dialect and negotiated `rsize`/`wsize` facts from
 `nfs-rs`. Mount/session concurrency, protocol request scheduling, and protocol-level retry remain
@@ -200,11 +203,14 @@ conditional S3-to-S3 `CopyObject`/multipart-copy adapter may implement it. Avail
 per connected pair, not per `BackendKind::S3`. All other backends use streaming and provide
 no empty native adapter. Standard S3 pairs compare an opaque affinity derived from the connected
 endpoint and compatibility profile; buckets and prefixes remain protocol-owned source/destination
-facts. Eligible copies bind the observed ETag/version, copy into an unpublished backend stage,
-then use the ordinary BLAKE3 verification and publication lifecycle. Strict client-shaped payload,
-supplied recovery state, a different endpoint, or a non-standard S3 profile selects streaming
-before remote mutation. A native operation failure retains stage cleanup authority and is never
-silently retried through streaming.
+facts. Eligible copies bind the observed ETag/version, prepare an unpublished stage through the
+ordinary destination role, and only then let the native endpoint fill that stage. Checkpointed
+native copy registers its opaque recovery identity and waits for the caller's durable
+acknowledgement before the first native payload request. Atomic `CopyObject` is ephemeral and needs
+no registrar; multipart copy is checkpointed. Both use the ordinary BLAKE3 verification and
+publication lifecycle. Strict client-shaped payload, supplied recovery state, a different endpoint,
+or a non-standard S3 profile selects streaming before remote mutation. A native operation failure
+retains stage cleanup authority and is never silently retried through streaming.
 
 ## 6. Observation model and traversal
 
@@ -300,8 +306,9 @@ The immutable metadata plan is compiled before target side effects.
 `compile_metadata_plan` consumes only the captured `MetadataObservations`, an explicit
 `MetadataTarget` capability description, family policies, and an optional mapper. It never
 re-reads source storage and contains no backend-name or protocol-pair switch. The resulting
-`MetadataPlan` holds backend-neutral `MetadataMutation` values; applying it invokes the target
-`Metadata` role once per planned family and stops on cancellation or the first storage failure.
+`MetadataPlan` holds backend-neutral `MetadataMutation` values; transfer applies it through the
+stage-owning destination once per planned family and stops on cancellation or the first storage
+failure. Standalone metadata operations use the ordinary `Metadata` role with the same mutations.
 The partial `MetadataApplicationReport` therefore remains distinct from the compile-time
 `LossReport`.
 
@@ -330,7 +337,7 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
 ```
 
 `TransferRequest` contains neutral source/destination descriptors, `TransferIdentity`,
-overwrite/publication requirements, recovery policy, verification policy, metadata policy,
+overwrite/publication requirements, resumability, verification policy, metadata policy,
 cancellation, inflight bounds, and optional shared source QoS.
 
 `TransferIdentity` is caller-supplied and stable across attempts of one logical transfer; it
@@ -347,20 +354,35 @@ streaming and staged-destination commands without exposing protocol handles. Hig
 expert flows invoke the same state machine and backend role implementations. Correctness
 policy becomes immutable after preflight; runtime controls cannot change guarantees.
 
+The expert source session revalidates the advertised `ObservedEntry`, negotiates its maximum
+chunk, reads the source sequentially, hashes the complete logical content, and emits only bytes
+after the destination-reported durable prefix. The expert destination session independently
+prepares or recovers backend-owned state and obtains durable `RecoveryRegistrar` acknowledgement
+before returning its write offset. A caller-owned bounded transport carries only byte chunks and
+neutral source evidence between the two halves. The destination then observes its checkpoint,
+verifies complete staged content, applies its precompiled metadata plan to that stage, and
+publishes through the same backend roles and failure phases as the high-level operation. A metadata
+failure is destination-attributed, stops at the first failed family, leaves `FinalDestination`
+unchanged, and retains stage cleanup/recovery authority. `VerifyOrSkip` is rejected before target
+mutation when a plan contains mutations, because retaining an existing content-equivalent object
+would discard the staged metadata. Prepared destination sessions have explicit discard ownership
+for remote cancellation before payload.
+
 ## 9. Transfer state machine
 
 ```text
 Created -> Preflighted -> Planned
-        -> Prepared(Fresh | Resumable | Restarted) -> Transferring -> Verified -> Published
-        -> CommitReady                           -> Verified -> Published
+        -> Prepared(Fresh | Resumable | Restarted) -> RecoveryRegistered -> Transferring -> Verified -> MetadataApplied -> Published
+        -> CommitReady                           -> Verified -> MetadataApplied -> Published
         -> AlreadyCommitted
         -> Completed | CommittedWithWarnings
 ```
 
 `Cancelled` and `Failed` are structured terminal states attributed to their stage;
 `FinalConflict` is a typed planning/preparation failure. Every transition emits neutral
-facts but progress is not checkpoint truth. Only `CheckpointAdvanced` may carry a new opaque
-recovery identity.
+facts but progress is not checkpoint truth. `Prepared` produces the current opaque recovery
+identity; `RecoveryRegistered` means the caller durably acknowledged it. Backend checkpoint
+advancement remains private and never asks the caller to persist ranges, offsets, or parts.
 
 ### Preflight
 
@@ -377,7 +399,10 @@ progress only. A staged destination remains invisible as `FinalDestination`.
 The Local streaming implementation lends both roles before source description or destination
 mutation, selects the backend-neutral `Streaming` data path, and admits sequential ranges through
 the shared chunk/byte/operation inflight runtime. Local range streams independently cap each
-emitted chunk at 1 MiB. Completion at this stage requires a re-observed durable prefix equal to
+emitted chunk at 2 MiB; the caller, inflight byte budget, QoS, or remaining range may negotiate a
+smaller read. The Local staged destination independently submits input pieces up to 5 MiB as one
+positional write and zero-copy splits larger input pieces into writes no larger than 5 MiB.
+Completion at this stage requires a re-observed durable prefix equal to
 the described source size; the staged file remains unpublished for verification and publication.
 
 ### Verification
@@ -415,19 +440,43 @@ Cancellation stops at a safe point and normally preserves a valid checkpoint. A 
 policy deletes only staged state whose ownership is proven. Failures carry lifecycle stage,
 source/destination attribution, retry safety, recoverability, and failure scope.
 
-Required metadata that can target staged content is applied before publication. Metadata
-that exists only on `FinalDestination` follows publication. A required post-publication
-failure returns committed data with `final_destination_changed = true`; best-effort failure
-returns `CommittedWithWarnings`. Transfer never deletes its source and returns only a neutral
+Required metadata is applied to backend-owned staged content before publication. A required
+metadata failure leaves the final destination unchanged and returns the partial family report;
+best-effort/omit behavior is already fixed in the compiled plan. Transfer never exposes a
+post-publication metadata workaround, never deletes its source, and returns only a neutral
 source-deletion-safety fact for terrasync policy.
 
 ## 10. Recovery contract
 
-`RecoveryPolicy` is one of:
+`Resumability` is either `Enabled` (the default) or `Disabled`. It expresses only whether
+the caller wants reusable work retained; checkpoint mechanisms remain backend-owned. The
+request combinations are strict:
 
-- `ResumeOrRestart` (default)
-- `RequireResume`
-- `Restart`
+- `Disabled` without a `RecoveryIdentity` uses an ephemeral stage and never checkpoints;
+- `Disabled` with a `RecoveryIdentity` is rejected before destination mutation;
+- `Disabled` with a recovery provider is rejected before destination mutation;
+- `Enabled` without a `RecoveryIdentity` starts a new recoverable transfer;
+- `Enabled` with a `RecoveryIdentity` must recover that state or fail without silently
+  restarting the upload.
+
+A recoverable transfer also requires a caller-owned `RecoveryProvider`. Data-mover opens that
+provider only after planning proves the transfer can retain a reusable checkpoint; single streaming
+chunk and atomic native transfers therefore perform no recovery-store interaction. The provider
+returns the optional persisted identity, the stable per-attempt claim, and a `RecoveryRegistrar`.
+Fresh and recovered stages snapshot their current opaque identity and wait for
+`register(identity)` to return `Ok(())` before any destination payload write. `Ok(())` is a durable
+acknowledgement: the caller must be able to return that identity and claim after a worker or process
+restart. Registration is an idempotent, at-least-once upsert scoped to the logical
+transfer/attempt; stale-attempt rejection is caller-owned. A provider or registration failure
+retains an unwritten unpublished stage. Cancellation does not interrupt an in-progress registration
+commit; it is observed immediately after acknowledgement and before payload.
+
+A streaming transfer that fits within one negotiated source-read chunk uses an ephemeral stage
+even when resumability is enabled, because it has no useful intermediate checkpoint. Atomic native
+`CopyObject` is ephemeral for the same reason. Such transfers never export a recovery identity.
+Restart upload is an explicit lifecycle action: the application asks
+data-mover to discard the owned failed stage, removes the persisted identity, and starts a new
+attempt without an identity. It is not another resumability mode.
 
 A checkpoint is valid only when the backend re-observes the staged state, binds it to the
 same transfer/source/destination, independently observes reusable bytes or parts, and meets
@@ -436,11 +485,15 @@ opaque, and validated before any destructive action.
 
 The Local identity binds the transfer identity, source identity/path/size, destination backend
 identity, final destination, stage token, and checkpoint record. Its checkpoint records only a contiguous prefix after the
-staged file has crossed a persistence barrier. Resume rereads the complete source sequentially
-for BLAKE3 but emits writes only after the re-observed durable prefix. `RequireResume` refuses a
-missing or invalid identity; `ResumeOrRestart` falls back to a distinct stage without deleting
-unknown state; `Restart` discards an old stage only after full ownership validation. Exporting a
-recovery identity consumes the in-process failed-stage authority. Local holds a persistent
+staged file has crossed a persistence barrier. Recoverable Local writes pause input after each
+backend-owned 256 MiB interval, drain inflight positional writes, verify the completed range is
+contiguous, synchronize file data and length, and atomically replace the checkpoint record before
+issuing later offsets. Resume rereads the complete source sequentially
+for BLAKE3 but emits writes only after the re-observed durable prefix. A supplied identity has
+strict recovery semantics: a missing, invalid, conflicting, or mismatched backend state fails
+without deleting unknown state or restarting implicitly. Observing a recovery identity is
+non-mutating. Only explicit failure handoff transfers recovery authority out of the current
+process; NFS releases its adapter-local claim during that handoff. Local holds a persistent
 per-stage claim file under an exclusive OS file lock. NFS recovery additionally requires a
 caller-persisted, per-attempt claim token: the adapter derives a deterministic claimed path from
 the opaque identity and token, then atomically renames the old stage. The same token makes a
@@ -460,8 +513,8 @@ protocol error translation. Each transfer attempt uses an isolated, deterministi
 creation same-directory partial, bounded chunks, BLAKE3 readback, and rename publication.
 An opaque recovery identity binds that partial to the source, destination, and expected
 size. Recovery atomically renames it to a claim-token-derived path, re-observes the HDFS
-continuous durable prefix, and appends only the remaining tail. Invalid identities may
-fall back to a distinct restart stage without deleting unknown state. HDFS
+continuous durable prefix, and appends only the remaining tail. Invalid identities fail without
+deleting unknown state or starting a replacement stage. HDFS
 string owner/group, replication, block size, and mode are persisted as backend facts;
 the current neutral ownership observation cannot yet expose string principals. ACL
 and xattr are reported unsupported until public dependency APIs are bound, rather

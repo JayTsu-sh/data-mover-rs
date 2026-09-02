@@ -36,7 +36,8 @@ class Nfs40ContractTest(unittest.TestCase):
     def test_contract_exercises_real_cancellation_and_restart_upload(self):
         contract = (ROOT / "examples/nfs3_contract.rs").read_text()
         self.assertIn("validate_cancel_and_restart", contract)
-        self.assertIn("RecoveryPolicy::Restart", contract)
+        self.assertIn("failure.discard_stage().await?", contract)
+        self.assertIn("Resumability::Enabled, None", contract)
         self.assertIn("has_recoverable_stage", contract)
         self.assertIn("cancel.cancel()", contract)
 

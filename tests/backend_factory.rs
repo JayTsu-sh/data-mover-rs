@@ -32,12 +32,14 @@ async fn explicit_factory_handles_source_and_destination_without_pair_dispatch()
     let source = connect_backend(BackendConfig::Local(LocalBackendConfig {
         root: source_root.path().to_path_buf(),
         identity: BackendIdentity::new(BackendKind::Local, "factory-source")?,
+        read_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
         write_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
     }))
     .await?;
     let destination = connect_backend(BackendConfig::Local(LocalBackendConfig {
         root: destination_root.path().to_path_buf(),
         identity: BackendIdentity::new(BackendKind::Local, "factory-destination")?,
+        read_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
         write_concurrency: NonZeroUsize::new(2).ok_or("non-zero")?,
     }))
     .await?;

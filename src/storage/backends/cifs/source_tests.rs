@@ -60,6 +60,7 @@ impl CifsSourceProtocol for MemoryCifs {
             kind: EntryKind::File,
             size: self.payload.len() as u64,
             identity: self.described_identity.clone(),
+            maximum_read_chunk: 4,
         })
     }
 
@@ -77,6 +78,7 @@ impl CifsSourceProtocol for MemoryCifs {
                 kind: EntryKind::File,
                 size: self.payload.len() as u64,
                 identity: self.opened_identity.clone(),
+                maximum_read_chunk: 4,
             },
         ))
     }
@@ -96,6 +98,7 @@ impl CifsNamespaceProtocol for MemoryCifs {
                     kind: EntryKind::File,
                     size: 10,
                     identity: Bytes::from_static(b"child-file"),
+                    maximum_read_chunk: 4,
                 },
             ),
             (
@@ -105,6 +108,7 @@ impl CifsNamespaceProtocol for MemoryCifs {
                     kind: EntryKind::Directory,
                     size: 0,
                     identity: Bytes::from_static(b"child-directory"),
+                    maximum_read_chunk: u32::MAX,
                 },
             ),
         ])
@@ -132,6 +136,8 @@ async fn source_stream_honours_negotiated_chunks_without_short_reads()
             path,
             range: None,
             expected_source: Some(descriptor.source_identity),
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 4,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -179,6 +185,8 @@ async fn active_source_cancellation_stops_before_another_read_and_closes()
             path: StoragePath::new("file.bin")?,
             range: None,
             expected_source: None,
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 4,
             cancel: cancel.clone(),
             source_qos: None,
         })
@@ -218,6 +226,8 @@ async fn opened_identity_change_fails_before_read_and_closes_resource()
             path,
             range: None,
             expected_source: Some(descriptor.source_identity),
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 4,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -260,6 +270,8 @@ async fn source_qos_limits_each_real_read_and_accounts_only_source_io()
             path,
             range: None,
             expected_source: Some(descriptor.source_identity),
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 4,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: Some(budget.clone()),
         })
@@ -344,6 +356,8 @@ async fn real_share_exercises_domain_roles_without_wire_api()
                 path: file.path.clone(),
                 range: Some(0..end),
                 expected_source: Some(described.source_identity),
+                maximum_chunk_bytes: 1024 * 1024,
+                read_inflight: 4,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 source_qos: None,
             })
@@ -578,6 +592,8 @@ async fn assert_real_payload(
             path: path.clone(),
             range: None,
             expected_source: Some(descriptor.source_identity),
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 4,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -642,6 +658,8 @@ async fn assert_real_failure_isolation(
             path: fixture.final_path.clone(),
             range: None,
             expected_source: None,
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 4,
             cancel,
             source_qos: None,
         })

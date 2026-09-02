@@ -1,4 +1,4 @@
-//! Streaming transfer requests, recovery policy, state, and outcomes.
+//! Streaming transfer requests, resumability, state, and outcomes.
 
 #[allow(dead_code)]
 mod engine;
@@ -7,9 +7,14 @@ mod model;
 pub use crate::storage::ExistingDestinationPolicy;
 pub use crate::storage::RecoveryIdentity;
 pub use crate::storage::{SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError};
-pub use engine::{TransferFailure, TransferOutcome, transfer};
+pub use engine::{
+    ExpertDestinationRequest, ExpertDestinationSession, ExpertDestinationTransferred,
+    ExpertSourceEvidence, ExpertSourceOffer, ExpertSourcePayload, ExpertSourceRequest,
+    ExpertSourceSession, TransferFailure, TransferOutcome, TransferPhase, TransferSide, transfer,
+};
 pub use model::{
-    InflightLimits, PayloadShapingPolicy, RecoveryPolicy, TransferIdentity, TransferRequest,
+    InflightLimits, PayloadShapingPolicy, RecoveryContext, RecoveryProvider, RecoveryRegistrar,
+    RecoveryRegistrationFailure, Resumability, TransferIdentity, TransferRequest,
     TransferValueError,
 };
 

@@ -9,10 +9,10 @@ use tokio_util::sync::CancellationToken;
 use super::protocol::{HdfsProtocol, cancelled, entry_failure};
 use crate::model::{BackendIdentity, EntryKind, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{
-    ByteStream, CheckpointObservation, ExistingDestinationPolicy, FinalDestination, PrepareRequest,
-    PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
-    RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure, VerificationEvidence,
-    VerifyRequest, WriteEvidence,
+    ByteStream, CheckpointObservation, ExistingDestinationPolicy, FinalDestination, Metadata,
+    MetadataMutation, PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence,
+    PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity, StagedDestination,
+    StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 const STAGE_TOKEN_MAGIC: &[u8] = b"hdfs-stage-v1\0";
@@ -200,6 +200,7 @@ fn array<const N: usize>(bytes: &[u8], path: &StoragePath) -> Result<[u8; N], St
 pub(super) struct HdfsStagedDestination {
     protocol: Arc<dyn HdfsProtocol>,
     identity: BackendIdentity,
+    metadata: Option<Arc<dyn Metadata>>,
 }
 
 impl HdfsStagedDestination {
@@ -207,7 +208,16 @@ impl HdfsStagedDestination {
         protocol: Arc<P>,
         identity: BackendIdentity,
     ) -> Self {
-        Self { protocol, identity }
+        Self {
+            protocol,
+            identity,
+            metadata: None,
+        }
+    }
+
+    pub(super) fn with_metadata(mut self, metadata: Arc<dyn Metadata>) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 
     fn part(&self, stage: &PreparedStage) -> Result<StoragePath, StorageRoleFailure> {
@@ -331,6 +341,23 @@ impl StagedDestination for HdfsStagedDestination {
             verified_bytes: request.expected_size,
             blake3: digest,
         })
+    }
+
+    async fn apply_metadata(
+        &self,
+        stage: &PreparedStage,
+        mutation: MetadataMutation,
+        cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        let path = self.part(stage)?;
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            failure(
+                stage.final_destination.path(),
+                Operation::Metadata,
+                FailureClass::Unsupported,
+            )
+        })?;
+        metadata.apply(&path, mutation, cancel).await
     }
 
     async fn publish(

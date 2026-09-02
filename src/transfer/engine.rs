@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
 
-use super::{RecoveryPolicy, TransferRequest};
+use super::{RecoveryContext, RecoveryRegistrationFailure, Resumability, TransferRequest};
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, Operation, SourceIdentity, StoragePath,
     Transience,
@@ -19,7 +19,13 @@ use crate::storage::{
     StorageRoleFailure, VerifyRequest, WriteEvidence,
 };
 
+mod expert;
 mod native;
+pub use expert::{
+    ExpertDestinationRequest, ExpertDestinationSession, ExpertDestinationTransferred,
+    ExpertSourceEvidence, ExpertSourceOffer, ExpertSourcePayload, ExpertSourceRequest,
+    ExpertSourceSession,
+};
 
 /// Lifecycle stage at which one transfer attempt stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,9 +33,11 @@ pub enum TransferPhase {
     Preflight,
     Describe,
     Prepare,
+    RecoveryRegistration,
     Transfer,
     Checkpoint,
     Verify,
+    Metadata,
     Publish,
 }
 
@@ -53,6 +61,7 @@ struct TransferPlan {
     data_path: TransferDataPath,
     source_size: u64,
     chunk_bytes: usize,
+    recovery_enabled: bool,
 }
 
 /// Structured failure from the unified transfer lifecycle.
@@ -62,6 +71,8 @@ pub struct TransferFailure {
     side: TransferSide,
     message: &'static str,
     role: Option<Box<StorageRoleFailure>>,
+    registration: Option<Box<RecoveryRegistrationFailure>>,
+    metadata: Option<Box<crate::metadata::MetadataApplicationFailure>>,
     failed_stage: Option<Box<FailedStage>>,
     committed_cleanup: Option<Box<FailedStage>>,
     final_destination_changed: bool,
@@ -86,6 +97,8 @@ impl TransferFailure {
             side,
             message: "storage role failed",
             role: Some(Box::new(role)),
+            registration: None,
+            metadata: None,
             failed_stage: None,
             committed_cleanup: None,
             final_destination_changed: false,
@@ -99,6 +112,8 @@ impl TransferFailure {
             side: TransferSide::Orchestration,
             message,
             role: None,
+            registration: None,
+            metadata: None,
             failed_stage: None,
             committed_cleanup: None,
             final_destination_changed: false,
@@ -112,6 +127,38 @@ impl TransferFailure {
             side,
             message,
             role: None,
+            registration: None,
+            metadata: None,
+            failed_stage: None,
+            committed_cleanup: None,
+            final_destination_changed: false,
+            source_qos: SourceQosStats::default(),
+        }
+    }
+
+    fn registration(error: RecoveryRegistrationFailure) -> Self {
+        Self {
+            phase: TransferPhase::RecoveryRegistration,
+            side: TransferSide::Orchestration,
+            message: "recovery identity registration failed",
+            role: None,
+            registration: Some(Box::new(error)),
+            metadata: None,
+            failed_stage: None,
+            committed_cleanup: None,
+            final_destination_changed: false,
+            source_qos: SourceQosStats::default(),
+        }
+    }
+
+    fn metadata(error: crate::metadata::MetadataApplicationFailure) -> Self {
+        Self {
+            phase: TransferPhase::Metadata,
+            side: TransferSide::Destination,
+            message: "staged metadata application failed",
+            role: None,
+            registration: None,
+            metadata: Some(Box::new(error)),
             failed_stage: None,
             committed_cleanup: None,
             final_destination_changed: false,
@@ -143,9 +190,17 @@ impl TransferFailure {
         self.side
     }
 
-    /// Whether the failed attempt retains unpublished staged state that may be discarded.
+    /// Whether the failed attempt retains unpublished state eligible for a later resume.
     #[must_use]
-    pub const fn has_recoverable_stage(&self) -> bool {
+    pub fn has_recoverable_stage(&self) -> bool {
+        self.failed_stage
+            .as_ref()
+            .is_some_and(|failed| failed.stage.recovery_enabled())
+    }
+
+    /// Whether the failed attempt retains unpublished state that may be explicitly discarded.
+    #[must_use]
+    pub const fn has_unpublished_stage(&self) -> bool {
         self.failed_stage.is_some()
     }
 
@@ -167,15 +222,21 @@ impl TransferFailure {
         self.source_qos
     }
 
+    /// Returns the fail-fast metadata application error and its partial family report.
+    #[must_use]
+    pub fn metadata_failure(&self) -> Option<&crate::metadata::MetadataApplicationFailure> {
+        self.metadata.as_deref()
+    }
+
     fn with_source_qos(mut self, source_qos: SourceQosStats) -> Self {
         self.source_qos = source_qos;
         self
     }
 
-    /// Consumes this failure and discards its recoverable unpublished stage.
+    /// Consumes this failure and discards its unpublished stage, whether recoverable or ephemeral.
     ///
     /// # Errors
-    /// Returns a storage-role failure if no recoverable stage exists or cleanup fails.
+    /// Returns a storage-role failure if no unpublished stage exists or cleanup fails.
     pub async fn discard_stage(mut self) -> Result<(), StorageRoleFailure> {
         let failed = self
             .failed_stage
@@ -206,11 +267,15 @@ impl TransferFailure {
     pub async fn into_recovery_identity(
         self,
     ) -> Result<crate::storage::RecoveryIdentity, (Self, StorageRoleFailure)> {
-        let Some(failed) = self.failed_stage.as_ref() else {
+        let Some(failed) = self
+            .failed_stage
+            .as_ref()
+            .filter(|failed| failed.stage.recovery_enabled())
+        else {
             let error = source_failure(&StoragePath::root(), FailureClass::InvalidInput);
             return Err((self, error));
         };
-        match failed.destination.recovery_identity(&failed.stage).await {
+        match failed.destination.handoff_recovery(&failed.stage).await {
             Ok(identity) => Ok(identity),
             Err(error) => Err((self, error)),
         }
@@ -232,6 +297,16 @@ impl std::error::Error for TransferFailure {
         self.role
             .as_ref()
             .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))
+            .or_else(|| {
+                self.registration
+                    .as_ref()
+                    .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))
+            })
+            .or_else(|| {
+                self.metadata
+                    .as_ref()
+                    .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))
+            })
     }
 }
 
@@ -258,6 +333,7 @@ pub struct TransferOutcome {
     pub transferred_bytes: u64,
     pub blake3: [u8; 32],
     pub source_qos: SourceQosStats,
+    pub metadata: Option<crate::metadata::MetadataApplicationReport>,
 }
 
 /// Transfers, verifies, and publishes one request.
@@ -361,6 +437,7 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
         transferred_bytes: expected_size,
         blake3,
         source_qos,
+        metadata: None,
     })
 }
 
@@ -409,6 +486,7 @@ async fn run_until_transferred_inner(
     request: TransferRequest,
     source_qos: Option<SourceQosBudget>,
 ) -> Result<Transferred, TransferFailure> {
+    validate_recovery_configuration(&request)?;
     let TransferRoles {
         source,
         destination,
@@ -417,14 +495,6 @@ async fn run_until_transferred_inner(
         return Err(TransferFailure::orchestration(
             TransferPhase::Preflight,
             "transfer was cancelled",
-        ));
-    }
-    if request.recovery_policy == RecoveryPolicy::RequireResume
-        && request.recovery_identity.is_none()
-    {
-        return Err(TransferFailure::orchestration(
-            TransferPhase::Preflight,
-            "resume was required but no recovery identity was supplied",
         ));
     }
     let descriptor = source
@@ -442,8 +512,7 @@ async fn run_until_transferred_inner(
             "transfer was cancelled before prepare",
         ));
     }
-    let native_pair = native::eligible_native_pair(&request);
-    let plan = plan_transfer(&descriptor, request.inflight, native_pair.is_some())?;
+    let (plan, native_pair, recovery) = plan_with_recovery(&request, &*source, &descriptor).await?;
     let recovery_binding = recovery_binding(&request, &descriptor);
     if let Some(pair) = native_pair {
         return native::transfer_native(
@@ -456,11 +525,25 @@ async fn run_until_transferred_inner(
                 recovery_binding,
                 source_qos,
                 plan,
+                recovery,
             },
         )
         .await;
     }
-    let stage = select_stage(&request, &destination, &descriptor, recovery_binding).await?;
+    let stage = select_stage(
+        &request,
+        &destination,
+        &descriptor,
+        recovery_binding,
+        plan.recovery_enabled,
+        recovery.as_ref(),
+    )
+    .await?;
+    let registration =
+        register_prepared_stage(&request, &destination, &stage, recovery.as_ref()).await;
+    if let Err(error) = registration {
+        return Err(error.with_stage(destination, stage));
+    }
     let identity = request.identity.clone();
     let result = transfer_stage(
         &request,
@@ -490,44 +573,149 @@ async fn run_until_transferred_inner(
     }
 }
 
+fn validate_recovery_configuration(request: &TransferRequest) -> Result<(), TransferFailure> {
+    if request.resumability == Resumability::Disabled && request.recovery_provider.is_some() {
+        return Err(TransferFailure::orchestration(
+            TransferPhase::Preflight,
+            "disabled resumability cannot accept a recovery provider",
+        ));
+    }
+    Ok(())
+}
+
+fn plan_request(
+    request: &TransferRequest,
+    source: &dyn ReadSource,
+    descriptor: &SourceDescriptor,
+) -> Result<(TransferPlan, Option<NativePair>), TransferFailure> {
+    let native_pair = native::eligible_native_pair(request);
+    let native_checkpointed = native_pair.as_ref().is_some_and(|pair| {
+        descriptor.size.is_some_and(|size| {
+            pair.recovery_mode(size) == crate::storage::NativeRecoveryMode::Checkpointed
+        })
+    });
+    let plan = plan_transfer(
+        descriptor,
+        request.inflight,
+        source.maximum_read_chunk_bytes(),
+        native_pair.is_some(),
+        native_checkpointed,
+        request.resumability == Resumability::Enabled,
+    )?;
+    if plan.recovery_enabled && request.recovery_provider.is_none() {
+        return Err(TransferFailure::orchestration(
+            TransferPhase::Preflight,
+            "recoverable transfer requires a recovery provider",
+        ));
+    }
+    Ok((plan, native_pair))
+}
+
+async fn plan_with_recovery(
+    request: &TransferRequest,
+    source: &dyn ReadSource,
+    descriptor: &SourceDescriptor,
+) -> Result<(TransferPlan, Option<NativePair>, Option<RecoveryContext>), TransferFailure> {
+    let (mut plan, mut native_pair) = plan_request(request, source, descriptor)?;
+    let recovery = open_recovery_context(request, plan.recovery_enabled).await?;
+    if recovery
+        .as_ref()
+        .is_some_and(|context| context.identity.is_some())
+        && native_pair.is_some()
+    {
+        native_pair = None;
+        plan = plan_transfer(
+            descriptor,
+            request.inflight,
+            source.maximum_read_chunk_bytes(),
+            false,
+            false,
+            request.resumability == Resumability::Enabled,
+        )?;
+    }
+    Ok((plan, native_pair, recovery))
+}
+
+async fn open_recovery_context(
+    request: &TransferRequest,
+    recovery_enabled: bool,
+) -> Result<Option<RecoveryContext>, TransferFailure> {
+    if !recovery_enabled {
+        return Ok(None);
+    }
+    let provider = request.recovery_provider.as_ref().ok_or_else(|| {
+        TransferFailure::orchestration(
+            TransferPhase::Preflight,
+            "recoverable transfer requires a recovery provider",
+        )
+    })?;
+    provider
+        .open()
+        .await
+        .map(Some)
+        .map_err(TransferFailure::registration)
+}
+
+async fn register_prepared_stage(
+    request: &TransferRequest,
+    destination: &Arc<dyn StagedDestination>,
+    stage: &PreparedStage,
+    recovery: Option<&RecoveryContext>,
+) -> Result<(), TransferFailure> {
+    let Some(recovery) = recovery else {
+        return Ok(());
+    };
+    let identity = destination
+        .recovery_identity(stage)
+        .await
+        .map_err(|error| {
+            TransferFailure::role(
+                TransferPhase::RecoveryRegistration,
+                TransferSide::Destination,
+                error,
+            )
+        })?;
+    recovery
+        .registrar
+        .register(identity)
+        .await
+        .map_err(TransferFailure::registration)?;
+    if request.cancel.is_cancelled() {
+        return Err(TransferFailure::orchestration(
+            TransferPhase::RecoveryRegistration,
+            "transfer was cancelled after recovery registration",
+        ));
+    }
+    Ok(())
+}
+
 async fn select_stage(
     request: &TransferRequest,
     destination: &Arc<dyn StagedDestination>,
     descriptor: &SourceDescriptor,
     recovery_binding: [u8; 32],
+    recovery_enabled: bool,
+    recovery: Option<&RecoveryContext>,
 ) -> Result<PreparedStage, TransferFailure> {
     let prepare = || PrepareRequest {
         final_destination: FinalDestination::new(request.final_path.clone()),
         source: descriptor.clone(),
         recovery_binding,
     };
-    if let Some(identity) = request.recovery_identity.clone() {
+    if let Some(identity) = recovery.and_then(|context| context.identity.clone()) {
+        debug_assert!(recovery_enabled);
         let recovered = destination
             .recover(crate::storage::RecoverRequest {
                 identity,
                 final_destination: FinalDestination::new(request.final_path.clone()),
                 source: descriptor.clone(),
                 recovery_binding,
-                claim_token: request.recovery_claim,
+                claim_token: recovery.map_or([0; 32], |context| context.claim),
             })
             .await;
-        match (request.recovery_policy, recovered) {
-            (RecoveryPolicy::ResumeOrRestart | RecoveryPolicy::RequireResume, Ok(stage)) => {
-                return Ok(stage);
-            }
-            (RecoveryPolicy::Restart, Ok(stage)) => {
-                destination.discard(stage).await.map_err(|error| {
-                    TransferFailure::role(TransferPhase::Prepare, TransferSide::Destination, error)
-                })?;
-            }
-            (RecoveryPolicy::ResumeOrRestart | RecoveryPolicy::Restart, Err(error))
-                if invalid_recovery_identity(&error) => {}
-            (
-                RecoveryPolicy::ResumeOrRestart
-                | RecoveryPolicy::RequireResume
-                | RecoveryPolicy::Restart,
-                Err(error),
-            ) => {
+        match recovered {
+            Ok(stage) => return Ok(stage),
+            Err(error) => {
                 return Err(TransferFailure::role(
                     TransferPhase::Prepare,
                     TransferSide::Destination,
@@ -536,34 +724,43 @@ async fn select_stage(
             }
         }
     }
-    destination.prepare(prepare()).await.map_err(|error| {
+    let prepared = if recovery_enabled {
+        destination.prepare(prepare()).await
+    } else {
+        destination.prepare_ephemeral(prepare()).await
+    };
+    prepared.map_err(|error| {
         TransferFailure::role(TransferPhase::Prepare, TransferSide::Destination, error)
     })
 }
 
-fn invalid_recovery_identity(error: &StorageRoleFailure) -> bool {
-    matches!(
-        error,
-        StorageRoleFailure::Entry(error)
-            if matches!(error.class(), FailureClass::Corruption | FailureClass::NotFound | FailureClass::Unsupported)
-                || (error.class() == FailureClass::Conflict
-                    && error.transience() == Transience::Permanent)
+fn recovery_binding(request: &TransferRequest, descriptor: &SourceDescriptor) -> [u8; 32] {
+    recovery_binding_for(
+        &request.identity,
+        &request.destination,
+        &request.final_path,
+        descriptor,
     )
 }
 
-fn recovery_binding(request: &TransferRequest, descriptor: &SourceDescriptor) -> [u8; 32] {
+pub(super) fn recovery_binding_for(
+    identity: &super::TransferIdentity,
+    destination: &crate::storage::Storage,
+    final_path: &StoragePath,
+    descriptor: &SourceDescriptor,
+) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"data-mover/recovery-binding/v1\0");
-    hasher.update(&(request.identity.as_bytes().len() as u64).to_le_bytes());
-    hasher.update(request.identity.as_bytes());
+    hasher.update(&(identity.as_bytes().len() as u64).to_le_bytes());
+    hasher.update(identity.as_bytes());
     hasher.update(descriptor.source_identity.identity_key().as_bytes());
     hasher.update(descriptor.path.as_str().as_bytes());
     hasher.update(&descriptor.size.unwrap_or(u64::MAX).to_le_bytes());
-    let destination_identity = request.destination.identity();
+    let destination_identity = destination.identity();
     hasher.update(destination_identity.kind().as_str().as_bytes());
     hasher.update(&(destination_identity.stable_id().len() as u64).to_le_bytes());
     hasher.update(destination_identity.stable_id().as_bytes());
-    hasher.update(request.final_path.as_str().as_bytes());
+    hasher.update(final_path.as_str().as_bytes());
     *hasher.finalize().as_bytes()
 }
 
@@ -595,7 +792,10 @@ fn lend_transfer_roles(request: &TransferRequest) -> Result<TransferRoles, Trans
 fn plan_transfer(
     descriptor: &SourceDescriptor,
     limits: super::InflightLimits,
+    backend_chunk_bytes: usize,
     native: bool,
+    native_checkpointed: bool,
+    recovery_allowed: bool,
 ) -> Result<TransferPlan, TransferFailure> {
     if descriptor.kind != EntryKind::File {
         return Err(TransferFailure::orchestration(
@@ -606,6 +806,9 @@ fn plan_transfer(
     let source_size = descriptor.size.ok_or_else(|| {
         TransferFailure::orchestration(TransferPhase::Describe, "source has no byte size")
     })?;
+    let chunk_bytes = limits
+        .negotiated_chunk_ceiling()
+        .min(backend_chunk_bytes.max(1));
     Ok(TransferPlan {
         data_path: if native {
             TransferDataPath::Native
@@ -613,7 +816,13 @@ fn plan_transfer(
             TransferDataPath::Streaming
         },
         source_size,
-        chunk_bytes: limits.bytes,
+        chunk_bytes,
+        recovery_enabled: recovery_allowed
+            && if native {
+                native_checkpointed
+            } else {
+                source_size > chunk_bytes as u64
+            },
     })
 }
 
@@ -645,7 +854,6 @@ async fn transfer_stage(
         path: descriptor.path.clone(),
         source_identity: descriptor.source_identity.clone(),
         cancel: request.cancel.clone(),
-        chunk_bytes: plan.chunk_bytes,
         runtime,
         failure: Arc::clone(&source_failure),
         size: plan.source_size,
@@ -655,12 +863,18 @@ async fn transfer_stage(
     let stream = ordered_stream(ordered, source_failure, descriptor.path.clone());
     let (write, source_blake3) =
         settle_transfer(destination.write(stage, stream).await, producer).await?;
-    let checkpoint = destination
-        .observe_checkpoint(stage)
-        .await
-        .map_err(|error| {
-            TransferFailure::role(TransferPhase::Checkpoint, TransferSide::Destination, error)
-        })?;
+    let checkpoint = if plan.recovery_enabled {
+        destination
+            .observe_checkpoint(stage)
+            .await
+            .map_err(|error| {
+                TransferFailure::role(TransferPhase::Checkpoint, TransferSide::Destination, error)
+            })?
+    } else {
+        CheckpointObservation {
+            durable_prefix: write.persisted_bytes,
+        }
+    };
     if checkpoint.durable_prefix != plan.source_size || write.persisted_bytes != plan.source_size {
         return Err(TransferFailure::orchestration(
             TransferPhase::Checkpoint,
@@ -722,7 +936,6 @@ struct ProducerRequest {
     path: StoragePath,
     source_identity: SourceIdentity,
     cancel: tokio_util::sync::CancellationToken,
-    chunk_bytes: usize,
     runtime: InflightRuntime,
     failure: Arc<Mutex<Option<StorageRoleFailure>>>,
     size: u64,
@@ -732,59 +945,91 @@ struct ProducerRequest {
 
 async fn produce(request: ProducerRequest) -> Result<[u8; 32], TransferFailure> {
     let mut hasher = blake3::Hasher::new();
-    let ranges = SequentialRanges::new(0, request.size, request.chunk_bytes).map_err(|_| {
-        TransferFailure::orchestration(TransferPhase::Preflight, "invalid source range")
-    })?;
-    for range in ranges {
-        let bytes = read_exact_range(
-            &*request.source,
-            &request.path,
-            &request.source_identity,
-            &request.cancel,
-            request.source_qos.clone(),
-            range,
-        )
+    let read_inflight = request.runtime.operation_budget();
+    let maximum_chunk_bytes = request.runtime.negotiated_chunk_ceiling();
+    let stream = request
+        .source
+        .read(ReadRequest {
+            path: request.path.clone(),
+            range: Some(0..request.size),
+            expected_source: Some(request.source_identity.clone()),
+            maximum_chunk_bytes,
+            read_inflight,
+            cancel: request.cancel.clone(),
+            source_qos: request.source_qos.clone(),
+        })
         .await;
-        match bytes {
-            Ok(bytes) => {
-                hasher.update(&bytes);
-                let range_end = range.offset + range.length as u64;
-                if range_end > request.write_start {
-                    let skip = usize::try_from(request.write_start.saturating_sub(range.offset))
-                        .map_err(|_| {
-                            TransferFailure::orchestration(
-                                TransferPhase::Transfer,
-                                "recovery prefix exceeds addressable range",
-                            )
-                        })?;
-                    let output = bytes.slice(skip..);
-                    let offset = range.offset + skip as u64;
-                    let admission = request
-                        .runtime
-                        .admit(offset, output.len())
-                        .await
-                        .map_err(|error| inflight_transfer_failure(&error, &request.path))?;
-                    admission
-                        .complete(output)
-                        .await
-                        .map_err(|error| inflight_transfer_failure(&error, &request.path))?;
-                }
-            }
-            Err(error) => {
-                *request
-                    .failure
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.clone());
-                let _ = request.runtime.fail(InflightFailure::Upstream).await;
-                return Err(TransferFailure::role(
+    let mut stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => return fail_source_producer(&request, error).await,
+    };
+    let mut offset = 0_u64;
+    while let Some(item) = stream.next().await {
+        let bytes = match item {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            Ok(_) => {
+                return Err(TransferFailure::orchestration(
                     TransferPhase::Transfer,
-                    TransferSide::Source,
-                    error,
+                    "source emitted an empty chunk",
                 ));
             }
+            Err(error) => return fail_source_producer(&request, error).await,
+        };
+        let next = offset.checked_add(bytes.len() as u64).ok_or_else(|| {
+            TransferFailure::orchestration(TransferPhase::Transfer, "source offset overflowed")
+        })?;
+        if next > request.size {
+            return Err(TransferFailure::orchestration(
+                TransferPhase::Transfer,
+                "source emitted more bytes than described",
+            ));
         }
+        hasher.update(&bytes);
+        if next > request.write_start {
+            let skip =
+                usize::try_from(request.write_start.saturating_sub(offset)).map_err(|_| {
+                    TransferFailure::orchestration(
+                        TransferPhase::Transfer,
+                        "recovery prefix exceeds addressable range",
+                    )
+                })?;
+            let output = bytes.slice(skip..);
+            let output_offset = offset + skip as u64;
+            let admission = request
+                .runtime
+                .admit(output_offset, output.len())
+                .await
+                .map_err(|error| inflight_transfer_failure(&error, &request.path))?;
+            admission
+                .complete(output)
+                .await
+                .map_err(|error| inflight_transfer_failure(&error, &request.path))?;
+        }
+        offset = next;
+    }
+    if offset != request.size {
+        return Err(TransferFailure::orchestration(
+            TransferPhase::Transfer,
+            "source emitted fewer bytes than described",
+        ));
     }
     Ok(*hasher.finalize().as_bytes())
+}
+
+async fn fail_source_producer(
+    request: &ProducerRequest,
+    error: StorageRoleFailure,
+) -> Result<[u8; 32], TransferFailure> {
+    *request
+        .failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.clone());
+    let _ = request.runtime.fail(InflightFailure::Upstream).await;
+    Err(TransferFailure::role(
+        TransferPhase::Transfer,
+        TransferSide::Source,
+        error,
+    ))
 }
 
 async fn read_exact_range(
@@ -800,6 +1045,8 @@ async fn read_exact_range(
             path: path.clone(),
             range: Some(range.offset..range.offset + range.length as u64),
             expected_source: Some(source_identity.clone()),
+            maximum_chunk_bytes: range.length,
+            read_inflight: 1,
             cancel: cancel.clone(),
             source_qos,
         })

@@ -10,6 +10,7 @@ use crate::storage::Storage;
 pub struct LocalBackendConfig {
     pub root: PathBuf,
     pub identity: BackendIdentity,
+    pub read_concurrency: NonZeroUsize,
     pub write_concurrency: NonZeroUsize,
 }
 
@@ -112,6 +113,7 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
         BackendConfig::Local(config) => crate::storage::backends::local::connect_transfer(
             config.root,
             config.identity,
+            config.read_concurrency,
             config.write_concurrency,
         )
         .map_err(|error| BackendConnectError::new(BackendKind::Local, error)),

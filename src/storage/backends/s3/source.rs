@@ -28,6 +28,10 @@ impl<P> S3ReadSource<P> {
 
 #[async_trait]
 impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        usize::try_from(self.chunk_size).unwrap_or(usize::MAX)
+    }
+
     async fn describe(
         &self,
         path: &crate::model::StoragePath,
@@ -60,6 +64,13 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure> {
         if request.cancel.is_cancelled() {
             return Err(cancelled(&request.path, Operation::Read));
+        }
+        if request.maximum_chunk_bytes == 0 || request.read_inflight == 0 {
+            return Err(entry(
+                &request.path,
+                Operation::Read,
+                "invalid streaming read limits",
+            ));
         }
         let facts = self
             .protocol
@@ -94,7 +105,7 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
         }
         let protocol = self.protocol.clone();
         let path = request.path;
-        let chunk_size = self.chunk_size;
+        let chunk_size = self.chunk_size.min(request.maximum_chunk_bytes as u64);
         let cancel = request.cancel;
         let qos = request.source_qos;
         let state = (

@@ -95,7 +95,10 @@ Every family executes the functional fixture set and asserts:
 - independent byte-stream validation stops at the first mismatch/read failure;
 - cancellation and injected source/destination/verification/publication failures leave no
   partial final destination and return truthful staged/recovery disposition;
-- valid checkpoint resumes; missing/invalid/unavailable checkpoint restarts;
+- valid checkpoint resumes; a supplied identity with missing, invalid, or unavailable checkpoint
+  fails without silently restarting, while an explicit restart begins without an identity;
+- recoverable fresh and recovered stages durably register their current opaque identity before
+  streaming or native payload; missing/rejected registration causes no payload mutation;
 - entry failures and backend-session failures have different propagation;
 - capability rejection happens before remote mutation;
 - metadata and namespace result equals the cell declaration;
@@ -118,6 +121,7 @@ Additional fixtures:
 - interruption inside an inflight/checkpoint interval and immediately after its durability
   barrier, with at least three intervals available;
 - S3 object sizes on both sides of the single CopyObject/multipart-copy boundary;
+- cancellation while recovery registration awaits durable acknowledgement;
 - paths with spaces, Unicode, maximum supported length, and legal special characters;
 - empty, deep, and wide directory trees plus an entry-level failure during traversal;
 - overwrite targets smaller than, equal to, and larger than the source;
@@ -246,6 +250,7 @@ device overlay.
   checkpoint state;
 - verification mismatch and publish/rename/complete-multipart failure;
 - cancellation, process termination, reconnect, and restart;
+- missing, rejected, ambiguously acknowledged, and stale-attempt recovery registration;
 - safe and unsafe protocol replay cases;
 - QUIC disconnect and receiver termination/restart.
 
@@ -262,6 +267,9 @@ produce `failed`, never semantic loss.
 The stable metadata seam must also prove that exact plans apply all requested families,
 known timestamp loss is rejected or reported by policy, external principal mapping is
 explicit, cancellation causes no later mutation, and a target failure returns partial outcomes.
+The expert destination gate additionally proves `verify -> staged metadata -> publish` ordering,
+fail-fast family application, unchanged `FinalDestination` plus retained stage authority on
+failure, and preflight rejection of `VerifyOrSkip` when a plan contains mutations.
 
 `DM-TRAVERSAL-CONTRACT` verifies bounded backpressure, cancellation, optional
 `ObservationPlan` modes, no default extra ACL/xattr/tag calls, ordered result delivery as
@@ -278,7 +286,15 @@ Terrasync gates additionally verify:
 - no backend refetch while reconstructing a stored observation;
 - scan completeness blocks deletion and generation commit after any incomplete traversal;
 - local work distribution does not introduce wire/NDX identity;
-- remote paging assigns session-local NDX without treating it as persistent identity.
+- remote paging assigns session-local NDX without treating it as persistent identity;
+- protocol v8 performs handshake and complete advertisement before NDX selection and rejects v7;
+- remote expert transfer negotiates source/destination chunk ceilings and a backend-observed
+  durable prefix without exposing recovery or backend facts;
+- payload and source evidence remain ordered, connection credit is returned at each transfer
+  terminal, and source QoS evidence reaches the destination unchanged;
+- success, source change, cancellation, recovery registration, staged-metadata failure,
+  post-publication recovery-completion failure, and mid-payload recoverable-stage ownership
+  produce exactly one truthful terminal.
 
 ## 9. Integrity gates
 
@@ -287,6 +303,8 @@ Terrasync gates additionally verify:
 - copy-time BLAKE3 over complete logical content;
 - resume/restart equivalence to fresh transfer;
 - native guarantee classification and mandatory stream fallback when insufficient;
+- atomic native copy remains ephemeral while checkpointed native copy waits for recovery
+  registration acknowledgement before its first payload request;
 - independent dual-byte-stream comparison;
 - first mismatching offset and read failure cause immediate cancellation of both streams;
 - size, ETag, successful write, or native call alone never proves content equivalence.

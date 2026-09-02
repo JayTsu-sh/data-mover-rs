@@ -9,10 +9,10 @@ use futures::StreamExt as _;
 use super::source::{NfsProtocolFailure, entry_failure, role_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{
-    ByteStream, CheckpointObservation, ExistingDestinationPolicy, PrepareRequest, PreparedStage,
-    PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
-    RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure, VerificationEvidence,
-    VerifyRequest, WriteEvidence,
+    ByteStream, CheckpointObservation, ExistingDestinationPolicy, Metadata, MetadataMutation,
+    PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure,
+    PublishRequest, RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure,
+    VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 const STAGING_DIR: &str = ".data-mover-staging";
@@ -44,6 +44,7 @@ pub(crate) struct NfsStagedDestinationAdapter {
     pub(super) protocol: Arc<dyn NfsStagedProtocol>,
     pub(super) identity: BackendIdentity,
     owned_stages: Mutex<HashSet<Bytes>>,
+    metadata: Option<Arc<dyn Metadata>>,
 }
 
 impl NfsStagedDestinationAdapter {
@@ -52,7 +53,13 @@ impl NfsStagedDestinationAdapter {
             protocol,
             identity,
             owned_stages: Mutex::new(HashSet::new()),
+            metadata: None,
         }
+    }
+
+    pub(crate) fn with_metadata(mut self, metadata: Arc<dyn Metadata>) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 
     fn validate(&self, stage: &PreparedStage) -> Result<StoragePath, StorageRoleFailure> {
@@ -288,6 +295,13 @@ impl StagedDestination for NfsStagedDestinationAdapter {
         super::recovery::export(self, stage).await
     }
 
+    async fn handoff_recovery(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<RecoveryIdentity, StorageRoleFailure> {
+        super::recovery::handoff(self, stage).await
+    }
+
     async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
         super::recovery::recover(self, request).await
     }
@@ -372,6 +386,23 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             verified_bytes: request.expected_size,
             blake3: hash,
         })
+    }
+
+    async fn apply_metadata(
+        &self,
+        stage: &PreparedStage,
+        mutation: MetadataMutation,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        let path = self.validate(stage)?;
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            failure(
+                stage.final_destination.path(),
+                FailureClass::Unsupported,
+                Transience::Permanent,
+            )
+        })?;
+        metadata.apply(&path, mutation, cancel).await
     }
 
     async fn publish(

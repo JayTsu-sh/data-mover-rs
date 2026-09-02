@@ -1,5 +1,7 @@
 use std::fmt;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::StoragePath;
@@ -18,6 +20,77 @@ impl fmt::Display for TransferValueError {
 }
 
 impl std::error::Error for TransferValueError {}
+
+/// Caller-side failure to durably register a recovery identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryRegistrationFailure {
+    /// The persistence or IPC path is temporarily unavailable.
+    Unavailable,
+    /// The caller permanently rejected the registration.
+    Rejected,
+}
+
+impl RecoveryRegistrationFailure {
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self::Unavailable
+    }
+
+    #[must_use]
+    pub const fn rejected() -> Self {
+        Self::Rejected
+    }
+}
+
+impl fmt::Display for RecoveryRegistrationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("recovery registration is unavailable"),
+            Self::Rejected => formatter.write_str("recovery registration was rejected"),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryRegistrationFailure {}
+
+/// Caller-owned persistence seam for one opaque recovery identity.
+///
+/// Returning `Ok(())` acknowledges that the identity can be supplied after a caller or worker
+/// restart. Data-mover does not write recoverable payload before that acknowledgement.
+#[async_trait]
+pub trait RecoveryRegistrar: Send + Sync {
+    async fn register(&self, identity: RecoveryIdentity)
+    -> Result<(), RecoveryRegistrationFailure>;
+}
+
+/// Caller-owned recovery inputs opened only after the planner proves a reusable checkpoint is
+/// possible for this transfer.
+pub struct RecoveryContext {
+    pub(crate) identity: Option<RecoveryIdentity>,
+    pub(crate) claim: [u8; 32],
+    pub(crate) registrar: Arc<dyn RecoveryRegistrar>,
+}
+
+impl RecoveryContext {
+    #[must_use]
+    pub fn new(
+        identity: Option<RecoveryIdentity>,
+        claim: [u8; 32],
+        registrar: Arc<dyn RecoveryRegistrar>,
+    ) -> Self {
+        Self {
+            identity,
+            claim,
+            registrar,
+        }
+    }
+}
+
+/// Lazily opens caller persistence for a transfer that can actually retain reusable work.
+#[async_trait]
+pub trait RecoveryProvider: Send + Sync {
+    async fn open(&self) -> Result<RecoveryContext, RecoveryRegistrationFailure>;
+}
 
 /// Caller-provided stable identity for one logical transfer.
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -58,13 +131,14 @@ pub struct InflightLimits {
     pub(crate) operations: usize,
 }
 
-/// Recovery behavior for one transfer attempt.
+/// Whether a transfer may retain backend-owned state for a later attempt.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum RecoveryPolicy {
+pub enum Resumability {
+    /// Use an ephemeral stage and restart from zero after interruption.
+    Disabled,
+    /// Allow the backend to retain and re-observe reusable staged work.
     #[default]
-    ResumeOrRestart,
-    RequireResume,
-    Restart,
+    Enabled,
 }
 
 /// Whether a planner may select a server-internal, unshaped native payload path.
@@ -98,6 +172,11 @@ impl InflightLimits {
             operations,
         })
     }
+
+    pub(crate) fn negotiated_chunk_ceiling(self) -> usize {
+        let streams = self.chunks.min(self.operations).max(1);
+        (self.bytes / streams).max(1)
+    }
 }
 
 /// Immutable inputs for one transfer attempt.
@@ -111,9 +190,8 @@ pub struct TransferRequest {
     pub(crate) inflight: InflightLimits,
     pub(crate) cancel: CancellationToken,
     pub(crate) existing_destination: ExistingDestinationPolicy,
-    pub(crate) recovery_policy: RecoveryPolicy,
-    pub(crate) recovery_identity: Option<RecoveryIdentity>,
-    pub(crate) recovery_claim: [u8; 32],
+    pub(crate) resumability: Resumability,
+    pub(crate) recovery_provider: Option<Arc<dyn RecoveryProvider>>,
     pub(crate) source_qos: Option<SourceQosGroup>,
     pub(crate) payload_shaping: PayloadShapingPolicy,
 }
@@ -139,9 +217,8 @@ impl TransferRequest {
             inflight,
             cancel,
             existing_destination: ExistingDestinationPolicy::default(),
-            recovery_policy: RecoveryPolicy::default(),
-            recovery_identity: None,
-            recovery_claim: *blake3::hash(uuid::Uuid::new_v4().as_bytes()).as_bytes(),
+            resumability: Resumability::default(),
+            recovery_provider: None,
             source_qos: None,
             payload_shaping: PayloadShapingPolicy::default(),
         }
@@ -154,22 +231,15 @@ impl TransferRequest {
         self
     }
 
-    /// Selects recovery behavior and supplies an optional persisted opaque identity.
+    /// Selects recovery behavior and supplies lazy caller persistence.
     #[must_use]
     pub fn with_recovery(
         mut self,
-        policy: RecoveryPolicy,
-        identity: Option<RecoveryIdentity>,
+        resumability: Resumability,
+        provider: Option<Arc<dyn RecoveryProvider>>,
     ) -> Self {
-        self.recovery_policy = policy;
-        self.recovery_identity = identity;
-        self
-    }
-
-    /// Supplies the caller-persisted identity for an idempotent recovery attempt.
-    #[must_use]
-    pub const fn with_recovery_claim(mut self, claim: [u8; 32]) -> Self {
-        self.recovery_claim = claim;
+        self.resumability = resumability;
+        self.recovery_provider = provider;
         self
     }
 

@@ -1,13 +1,14 @@
 use data_mover::transfer::{
-    PayloadShapingPolicy, RecoveryIdentity, RecoveryPolicy, SourceQosGroup, SourceQosPolicy,
+    PayloadShapingPolicy, RecoveryIdentity, Resumability, SourceQosGroup, SourceQosPolicy,
     SourceQosStats, SourceQosValueError, TransferFailure,
 };
 
 #[allow(dead_code)]
-fn public_failure_state(error: &TransferFailure) -> (bool, bool, bool) {
+fn public_failure_state(error: &TransferFailure) -> (bool, bool, bool, bool) {
     (
         error.final_destination_changed(),
         error.has_recoverable_stage(),
+        error.has_unpublished_stage(),
         error.has_pending_cleanup(),
     )
 }
@@ -34,9 +35,9 @@ async fn public_recovery_export(error: TransferFailure) -> Option<RecoveryIdenti
 
 #[test]
 fn transfer_failure_cleanup_contract_is_public() {
-    let state: fn(&TransferFailure) -> (bool, bool, bool) = public_failure_state;
+    let state: fn(&TransferFailure) -> (bool, bool, bool, bool) = public_failure_state;
     let _ = state;
-    assert_eq!(RecoveryPolicy::default(), RecoveryPolicy::ResumeOrRestart);
+    assert_eq!(Resumability::default(), Resumability::Enabled);
     assert_eq!(
         PayloadShapingPolicy::default(),
         PayloadShapingPolicy::AllowUnshapedNative

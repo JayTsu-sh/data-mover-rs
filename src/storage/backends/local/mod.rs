@@ -19,12 +19,17 @@ pub(crate) mod staged;
 pub(crate) fn connect_transfer(
     root: PathBuf,
     identity: BackendIdentity,
+    read_concurrency: NonZeroUsize,
     write_concurrency: NonZeroUsize,
 ) -> Result<Storage, Box<dyn std::error::Error>> {
     if identity.kind() != BackendKind::Local {
         return Err("Local roles require a Local backend identity".into());
     }
-    let source = Arc::new(source::LocalReadSource::new(&root, identity.clone())?);
+    let source = Arc::new(source::LocalReadSource::new(
+        &root,
+        identity.clone(),
+        read_concurrency.get(),
+    )?);
     let staged = Arc::new(staged::LocalStagedDestination::new(
         root,
         identity.clone(),
@@ -67,7 +72,7 @@ pub(crate) fn test_source_storage(
     Box<dyn std::error::Error>,
 > {
     let identity = test_identity(name);
-    let source = std::sync::Arc::new(source::LocalReadSource::new(root, identity.clone())?);
+    let source = std::sync::Arc::new(source::LocalReadSource::new(root, identity.clone(), 4)?);
     let storage = crate::storage::Storage::connected(
         identity,
         test_capabilities(true, false)?,

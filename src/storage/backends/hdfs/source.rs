@@ -40,6 +40,10 @@ impl HdfsReadSource {
 
 #[async_trait]
 impl ReadSource for HdfsReadSource {
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        usize::try_from(MAX_READ_CHUNK).unwrap_or(usize::MAX)
+    }
+
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         self.descriptor(path).await
     }
@@ -47,6 +51,13 @@ impl ReadSource for HdfsReadSource {
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure> {
         if request.cancel.is_cancelled() {
             return Err(cancelled(&request.path, Operation::Read));
+        }
+        if request.maximum_chunk_bytes == 0 || request.read_inflight == 0 {
+            return Err(failure(
+                &request.path,
+                Operation::Read,
+                FailureClass::InvalidInput,
+            ));
         }
         let observed = self.descriptor(&request.path).await?;
         if request
@@ -83,6 +94,7 @@ impl ReadSource for HdfsReadSource {
             path: request.path,
             next: range.start,
             end: range.end,
+            maximum_chunk_bytes: request.maximum_chunk_bytes,
             cancel: request.cancel,
             qos: request.source_qos,
         };
@@ -95,6 +107,7 @@ struct ReadState {
     path: StoragePath,
     next: u64,
     end: u64,
+    maximum_chunk_bytes: usize,
     cancel: CancellationToken,
     qos: Option<SourceQosBudget>,
 }
@@ -106,7 +119,9 @@ async fn read_next(mut state: ReadState) -> Result<Option<(Bytes, ReadState)>, S
     if state.cancel.is_cancelled() {
         return Err(cancelled(&state.path, Operation::Read));
     }
-    let requested = (state.end - state.next).min(MAX_READ_CHUNK);
+    let requested = (state.end - state.next)
+        .min(MAX_READ_CHUNK)
+        .min(state.maximum_chunk_bytes as u64);
     let count = admit_read(&state, requested).await?;
     let bytes = tokio::select! {
         biased;

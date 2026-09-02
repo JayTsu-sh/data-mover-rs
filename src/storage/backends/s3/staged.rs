@@ -8,9 +8,9 @@ use tokio::sync::Mutex;
 
 use crate::model::{BackendIdentity, FailureClass, Operation, Transience};
 use crate::storage::{
-    ByteStream, CheckpointObservation, PrepareRequest, PreparedStage, PublicationEvidence,
-    PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity, StagedDestination,
-    StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    ByteStream, CheckpointObservation, Metadata, MetadataMutation, PrepareRequest, PreparedStage,
+    PublicationEvidence, PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity,
+    StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 use super::source::{cancelled, classified_entry, entry, role_failure};
@@ -22,6 +22,7 @@ mod publication;
 use super::{S3ClaimOutcome, S3Protocol, S3ProtocolFailure};
 
 const PART_SIZE: usize = 8 * 1024 * 1024;
+const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
 const MAX_INFLIGHT_PARTS: usize = 4;
 
 async fn upload<P: S3Protocol>(
@@ -50,6 +51,7 @@ pub(crate) struct S3StagedDestination<P> {
     protocol: Arc<P>,
     identity: BackendIdentity,
     states: Mutex<HashMap<Vec<u8>, StageState>>,
+    metadata: Option<Arc<dyn Metadata>>,
 }
 
 impl<P> S3StagedDestination<P> {
@@ -58,7 +60,13 @@ impl<P> S3StagedDestination<P> {
             protocol,
             identity,
             states: Mutex::new(HashMap::new()),
+            metadata: None,
         }
+    }
+
+    pub(crate) fn with_metadata(mut self, metadata: Arc<dyn Metadata>) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 
     fn temp_key(request: &PrepareRequest) -> String {
@@ -116,12 +124,13 @@ fn resumable_parts(
 ) -> Result<(u64, Vec<(i32, String)>), StorageRoleFailure> {
     observed.sort_by_key(|part| part.number);
     let valid = observed.iter().enumerate().all(|(index, part)| {
-        part.number == i32::try_from(index + 1).unwrap_or(i32::MAX) && part.size == PART_SIZE as u64
+        part.number == i32::try_from(index + 1).unwrap_or(i32::MAX)
+            && part.size >= MIN_MULTIPART_PART_SIZE
     });
     if !valid {
         return Err(invalid_manifest(
             path,
-            "S3 multipart manifest is not a contiguous durable prefix",
+            "S3 multipart manifest is not a contiguous reusable prefix",
         ));
     }
     let persisted = observed.iter().try_fold(0_u64, |total, part| {
@@ -628,6 +637,32 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         })
     }
 
+    async fn apply_metadata(
+        &self,
+        stage: &PreparedStage,
+        mutation: MetadataMutation,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        let key = self.validate(stage)?;
+        let path = crate::model::StoragePath::new(key).map_err(|error| {
+            entry(
+                stage.final_destination.path(),
+                Operation::Metadata,
+                error.to_string(),
+            )
+        })?;
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            classified_entry(
+                stage.final_destination.path(),
+                Operation::Metadata,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "staged S3 metadata is unavailable",
+            )
+        })?;
+        metadata.apply(&path, mutation, cancel).await
+    }
+
     async fn publish(
         &self,
         stage: &PreparedStage,
@@ -707,6 +742,20 @@ mod manifest_tests {
         assert_eq!(valid?.0, (PART_SIZE * 2) as u64);
         assert!(resumable_parts(&path, vec![part(2, PART_SIZE as u64)]).is_err());
         assert!(resumable_parts(&path, vec![part(1, 17)]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn resumable_manifest_accepts_native_copy_part_sizes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let path = crate::model::StoragePath::new("native-stage")?;
+        let native_part_size = 1024 * 1024 * 1024;
+        let observed = resumable_parts(
+            &path,
+            vec![part(2, native_part_size), part(1, native_part_size)],
+        )?;
+        assert_eq!(observed.0, 2 * native_part_size);
+        assert_eq!(observed.1.len(), 2);
         Ok(())
     }
 }

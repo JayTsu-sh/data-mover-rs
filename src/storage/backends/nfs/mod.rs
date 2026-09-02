@@ -38,15 +38,17 @@ where
         protocol.clone(),
         identity.clone(),
     ));
-    let destination = Arc::new(staged::NfsStagedDestinationAdapter::new(
-        protocol.clone(),
-        identity.clone(),
-    ));
+    let metadata: Arc<dyn crate::storage::Metadata> =
+        Arc::new(metadata::NfsMetadataAdapter::new(protocol.clone()));
+    let destination = Arc::new(
+        staged::NfsStagedDestinationAdapter::new(protocol.clone(), identity.clone())
+            .with_metadata(Arc::clone(&metadata)),
+    );
     let namespace = Arc::new(namespace::NfsNamespaceAdapter::new(
         protocol.clone(),
         identity.clone(),
     ));
-    let metadata = Arc::new(metadata::NfsMetadataAdapter::new(protocol));
+    drop(protocol);
     Ok(Storage::connected(
         identity,
         capabilities,

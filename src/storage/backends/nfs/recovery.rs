@@ -24,8 +24,14 @@ pub(super) async fn export(
     bytes.extend_from_slice(&token_len.to_le_bytes());
     bytes.extend_from_slice(&stage.token);
     bytes.extend_from_slice(blake3::hash(&bytes).as_bytes());
-    let identity =
-        RecoveryIdentity::from_bytes(Bytes::from(bytes)).map_err(|_| invalid_stage(stage))?;
+    RecoveryIdentity::from_bytes(Bytes::from(bytes)).map_err(|_| invalid_stage(stage))
+}
+
+pub(super) async fn handoff(
+    adapter: &NfsStagedDestinationAdapter,
+    stage: &PreparedStage,
+) -> Result<RecoveryIdentity, StorageRoleFailure> {
+    let identity = export(adapter, stage).await?;
     adapter.release_authority(stage);
     Ok(identity)
 }

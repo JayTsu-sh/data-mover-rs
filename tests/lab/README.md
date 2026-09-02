@@ -107,6 +107,37 @@ throughput, user/system CPU time, process CPU percentage, and peak RSS. The
 timed command includes the production copy integrity check, so the CSV reports
 end-to-end copy-and-verify cost rather than an unchecked microbenchmark.
 
+`run-local-copy-comparison.sh <run-id> [output.csv]` compares three Local-to-Local
+paths on the runner's real filesystem: raw legacy `StorageEnum`, the same legacy
+path plus its missing `fdatasync` durability barrier, and the role-based Local
+backend with the unified staged lifecycle. It measures exact 4 KiB, 40 MiB, and
+1 GiB files three times by default, rotating implementation order. All paths run
+their content verification inside the timed copy; the runner additionally checks
+SHA-256 and flushes each sample outside the timed interval so the next sample does
+not inherit dirty-page debt. Raw legacy remains a historical reference, while the
+role-based path uses an ephemeral, non-resumable stage when the payload fits the
+backend-negotiated source chunk; it retains verification and atomic publication but
+does not persist a checkpoint. The larger payloads retain resumable staging. The
+optional `LOCAL_COPY_PERF_MAX_REGRESSION_PERCENT` guard compares Optimized against
+`legacy-durable`, the baseline with matching durability. Bulk payloads use that
+percentage guard; 4 KiB uses the absolute
+`LOCAL_COPY_PERF_MAX_FIXED_OVERHEAD_MS` budget (5 ms by default) because staged
+lifecycle setup is a fixed cost. Use
+`LOCAL_COPY_PERF_PAYLOADS` for a tight subset, `LOCAL_COPY_PERF_ROOT` to select the
+filesystem, and `LOCAL_COPY_PERF_REPEATS` to increase the sample count.
+
+`run-local-write-benchmark.sh` isolates the role-based Local destination write shape from source
+reads, hashing, channels, verification, and publication. Each sample opens one new scratch file,
+issues full-size positional `write_at` pieces through bounded `spawn_blocking` inflight work,
+records write submission and `sync_all` separately, validates syscall and short-write counts, and
+then deletes that file. Defaults cover 64 KiB through 8 MiB chunks, inflight 1/2/4/8, three rounds,
+and 256 MiB per sample on `/tmp` (ext4), `/work` (XFS), and `/dev/shm` (tmpfs). Override
+`LOCAL_WRITE_BENCHMARK_ROOTS`, `LOCAL_WRITE_BENCHMARK_CHUNKS`,
+`LOCAL_WRITE_BENCHMARK_INFLIGHT`, `LOCAL_WRITE_BENCHMARK_TOTAL_BYTES`, or
+`LOCAL_WRITE_BENCHMARK_ROUNDS` for a focused confirmation. This is a destination capability
+benchmark; it deliberately reuses one immutable payload so source allocation is outside the
+measurement, and production inflight memory must still be budgeted as distinct upstream pieces.
+
 `run-performance-baseline.sh` freezes the pre-refactor performance evidence.
 It requires a stable `PERF_HARDWARE_ID`, records the exact Git commit, dataset,
 single-file concurrency, requested 2 MiB chunk and inflight depth 8, and emits

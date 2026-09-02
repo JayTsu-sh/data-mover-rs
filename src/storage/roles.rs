@@ -11,8 +11,8 @@ use crate::runtime::qos::SourceQosBudget;
 
 use crate::model::{
     AclMetadata, BackendSessionFailure, EntryKind, EntryOperationFailure, ExtendedAttribute,
-    MappedOwnership, MetadataObservations, ObjectTag, ObservationPlan, OwnershipMode,
-    SourceIdentity, StoragePath, SymlinkTarget, TimestampMetadata,
+    FailureClass, MappedOwnership, MetadataObservations, ObjectTag, ObservationPlan, Operation,
+    OwnershipMode, SourceIdentity, StoragePath, SymlinkTarget, TimestampMetadata, Transience,
 };
 
 /// A bounded payload stream. Implementations own request sizing and backpressure.
@@ -58,6 +58,10 @@ pub struct ReadRequest {
     pub path: StoragePath,
     pub range: Option<Range<u64>>,
     pub expected_source: Option<SourceIdentity>,
+    /// Caller-side upper bound; the backend may negotiate a smaller chunk.
+    pub maximum_chunk_bytes: usize,
+    /// Caller-side upper bound for backend read operations within this stream.
+    pub read_inflight: usize,
     pub cancel: CancellationToken,
     pub source_qos: Option<SourceQosBudget>,
 }
@@ -90,6 +94,11 @@ impl Error for StorageRoleFailure {
 /// Source streaming role. Protocol handles and retry details remain behind this interface.
 #[async_trait]
 pub trait ReadSource: Send + Sync {
+    /// Largest payload the connected backend can return from one source read operation.
+    /// The transfer planner combines this backend limit with the caller's inflight budget.
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        usize::MAX
+    }
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure>;
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure>;
 }
@@ -178,6 +187,7 @@ pub struct PreparedStage {
     pub(crate) token: Bytes,
     pub(crate) recovery_binding: [u8; 32],
     pub(crate) write_offset: u64,
+    pub(crate) recovery_enabled: bool,
     pub(crate) claim: std::sync::Mutex<Option<std::fs::File>>,
 }
 
@@ -201,8 +211,18 @@ impl PreparedStage {
             token,
             recovery_binding,
             write_offset,
+            recovery_enabled: true,
             claim: std::sync::Mutex::new(claim),
         }
+    }
+
+    pub(crate) const fn disable_recovery(mut self) -> Self {
+        self.recovery_enabled = false;
+        self
+    }
+
+    pub(crate) const fn recovery_enabled(&self) -> bool {
+        self.recovery_enabled
     }
 
     pub(crate) fn validate_owner(
@@ -233,6 +253,7 @@ impl fmt::Debug for PreparedStage {
             .field("token", &"<redacted>")
             .field("recovery_binding", &"<redacted>")
             .field("write_offset", &self.write_offset)
+            .field("recovery_enabled", &self.recovery_enabled)
             .field("claim", &"<exclusive-lock>")
             .finish()
     }
@@ -311,10 +332,34 @@ pub struct PublicationEvidence {
 #[async_trait]
 pub trait StagedDestination: Send + Sync {
     async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure>;
+    /// Prepares unpublished state that must never be resumed after this attempt.
+    ///
+    /// The default preserves backend staging and atomic-publication behavior while marking the
+    /// returned state as ineligible for recovery. Backends with persistent checkpoint setup may
+    /// override this method to omit that work.
+    async fn prepare_ephemeral(
+        &self,
+        request: PrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        self.prepare(request)
+            .await
+            .map(PreparedStage::disable_recovery)
+    }
     async fn recovery_identity(
         &self,
         stage: &PreparedStage,
     ) -> Result<RecoveryIdentity, StorageRoleFailure>;
+    /// Transfers recovery authority out of the current process.
+    ///
+    /// The default identity snapshot is sufficient for backends whose authority is held by the
+    /// stage itself. Backends with adapter-local claims may override this to release that claim
+    /// only after the identity has been created successfully.
+    async fn handoff_recovery(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<RecoveryIdentity, StorageRoleFailure> {
+        self.recovery_identity(stage).await
+    }
     async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure>;
     async fn write(
         &self,
@@ -330,6 +375,35 @@ pub trait StagedDestination: Send + Sync {
         stage: &PreparedStage,
         request: VerifyRequest,
     ) -> Result<VerificationEvidence, StorageRoleFailure>;
+    /// Applies one compiled metadata mutation to the unpublished staged object.
+    ///
+    /// The default is a truthful refusal. A backend must override this method before advertising
+    /// the corresponding metadata target capability to the orchestration layer.
+    async fn apply_metadata(
+        &self,
+        stage: &PreparedStage,
+        _mutation: MetadataMutation,
+        cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        let class = if cancel.is_cancelled() {
+            FailureClass::Cancelled
+        } else {
+            FailureClass::Unsupported
+        };
+        let failure = EntryOperationFailure::new(
+            stage.final_destination.path().clone(),
+            Operation::Metadata,
+            class,
+            if class == FailureClass::Cancelled {
+                Transience::Transient
+            } else {
+                Transience::Permanent
+            },
+            "staged metadata mutation is unavailable",
+        )
+        .unwrap_or_else(|_| unreachable!("the static staged-metadata diagnostic is valid"));
+        Err(StorageRoleFailure::Entry(failure))
+    }
     async fn publish(
         &self,
         stage: &PreparedStage,

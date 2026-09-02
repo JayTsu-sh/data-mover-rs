@@ -73,6 +73,8 @@ async fn one_stream_uses_one_open_cursor_and_exact_ranges() -> Result<(), Box<dy
             path,
             range: Some(1..1_500_001),
             expected_source: Some(descriptor.source_identity),
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 4,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -113,6 +115,8 @@ async fn opened_identity_detects_change_and_precancel_avoids_another_open()
             path: path.clone(),
             range: None,
             expected_source: Some(other),
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 4,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -128,6 +132,8 @@ async fn opened_identity_detects_change_and_precancel_avoids_another_open()
             path,
             range: None,
             expected_source: None,
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 4,
             cancel,
             source_qos: None,
         })

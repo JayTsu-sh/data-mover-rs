@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_reobserves_durable_prefix_and_transfers_authority() {
+    async fn recovery_identity_snapshot_retains_authority_until_explicit_handoff() {
         let (adapter, protocol, identity) = adapter();
         let request = prepare_request(&identity);
         let stage = adapter
@@ -308,12 +308,28 @@ mod tests {
             .recovery_identity(&stage)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            adapter
+                .observe_checkpoint(&stage)
+                .await
+                .unwrap_or_else(|error| panic!("{error}"))
+                .durable_prefix,
+            3
+        );
+        let handed_off_identity = adapter
+            .handoff_recovery(&stage)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            handed_off_identity.as_bytes(),
+            recovery_identity.as_bytes()
+        );
         assert!(adapter.observe_checkpoint(&stage).await.is_err());
 
         let recovered_adapter = NfsStagedDestinationAdapter::new(protocol.clone(), identity);
         let recovered = recovered_adapter
             .recover(RecoverRequest {
-                identity: recovery_identity,
+                identity: handed_off_identity,
                 final_destination: request.final_destination,
                 source: request.source,
                 recovery_binding: request.recovery_binding,
@@ -344,7 +360,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let recovery_identity = adapter
-            .recovery_identity(&stage)
+            .handoff_recovery(&stage)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let first = NfsStagedDestinationAdapter::new(protocol.clone(), identity.clone());
@@ -393,7 +409,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let recovery_identity = adapter
-            .recovery_identity(&stage)
+            .handoff_recovery(&stage)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         protocol
@@ -427,7 +443,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let recovery_identity = adapter
-            .recovery_identity(&stage)
+            .handoff_recovery(&stage)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let recover = || RecoverRequest {

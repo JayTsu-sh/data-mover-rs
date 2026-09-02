@@ -34,11 +34,12 @@ pub(crate) fn connect(
         Arc::clone(&protocol),
         identity.clone(),
     ));
-    let staged = Arc::new(staged::CifsStagedDestination::new(
-        Arc::clone(&protocol),
-        identity.clone(),
-    ));
-    let metadata = Arc::new(metadata::CifsMetadata::new(protocol));
+    let metadata: Arc<dyn crate::storage::Metadata> =
+        Arc::new(metadata::CifsMetadata::new(Arc::clone(&protocol)));
+    let staged = Arc::new(
+        staged::CifsStagedDestination::new(Arc::clone(&protocol), identity.clone())
+            .with_metadata(Arc::clone(&metadata)),
+    );
     Ok(Storage::connected(
         identity,
         capabilities,

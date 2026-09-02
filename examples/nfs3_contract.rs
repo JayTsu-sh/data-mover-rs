@@ -14,7 +14,7 @@ use data_mover::storage::{
     PrepareRequest, PublishRequest, RecoverRequest, Storage, StorageRoleFailure, VerifyRequest,
 };
 use data_mover::transfer::{
-    InflightLimits, RecoveryPolicy, SourceQosGroup, SourceQosPolicy, TransferIdentity,
+    InflightLimits, Resumability, SourceQosGroup, SourceQosPolicy, TransferIdentity,
     TransferRequest, transfer,
 };
 use data_mover::traversal::{
@@ -429,10 +429,7 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
     if !failure.has_recoverable_stage() {
         return Err("in-flight cancellation did not preserve a recoverable stage".into());
     }
-    let recovery = failure
-        .into_recovery_identity()
-        .await
-        .map_err(|(_, error)| error)?;
+    failure.discard_stage().await?;
 
     let outcome = transfer(
         TransferRequest::new(
@@ -444,7 +441,7 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
             InflightLimits::new(4, 256 * 1024, 4)?,
             CancellationToken::new(),
         )
-        .with_recovery(RecoveryPolicy::Restart, Some(recovery))
+        .with_recovery(Resumability::Enabled, None)
         .with_existing_destination_policy(ExistingDestinationPolicy::Overwrite),
     )
     .await?;

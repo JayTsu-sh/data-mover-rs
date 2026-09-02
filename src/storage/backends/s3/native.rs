@@ -6,8 +6,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{BackendIdentity, IdentityStrength, Operation, SourceIdentity};
 use crate::storage::{
-    NativeAffinity, NativeEndpoint, NativeSourceBinding, NativeStageEvidence, NativeStageFailure,
-    PrepareRequest, SourceDescriptor, StorageRoleFailure,
+    NativeAffinity, NativeEndpoint, NativeRecoveryMode, NativeSourceBinding, NativeStageEvidence,
+    NativeStageFailure, SourceDescriptor, StorageRoleFailure,
 };
 
 use super::source::{entry, role_failure};
@@ -72,6 +72,14 @@ impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
         self.context.affinity
     }
 
+    fn recovery_mode(&self, source_size: u64) -> NativeRecoveryMode {
+        if source_size > super::S3_NATIVE_COPY_SINGLE_MAX {
+            NativeRecoveryMode::Checkpointed
+        } else {
+            NativeRecoveryMode::Atomic
+        }
+    }
+
     async fn bind_source(
         &self,
         source: &SourceDescriptor,
@@ -107,24 +115,21 @@ impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
         })
     }
 
-    async fn copy_to_stage(
+    async fn copy_into_stage(
         &self,
         source: NativeSourceBinding,
-        request: PrepareRequest,
+        stage: &crate::storage::PreparedStage,
         cancel: CancellationToken,
     ) -> Result<NativeStageEvidence, NativeStageFailure> {
         if source.affinity != self.context.affinity {
-            return Err(preparation_failure(
-                &request,
-                "native pair affinity changed",
-            ));
+            return Err(stage_failure(stage, "native pair affinity changed"));
         }
         let native = decode_source(source.token)
-            .map_err(|()| preparation_failure(&request, "invalid native source binding"))?;
-        if native.size != source.size || request.source.size != Some(source.size) {
-            return Err(preparation_failure(&request, "native source size changed"));
+            .map_err(|()| stage_failure(stage, "invalid native source binding"))?;
+        if native.size != source.size {
+            return Err(stage_failure(stage, "native source size changed"));
         }
-        self.staged.prepare_native(request, native, cancel).await
+        self.staged.fill_native(stage, native, cancel).await
     }
 }
 
@@ -202,14 +207,13 @@ fn take_string(token: &mut Bytes) -> Result<String, ()> {
     String::from_utf8(token.copy_to_bytes(length).to_vec()).map_err(|_| ())
 }
 
-fn preparation_failure(request: &PrepareRequest, diagnostic: &str) -> NativeStageFailure {
+fn stage_failure(stage: &crate::storage::PreparedStage, diagnostic: &str) -> NativeStageFailure {
     NativeStageFailure {
         error: entry(
-            request.final_destination.path(),
+            stage.final_destination.path(),
             Operation::Prepare,
             diagnostic,
         ),
-        stage: None,
         native_bytes: 0,
         native_requests: 0,
     }

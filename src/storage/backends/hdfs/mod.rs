@@ -28,15 +28,17 @@ where
         Arc::clone(&storage),
         identity.clone(),
     ));
-    let staged = Arc::new(staged::HdfsStagedDestination::new(
-        Arc::clone(&storage),
-        identity.clone(),
-    ));
+    let metadata: Arc<dyn crate::storage::Metadata> =
+        Arc::new(metadata::HdfsMetadata::new(Arc::clone(&storage)));
+    let staged = Arc::new(
+        staged::HdfsStagedDestination::new(Arc::clone(&storage), identity.clone())
+            .with_metadata(Arc::clone(&metadata)),
+    );
     let namespace = Arc::new(namespace::HdfsNamespace::new(
         Arc::clone(&storage),
         identity.clone(),
     ));
-    let metadata = Arc::new(metadata::HdfsMetadata::new(storage));
+    drop(storage);
     Ok(Storage::connected(
         identity,
         capabilities(),

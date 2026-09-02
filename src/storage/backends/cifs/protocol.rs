@@ -89,14 +89,15 @@ impl CifsSourceProtocol for SmbDomainProtocol {
         let resource = self.share.open(&share_path).await?;
         match resource {
             smb_domain::Resource::File(file) => {
+                let maximum_read_chunk = file.io_capabilities().maximum_read_chunk();
                 let metadata = file.metadata().await;
                 let close = close_file(*file).await;
-                finish_facts(metadata, close, EntryKind::File)
+                finish_facts(metadata, close, EntryKind::File, maximum_read_chunk)
             }
             smb_domain::Resource::Directory(directory) => {
                 let metadata = directory.metadata().await;
                 let close = close_directory(directory).await;
-                finish_facts(metadata, close, EntryKind::Directory)
+                finish_facts(metadata, close, EntryKind::Directory, u32::MAX)
             }
             smb_domain::Resource::Pipe(pipe) => {
                 let _ = close_pipe(pipe).await;
@@ -123,7 +124,11 @@ impl CifsSourceProtocol for SmbDomainProtocol {
                 return Err(error);
             }
         };
-        let facts = facts(EntryKind::File, &metadata);
+        let facts = facts(
+            EntryKind::File,
+            &metadata,
+            file.io_capabilities().maximum_read_chunk(),
+        );
         Ok((Box::new(DomainReadCursor { file }), facts))
     }
 }
@@ -165,6 +170,7 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
                         kind,
                         size: entry.len(),
                         identity: identity.freeze(),
+                        maximum_read_chunk: u32::MAX,
                     },
                 ))
             })
@@ -334,10 +340,11 @@ fn finish_facts(
     metadata: smb_domain::Result<smb_domain::ResourceMetadata>,
     close: smb_domain::Result<()>,
     kind: EntryKind,
+    maximum_read_chunk: u32,
 ) -> smb_domain::Result<CifsSourceFacts> {
     let metadata = metadata?;
     close?;
-    Ok(facts(kind, &metadata))
+    Ok(facts(kind, &metadata, maximum_read_chunk))
 }
 
 fn require_confirmed_close(outcome: smb_domain::CloseOutcome) -> smb_domain::Result<()> {
@@ -401,7 +408,11 @@ async fn close_pipe(pipe: smb_domain::Pipe) -> smb_domain::Result<()> {
     require_confirmed_close(pipe.close().await?)
 }
 
-fn facts(kind: EntryKind, metadata: &smb_domain::ResourceMetadata) -> CifsSourceFacts {
+fn facts(
+    kind: EntryKind,
+    metadata: &smb_domain::ResourceMetadata,
+    maximum_read_chunk: u32,
+) -> CifsSourceFacts {
     let mut identity = BytesMut::with_capacity(40);
     identity.extend_from_slice(b"data-mover:cifs-path-identity:v1\0");
     identity.put_u64(metadata.len());
@@ -411,6 +422,7 @@ fn facts(kind: EntryKind, metadata: &smb_domain::ResourceMetadata) -> CifsSource
         kind,
         size: metadata.len(),
         identity: identity.freeze(),
+        maximum_read_chunk,
     }
 }
 

@@ -49,15 +49,15 @@ async fn multipart_native_failure_retains_upload_for_discard_retry() -> TestResu
         "injected part failure",
     ));
     let adapter = S3StagedDestination::new(protocol.clone(), identity());
+    let stage = adapter.prepare(native_prepare()?).await?;
     let Err(failure) = adapter
-        .prepare_native(native_prepare()?, native_source(), CancellationToken::new())
+        .fill_native(&stage, native_source(), CancellationToken::new())
         .await
     else {
         return Err("multipart native failure unexpectedly succeeded".into());
     };
     assert_eq!(failure.native_bytes, 0);
     assert_eq!(failure.native_requests, 2);
-    let stage = failure.stage.ok_or("native failure lost stage authority")?;
     assert_eq!(protocol.uploads.lock().await.len(), 1);
     adapter.discard(stage).await?;
     assert!(protocol.uploads.lock().await.is_empty());
@@ -69,19 +69,15 @@ async fn multipart_native_failure_retains_upload_for_discard_retry() -> TestResu
 async fn multipart_native_cancellation_keeps_abort_authority() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let adapter = S3StagedDestination::new(protocol.clone(), identity());
+    let stage = adapter.prepare(native_prepare()?).await?;
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let Err(failure) = adapter
-        .prepare_native(native_prepare()?, native_source(), cancel)
-        .await
-    else {
+    let Err(failure) = adapter.fill_native(&stage, native_source(), cancel).await else {
         return Err("cancelled multipart native copy succeeded".into());
     };
     assert_eq!(failure.native_bytes, 0);
     assert_eq!(failure.native_requests, 1);
-    adapter
-        .discard(failure.stage.ok_or("cancel lost stage authority")?)
-        .await?;
+    adapter.discard(stage).await?;
     assert!(protocol.uploads.lock().await.is_empty());
     assert_eq!(*protocol.aborts.lock().await, 1);
     Ok(())

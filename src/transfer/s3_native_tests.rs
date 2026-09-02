@@ -8,11 +8,37 @@ use crate::storage::RecoveryIdentity;
 use crate::storage::backends::s3::tests::{MemoryS3, identity, native_context};
 use crate::storage::backends::s3::{S3NativeContext, S3ProtocolFailure, connect};
 use crate::transfer::{
-    InflightLimits, PayloadShapingPolicy, RecoveryPolicy, SourceQosGroup, SourceQosPolicy,
-    TransferIdentity, TransferRequest, transfer,
+    InflightLimits, PayloadShapingPolicy, RecoveryContext, RecoveryProvider, RecoveryRegistrar,
+    RecoveryRegistrationFailure, Resumability, SourceQosGroup, SourceQosPolicy, TransferIdentity,
+    TransferRequest, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+struct AcceptingRegistrar;
+
+#[async_trait::async_trait]
+impl RecoveryRegistrar for AcceptingRegistrar {
+    async fn register(
+        &self,
+        _identity: RecoveryIdentity,
+    ) -> Result<(), RecoveryRegistrationFailure> {
+        Ok(())
+    }
+}
+
+struct FixedRecoveryProvider(RecoveryIdentity);
+
+#[async_trait::async_trait]
+impl RecoveryProvider for FixedRecoveryProvider {
+    async fn open(&self) -> Result<RecoveryContext, RecoveryRegistrationFailure> {
+        Ok(RecoveryContext::new(
+            Some(self.0.clone()),
+            [7; 32],
+            Arc::new(AcceptingRegistrar),
+        ))
+    }
+}
 
 fn request(
     source: crate::storage::Storage,
@@ -53,6 +79,28 @@ async fn same_connected_pair_uses_native_stage_and_reports_unshaped_payload() ->
         payload.len() as u64
     );
     assert!(!outcome.source_qos.native_payload_shaped);
+    assert_eq!(*protocol.native_copies.lock().await, 1);
+    assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
+    Ok(())
+}
+
+#[tokio::test]
+async fn atomic_native_copy_does_not_require_streaming_recovery_registration() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    let payload = Bytes::from(vec![0x31; 128 * 1024]);
+    protocol
+        .objects
+        .lock()
+        .await
+        .insert("source".into(), payload.clone());
+    let source = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+
+    let outcome = transfer(request(source, destination)?).await?;
+
+    assert_eq!(outcome.transferred_bytes, payload.len() as u64);
+    assert_eq!(outcome.source_qos.native_bytes, payload.len() as u64);
+    assert_eq!(outcome.source_qos.native_requests, 1);
     assert_eq!(*protocol.native_copies.lock().await, 1);
     assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
     Ok(())
@@ -128,7 +176,8 @@ async fn native_failure_retains_cleanup_authority_without_changing_final() -> Te
         return Err("native failure unexpectedly succeeded".into());
     };
 
-    assert!(error.has_recoverable_stage());
+    assert!(!error.has_recoverable_stage());
+    assert!(error.has_unpublished_stage());
     assert!(!error.final_destination_changed());
     assert_eq!(error.source_qos().native_bytes, 0);
     assert_eq!(error.source_qos().native_requests, 1);
@@ -140,24 +189,31 @@ async fn native_failure_retains_cleanup_authority_without_changing_final() -> Te
 }
 
 #[tokio::test]
-async fn supplied_recovery_identity_uses_streaming_recovery_path() -> TestResult {
+async fn invalid_recovery_identity_fails_without_native_or_streaming_reupload() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
+    let payload = Bytes::from(vec![0x73; 128 * 1024]);
     protocol
         .objects
         .lock()
         .await
-        .insert("source".into(), Bytes::from_static(b"restart"));
+        .insert("source".into(), payload);
     let source = connect(protocol.clone(), identity(), Some(native_context()))?;
     let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
     let stale = RecoveryIdentity::from_bytes(Bytes::from_static(b"invalid"))?;
 
-    let outcome = transfer(
-        request(source, destination)?.with_recovery(RecoveryPolicy::ResumeOrRestart, Some(stale)),
+    let result = transfer(
+        request(source, destination)?
+            .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped)
+            .with_recovery(
+                Resumability::Enabled,
+                Some(Arc::new(FixedRecoveryProvider(stale))),
+            ),
     )
-    .await?;
+    .await;
 
-    assert_eq!(outcome.source_qos.native_requests, 0);
+    assert!(result.is_err());
     assert_eq!(*protocol.native_copies.lock().await, 0);
+    assert!(!protocol.objects.lock().await.contains_key("final"));
     Ok(())
 }
 

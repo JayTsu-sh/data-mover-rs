@@ -1,5 +1,6 @@
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -15,6 +16,7 @@ pub(super) struct CifsSourceFacts {
     pub(super) kind: EntryKind,
     pub(super) size: u64,
     pub(super) identity: Bytes,
+    pub(super) maximum_read_chunk: u32,
 }
 
 #[async_trait]
@@ -36,6 +38,7 @@ pub(super) trait CifsSourceProtocol: Send + Sync {
 pub(super) struct CifsReadSource {
     protocol: Arc<dyn CifsSourceProtocol>,
     identity: BackendIdentity,
+    maximum_read_chunk: AtomicU32,
 }
 
 impl CifsReadSource {
@@ -43,7 +46,11 @@ impl CifsReadSource {
     where
         P: CifsSourceProtocol + 'static,
     {
-        Self { protocol, identity }
+        Self {
+            protocol,
+            identity,
+            maximum_read_chunk: AtomicU32::new(u32::MAX),
+        }
     }
 
     async fn descriptor(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
@@ -52,6 +59,8 @@ impl CifsReadSource {
             .describe(path)
             .await
             .map_err(|error| classify(path, Operation::Observe, &error))?;
+        self.maximum_read_chunk
+            .store(facts.maximum_read_chunk.max(1), Ordering::Relaxed);
         descriptor_from_facts(&self.identity, path, &facts, Operation::Observe)
     }
 
@@ -94,6 +103,10 @@ impl CifsReadSource {
 
 #[async_trait]
 impl ReadSource for CifsReadSource {
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        usize::try_from(self.maximum_read_chunk.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
+    }
+
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         self.descriptor(path).await
     }
@@ -106,6 +119,13 @@ impl ReadSource for CifsReadSource {
                 FailureClass::Cancelled,
             ));
         }
+        if request.maximum_chunk_bytes == 0 || request.read_inflight == 0 {
+            return Err(entry_failure(
+                &request.path,
+                Operation::Read,
+                FailureClass::InvalidInput,
+            ));
+        }
         let state = self.open_state(request).await?;
         Ok(Box::pin(futures::stream::try_unfold(state, read_next)))
     }
@@ -116,6 +136,7 @@ struct ReadState {
     path: StoragePath,
     next: u64,
     end: u64,
+    maximum_chunk_bytes: usize,
     cancel: tokio_util::sync::CancellationToken,
     qos: Option<crate::storage::SourceQosBudget>,
 }
@@ -127,6 +148,7 @@ impl ReadState {
             path: request.path,
             next: range.start,
             end: range.end,
+            maximum_chunk_bytes: request.maximum_chunk_bytes,
             cancel: request.cancel,
             qos: request.source_qos,
         }
@@ -162,7 +184,9 @@ async fn read_next(mut state: ReadState) -> Result<Option<(Bytes, ReadState)>, S
             FailureClass::Cancelled,
         ));
     }
-    let requested = (state.end - state.next).min(u64::from(state.cursor.maximum_read_chunk()));
+    let requested = (state.end - state.next)
+        .min(u64::from(state.cursor.maximum_read_chunk()))
+        .min(state.maximum_chunk_bytes as u64);
     let granted = match &state.qos {
         Some(qos) => {
             let Ok(granted) = qos.admit_read(requested, &state.cancel).await else {

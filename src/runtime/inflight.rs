@@ -168,7 +168,9 @@ pub(crate) struct InflightRuntime {
     chunks: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     operations: Arc<Semaphore>,
+    chunk_budget: usize,
     byte_budget: usize,
+    operation_budget: usize,
     expected_end: u64,
     next_admission: Arc<Mutex<u64>>,
     cancel: CancellationToken,
@@ -207,6 +209,15 @@ impl InflightAdmission {
 }
 
 impl InflightRuntime {
+    pub(crate) const fn operation_budget(&self) -> usize {
+        self.operation_budget
+    }
+
+    pub(crate) fn negotiated_chunk_ceiling(&self) -> usize {
+        let streams = self.chunk_budget.min(self.operation_budget).max(1);
+        (self.byte_budget / streams).max(1)
+    }
+
     pub(crate) fn channel(
         config: InflightConfig,
         start_offset: u64,
@@ -224,7 +235,9 @@ impl InflightRuntime {
             chunks: Arc::new(Semaphore::new(config.chunks)),
             bytes: Arc::new(Semaphore::new(config.bytes)),
             operations: Arc::new(Semaphore::new(config.operations)),
+            chunk_budget: config.chunks,
             byte_budget: config.bytes,
+            operation_budget: config.operations,
             expected_end,
             next_admission: Arc::new(Mutex::new(start_offset)),
             cancel: cancel.clone(),
