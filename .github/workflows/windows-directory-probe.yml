@@ -1,0 +1,17 @@
+name: Windows directory sync probe
+on:
+  push:
+    branches: ['test/windows-probe-*']
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - run: |
+          rustc tests/lab/windows_directory_probe.rs -o directory-probe.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./directory-probe.exe
