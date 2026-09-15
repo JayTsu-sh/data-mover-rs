@@ -4,7 +4,7 @@ use futures::{StreamExt as _, stream};
 
 use super::*;
 use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity};
-use crate::storage::{ExistingDestinationPolicy, FinalDestination, SourceDescriptor};
+use crate::storage::{FinalDestination, SourceDescriptor};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -49,6 +49,7 @@ fn request(identity: &BackendIdentity, destination: &str) -> PrepareRequest {
                 b"source-file",
             )),
             backend_fact: None,
+            content_version: None,
         },
         recovery_binding: [7; 32],
     }
@@ -74,8 +75,20 @@ fn request_with_size(identity: &BackendIdentity, destination: &str, size: usize)
 }
 
 fn staging_is_empty(root: &Path) -> io::Result<bool> {
-    let staging = root.join(STAGING_DIRECTORY);
-    Ok(!staging.exists() || std::fs::read_dir(staging)?.next().is_none())
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".data-mover-")
+        {
+            return Ok(false);
+        }
+        if entry.file_type()?.is_dir() && !staging_is_empty(&entry.path())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn assert_out_of_order_completion(adapter: &LocalStagedDestination) {
@@ -157,20 +170,14 @@ async fn prepare_write_flush_checkpoint_and_discard_leave_final_unchanged() -> i
         9
     );
     ok(reconnected.discard(stage).await);
-    assert!(
-        tokio::fs::read_dir(root.0.join(STAGING_DIRECTORY))
-            .await?
-            .next_entry()
-            .await?
-            .is_none()
-    );
+    assert!(staging_is_empty(&root.0)?);
     Ok(())
 }
 
 #[tokio::test]
-async fn write_submits_a_five_mib_input_as_one_piece() -> io::Result<()> {
+async fn write_submits_an_eight_mib_input_as_one_piece() -> io::Result<()> {
     let root = TestRoot::new().await?;
-    let backend = identity("local-five-mib-write-test");
+    let backend = identity("local-eight-mib-write-test");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
     let payload = Bytes::from(vec![0x5a; LOCAL_MAX_WRITE_CHUNK_BYTES]);
     let stage = ok(adapter
@@ -192,6 +199,22 @@ async fn write_submits_a_five_mib_input_as_one_piece() -> io::Result<()> {
     assert_eq!(
         tokio::fs::read(ok(adapter.stage_full_path(&stage, Operation::Verify))).await?,
         payload
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_ceiling_does_not_change_automatic_checkpoint_interval() -> io::Result<()> {
+    let root = TestRoot::new().await?;
+    let adapter = ok(LocalStagedDestination::new(
+        &root.0,
+        identity("local-independent-checkpoint-interval"),
+        1,
+    ));
+    assert_eq!(LOCAL_MAX_WRITE_CHUNK_BYTES, 8 * 1024 * 1024);
+    assert_eq!(
+        adapter.automatic_checkpoint_interval_bytes(),
+        Some(64 * 1024 * 1024)
     );
     Ok(())
 }
@@ -438,6 +461,24 @@ async fn recoverable_write_advances_a_durable_prefix_before_input_ends() -> io::
     Ok(())
 }
 
+#[test]
+fn legacy_local_stage_names_are_rejected() {
+    for token in [
+        ".data-mover-0123456789abcdef-00003039-0000000000000001.stage",
+        ".data-mover-staging/old.stage",
+    ] {
+        let stage = PreparedStage::new(
+            identity("legacy-name-test"),
+            FinalDestination::new(ok(StoragePath::new("final.bin"))),
+            Bytes::copy_from_slice(token.as_bytes()),
+            [0; 32],
+            0,
+            None,
+        );
+        assert!(LocalStagedDestination::stage_relative(&stage, Operation::Prepare).is_err());
+    }
+}
+
 #[tokio::test]
 async fn paths_and_stage_ownership_are_confined_to_the_backend_root() -> io::Result<()> {
     let root = TestRoot::new().await?;
@@ -485,141 +526,350 @@ async fn paths_and_stage_ownership_are_confined_to_the_backend_root() -> io::Res
 async fn staging_symlink_cannot_escape_the_capability_root() -> io::Result<()> {
     let root = TestRoot::new().await?;
     let outside = TestRoot::new().await?;
-    std::os::unix::fs::symlink(&outside.0, root.0.join(STAGING_DIRECTORY))?;
+    std::os::unix::fs::symlink(&outside.0, root.0.join("subdir"))?;
     let backend = identity("local-symlink-confinement-test");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 1));
 
     assert!(
         adapter
-            .prepare(request(&backend, "final.bin"))
+            .prepare(request(&backend, "subdir/final.bin"))
             .await
             .is_err()
     );
     assert!(std::fs::read_dir(&outside.0)?.next().is_none());
     Ok(())
 }
+#[tokio::test]
+async fn cancelled_publication_preserves_destination_and_stage() -> io::Result<()> {
+    for existing in [true, false] {
+        let root = TestRoot::new().await?;
+        let final_path = root.0.join("final.bin");
+        if existing {
+            tokio::fs::write(&final_path, b"original").await?;
+        }
+        let backend = identity("local-cancelled-publication-test");
+        let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 1));
+        let payload = Bytes::from_static(b"new bytes");
+        let stage = ok(adapter
+            .prepare_ephemeral(request_with_size(&backend, "final.bin", payload.len()))
+            .await);
+        ok(adapter
+            .write(&stage, owned_bytes(vec![payload.clone()]))
+            .await);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn publishing_one_path_does_not_block_preparing_another_path() -> io::Result<()> {
-    const EXISTING_BYTES: u64 = 64 * 1024 * 1024;
-
-    let root = TestRoot::new().await?;
-    let existing = std::fs::File::create(root.0.join("slow-existing.bin"))?;
-    existing.set_len(EXISTING_BYTES)?;
-    drop(existing);
-
-    let backend = identity("local-independent-lifecycle-test");
-    let adapter = Arc::new(ok(LocalStagedDestination::new(&root.0, backend.clone(), 1)));
-    let slow_stage = ok(adapter
-        .prepare_ephemeral(request_with_size(
-            &backend,
-            "slow-existing.bin",
-            EXISTING_BYTES as usize,
-        ))
-        .await);
-    adapter.slow_existing_verify();
-
-    let publishing = {
-        let adapter = Arc::clone(&adapter);
-        tokio::spawn(async move {
-            adapter
-                .publish(
-                    &slow_stage,
-                    PublishRequest {
-                        policy: ExistingDestinationPolicy::VerifyOrSkip,
-                        expected_size: EXISTING_BYTES,
-                        expected_blake3: [0xff; 32],
-                        cancel: tokio_util::sync::CancellationToken::new(),
-                    },
-                )
-                .await
-        })
-    };
-
-    let observation_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while !adapter.existing_verify_started() {
-        assert!(
-            tokio::time::Instant::now() < observation_deadline,
-            "existing-destination verification did not start"
-        );
-        tokio::task::yield_now().await;
+        let failure = adapter
+            .publish(
+                &stage,
+                PublishRequest {
+                    expected_size: payload.len() as u64,
+                    expected_blake3: *blake3::hash(&payload).as_bytes(),
+                    cancel,
+                },
+            )
+            .await
+            .err()
+            .ok_or_else(|| io::Error::other("cancelled publication must not commit"))?;
+        assert!(matches!(
+            failure.error,
+            StorageRoleFailure::Entry(ref error) if error.class() == FailureClass::Cancelled
+        ));
+        assert!(!failure.final_destination_changed);
+        if existing {
+            assert_eq!(tokio::fs::read(&final_path).await?, b"original");
+        } else {
+            assert!(!final_path.exists());
+        }
+        let stage_name = ok(adapter.stage_name(&stage, Operation::Publish));
+        assert_eq!(tokio::fs::read(root.0.join(stage_name)).await?, payload);
+        ok(adapter.discard(stage).await);
     }
-
-    let independent = tokio::time::timeout(
-        Duration::from_millis(100),
-        adapter.prepare_ephemeral(request(&backend, "independent.bin")),
-    )
-    .await;
-    let publication = publishing.await.map_err(io::Error::other)?;
-    assert!(
-        publication.is_err(),
-        "the deliberately wrong digest was accepted"
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_source_chunk_splits_into_concurrent_destination_writes() -> io::Result<()> {
+    let root = TestRoot::new().await?;
+    let backend = identity("single-source-concurrent-write");
+    let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
+    let payload = Bytes::from(vec![0xa7; LOCAL_MAX_WRITE_CHUNK_BYTES + 4096]);
+    let stage = ok(adapter
+        .prepare_ephemeral(request_with_size(&backend, "final.bin", payload.len()))
+        .await);
+    adapter
+        .write_probe
+        .force_out_of_order
+        .store(true, Ordering::SeqCst);
+    let evidence = ok(adapter.write_single(&stage, payload.clone()).await);
+    assert_eq!(evidence.persisted_bytes, payload.len() as u64);
+    assert_eq!(
+        *adapter
+            .write_probe
+            .completion_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![LOCAL_MAX_WRITE_CHUNK_BYTES as u64, 0]
     );
-
-    let independent = independent.map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "publishing one final destination serialized preparation for another destination",
-        )
-    })?;
-    let independent = independent.map_err(io::Error::other)?;
-    ok(adapter.discard(independent).await);
+    assert_eq!(
+        tokio::fs::read(ok(adapter.stage_full_path(&stage, Operation::Verify))).await?,
+        payload
+    );
+    assert!(!root.0.join("final.bin").exists());
+    ok(adapter.discard(stage).await);
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_fail_if_exists_publications_commit_exactly_one_complete_file() -> io::Result<()>
-{
+#[tokio::test]
+async fn checkpoint_persistence_overlaps_the_next_write_window() -> io::Result<()> {
     let root = TestRoot::new().await?;
-    let backend = identity("local-concurrent-create-publication-test");
-    let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 1));
-    let left_payload = Bytes::from_static(b"left-complete");
-    let right_payload = Bytes::from_static(b"right-complete");
-
-    let left = ok(adapter
-        .prepare_ephemeral(request_with_size(
-            &backend,
-            "shared-final.bin",
-            left_payload.len(),
-        ))
-        .await);
-    let right = ok(adapter
-        .prepare_ephemeral(request_with_size(
-            &backend,
-            "shared-final.bin",
-            right_payload.len(),
-        ))
-        .await);
-    ok(adapter
-        .write(&left, owned_bytes(vec![left_payload.clone()]))
-        .await);
-    ok(adapter
-        .write(&right, owned_bytes(vec![right_payload.clone()]))
-        .await);
-
-    let publish_request = |payload: &Bytes| PublishRequest {
-        policy: ExistingDestinationPolicy::FailIfExists,
-        expected_size: payload.len() as u64,
-        expected_blake3: *blake3::hash(payload).as_bytes(),
-        cancel: tokio_util::sync::CancellationToken::new(),
-    };
-    let (left_result, right_result) = tokio::join!(
-        adapter.publish(&left, publish_request(&left_payload)),
-        adapter.publish(&right, publish_request(&right_payload)),
+    let backend = identity("checkpoint-overlap");
+    let adapter = Arc::new(ok(LocalStagedDestination::new(&root.0, backend.clone(), 2)));
+    let stage = ok(adapter.prepare(request(&backend, "final.bin")).await);
+    let probe = Arc::clone(&adapter.write_probe);
+    probe.pause_checkpoint.store(true, Ordering::SeqCst);
+    let writing = Arc::clone(&adapter);
+    let writer = tokio::spawn(async move {
+        let input = stream::iter((0..5).map(|_| Ok(Bytes::from(vec![42; 64 * 1024]))));
+        let result = writing.write(&stage, Box::pin(input)).await;
+        (stage, result)
+    });
+    tokio::time::timeout(Duration::from_secs(3), probe.checkpoint_started.notified()).await?;
+    let advanced = tokio::time::timeout(Duration::from_secs(1), async {
+        while adapter.write_completion_count() < 5 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    probe.checkpoint_release.notify_one();
+    let (stage, result) = writer.await?;
+    assert_eq!(ok(result).persisted_bytes, 5 * 64 * 1024);
+    assert!(
+        advanced.is_ok(),
+        "checkpoint persistence stalled subsequent writes"
     );
-
     assert_eq!(
-        usize::from(left_result.is_ok()) + usize::from(right_result.is_ok()),
-        1
+        tokio::fs::read(
+            adapter
+                .stage_full_path(&stage, Operation::Read)
+                .map_err(io::Error::other)?
+        )
+        .await?,
+        vec![42; 5 * 64 * 1024]
     );
-    if left_result.is_err() {
-        ok(adapter.discard(left).await);
-    }
-    if right_result.is_err() {
-        ok(adapter.discard(right).await);
-    }
-    let final_content = tokio::fs::read(root.0.join("shared-final.bin")).await?;
-    assert!(final_content == left_payload || final_content == right_payload);
+    assert_eq!(
+        ok(adapter.observe_checkpoint(&stage).await).durable_prefix,
+        5 * 64 * 1024
+    );
+    ok(adapter.discard(stage).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn nested_stages_recover_in_the_parent() -> io::Result<()> {
+    let root = TestRoot::new().await?;
+    let backend = identity("nested-stage-recovery");
+    let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
+    let prepare = request(&backend, "nested/deep/final.bin");
+    let stage = ok(adapter.prepare(prepare.clone()).await);
+    let stage_path = ok(adapter.stage_full_path(&stage, Operation::Read));
+    assert_eq!(
+        stage_path.parent(),
+        Some(root.0.join("nested/deep").as_path())
+    );
+    assert!(!root.0.join(STAGING_DIRECTORY).exists());
+    ok(adapter
+        .write(&stage, owned_bytes(vec![Bytes::from_static(b"new-bytes")]))
+        .await);
+    let recovery = ok(adapter.recovery_identity(&stage).await);
+    drop(stage);
+    let recovered = ok(adapter
+        .recover(RecoverRequest {
+            identity: recovery,
+            final_destination: prepare.final_destination,
+            source: prepare.source,
+            recovery_binding: prepare.recovery_binding,
+            claim_token: [3; 32],
+        })
+        .await);
+    assert_eq!(recovered.write_offset, 9);
+    ok(adapter
+        .publish(
+            &recovered,
+            PublishRequest {
+                expected_size: 9,
+                expected_blake3: *blake3::hash(b"new-bytes").as_bytes(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+            },
+        )
+        .await
+        .map_err(|error| error.error));
+    assert_eq!(
+        std::fs::read(root.0.join("nested/deep/final.bin"))?,
+        b"new-bytes"
+    );
     assert!(staging_is_empty(&root.0)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn publication_resolves_a_replaced_parent_and_preserves_existing_entries() -> io::Result<()> {
+    let root = TestRoot::new().await?;
+    let backend = identity("replaced-publication-parent");
+    let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
+    let stage = ok(adapter
+        .prepare_ephemeral(request(&backend, "nested/final.bin"))
+        .await);
+    ok(adapter
+        .write(&stage, owned_bytes(vec![Bytes::from_static(b"new-bytes")]))
+        .await);
+    tokio::fs::rename(root.0.join("nested"), root.0.join("moved")).await?;
+    tokio::fs::create_dir(root.0.join("nested")).await?;
+    tokio::fs::write(root.0.join("nested/unrelated.bin"), b"keep me").await?;
+    ok(adapter
+        .publish(
+            &stage,
+            PublishRequest {
+                expected_size: 9,
+                expected_blake3: *blake3::hash(b"new-bytes").as_bytes(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+            },
+        )
+        .await
+        .map_err(|error| error.error));
+    assert_eq!(
+        tokio::fs::read(root.0.join("nested/final.bin")).await?,
+        b"new-bytes"
+    );
+    assert_eq!(
+        tokio::fs::read(root.0.join("nested/unrelated.bin")).await?,
+        b"keep me"
+    );
+    assert!(
+        tokio::fs::read_dir(root.0.join("moved"))
+            .await?
+            .next_entry()
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_writes_normalize_the_previous_tail() -> io::Result<()> {
+    for single in [false, true] {
+        let root = TestRoot::new().await?;
+        let backend = identity("repeated-stage-length");
+        let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
+        let stage = ok(adapter
+            .prepare_ephemeral(request(&backend, "final.bin"))
+            .await);
+        for payload in [b"long payload".as_slice(), b"new", b""] {
+            let data = Bytes::copy_from_slice(payload);
+            if single {
+                ok(adapter.write_single(&stage, data).await);
+            } else {
+                ok(adapter.write(&stage, owned_bytes(vec![data])).await);
+            }
+            assert_eq!(
+                tokio::fs::read(
+                    adapter
+                        .stage_full_path(&stage, Operation::Write)
+                        .map_err(io::Error::other)?
+                )
+                .await?,
+                payload
+            );
+        }
+        ok(adapter.discard(stage).await);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovered_stage_with_no_remaining_input_removes_uncheckpointed_tail() -> io::Result<()> {
+    let root = TestRoot::new().await?;
+    let backend = identity("recovered-stage-tail");
+    let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
+    let stage = ok(adapter.prepare(request(&backend, "final.bin")).await);
+    ok(adapter.write(&stage, bytes(&[b"abc"])).await);
+    let recovery = ok(adapter.recovery_identity(&stage).await);
+    let path = ok(adapter.stage_full_path(&stage, Operation::Write));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)?
+        .set_len(128)?;
+    stage.release_claim();
+    let recovered = ok(adapter
+        .recover(RecoverRequest {
+            final_destination: stage.final_destination.clone(),
+            recovery_binding: stage.recovery_binding,
+            identity: recovery,
+            source: request(&backend, "final.bin").source,
+            claim_token: [3; 32],
+        })
+        .await);
+    ok(adapter.write(&recovered, bytes(&[])).await);
+    assert_eq!(tokio::fs::read(path).await?, b"abc");
+    ok(adapter.discard(recovered).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_first_write_does_not_skip_length_normalization_on_retry() -> io::Result<()> {
+    let root = TestRoot::new().await?;
+    let backend = identity("failed-stage-retry");
+    let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
+    let stage = ok(adapter
+        .prepare_ephemeral(request(&backend, "final.bin"))
+        .await);
+    let error = failure(
+        stage.final_destination.path(),
+        Operation::Write,
+        FailureClass::Cancelled,
+    );
+    let input = Box::pin(stream::iter([
+        Ok(Bytes::from_static(b"partial")),
+        Err(error),
+    ]));
+    assert!(adapter.write(&stage, input).await.is_err());
+    ok(adapter.write(&stage, bytes(&[])).await);
+    assert_eq!(
+        tokio::fs::metadata(ok(adapter.stage_full_path(&stage, Operation::Write)))
+            .await?
+            .len(),
+        0
+    );
+    ok(adapter.discard(stage).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cached_stage_rejects_a_rebound_token() -> io::Result<()> {
+    let root = TestRoot::new().await?;
+    let backend = identity("cached-stage-binding");
+    let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
+    let mut first = ok(adapter
+        .prepare_ephemeral(request(&backend, "final.bin"))
+        .await);
+    let second = ok(adapter
+        .prepare_ephemeral(request(&backend, "final.bin"))
+        .await);
+    let original = first.token.clone();
+    first.token = second.token.clone();
+    assert!(
+        adapter
+            .write_single(&first, Bytes::from_static(b"wrong"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        tokio::fs::metadata(ok(adapter.stage_full_path(&second, Operation::Write)))
+            .await?
+            .len(),
+        0
+    );
+    first.token = original;
+    ok(adapter.discard(first).await);
+    ok(adapter.discard(second).await);
     Ok(())
 }

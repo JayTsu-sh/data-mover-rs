@@ -4,10 +4,7 @@ use bytes::Bytes;
 use futures::stream;
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    InflightLimits, RecoveryContext, RecoveryProvider, RecoveryRegistrar,
-    RecoveryRegistrationFailure, Resumability, TransferIdentity, TransferRequest, transfer,
-};
+use super::{InflightLimits, TransferIdentity, TransferPolicy, TransferRequest, transfer};
 use crate::model::{
     FailureClass, MappedOwnership, ObservationMode, ObservationPlan, Operation, StoragePath,
     StorageTimestamp, TimePrecision, TimestampMetadata,
@@ -16,47 +13,14 @@ use crate::storage::backends::hdfs::contract_tests::MemoryHdfs;
 use crate::storage::backends::hdfs::protocol::cancelled;
 use crate::storage::backends::hdfs::{connect, test_identity};
 use crate::storage::{
-    ExistingDestinationPolicy, FinalDestination, MetadataMutation, PreflightPolicy, PrepareRequest,
-    PublicationDisposition, PublishRequest, RecoverRequest, RecoveryIdentity, Storage,
+    FinalDestination, MetadataMutation, PreflightPolicy, PrepareRequest, PublishRequest,
+    RecoverRequest, RecoveryIdentity, Storage,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-struct AcceptingRecoveryRegistrar;
-
-#[async_trait::async_trait]
-impl RecoveryRegistrar for AcceptingRecoveryRegistrar {
-    async fn register(
-        &self,
-        _identity: RecoveryIdentity,
-    ) -> Result<(), RecoveryRegistrationFailure> {
-        Ok(())
-    }
-}
-
-struct HdfsRecoveryProvider {
-    identity: Option<RecoveryIdentity>,
-}
-
-#[async_trait::async_trait]
-impl RecoveryProvider for HdfsRecoveryProvider {
-    async fn open(&self) -> Result<RecoveryContext, RecoveryRegistrationFailure> {
-        Ok(RecoveryContext::new(
-            self.identity.clone(),
-            [7; 32],
-            Arc::new(AcceptingRecoveryRegistrar),
-        ))
-    }
-}
-
-fn recoverable_request(
-    request: TransferRequest,
-    identity: Option<RecoveryIdentity>,
-) -> TransferRequest {
-    request.with_recovery(
-        Resumability::Enabled,
-        Some(Arc::new(HdfsRecoveryProvider { identity })),
-    )
+fn recoverable_request(request: TransferRequest, _resume_marker: Option<()>) -> TransferRequest {
+    request.with_transfer_policy(TransferPolicy::Checkpointed)
 }
 
 fn request(source: Storage, destination: Storage) -> TestResult<TransferRequest> {
@@ -304,44 +268,6 @@ async fn hdfs_recovery_rejects_tampering_and_competing_claims_without_mutation()
 }
 
 #[tokio::test]
-async fn invalid_identity_preserves_unknown_hdfs_stage_without_reupload() -> TestResult {
-    let protocol = Arc::new(MemoryHdfs::default());
-    let payload = Bytes::from(vec![0x72; 128 * 1024]);
-    protocol.insert("source", payload).await;
-    let source = connect(protocol.clone(), test_identity("restart-source")?)?;
-    let destination = connect(protocol.clone(), test_identity("restart-destination")?)?;
-    let descriptor = source
-        .read_source(&PreflightPolicy::production())?
-        .describe(&StoragePath::new("source")?)
-        .await?;
-    let staged = destination.staged_destination(&PreflightPolicy::production())?;
-    let unknown = staged
-        .prepare(PrepareRequest {
-            final_destination: FinalDestination::new(StoragePath::new("final")?),
-            source: descriptor,
-            recovery_binding: [7; 32],
-        })
-        .await?;
-    let recovery = staged.recovery_identity(&unknown).await?;
-    let mut bytes = recovery.as_bytes().to_vec();
-    let last = bytes
-        .len()
-        .checked_sub(1)
-        .ok_or("empty recovery identity")?;
-    bytes[last] ^= 1;
-    let recovery = RecoveryIdentity::from_bytes(bytes)?;
-    let result = transfer(recoverable_request(
-        request(source, destination)?,
-        Some(recovery),
-    ))
-    .await;
-    assert!(result.is_err());
-    assert!(protocol.get("final").await.is_none());
-    assert_eq!(protocol.len().await, 2);
-    Ok(())
-}
-
-#[tokio::test]
 async fn require_resume_reclaims_hdfs_stage_before_reupload() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     let payload = Bytes::from(vec![0x72; 64 * 1024]);
@@ -353,18 +279,11 @@ async fn require_resume_reclaims_hdfs_stage_before_reupload() -> TestResult {
         .await
         .err()
         .ok_or("injected HDFS failure succeeded")?;
-    let identity = failure
-        .into_recovery_identity()
-        .await
-        .map_err(|(_, error)| error)?;
+    drop(failure);
     protocol.allow_writes();
     let source = connect(protocol.clone(), test_identity("require-source")?)?;
     let destination = connect(protocol.clone(), test_identity("require-destination")?)?;
-    let outcome = transfer(recoverable_request(
-        request(source, destination)?,
-        Some(identity),
-    ))
-    .await?;
+    let outcome = transfer(recoverable_request(request(source, destination)?, None)).await?;
     assert_eq!(outcome.transferred_bytes, payload.len() as u64);
     assert_eq!(
         protocol.get("final").await.as_deref(),
@@ -437,52 +356,8 @@ async fn hdfs_metadata_observation_is_plan_scoped() -> TestResult {
     assert_eq!(protocol.metadata_calls().await.len(), 2);
     Ok(())
 }
-
 #[tokio::test]
-async fn verify_or_skip_keeps_equivalent_hdfs_final() -> TestResult {
-    let protocol = Arc::new(MemoryHdfs::default());
-    let payload = Bytes::from_static(b"same");
-    protocol.insert("source", payload.clone()).await;
-    let source = connect(protocol.clone(), test_identity("publish-source")?)?;
-    let destination = connect(protocol.clone(), test_identity("publish-dest")?)?;
-    let descriptor = source
-        .read_source(&PreflightPolicy::production())?
-        .describe(&StoragePath::new("source")?)
-        .await?;
-    protocol.insert("final", payload.clone()).await;
-    let staged = destination.staged_destination(&PreflightPolicy::production())?;
-    let stage = staged
-        .prepare(PrepareRequest {
-            final_destination: FinalDestination::new(StoragePath::new("final")?),
-            source: descriptor,
-            recovery_binding: [9; 32],
-        })
-        .await?;
-    staged
-        .write(&stage, Box::pin(stream::iter([Ok(payload.clone())])))
-        .await?;
-    let evidence = staged
-        .publish(
-            &stage,
-            PublishRequest {
-                policy: ExistingDestinationPolicy::VerifyOrSkip,
-                expected_size: payload.len() as u64,
-                expected_blake3: *blake3::hash(&payload).as_bytes(),
-                cancel: CancellationToken::new(),
-            },
-        )
-        .await
-        .map_err(|failure| failure.error)?;
-    assert_eq!(
-        evidence.disposition,
-        PublicationDisposition::ExistingEquivalent
-    );
-    assert_eq!(protocol.get("final").await, Some(payload));
-    Ok(())
-}
-
-#[tokio::test]
-async fn hdfs_publication_reports_conflict_and_ambiguous_commit_truthfully() -> TestResult {
+async fn hdfs_publication_reports_ambiguous_commit_truthfully() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     let payload = Bytes::from_static(b"replacement");
     protocol.insert("source", payload.clone()).await;
@@ -503,33 +378,6 @@ async fn hdfs_publication_reports_conflict_and_ambiguous_commit_truthfully() -> 
         source: descriptor.clone(),
         recovery_binding: binding,
     };
-    let conflict_stage = staged.prepare(prepare([2; 32])).await?;
-    staged
-        .write(
-            &conflict_stage,
-            Box::pin(stream::iter([Ok(payload.clone())])),
-        )
-        .await?;
-    let conflict = staged
-        .publish(
-            &conflict_stage,
-            PublishRequest {
-                policy: ExistingDestinationPolicy::FailIfExists,
-                expected_size: payload.len() as u64,
-                expected_blake3: *blake3::hash(&payload).as_bytes(),
-                cancel: CancellationToken::new(),
-            },
-        )
-        .await
-        .err()
-        .ok_or("FailIfExists unexpectedly published")?;
-    assert!(!conflict.final_destination_changed);
-    assert_eq!(
-        protocol.get("final").await.as_deref(),
-        Some(b"original".as_slice())
-    );
-    staged.discard(conflict_stage).await?;
-
     let ambiguous_stage = staged.prepare(prepare([3; 32])).await?;
     staged
         .write(
@@ -542,7 +390,6 @@ async fn hdfs_publication_reports_conflict_and_ambiguous_commit_truthfully() -> 
         .publish(
             &ambiguous_stage,
             PublishRequest {
-                policy: ExistingDestinationPolicy::Overwrite,
                 expected_size: payload.len() as u64,
                 expected_blake3: *blake3::hash(&payload).as_bytes(),
                 cancel: CancellationToken::new(),

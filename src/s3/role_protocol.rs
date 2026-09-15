@@ -652,6 +652,7 @@ mod tests {
                 b"invalid-source",
             )?,
             backend_fact: None,
+            content_version: None,
         };
         let path = StoragePath::new(format!(
             "{}.manifest",

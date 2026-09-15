@@ -10,11 +10,11 @@ use data_mover::model::{
     ObservationPlan, OwnershipMode, StoragePath, Transience,
 };
 use data_mover::storage::{
-    ByteStream, ExistingDestinationPolicy, FinalDestination, MetadataMutation, PreflightPolicy,
-    PrepareRequest, PublishRequest, RecoverRequest, Storage, StorageRoleFailure, VerifyRequest,
+    ByteStream, FinalDestination, MetadataMutation, PreflightPolicy, PrepareRequest,
+    PublishRequest, RecoverRequest, Storage, StorageRoleFailure, VerifyRequest,
 };
 use data_mover::transfer::{
-    InflightLimits, Resumability, SourceQosGroup, SourceQosPolicy, TransferIdentity,
+    InflightLimits, SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferPolicy,
     TransferRequest, transfer,
 };
 use data_mover::traversal::{
@@ -165,30 +165,41 @@ async fn seed_nfs4_fixture(
         let file = format!("{root}/{relative}");
         let _ = mount.remove_path(&file).await;
         let created = mount.create_path(&file, Some(0o600)).await?;
-        let count = mount
+        let outcome = mount
             .write(created.fh.clone(), 0, Bytes::copy_from_slice(payload))
             .await?;
-        if usize::try_from(count)? != payload.len() {
+        if usize::try_from(outcome.count)? != payload.len() {
             return Err("NFSv4.0 fixture write was short".into());
         }
-        mount.commit(created.fh.clone(), 0, count).await?;
+        mount
+            .commit_write_batch(
+                created.fh.clone(),
+                0,
+                outcome.count,
+                std::slice::from_ref(&outcome),
+            )
+            .await?;
         mount.close(created.fh).await?;
     }
     let cancellation_file = format!("{root}/cancellation.bin");
     let _ = mount.remove_path(&cancellation_file).await;
     let created = mount.create_path(&cancellation_file, Some(0o600)).await?;
     let chunk = Bytes::from(vec![0x5a; 64 * 1024]);
+    let mut outcomes = Vec::with_capacity(8);
     for index in 0..8_u64 {
         let offset = index * chunk.len() as u64;
-        let count = mount
+        let outcome = mount
             .write(created.fh.clone(), offset, chunk.clone())
             .await?;
-        if usize::try_from(count)? != chunk.len() {
+        if usize::try_from(outcome.count)? != chunk.len() {
             return Err("NFSv4.0 cancellation fixture write was short".into());
         }
+        outcomes.push(outcome);
     }
     let fixture_size = 8 * u32::try_from(chunk.len())?;
-    mount.commit(created.fh.clone(), 0, fixture_size).await?;
+    mount
+        .commit_write_batch(created.fh.clone(), 0, fixture_size, &outcomes)
+        .await?;
     mount.close(created.fh).await?;
     let link = format!("{root}/fixture.link");
     let _ = mount.remove_path(&link).await;
@@ -226,8 +237,15 @@ async fn validate_nfs4_stale_retry(
     mount.remove_path(&native).await?;
     let replacement = mount.create_path(&native, Some(0o600)).await?;
     let payload = Bytes::from_static(b"stale-handle-fixture");
-    let count = mount.write(replacement.fh.clone(), 0, payload).await?;
-    mount.commit(replacement.fh.clone(), 0, count).await?;
+    let outcome = mount.write(replacement.fh.clone(), 0, payload).await?;
+    mount
+        .commit_write_batch(
+            replacement.fh.clone(),
+            0,
+            outcome.count,
+            std::slice::from_ref(&outcome),
+        )
+        .await?;
     mount.close(replacement.fh).await?;
     let fresh = mount.lookup_path(&native).await?;
     if old.attr.as_ref().map(|attr| attr.fileid) == fresh.attr.as_ref().map(|attr| attr.fileid) {
@@ -390,8 +408,7 @@ async fn validate_streaming_copy(source: &Storage, destination: &Storage) -> Con
             Some((1024 * 1024, 1024 * 1024, Duration::ZERO)),
             64 * 1024,
             Some((100, 100, Duration::ZERO)),
-        )?))
-        .with_existing_destination_policy(ExistingDestinationPolicy::Overwrite),
+        )?)),
     )
     .await?;
     assert!(outcome.transferred_bytes > 0);
@@ -441,8 +458,7 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
             InflightLimits::new(4, 256 * 1024, 4)?,
             CancellationToken::new(),
         )
-        .with_recovery(Resumability::Enabled, None)
-        .with_existing_destination_policy(ExistingDestinationPolicy::Overwrite),
+        .with_transfer_policy(TransferPolicy::Checkpointed),
     )
     .await?;
     if outcome.transferred_bytes != 8 * 64 * 1024 {
@@ -531,7 +547,6 @@ async fn validate_recovery(source: &Storage, destination: Storage, url: &str) ->
         .publish(
             &recovered,
             PublishRequest {
-                policy: ExistingDestinationPolicy::Overwrite,
                 expected_size: payload.len() as u64,
                 expected_blake3: hash,
                 cancel: CancellationToken::new(),

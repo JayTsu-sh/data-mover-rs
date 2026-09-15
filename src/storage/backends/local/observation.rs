@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use crate::model::SpecialFileKind;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -5,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use std::{collections::HashMap, time::Duration};
 
+use async_trait::async_trait;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, Metadata};
 
@@ -12,10 +15,10 @@ use crate::model::{
     AclMetadata, BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure,
     ExtendedAttribute, FailureClass, IdentityStrength, MetadataObservation, MetadataObservations,
     MetadataProvenance, ObservationMode, ObservationPlan, ObservedEntry, Operation, OwnershipMode,
-    SourceIdentity, SpecialFileKind, StoragePath, StorageTimestamp, SymlinkTarget,
-    SymlinkTargetEncoding, TimePrecision, TimestampMetadata, Transience,
+    SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding,
+    TimePrecision, TimestampMetadata, Transience,
 };
-use crate::storage::StorageRoleFailure;
+use crate::storage::{Metadata as MetadataRole, MetadataMutation, StorageRoleFailure};
 
 pub(crate) struct LocalObservationAdapter {
     root: Arc<Dir>,
@@ -203,6 +206,16 @@ impl LocalObservationAdapter {
         path: StoragePath,
         plan: ObservationPlan,
     ) -> Result<ObservedEntry, StorageRoleFailure> {
+        self.observe_versioned(path, plan)
+            .await
+            .map(|(entry, _)| entry)
+    }
+
+    pub(crate) async fn observe_versioned(
+        &self,
+        path: StoragePath,
+        plan: ObservationPlan,
+    ) -> Result<(ObservedEntry, bytes::Bytes), StorageRoleFailure> {
         #[cfg(test)]
         let _probe = self.probe.enter(&path).await;
         let relative = checked_relative(&path)?;
@@ -227,10 +240,11 @@ impl LocalObservationAdapter {
             None => ObservedEntry::new(path, kind, size, modified, source_identity),
         }
         .map_err(|_| failure(&StoragePath::root(), FailureClass::Internal))?;
-        observed
+        let observed = observed
             .with_metadata(metadata_observations)
             .with_backend_fact_bytes(facts)
-            .map_err(|_| failure(&StoragePath::root(), FailureClass::Internal))
+            .map_err(|_| failure(&StoragePath::root(), FailureClass::Internal))?;
+        Ok((observed, content_version(&metadata)))
     }
 
     async fn observe_metadata(
@@ -340,6 +354,91 @@ impl LocalObservationAdapter {
         SymlinkTarget::new(encoding, bytes)
             .map(Some)
             .map_err(|_| failure(path, FailureClass::Protocol))
+    }
+}
+
+#[async_trait]
+impl MetadataRole for LocalObservationAdapter {
+    fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
+        #[cfg(unix)]
+        {
+            Some(
+                ObservationPlan::default()
+                    .with_ownership_mode(ObservationMode::InlineOnly)
+                    .with_timestamps(ObservationMode::InlineOnly),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    async fn observe(
+        &self,
+        path: &StoragePath,
+        plan: ObservationPlan,
+    ) -> Result<MetadataObservations, StorageRoleFailure> {
+        #[cfg(test)]
+        let _probe = self.probe.enter(path).await;
+        let relative = checked_relative(path)?;
+        let root = Arc::clone(&self.root);
+        let metadata = tokio::task::spawn_blocking(move || root.symlink_metadata(relative))
+            .await
+            .map_err(|_| failure(path, FailureClass::Internal))?
+            .map_err(|error| observation_io_failure(path, &error))?;
+        let kind = entry_kind(&metadata).ok_or_else(|| failure(path, FailureClass::Unsupported))?;
+        self.observe_metadata(path, kind, plan, &metadata).await
+    }
+
+    async fn observe_bound(
+        &self,
+        path: &StoragePath,
+        expected: &SourceIdentity,
+        plan: ObservationPlan,
+    ) -> Result<MetadataObservations, StorageRoleFailure> {
+        #[cfg(test)]
+        let _probe = self.probe.enter(path).await;
+        let relative = checked_relative(path)?;
+        let root = Arc::clone(&self.root);
+        let metadata = tokio::task::spawn_blocking(move || root.symlink_metadata(relative))
+            .await
+            .map_err(|_| failure(path, FailureClass::Internal))?
+            .map_err(|error| observation_io_failure(path, &error))?;
+        if source_identity(&self.identity, path, &metadata)? != *expected {
+            return Err(failure(path, FailureClass::Conflict));
+        }
+        let kind = entry_kind(&metadata).ok_or_else(|| failure(path, FailureClass::Unsupported))?;
+        self.observe_metadata(path, kind, plan, &metadata).await
+    }
+
+    async fn apply(
+        &self,
+        path: &StoragePath,
+        mutation: MetadataMutation,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        if cancel.is_cancelled() {
+            return Err(metadata_failure(path, FailureClass::Cancelled));
+        }
+        if !super::staged::local_metadata_supported(&mutation) {
+            return Err(metadata_failure(path, FailureClass::Unsupported));
+        }
+        let relative = checked_relative(path)?;
+        let root = Arc::clone(&self.root);
+        let result = tokio::task::spawn_blocking(move || {
+            if cancel.is_cancelled() {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let file = root.open(relative)?.into_std();
+            super::staged::apply_local_metadata(&file, mutation)
+        })
+        .await
+        .map_err(|_| metadata_failure(path, FailureClass::Internal))?;
+        result.map_err(|error| {
+            let (class, transience) = classify_io(error.kind());
+            metadata_failure_with_transience(path, class, transience)
+        })
     }
 }
 
@@ -594,7 +693,7 @@ pub(crate) fn source_identity(
 }
 
 #[cfg(not(unix))]
-fn source_identity(
+pub(crate) fn source_identity(
     backend: &BackendIdentity,
     path: &StoragePath,
     _metadata: &Metadata,
@@ -655,6 +754,26 @@ fn entry_failure(
     StorageRoleFailure::Entry(error)
 }
 
+fn metadata_failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure {
+    metadata_failure_with_transience(path, class, Transience::Permanent)
+}
+
+fn metadata_failure_with_transience(
+    path: &StoragePath,
+    class: FailureClass,
+    transience: Transience,
+) -> StorageRoleFailure {
+    let error = EntryOperationFailure::new(
+        path.clone(),
+        Operation::Metadata,
+        class,
+        transience,
+        "local metadata operation failed",
+    )
+    .unwrap_or_else(|_| unreachable!("static diagnostic is valid"));
+    StorageRoleFailure::Entry(error)
+}
+
 fn io_failure(path: &StoragePath, error: &io::Error) -> StorageRoleFailure {
     let (class, transience) = classify_io(error.kind());
     entry_failure(path, class, transience)
@@ -701,3 +820,30 @@ pub(crate) fn classify_io(kind: io::ErrorKind) -> (FailureClass, Transience) {
 
 #[cfg(test)]
 mod tests;
+
+// Excludes atime: reading a source must not invalidate its recovery version.
+fn content_version(metadata: &Metadata) -> bytes::Bytes {
+    let mut version = Vec::new();
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt as _;
+        for value in [
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ] {
+            version.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    for time in [metadata.modified(), metadata.created()] {
+        let nanos = time
+            .ok()
+            .and_then(|value| system_time_to_timestamp(value.into_std()))
+            .map(crate::model::StorageTimestamp::unix_nanos);
+        version.push(u8::from(nanos.is_some()));
+        version.extend_from_slice(&nanos.unwrap_or_default().to_le_bytes());
+    }
+    version.into()
+}

@@ -31,6 +31,7 @@ async fn fixture(name: &str, binding: [u8; 32]) -> TestResult<Fixture> {
         size: None,
         source_identity: SourceIdentity::new(identity(), IdentityStrength::PathScoped, b"source")?,
         backend_fact: None,
+        content_version: None,
     };
     let prepare = PrepareRequest {
         final_destination: FinalDestination::new(StoragePath::new(name)?),

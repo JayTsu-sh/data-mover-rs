@@ -1,0 +1,56 @@
+name: Windows native runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['test/windows-native-*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  native-runtime:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/cache/restore@v4
+        id: cargo-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-native-runtime-${{ hashFiles('Cargo.lock') }}
+      - name: Record native environment
+        run: |
+          [System.Environment]::OSVersion.VersionString
+          rustc -vV
+      - name: Compile library and examples
+        run: cargo check --locked --lib --examples
+      - name: Run native Local filesystem and public contracts
+        run: >-
+          cargo test --locked --no-fail-fast
+          --test local_transfer_runtime
+          --test test_local_overwrite_truncate
+          --test test_local_positional_io
+          --test test_local_write_flush
+          --test test_transfer_concurrency
+          --test transfer_public_api
+          --test hdfs_native_contract
+          -- --test-threads=1
+      - name: Save build cache even when runtime tests fail
+        if: always() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-native-runtime-${{ hashFiles('Cargo.lock') }}

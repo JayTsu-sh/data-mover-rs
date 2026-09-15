@@ -8,6 +8,73 @@ use crate::model::{BackendIdentity, BackendKind, StoragePath};
 use crate::storage::{ReadRequest, ReadSource};
 
 #[tokio::test]
+async fn prefetch_waits_for_shared_payload_capacity_before_reading()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::ReadBudget;
+    use crate::storage::{InflightConfig, InflightRuntime};
+    const CHUNK: usize = 1024 * 1024;
+    for (chunks, bytes) in [(1, 128 * CHUNK), (128, CHUNK)] {
+        let root = TestRoot::new()?;
+        std::fs::write(root.path().join("source.bin"), vec![7; 2 * CHUNK])?;
+        let identity = BackendIdentity::new(BackendKind::Local, "bounded-source")?;
+        let source = LocalReadSource::new(root.path(), identity, 128)?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (runtime, mut ordered) = InflightRuntime::channel(
+            InflightConfig::new(chunks, bytes, 128)?,
+            0,
+            (2 * CHUNK) as u64,
+            cancel.clone(),
+        )?;
+        let budget = ReadBudget::new(runtime.clone());
+        let mut stream = source
+            .read(ReadRequest {
+                path: StoragePath::new("source.bin")?,
+                range: None,
+                expected_source: None,
+                maximum_chunk_bytes: CHUNK,
+                read_inflight: 128,
+                read_budget: Some(budget.clone()),
+                cancel,
+                source_qos: None,
+            })
+            .await?;
+        let first = stream
+            .next()
+            .await
+            .transpose()?
+            .ok_or("missing first read")?;
+        assert_eq!(source.read_call_count(), 1);
+        runtime
+            .complete_read(budget.take(0).ok_or("missing reservation")?, 0, first)
+            .await?;
+        // Polling the source with the first chunk still queued cannot start a second read.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), stream.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(source.read_call_count(), 1);
+        assert!(ordered.next().await.transpose()?.is_some());
+        let second = stream
+            .next()
+            .await
+            .transpose()?
+            .ok_or("missing second read")?;
+        runtime
+            .complete_read(
+                budget.take(CHUNK as u64).ok_or("missing reservation")?,
+                CHUNK as u64,
+                second,
+            )
+            .await?;
+        assert!(ordered.next().await.transpose()?.is_some());
+        assert!(stream.next().await.is_none());
+        assert_eq!(source.read_call_count(), 2);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn role_describes_and_reads_an_exact_local_range() -> Result<(), Box<dyn std::error::Error>> {
     let root = TestRoot::new()?;
     std::fs::write(root.path().join("source.bin"), b"0123456789")?;
@@ -24,6 +91,7 @@ async fn role_describes_and_reads_an_exact_local_range() -> Result<(), Box<dyn s
             expected_source: None,
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -51,6 +119,7 @@ async fn role_splits_large_ranges_into_bounded_chunks() -> Result<(), Box<dyn st
             expected_source: None,
             maximum_chunk_bytes: 4 * 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -84,6 +153,7 @@ async fn caller_chunk_ceiling_negotiates_below_local_maximum()
             expected_source: None,
             maximum_chunk_bytes: REQUESTED_MAXIMUM,
             read_inflight: 2,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -119,6 +189,7 @@ async fn one_stream_reads_inflight_but_emits_in_admission_order()
             expected_source: None,
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -174,6 +245,7 @@ async fn inflight_stream_fast_fails_when_a_later_range_becomes_short()
             expected_source: None,
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -216,6 +288,7 @@ async fn cancellation_stops_an_active_inflight_stream_without_waiting_for_reads(
             expected_source: None,
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: cancel.clone(),
             source_qos: None,
         })
@@ -260,6 +333,7 @@ async fn one_stream_remains_bound_to_the_file_opened_at_read_start()
             expected_source: None,
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -300,6 +374,7 @@ async fn expected_identity_rejects_replacement_between_describe_and_read()
             expected_source: Some(descriptor.source_identity),
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })

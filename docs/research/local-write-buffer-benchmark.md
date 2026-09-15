@@ -1,5 +1,8 @@
 # Local 目标端最大写入 chunk 独立基准调研
 
+> 后续决策（2026-09-10）：Local 内部写任务上限已调整为 8 MiB。本文保留原始基准和
+> 当时选择 5 MiB 的分析；现行决策见 ADR-0002。Auto 检查点间隔独立固定为 64 MiB。
+
 - 调研日期：2026-09-01
 - 仓库基线：`76fdb81738df32a85284a974e1fea7570590a2b9`，并检查当前工作区改动
 - 范围：Linux buffered positional I/O；当前 role-based Local staged destination

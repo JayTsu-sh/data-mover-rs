@@ -1,10 +1,10 @@
+use super::super::S3Protocol;
 use super::super::source::{cancelled, entry, role_failure};
-use super::super::{S3Protocol, S3ProtocolFailure};
 use super::S3StagedDestination;
 use crate::model::Operation;
 use crate::storage::{
-    ExistingDestinationPolicy, PreparedStage, PublicationDisposition, PublicationEvidence,
-    PublicationFailure, PublishRequest, StorageRoleFailure,
+    PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
+    StorageRoleFailure,
 };
 
 pub(super) async fn publish<P: S3Protocol>(
@@ -13,11 +13,6 @@ pub(super) async fn publish<P: S3Protocol>(
     request: PublishRequest,
 ) -> Result<PublicationEvidence, PublicationFailure> {
     let key = validated_stage(adapter, stage, &request).await?;
-    if destination_exists(adapter, stage).await?
-        && let Some(evidence) = apply_existing_policy(adapter, stage, &key, &request).await?
-    {
-        return Ok(evidence);
-    }
     copy_or_reconcile(adapter, stage, &key, &request).await?;
     cleanup(adapter, stage, &key, true).await?;
     Ok(evidence(stage, PublicationDisposition::Published))
@@ -54,58 +49,6 @@ async fn validated_stage<P: S3Protocol>(
         )));
     }
     Ok(key)
-}
-
-async fn destination_exists<P: S3Protocol>(
-    adapter: &S3StagedDestination<P>,
-    stage: &PreparedStage,
-) -> Result<bool, PublicationFailure> {
-    match adapter
-        .protocol
-        .head(stage.final_destination.path().as_str())
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(S3ProtocolFailure::Entry {
-            class: crate::model::FailureClass::NotFound,
-            ..
-        }) => Ok(false),
-        Err(failure) => Err(unchanged_failure(role_failure(
-            stage.final_destination.path(),
-            Operation::Publish,
-            failure,
-        ))),
-    }
-}
-
-async fn apply_existing_policy<P: S3Protocol>(
-    adapter: &S3StagedDestination<P>,
-    stage: &PreparedStage,
-    key: &str,
-    request: &PublishRequest,
-) -> Result<Option<PublicationEvidence>, PublicationFailure> {
-    match request.policy {
-        ExistingDestinationPolicy::FailIfExists => Err(unchanged_failure(entry(
-            stage.final_destination.path(),
-            Operation::Publish,
-            "destination exists",
-        ))),
-        ExistingDestinationPolicy::Overwrite => Ok(None),
-        ExistingDestinationPolicy::VerifyOrSkip => {
-            if !matches_expected(adapter, stage, request).await? {
-                return Err(unchanged_failure(entry(
-                    stage.final_destination.path(),
-                    Operation::Publish,
-                    "existing destination differs",
-                )));
-            }
-            cleanup(adapter, stage, key, false).await?;
-            Ok(Some(evidence(
-                stage,
-                PublicationDisposition::ExistingEquivalent,
-            )))
-        }
-    }
 }
 
 async fn copy_or_reconcile<P: S3Protocol>(

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use super::{
-    EntryEnum, MAX_STALE_RETRIES, NFSStorage, classify_role_error, invalidate_path_cache,
+    MAX_STALE_RETRIES, NFSStorage, classify_role_error, invalidate_path_cache,
     is_retryable_with_invalidation,
 };
 use crate::storage::backends::nfs::metadata::{NfsMetadataInline, NfsMetadataProtocol};
@@ -33,21 +33,16 @@ impl NfsMetadataProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
     ) -> Result<NfsMetadataInline, NfsProtocolFailure> {
-        let entry = self
-            .get_metadata(Path::new(path.as_str()))
-            .await
-            .map_err(classify_role_error)?;
-        let EntryEnum::NAS(entry) = entry else {
-            return Err(NfsProtocolFailure::protocol());
-        };
+        let (file_handle, attrs) = self.role_lookup_with_attrs(path).await?;
         Ok(NfsMetadataInline {
-            symlink: entry.is_symlink,
-            uid: entry.uid,
-            gid: entry.gid,
-            mode: entry.mode,
-            atime: entry.atime,
-            mtime: entry.mtime,
-            ctime: entry.ctime,
+            file_handle,
+            symlink: attrs.type_ == super::FType3::NF3LNK as u32,
+            uid: Some(attrs.uid),
+            gid: Some(attrs.gid),
+            mode: attrs.file_mode,
+            atime: super::time_to_i64(attrs.atime),
+            mtime: super::time_to_i64(attrs.mtime),
+            ctime: super::time_to_i64(attrs.ctime),
         })
     }
 

@@ -37,7 +37,7 @@ class Nfs40ContractTest(unittest.TestCase):
         contract = (ROOT / "examples/nfs3_contract.rs").read_text()
         self.assertIn("validate_cancel_and_restart", contract)
         self.assertIn("failure.discard_stage().await?", contract)
-        self.assertIn("Resumability::Enabled, None", contract)
+        self.assertIn("TransferPolicy::Checkpointed", contract)
         self.assertIn("has_recoverable_stage", contract)
         self.assertIn("cancel.cancel()", contract)
 

@@ -12,12 +12,11 @@ use crate::metadata::MetadataPlan;
 use crate::model::observation::PrivateBackendEntryFacts;
 use crate::model::{EntryIdentityKey, EntryKind, ObservedEntry, StoragePath};
 use crate::storage::{
-    CheckpointObservation, ExistingDestinationPolicy, FinalDestination, PreflightPolicy,
-    PrepareRequest, PublicationEvidence, PublishRequest, ReadSource, SourceDescriptor,
-    SourceQosBudget, SourceQosGroup, SourceQosStats, StagedDestination, Storage, VerifyRequest,
-    WriteEvidence,
+    CheckpointObservation, FinalDestination, PreflightPolicy, PrepareRequest, PublicationEvidence,
+    PublishRequest, ReadSource, SourceDescriptor, SourceQosBudget, SourceQosGroup, SourceQosStats,
+    StagedDestination, Storage, VerifyRequest, WriteEvidence,
 };
-use crate::transfer::{InflightLimits, RecoveryProvider, Resumability, TransferIdentity};
+use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy};
 
 /// Inputs owned by the source process for one expert transfer attempt.
 #[derive(Clone)]
@@ -163,6 +162,7 @@ impl ExpertSourceSession {
         )?;
         let failure = Arc::new(Mutex::new(None));
         let producer = tokio::spawn(produce(ProducerRequest {
+            hash_content: true,
             source: self.source,
             path: self.descriptor.path.clone(),
             source_identity: self.descriptor.source_identity,
@@ -283,9 +283,7 @@ pub struct ExpertDestinationRequest {
     final_path: StoragePath,
     inflight: InflightLimits,
     cancel: tokio_util::sync::CancellationToken,
-    existing_destination: ExistingDestinationPolicy,
-    resumability: Resumability,
-    recovery_provider: Option<Arc<dyn RecoveryProvider>>,
+    transfer_policy: TransferPolicy,
     metadata_plan: Option<MetadataPlan>,
 }
 
@@ -308,27 +306,14 @@ impl ExpertDestinationRequest {
             final_path,
             inflight,
             cancel,
-            existing_destination: ExistingDestinationPolicy::default(),
-            resumability: Resumability::default(),
-            recovery_provider: None,
+            transfer_policy: TransferPolicy::default(),
             metadata_plan: None,
         }
     }
 
     #[must_use]
-    pub fn with_existing_destination_policy(mut self, policy: ExistingDestinationPolicy) -> Self {
-        self.existing_destination = policy;
-        self
-    }
-
-    #[must_use]
-    pub fn with_recovery(
-        mut self,
-        resumability: Resumability,
-        provider: Option<Arc<dyn RecoveryProvider>>,
-    ) -> Self {
-        self.resumability = resumability;
-        self.recovery_provider = provider;
+    pub const fn with_transfer_policy(mut self, policy: TransferPolicy) -> Self {
+        self.transfer_policy = policy;
         self
     }
 
@@ -348,13 +333,13 @@ pub struct ExpertDestinationSession {
     maximum_chunk_bytes: usize,
     stage: crate::storage::PreparedStage,
     recovery_enabled: bool,
-    existing_destination: ExistingDestinationPolicy,
+    effective_recovery: super::EffectiveRecovery,
     cancel: tokio_util::sync::CancellationToken,
     metadata_plan: Option<MetadataPlan>,
 }
 
 impl ExpertDestinationSession {
-    /// Prepares or recovers staged state and durably registers its identity before payload.
+    /// Prepares staged state; Checkpointed registers recoverable identities before payload.
     ///
     /// # Errors
     /// Returns a phase-attributed preflight, recovery, registration, or destination failure.
@@ -365,21 +350,10 @@ impl ExpertDestinationSession {
                 "expert source chunk ceiling must be non-zero",
             ));
         }
-        if request.resumability == Resumability::Disabled && request.recovery_provider.is_some() {
-            return Err(TransferFailure::orchestration(
-                TransferPhase::Preflight,
-                "disabled resumability cannot accept a recovery provider",
-            ));
-        }
-        if request.existing_destination == ExistingDestinationPolicy::VerifyOrSkip
-            && request
-                .metadata_plan
-                .as_ref()
-                .is_some_and(MetadataPlan::has_mutations)
-        {
-            return Err(TransferFailure::orchestration(
-                TransferPhase::Preflight,
-                "VerifyOrSkip cannot retain an existing object when staged metadata must change",
+        if request.transfer_policy == TransferPolicy::Direct {
+            return Err(TransferFailure::capability(
+                TransferSide::Destination,
+                "Direct requires the ordinary transfer entry with source identity validation",
             ));
         }
         let source = descriptor_from_observation(&request.source)?;
@@ -390,14 +364,15 @@ impl ExpertDestinationSession {
             .inflight
             .negotiated_chunk_ceiling()
             .min(request.source_maximum_chunk_bytes);
-        let recovery_enabled = request.resumability == Resumability::Enabled
+        let recovery_enabled = request.transfer_policy == TransferPolicy::Checkpointed
             && source_size > maximum_chunk_bytes as u64;
-        if recovery_enabled && request.recovery_provider.is_none() {
-            return Err(TransferFailure::orchestration(
-                TransferPhase::Preflight,
-                "recoverable transfer requires a recovery provider",
-            ));
-        }
+        let effective_recovery = if request.transfer_policy == TransferPolicy::AtomicReplace {
+            super::EffectiveRecovery::Disabled
+        } else if recovery_enabled {
+            super::EffectiveRecovery::Checkpointed
+        } else {
+            super::EffectiveRecovery::SkippedSingleSourceChunk
+        };
         let destination = request
             .destination
             .staged_destination(&PreflightPolicy::production())
@@ -413,8 +388,9 @@ impl ExpertDestinationSession {
                 "expert destination transfer was cancelled",
             ));
         }
-        let stage =
+        let mut stage =
             prepare_destination_stage(&request, &destination, &source, recovery_enabled).await?;
+        stage.durable_publication = request.transfer_policy == TransferPolicy::Checkpointed;
         Ok(Self {
             destination,
             source,
@@ -422,7 +398,7 @@ impl ExpertDestinationSession {
             maximum_chunk_bytes,
             stage,
             recovery_enabled,
-            existing_destination: request.existing_destination,
+            effective_recovery,
             cancel: request.cancel,
             metadata_plan: request.metadata_plan,
         })
@@ -448,7 +424,20 @@ impl ExpertDestinationSession {
     /// # Errors
     /// Returns the destination cleanup failure.
     pub async fn discard(self) -> Result<(), crate::storage::StorageRoleFailure> {
-        self.destination.discard(self.stage).await
+        let binding = self.stage.recovery_binding();
+        let recovery_enabled = self.stage.recovery_enabled();
+        self.destination.discard(self.stage).await?;
+        if recovery_enabled {
+            super::super::recovery_store::complete(binding)
+                .await
+                .map_err(|_| {
+                    super::source_failure(
+                        &StoragePath::root(),
+                        crate::model::FailureClass::Internal,
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     /// Writes the caller-owned bounded transport stream into the prepared destination.
@@ -494,7 +483,7 @@ impl ExpertDestinationSession {
         {
             return Err(TransferFailure::orchestration(
                 TransferPhase::Checkpoint,
-                "durable bytes differ from source size",
+                "completed bytes differ from source size",
             )
             .with_stage(self.destination, self.stage));
         }
@@ -505,9 +494,9 @@ impl ExpertDestinationSession {
             stage: self.stage,
             _write: write,
             checkpoint,
-            existing_destination: self.existing_destination,
             cancel: self.cancel,
             metadata_plan: self.metadata_plan,
+            effective_recovery: self.effective_recovery,
         })
     }
 }
@@ -518,28 +507,24 @@ async fn prepare_destination_stage(
     source: &SourceDescriptor,
     recovery_enabled: bool,
 ) -> Result<crate::storage::PreparedStage, TransferFailure> {
-    let recovery = if recovery_enabled {
-        let provider = request.recovery_provider.as_ref().ok_or_else(|| {
-            TransferFailure::orchestration(
-                TransferPhase::Preflight,
-                "recoverable transfer requires a recovery provider",
-            )
-        })?;
-        Some(
-            provider
-                .open()
-                .await
-                .map_err(TransferFailure::registration)?,
-        )
-    } else {
-        None
-    };
     let binding = recovery_binding_for(
         &request.identity,
         &request.destination,
         &request.final_path,
         source,
     );
+    let recovery = if recovery_enabled {
+        Some(
+            super::super::recovery_store::open(binding)
+                .await
+                .map_err(TransferFailure::registration)?,
+        )
+    } else {
+        None
+    };
+    if request.transfer_policy == TransferPolicy::AtomicReplace {
+        super::discard_prior_recovery(destination, &request.final_path, source, binding).await?;
+    }
     let prepare = || PrepareRequest {
         final_destination: FinalDestination::new(request.final_path.clone()),
         source: source.clone(),
@@ -583,6 +568,7 @@ async fn prepare_destination_stage(
                 TransferFailure::registration(error).with_stage(Arc::clone(destination), stage)
             );
         }
+        stage.retain_recovery_lease(Arc::clone(&recovery.lease));
         if request.cancel.is_cancelled() {
             return Err(TransferFailure::orchestration(
                 TransferPhase::RecoveryRegistration,
@@ -594,7 +580,8 @@ async fn prepare_destination_stage(
     Ok(stage)
 }
 
-/// Destination state after durable payload and before verification/publication.
+/// Destination state after completed writes and before verification/publication.
+/// Local `AtomicReplace` does not promise crash-durable payload.
 pub struct ExpertDestinationTransferred {
     destination: Arc<dyn StagedDestination>,
     source: SourceDescriptor,
@@ -602,9 +589,9 @@ pub struct ExpertDestinationTransferred {
     stage: crate::storage::PreparedStage,
     _write: WriteEvidence,
     checkpoint: CheckpointObservation,
-    existing_destination: ExistingDestinationPolicy,
     cancel: tokio_util::sync::CancellationToken,
     metadata_plan: Option<MetadataPlan>,
+    effective_recovery: super::EffectiveRecovery,
 }
 
 impl ExpertDestinationTransferred {
@@ -698,12 +685,19 @@ impl ExpertDestinationTransferred {
                     .with_source_qos(evidence.source_qos));
             }
         };
+        if self.stage.recovery_enabled()
+            && let Err(error) =
+                super::super::recovery_store::mark_publishing(self.stage.recovery_binding()).await
+        {
+            return Err(TransferFailure::registration(error)
+                .with_stage(Arc::clone(&self.destination), self.stage)
+                .with_source_qos(evidence.source_qos));
+        }
         let publication = self
             .destination
             .publish(
                 &self.stage,
                 PublishRequest {
-                    policy: self.existing_destination,
                     expected_size: self.source_size,
                     expected_blake3: evidence.blake3,
                     cancel: self.cancel,
@@ -732,13 +726,31 @@ impl ExpertDestinationTransferred {
                     .with_source_qos(evidence.source_qos));
             }
         };
+        let recovery_binding = self.stage.recovery_binding();
+        if self.stage.recovery_enabled()
+            && super::super::recovery_store::complete(recovery_binding)
+                .await
+                .is_err()
+        {
+            let mut failure = TransferFailure::orchestration(
+                TransferPhase::RecoveryCompletion,
+                "published transfer recovery state could not be cleared",
+            );
+            failure.final_destination_changed = true;
+            return Err(failure
+                .with_committed_cleanup(self.destination, self.stage)
+                .with_source_qos(evidence.source_qos));
+        }
         Ok(TransferOutcome {
             final_destination,
             disposition,
             transferred_bytes: self.source_size,
-            blake3: evidence.blake3,
+            blake3: Some(evidence.blake3),
+            read_back: super::ReadBackVerification::Enabled,
             source_qos: evidence.source_qos,
             metadata,
+            route: super::TransferRoute::Streaming,
+            recovery: self.effective_recovery,
         })
     }
 }

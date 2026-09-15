@@ -5,7 +5,7 @@ use std::os::unix::fs::FileExt as _;
 use std::os::windows::fs::FileExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -13,20 +13,25 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
-use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::{FutureExt, StreamExt};
 use tokio::task::JoinSet;
 
+#[cfg(unix)]
+use crate::model::AclEncoding;
 use crate::model::{
-    AclEncoding, BackendIdentity, EntryOperationFailure, FailureClass, Operation, StoragePath,
-    Transience,
+    BackendIdentity, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
 };
 use crate::storage::{
     ByteStream, CheckpointObservation, MetadataMutation, PrepareRequest, PreparedStage,
     PublicationEvidence, PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity,
-    StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure, VerificationEvidence,
+    VerifyRequest, WriteEvidence,
 };
 
 mod checkpoint;
+mod direct;
+mod directory_sync;
 mod probe;
 mod publication;
 mod recovery;
@@ -40,12 +45,13 @@ const STAGING_DIRECTORY: &str = ".data-mover-staging";
 /// This is independent of the Local source's 2 MiB read ceiling. Upstream
 /// pieces at or below this limit are submitted whole; larger pieces are split
 /// into zero-copy `Bytes` slices by `consume_input`.
-const LOCAL_MAX_WRITE_CHUNK_BYTES: usize = 5 * 1024 * 1024;
+const LOCAL_MAX_WRITE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// Recovery cadence is a durability policy and must not change when the write-task ceiling is
+/// tuned. Files must be strictly larger than this interval to enable deferred recovery.
 #[cfg(not(test))]
 const LOCAL_DURABLE_CHECKPOINT_INTERVAL_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(test)]
 const LOCAL_DURABLE_CHECKPOINT_INTERVAL_BYTES: u64 = 4 * 64 * 1024;
-static STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn write_all_at(
     data: &[u8],
@@ -79,6 +85,19 @@ fn write_all_at(
     Ok(written as u64)
 }
 
+// Per-attempt state: only the first write to an exclusively created empty stage
+// can infer EOF from completed contiguous positional writes. Reuse and recovery
+// must still normalize any previous tail.
+struct LocalStageState {
+    directory: Arc<Dir>,
+    file: std::sync::Mutex<Option<Arc<std::fs::File>>>,
+    token: Bytes,
+    final_path: StoragePath,
+    relative: PathBuf,
+    name: std::ffi::OsString,
+    first_write: AtomicBool,
+}
+
 pub(crate) struct LocalStagedDestination {
     #[cfg(test)]
     root: Arc<PathBuf>,
@@ -86,6 +105,7 @@ pub(crate) struct LocalStagedDestination {
     identity: BackendIdentity,
     write_concurrency: usize,
     write_probe: Arc<WriteProbe>,
+    directory_sync: Arc<directory_sync::DirectorySync>,
 }
 
 impl LocalStagedDestination {
@@ -97,7 +117,11 @@ impl LocalStagedDestination {
                 FailureClass::Unsupported,
             ));
         }
-        Self::checked_relative(request.final_destination.path(), Operation::Prepare)?;
+        let relative =
+            Self::checked_relative(request.final_destination.path(), Operation::Prepare)?;
+        if relative.components().any(|component| matches!(component, Component::Normal(name) if name.to_str().is_some_and(|name| name.starts_with(".data-mover-")))) {
+            return Err(failure(request.final_destination.path(), Operation::Prepare, FailureClass::Conflict));
+        }
         let reserved = Path::new(request.final_destination.path().as_str())
             .components()
             .next()
@@ -136,22 +160,102 @@ impl LocalStagedDestination {
             identity,
             write_concurrency,
             write_probe: Arc::new(WriteProbe::default()),
+            directory_sync: Arc::new(directory_sync::DirectorySync::default()),
         })
     }
 
-    async fn open_staging(
+    async fn stage_directory(
         &self,
+        stage: &PreparedStage,
         operation: Operation,
-        path: &StoragePath,
-    ) -> Result<Dir, StorageRoleFailure> {
+    ) -> Result<Arc<Dir>, StorageRoleFailure> {
+        stage.validate_owner(&self.identity).map_err(|_| {
+            failure(
+                stage.final_destination.path(),
+                operation,
+                FailureClass::Conflict,
+            )
+        })?;
+        if let Some(state) = Self::local_state(stage, operation)? {
+            return Ok(Arc::clone(&state.directory));
+        }
+        let relative = Self::stage_relative(stage, operation)?;
+        let parent = relative
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_owned();
         let root = Arc::clone(&self.root_dir);
-        tokio::task::spawn_blocking(move || {
-            root.create_dir_all(STAGING_DIRECTORY)?;
-            root.open_dir(STAGING_DIRECTORY)
-        })
-        .await
-        .map_err(|_| failure(path, operation, FailureClass::Internal))?
-        .map_err(|error| io_failure(path, operation, &error))
+        tokio::task::spawn_blocking(move || root.open_dir(parent))
+            .await
+            .map_err(|_| {
+                failure(
+                    stage.final_destination.path(),
+                    operation,
+                    FailureClass::Internal,
+                )
+            })?
+            .map(Arc::new)
+            .map_err(|error| io_failure(stage.final_destination.path(), operation, &error))
+    }
+
+    fn local_state(
+        stage: &PreparedStage,
+        operation: Operation,
+    ) -> Result<Option<&LocalStageState>, StorageRoleFailure> {
+        let Some(cached) = &stage.backend_state else {
+            return Ok(None);
+        };
+        let cached = cached
+            .downcast_ref::<LocalStageState>()
+            .filter(|cached| {
+                cached.token == stage.token && &cached.final_path == stage.final_destination.path()
+            })
+            .ok_or_else(|| {
+                failure(
+                    stage.final_destination.path(),
+                    operation,
+                    FailureClass::Corruption,
+                )
+            })?;
+        Ok(Some(cached))
+    }
+
+    fn cache_stage(
+        stage: &mut PreparedStage,
+        directory: Arc<Dir>,
+        file: Option<Arc<std::fs::File>>,
+        fresh: bool,
+    ) -> Result<(), StorageRoleFailure> {
+        let relative = Self::stage_relative(stage, Operation::Prepare)?;
+        let name = relative
+            .file_name()
+            .ok_or_else(|| {
+                failure(
+                    stage.final_destination.path(),
+                    Operation::Prepare,
+                    FailureClass::Corruption,
+                )
+            })?
+            .to_owned();
+        stage.backend_state = Some(Arc::new(LocalStageState {
+            directory,
+            file: std::sync::Mutex::new(file),
+            token: stage.token.clone(),
+            final_path: stage.final_destination.path().clone(),
+            relative,
+            name,
+            first_write: AtomicBool::new(fresh),
+        }));
+        Ok(())
+    }
+
+    fn take_fresh_write(stage: &PreparedStage) -> bool {
+        stage
+            .backend_state
+            .as_ref()
+            .and_then(|state| state.downcast_ref::<LocalStageState>())
+            .is_some_and(|state| state.first_write.swap(false, Ordering::Relaxed))
     }
 
     fn stage_name(
@@ -166,6 +270,9 @@ impl LocalStagedDestination {
                 FailureClass::Conflict,
             )
         })?;
+        if let Some(state) = Self::local_state(stage, operation)? {
+            return Ok(state.name.clone());
+        }
         let relative = Self::stage_relative(stage, operation)?;
         relative
             .file_name()
@@ -205,9 +312,7 @@ impl LocalStagedDestination {
         create: bool,
     ) -> Result<std::fs::File, StorageRoleFailure> {
         let name = self.claim_name(stage, Operation::Prepare)?;
-        let staging = self
-            .open_staging(Operation::Prepare, stage.final_destination.path())
-            .await?;
+        let staging = self.stage_directory(stage, Operation::Prepare).await?;
         let path = stage.final_destination.path().clone();
         tokio::task::spawn_blocking(move || {
             let mut options = OpenOptions::new();
@@ -271,6 +376,9 @@ impl LocalStagedDestination {
         stage: &PreparedStage,
         operation: Operation,
     ) -> Result<PathBuf, StorageRoleFailure> {
+        if let Some(state) = Self::local_state(stage, operation)? {
+            return Ok(state.relative.clone());
+        }
         let encoded = std::str::from_utf8(&stage.token).map_err(|_| {
             failure(
                 stage.final_destination.path(),
@@ -286,11 +394,20 @@ impl LocalStagedDestination {
             )
         })?;
         let relative = Self::checked_relative(&storage_path, operation)?;
-        let mut components = relative.components();
-        let valid = matches!(components.next(), Some(Component::Normal(value)) if value == STAGING_DIRECTORY)
-            && matches!(components.next(), Some(Component::Normal(_)))
-            && components.next().is_none();
-        if !valid {
+        let final_relative = Self::checked_relative(stage.final_destination.path(), operation)?;
+        let colocated = relative.parent() == final_relative.parent()
+            && relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    crate::storage::artifacts::stage_base(
+                        name,
+                        stage.final_destination.path().as_str(),
+                    ) == Some(name)
+                })
+            && relative.extension() == Some(std::ffi::OsStr::new("stage"))
+            && relative != final_relative;
+        if !colocated {
             return Err(failure(
                 stage.final_destination.path(),
                 operation,
@@ -316,26 +433,22 @@ impl LocalStagedDestination {
         Ok(self.root.join(Self::stage_relative(stage, operation)?))
     }
 
-    async fn write_piece(
-        file: Arc<std::fs::File>,
-        probe: Arc<WriteProbe>,
+    fn write_piece(
+        file: &std::fs::File,
+        probe: &WriteProbe,
         offset: u64,
-        data: Bytes,
+        data: &[u8],
     ) -> Result<u64, io::Error> {
-        tokio::task::spawn_blocking(move || {
-            probe.before_write(offset);
-            let written = write_all_at(&data, offset, |remaining, position| {
-                #[cfg(unix)]
-                let result = file.write_at(remaining, position);
-                #[cfg(windows)]
-                let result = file.seek_write(remaining, position);
-                result
-            })?;
-            probe.after_write(offset);
-            Ok(written)
-        })
-        .await
-        .map_err(io::Error::other)?
+        probe.before_write(offset);
+        let written = write_all_at(data, offset, |remaining, position| {
+            #[cfg(unix)]
+            let result = file.write_at(remaining, position);
+            #[cfg(windows)]
+            let result = file.seek_write(remaining, position);
+            result
+        })?;
+        probe.after_write(offset);
+        Ok(written)
     }
 
     async fn settle_one(
@@ -354,10 +467,32 @@ impl LocalStagedDestination {
         stage: &PreparedStage,
         operation: Operation,
     ) -> Result<Arc<std::fs::File>, StorageRoleFailure> {
+        stage.validate_owner(&self.identity).map_err(|_| {
+            failure(
+                stage.final_destination.path(),
+                operation,
+                FailureClass::Conflict,
+            )
+        })?;
+        if let Some(state) = Self::local_state(stage, operation)? {
+            let cached = state
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(unix)]
+            if let Some(file) = cached.as_ref() {
+                return Ok(Arc::clone(file));
+            }
+            #[cfg(not(unix))]
+            {
+                let mut cached = cached;
+                if let Some(file) = cached.take() {
+                    return Ok(file);
+                }
+            }
+        }
         let name = self.stage_name(stage, operation)?;
-        let staging = self
-            .open_staging(operation, stage.final_destination.path())
-            .await?;
+        let staging = self.stage_directory(stage, operation).await?;
         let result = tokio::task::spawn_blocking(move || {
             let mut options = OpenOptions::new();
             options.read(true).write(true);
@@ -385,9 +520,57 @@ impl LocalStagedDestination {
         file: &Arc<std::fs::File>,
         writes: &mut JoinSet<Result<u64, io::Error>>,
     ) -> (u64, u64, Option<StorageRoleFailure>, bool) {
+        let mut checkpoint = None;
+        let result = self
+            .consume_input_chunks(stage, input, file, writes, &mut checkpoint)
+            .await;
+        // A pending checkpoint owns persistence work: settle it before cleanup or final truncation.
+        if let Some(pending) = checkpoint
+            && let Err(error) = pending.await
+        {
+            return (result.0, result.1, Some(error), true);
+        }
+        result
+    }
+
+    async fn consume_input_chunks<'a>(
+        &'a self,
+        stage: &'a PreparedStage,
+        input: &mut ByteStream,
+        file: &Arc<std::fs::File>,
+        writes: &mut JoinSet<Result<u64, io::Error>>,
+        checkpoint: &mut Option<BoxFuture<'a, Result<(), StorageRoleFailure>>>,
+    ) -> (u64, u64, Option<StorageRoleFailure>, bool) {
         let (mut issued, mut persisted) = (stage.write_offset, stage.write_offset);
-        let mut durable_prefix = stage.write_offset;
-        while let Some(item) = input.next().await {
+        let interval = stage
+            .deferred_checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.interval_bytes)
+            .or_else(|| {
+                stage
+                    .recovery_enabled()
+                    .then_some(LOCAL_DURABLE_CHECKPOINT_INTERVAL_BYTES)
+            });
+        let mut next_checkpoint = interval.and_then(|bytes| stage.write_offset.checked_add(bytes));
+        loop {
+            let item = if let Some(pending) = checkpoint.as_mut() {
+                tokio::select! {
+                    biased;
+                    result = pending => {
+                        *checkpoint = None;
+                        if let Err(error) = result {
+                            return (issued, persisted, Some(error), true);
+                        }
+                        continue;
+                    }
+                    item = input.next() => item,
+                }
+            } else {
+                input.next().await
+            };
+            let Some(item) = item else {
+                break;
+            };
             let data = match item {
                 Ok(data) => data,
                 Err(error) => return (issued, persisted, Some(error), false),
@@ -415,12 +598,10 @@ impl LocalStagedDestination {
                     );
                 };
                 issued = next_offset;
-                writes.spawn(Self::write_piece(
-                    Arc::clone(file),
-                    Arc::clone(&self.write_probe),
-                    offset,
-                    piece,
-                ));
+                let write_file = Arc::clone(file);
+                let probe = Arc::clone(&self.write_probe);
+                writes
+                    .spawn_blocking(move || Self::write_piece(&write_file, &probe, offset, &piece));
                 piece_start = piece_end;
                 if writes.len() >= self.write_concurrency {
                     match Self::settle_one(writes, stage.final_destination.path()).await {
@@ -428,27 +609,37 @@ impl LocalStagedDestination {
                         Err(error) => return (issued, persisted, Some(error), false),
                     }
                 }
-                if stage.recovery_enabled()
-                    && issued.saturating_sub(durable_prefix)
-                        >= LOCAL_DURABLE_CHECKPOINT_INTERVAL_BYTES
+                if next_checkpoint.is_some_and(|threshold| issued >= threshold)
+                    && stage
+                        .deferred_checkpoint
+                        .as_ref()
+                        .is_none_or(|checkpoint| issued < checkpoint.source_size)
                 {
+                    if let Some(pending) = checkpoint.take()
+                        && let Err(error) = pending.await
+                    {
+                        return (issued, persisted, Some(error), true);
+                    }
                     if let Err(error) = self
-                        .durable_checkpoint_barrier(stage, file, writes, issued, &mut persisted)
+                        .drain_checkpoint_window(stage, writes, issued, &mut persisted)
                         .await
                     {
                         return (issued, persisted, Some(error), true);
                     }
-                    durable_prefix = issued;
+                    *checkpoint = Some(
+                        self.persist_synced_progress(stage, Arc::clone(file), issued)
+                            .boxed(),
+                    );
+                    next_checkpoint = interval.and_then(|bytes| issued.checked_add(bytes));
                 }
             }
         }
         (issued, persisted, None, false)
     }
 
-    async fn durable_checkpoint_barrier(
+    async fn drain_checkpoint_window(
         &self,
         stage: &PreparedStage,
-        file: &Arc<std::fs::File>,
         writes: &mut JoinSet<Result<u64, io::Error>>,
         issued: u64,
         persisted: &mut u64,
@@ -471,8 +662,59 @@ impl LocalStagedDestination {
                 FailureClass::Corruption,
             ));
         }
-        Self::sync_written_file(Arc::clone(file), issued, stage.final_destination.path()).await?;
-        self.persist_checkpoint(stage, issued).await
+        Ok(())
+    }
+
+    async fn persist_synced_progress(
+        &self,
+        stage: &PreparedStage,
+        file: Arc<std::fs::File>,
+        prefix: u64,
+    ) -> Result<(), StorageRoleFailure> {
+        // Subsequent positional writes may be in flight. Never truncate to this older prefix.
+        tokio::task::spawn_blocking(move || file.sync_data())
+            .await
+            .map_err(|_| {
+                failure(
+                    stage.final_destination.path(),
+                    Operation::Write,
+                    FailureClass::Internal,
+                )
+            })?
+            .map_err(|error| {
+                io_failure(stage.final_destination.path(), Operation::Write, &error)
+            })?;
+        self.persist_progress(stage, prefix).await
+    }
+
+    async fn persist_progress(
+        &self,
+        stage: &PreparedStage,
+        persisted: u64,
+    ) -> Result<(), StorageRoleFailure> {
+        let first = !stage.recovery_enabled();
+        if first {
+            let claim = self.acquire_claim(stage, true).await?;
+            *stage
+                .claim
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(claim);
+        }
+        self.persist_checkpoint(stage, persisted).await?;
+        if first {
+            // Once the durable checkpoint exists, failures must preserve recoverable stage state.
+            stage.recovery_enabled.store(true, Ordering::Release);
+            let checkpoint = stage.deferred_checkpoint.as_ref().ok_or_else(|| {
+                failure(
+                    stage.final_destination.path(),
+                    Operation::Prepare,
+                    FailureClass::Internal,
+                )
+            })?;
+            let identity = recovery::export(self, stage).await?;
+            checkpoint.registration.register(stage, identity).await?;
+        }
+        Ok(())
     }
 
     async fn drain_writes(
@@ -494,12 +736,19 @@ impl LocalStagedDestination {
         file: Arc<std::fs::File>,
         issued: u64,
         path: &StoragePath,
+        normalize_length: bool,
+        durable: bool,
     ) -> Result<(), StorageRoleFailure> {
         tokio::task::spawn_blocking(move || {
-            file.set_len(issued)?;
+            if normalize_length {
+                file.set_len(issued)?;
+            }
             // Recovery and safe publication both need file contents plus the length metadata
             // required to read them. They do not require unrelated inode metadata.
-            file.sync_data()
+            if durable {
+                file.sync_data()?;
+            }
+            Ok::<_, io::Error>(())
         })
         .await
         .map_err(|_| failure(path, Operation::Write, FailureClass::Internal))?
@@ -517,8 +766,8 @@ impl LocalStagedDestination {
         guard_name.push(".existing");
         let claim_name = self.claim_name(stage, operation)?;
         let path = stage.final_destination.path();
-        let staging = self.open_staging(operation, path).await?;
-        let claim_staging = if stage.recovery_enabled() {
+        let staging = self.stage_directory(stage, operation).await?;
+        let claim_staging = if stage.recovery_enabled() || stage.deferred_checkpoint.is_some() {
             Some(
                 staging
                     .try_clone()
@@ -571,7 +820,7 @@ impl LocalStagedDestination {
     async fn initialize_stage(
         &self,
         stage: PreparedStage,
-        file: std::fs::File,
+        file: Arc<std::fs::File>,
         staging: Arc<Dir>,
     ) -> Result<PreparedStage, StorageRoleFailure> {
         let path = stage.final_destination.path();
@@ -596,6 +845,13 @@ impl LocalStagedDestination {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_automatic_checkpoint_interval(&self, bytes: u64) {
+        self.write_probe
+            .automatic_interval
+            .store(bytes, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_checkpoint_at(&self, point: u64) {
         self.write_probe
             .checkpoint_failure
@@ -616,64 +872,32 @@ impl LocalStagedDestination {
         }
     }
 
-    async fn create_stage_candidate(
-        &self,
-        request: &PrepareRequest,
-        staging: Arc<Dir>,
-        destination_hash: &blake3::Hash,
-        recovery_enabled: bool,
-    ) -> Result<Option<PreparedStage>, StorageRoleFailure> {
-        let sequence = STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let name = format!("{}-{sequence:016x}.stage", &destination_hash.to_hex()[..16]);
-        let open_name = name.clone();
-        let staging_for_open = Arc::clone(&staging);
-        let result = tokio::task::spawn_blocking(move || {
-            let mut options = OpenOptions::new();
-            options.create_new(true).read(true).write(true);
-            staging_for_open
-                .open_with(&open_name, &options)
-                .map(cap_std::fs::File::into_std)
-        })
-        .await
-        .map_err(|_| {
-            failure(
-                request.final_destination.path(),
-                Operation::Prepare,
-                FailureClass::Internal,
-            )
-        })?;
-        let file = match result {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
-            Err(error) => {
-                return Err(io_failure(
-                    request.final_destination.path(),
-                    Operation::Prepare,
-                    &error,
-                ));
-            }
-        };
-        let token = PathBuf::from(STAGING_DIRECTORY)
-            .join(name)
-            .to_string_lossy()
-            .into_owned();
-        let mut stage = PreparedStage::new(
-            self.identity.clone(),
-            request.final_destination.clone(),
-            Bytes::from(token),
-            request.recovery_binding,
-            0,
-            None,
-        );
-        if !recovery_enabled {
-            return Ok(Some(Self::initialize_ephemeral_stage(stage)));
+    fn open_or_create_parent(root: &Dir, parent: &Path) -> io::Result<Dir> {
+        match root.open_dir(parent) {
+            Ok(directory) => return Ok(directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        let claim = match self.acquire_claim(&stage, true).await {
-            Ok(claim) => claim,
-            Err(error) => return self.rollback_prepare(&stage, error).await.map(Some),
-        };
-        stage.claim = std::sync::Mutex::new(Some(claim));
-        self.initialize_stage(stage, file, staging).await.map(Some)
+        let mut directory = root.try_clone()?;
+        for component in parent.components() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            let next = match directory.open_dir(name) {
+                Ok(next) => next,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match directory.create_dir(name) {
+                        Ok(()) => directory.open(".")?.sync_all()?,
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error),
+                    }
+                    directory.open_dir(name)?
+                }
+                Err(error) => return Err(error),
+            };
+            directory = next;
+        }
+        Ok(directory)
     }
 
     async fn prepare_mode(
@@ -682,35 +906,154 @@ impl LocalStagedDestination {
         recovery_enabled: bool,
     ) -> Result<PreparedStage, StorageRoleFailure> {
         Self::validate_prepare_request(&request)?;
-        let staging = self
-            .open_staging(Operation::Prepare, request.final_destination.path())
-            .await?;
-        let staging = Arc::new(staging);
-
-        let destination_hash = blake3::hash(request.final_destination.path().as_str().as_bytes());
-        for _ in 0..32 {
-            if let Some(stage) = self
-                .create_stage_candidate(
-                    &request,
-                    Arc::clone(&staging),
-                    &destination_hash,
-                    recovery_enabled,
-                )
-                .await?
-            {
-                return Ok(stage);
+        let root = Arc::clone(&self.root_dir);
+        let destination_path = request.final_destination.path().as_str().to_owned();
+        let relative =
+            Self::checked_relative(request.final_destination.path(), Operation::Prepare)?;
+        let parent = relative
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_owned();
+        let token_parent = relative
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_owned();
+        // Directory resolution and exclusive file creation are one blocking operation.
+        let (staging, file, name) = tokio::task::spawn_blocking(move || {
+            let staging = Self::open_or_create_parent(&root, &parent)?;
+            let mut options = OpenOptions::new();
+            options.create_new(true).read(true).write(true);
+            for _ in 0..32 {
+                let name = crate::storage::artifacts::stage_name(&destination_path);
+                match staging.open_with(&name, &options) {
+                    Ok(file) => return Ok((Arc::new(staging), file.into_std(), name)),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
             }
+            Err(io::Error::from(io::ErrorKind::AlreadyExists))
+        })
+        .await
+        .map_err(|_| {
+            failure(
+                request.final_destination.path(),
+                Operation::Prepare,
+                FailureClass::Internal,
+            )
+        })?
+        .map_err(|error| {
+            io_failure(request.final_destination.path(), Operation::Prepare, &error)
+        })?;
+        let token = token_parent.join(name).to_string_lossy().into_owned();
+        let mut stage = PreparedStage::new(
+            self.identity.clone(),
+            request.final_destination,
+            Bytes::from(token),
+            request.recovery_binding,
+            0,
+            None,
+        );
+        let file = Arc::new(file);
+        Self::cache_stage(
+            &mut stage,
+            Arc::clone(&staging),
+            Some(Arc::clone(&file)),
+            true,
+        )?;
+        if !recovery_enabled {
+            return Ok(Self::initialize_ephemeral_stage(stage));
         }
-        Err(failure(
-            request.final_destination.path(),
-            Operation::Prepare,
-            FailureClass::Conflict,
-        ))
+        let claim = match self.acquire_claim(&stage, true).await {
+            Ok(claim) => claim,
+            Err(error) => return self.rollback_prepare(&stage, error).await,
+        };
+        stage.claim = std::sync::Mutex::new(Some(claim));
+        self.initialize_stage(stage, file, staging).await
     }
 }
 
 #[async_trait]
 impl StagedDestination for LocalStagedDestination {
+    fn supports_direct(&self) -> bool {
+        cfg!(unix)
+    }
+
+    async fn prepare_direct(
+        &self,
+        request: PrepareRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        self.open_direct(request, cancel).await
+    }
+    fn copied_metadata_target(&self) -> Option<crate::storage::CopiedMetadataTarget> {
+        #[cfg(unix)]
+        {
+            Some(crate::storage::CopiedMetadataTarget {
+                timestamp_precision: crate::model::TimePrecision::Nanoseconds,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    fn automatic_checkpoint_interval_bytes(&self) -> Option<u64> {
+        #[cfg(test)]
+        if self.write_probe.automatic_interval.load(Ordering::Relaxed) != 0 {
+            return Some(self.write_probe.automatic_interval.load(Ordering::Relaxed));
+        }
+        Some(crate::storage::backends::DEFAULT_CHECKPOINT_INTERVAL_BYTES)
+    }
+
+    async fn write_single(
+        &self,
+        stage: &PreparedStage,
+        data: Bytes,
+    ) -> Result<WriteEvidence, StorageRoleFailure> {
+        if data.len() > LOCAL_MAX_WRITE_CHUNK_BYTES || stage.recovery_enabled() {
+            return self
+                .write(
+                    stage,
+                    Box::pin(futures::stream::once(async move { Ok(data) })),
+                )
+                .await;
+        }
+        let file = self.open_stage_file_for(stage, Operation::Write).await?;
+        let fresh = Self::take_fresh_write(stage);
+        let probe = Arc::clone(&self.write_probe);
+        let durable = stage.durable_publication;
+        let direct = stage.direct;
+        let written = tokio::task::spawn_blocking(move || {
+            if direct {
+                file.set_len(0)?;
+            }
+            let written = Self::write_piece(&file, &probe, 0, &data)?;
+            if !fresh {
+                file.set_len(written)?;
+            }
+            if durable {
+                #[cfg(test)]
+                probe.final_data_sync_calls.fetch_add(1, Ordering::SeqCst);
+                file.sync_data()?;
+            }
+            Ok::<_, io::Error>(written)
+        })
+        .await
+        .map_err(|_| {
+            failure(
+                stage.final_destination.path(),
+                Operation::Write,
+                FailureClass::Internal,
+            )
+        })?
+        .map_err(|error| io_failure(stage.final_destination.path(), Operation::Write, &error))?;
+        Ok(WriteEvidence {
+            persisted_bytes: written,
+        })
+    }
+
     async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
         self.prepare_mode(request, true).await
     }
@@ -746,6 +1089,20 @@ impl StagedDestination for LocalStagedDestination {
         mut input: ByteStream,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
         let file = self.open_stage_file_for(stage, Operation::Write).await?;
+        let fresh = Self::take_fresh_write(stage);
+        if stage.direct {
+            let target = Arc::clone(&file);
+            tokio::task::spawn_blocking(move || target.set_len(0))
+                .await
+                .map_err(|_| {
+                    failure(
+                        stage.final_destination.path(),
+                        Operation::Write,
+                        FailureClass::Internal,
+                    )
+                })?
+                .map_err(|e| io_failure(stage.final_destination.path(), Operation::Write, &e))?;
+        }
         let mut writes = JoinSet::new();
         let (issued, mut persisted, mut first_failure, checkpoint_failed) = self
             .consume_input(stage, &mut input, &file, &mut writes)
@@ -762,8 +1119,14 @@ impl StagedDestination for LocalStagedDestination {
                 return Err(error);
             }
             if persisted == issued {
-                Self::sync_written_file(Arc::clone(&file), issued, stage.final_destination.path())
-                    .await?;
+                Self::sync_written_file(
+                    Arc::clone(&file),
+                    issued,
+                    stage.final_destination.path(),
+                    true,
+                    stage.durable_publication,
+                )
+                .await?;
                 if stage.recovery_enabled() {
                     self.persist_checkpoint(stage, persisted).await?;
                 }
@@ -777,7 +1140,22 @@ impl StagedDestination for LocalStagedDestination {
                 FailureClass::Corruption,
             ));
         }
-        Self::sync_written_file(file, issued, stage.final_destination.path()).await?;
+        if stage.durable_publication || !fresh {
+            #[cfg(test)]
+            if stage.durable_publication {
+                self.write_probe
+                    .final_data_sync_calls
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            Self::sync_written_file(
+                file,
+                issued,
+                stage.final_destination.path(),
+                !fresh,
+                stage.durable_publication,
+            )
+            .await?;
+        }
         if stage.recovery_enabled() {
             self.persist_checkpoint(stage, persisted).await?;
         }
@@ -807,12 +1185,21 @@ impl StagedDestination for LocalStagedDestination {
         request: VerifyRequest,
     ) -> Result<VerificationEvidence, StorageRoleFailure> {
         let name = self.stage_name(stage, Operation::Verify)?;
-        let staging = self
-            .open_staging(Operation::Verify, stage.final_destination.path())
-            .await?;
+        let staging = self.stage_directory(stage, Operation::Verify).await?;
         let path = stage.final_destination.path().clone();
+        let direct_file = if stage.direct {
+            Some(self.open_stage_file_for(stage, Operation::Verify).await?)
+        } else {
+            None
+        };
         let probe = Arc::clone(&self.write_probe);
         tokio::task::spawn_blocking(move || {
+            if let Some(file) = direct_file {
+                use std::io::Seek as _;
+                let mut file = file.try_clone()?;
+                file.rewind()?;
+                return verification::verify_file(file, &request, &probe);
+            }
             verification::verify_local(&staging, &name, &request, &probe)
         })
         .await
@@ -851,13 +1238,95 @@ impl StagedDestination for LocalStagedDestination {
         }
         let file = self.open_stage_file_for(stage, Operation::Metadata).await?;
         let path = stage.final_destination.path().clone();
+        let durable = stage.durable_publication;
         tokio::task::spawn_blocking(move || {
             apply_local_metadata(&file, mutation)?;
-            file.sync_all()
+            if durable {
+                file.sync_all()?;
+            }
+            Ok(())
         })
         .await
         .map_err(|_| failure(&path, Operation::Metadata, FailureClass::Internal))?
         .map_err(|error| io_failure(&path, Operation::Metadata, &error))
+    }
+
+    async fn apply_metadata_batch(
+        &self,
+        stage: &PreparedStage,
+        mutations: Vec<MetadataMutation>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), StagedMetadataApplicationFailure> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+        if cancel.is_cancelled() {
+            return Err(StagedMetadataApplicationFailure {
+                failed_index: 0,
+                completed: 0,
+                error: None,
+            });
+        }
+        if let Some(index) = mutations
+            .iter()
+            .position(|mutation| !local_metadata_supported(mutation))
+        {
+            return Err(StagedMetadataApplicationFailure {
+                failed_index: index,
+                completed: 0,
+                error: Some(failure(
+                    stage.final_destination.path(),
+                    Operation::Metadata,
+                    FailureClass::Unsupported,
+                )),
+            });
+        }
+        let file = self
+            .open_stage_file_for(stage, Operation::Metadata)
+            .await
+            .map_err(|error| StagedMetadataApplicationFailure {
+                failed_index: 0,
+                completed: 0,
+                error: Some(error),
+            })?;
+        let path = stage.final_destination.path().clone();
+        let durable = stage.durable_publication;
+        let last_index = mutations.len().saturating_sub(1);
+        #[cfg(test)]
+        self.write_probe
+            .metadata_batch_calls
+            .fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        if durable {
+            self.write_probe
+                .metadata_sync_calls
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            for (index, mutation) in mutations.into_iter().enumerate() {
+                if cancel.is_cancelled() {
+                    return Err((index, None));
+                }
+                if let Err(error) = apply_local_metadata(&file, mutation) {
+                    return Err((index, Some(error)));
+                }
+            }
+            if durable && let Err(error) = file.sync_all() {
+                return Err((last_index, Some(error)));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| StagedMetadataApplicationFailure {
+            failed_index: 0,
+            completed: 0,
+            error: Some(failure(&path, Operation::Metadata, FailureClass::Internal)),
+        })?;
+        result.map_err(|(completed, error)| StagedMetadataApplicationFailure {
+            failed_index: completed,
+            completed,
+            error: error.map(|error| io_failure(&path, Operation::Metadata, &error)),
+        })
     }
 
     async fn publish(
@@ -865,6 +1334,9 @@ impl StagedDestination for LocalStagedDestination {
         stage: &PreparedStage,
         request: PublishRequest,
     ) -> Result<PublicationEvidence, PublicationFailure> {
+        if stage.direct {
+            return self.finish_direct(stage, request).await;
+        }
         let precommit = |error| PublicationFailure {
             error,
             final_destination_changed: false,
@@ -872,25 +1344,38 @@ impl StagedDestination for LocalStagedDestination {
         let stage_name = self
             .stage_name(stage, Operation::Publish)
             .map_err(precommit)?;
-        let checkpoint_name = self
-            .checkpoint_name(stage, Operation::Publish)
+        let checkpoint_name = stage
+            .recovery_enabled()
+            .then(|| self.checkpoint_name(stage, Operation::Publish))
+            .transpose()
             .map_err(precommit)?;
         let final_relative =
             Self::checked_relative(stage.final_destination.path(), Operation::Publish)
                 .map_err(precommit)?;
         let final_destination = stage.final_destination.path().clone();
         let staging = self
-            .open_staging(Operation::Publish, &final_destination)
+            .stage_directory(stage, Operation::Publish)
             .await
             .map_err(precommit)?;
         let root = Arc::clone(&self.root_dir);
         let probe = Arc::clone(&self.write_probe);
+        let colocated = Self::stage_relative(stage, Operation::Publish)
+            .map_err(precommit)?
+            .parent()
+            == final_relative.parent();
+        let directory_sync = Arc::clone(&self.directory_sync);
+        let durable = stage.durable_publication;
         let result = tokio::task::spawn_blocking(move || {
             publication::publish_local(
-                &root,
-                &staging,
+                publication::Directories {
+                    root: &root,
+                    staging: &staging,
+                    sync: &directory_sync,
+                    colocated,
+                    durable,
+                },
                 &stage_name,
-                &checkpoint_name,
+                checkpoint_name.as_deref(),
                 &final_relative,
                 &request,
                 &probe,
@@ -918,7 +1403,7 @@ impl StagedDestination for LocalStagedDestination {
                     .claim_name(stage, Operation::Publish)
                     .map_err(precommit)?;
                 let staging = self
-                    .open_staging(Operation::Publish, &final_destination)
+                    .stage_directory(stage, Operation::Publish)
                     .await
                     .map_err(precommit)?;
                 tokio::task::spawn_blocking(move || {
@@ -951,13 +1436,16 @@ impl StagedDestination for LocalStagedDestination {
     }
 
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
+        if stage.direct {
+            return Ok(());
+        }
         self.cleanup_stage_artifacts(&stage, Operation::Namespace)
             .await
     }
 }
 
 #[cfg(unix)]
-fn local_metadata_supported(mutation: &MetadataMutation) -> bool {
+pub(super) fn local_metadata_supported(mutation: &MetadataMutation) -> bool {
     match mutation {
         MetadataMutation::Acl(acl) => acl.encoding() == AclEncoding::Posix,
         MetadataMutation::Xattrs(_) | MetadataMutation::NumericOwnership(_) => true,
@@ -967,12 +1455,15 @@ fn local_metadata_supported(mutation: &MetadataMutation) -> bool {
 }
 
 #[cfg(not(unix))]
-fn local_metadata_supported(_mutation: &MetadataMutation) -> bool {
+pub(super) fn local_metadata_supported(_mutation: &MetadataMutation) -> bool {
     false
 }
 
 #[cfg(unix)]
-fn apply_local_metadata(file: &std::fs::File, mutation: MetadataMutation) -> io::Result<()> {
+pub(super) fn apply_local_metadata(
+    file: &std::fs::File,
+    mutation: MetadataMutation,
+) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{PermissionsExt as _, fchown};
     use xattr::FileExt as _;
@@ -1020,13 +1511,21 @@ fn set_optional_xattr(file: &std::fs::File, name: &str, value: Option<&[u8]>) ->
 
 #[cfg(unix)]
 fn local_file_time(value: crate::model::StorageTimestamp) -> io::Result<filetime::FileTime> {
+    const NANOS_PER_SECOND: i64 = 1_000_000_000;
     let nanos = i64::try_from(value.unix_nanos())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    Ok(crate::time_util::nanos_to_filetime_local(nanos))
+    Ok(filetime::FileTime::from_unix_time(
+        nanos.div_euclid(NANOS_PER_SECOND),
+        u32::try_from(nanos.rem_euclid(NANOS_PER_SECOND))
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
+    ))
 }
 
 #[cfg(not(unix))]
-fn apply_local_metadata(_file: &std::fs::File, _mutation: MetadataMutation) -> io::Result<()> {
+pub(super) fn apply_local_metadata(
+    _file: &std::fs::File,
+    _mutation: MetadataMutation,
+) -> io::Result<()> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 

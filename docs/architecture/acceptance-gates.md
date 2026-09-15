@@ -95,10 +95,10 @@ Every family executes the functional fixture set and asserts:
 - independent byte-stream validation stops at the first mismatch/read failure;
 - cancellation and injected source/destination/verification/publication failures leave no
   partial final destination and return truthful staged/recovery disposition;
-- valid checkpoint resumes; a supplied identity with missing, invalid, or unavailable checkpoint
-  fails without silently restarting, while an explicit restart begins without an identity;
-- recoverable fresh and recovered stages durably register their current opaque identity before
-  streaming or native payload; missing/rejected registration causes no payload mutation;
+- valid streaming checkpoints resume; missing, invalid, or unavailable internal state fails
+  without silently restarting, while explicit discard/reupload starts from zero;
+- recoverable fresh and recovered stages are durably persisted by data-mover before streaming
+  payload; single-source-chunk and all native paths perform no recovery-store interaction;
 - entry failures and backend-session failures have different propagation;
 - capability rejection happens before remote mutation;
 - metadata and namespace result equals the cell declaration;
@@ -250,12 +250,12 @@ device overlay.
   checkpoint state;
 - verification mismatch and publish/rename/complete-multipart failure;
 - cancellation, process termination, reconnect, and restart;
-- missing, rejected, ambiguously acknowledged, and stale-attempt recovery registration;
+- unavailable, corrupt, ambiguously persisted, and concurrently claimed recovery state;
 - safe and unsafe protocol replay cases;
 - QUIC disconnect and receiver termination/restart.
 
 Every case asserts terminal state, failure stage and attribution, entry/session scope,
-`FinalDestination`, staged-state disposition, and `RecoveryIdentity` validity. Merely
+`FinalDestination`, staged-state disposition, and internal recovery-record validity. Merely
 returning an error does not satisfy the gate.
 
 ## 8. Metadata and traversal gates
@@ -268,8 +268,8 @@ The stable metadata seam must also prove that exact plans apply all requested fa
 known timestamp loss is rejected or reported by policy, external principal mapping is
 explicit, cancellation causes no later mutation, and a target failure returns partial outcomes.
 The expert destination gate additionally proves `verify -> staged metadata -> publish` ordering,
-fail-fast family application, unchanged `FinalDestination` plus retained stage authority on
-failure, and preflight rejection of `VerifyOrSkip` when a plan contains mutations.
+fail-fast family application, and unchanged `FinalDestination` plus retained stage authority on
+failure.
 
 `DM-TRAVERSAL-CONTRACT` verifies bounded backpressure, cancellation, optional
 `ObservationPlan` modes, no default extra ACL/xattr/tag calls, ordered result delivery as

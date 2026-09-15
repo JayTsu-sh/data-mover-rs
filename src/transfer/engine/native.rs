@@ -1,7 +1,7 @@
 use super::{
-    Arc, NativePair, ReadSource, RecoveryContext, SequentialRanges, SourceDescriptor,
-    SourceQosBudget, SourceQosStats, StagedDestination, TransferFailure, TransferPhase,
-    TransferPlan, TransferRequest, TransferSide, Transferred, read_exact_range,
+    Arc, CopiedMetadataPlan, NativePair, ReadSource, RecoveryContext, SequentialRanges,
+    SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination, TransferFailure,
+    TransferPhase, TransferPlan, TransferRequest, TransferSide, Transferred, read_exact_range,
     register_prepared_stage, select_stage,
 };
 
@@ -22,6 +22,7 @@ pub(super) struct NativeTransferInput {
     pub source_qos: Option<SourceQosBudget>,
     pub plan: TransferPlan,
     pub recovery: Option<RecoveryContext>,
+    pub copied_metadata_plan: Option<CopiedMetadataPlan>,
 }
 
 pub(super) async fn transfer_native(
@@ -35,14 +36,18 @@ pub(super) async fn transfer_native(
         .map_err(|error| {
             TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
         })?;
-    let digest = hash_source(
-        &*input.source,
-        &input.descriptor,
-        request,
-        input.plan,
-        input.source_qos.clone(),
-    )
-    .await?;
+    let digest = if request.needs_source_digest() {
+        hash_source(
+            &*input.source,
+            &input.descriptor,
+            request,
+            input.plan,
+            input.source_qos.clone(),
+        )
+        .await?
+    } else {
+        [0; 32]
+    };
     let stage = select_stage(
         request,
         &input.destination,
@@ -151,6 +156,8 @@ async fn finish_native(
         source_qos: input.source_qos,
         native_bytes: native.native_bytes,
         native_requests: native.native_requests,
+        effective_recovery: input.plan.effective_recovery,
+        copied_metadata_plan: input.copied_metadata_plan,
     })
 }
 

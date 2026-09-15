@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::StreamExt as _;
 
@@ -8,29 +9,49 @@ use crate::model::{BackendKind, FailureClass};
 struct FakeProtocol {
     payload: Bytes,
     handle: Bytes,
+    maximum_read_chunk_bytes: usize,
+    described: AtomicUsize,
     opened: Mutex<usize>,
+    active_reads: Arc<AtomicUsize>,
+    maximum_active_reads: Arc<AtomicUsize>,
 }
 
-struct FakeCursor(Bytes);
+struct FakeCursor {
+    payload: Bytes,
+    active_reads: Arc<AtomicUsize>,
+    maximum_active_reads: Arc<AtomicUsize>,
+}
 
 #[async_trait]
 impl NfsReadCursor for FakeCursor {
-    async fn read_at(&mut self, offset: u64, count: usize) -> Result<Bytes, NfsProtocolFailure> {
+    async fn read_at(&self, offset: u64, count: usize) -> Result<Bytes, NfsProtocolFailure> {
+        let active = self.active_reads.fetch_add(1, Ordering::SeqCst) + 1;
+        self.maximum_active_reads
+            .fetch_max(active, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let start = usize::try_from(offset).map_err(|_| NfsProtocolFailure::protocol())?;
-        Ok(self.0.slice(start..start + count))
+        let result = self.payload.slice(start..start + count);
+        self.active_reads.fetch_sub(1, Ordering::SeqCst);
+        Ok(result)
     }
 }
 
 #[async_trait]
 impl NfsSourceProtocol for FakeProtocol {
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        self.maximum_read_chunk_bytes
+    }
+
     async fn describe(
         &self,
         _path: &StoragePath,
     ) -> Result<NfsSourceObservation, NfsProtocolFailure> {
+        self.described.fetch_add(1, Ordering::SeqCst);
         Ok(NfsSourceObservation {
             kind: EntryKind::File,
             size: Some(self.payload.len() as u64),
             file_handle: self.handle.clone(),
+            content_version: Bytes::from_static(b"version-1"),
         })
     }
 
@@ -43,7 +64,11 @@ impl NfsSourceProtocol for FakeProtocol {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         Ok((
-            Box::new(FakeCursor(self.payload.clone())),
+            Box::new(FakeCursor {
+                payload: self.payload.clone(),
+                active_reads: Arc::clone(&self.active_reads),
+                maximum_active_reads: Arc::clone(&self.maximum_active_reads),
+            }),
             self.handle.clone(),
         ))
     }
@@ -63,7 +88,11 @@ async fn one_stream_uses_one_open_cursor_and_exact_ranges() -> Result<(), Box<dy
     let protocol = Arc::new(FakeProtocol {
         payload: Bytes::from(vec![7; 2 * 1024 * 1024 + 3]),
         handle: Bytes::from_static(b"stable-file-handle"),
+        maximum_read_chunk_bytes: 1024 * 1024,
+        described: AtomicUsize::new(0),
         opened: Mutex::new(0),
+        active_reads: Arc::new(AtomicUsize::new(0)),
+        maximum_active_reads: Arc::new(AtomicUsize::new(0)),
     });
     let source = adapter(Arc::clone(&protocol));
     let path = StoragePath::new("large.bin")?;
@@ -75,16 +104,22 @@ async fn one_stream_uses_one_open_cursor_and_exact_ranges() -> Result<(), Box<dy
             expected_source: Some(descriptor.source_identity),
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
         .await?;
     let mut total = 0;
     while let Some(chunk) = stream.next().await.transpose()? {
-        assert!(chunk.len() <= usize::try_from(MAX_ROLE_READ)?);
+        assert!(chunk.len() <= MAX_ROLE_READ);
         total += chunk.len();
     }
     assert_eq!(total, 1_500_000);
+    assert_eq!(
+        protocol.described.load(Ordering::SeqCst),
+        1,
+        "an explicit range already carries the size boundary and must not re-describe"
+    );
     assert_eq!(
         *protocol
             .opened
@@ -96,12 +131,69 @@ async fn one_stream_uses_one_open_cursor_and_exact_ranges() -> Result<(), Box<dy
 }
 
 #[tokio::test]
+async fn shared_budget_bounds_nfs_prefetch_without_serializing_reads()
+-> Result<(), Box<dyn std::error::Error>> {
+    let protocol = Arc::new(FakeProtocol {
+        payload: Bytes::from(vec![7; 4 * 1024 * 1024]),
+        handle: Bytes::from_static(b"stable-file-handle"),
+        maximum_read_chunk_bytes: 1024 * 1024,
+        described: AtomicUsize::new(0),
+        opened: Mutex::new(0),
+        active_reads: Arc::new(AtomicUsize::new(0)),
+        maximum_active_reads: Arc::new(AtomicUsize::new(0)),
+    });
+    let source = adapter(Arc::clone(&protocol));
+    let path = StoragePath::new("large.bin")?;
+    let descriptor = source.describe(&path).await?;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (runtime, mut ordered) = crate::storage::InflightRuntime::channel(
+        crate::storage::InflightConfig::new(128, 2 * 1024 * 1024, 128)?,
+        0,
+        protocol.payload.len() as u64,
+        cancel.clone(),
+    )?;
+    let budget = crate::storage::ReadBudget::new(runtime.clone());
+    let mut stream = source
+        .read(ReadRequest {
+            path,
+            range: None,
+            expected_source: Some(descriptor.source_identity),
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 128,
+            read_budget: Some(budget.clone()),
+            cancel,
+            source_qos: None,
+        })
+        .await?;
+    let mut offset = 0;
+    while let Some(bytes) = stream.next().await.transpose()? {
+        let length = bytes.len() as u64;
+        runtime
+            .complete_read(
+                budget.take(offset).ok_or("missing reservation")?,
+                offset,
+                bytes,
+            )
+            .await?;
+        assert!(ordered.next().await.transpose()?.is_some());
+        offset += length;
+    }
+    assert_eq!(offset, protocol.payload.len() as u64);
+    assert_eq!(protocol.maximum_active_reads.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn opened_identity_detects_change_and_precancel_avoids_another_open()
 -> Result<(), Box<dyn std::error::Error>> {
     let protocol = Arc::new(FakeProtocol {
         payload: Bytes::from_static(b"payload"),
         handle: Bytes::from_static(b"current-handle"),
+        maximum_read_chunk_bytes: 1024 * 1024,
+        described: AtomicUsize::new(0),
         opened: Mutex::new(0),
+        active_reads: Arc::new(AtomicUsize::new(0)),
+        maximum_active_reads: Arc::new(AtomicUsize::new(0)),
     });
     let source = adapter(Arc::clone(&protocol));
     let path = StoragePath::new("file")?;
@@ -117,6 +209,7 @@ async fn opened_identity_detects_change_and_precancel_avoids_another_open()
             expected_source: Some(other),
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -134,6 +227,7 @@ async fn opened_identity_detects_change_and_precancel_avoids_another_open()
             expected_source: None,
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel,
             source_qos: None,
         })
@@ -148,6 +242,42 @@ async fn opened_identity_detects_change_and_precancel_avoids_another_open()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
         1
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn negotiated_protocol_limit_prevents_internal_read_resplitting()
+-> Result<(), Box<dyn std::error::Error>> {
+    let protocol = Arc::new(FakeProtocol {
+        payload: Bytes::from_static(b"abcdefgh"),
+        handle: Bytes::from_static(b"stable-file-handle"),
+        maximum_read_chunk_bytes: 3,
+        described: AtomicUsize::new(0),
+        opened: Mutex::new(0),
+        active_reads: Arc::new(AtomicUsize::new(0)),
+        maximum_active_reads: Arc::new(AtomicUsize::new(0)),
+    });
+    let source = adapter(protocol);
+    assert_eq!(source.maximum_read_chunk_bytes(), 3);
+    let path = StoragePath::new("file")?;
+    let descriptor = source.describe(&path).await?;
+    let mut stream = source
+        .read(ReadRequest {
+            path,
+            range: None,
+            expected_source: Some(descriptor.source_identity),
+            maximum_chunk_bytes: 8,
+            read_inflight: 4,
+            read_budget: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            source_qos: None,
+        })
+        .await?;
+    let mut chunks = Vec::new();
+    while let Some(chunk) = stream.next().await.transpose()? {
+        chunks.push(chunk.len());
+    }
+    assert_eq!(chunks, vec![3, 3, 2]);
     Ok(())
 }
 

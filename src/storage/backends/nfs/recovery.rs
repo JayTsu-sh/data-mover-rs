@@ -1,11 +1,11 @@
 use bytes::Bytes;
 
 use super::source::{entry_failure, role_failure};
-use super::staged::NfsStagedDestinationAdapter;
+use super::staged::{NfsStageState, NfsStagedDestinationAdapter};
 use crate::model::{FailureClass, Operation, Transience};
 use crate::storage::{PreparedStage, RecoverRequest, RecoveryIdentity, StorageRoleFailure};
 
-const MAGIC: &[u8; 8] = b"DMNRCV01";
+const MAGIC: &[u8; 8] = b"DMNRCV03";
 const FIXED_PREFIX: usize = 74;
 const CHECKSUM_SIZE: usize = 32;
 
@@ -32,6 +32,7 @@ pub(super) async fn handoff(
     stage: &PreparedStage,
 ) -> Result<RecoveryIdentity, StorageRoleFailure> {
     let identity = export(adapter, stage).await?;
+    adapter.close_prepared_handle(stage).await?;
     adapter.release_authority(stage);
     Ok(identity)
 }
@@ -45,20 +46,23 @@ pub(super) async fn recover(
         &token,
         request.final_destination.path(),
     )?;
+    let stage_id = NfsStagedDestinationAdapter::stage_id(&token, request.final_destination.path())?;
     let mut claim_hasher = blake3::Hasher::new();
     claim_hasher.update(b"data-mover/nfs-recovery-claim/v1\0");
     claim_hasher.update(request.identity.as_bytes());
     claim_hasher.update(&request.claim_token);
     let claim_hash = claim_hasher.finalize();
-    let claimed_token = Bytes::from(format!(
-        ".data-mover-staging/recovered-{}.part",
-        &claim_hash.to_hex()[..32]
-    ));
+    let claimed = super::staged::sibling_path(
+        request.final_destination.path(),
+        &format!("{stage_id}.claim-{}", &claim_hash.to_hex()[..32]),
+    )?;
+    let claimed_token = Bytes::copy_from_slice(claimed.as_str().as_bytes());
     let claimed = NfsStagedDestinationAdapter::validate_token_shape(
         &claimed_token,
         request.final_destination.path(),
     )?;
-    let durable_prefix = claim_durable_prefix(adapter, &request, &previous, &claimed).await?;
+    let durable_prefix =
+        claim_durable_prefix(adapter, &request, &previous, &claimed, &stage_id).await?;
     if !adapter.claim_authority(claimed_token.clone()) {
         return Err(entry_failure(
             request.final_destination.path(),
@@ -67,14 +71,18 @@ pub(super) async fn recover(
             Transience::Transient,
         ));
     }
-    Ok(PreparedStage::new(
+    let mut stage = PreparedStage::new(
         adapter.identity.clone(),
         request.final_destination,
         claimed_token,
         request.recovery_binding,
         durable_prefix,
         None,
-    ))
+    );
+    stage.backend_state = Some(std::sync::Arc::new(NfsStageState {
+        checkpoint_created: std::sync::atomic::AtomicBool::new(true),
+    }));
+    Ok(stage)
 }
 
 async fn claim_durable_prefix(
@@ -82,9 +90,28 @@ async fn claim_durable_prefix(
     request: &RecoverRequest,
     previous: &crate::model::StoragePath,
     claimed: &crate::model::StoragePath,
+    stage_id: &str,
 ) -> Result<u64, StorageRoleFailure> {
+    let durable_prefix = super::checkpoint::load(
+        adapter,
+        request.recovery_binding,
+        request.final_destination.path(),
+        stage_id,
+    )
+    .await?;
     match adapter.protocol.size(claimed).await {
-        Ok(size) => return Ok(size),
+        Ok(size) if size >= durable_prefix => {
+            truncate_claimed(adapter, request, claimed, durable_prefix).await?;
+            return Ok(durable_prefix);
+        }
+        Ok(_) => {
+            return Err(entry_failure(
+                request.final_destination.path(),
+                Operation::Prepare,
+                FailureClass::Corruption,
+                Transience::Permanent,
+            ));
+        }
         Err(error) if error.class == FailureClass::NotFound => {}
         Err(error) => {
             return Err(role_failure(
@@ -94,13 +121,25 @@ async fn claim_durable_prefix(
             ));
         }
     }
-    let expected = adapter.protocol.size(previous).await.map_err(|error| {
+    let previous_size = adapter.protocol.size(previous).await.map_err(|error| {
         role_failure(request.final_destination.path(), Operation::Prepare, error)
     })?;
+    if previous_size < durable_prefix {
+        return Err(entry_failure(
+            request.final_destination.path(),
+            Operation::Prepare,
+            FailureClass::Corruption,
+            Transience::Permanent,
+        ));
+    }
     let rename_result = adapter.protocol.rename(previous, claimed).await;
     let claimed_size = adapter.protocol.size(claimed).await;
-    if claimed_size.as_ref().is_ok_and(|size| *size == expected) {
-        return Ok(expected);
+    if claimed_size
+        .as_ref()
+        .is_ok_and(|size| *size >= durable_prefix)
+    {
+        truncate_claimed(adapter, request, claimed, durable_prefix).await?;
+        return Ok(durable_prefix);
     }
     let previous_consumed = adapter
         .protocol
@@ -128,6 +167,28 @@ async fn claim_durable_prefix(
         Operation::Prepare,
         error,
     ))
+}
+
+async fn truncate_claimed(
+    adapter: &NfsStagedDestinationAdapter,
+    request: &RecoverRequest,
+    claimed: &crate::model::StoragePath,
+    durable_prefix: u64,
+) -> Result<(), StorageRoleFailure> {
+    let handle = adapter
+        .protocol
+        .open_write(claimed)
+        .await
+        .map_err(|error| {
+            role_failure(request.final_destination.path(), Operation::Prepare, error)
+        })?;
+    let truncate_result = handle.set_len(durable_prefix).await;
+    let close_result = handle.close().await;
+    truncate_result.map_err(|error| {
+        role_failure(request.final_destination.path(), Operation::Prepare, error)
+    })?;
+    close_result
+        .map_err(|error| role_failure(request.final_destination.path(), Operation::Prepare, error))
 }
 
 fn decode(request: &RecoverRequest) -> Result<Bytes, StorageRoleFailure> {

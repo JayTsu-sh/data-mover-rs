@@ -34,12 +34,6 @@ pub(crate) struct NativeSourceBinding {
     pub size: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum NativeRecoveryMode {
-    Atomic,
-    Checkpointed,
-}
-
 pub(crate) struct NativeStageEvidence {
     pub write: WriteEvidence,
     pub native_bytes: u64,
@@ -55,8 +49,6 @@ pub(crate) struct NativeStageFailure {
 #[async_trait]
 pub(crate) trait NativeEndpoint: Send + Sync {
     fn affinity(&self) -> NativeAffinity;
-
-    fn recovery_mode(&self, source_size: u64) -> NativeRecoveryMode;
 
     async fn bind_source(
         &self,
@@ -92,10 +84,6 @@ impl NativePair {
         source: &super::SourceDescriptor,
     ) -> Result<NativeSourceBinding, StorageRoleFailure> {
         self.source.bind_source(source).await
-    }
-
-    pub(crate) fn recovery_mode(&self, source_size: u64) -> NativeRecoveryMode {
-        self.destination.recovery_mode(source_size)
     }
 
     pub(crate) async fn copy_into_stage(

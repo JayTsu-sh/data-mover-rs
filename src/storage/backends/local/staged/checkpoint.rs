@@ -1,10 +1,11 @@
 use std::io::{self, Read as _, Write as _};
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 
 use cap_std::fs::OpenOptions;
 
-use super::{LocalStagedDestination, STAGE_SEQUENCE, failure, io_failure, publication};
+use super::{LocalStagedDestination, failure, io_failure, publication};
 use crate::model::{FailureClass, Operation};
 use crate::storage::{PreparedStage, StorageRoleFailure};
 
@@ -27,16 +28,17 @@ pub(super) async fn persist(
     durable_prefix: u64,
 ) -> Result<(), StorageRoleFailure> {
     let checkpoint = adapter.checkpoint_name(stage, Operation::Verify)?;
-    let mut temporary = checkpoint.clone();
-    temporary.push(format!(
-        ".tmp-{:016x}",
-        STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    let temporary = std::ffi::OsString::from(crate::storage::artifacts::temporary_name(
+        &checkpoint.to_string_lossy(),
     ));
     let record = record(stage, durable_prefix);
-    let staging = adapter
-        .open_staging(Operation::Verify, stage.final_destination.path())
-        .await?;
+    let staging = adapter.stage_directory(stage, Operation::Verify).await?;
     let probe = Arc::clone(&adapter.write_probe);
+    #[cfg(test)]
+    if probe.pause_checkpoint.swap(false, Ordering::SeqCst) {
+        probe.checkpoint_started.notify_one();
+        probe.checkpoint_release.notified().await;
+    }
     tokio::task::spawn_blocking(move || {
         let result = (|| {
             let mut options = OpenOptions::new();
@@ -73,9 +75,7 @@ pub(super) async fn reobserve(
     let checkpoint_name = adapter.checkpoint_name(stage, Operation::Verify)?;
     let expected_hash =
         *blake3::hash(stage.final_destination.path().as_str().as_bytes()).as_bytes();
-    let staging = adapter
-        .open_staging(Operation::Verify, stage.final_destination.path())
-        .await?;
+    let staging = adapter.stage_directory(stage, Operation::Verify).await?;
     let (record, stage_len) = tokio::task::spawn_blocking(move || {
         let mut record = Vec::new();
         staging

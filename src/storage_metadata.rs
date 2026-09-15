@@ -63,7 +63,7 @@ impl StorageEnum {
             (Self::Local(s), EntryEnum::NAS(e)) => {
                 s.set_metadata(
                     &e.relative_path,
-                    Some(e.atime),
+                    None,
                     Some(e.mtime),
                     e.uid,
                     e.gid,

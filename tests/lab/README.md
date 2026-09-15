@@ -30,6 +30,14 @@ Root lifecycle cases use `LAB_HDFS_ADMIN_USER` (default
 `hdfs/hdfs-namenode@HDFS.LOCAL`) only to create
 and remove their isolated `/tmp/data-mover-nightly` namespace; read-only smoke
 coverage continues to use the user embedded in `LAB_HDFS_LOCATION`.
+The `Windows native runtime` workflow runs filesystem tests on GitHub-hosted Windows,
+using the native Rust MSVC target. Its `local_transfer_runtime` target covers Local
+AtomicReplace/Checkpointed copy and overwrite, read-back enabled/disabled, cancellation,
+and handle cleanup, alongside the existing positional-I/O and cluster-free contracts.
+It runs for pull requests, manual dispatch, and `test/windows-native-*` branch pushes.
+A successful cross-compile alone is not a native runtime result. This workflow does not
+exercise real NFS/CIFS/HDFS servers or assert POSIX metadata support on Windows.
+
 Regular CI also runs a native `windows-latest` compile gate for the library,
 the cluster-free HDFS contract target, and all examples. This establishes
 Windows build support for explicit Simple mode without silently skipping a

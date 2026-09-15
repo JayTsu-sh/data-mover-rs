@@ -138,6 +138,7 @@ async fn source_stream_honours_negotiated_chunks_without_short_reads()
             expected_source: Some(descriptor.source_identity),
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -187,6 +188,7 @@ async fn active_source_cancellation_stops_before_another_read_and_closes()
             expected_source: None,
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: cancel.clone(),
             source_qos: None,
         })
@@ -228,6 +230,7 @@ async fn opened_identity_change_fails_before_read_and_closes_resource()
             expected_source: Some(descriptor.source_identity),
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -272,6 +275,7 @@ async fn source_qos_limits_each_real_read_and_accounts_only_source_io()
             expected_source: Some(descriptor.source_identity),
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: Some(budget.clone()),
         })
@@ -358,6 +362,7 @@ async fn real_share_exercises_domain_roles_without_wire_api()
                 expected_source: Some(described.source_identity),
                 maximum_chunk_bytes: 1024 * 1024,
                 read_inflight: 4,
+                read_budget: None,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 source_qos: None,
             })
@@ -594,6 +599,7 @@ async fn assert_real_payload(
             expected_source: Some(descriptor.source_identity),
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
         })
@@ -626,7 +632,6 @@ async fn verify_and_publish(
         .publish(
             stage,
             crate::storage::PublishRequest {
-                policy: crate::storage::ExistingDestinationPolicy::FailIfExists,
                 expected_size: fixture.payload.len() as u64,
                 expected_blake3: hash,
                 cancel: tokio_util::sync::CancellationToken::new(),
@@ -660,6 +665,7 @@ async fn assert_real_failure_isolation(
             expected_source: None,
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel,
             source_qos: None,
         })
@@ -720,7 +726,7 @@ async fn round_trip_acl(
             Err(error) => Err(error.into()),
         }
     } else {
-        return Err("FAS2750 ACL observation did not return a value".into());
+        Err("FAS2750 ACL observation did not return a value".into())
     }
 }
 

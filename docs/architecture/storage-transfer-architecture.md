@@ -42,6 +42,7 @@ data-mover-rs ──must not know──> terrasync-rs
 - backend identity, capabilities, and typed unsupported/uncertified results;
 - storage traversal and immutable observations;
 - source streaming, staged writes, checkpoint validation, verification, and publication;
+- per-transfer recovery-state persistence, exclusive attempt claims, and cleanup;
 - deterministic metadata conversion and semantic-loss reporting;
 - source-only transfer QoS enforcement and neutral transfer outcomes;
 - versioned opaque observation snapshot and recovery-identity codecs.
@@ -55,10 +56,9 @@ data-mover-rs ──must not know──> terrasync-rs
 - tar manifests, NDX/tree synchronization, and product events;
 - credential sourcing/rotation and selection of neutral data-mover policies.
 
-terrasync may persist an opaque snapshot, `RecoveryIdentity`, and its opaque recovery-claim
-token. It must not parse or
-mutate backend facts, staged paths, file handles, upload IDs, parts, offsets, hashes, or
-checkpoint ranges.
+terrasync persists opaque observation snapshots but does not receive recovery identities, staged
+paths, upload IDs, parts, offsets, hashes, or checkpoint ranges. Its only per-job recovery input to
+data-mover is `TransferPolicy`.
 
 ## 3. Target module tree and dependency rules
 
@@ -88,6 +88,10 @@ transfer    -> model + storage roles + metadata + integrity
 runtime     -> model only; high-level modules may use runtime utilities
 backend dir -> model + its protocol dependency + storage role definitions
 ```
+
+During the in-crate legacy migration, `storage/factory.rs` is the sole composition boundary allowed
+to construct the NFS, CIFS, S3, and HDFS protocol owners before adapting them into storage roles.
+No other target-module file may import those legacy modules.
 
 Forbidden dependencies:
 
@@ -204,11 +208,10 @@ per connected pair, not per `BackendKind::S3`. All other backends use streaming 
 no empty native adapter. Standard S3 pairs compare an opaque affinity derived from the connected
 endpoint and compatibility profile; buckets and prefixes remain protocol-owned source/destination
 facts. Eligible copies bind the observed ETag/version, prepare an unpublished stage through the
-ordinary destination role, and only then let the native endpoint fill that stage. Checkpointed
-native copy registers its opaque recovery identity and waits for the caller's durable
-acknowledgement before the first native payload request. Atomic `CopyObject` is ephemeral and needs
-no registrar; multipart copy is checkpointed. Both use the ordinary BLAKE3 verification and
-publication lifecycle. Strict client-shaped payload, supplied recovery state, a different endpoint,
+ordinary destination role, and only then let the native endpoint fill that stage. S3 native copy,
+including multipart copy, never participates in streaming checkpoint recovery; a failed attempt is
+reissued through native operation semantics. Both forms use the ordinary BLAKE3 verification and
+publication lifecycle. Strict client-shaped payload, a different endpoint,
 or a non-standard S3 profile selects streaming before remote mutation. A native operation failure
 retains stage cleanup authority and is never silently retried through streaming.
 
@@ -312,6 +315,14 @@ failure. Standalone metadata operations use the ordinary `Metadata` role with th
 The partial `MetadataApplicationReport` therefore remains distinct from the compile-time
 `LossReport`.
 
+The ordinary Local-to-Local transfer entry preserves the same baseline file metadata as the
+legacy `StorageEnum` copy path: numeric ownership and mode plus modified time. Local atime is not
+copied because ordinary reads can change it and it is not part of the Local preservation contract. It
+captures and compiles that plan before preparing destination state, applies the mutations to the
+stage before publication, and returns the application report for both `Checkpointed` and `AtomicReplace`.
+`Checkpointed` synchronizes the staged metadata before its durable rename; `AtomicReplace` applies the same
+metadata without adding data or directory synchronization.
+
 The directed matrix classifies the intended preservation result of each family as:
 
 - `Preserved`
@@ -357,22 +368,21 @@ policy becomes immutable after preflight; runtime controls cannot change guarant
 The expert source session revalidates the advertised `ObservedEntry`, negotiates its maximum
 chunk, reads the source sequentially, hashes the complete logical content, and emits only bytes
 after the destination-reported durable prefix. The expert destination session independently
-prepares or recovers backend-owned state and obtains durable `RecoveryRegistrar` acknowledgement
+prepares or recovers backend-owned state after data-mover durably records its opaque identity,
 before returning its write offset. A caller-owned bounded transport carries only byte chunks and
 neutral source evidence between the two halves. The destination then observes its checkpoint,
 verifies complete staged content, applies its precompiled metadata plan to that stage, and
 publishes through the same backend roles and failure phases as the high-level operation. A metadata
 failure is destination-attributed, stops at the first failed family, leaves `FinalDestination`
-unchanged, and retains stage cleanup/recovery authority. `VerifyOrSkip` is rejected before target
-mutation when a plan contains mutations, because retaining an existing content-equivalent object
-would discard the staged metadata. Prepared destination sessions have explicit discard ownership
+unchanged, and retains stage cleanup/recovery authority. Prepared destination sessions have explicit
+discard ownership
 for remote cancellation before payload.
 
 ## 9. Transfer state machine
 
 ```text
 Created -> Preflighted -> Planned
-        -> Prepared(Fresh | Resumable | Restarted) -> RecoveryRegistered -> Transferring -> Verified -> MetadataApplied -> Published
+        -> Prepared(Fresh | Resumable | Restarted) -> RecoveryPersisted -> Transferring -> Verified -> MetadataApplied -> Published
         -> CommitReady                           -> Verified -> MetadataApplied -> Published
         -> AlreadyCommitted
         -> Completed | CommittedWithWarnings
@@ -381,7 +391,7 @@ Created -> Preflighted -> Planned
 `Cancelled` and `Failed` are structured terminal states attributed to their stage;
 `FinalConflict` is a typed planning/preparation failure. Every transition emits neutral
 facts but progress is not checkpoint truth. `Prepared` produces the current opaque recovery
-identity; `RecoveryRegistered` means the caller durably acknowledged it. Backend checkpoint
+identity; `RecoveryPersisted` means data-mover durably recorded it. Backend checkpoint
 advancement remains private and never asks the caller to persist ranges, offsets, or parts.
 
 ### Preflight
@@ -392,6 +402,12 @@ QoS. A capability failure is typed and precedes remote mutation.
 
 ### Staging and transfer
 
+Local and NFS source prefetch reserve shared chunk, byte and operation capacity before reading.
+The payload reservation passes to the ordered output queue and is released when consumed; the
+operation reservation ends when the read is submitted to that queue. A full budget prevents further source allocation,
+while available capacity still permits concurrent reads. Sources without this admission interface
+are polled serially with producer-owned reservations acquired before reading.
+
 The default path reads sequentially and may write out of order through bounded inflight
 buffers. Buffer count and bytes are explicit. Queued, read, or gap-separated bytes are
 progress only. A staged destination remains invisible as `FinalDestination`.
@@ -400,14 +416,16 @@ The Local streaming implementation lends both roles before source description or
 mutation, selects the backend-neutral `Streaming` data path, and admits sequential ranges through
 the shared chunk/byte/operation inflight runtime. Local range streams independently cap each
 emitted chunk at 2 MiB; the caller, inflight byte budget, QoS, or remaining range may negotiate a
-smaller read. The Local staged destination independently submits input pieces up to 5 MiB as one
-positional write and zero-copy splits larger input pieces into writes no larger than 5 MiB.
+smaller read. The Local staged destination independently submits input pieces up to 8 MiB as one
+positional write and zero-copy splits larger input pieces into writes no larger than 8 MiB. The
+64 MiB automatic-checkpoint interval is an independent recovery-policy constant and does not
+change when this write-task ceiling is tuned.
 Completion at this stage requires a re-observed durable prefix equal to
 the described source size; the staged file remains unpublished for verification and publication.
 
 ### Verification
 
-Copy-time generic transfer computes source BLAKE3 during the initial complete sequential
+With read-back verification enabled (the default), copy-time generic transfer computes source BLAKE3 during the initial complete sequential
 read, then sequentially rereads the complete durable staged destination and compares its
 BLAKE3 before publication. Recovery includes reused content in the complete verification.
 The Local implementation performs both passes through bounded buffers, checks cancellation
@@ -418,21 +436,15 @@ streams and stops on the first mismatch or read failure, cancelling the other re
 
 ### Publication
 
-Publication occurs only after required verification. Requests select a minimum acceptable
-guarantee from `AtomicReplace`, `AtomicCreate`, `VerifiedNonAtomic`, and `BestAvailable`;
-incapable destinations fail preflight and outcomes report the actual guarantee. Existing
-destination policy is `Overwrite` (default), `VerifyOrSkip`, or `FailIfExists`.
-`VerifyOrSkip` requires content-equivalence evidence, not path/time/size. Existing final
-content remains unchanged until successful publication.
-Local `Overwrite` publishes with a capability-confined atomic rename, while `FailIfExists` uses
-an atomic create/link boundary. `VerifyOrSkip` hard-links the observed final into staging, hashes
-that stable inode with cancellation checks, then atomically rebinds the verified inode to the
-final path; a concurrent path replacement therefore cannot invalidate the equivalence evidence.
+Publication occurs only after required verification. File publication has one behavior: replace the
+final destination with the staged object. Local and rename-capable backends use atomic replacement;
+other backends retain their documented reconciliation rules. The request API does not expose
+`FailIfExists` or `VerifyOrSkip`, and backends do not stat or hash an existing final merely to select
+a publication policy. Existing final content remains unchanged until successful publication.
 Publication failures explicitly distinguish pre-commit recoverable staged state from failures
 after the final path changed. Post-commit cleanup or durability failures never claim that the
 stage is recoverable or that `FinalDestination` is unchanged; they retain a separate idempotent
-cleanup handle for staged artifacts. Temporary equivalence guards are removed on every
-pre-commit exit and by discard/recovery cleanup after a process interruption.
+cleanup handle for staged artifacts.
 
 ### Cancellation and failure
 
@@ -448,42 +460,42 @@ source-deletion-safety fact for terrasync policy.
 
 ## 10. Recovery contract
 
-`Resumability` is either `Enabled` (the default) or `Disabled`. It expresses only whether
-the caller wants reusable work retained; checkpoint mechanisms remain backend-owned. The
-request combinations are strict:
+`TransferPolicy` offers `Checkpointed` (the default), `AtomicReplace`, and Local `Direct`. Direct writes the final inode without staging, rename, checkpoints, or final persistence barriers; see [ADR-0003](../adr/0003-transfer-policy-direct.md). AtomicReplace restarts from zero without
+creating checkpoints; Local and NFS skip final persistence barriers but retain staging,
+cancellation checks and atomic publication. Success in AtomicReplace mode does not promise crash
+durability. Other protocols may retain their required persistence operations. It is the only
+recovery control accepted from terrasync. Data-mover selects the effective behavior after route and
+source-read planning and reports it as `EffectiveRecovery`.
 
-- `Disabled` without a `RecoveryIdentity` uses an ephemeral stage and never checkpoints;
-- `Disabled` with a `RecoveryIdentity` is rejected before destination mutation;
-- `Disabled` with a recovery provider is rejected before destination mutation;
-- `Enabled` without a `RecoveryIdentity` starts a new recoverable transfer;
-- `Enabled` with a `RecoveryIdentity` must recover that state or fail without silently
-  restarting the upload.
+For eligible multi-source-chunk streaming with `Checkpointed`, data-mover opens its private recovery store,
+exclusively claims the transfer binding, recovers or prepares backend-owned staged state, and
+atomically persists the backend's versioned opaque identity. Ordinary Local and NFS defer registration until
+the first durable checkpoint; destinations without deferred support register before payload. Successful publication
+and explicit discard clear that record. Before publication, the record atomically enters a
+`Publishing` state. After a restart, only that state may reconcile a missing stage by clearing the
+ambiguous record and starting fresh; an ordinary missing staged object remains a strict failure.
+Invalid persisted records fail validation; they are never
+silently interpreted by terrasync.
 
-A recoverable transfer also requires a caller-owned `RecoveryProvider`. Data-mover opens that
-provider only after planning proves the transfer can retain a reusable checkpoint; single streaming
-chunk and atomic native transfers therefore perform no recovery-store interaction. The provider
-returns the optional persisted identity, the stable per-attempt claim, and a `RecoveryRegistrar`.
-Fresh and recovered stages snapshot their current opaque identity and wait for
-`register(identity)` to return `Ok(())` before any destination payload write. `Ok(())` is a durable
-acknowledgement: the caller must be able to return that identity and claim after a worker or process
-restart. Registration is an idempotent, at-least-once upsert scoped to the logical
-transfer/attempt; stale-attempt rejection is caller-owned. A provider or registration failure
-retains an unwritten unpublished stage. Cancellation does not interrupt an in-progress registration
-commit; it is observed immediately after acknowledgement and before payload.
-
-A streaming transfer that fits within one negotiated source-read chunk uses an ephemeral stage
-even when resumability is enabled, because it has no useful intermediate checkpoint. Atomic native
-`CopyObject` is ephemeral for the same reason. Such transfers never export a recovery identity.
-Restart upload is an explicit lifecycle action: the application asks
-data-mover to discard the owned failed stage, removes the persisted identity, and starts a new
-attempt without an identity. It is not another resumability mode.
+A streaming transfer that fits within one effective source-read chunk uses an ephemeral stage even
+under `Checkpointed`, because it has no useful intermediate checkpoint. This decision does not use
+the destination write ceiling: a destination may split that one source chunk into multiple writes.
+All native copies report `NotApplicableNative` and do not open recovery state. Restart upload is an
+explicit data-mover lifecycle action that discards its owned failed stage and state before starting
+from zero.
 
 A checkpoint is valid only when the backend re-observes the staged state, binds it to the
 same transfer/source/destination, independently observes reusable bytes or parts, and meets
 the requested verification guarantee. `RecoveryIdentity` is versioned, integrity-checked,
 opaque, and validated before any destructive action.
 
-The Local identity binds the transfer identity, source identity/path/size, destination backend
+Recovery bindings also include a source content-version observation, separate from object identity.
+Local captures mtime and ctime from the same stat as its descriptor (mtime and creation time on
+non-Unix platforms); NFS captures the server's mtime and ctime. Atime is excluded. A same-size
+in-place edit therefore selects a fresh binding instead of reusing an old durable prefix, even
+when read-back verification is disabled.
+
+The Local identity binds the transfer identity, source identity/path/size/version, destination backend
 identity, final destination, stage token, and checkpoint record. Its checkpoint records only a contiguous prefix after the
 staged file has crossed a persistence barrier. Recoverable Local writes pause input after each
 backend-owned 256 MiB interval, drain inflight positional writes, verify the completed range is
@@ -612,3 +624,44 @@ The architecture is implementable only together with the two YAML matrices and a
 gates named at the top. A change to a responsibility or semantic contract changes this
 document; a change to a capability/cell changes the corresponding YAML; a change to evidence
 changes `acceptance-gates.md`. No document duplicates another's authority.
+
+### Local execution and automatic recovery
+
+The accepted decision is [ADR-0001](../adr/0001-local-transfer-execution-and-recovery.md). Ordinary Local transfers default to automatic recovery: a 64 MiB destination checkpoint interval, with eligibility requiring a file strictly larger than that interval and more than one effective source chunk, selected once before payload I/O. Checkpointed uses this rule; a checkpoint boundary reached at end of file skips the periodic checkpoint and proceeds to final synchronization and publication. Eligible fresh stages are registered only at their first durable checkpoint. Smaller multi-chunk transfers still use inflight reads and writes without checkpoint registration. AtomicReplace skips new checkpoints and Local final durability barriers. See [ADR-0002](../adr/0002-auto-and-quick-policy.md).
+
+Single-source-chunk transfers bypass the producer/channel but preserve source length checks, cancellation and atomic publication; final durability follows Checkpointed or AtomicReplace. Backend write ceilings independently govern splitting and concurrent writes. `Bytes` slices retain their allocations; Local does not concatenate source fragments to fill its maximum write size. Prepared stages reuse directory capabilities within an attempt.
+
+### NFS execution and automatic recovery
+
+Ordinary NFS transfers use the same fixed 64 MiB Checkpointed eligibility interval, independent of
+negotiated protocol chunk sizes. Checkpointed sends UNSTABLE WRITEs while retaining their verifier evidence.
+It COMMITs at the first eligible recovery boundary or at EOF, so files below the threshold pay only
+the final COMMIT. Eligible copies register recovery only after the first interval is a contiguous
+committed prefix and its per-stage checkpoint file has been atomically replaced. Every later 64 MiB
+boundary replaces that record after its data barrier. Recovery trusts the record instead of stage
+length and truncates any inflight tail before resume. Stage and checkpoint are hidden siblings of
+the final file. The current stage token embeds an immutable, unique stage ID that remains present
+across claim renames, so recovery derives the checkpoint from the single token carried by recovery
+identity while isolating competing attempts for the same binding. NFS traversal omits the reserved
+`.data-mover-` siblings.
+Once recovery is active, bounded batch COMMITs may occur more frequently to release retry payloads,
+but they do not advance the recorded recovery prefix. AtomicReplace uses bounded UNSTABLE WRITEs without COMMIT, then closes and atomically renames
+the stage; it creates no recovery record and does not promise server-crash durability. Both modes
+retain the negotiated NFS write ceiling and the common inflight backpressure.
+
+The NFS write path distinguishes the requested stability from the server-reported commitment.
+`FILE_SYNC` replies need no ordinary COMMIT and do not retain payload bytes for verifier replay.
+`UNSTABLE` and `DATA_SYNC` replies retain payload bytes and count toward the bounded COMMIT batch.
+All retained outcomes still pass through the backend's batch-completion primitive at recovery and
+EOF boundaries so pNFS layout synchronization remains protocol-owned.
+
+`TransferRequest::with_read_back_verification` selects `ReadBackVerification::Enabled` or `Disabled`. Outcomes carry that selection and `blake3: Option<[u8; 32]>`; `None` explicitly means destination read-back was not performed. The expert interface continues to require verified evidence.
+
+
+Local/NFS artifact naming follow-up: new stages use the shared
+`.data-mover-<destination-path-hash-16>-<uuid-32>.stage` base name in the final parent.
+Checkpoints append `.checkpoint`; checkpoint update temporaries append `.tmp-<uuid-32>`.
+Local retains its `.claim` file lock. NFS claim rename appends `.claim-<claim-id-32>`
+to the stage base name, while its checkpoint name remains based on the unchanged base.
+RecoveryIdentity still carries one current stage token. Only the unified naming format is
+accepted for recovery; legacy stage names and the old centralized staging layout are rejected.

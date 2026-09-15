@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::StoragePath;
-use crate::storage::{ExistingDestinationPolicy, RecoveryIdentity, SourceQosGroup, Storage};
+use crate::storage::{RecoveryIdentity, SourceQosGroup, Storage};
 
 const MAX_IDENTITY_BYTES: usize = 1024;
 
@@ -21,23 +21,23 @@ impl fmt::Display for TransferValueError {
 
 impl std::error::Error for TransferValueError {}
 
-/// Caller-side failure to durably register a recovery identity.
+/// Failure to durably register a recovery identity inside data-mover.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RecoveryRegistrationFailure {
+pub(crate) enum RecoveryRegistrationFailure {
     /// The persistence or IPC path is temporarily unavailable.
     Unavailable,
-    /// The caller permanently rejected the registration.
+    /// A persisted record failed validation.
     Rejected,
 }
 
 impl RecoveryRegistrationFailure {
     #[must_use]
-    pub const fn unavailable() -> Self {
+    pub(crate) const fn unavailable() -> Self {
         Self::Unavailable
     }
 
     #[must_use]
-    pub const fn rejected() -> Self {
+    pub(crate) const fn rejected() -> Self {
         Self::Rejected
     }
 }
@@ -46,50 +46,46 @@ impl fmt::Display for RecoveryRegistrationFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable => formatter.write_str("recovery registration is unavailable"),
-            Self::Rejected => formatter.write_str("recovery registration was rejected"),
+            Self::Rejected => formatter.write_str("recovery state validation failed"),
         }
     }
 }
 
 impl std::error::Error for RecoveryRegistrationFailure {}
 
-/// Caller-owned persistence seam for one opaque recovery identity.
-///
-/// Returning `Ok(())` acknowledges that the identity can be supplied after a caller or worker
-/// restart. Data-mover does not write recoverable payload before that acknowledgement.
+/// Data-mover-owned persistence seam for one opaque recovery identity.
 #[async_trait]
-pub trait RecoveryRegistrar: Send + Sync {
+pub(crate) trait RecoveryRegistrar: Send + Sync {
     async fn register(&self, identity: RecoveryIdentity)
     -> Result<(), RecoveryRegistrationFailure>;
 }
 
-/// Caller-owned recovery inputs opened only after the planner proves a reusable checkpoint is
-/// possible for this transfer.
-pub struct RecoveryContext {
+/// Recovery inputs opened internally only after planning proves a checkpoint is useful.
+pub(crate) struct RecoveryContext {
     pub(crate) identity: Option<RecoveryIdentity>,
     pub(crate) claim: [u8; 32],
+    pub(crate) publication_pending: bool,
     pub(crate) registrar: Arc<dyn RecoveryRegistrar>,
+    pub(crate) lease: Arc<std::fs::File>,
 }
 
 impl RecoveryContext {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         identity: Option<RecoveryIdentity>,
         claim: [u8; 32],
+        publication_pending: bool,
         registrar: Arc<dyn RecoveryRegistrar>,
+        lease: Arc<std::fs::File>,
     ) -> Self {
         Self {
             identity,
             claim,
+            publication_pending,
             registrar,
+            lease,
         }
     }
-}
-
-/// Lazily opens caller persistence for a transfer that can actually retain reusable work.
-#[async_trait]
-pub trait RecoveryProvider: Send + Sync {
-    async fn open(&self) -> Result<RecoveryContext, RecoveryRegistrationFailure>;
 }
 
 /// Caller-provided stable identity for one logical transfer.
@@ -131,14 +127,29 @@ pub struct InflightLimits {
     pub(crate) operations: usize,
 }
 
-/// Whether a transfer may retain backend-owned state for a later attempt.
+/// Selects target write visibility, recovery behavior, and publication durability.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum Resumability {
-    /// Use an ephemeral stage and restart from zero after interruption.
-    Disabled,
-    /// Allow the backend to retain and re-observe reusable staged work.
+pub enum TransferPolicy {
+    /// Use destination-selected checkpoints and retain final durability barriers.
+    /// Single-source-chunk and below-threshold transfers may omit checkpoints.
+    #[default]
+    Checkpointed,
+    /// Restart interrupted transfers from zero without creating checkpoints.
+    /// Local and NFS retain staging and atomic publication, but omit final persistence
+    /// barriers: successful completion does not guarantee crash durability.
+    /// Other destinations may retain persistence required by their protocol.
+    AtomicReplace,
+    /// Write the final Local file in place, without checkpoints or durability barriers.
+    /// Failure may leave partial content. Supported by the ordinary Unix Local transfer entry.
+    Direct,
+}
+
+/// Whether copied content is independently read back before publication.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReadBackVerification {
     #[default]
     Enabled,
+    Disabled,
 }
 
 /// Whether a planner may select a server-internal, unshaped native payload path.
@@ -189,11 +200,10 @@ pub struct TransferRequest {
     pub(crate) final_path: StoragePath,
     pub(crate) inflight: InflightLimits,
     pub(crate) cancel: CancellationToken,
-    pub(crate) existing_destination: ExistingDestinationPolicy,
-    pub(crate) resumability: Resumability,
-    pub(crate) recovery_provider: Option<Arc<dyn RecoveryProvider>>,
+    pub(crate) transfer_policy: TransferPolicy,
     pub(crate) source_qos: Option<SourceQosGroup>,
     pub(crate) payload_shaping: PayloadShapingPolicy,
+    pub(crate) read_back: ReadBackVerification,
 }
 
 impl TransferRequest {
@@ -216,31 +226,29 @@ impl TransferRequest {
             final_path,
             inflight,
             cancel,
-            existing_destination: ExistingDestinationPolicy::default(),
-            resumability: Resumability::default(),
-            recovery_provider: None,
+            transfer_policy: TransferPolicy::default(),
             source_qos: None,
             payload_shaping: PayloadShapingPolicy::default(),
+            read_back: ReadBackVerification::default(),
         }
     }
 
-    /// Selects how publication handles an existing destination.
+    /// Selects the job-level transfer policy. Route-specific details remain inside data-mover.
     #[must_use]
-    pub fn with_existing_destination_policy(mut self, policy: ExistingDestinationPolicy) -> Self {
-        self.existing_destination = policy;
+    pub const fn with_transfer_policy(mut self, policy: TransferPolicy) -> Self {
+        self.transfer_policy = policy;
         self
     }
 
-    /// Selects recovery behavior and supplies lazy caller persistence.
+    /// Selects destination read-back verification independently of the transfer policy.
     #[must_use]
-    pub fn with_recovery(
-        mut self,
-        resumability: Resumability,
-        provider: Option<Arc<dyn RecoveryProvider>>,
-    ) -> Self {
-        self.resumability = resumability;
-        self.recovery_provider = provider;
+    pub const fn with_read_back_verification(mut self, policy: ReadBackVerification) -> Self {
+        self.read_back = policy;
         self
+    }
+
+    pub(crate) fn needs_source_digest(&self) -> bool {
+        self.read_back == ReadBackVerification::Enabled
     }
 
     /// Joins this attempt to one immutable shared source-read `QoS` group.

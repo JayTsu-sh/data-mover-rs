@@ -1,5 +1,6 @@
 //! Connected storage construction, roles, capabilities, and backend adapters.
 
+pub(crate) mod artifacts;
 pub(crate) mod backends;
 mod capability;
 mod factory;
@@ -8,8 +9,8 @@ mod native;
 mod roles;
 
 pub(crate) use native::{
-    NativeAffinity, NativeEndpoint, NativePair, NativeRecoveryMode, NativeSourceBinding,
-    NativeStageEvidence, NativeStageFailure,
+    NativeAffinity, NativeEndpoint, NativePair, NativeSourceBinding, NativeStageEvidence,
+    NativeStageFailure,
 };
 
 pub use crate::runtime::qos::{
@@ -25,9 +26,24 @@ pub use factory::{
 };
 pub use handle::Storage;
 pub use roles::{
-    ByteStream, CheckpointObservation, ExistingDestinationPolicy, FinalDestination, Metadata,
+    ByteStream, CheckpointObservation, CopiedMetadataTarget, FinalDestination, Metadata,
     MetadataMutation, Namespace, NamespaceRequest, NamespaceResult, PrepareRequest, PreparedStage,
     PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest, ReadRequest,
     ReadSource, RecoverRequest, RecoveryIdentity, RecoveryValueError, SourceDescriptor,
-    StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure, VerificationEvidence,
+    VerifyRequest, WriteEvidence,
 };
+pub(crate) use roles::{CheckpointRegistration, DeferredCheckpoint};
+
+/// Local transfer files use a reserved hidden namespace in destination parents.
+pub(crate) fn is_local_transfer_artifact(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with(".data-mover-"))
+}
+
+pub use crate::runtime::read_budget::ReadBudget;
+
+// Keep backend prefetch coupled to storage admission, not runtime internals.
+pub(crate) use crate::runtime::inflight::InflightAdmission as ReadAdmission;
+#[cfg(test)]
+pub(crate) use crate::runtime::inflight::{InflightConfig, InflightRuntime};

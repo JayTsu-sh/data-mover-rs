@@ -9,6 +9,22 @@ use std::time::Duration;
 #[derive(Default)]
 pub(super) struct WriteProbe {
     #[cfg(test)]
+    pub(super) final_data_sync_calls: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(super) final_directory_sync_calls: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(super) metadata_batch_calls: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(super) metadata_sync_calls: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(super) pause_checkpoint: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(super) checkpoint_started: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(super) checkpoint_release: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(super) automatic_interval: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
     pub(super) delays: std::sync::Mutex<HashMap<u64, Duration>>,
     #[cfg(test)]
     pub(super) completion_order: std::sync::Mutex<Vec<u64>>,
@@ -92,6 +108,23 @@ impl WriteProbe {
 
 #[cfg(test)]
 impl super::LocalStagedDestination {
+    pub(crate) fn final_sync_counts(&self) -> (u64, u64) {
+        (
+            self.write_probe
+                .final_data_sync_calls
+                .load(Ordering::SeqCst),
+            self.write_probe
+                .final_directory_sync_calls
+                .load(Ordering::SeqCst),
+        )
+    }
+
+    pub(crate) fn metadata_batch_counts(&self) -> (u64, u64) {
+        (
+            self.write_probe.metadata_batch_calls.load(Ordering::SeqCst),
+            self.write_probe.metadata_sync_calls.load(Ordering::SeqCst),
+        )
+    }
     pub(crate) fn corrupt_before_verify(&self) {
         self.write_probe
             .corrupt_before_verify

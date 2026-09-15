@@ -1,6 +1,7 @@
 //! NFS adapter facade.
 
 mod acl;
+mod checkpoint;
 pub(crate) mod common;
 #[allow(dead_code)]
 pub(crate) mod metadata;
@@ -38,8 +39,10 @@ where
         protocol.clone(),
         identity.clone(),
     ));
-    let metadata: Arc<dyn crate::storage::Metadata> =
-        Arc::new(metadata::NfsMetadataAdapter::new(protocol.clone()));
+    let metadata: Arc<dyn crate::storage::Metadata> = Arc::new(metadata::NfsMetadataAdapter::new(
+        protocol.clone(),
+        identity.clone(),
+    ));
     let destination = Arc::new(
         staged::NfsStagedDestinationAdapter::new(protocol.clone(), identity.clone())
             .with_metadata(Arc::clone(&metadata)),

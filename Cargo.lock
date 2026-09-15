@@ -1460,6 +1460,7 @@ dependencies = [
  "hyper-rustls 0.27.9",
  "hyper-util",
  "indicatif",
+ "libc",
  "md-5 0.10.6",
  "moka",
  "nfs-rs",
@@ -2892,9 +2893,9 @@ dependencies = [
 
 [[package]]
 name = "nfs-rs"
-version = "0.5.1"
+version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b400c87842f0daca0845a00118528eb7eafbb583b65e065f5994e06ff85f56"
+checksum = "7a2e5ec88bc8f14524df8f1565be8b355ebe8666a4401ac075ec59dd0c77fb45"
 dependencies = [
  "async-trait",
  "byteorder",

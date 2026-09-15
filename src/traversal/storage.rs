@@ -356,6 +356,7 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{error}")),
             backend_fact: None,
+            content_version: None,
         }
     }
 

@@ -3,8 +3,8 @@ use data_mover::model::{
     BackendIdentity, BackendKind, EntryKind, IdentityStrength, SourceIdentity, StoragePath,
 };
 use data_mover::storage::{
-    ExistingDestinationPolicy, FinalDestination, MetadataMutation, PreflightPolicy, PrepareRequest,
-    PublishRequest, ReadRequest, RecoverRequest, SourceDescriptor, Storage, VerifyRequest,
+    FinalDestination, MetadataMutation, PreflightPolicy, PrepareRequest, PublishRequest,
+    ReadRequest, RecoverRequest, SourceDescriptor, Storage, VerifyRequest,
 };
 use data_mover::transfer::{
     InflightLimits, PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferIdentity,
@@ -58,7 +58,7 @@ async fn verify_native_and_shaped_fallback(
     let request = transfer_request(storage, source, native_path, "native")?;
     let qos = SourceQosGroup::new(SourceQosPolicy::new(None, u64::try_from(PART_SIZE)?, None)?);
     let native = transfer(request.with_source_qos(qos)).await?;
-    assert_eq!(native.blake3, *blake3::hash(payload).as_bytes());
+    assert_eq!(native.blake3, Some(*blake3::hash(payload).as_bytes()));
     assert_eq!(native.source_qos.native_bytes, payload.len() as u64);
     assert_eq!(native.source_qos.native_requests, 1);
     assert!(!native.source_qos.native_payload_shaped);
@@ -239,7 +239,6 @@ async fn verify_publish_and_metadata(
         .publish(
             stage,
             PublishRequest {
-                policy: ExistingDestinationPolicy::Overwrite,
                 expected_size: payload.len() as u64,
                 expected_blake3: digest,
                 cancel: CancellationToken::new(),
@@ -306,6 +305,7 @@ async fn verify_range_and_cancellation(
             expected_source: Some(observed.source_identity.clone()),
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel: CancellationToken::new(),
             source_qos: None,
         })
@@ -324,6 +324,7 @@ async fn verify_range_and_cancellation(
             expected_source: Some(observed.source_identity),
             maximum_chunk_bytes: 1024 * 1024,
             read_inflight: 4,
+            read_budget: None,
             cancel,
             source_qos: None,
         })

@@ -18,6 +18,9 @@ ALLOWED = {
     "transfer": {"model", "storage", "metadata", "integrity", "runtime"},
     "runtime": {"model"},
 }
+FILE_ALLOWED = {
+    "storage/factory.rs": {"cifs", "hdfs", "nfs", "s3"},
+}
 CRATE_REFERENCE = re.compile(r"\bcrate::\s*([A-Za-z_]\w*)")
 CRATE_GROUP = re.compile(r"\bcrate::\s*\{([^{}]*)\}", re.DOTALL)
 CRATE_ALIAS = re.compile(r"\buse\s+crate\s+as\s+([A-Za-z_]\w*)\s*;")
@@ -210,10 +213,12 @@ def validate(root: Path) -> list[str]:
         for path in rust_files(source / module):
             text = path.read_text()
             code = code_only(text)
+            source_relative = relative(path, source)
             relative_path = path.relative_to(source / module)
             module_depth = len(relative_path.parts) if path.name == "mod.rs" else len(relative_path.parts) + 1
+            allowed = ALLOWED[module] | FILE_ALLOWED.get(source_relative, set())
             for dependency in dependency_roots(code, module_depth):
-                if dependency != module and dependency not in ALLOWED[module]:
+                if dependency != module and dependency not in allowed:
                     errors.append(
                         f"{relative(path, root)}: {module} must not import {dependency}"
                     )

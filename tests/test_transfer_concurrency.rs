@@ -20,9 +20,11 @@ fn explicit_storage_configuration_is_observable_through_the_shared_interface() {
 
 #[test]
 fn transfer_concurrency_rejects_zero_and_values_above_the_safe_limit() {
-    assert!(TransferConcurrency::new(16, 16).is_ok());
+    let maximum = TransferConcurrency::MAX;
+    assert_eq!(maximum, 24);
+    assert!(TransferConcurrency::new(maximum, maximum).is_ok());
     assert!(TransferConcurrency::new(0, 1).is_err());
     assert!(TransferConcurrency::new(1, 0).is_err());
-    assert!(TransferConcurrency::new(17, 1).is_err());
-    assert!(TransferConcurrency::new(1, 17).is_err());
+    assert!(TransferConcurrency::new(maximum + 1, 1).is_err());
+    assert!(TransferConcurrency::new(1, maximum + 1).is_err());
 }

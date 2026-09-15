@@ -31,7 +31,7 @@ Unset, invalid, or zero values use the documented defaults.
 ### Transfer concurrency
 
 Read and write pipelines are configured independently. Every value must be an
-integer in `1..=16`; an invalid value fails storage creation with a configuration
+integer in `1..=24`; an invalid value fails storage creation with a configuration
 error instead of being silently ignored.
 
 | Backend | Read default | Write default |
@@ -41,20 +41,28 @@ error instead of being silently ignored.
 | SMB/CIFS | `4` | `4` |
 | S3 | `4` | `5` |
 
-`DATA_MOVER_READ_INFLIGHT` and `DATA_MOVER_WRITE_INFLIGHT` set global values.
+`DATA_MOVER_INFLIGHT=8`, `16`, or `24` sets both read and write depths.
+`DATA_MOVER_READ_INFLIGHT` and `DATA_MOVER_WRITE_INFLIGHT` override each direction.
 Use `DATA_MOVER_<BACKEND>_READ_INFLIGHT` or
 `DATA_MOVER_<BACKEND>_WRITE_INFLIGHT` for a backend-specific override, where
 `<BACKEND>` is `LOCAL`, `NFS`, `CIFS`, or `S3`. Each direction is resolved
-independently: backend-specific variable, global variable, then protocol
-default. The Rust API can override the resolved pair with
+independently: backend-specific direction, global direction, shared
+`DATA_MOVER_INFLIGHT`, then protocol default. The Rust API can override the resolved pair with
 `TransferConcurrency` and `StorageEnum::with_transfer_concurrency` (or the
 corresponding concrete-adapter builder).
 
 The upper bound is intentional: lab measurements across the complete Local,
 NFSv3, NFSv4.1, and S3 copy matrix showed that increasing inflight from 8 to 16
 provided only a small aggregate throughput gain while CPU and peak memory grew
-substantially. Values above 16 are rejected rather than clamped so the effective
+substantially. The configurable limit is now 24 for targeted single-stream measurements;
+protocol defaults remain unchanged. Values above 24 are rejected rather than clamped so the effective
 configuration never differs silently from what the operator requested.
+
+Role-based callers can resolve the same environment rules with
+`TransferConcurrency::from_env(BackendKind::Nfs, defaults)` and use that pair
+for their backend configuration and `InflightLimits`. Explicitly supplied
+transfer limits are not silently overwritten by environment settings.
+The `nfs_mount_comparison` example does this for both transport paths.
 
 The defaults are the recommended general-purpose settings. For a high-latency
 NFS path with sufficient server session capacity, `read=8` and `write=16` can

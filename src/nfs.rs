@@ -15,7 +15,7 @@ use futures::stream::FuturesOrdered;
 use moka::sync::Cache;
 // nfs_rs 错误类型，用于直接匹配 error code
 use nfs_rs::NfsError;
-use nfs_rs::{Attr, ExportEntry, Mount, OPEN_READ, OPEN_WRITE, Time};
+use nfs_rs::{Attr, ExportEntry, Mount, OPEN_READ, OPEN_WRITE, Time, WriteOutcome};
 use path_clean::PathClean;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -431,47 +431,43 @@ impl Drop for NfsRoleReadCursor {
 #[async_trait]
 impl NfsReadCursor for NfsRoleReadCursor {
     async fn read_at(
-        &mut self,
+        &self,
         offset: u64,
         count: usize,
     ) -> std::result::Result<Bytes, NfsProtocolFailure> {
-        self.storage
-            .read(
-                self.handle
-                    .as_mut()
-                    .ok_or_else(NfsProtocolFailure::protocol)?,
-                offset,
-                count,
-            )
-            .await
-            .map_err(classify_role_error)
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(NfsProtocolFailure::protocol)?;
+        self.storage.role_read_exact(handle, offset, count).await
     }
 }
 
 #[async_trait]
 impl NfsSourceProtocol for NFSStorage {
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        usize::try_from(self.config.block_size).unwrap_or(usize::MAX)
+    }
+
     async fn describe(
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<NfsSourceObservation, NfsProtocolFailure> {
-        let entry = self
-            .get_metadata(&PathBuf::from(path.as_str()))
-            .await
-            .map_err(classify_role_error)?;
-        let file_handle = entry
-            .get_file_handle()
-            .cloned()
-            .ok_or_else(NfsProtocolFailure::protocol)?;
-        let kind = if entry.get_is_symlink() {
-            crate::model::EntryKind::Symlink
-        } else if entry.get_is_dir() {
-            crate::model::EntryKind::Directory
-        } else {
-            crate::model::EntryKind::File
-        };
+        let (file_handle, attrs) = self.role_lookup_with_attrs(path).await?;
+        let kind = role_kind(&attrs);
         Ok(NfsSourceObservation {
             kind,
-            size: (kind == crate::model::EntryKind::File).then(|| entry.get_size()),
+            size: (kind == crate::model::EntryKind::File).then_some(attrs.filesize),
+            content_version: [
+                attrs.mtime.seconds,
+                attrs.mtime.nseconds,
+                attrs.ctime.seconds,
+                attrs.ctime.nseconds,
+            ]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>()
+            .into(),
             file_handle,
         })
     }
@@ -526,6 +522,16 @@ fn classify_role_error(error: StorageError) -> NfsProtocolFailure {
     NfsProtocolFailure { class, transience }
 }
 
+fn role_kind(attrs: &Attr) -> crate::model::EntryKind {
+    if attrs.type_ == FType3::NF3LNK as u32 {
+        crate::model::EntryKind::Symlink
+    } else if attrs.type_ == FType3::NF3DIR as u32 {
+        crate::model::EntryKind::Directory
+    } else {
+        crate::model::EntryKind::File
+    }
+}
+
 fn role_observation(
     entry: &EntryEnum,
 ) -> std::result::Result<NfsNamespaceObservation, NfsProtocolFailure> {
@@ -556,11 +562,14 @@ impl NfsNamespaceProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<NfsNamespaceObservation, NfsProtocolFailure> {
-        let entry = self
-            .get_metadata(&PathBuf::from(path.as_str()))
-            .await
-            .map_err(classify_role_error)?;
-        role_observation(&entry)
+        let (file_handle, attrs) = self.role_lookup_with_attrs(path).await?;
+        let kind = role_kind(&attrs);
+        Ok(NfsNamespaceObservation {
+            path: path.clone(),
+            kind,
+            size: (kind == crate::model::EntryKind::File).then_some(attrs.filesize),
+            file_handle,
+        })
     }
 
     async fn list(
@@ -632,14 +641,177 @@ impl NfsNamespaceProtocol for NFSStorage {
 
 struct NfsRoleStageFile {
     storage: NFSStorage,
-    handle: Option<NFSFileHandle>,
+    handle: NFSFileHandle,
+    deferred_gate: tokio::sync::RwLock<()>,
+    deferred_writes: tokio::sync::Mutex<Vec<NfsDeferredWrite>>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+struct NfsDeferredWrite {
+    offset: u64,
+    accepted_bytes: usize,
+    retry_data: Option<Bytes>,
+    outcomes: Vec<WriteOutcome>,
+}
+
+impl NfsDeferredWrite {
+    fn from_outcomes(offset: u64, data: Bytes, outcomes: Vec<WriteOutcome>) -> Self {
+        let accepted_bytes = data.len();
+        let retry_data = outcomes
+            .iter()
+            .any(|outcome| outcome.committed != nfs_rs::WriteCommitted::FileSync)
+            .then_some(data);
+        Self {
+            offset,
+            accepted_bytes,
+            retry_data,
+            outcomes,
+        }
+    }
+
+    const fn accepted_bytes(&self) -> usize {
+        self.accepted_bytes
+    }
+
+    fn commit_pressure(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|outcome| outcome.committed != nfs_rs::WriteCommitted::FileSync)
+            .count()
+    }
+}
+
+struct NfsUnstableWriteFailure {
+    accepted: Option<NfsDeferredWrite>,
+    error: NfsError,
+}
+
+impl NfsRoleStageFile {
+    fn new(storage: NFSStorage, handle: NFSFileHandle) -> Self {
+        Self {
+            storage,
+            handle,
+            deferred_gate: tokio::sync::RwLock::new(()),
+            deferred_writes: tokio::sync::Mutex::new(Vec::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    async fn checkpoint_deferred_writes(&self) -> nfs_rs::Result<()> {
+        let _gate = self.deferred_gate.write().await;
+        let mut writes = self.deferred_writes.lock().await;
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        for attempt in 0..3 {
+            let start = writes.iter().map(|write| write.offset).min().unwrap_or(0);
+            let end = writes
+                .iter()
+                .filter_map(|write| write.offset.checked_add(write.accepted_bytes() as u64))
+                .max()
+                .unwrap_or(start);
+            let (commit_offset, commit_count) =
+                u32::try_from(end.saturating_sub(start)).map_or((0, 0), |count| (start, count));
+            let outcomes = writes
+                .iter()
+                .flat_map(|write| write.outcomes.iter().cloned())
+                .collect::<Vec<_>>();
+
+            match self
+                .storage
+                .mount
+                .commit_write_batch(
+                    self.handle.inner.fh.clone(),
+                    commit_offset,
+                    commit_count,
+                    &outcomes,
+                )
+                .await
+            {
+                Ok(()) => {
+                    writes.clear();
+                    return Ok(());
+                }
+                Err(error)
+                    if attempt < 2
+                        && error.operation_outcome().is_some_and(|outcome| {
+                            outcome.context().operation == "write_verifier"
+                        }) =>
+                {
+                    let retry_ranges = writes
+                        .iter()
+                        .filter_map(|write| {
+                            write.retry_data.clone().map(|data| (write.offset, data))
+                        })
+                        .collect::<Vec<_>>();
+                    if retry_ranges.is_empty() {
+                        return Err(error);
+                    }
+                    let mut retried = Vec::with_capacity(retry_ranges.len());
+                    for (offset, data) in retry_ranges {
+                        match self
+                            .storage
+                            .role_write_unstable(&self.handle, offset, data)
+                            .await
+                        {
+                            Ok(write) => retried.push(write),
+                            Err(failure) => {
+                                if let Some(accepted) = failure.accepted {
+                                    retried.push(accepted);
+                                }
+                                *writes = retried;
+                                return Err(failure.error);
+                            }
+                        }
+                    }
+                    *writes = retried;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the final commit attempt always returns")
+    }
+
+    async fn retain_unstable_write(
+        &self,
+        offset: u64,
+        data: Bytes,
+    ) -> std::result::Result<(u64, usize), NfsProtocolFailure> {
+        let _gate = self.deferred_gate.read().await;
+        match self
+            .storage
+            .role_write_unstable(&self.handle, offset, data)
+            .await
+        {
+            Ok(write) => {
+                let written = write.accepted_bytes() as u64;
+                let mut writes = self.deferred_writes.lock().await;
+                writes.push(write);
+                let commit_pressure = writes
+                    .iter()
+                    .map(NfsDeferredWrite::commit_pressure)
+                    .sum::<usize>();
+                Ok((written, commit_pressure))
+            }
+            Err(failure) => {
+                if let Some(accepted) = failure.accepted {
+                    self.deferred_writes.lock().await.push(accepted);
+                }
+                Err(crate::storage::backends::nfs::protocol::classify_error(
+                    failure.error,
+                ))
+            }
+        }
+    }
 }
 
 impl Drop for NfsRoleStageFile {
     fn drop(&mut self) {
-        let Some(handle) = self.handle.take() else {
+        if self.closed.swap(true, Ordering::SeqCst) {
             return;
-        };
+        }
+        let handle = self.handle.clone();
         let storage = self.storage.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
@@ -652,86 +824,133 @@ impl Drop for NfsRoleStageFile {
 #[async_trait]
 impl NfsStageFile for NfsRoleStageFile {
     async fn read_at(
-        &mut self,
+        &self,
         offset: u64,
         count: usize,
     ) -> std::result::Result<Bytes, NfsProtocolFailure> {
         self.storage
-            .read(
-                self.handle
-                    .as_mut()
-                    .ok_or_else(NfsProtocolFailure::protocol)?,
-                offset,
-                count,
-            )
+            .role_read_exact(&self.handle, offset, count)
             .await
-            .map_err(classify_role_error)
     }
 
     async fn write_at(
-        &mut self,
+        &self,
         offset: u64,
         data: Bytes,
     ) -> std::result::Result<u64, NfsProtocolFailure> {
         self.storage
-            .write(
-                self.handle
-                    .as_ref()
-                    .ok_or_else(NfsProtocolFailure::protocol)?,
-                offset,
-                data,
-            )
+            .role_write_once(&self.handle, offset, data)
             .await
-            .map_err(classify_role_error)
     }
 
-    async fn close(mut self: Box<Self>) -> std::result::Result<(), NfsProtocolFailure> {
-        let handle = self
-            .handle
-            .take()
-            .ok_or_else(NfsProtocolFailure::protocol)?;
+    async fn write_uncommitted_at(
+        &self,
+        offset: u64,
+        data: Bytes,
+    ) -> std::result::Result<u64, NfsProtocolFailure> {
         self.storage
-            .close(&handle)
+            .role_write_unstable(&self.handle, offset, data)
             .await
-            .map_err(classify_role_error)
+            .map(|write| write.accepted_bytes() as u64)
+            .map_err(|failure| {
+                crate::storage::backends::nfs::protocol::classify_error(failure.error)
+            })
+    }
+
+    async fn write_deferred_at(
+        &self,
+        offset: u64,
+        data: Bytes,
+    ) -> std::result::Result<u64, NfsProtocolFailure> {
+        let (written, commit_pressure) = self.retain_unstable_write(offset, data).await?;
+        if commit_pressure >= self.storage.config.transfer_concurrency.write() {
+            self.checkpoint_deferred_writes()
+                .await
+                .map_err(crate::storage::backends::nfs::protocol::classify_error)?;
+        }
+        Ok(written)
+    }
+
+    async fn write_until_checkpoint_at(
+        &self,
+        offset: u64,
+        data: Bytes,
+    ) -> std::result::Result<u64, NfsProtocolFailure> {
+        self.retain_unstable_write(offset, data)
+            .await
+            .map(|(written, _)| written)
+    }
+
+    async fn checkpoint(&self) -> std::result::Result<(), NfsProtocolFailure> {
+        self.checkpoint_deferred_writes()
+            .await
+            .map_err(crate::storage::backends::nfs::protocol::classify_error)
+    }
+
+    async fn set_len(&self, size: u64) -> std::result::Result<(), NfsProtocolFailure> {
+        self.storage
+            .mount
+            .setattr(
+                self.handle.inner.fh.clone(),
+                None,
+                None,
+                None,
+                None,
+                Some(size),
+                None,
+                None,
+            )
+            .await
+            .map_err(crate::storage::backends::nfs::protocol::classify_error)
+    }
+
+    async fn close(&self) -> std::result::Result<(), NfsProtocolFailure> {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let checkpoint = self
+            .checkpoint_deferred_writes()
+            .await
+            .map_err(crate::storage::backends::nfs::protocol::classify_error);
+        let close = self.storage.role_close(&self.handle).await;
+        checkpoint.and(close)
+    }
+
+    async fn close_uncommitted(&self) -> std::result::Result<(), NfsProtocolFailure> {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _gate = self.deferred_gate.write().await;
+        self.deferred_writes.lock().await.clear();
+        self.storage.role_close(&self.handle).await
     }
 }
 
 #[async_trait]
 impl NfsStagedProtocol for NFSStorage {
+    fn read_inflight(&self) -> usize {
+        self.config.transfer_concurrency.read()
+    }
+
+    fn write_inflight(&self) -> usize {
+        self.config.transfer_concurrency.write()
+    }
+
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        usize::try_from(self.config.block_size).unwrap_or(usize::MAX)
+    }
+
+    fn maximum_write_chunk_bytes(&self) -> usize {
+        usize::try_from(self.config.block_size).unwrap_or(usize::MAX)
+    }
+
     async fn create_empty(
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<(), NfsProtocolFailure> {
         let native = Path::new(path.as_str());
-        match self.get_metadata(native).await {
-            Ok(_) => {
-                return Err(NfsProtocolFailure {
-                    class: crate::model::FailureClass::Conflict,
-                    transience: crate::model::Transience::Permanent,
-                });
-            }
-            Err(StorageError::FileNotFound(_) | StorageError::DirectoryNotFound(_)) => {}
-            Err(error) => return Err(classify_role_error(error)),
-        }
-        let handle = self
-            // Staged files must remain readable after publication. Passing `None` lets the
-            // NFSv3 CREATE default to mode 000 on the certified servers.
-            .create_file(native, None, None, Some(0o600))
-            .await
-            .map_err(classify_role_error)?;
-        if let Err(error) = self.truncate_file(&handle).await {
-            let primary = classify_role_error(error);
-            let close_failure = self.close(&handle).await.err().map(classify_role_error);
-            let cleanup_failure = self
-                .delete_file(native)
-                .await
-                .err()
-                .map(classify_role_error);
-            return Err(cleanup_failure.or(close_failure).unwrap_or(primary));
-        }
-        if let Err(error) = self.close(&handle).await {
-            let primary = classify_role_error(error);
+        let handle = self.create_empty_open(path).await?;
+        if let Err(primary) = handle.close().await {
             let cleanup_failure = self
                 .delete_file(native)
                 .await
@@ -742,6 +961,24 @@ impl NfsStagedProtocol for NFSStorage {
         Ok(())
     }
 
+    async fn create_empty_open(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
+        let native = Path::new(path.as_str());
+        let handle = match self.create_file_exclusive(native, Some(0o600)).await {
+            Ok(Some(handle)) => handle,
+            Ok(None) => {
+                return Err(NfsProtocolFailure {
+                    class: crate::model::FailureClass::Conflict,
+                    transience: crate::model::Transience::Permanent,
+                });
+            }
+            Err(error) => return Err(classify_role_error(error)),
+        };
+        Ok(Box::new(NfsRoleStageFile::new(self.clone(), handle)))
+    }
+
     async fn open_read(
         &self,
         path: &crate::model::StoragePath,
@@ -750,10 +987,7 @@ impl NfsStagedProtocol for NFSStorage {
             .open(Path::new(path.as_str()), OPEN_READ)
             .await
             .map_err(classify_role_error)?;
-        Ok(Box::new(NfsRoleStageFile {
-            storage: self.clone(),
-            handle: Some(handle),
-        }))
+        Ok(Box::new(NfsRoleStageFile::new(self.clone(), handle)))
     }
 
     async fn open_write(
@@ -764,20 +998,16 @@ impl NfsStagedProtocol for NFSStorage {
             .open(Path::new(path.as_str()), OPEN_WRITE)
             .await
             .map_err(classify_role_error)?;
-        Ok(Box::new(NfsRoleStageFile {
-            storage: self.clone(),
-            handle: Some(handle),
-        }))
+        Ok(Box::new(NfsRoleStageFile::new(self.clone(), handle)))
     }
 
     async fn size(
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<u64, NfsProtocolFailure> {
-        self.get_metadata(Path::new(path.as_str()))
+        self.role_lookup_with_attrs(path)
             .await
-            .map(|entry| entry.get_size())
-            .map_err(classify_role_error)
+            .map(|(_, attrs)| attrs.filesize)
     }
 
     async fn rename(
@@ -958,6 +1188,148 @@ fn build_cache_root_fh(server_id: u64, raw_fh: &Bytes) -> Bytes {
 }
 
 impl NFSStorage {
+    /// Optimized role-only lookup. nfs-rs already folds GETATTR into LOOKUP on every supported
+    /// dialect, so reuse those attributes instead of paying a second metadata RPC. Directory-cache
+    /// hits can lack attributes and deliberately fall back to one GETATTR.
+    async fn role_lookup_with_attrs(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<(Bytes, Attr), NfsProtocolFailure> {
+        let object = self
+            .lookup_fh(Path::new(path.as_str()))
+            .await
+            .map_err(classify_role_error)?;
+        let file_handle = object.fh;
+        let attrs = if let Some(attrs) = object.attr {
+            attrs
+        } else {
+            self.mount
+                .getattr(file_handle.clone())
+                .await
+                .map_err(crate::storage::backends::nfs::protocol::classify_error)?
+        };
+        Ok((file_handle, attrs))
+    }
+
+    /// Optimized role-only read primitive.
+    ///
+    /// The normal case is one negotiated READ RPC and returns the crate-owned `Bytes` without a
+    /// copy. A legal short read is completed before returning because the role stream reserves
+    /// non-overlapping ranges and requires every issued range to be exact.
+    async fn role_read_exact(
+        &self,
+        file: &NFSFileHandle,
+        offset: u64,
+        count: usize,
+    ) -> std::result::Result<Bytes, NfsProtocolFailure> {
+        if count == 0 {
+            return Ok(Bytes::new());
+        }
+        let mut current = offset;
+        let mut remaining = count;
+        let mut aggregate: Option<BytesMut> = None;
+
+        while remaining != 0 {
+            let requested = u32::try_from(remaining).map_err(|_| NfsProtocolFailure::protocol())?;
+            let bytes = self
+                .mount
+                .read(file.inner.fh.clone(), current, requested)
+                .await
+                .map_err(crate::storage::backends::nfs::protocol::classify_error)?;
+            if bytes.len() > remaining {
+                return Err(NfsProtocolFailure::protocol());
+            }
+            if aggregate.is_none() && bytes.len() == count {
+                return Ok(bytes);
+            }
+            if bytes.is_empty() {
+                break;
+            }
+            current = current
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(NfsProtocolFailure::protocol)?;
+            remaining -= bytes.len();
+            aggregate
+                .get_or_insert_with(|| BytesMut::with_capacity(count))
+                .extend_from_slice(&bytes);
+        }
+
+        Ok(aggregate.map_or_else(Bytes::new, BytesMut::freeze))
+    }
+
+    /// Optimized role-only WRITE primitive. The staged adapter has already negotiated and split
+    /// its chunks, so this issues exactly one RPC and retains nfs-rs' structured outcome.
+    async fn role_write_once(
+        &self,
+        file: &NFSFileHandle,
+        offset: u64,
+        data: Bytes,
+    ) -> std::result::Result<u64, NfsProtocolFailure> {
+        nfs_rs::write_all(
+            self.mount.as_ref().as_ref(),
+            file.inner.fh.clone(),
+            offset,
+            data,
+        )
+        .await
+        .map_err(crate::storage::backends::nfs::protocol::classify_error)
+    }
+
+    async fn role_write_unstable(
+        &self,
+        file: &NFSFileHandle,
+        offset: u64,
+        data: Bytes,
+    ) -> std::result::Result<NfsDeferredWrite, NfsUnstableWriteFailure> {
+        let mut accepted = 0usize;
+        let mut outcomes = Vec::new();
+        while accepted < data.len() {
+            let outcome = match self
+                .mount
+                .write(
+                    file.inner.fh.clone(),
+                    offset + accepted as u64,
+                    data.slice(accepted..),
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let accepted_write = (accepted != 0).then(|| {
+                        NfsDeferredWrite::from_outcomes(offset, data.slice(..accepted), outcomes)
+                    });
+                    return Err(NfsUnstableWriteFailure {
+                        accepted: accepted_write,
+                        error,
+                    });
+                }
+            };
+            let count = outcome.count as usize;
+            if count == 0 || count > data.len() - accepted {
+                return Err(NfsUnstableWriteFailure {
+                    accepted: (accepted != 0).then(|| {
+                        NfsDeferredWrite::from_outcomes(offset, data.slice(..accepted), outcomes)
+                    }),
+                    error: NfsError::Rpc("server returned an invalid write count".to_owned()),
+                });
+            }
+            accepted += count;
+            outcomes.push(outcome);
+        }
+        Ok(NfsDeferredWrite::from_outcomes(offset, data, outcomes))
+    }
+
+    /// Optimized role-only CLOSE preserves uncertain session-control outcomes from nfs-rs.
+    async fn role_close(
+        &self,
+        file: &NFSFileHandle,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        self.mount
+            .close(file.inner.fh.clone())
+            .await
+            .map_err(crate::storage::backends::nfs::protocol::classify_error)
+    }
+
     pub(crate) fn instance_facts(&self) -> Result<NfsInstanceFacts> {
         let dialect = crate::storage::backends::nfs::protocol::dialect(self.mount.version())
             .map_err(|_| {
@@ -1639,6 +2011,63 @@ impl NFSStorage {
                     }
                     return Err(StorageError::NfsError(format!(
                         "[create] Failed to create file: {}, {e}",
+                        relative_path.display()
+                    )));
+                }
+            }
+        }
+        unreachable!("retry loop always returns")
+    }
+
+    /// Creates a provably new zero-length file without a prior existence probe.
+    ///
+    /// `Ok(None)` is the typed exclusive-create collision. Unlike [`Self::create_file`], this
+    /// never opens an existing file, so a successful CREATE already proves that a follow-up
+    /// truncate would be redundant.
+    async fn create_file_exclusive(
+        &self,
+        relative_path: &Path,
+        mode: Option<u32>,
+    ) -> Result<Option<NFSFileHandle>> {
+        let filename = relative_path
+            .file_name()
+            .ok_or_else(|| StorageError::InvalidPath("Invalid destination path".to_string()))?
+            .to_string_lossy()
+            .to_string();
+
+        if let Some(parent) = relative_path.parent() {
+            self.create_dir_all(parent).await?;
+        }
+
+        for attempt in 0..=MAX_STALE_RETRIES {
+            let parent_fh = if let Some(parent) = relative_path.parent() {
+                self.lookup_fh(parent).await?.fh
+            } else {
+                self.rpc_root_fh()
+            };
+            match self.mount.create(parent_fh, &filename, mode).await {
+                Ok(object) => {
+                    return Ok(Some(NFSFileHandle::new(
+                        object.fh,
+                        relative_path.to_path_buf(),
+                    )));
+                }
+                Err(error) if error.is_exist() => return Ok(None),
+                Err(error)
+                    if is_retryable_with_invalidation(&error) && attempt < MAX_STALE_RETRIES =>
+                {
+                    let stale_generation = self.refresh_generation.load(Ordering::Acquire);
+                    self.maybe_refresh_root_fh(stale_generation).await?;
+                    let root_fh = self.get_root_fh();
+                    let components = Self::collect_components(relative_path)?;
+                    invalidate_path_cache(&components, &root_fh);
+                }
+                Err(error) if is_server_busy(&error) && attempt < MAX_STALE_RETRIES => {
+                    backoff_server_busy("create_file_exclusive", &relative_path, attempt).await;
+                }
+                Err(error) => {
+                    return Err(StorageError::NfsError(format!(
+                        "[create exclusive] Failed to create file {}: {error}",
                         relative_path.display()
                     )));
                 }
@@ -3001,10 +3430,6 @@ impl NFSStorage {
         let producer_id = runtime.scheduler.worker_id;
         let ctx = runtime.scheduler;
         let max_depth = runtime.max_depth;
-        if entry.file_name == "." || entry.file_name == ".." {
-            return Ok(true);
-        }
-
         // 构建完整路径（使用 '/' 拼接，避免平台差异）
         let relative_path = self.build_relative_path(dir_path, &entry.file_name);
 
@@ -3260,25 +3685,26 @@ impl NFSStorage {
                     current_chunk_size, file.path, current_offset
                 );
 
-                // 写入数据到NFS - 使用异步调用。
-                // nfs-rs 的 write（v3/v4.1）以 FILE_SYNC 稳定级发送，server 降级时
-                // 其内部自动补 COMMIT，返回 Ok 即数据已落稳定存储，无需逐块 COMMIT
-                // （否则每块多付一次串行 RTT）。
-                let written = self
-                    .mount
-                    .write(file.inner.fh.clone(), current_offset, chunk_data)
-                    .await
-                    .map_err(|e| StorageError::NfsError(format!("Failed to write file: {e}")))?;
+                let written = nfs_rs::write_all(
+                    self.mount.as_ref().as_ref(),
+                    file.inner.fh.clone(),
+                    current_offset,
+                    chunk_data,
+                )
+                .await
+                .map_err(|e| StorageError::NfsError(format!("Failed to write file: {e}")))?;
 
                 trace!(
                     "[write] Wrote split chunk of {} bytes to file {:?} at offset {}",
                     written, file.path, current_offset
                 );
 
-                total_written += u64::from(written);
-                current_offset += u64::from(written);
-                remaining_bytes -= u64::from(written);
-                data_index += written as usize;
+                total_written += written;
+                current_offset += written;
+                remaining_bytes -= written;
+                data_index += usize::try_from(written).map_err(|_| {
+                    StorageError::NfsError("NFS write count exceeds addressable memory".to_string())
+                })?;
             }
         } else {
             // 数据块大小在限制内，直接写入
@@ -3287,18 +3713,20 @@ impl NFSStorage {
                 "[write] Writing {} bytes to file {:?} at offset {}",
                 length, file.path, offset
             );
-            // FILE_SYNC 写返回即落稳定存储（nfs-rs 内部已兜底 COMMIT），无需再 COMMIT
-            let written = self
-                .mount
-                .write(file.inner.fh.clone(), offset, data)
-                .await
-                .map_err(|e| StorageError::NfsError(format!("Failed to write file: {e}")))?;
+            let written = nfs_rs::write_all(
+                self.mount.as_ref().as_ref(),
+                file.inner.fh.clone(),
+                offset,
+                data,
+            )
+            .await
+            .map_err(|e| StorageError::NfsError(format!("Failed to write file: {e}")))?;
 
             trace!(
                 "[write] Wrote {} bytes to file {:?} at offset {}",
                 written, file.path, offset
             );
-            total_written = u64::from(written);
+            total_written = written;
         }
 
         Ok(total_written)
@@ -3891,10 +4319,6 @@ impl NFSStorage {
                     }
                 };
 
-                if entry.file_name == "." || entry.file_name == ".." {
-                    continue;
-                }
-
                 let Some(attrs) = entry.attr else {
                     errors.push(format!("{}: missing attributes", entry.file_name));
                     continue;
@@ -3979,9 +4403,6 @@ impl NFSStorage {
             let entry = result.map_err(|error| {
                 StorageError::NfsError(format!("NFS directory listing failed: {error}"))
             })?;
-            if entry.file_name == "." || entry.file_name == ".." {
-                continue;
-            }
             let attrs = entry.attr.ok_or_else(|| {
                 StorageError::NfsError("NFS directory entry omitted attributes".to_owned())
             })?;
@@ -4172,6 +4593,24 @@ fn next_read_want(cur: u64, end: u64, block_size: u64) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::AssertTestValue;
+
+    #[test]
+    fn deferred_write_retains_payload_only_when_server_commit_is_required() {
+        for (committed, expects_retry) in [
+            (nfs_rs::WriteCommitted::FileSync, false),
+            (nfs_rs::WriteCommitted::DataSync, true),
+            (nfs_rs::WriteCommitted::Unstable, true),
+        ] {
+            let write = NfsDeferredWrite::from_outcomes(
+                7,
+                Bytes::from_static(b"payload"),
+                vec![WriteOutcome::new(7, committed, Some([1; 8]))],
+            );
+            assert_eq!(write.accepted_bytes(), 7);
+            assert_eq!(write.retry_data.is_some(), expects_retry);
+            assert_eq!(write.commit_pressure(), usize::from(expects_retry));
+        }
+    }
 
     #[test]
     fn test_parse_nfs_url() {
