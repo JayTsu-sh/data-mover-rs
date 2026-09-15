@@ -358,7 +358,13 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    let directory = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
+    crate::storage::durability::sync_directory(&directory)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }

@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use cap_std::fs::Dir;
 
 use super::WriteProbe;
+use crate::storage::durability::open_directory;
 use crate::storage::{PublicationDisposition, PublishRequest};
 
 #[derive(Clone, Copy)]
@@ -105,7 +106,7 @@ fn finish_publication(
     probe
         .final_directory_sync_calls
         .fetch_add(1, Ordering::SeqCst);
-    let final_directory = root.open(".").map_err(committed)?;
+    let final_directory = open_directory(root).map_err(committed)?;
     #[cfg(unix)]
     {
         use cap_std::fs::MetadataExt as _;
@@ -123,7 +124,10 @@ fn finish_publication(
         if !same_directory {
             directories
                 .sync
-                .sync(staging.open(".").map_err(committed)?, &staging_metadata)
+                .sync(
+                    open_directory(staging).map_err(committed)?,
+                    &staging_metadata,
+                )
                 .map_err(committed)?;
         }
     }
@@ -132,7 +136,7 @@ fn finish_publication(
         directories.sync.sync(final_directory).map_err(committed)?;
         directories
             .sync
-            .sync(staging.open(".").map_err(committed)?)
+            .sync(open_directory(staging).map_err(committed)?)
             .map_err(committed)?;
     }
     Ok(disposition)

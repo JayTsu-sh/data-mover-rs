@@ -460,6 +460,12 @@ source-deletion-safety fact for terrasync policy.
 
 ## 10. Recovery contract
 
+Local namespace durability uses a shared directory-handle helper. On Windows it opens the
+existing directory capability with read/write access and `FILE_FLAG_BACKUP_SEMANTICS` before
+`sync_all()`; read-only directory handles cannot satisfy `FlushFileBuffers`. Publication,
+checkpoints, claim cleanup, new parent directories, and recovery-store registration retain
+real directory synchronization, and synchronization failures remain errors.
+
 `TransferPolicy` offers `Checkpointed` (the default), `AtomicReplace`, and Local `Direct`. Direct writes the final inode without staging, rename, checkpoints, or final persistence barriers; see [ADR-0003](../adr/0003-transfer-policy-direct.md). AtomicReplace restarts from zero without
 creating checkpoints; Local and NFS skip final persistence barriers but retain staging,
 cancellation checks and atomic publication. Success in AtomicReplace mode does not promise crash

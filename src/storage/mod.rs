@@ -3,6 +3,7 @@
 pub(crate) mod artifacts;
 pub(crate) mod backends;
 mod capability;
+pub(crate) mod durability;
 mod factory;
 mod handle;
 mod native;

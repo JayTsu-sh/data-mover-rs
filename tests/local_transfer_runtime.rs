@@ -111,3 +111,52 @@ async fn precancelled_copy_preserves_existing_destination() -> TestResult {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn checkpointed_persists_large_transfer_and_cleans_recovery_files() -> TestResult {
+    let source = tempfile::tempdir()?;
+    let destination = tempfile::tempdir()?;
+    // Cross the Local 256 MiB durable checkpoint window, including record persistence.
+    let payload = vec![0x5a; 257 * 1024 * 1024];
+    std::fs::write(source.path().join("file.bin"), &payload)?;
+    let outcome = tokio::time::timeout(
+        Duration::from_mins(2),
+        transfer(
+            request(source.path(), destination.path())
+                .await?
+                .with_transfer_policy(TransferPolicy::Checkpointed),
+        ),
+    )
+    .await??;
+    assert_eq!(
+        outcome.recovery,
+        data_mover::transfer::EffectiveRecovery::Checkpointed
+    );
+    assert_eq!(std::fs::read(destination.path().join("file.bin"))?, payload);
+    std::fs::remove_file(destination.path().join("file.bin"))?;
+    assert_eq!(std::fs::read_dir(destination.path())?.count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpointed_syncs_new_parent_directories() -> TestResult {
+    let source = tempfile::tempdir()?;
+    let destination = tempfile::tempdir()?;
+    std::fs::write(source.path().join("file.bin"), b"new parent")?;
+    let request = TransferRequest::new(
+        TransferIdentity::new("native-new-parent")?,
+        local(source.path(), "native-source").await?,
+        StoragePath::new("file.bin")?,
+        local(destination.path(), "native-destination").await?,
+        StoragePath::new("new/child/file.bin")?,
+        InflightLimits::new(1, 1024 * 1024, 1)?,
+        CancellationToken::new(),
+    )
+    .with_transfer_policy(TransferPolicy::Checkpointed);
+    transfer(request).await?;
+    let parent = destination.path().join("new/child");
+    assert_eq!(std::fs::read(parent.join("file.bin"))?, b"new parent");
+    std::fs::remove_file(parent.join("file.bin"))?;
+    assert_eq!(std::fs::read_dir(parent)?.count(), 0);
+    Ok(())
+}
