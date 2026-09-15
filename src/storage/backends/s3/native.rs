@@ -6,8 +6,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{BackendIdentity, IdentityStrength, Operation, SourceIdentity};
 use crate::storage::{
-    NativeAffinity, NativeEndpoint, NativeRecoveryMode, NativeSourceBinding, NativeStageEvidence,
-    NativeStageFailure, SourceDescriptor, StorageRoleFailure,
+    NativeAffinity, NativeEndpoint, NativeSourceBinding, NativeStageEvidence, NativeStageFailure,
+    SourceDescriptor, StorageRoleFailure,
 };
 
 use super::source::{entry, role_failure};
@@ -70,14 +70,6 @@ impl<P> S3NativeEndpoint<P> {
 impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
     fn affinity(&self) -> NativeAffinity {
         self.context.affinity
-    }
-
-    fn recovery_mode(&self, source_size: u64) -> NativeRecoveryMode {
-        if source_size > super::S3_NATIVE_COPY_SINGLE_MAX {
-            NativeRecoveryMode::Checkpointed
-        } else {
-            NativeRecoveryMode::Atomic
-        }
     }
 
     async fn bind_source(

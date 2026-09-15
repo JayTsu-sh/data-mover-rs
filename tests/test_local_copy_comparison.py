@@ -41,7 +41,7 @@ class LocalCopyComparisonTest(unittest.TestCase):
         self.assertIn("sync_data", benchmark)
         self.assertIn("connect_backend", benchmark)
         self.assertIn("transfer(request)", benchmark)
-        self.assertIn("enable_integrity_check: true", benchmark)
+        self.assertIn("enable_integrity_check: !args.no_read_back", benchmark)
 
 
 if __name__ == "__main__":

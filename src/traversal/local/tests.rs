@@ -360,3 +360,24 @@ async fn non_utf8_entry_failures_keep_distinct_lossless_identities() -> io::Resu
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn traversal_omits_reserved_local_transfer_artifacts() -> io::Result<()> {
+    let root = TestRoot::new()?;
+    std::fs::create_dir(root.0.join("dir"))?;
+    for name in [
+        ".data-mover-owned.stage",
+        ".data-mover-owned.stage.checkpoint",
+        ".data-mover-owned.stage.claim",
+    ] {
+        std::fs::write(root.0.join("dir").join(name), b"internal")?;
+    }
+    std::fs::write(root.0.join("dir/final.bin"), b"visible")?;
+    let mut session = source(&root.0).traverse(request(CancellationToken::new(), 2, 1));
+    let items = drain(&mut session).await;
+    let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
+    assert_eq!(items.len(), 2);
+    assert_eq!(completion.observed_entries, 2);
+    assert_eq!(completion.entry_failures, 0);
+    Ok(())
+}

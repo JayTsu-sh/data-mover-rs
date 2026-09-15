@@ -276,8 +276,41 @@ impl MetadataPlan {
         stage: &PreparedStage,
         cancel: CancellationToken,
     ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
-        self.apply_to(ApplicationTarget::Stage { target, stage }, cancel)
-            .await
+        let mut outcomes = self.planned_outcomes();
+        let Some((first_family, _)) = self.mutations.first() else {
+            return Ok(MetadataApplicationReport { outcomes });
+        };
+        if cancel.is_cancelled() {
+            return Err(MetadataApplicationFailure {
+                family: *first_family,
+                error: None,
+                report: MetadataApplicationReport { outcomes },
+            });
+        }
+        let mutations = self
+            .mutations
+            .iter()
+            .map(|(_, mutation)| mutation.clone())
+            .collect::<Vec<_>>();
+        if let Err(failure) = target.apply_metadata_batch(stage, mutations, cancel).await {
+            let failed_index = failure.failed_index.min(self.mutations.len() - 1);
+            for (family, _) in self.mutations.iter().take(failure.completed) {
+                set_outcome(&mut outcomes, *family, ApplicationOutcome::Applied);
+            }
+            let family = self.mutations[failed_index].0;
+            if failure.error.is_some() {
+                set_outcome(&mut outcomes, family, ApplicationOutcome::Failed);
+            }
+            return Err(MetadataApplicationFailure {
+                family,
+                error: failure.error,
+                report: MetadataApplicationReport { outcomes },
+            });
+        }
+        for (family, _) in &self.mutations {
+            set_outcome(&mut outcomes, *family, ApplicationOutcome::Applied);
+        }
+        Ok(MetadataApplicationReport { outcomes })
     }
 
     async fn apply_to(
@@ -285,19 +318,7 @@ impl MetadataPlan {
         target: ApplicationTarget<'_>,
         cancel: CancellationToken,
     ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
-        let mut outcomes = self
-            .mappings
-            .iter()
-            .map(|mapping| FamilyApplication {
-                family: mapping.family,
-                outcome: planned_outcome(
-                    &mapping.decision,
-                    self.mutations
-                        .iter()
-                        .any(|(family, _)| *family == mapping.family),
-                ),
-            })
-            .collect::<Vec<_>>();
+        let mut outcomes = self.planned_outcomes();
         for (family, mutation) in &self.mutations {
             if cancel.is_cancelled() {
                 return Err(MetadataApplicationFailure {
@@ -318,16 +339,27 @@ impl MetadataPlan {
         }
         Ok(MetadataApplicationReport { outcomes })
     }
+
+    fn planned_outcomes(&self) -> Vec<FamilyApplication> {
+        self.mappings
+            .iter()
+            .map(|mapping| FamilyApplication {
+                family: mapping.family,
+                outcome: planned_outcome(
+                    &mapping.decision,
+                    self.mutations
+                        .iter()
+                        .any(|(family, _)| *family == mapping.family),
+                ),
+            })
+            .collect()
+    }
 }
 
 enum ApplicationTarget<'a> {
     Published {
         target: &'a dyn Metadata,
         path: &'a StoragePath,
-    },
-    Stage {
-        target: &'a dyn StagedDestination,
-        stage: &'a PreparedStage,
     },
 }
 
@@ -339,7 +371,6 @@ impl ApplicationTarget<'_> {
     ) -> Result<(), StorageRoleFailure> {
         match self {
             Self::Published { target, path } => target.apply(path, mutation, cancel).await,
-            Self::Stage { target, stage } => target.apply_metadata(stage, mutation, cancel).await,
         }
     }
 }

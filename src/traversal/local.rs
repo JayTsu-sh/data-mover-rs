@@ -272,6 +272,9 @@ fn enumerate_entry(
             return sequence.checked_add(1);
         }
     };
+    if crate::storage::is_local_transfer_artifact(&entry.file_name()) {
+        return Some(sequence);
+    }
     let child = directory.join(entry.file_name());
     let path = match candidate_path(identity, directory, &child) {
         Ok(path) => path,

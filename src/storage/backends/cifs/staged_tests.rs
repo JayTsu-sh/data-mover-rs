@@ -12,8 +12,8 @@ use crate::model::{
     Operation, SourceIdentity, StoragePath, Transience,
 };
 use crate::storage::{
-    ByteStream, ExistingDestinationPolicy, FinalDestination, PrepareRequest, PublishRequest,
-    RecoverRequest, SourceDescriptor, StagedDestination, StorageRoleFailure, VerifyRequest,
+    ByteStream, FinalDestination, PrepareRequest, PublishRequest, RecoverRequest, SourceDescriptor,
+    StagedDestination, StorageRoleFailure, VerifyRequest,
 };
 
 #[derive(Default)]
@@ -234,7 +234,6 @@ async fn staged_lifecycle_flushes_verifies_and_atomically_publishes()
         .publish(
             &stage,
             PublishRequest {
-                policy: ExistingDestinationPolicy::Overwrite,
                 expected_size: 6,
                 expected_blake3: hash,
                 cancel: tokio_util::sync::CancellationToken::new(),
@@ -313,48 +312,6 @@ async fn repeated_recovery_reobserves_the_same_claim_after_a_lost_response()
     assert_eq!(repeated.write_offset, 3);
     Ok(())
 }
-
-#[tokio::test]
-async fn verify_or_skip_retains_equivalent_final_and_discards_stage()
--> Result<(), Box<dyn std::error::Error>> {
-    let protocol = Arc::new(MemoryProtocol::default());
-    protocol
-        .files
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert("final.bin".into(), b"abcdef".to_vec());
-    let identity = identity()?;
-    let destination = CifsStagedDestination::new(Arc::clone(&protocol), identity.clone());
-    let stage = destination.prepare(prepare_request(&identity)?).await?;
-    destination.write(&stage, input(&[b"abcdef"])).await?;
-    let hash = *blake3::hash(b"abcdef").as_bytes();
-    let published = destination
-        .publish(
-            &stage,
-            PublishRequest {
-                policy: ExistingDestinationPolicy::VerifyOrSkip,
-                expected_size: 6,
-                expected_blake3: hash,
-                cancel: tokio_util::sync::CancellationToken::new(),
-            },
-        )
-        .await
-        .map_err(|failure| failure.error)?;
-    assert_eq!(
-        published.disposition,
-        crate::storage::PublicationDisposition::ExistingEquivalent
-    );
-    assert_eq!(
-        protocol
-            .files
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len(),
-        1
-    );
-    Ok(())
-}
-
 #[tokio::test]
 async fn lost_rename_response_reconciles_committed_final_content()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -371,7 +328,6 @@ async fn lost_rename_response_reconciles_committed_final_content()
         .publish(
             &stage,
             PublishRequest {
-                policy: ExistingDestinationPolicy::Overwrite,
                 expected_size: 6,
                 expected_blake3: hash,
                 cancel: tokio_util::sync::CancellationToken::new(),
@@ -400,7 +356,6 @@ async fn cancelled_publication_leaves_the_stage_and_final_unchanged()
         .publish(
             &stage,
             PublishRequest {
-                policy: ExistingDestinationPolicy::Overwrite,
                 expected_size: 6,
                 expected_blake3: *blake3::hash(b"abcdef").as_bytes(),
                 cancel,

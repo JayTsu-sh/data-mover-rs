@@ -8,9 +8,9 @@ use data_mover::model::{
     StoragePath, Transience,
 };
 use data_mover::storage::{
-    ByteStream, ExistingDestinationPolicy, FinalDestination, PreflightPolicy, PrepareRequest,
-    PreparedStage, PublishRequest, RecoverRequest, RecoveryIdentity, SourceDescriptor,
-    StagedDestination, Storage, StorageRoleFailure, VerifyRequest,
+    ByteStream, FinalDestination, PreflightPolicy, PrepareRequest, PreparedStage, PublishRequest,
+    RecoverRequest, RecoveryIdentity, SourceDescriptor, StagedDestination, Storage,
+    StorageRoleFailure, VerifyRequest,
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
@@ -97,7 +97,7 @@ async fn transfer_and_assert(
         CancellationToken::new(),
     ))
     .await?;
-    assert_eq!(outcome.blake3, *blake3::hash(payload).as_bytes());
+    assert_eq!(outcome.blake3, Some(*blake3::hash(payload).as_bytes()));
     let published = destination_backend
         .open_file(Path::new("published/final.bin"))
         .await?;
@@ -306,7 +306,6 @@ async fn publish_recovered(
         .publish(
             recovered,
             PublishRequest {
-                policy: ExistingDestinationPolicy::default(),
                 expected_size,
                 expected_blake3,
                 cancel: CancellationToken::new(),

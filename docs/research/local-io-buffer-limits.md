@@ -1,5 +1,8 @@
 # Local buffered positional I/O 的 buffer 上限：1 MiB 还是 2 MiB
 
+> 后续决策（2026-09-10）：本文的读取端 2 MiB 结论保持不变；Local 写端内部任务上限
+> 后续调整为 8 MiB，并与固定的 64 MiB Auto 检查点间隔解耦。
+
 - 调研日期：2026-09-01
 - 范围：Linux 上的普通文件、buffered I/O、Rust `std::os::unix::fs::FileExt::{read_at, write_at}`；不涵盖 `O_DIRECT`、Windows 或网络文件系统
 - 仓库基线：`76fdb81738df32a85284a974e1fea7570590a2b9`，并检查了当前工作区中的 Local backend 改动

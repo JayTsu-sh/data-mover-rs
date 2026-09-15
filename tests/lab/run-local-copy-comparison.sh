@@ -5,7 +5,7 @@ source "$(dirname "$0")/common.sh"
 run_id="${1:?run id required}"
 output="${2:-local-copy-comparison.csv}"
 repeats="${LOCAL_COPY_PERF_REPEATS:-3}"
-selected_payloads="${LOCAL_COPY_PERF_PAYLOADS:-4KiB,40MiB,1GiB}"
+selected_payloads="${LOCAL_COPY_PERF_PAYLOADS:-4KiB,4MiB,40MiB,1GiB}"
 max_regression_percent="${LOCAL_COPY_PERF_MAX_REGRESSION_PERCENT:-}"
 max_fixed_overhead_ms="${LOCAL_COPY_PERF_MAX_FIXED_OVERHEAD_MS:-5}"
 validate_run_id "$run_id"
@@ -51,6 +51,7 @@ sizes=()
 for label in "${labels[@]}"; do
   case "$label" in
     4KiB) sizes+=(4096) ;;
+    4MiB) sizes+=($((4 * 1024 * 1024))) ;;
     40MiB) sizes+=($((40 * 1024 * 1024))) ;;
     1GiB) sizes+=($((1024 * 1024 * 1024))) ;;
     *)

@@ -173,10 +173,15 @@ mod producer_tests {
 
     #[tokio::test]
     async fn bounded_pair_delivers_items_before_completion_evidence() {
-        let (producer, mut session) =
-            TraversalSession::bounded(NonZeroUsize::new(1).unwrap(), CancellationToken::new());
+        let (producer, mut session) = TraversalSession::bounded(
+            NonZeroUsize::new(1).unwrap_or_else(|| unreachable!()),
+            CancellationToken::new(),
+        );
         let task = tokio::spawn(async move {
-            producer.send(failure()).await.unwrap();
+            producer
+                .send(failure())
+                .await
+                .unwrap_or_else(|_| panic!("session receiver dropped"));
             producer.finish(Ok(TraversalOutcome::Completed(TraversalCompletion {
                 observed_entries: 0,
                 entry_failures: 1,
@@ -191,13 +196,16 @@ mod producer_tests {
             session.finish().await,
             Ok(TraversalOutcome::Completed(_))
         ));
-        task.await.unwrap();
+        task.await
+            .unwrap_or_else(|error| panic!("producer task failed: {error}"));
     }
 
     #[tokio::test]
     async fn producer_drop_without_evidence_is_a_terminal_failure() {
-        let (producer, mut session) =
-            TraversalSession::bounded(NonZeroUsize::new(1).unwrap(), CancellationToken::new());
+        let (producer, mut session) = TraversalSession::bounded(
+            NonZeroUsize::new(1).unwrap_or_else(|| unreachable!()),
+            CancellationToken::new(),
+        );
         drop(producer);
         assert!(session.next_item().await.is_none());
         assert_eq!(
@@ -209,13 +217,13 @@ mod producer_tests {
     fn failure() -> TraversalItem {
         TraversalItem::EntryFailure(
             EntryOperationFailure::new(
-                StoragePath::new("denied").unwrap(),
+                StoragePath::new("denied").unwrap_or_else(|error| panic!("{error}")),
                 crate::model::Operation::Observe,
                 crate::model::FailureClass::PermissionDenied,
                 crate::model::Transience::Permanent,
                 "denied",
             )
-            .unwrap(),
+            .unwrap_or_else(|error| panic!("{error}")),
         )
     }
 }

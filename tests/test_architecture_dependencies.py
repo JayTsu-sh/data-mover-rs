@@ -85,6 +85,17 @@ class ArchitectureDependenciesTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(f"{module} must not import {dependency}", result.stderr)
 
+    def test_guard_limits_legacy_backend_dependencies_to_storage_factory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            shutil.copytree(ROOT / "src", fixture / "src")
+            (fixture / "src" / "storage" / "bad.rs").write_text(
+                "use crate::nfs::NFSStorage;\n"
+            )
+            result = self.run_validator(fixture)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("storage must not import nfs", result.stderr)
+
     def test_guard_rejects_cross_backend_import(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = Path(temporary)

@@ -1,15 +1,12 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::engine::{TransferDataPath, TransferPhase, TransferSide, run_until_transferred};
 use super::{
-    ExistingDestinationPolicy, ExpertDestinationRequest, ExpertDestinationSession,
-    ExpertSourceRequest, ExpertSourceSession, InflightLimits, RecoveryContext, RecoveryIdentity,
-    RecoveryProvider, RecoveryRegistrar, RecoveryRegistrationFailure, Resumability, SourceQosGroup,
-    SourceQosPolicy, TransferIdentity, TransferRequest, transfer,
+    ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest, ExpertSourceSession,
+    InflightLimits, SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferPolicy,
+    TransferRequest, transfer,
 };
 use crate::metadata::{
     AclTarget, ApplicationOutcome, MetadataPlanRequest, MetadataPolicies, MetadataPolicy,
@@ -20,160 +17,9 @@ use crate::model::{
     ObservedEntry,
 };
 
-struct TestRecoveryProvider {
-    identity: Option<RecoveryIdentity>,
-    claim: [u8; 32],
-    registrar: Arc<dyn RecoveryRegistrar>,
-    opens: AtomicU64,
-}
-
-impl TestRecoveryProvider {
-    fn new(identity: Option<RecoveryIdentity>, registrar: Arc<dyn RecoveryRegistrar>) -> Self {
-        Self {
-            identity,
-            claim: [7; 32],
-            registrar,
-            opens: AtomicU64::new(0),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl RecoveryProvider for TestRecoveryProvider {
-    async fn open(&self) -> Result<RecoveryContext, RecoveryRegistrationFailure> {
-        self.opens.fetch_add(1, Ordering::SeqCst);
-        Ok(RecoveryContext::new(
-            self.identity.clone(),
-            self.claim,
-            Arc::clone(&self.registrar),
-        ))
-    }
-}
-
-fn recovery_provider(
-    identity: Option<RecoveryIdentity>,
-    registrar: Arc<dyn RecoveryRegistrar>,
-) -> Arc<dyn RecoveryProvider> {
-    Arc::new(TestRecoveryProvider::new(identity, registrar))
-}
-
-struct BlockingRecoveryRegistrar {
-    identity: Mutex<Option<RecoveryIdentity>>,
-    started: tokio::sync::Semaphore,
-    acknowledge: tokio::sync::Semaphore,
-}
-
-impl BlockingRecoveryRegistrar {
-    fn new() -> Self {
-        Self {
-            identity: Mutex::new(None),
-            started: tokio::sync::Semaphore::new(0),
-            acknowledge: tokio::sync::Semaphore::new(0),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl RecoveryRegistrar for BlockingRecoveryRegistrar {
-    async fn register(
-        &self,
-        identity: RecoveryIdentity,
-    ) -> Result<(), RecoveryRegistrationFailure> {
-        *self
-            .identity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
-        self.started.add_permits(1);
-        self.acknowledge
-            .acquire()
-            .await
-            .map_err(|_| RecoveryRegistrationFailure::unavailable())?
-            .forget();
-        Ok(())
-    }
-}
-
-struct AcceptingRecoveryRegistrar;
-
-#[async_trait::async_trait]
-impl RecoveryRegistrar for AcceptingRecoveryRegistrar {
-    async fn register(
-        &self,
-        _identity: RecoveryIdentity,
-    ) -> Result<(), RecoveryRegistrationFailure> {
-        Ok(())
-    }
-}
-
-struct RejectingRecoveryRegistrar;
-
-#[async_trait::async_trait]
-impl RecoveryRegistrar for RejectingRecoveryRegistrar {
-    async fn register(
-        &self,
-        _identity: RecoveryIdentity,
-    ) -> Result<(), RecoveryRegistrationFailure> {
-        Err(RecoveryRegistrationFailure::rejected())
-    }
-}
-
-struct CheckpointedNativeEndpoint {
-    affinity: crate::storage::NativeAffinity,
-    payload: bytes::Bytes,
-    destination: Option<Arc<dyn crate::storage::StagedDestination>>,
-    copy_calls: Arc<AtomicU64>,
-}
-
-#[async_trait::async_trait]
-impl crate::storage::NativeEndpoint for CheckpointedNativeEndpoint {
-    fn affinity(&self) -> crate::storage::NativeAffinity {
-        self.affinity
-    }
-
-    fn recovery_mode(&self, _source_size: u64) -> crate::storage::NativeRecoveryMode {
-        crate::storage::NativeRecoveryMode::Checkpointed
-    }
-
-    async fn bind_source(
-        &self,
-        source: &crate::storage::SourceDescriptor,
-    ) -> Result<crate::storage::NativeSourceBinding, crate::storage::StorageRoleFailure> {
-        Ok(crate::storage::NativeSourceBinding {
-            affinity: self.affinity,
-            token: bytes::Bytes::from_static(b"checkpointed-native-source"),
-            size: source.size.unwrap_or_default(),
-        })
-    }
-
-    async fn copy_into_stage(
-        &self,
-        source: crate::storage::NativeSourceBinding,
-        stage: &crate::storage::PreparedStage,
-        _cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::storage::NativeStageEvidence, crate::storage::NativeStageFailure> {
-        self.copy_calls.fetch_add(1, Ordering::SeqCst);
-        let destination = self
-            .destination
-            .as_ref()
-            .unwrap_or_else(|| panic!("native destination role is missing"));
-        let stream: crate::storage::ByteStream =
-            Box::pin(futures::stream::iter([Ok(self.payload.clone())]));
-        let write = destination.write(stage, stream).await.map_err(|error| {
-            crate::storage::NativeStageFailure {
-                error,
-                native_bytes: 0,
-                native_requests: 1,
-            }
-        })?;
-        Ok(crate::storage::NativeStageEvidence {
-            write,
-            native_bytes: source.size,
-            native_requests: 1,
-        })
-    }
-}
 use crate::model::StoragePath;
 use crate::storage::PublicationDisposition;
+use crate::storage::RecoveryIdentity;
 use crate::storage::Storage;
 use crate::storage::backends::local::{
     source::LocalReadSource, test_destination_storage, test_destination_storage_with_role,
@@ -264,7 +110,7 @@ async fn complete_expert_transfer(
             limits,
             tokio_util::sync::CancellationToken::new(),
         )
-        .with_recovery(Resumability::Disabled, None)
+        .with_transfer_policy(TransferPolicy::AtomicReplace)
         .with_metadata_plan(plan),
     )
     .await?;
@@ -318,36 +164,6 @@ async fn expert_metadata_is_applied_to_the_stage_before_publication()
     }));
     Ok(())
 }
-
-#[tokio::test]
-async fn expert_metadata_rejects_verify_or_skip_before_destination_mutation()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("expert-metadata-preflight-source")?;
-    let destination_root = TestRoot::new("expert-metadata-preflight-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), b"metadata payload")?;
-    let source = local_source(source_root.path())?;
-    let observation = expert_observation(&source, "source.bin").await?;
-    let request = ExpertDestinationRequest::new(
-        TransferIdentity::new("expert-metadata-preflight")?,
-        observation,
-        64 * 1024,
-        local_destination(destination_root.path())?,
-        StoragePath::new("existing.bin")?,
-        InflightLimits::new(1, 64 * 1024, 1)?,
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .with_existing_destination_policy(ExistingDestinationPolicy::VerifyOrSkip)
-    .with_recovery(Resumability::Disabled, None)
-    .with_metadata_plan(local_xattr_plan()?);
-
-    let Err(error) = ExpertDestinationSession::prepare(request).await else {
-        return Err("VerifyOrSkip with staged metadata unexpectedly prepared a destination".into());
-    };
-    assert_eq!(error.phase(), TransferPhase::Preflight);
-    assert!(!destination_root.path().join(".data-mover-staging").exists());
-    Ok(())
-}
-
 #[tokio::test]
 async fn expert_metadata_failure_does_not_publish_and_retains_the_stage()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -374,7 +190,7 @@ async fn expert_metadata_failure_does_not_publish_and_retains_the_stage()
         principal_mapper: None,
     })?;
 
-    let error = complete_expert_transfer(
+    let Err(error) = complete_expert_transfer(
         "expert-metadata-failure",
         source,
         destination,
@@ -383,7 +199,9 @@ async fn expert_metadata_failure_does_not_publish_and_retains_the_stage()
         "must-not-publish.bin",
     )
     .await
-    .expect_err("unsupported staged tags must fail before publication");
+    else {
+        return Err("unsupported staged tags unexpectedly succeeded".into());
+    };
 
     assert_eq!(error.phase(), TransferPhase::Metadata);
     assert_eq!(error.side(), TransferSide::Destination);
@@ -464,9 +282,9 @@ async fn source_qos_cancellation_wait_is_fast_and_does_not_charge_an_unissued_re
     .with_source_qos(qos);
     let started = std::time::Instant::now();
     let attempt = tokio::spawn(transfer(request));
-    let staging = destination_root.path().join(".data-mover-staging");
+    let staging = destination_root.path();
     for _ in 0..100 {
-        if staging.exists() && std::fs::read_dir(&staging)?.next().is_some() {
+        if staging_entry_count(staging)? > 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -542,7 +360,7 @@ async fn local_transfer_verifies_blake3_then_atomically_overwrites_final()
 
     assert_eq!(outcome.disposition, PublicationDisposition::Published);
     assert_eq!(outcome.transferred_bytes, payload.len() as u64);
-    assert_eq!(outcome.blake3, *blake3::hash(&payload).as_bytes());
+    assert_eq!(outcome.blake3, Some(*blake3::hash(&payload).as_bytes()));
     assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,
         payload
@@ -561,18 +379,13 @@ async fn single_chunk_local_transfer_omits_recovery_checkpoint()
     let (destination, destination_role) =
         test_destination_storage_with_role(destination_root.path(), "single-chunk-destination")?;
     destination_role.fail_checkpoint_at(1);
-    let provider = Arc::new(TestRecoveryProvider::new(
-        None,
-        Arc::new(AcceptingRecoveryRegistrar),
-    ));
-
     let outcome = transfer(
         transfer_request(
             local_source(source_root.path())?,
             destination,
             tokio_util::sync::CancellationToken::new(),
         )?
-        .with_recovery(Resumability::Enabled, Some(provider.clone())),
+        .with_transfer_policy(TransferPolicy::Checkpointed),
     )
     .await?;
 
@@ -581,13 +394,16 @@ async fn single_chunk_local_transfer_omits_recovery_checkpoint()
         std::fs::read(destination_root.path().join("final.bin"))?,
         payload
     );
-    assert_eq!(provider.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        outcome.recovery,
+        super::engine::EffectiveRecovery::SkippedSingleSourceChunk
+    );
     assert_eq!(staging_entry_count(destination_root.path())?, 0);
     Ok(())
 }
 
 #[tokio::test]
-async fn multi_chunk_local_transfer_still_requires_recovery_checkpoint()
+async fn checkpointed_multichunk_below_threshold_skips_checkpoint_setup()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("multi-chunk-source")?;
     let destination_root = TestRoot::new("multi-chunk-destination")?;
@@ -607,11 +423,16 @@ async fn multi_chunk_local_transfer_still_requires_recovery_checkpoint()
     ))
     .await;
 
-    let Err(error) = result else {
-        return Err("multi-chunk transfer unexpectedly skipped checkpoint setup".into());
-    };
-    assert_eq!(error.phase(), TransferPhase::Prepare);
-    assert!(!destination_root.path().join("final.bin").exists());
+    let outcome = result?;
+    assert_eq!(
+        outcome.recovery,
+        super::engine::EffectiveRecovery::SkippedBelowCheckpointThreshold
+    );
+    assert_eq!(
+        std::fs::read(destination_root.path().join("final.bin"))?,
+        payload
+    );
+    assert_eq!(staging_entry_count(destination_root.path())?, 0);
     Ok(())
 }
 
@@ -634,7 +455,7 @@ async fn disabled_multi_chunk_transfer_omits_recovery_checkpoint()
             destination,
             tokio_util::sync::CancellationToken::new(),
         )?
-        .with_recovery(Resumability::Disabled, None),
+        .with_transfer_policy(TransferPolicy::AtomicReplace),
     )
     .await?;
 
@@ -644,255 +465,6 @@ async fn disabled_multi_chunk_transfer_omits_recovery_checkpoint()
         payload
     );
     assert_eq!(staging_entry_count(destination_root.path())?, 0);
-    Ok(())
-}
-
-#[tokio::test]
-async fn recoverable_transfer_waits_for_identity_registration_ack_before_writing()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("recovery-registration-source")?;
-    let destination_root = TestRoot::new("recovery-registration-destination")?;
-    let payload = vec![0x75; 128 * 1024 + 1];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
-    let (destination, destination_role) = test_destination_storage_with_role(
-        destination_root.path(),
-        "recovery-registration-destination",
-    )?;
-    let registrar = Arc::new(BlockingRecoveryRegistrar::new());
-    let request = transfer_request(
-        local_source(source_root.path())?,
-        destination,
-        tokio_util::sync::CancellationToken::new(),
-    )?
-    .with_recovery(
-        Resumability::Enabled,
-        Some(recovery_provider(None, registrar.clone())),
-    );
-    let transferring = tokio::spawn(transfer(request));
-
-    tokio::time::timeout(Duration::from_secs(1), registrar.started.acquire())
-        .await
-        .map_err(io::Error::other)?
-        .map_err(io::Error::other)?
-        .forget();
-    assert_eq!(destination_role.write_completion_count(), 0);
-    assert!(!destination_root.path().join("final.bin").exists());
-    assert!(
-        registrar
-            .identity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    );
-
-    registrar.acknowledge.add_permits(1);
-    let outcome = transferring.await??;
-    assert_eq!(outcome.transferred_bytes, payload.len() as u64);
-    assert_eq!(
-        std::fs::read(destination_root.path().join("final.bin"))?,
-        payload
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn checkpointed_native_transfer_waits_for_registration_ack_before_copy()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("checkpointed-native-source")?;
-    let destination_root = TestRoot::new("checkpointed-native-destination")?;
-    let payload = bytes::Bytes::from(vec![0x79; 128 * 1024 + 1]);
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
-    let (source_storage, source_role) =
-        test_source_storage(source_root.path(), "checkpointed-native-source")?;
-    let (destination_storage, destination_role) = test_destination_storage_with_role(
-        destination_root.path(),
-        "checkpointed-native-destination",
-    )?;
-    let affinity = crate::storage::NativeAffinity::derive(&[b"checkpointed-native-test"]);
-    let copy_calls = Arc::new(AtomicU64::new(0));
-    let source_native: Arc<dyn crate::storage::NativeEndpoint> =
-        Arc::new(CheckpointedNativeEndpoint {
-            affinity,
-            payload: payload.clone(),
-            destination: None,
-            copy_calls: Arc::clone(&copy_calls),
-        });
-    let destination_stage: Arc<dyn crate::storage::StagedDestination> = destination_role.clone();
-    let destination_native: Arc<dyn crate::storage::NativeEndpoint> =
-        Arc::new(CheckpointedNativeEndpoint {
-            affinity,
-            payload: payload.clone(),
-            destination: Some(Arc::clone(&destination_stage)),
-            copy_calls: Arc::clone(&copy_calls),
-        });
-    let source = Storage::connected(
-        source_storage.identity().clone(),
-        source_storage.capabilities().clone(),
-        Some(source_role),
-        None,
-        None,
-        None,
-        Some(source_native),
-    )?;
-    let destination = Storage::connected(
-        destination_storage.identity().clone(),
-        destination_storage.capabilities().clone(),
-        None,
-        Some(destination_stage),
-        None,
-        None,
-        Some(destination_native),
-    )?;
-    let registrar = Arc::new(BlockingRecoveryRegistrar::new());
-    let request = TransferRequest::new(
-        TransferIdentity::new("checkpointed-native")?,
-        source,
-        StoragePath::new("source.bin")?,
-        destination,
-        StoragePath::new("final.bin")?,
-        InflightLimits::new(2, 2 * 64 * 1024, 2)?,
-        tokio_util::sync::CancellationToken::new(),
-    )
-    .with_recovery(
-        Resumability::Enabled,
-        Some(recovery_provider(None, registrar.clone())),
-    );
-    let transferring = tokio::spawn(transfer(request));
-
-    tokio::time::timeout(Duration::from_secs(1), registrar.started.acquire())
-        .await
-        .map_err(io::Error::other)?
-        .map_err(io::Error::other)?
-        .forget();
-    assert_eq!(copy_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(destination_role.write_completion_count(), 0);
-
-    registrar.acknowledge.add_permits(1);
-    let outcome = transferring.await??;
-    assert_eq!(copy_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(outcome.source_qos.native_bytes, payload.len() as u64);
-    assert_eq!(
-        std::fs::read(destination_root.path().join("final.bin"))?,
-        payload
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn recoverable_transfer_requires_a_provider_before_destination_mutation()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("missing-recovery-provider-source")?;
-    let destination_root = TestRoot::new("missing-recovery-provider-destination")?;
-    std::fs::write(
-        source_root.path().join("source.bin"),
-        vec![0x76; 128 * 1024 + 1],
-    )?;
-
-    let request = transfer_request(
-        local_source(source_root.path())?,
-        local_destination(destination_root.path())?,
-        tokio_util::sync::CancellationToken::new(),
-    )?
-    .with_recovery(Resumability::Enabled, None);
-    let Err(error) = transfer(request).await else {
-        return Err("recoverable transfer unexpectedly ran without a provider".into());
-    };
-
-    assert_eq!(error.phase(), TransferPhase::Preflight);
-    assert_eq!(error.side(), TransferSide::Orchestration);
-    assert!(!destination_root.path().join(".data-mover-staging").exists());
-    assert!(!destination_root.path().join("final.bin").exists());
-    Ok(())
-}
-
-#[tokio::test]
-async fn rejected_recovery_registration_retains_an_unwritten_stage()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("rejected-recovery-registration-source")?;
-    let destination_root = TestRoot::new("rejected-recovery-registration-destination")?;
-    std::fs::write(
-        source_root.path().join("source.bin"),
-        vec![0x77; 128 * 1024 + 1],
-    )?;
-    let (destination, destination_role) = test_destination_storage_with_role(
-        destination_root.path(),
-        "rejected-recovery-registration-destination",
-    )?;
-
-    let request = transfer_request(
-        local_source(source_root.path())?,
-        destination,
-        tokio_util::sync::CancellationToken::new(),
-    )?
-    .with_recovery(
-        Resumability::Enabled,
-        Some(recovery_provider(
-            None,
-            Arc::new(RejectingRecoveryRegistrar),
-        )),
-    );
-    let Err(error) = transfer(request).await else {
-        return Err("rejected recovery registration unexpectedly transferred payload".into());
-    };
-
-    assert_eq!(error.phase(), TransferPhase::RecoveryRegistration);
-    assert_eq!(error.side(), TransferSide::Orchestration);
-    assert_eq!(destination_role.write_completion_count(), 0);
-    assert!(error.has_recoverable_stage());
-    assert!(error.has_unpublished_stage());
-    assert_eq!(
-        std::error::Error::source(&error).map(ToString::to_string),
-        Some("recovery registration was rejected".to_owned())
-    );
-    assert!(!destination_root.path().join("final.bin").exists());
-    error.discard_stage().await?;
-    assert_eq!(staging_entry_count(destination_root.path())?, 0);
-    Ok(())
-}
-
-#[tokio::test]
-async fn cancellation_waits_for_registration_ack_then_stops_before_payload()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("cancel-recovery-registration-source")?;
-    let destination_root = TestRoot::new("cancel-recovery-registration-destination")?;
-    std::fs::write(
-        source_root.path().join("source.bin"),
-        vec![0x78; 128 * 1024 + 1],
-    )?;
-    let (destination, destination_role) = test_destination_storage_with_role(
-        destination_root.path(),
-        "cancel-recovery-registration-destination",
-    )?;
-    let registrar = Arc::new(BlockingRecoveryRegistrar::new());
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let request = transfer_request(
-        local_source(source_root.path())?,
-        destination,
-        cancel.clone(),
-    )?
-    .with_recovery(
-        Resumability::Enabled,
-        Some(recovery_provider(None, registrar.clone())),
-    );
-    let transferring = tokio::spawn(transfer(request));
-
-    tokio::time::timeout(Duration::from_secs(1), registrar.started.acquire())
-        .await
-        .map_err(io::Error::other)?
-        .map_err(io::Error::other)?
-        .forget();
-    cancel.cancel();
-    registrar.acknowledge.add_permits(1);
-
-    let Err(error) = transferring.await? else {
-        return Err("cancelled recovery registration unexpectedly transferred payload".into());
-    };
-    assert_eq!(error.phase(), TransferPhase::RecoveryRegistration);
-    assert_eq!(error.side(), TransferSide::Orchestration);
-    assert_eq!(destination_role.write_completion_count(), 0);
-    assert!(error.has_recoverable_stage());
-    assert!(!destination_root.path().join("final.bin").exists());
-    error.discard_stage().await?;
     Ok(())
 }
 
@@ -915,7 +487,7 @@ async fn streaming_transfer_uses_one_source_stream_with_inflight_reads()
         InflightLimits::new(4, CHUNK_BYTES, 4)?,
         tokio_util::sync::CancellationToken::new(),
     )
-    .with_recovery(Resumability::Disabled, None);
+    .with_transfer_policy(TransferPolicy::AtomicReplace);
 
     transfer(request).await?;
 
@@ -973,60 +545,6 @@ async fn verification_mismatch_fast_fails_without_changing_final()
     error.discard_stage().await?;
     Ok(())
 }
-
-#[tokio::test]
-async fn existing_destination_policies_are_enforced_at_publication()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("policy-source")?;
-    std::fs::write(source_root.path().join("source.bin"), b"same-content")?;
-
-    let skip_root = TestRoot::new("policy-skip")?;
-    std::fs::write(skip_root.path().join("final.bin"), b"same-content")?;
-    std::fs::write(skip_root.path().join("replacement.bin"), b"raced-content")?;
-    let (skip_destination, skip_role) =
-        test_destination_storage_with_role(skip_root.path(), "policy-skip-destination")?;
-    skip_role.replace_final_during_skip();
-    let skip = transfer(
-        transfer_request(
-            local_source(source_root.path())?,
-            skip_destination,
-            tokio_util::sync::CancellationToken::new(),
-        )?
-        .with_existing_destination_policy(ExistingDestinationPolicy::VerifyOrSkip),
-    )
-    .await?;
-    assert_eq!(skip.disposition, PublicationDisposition::ExistingEquivalent);
-    assert_eq!(
-        std::fs::read(skip_root.path().join("final.bin"))?,
-        b"same-content"
-    );
-    assert_eq!(staging_entry_count(skip_root.path())?, 0);
-
-    let conflict_root = TestRoot::new("policy-conflict")?;
-    std::fs::write(conflict_root.path().join("final.bin"), b"keep")?;
-    let result = transfer(
-        transfer_request(
-            local_source(source_root.path())?,
-            local_destination(conflict_root.path())?,
-            tokio_util::sync::CancellationToken::new(),
-        )?
-        .with_existing_destination_policy(ExistingDestinationPolicy::FailIfExists),
-    )
-    .await;
-    let Err(error) = result else {
-        return Err("FailIfExists unexpectedly replaced an existing final".into());
-    };
-    assert_eq!(error.phase(), TransferPhase::Publish);
-    assert!(!error.has_recoverable_stage());
-    assert!(error.has_unpublished_stage());
-    assert_eq!(
-        std::fs::read(conflict_root.path().join("final.bin"))?,
-        b"keep"
-    );
-    error.discard_stage().await?;
-    Ok(())
-}
-
 #[tokio::test]
 async fn failure_after_atomic_publication_reports_changed_final_not_recoverable_stage()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1059,52 +577,6 @@ async fn failure_after_atomic_publication_reports_changed_final_not_recoverable_
     assert_eq!(staging_entry_count(destination_root.path())?, 0);
     Ok(())
 }
-
-#[tokio::test]
-async fn cancellation_during_existing_final_verification_preserves_stage_and_final()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("skip-cancel-source")?;
-    let destination_root = TestRoot::new("skip-cancel-destination")?;
-    let payload = vec![0x41; 8 * 1024 * 1024];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
-    std::fs::write(destination_root.path().join("final.bin"), &payload)?;
-    let (destination, role) =
-        test_destination_storage_with_role(destination_root.path(), "skip-cancel-destination")?;
-    role.slow_existing_verify();
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let request = recoverable_request(
-        transfer_request(
-            local_source(source_root.path())?,
-            destination,
-            cancel.clone(),
-        )?
-        .with_existing_destination_policy(ExistingDestinationPolicy::VerifyOrSkip),
-        None,
-    );
-    let task = tokio::spawn(transfer(request));
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while !role.existing_verify_started() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await?;
-    cancel.cancel();
-
-    let result = task.await?;
-    let Err(error) = result else {
-        return Err("cancelled existing-final verification unexpectedly succeeded".into());
-    };
-    assert_eq!(error.phase(), TransferPhase::Publish);
-    assert!(!error.final_destination_changed());
-    assert!(error.has_recoverable_stage());
-    assert_eq!(
-        std::fs::read(destination_root.path().join("final.bin"))?,
-        payload
-    );
-    error.discard_stage().await?;
-    Ok(())
-}
-
 #[tokio::test]
 async fn enabled_identity_reuses_a_reobserved_complete_local_prefix()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1115,23 +587,17 @@ async fn enabled_identity_reuses_a_reobserved_complete_local_prefix()
     std::fs::write(destination_root.path().join("final.bin"), b"existing")?;
     let (destination, role) =
         test_destination_storage_with_role(destination_root.path(), "transfer-destination")?;
-    let first = transfer(recoverable_request(
+    role.set_automatic_checkpoint_interval(64 * 1024);
+    let first = run_until_transferred(recoverable_request(
         transfer_request(
             local_source(source_root.path())?,
             destination.clone(),
             tokio_util::sync::CancellationToken::new(),
-        )?
-        .with_existing_destination_policy(ExistingDestinationPolicy::FailIfExists),
+        )?,
         None,
     ))
-    .await;
-    let Err(first_failure) = first else {
-        return Err("FailIfExists unexpectedly published".into());
-    };
-    let identity = first_failure
-        .into_recovery_identity()
-        .await
-        .map_err(|(_, error)| error)?;
+    .await?;
+    drop(first);
     let writes_before_resume = role.write_completion_count();
 
     let outcome = transfer(recoverable_request(
@@ -1140,7 +606,7 @@ async fn enabled_identity_reuses_a_reobserved_complete_local_prefix()
             destination,
             tokio_util::sync::CancellationToken::new(),
         )?,
-        Some(identity),
+        None,
     ))
     .await?;
 
@@ -1155,124 +621,6 @@ async fn enabled_identity_reuses_a_reobserved_complete_local_prefix()
 }
 
 #[tokio::test]
-async fn disabled_resumability_rejects_identity_before_destination_mutation()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("disabled-identity-source")?;
-    let destination_root = TestRoot::new("disabled-identity-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), b"payload")?;
-    let identity = RecoveryIdentity::from_bytes(bytes::Bytes::from_static(b"stale-stage"))?;
-
-    let result = transfer(
-        transfer_request(
-            local_source(source_root.path())?,
-            local_destination(destination_root.path())?,
-            tokio_util::sync::CancellationToken::new(),
-        )?
-        .with_recovery(
-            Resumability::Disabled,
-            Some(recovery_provider(
-                Some(identity),
-                Arc::new(AcceptingRecoveryRegistrar),
-            )),
-        ),
-    )
-    .await;
-
-    let Err(error) = result else {
-        return Err("disabled resumability unexpectedly accepted a recovery identity".into());
-    };
-    assert_eq!(error.phase(), TransferPhase::Preflight);
-    assert!(!destination_root.path().join(".data-mover-staging").exists());
-    Ok(())
-}
-
-#[tokio::test]
-async fn disabled_resumability_rejects_provider_before_destination_mutation()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("disabled-provider-source")?;
-    let destination_root = TestRoot::new("disabled-provider-destination")?;
-    std::fs::write(source_root.path().join("source.bin"), b"payload")?;
-
-    let result = transfer(
-        transfer_request(
-            local_source(source_root.path())?,
-            local_destination(destination_root.path())?,
-            tokio_util::sync::CancellationToken::new(),
-        )?
-        .with_recovery(
-            Resumability::Disabled,
-            Some(recovery_provider(
-                None,
-                Arc::new(AcceptingRecoveryRegistrar),
-            )),
-        ),
-    )
-    .await;
-
-    let Err(error) = result else {
-        return Err("disabled resumability unexpectedly accepted a provider".into());
-    };
-    assert_eq!(error.phase(), TransferPhase::Preflight);
-    assert!(!destination_root.path().join(".data-mover-staging").exists());
-    assert!(!destination_root.path().join("final.bin").exists());
-    Ok(())
-}
-
-#[tokio::test]
-async fn invalid_recovery_identity_is_never_deleted_or_restarted_silently()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("orphan-source")?;
-    let destination_root = TestRoot::new("orphan-destination")?;
-    let payload = vec![0x70; 128 * 1024];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
-    std::fs::write(destination_root.path().join("final.bin"), b"existing")?;
-    let first = transfer(recoverable_request(
-        transfer_request(
-            local_source(source_root.path())?,
-            local_destination(destination_root.path())?,
-            tokio_util::sync::CancellationToken::new(),
-        )?
-        .with_existing_destination_policy(ExistingDestinationPolicy::FailIfExists),
-        None,
-    ))
-    .await;
-    let Err(first_failure) = first else {
-        return Err("initial staged transfer unexpectedly published".into());
-    };
-    let identity = first_failure
-        .into_recovery_identity()
-        .await
-        .map_err(|(_, error)| error)?;
-    let mut tampered = identity.as_bytes().to_vec();
-    tampered[8] ^= 0x80;
-    let tampered = RecoveryIdentity::from_bytes(bytes::Bytes::from(tampered))?;
-    let entries_before = staging_entry_count(destination_root.path())?;
-
-    let result = transfer(recoverable_request(
-        transfer_request(
-            local_source(source_root.path())?,
-            local_destination(destination_root.path())?,
-            tokio_util::sync::CancellationToken::new(),
-        )?,
-        Some(tampered.clone()),
-    ))
-    .await;
-    let Err(failure) = result else {
-        return Err("tampered recovery identity unexpectedly succeeded".into());
-    };
-    assert_eq!(failure.phase(), TransferPhase::Prepare);
-    assert_eq!(
-        staging_entry_count(destination_root.path())?,
-        entries_before
-    );
-    assert_eq!(
-        std::fs::read(destination_root.path().join("final.bin"))?,
-        b"existing"
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("partial-resume-source")?;
@@ -1283,6 +631,7 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
     let second_read = source_role.gate_read_at(64 * 1024);
     let (destination, destination_role) =
         test_destination_storage_with_role(destination_root.path(), "transfer-destination")?;
+    destination_role.set_automatic_checkpoint_interval(64 * 1024);
     let cancel = tokio_util::sync::CancellationToken::new();
     let request = recoverable_request(
         transfer_request(source, destination.clone(), cancel.clone())?,
@@ -1302,10 +651,7 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
     let Err(failure) = result else {
         return Err("partially cancelled transfer unexpectedly succeeded".into());
     };
-    let recovery = failure
-        .into_recovery_identity()
-        .await
-        .map_err(|(_, error)| error)?;
+    drop(failure);
     let writes_before = destination_role.write_completion_count();
     assert_eq!(writes_before, 1);
     let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 64 * 1024, None)?);
@@ -1317,7 +663,7 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
                 destination,
                 tokio_util::sync::CancellationToken::new(),
             )?,
-            Some(recovery),
+            None,
         )
         .with_source_qos(qos),
     )
@@ -1336,162 +682,150 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
     );
     Ok(())
 }
-
 #[tokio::test]
-async fn explicitly_discarded_stage_is_reuploaded_from_zero()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("restart-policy-source")?;
-    let destination_root = TestRoot::new("restart-policy-destination")?;
-    let payload = vec![0x29; 2 * 64 * 1024];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
-    std::fs::write(destination_root.path().join("final.bin"), b"existing")?;
-    let (destination, role) =
-        test_destination_storage_with_role(destination_root.path(), "transfer-destination")?;
-    let first = transfer(recoverable_request(
-        transfer_request(
-            local_source(source_root.path())?,
-            destination.clone(),
-            tokio_util::sync::CancellationToken::new(),
-        )?
-        .with_existing_destination_policy(ExistingDestinationPolicy::FailIfExists),
-        None,
-    ))
-    .await;
-    let Err(failure) = first else {
-        return Err("initial restart fixture unexpectedly published".into());
-    };
-    failure.discard_stage().await?;
-    let writes_before = role.write_completion_count();
-
-    let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 64 * 1024, None)?);
-    let outcome = transfer(
-        recoverable_request(
-            transfer_request(
-                local_source(source_root.path())?,
-                destination,
-                tokio_util::sync::CancellationToken::new(),
-            )?,
+async fn recovery_restarts_after_same_size_source_edit() -> Result<(), Box<dyn std::error::Error>> {
+    for verification in [
+        super::ReadBackVerification::Enabled,
+        super::ReadBackVerification::Disabled,
+    ] {
+        let source_root = TestRoot::new("changed-resume-source")?;
+        let destination_root = TestRoot::new("changed-resume-destination")?;
+        let path = source_root.path().join("source.bin");
+        let payload = vec![0x73; 3 * 64 * 1024];
+        std::fs::write(&path, &payload)?;
+        let original_mtime = std::fs::metadata(&path)?.modified()?;
+        let (source, source_role) = test_source_storage(source_root.path(), "transfer-source")?;
+        let second_read = source_role.gate_read_at(64 * 1024);
+        let (destination, destination_role) =
+            test_destination_storage_with_role(destination_root.path(), "transfer-destination")?;
+        destination_role.set_automatic_checkpoint_interval(64 * 1024);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let request = recoverable_request(
+            transfer_request(source, destination.clone(), cancel.clone())?,
             None,
         )
-        .with_source_qos(qos),
+        .with_read_back_verification(verification);
+        let task = tokio::spawn(transfer(request));
+        second_read.wait_started().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while destination_role.write_completion_count() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        cancel.cancel();
+        second_read.release();
+        assert!(task.await?.is_err());
+        let writes_before = destination_role.write_completion_count();
+        assert_eq!(writes_before, 1);
+
+        // Keep the inode and length, and on Unix restore mtime to exercise ctime.
+        let replacement = vec![0xa5; payload.len()];
+        std::fs::write(&path, &replacement)?;
+        #[cfg(unix)]
+        std::fs::File::options()
+            .write(true)
+            .open(&path)?
+            .set_modified(original_mtime)?;
+        #[cfg(not(unix))]
+        let _ = original_mtime;
+        transfer(
+            recoverable_request(
+                transfer_request(
+                    local_source(source_root.path())?,
+                    destination,
+                    tokio_util::sync::CancellationToken::new(),
+                )?,
+                None,
+            )
+            .with_read_back_verification(verification),
+        )
+        .await?;
+        assert_eq!(destination_role.write_completion_count() - writes_before, 3);
+        assert_eq!(
+            std::fs::read(destination_root.path().join("final.bin"))?,
+            replacement
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn quick_discards_persisted_stage_before_reupload() -> Result<(), Box<dyn std::error::Error>>
+{
+    let source_root = TestRoot::new("restart-cleans-source")?;
+    let destination_root = TestRoot::new("restart-cleans-destination")?;
+    let payload = vec![0x39; 2 * 64 * 1024 + 1];
+    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    let source = local_source(source_root.path())?;
+    let destination = local_destination(destination_root.path())?;
+    let checkpointed = recoverable_request(
+        transfer_request(
+            source.clone(),
+            destination.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        )?,
+        None,
+    );
+
+    let staged = run_until_transferred(checkpointed).await?;
+    drop(staged);
+    assert!(staging_entry_count(destination_root.path())? > 0);
+
+    let outcome = transfer(
+        transfer_request(
+            source,
+            destination,
+            tokio_util::sync::CancellationToken::new(),
+        )?
+        .with_transfer_policy(TransferPolicy::AtomicReplace),
     )
     .await?;
 
-    assert_eq!(role.write_completion_count() - writes_before, 2);
-    assert_eq!(
-        outcome.source_qos.client_streamed_shaped_bytes,
-        payload.len() as u64
-    );
-    assert_eq!(outcome.source_qos.source_read_operations, 2);
-    assert_eq!(staging_entry_count(destination_root.path())?, 0);
+    assert_eq!(outcome.recovery, super::engine::EffectiveRecovery::Disabled);
     assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,
         payload
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn recovery_binding_rejects_another_destination_instance_without_deletion()
--> Result<(), Box<dyn std::error::Error>> {
-    let source_root = TestRoot::new("cross-destination-source")?;
-    let destination_root = TestRoot::new("cross-destination-target")?;
-    let payload = vec![0x62; 128 * 1024];
-    std::fs::write(source_root.path().join("source.bin"), &payload)?;
-    std::fs::write(destination_root.path().join("final.bin"), b"existing")?;
-    let first = transfer(recoverable_request(
-        transfer_request(
-            local_source(source_root.path())?,
-            local_destination(destination_root.path())?,
-            tokio_util::sync::CancellationToken::new(),
-        )?
-        .with_existing_destination_policy(ExistingDestinationPolicy::FailIfExists),
-        None,
-    ))
-    .await;
-    let Err(failure) = first else {
-        return Err("cross-destination fixture unexpectedly published".into());
-    };
-    let recovery = failure
-        .into_recovery_identity()
-        .await
-        .map_err(|(_, error)| error)?;
-    let entries_before = staging_entry_count(destination_root.path())?;
-    let foreign = test_destination_storage(destination_root.path(), "different-destination")?;
-
-    let result = transfer(recoverable_request(
-        transfer_request(
-            local_source(source_root.path())?,
-            foreign,
-            tokio_util::sync::CancellationToken::new(),
-        )?,
-        Some(recovery.clone()),
-    ))
-    .await;
-    let Err(error) = result else {
-        return Err("foreign destination unexpectedly recovered stage".into());
-    };
-    assert_eq!(error.phase(), TransferPhase::Prepare);
-    assert_eq!(
-        staging_entry_count(destination_root.path())?,
-        entries_before
-    );
-
-    transfer(recoverable_request(
-        transfer_request(
-            local_source(source_root.path())?,
-            local_destination(destination_root.path())?,
-            tokio_util::sync::CancellationToken::new(),
-        )?,
-        Some(recovery),
-    ))
-    .await?;
     assert_eq!(staging_entry_count(destination_root.path())?, 0);
     Ok(())
 }
 
 #[tokio::test]
-async fn one_recovery_identity_can_have_only_one_active_local_claim()
+async fn one_recovery_binding_can_have_only_one_active_attempt()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("claim-source")?;
     let destination_root = TestRoot::new("claim-destination")?;
     let payload = vec![0x52; 1024 * 1024];
     std::fs::write(source_root.path().join("source.bin"), &payload)?;
     std::fs::write(destination_root.path().join("final.bin"), b"existing")?;
-    let first = transfer(recoverable_request(
+    let first = run_until_transferred(recoverable_request(
         transfer_request(
             local_source(source_root.path())?,
             local_destination(destination_root.path())?,
             tokio_util::sync::CancellationToken::new(),
-        )?
-        .with_existing_destination_policy(ExistingDestinationPolicy::FailIfExists),
+        )?,
         None,
     ))
-    .await;
-    let Err(failure) = first else {
-        return Err("claim fixture unexpectedly published".into());
-    };
-    let recovery = failure
-        .into_recovery_identity()
-        .await
-        .map_err(|(_, error)| error)?;
+    .await?;
+    drop(first);
     let (source, source_role) = test_source_storage(source_root.path(), "transfer-source")?;
     source_role.delay_reads(std::time::Duration::from_millis(30));
     let first_request = recoverable_request(
         transfer_request(
             source.clone(),
-            test_destination_storage(destination_root.path(), "transfer-destination")?,
+            local_destination(destination_root.path())?,
             tokio_util::sync::CancellationToken::new(),
         )?,
-        Some(recovery.clone()),
+        None,
     );
     let second_request = recoverable_request(
         transfer_request(
             source,
-            test_destination_storage(destination_root.path(), "transfer-destination")?,
+            local_destination(destination_root.path())?,
             tokio_util::sync::CancellationToken::new(),
         )?,
-        Some(recovery),
+        None,
     );
 
     let (first_result, second_result) =
@@ -1505,7 +839,7 @@ async fn one_recovery_identity_can_have_only_one_active_local_claim()
     } else {
         return Err("both concurrent recoveries unexpectedly succeeded".into());
     };
-    assert_eq!(failure.phase(), TransferPhase::Prepare);
+    assert_eq!(failure.phase(), TransferPhase::RecoveryRegistration);
     assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,
         payload
@@ -1634,6 +968,54 @@ async fn cancellation_during_describe_stops_before_prepare()
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn copied_metadata_follows_the_described_source_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    const OLD_MODE: u32 = 0o640;
+    const REPLACEMENT_MODE: u32 = 0o604;
+    const REPLACEMENT_MTIME: i64 = 1_710_000_123;
+
+    let source_root = TestRoot::new("metadata-identity-source")?;
+    let destination_root = TestRoot::new("metadata-identity-destination")?;
+    let source_path = source_root.path().join("source.bin");
+    let replacement_path = source_root.path().join("replacement.bin");
+    std::fs::write(&source_path, b"old source")?;
+    std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(OLD_MODE))?;
+    std::fs::write(&replacement_path, b"replacement source")?;
+    std::fs::set_permissions(
+        &replacement_path,
+        std::fs::Permissions::from_mode(REPLACEMENT_MODE),
+    )?;
+    filetime::set_file_mtime(
+        &replacement_path,
+        filetime::FileTime::from_unix_time(REPLACEMENT_MTIME, 0),
+    )?;
+
+    let (source, source_role) =
+        test_source_storage(source_root.path(), "metadata-identity-source")?;
+    source_role.delay_description("source.bin", std::time::Duration::from_millis(200));
+    let request = transfer_request(
+        source,
+        local_destination(destination_root.path())?,
+        tokio_util::sync::CancellationToken::new(),
+    )?;
+    let task = tokio::spawn(transfer(request));
+    wait_for_description(&source_role).await?;
+    std::fs::rename(&replacement_path, &source_path)?;
+
+    let outcome = task.await??;
+    assert!(outcome.metadata.is_some());
+    let published_path = destination_root.path().join("final.bin");
+    assert_eq!(std::fs::read(&published_path)?, b"replacement source");
+    let metadata = std::fs::metadata(published_path)?;
+    assert_eq!(metadata.permissions().mode() & 0o7777, REPLACEMENT_MODE);
+    assert_eq!(metadata.mtime(), REPLACEMENT_MTIME);
+    Ok(())
+}
+
 #[tokio::test]
 async fn cancellation_during_source_read_preserves_unpublished_stage()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1665,20 +1047,28 @@ async fn cancellation_during_source_read_preserves_unpublished_stage()
     };
     assert_eq!(error.phase(), TransferPhase::Transfer);
     assert_eq!(error.side(), TransferSide::Source);
-    assert!(error.has_recoverable_stage());
+    assert!(!error.has_recoverable_stage());
     assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,
         b"old-final"
     );
-    assert!(destination_root.path().join(".data-mover-staging").exists());
+    assert!(staging_entry_count(destination_root.path())? > 0);
     error.discard_stage().await?;
     assert_eq!(staging_entry_count(destination_root.path())?, 0);
     Ok(())
 }
 
 fn staging_entry_count(root: &Path) -> io::Result<usize> {
-    std::fs::read_dir(root.join(".data-mover-staging"))?
-        .try_fold(0, |count, entry| entry.map(|_| count + 1))
+    std::fs::read_dir(root)?.try_fold(0, |count, entry| {
+        let entry = entry?;
+        Ok(count
+            + usize::from(
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".data-mover-"),
+            ))
+    })
 }
 
 fn transfer_request(
@@ -1696,20 +1086,11 @@ fn transfer_request(
         InflightLimits::new(2, 2 * 64 * 1024, 2)?,
         cancel,
     )
-    .with_recovery(Resumability::Disabled, None))
+    .with_transfer_policy(TransferPolicy::AtomicReplace))
 }
 
-fn recoverable_request(
-    request: TransferRequest,
-    identity: Option<RecoveryIdentity>,
-) -> TransferRequest {
-    request.with_recovery(
-        Resumability::Enabled,
-        Some(recovery_provider(
-            identity,
-            Arc::new(AcceptingRecoveryRegistrar),
-        )),
-    )
+fn recoverable_request(request: TransferRequest, _resume_marker: Option<()>) -> TransferRequest {
+    request.with_transfer_policy(TransferPolicy::Checkpointed)
 }
 
 async fn wait_for_read(source: &LocalReadSource) -> Result<(), Box<dyn std::error::Error>> {
@@ -1744,7 +1125,10 @@ fn local_source(root: &Path) -> Result<Storage, Box<dyn std::error::Error>> {
 }
 
 fn local_destination(root: &Path) -> Result<Storage, Box<dyn std::error::Error>> {
-    test_destination_storage(root, "transfer-destination")
+    let (storage, role) = test_destination_storage_with_role(root, "transfer-destination")?;
+    // Keep recovery fixtures small while exercising the deferred threshold path.
+    role.set_automatic_checkpoint_interval(64 * 1024);
+    Ok(storage)
 }
 
 struct TestRoot(PathBuf);
@@ -1771,3 +1155,6 @@ impl Drop for TestRoot {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+#[path = "local_optimization_tests.rs"]
+mod local_optimization;

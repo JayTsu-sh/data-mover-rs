@@ -58,6 +58,7 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             size: Some(facts.size),
             source_identity,
             backend_fact: None,
+            content_version: None,
         })
     }
 

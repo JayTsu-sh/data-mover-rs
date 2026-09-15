@@ -9,10 +9,10 @@ use tokio_util::sync::CancellationToken;
 use super::protocol::{HdfsProtocol, cancelled, entry_failure};
 use crate::model::{BackendIdentity, EntryKind, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{
-    ByteStream, CheckpointObservation, ExistingDestinationPolicy, FinalDestination, Metadata,
-    MetadataMutation, PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence,
-    PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity, StagedDestination,
-    StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    ByteStream, CheckpointObservation, FinalDestination, Metadata, MetadataMutation,
+    PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure,
+    PublishRequest, RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure,
+    VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 const STAGE_TOKEN_MAGIC: &[u8] = b"hdfs-stage-v1\0";
@@ -550,79 +550,15 @@ async fn publish(
         )));
     }
     let part = adapter.part(stage).map_err(publication_failure)?;
-    let disposition = match request.policy {
-        ExistingDestinationPolicy::Overwrite => {
-            adapter
-                .protocol
-                .rename(&part, stage.final_destination.path(), true)
-                .await
-                .map_err(publication_may_have_changed)?;
-            PublicationDisposition::Published
-        }
-        ExistingDestinationPolicy::FailIfExists => {
-            adapter
-                .protocol
-                .rename(&part, stage.final_destination.path(), false)
-                .await
-                .map_err(publication_may_have_changed)?;
-            PublicationDisposition::Published
-        }
-        ExistingDestinationPolicy::VerifyOrSkip => {
-            publish_or_skip(adapter, stage, &part, &request).await?
-        }
-    };
+    adapter
+        .protocol
+        .rename(&part, stage.final_destination.path(), true)
+        .await
+        .map_err(publication_may_have_changed)?;
     Ok(PublicationEvidence {
         final_destination: stage.final_destination.path().clone(),
-        disposition,
+        disposition: PublicationDisposition::Published,
     })
-}
-
-async fn publish_or_skip(
-    adapter: &HdfsStagedDestination,
-    stage: &PreparedStage,
-    part: &StoragePath,
-    request: &PublishRequest,
-) -> Result<PublicationDisposition, PublicationFailure> {
-    match adapter.protocol.stat(stage.final_destination.path()).await {
-        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
-            adapter
-                .protocol
-                .rename(part, stage.final_destination.path(), false)
-                .await
-                .map_err(publication_may_have_changed)?;
-            Ok(PublicationDisposition::Published)
-        }
-        Err(error) => Err(publication_failure(error)),
-        Ok(facts) if facts.size == Some(request.expected_size) => {
-            let digest = hash_file(
-                &*adapter.protocol,
-                stage.final_destination.path(),
-                stage.final_destination.path(),
-                request.expected_size,
-                &request.cancel,
-            )
-            .await
-            .map_err(publication_failure)?;
-            if digest != request.expected_blake3 {
-                return Err(publication_failure(failure(
-                    stage.final_destination.path(),
-                    Operation::Verify,
-                    FailureClass::Conflict,
-                )));
-            }
-            adapter
-                .protocol
-                .delete(part, EntryKind::File)
-                .await
-                .map_err(publication_failure)?;
-            Ok(PublicationDisposition::ExistingEquivalent)
-        }
-        Ok(_) => Err(publication_failure(failure(
-            stage.final_destination.path(),
-            Operation::Verify,
-            FailureClass::Conflict,
-        ))),
-    }
 }
 
 fn publication_failure(error: StorageRoleFailure) -> PublicationFailure {

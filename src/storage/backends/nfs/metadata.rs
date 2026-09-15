@@ -13,9 +13,11 @@ use crate::storage::{Metadata, MetadataMutation, StorageRoleFailure};
 
 pub(crate) struct NfsMetadataAdapter {
     protocol: Arc<dyn NfsMetadataProtocol>,
+    identity: crate::model::BackendIdentity,
 }
 
 pub(crate) struct NfsMetadataInline {
+    pub(crate) file_handle: bytes::Bytes,
     pub(crate) symlink: bool,
     pub(crate) uid: Option<u32>,
     pub(crate) gid: Option<u32>,
@@ -58,21 +60,24 @@ pub(crate) trait NfsMetadataProtocol: Send + Sync {
 }
 
 impl NfsMetadataAdapter {
-    pub(crate) fn new(protocol: Arc<dyn NfsMetadataProtocol>) -> Self {
-        Self { protocol }
+    pub(crate) fn new(
+        protocol: Arc<dyn NfsMetadataProtocol>,
+        identity: crate::model::BackendIdentity,
+    ) -> Self {
+        Self { protocol, identity }
     }
-}
 
-#[async_trait]
-impl Metadata for NfsMetadataAdapter {
-    async fn observe(
+    async fn observe_entry(
         &self,
         path: &StoragePath,
         plan: ObservationPlan,
+        entry: NfsMetadataInline,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
-        let entry = self.protocol.stat(path).await.map_err(|error| {
-            super::source::role_failure(path, crate::model::Operation::Metadata, error)
-        })?;
+        if plan.ownership_mode() == ObservationMode::Required
+            && (entry.uid.is_none() || entry.gid.is_none())
+        {
+            return Err(unsupported(path));
+        }
         let symlink = entry.symlink;
         let acl = if symlink {
             optional_not_applicable(plan.acl())
@@ -125,6 +130,61 @@ impl Metadata for NfsMetadataAdapter {
                 crate::model::Transience::Permanent,
             )
         })
+    }
+}
+
+#[async_trait]
+impl Metadata for NfsMetadataAdapter {
+    fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
+        Some(
+            ObservationPlan::default()
+                .with_ownership_mode(ObservationMode::Required)
+                .with_timestamps(ObservationMode::Required),
+        )
+    }
+
+    async fn observe_bound(
+        &self,
+        path: &StoragePath,
+        expected: &crate::model::SourceIdentity,
+        plan: ObservationPlan,
+    ) -> Result<MetadataObservations, StorageRoleFailure> {
+        let entry = self.protocol.stat(path).await.map_err(|error| {
+            super::source::role_failure(path, crate::model::Operation::Metadata, error)
+        })?;
+        let observed = crate::model::SourceIdentity::new(
+            self.identity.clone(),
+            crate::model::IdentityStrength::StableWithinBackend,
+            &entry.file_handle,
+        )
+        .map_err(|_| {
+            super::source::entry_failure(
+                path,
+                crate::model::Operation::Metadata,
+                crate::model::FailureClass::Protocol,
+                crate::model::Transience::Permanent,
+            )
+        })?;
+        if observed != *expected {
+            return Err(super::source::entry_failure(
+                path,
+                crate::model::Operation::Metadata,
+                crate::model::FailureClass::Conflict,
+                crate::model::Transience::Permanent,
+            ));
+        }
+        self.observe_entry(path, plan, entry).await
+    }
+
+    async fn observe(
+        &self,
+        path: &StoragePath,
+        plan: ObservationPlan,
+    ) -> Result<MetadataObservations, StorageRoleFailure> {
+        let entry = self.protocol.stat(path).await.map_err(|error| {
+            super::source::role_failure(path, crate::model::Operation::Metadata, error)
+        })?;
+        self.observe_entry(path, plan, entry).await
     }
 
     async fn apply(
@@ -275,7 +335,17 @@ mod tests {
     #[async_trait]
     impl NfsMetadataProtocol for CancellingProtocol {
         async fn stat(&self, _path: &StoragePath) -> Result<NfsMetadataInline, NfsProtocolFailure> {
-            Err(NfsProtocolFailure::protocol())
+            self.sets.fetch_add(1, Ordering::SeqCst);
+            Ok(NfsMetadataInline {
+                file_handle: bytes::Bytes::from_static(b"source-handle"),
+                symlink: false,
+                uid: Some(12345),
+                gid: Some(12346),
+                mode: 0o640,
+                atime: 1_700_000_000_123_456_789,
+                mtime: 1_700_000_001_123_456_789,
+                ctime: 1_700_000_002_123_456_789,
+            })
         }
         fn supports_acl(&self) -> bool {
             true
@@ -321,6 +391,93 @@ mod tests {
             _value: TimestampMetadata,
         ) -> Result<(), NfsProtocolFailure> {
             Err(NfsProtocolFailure::protocol())
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_metadata_is_bound_to_the_described_handle() {
+        let protocol = Arc::new(CancellingProtocol {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            sets: AtomicUsize::new(0),
+            xattrs_supported: true,
+        });
+        let identity = crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "source")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let adapter = NfsMetadataAdapter::new(protocol.clone(), identity.clone());
+        let plan = adapter
+            .copied_metadata_observation_plan()
+            .unwrap_or_else(|| panic!("metadata observation plan must be present"));
+        let path = StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
+        for (handle, matches) in [
+            (b"source-handle".as_slice(), true),
+            (b"replaced-handle".as_slice(), false),
+        ] {
+            let expected = crate::model::SourceIdentity::new(
+                identity.clone(),
+                crate::model::IdentityStrength::StableWithinBackend,
+                handle,
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            let result = adapter.observe_bound(&path, &expected, plan).await;
+            if matches {
+                let observations = result.unwrap_or_else(|error| panic!("{error}"));
+                assert!(
+                    matches!(observations.ownership_mode(), MetadataObservation::Value { value, .. } if *value == OwnershipMode { uid: 12345, gid: 12346, mode: 0o640 })
+                );
+                assert!(
+                    matches!(observations.timestamps(), MetadataObservation::Value { value, .. } if value.modified.is_some_and(|modified| modified.unix_nanos() == 1_700_000_001_123_456_789))
+                );
+                assert!(matches!(
+                    observations.acl(),
+                    MetadataObservation::NotRequested
+                ));
+                assert!(matches!(
+                    observations.xattrs(),
+                    MetadataObservation::NotRequested
+                ));
+            } else {
+                assert!(
+                    matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict)
+                );
+            }
+        }
+        // One stat supplies both the handle and baseline attributes; no extra identity RPC.
+        assert_eq!(protocol.sets.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn automatic_metadata_does_not_substitute_root_for_unknown_ownership() {
+        let protocol = Arc::new(CancellingProtocol {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            sets: AtomicUsize::new(0),
+            xattrs_supported: true,
+        });
+        let identity = crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "source")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let adapter = NfsMetadataAdapter::new(protocol.clone(), identity);
+        let path = StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
+        for missing_uid in [true, false] {
+            let mut entry = protocol
+                .stat(&path)
+                .await
+                .unwrap_or_else(|_| panic!("stat failed"));
+            if missing_uid {
+                entry.uid = None;
+            } else {
+                entry.gid = None;
+            }
+            let result = adapter
+                .observe_entry(
+                    &path,
+                    adapter
+                        .copied_metadata_observation_plan()
+                        .unwrap_or_else(|| panic!("metadata observation plan must be present")),
+                    entry,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Unsupported)
+            );
         }
     }
 
@@ -390,7 +547,11 @@ mod tests {
             sets: AtomicUsize::new(0),
             xattrs_supported: true,
         });
-        let adapter = NfsMetadataAdapter::new(protocol.clone());
+        let adapter = NfsMetadataAdapter::new(
+            protocol.clone(),
+            crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "metadata-test")
+                .unwrap_or_else(|error| panic!("{error}")),
+        );
         let values = vec![
             ExtendedAttribute::new(b"one".to_vec(), b"1".to_vec())
                 .unwrap_or_else(|error| panic!("{error}")),

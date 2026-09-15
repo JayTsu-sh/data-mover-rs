@@ -3,19 +3,18 @@
 #[allow(dead_code)]
 mod engine;
 mod model;
+mod recovery_store;
 
-pub use crate::storage::ExistingDestinationPolicy;
-pub use crate::storage::RecoveryIdentity;
 pub use crate::storage::{SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError};
 pub use engine::{
-    ExpertDestinationRequest, ExpertDestinationSession, ExpertDestinationTransferred,
-    ExpertSourceEvidence, ExpertSourceOffer, ExpertSourcePayload, ExpertSourceRequest,
-    ExpertSourceSession, TransferFailure, TransferOutcome, TransferPhase, TransferSide, transfer,
+    EffectiveRecovery, ExpertDestinationRequest, ExpertDestinationSession,
+    ExpertDestinationTransferred, ExpertSourceEvidence, ExpertSourceOffer, ExpertSourcePayload,
+    ExpertSourceRequest, ExpertSourceSession, TransferFailure, TransferOutcome, TransferPhase,
+    TransferRoute, TransferSide, transfer,
 };
 pub use model::{
-    InflightLimits, PayloadShapingPolicy, RecoveryContext, RecoveryProvider, RecoveryRegistrar,
-    RecoveryRegistrationFailure, Resumability, TransferIdentity, TransferRequest,
-    TransferValueError,
+    InflightLimits, PayloadShapingPolicy, ReadBackVerification, TransferIdentity, TransferPolicy,
+    TransferRequest, TransferValueError,
 };
 
 #[cfg(test)]

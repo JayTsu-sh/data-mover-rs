@@ -29,7 +29,12 @@ use crate::storage::{
 /// reading only the missing suffix.
 const LOCAL_MAX_READ_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
-type LocalReadFuture = tokio::task::JoinHandle<(u64, u64, io::Result<Bytes>)>;
+type LocalReadFuture = tokio::task::JoinHandle<(
+    u64,
+    u64,
+    io::Result<Bytes>,
+    Option<crate::storage::ReadAdmission>,
+)>;
 
 /// One-open local source whose positional reads may complete out of order while the stream emits
 /// them in ascending offset order.
@@ -174,18 +179,25 @@ impl LocalReadSource {
 
 #[async_trait]
 impl ReadSource for LocalReadSource {
+    fn supports_read_budget(&self) -> bool {
+        true
+    }
     fn maximum_read_chunk_bytes(&self) -> usize {
         LOCAL_MAX_READ_CHUNK_BYTES
     }
 
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
-        let observed = self.observer.observe(path.clone()).await?;
+        let (observed, version) = self
+            .observer
+            .observe_versioned(path.clone(), crate::model::ObservationPlan::default())
+            .await?;
         Ok(SourceDescriptor {
             path: path.clone(),
             kind: observed.kind(),
             size: observed.size(),
             source_identity: observed.source_identity().clone(),
             backend_fact: None,
+            content_version: Some(version),
         })
     }
 
@@ -231,6 +243,7 @@ impl ReadSource for LocalReadSource {
             inflight: FuturesOrdered::new(),
             cancel: request.cancel,
             source_qos: request.source_qos,
+            budget: request.read_budget,
             #[cfg(test)]
             probe: Arc::clone(&self.probe),
         };
@@ -279,6 +292,7 @@ struct LocalReadState {
     inflight: FuturesOrdered<LocalReadFuture>,
     cancel: tokio_util::sync::CancellationToken,
     source_qos: Option<SourceQosBudget>,
+    budget: Option<crate::storage::ReadBudget>,
     #[cfg(test)]
     probe: Arc<ReadProbe>,
 }
@@ -300,7 +314,7 @@ async fn read_next_chunk(
     let joined = next
         .ok_or_else(|| failure(&state.path, FailureClass::Internal, Transience::Unknown))?
         .map_err(|_| failure(&state.path, FailureClass::Internal, Transience::Unknown))?;
-    let (start, requested, result) = joined;
+    let (start, requested, result, admission) = joined;
     if start != state.next_emit {
         return Err(failure(
             &state.path,
@@ -329,6 +343,9 @@ async fn read_next_chunk(
                 Transience::Permanent,
             )
         })?;
+    if let (Some(budget), Some(admission)) = (&state.budget, admission) {
+        budget.ready(start, admission);
+    }
     Ok(Some((bytes, state)))
 }
 
@@ -342,6 +359,29 @@ async fn fill_read_pipeline(state: &mut LocalReadState) -> Result<(), StorageRol
             ));
         }
         let requested = (state.end - state.next_issue).min(state.maximum_chunk_bytes as u64);
+        let admission = if let Some(budget) = &state.budget {
+            let Some(admission) = budget
+                .reserve(
+                    usize::try_from(requested).map_err(|_| {
+                        failure(
+                            &state.path,
+                            FailureClass::InvalidInput,
+                            Transience::Permanent,
+                        )
+                    })?,
+                    state.inflight.is_empty(),
+                )
+                .await
+                .map_err(|_| {
+                    failure(&state.path, FailureClass::Cancelled, Transience::Transient)
+                })?
+            else {
+                break;
+            };
+            Some(admission)
+        } else {
+            None
+        };
         let granted = if let Some(qos) = &state.source_qos {
             qos.admit_read(requested, &state.cancel)
                 .await
@@ -368,21 +408,24 @@ async fn fill_read_pipeline(state: &mut LocalReadState) -> Result<(), StorageRol
         let cancel = state.cancel.clone();
         #[cfg(test)]
         let probe = Arc::clone(&state.probe);
-        state.inflight.push_back(tokio::spawn(async move {
-            #[cfg(test)]
-            probe.before_read(start).await;
-            let read = tokio::task::spawn_blocking(move || read_file_range(&file, start..end));
-            let result = tokio::select! {
-                biased;
-                () = cancel.cancelled() => Err(io::Error::from(io::ErrorKind::Interrupted)),
-                joined = read => joined
-                    .map_err(io::Error::other)
-                    .and_then(std::convert::identity),
-            };
-            #[cfg(test)]
-            probe.after_read(start);
-            (start, granted, result)
-        }));
+        // Submit the blocking read immediately, including while later QoS admissions await.
+        // A second asynchronous task per chunk only adds scheduling and wakeups.
+        #[cfg(test)]
+        let runtime = tokio::runtime::Handle::current();
+        state
+            .inflight
+            .push_back(tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                runtime.block_on(probe.before_read(start));
+                let result = if cancel.is_cancelled() {
+                    Err(io::Error::from(io::ErrorKind::Interrupted))
+                } else {
+                    read_file_range(&file, start..end)
+                };
+                #[cfg(test)]
+                probe.after_read(start);
+                (start, granted, result, admission)
+            }));
         state.next_issue = end;
     }
     Ok(())
@@ -456,7 +499,10 @@ fn read_file_range(file: &std::fs::File, range: std::ops::Range<u64>) -> io::Res
     let mut output = vec![0_u8; length];
     let mut read = 0;
     while read < length {
+        #[cfg(unix)]
         let count = file.read_at(&mut output[read..], range.start + read as u64)?;
+        #[cfg(windows)]
+        let count = file.seek_read(&mut output[read..], range.start + read as u64)?;
         if count == 0 {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
         }

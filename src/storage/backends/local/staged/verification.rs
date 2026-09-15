@@ -21,7 +21,15 @@ pub(super) fn verify_local(
     options.read(true);
     #[cfg(test)]
     options.write(true);
-    let mut file = staging.open_with(name, &options)?.into_std();
+    let file = staging.open_with(name, &options)?.into_std();
+    verify_file(file, request, probe)
+}
+
+pub(super) fn verify_file(
+    mut file: std::fs::File,
+    request: &VerifyRequest,
+    probe: &WriteProbe,
+) -> io::Result<VerificationEvidence> {
     #[cfg(test)]
     if probe.corrupt_before_verify.swap(false, Ordering::SeqCst) {
         #[cfg(unix)]
@@ -32,7 +40,7 @@ pub(super) fn verify_local(
     #[cfg(not(test))]
     let _ = probe;
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; request.expected_size.clamp(1, 1024 * 1024) as usize];
     let mut verified_bytes = 0_u64;
     loop {
         if request.cancel.is_cancelled() {

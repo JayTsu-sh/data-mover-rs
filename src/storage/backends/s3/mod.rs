@@ -399,6 +399,7 @@ pub(crate) mod tests {
                 expected_source: Some(descriptor.clone().source_identity),
                 maximum_chunk_bytes: 1024 * 1024,
                 read_inflight: 4,
+                read_budget: None,
                 cancel: CancellationToken::new(),
                 source_qos: None,
             })
@@ -440,7 +441,6 @@ pub(crate) mod tests {
             .publish(
                 &stage,
                 PublishRequest {
-                    policy: crate::storage::ExistingDestinationPolicy::Overwrite,
                     expected_size: payload.len() as u64,
                     expected_blake3: digest,
                     cancel: CancellationToken::new(),
@@ -537,6 +537,7 @@ pub(crate) mod tests {
                     size: None,
                     source_identity,
                     backend_fact: None,
+                    content_version: None,
                 },
                 recovery_binding: [9; 32],
             })
@@ -579,6 +580,7 @@ pub(crate) mod tests {
                 expected_source: None,
                 maximum_chunk_bytes: 1024 * 1024,
                 read_inflight: 4,
+                read_budget: None,
                 cancel,
                 source_qos: None,
             })
@@ -599,7 +601,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn destination_head_session_failure_never_means_absent()
+    async fn overwrite_publication_does_not_head_the_existing_destination()
     -> Result<(), Box<dyn std::error::Error>> {
         let protocol = Arc::new(MemoryS3::default());
         let storage = connect(protocol.clone(), identity(), Some(native_context()))?;
@@ -619,6 +621,7 @@ pub(crate) mod tests {
                     size: Some(7),
                     source_identity,
                     backend_fact: None,
+                    content_version: None,
                 },
                 recovery_binding: [4; 32],
             })
@@ -642,22 +645,21 @@ pub(crate) mod tests {
             .publish(
                 &stage,
                 PublishRequest {
-                    policy: crate::storage::ExistingDestinationPolicy::Overwrite,
                     expected_size: payload.len() as u64,
                     expected_blake3: *blake3::hash(&payload).as_bytes(),
                     cancel: CancellationToken::new(),
                 },
             )
             .await;
-        let Err(failure) = result else {
-            panic!("session failure allowed publication")
-        };
-        assert!(matches!(
-            failure.error,
-            crate::storage::StorageRoleFailure::Session(_)
-        ));
-        assert!(!failure.final_destination_changed);
-        assert!(!protocol.objects.lock().await.contains_key("final"));
+        let publication = result.map_err(|failure| failure.error)?;
+        assert_eq!(
+            publication.disposition,
+            crate::storage::PublicationDisposition::Published
+        );
+        assert_eq!(
+            protocol.objects.lock().await.get("final").cloned(),
+            Some(payload)
+        );
         Ok(())
     }
 
@@ -680,6 +682,7 @@ pub(crate) mod tests {
                 b"stable-source",
             )?,
             backend_fact: None,
+            content_version: None,
         };
         let prepare = PrepareRequest {
             final_destination: FinalDestination::new(final_path.clone()),
@@ -766,7 +769,6 @@ pub(crate) mod tests {
             .publish(
                 &resumed,
                 PublishRequest {
-                    policy: crate::storage::ExistingDestinationPolicy::Overwrite,
                     expected_size: full.len() as u64,
                     expected_blake3: digest,
                     cancel: CancellationToken::new(),
@@ -808,6 +810,7 @@ pub(crate) mod tests {
                         b"source",
                     )?,
                     backend_fact: None,
+                    content_version: None,
                 },
                 recovery_binding: [2; 32],
             })
@@ -824,7 +827,6 @@ pub(crate) mod tests {
             .publish(
                 &stage,
                 PublishRequest {
-                    policy: crate::storage::ExistingDestinationPolicy::Overwrite,
                     expected_size: payload.len() as u64,
                     expected_blake3: digest,
                     cancel: CancellationToken::new(),

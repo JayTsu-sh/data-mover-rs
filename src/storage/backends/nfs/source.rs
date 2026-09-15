@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt as _;
+use futures::stream::FuturesOrdered;
 
 use crate::model::{
     BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass,
@@ -9,13 +11,14 @@ use crate::model::{
 };
 use crate::storage::{ByteStream, ReadRequest, ReadSource, SourceDescriptor, StorageRoleFailure};
 
-const MAX_ROLE_READ: u64 = 1024 * 1024;
+const MAX_ROLE_READ: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct NfsSourceObservation {
     pub(crate) kind: EntryKind,
     pub(crate) size: Option<u64>,
     pub(crate) file_handle: Bytes,
+    pub(crate) content_version: Bytes,
 }
 
 #[derive(Clone, Copy)]
@@ -34,12 +37,15 @@ impl NfsProtocolFailure {
 }
 
 #[async_trait]
-pub(crate) trait NfsReadCursor: Send {
-    async fn read_at(&mut self, offset: u64, count: usize) -> Result<Bytes, NfsProtocolFailure>;
+pub(crate) trait NfsReadCursor: Send + Sync {
+    async fn read_at(&self, offset: u64, count: usize) -> Result<Bytes, NfsProtocolFailure>;
 }
 
 #[async_trait]
 pub(crate) trait NfsSourceProtocol: Send + Sync {
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        MAX_ROLE_READ
+    }
     async fn describe(
         &self,
         path: &StoragePath,
@@ -92,14 +98,18 @@ impl NfsReadSourceAdapter {
             size: observed.size,
             source_identity,
             backend_fact: None,
+            content_version: Some(observed.content_version),
         })
     }
 }
 
 #[async_trait]
 impl ReadSource for NfsReadSourceAdapter {
+    fn supports_read_budget(&self) -> bool {
+        true
+    }
     fn maximum_read_chunk_bytes(&self) -> usize {
-        usize::try_from(MAX_ROLE_READ).unwrap_or(usize::MAX)
+        self.protocol.maximum_read_chunk_bytes().max(1)
     }
 
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
@@ -118,8 +128,10 @@ impl ReadSource for NfsReadSourceAdapter {
                 Transience::Permanent,
             ));
         }
-        let observed = self.descriptor(&request.path).await?;
-        let range = request.range.unwrap_or(
+        let range = if let Some(range) = request.range {
+            range
+        } else {
+            let observed = self.descriptor(&request.path).await?;
             0..observed.size.ok_or_else(|| {
                 entry_failure(
                     &request.path,
@@ -127,8 +139,8 @@ impl ReadSource for NfsReadSourceAdapter {
                     FailureClass::Unsupported,
                     Transience::Permanent,
                 )
-            })?,
-        );
+            })?
+        };
         if range.end < range.start {
             return Err(entry_failure(
                 &request.path,
@@ -168,60 +180,147 @@ impl ReadSource for NfsReadSourceAdapter {
             ));
         }
         let state = ReadState {
-            cursor,
+            cursor: Arc::from(cursor),
             path: request.path,
-            next: range.start,
+            next_issue: range.start,
+            next_emit: range.start,
             end: range.end,
-            maximum_chunk_bytes: request.maximum_chunk_bytes,
+            maximum_chunk_bytes: request
+                .maximum_chunk_bytes
+                .min(self.protocol.maximum_read_chunk_bytes().max(1)),
+            read_concurrency: request.read_inflight,
+            inflight: FuturesOrdered::new(),
             cancel: request.cancel,
             qos: request.source_qos,
+            budget: request.read_budget,
         };
         Ok(Box::pin(futures::stream::try_unfold(state, read_next)))
     }
 }
 
 struct ReadState {
-    cursor: Box<dyn NfsReadCursor>,
+    cursor: Arc<dyn NfsReadCursor>,
     path: StoragePath,
-    next: u64,
+    next_issue: u64,
+    next_emit: u64,
     end: u64,
     maximum_chunk_bytes: usize,
+    read_concurrency: usize,
+    inflight: FuturesOrdered<NfsReadFuture>,
     cancel: tokio_util::sync::CancellationToken,
     qos: Option<crate::storage::SourceQosBudget>,
+    budget: Option<crate::storage::ReadBudget>,
+}
+
+type NfsReadFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = (
+                    u64,
+                    usize,
+                    Result<Bytes, NfsProtocolFailure>,
+                    Option<crate::storage::ReadAdmission>,
+                ),
+            > + Send,
+    >,
+>;
+
+async fn fill_read_pipeline(state: &mut ReadState) -> Result<(), StorageRoleFailure> {
+    while state.inflight.len() < state.read_concurrency && state.next_issue < state.end {
+        if state.cancel.is_cancelled() {
+            return Err(cancelled(&state.path));
+        }
+        let requested = (state.end - state.next_issue).min(state.maximum_chunk_bytes as u64);
+        let admission = if let Some(budget) = &state.budget {
+            let Some(admission) = budget
+                .reserve(
+                    usize::try_from(requested).map_err(|_| {
+                        entry_failure(
+                            &state.path,
+                            Operation::Read,
+                            FailureClass::InvalidInput,
+                            Transience::Permanent,
+                        )
+                    })?,
+                    state.inflight.is_empty(),
+                )
+                .await
+                .map_err(|_| cancelled(&state.path))?
+            else {
+                break;
+            };
+            Some(admission)
+        } else {
+            None
+        };
+        let granted = if let Some(qos) = &state.qos {
+            qos.admit_read(requested, &state.cancel)
+                .await
+                .map_err(|_| cancelled(&state.path))?
+        } else {
+            requested
+        };
+        let count = usize::try_from(granted).map_err(|_| {
+            entry_failure(
+                &state.path,
+                Operation::Read,
+                FailureClass::InvalidInput,
+                Transience::Permanent,
+            )
+        })?;
+        let offset = state.next_issue;
+        let cursor = Arc::clone(&state.cursor);
+        let cancel = state.cancel.clone();
+        state.inflight.push_back(Box::pin(async move {
+            let result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(NfsProtocolFailure {
+                    class: FailureClass::Cancelled,
+                    transience: Transience::Transient,
+                }),
+                result = cursor.read_at(offset, count) => result,
+            };
+            (offset, count, result, admission)
+        }));
+        state.next_issue = state.next_issue.checked_add(granted).ok_or_else(|| {
+            entry_failure(
+                &state.path,
+                Operation::Read,
+                FailureClass::InvalidInput,
+                Transience::Permanent,
+            )
+        })?;
+    }
+    Ok(())
 }
 
 async fn read_next(mut state: ReadState) -> Result<Option<(Bytes, ReadState)>, StorageRoleFailure> {
-    if state.next == state.end {
+    fill_read_pipeline(&mut state).await?;
+    if state.inflight.is_empty() {
         return Ok(None);
     }
-    if state.cancel.is_cancelled() {
-        return Err(cancelled(&state.path));
-    }
-    let requested = (state.end - state.next)
-        .min(MAX_ROLE_READ)
-        .min(state.maximum_chunk_bytes as u64);
-    let granted = if let Some(qos) = &state.qos {
-        qos.admit_read(requested, &state.cancel)
-            .await
-            .map_err(|_| cancelled(&state.path))?
-    } else {
-        requested
+    let next = tokio::select! {
+        biased;
+        () = state.cancel.cancelled() => return Err(cancelled(&state.path)),
+        result = state.inflight.next() => result,
     };
-    let count = usize::try_from(granted).map_err(|_| {
+    let (offset, count, result, admission) = next.ok_or_else(|| {
         entry_failure(
             &state.path,
             Operation::Read,
-            FailureClass::InvalidInput,
-            Transience::Permanent,
+            FailureClass::Internal,
+            Transience::Unknown,
         )
     })?;
-    let bytes = tokio::select! {
-        biased;
-        () = state.cancel.cancelled() => return Err(cancelled(&state.path)),
-        result = state.cursor.read_at(state.next, count) => {
-            result.map_err(|error| role_failure(&state.path, Operation::Read, error))?
-        }
-    };
+    if offset != state.next_emit {
+        return Err(entry_failure(
+            &state.path,
+            Operation::Read,
+            FailureClass::Internal,
+            Transience::Unknown,
+        ));
+    }
+    let bytes = result.map_err(|error| role_failure(&state.path, Operation::Read, error))?;
     if bytes.len() != count {
         return Err(entry_failure(
             &state.path,
@@ -233,7 +332,20 @@ async fn read_next(mut state: ReadState) -> Result<Option<(Bytes, ReadState)>, S
     if let Some(qos) = &state.qos {
         qos.record_read_bytes(bytes.len() as u64);
     }
-    state.next += bytes.len() as u64;
+    state.next_emit = state
+        .next_emit
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| {
+            entry_failure(
+                &state.path,
+                Operation::Read,
+                FailureClass::InvalidInput,
+                Transience::Permanent,
+            )
+        })?;
+    if let (Some(budget), Some(admission)) = (&state.budget, admission) {
+        budget.ready(offset, admission);
+    }
     Ok(Some((bytes, state)))
 }
 

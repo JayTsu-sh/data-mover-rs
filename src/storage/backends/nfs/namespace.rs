@@ -73,6 +73,7 @@ impl Namespace for NfsNamespaceAdapter {
                     .map_err(|error| role_failure(&path, Operation::Namespace, error))?;
                 let values = entries
                     .iter()
+                    .filter(|entry| !is_internal(&entry.path))
                     .map(|entry| descriptor(&self.identity, entry.path.clone(), entry))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(NamespaceResult::Entries(values))
@@ -135,6 +136,7 @@ fn descriptor(
         size: entry.size,
         source_identity,
         backend_fact: None,
+        content_version: None,
     })
 }
 
@@ -148,6 +150,7 @@ fn checked(path: &StoragePath) -> Result<PathBuf, StorageRoleFailure> {
 fn checked_allow_root(path: &StoragePath) -> Result<PathBuf, StorageRoleFailure> {
     let native = PathBuf::from(path.as_str());
     if native.is_absolute()
+        || is_internal(path)
         || native.components().any(|part| {
             matches!(
                 part,
@@ -159,6 +162,12 @@ fn checked_allow_root(path: &StoragePath) -> Result<PathBuf, StorageRoleFailure>
     } else {
         Ok(native)
     }
+}
+
+fn is_internal(path: &StoragePath) -> bool {
+    PathBuf::from(path.as_str()).components().any(|component| {
+        matches!(component, Component::Normal(name) if name.to_str().is_some_and(|name| name.starts_with(super::staged::INTERNAL_PREFIX)))
+    })
 }
 
 fn invalid(path: &StoragePath) -> StorageRoleFailure {
@@ -184,6 +193,13 @@ mod tests {
         assert!(
             checked(&StoragePath::new("safe/child").unwrap_or_else(|error| panic!("{error}")))
                 .is_ok()
+        );
+        assert!(
+            checked(
+                &StoragePath::new("safe/.data-mover-private.stage")
+                    .unwrap_or_else(|error| panic!("{error}"))
+            )
+            .is_err()
         );
         assert!(checked_allow_root(&StoragePath::root()).is_ok());
     }

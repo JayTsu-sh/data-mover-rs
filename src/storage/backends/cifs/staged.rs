@@ -9,10 +9,10 @@ use futures::StreamExt as _;
 use super::source::{classify, entry_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath};
 use crate::storage::{
-    ByteStream, CheckpointObservation, ExistingDestinationPolicy, Metadata, MetadataMutation,
-    PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure,
-    PublishRequest, RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure,
-    VerificationEvidence, VerifyRequest, WriteEvidence,
+    ByteStream, CheckpointObservation, Metadata, MetadataMutation, PrepareRequest, PreparedStage,
+    PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
+    RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure, VerificationEvidence,
+    VerifyRequest, WriteEvidence,
 };
 
 const STAGING_DIRECTORY: &str = ".data-mover-staging";
@@ -154,45 +154,6 @@ impl CifsStagedDestination {
             .await
             .map_err(|error| classify(path, Operation::Verify, &error))?;
         Ok(*hasher.finalize().as_bytes())
-    }
-
-    async fn verify_existing(
-        &self,
-        stage: &PreparedStage,
-        request: &PublishRequest,
-        stage_path: &StoragePath,
-    ) -> Result<Option<PublicationEvidence>, PublicationFailure> {
-        if request.policy != ExistingDestinationPolicy::VerifyOrSkip {
-            return Ok(None);
-        }
-        let final_path = stage.final_destination.path();
-        let size = match self.protocol.size(final_path).await {
-            Ok(size) if size == request.expected_size => size,
-            Ok(_) => return Err(publication_conflict(final_path)),
-            Err(error) if is_not_found(&error) => return Ok(None),
-            Err(error) => {
-                return Err(publication_unchanged(classify(
-                    final_path,
-                    Operation::Publish,
-                    &error,
-                )));
-            }
-        };
-        let hash = self
-            .hash(final_path, size, &request.cancel)
-            .await
-            .map_err(publication_unchanged)?;
-        if hash != request.expected_blake3 {
-            return Err(publication_conflict(final_path));
-        }
-        self.protocol.delete(stage_path).await.map_err(|error| {
-            publication_unchanged(classify(final_path, Operation::Publish, &error))
-        })?;
-        self.release(&stage.token);
-        Ok(Some(PublicationEvidence {
-            final_destination: final_path.clone(),
-            disposition: PublicationDisposition::ExistingEquivalent,
-        }))
     }
 
     async fn reconcile_rename(
@@ -440,13 +401,9 @@ impl StagedDestination for CifsStagedDestination {
                 FailureClass::Cancelled,
             )));
         }
-        if let Some(evidence) = self.verify_existing(stage, &request, &path).await? {
-            return Ok(evidence);
-        }
-        let replace = request.policy == ExistingDestinationPolicy::Overwrite;
         let rename = self
             .protocol
-            .rename(&path, stage.final_destination.path(), replace)
+            .rename(&path, stage.final_destination.path(), true)
             .await;
         if let Err(error) = rename {
             return self.reconcile_rename(stage, &request, &path, &error).await;
@@ -551,14 +508,6 @@ fn publication_unchanged(error: StorageRoleFailure) -> PublicationFailure {
         error,
         final_destination_changed: false,
     }
-}
-
-fn publication_conflict(path: &StoragePath) -> PublicationFailure {
-    publication_unchanged(entry_failure(
-        path,
-        Operation::Publish,
-        FailureClass::Conflict,
-    ))
 }
 
 fn published(path: &StoragePath) -> PublicationEvidence {

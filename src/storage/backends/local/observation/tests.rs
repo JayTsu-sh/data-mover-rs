@@ -117,6 +117,35 @@ async fn inline_plan_uses_stat_facts_without_optional_storage_calls() -> io::Res
 
 #[cfg(unix)]
 #[tokio::test]
+async fn copied_metadata_rejects_a_replaced_source_identity() -> io::Result<()> {
+    let root = TestRoot::new()?;
+    let path = StoragePath::new("file").map_err(io::Error::other)?;
+    std::fs::write(root.0.join("file"), b"first")?;
+    let adapter = adapter(&root.0).map_err(io::Error::other)?;
+    let described = adapter
+        .observe(path.clone())
+        .await
+        .map_err(io::Error::other)?;
+    std::fs::write(root.0.join("replacement"), b"second")?;
+    std::fs::rename(root.0.join("replacement"), root.0.join("file"))?;
+
+    let result = MetadataRole::observe_bound(
+        &adapter,
+        &path,
+        described.source_identity(),
+        ObservationPlan::default().with_ownership_mode(ObservationMode::InlineOnly),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn best_effort_records_optional_failure_but_required_fails_entry() -> io::Result<()> {
     let root = TestRoot::new()?;
     std::fs::write(root.0.join("file"), b"value")?;

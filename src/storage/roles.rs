@@ -12,7 +12,8 @@ use crate::runtime::qos::SourceQosBudget;
 use crate::model::{
     AclMetadata, BackendSessionFailure, EntryKind, EntryOperationFailure, ExtendedAttribute,
     FailureClass, MappedOwnership, MetadataObservations, ObjectTag, ObservationPlan, Operation,
-    OwnershipMode, SourceIdentity, StoragePath, SymlinkTarget, TimestampMetadata, Transience,
+    OwnershipMode, SourceIdentity, StoragePath, SymlinkTarget, TimePrecision, TimestampMetadata,
+    Transience,
 };
 
 /// A bounded payload stream. Implementations own request sizing and backpressure.
@@ -26,6 +27,8 @@ pub struct SourceDescriptor {
     pub size: Option<u64>,
     pub source_identity: SourceIdentity,
     pub(crate) backend_fact: Option<Bytes>,
+    /// Content-change observation, separate from stable inode/file-handle identity.
+    pub(crate) content_version: Option<Bytes>,
 }
 
 impl SourceDescriptor {
@@ -43,6 +46,7 @@ impl SourceDescriptor {
             size,
             source_identity,
             backend_fact: None,
+            content_version: None,
         }
     }
 
@@ -62,6 +66,8 @@ pub struct ReadRequest {
     pub maximum_chunk_bytes: usize,
     /// Caller-side upper bound for backend read operations within this stream.
     pub read_inflight: usize,
+    /// Shared pre-allocation admission, supplied by the transfer engine.
+    pub read_budget: Option<super::ReadBudget>,
     pub cancel: CancellationToken,
     pub source_qos: Option<SourceQosBudget>,
 }
@@ -71,6 +77,14 @@ pub struct ReadRequest {
 pub enum StorageRoleFailure {
     Entry(EntryOperationFailure),
     Session(BackendSessionFailure),
+}
+
+/// Failure while applying an ordered batch of staged metadata mutations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedMetadataApplicationFailure {
+    pub failed_index: usize,
+    pub completed: usize,
+    pub error: Option<StorageRoleFailure>,
 }
 
 impl fmt::Display for StorageRoleFailure {
@@ -94,6 +108,12 @@ impl Error for StorageRoleFailure {
 /// Source streaming role. Protocol handles and retry details remain behind this interface.
 #[async_trait]
 pub trait ReadSource: Send + Sync {
+    /// Whether this implementation reserves every prefetched read using `ReadRequest::read_budget`.
+    /// Other sources are polled serially with admission owned by the producer.
+    fn supports_read_budget(&self) -> bool {
+        false
+    }
+
     /// Largest payload the connected backend can return from one source read operation.
     /// The transfer planner combines this backend limit with the caller's inflight budget.
     fn maximum_read_chunk_bytes(&self) -> usize {
@@ -187,8 +207,16 @@ pub struct PreparedStage {
     pub(crate) token: Bytes,
     pub(crate) recovery_binding: [u8; 32],
     pub(crate) write_offset: u64,
-    pub(crate) recovery_enabled: bool,
+    pub(crate) recovery_enabled: std::sync::atomic::AtomicBool,
+    pub(crate) registration_owned: std::sync::atomic::AtomicBool,
+    pub(crate) deferred_checkpoint: Option<DeferredCheckpoint>,
+    /// Whether the caller requires final publication persistence barriers.
+    pub(crate) durable_publication: bool,
+    /// Direct targets are already visible and must never enter stage cleanup or recovery.
+    pub(crate) direct: bool,
+    pub(crate) backend_state: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     pub(crate) claim: std::sync::Mutex<Option<std::fs::File>>,
+    pub(crate) recovery_lease: std::sync::Mutex<Option<std::sync::Arc<std::fs::File>>>,
 }
 
 #[allow(dead_code)]
@@ -211,18 +239,37 @@ impl PreparedStage {
             token,
             recovery_binding,
             write_offset,
-            recovery_enabled: true,
+            recovery_enabled: std::sync::atomic::AtomicBool::new(true),
+            registration_owned: std::sync::atomic::AtomicBool::new(true),
+            deferred_checkpoint: None,
+            durable_publication: true,
+            direct: false,
+            backend_state: None,
             claim: std::sync::Mutex::new(claim),
+            recovery_lease: std::sync::Mutex::new(None),
         }
     }
 
-    pub(crate) const fn disable_recovery(mut self) -> Self {
-        self.recovery_enabled = false;
+    pub(crate) fn disable_recovery(self) -> Self {
+        self.recovery_enabled
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.registration_owned
+            .store(false, std::sync::atomic::Ordering::Release);
         self
     }
 
-    pub(crate) const fn recovery_enabled(&self) -> bool {
+    pub(crate) fn recovery_enabled(&self) -> bool {
         self.recovery_enabled
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn owns_recovery_registration(&self) -> bool {
+        self.registration_owned
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) const fn recovery_binding(&self) -> [u8; 32] {
+        self.recovery_binding
     }
 
     pub(crate) fn validate_owner(
@@ -242,6 +289,13 @@ impl PreparedStage {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
     }
+
+    pub(crate) fn retain_recovery_lease(&self, lease: std::sync::Arc<std::fs::File>) {
+        *self
+            .recovery_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lease);
+    }
 }
 
 impl fmt::Debug for PreparedStage {
@@ -253,15 +307,23 @@ impl fmt::Debug for PreparedStage {
             .field("token", &"<redacted>")
             .field("recovery_binding", &"<redacted>")
             .field("write_offset", &self.write_offset)
-            .field("recovery_enabled", &self.recovery_enabled)
+            .field("recovery_enabled", &self.recovery_enabled())
             .field("claim", &"<exclusive-lock>")
+            .field("recovery_lease", &"<exclusive-lock>")
+            .field("registration_owned", &self.owns_recovery_registration())
+            .field("deferred_checkpoint", &self.deferred_checkpoint.is_some())
+            .field("durable_publication", &self.durable_publication)
+            .field("direct", &self.direct)
+            .field("backend_state", &"<opaque>")
             .finish()
     }
 }
 
-/// Evidence returned after backend persistence barriers complete.
+/// Evidence of completed backend writes under the stage publication policy.
+/// `AtomicReplace` Local writes may still reside in the OS cache; this is not checkpoint evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteEvidence {
+    /// Completed bytes; crash durability depends on the requested publication policy.
     pub persisted_bytes: u64,
 }
 
@@ -279,16 +341,19 @@ pub struct VerifyRequest {
     pub cancel: CancellationToken,
 }
 
-/// Policy for a destination path that already exists at publication time.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ExistingDestinationPolicy {
-    /// Atomically replace an existing destination.
-    #[default]
-    Overwrite,
-    /// Keep equivalent existing content, otherwise fail.
-    VerifyOrSkip,
-    /// Fail without changing an existing destination.
-    FailIfExists,
+pub(crate) struct DeferredCheckpoint {
+    pub(crate) interval_bytes: u64,
+    pub(crate) source_size: u64,
+    pub(crate) registration: std::sync::Arc<dyn CheckpointRegistration>,
+}
+
+#[async_trait]
+pub(crate) trait CheckpointRegistration: Send + Sync {
+    async fn register(
+        &self,
+        stage: &PreparedStage,
+        identity: RecoveryIdentity,
+    ) -> Result<(), StorageRoleFailure>;
 }
 
 /// Evidence that staged content passed verification.
@@ -298,10 +363,9 @@ pub struct VerificationEvidence {
     pub blake3: [u8; 32],
 }
 
-/// Inputs required to publish verified staged content.
+/// Inputs required to atomically replace the final destination with verified staged content.
 #[derive(Clone, Debug)]
 pub struct PublishRequest {
-    pub policy: ExistingDestinationPolicy,
     pub expected_size: u64,
     pub expected_blake3: [u8; 32],
     pub cancel: CancellationToken,
@@ -314,14 +378,13 @@ pub struct PublicationFailure {
     pub final_destination_changed: bool,
 }
 
-/// Result of publication when equivalent existing content may be retained.
+/// Result of publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationDisposition {
     Published,
-    ExistingEquivalent,
 }
 
-/// Evidence that verified staged state was published.
+/// Evidence that staged state was published; content verification is reported separately.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicationEvidence {
     pub final_destination: StoragePath,
@@ -331,6 +394,51 @@ pub struct PublicationEvidence {
 /// Destination role owning prepare, write, checkpoint, verify, publish, and discard.
 #[async_trait]
 pub trait StagedDestination: Send + Sync {
+    /// Whether this backend can prepare an in-place target for the shared writer.
+    fn supports_direct(&self) -> bool {
+        false
+    }
+
+    /// Opens a final target without staging. The returned handle must be marked direct.
+    async fn prepare_direct(
+        &self,
+        request: PrepareRequest,
+        _cancel: CancellationToken,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        Err(StorageRoleFailure::Entry(
+            EntryOperationFailure::new(
+                request.final_destination.path().clone(),
+                Operation::Prepare,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "direct writes are unsupported by this destination",
+            )
+            .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
+        ))
+    }
+    /// Target capabilities for baseline metadata copied by the ordinary transfer entry.
+    fn copied_metadata_target(&self) -> Option<CopiedMetadataTarget> {
+        None
+    }
+
+    /// Automatic checkpoint spacing, when deferred recovery is supported by this destination.
+    fn automatic_checkpoint_interval_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    /// Writes one complete source chunk without requiring a separate producer task.
+    async fn write_single(
+        &self,
+        stage: &PreparedStage,
+        data: Bytes,
+    ) -> Result<WriteEvidence, StorageRoleFailure> {
+        self.write(
+            stage,
+            Box::pin(futures::stream::once(async move { Ok(data) })),
+        )
+        .await
+    }
+
     async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure>;
     /// Prepares unpublished state that must never be resumed after this attempt.
     ///
@@ -404,6 +512,34 @@ pub trait StagedDestination: Send + Sync {
         .unwrap_or_else(|_| unreachable!("the static staged-metadata diagnostic is valid"));
         Err(StorageRoleFailure::Entry(failure))
     }
+    /// Applies an ordered metadata batch to the same unpublished staged object.
+    ///
+    /// Backends may override this to share one stage handle and one persistence barrier. The
+    /// default preserves the per-mutation behavior of existing implementations.
+    async fn apply_metadata_batch(
+        &self,
+        stage: &PreparedStage,
+        mutations: Vec<MetadataMutation>,
+        cancel: CancellationToken,
+    ) -> Result<(), StagedMetadataApplicationFailure> {
+        for (completed, mutation) in mutations.into_iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(StagedMetadataApplicationFailure {
+                    failed_index: completed,
+                    completed,
+                    error: None,
+                });
+            }
+            if let Err(error) = self.apply_metadata(stage, mutation, cancel.clone()).await {
+                return Err(StagedMetadataApplicationFailure {
+                    failed_index: completed,
+                    completed,
+                    error: Some(error),
+                });
+            }
+        }
+        Ok(())
+    }
     async fn publish(
         &self,
         stage: &PreparedStage,
@@ -440,14 +576,36 @@ pub trait Namespace: Send + Sync {
     ) -> Result<NamespaceResult, StorageRoleFailure>;
 }
 
+/// Destination capabilities used by the ordinary baseline metadata copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CopiedMetadataTarget {
+    pub timestamp_precision: TimePrecision,
+}
+
 /// Metadata observation and application role. It never implicitly refetches omitted facts.
 #[async_trait]
 pub trait Metadata: Send + Sync {
+    /// Source observations requested by the ordinary transfer entry for baseline metadata copy.
+    fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
+        None
+    }
+
     async fn observe(
         &self,
         path: &StoragePath,
         plan: ObservationPlan,
     ) -> Result<MetadataObservations, StorageRoleFailure>;
+    /// Observes metadata only when the same operation confirms the expected source identity.
+    /// Roles that advertise copied metadata should override this method.
+    async fn observe_bound(
+        &self,
+        path: &StoragePath,
+        expected: &SourceIdentity,
+        plan: ObservationPlan,
+    ) -> Result<MetadataObservations, StorageRoleFailure> {
+        let _ = expected;
+        self.observe(path, plan).await
+    }
     async fn apply(
         &self,
         path: &StoragePath,

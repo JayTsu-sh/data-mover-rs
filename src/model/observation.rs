@@ -58,6 +58,10 @@ impl fmt::Debug for SourceIdentity {
 }
 
 impl SourceIdentity {
+    #[cfg(unix)]
+    pub(crate) const fn backend(&self) -> &BackendIdentity {
+        &self.backend
+    }
     /// Creates a backend-bound identity from stable opaque bytes.
     ///
     /// # Errors

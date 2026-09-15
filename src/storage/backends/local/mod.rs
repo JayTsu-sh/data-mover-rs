@@ -30,6 +30,10 @@ pub(crate) fn connect_transfer(
         identity.clone(),
         read_concurrency.get(),
     )?);
+    let metadata = Arc::new(observation::LocalObservationAdapter::new(
+        &root,
+        identity.clone(),
+    )?);
     let staged = Arc::new(staged::LocalStagedDestination::new(
         root,
         identity.clone(),
@@ -44,12 +48,12 @@ pub(crate) fn connect_transfer(
             CapabilityAvailability::Supported,
             CapabilityAvailability::Supported,
             unsupported.clone(),
-            unsupported,
+            CapabilityAvailability::Supported,
         ),
         Some(source),
         Some(staged),
         None,
-        None,
+        Some(metadata),
         None,
     )?)
 }
@@ -73,13 +77,17 @@ pub(crate) fn test_source_storage(
 > {
     let identity = test_identity(name);
     let source = std::sync::Arc::new(source::LocalReadSource::new(root, identity.clone(), 4)?);
+    let metadata = std::sync::Arc::new(observation::LocalObservationAdapter::new(
+        root,
+        identity.clone(),
+    )?);
     let storage = crate::storage::Storage::connected(
         identity,
-        test_capabilities(true, false)?,
+        test_capabilities(true, false, true)?,
         Some(source.clone()),
         None,
         None,
-        None,
+        Some(metadata),
         None,
     )?;
     Ok((storage, source))
@@ -110,13 +118,17 @@ pub(crate) fn test_destination_storage_with_role(
         identity.clone(),
         2,
     )?);
+    let metadata = std::sync::Arc::new(observation::LocalObservationAdapter::new(
+        root,
+        identity.clone(),
+    )?);
     let storage = crate::storage::Storage::connected(
         identity,
-        test_capabilities(false, true)?,
+        test_capabilities(false, true, true)?,
         None,
         Some(destination.clone()),
         None,
-        None,
+        Some(metadata),
         None,
     )?;
     Ok((storage, destination))
@@ -128,7 +140,7 @@ pub(crate) fn test_unsupported_storage(
 ) -> Result<crate::storage::Storage, Box<dyn std::error::Error>> {
     Ok(crate::storage::Storage::connected(
         test_identity(name),
-        test_capabilities(false, false)?,
+        test_capabilities(false, false, false)?,
         None,
         None,
         None,
@@ -141,6 +153,7 @@ pub(crate) fn test_unsupported_storage(
 fn test_capabilities(
     read: bool,
     staged: bool,
+    metadata: bool,
 ) -> Result<crate::storage::BackendCapabilities, Box<dyn std::error::Error>> {
     use crate::storage::{CapabilityAvailability, UnsupportedReason};
     let unavailable = CapabilityAvailability::Unsupported(UnsupportedReason::new("not supplied")?);
@@ -156,6 +169,10 @@ fn test_capabilities(
             unavailable.clone()
         },
         unavailable.clone(),
-        unavailable,
+        if metadata {
+            CapabilityAvailability::Supported
+        } else {
+            unavailable
+        },
     ))
 }

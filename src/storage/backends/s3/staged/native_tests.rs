@@ -25,6 +25,7 @@ fn native_prepare() -> TestResult<PrepareRequest> {
                 b"large-etag",
             )?,
             backend_fact: None,
+            content_version: None,
         },
         recovery_binding: [5; 32],
     })

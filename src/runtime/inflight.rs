@@ -209,6 +209,87 @@ impl InflightAdmission {
 }
 
 impl InflightRuntime {
+    pub(crate) fn read_depth(&self) -> usize {
+        self.chunk_budget
+            .min(self.operation_budget)
+            .min(self.byte_budget)
+    }
+
+    pub(crate) async fn reserve_read(
+        &self,
+        length: usize,
+        wait: bool,
+    ) -> Result<Option<InflightAdmission>, InflightFailure> {
+        if length == 0 || length > self.byte_budget {
+            return Err(InflightFailure::ChunkExceedsBudget {
+                bytes: length,
+                budget: self.byte_budget,
+            });
+        }
+        let permits = u32::try_from(length).map_err(|_| InflightFailure::OffsetOverflow)?;
+        let (chunk_permit, byte_permit, operation_permit) = if wait {
+            (
+                self.acquire(self.chunks.clone(), 1).await?,
+                self.acquire(self.bytes.clone(), length).await?,
+                self.acquire(self.operations.clone(), 1).await?,
+            )
+        } else {
+            let Ok(chunk) = self.chunks.clone().try_acquire_owned() else {
+                return Ok(None);
+            };
+            let Ok(bytes) = self.bytes.clone().try_acquire_many_owned(permits) else {
+                return Ok(None);
+            };
+            let Ok(operation) = self.operations.clone().try_acquire_owned() else {
+                return Ok(None);
+            };
+            (chunk, bytes, operation)
+        };
+        Ok(Some(InflightAdmission {
+            offset: 0,
+            length,
+            sender: self.sender.clone(),
+            cancel: self.cancel.clone(),
+            chunk_permit,
+            byte_permit,
+            _operation_permit: operation_permit,
+        }))
+    }
+
+    pub(crate) async fn complete_read(
+        &self,
+        mut admission: InflightAdmission,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<(), InflightFailure> {
+        if data.is_empty() || data.len() > admission.length {
+            return Err(InflightFailure::ProducedLengthMismatch {
+                reserved: admission.length,
+                produced: data.len(),
+            });
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(InflightFailure::OffsetOverflow)?;
+        let mut next = self.next_admission.lock().await;
+        if offset != *next {
+            return Err(InflightFailure::OutOfOrderAdmission {
+                expected: *next,
+                actual: offset,
+            });
+        }
+        if end > self.expected_end {
+            return Err(InflightFailure::RangeOutsideExpected {
+                end,
+                expected_end: self.expected_end,
+            });
+        }
+        *next = end;
+        drop(next);
+        admission.offset = offset;
+        admission.length = data.len();
+        admission.complete(data).await
+    }
     pub(crate) const fn operation_budget(&self) -> usize {
         self.operation_budget
     }
@@ -509,6 +590,36 @@ mod tests {
         assert!(some(ordered.next().await).is_ok());
         let second = ok(runtime.admit(3, 3).await);
         ok(second.complete(Bytes::from_static(b"def")).await);
+    }
+
+    #[tokio::test]
+    async fn prefetch_reservations_share_chunk_byte_and_operation_limits_with_queue() {
+        // Each budget independently limits prefetch even when the others are large.
+        for limits in [
+            config(1, 128, 128),
+            config(128, 1, 128),
+            config(128, 128, 1),
+        ] {
+            let (runtime, mut ordered) = channel(limits, 0, 2, CancellationToken::new());
+            let first = some(ok(runtime.reserve_read(1, false).await));
+            assert!(ok(runtime.reserve_read(1, false).await).is_none());
+            ok(runtime
+                .complete_read(first, 0, Bytes::from_static(b"a"))
+                .await);
+            // Completion must not release payload admission while it remains queued.
+            if runtime.chunk_budget == 1 || runtime.byte_budget == 1 {
+                assert!(ok(runtime.reserve_read(1, false).await).is_none());
+            }
+            assert_eq!(some(ordered.next().await), Ok(Bytes::from_static(b"a")));
+            let second = some(ok(runtime.reserve_read(1, false).await));
+            drop(second);
+            assert_eq!(runtime.chunks.available_permits(), runtime.chunk_budget);
+            assert_eq!(runtime.bytes.available_permits(), runtime.byte_budget);
+            assert_eq!(
+                runtime.operations.available_permits(),
+                runtime.operation_budget
+            );
+        }
     }
 
     #[tokio::test]

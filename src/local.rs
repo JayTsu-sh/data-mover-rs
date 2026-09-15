@@ -417,20 +417,8 @@ impl LocalStorage {
     async fn create_file(
         &self,
         relative_path: &Path,
-        #[cfg_attr(
-            windows,
-            expect(unused_variables, reason = "POSIX ownership is unavailable on Windows")
-        )]
         uid: Option<u32>,
-        #[cfg_attr(
-            windows,
-            expect(unused_variables, reason = "POSIX ownership is unavailable on Windows")
-        )]
         gid: Option<u32>,
-        #[cfg_attr(
-            windows,
-            expect(unused_variables, reason = "POSIX mode is unavailable on Windows")
-        )]
         mode: Option<u32>,
         truncate: bool,
     ) -> Result<LocalFileHandle> {
@@ -691,20 +679,8 @@ impl LocalStorage {
         relative_path: &Path,
         atime: Option<i64>,
         mtime: Option<i64>,
-        #[cfg_attr(
-            windows,
-            expect(unused_variables, reason = "POSIX ownership is unavailable on Windows")
-        )]
         uid: Option<u32>,
-        #[cfg_attr(
-            windows,
-            expect(unused_variables, reason = "POSIX ownership is unavailable on Windows")
-        )]
         gid: Option<u32>,
-        #[cfg_attr(
-            windows,
-            expect(unused_variables, reason = "POSIX mode is unavailable on Windows")
-        )]
         mode: Option<u32>,
     ) -> Result<()> {
         let full_path = self.get_full_path(relative_path);
