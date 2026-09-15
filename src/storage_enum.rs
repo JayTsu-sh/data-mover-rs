@@ -1043,7 +1043,7 @@ impl StorageEnum {
     pub fn block_size(&self) -> u64 {
         match self {
             StorageEnum::Local(s) => s.config.block_size,
-            StorageEnum::NFS(s) => s.config.block_size,
+            StorageEnum::NFS(s) => s.config.read_chunk_bytes,
             StorageEnum::CIFS(s) => s.config.block_size,
             StorageEnum::S3(s) => s.block_size,
             StorageEnum::HDFS(s) => s.block_size(),

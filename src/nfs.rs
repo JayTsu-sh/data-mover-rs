@@ -446,7 +446,7 @@ impl NfsReadCursor for NfsRoleReadCursor {
 #[async_trait]
 impl NfsSourceProtocol for NFSStorage {
     fn maximum_read_chunk_bytes(&self) -> usize {
-        usize::try_from(self.config.block_size).unwrap_or(usize::MAX)
+        usize::try_from(self.config.read_chunk_bytes).unwrap_or(usize::MAX)
     }
 
     async fn describe(
@@ -937,11 +937,11 @@ impl NfsStagedProtocol for NFSStorage {
     }
 
     fn maximum_read_chunk_bytes(&self) -> usize {
-        usize::try_from(self.config.block_size).unwrap_or(usize::MAX)
+        usize::try_from(self.config.read_chunk_bytes).unwrap_or(usize::MAX)
     }
 
     fn maximum_write_chunk_bytes(&self) -> usize {
-        usize::try_from(self.config.block_size).unwrap_or(usize::MAX)
+        usize::try_from(self.config.write_chunk_bytes).unwrap_or(usize::MAX)
     }
 
     async fn create_empty(
@@ -1140,10 +1140,27 @@ fn build_relative_path_impl(root: &str, dir_path: &str, entry_file_name: &str) -
     }
 }
 
+/// A zero limit is unspecified. Preserve the existing default/client cap in each direction.
+fn negotiated_chunk_sizes(client: Option<u64>, rsize: u64, wsize: u64) -> (u64, u64) {
+    let client_ceiling = client
+        .filter(|&size| size > 0)
+        .unwrap_or(DEFAULT_BLOCK_SIZE)
+        .min(DEFAULT_BLOCK_SIZE);
+    let ceiling = |server| {
+        if server > 0 {
+            client_ceiling.min(server)
+        } else {
+            client_ceiling
+        }
+    };
+    (ceiling(rsize), ceiling(wsize))
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StorageConfig {
-    /// 块大小，默认1MB
-    pub block_size: u64,
+    /// Read and write ceilings are negotiated independently.
+    pub read_chunk_bytes: u64,
+    pub write_chunk_bytes: u64,
     pub transfer_concurrency: TransferConcurrency,
 }
 
@@ -1473,19 +1490,13 @@ impl NFSStorage {
         };
 
         let mount_fh = mount.getfh().await;
-        // 取 NFS 服务器协商后的 rsize / wsize，将 block_size 对齐到两者的较小值，
-        // 确保每次 read/write 调用都走单次 RPC 零拷贝快路径
         let rsize = u64::from(mount.get_max_read_size());
         let wsize = u64::from(mount.get_max_write_size());
-        // 取 {客户 block_size, rsize, wsize, DEFAULT} 的最小值；为 0 的候选项视为无效不参与，
-        // 避免协商失败或非法输入把块大小塌成 0。DEFAULT 恒非零作兜底，结果恒 > 0。
-        let effective_block_size = [block_size.unwrap_or(0), rsize, wsize]
-            .into_iter()
-            .filter(|&c| c > 0)
-            .fold(DEFAULT_BLOCK_SIZE, u64::min);
+        let (read_chunk_bytes, write_chunk_bytes) =
+            negotiated_chunk_sizes(block_size, rsize, wsize);
         info!(
-            "NFS rsize={}, wsize={}, effective block_size={}",
-            rsize, wsize, effective_block_size
+            "NFS rsize={}, wsize={}, effective read_chunk_bytes={}, write_chunk_bytes={}",
+            rsize, wsize, read_chunk_bytes, write_chunk_bytes
         );
 
         let sid = get_or_assign_server_id(&nfs_url);
@@ -1496,7 +1507,8 @@ impl NFSStorage {
             root: Arc::new(String::new()),
             namespace_identity: Arc::new(format!("{nfs_url}#{root_dir}")),
             config: StorageConfig {
-                block_size: effective_block_size,
+                read_chunk_bytes,
+                write_chunk_bytes,
                 transfer_concurrency: resolve_transfer_concurrency(
                     TransferBackend::Nfs,
                     DEFAULT_TRANSFER_CONCURRENCY,
@@ -3564,8 +3576,8 @@ impl NFSStorage {
         offset: u64,
         count: usize,
     ) -> Result<Bytes> {
-        // block_size 在 mount 时已钳到 min(客户配置, rsize, wsize)，恒 > 0
-        let block_size = self.calculate_chunk_size(count as u64);
+        // Read ceiling uses only the client limit and negotiated rsize, never wsize.
+        let block_size = self.calculate_read_chunk_size(count as u64);
         let end = offset + count as u64;
         let mut cur = offset;
         // 延迟分配：常见情形（count <= block_size 且一次读满）零拷贝直返
@@ -3652,7 +3664,7 @@ impl NFSStorage {
         data: Bytes,
     ) -> Result<u64> {
         let length = data.len() as u64;
-        let chunk_size = self.calculate_chunk_size(length);
+        let chunk_size = length.min(self.config.write_chunk_bytes).max(1);
         let mut total_written = 0;
 
         // 如果数据块大小大于chunk_size，需要分拆处理
@@ -3732,13 +3744,10 @@ impl NFSStorage {
         Ok(total_written)
     }
 
-    /// 处理单个文件或目录的复制
-    /// 根据文件大小计算合适的块大小并记录大文件日志
+    /// Bound source reads by the independently negotiated read ceiling.
     #[inline]
-    fn calculate_chunk_size(&self, file_size: u64) -> u64 {
-        // 根据文件大小动态调整块大小，优化内存使用
-        // chunk size最小为一个字节，最大为2MB
-        std::cmp::min(file_size, self.config.block_size).max(1)
+    fn calculate_read_chunk_size(&self, file_size: u64) -> u64 {
+        std::cmp::min(file_size, self.config.read_chunk_bytes).max(1)
     }
 
     /// 计算相对于 root 的路径
@@ -3770,7 +3779,7 @@ impl NFSStorage {
             return Ok(None);
         }
 
-        let chunk_size = self.calculate_chunk_size(size);
+        let chunk_size = self.calculate_read_chunk_size(size);
         trace!(
             "Starting read_data_task for file {:?}, size: {}, chunk_size: {}",
             relative_path, size, chunk_size
@@ -4026,8 +4035,8 @@ impl NFSStorage {
 
         // 上游 chunk 可能大于 NFS 协商的 wsize（跨协议拷贝，如 CIFS 读侧 8MB
         // chunk），write_pipeline_core 按 block_size 零拷贝切分（slice 仅动
-        // refcount），使大 chunk 同样吃到 inflight 并发。同协议时
-        // data.len() ≤ block_size 恒成立，切分循环单次通过、零开销。
+        // refcount），使大 chunk 同样吃到 inflight 并发。读写协商上限独立，
+        // 同协议读取的 chunk 也可能超过写上限；未超过时切分循环仅执行一次。
         //
         // ── inflight write pipeline ─────────────────────────────────────────────
         // 维持配置的 write_inflight 个 WRITE 同时在飞（FuturesUnordered，
@@ -4041,7 +4050,7 @@ impl NFSStorage {
         let result = write_pipeline_core(
             rx,
             &sink,
-            Some(self.config.block_size.max(1)),
+            Some(self.config.write_chunk_bytes.max(1)),
             self.config.transfer_concurrency.write(),
             CommitPolicy::None,
             bytes_counter,
@@ -4076,7 +4085,7 @@ impl NFSStorage {
         if total == 0 {
             return Ok(());
         }
-        let chunk_size = self.calculate_chunk_size(total);
+        let chunk_size = self.calculate_read_chunk_size(total);
 
         let handler = self
             .open(&path_to_use, OPEN_READ)
@@ -4159,7 +4168,7 @@ impl NFSStorage {
         let result = write_pipeline_core(
             rx,
             &sink,
-            Some(self.config.block_size.max(1)),
+            Some(self.config.write_chunk_bytes.max(1)),
             self.config.transfer_concurrency.write(),
             CommitPolicy::PerChunk(on_committed),
             bytes_counter,
@@ -4581,7 +4590,7 @@ impl Drop for NFSStorage {
 /// 推进 `cur` 后再调用本函数，短返回时即自然补读剩余（与 `read_data` 的
 /// partial 补读语义一致）；单次返回 0 字节视为 EOF，由调用方提前终止。
 ///
-/// 前置条件：`block_size >= 1`（`calculate_chunk_size` 保证）。
+/// 前置条件：`block_size >= 1`（`calculate_read_chunk_size` 保证）。
 fn next_read_want(cur: u64, end: u64, block_size: u64) -> Option<u32> {
     if cur >= end {
         return None;
@@ -4593,6 +4602,39 @@ fn next_read_want(cur: u64, end: u64, block_size: u64) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::AssertTestValue;
+
+    #[test]
+    fn negotiated_read_and_write_limits_are_independent() {
+        let small = DEFAULT_BLOCK_SIZE / 4;
+        assert_eq!(
+            negotiated_chunk_sizes(None, small, DEFAULT_BLOCK_SIZE),
+            (small, DEFAULT_BLOCK_SIZE)
+        );
+        assert_eq!(
+            negotiated_chunk_sizes(None, DEFAULT_BLOCK_SIZE, small),
+            (DEFAULT_BLOCK_SIZE, small)
+        );
+        assert_eq!(
+            negotiated_chunk_sizes(Some(small / 2), small, DEFAULT_BLOCK_SIZE),
+            (small / 2, small / 2)
+        );
+        assert_eq!(
+            negotiated_chunk_sizes(Some(0), 0, small),
+            (DEFAULT_BLOCK_SIZE, small)
+        );
+        assert_eq!(
+            negotiated_chunk_sizes(None, small, 0),
+            (small, DEFAULT_BLOCK_SIZE)
+        );
+        assert_eq!(
+            negotiated_chunk_sizes(
+                Some(2 * DEFAULT_BLOCK_SIZE),
+                2 * DEFAULT_BLOCK_SIZE,
+                2 * DEFAULT_BLOCK_SIZE
+            ),
+            (DEFAULT_BLOCK_SIZE, DEFAULT_BLOCK_SIZE)
+        );
+    }
 
     #[test]
     fn deferred_write_retains_payload_only_when_server_commit_is_required() {
