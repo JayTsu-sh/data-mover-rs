@@ -3,6 +3,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
+use crate::storage::durability::sync_directory;
 use cap_std::fs::OpenOptions;
 
 use super::{LocalStagedDestination, failure, io_failure, publication};
@@ -49,7 +50,7 @@ pub(super) async fn persist(
             probe.fail_checkpoint_at(1)?;
             staging.rename(&temporary, &staging, &checkpoint)?;
             probe.fail_checkpoint_at(2)?;
-            staging.open(".")?.sync_all()
+            sync_directory(&staging)
         })();
         if result.is_err() {
             let _ = publication::remove_if_present(&staging, &temporary);

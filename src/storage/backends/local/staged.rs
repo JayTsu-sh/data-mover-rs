@@ -22,6 +22,7 @@ use crate::model::AclEncoding;
 use crate::model::{
     BackendIdentity, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
 };
+use crate::storage::durability::sync_directory;
 use crate::storage::{
     ByteStream, CheckpointObservation, MetadataMutation, PrepareRequest, PreparedStage,
     PublicationEvidence, PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity,
@@ -780,7 +781,7 @@ impl LocalStagedDestination {
             let stage_result = publication::remove_if_present(&staging, &stage_name);
             let checkpoint_result = publication::remove_if_present(&staging, &checkpoint_name);
             let guard_result = publication::remove_if_present(&staging, &guard_name);
-            let sync_result = staging.open(".").and_then(|directory| directory.sync_all());
+            let sync_result = sync_directory(&staging);
             stage_result
                 .and(checkpoint_result)
                 .and(guard_result)
@@ -810,7 +811,7 @@ impl LocalStagedDestination {
         };
         tokio::task::spawn_blocking(move || {
             publication::remove_if_present(&claim_staging, &claim_name)?;
-            claim_staging.open(".")?.sync_all()
+            sync_directory(&claim_staging)
         })
         .await
         .map_err(|_| failure(path, operation, FailureClass::Internal))?
@@ -826,7 +827,7 @@ impl LocalStagedDestination {
         let path = stage.final_destination.path();
         let sync_result = tokio::task::spawn_blocking(move || {
             file.sync_all()?;
-            staging.open(".")?.sync_all()
+            sync_directory(&staging)
         })
         .await
         .map_err(|_| failure(path, Operation::Prepare, FailureClass::Internal))?
@@ -887,7 +888,7 @@ impl LocalStagedDestination {
                 Ok(next) => next,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     match directory.create_dir(name) {
-                        Ok(()) => directory.open(".")?.sync_all()?,
+                        Ok(()) => sync_directory(&directory)?,
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                         Err(error) => return Err(error),
                     }
@@ -1408,7 +1409,7 @@ impl StagedDestination for LocalStagedDestination {
                     .map_err(precommit)?;
                 tokio::task::spawn_blocking(move || {
                     publication::remove_if_present(&staging, &claim_name)?;
-                    staging.open(".")?.sync_all()
+                    sync_directory(&staging)
                 })
                 .await
                 .map_err(|_| PublicationFailure {
