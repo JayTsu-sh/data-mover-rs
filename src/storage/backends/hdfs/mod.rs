@@ -7,6 +7,7 @@ mod namespace;
 pub(crate) mod protocol;
 mod source;
 mod staged;
+mod writer;
 
 use std::sync::Arc;
 
@@ -28,8 +29,10 @@ where
         Arc::clone(&storage),
         identity.clone(),
     ));
-    let metadata: Arc<dyn crate::storage::Metadata> =
-        Arc::new(metadata::HdfsMetadata::new(Arc::clone(&storage)));
+    let metadata: Arc<dyn crate::storage::Metadata> = Arc::new(metadata::HdfsMetadata::new(
+        Arc::clone(&storage),
+        identity.clone(),
+    ));
     let staged = Arc::new(
         staged::HdfsStagedDestination::new(Arc::clone(&storage), identity.clone())
             .with_metadata(Arc::clone(&metadata)),

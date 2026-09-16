@@ -109,6 +109,8 @@ pub(crate) mod tests {
 
     #[derive(Default)]
     pub(crate) struct MemoryS3 {
+        version: Mutex<Option<String>>,
+        range_observations: Mutex<Vec<S3ObjectFacts>>,
         pub(crate) objects: Mutex<HashMap<String, Bytes>>,
         pub(super) uploads: Mutex<UploadParts>,
         tags: Mutex<HashMap<String, Vec<ObjectTag>>>,
@@ -117,7 +119,7 @@ pub(crate) mod tests {
         pub(super) abort_failure: Mutex<Option<S3ProtocolFailure>>,
         head_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
         pub(super) claims: Mutex<HashMap<String, [u8; 32]>>,
-        copy_commits_then_fails: Mutex<bool>,
+        pub(crate) copy_commits_then_fails: Mutex<bool>,
         pub(crate) native_copies: Mutex<u64>,
         pub(crate) native_failure: Mutex<Option<S3ProtocolFailure>>,
     }
@@ -141,10 +143,16 @@ pub(crate) mod tests {
             Ok(S3ObjectFacts {
                 size: bytes.len() as u64,
                 etag: blake3::hash(bytes).to_hex().to_string(),
-                version_id: None,
+                version_id: self.version.lock().await.clone(),
             })
         }
-        async fn get_range(&self, key: &str, range: Range<u64>) -> S3Result<Bytes> {
+        async fn get_range(
+            &self,
+            key: &str,
+            range: Range<u64>,
+            observed: &S3ObjectFacts,
+        ) -> S3Result<Bytes> {
+            self.range_observations.lock().await.push(observed.clone());
             let objects = self.objects.lock().await;
             let bytes = objects.get(key).ok_or_else(|| {
                 S3ProtocolFailure::entry(
@@ -153,6 +161,13 @@ pub(crate) mod tests {
                     "not found",
                 )
             })?;
+            if observed.etag != blake3::hash(bytes).to_hex().as_str() {
+                return Err(S3ProtocolFailure::entry(
+                    crate::model::FailureClass::Conflict,
+                    crate::model::Transience::Permanent,
+                    "source changed",
+                ));
+            }
             let start = usize::try_from(range.start).map_err(|_| {
                 S3ProtocolFailure::entry(
                     crate::model::FailureClass::InvalidInput,
@@ -380,6 +395,58 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn every_range_is_bound_and_overwrites_cannot_mix_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use futures::StreamExt as _;
+        for version in [None, Some("null"), Some("version-1")] {
+            let protocol = Arc::new(MemoryS3::default());
+            *protocol.version.lock().await = version.map(str::to_owned);
+            protocol
+                .objects
+                .lock()
+                .await
+                .insert("source".into(), Bytes::from_static(b"abcdef"));
+            let storage = connect(protocol.clone(), identity(), None)?;
+            let source = storage.read_source(&validation_policy())?;
+            let path = StoragePath::new("source")?;
+            let before = source.describe(&path).await?;
+            let mut stream = source
+                .read(ReadRequest {
+                    path: path.clone(),
+                    range: None,
+                    expected_source: Some(before.source_identity.clone()),
+                    maximum_chunk_bytes: 3,
+                    read_inflight: 1,
+                    read_budget: None,
+                    cancel: CancellationToken::new(),
+                    source_qos: None,
+                })
+                .await?;
+            assert_eq!(
+                stream.next().await.transpose()?,
+                Some(Bytes::from_static(b"abc"))
+            );
+            protocol
+                .objects
+                .lock()
+                .await
+                .insert("source".into(), Bytes::from_static(b"UVWXYZ"));
+            assert!(stream.next().await.transpose().is_err());
+            let reads = protocol.range_observations.lock().await;
+            assert_eq!(reads.len(), 2);
+            assert_eq!(reads[0].version_id.as_deref(), version);
+            assert_eq!(reads[0].etag, reads[1].etag);
+            if version != Some("version-1") {
+                assert_ne!(
+                    before.source_identity,
+                    source.describe(&path).await?.source_identity
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn range_stream_multipart_verify_publish_and_readback()
     -> Result<(), Box<dyn std::error::Error>> {
         let protocol = Arc::new(MemoryS3::default());
@@ -442,7 +509,7 @@ pub(crate) mod tests {
                 &stage,
                 PublishRequest {
                     expected_size: payload.len() as u64,
-                    expected_blake3: digest,
+                    expected_blake3: Some(digest),
                     cancel: CancellationToken::new(),
                 },
             )
@@ -646,7 +713,7 @@ pub(crate) mod tests {
                 &stage,
                 PublishRequest {
                     expected_size: payload.len() as u64,
-                    expected_blake3: *blake3::hash(&payload).as_bytes(),
+                    expected_blake3: Some(*blake3::hash(&payload).as_bytes()),
                     cancel: CancellationToken::new(),
                 },
             )
@@ -770,7 +837,7 @@ pub(crate) mod tests {
                 &resumed,
                 PublishRequest {
                     expected_size: full.len() as u64,
-                    expected_blake3: digest,
+                    expected_blake3: Some(digest),
                     cancel: CancellationToken::new(),
                 },
             )
@@ -828,7 +895,7 @@ pub(crate) mod tests {
                 &stage,
                 PublishRequest {
                     expected_size: payload.len() as u64,
-                    expected_blake3: digest,
+                    expected_blake3: Some(digest),
                     cancel: CancellationToken::new(),
                 },
             )

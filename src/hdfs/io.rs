@@ -690,13 +690,34 @@ async fn open_append_after_lease_recovery(
     path: &str,
     relative_path: &Path,
 ) -> Result<FileWriter, StorageError> {
-    for attempt in 0..7 {
+    let started = tokio::time::Instant::now();
+    let mut attempt = 0_u32;
+    loop {
         match client.append(path).await {
             Ok(writer) => return Ok(writer),
             Err(error) => {
-                if let Some(delay) = append_open_retry_delay(&error, attempt) {
+                if let Some(delay) =
+                    append_open_retry_delay(&error, attempt, started.elapsed())
+                {
                     sleep(delay).await;
+                    attempt = attempt.saturating_add(1);
                     continue;
+                }
+                if is_append_lease_recovery_error(&error) {
+                    let class = match &error {
+                        HdfsError::RPCError(class, _) | HdfsError::FatalRPCError(class, _) => {
+                            Some(class.as_str())
+                        }
+                        _ => None,
+                    };
+                    return Err(structured_hdfs_error(
+                        "append file",
+                        Some(relative_path),
+                        crate::HdfsErrorKind::Rpc,
+                        class,
+                        "lease recovery did not finish within the retry window",
+                        true,
+                    ));
                 }
                 return Err(hdfs_operation_error(
                     "append file",
@@ -706,20 +727,83 @@ async fn open_append_after_lease_recovery(
             }
         }
     }
-    unreachable!("bounded append-open retry loop always returns")
 }
 
-fn append_open_retry_delay(error: &HdfsError, attempt: u32) -> Option<Duration> {
-    let lease_recovery = match error {
-        HdfsError::RPCError(class, _) => {
+const HDFS_LEASE_RECOVERY_TIMEOUT: Duration = Duration::from_mins(2);
+const HDFS_LEASE_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+pub(crate) async fn recover_lease_until_closed(
+    client: &Client,
+    path: &str,
+    relative_path: &Path,
+) -> Result<(), StorageError> {
+    let started = tokio::time::Instant::now();
+    loop {
+        match client.recover_lease(path).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if is_recovery_in_progress_error(&error) => {}
+            Err(error) => {
+                return Err(hdfs_operation_error(
+                    "recover file lease",
+                    Some(relative_path),
+                    &error,
+                ));
+            }
+        }
+
+        let Some(delay) = lease_recovery_poll_delay(started.elapsed()) else {
+            return Err(structured_hdfs_error(
+                "recover file lease",
+                Some(relative_path),
+                crate::HdfsErrorKind::Rpc,
+                None,
+                "lease recovery did not finish within the retry window",
+                true,
+            ));
+        };
+        sleep(delay).await;
+    }
+}
+
+fn is_recovery_in_progress_error(error: &HdfsError) -> bool {
+    match error {
+        HdfsError::RPCError(class, _) | HdfsError::FatalRPCError(class, _) => {
+            class_has_suffix(class, &["RecoveryInProgressException"])
+        }
+        _ => false,
+    }
+}
+
+fn lease_recovery_poll_delay(elapsed: Duration) -> Option<Duration> {
+    let remaining = HDFS_LEASE_RECOVERY_TIMEOUT.checked_sub(elapsed)?;
+    (HDFS_LEASE_RECOVERY_POLL_INTERVAL < remaining)
+        .then_some(HDFS_LEASE_RECOVERY_POLL_INTERVAL)
+}
+
+fn is_append_lease_recovery_error(error: &HdfsError) -> bool {
+    match error {
+        HdfsError::RPCError(class, _) | HdfsError::FatalRPCError(class, _) => {
             class_has_suffix(class, &["RecoveryInProgressException"])
         }
         _ => hdfs_structured_attributes(error).0 == HdfsErrorKind::AlreadyExists,
-    };
-    if attempt >= 6 || !lease_recovery {
+    }
+}
+
+fn append_open_retry_delay(
+    error: &HdfsError,
+    attempt: u32,
+    elapsed: Duration,
+) -> Option<Duration> {
+    if !is_append_lease_recovery_error(error) {
         return None;
     }
-    Some(Duration::from_secs(1_u64 << attempt))
+    let delay = match error {
+        HdfsError::RPCError(_, _) | HdfsError::FatalRPCError(_, _) => Duration::from_secs(1),
+        _ => Duration::from_secs(1_u64 << attempt.min(3)),
+    };
+    let remaining = HDFS_LEASE_RECOVERY_TIMEOUT.checked_sub(elapsed)?;
+    (delay < remaining).then_some(delay)
 }
 
 fn confirmed_append_range(

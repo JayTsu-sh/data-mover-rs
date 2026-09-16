@@ -19,11 +19,30 @@ mod native;
 #[cfg(test)]
 mod native_tests;
 mod publication;
+#[cfg(test)]
+mod sizing_tests;
 use super::{S3ClaimOutcome, S3Protocol, S3ProtocolFailure};
 
 const PART_SIZE: usize = 8 * 1024 * 1024;
 const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
 const MAX_INFLIGHT_PARTS: usize = 4;
+
+fn planned_part_size(
+    size: Option<u64>,
+    path: &crate::model::StoragePath,
+) -> Result<usize, StorageRoleFailure> {
+    let size = size.unwrap_or(0);
+    let part = size.div_ceil(10_000).max(PART_SIZE as u64);
+    if part > 5 * 1024 * 1024 * 1024 {
+        return Err(entry(
+            path,
+            Operation::Prepare,
+            "S3 multipart capacity exceeded",
+        ));
+    }
+    usize::try_from(part)
+        .map_err(|_| entry(path, Operation::Prepare, "S3 part cannot fit address space"))
+}
 
 async fn upload<P: S3Protocol>(
     protocol: Arc<P>,
@@ -32,6 +51,13 @@ async fn upload<P: S3Protocol>(
     number: i32,
     bytes: Bytes,
 ) -> Result<(i32, String), S3ProtocolFailure> {
+    if !(1..=10_000).contains(&number) {
+        return Err(S3ProtocolFailure::entry(
+            FailureClass::InvalidInput,
+            Transience::Permanent,
+            "S3 multipart part limit exceeded",
+        ));
+    }
     let etag = protocol
         .upload_part(&key, &upload_id, number, bytes)
         .await?;
@@ -41,6 +67,8 @@ async fn upload<P: S3Protocol>(
 #[derive(Clone, Default)]
 struct StageState {
     persisted: u64,
+    expected_size: Option<u64>,
+    part_size: usize,
     upload_id: String,
     parts: Vec<(i32, String)>,
     completed: bool,
@@ -121,23 +149,32 @@ impl<P> S3StagedDestination<P> {
 fn resumable_parts(
     path: &crate::model::StoragePath,
     mut observed: Vec<super::S3PartFacts>,
+    expected_size: Option<u64>,
 ) -> Result<(u64, Vec<(i32, String)>), StorageRoleFailure> {
     observed.sort_by_key(|part| part.number);
-    let valid = observed.iter().enumerate().all(|(index, part)| {
-        part.number == i32::try_from(index + 1).unwrap_or(i32::MAX)
-            && part.size >= MIN_MULTIPART_PART_SIZE
-    });
-    if !valid {
+    if observed.len() > 10_000 {
         return Err(invalid_manifest(
             path,
             "S3 multipart manifest is not a contiguous reusable prefix",
         ));
     }
-    let persisted = observed.iter().try_fold(0_u64, |total, part| {
-        total
+    let mut persisted = 0_u64;
+    for (index, part) in observed.iter().enumerate() {
+        persisted = persisted
             .checked_add(part.size)
-            .ok_or_else(|| invalid_manifest(path, "S3 multipart prefix size overflow"))
-    })?;
+            .ok_or_else(|| invalid_manifest(path, "S3 multipart prefix size overflow"))?;
+        let contiguous = part.number == i32::try_from(index + 1).unwrap_or(i32::MAX);
+        let bounded = part.size <= 5 * 1024 * 1024 * 1024;
+        let short_final = part.size < MIN_MULTIPART_PART_SIZE
+            && index + 1 == observed.len()
+            && expected_size == Some(persisted);
+        if !contiguous || !bounded || (part.size < MIN_MULTIPART_PART_SIZE && !short_final) {
+            return Err(invalid_manifest(
+                path,
+                "S3 multipart manifest is not a contiguous reusable prefix",
+            ));
+        }
+    }
     Ok((
         persisted,
         observed
@@ -256,7 +293,22 @@ impl<P: S3Protocol> S3StagedDestination<P> {
     ) -> Result<(u64, Vec<(i32, String)>, bool), StorageRoleFailure> {
         match self.protocol.list_parts(key, upload_id).await {
             Ok(parts) => {
-                let (size, parts) = resumable_parts(request.final_destination.path(), parts)?;
+                let planned =
+                    planned_part_size(request.source.size, request.final_destination.path())?
+                        as u64;
+                let (size, parts) =
+                    resumable_parts(request.final_destination.path(), parts, request.source.size)?;
+                let available = 10_000 - parts.len() as u64;
+                if request.source.size.is_some_and(|expected| {
+                    expected
+                        .checked_sub(size)
+                        .is_none_or(|remaining| remaining.div_ceil(planned) > available)
+                }) {
+                    return Err(invalid_manifest(
+                        request.final_destination.path(),
+                        "S3 recovered parts cannot satisfy the planned part limit",
+                    ));
+                }
                 Ok((size, parts, false))
             }
             Err(S3ProtocolFailure::Entry {
@@ -309,24 +361,23 @@ impl<P: S3Protocol> S3StagedDestination<P> {
             })
     }
 
-    async fn content_matches(
+    async fn content_digest(
         &self,
         path: &crate::model::StoragePath,
         expected_size: u64,
-        expected_blake3: &[u8; 32],
         cancel: &tokio_util::sync::CancellationToken,
         operation: Operation,
-    ) -> Result<bool, StorageRoleFailure> {
+    ) -> Result<Option<[u8; 32]>, StorageRoleFailure> {
         let facts = match self.protocol.head(path.as_str()).await {
             Ok(facts) => facts,
             Err(S3ProtocolFailure::Entry {
                 class: crate::model::FailureClass::NotFound,
                 ..
-            }) => return Ok(false),
+            }) => return Ok(None),
             Err(failure) => return Err(role_failure(path, operation, failure)),
         };
         if facts.size != expected_size {
-            return Ok(false);
+            return Ok(None);
         }
         let mut hasher = blake3::Hasher::new();
         let mut offset = 0;
@@ -337,22 +388,36 @@ impl<P: S3Protocol> S3StagedDestination<P> {
             let end = (offset + PART_SIZE as u64).min(facts.size);
             let bytes = self
                 .protocol
-                .get_range(path.as_str(), offset..end)
+                .get_range(path.as_str(), offset..end, &facts)
                 .await
                 .map_err(|failure| role_failure(path, operation, failure))?;
             if bytes.len() as u64 != end - offset {
-                return Ok(false);
+                return Ok(None);
             }
             hasher.update(&bytes);
             offset = end;
         }
-        Ok(hasher.finalize().as_bytes() == expected_blake3)
+        Ok(Some(*hasher.finalize().as_bytes()))
+    }
+
+    async fn content_matches(
+        &self,
+        path: &crate::model::StoragePath,
+        expected_size: u64,
+        expected_blake3: &[u8; 32],
+        cancel: &tokio_util::sync::CancellationToken,
+        operation: Operation,
+    ) -> Result<bool, StorageRoleFailure> {
+        self.content_digest(path, expected_size, cancel, operation)
+            .await
+            .map(|digest| digest.as_ref() == Some(expected_blake3))
     }
 }
 
 #[async_trait]
 impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
     async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
+        let part_size = planned_part_size(request.source.size, request.final_destination.path())?;
         let key = Self::temp_key(&request);
         let upload_id =
             self.protocol.begin_multipart(&key).await.map_err(|e| {
@@ -363,6 +428,8 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
             token.to_vec(),
             StageState {
                 persisted: 0,
+                expected_size: request.source.size,
+                part_size,
                 upload_id,
                 parts: Vec::new(),
                 completed: false,
@@ -394,6 +461,8 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
     }
 
     async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
+        // Source size is bound into recovery_binding, so retry selects the same sizing.
+        let part_size = planned_part_size(request.source.size, request.final_destination.path())?;
         let (token, key, upload_id) = Self::validated_recovery(&request)?;
         let claim_key = self.claim_recovery(&request, &key).await?;
         let observed = self.recovered_state(&request, &key, &upload_id).await;
@@ -425,6 +494,8 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
             token.to_vec(),
             StageState {
                 persisted,
+                expected_size: request.source.size,
+                part_size,
                 upload_id,
                 parts,
                 completed,
@@ -447,26 +518,15 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         mut input: ByteStream,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
         let key = self.validate(stage)?;
-        let initial = self
-            .states
-            .lock()
-            .await
-            .get(stage.token.as_ref())
-            .cloned()
-            .ok_or_else(|| {
-                entry(
-                    stage.final_destination.path(),
-                    Operation::Write,
-                    "S3 stage is not claimed",
-                )
-            })?;
+        let initial = self.stage_state(stage, Operation::Write).await?;
         if initial.completed {
             return Ok(WriteEvidence {
                 persisted_bytes: initial.persisted,
             });
         }
         let upload_id = initial.upload_id.clone();
-        let mut buffered = BytesMut::with_capacity(PART_SIZE);
+        let part_size = initial.part_size;
+        let mut buffered = BytesMut::with_capacity(part_size);
         let mut parts = initial.parts;
         let mut number = parts.iter().map(|part| part.0).max().unwrap_or(0) + 1;
         let result: Result<u64, StorageRoleFailure> = async {
@@ -480,8 +540,8 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                     }
                 };
                 buffered.extend_from_slice(&chunk);
-                while buffered.len() >= PART_SIZE {
-                    let part = buffered.split_to(PART_SIZE).freeze();
+                while buffered.len() >= part_size {
+                    let part = buffered.split_to(part_size).freeze();
                     inflight.push(upload(
                         self.protocol.clone(),
                         key.clone(),
@@ -504,7 +564,7 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                     }
                 }
             }
-            if !buffered.is_empty() || parts.is_empty() {
+            if !buffered.is_empty() || (parts.is_empty() && inflight.is_empty()) {
                 inflight.push(upload(
                     self.protocol.clone(),
                     key.clone(),
@@ -537,6 +597,8 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
             stage.token.to_vec(),
             StageState {
                 persisted,
+                expected_size: initial.expected_size,
+                part_size,
                 upload_id,
                 parts,
                 completed: true,
@@ -574,11 +636,17 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 .list_parts(&key, &stage_state.upload_id)
                 .await
                 .map_err(|e| role_failure(stage.final_destination.path(), Operation::Prepare, e))?;
-            let (persisted, parts) = resumable_parts(stage.final_destination.path(), parts)?;
+            let (persisted, parts) = resumable_parts(
+                stage.final_destination.path(),
+                parts,
+                stage_state.expected_size,
+            )?;
             self.states.lock().await.insert(
                 stage.token.to_vec(),
                 StageState {
                     persisted,
+                    expected_size: stage_state.expected_size,
+                    part_size: stage_state.part_size,
                     upload_id: stage_state.upload_id,
                     parts,
                     completed: false,
@@ -617,7 +685,7 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
             let end = (offset + PART_SIZE as u64).min(facts.size);
             let bytes = self
                 .protocol
-                .get_range(&key, offset..end)
+                .get_range(&key, offset..end, &facts)
                 .await
                 .map_err(|e| role_failure(stage.final_destination.path(), Operation::Verify, e))?;
             hasher.update(&bytes);
@@ -738,10 +806,11 @@ mod manifest_tests {
         let valid = resumable_parts(
             &path,
             vec![part(2, PART_SIZE as u64), part(1, PART_SIZE as u64)],
+            Some((PART_SIZE * 2) as u64),
         );
         assert_eq!(valid?.0, (PART_SIZE * 2) as u64);
-        assert!(resumable_parts(&path, vec![part(2, PART_SIZE as u64)]).is_err());
-        assert!(resumable_parts(&path, vec![part(1, 17)]).is_err());
+        assert!(resumable_parts(&path, vec![part(2, PART_SIZE as u64)], None).is_err());
+        assert!(resumable_parts(&path, vec![part(1, 17)], None).is_err());
         Ok(())
     }
 
@@ -753,9 +822,40 @@ mod manifest_tests {
         let observed = resumable_parts(
             &path,
             vec![part(2, native_part_size), part(1, native_part_size)],
+            Some(2 * native_part_size),
         )?;
         assert_eq!(observed.0, 2 * native_part_size);
         assert_eq!(observed.1.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn resumable_manifest_accepts_only_a_complete_short_final_part()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = crate::model::StoragePath::new("short-final-stage")?;
+        let final_size = PART_SIZE as u64 + 17;
+        let observed = resumable_parts(
+            &path,
+            vec![part(1, PART_SIZE as u64), part(2, 17)],
+            Some(final_size),
+        )?;
+        assert_eq!(observed.0, final_size);
+        assert!(
+            resumable_parts(
+                &path,
+                vec![part(1, PART_SIZE as u64), part(2, 17)],
+                Some(final_size + 1),
+            )
+            .is_err()
+        );
+        assert!(
+            resumable_parts(
+                &path,
+                vec![part(1, 17), part(2, PART_SIZE as u64)],
+                Some(final_size),
+            )
+            .is_err()
+        );
         Ok(())
     }
 }

@@ -37,16 +37,18 @@ pub(super) async fn transfer_native(
             TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
         })?;
     let digest = if request.needs_source_digest() {
-        hash_source(
-            &*input.source,
-            &input.descriptor,
-            request,
-            input.plan,
-            input.source_qos.clone(),
+        Some(
+            hash_source(
+                &*input.source,
+                &input.descriptor,
+                request,
+                input.plan,
+                input.source_qos.clone(),
+            )
+            .await?,
         )
-        .await?
     } else {
-        [0; 32]
+        None
     };
     let stage = select_stage(
         request,
@@ -110,7 +112,7 @@ async fn finish_native(
     input: NativeTransferInput,
     stage: crate::storage::PreparedStage,
     native: crate::storage::NativeStageEvidence,
-    digest: [u8; 32],
+    digest: Option<[u8; 32]>,
 ) -> Result<Transferred, TransferFailure> {
     let native_stats = SourceQosStats {
         logical_bytes: input.plan.source_size,

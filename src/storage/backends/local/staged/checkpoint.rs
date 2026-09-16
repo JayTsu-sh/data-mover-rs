@@ -36,6 +36,12 @@ pub(super) async fn persist(
     let staging = adapter.stage_directory(stage, Operation::Verify).await?;
     let probe = Arc::clone(&adapter.write_probe);
     #[cfg(test)]
+    probe
+        .checkpoint_prefixes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(durable_prefix);
+    #[cfg(test)]
     if probe.pause_checkpoint.swap(false, Ordering::SeqCst) {
         probe.checkpoint_started.notify_one();
         probe.checkpoint_release.notified().await;

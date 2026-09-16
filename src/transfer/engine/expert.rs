@@ -188,7 +188,7 @@ impl ExpertSourceSession {
 /// Bounded source payload consumed by a caller-owned transport.
 pub struct ExpertSourcePayload {
     ordered: crate::runtime::inflight::OrderedChunks,
-    producer: tokio::task::JoinHandle<Result<[u8; 32], TransferFailure>>,
+    producer: tokio::task::JoinHandle<Result<Option<[u8; 32]>, TransferFailure>>,
     failure: Arc<Mutex<Option<crate::storage::StorageRoleFailure>>>,
     path: crate::model::StoragePath,
     source_qos: Option<SourceQosBudget>,
@@ -237,9 +237,18 @@ impl ExpertSourcePayload {
                 "expert source payload was not fully consumed",
             ));
         }
-        let blake3 = self.producer.await.map_err(|_| {
-            TransferFailure::orchestration(TransferPhase::Transfer, "source producer stopped")
-        })??;
+        let blake3 = self
+            .producer
+            .await
+            .map_err(|_| {
+                TransferFailure::orchestration(TransferPhase::Transfer, "source producer stopped")
+            })??
+            .ok_or_else(|| {
+                TransferFailure::orchestration(
+                    TransferPhase::Transfer,
+                    "expert source digest is unavailable",
+                )
+            })?;
         Ok(ExpertSourceEvidence {
             source_size: self.offer.source_size,
             blake3,
@@ -699,7 +708,7 @@ impl ExpertDestinationTransferred {
                 &self.stage,
                 PublishRequest {
                     expected_size: self.source_size,
-                    expected_blake3: evidence.blake3,
+                    expected_blake3: Some(evidence.blake3),
                     cancel: self.cancel,
                 },
             )

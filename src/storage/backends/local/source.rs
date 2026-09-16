@@ -11,7 +11,7 @@ use bytes::Bytes;
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use futures::StreamExt as _;
-use futures::stream::FuturesOrdered;
+use futures::stream::{FuturesOrdered, FuturesUnordered};
 
 use super::observation::{LocalObservationAdapter, classify_io, source_identity};
 use crate::model::{
@@ -19,7 +19,8 @@ use crate::model::{
     Transience,
 };
 use crate::storage::{
-    ByteStream, ReadRequest, ReadSource, SourceDescriptor, SourceQosBudget, StorageRoleFailure,
+    ByteStream, PositionedByteStream, PositionedChunk, ReadRequest, ReadSource, SourceDescriptor,
+    SourceQosBudget, StorageRoleFailure,
 };
 
 /// Backend capability ceiling for one Local positional read.
@@ -29,15 +30,15 @@ use crate::storage::{
 /// reading only the missing suffix.
 const LOCAL_MAX_READ_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
-type LocalReadFuture = tokio::task::JoinHandle<(
+type LocalReadResult = (
     u64,
     u64,
     io::Result<Bytes>,
     Option<crate::storage::ReadAdmission>,
-)>;
+);
+type LocalReadFuture = tokio::task::JoinHandle<LocalReadResult>;
 
-/// One-open local source whose positional reads may complete out of order while the stream emits
-/// them in ascending offset order.
+/// One-open local source supporting ordered streams and completion-ordered positioned reads.
 pub(crate) struct LocalReadSource {
     root: Arc<Dir>,
     identity: BackendIdentity,
@@ -201,7 +202,36 @@ impl ReadSource for LocalReadSource {
         })
     }
 
+    fn supports_positioned_read(&self) -> bool {
+        true
+    }
+
+    async fn read_positioned(
+        &self,
+        request: ReadRequest,
+    ) -> Result<PositionedByteStream, StorageRoleFailure> {
+        let state = self.read_state(request, false).await?;
+        Ok(Box::pin(futures::stream::try_unfold(
+            state,
+            read_next_chunk,
+        )))
+    }
+
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure> {
+        let state = self.read_state(request, true).await?;
+        Ok(Box::pin(
+            futures::stream::try_unfold(state, read_next_chunk)
+                .map(|item| item.map(|chunk| chunk.data)),
+        ))
+    }
+}
+
+impl LocalReadSource {
+    async fn read_state(
+        &self,
+        request: ReadRequest,
+        ordered: bool,
+    ) -> Result<LocalReadState, StorageRoleFailure> {
         if request.cancel.is_cancelled() {
             return Err(failure(
                 &request.path,
@@ -240,17 +270,18 @@ impl ReadSource for LocalReadSource {
             end: range.end,
             maximum_chunk_bytes: request.maximum_chunk_bytes.min(LOCAL_MAX_READ_CHUNK_BYTES),
             read_concurrency: self.read_concurrency.min(request.read_inflight),
-            inflight: FuturesOrdered::new(),
+            inflight: if ordered {
+                ReadQueue::Ordered(FuturesOrdered::new())
+            } else {
+                ReadQueue::Positioned(FuturesUnordered::new())
+            },
             cancel: request.cancel,
             source_qos: request.source_qos,
             budget: request.read_budget,
             #[cfg(test)]
             probe: Arc::clone(&self.probe),
         };
-        Ok(Box::pin(futures::stream::try_unfold(
-            state,
-            read_next_chunk,
-        )))
+        Ok(state)
     }
 }
 
@@ -281,6 +312,35 @@ impl LocalReadSource {
     }
 }
 
+enum ReadQueue {
+    Ordered(FuturesOrdered<LocalReadFuture>),
+    Positioned(FuturesUnordered<LocalReadFuture>),
+}
+
+impl ReadQueue {
+    fn len(&self) -> usize {
+        match self {
+            Self::Ordered(q) => q.len(),
+            Self::Positioned(q) => q.len(),
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn push_back(&mut self, value: LocalReadFuture) {
+        match self {
+            Self::Ordered(q) => q.push_back(value),
+            Self::Positioned(q) => q.push(value),
+        }
+    }
+    async fn next(&mut self) -> Option<Result<LocalReadResult, tokio::task::JoinError>> {
+        match self {
+            Self::Ordered(q) => q.next().await,
+            Self::Positioned(q) => q.next().await,
+        }
+    }
+}
+
 struct LocalReadState {
     file: Arc<std::fs::File>,
     path: StoragePath,
@@ -289,7 +349,7 @@ struct LocalReadState {
     end: u64,
     maximum_chunk_bytes: usize,
     read_concurrency: usize,
-    inflight: FuturesOrdered<LocalReadFuture>,
+    inflight: ReadQueue,
     cancel: tokio_util::sync::CancellationToken,
     source_qos: Option<SourceQosBudget>,
     budget: Option<crate::storage::ReadBudget>,
@@ -299,7 +359,7 @@ struct LocalReadState {
 
 async fn read_next_chunk(
     mut state: LocalReadState,
-) -> Result<Option<(Bytes, LocalReadState)>, StorageRoleFailure> {
+) -> Result<Option<(PositionedChunk, LocalReadState)>, StorageRoleFailure> {
     fill_read_pipeline(&mut state).await?;
     if state.inflight.is_empty() {
         return Ok(None);
@@ -315,7 +375,7 @@ async fn read_next_chunk(
         .ok_or_else(|| failure(&state.path, FailureClass::Internal, Transience::Unknown))?
         .map_err(|_| failure(&state.path, FailureClass::Internal, Transience::Unknown))?;
     let (start, requested, result, admission) = joined;
-    if start != state.next_emit {
+    if matches!(state.inflight, ReadQueue::Ordered(_)) && start != state.next_emit {
         return Err(failure(
             &state.path,
             FailureClass::Internal,
@@ -346,7 +406,13 @@ async fn read_next_chunk(
     if let (Some(budget), Some(admission)) = (&state.budget, admission) {
         budget.ready(start, admission);
     }
-    Ok(Some((bytes, state)))
+    Ok(Some((
+        PositionedChunk {
+            offset: start,
+            data: bytes,
+        },
+        state,
+    )))
 }
 
 async fn fill_read_pipeline(state: &mut LocalReadState) -> Result<(), StorageRoleFailure> {

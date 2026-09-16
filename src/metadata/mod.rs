@@ -95,6 +95,7 @@ pub enum ValueTarget {
 pub enum OwnershipTarget {
     Numeric,
     ExternalMapping,
+    ModeOnly,
     Unsupported,
     NotApplicable,
 }
@@ -148,6 +149,7 @@ pub enum SemanticLoss {
     XattrsDropped,
     TagsDropped,
     OwnershipModeDropped,
+    OwnerAndGroupDropped,
     TimestampPrecisionReduced,
     AccessedTimestampDropped,
     ModifiedTimestampDropped,
@@ -278,13 +280,19 @@ impl MetadataPlan {
     ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
         let mut outcomes = self.planned_outcomes();
         let Some((first_family, _)) = self.mutations.first() else {
-            return Ok(MetadataApplicationReport { outcomes });
+            return Ok(MetadataApplicationReport {
+                outcomes,
+                losses: self.losses.clone(),
+            });
         };
         if cancel.is_cancelled() {
             return Err(MetadataApplicationFailure {
                 family: *first_family,
                 error: None,
-                report: MetadataApplicationReport { outcomes },
+                report: MetadataApplicationReport {
+                    outcomes,
+                    losses: self.losses.clone(),
+                },
             });
         }
         let mutations = self
@@ -304,13 +312,19 @@ impl MetadataPlan {
             return Err(MetadataApplicationFailure {
                 family,
                 error: failure.error,
-                report: MetadataApplicationReport { outcomes },
+                report: MetadataApplicationReport {
+                    outcomes,
+                    losses: self.losses.clone(),
+                },
             });
         }
         for (family, _) in &self.mutations {
             set_outcome(&mut outcomes, *family, ApplicationOutcome::Applied);
         }
-        Ok(MetadataApplicationReport { outcomes })
+        Ok(MetadataApplicationReport {
+            outcomes,
+            losses: self.losses.clone(),
+        })
     }
 
     async fn apply_to(
@@ -324,7 +338,10 @@ impl MetadataPlan {
                 return Err(MetadataApplicationFailure {
                     family: *family,
                     error: None,
-                    report: MetadataApplicationReport { outcomes },
+                    report: MetadataApplicationReport {
+                        outcomes,
+                        losses: self.losses.clone(),
+                    },
                 });
             }
             if let Err(error) = target.apply(mutation.clone(), cancel.clone()).await {
@@ -332,12 +349,18 @@ impl MetadataPlan {
                 return Err(MetadataApplicationFailure {
                     family: *family,
                     error: Some(error),
-                    report: MetadataApplicationReport { outcomes },
+                    report: MetadataApplicationReport {
+                        outcomes,
+                        losses: self.losses.clone(),
+                    },
                 });
             }
             set_outcome(&mut outcomes, *family, ApplicationOutcome::Applied);
         }
-        Ok(MetadataApplicationReport { outcomes })
+        Ok(MetadataApplicationReport {
+            outcomes,
+            losses: self.losses.clone(),
+        })
     }
 
     fn planned_outcomes(&self) -> Vec<FamilyApplication> {
@@ -394,9 +417,16 @@ pub struct FamilyApplication {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetadataApplicationReport {
     outcomes: Vec<FamilyApplication>,
+    losses: LossReport,
 }
 
 impl MetadataApplicationReport {
+    /// Known semantic losses retained from planning, including unmapped principals.
+    #[must_use]
+    pub const fn loss_report(&self) -> &LossReport {
+        &self.losses
+    }
+
     #[must_use]
     pub fn outcomes(&self) -> &[FamilyApplication] {
         &self.outcomes
@@ -464,6 +494,57 @@ pub fn compile_metadata_plan(
     )?;
     compile_ownership(request, &mut plan)?;
     compile_timestamps(request, &mut plan)?;
+    Ok(plan)
+}
+
+/// Compiles automatic copy facts without fabricating numeric owner/group IDs.
+pub(crate) fn compile_copied_metadata_plan(
+    request: &MetadataPlanRequest<'_>,
+    mode_without_ownership: Option<u32>,
+) -> Result<MetadataPlan, MetadataPlanError> {
+    let projected = MetadataPlanRequest {
+        observations: request.observations,
+        target: request.target,
+        policies: if mode_without_ownership.is_some() {
+            request.policies.with_ownership_mode(MetadataPolicy::Omit)
+        } else {
+            request.policies
+        },
+        principal_mapper: request.principal_mapper,
+    };
+    let mut plan = compile_metadata_plan(&projected)?;
+    if let Some(mode) = mode_without_ownership
+        .filter(|_| request.policies.get(MetadataFamily::OwnershipMode) != MetadataPolicy::Omit)
+    {
+        let family = MetadataFamily::OwnershipMode;
+        // This alternative observation replaces the absent numeric ownership family.
+        plan.mappings.retain(|value| value.family != family);
+        plan.mutations.retain(|(value, _)| *value != family);
+        plan.losses.0.retain(|(value, _)| *value != family);
+        let supported = matches!(
+            request.target.ownership_mode,
+            OwnershipTarget::Numeric | OwnershipTarget::ModeOnly
+        );
+        drop_with_loss(
+            &mut plan,
+            family,
+            request.policies.get(family),
+            if supported {
+                SemanticLoss::OwnerAndGroupDropped
+            } else {
+                SemanticLoss::OwnershipModeDropped
+            },
+        )?;
+        if supported {
+            let index = plan
+                .mutations
+                .iter()
+                .position(|(value, _)| *value == MetadataFamily::Timestamps)
+                .unwrap_or(plan.mutations.len());
+            plan.mutations
+                .insert(index, (family, MetadataMutation::Mode(mode & 0o7777)));
+        }
+    }
     Ok(plan)
 }
 
@@ -557,6 +638,23 @@ fn compile_ownership(
                 kind: MetadataPlanErrorKind::PrincipalMappingFailed,
             })?;
             exact(plan, family, MetadataMutation::MappedOwnership(ownership));
+            Ok(())
+        }
+        OwnershipTarget::ModeOnly => {
+            let losses = vec![SemanticLoss::OwnerAndGroupDropped];
+            if policy == MetadataPolicy::RequireExact {
+                return Err(MetadataPlanError {
+                    family,
+                    kind: MetadataPlanErrorKind::KnownLossRejected,
+                });
+            }
+            plan.losses.0.push((family, losses[0]));
+            plan.mappings.push(FamilyMapping {
+                family,
+                decision: MappingDecision::Lossy(losses),
+            });
+            plan.mutations
+                .push((family, MetadataMutation::Mode(value.mode & 0o7777)));
             Ok(())
         }
         OwnershipTarget::Unsupported => {
@@ -669,6 +767,7 @@ const fn precision_step(precision: TimePrecision) -> i128 {
         TimePrecision::Seconds => 1_000_000_000,
         TimePrecision::Milliseconds => 1_000_000,
         TimePrecision::Microseconds => 1_000,
+        TimePrecision::HundredNanoseconds => 100,
         TimePrecision::Nanoseconds => 1,
     }
 }

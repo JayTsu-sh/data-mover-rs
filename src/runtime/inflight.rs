@@ -187,6 +187,10 @@ pub(crate) struct InflightAdmission {
 }
 
 impl InflightAdmission {
+    pub(crate) const fn reserved_length(&self) -> usize {
+        self.length
+    }
+
     pub(crate) async fn complete(self, data: Bytes) -> Result<(), InflightFailure> {
         if data.len() != self.length {
             return Err(InflightFailure::ProducedLengthMismatch {

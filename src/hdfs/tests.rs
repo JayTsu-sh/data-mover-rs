@@ -18,24 +18,54 @@ mod tests {
     fn append_open_waits_only_for_a_bounded_lease_recovery_window() {
         let lease = hdfs_native::HdfsError::AlreadyExists("lease is still owned".to_string());
         assert_eq!(
-            super::append_open_retry_delay(&lease, 0),
+            super::append_open_retry_delay(&lease, 0, std::time::Duration::ZERO),
             Some(std::time::Duration::from_secs(1))
         );
         assert_eq!(
-            super::append_open_retry_delay(&lease, 5),
-            Some(std::time::Duration::from_secs(32))
+            super::append_open_retry_delay(&lease, 5, std::time::Duration::from_secs(31)),
+            Some(std::time::Duration::from_secs(8))
         );
-        assert_eq!(super::append_open_retry_delay(&lease, 6), None);
         let recovering = hdfs_native::HdfsError::RPCError(
             "org.apache.hadoop.hdfs.protocol.RecoveryInProgressException".to_string(),
             "redacted".to_string(),
         );
         assert_eq!(
-            super::append_open_retry_delay(&recovering, 1),
-            Some(std::time::Duration::from_secs(2))
+            super::append_open_retry_delay(
+                &recovering,
+                6,
+                std::time::Duration::from_secs(63)
+            ),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            super::append_open_retry_delay(
+                &recovering,
+                7,
+                super::HDFS_LEASE_RECOVERY_TIMEOUT
+            ),
+            None
         );
         let missing = hdfs_native::HdfsError::FileNotFound("missing".to_string());
-        assert_eq!(super::append_open_retry_delay(&missing, 0), None);
+        assert_eq!(
+            super::append_open_retry_delay(&missing, 0, std::time::Duration::ZERO),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_lease_recovery_polling_is_bounded() {
+        assert_eq!(
+            super::lease_recovery_poll_delay(std::time::Duration::ZERO),
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert_eq!(
+            super::lease_recovery_poll_delay(std::time::Duration::from_millis(119_750)),
+            None
+        );
+        assert_eq!(
+            super::lease_recovery_poll_delay(super::HDFS_LEASE_RECOVERY_TIMEOUT),
+            None
+        );
     }
 
     #[test]

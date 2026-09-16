@@ -13,16 +13,49 @@ use crate::storage::{Metadata, MetadataMutation, StorageRoleFailure};
 
 pub(super) struct HdfsMetadata {
     protocol: Arc<dyn HdfsProtocol>,
+    identity: crate::model::BackendIdentity,
 }
 
 impl HdfsMetadata {
-    pub(super) fn new<P: HdfsProtocol + 'static>(protocol: Arc<P>) -> Self {
-        Self { protocol }
+    pub(super) fn new<P: HdfsProtocol + 'static>(
+        protocol: Arc<P>,
+        identity: crate::model::BackendIdentity,
+    ) -> Self {
+        Self { protocol, identity }
     }
 }
 
 #[async_trait]
 impl Metadata for HdfsMetadata {
+    fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
+        Some(ObservationPlan::default().with_timestamps(ObservationMode::Required))
+    }
+
+    async fn observe_copy_bound(
+        &self,
+        path: &StoragePath,
+        expected: &crate::model::SourceIdentity,
+        plan: ObservationPlan,
+    ) -> Result<crate::storage::CopiedMetadataObservation, StorageRoleFailure> {
+        let facts = self.protocol.stat(path).await?;
+        let descriptor = super::source::descriptor(&self.identity, path.clone(), &facts)?;
+        if descriptor.source_identity != *expected {
+            return Err(failure(path, FailureClass::Conflict));
+        }
+        let observations = MetadataObservations::new(
+            unavailable(plan.acl()),
+            unavailable(plan.xattrs()),
+            not_applicable(plan.tags()),
+            unavailable(plan.ownership_mode()),
+            inline(plan.timestamps(), timestamps(facts.atime, facts.mtime)),
+        )
+        .map_err(|_| failure(path, FailureClass::Protocol))?;
+        Ok(crate::storage::CopiedMetadataObservation {
+            observations,
+            mode_without_ownership: Some(facts.mode & 0o7777),
+        })
+    }
+
     async fn observe(
         &self,
         path: &StoragePath,
@@ -59,6 +92,7 @@ impl Metadata for HdfsMetadata {
                     .set_mapped_ownership(path, value.owner(), value.group(), value.mode)
                     .await
             }
+            MetadataMutation::Mode(mode) => self.protocol.set_mode(path, mode).await,
             MetadataMutation::Timestamps(value) => {
                 self.protocol
                     .set_timestamps(

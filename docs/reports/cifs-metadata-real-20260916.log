@@ -1,0 +1,34 @@
+   Compiling data-mover v0.2.0 (/root/jay/rust/github/data-mover-rs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 38.43s
+     Running tests/cifs_policy_contract.rs (/work/cargo-target/debug/deps/cifs_policy_contract-a710a9cc4af72dfc)
+
+running 2 tests
+test real_directory_mtime_apply_preserves_creation_time ... ok
+test real_share_checkpointed_and_atomic_replace_roundtrip ... CIFS case Checkpointed destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-Checkpointed-4096 elapsed_ms=24 recovery=SkippedSingleSourceChunk
+CIFS case Checkpointed destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-Checkpointed-4096-copied elapsed_ms=26 recovery=SkippedSingleSourceChunk
+CIFS case Checkpointed destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-Checkpointed-4096-copied elapsed_ms=31 recovery=SkippedSingleSourceChunk
+CIFS case AtomicReplace destination=returned elapsed_ms=11 recovery=Disabled
+CIFS case Checkpointed destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-Checkpointed-2097153 elapsed_ms=79 recovery=SkippedBelowCheckpointThreshold
+CIFS case Checkpointed destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-Checkpointed-2097153-copied elapsed_ms=62 recovery=SkippedBelowCheckpointThreshold
+CIFS case Checkpointed destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-Checkpointed-2097153-copied elapsed_ms=102 recovery=SkippedBelowCheckpointThreshold
+CIFS case AtomicReplace destination=returned elapsed_ms=45 recovery=Disabled
+CIFS case Checkpointed destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-Checkpointed-67108865 elapsed_ms=1580 recovery=Checkpointed
+CIFS case Checkpointed destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-Checkpointed-67108865-copied elapsed_ms=999 recovery=Checkpointed
+CIFS case Checkpointed destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-Checkpointed-67108865-copied elapsed_ms=1643 recovery=Checkpointed
+CIFS case AtomicReplace destination=returned elapsed_ms=690 recovery=Disabled
+CIFS case AtomicReplace destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-AtomicReplace-4096 elapsed_ms=31 recovery=Disabled
+CIFS case AtomicReplace destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-AtomicReplace-4096-copied elapsed_ms=35 recovery=Disabled
+CIFS case AtomicReplace destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-AtomicReplace-4096-copied elapsed_ms=30 recovery=Disabled
+CIFS case AtomicReplace destination=returned elapsed_ms=11 recovery=Disabled
+CIFS case AtomicReplace destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-AtomicReplace-2097153 elapsed_ms=101 recovery=Disabled
+CIFS case AtomicReplace destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-AtomicReplace-2097153-copied elapsed_ms=58 recovery=Disabled
+CIFS case AtomicReplace destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-AtomicReplace-2097153-copied elapsed_ms=93 recovery=Disabled
+CIFS case AtomicReplace destination=returned elapsed_ms=35 recovery=Disabled
+CIFS case AtomicReplace destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-AtomicReplace-67108865 elapsed_ms=1598 recovery=Disabled
+CIFS case AtomicReplace destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-AtomicReplace-67108865-copied elapsed_ms=726 recovery=Disabled
+CIFS case AtomicReplace destination=dm-cifs-policy-5e3bd759ae604029b06269dc490058e8-AtomicReplace-67108865-copied elapsed_ms=1501 recovery=Disabled
+CIFS case AtomicReplace destination=returned elapsed_ms=682 recovery=Disabled
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.09s
+

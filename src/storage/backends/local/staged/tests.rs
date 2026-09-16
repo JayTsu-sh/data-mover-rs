@@ -564,7 +564,7 @@ async fn cancelled_publication_preserves_destination_and_stage() -> io::Result<(
                 &stage,
                 PublishRequest {
                     expected_size: payload.len() as u64,
-                    expected_blake3: *blake3::hash(&payload).as_bytes(),
+                    expected_blake3: Some(*blake3::hash(&payload).as_bytes()),
                     cancel,
                 },
             )
@@ -697,7 +697,7 @@ async fn nested_stages_recover_in_the_parent() -> io::Result<()> {
             &recovered,
             PublishRequest {
                 expected_size: 9,
-                expected_blake3: *blake3::hash(b"new-bytes").as_bytes(),
+                expected_blake3: Some(*blake3::hash(b"new-bytes").as_bytes()),
                 cancel: tokio_util::sync::CancellationToken::new(),
             },
         )
@@ -730,7 +730,7 @@ async fn publication_resolves_a_replaced_parent_and_preserves_existing_entries()
             &stage,
             PublishRequest {
                 expected_size: 9,
-                expected_blake3: *blake3::hash(b"new-bytes").as_bytes(),
+                expected_blake3: Some(*blake3::hash(b"new-bytes").as_bytes()),
                 cancel: tokio_util::sync::CancellationToken::new(),
             },
         )
@@ -871,5 +871,357 @@ async fn cached_stage_rejects_a_rebound_token() -> io::Result<()> {
     first.token = original;
     ok(adapter.discard(first).await);
     ok(adapter.discard(second).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn positioned_write_stores_later_chunk_before_receiving_prefix() -> io::Result<()> {
+    use crate::storage::PositionedChunk;
+    let root = TestRoot::new().await?;
+    let backend = identity("positioned-write");
+    let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
+    let stage = ok(adapter
+        .prepare(request_with_size(&backend, "final.bin", 8))
+        .await);
+    let path = ok(adapter.stage_full_path(&stage, Operation::Read));
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let input = Box::pin(stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    }));
+    let produce = async {
+        ok(sender
+            .send(Ok(PositionedChunk {
+                offset: 4,
+                data: Bytes::from_static(b"efgh"),
+            }))
+            .await);
+        let observed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let bytes = tokio::fs::read(&path).await?;
+                if bytes.len() == 8 && &bytes[4..] == b"efgh" {
+                    return Ok::<_, io::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        // Always release the consumer, even if the positioned write did not progress.
+        ok(sender
+            .send(Ok(PositionedChunk {
+                offset: 0,
+                data: Bytes::from_static(b"abcd"),
+            }))
+            .await);
+        drop(sender);
+        observed??;
+        Ok::<_, io::Error>(())
+    };
+    let (result, produced) = tokio::join!(adapter.write_positioned(&stage, input), produce);
+    produced?;
+    assert_eq!(ok(result).persisted_bytes, 8);
+    assert_eq!(tokio::fs::read(&path).await?, b"abcdefgh");
+    assert_eq!(
+        ok(adapter.observe_checkpoint(&stage).await).durable_prefix,
+        8
+    );
+    ok(adapter.discard(stage).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn positioned_cancel_preserves_only_contiguous_prefix() -> io::Result<()> {
+    use crate::storage::PositionedChunk;
+    let root = TestRoot::new().await?;
+    let backend = identity("positioned-cancel");
+    let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 3));
+    let stage = ok(adapter
+        .prepare(request_with_size(&backend, "final.bin", 12))
+        .await);
+    let cancelled = failure(
+        stage.final_destination.path(),
+        Operation::Read,
+        FailureClass::Cancelled,
+    );
+    let input = Box::pin(stream::iter(vec![
+        Ok(PositionedChunk {
+            offset: 8,
+            data: Bytes::from_static(b"ijkl"),
+        }),
+        Ok(PositionedChunk {
+            offset: 0,
+            data: Bytes::from_static(b"abcd"),
+        }),
+        Err(cancelled),
+    ]));
+    let error = adapter.write_positioned(&stage, input).await;
+    assert!(
+        matches!(error, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled)
+    );
+    assert_eq!(
+        ok(adapter.observe_checkpoint(&stage).await).durable_prefix,
+        4
+    );
+    assert_eq!(
+        tokio::fs::read(ok(adapter.stage_full_path(&stage, Operation::Read))).await?,
+        b"abcd"
+    );
+    ok(adapter.discard(stage).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn positioned_eof_with_hole_is_corruption_not_checkpointed_length() -> io::Result<()> {
+    use crate::storage::PositionedChunk;
+    let root = TestRoot::new().await?;
+    let backend = identity("positioned-hole");
+    let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
+    let stage = ok(adapter
+        .prepare(request_with_size(&backend, "final.bin", 8))
+        .await);
+    let input = Box::pin(stream::iter(vec![Ok(PositionedChunk {
+        offset: 4,
+        data: Bytes::from_static(b"efgh"),
+    })]));
+    assert!(
+        matches!(adapter.write_positioned(&stage, input).await, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Corruption)
+    );
+    assert_eq!(
+        ok(adapter.observe_checkpoint(&stage).await).durable_prefix,
+        0
+    );
+    assert_eq!(
+        tokio::fs::metadata(ok(adapter.stage_full_path(&stage, Operation::Read)))
+            .await?
+            .len(),
+        0
+    );
+    ok(adapter.discard(stage).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn positioned_checkpoint_persistence_overlaps_the_next_write_window() -> io::Result<()> {
+    let root = TestRoot::new().await?;
+    let backend = identity("positioned-checkpoint-overlap");
+    let adapter = Arc::new(ok(LocalStagedDestination::new(&root.0, backend.clone(), 2)));
+    let stage = ok(adapter.prepare(request(&backend, "final.bin")).await);
+    let probe = Arc::clone(&adapter.write_probe);
+    probe.pause_checkpoint.store(true, Ordering::SeqCst);
+    let writing = Arc::clone(&adapter);
+    let writer = tokio::spawn(async move {
+        let input = stream::iter((0..5).map(|index| {
+            Ok(crate::storage::PositionedChunk {
+                offset: index * 64 * 1024,
+                data: Bytes::from(vec![42; 64 * 1024]),
+            })
+        }));
+        let result = writing.write_positioned(&stage, Box::pin(input)).await;
+        (stage, result)
+    });
+    tokio::time::timeout(Duration::from_secs(3), probe.checkpoint_started.notified()).await?;
+    let advanced = tokio::time::timeout(Duration::from_secs(1), async {
+        while adapter.write_completion_count() < 5 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    probe.checkpoint_release.notify_one();
+    let (stage, result) = writer.await?;
+    assert_eq!(ok(result).persisted_bytes, 5 * 64 * 1024);
+    assert!(
+        advanced.is_ok(),
+        "checkpoint persistence stalled subsequent writes"
+    );
+    assert_eq!(
+        tokio::fs::read(
+            adapter
+                .stage_full_path(&stage, Operation::Read)
+                .map_err(io::Error::other)?
+        )
+        .await?,
+        vec![42; 5 * 64 * 1024]
+    );
+    assert_eq!(
+        ok(adapter.observe_checkpoint(&stage).await).durable_prefix,
+        5 * 64 * 1024
+    );
+    ok(adapter.discard(stage).await);
+    Ok(())
+}
+
+struct PositionedRegistration(AtomicU64);
+
+#[async_trait]
+impl crate::storage::roles::CheckpointRegistration for PositionedRegistration {
+    async fn register(
+        &self,
+        _stage: &PreparedStage,
+        _identity: RecoveryIdentity,
+    ) -> Result<(), StorageRoleFailure> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn positioned_checkpoint_distinguishes_final_crossing_from_earlier_boundary() -> io::Result<()>
+{
+    use crate::storage::{DeferredCheckpoint, PositionedChunk};
+    for (size, offsets, expected) in [(8, vec![4, 0], 0), (12, vec![8, 4, 0], 1)] {
+        let root = TestRoot::new().await?;
+        let backend = identity("positioned-checkpoint-boundaries");
+        let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 3));
+        let mut stage = ok(adapter
+            .prepare_ephemeral(request_with_size(&backend, "final.bin", size))
+            .await);
+        let registration = Arc::new(PositionedRegistration(AtomicU64::new(0)));
+        stage.deferred_checkpoint = Some(DeferredCheckpoint {
+            interval_bytes: 6,
+            source_size: size as u64,
+            registration: registration.clone(),
+        });
+        let input = Box::pin(stream::iter(offsets.into_iter().map(|offset| {
+            Ok(PositionedChunk {
+                offset,
+                data: Bytes::from_static(b"abcd"),
+            })
+        })));
+        assert_eq!(
+            ok(adapter.write_positioned(&stage, input).await).persisted_bytes,
+            size as u64
+        );
+        assert_eq!(registration.0.load(Ordering::SeqCst), expected);
+        assert_eq!(stage.recovery_enabled(), expected != 0);
+        ok(adapter.discard(stage).await);
+    }
+    Ok(())
+}
+
+async fn send_positioned_then_wait_for_next_poll(
+    sender: &tokio::sync::mpsc::Sender<Result<crate::storage::PositionedChunk, StorageRoleFailure>>,
+    polled: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    offset: u64,
+    length: usize,
+) -> io::Result<()> {
+    sender
+        .send(Ok(crate::storage::PositionedChunk {
+            offset,
+            data: Bytes::from(vec![42; length]),
+        }))
+        .await
+        .map_err(io::Error::other)?;
+    tokio::time::timeout(Duration::from_secs(3), polled.recv())
+        .await?
+        .ok_or_else(|| io::Error::other("positioned writer stopped polling"))
+}
+
+async fn wait_for_durable_prefix(
+    adapter: &LocalStagedDestination,
+    stage: &PreparedStage,
+    prefix: u64,
+) -> io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if stage.recovery_enabled()
+                && adapter
+                    .observe_checkpoint(stage)
+                    .await
+                    .is_ok_and(|value| value.durable_prefix == prefix)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+fn observed_checkpoint_prefixes(adapter: &LocalStagedDestination) -> Vec<u64> {
+    adapter
+        .write_probe
+        .checkpoint_prefixes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+#[tokio::test]
+async fn positioned_sparse_completion_crosses_multiple_intervals_once() -> io::Result<()> {
+    use crate::storage::DeferredCheckpoint;
+    let root = TestRoot::new().await?;
+    let backend = identity("positioned-sparse-threshold");
+    // Depth one makes the next input poll an acknowledgement barrier for the prior write.
+    let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 1));
+    let mut stage = ok(adapter
+        .prepare_ephemeral(request_with_size(&backend, "final.bin", 24))
+        .await);
+    let registration = Arc::new(PositionedRegistration(AtomicU64::new(0)));
+    stage.deferred_checkpoint = Some(DeferredCheckpoint {
+        interval_bytes: 4,
+        source_size: 24,
+        registration: registration.clone(),
+    });
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let (poll_sender, mut polled) = tokio::sync::mpsc::unbounded_channel();
+    let input = Box::pin(stream::unfold(
+        (receiver, poll_sender),
+        |(mut receiver, poll_sender)| async move {
+            let _ = poll_sender.send(());
+            receiver
+                .recv()
+                .await
+                .map(|item| (item, (receiver, poll_sender)))
+        },
+    ));
+    let produce = async {
+        tokio::time::timeout(Duration::from_secs(3), polled.recv()).await?;
+        send_positioned_then_wait_for_next_poll(&sender, &mut polled, 16, 4).await?;
+        send_positioned_then_wait_for_next_poll(&sender, &mut polled, 4, 8).await?;
+        assert_eq!(registration.0.load(Ordering::SeqCst), 0);
+        assert!(!stage.recovery_enabled());
+        assert!(observed_checkpoint_prefixes(&adapter).is_empty());
+        // Filling 0..4 joins 4..12. The sparse 16..20 suffix is still ineligible.
+        send_positioned_then_wait_for_next_poll(&sender, &mut polled, 0, 4).await?;
+        wait_for_durable_prefix(&adapter, &stage, 12).await?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while registration.0.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(registration.0.load(Ordering::SeqCst), 1);
+        assert_eq!(observed_checkpoint_prefixes(&adapter), [12]);
+        assert_eq!(
+            tokio::fs::metadata(ok(adapter.stage_full_path(&stage, Operation::Read)))
+                .await?
+                .len(),
+            20
+        );
+        // Acknowledged prefix 14 must not trigger a catch-up checkpoint at 4 or 8.
+        send_positioned_then_wait_for_next_poll(&sender, &mut polled, 12, 2).await?;
+        assert_eq!(
+            ok(adapter.observe_checkpoint(&stage).await).durable_prefix,
+            12
+        );
+        // Crossing the new threshold 16 connects the already-written suffix to 20.
+        send_positioned_then_wait_for_next_poll(&sender, &mut polled, 14, 2).await?;
+        wait_for_durable_prefix(&adapter, &stage, 20).await?;
+        assert_eq!(observed_checkpoint_prefixes(&adapter), [12, 20]);
+        send_positioned_then_wait_for_next_poll(&sender, &mut polled, 20, 4).await?;
+        drop(sender);
+        Ok::<_, io::Error>(())
+    };
+    let (written, produced) = tokio::join!(adapter.write_positioned(&stage, input), produce);
+    produced?;
+    assert_eq!(ok(written).persisted_bytes, 24);
+    // Two periodic checkpoints plus the final checkpoint, no redundant threshold replay.
+    assert_eq!(observed_checkpoint_prefixes(&adapter), [12, 20, 24]);
+    assert_eq!(registration.0.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        tokio::fs::read(ok(adapter.stage_full_path(&stage, Operation::Read))).await?,
+        vec![42; 24]
+    );
+    ok(adapter.discard(stage).await);
     Ok(())
 }

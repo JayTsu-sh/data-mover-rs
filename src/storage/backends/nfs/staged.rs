@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +15,9 @@ use crate::storage::{
     RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure, VerificationEvidence,
     VerifyRequest, WriteEvidence,
 };
+
+#[path = "positioned_writer.rs"]
+mod positioned_writer;
 
 pub(crate) const INTERNAL_PREFIX: &str = ".data-mover-";
 
@@ -381,143 +384,6 @@ impl NfsStagedDestinationAdapter {
             .map_err(|error| role_failure(stage.final_destination.path(), Operation::Write, error))
     }
 
-    async fn consume_input(
-        &self,
-        stage: &PreparedStage,
-        input: &mut ByteStream,
-        handle: &Arc<dyn NfsStageFile>,
-        concurrency: usize,
-        maximum_chunk_bytes: usize,
-    ) -> NfsWriteProgress {
-        let mut writes = FuturesUnordered::<NfsWriteFuture>::new();
-        let mut issued = stage.write_offset;
-        let mut persisted = stage.write_offset;
-        let mut completed = BTreeMap::new();
-        let mut input_finished = false;
-        let mut pending_input: Option<Bytes> = None;
-        let mut first_failure = None;
-        let mut checkpoint_due = false;
-        let mut deferred_writes_used = false;
-        let mut next_checkpoint = next_deferred_checkpoint(stage, stage.write_offset);
-        let periodic_checkpoint = stage.deferred_checkpoint.is_some();
-        let mut checkpoint: Option<futures::future::BoxFuture<'_, Result<(), StorageRoleFailure>>> =
-            None;
-        loop {
-            if checkpoint_due && writes.is_empty() && first_failure.is_none() {
-                // Settle the previous record before the next periodic data barrier.
-                if let Some(pending) = checkpoint.take() {
-                    first_failure = pending.await.err();
-                }
-                if first_failure.is_none() {
-                    first_failure = Self::checkpoint_prefix(stage, handle, persisted, issued)
-                        .await
-                        .err();
-                }
-                if first_failure.is_none() {
-                    checkpoint = Some(Box::pin(
-                        self.persist_deferred_checkpoint_record(stage, issued),
-                    ));
-                    next_checkpoint = next_deferred_checkpoint(stage, issued);
-                }
-                checkpoint_due = false;
-            }
-            let accept_input = !input_finished
-                && first_failure.is_none()
-                && !checkpoint_due
-                && writes.len() < concurrency;
-            if !accept_input && writes.is_empty() {
-                break;
-            }
-            tokio::select! {
-                biased;
-                result = async { match checkpoint.as_mut() { Some(pending) => pending.await, None => std::future::pending().await } }, if checkpoint.is_some() => {
-                    checkpoint = None;
-                    if first_failure.is_none() {
-                        first_failure = result.err();
-                    }
-                }
-                Some((offset, expected, result)) = writes.next(), if !writes.is_empty() => {
-                    match Self::record_write_completion(stage.final_destination.path(), offset, expected, result, &mut completed, &mut persisted) {
-                        Ok(error) if first_failure.is_none() => first_failure = error,
-                        Err(error) if first_failure.is_none() => first_failure = Some(error),
-                        Ok(_) | Err(_) => {},
-                    }
-                }
-                item = async {
-                    if let Some(bytes) = pending_input.take() { Some(Ok(bytes)) }
-                    else { input.next().await }
-                }, if accept_input => {
-                    let mut bytes = match item {
-                        Some(Ok(bytes)) => bytes,
-                        Some(Err(error)) => { first_failure = Some(error); continue; },
-                        None => { input_finished = true; continue; },
-                    };
-                    if bytes.is_empty() { continue; }
-                    let piece = bytes.split_to(bytes.len().min(maximum_chunk_bytes));
-                    if !bytes.is_empty() { pending_input = Some(bytes); }
-                    let offset = issued;
-                    let expected = piece.len() as u64;
-                    let Some(next_issued) = issued.checked_add(expected) else {
-                        first_failure = Some(failure(stage.final_destination.path(), FailureClass::InvalidInput, Transience::Permanent));
-                        continue;
-                    };
-                    issued = next_issued;
-                    let recovery_enabled = stage.recovery_enabled();
-                    let checkpoint_pending = periodic_checkpoint || stage.durable_publication;
-                    deferred_writes_used |= recovery_enabled || checkpoint_pending;
-                    let write_handle = Arc::clone(handle);
-                    writes.push(Box::pin(async move {
-                        // A periodic checkpoint owns COMMIT cadence even after registration.
-                        let result = if recovery_enabled && !periodic_checkpoint {
-                            write_handle.write_deferred_at(offset, piece).await
-                        } else if checkpoint_pending {
-                            write_handle.write_until_checkpoint_at(offset, piece).await
-                        } else {
-                            write_handle.write_uncommitted_at(offset, piece).await
-                        };
-                        (offset, expected, result)
-                    }));
-                    checkpoint_due = deferred_checkpoint_due(stage, next_checkpoint, issued);
-                }
-            }
-        }
-        // Also settle the record before final close, failure truncation, or publication.
-        if let Some(pending) = checkpoint {
-            let result = pending.await;
-            if first_failure.is_none() {
-                first_failure = result.err();
-            }
-        }
-        NfsWriteProgress::finished(issued, persisted, first_failure, deferred_writes_used)
-    }
-
-    fn record_write_completion(
-        path: &StoragePath,
-        offset: u64,
-        expected: u64,
-        result: Result<u64, NfsProtocolFailure>,
-        completed: &mut BTreeMap<u64, u64>,
-        persisted: &mut u64,
-    ) -> Result<Option<StorageRoleFailure>, StorageRoleFailure> {
-        match result {
-            Ok(written) if written == expected => {
-                completed.insert(offset, written);
-                while let Some(written) = completed.remove(persisted) {
-                    *persisted = persisted.checked_add(written).ok_or_else(|| {
-                        failure(path, FailureClass::InvalidInput, Transience::Permanent)
-                    })?;
-                }
-                Ok(None)
-            }
-            Ok(_) => Ok(Some(failure(
-                path,
-                FailureClass::Corruption,
-                Transience::Unknown,
-            ))),
-            Err(error) => Ok(Some(role_failure(path, Operation::Write, error))),
-        }
-    }
-
     pub(super) async fn reobserve_checkpoint(
         &self,
         stage: &PreparedStage,
@@ -637,20 +503,21 @@ impl NfsStagedDestinationAdapter {
             final_destination_changed: true,
         })?;
         let final_observation = self.protocol.size(&final_path).await;
-        let final_equivalent = if final_observation
+        let final_size_matches = final_observation
             .as_ref()
-            .is_ok_and(|size| *size == request.expected_size)
-        {
-            self.hash(
-                stage.final_destination.path(),
-                final_path,
-                request.expected_size,
-                &request.cancel,
-            )
-            .await
-            .is_ok_and(|hash| hash == request.expected_blake3)
-        } else {
-            false
+            .is_ok_and(|size| *size == request.expected_size);
+        let final_equivalent = match request.expected_blake3 {
+            Some(expected) if final_size_matches => self
+                .hash(
+                    stage.final_destination.path(),
+                    final_path,
+                    request.expected_size,
+                    &request.cancel,
+                )
+                .await
+                .is_ok_and(|hash| hash == expected),
+            None => final_size_matches,
+            Some(_) => false,
         };
         match self.protocol.size(&staged_path).await {
             Err(NfsProtocolFailure {
@@ -680,7 +547,7 @@ impl NfsStagedDestinationAdapter {
                     })
                 }
             }
-            Ok(_) if final_equivalent => {
+            Ok(_) if final_equivalent && request.expected_blake3.is_some() => {
                 self.protocol
                     .delete(&staged_path)
                     .await
@@ -727,6 +594,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             .as_ref()
             .map(|_| crate::storage::CopiedMetadataTarget {
                 timestamp_precision: crate::model::TimePrecision::Nanoseconds,
+                ownership: crate::storage::CopiedOwnershipTarget::Numeric,
             })
     }
 
@@ -786,6 +654,49 @@ impl StagedDestination for NfsStagedDestinationAdapter {
         let maximum_chunk_bytes = self.protocol.maximum_write_chunk_bytes().max(1);
         let progress = self
             .consume_input(stage, &mut input, &handle, concurrency, maximum_chunk_bytes)
+            .await;
+        Self::finish_write_handle(
+            stage,
+            &handle,
+            progress.deferred_writes_used,
+            progress.failure.is_some(),
+            progress.persisted,
+            progress.issued,
+        )
+        .await?;
+        if let Some(error) = progress.failure {
+            return Err(error);
+        }
+        if progress.persisted != progress.issued {
+            return Err(failure(
+                stage.final_destination.path(),
+                FailureClass::Corruption,
+                Transience::Unknown,
+            ));
+        }
+        if stage.recovery_enabled() {
+            super::checkpoint::persist(self, stage, progress.persisted).await?;
+        }
+        Ok(WriteEvidence {
+            persisted_bytes: progress.persisted,
+        })
+    }
+
+    fn supports_positioned_write(&self) -> bool {
+        true
+    }
+
+    async fn write_positioned(
+        &self,
+        stage: &PreparedStage,
+        mut input: crate::storage::PositionedByteStream,
+    ) -> Result<WriteEvidence, StorageRoleFailure> {
+        let native = self.validate(stage)?;
+        let handle = self.open_stage_for_write(stage, &native).await?;
+        let concurrency = self.protocol.write_inflight().max(1);
+        let maximum_chunk_bytes = self.protocol.maximum_write_chunk_bytes().max(1);
+        let progress = self
+            .consume_positioned_stream(stage, &mut input, &handle, concurrency, maximum_chunk_bytes)
             .await;
         Self::finish_write_handle(
             stage,
@@ -965,7 +876,7 @@ fn deferred_checkpoint_due(
             && stage
                 .deferred_checkpoint
                 .as_ref()
-                .is_some_and(|checkpoint| issued < checkpoint.source_size)
+                .is_some_and(|checkpoint| boundary < checkpoint.source_size)
     })
 }
 

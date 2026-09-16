@@ -33,6 +33,7 @@ use crate::storage::{
 mod checkpoint;
 mod direct;
 mod directory_sync;
+mod positioned;
 mod probe;
 mod publication;
 mod recovery;
@@ -992,6 +993,7 @@ impl StagedDestination for LocalStagedDestination {
         {
             Some(crate::storage::CopiedMetadataTarget {
                 timestamp_precision: crate::model::TimePrecision::Nanoseconds,
+                ownership: crate::storage::CopiedOwnershipTarget::Numeric,
             })
         }
         #[cfg(not(unix))]
@@ -1082,6 +1084,18 @@ impl StagedDestination for LocalStagedDestination {
 
     async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
         recovery::recover(self, request).await
+    }
+
+    fn supports_positioned_write(&self) -> bool {
+        true
+    }
+
+    async fn write_positioned(
+        &self,
+        stage: &PreparedStage,
+        input: crate::storage::PositionedByteStream,
+    ) -> Result<WriteEvidence, StorageRoleFailure> {
+        positioned::write(self, stage, input).await
     }
 
     async fn write(
@@ -1449,7 +1463,9 @@ impl StagedDestination for LocalStagedDestination {
 pub(super) fn local_metadata_supported(mutation: &MetadataMutation) -> bool {
     match mutation {
         MetadataMutation::Acl(acl) => acl.encoding() == AclEncoding::Posix,
-        MetadataMutation::Xattrs(_) | MetadataMutation::NumericOwnership(_) => true,
+        MetadataMutation::Xattrs(_)
+        | MetadataMutation::NumericOwnership(_)
+        | MetadataMutation::Mode(_) => true,
         MetadataMutation::Timestamps(value) => value.created.is_none(),
         MetadataMutation::Tags(_) | MetadataMutation::MappedOwnership(_) => false,
     }
@@ -1480,6 +1496,9 @@ pub(super) fn apply_local_metadata(
                 file.set_xattr(name, value.value())?;
             }
             Ok(())
+        }
+        MetadataMutation::Mode(mode) => {
+            file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
         }
         MetadataMutation::NumericOwnership(value) => {
             fchown(file, Some(value.uid), Some(value.gid))?;

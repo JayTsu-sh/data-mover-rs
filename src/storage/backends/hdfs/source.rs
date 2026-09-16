@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::stream::try_unfold;
+use futures::{
+    StreamExt as _,
+    stream::{FuturesOrdered, FuturesUnordered, try_unfold},
+};
 use tokio_util::sync::CancellationToken;
 
 use super::protocol::{HdfsEntryFacts, HdfsProtocol, cancelled, entry_failure};
@@ -11,10 +14,9 @@ use crate::model::{
     StoragePath, Transience,
 };
 use crate::storage::{
-    ByteStream, ReadRequest, ReadSource, SourceDescriptor, SourceQosBudget, StorageRoleFailure,
+    ByteStream, PositionedByteStream, PositionedChunk, ReadRequest, ReadSource, SourceDescriptor,
+    SourceQosBudget, StorageRoleFailure,
 };
-
-const MAX_READ_CHUNK: u64 = 1024 * 1024;
 
 pub(super) struct HdfsReadSource {
     protocol: Arc<dyn HdfsProtocol>,
@@ -40,15 +42,45 @@ impl HdfsReadSource {
 
 #[async_trait]
 impl ReadSource for HdfsReadSource {
+    fn supports_read_budget(&self) -> bool {
+        true
+    }
     fn maximum_read_chunk_bytes(&self) -> usize {
-        usize::try_from(MAX_READ_CHUNK).unwrap_or(usize::MAX)
+        self.protocol.maximum_read_chunk_bytes().max(1)
     }
 
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         self.descriptor(path).await
     }
 
+    fn supports_positioned_read(&self) -> bool {
+        true
+    }
+
+    async fn read_positioned(
+        &self,
+        request: ReadRequest,
+    ) -> Result<PositionedByteStream, StorageRoleFailure> {
+        Ok(Box::pin(try_unfold(
+            self.read_state(request, false).await?,
+            read_next,
+        )))
+    }
+
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure> {
+        Ok(Box::pin(
+            try_unfold(self.read_state(request, true).await?, read_next)
+                .map(|item| item.map(|chunk| chunk.data)),
+        ))
+    }
+}
+
+impl HdfsReadSource {
+    async fn read_state(
+        &self,
+        request: ReadRequest,
+        ordered: bool,
+    ) -> Result<ReadState, StorageRoleFailure> {
         if request.cancel.is_cancelled() {
             return Err(cancelled(&request.path, Operation::Read));
         }
@@ -89,45 +121,155 @@ impl ReadSource for HdfsReadSource {
                 FailureClass::InvalidInput,
             ));
         }
+        let cursor = self.protocol.open_reader(&request.path).await?;
+        let confirmed = self.descriptor(&request.path).await?;
+        if confirmed.source_identity != observed.source_identity {
+            return Err(failure(
+                &request.path,
+                Operation::Read,
+                FailureClass::Conflict,
+            ));
+        }
         let state = ReadState {
             protocol: Arc::clone(&self.protocol),
             path: request.path,
-            next: range.start,
+            cursor,
+            next_issue: range.start,
+            inflight: if ordered {
+                ReadQueue::Ordered(FuturesOrdered::new())
+            } else {
+                ReadQueue::Positioned(FuturesUnordered::new())
+            },
+            budget: request.read_budget,
+            concurrency: request
+                .read_inflight
+                .min(self.protocol.read_concurrency().max(1)),
             end: range.end,
-            maximum_chunk_bytes: request.maximum_chunk_bytes,
+            maximum_chunk_bytes: request
+                .maximum_chunk_bytes
+                .min(self.maximum_read_chunk_bytes()),
             cancel: request.cancel,
             qos: request.source_qos,
         };
-        Ok(Box::pin(try_unfold(state, read_next)))
+        Ok(state)
     }
 }
 
 struct ReadState {
     protocol: Arc<dyn HdfsProtocol>,
+    cursor: Option<Arc<dyn super::protocol::HdfsReadCursor>>,
     path: StoragePath,
-    next: u64,
+    next_issue: u64,
     end: u64,
     maximum_chunk_bytes: usize,
+    concurrency: usize,
+    inflight: ReadQueue,
+    budget: Option<crate::storage::ReadBudget>,
     cancel: CancellationToken,
     qos: Option<SourceQosBudget>,
 }
 
-async fn read_next(mut state: ReadState) -> Result<Option<(Bytes, ReadState)>, StorageRoleFailure> {
-    if state.next == state.end {
-        return Ok(None);
+type ReadResult = (
+    u64,
+    u64,
+    Result<Bytes, StorageRoleFailure>,
+    Option<crate::storage::ReadAdmission>,
+);
+type ReadFuture = futures::future::BoxFuture<'static, ReadResult>;
+
+enum ReadQueue {
+    Ordered(FuturesOrdered<ReadFuture>),
+    Positioned(FuturesUnordered<ReadFuture>),
+}
+
+impl ReadQueue {
+    fn len(&self) -> usize {
+        match self {
+            Self::Ordered(queue) => queue.len(),
+            Self::Positioned(queue) => queue.len(),
+        }
     }
-    if state.cancel.is_cancelled() {
-        return Err(cancelled(&state.path, Operation::Read));
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
-    let requested = (state.end - state.next)
-        .min(MAX_READ_CHUNK)
-        .min(state.maximum_chunk_bytes as u64);
-    let count = admit_read(&state, requested).await?;
-    let bytes = tokio::select! {
+    fn push_back(&mut self, future: ReadFuture) {
+        match self {
+            Self::Ordered(queue) => queue.push_back(future),
+            Self::Positioned(queue) => queue.push(future),
+        }
+    }
+    async fn next(&mut self) -> Option<ReadResult> {
+        match self {
+            Self::Ordered(queue) => queue.next().await,
+            Self::Positioned(queue) => queue.next().await,
+        }
+    }
+}
+
+async fn fill_pipeline(state: &mut ReadState) -> Result<(), StorageRoleFailure> {
+    while state.inflight.len() < state.concurrency && state.next_issue < state.end {
+        let requested = (state.end - state.next_issue).min(state.maximum_chunk_bytes as u64);
+        let admission = if let Some(budget) = &state.budget {
+            let Some(permit) = budget
+                .reserve(
+                    usize::try_from(requested).map_err(|_| {
+                        failure(&state.path, Operation::Read, FailureClass::InvalidInput)
+                    })?,
+                    state.inflight.is_empty(),
+                )
+                .await
+                .map_err(|_| cancelled(&state.path, Operation::Read))?
+            else {
+                break;
+            };
+            Some(permit)
+        } else {
+            None
+        };
+        let count = if let Some(qos) = &state.qos {
+            qos.admit_read(requested, &state.cancel)
+                .await
+                .map_err(|_| cancelled(&state.path, Operation::Read))?
+        } else {
+            requested
+        };
+        let offset = state.next_issue;
+        let protocol = Arc::clone(&state.protocol);
+        let cursor = state.cursor.clone();
+        let path = state.path.clone();
+        let cancel = state.cancel.clone();
+        state.inflight.push_back(Box::pin(async move {
+            let read = async {
+                match cursor {
+                    Some(cursor) => cursor.read_range(offset..offset + count).await,
+                    None => protocol.read_range(&path, offset..offset + count).await,
+                }
+            };
+            let result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(cancelled(&path, Operation::Read)),
+                result = read => result,
+            };
+            (offset, count, result, admission)
+        }));
+        state.next_issue += count;
+    }
+    Ok(())
+}
+
+async fn read_next(
+    mut state: ReadState,
+) -> Result<Option<(PositionedChunk, ReadState)>, StorageRoleFailure> {
+    fill_pipeline(&mut state).await?;
+    let next = tokio::select! {
         biased;
         () = state.cancel.cancelled() => return Err(cancelled(&state.path, Operation::Read)),
-        result = state.protocol.read_range(&state.path, state.next..state.next + count) => result?,
+        next = state.inflight.next() => next,
     };
+    let Some((offset, count, result, admission)) = next else {
+        return Ok(None);
+    };
+    let bytes = result?;
     if bytes.len() as u64 != count {
         return Err(failure(
             &state.path,
@@ -138,18 +280,16 @@ async fn read_next(mut state: ReadState) -> Result<Option<(Bytes, ReadState)>, S
     if let Some(qos) = &state.qos {
         qos.record_read_bytes(count);
     }
-    state.next += count;
-    Ok(Some((bytes, state)))
-}
-
-async fn admit_read(state: &ReadState, requested: u64) -> Result<u64, StorageRoleFailure> {
-    match &state.qos {
-        Some(qos) => qos
-            .admit_read(requested, &state.cancel)
-            .await
-            .map_err(|_| cancelled(&state.path, Operation::Read)),
-        None => Ok(requested),
+    if let (Some(budget), Some(admission)) = (&state.budget, admission) {
+        budget.ready(offset, admission);
     }
+    Ok(Some((
+        PositionedChunk {
+            offset,
+            data: bytes,
+        },
+        state,
+    )))
 }
 
 pub(super) fn descriptor(
@@ -240,3 +380,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "source_tests.rs"]
+mod source_tests;

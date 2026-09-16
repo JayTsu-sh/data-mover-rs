@@ -26,6 +26,26 @@ impl<P> S3ReadSource<P> {
     }
 }
 
+fn object_identity(
+    backend: &BackendIdentity,
+    facts: &super::S3ObjectFacts,
+) -> Result<SourceIdentity, crate::model::ModelValueError> {
+    // The null version can be replaced; its ETag must remain part of source identity.
+    let version = facts
+        .version_id
+        .as_deref()
+        .filter(|version| !version.is_empty() && *version != "null");
+    SourceIdentity::new(
+        backend.clone(),
+        if version.is_some() {
+            IdentityStrength::VersionScoped
+        } else {
+            IdentityStrength::PathScoped
+        },
+        version.unwrap_or(&facts.etag),
+    )
+}
+
 #[async_trait]
 impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
     fn maximum_read_chunk_bytes(&self) -> usize {
@@ -41,17 +61,8 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             .head(path.as_str())
             .await
             .map_err(|e| role_failure(path, Operation::Observe, e))?;
-        let stable = facts.version_id.as_deref().unwrap_or(&facts.etag);
-        let source_identity = SourceIdentity::new(
-            self.identity.clone(),
-            if facts.version_id.is_some() {
-                IdentityStrength::VersionScoped
-            } else {
-                IdentityStrength::PathScoped
-            },
-            stable,
-        )
-        .map_err(|e| entry(path, Operation::Observe, e.to_string()))?;
+        let source_identity = object_identity(&self.identity, &facts)
+            .map_err(|e| entry(path, Operation::Observe, e.to_string()))?;
         Ok(SourceDescriptor {
             path: path.clone(),
             kind: EntryKind::File,
@@ -78,25 +89,18 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             .head(request.path.as_str())
             .await
             .map_err(|e| role_failure(&request.path, Operation::Read, e))?;
-        let stable = facts.version_id.as_deref().unwrap_or(&facts.etag);
-        let opened_identity = SourceIdentity::new(
-            self.identity.clone(),
-            if facts.version_id.is_some() {
-                IdentityStrength::VersionScoped
-            } else {
-                IdentityStrength::PathScoped
-            },
-            stable,
-        )
-        .map_err(|e| entry(&request.path, Operation::Read, e.to_string()))?;
+        let opened_identity = object_identity(&self.identity, &facts)
+            .map_err(|e| entry(&request.path, Operation::Read, e.to_string()))?;
         if request
             .expected_source
             .as_ref()
             .is_some_and(|expected| expected != &opened_identity)
         {
-            return Err(entry(
+            return Err(classified_entry(
                 &request.path,
                 Operation::Read,
+                FailureClass::Conflict,
+                Transience::Permanent,
                 "S3 source identity changed",
             ));
         }
@@ -117,10 +121,11 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             chunk_size,
             cancel,
             qos,
+            facts,
         );
         Ok(Box::pin(futures::stream::try_unfold(
             state,
-            |(protocol, path, offset, limit, chunk_size, cancel, qos)| async move {
+            |(protocol, path, offset, limit, chunk_size, cancel, qos, facts)| async move {
                 if offset == limit {
                     return Ok(None);
                 }
@@ -138,7 +143,7 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
                 };
                 let end = offset + granted;
                 let bytes = protocol
-                    .get_range(path.as_str(), offset..end)
+                    .get_range(path.as_str(), offset..end, &facts)
                     .await
                     .map_err(|e| role_failure(&path, Operation::Read, e))?;
                 if bytes.len() as u64 != end - offset {
@@ -149,7 +154,7 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
                 }
                 Ok(Some((
                     bytes,
-                    (protocol, path, end, limit, chunk_size, cancel, qos),
+                    (protocol, path, end, limit, chunk_size, cancel, qos, facts),
                 )))
             },
         )))

@@ -58,7 +58,6 @@ impl fmt::Debug for SourceIdentity {
 }
 
 impl SourceIdentity {
-    #[cfg(unix)]
     pub(crate) const fn backend(&self) -> &BackendIdentity {
         &self.backend
     }
@@ -635,6 +634,7 @@ pub(super) fn encode_time(output: &mut Vec<u8>, time: Option<StorageTimestamp>) 
                 TimePrecision::Milliseconds => 1,
                 TimePrecision::Microseconds => 2,
                 TimePrecision::Nanoseconds => 3,
+                TimePrecision::HundredNanoseconds => 4,
             });
         }
         None => output.push(0),
@@ -653,6 +653,7 @@ pub(super) fn decode_time(
                 1 => TimePrecision::Milliseconds,
                 2 => TimePrecision::Microseconds,
                 3 => TimePrecision::Nanoseconds,
+                4 => TimePrecision::HundredNanoseconds,
                 _ => return Err(SnapshotDecodeError::Malformed),
             };
             StorageTimestamp::new(i128::from_le_bytes(value), precision)

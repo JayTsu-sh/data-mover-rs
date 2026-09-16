@@ -19,6 +19,17 @@ use crate::model::{
 /// A bounded payload stream. Implementations own request sizing and backpressure.
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, StorageRoleFailure>> + Send>>;
 
+/// A payload and its absolute file offset; completion order need not match file order.
+#[derive(Clone, Debug)]
+pub struct PositionedChunk {
+    pub offset: u64,
+    pub data: Bytes,
+}
+
+/// Completion-ordered payloads for destinations supporting positioned writes.
+pub type PositionedByteStream =
+    Pin<Box<dyn Stream<Item = Result<PositionedChunk, StorageRoleFailure>> + Send>>;
+
 /// A stable neutral source description.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceDescriptor {
@@ -108,6 +119,28 @@ impl Error for StorageRoleFailure {
 /// Source streaming role. Protocol handles and retry details remain behind this interface.
 #[async_trait]
 pub trait ReadSource: Send + Sync {
+    /// Whether reads can retain offsets and be delivered as each operation completes.
+    fn supports_positioned_read(&self) -> bool {
+        false
+    }
+
+    /// Returns exact, nonoverlapping coverage of the requested range using absolute offsets.
+    /// Implementations must honor the same pre-allocation budget as ordered reads.
+    async fn read_positioned(
+        &self,
+        request: ReadRequest,
+    ) -> Result<PositionedByteStream, StorageRoleFailure> {
+        Err(StorageRoleFailure::Entry(
+            EntryOperationFailure::new(
+                request.path,
+                Operation::Read,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "positioned I/O is unavailable",
+            )
+            .unwrap_or_else(|_| unreachable!("the static positioned-I/O diagnostic is valid")),
+        ))
+    }
     /// Whether this implementation reserves every prefetched read using `ReadRequest::read_budget`.
     /// Other sources are polled serially with admission owned by the producer.
     fn supports_read_budget(&self) -> bool {
@@ -367,7 +400,9 @@ pub struct VerificationEvidence {
 #[derive(Clone, Debug)]
 pub struct PublishRequest {
     pub expected_size: u64,
-    pub expected_blake3: [u8; 32],
+    /// Content identity used to reconcile an ambiguous remote commit. Native
+    /// transfers may omit it when obtaining one would require client-side I/O.
+    pub expected_blake3: Option<[u8; 32]>,
     pub cancel: CancellationToken,
 }
 
@@ -394,6 +429,30 @@ pub struct PublicationEvidence {
 /// Destination role owning prepare, write, checkpoint, verify, publish, and discard.
 #[async_trait]
 pub trait StagedDestination: Send + Sync {
+    /// Whether the destination accepts nonoverlapping chunks in completion order.
+    fn supports_positioned_write(&self) -> bool {
+        false
+    }
+
+    /// Writes nonoverlapping ranges without assuming delivery order. Successful completion
+    /// requires contiguous coverage from the stage's recovery offset; checkpoints must never
+    /// use sparse file length as proof of a durable prefix.
+    async fn write_positioned(
+        &self,
+        stage: &PreparedStage,
+        _input: PositionedByteStream,
+    ) -> Result<WriteEvidence, StorageRoleFailure> {
+        Err(StorageRoleFailure::Entry(
+            EntryOperationFailure::new(
+                stage.final_destination.path().clone(),
+                Operation::Write,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "positioned I/O is unavailable",
+            )
+            .unwrap_or_else(|_| unreachable!("the static positioned-I/O diagnostic is valid")),
+        ))
+    }
     /// Whether this backend can prepare an in-place target for the shared writer.
     fn supports_direct(&self) -> bool {
         false
@@ -580,6 +639,26 @@ pub trait Namespace: Send + Sync {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CopiedMetadataTarget {
     pub timestamp_precision: TimePrecision,
+    pub ownership: CopiedOwnershipTarget,
+}
+
+/// Ownership behavior used by the ordinary baseline metadata copy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopiedOwnershipTarget {
+    /// Preserve numeric owner, group, and mode together.
+    Numeric,
+    /// Preserve mode while retaining destination-native owner and group.
+    ModeOnly,
+    /// No implicit numeric-to-native principal mapping.
+    Unsupported,
+}
+
+/// Identity-bound observations for automatic baseline metadata copying.
+/// `mode_without_ownership` carries permissions from a source whose owner/group
+/// cannot be projected as numeric IDs. Copying it explicitly loses owner/group.
+pub struct CopiedMetadataObservation {
+    pub observations: MetadataObservations,
+    pub mode_without_ownership: Option<u32>,
 }
 
 /// Metadata observation and application role. It never implicitly refetches omitted facts.
@@ -606,6 +685,18 @@ pub trait Metadata: Send + Sync {
         let _ = expected;
         self.observe(path, plan).await
     }
+    /// Observes baseline copy facts together, bound to the described source version.
+    async fn observe_copy_bound(
+        &self,
+        path: &StoragePath,
+        expected: &SourceIdentity,
+        plan: ObservationPlan,
+    ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
+        Ok(CopiedMetadataObservation {
+            observations: self.observe_bound(path, expected, plan).await?,
+            mode_without_ownership: None,
+        })
+    }
     async fn apply(
         &self,
         path: &StoragePath,
@@ -622,6 +713,7 @@ pub enum MetadataMutation {
     Tags(Vec<ObjectTag>),
     NumericOwnership(OwnershipMode),
     MappedOwnership(MappedOwnership),
+    Mode(u32),
     Timestamps(TimestampMetadata),
 }
 

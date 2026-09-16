@@ -73,7 +73,7 @@ impl CifsReadCursor for DomainReadCursor {
         self.file.io_capabilities().maximum_read_chunk()
     }
 
-    async fn read_at(&mut self, offset: u64, count: u32) -> smb_domain::Result<Bytes> {
+    async fn read_at(&self, offset: u64, count: u32) -> smb_domain::Result<Bytes> {
         self.file.read_exact_at(offset, count).await
     }
 
@@ -181,37 +181,6 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
 #[async_trait]
 impl CifsStagedProtocol for SmbDomainProtocol {
     async fn create_empty(&self, path: &StoragePath) -> smb_domain::Result<()> {
-        let staging = StoragePath::new(".data-mover-staging")
-            .map_err(|_| smb_domain::Error::InvalidArgument("invalid staging path".into()))?;
-        let staging = self.share_path(&staging)?;
-        match self
-            .share
-            .open_directory(&staging, smb_domain::DirectoryOpenOptions::open_existing())
-            .await
-        {
-            Ok(directory) => close_directory(directory).await?,
-            Err(error) if is_not_found(&error) => {
-                match self
-                    .share
-                    .open_directory(&staging, smb_domain::DirectoryOpenOptions::create_new())
-                    .await
-                {
-                    Ok(directory) => close_directory(directory).await?,
-                    Err(error) if is_name_collision(&error) => {
-                        let directory = self
-                            .share
-                            .open_directory(
-                                &staging,
-                                smb_domain::DirectoryOpenOptions::open_existing(),
-                            )
-                            .await?;
-                        close_directory(directory).await?;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(error) => return Err(error),
-        }
         let path = self.share_path(path)?;
         let file = self
             .share
@@ -287,10 +256,34 @@ impl CifsMetadataProtocol for SmbDomainProtocol {
         let metadata = metadata?;
         close?;
         Ok(CifsInlineMetadata {
+            facts: facts(EntryKind::File, &metadata, u32::MAX),
             accessed: metadata.accessed(),
             modified: metadata.written(),
             created: metadata.created(),
         })
+    }
+
+    async fn set_timestamps(
+        &self,
+        path: &StoragePath,
+        value: crate::model::TimestampMetadata,
+    ) -> smb_domain::Result<()> {
+        let update = super::metadata::timestamp_update(value)?;
+        if update == smb_domain::MetadataUpdate::default() {
+            return Ok(());
+        }
+        let path = self.share_path(path)?;
+        let resource = self
+            .share
+            .open_metadata(
+                &path,
+                smb_domain::MetadataOpenOptions::default().write_attributes(true),
+            )
+            .await?;
+        let applied = resource.set_metadata(update).await;
+        let close = close_resource(resource).await;
+        applied?;
+        close
     }
 
     async fn get_acl(
@@ -362,30 +355,6 @@ fn child_path(parent: &StoragePath, name: &str) -> smb_domain::Result<StoragePat
     };
     StoragePath::new(value)
         .map_err(|_| smb_domain::Error::InvalidArgument("invalid CIFS child path".into()))
-}
-
-fn is_not_found(error: &smb_domain::Error) -> bool {
-    match error {
-        smb_domain::Error::NotFound(_) => true,
-        smb_domain::Error::ReceivedErrorMessage(status, _)
-        | smb_domain::Error::UnexpectedMessageStatus(status) => matches!(
-            smb_domain::protocol::Status::try_from(*status),
-            Ok(smb_domain::protocol::Status::ObjectNameNotFound
-                | smb_domain::protocol::Status::ObjectPathNotFound)
-        ),
-        _ => false,
-    }
-}
-
-fn is_name_collision(error: &smb_domain::Error) -> bool {
-    match error {
-        smb_domain::Error::ReceivedErrorMessage(status, _)
-        | smb_domain::Error::UnexpectedMessageStatus(status) => matches!(
-            smb_domain::protocol::Status::try_from(*status),
-            Ok(smb_domain::protocol::Status::ObjectNameCollision)
-        ),
-        _ => false,
-    }
 }
 
 async fn close_resource(resource: smb_domain::Resource) -> smb_domain::Result<()> {

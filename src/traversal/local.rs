@@ -308,7 +308,7 @@ fn candidate_path(
     let Some(encoded) = child.to_str() else {
         return Err(unrepresentable_failure(identity, child));
     };
-    StoragePath::new(encoded.replace('\\', "/"))
+    StoragePath::new(portable_spelling(encoded))
         .map_err(|_| entry_failure(&storage_path(directory), FailureClass::Unsupported))
 }
 
@@ -557,9 +557,20 @@ fn checked_relative_root(path: &StoragePath) -> Result<PathBuf, ()> {
     }
 }
 
+fn portable_spelling(value: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        std::borrow::Cow::Owned(value.replace('\\', "/"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::borrow::Cow::Borrowed(value)
+    }
+}
+
 fn storage_path(path: &Path) -> StoragePath {
     path.to_str()
-        .and_then(|value| StoragePath::new(value.replace('\\', "/")).ok())
+        .and_then(|value| StoragePath::new(portable_spelling(value)).ok())
         .unwrap_or_else(StoragePath::root)
 }
 

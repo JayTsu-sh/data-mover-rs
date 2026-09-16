@@ -240,7 +240,7 @@ async fn verify_publish_and_metadata(
             stage,
             PublishRequest {
                 expected_size: payload.len() as u64,
-                expected_blake3: digest,
+                expected_blake3: Some(digest),
                 cancel: CancellationToken::new(),
             },
         )

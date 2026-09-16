@@ -9,7 +9,7 @@ use super::{ReadBackVerification, TransferPolicy, TransferRequest};
 use crate::metadata::{
     AclTarget, MetadataPlan, MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget,
     OwnershipTarget, TimestampTarget, TimestampTargetCapability, ValueTarget,
-    compile_metadata_plan,
+    compile_copied_metadata_plan,
 };
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, Operation, SourceIdentity, StoragePath,
@@ -19,15 +19,16 @@ use crate::runtime::inflight::{
     InflightConfig, InflightFailure, InflightRuntime, OrderedChunks, ReadRange, SequentialRanges,
 };
 use crate::storage::{
-    CheckpointObservation, FinalDestination, NativePair, PreflightPolicy, PrepareRequest,
-    PreparedStage, PublicationDisposition, PublicationEvidence, PublishRequest, ReadRequest,
-    ReadSource, SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination,
+    CheckpointObservation, CopiedOwnershipTarget, FinalDestination, NativePair, PreflightPolicy,
+    PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublishRequest,
+    ReadRequest, ReadSource, SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination,
     StorageRoleFailure, VerifyRequest, WriteEvidence,
 };
 
 mod automatic;
 mod expert;
 mod native;
+mod positioned;
 mod single;
 pub use expert::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertDestinationTransferred,
@@ -354,7 +355,7 @@ pub(crate) struct Transferred {
     #[allow(dead_code)]
     source: SourceDescriptor,
     data_path: TransferDataPath,
-    source_blake3: [u8; 32],
+    source_blake3: Option<[u8; 32]>,
     source_qos: Option<SourceQosBudget>,
     native_bytes: u64,
     native_requests: u64,
@@ -379,9 +380,11 @@ pub struct TransferOutcome {
 
 /// Transfers, optionally verifies by read-back, and publishes one request.
 ///
-/// When the source and destination advertise baseline metadata support (including Local and
-/// NFS), copies numeric uid/gid, mode and mtime automatically. Metadata is observed against the
-/// described source identity and applied before publication; callers need not apply it again.
+/// When the source and destination advertise baseline metadata support, copies compatible mode,
+/// ownership, and mtime facts automatically. Local and NFS preserve numeric uid/gid and mode;
+/// HDFS preserves mode while retaining its destination-native owner/group principals. Metadata
+/// is observed against the described source identity and applied before publication; callers
+/// need not apply it again.
 /// Access time, change time, ACLs and extended attributes are not part of this default copy.
 ///
 /// # Errors
@@ -403,7 +406,11 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
     };
     let expected_size = transferred.checkpoint.durable_prefix;
     let source_digest = transferred.source_blake3;
-    let blake3 = (read_back == ReadBackVerification::Enabled).then_some(source_digest);
+    let blake3 = if read_back == ReadBackVerification::Enabled {
+        source_digest
+    } else {
+        None
+    };
     let metadata = match apply_copied_metadata(
         &transferred,
         transferred.copied_metadata_plan.as_ref(),
@@ -529,7 +536,7 @@ async fn copied_metadata_plan(
         return Ok(None);
     };
     let observations = metadata
-        .observe_bound(
+        .observe_copy_bound(
             &request.source_path,
             &descriptor.source_identity,
             observation_plan,
@@ -538,11 +545,21 @@ async fn copied_metadata_plan(
         .map_err(|error| {
             TransferFailure::role(TransferPhase::Metadata, TransferSide::Source, error)
         })?;
+    let (ownership_mode, ownership_policy) = match target.ownership {
+        CopiedOwnershipTarget::Numeric => (OwnershipTarget::Numeric, MetadataPolicy::RequireExact),
+        CopiedOwnershipTarget::Unsupported => (
+            OwnershipTarget::NotApplicable,
+            MetadataPolicy::AllowKnownLoss,
+        ),
+        CopiedOwnershipTarget::ModeOnly => {
+            (OwnershipTarget::ModeOnly, MetadataPolicy::AllowKnownLoss)
+        }
+    };
     let target = MetadataTarget {
         acl: AclTarget::Unsupported,
         xattrs: ValueTarget::Unsupported,
         tags: ValueTarget::NotApplicable,
-        ownership_mode: OwnershipTarget::Numeric,
+        ownership_mode,
         timestamps: TimestampTargetCapability::Supported(TimestampTarget {
             precision: target.timestamp_precision,
             accessed: false,
@@ -550,15 +567,23 @@ async fn copied_metadata_plan(
             created: false,
         }),
     };
+    let ownership_policy = if observations.mode_without_ownership.is_some() {
+        MetadataPolicy::AllowKnownLoss
+    } else {
+        ownership_policy
+    };
     let policies = MetadataPolicies::default()
-        .with_ownership_mode(MetadataPolicy::RequireExact)
+        .with_ownership_mode(ownership_policy)
         .with_timestamps(MetadataPolicy::AllowKnownLoss);
-    compile_metadata_plan(&MetadataPlanRequest {
-        observations: &observations,
-        target,
-        policies,
-        principal_mapper: None,
-    })
+    compile_copied_metadata_plan(
+        &MetadataPlanRequest {
+            observations: &observations.observations,
+            target,
+            policies,
+            principal_mapper: None,
+        },
+        observations.mode_without_ownership,
+    )
     .map(|plan| Some(CopiedMetadataPlan { plan }))
     .map_err(|_| {
         TransferFailure::orchestration(
@@ -581,13 +606,21 @@ async fn verify_transferred(
         .with_stage(Arc::clone(&transferred.destination), transferred.stage)
         .with_source_qos(source_qos));
     }
+    let Some(source_blake3) = transferred.source_blake3 else {
+        return Err(TransferFailure::orchestration(
+            TransferPhase::Verify,
+            "source digest is unavailable for verification",
+        )
+        .with_stage(Arc::clone(&transferred.destination), transferred.stage)
+        .with_source_qos(source_qos));
+    };
     let verification = transferred
         .destination
         .verify(
             &transferred.stage,
             VerifyRequest {
                 expected_size: transferred.checkpoint.durable_prefix,
-                expected_blake3: transferred.source_blake3,
+                expected_blake3: source_blake3,
                 cancel: cancel.clone(),
             },
         )
@@ -605,7 +638,7 @@ async fn verify_transferred(
         }
     };
     if verification.verified_bytes != transferred.checkpoint.durable_prefix
-        || verification.blake3 != transferred.source_blake3
+        || verification.blake3 != source_blake3
     {
         return Err(TransferFailure::orchestration(
             TransferPhase::Verify,
@@ -1106,7 +1139,7 @@ fn lend_transfer_roles(request: &TransferRequest) -> Result<TransferRoles, Trans
     if request.transfer_policy == TransferPolicy::Direct && !destination.supports_direct() {
         return Err(TransferFailure::capability(
             TransferSide::Destination,
-            "Direct requires a supported Local destination",
+            "Direct requires a destination that supports direct writes",
         ));
     }
     Ok(TransferRoles {
@@ -1175,28 +1208,46 @@ async fn transfer_stage(
             "recovered prefix exceeds source size",
         ));
     }
-    let (runtime, ordered) = inflight_channel(
-        request.inflight,
-        write_start,
-        plan.source_size,
-        request.cancel.clone(),
-    )?;
-    let source_failure = Arc::new(Mutex::new(None));
-    let producer = tokio::spawn(produce(ProducerRequest {
-        source: Arc::clone(&source),
-        path: descriptor.path.clone(),
-        source_identity: descriptor.source_identity.clone(),
-        cancel: request.cancel.clone(),
-        runtime,
-        failure: Arc::clone(&source_failure),
-        size: plan.source_size,
-        write_start,
-        source_qos,
-        hash_content: request.needs_source_digest(),
-    }));
-    let stream = ordered_stream(ordered, source_failure, descriptor.path.clone());
-    let (write, source_blake3) =
-        settle_transfer(destination.write(stage, stream).await, producer).await?;
+    let (write, source_blake3) = if source.supports_read_budget()
+        && source.supports_positioned_read()
+        && destination.supports_positioned_write()
+    {
+        positioned::transfer(
+            request,
+            source,
+            destination,
+            descriptor,
+            stage,
+            plan.source_size,
+            source_qos,
+        )
+        .await?
+    } else {
+        let (runtime, ordered) = inflight_channel(
+            request.inflight,
+            write_start,
+            plan.source_size,
+            request.cancel.clone(),
+        )?;
+        let source_failure = Arc::new(Mutex::new(None));
+        let producer = tokio::spawn(produce(ProducerRequest {
+            source: Arc::clone(&source),
+            path: descriptor.path.clone(),
+            source_identity: descriptor.source_identity.clone(),
+            cancel: request.cancel.clone(),
+            runtime,
+            failure: Arc::clone(&source_failure),
+            size: plan.source_size,
+            write_start,
+            source_qos,
+            // Fresh streaming transfers already visit every byte, so retain a
+            // commit digest without another read. A disabled-verification resume
+            // must not reread its durable prefix solely to reconstruct that hash.
+            hash_content: request.needs_source_digest() || write_start == 0,
+        }));
+        let stream = ordered_stream(ordered, source_failure, descriptor.path.clone());
+        settle_transfer(destination.write(stage, stream).await, producer).await?
+    };
     let checkpoint = if stage.recovery_enabled() {
         destination
             .observe_checkpoint(stage)
@@ -1225,13 +1276,13 @@ async fn transfer_stage(
 struct TransferEvidence {
     write: WriteEvidence,
     checkpoint: CheckpointObservation,
-    source_blake3: [u8; 32],
+    source_blake3: Option<[u8; 32]>,
 }
 
 async fn settle_transfer(
     write: Result<WriteEvidence, StorageRoleFailure>,
-    producer: tokio::task::JoinHandle<Result<[u8; 32], TransferFailure>>,
-) -> Result<(WriteEvidence, [u8; 32]), TransferFailure> {
+    producer: tokio::task::JoinHandle<Result<Option<[u8; 32]>, TransferFailure>>,
+) -> Result<(WriteEvidence, Option<[u8; 32]>), TransferFailure> {
     let write = match write {
         Ok(write) => write,
         Err(error) => {
@@ -1326,7 +1377,7 @@ async fn open_producer_stream(
     Ok((stream, budget, serial_admission))
 }
 
-async fn produce(request: ProducerRequest) -> Result<[u8; 32], TransferFailure> {
+async fn produce(request: ProducerRequest) -> Result<Option<[u8; 32]>, TransferFailure> {
     let mut hasher = request.hash_content.then(blake3::Hasher::new);
     let read_start = if request.hash_content {
         0
@@ -1407,7 +1458,7 @@ async fn produce(request: ProducerRequest) -> Result<[u8; 32], TransferFailure> 
             "source emitted fewer bytes than described",
         ));
     }
-    Ok(hasher.map_or([0; 32], |hasher| *hasher.finalize().as_bytes()))
+    Ok(hasher.map(|hasher| *hasher.finalize().as_bytes()))
 }
 
 async fn fail_source_producer<T>(
@@ -1628,7 +1679,7 @@ mod plan_tests {
                 &transferred.stage,
                 PublishRequest {
                     expected_size: verification.verified_bytes,
-                    expected_blake3: verification.blake3,
+                    expected_blake3: Some(verification.blake3),
                     cancel: tokio_util::sync::CancellationToken::new(),
                 },
             )

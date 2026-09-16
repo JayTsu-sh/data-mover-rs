@@ -122,6 +122,7 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         &self,
         key: &str,
         range: std::ops::Range<u64>,
+        observed: &crate::storage::backends::s3::S3ObjectFacts,
     ) -> crate::storage::backends::s3::S3Result<Bytes> {
         if range.start == range.end {
             return Ok(Bytes::new());
@@ -132,6 +133,8 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .bucket(&self.bucket_name)
             .key(self.build_full_key(key))
             .range(format!("bytes={}-{}", range.start, range.end - 1))
+            .set_version_id(observed.version_id.clone())
+            .if_match(&observed.etag)
             .send()
             .await
             .map_err(|error| classify_sdk!(error, "S3 GetObject range request failed"))?;

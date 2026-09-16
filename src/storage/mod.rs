@@ -22,17 +22,18 @@ pub use capability::{
     CapabilityValueError, PreflightPolicy, UnsupportedReason, ValidationGate,
 };
 pub use factory::{
-    BackendConfig, BackendConnectError, CifsBackendConfig, HdfsBackendConfig, LocalBackendConfig,
-    NfsBackendConfig, S3BackendConfig, connect_backend,
+    BackendConfig, BackendConnectError, CifsBackendConfig, CifsSigningPolicy, HdfsBackendConfig,
+    LocalBackendConfig, NfsBackendConfig, S3BackendConfig, connect_backend,
 };
 pub use handle::Storage;
 pub use roles::{
-    ByteStream, CheckpointObservation, CopiedMetadataTarget, FinalDestination, Metadata,
-    MetadataMutation, Namespace, NamespaceRequest, NamespaceResult, PrepareRequest, PreparedStage,
-    PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest, ReadRequest,
-    ReadSource, RecoverRequest, RecoveryIdentity, RecoveryValueError, SourceDescriptor,
-    StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure, VerificationEvidence,
-    VerifyRequest, WriteEvidence,
+    ByteStream, CheckpointObservation, CopiedMetadataObservation, CopiedMetadataTarget,
+    CopiedOwnershipTarget, FinalDestination, Metadata, MetadataMutation, Namespace,
+    NamespaceRequest, NamespaceResult, PositionedByteStream, PositionedChunk, PrepareRequest,
+    PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
+    ReadRequest, ReadSource, RecoverRequest, RecoveryIdentity, RecoveryValueError,
+    SourceDescriptor, StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure,
+    VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 pub(crate) use roles::{CheckpointRegistration, DeferredCheckpoint};
 

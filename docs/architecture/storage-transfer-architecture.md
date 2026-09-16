@@ -402,15 +402,41 @@ QoS. A capability failure is typed and precedes remote mutation.
 
 ### Staging and transfer
 
-Local and NFS source prefetch reserve shared chunk, byte and operation capacity before reading.
-The payload reservation passes to the ordered output queue and is released when consumed; the
-operation reservation ends when the read is submitted to that queue. A full budget prevents further source allocation,
+Local, NFS, CIFS, and HDFS source prefetch reserve shared chunk, byte and operation capacity before reading.
+On the ordered path the payload reservation passes to the output queue and is released when
+consumed; the operation reservation ends when the read is submitted to that queue. On the
+positioned path the reservation is shared by the write-input queue and digest reordering until
+both release it. A full budget prevents further source allocation,
 while available capacity still permits concurrent reads. Sources without this admission interface
 are polled serially with producer-owned reservations acquired before reading.
 
 The default path reads sequentially and may write out of order through bounded inflight
 buffers. Buffer count and bytes are explicit. Queued, read, or gap-separated bytes are
 progress only. A staged destination remains invisible as `FinalDestination`.
+
+Sources and staged destinations may opt into neutral positioned payload streams carrying an
+absolute offset and `Bytes`. Local, NFS, and CIFS implement both roles: completed reads can reach
+positioned writes without waiting for earlier reads, including mixed transfers among these
+backends. HDFS sources also offer completion-ordered positioned reads, so HDFS-to-Local/NFS/CIFS
+uses this same path. HDFS destinations retain ordered input and a single append writer; all
+sources keep their ordered interface for this combination. Other role combinations retain the ordered stream.
+The engine validates nonoverlapping coverage and computes the source digest in file order;
+digest reordering and the write-input queue share each pre-read admission, so a missing prefix
+cannot create an unbounded payload buffer. Payload sharing and write splitting do not copy bytes.
+These destinations track acknowledged contiguous ranges independently of stage file length.
+At a periodic checkpoint they drain issued writes and persist only a contiguous prefix confirmed
+by their durability barrier: Local data synchronization, CIFS FLUSH, or NFS stable-write/COMMIT
+and verifier validation. NFS keeps its FILE_SYNC fast path and UNSTABLE replay data; an ordinary
+WRITE acknowledgement alone cannot advance a durable recovery record. Completed writes beyond
+a hole cannot advance recovery. Checkpoint intervals are minimum progress triggers, not write
+boundaries: a chunk need not be split at the threshold. Use `contiguous_prefix >= next_threshold`,
+never equality, total acknowledged bytes, or maximum written offset. If filling a hole crosses
+several thresholds, drain the issued writes and persist the actual durable contiguous prefix
+once, then set the next threshold to that recorded prefix plus the interval. Do not issue one
+barrier per skipped threshold. Sparse suffixes may be synchronized by the same barrier but are
+not included in the recovery prefix; NFS must retain or commit their UNSTABLE receipts even
+when those offsets are beyond the recorded prefix. Existing EOF eligibility rules still apply. Final coverage, digest verification when
+enabled, metadata application, and publication retain their existing lifecycle requirements.
 
 The Local streaming implementation lends both roles before source description or destination
 mutation, selects the backend-neutral `Streaming` data path, and admits sequential ranges through
@@ -466,7 +492,7 @@ existing directory capability with read/write access and `FILE_FLAG_BACKUP_SEMAN
 checkpoints, claim cleanup, new parent directories, and recovery-store registration retain
 real directory synchronization, and synchronization failures remain errors.
 
-`TransferPolicy` offers `Checkpointed` (the default), `AtomicReplace`, and Local `Direct`. Direct writes the final inode without staging, rename, checkpoints, or final persistence barriers; see [ADR-0003](../adr/0003-transfer-policy-direct.md). AtomicReplace restarts from zero without
+`TransferPolicy` offers `Checkpointed` (the default), `AtomicReplace`, and Local/HDFS `Direct`. Local Direct writes the final inode without staging, rename, checkpoints, or final persistence barriers; see [ADR-0003](../adr/0003-transfer-policy-direct.md). HDFS uses ordered append and close-based checkpoint barriers; see [ADR-0004](../adr/0004-hdfs-transfer-policies.md). AtomicReplace restarts from zero without
 creating checkpoints; Local and NFS skip final persistence barriers but retain staging,
 cancellation checks and atomic publication. Success in AtomicReplace mode does not promise crash
 durability. Other protocols may retain their required persistence operations. It is the only
@@ -475,7 +501,7 @@ source-read planning and reports it as `EffectiveRecovery`.
 
 For eligible multi-source-chunk streaming with `Checkpointed`, data-mover opens its private recovery store,
 exclusively claims the transfer binding, recovers or prepares backend-owned staged state, and
-atomically persists the backend's versioned opaque identity. Ordinary Local and NFS defer registration until
+atomically persists the backend's versioned opaque identity. Ordinary Local, NFS and HDFS defer registration until
 the first durable checkpoint; destinations without deferred support register before payload. Successful publication
 and explicit discard clear that record. Before publication, the record atomically enters a
 `Publishing` state. After a restart, only that state may reconcile a missing stage by clearing the
@@ -671,3 +697,14 @@ Local retains its `.claim` file lock. NFS claim rename appends `.claim-<claim-id
 to the stage base name, while its checkpoint name remains based on the unchanged base.
 RecoveryIdentity still carries one current stage token. Only the unified naming format is
 accepted for recovery; legacy stage names and the old centralized staging layout are rejected.
+
+
+### HDFS source baseline metadata
+
+Automatic copy observes HDFS mode and timestamps in the same stat that validates the described
+source identity. A separate mode-only copy observation carries no fabricated numeric UID/GID
+and leaves the existing metadata snapshot encoding unchanged. The metadata planner applies
+mode to Local (Unix), NFS, and HDFS destinations while reporting owner/group loss and preserving
+the destination principals. CIFS does not advertise POSIX mode conversion and reports that loss.
+Compatible mtime is copied; atime and creation time remain excluded. Local mode application
+uses permissions only; NFS uses a mode-only SETATTR, without reading or rewriting ownership.

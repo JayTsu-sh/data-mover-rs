@@ -389,6 +389,8 @@ pub enum TimePrecision {
     Milliseconds,
     /// Microseconds.
     Microseconds,
+    /// SMB FILETIME resolution (100 nanoseconds).
+    HundredNanoseconds,
     /// Nanoseconds.
     Nanoseconds,
 }
@@ -410,6 +412,7 @@ impl StorageTimestamp {
             TimePrecision::Seconds => 1_000_000_000,
             TimePrecision::Milliseconds => 1_000_000,
             TimePrecision::Microseconds => 1_000,
+            TimePrecision::HundredNanoseconds => 100,
             TimePrecision::Nanoseconds => 1,
         };
         if unix_nanos % quantum == 0 {

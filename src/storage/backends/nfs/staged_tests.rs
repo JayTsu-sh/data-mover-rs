@@ -127,7 +127,7 @@ mod tests {
                 let end = start
                     .checked_add(data.len())
                     .ok_or_else(NfsProtocolFailure::protocol)?;
-                value.resize(end, 0);
+                value.resize(value.len().max(end), 0);
                 value[start..end].copy_from_slice(&data);
                 return Ok(data.len() as u64);
             }
@@ -168,7 +168,7 @@ mod tests {
             let end = start
                 .checked_add(data.len())
                 .ok_or_else(NfsProtocolFailure::protocol)?;
-            value.resize(end, 0);
+            value.resize(value.len().max(end), 0);
             value[start..end].copy_from_slice(&data);
             self.active_writes
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -487,7 +487,7 @@ mod tests {
                 &stage,
                 PublishRequest {
                     expected_size: 7,
-                    expected_blake3: *blake3::hash(b"payload").as_bytes(),
+                    expected_blake3: Some(*blake3::hash(b"payload").as_bytes()),
                     cancel: tokio_util::sync::CancellationToken::new(),
                 },
             )
@@ -1130,7 +1130,7 @@ mod tests {
                 &stage,
                 PublishRequest {
                     expected_size: 6,
-                    expected_blake3: hash,
+                    expected_blake3: Some(hash),
                     cancel: tokio_util::sync::CancellationToken::new(),
                 },
             )
@@ -1444,7 +1444,7 @@ mod tests {
                     &stage,
                     PublishRequest {
                         expected_size: 0,
-                        expected_blake3: *blake3::hash(b"").as_bytes(),
+                        expected_blake3: Some(*blake3::hash(b"").as_bytes()),
                         cancel: tokio_util::sync::CancellationToken::new(),
                     },
                 )
@@ -1651,4 +1651,6 @@ mod tests {
             );
         }
     }
+    include!("positioned_tests.rs");
+
 }

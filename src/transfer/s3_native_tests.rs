@@ -89,6 +89,34 @@ async fn disabled_read_back_native_copy_skips_client_source_hashing() -> TestRes
 }
 
 #[tokio::test]
+async fn disabled_read_back_reconciles_a_committed_native_publication() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    let payload = Bytes::from(vec![0x6b; 256 * 1024]);
+    protocol
+        .objects
+        .lock()
+        .await
+        .insert("source".into(), payload.clone());
+    *protocol.copy_commits_then_fails.lock().await = true;
+    let source = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 4, None)?);
+
+    let outcome = transfer(
+        request(source, destination)?
+            .with_source_qos(qos)
+            .with_read_back_verification(ReadBackVerification::Disabled),
+    )
+    .await?;
+
+    assert_eq!(outcome.route, TransferRoute::Native);
+    assert_eq!(outcome.blake3, None);
+    assert_eq!(outcome.source_qos.source_read_operations, 0);
+    assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
+    Ok(())
+}
+
+#[tokio::test]
 async fn native_copy_never_enables_streaming_recovery() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let payload = Bytes::from(vec![0x31; 128 * 1024]);

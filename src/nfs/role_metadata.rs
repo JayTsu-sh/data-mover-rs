@@ -158,6 +158,16 @@ impl NfsMetadataProtocol for NFSStorage {
         .map_err(classify_role_error)
     }
 
+    async fn set_mode(
+        &self,
+        path: &crate::model::StoragePath,
+        mode: u32,
+    ) -> Result<(), NfsProtocolFailure> {
+        self.update_metadata(Path::new(path.as_str()), None, None, None, None, Some(mode))
+            .await
+            .map_err(classify_role_error)
+    }
+
     async fn set_timestamps(
         &self,
         path: &crate::model::StoragePath,

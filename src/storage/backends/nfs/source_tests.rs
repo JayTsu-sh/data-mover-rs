@@ -294,3 +294,55 @@ fn connectivity_is_session_scoped_not_entry_scoped() -> Result<(), Box<dyn std::
     assert!(matches!(failure, StorageRoleFailure::Session(_)));
     Ok(())
 }
+
+struct DelayedPrefixCursor;
+#[async_trait]
+impl NfsReadCursor for DelayedPrefixCursor {
+    async fn read_at(&self, offset: u64, count: usize) -> Result<Bytes, NfsProtocolFailure> {
+        tokio::time::sleep(std::time::Duration::from_millis(if offset == 0 {
+            25
+        } else {
+            1
+        }))
+        .await;
+        let offset = usize::try_from(offset).map_err(|_| NfsProtocolFailure {
+            class: FailureClass::InvalidInput,
+            transience: Transience::Permanent,
+        })?;
+        Ok(Bytes::from_static(b"abcdefghijkl").slice(offset..offset + count))
+    }
+}
+
+#[tokio::test]
+async fn positioned_nfs_read_does_not_wait_for_delayed_first_range()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state = ReadState {
+        cursor: Arc::new(DelayedPrefixCursor),
+        path: StoragePath::new("source")?,
+        next_issue: 0,
+        next_emit: 0,
+        end: 12,
+        maximum_chunk_bytes: 4,
+        read_concurrency: 3,
+        inflight: Either::Right(FuturesUnordered::new()),
+        cancel: tokio_util::sync::CancellationToken::new(),
+        qos: None,
+        budget: None,
+    };
+    let mut input = Box::pin(futures::stream::try_unfold(state, read_next));
+    let first = input.next().await.ok_or("missing first read")??;
+    assert_ne!(first.offset, 0);
+    let mut chunks = vec![first];
+    while let Some(chunk) = input.next().await.transpose()? {
+        chunks.push(chunk);
+    }
+    chunks.sort_by_key(|chunk| chunk.offset);
+    assert_eq!(
+        chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.data.to_vec())
+            .collect::<Vec<_>>(),
+        b"abcdefghijkl"
+    );
+    Ok(())
+}

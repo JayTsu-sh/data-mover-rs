@@ -20,9 +20,9 @@ pub(super) struct CifsSourceFacts {
 }
 
 #[async_trait]
-pub(super) trait CifsReadCursor: Send {
+pub(super) trait CifsReadCursor: Send + Sync {
     fn maximum_read_chunk(&self) -> u32;
-    async fn read_at(&mut self, offset: u64, count: u32) -> smb_domain::Result<Bytes>;
+    async fn read_at(&self, offset: u64, count: u32) -> smb_domain::Result<Bytes>;
     async fn close(self: Box<Self>) -> smb_domain::Result<()>;
 }
 
@@ -39,6 +39,7 @@ pub(super) struct CifsReadSource {
     protocol: Arc<dyn CifsSourceProtocol>,
     identity: BackendIdentity,
     maximum_read_chunk: AtomicU32,
+    read_inflight: usize,
 }
 
 impl CifsReadSource {
@@ -50,7 +51,13 @@ impl CifsReadSource {
             protocol,
             identity,
             maximum_read_chunk: AtomicU32::new(u32::MAX),
+            read_inflight: 8,
         }
+    }
+
+    pub(super) fn with_read_inflight(mut self, depth: std::num::NonZeroUsize) -> Self {
+        self.read_inflight = depth.get();
+        self
     }
 
     async fn descriptor(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
@@ -64,27 +71,35 @@ impl CifsReadSource {
         descriptor_from_facts(&self.identity, path, &facts, Operation::Observe)
     }
 
-    async fn open_state(&self, request: ReadRequest) -> Result<ReadState, StorageRoleFailure> {
-        let descriptor = self.descriptor(&request.path).await?;
-        if descriptor.kind != EntryKind::File {
-            return Err(entry_failure(
-                &request.path,
-                Operation::Read,
-                FailureClass::Unsupported,
-            ));
-        }
-        let range = checked_range(&request, descriptor.size.unwrap_or_default())?;
+    async fn open_state(&self, mut request: ReadRequest) -> Result<ReadState, StorageRoleFailure> {
         let (cursor, opened_facts) = self
             .protocol
             .open(&request.path)
             .await
             .map_err(|error| classify(&request.path, Operation::Read, &error))?;
-        let opened = descriptor_from_facts(
+        let opened = match descriptor_from_facts(
             &self.identity,
             &request.path,
             &opened_facts,
             Operation::Read,
-        )?;
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = cursor.close().await;
+                return Err(error);
+            }
+        };
+        let range = match checked_range(&request, opened_facts.size) {
+            Ok(range) if opened.kind == EntryKind::File => range,
+            _ => {
+                let _ = cursor.close().await;
+                return Err(entry_failure(
+                    &request.path,
+                    Operation::Read,
+                    FailureClass::InvalidInput,
+                ));
+            }
+        };
         if request
             .expected_source
             .as_ref()
@@ -97,18 +112,49 @@ impl CifsReadSource {
                 FailureClass::Conflict,
             ));
         }
+        request.read_inflight = request.read_inflight.min(self.read_inflight);
         Ok(ReadState::new(request, cursor, range))
     }
 }
 
 #[async_trait]
 impl ReadSource for CifsReadSource {
+    fn supports_read_budget(&self) -> bool {
+        true
+    }
     fn maximum_read_chunk_bytes(&self) -> usize {
         usize::try_from(self.maximum_read_chunk.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
     }
 
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         self.descriptor(path).await
+    }
+
+    fn supports_positioned_read(&self) -> bool {
+        true
+    }
+
+    async fn read_positioned(
+        &self,
+        request: ReadRequest,
+    ) -> Result<crate::storage::PositionedByteStream, StorageRoleFailure> {
+        if request.cancel.is_cancelled() {
+            return Err(entry_failure(
+                &request.path,
+                Operation::Read,
+                FailureClass::Cancelled,
+            ));
+        }
+        if request.maximum_chunk_bytes == 0 || request.read_inflight == 0 {
+            return Err(entry_failure(
+                &request.path,
+                Operation::Read,
+                FailureClass::InvalidInput,
+            ));
+        }
+        Ok(super::read_pipeline::positioned_stream(
+            self.open_state(request).await?,
+        ))
     }
 
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure> {
@@ -127,30 +173,22 @@ impl ReadSource for CifsReadSource {
             ));
         }
         let state = self.open_state(request).await?;
-        Ok(Box::pin(futures::stream::try_unfold(state, read_next)))
+        Ok(super::read_pipeline::stream(state))
     }
 }
 
-struct ReadState {
-    cursor: Box<dyn CifsReadCursor>,
-    path: StoragePath,
-    next: u64,
-    end: u64,
-    maximum_chunk_bytes: usize,
-    cancel: tokio_util::sync::CancellationToken,
-    qos: Option<crate::storage::SourceQosBudget>,
+pub(super) struct ReadState {
+    pub(super) cursor: Box<dyn CifsReadCursor>,
+    pub(super) request: ReadRequest,
+    pub(super) range: Range<u64>,
 }
 
 impl ReadState {
     fn new(request: ReadRequest, cursor: Box<dyn CifsReadCursor>, range: Range<u64>) -> Self {
         Self {
             cursor,
-            path: request.path,
-            next: range.start,
-            end: range.end,
-            maximum_chunk_bytes: request.maximum_chunk_bytes,
-            cancel: request.cancel,
-            qos: request.source_qos,
+            request,
+            range,
         }
     }
 }
@@ -165,73 +203,6 @@ fn checked_range(request: &ReadRequest, size: u64) -> Result<Range<u64>, Storage
         ));
     }
     Ok(range)
-}
-
-async fn read_next(mut state: ReadState) -> Result<Option<(Bytes, ReadState)>, StorageRoleFailure> {
-    if state.next == state.end {
-        return state
-            .cursor
-            .close()
-            .await
-            .map(|()| None)
-            .map_err(|error| classify(&state.path, Operation::Read, &error));
-    }
-    if state.cancel.is_cancelled() {
-        let _ = state.cursor.close().await;
-        return Err(entry_failure(
-            &state.path,
-            Operation::Read,
-            FailureClass::Cancelled,
-        ));
-    }
-    let requested = (state.end - state.next)
-        .min(u64::from(state.cursor.maximum_read_chunk()))
-        .min(state.maximum_chunk_bytes as u64);
-    let granted = match &state.qos {
-        Some(qos) => {
-            let Ok(granted) = qos.admit_read(requested, &state.cancel).await else {
-                let _ = state.cursor.close().await;
-                return Err(entry_failure(
-                    &state.path,
-                    Operation::Read,
-                    FailureClass::Cancelled,
-                ));
-            };
-            granted
-        }
-        None => requested,
-    };
-    let count = u32::try_from(granted)
-        .map_err(|_| entry_failure(&state.path, Operation::Read, FailureClass::InvalidInput))?;
-    let read_result = tokio::select! {
-        biased;
-        () = state.cancel.cancelled() => {
-            Err(entry_failure(&state.path, Operation::Read, FailureClass::Cancelled))
-        }
-        result = state.cursor.read_at(state.next, count) => {
-            result.map_err(|error| classify(&state.path, Operation::Read, &error))
-        }
-    };
-    let bytes = match read_result {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let _ = state.cursor.close().await;
-            return Err(error);
-        }
-    };
-    if bytes.len() != count as usize {
-        let _ = state.cursor.close().await;
-        return Err(entry_failure(
-            &state.path,
-            Operation::Read,
-            FailureClass::Corruption,
-        ));
-    }
-    if let Some(qos) = &state.qos {
-        qos.record_read_bytes(bytes.len() as u64);
-    }
-    state.next += bytes.len() as u64;
-    Ok(Some((bytes, state)))
 }
 
 pub(super) fn descriptor_from_facts(
@@ -338,7 +309,16 @@ pub(super) fn entry_failure(
     operation: Operation,
     class: FailureClass,
 ) -> StorageRoleFailure {
-    entry_failure_with_transience(path, operation, class, Transience::Permanent)
+    entry_failure_with_transience(
+        path,
+        operation,
+        class,
+        if class == FailureClass::Cancelled {
+            Transience::Transient
+        } else {
+            Transience::Permanent
+        },
+    )
 }
 
 fn entry_failure_with_transience(

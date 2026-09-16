@@ -52,6 +52,14 @@ pub(crate) trait NfsMetadataProtocol: Send + Sync {
         path: &StoragePath,
         value: OwnershipMode,
     ) -> Result<(), NfsProtocolFailure>;
+    /// Change permission bits without synthesizing or rewriting numeric ownership.
+    async fn set_mode(&self, path: &StoragePath, mode: u32) -> Result<(), NfsProtocolFailure> {
+        let _ = (path, mode);
+        Err(NfsProtocolFailure {
+            class: crate::model::FailureClass::Unsupported,
+            transience: crate::model::Transience::Permanent,
+        })
+    }
     async fn set_timestamps(
         &self,
         path: &StoragePath,
@@ -232,6 +240,7 @@ impl Metadata for NfsMetadataAdapter {
             MetadataMutation::NumericOwnership(value) => {
                 self.protocol.set_numeric_ownership(path, value).await
             }
+            MetadataMutation::Mode(mode) => self.protocol.set_mode(path, mode).await,
             MetadataMutation::Timestamps(value) => self.protocol.set_timestamps(path, value).await,
             MetadataMutation::Tags(_) | MetadataMutation::MappedOwnership(_) => {
                 return Err(super::source::entry_failure(
@@ -384,6 +393,13 @@ mod tests {
             _value: OwnershipMode,
         ) -> Result<(), NfsProtocolFailure> {
             Err(NfsProtocolFailure::protocol())
+        }
+        async fn set_mode(&self, _path: &StoragePath, mode: u32) -> Result<(), NfsProtocolFailure> {
+            // Any unexpected stat first increments `sets`, making this assertion fail.
+            self.sets
+                .compare_exchange(0, mode as usize, Ordering::SeqCst, Ordering::SeqCst)
+                .map_err(|_| NfsProtocolFailure::protocol())?;
+            Ok(())
         }
         async fn set_timestamps(
             &self,
@@ -567,5 +583,37 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert_eq!(protocol.sets.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn mode_only_apply_never_observes_or_rewrites_numeric_ownership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let protocol = Arc::new(CancellingProtocol {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            sets: AtomicUsize::new(0),
+            xattrs_supported: false,
+        });
+        let adapter = NfsMetadataAdapter::new(
+            protocol.clone(),
+            crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "mode-only")?,
+        );
+        let path = StoragePath::new("file")?;
+        adapter
+            .apply(
+                &path,
+                MetadataMutation::Mode(0o640),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await?;
+        assert_eq!(protocol.sets.load(Ordering::SeqCst), 0o640);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let result = adapter
+            .apply(&path, MetadataMutation::Mode(0o600), cancel)
+            .await;
+        assert!(
+            matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled)
+        );
+        assert_eq!(protocol.sets.load(Ordering::SeqCst), 0o640);
+        Ok(())
     }
 }

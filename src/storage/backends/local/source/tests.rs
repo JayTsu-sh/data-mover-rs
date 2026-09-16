@@ -364,7 +364,8 @@ async fn expected_identity_rejects_replacement_between_describe_and_read()
     let source = LocalReadSource::new(root.path(), identity, 4)?;
     let storage_path = StoragePath::new("source.bin")?;
     let descriptor = source.describe(&storage_path).await?;
-    std::fs::remove_file(&path)?;
+    // Retain the old inode so immediate allocation cannot reuse its identity.
+    std::fs::rename(&path, root.path().join("original.bin"))?;
     std::fs::write(&path, b"replaced")?;
 
     let result = source
@@ -410,4 +411,40 @@ impl Drop for TestRoot {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[tokio::test]
+async fn positioned_read_delivers_later_chunk_before_blocked_prefix()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = TestRoot::new()?;
+    std::fs::write(root.path().join("source.bin"), b"abcdefgh")?;
+    let source = LocalReadSource::new(
+        root.path(),
+        BackendIdentity::new(BackendKind::Local, "positioned")?,
+        2,
+    )?;
+    let gate = source.gate_read_at(0);
+    let mut input = source
+        .read_positioned(ReadRequest {
+            path: StoragePath::new("source.bin")?,
+            range: Some(0..8),
+            expected_source: None,
+            maximum_chunk_bytes: 4,
+            read_inflight: 2,
+            read_budget: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            source_qos: None,
+        })
+        .await?;
+    let later = tokio::time::timeout(std::time::Duration::from_secs(3), input.next()).await;
+    // Release the blocking read even when the assertion fails.
+    gate.release();
+    let later = later?.transpose()?.ok_or("missing later read")?;
+    assert_eq!(later.offset, 4);
+    assert_eq!(&later.data[..], b"efgh");
+    let first = input.next().await.transpose()?.ok_or("missing prefix")?;
+    assert_eq!(first.offset, 0);
+    assert_eq!(&first.data[..], b"abcd");
+    assert!(input.next().await.is_none());
+    Ok(())
 }

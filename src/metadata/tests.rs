@@ -397,3 +397,108 @@ fn external_principal_mapping_is_required_and_redacted() {
         .is_ok()
     );
 }
+
+#[test]
+fn mode_only_target_preserves_permissions_and_reports_principal_loss() {
+    let observations = exact_observations();
+    let mut target = exact_target();
+    target.ownership_mode = OwnershipTarget::ModeOnly;
+    let policies = all_exact().with_ownership_mode(MetadataPolicy::AllowKnownLoss);
+    let plan = compile_metadata_plan(&MetadataPlanRequest {
+        observations: &observations,
+        target,
+        policies,
+        principal_mapper: None,
+    })
+    .unwrap();
+
+    assert!(plan.loss_report().losses().contains(&(
+        MetadataFamily::OwnershipMode,
+        SemanticLoss::OwnerAndGroupDropped,
+    )));
+    assert!(
+        plan.mutations
+            .contains(&(MetadataFamily::OwnershipMode, MetadataMutation::Mode(0o640),))
+    );
+    assert!(
+        plan.mutations
+            .iter()
+            .all(|(_, mutation)| !matches!(mutation, MetadataMutation::MappedOwnership(_)))
+    );
+}
+
+#[test]
+fn smb_timestamp_precision_is_reported_and_quantized_before_application() {
+    let observations = exact_observations();
+    let mut target = exact_target();
+    target.timestamps = TimestampTargetCapability::Supported(TimestampTarget {
+        precision: TimePrecision::HundredNanoseconds,
+        accessed: false,
+        modified: true,
+        created: false,
+    });
+    let plan = compile_metadata_plan(&MetadataPlanRequest {
+        observations: &observations,
+        target,
+        policies: MetadataPolicies::default().with_timestamps(MetadataPolicy::AllowKnownLoss),
+        principal_mapper: None,
+    })
+    .unwrap();
+    assert!(plan.loss_report().losses().contains(&(
+        MetadataFamily::Timestamps,
+        SemanticLoss::TimestampPrecisionReduced
+    )));
+    let MetadataMutation::Timestamps(value) = &plan.mutations[0].1 else {
+        panic!("missing timestamps");
+    };
+    assert!(value.accessed.is_none() && value.created.is_none());
+    let modified = value.modified.unwrap();
+    assert_eq!(modified.unix_nanos(), 1_234_567_800);
+    assert_eq!(modified.precision(), TimePrecision::HundredNanoseconds);
+}
+
+#[test]
+fn copied_mode_never_synthesizes_numeric_ownership() {
+    let observations = MetadataObservations::default();
+    for ownership in [
+        OwnershipTarget::Numeric,
+        OwnershipTarget::ModeOnly,
+        OwnershipTarget::NotApplicable,
+    ] {
+        let mut target = exact_target();
+        target.ownership_mode = ownership;
+        let plan = compile_copied_metadata_plan(
+            &MetadataPlanRequest {
+                observations: &observations,
+                target,
+                policies: MetadataPolicies::default()
+                    .with_ownership_mode(MetadataPolicy::AllowKnownLoss),
+                principal_mapper: None,
+            },
+            Some(0o100_640),
+        )
+        .unwrap();
+        if ownership == OwnershipTarget::NotApplicable {
+            assert!(plan.mutations.is_empty());
+            assert_eq!(
+                plan.loss_report().losses(),
+                &[(
+                    MetadataFamily::OwnershipMode,
+                    SemanticLoss::OwnershipModeDropped
+                )]
+            );
+        } else {
+            assert_eq!(
+                plan.mutations,
+                [(MetadataFamily::OwnershipMode, MetadataMutation::Mode(0o640))]
+            );
+            assert_eq!(
+                plan.loss_report().losses(),
+                &[(
+                    MetadataFamily::OwnershipMode,
+                    SemanticLoss::OwnerAndGroupDropped
+                )]
+            );
+        }
+    }
+}

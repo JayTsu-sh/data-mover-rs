@@ -198,7 +198,7 @@ fn array<const N: usize>(bytes: &[u8], path: &StoragePath) -> Result<[u8; N], St
 }
 
 pub(super) struct HdfsStagedDestination {
-    protocol: Arc<dyn HdfsProtocol>,
+    pub(super) protocol: Arc<dyn HdfsProtocol>,
     identity: BackendIdentity,
     metadata: Option<Arc<dyn Metadata>>,
 }
@@ -220,7 +220,7 @@ impl HdfsStagedDestination {
         self
     }
 
-    fn part(&self, stage: &PreparedStage) -> Result<StoragePath, StorageRoleFailure> {
+    pub(super) fn part(&self, stage: &PreparedStage) -> Result<StoragePath, StorageRoleFailure> {
         stage.validate_owner(&self.identity).map_err(|_| {
             failure(
                 stage.final_destination.path(),
@@ -234,6 +234,71 @@ impl HdfsStagedDestination {
 
 #[async_trait]
 impl StagedDestination for HdfsStagedDestination {
+    fn supports_direct(&self) -> bool {
+        true
+    }
+
+    fn copied_metadata_target(&self) -> Option<crate::storage::CopiedMetadataTarget> {
+        self.metadata
+            .as_ref()
+            .map(|_| crate::storage::CopiedMetadataTarget {
+                timestamp_precision: crate::model::TimePrecision::Milliseconds,
+                ownership: crate::storage::CopiedOwnershipTarget::ModeOnly,
+            })
+    }
+
+    fn automatic_checkpoint_interval_bytes(&self) -> Option<u64> {
+        Some(crate::storage::backends::DEFAULT_CHECKPOINT_INTERVAL_BYTES)
+    }
+
+    async fn prepare_direct(
+        &self,
+        request: PrepareRequest,
+        cancel: CancellationToken,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        if cancel.is_cancelled() {
+            return Err(cancelled(
+                request.final_destination.path(),
+                Operation::Prepare,
+            ));
+        }
+        if request.source.source_identity.backend() == &self.identity
+            && request.source.path == *request.final_destination.path()
+        {
+            return Err(failure(
+                request.final_destination.path(),
+                Operation::Prepare,
+                FailureClass::Conflict,
+            ));
+        }
+        let expected_size = request.source.size.ok_or_else(|| {
+            failure(
+                request.final_destination.path(),
+                Operation::Prepare,
+                FailureClass::Unsupported,
+            )
+        })?;
+        let path = request.final_destination.path().clone();
+        let mut stage = PreparedStage::new(
+            self.identity.clone(),
+            request.final_destination,
+            HdfsStageToken {
+                expected_size,
+                nonce: [0; 16],
+                base_path: path.clone(),
+                partial_path: path,
+            }
+            .encode()?,
+            request.recovery_binding,
+            0,
+            None,
+        )
+        .disable_recovery();
+        stage.direct = true;
+        stage.durable_publication = false;
+        Ok(stage)
+    }
+
     async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
         let expected = request.source.size.ok_or_else(|| {
             failure(
@@ -288,15 +353,7 @@ impl StagedDestination for HdfsStagedDestination {
         stage: &PreparedStage,
         input: ByteStream,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
-        let part = self.part(stage)?;
-        let expected = expected_size(stage)?;
-        let persisted = self
-            .protocol
-            .append_stage(&part, stage.write_offset, expected, input)
-            .await?;
-        Ok(WriteEvidence {
-            persisted_bytes: persisted,
-        })
+        super::writer::write(self, stage, input).await
     }
 
     async fn observe_checkpoint(
@@ -369,6 +426,9 @@ impl StagedDestination for HdfsStagedDestination {
     }
 
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
+        if stage.direct {
+            return Ok(());
+        }
         self.protocol
             .delete(&self.part(&stage)?, EntryKind::File)
             .await
@@ -398,9 +458,11 @@ async fn recover(
     let claimed = claimed_path(&token.base_path, request.claim_token)?;
     let claimed_size = observe_prefix(adapter, &claimed, token.expected_size).await?;
     let base_size = observe_prefix(adapter, &token.base_path, token.expected_size).await?;
-    let size = match (base_size, claimed_size) {
-        (None, Some(size)) => size,
-        (Some(_), None) => claim_base(adapter, &token, &claimed).await?,
+    match (base_size, claimed_size) {
+        (None, Some(_)) => {}
+        (Some(_), None) => {
+            let _ = claim_base(adapter, &token, &claimed).await?;
+        }
         (Some(_), Some(_)) | (None, None) => {
             return Err(failure(
                 &claimed,
@@ -408,7 +470,15 @@ async fn recover(
                 FailureClass::Conflict,
             ));
         }
-    };
+    }
+    let size = adapter.protocol.stabilize_recovered_stage(&claimed).await?;
+    if size > token.expected_size {
+        return Err(failure(
+            &claimed,
+            Operation::Prepare,
+            FailureClass::Corruption,
+        ));
+    }
     Ok(PreparedStage::new(
         adapter.identity.clone(),
         request.final_destination,
@@ -550,11 +620,13 @@ async fn publish(
         )));
     }
     let part = adapter.part(stage).map_err(publication_failure)?;
-    adapter
-        .protocol
-        .rename(&part, stage.final_destination.path(), true)
-        .await
-        .map_err(publication_may_have_changed)?;
+    if !stage.direct {
+        adapter
+            .protocol
+            .rename(&part, stage.final_destination.path(), true)
+            .await
+            .map_err(publication_may_have_changed)?;
+    }
     Ok(PublicationEvidence {
         final_destination: stage.final_destination.path().clone(),
         disposition: PublicationDisposition::Published,
@@ -611,7 +683,7 @@ fn partial_path(
     })
 }
 
-fn expected_size(stage: &PreparedStage) -> Result<u64, StorageRoleFailure> {
+pub(super) fn expected_size(stage: &PreparedStage) -> Result<u64, StorageRoleFailure> {
     Ok(HdfsStageToken::decode(stage)?.expected_size)
 }
 

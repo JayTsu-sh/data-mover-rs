@@ -43,8 +43,8 @@ the cluster-free HDFS contract target, and all examples. This establishes
 Windows build support for explicit Simple mode without silently skipping a
 missing cross target. It does not claim real Windows-to-HDFS runtime support;
 that requires a separately provisioned Windows lab before becoming a gate.
-`tests/hdfs_upstream_contract.py` is the acceptance entry point for the rolling
-`hdfs-native` Git dependency. It verifies that `Cargo.toml` remains unpinned,
+`tests/hdfs_upstream_contract.py` is the acceptance entry point for the hsync-enabled
+`hdfs-native` Git dependency. It verifies the pinned fork revision,
 prints the full `Cargo.lock`-resolved commit (and the previous commit when it
 changed), then runs the cluster-free API/config/error contracts. Nightly invokes
 the same entry point with `--nightly --run-id "$RUN_ID"`, which additionally
@@ -317,3 +317,14 @@ configured S3-compatible endpoints while the main S3 matrix continues using
 standard `s3://`. These checks validate scheme selection, copy, rename, and
 non-regression behavior, but they are not a substitute for a smoke test on the
 target StorageGRID version.
+
+### Optional FAS2750 CIFS policy contracts
+
+`tests/cifs_policy_contract.rs` uses an explicitly configured writable share through
+`CIFS_REAL_SERVER`, `CIFS_REAL_SECOND_SERVER`, `CIFS_REAL_SHARE`, `CIFS_REAL_USER`,
+and `CIFS_REAL_PASS`. Use a separate `DATA_MOVER_RECOVERY_DIR` and run with
+`cargo test --release --test cifs_policy_contract -- --ignored --nocapture`.
+`CIFS_POLICY_TEST_BYTES` optionally supplies comma-separated file sizes. The test
+uses unique names, exercises both policies with read-back enabled, and cleans up
+its own final/stage/checkpoint files. See the [FAS2750 validation report](../../docs/reports/2026-09-16-cifs-policy-validation.md)
+for tested sizes, recovery coverage and debug-runtime limitations.

@@ -64,7 +64,7 @@ async fn copy_or_reconcile<P: S3Protocol>(
     else {
         return Ok(());
     };
-    match matches_expected(adapter, stage, request).await {
+    match matches_expected(adapter, stage, key, request).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(changed_failure(role_failure(
             stage.final_destination.path(),
@@ -81,13 +81,38 @@ async fn copy_or_reconcile<P: S3Protocol>(
 async fn matches_expected<P: S3Protocol>(
     adapter: &S3StagedDestination<P>,
     stage: &PreparedStage,
+    stage_key: &str,
     request: &PublishRequest,
 ) -> Result<bool, PublicationFailure> {
+    let expected_blake3 = if let Some(digest) = request.expected_blake3 {
+        digest
+    } else {
+        let path = crate::model::StoragePath::new(stage_key).map_err(|_| {
+            unchanged_failure(entry(
+                stage.final_destination.path(),
+                Operation::Publish,
+                "invalid S3 stage path during publication reconciliation",
+            ))
+        })?;
+        let Some(digest) = adapter
+            .content_digest(
+                &path,
+                request.expected_size,
+                &request.cancel,
+                Operation::Publish,
+            )
+            .await
+            .map_err(unchanged_failure)?
+        else {
+            return Ok(false);
+        };
+        digest
+    };
     adapter
         .content_matches(
             stage.final_destination.path(),
             request.expected_size,
-            &request.expected_blake3,
+            &expected_blake3,
             &request.cancel,
             Operation::Publish,
         )

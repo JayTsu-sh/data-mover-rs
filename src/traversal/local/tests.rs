@@ -7,6 +7,26 @@ use crate::traversal::{TraversalOrder, TraversalTerminalFailure};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(unix)]
+#[tokio::test]
+async fn literal_backslash_is_distinct_from_nested_path() -> io::Result<()> {
+    let root = TestRoot::new()?;
+    std::fs::create_dir(root.0.join("a"))?;
+    std::fs::write(root.0.join("a/b"), b"nested")?;
+    std::fs::write(root.0.join(r"a\b"), b"literal")?;
+    let mut session = source(&root.0).traverse(request(CancellationToken::new(), 2, 1));
+    let items = drain(&mut session).await;
+    let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
+    assert_eq!(completion.entry_failures, 0);
+    for name in [r"a\b", "a/b"] {
+        assert!(items.iter().any(
+            |item| matches!(item, TraversalItem::Entry(entry) if entry.path().as_str().strip_prefix("./").unwrap_or(entry.path().as_str()) == name)
+        ));
+    }
+    assert_eq!(storage_path(Path::new(r"a\b")).as_str(), r"a\b");
+    Ok(())
+}
+
 struct TestRoot(PathBuf);
 
 impl TestRoot {

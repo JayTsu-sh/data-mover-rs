@@ -2,24 +2,59 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use futures::StreamExt as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
-use super::protocol::{HdfsEntryFacts, HdfsProtocol, entry_failure};
+use super::protocol::{HdfsEntryFacts, HdfsProtocol, HdfsWriteSession, entry_failure};
 use crate::model::{EntryKind, FailureClass, Operation, StoragePath, Transience};
-use crate::storage::{ByteStream, StorageRoleFailure};
+use crate::storage::StorageRoleFailure;
 
 #[derive(Default)]
 pub(crate) struct MemoryHdfs {
     objects: Mutex<HashMap<String, Bytes>>,
     metadata_calls: Mutex<Vec<String>>,
     stat_calls: AtomicUsize,
+    read_active: AtomicUsize,
+    read_peak: AtomicUsize,
+    read_limit: AtomicUsize,
+    write_limit: AtomicUsize,
+    write_peak: AtomicUsize,
+    append_calls: AtomicUsize,
+    stabilize_calls: AtomicUsize,
+    recovered_tail: Mutex<Option<Bytes>>,
+    hsync_calls: AtomicUsize,
+    fail_after_hsync: std::sync::atomic::AtomicBool,
+    hsync_completed: std::sync::atomic::AtomicBool,
+    delayed_reads: std::sync::atomic::AtomicBool,
     fail_write: std::sync::atomic::AtomicBool,
     fail_rename_after_commit: std::sync::atomic::AtomicBool,
 }
 
 impl MemoryHdfs {
+    pub(crate) fn fail_once_after_hsync(&self) {
+        self.fail_after_hsync.store(true, Ordering::SeqCst);
+    }
+    pub(crate) fn configure_io(&self, read: usize, write: usize) {
+        self.read_limit.store(read, Ordering::SeqCst);
+        self.write_limit.store(write, Ordering::SeqCst);
+        self.delayed_reads.store(true, Ordering::SeqCst);
+    }
+    pub(crate) fn io_peaks(&self) -> (usize, usize, usize) {
+        (
+            self.read_peak.load(Ordering::SeqCst),
+            self.write_peak.load(Ordering::SeqCst),
+            self.append_calls.load(Ordering::SeqCst),
+        )
+    }
+    pub(crate) fn hsync_calls(&self) -> usize {
+        self.hsync_calls.load(Ordering::SeqCst)
+    }
+    pub(crate) async fn reveal_tail_during_lease_recovery(&self, tail: Bytes) {
+        *self.recovered_tail.lock().await = Some(tail);
+    }
+    pub(crate) fn stabilize_calls(&self) -> usize {
+        self.stabilize_calls.load(Ordering::SeqCst)
+    }
     pub(crate) async fn insert(&self, path: &str, value: Bytes) {
         self.objects.lock().await.insert(path.into(), value);
     }
@@ -80,6 +115,18 @@ impl MemoryHdfs {
 
 #[async_trait]
 impl HdfsProtocol for MemoryHdfs {
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        match self.read_limit.load(Ordering::SeqCst) {
+            0 => 2 * 1024 * 1024,
+            value => value,
+        }
+    }
+    fn maximum_write_chunk_bytes(&self) -> usize {
+        match self.write_limit.load(Ordering::SeqCst) {
+            0 => 2 * 1024 * 1024,
+            value => value,
+        }
+    }
     async fn stat(&self, path: &StoragePath) -> Result<HdfsEntryFacts, StorageRoleFailure> {
         self.stat_calls.fetch_add(1, Ordering::SeqCst);
         let objects = self.objects.lock().await;
@@ -113,6 +160,12 @@ impl HdfsProtocol for MemoryHdfs {
         path: &StoragePath,
         range: std::ops::Range<u64>,
     ) -> Result<Bytes, StorageRoleFailure> {
+        let _active = ActiveRead(self);
+        let active = self.read_active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.read_peak.fetch_max(active, Ordering::SeqCst);
+        if self.delayed_reads.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
         let objects = self.objects.lock().await;
         let value = objects
             .get(path.as_str())
@@ -213,13 +266,13 @@ impl HdfsProtocol for MemoryHdfs {
         Ok(())
     }
 
-    async fn append_stage(
+    async fn open_stage_writer(
         &self,
         path: &StoragePath,
         start_offset: u64,
-        expected_size: u64,
-        mut input: ByteStream,
-    ) -> Result<u64, StorageRoleFailure> {
+        direct: bool,
+    ) -> Result<Box<dyn HdfsWriteSession + '_>, StorageRoleFailure> {
+        self.append_calls.fetch_add(1, Ordering::SeqCst);
         if self.fail_write.load(Ordering::SeqCst) {
             return Err(entry_failure(
                 path,
@@ -228,61 +281,22 @@ impl HdfsProtocol for MemoryHdfs {
                 Transience::Transient,
             ));
         }
-        if expected_size < start_offset {
-            return Err(entry_failure(
-                path,
-                Operation::Write,
-                FailureClass::InvalidInput,
-                Transience::Permanent,
-            ));
-        }
-        let initial_len = self
-            .objects
-            .lock()
-            .await
-            .get(path.as_str())
-            .ok_or_else(|| Self::missing(path, Operation::Write))?
-            .len() as u64;
-        if initial_len != start_offset {
-            return Err(entry_failure(
-                path,
-                Operation::Write,
-                FailureClass::Conflict,
-                Transience::Permanent,
-            ));
-        }
-        let mut offset = start_offset;
-        while let Some(chunk) = input.next().await {
-            let chunk = chunk?;
-            let length = u64::try_from(chunk.len()).map_err(|_| {
-                entry_failure(
-                    path,
-                    Operation::Write,
-                    FailureClass::InvalidInput,
-                    Transience::Permanent,
-                )
-            })?;
-            let next = offset.checked_add(length).ok_or_else(|| {
-                entry_failure(
-                    path,
-                    Operation::Write,
-                    FailureClass::InvalidInput,
-                    Transience::Permanent,
-                )
-            })?;
-            if next > expected_size {
+        let mut objects = self.objects.lock().await;
+        if direct {
+            if start_offset != 0 {
                 return Err(entry_failure(
                     path,
                     Operation::Write,
-                    FailureClass::Corruption,
+                    FailureClass::InvalidInput,
                     Transience::Permanent,
                 ));
             }
-            let mut objects = self.objects.lock().await;
-            let value = objects
-                .get_mut(path.as_str())
+            objects.insert(path.as_str().into(), Bytes::new());
+        } else {
+            let current = objects
+                .get(path.as_str())
                 .ok_or_else(|| Self::missing(path, Operation::Write))?;
-            if value.len() as u64 != offset {
+            if current.len() as u64 != start_offset {
                 return Err(entry_failure(
                     path,
                     Operation::Write,
@@ -290,20 +304,28 @@ impl HdfsProtocol for MemoryHdfs {
                     Transience::Permanent,
                 ));
             }
-            let mut appended = BytesMut::from(value.as_ref());
-            appended.extend_from_slice(&chunk);
-            *value = appended.freeze();
-            offset = next;
         }
-        if offset != expected_size {
-            return Err(entry_failure(
-                path,
-                Operation::Write,
-                FailureClass::Corruption,
-                Transience::Permanent,
-            ));
+        drop(objects);
+        Ok(Box::new(MemoryWriteSession {
+            storage: self,
+            path: path.clone(),
+            offset: start_offset,
+        }))
+    }
+
+    async fn stabilize_recovered_stage(
+        &self,
+        path: &StoragePath,
+    ) -> Result<u64, StorageRoleFailure> {
+        self.stabilize_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(tail) = self.recovered_tail.lock().await.take() {
+            self.objects.lock().await.insert(path.as_str().into(), tail);
         }
-        Ok(expected_size)
+        let objects = self.objects.lock().await;
+        let value = objects
+            .get(path.as_str())
+            .ok_or_else(|| Self::missing(path, Operation::Prepare))?;
+        Ok(value.len() as u64)
     }
 
     async fn set_mapped_ownership(
@@ -320,6 +342,14 @@ impl HdfsProtocol for MemoryHdfs {
         Ok(())
     }
 
+    async fn set_mode(&self, path: &StoragePath, mode: u32) -> Result<(), StorageRoleFailure> {
+        self.metadata_calls
+            .lock()
+            .await
+            .push(format!("mode:{}:{mode:o}", path.as_str()));
+        Ok(())
+    }
+
     async fn set_timestamps(
         &self,
         path: &StoragePath,
@@ -330,6 +360,62 @@ impl HdfsProtocol for MemoryHdfs {
             .lock()
             .await
             .push(format!("timestamps:{}:{atime:?}:{mtime:?}", path.as_str()));
+        Ok(())
+    }
+}
+
+struct MemoryWriteSession<'a> {
+    storage: &'a MemoryHdfs,
+    path: StoragePath,
+    offset: u64,
+}
+
+#[async_trait]
+impl HdfsWriteSession for MemoryWriteSession<'_> {
+    async fn write(&mut self, data: Bytes) -> Result<usize, StorageRoleFailure> {
+        if self.storage.hsync_completed.load(Ordering::SeqCst)
+            && self.storage.fail_after_hsync.swap(false, Ordering::SeqCst)
+        {
+            return Err(entry_failure(
+                &self.path,
+                Operation::Write,
+                FailureClass::Protocol,
+                Transience::Transient,
+            ));
+        }
+        self.storage
+            .write_peak
+            .fetch_max(data.len(), Ordering::SeqCst);
+        let mut objects = self.storage.objects.lock().await;
+        let value = objects
+            .get_mut(self.path.as_str())
+            .ok_or_else(|| MemoryHdfs::missing(&self.path, Operation::Write))?;
+        if value.len() as u64 != self.offset {
+            return Err(entry_failure(
+                &self.path,
+                Operation::Write,
+                FailureClass::Conflict,
+                Transience::Permanent,
+            ));
+        }
+        let count = data.len();
+        let mut appended = BytesMut::from(value.as_ref());
+        appended.extend_from_slice(&data);
+        *value = appended.freeze();
+        self.offset = self
+            .offset
+            .checked_add(count as u64)
+            .ok_or_else(|| MemoryHdfs::missing(&self.path, Operation::Write))?;
+        Ok(count)
+    }
+
+    async fn hsync(&mut self) -> Result<(), StorageRoleFailure> {
+        self.storage.hsync_calls.fetch_add(1, Ordering::SeqCst);
+        self.storage.hsync_completed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn close(self: Box<Self>) -> Result<(), StorageRoleFailure> {
         Ok(())
     }
 }
@@ -350,50 +436,6 @@ async fn exclusive_stage_creation_preserves_existing_partial() {
 }
 
 #[tokio::test]
-async fn append_stage_requires_current_prefix_and_exact_final_size() {
-    let storage = MemoryHdfs::default();
-    let path = StoragePath::new("partial").unwrap_or_else(|error| panic!("{error}"));
-    storage.insert("partial", Bytes::from_static(b"abc")).await;
-    let input: ByteStream = Box::pin(futures::stream::iter([Ok(Bytes::from_static(b"def"))]));
-
-    let written = storage
-        .append_stage(&path, 3, 6, input)
-        .await
-        .unwrap_or_else(|error| panic!("{error:?}"));
-
-    assert_eq!(written, 6);
-    assert_eq!(
-        storage.get("partial").await,
-        Some(Bytes::from_static(b"abcdef"))
-    );
-    let stale: ByteStream = Box::pin(futures::stream::empty());
-    assert!(storage.append_stage(&path, 3, 3, stale).await.is_err());
-}
-
-#[tokio::test]
-async fn append_stage_preserves_each_durable_chunk_after_input_failure() {
-    let storage = MemoryHdfs::default();
-    let path = StoragePath::new("partial").unwrap_or_else(|error| panic!("{error}"));
-    storage.insert("partial", Bytes::from_static(b"abc")).await;
-    let failure = entry_failure(
-        &path,
-        Operation::Read,
-        FailureClass::Connectivity,
-        Transience::Transient,
-    );
-    let input: ByteStream = Box::pin(futures::stream::iter([
-        Ok(Bytes::from_static(b"def")),
-        Err(failure),
-    ]));
-
-    assert!(storage.append_stage(&path, 3, 9, input).await.is_err());
-    assert_eq!(
-        storage.get("partial").await,
-        Some(Bytes::from_static(b"abcdef"))
-    );
-}
-
-#[tokio::test]
 async fn claim_stage_failures_are_prepare_operations() {
     let storage = MemoryHdfs::default();
     let base = StoragePath::new("base").unwrap_or_else(|error| panic!("{error}"));
@@ -411,4 +453,11 @@ async fn claim_stage_failures_are_prepare_operations() {
     let missing = storage.claim_stage(&base, &claimed).await;
     assert!(matches!(missing, Err(StorageRoleFailure::Entry(error))
         if error.operation() == Operation::Prepare && error.class() == FailureClass::NotFound));
+}
+
+struct ActiveRead<'a>(&'a MemoryHdfs);
+impl Drop for ActiveRead<'_> {
+    fn drop(&mut self) {
+        self.0.read_active.fetch_sub(1, Ordering::SeqCst);
+    }
 }

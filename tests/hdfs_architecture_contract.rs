@@ -307,7 +307,7 @@ async fn publish_recovered(
             recovered,
             PublishRequest {
                 expected_size,
-                expected_blake3,
+                expected_blake3: Some(expected_blake3),
                 cancel: CancellationToken::new(),
             },
         )

@@ -3065,7 +3065,17 @@ pub fn create_cifs_role_storage(
     root: Option<String>,
     identity: crate::model::BackendIdentity,
 ) -> std::result::Result<crate::storage::Storage, Box<dyn std::error::Error>> {
-    crate::storage::backends::cifs::connect(share, root, identity)
+    let concurrency = TransferConcurrency::from_env(
+        crate::model::BackendKind::Cifs,
+        TransferConcurrency::defaults(8, 8),
+    )?;
+    crate::storage::backends::cifs::connect(
+        share,
+        root,
+        identity,
+        std::num::NonZeroUsize::new(concurrency.read()).ok_or("invalid CIFS read depth")?,
+        std::num::NonZeroUsize::new(concurrency.write()).ok_or("invalid CIFS write depth")?,
+    )
 }
 
 #[cfg(test)]

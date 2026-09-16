@@ -99,7 +99,12 @@ pub(crate) enum S3ClaimOutcome {
 #[async_trait]
 pub(crate) trait S3Protocol: Send + Sync {
     async fn head(&self, key: &str) -> S3Result<S3ObjectFacts>;
-    async fn get_range(&self, key: &str, range: Range<u64>) -> S3Result<Bytes>;
+    async fn get_range(
+        &self,
+        key: &str,
+        range: Range<u64>,
+        observed: &S3ObjectFacts,
+    ) -> S3Result<Bytes>;
     async fn begin_multipart(&self, key: &str) -> S3Result<String>;
     async fn upload_part(
         &self,

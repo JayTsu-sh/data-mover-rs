@@ -3,13 +3,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt as _;
-use futures::stream::FuturesOrdered;
+use futures::future::Either;
+use futures::stream::{FuturesOrdered, FuturesUnordered};
 
 use crate::model::{
     BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass,
     IdentityStrength, Operation, SourceIdentity, StoragePath, Transience,
 };
-use crate::storage::{ByteStream, ReadRequest, ReadSource, SourceDescriptor, StorageRoleFailure};
+use crate::storage::{
+    ByteStream, PositionedByteStream, PositionedChunk, ReadRequest, ReadSource, SourceDescriptor,
+    StorageRoleFailure,
+};
 
 const MAX_ROLE_READ: usize = 1024 * 1024;
 
@@ -116,7 +120,33 @@ impl ReadSource for NfsReadSourceAdapter {
         self.descriptor(path).await
     }
 
+    fn supports_positioned_read(&self) -> bool {
+        true
+    }
+
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure> {
+        let state = self.open_state(request, false).await?;
+        Ok(Box::pin(
+            futures::stream::try_unfold(state, read_next)
+                .map(|result| result.map(|chunk| chunk.data)),
+        ))
+    }
+
+    async fn read_positioned(
+        &self,
+        request: ReadRequest,
+    ) -> Result<PositionedByteStream, StorageRoleFailure> {
+        let state = self.open_state(request, true).await?;
+        Ok(Box::pin(futures::stream::try_unfold(state, read_next)))
+    }
+}
+
+impl NfsReadSourceAdapter {
+    async fn open_state(
+        &self,
+        request: ReadRequest,
+        unordered: bool,
+    ) -> Result<ReadState, StorageRoleFailure> {
         if request.cancel.is_cancelled() {
             return Err(cancelled(&request.path));
         }
@@ -189,12 +219,16 @@ impl ReadSource for NfsReadSourceAdapter {
                 .maximum_chunk_bytes
                 .min(self.protocol.maximum_read_chunk_bytes().max(1)),
             read_concurrency: request.read_inflight,
-            inflight: FuturesOrdered::new(),
+            inflight: if unordered {
+                Either::Right(FuturesUnordered::new())
+            } else {
+                Either::Left(FuturesOrdered::new())
+            },
             cancel: request.cancel,
             qos: request.source_qos,
             budget: request.read_budget,
         };
-        Ok(Box::pin(futures::stream::try_unfold(state, read_next)))
+        Ok(state)
     }
 }
 
@@ -206,10 +240,19 @@ struct ReadState {
     end: u64,
     maximum_chunk_bytes: usize,
     read_concurrency: usize,
-    inflight: FuturesOrdered<NfsReadFuture>,
+    inflight: Either<FuturesOrdered<NfsReadFuture>, FuturesUnordered<NfsReadFuture>>,
     cancel: tokio_util::sync::CancellationToken,
     qos: Option<crate::storage::SourceQosBudget>,
     budget: Option<crate::storage::ReadBudget>,
+}
+
+impl ReadState {
+    fn inflight_len(&self) -> usize {
+        match &self.inflight {
+            Either::Left(queue) => queue.len(),
+            Either::Right(queue) => queue.len(),
+        }
+    }
 }
 
 type NfsReadFuture = std::pin::Pin<
@@ -226,7 +269,7 @@ type NfsReadFuture = std::pin::Pin<
 >;
 
 async fn fill_read_pipeline(state: &mut ReadState) -> Result<(), StorageRoleFailure> {
-    while state.inflight.len() < state.read_concurrency && state.next_issue < state.end {
+    while state.inflight_len() < state.read_concurrency && state.next_issue < state.end {
         if state.cancel.is_cancelled() {
             return Err(cancelled(&state.path));
         }
@@ -242,7 +285,7 @@ async fn fill_read_pipeline(state: &mut ReadState) -> Result<(), StorageRoleFail
                             Transience::Permanent,
                         )
                     })?,
-                    state.inflight.is_empty(),
+                    state.inflight_len() == 0,
                 )
                 .await
                 .map_err(|_| cancelled(&state.path))?
@@ -271,7 +314,7 @@ async fn fill_read_pipeline(state: &mut ReadState) -> Result<(), StorageRoleFail
         let offset = state.next_issue;
         let cursor = Arc::clone(&state.cursor);
         let cancel = state.cancel.clone();
-        state.inflight.push_back(Box::pin(async move {
+        let future: NfsReadFuture = Box::pin(async move {
             let result = tokio::select! {
                 biased;
                 () = cancel.cancelled() => Err(NfsProtocolFailure {
@@ -281,7 +324,11 @@ async fn fill_read_pipeline(state: &mut ReadState) -> Result<(), StorageRoleFail
                 result = cursor.read_at(offset, count) => result,
             };
             (offset, count, result, admission)
-        }));
+        });
+        match &mut state.inflight {
+            Either::Left(queue) => queue.push_back(future),
+            Either::Right(queue) => queue.push(future),
+        }
         state.next_issue = state.next_issue.checked_add(granted).ok_or_else(|| {
             entry_failure(
                 &state.path,
@@ -294,9 +341,11 @@ async fn fill_read_pipeline(state: &mut ReadState) -> Result<(), StorageRoleFail
     Ok(())
 }
 
-async fn read_next(mut state: ReadState) -> Result<Option<(Bytes, ReadState)>, StorageRoleFailure> {
+async fn read_next(
+    mut state: ReadState,
+) -> Result<Option<(PositionedChunk, ReadState)>, StorageRoleFailure> {
     fill_read_pipeline(&mut state).await?;
-    if state.inflight.is_empty() {
+    if state.inflight_len() == 0 {
         return Ok(None);
     }
     let next = tokio::select! {
@@ -312,7 +361,7 @@ async fn read_next(mut state: ReadState) -> Result<Option<(Bytes, ReadState)>, S
             Transience::Unknown,
         )
     })?;
-    if offset != state.next_emit {
+    if matches!(state.inflight, Either::Left(_)) && offset != state.next_emit {
         return Err(entry_failure(
             &state.path,
             Operation::Read,
@@ -346,7 +395,13 @@ async fn read_next(mut state: ReadState) -> Result<Option<(Bytes, ReadState)>, S
     if let (Some(budget), Some(admission)) = (&state.budget, admission) {
         budget.ready(offset, admission);
     }
-    Ok(Some((bytes, state)))
+    Ok(Some((
+        PositionedChunk {
+            offset,
+            data: bytes,
+        },
+        state,
+    )))
 }
 
 pub(super) fn cancelled(path: &StoragePath) -> StorageRoleFailure {

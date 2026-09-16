@@ -9,6 +9,8 @@ use std::time::Duration;
 #[derive(Default)]
 pub(super) struct WriteProbe {
     #[cfg(test)]
+    pub(super) checkpoint_prefixes: std::sync::Mutex<Vec<u64>>,
+    #[cfg(test)]
     pub(super) final_data_sync_calls: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     pub(super) final_directory_sync_calls: std::sync::atomic::AtomicU64,

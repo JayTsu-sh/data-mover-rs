@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -7,7 +8,7 @@ use crate::model::{
     BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
     Transience,
 };
-use crate::storage::{ByteStream, StorageRoleFailure};
+use crate::storage::StorageRoleFailure;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HdfsEntryFacts {
@@ -24,7 +25,35 @@ pub(crate) struct HdfsEntryFacts {
 }
 
 #[async_trait]
+pub(crate) trait HdfsReadCursor: Send + Sync {
+    async fn read_range(&self, range: Range<u64>) -> Result<Bytes, StorageRoleFailure>;
+}
+
+#[async_trait]
+pub(crate) trait HdfsWriteSession: Send {
+    async fn write(&mut self, data: Bytes) -> Result<usize, StorageRoleFailure>;
+    async fn hsync(&mut self) -> Result<(), StorageRoleFailure>;
+    async fn close(self: Box<Self>) -> Result<(), StorageRoleFailure>;
+}
+
+#[async_trait]
 pub(crate) trait HdfsProtocol: Send + Sync {
+    fn maximum_read_chunk_bytes(&self) -> usize {
+        2 * 1024 * 1024
+    }
+    fn maximum_write_chunk_bytes(&self) -> usize {
+        2 * 1024 * 1024
+    }
+    fn read_concurrency(&self) -> usize {
+        8
+    }
+    async fn open_reader(
+        &self,
+        path: &StoragePath,
+    ) -> Result<Option<Arc<dyn HdfsReadCursor>>, StorageRoleFailure> {
+        let _ = path;
+        Ok(None)
+    }
     async fn stat(&self, path: &StoragePath) -> Result<HdfsEntryFacts, StorageRoleFailure>;
     async fn list(&self, path: &StoragePath) -> Result<Vec<HdfsEntryFacts>, StorageRoleFailure>;
     async fn read_range(
@@ -49,13 +78,27 @@ pub(crate) trait HdfsProtocol: Send + Sync {
         &self,
         path: &StoragePath,
     ) -> Result<(), StorageRoleFailure>;
-    async fn append_stage(
+    async fn open_stage_writer(
         &self,
         path: &StoragePath,
         start_offset: u64,
-        expected_size: u64,
-        input: ByteStream,
-    ) -> Result<u64, StorageRoleFailure>;
+        direct: bool,
+    ) -> Result<Box<dyn HdfsWriteSession + '_>, StorageRoleFailure>;
+    async fn stabilize_recovered_stage(
+        &self,
+        path: &StoragePath,
+    ) -> Result<u64, StorageRoleFailure> {
+        let facts = self.stat(path).await?;
+        match (facts.kind, facts.size) {
+            (EntryKind::File, Some(size)) => Ok(size),
+            _ => Err(entry_failure(
+                path,
+                Operation::Prepare,
+                FailureClass::Corruption,
+                Transience::Permanent,
+            )),
+        }
+    }
     async fn set_mapped_ownership(
         &self,
         path: &StoragePath,
@@ -63,6 +106,7 @@ pub(crate) trait HdfsProtocol: Send + Sync {
         group: &str,
         mode: u32,
     ) -> Result<(), StorageRoleFailure>;
+    async fn set_mode(&self, path: &StoragePath, mode: u32) -> Result<(), StorageRoleFailure>;
     async fn set_timestamps(
         &self,
         path: &StoragePath,

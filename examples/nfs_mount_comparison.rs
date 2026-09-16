@@ -31,6 +31,9 @@ enum Policy {
 struct Args {
     #[arg(long, value_enum)]
     transport: Transport,
+    /// Override the source independently to exercise mixed-backend transfers.
+    #[arg(long, value_enum)]
+    source_transport: Option<Transport>,
     #[arg(long, value_enum)]
     policy: Policy,
     #[arg(long)]
@@ -52,11 +55,12 @@ struct Args {
 
 async fn endpoint(
     args: &Args,
+    transport: Transport,
     root: &str,
     side: &str,
     concurrency: TransferConcurrency,
 ) -> Result<data_mover::storage::Storage, Error> {
-    let config = match args.transport {
+    let config = match transport {
         Transport::Mounted => BackendConfig::Local(LocalBackendConfig {
             root: root.into(),
             identity: BackendIdentity::new(BackendKind::Local, side)?,
@@ -80,13 +84,27 @@ async fn main() -> Result<(), Error> {
     if args.files == 0 || args.concurrency == 0 {
         return Err("files and concurrency must be positive".into());
     }
-    let backend = match args.transport {
-        Transport::Mounted => BackendKind::Local,
-        Transport::Client => BackendKind::Nfs,
-    };
-    let concurrency = TransferConcurrency::from_env(backend, TransferConcurrency::new(8, 8)?)?;
-    let source = endpoint(&args, &args.source, "source", concurrency).await?;
-    let destination = endpoint(&args, &args.destination, "destination", concurrency).await?;
+    let source_transport = args.source_transport.unwrap_or(args.transport);
+    let source_concurrency = concurrency(source_transport)?;
+    let destination_concurrency = concurrency(args.transport)?;
+    let concurrency =
+        TransferConcurrency::new(source_concurrency.read(), destination_concurrency.write())?;
+    let source = endpoint(
+        &args,
+        source_transport,
+        &args.source,
+        "source",
+        source_concurrency,
+    )
+    .await?;
+    let destination = endpoint(
+        &args,
+        args.transport,
+        &args.destination,
+        "destination",
+        destination_concurrency,
+    )
+    .await?;
     let slots = concurrency.read().max(concurrency.write());
     let inflight = InflightLimits::new(
         slots,
@@ -141,4 +159,15 @@ async fn main() -> Result<(), Error> {
         args.chunk_bytes
     );
     Ok(())
+}
+
+fn concurrency(transport: Transport) -> Result<TransferConcurrency, Error> {
+    let backend = match transport {
+        Transport::Mounted => BackendKind::Local,
+        Transport::Client => BackendKind::Nfs,
+    };
+    Ok(TransferConcurrency::from_env(
+        backend,
+        TransferConcurrency::new(8, 8)?,
+    )?)
 }

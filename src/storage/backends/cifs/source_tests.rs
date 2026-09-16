@@ -37,7 +37,7 @@ impl CifsReadCursor for MemoryCursor {
         4
     }
 
-    async fn read_at(&mut self, offset: u64, count: u32) -> smb_domain::Result<Bytes> {
+    async fn read_at(&self, offset: u64, count: u32) -> smb_domain::Result<Bytes> {
         let count = usize::try_from(count)?;
         self.reads
             .lock()
@@ -167,7 +167,7 @@ async fn source_stream_honours_negotiated_chunks_without_short_reads()
 }
 
 #[tokio::test]
-async fn active_source_cancellation_stops_before_another_read_and_closes()
+async fn active_source_cancellation_stops_prefetch_and_closes()
 -> Result<(), Box<dyn std::error::Error>> {
     let protocol = Arc::new(MemoryCifs {
         payload: Bytes::from_static(b"abcdefgh"),
@@ -201,7 +201,7 @@ async fn active_source_cancellation_stops_before_another_read_and_closes()
             .reads
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        [(0, 4)]
+        [(0, 4), (4, 4)]
     );
     assert_eq!(protocol.closes.load(Ordering::SeqCst), 1);
     Ok(())
@@ -342,6 +342,8 @@ async fn real_share_exercises_domain_roles_without_wire_api()
         share,
         root,
         BackendIdentity::new(BackendKind::Cifs, format!("{server}/{share_name}"))?,
+        std::num::NonZeroUsize::new(8).ok_or("zero read depth")?,
+        std::num::NonZeroUsize::new(8).ok_or("zero write depth")?,
     )?;
     let policy = crate::storage::PreflightPolicy::production();
     let namespace = storage.namespace(&policy)?;
@@ -465,7 +467,13 @@ impl RealCifsConfig {
                 smb_domain::Credentials::ntlm(self.username.clone(), self.password.clone()),
             )
             .await?;
-        let storage = super::connect(share.clone(), self.root.clone(), self.identity.clone())?;
+        let storage = super::connect(
+            share.clone(),
+            self.root.clone(),
+            self.identity.clone(),
+            std::num::NonZeroUsize::new(8).ok_or("zero read depth")?,
+            std::num::NonZeroUsize::new(8).ok_or("zero write depth")?,
+        )?;
         Ok(RealConnection {
             client,
             share,
@@ -633,7 +641,7 @@ async fn verify_and_publish(
             stage,
             crate::storage::PublishRequest {
                 expected_size: fixture.payload.len() as u64,
-                expected_blake3: hash,
+                expected_blake3: Some(hash),
                 cancel: tokio_util::sync::CancellationToken::new(),
             },
         )
@@ -738,7 +746,7 @@ async fn cleanup_real_fixture(
     delete_real_path_if_present(share, root, fixture.final_path.as_str()).await?;
     let directory = match share
         .open_directory(
-            &real_share_path(root, ".data-mover-staging")?,
+            &real_share_path(root, "")?,
             smb_domain::DirectoryOpenOptions::open_existing(),
         )
         .await
@@ -750,10 +758,10 @@ async fn cleanup_real_fixture(
     let entries = directory.entries("*").try_collect::<Vec<_>>().await;
     close_real_directory(directory).await?;
     let digest = blake3::hash(fixture.final_path.as_str().as_bytes()).to_hex();
-    let prefix = &digest[..16];
+    let prefix = format!(".data-mover-{}-", &digest[..16]);
     for entry in entries? {
-        if entry.name().starts_with(prefix) {
-            let path = format!(".data-mover-staging/{}", entry.name());
+        if entry.name().starts_with(&prefix) {
+            let path = entry.name().to_owned();
             delete_real_path_if_present(share, root, &path).await?;
         }
     }
@@ -789,7 +797,11 @@ fn real_share_path(
         || relative.clone(),
         |root| format!("{}\\{relative}", root.replace('/', "\\")),
     );
-    Ok(smb_domain::SharePath::new(value)?)
+    Ok(smb_domain::SharePath::new(if value.is_empty() {
+        ".".to_owned()
+    } else {
+        value
+    })?)
 }
 
 async fn close_real_file(file: smb_domain::File) -> Result<(), Box<dyn std::error::Error>> {

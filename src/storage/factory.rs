@@ -22,6 +22,18 @@ pub struct NfsBackendConfig {
     pub ensure_dir: bool,
 }
 
+/// Controls SMB integrity negotiation for CIFS connections.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CifsSigningPolicy {
+    /// Require signed or encrypted authenticated traffic.
+    Required,
+    /// Omit ordinary signing when the server permits it; mandatory protocol
+    /// protection and encryption integrity remain enabled.
+    /// Without encryption, unsigned traffic has no SMB message integrity protection.
+    #[default]
+    WhenRequired,
+}
+
 #[derive(Clone)]
 pub struct CifsBackendConfig {
     pub server: String,
@@ -29,6 +41,8 @@ pub struct CifsBackendConfig {
     pub root: Option<String>,
     pub username: String,
     pub password: String,
+    /// Signing policy negotiated independently with each server.
+    pub signing_policy: CifsSigningPolicy,
     pub identity: BackendIdentity,
 }
 
@@ -41,6 +55,7 @@ impl fmt::Debug for CifsBackendConfig {
             .field("root", &self.root)
             .field("username", &"<redacted>")
             .field("password", &"<redacted>")
+            .field("signing_policy", &self.signing_policy)
             .field("identity", &self.identity)
             .finish()
     }
@@ -126,7 +141,11 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
         .await
         .map_err(|error| BackendConnectError::new(BackendKind::Nfs, error)),
         BackendConfig::Cifs(config) => {
-            let client = smb_domain::Client::new();
+            let signing = match config.signing_policy {
+                CifsSigningPolicy::Required => smb_domain::SigningPolicy::Required,
+                CifsSigningPolicy::WhenRequired => smb_domain::SigningPolicy::WhenRequired,
+            };
+            let client = smb_domain::Client::with_signing_policy(signing);
             let target = smb_domain::ShareTarget::new(&config.server, &config.share)
                 .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))?;
             let share = client

@@ -139,8 +139,9 @@ pub enum TransferPolicy {
     /// barriers: successful completion does not guarantee crash durability.
     /// Other destinations may retain persistence required by their protocol.
     AtomicReplace,
-    /// Write the final Local file in place, without checkpoints or durability barriers.
-    /// Failure may leave partial content. Supported by the ordinary Unix Local transfer entry.
+    /// Write the final path directly, without staging, rename, or checkpoints.
+    /// Failure may leave partial content. Supported by Unix Local and HDFS destinations.
+    /// HDFS recreates the target and completes its writer; Local writes the existing inode.
     Direct,
 }
 

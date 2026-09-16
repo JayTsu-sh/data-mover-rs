@@ -1,9 +1,7 @@
 use std::ops::Range as RoleRange;
 
 use bytes::Bytes as RoleBytes;
-use tokio::sync::mpsc as role_mpsc;
 
-use crate::DataChunk as RoleDataChunk;
 use crate::error::HdfsErrorKind as RoleHdfsErrorKind;
 use crate::model::{
     EntryKind as RoleEntryKind, FailureClass as RoleFailureClass, Operation as RoleOperation,
@@ -11,14 +9,32 @@ use crate::model::{
 };
 use crate::storage::backends::hdfs::protocol::{
     HdfsEntryFacts as RoleHdfsEntryFacts, HdfsProtocol as RoleHdfsProtocol,
+    HdfsWriteSession as RoleHdfsWriteSession,
     entry_failure as role_entry_failure, session_failure as role_session_failure,
 };
-use crate::storage::{ByteStream as RoleByteStream, StorageRoleFailure as RoleFailure};
-
-const HDFS_ROLE_MAX_CHUNK: usize = 1024 * 1024;
+use crate::storage::StorageRoleFailure as RoleFailure;
 
 #[async_trait::async_trait]
 impl RoleHdfsProtocol for HDFSStorage {
+    fn read_concurrency(&self) -> usize {
+        self.transfer_concurrency().read()
+    }
+    async fn open_reader(
+        &self,
+        path: &RoleStoragePath,
+    ) -> Result<
+        Option<Arc<dyn crate::storage::backends::hdfs::protocol::HdfsReadCursor>>,
+        RoleFailure,
+    > {
+        let file = self
+            .open_file(Path::new(path.as_str()))
+            .await
+            .map_err(|error| hdfs_role_error(path, RoleOperation::Read, error))?;
+        Ok(Some(Arc::new(RoleReadCursor {
+            file,
+            path: path.clone(),
+        })))
+    }
     async fn stat(&self, path: &RoleStoragePath) -> Result<RoleHdfsEntryFacts, RoleFailure> {
         let entry = self
             .get_metadata(Path::new(path.as_str()))
@@ -148,27 +164,90 @@ impl RoleHdfsProtocol for HDFSStorage {
         validate_empty_stage(self, path, native).await
     }
 
-    async fn append_stage(
+    async fn open_stage_writer(
         &self,
         path: &RoleStoragePath,
         start_offset: u64,
-        expected_size: u64,
-        input: RoleByteStream,
+        direct: bool,
+    ) -> Result<Box<dyn RoleHdfsWriteSession + '_>, RoleFailure> {
+        let native = Path::new(path.as_str());
+        let resolved = self
+            .resolve_path(native)
+            .map_err(|error| hdfs_role_error(path, RoleOperation::Write, error))?;
+        let writer = if direct {
+            if let Some(parent) = native
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                self.create_dir_all(parent, 0o755)
+                    .await
+                    .map_err(|error| hdfs_role_error(path, RoleOperation::Prepare, error))?;
+            }
+            if start_offset != 0 {
+                return Err(invalid_stage_chunk(path));
+            }
+            self.client
+                .create(
+                    &resolved,
+                    hdfs_native::WriteOptions::default()
+                        .block_size(self.block_size)
+                        .overwrite(true),
+                )
+                .await
+                .map_err(|error| {
+                    hdfs_role_error(
+                        path,
+                        RoleOperation::Write,
+                        hdfs_operation_error("create direct target", Some(native), &error),
+                    )
+                })?
+        } else {
+            let metadata = self
+                .get_metadata(native)
+                .await
+                .map_err(|error| hdfs_role_error(path, RoleOperation::Write, error))?;
+            if metadata.is_dir || metadata.size != start_offset {
+                return Err(hdfs_role_entry(
+                    path,
+                    RoleOperation::Write,
+                    RoleFailureClass::Conflict,
+                    RoleTransience::Permanent,
+                ));
+            }
+            open_append_after_lease_recovery(&self.client, &resolved, native)
+                .await
+                .map_err(|error| hdfs_role_error(path, RoleOperation::Write, error))?
+        };
+        Ok(Box::new(RoleWriteSession {
+            writer,
+            path: path.clone(),
+        }))
+    }
+
+    async fn stabilize_recovered_stage(
+        &self,
+        path: &RoleStoragePath,
     ) -> Result<u64, RoleFailure> {
-        let capacity = self.transfer_concurrency().write().max(1);
-        let (sender, receiver) = role_mpsc::channel(capacity);
-        let feed = feed_stage_chunks(path.clone(), start_offset, input, sender);
-        let append = self.append_stream(
-            receiver,
-            Path::new(path.as_str()),
-            start_offset,
-            expected_size,
-        );
-        let (feed_result, append_result) = tokio::join!(feed, append);
-        resolve_stage_append(
-            feed_result,
-            append_result.map_err(|error| hdfs_role_error(path, RoleOperation::Write, error)),
-        )
+        let native = Path::new(path.as_str());
+        let resolved = self
+            .resolve_path(native)
+            .map_err(|error| hdfs_role_error(path, RoleOperation::Prepare, error))?;
+        recover_lease_until_closed(&self.client, &resolved, native)
+            .await
+            .map_err(|error| hdfs_role_error(path, RoleOperation::Prepare, error))?;
+        let metadata = self
+            .get_metadata(native)
+            .await
+            .map_err(|error| hdfs_role_error(path, RoleOperation::Prepare, error))?;
+        if metadata.is_dir {
+            return Err(hdfs_role_entry(
+                path,
+                RoleOperation::Prepare,
+                RoleFailureClass::Corruption,
+                RoleTransience::Permanent,
+            ));
+        }
+        Ok(metadata.size)
     }
 
     async fn set_mapped_ownership(
@@ -187,6 +266,12 @@ impl RoleHdfsProtocol for HDFSStorage {
             .map_err(|error| hdfs_role_error(path, RoleOperation::Metadata, error))
     }
 
+    async fn set_mode(&self, path: &RoleStoragePath, mode: u32) -> Result<(), RoleFailure> {
+        self.set_permission(Path::new(path.as_str()), mode)
+            .await
+            .map_err(|error| hdfs_role_error(path, RoleOperation::Metadata, error))
+    }
+
     async fn set_timestamps(
         &self,
         path: &RoleStoragePath,
@@ -196,6 +281,58 @@ impl RoleHdfsProtocol for HDFSStorage {
         self.set_metadata(Path::new(path.as_str()), atime, mtime, None)
             .await
             .map_err(|error| hdfs_role_error(path, RoleOperation::Metadata, error))
+    }
+}
+
+struct RoleWriteSession {
+    writer: FileWriter,
+    path: RoleStoragePath,
+}
+
+#[async_trait::async_trait]
+impl RoleHdfsWriteSession for RoleWriteSession {
+    async fn write(&mut self, data: RoleBytes) -> Result<usize, RoleFailure> {
+        Box::pin(self.writer.write_bytes(data))
+            .await
+            .map_err(|error| {
+                hdfs_role_error(
+                    &self.path,
+                    RoleOperation::Write,
+                    hdfs_operation_error(
+                        "write role stream",
+                        Some(Path::new(self.path.as_str())),
+                        &error,
+                    ),
+                )
+            })
+    }
+
+    async fn hsync(&mut self) -> Result<(), RoleFailure> {
+        Box::pin(self.writer.hsync()).await.map_err(|error| {
+            hdfs_role_error(
+                &self.path,
+                RoleOperation::Write,
+                hdfs_operation_error(
+                    "hsync role writer",
+                    Some(Path::new(self.path.as_str())),
+                    &error,
+                ),
+            )
+        })
+    }
+
+    async fn close(mut self: Box<Self>) -> Result<(), RoleFailure> {
+        Box::pin(self.writer.close()).await.map_err(|error| {
+            hdfs_role_error(
+                &self.path,
+                RoleOperation::Write,
+                hdfs_operation_error(
+                    "close role writer",
+                    Some(Path::new(self.path.as_str())),
+                    &error,
+                ),
+            )
+        })
     }
 }
 
@@ -217,101 +354,6 @@ async fn validate_empty_stage(
         ));
     }
     Ok(())
-}
-
-async fn feed_stage_chunks(
-    path: RoleStoragePath,
-    start_offset: u64,
-    mut input: RoleByteStream,
-    sender: role_mpsc::Sender<RoleDataChunk>,
-) -> Result<StageFeedOutcome, RoleFailure> {
-    let mut offset = start_offset;
-    while let Some(value) = input.next().await {
-        let data = value?;
-        let length = checked_stage_chunk_length(&path, &data)?;
-        if sender.send(RoleDataChunk { offset, data }).await.is_err() {
-            return Ok(StageFeedOutcome::ReceiverClosed);
-        }
-        offset = offset
-            .checked_add(length)
-            .ok_or_else(|| invalid_stage_chunk(&path))?;
-    }
-    Ok(StageFeedOutcome::Complete)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StageFeedOutcome {
-    Complete,
-    ReceiverClosed,
-}
-
-fn resolve_stage_append(
-    feed: Result<StageFeedOutcome, RoleFailure>,
-    append: Result<u64, RoleFailure>,
-) -> Result<u64, RoleFailure> {
-    match feed {
-        Err(input_error) => Err(input_error),
-        Ok(StageFeedOutcome::Complete | StageFeedOutcome::ReceiverClosed) => append,
-    }
-}
-
-#[cfg(test)]
-mod stage_bridge_tests {
-    use super::*;
-
-    fn path() -> RoleStoragePath {
-        RoleStoragePath::new("partial").unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    #[test]
-    fn receiver_closure_preserves_real_destination_failure() {
-        let path = path();
-        for class in [RoleFailureClass::Conflict, RoleFailureClass::Connectivity] {
-            let destination = hdfs_role_entry(
-                &path,
-                RoleOperation::Write,
-                class,
-                RoleTransience::Transient,
-            );
-            let result =
-                resolve_stage_append(Ok(StageFeedOutcome::ReceiverClosed), Err(destination));
-            assert!(matches!(result, Err(RoleFailure::Entry(error))
-                if error.operation() == RoleOperation::Write && error.class() == class));
-        }
-    }
-
-    #[test]
-    fn real_input_cancellation_wins_over_destination_failure() {
-        let path = path();
-        let input = hdfs_role_entry(
-            &path,
-            RoleOperation::Read,
-            RoleFailureClass::Cancelled,
-            RoleTransience::Transient,
-        );
-        let destination = hdfs_role_entry(
-            &path,
-            RoleOperation::Write,
-            RoleFailureClass::Connectivity,
-            RoleTransience::Transient,
-        );
-
-        let result = resolve_stage_append(Err(input), Err(destination));
-
-        assert!(matches!(result, Err(RoleFailure::Entry(error))
-            if error.operation() == RoleOperation::Read
-                && error.class() == RoleFailureClass::Cancelled));
-    }
-}
-
-fn checked_stage_chunk_length(
-    path: &RoleStoragePath,
-    data: &RoleBytes,
-) -> Result<u64, RoleFailure> {
-    if data.len() > HDFS_ROLE_MAX_CHUNK {
-        return Err(invalid_stage_chunk(path));
-    }
-    u64::try_from(data.len()).map_err(|_| invalid_stage_chunk(path))
 }
 
 fn invalid_stage_chunk(path: &RoleStoragePath) -> RoleFailure {
@@ -412,5 +454,27 @@ fn hdfs_role_classify(error: &StorageError) -> (RoleFailureClass, RoleTransience
             }
         }
         _ => (RoleFailureClass::Protocol, RoleTransience::Unknown, false),
+    }
+}
+
+struct RoleReadCursor {
+    file: HDFSFileHandle,
+    path: RoleStoragePath,
+}
+
+#[async_trait::async_trait]
+impl crate::storage::backends::hdfs::protocol::HdfsReadCursor for RoleReadCursor {
+    async fn read_range(&self, range: RoleRange<u64>) -> Result<RoleBytes, RoleFailure> {
+        let offset = usize::try_from(range.start).map_err(|_| invalid_stage_chunk(&self.path))?;
+        let length = usize::try_from(range.end - range.start)
+            .map_err(|_| invalid_stage_chunk(&self.path))?;
+        retry_hdfs_read(
+            "read role cursor",
+            Some(Path::new(self.path.as_str())),
+            None,
+            || self.file.reader.read_range(offset, length),
+        )
+        .await
+        .map_err(|error| hdfs_role_error(&self.path, RoleOperation::Read, error))
     }
 }

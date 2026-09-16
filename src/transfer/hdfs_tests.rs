@@ -216,6 +216,97 @@ async fn interrupted_hdfs_stage_recovers_only_the_durable_tail() -> TestResult {
 }
 
 #[tokio::test]
+async fn hdfs_recovery_stabilizes_the_lease_before_choosing_the_resume_offset() -> TestResult {
+    let protocol = Arc::new(MemoryHdfs::default());
+    protocol
+        .insert("source", Bytes::from_static(b"abcdef"))
+        .await;
+    let source = connect(protocol.clone(), test_identity("lease-source")?)?;
+    let descriptor = source
+        .read_source(&PreflightPolicy::production())?
+        .describe(&StoragePath::new("source")?)
+        .await?;
+    let destination = connect(protocol.clone(), test_identity("lease-destination")?)?;
+    let staged = destination.staged_destination(&PreflightPolicy::production())?;
+    let stage = staged
+        .prepare(PrepareRequest {
+            final_destination: FinalDestination::new(StoragePath::new("final")?),
+            source: descriptor.clone(),
+            recovery_binding: [9; 32],
+        })
+        .await?;
+    let identity = staged.recovery_identity(&stage).await?;
+    protocol
+        .reveal_tail_during_lease_recovery(Bytes::from_static(b"abc"))
+        .await;
+
+    let recovered = staged
+        .recover(RecoverRequest {
+            identity,
+            final_destination: FinalDestination::new(StoragePath::new("final")?),
+            source: descriptor,
+            recovery_binding: [9; 32],
+            claim_token: [10; 32],
+        })
+        .await?;
+    assert_eq!(protocol.stabilize_calls(), 1);
+    let evidence = staged
+        .write(
+            &recovered,
+            Box::pin(stream::iter([Ok(Bytes::from_static(b"def"))])),
+        )
+        .await?;
+
+    assert_eq!(evidence.persisted_bytes, 6);
+    staged.discard(recovered).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn complete_recovered_hdfs_stage_does_not_poll_an_ended_stream_twice() -> TestResult {
+    let protocol = Arc::new(MemoryHdfs::default());
+    protocol
+        .insert("source", Bytes::from_static(b"abcdef"))
+        .await;
+    let source = connect(protocol.clone(), test_identity("complete-source")?)?;
+    let descriptor = source
+        .read_source(&PreflightPolicy::production())?
+        .describe(&StoragePath::new("source")?)
+        .await?;
+    let destination = connect(protocol.clone(), test_identity("complete-destination")?)?;
+    let staged = destination.staged_destination(&PreflightPolicy::production())?;
+    let stage = staged
+        .prepare(PrepareRequest {
+            final_destination: FinalDestination::new(StoragePath::new("final")?),
+            source: descriptor.clone(),
+            recovery_binding: [11; 32],
+        })
+        .await?;
+    let identity = staged.recovery_identity(&stage).await?;
+    protocol
+        .reveal_tail_during_lease_recovery(Bytes::from_static(b"abcdef"))
+        .await;
+    let recovered = staged
+        .recover(RecoverRequest {
+            identity,
+            final_destination: FinalDestination::new(StoragePath::new("final")?),
+            source: descriptor,
+            recovery_binding: [11; 32],
+            claim_token: [12; 32],
+        })
+        .await?;
+
+    let ended = stream::unfold((), |()| async {
+        None::<(Result<Bytes, crate::storage::StorageRoleFailure>, ())>
+    });
+    let evidence = staged.write(&recovered, Box::pin(ended)).await?;
+
+    assert_eq!(evidence.persisted_bytes, 6);
+    staged.discard(recovered).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn hdfs_recovery_rejects_tampering_and_competing_claims_without_mutation() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
     protocol
@@ -391,7 +482,7 @@ async fn hdfs_publication_reports_ambiguous_commit_truthfully() -> TestResult {
             &ambiguous_stage,
             PublishRequest {
                 expected_size: payload.len() as u64,
-                expected_blake3: *blake3::hash(&payload).as_bytes(),
+                expected_blake3: Some(*blake3::hash(&payload).as_bytes()),
                 cancel: CancellationToken::new(),
             },
         )

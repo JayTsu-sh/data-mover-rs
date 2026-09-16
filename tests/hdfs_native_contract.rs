@@ -12,6 +12,8 @@ use data_mover::{
 };
 use hdfs_native::file::{FileReader, FileWriter};
 use hdfs_native::{Client, ClientBuilder, WriteOptions};
+#[path = "hdfs_native_contract/policy_runtime.rs"]
+mod policy_runtime;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -1505,6 +1507,7 @@ fn async_types_meet_streaming_adapter_ownership_contract() {
     assert_send_value(client.read("/contract"));
     assert_send_value(client.create("/contract", options));
     assert_send_value(client.append("/contract"));
+    assert_send_value(client.recover_lease("/contract"));
     assert_send_value(client.mkdirs("/contract", 0o750, true));
     assert_send_value(client.rename("/contract", "/renamed", true));
     assert_send_value(client.delete("/contract", true));
