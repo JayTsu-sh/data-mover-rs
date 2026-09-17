@@ -361,3 +361,121 @@ fn identity_bytes_track_content_change_and_ignore_directory_length() {
         "listing reports 0 while a directory handle reports index allocation"
     );
 }
+
+/// Listing protocol whose records carry the read-only attribute, as `QUERY_DIRECTORY` does.
+struct ListingProtocol {
+    entries: Vec<(String, EntryKind, Option<bool>)>,
+}
+
+#[async_trait]
+impl CifsNamespaceProtocol for ListingProtocol {
+    async fn stat(&self, _path: &StoragePath) -> smb_domain::Result<CifsSourceFacts> {
+        Ok(CifsSourceFacts {
+            kind: EntryKind::File,
+            size: 7,
+            identity: Bytes::from_static(b"stat-identity"),
+            maximum_read_chunk: 4,
+        })
+    }
+
+    async fn list(
+        &self,
+        path: &StoragePath,
+    ) -> smb_domain::Result<Vec<(StoragePath, CifsInlineMetadata)>> {
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        self.entries
+            .iter()
+            .map(|(name, kind, readonly)| {
+                let child = StoragePath::new(format!("{}/{name}", path.as_str()))
+                    .map_err(|_| smb_domain::Error::InvalidArgument("invalid path".into()))?;
+                Ok((
+                    child,
+                    CifsInlineMetadata {
+                        facts: CifsSourceFacts {
+                            kind: *kind,
+                            size: 3,
+                            identity: Bytes::from_static(b"listed"),
+                            maximum_read_chunk: u32::MAX,
+                        },
+                        accessed: stamp,
+                        modified: stamp,
+                        created: stamp,
+                        readonly: *readonly,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    async fn create_directory(&self, _path: &StoragePath) -> smb_domain::Result<()> {
+        Ok(())
+    }
+
+    async fn remove(&self, _path: &StoragePath) -> smb_domain::Result<()> {
+        Ok(())
+    }
+
+    async fn rename_entry(
+        &self,
+        _from: &StoragePath,
+        _to: &StoragePath,
+    ) -> smb_domain::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn listing_derives_mode_from_the_read_only_attribute_per_entry() -> Result {
+    let protocol = Arc::new(ListingProtocol {
+        entries: vec![
+            ("locked.bin".to_owned(), EntryKind::File, Some(true)),
+            ("plain.bin".to_owned(), EntryKind::File, Some(false)),
+            ("locked.dir".to_owned(), EntryKind::Directory, Some(true)),
+            ("plain.dir".to_owned(), EntryKind::Directory, Some(false)),
+            ("unknown.bin".to_owned(), EntryKind::File, None),
+        ],
+    });
+    let namespace = CifsNamespace::new(
+        protocol,
+        BackendIdentity::new(BackendKind::Cifs, "cifs-readonly-test")?,
+    );
+    let NamespaceResult::Entries(entries) = namespace
+        .execute(NamespaceRequest::List(path("dir")?))
+        .await?
+    else {
+        return Err("list must return entries".into());
+    };
+    let observed: Vec<Option<u32>> = entries
+        .iter()
+        .map(crate::storage::SourceDescriptor::inline_mode)
+        .collect();
+    assert_eq!(
+        observed,
+        vec![
+            Some(0o444),
+            Some(0o644),
+            Some(0o555),
+            Some(0o755),
+            None,
+        ],
+        "a record without the attribute stays None instead of claiming the entry is writable"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stat_never_claims_permission_bits() -> Result {
+    let protocol = RecordingProtocol::new(None);
+    let NamespaceResult::Entries(entries) = namespace(&protocol)?
+        .execute(NamespaceRequest::Stat(path("file.bin")?))
+        .await?
+    else {
+        return Err("stat must return entries".into());
+    };
+    assert_eq!(
+        entries[0].inline_mode(),
+        None,
+        "a metadata open carries no attribute bits, so stat must not invent permission bits"
+    );
+    Ok(())
+}

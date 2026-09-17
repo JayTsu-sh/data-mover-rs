@@ -51,6 +51,7 @@ fn request(identity: &BackendIdentity, destination: &str) -> PrepareRequest {
             backend_fact: None,
             content_version: None,
             inline_timestamps: None,
+            inline_mode: None,
         },
         recovery_binding: [7; 32],
     }

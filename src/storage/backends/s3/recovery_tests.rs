@@ -33,6 +33,7 @@ async fn fixture(name: &str, binding: [u8; 32]) -> TestResult<Fixture> {
         backend_fact: None,
         content_version: None,
         inline_timestamps: None,
+        inline_mode: None,
     };
     let prepare = PrepareRequest {
         final_destination: FinalDestination::new(StoragePath::new(name)?),

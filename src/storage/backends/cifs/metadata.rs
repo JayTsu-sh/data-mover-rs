@@ -18,6 +18,12 @@ pub(super) struct CifsInlineMetadata {
     pub(super) accessed: std::time::SystemTime,
     pub(super) modified: std::time::SystemTime,
     pub(super) created: std::time::SystemTime,
+    /// `FILE_ATTRIBUTE_READONLY`, when the operation that produced this record carried it.
+    ///
+    /// `QUERY_DIRECTORY` records carry the attribute, so `list` fills it. A metadata open does
+    /// not: `smb_domain::ResourceMetadata` exposes only the four timestamps and the length, so
+    /// `metadata` leaves it `None` rather than inventing a writable entry.
+    pub(super) readonly: Option<bool>,
 }
 
 #[async_trait]
@@ -363,6 +369,7 @@ mod tests {
                 accessed: std::time::UNIX_EPOCH,
                 modified: std::time::UNIX_EPOCH,
                 created: std::time::UNIX_EPOCH,
+                readonly: None,
             })
         }
 

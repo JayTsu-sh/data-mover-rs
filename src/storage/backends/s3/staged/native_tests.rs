@@ -27,6 +27,7 @@ fn native_prepare() -> TestResult<PrepareRequest> {
             backend_fact: None,
             content_version: None,
             inline_timestamps: None,
+            inline_mode: None,
         },
         recovery_binding: [5; 32],
     })

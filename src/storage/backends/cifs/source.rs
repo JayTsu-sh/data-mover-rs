@@ -354,6 +354,23 @@ fn entry_failure_with_transience(
     )
 }
 
+/// Approximates POSIX permission bits from the SMB attributes a listing carries.
+///
+/// SMB exposes no POSIX mode: on a server-side UNIX volume the real mode comes from
+/// name-mapping and umask, which the client cannot observe. `FILE_ATTRIBUTE_READONLY` is the
+/// only permission-shaped bit a `QUERY_DIRECTORY` record carries, so enumeration output
+/// reports this approximation and metadata application keeps reporting ownership as
+/// unsupported.
+pub(super) const fn smb_attributes_to_mode(is_dir: bool, readonly: bool) -> u32 {
+    if is_dir {
+        if readonly { 0o555 } else { 0o755 }
+    } else if readonly {
+        0o444
+    } else {
+        0o644
+    }
+}
+
 #[cfg(test)]
 mod classification_tests {
     use super::*;
@@ -372,5 +389,18 @@ mod classification_tests {
             classify_status(smb_domain::protocol::Status::SharingViolation as u32),
             (FailureClass::Conflict, Transience::Transient)
         );
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::smb_attributes_to_mode;
+
+    #[test]
+    fn read_only_attribute_clears_the_write_bits_for_files_and_directories() {
+        assert_eq!(smb_attributes_to_mode(false, false), 0o644);
+        assert_eq!(smb_attributes_to_mode(false, true), 0o444);
+        assert_eq!(smb_attributes_to_mode(true, false), 0o755);
+        assert_eq!(smb_attributes_to_mode(true, true), 0o555);
     }
 }

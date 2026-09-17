@@ -606,6 +606,7 @@ pub(crate) mod tests {
                     backend_fact: None,
                     content_version: None,
                     inline_timestamps: None,
+                    inline_mode: None,
                 },
                 recovery_binding: [9; 32],
             })
@@ -691,6 +692,7 @@ pub(crate) mod tests {
                     backend_fact: None,
                     content_version: None,
                     inline_timestamps: None,
+                    inline_mode: None,
                 },
                 recovery_binding: [4; 32],
             })
@@ -753,6 +755,7 @@ pub(crate) mod tests {
             backend_fact: None,
             content_version: None,
             inline_timestamps: None,
+            inline_mode: None,
         };
         let prepare = PrepareRequest {
             final_destination: FinalDestination::new(final_path.clone()),
@@ -882,6 +885,7 @@ pub(crate) mod tests {
                     backend_fact: None,
                     content_version: None,
                     inline_timestamps: None,
+                    inline_mode: None,
                 },
                 recovery_binding: [2; 32],
             })

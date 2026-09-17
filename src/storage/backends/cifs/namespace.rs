@@ -3,9 +3,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::metadata::{CifsInlineMetadata, timestamp};
-use super::source::{CifsSourceFacts, classify, descriptor_from_facts, entry_failure};
+use super::source::{
+    CifsSourceFacts, classify, descriptor_from_facts, entry_failure, smb_attributes_to_mode,
+};
 use crate::model::TimestampMetadata;
-use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath};
+use crate::model::{BackendIdentity, EntryKind, FailureClass, Operation, StoragePath};
 use crate::storage::{Namespace, NamespaceRequest, NamespaceResult, StorageRoleFailure};
 
 /// Protocol verbs behind the CIFS namespace role.
@@ -63,11 +65,18 @@ impl CifsNamespace {
             .map(|(child, inline)| {
                 descriptor_from_facts(&self.identity, &child, &inline.facts, Operation::Traverse)
                     .map(|descriptor| {
-                        descriptor.with_inline_timestamps(TimestampMetadata {
+                        let descriptor = descriptor.with_inline_timestamps(TimestampMetadata {
                             accessed: timestamp(inline.accessed),
                             modified: timestamp(inline.modified),
                             created: timestamp(inline.created),
-                        })
+                        });
+                        match inline.readonly {
+                            Some(readonly) => descriptor.with_inline_mode(smb_attributes_to_mode(
+                                inline.facts.kind == EntryKind::Directory,
+                                readonly,
+                            )),
+                            None => descriptor,
+                        }
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;

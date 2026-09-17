@@ -43,6 +43,16 @@ pub struct SourceDescriptor {
     /// Timestamps the listing or stat already returned, so traversal can avoid a per-entry
     /// metadata round trip when nothing beyond timestamps was requested.
     pub(crate) inline_timestamps: Option<TimestampMetadata>,
+    /// Approximate POSIX permission bits the enumerating operation could already derive, when it
+    /// carried enough to derive any. `None` means this path observed nothing about permissions,
+    /// which is distinct from an observed `0o644`.
+    ///
+    /// It is a display-grade value for enumeration output, never an input to metadata
+    /// application: a backend that cannot observe real ownership still reports
+    /// `ownership_mode` as unsupported through the [`Metadata`] role. On CIFS only the
+    /// `QUERY_DIRECTORY` path can derive it (from `FILE_ATTRIBUTE_READONLY`); a metadata open
+    /// carries no attribute bits at all.
+    pub(crate) inline_mode: Option<u32>,
 }
 
 impl SourceDescriptor {
@@ -62,6 +72,7 @@ impl SourceDescriptor {
             backend_fact: None,
             content_version: None,
             inline_timestamps: None,
+            inline_mode: None,
         }
     }
 
@@ -81,6 +92,19 @@ impl SourceDescriptor {
     #[must_use]
     pub const fn inline_timestamps(&self) -> Option<TimestampMetadata> {
         self.inline_timestamps
+    }
+
+    /// Attaches permission bits the enumerating operation could already derive.
+    #[must_use]
+    pub(crate) const fn with_inline_mode(mut self, mode: u32) -> Self {
+        self.inline_mode = Some(mode);
+        self
+    }
+
+    /// Permission bits the enumerating operation could already derive, if any.
+    #[must_use]
+    pub const fn inline_mode(&self) -> Option<u32> {
+        self.inline_mode
     }
 }
 

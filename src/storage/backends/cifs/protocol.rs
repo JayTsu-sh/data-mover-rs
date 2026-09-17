@@ -260,6 +260,7 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
                         accessed: entry.accessed(),
                         modified: entry.written(),
                         created: entry.created(),
+                        readonly: Some(entry.is_readonly()),
                     },
                 ))
             })
@@ -494,6 +495,9 @@ impl CifsMetadataProtocol for SmbDomainProtocol {
             accessed: metadata.accessed(),
             modified: metadata.written(),
             created: metadata.created(),
+            // `ResourceMetadata` carries only the four timestamps and the length, so a metadata
+            // open cannot observe `FILE_ATTRIBUTE_READONLY` at all.
+            readonly: None,
         })
     }
 

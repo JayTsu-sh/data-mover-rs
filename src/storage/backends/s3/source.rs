@@ -71,6 +71,7 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             backend_fact: None,
             content_version: None,
             inline_timestamps: None,
+            inline_mode: None,
         })
     }
 

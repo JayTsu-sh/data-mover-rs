@@ -200,6 +200,7 @@ impl ReadSource for LocalReadSource {
             backend_fact: None,
             content_version: Some(version),
             inline_timestamps: None,
+            inline_mode: None,
         })
     }
 

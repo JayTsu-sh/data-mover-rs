@@ -41,6 +41,7 @@ fn descriptor(value: &str, kind: EntryKind) -> SourceDescriptor {
         backend_fact: None,
         content_version: None,
         inline_timestamps: None,
+        inline_mode: None,
     }
 }
 
