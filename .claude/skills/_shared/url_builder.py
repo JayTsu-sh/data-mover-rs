@@ -5,35 +5,6 @@ from __future__ import annotations
 from urllib.parse import quote
 
 
-def cifs_url(
-    host: str,
-    share: str,
-    user: str = "",
-    password: str = "",
-    sub_path: str = "",
-    port: int | None = None,
-    smb2_only: bool = True,
-    anon: bool = False,
-) -> str:
-    auth = ""
-    if user or password:
-        auth = f"{quote(user)}:{quote(password)}@"
-    elif anon:
-        auth = "guest:@"
-
-    host_part = f"{host}:{port}" if port else host
-    path = f"/{share}"
-    if sub_path:
-        path += "/" + sub_path.lstrip("/")
-
-    params: list[str] = []
-    if smb2_only is False:
-        params.append("smb2_only=false")
-    if anon:
-        params.append("anon=true")
-    query = "?" + "&".join(params) if params else ""
-
-    return f"smb://{auth}{host_part}{path}{query}"
 
 
 def nfs_url(

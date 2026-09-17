@@ -36,10 +36,6 @@ impl StorageEnum {
                 s.update_metadata(relative_path, atime, mtime, uid, gid, mode)
                     .await
             }
-            Self::CIFS(s) => {
-                s.update_metadata(relative_path, atime, mtime, uid, gid, mode)
-                    .await
-            }
             Self::S3(_) => Ok(()),
             Self::HDFS(s) => {
                 if uid.is_some() || gid.is_some() {
@@ -82,17 +78,6 @@ impl StorageEnum {
                 )
                 .await
             }
-            (Self::CIFS(s), EntryEnum::NAS(e)) => {
-                s.update_metadata(
-                    &e.relative_path,
-                    Some(e.atime),
-                    Some(e.mtime),
-                    e.uid,
-                    e.gid,
-                    Some(e.mode),
-                )
-                .await
-            }
             (Self::Local(s), EntryEnum::S3(e)) => {
                 s.set_metadata(
                     Path::new(&e.relative_path),
@@ -105,17 +90,6 @@ impl StorageEnum {
                 .await
             }
             (Self::NFS(s), EntryEnum::S3(e)) => {
-                s.update_metadata(
-                    Path::new(&e.relative_path),
-                    Some(e.mtime),
-                    Some(e.mtime),
-                    None,
-                    None,
-                    None,
-                )
-                .await
-            }
-            (Self::CIFS(s), EntryEnum::S3(e)) => {
                 s.update_metadata(
                     Path::new(&e.relative_path),
                     Some(e.mtime),
@@ -164,18 +138,6 @@ impl StorageEnum {
                     )
                     .await
             }
-            Self::CIFS(storage) => {
-                storage
-                    .update_metadata(
-                        &entry.relative_path,
-                        None,
-                        Some(entry.mtime),
-                        None,
-                        None,
-                        Some(entry.mode & 0o7777),
-                    )
-                    .await
-            }
             Self::HDFS(storage) => {
                 storage
                     .set_permission(&entry.relative_path, entry.mode)
@@ -213,7 +175,6 @@ impl StorageEnum {
     ///
     /// 支持组合：
     /// - Local → Local（仅 Windows，Win32 API）
-    /// - CIFS → CIFS（跨平台，smb-rs 直通）
     /// - NFS → NFS（仅当双方都支持 ACL，即 `NFSv4+`）
     /// - 跨类型或不支持的组合静默跳过
     ///
@@ -226,12 +187,6 @@ impl StorageEnum {
         relative_path: &Path,
     ) -> Result<()> {
         match (from, to) {
-            // CIFS → CIFS：smb-rs SecurityDescriptor 直通（跨平台）
-            (StorageEnum::CIFS(src), StorageEnum::CIFS(dst)) => {
-                let sd = src.get_security_descriptor(relative_path).await?;
-                dst.set_security_descriptor(relative_path, &sd).await
-            }
-
             // NFS → NFS：NFSv4 ACL 直通（仅当双方都支持 ACL）
             (StorageEnum::NFS(src), StorageEnum::NFS(dst)) => {
                 if src.supports_acl() && dst.supports_acl() {
@@ -306,15 +261,6 @@ impl StorageEnum {
     /// Returns an error when the requested storage operation cannot be completed.
     pub async fn get_acl_bytes(&self, relative_path: &Path) -> Result<Option<Vec<u8>>> {
         match self {
-            StorageEnum::CIFS(s) => {
-                use binrw::BinWrite;
-                let sd = s.get_security_descriptor(relative_path).await?;
-                // 用 binrw 序列化 SecurityDescriptor 为字节
-                let mut buf = std::io::Cursor::new(Vec::new());
-                sd.write_le(&mut buf)
-                    .map_err(|e| StorageError::OperationError(format!("serialize SD: {e}")))?;
-                Ok(Some(buf.into_inner()))
-            }
             StorageEnum::NFS(s) if s.supports_acl() => {
                 match s.get_acl(relative_path).await {
                     Ok(acl) if !acl.aces.is_empty() => Ok(Some(serialize_nfs_acl(&acl)?)),
@@ -341,14 +287,6 @@ impl StorageEnum {
     /// Returns an error when the requested storage operation cannot be completed.
     pub async fn set_acl_bytes(&self, relative_path: &Path, acl_data: &[u8]) -> Result<()> {
         match self {
-            StorageEnum::CIFS(s) => {
-                use binrw::BinRead;
-                // 用 binrw 反序列化字节为 SecurityDescriptor
-                let mut cursor = std::io::Cursor::new(acl_data);
-                let sd = smb::SecurityDescriptor::read_le(&mut cursor)
-                    .map_err(|e| StorageError::OperationError(format!("deserialize SD: {e}")))?;
-                s.set_security_descriptor(relative_path, &sd).await
-            }
             StorageEnum::NFS(s) if s.supports_acl() => {
                 let acl = deserialize_nfs_acl(acl_data)?;
                 s.set_acl(relative_path, &acl).await

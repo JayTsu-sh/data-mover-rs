@@ -14,7 +14,9 @@ create_storage(url, block_size, ensure_dir)
     ├──→ Local(LocalStorage)
     ├──→ NFS(NFSStorage)
     ├──→ S3(S3Storage)
-    └──→ CIFS(CifsStorage)
+    └──→ HDFS(HDFSStorage)
+
+(CIFS 不在 StorageEnum 里：只有 role-based `storage::connect_backend` 路径)
     │
     ▼
 StorageEnum 提供 30+ 操作 (walkdir, walkdir_2, copy_file, copy_file_with_cancel,
@@ -23,10 +25,10 @@ StorageEnum 提供 30+ 操作 (walkdir, walkdir_2, copy_file, copy_file_with_can
     ▼  每个操作内部 match self { ... } 分派到具体 backend
     │
     ▼
-Backend 实现 (cifs.rs / nfs.rs / s3.rs / local.rs)
+Backend 实现 (nfs.rs / s3.rs / local.rs / hdfs.rs)
     │
     ▼
-底层 crate (smb / nfs-rs / aws-sdk-s3 / std::fs+rayon)
+底层 crate (nfs-rs / aws-sdk-s3 / std::fs+rayon / hdfs-native)
 ```
 
 **关键点**：没有 `Storage` trait，没有 `dyn Storage`，没有 vtable。这是有意的 — 4 个 backend 协议差异极大，trait 抽象会塞 30+ 默认方法和大量 `Self`-bound 限制，不如 enum + match 直接。
@@ -89,7 +91,7 @@ const TAR_PIPELINE_CAPACITY: usize = 16;   // tar 打包流水线
 
 ## 资源句柄
 
-CIFS / NFS / S3 都有需要显式释放的句柄。**统一走 `close_resource` helper** (cifs.rs 已有)。
+CIFS / NFS / S3 都有需要显式释放的句柄。**统一走 `close_resource` helper** (`storage/backends/cifs/protocol.rs` 已有)。
 
 S99 教训：裸 `.close()` 在 error path 漏释放 → 资源泄漏。helper 用 RAII-style 包装确保不漏。
 
@@ -112,7 +114,7 @@ lib.rs                  ← 公开 API 出口
   │
   ├── storage_enum.rs   ← dispatch 层
   │     │
-  │     ├── cifs.rs ─── smb crate
+  │     ├── hdfs.rs ─── hdfs-native crate
   │     ├── nfs.rs  ─── nfs-rs crate + moka cache
   │     ├── s3.rs   ─── aws-sdk-s3 + hyper-rustls
   │     └── local.rs ── std::fs + rayon + acl.rs

@@ -62,7 +62,6 @@ impl<T> AsyncReceiver<T> {
 
 所有 backend 的 walkdir 实现走这套：
 
-- `cifs.rs` walkdir / walkdir_2
 - `nfs.rs` walkdir / walkdir_2
 - `s3.rs` walkdir (S3 list 本身分页，walk 是平的，但仍走 scheduler 统一并发)
 - `local.rs` walkdir / walkdir_2

@@ -176,10 +176,6 @@ async fn write_tar_stream(
             nfs.write_data(rx, tar_path, None, None, None, bytes_counter)
                 .await
         }
-        StorageEnum::CIFS(cifs) => {
-            cifs.write_data(rx, tar_path, None, None, None, bytes_counter)
-                .await
-        }
         StorageEnum::S3(s3) => {
             let tar_key = path_to_s3_key(tar_path);
             s3.write_data(rx, &tar_key, tar_size, tar_mtime, None, bytes_counter)

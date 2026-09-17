@@ -90,7 +90,7 @@ BLOCKED       — CRITICAL ≥ 1
 ```
 CRITICAL
 ========
-- src/cifs.rs:1234: open_resource 后 query_info 返回 ? 直接 propagate，handle 漏 close。改用 close_resource pattern (S99 教训)。
+- src/storage/backends/cifs/protocol.rs:<line>: open 后 metadata() 返回 ? 直接 propagate，handle 漏 close。改用 close_resource pattern (S99 教训)。
 
 HIGH
 ====

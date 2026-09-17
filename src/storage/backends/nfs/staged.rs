@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt as _;
-use futures::stream::{FuturesOrdered, FuturesUnordered};
+use futures::stream::FuturesOrdered;
 
 use super::source::{NfsProtocolFailure, entry_failure, role_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath, Transience};

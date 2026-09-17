@@ -1,6 +1,6 @@
 ---
 name: dispatch-checker
-description: data-mover-rs StorageEnum 分派完整性检查。改 storage_enum.rs 的公开操作时**必须**调这个 agent — 自动扫描 4 个 backend 文件 + lib.rs，列出"应该改但还没改"的位置。
+description: data-mover-rs StorageEnum 分派完整性检查。改 storage_enum.rs 的公开操作时**必须**调这个 agent — 自动扫描 4 个 backend 文件 (nfs/s3/local/hdfs；CIFS 不在 StorageEnum 里) + lib.rs，列出"应该改但还没改"的位置。
 tools: [Read, Grep, Glob, Bash]
 ---
 
@@ -11,7 +11,7 @@ tools: [Read, Grep, Glob, Bash]
 每个 `StorageEnum` 公开操作必须在以下五处一致：
 
 1. **`src/storage_enum.rs`** 的 enum impl — `match self { ... }` 4 路分派。
-2. **`src/cifs.rs`** — `impl CifsStorage` 内有同名同签名方法。
+2. **`src/hdfs.rs`** — `impl HDFSStorage` 内有同名同签名方法。
 3. **`src/nfs.rs`** — `impl NFSStorage` 同上。
 4. **`src/s3.rs`** — `impl S3Storage` 同上。
 5. **`src/local.rs`** — `impl LocalStorage` 同上。
@@ -31,10 +31,10 @@ tools: [Read, Grep, Glob, Bash]
 grep -nE 'pub (async )?fn ' src/storage_enum.rs
 
 # 对一个具体方法 (例如 truncate_file) 检查 4 个 backend
-grep -nE 'fn truncate_file' src/cifs.rs src/nfs.rs src/s3.rs src/local.rs
+grep -nE 'fn truncate_file' src/nfs.rs src/s3.rs src/local.rs src/hdfs.rs
 
 # 检查签名一致性 (参数列表)
-grep -A 2 -nE 'fn truncate_file' src/cifs.rs src/nfs.rs src/s3.rs src/local.rs
+grep -A 2 -nE 'fn truncate_file' src/nfs.rs src/s3.rs src/local.rs src/hdfs.rs
 ```
 
 ## 输出契约
@@ -46,7 +46,7 @@ TOUCHED
 =======
 <已经改了的位置>
 - src/storage_enum.rs:<line>: <enum impl 分派>
-- src/cifs.rs:<line>: <CifsStorage 实现>
+- src/hdfs.rs:<line>: <HDFSStorage 实现>
 - src/nfs.rs:<line>: <NFSStorage 实现>
 
 MISSED
@@ -85,7 +85,7 @@ OPERATION: truncate_file
 TOUCHED
 =======
 - src/storage_enum.rs:1100: 加了 4 路 match
-- src/cifs.rs:1900: 加了实现
+- src/hdfs.rs:1900: 加了实现
 - src/local.rs:800: 加了实现
 
 MISSED
@@ -113,7 +113,7 @@ OPERATION: copy_file_with_cancel
 TOUCHED
 =======
 - src/storage_enum.rs:600: 4 路 match
-- src/cifs.rs / nfs.rs / s3.rs / local.rs: 都有实现
+- src/hdfs.rs / nfs.rs / s3.rs / local.rs: 都有实现
 
 MISSED
 ======

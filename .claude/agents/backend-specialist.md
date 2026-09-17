@@ -15,13 +15,16 @@ tools: [Read, Grep, Glob, Bash]
 
 ## 各 backend 的"必懂"
 
-### CIFS (`src/cifs.rs`, 2246 行)
+### CIFS (`src/storage/backends/cifs/`, role-based only)
 
-- crate: `smb` 0.11
-- 关键参数: `smb2_only` (默认 true)、`anon`、`file_id` (128-bit)
-- 必懂：`close_resource` helper、`CreateDisposition::OverwriteIf`、share-relative rename、`mkdir_or_open` 把 OBJECT_NAME_COLLISION 当成功
+- crate: `smb-domain` (package `smb`, JayTsu-sh/smb-rs 固定提交 `18ed91d`)，domain facade
+  `Client → Session → Share → File / Directory`；不碰 wire / runtime 类型
+- 不在 `StorageEnum` 里；构造走 `storage::connect_backend(BackendConfig::Cifs)`，
+  `src/cifs.rs` 只剩 `create_cifs_role_storage` bridge
+- 必懂：`protocol.rs` 的 `close_resource`、staged `Checkpointed` / `AtomicReplace`、
+  `CifsNamespace` 只实现 `List`、`Metadata` 只支持 Timestamps + ACL、签名策略 `CifsSigningPolicy`
 - 时间：FileTime (100ns since 1601-01-01) → `time_util`
-- 协议解析：binrw 0.15
+- ACL codec：binrw 0.15 (`metadata.rs`)
 
 ### NFS (`src/nfs.rs`, 3100 行)
 
@@ -79,13 +82,13 @@ BACKEND: cifs
 DIAGNOSIS
 =========
 storage-cifs.md 已记录这个陷阱：早期用 CreateDisposition::Create + 追加，
-触发 Samba 的 STATUS_ACCESS_DENIED (commit 4051)。当前代码 (src/cifs.rs:1820)
+触发 Samba 的 STATUS_ACCESS_DENIED (commit 4051)。当前代码 (src/storage/backends/cifs/protocol.rs:<line>)
 仍是 Create — 应该是 OverwriteIf。
 
 FIX
 ===
-- src/cifs.rs:1820 替换 CreateDisposition::Create → OverwriteIf
-- src/cifs.rs:1830 删除手动 truncate 调用 (OverwriteIf 自带)
+- src/storage/backends/cifs/protocol.rs:<line> 替换 CreateDisposition::Create → OverwriteIf
+- src/storage/backends/cifs/protocol.rs:<line> 删除手动 truncate 调用 (OverwriteIf 自带)
 
 IMPACT
 ======

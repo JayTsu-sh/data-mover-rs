@@ -6,7 +6,6 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use crate::checksum::HashCalculator;
-use crate::cifs::CifsStorage;
 use crate::error::StorageError;
 use crate::filter::FilterExpression;
 use crate::hdfs::HDFSStorage;
@@ -41,7 +40,6 @@ pub enum StorageEnum {
     Local(LocalStorage),
     NFS(NFSStorage),
     S3(S3Storage),
-    CIFS(CifsStorage),
     HDFS(HDFSStorage),
 }
 
@@ -68,7 +66,6 @@ impl StorageEnum {
             }
             StorageEnum::NFS(_) => Ok(()),
             StorageEnum::S3(storage) => storage.check_connectivity().await,
-            StorageEnum::CIFS(storage) => storage.check_connectivity().await,
             StorageEnum::HDFS(storage) => storage
                 .client()
                 .get_file_info(storage.location().root())
@@ -109,15 +106,6 @@ impl StorageEnum {
                 let _ = s.delete_object(&tmp_name).await;
                 Ok(Some(mtime))
             }
-            StorageEnum::CIFS(s) => {
-                let tmp_path = PathBuf::from(&tmp_name);
-                s.write_file(&tmp_path, Bytes::from_static(b"\0"), None, None, None)
-                    .await?;
-                let entry = Box::pin(s.get_metadata(&tmp_path)).await?;
-                let mtime = entry.get_mtime();
-                let _ = s.delete_file(&tmp_path).await;
-                Ok(Some(mtime))
-            }
             StorageEnum::HDFS(s) => {
                 let tmp_path = PathBuf::from(&tmp_name);
                 s.write_file(&tmp_path, Bytes::from_static(b"\0"), 0o600, None)
@@ -153,12 +141,6 @@ impl StorageEnum {
             (StorageEnum::NFS(storage), EntryEnum::S3(entry)) => {
                 storage.delete_file(Path::new(&entry.relative_path)).await
             }
-            (StorageEnum::CIFS(storage), EntryEnum::NAS(entry)) => {
-                storage.delete_file(&entry.relative_path).await
-            }
-            (StorageEnum::CIFS(storage), EntryEnum::S3(entry)) => {
-                storage.delete_file(Path::new(&entry.relative_path)).await
-            }
             (StorageEnum::S3(storage), EntryEnum::S3(entry)) => {
                 let key = storage.build_full_key(&entry.relative_path);
                 storage.delete_object(&key).await
@@ -174,9 +156,6 @@ impl StorageEnum {
                 storage.delete_file(&entry.relative_path).await
             }
             (StorageEnum::NFS(storage), EntryEnum::HDFS(entry)) => {
-                storage.delete_file(&entry.relative_path).await
-            }
-            (StorageEnum::CIFS(storage), EntryEnum::HDFS(entry)) => {
                 storage.delete_file(&entry.relative_path).await
             }
             (StorageEnum::S3(storage), EntryEnum::HDFS(entry)) => {
@@ -219,14 +198,6 @@ impl StorageEnum {
                 .create_dir_all(Path::new(&entry.relative_path))
                 .await
                 .map(|_| ()),
-            (StorageEnum::CIFS(storage), EntryEnum::NAS(entry)) => {
-                storage.create_dir_all(&entry.relative_path).await
-            }
-            (StorageEnum::CIFS(storage), EntryEnum::S3(entry)) => {
-                storage
-                    .create_dir_all(Path::new(&entry.relative_path))
-                    .await
-            }
             // s3 storage has no directory concept.
             (StorageEnum::S3(_), _) => Ok(()),
             (StorageEnum::Local(storage), EntryEnum::HDFS(entry)) => {
@@ -236,9 +207,6 @@ impl StorageEnum {
                 .create_dir_all(&entry.relative_path)
                 .await
                 .map(|_| ()),
-            (StorageEnum::CIFS(storage), EntryEnum::HDFS(entry)) => {
-                storage.create_dir_all(&entry.relative_path).await
-            }
         }
     }
 
@@ -291,14 +259,6 @@ impl StorageEnum {
                     )
                     .await
             }
-            (StorageEnum::CIFS(storage), EntryEnum::NAS(entry)) => storage.create_symlink(
-                &entry.relative_path,
-                target,
-                entry.atime,
-                entry.mtime,
-                entry.uid,
-                entry.gid,
-            ),
             _ => Ok(()),
         }
     }
@@ -315,9 +275,6 @@ impl StorageEnum {
             (StorageEnum::NFS(storage), EntryEnum::NAS(entry)) => {
                 storage.read_symlink(&entry.relative_path).await
             }
-            (StorageEnum::CIFS(storage), EntryEnum::NAS(entry)) => {
-                storage.read_symlink(&entry.relative_path)
-            }
             _ => Ok(PathBuf::new()),
         }
     }
@@ -331,7 +288,6 @@ impl StorageEnum {
             StorageEnum::Local(storage) => storage.get_metadata(relative_path).await,
             StorageEnum::NFS(storage) => storage.get_metadata(relative_path).await,
             StorageEnum::S3(storage) => storage.get_metadata(&path_to_s3_key(relative_path)).await,
-            StorageEnum::CIFS(storage) => Box::pin(storage.get_metadata(relative_path)).await,
             StorageEnum::HDFS(storage) => storage
                 .get_metadata(relative_path)
                 .await
@@ -355,7 +311,6 @@ impl StorageEnum {
                 let key = sub_path.map(|p| path_to_s3_key(p));
                 s.walkdir(key.as_deref(), options)
             }
-            StorageEnum::CIFS(s) => s.walkdir(sub_path, options),
             StorageEnum::HDFS(storage) => storage.walkdir(sub_path, options),
         }
     }
@@ -403,13 +358,6 @@ impl StorageEnum {
                     include_tags,
                 )
             }
-            StorageEnum::CIFS(s) => s.walkdir_2(
-                sub_path,
-                depth,
-                match_expressions,
-                exclude_expressions,
-                concurrency,
-            ),
             StorageEnum::HDFS(storage) => storage.walkdir_2(
                 sub_path,
                 depth,
@@ -444,7 +392,6 @@ impl StorageEnum {
             StorageEnum::Local(s) => s.rename(from, to).await,
             StorageEnum::NFS(s) => s.rename(from, to).await,
             StorageEnum::S3(s) => s.rename_with_expected_size(from, to, expected_size).await,
-            StorageEnum::CIFS(s) => s.rename(from, to).await,
             StorageEnum::HDFS(s) => s.rename(from, to).await,
         }
     }
@@ -458,7 +405,6 @@ impl StorageEnum {
         match self {
             StorageEnum::Local(s) => s.set_file_len(relative_path, len).await,
             StorageEnum::NFS(s) => s.set_file_len(relative_path, len).await,
-            StorageEnum::CIFS(s) => s.set_file_len(relative_path, len).await,
             StorageEnum::S3(_) => Err(StorageError::OperationError(
                 "S3 does not support byte-level resume".to_string(),
             )),
@@ -482,7 +428,6 @@ impl StorageEnum {
         match self {
             StorageEnum::Local(s) => s.delete_dir_all_with_progress(relative_path, concurrency),
             StorageEnum::NFS(s) => s.delete_dir_all_with_progress(relative_path, concurrency),
-            StorageEnum::CIFS(s) => s.delete_dir_all_with_progress(relative_path, concurrency),
             StorageEnum::S3(s) => {
                 let key = relative_path.map(|p| path_to_s3_key(p));
                 s.delete_dir_all_with_progress(key.as_deref(), concurrency)
@@ -728,10 +673,6 @@ impl StorageEnum {
                         .read_data_intervals(tx, &e.relative_path, &ivals, qos)
                         .await
                         .map(|()| None),
-                    (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => s
-                        .read_data_intervals(tx, &e.relative_path, &ivals, qos)
-                        .await
-                        .map(|()| None),
                     (StorageEnum::S3(s), EntryEnum::S3(e)) => s
                         .read_data_intervals_version(
                             tx,
@@ -758,10 +699,6 @@ impl StorageEnum {
                             .await
                     }
                     (StorageEnum::NFS(s), EntryEnum::NAS(e)) => {
-                        s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
-                            .await
-                    }
-                    (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
                         s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
                             .await
                     }
@@ -847,7 +784,7 @@ impl StorageEnum {
         }
     }
 
-    /// 字节级断点续传复制（仅多块大文件，源端：Local/NFS/CIFS/S3，目标端：全部后端）。
+    /// 字节级断点续传复制（仅多块大文件，源端：Local/NFS/S3，目标端：全部后端）。
     ///
     /// 与 `copy_file` 的差异：
     /// - 源端只读缺失的 offset 区间；
@@ -943,7 +880,6 @@ impl StorageEnum {
         match (from, entry) {
             (StorageEnum::Local(s), EntryEnum::NAS(e)) => s.read_file(&e.relative_path, size).await,
             (StorageEnum::NFS(s), EntryEnum::NAS(e)) => s.read_file(&e.relative_path, size).await,
-            (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => s.read_file(&e.relative_path, size).await,
             (StorageEnum::S3(s), EntryEnum::S3(e)) => s.read_file(&e.relative_path, size).await,
             (StorageEnum::HDFS(s), EntryEnum::HDFS(e)) => s.read_file(&e.relative_path, size).await,
             _ => Err(StorageError::OperationError(format!(
@@ -982,10 +918,6 @@ impl StorageEnum {
                 s.write_file(&e.relative_path, data, e.uid, e.gid, Some(e.mode))
                     .await
             }
-            (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
-                s.write_file(&e.relative_path, data, e.uid, e.gid, Some(e.mode))
-                    .await
-            }
             (StorageEnum::S3(s), EntryEnum::S3(e)) => {
                 s.write_file(&e.relative_path, data, e.mtime, e.tags.clone())
                     .await
@@ -998,19 +930,11 @@ impl StorageEnum {
                 s.write_file(Path::new(&e.relative_path), data, None, None, None)
                     .await
             }
-            (StorageEnum::CIFS(s), EntryEnum::S3(e)) => {
-                s.write_file(Path::new(&e.relative_path), data, None, None, None)
-                    .await
-            }
             (StorageEnum::Local(s), EntryEnum::HDFS(e)) => {
                 s.write_file(&e.relative_path, data, None, None, Some(e.mode & 0o7777))
                     .await
             }
             (StorageEnum::NFS(s), EntryEnum::HDFS(e)) => {
-                s.write_file(&e.relative_path, data, None, None, Some(e.mode & 0o7777))
-                    .await
-            }
-            (StorageEnum::CIFS(s), EntryEnum::HDFS(e)) => {
                 s.write_file(&e.relative_path, data, None, None, Some(e.mode & 0o7777))
                     .await
             }
@@ -1044,7 +968,6 @@ impl StorageEnum {
         match self {
             StorageEnum::Local(s) => s.config.block_size,
             StorageEnum::NFS(s) => s.config.read_chunk_bytes,
-            StorageEnum::CIFS(s) => s.config.block_size,
             StorageEnum::S3(s) => s.block_size,
             StorageEnum::HDFS(s) => s.block_size(),
         }
@@ -1056,7 +979,6 @@ impl StorageEnum {
         match self {
             Self::Local(storage) => storage.config.transfer_concurrency,
             Self::NFS(storage) => storage.config.transfer_concurrency,
-            Self::CIFS(storage) => storage.config.transfer_concurrency,
             Self::S3(storage) => storage.transfer_concurrency,
             Self::HDFS(storage) => storage.transfer_concurrency(),
         }
@@ -1068,7 +990,6 @@ impl StorageEnum {
         match self {
             Self::Local(storage) => Self::Local(storage.with_transfer_concurrency(concurrency)),
             Self::NFS(storage) => Self::NFS(storage.with_transfer_concurrency(concurrency)),
-            Self::CIFS(storage) => Self::CIFS(storage.with_transfer_concurrency(concurrency)),
             Self::S3(storage) => Self::S3(storage.with_transfer_concurrency(concurrency)),
             Self::HDFS(storage) => Self::HDFS(storage.with_transfer_concurrency(concurrency)),
         }
@@ -1081,7 +1002,7 @@ impl StorageEnum {
 
     /// 后端是否拥有真实的目录对象（具有独立 inode/元数据）。
     ///
-    /// - `true`：NFS / CIFS / Local — 目录是一等对象，可读写 mode/uid/gid/atime/mtime；
+    /// - `true`：NFS / Local / HDFS — 目录是一等对象，可读写 mode/uid/gid/atime/mtime；
     /// - `false`：S3 — 目录仅作为 key prefix 的隐式存在，没有自身元数据。
     ///
     /// 调用方（如 integrity-check `的目录元数据校验、tar_pack` 的目录条目写入）

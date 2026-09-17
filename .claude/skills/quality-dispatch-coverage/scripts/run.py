@@ -15,7 +15,8 @@ sys.path.insert(0, str(SHARED))
 
 from protocol_constants import PROJECT_ROOT  # noqa: E402
 
-BACKEND_FILES = ["cifs.rs", "nfs.rs", "s3.rs", "local.rs"]
+# CIFS 不在 StorageEnum 里 (只有 role-based 实现)，所以不参与 dispatch 覆盖检查。
+BACKEND_FILES = ["nfs.rs", "s3.rs", "local.rs"]
 FN_RE = re.compile(r"^\s*pub\s+(?:async\s+)?fn\s+(\w+)\s*[<(]", re.MULTILINE)
 
 
@@ -64,7 +65,7 @@ def main() -> int:
     known_holes: list[str] = []
     enum_only: list[str] = []
 
-    print(f"checking {len(enum_fns)} StorageEnum public methods against 4 backends")
+    print(f"checking {len(enum_fns)} StorageEnum public methods against {len(BACKEND_FILES)} backends")
     print(f"baseline: {len(baseline)} known holes (see baseline_holes.json)")
     print("-" * 70)
 

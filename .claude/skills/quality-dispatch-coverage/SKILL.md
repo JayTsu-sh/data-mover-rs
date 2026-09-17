@@ -1,21 +1,21 @@
 ---
 name: quality-dispatch-coverage
-description: 检查 src/storage_enum.rs 中所有公开方法是否在 4 个 backend (cifs/nfs/s3/local) 都有实现。enum dispatch 没有 trait 完整性强制，必须脚本检查。
+description: 检查 src/storage_enum.rs 中所有公开方法是否在 legacy backend 文件 (nfs/s3/local；CIFS 不在 StorageEnum 里) 都有实现。enum dispatch 没有 trait 完整性强制，必须脚本检查。
 ---
 
 # quality-dispatch-coverage
 
-**触发关键词**：查 StorageEnum 分派完整性 / dispatch 检查 / 4 backend 一致性。
+**触发关键词**：查 StorageEnum 分派完整性 / dispatch 检查 / backend 一致性。
 
 ## 步骤
 
 1. grep src/storage_enum.rs 列所有 `pub (async )?fn <name>` 方法名。
-2. 对每个方法名，grep 4 个 backend 文件检查同名 fn 存在。
+2. 对每个方法名，grep 各 backend 文件检查同名 fn 存在。
 3. 列缺失。
 
 ## 成功判据
 
-- 每个 storage_enum 公开方法在 4 个 backend 都能 grep 到。
+- 每个 storage_enum 公开方法在各 backend 文件都能 grep 到。
 - 报告 "OK" / "MISSING in <backend>" 一行一行。
 
 ## 备注

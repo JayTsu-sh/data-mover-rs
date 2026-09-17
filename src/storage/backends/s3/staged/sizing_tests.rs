@@ -112,7 +112,7 @@ async fn aligned_uploads_do_not_append_empty_parts_but_empty_files_have_one()
             .await?;
         let upload_state = destination.stage_state(&stage, Operation::Write).await?;
         assert_eq!(upload_state.parts.len(), count.max(1));
-        assert_eq!(state.persisted, size as u64);
+        assert_eq!(upload_state.persisted, size as u64);
         destination.discard(stage).await?;
     }
     Ok(())

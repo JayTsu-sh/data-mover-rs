@@ -2,14 +2,15 @@
 
 ## 核心约束
 
-`StorageEnum` 是 4 backend 的联合枚举，**用 match 分派**，没有 `Storage` trait。
+`StorageEnum` 是 4 backend (Local / NFS / S3 / HDFS) 的联合枚举，**用 match 分派**，没有 `Storage` trait。
+CIFS 不在其中：CIFS 只有 role-based 实现 (`src/storage/backends/cifs/`)，见 [storage-cifs.md](storage-cifs.md)。
 
 ```rust
 pub enum StorageEnum {
     Local(LocalStorage),
     NFS(NFSStorage),
     S3(S3Storage),
-    CIFS(CifsStorage),
+    HDFS(HDFSStorage),
 }
 ```
 
@@ -22,7 +23,7 @@ impl StorageEnum {
             StorageEnum::Local(s) => s.copy_file(src, dst).await,
             StorageEnum::NFS(s)   => s.copy_file(src, dst).await,
             StorageEnum::S3(s)    => s.copy_file(src, dst).await,
-            StorageEnum::CIFS(s)  => s.copy_file(src, dst).await,
+            StorageEnum::HDFS(s)  => s.copy_file(src, dst).await,
         }
     }
 }
@@ -43,10 +44,10 @@ impl StorageEnum {
 
 ### 2. 4 个 backend 文件各自实现
 
-- `src/cifs.rs` — 用 smb crate API；资源句柄走 `close_resource` helper。
 - `src/nfs.rs` — 用 nfs-rs crate；retry 决策查 [error-taxonomy.md](error-taxonomy.md)。
 - `src/s3.rs` — 用 aws-sdk-s3；S3 404 → `FileNotFound`；multipart 阈值参考已有写法。
 - `src/local.rs` — 用 std::fs / tokio::fs / rayon；Win ACL 走 `acl.rs`。
+- `src/hdfs.rs` — 用 hdfs-native；不适用的 POSIX 语义返回 `UnsupportedType`。
 
 签名必须**完全一致** (除了不需要协议参数的 backend 可以 `#[allow(unused)]`)。
 
@@ -89,7 +90,7 @@ impl StorageEnum {
 
 ## 何时 *不* 用 StorageEnum
 
-- backend 内部辅助函数 (例如 cifs.rs 的 SMB 协议帧构造) → 留在 backend 文件，不入 enum。
+- backend 内部辅助函数 (例如 nfs.rs 的 RPC 细节) → 留在 backend 文件，不入 enum。
 - 跨 backend 的纯算法 (例如 filter / checksum / time_util) → 独立模块，不入 enum。
 - 一次性的迁移工具 (例如 nfs_export 查询) → 直接 backend API，不入 enum。
 

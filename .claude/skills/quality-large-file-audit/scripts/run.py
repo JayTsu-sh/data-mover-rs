@@ -19,7 +19,7 @@ BASELINE = {
     "filter.rs": 5303,
     "s3.rs": 4329,
     "nfs.rs": 3853,
-    "cifs.rs": 3152,
+    "cifs.rs": 36,  # #150 后只剩 factory bridge
     "storage_enum.rs": 2246,
     "local.rs": 1423,
     # Integrity tests intentionally stay next to the implementation so private

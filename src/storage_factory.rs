@@ -6,7 +6,6 @@ use std::path::Path;
 use tracing::debug;
 
 use crate::Result;
-use crate::cifs::create_cifs_storage;
 use crate::error::StorageError;
 use crate::hdfs::create_hdfs_storage;
 use crate::local::create_local_storage;
@@ -14,6 +13,7 @@ use crate::nfs::create_nfs_storage;
 use crate::s3::create_s3_storage;
 use crate::storage_enum::{StorageEnum, StorageType};
 use crate::storage_options::{BackendConfig, CreateStorageOptions};
+use crate::url_redact::redact_storage_url;
 
 /// 将 Path 转为 S3 兼容的字符串（正斜杠分隔）。
 /// Linux 上零开销（直接返回 `Cow::Borrowed`），Windows 上仅在含 `\` 时分配新 `String`。
@@ -84,10 +84,16 @@ pub async fn create_storage(path: &str, options: CreateStorageOptions) -> Result
     };
     debug!(
         "Creating {:?} storage for path: {} (ensure_dir={})",
-        storage_type, path, ensure_dir
+        storage_type,
+        redact_storage_url(path),
+        ensure_dir
     );
     match storage_type {
-        StorageType::Cifs => create_cifs_storage(path, block_size, ensure_dir).await,
+        StorageType::Cifs => Err(StorageError::UnsupportedType(
+            "smb:// locations are not available through StorageEnum; \
+             connect CIFS with storage::connect_backend(BackendConfig::Cifs)"
+                .to_string(),
+        )),
         StorageType::Nfs => create_nfs_storage(path, block_size, ensure_dir).await,
         StorageType::S3 => create_s3_storage(path, block_size).await,
         StorageType::Hdfs => Ok(StorageEnum::HDFS(
@@ -102,5 +108,24 @@ pub async fn create_storage(path: &str, options: CreateStorageOptions) -> Result
             .await?,
         )),
         StorageType::Local => create_local_storage(path, block_size, ensure_dir),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn smb_locations_are_refused_by_the_legacy_factory() {
+        let error = create_storage(
+            "smb://user:secret@nas01/share",
+            CreateStorageOptions::default(),
+        )
+        .await
+        .err();
+        assert!(
+            matches!(error, Some(StorageError::UnsupportedType(_))),
+            "smb:// must point callers at storage::connect_backend, got {error:?}"
+        );
     }
 }

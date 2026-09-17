@@ -49,7 +49,7 @@ pub(crate) const HASH_CHANNEL_CAPACITY: usize = 4;
 /// 读写两端各自有 inflight pipeline（如 NFS 读 4 / 写 8），channel 是两级
 /// 之间的解耦缓冲：容量 2 时写端一次落盘抖动即填满 channel、反压打空读端
 /// 流水线；4 可吸收单次抖动。内存上界 = 容量 × chunk 大小 × 并发文件数
-/// （NFS chunk ≤ 1MB；CIFS chunk 可达 8MB，增大容量时需关注）。
+/// （NFS chunk ≤ 1MB；增大容量时需关注）。
 pub(crate) const COPY_PIPELINE_CAPACITY: usize = 4;
 
 pub(crate) async fn write_copy_data(
@@ -109,30 +109,6 @@ pub(crate) async fn write_copy_data(
                 )
                 .await
         }
-        (StorageEnum::CIFS(storage), EntryEnum::NAS(entry)) => {
-            storage
-                .write_data(
-                    rx,
-                    &entry.relative_path,
-                    entry.uid,
-                    entry.gid,
-                    Some(entry.mode),
-                    bytes_counter,
-                )
-                .await
-        }
-        (StorageEnum::CIFS(storage), EntryEnum::S3(entry)) => {
-            storage
-                .write_data(
-                    rx,
-                    Path::new(&entry.relative_path),
-                    None,
-                    None,
-                    None,
-                    bytes_counter,
-                )
-                .await
-        }
         (StorageEnum::S3(storage), EntryEnum::S3(entry)) => {
             write_s3_copy_data(storage, entry, rx, size, bytes_counter).await
         }
@@ -173,11 +149,6 @@ async fn write_hdfs_copy_to_nas(
                 .await
         }
         StorageEnum::NFS(storage) => {
-            storage
-                .write_data(rx, &entry.relative_path, None, None, mode, bytes_counter)
-                .await
-        }
-        StorageEnum::CIFS(storage) => {
             storage
                 .write_data(rx, &entry.relative_path, None, None, mode, bytes_counter)
                 .await
@@ -335,7 +306,6 @@ impl StorageEnum {
             match &storage_c {
                 StorageEnum::Local(s) => s.read_data(tx, &path, size, true, None).await,
                 StorageEnum::NFS(s) => s.read_data(tx, &path, size, true, None).await,
-                StorageEnum::CIFS(s) => s.read_data(tx, &path, size, true, None).await,
                 StorageEnum::S3(s) => {
                     let key = path_to_s3_key(&path);
                     s.read_data(tx, &key, size, true, None).await

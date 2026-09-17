@@ -25,10 +25,6 @@ pub(crate) async fn read_data_from(
             s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
                 .await
         }
-        (StorageEnum::CIFS(s), EntryEnum::NAS(e)) => {
-            s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
-                .await
-        }
         (StorageEnum::S3(s), EntryEnum::S3(e)) => {
             s.read_data(tx, &e.relative_path, size, enable_integrity_check, qos)
                 .await

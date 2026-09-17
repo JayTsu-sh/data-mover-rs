@@ -124,11 +124,6 @@ pub(crate) async fn write_nas(
                 .write_data_resumable(rx, part_path, uid, gid, mode, progress)
                 .await
         }
-        StorageEnum::CIFS(storage) => {
-            storage
-                .write_data_resumable(rx, part_path, uid, gid, mode, progress)
-                .await
-        }
         StorageEnum::S3(_) => Err(StorageError::OperationError(
             "write_chunk_stream: Nas StreamHandle used with an S3 destination".to_string(),
         )),

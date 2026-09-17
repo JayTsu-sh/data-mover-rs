@@ -1,6 +1,7 @@
 # Storage Driver Conventions
 
-针对 4 个 backend (cifs/nfs/s3/local) 的硬规则。
+针对 legacy `StorageEnum` backend 文件 (nfs/s3/local/hdfs) 与 role-based `src/storage/backends/*` 的硬规则。
+CIFS 只有 role-based 实现 (`src/storage/backends/cifs/`)，不在 `StorageEnum` 里。
 
 ## D1 · 改 `StorageEnum` 操作 = 5 处同步
 
@@ -8,7 +9,7 @@
 
 ```bash
 # 列出 storage_enum.rs 中的所有 match 分支 vs 4 个 backend 实现
-grep -nE 'StorageEnum::(Local|NFS|S3|CIFS)' src/storage_enum.rs | wc -l
+grep -nE 'StorageEnum::(Local|NFS|S3|HDFS)' src/storage_enum.rs | wc -l
 # 应该 4 的倍数 (每个操作有 4 分支)
 ```
 
@@ -20,13 +21,13 @@ grep -nE 'StorageEnum::(Local|NFS|S3|CIFS)' src/storage_enum.rs | wc -l
 **verify**:
 
 ```bash
-grep -nE '\.close\(\)' src/cifs.rs src/nfs.rs src/s3.rs | grep -v close_resource
+grep -nE '\.close\(\)' src/storage/backends/cifs/*.rs src/nfs.rs src/s3.rs | grep -v close_resource
 ```
 
 应空 (除了 helper 自身实现)。
 
 **why**: error path 漏 close → 句柄泄漏 → 长 session 句柄耗尽 (S99 教训)。
-**how to apply**: cifs.rs 的 `close_resource(handle)` 是模板。打开 handle 后用 `defer`-like 模式 (async block + 总在末尾 close) 或 RAII helper。
+**how to apply**: `src/storage/backends/cifs/protocol.rs` 的 `close_resource` 是模板。打开 handle 后用 `defer`-like 模式 (async block + 总在末尾 close) 或 RAII helper。
 
 ## D3 · backend retry 决策走映射表
 
@@ -34,7 +35,7 @@ grep -nE '\.close\(\)' src/cifs.rs src/nfs.rs src/s3.rs | grep -v close_resource
 
 ```bash
 # retry 行为应该集中在 retry helper，不散写
-grep -nE 'retry|backoff|sleep' src/{cifs,nfs,s3,local}.rs
+grep -nE 'retry|backoff|sleep' src/{nfs,s3,local}.rs src/storage/backends/cifs/*.rs
 ```
 
 **why**: 上游 sync 引擎根据错误变体决定重试，决策必须一致。
@@ -45,7 +46,7 @@ grep -nE 'retry|backoff|sleep' src/{cifs,nfs,s3,local}.rs
 **verify**:
 
 ```bash
-grep -nE 'UrlParseError|ConfigError' src/{cifs,nfs,s3,local}.rs
+grep -nE 'UrlParseError|ConfigError' src/{nfs,s3,local}.rs
 ```
 
 URL 解析阶段返回 `UrlParseError`；URL 解析后的语义校验返回 `ConfigError`。
@@ -58,7 +59,7 @@ URL 解析阶段返回 `UrlParseError`；URL 解析后的语义校验返回 `Con
 **verify**:
 
 ```bash
-grep -nE 'use crate::storage_enum::StorageEnum' src/{cifs,nfs,s3,local}.rs
+grep -nE 'use crate::storage_enum::StorageEnum' src/{nfs,s3,local}.rs src/storage/backends/*/*.rs
 ```
 
 应空。
@@ -94,7 +95,7 @@ grep -nE 'use crate::storage_enum::StorageEnum' src/{cifs,nfs,s3,local}.rs
 **verify**:
 
 ```bash
-grep -nE 'pub use crate::(cifs::CifsStorage|nfs::NFSStorage|s3::S3Storage|local::LocalStorage)' src/lib.rs
+grep -nE 'pub use crate::(nfs::NFSStorage|s3::S3Storage|local::LocalStorage)' src/lib.rs
 ```
 
 应空 — 只 `pub use crate::storage_enum::StorageEnum`。

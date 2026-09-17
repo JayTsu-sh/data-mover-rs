@@ -4,7 +4,7 @@ description: 调试 CLAUDE.md 路由表 — 输入场景描述，输出"应该�
 
 # /route <场景>
 
-输入：自由文本场景描述 (例如 "改 CIFS smb2_only 行为" / "测 filter DSL")。
+输入：自由文本场景描述 (例如 "改 CIFS guest_policy 行为" / "测 filter DSL")。
 
 输出：CLAUDE.md 路由表给出的应读文件列表 + 推荐 agent + 推荐 skill。
 

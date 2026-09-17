@@ -7,9 +7,6 @@
 //! - **外部消费者**（terrasync、integrity-check 等）在自己的日志/审计层
 //!   屏蔽 storage URL；
 //! - **本 crate 内部新增的日志/错误路径**优先使用此函数。
-//!
-//! 注意：CIFS 已有 `cifs::redact_smb_url`（**保留 username** 仅屏蔽密码，
-//! 用于现有错误诊断兼容性）；切换到本通用函数会丢失 username，需评估后再换。
 
 /// 屏蔽 URL 中的 `user:password@` 部分为 `***:***@`。
 ///

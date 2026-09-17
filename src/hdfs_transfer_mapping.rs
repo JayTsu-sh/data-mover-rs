@@ -8,7 +8,6 @@ pub(crate) fn hdfs_default_transfer_identity(source: &StorageEnum, entry: &Entry
         StorageEnum::Local(storage) => (b"local".as_slice(), storage.root_path.to_string_lossy()),
         StorageEnum::NFS(storage) => (b"nfs".as_slice(), storage.transfer_namespace().into()),
         StorageEnum::S3(storage) => (b"s3".as_slice(), storage.transfer_namespace().into()),
-        StorageEnum::CIFS(storage) => (b"cifs".as_slice(), storage.transfer_namespace().into()),
         StorageEnum::HDFS(storage) => (b"hdfs".as_slice(), storage.transfer_namespace().into()),
     };
     hdfs_default_transfer_identity_for(source_kind, &namespace, entry)

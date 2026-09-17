@@ -4,11 +4,11 @@
     "check_connectivity": ["nfs.rs", "local.rs"],
     "create_dir_all": ["s3.rs"],
     "create_symlink": ["s3.rs"],
-    "delete_dir_all": ["cifs.rs", "s3.rs"],
+    "delete_dir_all": ["s3.rs"],
     "delete_file": ["s3.rs"],
     "get_metadata": ["s3.rs"],
     "read_symlink": ["s3.rs"],
     "rename": ["s3.rs"],
-    "set_metadata": ["cifs.rs", "nfs.rs", "s3.rs"]
+    "set_metadata": ["nfs.rs", "s3.rs"]
   }
 }
