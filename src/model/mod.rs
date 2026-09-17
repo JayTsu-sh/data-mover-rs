@@ -395,6 +395,21 @@ pub enum TimePrecision {
     Nanoseconds,
 }
 
+impl TimePrecision {
+    /// Nanoseconds per tick of this resolution. Comparing two timestamps at the coarser of
+    /// their precisions is the only sound way to test cross-protocol equality.
+    #[must_use]
+    pub const fn quantum_nanos(self) -> i128 {
+        match self {
+            Self::Seconds => 1_000_000_000,
+            Self::Milliseconds => 1_000_000,
+            Self::Microseconds => 1_000,
+            Self::HundredNanoseconds => 100,
+            Self::Nanoseconds => 1,
+        }
+    }
+}
+
 /// A signed Unix timestamp plus the precision actually observed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StorageTimestamp {
@@ -408,13 +423,7 @@ impl StorageTimestamp {
     /// # Errors
     /// Returns an error when the value is not aligned to the declared precision.
     pub const fn new(unix_nanos: i128, precision: TimePrecision) -> Result<Self, ModelValueError> {
-        let quantum = match precision {
-            TimePrecision::Seconds => 1_000_000_000,
-            TimePrecision::Milliseconds => 1_000_000,
-            TimePrecision::Microseconds => 1_000,
-            TimePrecision::HundredNanoseconds => 100,
-            TimePrecision::Nanoseconds => 1,
-        };
+        let quantum = precision.quantum_nanos();
         if unix_nanos % quantum == 0 {
             Ok(Self {
                 unix_nanos,
