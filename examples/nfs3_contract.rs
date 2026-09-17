@@ -319,6 +319,8 @@ async fn validate_traversal(source: &Storage, dialect: ContractDialect) -> Contr
             .with_ownership_mode(ObservationMode::InlineOnly)
             .with_timestamps(ObservationMode::InlineOnly),
         cancel: CancellationToken::new(),
+        filter: None,
+        max_depth: None,
     });
     let mut saw_fixture = false;
     let mut saw_link = false;

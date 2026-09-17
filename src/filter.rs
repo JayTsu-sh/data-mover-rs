@@ -273,7 +273,7 @@ pub fn get_filter_field_definitions() -> Vec<FilterFieldDef> {
             label: "类型",
             value_type: "enum",
             operators: ops_from(EQ_NE_OPS),
-            enum_values: Some(vec!["file", "dir", "symlink"]),
+            enum_values: Some(vec!["file", "dir", "symlink", "special"]),
         },
         FilterFieldDef {
             name: "dir_date",
@@ -1086,6 +1086,15 @@ pub struct FilterExpression {
     root: FilterASTNode,
 }
 
+/// 表达式中出现过的、需要在评估前先取得的元数据字段。见 [`FilterExpression::referenced_fields`]。
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReferencedFields {
+    /// 出现了 `modified` 条件。
+    pub modified: bool,
+    /// 出现了 `size` 条件。
+    pub size: bool,
+}
+
 // ========== FilterExpression 实现 ==========
 impl FilterExpression {
     /// 解析过滤表达式字符串，构建逻辑表达式树
@@ -1352,6 +1361,30 @@ impl FilterExpression {
             MatchResult::Match(MatchAddon::Path)
         } else {
             MatchResult::MisMatch(MisMatchAddon::FullPathNotMatch)
+        }
+    }
+
+    /// 报告表达式引用了哪些需要额外元数据的字段。
+    ///
+    /// `modified` 与 `size` 在 `FilterInput` 里缺失时会产生 `LazyMatch`，而 `LazyMatch`
+    /// 会被 `AND` / `OR` 吸收 (`Match & Lazy = Match`)，所以“字段缺失时先评估一次”得到的
+    /// 三元组既不是上界也不是下界。调用方必须在拿到这些字段之前**完全不使用**评估结果。
+    #[must_use]
+    pub fn referenced_fields(&self) -> ReferencedFields {
+        let mut fields = ReferencedFields::default();
+        Self::collect_referenced_fields(&self.root, &mut fields);
+        fields
+    }
+
+    fn collect_referenced_fields(node: &FilterASTNode, fields: &mut ReferencedFields) {
+        match node {
+            FilterASTNode::Condition(FilterCondition::Modified { .. }) => fields.modified = true,
+            FilterASTNode::Condition(FilterCondition::Size { .. }) => fields.size = true,
+            FilterASTNode::Condition(_) => {}
+            FilterASTNode::And(left, right) | FilterASTNode::Or(left, right) => {
+                Self::collect_referenced_fields(left, fields);
+                Self::collect_referenced_fields(right, fields);
+            }
         }
     }
 
@@ -1767,6 +1800,203 @@ mod tests {
                 },
             )
         }};
+    }
+
+    // ==================== 7.0 Traversal integration contract (LazyMatch / referenced_fields) ====================
+
+    #[test]
+    fn test_referenced_fields_reports_modified_and_size_anywhere_in_the_tree() {
+        let parse = |value: &str| FilterExpression::parse(value).assert_value("parse");
+        assert_eq!(
+            parse("name == \"*.log\"").referenced_fields(),
+            ReferencedFields::default()
+        );
+        assert_eq!(
+            parse("path == \"a/**\" and type == \"dir\" and extension == \"rs\" and dir_date <= 20240301")
+                .referenced_fields(),
+            ReferencedFields::default()
+        );
+        assert_eq!(
+            parse("modified < 7d").referenced_fields(),
+            ReferencedFields {
+                modified: true,
+                size: false
+            }
+        );
+        assert_eq!(
+            parse("size > 100").referenced_fields(),
+            ReferencedFields {
+                modified: false,
+                size: true
+            }
+        );
+        assert_eq!(
+            parse("(name == \"*.rs\" or (size > 100 and modified < 7d))").referenced_fields(),
+            ReferencedFields {
+                modified: true,
+                size: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_should_skip_lazy_modified_include_defaults_keep() {
+        // 无 modified 时 include 表达式整体 LazyMatch → 默认保留，不是“跳过”。
+        assert_eq!(
+            skip!(
+                Some("modified < 7d"),
+                None::<&str>,
+                Some("a.log"),
+                Some("a.log"),
+                Some("file"),
+                None,
+                None,
+                Some("log")
+            ),
+            (false, false, true)
+        );
+    }
+
+    #[test]
+    fn test_should_skip_lazy_modified_exclude_falls_through() {
+        assert_eq!(
+            skip!(
+                None::<&str>,
+                Some("modified < 7d"),
+                Some("d"),
+                Some("d"),
+                Some("dir"),
+                None,
+                None,
+                Some("")
+            ),
+            (false, true, true)
+        );
+    }
+
+    #[test]
+    fn test_should_skip_lazy_absorbed_prunes_exclude() {
+        // `Match(Path) & Lazy = Match(Path)`：缺 modified 时会误剪枝；老目录 (不满足
+        // `modified < 30d`) 有 modified 时保留。
+        let old = crate::time_util::now_secs() - 60 * 86_400;
+        assert_eq!(
+            skip!(
+                None::<&str>,
+                Some("path == \"logs/**\" and modified < 30d"),
+                Some("2024"),
+                Some("logs/2024"),
+                Some("dir"),
+                None,
+                None,
+                Some("")
+            ),
+            (true, false, false)
+        );
+        assert_eq!(
+            skip!(
+                None::<&str>,
+                Some("path == \"logs/**\" and modified < 30d"),
+                Some("2024"),
+                Some("logs/2024"),
+                Some("dir"),
+                Some(old),
+                None,
+                Some("")
+            ),
+            (false, true, true)
+        );
+    }
+
+    #[test]
+    fn test_should_skip_lazy_absorbed_prunes_include_or() {
+        let now = crate::time_util::now_secs();
+        // 缺 modified 时目录被隐藏 (true, ..)，有 modified 时被收集 (false, ..)。
+        assert_eq!(
+            skip!(
+                Some("path == \"a/b\" or modified < 7d"),
+                None::<&str>,
+                Some("x"),
+                Some("x"),
+                Some("dir"),
+                None,
+                None,
+                Some("")
+            ),
+            (true, true, true)
+        );
+        assert_eq!(
+            skip!(
+                Some("path == \"a/b\" or modified < 7d"),
+                None::<&str>,
+                Some("x"),
+                Some("x"),
+                Some("dir"),
+                Some(now),
+                None,
+                Some("")
+            ),
+            (false, true, true)
+        );
+    }
+
+    #[test]
+    fn test_should_skip_size_none_vs_zero_dir() {
+        assert_eq!(
+            skip!(
+                Some("size > 100"),
+                None::<&str>,
+                Some("d"),
+                Some("d"),
+                Some("dir"),
+                None,
+                None,
+                Some("")
+            ),
+            (false, true, true)
+        );
+        assert_eq!(
+            skip!(
+                Some("size > 100"),
+                None::<&str>,
+                Some("d"),
+                Some("d"),
+                Some("dir"),
+                None,
+                Some(0),
+                Some("")
+            ),
+            (true, true, true)
+        );
+    }
+
+    #[test]
+    fn test_should_skip_type_special_never_matches_file() {
+        assert_eq!(
+            skip!(
+                Some("type == \"file\""),
+                None::<&str>,
+                Some("fifo"),
+                Some("fifo"),
+                Some("special"),
+                None,
+                Some(0),
+                Some("")
+            ),
+            (true, false, true)
+        );
+        assert_eq!(
+            skip!(
+                Some("type != \"file\""),
+                None::<&str>,
+                Some("fifo"),
+                Some("fifo"),
+                Some("special"),
+                None,
+                Some(0),
+                Some("")
+            ),
+            (false, false, true)
+        );
     }
 
     // ==================== 7.1 Basic parsing / existing test updates ====================

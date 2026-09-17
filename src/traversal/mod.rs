@@ -2,17 +2,19 @@
 
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    BackendSessionFailure, EntryOperationFailure, ObservationPlan, ObservedEntry, StoragePath,
+    BackendSessionFailure, EntryKind, EntryOperationFailure, ObservationPlan, ObservedEntry,
+    StoragePath, StorageTimestamp,
 };
 
-#[allow(dead_code)]
-pub(crate) mod local;
+mod local;
 mod storage;
+pub use local::LocalTraversalSource;
 pub use storage::StorageTraversalSource;
 #[cfg(test)]
 mod hdfs_tests;
@@ -21,6 +23,64 @@ mod hdfs_tests;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TraversalOrder {
     Admission,
+}
+
+/// Facts known about one directory child when the traversal decides whether to emit it,
+/// descend into it, and keep filtering below it.
+#[derive(Clone, Copy, Debug)]
+pub struct TraversalCandidate<'a> {
+    /// Path relative to the **traversal root**, slash-separated and without a leading slash.
+    ///
+    /// This is the frame of reference the legacy walkers used, so an expression written against
+    /// a scan root keeps matching. It is deliberately not the backend-relative path that the
+    /// emitted [`ObservedEntry`] carries.
+    pub path: &'a str,
+    /// Final path component.
+    pub name: &'a str,
+    pub kind: EntryKind,
+    pub size: Option<u64>,
+    /// Present only when the enumerating operation or a metadata observation already
+    /// supplied it; see [`TraversalFilter::needs_modified`].
+    pub modified: Option<StorageTimestamp>,
+}
+
+/// Per-entry traversal decision. The three components are independent:
+///
+/// | field | meaning |
+/// |---|---|
+/// | `emit` | deliver this entry as a [`TraversalItem::Entry`] |
+/// | `descend` | list this directory's children (ignored for non-directories) |
+/// | `filter_children` | keep consulting the filter below this directory; `false` admits the whole subtree unfiltered |
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TraversalDecision {
+    pub emit: bool,
+    pub descend: bool,
+    pub filter_children: bool,
+}
+
+impl TraversalDecision {
+    /// The decision for an entry that is not subject to filtering.
+    #[must_use]
+    pub const fn unfiltered(kind: EntryKind) -> Self {
+        Self {
+            emit: true,
+            descend: matches!(kind, EntryKind::Directory),
+            filter_children: false,
+        }
+    }
+}
+
+/// Caller-supplied admission and pruning policy consulted for every enumerated child.
+///
+/// The trait keeps the traversal independent of any concrete expression language; the
+/// crate's DSL adapter lives outside this module.
+pub trait TraversalFilter: fmt::Debug + Send + Sync {
+    /// Whether [`TraversalCandidate::modified`] must be known before [`Self::decide`] is
+    /// meaningful. When `true`, the traversal observes every candidate before deciding and
+    /// never evaluates the filter with an absent timestamp.
+    fn needs_modified(&self) -> bool;
+
+    fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision;
 }
 
 /// A bounded traversal request.
@@ -32,6 +92,55 @@ pub struct TraversalRequest {
     pub max_buffered_items: NonZeroUsize,
     pub observation_plan: ObservationPlan,
     pub cancel: CancellationToken,
+    /// Optional admission / pruning policy. `None` admits every entry and descends into every
+    /// directory.
+    pub filter: Option<Arc<dyn TraversalFilter>>,
+    /// Maximum depth to enumerate. Children of `root` are depth 1; a directory at depth `d`
+    /// is listed only when `d < max_depth`. `None` means unlimited.
+    pub max_depth: Option<NonZeroUsize>,
+}
+
+/// Re-expresses a backend-relative path in the traversal root's frame of reference.
+///
+/// The leading `./` that the Local enumerator produces for a root-relative walk is stripped, so
+/// a `path` expression written against the scan root matches on every backend.
+pub(crate) fn relative_to<'a>(root: &StoragePath, path: &'a StoragePath) -> &'a str {
+    let value = path.as_str().strip_prefix("./").unwrap_or(path.as_str());
+    let root = root.as_str();
+    if root.is_empty() {
+        return value;
+    }
+    value
+        .strip_prefix(root)
+        .map_or(value, |rest| rest.trim_start_matches('/'))
+}
+
+#[cfg(test)]
+mod relative_tests {
+    use super::{StoragePath, relative_to};
+
+    fn path(value: &str) -> StoragePath {
+        StoragePath::new(value).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[test]
+    fn candidate_paths_are_normalised_against_the_traversal_root() {
+        assert_eq!(relative_to(&StoragePath::root(), &path("a/b")), "a/b");
+        assert_eq!(relative_to(&StoragePath::root(), &path("./a/b")), "a/b");
+        assert_eq!(relative_to(&path("keep"), &path("keep/a/b")), "a/b");
+        assert_eq!(relative_to(&path("keep"), &path("./keep/a/b")), "a/b");
+        // A path outside the root keeps its own spelling rather than being silently truncated.
+        assert_eq!(relative_to(&path("keep"), &path("other/a")), "other/a");
+    }
+}
+
+impl TraversalRequest {
+    /// Whether a directory at `depth` (direct children of the traversal root are 1) may be
+    /// listed under `max_depth`.
+    #[must_use]
+    pub(crate) fn admits_depth(&self, depth: usize) -> bool {
+        self.max_depth.is_none_or(|limit| depth < limit.get())
+    }
 }
 
 /// One ordered traversal item. Entry failures do not terminate the session.

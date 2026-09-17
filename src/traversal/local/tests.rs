@@ -62,6 +62,8 @@ fn request(cancel: CancellationToken, inflight: usize, buffered: usize) -> Trave
             .unwrap_or_else(|| unreachable!("test limit is nonzero")),
         observation_plan: crate::model::ObservationPlan::default(),
         cancel,
+        filter: None,
+        max_depth: None,
     }
 }
 

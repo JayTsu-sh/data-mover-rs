@@ -27,6 +27,8 @@ async fn hdfs_facts_survive_snapshot_without_backend_requery()
         max_buffered_items: NonZeroUsize::new(2).ok_or("invalid buffer")?,
         observation_plan: ObservationPlan::default(),
         cancel: CancellationToken::new(),
+        filter: None,
+        max_depth: None,
     });
     let Some(TraversalItem::Entry(entry)) = session.next_item().await else {
         return Err("HDFS traversal did not return an entry".into());

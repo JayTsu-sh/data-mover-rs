@@ -5,11 +5,13 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use super::{
-    TraversalCompletion, TraversalItem, TraversalOutcome, TraversalRequest, TraversalSession,
-    TraversalSource, TraversalTerminalFailure,
+    TraversalCandidate, TraversalCompletion, TraversalDecision, TraversalFilter, TraversalItem,
+    TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
+    TraversalTerminalFailure, relative_to,
 };
 use crate::model::{
-    EntryKind, EntryOperationFailure, FailureClass, MetadataObservations, Operation, StoragePath,
+    EntryKind, EntryOperationFailure, FailureClass, MetadataObservation, MetadataObservations,
+    MetadataProvenance, ObservationMode, ObservationPlan, ObservedEntry, Operation, StoragePath,
     Transience,
 };
 use crate::storage::{
@@ -61,14 +63,44 @@ impl TraversalSource for StorageTraversalSource {
     }
 }
 
-type ObservationTask = JoinSet<(u64, Result<crate::model::ObservedEntry, StorageRoleFailure>)>;
+/// One directory waiting to be listed.
+#[derive(Clone, Debug)]
+struct DirectoryWork {
+    path: StoragePath,
+    /// Depth of the directory's children; the traversal root's children are 1.
+    child_depth: usize,
+    /// Whether the filter is still consulted for children (legacy `check_children`).
+    filter_children: bool,
+}
+
+/// Facts a deferred decision needs once the observation has settled. Deferral only happens
+/// for children whose parent still consults the filter.
+#[derive(Clone, Copy, Debug)]
+struct Deferred {
+    depth: usize,
+    /// Carried so a failed observation of a directory can still be descended rather than
+    /// silently dropping its whole subtree.
+    kind: EntryKind,
+}
+
+type ObservationTask = JoinSet<(
+    u64,
+    Result<ObservedEntry, StorageRoleFailure>,
+    Option<Deferred>,
+)>;
+
+/// A settled sequence slot: an optional item to deliver and an optional directory to list.
+struct Settled {
+    item: Option<TraversalItem>,
+    descend: Option<DirectoryWork>,
+}
 
 struct State {
     next_sequence: u64,
     next_output: u64,
     observed: u64,
     failed: u64,
-    pending: BTreeMap<u64, TraversalItem>,
+    pending: BTreeMap<u64, Settled>,
 }
 
 impl State {
@@ -81,6 +113,59 @@ impl State {
             pending: BTreeMap::new(),
         }
     }
+
+    fn allocate(&mut self) -> Result<u64, TraversalTerminalFailure> {
+        let sequence = self.next_sequence;
+        self.next_sequence = sequence
+            .checked_add(1)
+            .ok_or(TraversalTerminalFailure::Internal)?;
+        Ok(sequence)
+    }
+}
+
+/// Per-traversal admission policy derived once from the request.
+struct Policy {
+    filter: Option<Arc<dyn TraversalFilter>>,
+    /// Decisions wait for the metadata observation because the filter needs `modified`.
+    deferred: bool,
+    observation_plan: ObservationPlan,
+}
+
+impl Policy {
+    fn new(request: &TraversalRequest) -> Self {
+        let deferred = request
+            .filter
+            .as_ref()
+            .is_some_and(|filter| filter.needs_modified());
+        let mut observation_plan = request.observation_plan;
+        if deferred && observation_plan.timestamps() == ObservationMode::Omit {
+            observation_plan = observation_plan.with_timestamps(ObservationMode::InlineOnly);
+        }
+        Self {
+            filter: request.filter.clone(),
+            deferred,
+            observation_plan,
+        }
+    }
+
+    fn decide(
+        &self,
+        consult_filter: bool,
+        candidate: &TraversalCandidate<'_>,
+    ) -> TraversalDecision {
+        match (&self.filter, consult_filter) {
+            (Some(filter), true) => filter.decide(candidate),
+            _ => TraversalDecision::unfiltered(candidate.kind),
+        }
+    }
+}
+
+struct Runtime<'a> {
+    namespace: &'a Arc<dyn Namespace>,
+    metadata: &'a Arc<dyn Metadata>,
+    request: &'a TraversalRequest,
+    policy: Policy,
+    items: &'a mpsc::Sender<TraversalItem>,
 }
 
 async fn run(
@@ -91,18 +176,20 @@ async fn run(
     completion: oneshot::Sender<Result<TraversalOutcome, TraversalTerminalFailure>>,
 ) {
     let mut state = State::new();
-    let mut directories = VecDeque::from([request.root.clone()]);
+    let mut directories = VecDeque::from([DirectoryWork {
+        path: request.root.clone(),
+        child_depth: 1,
+        filter_children: request.filter.is_some(),
+    }]);
     let mut tasks = JoinSet::new();
-    let result = enumerate_and_observe(
-        &namespace,
-        &metadata,
-        &request,
-        &items,
-        &mut directories,
-        &mut tasks,
-        &mut state,
-    )
-    .await;
+    let runtime = Runtime {
+        namespace: &namespace,
+        metadata: &metadata,
+        request: &request,
+        policy: Policy::new(&request),
+        items: &items,
+    };
+    let result = enumerate_and_observe(&runtime, &mut directories, &mut tasks, &mut state).await;
     tasks.abort_all();
     drop(items);
     let terminal = if request.cancel.is_cancelled() {
@@ -119,79 +206,182 @@ async fn run(
 }
 
 async fn enumerate_and_observe(
-    namespace: &Arc<dyn Namespace>,
-    metadata: &Arc<dyn Metadata>,
-    request: &TraversalRequest,
-    items: &mpsc::Sender<TraversalItem>,
-    directories: &mut VecDeque<StoragePath>,
+    runtime: &Runtime<'_>,
+    directories: &mut VecDeque<DirectoryWork>,
     tasks: &mut ObservationTask,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
-    while let Some(directory) = directories.pop_front() {
-        if request.cancel.is_cancelled() {
+    loop {
+        if runtime.request.cancel.is_cancelled() {
             return Ok(());
         }
-        let listed = namespace
-            .execute(NamespaceRequest::List(directory.clone()))
-            .await;
-        let descriptors = match listed {
-            Ok(NamespaceResult::Entries(values)) => values,
-            Ok(_) => {
-                queue_failure(state, entry_failure(&directory, FailureClass::Protocol))?;
-                flush(items, state, &request.cancel).await?;
-                continue;
-            }
-            Err(StorageRoleFailure::Entry(error)) => {
-                queue_failure(state, error)?;
-                flush(items, state, &request.cancel).await?;
-                continue;
-            }
-            Err(StorageRoleFailure::Session(error)) => {
-                return Err(TraversalTerminalFailure::Session(error));
-            }
-        };
-        for descriptor in descriptors {
-            if descriptor.kind == EntryKind::Directory {
-                directories.push_back(descriptor.path.clone());
-            }
-            while tasks.len() >= request.max_inflight_operations.get() {
-                if request.cancel.is_cancelled() {
-                    return Ok(());
-                }
-                settle(tasks, state, &request.cancel).await?;
-                flush(items, state, &request.cancel).await?;
-            }
-            let sequence = state.next_sequence;
-            state.next_sequence = state
-                .next_sequence
-                .checked_add(1)
-                .ok_or(TraversalTerminalFailure::Internal)?;
-            let namespace = Arc::clone(namespace);
-            let metadata = Arc::clone(metadata);
-            let plan = request.observation_plan;
-            tasks.spawn(async move {
-                let result = observe(namespace, metadata, descriptor, plan).await;
-                (sequence, result)
-            });
+        if let Some(directory) = directories.pop_front() {
+            list_directory(runtime, directory, directories, tasks, state).await?;
+        } else if tasks.is_empty() {
+            return Ok(());
+        } else {
+            settle(runtime, tasks, state).await?;
+            flush(runtime, state, directories).await?;
         }
-        flush(items, state, &request.cancel).await?;
     }
-    while !tasks.is_empty() && !request.cancel.is_cancelled() {
-        settle(tasks, state, &request.cancel).await?;
-        flush(items, state, &request.cancel).await?;
+}
+
+async fn list_directory(
+    runtime: &Runtime<'_>,
+    directory: DirectoryWork,
+    directories: &mut VecDeque<DirectoryWork>,
+    tasks: &mut ObservationTask,
+    state: &mut State,
+) -> Result<(), TraversalTerminalFailure> {
+    let listed = runtime
+        .namespace
+        .execute(NamespaceRequest::List(directory.path.clone()))
+        .await;
+    let descriptors = match listed {
+        Ok(NamespaceResult::Entries(values)) => values,
+        Ok(_) => {
+            queue_failure(
+                state,
+                entry_failure(&directory.path, FailureClass::Protocol),
+            )?;
+            return flush(runtime, state, directories).await;
+        }
+        Err(StorageRoleFailure::Entry(error)) => {
+            queue_failure(state, error)?;
+            return flush(runtime, state, directories).await;
+        }
+        Err(StorageRoleFailure::Session(error)) => {
+            return Err(TraversalTerminalFailure::Session(error));
+        }
+    };
+    for descriptor in descriptors {
+        while tasks.len() >= runtime.request.max_inflight_operations.get() {
+            if runtime.request.cancel.is_cancelled() {
+                return Ok(());
+            }
+            settle(runtime, tasks, state).await?;
+            flush(runtime, state, directories).await?;
+        }
+        admit(runtime, &directory, descriptor, directories, tasks, state)?;
     }
+    flush(runtime, state, directories).await
+}
+
+/// Applies the admission policy to one listed child and either spawns its observation,
+/// enqueues it for listing without emitting it, or drops it.
+fn admit(
+    runtime: &Runtime<'_>,
+    parent: &DirectoryWork,
+    descriptor: SourceDescriptor,
+    directories: &mut VecDeque<DirectoryWork>,
+    tasks: &mut ObservationTask,
+    state: &mut State,
+) -> Result<(), TraversalTerminalFailure> {
+    let depth = parent.child_depth;
+    let deferred = runtime.policy.deferred && parent.filter_children;
+    if !deferred {
+        let candidate = TraversalCandidate {
+            path: relative_to(&runtime.request.root, &descriptor.path),
+            name: entry_name(&descriptor.path),
+            kind: descriptor.kind,
+            size: descriptor.size,
+            modified: descriptor
+                .inline_timestamps
+                .and_then(|value| value.modified),
+        };
+        let decision = runtime.policy.decide(parent.filter_children, &candidate);
+        if let Some(work) = descend_work(runtime.request, &descriptor, depth, decision) {
+            directories.push_back(work);
+        }
+        if !decision.emit {
+            return Ok(());
+        }
+    }
+    let sequence = state.allocate()?;
+    let namespace = Arc::clone(runtime.namespace);
+    let metadata = Arc::clone(runtime.metadata);
+    let plan = runtime.policy.observation_plan;
+    let context = deferred.then_some(Deferred {
+        depth,
+        kind: descriptor.kind,
+    });
+    tasks.spawn(async move {
+        let result = observe(namespace, metadata, descriptor, plan).await;
+        (sequence, result, context)
+    });
     Ok(())
+}
+
+fn descend_work(
+    request: &TraversalRequest,
+    descriptor: &SourceDescriptor,
+    depth: usize,
+    decision: TraversalDecision,
+) -> Option<DirectoryWork> {
+    (decision.descend && descriptor.kind == EntryKind::Directory && request.admits_depth(depth))
+        .then(|| DirectoryWork {
+            path: descriptor.path.clone(),
+            child_depth: depth.saturating_add(1),
+            filter_children: decision.filter_children,
+        })
+}
+
+fn entry_name(path: &StoragePath) -> &str {
+    path.as_str().rsplit('/').next().unwrap_or_default()
+}
+
+/// Whether the metadata role must be consulted for `descriptor` under `plan`, or whether the
+/// listing already supplied everything the plan asks for.
+fn needs_metadata_role(plan: ObservationPlan, descriptor: &SourceDescriptor) -> bool {
+    let optional_requested = [
+        plan.acl(),
+        plan.xattrs(),
+        plan.tags(),
+        plan.ownership_mode(),
+    ]
+    .into_iter()
+    .any(|mode| mode != ObservationMode::Omit);
+    optional_requested
+        || (plan.timestamps() != ObservationMode::Omit && descriptor.inline_timestamps.is_none())
+}
+
+fn inline_observations(
+    plan: ObservationPlan,
+    descriptor: &SourceDescriptor,
+) -> Result<MetadataObservations, StorageRoleFailure> {
+    let timestamps = match (plan.timestamps(), descriptor.inline_timestamps) {
+        (ObservationMode::Omit, _) | (_, None) => MetadataObservation::NotRequested,
+        (_, Some(value)) => MetadataObservation::Value {
+            value,
+            provenance: MetadataProvenance::Inline,
+        },
+    };
+    MetadataObservations::new(
+        MetadataObservation::NotRequested,
+        MetadataObservation::NotRequested,
+        MetadataObservation::NotRequested,
+        MetadataObservation::NotRequested,
+        timestamps,
+    )
+    .map_err(|_| StorageRoleFailure::Entry(entry_failure(&descriptor.path, FailureClass::Protocol)))
 }
 
 async fn observe(
     namespace: Arc<dyn Namespace>,
     metadata_role: Arc<dyn Metadata>,
     descriptor: SourceDescriptor,
-    plan: crate::model::ObservationPlan,
-) -> Result<crate::model::ObservedEntry, StorageRoleFailure> {
+    plan: ObservationPlan,
+) -> Result<ObservedEntry, StorageRoleFailure> {
     let backend_fact = descriptor.backend_fact.clone();
-    let metadata = metadata_role.observe(&descriptor.path, plan).await?;
-    let modified = modified(&metadata);
+    let metadata = if needs_metadata_role(plan, &descriptor) {
+        metadata_role.observe(&descriptor.path, plan).await?
+    } else {
+        inline_observations(plan, &descriptor)?
+    };
+    let modified = metadata
+        .timestamps()
+        .value()
+        .and_then(|value| value.modified);
     let entry = if descriptor.kind == EntryKind::Symlink {
         let result = namespace
             .execute(NamespaceRequest::ReadLink(descriptor.path.clone()))
@@ -202,14 +392,14 @@ async fn observe(
                 FailureClass::Protocol,
             )));
         };
-        crate::model::ObservedEntry::new_symlink(
+        ObservedEntry::new_symlink(
             descriptor.path.clone(),
             modified,
             descriptor.source_identity,
             target,
         )
     } else {
-        crate::model::ObservedEntry::new(
+        ObservedEntry::new(
             descriptor.path.clone(),
             descriptor.kind,
             descriptor.size,
@@ -229,57 +419,109 @@ async fn observe(
     }
 }
 
-fn modified(metadata: &MetadataObservations) -> Option<crate::model::StorageTimestamp> {
-    metadata
-        .timestamps()
-        .value()
-        .and_then(|value| value.modified)
-}
-
 async fn settle(
+    runtime: &Runtime<'_>,
     tasks: &mut ObservationTask,
     state: &mut State,
-    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), TraversalTerminalFailure> {
     let result = tokio::select! {
         biased;
-        () = cancel.cancelled() => return Ok(()),
+        () = runtime.request.cancel.cancelled() => return Ok(()),
         result = tasks.join_next() => result,
     };
-    match result {
-        Some(Ok((sequence, Ok(entry)))) => {
-            state
-                .pending
-                .insert(sequence, TraversalItem::Entry(Box::new(entry)));
+    let settled = match result {
+        Some(Ok((sequence, Ok(entry), deferred))) => {
+            (sequence, settle_entry(runtime, entry, deferred))
         }
-        Some(Ok((sequence, Err(StorageRoleFailure::Entry(error))))) => {
-            state
-                .pending
-                .insert(sequence, TraversalItem::EntryFailure(error));
+        Some(Ok((sequence, Err(StorageRoleFailure::Entry(error)), deferred))) => {
+            (sequence, settle_failure(runtime, error, deferred))
         }
-        Some(Ok((_, Err(StorageRoleFailure::Session(error))))) => {
+        Some(Ok((_, Err(StorageRoleFailure::Session(error)), _))) => {
             return Err(TraversalTerminalFailure::Session(error));
         }
         Some(Err(_)) | None => return Err(TraversalTerminalFailure::Internal),
-    }
+    };
+    state.pending.insert(settled.0, settled.1);
     Ok(())
 }
 
+/// A deferred decision whose observation failed cannot be evaluated. Reporting the failure and
+/// pruning would silently drop the whole subtree, so a directory is still listed; the caller sees
+/// the failure item and keeps a complete enumeration below it.
+fn settle_failure(
+    runtime: &Runtime<'_>,
+    error: EntryOperationFailure,
+    deferred: Option<Deferred>,
+) -> Settled {
+    let descend = deferred
+        .filter(|deferred| {
+            deferred.kind == EntryKind::Directory && runtime.request.admits_depth(deferred.depth)
+        })
+        .map(|deferred| DirectoryWork {
+            path: error.path().clone(),
+            child_depth: deferred.depth.saturating_add(1),
+            filter_children: true,
+        });
+    Settled {
+        item: Some(TraversalItem::EntryFailure(error)),
+        descend,
+    }
+}
+
+/// Applies a deferred decision now that the observation (and therefore `modified`) is known.
+fn settle_entry(
+    runtime: &Runtime<'_>,
+    entry: ObservedEntry,
+    deferred: Option<Deferred>,
+) -> Settled {
+    let Some(deferred) = deferred else {
+        return Settled {
+            item: Some(TraversalItem::Entry(Box::new(entry))),
+            descend: None,
+        };
+    };
+    let candidate = TraversalCandidate {
+        path: relative_to(&runtime.request.root, entry.path()),
+        name: entry_name(entry.path()),
+        kind: entry.kind(),
+        size: entry.size(),
+        modified: entry.modified(),
+    };
+    let decision = runtime.policy.decide(true, &candidate);
+    let descend = (decision.descend
+        && entry.kind() == EntryKind::Directory
+        && runtime.request.admits_depth(deferred.depth))
+    .then(|| DirectoryWork {
+        path: entry.path().clone(),
+        child_depth: deferred.depth.saturating_add(1),
+        filter_children: decision.filter_children,
+    });
+    Settled {
+        item: decision.emit.then(|| TraversalItem::Entry(Box::new(entry))),
+        descend,
+    }
+}
+
 async fn flush(
-    sender: &mpsc::Sender<TraversalItem>,
+    runtime: &Runtime<'_>,
     state: &mut State,
-    cancel: &tokio_util::sync::CancellationToken,
+    directories: &mut VecDeque<DirectoryWork>,
 ) -> Result<(), TraversalTerminalFailure> {
-    while let Some(item) = state.pending.remove(&state.next_output) {
-        match &item {
-            TraversalItem::Entry(_) => state.observed += 1,
-            TraversalItem::EntryFailure(_) => state.failed += 1,
+    while let Some(settled) = state.pending.remove(&state.next_output) {
+        if let Some(work) = settled.descend {
+            directories.push_back(work);
         }
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Ok(()),
-            result = sender.send(item) => {
-                result.map_err(|_| TraversalTerminalFailure::Internal)?;
+        if let Some(item) = settled.item {
+            match &item {
+                TraversalItem::Entry(_) => state.observed += 1,
+                TraversalItem::EntryFailure(_) => state.failed += 1,
+            }
+            tokio::select! {
+                biased;
+                () = runtime.request.cancel.cancelled() => return Ok(()),
+                result = runtime.items.send(item) => {
+                    result.map_err(|_| TraversalTerminalFailure::Internal)?;
+                }
             }
         }
         state.next_output += 1;
@@ -291,14 +533,14 @@ fn queue_failure(
     state: &mut State,
     error: EntryOperationFailure,
 ) -> Result<(), TraversalTerminalFailure> {
-    let sequence = state.next_sequence;
-    state.next_sequence = state
-        .next_sequence
-        .checked_add(1)
-        .ok_or(TraversalTerminalFailure::Internal)?;
-    state
-        .pending
-        .insert(sequence, TraversalItem::EntryFailure(error));
+    let sequence = state.allocate()?;
+    state.pending.insert(
+        sequence,
+        Settled {
+            item: Some(TraversalItem::EntryFailure(error)),
+            descend: None,
+        },
+    );
     Ok(())
 }
 
@@ -314,293 +556,4 @@ fn entry_failure(path: &StoragePath, class: FailureClass) -> EntryOperationFailu
 }
 
 #[cfg(test)]
-mod tests {
-    use std::num::NonZeroUsize;
-
-    use async_trait::async_trait;
-
-    use super::*;
-    use crate::model::{
-        BackendIdentity, BackendKind as Kind, IdentityStrength, MetadataObservation,
-        MetadataProvenance, ObservationPlan, SourceIdentity, SymlinkTarget, SymlinkTargetEncoding,
-        TimestampMetadata,
-    };
-    use crate::storage::MetadataMutation;
-
-    struct FakeNamespace;
-    struct FakeMetadata;
-
-    #[derive(Clone, Copy)]
-    enum MetadataFailureMode {
-        Entry,
-        Session,
-    }
-
-    struct FailingMetadata(MetadataFailureMode);
-    struct BlockingMetadata;
-
-    fn path(value: &str) -> StoragePath {
-        StoragePath::new(value).unwrap_or_else(|error| panic!("{error}"))
-    }
-
-    fn descriptor(value: &str, kind: EntryKind) -> SourceDescriptor {
-        SourceDescriptor {
-            path: path(value),
-            kind,
-            size: (kind == EntryKind::File).then_some(3),
-            source_identity: SourceIdentity::new(
-                BackendIdentity::new(Kind::Nfs, "traversal-test")
-                    .unwrap_or_else(|error| panic!("{error}")),
-                IdentityStrength::StableWithinBackend,
-                value.as_bytes(),
-            )
-            .unwrap_or_else(|error| panic!("{error}")),
-            backend_fact: None,
-            content_version: None,
-            inline_timestamps: None,
-        }
-    }
-
-    #[async_trait]
-    impl Namespace for FakeNamespace {
-        async fn execute(
-            &self,
-            request: NamespaceRequest,
-        ) -> Result<NamespaceResult, StorageRoleFailure> {
-            match request {
-                NamespaceRequest::List(root) if root == StoragePath::root() => {
-                    Ok(NamespaceResult::Entries(vec![
-                        descriptor("dir", EntryKind::Directory),
-                        descriptor("file", EntryKind::File),
-                        descriptor("link", EntryKind::Symlink),
-                    ]))
-                }
-                NamespaceRequest::List(root) if root == path("dir") => Ok(
-                    NamespaceResult::Entries(vec![descriptor("dir/child", EntryKind::File)]),
-                ),
-                NamespaceRequest::ReadLink(link) if link == path("link") => {
-                    Ok(NamespaceResult::LinkTarget(
-                        SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, b"file".to_vec())
-                            .unwrap_or_else(|error| panic!("{error}")),
-                    ))
-                }
-                _ => Err(StorageRoleFailure::Entry(entry_failure(
-                    &StoragePath::root(),
-                    FailureClass::NotFound,
-                ))),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Metadata for FakeMetadata {
-        async fn observe(
-            &self,
-            _path: &StoragePath,
-            _plan: ObservationPlan,
-        ) -> Result<MetadataObservations, StorageRoleFailure> {
-            MetadataObservations::new(
-                MetadataObservation::NotRequested,
-                MetadataObservation::NotRequested,
-                MetadataObservation::NotApplicable,
-                MetadataObservation::NotRequested,
-                MetadataObservation::Value {
-                    value: TimestampMetadata {
-                        accessed: None,
-                        modified: None,
-                        created: None,
-                    },
-                    provenance: MetadataProvenance::Inline,
-                },
-            )
-            .map_err(|_| {
-                StorageRoleFailure::Entry(entry_failure(
-                    &StoragePath::root(),
-                    FailureClass::Protocol,
-                ))
-            })
-        }
-
-        async fn apply(
-            &self,
-            _path: &StoragePath,
-            _mutation: MetadataMutation,
-            _cancel: tokio_util::sync::CancellationToken,
-        ) -> Result<(), StorageRoleFailure> {
-            unreachable!("traversal never applies metadata")
-        }
-    }
-
-    #[async_trait]
-    impl Metadata for FailingMetadata {
-        async fn observe(
-            &self,
-            observed_path: &StoragePath,
-            _plan: ObservationPlan,
-        ) -> Result<MetadataObservations, StorageRoleFailure> {
-            match self.0 {
-                MetadataFailureMode::Entry => Err(StorageRoleFailure::Entry(entry_failure(
-                    observed_path,
-                    FailureClass::PermissionDenied,
-                ))),
-                MetadataFailureMode::Session => Err(StorageRoleFailure::Session(
-                    crate::model::BackendSessionFailure::new(
-                        Operation::Observe,
-                        FailureClass::Connectivity,
-                        Transience::Transient,
-                        "test storage session failed",
-                    )
-                    .unwrap_or_else(|error| panic!("{error}")),
-                )),
-            }
-        }
-
-        async fn apply(
-            &self,
-            _path: &StoragePath,
-            _mutation: MetadataMutation,
-            _cancel: tokio_util::sync::CancellationToken,
-        ) -> Result<(), StorageRoleFailure> {
-            unreachable!("traversal never applies metadata")
-        }
-    }
-
-    #[async_trait]
-    impl Metadata for BlockingMetadata {
-        async fn observe(
-            &self,
-            _path: &StoragePath,
-            _plan: ObservationPlan,
-        ) -> Result<MetadataObservations, StorageRoleFailure> {
-            std::future::pending().await
-        }
-
-        async fn apply(
-            &self,
-            _path: &StoragePath,
-            _mutation: MetadataMutation,
-            _cancel: tokio_util::sync::CancellationToken,
-        ) -> Result<(), StorageRoleFailure> {
-            unreachable!("traversal never applies metadata")
-        }
-    }
-
-    #[tokio::test]
-    async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
-        let source =
-            StorageTraversalSource::with_roles(Arc::new(FakeNamespace), Arc::new(FakeMetadata));
-        let mut session = source.traverse(TraversalRequest {
-            root: StoragePath::root(),
-            order: crate::traversal::TraversalOrder::Admission,
-            max_inflight_operations: NonZeroUsize::new(2)
-                .unwrap_or_else(|| unreachable!("constant is nonzero")),
-            max_buffered_items: NonZeroUsize::new(1)
-                .unwrap_or_else(|| unreachable!("constant is nonzero")),
-            observation_plan: ObservationPlan::default(),
-            cancel: tokio_util::sync::CancellationToken::new(),
-        });
-        let mut observed = Vec::new();
-        while let Some(item) = session.next_item().await {
-            let TraversalItem::Entry(entry) = item else {
-                panic!("unexpected entry failure")
-            };
-            observed.push((entry.path().clone(), entry.symlink_target().cloned()));
-        }
-        assert_eq!(
-            observed
-                .iter()
-                .map(|(path, _)| path.as_str())
-                .collect::<Vec<_>>(),
-            ["dir", "file", "link", "dir/child"]
-        );
-        assert_eq!(
-            observed[2].1.as_ref().map(SymlinkTarget::as_bytes),
-            Some(&b"file"[..])
-        );
-        assert!(matches!(
-            session.finish().await,
-            Ok(TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 4,
-                entry_failures: 0
-            }))
-        ));
-    }
-
-    fn request(cancel: tokio_util::sync::CancellationToken) -> TraversalRequest {
-        TraversalRequest {
-            root: StoragePath::root(),
-            order: crate::traversal::TraversalOrder::Admission,
-            max_inflight_operations: NonZeroUsize::new(2)
-                .unwrap_or_else(|| unreachable!("constant is nonzero")),
-            max_buffered_items: NonZeroUsize::new(1)
-                .unwrap_or_else(|| unreachable!("constant is nonzero")),
-            observation_plan: ObservationPlan::default(),
-            cancel,
-        }
-    }
-
-    #[tokio::test]
-    async fn entry_failures_are_items_while_session_failures_are_terminal() {
-        let source = StorageTraversalSource::with_roles(
-            Arc::new(FakeNamespace),
-            Arc::new(FailingMetadata(MetadataFailureMode::Entry)),
-        );
-        let mut session = source.traverse(request(tokio_util::sync::CancellationToken::new()));
-        let mut failures = 0;
-        while let Some(item) = session.next_item().await {
-            assert!(matches!(item, TraversalItem::EntryFailure(_)));
-            failures += 1;
-        }
-        assert_eq!(failures, 4);
-        assert!(matches!(
-            session.finish().await,
-            Ok(TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 0,
-                entry_failures: 4
-            }))
-        ));
-
-        let source = StorageTraversalSource::with_roles(
-            Arc::new(FakeNamespace),
-            Arc::new(FailingMetadata(MetadataFailureMode::Session)),
-        );
-        let mut session = source.traverse(request(tokio_util::sync::CancellationToken::new()));
-        while session.next_item().await.is_some() {}
-        assert!(matches!(
-            session.finish().await,
-            Err(TraversalTerminalFailure::Session(error))
-                if error.class() == FailureClass::Connectivity
-        ));
-    }
-
-    #[tokio::test]
-    async fn precancelled_traversal_has_a_distinct_cancelled_outcome() {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        cancel.cancel();
-        let source =
-            StorageTraversalSource::with_roles(Arc::new(FakeNamespace), Arc::new(FakeMetadata));
-        let mut session = source.traverse(request(cancel));
-        assert!(session.next_item().await.is_none());
-        assert_eq!(session.finish().await, Ok(TraversalOutcome::Cancelled));
-    }
-
-    #[tokio::test]
-    async fn cancellation_while_inflight_is_full_terminates_without_spinning() {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let source =
-            StorageTraversalSource::with_roles(Arc::new(FakeNamespace), Arc::new(BlockingMetadata));
-        let mut traversal_request = request(cancel.clone());
-        traversal_request.max_inflight_operations =
-            NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("constant is nonzero"));
-        let mut session = source.traverse(traversal_request);
-        tokio::task::yield_now().await;
-        cancel.cancel();
-        assert!(session.next_item().await.is_none());
-        assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), session.finish())
-                .await
-                .unwrap_or_else(|_| panic!("cancelled traversal did not terminate")),
-            Ok(TraversalOutcome::Cancelled)
-        );
-    }
-}
+mod tests;

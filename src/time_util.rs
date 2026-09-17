@@ -26,6 +26,17 @@ pub fn nanos_to_secs(nanos: i64) -> i64 {
     nanos.div_euclid(NANOS_PER_SEC)
 }
 
+/// Floors signed 128-bit Unix nanoseconds (the `StorageTimestamp` representation) to whole
+/// seconds, saturating at the `i64` range.
+#[must_use]
+pub fn unix_nanos_to_secs(nanos: i128) -> i64 {
+    i64::try_from(nanos.div_euclid(1_000_000_000)).unwrap_or(if nanos < 0 {
+        i64::MIN
+    } else {
+        i64::MAX
+    })
+}
+
 #[inline]
 #[must_use]
 pub fn nanos_subsec(nanos: i64) -> u32 {

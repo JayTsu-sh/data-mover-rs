@@ -12,15 +12,18 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    TraversalCompletion, TraversalItem, TraversalOutcome, TraversalRequest, TraversalSession,
-    TraversalSource, TraversalTerminalFailure,
+    TraversalCandidate, TraversalCompletion, TraversalDecision, TraversalFilter, TraversalItem,
+    TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
+    TraversalTerminalFailure, relative_to,
 };
 use crate::model::{
-    BackendIdentity, BackendSessionFailure, EntryFailureIdentity, EntryOperationFailure,
+    BackendIdentity, BackendSessionFailure, EntryFailureIdentity, EntryKind, EntryOperationFailure,
     FailureClass, Operation, StoragePath, Transience,
 };
 use crate::storage::StorageRoleFailure;
-use crate::storage::backends::local::observation::{LocalObservationAdapter, classify_io};
+use crate::storage::backends::local::observation::{
+    LocalObservationAdapter, classify_io, entry_kind, system_time_to_timestamp,
+};
 
 enum Candidate {
     Path {
@@ -48,7 +51,12 @@ enum DirectoryRead {
     Stop,
 }
 
-pub(crate) struct LocalTraversalSource {
+/// Traversal for the Local backend.
+///
+/// Local lends no namespace role (its enumeration runs inside a `cap-std` sandbox rather than
+/// through protocol verbs), so it cannot use [`super::StorageTraversalSource`] and gets its own
+/// implementation of the same contract, including the filter and depth bound.
+pub struct LocalTraversalSource {
     root: Arc<Dir>,
     observer: Arc<LocalObservationAdapter>,
     identity: BackendIdentity,
@@ -84,7 +92,11 @@ impl EnumerationProbe {
 }
 
 impl LocalTraversalSource {
-    pub(crate) fn new(
+    /// Opens a sandboxed traversal rooted at `root`.
+    ///
+    /// # Errors
+    /// Returns a session failure when the root cannot be canonicalised or opened.
+    pub fn new(
         root: impl AsRef<Path>,
         identity: BackendIdentity,
     ) -> Result<Self, BackendSessionFailure> {
@@ -159,9 +171,16 @@ fn spawn_enumerator(
 ) {
     let root_path = request.root.clone();
     let cancel = request.cancel.clone();
+    let admission = Admission {
+        filter: request.filter.clone(),
+        max_depth: request.max_depth,
+        root: request.root.clone(),
+    };
     let completion_sender = sender.clone();
     let task = tokio::task::spawn_blocking(move || {
-        enumerate(&root, &identity, &probe, &root_path, &cancel, &sender);
+        enumerate(
+            &root, &identity, &probe, &root_path, &admission, &cancel, &sender,
+        );
     });
     tokio::spawn(async move {
         let candidate = match task.await {
@@ -172,11 +191,46 @@ fn spawn_enumerator(
     });
 }
 
+/// Admission policy shared with the blocking enumerator.
+struct Admission {
+    filter: Option<Arc<dyn TraversalFilter>>,
+    max_depth: Option<std::num::NonZeroUsize>,
+    /// Frame of reference for [`TraversalCandidate::path`].
+    root: StoragePath,
+}
+
+impl Admission {
+    fn admits_depth(&self, depth: usize) -> bool {
+        self.max_depth.is_none_or(|limit| depth < limit.get())
+    }
+
+    /// Local `symlink_metadata` already carries `modified`, so every decision is immediate.
+    fn decide(
+        &self,
+        consult_filter: bool,
+        candidate: &TraversalCandidate<'_>,
+    ) -> TraversalDecision {
+        match (&self.filter, consult_filter) {
+            (Some(filter), true) => filter.decide(candidate),
+            _ => TraversalDecision::unfiltered(candidate.kind),
+        }
+    }
+}
+
+/// One directory waiting to be read: its path, the depth of its children, and whether the
+/// filter still applies below it.
+struct PendingDirectory {
+    path: PathBuf,
+    child_depth: usize,
+    filter_children: bool,
+}
+
 fn enumerate(
     root: &Dir,
     identity: &BackendIdentity,
     probe: &EnumerationProbe,
     scan_root: &StoragePath,
+    admission: &Admission,
     cancel: &CancellationToken,
     sender: &mpsc::Sender<Candidate>,
 ) {
@@ -184,12 +238,16 @@ fn enumerate(
         return;
     };
     let mut sequence = 0_u64;
-    let mut directories = vec![relative_root];
+    let mut directories = vec![PendingDirectory {
+        path: relative_root,
+        child_depth: 1,
+        filter_children: admission.filter.is_some(),
+    }];
     while let Some(directory) = directories.pop() {
         if cancel.is_cancelled() {
             return;
         }
-        let entries = match read_directory(probe, root, &directory, sender, &mut sequence) {
+        let entries = match read_directory(probe, root, &directory.path, sender, &mut sequence) {
             DirectoryRead::Entries(entries) => entries,
             DirectoryRead::Skip => continue,
             DirectoryRead::Stop => return,
@@ -205,6 +263,7 @@ fn enumerate(
                 &directory,
                 entry,
                 sequence,
+                admission,
                 &mut directories,
             ) else {
                 return;
@@ -252,19 +311,21 @@ fn initial_directory(scan_root: &StoragePath, sender: &mpsc::Sender<Candidate>) 
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enumerate_entry(
     root: &Dir,
     identity: &BackendIdentity,
     sender: &mpsc::Sender<Candidate>,
-    directory: &Path,
+    directory: &PendingDirectory,
     entry: io::Result<cap_std::fs::DirEntry>,
     sequence: u64,
-    directories: &mut Vec<PathBuf>,
+    admission: &Admission,
+    directories: &mut Vec<PendingDirectory>,
 ) -> Option<u64> {
     let entry = match entry {
         Ok(entry) => entry,
         Err(source) => {
-            let path = storage_path(directory);
+            let path = storage_path(&directory.path);
             let error = entry_io_failure(&path, &source);
             sender
                 .blocking_send(Candidate::EntryFailure { sequence, error })
@@ -275,8 +336,8 @@ fn enumerate_entry(
     if crate::storage::is_local_transfer_artifact(&entry.file_name()) {
         return Some(sequence);
     }
-    let child = directory.join(entry.file_name());
-    let path = match candidate_path(identity, directory, &child) {
+    let child = directory.path.join(entry.file_name());
+    let path = match candidate_path(identity, &directory.path, &child) {
         Ok(path) => path,
         Err(error) => {
             sender
@@ -285,19 +346,50 @@ fn enumerate_entry(
             return sequence.checked_add(1);
         }
     };
-    sender
-        .blocking_send(Candidate::Path {
-            sequence,
-            path: path.clone(),
-        })
-        .ok()?;
-    if root
-        .symlink_metadata(&child)
-        .is_ok_and(|metadata| metadata.is_dir())
-    {
-        directories.push(child);
+    // A failed stat gives no facts to filter on. Admitting the entry unfiltered keeps the old
+    // behaviour, so the observation stage reports the real error instead of the entry vanishing.
+    let Some(metadata) = root.symlink_metadata(&child).ok() else {
+        sender
+            .blocking_send(Candidate::Path { sequence, path })
+            .ok()?;
+        return sequence.checked_add(1);
+    };
+    let kind = entry_kind(&metadata).unwrap_or(EntryKind::File);
+    let file_name = entry.file_name();
+    let candidate = TraversalCandidate {
+        path: relative_to(&admission.root, &path),
+        name: file_name.to_str().unwrap_or_default(),
+        kind,
+        size: Some(metadata.len()),
+        modified: metadata
+            .modified()
+            .ok()
+            .and_then(|value| system_time_to_timestamp(value.into_std())),
+    };
+    let decision = admission.decide(directory.filter_children, &candidate);
+    if decision.emit {
+        sender
+            .blocking_send(Candidate::Path {
+                sequence,
+                path: path.clone(),
+            })
+            .ok()?;
     }
-    sequence.checked_add(1)
+    if decision.descend
+        && kind == EntryKind::Directory
+        && admission.admits_depth(directory.child_depth)
+    {
+        directories.push(PendingDirectory {
+            path: child,
+            child_depth: directory.child_depth.saturating_add(1),
+            filter_children: decision.filter_children,
+        });
+    }
+    if decision.emit {
+        sequence.checked_add(1)
+    } else {
+        Some(sequence)
+    }
 }
 
 fn candidate_path(

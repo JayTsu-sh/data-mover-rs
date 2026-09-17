@@ -629,7 +629,7 @@ fn checked_relative(path: &StoragePath) -> Result<PathBuf, StorageRoleFailure> {
     }
 }
 
-fn system_time_to_timestamp(time: SystemTime) -> Option<StorageTimestamp> {
+pub(crate) fn system_time_to_timestamp(time: SystemTime) -> Option<StorageTimestamp> {
     let nanos = match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => i128::try_from(duration.as_nanos()).ok()?,
         Err(error) => -i128::try_from(error.duration().as_nanos()).ok()?,
@@ -638,7 +638,7 @@ fn system_time_to_timestamp(time: SystemTime) -> Option<StorageTimestamp> {
 }
 
 #[cfg(unix)]
-fn entry_kind(metadata: &Metadata) -> Option<EntryKind> {
+pub(crate) fn entry_kind(metadata: &Metadata) -> Option<EntryKind> {
     use cap_std::fs::FileTypeExt as _;
     let kind = metadata.file_type();
     if kind.is_file() {
@@ -661,7 +661,7 @@ fn entry_kind(metadata: &Metadata) -> Option<EntryKind> {
 }
 
 #[cfg(not(unix))]
-fn entry_kind(metadata: &Metadata) -> Option<EntryKind> {
+pub(crate) fn entry_kind(metadata: &Metadata) -> Option<EntryKind> {
     let kind = metadata.file_type();
     if kind.is_file() {
         Some(EntryKind::File)

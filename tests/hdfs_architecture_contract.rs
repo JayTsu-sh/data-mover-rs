@@ -70,6 +70,8 @@ async fn observes_nested_source(storage: &Storage) -> TestResult<bool> {
         max_buffered_items: NonZeroUsize::new(2).ok_or("invalid buffer")?,
         observation_plan: ObservationPlan::default(),
         cancel: CancellationToken::new(),
+        filter: None,
+        max_depth: None,
     });
     let mut observed = false;
     while let Some(item) = session.next_item().await {

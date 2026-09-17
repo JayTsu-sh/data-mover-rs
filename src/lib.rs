@@ -25,6 +25,8 @@ pub mod dir_tree;
 pub mod error;
 pub use error::{HdfsErrorKind, HdfsOperationError};
 pub mod filter;
+mod filter_traversal;
+pub use filter_traversal::DslTraversalFilter;
 pub mod hdfs;
 mod hdfs_legacy_resume;
 mod hdfs_recoverable_copy;
