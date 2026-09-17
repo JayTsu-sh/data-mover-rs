@@ -80,6 +80,12 @@ serde_json = "1"
 tempfile = "3"
 tokio = { version = "1.51.1", features = ["test-util"] }
 
+# 546 个依赖里几乎不会去单步调试，本 crate 自己的代码不受影响。
+# 这是 dev 产物体积的大头，且完全可移植。
+# 调试信息不再复制进每个产物，见 .cargo/config.toml (只对 unix 生效)。
+[profile.dev.package."*"]
+debug = 0
+
 [lints.rust]
 unsafe_code = "deny"
 

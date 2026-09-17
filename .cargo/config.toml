@@ -1,0 +1,7 @@
+# 这个 workspace 的 dev 产物是几十个测试/示例二进制，每个都会复制一份完整 DWARF。
+# unpacked 把调试信息留在 .o/.dwo 里由二进制引用，调试能力不变，产物不再各存一份。
+#
+# 放在这里而不是 [profile.dev]，是因为 profile 不能按 target 区分，而
+# `-Csplit-debuginfo=unpacked` 在 windows-msvc 上不被接受。
+[target.'cfg(unix)']
+rustflags = ["-Csplit-debuginfo=unpacked"]
