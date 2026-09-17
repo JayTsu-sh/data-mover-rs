@@ -104,6 +104,10 @@ pub struct TraversalRequest {
 ///
 /// The leading `./` that the Local enumerator produces for a root-relative walk is stripped, so
 /// a `path` expression written against the scan root matches on every backend.
+///
+/// The root only matches on a component boundary. A raw string prefix would rewrite a sibling
+/// that merely starts with the root's spelling — `keeper/a` under root `keep` would become
+/// `er/a` — which silently corrupts both the emitted path and anything matched against it.
 pub(crate) fn relative_to<'a>(root: &StoragePath, path: &'a StoragePath) -> &'a str {
     let value = path.as_str().strip_prefix("./").unwrap_or(path.as_str());
     let root = root.as_str();
@@ -112,6 +116,7 @@ pub(crate) fn relative_to<'a>(root: &StoragePath, path: &'a StoragePath) -> &'a 
     }
     value
         .strip_prefix(root)
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
         .map_or(value, |rest| rest.trim_start_matches('/'))
 }
 
@@ -131,6 +136,20 @@ mod relative_tests {
         assert_eq!(relative_to(&path("keep"), &path("./keep/a/b")), "a/b");
         // A path outside the root keeps its own spelling rather than being silently truncated.
         assert_eq!(relative_to(&path("keep"), &path("other/a")), "other/a");
+    }
+
+    #[test]
+    fn a_sibling_sharing_the_roots_spelling_is_not_rewritten() {
+        // `keeper` merely starts with `keep`; it is not inside it. A raw string prefix would
+        // have turned this into `er/a`, corrupting the emitted path and every expression
+        // matched against it.
+        assert_eq!(relative_to(&path("keep"), &path("keeper/a")), "keeper/a");
+        assert_eq!(relative_to(&path("keep"), &path("keeper")), "keeper");
+        assert_eq!(relative_to(&path("a/b"), &path("a/bc/d")), "a/bc/d");
+        // The root itself rebases to the empty path, which is the traversal root's own name.
+        assert_eq!(relative_to(&path("keep"), &path("keep")), "");
+        // A deeper match still rebases normally.
+        assert_eq!(relative_to(&path("a/b"), &path("a/b/c")), "c");
     }
 }
 
