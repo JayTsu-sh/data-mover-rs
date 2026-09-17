@@ -12,8 +12,8 @@
 - backend 使用 smb-rs domain facade：`Client → Session → Share → File / Directory`。
 - data-mover 不得重新依赖 smb-rs 的 connection、runtime、wire create/query/set 类型或协议 handle。
 - `smb_domain::protocol` 只允许用于 lossless ACL codec 等明确的协议值边界，普通 I/O 不使用。
-- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = dbf1d31... }`
-  (已随 smb-rs PR #70 / #71 合入 main；= `18ed91d` + `feat(domain): expose directory rename` +
+- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = 53057c4... }`
+  (smb-rs main 顶端 = PR #70 + PR #71：`18ed91d` + `feat(domain): expose directory rename` +
   `feat(facade): expose guest session policy` + `refactor(smb): remove dead protocol paths hidden
   by dead_code allows`，后者删掉约 2400 行从未接线的 lease-slot 缓存 /
   multichannel 残留 / 未用协议 helper，`runtime/port.rs` 的 `Legacy*` 别名改为 `Protocol*`)。不得改成浮动 branch。`[patch.crates-io] smb` 与
