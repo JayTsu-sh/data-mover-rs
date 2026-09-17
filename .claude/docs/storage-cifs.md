@@ -168,7 +168,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 | 符号链接 | NFS 建的 UNIX symlink 在 SMB 列举里始终是 0 字节普通文件，不带 reparse 标记。share `symlink-properties` 为空 (本 share 默认)：`open` → `STATUS_ACCESS_DENIED`，role Stat → `PermissionDenied` (ONTAP 文档化行为)；临时设为 `enable`：服务端跟随，悬空链接呈现为 len=0 的 File，Stat → File。两种配置下客户端都无法识别它是链接；smb-rs 也无 `FSCTL_GET_REPARSE_POINT` | **不实现**。`ReadLink` 保持 typed `Unsupported`；遍历遇到时按 entry failure (PermissionDenied) 隔离，不中断 |
 | ACL | query 正常 (2.9 KB SD 含 DACL)；显式/继承合并路径下 policy contract 通过 | **已实现** (见 Metadata observation) |
 | uid/gid/mode | facade `ResourceMetadata` 只有 4 个时间 + len；服务端 unix 卷由 name-mapping 决定 mode | **不实现**，矩阵改 `unsupported` |
-| 时钟 / 精度 | 服务器比本机快 ~550 ms (2026-09-16)、1624 ms (2026-09-17)；written 时间戳 100 ns 对齐 | 无需 `probe_server_time`。偏差量级本身不稳定，跨端比较必须按两侧较粗精度 + 容差，不能按纳秒 |
+| 时钟 / 精度 | **偏的是本机，不是服务器**：ONTAP 同步 `ntp1.aliyun.com`，直接查同一 NTP 源本机慢 1.75-1.9 s，REST 查两节点也是本机慢 1.24 s+；探测报的 +550 ms (09-16) / +1624 ms (09-17) 是 WSL2 时钟漂移量。WSL2 内没有 NTP 客户端 (`timedatectl` NTP service: n/a，clocksource `tsc`)，宿主 PTP 源 (`ptp0`/hyperv) 无人用于校准，所以偏差随开机时长累积。written 时间戳 100 ns 对齐 | 无需 `probe_server_time` —— 需要担心的从来不是服务端。本机时钟只被 filter DSL 的相对时间表达式用到 (天级，2 s 误差无感)；所有影响正确性的比较都是服务端对服务端。探测那行的措辞 `server clock skew vs local` 量的其实是本机漂移 |
 | 根目录列举 | 7-8 项 7-60 ms | — |
 | 列举元数据密度 | `DirectoryEntry` 自 smb-rs #72 起带四个时间戳 + 只读 / reparse 属性；handle 侧 `ResourceMetadata` 仍只有四个时间 + len | **已实现**：`SourceDescriptor::inline_timestamps`，遍历只要时间戳时不再每条目多发一次 `Metadata::observe` |
 | 递归删除 | 11 个条目 (6 文件 + 5 目录，四层深) 一次删净：文件并发、目录由深到浅、根最后，零失败，事后列举无残留 | **已实现** (`storage::delete_tree`) |
