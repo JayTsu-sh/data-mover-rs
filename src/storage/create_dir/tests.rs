@@ -172,8 +172,8 @@ impl Namespace for FakeNamespace {
                 } else {
                     return Err(entry_failure(&path, FailureClass::NotFound));
                 };
-                let entry =
-                    descriptor(&path, kind).map_err(|_| entry_failure(&path, FailureClass::Protocol))?;
+                let entry = descriptor(&path, kind)
+                    .map_err(|_| entry_failure(&path, FailureClass::Protocol))?;
                 Ok(NamespaceResult::Entries(vec![entry]))
             }
             other => {
@@ -195,15 +195,17 @@ fn path(value: &str) -> Result<StoragePath> {
 async fn every_missing_component_is_created_in_order() -> Result {
     let namespace = FakeNamespace::new(ExistingBehaviour::Conflict);
     create_directory_all_with_namespace(namespace.as_ref(), &path("a/b/c")?).await?;
-    assert_eq!(namespace.calls(), vec!["mkdir a", "mkdir a/b", "mkdir a/b/c"]);
+    assert_eq!(
+        namespace.calls(),
+        vec!["mkdir a", "mkdir a/b", "mkdir a/b/c"]
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn an_existing_tree_is_a_success_whichever_way_the_backend_reports_it() -> Result {
     for existing in [ExistingBehaviour::Conflict, ExistingBehaviour::Completed] {
-        let namespace =
-            FakeNamespace::with_existing_directories(existing, &["a", "a/b", "a/b/c"]);
+        let namespace = FakeNamespace::with_existing_directories(existing, &["a", "a/b", "a/b/c"]);
         create_directory_all_with_namespace(namespace.as_ref(), &path("a/b/c")?).await?;
         assert!(
             namespace.calls().contains(&"mkdir a/b/c".to_owned()),

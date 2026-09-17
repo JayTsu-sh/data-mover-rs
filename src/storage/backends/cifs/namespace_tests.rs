@@ -415,11 +415,7 @@ impl CifsNamespaceProtocol for ListingProtocol {
         Ok(())
     }
 
-    async fn rename_entry(
-        &self,
-        _from: &StoragePath,
-        _to: &StoragePath,
-    ) -> smb_domain::Result<()> {
+    async fn rename_entry(&self, _from: &StoragePath, _to: &StoragePath) -> smb_domain::Result<()> {
         Ok(())
     }
 }
@@ -451,13 +447,7 @@ async fn listing_derives_mode_from_the_read_only_attribute_per_entry() -> Result
         .collect();
     assert_eq!(
         observed,
-        vec![
-            Some(0o444),
-            Some(0o644),
-            Some(0o555),
-            Some(0o755),
-            None,
-        ],
+        vec![Some(0o444), Some(0o644), Some(0o555), Some(0o755), None,],
         "a record without the attribute stays None instead of claiming the entry is writable"
     );
     Ok(())

@@ -290,8 +290,7 @@ async fn ndx_rises_monotonically_and_each_page_reserves_its_gap_slot() -> Result
             .map(|entry| entry.ndx)
             .collect();
         assert_eq!(
-            page.ndx_start,
-            entries[0],
+            page.ndx_start, entries[0],
             "ndx_start names the first entry of page '{}'",
             page.dir_path
         );
@@ -360,7 +359,13 @@ async fn a_subtree_root_rebases_emitted_paths_and_still_lists_the_backend_path()
     let emitted: Vec<String> = pages
         .iter()
         .flat_map(|page| page.files.iter().chain(page.subdirs.iter()))
-        .map(|entry| entry.entry.get_relative_path().to_string_lossy().into_owned())
+        .map(|entry| {
+            entry
+                .entry
+                .get_relative_path()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     assert_eq!(
         emitted,
@@ -379,7 +384,10 @@ async fn max_depth_limits_how_deep_directories_are_listed() -> Result {
         walk_request.max_depth = depth.and_then(NonZeroUsize::new);
         let (pages, _) = drain(&ndx_walk(&storage, walk_request)?).await;
         let visited: Vec<&str> = pages.iter().map(|page| page.dir_path.as_str()).collect();
-        assert_eq!(visited, expected, "max_depth {depth:?} listed the wrong set");
+        assert_eq!(
+            visited, expected,
+            "max_depth {depth:?} listed the wrong set"
+        );
     }
 
     let namespace = TreeNamespace::new(sample_tree());
@@ -518,7 +526,10 @@ async fn entry_fields_follow_the_neutral_descriptor_and_path_extension_rules() -
         );
         assert_eq!(nas.mode, 0o644, "no inline mode falls back to the default");
         assert!(!nas.is_symlink, "listed entries are never links");
-        assert!(nas.file_handle.is_none(), "no protocol file id is available");
+        assert!(
+            nas.file_handle.is_none(),
+            "no protocol file id is available"
+        );
     }
     assert_eq!(
         extensions.get("archive.tar.gz"),
@@ -586,12 +597,8 @@ async fn a_storage_without_a_namespace_role_is_refused_before_any_listing() -> R
     let absent = CapabilityAvailability::Unsupported(UnsupportedReason::new(
         "Local lends no namespace role",
     )?);
-    let capabilities = BackendCapabilities::new(
-        absent.clone(),
-        absent.clone(),
-        absent.clone(),
-        absent,
-    );
+    let capabilities =
+        BackendCapabilities::new(absent.clone(), absent.clone(), absent.clone(), absent);
     let storage = Storage::connected(
         BackendIdentity::new(BackendKind::Local, "ndx-walk-no-namespace")?,
         capabilities,

@@ -20,7 +20,6 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand, ValueEnum};
 use data_mover::dir_tree::{NdxEntry, NdxEvent};
 use data_mover::filter::parse_filter_expression;
-use data_mover::{DslTraversalFilter, EntryEnum};
 use data_mover::integrity::{
     IntegrityMode, IntegrityOptions, IntegrityRequest, compare as compare_objects,
 };
@@ -37,6 +36,7 @@ use data_mover::traversal::{
     LocalTraversalSource, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest,
     TraversalSession, TraversalSource as _,
 };
+use data_mover::{DslTraversalFilter, EntryEnum};
 use tokio_util::sync::CancellationToken;
 
 type Error = Box<dyn std::error::Error>;
