@@ -55,10 +55,8 @@
 - **`[lints.rust]`**：`unsafe_code = deny`。新增 unsafe 必须有 SAFETY 注释 + PR 说明。
 - **异步**：tokio (full)。**错误**：thiserror。**日志**：tracing。
 - **依赖管理**：默认全 crates.io，无 `[patch.crates-io]` (与 terrasync-rs 不同)。升级 `smb-domain` / `nfs-rs` / `aws-sdk-s3` 是真实风险。
-  经项目授权的 git 固定：`smb-domain` (package `smb`) 固定 JayTsu-sh/smb-rs 提交
-  `c384253` (= main 顶端 `53057c4` + `feat(domain): expose listing timestamps and attributes on
-  DirectoryEntry`；**该提交还在 feature 分支 `feat/directory-entry-metadata` 上，合入 main 后
-  须按 D9 切回 main 上的提交**)，`hdfs-native` 固定 fork
+  经项目授权的 git 固定：`smb-domain` (package `smb`) 固定 JayTsu-sh/smb-rs 已验证提交
+  `7f45658` (smb-rs main 顶端，= PR #72 DirectoryEntry 列举元数据)，`hdfs-native` 固定 fork
   提交。不得使用浮动 branch。smb-rs 历史 API 依赖已随 legacy `CifsStorage` 删除 (#150)。
 
 ## 文件大小现状 (backlog，不是新增红线)

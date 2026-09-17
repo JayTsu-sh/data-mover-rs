@@ -72,7 +72,7 @@
 | Crate | 版本 | 用途 |
 |---|---|---|
 | tokio | 1.51.1 (full) | 异步 runtime |
-| smb-domain (package `smb`) | git JayTsu-sh/smb-rs `53057c4` (main) | CIFS/SMB 协议栈 (domain facade) |
+| smb-domain (package `smb`) | git JayTsu-sh/smb-rs `7f45658` (main) | CIFS/SMB 协议栈 (domain facade) |
 | nfs-rs | 0.2.0 | NFS v3/v4 客户端 |
 | aws-sdk-s3 | 1.129.0 | S3 SDK |
 | binrw | 0.15 | CIFS FileTime / 目录条目二进制解析 |
