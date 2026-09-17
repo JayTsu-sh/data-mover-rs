@@ -13,7 +13,7 @@
 | 元 | 含义 | 影响 |
 |---|---|---|
 | `should_skip: bool` | 当前条目是否跳过 | 单条目级别 |
-| `continue_scan: bool` | 是否继续扫这一层 | 同级兄弟节点 |
+| `continue_scan: bool` | 该目录是否继续往下扫 | 子目录递归 (仅对目录有意义) |
 | `check_children: bool` | 子项是否还需要过滤 | 子目录递归 |
 
 **三个分量独立**，不能互相推导。
@@ -25,6 +25,40 @@
 - `(false, false, false)` — 收当前条目，停止扫描，子项不过滤。
 
 **改 `should_skip` 前必须想清三个语义独立性**，并在 PR 描述中说明每种组合的预期行为。
+
+> `continue_scan` 是"要不要把这个目录排进待扫队列"，不是"要不要继续扫同级兄弟"。
+> 四个 legacy backend 的用法都是 `if is_dir && continue_scan { subdirs.push(..) }`；
+> 默认返回值 `(false, is_dir, true)` 对文件给 `false`，若解释成"同级"则每个文件都会终止本层扫描。
+
+### role-based traversal 的映射
+
+`crate::DslTraversalFilter` (`src/filter_traversal.rs`) 把三元组映射到
+`traversal::TraversalDecision`：
+
+| 三元组 | `TraversalDecision` |
+|---|---|
+| `should_skip` | `emit = !should_skip` |
+| `continue_scan` | `descend` |
+| `check_children` | `filter_children` |
+
+`filter_children = false` 是**传递性**的：整棵子树都不再调 `should_skip`，连 exclude 也绕过
+(legacy `dir_tree.rs` 的 `need_filter` 同语义)。
+
+`FilterInput` 各字段的取值口径（与 legacy walkdir 对齐）：
+
+| 字段 | 取值 |
+|---|---|
+| `file_path` | **相对遍历根**，`/` 分隔、无前导 `/`；Local 的 `./` 前缀会被剥掉。不是条目最终发布的 backend 相对路径 |
+| `file_name` | 最后一段 |
+| `file_type` | `file` / `dir` / `symlink` / `special` |
+| `extension` | 与 `Path::extension` 一致：最后一个 `.` 之后，且该 `.` 前必须有内容，所以 `.bashrc` 没有扩展名。永不为 `None` |
+| `size` | 目录取 `Some(0)`，否则 `size` 条件会退化成放行的 `LazyMatch` |
+
+**`modified` 缺失时不能先评估**：缺 `modified` 的 `Modified` 条件返回 `LazyMatch`，而
+`LazyMatch` 会被组合子吸收 (`Match & Lazy = Match`、`MisMatch | Lazy = MisMatch`)，
+结果既不是上界也不是下界 — 可能误剪枝，也可能误收。因此
+`FilterExpression::referenced_fields().modified` 为真时，traversal 先做元数据观察再决策
+(`TraversalFilter::needs_modified`)，绝不用缺 `modified` 的评估结果。
 
 ## 表达式形式
 
@@ -102,6 +136,13 @@ walkdir 流水线
 ```
 
 walk_scheduler 不感知 filter — filter 是 walkdir 实现层调的，走 enum dispatch 后由各 backend 注入。
+
+role-based 路径同理：`traversal` 模块不依赖 `crate::filter` (架构依赖校验禁止)，
+只认 `TraversalFilter` trait；DSL 适配器在 crate 根的 `src/filter_traversal.rs`。
+
+两个遍历实现都接这个接缝：Local 走 `traversal::LocalTraversalSource` (它没有 Namespace 角色，
+枚举在 cap-std 沙箱里)，其余 backend 走 `traversal::StorageTraversalSource`。
+可运行入口见 `examples/storage_role_operations.rs`。
 
 ## 已知陷阱
 

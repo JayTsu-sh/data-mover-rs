@@ -90,7 +90,14 @@ CIFS 只有 role-based 实现，不经过 `StorageError`；映射表在
 | `STATUS_NOT_IMPLEMENTED` / `STATUS_NOT_SUPPORTED` / `STATUS_DEVICE_FEATURE_NOT_SUPPORTED` | `Unsupported` | Permanent |
 | `STATUS_CANCELLED` | `Cancelled` | Transient |
 | `STATUS_IO_TIMEOUT` / `STATUS_NETWORK_NAME_DELETED` / `STATUS_NETWORK_SESSION_EXPIRED` | `Connectivity` (session failure) | Transient |
+| `STATUS_NOT_A_DIRECTORY` (0xC0000103，目录 open 命中文件) | `Conflict` | Permanent |
+| `STATUS_CANNOT_DELETE` (0xC0000121) | `PermissionDenied` | **Unknown** |
 | 其他 NTSTATUS / 非状态类 smb 错误 | `Protocol` | Unknown |
+
+最后两个状态不在固定的 smb-rs `Status` 枚举里，`classify_status` 先按裸 `u32` 匹配，再走
+`Status::try_from`。`STATUS_CANNOT_DELETE` 的 transience 是 `Unknown` 而不是 `Permanent`：
+只读属性是永久的，但被映射/占用的文件会自己恢复，服务端不区分两者，写死 `Permanent` 会让
+后者永远不重试。
 
 非状态类 smb-rs 错误：`NotFound` → NotFound；`MissingPermissions` → PermissionDenied；
 `InvalidArgument` → InvalidInput；`UnsupportedOperation` → Unsupported；`Cancelled` → Cancelled；

@@ -26,8 +26,11 @@
 | 改 S3 multipart / 404 / credential | `.claude/docs/storage-s3.md` + `src/s3.rs` |
 | 改 Local rayon delete / Win ACL | `.claude/docs/storage-local.md` + `src/local.rs` + `src/acl.rs` |
 | **新增/修改 `StorageEnum` 操作** | `.claude/docs/storage-enum-dispatch.md` + `src/storage_enum.rs` (1334 行) |
-| 改 filter DSL (lexer / `should_skip` 三元组) | `.claude/docs/filter-dsl.md` + `src/filter.rs` (4849 行) |
+| 改 filter DSL (lexer / `should_skip` 三元组) | `.claude/docs/filter-dsl.md` + `src/filter.rs` (4849 行) + `src/filter_traversal.rs` (role-based 适配器) |
 | 改 walk 调度 / work-stealing | `.claude/docs/walk-scheduler.md` + `src/walk_scheduler.rs` + `src/async_receiver.rs` |
+| 改 role-based 遍历 (filter / max_depth / inline 观察) | `src/traversal/{mod,storage,local}.rs` + `src/filter_traversal.rs` + `examples/storage_role_operations.rs` |
+| 改递归删除 | `src/storage/delete_tree.rs` (走 `Namespace` 角色，backend 无关) |
+| 改跨端完整性比对 | `src/integrity/mod.rs` (走 `ReadSource` + `Metadata` 角色) |
 | 改 error 变体或 retry 映射 | `.claude/docs/error-taxonomy.md` + `src/error.rs` |
 | 改时间转换 (FileTime / NFS Time) | `src/time_util.rs` (单文件直读) |
 | 改 ACL / xattr | `src/acl.rs` + `.claude/docs/storage-{nfs,local}.md` |

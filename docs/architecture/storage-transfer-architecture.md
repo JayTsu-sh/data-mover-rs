@@ -265,6 +265,14 @@ result. POSIX access/default ACL and xattr requests use separate capability-open
 calls and therefore run only for `BestEffort` or `Required`; ACL storage attributes are excluded
 from the general xattr family. Optional metadata never follows a symlink target.
 The observation plan is carried once by the traversal request and applies to every admitted entry.
+A traversal may also carry an admission policy (`TraversalFilter`) and a depth bound. The policy
+decides, per enumerated child, whether the entry is emitted, whether the directory is listed, and
+whether the policy still applies below it; a directory that is not emitted may still be listed, and
+a subtree admitted unconditionally is never consulted again. The policy is expressed as a trait, so
+traversal stays independent of any expression language. When a policy needs the modification time,
+the traversal observes the entry before deciding and, if the plan omitted timestamps, raises them to
+`InlineOnly` for that traversal; it never evaluates a policy against an absent timestamp. A listing
+that already returns timestamps satisfies a timestamps-only plan without a second call.
 All states, provenance, empty values, and failures are retained in the opaque entry snapshot.
 
 ### Traversal contract
@@ -639,6 +647,8 @@ identity. A backend performs only safe protocol retries; terrasync owns job retr
 | NFS export and S3 bucket discovery | Keep on concrete backend interfaces |
 | verified StorageGRID/DXN/NFS/HDFS/CIFS quirks | Keep inside owning backend adapter |
 | tar manifests/orchestration, DB/job retry/redo/requeue | Move to terrasync |
+| per-backend `delete_dir_all_with_progress` | Replace with one `Namespace`-role recursive delete |
+| per-backend integrity comparison over the storage enum | Replace with the `integrity` module over `ReadSource` + `Metadata` |
 
 Migration is architecture-first and coordinated:
 

@@ -41,12 +41,25 @@ legacy `CifsStorage` 中以下能力在 role-based backend 里**没有**对应�
   SMB2 `FileRenameInformation` 对目录句柄同样有效)。`ReadLink` 返回 typed `Unsupported`：
   facade 不暴露 reparse point，且 FAS2750 实测见下文"真实环境证据"。
   已存在目录再 `CreateDirectory` → `Conflict` (与 Local 的 AlreadyExists 一致)，不再像 legacy
-  `mkdir_or_open` 那样吞掉 COLLISION；递归删除带进度 (`delete_dir_all_with_progress`) 与
-  `ensure_root_exists` 归调用方编排。
-- 遍历由通用 `traversal::StorageTraversalSource` 驱动，纯递归；filter DSL 剪枝、`max_depth`、
-  packaged/NDX 分页、work-stealing 归 terrasync。
-- 无 128-bit file id / info-class 探测；source identity 是 `len + written + changed`
+  `mkdir_or_open` 那样吞掉 COLLISION。
+- 递归删除带进度 (legacy `delete_dir_all_with_progress`) 现在是 backend 无关的
+  `storage::delete_tree`：走 `Namespace` 角色，先并发删非目录条目，再按深度由深到浅删目录。
+  `Delete` 返回 `NotFound` 记成功 (SMB 在 CLOSE 时才真正移除，close 应答丢失会让条目已经消失)；
+  有后代删不掉的目录不再下发 `Delete`，只报一次 `Conflict`；取消时等待在途删除完成，不 abort。
+- 根子路径自动创建 (legacy `ensure_root_exists`) 由 `CifsBackendConfig.ensure_dir` 控制
+  (与 NFS / HDFS 的 `ensure_dir` 对齐)。`true` 时连接阶段补齐缺失层级：根存在只花一次 open，
+  缺失才逐级探测 + `create_new`，COLLISION 视为竞争成功，某层是文件则连接失败。
+  `false` 不探测根，行为与之前一致。
+- 遍历由通用 `traversal::StorageTraversalSource` 驱动；filter DSL 剪枝与 `max_depth` 经
+  `TraversalRequest.filter` / `.max_depth` 注入 (适配器 `crate::DslTraversalFilter`)。
+  packaged/NDX 分页、work-stealing 仍归上层编排。
+- 无 128-bit file id / info-class 探测；source identity 是
+  `len + written + changed` (目录 len 记 0)，`describe` / `open` / `metadata` / `list` 四条路径
+  共用 `protocol::identity_bytes` 同一套字节，互相可比
   (矩阵 `hardlink_topology: unsupported`，路径级 identity 足够)。
+- 目录列举带回 `FILE_DIRECTORY_INFORMATION` 里已有的四个时间戳，挂在
+  `SourceDescriptor::inline_timestamps` 上；`ObservationPlan` 只要时间戳时，遍历直接用它，
+  不再对每个条目多发一次 `Metadata::observe` (N+1 → 1)。
 - 无 `check_connectivity` / `probe_server_time`；`Metadata` 只支持 `Timestamps` 与 `Acl`，
   numeric uid/gid/mode 标为 `Unsupported`：SMB 不暴露 POSIX mode，FAS2750 unix 卷上的 mode 由
   服务端 name-mapping + umask 决定 (session 里 `mapped_unix_user=lisauser`)，客户端无法观察/应用。
@@ -195,6 +208,8 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 | 陷阱 | 应对 |
 |---|---|
 | Samba `STATUS_ACCESS_DENIED` on write | smb-domain open options 用 OverwriteIf 语义 |
+| 目录 len 在列举与句柄查询上不一致 | 列举报 0，目录句柄报索引分配量；identity 对目录一律记 0 |
+| `STATUS_NOT_A_DIRECTORY` / `STATUS_CANNOT_DELETE` 不在 smb-rs `Status` 枚举里 | `classify_status` 先按裸 u32 匹配，映射到 `Conflict` / `PermissionDenied` |
 | Rename 用 UNC 路径失败 | 改 share-relative (smb-domain 已封装) |
 | 服务器要求签名 | 始终遵守；`CifsSigningPolicy::Required` 可强制 |
 | 未知用户/空密码报 "Message not signed ... signing is required" | 服务端做了 guest 映射，会话无法签名；需要 `CifsGuestPolicy::AllowUnsigned` (注意无完整性保护) |
