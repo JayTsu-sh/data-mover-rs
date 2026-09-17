@@ -151,7 +151,7 @@ result
 - mkdir 时 `STATUS_OBJECT_NAME_COLLISION` 应视为成功 (commit `4061`)。
 - 目录列举优先 `FileIdExtdDirectory` (128-bit id)，`FileIdBothDirectory` 只有 64-bit (commit `b1b9db1`)。
 
-## 真实环境证据 (FAS2750 / ONTAP 9.19.1，2026-09-16)
+## 真实环境证据 (FAS2750 / ONTAP 9.19.1，2026-09-16，2026-09-17 复测)
 
 来源：`tests/cifs_capability_probe.rs` (`[probe]` 行)、`tests/cifs_namespace_contract.rs`、
 `tests/cifs_policy_contract.rs` 与 ONTAP REST。share `ontap_lisaauto_cifs` (SVM `lizy`，AD 域
@@ -168,10 +168,19 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 | 符号链接 | NFS 建的 UNIX symlink 在 SMB 列举里始终是 0 字节普通文件，不带 reparse 标记。share `symlink-properties` 为空 (本 share 默认)：`open` → `STATUS_ACCESS_DENIED`，role Stat → `PermissionDenied` (ONTAP 文档化行为)；临时设为 `enable`：服务端跟随，悬空链接呈现为 len=0 的 File，Stat → File。两种配置下客户端都无法识别它是链接；smb-rs 也无 `FSCTL_GET_REPARSE_POINT` | **不实现**。`ReadLink` 保持 typed `Unsupported`；遍历遇到时按 entry failure (PermissionDenied) 隔离，不中断 |
 | ACL | query 正常 (2.9 KB SD 含 DACL)；显式/继承合并路径下 policy contract 通过 | **已实现** (见 Metadata observation) |
 | uid/gid/mode | facade `ResourceMetadata` 只有 4 个时间 + len；服务端 unix 卷由 name-mapping 决定 mode | **不实现**，矩阵改 `unsupported` |
-| 时钟 / 精度 | 服务器比本机快 ~550 ms；written 时间戳 100 ns 对齐 | 无需 `probe_server_time` |
-| 根目录列举 | 7 项 8–60 ms | — |
+| 时钟 / 精度 | 服务器比本机快 ~550 ms (2026-09-16)、1624 ms (2026-09-17)；written 时间戳 100 ns 对齐 | 无需 `probe_server_time`。偏差量级本身不稳定，跨端比较必须按两侧较粗精度 + 容差，不能按纳秒 |
+| 根目录列举 | 7-8 项 7-60 ms | — |
+| 列举元数据密度 | `DirectoryEntry` 自 smb-rs #72 起带四个时间戳 + 只读 / reparse 属性；handle 侧 `ResourceMetadata` 仍只有四个时间 + len | **已实现**：`SourceDescriptor::inline_timestamps`，遍历只要时间戳时不再每条目多发一次 `Metadata::observe` |
+| 递归删除 | 11 个条目 (6 文件 + 5 目录，四层深) 一次删净：文件并发、目录由深到浅、根最后，零失败，事后列举无残留 | **已实现** (`storage::delete_tree`) |
+| 根子路径自动创建 | 一次创建三层 `a/nested/deep`；对已存在父级再建子目录复用不报错 | **已实现** (`ensure_dir`) |
+| filter / max_depth 剪枝 | `max_depth=1` 只列举一层；`path == "sub/**"` 只收子目录内容 (sub 本身 PartialMatch 隐藏但下潜)；`exclude name == ...` 在两层同名文件上都生效 | **已实现** (`TraversalRequest.filter` / `.max_depth`) |
+| 跨端完整性比对 | 同一对象完全一致；跨目录副本报出 Size + Modified + Content | **已实现** (`integrity::compare`) |
 
-复现：`.claude/skills/e2e-cifs` (`CIFS_REAL_*`)。symlink probe 需要 `CIFS_PROBE_NFS_URL`
+复现：`.claude/skills/e2e-cifs` (`CIFS_REAL_*`)。新能力的真机链路用
+`examples/storage_role_operations` 的 `seed → traverse → compare → delete-tree`。
+注意 `CIFS_POLICY_TEST_BYTES` 里的 64 MiB **等于**默认 checkpoint 间隔，日志会是
+`SkippedBelowCheckpointThreshold`；要真正压到恢复路径需给一个更大的值 (实测 192 MiB 起
+`recovery=Checkpointed`)。symlink probe 需要 `CIFS_PROBE_NFS_URL`
 (`nfs://<lif>/<vol>:/?uid=0&gid=0&noresvport=true`)；WSL2 NAT 会改写源端口，ONTAP
 `mount_root_only=true` 时会 `AUTH_TOOWEAK`，测试期间需临时关闭并事后恢复。
 
