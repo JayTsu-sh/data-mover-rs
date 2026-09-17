@@ -476,6 +476,8 @@ async fn fill_read_pipeline(state: &mut LocalReadState) -> Result<(), StorageRol
         let cancel = state.cancel.clone();
         #[cfg(test)]
         let probe = Arc::clone(&state.probe);
+        #[cfg(test)]
+        probe.on_submit();
         // Submit the blocking read immediately, including while later QoS admissions await.
         // A second asynchronous task per chunk only adds scheduling and wakeups.
         #[cfg(test)]
@@ -501,12 +503,25 @@ async fn fill_read_pipeline(state: &mut LocalReadState) -> Result<(), StorageRol
 
 #[cfg(test)]
 impl ReadProbe {
+    /// Records one read entering the in-flight window, at submission rather than at execution.
+    ///
+    /// "In flight" is what the pipeline actually controls: `fill_read_pipeline` submits up to
+    /// `read_concurrency` reads before awaiting any completion. Counting from the moment the
+    /// blocking thread starts running instead measured how the blocking pool happened to
+    /// interleave, so a short read could finish before the next one was scheduled and the peak
+    /// would land below the window size under load — a race in the observation, not in the
+    /// pipeline.
+    fn on_submit(&self) {
+        use std::sync::atomic::Ordering;
+
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(active, Ordering::SeqCst);
+    }
+
     async fn before_read(&self, offset: u64) {
         use std::sync::atomic::Ordering;
 
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-        self.peak.fetch_max(active, Ordering::SeqCst);
         let gate = self
             .gates
             .lock()

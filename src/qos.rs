@@ -1248,11 +1248,22 @@ mod tests {
         assert!(burst_elapsed < Duration::from_millis(180));
 
         // Once credit is consumed, the schedule returns to the 20 IOPS soft rate.
+        //
+        // The bound is derived from the credit ceiling rather than from the credit the burst
+        // happens to leave behind. Credit never exceeds `credit_capacity` (8 here), so of these
+        // 16 operations at most 8 can be released against credit; the other 8 are paced by the
+        // 20 IOPS soft rate at 50 ms each, which is 400 ms even in the worst case. Measuring
+        // only 4 operations made the assertion depend on how long the burst above took: every
+        // extra millisecond there regenerates 0.02 credit, and the nominal total sat exactly on
+        // the 120 ms bound, so a loaded machine drove it under.
         let sustained_started = Instant::now();
-        for _ in 0..4 {
+        for _ in 0..16 {
             qos.acquire_iops().await;
         }
-        assert!(sustained_started.elapsed() >= Duration::from_millis(120));
+        assert!(
+            sustained_started.elapsed() >= Duration::from_millis(400),
+            "at most `credit_capacity` of 16 operations may skip the soft rate"
+        );
     }
 
     #[test]

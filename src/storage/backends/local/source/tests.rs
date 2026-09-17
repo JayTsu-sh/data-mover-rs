@@ -197,7 +197,7 @@ async fn one_stream_reads_inflight_but_emits_in_admission_order()
         (first, stream)
     });
     gate.wait_started().await;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while source.read_completion_order().len() < 2 {
         if tokio::time::Instant::now() >= deadline {
             return Err("later inflight reads did not complete".into());
@@ -215,11 +215,18 @@ async fn one_stream_reads_inflight_but_emits_in_admission_order()
         chunks.push(bytes);
     }
 
-    assert_eq!(source.peak_read_concurrency(), 3);
+    assert_eq!(
+        source.peak_read_concurrency(),
+        3,
+        "the whole window is submitted before any completion is awaited"
+    );
     assert_eq!(source.read_call_count(), 3);
     let completion_order = source.read_completion_order();
     assert_eq!(completion_order.len(), 3);
-    assert_ne!(completion_order[0], 0);
+    assert_ne!(
+        completion_order[0], 0,
+        "a later read completes first while the first one is held"
+    );
     assert_eq!(chunks.len(), 3);
     assert!(chunks[0].iter().all(|byte| *byte == 0x11));
     assert!(chunks[1].iter().all(|byte| *byte == 0x22));
