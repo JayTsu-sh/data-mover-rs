@@ -8,6 +8,7 @@ pub(crate) mod durability;
 mod factory;
 mod handle;
 mod native;
+mod ndx_walk;
 mod roles;
 
 pub(crate) use native::{
@@ -31,6 +32,7 @@ pub use factory::{
     HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, connect_backend,
 };
 pub use handle::Storage;
+pub use ndx_walk::{NdxWalkRequest, ndx_walk};
 pub use roles::{
     ByteStream, CheckpointObservation, CopiedMetadataObservation, CopiedMetadataTarget,
     CopiedOwnershipTarget, FinalDestination, Metadata, MetadataMutation, Namespace,

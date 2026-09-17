@@ -1,12 +1,15 @@
 //! Role-based entry point for the operations that have no `StorageEnum` equivalent:
-//! filtered / depth-limited traversal, recursive delete, and cross-endpoint integrity.
+//! filtered / depth-limited traversal, NDX paging, recursive delete, and cross-endpoint
+//! integrity.
 //!
-//! Local lends no namespace role, so `delete-tree` needs a NAS backend; `traverse` and
-//! `compare` work anywhere.
+//! Local lends no namespace role, so `delete-tree` and `ndx-walk` need a NAS backend;
+//! `traverse` and `compare` work anywhere.
 //!
 //! ```text
 //! cargo run --example storage_role_operations -- traverse --backend local --root /tmp/tree \
 //!     --match 'name == "*.log"' --max-depth 2
+//! cargo run --example storage_role_operations -- ndx-walk --backend cifs --path scratch \
+//!     --entries
 //! cargo run --example storage_role_operations -- delete-tree --backend cifs --path scratch/old
 //! cargo run --example storage_role_operations -- compare --backend local --root /tmp/a \
 //!     --other-root /tmp/b --path object.bin --content
@@ -15,7 +18,9 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use data_mover::DslTraversalFilter;
+use data_mover::dir_tree::{NdxEntry, NdxEvent};
+use data_mover::filter::parse_filter_expression;
+use data_mover::{DslTraversalFilter, EntryEnum};
 use data_mover::integrity::{
     IntegrityMode, IntegrityOptions, IntegrityRequest, compare as compare_objects,
 };
@@ -24,7 +29,8 @@ use data_mover::model::{
 };
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, DeleteTreeItem,
-    DeleteTreeRequest, LocalBackendConfig, NfsBackendConfig, Storage, connect_backend, delete_tree,
+    DeleteTreeRequest, LocalBackendConfig, NdxWalkRequest, NfsBackendConfig, Storage,
+    connect_backend, delete_tree, ndx_walk,
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
@@ -72,6 +78,21 @@ enum Command {
         /// Sub-path to start from, relative to the backend root.
         #[arg(long, default_value = "")]
         path: String,
+    },
+    /// Stream an NDX-paged depth-first traversal, printing one line per page.
+    NdxWalk {
+        #[arg(long = "match")]
+        match_expression: Option<String>,
+        #[arg(long = "exclude")]
+        exclude_expression: Option<String>,
+        #[arg(long)]
+        max_depth: Option<usize>,
+        /// Sub-path to start from, relative to the backend root.
+        #[arg(long, default_value = "")]
+        path: String,
+        /// Also print every entry with its NDX and mode.
+        #[arg(long)]
+        entries: bool,
     },
     /// Write a small fixture tree under the root, so the other subcommands have something
     /// to work on. Each file is transferred from a local temporary directory.
@@ -193,6 +214,81 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
     Ok(())
 }
 
+async fn ndx_walk_pages(storage: &Storage, args: &Args, command: &Command) -> Result<(), Error> {
+    let Command::NdxWalk {
+        match_expression,
+        exclude_expression,
+        max_depth,
+        path,
+        entries: print_entries,
+    } = command
+    else {
+        unreachable!("dispatched by the caller")
+    };
+    let walk = ndx_walk(
+        storage,
+        NdxWalkRequest {
+            root: StoragePath::new(path.clone())?,
+            max_depth: max_depth.and_then(NonZeroUsize::new),
+            match_expressions: match_expression
+                .as_deref()
+                .map(parse_filter_expression)
+                .transpose()?,
+            exclude_expressions: exclude_expression
+                .as_deref()
+                .map(parse_filter_expression)
+                .transpose()?,
+            concurrency: NonZeroUsize::new(args.concurrency)
+                .ok_or("concurrency must be non-zero")?,
+        },
+    )?;
+    let (mut pages, mut counted, mut failures) = (0_u64, 0_u64, 0_u64);
+    while let Some(event) = walk.next().await {
+        match event {
+            NdxEvent::Page(page) => {
+                pages += 1;
+                counted += page.files.len() as u64 + page.subdirs.len() as u64;
+                println!(
+                    "page dir='{}' ndx_start={} files={} subdirs={} gap={}",
+                    page.dir_path,
+                    page.ndx_start,
+                    page.files.len(),
+                    page.subdirs.len(),
+                    page.gap_ndx
+                );
+                if *print_entries {
+                    for entry in page.files.iter().chain(page.subdirs.iter()) {
+                        print_ndx_entry(entry);
+                    }
+                }
+            }
+            NdxEvent::Error { path, reason } => {
+                failures += 1;
+                eprintln!("page error {path}: {reason}");
+            }
+            NdxEvent::Done => break,
+        }
+    }
+    println!("pages={pages} entries={counted} errors={failures}");
+    Ok(())
+}
+
+fn print_ndx_entry(entry: &NdxEntry) {
+    let EntryEnum::NAS(nas) = entry.entry.as_ref() else {
+        println!("  ndx={} {}", entry.ndx, entry.entry.get_name());
+        return;
+    };
+    println!(
+        "  ndx={} {} mode={:o} size={} mtime={} dir={}",
+        entry.ndx,
+        nas.relative_path.display(),
+        nas.mode,
+        nas.size,
+        nas.mtime,
+        nas.is_dir
+    );
+}
+
 async fn seed(storage: &Storage, args: &Args, command: &Command) -> Result<(), Error> {
     let Command::Seed { path, files, bytes } = command else {
         unreachable!("dispatched by the caller")
@@ -301,6 +397,7 @@ async fn main() -> Result<(), Error> {
     match &args.command {
         Command::Seed { .. } => seed(&storage, &args, &args.command).await,
         Command::Traverse { .. } => traverse(&storage, &args, &args.command).await,
+        Command::NdxWalk { .. } => ndx_walk_pages(&storage, &args, &args.command).await,
         Command::DeleteTree { .. } => remove_tree(&storage, &args, &args.command).await,
         Command::Compare { .. } => compare(storage, &args, &args.command).await,
     }

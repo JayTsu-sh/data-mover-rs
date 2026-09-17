@@ -1,0 +1,609 @@
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use async_trait::async_trait;
+
+use super::{NdxWalkRequest, ndx_walk};
+use crate::dir_tree::{DirPageResult, NdxEvent};
+use crate::model::{
+    BackendIdentity, BackendKind, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
+    Operation, SourceIdentity, StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata,
+    Transience,
+};
+use crate::storage::{
+    BackendCapabilities, CapabilityAvailability, Namespace, NamespaceRequest, NamespaceResult,
+    SourceDescriptor, Storage, StorageRoleFailure, UnsupportedReason,
+};
+
+type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+const MODIFIED_NANOS: i128 = 1_700_000_000_000_000_000;
+
+fn path(value: &str) -> Result<StoragePath> {
+    Ok(StoragePath::new(value)?)
+}
+
+/// How one directory's listing behaves.
+enum Listing {
+    /// Children as `(name, kind)`, listed with inline timestamps.
+    Entries(Vec<(&'static str, EntryKind)>),
+    /// Children listed without inline timestamps, as every non-CIFS backend does today.
+    WithoutTimestamps(Vec<(&'static str, EntryKind)>),
+    /// One unreadable directory.
+    EntryFailure,
+    /// A broken session.
+    SessionFailure,
+}
+
+struct TreeNamespace {
+    listings: HashMap<String, Listing>,
+    listed: Mutex<Vec<String>>,
+    non_list_requests: Mutex<Vec<String>>,
+}
+
+impl TreeNamespace {
+    fn new(listings: Vec<(&str, Listing)>) -> Arc<Self> {
+        Arc::new(Self {
+            listings: listings
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect(),
+            listed: Mutex::new(Vec::new()),
+            non_list_requests: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn listed(&self) -> Vec<String> {
+        self.listed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn non_list_requests(&self) -> Vec<String> {
+        self.non_list_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+fn descriptor(full_path: &str, kind: EntryKind, timestamps: bool) -> Result<SourceDescriptor> {
+    let descriptor = SourceDescriptor {
+        path: path(full_path)?,
+        kind,
+        size: (kind == EntryKind::File).then_some(3),
+        source_identity: SourceIdentity::new(
+            BackendIdentity::new(BackendKind::Cifs, "ndx-walk-test")?,
+            IdentityStrength::PathScoped,
+            full_path.as_bytes(),
+        )?,
+        backend_fact: None,
+        content_version: None,
+        inline_timestamps: None,
+        inline_mode: None,
+    };
+    if !timestamps {
+        return Ok(descriptor);
+    }
+    let stamp = StorageTimestamp::new(MODIFIED_NANOS, TimePrecision::Nanoseconds)?;
+    Ok(descriptor.with_inline_timestamps(TimestampMetadata {
+        accessed: Some(stamp),
+        modified: Some(stamp),
+        created: Some(stamp),
+    }))
+}
+
+fn children(
+    parent: &str,
+    entries: &[(&'static str, EntryKind)],
+    timestamps: bool,
+) -> Result<NamespaceResult> {
+    let mut built = Vec::new();
+    for (name, kind) in entries {
+        let full = if parent.is_empty() {
+            (*name).to_owned()
+        } else {
+            format!("{parent}/{name}")
+        };
+        built.push(descriptor(&full, *kind, timestamps)?);
+    }
+    Ok(NamespaceResult::Entries(built))
+}
+
+fn entry_failure(target: &StoragePath) -> StorageRoleFailure {
+    StorageRoleFailure::Entry(
+        EntryOperationFailure::new(
+            target.clone(),
+            Operation::Traverse,
+            FailureClass::PermissionDenied,
+            Transience::Permanent,
+            "listing refused by the test namespace",
+        )
+        .unwrap_or_else(|error| panic!("{error}")),
+    )
+}
+
+fn session_failure() -> StorageRoleFailure {
+    StorageRoleFailure::Session(
+        crate::model::BackendSessionFailure::new(
+            Operation::Traverse,
+            FailureClass::Connectivity,
+            Transience::Transient,
+            "test namespace session failed",
+        )
+        .unwrap_or_else(|error| panic!("{error}")),
+    )
+}
+
+#[async_trait]
+impl Namespace for TreeNamespace {
+    async fn execute(
+        &self,
+        request: NamespaceRequest,
+    ) -> std::result::Result<NamespaceResult, StorageRoleFailure> {
+        let NamespaceRequest::List(target) = request else {
+            self.non_list_requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(format!("{request:?}"));
+            return Err(entry_failure(&StoragePath::root()));
+        };
+        let key = target.as_str().to_owned();
+        self.listed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(key.clone());
+        match self.listings.get(&key) {
+            Some(Listing::Entries(entries)) => {
+                children(&key, entries, true).map_err(|_| entry_failure(&target))
+            }
+            Some(Listing::WithoutTimestamps(entries)) => {
+                children(&key, entries, false).map_err(|_| entry_failure(&target))
+            }
+            Some(Listing::EntryFailure) => Err(entry_failure(&target)),
+            Some(Listing::SessionFailure) => Err(session_failure()),
+            None => Ok(NamespaceResult::Entries(Vec::new())),
+        }
+    }
+}
+
+/// Only the namespace role is lent, which is all this adapter borrows.
+fn namespace_only_capabilities() -> Result<BackendCapabilities> {
+    let absent = CapabilityAvailability::Unsupported(UnsupportedReason::new(
+        "not lent by the ndx_walk test storage",
+    )?);
+    Ok(BackendCapabilities::new(
+        absent.clone(),
+        absent.clone(),
+        CapabilityAvailability::Supported,
+        absent,
+    ))
+}
+
+fn storage(namespace: Arc<TreeNamespace>) -> Result<Storage> {
+    let capabilities = namespace_only_capabilities()?;
+    Ok(Storage::connected(
+        BackendIdentity::new(BackendKind::Cifs, "ndx-walk-test")?,
+        capabilities,
+        None,
+        None,
+        Some(namespace),
+        None,
+        None,
+    )?)
+}
+
+fn request(root: StoragePath) -> Result<NdxWalkRequest> {
+    Ok(NdxWalkRequest {
+        root,
+        max_depth: None,
+        match_expressions: None,
+        exclude_expressions: None,
+        concurrency: NonZeroUsize::new(2).ok_or("concurrency must be non-zero")?,
+    })
+}
+
+/// Drains the walk into its pages and errors, in emission order.
+async fn drain(walk: &crate::WalkDirAsyncIterator2) -> (Vec<DirPageResult>, Vec<String>) {
+    let mut pages = Vec::new();
+    let mut errors = Vec::new();
+    while let Some(event) = walk.next().await {
+        match event {
+            NdxEvent::Page(page) => pages.push(page),
+            NdxEvent::Error { path, reason } => errors.push(format!("{path}: {reason}")),
+            NdxEvent::Done => break,
+        }
+    }
+    (pages, errors)
+}
+
+/// `a/{x.txt, deep/{y.txt}}` plus a sibling `b/`, enough to exercise DFS and gaps.
+fn sample_tree() -> Vec<(&'static str, Listing)> {
+    vec![
+        (
+            "",
+            Listing::Entries(vec![
+                ("b", EntryKind::Directory),
+                ("a", EntryKind::Directory),
+                ("root.txt", EntryKind::File),
+            ]),
+        ),
+        (
+            "a",
+            Listing::Entries(vec![
+                ("x.txt", EntryKind::File),
+                ("deep", EntryKind::Directory),
+            ]),
+        ),
+        ("a/deep", Listing::Entries(vec![("y.txt", EntryKind::File)])),
+        ("b", Listing::Entries(vec![("z.txt", EntryKind::File)])),
+    ]
+}
+
+fn page_names(page: &DirPageResult) -> Vec<String> {
+    page.files
+        .iter()
+        .chain(page.subdirs.iter())
+        .map(|entry| entry.entry.get_name().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn pages_arrive_depth_first_with_entries_sorted_by_name() -> Result {
+    let namespace = TreeNamespace::new(sample_tree());
+    let storage = storage(Arc::clone(&namespace))?;
+    let (pages, errors) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+    assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+    let visited: Vec<&str> = pages.iter().map(|page| page.dir_path.as_str()).collect();
+    assert_eq!(
+        visited,
+        vec!["", "a", "a/deep", "b"],
+        "subdirectories are visited depth-first in name order, not listing order"
+    );
+    assert_eq!(
+        page_names(&pages[0]),
+        vec!["root.txt", "a", "b"],
+        "files sort before subdirectories, each group sorted by name"
+    );
+    assert_eq!(page_names(&pages[1]), vec!["x.txt", "deep"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ndx_rises_monotonically_and_each_page_reserves_its_gap_slot() -> Result {
+    let namespace = TreeNamespace::new(sample_tree());
+    let storage = storage(Arc::clone(&namespace))?;
+    let (pages, _) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+
+    // Entry numbering is deliberately not dense: `allocate_gap_ndx` reserves one slot between
+    // segments, which is what `gap_ndx` reports. Only monotonicity and the gap accounting are
+    // invariants.
+    let mut previous = -1;
+    for page in &pages {
+        let entries: Vec<i32> = page
+            .files
+            .iter()
+            .chain(page.subdirs.iter())
+            .map(|entry| entry.ndx)
+            .collect();
+        assert_eq!(
+            page.ndx_start,
+            entries[0],
+            "ndx_start names the first entry of page '{}'",
+            page.dir_path
+        );
+        for ndx in &entries {
+            assert!(
+                *ndx > previous,
+                "NDX must rise across the DFS order, got {ndx} after {previous}"
+            );
+            previous = *ndx;
+        }
+        if page.gap_ndx >= 0 {
+            assert!(
+                page.gap_ndx > previous,
+                "a page's gap slot follows its entries"
+            );
+            previous = page.gap_ndx;
+        }
+    }
+    assert_eq!(
+        pages.last().map(|page| page.gap_ndx),
+        Some(-1),
+        "the last page of the tree carries no gap"
+    );
+    assert!(
+        pages[..pages.len() - 1]
+            .iter()
+            .all(|page| page.gap_ndx >= 0),
+        "every earlier page reserves a gap slot"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_list_per_directory_and_no_metadata_round_trips() -> Result {
+    let namespace = TreeNamespace::new(sample_tree());
+    let storage = storage(Arc::clone(&namespace))?;
+    let (pages, _) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+    assert_eq!(pages.len(), 4);
+
+    let mut listed = namespace.listed();
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec!["", "a", "a/deep", "b"],
+        "each directory is listed exactly once"
+    );
+    assert!(
+        namespace.non_list_requests().is_empty(),
+        "timestamps come from the listing, so no per-entry observation is issued"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_subtree_root_rebases_emitted_paths_and_still_lists_the_backend_path() -> Result {
+    let namespace = TreeNamespace::new(sample_tree());
+    let storage = storage(Arc::clone(&namespace))?;
+    let (pages, errors) = drain(&ndx_walk(&storage, request(path("a")?)?)?).await;
+    assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+
+    assert_eq!(
+        namespace.listed(),
+        vec!["a", "a/deep"],
+        "listing targets stay backend-relative"
+    );
+    let emitted: Vec<String> = pages
+        .iter()
+        .flat_map(|page| page.files.iter().chain(page.subdirs.iter()))
+        .map(|entry| entry.entry.get_relative_path().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        emitted,
+        vec!["x.txt", "deep", "deep/y.txt"],
+        "emitted paths are relative to the traversal root, without the 'a/' prefix"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn max_depth_limits_how_deep_directories_are_listed() -> Result {
+    for (depth, expected) in [(Some(1), vec![""]), (Some(2), vec!["", "a", "b"])] {
+        let namespace = TreeNamespace::new(sample_tree());
+        let storage = storage(Arc::clone(&namespace))?;
+        let mut walk_request = request(StoragePath::root())?;
+        walk_request.max_depth = depth.and_then(NonZeroUsize::new);
+        let (pages, _) = drain(&ndx_walk(&storage, walk_request)?).await;
+        let visited: Vec<&str> = pages.iter().map(|page| page.dir_path.as_str()).collect();
+        assert_eq!(visited, expected, "max_depth {depth:?} listed the wrong set");
+    }
+
+    let namespace = TreeNamespace::new(sample_tree());
+    let storage = storage(Arc::clone(&namespace))?;
+    let (pages, _) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+    assert_eq!(pages.len(), 4, "None means unlimited, not zero");
+    Ok(())
+}
+
+#[tokio::test]
+async fn depth_bounded_directories_are_emitted_as_entries_rather_than_dropped() -> Result {
+    let namespace = TreeNamespace::new(sample_tree());
+    let storage = storage(Arc::clone(&namespace))?;
+    let mut walk_request = request(StoragePath::root())?;
+    walk_request.max_depth = NonZeroUsize::new(1);
+    let (pages, _) = drain(&ndx_walk(&storage, walk_request)?).await;
+    assert_eq!(
+        page_names(&pages[0]),
+        vec!["a", "b", "root.txt"],
+        "directories at the depth limit still appear, sorted among the files"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn exclude_expression_hides_entries_but_still_descends_when_asked() -> Result {
+    let namespace = TreeNamespace::new(sample_tree());
+    let storage = storage(Arc::clone(&namespace))?;
+    let mut walk_request = request(StoragePath::root())?;
+    walk_request.exclude_expressions =
+        Some(crate::filter::parse_filter_expression("name == \"x.txt\"")?);
+    let (pages, _) = drain(&ndx_walk(&storage, walk_request)?).await;
+    let emitted: Vec<String> = pages
+        .iter()
+        .flat_map(|page| page.files.iter().chain(page.subdirs.iter()))
+        .map(|entry| entry.entry.get_name().to_owned())
+        .collect();
+    assert!(
+        !emitted.contains(&"x.txt".to_owned()),
+        "excluded entry must not be emitted: {emitted:?}"
+    );
+    assert!(
+        emitted.contains(&"y.txt".to_owned()),
+        "excluding one file must not prune its sibling subtree: {emitted:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unreadable_directory_is_reported_and_the_rest_of_the_tree_continues() -> Result {
+    let mut listings = sample_tree();
+    listings.retain(|(key, _)| *key != "a");
+    listings.push(("a", Listing::EntryFailure));
+    let namespace = TreeNamespace::new(listings);
+    let storage = storage(Arc::clone(&namespace))?;
+    let (pages, errors) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+
+    assert_eq!(errors.len(), 1, "one soft error for the one bad directory");
+    assert!(
+        errors[0].contains("failed to list 'a'"),
+        "error names the directory: {errors:?}"
+    );
+    let visited: Vec<&str> = pages.iter().map(|page| page.dir_path.as_str()).collect();
+    assert!(
+        visited.contains(&"b"),
+        "the sibling subtree still pages: {visited:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_listing_without_timestamps_is_refused_instead_of_reporting_the_epoch() -> Result {
+    let namespace = TreeNamespace::new(vec![(
+        "",
+        Listing::WithoutTimestamps(vec![("only.txt", EntryKind::File)]),
+    )]);
+    let storage = storage(Arc::clone(&namespace))?;
+    let (pages, errors) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+
+    assert_eq!(errors.len(), 1, "one aggregated error, not one per entry");
+    assert!(
+        errors[0].contains("no inline timestamps"),
+        "error explains why the directory was refused: {errors:?}"
+    );
+    assert!(
+        pages.iter().all(|page| page.files.is_empty()),
+        "no entry is emitted with an epoch modification time"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_broken_session_drops_its_frame_without_ending_the_walk() -> Result {
+    let mut listings = sample_tree();
+    listings.retain(|(key, _)| *key != "a");
+    listings.push(("a", Listing::SessionFailure));
+    let namespace = TreeNamespace::new(listings);
+    let storage = storage(Arc::clone(&namespace))?;
+    let (pages, errors) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+
+    assert!(
+        errors.iter().any(|error| error.contains("session failed")),
+        "the session failure is reported: {errors:?}"
+    );
+    let visited: Vec<&str> = pages.iter().map(|page| page.dir_path.as_str()).collect();
+    assert!(
+        visited.contains(&""),
+        "the already-paged root survives: {visited:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn entry_fields_follow_the_neutral_descriptor_and_path_extension_rules() -> Result {
+    let namespace = TreeNamespace::new(vec![(
+        "",
+        Listing::Entries(vec![
+            ("archive.tar.gz", EntryKind::File),
+            (".bashrc", EntryKind::File),
+            ("plain", EntryKind::File),
+        ]),
+    )]);
+    let storage = storage(Arc::clone(&namespace))?;
+    let (pages, _) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+
+    let mut extensions = HashMap::new();
+    for entry in &pages[0].files {
+        let crate::EntryEnum::NAS(nas) = entry.entry.as_ref() else {
+            return Err("ndx_walk emits NAS entries".into());
+        };
+        extensions.insert(nas.name.clone(), nas.extension.clone());
+        assert_eq!(
+            i128::from(nas.mtime),
+            MODIFIED_NANOS,
+            "mtime comes from the listing, not the epoch"
+        );
+        assert_eq!(nas.mode, 0o644, "no inline mode falls back to the default");
+        assert!(!nas.is_symlink, "listed entries are never links");
+        assert!(nas.file_handle.is_none(), "no protocol file id is available");
+    }
+    assert_eq!(
+        extensions.get("archive.tar.gz"),
+        Some(&Some("gz".to_owned())),
+        "only the last component counts as the extension"
+    );
+    assert_eq!(
+        extensions.get(".bashrc"),
+        Some(&None),
+        "a leading dot is a stem, not an extension (Path::extension semantics)"
+    );
+    assert_eq!(extensions.get("plain"), Some(&None));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_inline_mode_from_the_listing_reaches_the_emitted_entry() -> Result {
+    struct ModeNamespace;
+    #[async_trait]
+    impl Namespace for ModeNamespace {
+        async fn execute(
+            &self,
+            request: NamespaceRequest,
+        ) -> std::result::Result<NamespaceResult, StorageRoleFailure> {
+            let NamespaceRequest::List(target) = request else {
+                return Err(entry_failure(&StoragePath::root()));
+            };
+            if !target.as_str().is_empty() {
+                return Ok(NamespaceResult::Entries(Vec::new()));
+            }
+            let stamp = StorageTimestamp::new(MODIFIED_NANOS, TimePrecision::Nanoseconds)
+                .unwrap_or_else(|error| panic!("{error}"));
+            let descriptor = descriptor("locked.bin", EntryKind::File, true)
+                .unwrap_or_else(|error| panic!("{error}"))
+                .with_inline_timestamps(TimestampMetadata {
+                    accessed: Some(stamp),
+                    modified: Some(stamp),
+                    created: Some(stamp),
+                })
+                .with_inline_mode(0o444);
+            Ok(NamespaceResult::Entries(vec![descriptor]))
+        }
+    }
+
+    let capabilities = namespace_only_capabilities()?;
+    let storage = Storage::connected(
+        BackendIdentity::new(BackendKind::Cifs, "ndx-walk-mode-test")?,
+        capabilities,
+        None,
+        None,
+        Some(Arc::new(ModeNamespace)),
+        None,
+        None,
+    )?;
+    let (pages, _) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+    let crate::EntryEnum::NAS(nas) = pages[0].files[0].entry.as_ref() else {
+        return Err("ndx_walk emits NAS entries".into());
+    };
+    assert_eq!(nas.mode, 0o444, "the listing's mode wins over the default");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_storage_without_a_namespace_role_is_refused_before_any_listing() -> Result {
+    let absent = CapabilityAvailability::Unsupported(UnsupportedReason::new(
+        "Local lends no namespace role",
+    )?);
+    let capabilities = BackendCapabilities::new(
+        absent.clone(),
+        absent.clone(),
+        absent.clone(),
+        absent,
+    );
+    let storage = Storage::connected(
+        BackendIdentity::new(BackendKind::Local, "ndx-walk-no-namespace")?,
+        capabilities,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+    assert!(
+        ndx_walk(&storage, request(StoragePath::root())?).is_err(),
+        "Local and S3 lend no namespace role, so the walk is refused up front"
+    );
+    Ok(())
+}
