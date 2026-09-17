@@ -36,7 +36,8 @@ key、不能签名 (MS-SMB2 3.2.5.3.1)，`Deny` 下客户端在最终 SessionSet
 
 ## 与 legacy 路径的能力差异
 
-legacy `CifsStorage` 中以下能力在 role-based backend 里**没有**对应物 (删除时的盘点)：
+legacy `CifsStorage` 的能力在 role-based backend 里的去向 —— 有对应物的说清语义变化，没有的
+说清为什么以及代价。2026-09-17 按删除前的 `git show b0c149b^:src/cifs.rs` 逐方法复核过一遍。
 
 - `Namespace` 实现 `Stat` / `List` / `CreateDirectory` / `Delete` (文件或空目录) / `Rename`
   (文件和目录，replace 语义与 NFS/HDFS 一致；目录 rename 走 smb-rs `Directory::rename_replace`，
@@ -52,21 +53,61 @@ legacy `CifsStorage` 中以下能力在 role-based backend 里**没有**对应�
   (与 NFS / HDFS 的 `ensure_dir` 对齐)。`true` 时连接阶段补齐缺失层级：根存在只花一次 open，
   缺失才逐级探测 + `create_new`，COLLISION 视为竞争成功，某层是文件则连接失败。
   `false` 不探测根，行为与之前一致。
-- 遍历由通用 `traversal::StorageTraversalSource` 驱动；filter DSL 剪枝与 `max_depth` 经
-  `TraversalRequest.filter` / `.max_depth` 注入 (适配器 `crate::DslTraversalFilter`)。
-  packaged/NDX 分页、work-stealing 仍归上层编排。
+- 遍历有两条线并存。**条目流**由通用 `traversal::StorageTraversalSource` 驱动，filter DSL
+  剪枝与 `max_depth` 经 `TraversalRequest.filter` / `.max_depth` 注入 (适配器
+  `crate::DslTraversalFilter`)。**NDX 分页**由 `storage::ndx_walk` 驱动 (legacy `walkdir_2`
+  的中立替身)：走 `Namespace::List` 取数，复用 `dir_tree::run_dfs_driver` 的 DFS 栈 / 预读
+  窗口 / NDX 与 gap 编号，产出 `NdxEvent`。两条线的 filter 适配不同 —— 前者是
+  `TraversalDecision`，后者是 legacy `should_skip` 三元组 (`ReadContext.apply_filter` /
+  `SubdirEntry.visible` / `need_filter`)。这是有意并存：其余四个 backend 的 walkdir_2 也还在
+  legacy 那条线上。work-stealing 仍归上层编排。
 - 无 128-bit file id / info-class 探测；source identity 是
   `len + written + changed` (目录 len 记 0)，`describe` / `open` / `metadata` / `list` 四条路径
   共用 `protocol::identity_bytes` 同一套字节，互相可比
   (矩阵 `hardlink_topology: unsupported`，路径级 identity 足够)。
+  **已知降级**：`ndx_walk` 产出的 `NASEntry.file_handle` 恒为 `None`，因为 smb-domain facade
+  完全不暴露 file id (`crates/smb/src/domain/` 搜 `file_id` / `FileId` / `IndexNumber` 零命中，
+  `runtime/port.rs:496` 用的是最窄的 `FileDirectoryInformation`)。legacy 用它当 rename 检测键
+  (NTFS `IndexNumber` / ReFS 完整 128 位 / Samba inode)，所以 **CIFS 上的 rename 检测退回
+  Path 模式** —— 增量同步里整目录改名会被看成全删全建。要修得给 smb-rs 提 PR 换宽 info class
+  (`FileIdFullDirectoryInformation` 0x26 / `FileIdExtdDirectoryInformation` 0x3c)，file id 随
+  `QUERY_DIRECTORY` 一起回来、**不增加往返**，但记录变宽约 15%，且必须带上服务器拒绝宽 class
+  时回退窄 class 的探测 (legacy `probe_dir_info_class` 就是为此存在)。因为宽 class 的成本只在
+  全量搬迁时白付、收益只在增量时兑现，这个开关应该是可选的，不要无条件换。
 - 目录列举带回 `FILE_DIRECTORY_INFORMATION` 里已有的四个时间戳，挂在
   `SourceDescriptor::inline_timestamps` 上；`ObservationPlan` 只要时间戳时，遍历直接用它，
   不再对每个条目多发一次 `Metadata::observe` (N+1 → 1)。
-- 无 `check_connectivity` / `probe_server_time`；`Metadata` 只支持 `Timestamps` 与 `Acl`，
-  numeric uid/gid/mode 标为 `Unsupported`：SMB 不暴露 POSIX mode，FAS2750 unix 卷上的 mode 由
-  服务端 name-mapping + umask 决定 (session 里 `mapped_unix_user=lisauser`)，客户端无法观察/应用。
+- 无 `check_connectivity`：连接阶段 `connect_share` 已经做了认证 + tree connect，丢的只是
+  会话建立之后的健康探测。`probe_server_time` 则**不是回归** —— legacy `CifsStorage` 从来没有
+  这个方法 (旧 `src/cifs.rs` 零命中)，它是 D7 的要求项；真实环境证据那节也已论证不需要它。
+- `Metadata` 只支持 `Timestamps` 与 `Acl`，numeric uid/gid/mode 标为 `Unsupported`：SMB 不暴露
+  POSIX mode，FAS2750 unix 卷上的 mode 由服务端 name-mapping + umask 决定 (session 里
+  `mapped_unix_user=lisauser`)，客户端无法观察/应用。
+- **`FILE_ATTRIBUTE_READONLY` → 近似 mode，只在列举路径**。`QUERY_DIRECTORY` 记录带只读位，
+  `namespace.rs list` 把它经 `smb_attributes_to_mode` (dir → 0o755/0o555，file → 0o644/0o444，
+  照搬 legacy) 挂到中立的 `SourceDescriptor::inline_mode` 上，`ndx_walk` 再填进
+  `NASEntry.mode`。stat 路径显式留 `None` 而不是伪造：`smb_domain::ResourceMetadata`
+  (domain/mod.rs:845) 只有四个时间戳和长度，没有任何属性位，填 `false` 会让 stat 谎报"不是只读"。
+  这个值是**展示级**的，不进 `MetadataObservations.ownership_mode` (那仍是 `NotApplicable`)：
+  塞进去会让 transfer engine 以为可以 apply，目标端会被写错权限。apply 侧不做 (legacy 也没做)。
+  根治要给 smb-rs 的 `RuntimeMetadata` / `ResourceMetadata` 加属性位 —— 底层 stat 本来就在查
+  `FileBasicInformation`，数据已在响应里、零额外往返，适合和 file id 合成同一个上游 PR。
+- **列举里的 reparse point 一律当普通文件**。`protocol.rs list` 明确不把它映射成 `Symlink`
+  (facade 读不了 link target，`Symlink` 会把遍历送进不支持的 `ReadLink`)，所以
+  `NASEntry.is_symlink` 恒 `false`，filter 表达式里的 `type == "symlink"` 在 CIFS 上恒不匹配。
+  FAS2750 实测见下文"真实环境证据"的符号链接行：unix 卷上的 symlink 在 SMB 列举里本来就不带
+  reparse 标记，客户端无从识别，所以这条在实测环境里不构成额外损失。
 - 整文件 `read_file` / `write_file`、`set_file_len`、`.part` 续传、tar 直写按设计删除，
   由 staged `Checkpointed` / `AtomicReplace` 替代。
+- 递归建目录 (legacy `create_dir_all`) 现在是 backend 无关的 `storage::create_directory_all`：
+  逐层 `CreateDirectory`，`Ok` 与 `Conflict` 都算"这层已存在"，只在叶子层冲突时多花一次 `Stat`
+  确认不是文件。legacy 的 `DirExistsCache` 不补 —— 跨调用缓存是调用方的会话状态。
+- `update_metadata` 的 2-RT compound (legacy `evict_lease` + `compound_set_basic_info`) 没有
+  对应物，现在是 open + set + close 三个往返，facade 不暴露 wire compound
+  (`domain/batch.rs` 的 `Batch::execute` 是顺序 await，不是 SMB2 复合请求)。**正确性没问题**：
+  当年那个 compound 的动机是 deferred-close 句柄的 sticky LastWriteTime 会盖掉 SetInfo，而
+  `require_confirmed_close` + staged `write` 先确认关闭再 `apply_metadata` 已经把成因结构性消除。
+  剩下的纯粹是每文件 1 个往返的差距。
 - 默认并发 8/8 (legacy 为 4/4)。
 
 ## 关键代码点

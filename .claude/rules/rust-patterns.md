@@ -14,9 +14,10 @@
 **why**: 全库统一错误模型。混 `std::io::Result` / `anyhow::Result` 让上游 retry 决策错乱。
 **how to apply**: 内部 helper 用 `Result<T>` (本模块 alias)；公开 `pub` 必须 `crate::Result<T>` 或同义。
 
-## R3 · backend 错误映射到 `StorageError` 24 变体
+## R3 · backend 错误映射到 `StorageError` 的既有变体
 
-**verify**: `grep -c '#\[error' src/error.rs` 应 = 24。变更必须 PR 说明。
+**verify**: `grep -c '#\[error' src/error.rs` 应 = 29。变更必须 PR 说明。
+(这个数字是绊线不是上限；2026-09-17 发现它长期停在 24 而实际已 29，期间的新增变体没走过 PR 说明。改动数字时同步改 CLAUDE.md。)
 **why**: 上游 retry taxonomy 依赖变体语义 (见 `.claude/docs/error-taxonomy.md`)。
 **how to apply**: backend 内部错误用 `StorageError::S3Error / NfsError / CifsError` 透传消息；已知协议错误映射到具体变体 (FileNotFound / PermissionDenied / InsufficientSpace 等)。新加变体必须更新 error-taxonomy.md。
 

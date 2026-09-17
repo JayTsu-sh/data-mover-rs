@@ -31,6 +31,30 @@ Backend 实现 (nfs.rs / s3.rs / local.rs / hdfs.rs)
 底层 crate (nfs-rs / aws-sdk-s3 / std::fs+rayon / hdfs-native)
 ```
 
+### role-based 侧的中立组合层
+
+`storage::connect_backend` 出来的 `Storage` 借出四个角色 (`ReadSource` /
+`StagedDestination` / `Namespace` / `Metadata`)。凡是"树形状"的操作都写成拿 `&Storage`、
+借角色的中立 helper，不再逐 backend 实现：
+
+```
+Storage (roles)
+    │
+    ├──→ traversal::StorageTraversalSource   Namespace::List + Metadata → TraversalItem 流
+    ├──→ storage::ndx_walk                   Namespace::List → dir_tree::run_dfs_driver → NdxEvent
+    ├──→ storage::delete_tree                Namespace::{List,Delete} → DeleteTreeItem 流
+    ├──→ storage::create_directory_all       Namespace::{CreateDirectory,Stat} 逐层创建
+    └──→ integrity::compare                  ReadSource + Metadata
+```
+
+`ndx_walk` 是 legacy `walkdir_2` 的中立替身：DFS 栈、预读窗口、NDX / gap 编号仍归
+`src/dir_tree.rs` 的 `run_dfs_driver`(那部分本来就后端无关)，这里只负责列举取数、按名排序、
+以及把 `SourceDescriptor` 反拼成 `NdxEvent` 载荷要的 `EntryEnum::NAS`。
+
+**覆盖面**：Local 和 S3 不出借 `Namespace` 角色，所以 `ndx_walk` / `delete_tree` /
+`create_directory_all` 在这两个 backend 上于 preflight 处返回 `CapabilityUnavailable`，
+实际覆盖 CIFS / NFS / HDFS。
+
 **关键点**：没有 `Storage` trait，没有 `dyn Storage`，没有 vtable。这是有意的 — 4 个 backend 协议差异极大，trait 抽象会塞 30+ 默认方法和大量 `Self`-bound 限制，不如 enum + match 直接。
 
 代价：**新增/修改一个 StorageEnum 操作 = 五处同步**。详见 [storage-enum-dispatch.md](storage-enum-dispatch.md)。

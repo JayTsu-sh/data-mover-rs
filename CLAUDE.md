@@ -15,7 +15,7 @@
 - **`.unwrap()` / `.expect()` 编译期 deny** (Cargo.toml `[lints.clippy]` 已强制)，仅 `#[cfg(test)]` 和测试 helper 例外。
 - **资源句柄走 `close_resource` helper** (`src/storage/backends/cifs/protocol.rs` 已有)，不要裸 `.close()`。S99 教训。
 - **`Cancelled` ≠ `Error`**，是 `CancellationToken` 信号，上游可重入队 (commit `7eb3046` split retry taxonomy)。
-- **Backend 错误统一映射到 `StorageError` 24 个变体之一**。新增变体需要 PR 说明强需求。
+- **Backend 错误统一映射到 `StorageError` 的变体之一** (当前 29 个)。新增变体需要 PR 说明强需求。
 
 ## 场景路由表
 
@@ -30,6 +30,8 @@
 | 改 walk 调度 / work-stealing | `.claude/docs/walk-scheduler.md` + `src/walk_scheduler.rs` + `src/async_receiver.rs` |
 | 改 role-based 遍历 (filter / max_depth / inline 观察) | `src/traversal/{mod,storage,local}.rs` + `src/filter_traversal.rs` + `examples/storage_role_operations.rs` |
 | 改递归删除 | `src/storage/delete_tree.rs` (走 `Namespace` 角色，backend 无关) |
+| 改 NDX 分页遍历 (legacy walkdir_2 的中立替身) | `src/storage/ndx_walk.rs` + `src/dir_tree.rs` (`run_dfs_driver` 不要动) |
+| 改递归建目录 | `src/storage/create_dir.rs` (走 `Namespace` 角色，backend 无关) |
 | 改跨端完整性比对 | `src/integrity/mod.rs` (走 `ReadSource` + `Metadata` 角色) |
 | 改 error 变体或 retry 映射 | `.claude/docs/error-taxonomy.md` + `src/error.rs` |
 | 改时间转换 (FileTime / NFS Time) | `src/time_util.rs` (单文件直读) |
