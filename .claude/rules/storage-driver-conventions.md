@@ -102,3 +102,25 @@ grep -nE 'pub use crate::(nfs::NFSStorage|s3::S3Storage|local::LocalStorage)' sr
 
 **why**: 用户拿到具体 backend 类型会绕过 `StorageEnum` 抽象，导致代码与 backend 耦合。
 **how to apply**: 如果用户需要某 backend 特有功能，加到 `StorageEnum` 的方法 (匹配只对应 backend 有实际操作，其他 backend 返回 `UnsupportedType`)。
+
+## D9 · smb-rs 依赖只固定 main 上的提交，升级走完整矩阵
+
+**verify**:
+
+```bash
+# rev 必须是 40 位提交，不是 branch / tag
+grep -nE 'smb-domain.*rev = "[0-9a-f]{40}"' Cargo.toml
+# 该提交必须在 smb-rs main 上 (在 smb-rs clone 里)
+git merge-base --is-ancestor <rev> origin/main && echo on-main
+# Cargo.lock 里 smb-* 只能有一个 rev
+grep -oE 'smb-rs\.git\?rev=[0-9a-f]+' Cargo.lock | sort -u | wc -l   # 应为 1
+```
+
+升级 rev 的 commit 必须是单独的 `chore(deps)` commit，body 列出 `.claude/docs/storage-cifs.md`
+"升级 smb-rs 依赖" 第 3、4 步的结果 (clippy 门禁、单测、namespace / policy / anon 契约各跑几次)。
+
+**why**: 2026-09-16 的 dead-code 清理让 64 MiB checkpoint 用例出现过间歇失败，只有真实
+FAS2750 + 多次重跑才能区分回归与瞬时状态；`[patch.crates-io]` 与浮动分支在 #150 前造成过
+两版 smb 并存。
+**how to apply**: 见 [storage-cifs.md](../docs/storage-cifs.md) "升级 smb-rs 依赖" 六步；协议层
+(session / connection / runtime / crypto / domain / facade) 有改动的升级不得跳过第 4 步。

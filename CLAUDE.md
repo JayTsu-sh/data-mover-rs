@@ -36,6 +36,7 @@
 | 改 tar 打包 | `src/tar_pack.rs` |
 | URL 红化 / 日志脱敏 | `src/url_redact.rs` |
 | 写 commit / PR | `.claude/docs/conventions.md` |
+| 升级 smb-rs 依赖 (改 `smb-domain` rev) | `.claude/docs/storage-cifs.md` "升级 smb-rs 依赖" + `.claude/rules/storage-driver-conventions.md` D9 |
 | 跑某 backend 验证 | `.claude/skills/e2e-{cifs,nfs,s3,local}/SKILL.md` |
 | 跑取消语义 / filter DSL 测试 | `.claude/skills/op-{cancel,filter-dsl}/SKILL.md` |
 | 跑全套 (无外部环境) | `.claude/skills/harness-run/SKILL.md` 或 `make ci` |

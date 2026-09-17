@@ -162,6 +162,34 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 (`nfs://<lif>/<vol>:/?uid=0&gid=0&noresvport=true`)；WSL2 NAT 会改写源端口，ONTAP
 `mount_root_only=true` 时会 `AUTH_TOOWEAK`，测试期间需临时关闭并事后恢复。
 
+## 升级 smb-rs 依赖
+
+`smb-domain` 固定的是 JayTsu-sh/smb-rs **main 上的一个提交**，不是 branch。升级 = 改一处 rev，
+但验证必须完整，因为 smb-rs 的协议内部 (credits、签名、recovery) 出问题只会在真实服务器和
+大文件上暴露 (2026-09-16 一次 64 MiB checkpoint 用例的间歇失败就是这样发现的)。
+
+1. **确认来源**：目标提交必须已在 smb-rs `main` 上 (`git merge-base --is-ancestor <rev> origin/main`)，
+   且 smb-rs 自己的 CI ("Format, lint, and test") 对该提交是绿的。不固定分支顶端以外的 PR 分支；
+   如果确实要先用未合并分支验证，Cargo.toml 里写完整 40 位 rev，并在 PR 描述里说明，合并后再切回 main 提交。
+2. **看变更面**：`git log --oneline <old>..<new>` + `git diff --stat`。凡是碰到
+   `session/` `connection/` `runtime/wire.rs` `runtime/port.rs` `crypto/` `domain/` `facade/` 的提交，
+   都按"协议变更"对待，走第 4 步的完整矩阵；只改 docs / tests 的提交可以只做第 3 步。
+3. **本地门禁**：改 `Cargo.toml` 的 `rev`，`cargo fetch`，确认 `Cargo.lock` 里 `smb-*` 只剩新 rev；
+   `python3 .claude/skills/quality-clippy/scripts/run.py` (即 `cargo clippy --all-targets -- -D warnings ...`)；
+   `cargo test --lib`；`python3 tests/validate_architecture_dependencies.py .`。
+4. **真实环境**：`.claude/skills/e2e-cifs` 全套 (需要 `CIFS_REAL_*`)：
+   - `cifs_namespace_contract`：Stat / List / CreateDirectory / Rename (文件+目录) / Delete；
+   - `cifs_policy_contract`：Checkpointed / AtomicReplace，含 64 MiB 多块 checkpoint、双 LIF、
+     读回校验、目录 mtime；**至少跑 2 次**——协议层的回归常表现为间歇失败；
+   - `cifs_namespace_contract` 以 `CIFS_REAL_GUEST_POLICY=allow-unsigned` + 空用户名跑匿名 share；
+   - `cifs_capability_probe`：对照"真实环境证据"表，`[probe]` 行有变化时更新该表。
+   失败时先用 `git bisect`/切回旧 rev 重跑同一用例区分"smb-rs 回归"与"服务端瞬时状态"。
+5. **同步记录**：更新本文件"底层依赖与边界"里的 rev 与内容摘要、`CLAUDE.md` "强制约束" 的 rev、
+   `.claude/docs/codebase.md` 依赖表；smb-rs 公开 API 有增删时同步 `连接配置` / `能力差异` 段和
+   `docs/architecture/backend-capability-matrix.yaml`。
+6. **提交**：单独一个 `chore(deps): smb-domain 固定到 smb-rs main <rev>` commit，body 写清 smb-rs
+   提交范围、跑过的矩阵和结果；不要和功能改动混在一起，出问题能单独 revert。
+
 ## 已知陷阱
 
 | 陷阱 | 应对 |
