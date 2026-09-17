@@ -26,6 +26,7 @@ use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, DeleteTreeItem,
     DeleteTreeRequest, LocalBackendConfig, NfsBackendConfig, Storage, connect_backend, delete_tree,
 };
+use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
     LocalTraversalSource, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest,
     TraversalSession, TraversalSource as _,
@@ -71,6 +72,17 @@ enum Command {
         /// Sub-path to start from, relative to the backend root.
         #[arg(long, default_value = "")]
         path: String,
+    },
+    /// Write a small fixture tree under the root, so the other subcommands have something
+    /// to work on. Each file is transferred from a local temporary directory.
+    Seed {
+        /// Sub-path under the root to populate.
+        #[arg(long, default_value = "")]
+        path: String,
+        #[arg(long, default_value_t = 3)]
+        files: usize,
+        #[arg(long, default_value_t = 4096)]
+        bytes: usize,
     },
     /// Delete a subtree, reporting progress per entry.
     DeleteTree {
@@ -181,6 +193,44 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
     Ok(())
 }
 
+async fn seed(storage: &Storage, args: &Args, command: &Command) -> Result<(), Error> {
+    let Command::Seed { path, files, bytes } = command else {
+        unreachable!("dispatched by the caller")
+    };
+    let local_root = tempfile::tempdir()?;
+    let payload = vec![b'x'; *bytes];
+    let slots = NonZeroUsize::new(args.concurrency).ok_or("concurrency must be non-zero")?;
+    let source = connect(
+        Backend::Local,
+        &local_root.path().to_string_lossy(),
+        "seed",
+        args.concurrency,
+    )
+    .await?;
+    let inflight = InflightLimits::new(slots.get(), (*bytes).max(1) * slots.get(), slots.get())?;
+    for index in 0..*files {
+        let name = format!("file-{index}.log");
+        std::fs::write(local_root.path().join(&name), &payload)?;
+        let destination = if path.is_empty() {
+            name.clone()
+        } else {
+            format!("{path}/{name}")
+        };
+        let outcome = transfer(TransferRequest::new(
+            TransferIdentity::new(format!("seed-{}-{index}", std::process::id()))?,
+            source.clone(),
+            StoragePath::new(name)?,
+            storage.clone(),
+            StoragePath::new(&destination)?,
+            inflight,
+            CancellationToken::new(),
+        ))
+        .await?;
+        println!("seeded {destination} bytes={}", outcome.transferred_bytes);
+    }
+    Ok(())
+}
+
 async fn remove_tree(storage: &Storage, args: &Args, command: &Command) -> Result<(), Error> {
     let Command::DeleteTree { path, delete_root } = command else {
         unreachable!("dispatched by the caller")
@@ -249,6 +299,7 @@ async fn main() -> Result<(), Error> {
     let args = Args::parse();
     let storage = connect(args.backend, &args.root, "source", args.concurrency).await?;
     match &args.command {
+        Command::Seed { .. } => seed(&storage, &args, &args.command).await,
         Command::Traverse { .. } => traverse(&storage, &args, &args.command).await,
         Command::DeleteTree { .. } => remove_tree(&storage, &args, &args.command).await,
         Command::Compare { .. } => compare(storage, &args, &args.command).await,
