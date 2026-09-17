@@ -12,18 +12,20 @@
 - backend 使用 smb-rs domain facade：`Client → Session → Share → File / Directory`。
 - data-mover 不得重新依赖 smb-rs 的 connection、runtime、wire create/query/set 类型或协议 handle。
 - `smb_domain::protocol` 只允许用于 lossless ACL codec 等明确的协议值边界，普通 I/O 不使用。
-- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = 7f45658... }`
-  (smb-rs main 顶端 = PR #70 + #71 + #72。#70/#71 给出 metadata-timestamps、目录 rename、
+- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = 9f68e92... }`
+  (smb-rs main 顶端 = PR #70 + #71 + #72 + #73。#70/#71 给出 metadata-timestamps、目录 rename、
   `GuestPolicy`，并删掉约 2400 行从未接线的 lease-slot 缓存 / multichannel 残留 / 未用协议
   helper (`runtime/port.rs` 的 `Legacy*` 别名改为 `Protocol*`)；#72 把 `QUERY_DIRECTORY` 本来
   就返回的四个时间戳与只读 / reparse 属性暴露到 `DirectoryEntry`，不发新请求也不换 info
-  class)。不得改成浮动 branch。`[patch.crates-io] smb` 与历史 API 提交 `c3ecf00` 已删除。
+  class)；#73 让协商始终直接发 SMB2 NEGOTIATE。不得改成浮动 branch。`[patch.crates-io] smb` 与
+  历史 API 提交 `c3ecf00` 已删除。
 
 ## 连接配置
 
 没有 URL。`CifsBackendConfig` 字段：`server` / `share` / `username` / `password` /
 `root: Option<String>` (share 内子路径) / `identity: BackendIdentity` / `signing_policy`。
-凭据只有 NTLM (`smb_domain::Credentials::ntlm`)；facade 没有 `smb2_only`、multichannel 开关。
+凭据只有 NTLM (`smb_domain::Credentials::ntlm`)；facade 没有 multichannel 开关。
+协商**始终**直接发 SMB2 NEGOTIATE，不再需要 legacy 的 `smb2_only` 开关 (smb-rs #73)。
 
 **匿名 / guest 访问**：`guest_policy: CifsGuestPolicy` (默认 `Deny`)。服务端把未知用户或空/错密码映射到
 guest 账号时 (ONTAP `vserver cifs options -guest-unix-user`，Samba `map to guest`)，会话没有 session
@@ -160,7 +162,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 | 项 | 实测 | 决定 |
 |---|---|---|
 | 匿名 / guest (legacy `anon`) | 默认配置下：空身份被 NTLM 层拒绝，实名空/错密码 `STATUS_WRONG_PASSWORD`。设置 `guest-unix-user=pcuser` 并建 share `dm_anon_share` (Everyone full_control) 后：未知用户 + 空密码被接受为 guest，`CifsGuestPolicy::AllowUnsigned` 下 Namespace 契约全绿 (mkdir/list/rename/delete)；空用户名经占位身份同样通过；`Deny` 下按预期拒绝 (未签名会话)。AD 内置 `guest` 账号返回 `OutcomeUnknown` (账号禁用状态在 smb-rs 里未细分) | **已实现** (`guest_policy`)。真正的 null session (空身份) 仍不可用 |
-| SMB1 多协议探测 (legacy `smb2_only`) | 直接 SMB 3.1.1 协商成功 (session `protocol=smb3`, `ntlmv2`) | **不实现** |
+| SMB1 多协议探测 (legacy `smb2_only`) | 协商结果是 SMB 3.1.1 (`protocol=smb3`, `ntlmv2`)，但**方言只反映协商结果，不代表没先发过 SMB1 帧**。实际上 `ConnectionConfig::smb2_only_negotiate` 是 `#[derive(Default)]` 上的 `bool`，默认 `false`，facade 此前每次建连都先发 legacy SMB1 多协议 NEGOTIATE | **已修** (smb-rs #73)：facade 固定 `smb2_only_negotiate = true`，始终直接 SMB2，且不提供开关。旧记录写成「不实现」是误判 —— 不是没实现，是默认行为从 legacy 的「跳过」悄悄变成了「发送」 |
 | Multichannel | 服务端 `multichannel=false`；dual LIF 靠两个地址 | **不实现** (需要时先改 smb-rs facade) |
 | 签名 | 服务端不强制 (`smb_signing=false`)；`WhenRequired` / `Required` 都能连 | 保持 `CifsSigningPolicy` |
 | 目录 rename | role `Rename` 对目录 → `Completed`，往返成功 (smb-rs `Directory::rename_replace`) | **已实现** |
