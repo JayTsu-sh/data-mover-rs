@@ -86,6 +86,22 @@ impl CifsSourceProtocol for MemoryCifs {
 
 #[async_trait]
 impl CifsNamespaceProtocol for MemoryCifs {
+    async fn stat(&self, path: &StoragePath) -> smb_domain::Result<CifsSourceFacts> {
+        CifsSourceProtocol::describe(self, path).await
+    }
+
+    async fn create_directory(&self, _path: &StoragePath) -> smb_domain::Result<()> {
+        Ok(())
+    }
+
+    async fn remove(&self, _path: &StoragePath) -> smb_domain::Result<()> {
+        Ok(())
+    }
+
+    async fn rename_entry(&self, _from: &StoragePath, _to: &StoragePath) -> smb_domain::Result<()> {
+        Ok(())
+    }
+
     async fn list(
         &self,
         path: &StoragePath,

@@ -2,8 +2,8 @@
 use bytes::Bytes;
 use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
 use data_mover::storage::{
-    BackendConfig, CifsBackendConfig, CifsSigningPolicy, LocalBackendConfig, Storage,
-    connect_backend,
+    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, LocalBackendConfig,
+    Storage, connect_backend,
 };
 use data_mover::transfer::{
     InflightLimits, ReadBackVerification, TransferIdentity, TransferOutcome, TransferPolicy,
@@ -17,14 +17,11 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 async fn real_share_checkpointed_and_atomic_replace_roundtrip() -> Result {
     let server = std::env::var("CIFS_REAL_SERVER")?;
     let share_name = std::env::var("CIFS_REAL_SHARE")?;
-    let client = smb_domain::Client::new();
+    let client = smb_client();
     let share = client
         .connect_share(
             &smb_domain::ShareTarget::new(&server, &share_name)?,
-            smb_domain::Credentials::ntlm(
-                std::env::var("CIFS_REAL_USER")?,
-                std::env::var("CIFS_REAL_PASS")?,
-            ),
+            smb_domain::Credentials::ntlm(raw_username()?, std::env::var("CIFS_REAL_PASS")?),
         )
         .await?;
     let remote = connect_remote(&server, &share_name).await?;
@@ -73,6 +70,7 @@ async fn real_share_checkpointed_and_atomic_replace_roundtrip() -> Result {
 async fn connect_remote(server: &str, share: &str) -> Result<Storage> {
     Ok(connect_backend(BackendConfig::Cifs(CifsBackendConfig {
         signing_policy: CifsSigningPolicy::default(),
+        guest_policy: guest_policy(),
         server: server.to_owned(),
         share: share.to_owned(),
         root: None,
@@ -261,14 +259,11 @@ async fn assert_mtime(storage: &Storage, path: &str) -> Result {
 async fn real_directory_mtime_apply_preserves_creation_time() -> Result {
     let server = std::env::var("CIFS_REAL_SERVER")?;
     let name = std::env::var("CIFS_REAL_SHARE")?;
-    let client = smb_domain::Client::with_signing_policy(smb_domain::SigningPolicy::WhenRequired);
+    let client = smb_client();
     let share = client
         .connect_share(
             &smb_domain::ShareTarget::new(&server, &name)?,
-            smb_domain::Credentials::ntlm(
-                std::env::var("CIFS_REAL_USER")?,
-                std::env::var("CIFS_REAL_PASS")?,
-            ),
+            smb_domain::Credentials::ntlm(raw_username()?, std::env::var("CIFS_REAL_PASS")?),
         )
         .await?;
     let path = format!("dm-cifs-metadata-dir-{}", uuid::Uuid::new_v4().simple());
@@ -317,4 +312,37 @@ async fn verify_directory_metadata(
     assert_eq!(before.created(), after.created());
     assert_eq!(before.accessed(), after.accessed());
     Ok(())
+}
+
+/// `CIFS_REAL_GUEST_POLICY=allow-unsigned` opts the real-share tests into guest sessions.
+fn guest_policy() -> CifsGuestPolicy {
+    if std::env::var("CIFS_REAL_GUEST_POLICY").is_ok_and(|value| value == "allow-unsigned") {
+        CifsGuestPolicy::AllowUnsigned
+    } else {
+        CifsGuestPolicy::Deny
+    }
+}
+
+fn smb_client() -> smb_domain::Client {
+    smb_domain::Client::with_policies(
+        smb_domain::SigningPolicy::WhenRequired,
+        match guest_policy() {
+            CifsGuestPolicy::AllowUnsigned => smb_domain::GuestPolicy::AllowUnsigned,
+            CifsGuestPolicy::Deny => smb_domain::GuestPolicy::Deny,
+        },
+    )
+}
+
+/// Raw smb-domain connections in these tests mirror the factory: an empty username under
+/// `allow-unsigned` becomes the placeholder identity that reaches the server's guest mapping.
+fn raw_username() -> std::result::Result<String, std::env::VarError> {
+    std::env::var("CIFS_REAL_USER").map(|user| raw_username_of(&user))
+}
+
+fn raw_username_of(user: &str) -> String {
+    if user.is_empty() && guest_policy() == CifsGuestPolicy::AllowUnsigned {
+        "anonymous".to_owned()
+    } else {
+        user.to_owned()
+    }
 }

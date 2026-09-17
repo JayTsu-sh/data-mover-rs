@@ -12,8 +12,8 @@
 | 文件 | LOC | 角色 |
 |---|---|---|
 | `lib.rs` | 542 | 公开 API + 模块导出 + `EntryEnum` / `Result` / `canonicalize_path` / `detect_storage_type` |
-| **`storage_enum.rs`** | **1334** | **enum-based dispatch 层**，`StorageEnum::{Local, NFS, S3, CIFS}` 用 match 分派 30+ 操作 |
-| `cifs.rs` | 2246 | CIFS/SMB backend (smb 0.11) |
+| **`storage_enum.rs`** | **1334** | **enum-based dispatch 层**，`StorageEnum::{Local, NFS, S3, HDFS}` 用 match 分派 30+ 操作 (CIFS 不在其中) |
+| `cifs.rs` | 36 | 仅 `create_cifs_role_storage` factory bridge；CIFS 实现在 `storage/backends/cifs/` (smb-domain) |
 | `nfs.rs` | 3100 | NFS v3/v4 backend (nfs-rs 0.2.0) |
 | `s3.rs` | 3350 | S3 backend (aws-sdk-s3 1.129.0) |
 | `local.rs` | 1134 | 本地文件系统 backend (std::fs + rayon) |
@@ -52,8 +52,7 @@
 | `local_walkdir.rs` | 本地递归扫描 + md5 | 无 |
 | `local_walkdir_2.rs` | walkdir_2 API 演示 | 无 |
 | `local_opt_dir.rs` | 创建优化目录结构 | 无 |
-| `cifs_copy.rs` | SMB → SMB 拷贝 (clap CLI) | SMB 服务器 |
-| `cifs_walkdir.rs` | 遍历 SMB share | SMB 服务器 |
+| `cifs_mount_comparison.rs` | role-based CIFS vs mounted Local 传输对比 (clap CLI) | SMB 服务器 (CIFS_REAL_*) |
 | `nfs_walkdir.rs` | NFS mount 遍历 | NFS 服务器 |
 | `nfs_export.rs` | NFS export 信息查询 | NFS 服务器 |
 | `nfs_opt_dir.rs` | NFS 上创建目录 | NFS 服务器 |
@@ -73,7 +72,7 @@
 | Crate | 版本 | 用途 |
 |---|---|---|
 | tokio | 1.51.1 (full) | 异步 runtime |
-| smb | 0.11 | CIFS/SMB 协议栈 |
+| smb-domain (package `smb`) | git JayTsu-sh/smb-rs `dbf1d31` | CIFS/SMB 协议栈 (domain facade) |
 | nfs-rs | 0.2.0 | NFS v3/v4 客户端 |
 | aws-sdk-s3 | 1.129.0 | S3 SDK |
 | binrw | 0.15 | CIFS FileTime / 目录条目二进制解析 |

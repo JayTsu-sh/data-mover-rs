@@ -156,12 +156,84 @@ impl Metadata for CifsMetadata {
                 FailureClass::Unsupported,
             ));
         };
-        let descriptor = decode_acl(path, &value)?;
+        let source = decode_acl(path, &value)?;
+        let target = self
+            .protocol
+            .get_acl(path)
+            .await
+            .map_err(|error| classify(path, Operation::Metadata, &error))?;
+        let Some(merged) = merge_dacl(&source, target) else {
+            return Ok(());
+        };
         self.protocol
-            .set_acl(path, descriptor)
+            .set_acl(path, merged)
             .await
             .map_err(|error| classify(path, Operation::Metadata, &error))
     }
+}
+
+/// Keeps only explicit DACL entries plus the inheritance-protection bit, mirroring the
+/// Windows `acl::copy_acl` contract: inherited ACEs belong to the destination tree.
+fn explicit_dacl(mut descriptor: smb_domain::SecurityDescriptor) -> smb_domain::SecurityDescriptor {
+    if let Some(dacl) = descriptor.dacl.as_mut() {
+        dacl.ace.retain(|ace| !ace.ace_flags.inherited());
+    }
+    descriptor
+}
+
+/// Builds the descriptor to apply: source explicit ACEs first, then the target's inherited
+/// ACEs (canonical order) unless the source DACL is protected, since `SE_DACL_PROTECTED`
+/// means the object stops inheriting. Stale explicit ACEs on the target are dropped so
+/// the result mirrors the source. Returns `None` when there is nothing to apply: the
+/// source has a NULL DACL (no ACL information, everyone-allowed on NTFS), or the target
+/// already matches (no explicit ACEs on either side and the same protection bit), so an
+/// unchanged file costs no `SET_INFO`.
+fn merge_dacl(
+    source: &smb_domain::SecurityDescriptor,
+    mut target: smb_domain::SecurityDescriptor,
+) -> Option<smb_domain::SecurityDescriptor> {
+    source.dacl.as_ref()?;
+    let source_protected = source.control.dacl_protected();
+    let explicit: Vec<_> = source
+        .dacl
+        .iter()
+        .flat_map(|dacl| dacl.ace.iter())
+        .filter(|ace| !ace.ace_flags.inherited())
+        .cloned()
+        .collect();
+    let target_has_explicit = target
+        .dacl
+        .as_ref()
+        .is_some_and(|dacl| dacl.ace.iter().any(|ace| !ace.ace_flags.inherited()));
+    if source_protected == target.control.dacl_protected()
+        && explicit.is_empty()
+        && !target_has_explicit
+    {
+        return None;
+    }
+    let revision = source
+        .dacl
+        .as_ref()
+        .or(target.dacl.as_ref())
+        .map_or(smb_domain::protocol::AclRevision::Nt4, |dacl| {
+            dacl.acl_revision
+        });
+    let mut ace = explicit;
+    match target.dacl.take() {
+        Some(dacl) if !source_protected => {
+            ace.extend(dacl.ace.into_iter().filter(|ace| ace.ace_flags.inherited()));
+        }
+        _ => {}
+    }
+    target.dacl = Some(smb_domain::protocol::ACL {
+        acl_revision: revision,
+        ace,
+    });
+    target.control = target
+        .control
+        .with_dacl_present(true)
+        .with_dacl_protected(source_protected);
+    Some(target)
 }
 
 fn decode_acl(
@@ -193,7 +265,7 @@ async fn observe_acl(
     match protocol.get_acl(path).await {
         Ok(descriptor) => {
             let mut output = Cursor::new(Vec::new());
-            descriptor
+            explicit_dacl(descriptor)
                 .write_le(&mut output)
                 .map_err(|_| entry_failure(path, Operation::Metadata, FailureClass::Protocol))?;
             let value =
@@ -447,6 +519,151 @@ mod tests {
             }
         ));
         assert_eq!(protocol.acl_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod acl_tests {
+    use std::str::FromStr as _;
+
+    use smb_domain::protocol::{
+        ACE, ACL, AccessAce, AccessMask, AceFlags, AceValue, AclRevision, SID, SecurityDescriptor,
+        SecurityDescriptorControl,
+    };
+
+    use super::{explicit_dacl, merge_dacl};
+
+    type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+    fn ace(sid: &str, inherited: bool) -> Result<ACE> {
+        Ok(ACE {
+            ace_flags: AceFlags::new().with_inherited(inherited),
+            value: AceValue::AccessAllowed(AccessAce {
+                access_mask: AccessMask::new().with_generic_read(true),
+                sid: SID::from_str(sid)?,
+            }),
+        })
+    }
+
+    fn descriptor(aces: Vec<ACE>, protected: bool) -> SecurityDescriptor {
+        SecurityDescriptor {
+            sbz1: 0,
+            control: SecurityDescriptorControl::new()
+                .with_self_relative(true)
+                .with_dacl_present(true)
+                .with_dacl_protected(protected),
+            owner_sid: None,
+            group_sid: None,
+            sacl: None,
+            dacl: Some(ACL {
+                acl_revision: AclRevision::Nt4,
+                ace: aces,
+            }),
+        }
+    }
+
+    fn sids(descriptor: &SecurityDescriptor) -> Vec<(String, bool)> {
+        descriptor
+            .dacl
+            .iter()
+            .flat_map(|dacl| dacl.ace.iter())
+            .map(|ace| {
+                let sid = match &ace.value {
+                    AceValue::AccessAllowed(value) => value.sid.to_string(),
+                    other => format!("{other:?}"),
+                };
+                (sid, ace.ace_flags.inherited())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn observation_keeps_only_explicit_aces_and_the_protection_bit() -> Result {
+        let observed = explicit_dacl(descriptor(
+            vec![ace("S-1-1-0", true)?, ace("S-1-5-32-545", false)?],
+            true,
+        ));
+        assert_eq!(sids(&observed), vec![("S-1-5-32-545".to_owned(), false)]);
+        assert!(observed.control.dacl_protected());
+        assert!(observed.control.dacl_present());
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_target_costs_no_set_info() -> Result {
+        let source = descriptor(Vec::new(), false);
+        let target = descriptor(vec![ace("S-1-1-0", true)?], false);
+        assert!(merge_dacl(&source, target).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn merge_puts_source_explicit_aces_before_target_inherited_ones() -> Result {
+        let source = descriptor(vec![ace("S-1-5-32-545", false)?], false);
+        let target = descriptor(
+            vec![ace("S-1-5-32-544", false)?, ace("S-1-1-0", true)?],
+            false,
+        );
+        let merged = merge_dacl(&source, target).ok_or("merge expected")?;
+        assert_eq!(
+            sids(&merged),
+            vec![
+                ("S-1-5-32-545".to_owned(), false),
+                ("S-1-1-0".to_owned(), true),
+            ]
+        );
+        assert!(!merged.control.dacl_protected());
+        assert!(merged.control.dacl_present());
+        Ok(())
+    }
+
+    #[test]
+    fn protected_source_stops_inheritance_on_the_target() -> Result {
+        let source = descriptor(vec![ace("S-1-5-32-545", false)?], true);
+        let target = descriptor(
+            vec![ace("S-1-5-32-544", false)?, ace("S-1-1-0", true)?],
+            false,
+        );
+        let merged = merge_dacl(&source, target).ok_or("merge expected")?;
+        assert_eq!(sids(&merged), vec![("S-1-5-32-545".to_owned(), false)]);
+        assert!(merged.control.dacl_protected());
+        Ok(())
+    }
+
+    #[test]
+    fn null_dacl_source_applies_nothing() -> Result {
+        let mut source = descriptor(Vec::new(), false);
+        source.dacl = None;
+        source.control = source.control.with_dacl_present(false);
+        let target = descriptor(vec![ace("S-1-5-32-544", false)?], true);
+        assert!(merge_dacl(&source, target).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_explicit_target_aces_are_cleared_when_source_has_none() -> Result {
+        let source = descriptor(Vec::new(), false);
+        let target = descriptor(
+            vec![ace("S-1-5-32-544", false)?, ace("S-1-1-0", true)?],
+            false,
+        );
+        let merged = merge_dacl(&source, target).ok_or("merge expected")?;
+        assert_eq!(sids(&merged), vec![("S-1-1-0".to_owned(), true)]);
+        Ok(())
+    }
+
+    #[test]
+    fn protection_bit_change_alone_triggers_an_update() -> Result {
+        let source = descriptor(Vec::new(), true);
+        let target = descriptor(vec![ace("S-1-1-0", true)?], false);
+        let merged = merge_dacl(&source, target).ok_or("merge expected")?;
+        assert!(merged.control.dacl_protected());
+        assert!(merged.control.dacl_present());
+        assert!(
+            sids(&merged).is_empty(),
+            "protected source without ACEs is deny-all"
+        );
         Ok(())
     }
 }

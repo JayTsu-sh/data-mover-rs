@@ -75,14 +75,27 @@
 
 ### CIFS
 
-| NTSTATUS | 映射到 |
-|---|---|
-| `STATUS_ACCESS_DENIED` | `PermissionDenied(...)` |
-| `STATUS_OBJECT_NAME_NOT_FOUND` | `FileNotFound(...)` |
-| `STATUS_OBJECT_PATH_NOT_FOUND` | `DirectoryNotFound(...)` |
-| `STATUS_DISK_FULL` | `InsufficientSpace(...)` |
-| `STATUS_OBJECT_NAME_COLLISION` | (`mkdir_or_open` 当成功) |
-| 其他 | `CifsError(...)` |
+CIFS 只有 role-based 实现，不经过 `StorageError`；映射表在
+`src/storage/backends/cifs/source.rs::classify_status`，产出 `FailureClass` + `Transience`：
+
+| NTSTATUS | FailureClass | Transience |
+|---|---|---|
+| `STATUS_OBJECT_NAME_NOT_FOUND` / `STATUS_OBJECT_PATH_NOT_FOUND` | `NotFound` | Permanent |
+| `STATUS_ACCESS_DENIED` | `PermissionDenied` | Permanent |
+| `STATUS_WRONG_PASSWORD` / `STATUS_LOGON_FAILURE` / `STATUS_USER_ACCOUNT_LOCKED_OUT` | `Authentication` | Permanent |
+| `STATUS_OBJECT_NAME_COLLISION` (mkdir 已存在) / `STATUS_DIRECTORY_NOT_EMPTY` (删非空目录) | `Conflict` | Permanent |
+| `STATUS_SHARING_VIOLATION` / `STATUS_DELETE_PENDING` | `Conflict` | Transient |
+| `STATUS_DISK_FULL` | `Capacity` | Permanent |
+| `STATUS_INVALID_PARAMETER` / `STATUS_OBJECT_NAME_INVALID` | `InvalidInput` | Permanent |
+| `STATUS_NOT_IMPLEMENTED` / `STATUS_NOT_SUPPORTED` / `STATUS_DEVICE_FEATURE_NOT_SUPPORTED` | `Unsupported` | Permanent |
+| `STATUS_CANCELLED` | `Cancelled` | Transient |
+| `STATUS_IO_TIMEOUT` / `STATUS_NETWORK_NAME_DELETED` / `STATUS_NETWORK_SESSION_EXPIRED` | `Connectivity` (session failure) | Transient |
+| 其他 NTSTATUS / 非状态类 smb 错误 | `Protocol` | Unknown |
+
+非状态类 smb-rs 错误：`NotFound` → NotFound；`MissingPermissions` → PermissionDenied；
+`InvalidArgument` → InvalidInput；`UnsupportedOperation` → Unsupported；`Cancelled` → Cancelled；
+`ConnectionStopped` / `SessionInvalidated` / `RuntimeTerminated` / `TransportError` → session 级 Connectivity。
+legacy 的"`OBJECT_NAME_COLLISION` 当成功"已随 #150 删除：role 返回 `Conflict`，由调用方决定是否幂等。
 
 ### Local
 

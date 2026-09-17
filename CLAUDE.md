@@ -1,6 +1,7 @@
 # data-mover-rs
 
-多源数据迁移核心库。4 backend (Local / NFS / S3 / CIFS) + filter DSL + work-stealing 并发遍历。
+多源数据迁移核心库。legacy `StorageEnum` 覆盖 Local / NFS / S3 / HDFS；CIFS 只有 role-based 实现
+(`src/storage/backends/cifs/`，经 `storage::connect_backend` 构造)。+ filter DSL + work-stealing 并发遍历。
 从 terrasync-rs 拆分独立 (commit `4289a15`)，仅库 (无 binary，无 GUI)。
 
 > 这是 Claude Code 的项目入口。先读这页路由，再按场景按需展开 `.claude/docs/`。
@@ -12,7 +13,7 @@
 - **Smallest change**。bug fix 与 refactor 分两个 commit。
 - **enum-based dispatch 同步规则**：改一个 backend 操作 = `src/storage_enum.rs` + 该 backend.rs + 可能 `src/lib.rs` 导出 + `examples/` + `tests/` 五处同步。漏一处就是潜在编译错或行为分裂。
 - **`.unwrap()` / `.expect()` 编译期 deny** (Cargo.toml `[lints.clippy]` 已强制)，仅 `#[cfg(test)]` 和测试 helper 例外。
-- **资源句柄走 `close_resource` helper** (cifs.rs 已有)，不要裸 `.close()`。S99 教训。
+- **资源句柄走 `close_resource` helper** (`src/storage/backends/cifs/protocol.rs` 已有)，不要裸 `.close()`。S99 教训。
 - **`Cancelled` ≠ `Error`**，是 `CancellationToken` 信号，上游可重入队 (commit `7eb3046` split retry taxonomy)。
 - **Backend 错误统一映射到 `StorageError` 24 个变体之一**。新增变体需要 PR 说明强需求。
 
@@ -20,7 +21,7 @@
 
 | 场景 | 先读这些 |
 |---|---|
-| 改 CIFS `smb2_only`/`anon`/`file_id` 行为 | `.claude/docs/storage-cifs.md` + `src/cifs.rs` |
+| 改 CIFS (role-based backend / signing / staged) | `.claude/docs/storage-cifs.md` + `src/storage/backends/cifs/` |
 | 改 NFS v3/v4 retry 分类 | `.claude/docs/storage-nfs.md` + `.claude/docs/error-taxonomy.md` + `src/nfs.rs` |
 | 改 S3 multipart / 404 / credential | `.claude/docs/storage-s3.md` + `src/s3.rs` |
 | 改 Local rayon delete / Win ACL | `.claude/docs/storage-local.md` + `src/local.rs` + `src/acl.rs` |
@@ -38,7 +39,7 @@
 | 跑某 backend 验证 | `.claude/skills/e2e-{cifs,nfs,s3,local}/SKILL.md` |
 | 跑取消语义 / filter DSL 测试 | `.claude/skills/op-{cancel,filter-dsl}/SKILL.md` |
 | 跑全套 (无外部环境) | `.claude/skills/harness-run/SKILL.md` 或 `make ci` |
-| 大文件拆分候选 (filter 4849 / s3 3350 / nfs 3100 / cifs 2246) | 调 `architect` agent，filter 优先调 `filter-expert` |
+| 大文件拆分候选 (filter 4849 / s3 3350 / nfs 3100) | 调 `architect` agent，filter 优先调 `filter-expert` |
 | 改 `StorageEnum` 操作时查漏 | 调 `dispatch-checker` agent |
 | commit 前自检 | 调 `reviewer` agent |
 | 新增 skill / 升级 rule / 加 agent | `.claude/docs/claude-onboarding.md` |
@@ -49,10 +50,10 @@
 - **Cargo.toml `[lints.clippy]`**：`pedantic = warn` + `unwrap_used = deny` + `expect_used = deny` + `dbg_macro / todo / unimplemented = warn`。
 - **`[lints.rust]`**：`unsafe_code = deny`。新增 unsafe 必须有 SAFETY 注释 + PR 说明。
 - **异步**：tokio (full)。**错误**：thiserror。**日志**：tracing。
-- **依赖管理**：默认全 crates.io，无 git patch (与 terrasync-rs 不同)。升级 `smb` / `nfs-rs` / `aws-sdk-s3` 是真实风险。
-  CIFS 架构迁移经项目授权允许固定 smb-rs commit：domain facade 固定 `main` 已验证提交；
-  历史 API 固定旧提交且仅可用于待 #150 删除的 `src/cifs.rs` 路径。不得使用浮动 branch，
-  不得让旧 API 进入 `src/storage/backends/cifs/`，#150 完成时删除旧提交依赖与本例外。
+- **依赖管理**：默认全 crates.io，无 `[patch.crates-io]` (与 terrasync-rs 不同)。升级 `smb-domain` / `nfs-rs` / `aws-sdk-s3` 是真实风险。
+  经项目授权的 git 固定：`smb-domain` (package `smb`) 固定 JayTsu-sh/smb-rs 已验证提交
+  `dbf1d31` (`feat/directory-rename`，= `18ed91d` + `Directory::rename` + `GuestPolicy` + 死代码清理)，`hdfs-native` 固定 fork
+  提交。不得使用浮动 branch。smb-rs 历史 API 依赖已随 legacy `CifsStorage` 删除 (#150)。
 
 ## 文件大小现状 (backlog，不是新增红线)
 
@@ -61,7 +62,6 @@
 | filter.rs | 4849 | 拆分候选 #1 (DSL lexer 可独立) |
 | s3.rs | 3350 | 拆分候选 |
 | nfs.rs | 3100 | 拆分候选 |
-| cifs.rs | 2246 | 拆分候选 |
 | storage_enum.rs | 1334 | dispatch 表，难拆 |
 | local.rs | 1134 | 边缘 |
 

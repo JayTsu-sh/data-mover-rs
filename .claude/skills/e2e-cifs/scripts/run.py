@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""e2e-cifs skill runner — 需要真 SMB 服务器。"""
+"""e2e-cifs skill runner — 需要真 SMB 服务器 (role-based CIFS backend)。"""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -15,49 +17,47 @@ sys.path.insert(0, str(SHARED))
 from assertions import assert_exit_code  # noqa: E402
 from env_loader import load_env, require  # noqa: E402
 from protocol_constants import PROJECT_ROOT  # noqa: E402
-from url_builder import cifs_url  # noqa: E402
+
+REQUIRED = ("CIFS_REAL_SERVER", "CIFS_REAL_SHARE", "CIFS_REAL_USER", "CIFS_REAL_PASS")
 
 
-def run(label: str, cmd: list[str]) -> int:
+def run(label: str, cmd: list[str], env: dict[str, str]) -> int:
     print(f"\n[skill e2e-cifs] $ {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT)
+    result = subprocess.run(cmd, cwd=PROJECT_ROOT, env=env)
     assert_exit_code(label, result.returncode)
     return result.returncode
 
 
 def main() -> int:
     env = load_env(SKILL_DIR)
-    require(env, "CIFS_HOST", "CIFS_SHARE", "CIFS_USER", "CIFS_PASS")
+    require(env, *REQUIRED)
 
-    host = env["CIFS_HOST"]
-    port = int(env.get("CIFS_PORT", 445))
-    share = env["CIFS_SHARE"]
-    user = env["CIFS_USER"]
-    password = env["CIFS_PASS"]
-    anon_share = env.get("CIFS_ANON_SHARE", "").strip()
+    child_env = dict(os.environ)
+    for key in (*REQUIRED, "CIFS_REAL_SECOND_SERVER", "CIFS_POLICY_TEST_BYTES", "CIFS_PROBE_NFS_URL", "CIFS_REAL_GUEST_POLICY"):
+        if key in env:
+            child_env[key] = env[key]
+    child_env.setdefault("CIFS_REAL_SECOND_SERVER", child_env["CIFS_REAL_SERVER"])
+    child_env.setdefault(
+        "DATA_MOVER_RECOVERY_DIR", tempfile.mkdtemp(prefix="data-mover-cifs-recovery-")
+    )
 
-    run("build cifs_walkdir", ["cargo", "build", "--example", "cifs_walkdir"])
-    run("build cifs_copy", ["cargo", "build", "--example", "cifs_copy"])
+    # role-based 传输入口必须能编译；实际传输由 policy contract 覆盖。
+    run(
+        "build cifs_mount_comparison",
+        ["cargo", "build", "--release", "--example", "cifs_mount_comparison"],
+        child_env,
+    )
+    for test in ("cifs_policy_contract", "cifs_namespace_contract", "cifs_capability_probe"):
+        run(
+            test,
+            ["cargo", "test", "--release", "--test", test, "--", "--ignored", "--nocapture"],
+            child_env,
+        )
 
-    matrix: list[tuple[str, str]] = []
-
-    # smb2_only=true (默认)
-    url_default = cifs_url(host, share, user, password, port=port, smb2_only=True, anon=False)
-    matrix.append(("smb2_only=true", url_default))
-
-    # smb2_only=false (老 NAS 兼容)
-    url_smb1 = cifs_url(host, share, user, password, port=port, smb2_only=False, anon=False)
-    matrix.append(("smb2_only=false", url_smb1))
-
-    # 匿名 share (可选)
-    if anon_share:
-        url_anon = cifs_url(host, anon_share, port=port, smb2_only=True, anon=True)
-        matrix.append(("anon=true", url_anon))
-
-    for label, url in matrix:
-        run(f"cifs_walkdir [{label}]", ["cargo", "run", "--example", "cifs_walkdir", "--", url])
-
-    print("\n[skill e2e-cifs] matrix passed:", [m[0] for m in matrix])
+    print(
+        "\n[skill e2e-cifs] passed: policy + namespace contracts on real share; "
+        "see [probe] lines above for capability evidence"
+    )
     return 0
 
 

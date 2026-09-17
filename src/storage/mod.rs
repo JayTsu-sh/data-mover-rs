@@ -22,8 +22,8 @@ pub use capability::{
     CapabilityValueError, PreflightPolicy, UnsupportedReason, ValidationGate,
 };
 pub use factory::{
-    BackendConfig, BackendConnectError, CifsBackendConfig, CifsSigningPolicy, HdfsBackendConfig,
-    LocalBackendConfig, NfsBackendConfig, S3BackendConfig, connect_backend,
+    BackendConfig, BackendConnectError, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy,
+    HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, connect_backend,
 };
 pub use handle::Storage;
 pub use roles::{

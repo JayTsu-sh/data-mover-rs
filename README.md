@@ -1,6 +1,8 @@
 # data-mover-rs
 
-Storage abstraction layer supporting Local, NFS, S3, and SMB/CIFS backends.
+Storage abstraction layer supporting Local, NFS, S3, HDFS, and SMB/CIFS backends.
+SMB/CIFS is available only through the role-based `storage::connect_backend` API;
+it has no `StorageEnum` variant and no URL form.
 
 ## Storage URL Formats
 
@@ -14,7 +16,7 @@ Storage abstraction layer supporting Local, NFS, S3, and SMB/CIFS backends.
 | StorageGRID (TLS) | `s3+sg+https://access_key:secret_key@bucket.host/prefix` |
 | DXN | `s3+dxn://access_key:secret_key@bucket.host:port/prefix` |
 | DXN (TLS) | `s3+dxn+https://access_key:secret_key@bucket.host/prefix` |
-| SMB/CIFS | `smb://user:password@host[:port]/share[/sub/path][?smb2_only=false]` |
+| SMB/CIFS | No URL. Use `connect_backend(BackendConfig::Cifs(CifsBackendConfig { .. }))` |
 
 ### S3 Timeout Environment Variables
 
@@ -38,7 +40,7 @@ error instead of being silently ignored.
 |---------|--------------|---------------|
 | Local | `4` | `8` |
 | NFS | `4` | `8` |
-| SMB/CIFS | `4` | `4` |
+| SMB/CIFS | `8` | `8` |
 | S3 | `4` | `5` |
 
 `DATA_MOVER_INFLIGHT=8`, `16`, or `24` sets both read and write depths.
@@ -68,8 +70,8 @@ The defaults are the recommended general-purpose settings. For a high-latency
 NFS path with sufficient server session capacity, `read=8` and `write=16` can
 improve throughput. S3 normally reaches its throughput knee around 4 to 8, and
 Local reads normally reach it around 4; raising them to 16 is generally not a
-good CPU/memory tradeoff. CIFS keeps its conservative 4/4 default because the
-shared lab does not yet provide a real SMB endpoint for performance tuning.
+good CPU/memory tradeoff. The role-based CIFS backend defaults to 8/8 and reads
+the same `DATA_MOVER_CIFS_*` variables through `TransferConcurrency::from_env`.
 
 ### QoS semantics
 
@@ -216,24 +218,34 @@ that need to accommodate endpoints with coarser timestamp resolution can use
 The `storage_integrity_check` example exposes the same behavior through
 `--mtime-auto-precision` and `--mtime-tolerance-ms`.
 
-### SMB/CIFS URL Parameters
+### SMB/CIFS connection
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `smb2_only` | `true` | `true`：直接发 SMB2 NegotiateRequest，跳过 SMB1 多协议探测帧，速度更快。`false`：先发 SMB1 探测帧再升级到 SMB2/3，兼容不接受直接 SMB2 握手的老设备或防火墙。 |
+SMB/CIFS has no URL form. Connect it explicitly through the role-based factory:
 
-**示例：**
+```rust
+use data_mover::model::{BackendIdentity, BackendKind};
+use data_mover::storage::{
+    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, connect_backend,
+};
 
+let storage = connect_backend(BackendConfig::Cifs(CifsBackendConfig {
+    signing_policy: CifsSigningPolicy::default(), // WhenRequired
+    guest_policy: CifsGuestPolicy::default(),     // Deny; AllowUnsigned for guest/anonymous shares
+    server: "nas01".into(),
+    share: "shared".into(),
+    username: "admin".into(),
+    password: "password".into(),
+    root: Some("data/2024".into()),
+    identity: BackendIdentity::new(BackendKind::Cifs, "nas01/shared")?,
+})).await?;
 ```
-# 默认（modern server，直接 SMB2 协商）
-smb://admin:password@nas01/shared
-smb://admin:password@nas01:445/shared/data
 
-# 显式关闭（兼容老设备，走 SMB1 多协议探测帧）
-smb://admin:password@nas01/shared?smb2_only=false
-
-# 匿名访问（空密码）
-smb://guest:@nas01/public
-```
-
-> 路径中的反斜杠 `\` 需 percent-encode 为 `%5C`。
+Credentials are NTLM only. Anonymous or guest shares need
+`guest_policy: CifsGuestPolicy::AllowUnsigned`: servers map unknown or password-less users
+to a guest session that cannot be signed, so `Deny` (the default) refuses it. With
+`AllowUnsigned` an empty `username` sends a placeholder identity for the server's guest
+mapping. The legacy `smb://` URL and `smb2_only` option were removed together with the
+legacy `CifsStorage` path (#150).
+`examples/cifs_mount_comparison.rs` and `tests/cifs_policy_contract.rs` read
+`CIFS_REAL_SERVER`, `CIFS_REAL_SECOND_SERVER`, `CIFS_REAL_SHARE`, `CIFS_REAL_USER`,
+and `CIFS_REAL_PASS`.

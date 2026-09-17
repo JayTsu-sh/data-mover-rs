@@ -285,7 +285,9 @@ fn classify_status(status: u32) -> (FailureClass, Transience) {
         Ok(Status::WrongPassword | Status::LogonFailure | Status::UserAccountLockedOut) => {
             (FailureClass::Authentication, Transience::Permanent)
         }
-        Ok(Status::ObjectNameCollision) => (FailureClass::Conflict, Transience::Permanent),
+        Ok(Status::ObjectNameCollision | Status::DirectoryNotEmpty) => {
+            (FailureClass::Conflict, Transience::Permanent)
+        }
         Ok(Status::SharingViolation | Status::DeletePending) => {
             (FailureClass::Conflict, Transience::Transient)
         }

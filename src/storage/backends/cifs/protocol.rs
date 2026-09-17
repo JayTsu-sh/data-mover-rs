@@ -135,6 +135,67 @@ impl CifsSourceProtocol for SmbDomainProtocol {
 
 #[async_trait]
 impl CifsNamespaceProtocol for SmbDomainProtocol {
+    async fn stat(&self, path: &StoragePath) -> smb_domain::Result<CifsSourceFacts> {
+        CifsSourceProtocol::describe(self, path).await
+    }
+
+    async fn create_directory(&self, path: &StoragePath) -> smb_domain::Result<()> {
+        let path = self.share_path(path)?;
+        let directory = self
+            .share
+            .open_directory(&path, smb_domain::DirectoryOpenOptions::create_new())
+            .await?;
+        close_directory(directory).await
+    }
+
+    async fn remove(&self, path: &StoragePath) -> smb_domain::Result<()> {
+        let kind = CifsSourceProtocol::describe(self, path).await?.kind;
+        let path = self.share_path(path)?;
+        if kind == EntryKind::Directory {
+            let directory = self
+                .share
+                .open_directory(&path, smb_domain::DirectoryOpenOptions::open_existing())
+                .await?;
+            let deleted = directory.delete().await;
+            let close = close_directory(directory).await;
+            deleted?;
+            close
+        } else {
+            let file = self
+                .share
+                .open_file(&path, smb_domain::FileOpenOptions::open_existing())
+                .await?;
+            let deleted = file.delete().await;
+            let close = close_file(file).await;
+            deleted?;
+            close
+        }
+    }
+
+    async fn rename_entry(&self, from: &StoragePath, to: &StoragePath) -> smb_domain::Result<()> {
+        let kind = CifsSourceProtocol::describe(self, from).await?.kind;
+        let from = self.share_path(from)?;
+        let to = self.share_path(to)?;
+        if kind == EntryKind::Directory {
+            let directory = self
+                .share
+                .open_directory(&from, smb_domain::DirectoryOpenOptions::open_existing())
+                .await?;
+            let renamed = directory.rename_replace(&to).await;
+            let close = close_directory(directory).await;
+            renamed?;
+            return close;
+        }
+        let file = self
+            .share
+            .open_file(&from, smb_domain::FileOpenOptions::open_existing())
+            .await?;
+        let renamed = file.rename_replace(&to).await;
+        let close = close_file(file).await;
+        renamed?;
+        close
+    }
+
     async fn list(
         &self,
         path: &StoragePath,

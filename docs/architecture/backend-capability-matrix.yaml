@@ -175,7 +175,7 @@ profiles:
       acl: {state: uncertified, gate: DM-CIFS-CONTRACT}
       xattr: unsupported
       tags: not_applicable
-      uid_gid_mode: {state: uncertified, gate: DM-CIFS-CONTRACT}
+      uid_gid_mode: {state: unsupported, reason: smb_exposes_no_posix_mode_fas2750_unix_volume_maps_server_side}
       timestamps: {state: uncertified, gate: DM-CIFS-CONTRACT}
       backend_fact_reconstruction: {state: required, source: persisted_snapshot_only}
       safe_protocol_retry: {state: uncertified, gate: DM-CIFS-CONTRACT, scope: smb_operation_replay_safety}

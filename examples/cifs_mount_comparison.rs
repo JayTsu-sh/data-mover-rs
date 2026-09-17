@@ -6,7 +6,8 @@ use clap::{Parser, ValueEnum};
 use data_mover::TransferConcurrency;
 use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
 use data_mover::storage::{
-    BackendConfig, CifsBackendConfig, CifsSigningPolicy, LocalBackendConfig, connect_backend,
+    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, LocalBackendConfig,
+    connect_backend,
 };
 use data_mover::transfer::{
     InflightLimits, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest,
@@ -86,6 +87,7 @@ async fn endpoint(
                 Signing::Required => CifsSigningPolicy::Required,
                 Signing::WhenRequired => CifsSigningPolicy::WhenRequired,
             },
+            guest_policy: CifsGuestPolicy::Deny,
             server: std::env::var(if side == "source" {
                 "CIFS_REAL_SERVER"
             } else {

@@ -34,6 +34,27 @@ pub enum CifsSigningPolicy {
     WhenRequired,
 }
 
+/// Controls whether a session the server downgraded to guest or anonymous may proceed.
+///
+/// Servers that map unknown or password-less users to a guest account (ONTAP
+/// `guest-unix-user`, Samba `map to guest`) answer with an unsigned guest session that has
+/// no session key; without `AllowUnsigned` the connection is refused. An empty `username`
+/// together with `AllowUnsigned` sends a placeholder identity so the server can apply its
+/// guest mapping.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CifsGuestPolicy {
+    /// Refuse guest and anonymous sessions (message integrity is preserved).
+    #[default]
+    Deny,
+    /// Accept unsigned guest or anonymous sessions when the server does not require signing.
+    AllowUnsigned,
+}
+
+/// Identity sent for an empty username under `CifsGuestPolicy::AllowUnsigned`; the NTLM
+/// layer rejects a truly empty identity, so guest mapping is reached through a name the
+/// server does not know.
+const ANONYMOUS_PLACEHOLDER_USER: &str = "anonymous";
+
 #[derive(Clone)]
 pub struct CifsBackendConfig {
     pub server: String,
@@ -43,6 +64,8 @@ pub struct CifsBackendConfig {
     pub password: String,
     /// Signing policy negotiated independently with each server.
     pub signing_policy: CifsSigningPolicy,
+    /// Guest / anonymous session policy; see [`CifsGuestPolicy`].
+    pub guest_policy: CifsGuestPolicy,
     pub identity: BackendIdentity,
 }
 
@@ -56,6 +79,7 @@ impl fmt::Debug for CifsBackendConfig {
             .field("username", &"<redacted>")
             .field("password", &"<redacted>")
             .field("signing_policy", &self.signing_policy)
+            .field("guest_policy", &self.guest_policy)
             .field("identity", &self.identity)
             .finish()
     }
@@ -145,13 +169,24 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
                 CifsSigningPolicy::Required => smb_domain::SigningPolicy::Required,
                 CifsSigningPolicy::WhenRequired => smb_domain::SigningPolicy::WhenRequired,
             };
-            let client = smb_domain::Client::with_signing_policy(signing);
+            let guest = match config.guest_policy {
+                CifsGuestPolicy::Deny => smb_domain::GuestPolicy::Deny,
+                CifsGuestPolicy::AllowUnsigned => smb_domain::GuestPolicy::AllowUnsigned,
+            };
+            let username = if config.username.is_empty()
+                && config.guest_policy == CifsGuestPolicy::AllowUnsigned
+            {
+                ANONYMOUS_PLACEHOLDER_USER.to_owned()
+            } else {
+                config.username
+            };
+            let client = smb_domain::Client::with_policies(signing, guest);
             let target = smb_domain::ShareTarget::new(&config.server, &config.share)
                 .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))?;
             let share = client
                 .connect_share(
                     &target,
-                    smb_domain::Credentials::ntlm(config.username, config.password),
+                    smb_domain::Credentials::ntlm(username, config.password),
                 )
                 .await
                 .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))?;

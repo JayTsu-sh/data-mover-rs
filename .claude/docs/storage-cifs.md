@@ -2,40 +2,57 @@
 
 ## 底层依赖与边界
 
-- Architecture-ready backend 使用 smb-rs domain facade：`Client → Session → Share → File / Directory`。
+- CIFS **只有** role-based 实现：`src/storage/backends/cifs/`，经
+  `storage::connect_backend(BackendConfig::Cifs(CifsBackendConfig { .. }))` 构造。
+  `src/cifs.rs` 只剩 `create_cifs_role_storage` 这一个 factory bridge (解析 inflight 环境变量后
+  调 `backends::cifs::connect`)。
+- 历史 `CifsStorage` / `StorageEnum::CIFS` / `create_cifs_storage` 及其 `smb://` URL 解析已随
+  #150 删除；`create_storage("smb://...")` 返回 `UnsupportedType`。`StorageType::Cifs` 仅保留给
+  `detect_storage_type` 识别 scheme。
+- backend 使用 smb-rs domain facade：`Client → Session → Share → File / Directory`。
 - data-mover 不得重新依赖 smb-rs 的 connection、runtime、wire create/query/set 类型或协议 handle。
-- `smb::protocol` 只允许用于 lossless ACL codec 等明确的协议值边界，普通 I/O 不使用。
-- `src/cifs.rs` 是待 #150 删除的历史公共路径；新功能只进入
-  `src/storage/backends/cifs/`。迁移期间的双版本依赖不是兼容承诺。
-- 经项目授权，新 domain facade 固定到 JayTsu-sh/smb-rs `feat/metadata-timestamps` 已验证提交
-  `18ed91d65c3c5bac22fde1f552d46e0771f11fac`；历史路径固定旧提交
-  `c3ecf0007a5477cfd954d4e6dda65c7abd765e71`。两者都不得改成浮动 branch，
-  旧提交及此迁移例外随 #150 删除。
+- `smb_domain::protocol` 只允许用于 lossless ACL codec 等明确的协议值边界，普通 I/O 不使用。
+- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = dbf1d31... }`
+  (分支 `feat/directory-rename` = `feat/metadata-timestamps` 的 `18ed91d` + `feat(domain): expose
+  directory rename` + `feat(facade): expose guest session policy` + `refactor(smb): remove dead
+  protocol paths hidden by dead_code allows`，后者删掉约 2400 行从未接线的 lease-slot 缓存 /
+  multichannel 残留 / 未用协议 helper，`runtime/port.rs` 的 `Legacy*` 别名改为 `Protocol*`)。不得改成浮动 branch。`[patch.crates-io] smb` 与
+  历史 API 提交 `c3ecf00` 已删除。
 
-## URL 形式
+## 连接配置
 
-```
-smb://[user[:password]@]host[:port]/share[/sub/path][?param=value&...]
-```
+没有 URL。`CifsBackendConfig` 字段：`server` / `share` / `username` / `password` /
+`root: Option<String>` (share 内子路径) / `identity: BackendIdentity` / `signing_policy`。
+凭据只有 NTLM (`smb_domain::Credentials::ntlm`)；facade 没有 `smb2_only`、multichannel 开关。
 
-示例：
+**匿名 / guest 访问**：`guest_policy: CifsGuestPolicy` (默认 `Deny`)。服务端把未知用户或空/错密码映射到
+guest 账号时 (ONTAP `vserver cifs options -guest-unix-user`，Samba `map to guest`)，会话没有 session
+key、不能签名 (MS-SMB2 3.2.5.3.1)，`Deny` 下客户端在最终 SessionSetup 应答处拒绝。设为 `AllowUnsigned`
+后接受未签名 guest 会话 (smb-rs `GuestPolicy`)。`username` 为空 + `AllowUnsigned` 时 factory 发送占位
+身份 `anonymous` (NTLM 层拒绝空身份，真正的 null session 不可用)，由服务端做 guest 映射。
+安全含义：guest 会话没有消息完整性；且 ONTAP 的 guest 映射是 SVM 级的——错密码也会被映射成 guest。
 
-```
-smb://admin:secret@nas01/shared
-smb://admin:secret@nas01:445/shared/data
-smb://admin:secret@nas01/shared?smb2_only=false
-smb://guest:@nas01/public                 # 匿名 (空密码)
-```
+## 与 legacy 路径的能力差异
 
-路径中的反斜杠 `\` 必须 percent-encode 为 `%5C`。
+legacy `CifsStorage` 中以下能力在 role-based backend 里**没有**对应物 (删除时的盘点)：
 
-## URL 参数
-
-| 参数 | 类型 | 默认 | 含义 | 来源 |
-|---|---|---|---|---|
-| `smb2_only` | bool | `true` | `true`：直接 SMB2 NegotiateRequest，跳过 SMB1 多协议探测帧 (快)。`false`：先 SMB1 探测再升级到 SMB2/3 (兼容老设备 / 防火墙)。 | commit `af0e017` |
-| `anon` | bool | (推断) | `true`：匿名访问 (空密码 + 无签名)。配合空 password 或 `guest:`。 | commit `9b332aa` |
-| `file_id` | (内部) | 自动 | 128-bit `FileIdExtdDirectory`，NTFS inode 编码为 `fh3` join key。 | commit `b1b9db1` |
+- `Namespace` 实现 `Stat` / `List` / `CreateDirectory` / `Delete` (文件或空目录) / `Rename`
+  (文件和目录，replace 语义与 NFS/HDFS 一致；目录 rename 走 smb-rs `Directory::rename_replace`，
+  SMB2 `FileRenameInformation` 对目录句柄同样有效)。`ReadLink` 返回 typed `Unsupported`：
+  facade 不暴露 reparse point，且 FAS2750 实测见下文"真实环境证据"。
+  已存在目录再 `CreateDirectory` → `Conflict` (与 Local 的 AlreadyExists 一致)，不再像 legacy
+  `mkdir_or_open` 那样吞掉 COLLISION；递归删除带进度 (`delete_dir_all_with_progress`) 与
+  `ensure_root_exists` 归调用方编排。
+- 遍历由通用 `traversal::StorageTraversalSource` 驱动，纯递归；filter DSL 剪枝、`max_depth`、
+  packaged/NDX 分页、work-stealing 归 terrasync。
+- 无 128-bit file id / info-class 探测；source identity 是 `len + written + changed`
+  (矩阵 `hardlink_topology: unsupported`，路径级 identity 足够)。
+- 无 `check_connectivity` / `probe_server_time`；`Metadata` 只支持 `Timestamps` 与 `Acl`，
+  numeric uid/gid/mode 标为 `Unsupported`：SMB 不暴露 POSIX mode，FAS2750 unix 卷上的 mode 由
+  服务端 name-mapping + umask 决定 (session 里 `mapped_unix_user=lisauser`)，客户端无法观察/应用。
+- 整文件 `read_file` / `write_file`、`set_file_len`、`.part` 续传、tar 直写按设计删除，
+  由 staged `Checkpointed` / `AtomicReplace` 替代。
+- 默认并发 8/8 (legacy 为 4/4)。
 
 ## 关键代码点
 
@@ -98,61 +115,79 @@ result
   数字 uid/gid/mode 不伪装成 Windows SID；自动跨协议复制会报告所有权未保留。
 - ACL 需要额外 storage call，因此 `Omit`/`InlineOnly` 不调用服务器；只有
   `BestEffort`/`Required` 才 query security descriptor。
+- ACL 语义与 Windows `src/acl.rs::copy_acl` 及 legacy `CifsStorage` 一致 (`metadata.rs`
+  `explicit_dacl` / `merge_dacl`)：observe 只保留**显式** (非 `INHERITED_ACE`) ACE + `SE_DACL_PROTECTED`
+  位；apply 先读目标 SD，源显式 ACE 在前、目标继承 ACE 在后合并 (canonical 顺序)，保护位取源端；
+  源端 `SE_DACL_PROTECTED` 时不保留目标继承 ACE (protected 就是停止继承)；源端 NULL DACL 不应用；
+  两端都无显式 ACE 且保护位相同时跳过 `SET_INFO`。与 `copy_acl` 的差异：源无显式 ACE 时
+  这里会清掉目标端多余的显式 ACE (严格镜像源端)，`copy_acl` 则直接跳过。编码仍是 self-relative `SecurityDescriptor` 字节
+  (`AclEncoding::WindowsSecurityDescriptor`)，与 `acl::get_acl_bytes` 的格式相同。
 - CIFS xattr、tags、numeric ownership 当前按 typed not-applicable/unsupported 体现，
   不通过 storage enum 做协议配对分支。
-
-### 历史 CreateDisposition
-
-- **写文件用 `CreateDisposition::OverwriteIf`** (commit `4051`)。
-- 早期用 Create + 追加，触发 Samba 服务器的 `STATUS_ACCESS_DENIED`。
-- OverwriteIf = 不存在则建，存在则截断。最稳。
-
-### Rename
-
-- **必须用 share-relative 路径**，不是 UNC 全路径 (commit `4052`)。
-- `FileRenameInformation` 字段填 `\sub\path\target.txt` (相对 share 根)，不是 `\\server\share\sub\path\target.txt`。
-
-### Mkdir
-
-- `mkdir_or_open` helper：`STATUS_OBJECT_NAME_COLLISION` 当作成功 (节省 1 RT 每个已存在目录)。
-- 详见 commit `4061`。
-
-### File ID
-
-- 用 `FileIdExtdDirectory` info class (128-bit)，不是旧的 `FileIdBothDirectory` (64-bit)。
-- 通过 `info-class probe` 在连接时探测服务器是否支持 (commit `b1b9db1`)。
-- 探测结果缓存在 `CifsStorage::file_id_class` (`OnceCell` + `Mutex<()>` 双层，热路径 lock-free)。
 
 ### FileTime ↔ Unix nanos
 
 - SMB FileTime = 100ns ticks since 1601-01-01 UTC。
 - 转换在 `time_util.rs`，不要散写。
 
+### 来自 legacy 路径的协议经验 (代码已删，经验保留)
+
+- 写文件用 `CreateDisposition::OverwriteIf`：早期 Create + 追加触发 Samba `STATUS_ACCESS_DENIED`
+  (commit `4051`)。现在由 smb-domain `File` open options 封装。
+- Rename 必须用 share-relative 路径，不是 UNC 全路径 (commit `4052`)。smb-domain `rename_replace` 已封装。
+- mkdir 时 `STATUS_OBJECT_NAME_COLLISION` 应视为成功 (commit `4061`)。
+- 目录列举优先 `FileIdExtdDirectory` (128-bit id)，`FileIdBothDirectory` 只有 64-bit (commit `b1b9db1`)。
+
+## 真实环境证据 (FAS2750 / ONTAP 9.19.1，2026-09-16)
+
+来源：`tests/cifs_capability_probe.rs` (`[probe]` 行)、`tests/cifs_namespace_contract.rs`、
+`tests/cifs_policy_contract.rs` 与 ONTAP REST。share `ontap_lisaauto_cifs` (SVM `lizy`，AD 域
+CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201 分属两个节点)。
+
+| 项 | 实测 | 决定 |
+|---|---|---|
+| 匿名 / guest (legacy `anon`) | 默认配置下：空身份被 NTLM 层拒绝，实名空/错密码 `STATUS_WRONG_PASSWORD`。设置 `guest-unix-user=pcuser` 并建 share `dm_anon_share` (Everyone full_control) 后：未知用户 + 空密码被接受为 guest，`CifsGuestPolicy::AllowUnsigned` 下 Namespace 契约全绿 (mkdir/list/rename/delete)；空用户名经占位身份同样通过；`Deny` 下按预期拒绝 (未签名会话)。AD 内置 `guest` 账号返回 `OutcomeUnknown` (账号禁用状态在 smb-rs 里未细分) | **已实现** (`guest_policy`)。真正的 null session (空身份) 仍不可用 |
+| SMB1 多协议探测 (legacy `smb2_only`) | 直接 SMB 3.1.1 协商成功 (session `protocol=smb3`, `ntlmv2`) | **不实现** |
+| Multichannel | 服务端 `multichannel=false`；dual LIF 靠两个地址 | **不实现** (需要时先改 smb-rs facade) |
+| 签名 | 服务端不强制 (`smb_signing=false`)；`WhenRequired` / `Required` 都能连 | 保持 `CifsSigningPolicy` |
+| 目录 rename | role `Rename` 对目录 → `Completed`，往返成功 (smb-rs `Directory::rename_replace`) | **已实现** |
+| Namespace `Stat/CreateDirectory/Delete/Rename` | 契约全绿；已存在目录再 mkdir → `Conflict`；rename 替换已存在文件成功 | **已实现** |
+| 符号链接 | NFS 建的 UNIX symlink 在 SMB 列举里始终是 0 字节普通文件，不带 reparse 标记。share `symlink-properties` 为空 (本 share 默认)：`open` → `STATUS_ACCESS_DENIED`，role Stat → `PermissionDenied` (ONTAP 文档化行为)；临时设为 `enable`：服务端跟随，悬空链接呈现为 len=0 的 File，Stat → File。两种配置下客户端都无法识别它是链接；smb-rs 也无 `FSCTL_GET_REPARSE_POINT` | **不实现**。`ReadLink` 保持 typed `Unsupported`；遍历遇到时按 entry failure (PermissionDenied) 隔离，不中断 |
+| ACL | query 正常 (2.9 KB SD 含 DACL)；显式/继承合并路径下 policy contract 通过 | **已实现** (见 Metadata observation) |
+| uid/gid/mode | facade `ResourceMetadata` 只有 4 个时间 + len；服务端 unix 卷由 name-mapping 决定 mode | **不实现**，矩阵改 `unsupported` |
+| 时钟 / 精度 | 服务器比本机快 ~550 ms；written 时间戳 100 ns 对齐 | 无需 `probe_server_time` |
+| 根目录列举 | 7 项 8–60 ms | — |
+
+复现：`.claude/skills/e2e-cifs` (`CIFS_REAL_*`)。symlink probe 需要 `CIFS_PROBE_NFS_URL`
+(`nfs://<lif>/<vol>:/?uid=0&gid=0&noresvport=true`)；WSL2 NAT 会改写源端口，ONTAP
+`mount_root_only=true` 时会 `AUTH_TOOWEAK`，测试期间需临时关闭并事后恢复。
+
 ## 已知陷阱
 
 | 陷阱 | 应对 |
 |---|---|
-| Samba `STATUS_ACCESS_DENIED` on write | 用 `CreateDisposition::OverwriteIf` |
-| Rename 用 UNC 路径失败 | 改 share-relative |
-| 老 NAS 不接受直接 SMB2 协商 | 用户加 `?smb2_only=false` |
-| 匿名 share 不能签名 | 加 `?anon=true` 或空密码 |
+| Samba `STATUS_ACCESS_DENIED` on write | smb-domain open options 用 OverwriteIf 语义 |
+| Rename 用 UNC 路径失败 | 改 share-relative (smb-domain 已封装) |
+| 服务器要求签名 | 始终遵守；`CifsSigningPolicy::Required` 可强制 |
+| 未知用户/空密码报 "Message not signed ... signing is required" | 服务端做了 guest 映射，会话无法签名；需要 `CifsGuestPolicy::AllowUnsigned` (注意无完整性保护) |
 | 长 session 句柄耗尽 | 检查所有 close 路径走 `close_resource` |
-| `FileIdBothDirectory` 不可用 | 已切到 `FileIdExtdDirectory` |
-| `mkdir` 已存在报错 | `mkdir_or_open` 把 `OBJECT_NAME_COLLISION` 当成功 |
+| 符号链接 | facade 不暴露 reparse point；`ReadLink` 返回 typed `Unsupported` (实测见"真实环境证据") |
+| 目录 rename 目标已存在 | NTFS 语义下不能替换非空目录，服务器返回 COLLISION/ACCESS_DENIED → `Conflict`/`PermissionDenied` |
 
 ## 测试
 
-- `examples/cifs_copy.rs` — clap CLI，src + dst 两个 SMB URL。
-- `examples/cifs_walkdir.rs` — 遍历单 share。
-- `tests/cifs_policy_contract.rs` — 显式配置 CIFS_REAL_* 环境变量后运行的真实双 LIF 策略测试。
-- skill：`.claude/skills/e2e-cifs/` (需要 `.env` 填测试服务器)。
+- `examples/cifs_mount_comparison.rs` — role-based 传输入口，`--transport client` 走 CIFS backend，
+  读 `CIFS_REAL_SERVER` / `CIFS_REAL_SECOND_SERVER` / `CIFS_REAL_SHARE` / `CIFS_REAL_USER` / `CIFS_REAL_PASS`。
+- `tests/cifs_policy_contract.rs` — 同一组 CIFS_REAL_* 环境变量下运行的真实双 LIF 策略测试 (`#[ignore]`)。
+- 无外部依赖的单测：`src/storage/backends/cifs/*_tests.rs` (in-memory protocol)。
+- skill：`.claude/skills/e2e-cifs/` (需要 `.env` 填 CIFS_REAL_*)。
 
 ## 改 CIFS 时
 
-1. 读本 doc + 本 backend 当前的 `src/cifs.rs`。
+1. 读本 doc + `src/storage/backends/cifs/` (protocol / source / staged / metadata / namespace)。
 2. 调 `backend-specialist` agent 传 `cifs`。
 3. 改完跑 `make e2e-cifs` (需测试服务器)，否则至少 `make clippy && make test`。
-4. 如果改的是公开操作 → 走 [storage-enum-dispatch.md](storage-enum-dispatch.md) 五处同步。
+4. CIFS 不在 `StorageEnum` 里；新增对外能力走 role (`Namespace` / `Metadata` / ...) 而不是 enum 分派。
 
 ## 签名策略
 
@@ -165,4 +200,3 @@ result
 服务端要求签名时始终遵守；SMB 3.1.1 TREE_CONNECT、认证/绑定及加密完整性保护保留。
 无加密且省略签名时，普通流量不具备 SMB 消息完整性保护。
 基准例子提供 `--signing required|when-required`，默认使用协商策略。
-历史 `StorageEnum` 路径保持原实现；此配置只作用于新的 backend 工厂。

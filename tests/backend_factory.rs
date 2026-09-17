@@ -2,7 +2,8 @@ use std::num::NonZeroUsize;
 
 use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
 use data_mover::storage::{
-    BackendConfig, CifsBackendConfig, CifsSigningPolicy, LocalBackendConfig, connect_backend,
+    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, LocalBackendConfig,
+    connect_backend,
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use tokio_util::sync::CancellationToken;
@@ -11,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 fn cifs_config_debug_never_exposes_credentials() -> Result<(), Box<dyn std::error::Error>> {
     let config = CifsBackendConfig {
         signing_policy: CifsSigningPolicy::default(),
+        guest_policy: CifsGuestPolicy::default(),
         server: "server".to_string(),
         share: "share".to_string(),
         root: None,
