@@ -52,7 +52,7 @@
 - **异步**：tokio (full)。**错误**：thiserror。**日志**：tracing。
 - **依赖管理**：默认全 crates.io，无 `[patch.crates-io]` (与 terrasync-rs 不同)。升级 `smb-domain` / `nfs-rs` / `aws-sdk-s3` 是真实风险。
   经项目授权的 git 固定：`smb-domain` (package `smb`) 固定 JayTsu-sh/smb-rs 已验证提交
-  `dbf1d31` (`feat/directory-rename`，= `18ed91d` + `Directory::rename` + `GuestPolicy` + 死代码清理)，`hdfs-native` 固定 fork
+  `dbf1d31` (已随 smb-rs PR #70/#71 合入 main，= `18ed91d` + `Directory::rename` + `GuestPolicy` + 死代码清理)，`hdfs-native` 固定 fork
   提交。不得使用浮动 branch。smb-rs 历史 API 依赖已随 legacy `CifsStorage` 删除 (#150)。
 
 ## 文件大小现状 (backlog，不是新增红线)
