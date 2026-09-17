@@ -3,6 +3,7 @@
 pub(crate) mod artifacts;
 pub(crate) mod backends;
 mod capability;
+mod create_dir;
 mod delete_tree;
 pub(crate) mod durability;
 mod factory;
@@ -23,6 +24,7 @@ pub use capability::{
     BackendCapabilities, Capability, CapabilityAvailability, CapabilityUnavailable,
     CapabilityValueError, PreflightPolicy, UnsupportedReason, ValidationGate,
 };
+pub use create_dir::{CreateDirectoryAllFailure, create_directory_all};
 pub use delete_tree::{
     DeleteTreeCompletion, DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest, DeleteTreeSession,
     DeleteTreeTerminalFailure, delete_tree,

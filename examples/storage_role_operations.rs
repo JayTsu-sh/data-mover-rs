@@ -2,8 +2,8 @@
 //! filtered / depth-limited traversal, NDX paging, recursive delete, and cross-endpoint
 //! integrity.
 //!
-//! Local lends no namespace role, so `delete-tree` and `ndx-walk` need a NAS backend;
-//! `traverse` and `compare` work anywhere.
+//! Local lends no namespace role, so `create-dir`, `delete-tree` and `ndx-walk` need a NAS
+//! backend; `traverse` and `compare` work anywhere.
 //!
 //! ```text
 //! cargo run --example storage_role_operations -- traverse --backend local --root /tmp/tree \
@@ -30,7 +30,7 @@ use data_mover::model::{
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, DeleteTreeItem,
     DeleteTreeRequest, LocalBackendConfig, NdxWalkRequest, NfsBackendConfig, Storage,
-    connect_backend, delete_tree, ndx_walk,
+    connect_backend, create_directory_all, delete_tree, ndx_walk,
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
@@ -104,6 +104,11 @@ enum Command {
         files: usize,
         #[arg(long, default_value_t = 4096)]
         bytes: usize,
+    },
+    /// Create every missing component of a path, idempotently.
+    CreateDir {
+        #[arg(long)]
+        path: String,
     },
     /// Delete a subtree, reporting progress per entry.
     DeleteTree {
@@ -327,6 +332,15 @@ async fn seed(storage: &Storage, args: &Args, command: &Command) -> Result<(), E
     Ok(())
 }
 
+async fn make_directory(storage: &Storage, command: &Command) -> Result<(), Error> {
+    let Command::CreateDir { path } = command else {
+        unreachable!("dispatched by the caller")
+    };
+    create_directory_all(storage, &StoragePath::new(path.clone())?).await?;
+    println!("created {path}");
+    Ok(())
+}
+
 async fn remove_tree(storage: &Storage, args: &Args, command: &Command) -> Result<(), Error> {
     let Command::DeleteTree { path, delete_root } = command else {
         unreachable!("dispatched by the caller")
@@ -398,6 +412,7 @@ async fn main() -> Result<(), Error> {
         Command::Seed { .. } => seed(&storage, &args, &args.command).await,
         Command::Traverse { .. } => traverse(&storage, &args, &args.command).await,
         Command::NdxWalk { .. } => ndx_walk_pages(&storage, &args, &args.command).await,
+        Command::CreateDir { .. } => make_directory(&storage, &args.command).await,
         Command::DeleteTree { .. } => remove_tree(&storage, &args, &args.command).await,
         Command::Compare { .. } => compare(storage, &args, &args.command).await,
     }
