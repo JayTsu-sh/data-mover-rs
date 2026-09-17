@@ -90,6 +90,10 @@ legacy `CifsStorage` 的能力在 role-based backend 里的去向 —— 有对�
   (domain/mod.rs:845) 只有四个时间戳和长度，没有任何属性位，填 `false` 会让 stat 谎报"不是只读"。
   这个值是**展示级**的，不进 `MetadataObservations.ownership_mode` (那仍是 `NotApplicable`)：
   塞进去会让 transfer engine 以为可以 apply，目标端会被写错权限。apply 侧不做 (legacy 也没做)。
+  **注意两条遍历线报的 mode 不一样**：`ndx_walk` 的 `NASEntry.mode` 有这个近似值，而
+  `traversal::StorageTraversalSource` 产出的 `ObservedEntry` 根本不带 mode
+  (`ownership_mode` 是 `NotApplicable`)。同一个条目、两条线、两种答案 —— 这是
+  `inline_mode` 只服务于 NDX 输出的直接后果。
   根治要给 smb-rs 的 `RuntimeMetadata` / `ResourceMetadata` 加属性位 —— 底层 stat 本来就在查
   `FileBasicInformation`，数据已在响应里、零额外往返，适合和 file id 合成同一个上游 PR。
 - **列举里的 reparse point 一律当普通文件**。`protocol.rs list` 明确不把它映射成 `Symlink`

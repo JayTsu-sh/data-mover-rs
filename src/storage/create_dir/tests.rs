@@ -84,6 +84,21 @@ impl FakeNamespace {
             .clone()
     }
 
+    /// Whether some strict ancestor of `path` exists as a file.
+    fn blocked_by_file_ancestor(&self, path: &str) -> bool {
+        let mut prefix = String::new();
+        for component in path.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            if prefix.len() < path.len() && self.files.contains(&prefix) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn record(&self, call: String) {
         self.calls
             .lock()
@@ -147,6 +162,11 @@ impl Namespace for FakeNamespace {
                     // directory, which is exactly why the leaf gets verified.
                     return Err(entry_failure(&path, FailureClass::Conflict));
                 }
+                if self.blocked_by_file_ancestor(path.as_str()) {
+                    // CIFS / HDFS behaviour: a file at an ancestor level makes the level below
+                    // it fail on its own, which is the argument for not verifying every level.
+                    return Err(entry_failure(&path, FailureClass::NotFound));
+                }
                 let fresh = self
                     .directories
                     .lock()
@@ -207,10 +227,14 @@ async fn an_existing_tree_is_a_success_whichever_way_the_backend_reports_it() ->
     for existing in [ExistingBehaviour::Conflict, ExistingBehaviour::Completed] {
         let namespace = FakeNamespace::with_existing_directories(existing, &["a", "a/b", "a/b/c"]);
         create_directory_all_with_namespace(namespace.as_ref(), &path("a/b/c")?).await?;
-        assert!(
-            namespace.calls().contains(&"mkdir a/b/c".to_owned()),
-            "every level is still attempted"
-        );
+        let expected = match existing {
+            // A Conflict at the leaf buys one Stat to prove it is a directory.
+            ExistingBehaviour::Conflict => {
+                vec!["mkdir a", "mkdir a/b", "mkdir a/b/c", "stat a/b/c"]
+            }
+            ExistingBehaviour::Completed => vec!["mkdir a", "mkdir a/b", "mkdir a/b/c"],
+        };
+        assert_eq!(namespace.calls(), expected);
     }
     Ok(())
 }
@@ -265,8 +289,9 @@ async fn the_backend_root_is_never_requested() -> Result {
 #[tokio::test]
 async fn repeated_separators_collapse_instead_of_creating_empty_levels() -> Result {
     let namespace = FakeNamespace::new(ExistingBehaviour::Conflict);
-    // `StoragePath` may normalise this itself; either way no empty component may be requested.
-    let target = StoragePath::new("a//b").or_else(|_| StoragePath::new("a/b"))?;
+    // `StoragePath` accepts this spelling, so the helper is what must not request an empty
+    // level between the two separators.
+    let target = StoragePath::new("a//b")?;
     create_directory_all_with_namespace(namespace.as_ref(), &target).await?;
     assert_eq!(namespace.calls(), vec!["mkdir a", "mkdir a/b"]);
     Ok(())
@@ -311,5 +336,25 @@ async fn a_permission_failure_propagates_rather_than_being_treated_as_existing()
         return Err(format!("expected a role failure, got {outcome:?}").into());
     };
     assert_eq!(super::class_of(&failure), FailureClass::PermissionDenied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_file_at_an_intermediate_level_surfaces_through_the_level_below_it() -> Result {
+    let namespace = FakeNamespace::with_existing_file(ExistingBehaviour::Conflict, "a");
+    let outcome = create_directory_all_with_namespace(namespace.as_ref(), &path("a/b")?).await;
+    let Err(CreateDirectoryAllFailure::Role(failure)) = outcome else {
+        return Err(format!("expected a role failure, got {outcome:?}").into());
+    };
+    assert_eq!(
+        super::class_of(&failure),
+        FailureClass::NotFound,
+        "the deeper level fails on its own, which is why intermediate levels are not verified"
+    );
+    assert_eq!(
+        namespace.calls(),
+        vec!["mkdir a", "mkdir a/b"],
+        "no Stat is spent on the intermediate level"
+    );
     Ok(())
 }

@@ -12,11 +12,19 @@
 //!   Both are treated as "this level exists now".
 //! - **Only the leaf is verified on conflict.** A conflict costs one extra `Stat` at the leaf
 //!   to prove the existing entry is a directory rather than a file. Intermediate levels skip
-//!   that check on purpose: if one were a file, creating the level below it fails anyway, so
+//!   that check on CIFS and HDFS, where a file in the way makes the level below it fail, so
 //!   the mistake cannot pass silently — only the leaf could.
-//! - **No cross-call cache.** The legacy `DirExistsCache` lived in the backend because there
-//!   was no role layer; which destination directories a session already created is caller
-//!   state, so it belongs to the caller.
+//!
+//!   **NFS is the exception, and it is not this helper's doing.** Its `CreateDirectory`
+//!   forwards to `nfs::create_dir_all`, which deletes a non-directory blocking a component and
+//!   retries, by deliberate rsync-style migration semantics (`src/nfs.rs`, logged at `warn`).
+//!   So on NFS a file at any level — leaf included — is removed rather than reported, and the
+//!   leaf `Stat` then sees the directory that replaced it. Verifying intermediate levels here
+//!   would not change that: the delete happens inside the one call this helper makes.
+//! - **No cross-call cache in this layer.** The legacy `DirExistsCache` lived in the backend
+//!   because there was no role layer; which destination directories a session already created
+//!   is caller state, so it belongs to the caller. Backends may still cache below the role:
+//!   the NFS adapter keeps a process-wide directory-handle cache.
 //! - **The backend root always exists.** An empty path is a no-op, never a request: the HDFS
 //!   namespace refuses a root-targeted `CreateDirectory` outright.
 
@@ -26,7 +34,9 @@ use super::{
     CapabilityUnavailable, Namespace, NamespaceRequest, NamespaceResult, PreflightPolicy, Storage,
     StorageRoleFailure,
 };
-use crate::model::{EntryKind, FailureClass, StoragePath};
+use crate::model::{
+    EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
+};
 
 /// Why a recursive directory creation could not complete.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,8 +131,8 @@ async fn create_level(
     if !is_leaf {
         return Ok(());
     }
-    // The leaf is the only level whose conflict could hide a file: a file at an intermediate
-    // level makes the next level's creation fail on its own.
+    // The leaf is the only level whose conflict could hide a file where the backend reports
+    // one at all; see the NFS exception in the module docs.
     match namespace.execute(NamespaceRequest::Stat(level)).await {
         Ok(NamespaceResult::Entries(entries))
             if entries
@@ -146,11 +156,11 @@ fn class_of(failure: &StorageRoleFailure) -> FailureClass {
 
 fn invalid(path: &StoragePath) -> CreateDirectoryAllFailure {
     CreateDirectoryAllFailure::Role(StorageRoleFailure::Entry(
-        crate::model::EntryOperationFailure::new(
+        EntryOperationFailure::new(
             path.clone(),
-            crate::model::Operation::Namespace,
+            Operation::Namespace,
             FailureClass::InvalidInput,
-            crate::model::Transience::Permanent,
+            Transience::Permanent,
             "path component is not a valid storage path",
         )
         .unwrap_or_else(|_| unreachable!("the static diagnostic is valid")),

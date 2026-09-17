@@ -245,6 +245,7 @@ async fn ndx_walk_pages(storage: &Storage, args: &Args, command: &Command) -> Re
                 .transpose()?,
             concurrency: NonZeroUsize::new(args.concurrency)
                 .ok_or("concurrency must be non-zero")?,
+            cancel: CancellationToken::new(),
         },
     )?;
     let (mut pages, mut counted, mut failures) = (0_u64, 0_u64, 0_u64);

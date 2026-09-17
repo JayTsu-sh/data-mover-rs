@@ -3,6 +3,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use super::{NdxWalkRequest, ndx_walk};
 use crate::dir_tree::{DirPageResult, NdxEvent};
@@ -34,6 +35,8 @@ enum Listing {
     EntryFailure,
     /// A broken session.
     SessionFailure,
+    /// The backend reports the operation was cancelled.
+    Cancelled,
 }
 
 struct TreeNamespace {
@@ -113,11 +116,15 @@ fn children(
 }
 
 fn entry_failure(target: &StoragePath) -> StorageRoleFailure {
+    entry_failure_with(target, FailureClass::PermissionDenied)
+}
+
+fn entry_failure_with(target: &StoragePath, class: FailureClass) -> StorageRoleFailure {
     StorageRoleFailure::Entry(
         EntryOperationFailure::new(
             target.clone(),
             Operation::Traverse,
-            FailureClass::PermissionDenied,
+            class,
             Transience::Permanent,
             "listing refused by the test namespace",
         )
@@ -164,6 +171,7 @@ impl Namespace for TreeNamespace {
             }
             Some(Listing::EntryFailure) => Err(entry_failure(&target)),
             Some(Listing::SessionFailure) => Err(session_failure()),
+            Some(Listing::Cancelled) => Err(entry_failure_with(&target, FailureClass::Cancelled)),
             None => Ok(NamespaceResult::Entries(Vec::new())),
         }
     }
@@ -202,6 +210,7 @@ fn request(root: StoragePath) -> Result<NdxWalkRequest> {
         match_expressions: None,
         exclude_expressions: None,
         concurrency: NonZeroUsize::new(2).ok_or("concurrency must be non-zero")?,
+        cancel: CancellationToken::new(),
     })
 }
 
@@ -469,33 +478,194 @@ async fn a_listing_without_timestamps_is_refused_instead_of_reporting_the_epoch(
 
     assert_eq!(errors.len(), 1, "one aggregated error, not one per entry");
     assert!(
-        errors[0].contains("no inline timestamps"),
+        errors[0].contains("carry no inline modification time"),
         "error explains why the directory was refused: {errors:?}"
     );
     assert!(
-        pages.iter().all(|page| page.files.is_empty()),
-        "no entry is emitted with an epoch modification time"
+        pages.is_empty(),
+        "a refused directory emits no page at all, so nothing carries an epoch mtime: {pages:?}"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn a_broken_session_drops_its_frame_without_ending_the_walk() -> Result {
+async fn a_refused_directory_takes_its_whole_subtree_with_it() -> Result {
+    let namespace = TreeNamespace::new(vec![
+        (
+            "",
+            Listing::WithoutTimestamps(vec![("sub", EntryKind::Directory)]),
+        ),
+        ("sub", Listing::Entries(vec![("deep.txt", EntryKind::File)])),
+    ]);
+    let storage = storage(Arc::clone(&namespace))?;
+    let (pages, errors) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+
+    assert_eq!(errors.len(), 1);
+    assert!(pages.is_empty(), "nothing is emitted: {pages:?}");
+    assert_eq!(
+        namespace.listed(),
+        vec![""],
+        "the subtree below a refused directory is never listed"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_present_record_without_a_modification_time_is_refused_too() -> Result {
+    struct UndatedNamespace;
+    #[async_trait]
+    impl Namespace for UndatedNamespace {
+        async fn execute(
+            &self,
+            request: NamespaceRequest,
+        ) -> std::result::Result<NamespaceResult, StorageRoleFailure> {
+            let NamespaceRequest::List(target) = request else {
+                return Err(entry_failure(&StoragePath::root()));
+            };
+            if !target.as_str().is_empty() {
+                return Ok(NamespaceResult::Entries(Vec::new()));
+            }
+            let stamp = StorageTimestamp::new(MODIFIED_NANOS, TimePrecision::Nanoseconds)
+                .unwrap_or_else(|error| panic!("{error}"));
+            // The record is present, but the field transfers actually depend on is not.
+            let descriptor = descriptor("only.txt", EntryKind::File, false)
+                .unwrap_or_else(|error| panic!("{error}"))
+                .with_inline_timestamps(TimestampMetadata {
+                    accessed: Some(stamp),
+                    modified: None,
+                    created: Some(stamp),
+                });
+            Ok(NamespaceResult::Entries(vec![descriptor]))
+        }
+    }
+
+    let storage = Storage::connected(
+        BackendIdentity::new(BackendKind::Cifs, "ndx-walk-undated")?,
+        namespace_only_capabilities()?,
+        None,
+        None,
+        Some(Arc::new(UndatedNamespace)),
+        None,
+        None,
+    )?;
+    let (pages, errors) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+    assert!(pages.is_empty(), "nothing is emitted: {pages:?}");
+    assert_eq!(errors.len(), 1, "an absent modified field is refused too");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_broken_session_stops_the_walk_instead_of_listing_every_remaining_directory() -> Result {
     let mut listings = sample_tree();
     listings.retain(|(key, _)| *key != "a");
     listings.push(("a", Listing::SessionFailure));
     let namespace = TreeNamespace::new(listings);
     let storage = storage(Arc::clone(&namespace))?;
-    let (pages, errors) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+    let walk_request = request(StoragePath::root())?;
+    let cancel = walk_request.cancel.clone();
+    let (_, errors) = drain(&ndx_walk(&storage, walk_request)?).await;
 
     assert!(
         errors.iter().any(|error| error.contains("session failed")),
         "the session failure is reported: {errors:?}"
     );
-    let visited: Vec<&str> = pages.iter().map(|page| page.dir_path.as_str()).collect();
     assert!(
-        visited.contains(&""),
-        "the already-paged root survives: {visited:?}"
+        cancel.is_cancelled(),
+        "a dead session ends the walk; the driver has no cancel channel, so the readers must \
+         stop answering with backend calls"
+    );
+    let listed = namespace.listed();
+    assert!(
+        !listed.contains(&"a/deep".to_owned()),
+        "no directory is listed after the session died: {listed:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancelled_listing_is_a_signal_that_stops_the_walk_without_looking_like_io_failure()
+-> Result {
+    let mut listings = sample_tree();
+    listings.retain(|(key, _)| *key != "a");
+    listings.push(("a", Listing::Cancelled));
+    let namespace = TreeNamespace::new(listings);
+    let storage = storage(Arc::clone(&namespace))?;
+    let walk_request = request(StoragePath::root())?;
+    let cancel = walk_request.cancel.clone();
+    let (_, errors) = drain(&ndx_walk(&storage, walk_request)?).await;
+
+    assert!(
+        errors.iter().any(|error| error.contains("cancelled")),
+        "cancellation is reported as cancellation, not as a listing failure: {errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|error| error.contains("failed to list")),
+        "R10: a cancellation must not be dressed up as an I/O error: {errors:?}"
+    );
+    assert!(cancel.is_cancelled(), "the walk winds down");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pre_cancelled_token_lists_nothing_at_all() -> Result {
+    let namespace = TreeNamespace::new(sample_tree());
+    let storage = storage(Arc::clone(&namespace))?;
+    let mut walk_request = request(StoragePath::root())?;
+    walk_request.cancel = CancellationToken::new();
+    walk_request.cancel.cancel();
+    let (pages, errors) = drain(&ndx_walk(&storage, walk_request)?).await;
+
+    assert!(pages.is_empty(), "nothing is emitted: {pages:?}");
+    assert!(!errors.is_empty(), "the cancellation is visible");
+    assert!(
+        namespace.listed().is_empty(),
+        "not one backend listing is issued"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_match_expression_admits_only_what_it_names() -> Result {
+    let namespace = TreeNamespace::new(sample_tree());
+    let storage = storage(Arc::clone(&namespace))?;
+    let mut walk_request = request(StoragePath::root())?;
+    walk_request.match_expressions =
+        Some(crate::filter::parse_filter_expression("name == \"y.txt\"")?);
+    let (pages, _) = drain(&ndx_walk(&storage, walk_request)?).await;
+    let emitted: Vec<String> = pages
+        .iter()
+        .flat_map(|page| page.files.iter())
+        .map(|entry| entry.entry.get_name().to_owned())
+        .collect();
+    assert_eq!(
+        emitted,
+        vec!["y.txt"],
+        "only the named file is emitted, and it is nested so the walk had to descend"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_filtered_out_directory_is_descended_without_appearing_in_its_parent_page() -> Result {
+    let namespace = TreeNamespace::new(sample_tree());
+    let storage = storage(Arc::clone(&namespace))?;
+    let mut walk_request = request(StoragePath::root())?;
+    walk_request.match_expressions =
+        Some(crate::filter::parse_filter_expression("name == \"y.txt\"")?);
+    let (pages, _) = drain(&ndx_walk(&storage, walk_request)?).await;
+
+    let root_page = pages.iter().find(|page| page.dir_path.is_empty());
+    assert!(
+        root_page.is_none_or(|page| page
+            .subdirs
+            .iter()
+            .all(|entry| entry.entry.get_name() != "a")),
+        "'a' does not match, so it is hidden from the page"
+    );
+    assert!(
+        namespace.listed().contains(&"a/deep".to_owned()),
+        "but it is still descended into, or 'y.txt' could never be found: {:?}",
+        namespace.listed()
     );
     Ok(())
 }

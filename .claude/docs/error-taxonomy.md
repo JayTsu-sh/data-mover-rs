@@ -1,6 +1,6 @@
 # Error Taxonomy
 
-## `StorageError` 24 个变体 (src/error.rs)
+## `StorageError` 29 个变体 (src/error.rs)
 
 | # | 变体 | 含义 / 来源 |
 |---|---|---|
@@ -12,7 +12,7 @@
 | 6 | `InvalidFilterExpression(String)` | filter DSL 表达式语法错 |
 | 7 | `MismatchedParentheses(String)` | filter DSL 括号不匹配 |
 | 8 | `InvalidToken(String)` | filter DSL 非法 token |
-| 9 | `UnexpectedEofToken(String)` | filter DSL 表达式提前结束 |
+| 9 | `UnexpectedEndOfToken(String)` | filter DSL 表达式提前结束 |
 | 10 | `ChecksumError(String)` | blake3 校验失败 |
 | 11 | `Cancelled` | **不是错误**，是 CancellationToken 信号 |
 | 12 | `S3Error(String)` | S3 SDK 错误 (除已映射的 404 等) |
@@ -28,6 +28,15 @@
 | 22 | `FileLockError(String)` | 文件锁冲突 |
 | 23 | `WinAceError(String)` | Windows ACL/SDDL 错误 |
 | 24 | `CifsError(String)` | SMB/CIFS 协议错误 (除已映射的) |
+| 25 | `HdfsOperation(HdfsOperationError)` | HDFS 结构化操作错误 (带 operation / kind / retryable) |
+| 26 | `ReadError(String)` | 从源存储读取文件数据失败 |
+| 27 | `WriteError(String)` | 向目标存储写入文件数据失败 |
+| 28 | `MismatchData(Vec<MismatchDataField>)` | 完整性比对：文件内容或条目类型不匹配 |
+| 29 | `MismatchMeta(Vec<MismatchMetaField>)` | 完整性比对：POSIX 元数据不匹配 |
+
+> 表格顺序跟 `src/error.rs` 的声明顺序一致；`HdfsOperation` 在源文件里排第一，这里按补录时间
+> 放在末尾。2026-09-17 复核：`grep -c '#\[error' src/error.rs` = 29，此前表与 R3 的 verify
+> 命令都停在 24，25-29 是期间新增但没同步进来的。
 
 ## Retry Taxonomy (commit `7eb3046`)
 

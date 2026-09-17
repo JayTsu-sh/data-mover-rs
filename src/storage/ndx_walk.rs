@@ -3,25 +3,33 @@
 //! Replaces the legacy per-backend `walkdir_2`: directories are listed through
 //! `NamespaceRequest::List` and handed to the shared DFS driver in [`crate::dir_tree`], which
 //! owns the prefetch window, the depth-first order and the NDX / gap numbering. Only the
-//! listing and the legacy-model conversion live here, so any backend that lends a namespace
-//! role gets NDX paging without protocol-specific code.
+//! listing and the legacy-model conversion live here, so the adapter carries no
+//! protocol-specific code.
 //!
 //! Semantics worth knowing before relying on it:
 //!
-//! - **Timestamps must come from the listing.** A `SourceDescriptor` without
-//!   [`SourceDescriptor::inline_timestamps`] would force either a per-entry metadata round trip
-//!   (the N+1 this adapter exists to avoid) or an epoch timestamp, which silently tells an
-//!   incremental sync that every entry changed. Such a directory is reported as an error
-//!   instead. Today only CIFS attaches them.
+//! - **Only CIFS can actually be walked today.** Every emitted entry needs a modification
+//!   time, and the only source that costs no extra round trip is
+//!   [`SourceDescriptor::inline_timestamps`], which only the CIFS namespace attaches
+//!   (`backends/cifs/namespace.rs`). NFS and HDFS lend a namespace role, so preflight admits
+//!   them, but each of their directories is then reported as an error rather than emitted with
+//!   an epoch timestamp — an epoch would silently tell an incremental sync that every entry
+//!   changed, and would disable every `modified` filter condition. Making them work is a
+//!   matter of attaching the timestamps their listings already carry (NFS `readdirplus`
+//!   returns the attributes and currently drops them), not of changing this adapter.
 //! - **Local and S3 lend no namespace role**, so they fail preflight here rather than
 //!   producing an empty walk.
-//! - **Stopping is by drop.** There is no cancellation token, matching the four legacy
-//!   `walkdir_2` entry points: drop the returned iterator and the driver's next send fails,
-//!   which unwinds the reader pool.
+//! - **Stopping needs the token.** `NdxWalkRequest::cancel` stops the reader pool at its next
+//!   listing. Dropping the returned iterator is *not* reliable on its own: the driver only
+//!   gives up when sending a non-empty page fails, and ignores send failures for error and
+//!   completion events, so a subtree that is entirely empty or entirely failing keeps
+//!   listing after the consumer is gone.
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use tokio_util::sync::CancellationToken;
 
 use super::{
     CapabilityUnavailable, Namespace, NamespaceRequest, NamespaceResult, PreflightPolicy,
@@ -30,7 +38,8 @@ use super::{
 use crate::dir_tree::{DirHandle, ReadContext, ReadResult, SubdirEntry, run_dfs_driver};
 use crate::error::StorageError;
 use crate::filter::{FilterExpression, FilterInput, should_skip};
-use crate::model::{BackendKind, EntryKind, FailureClass, StoragePath};
+use crate::model::{BackendKind, EntryKind, FailureClass, StoragePath, StorageTimestamp};
+use crate::traversal::relative_to;
 use crate::{EntryEnum, NASEntry, TransferConcurrency};
 
 /// One NDX-paged traversal request.
@@ -47,6 +56,10 @@ pub struct NdxWalkRequest {
     pub exclude_expressions: Option<FilterExpression>,
     /// Reader pool size, clamped to `1..=TransferConcurrency::MAX`.
     pub concurrency: NonZeroUsize,
+    /// Stops the reader pool at its next listing. The DFS driver has no cancellation channel,
+    /// so it keeps asking for directories; the readers answer without touching the backend,
+    /// which is what actually bounds the cost.
+    pub cancel: CancellationToken,
 }
 
 /// Starts an NDX-paged traversal of `request.root` through `storage`'s namespace role.
@@ -70,9 +83,28 @@ pub fn ndx_walk(
         let namespace = Arc::clone(&namespace);
         let root = request.root.clone();
         let receiver = request_receiver.clone();
+        let cancel = request.cancel.clone();
         tokio::spawn(async move {
             while let Ok(read) = receiver.recv().await {
-                let result = read_dir(namespace.as_ref(), &root, &read.dir_path, &read.ctx).await;
+                // Once the walk is over, answer without a backend call. The driver has no
+                // cancellation channel and will keep requesting the remaining directories, so
+                // this is what keeps a dead session or a cancelled walk from costing one
+                // doomed round trip per directory.
+                let result = if cancel.is_cancelled() {
+                    Ok(errors_only(
+                        &read.dir_path,
+                        format!("cancelled before listing '{}'", read.dir_path),
+                    ))
+                } else {
+                    read_dir(
+                        namespace.as_ref(),
+                        &root,
+                        &read.dir_path,
+                        &read.ctx,
+                        &cancel,
+                    )
+                    .await
+                };
                 let _ = read.reply.send(result);
             }
         });
@@ -135,32 +167,36 @@ async fn read_dir(
     root: &StoragePath,
     dir_path: &str,
     ctx: &ReadContext,
+    cancel: &CancellationToken,
 ) -> crate::Result<ReadResult> {
     let target = join_root(root, dir_path)?;
     let descriptors = match namespace.execute(NamespaceRequest::List(target)).await {
         Ok(NamespaceResult::Entries(entries)) => entries,
         Ok(_) => return Err(StorageError::MismatchedType),
-        Err(failure) => return listing_failure(dir_path, &failure),
+        Err(failure) => return listing_failure(dir_path, &failure, cancel),
     };
     Ok(build_read_result(root, dir_path, &descriptors, ctx))
 }
 
-/// Splits a listing failure into the driver's two channels.
+/// Splits a listing failure into the driver's two channels, and ends the walk when the
+/// failure means no later listing can succeed either.
 ///
-/// An entry-scoped failure (one unreadable directory) becomes a soft error so the rest of the
-/// tree keeps paging, matching what the legacy `read_dir_sorted` did for a failed open. A
-/// session-scoped failure returns `Err`, which makes the driver drop that frame. `Cancelled`
-/// is a signal rather than a failure (R10), so it is reported with a distinguishable prefix
-/// and never looks like an I/O error to whoever reads the page stream.
-fn listing_failure(dir_path: &str, failure: &StorageRoleFailure) -> crate::Result<ReadResult> {
-    let cancelled = matches!(
-        failure,
-        StorageRoleFailure::Entry(error) if error.class() == FailureClass::Cancelled
-    ) || matches!(
-        failure,
-        StorageRoleFailure::Session(error) if error.class() == FailureClass::Cancelled
-    );
-    if cancelled {
+/// An entry-scoped failure (one unreadable directory) stays soft so the rest of the tree keeps
+/// paging, matching what the legacy `read_dir_sorted` did for a failed open. A session-scoped
+/// failure and a cancellation both trip the token: the driver cannot be told to stop, so
+/// without this every remaining directory would cost one more doomed round trip. `Cancelled`
+/// is reported with a distinguishable prefix rather than as an I/O error, per R10.
+fn listing_failure(
+    dir_path: &str,
+    failure: &StorageRoleFailure,
+    cancel: &CancellationToken,
+) -> crate::Result<ReadResult> {
+    let class = match failure {
+        StorageRoleFailure::Entry(error) => error.class(),
+        StorageRoleFailure::Session(error) => error.class(),
+    };
+    if class == FailureClass::Cancelled {
+        cancel.cancel();
         return Ok(errors_only(dir_path, format!("cancelled: {dir_path}")));
     }
     match failure {
@@ -168,9 +204,12 @@ fn listing_failure(dir_path: &str, failure: &StorageRoleFailure) -> crate::Resul
             dir_path,
             format!("failed to list '{dir_path}': {error}"),
         )),
-        StorageRoleFailure::Session(error) => Err(StorageError::OperationError(format!(
-            "namespace session failed while listing '{dir_path}': {error}"
-        ))),
+        StorageRoleFailure::Session(error) => {
+            cancel.cancel();
+            Err(StorageError::OperationError(format!(
+                "namespace session failed while listing '{dir_path}': {error}"
+            )))
+        }
     }
 }
 
@@ -190,24 +229,44 @@ fn build_read_result(
     ctx: &ReadContext,
 ) -> ReadResult {
     let mut entries = Vec::with_capacity(descriptors.len());
+    let mut undated = 0_usize;
     for descriptor in descriptors {
         match descriptor_to_nas(root, descriptor) {
             Some(entry) => entries.push(entry),
-            // One aggregated error rather than one per entry: a backend either attaches inline
-            // timestamps to every listed entry or to none, so per-entry reporting would emit a
-            // line per file for the whole tree.
-            None => {
-                return errors_only(
-                    dir_path,
-                    format!(
-                        "listing of '{dir_path}' carries no inline timestamps, so NDX entries \
-                         would report the epoch as the modification time"
-                    ),
-                );
-            }
+            None => undated += 1,
         }
     }
+    if undated > 0 {
+        // Aggregated rather than one error per entry: a backend attaches inline timestamps to
+        // every listed entry or to none, so per-entry reporting would emit a line per file for
+        // the whole tree. The count is carried anyway, because "or to none" is an observation
+        // about today's backends, not a contract `SourceDescriptor` enforces.
+        return errors_only(
+            dir_path,
+            format!(
+                "{undated} of {} entries in '{dir_path}' carry no inline modification time;                  emitting them would report the epoch and tell an incremental sync that every                  entry changed, so the directory and its subtree are skipped",
+                descriptors.len()
+            ),
+        );
+    }
+    let (files, subdirs) = partition_entries(entries, ctx);
+    ReadResult {
+        dir_path: dir_path.to_owned(),
+        files,
+        subdirs,
+        errors: Vec::new(),
+    }
+}
 
+/// Applies the legacy `should_skip` triple and sorts each bucket by name.
+///
+/// A directory at the depth limit is emitted as an entry rather than descended into, which is
+/// what the legacy readers did; `visible: false` keeps a filtered-out directory out of the page
+/// while still descending into it.
+fn partition_entries(
+    entries: Vec<NASEntry>,
+    ctx: &ReadContext,
+) -> (Vec<Arc<EntryEnum>>, Vec<SubdirEntry>) {
     let mut files = Vec::new();
     let mut subdirs = Vec::new();
     for entry in entries {
@@ -239,12 +298,7 @@ fn build_read_result(
     }
     files.sort_by(|left, right| left.get_name().cmp(right.get_name()));
     subdirs.sort_by(|left, right| left.entry.get_name().cmp(right.entry.get_name()));
-    ReadResult {
-        dir_path: dir_path.to_owned(),
-        files,
-        subdirs,
-        errors: Vec::new(),
-    }
+    (files, subdirs)
 }
 
 fn filter_decision(entry: &NASEntry, ctx: &ReadContext) -> (bool, bool, bool) {
@@ -266,10 +320,14 @@ fn filter_decision(entry: &NASEntry, ctx: &ReadContext) -> (bool, bool, bool) {
 
 /// Rebuilds the legacy enumeration entry from a neutral descriptor.
 ///
-/// Returns `None` when the listing carried no timestamps; see the module docs.
+/// Returns `None` unless the listing carried a modification time. The whole record being
+/// absent and the record being present with `modified: None` are the same thing here: either
+/// way `mtime` would have to be the epoch, which is the outcome the module docs rule out.
+/// `accessed` and `created` are allowed to be missing — nothing decides transfers on them.
 fn descriptor_to_nas(root: &StoragePath, descriptor: &SourceDescriptor) -> Option<NASEntry> {
     let timestamps = descriptor.inline_timestamps()?;
-    let relative = crate::traversal::relative_to(root, &descriptor.path);
+    timestamps.modified?;
+    let relative = relative_to(root, &descriptor.path);
     let name = relative
         .rsplit_once('/')
         .map_or(relative, |(_, name)| name)
@@ -312,7 +370,7 @@ fn descriptor_to_nas(root: &StoragePath, descriptor: &SourceDescriptor) -> Optio
     })
 }
 
-fn unix_nanos(value: Option<crate::model::StorageTimestamp>) -> i64 {
+fn unix_nanos(value: Option<StorageTimestamp>) -> i64 {
     value.map_or(0, |value| {
         i64::try_from(value.unix_nanos()).unwrap_or(i64::MAX)
     })

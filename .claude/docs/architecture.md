@@ -51,9 +51,16 @@ Storage (roles)
 `src/dir_tree.rs` 的 `run_dfs_driver`(那部分本来就后端无关)，这里只负责列举取数、按名排序、
 以及把 `SourceDescriptor` 反拼成 `NdxEvent` 载荷要的 `EntryEnum::NAS`。
 
-**覆盖面**：Local 和 S3 不出借 `Namespace` 角色，所以 `ndx_walk` / `delete_tree` /
-`create_directory_all` 在这两个 backend 上于 preflight 处返回 `CapabilityUnavailable`，
-实际覆盖 CIFS / NFS / HDFS。
+**覆盖面**，两层门槛，别只看第一层：
+
+1. Local 和 S3 **不出借 `Namespace` 角色**，上面四个 helper 在这两个 backend 上于 preflight
+   处返回 `CapabilityUnavailable`。`delete_tree` / `create_directory_all` /
+   `StorageTraversalSource` 到此为止，覆盖 CIFS / NFS / HDFS。
+2. `ndx_walk` 还多一道：它要求列举自带修改时间 (`SourceDescriptor::inline_timestamps`)，
+   而目前**只有 CIFS 挂了**。NFS / HDFS 过得了 preflight，但每个目录都会被报成错误而不是
+   产出条目 —— 这是刻意的，填 epoch 会让增量同步认为所有条目都变了。所以 `ndx_walk`
+   **实际只有 CIFS 可用**。要让 NFS 也能用，是把 `readdirplus` 已经拿到、目前被丢弃的
+   attrs 挂上去，不是改 `ndx_walk`。
 
 **关键点**：没有 `Storage` trait，没有 `dyn Storage`，没有 vtable。这是有意的 — 4 个 backend 协议差异极大，trait 抽象会塞 30+ 默认方法和大量 `Self`-bound 限制，不如 enum + match 直接。
 

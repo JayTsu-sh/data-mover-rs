@@ -53,7 +53,7 @@ impl DslTraversalFilter {
     ///
     /// # Errors
     /// Returns the DSL parse error (`InvalidToken` / `MismatchedParentheses` /
-    /// `InvalidFilterExpression` / `UnexpectedEofToken`) of the first expression that fails.
+    /// `InvalidFilterExpression` / `UnexpectedEndOfToken`) of the first expression that fails.
     pub fn parse(
         match_expression: Option<&str>,
         exclude_expression: Option<&str>,
