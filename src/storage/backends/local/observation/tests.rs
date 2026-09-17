@@ -471,8 +471,9 @@ async fn snapshot_rebuild_preserves_private_local_facts_without_requery() -> io:
         panic!("expected local backend facts");
     };
     assert_eq!(facts.first(), Some(&1));
-    for (encoded, expected) in facts[1..].chunks_exact(8).zip(expected) {
-        assert_eq!(encoded, expected.to_le_bytes());
+    let (encoded, _) = facts[1..].as_chunks::<8>();
+    for (encoded, expected) in encoded.iter().zip(expected) {
+        assert_eq!(*encoded, expected.to_le_bytes());
     }
     Ok(())
 }

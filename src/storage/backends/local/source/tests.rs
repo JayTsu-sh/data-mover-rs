@@ -1,8 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use futures::StreamExt as _;
-
 use super::*;
 use crate::model::{BackendIdentity, BackendKind, StoragePath};
 use crate::storage::{ReadRequest, ReadSource};

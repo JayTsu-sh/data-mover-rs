@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use futures::{StreamExt as _, stream};
+use futures::stream;
 
 use super::*;
 use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity};

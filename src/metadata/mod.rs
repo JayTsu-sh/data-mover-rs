@@ -311,7 +311,7 @@ impl MetadataPlan {
             }
             return Err(MetadataApplicationFailure {
                 family,
-                error: failure.error,
+                error: failure.error.map(Box::new),
                 report: MetadataApplicationReport {
                     outcomes,
                     losses: self.losses.clone(),
@@ -348,7 +348,7 @@ impl MetadataPlan {
                 set_outcome(&mut outcomes, *family, ApplicationOutcome::Failed);
                 return Err(MetadataApplicationFailure {
                     family: *family,
-                    error: Some(error),
+                    error: Some(Box::new(error)),
                     report: MetadataApplicationReport {
                         outcomes,
                         losses: self.losses.clone(),
@@ -436,7 +436,9 @@ impl MetadataApplicationReport {
 #[derive(Debug)]
 pub struct MetadataApplicationFailure {
     family: MetadataFamily,
-    error: Option<StorageRoleFailure>,
+    /// Boxed so the whole `Result` stays small: the role failure carries paths and diagnostic
+    /// strings, and every successful application would otherwise pay for its size.
+    error: Option<Box<StorageRoleFailure>>,
     report: MetadataApplicationReport,
 }
 
@@ -446,8 +448,8 @@ impl MetadataApplicationFailure {
         self.family
     }
     #[must_use]
-    pub const fn storage_error(&self) -> Option<&StorageRoleFailure> {
-        self.error.as_ref()
+    pub fn storage_error(&self) -> Option<&StorageRoleFailure> {
+        self.error.as_deref()
     }
     #[must_use]
     pub const fn report(&self) -> &MetadataApplicationReport {

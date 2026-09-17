@@ -1,8 +1,6 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use futures::StreamExt as _;
-
 use super::*;
 use crate::model::{BackendKind, FailureClass};
 

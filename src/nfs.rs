@@ -683,7 +683,9 @@ impl NfsDeferredWrite {
 
 struct NfsUnstableWriteFailure {
     accepted: Option<NfsDeferredWrite>,
-    error: NfsError,
+    /// Boxed to keep the `Result` small: every accepted write would otherwise carry the size of
+    /// a full protocol error.
+    error: Box<NfsError>,
 }
 
 impl NfsRoleStageFile {
@@ -761,7 +763,7 @@ impl NfsRoleStageFile {
                                     retried.push(accepted);
                                 }
                                 *writes = retried;
-                                return Err(failure.error);
+                                return Err(*failure.error);
                             }
                         }
                     }
@@ -799,7 +801,7 @@ impl NfsRoleStageFile {
                     self.deferred_writes.lock().await.push(accepted);
                 }
                 Err(crate::storage::backends::nfs::protocol::classify_error(
-                    failure.error,
+                    *failure.error,
                 ))
             }
         }
@@ -853,7 +855,7 @@ impl NfsStageFile for NfsRoleStageFile {
             .await
             .map(|write| write.accepted_bytes() as u64)
             .map_err(|failure| {
-                crate::storage::backends::nfs::protocol::classify_error(failure.error)
+                crate::storage::backends::nfs::protocol::classify_error(*failure.error)
             })
     }
 
@@ -1317,7 +1319,7 @@ impl NFSStorage {
                     });
                     return Err(NfsUnstableWriteFailure {
                         accepted: accepted_write,
-                        error,
+                        error: Box::new(error),
                     });
                 }
             };
@@ -1327,7 +1329,9 @@ impl NFSStorage {
                     accepted: (accepted != 0).then(|| {
                         NfsDeferredWrite::from_outcomes(offset, data.slice(..accepted), outcomes)
                     }),
-                    error: NfsError::Rpc("server returned an invalid write count".to_owned()),
+                    error: Box::new(NfsError::Rpc(
+                        "server returned an invalid write count".to_owned(),
+                    )),
                 });
             }
             accepted += count;
