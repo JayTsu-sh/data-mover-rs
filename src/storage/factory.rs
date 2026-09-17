@@ -60,6 +60,10 @@ pub struct CifsBackendConfig {
     pub server: String,
     pub share: String,
     pub root: Option<String>,
+    /// Create missing components of `root` at connect time (parity with the NFS / HDFS
+    /// `ensure_dir`). `false` never probes the root; a missing root then fails lazily on first
+    /// use.
+    pub ensure_dir: bool,
     pub username: String,
     pub password: String,
     /// Signing policy negotiated independently with each server.
@@ -76,6 +80,7 @@ impl fmt::Debug for CifsBackendConfig {
             .field("server", &self.server)
             .field("share", &self.share)
             .field("root", &self.root)
+            .field("ensure_dir", &self.ensure_dir)
             .field("username", &"<redacted>")
             .field("password", &"<redacted>")
             .field("signing_policy", &self.signing_policy)
@@ -190,8 +195,14 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
                 )
                 .await
                 .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))?;
-            crate::cifs::create_cifs_role_storage(share, config.root, config.identity)
-                .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))
+            crate::cifs::create_cifs_role_storage(
+                share,
+                config.root,
+                config.ensure_dir,
+                config.identity,
+            )
+            .await
+            .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))
         }
         BackendConfig::S3(config) => {
             let storage = crate::s3::S3Storage::new(&config.url, config.block_size)

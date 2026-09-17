@@ -656,6 +656,7 @@ mod tests {
             )?,
             backend_fact: None,
             content_version: None,
+            inline_timestamps: None,
         };
         let path = StoragePath::new(format!(
             "{}.manifest",

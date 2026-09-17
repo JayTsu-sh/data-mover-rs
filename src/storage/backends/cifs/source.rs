@@ -35,6 +35,13 @@ pub(super) trait CifsSourceProtocol: Send + Sync {
     ) -> smb_domain::Result<(Box<dyn CifsReadCursor>, CifsSourceFacts)>;
 }
 
+/// `STATUS_NOT_A_DIRECTORY`: a directory open hit a file.
+const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
+/// `STATUS_CANNOT_DELETE`: the read-only attribute (permanent) or a mapped / in-use file
+/// (clears on its own). The server does not distinguish them, so the transience is `Unknown`
+/// rather than a guess that would either foreclose or force a retry.
+const STATUS_CANNOT_DELETE: u32 = 0xC000_0121;
+
 pub(super) struct CifsReadSource {
     protocol: Arc<dyn CifsSourceProtocol>,
     identity: BackendIdentity,
@@ -277,6 +284,12 @@ pub(super) fn classify(
 fn classify_status(status: u32) -> (FailureClass, Transience) {
     use smb_domain::protocol::Status;
 
+    // Statuses the pinned smb-rs `Status` enum does not model yet.
+    match status {
+        STATUS_NOT_A_DIRECTORY => return (FailureClass::Conflict, Transience::Permanent),
+        STATUS_CANNOT_DELETE => return (FailureClass::PermissionDenied, Transience::Unknown),
+        _ => {}
+    }
     match Status::try_from(status) {
         Ok(Status::ObjectNameNotFound | Status::ObjectPathNotFound) => {
             (FailureClass::NotFound, Transience::Permanent)

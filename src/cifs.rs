@@ -17,13 +17,21 @@ use crate::transfer_concurrency::TransferConcurrency;
 
 /// Builds the architecture-ready CIFS role handle from a connected smb-rs share.
 ///
+/// With `ensure_dir`, missing components of `root` are created first (legacy
+/// `ensure_root_exists`); without it the root is used lazily and never probed.
+///
 /// # Errors
-/// Returns an error when the identity is not CIFS or connected roles contradict capabilities.
-pub fn create_cifs_role_storage(
+/// Returns an error when the identity is not CIFS, when a root component exists but is not a
+/// directory, when root creation fails, or when connected roles contradict capabilities.
+pub async fn create_cifs_role_storage(
     share: smb_domain::Share,
     root: Option<String>,
+    ensure_dir: bool,
     identity: BackendIdentity,
 ) -> std::result::Result<Storage, Box<dyn std::error::Error>> {
+    if ensure_dir && let Some(root) = root.as_deref() {
+        crate::storage::backends::cifs::ensure_root(&share, root).await?;
+    }
     let concurrency =
         TransferConcurrency::from_env(BackendKind::Cifs, TransferConcurrency::defaults(8, 8))?;
     crate::storage::backends::cifs::connect(

@@ -74,6 +74,7 @@ async fn connect_remote(server: &str, share: &str) -> Result<Storage> {
         server: server.to_owned(),
         share: share.to_owned(),
         root: None,
+        ensure_dir: false,
         username: std::env::var("CIFS_REAL_USER")?,
         password: std::env::var("CIFS_REAL_PASS")?,
         identity: BackendIdentity::new(BackendKind::Cifs, format!("{server}/{share}"))?,

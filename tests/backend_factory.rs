@@ -16,6 +16,7 @@ fn cifs_config_debug_never_exposes_credentials() -> Result<(), Box<dyn std::erro
         server: "server".to_string(),
         share: "share".to_string(),
         root: None,
+        ensure_dir: false,
         username: "sensitive-user".to_string(),
         password: "sensitive-password".to_string(),
         identity: BackendIdentity::new(BackendKind::Cifs, "cifs-fixture")?,

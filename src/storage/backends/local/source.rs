@@ -199,6 +199,7 @@ impl ReadSource for LocalReadSource {
             source_identity: observed.source_identity().clone(),
             backend_fact: None,
             content_version: Some(version),
+            inline_timestamps: None,
         })
     }
 

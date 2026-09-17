@@ -8,6 +8,7 @@ use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use futures::stream;
 
+use super::metadata::CifsInlineMetadata;
 use super::namespace::{CifsNamespace, CifsNamespaceProtocol};
 use super::source::{CifsReadCursor, CifsReadSource, CifsSourceFacts, CifsSourceProtocol};
 use crate::model::{BackendIdentity, BackendKind, EntryKind, StoragePath};
@@ -105,26 +106,37 @@ impl CifsNamespaceProtocol for MemoryCifs {
     async fn list(
         &self,
         path: &StoragePath,
-    ) -> smb_domain::Result<Vec<(StoragePath, CifsSourceFacts)>> {
+    ) -> smb_domain::Result<Vec<(StoragePath, CifsInlineMetadata)>> {
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         Ok(vec![
             (
                 StoragePath::new(format!("{}/child.bin", path.as_str()))
                     .map_err(|_| smb_domain::Error::InvalidArgument("invalid path".into()))?,
-                CifsSourceFacts {
-                    kind: EntryKind::File,
-                    size: 10,
-                    identity: Bytes::from_static(b"child-file"),
-                    maximum_read_chunk: 4,
+                CifsInlineMetadata {
+                    facts: CifsSourceFacts {
+                        kind: EntryKind::File,
+                        size: 10,
+                        identity: Bytes::from_static(b"child-file"),
+                        maximum_read_chunk: 4,
+                    },
+                    accessed: stamp,
+                    modified: stamp,
+                    created: stamp,
                 },
             ),
             (
                 StoragePath::new(format!("{}/nested", path.as_str()))
                     .map_err(|_| smb_domain::Error::InvalidArgument("invalid path".into()))?,
-                CifsSourceFacts {
-                    kind: EntryKind::Directory,
-                    size: 0,
-                    identity: Bytes::from_static(b"child-directory"),
-                    maximum_read_chunk: u32::MAX,
+                CifsInlineMetadata {
+                    facts: CifsSourceFacts {
+                        kind: EntryKind::Directory,
+                        size: 0,
+                        identity: Bytes::from_static(b"child-directory"),
+                        maximum_read_chunk: u32::MAX,
+                    },
+                    accessed: stamp,
+                    modified: stamp,
+                    created: stamp,
                 },
             ),
         ])
@@ -337,6 +349,15 @@ async fn namespace_list_returns_neutral_child_descriptors() -> Result<(), Box<dy
     assert_eq!(entries[0].kind, EntryKind::File);
     assert_eq!(entries[1].path.as_str(), "root/nested");
     assert_eq!(entries[1].kind, EntryKind::Directory);
+    let inline = entries[0]
+        .inline_timestamps()
+        .ok_or("listing must carry inline timestamps")?;
+    assert_eq!(
+        inline
+            .modified
+            .map(crate::model::StorageTimestamp::unix_nanos),
+        Some(1_700_000_000_i128 * 1_000_000_000)
+    );
     Ok(())
 }
 

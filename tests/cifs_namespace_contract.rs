@@ -80,6 +80,28 @@ async fn exercise_listing(namespace: &dyn Namespace, dir: &str, file: &str) -> R
     assert_eq!(listed[0].path.as_str(), file);
     assert_eq!(listed[0].kind, EntryKind::File);
     assert_eq!(listed[0].size, Some(0));
+    assert!(
+        listed[0].inline_timestamps().is_some(),
+        "the listing carries the timestamps its QUERY_DIRECTORY records already returned"
+    );
+    // A transfer validates a traversal observation against a fresh describe, so the identity a
+    // listing produces has to equal the identity Stat produces for the same unchanged entry.
+    let stat = single(
+        namespace
+            .execute(NamespaceRequest::Stat(path(file)?))
+            .await?,
+    )?;
+    assert_eq!(
+        listed[0].source_identity.identity_key(),
+        stat.source_identity.identity_key(),
+        "List and Stat must agree on identity for an unchanged entry"
+    );
+    let directory = single(
+        namespace
+            .execute(NamespaceRequest::Stat(path(dir)?))
+            .await?,
+    )?;
+    assert_eq!(directory.kind, EntryKind::Directory);
     Ok(())
 }
 
@@ -199,6 +221,7 @@ async fn connect_remote(server: &str, share: &str) -> Result<Storage> {
         server: server.to_owned(),
         share: share.to_owned(),
         root: None,
+        ensure_dir: false,
         username: std::env::var("CIFS_REAL_USER")?,
         password: std::env::var("CIFS_REAL_PASS")?,
         identity: BackendIdentity::new(BackendKind::Cifs, format!("{server}/{share}"))?,

@@ -12,6 +12,8 @@ mod writer;
 
 use std::sync::Arc;
 
+pub(crate) use protocol::ensure_root;
+
 use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
 

@@ -137,6 +137,7 @@ fn descriptor(
         source_identity,
         backend_fact: None,
         content_version: None,
+        inline_timestamps: None,
     })
 }
 

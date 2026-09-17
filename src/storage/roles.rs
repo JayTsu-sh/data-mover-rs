@@ -40,6 +40,9 @@ pub struct SourceDescriptor {
     pub(crate) backend_fact: Option<Bytes>,
     /// Content-change observation, separate from stable inode/file-handle identity.
     pub(crate) content_version: Option<Bytes>,
+    /// Timestamps the listing or stat already returned, so traversal can avoid a per-entry
+    /// metadata round trip when nothing beyond timestamps was requested.
+    pub(crate) inline_timestamps: Option<TimestampMetadata>,
 }
 
 impl SourceDescriptor {
@@ -58,12 +61,26 @@ impl SourceDescriptor {
             source_identity,
             backend_fact: None,
             content_version: None,
+            inline_timestamps: None,
         }
     }
 
     pub(crate) fn with_backend_fact(mut self, fact: Bytes) -> Self {
         self.backend_fact = Some(fact);
         self
+    }
+
+    /// Attaches timestamps that the enumerating operation already returned.
+    #[must_use]
+    pub(crate) const fn with_inline_timestamps(mut self, timestamps: TimestampMetadata) -> Self {
+        self.inline_timestamps = Some(timestamps);
+        self
+    }
+
+    /// Timestamps the enumerating operation already returned, if any.
+    #[must_use]
+    pub const fn inline_timestamps(&self) -> Option<TimestampMetadata> {
+        self.inline_timestamps
     }
 }
 

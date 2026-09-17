@@ -298,7 +298,7 @@ fn not_applicable<T>(mode: ObservationMode) -> MetadataObservation<T> {
     }
 }
 
-fn timestamp(value: std::time::SystemTime) -> Option<StorageTimestamp> {
+pub(super) fn timestamp(value: std::time::SystemTime) -> Option<StorageTimestamp> {
     let nanos = match value.duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => i128::try_from(duration.as_nanos()).ok()?,
         Err(error) => -i128::try_from(error.duration().as_nanos()).ok()?,

@@ -97,6 +97,7 @@ async fn endpoint(
             username: std::env::var("CIFS_REAL_USER")?,
             password: std::env::var("CIFS_REAL_PASS")?,
             root: Some(root.to_owned()),
+            ensure_dir: side == "destination",
             identity: BackendIdentity::new(BackendKind::Cifs, format!("{side}:{root}"))?,
         }),
     };

@@ -103,6 +103,7 @@ impl NfsReadSourceAdapter {
             source_identity,
             backend_fact: None,
             content_version: Some(observed.content_version),
+            inline_timestamps: None,
         })
     }
 }

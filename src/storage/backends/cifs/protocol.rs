@@ -1,3 +1,6 @@
+use std::fmt;
+use std::time::SystemTime;
+
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::TryStreamExt as _;
@@ -7,6 +10,10 @@ use super::namespace::CifsNamespaceProtocol;
 use super::source::{CifsReadCursor, CifsSourceFacts, CifsSourceProtocol};
 use super::staged::{CifsStageFile, CifsStagedProtocol};
 use crate::model::{EntryKind, StoragePath};
+
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 
 pub(super) struct SmbDomainProtocol {
     share: smb_domain::Share,
@@ -29,6 +36,18 @@ impl SmbDomainProtocol {
             _ => ".".to_owned(),
         };
         smb_domain::SharePath::new(value)
+    }
+
+    /// Entry kind through one `GENERIC_READ` open, without the two `QUERY_INFO` round trips
+    /// that `describe` adds.
+    async fn kind_of(&self, path: &StoragePath) -> smb_domain::Result<EntryKind> {
+        let share_path = self.share_path(path)?;
+        let resource = self.share.open(&share_path).await?;
+        let kind = resource_kind(&resource);
+        close_resource(resource).await?;
+        kind.ok_or_else(|| {
+            smb_domain::Error::UnsupportedOperation("named pipes are not storage entries".into())
+        })
     }
 }
 
@@ -149,7 +168,7 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
     }
 
     async fn remove(&self, path: &StoragePath) -> smb_domain::Result<()> {
-        let kind = CifsSourceProtocol::describe(self, path).await?.kind;
+        let kind = self.kind_of(path).await?;
         let path = self.share_path(path)?;
         if kind == EntryKind::Directory {
             let directory = self
@@ -173,7 +192,7 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
     }
 
     async fn rename_entry(&self, from: &StoragePath, to: &StoragePath) -> smb_domain::Result<()> {
-        let kind = CifsSourceProtocol::describe(self, from).await?.kind;
+        let kind = self.kind_of(from).await?;
         let from = self.share_path(from)?;
         let to = self.share_path(to)?;
         if kind == EntryKind::Directory {
@@ -199,7 +218,7 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
     async fn list(
         &self,
         path: &StoragePath,
-    ) -> smb_domain::Result<Vec<(StoragePath, CifsSourceFacts)>> {
+    ) -> smb_domain::Result<Vec<(StoragePath, CifsInlineMetadata)>> {
         let share_path = self.share_path(path)?;
         let directory = self
             .share
@@ -217,25 +236,178 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
             .filter(|entry| !matches!(entry.name(), "." | ".."))
             .map(|entry| {
                 let child = child_path(path, entry.name())?;
+                // Reparse points stay `File`: the facade cannot read link targets, and
+                // `Symlink` would route traversal into an unsupported `ReadLink`.
                 let kind = if entry.is_directory() {
                     EntryKind::Directory
                 } else {
                     EntryKind::File
                 };
-                let mut identity = BytesMut::with_capacity(16);
-                identity.extend_from_slice(b"cifs-dir-entry-v1\0");
-                identity.put_u64(entry.len());
                 Ok((
                     child,
-                    CifsSourceFacts {
-                        kind,
-                        size: entry.len(),
-                        identity: identity.freeze(),
-                        maximum_read_chunk: u32::MAX,
+                    CifsInlineMetadata {
+                        facts: CifsSourceFacts {
+                            kind,
+                            size: entry.len(),
+                            identity: identity_bytes(
+                                kind,
+                                entry.len(),
+                                entry.written(),
+                                entry.changed(),
+                            ),
+                            maximum_read_chunk: u32::MAX,
+                        },
+                        accessed: entry.accessed(),
+                        modified: entry.written(),
+                        created: entry.created(),
                     },
                 ))
             })
             .collect()
+    }
+}
+
+/// Error surfaced by [`ensure_root`] at connect time.
+#[derive(Debug)]
+pub(crate) enum CifsRootError {
+    /// A component of the configured root exists but is not a directory.
+    NotADirectory(String),
+    Protocol(smb_domain::Error),
+}
+
+impl fmt::Display for CifsRootError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotADirectory(component) => write!(
+                formatter,
+                "CIFS root component '{component}' exists but is not a directory"
+            ),
+            Self::Protocol(error) => write!(formatter, "CIFS root check failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CifsRootError {}
+
+impl From<smb_domain::Error> for CifsRootError {
+    fn from(error: smb_domain::Error) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+/// Minimal namespace verbs [`ensure_root`] needs, so the walk is unit-testable without a share.
+#[async_trait]
+pub(crate) trait RootProtocol: Send + Sync {
+    /// `Ok(None)` when the path does not exist.
+    async fn kind(&self, share_path: &str) -> smb_domain::Result<Option<EntryKind>>;
+    async fn create_directory(&self, share_path: &str) -> smb_domain::Result<()>;
+}
+
+#[async_trait]
+impl RootProtocol for smb_domain::Share {
+    async fn kind(&self, share_path: &str) -> smb_domain::Result<Option<EntryKind>> {
+        let path = smb_domain::SharePath::new(share_path)?;
+        match self.open(&path).await {
+            Ok(resource) => {
+                let kind = resource_kind(&resource);
+                close_resource(resource).await?;
+                Ok(kind)
+            }
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn create_directory(&self, share_path: &str) -> smb_domain::Result<()> {
+        let path = smb_domain::SharePath::new(share_path)?;
+        let directory = self
+            .open_directory(&path, smb_domain::DirectoryOpenOptions::create_new())
+            .await?;
+        close_directory(directory).await
+    }
+}
+
+/// Share-relative prefixes of `root` (`"a/b/c"` → `["a", "a\\b", "a\\b\\c"]`), ignoring empty
+/// components so trailing or doubled separators do not produce invalid share paths.
+pub(crate) fn root_prefixes(root: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    let mut accumulated = String::new();
+    for component in root
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+    {
+        if !accumulated.is_empty() {
+            accumulated.push('\\');
+        }
+        accumulated.push_str(component);
+        prefixes.push(accumulated.clone());
+    }
+    prefixes
+}
+
+/// Creates the missing components of the configured root sub-path (legacy
+/// `ensure_root_exists`). An existing root costs one open; only a missing one walks the prefixes.
+///
+/// # Errors
+/// Returns [`CifsRootError::NotADirectory`] when a component exists as a file or pipe and
+/// [`CifsRootError::Protocol`] for any other server failure.
+pub(crate) async fn ensure_root(
+    protocol: &(impl RootProtocol + ?Sized),
+    root: &str,
+) -> Result<(), CifsRootError> {
+    let prefixes = root_prefixes(root);
+    let Some(full) = prefixes.last() else {
+        return Ok(());
+    };
+    match protocol.kind(full).await? {
+        Some(EntryKind::Directory) => return Ok(()),
+        Some(_) => return Err(CifsRootError::NotADirectory(full.clone())),
+        None => {}
+    }
+    for prefix in &prefixes {
+        match protocol.kind(prefix).await? {
+            Some(EntryKind::Directory) => continue,
+            Some(_) => return Err(CifsRootError::NotADirectory(prefix.clone())),
+            None => {}
+        }
+        match protocol.create_directory(prefix).await {
+            Ok(()) => {}
+            // Lost a race with another creator: accept it if it is a directory.
+            Err(error) if is_collision(&error) => match protocol.kind(prefix).await? {
+                Some(EntryKind::Directory) => {}
+                _ => return Err(CifsRootError::NotADirectory(prefix.clone())),
+            },
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn error_status(error: &smb_domain::Error) -> Option<u32> {
+    match error {
+        smb_domain::Error::ReceivedErrorMessage(status, _)
+        | smb_domain::Error::UnexpectedMessageStatus(status) => Some(*status),
+        _ => None,
+    }
+}
+
+fn is_not_found(error: &smb_domain::Error) -> bool {
+    matches!(error, smb_domain::Error::NotFound(_))
+        || matches!(
+            error_status(error),
+            Some(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND)
+        )
+}
+
+fn is_collision(error: &smb_domain::Error) -> bool {
+    error_status(error) == Some(STATUS_OBJECT_NAME_COLLISION)
+}
+
+const fn resource_kind(resource: &smb_domain::Resource) -> Option<EntryKind> {
+    match resource {
+        smb_domain::Resource::File(_) => Some(EntryKind::File),
+        smb_domain::Resource::Directory(_) => Some(EntryKind::Directory),
+        smb_domain::Resource::Pipe(_) => None,
     }
 }
 
@@ -312,12 +484,13 @@ impl CifsMetadataProtocol for SmbDomainProtocol {
     async fn metadata(&self, path: &StoragePath) -> smb_domain::Result<CifsInlineMetadata> {
         let path = self.share_path(path)?;
         let resource = self.share.open(&path).await?;
+        let kind = resource_kind(&resource).unwrap_or(EntryKind::File);
         let metadata = resource.metadata().await;
         let close = close_resource(resource).await;
         let metadata = metadata?;
         close?;
         Ok(CifsInlineMetadata {
-            facts: facts(EntryKind::File, &metadata, u32::MAX),
+            facts: facts(kind, &metadata, u32::MAX),
             accessed: metadata.accessed(),
             modified: metadata.written(),
             created: metadata.created(),
@@ -443,17 +616,36 @@ fn facts(
     metadata: &smb_domain::ResourceMetadata,
     maximum_read_chunk: u32,
 ) -> CifsSourceFacts {
-    let mut identity = BytesMut::with_capacity(40);
-    identity.extend_from_slice(b"data-mover:cifs-path-identity:v1\0");
-    identity.put_u64(metadata.len());
-    put_time(&mut identity, metadata.written());
-    put_time(&mut identity, metadata.changed());
     CifsSourceFacts {
         kind,
         size: metadata.len(),
-        identity: identity.freeze(),
+        identity: identity_bytes(kind, metadata.len(), metadata.written(), metadata.changed()),
         maximum_read_chunk,
     }
+}
+
+/// Path-scoped identity payload shared by `describe`, `open`, `metadata`, and `list`, so the
+/// same entry hashes identically whichever verb observed it.
+///
+/// Directories hash a zero length: `FILE_DIRECTORY_INFORMATION` reports 0 for a subdirectory
+/// while a directory handle's `EndOfFile` reports index allocation, so the real length would
+/// make listing and stat disagree.
+///
+/// `v2` because the payload changed: `v1` listings hashed a different prefix and length only, and
+/// `v1` directories hashed their real length. The bump keeps a snapshot persisted by an older
+/// build distinguishable instead of silently comparing unequal.
+pub(super) fn identity_bytes(
+    kind: EntryKind,
+    len: u64,
+    written: SystemTime,
+    changed: SystemTime,
+) -> Bytes {
+    let mut identity = BytesMut::with_capacity(40);
+    identity.extend_from_slice(b"data-mover:cifs-path-identity:v2\0");
+    identity.put_u64(if kind == EntryKind::Directory { 0 } else { len });
+    put_time(&mut identity, written);
+    put_time(&mut identity, changed);
+    identity.freeze()
 }
 
 fn put_time(output: &mut BytesMut, value: std::time::SystemTime) {

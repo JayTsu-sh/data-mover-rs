@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use super::metadata::{CifsInlineMetadata, timestamp};
 use super::source::{CifsSourceFacts, classify, descriptor_from_facts, entry_failure};
+use crate::model::TimestampMetadata;
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath};
 use crate::storage::{Namespace, NamespaceRequest, NamespaceResult, StorageRoleFailure};
 
@@ -13,10 +15,11 @@ use crate::storage::{Namespace, NamespaceRequest, NamespaceResult, StorageRoleFa
 #[async_trait]
 pub(super) trait CifsNamespaceProtocol: Send + Sync {
     async fn stat(&self, path: &StoragePath) -> smb_domain::Result<CifsSourceFacts>;
+    /// Lists direct children with the timestamps the `QUERY_DIRECTORY` records already carry.
     async fn list(
         &self,
         path: &StoragePath,
-    ) -> smb_domain::Result<Vec<(StoragePath, CifsSourceFacts)>>;
+    ) -> smb_domain::Result<Vec<(StoragePath, CifsInlineMetadata)>>;
     /// Creates one directory; an existing entry surfaces as `STATUS_OBJECT_NAME_COLLISION`.
     async fn create_directory(&self, path: &StoragePath) -> smb_domain::Result<()>;
     /// Deletes one file or one empty directory.
@@ -57,8 +60,15 @@ impl CifsNamespace {
             .map_err(|error| classify(path, Operation::Traverse, &error))?;
         let entries = facts
             .into_iter()
-            .map(|(child, facts)| {
-                descriptor_from_facts(&self.identity, &child, &facts, Operation::Traverse)
+            .map(|(child, inline)| {
+                descriptor_from_facts(&self.identity, &child, &inline.facts, Operation::Traverse)
+                    .map(|descriptor| {
+                        descriptor.with_inline_timestamps(TimestampMetadata {
+                            accessed: timestamp(inline.accessed),
+                            modified: timestamp(inline.modified),
+                            created: timestamp(inline.created),
+                        })
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(NamespaceResult::Entries(entries))

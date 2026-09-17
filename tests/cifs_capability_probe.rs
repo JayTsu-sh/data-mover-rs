@@ -317,6 +317,7 @@ async fn probe_symlink_named(share: &smb_domain::Share, target: &Endpoint, name:
         server: target.server.clone(),
         share: target.share.clone(),
         root: None,
+        ensure_dir: false,
         username: target.user.clone(),
         password: target.pass.clone(),
         identity: BackendIdentity::new(BackendKind::Cifs, "symlink-probe")?,
@@ -345,6 +346,7 @@ async fn probe_namespace_role(target: &Endpoint) -> Result {
         server: target.server.clone(),
         share: target.share.clone(),
         root: None,
+        ensure_dir: false,
         username: target.user.clone(),
         password: target.pass.clone(),
         identity: BackendIdentity::new(
