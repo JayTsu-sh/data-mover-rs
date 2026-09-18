@@ -52,6 +52,7 @@ pub(crate) struct LocalNamespace {
 struct ListProbe {
     calls: AtomicUsize,
     fail_on_call: AtomicUsize,
+    fail_path: std::sync::Mutex<Option<StoragePath>>,
     failed_path: std::sync::Mutex<Option<StoragePath>>,
 }
 
@@ -71,6 +72,17 @@ impl LocalNamespace {
         self.probe.fail_on_call.store(call_number, Ordering::SeqCst);
     }
 
+    /// Makes every `List` of `path` fail with `PermissionDenied`, whatever order listings are
+    /// issued in.
+    #[cfg(test)]
+    pub(crate) fn fail_list_path(&self, path: StoragePath) {
+        *self
+            .probe
+            .fail_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
+    }
+
     /// The directory whose listing the probe failed, once it has.
     #[cfg(test)]
     pub(crate) fn failed_list_path(&self) -> Option<StoragePath> {
@@ -84,7 +96,14 @@ impl LocalNamespace {
     #[cfg(test)]
     fn injected_list_failure(&self, directory: &StoragePath) -> Option<StorageRoleFailure> {
         let call = self.probe.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        if call != self.probe.fail_on_call.load(Ordering::SeqCst) {
+        let by_path = self
+            .probe
+            .fail_path
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            == Some(directory);
+        if !by_path && call != self.probe.fail_on_call.load(Ordering::SeqCst) {
             return None;
         }
         *self

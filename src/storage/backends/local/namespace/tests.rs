@@ -277,6 +277,29 @@ async fn the_list_probe_fails_exactly_the_chosen_call() -> Result {
     Ok(())
 }
 
+#[tokio::test]
+async fn the_list_probe_fails_a_chosen_path_on_every_call() -> Result {
+    let temp = tempfile::tempdir()?;
+    std::fs::create_dir(temp.path().join("a"))?;
+    std::fs::create_dir(temp.path().join("b"))?;
+    let (namespace, _) = roles(temp.path())?;
+    namespace.fail_list_path(path("a"));
+    assert!(
+        namespace
+            .execute(NamespaceRequest::List(path("b")))
+            .await
+            .is_ok()
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            failure_class(namespace.execute(NamespaceRequest::List(path("a"))).await),
+            FailureClass::PermissionDenied
+        );
+    }
+    assert_eq!(namespace.failed_list_path(), Some(path("a")));
+    Ok(())
+}
+
 #[cfg(unix)]
 mod unix {
     use std::os::unix::ffi::OsStringExt as _;

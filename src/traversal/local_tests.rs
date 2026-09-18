@@ -224,8 +224,10 @@ async fn directory_read_failure_is_ordered_and_siblings_continue() -> io::Result
     std::fs::write(root.path().join("a/child"), b"a")?;
     std::fs::write(root.path().join("b/child"), b"b")?;
     let fixture = fixture(root.path())?;
-    // The root is the first listing; the second is whichever subdirectory comes first.
-    fixture.namespace.fail_list_call(2);
+    // Fail `a` by name: with concurrent listing, "the second List call" could be either child.
+    fixture
+        .namespace
+        .fail_list_path(StoragePath::new("a").map_err(io::Error::other)?);
     let mut session = fixture
         .source
         .traverse(request(CancellationToken::new(), 2, 2));
@@ -243,11 +245,9 @@ async fn directory_read_failure_is_ordered_and_siblings_continue() -> io::Result
 
     assert_eq!(completion.entry_failures, 1);
     assert_eq!(completion.observed_entries, 3);
-    assert!(
-        items[failure_index + 1..]
-            .iter()
-            .any(|item| matches!(item, TraversalItem::Entry(_)))
-    );
+    // The sibling's subtree is still traversed. Where it lands relative to the failure depends
+    // on the order the filesystem returns `a` and `b` in, so only its presence is asserted.
+    assert!(entry_paths(&items).iter().any(|path| path == "b/child"));
     assert!(matches!(
         &items[failure_index],
         TraversalItem::EntryFailure(error)

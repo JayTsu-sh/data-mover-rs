@@ -577,7 +577,10 @@ async fn max_depth_lists_only_admitted_levels() {
             "keep", "drop", "top", "keep/a", "keep/b", "drop/x", "drop/y"
         ]
     );
-    assert_eq!(namespace.listed(), ["", "keep", "drop"]);
+    // The root is listed first; its two subdirectories may be listed in either order.
+    let mut listed = namespace.listed();
+    listed[1..].sort();
+    assert_eq!(listed, ["", "drop", "keep"]);
 }
 
 #[tokio::test]
