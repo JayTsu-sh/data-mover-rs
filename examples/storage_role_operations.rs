@@ -28,10 +28,11 @@ use data_mover::model::{
     BackendIdentity, BackendKind, ObservationMode, ObservationPlan, ObservedEntry, StoragePath,
     StorageTimestamp,
 };
+use data_mover::ndx_walk::{NdxWalkRequest, ndx_walk};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, DeleteTreeItem,
-    DeleteTreeRequest, LocalBackendConfig, NdxWalkRequest, NfsBackendConfig, Storage,
-    connect_backend, create_directory_all, delete_tree, ndx_walk,
+    DeleteTreeRequest, LocalBackendConfig, NfsBackendConfig, Storage, connect_backend,
+    create_directory_all, delete_tree,
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{

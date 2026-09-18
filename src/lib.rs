@@ -34,6 +34,7 @@ mod hdfs_transfer_integrity;
 mod hdfs_transfer_mapping;
 pub mod integrity_check;
 pub mod local;
+pub mod ndx_walk;
 pub mod nfs;
 mod pipeline_primitives;
 pub mod qos;

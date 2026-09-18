@@ -30,7 +30,7 @@
 | 改 walk 调度 / work-stealing | `.claude/docs/walk-scheduler.md` + `src/walk_scheduler.rs` + `src/async_receiver.rs` |
 | 改 role-based 遍历 (filter / max_depth / inline 观察) | `src/traversal/{mod,storage,local}.rs` + `src/filter_traversal.rs` + `examples/storage_role_operations.rs` |
 | 改递归删除 | `src/storage/delete_tree.rs` (走 `Namespace` 角色，backend 无关) |
-| 改 NDX 分页遍历 (legacy walkdir_2 的中立替身) | `src/storage/ndx_walk.rs` + `src/dir_tree.rs` (`run_dfs_driver` 不要动) |
+| 改 NDX 分页遍历 (legacy walkdir_2 的中立替身) | `src/ndx_walk.rs` (crate 根，与 `filter_traversal` 同层) + `src/dir_tree.rs` (`run_dfs_driver` 不要动) |
 | 改递归建目录 | `src/storage/create_dir.rs` (走 `Namespace` 角色，backend 无关) |
 | 改跨端完整性比对 | `src/integrity/mod.rs` (走 `ReadSource` + `Metadata` 角色) |
 | 改 error 变体或 retry 映射 | `.claude/docs/error-taxonomy.md` + `src/error.rs` |

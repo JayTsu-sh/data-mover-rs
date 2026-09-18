@@ -6,6 +6,11 @@
 //! listing and the legacy-model conversion live here, so the adapter carries no
 //! protocol-specific code.
 //!
+//! It sits at the crate root, next to `filter_traversal`, rather than inside `storage`: it
+//! composes the `storage` roles with the filter DSL, `traversal::relative_to` and the legacy
+//! driver, and the dependency guard (`tests/validate_architecture_dependencies.py`) keeps
+//! `storage` free of all three.
+//!
 //! Semantics worth knowing before relying on it:
 //!
 //! - **Every emitted entry needs a modification time**, and the only source that costs no extra
@@ -39,10 +44,6 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    CapabilityUnavailable, Namespace, NamespaceRequest, NamespaceResult, PreflightPolicy,
-    SourceDescriptor, Storage, StorageRoleFailure,
-};
 use crate::TransferConcurrency;
 use crate::dir_tree::{
     DirHandle, NdxEvent, ReadContext, ReadResult, SubdirEntry, run_dfs_driver_with,
@@ -52,6 +53,10 @@ use crate::filter::{FilterExpression, FilterInput, should_skip};
 use crate::model::{
     BackendKind, EntryKind, FailureClass, MetadataObservation, MetadataObservations,
     MetadataProvenance, ObservedEntry, StoragePath,
+};
+use crate::storage::{
+    CapabilityUnavailable, Namespace, NamespaceRequest, NamespaceResult, PreflightPolicy,
+    SourceDescriptor, Storage, StorageRoleFailure,
 };
 use crate::traversal::relative_to;
 

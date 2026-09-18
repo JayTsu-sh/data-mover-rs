@@ -41,7 +41,7 @@ Backend 实现 (nfs.rs / s3.rs / local.rs / hdfs.rs)
 Storage (roles)
     │
     ├──→ traversal::StorageTraversalSource   Namespace::List + Metadata → TraversalItem 流
-    ├──→ storage::ndx_walk                   Namespace::List → dir_tree::run_dfs_driver → NdxEvent
+    ├──→ ndx_walk (crate 根)                 Namespace::List → dir_tree::run_dfs_driver → NdxEvent
     ├──→ storage::delete_tree                Namespace::{List,Delete} → DeleteTreeItem 流
     ├──→ storage::create_directory_all       Namespace::{CreateDirectory,Stat} 逐层创建
     └──→ integrity::compare                  ReadSource + Metadata
