@@ -556,7 +556,11 @@ fn inline_timestamps(
     mode: ObservationMode,
     metadata: &Metadata,
 ) -> MetadataObservation<TimestampMetadata> {
-    let value = TimestampMetadata {
+    inline_value(mode, timestamp_metadata(metadata))
+}
+
+pub(super) fn timestamp_metadata(metadata: &Metadata) -> TimestampMetadata {
+    TimestampMetadata {
         accessed: metadata
             .accessed()
             .ok()
@@ -569,8 +573,7 @@ fn inline_timestamps(
             .created()
             .ok()
             .and_then(|value| system_time_to_timestamp(value.into_std())),
-    };
-    inline_value(mode, value)
+    }
 }
 
 fn inline_value<T>(mode: ObservationMode, value: T) -> MetadataObservation<T> {
@@ -587,7 +590,9 @@ fn inline_value<T>(mode: ObservationMode, value: T) -> MetadataObservation<T> {
 
 #[cfg(unix)]
 #[allow(clippy::unnecessary_wraps)]
-fn path_bytes(path: &Path) -> Result<(SymlinkTargetEncoding, Vec<u8>), StorageRoleFailure> {
+pub(super) fn path_bytes(
+    path: &Path,
+) -> Result<(SymlinkTargetEncoding, Vec<u8>), StorageRoleFailure> {
     use std::os::unix::ffi::OsStrExt as _;
     Ok((
         SymlinkTargetEncoding::UnixBytes,
@@ -597,7 +602,9 @@ fn path_bytes(path: &Path) -> Result<(SymlinkTargetEncoding, Vec<u8>), StorageRo
 
 #[cfg(windows)]
 #[allow(clippy::unnecessary_wraps)]
-fn path_bytes(path: &Path) -> Result<(SymlinkTargetEncoding, Vec<u8>), StorageRoleFailure> {
+pub(super) fn path_bytes(
+    path: &Path,
+) -> Result<(SymlinkTargetEncoding, Vec<u8>), StorageRoleFailure> {
     use std::os::windows::ffi::OsStrExt as _;
     let bytes = path
         .as_os_str()
@@ -608,7 +615,9 @@ fn path_bytes(path: &Path) -> Result<(SymlinkTargetEncoding, Vec<u8>), StorageRo
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn path_bytes(_path: &Path) -> Result<(SymlinkTargetEncoding, Vec<u8>), StorageRoleFailure> {
+pub(super) fn path_bytes(
+    _path: &Path,
+) -> Result<(SymlinkTargetEncoding, Vec<u8>), StorageRoleFailure> {
     Err(failure(&StoragePath::root(), FailureClass::Unsupported))
 }
 
@@ -707,7 +716,7 @@ pub(crate) fn source_identity(
 }
 
 #[cfg(unix)]
-fn backend_facts(metadata: &Metadata) -> Vec<u8> {
+pub(super) fn backend_facts(metadata: &Metadata) -> Vec<u8> {
     use cap_std::fs::MetadataExt as _;
     let mut facts = Vec::with_capacity(57);
     facts.push(1);
@@ -726,7 +735,7 @@ fn backend_facts(metadata: &Metadata) -> Vec<u8> {
 }
 
 #[cfg(not(unix))]
-fn backend_facts(metadata: &Metadata) -> Vec<u8> {
+pub(super) fn backend_facts(metadata: &Metadata) -> Vec<u8> {
     let mut facts = Vec::with_capacity(17);
     facts.push(1);
     facts.extend_from_slice(&metadata.len().to_le_bytes());
@@ -822,7 +831,7 @@ pub(crate) fn classify_io(kind: io::ErrorKind) -> (FailureClass, Transience) {
 mod tests;
 
 // Excludes atime: reading a source must not invalidate its recovery version.
-fn content_version(metadata: &Metadata) -> bytes::Bytes {
+pub(super) fn content_version(metadata: &Metadata) -> bytes::Bytes {
     let mut version = Vec::new();
     #[cfg(unix)]
     {
