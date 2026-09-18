@@ -18,31 +18,31 @@ use crate::{EntryEnum, Result};
 
 /// 带 NDX 编号的 entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NdxEntry {
+pub struct NdxEntry<E = Arc<EntryEnum>> {
     pub ndx: i32,
-    pub entry: Arc<EntryEnum>,
+    pub entry: E,
 }
 
 /// 一整页目录内容，消费完 drop 即释放内存
 #[derive(Debug, Serialize, Deserialize)]
-pub struct DirPageResult {
+pub struct DirPageResult<E = Arc<EntryEnum>> {
     /// 本目录的 `relative_path`（root 为空字符串）
     pub dir_path: String,
     /// 本页 NDX 范围起始（含）
     pub ndx_start: i32,
     /// 文件 entries（已按 name 排序，NDX 从 `ndx_start` 连续递增）
-    pub files: Vec<NdxEntry>,
+    pub files: Vec<NdxEntry<E>>,
     /// 子目录 entries（已按 name 排序，NDX 紧接 files 之后连续递增）
-    pub subdirs: Vec<NdxEntry>,
+    pub subdirs: Vec<NdxEntry<E>>,
     /// 本页段间隔的 gap NDX 值（-1 表示整棵树最后一页，无 gap）
     pub gap_ndx: i32,
 }
 
 /// `walkdir_2` 产出的事件流（页级粒度）
 #[derive(Debug)]
-pub enum NdxEvent {
+pub enum NdxEvent<E = Arc<EntryEnum>> {
     /// 一整页目录内容，DFS 顺序产出
-    Page(DirPageResult),
+    Page(DirPageResult<E>),
     /// 遍历过程中的 per-directory 错误（不中断整棵树）
     Error { path: String, reason: String },
     /// 整棵树遍历完成，对应 rsync `NDX_DONE` = -1
@@ -138,8 +138,8 @@ pub struct ReadContext {
 
 /// 子目录 entry，携带递归控制标志
 #[derive(Debug)]
-pub struct SubdirEntry {
-    pub entry: Arc<EntryEnum>,
+pub struct SubdirEntry<E = Arc<EntryEnum>> {
+    pub entry: E,
     /// 是否在页面中可见（分配 NDX）。
     /// false = 目录被 filter 跳过（`skip_entry=true`），但 `continue_scan=true` 仍需递归
     pub visible: bool,
@@ -150,22 +150,22 @@ pub struct SubdirEntry {
 
 /// 读取一个目录的结果
 #[derive(Debug)]
-pub struct ReadResult {
+pub struct ReadResult<E = Arc<EntryEnum>> {
     pub dir_path: String,
     /// 排序后的文件 entries（非目录）
-    pub files: Vec<Arc<EntryEnum>>,
+    pub files: Vec<E>,
     /// 排序后的子目录 entries（含 `visible`/`need_filter` 标志）
-    pub subdirs: Vec<SubdirEntry>,
+    pub subdirs: Vec<SubdirEntry<E>>,
     /// 读取过程中的错误
     pub errors: Vec<String>,
 }
 
 /// 发送给 Reader 池的请求
-pub struct ReadRequest {
+pub struct ReadRequest<E = Arc<EntryEnum>> {
     pub dir_path: String,
     pub handle: DirHandle,
     pub ctx: ReadContext,
-    pub reply: oneshot::Sender<Result<ReadResult>>,
+    pub reply: oneshot::Sender<Result<ReadResult<E>>>,
 }
 
 // ============================================================
@@ -176,14 +176,14 @@ pub struct ReadRequest {
 const PREFETCH_WINDOW: usize = 32;
 
 /// DFS 栈帧
-struct DfsFrame {
+struct DfsFrame<E> {
     dir_path: String,
     /// 本目录的读取结果 receiver
-    read_rx: Option<oneshot::Receiver<Result<ReadResult>>>,
+    read_rx: Option<oneshot::Receiver<Result<ReadResult<E>>>>,
     /// 所有子目录（含 `visible`/`need_filter` 标志）
-    subdirs: Vec<SubdirEntry>,
+    subdirs: Vec<SubdirEntry<E>>,
     /// 已提交预读的子目录对应的 oneshot receiver
-    pending_reads: Vec<Option<oneshot::Receiver<Result<ReadResult>>>>,
+    pending_reads: Vec<Option<oneshot::Receiver<Result<ReadResult<E>>>>>,
     /// 下一个要 DFS 下降的子目录索引
     next_child: usize,
     /// 下一个要提交预读的子目录索引（窗口前沿）
@@ -192,8 +192,8 @@ struct DfsFrame {
     page_sent: bool,
 }
 
-impl DfsFrame {
-    fn new_root(read_rx: oneshot::Receiver<Result<ReadResult>>) -> Self {
+impl<E> DfsFrame<E> {
+    fn new_root(read_rx: oneshot::Receiver<Result<ReadResult<E>>>) -> Self {
         Self {
             dir_path: String::new(),
             read_rx: Some(read_rx),
@@ -216,22 +216,23 @@ impl DfsFrame {
     }
 
     /// 预提交子目录读取，最多到窗口边界
-    async fn prefetch_subdirs(
+    async fn prefetch_subdirs<F>(
         &mut self,
-        req_tx: &async_channel::Sender<ReadRequest>,
-        root_path: &Path,
-        backend: BackendKind,
+        req_tx: &async_channel::Sender<ReadRequest<E>>,
+        child_of: &F,
         base_ctx: &ReadContext,
-    ) {
+    ) where
+        F: Fn(&E) -> (String, DirHandle),
+    {
         let window_end = (self.next_child + PREFETCH_WINDOW).min(self.subdirs.len());
         while self.next_prefetch < window_end {
             let sub = &self.subdirs[self.next_prefetch];
             let (reply_tx, reply_rx) = oneshot::channel();
-            let handle = extract_dir_handle(&sub.entry, root_path, backend);
+            let (child_path, handle) = child_of(&sub.entry);
             let child_ctx = self.build_child_ctx(self.next_prefetch, base_ctx);
             if req_tx
                 .send(ReadRequest {
-                    dir_path: sub.entry.get_relative_path().to_string_lossy().to_string(),
+                    dir_path: child_path,
                     handle,
                     ctx: child_ctx,
                     reply: reply_tx,
@@ -247,21 +248,22 @@ impl DfsFrame {
     }
 
     /// 消费一个子目录后，滑动窗口
-    async fn advance_prefetch(
+    async fn advance_prefetch<F>(
         &mut self,
-        req_tx: &async_channel::Sender<ReadRequest>,
-        root_path: &Path,
-        backend: BackendKind,
+        req_tx: &async_channel::Sender<ReadRequest<E>>,
+        child_of: &F,
         base_ctx: &ReadContext,
-    ) {
+    ) where
+        F: Fn(&E) -> (String, DirHandle),
+    {
         if self.next_prefetch < self.subdirs.len() {
             let sub = &self.subdirs[self.next_prefetch];
             let (reply_tx, reply_rx) = oneshot::channel();
-            let handle = extract_dir_handle(&sub.entry, root_path, backend);
+            let (child_path, handle) = child_of(&sub.entry);
             let child_ctx = self.build_child_ctx(self.next_prefetch, base_ctx);
             if req_tx
                 .send(ReadRequest {
-                    dir_path: sub.entry.get_relative_path().to_string_lossy().to_string(),
+                    dir_path: child_path,
                     handle,
                     ctx: child_ctx,
                     reply: reply_tx,
@@ -286,7 +288,7 @@ impl DfsFrame {
 }
 
 /// 判断当前帧在栈中是否还有未处理的可见兄弟目录（检查整个祖先链）
-fn has_more_visible_siblings(stack: &[DfsFrame]) -> bool {
+fn has_more_visible_siblings<E>(stack: &[DfsFrame<E>]) -> bool {
     // 从直接父级到根，任一祖先还有未处理的可见子目录就返回 true
     for i in (0..stack.len().saturating_sub(1)).rev() {
         let ancestor = &stack[i];
@@ -300,11 +302,11 @@ fn has_more_visible_siblings(stack: &[DfsFrame]) -> bool {
     false
 }
 
-fn assign_page_ndx(
-    files: Vec<Arc<EntryEnum>>,
-    subdirs: &[SubdirEntry],
+fn assign_page_ndx<E: Clone>(
+    files: Vec<E>,
+    subdirs: &[SubdirEntry<E>],
     next_ndx: &mut i32,
-) -> (i32, Vec<NdxEntry>, Vec<NdxEntry>) {
+) -> (i32, Vec<NdxEntry<E>>, Vec<NdxEntry<E>>) {
     let ndx_start = *next_ndx;
     let files = files
         .into_iter()
@@ -329,8 +331,8 @@ fn assign_page_ndx(
     (ndx_start, files, subdirs)
 }
 
-async fn send_directory_errors(
-    out_tx: &async_channel::Sender<NdxEvent>,
+async fn send_directory_errors<E>(
+    out_tx: &async_channel::Sender<NdxEvent<E>>,
     path: &str,
     errors: &[String],
 ) {
@@ -353,11 +355,11 @@ fn allocate_gap_ndx(has_children: bool, has_siblings: bool, next_ndx: &mut i32) 
     gap_ndx
 }
 
-async fn request_root_directory(
-    req_tx: &async_channel::Sender<ReadRequest>,
+async fn request_root_directory<E>(
+    req_tx: &async_channel::Sender<ReadRequest<E>>,
     root_handle: DirHandle,
     base_ctx: &ReadContext,
-) -> Option<oneshot::Receiver<Result<ReadResult>>> {
+) -> Option<oneshot::Receiver<Result<ReadResult<E>>>> {
     let (reply, response) = oneshot::channel();
     req_tx
         .send(ReadRequest {
@@ -372,6 +374,12 @@ async fn request_root_directory(
 }
 
 /// DFS 驱动器主循环，运行在单个 tokio task 中
+/// Legacy entry point: drives the DFS over `EntryEnum` payloads.
+///
+/// Child directories are located through [`extract_dir_handle`] and the entry's own
+/// scan-root-relative path, which is what the four `StorageEnum` backends produce. New callers
+/// use [`run_dfs_driver_with`] and supply their own payload type; `EntryEnum` is on its way out,
+/// and the default type parameter on the public NDX types is the runway for that.
 pub async fn run_dfs_driver(
     req_tx: async_channel::Sender<ReadRequest>,
     out_tx: async_channel::Sender<NdxEvent>,
@@ -381,13 +389,37 @@ pub async fn run_dfs_driver(
 ) {
     // 从 root_handle 推导后端类型，用于子目录 handle 构建
     let backend = root_handle.backend_kind();
+    run_dfs_driver_with(req_tx, out_tx, root_handle, base_ctx, move |entry| {
+        (
+            entry.get_relative_path().to_string_lossy().to_string(),
+            extract_dir_handle(entry, &root_path, backend),
+        )
+    })
+    .await;
+}
 
+/// Drives the DFS over any payload type.
+///
+/// The driver never inspects the payload. `child_of` supplies the only two facts it needs about
+/// a subdirectory entry: the path to report as the child frame's `dir_path`, which must be
+/// relative to the traversal root because depth is derived from its separator count, and the
+/// handle to hand the reader pool.
+pub async fn run_dfs_driver_with<E, F>(
+    req_tx: async_channel::Sender<ReadRequest<E>>,
+    out_tx: async_channel::Sender<NdxEvent<E>>,
+    root_handle: DirHandle,
+    base_ctx: ReadContext,
+    child_of: F,
+) where
+    E: Clone,
+    F: Fn(&E) -> (String, DirHandle),
+{
     let Some(reply_rx) = request_root_directory(&req_tx, root_handle, &base_ctx).await else {
         let _ = out_tx.send(NdxEvent::Done).await;
         return;
     };
 
-    let mut stack: Vec<DfsFrame> = vec![DfsFrame::new_root(reply_rx)];
+    let mut stack: Vec<DfsFrame<E>> = vec![DfsFrame::new_root(reply_rx)];
     let mut next_ndx: i32 = 0;
 
     loop {
@@ -432,7 +464,7 @@ pub async fn run_dfs_driver(
 
             // 窗口预读：提交前 PREFETCH_WINDOW 个子目录
             stack[frame_idx]
-                .prefetch_subdirs(&req_tx, &root_path, backend, &base_ctx)
+                .prefetch_subdirs(&req_tx, &child_of, &base_ctx)
                 .await;
 
             send_directory_errors(&out_tx, &stack[frame_idx].dir_path, &result.errors).await;
@@ -472,16 +504,12 @@ pub async fn run_dfs_driver(
 
             // 滑动窗口
             stack[frame_idx]
-                .advance_prefetch(&req_tx, &root_path, backend, &base_ctx)
+                .advance_prefetch(&req_tx, &child_of, &base_ctx)
                 .await;
 
             // 取出该子目录的 oneshot receiver
             let child_rx = stack[frame_idx].pending_reads[child_idx].take();
-            let child_path = stack[frame_idx].subdirs[child_idx]
-                .entry
-                .get_relative_path()
-                .to_string_lossy()
-                .to_string();
+            let (child_path, _) = child_of(&stack[frame_idx].subdirs[child_idx].entry);
 
             stack.push(DfsFrame {
                 dir_path: child_path,

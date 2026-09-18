@@ -9,8 +9,8 @@ use super::{NdxWalkRequest, ndx_walk};
 use crate::dir_tree::{DirPageResult, NdxEvent};
 use crate::model::{
     BackendIdentity, BackendKind, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
-    Operation, SourceIdentity, StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata,
-    Transience,
+    ObservedEntry, Operation, SourceIdentity, StoragePath, StorageTimestamp, TimePrecision,
+    TimestampMetadata, Transience,
 };
 use crate::storage::{
     BackendCapabilities, CapabilityAvailability, Namespace, NamespaceRequest, NamespaceResult,
@@ -215,7 +215,7 @@ fn request(root: StoragePath) -> Result<NdxWalkRequest> {
 }
 
 /// Drains the walk into its pages and errors, in emission order.
-async fn drain(walk: &crate::WalkDirAsyncIterator2) -> (Vec<DirPageResult>, Vec<String>) {
+async fn drain(walk: &super::NdxWalkIterator) -> (Vec<DirPageResult<ObservedEntry>>, Vec<String>) {
     let mut pages = Vec::new();
     let mut errors = Vec::new();
     while let Some(event) = walk.next().await {
@@ -251,12 +251,21 @@ fn sample_tree() -> Vec<(&'static str, Listing)> {
     ]
 }
 
-fn page_names(page: &DirPageResult) -> Vec<String> {
+fn page_names(page: &DirPageResult<ObservedEntry>) -> Vec<String> {
     page.files
         .iter()
         .chain(page.subdirs.iter())
-        .map(|entry| entry.entry.get_name().to_owned())
+        .map(|entry| name_of(&entry.entry))
         .collect()
+}
+
+/// Final path component of an emitted observation.
+fn name_of(entry: &ObservedEntry) -> String {
+    let value = entry.path().as_str();
+    value
+        .rsplit_once('/')
+        .map_or(value, |(_, name)| name)
+        .to_owned()
 }
 
 #[tokio::test]
@@ -368,18 +377,21 @@ async fn a_subtree_root_rebases_emitted_paths_and_still_lists_the_backend_path()
     let emitted: Vec<String> = pages
         .iter()
         .flat_map(|page| page.files.iter().chain(page.subdirs.iter()))
-        .map(|entry| {
-            entry
-                .entry
-                .get_relative_path()
-                .to_string_lossy()
-                .into_owned()
-        })
+        .map(|entry| entry.entry.path().as_str().to_owned())
         .collect();
     assert_eq!(
         emitted,
-        vec!["x.txt", "deep", "deep/y.txt"],
-        "emitted paths are relative to the traversal root, without the 'a/' prefix"
+        vec!["a/x.txt", "a/deep", "a/deep/y.txt"],
+        "an observation carries its backend-relative path, as `StorageTraversalSource` does"
+    );
+    assert_eq!(
+        pages
+            .iter()
+            .map(|page| page.dir_path.clone())
+            .collect::<Vec<_>>(),
+        vec!["", "deep"],
+        "the driver's own frame of reference stays relative to the traversal root, because it \
+         derives depth from the separator count"
     );
     Ok(())
 }
@@ -432,7 +444,7 @@ async fn exclude_expression_hides_entries_but_still_descends_when_asked() -> Res
     let emitted: Vec<String> = pages
         .iter()
         .flat_map(|page| page.files.iter().chain(page.subdirs.iter()))
-        .map(|entry| entry.entry.get_name().to_owned())
+        .map(|entry| name_of(&entry.entry))
         .collect();
     assert!(
         !emitted.contains(&"x.txt".to_owned()),
@@ -635,7 +647,7 @@ async fn a_match_expression_admits_only_what_it_names() -> Result {
     let emitted: Vec<String> = pages
         .iter()
         .flat_map(|page| page.files.iter())
-        .map(|entry| entry.entry.get_name().to_owned())
+        .map(|entry| name_of(&entry.entry))
         .collect();
     assert_eq!(
         emitted,
@@ -659,7 +671,7 @@ async fn a_filtered_out_directory_is_descended_without_appearing_in_its_parent_p
         root_page.is_none_or(|page| page
             .subdirs
             .iter()
-            .all(|entry| entry.entry.get_name() != "a")),
+            .all(|entry| name_of(&entry.entry) != "a")),
         "'a' does not match, so it is hidden from the page"
     );
     assert!(
@@ -671,7 +683,43 @@ async fn a_filtered_out_directory_is_descended_without_appearing_in_its_parent_p
 }
 
 #[tokio::test]
-async fn entry_fields_follow_the_neutral_descriptor_and_path_extension_rules() -> Result {
+async fn emitted_observations_carry_the_listed_facts_and_no_metadata_round_trip() -> Result {
+    let namespace = TreeNamespace::new(vec![(
+        "",
+        Listing::Entries(vec![
+            ("archive.tar.gz", EntryKind::File),
+            ("nested", EntryKind::Directory),
+        ]),
+    )]);
+    let storage = storage(Arc::clone(&namespace))?;
+    let (pages, _) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+
+    let file = &pages[0].files[0].entry;
+    assert_eq!(file.path().as_str(), "archive.tar.gz");
+    assert_eq!(file.kind(), EntryKind::File);
+    assert_eq!(file.size(), Some(3));
+    assert_eq!(
+        file.modified().map(StorageTimestamp::unix_nanos),
+        Some(MODIFIED_NANOS),
+        "the modification time comes from the listing, not the epoch"
+    );
+    assert_eq!(
+        file.metadata()
+            .timestamps()
+            .value()
+            .and_then(|v| v.modified),
+        file.modified(),
+        "the observation's metadata carries the same listed timestamps"
+    );
+    assert!(
+        namespace.non_list_requests().is_empty(),
+        "building the observation issues no extra namespace request"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn extension_conditions_use_path_extension_semantics() -> Result {
     let namespace = TreeNamespace::new(vec![(
         "",
         Listing::Entries(vec![
@@ -681,84 +729,20 @@ async fn entry_fields_follow_the_neutral_descriptor_and_path_extension_rules() -
         ]),
     )]);
     let storage = storage(Arc::clone(&namespace))?;
-    let (pages, _) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
-
-    let mut extensions = HashMap::new();
-    for entry in &pages[0].files {
-        let crate::EntryEnum::NAS(nas) = entry.entry.as_ref() else {
-            return Err("ndx_walk emits NAS entries".into());
-        };
-        extensions.insert(nas.name.clone(), nas.extension.clone());
-        assert_eq!(
-            i128::from(nas.mtime),
-            MODIFIED_NANOS,
-            "mtime comes from the listing, not the epoch"
-        );
-        assert_eq!(nas.mode, 0o644, "no inline mode falls back to the default");
-        assert!(!nas.is_symlink, "listed entries are never links");
-        assert!(
-            nas.file_handle.is_none(),
-            "no protocol file id is available"
-        );
-    }
-    assert_eq!(
-        extensions.get("archive.tar.gz"),
-        Some(&Some("gz".to_owned())),
-        "only the last component counts as the extension"
-    );
-    assert_eq!(
-        extensions.get(".bashrc"),
-        Some(&None),
-        "a leading dot is a stem, not an extension (Path::extension semantics)"
-    );
-    assert_eq!(extensions.get("plain"), Some(&None));
-    Ok(())
-}
-
-#[tokio::test]
-async fn an_inline_mode_from_the_listing_reaches_the_emitted_entry() -> Result {
-    struct ModeNamespace;
-    #[async_trait]
-    impl Namespace for ModeNamespace {
-        async fn execute(
-            &self,
-            request: NamespaceRequest,
-        ) -> std::result::Result<NamespaceResult, StorageRoleFailure> {
-            let NamespaceRequest::List(target) = request else {
-                return Err(entry_failure(&StoragePath::root()));
-            };
-            if !target.as_str().is_empty() {
-                return Ok(NamespaceResult::Entries(Vec::new()));
-            }
-            let stamp = StorageTimestamp::new(MODIFIED_NANOS, TimePrecision::Nanoseconds)
-                .unwrap_or_else(|error| panic!("{error}"));
-            let descriptor = descriptor("locked.bin", EntryKind::File, true)
-                .unwrap_or_else(|error| panic!("{error}"))
-                .with_inline_timestamps(TimestampMetadata {
-                    accessed: Some(stamp),
-                    modified: Some(stamp),
-                    created: Some(stamp),
-                })
-                .with_inline_mode(0o444);
-            Ok(NamespaceResult::Entries(vec![descriptor]))
-        }
-    }
-
-    let capabilities = namespace_only_capabilities()?;
-    let storage = Storage::connected(
-        BackendIdentity::new(BackendKind::Cifs, "ndx-walk-mode-test")?,
-        capabilities,
-        None,
-        None,
-        Some(Arc::new(ModeNamespace)),
-        None,
-        None,
-    )?;
-    let (pages, _) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
-    let crate::EntryEnum::NAS(nas) = pages[0].files[0].entry.as_ref() else {
-        return Err("ndx_walk emits NAS entries".into());
-    };
-    assert_eq!(nas.mode, 0o444, "the listing's mode wins over the default");
+    let mut walk_request = request(StoragePath::root())?;
+    walk_request.match_expressions = Some(crate::filter::parse_filter_expression(
+        "extension == \"gz\"",
+    )?);
+    let (pages, _) = drain(&ndx_walk(&storage, walk_request)?).await;
+    let emitted: Vec<String> = pages
+        .iter()
+        .flat_map(|page| page.files.iter())
+        .map(|entry| name_of(&entry.entry))
+        .collect();
+    // `.bashrc` has a stem and no extension, and `plain` has neither: only the last component
+    // after a dot counts, which is `Path::extension` semantics rather than the legacy CIFS
+    // walker's `rsplit_once('.')` (that one reported `Some("bashrc")`).
+    assert_eq!(emitted, vec!["archive.tar.gz"]);
     Ok(())
 }
 

@@ -532,6 +532,8 @@ fn role_kind(attrs: &Attr) -> crate::model::EntryKind {
     }
 }
 
+use crate::storage::backends::nfs::metadata::timestamp as nfs_timestamp;
+
 fn role_observation(
     entry: &EntryEnum,
 ) -> std::result::Result<NfsNamespaceObservation, NfsProtocolFailure> {
@@ -548,12 +550,37 @@ fn role_observation(
     };
     let path = crate::model::StoragePath::new(entry.get_relative_path().to_string_lossy())
         .map_err(|_| NfsProtocolFailure::protocol())?;
+    let (timestamps, mode) = match entry {
+        EntryEnum::NAS(nas) => (
+            Some(crate::model::TimestampMetadata {
+                accessed: nfs_timestamp(nas.atime),
+                modified: nfs_timestamp(nas.mtime),
+                created: nfs_timestamp(nas.ctime),
+            }),
+            Some(nas.mode),
+        ),
+        _ => (None, None),
+    };
     Ok(NfsNamespaceObservation {
         path,
         kind,
         size: (kind == crate::model::EntryKind::File).then(|| entry.get_size()),
         file_handle,
+        timestamps,
+        mode,
     })
+}
+
+/// Builds the neutral timestamp record from one NFS attribute set.
+///
+/// `created` carries the POSIX change time: `NFSv3` has no birth time, and this is the mapping
+/// the NFS metadata role already uses, so both roles report the same three values.
+fn attrs_timestamps(attrs: &Attr) -> crate::model::TimestampMetadata {
+    crate::model::TimestampMetadata {
+        accessed: nfs_timestamp(time_to_i64(attrs.atime)),
+        modified: nfs_timestamp(time_to_i64(attrs.mtime)),
+        created: nfs_timestamp(time_to_i64(attrs.ctime)),
+    }
 }
 
 #[async_trait]
@@ -569,6 +596,8 @@ impl NfsNamespaceProtocol for NFSStorage {
             kind,
             size: (kind == crate::model::EntryKind::File).then_some(attrs.filesize),
             file_handle,
+            timestamps: Some(attrs_timestamps(&attrs)),
+            mode: Some(attrs.file_mode),
         })
     }
 

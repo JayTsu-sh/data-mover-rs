@@ -18,13 +18,15 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use data_mover::DslTraversalFilter;
 use data_mover::dir_tree::{NdxEntry, NdxEvent};
 use data_mover::filter::parse_filter_expression;
 use data_mover::integrity::{
     IntegrityMode, IntegrityOptions, IntegrityRequest, compare as compare_objects,
 };
 use data_mover::model::{
-    BackendIdentity, BackendKind, ObservationMode, ObservationPlan, StoragePath,
+    BackendIdentity, BackendKind, ObservationMode, ObservationPlan, ObservedEntry, StoragePath,
+    StorageTimestamp,
 };
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, DeleteTreeItem,
@@ -36,7 +38,6 @@ use data_mover::traversal::{
     LocalTraversalSource, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest,
     TraversalSession, TraversalSource as _,
 };
-use data_mover::{DslTraversalFilter, EntryEnum};
 use tokio_util::sync::CancellationToken;
 
 type Error = Box<dyn std::error::Error>;
@@ -279,19 +280,14 @@ async fn ndx_walk_pages(storage: &Storage, args: &Args, command: &Command) -> Re
     Ok(())
 }
 
-fn print_ndx_entry(entry: &NdxEntry) {
-    let EntryEnum::NAS(nas) = entry.entry.as_ref() else {
-        println!("  ndx={} {}", entry.ndx, entry.entry.get_name());
-        return;
-    };
+fn print_ndx_entry(entry: &NdxEntry<ObservedEntry>) {
     println!(
-        "  ndx={} {} mode={:o} size={} mtime={} dir={}",
+        "  ndx={} {} kind={:?} size={:?} modified={:?}",
         entry.ndx,
-        nas.relative_path.display(),
-        nas.mode,
-        nas.size,
-        nas.mtime,
-        nas.is_dir
+        entry.entry.path(),
+        entry.entry.kind(),
+        entry.entry.size(),
+        entry.entry.modified().map(StorageTimestamp::unix_nanos)
     );
 }
 

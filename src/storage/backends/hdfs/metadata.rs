@@ -112,7 +112,7 @@ impl Metadata for HdfsMetadata {
     }
 }
 
-fn timestamps(atime: i64, mtime: i64) -> TimestampMetadata {
+pub(super) fn timestamps(atime: i64, mtime: i64) -> TimestampMetadata {
     TimestampMetadata {
         accessed: StorageTimestamp::new(i128::from(atime), TimePrecision::Milliseconds).ok(),
         modified: StorageTimestamp::new(i128::from(mtime), TimePrecision::Milliseconds).ok(),

@@ -266,7 +266,7 @@ fn unsupported(path: &StoragePath) -> StorageRoleFailure {
     )
 }
 
-fn timestamp(value: i64) -> Option<StorageTimestamp> {
+pub(crate) fn timestamp(value: i64) -> Option<StorageTimestamp> {
     StorageTimestamp::new(i128::from(value), TimePrecision::Nanoseconds).ok()
 }
 

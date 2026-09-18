@@ -8,17 +8,25 @@
 //!
 //! Semantics worth knowing before relying on it:
 //!
-//! - **Only CIFS can actually be walked today.** Every emitted entry needs a modification
-//!   time, and the only source that costs no extra round trip is
-//!   [`SourceDescriptor::inline_timestamps`], which only the CIFS namespace attaches
-//!   (`backends/cifs/namespace.rs`). NFS and HDFS lend a namespace role, so preflight admits
-//!   them, but each of their directories is then reported as an error rather than emitted with
-//!   an epoch timestamp — an epoch would silently tell an incremental sync that every entry
-//!   changed, and would disable every `modified` filter condition. Making them work is a
-//!   matter of attaching the timestamps their listings already carry (NFS `readdirplus`
-//!   returns the attributes and currently drops them), not of changing this adapter.
+//! - **Every emitted entry needs a modification time**, and the only source that costs no extra
+//!   round trip is [`SourceDescriptor::inline_timestamps`]. CIFS, NFS and HDFS all attach it:
+//!   `QUERY_DIRECTORY`, `readdirplus` and the HDFS listing each already carry the attributes.
+//!   A listing that does not is reported as an error rather than emitted with an epoch
+//!   timestamp — an epoch would silently tell an incremental sync that every entry changed, and
+//!   would disable every `modified` filter condition.
 //! - **Local and S3 lend no namespace role**, so they fail preflight here rather than
 //!   producing an empty walk.
+//! - **Pages carry [`ObservedEntry`], not `EntryEnum`.** That is the same immutable observation
+//!   [`crate::traversal::StorageTraversalSource`] emits, so both role-layer walkers describe an
+//!   entry the same way and `EntryEnum` — which is on its way out — gains no new caller here.
+//!   As in that traversal, the emitted entry carries its **backend-relative** path; the
+//!   scan-root-relative spelling is what the filter matches against and what the driver uses to
+//!   derive depth.
+//! - **What each backend can fill differs.** `created` holds the POSIX change time on NFS
+//!   (`NFSv3` has no birth time), the real creation time on CIFS, and nothing on HDFS. Permission
+//!   bits ride along as `ownership_mode` only where the backend observes them: real POSIX bits
+//!   on NFS and HDFS, and on CIFS an approximation derived from `FILE_ATTRIBUTE_READONLY` that
+//!   is reported for display and never applied to a destination.
 //! - **Stopping needs the token.** `NdxWalkRequest::cancel` stops the reader pool at its next
 //!   listing. Dropping the returned iterator is *not* reliable on its own: the driver only
 //!   gives up when sending a non-empty page fails, and ignores send failures for error and
@@ -35,12 +43,20 @@ use super::{
     CapabilityUnavailable, Namespace, NamespaceRequest, NamespaceResult, PreflightPolicy,
     SourceDescriptor, Storage, StorageRoleFailure,
 };
-use crate::dir_tree::{DirHandle, ReadContext, ReadResult, SubdirEntry, run_dfs_driver};
+use crate::TransferConcurrency;
+use crate::dir_tree::{
+    DirHandle, NdxEvent, ReadContext, ReadResult, SubdirEntry, run_dfs_driver_with,
+};
 use crate::error::StorageError;
 use crate::filter::{FilterExpression, FilterInput, should_skip};
-use crate::model::{BackendKind, EntryKind, FailureClass, StoragePath, StorageTimestamp};
+use crate::model::{
+    BackendKind, EntryKind, FailureClass, MetadataObservation, MetadataObservations,
+    MetadataProvenance, ObservedEntry, StoragePath,
+};
 use crate::traversal::relative_to;
-use crate::{EntryEnum, NASEntry, TransferConcurrency};
+
+/// The event stream [`ndx_walk`] produces.
+pub type NdxWalkIterator = crate::AsyncReceiver<NdxEvent<ObservedEntry>>;
 
 /// One NDX-paged traversal request.
 #[derive(Clone, Debug)]
@@ -72,11 +88,12 @@ pub struct NdxWalkRequest {
 pub fn ndx_walk(
     storage: &Storage,
     request: NdxWalkRequest,
-) -> Result<crate::WalkDirAsyncIterator2, CapabilityUnavailable> {
+) -> Result<NdxWalkIterator, CapabilityUnavailable> {
     let namespace = storage.namespace(&PreflightPolicy::production())?;
     let concurrency = request.concurrency.get().min(TransferConcurrency::MAX);
-    let (request_sender, request_receiver) =
-        async_channel::bounded::<crate::dir_tree::ReadRequest>(concurrency.saturating_mul(2));
+    let (request_sender, request_receiver) = async_channel::bounded::<
+        crate::dir_tree::ReadRequest<ObservedEntry>,
+    >(concurrency.saturating_mul(2));
     let (output_sender, output_receiver) = async_channel::bounded(64);
 
     for _ in 0..concurrency {
@@ -119,12 +136,19 @@ pub fn ndx_walk(
         include_tags: false,
         is_versioned: false,
     };
-    tokio::spawn(run_dfs_driver(
+    let root = request.root.clone();
+    let kind = storage.kind();
+    tokio::spawn(run_dfs_driver_with(
         request_sender,
         output_sender,
-        PathBuf::new(),
-        root_handle(storage.kind()),
+        root_handle(kind),
         context,
+        move |entry| {
+            (
+                relative_to(&root, entry.path()).to_owned(),
+                root_handle(kind),
+            )
+        },
     ));
     Ok(crate::AsyncReceiver::new(output_receiver))
 }
@@ -168,7 +192,7 @@ async fn read_dir(
     dir_path: &str,
     ctx: &ReadContext,
     cancel: &CancellationToken,
-) -> crate::Result<ReadResult> {
+) -> crate::Result<ReadResult<ObservedEntry>> {
     let target = join_root(root, dir_path)?;
     let descriptors = match namespace.execute(NamespaceRequest::List(target)).await {
         Ok(NamespaceResult::Entries(entries)) => entries,
@@ -186,11 +210,11 @@ async fn read_dir(
 /// failure and a cancellation both trip the token: the driver cannot be told to stop, so
 /// without this every remaining directory would cost one more doomed round trip. `Cancelled`
 /// is reported with a distinguishable prefix rather than as an I/O error, per R10.
-fn listing_failure(
+fn listing_failure<E>(
     dir_path: &str,
     failure: &StorageRoleFailure,
     cancel: &CancellationToken,
-) -> crate::Result<ReadResult> {
+) -> crate::Result<ReadResult<E>> {
     let class = match failure {
         StorageRoleFailure::Entry(error) => error.class(),
         StorageRoleFailure::Session(error) => error.class(),
@@ -213,7 +237,7 @@ fn listing_failure(
     }
 }
 
-fn errors_only(dir_path: &str, reason: String) -> ReadResult {
+fn errors_only<E>(dir_path: &str, reason: String) -> ReadResult<E> {
     ReadResult {
         dir_path: dir_path.to_owned(),
         files: Vec::new(),
@@ -227,11 +251,11 @@ fn build_read_result(
     dir_path: &str,
     descriptors: &[SourceDescriptor],
     ctx: &ReadContext,
-) -> ReadResult {
+) -> ReadResult<ObservedEntry> {
     let mut entries = Vec::with_capacity(descriptors.len());
     let mut undated = 0_usize;
     for descriptor in descriptors {
-        match descriptor_to_nas(root, descriptor) {
+        match observed(descriptor) {
             Some(entry) => entries.push(entry),
             None => undated += 1,
         }
@@ -244,12 +268,14 @@ fn build_read_result(
         return errors_only(
             dir_path,
             format!(
-                "{undated} of {} entries in '{dir_path}' carry no inline modification time;                  emitting them would report the epoch and tell an incremental sync that every                  entry changed, so the directory and its subtree are skipped",
+                "{undated} of {} entries in '{dir_path}' carry no inline modification time; \
+                 emitting them would report the epoch and tell an incremental sync that every \
+                 entry changed, so the directory and its subtree are skipped",
                 descriptors.len()
             ),
         );
     }
-    let (files, subdirs) = partition_entries(entries, ctx);
+    let (files, subdirs) = partition_entries(root, entries, ctx);
     ReadResult {
         dir_path: dir_path.to_owned(),
         files,
@@ -264,20 +290,20 @@ fn build_read_result(
 /// what the legacy readers did; `visible: false` keeps a filtered-out directory out of the page
 /// while still descending into it.
 fn partition_entries(
-    entries: Vec<NASEntry>,
+    root: &StoragePath,
+    entries: Vec<ObservedEntry>,
     ctx: &ReadContext,
-) -> (Vec<Arc<EntryEnum>>, Vec<SubdirEntry>) {
+) -> (Vec<ObservedEntry>, Vec<SubdirEntry<ObservedEntry>>) {
     let mut files = Vec::new();
     let mut subdirs = Vec::new();
     for entry in entries {
         let (skip, continue_scan, need_filter) = if ctx.apply_filter {
-            filter_decision(&entry, ctx)
+            filter_decision(root, &entry, ctx)
         } else {
             (false, true, false)
         };
-        let can_descend = entry.is_dir
+        let can_descend = entry.kind() == EntryKind::Directory
             && (ctx.max_depth == 0 || ctx.current_depth.saturating_add(1) < ctx.max_depth);
-        let entry = Arc::new(EntryEnum::NAS(entry));
         if skip {
             if can_descend && continue_scan {
                 subdirs.push(SubdirEntry {
@@ -296,84 +322,87 @@ fn partition_entries(
             files.push(entry);
         }
     }
-    files.sort_by(|left, right| left.get_name().cmp(right.get_name()));
-    subdirs.sort_by(|left, right| left.entry.get_name().cmp(right.entry.get_name()));
+    files.sort_by(|left, right| entry_name(left).cmp(entry_name(right)));
+    subdirs.sort_by(|left, right| entry_name(&left.entry).cmp(entry_name(&right.entry)));
     (files, subdirs)
 }
 
-fn filter_decision(entry: &NASEntry, ctx: &ReadContext) -> (bool, bool, bool) {
-    let path = entry.relative_path.to_string_lossy();
-    let file_type = if entry.is_dir { "dir" } else { "file" };
+/// Final path component of an observation.
+fn entry_name(entry: &ObservedEntry) -> &str {
+    let value = entry.path().as_str();
+    value.rsplit_once('/').map_or(value, |(_, name)| name)
+}
+
+fn filter_decision(
+    root: &StoragePath,
+    entry: &ObservedEntry,
+    ctx: &ReadContext,
+) -> (bool, bool, bool) {
+    let name = entry_name(entry);
+    // The filter frame of reference is the traversal root, matching every legacy walker and
+    // `DslTraversalFilter`, even though the observation itself carries the backend-relative path.
+    let path = relative_to(root, entry.path());
+    let file_type = if entry.kind() == EntryKind::Directory {
+        "dir"
+    } else {
+        "file"
+    };
+    let extension = Path::new(name).extension().and_then(|value| value.to_str());
     should_skip(
         ctx.match_expr.as_ref().as_ref(),
         ctx.exclude_expr.as_ref().as_ref(),
         FilterInput {
-            file_name: Some(&entry.name),
-            file_path: Some(&path),
+            file_name: Some(name),
+            file_path: Some(path),
             file_type: Some(file_type),
-            modified_epoch: Some(entry.mtime / 1_000_000_000),
-            size: Some(entry.size),
-            extension: entry.extension.as_deref().or(Some("")),
+            modified_epoch: entry
+                .modified()
+                .and_then(|value| i64::try_from(value.unix_nanos() / 1_000_000_000).ok()),
+            size: entry.size(),
+            extension: extension.or(Some("")),
         },
     )
 }
 
-/// Rebuilds the legacy enumeration entry from a neutral descriptor.
+/// Turns one listed descriptor into the immutable observation the pages carry.
 ///
-/// Returns `None` unless the listing carried a modification time. The whole record being
-/// absent and the record being present with `modified: None` are the same thing here: either
-/// way `mtime` would have to be the epoch, which is the outcome the module docs rule out.
-/// `accessed` and `created` are allowed to be missing — nothing decides transfers on them.
-fn descriptor_to_nas(root: &StoragePath, descriptor: &SourceDescriptor) -> Option<NASEntry> {
+/// Returns `None` unless the listing carried a modification time. The whole record being absent
+/// and the record being present with `modified: None` are the same thing here: either way the
+/// entry would report the epoch, which is the outcome the module docs rule out. `accessed` and
+/// `created` are allowed to be missing — nothing decides transfers on them.
+///
+/// No `Metadata` role call is made: everything here comes from facts the listing already
+/// returned, which is the whole point of the adapter.
+fn observed(descriptor: &SourceDescriptor) -> Option<ObservedEntry> {
     let timestamps = descriptor.inline_timestamps()?;
-    timestamps.modified?;
-    let relative = relative_to(root, &descriptor.path);
-    let name = relative
-        .rsplit_once('/')
-        .map_or(relative, |(_, name)| name)
-        .to_owned();
-    let is_dir = descriptor.kind == EntryKind::Directory;
-    Some(NASEntry {
-        extension: Path::new(&name)
-            .extension()
-            .map(|value| value.to_string_lossy().into_owned()),
-        name,
-        relative_path: PathBuf::from(relative),
-        is_dir,
-        size: if is_dir {
-            0
-        } else {
-            descriptor.size.unwrap_or(0)
+    let modified = timestamps.modified?;
+    let observations = MetadataObservations::new(
+        MetadataObservation::NotRequested,
+        MetadataObservation::NotRequested,
+        MetadataObservation::NotRequested,
+        // `OwnershipMode` requires numeric owner and group; the model deliberately has no
+        // mode-only shape here (that is what `CopiedMetadataObservation::mode_without_ownership`
+        // is for), and inventing ids would let a destination be given the wrong principal.
+        MetadataObservation::NotRequested,
+        MetadataObservation::Value {
+            value: timestamps,
+            provenance: MetadataProvenance::Inline,
         },
-        atime: unix_nanos(timestamps.accessed),
-        ctime: unix_nanos(timestamps.created),
-        mtime: unix_nanos(timestamps.modified),
-        // Approximate bits when the listing could derive them; otherwise the conventional
-        // default for the kind. A backend that observes real POSIX mode fills `inline_mode`.
-        mode: descriptor
-            .inline_mode()
-            .unwrap_or(if is_dir { 0o755 } else { 0o644 }),
-        // Reparse points are listed as files (the facade cannot read link targets), so no
-        // listed entry is ever a link.
-        is_symlink: false,
-        // No protocol-neutral source: SMB link counts need a second per-file query, and the
-        // domain facade exposes no file id at all, so rename detection falls back to paths.
-        hard_links: None,
-        file_handle: None,
-        ino: None,
-        uid: None,
-        gid: None,
-        acl: None,
-        owner: None,
-        owner_group: None,
-        xattrs: None,
-    })
-}
-
-fn unix_nanos(value: Option<StorageTimestamp>) -> i64 {
-    value.map_or(0, |value| {
-        i64::try_from(value.unix_nanos()).unwrap_or(i64::MAX)
-    })
+    )
+    .ok()?;
+    let entry = ObservedEntry::new(
+        descriptor.path.clone(),
+        descriptor.kind,
+        descriptor.size,
+        Some(modified),
+        descriptor.source_identity.clone(),
+    )
+    .ok()?
+    .with_metadata(observations);
+    match descriptor.backend_fact.clone() {
+        Some(fact) => entry.with_backend_fact_bytes(fact.to_vec()).ok(),
+        None => Some(entry),
+    }
 }
 
 #[cfg(test)]

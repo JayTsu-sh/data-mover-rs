@@ -298,9 +298,13 @@ pub(super) fn descriptor(
     facts: &HdfsEntryFacts,
 ) -> Result<SourceDescriptor, StorageRoleFailure> {
     let source_identity = identity_for(identity, &path, facts)?;
+    // `stat` and `list` share this one constructor, so both paths report the same inline facts.
+    // HDFS has no change or birth time, so `created` stays absent rather than being faked.
     Ok(
         SourceDescriptor::new(path, facts.kind, facts.size, source_identity)
-            .with_backend_fact(backend_fact(facts)),
+            .with_backend_fact(backend_fact(facts))
+            .with_inline_timestamps(super::metadata::timestamps(facts.atime, facts.mtime))
+            .with_inline_mode(facts.mode),
     )
 }
 

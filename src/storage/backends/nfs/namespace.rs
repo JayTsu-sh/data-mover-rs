@@ -22,6 +22,12 @@ pub(crate) struct NfsNamespaceObservation {
     pub(crate) kind: EntryKind,
     pub(crate) size: Option<u64>,
     pub(crate) file_handle: bytes::Bytes,
+    /// Timestamps the enumerating operation already returned. `readdirplus` and `LOOKUP` both
+    /// carry the full attribute set, so neither path costs an extra round trip; `created` holds
+    /// the POSIX change time, as the NFS metadata role also reports it (`NFSv3` has no birth time).
+    pub(crate) timestamps: Option<crate::model::TimestampMetadata>,
+    /// POSIX permission bits from the same attributes.
+    pub(crate) mode: Option<u32>,
 }
 
 #[async_trait]
@@ -137,8 +143,8 @@ fn descriptor(
         source_identity,
         backend_fact: None,
         content_version: None,
-        inline_timestamps: None,
-        inline_mode: None,
+        inline_timestamps: entry.timestamps,
+        inline_mode: entry.mode,
     })
 }
 
