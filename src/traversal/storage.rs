@@ -14,12 +14,14 @@ use crate::model::{
     ObservedEntry, Operation, StoragePath, Transience,
 };
 use crate::storage::{
-    CapabilityUnavailable, Metadata, Namespace, NamespaceRequest, NamespaceResult, PreflightPolicy,
-    SourceDescriptor, Storage, StorageRoleFailure,
+    CapabilityUnavailable, Metadata, Namespace, NamespaceResult, PreflightPolicy, SourceDescriptor,
+    Storage, StorageRoleFailure,
 };
 
+mod cursor;
 mod observe;
 
+use cursor::{Cursor, Step};
 use observe::observe;
 
 /// Protocol-neutral traversal assembled from one connected storage's namespace and metadata roles.
@@ -66,7 +68,7 @@ impl TraversalSource for StorageTraversalSource {
     }
 }
 
-/// One directory waiting to be listed.
+/// One directory to list, with the filter state its children inherit.
 #[derive(Clone, Debug)]
 struct DirectoryWork {
     path: StoragePath,
@@ -92,18 +94,17 @@ type ObservationTask = JoinSet<(
     Option<Deferred>,
 )>;
 
-/// A settled sequence slot: an optional item to deliver and an optional directory to list.
-struct Settled {
-    item: Option<TraversalItem>,
-    descend: Option<DirectoryWork>,
-}
+type ListingTask = JoinSet<(StoragePath, Result<NamespaceResult, StorageRoleFailure>)>;
 
+/// Output sequencing: every emitted item owns one sequence number, assigned in output order by
+/// the cursor; the reorder buffer releases them strictly in that order.
 struct State {
     next_sequence: u64,
     next_output: u64,
     observed: u64,
     failed: u64,
-    pending: BTreeMap<u64, Settled>,
+    /// Settled sequence slots waiting for their turn; `None` settles a slot with no item.
+    pending: BTreeMap<u64, Option<TraversalItem>>,
 }
 
 impl State {
@@ -186,12 +187,13 @@ async fn run(
     completion: oneshot::Sender<Result<TraversalOutcome, TraversalTerminalFailure>>,
 ) {
     let mut state = State::new();
-    let mut directories = VecDeque::from([DirectoryWork {
+    let mut cursor = Cursor::new(DirectoryWork {
         path: request.root.clone(),
         child_depth: 1,
         filter_children: request.filter.is_some(),
-    }]);
+    });
     let mut tasks = JoinSet::new();
+    let mut listings = JoinSet::new();
     let runtime = Runtime {
         namespace: &namespace,
         metadata: &metadata,
@@ -199,12 +201,14 @@ async fn run(
         policy: Policy::new(&request),
         items: &items,
     };
-    let result = enumerate_and_observe(&runtime, &mut directories, &mut tasks, &mut state).await;
-    // Never abort an observation: a backend may hold an open handle between two awaits (CIFS
-    // opens, reads attributes, then closes), and dropping the future there leaks it. Detached
-    // observations run to completion in the background and close what they opened; there are
-    // at most `max_inflight_operations` of them, and their results are simply discarded.
+    let result = drive(&runtime, &mut cursor, &mut listings, &mut tasks, &mut state).await;
+    // Never abort a backend operation: it may hold an open handle between two awaits (a CIFS
+    // listing holds its directory handle, a CIFS observation opens, reads attributes, then
+    // closes), and dropping the future there leaks it. Detached operations run to completion in
+    // the background and close what they opened; their results are simply discarded, and both
+    // sets are bounded by the request's budgets.
     tasks.detach_all();
+    listings.detach_all();
     drop(items);
     let terminal = if request.cancel.is_cancelled() {
         Ok(TraversalOutcome::Cancelled)
@@ -219,9 +223,12 @@ async fn run(
     let _ = completion.send(terminal);
 }
 
-async fn enumerate_and_observe(
+/// Advances the cursor as far as it can, emits what is ready, then waits for whatever the
+/// cursor is blocked on.
+async fn drive(
     runtime: &Runtime<'_>,
-    directories: &mut VecDeque<DirectoryWork>,
+    cursor: &mut Cursor,
+    listings: &mut ListingTask,
     tasks: &mut ObservationTask,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
@@ -229,84 +236,49 @@ async fn enumerate_and_observe(
         if runtime.request.cancel.is_cancelled() {
             return Ok(());
         }
-        if let Some(directory) = directories.pop_front() {
-            list_directory(runtime, directory, directories, tasks, state).await?;
-        } else if tasks.is_empty() {
-            return Ok(());
-        } else {
-            settle(runtime, tasks, state).await?;
-            flush(runtime, state, directories).await?;
+        let step = cursor.advance(runtime, tasks, state)?;
+        cursor.start_listings(runtime, listings);
+        flush(runtime, state).await?;
+        match step {
+            Step::Done if tasks.is_empty() => return Ok(()),
+            // Nothing in flight means every admitted entry has settled, so the flush above
+            // emitted them all and the window is open again.
+            Step::WindowFull if tasks.is_empty() => {}
+            _ => wait(runtime, cursor, listings, tasks, state).await?,
         }
     }
 }
 
-async fn list_directory(
+/// Waits for one listing or one observation to finish, or for cancellation.
+async fn wait(
     runtime: &Runtime<'_>,
-    directory: DirectoryWork,
-    directories: &mut VecDeque<DirectoryWork>,
+    cursor: &mut Cursor,
+    listings: &mut ListingTask,
     tasks: &mut ObservationTask,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
-    let Some(descriptors) = listed_children(runtime, &directory.path, state).await? else {
-        return flush(runtime, state, directories).await;
-    };
-    for descriptor in descriptors {
-        while state.admitted() >= runtime.request.max_inflight_operations.get() {
-            if runtime.request.cancel.is_cancelled() {
-                return Ok(());
-            }
-            // With nothing in flight, every admitted entry has settled, so the flush below can
-            // always emit the next one and shrink the window.
-            if !tasks.is_empty() {
-                settle(runtime, tasks, state).await?;
-            }
-            flush(runtime, state, directories).await?;
+    tokio::select! {
+        biased;
+        () = runtime.request.cancel.cancelled() => Ok(()),
+        Some(joined) = listings.join_next(), if !listings.is_empty() => {
+            let (path, result) = joined.map_err(|_| TraversalTerminalFailure::Internal)?;
+            cursor.listed(path, result)
         }
-        admit(runtime, &directory, descriptor, directories, tasks, state)?;
-    }
-    flush(runtime, state, directories).await
-}
-
-/// Lists one directory, queueing every entry-scoped failure it reports.
-///
-/// Returns `None` when the directory itself could not be listed, and the children that could
-/// be described otherwise; a child the backend could not describe becomes its own failure item
-/// without hiding its siblings.
-async fn listed_children(
-    runtime: &Runtime<'_>,
-    directory: &StoragePath,
-    state: &mut State,
-) -> Result<Option<Vec<SourceDescriptor>>, TraversalTerminalFailure> {
-    let listed = runtime
-        .namespace
-        .execute(NamespaceRequest::List(directory.clone()))
-        .await;
-    match listed.map(NamespaceResult::into_listing) {
-        Ok(Some((entries, failures))) => {
-            for failure in failures {
-                queue_failure(state, failure)?;
-            }
-            Ok(Some(entries))
+        Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
+            settle(runtime, cursor, state, joined)
         }
-        Ok(None) => {
-            queue_failure(state, entry_failure(directory, FailureClass::Protocol))?;
-            Ok(None)
-        }
-        Err(StorageRoleFailure::Entry(error)) => {
-            queue_failure(state, error)?;
-            Ok(None)
-        }
-        Err(StorageRoleFailure::Session(error)) => Err(TraversalTerminalFailure::Session(error)),
+        // The cursor only waits on work it started, so this means that invariant broke.
+        else => Err(TraversalTerminalFailure::Internal),
     }
 }
 
-/// Applies the admission policy to one listed child and either spawns its observation,
-/// enqueues it for listing without emitting it, or drops it.
+/// Applies the admission policy to one listed child: spawns its observation, records where to
+/// descend next, or drops it.
 fn admit(
     runtime: &Runtime<'_>,
     parent: &DirectoryWork,
     descriptor: SourceDescriptor,
-    directories: &mut VecDeque<DirectoryWork>,
+    cursor_slots: &mut VecDeque<cursor::Slot>,
     tasks: &mut ObservationTask,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
@@ -324,25 +296,33 @@ fn admit(
         };
         let decision = runtime.policy.decide(parent.filter_children, &candidate);
         if let Some(work) = descend_work(runtime.request, &descriptor, depth, decision) {
-            directories.push_back(work);
+            cursor_slots.push_back(cursor::Slot::Descend(work));
         }
         if !decision.emit {
             return Ok(());
         }
     }
     let sequence = state.allocate()?;
-    let namespace = Arc::clone(runtime.namespace);
-    let metadata = Arc::clone(runtime.metadata);
-    let plan = runtime.policy.observation_plan;
     let context = deferred.then_some(Deferred {
         depth,
         kind: descriptor.kind,
     });
+    if context.is_some_and(|context| awaits_slot(runtime.request, context)) {
+        cursor_slots.push_back(cursor::Slot::Pending(sequence));
+    }
+    let namespace = Arc::clone(runtime.namespace);
+    let metadata = Arc::clone(runtime.metadata);
+    let plan = runtime.policy.observation_plan;
     tasks.spawn(async move {
         let result = observe(namespace, metadata, descriptor, plan).await;
         (sequence, result, context)
     });
     Ok(())
+}
+
+/// Whether a deferred child can be descended into at all, so its decision fills a slot.
+fn awaits_slot(request: &TraversalRequest, deferred: Deferred) -> bool {
+    deferred.kind == EntryKind::Directory && request.admits_depth(deferred.depth)
 }
 
 fn descend_work(
@@ -363,29 +343,33 @@ fn entry_name(path: &StoragePath) -> &str {
     path.as_str().rsplit('/').next().unwrap_or_default()
 }
 
-async fn settle(
+type Joined = Result<
+    (
+        u64,
+        Result<ObservedEntry, StorageRoleFailure>,
+        Option<Deferred>,
+    ),
+    tokio::task::JoinError,
+>;
+
+fn settle(
     runtime: &Runtime<'_>,
-    tasks: &mut ObservationTask,
+    cursor: &mut Cursor,
     state: &mut State,
+    joined: Joined,
 ) -> Result<(), TraversalTerminalFailure> {
-    let result = tokio::select! {
-        biased;
-        () = runtime.request.cancel.cancelled() => return Ok(()),
-        result = tasks.join_next() => result,
-    };
-    let settled = match result {
-        Some(Ok((sequence, Ok(entry), deferred))) => {
-            (sequence, settle_entry(runtime, entry, deferred))
-        }
-        Some(Ok((sequence, Err(StorageRoleFailure::Entry(error)), deferred))) => {
-            (sequence, settle_failure(runtime, error, deferred))
-        }
-        Some(Ok((_, Err(StorageRoleFailure::Session(error)), _))) => {
+    let (sequence, result, deferred) = joined.map_err(|_| TraversalTerminalFailure::Internal)?;
+    let (item, descend) = match result {
+        Ok(entry) => settle_entry(runtime, entry, deferred),
+        Err(StorageRoleFailure::Entry(error)) => settle_failure(runtime, error, deferred),
+        Err(StorageRoleFailure::Session(error)) => {
             return Err(TraversalTerminalFailure::Session(error));
         }
-        Some(Err(_)) | None => return Err(TraversalTerminalFailure::Internal),
     };
-    state.pending.insert(settled.0, settled.1);
+    if deferred.is_some_and(|deferred| awaits_slot(runtime.request, deferred)) {
+        cursor.decide(sequence, descend);
+    }
+    state.pending.insert(sequence, item);
     Ok(())
 }
 
@@ -396,20 +380,15 @@ fn settle_failure(
     runtime: &Runtime<'_>,
     error: EntryOperationFailure,
     deferred: Option<Deferred>,
-) -> Settled {
+) -> (Option<TraversalItem>, Option<DirectoryWork>) {
     let descend = deferred
-        .filter(|deferred| {
-            deferred.kind == EntryKind::Directory && runtime.request.admits_depth(deferred.depth)
-        })
+        .filter(|deferred| awaits_slot(runtime.request, *deferred))
         .map(|deferred| DirectoryWork {
             path: error.path().clone(),
             child_depth: deferred.depth.saturating_add(1),
             filter_children: true,
         });
-    Settled {
-        item: Some(TraversalItem::EntryFailure(error)),
-        descend,
-    }
+    (Some(TraversalItem::EntryFailure(error)), descend)
 }
 
 /// Applies a deferred decision now that the observation (and therefore `modified`) is known.
@@ -417,12 +396,9 @@ fn settle_entry(
     runtime: &Runtime<'_>,
     entry: ObservedEntry,
     deferred: Option<Deferred>,
-) -> Settled {
+) -> (Option<TraversalItem>, Option<DirectoryWork>) {
     let Some(deferred) = deferred else {
-        return Settled {
-            item: Some(TraversalItem::Entry(Box::new(entry))),
-            descend: None,
-        };
+        return (Some(TraversalItem::Entry(Box::new(entry))), None);
     };
     let candidate = TraversalCandidate {
         path: relative_to(&runtime.request.root, entry.path()),
@@ -432,30 +408,22 @@ fn settle_entry(
         modified: entry.modified(),
     };
     let decision = runtime.policy.decide(true, &candidate);
-    let descend = (decision.descend
-        && entry.kind() == EntryKind::Directory
-        && runtime.request.admits_depth(deferred.depth))
-    .then(|| DirectoryWork {
-        path: entry.path().clone(),
-        child_depth: deferred.depth.saturating_add(1),
-        filter_children: decision.filter_children,
-    });
-    Settled {
-        item: decision.emit.then(|| TraversalItem::Entry(Box::new(entry))),
+    let descend =
+        (decision.descend && awaits_slot(runtime.request, deferred)).then(|| DirectoryWork {
+            path: entry.path().clone(),
+            child_depth: deferred.depth.saturating_add(1),
+            filter_children: decision.filter_children,
+        });
+    (
+        decision.emit.then(|| TraversalItem::Entry(Box::new(entry))),
         descend,
-    }
+    )
 }
 
-async fn flush(
-    runtime: &Runtime<'_>,
-    state: &mut State,
-    directories: &mut VecDeque<DirectoryWork>,
-) -> Result<(), TraversalTerminalFailure> {
+/// Emits every settled item that is next in sequence.
+async fn flush(runtime: &Runtime<'_>, state: &mut State) -> Result<(), TraversalTerminalFailure> {
     while let Some(settled) = state.pending.remove(&state.next_output) {
-        if let Some(work) = settled.descend {
-            directories.push_back(work);
-        }
-        if let Some(item) = settled.item {
+        if let Some(item) = settled {
             match &item {
                 TraversalItem::Entry(_) => state.observed += 1,
                 TraversalItem::EntryFailure(_) => state.failed += 1,
@@ -478,13 +446,9 @@ fn queue_failure(
     error: EntryOperationFailure,
 ) -> Result<(), TraversalTerminalFailure> {
     let sequence = state.allocate()?;
-    state.pending.insert(
-        sequence,
-        Settled {
-            item: Some(TraversalItem::EntryFailure(error)),
-            descend: None,
-        },
-    );
+    state
+        .pending
+        .insert(sequence, Some(TraversalItem::EntryFailure(error)));
     Ok(())
 }
 

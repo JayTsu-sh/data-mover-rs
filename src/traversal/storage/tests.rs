@@ -8,7 +8,7 @@ use crate::model::{
     MetadataObservations, MetadataProvenance, ObservationPlan, SourceIdentity, SymlinkTarget,
     SymlinkTargetEncoding, TimestampMetadata,
 };
-use crate::storage::MetadataMutation;
+use crate::storage::{MetadataMutation, NamespaceRequest};
 
 struct FakeNamespace;
 struct FakeMetadata;
@@ -995,4 +995,24 @@ async fn cancellation_lets_inflight_observations_finish_and_close_their_handles(
             opened()
         )
     });
+}
+
+/// Output is depth-first by blocks: one directory's children together, in listing order, then
+/// each descended subdirectory's block in turn.
+#[tokio::test]
+async fn output_is_depth_first_in_listing_order_blocks() {
+    let namespace = Arc::new(TreeNamespace::new());
+    let source = StorageTraversalSource::with_roles(
+        Arc::clone(&namespace) as Arc<dyn Namespace>,
+        Arc::new(CountingMetadata::new()),
+    );
+    let mut request = request(tokio_util::sync::CancellationToken::new());
+    request.observation_plan = ObservationPlan::default();
+    let (paths, _) = collect(source.traverse(request)).await;
+    assert_eq!(
+        paths,
+        [
+            "keep", "drop", "top", "keep/a", "keep/b", "keep/b/c", "drop/x", "drop/y", "drop/y/z"
+        ]
+    );
 }
