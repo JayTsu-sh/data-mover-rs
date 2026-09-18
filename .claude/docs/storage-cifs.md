@@ -275,6 +275,12 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 
 ## 升级 smb-rs 依赖
 
+> 2026-09-18 (三)：smb-rs **PR #78** (issue #77) 合入 main，顶端 `79d50c0`：连接被 drop (未
+> `close()`) 后恢复任务不再对已失效的 `Weak` 按退避重试三次并误报 `AttemptsExhausted`；
+> bootstrap 报 `Closed` 即结束恢复。真机验证过恢复本身可用：generation 退出后 reconnect、会话
+> 重认证、tree 恢复毫秒级完成，同一 `Share` 继续可用。变更面 `connection.rs`、
+> `runtime/recovery_driver.rs` → 协议层，第 4 步完整矩阵在 `79d50c0` 上跑过。
+>
 > 2026-09-18 (二)：smb-rs **PR #76** (issue #75，中途丢流 / 未建模 NTSTATUS 致命退出、恢复等待
 > 无界) 合入 main，顶端 `8b10f35`。变更面 `runtime/engine.rs`、`runtime/recovery_driver.rs`、
 > `resource/directory.rs`、`smb-msg/header.rs` → 协议层，第 4 步完整矩阵在 `8b10f35` 上跑过
