@@ -105,23 +105,45 @@ impl Cursor {
         Ok(())
     }
 
-    /// Starts the listing the cursor needs next, if it is not already running.
+    /// Starts the listing the cursor needs next, then prefetches the listings it will need
+    /// soonest, within the listing budget.
+    ///
+    /// The needed listing always starts, even over budget: prefetched listings further along
+    /// must never be able to starve the one the cursor is blocked on. Prefetch candidates are
+    /// the subdirectories already known to be descended into, in output order: the top frame's
+    /// slots first (the deepest, needed first), then each frame below it. A `Pending` slot
+    /// cannot be prefetched until its deferred decision settles.
     pub(super) fn start_listings(&mut self, runtime: &Runtime<'_>, listings: &mut ListingTask) {
-        let Some(frame) = self.stack.last() else {
-            return;
-        };
-        if frame.children.is_some() || self.listings.contains_key(&frame.work.path) {
-            return;
+        let Self {
+            stack,
+            listings: started,
+            ..
+        } = self;
+        if let Some(frame) = stack.last()
+            && frame.children.is_none()
+            && !started.contains_key(&frame.work.path)
+        {
+            spawn_listing(runtime, listings, started, frame.work.path.clone());
         }
-        let path = frame.work.path.clone();
-        self.listings.insert(path.clone(), None);
-        let namespace = Arc::clone(runtime.namespace);
-        listings.spawn(async move {
-            let result = namespace
-                .execute(NamespaceRequest::List(path.clone()))
-                .await;
-            (path, result)
-        });
+        let budget = listing_budget(runtime);
+        // Each call only needs to find up to `budget` listings to start, so the scan is capped
+        // rather than walking every slot of every frame on each wake-up: a directory with a
+        // huge fan-out would otherwise make every event cost that fan-out.
+        let slots = stack
+            .iter()
+            .rev()
+            .flat_map(|frame| frame.slots.iter())
+            .take(budget.saturating_mul(4));
+        for slot in slots {
+            if started.len() >= budget {
+                return;
+            }
+            if let Slot::Descend(work) = slot
+                && !started.contains_key(&work.path)
+            {
+                spawn_listing(runtime, listings, started, work.path.clone());
+            }
+        }
     }
 
     /// Admits as much as possible and reports what stopped it.
@@ -229,4 +251,34 @@ fn take_listing(
         }
         Err(StorageRoleFailure::Session(error)) => Err(TraversalTerminalFailure::Session(error)),
     }
+}
+
+/// Upper bound on listings started ahead of the cursor, whatever the request allows.
+const LISTING_PREFETCH_CAP: usize = 64;
+
+/// Listings allowed in flight or waiting to be consumed. Separate from the observation window:
+/// with the default plan observations never reach the backend, and when they do, a shared
+/// budget would let either side starve the other.
+fn listing_budget(runtime: &Runtime<'_>) -> usize {
+    runtime
+        .request
+        .max_inflight_operations
+        .get()
+        .min(LISTING_PREFETCH_CAP)
+}
+
+fn spawn_listing(
+    runtime: &Runtime<'_>,
+    listings: &mut ListingTask,
+    started: &mut HashMap<StoragePath, Option<ListingResult>>,
+    path: StoragePath,
+) {
+    started.insert(path.clone(), None);
+    let namespace = Arc::clone(runtime.namespace);
+    listings.spawn(async move {
+        let result = namespace
+            .execute(NamespaceRequest::List(path.clone()))
+            .await;
+        (path, result)
+    });
 }
