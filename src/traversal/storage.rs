@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinSet};
 
 use super::{
     TraversalCandidate, TraversalCompletion, TraversalDecision, TraversalFilter, TraversalItem,
@@ -96,8 +96,9 @@ type ObservationTask = JoinSet<(
 
 type ListingTask = JoinSet<(StoragePath, Result<NamespaceResult, StorageRoleFailure>)>;
 
-/// Output sequencing: every emitted item owns one sequence number, assigned in output order by
-/// the cursor; the reorder buffer releases them strictly in that order.
+/// Output sequencing: every admitted entry and every queued listing failure owns one sequence
+/// number, assigned in output order by the cursor; the reorder buffer releases them strictly in
+/// that order. An entry a deferred filter then drops keeps its number and settles as `None`.
 struct State {
     next_sequence: u64,
     next_output: u64,
@@ -349,7 +350,7 @@ type Joined = Result<
         Result<ObservedEntry, StorageRoleFailure>,
         Option<Deferred>,
     ),
-    tokio::task::JoinError,
+    JoinError,
 >;
 
 fn settle(

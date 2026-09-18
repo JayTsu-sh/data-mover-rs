@@ -158,16 +158,8 @@ impl Cursor {
                 return Ok(Step::Done);
             };
             if frame.children.is_none() {
-                let Some(result) = self
-                    .listings
-                    .get_mut(&frame.work.path)
-                    .and_then(Option::take)
-                else {
+                if !self.take_top_listing(state)? {
                     return Ok(Step::WaitListing);
-                };
-                self.listings.remove(&frame.work.path);
-                if !take_listing(frame, result, state)? {
-                    self.stack.pop();
                 }
                 continue;
             }
@@ -199,6 +191,26 @@ impl Cursor {
                 Next::Wait => return Ok(Step::WaitObservation),
             }
         }
+    }
+
+    /// Takes the top frame's finished listing as its block, popping the frame when the directory
+    /// could not be listed. Returns `false` while the listing is still outstanding.
+    fn take_top_listing(&mut self, state: &mut State) -> Result<bool, TraversalTerminalFailure> {
+        let Some(frame) = self.stack.last_mut() else {
+            return Ok(true);
+        };
+        let Some(result) = self
+            .listings
+            .get_mut(&frame.work.path)
+            .and_then(Option::take)
+        else {
+            return Ok(false);
+        };
+        self.listings.remove(&frame.work.path);
+        if !take_listing(frame, result, state)? {
+            self.stack.pop();
+        }
+        Ok(true)
     }
 
     /// Consumes the top frame's next slot once its whole block has been admitted.
