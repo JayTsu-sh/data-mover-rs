@@ -1228,13 +1228,19 @@ mod tests {
 
     #[tokio::test]
     async fn soft_iops_credit_bursts_only_up_to_the_governor_hard_limit() {
+        // The soft pacer's schedule starts when the manager is created, so measure from
+        // there: under CPU pressure the gap between creation and the first acquire is what
+        // used to make this assertion flake (the wait got *shorter*, not longer).
+        let cold_started = Instant::now();
         let qos = QosManager::try_new_with_iops_limits(20, 100, Duration::from_millis(100))
             .assert_value("create dual-rate IOPS qos");
 
         // Initial credit is zero, so the first operation is paced by soft IOPS.
-        let cold_started = Instant::now();
         qos.acquire_iops().await;
-        assert!(cold_started.elapsed() >= Duration::from_millis(45));
+        assert!(
+            cold_started.elapsed() >= Duration::from_millis(45),
+            "first operation at 20 soft IOPS must wait about 50 ms from creation"
+        );
 
         // Idle time fills at most eight operation credits. Those operations
         // must still traverse governor's 100 IOPS hard leaky bucket.
