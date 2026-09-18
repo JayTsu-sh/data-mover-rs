@@ -665,6 +665,30 @@ pub enum NamespaceResult {
     Completed,
     Entries(Vec<SourceDescriptor>),
     LinkTarget(SymlinkTarget),
+    /// A directory listing in which some children could not be described.
+    ///
+    /// The listing itself succeeded, so `entries` is every child that could be described and
+    /// `failures` holds one entry-scoped failure per child that could not (for example a name
+    /// that no `StoragePath` can spell). Failing the whole directory instead would drop valid
+    /// siblings; skipping silently would break completeness.
+    Listing {
+        entries: Vec<SourceDescriptor>,
+        failures: Vec<EntryOperationFailure>,
+    },
+}
+
+impl NamespaceResult {
+    /// Splits a `List` or `Stat` result into described children and per-child failures.
+    ///
+    /// Returns `None` for results that are not listings.
+    #[must_use]
+    pub fn into_listing(self) -> Option<(Vec<SourceDescriptor>, Vec<EntryOperationFailure>)> {
+        match self {
+            Self::Entries(entries) => Some((entries, Vec::new())),
+            Self::Listing { entries, failures } => Some((entries, failures)),
+            Self::Completed | Self::LinkTarget(_) => None,
+        }
+    }
 }
 
 /// Coherent namespace role with typed verb availability behind one interface.

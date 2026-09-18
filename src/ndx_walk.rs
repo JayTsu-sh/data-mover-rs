@@ -199,12 +199,20 @@ async fn read_dir(
     cancel: &CancellationToken,
 ) -> crate::Result<ReadResult<ObservedEntry>> {
     let target = join_root(root, dir_path)?;
-    let descriptors = match namespace.execute(NamespaceRequest::List(target)).await {
-        Ok(NamespaceResult::Entries(entries)) => entries,
-        Ok(_) => return Err(StorageError::MismatchedType),
+    let listed = namespace.execute(NamespaceRequest::List(target)).await;
+    let (descriptors, failures) = match listed.map(NamespaceResult::into_listing) {
+        Ok(Some(listing)) => listing,
+        Ok(None) => return Err(StorageError::MismatchedType),
         Err(failure) => return listing_failure(dir_path, &failure, cancel),
     };
-    Ok(build_read_result(root, dir_path, &descriptors, ctx))
+    let mut result = build_read_result(root, dir_path, &descriptors, ctx);
+    // A child the backend could not describe is reported without hiding its siblings.
+    result.errors.extend(
+        failures
+            .iter()
+            .map(|failure| format!("failed to describe an entry of '{dir_path}': {failure}")),
+    );
+    Ok(result)
 }
 
 /// Splits a listing failure into the driver's two channels, and ends the walk when the

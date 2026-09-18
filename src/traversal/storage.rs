@@ -233,26 +233,8 @@ async fn list_directory(
     tasks: &mut ObservationTask,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
-    let listed = runtime
-        .namespace
-        .execute(NamespaceRequest::List(directory.path.clone()))
-        .await;
-    let descriptors = match listed {
-        Ok(NamespaceResult::Entries(values)) => values,
-        Ok(_) => {
-            queue_failure(
-                state,
-                entry_failure(&directory.path, FailureClass::Protocol),
-            )?;
-            return flush(runtime, state, directories).await;
-        }
-        Err(StorageRoleFailure::Entry(error)) => {
-            queue_failure(state, error)?;
-            return flush(runtime, state, directories).await;
-        }
-        Err(StorageRoleFailure::Session(error)) => {
-            return Err(TraversalTerminalFailure::Session(error));
-        }
+    let Some(descriptors) = listed_children(runtime, &directory.path, state).await? else {
+        return flush(runtime, state, directories).await;
     };
     for descriptor in descriptors {
         while tasks.len() >= runtime.request.max_inflight_operations.get() {
@@ -265,6 +247,39 @@ async fn list_directory(
         admit(runtime, &directory, descriptor, directories, tasks, state)?;
     }
     flush(runtime, state, directories).await
+}
+
+/// Lists one directory, queueing every entry-scoped failure it reports.
+///
+/// Returns `None` when the directory itself could not be listed, and the children that could
+/// be described otherwise; a child the backend could not describe becomes its own failure item
+/// without hiding its siblings.
+async fn listed_children(
+    runtime: &Runtime<'_>,
+    directory: &StoragePath,
+    state: &mut State,
+) -> Result<Option<Vec<SourceDescriptor>>, TraversalTerminalFailure> {
+    let listed = runtime
+        .namespace
+        .execute(NamespaceRequest::List(directory.clone()))
+        .await;
+    match listed.map(NamespaceResult::into_listing) {
+        Ok(Some((entries, failures))) => {
+            for failure in failures {
+                queue_failure(state, failure)?;
+            }
+            Ok(Some(entries))
+        }
+        Ok(None) => {
+            queue_failure(state, entry_failure(directory, FailureClass::Protocol))?;
+            Ok(None)
+        }
+        Err(StorageRoleFailure::Entry(error)) => {
+            queue_failure(state, error)?;
+            Ok(None)
+        }
+        Err(StorageRoleFailure::Session(error)) => Err(TraversalTerminalFailure::Session(error)),
+    }
 }
 
 /// Applies the admission policy to one listed child and either spawns its observation,

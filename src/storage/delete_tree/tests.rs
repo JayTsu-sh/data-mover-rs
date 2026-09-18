@@ -15,6 +15,8 @@ struct MemoryTree {
     /// Paths that vanish before Delete (server answers `NotFound`).
     vanished: Vec<String>,
     list_failure: Option<String>,
+    /// Directory whose listing also reports one child the backend could not describe.
+    partial_listing: Option<String>,
     block_deletes: Option<CancellationToken>,
 }
 
@@ -31,6 +33,7 @@ impl MemoryTree {
             failing: BTreeMap::new(),
             vanished: Vec::new(),
             list_failure: None,
+            partial_listing: None,
             block_deletes: None,
         }
     }
@@ -99,6 +102,18 @@ impl Namespace for MemoryTree {
                     })
                     .map(|(path, kind)| Self::descriptor(path, *kind))
                     .collect();
+                if self.partial_listing.as_deref() == Some(directory.as_str()) {
+                    let unnamed = StoragePath::new("@undescribable")
+                        .unwrap_or_else(|error| panic!("{error}"));
+                    return Ok(NamespaceResult::Listing {
+                        entries,
+                        failures: vec![entry_failure(
+                            &unnamed,
+                            Operation::Traverse,
+                            FailureClass::Unsupported,
+                        )],
+                    });
+                }
                 Ok(NamespaceResult::Entries(entries))
             }
             NamespaceRequest::Delete(path) => {
@@ -363,5 +378,37 @@ async fn cancellation_awaits_inflight_deletes_and_reports_cancelled() {
     assert!(
         namespace.remaining().contains(&"top".to_owned()),
         "no directory deletion after cancel"
+    );
+}
+
+#[tokio::test]
+async fn an_undescribable_child_is_reported_and_keeps_its_directory() {
+    let mut namespace = tree();
+    namespace.partial_listing = Some("top/sub".to_owned());
+    let namespace = Arc::new(namespace);
+    let (items, outcome) = collect(delete_tree_with_namespace(
+        Arc::clone(&namespace) as Arc<dyn Namespace>,
+        request("top", true),
+    ))
+    .await;
+    assert!(matches!(outcome, Ok(DeleteTreeOutcome::Completed(_))));
+    assert!(items.iter().any(|item| matches!(
+        item,
+        DeleteTreeItem::EntryFailure(error)
+            if error.path().as_str() == "@undescribable" && error.class() == FailureClass::Unsupported
+    )));
+    // The described siblings and their subtree are still deleted ...
+    let remaining = namespace.remaining();
+    assert!(!remaining.contains(&"top/sub/b.bin".to_owned()));
+    assert!(!remaining.contains(&"top/sub/deep".to_owned()));
+    // ... but the directory holding the undescribable child is never attempted: it cannot be
+    // empty, so neither can any of its ancestors.
+    assert!(remaining.contains(&"top/sub".to_owned()));
+    assert!(remaining.contains(&"top".to_owned()));
+    assert!(
+        !namespace
+            .deletes()
+            .iter()
+            .any(|path| path == "top/sub" || path == "top")
     );
 }

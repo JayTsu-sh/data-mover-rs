@@ -770,3 +770,56 @@ async fn candidate_paths_are_relative_to_the_traversal_root() {
         assert_eq!(seen, ["a", "b", "b/c"], "needs_modified={needs_modified}");
     }
 }
+
+/// Lists `dir` with one describable child and one child the backend could not describe.
+struct PartialListingNamespace;
+
+#[async_trait]
+impl Namespace for PartialListingNamespace {
+    async fn execute(
+        &self,
+        request: NamespaceRequest,
+    ) -> Result<NamespaceResult, StorageRoleFailure> {
+        match request {
+            NamespaceRequest::List(root) if root == StoragePath::root() => Ok(
+                NamespaceResult::Entries(vec![descriptor("dir", EntryKind::Directory)]),
+            ),
+            NamespaceRequest::List(root) if root == path("dir") => Ok(NamespaceResult::Listing {
+                entries: vec![descriptor("dir/ok", EntryKind::File)],
+                failures: vec![entry_failure(&path("dir/bad"), FailureClass::Unsupported)],
+            }),
+            _ => Err(StorageRoleFailure::Entry(entry_failure(
+                &StoragePath::root(),
+                FailureClass::NotFound,
+            ))),
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_undescribable_child_is_a_failure_item_without_hiding_its_siblings() {
+    let source = StorageTraversalSource::with_roles(
+        Arc::new(PartialListingNamespace),
+        Arc::new(FakeMetadata),
+    );
+    let mut request = request(tokio_util::sync::CancellationToken::new());
+    request.observation_plan = ObservationPlan::default();
+    let mut session = source.traverse(request);
+    let mut entries = Vec::new();
+    let mut failures = Vec::new();
+    while let Some(item) = session.next_item().await {
+        match item {
+            TraversalItem::Entry(entry) => entries.push(entry.path().as_str().to_owned()),
+            TraversalItem::EntryFailure(error) => failures.push(error.path().as_str().to_owned()),
+        }
+    }
+    assert_eq!(entries, ["dir", "dir/ok"]);
+    assert_eq!(failures, ["dir/bad"]);
+    assert!(matches!(
+        session.finish().await,
+        Ok(TraversalOutcome::Completed(TraversalCompletion {
+            observed_entries: 2,
+            entry_failures: 1
+        }))
+    ));
+}

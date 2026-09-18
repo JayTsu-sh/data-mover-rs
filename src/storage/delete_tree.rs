@@ -24,8 +24,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    CapabilityUnavailable, Namespace, NamespaceRequest, NamespaceResult, PreflightPolicy, Storage,
-    StorageRoleFailure,
+    CapabilityUnavailable, Namespace, NamespaceRequest, NamespaceResult, PreflightPolicy,
+    SourceDescriptor, Storage, StorageRoleFailure,
 };
 use crate::model::{
     BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
@@ -231,28 +231,8 @@ impl Driver {
             if self.request.cancel.is_cancelled() || self.cancelled {
                 return Ok(());
             }
-            let entries = match self
-                .namespace
-                .execute(NamespaceRequest::List(directory.clone()))
-                .await
-            {
-                Ok(NamespaceResult::Entries(entries)) => entries,
-                Ok(_) => {
-                    self.report_failure(entry_failure(
-                        &directory,
-                        Operation::Traverse,
-                        FailureClass::Protocol,
-                    ))
-                    .await?;
-                    continue;
-                }
-                Err(StorageRoleFailure::Entry(error)) => {
-                    self.report_failure(error).await?;
-                    continue;
-                }
-                Err(StorageRoleFailure::Session(error)) => {
-                    return Err(DeleteTreeTerminalFailure::Session(error));
-                }
+            let Some(entries) = self.list_directory(&directory).await? else {
+                continue;
             };
             for entry in entries {
                 if entry.kind == EntryKind::Directory {
@@ -267,6 +247,44 @@ impl Driver {
             }
         }
         Ok(())
+    }
+
+    /// Lists one directory, reporting every entry-scoped failure.
+    ///
+    /// Returns `None` when the directory itself could not be listed. A child the backend could
+    /// not describe is reported and marks the directory incomplete, so it is never attempted:
+    /// it cannot be empty.
+    async fn list_directory(
+        &mut self,
+        directory: &StoragePath,
+    ) -> Result<Option<Vec<SourceDescriptor>>, DeleteTreeTerminalFailure> {
+        let listed = self
+            .namespace
+            .execute(NamespaceRequest::List(directory.clone()))
+            .await;
+        match listed.map(NamespaceResult::into_listing) {
+            Ok(Some((entries, failures))) => {
+                if !failures.is_empty() {
+                    self.mark_incomplete(directory);
+                }
+                for failure in failures {
+                    self.report_failure(failure).await?;
+                }
+                Ok(Some(entries))
+            }
+            Ok(None) => {
+                let failure = entry_failure(directory, Operation::Traverse, FailureClass::Protocol);
+                self.report_failure(failure).await?;
+                Ok(None)
+            }
+            Err(StorageRoleFailure::Entry(error)) => {
+                self.report_failure(error).await?;
+                Ok(None)
+            }
+            Err(StorageRoleFailure::Session(error)) => {
+                Err(DeleteTreeTerminalFailure::Session(error))
+            }
+        }
     }
 
     async fn spawn_delete(

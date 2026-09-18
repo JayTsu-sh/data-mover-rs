@@ -37,6 +37,8 @@ enum Listing {
     SessionFailure,
     /// The backend reports the operation was cancelled.
     Cancelled,
+    /// Children as `(name, kind)` plus one child the backend could not describe.
+    Partial(Vec<(&'static str, EntryKind)>),
 }
 
 struct TreeNamespace {
@@ -172,6 +174,20 @@ impl Namespace for TreeNamespace {
             Some(Listing::EntryFailure) => Err(entry_failure(&target)),
             Some(Listing::SessionFailure) => Err(session_failure()),
             Some(Listing::Cancelled) => Err(entry_failure_with(&target, FailureClass::Cancelled)),
+            Some(Listing::Partial(entries)) => {
+                let Ok(NamespaceResult::Entries(described)) = children(&key, entries, true) else {
+                    return Err(entry_failure(&target));
+                };
+                let StorageRoleFailure::Entry(failure) =
+                    entry_failure_with(&target, FailureClass::Unsupported)
+                else {
+                    unreachable!("entry_failure_with builds an entry failure")
+                };
+                Ok(NamespaceResult::Listing {
+                    entries: described,
+                    failures: vec![failure],
+                })
+            }
             None => Ok(NamespaceResult::Entries(Vec::new())),
         }
     }
@@ -765,6 +781,24 @@ async fn a_storage_without_a_namespace_role_is_refused_before_any_listing() -> R
     assert!(
         ndx_walk(&storage, request(StoragePath::root())?).is_err(),
         "Local and S3 lend no namespace role, so the walk is refused up front"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_undescribable_child_is_reported_while_its_siblings_are_still_paged() -> Result {
+    let namespace = TreeNamespace::new(vec![(
+        "",
+        Listing::Partial(vec![("ok.txt", EntryKind::File)]),
+    )]);
+    let storage = storage(Arc::clone(&namespace))?;
+    let (pages, errors) = drain(&ndx_walk(&storage, request(StoragePath::root())?)?).await;
+    assert_eq!(pages.len(), 1);
+    assert_eq!(page_names(&pages[0]), ["ok.txt"]);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("failed to describe an entry"),
+        "{errors:?}"
     );
     Ok(())
 }
