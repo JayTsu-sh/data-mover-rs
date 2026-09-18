@@ -1,6 +1,6 @@
 .PHONY: help build test clippy clippy-strict fmt fmt-fix check ci doc clean examples \
         e2e-local e2e-cifs e2e-nfs e2e-s3 e2e-network e2e-all \
-        coverage audit-large audit-dispatch verify
+        coverage audit-large audit-dispatch arch-guard arch-guard-selftest verify
 
 help:
 	@echo "data-mover-rs Makefile (Claude harness 稳定命令面)"
@@ -27,10 +27,12 @@ help:
 	@echo "  e2e-all        跑全部 e2e (含 local)"
 	@echo "  audit-large    审大文件 (列 >800 行的 src/*.rs)"
 	@echo "  audit-dispatch 审 StorageEnum 分派完整性"
+	@echo "  arch-guard     模块依赖方向守卫 (~4s，GitHub CI 同款)"
+	@echo "  arch-guard-selftest 守卫脚本自身单测 (~90s，改守卫时必跑)"
 	@echo ""
 	@echo "组合："
-	@echo "  ci             fmt + clippy + test + examples + e2e-local"
-	@echo "  verify         ci + audit-large + audit-dispatch (commit 前自检)"
+	@echo "  ci             fmt + arch-guard + clippy + test + examples + e2e-local"
+	@echo "  verify         ci + audit-large + audit-dispatch + arch-guard-selftest (commit 前自检)"
 
 build:
 	cargo build --all-targets
@@ -84,9 +86,16 @@ audit-large:
 audit-dispatch:
 	python3 .claude/skills/quality-dispatch-coverage/scripts/run.py
 
-ci: fmt clippy test examples e2e-local
+arch-guard:
+	python3 tests/validate_architecture_dependencies.py .
 
-verify: ci audit-large audit-dispatch
+# 每个用例复制整棵 src/ 重跑守卫，约 90s；只验证守卫逻辑，不验证代码，故不进 ci。
+arch-guard-selftest:
+	python3 -m unittest tests/test_architecture_dependencies.py
+
+ci: fmt arch-guard clippy test examples e2e-local
+
+verify: ci audit-large audit-dispatch arch-guard-selftest
 
 clean:
 	cargo clean
