@@ -338,3 +338,23 @@ async fn deferred_decisions_are_prefetched_once_they_settle() {
         "deferred {deferred_time:?} vs immediate {immediate_time:?}"
     );
 }
+
+/// Many directories with a few subdirectories each: the subdirectories of a directory that was
+/// prefetched but not yet reached must be prefetched too, or the second level lists one at a
+/// time as the cursor walks across.
+#[tokio::test(start_paused = true)]
+async fn subdirectories_of_prefetched_directories_are_prefetched_too() {
+    let nested_tree = fan_tree(64, 1);
+    let (nested, peak, nested_time) = timed(&nested_tree, latency_request(8)).await;
+    // The same 129 listings, all at one level.
+    let (_, _, flat_time) = timed(&fan_tree(128, 0), latency_request(8)).await;
+    // Depth-first blocks: the root block, then each `d` block (its one child) in turn.
+    let mut blocks: Vec<String> = (0..64).map(|index| format!("d{index:02}")).collect();
+    blocks.extend((0..64).map(|index| format!("d{index:02}/s00")));
+    assert_eq!(nested, blocks);
+    assert!(peak >= 4, "peak {peak}");
+    assert!(
+        nested_time.as_millis() * 10 <= flat_time.as_millis() * 15,
+        "nested {nested_time:?} vs flat {flat_time:?}"
+    );
+}

@@ -9,17 +9,23 @@
 //! and observations may finish in any order; timing decides only *when* the cursor can take the
 //! next step, never which sequence a result receives, and the reorder buffer releases results
 //! strictly by sequence. That is what makes the output deterministic for a given tree.
+//!
+//! Listings are prefetched ahead of the cursor in the same depth-first order. A listing is
+//! *prepared* when it arrives: each child's admission decision is made then (unless it waits for
+//! a deferred observation), so the subdirectories of a prefetched directory are known, and can
+//! be prefetched in turn, before the cursor reaches it.
 
 use std::collections::{HashMap, VecDeque};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use super::{
-    DirectoryWork, ListingTask, ObservationTask, Runtime, State, admit, entry_failure,
-    queue_failure,
+    DirectoryWork, ListingTask, ObservationTask, Runtime, State, admit, descend_work,
+    entry_failure, immediate_decision, queue_failure,
 };
-use crate::model::{FailureClass, StoragePath};
+use crate::model::{EntryOperationFailure, FailureClass, StoragePath};
 use crate::storage::{NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure};
-use crate::traversal::TraversalTerminalFailure;
+use crate::traversal::{TraversalDecision, TraversalTerminalFailure};
 
 /// Why the cursor stopped advancing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,11 +47,32 @@ pub(super) enum Slot {
     Pending(u64),
 }
 
+/// One listed child with the decision made when its listing arrived; `None` waits for a
+/// deferred observation.
+pub(super) struct Child {
+    pub(super) descriptor: SourceDescriptor,
+    pub(super) decision: Option<TraversalDecision>,
+}
+
+/// A listing turned into a block, ready for the cursor.
+struct Prepared {
+    failures: Vec<EntryOperationFailure>,
+    children: VecDeque<Child>,
+    /// Subdirectories this block already knows it will descend into, in listing order.
+    descend: Vec<DirectoryWork>,
+}
+
+/// A started listing: the directory, and its prepared result once it has arrived.
+struct Listing {
+    work: DirectoryWork,
+    arrived: Option<Result<Prepared, EntryOperationFailure>>,
+}
+
 /// One directory on the cursor's path from the root.
 struct Frame {
     work: DirectoryWork,
     /// Children still to admit, in listing order; `None` until the listing is taken.
-    children: Option<VecDeque<SourceDescriptor>>,
+    children: Option<VecDeque<Child>>,
     /// Subdirectories to descend into once the block is admitted.
     slots: VecDeque<Slot>,
 }
@@ -60,14 +87,12 @@ impl Frame {
     }
 }
 
-type ListingResult = Result<NamespaceResult, StorageRoleFailure>;
-
 pub(super) struct Cursor {
     stack: Vec<Frame>,
     /// Deferred descend decisions, filled as their observations settle.
     decisions: HashMap<u64, Option<DirectoryWork>>,
-    /// Listings started for frames the cursor has not taken yet: `None` while in flight.
-    listings: HashMap<StoragePath, Option<ListingResult>>,
+    /// Listings started for frames the cursor has not taken yet.
+    listings: HashMap<StoragePath, Listing>,
 }
 
 /// What to do with the top frame once its block is admitted.
@@ -92,73 +117,78 @@ impl Cursor {
         self.decisions.insert(sequence, descend);
     }
 
-    /// Stores a finished listing. A lost session ends the traversal at once.
+    /// Prepares a finished listing. A lost session ends the traversal at once.
     pub(super) fn listed(
         &mut self,
-        path: StoragePath,
-        result: ListingResult,
+        runtime: &Runtime<'_>,
+        path: &StoragePath,
+        result: Result<NamespaceResult, StorageRoleFailure>,
     ) -> Result<(), TraversalTerminalFailure> {
-        if let Err(StorageRoleFailure::Session(error)) = result {
-            return Err(TraversalTerminalFailure::Session(error));
-        }
-        self.listings.insert(path, Some(result));
+        let Some(listing) = self.listings.get_mut(path) else {
+            return Err(TraversalTerminalFailure::Internal);
+        };
+        listing.arrived = Some(prepare(runtime, &listing.work, result)?);
         Ok(())
     }
 
     /// Starts the listing the cursor needs next, then prefetches the listings it will need
-    /// soonest.
+    /// soonest, in output order.
     ///
     /// The needed listing always starts, even over budget: prefetched listings further along
-    /// must never be able to starve the one the cursor is blocked on. Prefetch candidates are
-    /// the subdirectories already known to be descended into, in output order: the top frame's
-    /// slots first (the deepest, needed first), then each frame below it. A `Pending` slot is a
-    /// candidate once its deferred decision has settled on descending.
+    /// must never be able to starve the one the cursor is blocked on. Candidates are visited
+    /// depth-first from the top frame's slots (the deepest, needed first) down the stack; a
+    /// candidate whose listing already arrived is expanded into its own subdirectories.
     ///
-    /// Two separate limits apply. At most `budget` listings are in flight; and at most
-    /// `2 × budget` finished listings may wait for the cursor. Counting finished ones against
-    /// the in-flight budget would let early-prefetched shallow siblings, which the cursor only
-    /// reaches after the whole subtree in front of them, keep the deeper listings it needs
-    /// first from starting.
+    /// Two separate limits apply. At most `budget` listings are in flight, and at most
+    /// `2 × budget` finished listings may wait for the cursor. Counting finished ones against the
+    /// in-flight budget would let early-prefetched shallow siblings keep the deeper listings the
+    /// cursor needs first from starting.
     pub(super) fn start_listings(&mut self, runtime: &Runtime<'_>, listings: &mut ListingTask) {
-        let Self {
-            stack,
-            decisions,
-            listings: started,
-        } = self;
-        if let Some(frame) = stack.last()
+        if let Some(frame) = self.stack.last()
             && frame.children.is_none()
-            && !started.contains_key(&frame.work.path)
+            && !self.listings.contains_key(&frame.work.path)
         {
-            spawn_listing(runtime, listings, started, frame.work.path.clone());
+            let work = frame.work.clone();
+            spawn_listing(runtime, listings, &mut self.listings, work);
         }
         let budget = listing_budget(runtime);
-        // Each call only needs a few candidates, so the scan is capped rather than walking every
-        // slot of every frame on each wake-up; a huge fan-out would otherwise cost that fan-out
-        // per event. Undecided `Pending` slots are skipped without counting: there are at most
-        // as many as observations in flight.
-        let mut scanned = 0_usize;
-        for slot in stack.iter().rev().flat_map(|frame| frame.slots.iter()) {
-            let finished = started.len().saturating_sub(listings.len());
-            if listings.len() >= budget || finished >= budget.saturating_mul(2) {
-                return;
-            }
+        let finished = self.listings.len().saturating_sub(listings.len());
+        let room = budget
+            .saturating_sub(listings.len())
+            .min(budget.saturating_mul(2).saturating_sub(finished));
+        for work in self.prefetch_candidates(room, budget.saturating_mul(4)) {
+            spawn_listing(runtime, listings, &mut self.listings, work);
+        }
+    }
+
+    /// Up to `room` directories to prefetch, in output order, examining at most `scan_cap`
+    /// candidates so a huge fan-out does not make every wake-up cost that fan-out. Undecided
+    /// `Pending` slots are skipped without counting: there are at most as many as observations
+    /// in flight.
+    fn prefetch_candidates(&self, room: usize, scan_cap: usize) -> Vec<DirectoryWork> {
+        let mut search = Search {
+            listings: &self.listings,
+            chosen: Vec::new(),
+            room,
+            scanned: 0,
+            scan_cap,
+        };
+        if room == 0 {
+            return search.chosen;
+        }
+        for slot in self.stack.iter().rev().flat_map(|frame| frame.slots.iter()) {
             let candidate = match slot {
                 Slot::Descend(work) => Some(work),
-                Slot::Pending(sequence) => match decisions.get(sequence) {
+                Slot::Pending(sequence) => match self.decisions.get(sequence) {
                     Some(decision) => decision.as_ref(),
                     None => continue,
                 },
             };
-            scanned += 1;
-            if scanned > budget.saturating_mul(4) {
-                return;
-            }
-            if let Some(work) = candidate
-                && !started.contains_key(&work.path)
-            {
-                spawn_listing(runtime, listings, started, work.path.clone());
+            if search.visit(candidate).is_break() {
+                break;
             }
         }
+        search.chosen
     }
 
     /// Admits as much as possible and reports what stopped it.
@@ -184,17 +214,10 @@ impl Cursor {
                 if state.admitted() >= runtime.request.max_inflight_operations.get() {
                     return Ok(Step::WindowFull);
                 }
-                let Some(descriptor) = children.pop_front() else {
+                let Some(child) = children.pop_front() else {
                     continue;
                 };
-                admit(
-                    runtime,
-                    &frame.work,
-                    descriptor,
-                    &mut frame.slots,
-                    tasks,
-                    state,
-                )?;
+                admit(runtime, &frame.work, child, &mut frame.slots, tasks, state)?;
                 continue;
             }
             match self.next_after_block() {
@@ -208,22 +231,31 @@ impl Cursor {
         }
     }
 
-    /// Takes the top frame's finished listing as its block, popping the frame when the directory
+    /// Takes the top frame's arrived listing as its block, popping the frame when the directory
     /// could not be listed. Returns `false` while the listing is still outstanding.
     fn take_top_listing(&mut self, state: &mut State) -> Result<bool, TraversalTerminalFailure> {
         let Some(frame) = self.stack.last_mut() else {
             return Ok(true);
         };
-        let Some(result) = self
+        let Some(arrived) = self
             .listings
             .get_mut(&frame.work.path)
-            .and_then(Option::take)
+            .and_then(|listing| listing.arrived.take())
         else {
             return Ok(false);
         };
         self.listings.remove(&frame.work.path);
-        if !take_listing(frame, result, state)? {
-            self.stack.pop();
+        match arrived {
+            Ok(prepared) => {
+                for failure in prepared.failures {
+                    queue_failure(state, failure)?;
+                }
+                frame.children = Some(prepared.children);
+            }
+            Err(failure) => {
+                queue_failure(state, failure)?;
+                self.stack.pop();
+            }
         }
         Ok(true)
     }
@@ -250,42 +282,91 @@ impl Cursor {
     }
 }
 
-/// Turns a finished listing into the frame's block. Returns `false` when the directory could not
-/// be listed, after queueing its failure in the block's place.
-fn take_listing(
-    frame: &mut Frame,
-    result: ListingResult,
-    state: &mut State,
-) -> Result<bool, TraversalTerminalFailure> {
-    match result.map(NamespaceResult::into_listing) {
-        Ok(Some((entries, failures))) => {
-            for failure in failures {
-                queue_failure(state, failure)?;
+/// Depth-first search over the directories the traversal will list next.
+struct Search<'a> {
+    listings: &'a HashMap<StoragePath, Listing>,
+    chosen: Vec<DirectoryWork>,
+    room: usize,
+    scanned: usize,
+    scan_cap: usize,
+}
+
+impl Search<'_> {
+    /// Chooses `candidate` if its listing has not started, or expands it into its own known
+    /// subdirectories if its listing already arrived. `None` is a decided skip, which still
+    /// counts towards the scan cap.
+    fn visit(&mut self, candidate: Option<&DirectoryWork>) -> ControlFlow<()> {
+        self.scanned += 1;
+        if self.scanned > self.scan_cap {
+            return ControlFlow::Break(());
+        }
+        let Some(work) = candidate else {
+            return ControlFlow::Continue(());
+        };
+        match self.listings.get(&work.path) {
+            None if !self.chosen.iter().any(|chosen| chosen.path == work.path) => {
+                self.chosen.push(work.clone());
+                if self.chosen.len() >= self.room {
+                    return ControlFlow::Break(());
+                }
             }
-            frame.children = Some(entries.into());
-            Ok(true)
+            Some(Listing {
+                arrived: Some(Ok(prepared)),
+                ..
+            }) => {
+                for child in &prepared.descend {
+                    self.visit(Some(child))?;
+                }
+            }
+            _ => {}
         }
-        Ok(None) => {
-            queue_failure(
-                state,
-                entry_failure(&frame.work.path, FailureClass::Protocol),
-            )?;
-            Ok(false)
-        }
-        Err(StorageRoleFailure::Entry(error)) => {
-            queue_failure(state, error)?;
-            Ok(false)
-        }
-        Err(StorageRoleFailure::Session(error)) => Err(TraversalTerminalFailure::Session(error)),
+        ControlFlow::Continue(())
     }
+}
+
+/// Turns a finished listing into a block: listing-level failures stay failures, and every child
+/// gets its admission decision now.
+fn prepare(
+    runtime: &Runtime<'_>,
+    work: &DirectoryWork,
+    result: Result<NamespaceResult, StorageRoleFailure>,
+) -> Result<Result<Prepared, EntryOperationFailure>, TraversalTerminalFailure> {
+    let (entries, failures) = match result.map(NamespaceResult::into_listing) {
+        Ok(Some(listing)) => listing,
+        Ok(None) => return Ok(Err(entry_failure(&work.path, FailureClass::Protocol))),
+        Err(StorageRoleFailure::Entry(error)) => return Ok(Err(error)),
+        Err(StorageRoleFailure::Session(error)) => {
+            return Err(TraversalTerminalFailure::Session(error));
+        }
+    };
+    let mut children = VecDeque::with_capacity(entries.len());
+    let mut descend = Vec::new();
+    for descriptor in entries {
+        let decision = immediate_decision(runtime, work, &descriptor);
+        if let Some(decision) = decision
+            && let Some(below) =
+                descend_work(runtime.request, &descriptor, work.child_depth, decision)
+        {
+            descend.push(below);
+        }
+        children.push_back(Child {
+            descriptor,
+            decision,
+        });
+    }
+    Ok(Ok(Prepared {
+        failures,
+        children,
+        descend,
+    }))
 }
 
 /// Upper bound on listings started ahead of the cursor, whatever the request allows.
 const LISTING_PREFETCH_CAP: usize = 64;
 
-/// Listings allowed in flight or waiting to be consumed. Separate from the observation window:
-/// with the default plan observations never reach the backend, and when they do, a shared
-/// budget would let either side starve the other.
+/// Listings allowed in flight. Separate from the observation window: with the default plan
+/// observations never reach the backend, and when they do, a shared budget would let either
+/// side starve the other.
 fn listing_budget(runtime: &Runtime<'_>) -> usize {
     runtime
         .request
@@ -297,10 +378,17 @@ fn listing_budget(runtime: &Runtime<'_>) -> usize {
 fn spawn_listing(
     runtime: &Runtime<'_>,
     listings: &mut ListingTask,
-    started: &mut HashMap<StoragePath, Option<ListingResult>>,
-    path: StoragePath,
+    started: &mut HashMap<StoragePath, Listing>,
+    work: DirectoryWork,
 ) {
-    started.insert(path.clone(), None);
+    let path = work.path.clone();
+    started.insert(
+        path.clone(),
+        Listing {
+            work,
+            arrived: None,
+        },
+    );
     let namespace = Arc::clone(runtime.namespace);
     listings.spawn(async move {
         let result = namespace

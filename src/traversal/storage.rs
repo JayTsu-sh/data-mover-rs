@@ -263,7 +263,7 @@ async fn wait(
         () = runtime.request.cancel.cancelled() => Ok(()),
         Some(joined) = listings.join_next(), if !listings.is_empty() => {
             let (path, result) = joined.map_err(|_| TraversalTerminalFailure::Internal)?;
-            cursor.listed(path, result)
+            cursor.listed(runtime, &path, result)
         }
         Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
             settle(runtime, cursor, state, joined)
@@ -273,29 +273,47 @@ async fn wait(
     }
 }
 
-/// Applies the admission policy to one listed child: spawns its observation, records where to
-/// descend next, or drops it.
+/// The admission decision for one listed child, when it can be made from the listing alone.
+///
+/// `None` means the filter needs `modified` and still applies below `parent`, so the decision
+/// waits for the child's observation. Made once per child, when the listing arrives, so that a
+/// prefetched directory's subdirectories are known before the cursor reaches it.
+fn immediate_decision(
+    runtime: &Runtime<'_>,
+    parent: &DirectoryWork,
+    descriptor: &SourceDescriptor,
+) -> Option<TraversalDecision> {
+    if runtime.policy.deferred && parent.filter_children {
+        return None;
+    }
+    let candidate = TraversalCandidate {
+        path: relative_to(&runtime.request.root, &descriptor.path),
+        name: entry_name(&descriptor.path),
+        kind: descriptor.kind,
+        size: descriptor.size,
+        modified: descriptor
+            .inline_timestamps
+            .and_then(|value| value.modified),
+    };
+    Some(runtime.policy.decide(parent.filter_children, &candidate))
+}
+
+/// Admits one listed child: spawns its observation and records where to descend next, or drops
+/// it. `decision` is the child's [`immediate_decision`].
 fn admit(
     runtime: &Runtime<'_>,
     parent: &DirectoryWork,
-    descriptor: SourceDescriptor,
+    child: cursor::Child,
     cursor_slots: &mut VecDeque<cursor::Slot>,
     tasks: &mut ObservationTask,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
+    let cursor::Child {
+        descriptor,
+        decision,
+    } = child;
     let depth = parent.child_depth;
-    let deferred = runtime.policy.deferred && parent.filter_children;
-    if !deferred {
-        let candidate = TraversalCandidate {
-            path: relative_to(&runtime.request.root, &descriptor.path),
-            name: entry_name(&descriptor.path),
-            kind: descriptor.kind,
-            size: descriptor.size,
-            modified: descriptor
-                .inline_timestamps
-                .and_then(|value| value.modified),
-        };
-        let decision = runtime.policy.decide(parent.filter_children, &candidate);
+    if let Some(decision) = decision {
         if let Some(work) = descend_work(runtime.request, &descriptor, depth, decision) {
             cursor_slots.push_back(cursor::Slot::Descend(work));
         }
@@ -304,7 +322,7 @@ fn admit(
         }
     }
     let sequence = state.allocate()?;
-    let context = deferred.then_some(Deferred {
+    let context = decision.is_none().then_some(Deferred {
         depth,
         kind: descriptor.kind,
     });
