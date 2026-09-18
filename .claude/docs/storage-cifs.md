@@ -273,9 +273,14 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 
 ## 升级 smb-rs 依赖
 
-> 2026-09-18：file id / CREATE 快照经 smb-rs **PR #74** 以 merge commit 合入 main，
-> 顶端 `10de18c` (树与分支 head `7585e30` 相同)。`Cargo.toml` 钉 `10de18c`；第 3、4 步在
-> `7585e30` 上跑过 (namespace ×3、policy ×3、probe ×1)，重钉后又在 `10de18c` 上各跑一次。
+> 2026-09-18 (二)：smb-rs **PR #76** (issue #75，中途丢流 / 未建模 NTSTATUS 致命退出、恢复等待
+> 无界) 合入 main，顶端 `8b10f35`。变更面 `runtime/engine.rs`、`runtime/recovery_driver.rs`、
+> `resource/directory.rs`、`smb-msg/header.rs` → 协议层，第 4 步完整矩阵在 `8b10f35` 上跑过
+> (namespace ×2、policy ×2、匿名 share ×1、probe ×1、8 轮 seed→ndx-walk→delete-tree)。
+>
+> 2026-09-18 (一)：file id / CREATE 快照经 smb-rs **PR #74** 以 merge commit 合入 main，
+> 顶端 `10de18c` (树与分支 head `7585e30` 相同)。第 3、4 步在 `7585e30` 上跑过
+> (namespace ×3、policy ×3、probe ×1)，重钉后又在 `10de18c` 上各跑一次。
 
 `smb-domain` 固定的是 JayTsu-sh/smb-rs **main 上的一个提交**，不是 branch。升级 = 改一处 rev，
 但验证必须完整，因为 smb-rs 的协议内部 (credits、签名、recovery) 出问题只会在真实服务器和
@@ -316,7 +321,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 | 长 session 句柄耗尽 | 检查所有 close 路径走 `close_resource` |
 | 符号链接 | facade 不暴露 reparse point；`ReadLink` 返回 typed `Unsupported` (实测见"真实环境证据") |
 | 目录 rename 目标已存在 | NTFS 语义下不能替换非空目录，服务器返回 COLLISION/ACCESS_DENIED → `Conflict`/`PermissionDenied` |
-| **中途丢弃 `entries()` 流** (取到首项就 return) | facade 的 fetch_loop 在消费端取空缓冲的瞬间就发下一条 QUERY_DIRECTORY；随后 drop 流 → wire CANCEL → 迟到响应撞上 runtime 的 `operation-response-contract` → generation 以 Transport 原因退出 → 连接进入恢复期，**下一个操作**报 `Invalid state: only the Connection dependency may wait in this recovery stage` (`Protocol`/Unknown)。FAS2750 上 16 次连接复现 3 次，且总是紧随连接后的第一个 List。应对：任何 `entries()` 都 `try_collect` / 读到 `None` 再 close (`list`、`probe_candidates` 都这样做)；改为读到流尾后 46 次连接 0 次报错。**同一根因还有第二种表现**：依赖是 Connection 的操作在恢复期不报错而是等待 (`create_object` 传的 deadline 是 `None`)，46 次连接里有 1 次整个进程挂满 300 s 被外部 timeout 杀掉、无任何输出，同一时刻新开的连接 2 s 内正常。smb-rs 侧已提 [issue #75](https://github.com/JayTsu-sh/smb-rs/issues/75)：被取消操作的迟到响应不该致命；`recover()` 的 `MismatchedGeneration` / `PublishGeneration` 分支返回前没有 `fail_waiters`，等待者会永远挂住 |
+| **中途丢弃 `entries()` 流** (取到首项就 return) | 曾让紧随其后的第一个操作报 `Invalid state: only the Connection dependency may wait in this recovery stage`，或整个进程挂住。真机复现 + generation 退出事件定位到根因是 **`Wire("invalid-status")`**：消费端取空缓冲的瞬间 fetch_loop 就发下一条 QUERY_DIRECTORY，drop 流触发 CANCEL，服务器在 CLOSE 之后用 `STATUS_FILE_CLOSED` (0xC0000128) 回它，这个状态不在 smb-msg `Status` 枚举里，`Header::status()` 失败被 engine 判为致命 → generation 退出 → 恢复期。**已修 (smb-rs #76，钉 `8b10f35`)**：未建模 NTSTATUS 不再致命，draining 操作的迟到响应不受状态合约约束；流 Drop 先 cancel 再唤醒、fetch_loop 醒来先查 token；恢复等待无 deadline 时用 `total_timeout` 兜底，`recover()` 所有失败分支都释放等待者；generation 退出 / 恢复起止有 tracing 事件。data-mover 的 `list` / `probe_candidates` 仍读到流尾再 close —— 少一次无人接收的往返，不依赖上游行为 |
 
 ## 测试
 
