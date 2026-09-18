@@ -631,16 +631,17 @@ impl SmbDomainProtocol {
 
 /// Decides once per session whether file ids can be identity.
 ///
-/// Lists the root once and opens the first of its entries that will open. A session uses file
-/// ids only when the wide directory class **and** the `QFid` create context both answered,
-/// because identity must be the same whichever verb observed an entry; a server offering only
-/// one would make `List` and `Stat` disagree on every entry.
+/// Lists the root once and opens it once (its `.` record answers for the listing path, so an
+/// empty root is judged like any other). A session uses file ids only when the wide directory
+/// class **and** the `QFid` create context both answered, because identity must be the same
+/// whichever verb observed an entry; a server offering only one would make `List` and `Stat`
+/// disagree on every entry.
 ///
 /// This is a capability check, so it never fails the connect: any error (a root that is
-/// write-only or does not exist yet, no candidate entry the caller may open) and an empty root
-/// both switch file ids **off** on both paths, each with a warning. Off is the conservative answer
-/// for an empty root — an empty source has no renames to detect, and defaulting to on would
-/// split identities later on a server that accepts the wide class but not `QFid`.
+/// write-only or does not exist yet, nothing the caller may open) and a listing with nothing
+/// to judge (no `.` record and no entries) both switch file ids **off** on both paths, each
+/// with a warning. Off is the conservative answer: defaulting to on would split identities
+/// later on a server that accepts the wide class but not `QFid`.
 pub(crate) async fn probe_identity_mode(share: &smb_domain::Share, root: Option<&str>) -> bool {
     let base = SmbDomainProtocol::new(share.clone(), root.map(str::to_owned), true);
     match probe_both_paths(&base).await {
@@ -655,7 +656,10 @@ pub(crate) async fn probe_identity_mode(share: &smb_domain::Share, root: Option<
             false
         }
         Ok(None) => {
-            tracing::warn!("CIFS identity probe: root is empty; identities stay path-scoped");
+            tracing::warn!(
+                "CIFS identity probe: root listing had nothing to judge; identities stay \
+                 path-scoped"
+            );
             false
         }
         Err(error) => {
@@ -668,13 +672,14 @@ pub(crate) async fn probe_identity_mode(share: &smb_domain::Share, root: Option<
     }
 }
 
-/// `(listing_has_id, open_has_id)` for the first root entry that opens, or `None` for an empty
-/// root.
+/// `(listing_has_id, open_has_id)` for the root, or `None` when the root gave nothing to judge.
 ///
-/// Up to [`PROBE_CANDIDATES`] entries are tried, because the entry a server lists first is often
-/// one the caller may not open (`$RECYCLE.BIN`, another user's directory); a single
-/// `ACCESS_DENIED` there must not switch rename detection off for the whole session. The last
-/// open error is returned when none of the candidates opens.
+/// The listing half comes from the root's own `.` record when the server returns one, so an
+/// empty root still gets a verdict; otherwise from its first entry. The open half comes from
+/// opening the root itself, falling back to the first [`PROBE_CANDIDATES`] children only if the
+/// root refuses (a listable but not openable root is unusual, a first child that is
+/// `$RECYCLE.BIN` or another user's directory is not, and a single `ACCESS_DENIED` must not
+/// switch rename detection off for the whole session).
 async fn probe_both_paths(base: &SmbDomainProtocol) -> smb_domain::Result<Option<(bool, bool)>> {
     let root = StoragePath::root();
     let directory = base
@@ -684,12 +689,21 @@ async fn probe_both_paths(base: &SmbDomainProtocol) -> smb_domain::Result<Option
             smb_domain::DirectoryOpenOptions::open_existing(),
         )
         .await?;
-    let candidates = probe_candidates(&directory).await;
+    let listing = probe_listing(&directory).await;
     let close = close_directory(directory).await;
-    let candidates = candidates?;
+    let listing = listing?;
     close?;
-    let mut last_error = None;
-    for (child, listing_has_id) in candidates {
+    let Some(listing_has_id) = listing
+        .dot_has_id
+        .or(listing.candidates.first().map(|c| c.1))
+    else {
+        return Ok(None);
+    };
+    let mut last_error = match CifsSourceProtocol::describe(base, &root).await {
+        Ok(facts) => return Ok(Some((listing_has_id, facts.file_id.is_some()))),
+        Err(error) => error,
+    };
+    for (child, _) in listing.candidates {
         match CifsSourceProtocol::describe(base, &child).await {
             Ok(facts) => return Ok(Some((listing_has_id, facts.file_id.is_some()))),
             Err(error) => {
@@ -698,43 +712,53 @@ async fn probe_both_paths(base: &SmbDomainProtocol) -> smb_domain::Result<Option
                     path = child.as_str(),
                     "CIFS identity probe: candidate did not open"
                 );
-                last_error = Some(error);
+                last_error = error;
             }
         }
     }
-    match last_error {
-        Some(error) => Err(error),
-        None => Ok(None),
-    }
+    Err(last_error)
 }
 
-/// How many root entries the identity probe will try to open before giving up.
+/// How many root entries the identity probe will try to open when the root itself refuses.
 const PROBE_CANDIDATES: usize = 3;
 
-/// The first few real children of an open directory, each with whether its listing record
-/// carried a file id.
+/// What one listing of the root tells the identity probe.
+struct ProbeListing {
+    /// Whether the `.` record carried a file id; `None` when the server returned no `.` record.
+    dot_has_id: Option<bool>,
+    /// The first few real children, each with whether its record carried a file id.
+    candidates: Vec<(StoragePath, bool)>,
+}
+
+/// Lists the root once for the identity probe.
 ///
-/// The stream is drained to its end even though only a few entries are kept. Dropping a
-/// `QueryDirectoryStream` mid-way cancels a `QUERY_DIRECTORY` the facade may already have sent
-/// for the next batch; the late response then fails the runtime's response contract and the
-/// connection enters recovery, so the next operation on the fresh session fails with
-/// `Invalid state: only the Connection dependency may wait in this recovery stage`
-/// (reproduced 3/16 on FAS2750, 2026-09-18). Draining costs the root's full listing once per
-/// connect, which is what `list` pays for the same directory anyway.
-async fn probe_candidates(
-    directory: &smb_domain::Directory,
-) -> smb_domain::Result<Vec<(StoragePath, bool)>> {
+/// The stream is drained to its end even though only a few records are kept. Dropping a
+/// `QueryDirectoryStream` mid-way used to cancel a `QUERY_DIRECTORY` the facade had already
+/// sent for the next page; the server answered it after the CLOSE with `STATUS_FILE_CLOSED`,
+/// which the runtime treated as a fatal wire fault, and the next operation on the fresh
+/// session failed in recovery (3/16 connects on FAS2750, 2026-09-18). smb-rs #76 fixed both
+/// ends (pinned `8b10f35`); draining stays because it also spares one round trip nobody
+/// would collect, at the price of the root's full listing once per connect, which `list`
+/// pays for the same directory anyway.
+async fn probe_listing(directory: &smb_domain::Directory) -> smb_domain::Result<ProbeListing> {
     let mut entries = directory.entries("*");
-    let mut candidates = Vec::with_capacity(PROBE_CANDIDATES);
+    let mut listing = ProbeListing {
+        dot_has_id: None,
+        candidates: Vec::with_capacity(PROBE_CANDIDATES),
+    };
     while let Some(entry) = entries.next().await {
         let entry = entry?;
-        if candidates.len() == PROBE_CANDIDATES || matches!(entry.name(), "." | "..") {
-            continue;
+        match entry.name() {
+            "." => listing.dot_has_id = Some(entry.file_id().is_some()),
+            ".." => {}
+            name if listing.candidates.len() < PROBE_CANDIDATES => {
+                let child = child_path(&StoragePath::root(), name)?;
+                listing.candidates.push((child, entry.file_id().is_some()));
+            }
+            _ => {}
         }
-        let child = child_path(&StoragePath::root(), entry.name())?;
-        candidates.push((child, entry.file_id().is_some()));
     }
-    Ok(candidates)
+    Ok(listing)
 }
 
 /// Content-version payload shared by `describe`, `open`, `metadata`, and `list`, so the same

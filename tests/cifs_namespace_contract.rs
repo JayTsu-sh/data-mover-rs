@@ -108,13 +108,13 @@ async fn exercise_listing(namespace: &dyn Namespace, dir: &str, file: &str) -> R
     );
     // The connect-time probe turns file ids off on *both* paths when either half is missing, so a
     // PathScoped result here does not say which half failed: look for the connect-time warn
-    // ("file id available on only one path" / "root is empty" / "probe failed") to tell them
-    // apart.
+    // ("file id available on only one path" / "nothing to judge" / "probe failed") to tell
+    // them apart.
     assert_eq!(
         listed[0].source_identity.strength(),
         IdentityStrength::StableWithinBackend,
         "session is not using file ids (see the connect-time identity-probe warning): the wide \
-         directory class or the QFid create context was unavailable, or the root was empty"
+         directory class or the QFid create context was unavailable"
     );
     assert_eq!(
         stat.source_identity.strength(),
