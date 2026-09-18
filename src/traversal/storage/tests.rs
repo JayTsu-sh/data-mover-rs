@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use super::*;
 use crate::model::{
     BackendIdentity, BackendKind as Kind, IdentityStrength, MetadataObservation,
-    MetadataProvenance, ObservationPlan, SourceIdentity, SymlinkTarget, SymlinkTargetEncoding,
-    TimestampMetadata,
+    MetadataObservations, MetadataProvenance, ObservationPlan, SourceIdentity, SymlinkTarget,
+    SymlinkTargetEncoding, TimestampMetadata,
 };
 use crate::storage::MetadataMutation;
 
