@@ -114,6 +114,13 @@ impl State {
         }
     }
 
+    /// Entries admitted but not yet emitted: in flight, or settled and waiting in the reorder
+    /// buffer behind an earlier one. This, not the in-flight count alone, is what the admission
+    /// window bounds; otherwise one slow observation lets the reorder buffer grow without limit.
+    fn admitted(&self) -> usize {
+        usize::try_from(self.next_sequence - self.next_output).unwrap_or(usize::MAX)
+    }
+
     fn allocate(&mut self) -> Result<u64, TraversalTerminalFailure> {
         let sequence = self.next_sequence;
         self.next_sequence = sequence
@@ -237,11 +244,15 @@ async fn list_directory(
         return flush(runtime, state, directories).await;
     };
     for descriptor in descriptors {
-        while tasks.len() >= runtime.request.max_inflight_operations.get() {
+        while state.admitted() >= runtime.request.max_inflight_operations.get() {
             if runtime.request.cancel.is_cancelled() {
                 return Ok(());
             }
-            settle(runtime, tasks, state).await?;
+            // With nothing in flight, every admitted entry has settled, so the flush below can
+            // always emit the next one and shrink the window.
+            if !tasks.is_empty() {
+                settle(runtime, tasks, state).await?;
+            }
             flush(runtime, state, directories).await?;
         }
         admit(runtime, &directory, descriptor, directories, tasks, state)?;
