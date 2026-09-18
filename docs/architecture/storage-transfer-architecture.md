@@ -295,9 +295,12 @@ The default `Admission` order is depth-first by blocks: all children of one list
 in the order the backend listed them, then the block of each subdirectory descended into, in the
 same order, recursively. A directory's children therefore always follow the directory, and one
 listing's children are contiguous. Directory listings are prefetched concurrently ahead of the
-admission point (deepest first) under a listing budget of `min(max_inflight_operations, 64)`,
-separate from the observation window, so memory stays proportional to depth × fan-out rather
-than to the width of a tree level. Listings and observations may finish out of order, but
+admission point (deepest first): at most `min(max_inflight_operations, 64)` listings are in
+flight, separate from the observation window, and at most twice that many finished listings
+wait for the admission point. Memory is therefore bounded by depth × fan-out for the pending
+path plus those finished listings (each a whole directory), never by the width of a tree level.
+A session failure reported by a prefetched listing ends the traversal as soon as it arrives,
+including before entries admitted ahead of it have been delivered. Listings and observations may finish out of order, but
 cannot change delivery order: sequence numbers are assigned only in admission order. Both the
 admission window and item channel are bounded, so a slow consumer backpressures enumeration
 without allowing the reorder buffer to grow without limit. Backend operations already started

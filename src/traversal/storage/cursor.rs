@@ -106,18 +106,24 @@ impl Cursor {
     }
 
     /// Starts the listing the cursor needs next, then prefetches the listings it will need
-    /// soonest, within the listing budget.
+    /// soonest.
     ///
     /// The needed listing always starts, even over budget: prefetched listings further along
     /// must never be able to starve the one the cursor is blocked on. Prefetch candidates are
     /// the subdirectories already known to be descended into, in output order: the top frame's
-    /// slots first (the deepest, needed first), then each frame below it. A `Pending` slot
-    /// cannot be prefetched until its deferred decision settles.
+    /// slots first (the deepest, needed first), then each frame below it. A `Pending` slot is a
+    /// candidate once its deferred decision has settled on descending.
+    ///
+    /// Two separate limits apply. At most `budget` listings are in flight; and at most
+    /// `2 × budget` finished listings may wait for the cursor. Counting finished ones against
+    /// the in-flight budget would let early-prefetched shallow siblings, which the cursor only
+    /// reaches after the whole subtree in front of them, keep the deeper listings it needs
+    /// first from starting.
     pub(super) fn start_listings(&mut self, runtime: &Runtime<'_>, listings: &mut ListingTask) {
         let Self {
             stack,
+            decisions,
             listings: started,
-            ..
         } = self;
         if let Some(frame) = stack.last()
             && frame.children.is_none()
@@ -126,19 +132,28 @@ impl Cursor {
             spawn_listing(runtime, listings, started, frame.work.path.clone());
         }
         let budget = listing_budget(runtime);
-        // Each call only needs to find up to `budget` listings to start, so the scan is capped
-        // rather than walking every slot of every frame on each wake-up: a directory with a
-        // huge fan-out would otherwise make every event cost that fan-out.
-        let slots = stack
-            .iter()
-            .rev()
-            .flat_map(|frame| frame.slots.iter())
-            .take(budget.saturating_mul(4));
-        for slot in slots {
-            if started.len() >= budget {
+        // Each call only needs a few candidates, so the scan is capped rather than walking every
+        // slot of every frame on each wake-up; a huge fan-out would otherwise cost that fan-out
+        // per event. Undecided `Pending` slots are skipped without counting: there are at most
+        // as many as observations in flight.
+        let mut scanned = 0_usize;
+        for slot in stack.iter().rev().flat_map(|frame| frame.slots.iter()) {
+            let finished = started.len().saturating_sub(listings.len());
+            if listings.len() >= budget || finished >= budget.saturating_mul(2) {
                 return;
             }
-            if let Slot::Descend(work) = slot
+            let candidate = match slot {
+                Slot::Descend(work) => Some(work),
+                Slot::Pending(sequence) => match decisions.get(sequence) {
+                    Some(decision) => decision.as_ref(),
+                    None => continue,
+                },
+            };
+            scanned += 1;
+            if scanned > budget.saturating_mul(4) {
+                return;
+            }
+            if let Some(work) = candidate
                 && !started.contains_key(&work.path)
             {
                 spawn_listing(runtime, listings, started, work.path.clone());

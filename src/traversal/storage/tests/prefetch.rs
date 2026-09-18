@@ -1,5 +1,6 @@
 //! Concurrent listing prefetch: determinism, budgets and parallelism, on a virtual clock.
 
+use super::filter::RecordingFilter;
 use super::*;
 
 /// A namespace over an explicit tree whose listings take a configurable (virtual) time, and
@@ -269,4 +270,71 @@ async fn cancellation_lets_inflight_listings_finish() {
     })
     .await
     .unwrap_or_else(|_| panic!("detached listings never finished"));
+}
+
+/// `top` directories at the root, each holding `sub` empty subdirectories.
+fn fan_tree(top: usize, sub: usize) -> Vec<(String, Vec<(String, EntryKind)>)> {
+    let mut tree = vec![(
+        String::new(),
+        (0..top)
+            .map(|index| (format!("d{index:02}"), EntryKind::Directory))
+            .collect(),
+    )];
+    for index in 0..top {
+        let parent = format!("d{index:02}");
+        let children = (0..sub)
+            .map(|child| (format!("{parent}/s{child:02}"), EntryKind::Directory))
+            .collect();
+        tree.push((parent, children));
+    }
+    tree
+}
+
+/// Runs a traversal of `tree` with 10 ms listings and reports (paths, peak, virtual elapsed).
+async fn timed(
+    tree: &[(String, Vec<(String, EntryKind)>)],
+    request: TraversalRequest,
+) -> (Vec<String>, usize, std::time::Duration) {
+    let namespace = Arc::new(latency_namespace(tree, |_| 10));
+    let source = StorageTraversalSource::with_roles(
+        Arc::clone(&namespace) as Arc<dyn Namespace>,
+        Arc::new(FakeMetadata),
+    );
+    let started = tokio::time::Instant::now();
+    let (paths, _) = collect(source.traverse(request)).await;
+    (paths, namespace.peak(), started.elapsed())
+}
+
+/// Listings that already finished for shallow siblings must not keep the budget from the
+/// deeper listings the cursor needs first: a two-level tree should take about as long as a
+/// flat one with the same number of listings.
+#[tokio::test(start_paused = true)]
+async fn prefetched_shallow_results_do_not_starve_deeper_listings() {
+    let (two_level, _, nested) = timed(&fan_tree(10, 20), latency_request(8)).await;
+    let (flat, _, single) = timed(&fan_tree(210, 0), latency_request(8)).await;
+    assert_eq!(two_level.len(), 210);
+    assert_eq!(flat.len(), 210);
+    assert!(
+        nested.as_millis() * 10 <= single.as_millis() * 13,
+        "two-level {nested:?} vs flat {single:?}"
+    );
+}
+
+/// A deferred (`modified`) filter decides descent only after observing, but once decided the
+/// subdirectories must be prefetched like any other, with the same output.
+#[tokio::test(start_paused = true)]
+async fn deferred_decisions_are_prefetched_once_they_settle() {
+    let tree = fan_tree(64, 0);
+    let mut deferred = latency_request(8);
+    deferred.filter = Some(Arc::new(RecordingFilter::new(true)));
+    let mut immediate = latency_request(8);
+    immediate.filter = Some(Arc::new(RecordingFilter::new(false)));
+    let (deferred_paths, peak, deferred_time) = timed(&tree, deferred).await;
+    let (immediate_paths, _, immediate_time) = timed(&tree, immediate).await;
+    assert_eq!(deferred_paths, immediate_paths);
+    assert!(peak >= 4, "deferred listings never overlapped: peak {peak}");
+    assert!(
+        deferred_time.as_millis() * 10 <= immediate_time.as_millis() * 15,
+        "deferred {deferred_time:?} vs immediate {immediate_time:?}"
+    );
 }

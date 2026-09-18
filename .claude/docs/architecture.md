@@ -54,7 +54,12 @@ Storage (roles)
 `StorageTraversalSource` 的调度 (`src/traversal/storage.rs` + `storage/{cursor,observe}.rs`)：
 准入游标按"块"走深度优先 —— 一个目录的子项按列举顺序连续输出，再依次下钻各子目录；序号只由
 游标分配，重排缓冲按序号输出，所以列举/观察乱序完成不影响顺序。列举预读额度
-`min(max_inflight_operations, 64)`，与观察窗口分开；游标马上需要的列举不计额度 (防饿死)。
+`min(max_inflight_operations, 64)` 只计**在途**，已列出待消费的另限 2 倍额度 (否则早期预读的
+浅层兄弟会占住额度，饿死深层)；与观察窗口分开；游标马上需要的列举不计额度 (防饿死)。
+deferred filter 已决定下钻的 `Pending` 槽位也会预读。
+**已知局限**：只预读"栈上帧"已知的子目录；已预读完、游标还没走到的目录，其子目录要等游标到达
+才知道。"很多目录、每个只有少量子目录"的树，第二层近乎串行 (64 个目录各挂 1 个子目录：
+约 660 ms，理想约 160 ms)。改进需要在列举结果到达时就做 filter 决定 (architect 原方案)。
 取消或结束时在途的列举和观察都 detach 而非 abort (CIFS 句柄)。P3 的 `DirectoryComplete`
 挂在 `Cursor::advance` 里"块已全部准入"那一步。
 

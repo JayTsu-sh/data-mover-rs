@@ -367,13 +367,13 @@ impl Metadata for FailingAt {
 
 /// Records every candidate path the filter is shown, and admits everything.
 #[derive(Debug)]
-struct RecordingFilter {
+pub(super) struct RecordingFilter {
     needs_modified: bool,
     seen: std::sync::Mutex<Vec<String>>,
 }
 
 impl RecordingFilter {
-    fn new(needs_modified: bool) -> Self {
+    pub(super) fn new(needs_modified: bool) -> Self {
         Self {
             needs_modified,
             seen: std::sync::Mutex::new(Vec::new()),
