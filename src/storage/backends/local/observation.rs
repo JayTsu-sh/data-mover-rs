@@ -346,7 +346,9 @@ impl LocalObservationAdapter {
         }
         let relative = checked_relative(path)?;
         let root = Arc::clone(&self.root);
-        let target = tokio::task::spawn_blocking(move || root.read_link(relative))
+        // `read_link_contents` returns the stored link text; `read_link` would refuse any
+        // absolute target as an escape from the root, although nothing here resolves it.
+        let target = tokio::task::spawn_blocking(move || root.read_link_contents(relative))
             .await
             .map_err(|_| failure(path, FailureClass::Internal))?
             .map_err(|error| observation_io_failure(path, &error))?;

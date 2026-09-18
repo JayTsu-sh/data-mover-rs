@@ -326,6 +326,26 @@ async fn observes_symlink_without_following_target() -> io::Result<()> {
     Ok(())
 }
 
+/// Observing a link reads its text; it never resolves it, so an absolute target is not an
+/// escape from the root and must be reported verbatim.
+#[cfg(unix)]
+#[tokio::test]
+async fn observes_a_symlink_with_an_absolute_target_verbatim() -> io::Result<()> {
+    let root = TestRoot::new()?;
+    std::os::unix::fs::symlink("/etc/hostname", root.0.join("abs"))?;
+    let adapter = adapter(&root.0).map_err(io::Error::other)?;
+    let observed = adapter
+        .observe(StoragePath::new("abs").map_err(io::Error::other)?)
+        .await
+        .map_err(|error| io::Error::other(format!("{error:?}")))?;
+    assert_eq!(observed.kind(), EntryKind::Symlink);
+    assert_eq!(
+        observed.symlink_target().map(SymlinkTarget::as_bytes),
+        Some(&b"/etc/hostname"[..])
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn optional_metadata_marks_symlinks_not_applicable_without_calls() -> io::Result<()> {
@@ -371,12 +391,21 @@ async fn optional_metadata_never_follows_a_symlink_target() -> io::Result<()> {
         .with_acl(ObservationMode::Required)
         .with_xattrs(ObservationMode::Required);
 
-    let result = adapter
+    // The link's absolute target lies outside the root. Observing the link reads only its
+    // text, so it succeeds, and ACL / xattrs are not applicable to the link itself: nothing
+    // is read from the target.
+    let observed = adapter
         .observe_with_plan(StoragePath::new("link").map_err(io::Error::other)?, plan)
-        .await;
+        .await
+        .map_err(|error| io::Error::other(format!("{error:?}")))?;
+    assert_eq!(observed.kind(), EntryKind::Symlink);
     assert!(matches!(
-        result,
-        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::PermissionDenied
+        observed.metadata().acl(),
+        MetadataObservation::NotApplicable
+    ));
+    assert!(matches!(
+        observed.metadata().xattrs(),
+        MetadataObservation::NotApplicable
     ));
     assert_eq!(adapter.optional_call_count(), 0);
     Ok(())
