@@ -14,13 +14,14 @@
 //! Semantics worth knowing before relying on it:
 //!
 //! - **Every emitted entry needs a modification time**, and the only source that costs no extra
-//!   round trip is [`SourceDescriptor::inline_timestamps`]. CIFS, NFS and HDFS all attach it:
-//!   `QUERY_DIRECTORY`, `readdirplus` and the HDFS listing each already carry the attributes.
+//!   round trip is [`SourceDescriptor::inline_timestamps`]. CIFS, NFS, HDFS and Local all
+//!   attach it: `QUERY_DIRECTORY`, `readdirplus`, the HDFS listing and the Local per-child stat
+//!   each already carry the attributes.
 //!   A listing that does not is reported as an error rather than emitted with an epoch
 //!   timestamp — an epoch would silently tell an incremental sync that every entry changed, and
 //!   would disable every `modified` filter condition.
-//! - **Local and S3 lend no namespace role**, so they fail preflight here rather than
-//!   producing an empty walk.
+//! - **S3 lends no namespace role**, so it fails preflight here rather than producing an empty
+//!   walk.
 //! - **Pages carry [`ObservedEntry`], not `EntryEnum`.** That is the same immutable observation
 //!   [`crate::traversal::StorageTraversalSource`] emits, so both role-layer walkers describe an
 //!   entry the same way and `EntryEnum` — which is on its way out — gains no new caller here.
@@ -175,7 +176,8 @@ fn root_handle(kind: BackendKind) -> DirHandle {
             fh: bytes::Bytes::new(),
             path: String::new(),
         },
-        // Local and S3 lend no namespace role, so preflight already refused them.
+        // S3 lends no namespace role, so preflight already refused it; it shares Local's
+        // handle only because the match must be exhaustive.
         BackendKind::Local | BackendKind::S3 => DirHandle::Local(PathBuf::new()),
     }
 }

@@ -51,16 +51,20 @@ Storage (roles)
 `src/dir_tree.rs` 的 `run_dfs_driver`(那部分本来就后端无关)，这里只负责列举取数、按名排序、
 以及把 `SourceDescriptor` 反拼成 `NdxEvent` 载荷要的 `EntryEnum::NAS`。
 
-**覆盖面**，两层门槛，别只看第一层：
+**覆盖面**：
 
-1. Local 和 S3 **不出借 `Namespace` 角色**，上面四个 helper 在这两个 backend 上于 preflight
-   处返回 `CapabilityUnavailable`。`delete_tree` / `create_directory_all` /
-   `StorageTraversalSource` 到此为止，覆盖 CIFS / NFS / HDFS。
-2. `ndx_walk` 还多一道：它要求列举自带修改时间 (`SourceDescriptor::inline_timestamps`)，
-   而目前**只有 CIFS 挂了**。NFS / HDFS 过得了 preflight，但每个目录都会被报成错误而不是
-   产出条目 —— 这是刻意的，填 epoch 会让增量同步认为所有条目都变了。所以 `ndx_walk`
-   **实际只有 CIFS 可用**。要让 NFS 也能用，是把 `readdirplus` 已经拿到、目前被丢弃的
-   attrs 挂上去，不是改 `ndx_walk`。
+1. S3 **不出借 `Namespace` 角色**，上面四个 helper 在 S3 上于 preflight 处返回
+   `CapabilityUnavailable`。其余四个 backend (Local / NFS / CIFS / HDFS) 都出借。
+   Local 的 namespace 在 `src/storage/backends/local/namespace.rs`，与观察角色共用同一个
+   `cap_std::Dir` 沙箱；路径逐段用 `open_dir_nofollow` 解析，**任何一段**是 symlink 都拒绝，
+   最后一段在父目录句柄里操作 (描述/删除的是链接本身)。
+2. `ndx_walk` 还要求列举自带修改时间 (`SourceDescriptor::inline_timestamps`)，缺了就把
+   该目录报成错误而不是产出 epoch —— 填 epoch 会让增量同步认为所有条目都变了。目前
+   CIFS (`QUERY_DIRECTORY`)、NFS (`readdirplus`)、HDFS (listing) 和 Local (unix 逐子项
+   `fstatat`，Windows 直接取目录读回的属性) 都挂了，四个都可用。
+3. 列举里个别子项无法描述 (例如文件名拼不成 `StoragePath`) 时，backend 返回
+   `NamespaceResult::Listing { entries, failures }`，三个消费方用 `into_listing()` 统一
+   处理：失败逐项上报，兄弟条目照常。
 
 **关键点**：没有 `Storage` trait，没有 `dyn Storage`，没有 vtable。这是有意的 — 4 个 backend 协议差异极大，trait 抽象会塞 30+ 默认方法和大量 `Self`-bound 限制，不如 enum + match 直接。
 

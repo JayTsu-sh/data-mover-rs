@@ -35,8 +35,8 @@ pub enum IntegritySide {
 /// How much evidence the comparison gathers.
 ///
 /// Symlink targets are never compared: reading a link target needs the `Namespace` role, which
-/// this module deliberately does not take (Local lends no namespace role at all). Two links
-/// with equal size and timestamp therefore compare as matching whatever they point at.
+/// this module deliberately does not take (S3 lends none). Two links with equal size and
+/// timestamp therefore compare as matching whatever they point at.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum IntegrityMode {
     /// Kind, size, and modification time only. No object bytes are read.

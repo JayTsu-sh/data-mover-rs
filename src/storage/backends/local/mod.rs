@@ -1,11 +1,17 @@
 //! Local-filesystem adapter facade.
 
+use std::io;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
+
 use crate::model::{BackendIdentity, BackendKind};
-use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage, UnsupportedReason};
+use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
+
+pub(crate) mod namespace;
 
 #[allow(dead_code)]
 pub(crate) mod observation;
@@ -30,32 +36,40 @@ pub(crate) fn connect_transfer(
         identity.clone(),
         read_concurrency.get(),
     )?);
-    let metadata = Arc::new(observation::LocalObservationAdapter::new(
-        &root,
+    let sandbox = open_root(&root)?;
+    let metadata = Arc::new(observation::LocalObservationAdapter::from_root(
+        Arc::clone(&sandbox),
         identity.clone(),
-    )?);
+    ));
+    let namespace = Arc::new(namespace::LocalNamespace::from_root(
+        sandbox,
+        identity.clone(),
+    ));
     let staged = Arc::new(staged::LocalStagedDestination::new(
         root,
         identity.clone(),
         write_concurrency.get(),
-    )?);
-    let unsupported = CapabilityAvailability::Unsupported(UnsupportedReason::new(
-        "role is not supplied by the Local transfer-only endpoint",
     )?);
     Ok(Storage::connected(
         identity,
         BackendCapabilities::new(
             CapabilityAvailability::Supported,
             CapabilityAvailability::Supported,
-            unsupported.clone(),
+            CapabilityAvailability::Supported,
             CapabilityAvailability::Supported,
         ),
         Some(source),
         Some(staged),
-        None,
+        Some(namespace),
         Some(metadata),
         None,
     )?)
+}
+
+/// Opens the root directory capability shared by the observation and namespace roles.
+fn open_root(root: &Path) -> io::Result<Arc<Dir>> {
+    let canonical = std::fs::canonicalize(root)?;
+    Dir::open_ambient_dir(canonical, ambient_authority()).map(Arc::new)
 }
 
 #[cfg(test)]

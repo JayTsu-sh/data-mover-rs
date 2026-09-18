@@ -1447,6 +1447,7 @@ dependencies = [
  "binrw",
  "blake3",
  "bytes 1.11.1",
+ "cap-primitives",
  "cap-std",
  "chrono",
  "clap",

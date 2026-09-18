@@ -2,8 +2,7 @@
 //! filtered / depth-limited traversal, NDX paging, recursive delete, and cross-endpoint
 //! integrity.
 //!
-//! Local lends no namespace role, so `create-dir`, `delete-tree` and `ndx-walk` need a NAS
-//! backend; `traverse` and `compare` work anywhere.
+//! Every backend here lends the namespace role, so all subcommands work on Local, NFS and CIFS.
 //!
 //! ```text
 //! cargo run --example storage_role_operations -- traverse --backend local --root /tmp/tree \

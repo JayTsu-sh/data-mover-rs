@@ -764,13 +764,12 @@ async fn extension_conditions_use_path_extension_semantics() -> Result {
 
 #[tokio::test]
 async fn a_storage_without_a_namespace_role_is_refused_before_any_listing() -> Result {
-    let absent = CapabilityAvailability::Unsupported(UnsupportedReason::new(
-        "Local lends no namespace role",
-    )?);
+    let absent =
+        CapabilityAvailability::Unsupported(UnsupportedReason::new("S3 lends no namespace role")?);
     let capabilities =
         BackendCapabilities::new(absent.clone(), absent.clone(), absent.clone(), absent);
     let storage = Storage::connected(
-        BackendIdentity::new(BackendKind::Local, "ndx-walk-no-namespace")?,
+        BackendIdentity::new(BackendKind::S3, "ndx-walk-no-namespace")?,
         capabilities,
         None,
         None,
@@ -780,7 +779,7 @@ async fn a_storage_without_a_namespace_role_is_refused_before_any_listing() -> R
     )?;
     assert!(
         ndx_walk(&storage, request(StoragePath::root())?).is_err(),
-        "Local and S3 lend no namespace role, so the walk is refused up front"
+        "a storage without a namespace role is refused up front"
     );
     Ok(())
 }
