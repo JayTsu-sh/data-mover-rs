@@ -296,9 +296,10 @@ in the order the backend listed them, then the block of each subdirectory descen
 same order, recursively. A directory's children therefore always follow the directory, and one
 listing's children are contiguous. Directory listings are prefetched concurrently ahead of the
 admission point (deepest first): at most `min(max_inflight_operations, 64)` listings are in
-flight, separate from the observation window, and at most twice that many finished listings
-wait for the admission point. Memory is therefore bounded by depth × fan-out for the pending
-path plus those finished listings (each a whole directory), never by the width of a tree level.
+flight, separate from the observation window, and at most twice that many listings, in flight
+and finished together, wait for the admission point. Memory is therefore bounded by
+depth × fan-out for the pending path plus those listings (each a whole directory), never by the
+width of a tree level.
 A session failure reported by a prefetched listing ends the traversal as soon as it arrives,
 including before entries admitted ahead of it have been delivered. Listings and observations may finish out of order, but
 cannot change delivery order: sequence numbers are assigned only in admission order. Both the

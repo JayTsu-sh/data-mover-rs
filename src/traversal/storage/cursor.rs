@@ -140,7 +140,7 @@ impl Cursor {
     /// candidate whose listing already arrived is expanded into its own subdirectories.
     ///
     /// Two separate limits apply. At most `budget` listings are in flight, and at most
-    /// `2 × budget` finished listings may wait for the cursor. Counting finished ones against the
+    /// `2 × budget` listings, in flight and finished together, may wait for the cursor. Counting finished ones against the
     /// in-flight budget would let early-prefetched shallow siblings keep the deeper listings the
     /// cursor needs first from starting.
     pub(super) fn start_listings(&mut self, runtime: &Runtime<'_>, listings: &mut ListingTask) {
@@ -152,10 +152,12 @@ impl Cursor {
             spawn_listing(runtime, listings, &mut self.listings, work);
         }
         let budget = listing_budget(runtime);
-        let finished = self.listings.len().saturating_sub(listings.len());
+        // `self.listings` holds every started listing not yet taken, in flight or finished, so
+        // capping it at 2 × budget bounds the finished ones there even after everything in
+        // flight arrives.
         let room = budget
             .saturating_sub(listings.len())
-            .min(budget.saturating_mul(2).saturating_sub(finished));
+            .min(budget.saturating_mul(2).saturating_sub(self.listings.len()));
         for work in self.prefetch_candidates(room, budget.saturating_mul(4)) {
             spawn_listing(runtime, listings, &mut self.listings, work);
         }

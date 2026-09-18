@@ -80,6 +80,9 @@ pub trait TraversalFilter: fmt::Debug + Send + Sync {
     /// never evaluates the filter with an absent timestamp.
     fn needs_modified(&self) -> bool;
 
+    /// Decides one candidate. May be called in any order, before the entry is admitted, and for
+    /// entries that are never delivered if the traversal ends early; implementations must not
+    /// depend on call order or keep state between calls that affects decisions.
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision;
 }
 

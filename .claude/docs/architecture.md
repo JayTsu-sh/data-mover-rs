@@ -54,7 +54,7 @@ Storage (roles)
 `StorageTraversalSource` 的调度 (`src/traversal/storage.rs` + `storage/{cursor,observe}.rs`)：
 准入游标按"块"走深度优先 —— 一个目录的子项按列举顺序连续输出，再依次下钻各子目录；序号只由
 游标分配，重排缓冲按序号输出，所以列举/观察乱序完成不影响顺序。列举预读额度
-`min(max_inflight_operations, 64)` 只计**在途**，已列出待消费的另限 2 倍额度 (否则早期预读的
+`min(max_inflight_operations, 64)` 只计**在途**，在途 + 已列出待消费合计另限 2 倍额度 (否则早期预读的
 浅层兄弟会占住额度，饿死深层)；与观察窗口分开；游标马上需要的列举不计额度 (防饿死)。
 deferred filter 已决定下钻的 `Pending` 槽位也会预读。列举结果**到达时**就对每个子项做
 filter 决定 (deferred 的除外)，所以已预读、游标还没走到的目录，其子目录也能继续预读；候选按
