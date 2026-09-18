@@ -61,19 +61,57 @@ legacy `CifsStorage` 的能力在 role-based backend 里的去向 —— 有对�
   `TraversalDecision`，后者是 legacy `should_skip` 三元组 (`ReadContext.apply_filter` /
   `SubdirEntry.visible` / `need_filter`)。这是有意并存：其余四个 backend 的 walkdir_2 也还在
   legacy 那条线上。work-stealing 仍归上层编排。
-- 无 128-bit file id / info-class 探测；source identity 是
-  `len + written + changed` (目录 len 记 0)，`describe` / `open` / `metadata` / `list` 四条路径
-  共用 `protocol::identity_bytes` 同一套字节，互相可比
-  (矩阵 `hardlink_topology: unsupported`，路径级 identity 足够)。
-  **已知降级**：`ndx_walk` 产出的 `NASEntry.file_handle` 恒为 `None`，因为 smb-domain facade
-  完全不暴露 file id (`crates/smb/src/domain/` 搜 `file_id` / `FileId` / `IndexNumber` 零命中，
-  `runtime/port.rs:496` 用的是最窄的 `FileDirectoryInformation`)。legacy 用它当 rename 检测键
-  (NTFS `IndexNumber` / ReFS 完整 128 位 / Samba inode)，所以 **CIFS 上的 rename 检测退回
-  Path 模式** —— 增量同步里整目录改名会被看成全删全建。要修得给 smb-rs 提 PR 换宽 info class
-  (`FileIdFullDirectoryInformation` 0x26 / `FileIdExtdDirectoryInformation` 0x3c)，file id 随
-  `QUERY_DIRECTORY` 一起回来、**不增加往返**，但记录变宽约 15%，且必须带上服务器拒绝宽 class
-  时回退窄 class 的探测 (legacy `probe_dir_info_class` 就是为此存在)。因为宽 class 的成本只在
-  全量搬迁时白付、收益只在增量时兑现，这个开关应该是可选的，不要无条件换。
+- **source identity 用 64 位 SMB file id，`StableWithinBackend`** —— 与 NFS 的 file handle
+  同一角色，也是 terrasync `clickhouse.rs` 里 `file_handle` 列 / `JoinStrategy::FileHandle`
+  的输入 (2026-09-18 起，smb-rs PR #74)。消费端经 `ObservedEntry::source_identity()` →
+  `SourceIdentity::stable_bytes()` 取字节 (只在 `StableWithinBackend` 时是 `Some`)。编码 16 字节
+  大端、高 64 位补零：NTFS / Samba 上 (高位本来是 0) 与 legacy `file_id_to_handle` 逐字节一致；
+  legacy 优先用 `FileIdExtd` 存完整 128 位，高位非零的服务器 (ReFS) 上两者不一致，base 表要
+  重建。四条路径来源：
+  - `list`：`FileIdFullDirectoryInformation` (64 位) → `FileIdExtdDirectoryInformation`
+    (128 位取低 64) → 窄 class 的阶梯，`STATUS_INVALID_INFO_CLASS` 出现在流的**第一个元素**上，
+    smb-rs 靠读首元素判定并降级。宽 class 随 QUERY_DIRECTORY 一起回来，**零额外往返**。
+  - `describe` / `open` / `metadata`：CREATE 响应的 `QFid` create context (smb-rs 每次 open
+    都附带)，同样零额外往返。
+  统一 64 位而不是 128：QFid 只给 64 位，ReFS 上 Extd 的 128 位与之不一致，统一后同一对象
+  的列举与打开在所有文件系统上一致 (这是 rename 检测对身份的一致性要求，见 smb-rs PR #74)。
+  零值报 `None` → 退回路径级身份 (FAT 一类后端)。
+  **两个来源相互独立，连接期探测一次钉死会话模式** (`protocol::probe_identity_mode`)：完整
+  列举根目录一次，取前 3 个子项为候选，依次打开直到有一个打开成功 (首个条目常是
+  `$RECYCLE.BIN` 或别人的目录，单个 ACCESS_DENIED 不该关掉整个会话的 rename 检测)。只答其一的
+  服务器上 List 与 Stat 会对每个条目给出不同身份 → 每个传输 `Conflict`，所以任一缺失就在
+  **两条路径上都**关掉 file id，退回路径级身份。探测是能力检测，**永不让连接失败**：任一步出错
+  (根不可列举的只写目录、`ensure_dir=false` 且根尚不存在、候选全被 ACL 拒绝) 或根为空 →
+  warn + 关掉 file id。空根关掉是保守值：空源没有 rename 可检测，代价为零；而"接受宽 class
+  但不答 QFid"的服务器上默认开会在根被填充后分裂。列举**必须读到流尾**而不是取到首项就丢流，
+  原因见"已知陷阱"的中途丢流一条。
+  **变更检测与身份分离，但 `expected_source` 只比身份**：身份跨 rename **和跨编辑**都稳定
+  (`source_tests::a_file_id_makes_the_identity_rename_stable`)，这正是 rename 检测要的性质；
+  代价是 describe→open 之间源被原地编辑时 CIFS 不再报 `Conflict`
+  (`source_tests::with_a_file_id_an_edited_source_still_opens_because_identity_is_the_file_id`)。
+  NFS / Local 用 fh / dev+ino 做身份，本来就是这个语义；CIFS 此前靠 `len+written+changed`
+  才有那道检查。`content_version` (= `identity_bytes`) 现在只进恢复绑定 (`engine.rs:1107`)；
+  把它接进 `ReadRequest::expected_source` / `observe_bound` 是跨后端的模型工作，未做。
+  **仍未覆盖**：ONTAP share 经 junction 跨卷时两个卷的 file id 理论上可碰撞；QFid 同时回
+  `volume_id`，`ResourceMetadata::volume_id()` 已暴露但列举侧 (`FileIdFull`) 没有，所以身份
+  暂不掺 volume id。要验证请在含 junction 的 share 上比对 `volume_id`。
+- **describe 从 4 个往返降到 2 个，open (读游标) 从 3 个降到 1 个**：`CREATE + 2×QUERY_INFO
+  (+ CLOSE)` → `CREATE (+ CLOSE)`。CREATE 响应本来就带四个时间戳、EndOfFile、FileAttributes、
+  reparse 标志和 QFid，smb-rs 现在把它快照在 `ResourceHandle::opened()`，`opened_metadata()`
+  同步读取。快照是 open 时刻的，写后不刷新 —— staged `size()` 每次重新 open 所以仍然新鲜；
+  需要写后新值的路径用 `metadata()` (保留两次查询)。`Metadata::observe` 的 inline 记录
+  (`CifsInlineMetadata.readonly`) 因此在 metadata 路径也有值了；但 `Namespace::Stat` 走的是
+  `describe` → `CifsSourceFacts`，没有 readonly 字段，`inline_mode` 仍只在 list 路径有。
+- **升级影响 (一次性，必读)**：CIFS 身份的 `identity_key` 变了 (strength tag 与字节都不同)，
+  `content_version` 从 `None` 变为 `Some`。
+  (1) 恢复记录按 recovery binding 的哈希做 key (`engine.rs` `recovery_store::open_existing(binding)`)，
+  而 binding 同时含 `identity_key` 与 `content_version` (`engine.rs:1104-1110`)。CIFS 作源时两者
+  都变 → 新 binding **查不到**旧记录 → `recover` 根本不会被调用，直接走全新 `prepare`。真实后果
+  不是报错，而是升级前在途的 `Checkpointed` 传输在目标端留下的 stage 文件和 recovery-store 记录
+  **静默孤儿化**。升级后 `discard_prior_recovery` 同样用新 binding 查，也找不到 —— 所以唯一有效
+  的做法是**升级前**排空或 `discard` 所有以 CIFS 为源的在途传输；升级后残留只能手工清理目标端
+  stage 与 recovery-store。(2) 旧 `EntrySnapshot` 的 key 全部不再匹配，升级后第一次增量会把所有
+  CIFS 条目视为新增，一次性全量。
 - 目录列举带回 `FILE_DIRECTORY_INFORMATION` 里已有的四个时间戳，挂在
   `SourceDescriptor::inline_timestamps` 上；`ObservationPlan` 只要时间戳时，遍历直接用它，
   不再对每个条目多发一次 `Metadata::observe` (N+1 → 1)。
@@ -222,6 +260,8 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 | 根子路径自动创建 | 一次创建三层 `a/nested/deep`；对已存在父级再建子目录复用不报错 | **已实现** (`ensure_dir`) |
 | filter / max_depth 剪枝 | `max_depth=1` 只列举一层；`path == "sub/**"` 只收子目录内容 (sub 本身 PartialMatch 隐藏但下潜)；`exclude name == ...` 在两层同名文件上都生效 | **已实现** (`TraversalRequest.filter` / `.max_depth`) |
 | 跨端完整性比对 | 同一对象完全一致；跨目录副本报出 Size + Modified + Content | **已实现** (`integrity::compare`) |
+| file id (2026-09-18，smb-rs #74 → main `10de18c`；连接期 `probe_identity_mode` 判定两路都有 → 会话启用) | `[identity] strength=StableWithinBackend (List) / StableWithinBackend (Stat)`：ONTAP 接受 `FileIdFullDirectoryInformation` 宽 class，**且回答 QFid create context**；`real_share_namespace_verbs_roundtrip` 里 rename 前后 `identity_key` 相等；policy 契约 (64 MiB Checkpointed / AtomicReplace) 在 2-RT describe/open 上通过 | **已实现**。rename 检测不再退回 Path 模式 |
+| NDX 分页遍历 (2026-09-18) | `storage_role_operations --backend cifs --root <scratch> ndx-walk --entries`：`seed --path sub` 后 2 页 DFS，NDX `0(sub) → gap 1 → 2,3,4 → gap -1`，每个条目 (含目录) `identity=StableWithinBackend`，时间戳为真值；`--max-depth 1` 只出根页且 `sub` 作为条目发出；`delete-tree --delete-root` 3 文件 + 1 目录零失败 | **已实现** (`storage::ndx_walk` + `create_directory_all` 建父目录) |
 
 复现：`.claude/skills/e2e-cifs` (`CIFS_REAL_*`)。新能力的真机链路用
 `examples/storage_role_operations` 的 `seed → traverse → compare → delete-tree`。
@@ -232,6 +272,10 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 `mount_root_only=true` 时会 `AUTH_TOOWEAK`，测试期间需临时关闭并事后恢复。
 
 ## 升级 smb-rs 依赖
+
+> 2026-09-18：file id / CREATE 快照经 smb-rs **PR #74** 以 merge commit 合入 main，
+> 顶端 `10de18c` (树与分支 head `7585e30` 相同)。`Cargo.toml` 钉 `10de18c`；第 3、4 步在
+> `7585e30` 上跑过 (namespace ×3、policy ×3、probe ×1)，重钉后又在 `10de18c` 上各跑一次。
 
 `smb-domain` 固定的是 JayTsu-sh/smb-rs **main 上的一个提交**，不是 branch。升级 = 改一处 rev，
 但验证必须完整，因为 smb-rs 的协议内部 (credits、签名、recovery) 出问题只会在真实服务器和
@@ -272,6 +316,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 | 长 session 句柄耗尽 | 检查所有 close 路径走 `close_resource` |
 | 符号链接 | facade 不暴露 reparse point；`ReadLink` 返回 typed `Unsupported` (实测见"真实环境证据") |
 | 目录 rename 目标已存在 | NTFS 语义下不能替换非空目录，服务器返回 COLLISION/ACCESS_DENIED → `Conflict`/`PermissionDenied` |
+| **中途丢弃 `entries()` 流** (取到首项就 return) | facade 的 fetch_loop 在消费端取空缓冲的瞬间就发下一条 QUERY_DIRECTORY；随后 drop 流 → wire CANCEL → 迟到响应撞上 runtime 的 `operation-response-contract` → generation 以 Transport 原因退出 → 连接进入恢复期，**下一个操作**报 `Invalid state: only the Connection dependency may wait in this recovery stage` (`Protocol`/Unknown)。FAS2750 上 16 次连接复现 3 次，且总是紧随连接后的第一个 List。应对：任何 `entries()` 都 `try_collect` / 读到 `None` 再 close (`list`、`probe_candidates` 都这样做)；改为读到流尾后 46 次连接 0 次报错。**同一根因还有第二种表现**：依赖是 Connection 的操作在恢复期不报错而是等待 (`create_object` 传的 deadline 是 `None`)，46 次连接里有 1 次整个进程挂满 300 s 被外部 timeout 杀掉、无任何输出，同一时刻新开的连接 2 s 内正常。smb-rs 侧待提 issue：被取消操作的迟到响应不该致命；`recover()` 的 `MismatchedGeneration` / `PublishGeneration` 分支返回前没有 `fail_waiters`，等待者会永远挂住 |
 
 ## 测试
 

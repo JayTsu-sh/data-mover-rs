@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::TryStreamExt as _;
+use futures::{StreamExt as _, TryStreamExt as _};
 
 use super::metadata::{CifsInlineMetadata, CifsMetadataProtocol};
 use super::namespace::CifsNamespaceProtocol;
@@ -18,11 +18,27 @@ const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
 pub(super) struct SmbDomainProtocol {
     share: smb_domain::Share,
     root: Option<String>,
+    /// Whether file ids take part in identity for this session.
+    ///
+    /// Listings get their id from a wide `QUERY_DIRECTORY` class and opens from the `QFid`
+    /// create context — two independent server features. A server that offers only one would
+    /// make `List` and `Stat` disagree on identity for every entry (`Conflict` on each
+    /// transfer), so [`probe_identity_mode`] checks both at connect time and this flag turns
+    /// file ids off on **both** paths when either is missing.
+    use_file_ids: bool,
 }
 
 impl SmbDomainProtocol {
-    pub(super) fn new(share: smb_domain::Share, root: Option<String>) -> Self {
-        Self { share, root }
+    pub(super) fn new(share: smb_domain::Share, root: Option<String>, use_file_ids: bool) -> Self {
+        Self {
+            share,
+            root,
+            use_file_ids,
+        }
+    }
+
+    fn file_id(&self, file_id: Option<u64>) -> Option<u64> {
+        file_id.filter(|_| self.use_file_ids)
     }
 
     fn share_path(&self, path: &StoragePath) -> smb_domain::Result<smb_domain::SharePath> {
@@ -107,16 +123,18 @@ impl CifsSourceProtocol for SmbDomainProtocol {
         let share_path = self.share_path(path)?;
         let resource = self.share.open(&share_path).await?;
         match resource {
+            // The CREATE response already carried everything a describe needs, so no
+            // QUERY_INFO round trip: CREATE + CLOSE instead of CREATE + 2×QUERY_INFO + CLOSE.
             smb_domain::Resource::File(file) => {
                 let maximum_read_chunk = file.io_capabilities().maximum_read_chunk();
-                let metadata = file.metadata().await;
-                let close = close_file(*file).await;
-                finish_facts(metadata, close, EntryKind::File, maximum_read_chunk)
+                let metadata = file.opened_metadata();
+                close_file(*file).await?;
+                Ok(self.facts(EntryKind::File, &metadata, maximum_read_chunk))
             }
             smb_domain::Resource::Directory(directory) => {
-                let metadata = directory.metadata().await;
-                let close = close_directory(directory).await;
-                finish_facts(metadata, close, EntryKind::Directory, u32::MAX)
+                let metadata = directory.opened_metadata();
+                close_directory(directory).await?;
+                Ok(self.facts(EntryKind::Directory, &metadata, u32::MAX))
             }
             smb_domain::Resource::Pipe(pipe) => {
                 let _ = close_pipe(pipe).await;
@@ -136,14 +154,8 @@ impl CifsSourceProtocol for SmbDomainProtocol {
             .share
             .open_file(&share_path, smb_domain::FileOpenOptions::open_existing())
             .await?;
-        let metadata = match file.metadata().await {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                let _ = close_file(file).await;
-                return Err(error);
-            }
-        };
-        let facts = facts(
+        let metadata = file.opened_metadata();
+        let facts = self.facts(
             EntryKind::File,
             &metadata,
             file.io_capabilities().maximum_read_chunk(),
@@ -255,6 +267,7 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
                                 entry.written(),
                                 entry.changed(),
                             ),
+                            file_id: self.file_id(entry.file_id()),
                             maximum_read_chunk: u32::MAX,
                         },
                         accessed: entry.accessed(),
@@ -438,10 +451,8 @@ impl CifsStagedProtocol for SmbDomainProtocol {
             .share
             .open_file(&path, smb_domain::FileOpenOptions::open_existing())
             .await?;
-        let metadata = file.metadata().await;
-        let close = close_file(file).await;
-        let metadata = metadata?;
-        close?;
+        let metadata = file.opened_metadata();
+        close_file(file).await?;
         Ok(metadata.len())
     }
 
@@ -486,18 +497,15 @@ impl CifsMetadataProtocol for SmbDomainProtocol {
         let path = self.share_path(path)?;
         let resource = self.share.open(&path).await?;
         let kind = resource_kind(&resource).unwrap_or(EntryKind::File);
-        let metadata = resource.metadata().await;
-        let close = close_resource(resource).await;
+        let metadata = resource.opened_metadata();
+        close_resource(resource).await?;
         let metadata = metadata?;
-        close?;
         Ok(CifsInlineMetadata {
-            facts: facts(kind, &metadata, u32::MAX),
+            facts: self.facts(kind, &metadata, u32::MAX),
             accessed: metadata.accessed(),
             modified: metadata.written(),
             created: metadata.created(),
-            // `ResourceMetadata` carries only the four timestamps and the length, so a metadata
-            // open cannot observe `FILE_ATTRIBUTE_READONLY` at all.
-            readonly: None,
+            readonly: Some(metadata.is_readonly()),
         })
     }
 
@@ -567,17 +575,6 @@ impl CifsMetadataProtocol for SmbDomainProtocol {
     }
 }
 
-fn finish_facts(
-    metadata: smb_domain::Result<smb_domain::ResourceMetadata>,
-    close: smb_domain::Result<()>,
-    kind: EntryKind,
-    maximum_read_chunk: u32,
-) -> smb_domain::Result<CifsSourceFacts> {
-    let metadata = metadata?;
-    close?;
-    Ok(facts(kind, &metadata, maximum_read_chunk))
-}
-
 fn require_confirmed_close(outcome: smb_domain::CloseOutcome) -> smb_domain::Result<()> {
     match outcome {
         smb_domain::CloseOutcome::Confirmed | smb_domain::CloseOutcome::AlreadyClosed => Ok(()),
@@ -615,21 +612,138 @@ async fn close_pipe(pipe: smb_domain::Pipe) -> smb_domain::Result<()> {
     require_confirmed_close(pipe.close().await?)
 }
 
-fn facts(
-    kind: EntryKind,
-    metadata: &smb_domain::ResourceMetadata,
-    maximum_read_chunk: u32,
-) -> CifsSourceFacts {
-    CifsSourceFacts {
-        kind,
-        size: metadata.len(),
-        identity: identity_bytes(kind, metadata.len(), metadata.written(), metadata.changed()),
-        maximum_read_chunk,
+impl SmbDomainProtocol {
+    fn facts(
+        &self,
+        kind: EntryKind,
+        metadata: &smb_domain::ResourceMetadata,
+        maximum_read_chunk: u32,
+    ) -> CifsSourceFacts {
+        CifsSourceFacts {
+            kind,
+            size: metadata.len(),
+            identity: identity_bytes(kind, metadata.len(), metadata.written(), metadata.changed()),
+            file_id: self.file_id(metadata.file_id()),
+            maximum_read_chunk,
+        }
     }
 }
 
-/// Path-scoped identity payload shared by `describe`, `open`, `metadata`, and `list`, so the
-/// same entry hashes identically whichever verb observed it.
+/// Decides once per session whether file ids can be identity.
+///
+/// Lists the root once and opens the first of its entries that will open. A session uses file
+/// ids only when the wide directory class **and** the `QFid` create context both answered,
+/// because identity must be the same whichever verb observed an entry; a server offering only
+/// one would make `List` and `Stat` disagree on every entry.
+///
+/// This is a capability check, so it never fails the connect: any error (a root that is
+/// write-only or does not exist yet, no candidate entry the caller may open) and an empty root
+/// both switch file ids **off** on both paths, each with a warning. Off is the conservative answer
+/// for an empty root — an empty source has no renames to detect, and defaulting to on would
+/// split identities later on a server that accepts the wide class but not `QFid`.
+pub(crate) async fn probe_identity_mode(share: &smb_domain::Share, root: Option<&str>) -> bool {
+    let base = SmbDomainProtocol::new(share.clone(), root.map(str::to_owned), true);
+    match probe_both_paths(&base).await {
+        Ok(Some((listing, open))) if listing && open => true,
+        Ok(Some((listing, open))) => {
+            tracing::warn!(
+                listing,
+                open,
+                "CIFS identity probe: file id available on only one path; identities fall back \
+                 to path scope for this session"
+            );
+            false
+        }
+        Ok(None) => {
+            tracing::warn!("CIFS identity probe: root is empty; identities stay path-scoped");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "CIFS identity probe failed; identities fall back to path scope for this session"
+            );
+            false
+        }
+    }
+}
+
+/// `(listing_has_id, open_has_id)` for the first root entry that opens, or `None` for an empty
+/// root.
+///
+/// Up to [`PROBE_CANDIDATES`] entries are tried, because the entry a server lists first is often
+/// one the caller may not open (`$RECYCLE.BIN`, another user's directory); a single
+/// `ACCESS_DENIED` there must not switch rename detection off for the whole session. The last
+/// open error is returned when none of the candidates opens.
+async fn probe_both_paths(base: &SmbDomainProtocol) -> smb_domain::Result<Option<(bool, bool)>> {
+    let root = StoragePath::root();
+    let directory = base
+        .share
+        .open_directory(
+            &base.share_path(&root)?,
+            smb_domain::DirectoryOpenOptions::open_existing(),
+        )
+        .await?;
+    let candidates = probe_candidates(&directory).await;
+    let close = close_directory(directory).await;
+    let candidates = candidates?;
+    close?;
+    let mut last_error = None;
+    for (child, listing_has_id) in candidates {
+        match CifsSourceProtocol::describe(base, &child).await {
+            Ok(facts) => return Ok(Some((listing_has_id, facts.file_id.is_some()))),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    path = child.as_str(),
+                    "CIFS identity probe: candidate did not open"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
+/// How many root entries the identity probe will try to open before giving up.
+const PROBE_CANDIDATES: usize = 3;
+
+/// The first few real children of an open directory, each with whether its listing record
+/// carried a file id.
+///
+/// The stream is drained to its end even though only a few entries are kept. Dropping a
+/// `QueryDirectoryStream` mid-way cancels a `QUERY_DIRECTORY` the facade may already have sent
+/// for the next batch; the late response then fails the runtime's response contract and the
+/// connection enters recovery, so the next operation on the fresh session fails with
+/// `Invalid state: only the Connection dependency may wait in this recovery stage`
+/// (reproduced 3/16 on FAS2750, 2026-09-18). Draining costs the root's full listing once per
+/// connect, which is what `list` pays for the same directory anyway.
+async fn probe_candidates(
+    directory: &smb_domain::Directory,
+) -> smb_domain::Result<Vec<(StoragePath, bool)>> {
+    let mut entries = directory.entries("*");
+    let mut candidates = Vec::with_capacity(PROBE_CANDIDATES);
+    while let Some(entry) = entries.next().await {
+        let entry = entry?;
+        if candidates.len() == PROBE_CANDIDATES || matches!(entry.name(), "." | "..") {
+            continue;
+        }
+        let child = child_path(&StoragePath::root(), entry.name())?;
+        candidates.push((child, entry.file_id().is_some()));
+    }
+    Ok(candidates)
+}
+
+/// Content-version payload shared by `describe`, `open`, `metadata`, and `list`, so the same
+/// entry hashes identically whichever verb observed it. It is also the path-scoped identity
+/// when the server offers no file id.
+///
+/// The `cifs-path-identity:v2` prefix predates the file-id identity; it is kept because the
+/// bytes are persisted in recovery bindings and snapshots, and renaming it would invalidate
+/// them for no behavioural gain.
 ///
 /// Directories hash a zero length: `FILE_DIRECTORY_INFORMATION` reports 0 for a subdirectory
 /// while a directory handle's `EndOfFile` reports index allocation, so the real length would

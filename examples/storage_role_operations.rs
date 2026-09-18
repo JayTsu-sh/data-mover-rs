@@ -282,12 +282,13 @@ async fn ndx_walk_pages(storage: &Storage, args: &Args, command: &Command) -> Re
 
 fn print_ndx_entry(entry: &NdxEntry<ObservedEntry>) {
     println!(
-        "  ndx={} {} kind={:?} size={:?} modified={:?}",
+        "  ndx={} {} kind={:?} size={:?} modified={:?} identity={:?}",
         entry.ndx,
         entry.entry.path(),
         entry.entry.kind(),
         entry.entry.size(),
-        entry.entry.modified().map(StorageTimestamp::unix_nanos)
+        entry.entry.modified().map(StorageTimestamp::unix_nanos),
+        entry.entry.source_identity().strength()
     );
 }
 
@@ -295,6 +296,11 @@ async fn seed(storage: &Storage, args: &Args, command: &Command) -> Result<(), E
     let Command::Seed { path, files, bytes } = command else {
         unreachable!("dispatched by the caller")
     };
+    // Staged prepare creates the file itself but not its parents; the role-layer helper
+    // creates every missing level idempotently.
+    if !path.is_empty() {
+        create_directory_all(storage, &StoragePath::new(path.clone())?).await?;
+    }
     let local_root = tempfile::tempdir()?;
     let payload = vec![b'x'; *bytes];
     let slots = NonZeroUsize::new(args.concurrency).ok_or("concurrency must be non-zero")?;
@@ -357,7 +363,12 @@ async fn remove_tree(storage: &Storage, args: &Args, command: &Command) -> Resul
         match item {
             DeleteTreeItem::Deleted { path, kind } => println!("deleted {kind:?} {path}"),
             DeleteTreeItem::EntryFailure(error) => {
-                eprintln!("delete failure {} {:?}", error.path(), error.class());
+                eprintln!(
+                    "delete failure {} {:?}: {}",
+                    error.path(),
+                    error.class(),
+                    error.diagnostic()
+                );
             }
         }
     }

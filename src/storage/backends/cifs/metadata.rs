@@ -20,9 +20,9 @@ pub(super) struct CifsInlineMetadata {
     pub(super) created: std::time::SystemTime,
     /// `FILE_ATTRIBUTE_READONLY`, when the operation that produced this record carried it.
     ///
-    /// `QUERY_DIRECTORY` records carry the attribute, so `list` fills it. A metadata open does
-    /// not: `smb_domain::ResourceMetadata` exposes only the four timestamps and the length, so
-    /// `metadata` leaves it `None` rather than inventing a writable entry.
+    /// Both `QUERY_DIRECTORY` records and the `CREATE` response snapshot carry the attribute,
+    /// so `list` and `metadata` fill it. It stays optional for protocols whose records omit it,
+    /// so an unknown attribute is never reported as a writable entry.
     pub(super) readonly: Option<bool>,
 }
 
@@ -364,6 +364,7 @@ mod tests {
                     kind: crate::model::EntryKind::File,
                     size: 4,
                     identity: bytes::Bytes::from_static(b"source-version"),
+                    file_id: None,
                     maximum_read_chunk: 1024,
                 },
                 accessed: std::time::UNIX_EPOCH,

@@ -49,9 +49,9 @@ pub struct SourceDescriptor {
     ///
     /// It is a display-grade value for enumeration output, never an input to metadata
     /// application: a backend that cannot observe real ownership still reports
-    /// `ownership_mode` as unsupported through the [`Metadata`] role. On CIFS only the
-    /// `QUERY_DIRECTORY` path can derive it (from `FILE_ATTRIBUTE_READONLY`); a metadata open
-    /// carries no attribute bits at all.
+    /// `ownership_mode` as unsupported through the [`Metadata`] role. On CIFS it is derived
+    /// from `FILE_ATTRIBUTE_READONLY`, which listings carry; the `Stat` verb builds its
+    /// descriptor from facts without the attribute and leaves it `None`.
     pub(crate) inline_mode: Option<u32>,
 }
 

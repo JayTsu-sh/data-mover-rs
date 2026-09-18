@@ -156,7 +156,7 @@ async fn probe_clock_and_precision(share: &smb_domain::Share) -> Result {
     let skew_ms = i128::try_from(written.as_millis())? - i128::try_from(local.as_millis())?;
     println!(
         "[probe] server clock skew vs local: {skew_ms} ms; written timestamp sub-100ns remainder: {} \
-         (facade exposes created/accessed/written/changed/len only; no attributes, owner, or mode)",
+         (facade exposes timestamps, len, readonly/reparse attributes and the QFid file id; no owner or POSIX mode)",
         written.subsec_nanos() % 100
     );
     Ok(())

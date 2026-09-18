@@ -15,8 +15,19 @@ use crate::storage::{ByteStream, ReadRequest, ReadSource, SourceDescriptor, Stor
 pub(super) struct CifsSourceFacts {
     pub(super) kind: EntryKind,
     pub(super) size: u64,
+    /// Path-scoped identity payload (`len + written + changed`), used when no file id is
+    /// available and always recorded as the content version.
     pub(super) identity: Bytes,
+    /// Server-assigned 64-bit file identifier, stable across renames within the volume.
+    /// `None` when the server offers none (FAT, a rejected info class, no `QFid` answer).
+    pub(super) file_id: Option<u64>,
     pub(super) maximum_read_chunk: u32,
+}
+
+/// Encodes a file identifier the way the legacy `NASEntry.file_handle` did: 16 big-endian
+/// bytes, so base tables built from older scans keep joining on the same string.
+pub(super) fn file_handle_bytes(file_id: u64) -> Bytes {
+    Bytes::copy_from_slice(&u128::from(file_id).to_be_bytes())
 }
 
 #[async_trait]
@@ -218,23 +229,32 @@ pub(super) fn descriptor_from_facts(
     facts: &CifsSourceFacts,
     operation: Operation,
 ) -> Result<SourceDescriptor, StorageRoleFailure> {
-    let mut identity_bytes =
-        BytesMut::with_capacity(path.as_str().len() + facts.identity.len() + 8);
-    identity_bytes.put_u32(u32::try_from(path.as_str().len()).unwrap_or(u32::MAX));
-    identity_bytes.extend_from_slice(path.as_str().as_bytes());
-    identity_bytes.extend_from_slice(&facts.identity);
-    let source_identity = SourceIdentity::new(
-        identity.clone(),
-        IdentityStrength::PathScoped,
-        identity_bytes.freeze(),
-    )
+    // With a file id the identity is the file id alone — the same role the NFS file handle
+    // plays — so it survives renames and edits; the content version below is what detects
+    // modification. Without one, fall back to the path-scoped payload as before.
+    let source_identity = if let Some(file_id) = facts.file_id {
+        SourceIdentity::new(
+            identity.clone(),
+            IdentityStrength::StableWithinBackend,
+            file_handle_bytes(file_id),
+        )
+    } else {
+        let mut identity_bytes =
+            BytesMut::with_capacity(path.as_str().len() + facts.identity.len() + 8);
+        identity_bytes.put_u32(u32::try_from(path.as_str().len()).unwrap_or(u32::MAX));
+        identity_bytes.extend_from_slice(path.as_str().as_bytes());
+        identity_bytes.extend_from_slice(&facts.identity);
+        SourceIdentity::new(
+            identity.clone(),
+            IdentityStrength::PathScoped,
+            identity_bytes.freeze(),
+        )
+    }
     .map_err(|_| entry_failure(path, operation, FailureClass::Protocol))?;
-    Ok(SourceDescriptor::new(
-        path.clone(),
-        facts.kind,
-        Some(facts.size),
-        source_identity,
-    ))
+    let mut descriptor =
+        SourceDescriptor::new(path.clone(), facts.kind, Some(facts.size), source_identity);
+    descriptor.content_version = Some(facts.identity.clone());
+    Ok(descriptor)
 }
 
 pub(super) fn classify(
@@ -242,6 +262,11 @@ pub(super) fn classify(
     operation: Operation,
     error: &smb_domain::Error,
 ) -> StorageRoleFailure {
+    // The facade's `Display` carries the NT status or the transport reason and never the
+    // credentials, so it can ride along as the redacted diagnostic; without it a `Protocol`
+    // fallback is undiagnosable from the caller's side.
+    // `required` rejects NUL, and a few facade variants carry server-derived strings.
+    let diagnostic = format!("CIFS {operation:?} failed: {error}").replace('\0', "\\0");
     let (class, transience) = match error {
         smb_domain::Error::ReceivedErrorMessage(status, _)
         | smb_domain::Error::UnexpectedMessageStatus(status) => classify_status(*status),
@@ -265,20 +290,20 @@ pub(super) fn classify(
                     operation,
                     FailureClass::Connectivity,
                     Transience::Unknown,
-                    "CIFS session failed",
+                    diagnostic,
                 )
-                .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
+                .unwrap_or_else(|_| unreachable!("prefixed, NUL-free diagnostic is valid")),
             );
         }
         _ => (FailureClass::Protocol, Transience::Unknown),
     };
     if class == FailureClass::Connectivity {
         return StorageRoleFailure::Session(
-            BackendSessionFailure::new(operation, class, transience, "CIFS session failed")
-                .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
+            BackendSessionFailure::new(operation, class, transience, diagnostic)
+                .unwrap_or_else(|_| unreachable!("prefixed, NUL-free diagnostic is valid")),
         );
     }
-    entry_failure_with_transience(path, operation, class, transience)
+    entry_failure_with_transience(path, operation, class, transience, &diagnostic)
 }
 
 fn classify_status(status: u32) -> (FailureClass, Transience) {
@@ -333,6 +358,7 @@ pub(super) fn entry_failure(
         } else {
             Transience::Permanent
         },
+        "CIFS entry operation failed",
     )
 }
 
@@ -341,16 +367,11 @@ fn entry_failure_with_transience(
     operation: Operation,
     class: FailureClass,
     transience: Transience,
+    diagnostic: &str,
 ) -> StorageRoleFailure {
     StorageRoleFailure::Entry(
-        EntryOperationFailure::new(
-            path.clone(),
-            operation,
-            class,
-            transience,
-            "CIFS entry operation failed",
-        )
-        .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
+        EntryOperationFailure::new(path.clone(), operation, class, transience, diagnostic)
+            .unwrap_or_else(|_| unreachable!("prefixed, NUL-free diagnostic is valid")),
     )
 }
 

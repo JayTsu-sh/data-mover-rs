@@ -12,7 +12,7 @@ mod writer;
 
 use std::sync::Arc;
 
-pub(crate) use protocol::ensure_root;
+pub(crate) use protocol::{ensure_root, probe_identity_mode};
 
 use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
@@ -23,6 +23,7 @@ pub(crate) fn connect(
     identity: BackendIdentity,
     read_inflight: std::num::NonZeroUsize,
     write_inflight: std::num::NonZeroUsize,
+    use_file_ids: bool,
 ) -> Result<Storage, Box<dyn std::error::Error>> {
     if identity.kind() != BackendKind::Cifs {
         return Err("CIFS roles require a CIFS backend identity".into());
@@ -33,7 +34,7 @@ pub(crate) fn connect(
         CapabilityAvailability::Supported,
         CapabilityAvailability::Supported,
     );
-    let protocol = Arc::new(protocol::SmbDomainProtocol::new(share, root));
+    let protocol = Arc::new(protocol::SmbDomainProtocol::new(share, root, use_file_ids));
     let source = Arc::new(
         source::CifsReadSource::new(Arc::clone(&protocol), identity.clone())
             .with_read_inflight(read_inflight),

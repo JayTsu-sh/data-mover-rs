@@ -60,6 +60,7 @@ impl CifsNamespaceProtocol for RecordingProtocol {
             },
             size: 7,
             identity: Bytes::from_static(b"stat-identity"),
+            file_id: None,
             maximum_read_chunk: 4,
         })
     }
@@ -374,6 +375,7 @@ impl CifsNamespaceProtocol for ListingProtocol {
             kind: EntryKind::File,
             size: 7,
             identity: Bytes::from_static(b"stat-identity"),
+            file_id: None,
             maximum_read_chunk: 4,
         })
     }
@@ -395,6 +397,7 @@ impl CifsNamespaceProtocol for ListingProtocol {
                             kind: *kind,
                             size: 3,
                             identity: Bytes::from_static(b"listed"),
+                            file_id: None,
                             maximum_read_chunk: u32::MAX,
                         },
                         accessed: stamp,

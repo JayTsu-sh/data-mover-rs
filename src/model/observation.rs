@@ -90,6 +90,19 @@ impl SourceIdentity {
         self.strength
     }
 
+    /// The identity bytes, only when they are a rename-stable key.
+    ///
+    /// `Some` for `StableWithinBackend` identities — the NFS file handle, the CIFS file id
+    /// (16 big-endian bytes, matching the legacy `NASEntry.file_handle` encoding) — which a
+    /// consumer may use as a `file_handle`-style join key across scans. `None` for
+    /// `PathScoped` and `VersionScoped` identities: their bytes change with the path or the
+    /// object version, so joining on them would turn every rename into a delete plus a create.
+    #[must_use]
+    pub fn stable_bytes(&self) -> Option<&[u8]> {
+        matches!(self.strength, IdentityStrength::StableWithinBackend)
+            .then_some(self.stable_bytes.as_slice())
+    }
+
     /// Derives the fixed opaque comparison key. This is not a content hash.
     #[must_use]
     pub fn identity_key(&self) -> EntryIdentityKey {
@@ -327,7 +340,13 @@ impl ObservedEntry {
     pub const fn identity_key(&self) -> EntryIdentityKey {
         self.identity_key
     }
-    pub(crate) const fn source_identity(&self) -> &SourceIdentity {
+    /// The identity the source reported, with its [`IdentityStrength`].
+    ///
+    /// Consumers that detect renames key on this: `StableWithinBackend` identities (NFS file
+    /// handle, CIFS file id) survive a rename and map to a `file_handle`-style join key, while
+    /// `PathScoped` ones must be treated as absent so the join falls back to paths.
+    #[must_use]
+    pub const fn source_identity(&self) -> &SourceIdentity {
         &self.source_identity
     }
     /// Returns the owning backend kind.

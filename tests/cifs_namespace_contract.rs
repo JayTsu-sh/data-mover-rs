@@ -1,5 +1,7 @@
 //! Optional real SMB namespace-role contract, confined to unique entry names.
-use data_mover::model::{BackendIdentity, BackendKind, EntryKind, FailureClass, StoragePath};
+use data_mover::model::{
+    BackendIdentity, BackendKind, EntryKind, FailureClass, IdentityStrength, StoragePath,
+};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, Namespace,
     NamespaceRequest, NamespaceResult, PreflightPolicy, Storage, StorageRoleFailure,
@@ -96,6 +98,29 @@ async fn exercise_listing(namespace: &dyn Namespace, dir: &str, file: &str) -> R
         stat.source_identity.identity_key(),
         "List and Stat must agree on identity for an unchanged entry"
     );
+    // The server must have answered with a file id on both paths — the wide directory class
+    // for List and the QFid create context for Stat — or rename detection silently degrades to
+    // path joins. Print which one we got so a real-server run leaves evidence either way.
+    println!(
+        "[identity] strength={:?} (List) / {:?} (Stat)",
+        listed[0].source_identity.strength(),
+        stat.source_identity.strength()
+    );
+    // The connect-time probe turns file ids off on *both* paths when either half is missing, so a
+    // PathScoped result here does not say which half failed: look for the connect-time warn
+    // ("file id available on only one path" / "root is empty" / "probe failed") to tell them
+    // apart.
+    assert_eq!(
+        listed[0].source_identity.strength(),
+        IdentityStrength::StableWithinBackend,
+        "session is not using file ids (see the connect-time identity-probe warning): the wide \
+         directory class or the QFid create context was unavailable, or the root was empty"
+    );
+    assert_eq!(
+        stat.source_identity.strength(),
+        IdentityStrength::StableWithinBackend,
+        "session is not using file ids (see the connect-time identity-probe warning)"
+    );
     let directory = single(
         namespace
             .execute(NamespaceRequest::Stat(path(dir)?))
@@ -107,6 +132,11 @@ async fn exercise_listing(namespace: &dyn Namespace, dir: &str, file: &str) -> R
 
 /// Rename moves `from` onto `to`, replacing an existing destination like the NFS and HDFS roles.
 async fn exercise_rename(namespace: &dyn Namespace, from: &str, to: &str) -> Result {
+    let before = single(
+        namespace
+            .execute(NamespaceRequest::Stat(path(from)?))
+            .await?,
+    )?;
     completed(
         namespace
             .execute(NamespaceRequest::Rename {
@@ -115,6 +145,12 @@ async fn exercise_rename(namespace: &dyn Namespace, from: &str, to: &str) -> Res
             })
             .await?,
     )?;
+    let after = single(namespace.execute(NamespaceRequest::Stat(path(to)?)).await?)?;
+    assert_eq!(
+        before.source_identity.identity_key(),
+        after.source_identity.identity_key(),
+        "a rename must not change the identity — this is the property rename detection relies on"
+    );
     expect_class(
         namespace.execute(NamespaceRequest::Stat(path(from)?)).await,
         FailureClass::NotFound,

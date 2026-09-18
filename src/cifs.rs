@@ -13,12 +13,16 @@ use std::num::NonZeroUsize;
 
 use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::Storage;
+use crate::storage::backends::cifs;
 use crate::transfer_concurrency::TransferConcurrency;
 
 /// Builds the architecture-ready CIFS role handle from a connected smb-rs share.
 ///
 /// With `ensure_dir`, missing components of `root` are created first (legacy
-/// `ensure_root_exists`); without it the root is used lazily and never probed.
+/// `ensure_root_exists`); without it the root is never created here. Either way the connect
+/// then runs one identity probe (the root listed once, the first of its entries that will open
+/// opened once) to decide whether this session may use file ids as identity; the probe never
+/// fails the connect, it only falls back to path-scoped identities with a warning.
 ///
 /// # Errors
 /// Returns an error when the identity is not CIFS, when a root component exists but is not a
@@ -30,15 +34,19 @@ pub async fn create_cifs_role_storage(
     identity: BackendIdentity,
 ) -> std::result::Result<Storage, Box<dyn std::error::Error>> {
     if ensure_dir && let Some(root) = root.as_deref() {
-        crate::storage::backends::cifs::ensure_root(&share, root).await?;
+        cifs::ensure_root(&share, root).await?;
     }
+    // The root's first entry, listed and opened once, decides whether this session may use file
+    // ids as identity; see `protocol::probe_identity_mode`. Never fails the connect.
+    let use_file_ids = cifs::probe_identity_mode(&share, root.as_deref()).await;
     let concurrency =
         TransferConcurrency::from_env(BackendKind::Cifs, TransferConcurrency::defaults(8, 8))?;
-    crate::storage::backends::cifs::connect(
+    cifs::connect(
         share,
         root,
         identity,
         NonZeroUsize::new(concurrency.read()).ok_or("invalid CIFS read depth")?,
         NonZeroUsize::new(concurrency.write()).ok_or("invalid CIFS write depth")?,
+        use_file_ids,
     )
 }

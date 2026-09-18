@@ -112,6 +112,10 @@ CIFS 只有 role-based 实现，不经过 `StorageError`；映射表在
 `InvalidArgument` → InvalidInput；`UnsupportedOperation` → Unsupported；`Cancelled` → Cancelled；
 `ConnectionStopped` / `SessionInvalidated` / `RuntimeTerminated` / `TransportError` → session 级 Connectivity。
 legacy 的"`OBJECT_NAME_COLLISION` 当成功"已随 #150 删除：role 返回 `Conflict`，由调用方决定是否幂等。
+`classify` 产出的 diagnostic 是 `CIFS {Operation} failed: {smb 错误 Display}` (去掉 NUL)：
+smb-rs 的 Display 只含 NTSTATUS / 传输原因 / UNC 路径，不含凭据。之前是固定文案
+"CIFS entry operation failed"，`Protocol` 兜底一旦命中就无从定位 (2026-09-18 的中途丢流
+问题就是靠这行文本才找到的)。
 
 ### Local
 

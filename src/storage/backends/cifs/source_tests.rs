@@ -10,10 +10,17 @@ use futures::stream;
 
 use super::metadata::CifsInlineMetadata;
 use super::namespace::{CifsNamespace, CifsNamespaceProtocol};
-use super::source::{CifsReadCursor, CifsReadSource, CifsSourceFacts, CifsSourceProtocol};
-use crate::model::{BackendIdentity, BackendKind, EntryKind, StoragePath};
-use crate::storage::{Namespace, NamespaceRequest, NamespaceResult, ReadRequest, ReadSource};
-use crate::storage::{SourceQosGroup, SourceQosPolicy};
+use super::source::{
+    CifsReadCursor, CifsReadSource, CifsSourceFacts, CifsSourceProtocol, descriptor_from_facts,
+    file_handle_bytes,
+};
+use crate::model::{
+    BackendIdentity, BackendKind, EntryKind, IdentityStrength, Operation, StoragePath,
+};
+use crate::storage::{
+    Namespace, NamespaceRequest, NamespaceResult, ReadRequest, ReadSource, SourceQosGroup,
+    SourceQosPolicy,
+};
 
 const REAL_RECOVERY_BINDING: [u8; 32] = [11; 32];
 const REAL_RECOVERY_CLAIM: [u8; 32] = [12; 32];
@@ -24,6 +31,7 @@ struct MemoryCifs {
     described_identity: Bytes,
     opened_identity: Bytes,
     closes: Arc<AtomicUsize>,
+    file_id: Option<u64>,
 }
 
 struct MemoryCursor {
@@ -61,6 +69,7 @@ impl CifsSourceProtocol for MemoryCifs {
             kind: EntryKind::File,
             size: self.payload.len() as u64,
             identity: self.described_identity.clone(),
+            file_id: self.file_id,
             maximum_read_chunk: 4,
         })
     }
@@ -79,6 +88,7 @@ impl CifsSourceProtocol for MemoryCifs {
                 kind: EntryKind::File,
                 size: self.payload.len() as u64,
                 identity: self.opened_identity.clone(),
+                file_id: self.file_id,
                 maximum_read_chunk: 4,
             },
         ))
@@ -117,6 +127,7 @@ impl CifsNamespaceProtocol for MemoryCifs {
                         kind: EntryKind::File,
                         size: 10,
                         identity: Bytes::from_static(b"child-file"),
+                        file_id: None,
                         maximum_read_chunk: 4,
                     },
                     accessed: stamp,
@@ -133,6 +144,7 @@ impl CifsNamespaceProtocol for MemoryCifs {
                         kind: EntryKind::Directory,
                         size: 0,
                         identity: Bytes::from_static(b"child-directory"),
+                        file_id: None,
                         maximum_read_chunk: u32::MAX,
                     },
                     accessed: stamp,
@@ -154,6 +166,7 @@ async fn source_stream_honours_negotiated_chunks_without_short_reads()
         described_identity: Bytes::from_static(b"file-identity"),
         opened_identity: Bytes::from_static(b"file-identity"),
         closes: Arc::new(AtomicUsize::new(0)),
+        file_id: None,
     });
     let source = CifsReadSource::new(
         Arc::clone(&protocol),
@@ -205,6 +218,7 @@ async fn active_source_cancellation_stops_prefetch_and_closes()
         described_identity: Bytes::from_static(b"file-identity"),
         opened_identity: Bytes::from_static(b"file-identity"),
         closes: Arc::new(AtomicUsize::new(0)),
+        file_id: None,
     });
     let source = CifsReadSource::new(
         Arc::clone(&protocol),
@@ -246,6 +260,7 @@ async fn opened_identity_change_fails_before_read_and_closes_resource()
         described_identity: Bytes::from_static(b"observed"),
         opened_identity: Bytes::from_static(b"replaced"),
         closes: Arc::new(AtomicUsize::new(0)),
+        file_id: None,
     });
     let source = CifsReadSource::new(
         Arc::clone(&protocol),
@@ -290,6 +305,7 @@ async fn source_qos_limits_each_real_read_and_accounts_only_source_io()
         described_identity: Bytes::from_static(b"stable"),
         opened_identity: Bytes::from_static(b"stable"),
         closes: Arc::new(AtomicUsize::new(0)),
+        file_id: None,
     });
     let source = CifsReadSource::new(
         Arc::clone(&protocol),
@@ -335,6 +351,7 @@ async fn namespace_list_returns_neutral_child_descriptors() -> Result<(), Box<dy
         described_identity: Bytes::from_static(b"directory"),
         opened_identity: Bytes::from_static(b"directory"),
         closes: Arc::new(AtomicUsize::new(0)),
+        file_id: None,
     });
     let namespace = CifsNamespace::new(
         protocol,
@@ -377,12 +394,14 @@ async fn real_share_exercises_domain_roles_without_wire_api()
     let share = client
         .connect_share(&target, smb_domain::Credentials::ntlm(username, password))
         .await?;
+    let use_file_ids = super::probe_identity_mode(&share, root.as_deref()).await;
     let storage = super::connect(
         share,
         root,
         BackendIdentity::new(BackendKind::Cifs, format!("{server}/{share_name}"))?,
         std::num::NonZeroUsize::new(8).ok_or("zero read depth")?,
         std::num::NonZeroUsize::new(8).ok_or("zero write depth")?,
+        use_file_ids,
     )?;
     let policy = crate::storage::PreflightPolicy::production();
     let namespace = storage.namespace(&policy)?;
@@ -506,12 +525,14 @@ impl RealCifsConfig {
                 smb_domain::Credentials::ntlm(self.username.clone(), self.password.clone()),
             )
             .await?;
+        let use_file_ids = super::probe_identity_mode(&share, self.root.as_deref()).await;
         let storage = super::connect(
             share.clone(),
             self.root.clone(),
             self.identity.clone(),
             std::num::NonZeroUsize::new(8).ok_or("zero read depth")?,
             std::num::NonZeroUsize::new(8).ok_or("zero write depth")?,
+            use_file_ids,
         )?;
         Ok(RealConnection {
             client,
@@ -871,4 +892,142 @@ fn real_not_found(error: &smb_domain::Error) -> bool {
         ),
         _ => false,
     }
+}
+
+fn facts_with(file_id: Option<u64>, identity: &'static [u8]) -> CifsSourceFacts {
+    CifsSourceFacts {
+        kind: EntryKind::File,
+        size: 10,
+        identity: Bytes::from_static(identity),
+        file_id,
+        maximum_read_chunk: 4,
+    }
+}
+
+#[test]
+fn a_file_id_makes_the_identity_rename_stable() -> Result<(), Box<dyn std::error::Error>> {
+    let backend = BackendIdentity::new(BackendKind::Cifs, "cifs-identity-test")?;
+    let before = descriptor_from_facts(
+        &backend,
+        &StoragePath::new("dir/old-name.bin")?,
+        &facts_with(Some(0x1234_5678_9abc_def0), b"v1"),
+        Operation::Observe,
+    )?;
+    let after = descriptor_from_facts(
+        &backend,
+        &StoragePath::new("elsewhere/new-name.bin")?,
+        &facts_with(Some(0x1234_5678_9abc_def0), b"v2"),
+        Operation::Observe,
+    )?;
+    assert_eq!(
+        before.source_identity.strength(),
+        IdentityStrength::StableWithinBackend
+    );
+    assert_eq!(
+        before.source_identity.identity_key(),
+        after.source_identity.identity_key(),
+        "same file id ⇒ same identity across a rename and an edit — that is what rename \
+         detection joins on"
+    );
+    assert_ne!(
+        before.content_version, after.content_version,
+        "the edit is still visible through the content version"
+    );
+    assert_eq!(
+        before.source_identity.stable_bytes(),
+        Some(&file_handle_bytes(0x1234_5678_9abc_def0)[..]),
+        "a stable identity exposes its bytes as the consumer's join key"
+    );
+    Ok(())
+}
+
+#[test]
+fn file_handle_bytes_are_sixteen_big_endian_bytes_with_a_zero_high_half() {
+    assert_eq!(
+        file_handle_bytes(0x1234_5678_9abc_def0).as_ref(),
+        &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0
+        ],
+        "byte-for-byte what the legacy NASEntry.file_handle carried when the high half was zero"
+    );
+}
+
+#[test]
+fn without_a_file_id_the_identity_stays_path_scoped_and_changes_with_the_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let backend = BackendIdentity::new(BackendKind::Cifs, "cifs-identity-test")?;
+    let here = descriptor_from_facts(
+        &backend,
+        &StoragePath::new("a.bin")?,
+        &facts_with(None, b"same"),
+        Operation::Observe,
+    )?;
+    let there = descriptor_from_facts(
+        &backend,
+        &StoragePath::new("b.bin")?,
+        &facts_with(None, b"same"),
+        Operation::Observe,
+    )?;
+    assert_eq!(
+        here.source_identity.strength(),
+        IdentityStrength::PathScoped
+    );
+    assert_ne!(
+        here.source_identity.identity_key(),
+        there.source_identity.identity_key(),
+        "no file id ⇒ a rename looks like a different entry, and the consumer must fall back \
+         to path joins"
+    );
+    assert_eq!(here.content_version.as_deref(), Some(&b"same"[..]));
+    assert_eq!(
+        here.source_identity.stable_bytes(),
+        None,
+        "a path-scoped identity is not a join key and must read as absent"
+    );
+    Ok(())
+}
+
+/// The other half of `opened_identity_change_fails_before_read_and_closes_resource`: with a
+/// file id the identity is the file id, so a content change between describe and open is no
+/// longer a conflict — that is the same contract the NFS file handle gives, and the content
+/// version is what records the change.
+#[tokio::test]
+async fn with_a_file_id_an_edited_source_still_opens_because_identity_is_the_file_id()
+-> Result<(), Box<dyn std::error::Error>> {
+    let protocol = Arc::new(MemoryCifs {
+        payload: Bytes::from_static(b"payload"),
+        reads: Arc::new(Mutex::new(Vec::new())),
+        described_identity: Bytes::from_static(b"observed"),
+        opened_identity: Bytes::from_static(b"replaced"),
+        closes: Arc::new(AtomicUsize::new(0)),
+        file_id: Some(42),
+    });
+    let source = CifsReadSource::new(
+        Arc::clone(&protocol),
+        BackendIdentity::new(BackendKind::Cifs, "test-share")?,
+    );
+    let path = StoragePath::new("file.bin")?;
+    let descriptor = source.describe(&path).await?;
+    assert_eq!(
+        descriptor.source_identity.strength(),
+        IdentityStrength::StableWithinBackend
+    );
+    let mut stream = source
+        .read(ReadRequest {
+            path,
+            range: None,
+            expected_source: Some(descriptor.source_identity),
+            maximum_chunk_bytes: 1024 * 1024,
+            read_inflight: 4,
+            read_budget: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            source_qos: None,
+        })
+        .await?;
+    let mut rebuilt = Vec::new();
+    while let Some(chunk) = stream.next().await.transpose()? {
+        rebuilt.extend_from_slice(&chunk);
+    }
+    assert_eq!(rebuilt, b"payload");
+    Ok(())
 }
