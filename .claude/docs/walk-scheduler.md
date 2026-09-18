@@ -1,5 +1,9 @@
 # Walk Scheduler (work-stealing)
 
+> 本页只讲 **legacy** `StorageEnum::walkdir` 的 work-stealing 调度。role-based 遍历
+> (`traversal::StorageTraversalSource`) 用的是另一套：深度优先块顺序 + 列举预读，见
+> `.claude/docs/architecture.md` 与 `src/traversal/storage/cursor.rs`。
+
 ## 文件
 
 - `src/walk_scheduler.rs` (147 行) — `WorkerContext<T>`。

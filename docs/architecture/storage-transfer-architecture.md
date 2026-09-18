@@ -291,10 +291,18 @@ await the session completion and receive `Ok(TraversalCompletion)` before commit
 generation or enabling deletion. Paging and backend concurrency are hidden in the traversal
 implementation.
 
-The default `Admission` order emits results in the sequence assigned by the backend enumerator.
-Concurrent observation may finish out of order, but cannot change delivery order. Both the
+The default `Admission` order is depth-first by blocks: all children of one listed directory,
+in the order the backend listed them, then the block of each subdirectory descended into, in the
+same order, recursively. A directory's children therefore always follow the directory, and one
+listing's children are contiguous. Directory listings are prefetched concurrently ahead of the
+admission point (deepest first) under a listing budget of `min(max_inflight_operations, 64)`,
+separate from the observation window, so memory stays proportional to depth × fan-out rather
+than to the width of a tree level. Listings and observations may finish out of order, but
+cannot change delivery order: sequence numbers are assigned only in admission order. Both the
 admission window and item channel are bounded, so a slow consumer backpressures enumeration
-without allowing the reorder buffer to grow without limit.
+without allowing the reorder buffer to grow without limit. Backend operations already started
+are never aborted on cancellation or termination; they run to completion in the background so
+any handle they opened is closed.
 
 Terrasync projects this same stream in three ways:
 

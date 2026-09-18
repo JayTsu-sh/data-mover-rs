@@ -40,7 +40,7 @@ Backend 实现 (nfs.rs / s3.rs / local.rs / hdfs.rs)
 ```
 Storage (roles)
     │
-    ├──→ traversal::StorageTraversalSource   Namespace::List + Metadata → TraversalItem 流
+    ├──→ traversal::StorageTraversalSource   Namespace::List + Metadata → TraversalItem 流 (深度优先块顺序 + 列举预读)
     ├──→ ndx_walk (crate 根)                 Namespace::List → dir_tree::run_dfs_driver → NdxEvent
     ├──→ storage::delete_tree                Namespace::{List,Delete} → DeleteTreeItem 流
     ├──→ storage::create_directory_all       Namespace::{CreateDirectory,Stat} 逐层创建
@@ -50,6 +50,13 @@ Storage (roles)
 `ndx_walk` 是 legacy `walkdir_2` 的中立替身：DFS 栈、预读窗口、NDX / gap 编号仍归
 `src/dir_tree.rs` 的 `run_dfs_driver`(那部分本来就后端无关)，这里只负责列举取数、按名排序、
 以及把 `SourceDescriptor` 反拼成 `NdxEvent` 载荷要的 `EntryEnum::NAS`。
+
+`StorageTraversalSource` 的调度 (`src/traversal/storage.rs` + `storage/{cursor,observe}.rs`)：
+准入游标按"块"走深度优先 —— 一个目录的子项按列举顺序连续输出，再依次下钻各子目录；序号只由
+游标分配，重排缓冲按序号输出，所以列举/观察乱序完成不影响顺序。列举预读额度
+`min(max_inflight_operations, 64)`，与观察窗口分开；游标马上需要的列举不计额度 (防饿死)。
+取消或结束时在途的列举和观察都 detach 而非 abort (CIFS 句柄)。P3 的 `DirectoryComplete`
+挂在 `Cursor::advance` 里"块已全部准入"那一步。
 
 **覆盖面**：
 
