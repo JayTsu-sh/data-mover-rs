@@ -200,7 +200,11 @@ async fn run(
         items: &items,
     };
     let result = enumerate_and_observe(&runtime, &mut directories, &mut tasks, &mut state).await;
-    tasks.abort_all();
+    // Never abort an observation: a backend may hold an open handle between two awaits (CIFS
+    // opens, reads attributes, then closes), and dropping the future there leaks it. Detached
+    // observations run to completion in the background and close what they opened; there are
+    // at most `max_inflight_operations` of them, and their results are simply discarded.
+    tasks.detach_all();
     drop(items);
     let terminal = if request.cancel.is_cancelled() {
         Ok(TraversalOutcome::Cancelled)
