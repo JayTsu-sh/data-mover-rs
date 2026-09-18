@@ -28,7 +28,8 @@
 | **新增/修改 `StorageEnum` 操作** | `.claude/docs/storage-enum-dispatch.md` + `src/storage_enum.rs` (1334 行) |
 | 改 filter DSL (lexer / `should_skip` 三元组) | `.claude/docs/filter-dsl.md` + `src/filter.rs` (4849 行) + `src/filter_traversal.rs` (role-based 适配器) |
 | 改 walk 调度 / work-stealing | `.claude/docs/walk-scheduler.md` + `src/walk_scheduler.rs` + `src/async_receiver.rs` |
-| 改 role-based 遍历 (filter / max_depth / inline 观察) | `src/traversal/{mod,storage,local}.rs` + `src/filter_traversal.rs` + `examples/storage_role_operations.rs` |
+| 改 role-based 遍历 (filter / max_depth / inline 观察) | `src/traversal/{mod,storage}.rs` (唯一实现，`local_tests.rs` 用真文件系统测它) + `src/filter_traversal.rs` + `examples/storage_role_operations.rs` |
+| 改 Local namespace 角色 (逐段不跟随 symlink) | `.claude/docs/storage-local.md` "Namespace 角色" + `src/storage/backends/local/namespace.rs` |
 | 改递归删除 | `src/storage/delete_tree.rs` (走 `Namespace` 角色，backend 无关) |
 | 改 NDX 分页遍历 (legacy walkdir_2 的中立替身) | `src/ndx_walk.rs` (crate 根，与 `filter_traversal` 同层) + `src/dir_tree.rs` (`run_dfs_driver` 不要动) |
 | 改递归建目录 | `src/storage/create_dir.rs` (走 `Namespace` 角色，backend 无关) |

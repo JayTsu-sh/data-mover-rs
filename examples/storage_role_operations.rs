@@ -35,8 +35,7 @@ use data_mover::storage::{
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
-    LocalTraversalSource, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest,
-    TraversalSession, TraversalSource as _,
+    StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest, TraversalSource as _,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -161,23 +160,6 @@ async fn connect(backend: Backend, root: &str, side: &str, depth: usize) -> Resu
     Ok(connect_backend(config).await?)
 }
 
-/// Local lends no namespace role, so it uses its own sandboxed traversal; every other backend
-/// composes the namespace and metadata roles.
-fn open_traversal(
-    storage: &Storage,
-    args: &Args,
-    request: TraversalRequest,
-) -> Result<TraversalSession, Error> {
-    Ok(match args.backend {
-        Backend::Local => LocalTraversalSource::new(
-            &args.root,
-            BackendIdentity::new(BackendKind::Local, format!("source:{}", args.root))?,
-        )?
-        .traverse(request),
-        Backend::Cifs | Backend::Nfs => StorageTraversalSource::new(storage)?.traverse(request),
-    })
-}
-
 async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(), Error> {
     let Command::Traverse {
         match_expression,
@@ -201,7 +183,7 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
         filter: (!filter.is_empty()).then(|| Arc::new(filter) as Arc<_>),
         max_depth: max_depth.and_then(NonZeroUsize::new),
     };
-    let mut session = open_traversal(storage, args, request)?;
+    let mut session = StorageTraversalSource::new(storage)?.traverse(request);
     let (mut entries, mut failures) = (0_u64, 0_u64);
     while let Some(item) = session.next_item().await {
         match item {

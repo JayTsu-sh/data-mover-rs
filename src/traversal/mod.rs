@@ -12,12 +12,12 @@ use crate::model::{
     StoragePath, StorageTimestamp,
 };
 
-mod local;
 mod storage;
-pub use local::LocalTraversalSource;
 pub use storage::StorageTraversalSource;
 #[cfg(test)]
 mod hdfs_tests;
+#[cfg(test)]
+mod local_tests;
 
 /// Traversal output order. Concurrent completion never changes admission order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,8 +102,9 @@ pub struct TraversalRequest {
 
 /// Re-expresses a backend-relative path in the traversal root's frame of reference.
 ///
-/// The leading `./` that the Local enumerator produces for a root-relative walk is stripped, so
-/// a `path` expression written against the scan root matches on every backend.
+/// A leading `./` is stripped, so a `path` expression written against the scan root matches
+/// however the path was spelled. No backend emits one today; the Local namespace role spells
+/// root children without it.
 ///
 /// The root only matches on a component boundary. A raw string prefix would rewrite a sibling
 /// that merely starts with the root's spelling — `keeper/a` under root `keep` would become

@@ -140,8 +140,8 @@ walk_scheduler 不感知 filter — filter 是 walkdir 实现层调的，走 enu
 role-based 路径同理：`traversal` 模块不依赖 `crate::filter` (架构依赖校验禁止)，
 只认 `TraversalFilter` trait；DSL 适配器在 crate 根的 `src/filter_traversal.rs`。
 
-两个遍历实现都接这个接缝：Local 走 `traversal::LocalTraversalSource` (它没有 Namespace 角色，
-枚举在 cap-std 沙箱里)，其余 backend 走 `traversal::StorageTraversalSource`。
+只有一个遍历实现接这个接缝：`traversal::StorageTraversalSource`，出借 Namespace 角色的
+backend (Local / NFS / CIFS / HDFS) 都走它。
 可运行入口见 `examples/storage_role_operations.rs`。
 
 ## 已知陷阱

@@ -148,6 +148,50 @@ pub(crate) fn test_destination_storage_with_role(
     Ok((storage, destination))
 }
 
+/// A traversal-only storage plus the two roles it lends, so tests can drive their probes.
+#[cfg(test)]
+pub(crate) type TraversalStorage = (
+    Storage,
+    Arc<namespace::LocalNamespace>,
+    Arc<observation::LocalObservationAdapter>,
+);
+
+/// Storage lending only the namespace and metadata roles, which is what traversal borrows.
+#[cfg(test)]
+pub(crate) fn test_traversal_storage(
+    root: &Path,
+    name: &str,
+) -> Result<TraversalStorage, Box<dyn std::error::Error>> {
+    let identity = test_identity(name);
+    let sandbox = open_root(root)?;
+    let namespace = Arc::new(namespace::LocalNamespace::from_root(
+        Arc::clone(&sandbox),
+        identity.clone(),
+    ));
+    let metadata = Arc::new(observation::LocalObservationAdapter::from_root(
+        sandbox,
+        identity.clone(),
+    ));
+    let unavailable = CapabilityAvailability::Unsupported(crate::storage::UnsupportedReason::new(
+        "not supplied",
+    )?);
+    let storage = Storage::connected(
+        identity,
+        BackendCapabilities::new(
+            unavailable.clone(),
+            unavailable,
+            CapabilityAvailability::Supported,
+            CapabilityAvailability::Supported,
+        ),
+        None,
+        None,
+        Some(namespace.clone()),
+        Some(metadata.clone()),
+        None,
+    )?;
+    Ok((storage, namespace, metadata))
+}
+
 #[cfg(test)]
 pub(crate) fn test_unsupported_storage(
     name: &str,
