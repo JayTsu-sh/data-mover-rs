@@ -233,8 +233,8 @@ impl Cursor {
         }
     }
 
-    /// Takes the top frame's arrived listing as its block, popping the frame when the directory
-    /// could not be listed. Returns `false` while the listing is still outstanding.
+    /// Takes the top frame's arrived listing as its block, using an empty block when the
+    /// directory could not be listed. Returns `false` while the listing is still outstanding.
     fn take_top_listing(&mut self, state: &mut State) -> Result<bool, TraversalTerminalFailure> {
         let Some(frame) = self.stack.last_mut() else {
             return Ok(true);
@@ -255,8 +255,11 @@ impl Cursor {
                 frame.children = Some(prepared.children);
             }
             Err(failure) => {
+                // A directory that could not be listed still closes like any other: an empty
+                // block, then the frame's normal pop. Keeping one close path means everything
+                // hung off it holds for failed listings too.
                 queue_failure(state, failure)?;
-                self.stack.pop();
+                frame.children = Some(VecDeque::new());
             }
         }
         Ok(true)
