@@ -213,6 +213,7 @@ async fn run(
             TraversalOutcome::Completed(TraversalCompletion {
                 observed_entries: state.output.observed(),
                 entry_failures: state.output.failed(),
+                directories_listed: state.output.listed(),
             })
         })
     };

@@ -207,7 +207,8 @@ async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
         session.finish().await,
         Ok(TraversalOutcome::Completed(TraversalCompletion {
             observed_entries: 4,
-            entry_failures: 0
+            entry_failures: 0,
+            ..
         }))
     ));
 }
@@ -250,7 +251,8 @@ async fn entry_failures_are_items_while_session_failures_are_terminal() {
         session.finish().await,
         Ok(TraversalOutcome::Completed(TraversalCompletion {
             observed_entries: 0,
-            entry_failures: 4
+            entry_failures: 4,
+            ..
         }))
     ));
 
@@ -365,7 +367,8 @@ async fn an_undescribable_child_is_a_failure_item_without_hiding_its_siblings() 
         session.finish().await,
         Ok(TraversalOutcome::Completed(TraversalCompletion {
             observed_entries: 2,
-            entry_failures: 1
+            entry_failures: 1,
+            ..
         }))
     ));
 }

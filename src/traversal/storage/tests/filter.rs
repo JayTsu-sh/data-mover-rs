@@ -200,7 +200,9 @@ async fn immediate_filter_prunes_without_observing_and_hides_directories() {
         outcome,
         TraversalOutcome::Completed(TraversalCompletion {
             observed_entries: 4,
-            entry_failures: 0
+            entry_failures: 0,
+            // One per listed directory, which is exactly what the namespace was asked for.
+            directories_listed: 3,
         })
     );
     assert_eq!(

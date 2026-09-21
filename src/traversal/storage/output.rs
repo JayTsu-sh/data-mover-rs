@@ -96,6 +96,7 @@ pub(super) struct Output {
     next: u64,
     observed: u64,
     failed: u64,
+    listed: u64,
     /// Settled slots waiting for their turn.
     pending: BTreeMap<u64, Settled>,
     block: BlockCounts,
@@ -109,6 +110,7 @@ impl Output {
             next: 0,
             observed: 0,
             failed: 0,
+            listed: 0,
             pending: BTreeMap::new(),
             block: BlockCounts::new(),
             open: Vec::new(),
@@ -126,6 +128,10 @@ impl Output {
 
     pub(super) const fn failed(&self) -> u64 {
         self.failed
+    }
+
+    pub(super) const fn listed(&self) -> u64 {
+        self.listed
     }
 
     pub(super) fn settle(&mut self, sequence: u64, settled: Settled) {
@@ -238,8 +244,9 @@ impl Output {
         match &item {
             TraversalItem::Entry(_) => self.observed += 1,
             TraversalItem::EntryFailure(_) => self.failed += 1,
-            // Completion items are neither entries nor failures; they have their own tallies.
-            TraversalItem::DirectoryListed(_) | TraversalItem::SubtreeComplete(_) => {}
+            TraversalItem::DirectoryListed(_) => self.listed += 1,
+            // A subtree marker restates what its blocks already said; it is not its own tally.
+            TraversalItem::SubtreeComplete(_) => {}
         }
         tokio::select! {
             biased;

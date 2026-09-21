@@ -286,14 +286,18 @@ pub(crate) const fn is_completion(item: &TraversalItem) -> bool {
 pub struct TraversalCompletion {
     pub observed_entries: u64,
     pub entry_failures: u64,
+    /// Directories that were listed, the traversal root included. Every one of them produced a
+    /// [`TraversalItem::DirectoryListed`].
+    pub directories_listed: u64,
 }
 
 impl TraversalCompletion {
     #[must_use]
-    pub const fn new(observed_entries: u64, entry_failures: u64) -> Self {
+    pub const fn new(observed_entries: u64, entry_failures: u64, directories_listed: u64) -> Self {
         Self {
             observed_entries,
             entry_failures,
+            directories_listed,
         }
     }
 }
@@ -432,10 +436,9 @@ mod producer_tests {
                 .send(failure())
                 .await
                 .unwrap_or_else(|_| panic!("session receiver dropped"));
-            producer.finish(Ok(TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 0,
-                entry_failures: 1,
-            })));
+            producer.finish(Ok(TraversalOutcome::Completed(TraversalCompletion::new(
+                0, 1, 0,
+            ))));
         });
         assert!(matches!(
             session.next_item().await,
