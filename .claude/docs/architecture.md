@@ -59,8 +59,27 @@ Storage (roles)
 deferred filter 已决定下钻的 `Pending` 槽位也会预读。列举结果**到达时**就对每个子项做
 filter 决定 (deferred 的除外)，所以已预读、游标还没走到的目录，其子目录也能继续预读；候选按
 输出顺序深度优先展开 (`cursor.rs` 的 `Search`)。
-取消或结束时在途的列举和观察都 detach 而非 abort (CIFS 句柄)。P3 的 `DirectoryComplete`
-挂在 `Cursor::advance` 里"块已全部准入"那一步。
+取消或结束时在途的列举和观察都 detach 而非 abort (CIFS 句柄)。
+
+**目录完成事件**。游标在两处排入 marker 槽位：块被完全准入时排 `DirectoryListed`，帧弹出前排
+`SubtreeComplete`。于是一个被列举的目录 D 的输出是：D 的块 → `DirectoryListed(D)` → 各子目录
+递归同样的序列 → `SubtreeComplete(D)`；跑完的遍历以根的 `SubtreeComplete` 收尾。**只有真被
+列举过的目录**才有这两项 —— `max_depth` 边界目录发了 Entry 却没列举，两项都没有；filter 隐藏
+但仍下钻的目录两项都有、却没有自己的 Entry。取消时 `DirectoryListed` 可以没有配对的
+`SubtreeComplete`，只有 `TraversalOutcome::Completed` 保证配对。
+
+marker **占准入窗口**的名额，不绕过它，所以 overshoot 为零。重入安全靠位置：`DirectoryListed`
+由 `Frame.closed` 一次性标志守护 (`next_after_block` 每槽位调一次)；`SubtreeComplete` 的窗口
+检查必须在 `next_after_block` 返回 `Next::Pop` 之后、`stack.pop()` 之前 —— 放到调用之前会让
+`Descend` 分支已消费的槽位随提前返回一起丢掉，表现为整棵子目录静默消失。
+
+判定与汇总在**输出侧** (`storage/output.rs`) 而不是游标：槽位离开重排缓冲时比它早的槽位全部
+已经过去，所以在 `DirectoryListed` 处整个块 (含 deferred 决定) 已落定，在 `SubtreeComplete`
+处其下所有块也已落定，计数是精确的。`DirectoryListing` 四个状态互斥，同时成立取最强者
+`Failed > Partial > Filtered > Complete`。账目分两条路进来：立即决定隐藏的子项**根本不分配
+槽位** (给它分配会让一个排除百万文件的 filter 反过来被准入窗口节流)，记在 `BlockFacts`；
+deferred 决定随 `Settled::Child.descent` 走。两条路的 `max_depth` 与 filter 判定顺序统一为
+先判深度，否则同一个目录会因 filter 是否 deferred 而一会儿报 Pruned 一会儿报 Truncated。
 
 **覆盖面**：
 

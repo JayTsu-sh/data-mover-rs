@@ -112,7 +112,9 @@ impl TraversalFilter for HideAndPrune {
                 descend: true,
                 filter_children: true,
             },
-            "drop" => TraversalDecision {
+            // Both are emitted but not descended into. `keep/b` sits in a block with nothing
+            // hidden, which is what separates `pruned_children` from `Filtered`.
+            "drop" | "keep/b" => TraversalDecision {
                 emit: true,
                 descend: false,
                 filter_children: false,
@@ -254,12 +256,10 @@ async fn a_hidden_directory_is_still_reported_while_a_pruned_one_is_not() {
                 "listed <root> Filtered pruned=1 truncated=0",
                 "entry keep/a",
                 "entry keep/b",
-                "listed keep Complete pruned=0 truncated=0",
-                "entry keep/b/c",
-                "listed keep/b Complete pruned=0 truncated=0",
-                "subtree keep/b dirs=1 entries=1 exhaustive=true",
-                "subtree keep dirs=2 entries=3 exhaustive=true",
-                "subtree <root> dirs=3 entries=5 exhaustive=false",
+                // Nothing in this block was hidden, so pruning `keep/b` leaves it `Complete`.
+                "listed keep Complete pruned=1 truncated=0",
+                "subtree keep dirs=1 entries=2 exhaustive=false",
+                "subtree <root> dirs=2 entries=4 exhaustive=false",
             ],
             "needs_modified={needs_modified}"
         );

@@ -44,6 +44,18 @@
 `filter_children = false` 是**传递性**的：整棵子树都不再调 `should_skip`，连 exclude 也绕过
 (legacy `dir_tree.rs` 的 `need_filter` 同语义)。
 
+被 filter 拦下的目录在遍历输出里是**可观测**的，`(emit, descend)` 两个分量各自对应不同的证据：
+
+| `(emit, descend)` | 遍历输出 |
+|---|---|
+| `(false, true)` 隐藏但下钻 | 没有自己的 `Entry`，但有 `DirectoryListed` + `SubtreeComplete`；父目录的 listing 报 `Filtered` |
+| `(true, false)` 发出但不下钻 | 有 `Entry`，没有完成事件；只进父目录的 `DirectoryListed.pruned_children`，**不算** `Filtered` |
+| `(false, false)` 两者皆无 | 既无 `Entry` 也无完成事件；父目录同时报 `Filtered` 和 `pruned_children` |
+
+所以 `Filtered` 只意味着"有子项没被输出"，与"有子树没被下钻"是两件事，别把它们合起来读 ——
+下游判断"能不能安全删除目的端多余条目"看的是 `SubtreeSummary::is_exhaustive()`，它要求隐藏、
+剪枝、截断、失败四者全为零。
+
 `FilterInput` 各字段的取值口径（与 legacy walkdir 对齐）：
 
 | 字段 | 取值 |

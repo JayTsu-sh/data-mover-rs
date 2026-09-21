@@ -55,7 +55,9 @@ legacy `CifsStorage` 的能力在 role-based backend 里的去向 —— 有对�
   `false` 不探测根，行为与之前一致。
 - 遍历有两条线并存。**条目流**由通用 `traversal::StorageTraversalSource` 驱动，filter DSL
   剪枝与 `max_depth` 经 `TraversalRequest.filter` / `.max_depth` 注入 (适配器
-  `crate::DslTraversalFilter`)。**NDX 分页**由 crate 根的 `ndx_walk` 驱动 (legacy `walkdir_2`
+  `crate::DslTraversalFilter`)；除 `Entry` / `EntryFailure` 外还产出目录完成事件
+  (`DirectoryListed` / `SubtreeComplete`，见 architecture.md §6)，消费方 match 时必须带通配臂
+  —— `TraversalItem` 是 `#[non_exhaustive]`。**NDX 分页**由 crate 根的 `ndx_walk` 驱动 (legacy `walkdir_2`
   的中立替身)：走 `Namespace::List` 取数，复用 `dir_tree::run_dfs_driver` 的 DFS 栈 / 预读
   窗口 / NDX 与 gap 编号，产出 `NdxEvent`。两条线的 filter 适配不同 —— 前者是
   `TraversalDecision`，后者是 legacy `should_skip` 三元组 (`ReadContext.apply_filter` /
