@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use super::Runtime;
 use crate::model::StoragePath;
 use crate::traversal::{
-    DirectoryListed, DirectoryListing, SubtreeComplete, SubtreeSummary, TraversalItem,
+    ChildOrder, DirectoryListed, DirectoryListing, SubtreeComplete, SubtreeSummary, TraversalItem,
     TraversalTerminalFailure,
 };
 
@@ -43,6 +43,8 @@ pub(super) struct BlockFacts {
     pub(super) pruned: u64,
     /// Subdirectories `max_depth` stopped at, by an immediate decision.
     pub(super) truncated: u64,
+    /// The order the block's children were admitted in.
+    pub(super) child_order: ChildOrder,
 }
 
 /// What settled into one output slot.
@@ -213,6 +215,7 @@ impl Output {
         TraversalItem::DirectoryListed(DirectoryListed {
             path,
             listing,
+            child_order: facts.child_order,
             pruned_children,
             truncated_children,
         })

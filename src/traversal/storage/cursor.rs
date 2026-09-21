@@ -22,11 +22,12 @@ use std::sync::Arc;
 use super::output::BlockFacts;
 use super::{
     DirectoryWork, ListingTask, ObservationTask, Runtime, State, admit, descend_work,
-    entry_failure, immediate_decision, queue_block_end, queue_failure, queue_subtree_end,
+    entry_failure, entry_name, immediate_decision, queue_block_end, queue_failure,
+    queue_subtree_end,
 };
 use crate::model::{EntryOperationFailure, FailureClass, StoragePath};
 use crate::storage::{NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure};
-use crate::traversal::{TraversalDecision, TraversalTerminalFailure};
+use crate::traversal::{ChildOrder, TraversalDecision, TraversalOrder, TraversalTerminalFailure};
 
 /// Why the cursor stopped advancing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +62,8 @@ struct Prepared {
     children: VecDeque<Child>,
     /// Subdirectories this block already knows it will descend into, in listing order.
     descend: Vec<DirectoryWork>,
+    /// The order the children above are in, for the block's end marker to report.
+    child_order: ChildOrder,
 }
 
 /// A started listing: the directory, and its prepared result once it has arrived.
@@ -288,6 +291,7 @@ impl Cursor {
                 for failure in prepared.failures {
                     queue_failure(state, failure)?;
                 }
+                frame.facts.child_order = prepared.child_order;
                 frame.children = Some(prepared.children);
             }
             Err(failure) => {
@@ -425,7 +429,26 @@ fn prepare(
         failures,
         children,
         descend,
+        child_order: match runtime.request.order {
+            TraversalOrder::Admission => ChildOrder::Listing,
+            TraversalOrder::NameBytes => ChildOrder::NameBytes,
+        },
     }))
+}
+
+/// Sorts a listing's described children by the bytes of their final path component.
+///
+/// Unstable, so a directory of millions does not also pay the half-length temporary a stable
+/// sort allocates. Two children of one directory cannot share a name, so a tie is a backend
+/// defect and the contract leaves its order unspecified. `failures` keep their place ahead of
+/// the block: a child the listing could not describe has no name to sort by.
+fn sort_by_name(result: &mut Result<NamespaceResult, StorageRoleFailure>) {
+    let Ok(listing) = result else { return };
+    let entries = match listing {
+        NamespaceResult::Entries(entries) | NamespaceResult::Listing { entries, .. } => entries,
+        NamespaceResult::Completed | NamespaceResult::LinkTarget(_) => return,
+    };
+    entries.sort_unstable_by(|left, right| entry_name(&left.path).cmp(entry_name(&right.path)));
 }
 
 /// Upper bound on listings started ahead of the cursor, whatever the request allows.
@@ -457,10 +480,16 @@ fn spawn_listing(
         },
     );
     let namespace = Arc::clone(runtime.namespace);
+    // Sorting rides on the listing's own task, never on the driver: a directory of millions
+    // would keep the driver loop from reaching an await point, and cancellation with it.
+    let order = runtime.request.order;
     listings.spawn(async move {
-        let result = namespace
+        let mut result = namespace
             .execute(NamespaceRequest::List(path.clone()))
             .await;
+        if order == TraversalOrder::NameBytes {
+            sort_by_name(&mut result);
+        }
         (path, result)
     });
 }

@@ -20,9 +20,35 @@ mod hdfs_tests;
 mod local_tests;
 
 /// Traversal output order. Concurrent completion never changes admission order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum TraversalOrder {
+    /// Each directory's children arrive in the order its backend listed them, so two backends
+    /// can deliver the same tree in two different orders.
+    #[default]
     Admission,
+    /// Each directory's children arrive sorted by the bytes of their final path component, and
+    /// its subdirectories are descended into in that same order. The stream is therefore the
+    /// tree's ordered depth-first preorder, and the same tree gives the same sequence whichever
+    /// backend holds it.
+    ///
+    /// Two sides ordered this way compare by a streaming two-pointer merge that holds nothing:
+    /// a run of paths present on one side only is a run of copies, or of deletions. The descent
+    /// half of the guarantee is what bounds how far two independent traversals can drift, because
+    /// it is what lets a consumer tell which side is behind and stop reading from the other.
+    ///
+    /// Compare paths **one component at a time**, never as whole strings: `a` (a directory
+    /// holding `a/x`) and `a.txt` arrive as `a`, `a/x`, `a.txt`, while comparing whole relative
+    /// paths byte-wise would put `a.txt` second, because `.` is `0x2E` and `/` is `0x2F`.
+    /// Equivalently: treat the separator as smaller than every other byte. Comparing whole paths
+    /// still agrees within one directory, so a small tree can pass while the rule is already
+    /// broken.
+    ///
+    /// The order is over raw UTF-8 bytes and is **no server's collation**: a case-insensitive
+    /// share sorts `README.md` next to `readme.md`, this does not, and such a destination cannot
+    /// hold both at once. Children the listing itself could not describe have no name to sort by
+    /// and stay ahead of the block, outside the order.
+    NameBytes,
 }
 
 /// Facts known about one directory child when the traversal decides whether to emit it,
@@ -173,9 +199,9 @@ impl TraversalRequest {
 /// last [`TraversalItem::SubtreeComplete`] for `D`. A traversal that runs to completion
 /// therefore ends with the root's `SubtreeComplete`.
 ///
-/// `D`'s block holds one item per admitted child, in listing order, except that children the
-/// listing itself could not describe come first as entry failures, ahead of every described
-/// child.
+/// `D`'s block holds one item per admitted child, in the order [`TraversalRequest::order`] asked
+/// for, except that children the listing itself could not describe come first as entry failures,
+/// ahead of every described child and outside any order.
 ///
 /// Only a directory that was actually listed gets those two items. A directory `max_depth`
 /// stops at is emitted as an entry and never listed, so it has neither; a directory the filter
@@ -200,6 +226,8 @@ pub enum TraversalItem {
 pub struct DirectoryListed {
     pub path: StoragePath,
     pub listing: DirectoryListing,
+    /// The order this block's children were delivered in.
+    pub child_order: ChildOrder,
     /// Direct subdirectories the filter did not descend into. None of them has completion
     /// items of its own.
     ///
@@ -214,6 +242,24 @@ pub struct DirectoryListed {
     /// whatever the filter said about descending, and, as there, the filter may independently
     /// have kept it out of the output.
     pub truncated_children: u64,
+}
+
+/// The order one directory's block was delivered in.
+///
+/// Orthogonal to [`DirectoryListing`]: how complete a block is and how it was ordered are
+/// separate questions, and one block can be `Partial` and sorted at the same time.
+///
+/// It confirms after the fact and cannot warn ahead of it, because the whole block is already
+/// past by the time its [`DirectoryListed`] arrives. A consumer that needs an order asks for it
+/// in the request; this only reports what happened.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ChildOrder {
+    /// Backend listing order.
+    #[default]
+    Listing,
+    /// Sorted by the bytes of the final path component; see [`TraversalOrder::NameBytes`].
+    NameBytes,
 }
 
 /// How complete one directory's block is.
