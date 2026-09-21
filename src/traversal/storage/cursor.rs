@@ -237,23 +237,36 @@ impl Cursor {
                 continue;
             }
             match self.next_after_block() {
-                Next::Pop => {
-                    // The window check belongs here and not before `next_after_block`: its
-                    // other branches consume a slot, so returning early there would drop a
-                    // whole subtree. `Next::Pop` changes nothing, so this is re-entrant.
-                    if state.admitted() >= runtime.request.max_inflight_operations.get() {
-                        return Ok(Step::WindowFull);
-                    }
-                    let Some(frame) = self.stack.pop() else {
-                        return Err(TraversalTerminalFailure::Internal);
-                    };
-                    queue_subtree_end(state, frame.work.path)?;
-                }
+                Next::Pop => match self.end_top_subtree(runtime, state)? {
+                    ControlFlow::Break(step) => return Ok(step),
+                    ControlFlow::Continue(()) => {}
+                },
                 Next::Descend(work) => self.stack.push(Frame::new(work)),
                 Next::Skip => {}
                 Next::Wait => return Ok(Step::WaitObservation),
             }
         }
+    }
+
+    /// Queues the top frame's subtree marker and pops it.
+    ///
+    /// The window is checked here rather than before [`Self::next_after_block`] because that
+    /// call's other branches consume a slot: returning early there would drop a whole subtree,
+    /// and only when the window happened to be full. `Next::Pop` changes nothing, so stopping
+    /// after it is re-entrant.
+    fn end_top_subtree(
+        &mut self,
+        runtime: &Runtime<'_>,
+        state: &mut State,
+    ) -> Result<ControlFlow<Step>, TraversalTerminalFailure> {
+        if state.admitted() >= runtime.request.max_inflight_operations.get() {
+            return Ok(ControlFlow::Break(Step::WindowFull));
+        }
+        let Some(frame) = self.stack.pop() else {
+            return Err(TraversalTerminalFailure::Internal);
+        };
+        queue_subtree_end(state, frame.work.path)?;
+        Ok(ControlFlow::Continue(()))
     }
 
     /// Takes the top frame's arrived listing as its block, using an empty block when the

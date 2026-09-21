@@ -1,5 +1,7 @@
 //! Directory completion items: their order against the entries, and what their tallies mean.
 
+use std::fmt::Write as _;
+
 use super::filter::{CountingMetadata, TreeNamespace};
 use super::*;
 use crate::traversal::{DirectoryListing, TraversalCandidate, TraversalDecision, TraversalFilter};
@@ -25,13 +27,34 @@ fn render(item: &TraversalItem) -> String {
             listed.pruned_children,
             listed.truncated_children
         ),
-        TraversalItem::SubtreeComplete(complete) => format!(
-            "subtree {} dirs={} entries={} exhaustive={}",
-            name(&complete.path),
-            complete.summary.directories_listed,
-            complete.summary.observed_entries,
-            complete.summary.is_exhaustive()
-        ),
+        TraversalItem::SubtreeComplete(complete) => {
+            let summary = &complete.summary;
+            // Only the counts that are set are named, which keeps an expected sequence short
+            // while still pinning every field: transpose two of them in `close_block` or
+            // `absorb` and the number turns up under the other name.
+            let set = [
+                ("filtered", summary.filtered_listings),
+                ("partial", summary.partial_listings),
+                ("failed", summary.failed_listings),
+                ("failures", summary.entry_failures),
+                ("pruned", summary.pruned_directories),
+                ("truncated", summary.truncated_directories),
+            ]
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .fold(String::new(), |mut set, (label, count)| {
+                let _ = write!(set, " {label}={count}");
+                set
+            });
+            format!(
+                "subtree {} dirs={} entries={}{} exhaustive={}",
+                name(&complete.path),
+                summary.directories_listed,
+                summary.observed_entries,
+                set,
+                summary.is_exhaustive()
+            )
+        }
     }
 }
 
@@ -112,10 +135,17 @@ impl TraversalFilter for HideAndPrune {
                 descend: true,
                 filter_children: true,
             },
-            // Both are emitted but not descended into. `keep/b` sits in a block with nothing
-            // hidden, which is what separates `pruned_children` from `Filtered`.
-            "drop" | "keep/b" => TraversalDecision {
+            // Emitted but not descended into. `keep/b` sits in a block with nothing hidden,
+            // which is what separates `pruned_children` from `Filtered`.
+            "keep/b" => TraversalDecision {
                 emit: true,
+                descend: false,
+                filter_children: false,
+            },
+            // Neither emitted nor descended into: what the DSL adapter produces for a path
+            // exclude, and the only shape where one child is hidden *and* pruned.
+            "drop" => TraversalDecision {
+                emit: false,
                 descend: false,
                 filter_children: false,
             },
@@ -249,17 +279,17 @@ async fn a_hidden_directory_is_still_reported_while_a_pruned_one_is_not() {
         assert_eq!(
             lines,
             [
-                // `keep` is hidden, so the root's listing is `Filtered`; `drop` is emitted but
-                // not descended into, which is `pruned_children`, not `Filtered`.
-                "entry drop",
+                // `keep` and `drop` are both hidden, so the root's listing is `Filtered`, and
+                // `drop` is pruned on top of that: one child, counted in both places.
                 "entry top",
                 "listed <root> Filtered pruned=1 truncated=0",
                 "entry keep/a",
                 "entry keep/b",
-                // Nothing in this block was hidden, so pruning `keep/b` leaves it `Complete`.
+                // Nothing in this block was hidden, so pruning `keep/b` leaves it `Complete`:
+                // a prune on its own is not a `Filtered` listing.
                 "listed keep Complete pruned=1 truncated=0",
-                "subtree keep dirs=1 entries=2 exhaustive=false",
-                "subtree <root> dirs=2 entries=4 exhaustive=false",
+                "subtree keep dirs=1 entries=2 pruned=1 exhaustive=false",
+                "subtree <root> dirs=2 entries=3 filtered=1 pruned=2 exhaustive=false",
             ],
             "needs_modified={needs_modified}"
         );
@@ -282,12 +312,12 @@ async fn a_directory_max_depth_stops_at_is_emitted_without_completion_items() {
             "entry keep/a",
             "entry keep/b",
             "listed keep Complete pruned=0 truncated=1",
-            "subtree keep dirs=1 entries=2 exhaustive=false",
+            "subtree keep dirs=1 entries=2 truncated=1 exhaustive=false",
             "entry drop/x",
             "entry drop/y",
             "listed drop Complete pruned=0 truncated=1",
-            "subtree drop dirs=1 entries=2 exhaustive=false",
-            "subtree <root> dirs=3 entries=7 exhaustive=false",
+            "subtree drop dirs=1 entries=2 truncated=1 exhaustive=false",
+            "subtree <root> dirs=3 entries=7 truncated=2 exhaustive=false",
         ]
     );
 }
@@ -308,8 +338,9 @@ async fn a_directory_that_cannot_be_listed_still_gets_both_items() {
             "listed <root> Complete pruned=0 truncated=0",
             "failure sub",
             "listed sub Failed pruned=0 truncated=0",
-            "subtree sub dirs=1 entries=0 exhaustive=false",
-            "subtree <root> dirs=2 entries=2 exhaustive=false",
+            // The one failure counts in both denominators, as the summary's docs say.
+            "subtree sub dirs=1 entries=0 failed=1 failures=1 exhaustive=false",
+            "subtree <root> dirs=2 entries=2 failed=1 failures=1 exhaustive=false",
         ]
     );
     assert!(matches!(
@@ -340,8 +371,8 @@ async fn an_undescribable_child_makes_the_listing_partial_and_not_merely_failed(
             "failure dir/bad",
             "entry dir/ok",
             "listed dir Partial { failures: 1 } pruned=0 truncated=0",
-            "subtree dir dirs=1 entries=1 exhaustive=false",
-            "subtree <root> dirs=2 entries=2 exhaustive=false",
+            "subtree dir dirs=1 entries=1 partial=1 failures=1 exhaustive=false",
+            "subtree <root> dirs=2 entries=2 partial=1 failures=1 exhaustive=false",
         ]
     );
     let listing = items.iter().find_map(|item| match item {

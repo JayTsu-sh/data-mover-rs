@@ -26,7 +26,7 @@ use crate::traversal::{
 /// invisible here. A deferred decision is not known until the child's observation settles, so
 /// its slot carries the outcome and the tally happens at the block's end marker instead.
 #[derive(Clone, Copy)]
-pub(super) enum Descent {
+pub(super) enum ChildDescent {
     Listed,
     Pruned,
     Truncated,
@@ -51,8 +51,8 @@ pub(super) enum Settled {
     /// sequence so the slots behind it stay in order, and emits nothing.
     Child {
         item: Option<TraversalItem>,
-        /// Carried only for a deferred decision; see [`Descent`].
-        descent: Option<Descent>,
+        /// Carried only for a deferred decision; see [`ChildDescent`].
+        descent: Option<ChildDescent>,
     },
     /// Every direct child of `path` has been admitted.
     BlockEnd {
@@ -163,18 +163,20 @@ impl Output {
     fn settle_child(
         &mut self,
         item: Option<TraversalItem>,
-        descent: Option<Descent>,
+        descent: Option<ChildDescent>,
     ) -> Option<TraversalItem> {
         match &item {
             Some(TraversalItem::Entry(_)) => self.block.observed += 1,
             Some(TraversalItem::EntryFailure(_)) => self.block.failures += 1,
-            Some(_) => {}
+            // A marker never settles into a child slot. Naming both rather than wildcarding
+            // makes the next variant added to `TraversalItem` a compile error at this tally.
+            Some(TraversalItem::DirectoryListed(_) | TraversalItem::SubtreeComplete(_)) => {}
             None => self.block.hidden += 1,
         }
         match descent {
-            Some(Descent::Pruned) => self.block.pruned += 1,
-            Some(Descent::Truncated) => self.block.truncated += 1,
-            Some(Descent::Listed) | None => {}
+            Some(ChildDescent::Pruned) => self.block.pruned += 1,
+            Some(ChildDescent::Truncated) => self.block.truncated += 1,
+            Some(ChildDescent::Listed) | None => {}
         }
         item
     }

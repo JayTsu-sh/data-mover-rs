@@ -168,10 +168,14 @@ impl TraversalRequest {
 
 /// One ordered traversal item. Entry failures do not terminate the session.
 ///
-/// A listed directory `D` produces, in order: its block, which is one item per admitted child;
-/// then [`TraversalItem::DirectoryListed`] for `D`; then, for every subdirectory `D` descends
-/// into, that same sequence recursively; and last [`TraversalItem::SubtreeComplete`] for `D`.
-/// A traversal that runs to completion therefore ends with the root's `SubtreeComplete`.
+/// A listed directory `D` produces, in order: its block; then [`TraversalItem::DirectoryListed`]
+/// for `D`; then, for every subdirectory `D` descends into, that same sequence recursively; and
+/// last [`TraversalItem::SubtreeComplete`] for `D`. A traversal that runs to completion
+/// therefore ends with the root's `SubtreeComplete`.
+///
+/// `D`'s block holds one item per admitted child, in listing order, except that children the
+/// listing itself could not describe come first as entry failures, ahead of every described
+/// child.
 ///
 /// Only a directory that was actually listed gets those two items. A directory `max_depth`
 /// stops at is emitted as an entry and never listed, so it has neither; a directory the filter
@@ -196,11 +200,19 @@ pub enum TraversalItem {
 pub struct DirectoryListed {
     pub path: StoragePath,
     pub listing: DirectoryListing,
-    /// Direct subdirectories the filter did not descend into. Each was still emitted as an
-    /// entry, and none of them has completion items of its own.
+    /// Direct subdirectories the filter did not descend into. None of them has completion
+    /// items of its own.
+    ///
+    /// Whether such a subdirectory was itself emitted is a separate question, answered by
+    /// `listing`. The filter decides `emit` and `descend` independently, so a child can be both
+    /// pruned and hidden: it counts here *and* makes the listing `Filtered`. Neither this count
+    /// nor `truncated_children` is a count of emitted entries, and adding them to the entries
+    /// in the block does not give the number of children the directory has.
     pub pruned_children: u64,
-    /// Direct subdirectories `max_depth` stopped at. Each was still emitted as an entry, and
-    /// none of them has completion items of its own.
+    /// Direct subdirectories `max_depth` stopped at. None of them has completion items of its
+    /// own. A directory beyond the depth limit counts here rather than in `pruned_children`
+    /// whatever the filter said about descending, and, as there, the filter may independently
+    /// have kept it out of the output.
     pub truncated_children: u64,
 }
 
@@ -286,8 +298,9 @@ pub(crate) const fn is_completion(item: &TraversalItem) -> bool {
 pub struct TraversalCompletion {
     pub observed_entries: u64,
     pub entry_failures: u64,
-    /// Directories that were listed, the traversal root included. Every one of them produced a
-    /// [`TraversalItem::DirectoryListed`].
+    /// Directories the traversal tried to list, the traversal root included, and therefore the
+    /// number of [`TraversalItem::DirectoryListed`] items it emitted. A directory whose listing
+    /// failed counts too: it produced that item, carrying [`DirectoryListing::Failed`].
     pub directories_listed: u64,
 }
 

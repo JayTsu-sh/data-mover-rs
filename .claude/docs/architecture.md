@@ -68,7 +68,11 @@ filter 决定 (deferred 的除外)，所以已预读、游标还没走到的目�
 但仍下钻的目录两项都有、却没有自己的 Entry。取消时 `DirectoryListed` 可以没有配对的
 `SubtreeComplete`，只有 `TraversalOutcome::Completed` 保证配对。
 
-marker **占准入窗口**的名额，不绕过它，所以 overshoot 为零。重入安全靠位置：`DirectoryListed`
+marker **占准入窗口**的名额，不绕过它，所以两个 marker 都不会让 `admitted()` 越界。
+(唯一的例外是既有的 `queue_failure`：`take_top_listing` 为列举自带的 N 个不可描述子项、以及
+列举失败本身排队失败项时不查窗口，`admitted()` 可短暂到 `max_inflight + N`。它们同步落盘、
+下一次 flush 就排空，且 N 受该次列举已在内存里的结果限制。这是 P2 之前就有的行为，P3 没有
+扩大它。) 重入安全靠位置：`DirectoryListed`
 由 `Frame.closed` 一次性标志守护 (`next_after_block` 每槽位调一次)；`SubtreeComplete` 的窗口
 检查必须在 `next_after_block` 返回 `Next::Pop` 之后、`stack.pop()` 之前 —— 放到调用之前会让
 `Descend` 分支已消费的槽位随提前返回一起丢掉，表现为整棵子目录静默消失。

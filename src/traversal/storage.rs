@@ -24,7 +24,7 @@ mod output;
 
 use cursor::{Cursor, Step};
 use observe::observe;
-use output::{BlockFacts, Descent, Output, Settled};
+use output::{BlockFacts, ChildDescent, Output, Settled};
 
 /// Protocol-neutral traversal assembled from one connected storage's namespace and metadata roles.
 pub struct StorageTraversalSource {
@@ -118,7 +118,10 @@ impl State {
     /// buffer behind an earlier one. This, not the in-flight count alone, is what the admission
     /// window bounds; otherwise one slow observation lets the reorder buffer grow without limit.
     fn admitted(&self) -> usize {
-        usize::try_from(self.next_sequence - self.output.next()).unwrap_or(usize::MAX)
+        // Saturating, not raw: were the invariant that output never runs ahead of allocation
+        // ever to break, a wrapped `u64` would read as `usize::MAX`, hold the window shut for
+        // good, and spin `drive` through its `WindowFull` arm, which has no await point.
+        usize::try_from(self.next_sequence.saturating_sub(self.output.next())).unwrap_or(usize::MAX)
     }
 
     fn allocate(&mut self) -> Result<u64, TraversalTerminalFailure> {
@@ -315,10 +318,10 @@ fn admit(
     let depth = parent.child_depth;
     if let Some(decision) = decision {
         match descend_outcome(runtime.request, &descriptor, depth, decision) {
-            Descend::Into(work) => cursor_slots.push_back(cursor::Slot::Descend(work)),
-            Descend::Pruned => facts.pruned = facts.pruned.saturating_add(1),
-            Descend::Truncated => facts.truncated = facts.truncated.saturating_add(1),
-            Descend::NotDirectory => {}
+            DescendOutcome::Into(work) => cursor_slots.push_back(cursor::Slot::Descend(work)),
+            DescendOutcome::Pruned => facts.pruned = facts.pruned.saturating_add(1),
+            DescendOutcome::Truncated => facts.truncated = facts.truncated.saturating_add(1),
+            DescendOutcome::NotDirectory => {}
         }
         if !decision.emit {
             facts.hidden = facts.hidden.saturating_add(1);
@@ -349,7 +352,7 @@ fn awaits_slot(request: &TraversalRequest, deferred: Deferred) -> bool {
 }
 
 /// Where one child's subtree goes, given a decision already made.
-enum Descend {
+enum DescendOutcome {
     Into(DirectoryWork),
     Pruned,
     Truncated,
@@ -364,17 +367,17 @@ fn descend_outcome(
     descriptor: &SourceDescriptor,
     depth: usize,
     decision: TraversalDecision,
-) -> Descend {
+) -> DescendOutcome {
     if descriptor.kind != EntryKind::Directory {
-        return Descend::NotDirectory;
+        return DescendOutcome::NotDirectory;
     }
     if !request.admits_depth(depth) {
-        return Descend::Truncated;
+        return DescendOutcome::Truncated;
     }
     if !decision.descend {
-        return Descend::Pruned;
+        return DescendOutcome::Pruned;
     }
-    Descend::Into(DirectoryWork {
+    DescendOutcome::Into(DirectoryWork {
         path: descriptor.path.clone(),
         child_depth: depth.saturating_add(1),
         filter_children: decision.filter_children,
@@ -388,8 +391,8 @@ fn descend_work(
     decision: TraversalDecision,
 ) -> Option<DirectoryWork> {
     match descend_outcome(request, descriptor, depth, decision) {
-        Descend::Into(work) => Some(work),
-        Descend::Pruned | Descend::Truncated | Descend::NotDirectory => None,
+        DescendOutcome::Into(work) => Some(work),
+        DescendOutcome::Pruned | DescendOutcome::Truncated | DescendOutcome::NotDirectory => None,
     }
 }
 
@@ -399,17 +402,17 @@ fn deferred_descent(
     request: &TraversalRequest,
     deferred: Deferred,
     descending: bool,
-) -> Option<Descent> {
+) -> Option<ChildDescent> {
     if deferred.kind != EntryKind::Directory {
         return None;
     }
     if !request.admits_depth(deferred.depth) {
-        return Some(Descent::Truncated);
+        return Some(ChildDescent::Truncated);
     }
     Some(if descending {
-        Descent::Listed
+        ChildDescent::Listed
     } else {
-        Descent::Pruned
+        ChildDescent::Pruned
     })
 }
 
