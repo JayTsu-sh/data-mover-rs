@@ -70,7 +70,7 @@ async fn drain(mut session: TraversalSession) -> (Vec<TraversalItem>, TraversalO
     (items, outcome)
 }
 
-async fn events(session: TraversalSession) -> (Vec<String>, TraversalOutcome) {
+pub(super) async fn events(session: TraversalSession) -> (Vec<String>, TraversalOutcome) {
     let (items, outcome) = drain(session).await;
     assert_well_formed(&items);
     (items.iter().map(render).collect(), outcome)
