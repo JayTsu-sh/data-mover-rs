@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
@@ -20,9 +20,11 @@ use crate::storage::{
 
 mod cursor;
 mod observe;
+mod output;
 
 use cursor::{Cursor, Step};
 use observe::observe;
+use output::{Output, Settled};
 
 /// Protocol-neutral traversal assembled from one connected storage's namespace and metadata roles.
 pub struct StorageTraversalSource {
@@ -97,25 +99,18 @@ type ObservationTask = JoinSet<(
 type ListingTask = JoinSet<(StoragePath, Result<NamespaceResult, StorageRoleFailure>)>;
 
 /// Output sequencing: every admitted entry and every queued listing failure owns one sequence
-/// number, assigned in output order by the cursor; the reorder buffer releases them strictly in
-/// that order. An entry a deferred filter then drops keeps its number and settles as `None`.
+/// number, assigned in output order by the cursor. Allocation lives here; releasing the slots
+/// in that order is [`Output`]'s job.
 struct State {
     next_sequence: u64,
-    next_output: u64,
-    observed: u64,
-    failed: u64,
-    /// Settled sequence slots waiting for their turn; `None` settles a slot with no item.
-    pending: BTreeMap<u64, Option<TraversalItem>>,
+    output: Output,
 }
 
 impl State {
     const fn new() -> Self {
         Self {
             next_sequence: 0,
-            next_output: 0,
-            observed: 0,
-            failed: 0,
-            pending: BTreeMap::new(),
+            output: Output::new(),
         }
     }
 
@@ -123,7 +118,7 @@ impl State {
     /// buffer behind an earlier one. This, not the in-flight count alone, is what the admission
     /// window bounds; otherwise one slow observation lets the reorder buffer grow without limit.
     fn admitted(&self) -> usize {
-        usize::try_from(self.next_sequence - self.next_output).unwrap_or(usize::MAX)
+        usize::try_from(self.next_sequence - self.output.next()).unwrap_or(usize::MAX)
     }
 
     fn allocate(&mut self) -> Result<u64, TraversalTerminalFailure> {
@@ -216,8 +211,8 @@ async fn run(
     } else {
         result.map(|()| {
             TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: state.observed,
-                entry_failures: state.failed,
+                observed_entries: state.output.observed(),
+                entry_failures: state.output.failed(),
             })
         })
     };
@@ -239,7 +234,7 @@ async fn drive(
         }
         let step = cursor.advance(runtime, tasks, state)?;
         cursor.start_listings(runtime, listings);
-        flush(runtime, state).await?;
+        state.output.flush(runtime).await?;
         match step {
             Step::Done if tasks.is_empty() => return Ok(()),
             // Nothing in flight means every admitted entry has settled, so the flush above
@@ -388,7 +383,7 @@ fn settle(
     if deferred.is_some_and(|deferred| awaits_slot(runtime.request, deferred)) {
         cursor.decide(sequence, descend);
     }
-    state.pending.insert(sequence, item);
+    state.output.settle(sequence, Settled::Child(item));
     Ok(())
 }
 
@@ -439,35 +434,15 @@ fn settle_entry(
     )
 }
 
-/// Emits every settled item that is next in sequence.
-async fn flush(runtime: &Runtime<'_>, state: &mut State) -> Result<(), TraversalTerminalFailure> {
-    while let Some(settled) = state.pending.remove(&state.next_output) {
-        if let Some(item) = settled {
-            match &item {
-                TraversalItem::Entry(_) => state.observed += 1,
-                TraversalItem::EntryFailure(_) => state.failed += 1,
-            }
-            tokio::select! {
-                biased;
-                () = runtime.request.cancel.cancelled() => return Ok(()),
-                result = runtime.items.send(item) => {
-                    result.map_err(|_| TraversalTerminalFailure::Internal)?;
-                }
-            }
-        }
-        state.next_output += 1;
-    }
-    Ok(())
-}
-
 fn queue_failure(
     state: &mut State,
     error: EntryOperationFailure,
 ) -> Result<(), TraversalTerminalFailure> {
     let sequence = state.allocate()?;
-    state
-        .pending
-        .insert(sequence, Some(TraversalItem::EntryFailure(error)));
+    state.output.settle(
+        sequence,
+        Settled::Child(Some(TraversalItem::EntryFailure(error))),
+    );
     Ok(())
 }
 
