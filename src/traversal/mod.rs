@@ -28,21 +28,22 @@ pub enum TraversalOrder {
     #[default]
     Admission,
     /// Each directory's children arrive sorted by the bytes of their final path component, and
-    /// its subdirectories are descended into in that same order. The stream is therefore the
-    /// tree's ordered depth-first preorder, and the same tree gives the same sequence whichever
-    /// backend holds it.
+    /// its subdirectories are descended into in that same order. Together with the block order
+    /// every traversal already keeps, that makes the stream a total order the same tree produces
+    /// on any backend, which is what two independently running traversals need to be compared by
+    /// a streaming two-pointer merge that holds nothing: a run of paths present on one side only
+    /// is a run of copies, or of deletions. The descent half of the guarantee is also what bounds
+    /// how far the two sides can drift, because it is what lets a consumer tell which side is
+    /// behind and stop reading from the other.
     ///
-    /// Two sides ordered this way compare by a streaming two-pointer merge that holds nothing:
-    /// a run of paths present on one side only is a run of copies, or of deletions. The descent
-    /// half of the guarantee is what bounds how far two independent traversals can drift, because
-    /// it is what lets a consumer tell which side is behind and stop reading from the other.
-    ///
-    /// Compare paths **one component at a time**, never as whole strings: `a` (a directory
-    /// holding `a/x`) and `a.txt` arrive as `a`, `a/x`, `a.txt`, while comparing whole relative
-    /// paths byte-wise would put `a.txt` second, because `.` is `0x2E` and `/` is `0x2F`.
-    /// Equivalently: treat the separator as smaller than every other byte. Comparing whole paths
-    /// still agrees within one directory, so a small tree can pass while the rule is already
-    /// broken.
+    /// **The key to compare by is `(parent directory, name)`, not the whole path.** Blocks do not
+    /// interleave: every child of one directory arrives before any grandchild, and directories
+    /// are visited in sorted depth-first order. So `a` (a directory holding `a/x`) and `a.txt`
+    /// arrive as `a`, `a.txt`, …, `a/x` — both are the root's children, so both precede anything
+    /// under `a`. Comparing whole paths one component at a time would put `a/x` second and
+    /// silently misalign the merge, which reads as "present at the destination, absent at the
+    /// source" and licenses a delete. Whole-path comparison agrees inside a single directory, so
+    /// a small tree can pass while the rule is already broken.
     ///
     /// The order is over raw UTF-8 bytes and is **no server's collation**: a case-insensitive
     /// share sorts `README.md` next to `readme.md`, this does not, and such a destination cannot

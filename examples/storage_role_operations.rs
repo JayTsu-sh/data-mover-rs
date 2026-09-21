@@ -65,6 +65,25 @@ struct Args {
     command: Command,
 }
 
+/// How a traversal orders each directory's children and the descent into them.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum OrderArg {
+    /// Whatever order the backend listed in, which differs between backends.
+    Admission,
+    /// Sorted by the bytes of the final path component, descent included, so the same tree
+    /// gives the same sequence on every backend.
+    NameBytes,
+}
+
+impl From<OrderArg> for TraversalOrder {
+    fn from(value: OrderArg) -> Self {
+        match value {
+            OrderArg::Admission => Self::Admission,
+            OrderArg::NameBytes => Self::NameBytes,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Stream a filtered, depth-limited traversal.
@@ -75,6 +94,9 @@ enum Command {
         exclude_expression: Option<String>,
         #[arg(long)]
         max_depth: Option<usize>,
+        /// Sibling and descent order.
+        #[arg(long, value_enum, default_value_t = OrderArg::Admission)]
+        order: OrderArg,
         /// Sub-path to start from, relative to the backend root.
         #[arg(long, default_value = "")]
         path: String,
@@ -165,6 +187,7 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
         match_expression,
         exclude_expression,
         max_depth,
+        order,
         path,
     } = command
     else {
@@ -175,7 +198,7 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
     let slots = NonZeroUsize::new(args.concurrency).ok_or("concurrency must be non-zero")?;
     let request = TraversalRequest {
         root: StoragePath::new(path.clone())?,
-        order: TraversalOrder::Admission,
+        order: TraversalOrder::from(*order),
         max_inflight_operations: slots,
         max_buffered_items: slots,
         observation_plan: ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly),
@@ -197,8 +220,12 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
             }
             TraversalItem::DirectoryListed(listed) => {
                 println!(
-                    "listed {} {:?} pruned={} truncated={}",
-                    listed.path, listed.listing, listed.pruned_children, listed.truncated_children
+                    "listed {} {:?} order={:?} pruned={} truncated={}",
+                    listed.path,
+                    listed.listing,
+                    listed.child_order,
+                    listed.pruned_children,
+                    listed.truncated_children
                 );
             }
             TraversalItem::SubtreeComplete(complete) => {
