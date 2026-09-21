@@ -233,6 +233,15 @@ loop {
    (2026-09-21 更正：本节初稿把它写成"有序 DFS 前序"并给了 `a, a/x, a.txt` 的例子，是错的 ——
    真机跑 `examples/storage_role_operations traverse --order name-bytes` 才发现。)
 
+**真机证据 (FAS2750，2026-09-21)**：同一棵树 (目录 `Zoo`/`a`/`B`/`bar` + `a/a1`、`a/a2`) 同时
+播到 CIFS `ontap_lisaauto_cifs` 与 NFS `ontap_lisaauto_nfs` (v4.1)，`--order name-bytes` 两侧
+**逐行相同**；`--order admission` 两侧不同 (CIFS `Zoo, a, B, bar` / NFS `B, Zoo, a, bar`)。
+字节序 `B`(0x42) < `Zoo`(0x5A) < `a`(0x61) < `bar`(0x62)，而大小写不敏感排序会给
+`a, B, bar, Zoo` —— 所以这同时证明字节序压过了 NTFS/ONTAP 的 `$UpCase` collation。
+
+> **陷阱**：ONTAP 的 NFS READDIR 在这棵树上**恰好就返回字节序**。只测 NFS 会得出"根本不用排序"
+> 的结论，而同一棵树在 CIFS 上并非如此。不要用单个 backend 的原生顺序推断是否需要排序。
+
 ### 四、单目录海量子目录：低内存模式
 
 `Frame.slots` 与 `Prepared.descend` 各为一个将要下钻的子目录留一条记录。根因是**物理的**：
