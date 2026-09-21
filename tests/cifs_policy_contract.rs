@@ -1,4 +1,6 @@
 //! Optional real SMB policy tests, confined to unique file names.
+mod common;
+
 use bytes::Bytes;
 use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
 use data_mover::storage::{
@@ -15,6 +17,7 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an explicitly configured writable CIFS share"]
 async fn real_share_checkpointed_and_atomic_replace_roundtrip() -> Result {
+    common::init_tracing();
     let server = std::env::var("CIFS_REAL_SERVER")?;
     let share_name = std::env::var("CIFS_REAL_SHARE")?;
     let client = smb_client();
@@ -258,6 +261,7 @@ async fn assert_mtime(storage: &Storage, path: &str) -> Result {
 #[tokio::test]
 #[ignore = "requires an explicitly configured writable CIFS share"]
 async fn real_directory_mtime_apply_preserves_creation_time() -> Result {
+    common::init_tracing();
     let server = std::env::var("CIFS_REAL_SERVER")?;
     let name = std::env::var("CIFS_REAL_SHARE")?;
     let client = smb_client();

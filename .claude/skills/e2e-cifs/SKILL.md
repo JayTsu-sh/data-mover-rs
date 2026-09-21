@@ -24,7 +24,11 @@ CIFS_REAL_GUEST_POLICY=allow-unsigned   # 可选，对匿名/guest share 跑契�
 ```
 
 匿名 share 用法：`CIFS_REAL_SHARE=dm_anon_share CIFS_REAL_USER= CIFS_REAL_PASS= CIFS_REAL_GUEST_POLICY=allow-unsigned`
-(FAS2750 上需 `vserver cifs options -guest-unix-user pcuser`，share ACL 给 Everyone)。
+**跑之前先确认 SVM 能发现域控**：`vserver cifs domain discovered-servers` 为空时，任何未知用户的
+登录都会等约 2 秒后拿到 `0xC0000466 STATUS_SERVER_UNAVAILABLE` —— guest 映射发生在"确认用户在域里
+无效"之后，DC 不可用就走不到那一步。2026-09-21 的 FAS2750 正处于这个状态，而其余测试照常通过，
+因为测试账号是本地用户、不经过 DC。这一档也不在 `run.py` 的默认步骤里 (`.env` 不设
+`CIFS_REAL_GUEST_POLICY`)。详见 `.claude/docs/storage-cifs.md` 的"真实环境证据"表。
 
 `DATA_MOVER_RECOVERY_DIR` 未设置时 runner 自动创建临时目录。
 
@@ -46,6 +50,17 @@ CIFS_REAL_GUEST_POLICY=allow-unsigned   # 可选，对匿名/guest share 跑契�
 - example 编译通过
 - policy + namespace contract 全部通过 (退出码 0)，测试自行清理 fixture
 - probe 退出码 0，`[probe]` 行作为能力取舍的证据记录到 `.claude/docs/storage-cifs.md`
+
+## 打开协议日志
+
+三个 `cifs_*` 测试都调用 `tests/common/init_tracing()`，按 `RUST_LOG` 开关，不设时零开销：
+
+```bash
+RUST_LOG=smb=debug cargo test --release --test cifs_namespace_contract -- --ignored --nocapture
+RUST_LOG=smb=trace ...   # 加上原始帧，定位未知 NTSTATUS 时需要
+```
+
+真机故障往往是间歇的，重跑未必复现；日志是唯一的现场记录。
 
 ## 失败如何排查
 

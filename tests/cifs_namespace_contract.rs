@@ -1,4 +1,6 @@
 //! Optional real SMB namespace-role contract, confined to unique entry names.
+mod common;
+
 use data_mover::model::{
     BackendIdentity, BackendKind, EntryKind, FailureClass, IdentityStrength, StoragePath,
 };
@@ -13,6 +15,7 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an explicitly configured writable CIFS share"]
 async fn real_share_namespace_verbs_roundtrip() -> Result {
+    common::init_tracing();
     let server = std::env::var("CIFS_REAL_SERVER")?;
     let share_name = std::env::var("CIFS_REAL_SHARE")?;
     let client = smb_client();

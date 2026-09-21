@@ -2,6 +2,8 @@
 //!
 //! Every probe prints one `[probe]` line and never fails on an unsupported outcome; only
 //! setup failures (no server, bad primary credentials) fail the test. Run with `--nocapture`.
+mod common;
+
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use data_mover::model::{BackendIdentity, BackendKind, FailureClass, StoragePath};
@@ -24,6 +26,7 @@ struct Endpoint {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires an explicitly configured CIFS share"]
 async fn probe_real_share_capabilities() -> Result {
+    common::init_tracing();
     let server = std::env::var("CIFS_REAL_SERVER")?;
     let share = std::env::var("CIFS_REAL_SHARE")?;
     let target = Endpoint {

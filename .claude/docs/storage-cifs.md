@@ -248,7 +248,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 
 | 项 | 实测 | 决定 |
 |---|---|---|
-| 匿名 / guest (legacy `anon`) | 默认配置下：空身份被 NTLM 层拒绝，实名空/错密码 `STATUS_WRONG_PASSWORD`。设置 `guest-unix-user=pcuser` 并建 share `dm_anon_share` (Everyone full_control) 后：未知用户 + 空密码被接受为 guest，`CifsGuestPolicy::AllowUnsigned` 下 Namespace 契约全绿 (mkdir/list/rename/delete)；空用户名经占位身份同样通过；`Deny` 下按预期拒绝 (未签名会话)。AD 内置 `guest` 账号返回 `OutcomeUnknown` (账号禁用状态在 smb-rs 里未细分) | **已实现** (`guest_policy`)。真正的 null session (空身份) 仍不可用 |
+| 匿名 / guest (legacy `anon`) | 2026-09-16 实测：设 `guest-unix-user=pcuser` 并建 share `dm_anon_share` (Everyone full_control) 后，未知用户 + 空密码被接受为 guest，`AllowUnsigned` 下 Namespace 契约全绿；`Deny` 下按预期拒绝。**2026-09-21 复测失败，原因在服务端而非代码**：SVM `lizy` 发现的域控数为 **0** (`vserver cifs domain discovered-servers` 空)，而 guest 映射发生在"确认该用户在域里无效"之后 —— DC 联系不上就走不到那一步，任何未知用户的 SESSION_SETUP 等约 2 秒后被回以 `0xC0000466 STATUS_SERVER_UNAVAILABLE` (字面义即"域控不可用")。其余测试不受影响，因为测试账号 `LIZYAD\lisauser` 是**本地**用户 (RID 1008)，本地校验不经过 DC。(该状态码此前未建模，表现为 `OutcomeUnknown` + 连接被杀；已由 smb-rs PR #81 修正) | **已实现** (`guest_policy`)。DC 恢复后这一档应自动可用 |
 | SMB1 多协议探测 (legacy `smb2_only`) | 协商结果是 SMB 3.1.1 (`protocol=smb3`, `ntlmv2`)，但**方言只反映协商结果，不代表没先发过 SMB1 帧**。实际上 `ConnectionConfig::smb2_only_negotiate` 是 `#[derive(Default)]` 上的 `bool`，默认 `false`，facade 此前每次建连都先发 legacy SMB1 多协议 NEGOTIATE | **已修** (smb-rs #73)：facade 固定 `smb2_only_negotiate = true`，始终直接 SMB2，且不提供开关。旧记录写成「不实现」是误判 —— 不是没实现，是默认行为从 legacy 的「跳过」悄悄变成了「发送」 |
 | Multichannel | 服务端 `multichannel=false`；dual LIF 靠两个地址 | **不实现** (需要时先改 smb-rs facade) |
 | 签名 | 服务端不强制 (`smb_signing=false`)；`WhenRequired` / `Required` 都能连 | 保持 `CifsSigningPolicy` |
@@ -309,7 +309,10 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
    - `cifs_namespace_contract`：Stat / List / CreateDirectory / Rename (文件+目录) / Delete；
    - `cifs_policy_contract`：Checkpointed / AtomicReplace，含 64 MiB 多块 checkpoint、双 LIF、
      读回校验、目录 mtime；**至少跑 2 次**——协议层的回归常表现为间歇失败；
-   - `cifs_namespace_contract` 以 `CIFS_REAL_GUEST_POLICY=allow-unsigned` + 空用户名跑匿名 share；
+   - `cifs_namespace_contract` 以 `CIFS_REAL_GUEST_POLICY=allow-unsigned` + 空用户名跑匿名 share
+     —— **先确认 SVM 能发现域控** (`vserver cifs domain discovered-servers` 非空)，否则这一档必然
+     报 `0xC0000466`，那是域控不可用而不是升级回归 (2026-09-21 实测，见上方证据表)。
+     `skill` 的 `.env` 默认不设 `CIFS_REAL_GUEST_POLICY`，所以 `run.py` 本来就不跑它；
    - `cifs_capability_probe`：对照"真实环境证据"表，`[probe]` 行有变化时更新该表。
    失败时先用 `git bisect`/切回旧 rev 重跑同一用例区分"smb-rs 回归"与"服务端瞬时状态"。
 5. **同步记录**：更新本文件"底层依赖与边界"里的 rev 与内容摘要、`CLAUDE.md` "强制约束" 的 rev、

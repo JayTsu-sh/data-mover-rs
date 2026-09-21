@@ -81,6 +81,8 @@ indicatif = "0.18.4"
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1.51.1", features = ["test-util"] }
+# Real-server tests turn protocol tracing on through RUST_LOG; see tests/common/mod.rs.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # 546 个依赖里几乎不会去单步调试，本 crate 自己的代码不受影响。
 # 这是 dev 产物体积的大头，且完全可移植。
