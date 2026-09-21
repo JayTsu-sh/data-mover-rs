@@ -3,18 +3,18 @@
 use super::*;
 
 /// Namespace over a fixed tree: `keep/{a,b/c}`, `drop/{x,y/z}`, `top`.
-struct TreeNamespace {
+pub(super) struct TreeNamespace {
     lists: std::sync::Mutex<Vec<String>>,
 }
 
 impl TreeNamespace {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             lists: std::sync::Mutex::new(Vec::new()),
         }
     }
 
-    fn listed(&self) -> Vec<String> {
+    pub(super) fn listed(&self) -> Vec<String> {
         self.lists
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -61,12 +61,12 @@ impl Namespace for TreeNamespace {
 }
 
 /// Metadata role that counts calls and reports a fixed `modified`.
-struct CountingMetadata {
+pub(super) struct CountingMetadata {
     calls: std::sync::atomic::AtomicUsize,
 }
 
 impl CountingMetadata {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             calls: std::sync::atomic::AtomicUsize::new(0),
         }

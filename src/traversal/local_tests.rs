@@ -216,13 +216,62 @@ async fn invalid_subtree_is_an_ordered_entry_failure_with_completion() -> io::Re
     let mut request = request(CancellationToken::new(), 1, 1);
     request.root = StoragePath::new("../escape").map_err(io::Error::other)?;
     let mut session = fixture(root.path())?.source.traverse(request);
-    let items = drain_entries(&mut session).await;
+    let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
 
     assert_eq!(completion.observed_entries, 0);
     assert_eq!(completion.entry_failures, 1);
+    assert_eq!(completion.directories_listed, 1);
+    // The root could not be listed, so its block holds only that failure: the failure first,
+    // then the two completion items that say so. A consumer that ignores the completion items
+    // still sees the failure and cannot read this as an empty directory.
+    let [
+        TraversalItem::EntryFailure(error),
+        TraversalItem::DirectoryListed(listed),
+        TraversalItem::SubtreeComplete(complete),
+    ] = items.as_slice()
+    else {
+        panic!("unexpected item sequence: {items:?}")
+    };
+    assert_eq!(error.operation(), Operation::Traverse);
+    assert_eq!(listed.listing, crate::traversal::DirectoryListing::Failed);
+    assert_eq!(complete.summary.failed_listings, 1);
+    assert!(!complete.summary.is_exhaustive());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_real_subtree_reports_an_exhaustive_summary() -> io::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::create_dir(root.path().join("sub"))?;
+    std::fs::write(root.path().join("top.txt"), b"value")?;
+    std::fs::write(root.path().join("sub/inner.txt"), b"value")?;
+    let mut session =
+        fixture(root.path())?
+            .source
+            .traverse(request(CancellationToken::new(), 4, 2));
+
+    let items = drain(&mut session).await;
+    let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
+
+    let Some(TraversalItem::SubtreeComplete(complete)) = items.last() else {
+        panic!("a completed traversal ends with the root's subtree item: {items:?}")
+    };
+    assert_eq!(complete.path, StoragePath::root());
+    assert_eq!(complete.summary.directories_listed, 2);
+    assert_eq!(complete.summary.observed_entries, 3);
     assert!(
-        matches!(items.as_slice(), [TraversalItem::EntryFailure(error)] if error.operation() == Operation::Traverse)
+        complete.summary.is_exhaustive(),
+        "nothing was filtered, pruned, truncated or failed: {:?}",
+        complete.summary
+    );
+    assert_eq!(
+        completion.directories_listed,
+        complete.summary.directories_listed
+    );
+    assert_eq!(
+        completion.observed_entries,
+        complete.summary.observed_entries
     );
     Ok(())
 }
