@@ -267,6 +267,16 @@ impl SubtreeSummary {
     }
 }
 
+/// Whether an item is a directory completion item rather than an entry. Tests about entry
+/// order skip these; the ones in `storage::tests::events` are about them.
+#[cfg(test)]
+pub(crate) const fn is_completion(item: &TraversalItem) -> bool {
+    matches!(
+        item,
+        TraversalItem::DirectoryListed(_) | TraversalItem::SubtreeComplete(_)
+    )
+}
+
 /// Positive evidence that enumeration reached its normal terminal boundary.
 ///
 /// These are item tallies for the whole traversal. The structural account of what was and was

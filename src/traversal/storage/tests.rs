@@ -184,6 +184,9 @@ async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
     });
     let mut observed = Vec::new();
     while let Some(item) = session.next_item().await {
+        if crate::traversal::is_completion(&item) {
+            continue;
+        }
         let TraversalItem::Entry(entry) = item else {
             panic!("unexpected entry failure")
         };
@@ -236,6 +239,9 @@ async fn entry_failures_are_items_while_session_failures_are_terminal() {
     let mut session = source.traverse(request(tokio_util::sync::CancellationToken::new()));
     let mut failures = 0;
     while let Some(item) = session.next_item().await {
+        if crate::traversal::is_completion(&item) {
+            continue;
+        }
         assert!(matches!(item, TraversalItem::EntryFailure(_)));
         failures += 1;
     }
@@ -295,6 +301,9 @@ async fn cancellation_while_inflight_is_full_terminates_without_spinning() {
 async fn collect(mut session: TraversalSession) -> (Vec<String>, TraversalOutcome) {
     let mut paths = Vec::new();
     while let Some(item) = session.next_item().await {
+        if crate::traversal::is_completion(&item) {
+            continue;
+        }
         let TraversalItem::Entry(entry) = item else {
             panic!("unexpected entry failure")
         };
@@ -432,6 +441,9 @@ async fn the_admission_window_bounds_entries_waiting_to_be_emitted_not_only_infl
     assert!(metadata.started.load(std::sync::atomic::Ordering::SeqCst) <= 3);
     let mut emitted = Vec::new();
     while let Some(item) = session.next_item().await {
+        if crate::traversal::is_completion(&item) {
+            continue;
+        }
         let TraversalItem::Entry(entry) = item else {
             panic!("unexpected failure item")
         };

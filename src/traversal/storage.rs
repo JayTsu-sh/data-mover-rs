@@ -24,7 +24,7 @@ mod output;
 
 use cursor::{Cursor, Step};
 use observe::observe;
-use output::{Output, Settled};
+use output::{BlockFacts, Descent, Output, Settled};
 
 /// Protocol-neutral traversal assembled from one connected storage's namespace and metadata roles.
 pub struct StorageTraversalSource {
@@ -295,11 +295,15 @@ fn immediate_decision(
 
 /// Admits one listed child: spawns its observation and records where to descend next, or drops
 /// it. `decision` is the child's [`immediate_decision`].
+///
+/// An immediate decision is tallied on `facts` right here, because a child it hides never gets
+/// an output slot and the output side would never see it. A deferred one travels in its slot.
 fn admit(
     runtime: &Runtime<'_>,
     parent: &DirectoryWork,
     child: cursor::Child,
     cursor_slots: &mut VecDeque<cursor::Slot>,
+    facts: &mut BlockFacts,
     tasks: &mut ObservationTask,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
@@ -309,10 +313,14 @@ fn admit(
     } = child;
     let depth = parent.child_depth;
     if let Some(decision) = decision {
-        if let Some(work) = descend_work(runtime.request, &descriptor, depth, decision) {
-            cursor_slots.push_back(cursor::Slot::Descend(work));
+        match descend_outcome(runtime.request, &descriptor, depth, decision) {
+            Descend::Into(work) => cursor_slots.push_back(cursor::Slot::Descend(work)),
+            Descend::Pruned => facts.pruned = facts.pruned.saturating_add(1),
+            Descend::Truncated => facts.truncated = facts.truncated.saturating_add(1),
+            Descend::NotDirectory => {}
         }
         if !decision.emit {
+            facts.hidden = facts.hidden.saturating_add(1);
             return Ok(());
         }
     }
@@ -339,18 +347,69 @@ fn awaits_slot(request: &TraversalRequest, deferred: Deferred) -> bool {
     deferred.kind == EntryKind::Directory && request.admits_depth(deferred.depth)
 }
 
+/// Where one child's subtree goes, given a decision already made.
+enum Descend {
+    Into(DirectoryWork),
+    Pruned,
+    Truncated,
+    NotDirectory,
+}
+
+/// `max_depth` is weighed before the filter: a directory the request never reaches is truncated
+/// whatever a filter would have said about descending into it. [`deferred_descent`] reads the
+/// same order, so the two paths agree.
+fn descend_outcome(
+    request: &TraversalRequest,
+    descriptor: &SourceDescriptor,
+    depth: usize,
+    decision: TraversalDecision,
+) -> Descend {
+    if descriptor.kind != EntryKind::Directory {
+        return Descend::NotDirectory;
+    }
+    if !request.admits_depth(depth) {
+        return Descend::Truncated;
+    }
+    if !decision.descend {
+        return Descend::Pruned;
+    }
+    Descend::Into(DirectoryWork {
+        path: descriptor.path.clone(),
+        child_depth: depth.saturating_add(1),
+        filter_children: decision.filter_children,
+    })
+}
+
 fn descend_work(
     request: &TraversalRequest,
     descriptor: &SourceDescriptor,
     depth: usize,
     decision: TraversalDecision,
 ) -> Option<DirectoryWork> {
-    (decision.descend && descriptor.kind == EntryKind::Directory && request.admits_depth(depth))
-        .then(|| DirectoryWork {
-            path: descriptor.path.clone(),
-            child_depth: depth.saturating_add(1),
-            filter_children: decision.filter_children,
-        })
+    match descend_outcome(request, descriptor, depth, decision) {
+        Descend::Into(work) => Some(work),
+        Descend::Pruned | Descend::Truncated | Descend::NotDirectory => None,
+    }
+}
+
+/// Where a deferred child's subtree goes, now that its observation has settled. `descending` is
+/// whether the settled decision produced work.
+fn deferred_descent(
+    request: &TraversalRequest,
+    deferred: Deferred,
+    descending: bool,
+) -> Option<Descent> {
+    if deferred.kind != EntryKind::Directory {
+        return None;
+    }
+    if !request.admits_depth(deferred.depth) {
+        return Some(Descent::Truncated);
+    }
+    Some(if descending {
+        Descent::Listed
+    } else {
+        Descent::Pruned
+    })
 }
 
 fn entry_name(path: &StoragePath) -> &str {
@@ -373,17 +432,21 @@ fn settle(
     joined: Joined,
 ) -> Result<(), TraversalTerminalFailure> {
     let (sequence, result, deferred) = joined.map_err(|_| TraversalTerminalFailure::Internal)?;
-    let (item, descend) = match result {
+    let (item, below) = match result {
         Ok(entry) => settle_entry(runtime, entry, deferred),
         Err(StorageRoleFailure::Entry(error)) => settle_failure(runtime, error, deferred),
         Err(StorageRoleFailure::Session(error)) => {
             return Err(TraversalTerminalFailure::Session(error));
         }
     };
+    let descent =
+        deferred.and_then(|deferred| deferred_descent(runtime.request, deferred, below.is_some()));
     if deferred.is_some_and(|deferred| awaits_slot(runtime.request, deferred)) {
-        cursor.decide(sequence, descend);
+        cursor.decide(sequence, below);
     }
-    state.output.settle(sequence, Settled::Child(item));
+    state
+        .output
+        .settle(sequence, Settled::Child { item, descent });
     Ok(())
 }
 
@@ -441,8 +504,31 @@ fn queue_failure(
     let sequence = state.allocate()?;
     state.output.settle(
         sequence,
-        Settled::Child(Some(TraversalItem::EntryFailure(error))),
+        Settled::Child {
+            item: Some(TraversalItem::EntryFailure(error)),
+            descent: None,
+        },
     );
+    Ok(())
+}
+
+/// Queues the marker that closes one directory's block.
+fn queue_block_end(
+    state: &mut State,
+    path: StoragePath,
+    facts: BlockFacts,
+) -> Result<(), TraversalTerminalFailure> {
+    let sequence = state.allocate()?;
+    state
+        .output
+        .settle(sequence, Settled::BlockEnd { path, facts });
+    Ok(())
+}
+
+/// Queues the marker that closes one directory's whole subtree.
+fn queue_subtree_end(state: &mut State, path: StoragePath) -> Result<(), TraversalTerminalFailure> {
+    let sequence = state.allocate()?;
+    state.output.settle(sequence, Settled::SubtreeEnd { path });
     Ok(())
 }
 

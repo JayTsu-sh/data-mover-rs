@@ -316,6 +316,9 @@ async fn inline_timestamps_replace_the_metadata_round_trip() {
     let mut session = source.traverse(request(tokio_util::sync::CancellationToken::new()));
     let mut modified = Vec::new();
     while let Some(item) = session.next_item().await {
+        if crate::traversal::is_completion(&item) {
+            continue;
+        }
         let TraversalItem::Entry(entry) = item else {
             panic!("unexpected entry failure")
         };

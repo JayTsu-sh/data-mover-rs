@@ -76,10 +76,12 @@ async fn traversal_lists_the_whole_tree_through_the_namespace_role() -> Result {
     });
     let mut paths = Vec::new();
     while let Some(item) = session.next_item().await {
-        let TraversalItem::Entry(entry) = item else {
-            return Err(format!("unexpected failure item: {item:?}").into());
-        };
-        paths.push(entry.path().as_str().to_owned());
+        match item {
+            TraversalItem::Entry(entry) => paths.push(entry.path().as_str().to_owned()),
+            // Directory completion items are ordering evidence, not entries.
+            TraversalItem::DirectoryListed(_) | TraversalItem::SubtreeComplete(_) => {}
+            other => return Err(format!("unexpected failure item: {other:?}").into()),
+        }
     }
     paths.sort();
     assert_eq!(

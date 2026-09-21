@@ -19,9 +19,10 @@ use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+use super::output::BlockFacts;
 use super::{
     DirectoryWork, ListingTask, ObservationTask, Runtime, State, admit, descend_work,
-    entry_failure, immediate_decision, queue_failure,
+    entry_failure, immediate_decision, queue_block_end, queue_failure, queue_subtree_end,
 };
 use crate::model::{EntryOperationFailure, FailureClass, StoragePath};
 use crate::storage::{NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure};
@@ -75,14 +76,21 @@ struct Frame {
     children: Option<VecDeque<Child>>,
     /// Subdirectories to descend into once the block is admitted.
     slots: VecDeque<Slot>,
+    /// What this block knows that no output slot records.
+    facts: BlockFacts,
+    /// Whether the block's end marker has been queued. `next_after_block` runs once per slot,
+    /// so the marker needs a flag of its own to stay one per directory.
+    closed: bool,
 }
 
 impl Frame {
-    const fn new(work: DirectoryWork) -> Self {
+    fn new(work: DirectoryWork) -> Self {
         Self {
             work,
             children: None,
             slots: VecDeque::new(),
+            facts: BlockFacts::default(),
+            closed: false,
         }
     }
 }
@@ -210,21 +218,36 @@ impl Cursor {
                 }
                 continue;
             }
-            if let Some(children) = frame.children.as_mut()
-                && !children.is_empty()
+            if frame
+                .children
+                .as_ref()
+                .is_some_and(|children| !children.is_empty())
             {
+                match admit_next_child(runtime, frame, tasks, state)? {
+                    ControlFlow::Break(step) => return Ok(step),
+                    ControlFlow::Continue(()) => continue,
+                }
+            }
+            if !frame.closed {
                 if state.admitted() >= runtime.request.max_inflight_operations.get() {
                     return Ok(Step::WindowFull);
                 }
-                let Some(child) = children.pop_front() else {
-                    continue;
-                };
-                admit(runtime, &frame.work, child, &mut frame.slots, tasks, state)?;
+                queue_block_end(state, frame.work.path.clone(), frame.facts)?;
+                frame.closed = true;
                 continue;
             }
             match self.next_after_block() {
                 Next::Pop => {
-                    self.stack.pop();
+                    // The window check belongs here and not before `next_after_block`: its
+                    // other branches consume a slot, so returning early there would drop a
+                    // whole subtree. `Next::Pop` changes nothing, so this is re-entrant.
+                    if state.admitted() >= runtime.request.max_inflight_operations.get() {
+                        return Ok(Step::WindowFull);
+                    }
+                    let Some(frame) = self.stack.pop() else {
+                        return Err(TraversalTerminalFailure::Internal);
+                    };
+                    queue_subtree_end(state, frame.work.path)?;
                 }
                 Next::Descend(work) => self.stack.push(Frame::new(work)),
                 Next::Skip => {}
@@ -256,9 +279,10 @@ impl Cursor {
             }
             Err(failure) => {
                 // A directory that could not be listed still closes like any other: an empty
-                // block, then the frame's normal pop. Keeping one close path means everything
-                // hung off it holds for failed listings too.
+                // block, then the frame's normal pop. Keeping one close path means its
+                // completion items come out of the same code as everyone else's.
                 queue_failure(state, failure)?;
+                frame.facts.listing_failed = true;
                 frame.children = Some(VecDeque::new());
             }
         }
@@ -285,6 +309,31 @@ impl Cursor {
             },
         }
     }
+}
+
+/// Admits the top block's next child, or reports that the admission window is full.
+fn admit_next_child(
+    runtime: &Runtime<'_>,
+    frame: &mut Frame,
+    tasks: &mut ObservationTask,
+    state: &mut State,
+) -> Result<ControlFlow<Step>, TraversalTerminalFailure> {
+    if state.admitted() >= runtime.request.max_inflight_operations.get() {
+        return Ok(ControlFlow::Break(Step::WindowFull));
+    }
+    let Some(child) = frame.children.as_mut().and_then(VecDeque::pop_front) else {
+        return Ok(ControlFlow::Continue(()));
+    };
+    admit(
+        runtime,
+        &frame.work,
+        child,
+        &mut frame.slots,
+        &mut frame.facts,
+        tasks,
+        state,
+    )?;
+    Ok(ControlFlow::Continue(()))
 }
 
 /// Depth-first search over the directories the traversal will list next.

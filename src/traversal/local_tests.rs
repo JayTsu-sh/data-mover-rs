@@ -58,6 +58,15 @@ async fn drain(session: &mut TraversalSession) -> Vec<TraversalItem> {
     items
 }
 
+/// Everything but the directory completion items, for tests that are about entry order.
+async fn drain_entries(session: &mut TraversalSession) -> Vec<TraversalItem> {
+    drain(session)
+        .await
+        .into_iter()
+        .filter(|item| !crate::traversal::is_completion(item))
+        .collect()
+}
+
 fn completed(outcome: TraversalOutcome) -> io::Result<TraversalCompletion> {
     match outcome {
         TraversalOutcome::Completed(completion) => Ok(completion),
@@ -135,7 +144,7 @@ async fn traversal_applies_one_optional_metadata_plan_to_each_entry() -> io::Res
         ObservationPlan::default().with_ownership_mode(ObservationMode::InlineOnly);
     let mut session = fixture(root.path())?.source.traverse(request);
 
-    let items = drain(&mut session).await;
+    let items = drain_entries(&mut session).await;
     let _ = completed(session.finish().await.map_err(io::Error::other)?)?;
     assert!(matches!(
         items.as_slice(),
@@ -207,7 +216,7 @@ async fn invalid_subtree_is_an_ordered_entry_failure_with_completion() -> io::Re
     let mut request = request(CancellationToken::new(), 1, 1);
     request.root = StoragePath::new("../escape").map_err(io::Error::other)?;
     let mut session = fixture(root.path())?.source.traverse(request);
-    let items = drain(&mut session).await;
+    let items = drain_entries(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
 
     assert_eq!(completion.observed_entries, 0);

@@ -325,6 +325,13 @@ async fn validate_traversal(source: &Storage, dialect: ContractDialect) -> Contr
     let mut saw_fixture = false;
     let mut saw_link = false;
     while let Some(item) = session.next_item().await {
+        // Directory completion items are ordering evidence, not entries.
+        if matches!(
+            item,
+            TraversalItem::DirectoryListed(_) | TraversalItem::SubtreeComplete(_)
+        ) {
+            continue;
+        }
         let TraversalItem::Entry(entry) = item else {
             return Err("fixture traversal returned an entry failure".into());
         };

@@ -35,7 +35,9 @@ async fn hdfs_facts_survive_snapshot_without_backend_requery()
     };
     let rebuilt = ObservedEntry::decode_snapshot(entry.encode_snapshot().as_bytes())?;
     assert_eq!(*entry, rebuilt);
-    assert!(session.next_item().await.is_none());
+    while let Some(item) = session.next_item().await {
+        assert!(crate::traversal::is_completion(&item));
+    }
     session.finish().await?;
     Ok(())
 }
