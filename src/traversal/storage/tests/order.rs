@@ -2,12 +2,13 @@
 
 use super::events::events;
 use super::*;
-use crate::traversal::{ChildOrder, TraversalOrder};
+use crate::traversal::{ChildOrder, DirectoryListing, TraversalOrder};
 
 /// A tree whose every listing arrives in the reverse of its byte order, so nothing passes by
 /// accident, plus the three shapes the contract makes claims about: `a`, `a/x` and `a.txt`
-/// together (descent must come between two siblings), an uppercase name (byte order is not any
-/// server's case-insensitive collation), and a listing that also carries a failure.
+/// together (all of the root's children precede anything under `a`, which is what makes the
+/// comparison key `(parent, name)` rather than the whole path), an uppercase name (byte order is
+/// not any server's case-insensitive collation), and a listing that also carries a failure.
 struct ReversedNamespace;
 
 #[async_trait]
@@ -100,11 +101,14 @@ async fn admission_leaves_the_backend_listing_order_alone() {
 }
 
 /// The whole contract in one sequence: siblings sorted, subdirectories descended into in that
-/// same order, and so the stream as a whole is the tree's ordered depth-first preorder.
+/// same order, and blocks that never interleave.
 ///
-/// `a`, `a/x` and `a.txt` are the case that separates this from sorting whole relative paths:
-/// `a`'s subtree comes between `a` and `a.txt`, because the separator sorts below every other
-/// byte. `B` before `a` is the other one: `0x42 < 0x61`, which no case-insensitive server would
+/// `a`, `a/x` and `a.txt` are the case that fixes the comparison key. The sequence is `a`,
+/// `a.txt`, …, `a/x`: both are the root's children, so both precede everything under `a`. It is
+/// **not** the tree's depth-first preorder, which would be `a`, `a/x`, `a.txt` and would need
+/// the traversal to descend mid-block. So a consumer compares `(parent, name)`; comparing whole
+/// paths one component at a time would put `a/x` second and misalign a two-sided merge.
+/// `B` before `a` is the other case: `0x42 < 0x61`, which no case-insensitive server would
 /// agree with.
 #[tokio::test]
 async fn name_bytes_orders_both_the_block_and_the_descent() {
@@ -302,5 +306,69 @@ async fn name_bytes_does_not_depend_on_how_much_runs_at_once() {
     assert!(
         rendered.windows(2).all(|pair| pair[0] == pair[1]),
         "{rendered:#?}"
+    );
+}
+
+/// A listing that fails outright still closes like any other directory, with an empty block.
+struct FailingListNamespace;
+
+#[async_trait]
+impl Namespace for FailingListNamespace {
+    async fn execute(
+        &self,
+        request: NamespaceRequest,
+    ) -> Result<NamespaceResult, StorageRoleFailure> {
+        let NamespaceRequest::List(directory) = request else {
+            return Err(StorageRoleFailure::Entry(entry_failure(
+                &StoragePath::root(),
+                FailureClass::Unsupported,
+            )));
+        };
+        match directory.as_str() {
+            "" => Ok(NamespaceResult::Entries(vec![descriptor(
+                "sub",
+                EntryKind::Directory,
+            )])),
+            _ => Err(StorageRoleFailure::Entry(entry_failure(
+                &directory,
+                FailureClass::Protocol,
+            ))),
+        }
+    }
+}
+
+/// A directory that could not be listed has an empty block, so there is nothing to put in order
+/// — but it still reports the order that was asked for. Reporting the default instead would read
+/// as "the request was not honored", and a consumer guarding its merge on `child_order` would
+/// trip on every unreadable directory rather than on the one thing that matters, `listing`.
+#[tokio::test]
+async fn a_directory_that_could_not_be_listed_still_reports_the_requested_order() {
+    let source =
+        StorageTraversalSource::with_roles(Arc::new(FailingListNamespace), Arc::new(FakeMetadata));
+    let mut session = source.traverse(ordered_request(TraversalOrder::NameBytes));
+    let mut seen = Vec::new();
+    while let Some(item) = session.next_item().await {
+        if let TraversalItem::DirectoryListed(listed) = item {
+            seen.push((
+                listed.path.as_str().to_owned(),
+                listed.listing,
+                listed.child_order,
+            ));
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            (
+                String::new(),
+                DirectoryListing::Complete,
+                ChildOrder::NameBytes
+            ),
+            (
+                "sub".to_owned(),
+                DirectoryListing::Failed,
+                ChildOrder::NameBytes
+            ),
+        ]
     );
 }

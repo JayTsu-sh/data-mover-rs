@@ -48,7 +48,9 @@ pub enum TraversalOrder {
     /// The order is over raw UTF-8 bytes and is **no server's collation**: a case-insensitive
     /// share sorts `README.md` next to `readme.md`, this does not, and such a destination cannot
     /// hold both at once. Children the listing itself could not describe have no name to sort by
-    /// and stay ahead of the block, outside the order.
+    /// and stay ahead of the block, outside the order: the guarantee covers described children,
+    /// and two backends that fail to name the same two children may still put those two failures
+    /// in two different sequences. A merge that walks the stream literally has to skip them.
     NameBytes,
 }
 

@@ -1,9 +1,11 @@
 //! The admission cursor: walks the tree depth-first and assigns every output slot its sequence.
 //!
 //! Output order is a sequence of *blocks*. A block is every child of one listed directory, in
-//! listing order. The root's block comes first; after a directory's block, each subdirectory
-//! it descends into contributes its own block, recursively, in listing order. So a directory's
-//! children always follow the directory itself, and one listing's children are contiguous.
+//! the order the request asked for. The root's block comes first; after a directory's block,
+//! each subdirectory it descends into contributes its own block, recursively, in that same
+//! order. So a directory's children always follow the directory itself, and one listing's
+//! children are contiguous. Blocks never interleave, which is why the stream is not a
+//! depth-first preorder over paths: every child of a directory precedes every grandchild.
 //!
 //! Only the cursor allocates sequence numbers, and it does so in exactly that order. Listings
 //! and observations may finish in any order; timing decides only *when* the cursor can take the
@@ -42,7 +44,7 @@ pub(super) enum Step {
     WaitObservation,
 }
 
-/// Where the cursor goes after a block, in listing order.
+/// Where the cursor goes after a block, in the block's own order.
 pub(super) enum Slot {
     Descend(DirectoryWork),
     /// A deferred decision, keyed by the sequence of the observation that settles it.
@@ -60,10 +62,8 @@ pub(super) struct Child {
 struct Prepared {
     failures: Vec<EntryOperationFailure>,
     children: VecDeque<Child>,
-    /// Subdirectories this block already knows it will descend into, in listing order.
+    /// Subdirectories this block already knows it will descend into, in the block's own order.
     descend: Vec<DirectoryWork>,
-    /// The order the children above are in, for the block's end marker to report.
-    child_order: ChildOrder,
 }
 
 /// A started listing: the directory, and its prepared result once it has arrived.
@@ -75,7 +75,7 @@ struct Listing {
 /// One directory on the cursor's path from the root.
 struct Frame {
     work: DirectoryWork,
-    /// Children still to admit, in listing order; `None` until the listing is taken.
+    /// Children still to admit, in the block's own order; `None` until the listing is taken.
     children: Option<VecDeque<Child>>,
     /// Subdirectories to descend into once the block is admitted.
     slots: VecDeque<Slot>,
@@ -87,12 +87,18 @@ struct Frame {
 }
 
 impl Frame {
-    fn new(work: DirectoryWork) -> Self {
+    /// `child_order` is set here rather than when the listing lands, so that a directory that
+    /// could not be listed at all still reports the order the request asked for instead of
+    /// falling back to the default and reading as if the option had been ignored.
+    fn new(work: DirectoryWork, child_order: ChildOrder) -> Self {
         Self {
             work,
             children: None,
             slots: VecDeque::new(),
-            facts: BlockFacts::default(),
+            facts: BlockFacts {
+                child_order,
+                ..BlockFacts::default()
+            },
             closed: false,
         }
     }
@@ -100,6 +106,9 @@ impl Frame {
 
 pub(super) struct Cursor {
     stack: Vec<Frame>,
+    /// What every frame reports as its block's order. Per request today; the field lives on
+    /// `BlockFacts` so a future per-directory degradation can report itself.
+    child_order: ChildOrder,
     /// Deferred descend decisions, filled as their observations settle.
     decisions: HashMap<u64, Option<DirectoryWork>>,
     /// Listings started for frames the cursor has not taken yet.
@@ -115,9 +124,10 @@ enum Next {
 }
 
 impl Cursor {
-    pub(super) fn new(root: DirectoryWork) -> Self {
+    pub(super) fn new(root: DirectoryWork, child_order: ChildOrder) -> Self {
         Self {
-            stack: vec![Frame::new(root)],
+            stack: vec![Frame::new(root, child_order)],
+            child_order,
             decisions: HashMap::new(),
             listings: HashMap::new(),
         }
@@ -244,7 +254,7 @@ impl Cursor {
                     ControlFlow::Break(step) => return Ok(step),
                     ControlFlow::Continue(()) => {}
                 },
-                Next::Descend(work) => self.stack.push(Frame::new(work)),
+                Next::Descend(work) => self.stack.push(Frame::new(work, self.child_order)),
                 Next::Skip => {}
                 Next::Wait => return Ok(Step::WaitObservation),
             }
@@ -291,7 +301,6 @@ impl Cursor {
                 for failure in prepared.failures {
                     queue_failure(state, failure)?;
                 }
-                frame.facts.child_order = prepared.child_order;
                 frame.children = Some(prepared.children);
             }
             Err(failure) => {
@@ -429,19 +438,17 @@ fn prepare(
         failures,
         children,
         descend,
-        child_order: match runtime.request.order {
-            TraversalOrder::Admission => ChildOrder::Listing,
-            TraversalOrder::NameBytes => ChildOrder::NameBytes,
-        },
     }))
 }
 
 /// Sorts a listing's described children by the bytes of their final path component.
 ///
 /// Unstable, so a directory of millions does not also pay the half-length temporary a stable
-/// sort allocates. Two children of one directory cannot share a name, so a tie is a backend
-/// defect and the contract leaves its order unspecified. `failures` keep their place ahead of
-/// the block: a child the listing could not describe has no name to sort by.
+/// sort allocates. A tie needs no defined order: two children of one directory normally cannot
+/// share a name, and where one still arrives twice — an NFS readdir crossing a cookie boundary
+/// on a directory being written to — both descriptors spell the same path, so which one wins
+/// cannot change the emitted sequence. `failures` keep their place ahead of the block: a child
+/// the listing could not describe has no name to sort by.
 fn sort_by_name(result: &mut Result<NamespaceResult, StorageRoleFailure>) {
     let Ok(listing) = result else { return };
     let entries = match listing {
@@ -480,8 +487,10 @@ fn spawn_listing(
         },
     );
     let namespace = Arc::clone(runtime.namespace);
-    // Sorting rides on the listing's own task, never on the driver: a directory of millions
-    // would keep the driver loop from reaching an await point, and cancellation with it.
+    // Sorting rides on the listing's own task rather than the driver's, so a directory of
+    // millions is scheduled like the listing I/O already is instead of sitting between two of
+    // the driver loop's await points. On a current-thread runtime it still shares the thread;
+    // only `spawn_blocking` would change that, and no listing so far has been worth it.
     let order = runtime.request.order;
     listings.spawn(async move {
         let mut result = namespace

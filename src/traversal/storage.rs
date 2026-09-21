@@ -5,9 +5,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinSet};
 
 use super::{
-    TraversalCandidate, TraversalCompletion, TraversalDecision, TraversalFilter, TraversalItem,
-    TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
-    TraversalTerminalFailure, relative_to,
+    ChildOrder, TraversalCandidate, TraversalCompletion, TraversalDecision, TraversalFilter,
+    TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest, TraversalSession,
+    TraversalSource, TraversalTerminalFailure, relative_to,
 };
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, ObservationMode, ObservationPlan,
@@ -186,11 +186,17 @@ async fn run(
     completion: oneshot::Sender<Result<TraversalOutcome, TraversalTerminalFailure>>,
 ) {
     let mut state = State::new();
-    let mut cursor = Cursor::new(DirectoryWork {
-        path: request.root.clone(),
-        child_depth: 1,
-        filter_children: request.filter.is_some(),
-    });
+    let mut cursor = Cursor::new(
+        DirectoryWork {
+            path: request.root.clone(),
+            child_depth: 1,
+            filter_children: request.filter.is_some(),
+        },
+        match request.order {
+            TraversalOrder::Admission => ChildOrder::Listing,
+            TraversalOrder::NameBytes => ChildOrder::NameBytes,
+        },
+    );
     let mut tasks = JoinSet::new();
     let mut listings = JoinSet::new();
     let runtime = Runtime {
