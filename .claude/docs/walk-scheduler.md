@@ -77,7 +77,7 @@ impl<T> AsyncReceiver<T> {
 | `is_done` 早退 | 必须同时检 active_tasks + active_producers |
 | 窃任务被取走两次 | FIFO 用原子 take，head 推进 |
 | 长尾任务卡死 | 自栈 LIFO 让最深的子任务先做完，避免 leaf 任务积压 |
-| Notify 丢失 wake | tokio Notify 有 permit 机制，不会丢 |
+| Notify 丢失 wake | **会丢**：`push_task` 用的 `notify_waiters()` 不存 permit，对当时没在等的 worker 就是丢。存 permit 的是 `notify_one()`。现在靠 `wait_for_task()` 的 100μs 超时兜底 (空闲时每 worker 每秒醒 1 万次)。正解是改 `notify_one()` 并去掉超时。同一成因见 smb-rs PR #80 |
 | 跨 worker 数据共享 | 任务自包含，不要全局可变状态 |
 
 ## 调参
