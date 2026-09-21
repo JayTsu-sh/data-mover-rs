@@ -435,6 +435,7 @@ async fn a_deferred_observation_failure_still_lists_the_directory() {
         match item {
             TraversalItem::Entry(entry) => emitted.push(entry.path().as_str().to_owned()),
             TraversalItem::EntryFailure(error) => failed.push(error.path().as_str().to_owned()),
+            TraversalItem::DirectoryListed(_) | TraversalItem::SubtreeComplete(_) => {}
         }
     }
     assert_eq!(failed, ["keep"]);

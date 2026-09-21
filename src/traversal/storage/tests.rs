@@ -347,6 +347,7 @@ async fn an_undescribable_child_is_a_failure_item_without_hiding_its_siblings() 
         match item {
             TraversalItem::Entry(entry) => entries.push(entry.path().as_str().to_owned()),
             TraversalItem::EntryFailure(error) => failures.push(error.path().as_str().to_owned()),
+            TraversalItem::DirectoryListed(_) | TraversalItem::SubtreeComplete(_) => {}
         }
     }
     assert_eq!(entries, ["dir", "dir/ok"]);

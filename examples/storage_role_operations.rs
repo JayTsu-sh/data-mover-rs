@@ -195,6 +195,22 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
                 failures += 1;
                 eprintln!("entry failure {} {:?}", error.path(), error.class());
             }
+            TraversalItem::DirectoryListed(listed) => {
+                println!(
+                    "listed {} {:?} pruned={} truncated={}",
+                    listed.path, listed.listing, listed.pruned_children, listed.truncated_children
+                );
+            }
+            TraversalItem::SubtreeComplete(complete) => {
+                println!(
+                    "subtree {} exhaustive={} {:?}",
+                    complete.path,
+                    complete.summary.is_exhaustive(),
+                    complete.summary
+                );
+            }
+            // `TraversalItem` is `#[non_exhaustive]`: a later item kind must not break this.
+            _ => {}
         }
     }
     let outcome = session.finish().await?;

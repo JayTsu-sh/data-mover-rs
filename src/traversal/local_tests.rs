@@ -70,7 +70,9 @@ fn entry_paths(items: &[TraversalItem]) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             TraversalItem::Entry(entry) => Some(entry.path().as_str().to_owned()),
-            TraversalItem::EntryFailure(_) => None,
+            TraversalItem::EntryFailure(_)
+            | TraversalItem::DirectoryListed(_)
+            | TraversalItem::SubtreeComplete(_) => None,
         })
         .collect()
 }
@@ -317,7 +319,9 @@ async fn non_utf8_entry_failures_keep_distinct_lossless_identities() -> io::Resu
         .iter()
         .filter_map(|item| match item {
             TraversalItem::EntryFailure(error) => Some(error),
-            TraversalItem::Entry(_) => None,
+            TraversalItem::Entry(_)
+            | TraversalItem::DirectoryListed(_)
+            | TraversalItem::SubtreeComplete(_) => None,
         })
         .collect::<Vec<_>>();
 

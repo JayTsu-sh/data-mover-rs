@@ -81,6 +81,8 @@ impl Output {
         match &item {
             TraversalItem::Entry(_) => self.observed += 1,
             TraversalItem::EntryFailure(_) => self.failed += 1,
+            // Completion items are neither entries nor failures; they have their own tallies.
+            TraversalItem::DirectoryListed(_) | TraversalItem::SubtreeComplete(_) => {}
         }
         tokio::select! {
             biased;

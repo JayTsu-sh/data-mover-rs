@@ -167,17 +167,125 @@ impl TraversalRequest {
 }
 
 /// One ordered traversal item. Entry failures do not terminate the session.
+///
+/// A listed directory `D` produces, in order: its block, which is one item per admitted child;
+/// then [`TraversalItem::DirectoryListed`] for `D`; then, for every subdirectory `D` descends
+/// into, that same sequence recursively; and last [`TraversalItem::SubtreeComplete`] for `D`.
+/// A traversal that runs to completion therefore ends with the root's `SubtreeComplete`.
+///
+/// Only a directory that was actually listed gets those two items. A directory `max_depth`
+/// stops at is emitted as an entry and never listed, so it has neither; a directory the filter
+/// hides but still descends into has both, with no [`TraversalItem::Entry`] of its own.
+///
+/// A `DirectoryListed` can arrive without its `SubtreeComplete`: cancellation stops the
+/// traversal wherever it stands, and only [`TraversalOutcome::Completed`] guarantees the pair.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum TraversalItem {
     Entry(Box<ObservedEntry>),
     EntryFailure(EntryOperationFailure),
+    /// Every direct child of one listed directory has been delivered.
+    DirectoryListed(DirectoryListed),
+    /// One listed directory's whole subtree has been delivered.
+    SubtreeComplete(Box<SubtreeComplete>),
+}
+
+/// Every direct child of one listed directory has been delivered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct DirectoryListed {
+    pub path: StoragePath,
+    pub listing: DirectoryListing,
+    /// Direct subdirectories the filter did not descend into. Each was still emitted as an
+    /// entry, and none of them has completion items of its own.
+    pub pruned_children: u64,
+    /// Direct subdirectories `max_depth` stopped at. Each was still emitted as an entry, and
+    /// none of them has completion items of its own.
+    pub truncated_children: u64,
+}
+
+/// How complete one directory's block is.
+///
+/// The states are exclusive. When more than one applies, the strongest holds: `Failed` over
+/// `Partial` over `Filtered` over `Complete`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DirectoryListing {
+    /// Every child was described and emitted.
+    Complete,
+    /// Every child was described, but the filter kept at least one out of the output. A
+    /// subdirectory that was merely not descended into does not make a listing `Filtered`,
+    /// because its own entry was still emitted; see [`DirectoryListed::pruned_children`].
+    Filtered,
+    /// The listing succeeded, but `failures` children produced an entry failure instead of an
+    /// entry: the listing could not name them, or observing them failed. Each one is an item in
+    /// this block.
+    Partial { failures: u64 },
+    /// The directory could not be listed at all. Why is in the `Operation::Traverse` entry
+    /// failure that is the only item in its block.
+    Failed,
+}
+
+/// One listed directory's whole subtree has been delivered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SubtreeComplete {
+    pub path: StoragePath,
+    pub summary: SubtreeSummary,
+}
+
+/// What one subtree, the directory at its root included, turned out to hold.
+///
+/// A listing that failed counts in both `entry_failures` and `failed_listings`: the first counts
+/// items, the second counts directories, and one failed listing is one of each.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SubtreeSummary {
+    pub directories_listed: u64,
+    pub filtered_listings: u64,
+    pub partial_listings: u64,
+    pub failed_listings: u64,
+    pub observed_entries: u64,
+    pub entry_failures: u64,
+    /// Subdirectories the filter did not descend into.
+    pub pruned_directories: u64,
+    /// Subdirectories `max_depth` stopped at.
+    pub truncated_directories: u64,
+}
+
+impl SubtreeSummary {
+    /// Whether this subtree is a complete account of what the source holds: nothing hidden,
+    /// pruned, truncated or failed. Only then may a caller treat what it did not see as absent.
+    #[must_use]
+    pub const fn is_exhaustive(&self) -> bool {
+        self.filtered_listings == 0
+            && self.partial_listings == 0
+            && self.failed_listings == 0
+            && self.entry_failures == 0
+            && self.pruned_directories == 0
+            && self.truncated_directories == 0
+    }
 }
 
 /// Positive evidence that enumeration reached its normal terminal boundary.
+///
+/// These are item tallies for the whole traversal. The structural account of what was and was
+/// not seen is [`SubtreeSummary`], carried by the root's [`TraversalItem::SubtreeComplete`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct TraversalCompletion {
     pub observed_entries: u64,
     pub entry_failures: u64,
+}
+
+impl TraversalCompletion {
+    #[must_use]
+    pub const fn new(observed_entries: u64, entry_failures: u64) -> Self {
+        Self {
+            observed_entries,
+            entry_failures,
+        }
+    }
 }
 
 /// Normal terminal outcomes, distinct from backend/runtime failure.
