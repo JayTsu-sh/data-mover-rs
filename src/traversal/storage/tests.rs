@@ -468,3 +468,4 @@ mod filter;
 mod order;
 mod prefetch;
 mod residency;
+mod slots;
