@@ -25,8 +25,8 @@ use super::output::BlockFacts;
 #[cfg(test)]
 use super::residency::Residency;
 use super::{
-    DirectoryWork, ListingTask, ObservationTask, Runtime, State, admit, descend_work,
-    entry_failure, entry_name, immediate_decision, queue_block_end, queue_failure,
+    DescendOutcome, DirectoryWork, ListingTask, ObservationTask, Runtime, State, admit,
+    descend_outcome, entry_failure, entry_name, immediate_decision, queue_block_end, queue_failure,
     queue_subtree_end,
 };
 use crate::model::{EntryOperationFailure, FailureClass, StoragePath};
@@ -64,8 +64,17 @@ pub(super) struct Child {
 struct Prepared {
     failures: Vec<EntryOperationFailure>,
     children: VecDeque<Child>,
-    /// Subdirectories this block already knows it will descend into, in the block's own order.
-    descend: Vec<DirectoryWork>,
+    /// Where the cursor goes after this block, in the block's own order.
+    ///
+    /// Built here rather than as each child is admitted, so one listing yields one table instead
+    /// of two copies of it, and [`descend_outcome`] runs once per child instead of twice. Empty
+    /// when the filter defers its decisions: those slots carry an observation's sequence, which
+    /// only exists once the child is admitted.
+    slots: VecDeque<Slot>,
+    /// Subdirectories an immediate decision did not descend into, and those `max_depth` stopped
+    /// at. Counted here for the same reason the slots are built here.
+    pruned: u64,
+    truncated: u64,
 }
 
 /// A started listing: the directory, and its prepared result once it has arrived.
@@ -163,9 +172,9 @@ impl Cursor {
                 Some(arrived) => {
                     sample.listings_arrived += 1;
                     if let Ok(prepared) = arrived {
-                        sample.block_children += prepared.children.len();
+                        sample.prefetched_children += prepared.children.len();
                         sample.block_capacity += prepared.children.capacity();
-                        sample.descend_slots += prepared.descend.len();
+                        sample.prefetched_slots += prepared.slots.len();
                         sample.path_bytes += prepared_path_bytes(prepared);
                     }
                 }
@@ -343,6 +352,9 @@ impl Cursor {
                 for failure in prepared.failures {
                     queue_failure(state, failure)?;
                 }
+                frame.facts.pruned = frame.facts.pruned.saturating_add(prepared.pruned);
+                frame.facts.truncated = frame.facts.truncated.saturating_add(prepared.truncated);
+                frame.slots = prepared.slots;
                 frame.children = Some(prepared.children);
             }
             Err(failure) => {
@@ -436,8 +448,10 @@ impl Search<'_> {
                 arrived: Some(Ok(prepared)),
                 ..
             }) => {
-                for child in &prepared.descend {
-                    self.visit(Some(child))?;
+                for slot in &prepared.slots {
+                    if let Slot::Descend(child) = slot {
+                        self.visit(Some(child))?;
+                    }
                 }
             }
             _ => {}
@@ -462,14 +476,17 @@ fn prepare(
         }
     };
     let mut children = VecDeque::with_capacity(entries.len());
-    let mut descend = Vec::new();
+    let mut slots = VecDeque::new();
+    let (mut pruned, mut truncated) = (0_u64, 0_u64);
     for descriptor in entries {
         let decision = immediate_decision(runtime, work, &descriptor);
-        if let Some(decision) = decision
-            && let Some(below) =
-                descend_work(runtime.request, &descriptor, work.child_depth, decision)
-        {
-            descend.push(below);
+        if let Some(decision) = decision {
+            match descend_outcome(runtime.request, &descriptor, work.child_depth, decision) {
+                DescendOutcome::Into(below) => slots.push_back(Slot::Descend(below)),
+                DescendOutcome::Pruned => pruned = pruned.saturating_add(1),
+                DescendOutcome::Truncated => truncated = truncated.saturating_add(1),
+                DescendOutcome::NotDirectory => {}
+            }
         }
         children.push_back(Child {
             descriptor,
@@ -479,7 +496,9 @@ fn prepare(
     Ok(Ok(Prepared {
         failures,
         children,
-        descend,
+        slots,
+        pruned,
+        truncated,
     }))
 }
 
@@ -552,7 +571,10 @@ fn prepared_path_bytes(prepared: &Prepared) -> usize {
         .children
         .iter()
         .map(|child| child.descriptor.path.as_str().len())
-        .chain(prepared.descend.iter().map(|work| work.path.as_str().len()))
+        .chain(prepared.slots.iter().map(|slot| match slot {
+            Slot::Descend(work) => work.path.as_str().len(),
+            Slot::Pending(_) => 0,
+        }))
         .chain(
             prepared
                 .failures

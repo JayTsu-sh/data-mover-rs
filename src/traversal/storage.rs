@@ -351,11 +351,13 @@ fn immediate_decision(
     Some(runtime.policy.decide(parent.filter_children, &candidate))
 }
 
-/// Admits one listed child: spawns its observation and records where to descend next, or drops
-/// it. `decision` is the child's [`immediate_decision`].
+/// Admits one listed child: spawns its observation, or drops it. `decision` is the child's
+/// [`immediate_decision`].
 ///
-/// An immediate decision is tallied on `facts` right here, because a child it hides never gets
-/// an output slot and the output side would never see it. A deferred one travels in its slot.
+/// Where an immediate decision descends to was settled when the listing arrived, so this only
+/// tallies what an output slot cannot show: a child the filter hides never gets one, and the
+/// output side would never see it. A deferred decision still needs a slot here, because the slot
+/// is keyed by the sequence this function allocates.
 fn admit(
     runtime: &Runtime<'_>,
     parent: &DirectoryWork,
@@ -370,17 +372,11 @@ fn admit(
         decision,
     } = child;
     let depth = parent.child_depth;
-    if let Some(decision) = decision {
-        match descend_outcome(runtime.request, &descriptor, depth, decision) {
-            DescendOutcome::Into(work) => cursor_slots.push_back(cursor::Slot::Descend(work)),
-            DescendOutcome::Pruned => facts.pruned = facts.pruned.saturating_add(1),
-            DescendOutcome::Truncated => facts.truncated = facts.truncated.saturating_add(1),
-            DescendOutcome::NotDirectory => {}
-        }
-        if !decision.emit {
-            facts.hidden = facts.hidden.saturating_add(1);
-            return Ok(());
-        }
+    if let Some(decision) = decision
+        && !decision.emit
+    {
+        facts.hidden = facts.hidden.saturating_add(1);
+        return Ok(());
     }
     let sequence = state.allocate()?;
     let context = decision.is_none().then_some(Deferred {
@@ -436,18 +432,6 @@ fn descend_outcome(
         child_depth: depth.saturating_add(1),
         filter_children: decision.filter_children,
     })
-}
-
-fn descend_work(
-    request: &TraversalRequest,
-    descriptor: &SourceDescriptor,
-    depth: usize,
-    decision: TraversalDecision,
-) -> Option<DirectoryWork> {
-    match descend_outcome(request, descriptor, depth, decision) {
-        DescendOutcome::Into(work) => Some(work),
-        DescendOutcome::Pruned | DescendOutcome::Truncated | DescendOutcome::NotDirectory => None,
-    }
 }
 
 /// Where a deferred child's subtree goes, now that its observation has settled. `descending` is

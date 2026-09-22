@@ -23,7 +23,13 @@ pub(super) struct Residency {
     /// Only the top frame ever has any: a block is admitted in full before the cursor descends,
     /// so every ancestor's queue is already empty. The stack does **not** hold one pending block
     /// per level.
+    ///
+    /// Counts the frames alone. What prefetch is holding is [`Self::prefetched_children`], kept
+    /// apart because the two move for different reasons: one with how wide a directory is, the
+    /// other with how far ahead the traversal is allowed to read.
     pub(super) block_children: usize,
+    /// Children of listings that arrived before the cursor asked for them.
+    pub(super) prefetched_children: usize,
     /// Room those queues still occupy. An emptied `VecDeque` does not shrink, so an ancestor
     /// frame keeps its widest block's allocation until it pops — invisible in `block_children`,
     /// which is exactly why it is counted apart.
@@ -32,6 +38,8 @@ pub(super) struct Residency {
     /// and cannot be paged away: returning to ten million subdirectories means remembering ten
     /// million places to return to.
     pub(super) descend_slots: usize,
+    /// Descend slots of listings that arrived before the cursor asked for them.
+    pub(super) prefetched_slots: usize,
     /// Deferred filter decisions waiting for their observation to settle. Shares an exit with
     /// `descend_slots` — both are consumed only once a block closes — so under a filter that
     /// needs `modified` it grows just as far.
@@ -51,8 +59,10 @@ pub(super) struct Residency {
 #[derive(Debug, Default)]
 pub(super) struct ResidencyPeak {
     block_children: AtomicUsize,
+    prefetched_children: AtomicUsize,
     block_capacity: AtomicUsize,
     descend_slots: AtomicUsize,
+    prefetched_slots: AtomicUsize,
     deferred_decisions: AtomicUsize,
     listings_inflight: AtomicUsize,
     listings_arrived: AtomicUsize,
@@ -63,8 +73,10 @@ impl ResidencyPeak {
     pub(super) fn record(&self, sample: Residency) {
         for (slot, value) in [
             (&self.block_children, sample.block_children),
+            (&self.prefetched_children, sample.prefetched_children),
             (&self.block_capacity, sample.block_capacity),
             (&self.descend_slots, sample.descend_slots),
+            (&self.prefetched_slots, sample.prefetched_slots),
             (&self.deferred_decisions, sample.deferred_decisions),
             (&self.listings_inflight, sample.listings_inflight),
             (&self.listings_arrived, sample.listings_arrived),
@@ -77,8 +89,10 @@ impl ResidencyPeak {
     pub(super) fn peak(&self) -> Residency {
         Residency {
             block_children: self.block_children.load(Ordering::Relaxed),
+            prefetched_children: self.prefetched_children.load(Ordering::Relaxed),
             block_capacity: self.block_capacity.load(Ordering::Relaxed),
             descend_slots: self.descend_slots.load(Ordering::Relaxed),
+            prefetched_slots: self.prefetched_slots.load(Ordering::Relaxed),
             deferred_decisions: self.deferred_decisions.load(Ordering::Relaxed),
             listings_inflight: self.listings_inflight.load(Ordering::Relaxed),
             listings_arrived: self.listings_arrived.load(Ordering::Relaxed),

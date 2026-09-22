@@ -230,9 +230,11 @@ async fn depth_multiplies_retained_room_but_not_pending_children() {
         peak.block_children <= fan_out + 1,
         "more than one level pending: {peak:?}"
     );
+    // One per level at most: a frame's slot is consumed the moment the cursor descends through
+    // it, so the stack carries the path's remaining turns, not each level's whole fan-out.
     assert!(
-        peak.descend_slots <= 1,
-        "a descended slot was not consumed: {peak:?}"
+        peak.descend_slots <= depth,
+        "slots grew faster than the depth: {peak:?}"
     );
     assert!(
         peak.block_capacity > 4 * (fan_out + 1),
@@ -351,9 +353,11 @@ async fn arrived_but_untaken_listings_count_towards_residency() {
         probed_request("", 4),
     )
     .await;
+    // Several finished listings at once, each a full block: the frames alone never account for
+    // this, and a probe that skipped them would report a fraction of the real peak.
     assert!(
-        peak.block_children > breadth + leaves,
-        "no more than the root's block plus one child's: {peak:?}"
+        peak.prefetched_children > leaves,
+        "at most one finished listing: {peak:?}"
     );
     assert!(
         peak.listings_arrived > 1,
