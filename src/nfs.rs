@@ -4436,6 +4436,12 @@ impl NFSStorage {
     }
 
     /// Lists exactly one directory for the storage Namespace role.
+    ///
+    /// Entries keep the order the server sent them in. The traversal contract deliberately does
+    /// not constrain sibling order, and a caller that needs one asks for `TraversalOrder`, which
+    /// sorts in the cursor. Sorting here bought nothing: it cost an `O(n log n)` pass per
+    /// directory, and it was the reason this backend looked ordered while the CIFS and Local
+    /// namespaces, which do not sort, did not.
     pub(crate) async fn list_role_entries(&self, relative_path: &Path) -> Result<Vec<EntryEnum>> {
         let directory = self.lookup_fh(relative_path).await?;
         let mount = self.mount.clone();
@@ -4462,7 +4468,6 @@ impl NFSStorage {
                 NfsEnrich::from_attrs(&attrs),
             )));
         }
-        entries.sort_by(|left, right| left.get_relative_path().cmp(right.get_relative_path()));
         Ok(entries)
     }
 
