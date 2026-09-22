@@ -467,3 +467,4 @@ mod events;
 mod filter;
 mod order;
 mod prefetch;
+mod residency;

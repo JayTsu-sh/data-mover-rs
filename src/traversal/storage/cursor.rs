@@ -22,6 +22,8 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use super::output::BlockFacts;
+#[cfg(test)]
+use super::residency::Residency;
 use super::{
     DirectoryWork, ListingTask, ObservationTask, Runtime, State, admit, descend_work,
     entry_failure, entry_name, immediate_decision, queue_block_end, queue_failure,
@@ -131,6 +133,46 @@ impl Cursor {
             decisions: HashMap::new(),
             listings: HashMap::new(),
         }
+    }
+
+    /// What the cursor is holding: see [`Residency`].
+    ///
+    /// Walks the whole stack, not just its top: every frame on the path from the root keeps its
+    /// own remaining children, so a deep tree holds one block per level.
+    #[cfg(test)]
+    pub(super) fn residency(&self) -> Residency {
+        let mut sample = Residency {
+            deferred_decisions: self.decisions.len(),
+            ..Residency::default()
+        };
+        for frame in &self.stack {
+            sample.block_children += frame.children.as_ref().map_or(0, VecDeque::len);
+            sample.block_capacity += frame.children.as_ref().map_or(0, VecDeque::capacity);
+            sample.descend_slots += frame.slots.len();
+            sample.path_bytes += frame.work.path.as_str().len();
+            if let Some(pending) = frame.children.as_ref() {
+                sample.path_bytes += pending
+                    .iter()
+                    .map(|child| child.descriptor.path.as_str().len())
+                    .sum::<usize>();
+            }
+        }
+        for listing in self.listings.values() {
+            match listing.arrived.as_ref() {
+                None => sample.listings_inflight += 1,
+                Some(arrived) => {
+                    sample.listings_arrived += 1;
+                    if let Ok(prepared) = arrived {
+                        sample.block_children += prepared.children.len();
+                        sample.block_capacity += prepared.children.capacity();
+                        sample.descend_slots += prepared.descend.len();
+                        sample.path_bytes += prepared_path_bytes(prepared);
+                    }
+                }
+            }
+            sample.path_bytes += listing.work.path.as_str().len();
+        }
+        sample
     }
 
     /// Records a deferred observation's descend decision.
@@ -501,4 +543,21 @@ fn spawn_listing(
         }
         (path, result)
     });
+}
+
+/// Path text held by one arrived-but-untaken listing.
+#[cfg(test)]
+fn prepared_path_bytes(prepared: &Prepared) -> usize {
+    prepared
+        .children
+        .iter()
+        .map(|child| child.descriptor.path.as_str().len())
+        .chain(prepared.descend.iter().map(|work| work.path.as_str().len()))
+        .chain(
+            prepared
+                .failures
+                .iter()
+                .map(|failure| failure.path().as_str().len()),
+        )
+        .sum()
 }

@@ -21,15 +21,31 @@ use crate::storage::{
 mod cursor;
 mod observe;
 mod output;
+#[cfg(test)]
+mod residency;
 
 use cursor::{Cursor, Step};
 use observe::observe;
 use output::{BlockFacts, ChildDescent, Output, Settled};
+#[cfg(test)]
+use residency::ResidencyPeak;
+
+/// The driver's handle on the residency probe.
+///
+/// A field rather than a `#[cfg(test)]` parameter so the one call site stays single: outside
+/// tests this is a zero-sized type, cloning it is free, and [`Cursor::residency`] does not
+/// exist at all, so nothing walks the stack in a release build.
+#[derive(Clone, Default)]
+struct Probe {
+    #[cfg(test)]
+    peak: Arc<ResidencyPeak>,
+}
 
 /// Protocol-neutral traversal assembled from one connected storage's namespace and metadata roles.
 pub struct StorageTraversalSource {
     namespace: Arc<dyn Namespace>,
     metadata: Arc<dyn Metadata>,
+    probe: Probe,
 }
 
 impl StorageTraversalSource {
@@ -42,6 +58,7 @@ impl StorageTraversalSource {
         Ok(Self {
             namespace: storage.namespace(&policy)?,
             metadata: storage.metadata(&policy)?,
+            probe: Probe::default(),
         })
     }
 
@@ -50,7 +67,19 @@ impl StorageTraversalSource {
         Self {
             namespace,
             metadata,
+            probe: Probe::default(),
         }
+    }
+
+    /// Same as [`Self::with_roles`], plus the handle the driver records residency into.
+    #[cfg(test)]
+    fn with_roles_probed(
+        namespace: Arc<dyn Namespace>,
+        metadata: Arc<dyn Metadata>,
+    ) -> (Self, Arc<ResidencyPeak>) {
+        let source = Self::with_roles(namespace, metadata);
+        let peak = Arc::clone(&source.probe.peak);
+        (source, peak)
     }
 }
 
@@ -65,6 +94,7 @@ impl TraversalSource for StorageTraversalSource {
             request,
             item_tx,
             completion_tx,
+            self.probe.clone(),
         ));
         TraversalSession::new(item_rx, completion_rx, cancel)
     }
@@ -184,6 +214,7 @@ async fn run(
     request: TraversalRequest,
     items: mpsc::Sender<TraversalItem>,
     completion: oneshot::Sender<Result<TraversalOutcome, TraversalTerminalFailure>>,
+    probe: Probe,
 ) {
     let mut state = State::new();
     let mut cursor = Cursor::new(
@@ -206,7 +237,15 @@ async fn run(
         policy: Policy::new(&request),
         items: &items,
     };
-    let result = drive(&runtime, &mut cursor, &mut listings, &mut tasks, &mut state).await;
+    let result = drive(
+        &runtime,
+        &mut cursor,
+        &mut listings,
+        &mut tasks,
+        &mut state,
+        &probe,
+    )
+    .await;
     // Never abort a backend operation: it may hold an open handle between two awaits (a CIFS
     // listing holds its directory handle, a CIFS observation opens, reads attributes, then
     // closes), and dropping the future there leaks it. Detached operations run to completion in
@@ -237,13 +276,22 @@ async fn drive(
     listings: &mut ListingTask,
     tasks: &mut ObservationTask,
     state: &mut State,
+    probe: &Probe,
 ) -> Result<(), TraversalTerminalFailure> {
+    // The probe is a zero-sized type outside tests, where nothing samples it.
+    #[cfg(not(test))]
+    let _ = probe;
     loop {
         if runtime.request.cancel.is_cancelled() {
             return Ok(());
         }
         let step = cursor.advance(runtime, tasks, state)?;
         cursor.start_listings(runtime, listings);
+        // After `start_listings`, so the listings it just began count towards the peak; before
+        // `flush`, so the sample is taken while the block is still held rather than after the
+        // reorder buffer has drained it.
+        #[cfg(test)]
+        probe.peak.record(cursor.residency());
         state.output.flush(runtime).await?;
         match step {
             Step::Done if tasks.is_empty() => return Ok(()),
