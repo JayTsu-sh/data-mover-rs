@@ -13,8 +13,8 @@ use data_mover::storage::{
     Storage, connect_backend, create_directory_all, delete_tree,
 };
 use data_mover::traversal::{
-    StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest,
-    TraversalSource,
+    ChildOrder, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome,
+    TraversalRequest, TraversalSource,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -44,6 +44,19 @@ fn seed(root: &Path) -> Result {
     std::fs::write(root.join("tree/a.txt"), b"a")?;
     std::fs::write(root.join("tree/sub/b.txt"), b"bb")?;
     std::fs::write(root.join("tree/sub/deep/c.txt"), b"ccc")?;
+    Ok(())
+}
+
+/// Names chosen so byte order differs from any case-insensitive order (`B.txt` before `a`) and
+/// so the directory `a`, the file `a.txt` and the child `a/x.txt` are all present at once.
+fn seed_for_ordering(root: &Path) -> Result {
+    std::fs::create_dir_all(root.join("ordered/Zoo"))?;
+    std::fs::create_dir_all(root.join("ordered/a"))?;
+    std::fs::create_dir_all(root.join("ordered/bar"))?;
+    std::fs::write(root.join("ordered/B.txt"), b"B")?;
+    std::fs::write(root.join("ordered/a.txt"), b"a")?;
+    std::fs::write(root.join("ordered/a/x.txt"), b"x")?;
+    std::fs::write(root.join("ordered/bar/y.txt"), b"y")?;
     Ok(())
 }
 
@@ -225,5 +238,70 @@ async fn directories_are_listed_as_directories_not_files() -> Result {
     };
     assert_eq!(entry.path().as_str(), "only");
     assert_eq!(entry.kind(), EntryKind::Directory);
+    Ok(())
+}
+
+/// The ordered contract as a caller outside the crate sees it: the sequence is asserted without
+/// sorting it first, and `ChildOrder` has to be nameable from here at all.
+///
+/// The three claims this pins, all on one tree:
+///
+/// * `B.txt` comes before `a`, because `0x42 < 0x61`. Every case-insensitive order puts `a`
+///   first, so this is the assertion that says "raw bytes, not a collation".
+/// * `a` (a directory), `a.txt` (a file) and `a/x.txt` arrive in that order. Both `a` and
+///   `a.txt` are the root's children, so both precede everything under `a`: blocks do not
+///   interleave. The key to compare by is therefore `(parent, name)` — comparing whole paths
+///   one component at a time would have put `a/x.txt` second.
+/// * The same tree read twice gives the same sequence, whatever the filesystem's own order is.
+#[tokio::test]
+async fn name_bytes_order_is_the_same_sequence_for_a_caller_outside_the_crate() -> Result {
+    let temp = tempfile::tempdir()?;
+    seed_for_ordering(temp.path())?;
+    let storage = connect(temp.path()).await?;
+    let source = StorageTraversalSource::new(&storage)?;
+    let mut session = source.traverse(TraversalRequest {
+        root: path("ordered")?,
+        order: TraversalOrder::NameBytes,
+        max_inflight_operations: nonzero(4)?,
+        max_buffered_items: nonzero(4)?,
+        observation_plan: ObservationPlan::default(),
+        cancel: CancellationToken::new(),
+        filter: None,
+        max_depth: None,
+    });
+    let mut paths = Vec::new();
+    let mut listed = Vec::new();
+    while let Some(item) = session.next_item().await {
+        match item {
+            TraversalItem::Entry(entry) => paths.push(entry.path().as_str().to_owned()),
+            TraversalItem::DirectoryListed(directory) => {
+                assert_eq!(
+                    directory.child_order,
+                    ChildOrder::NameBytes,
+                    "{}",
+                    directory.path
+                );
+                listed.push(directory.path.as_str().to_owned());
+            }
+            TraversalItem::SubtreeComplete(_) => {}
+            other => return Err(format!("unexpected failure item: {other:?}").into()),
+        }
+    }
+    assert_eq!(
+        paths,
+        [
+            "ordered/B.txt",
+            "ordered/Zoo",
+            "ordered/a",
+            "ordered/a.txt",
+            "ordered/bar",
+            "ordered/a/x.txt",
+            "ordered/bar/y.txt",
+        ]
+    );
+    assert_eq!(
+        listed,
+        ["ordered", "ordered/Zoo", "ordered/a", "ordered/bar"]
+    );
     Ok(())
 }
