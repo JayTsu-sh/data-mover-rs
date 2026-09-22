@@ -100,6 +100,10 @@ enum Command {
         /// Sub-path to start from, relative to the backend root.
         #[arg(long, default_value = "")]
         path: String,
+        /// Count items instead of printing one line each, so a timing run measures the
+        /// traversal rather than this example's formatting.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Stream an NDX-paged depth-first traversal, printing one line per page.
     NdxWalk {
@@ -189,6 +193,7 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
         max_depth,
         order,
         path,
+        quiet,
     } = command
     else {
         unreachable!("dispatched by the caller")
@@ -212,13 +217,15 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
         match item {
             TraversalItem::Entry(entry) => {
                 entries += 1;
-                println!("{:?} {}", entry.kind(), entry.path());
+                if !*quiet {
+                    println!("{:?} {}", entry.kind(), entry.path());
+                }
             }
             TraversalItem::EntryFailure(error) => {
                 failures += 1;
                 eprintln!("entry failure {} {:?}", error.path(), error.class());
             }
-            TraversalItem::DirectoryListed(listed) => {
+            TraversalItem::DirectoryListed(listed) if !*quiet => {
                 println!(
                     "listed {} {:?} order={:?} pruned={} truncated={}",
                     listed.path,
@@ -228,7 +235,9 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
                     listed.truncated_children
                 );
             }
-            TraversalItem::SubtreeComplete(complete) => {
+            TraversalItem::SubtreeComplete(complete)
+                if !*quiet || complete.path.as_str() == path =>
+            {
                 println!(
                     "subtree {} exhaustive={} {:?}",
                     complete.path,
