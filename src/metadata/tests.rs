@@ -33,6 +33,47 @@ fn decision_for(plan: &MetadataPlan, family: MetadataFamily) -> MappingDecision 
         )
 }
 
+/// Refuses exactly one family and accepts everything else. `RecordingMetadata::fail_at` counts
+/// *applied* mutations, so once a tolerated failure stops advancing that count every later
+/// mutation fails too — which is the wrong instrument for asking "does the rest still get
+/// applied".
+struct RefusesAcl {
+    applied: Mutex<Vec<MetadataMutation>>,
+}
+
+#[async_trait]
+impl Metadata for RefusesAcl {
+    async fn observe(
+        &self,
+        _path: &StoragePath,
+        _plan: crate::model::ObservationPlan,
+    ) -> Result<MetadataObservations, StorageRoleFailure> {
+        Ok(MetadataObservations::default())
+    }
+
+    async fn apply(
+        &self,
+        path: &StoragePath,
+        mutation: MetadataMutation,
+        _cancel: CancellationToken,
+    ) -> Result<(), StorageRoleFailure> {
+        if matches!(mutation, MetadataMutation::Acl(_)) {
+            return Err(StorageRoleFailure::Entry(
+                EntryOperationFailure::new(
+                    path.clone(),
+                    Operation::Metadata,
+                    FailureClass::Unsupported,
+                    Transience::Permanent,
+                    "destination refused the ACL",
+                )
+                .unwrap(),
+            ));
+        }
+        self.applied.lock().unwrap().push(mutation);
+        Ok(())
+    }
+}
+
 struct RecordingMetadata {
     mutations: Mutex<Vec<MetadataMutation>>,
     fail_at: Option<usize>,
@@ -168,6 +209,66 @@ fn the_mode_that_replaces_ownership_is_applied_before_the_acl_too() {
         family_order(&plan, MetadataFamily::OwnershipMode)
             < family_order(&plan, MetadataFamily::Acl)
     );
+}
+
+/// A destination can advertise a capability and still refuse the write — `NFSv4` `SETACL` is the
+/// standing example. `BestEffort` is the policy that says that must not take the copy down with
+/// it, and the families after the failed one still have to be applied.
+#[tokio::test]
+async fn a_best_effort_family_that_fails_to_apply_leaves_the_rest_alone() {
+    let observations = exact_observations();
+    let plan = compile_metadata_plan(&MetadataPlanRequest {
+        observations: &observations,
+        target: exact_target(),
+        policies: all_exact().with_acl(MetadataPolicy::BestEffort),
+        principal_mapper: None,
+    })
+    .unwrap();
+    let target = RefusesAcl {
+        applied: Mutex::new(Vec::new()),
+    };
+    let report = plan
+        .apply(
+            &target,
+            &StoragePath::new("file").unwrap(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome_for(&report, MetadataFamily::Acl),
+        ApplicationOutcome::Failed
+    );
+    assert_eq!(
+        outcome_for(&report, MetadataFamily::Timestamps),
+        ApplicationOutcome::Applied
+    );
+}
+
+/// The same refusal under a policy that requires the family must still fail the copy — that is
+/// the whole difference between asking for a family and requiring it.
+#[tokio::test]
+async fn a_required_family_that_fails_to_apply_still_fails_the_copy() {
+    let observations = exact_observations();
+    let plan = compile_metadata_plan(&MetadataPlanRequest {
+        observations: &observations,
+        target: exact_target(),
+        policies: all_exact(),
+        principal_mapper: None,
+    })
+    .unwrap();
+    let target = RefusesAcl {
+        applied: Mutex::new(Vec::new()),
+    };
+    let failure = plan
+        .apply(
+            &target,
+            &StoragePath::new("file").unwrap(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.family(), MetadataFamily::Acl);
 }
 
 fn families(plan: &MetadataPlan) -> Vec<MetadataFamily> {

@@ -13,8 +13,8 @@ pub use engine::{
     TransferRoute, TransferSide, transfer,
 };
 pub use model::{
-    InflightLimits, PayloadShapingPolicy, ReadBackVerification, TransferIdentity, TransferPolicy,
-    TransferRequest, TransferValueError,
+    CopiedMetadataRequest, InflightLimits, PayloadShapingPolicy, ReadBackVerification,
+    TransferIdentity, TransferPolicy, TransferRequest, TransferValueError,
 };
 
 #[cfg(test)]

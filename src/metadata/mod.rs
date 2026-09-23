@@ -206,6 +206,13 @@ pub struct MetadataPlanError {
 }
 
 impl MetadataPlanError {
+    /// Builds one refusal. Callers outside this module only ever read refusals; this exists so
+    /// their tests can state the case they are checking instead of provoking it.
+    #[cfg(test)]
+    pub(crate) const fn new(family: MetadataFamily, kind: MetadataPlanErrorKind) -> Self {
+        Self { family, kind }
+    }
+
     #[must_use]
     pub const fn family(self) -> MetadataFamily {
         self.family
@@ -240,6 +247,10 @@ pub struct MetadataPlan {
     mappings: Vec<FamilyMapping>,
     mutations: Vec<(MetadataFamily, MetadataMutation)>,
     losses: LossReport,
+    /// Families whose application failure is recorded instead of propagated. A destination can
+    /// advertise a capability and still refuse the write — `NFSv4` `SETACL` is the standing example
+    /// — and `BestEffort` is the one policy that says that must not fail the transfer.
+    tolerant: Vec<MetadataFamily>,
 }
 
 impl MetadataPlan {
@@ -295,19 +306,38 @@ impl MetadataPlan {
                 },
             });
         }
-        let mutations = self
-            .mutations
-            .iter()
-            .map(|(_, mutation)| mutation.clone())
-            .collect::<Vec<_>>();
-        if let Err(failure) = target.apply_metadata_batch(stage, mutations, cancel).await {
-            let failed_index = failure.failed_index.min(self.mutations.len() - 1);
-            for (family, _) in self.mutations.iter().take(failure.completed) {
+        // A tolerant family that fails is skipped and the rest of the batch is sent again from
+        // the next mutation. Resuming rather than reordering is deliberate: the order families
+        // are applied in is itself an invariant (a mode written after an ACL rewrites it), so
+        // moving the tolerant ones to the end to make one batch would trade one silent
+        // corruption for another.
+        let mut start = 0;
+        while start < self.mutations.len() {
+            let remaining = &self.mutations[start..];
+            let mutations = remaining
+                .iter()
+                .map(|(_, mutation)| mutation.clone())
+                .collect::<Vec<_>>();
+            let Err(failure) = target
+                .apply_metadata_batch(stage, mutations, cancel.clone())
+                .await
+            else {
+                for (family, _) in remaining {
+                    set_outcome(&mut outcomes, *family, ApplicationOutcome::Applied);
+                }
+                break;
+            };
+            let failed_index = failure.failed_index.min(remaining.len() - 1);
+            for (family, _) in remaining.iter().take(failure.completed) {
                 set_outcome(&mut outcomes, *family, ApplicationOutcome::Applied);
             }
-            let family = self.mutations[failed_index].0;
+            let family = remaining[failed_index].0;
             if failure.error.is_some() {
                 set_outcome(&mut outcomes, family, ApplicationOutcome::Failed);
+            }
+            if self.tolerant.contains(&family) {
+                start += failed_index + 1;
+                continue;
             }
             return Err(MetadataApplicationFailure {
                 family,
@@ -317,9 +347,6 @@ impl MetadataPlan {
                     losses: self.losses.clone(),
                 },
             });
-        }
-        for (family, _) in &self.mutations {
-            set_outcome(&mut outcomes, *family, ApplicationOutcome::Applied);
         }
         Ok(MetadataApplicationReport {
             outcomes,
@@ -346,6 +373,9 @@ impl MetadataPlan {
             }
             if let Err(error) = target.apply(mutation.clone(), cancel.clone()).await {
                 set_outcome(&mut outcomes, *family, ApplicationOutcome::Failed);
+                if self.tolerant.contains(family) {
+                    continue;
+                }
                 return Err(MetadataApplicationFailure {
                     family: *family,
                     error: Some(Box::new(error)),
@@ -476,6 +506,7 @@ pub fn compile_metadata_plan(
         mappings: Vec::with_capacity(5),
         mutations: Vec::with_capacity(5),
         losses: LossReport::default(),
+        tolerant: Vec::new(),
     };
     // Ownership first, and mode with it: writing permission bits recomputes the ACL — the POSIX
     // mask entry, and on most NFSv4 servers (ONTAP among them) the whole ACL. Compiling the ACL
@@ -501,6 +532,12 @@ pub fn compile_metadata_plan(
         |value| MetadataMutation::Tags(value.clone()),
     )?;
     compile_timestamps(request, &mut plan)?;
+    plan.tolerant = plan
+        .mutations
+        .iter()
+        .map(|(family, _)| *family)
+        .filter(|family| request.policies.get(*family) == MetadataPolicy::BestEffort)
+        .collect();
     Ok(plan)
 }
 

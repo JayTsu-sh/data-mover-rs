@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
+use crate::metadata::MetadataPolicy;
 use crate::model::StoragePath;
 use crate::storage::{RecoveryIdentity, SourceQosGroup, Storage};
 
@@ -205,6 +206,62 @@ pub struct TransferRequest {
     pub(crate) source_qos: Option<SourceQosGroup>,
     pub(crate) payload_shaping: PayloadShapingPolicy,
     pub(crate) read_back: ReadBackVerification,
+    pub(crate) copied_metadata: CopiedMetadataRequest,
+}
+
+/// Metadata families a caller can ask a copy to carry, beyond the baseline.
+///
+/// Only the optional families appear here. Ownership, mode and timestamps are copied by every
+/// transfer and cannot be turned off — **what is absent from this type is what is mandatory**.
+/// A family named here is carried only when asked for, and only when both ends can: the
+/// destination reports what it accepts through `CopiedMetadataTarget`, the source reports what it
+/// can read through its observations, and either one can refuse.
+///
+/// The policy picks what happens when one of them refuses:
+/// - [`MetadataPolicy::Omit`] (the default) does not even observe the family.
+/// - [`MetadataPolicy::BestEffort`] carries it when both ends can and records what happened when
+///   they cannot — including a destination that advertises the capability and then refuses the
+///   write, which is the normal `NFSv4` `SETACL` outcome on many servers. The transfer still
+///   succeeds.
+/// - [`MetadataPolicy::AllowKnownLoss`] requires the family to be carried, accepting a documented
+///   downgrade, and **fails** when either end lacks it outright.
+/// - [`MetadataPolicy::RequireExact`] additionally rejects any downgrade.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CopiedMetadataRequest {
+    acl: MetadataPolicy,
+    xattrs: MetadataPolicy,
+}
+
+impl CopiedMetadataRequest {
+    /// Asks for the access control list under `policy`.
+    #[must_use]
+    pub const fn with_acl(mut self, policy: MetadataPolicy) -> Self {
+        self.acl = policy;
+        self
+    }
+
+    /// Asks for extended attributes under `policy`.
+    #[must_use]
+    pub const fn with_xattrs(mut self, policy: MetadataPolicy) -> Self {
+        self.xattrs = policy;
+        self
+    }
+
+    #[must_use]
+    pub const fn acl(self) -> MetadataPolicy {
+        self.acl
+    }
+
+    #[must_use]
+    pub const fn xattrs(self) -> MetadataPolicy {
+        self.xattrs
+    }
+
+    /// Whether every optional family is switched off, which is the default.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.acl == MetadataPolicy::Omit && self.xattrs == MetadataPolicy::Omit
+    }
 }
 
 impl TransferRequest {
@@ -231,7 +288,16 @@ impl TransferRequest {
             source_qos: None,
             payload_shaping: PayloadShapingPolicy::default(),
             read_back: ReadBackVerification::default(),
+            copied_metadata: CopiedMetadataRequest::default(),
         }
+    }
+
+    /// Asks the copy to carry optional metadata families. Left alone, a transfer carries the
+    /// baseline only.
+    #[must_use]
+    pub const fn with_copied_metadata(mut self, request: CopiedMetadataRequest) -> Self {
+        self.copied_metadata = request;
+        self
     }
 
     /// Selects the job-level transfer policy. Route-specific details remain inside data-mover.
