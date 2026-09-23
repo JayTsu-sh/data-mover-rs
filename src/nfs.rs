@@ -4534,7 +4534,12 @@ impl NFSStorage {
                 extension,
                 &attrs,
                 entry.handle,
-                NfsEnrich::from_attrs(&attrs),
+                // The only consumer of this listing is `role_observation`, which reads the
+                // handle, the kind, the path, the timestamps, the mode and the size — never the
+                // ACL, owner or group. Filling them would clone two `String`s and an `Acl` per
+                // entry for nothing, which at fifty million entries is not nothing. Restore
+                // `from_attrs` here the moment that observation starts reporting them.
+                NfsEnrich::default(),
             )));
         }
         Ok(Ok(entries))
@@ -4722,9 +4727,9 @@ mod tests {
             ("./a", "c", "a/c"),
         ] {
             let child = Path::new(parent).join(name);
-            let key = NFSStorage::cache_path(&child).unwrap();
+            let key = NFSStorage::cache_path(&child).assert_value("cache path");
             let asked_for: PathBuf = NFSStorage::collect_components(&child)
-                .unwrap()
+                .assert_value("lookup components")
                 .iter()
                 .collect();
             assert_eq!(key, asked_for, "backfilled key for {child:?}");
