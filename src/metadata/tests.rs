@@ -271,6 +271,41 @@ async fn a_required_family_that_fails_to_apply_still_fails_the_copy() {
     assert_eq!(failure.family(), MetadataFamily::Acl);
 }
 
+/// A destination that stores ACLs in another encoding cannot hold this one at all without an
+/// external mapping. That is absence, not a downgrade: `AllowKnownLoss` requires the family to
+/// be carried, so it refuses like `RequireExact`, and only `BestEffort` goes on without it.
+#[test]
+fn an_acl_in_another_encoding_is_absence_not_a_known_loss() {
+    let observations = exact_observations();
+    let target = MetadataTarget {
+        acl: AclTarget::Encoding(AclEncoding::WindowsSecurityDescriptor),
+        ..exact_target()
+    };
+    let compile = |policy| {
+        compile_metadata_plan(&MetadataPlanRequest {
+            observations: &observations,
+            target,
+            policies: all_exact().with_acl(policy),
+            principal_mapper: None,
+        })
+    };
+    for policy in [MetadataPolicy::AllowKnownLoss, MetadataPolicy::RequireExact] {
+        let error = compile(policy).unwrap_err();
+        assert_eq!(error.family(), MetadataFamily::Acl, "{policy:?}");
+        assert_eq!(
+            error.kind(),
+            MetadataPlanErrorKind::ExternalMappingRequired,
+            "{policy:?}"
+        );
+    }
+    let plan = compile(MetadataPolicy::BestEffort).unwrap();
+    assert_eq!(
+        decision_for(&plan, MetadataFamily::Acl),
+        MappingDecision::RequiresExternalMapping
+    );
+    assert!(!families(&plan).contains(&MetadataFamily::Acl));
+}
+
 fn families(plan: &MetadataPlan) -> Vec<MetadataFamily> {
     plan.mutations.iter().map(|(family, _)| *family).collect()
 }

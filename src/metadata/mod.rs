@@ -626,9 +626,8 @@ fn compile_acl(
             exact(plan, family, MetadataMutation::Acl(value.clone()));
             Ok(())
         }
-        AclTarget::Encoding(_) if policy == MetadataPolicy::AllowKnownLoss => {
-            drop_with_loss(plan, family, policy, SemanticLoss::AclDropped)
-        }
+        // Not a downgrade: without an external mapping the destination cannot hold this ACL at
+        // all, so `AllowKnownLoss`, which requires the family to be carried, refuses too.
         AclTarget::Encoding(_) => unavailable(
             plan,
             family,

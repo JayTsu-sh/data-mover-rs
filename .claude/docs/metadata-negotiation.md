@@ -24,9 +24,9 @@ atime / ctime 任何情况下都不拷。
 | 情形 | Omit | RequireExact | AllowKnownLoss | BestEffort |
 |---|---|---|---|---|
 | 能精确写入 | 跳过 | 写 | 写 | 写 |
-| 写得进去但有语义损失（编码降级、精度降级、owner 丢失） | 跳过 | **失败** | 记 `losses` 后继续 | 记 `losses` 后继续 |
+| 写得进去但有语义损失（精度降级、owner 丢失） | 跳过 | **失败** | 记 `losses` 后继续 | 记 `losses` 后继续 |
 | 一端不支持这一族 | 跳过 | **失败** | **失败** | 记 `Unsupported` 后继续 |
-| 两端都支持但编码不同（Posix ↔ NfsV4 ↔ WindowsSecurityDescriptor） | 跳过 | **失败** | **失败** | 记后继续 |
+| 两端都支持但编码不同（Posix ↔ NfsV4 ↔ WindowsSecurityDescriptor） | 跳过 | **失败** | **失败**（整族丢失是缺席，不是降级） | 记 `Unsupported` 后继续 |
 | 源端观测失败（GETACL 报错） | 跳过 | **失败** | **失败** | 记 `Failed` 后继续 |
 | 目的端**应用期**拒绝（能力位为真但 SETACL 被拒） | — | **失败** | **失败** | 记 `Failed` 后继续，**传输仍然成功** |
 | 应用期**取消**（token 已触发，或 backend 报 `Cancelled`，含服务端的 `STATUS_CANCELLED`） | — | **停止** | **停止** | **停止**，该族保持规划期结果、不记 `Failed` |
