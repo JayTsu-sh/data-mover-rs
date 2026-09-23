@@ -175,3 +175,33 @@ fn differing_encodings_are_neither_ends_fault() {
         RefusalSide::Mapping
     );
 }
+
+/// Asking for a feature carries it when both ends can and skips it when either cannot — but a
+/// source that tried to read it and failed is a failure, not a "cannot", even under `BestEffort`.
+#[test]
+fn a_failed_read_is_a_failure_even_for_a_feature_that_was_only_asked_for() {
+    let failed = refusal(
+        &with_acl(MetadataObservation::Failed {
+            class: FailureClass::Connectivity,
+            transience: Transience::Transient,
+        }),
+        exact_target(),
+        all_exact().with_acl(MetadataPolicy::BestEffort),
+    );
+    assert_eq!(failed.family(), MetadataFamily::Acl);
+    assert!(matches!(
+        failed.cause(),
+        RefusalCause::SourceObservationFailed { .. }
+    ));
+    let cannot = compile_metadata_plan(&MetadataPlanRequest {
+        observations: &with_acl(MetadataObservation::Unsupported),
+        target: exact_target(),
+        policies: all_exact().with_acl(MetadataPolicy::BestEffort),
+        principal_mapper: None,
+    })
+    .unwrap();
+    assert_eq!(
+        decision_for(&cannot, MetadataFamily::Acl),
+        MappingDecision::Unsupported
+    );
+}

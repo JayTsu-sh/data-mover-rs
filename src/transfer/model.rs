@@ -4,7 +4,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::metadata::MetadataPolicy;
 use crate::model::StoragePath;
 use crate::storage::{RecoveryIdentity, SourceQosGroup, Storage};
 
@@ -209,58 +208,59 @@ pub struct TransferRequest {
     pub(crate) copied_metadata: CopiedMetadataRequest,
 }
 
-/// Metadata families a caller can ask a copy to carry, beyond the baseline.
+/// The optional metadata features a copy should carry, beyond the baseline — the "should" of a
+/// copy, which the calling application decides (typically from its command line).
 ///
-/// Only the optional families appear here. Ownership, mode and timestamps are copied by every
-/// transfer and cannot be turned off — **what is absent from this type is what is mandatory**.
-/// A family named here is carried only when asked for, and only when both ends can: the
-/// destination reports what it accepts through `CopiedMetadataTarget`, the source reports what it
-/// can read through its observations, and either one can refuse.
+/// Only the optional features appear here. Ownership, mode and mtime are carried by every copy
+/// and cannot be turned off — **what is absent from this type is what is mandatory**. xattrs are
+/// one feature, never selected attribute by attribute.
 ///
-/// The policy picks what happens when one of them refuses:
-/// - [`MetadataPolicy::Omit`] (the default) does not even observe the family.
-/// - [`MetadataPolicy::BestEffort`] carries it when both ends can and records why when they
-///   cannot. A write the destination refuses after advertising the capability — the usual `NFSv4`
-///   `SETACL` outcome on many servers — still fails the transfer, once the other families have
-///   been applied.
-/// - [`MetadataPolicy::AllowKnownLoss`] requires the family to be carried, accepting a documented
-///   downgrade, and **fails** when either end lacks it outright.
-/// - [`MetadataPolicy::RequireExact`] additionally rejects any downgrade.
+/// Asking for a feature is not a guarantee it is carried: whether it *can* be is decided inside
+/// data-mover, by the source's ability to read it and the destination's ability to store it,
+/// and comes out as one of
+/// - **exact** — carried as is;
+/// - **lossy** — carried with a named loss (a coarser precision), recorded in the report;
+/// - **cannot** — not read, not written, and the reason recorded in the report. This is never a
+///   failure: what the user asked for that the storage cannot do is the caller's to judge.
+///
+/// A feature both ends can handle is then carried for real: a read that fails, or a write the
+/// destination refuses, fails the transfer — after every other family has been applied, with
+/// every reason listed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CopiedMetadataRequest {
-    acl: MetadataPolicy,
-    xattrs: MetadataPolicy,
+    acl: bool,
+    xattrs: bool,
 }
 
 impl CopiedMetadataRequest {
-    /// Asks for the access control list under `policy`.
+    /// Asks for the access control list.
     #[must_use]
-    pub const fn with_acl(mut self, policy: MetadataPolicy) -> Self {
-        self.acl = policy;
+    pub const fn with_acl(mut self) -> Self {
+        self.acl = true;
         self
     }
 
-    /// Asks for extended attributes under `policy`.
+    /// Asks for extended attributes.
     #[must_use]
-    pub const fn with_xattrs(mut self, policy: MetadataPolicy) -> Self {
-        self.xattrs = policy;
+    pub const fn with_xattrs(mut self) -> Self {
+        self.xattrs = true;
         self
     }
 
     #[must_use]
-    pub const fn acl(self) -> MetadataPolicy {
+    pub const fn acl(self) -> bool {
         self.acl
     }
 
     #[must_use]
-    pub const fn xattrs(self) -> MetadataPolicy {
+    pub const fn xattrs(self) -> bool {
         self.xattrs
     }
 
-    /// Whether every optional family is switched off, which is the default.
+    /// Whether no optional feature is asked for, which is the default.
     #[must_use]
-    pub fn is_empty(self) -> bool {
-        self.acl == MetadataPolicy::Omit && self.xattrs == MetadataPolicy::Omit
+    pub const fn is_empty(self) -> bool {
+        !self.acl && !self.xattrs
     }
 }
 

@@ -28,11 +28,11 @@ NFS_DENY_DIR=/data/no-access     # 用于测 EACCES (服务器侧设置 0700 roo
 
 6. **ACL / xattr 拷贝策略矩阵**（可选，需 `NFS_META_V41_EXPORT`）：
    `bash .claude/skills/e2e-nfs/scripts/metadata_matrix.sh`。用 `examples/nfs_metadata_copy.rs`
-   逐档验证 `CopiedMetadataRequest`：NFSv3 源的 `BestEffort` 成功且标 `Unsupported`、`RequireExact`
-   被拒；NFSv4.1 同端 `RequireExact` / `BestEffort` 下源端打标记的 ACL 原样到达（raw GETACL 回读比对，
-   `--acl omit` 作阴性对照必须失败）；xattr `RequireExact` 在无 named attributes 的导出上被拒；
-   设了 `CIFS_REAL_*` 时再验 NFSv4 → CIFS 的编码不同：`RequireExact` 与 `AllowKnownLoss` 都拒绝、
-   `BestEffort` 成功。语义见 `.claude/docs/metadata-negotiation.md`。
+   验证 `CopiedMetadataRequest`（要拷哪些功能）：NFSv3 源要 ACL + xattr → 拷贝成功、两族记
+   `Unsupported`（源端读不了）；NFSv4.1 同端要 ACL → 源端打标记的 ACL 原样到达（raw GETACL 回读比对，
+   不要 ACL 作阴性对照必须失败）；要 xattr 而该导出没协商 named attributes → 成功、记 `Unsupported`；
+   设了 `CIFS_REAL_*` 时再验 NFSv4 → CIFS 要 ACL → 成功、记 `Unsupported`（编码不同，不做转换）。
+   语义见 `.claude/docs/metadata-negotiation.md`。
 
 ## 成功判据
 

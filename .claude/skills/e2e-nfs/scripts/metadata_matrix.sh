@@ -32,38 +32,26 @@ case_() { # name, expected exit (0|1), grep marker, args...
 }
 echo "run=$RUN"
 if [ -n "${NFS_META_V3_URL:-}" ]; then
-case_ "v3->v4.1 acl+xattrs best-effort: copied, both Unsupported" 0 "copied " \
-  --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$V41" --destination-path v3-be \
-  --acl best-effort --xattrs best-effort --expect copied --expect-acl unsupported --expect-xattrs unsupported
-case_ "v3->v4.1 acl require-exact: refused, one side unsupported" 0 "ACL (RequireExact): the source cannot read it" \
-  --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$V41" --destination-path v3-exact \
-  --acl require-exact --expect refused
+case_ "v3->v4.1 acl+xattrs asked: copied, both skipped (source cannot read)" 0 "copied " \
+  --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$V41" --destination-path v3-asked \
+  --acl --xattrs --expect copied --expect-acl unsupported --expect-xattrs unsupported
 else echo "SKIP NFSv3 rung (NFS_META_V3_URL unset)"; fi
-case_ "v4.1->v4.1 acl require-exact, principal mark: carried" 0 "ACLs equal and marked: 4" \
+case_ "v4.1->v4.1 acl asked, principal mark: carried" 0 "ACLs equal and marked: 4" \
   --source "$V41" --source-path src-principal --seed-bytes 4096 --mark-acl principal \
-  --destination "$V41" --destination-path exact-principal --acl require-exact --expect copied --expect-acl applied --verify-acl
-case_ "v4.1->v4.1 acl require-exact, EVERYONE@ WRITE_ACL mark: carried" 0 "ACLs equal and marked: 3" \
+  --destination "$V41" --destination-path acl-principal --acl --expect copied --expect-acl applied --verify-acl
+case_ "v4.1->v4.1 acl asked, EVERYONE@ WRITE_ACL mark: carried" 0 "ACLs equal and marked: 3" \
   --source "$V41" --source-path src-everyone --seed-bytes 4096 --mark-acl everyone-write-acl \
-  --destination "$V41" --destination-path exact-everyone --acl require-exact --expect copied --expect-acl applied --verify-acl
-case_ "v4.1->v4.1 acl best-effort, principal mark: carried" 0 "ACLs equal and marked: 4" \
-  --source "$V41" --source-path src-be --seed-bytes 4096 --mark-acl principal \
-  --destination "$V41" --destination-path be-principal --acl best-effort --expect copied --expect-acl applied --verify-acl
-case_ "negative control: acl omit loses the mark" 1 "lost the Principal mark" \
+  --destination "$V41" --destination-path acl-everyone --acl --expect copied --expect-acl applied --verify-acl
+case_ "negative control: acl not asked loses the mark" 1 "lost the Principal mark" \
   --source "$V41" --source-path src-omit --seed-bytes 4096 --mark-acl principal \
-  --destination "$V41" --destination-path omit-principal --acl omit --expect copied --expect-acl omitted-by-policy --verify-acl
-case_ "v4.1->v4.1 xattrs require-exact: refused" 0 "extended attributes (RequireExact):" \
-  --source "$V41" --source-path src-principal --destination "$V41" --destination-path xattr-exact \
-  --xattrs require-exact --expect refused
+  --destination "$V41" --destination-path omit-principal --expect copied --expect-acl omitted-by-policy --verify-acl
+case_ "v4.1->v4.1 xattrs asked: copied, skipped (export did not negotiate named attributes)" 0 "copied 4096" \
+  --source "$V41" --source-path src-principal --destination "$V41" --destination-path xattrs-asked \
+  --xattrs --expect copied --expect-xattrs unsupported
 if [ -n "${CIFS_REAL_SERVER:-}" ]; then
-case_ "v4.1->cifs acl require-exact: refused, external mapping" 0 "the source holds a NfsV4 ACL and the destination stores WindowsSecurityDescriptor" \
-  --source "$V41" --source-path src-principal --destination "$CIFS" --destination-path acl-exact \
-  --acl require-exact --expect refused
-case_ "v4.1->cifs acl allow-known-loss: refused, external mapping (113c0be)" 0 "the source holds a NfsV4 ACL and the destination stores WindowsSecurityDescriptor" \
-  --source "$V41" --source-path src-principal --destination "$CIFS" --destination-path acl-akl \
-  --acl allow-known-loss --expect refused
-case_ "v4.1->cifs acl best-effort: copied, Unsupported" 0 "copied 4096" \
-  --source "$V41" --source-path src-principal --destination "$CIFS" --destination-path acl-be \
-  --acl best-effort --expect copied --expect-acl unsupported
+case_ "v4.1->cifs acl asked: copied, skipped (NfsV4 vs Windows SD, no conversion)" 0 "copied 4096" \
+  --source "$V41" --source-path src-principal --destination "$CIFS" --destination-path acl-asked \
+  --acl --expect copied --expect-acl unsupported
 else echo "SKIP CIFS rung (CIFS_REAL_* unset)"; fi
 case_ "guard: seeding an existing path is refused" 1 "already exists" \
   --source "$V41" --source-path src-principal --seed-bytes 1 --destination "$V41" --destination-path never \

@@ -2,11 +2,11 @@
 //! negotiation did with them, against a real share. See `.claude/docs/metadata-negotiation.md`.
 //!
 //! ```text
-//! # NFSv3 cannot observe an ACL, so asking for one best-effort must still copy the file
+//! # NFSv3 cannot read an ACL, so asking for one skips it with the reason and still copies the file
 //! cargo run --example nfs_metadata_copy -- \
 //!     --source 'nfs://10.131.5.221/m1-source:/?uid=0&gid=0&noresvport=true' --source-path d000/f000 \
 //!     --destination /tmp/dm-meta --destination-path f000 \
-//!     --acl best-effort --expect copied --expect-acl unsupported
+//!     --acl --expect copied --expect-acl unsupported
 //! ```
 //!
 //! An endpoint starting with `nfs://` is an NFS URL; `cifs:<sub-path>` is that sub-path of the
@@ -20,9 +20,7 @@ use std::num::NonZeroUsize;
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use data_mover::metadata::{
-    ApplicationOutcome, MetadataApplicationReport, MetadataFamily, MetadataPolicy,
-};
+use data_mover::metadata::{ApplicationOutcome, MetadataApplicationReport, MetadataFamily};
 use data_mover::model::{BackendIdentity, BackendKind, FailureClass, StoragePath};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, LocalBackendConfig,
@@ -51,10 +49,12 @@ struct Args {
     destination: String,
     #[arg(long)]
     destination_path: String,
-    #[arg(long, value_enum, default_value_t = Policy::Omit)]
-    acl: Policy,
-    #[arg(long, value_enum, default_value_t = Policy::Omit)]
-    xattrs: Policy,
+    /// Ask for the ACL to be carried.
+    #[arg(long)]
+    acl: bool,
+    /// Ask for extended attributes to be carried.
+    #[arg(long)]
+    xattrs: bool,
     /// Whether the copy has to succeed or has to be refused.
     #[arg(long, value_enum)]
     expect: Expect,
@@ -89,25 +89,6 @@ enum Mark {
 
 const MARK_PRINCIPAL: &str = "12345";
 const EVERYONE: &str = "EVERYONE@";
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Policy {
-    Omit,
-    BestEffort,
-    AllowKnownLoss,
-    RequireExact,
-}
-
-impl From<Policy> for MetadataPolicy {
-    fn from(value: Policy) -> Self {
-        match value {
-            Policy::Omit => Self::Omit,
-            Policy::BestEffort => Self::BestEffort,
-            Policy::AllowKnownLoss => Self::AllowKnownLoss,
-            Policy::RequireExact => Self::RequireExact,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Expect {
@@ -388,9 +369,13 @@ async fn main() -> Result {
     if let Some(mark) = args.mark_acl {
         mark_acl(mark, &args.source, &args.source_path).await?;
     }
-    let copied_metadata = CopiedMetadataRequest::default()
-        .with_acl(args.acl.into())
-        .with_xattrs(args.xattrs.into());
+    let mut copied_metadata = CopiedMetadataRequest::default();
+    if args.acl {
+        copied_metadata = copied_metadata.with_acl();
+    }
+    if args.xattrs {
+        copied_metadata = copied_metadata.with_xattrs();
+    }
     let request = request(
         &source,
         &args.source_path,

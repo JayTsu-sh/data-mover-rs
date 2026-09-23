@@ -11,7 +11,7 @@ use crate::metadata::{
     TimestampTarget, TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
     role_failure_text,
 };
-use crate::model::ObservationPlan;
+use crate::model::{ObservationMode, ObservationPlan};
 use crate::storage::{
     CopiedAclTarget, CopiedMetadataTarget, CopiedOwnershipTarget, CopiedValueTarget, Metadata,
     PreflightPolicy, SourceDescriptor, StorageRoleFailure,
@@ -49,7 +49,7 @@ pub(super) async fn copied_metadata_plan(
         source: metadata,
         baseline,
         target,
-    }) = metadata_roles(request)?
+    }) = metadata_roles(request)
     else {
         return Ok(None);
     };
@@ -96,46 +96,24 @@ struct MetadataRoles {
     target: CopiedMetadataTarget,
 }
 
-/// Both ends' metadata roles, or `None` when an end has none and the request can go on without
-/// metadata.
-fn metadata_roles(request: &TransferRequest) -> Result<Option<MetadataRoles>, TransferFailure> {
-    let requested = request.copied_metadata;
-    let Ok(metadata) = request.source.metadata(&PreflightPolicy::production()) else {
-        refuse_unavailable(
-            requested,
-            "copied metadata was requested but the source has no metadata role",
-        )?;
-        return Ok(None);
-    };
-    let Some(baseline) = metadata.copied_metadata_observation_plan() else {
-        refuse_unavailable(
-            requested,
-            "copied metadata was requested but the source copies none",
-        )?;
-        return Ok(None);
-    };
-    let Ok(destination) = request
+/// Both ends' metadata roles, or `None` when an end has none. The copy then goes on without
+/// metadata — mtime included, which the mandatory-mtime rule still has to close.
+fn metadata_roles(request: &TransferRequest) -> Option<MetadataRoles> {
+    let source = request
+        .source
+        .metadata(&PreflightPolicy::production())
+        .ok()?;
+    let baseline = source.copied_metadata_observation_plan()?;
+    let destination = request
         .destination
         .staged_destination(&PreflightPolicy::production())
-    else {
-        refuse_unavailable(
-            requested,
-            "copied metadata was requested but the destination cannot stage",
-        )?;
-        return Ok(None);
-    };
-    let Some(target) = destination.copied_metadata_target() else {
-        refuse_unavailable(
-            requested,
-            "copied metadata was requested but the destination copies none",
-        )?;
-        return Ok(None);
-    };
-    Ok(Some(MetadataRoles {
-        source: metadata,
+        .ok()?;
+    let target = destination.copied_metadata_target()?;
+    Some(MetadataRoles {
+        source,
         baseline,
         target,
-    }))
+    })
 }
 
 /// Translates what the destination accepts across the layer boundary — `storage` cannot name
@@ -189,8 +167,20 @@ fn copied_policies(
     MetadataPolicies::default()
         .with_ownership_mode(ownership_policy)
         .with_timestamps(MetadataPolicy::AllowKnownLoss)
-        .with_acl(requested.acl())
-        .with_xattrs(requested.xattrs())
+        .with_acl(optional_policy(requested.acl()))
+        .with_xattrs(optional_policy(requested.xattrs()))
+}
+
+/// How an optional feature is planned: not asked for, it is not even read; asked for, it is
+/// carried exactly or with a named loss when both ends can, and skipped with the reason when
+/// either cannot — never refused, because what a user asks the storage cannot do is the caller's
+/// to judge. A read that fails is still a failure (`BestEffort` no longer skips those).
+const fn optional_policy(asked: bool) -> MetadataPolicy {
+    if asked {
+        MetadataPolicy::BestEffort
+    } else {
+        MetadataPolicy::Omit
+    }
 }
 
 impl TransferFailure {
@@ -231,37 +221,13 @@ pub(super) fn write_metadata_detail(
     Ok(())
 }
 
-/// What a family that was asked for but cannot be reached means for the transfer.
-///
-/// `BestEffort` is the one policy that says "carry it if you can" rather than "carry it", so it
-/// is the only one that may proceed with the baseline alone. Anything else asked for a family
-/// that no longer has a route, and silently dropping it is exactly the failure this parameter
-/// exists to prevent.
-fn refuse_unavailable(
-    requested: CopiedMetadataRequest,
-    reason: &'static str,
-) -> Result<Option<CopiedMetadataPlan>, TransferFailure> {
-    let demanded = [requested.acl(), requested.xattrs()]
-        .into_iter()
-        .any(|policy| !matches!(policy, MetadataPolicy::Omit | MetadataPolicy::BestEffort));
-    if demanded {
-        return Err(TransferFailure::orchestration(
-            TransferPhase::Metadata,
-            reason,
-        ));
-    }
-    Ok(None)
-}
-
-/// Translates a copy policy into how hard the source should look. `Omit` leaves the backend's own
-/// baseline alone rather than overriding it.
-fn observation_mode(policy: MetadataPolicy) -> crate::model::ObservationMode {
-    match policy {
-        MetadataPolicy::Omit => crate::model::ObservationMode::Omit,
-        MetadataPolicy::BestEffort => crate::model::ObservationMode::BestEffort,
-        MetadataPolicy::RequireExact | MetadataPolicy::AllowKnownLoss => {
-            crate::model::ObservationMode::Required
-        }
+/// How hard the source looks for an optional feature: not at all unless asked, and when asked,
+/// as far as it can — a source that cannot read the feature says so rather than failing.
+const fn observation_mode(asked: bool) -> ObservationMode {
+    if asked {
+        ObservationMode::BestEffort
+    } else {
+        ObservationMode::Omit
     }
 }
 
@@ -271,51 +237,13 @@ mod tests {
     use crate::metadata::{MetadataFamily, RefusalCause};
     use crate::model::AclEncoding;
 
-    /// `Omit` must leave the backend's own baseline plan alone rather than overriding it with
-    /// `Omit`, and the two demanding policies must both make the source actually look.
+    /// Not asked for, a feature is not even read; asked for, the source reads it as far as it can.
     #[test]
-    fn a_policy_decides_how_hard_the_source_looks() {
-        assert_eq!(
-            observation_mode(MetadataPolicy::Omit),
-            crate::model::ObservationMode::Omit
-        );
-        assert_eq!(
-            observation_mode(MetadataPolicy::BestEffort),
-            crate::model::ObservationMode::BestEffort
-        );
-        for policy in [MetadataPolicy::AllowKnownLoss, MetadataPolicy::RequireExact] {
-            assert_eq!(
-                observation_mode(policy),
-                crate::model::ObservationMode::Required
-            );
-        }
-    }
-
-    /// A family that was asked for and has no route must not be dropped quietly — silently
-    /// copying less than asked is the failure this parameter exists to prevent. `BestEffort` is
-    /// the one policy that permits it, because it asks rather than requires.
-    #[test]
-    fn a_route_that_does_not_exist_is_only_tolerated_by_best_effort() {
-        let reason = "no route";
-        assert!(refuse_unavailable(CopiedMetadataRequest::default(), reason).is_ok());
-        assert!(
-            refuse_unavailable(
-                CopiedMetadataRequest::default().with_acl(MetadataPolicy::BestEffort),
-                reason
-            )
-            .is_ok()
-        );
-        for policy in [MetadataPolicy::AllowKnownLoss, MetadataPolicy::RequireExact] {
-            assert!(
-                refuse_unavailable(CopiedMetadataRequest::default().with_acl(policy), reason)
-                    .is_err(),
-                "{policy:?} asked for the ACL and must not proceed without it"
-            );
-            assert!(
-                refuse_unavailable(CopiedMetadataRequest::default().with_xattrs(policy), reason)
-                    .is_err()
-            );
-        }
+    fn asking_decides_whether_the_source_looks() {
+        assert_eq!(observation_mode(false), ObservationMode::Omit);
+        assert_eq!(observation_mode(true), ObservationMode::BestEffort);
+        assert_eq!(optional_policy(false), MetadataPolicy::Omit);
+        assert_eq!(optional_policy(true), MetadataPolicy::BestEffort);
     }
 
     fn refused(cause: RefusalCause) -> String {

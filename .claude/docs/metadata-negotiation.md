@@ -1,8 +1,19 @@
 # 元数据协商（拷贝带什么、谁能否决）
 
 > 场景：要打开或关闭 ACL / xattr 的拷贝、排查「请求了却没带上」、给新 backend 声明能力。
-> 代码：`src/transfer/model.rs`（请求）· `src/transfer/engine.rs`（协商）·
+> 代码：`src/transfer/model.rs`（请求）· `src/transfer/engine/negotiation.rs`（协商）·
 > `src/metadata/mod.rs`（规划与应用）· `src/storage/roles.rs`（目的端能力）。
+
+## 用户规则（2026-09-23，决定本页一切）
+
+- **should**（要拷什么）由调用方给 —— terrasync-rs 的命令行 —— 对 data-mover 是用户输入，
+  但**用户输入错误由上层处理**：data-mover 从不因「要了做不到」而失败。
+- **can**（能不能拷）由两端自己的能力决定：源端能不能读（can scan）、目的端能不能存（can copy，
+  依据源端的元数据自动适配，精度降低等损失只记在报告里）。**先看 can，再看 should。**
+- **should scan ≡ should copy**：扫描不要的是浪费，要了没扫到的也拷不了 —— 同一个输入。
+- 两端都能 → 真的去读、去写；**读或写失败就是失败**：该文件失败，但先把其余族都应用完，再一次性
+  列出所有原因。任一端不能 → 不读、不写、报告里记原因，不算失败。
+- mtime 必拷（S3 目的端除外，那是目的端的「不能」）。xattr 是一个功能，不按名字挑。
 
 ## 必须复制 vs 可配置
 
@@ -11,49 +22,42 @@
 | | 谁决定 | 在哪 |
 |---|---|---|
 | **基线**：ownership、mode、timestamps(mtime) | backend 声明，调用方**关不掉** | `Metadata::copied_metadata_observation_plan()` |
-| **可选**：ACL、xattrs | 调用方开口才带 | `CopiedMetadataRequest`（`TransferRequest::with_copied_metadata`） |
+| **可选功能**：ACL、xattrs | 调用方开口才带 | `CopiedMetadataRequest::with_acl()` / `with_xattrs()` |
 
-**`CopiedMetadataRequest` 里没有的字段，就是关不掉的。** 加一族到可选集合 = 给这个结构加字段。
-
+**`CopiedMetadataRequest` 里没有的，就是关不掉的。** 加一个可选功能 = 给这个结构加字段。
 atime / ctime 任何情况下都不拷。
 
-## 四档策略
+## 要了一个可选功能之后
 
-判定点：`src/metadata/mod.rs` 的 `drop_with_losses()` 与 `unavailable()`。
+判定点：`src/transfer/engine/negotiation.rs` 的 `optional_policy()`（要 → 规划期 `BestEffort`，
+不要 → `Omit`），再由 `src/metadata/mod.rs` 的规划器按两端能力裁决。
 
-| 情形 | Omit | RequireExact | AllowKnownLoss | BestEffort |
-|---|---|---|---|---|
-| 能精确写入 | 跳过 | 写 | 写 | 写 |
-| 写得进去但有语义损失（精度降级、owner 丢失） | 跳过 | **失败** | 记 `losses` 后继续 | 记 `losses` 后继续 |
-| 一端不支持这一族 | 跳过 | **失败** | **失败** | 记 `Unsupported` 后继续 |
-| 两端都支持但编码不同（Posix ↔ NfsV4 ↔ WindowsSecurityDescriptor） | 跳过 | **失败** | **失败**（整族丢失是缺席，不是降级） | 记 `Unsupported` 后继续 |
-| 源端观测失败（GETACL 报错） | 跳过 | **失败** | **失败** | 记 `Failed` 后继续 |
-| 目的端**应用期**拒绝（能力位为真但 SETACL 被拒） | — | 其余族照常应用，**该文件最终失败**并列出所有被拒的族 | 同左 | 同左 |
-| 应用期**取消**（token 已触发，或 backend 报 `Cancelled`，含服务端的 `STATUS_CANCELLED`） | — | **停止** | **停止** | **停止**，该族保持规划期结果、不记 `Failed` |
-| 应用期**整批失败**（stage 打不开、落盘屏障 `sync_all` 失败；目前只有 Local 这样报）或**会话级失败** | — | **立即停止**并失败 | 同左 | 同左 |
-| 不适用（symlink 上的 ACL） | 跳过 | 跳过 | 跳过 | 跳过 |
+| 情形 | 不要 | 要 |
+|---|---|---|
+| 两端都能，精确 | 不读不写 | 拷 |
+| 两端都能，有损（精度降低、只保留 mode 等） | 不读不写 | 拷，损失记进报告 |
+| 源端读不了（NFSv3 的 ACL、未协商 named attributes 的 xattr） | 不读不写 | 跳过，记 `Unsupported`（`SourceCannotObserve`） |
+| 目的端存不了 | 不读不写 | 跳过，记 `Unsupported`（`DestinationCannotStore`） |
+| 两端都存但编码不同（Posix ↔ NfsV4 ↔ WindowsSecurityDescriptor） | 不读不写 | 跳过，记 `RequiresExternalMapping`；**不做任何转换** |
+| 源端**读失败**（GETACL 报错） | — | **文件失败**（`SourceObservationFailed`，带 class） |
+| 目的端**写失败**（能力位为真但 SETACL 被拒） | — | 其余族照常应用，**文件最终失败**并列出所有失败的族 |
+| 应用期**取消** / **会话级失败** / **整批失败** | — | **立即停止**并失败 |
+| 不适用（symlink 上的 ACL） | 跳过 | 跳过 |
 
-**分野是「降级」与「缺席」**：`AllowKnownLoss` 容忍降级、不容忍缺席；`BestEffort` 两者都容忍。
-名字容易让人以为 `AllowKnownLoss` 更宽松 —— 它不是，它要求这一族**必须被带上**。
-
-**选哪一档**：
-- 同构 NAS 迁移、希望"能带就带" → `BestEffort`
-- 合规场景、ACL 必须逐位一致 → `RequireExact`，并接受在不支持的目的端上确定性失败
-- 不确定 → 保持默认 `Omit`
+`MetadataPolicy` 的四档（`RequireExact` / `AllowKnownLoss` / `BestEffort` / `Omit`）仍在
+`metadata` 模块里，给基线族与直接调用 `compile_metadata_plan` 的代码用；**不再出现在拷贝请求里**。
 
 ## 否决链（按发生顺序）
 
-1. **调用方策略** —— `Omit` 一票否决，连观测都不发（默认）。
-2. **源端观测能力** —— 请求叠加到 backend 的基线 plan 上：
-   `RequireExact`/`AllowKnownLoss` → `ObservationMode::Required`，`BestEffort` → `BestEffort`，
-   `Omit` → 不动基线。backend 用 `MetadataObservation::{Unsupported, NotApplicable, Failed}` 否决。
-3. **目的端写入能力** —— `CopiedMetadataTarget.acl` / `.xattrs`。
+1. **should** —— 不要的功能连观测都不发（默认）。
+2. **源端能不能读** —— 要的功能以 `ObservationMode::BestEffort` 叠加到 backend 的基线 plan 上；
+   backend 用 `MetadataObservation::{Unsupported, NotApplicable}` 说「读不了」，`Failed` 说「读失败」。
+3. **目的端能不能存** —— `CopiedMetadataTarget.acl` / `.xattrs`。
 4. **规划期交叉** —— `compile_copied_metadata_plan` 按上表裁决。
-5. **应用期** —— 服务端可以在能力位说 yes 之后仍然拒绝。**任何一族写失败都让该文件失败**（用户规则，
-   2026-09-23），但先把其余族都应用完，再一次性列出所有失败的族与原因。
+5. **应用期** —— 服务端可以在能力位说 yes 之后仍然拒绝：该文件失败（先应用完其余族）。
 
-源端 plan 为 `None`、目的端 target 为 `None`（今天的 S3 目的端）同样算否决：
-**只有 `Omit` 与 `BestEffort` 能继续**，其余按"要了却没有路"失败，不静默少拷。
+源端没有元数据角色、目的端没有 target（今天的 S3 目的端）时整段跳过，**包括 mtime** ——
+「mtime 必拷、S3 目的端除外」尚未落实，是下一步。
 
 ## 各 backend 的能力
 
@@ -124,18 +128,19 @@ flush 失败经 `classify` 成 Entry 级，被当成那一条的拒绝 —— �
 
 ## 真机证据（2026-09-23，`examples/nfs_metadata_copy.rs`）
 
-入口：`.claude/skills/e2e-nfs/scripts/metadata_matrix.sh`，13 档全过。环境：m1-source（NFSv3，只读源）、
+入口：`.claude/skills/e2e-nfs/scripts/metadata_matrix.sh`，9 档全过。环境：m1-source（NFSv3，只读源）、
 FAS2750 `ontap_lisaauto_nfs`（ONTAP 9.19.1，NFSv4.1）与同机 CIFS share。
 
-| 路径 | 策略 | 结果 |
+| 路径 | 要什么 | 结果 |
 |---|---|---|
-| NFSv3 → NFSv4.1 | ACL + xattr `BestEffort` | 拷贝成功，两族都记 `Unsupported` |
-| NFSv3 → NFSv4.1 | ACL `RequireExact` | 规划期拒绝："ACL (RequireExact): the source cannot read it" |
-| NFSv4.1 → NFSv4.1 | ACL `RequireExact` / `BestEffort` | `Applied`，raw GETACL 回读与源**逐条相等且带标记** |
-| NFSv4.1 → NFSv4.1 | ACL `Omit`（阴性对照） | 目的端没有标记，校验按预期失败 |
-| NFSv4.1 → NFSv4.1 | xattr `RequireExact` | 拒绝："extended attributes (RequireExact): the source cannot read it"（该导出没协商到 named attributes） |
-| NFSv4.1 → CIFS | ACL `RequireExact` / `AllowKnownLoss` | 拒绝："the source holds a NfsV4 ACL and the destination stores WindowsSecurityDescriptor"（后者由 `113c0be` 修正） |
-| NFSv4.1 → CIFS | ACL `BestEffort` | 拷贝成功，ACL 记 `Unsupported` |
+| NFSv3 → NFSv4.1 | ACL + xattr | 拷贝成功，两族记 `Unsupported`（源端读不了） |
+| NFSv4.1 → NFSv4.1 | ACL | `Applied`，raw GETACL 回读与源**逐条相等且带标记** |
+| NFSv4.1 → NFSv4.1 | 不要 ACL（阴性对照） | 目的端没有标记，校验按预期失败 |
+| NFSv4.1 → NFSv4.1 | xattr | 拷贝成功，记 `Unsupported`（该导出没协商到 named attributes） |
+| NFSv4.1 → CIFS | ACL | 拷贝成功，记 `Unsupported`（NfsV4 与 Windows SD 编码不同，不做转换） |
+
+（2026-09-23 早先按四档策略跑过一版：`RequireExact` / `AllowKnownLoss` 在上面「做不到」的格子里
+都是规划期拒绝。按用户规则改成「要了做不到就跳过」后矩阵 9/9。）
 
 **这台 ONTAP 接受 SETACL**，`RequireExact` 的 ACL 真的落地 —— 不是只看报告：源端先加一条
 mode 表达不了的 ACE（`--mark-acl`），再从目的端读回比对。**不加标记的比对没有意义**：

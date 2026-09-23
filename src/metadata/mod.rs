@@ -174,6 +174,8 @@ pub enum MappingDecision {
     NotObserved,
     NotApplicable,
     OmittedByPolicy,
+    /// No longer produced: a read that fails is a failure under every policy. Kept so matching
+    /// code outside the crate still compiles.
     ObservationFailed,
 }
 
@@ -859,13 +861,6 @@ fn observed_value<'a, T>(
             RefusalCause::SourceCannotObserve,
         )
         .map(|()| None),
-        MetadataObservation::Failed { .. } if policy == MetadataPolicy::BestEffort => {
-            plan.mappings.push(FamilyMapping {
-                family,
-                decision: MappingDecision::ObservationFailed,
-            });
-            Ok(None)
-        }
         MetadataObservation::Failed { class, transience } => Err(MetadataPlanError::new(
             family,
             policy,
