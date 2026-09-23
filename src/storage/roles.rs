@@ -700,11 +700,19 @@ pub trait Namespace: Send + Sync {
     ) -> Result<NamespaceResult, StorageRoleFailure>;
 }
 
-/// Destination capabilities used by the ordinary baseline metadata copy.
+/// Destination capabilities used by the copied metadata families.
+///
+/// `timestamp_precision` and `ownership` describe the baseline every copy carries; a caller
+/// cannot turn them off. `acl` and `xattrs` describe families a caller has to ask for — what a
+/// destination reports here is only its ability to accept them, never a decision to copy them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CopiedMetadataTarget {
     pub timestamp_precision: TimePrecision,
     pub ownership: CopiedOwnershipTarget,
+    /// The ACL encoding this destination writes, if it writes one at all.
+    pub acl: crate::metadata::AclTarget,
+    /// Whether this destination stores extended attributes.
+    pub xattrs: crate::metadata::ValueTarget,
 }
 
 /// Ownership behavior used by the ordinary baseline metadata copy.

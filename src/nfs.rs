@@ -959,6 +959,14 @@ impl NfsStageFile for NfsRoleStageFile {
 
 #[async_trait]
 impl NfsStagedProtocol for NFSStorage {
+    fn supports_acl(&self) -> bool {
+        Self::supports_acl(self)
+    }
+
+    fn supports_xattrs(&self) -> bool {
+        Self::supports_xattr(self)
+    }
+
     fn read_inflight(&self) -> usize {
         self.config.transfer_concurrency.read()
     }

@@ -994,6 +994,8 @@ impl StagedDestination for LocalStagedDestination {
             Some(crate::storage::CopiedMetadataTarget {
                 timestamp_precision: crate::model::TimePrecision::Nanoseconds,
                 ownership: crate::storage::CopiedOwnershipTarget::Numeric,
+                acl: crate::metadata::AclTarget::Encoding(crate::model::AclEncoding::Posix),
+                xattrs: crate::metadata::ValueTarget::Supported,
             })
         }
         #[cfg(not(unix))]

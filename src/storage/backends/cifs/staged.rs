@@ -246,6 +246,12 @@ impl StagedDestination for CifsStagedDestination {
             .map(|_| crate::storage::CopiedMetadataTarget {
                 timestamp_precision: crate::model::TimePrecision::HundredNanoseconds,
                 ownership: crate::storage::CopiedOwnershipTarget::Unsupported,
+                // `metadata::decode` accepts only this encoding, so anything else has to be
+                // refused as a mapping problem rather than written wrong.
+                acl: crate::metadata::AclTarget::Encoding(
+                    crate::model::AclEncoding::WindowsSecurityDescriptor,
+                ),
+                xattrs: crate::metadata::ValueTarget::Unsupported,
             })
     }
 

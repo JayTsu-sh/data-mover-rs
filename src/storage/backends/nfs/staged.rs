@@ -56,6 +56,16 @@ pub(crate) trait NfsStageFile: Send + Sync {
 pub(crate) trait NfsStagedProtocol: Send + Sync {
     fn read_inflight(&self) -> usize;
     fn write_inflight(&self) -> usize;
+    /// Whether the negotiated mount accepts an ACL. Asked of the protocol rather than cached at
+    /// connect time, so a remount that renegotiates is reflected. Defaults to refusing, which is
+    /// the safe answer for a protocol object that does not know.
+    fn supports_acl(&self) -> bool {
+        false
+    }
+    /// Whether the negotiated mount stores named attributes.
+    fn supports_xattrs(&self) -> bool {
+        false
+    }
     fn maximum_read_chunk_bytes(&self) -> usize {
         1024 * 1024
     }
@@ -595,6 +605,16 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             .map(|_| crate::storage::CopiedMetadataTarget {
                 timestamp_precision: crate::model::TimePrecision::Nanoseconds,
                 ownership: crate::storage::CopiedOwnershipTarget::Numeric,
+                acl: if self.protocol.supports_acl() {
+                    crate::metadata::AclTarget::Encoding(crate::model::AclEncoding::NfsV4)
+                } else {
+                    crate::metadata::AclTarget::Unsupported
+                },
+                xattrs: if self.protocol.supports_xattrs() {
+                    crate::metadata::ValueTarget::Supported
+                } else {
+                    crate::metadata::ValueTarget::Unsupported
+                },
             })
     }
 
