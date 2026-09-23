@@ -728,3 +728,6 @@ fn copied_mode_never_synthesizes_numeric_ownership() {
 
 #[path = "stage_tests.rs"]
 mod stage;
+
+#[path = "error_tests.rs"]
+mod errors;

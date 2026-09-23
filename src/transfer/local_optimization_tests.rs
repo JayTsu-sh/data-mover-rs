@@ -686,6 +686,18 @@ async fn a_failed_metadata_barrier_is_not_absorbed_by_a_best_effort_family()
     };
 
     assert_eq!(error.phase(), TransferPhase::Metadata);
+    // What a caller reads: which family, that the whole batch failed, and what storage said.
+    let text = error.to_string();
+    assert!(
+        text.contains(
+            "applying extended attributes failed: the destination failed the batch as a whole"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("— Metadata failed at must-not-publish.bin (Protocol, Permanent): "),
+        "{text}"
+    );
     assert_eq!(role.metadata_batch_counts(), (1, 1));
     assert!(!error.final_destination_changed());
     assert!(

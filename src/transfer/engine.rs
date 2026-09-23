@@ -104,6 +104,8 @@ pub struct TransferFailure {
     role: Option<Box<StorageRoleFailure>>,
     registration: Option<Box<RecoveryRegistrationFailure>>,
     metadata: Option<Box<crate::metadata::MetadataApplicationFailure>>,
+    /// Why copied metadata was refused while planning, before anything was written.
+    refusal: Option<crate::metadata::MetadataPlanError>,
     failed_stage: Option<Box<FailedStage>>,
     committed_cleanup: Option<Box<FailedStage>>,
     final_destination_changed: bool,
@@ -130,6 +132,7 @@ impl TransferFailure {
             role: Some(Box::new(role)),
             registration: None,
             metadata: None,
+            refusal: None,
             failed_stage: None,
             committed_cleanup: None,
             final_destination_changed: false,
@@ -145,6 +148,7 @@ impl TransferFailure {
             role: None,
             registration: None,
             metadata: None,
+            refusal: None,
             failed_stage: None,
             committed_cleanup: None,
             final_destination_changed: false,
@@ -160,6 +164,7 @@ impl TransferFailure {
             role: None,
             registration: None,
             metadata: None,
+            refusal: None,
             failed_stage: None,
             committed_cleanup: None,
             final_destination_changed: false,
@@ -175,6 +180,7 @@ impl TransferFailure {
             role: None,
             registration: Some(Box::new(error)),
             metadata: None,
+            refusal: None,
             failed_stage: None,
             committed_cleanup: None,
             final_destination_changed: false,
@@ -190,6 +196,7 @@ impl TransferFailure {
             role: None,
             registration: None,
             metadata: Some(Box::new(error)),
+            refusal: None,
             failed_stage: None,
             committed_cleanup: None,
             final_destination_changed: false,
@@ -267,6 +274,13 @@ impl TransferFailure {
         self.metadata.as_deref()
     }
 
+    /// Why copied metadata was refused while planning — which family, under which policy, and
+    /// which end lacks it — when that is what failed.
+    #[must_use]
+    pub const fn metadata_refusal(&self) -> Option<crate::metadata::MetadataPlanError> {
+        self.refusal
+    }
+
     fn with_source_qos(mut self, source_qos: SourceQosStats) -> Self {
         self.source_qos = source_qos;
         self
@@ -321,12 +335,27 @@ impl fmt::Display for TransferFailure {
             formatter,
             "transfer {:?} failed on {:?}: {}",
             self.phase, self.side, self.message
-        )
+        )?;
+        if self.phase == TransferPhase::Metadata {
+            negotiation::write_metadata_detail(
+                formatter,
+                self.refusal,
+                self.metadata.as_deref(),
+                self.role.as_deref(),
+            )?;
+        }
+        Ok(())
     }
 }
 
+/// A metadata-phase failure has no `source()`: its Display already carries the refusal, the failed
+/// write, or the failed read, with the storage diagnostic, and a chain printer would repeat them.
+/// `metadata_refusal()` and `metadata_failure()` reach them as values.
 impl std::error::Error for TransferFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        if self.phase == TransferPhase::Metadata {
+            return None;
+        }
         self.role
             .as_ref()
             .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))

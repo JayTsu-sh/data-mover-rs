@@ -1,18 +1,20 @@
 //! Which metadata a copy carries: the baseline every copy takes, the families the caller asks
 //! for, and what the two ends can do. See `.claude/docs/metadata-negotiation.md`.
 
+use std::fmt;
 use std::sync::Arc;
 
 use super::{TransferFailure, TransferPhase, TransferSide, Transferred};
 use crate::metadata::{
-    AclTarget, MetadataFamily, MetadataPlan, MetadataPlanError, MetadataPlanErrorKind,
-    MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget,
+    AclTarget, MetadataApplicationFailure, MetadataPlan, MetadataPlanError, MetadataPlanRequest,
+    MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget, RefusalSide,
     TimestampTarget, TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
+    role_failure_text,
 };
 use crate::model::ObservationPlan;
 use crate::storage::{
     CopiedAclTarget, CopiedMetadataTarget, CopiedOwnershipTarget, CopiedValueTarget, Metadata,
-    PreflightPolicy, SourceDescriptor,
+    PreflightPolicy, SourceDescriptor, StorageRoleFailure,
 };
 use crate::transfer::{CopiedMetadataRequest, TransferRequest};
 
@@ -62,7 +64,10 @@ pub(super) async fn copied_metadata_plan(
         )
         .await
         .map_err(|error| {
-            TransferFailure::role(TransferPhase::Metadata, TransferSide::Source, error)
+            let mut failure =
+                TransferFailure::role(TransferPhase::Metadata, TransferSide::Source, error);
+            failure.message = "observing source metadata failed";
+            failure
         })?;
     let (target, ownership_policy) = metadata_target(target);
     let policies = copied_policies(
@@ -80,7 +85,7 @@ pub(super) async fn copied_metadata_plan(
         observations.mode_without_ownership,
     )
     .map(|plan| Some(CopiedMetadataPlan { plan }))
-    .map_err(|error| TransferFailure::orchestration(TransferPhase::Metadata, refusal(error)))
+    .map_err(TransferFailure::refused_metadata)
 }
 
 /// The source's metadata role with the baseline it observes for a copy, and what the destination
@@ -188,25 +193,42 @@ fn copied_policies(
         .with_xattrs(requested.xattrs())
 }
 
-/// Names the refusal a caller can act on. "One side cannot store ACLs at all" and "both sides can
-/// but their encodings differ" lead to different decisions, and a single message for every
-/// planning refusal hides which one happened. `TransferFailure` carries a `&'static str`, so the
-/// distinctions that matter get their own sentence and the rest share one.
-const fn refusal(error: MetadataPlanError) -> &'static str {
-    match (error.family(), error.kind()) {
-        (MetadataFamily::Acl, MetadataPlanErrorKind::Unsupported) => {
-            "copied ACL: one side does not support ACLs"
-        }
-        (MetadataFamily::Acl, MetadataPlanErrorKind::ExternalMappingRequired) => {
-            "copied ACL: the two sides use different encodings and need an external mapping"
-        }
-        (MetadataFamily::Acl, _) => "copied ACL: refused by policy",
-        (MetadataFamily::Xattrs, MetadataPlanErrorKind::Unsupported) => {
-            "copied extended attributes: one side does not support them"
-        }
-        (MetadataFamily::Xattrs, _) => "copied extended attributes: refused by policy",
-        _ => "copied metadata could not be planned",
+impl TransferFailure {
+    /// Copied metadata refused while planning: the headline names the end the cause is about.
+    pub(super) fn refused_metadata(error: MetadataPlanError) -> Self {
+        let side = match error.cause().side() {
+            RefusalSide::Source => TransferSide::Source,
+            RefusalSide::Destination => TransferSide::Destination,
+            _ => TransferSide::Orchestration,
+        };
+        let mut failure = Self::orchestration(
+            TransferPhase::Metadata,
+            "copied metadata was refused while planning",
+        );
+        failure.side = side;
+        failure.refusal = Some(error);
+        failure
     }
+}
+
+/// The part of a metadata-phase failure a caller acts on: which family was refused while
+/// planning and why, or which write failed and how, or what reading the source reported — each
+/// with the adapter's (already redacted) diagnostic.
+pub(super) fn write_metadata_detail(
+    formatter: &mut fmt::Formatter<'_>,
+    refusal: Option<MetadataPlanError>,
+    application: Option<&MetadataApplicationFailure>,
+    role: Option<&StorageRoleFailure>,
+) -> fmt::Result {
+    if let Some(refusal) = refusal {
+        write!(formatter, ": {refusal}")?;
+    }
+    if let Some(application) = application {
+        write!(formatter, ": {application}")?;
+    } else if let Some(role) = role {
+        write!(formatter, ": {}", role_failure_text(role))?;
+    }
+    Ok(())
 }
 
 /// What a family that was asked for but cannot be reached means for the transfer.
@@ -246,6 +268,8 @@ fn observation_mode(policy: MetadataPolicy) -> crate::model::ObservationMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::{MetadataFamily, RefusalCause};
+    use crate::model::AclEncoding;
 
     /// `Omit` must leave the backend's own baseline plan alone rather than overriding it with
     /// `Omit`, and the two demanding policies must both make the source actually look.
@@ -294,27 +318,40 @@ mod tests {
         }
     }
 
-    /// "Neither side can" and "both can but they disagree on the encoding" send a caller to
-    /// different places, so they must not share a message.
+    fn refused(cause: RefusalCause) -> String {
+        TransferFailure::refused_metadata(MetadataPlanError::new(
+            MetadataFamily::Acl,
+            MetadataPolicy::RequireExact,
+            cause,
+        ))
+        .to_string()
+    }
+
+    /// A refusal names the family, the policy it was asked under, and which end lacks it — "the
+    /// source cannot read it" and "the destination cannot store it" send a caller to different
+    /// places, and so does "the encodings differ", which also names both.
     #[test]
-    fn a_refusal_says_which_kind_it_was() {
-        let unsupported = refusal(MetadataPlanError::new(
-            MetadataFamily::Acl,
-            MetadataPlanErrorKind::Unsupported,
-        ));
-        let mapping = refusal(MetadataPlanError::new(
-            MetadataFamily::Acl,
-            MetadataPlanErrorKind::ExternalMappingRequired,
-        ));
-        assert_ne!(unsupported, mapping);
-        assert!(unsupported.contains("does not support"));
-        assert!(mapping.contains("encodings"));
-        assert_ne!(
-            refusal(MetadataPlanError::new(
-                MetadataFamily::Xattrs,
-                MetadataPlanErrorKind::Unsupported,
-            )),
-            unsupported
+    fn a_planning_refusal_says_what_which_end_and_why() {
+        let source = refused(RefusalCause::SourceCannotObserve);
+        let destination = refused(RefusalCause::DestinationCannotStore);
+        assert!(source.contains("on Source"), "{source}");
+        assert!(
+            source.contains("ACL (RequireExact): the source cannot read it"),
+            "{source}"
+        );
+        assert!(destination.contains("on Destination"), "{destination}");
+        assert!(
+            destination.contains("the destination cannot store it"),
+            "{destination}"
+        );
+        let encodings = refused(RefusalCause::EncodingsDiffer {
+            source: AclEncoding::NfsV4,
+            destination: AclEncoding::WindowsSecurityDescriptor,
+        });
+        assert!(encodings.contains("NfsV4"), "{encodings}");
+        assert!(
+            encodings.contains("WindowsSecurityDescriptor"),
+            "{encodings}"
         );
     }
 }

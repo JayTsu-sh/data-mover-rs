@@ -105,6 +105,18 @@ atime / ctime 任何情况下都不拷。
 flush 失败经 `classify` 成 Entry 级，于是仍会被当成那一条的拒绝而被 `BestEffort` 容忍。危害比
 Local 小（之前各条已各自 flush），但与上面的规则不符；要改得让逐条接口也能表达「屏障失败」。
 
+## 报错
+
+元数据失败的文本由三部分拼成：`TransferFailure` 的标题（阶段、哪一端）+ 具体原因 + 适配器诊断。
+- 规划期拒绝：`MetadataPlanError` = 族 + 策略 + `RefusalCause`（源端读不了 / 读失败（带 class）/ 没读 /
+  目的端存不了 / 两端编码不同（两个都点名）/ 缺映射器 / 映射失败 / 策略不允许的损失（点名是哪种））。
+  `cause().side()` 决定标题里的 Source / Destination。
+- 应用期失败：`MetadataApplicationFailure` = 族 + `ApplicationFailureKind`（被拒 / 整批失败 / 会话断 / 取消）
+  + 存储失败及其诊断；`source()` 可取到底层 `StorageRoleFailure`。
+- 读源端元数据失败：标题 "observing source metadata failed" + 存储失败及其诊断。
+
+诊断是适配器按契约已脱敏的文本（R8）。
+
 ## 真机证据（2026-09-23，`examples/nfs_metadata_copy.rs`）
 
 入口：`.claude/skills/e2e-nfs/scripts/metadata_matrix.sh`，13 档全过。环境：m1-source（NFSv3，只读源）、
@@ -113,11 +125,11 @@ FAS2750 `ontap_lisaauto_nfs`（ONTAP 9.19.1，NFSv4.1）与同机 CIFS share。
 | 路径 | 策略 | 结果 |
 |---|---|---|
 | NFSv3 → NFSv4.1 | ACL + xattr `BestEffort` | 拷贝成功，两族都记 `Unsupported` |
-| NFSv3 → NFSv4.1 | ACL `RequireExact` | 规划期拒绝："one side does not support ACLs" |
+| NFSv3 → NFSv4.1 | ACL `RequireExact` | 规划期拒绝："ACL (RequireExact): the source cannot read it" |
 | NFSv4.1 → NFSv4.1 | ACL `RequireExact` / `BestEffort` | `Applied`，raw GETACL 回读与源**逐条相等且带标记** |
 | NFSv4.1 → NFSv4.1 | ACL `Omit`（阴性对照） | 目的端没有标记，校验按预期失败 |
-| NFSv4.1 → NFSv4.1 | xattr `RequireExact` | 拒绝：该导出没协商到 named attributes |
-| NFSv4.1 → CIFS | ACL `RequireExact` / `AllowKnownLoss` | 拒绝："need an external mapping"（后者由 `113c0be` 修正） |
+| NFSv4.1 → NFSv4.1 | xattr `RequireExact` | 拒绝："extended attributes (RequireExact): the source cannot read it"（该导出没协商到 named attributes） |
+| NFSv4.1 → CIFS | ACL `RequireExact` / `AllowKnownLoss` | 拒绝："the source holds a NfsV4 ACL and the destination stores WindowsSecurityDescriptor"（后者由 `113c0be` 修正） |
 | NFSv4.1 → CIFS | ACL `BestEffort` | 拷贝成功，ACL 记 `Unsupported` |
 
 **这台 ONTAP 接受 SETACL**，`RequireExact` 的 ACL 真的落地 —— 不是只看报告：源端先加一条

@@ -35,7 +35,7 @@ if [ -n "${NFS_META_V3_URL:-}" ]; then
 case_ "v3->v4.1 acl+xattrs best-effort: copied, both Unsupported" 0 "copied " \
   --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$V41" --destination-path v3-be \
   --acl best-effort --xattrs best-effort --expect copied --expect-acl unsupported --expect-xattrs unsupported
-case_ "v3->v4.1 acl require-exact: refused, one side unsupported" 0 "one side does not support ACLs" \
+case_ "v3->v4.1 acl require-exact: refused, one side unsupported" 0 "ACL (RequireExact): the source cannot read it" \
   --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$V41" --destination-path v3-exact \
   --acl require-exact --expect refused
 else echo "SKIP NFSv3 rung (NFS_META_V3_URL unset)"; fi
@@ -51,14 +51,14 @@ case_ "v4.1->v4.1 acl best-effort, principal mark: carried" 0 "ACLs equal and ma
 case_ "negative control: acl omit loses the mark" 1 "lost the Principal mark" \
   --source "$V41" --source-path src-omit --seed-bytes 4096 --mark-acl principal \
   --destination "$V41" --destination-path omit-principal --acl omit --expect copied --expect-acl omitted-by-policy --verify-acl
-case_ "v4.1->v4.1 xattrs require-exact: refused" 0 "copied extended attributes: one side does not support them" \
+case_ "v4.1->v4.1 xattrs require-exact: refused" 0 "extended attributes (RequireExact):" \
   --source "$V41" --source-path src-principal --destination "$V41" --destination-path xattr-exact \
   --xattrs require-exact --expect refused
 if [ -n "${CIFS_REAL_SERVER:-}" ]; then
-case_ "v4.1->cifs acl require-exact: refused, external mapping" 0 "need an external mapping" \
+case_ "v4.1->cifs acl require-exact: refused, external mapping" 0 "the source holds a NfsV4 ACL and the destination stores WindowsSecurityDescriptor" \
   --source "$V41" --source-path src-principal --destination "$CIFS" --destination-path acl-exact \
   --acl require-exact --expect refused
-case_ "v4.1->cifs acl allow-known-loss: refused, external mapping (113c0be)" 0 "need an external mapping" \
+case_ "v4.1->cifs acl allow-known-loss: refused, external mapping (113c0be)" 0 "the source holds a NfsV4 ACL and the destination stores WindowsSecurityDescriptor" \
   --source "$V41" --source-path src-principal --destination "$CIFS" --destination-path acl-akl \
   --acl allow-known-loss --expect refused
 case_ "v4.1->cifs acl best-effort: copied, Unsupported" 0 "copied 4096" \

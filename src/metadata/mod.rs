@@ -16,7 +16,11 @@ use crate::storage::{
 
 mod errors;
 
-pub use errors::{MetadataApplicationFailure, MetadataPlanError, MetadataPlanErrorKind};
+pub(crate) use errors::role_failure_text;
+pub use errors::{
+    ApplicationFailureKind, MetadataApplicationFailure, MetadataPlanError, MetadataPlanErrorKind,
+    RefusalCause, RefusalSide,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MetadataFamily {
@@ -254,7 +258,7 @@ impl MetadataPlan {
         if let Some((family, _)) = pending.first()
             && cancel.is_cancelled()
         {
-            return Err(self.failure(*family, None, outcomes));
+            return Err(self.failure(*family, ApplicationFailureKind::Cancelled, None, outcomes));
         }
         while !pending.is_empty() {
             let mutations = pending
@@ -317,7 +321,8 @@ impl MetadataPlan {
             if !cancelled {
                 set_outcome(outcomes, family, ApplicationOutcome::Failed);
             }
-            return Err(self.failure(family, failure.error, mem::take(outcomes)));
+            let kind = ApplicationFailureKind::of(failure.error.as_ref(), cancelled, whole_batch);
+            return Err(self.failure(family, kind, failure.error, mem::take(outcomes)));
         }
         set_outcome(outcomes, family, ApplicationOutcome::Failed);
         Ok(pending[completed..failed_index]
@@ -330,11 +335,13 @@ impl MetadataPlan {
     fn failure(
         &self,
         family: MetadataFamily,
+        kind: ApplicationFailureKind,
         error: Option<StorageRoleFailure>,
         outcomes: Vec<FamilyApplication>,
     ) -> MetadataApplicationFailure {
         MetadataApplicationFailure {
             family,
+            kind,
             error: error.map(Box::new),
             report: MetadataApplicationReport {
                 outcomes,
@@ -351,14 +358,12 @@ impl MetadataPlan {
         let mut outcomes = self.planned_outcomes();
         for (family, mutation) in &self.mutations {
             if cancel.is_cancelled() {
-                return Err(MetadataApplicationFailure {
-                    family: *family,
-                    error: None,
-                    report: MetadataApplicationReport {
-                        outcomes,
-                        losses: self.losses.clone(),
-                    },
-                });
+                return Err(self.failure(
+                    *family,
+                    ApplicationFailureKind::Cancelled,
+                    None,
+                    outcomes,
+                ));
             }
             if let Err(error) = target.apply(mutation.clone(), cancel.clone()).await {
                 let cancelled = cancel.is_cancelled() || is_cancellation(&error);
@@ -368,14 +373,8 @@ impl MetadataPlan {
                 if !cancelled && is_refusal(&error) && self.tolerant.contains(family) {
                     continue;
                 }
-                return Err(MetadataApplicationFailure {
-                    family: *family,
-                    error: Some(Box::new(error)),
-                    report: MetadataApplicationReport {
-                        outcomes,
-                        losses: self.losses.clone(),
-                    },
-                });
+                let kind = ApplicationFailureKind::of(Some(&error), cancelled, false);
+                return Err(self.failure(*family, kind, Some(error), outcomes));
             }
             set_outcome(&mut outcomes, *family, ApplicationOutcome::Applied);
         }
@@ -566,13 +565,23 @@ fn compile_acl(
         }
         // Not a downgrade: without an external mapping the destination cannot hold this ACL at
         // all, so `AllowKnownLoss`, which requires the family to be carried, refuses too.
-        AclTarget::Encoding(_) => unavailable(
+        AclTarget::Encoding(destination) => unavailable(
             plan,
             family,
             policy,
             MappingDecision::RequiresExternalMapping,
+            RefusalCause::EncodingsDiffer {
+                source: value.encoding(),
+                destination,
+            },
         ),
-        AclTarget::Unsupported => unavailable(plan, family, policy, MappingDecision::Unsupported),
+        AclTarget::Unsupported => unavailable(
+            plan,
+            family,
+            policy,
+            MappingDecision::Unsupported,
+            RefusalCause::DestinationCannotStore,
+        ),
         AclTarget::NotApplicable => drop_with_loss(plan, family, policy, SemanticLoss::AclDropped),
     }
 }
@@ -594,7 +603,13 @@ fn compile_value<T>(
             exact(plan, family, mutation(value));
             Ok(())
         }
-        ValueTarget::Unsupported => unavailable(plan, family, policy, MappingDecision::Unsupported),
+        ValueTarget::Unsupported => unavailable(
+            plan,
+            family,
+            policy,
+            MappingDecision::Unsupported,
+            RefusalCause::DestinationCannotStore,
+        ),
         ValueTarget::NotApplicable => {
             let loss = match family {
                 MetadataFamily::Xattrs => SemanticLoss::XattrsDropped,
@@ -631,12 +646,12 @@ fn compile_ownership(
                         family,
                         policy,
                         MappingDecision::RequiresExternalMapping,
+                        RefusalCause::PrincipalMapperMissing,
                     )
                 };
             };
-            let ownership = mapper.map(*value).map_err(|_| MetadataPlanError {
-                family,
-                kind: MetadataPlanErrorKind::PrincipalMappingFailed,
+            let ownership = mapper.map(*value).map_err(|_| {
+                MetadataPlanError::new(family, policy, RefusalCause::PrincipalMappingFailed)
             })?;
             exact(plan, family, MetadataMutation::MappedOwnership(ownership));
             Ok(())
@@ -644,10 +659,11 @@ fn compile_ownership(
         OwnershipTarget::ModeOnly => {
             let losses = vec![SemanticLoss::OwnerAndGroupDropped];
             if policy == MetadataPolicy::RequireExact {
-                return Err(MetadataPlanError {
+                return Err(MetadataPlanError::new(
                     family,
-                    kind: MetadataPlanErrorKind::KnownLossRejected,
-                });
+                    policy,
+                    RefusalCause::LossRejected(SemanticLoss::OwnerAndGroupDropped),
+                ));
             }
             plan.losses.0.push((family, losses[0]));
             plan.mappings.push(FamilyMapping {
@@ -658,9 +674,13 @@ fn compile_ownership(
                 .push((family, MetadataMutation::Mode(value.mode & 0o7777)));
             Ok(())
         }
-        OwnershipTarget::Unsupported => {
-            unavailable(plan, family, policy, MappingDecision::Unsupported)
-        }
+        OwnershipTarget::Unsupported => unavailable(
+            plan,
+            family,
+            policy,
+            MappingDecision::Unsupported,
+            RefusalCause::DestinationCannotStore,
+        ),
         OwnershipTarget::NotApplicable => {
             drop_with_loss(plan, family, policy, SemanticLoss::OwnershipModeDropped)
         }
@@ -680,7 +700,13 @@ fn compile_timestamps(
     let target = match request.target.timestamps {
         TimestampTargetCapability::Supported(target) => target,
         TimestampTargetCapability::Unsupported => {
-            return unavailable(plan, family, policy, MappingDecision::Unsupported);
+            return unavailable(
+                plan,
+                family,
+                policy,
+                MappingDecision::Unsupported,
+                RefusalCause::DestinationCannotStore,
+            );
         }
         TimestampTargetCapability::NotApplicable => {
             let mut losses = Vec::new();
@@ -725,10 +751,11 @@ fn compile_timestamps(
         return Ok(());
     }
     if policy == MetadataPolicy::RequireExact {
-        return Err(MetadataPlanError {
+        return Err(MetadataPlanError::new(
             family,
-            kind: MetadataPlanErrorKind::KnownLossRejected,
-        });
+            policy,
+            RefusalCause::LossRejected(losses[0]),
+        ));
     }
     for loss in &losses {
         plan.losses.0.push((family, *loss));
@@ -790,10 +817,11 @@ fn observed_value<'a, T>(
         MetadataObservation::Value { value, .. } => Ok(Some(value)),
         MetadataObservation::NotRequested => {
             if policy != MetadataPolicy::BestEffort {
-                return Err(MetadataPlanError {
+                return Err(MetadataPlanError::new(
                     family,
-                    kind: MetadataPlanErrorKind::ObservationRequired,
-                });
+                    policy,
+                    RefusalCause::SourceDidNotObserve,
+                ));
             }
             plan.mappings.push(FamilyMapping {
                 family,
@@ -808,9 +836,14 @@ fn observed_value<'a, T>(
             });
             Ok(None)
         }
-        MetadataObservation::Unsupported => {
-            unavailable(plan, family, policy, MappingDecision::Unsupported).map(|()| None)
-        }
+        MetadataObservation::Unsupported => unavailable(
+            plan,
+            family,
+            policy,
+            MappingDecision::Unsupported,
+            RefusalCause::SourceCannotObserve,
+        )
+        .map(|()| None),
         MetadataObservation::Failed { .. } if policy == MetadataPolicy::BestEffort => {
             plan.mappings.push(FamilyMapping {
                 family,
@@ -818,10 +851,14 @@ fn observed_value<'a, T>(
             });
             Ok(None)
         }
-        MetadataObservation::Failed { .. } => Err(MetadataPlanError {
+        MetadataObservation::Failed { class, transience } => Err(MetadataPlanError::new(
             family,
-            kind: MetadataPlanErrorKind::ObservationFailed,
-        }),
+            policy,
+            RefusalCause::SourceObservationFailed {
+                class: *class,
+                transience: *transience,
+            },
+        )),
     }
 }
 
@@ -851,10 +888,20 @@ fn drop_with_losses(
             });
             Ok(())
         }
-        MetadataPolicy::RequireExact | MetadataPolicy::Omit => Err(MetadataPlanError {
+        // Nothing to lose — no value was there to drop — so nothing for a policy to refuse, and
+        // "lossy" or "omitted" would both misreport it.
+        _ if losses.is_empty() => {
+            plan.mappings.push(FamilyMapping {
+                family,
+                decision: MappingDecision::NotApplicable,
+            });
+            Ok(())
+        }
+        MetadataPolicy::RequireExact | MetadataPolicy::Omit => Err(MetadataPlanError::new(
             family,
-            kind: MetadataPlanErrorKind::KnownLossRejected,
-        }),
+            policy,
+            RefusalCause::LossRejected(losses[0]),
+        )),
     }
 }
 
@@ -871,17 +918,13 @@ fn unavailable(
     family: MetadataFamily,
     policy: MetadataPolicy,
     decision: MappingDecision,
+    cause: RefusalCause,
 ) -> Result<(), MetadataPlanError> {
     if policy == MetadataPolicy::BestEffort {
         plan.mappings.push(FamilyMapping { family, decision });
         return Ok(());
     }
-    let kind = match decision {
-        MappingDecision::RequiresExternalMapping => MetadataPlanErrorKind::ExternalMappingRequired,
-        MappingDecision::Unsupported => MetadataPlanErrorKind::Unsupported,
-        _ => MetadataPlanErrorKind::KnownLossRejected,
-    };
-    Err(MetadataPlanError { family, kind })
+    Err(MetadataPlanError::new(family, policy, cause))
 }
 
 fn planned_outcome(decision: &MappingDecision, has_mutation: bool) -> ApplicationOutcome {

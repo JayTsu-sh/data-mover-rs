@@ -527,6 +527,12 @@ async fn a_failure_of_the_whole_batch_is_never_tolerated() {
             .unwrap_err();
         assert_eq!(failure.family(), family, "{refusal:?}");
         assert!(failure.storage_error().is_some(), "{refusal:?}");
+        assert_eq!(
+            failure.kind(),
+            ApplicationFailureKind::BatchFailed,
+            "{refusal:?}"
+        );
+        assert!(failure.to_string().contains("as a whole"), "{failure}");
         assert_eq!(target.applied_families(), applied, "{refusal:?}");
         // Applied to the stage is not applied: after a failed barrier none of it is durable.
         assert!(
@@ -550,6 +556,7 @@ async fn a_lost_session_on_a_tolerant_family_still_stops_the_copy() {
         .await
         .unwrap_err();
     assert_eq!(staged.family(), MetadataFamily::Acl);
+    assert_eq!(staged.kind(), ApplicationFailureKind::SessionLost);
     let target = ScriptedStage::new(Refusal::SessionLost);
     let published = plan(best_effort_after_ownership())
         .apply(
@@ -561,4 +568,33 @@ async fn a_lost_session_on_a_tolerant_family_still_stops_the_copy() {
         .unwrap_err();
     assert_eq!(published.family(), MetadataFamily::Acl);
     assert_eq!(target.applied_families(), [MetadataFamily::OwnershipMode]);
+}
+
+/// A required family the destination refuses: the failure says it was refused, and the caller can
+/// reach what the storage reported, both through `source()` and in the text.
+#[tokio::test]
+async fn a_refused_write_reaches_the_storage_diagnostic() {
+    let target = ScriptedStage::new(Refusal::InOrder);
+    let failure = plan(all_exact())
+        .apply_to_stage(&target, &stage(), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(failure.kind(), ApplicationFailureKind::Refused);
+    assert!(failure.storage_error().is_some());
+    let text = failure.to_string();
+    assert!(
+        text.starts_with("applying ACL failed: the destination refused the write"),
+        "{text}"
+    );
+    assert!(text.contains("destination refused the ACL"), "{text}");
+}
+
+#[tokio::test]
+async fn a_cancelled_application_says_so() {
+    let target = ScriptedStage::new(Refusal::CancelledBetween);
+    let failure = plan(best_effort_after_ownership())
+        .apply_to_stage(&target, &stage(), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(failure.kind(), ApplicationFailureKind::Cancelled);
 }
