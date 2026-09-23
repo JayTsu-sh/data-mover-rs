@@ -4437,20 +4437,64 @@ impl NFSStorage {
 
     /// Lists exactly one directory for the storage Namespace role.
     ///
+    /// A cached directory handle is handed back without being verified — `lookup_fh` sends no
+    /// RPC when the whole path is cached — so a stale one first shows up here, at
+    /// `readdirplus`. Invalidating the path and listing again is what makes that self-healing;
+    /// every other NFS site already does this and this one did not, which left a directory
+    /// failing for as long as the cache entry lived (two hours for a shallow path).
+    ///
     /// Entries keep the order the server sent them in. The traversal contract deliberately does
     /// not constrain sibling order, and a caller that needs one asks for `TraversalOrder`, which
     /// sorts in the cursor. Sorting here bought nothing: it cost an `O(n log n)` pass per
     /// directory, and it was the reason this backend looked ordered while the CIFS and Local
     /// namespaces, which do not sort, did not.
     pub(crate) async fn list_role_entries(&self, relative_path: &Path) -> Result<Vec<EntryEnum>> {
+        for attempt in 0..=MAX_STALE_RETRIES {
+            match self.list_role_entries_once(relative_path).await? {
+                Ok(entries) => return Ok(entries),
+                Err(error)
+                    if is_retryable_with_invalidation(&error) && attempt < MAX_STALE_RETRIES =>
+                {
+                    let stale_generation = self.refresh_generation.load(Ordering::Acquire);
+                    self.maybe_refresh_root_fh(stale_generation).await?;
+                    let root_fh = self.get_root_fh();
+                    let components = Self::collect_components(relative_path)?;
+                    invalidate_path_cache(&components, &root_fh);
+                }
+                Err(error) if is_server_busy(&error) && attempt < MAX_STALE_RETRIES => {
+                    backoff_server_busy("list_role_entries", &relative_path, attempt).await;
+                }
+                Err(error) => {
+                    return Err(StorageError::NfsError(format!(
+                        "NFS directory listing failed: {error}"
+                    )));
+                }
+            }
+        }
+        Err(StorageError::NfsError(format!(
+            "NFS directory listing failed for {} after {MAX_STALE_RETRIES} retries",
+            relative_path.display()
+        )))
+    }
+
+    /// One listing attempt. The outer `Result` is terminal; the inner one hands the protocol
+    /// error back so the caller can decide whether invalidating the cached handle is worth a
+    /// retry.
+    async fn list_role_entries_once(
+        &self,
+        relative_path: &Path,
+    ) -> Result<std::result::Result<Vec<EntryEnum>, NfsError>> {
         let directory = self.lookup_fh(relative_path).await?;
         let mount = self.mount.clone();
         let mut stream = mount.readdirplus(directory.fh).await;
         let mut entries = Vec::new();
         while let Some(result) = stream.next().await {
-            let entry = result.map_err(|error| {
-                StorageError::NfsError(format!("NFS directory listing failed: {error}"))
-            })?;
+            let entry = match result {
+                Ok(entry) => entry,
+                // Partial results are dropped on purpose: the caller starts the listing over,
+                // and keeping them would duplicate every entry read before the failure.
+                Err(error) => return Ok(Err(error)),
+            };
             let attrs = entry.attr.ok_or_else(|| {
                 StorageError::NfsError("NFS directory entry omitted attributes".to_owned())
             })?;
@@ -4468,7 +4512,7 @@ impl NFSStorage {
                 NfsEnrich::from_attrs(&attrs),
             )));
         }
-        Ok(entries)
+        Ok(Ok(entries))
     }
 
     fn finish_read_dir(
