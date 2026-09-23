@@ -35,7 +35,7 @@ pub(crate) fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
             }
             nfs_rs::RecoveryAction::DoNotRetry => (FailureClass::Protocol, Transience::Permanent),
         };
-        return NfsProtocolFailure { class, transience };
+        return with_server_status(NfsProtocolFailure::new(class, transience), &error);
     }
     let (class, transience) = match &error {
         nfs_rs::NfsError::Unsupported(_) => (FailureClass::Unsupported, Transience::Permanent),
@@ -75,11 +75,23 @@ pub(crate) fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
         }
         _ => (FailureClass::Protocol, Transience::Unknown),
     };
-    NfsProtocolFailure { class, transience }
+    with_server_status(NfsProtocolFailure::new(class, transience), &error)
+}
+
+/// Names the NFS status the server answered with, looking through the recovery wrapper nfs-rs
+/// puts around it. Transport and client-side failures have none.
+fn with_server_status(failure: NfsProtocolFailure, error: &nfs_rs::NfsError) -> NfsProtocolFailure {
+    match error {
+        nfs_rs::NfsError::Nfs3(code) => failure.with_status(code),
+        nfs_rs::NfsError::Nfs4(code) => failure.with_status(code),
+        nfs_rs::NfsError::OperationOutcome(outcome) => with_server_status(failure, &outcome.source),
+        _ => failure,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::source::role_failure;
     use super::*;
 
     #[test]
@@ -142,6 +154,84 @@ mod tests {
                 "test timeout",
             )),
         )))
+    }
+
+    fn wrapped(recovery: nfs_rs::RecoveryAction, source: nfs_rs::NfsError) -> nfs_rs::NfsError {
+        nfs_rs::NfsError::OperationOutcome(Box::new(nfs_rs::OperationOutcomeError::new(
+            nfs_rs::OperationOutcome::DefiniteFailure,
+            nfs_rs::OperationClass::ReplaySensitive,
+            recovery,
+            nfs_rs::RequestContext {
+                operation: "test".to_owned(),
+                protocol: nfs_rs::NFSVersion::NFSv4p1,
+                request_id: None,
+            },
+            source,
+        )))
+    }
+
+    #[test]
+    fn classify_error_keeps_the_nfs_status_name() {
+        for (error, status) in [
+            (
+                nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_BADOWNER),
+                Some("NFS4ERR_BADOWNER (bad owner)"),
+            ),
+            (
+                nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_PERM),
+                Some("NFS3ERR_PERM (permission denied)"),
+            ),
+            (
+                wrapped(
+                    nfs_rs::RecoveryAction::DoNotRetry,
+                    nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_PERM),
+                ),
+                Some("NFS4ERR_PERM (permission denied)"),
+            ),
+            (
+                nfs_rs::NfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "connection reset",
+                )),
+                None,
+            ),
+        ] {
+            assert_eq!(classify_error(error).status.as_deref(), status);
+        }
+    }
+
+    #[test]
+    fn a_refused_write_names_the_nfs_status() {
+        let path = crate::model::StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
+        let refused = classify_error(nfs_rs::NfsError::Nfs4(
+            nfs_rs::Nfs4ErrorCode::NFS4ERR_BADOWNER,
+        ));
+        let crate::storage::StorageRoleFailure::Entry(error) =
+            role_failure(&path, crate::model::Operation::Metadata, refused)
+        else {
+            panic!("a refused write is entry-scoped");
+        };
+        assert_eq!(
+            error.diagnostic(),
+            "NFS role failed: NFS4ERR_BADOWNER (bad owner)"
+        );
+
+        let lost = classify_error(wrapped(
+            nfs_rs::RecoveryAction::Remount,
+            nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_BADSESSION),
+        ));
+        let crate::storage::StorageRoleFailure::Session(error) =
+            role_failure(&path, crate::model::Operation::Metadata, lost)
+        else {
+            panic!("a lost session is session-scoped");
+        };
+        assert!(
+            error
+                .diagnostic()
+                .starts_with("NFS session failed: NFS4ERR_BADSESSION ("),
+            "{}",
+            error.diagnostic()
+        );
     }
 
     #[test]

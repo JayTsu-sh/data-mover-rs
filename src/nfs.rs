@@ -531,7 +531,7 @@ fn classify_role_error(error: StorageError) -> NfsProtocolFailure {
             crate::model::Transience::Unknown,
         ),
     };
-    NfsProtocolFailure { class, transience }
+    NfsProtocolFailure::new(class, transience)
 }
 
 fn role_kind(attrs: &Attr) -> crate::model::EntryKind {
@@ -1020,10 +1020,10 @@ impl NfsStagedProtocol for NFSStorage {
         let handle = match self.create_file_exclusive(native, Some(0o600)).await {
             Ok(Some(handle)) => handle,
             Ok(None) => {
-                return Err(NfsProtocolFailure {
-                    class: crate::model::FailureClass::Conflict,
-                    transience: crate::model::Transience::Permanent,
-                });
+                return Err(NfsProtocolFailure::new(
+                    crate::model::FailureClass::Conflict,
+                    crate::model::Transience::Permanent,
+                ));
             }
             Err(error) => return Err(classify_role_error(error)),
         };

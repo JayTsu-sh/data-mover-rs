@@ -278,10 +278,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if files.insert(path.as_str().to_owned(), Vec::new()).is_some() {
-                return Err(NfsProtocolFailure {
-                    class: FailureClass::Conflict,
-                    transience: Transience::Permanent,
-                });
+                return Err(NfsProtocolFailure::new(
+                    FailureClass::Conflict,
+                    Transience::Permanent,
+                ));
             }
             Ok(())
         }
@@ -303,10 +303,10 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains_key(path.as_str())
             {
-                return Err(NfsProtocolFailure {
-                    class: FailureClass::NotFound,
-                    transience: Transience::Permanent,
-                });
+                return Err(NfsProtocolFailure::new(
+                    FailureClass::NotFound,
+                    Transience::Permanent,
+                ));
             }
             if !path.as_str().contains(".checkpoint") {
                 self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -339,10 +339,10 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(path.as_str())
                 .map(|value| value.len() as u64)
-                .ok_or(NfsProtocolFailure {
-                    class: FailureClass::NotFound,
-                    transience: Transience::Permanent,
-                })
+                .ok_or(NfsProtocolFailure::new(
+                    FailureClass::NotFound,
+                    Transience::Permanent,
+                ))
         }
 
         async fn rename(
@@ -354,10 +354,10 @@ mod tests {
                 .files
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let value = files.remove(from.as_str()).ok_or(NfsProtocolFailure {
-                class: FailureClass::NotFound,
-                transience: Transience::Permanent,
-            })?;
+            let value = files.remove(from.as_str()).ok_or(NfsProtocolFailure::new(
+                FailureClass::NotFound,
+                Transience::Permanent,
+            ))?;
             match self.rename_mode.load(std::sync::atomic::Ordering::SeqCst) {
                 2 => Err(NfsProtocolFailure::protocol()),
                 3 => {
@@ -381,10 +381,10 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(path.as_str())
                 .map(|_| ())
-                .ok_or(NfsProtocolFailure {
-                    class: FailureClass::NotFound,
-                    transience: Transience::Permanent,
-                })
+                .ok_or(NfsProtocolFailure::new(
+                    FailureClass::NotFound,
+                    Transience::Permanent,
+                ))
         }
     }
 
@@ -969,9 +969,9 @@ mod tests {
                 )
                 .unwrap_or_else(|error| panic!("{error}")),
                 backend_fact: None,
-            content_version: None,
-            inline_timestamps: None,
-            inline_mode: None,
+                content_version: None,
+                inline_timestamps: None,
+                inline_mode: None,
             },
             recovery_binding: [7; 32],
         }
@@ -1654,5 +1654,4 @@ mod tests {
         }
     }
     include!("positioned_tests.rs");
-
 }

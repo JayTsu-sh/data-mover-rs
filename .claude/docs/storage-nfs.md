@@ -50,6 +50,14 @@ NFS 错误必须按 commit `7eb3046` 的分类映射：
 
 **修改 retry 决策必须同步更新本表 + [error-taxonomy.md](error-taxonomy.md)**。
 
+**role 失败的诊断带服务端状态**（`storage/backends/nfs/protocol.rs::classify_error`）：经过
+`classify_error` 的失败，服务端回了 NFSv3/v4 状态时，`NfsProtocolFailure.status` 记下 RFC 名字和含义，
+诊断是 `NFS role failed: NFS4ERR_BADOWNER (bad owner)` / `NFS session failed: NFS4ERR_BADSESSION (...)`；
+nfs-rs 包在 `OperationOutcome` 里的状态也会取出来。传输 / 客户端侧失败没有状态，诊断仍是
+`NFS role failed`。分类（class / transience）不受影响。
+**缺口**：走 legacy `StorageError` 再 `classify_role_error` 的路径（`nfs.rs` 的 SETATTR —— mode /
+owner / 时间 —— xattr、namespace、staged 的多数操作）在转成字符串时丢了 nfs-rs 错误，没有状态。
+
 ## NfsEnrich
 
 - 结构在 `lookup` vs `walkdir_2` 中行为不同 (按站点配置)。

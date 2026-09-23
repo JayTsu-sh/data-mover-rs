@@ -284,10 +284,10 @@ fn connectivity_is_session_scoped_not_entry_scoped() -> Result<(), Box<dyn std::
     let failure = role_failure(
         &StoragePath::new("file")?,
         crate::model::Operation::Read,
-        NfsProtocolFailure {
-            class: FailureClass::Connectivity,
-            transience: crate::model::Transience::Unknown,
-        },
+        NfsProtocolFailure::new(
+            FailureClass::Connectivity,
+            crate::model::Transience::Unknown,
+        ),
     );
     assert!(matches!(failure, StorageRoleFailure::Session(_)));
     Ok(())
@@ -303,9 +303,8 @@ impl NfsReadCursor for DelayedPrefixCursor {
             1
         }))
         .await;
-        let offset = usize::try_from(offset).map_err(|_| NfsProtocolFailure {
-            class: FailureClass::InvalidInput,
-            transience: Transience::Permanent,
+        let offset = usize::try_from(offset).map_err(|_| {
+            NfsProtocolFailure::new(FailureClass::InvalidInput, Transience::Permanent)
         })?;
         Ok(Bytes::from_static(b"abcdefghijkl").slice(offset..offset + count))
     }

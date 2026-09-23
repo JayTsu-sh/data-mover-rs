@@ -117,19 +117,13 @@ async fn a_refused_setacl_stays_entry_scoped_and_only_a_lost_connection_does_not
         FailureClass::Unsupported,
         FailureClass::InvalidInput,
     ] {
-        let failure = NfsProtocolFailure {
-            class,
-            transience: Transience::Permanent,
-        };
+        let failure = NfsProtocolFailure::new(class, Transience::Permanent);
         assert!(matches!(
             role_failure(&path, crate::model::Operation::Metadata, failure),
             StorageRoleFailure::Entry(_)
         ));
     }
-    let lost = NfsProtocolFailure {
-        class: FailureClass::Connectivity,
-        transience: Transience::Transient,
-    };
+    let lost = NfsProtocolFailure::new(FailureClass::Connectivity, Transience::Transient);
     assert!(matches!(
         role_failure(&path, crate::model::Operation::Metadata, lost),
         StorageRoleFailure::Session(_)
@@ -320,12 +314,12 @@ async fn modes_avoid_unrequested_or_unsupported_storage_calls() {
 #[tokio::test]
 async fn optional_failure_policy_preserves_entry_scope() {
     let path = StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
-    let failure = super::super::source::NfsProtocolFailure {
-        class: FailureClass::PermissionDenied,
-        transience: Transience::Permanent,
-    };
+    let failure = super::super::source::NfsProtocolFailure::new(
+        FailureClass::PermissionDenied,
+        Transience::Permanent,
+    );
     let observed = observe_optional(&path, ObservationMode::BestEffort, true, || async {
-        Err::<u8, _>(failure)
+        Err::<u8, _>(failure.clone())
     })
     .await
     .unwrap_or_else(|error| panic!("{error}"));

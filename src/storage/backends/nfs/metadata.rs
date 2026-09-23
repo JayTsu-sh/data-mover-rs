@@ -55,10 +55,10 @@ pub(crate) trait NfsMetadataProtocol: Send + Sync {
     /// Change permission bits without synthesizing or rewriting numeric ownership.
     async fn set_mode(&self, path: &StoragePath, mode: u32) -> Result<(), NfsProtocolFailure> {
         let _ = (path, mode);
-        Err(NfsProtocolFailure {
-            class: crate::model::FailureClass::Unsupported,
-            transience: crate::model::Transience::Permanent,
-        })
+        Err(NfsProtocolFailure::new(
+            crate::model::FailureClass::Unsupported,
+            crate::model::Transience::Permanent,
+        ))
     }
     async fn set_timestamps(
         &self,
@@ -397,11 +397,10 @@ where
             class: error.class,
             transience: error.transience,
         }),
-        Err(error) => Err(super::source::entry_failure(
+        Err(error) => Err(super::source::entry_scoped(
             path,
             crate::model::Operation::Metadata,
-            error.class,
-            error.transience,
+            error,
         )),
     }
 }

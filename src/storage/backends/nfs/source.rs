@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -25,18 +26,34 @@ pub(crate) struct NfsSourceObservation {
     pub(crate) content_version: Bytes,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct NfsProtocolFailure {
     pub(crate) class: FailureClass,
     pub(crate) transience: Transience,
+    /// The status the server answered with, when the failure came from one — `NFS4ERR_PERM
+    /// (permission denied)`: the diagnostic names it, so a refused owner can be told from a
+    /// refused permission without a packet capture.
+    pub(crate) status: Option<Arc<str>>,
 }
 
 impl NfsProtocolFailure {
-    pub(crate) const fn protocol() -> Self {
+    /// A failure with no server status: the client or transport decided it.
+    pub(crate) const fn new(class: FailureClass, transience: Transience) -> Self {
         Self {
-            class: FailureClass::Protocol,
-            transience: Transience::Permanent,
+            class,
+            transience,
+            status: None,
         }
+    }
+
+    pub(crate) const fn protocol() -> Self {
+        Self::new(FailureClass::Protocol, Transience::Permanent)
+    }
+
+    /// Names the status the server answered with.
+    pub(crate) fn with_status(mut self, status: impl fmt::Debug + fmt::Display) -> Self {
+        self.status = Some(Arc::from(format!("{status:?} ({status})")));
+        self
     }
 }
 
@@ -86,16 +103,7 @@ impl NfsReadSourceAdapter {
             IdentityStrength::StableWithinBackend,
             &observed.file_handle,
         )
-        .map_err(|_| {
-            role_failure(
-                path,
-                Operation::Observe,
-                NfsProtocolFailure {
-                    class: FailureClass::Protocol,
-                    transience: Transience::Permanent,
-                },
-            )
-        })?;
+        .map_err(|_| role_failure(path, Operation::Observe, NfsProtocolFailure::protocol()))?;
         Ok(SourceDescriptor {
             path: path.clone(),
             kind: observed.kind,
@@ -319,10 +327,10 @@ async fn fill_read_pipeline(state: &mut ReadState) -> Result<(), StorageRoleFail
         let future: NfsReadFuture = Box::pin(async move {
             let result = tokio::select! {
                 biased;
-                () = cancel.cancelled() => Err(NfsProtocolFailure {
-                    class: FailureClass::Cancelled,
-                    transience: Transience::Transient,
-                }),
+                () = cancel.cancelled() => Err(NfsProtocolFailure::new(
+                    FailureClass::Cancelled,
+                    Transience::Transient,
+                )),
                 result = cursor.read_at(offset, count) => result,
             };
             (offset, count, result, admission)
@@ -421,17 +429,47 @@ pub(super) fn role_failure(
     error: NfsProtocolFailure,
 ) -> StorageRoleFailure {
     if error.class == FailureClass::Connectivity {
+        let diagnostic = diagnostic("session", error.status.as_deref());
         return StorageRoleFailure::Session(
-            BackendSessionFailure::new(
-                operation,
-                error.class,
-                error.transience,
-                "NFS session failed",
-            )
-            .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
+            BackendSessionFailure::new(operation, error.class, error.transience, diagnostic)
+                .unwrap_or_else(|_| unreachable!("{DIAGNOSTIC_IS_VALID}")),
         );
     }
-    entry_failure(path, operation, error.class, error.transience)
+    entry_scoped(path, operation, error)
+}
+
+/// The failure as entry-scoped even when it is a connectivity class — for callers that must not
+/// promote it to the session — keeping the server's status in the diagnostic.
+pub(super) fn entry_scoped(
+    path: &StoragePath,
+    operation: Operation,
+    error: NfsProtocolFailure,
+) -> StorageRoleFailure {
+    let NfsProtocolFailure {
+        class,
+        transience,
+        status,
+    } = error;
+    StorageRoleFailure::Entry(
+        EntryOperationFailure::new(
+            path.clone(),
+            operation,
+            class,
+            transience,
+            diagnostic("role", status.as_deref()),
+        )
+        .unwrap_or_else(|_| unreachable!("{DIAGNOSTIC_IS_VALID}")),
+    )
+}
+
+const DIAGNOSTIC_IS_VALID: &str =
+    "the prefix is non-blank and nfs-rs status text is fixed, NUL-free and short";
+
+fn diagnostic(scope: &str, status: Option<&str>) -> String {
+    match status {
+        Some(status) => format!("NFS {scope} failed: {status}"),
+        None => format!("NFS {scope} failed"),
+    }
 }
 
 pub(super) fn entry_failure(
