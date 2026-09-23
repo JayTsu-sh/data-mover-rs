@@ -245,8 +245,8 @@ impl StagedDestination for HdfsStagedDestination {
                 timestamp_precision: crate::model::TimePrecision::Milliseconds,
                 ownership: crate::storage::CopiedOwnershipTarget::ModeOnly,
                 // The metadata role reports both families unavailable on observation too.
-                acl: crate::metadata::AclTarget::Unsupported,
-                xattrs: crate::metadata::ValueTarget::Unsupported,
+                acl: crate::storage::CopiedAclTarget::Unsupported,
+                xattrs: crate::storage::CopiedValueTarget::Unsupported,
             })
     }
 

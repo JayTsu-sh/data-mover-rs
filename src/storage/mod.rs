@@ -34,13 +34,13 @@ pub use factory::{
 };
 pub use handle::Storage;
 pub use roles::{
-    ByteStream, CheckpointObservation, CopiedMetadataObservation, CopiedMetadataTarget,
-    CopiedOwnershipTarget, FinalDestination, Metadata, MetadataMutation, Namespace,
-    NamespaceRequest, NamespaceResult, PositionedByteStream, PositionedChunk, PrepareRequest,
-    PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
-    ReadRequest, ReadSource, RecoverRequest, RecoveryIdentity, RecoveryValueError,
-    SourceDescriptor, StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure,
-    VerificationEvidence, VerifyRequest, WriteEvidence,
+    ByteStream, CheckpointObservation, CopiedAclTarget, CopiedMetadataObservation,
+    CopiedMetadataTarget, CopiedOwnershipTarget, CopiedValueTarget, FinalDestination, Metadata,
+    MetadataMutation, Namespace, NamespaceRequest, NamespaceResult, PositionedByteStream,
+    PositionedChunk, PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence,
+    PublicationFailure, PublishRequest, ReadRequest, ReadSource, RecoverRequest, RecoveryIdentity,
+    RecoveryValueError, SourceDescriptor, StagedDestination, StagedMetadataApplicationFailure,
+    StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 pub(crate) use roles::{CheckpointRegistration, DeferredCheckpoint};
 

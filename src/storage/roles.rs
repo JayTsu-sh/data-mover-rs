@@ -710,9 +710,29 @@ pub struct CopiedMetadataTarget {
     pub timestamp_precision: TimePrecision,
     pub ownership: CopiedOwnershipTarget,
     /// The ACL encoding this destination writes, if it writes one at all.
-    pub acl: crate::metadata::AclTarget,
+    pub acl: CopiedAclTarget,
     /// Whether this destination stores extended attributes.
-    pub xattrs: crate::metadata::ValueTarget,
+    pub xattrs: CopiedValueTarget,
+}
+
+/// ACL behavior used by the copied metadata families.
+///
+/// This mirrors `metadata::AclTarget` instead of reusing it because the layering runs the other
+/// way: `metadata` is allowed to depend on `storage`, so `storage` cannot name it. The transfer
+/// layer, which may see both, translates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopiedAclTarget {
+    /// Writes an ACL in this encoding.
+    Encoding(crate::model::AclEncoding),
+    /// Stores no ACL at all.
+    Unsupported,
+}
+
+/// Whether a destination stores a copied value family, with the same layering caveat.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopiedValueTarget {
+    Supported,
+    Unsupported,
 }
 
 /// Ownership behavior used by the ordinary baseline metadata copy.

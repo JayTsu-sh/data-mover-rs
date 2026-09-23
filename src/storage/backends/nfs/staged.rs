@@ -606,14 +606,14 @@ impl StagedDestination for NfsStagedDestinationAdapter {
                 timestamp_precision: crate::model::TimePrecision::Nanoseconds,
                 ownership: crate::storage::CopiedOwnershipTarget::Numeric,
                 acl: if self.protocol.supports_acl() {
-                    crate::metadata::AclTarget::Encoding(crate::model::AclEncoding::NfsV4)
+                    crate::storage::CopiedAclTarget::Encoding(crate::model::AclEncoding::NfsV4)
                 } else {
-                    crate::metadata::AclTarget::Unsupported
+                    crate::storage::CopiedAclTarget::Unsupported
                 },
                 xattrs: if self.protocol.supports_xattrs() {
-                    crate::metadata::ValueTarget::Supported
+                    crate::storage::CopiedValueTarget::Supported
                 } else {
-                    crate::metadata::ValueTarget::Unsupported
+                    crate::storage::CopiedValueTarget::Unsupported
                 },
             })
     }

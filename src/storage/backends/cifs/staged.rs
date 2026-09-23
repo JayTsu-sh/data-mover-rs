@@ -248,10 +248,10 @@ impl StagedDestination for CifsStagedDestination {
                 ownership: crate::storage::CopiedOwnershipTarget::Unsupported,
                 // `metadata::decode` accepts only this encoding, so anything else has to be
                 // refused as a mapping problem rather than written wrong.
-                acl: crate::metadata::AclTarget::Encoding(
+                acl: crate::storage::CopiedAclTarget::Encoding(
                     crate::model::AclEncoding::WindowsSecurityDescriptor,
                 ),
-                xattrs: crate::metadata::ValueTarget::Unsupported,
+                xattrs: crate::storage::CopiedValueTarget::Unsupported,
             })
     }
 

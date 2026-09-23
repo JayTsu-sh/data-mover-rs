@@ -7,9 +7,9 @@ use futures::StreamExt as _;
 use super::model::{InflightLimits, RecoveryContext, RecoveryRegistrationFailure};
 use super::{CopiedMetadataRequest, ReadBackVerification, TransferPolicy, TransferRequest};
 use crate::metadata::{
-    MetadataFamily, MetadataPlan, MetadataPlanError, MetadataPlanErrorKind, MetadataPlanRequest,
-    MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget, TimestampTarget,
-    TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
+    AclTarget, MetadataFamily, MetadataPlan, MetadataPlanError, MetadataPlanErrorKind,
+    MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget,
+    TimestampTarget, TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
 };
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, Operation, SourceIdentity, StoragePath,
@@ -19,10 +19,11 @@ use crate::runtime::inflight::{
     InflightConfig, InflightFailure, InflightRuntime, OrderedChunks, ReadRange, SequentialRanges,
 };
 use crate::storage::{
-    CheckpointObservation, CopiedOwnershipTarget, FinalDestination, NativePair, PreflightPolicy,
-    PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublishRequest,
-    ReadRequest, ReadSource, SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination,
-    StorageRoleFailure, VerifyRequest, WriteEvidence,
+    CheckpointObservation, CopiedAclTarget, CopiedOwnershipTarget, CopiedValueTarget,
+    FinalDestination, NativePair, PreflightPolicy, PrepareRequest, PreparedStage,
+    PublicationDisposition, PublicationEvidence, PublishRequest, ReadRequest, ReadSource,
+    SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination, StorageRoleFailure,
+    VerifyRequest, WriteEvidence,
 };
 
 mod automatic;
@@ -575,10 +576,17 @@ async fn copied_metadata_plan(
         }
     };
     let target = MetadataTarget {
-        // What the destination accepts. Whether a family is carried at all is the caller's
-        // request, which reaches the compiler as a policy below.
-        acl: target.acl,
-        xattrs: target.xattrs,
+        // What the destination accepts, translated across the layer boundary: `storage` cannot
+        // name `metadata`'s vocabulary, and this is the layer that sees both. Whether a family is
+        // carried at all is the caller's request, which reaches the compiler as a policy below.
+        acl: match target.acl {
+            CopiedAclTarget::Encoding(encoding) => AclTarget::Encoding(encoding),
+            CopiedAclTarget::Unsupported => AclTarget::Unsupported,
+        },
+        xattrs: match target.xattrs {
+            CopiedValueTarget::Supported => ValueTarget::Supported,
+            CopiedValueTarget::Unsupported => ValueTarget::Unsupported,
+        },
         tags: ValueTarget::NotApplicable,
         ownership_mode,
         timestamps: TimestampTargetCapability::Supported(TimestampTarget {
