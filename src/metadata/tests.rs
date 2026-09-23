@@ -4,8 +4,8 @@ use async_trait::async_trait;
 
 use super::*;
 use crate::model::{
-    AclMetadata, EntryOperationFailure, FailureClass, MetadataProvenance, ObjectTag, Operation,
-    OwnershipMode, Transience,
+    AclMetadata, EntryOperationFailure, FailureClass, MetadataObservation, MetadataProvenance,
+    ObjectTag, Operation, OwnershipMode, StorageTimestamp, TimestampMetadata, Transience,
 };
 
 /// Looks a family's outcome up by name. Indexing into `outcomes()` ties a test to the order the

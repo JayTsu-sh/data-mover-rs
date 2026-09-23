@@ -2,7 +2,7 @@
 
 > 场景：要打开或关闭 ACL / xattr 的拷贝、排查「请求了却没带上」、给新 backend 声明能力。
 > 代码：`src/transfer/model.rs`（请求）· `src/transfer/engine/negotiation.rs`（协商）·
-> `src/metadata/mod.rs`（规划与应用）· `src/storage/roles.rs`（目的端能力）。
+> `src/metadata/compile.rs`（规划）· `src/metadata/mod.rs`（应用）· `src/storage/roles.rs`（目的端能力）。
 
 ## 用户规则（2026-09-23，决定本页一切）
 
@@ -30,7 +30,7 @@ atime / ctime 任何情况下都不拷。
 ## 要了一个可选功能之后
 
 判定点：`src/transfer/engine/negotiation.rs` 的 `optional_policy()`（要 → 规划期 `BestEffort`，
-不要 → `Omit`），再由 `src/metadata/mod.rs` 的规划器按两端能力裁决。
+不要 → `Omit`），再由 `src/metadata/compile.rs` 的规划器按两端能力裁决。
 
 | 情形 | 不要 | 要 |
 |---|---|---|
