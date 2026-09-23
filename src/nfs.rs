@@ -2343,6 +2343,21 @@ impl NFSStorage {
         (current_fh, 0)
     }
 
+    /// The path form `lookup_fh` builds its cache keys from. A key built from a raw `join` is
+    /// written but never read: `join` uses the platform separator, while the lookup side runs
+    /// every path through `collect_components`.
+    fn cache_path(path: &Path) -> Result<PathBuf> {
+        Ok(Self::collect_components(path)?.iter().collect())
+    }
+
+    /// Whether a listing entry's handle is worth caching. Only directories are ever listed, and
+    /// an empty handle means the server supplied none — `post_op_fh3::FALSE` on v3, or a v4
+    /// `FATTR4_FILEHANDLE` that did not decode. Caching that would hand out a handle no RPC can
+    /// use.
+    fn caches_directory_handle(file_type: u32, handle: &Bytes) -> bool {
+        file_type == FType3::NF3DIR as u32 && !handle.is_empty()
+    }
+
     fn cache_directory(cache_key: (PathBuf, Bytes), file_handle: Bytes) {
         trace!(
             "Inserting into global cache: key={:?}, value_len={}",
@@ -4499,6 +4514,16 @@ impl NFSStorage {
                 StorageError::NfsError("NFS directory entry omitted attributes".to_owned())
             })?;
             let child = relative_path.join(&entry.file_name);
+            if Self::caches_directory_handle(attrs.type_, &entry.handle) {
+                // The listing already carries this directory's handle, so caching it is what
+                // spares the descent a LOOKUP. The handle is a slice of the readdirplus page
+                // buffer, so it is copied: keeping the slice would pin the whole 8 KiB page for
+                // as long as the entry lives in the cache.
+                Self::cache_directory(
+                    (Self::cache_path(&child)?, self.get_root_fh()),
+                    Bytes::copy_from_slice(&entry.handle),
+                );
+            }
             let extension = child
                 .extension()
                 .and_then(|value| value.to_str())
@@ -4684,6 +4709,54 @@ fn next_read_want(cur: u64, end: u64, block_size: u64) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::AssertTestValue;
+
+    /// A handle cached under a key `lookup_fh` never asks for is written and never read, which
+    /// looks exactly like a cache that does not help — no failure, just the LOOKUP it was meant
+    /// to remove. The raw `join` is the shape that gets this wrong.
+    #[test]
+    fn a_backfilled_cache_key_is_the_one_lookup_will_ask_for() {
+        for (parent, name, expected) in [
+            ("", "c", "c"),
+            ("a", "c", "a/c"),
+            ("a/b", "c", "a/b/c"),
+            ("./a", "c", "a/c"),
+        ] {
+            let child = Path::new(parent).join(name);
+            let key = NFSStorage::cache_path(&child).unwrap();
+            let asked_for: PathBuf = NFSStorage::collect_components(&child)
+                .unwrap()
+                .iter()
+                .collect();
+            assert_eq!(key, asked_for, "backfilled key for {child:?}");
+            assert_eq!(key, PathBuf::from(expected));
+        }
+        // The case that proves the normalisation is load-bearing rather than decorative.
+        let unnormalised = Path::new("./a").join("c");
+        assert_ne!(unnormalised, PathBuf::from("a/c"));
+    }
+
+    /// Only directories are ever listed, and an empty handle is the server saying it has none.
+    #[test]
+    fn only_a_directory_with_a_handle_is_cached() {
+        let handle = Bytes::from_static(b"fh");
+        let empty = Bytes::new();
+        assert!(NFSStorage::caches_directory_handle(
+            FType3::NF3DIR as u32,
+            &handle
+        ));
+        assert!(!NFSStorage::caches_directory_handle(
+            FType3::NF3DIR as u32,
+            &empty
+        ));
+        assert!(!NFSStorage::caches_directory_handle(
+            FType3::NF3REG as u32,
+            &handle
+        ));
+        assert!(!NFSStorage::caches_directory_handle(
+            FType3::NF3LNK as u32,
+            &handle
+        ));
+    }
 
     #[test]
     fn negotiated_read_and_write_limits_are_independent() {
