@@ -179,7 +179,15 @@ async fn connect(backend: Backend, root: &str, side: &str, depth: usize) -> Resu
             username: std::env::var("CIFS_REAL_USER")?,
             password: std::env::var("CIFS_REAL_PASS")?,
             signing_policy: CifsSigningPolicy::default(),
-            guest_policy: CifsGuestPolicy::default(),
+            // Same opt-in the `cifs_*` tests use, so a guest share can be reached without
+            // relaxing the default for everyone.
+            guest_policy: if std::env::var("CIFS_REAL_GUEST_POLICY")
+                .is_ok_and(|value| value == "allow-unsigned")
+            {
+                CifsGuestPolicy::AllowUnsigned
+            } else {
+                CifsGuestPolicy::default()
+            },
             identity: BackendIdentity::new(BackendKind::Cifs, format!("{side}:{root}"))?,
         }),
     };
