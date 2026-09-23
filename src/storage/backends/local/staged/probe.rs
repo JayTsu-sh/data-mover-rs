@@ -99,8 +99,8 @@ impl WriteProbe {
     }
 
     /// Counts one metadata batch, and — when `durable` — the barrier it is due to end with. This
-    /// counts intent: the barrier is skipped when nothing was applied or the batch was cancelled,
-    /// so only an injected barrier failure proves that one ran.
+    /// counts intent: the barrier is skipped when the batch stops at a refusal or is cancelled, so
+    /// only an injected barrier failure proves that one ran.
     #[cfg_attr(not(test), allow(clippy::unused_self))]
     pub(super) fn record_metadata_batch(&self, durable: bool) {
         #[cfg(test)]

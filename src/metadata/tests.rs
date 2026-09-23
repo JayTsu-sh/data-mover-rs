@@ -34,7 +34,7 @@ fn decision_for(plan: &MetadataPlan, family: MetadataFamily) -> MappingDecision 
 }
 
 /// Refuses exactly one family and accepts everything else. `RecordingMetadata::fail_at` counts
-/// *applied* mutations, so once a tolerated failure stops advancing that count every later
+/// *applied* mutations, so once a failure the application goes past stops advancing that count every later
 /// mutation fails too — which is the wrong instrument for asking "does the rest still get
 /// applied".
 struct RefusesAcl {
@@ -212,10 +212,10 @@ fn the_mode_that_replaces_ownership_is_applied_before_the_acl_too() {
 }
 
 /// A destination can advertise a capability and still refuse the write — `NFSv4` `SETACL` is the
-/// standing example. `BestEffort` is the policy that says that must not take the copy down with
-/// it, and the families after the failed one still have to be applied.
+/// standing example. The families after the refused one are still applied, and only then does the
+/// item fail — once, naming every family that could not be applied.
 #[tokio::test]
-async fn a_best_effort_family_that_fails_to_apply_leaves_the_rest_alone() {
+async fn a_refused_family_leaves_the_rest_applied_and_then_fails_the_item() {
     let observations = exact_observations();
     let plan = compile_metadata_plan(&MetadataPlanRequest {
         observations: &observations,
@@ -227,20 +227,29 @@ async fn a_best_effort_family_that_fails_to_apply_leaves_the_rest_alone() {
     let target = RefusesAcl {
         applied: Mutex::new(Vec::new()),
     };
-    let report = plan
+    let failure = plan
         .apply(
             &target,
             &StoragePath::new("file").unwrap(),
             CancellationToken::new(),
         )
         .await
-        .unwrap();
+        .unwrap_err();
     assert_eq!(
-        outcome_for(&report, MetadataFamily::Acl),
+        failure
+            .failures()
+            .iter()
+            .map(FamilyFailure::family)
+            .collect::<Vec<_>>(),
+        [MetadataFamily::Acl]
+    );
+    let report = failure.report();
+    assert_eq!(
+        outcome_for(report, MetadataFamily::Acl),
         ApplicationOutcome::Failed
     );
     assert_eq!(
-        outcome_for(&report, MetadataFamily::Timestamps),
+        outcome_for(report, MetadataFamily::Timestamps),
         ApplicationOutcome::Applied
     );
 }

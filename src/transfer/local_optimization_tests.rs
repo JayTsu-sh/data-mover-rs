@@ -710,8 +710,10 @@ async fn a_failed_metadata_barrier_is_not_absorbed_by_a_best_effort_family()
     Ok(())
 }
 
-/// Ownership that has to be applied, then an xattr the filesystem refuses at run time (an unknown
-/// namespace) that the caller only asked for on a best-effort basis — the last mutation.
+const REFUSAL_PLAN_MTIME_NANOS: i128 = 1_700_000_000_123_456_789;
+
+/// Ownership, then an xattr the filesystem refuses at run time (an unknown namespace), then an
+/// mtime — so there is a family after the refusal for application to go on to.
 #[cfg(unix)]
 fn ownership_then_refused_xattr_plan(
     source: &Path,
@@ -731,44 +733,61 @@ fn ownership_then_refused_xattr_plan(
             gid: metadata.gid(),
             mode: 0o640,
         }),
-        MetadataObservation::NotRequested,
+        observed(crate::model::TimestampMetadata {
+            accessed: None,
+            modified: Some(crate::model::StorageTimestamp::new(
+                REFUSAL_PLAN_MTIME_NANOS,
+                crate::model::TimePrecision::Nanoseconds,
+            )?),
+            created: None,
+        }),
     )?;
     Ok(compile_metadata_plan(&MetadataPlanRequest {
         observations: &observations,
-        target: local_metadata_target(),
+        target: MetadataTarget {
+            timestamps: crate::metadata::TimestampTargetCapability::Supported(
+                crate::metadata::TimestampTarget {
+                    precision: crate::model::TimePrecision::Nanoseconds,
+                    accessed: false,
+                    modified: true,
+                    created: false,
+                },
+            ),
+            ..local_metadata_target()
+        },
         policies: MetadataPolicies::default()
             .with_ownership_mode(MetadataPolicy::RequireExact)
-            .with_xattrs(MetadataPolicy::BestEffort),
+            .with_xattrs(MetadataPolicy::BestEffort)
+            .with_timestamps(MetadataPolicy::RequireExact),
         principal_mapper: None,
     })?)
 }
 
-/// A refusal on the last mutation ends the batch with nothing left to resend, so the barrier has
-/// to run before the refusal is reported — otherwise the ownership applied ahead of it is
-/// published without ever being made durable. A barrier that runs can fail, so injecting that
-/// failure is how this observes that it ran.
+/// Any metadata the destination refuses fails the item — after every other family has been
+/// applied, and naming the refused one — and nothing is published. The Local refusal here is real:
+/// an xattr in a namespace the filesystem does not have. The batch stops at it without a barrier
+/// (running one could only hide the refusal); the resent remainder ends in one. Injecting a
+/// barrier failure shows that it ran, and that the list then holds both reasons, in order.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_tolerated_refusal_on_the_last_mutation_still_makes_the_rest_durable()
+async fn a_refused_family_fails_the_item_after_the_rest_is_applied()
 -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    use crate::metadata::MetadataFamily;
+    use crate::metadata::{ApplicationFailureKind, FamilyFailure, MetadataFamily};
 
     for fail_barrier in [false, true] {
-        let source_root = TestRoot::new("metadata-last-refusal-source")?;
-        let destination_root = TestRoot::new("metadata-last-refusal-destination")?;
+        let source_root = TestRoot::new("metadata-refusal-source")?;
+        let destination_root = TestRoot::new("metadata-refusal-destination")?;
         let source_path = source_root.path().join("source.bin");
         std::fs::write(&source_path, b"metadata payload")?;
         let source = local_source(source_root.path())?;
         let (destination, role) =
-            test_destination_storage_with_role(destination_root.path(), "metadata-last-refusal")?;
+            test_destination_storage_with_role(destination_root.path(), "metadata-refusal")?;
         if fail_barrier {
             role.fail_metadata_sync();
         }
         let observation = expert_observation(&source, "source.bin").await?;
-        let result = complete_expert_transfer(
-            "metadata-last-refusal",
+        let Err(error) = complete_expert_transfer(
+            "metadata-refusal",
             source,
             destination,
             observation,
@@ -776,39 +795,54 @@ async fn a_tolerated_refusal_on_the_last_mutation_still_makes_the_rest_durable()
             "final.bin",
             TransferPolicy::Checkpointed,
         )
-        .await;
-        let published = destination_root.path().join("final.bin");
-        if fail_barrier {
-            let Err(error) = result else {
-                return Err("the barrier after a tolerated refusal never ran".into());
-            };
-            assert_eq!(error.phase(), TransferPhase::Metadata);
-            assert!(!published.exists());
-            error.discard_stage().await?;
-            continue;
-        }
-        let report = result?
-            .metadata
-            .ok_or("successful metadata transfer omitted its application report")?;
-        let outcome = |family| {
-            report
-                .outcomes()
-                .iter()
-                .find(|item| item.family == family)
-                .map(|item| item.outcome)
+        .await
+        else {
+            return Err("a refused xattr was tolerated and the file published".into());
         };
-        assert_eq!(
-            outcome(MetadataFamily::Xattrs),
-            Some(ApplicationOutcome::Failed)
+        assert!(!destination_root.path().join("final.bin").exists());
+        // The first batch stopped at the refusal; the remainder went out as a second one.
+        assert_eq!(role.metadata_batch_counts(), (2, 2), "{fail_barrier}");
+        let failure = error
+            .metadata_failure()
+            .ok_or("the failure does not carry the metadata failure")?;
+        let failures = failure
+            .failures()
+            .iter()
+            .map(|item| (FamilyFailure::family(item), FamilyFailure::kind(item)))
+            .collect::<Vec<_>>();
+        let mut expected = vec![(MetadataFamily::Xattrs, ApplicationFailureKind::Refused)];
+        if fail_barrier {
+            expected.push((
+                MetadataFamily::Timestamps,
+                ApplicationFailureKind::BatchFailed,
+            ));
+        }
+        assert_eq!(failures, expected, "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("applying extended attributes failed: the destination refused the write"),
+            "{error}"
         );
-        assert_eq!(
-            outcome(MetadataFamily::OwnershipMode),
-            Some(ApplicationOutcome::Applied)
-        );
-        assert_eq!(
-            std::fs::metadata(&published)?.permissions().mode() & 0o7777,
-            0o640
-        );
+        if !fail_barrier {
+            let outcome = |family| {
+                failure
+                    .report()
+                    .outcomes()
+                    .iter()
+                    .find(|item| item.family == family)
+                    .map(|item| item.outcome)
+            };
+            assert_eq!(
+                outcome(MetadataFamily::Timestamps),
+                Some(ApplicationOutcome::Applied)
+            );
+            assert_eq!(
+                outcome(MetadataFamily::OwnershipMode),
+                Some(ApplicationOutcome::Applied)
+            );
+        }
+        error.discard_stage().await?;
     }
     Ok(())
 }

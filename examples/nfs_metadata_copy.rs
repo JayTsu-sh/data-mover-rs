@@ -403,7 +403,9 @@ async fn main() -> Result {
         (Err(failure), Expect::Refused) => {
             println!("refused as expected: {failure}");
             if let Some(metadata) = failure.metadata_failure() {
-                println!("  metadata family {:?}: {metadata}", metadata.family());
+                for family in metadata.failures() {
+                    println!("  {family}");
+                }
             }
             Ok(())
         }

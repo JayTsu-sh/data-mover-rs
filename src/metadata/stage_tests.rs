@@ -1,6 +1,6 @@
 //! `apply_to_stage` is the path real transfers take: one ordered batch per stage, resumed after
-//! a tolerated refusal. It shares its tolerance rules with `apply` but not its code, so it needs
-//! its own fake destination.
+//! a refusal. It shares its rules with `apply` but not its code, so it needs its own fake
+//! destination.
 
 use bytes::Bytes;
 
@@ -39,8 +39,8 @@ enum Refusal {
     /// Fails before touching the batch for a reason that is not about any mutation in it, as
     /// Local's stage open can.
     StageUnavailable,
-    /// Stops at the refused mutation, then fails the barrier over the ones ahead of it, as Local
-    /// does when both happen in one batch.
+    /// Stops at the refused mutation, then fails the barrier over the ones ahead of it — a backend
+    /// that syncs at a refusal. (Local no longer does, so the refusal is not hidden.)
     RefusedThenBarrierFailed,
 }
 
@@ -307,14 +307,24 @@ const EVERYTHING_BUT_THE_ACL: [MetadataFamily; 4] = [
     MetadataFamily::Timestamps,
 ];
 
-async fn tolerated(refusal: Refusal) -> (ScriptedStage, MetadataApplicationReport) {
-    let plan = plan(all_exact().with_acl(MetadataPolicy::BestEffort));
+fn failed_families(failure: &MetadataApplicationFailure) -> Vec<MetadataFamily> {
+    failure
+        .failures()
+        .iter()
+        .map(FamilyFailure::family)
+        .collect()
+}
+
+/// The ACL is refused; application goes on, and the item fails afterwards naming only the ACL.
+async fn refused(refusal: Refusal) -> (ScriptedStage, MetadataApplicationFailure) {
     let target = ScriptedStage::new(refusal);
-    let report = plan
+    let failure = plan(all_exact())
         .apply_to_stage(&target, &stage(), CancellationToken::new())
         .await
-        .unwrap();
-    (target, report)
+        .unwrap_err();
+    assert_eq!(failed_families(&failure), [MetadataFamily::Acl]);
+    assert_eq!(failure.kind(), ApplicationFailureKind::Refused);
+    (target, failure)
 }
 
 fn assert_only_the_acl_was_lost(target: &ScriptedStage, report: &MetadataApplicationReport) {
@@ -334,9 +344,9 @@ fn assert_only_the_acl_was_lost(target: &ScriptedStage, report: &MetadataApplica
 }
 
 #[tokio::test]
-async fn a_staged_best_effort_refusal_resumes_with_the_next_family() {
-    let (target, report) = tolerated(Refusal::InOrder).await;
-    assert_only_the_acl_was_lost(&target, &report);
+async fn a_staged_refusal_resumes_with_the_next_family() {
+    let (target, failure) = refused(Refusal::InOrder).await;
+    assert_only_the_acl_was_lost(&target, failure.report());
 }
 
 /// A backend may reject a batch before applying any of it, so the failed index is not the
@@ -344,26 +354,14 @@ async fn a_staged_best_effort_refusal_resumes_with_the_next_family() {
 /// ahead of it without applying them — and without anything in the result saying so.
 #[tokio::test]
 async fn a_refusal_found_before_anything_was_applied_does_not_skip_earlier_families() {
-    let (target, report) = tolerated(Refusal::UpFront).await;
-    assert_only_the_acl_was_lost(&target, &report);
+    let (target, failure) = refused(Refusal::UpFront).await;
+    assert_only_the_acl_was_lost(&target, failure.report());
 }
 
+/// A resent batch can be refused again. The item fails naming both, everything else is applied,
+/// and nothing that was applied once is applied twice.
 #[tokio::test]
-async fn a_staged_required_refusal_still_fails_the_copy() {
-    let target = ScriptedStage::new(Refusal::InOrder);
-    let failure = plan(all_exact())
-        .apply_to_stage(&target, &stage(), CancellationToken::new())
-        .await
-        .unwrap_err();
-    assert_eq!(failure.family(), MetadataFamily::Acl);
-    assert!(failure.storage_error().is_some());
-    assert_eq!(target.applied_families(), [MetadataFamily::OwnershipMode]);
-}
-
-/// A resent batch can be refused again. Both tolerated families are lost, nothing else is, and
-/// nothing that was applied once is applied twice.
-#[tokio::test]
-async fn a_second_refusal_in_the_resent_batch_is_tolerated_too() {
+async fn a_second_refusal_in_the_resent_batch_is_reported_too() {
     for refusal in [Refusal::InOrder, Refusal::UpFront] {
         let target =
             ScriptedStage::refusing(refusal, &[MetadataFamily::Acl, MetadataFamily::Xattrs]);
@@ -372,13 +370,24 @@ async fn a_second_refusal_in_the_resent_batch_is_tolerated_too() {
                 .with_acl(MetadataPolicy::BestEffort)
                 .with_xattrs(MetadataPolicy::BestEffort),
         );
-        let report = plan
+        let failure = plan
             .apply_to_stage(&target, &stage(), CancellationToken::new())
             .await
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(
+            failed_families(&failure),
+            [MetadataFamily::Acl, MetadataFamily::Xattrs],
+            "{refusal:?}"
+        );
+        assert!(
+            failure
+                .to_string()
+                .contains("; applying extended attributes failed"),
+            "{failure}"
+        );
         for family in [MetadataFamily::Acl, MetadataFamily::Xattrs] {
             assert_eq!(
-                outcome_for(&report, family),
+                outcome_for(failure.report(), family),
                 ApplicationOutcome::Failed,
                 "{refusal:?} {family:?}"
             );
@@ -400,12 +409,13 @@ async fn a_second_refusal_in_the_resent_batch_is_tolerated_too() {
 #[tokio::test]
 async fn a_refusal_after_a_partial_batch_resends_only_what_was_not_applied() {
     let target = ScriptedStage::refusing(Refusal::Partway, &[MetadataFamily::Xattrs]);
-    let report = plan(all_exact().with_xattrs(MetadataPolicy::BestEffort))
+    let failure = plan(all_exact())
         .apply_to_stage(&target, &stage(), CancellationToken::new())
         .await
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(failed_families(&failure), [MetadataFamily::Xattrs]);
     assert_eq!(
-        outcome_for(&report, MetadataFamily::Xattrs),
+        outcome_for(failure.report(), MetadataFamily::Xattrs),
         ApplicationOutcome::Failed
     );
     assert_eq!(
@@ -438,11 +448,11 @@ fn assert_cancelled_on_the_acl(failure: &MetadataApplicationFailure, refusal: Re
     );
 }
 
-/// `BestEffort` tolerates a destination saying no. Cancellation is not the destination saying
-/// no: it has to stop the copy even when the family it lands on is a tolerant one, even when
-/// every family after it is tolerant too, and whatever class the interrupted request reported.
+/// A destination saying no lets the other families go on. Cancellation is not the destination
+/// saying no: it stops application at once, even under `BestEffort`, and whatever class the
+/// interrupted request reported.
 #[tokio::test]
-async fn cancellation_on_a_tolerant_staged_family_still_stops_the_copy() {
+async fn cancellation_stops_staged_application_at_once() {
     for refusal in CANCELLATIONS {
         let target = ScriptedStage::new(refusal);
         let failure = plan(best_effort_after_ownership())
@@ -460,7 +470,7 @@ async fn cancellation_on_a_tolerant_staged_family_still_stops_the_copy() {
 
 /// The per-mutation path has the same rule.
 #[tokio::test]
-async fn cancellation_on_a_tolerant_published_family_still_stops_the_copy() {
+async fn cancellation_stops_published_application_at_once() {
     for refusal in [Refusal::CancelledDuring, Refusal::CancelledAsProtocol] {
         let target = ScriptedStage::new(refusal);
         let failure = plan(best_effort_after_ownership())
@@ -480,17 +490,16 @@ async fn cancellation_on_a_tolerant_published_family_still_stops_the_copy() {
     }
 }
 
-/// Every family `BestEffort`, so any failure that is tolerated at all would be tolerated here.
+/// Every family `BestEffort`, the most permissive plan there is.
 fn everything_best_effort() -> MetadataPolicies {
     best_effort_after_ownership().with_ownership_mode(MetadataPolicy::BestEffort)
 }
 
-/// `BestEffort` tolerates the destination declining one write. A batch whose persistence barrier
-/// failed, or that could not be started, did not decline anything: the metadata that is there is
-/// not durable, or none of it is there. Pinning it on one family and tolerating that family would
-/// publish a file whose report says its metadata was applied.
+/// A batch whose persistence barrier failed, or that could not be started, did not decline any
+/// one write: the metadata that is there is not durable, or none of it is there. Application stops
+/// there, and nothing in the batch is reported applied.
 #[tokio::test]
-async fn a_failure_of_the_whole_batch_is_never_tolerated() {
+async fn a_failure_of_the_whole_batch_stops_application() {
     for (refusal, family, applied) in [
         (
             Refusal::BarrierFailed,
@@ -549,7 +558,7 @@ async fn a_failure_of_the_whole_batch_is_never_tolerated() {
 
 /// A lost session is not the destination declining this write either, on either path.
 #[tokio::test]
-async fn a_lost_session_on_a_tolerant_family_still_stops_the_copy() {
+async fn a_lost_session_stops_application() {
     let target = ScriptedStage::new(Refusal::SessionLost);
     let staged = plan(best_effort_after_ownership())
         .apply_to_stage(&target, &stage(), CancellationToken::new())

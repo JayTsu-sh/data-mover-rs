@@ -219,10 +219,10 @@ pub struct TransferRequest {
 ///
 /// The policy picks what happens when one of them refuses:
 /// - [`MetadataPolicy::Omit`] (the default) does not even observe the family.
-/// - [`MetadataPolicy::BestEffort`] carries it when both ends can and records what happened when
-///   they cannot — including a destination that advertises the capability and then refuses the
-///   write, which is the normal `NFSv4` `SETACL` outcome on many servers. The transfer still
-///   succeeds.
+/// - [`MetadataPolicy::BestEffort`] carries it when both ends can and records why when they
+///   cannot. A write the destination refuses after advertising the capability — the usual `NFSv4`
+///   `SETACL` outcome on many servers — still fails the transfer, once the other families have
+///   been applied.
 /// - [`MetadataPolicy::AllowKnownLoss`] requires the family to be carried, accepting a documented
 ///   downgrade, and **fails** when either end lacks it outright.
 /// - [`MetadataPolicy::RequireExact`] additionally rejects any downgrade.

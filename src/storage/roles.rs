@@ -133,7 +133,7 @@ pub enum StorageRoleFailure {
 
 /// Failure while applying an ordered batch of staged metadata mutations.
 ///
-/// The caller resends what was not applied after a tolerated refusal, so these fields are a
+/// The caller resends what was not applied after a refusal, so these fields are a
 /// contract, not diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedMetadataApplicationFailure {
@@ -153,9 +153,9 @@ impl StagedMetadataApplicationFailure {
     /// persistence barrier over the mutations it applied failed, whether the batch ran to the end
     /// or stopped at a refusal — with the first `completed` applied but not made durable.
     ///
-    /// It is never the destination declining one write, so no policy tolerates it. Reporting it
-    /// against the last mutation instead would let a `BestEffort` family there absorb a failed
-    /// barrier, and the copy would be published with metadata that is not durable.
+    /// It is never the destination declining one write, so application stops instead of going
+    /// on to the families after it. Reporting it against the last mutation would make it read as
+    /// that family being refused.
     #[must_use]
     pub fn whole_batch(len: usize, completed: usize, error: Option<StorageRoleFailure>) -> Self {
         Self {

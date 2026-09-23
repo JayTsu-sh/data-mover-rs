@@ -418,9 +418,9 @@ mod tests {
         }
     }
 
-    /// `BestEffort` tolerates a refusal only while it is entry-scoped: a session-scoped failure
-    /// ends every write after it, so it is never tolerated. A server refusing SETACL therefore has
-    /// to stay entry-scoped, or every best-effort ACL copy to such a server becomes a failed copy.
+    /// Application goes on past a refusal only while it is entry-scoped: a session-scoped failure
+    /// ends every write after it, so application stops there. A server refusing SETACL therefore
+    /// has to stay entry-scoped, or the families after it would never be applied or reported.
     /// This pins the class-to-scope step (only a lost connection is session-scoped); the status to
     /// class step is `classify_error`'s.
     #[tokio::test]

@@ -28,9 +28,9 @@ atime / ctime 任何情况下都不拷。
 | 一端不支持这一族 | 跳过 | **失败** | **失败** | 记 `Unsupported` 后继续 |
 | 两端都支持但编码不同（Posix ↔ NfsV4 ↔ WindowsSecurityDescriptor） | 跳过 | **失败** | **失败**（整族丢失是缺席，不是降级） | 记 `Unsupported` 后继续 |
 | 源端观测失败（GETACL 报错） | 跳过 | **失败** | **失败** | 记 `Failed` 后继续 |
-| 目的端**应用期**拒绝（能力位为真但 SETACL 被拒） | — | **失败** | **失败** | 记 `Failed` 后继续，**传输仍然成功** |
+| 目的端**应用期**拒绝（能力位为真但 SETACL 被拒） | — | 其余族照常应用，**该文件最终失败**并列出所有被拒的族 | 同左 | 同左 |
 | 应用期**取消**（token 已触发，或 backend 报 `Cancelled`，含服务端的 `STATUS_CANCELLED`） | — | **停止** | **停止** | **停止**，该族保持规划期结果、不记 `Failed` |
-| 应用期**整批失败**（stage 打不开、落盘屏障 `sync_all` 失败；目前只有 Local 这样报）或**会话级失败** | — | **失败** | **失败** | **失败** —— 不是目的端拒绝某一次写入 |
+| 应用期**整批失败**（stage 打不开、落盘屏障 `sync_all` 失败；目前只有 Local 这样报）或**会话级失败** | — | **立即停止**并失败 | 同左 | 同左 |
 | 不适用（symlink 上的 ACL） | 跳过 | 跳过 | 跳过 | 跳过 |
 
 **分野是「降级」与「缺席」**：`AllowKnownLoss` 容忍降级、不容忍缺席；`BestEffort` 两者都容忍。
@@ -49,7 +49,8 @@ atime / ctime 任何情况下都不拷。
    `Omit` → 不动基线。backend 用 `MetadataObservation::{Unsupported, NotApplicable, Failed}` 否决。
 3. **目的端写入能力** —— `CopiedMetadataTarget.acl` / `.xattrs`。
 4. **规划期交叉** —— `compile_copied_metadata_plan` 按上表裁决。
-5. **应用期** —— 服务端可以在能力位说 yes 之后仍然拒绝。只有 `BestEffort` 能吸收这一环。
+5. **应用期** —— 服务端可以在能力位说 yes 之后仍然拒绝。**任何一族写失败都让该文件失败**（用户规则，
+   2026-09-23），但先把其余族都应用完，再一次性列出所有失败的族与原因。
 
 源端 plan 为 `None`、目的端 target 为 `None`（今天的 S3 目的端）同样算否决：
 **只有 `Omit` 与 `BestEffort` 能继续**，其余按"要了却没有路"失败，不静默少拷。
@@ -71,39 +72,41 @@ atime / ctime 任何情况下都不拷。
    所以 `compile_ownership` 必须排在 `compile_acl` 之前；替换 ownership 的那个 `Mode` mutation
    插在**队首**。由 `acl_is_applied_after_the_mode_that_would_rewrite_it` 与
    `the_mode_that_replaces_ownership_is_applied_before_the_acl_too` 看守。
-2. **容忍不能靠重排实现。** `BestEffort` 的族失败后，批量路径重发**所有尚未应用的**、
+2. **续发不能靠重排实现。** 某一族被拒后（记下，继续应用其余族），批量路径重发**所有尚未应用的**、
    去掉被拒那一条：`pending[completed..failed_index] ++ pending[failed_index + 1..]`
    （`MetadataPlan::resume_after`）。不能从 `failed_index + 1` 续 —— backend 可以在动手前整批拒绝
    （Local 的预校验就是，`completed = 0` 而 `failed_index > 0`），那样前面的族会被静默跳过。
-   也不是把容忍的族挪到队尾凑成一批 —— 后者会让 `BestEffort` 的 ownership 跑到
-   `RequireExact` 的 ACL 后面，重新制造第 1 条要防的静默覆盖。
+   也不是把被拒的族挪到队尾凑成一批 —— 那会让 ownership 跑到 ACL 后面，重新制造第 1 条要防的
+   静默覆盖。
    `StagedMetadataApplicationFailure` 的三条字段约定（`src/storage/roles.rs`）就是这条的前提。
    由 `src/metadata/stage_tests.rs` 看守。
 
-**取消永远不被容忍。** `BestEffort` 吸收的是「目的端说不」，取消不是。两条路径都按
-「token 已触发 **或** 失败类别为 `Cancelled`」判定 —— 被打断的请求可能报成别的类别。
-
-**`BestEffort` 只吸收「目的端拒绝这一次写入」**（`is_refusal`：Entry 级、非取消），其余一律停止：
+**应用期失败的规则**（用户，2026-09-23）：**任何一族写失败都意味着该文件拷贝失败**，但一个文件的
+所有族都先应用完，再把失败一次性报出（`MetadataApplicationFailure::failures()`，Display 逐条列出）。
+只有三种情况立即停止，因为之后的写要么不可能成功、要么不可信：
+- **取消** —— token 已触发，或 backend 报 `Cancelled`（含服务端的 `STATUS_CANCELLED`）；被打断的请求
+  可能报成别的类别，所以两者任一即算。该族保持规划期结果，不记 `Failed`。
 - **会话级失败**（`StorageRoleFailure::Session`）—— 会话断了，后面每一次写都会跟着失败。
 - **整批失败** —— backend 用 `StagedMetadataApplicationFailure::whole_batch(len, completed, error)`
   报告，即 `failed_index == len`：不归属任何一条 mutation。Local 的 stage 打不开、`spawn_blocking`
-  丢失、以及 durable **屏障 `sync_all` 失败**（无论批次跑完，还是停在某条拒绝上）都走这里。此前 Local
-  把 `sync_all` 失败报在最后一条上，若那一族是 `BestEffort`（经 expert API 的 `with_metadata_plan`
-  可以做到），失败被容忍，文件带着没落盘的元数据发布，报告还写着 `Applied`。
-  整批失败记在**最后一条已应用但未落盘**的族上（`completed - 1`；一条都没应用时记第一条），
-  不记在拒绝它的那一条上；且该批次一个都不标 `Applied`。
-- **Local 的屏障在报告拒绝之前就跑**（`apply_local_batch`）：拒绝若落在最后一条，调用方容忍后没有
-  东西可重发，不先 sync 的话前面已应用的族永远不会落盘。
+  丢失、以及 durable **屏障 `sync_all` 失败**走这里。记在**最后一条已应用但未落盘**的族上
+  （`completed - 1`；一条都没应用时记第一条），该批次一个都不标 `Applied`。
 
-看守：`a_failure_of_the_whole_batch_is_never_tolerated`（假件，三种整批形态，含「拒绝后屏障失败」）、
+其余（Entry 级、非取消，`is_refusal`）都是「目的端拒绝这一次写入」：记下，续发剩下的族。
+
+**Local 在拒绝处不跑屏障**（`apply_local_batch`）：任何拒绝都让文件失败、不会发布，续发的批次以屏障
+结束、覆盖整个文件；若在拒绝处跑屏障且它失败，整批失败会**盖掉拒绝本身** —— 调用方要处置的原因。
+（`7dec6c7` 曾为「被容忍的拒绝落在最后一条」而在拒绝前跑屏障；应用期不再有容忍，这个理由不在了。）
+
+看守：`src/metadata/stage_tests.rs`（续发、二次拒绝、整批失败三形态、会话断、取消）、
 `a_failed_metadata_barrier_is_not_absorbed_by_a_best_effort_family` 与
-`a_tolerated_refusal_on_the_last_mutation_still_makes_the_rest_durable`（expert API + 真 Local stage +
-注入的屏障失败）、`a_refused_setacl_stays_entry_scoped_and_only_a_lost_connection_does_not`（NFS 的
-拒绝必须是 Entry 级，否则 `BestEffort` 的 ACL 会变成拷贝失败）。
+`a_refused_family_fails_the_item_after_the_rest_is_applied`（expert API + 真 Local stage）、
+`a_refused_setacl_stays_entry_scoped_and_only_a_lost_connection_does_not`（NFS 的拒绝必须是 Entry 级，
+否则会被当成会话失败而提前停止）。
 
 **已知缺口：CIFS。** 它没有批量实现，逐条 `apply_metadata` 在 durable 时 apply 后再 open/flush/close，
-flush 失败经 `classify` 成 Entry 级，于是仍会被当成那一条的拒绝而被 `BestEffort` 容忍。危害比
-Local 小（之前各条已各自 flush），但与上面的规则不符；要改得让逐条接口也能表达「屏障失败」。
+flush 失败经 `classify` 成 Entry 级，被当成那一条的拒绝 —— 文件照样失败，但报成「拒绝」而不是
+「整批失败」，且不会提前停止。要改得让逐条接口也能表达「屏障失败」。
 
 ## 报错
 
@@ -111,8 +114,10 @@ Local 小（之前各条已各自 flush），但与上面的规则不符；要�
 - 规划期拒绝：`MetadataPlanError` = 族 + 策略 + `RefusalCause`（源端读不了 / 读失败（带 class）/ 没读 /
   目的端存不了 / 两端编码不同（两个都点名）/ 缺映射器 / 映射失败 / 策略不允许的损失（点名是哪种））。
   `cause().side()` 决定标题里的 Source / Destination。
-- 应用期失败：`MetadataApplicationFailure` = 族 + `ApplicationFailureKind`（被拒 / 整批失败 / 会话断 / 取消）
-  + 存储失败及其诊断；`source()` 可取到底层 `StorageRoleFailure`。
+- 应用期失败：`MetadataApplicationFailure` = 每个失败的族（`failures()`）各自的
+  `ApplicationFailureKind`（被拒 / 整批失败 / 会话断 / 取消）+ 存储失败及其诊断，Display 用「; 」逐条列出；
+  `family()` / `kind()` / `storage_error()` 指结束应用的那一条（最后一条）。
+- Metadata 阶段的 `TransferFailure` 不实现 `source()`：Display 已经完整，链式打印会重复。
 - 读源端元数据失败：标题 "observing source metadata failed" + 存储失败及其诊断。
 
 诊断是适配器按契约已脱敏的文本（R8）。

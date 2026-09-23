@@ -1464,12 +1464,14 @@ fn refuse_before_applying(
 /// fields of `StagedMetadataApplicationFailure` before the error is mapped.
 type LocalBatchStop = (usize, usize, Option<io::Error>);
 
-/// Applies a staged metadata batch in order and makes whatever it applied durable.
+/// Applies a staged metadata batch in order and makes it durable.
 ///
-/// The barrier runs even when a mutation is refused: the caller may tolerate the refusal, and
-/// when it was the last mutation nothing is resent, so nothing else would ever sync what came
-/// before it. A failed barrier belongs to no one mutation and is reported against the batch
-/// (`failed_index == count`).
+/// A refused mutation ends the batch without the barrier: any refusal fails the item, so what the
+/// batch applied is not published through a stage (a direct target never had a metadata barrier),
+/// and a non-empty resent remainder ends in a barrier that covers the whole file; when none runs
+/// the item fails anyway. Running it here could only replace the refusal — the reason a caller
+/// acts on — with a barrier failure. A failed barrier belongs to no one mutation and is reported against the
+/// batch (`failed_index == count`).
 fn apply_local_batch(
     file: &std::fs::File,
     mutations: Vec<MetadataMutation>,
@@ -1478,27 +1480,21 @@ fn apply_local_batch(
     fail_sync: bool,
 ) -> Result<(), LocalBatchStop> {
     let count = mutations.len();
-    let mut refused = None;
     for (index, mutation) in mutations.into_iter().enumerate() {
         if cancel.is_cancelled() {
             // Cancelled work is never published, so what it applied need not be durable.
             return Err((index, index, None));
         }
         if let Err(error) = apply_local_metadata(file, mutation) {
-            refused = Some((index, error));
-            break;
+            return Err((index, index, Some(error)));
         }
     }
-    let applied = refused.as_ref().map_or(count, |(index, _)| *index);
-    let synced = match (durable && applied > 0, fail_sync) {
+    let synced = match (durable, fail_sync) {
         (false, _) => Ok(()),
         (true, true) => Err(io::Error::other("injected metadata sync failure")),
         (true, false) => file.sync_all(),
     };
-    if let Err(error) = synced {
-        return Err((count, applied, Some(error)));
-    }
-    refused.map_or(Ok(()), |(index, error)| Err((index, index, Some(error))))
+    synced.map_err(|error| (count, count, Some(error)))
 }
 
 #[cfg(unix)]

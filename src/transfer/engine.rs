@@ -268,7 +268,7 @@ impl TransferFailure {
         self.source_qos
     }
 
-    /// Returns the fail-fast metadata application error and its partial family report.
+    /// Returns the metadata application failure, every failed family with it, and its partial family report.
     #[must_use]
     pub fn metadata_failure(&self) -> Option<&crate::metadata::MetadataApplicationFailure> {
         self.metadata.as_deref()

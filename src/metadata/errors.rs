@@ -253,36 +253,35 @@ impl fmt::Display for ApplicationFailureKind {
     }
 }
 
+/// One family that could not be applied.
 #[derive(Debug)]
-pub struct MetadataApplicationFailure {
+pub struct FamilyFailure {
     pub(super) family: MetadataFamily,
     pub(super) kind: ApplicationFailureKind,
     /// Boxed so the whole `Result` stays small: the role failure carries paths and diagnostic
     /// strings, and every successful application would otherwise pay for its size.
     pub(super) error: Option<Box<StorageRoleFailure>>,
-    pub(super) report: MetadataApplicationReport,
 }
 
-impl MetadataApplicationFailure {
+impl FamilyFailure {
+    /// The family that could not be applied.
     #[must_use]
     pub const fn family(&self) -> MetadataFamily {
         self.family
     }
+    /// How it failed.
     #[must_use]
     pub const fn kind(&self) -> ApplicationFailureKind {
         self.kind
     }
+    /// What the storage reported; `None` when the copy was cancelled.
     #[must_use]
     pub fn storage_error(&self) -> Option<&StorageRoleFailure> {
         self.error.as_deref()
     }
-    #[must_use]
-    pub const fn report(&self) -> &MetadataApplicationReport {
-        &self.report
-    }
 }
 
-impl fmt::Display for MetadataApplicationFailure {
+impl fmt::Display for FamilyFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
@@ -292,6 +291,68 @@ impl fmt::Display for MetadataApplicationFailure {
         )?;
         if let Some(error) = &self.error {
             write!(formatter, " — {}", role_failure_text(error))?;
+        }
+        Ok(())
+    }
+}
+
+/// Every family of one item that could not be applied. Application goes on past a family the
+/// destination refuses, so the item fails once with every reason rather than with the first; only
+/// a cancellation, a lost session, or a batch that failed as a whole stops it early, and that one
+/// is always last.
+#[derive(Debug)]
+pub struct MetadataApplicationFailure {
+    /// Never empty.
+    pub(super) failures: Vec<FamilyFailure>,
+    /// In a failure report `Applied` means written to the stage, not durable: the item fails and
+    /// is not published, so nothing it wrote is claimed durable.
+    pub(super) report: MetadataApplicationReport,
+}
+
+impl MetadataApplicationFailure {
+    /// Every family that failed, in the order they were applied.
+    #[must_use]
+    pub fn failures(&self) -> &[FamilyFailure] {
+        &self.failures
+    }
+    /// The family of the most severe failure. A failure that stops application (cancellation, a
+    /// lost session, a whole batch) is always the last one; when every failure was a refusal, it
+    /// is the last refusal.
+    #[must_use]
+    pub fn family(&self) -> MetadataFamily {
+        self.last().family
+    }
+    /// The most severe failure's kind: `Cancelled` exactly when the copy was cancelled, whatever
+    /// came before it.
+    #[must_use]
+    pub fn kind(&self) -> ApplicationFailureKind {
+        self.last().kind
+    }
+    /// The most severe failure's storage error. Earlier refusals keep theirs in `failures()` — a
+    /// retry decision has to look at all of them.
+    #[must_use]
+    pub fn storage_error(&self) -> Option<&StorageRoleFailure> {
+        self.last().storage_error()
+    }
+    #[must_use]
+    pub const fn report(&self) -> &MetadataApplicationReport {
+        &self.report
+    }
+
+    fn last(&self) -> &FamilyFailure {
+        self.failures
+            .last()
+            .unwrap_or_else(|| unreachable!("a metadata application failure lists at least one"))
+    }
+}
+
+impl fmt::Display for MetadataApplicationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, failure) in self.failures.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("; ")?;
+            }
+            write!(formatter, "{failure}")?;
         }
         Ok(())
     }
