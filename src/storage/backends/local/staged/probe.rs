@@ -41,6 +41,8 @@ pub(super) struct WriteProbe {
     #[cfg(test)]
     pub(super) fail_after_publication_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    pub(super) fail_metadata_sync: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     pub(super) replace_final_during_skip: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(super) slow_existing_verify: std::sync::atomic::AtomicBool,
@@ -96,6 +98,22 @@ impl WriteProbe {
         let _ = offset;
     }
 
+    /// Counts one metadata batch, and — when `durable` — the barrier it is due to end with. This
+    /// counts intent: the barrier is skipped when nothing was applied or the batch was cancelled,
+    /// so only an injected barrier failure proves that one ran.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    pub(super) fn record_metadata_batch(&self, durable: bool) {
+        #[cfg(test)]
+        {
+            self.metadata_batch_calls.fetch_add(1, Ordering::SeqCst);
+            if durable {
+                self.metadata_sync_calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        #[cfg(not(test))]
+        let _ = durable;
+    }
+
     #[cfg_attr(not(test), allow(clippy::unused_self))]
     pub(super) fn after_write(&self, offset: u64) {
         #[cfg(test)]
@@ -130,6 +148,13 @@ impl super::LocalStagedDestination {
     pub(crate) fn corrupt_before_verify(&self) {
         self.write_probe
             .corrupt_before_verify
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Fails the persistence barrier of every later metadata batch, after its mutations applied.
+    pub(crate) fn fail_metadata_sync(&self) {
+        self.write_probe
+            .fail_metadata_sync
             .store(true, Ordering::SeqCst);
     }
 

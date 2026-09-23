@@ -636,3 +636,167 @@ async fn direct_cancellation_returns_after_writes_settle_and_retains_target()
     assert_eq!(std::fs::read_dir(target_root.path())?.count(), 1);
     Ok(())
 }
+
+/// A failed persistence barrier after every staged mutation applied belongs to no one mutation.
+/// Local used to report it against the last one, so a `BestEffort` family there absorbed it and
+/// the file was published with metadata that was never made durable, its report saying `Applied`.
+/// An expert caller reaches this with any plan whose last family is `BestEffort`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_metadata_barrier_is_not_absorbed_by_a_best_effort_family()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = TestRoot::new("metadata-barrier-source")?;
+    let destination_root = TestRoot::new("metadata-barrier-destination")?;
+    std::fs::write(source_root.path().join("source.bin"), b"metadata payload")?;
+    let source = local_source(source_root.path())?;
+    let (destination, role) =
+        test_destination_storage_with_role(destination_root.path(), "metadata-barrier")?;
+    role.fail_metadata_sync();
+    let observation = expert_observation(&source, "source.bin").await?;
+    let observations = MetadataObservations::new(
+        MetadataObservation::NotRequested,
+        observed(vec![ExtendedAttribute::new(
+            b"user.data-mover-barrier".to_vec(),
+            b"not-durable".to_vec(),
+        )?]),
+        MetadataObservation::NotRequested,
+        MetadataObservation::NotRequested,
+        MetadataObservation::NotRequested,
+    )?;
+    let plan = compile_metadata_plan(&MetadataPlanRequest {
+        observations: &observations,
+        target: local_metadata_target(),
+        policies: MetadataPolicies::default().with_xattrs(MetadataPolicy::BestEffort),
+        principal_mapper: None,
+    })?;
+
+    let Err(error) = complete_expert_transfer(
+        "metadata-barrier",
+        source,
+        destination,
+        observation,
+        plan,
+        "must-not-publish.bin",
+        // Checkpointed stages are durable, so their metadata batch ends in a barrier.
+        TransferPolicy::Checkpointed,
+    )
+    .await
+    else {
+        return Err("a failed metadata barrier was tolerated and the file published".into());
+    };
+
+    assert_eq!(error.phase(), TransferPhase::Metadata);
+    assert_eq!(role.metadata_batch_counts(), (1, 1));
+    assert!(!error.final_destination_changed());
+    assert!(
+        !destination_root
+            .path()
+            .join("must-not-publish.bin")
+            .exists()
+    );
+    error.discard_stage().await?;
+    Ok(())
+}
+
+/// Ownership that has to be applied, then an xattr the filesystem refuses at run time (an unknown
+/// namespace) that the caller only asked for on a best-effort basis — the last mutation.
+#[cfg(unix)]
+fn ownership_then_refused_xattr_plan(
+    source: &Path,
+) -> Result<crate::metadata::MetadataPlan, Box<dyn std::error::Error>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(source)?;
+    let observations = MetadataObservations::new(
+        MetadataObservation::NotRequested,
+        observed(vec![ExtendedAttribute::new(
+            b"bogus.data-mover-refused".to_vec(),
+            b"refused".to_vec(),
+        )?]),
+        MetadataObservation::NotRequested,
+        observed(crate::model::OwnershipMode {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            mode: 0o640,
+        }),
+        MetadataObservation::NotRequested,
+    )?;
+    Ok(compile_metadata_plan(&MetadataPlanRequest {
+        observations: &observations,
+        target: local_metadata_target(),
+        policies: MetadataPolicies::default()
+            .with_ownership_mode(MetadataPolicy::RequireExact)
+            .with_xattrs(MetadataPolicy::BestEffort),
+        principal_mapper: None,
+    })?)
+}
+
+/// A refusal on the last mutation ends the batch with nothing left to resend, so the barrier has
+/// to run before the refusal is reported — otherwise the ownership applied ahead of it is
+/// published without ever being made durable. A barrier that runs can fail, so injecting that
+/// failure is how this observes that it ran.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tolerated_refusal_on_the_last_mutation_still_makes_the_rest_durable()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use crate::metadata::MetadataFamily;
+
+    for fail_barrier in [false, true] {
+        let source_root = TestRoot::new("metadata-last-refusal-source")?;
+        let destination_root = TestRoot::new("metadata-last-refusal-destination")?;
+        let source_path = source_root.path().join("source.bin");
+        std::fs::write(&source_path, b"metadata payload")?;
+        let source = local_source(source_root.path())?;
+        let (destination, role) =
+            test_destination_storage_with_role(destination_root.path(), "metadata-last-refusal")?;
+        if fail_barrier {
+            role.fail_metadata_sync();
+        }
+        let observation = expert_observation(&source, "source.bin").await?;
+        let result = complete_expert_transfer(
+            "metadata-last-refusal",
+            source,
+            destination,
+            observation,
+            ownership_then_refused_xattr_plan(&source_path)?,
+            "final.bin",
+            TransferPolicy::Checkpointed,
+        )
+        .await;
+        let published = destination_root.path().join("final.bin");
+        if fail_barrier {
+            let Err(error) = result else {
+                return Err("the barrier after a tolerated refusal never ran".into());
+            };
+            assert_eq!(error.phase(), TransferPhase::Metadata);
+            assert!(!published.exists());
+            error.discard_stage().await?;
+            continue;
+        }
+        let report = result?
+            .metadata
+            .ok_or("successful metadata transfer omitted its application report")?;
+        let outcome = |family| {
+            report
+                .outcomes()
+                .iter()
+                .find(|item| item.family == family)
+                .map(|item| item.outcome)
+        };
+        assert_eq!(
+            outcome(MetadataFamily::Xattrs),
+            Some(ApplicationOutcome::Failed)
+        );
+        assert_eq!(
+            outcome(MetadataFamily::OwnershipMode),
+            Some(ApplicationOutcome::Applied)
+        );
+        assert_eq!(
+            std::fs::metadata(&published)?.permissions().mode() & 0o7777,
+            0o640
+        );
+    }
+    Ok(())
+}

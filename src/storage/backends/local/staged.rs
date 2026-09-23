@@ -1277,73 +1277,40 @@ impl StagedDestination for LocalStagedDestination {
         if mutations.is_empty() {
             return Ok(());
         }
-        if cancel.is_cancelled() {
-            return Err(StagedMetadataApplicationFailure {
-                failed_index: 0,
-                completed: 0,
-                error: None,
-            });
-        }
-        if let Some(index) = mutations
-            .iter()
-            .position(|mutation| !local_metadata_supported(mutation))
-        {
-            return Err(StagedMetadataApplicationFailure {
-                failed_index: index,
-                completed: 0,
-                error: Some(failure(
-                    stage.final_destination.path(),
-                    Operation::Metadata,
-                    FailureClass::Unsupported,
-                )),
-            });
-        }
+        refuse_before_applying(stage, &mutations, &cancel)?;
         let file = self
             .open_stage_file_for(stage, Operation::Metadata)
             .await
-            .map_err(|error| StagedMetadataApplicationFailure {
-                failed_index: 0,
-                completed: 0,
-                error: Some(error),
+            .map_err(|error| {
+                StagedMetadataApplicationFailure::whole_batch(mutations.len(), 0, Some(error))
             })?;
         let path = stage.final_destination.path().clone();
         let durable = stage.durable_publication;
-        let last_index = mutations.len().saturating_sub(1);
+        let count = mutations.len();
         #[cfg(test)]
-        self.write_probe
-            .metadata_batch_calls
-            .fetch_add(1, Ordering::SeqCst);
-        #[cfg(test)]
-        if durable {
-            self.write_probe
-                .metadata_sync_calls
-                .fetch_add(1, Ordering::SeqCst);
-        }
-        let result = tokio::task::spawn_blocking(move || {
-            for (index, mutation) in mutations.into_iter().enumerate() {
-                if cancel.is_cancelled() {
-                    return Err((index, None));
-                }
-                if let Err(error) = apply_local_metadata(&file, mutation) {
-                    return Err((index, Some(error)));
-                }
-            }
-            if durable && let Err(error) = file.sync_all() {
-                return Err((last_index, Some(error)));
-            }
-            Ok(())
+        let fail_sync = self.write_probe.fail_metadata_sync.load(Ordering::SeqCst);
+        #[cfg(not(test))]
+        let fail_sync = false;
+        self.write_probe.record_metadata_batch(durable);
+        tokio::task::spawn_blocking(move || {
+            apply_local_batch(&file, mutations, &cancel, durable, fail_sync)
         })
         .await
-        .map_err(|_| StagedMetadataApplicationFailure {
-            failed_index: 0,
-            completed: 0,
-            error: Some(failure(&path, Operation::Metadata, FailureClass::Internal)),
-        })?;
-        result.map_err(|(completed, error)| StagedMetadataApplicationFailure {
-            failed_index: completed,
-            completed,
-            error: error.map(|error| io_failure(&path, Operation::Metadata, &error)),
-        })
+        .map_err(|_| {
+            // Nothing says how far the lost task got, so nothing is claimed applied.
+            StagedMetadataApplicationFailure::whole_batch(
+                count,
+                0,
+                Some(failure(&path, Operation::Metadata, FailureClass::Internal)),
+            )
+        })?
+        .map_err(
+            |(failed_index, completed, error)| StagedMetadataApplicationFailure {
+                failed_index,
+                completed,
+                error: error.map(|error| io_failure(&path, Operation::Metadata, &error)),
+            },
+        )
     }
 
     async fn publish(
@@ -1459,6 +1426,79 @@ impl StagedDestination for LocalStagedDestination {
         self.cleanup_stage_artifacts(&stage, Operation::Namespace)
             .await
     }
+}
+
+/// Refuses a batch before any of it is applied: cancelled, or holding a mutation Local cannot
+/// apply at all. The unsupported one is reported at its index with nothing completed, so the
+/// caller resends the ones ahead of it.
+fn refuse_before_applying(
+    stage: &PreparedStage,
+    mutations: &[MetadataMutation],
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(), StagedMetadataApplicationFailure> {
+    if cancel.is_cancelled() {
+        return Err(StagedMetadataApplicationFailure {
+            failed_index: 0,
+            completed: 0,
+            error: None,
+        });
+    }
+    match mutations
+        .iter()
+        .position(|mutation| !local_metadata_supported(mutation))
+    {
+        Some(index) => Err(StagedMetadataApplicationFailure {
+            failed_index: index,
+            completed: 0,
+            error: Some(failure(
+                stage.final_destination.path(),
+                Operation::Metadata,
+                FailureClass::Unsupported,
+            )),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Where a blocking Local metadata batch stopped, as `(failed_index, completed, error)`: the
+/// fields of `StagedMetadataApplicationFailure` before the error is mapped.
+type LocalBatchStop = (usize, usize, Option<io::Error>);
+
+/// Applies a staged metadata batch in order and makes whatever it applied durable.
+///
+/// The barrier runs even when a mutation is refused: the caller may tolerate the refusal, and
+/// when it was the last mutation nothing is resent, so nothing else would ever sync what came
+/// before it. A failed barrier belongs to no one mutation and is reported against the batch
+/// (`failed_index == count`).
+fn apply_local_batch(
+    file: &std::fs::File,
+    mutations: Vec<MetadataMutation>,
+    cancel: &tokio_util::sync::CancellationToken,
+    durable: bool,
+    fail_sync: bool,
+) -> Result<(), LocalBatchStop> {
+    let count = mutations.len();
+    let mut refused = None;
+    for (index, mutation) in mutations.into_iter().enumerate() {
+        if cancel.is_cancelled() {
+            // Cancelled work is never published, so what it applied need not be durable.
+            return Err((index, index, None));
+        }
+        if let Err(error) = apply_local_metadata(file, mutation) {
+            refused = Some((index, error));
+            break;
+        }
+    }
+    let applied = refused.as_ref().map_or(count, |(index, _)| *index);
+    let synced = match (durable && applied > 0, fail_sync) {
+        (false, _) => Ok(()),
+        (true, true) => Err(io::Error::other("injected metadata sync failure")),
+        (true, false) => file.sync_all(),
+    };
+    if let Err(error) = synced {
+        return Err((count, applied, Some(error)));
+    }
+    refused.map_or(Ok(()), |(index, error)| Err((index, index, Some(error))))
 }
 
 #[cfg(unix)]

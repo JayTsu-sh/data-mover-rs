@@ -137,7 +137,8 @@ pub enum StorageRoleFailure {
 /// contract, not diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedMetadataApplicationFailure {
-    /// Index in the batch of the mutation that failed.
+    /// Index in the batch of the mutation that failed, or the batch length when no single
+    /// mutation did and the batch failed as a whole (see [`Self::whole_batch`]).
     pub failed_index: usize,
     /// How many leading mutations were applied, never more than `failed_index`. It may be less:
     /// a backend that rejects the batch before touching it reports zero, and the mutations
@@ -145,6 +146,24 @@ pub struct StagedMetadataApplicationFailure {
     pub completed: usize,
     /// `None` means the batch stopped because it was cancelled.
     pub error: Option<StorageRoleFailure>,
+}
+
+impl StagedMetadataApplicationFailure {
+    /// A failure of a batch of `len` mutations as a whole — the stage could not be opened, or the
+    /// persistence barrier over the mutations it applied failed, whether the batch ran to the end
+    /// or stopped at a refusal — with the first `completed` applied but not made durable.
+    ///
+    /// It is never the destination declining one write, so no policy tolerates it. Reporting it
+    /// against the last mutation instead would let a `BestEffort` family there absorb a failed
+    /// barrier, and the copy would be published with metadata that is not durable.
+    #[must_use]
+    pub fn whole_batch(len: usize, completed: usize, error: Option<StorageRoleFailure>) -> Self {
+        Self {
+            failed_index: len,
+            completed: completed.min(len),
+            error,
+        }
+    }
 }
 
 impl fmt::Display for StorageRoleFailure {

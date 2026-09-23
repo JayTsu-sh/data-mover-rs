@@ -5,7 +5,7 @@
 use bytes::Bytes;
 
 use super::*;
-use crate::model::{BackendIdentity, BackendKind};
+use crate::model::{BackendIdentity, BackendKind, BackendSessionFailure};
 use crate::storage::{
     ByteStream, CheckpointObservation, FinalDestination, PrepareRequest, PublicationEvidence,
     PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity,
@@ -31,6 +31,17 @@ enum Refusal {
     /// The token fires while the refused mutation is in flight, and the backend reports whatever
     /// the interrupted request surfaced as rather than `Cancelled`.
     CancelledAsProtocol,
+    /// The session is lost while the refused mutation is in flight.
+    SessionLost,
+    /// Applies the whole batch and then fails its persistence barrier, as Local's durable
+    /// `sync_all` can: no single mutation failed, the batch did.
+    BarrierFailed,
+    /// Fails before touching the batch for a reason that is not about any mutation in it, as
+    /// Local's stage open can.
+    StageUnavailable,
+    /// Stops at the refused mutation, then fails the barrier over the ones ahead of it, as Local
+    /// does when both happen in one batch.
+    RefusedThenBarrierFailed,
 }
 
 struct ScriptedStage {
@@ -74,6 +85,18 @@ impl ScriptedStage {
                 cancel.cancel();
                 Some(refusal(FailureClass::Protocol))
             }
+            Refusal::SessionLost => Some(StorageRoleFailure::Session(
+                BackendSessionFailure::new(
+                    Operation::Metadata,
+                    FailureClass::Connectivity,
+                    Transience::Transient,
+                    "session lost",
+                )
+                .unwrap(),
+            )),
+            Refusal::BarrierFailed
+            | Refusal::StageUnavailable
+            | Refusal::RefusedThenBarrierFailed => Some(refusal(FailureClass::Protocol)),
         }
     }
 
@@ -156,10 +179,40 @@ impl StagedDestination for ScriptedStage {
         if cancel.is_cancelled() {
             return Err(batch_failure(0, 0, None));
         }
+        let len = mutations.len();
+        match self.refusal {
+            Refusal::StageUnavailable => {
+                return Err(StagedMetadataApplicationFailure::whole_batch(
+                    len,
+                    0,
+                    self.refusal_error(&cancel),
+                ));
+            }
+            Refusal::BarrierFailed => {
+                self.applied.lock().unwrap().extend(mutations);
+                return Err(StagedMetadataApplicationFailure::whole_batch(
+                    len,
+                    len,
+                    self.refusal_error(&cancel),
+                ));
+            }
+            _ => {}
+        }
         let Some(index) = mutations.iter().position(|mutation| self.refuses(mutation)) else {
             self.applied.lock().unwrap().extend(mutations);
             return Ok(());
         };
+        if let Refusal::RefusedThenBarrierFailed = self.refusal {
+            self.applied
+                .lock()
+                .unwrap()
+                .extend(mutations.into_iter().take(index));
+            return Err(StagedMetadataApplicationFailure::whole_batch(
+                len,
+                index,
+                self.refusal_error(&cancel),
+            ));
+        }
         let completed = match self.refusal {
             Refusal::UpFront => 0,
             Refusal::Partway => index.min(1),
@@ -425,4 +478,87 @@ async fn cancellation_on_a_tolerant_published_family_still_stops_the_copy() {
             "{refusal:?}"
         );
     }
+}
+
+/// Every family `BestEffort`, so any failure that is tolerated at all would be tolerated here.
+fn everything_best_effort() -> MetadataPolicies {
+    best_effort_after_ownership().with_ownership_mode(MetadataPolicy::BestEffort)
+}
+
+/// `BestEffort` tolerates the destination declining one write. A batch whose persistence barrier
+/// failed, or that could not be started, did not decline anything: the metadata that is there is
+/// not durable, or none of it is there. Pinning it on one family and tolerating that family would
+/// publish a file whose report says its metadata was applied.
+#[tokio::test]
+async fn a_failure_of_the_whole_batch_is_never_tolerated() {
+    for (refusal, family, applied) in [
+        (
+            Refusal::BarrierFailed,
+            MetadataFamily::Timestamps,
+            &[
+                MetadataFamily::OwnershipMode,
+                MetadataFamily::Acl,
+                MetadataFamily::Xattrs,
+                MetadataFamily::Tags,
+                MetadataFamily::Timestamps,
+            ][..],
+        ),
+        (
+            Refusal::StageUnavailable,
+            MetadataFamily::OwnershipMode,
+            &[][..],
+        ),
+        // The refused ACL is not what the caller has to look at: the ownership ahead of it was
+        // applied and is not durable.
+        (
+            Refusal::RefusedThenBarrierFailed,
+            MetadataFamily::OwnershipMode,
+            &[MetadataFamily::OwnershipMode][..],
+        ),
+    ] {
+        let refused: &'static [MetadataFamily] = match refusal {
+            Refusal::RefusedThenBarrierFailed => &[MetadataFamily::Acl],
+            _ => &[],
+        };
+        let target = ScriptedStage::refusing(refusal, refused);
+        let failure = plan(everything_best_effort())
+            .apply_to_stage(&target, &stage(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.family(), family, "{refusal:?}");
+        assert!(failure.storage_error().is_some(), "{refusal:?}");
+        assert_eq!(target.applied_families(), applied, "{refusal:?}");
+        // Applied to the stage is not applied: after a failed barrier none of it is durable.
+        assert!(
+            failure
+                .report()
+                .outcomes()
+                .iter()
+                .all(|value| value.outcome != ApplicationOutcome::Applied),
+            "{refusal:?}: {:?}",
+            failure.report()
+        );
+    }
+}
+
+/// A lost session is not the destination declining this write either, on either path.
+#[tokio::test]
+async fn a_lost_session_on_a_tolerant_family_still_stops_the_copy() {
+    let target = ScriptedStage::new(Refusal::SessionLost);
+    let staged = plan(best_effort_after_ownership())
+        .apply_to_stage(&target, &stage(), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert_eq!(staged.family(), MetadataFamily::Acl);
+    let target = ScriptedStage::new(Refusal::SessionLost);
+    let published = plan(best_effort_after_ownership())
+        .apply(
+            &target,
+            &StoragePath::new("file").unwrap(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(published.family(), MetadataFamily::Acl);
+    assert_eq!(target.applied_families(), [MetadataFamily::OwnershipMode]);
 }

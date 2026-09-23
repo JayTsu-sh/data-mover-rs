@@ -339,6 +339,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::super::source::role_failure;
     use super::*;
     use crate::model::{FailureClass, Transience};
 
@@ -415,6 +416,59 @@ mod tests {
         ) -> Result<(), NfsProtocolFailure> {
             Err(NfsProtocolFailure::protocol())
         }
+    }
+
+    /// `BestEffort` tolerates a refusal only while it is entry-scoped: a session-scoped failure
+    /// ends every write after it, so it is never tolerated. A server refusing SETACL therefore has
+    /// to stay entry-scoped, or every best-effort ACL copy to such a server becomes a failed copy.
+    /// This pins the class-to-scope step (only a lost connection is session-scoped); the status to
+    /// class step is `classify_error`'s.
+    #[tokio::test]
+    async fn a_refused_setacl_stays_entry_scoped_and_only_a_lost_connection_does_not() {
+        let protocol = Arc::new(CancellingProtocol {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            sets: AtomicUsize::new(0),
+            xattrs_supported: false,
+        });
+        let identity = crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "dest")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let adapter = NfsMetadataAdapter::new(protocol, identity);
+        let path = StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
+        let acl = acl::encode(&nfs_rs::Acl::default()).unwrap_or_else(|error| panic!("{error:?}"));
+        let refused = adapter
+            .apply(
+                &path,
+                MetadataMutation::Acl(acl),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(StorageRoleFailure::Entry(_))),
+            "{refused:?}"
+        );
+        for class in [
+            FailureClass::Protocol,
+            FailureClass::PermissionDenied,
+            FailureClass::Unsupported,
+            FailureClass::InvalidInput,
+        ] {
+            let failure = NfsProtocolFailure {
+                class,
+                transience: Transience::Permanent,
+            };
+            assert!(matches!(
+                role_failure(&path, crate::model::Operation::Metadata, failure),
+                StorageRoleFailure::Entry(_)
+            ));
+        }
+        let lost = NfsProtocolFailure {
+            class: FailureClass::Connectivity,
+            transience: Transience::Transient,
+        };
+        assert!(matches!(
+            role_failure(&path, crate::model::Operation::Metadata, lost),
+            StorageRoleFailure::Session(_)
+        ));
     }
 
     #[tokio::test]

@@ -86,6 +86,7 @@ async fn complete_expert_transfer(
     observation: ObservedEntry,
     plan: crate::metadata::MetadataPlan,
     final_path: &str,
+    policy: TransferPolicy,
 ) -> Result<super::TransferOutcome, super::TransferFailure> {
     let limits = InflightLimits::new(2, 128 * 1024, 2)
         .unwrap_or_else(|error| panic!("valid test inflight limits: {error}"));
@@ -110,7 +111,7 @@ async fn complete_expert_transfer(
             limits,
             tokio_util::sync::CancellationToken::new(),
         )
-        .with_transfer_policy(TransferPolicy::AtomicReplace)
+        .with_transfer_policy(policy)
         .with_metadata_plan(plan),
     )
     .await?;
@@ -145,6 +146,7 @@ async fn expert_metadata_is_applied_to_the_stage_before_publication()
         observation,
         plan,
         "published.bin",
+        TransferPolicy::AtomicReplace,
     )
     .await?;
 
@@ -197,6 +199,7 @@ async fn expert_metadata_failure_does_not_publish_and_retains_the_stage()
         observation,
         plan,
         "must-not-publish.bin",
+        TransferPolicy::AtomicReplace,
     )
     .await
     else {

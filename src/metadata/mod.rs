@@ -334,16 +334,28 @@ impl MetadataPlan {
         outcomes: &mut Vec<FamilyApplication>,
         cancel: &CancellationToken,
     ) -> Result<Vec<&'a (MetadataFamily, MetadataMutation)>, MetadataApplicationFailure> {
-        let failed_index = failure.failed_index.min(pending.len() - 1);
+        // A batch that failed as a whole is never tolerated. It is charged to the last mutation
+        // it applied without making durable — the first one when it applied none — which is the
+        // family a caller has to look at, rather than whatever stopped the batch before it.
+        let whole_batch = failure.failed_index >= pending.len();
+        let failed_index = if whole_batch {
+            failure.completed.saturating_sub(1)
+        } else {
+            failure.failed_index
+        }
+        .min(pending.len() - 1);
         // A backend may reject the batch before applying any of it, so what precedes the failed
         // index is not necessarily applied: only `completed` says that.
         let completed = failure.completed.min(failed_index);
-        for (family, _) in &pending[..completed] {
+        // After a failed barrier nothing in this batch is durable, so none of it is claimed.
+        let durably_applied = if whole_batch { 0 } else { completed };
+        for (family, _) in &pending[..durably_applied] {
             set_outcome(outcomes, *family, ApplicationOutcome::Applied);
         }
         let family = pending[failed_index].0;
         let cancelled = cancel.is_cancelled() || failure.error.as_ref().is_none_or(is_cancellation);
-        if cancelled || !self.tolerant.contains(&family) {
+        let refusal = !whole_batch && failure.error.as_ref().is_some_and(is_refusal);
+        if cancelled || !refusal || !self.tolerant.contains(&family) {
             if !cancelled {
                 set_outcome(outcomes, family, ApplicationOutcome::Failed);
             }
@@ -395,7 +407,7 @@ impl MetadataPlan {
                 if !cancelled {
                     set_outcome(&mut outcomes, *family, ApplicationOutcome::Failed);
                 }
-                if !cancelled && self.tolerant.contains(family) {
+                if !cancelled && is_refusal(&error) && self.tolerant.contains(family) {
                     continue;
                 }
                 return Err(MetadataApplicationFailure {
@@ -972,6 +984,12 @@ fn is_cancellation(error: &StorageRoleFailure) -> bool {
         StorageRoleFailure::Session(error) => error.class(),
     };
     class == FailureClass::Cancelled
+}
+
+/// Whether a failure is the destination declining this one write — the only failure
+/// `BestEffort` tolerates. A lost session is not: it ends every write after it too.
+fn is_refusal(error: &StorageRoleFailure) -> bool {
+    matches!(error, StorageRoleFailure::Entry(_)) && !is_cancellation(error)
 }
 
 fn set_outcome(

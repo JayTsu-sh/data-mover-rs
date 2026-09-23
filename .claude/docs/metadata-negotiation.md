@@ -30,6 +30,7 @@ atime / ctime 任何情况下都不拷。
 | 源端观测失败（GETACL 报错） | 跳过 | **失败** | **失败** | 记 `Failed` 后继续 |
 | 目的端**应用期**拒绝（能力位为真但 SETACL 被拒） | — | **失败** | **失败** | 记 `Failed` 后继续，**传输仍然成功** |
 | 应用期**取消**（token 已触发，或 backend 报 `Cancelled`，含服务端的 `STATUS_CANCELLED`） | — | **停止** | **停止** | **停止**，该族保持规划期结果、不记 `Failed` |
+| 应用期**整批失败**（stage 打不开、落盘屏障 `sync_all` 失败；目前只有 Local 这样报）或**会话级失败** | — | **失败** | **失败** | **失败** —— 不是目的端拒绝某一次写入 |
 | 不适用（symlink 上的 ACL） | 跳过 | 跳过 | 跳过 | 跳过 |
 
 **分野是「降级」与「缺席」**：`AllowKnownLoss` 容忍降级、不容忍缺席；`BestEffort` 两者都容忍。
@@ -81,6 +82,28 @@ atime / ctime 任何情况下都不拷。
 
 **取消永远不被容忍。** `BestEffort` 吸收的是「目的端说不」，取消不是。两条路径都按
 「token 已触发 **或** 失败类别为 `Cancelled`」判定 —— 被打断的请求可能报成别的类别。
+
+**`BestEffort` 只吸收「目的端拒绝这一次写入」**（`is_refusal`：Entry 级、非取消），其余一律停止：
+- **会话级失败**（`StorageRoleFailure::Session`）—— 会话断了，后面每一次写都会跟着失败。
+- **整批失败** —— backend 用 `StagedMetadataApplicationFailure::whole_batch(len, completed, error)`
+  报告，即 `failed_index == len`：不归属任何一条 mutation。Local 的 stage 打不开、`spawn_blocking`
+  丢失、以及 durable **屏障 `sync_all` 失败**（无论批次跑完，还是停在某条拒绝上）都走这里。此前 Local
+  把 `sync_all` 失败报在最后一条上，若那一族是 `BestEffort`（经 expert API 的 `with_metadata_plan`
+  可以做到），失败被容忍，文件带着没落盘的元数据发布，报告还写着 `Applied`。
+  整批失败记在**最后一条已应用但未落盘**的族上（`completed - 1`；一条都没应用时记第一条），
+  不记在拒绝它的那一条上；且该批次一个都不标 `Applied`。
+- **Local 的屏障在报告拒绝之前就跑**（`apply_local_batch`）：拒绝若落在最后一条，调用方容忍后没有
+  东西可重发，不先 sync 的话前面已应用的族永远不会落盘。
+
+看守：`a_failure_of_the_whole_batch_is_never_tolerated`（假件，三种整批形态，含「拒绝后屏障失败」）、
+`a_failed_metadata_barrier_is_not_absorbed_by_a_best_effort_family` 与
+`a_tolerated_refusal_on_the_last_mutation_still_makes_the_rest_durable`（expert API + 真 Local stage +
+注入的屏障失败）、`a_refused_setacl_stays_entry_scoped_and_only_a_lost_connection_does_not`（NFS 的
+拒绝必须是 Entry 级，否则 `BestEffort` 的 ACL 会变成拷贝失败）。
+
+**已知缺口：CIFS。** 它没有批量实现，逐条 `apply_metadata` 在 durable 时 apply 后再 open/flush/close，
+flush 失败经 `classify` 成 Entry 级，于是仍会被当成那一条的拒绝而被 `BestEffort` 容忍。危害比
+Local 小（之前各条已各自 flush），但与上面的规则不符；要改得让逐条接口也能表达「屏障失败」。
 
 ## 真机证据（2026-09-23，`examples/nfs_metadata_copy.rs`）
 
