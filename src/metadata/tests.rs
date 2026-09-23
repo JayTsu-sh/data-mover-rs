@@ -195,6 +195,7 @@ fn the_mode_that_replaces_ownership_is_applied_before_the_acl_too() {
             principal_mapper: None,
         },
         Some(0o640),
+        false,
     )
     .unwrap();
     assert!(
@@ -209,6 +210,65 @@ fn the_mode_that_replaces_ownership_is_applied_before_the_acl_too() {
         family_order(&plan, MetadataFamily::OwnershipMode)
             < family_order(&plan, MetadataFamily::Acl)
     );
+}
+
+/// An owner the source named but could not map to an id is its own loss, not the one a source
+/// without numeric owners reports: the two send a caller to different places.
+#[test]
+fn owner_names_that_could_not_be_mapped_are_reported_as_such() {
+    let observations = exact_observations();
+    for (unmapped, loss) in [
+        (true, SemanticLoss::OwnerAndGroupUnmapped),
+        (false, SemanticLoss::OwnerAndGroupDropped),
+    ] {
+        let plan = compile_copied_metadata_plan(
+            &MetadataPlanRequest {
+                observations: &observations,
+                target: exact_target(),
+                policies: all_exact().with_ownership_mode(MetadataPolicy::AllowKnownLoss),
+                principal_mapper: None,
+            },
+            Some(0o640),
+            unmapped,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.loss_report().losses(),
+            [(MetadataFamily::OwnershipMode, loss)]
+        );
+        assert!(matches!(
+            plan.mutations.first(),
+            Some((MetadataFamily::OwnershipMode, MetadataMutation::Mode(0o640)))
+        ));
+    }
+}
+
+/// Without the owner, the file belongs to whoever writes it — root, for a copy run as root — so a
+/// set-id bit carried along would make someone else's program run as that writer.
+#[test]
+fn a_mode_carried_without_its_owner_loses_its_set_id_bits() {
+    let observations = exact_observations();
+    for (mode, carried) in [(0o4755, 0o755), (0o2755, 0o755), (0o6750, 0o750)] {
+        let plan = compile_copied_metadata_plan(
+            &MetadataPlanRequest {
+                observations: &observations,
+                target: exact_target(),
+                policies: all_exact().with_ownership_mode(MetadataPolicy::AllowKnownLoss),
+                principal_mapper: None,
+            },
+            Some(mode),
+            true,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                plan.mutations.first(),
+                Some((MetadataFamily::OwnershipMode, MetadataMutation::Mode(value))) if *value == carried
+            ),
+            "{mode:o}: {:?}",
+            plan.mutations.first()
+        );
+    }
 }
 
 /// A destination can advertise a capability and still refuse the write — `NFSv4` `SETACL` is the
@@ -708,6 +768,7 @@ fn copied_mode_never_synthesizes_numeric_ownership() {
                 principal_mapper: None,
             },
             Some(0o100_640),
+            false,
         )
         .unwrap();
         if ownership == OwnershipTarget::NotApplicable {

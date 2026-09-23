@@ -7,6 +7,7 @@ pub(crate) const MAX_MODEL_FIELD_BYTES: usize = 16 * 1024 * 1024;
 
 mod metadata_observation;
 pub(crate) mod observation;
+mod ownership;
 pub use metadata_observation::{
     AclEncoding, AclMetadata, ExtendedAttribute, MappedOwnership, MetadataObservation,
     MetadataObservations, MetadataProvenance, ObjectTag, ObservationMode, ObservationPlan,
@@ -16,6 +17,7 @@ pub use observation::{
     EntryIdentityKey, EntrySnapshot, IdentityStrength, ObservedEntry, SnapshotDecodeError,
     SourceIdentity, SymlinkTarget, SymlinkTargetEncoding,
 };
+pub(crate) use ownership::without_unowned_set_id;
 
 /// A failure to construct a neutral model value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

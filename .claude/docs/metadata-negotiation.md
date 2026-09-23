@@ -61,13 +61,13 @@ atime / ctime 任何情况下都不拷。
 
 ## 各 backend 的能力
 
-| backend | ACL | xattrs | 依据 |
-|---|---|---|---|
-| NFS | 协商到才有，报 `NfsV4` | 协商到才有 | `mount.capabilities().acl` / `.named_attributes` |
-| Local | unix 下 `Posix` | unix 下支持 | 非 unix 整体不参与拷贝 |
-| CIFS | `WindowsSecurityDescriptor` | 不支持 | `cifs/metadata.rs` 的 decode 只认这一种 |
-| HDFS | 不支持 | 不支持 | 观测侧也一律 `unavailable` |
-| S3（目的端） | 不参与 | 不参与 | 未实现 `copied_metadata_target` |
+| backend | owner/group（源端） | ACL | xattrs | 依据 |
+|---|---|---|---|---|
+| NFS | v3 数字；v4 字符串，nfs-rs 映射不了的名字走「只有 mode」（`OwnerAndGroupUnmapped`，见 `storage-nfs.md`） | 协商到才有，报 `NfsV4` | nfs-rs 0.8.4 永远报未协商 | `mount.capabilities().acl` / `.named_attributes` |
+| Local | unix 下数字 | unix 下 `Posix` | unix 下支持 | 非 unix 整体不参与拷贝 |
+| CIFS | 读不到（`NotApplicable`） | `WindowsSecurityDescriptor`（只保留 account 类 ACE） | 不支持 | `cifs/metadata.rs` 的 decode 只认这一种 |
+| HDFS | 字符串，走「只有 mode」（`OwnerAndGroupDropped`） | 不支持 | 不支持 | 观测侧也一律 `unavailable` |
+| S3（目的端） | 不参与 | 不参与 | 不参与 | 未实现 `copied_metadata_target` |
 
 ## 两条必须记住的不变式
 

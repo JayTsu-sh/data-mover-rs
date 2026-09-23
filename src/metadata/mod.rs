@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::model::{
     AclEncoding, FailureClass, MappedOwnership, MetadataObservation, MetadataObservations,
     OwnershipMode, StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata,
+    without_unowned_set_id,
 };
 use crate::storage::{
     Metadata, MetadataMutation, PreparedStage, StagedDestination, StagedMetadataApplicationFailure,
@@ -153,12 +154,16 @@ pub trait PrincipalMapper: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SemanticLoss {
     AclDropped,
     XattrsDropped,
     TagsDropped,
     OwnershipModeDropped,
     OwnerAndGroupDropped,
+    /// Owner and group dropped because the source named them and the names could not be mapped
+    /// to ids; the mode is kept.
+    OwnerAndGroupUnmapped,
     TimestampPrecisionReduced,
     AccessedTimestampDropped,
     ModifiedTimestampDropped,
@@ -517,10 +522,18 @@ pub fn compile_metadata_plan(
     Ok(plan)
 }
 
+/// The mode a copy writes when it does not carry owner and group: the file ends up owned by
+/// whoever writes it, so no set-id bit may go with it (`model::without_unowned_set_id`). The copy
+/// path carries files only, never directories.
+const fn mode_only(mode: u32) -> u32 {
+    without_unowned_set_id(mode & 0o7777, false, false, false)
+}
+
 /// Compiles automatic copy facts without fabricating numeric owner/group IDs.
 pub(crate) fn compile_copied_metadata_plan(
     request: &MetadataPlanRequest<'_>,
     mode_without_ownership: Option<u32>,
+    owner_names_unmapped: bool,
 ) -> Result<MetadataPlan, MetadataPlanError> {
     let projected = MetadataPlanRequest {
         observations: request.observations,
@@ -549,10 +562,10 @@ pub(crate) fn compile_copied_metadata_plan(
             &mut plan,
             family,
             request.policies.get(family),
-            if supported {
-                SemanticLoss::OwnerAndGroupDropped
-            } else {
-                SemanticLoss::OwnershipModeDropped
+            match (supported, owner_names_unmapped) {
+                (true, true) => SemanticLoss::OwnerAndGroupUnmapped,
+                (true, false) => SemanticLoss::OwnerAndGroupDropped,
+                (false, _) => SemanticLoss::OwnershipModeDropped,
             },
         )?;
         if supported {
@@ -560,7 +573,7 @@ pub(crate) fn compile_copied_metadata_plan(
             // has to observe the new mode: the ACL is recomputed by it, and the timestamps have
             // to be stamped after it. Front of the queue is the only correct place.
             plan.mutations
-                .insert(0, (family, MetadataMutation::Mode(mode & 0o7777)));
+                .insert(0, (family, MetadataMutation::Mode(mode_only(mode))));
         }
     }
     Ok(plan)

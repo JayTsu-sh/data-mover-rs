@@ -53,6 +53,7 @@ impl Metadata for HdfsMetadata {
         Ok(crate::storage::CopiedMetadataObservation {
             observations,
             mode_without_ownership: Some(facts.mode & 0o7777),
+            owner_names_unmapped: false,
         })
     }
 

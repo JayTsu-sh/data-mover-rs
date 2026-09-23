@@ -85,6 +85,39 @@ NFS 错误必须按 commit `7eb3046` 的分类映射：
 | uid/gid 默认 1000 不匹配服务器 | URL 参数显式指定 |
 | v3 vs v4 差异 (例如 `setattr` 字段) | 走 `nfs-rs` 的协议无关接口 |
 
+### NFSv4 owner / owner_group 是字符串，nfs-rs 会把认不出的名字变成 65534
+
+NFSv3 的 uid/gid 是数字；NFSv4.0/4.1 线上是 UTF-8 字符串（`owner` / `owner_group`）。ONTAP 在 SVM
+能把 id 映射成名字时发 `name@domain`，否则发数字串 —— FAS2750 实测：uid 0 → `root@localdomain`，
+1000 / 4242 / 65533（SVM 无对应用户）→ `"1000"` 等，v4.0 与 v4.1 一致。nfs-rs 0.8.4
+`parse_numeric_owner` 只认数字串、`N@domain` 与 `root`，其余名字**不报错地**给 65534。接了
+LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobody。
+
+我们这边的处理（`src/nfs/owner.rs` `owner_id`，用在 role 的 stat 与 `NASEntry`）：按**协商到的版本**
+判断 —— v3 的数值原样可信；v4 只有非空的数字串、`N@domain`、`root` / `root@…` 才信 nfs-rs 的数值，
+其余（包括服务端没发这个 RECOMMENDED 属性时 nfs-rs 留下的空串 + 0）给 `None`。之后：
+- 拷贝走 `observe_copy_bound` 的「只有 mode」路径：mode 照拷，owner/group 记为损失
+  `OwnerAndGroupUnmapped`（与 HDFS 那种「源端本来就没有数字 owner」的 `OwnerAndGroupDropped` 分开），
+  文件不失败（用户规则：做不到的跳过并记原因）。目的端文件的 owner/group 于是是**执行拷贝的那个身份**
+  （以 root 跑就是 root:root 建出来的，只是不再 chown）。只有一半（仅 group 或仅 owner）映射不了时
+  两个都丢 —— 模型里没有只改一半的 mutation，列为后续。
+- 其余观测：`InlineOnly` / `BestEffort` 下 ownership 为 `MetadataObservation::Unsupported`，不再
+  `unwrap_or_default()` 成 0（root）；`Required` 下整条观测以 `FailureClass::Unsupported` 失败（拷贝路径
+  不走这里，它走上面的 `observe_copy_bound`）。
+- **set-id 位跟着 owner 走**（`model::without_unowned_set_id`）：owner 不带过去时文件归执行拷贝的身份所有，
+  以 root 跑就是 root，所以 uid 未知去掉 setuid，gid 未知且不是目录去掉 setgid（目录的 setgid 只是
+  让子项继承组，不授予权限）。拷贝路径（只拷文件，也覆盖 HDFS 的 mode-only）、legacy `NASEntry`
+  （所有 legacy 消费方都会应用这个 mode 且不 chown）与 tar 头三处用同一条规则。
+- tar 打包（`src/tar_pack.rs` `header_ownership`）：缺的 uid/gid 记为 65534，并去掉 setuid/setgid 位
+  —— 以前 `unwrap_or(0)` 会把它写成 root。
+- legacy 路径收到 `None` 的行为有三种，均不会写成 0（mode 已按上一条去掉 set-id 位）：Local 与 NFS 的 `write_file` / `create_file`
+  两个都不 chown；NFS 的 `set_entry_metadata` 与 `create_symlink` 分别传 uid、gid，只设已知的那个。
+- **目的端的镜像问题**（未处理，列为后续）：nfs-rs `encode_setattr` 总是发数字串；ONTAP 关掉
+  `-v4-numeric-ids` 或用 Kerberos 时会回 `NFS4ERR_BADOWNER`，我们现在把它归成 Protocol + Unknown，
+  报错不够精确，且需要真机验证。
+
+上游：nfs-rs 0.8.4 `src/nfs4/attrs.rs:654`（`parse_numeric_owner`）应暴露「映射不了」而不是伪造 nobody。
+
 ## 测试
 
 - `examples/nfs_walkdir.rs` — 遍历 export。

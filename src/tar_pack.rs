@@ -10,6 +10,7 @@ use tracing::warn;
 
 // 内部模块
 use crate::error::StorageError;
+use crate::model::without_unowned_set_id;
 use crate::storage_copy_pipeline::HASH_CHANNEL_CAPACITY;
 use crate::storage_enum::{StorageEnum, path_to_s3_key};
 use crate::{DataChunk, EntryEnum, Result, TarPackOptions};
@@ -312,6 +313,26 @@ pub fn calculate_tar_size(entries: &[Arc<EntryEnum>]) -> u64 {
     size
 }
 
+/// Nobody, the id a tar records for an owner the source could not name.
+const TAR_UNKNOWN_ID: u32 = 65534;
+
+/// Mode, uid and gid for a tar header. An owner or group the source could not give (an `NFSv4`
+/// name nfs-rs cannot map, see `nfs::owner_id`) is recorded as nobody, never as root (0), and
+/// takes its set-id bit with it (`model::without_unowned_set_id`) — a root extraction that keeps
+/// owners would otherwise create set-id files owned by someone the source never named.
+fn header_ownership(
+    mode: u32,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    is_dir: bool,
+) -> (u32, u32, u32) {
+    (
+        without_unowned_set_id(mode, uid.is_some(), gid.is_some(), is_dir),
+        uid.unwrap_or(TAR_UNKNOWN_ID),
+        gid.unwrap_or(TAR_UNKNOWN_ID),
+    )
+}
+
 /// 从 `EntryEnum` 构建 ustar header 的 Bytes
 ///
 /// 自动判断条目类型（目录/symlink/普通文件）并设置对应的 `type_flag` 和 size。
@@ -336,13 +357,19 @@ pub(crate) fn build_header_for_entry(
         tar_internal_path.to_string()
     };
 
+    let (mode, uid, gid) = header_ownership(
+        entry.get_mode().unwrap_or(0),
+        entry.get_uid(),
+        entry.get_gid(),
+        entry.get_is_dir(),
+    );
     let header = build_ustar_header(&UstarHeader {
         path: &path,
         size,
         mtime: entry.get_mtime(),
-        mode: entry.get_mode().unwrap_or(0),
-        uid: entry.get_uid().unwrap_or(0),
-        gid: entry.get_gid().unwrap_or(0),
+        mode,
+        uid,
+        gid,
         type_flag,
         link_name: link_target,
     });
@@ -376,6 +403,27 @@ pub(crate) fn tar_eof_marker() -> Bytes {
 mod tests {
     use super::*;
     use crate::AssertTestValue;
+
+    #[test]
+    fn an_owner_the_source_could_not_name_is_nobody_without_its_set_id_bit() {
+        assert_eq!(
+            header_ownership(0o6755, Some(1000), Some(100), false),
+            (0o6755, 1000, 100)
+        );
+        assert_eq!(
+            header_ownership(0o6755, None, Some(100), false),
+            (0o2755, TAR_UNKNOWN_ID, 100)
+        );
+        assert_eq!(
+            header_ownership(0o6755, Some(1000), None, false),
+            (0o4755, 1000, TAR_UNKNOWN_ID)
+        );
+        // A directory keeps setgid: it only makes children inherit the group.
+        assert_eq!(
+            header_ownership(0o2775, None, None, true),
+            (0o2775, TAR_UNKNOWN_ID, TAR_UNKNOWN_ID)
+        );
+    }
 
     #[test]
     fn test_build_ustar_header_basic() {

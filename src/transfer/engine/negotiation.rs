@@ -83,6 +83,7 @@ pub(super) async fn copied_metadata_plan(
             principal_mapper: None,
         },
         observations.mode_without_ownership,
+        observations.owner_names_unmapped,
     )
     .map(|plan| Some(CopiedMetadataPlan { plan }))
     .map_err(TransferFailure::refused_metadata)

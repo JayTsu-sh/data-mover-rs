@@ -761,6 +761,7 @@ pub trait Metadata: Send + Sync {
         Ok(CopiedMetadataObservation {
             observations: self.observe_bound(path, expected, plan).await?,
             mode_without_ownership: None,
+            owner_names_unmapped: false,
         })
     }
     async fn apply(

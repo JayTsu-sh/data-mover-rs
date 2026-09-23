@@ -9,7 +9,7 @@ use crate::model::{
     ObservationMode, ObservationPlan, OwnershipMode, StoragePath, StorageTimestamp, TimePrecision,
     TimestampMetadata,
 };
-use crate::storage::{Metadata, MetadataMutation, StorageRoleFailure};
+use crate::storage::{CopiedMetadataObservation, Metadata, MetadataMutation, StorageRoleFailure};
 
 pub(crate) struct NfsMetadataAdapter {
     protocol: Arc<dyn NfsMetadataProtocol>,
@@ -86,35 +86,10 @@ impl NfsMetadataAdapter {
         {
             return Err(unsupported(path));
         }
-        let symlink = entry.symlink;
-        let acl = if symlink {
-            optional_not_applicable(plan.acl())
-        } else {
-            observe_optional(path, plan.acl(), self.protocol.supports_acl(), || async {
-                let value = self.protocol.get_acl(path).await?;
-                acl::encode(&value).map_err(|_| super::source::NfsProtocolFailure::protocol())
-            })
-            .await?
-        };
-        let xattrs = if symlink {
-            optional_not_applicable(plan.xattrs())
-        } else {
-            observe_optional(
-                path,
-                plan.xattrs(),
-                self.protocol.supports_xattrs(),
-                || async { self.protocol.get_xattrs(path).await },
-            )
-            .await?
-        };
-        let ownership = inline(
-            plan.ownership_mode(),
-            OwnershipMode {
-                uid: entry.uid.unwrap_or_default(),
-                gid: entry.gid.unwrap_or_default(),
-                mode: entry.mode,
-            },
-        );
+        let (acl, xattrs) = self
+            .observe_optional_families(path, plan, entry.symlink)
+            .await?;
+        let ownership = ownership(plan.ownership_mode(), &entry);
         let timestamps = inline(
             plan.timestamps(),
             TimestampMetadata {
@@ -139,24 +114,48 @@ impl NfsMetadataAdapter {
             )
         })
     }
-}
 
-#[async_trait]
-impl Metadata for NfsMetadataAdapter {
-    fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
-        Some(
-            ObservationPlan::default()
-                .with_ownership_mode(ObservationMode::Required)
-                .with_timestamps(ObservationMode::Required),
+    /// ACL and xattrs: never for a symlink, otherwise one extra call each when asked for and the
+    /// mount negotiated them.
+    async fn observe_optional_families(
+        &self,
+        path: &StoragePath,
+        plan: ObservationPlan,
+        symlink: bool,
+    ) -> Result<
+        (
+            MetadataObservation<crate::model::AclMetadata>,
+            MetadataObservation<Vec<ExtendedAttribute>>,
+        ),
+        StorageRoleFailure,
+    > {
+        if symlink {
+            return Ok((
+                optional_not_applicable(plan.acl()),
+                optional_not_applicable(plan.xattrs()),
+            ));
+        }
+        let acl = observe_optional(path, plan.acl(), self.protocol.supports_acl(), || async {
+            let value = self.protocol.get_acl(path).await?;
+            acl::encode(&value).map_err(|_| super::source::NfsProtocolFailure::protocol())
+        })
+        .await?;
+        let xattrs = observe_optional(
+            path,
+            plan.xattrs(),
+            self.protocol.supports_xattrs(),
+            || async { self.protocol.get_xattrs(path).await },
         )
+        .await?;
+        Ok((acl, xattrs))
     }
 
-    async fn observe_bound(
+    /// One stat of `path`, refused unless it is still the object `expected` describes.
+    async fn bound_entry(
         &self,
         path: &StoragePath,
         expected: &crate::model::SourceIdentity,
-        plan: ObservationPlan,
-    ) -> Result<MetadataObservations, StorageRoleFailure> {
+    ) -> Result<NfsMetadataInline, StorageRoleFailure> {
         let entry = self.protocol.stat(path).await.map_err(|error| {
             super::source::role_failure(path, crate::model::Operation::Metadata, error)
         })?;
@@ -181,7 +180,52 @@ impl Metadata for NfsMetadataAdapter {
                 crate::model::Transience::Permanent,
             ));
         }
+        Ok(entry)
+    }
+}
+
+#[async_trait]
+impl Metadata for NfsMetadataAdapter {
+    fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
+        Some(
+            ObservationPlan::default()
+                .with_ownership_mode(ObservationMode::Required)
+                .with_timestamps(ObservationMode::Required),
+        )
+    }
+
+    async fn observe_bound(
+        &self,
+        path: &StoragePath,
+        expected: &crate::model::SourceIdentity,
+        plan: ObservationPlan,
+    ) -> Result<MetadataObservations, StorageRoleFailure> {
+        let entry = self.bound_entry(path, expected).await?;
         self.observe_entry(path, plan, entry).await
+    }
+
+    /// An owner or group nfs-rs could not map is copied the way a mode-only source is: the mode is
+    /// carried, and owner and group are recorded as dropped — never as a made-up id, and never as a
+    /// failure, because the destination can still take everything else.
+    async fn observe_copy_bound(
+        &self,
+        path: &StoragePath,
+        expected: &crate::model::SourceIdentity,
+        plan: ObservationPlan,
+    ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
+        let entry = self.bound_entry(path, expected).await?;
+        let mode_without_ownership =
+            (entry.uid.is_none() || entry.gid.is_none()).then_some(entry.mode & 0o7777);
+        let plan = if mode_without_ownership.is_some() {
+            plan.with_ownership_mode(ObservationMode::Omit)
+        } else {
+            plan
+        };
+        Ok(CopiedMetadataObservation {
+            observations: self.observe_entry(path, plan, entry).await?,
+            owner_names_unmapped: mode_without_ownership.is_some(),
+            mode_without_ownership,
+        })
     }
 
     async fn observe(
@@ -289,6 +333,34 @@ fn inline<T>(mode: ObservationMode, value: T) -> MetadataObservation<T> {
     }
 }
 
+/// An owner or group the server named and nfs-rs could not map has no number to report, and one
+/// made up would be written as the owner (see `nfs::owner_id`).
+fn ownership(
+    mode: ObservationMode,
+    entry: &NfsMetadataInline,
+) -> MetadataObservation<OwnershipMode> {
+    match (entry.uid, entry.gid) {
+        (Some(uid), Some(gid)) => inline(
+            mode,
+            OwnershipMode {
+                uid,
+                gid,
+                mode: entry.mode,
+            },
+        ),
+        _ => unmapped(mode),
+    }
+}
+
+/// No value to give: the observation says so instead of carrying a made-up one.
+fn unmapped<T>(mode: ObservationMode) -> MetadataObservation<T> {
+    if mode == ObservationMode::Omit {
+        MetadataObservation::NotRequested
+    } else {
+        MetadataObservation::Unsupported
+    }
+}
+
 fn optional_not_applicable<T>(mode: ObservationMode) -> MetadataObservation<T> {
     if mode == ObservationMode::Omit {
         MetadataObservation::NotRequested
@@ -335,346 +407,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::super::source::role_failure;
-    use super::*;
-    use crate::model::{FailureClass, Transience};
-
-    struct CancellingProtocol {
-        cancel: tokio_util::sync::CancellationToken,
-        sets: AtomicUsize,
-        xattrs_supported: bool,
-    }
-
-    #[async_trait]
-    impl NfsMetadataProtocol for CancellingProtocol {
-        async fn stat(&self, _path: &StoragePath) -> Result<NfsMetadataInline, NfsProtocolFailure> {
-            self.sets.fetch_add(1, Ordering::SeqCst);
-            Ok(NfsMetadataInline {
-                file_handle: bytes::Bytes::from_static(b"source-handle"),
-                symlink: false,
-                uid: Some(12345),
-                gid: Some(12346),
-                mode: 0o640,
-                atime: 1_700_000_000_123_456_789,
-                mtime: 1_700_000_001_123_456_789,
-                ctime: 1_700_000_002_123_456_789,
-            })
-        }
-        fn supports_acl(&self) -> bool {
-            true
-        }
-        fn supports_xattrs(&self) -> bool {
-            self.xattrs_supported
-        }
-        async fn get_acl(&self, _path: &StoragePath) -> Result<nfs_rs::Acl, NfsProtocolFailure> {
-            Err(NfsProtocolFailure::protocol())
-        }
-        async fn get_xattrs(
-            &self,
-            _path: &StoragePath,
-        ) -> Result<Vec<ExtendedAttribute>, NfsProtocolFailure> {
-            Err(NfsProtocolFailure::protocol())
-        }
-        async fn set_acl(
-            &self,
-            _path: &StoragePath,
-            _acl: &nfs_rs::Acl,
-        ) -> Result<(), NfsProtocolFailure> {
-            Err(NfsProtocolFailure::protocol())
-        }
-        async fn set_xattr(
-            &self,
-            _path: &StoragePath,
-            _value: &ExtendedAttribute,
-        ) -> Result<(), NfsProtocolFailure> {
-            self.sets.fetch_add(1, Ordering::SeqCst);
-            self.cancel.cancel();
-            Ok(())
-        }
-        async fn set_numeric_ownership(
-            &self,
-            _path: &StoragePath,
-            _value: OwnershipMode,
-        ) -> Result<(), NfsProtocolFailure> {
-            Err(NfsProtocolFailure::protocol())
-        }
-        async fn set_mode(&self, _path: &StoragePath, mode: u32) -> Result<(), NfsProtocolFailure> {
-            // Any unexpected stat first increments `sets`, making this assertion fail.
-            self.sets
-                .compare_exchange(0, mode as usize, Ordering::SeqCst, Ordering::SeqCst)
-                .map_err(|_| NfsProtocolFailure::protocol())?;
-            Ok(())
-        }
-        async fn set_timestamps(
-            &self,
-            _path: &StoragePath,
-            _value: TimestampMetadata,
-        ) -> Result<(), NfsProtocolFailure> {
-            Err(NfsProtocolFailure::protocol())
-        }
-    }
-
-    /// Application goes on past a refusal only while it is entry-scoped: a session-scoped failure
-    /// ends every write after it, so application stops there. A server refusing SETACL therefore
-    /// has to stay entry-scoped, or the families after it would never be applied or reported.
-    /// This pins the class-to-scope step (only a lost connection is session-scoped); the status to
-    /// class step is `classify_error`'s.
-    #[tokio::test]
-    async fn a_refused_setacl_stays_entry_scoped_and_only_a_lost_connection_does_not() {
-        let protocol = Arc::new(CancellingProtocol {
-            cancel: tokio_util::sync::CancellationToken::new(),
-            sets: AtomicUsize::new(0),
-            xattrs_supported: false,
-        });
-        let identity = crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "dest")
-            .unwrap_or_else(|error| panic!("{error}"));
-        let adapter = NfsMetadataAdapter::new(protocol, identity);
-        let path = StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
-        let acl = acl::encode(&nfs_rs::Acl::default()).unwrap_or_else(|error| panic!("{error:?}"));
-        let refused = adapter
-            .apply(
-                &path,
-                MetadataMutation::Acl(acl),
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .await;
-        assert!(
-            matches!(refused, Err(StorageRoleFailure::Entry(_))),
-            "{refused:?}"
-        );
-        for class in [
-            FailureClass::Protocol,
-            FailureClass::PermissionDenied,
-            FailureClass::Unsupported,
-            FailureClass::InvalidInput,
-        ] {
-            let failure = NfsProtocolFailure {
-                class,
-                transience: Transience::Permanent,
-            };
-            assert!(matches!(
-                role_failure(&path, crate::model::Operation::Metadata, failure),
-                StorageRoleFailure::Entry(_)
-            ));
-        }
-        let lost = NfsProtocolFailure {
-            class: FailureClass::Connectivity,
-            transience: Transience::Transient,
-        };
-        assert!(matches!(
-            role_failure(&path, crate::model::Operation::Metadata, lost),
-            StorageRoleFailure::Session(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn automatic_metadata_is_bound_to_the_described_handle() {
-        let protocol = Arc::new(CancellingProtocol {
-            cancel: tokio_util::sync::CancellationToken::new(),
-            sets: AtomicUsize::new(0),
-            xattrs_supported: true,
-        });
-        let identity = crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "source")
-            .unwrap_or_else(|error| panic!("{error}"));
-        let adapter = NfsMetadataAdapter::new(protocol.clone(), identity.clone());
-        let plan = adapter
-            .copied_metadata_observation_plan()
-            .unwrap_or_else(|| panic!("metadata observation plan must be present"));
-        let path = StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
-        for (handle, matches) in [
-            (b"source-handle".as_slice(), true),
-            (b"replaced-handle".as_slice(), false),
-        ] {
-            let expected = crate::model::SourceIdentity::new(
-                identity.clone(),
-                crate::model::IdentityStrength::StableWithinBackend,
-                handle,
-            )
-            .unwrap_or_else(|error| panic!("{error}"));
-            let result = adapter.observe_bound(&path, &expected, plan).await;
-            if matches {
-                let observations = result.unwrap_or_else(|error| panic!("{error}"));
-                assert!(
-                    matches!(observations.ownership_mode(), MetadataObservation::Value { value, .. } if *value == OwnershipMode { uid: 12345, gid: 12346, mode: 0o640 })
-                );
-                assert!(
-                    matches!(observations.timestamps(), MetadataObservation::Value { value, .. } if value.modified.is_some_and(|modified| modified.unix_nanos() == 1_700_000_001_123_456_789))
-                );
-                assert!(matches!(
-                    observations.acl(),
-                    MetadataObservation::NotRequested
-                ));
-                assert!(matches!(
-                    observations.xattrs(),
-                    MetadataObservation::NotRequested
-                ));
-            } else {
-                assert!(
-                    matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict)
-                );
-            }
-        }
-        // One stat supplies both the handle and baseline attributes; no extra identity RPC.
-        assert_eq!(protocol.sets.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn automatic_metadata_does_not_substitute_root_for_unknown_ownership() {
-        let protocol = Arc::new(CancellingProtocol {
-            cancel: tokio_util::sync::CancellationToken::new(),
-            sets: AtomicUsize::new(0),
-            xattrs_supported: true,
-        });
-        let identity = crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "source")
-            .unwrap_or_else(|error| panic!("{error}"));
-        let adapter = NfsMetadataAdapter::new(protocol.clone(), identity);
-        let path = StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
-        for missing_uid in [true, false] {
-            let mut entry = protocol
-                .stat(&path)
-                .await
-                .unwrap_or_else(|_| panic!("stat failed"));
-            if missing_uid {
-                entry.uid = None;
-            } else {
-                entry.gid = None;
-            }
-            let result = adapter
-                .observe_entry(
-                    &path,
-                    adapter
-                        .copied_metadata_observation_plan()
-                        .unwrap_or_else(|| panic!("metadata observation plan must be present")),
-                    entry,
-                )
-                .await;
-            assert!(
-                matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Unsupported)
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn modes_avoid_unrequested_or_unsupported_storage_calls() {
-        for (mode, supported, expected) in [
-            (
-                ObservationMode::Omit,
-                true,
-                MetadataObservation::NotRequested,
-            ),
-            (
-                ObservationMode::InlineOnly,
-                true,
-                MetadataObservation::NotRequested,
-            ),
-            (
-                ObservationMode::Required,
-                false,
-                MetadataObservation::Unsupported,
-            ),
-        ] {
-            let calls = AtomicUsize::new(0);
-            let result = observe_optional(&StoragePath::root(), mode, supported, || async {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, super::super::source::NfsProtocolFailure>(7_u8)
-            })
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-            assert_eq!(result, expected);
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn optional_failure_policy_preserves_entry_scope() {
-        let path = StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
-        let failure = super::super::source::NfsProtocolFailure {
-            class: FailureClass::PermissionDenied,
-            transience: Transience::Permanent,
-        };
-        let observed = observe_optional(&path, ObservationMode::BestEffort, true, || async {
-            Err::<u8, _>(failure)
-        })
-        .await
-        .unwrap_or_else(|error| panic!("{error}"));
-        assert!(matches!(
-            observed,
-            MetadataObservation::Failed {
-                class: FailureClass::PermissionDenied,
-                ..
-            }
-        ));
-
-        let required = observe_optional(&path, ObservationMode::Required, true, || async {
-            Err::<u8, _>(failure)
-        })
-        .await;
-        assert!(matches!(required, Err(StorageRoleFailure::Entry(error)) if error.path() == &path));
-    }
-
-    #[tokio::test]
-    async fn xattr_apply_stops_before_the_next_remote_mutation_after_cancel() {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let protocol = Arc::new(CancellingProtocol {
-            cancel: cancel.clone(),
-            sets: AtomicUsize::new(0),
-            xattrs_supported: true,
-        });
-        let adapter = NfsMetadataAdapter::new(
-            protocol.clone(),
-            crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "metadata-test")
-                .unwrap_or_else(|error| panic!("{error}")),
-        );
-        let values = vec![
-            ExtendedAttribute::new(b"one".to_vec(), b"1".to_vec())
-                .unwrap_or_else(|error| panic!("{error}")),
-            ExtendedAttribute::new(b"two".to_vec(), b"2".to_vec())
-                .unwrap_or_else(|error| panic!("{error}")),
-        ];
-        let result = adapter
-            .apply(
-                &StoragePath::new("file").unwrap_or_else(|error| panic!("{error}")),
-                MetadataMutation::Xattrs(values),
-                cancel,
-            )
-            .await;
-        assert!(result.is_err());
-        assert_eq!(protocol.sets.load(Ordering::SeqCst), 1);
-    }
-    #[tokio::test]
-    async fn mode_only_apply_never_observes_or_rewrites_numeric_ownership()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let protocol = Arc::new(CancellingProtocol {
-            cancel: tokio_util::sync::CancellationToken::new(),
-            sets: AtomicUsize::new(0),
-            xattrs_supported: false,
-        });
-        let adapter = NfsMetadataAdapter::new(
-            protocol.clone(),
-            crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "mode-only")?,
-        );
-        let path = StoragePath::new("file")?;
-        adapter
-            .apply(
-                &path,
-                MetadataMutation::Mode(0o640),
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .await?;
-        assert_eq!(protocol.sets.load(Ordering::SeqCst), 0o640);
-        let cancel = tokio_util::sync::CancellationToken::new();
-        cancel.cancel();
-        let result = adapter
-            .apply(&path, MetadataMutation::Mode(0o600), cancel)
-            .await;
-        assert!(
-            matches!(result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled)
-        );
-        assert_eq!(protocol.sets.load(Ordering::SeqCst), 0o640);
-        Ok(())
-    }
-}
+#[path = "metadata_tests.rs"]
+mod tests;

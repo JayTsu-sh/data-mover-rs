@@ -193,6 +193,9 @@ const fn loss_text(loss: SemanticLoss) -> &'static str {
         SemanticLoss::TagsDropped => "the object tags",
         SemanticLoss::OwnershipModeDropped => "owner, group and mode",
         SemanticLoss::OwnerAndGroupDropped => "owner and group (mode is kept)",
+        SemanticLoss::OwnerAndGroupUnmapped => {
+            "owner and group (the source's names could not be mapped to ids; mode is kept)"
+        }
         SemanticLoss::TimestampPrecisionReduced => "timestamp precision",
         SemanticLoss::AccessedTimestampDropped => "the access time",
         SemanticLoss::ModifiedTimestampDropped => "the modification time",

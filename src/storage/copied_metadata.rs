@@ -55,4 +55,8 @@ pub enum CopiedOwnershipTarget {
 pub struct CopiedMetadataObservation {
     pub observations: MetadataObservations,
     pub mode_without_ownership: Option<u32>,
+    /// Why owner and group are missing when `mode_without_ownership` is set: the source named them
+    /// and the names could not be mapped to ids (an `NFSv4` owner nfs-rs cannot parse), rather
+    /// than a source that has no numeric owner at all (HDFS). Reported as its own loss.
+    pub owner_names_unmapped: bool,
 }

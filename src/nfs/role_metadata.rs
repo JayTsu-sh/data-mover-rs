@@ -37,8 +37,8 @@ impl NfsMetadataProtocol for NFSStorage {
         Ok(NfsMetadataInline {
             file_handle,
             symlink: attrs.type_ == super::FType3::NF3LNK as u32,
-            uid: Some(attrs.uid),
-            gid: Some(attrs.gid),
+            uid: super::owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
+            gid: super::owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
             mode: attrs.file_mode,
             atime: super::time_to_i64(attrs.atime),
             mtime: super::time_to_i64(attrs.mtime),

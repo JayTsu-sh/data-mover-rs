@@ -15,7 +15,7 @@ use futures::stream::FuturesOrdered;
 use moka::sync::Cache;
 // nfs_rs 错误类型，用于直接匹配 error code
 use nfs_rs::NfsError;
-use nfs_rs::{Attr, ExportEntry, Mount, OPEN_READ, OPEN_WRITE, Time, WriteOutcome};
+use nfs_rs::{Attr, ExportEntry, Mount, NFSVersion, OPEN_READ, OPEN_WRITE, Time, WriteOutcome};
 use path_clean::PathClean;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -44,7 +44,10 @@ use crate::{
     StorageEntryMessage, WalkDirAsyncIterator,
 };
 
+mod owner;
 mod role_metadata;
+
+pub(crate) use owner::owner_id;
 
 type NfsWalkTask = (String, Bytes, usize, bool, Option<usize>);
 
@@ -142,9 +145,12 @@ impl NASEntry {
         attrs: &nfs_rs::Attr,
         file_handle: Bytes,
         enrich: NfsEnrich,
+        owners_are_strings: bool,
     ) -> Self {
         let is_dir = attrs.type_ == FType3::NF3DIR as u32;
         let is_symlink = attrs.type_ == FType3::NF3LNK as u32;
+        let uid = owner_id(&attrs.owner, attrs.uid, owners_are_strings);
+        let gid = owner_id(&attrs.owner_group, attrs.gid, owners_are_strings);
         Self {
             name,
             relative_path,
@@ -154,12 +160,18 @@ impl NASEntry {
             mtime: time_to_i64(attrs.mtime),
             atime: time_to_i64(attrs.atime),
             ctime: time_to_i64(attrs.ctime),
-            mode: attrs.file_mode,
+            // Every legacy consumer applies this mode, and skips the chown for an owner it lacks.
+            mode: crate::model::without_unowned_set_id(
+                attrs.file_mode,
+                uid.is_some(),
+                gid.is_some(),
+                is_dir,
+            ),
             hard_links: Some(attrs.nlink),
             is_symlink,
             file_handle: Some(file_handle),
-            uid: Some(attrs.uid),
-            gid: Some(attrs.gid),
+            uid,
+            gid,
             ino: Some(attrs.fsid),
             acl: enrich.acl,
             owner: enrich.owner,
@@ -2871,6 +2883,7 @@ impl NFSStorage {
             &attrs,
             obj.fh,
             NfsEnrich::from_attrs(&attrs),
+            self.owners_are_strings(),
         ));
 
         Ok(storage_entry)
@@ -2965,8 +2978,14 @@ impl NFSStorage {
 
     /// 查询 NFS 版本
     #[must_use]
-    pub fn version(&self) -> nfs_rs::NFSVersion {
+    pub fn version(&self) -> NFSVersion {
         self.mount.version()
+    }
+
+    /// Whether this mount's owners arrive as strings (`NFSv4`) rather than numbers (`NFSv3`); see
+    /// [`owner_id`].
+    pub(crate) fn owners_are_strings(&self) -> bool {
+        !matches!(self.mount.version(), NFSVersion::NFSv3)
     }
 
     /// 返回当前已协商实例报告的 ACL 能力。
@@ -3568,6 +3587,7 @@ impl NFSStorage {
             &attrs,
             entry.handle.clone(),
             NfsEnrich::from_attrs(&attrs).with_xattrs(xattrs),
+            self.owners_are_strings(),
         ));
 
         let Some(send_packaged) = Self::packaged_entry_decision(
@@ -4410,6 +4430,7 @@ impl NFSStorage {
                     &attrs,
                     entry.handle,
                     NfsEnrich::default(),
+                    self.owners_are_strings(),
                 )));
 
                 if skip_entry {
@@ -4548,6 +4569,7 @@ impl NFSStorage {
                 // entry for nothing, which at fifty million entries is not nothing. Restore
                 // `from_attrs` here the moment that observation starts reporting them.
                 NfsEnrich::default(),
+                self.owners_are_strings(),
             )));
         }
         Ok(Ok(entries))
