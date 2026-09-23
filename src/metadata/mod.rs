@@ -14,6 +14,10 @@ use crate::storage::{
     StorageRoleFailure,
 };
 
+mod errors;
+
+pub use errors::{MetadataApplicationFailure, MetadataPlanError, MetadataPlanErrorKind};
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MetadataFamily {
     Acl,
@@ -190,52 +194,6 @@ impl LossReport {
         self.0.is_empty()
     }
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MetadataPlanErrorKind {
-    KnownLossRejected,
-    ExternalMappingRequired,
-    Unsupported,
-    ObservationFailed,
-    ObservationRequired,
-    PrincipalMappingFailed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MetadataPlanError {
-    family: MetadataFamily,
-    kind: MetadataPlanErrorKind,
-}
-
-impl MetadataPlanError {
-    /// Builds one refusal. Callers outside this module only ever read refusals; this exists so
-    /// their tests can state the case they are checking instead of provoking it.
-    #[cfg(test)]
-    pub(crate) const fn new(family: MetadataFamily, kind: MetadataPlanErrorKind) -> Self {
-        Self { family, kind }
-    }
-
-    #[must_use]
-    pub const fn family(self) -> MetadataFamily {
-        self.family
-    }
-    #[must_use]
-    pub const fn kind(self) -> MetadataPlanErrorKind {
-        self.kind
-    }
-}
-
-impl fmt::Display for MetadataPlanError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "metadata {:?} planning failed: {:?}",
-            self.family, self.kind
-        )
-    }
-}
-
-impl std::error::Error for MetadataPlanError {}
 
 pub struct MetadataPlanRequest<'a> {
     pub observations: &'a MetadataObservations,
@@ -496,38 +454,6 @@ impl MetadataApplicationReport {
         &self.outcomes
     }
 }
-
-#[derive(Debug)]
-pub struct MetadataApplicationFailure {
-    family: MetadataFamily,
-    /// Boxed so the whole `Result` stays small: the role failure carries paths and diagnostic
-    /// strings, and every successful application would otherwise pay for its size.
-    error: Option<Box<StorageRoleFailure>>,
-    report: MetadataApplicationReport,
-}
-
-impl MetadataApplicationFailure {
-    #[must_use]
-    pub const fn family(&self) -> MetadataFamily {
-        self.family
-    }
-    #[must_use]
-    pub fn storage_error(&self) -> Option<&StorageRoleFailure> {
-        self.error.as_deref()
-    }
-    #[must_use]
-    pub const fn report(&self) -> &MetadataApplicationReport {
-        &self.report
-    }
-}
-
-impl fmt::Display for MetadataApplicationFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "metadata {:?} application failed", self.family)
-    }
-}
-
-impl std::error::Error for MetadataApplicationFailure {}
 
 /// Compiles all mappings before a target mutation can be issued.
 ///
