@@ -12,7 +12,7 @@
 - backend 使用 smb-rs domain facade：`Client → Session → Share → File / Directory`。
 - data-mover 不得重新依赖 smb-rs 的 connection、runtime、wire create/query/set 类型或协议 handle。
 - `smb_domain::protocol` 只允许用于 lossless ACL codec 等明确的协议值边界，普通 I/O 不使用。
-- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = 9f68e92... }`
+- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = 91e6cfb... }`
   (smb-rs main 顶端 = PR #70 + #71 + #72 + #73。#70/#71 给出 metadata-timestamps、目录 rename、
   `GuestPolicy`，并删掉约 2400 行从未接线的 lease-slot 缓存 / multichannel 残留 / 未用协议
   helper (`runtime/port.rs` 的 `Legacy*` 别名改为 `Protocol*`)；#72 把 `QUERY_DIRECTORY` 本来
@@ -277,6 +277,16 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 
 ## 升级 smb-rs 依赖
 
+> 2026-09-23：`ced48ff` → main 顶端 **`91e6cfb`**（#82 `c81c75a` runtime / CMAC 签名批处理 / crypto
+> executor / session setup / dialects / domain security，#83 预备阶段取消修复）。协议层变更，第 4 步完整
+> 矩阵在 `91e6cfb` 上跑了两轮：policy contract ×2、namespace ×2、probe ×2，全过；匿名 share 一档未跑
+> （`.env` 不设 `CIFS_REAL_GUEST_POLICY`，且 SVM 域控发现问题见下方证据表）。smb-rs 自己的 CI 对该提交
+> 为绿。data-mover 代码无需改动。`Cargo.lock` 随 sspi 0.21.3 更新了一串 crypto 预发布依赖
+> （ed25519 / rsa / p256… / signature 3.0.0）并把 uuid 升到 1.26.1（semver 范围内）。
+> **行为变化**：domain `query_security` / `set_security` 只保留 account 类 ACE（域账户 S-1-5-21-…、
+> POSIX 映射 S-1-22-1/2-x、Everyone、SYSTEM），其余（BUILTIN\Administrators、CREATOR OWNER…）在读与写
+> 两侧都被丢弃 —— smb-rs 有意为之，用户确认 CIFS→CIFS 只复制 account ACE，不记为损失。
+>
 > 2026-09-18 (三)：smb-rs **PR #78** (issue #77) 合入 main，顶端 `79d50c0`：连接被 drop (未
 > `close()`) 后恢复任务不再对已失效的 `Weak` 按退避重试三次并误报 `AttemptsExhausted`；
 > bootstrap 报 `Closed` 即结束恢复。真机验证过恢复本身可用：generation 退出后 reconnect、会话

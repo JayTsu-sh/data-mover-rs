@@ -47,7 +47,7 @@ reqwest = { version = "0.13.2", default-features = false, features = [
 ] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive", "rc"] }
-smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "ced48ff2f73af3f5affcab07f0d92075b364c64e" }
+smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "91e6cfb6fe1332a1f1d13d2192b0ec996c0f08b0" }
 soft-canonicalize = "0.5.5"
 thiserror = "2.0.18"
 tokio = { version = "1.51.1", features = ["full"] }
