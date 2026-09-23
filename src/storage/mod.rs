@@ -6,6 +6,7 @@ mod capability;
 mod copied_metadata;
 mod create_dir;
 mod delete_tree;
+mod descriptor;
 pub(crate) mod durability;
 mod factory;
 mod handle;
@@ -33,6 +34,7 @@ pub use delete_tree::{
     DeleteTreeCompletion, DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest, DeleteTreeSession,
     DeleteTreeTerminalFailure, delete_tree,
 };
+pub use descriptor::SourceDescriptor;
 pub use factory::{
     BackendConfig, BackendConnectError, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy,
     HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, connect_backend,
@@ -43,8 +45,8 @@ pub use roles::{
     NamespaceRequest, NamespaceResult, PositionedByteStream, PositionedChunk, PrepareRequest,
     PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
     ReadRequest, ReadSource, RecoverRequest, RecoveryIdentity, RecoveryValueError,
-    SourceDescriptor, StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure,
-    VerificationEvidence, VerifyRequest, WriteEvidence,
+    StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure, VerificationEvidence,
+    VerifyRequest, WriteEvidence,
 };
 pub(crate) use roles::{CheckpointRegistration, DeferredCheckpoint};
 
