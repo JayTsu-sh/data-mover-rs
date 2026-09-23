@@ -385,7 +385,10 @@ pub struct TransferOutcome {
 /// HDFS preserves mode while retaining its destination-native owner/group principals. Metadata
 /// is observed against the described source identity and applied before publication; callers
 /// need not apply it again.
-/// Access time, change time, ACLs and extended attributes are not part of this default copy.
+/// Access time and change time are not part of any copy. ACLs and extended attributes are not
+/// part of the default one either, but a caller can ask for them with
+/// [`TransferRequest::with_copied_metadata`]; whether they are carried then depends on what both
+/// ends can do. See `.claude/docs/metadata-negotiation.md`.
 ///
 /// # Errors
 /// Returns a phase- and side-attributed failure while retaining an owned staged state whenever

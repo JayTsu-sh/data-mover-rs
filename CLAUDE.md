@@ -34,6 +34,7 @@
 | 改 NDX 分页遍历 (legacy walkdir_2 的中立替身) | `src/ndx_walk.rs` (crate 根，与 `filter_traversal` 同层) + `src/dir_tree.rs` (`run_dfs_driver` 不要动) |
 | 改递归建目录 | `src/storage/create_dir.rs` (走 `Namespace` 角色，backend 无关) |
 | 改跨端完整性比对 | `src/integrity/mod.rs` (走 `ReadSource` + `Metadata` 角色) |
+| 改拷贝带哪些元数据 / ACL / xattr 开关 | `.claude/docs/metadata-negotiation.md` + `src/transfer/engine.rs` + `src/metadata/mod.rs` |
 | 改 error 变体或 retry 映射 | `.claude/docs/error-taxonomy.md` + `src/error.rs` |
 | 改时间转换 (FileTime / NFS Time) | `src/time_util.rs` (单文件直读) |
 | 改 ACL / xattr | `src/acl.rs` + `.claude/docs/storage-{nfs,local}.md` |
