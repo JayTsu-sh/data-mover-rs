@@ -206,6 +206,13 @@ impl Metadata for NfsMetadataAdapter {
         }
         let result = match mutation {
             MetadataMutation::Acl(value) => {
+                // The xattr branch below has always checked this. Without the same check here a
+                // mount that never negotiated ACL support still sends a SETACL, and the caller
+                // gets whatever protocol error comes back instead of the typed refusal that says
+                // the destination cannot do this at all.
+                if !self.protocol.supports_acl() {
+                    return Err(unsupported(path));
+                }
                 let value = acl::decode(&value).map_err(|_| {
                     super::source::entry_failure(
                         path,
