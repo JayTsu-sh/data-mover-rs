@@ -2921,6 +2921,28 @@ impl NFSStorage {
         gid: Option<u32>,
         mode: Option<u32>,
     ) -> Result<()> {
+        self.setattr_retrying(file, atime, mtime, uid, gid, mode)
+            .await?
+            .map_err(|e| {
+                StorageError::NfsError(format!(
+                    "Failed to set file metadata: {}, {e:?}",
+                    file.path.display()
+                ))
+            })
+    }
+
+    /// SETATTR with the stale-handle retry. The outer error is our own step failing (re-lookup,
+    /// time conversion); the inner one is the server's answer to the SETATTR itself, kept as
+    /// nfs-rs gave it so a caller can classify it and name its status.
+    pub(crate) async fn setattr_retrying(
+        &self,
+        file: &NFSFileHandle,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: Option<u32>,
+    ) -> Result<std::result::Result<(), NfsError>> {
         debug!("Setting metadata for {:?}", file.path);
 
         // 转换纳秒时间戳到Time类型
@@ -2945,7 +2967,7 @@ impl NFSStorage {
                 )
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(Ok(())),
                 Err(e) => {
                     if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
@@ -2962,10 +2984,7 @@ impl NFSStorage {
                         current_fh = fresh_obj.fh;
                         continue;
                     }
-                    return Err(StorageError::NfsError(format!(
-                        "Failed to set file metadata: {}, {e:?}",
-                        file.path.display()
-                    )));
+                    return Ok(Err(e));
                 }
             }
         }
