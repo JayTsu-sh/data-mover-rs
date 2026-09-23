@@ -73,7 +73,8 @@
 |---|---|---|
 | tokio | 1.51.1 (full) | 异步 runtime |
 | smb-domain (package `smb`) | git JayTsu-sh/smb-rs `91e6cfb` (main，PR #83) | CIFS/SMB 协议栈 (domain facade) |
-| nfs-rs | 0.2.0 | NFS v3/v4 客户端 |
+| nfs-rs | 0.8.4 | NFS v3/v4 客户端 |
+| hdfs-native | git kimahriman/hdfs-native `695fc47` (上游 master) | HDFS 客户端 (hsync / recover_lease) |
 | aws-sdk-s3 | 1.129.0 | S3 SDK |
 | binrw | 0.15 | CIFS FileTime / 目录条目二进制解析 |
 | blake3 | 1.8.4 | 完整性校验 |

@@ -62,7 +62,7 @@
   经项目授权的 git 固定：`smb-domain` (package `smb`) 固定 JayTsu-sh/smb-rs 已验证提交
   `91e6cfb` (smb-rs main 顶端，2026-09-23：#83 预备阶段取消修复、#82 runtime / 签名批处理 / 真机
   CIFS 验收，domain ACL 只保留 account 类 ACE —— 有意为之；其前 #78 drop 连接即结束恢复、#76 丢流 /
-  未建模 NTSTATUS 不再致命、#74 64 位 file id、#72 列举元数据、#73 始终直接 SMB2 协商)，`hdfs-native` 固定 fork 提交。不得使用浮动 branch。smb-rs 历史 API 依赖已随 legacy `CifsStorage` 删除 (#150)。
+  未建模 NTSTATUS 不再致命、#74 64 位 file id、#72 列举元数据、#73 始终直接 SMB2 协商)，`hdfs-native` 固定上游 kimahriman/hdfs-native master 提交 `695fc47` (2026-09-23 从 JayTsu-sh fork `373739f` 切回；fork 的 hsync / recover_lease 已并入上游)。不得使用浮动 branch。smb-rs 历史 API 依赖已随 legacy `CifsStorage` 删除 (#150)。
 
 ## 文件大小现状 (backlog，不是新增红线)
 

@@ -63,6 +63,10 @@ the explicit lease RPC. NameNode completion and rename provide the namespace ope
 adapter does not invent a Local directory `fsync` equivalent. The dependency contract checks the
 public lease-recovery and hsync assumptions.
 
+The pin later moved (2026-09-23) to upstream `kimahriman/hdfs-native` master `695fc47`, which
+contains the fork's hsync and lease-recovery commits; `client.rs`, `file.rs` and
+`hdfs/block_writer.rs` are byte-identical to `373739f`, so the evidence below still applies.
+
 Evidence: [native client](https://github.com/JayTsu-sh/hdfs-native/blob/373739fc0fb69f3f3cd2a32db58170d8cf83a514/rust/src/client.rs),
 [native file writer](https://github.com/JayTsu-sh/hdfs-native/blob/373739fc0fb69f3f3cd2a32db58170d8cf83a514/rust/src/file.rs),
 [native block writer](https://github.com/JayTsu-sh/hdfs-native/blob/373739fc0fb69f3f3cd2a32db58170d8cf83a514/rust/src/hdfs/block_writer.rs),
