@@ -26,10 +26,19 @@ NFS_DENY_DIR=/data/no-access     # 用于测 EACCES (服务器侧设置 0700 roo
 4. nfs_opt_dir 创建优化目录结构 — 应成功 (含已存在目录)。
 5. **retry taxonomy 验证**：访问 NFS_DENY_DIR (设为 0700 root-only) — 应直接 PermissionDenied，**不重试**。
 
+6. **ACL / xattr 拷贝策略矩阵**（可选，需 `NFS_META_V41_EXPORT`）：
+   `bash .claude/skills/e2e-nfs/scripts/metadata_matrix.sh`。用 `examples/nfs_metadata_copy.rs`
+   逐档验证 `CopiedMetadataRequest`：NFSv3 源的 `BestEffort` 成功且标 `Unsupported`、`RequireExact`
+   被拒；NFSv4.1 同端 `RequireExact` / `BestEffort` 下源端打标记的 ACL 原样到达（raw GETACL 回读比对，
+   `--acl omit` 作阴性对照必须失败）；xattr `RequireExact` 在无 named attributes 的导出上被拒；
+   设了 `CIFS_REAL_*` 时再验 NFSv4 → CIFS 的编码不同：`RequireExact` 与 `AllowKnownLoss` 都拒绝、
+   `BestEffort` 成功。语义见 `.claude/docs/metadata-negotiation.md`。
+
 ## 成功判据
 
 - 1-4 退出码 = 0
 - 5 错误必须是 `PermissionDenied`，且日志中**不应有** retry/backoff 字样
+- 6 末行 `RESULT pass=N fail=0`，退出码 0
 
 ## 失败如何排查
 

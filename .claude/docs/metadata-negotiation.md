@@ -82,6 +82,32 @@ atime / ctime 任何情况下都不拷。
 **取消永远不被容忍。** `BestEffort` 吸收的是「目的端说不」，取消不是。两条路径都按
 「token 已触发 **或** 失败类别为 `Cancelled`」判定 —— 被打断的请求可能报成别的类别。
 
+## 真机证据（2026-09-23，`examples/nfs_metadata_copy.rs`）
+
+入口：`.claude/skills/e2e-nfs/scripts/metadata_matrix.sh`，13 档全过。环境：m1-source（NFSv3，只读源）、
+FAS2750 `ontap_lisaauto_nfs`（ONTAP 9.19.1，NFSv4.1）与同机 CIFS share。
+
+| 路径 | 策略 | 结果 |
+|---|---|---|
+| NFSv3 → NFSv4.1 | ACL + xattr `BestEffort` | 拷贝成功，两族都记 `Unsupported` |
+| NFSv3 → NFSv4.1 | ACL `RequireExact` | 规划期拒绝："one side does not support ACLs" |
+| NFSv4.1 → NFSv4.1 | ACL `RequireExact` / `BestEffort` | `Applied`，raw GETACL 回读与源**逐条相等且带标记** |
+| NFSv4.1 → NFSv4.1 | ACL `Omit`（阴性对照） | 目的端没有标记，校验按预期失败 |
+| NFSv4.1 → NFSv4.1 | xattr `RequireExact` | 拒绝：该导出没协商到 named attributes |
+| NFSv4.1 → CIFS | ACL `RequireExact` / `AllowKnownLoss` | 拒绝："need an external mapping"（后者由 `113c0be` 修正） |
+| NFSv4.1 → CIFS | ACL `BestEffort` | 拷贝成功，ACL 记 `Unsupported` |
+
+**这台 ONTAP 接受 SETACL**，`RequireExact` 的 ACL 真的落地 —— 不是只看报告：源端先加一条
+mode 表达不了的 ACE（`--mark-acl`），再从目的端读回比对。**不加标记的比对没有意义**：
+mode 是基线族，两端 ACL 都由同一个 mode 重建，`Omit` 也会「相等」。
+
+**不变式 1（mode 先于 ACL）在这台机器上无法证伪。** 把编译顺序临时对调成 ACL 在前，两种标记
+（新增主体 `12345`；给 `EVERYONE@` 加 `WRITE_ACL`）都照样到达。前者符合 ONTAP 的
+`v4-acl-preserve`（chmod 保留非 `OWNER@/GROUP@/EVERYONE@` 条目）；后者说明随后的 chmod 没有
+重建 `EVERYONE@` —— 最可能是目的端 mode 与 ONTAP 从同一份 ACL 推出的 mode 相同，chmod 是
+无变化写入。所以这条不变式的依据仍是 POSIX mask 与不保留 ACL 的服务器，真机上只能证明
+「按现顺序不丢」，证明不了「反顺序会丢」。
+
 ## 代价
 
 开 ACL/xattr 后源端每个文件多一次 GETACL + LISTXATTR/GETXATTR（NFS 的 `get_acl` 还带
