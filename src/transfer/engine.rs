@@ -5,12 +5,7 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
 
 use super::model::{InflightLimits, RecoveryContext, RecoveryRegistrationFailure};
-use super::{CopiedMetadataRequest, ReadBackVerification, TransferPolicy, TransferRequest};
-use crate::metadata::{
-    AclTarget, MetadataFamily, MetadataPlan, MetadataPlanError, MetadataPlanErrorKind,
-    MetadataPlanRequest, MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget,
-    TimestampTarget, TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
-};
+use super::{ReadBackVerification, TransferPolicy, TransferRequest};
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, Operation, SourceIdentity, StoragePath,
     Transience,
@@ -19,16 +14,17 @@ use crate::runtime::inflight::{
     InflightConfig, InflightFailure, InflightRuntime, OrderedChunks, ReadRange, SequentialRanges,
 };
 use crate::storage::{
-    CheckpointObservation, CopiedAclTarget, CopiedOwnershipTarget, CopiedValueTarget,
-    FinalDestination, NativePair, PreflightPolicy, PrepareRequest, PreparedStage,
-    PublicationDisposition, PublicationEvidence, PublishRequest, ReadRequest, ReadSource,
-    SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination, StorageRoleFailure,
-    VerifyRequest, WriteEvidence,
+    CheckpointObservation, FinalDestination, NativePair, PreflightPolicy, PrepareRequest,
+    PreparedStage, PublicationDisposition, PublicationEvidence, PublishRequest, ReadRequest,
+    ReadSource, SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination,
+    StorageRoleFailure, VerifyRequest, WriteEvidence,
 };
+use negotiation::{CopiedMetadataPlan, apply_copied_metadata, copied_metadata_plan};
 
 mod automatic;
 mod expert;
 mod native;
+mod negotiation;
 mod positioned;
 mod single;
 pub use expert::{
@@ -495,182 +491,6 @@ const fn transfer_route(data_path: TransferDataPath) -> TransferRoute {
     match data_path {
         TransferDataPath::Streaming => TransferRoute::Streaming,
         TransferDataPath::Native => TransferRoute::Native,
-    }
-}
-
-async fn apply_copied_metadata(
-    transferred: &Transferred,
-    copied: Option<&CopiedMetadataPlan>,
-    cancel: tokio_util::sync::CancellationToken,
-) -> Result<
-    Option<crate::metadata::MetadataApplicationReport>,
-    crate::metadata::MetadataApplicationFailure,
-> {
-    let Some(copied) = copied else {
-        return Ok(None);
-    };
-    copied
-        .plan
-        .apply_to_stage(transferred.destination.as_ref(), &transferred.stage, cancel)
-        .await
-        .map(Some)
-}
-
-pub(super) struct CopiedMetadataPlan {
-    plan: MetadataPlan,
-}
-
-async fn copied_metadata_plan(
-    request: &TransferRequest,
-    descriptor: &SourceDescriptor,
-) -> Result<Option<CopiedMetadataPlan>, TransferFailure> {
-    let requested = request.copied_metadata;
-    let Ok(metadata) = request.source.metadata(&PreflightPolicy::production()) else {
-        return refuse_unavailable(
-            requested,
-            "copied metadata was requested but the source has no metadata role",
-        );
-    };
-    let Some(baseline) = metadata.copied_metadata_observation_plan() else {
-        return refuse_unavailable(
-            requested,
-            "copied metadata was requested but the source copies none",
-        );
-    };
-    let Ok(destination) = request
-        .destination
-        .staged_destination(&PreflightPolicy::production())
-    else {
-        return refuse_unavailable(
-            requested,
-            "copied metadata was requested but the destination cannot stage",
-        );
-    };
-    let Some(target) = destination.copied_metadata_target() else {
-        return refuse_unavailable(
-            requested,
-            "copied metadata was requested but the destination copies none",
-        );
-    };
-    let observation_plan = baseline
-        .with_acl(observation_mode(requested.acl()))
-        .with_xattrs(observation_mode(requested.xattrs()));
-    let observations = metadata
-        .observe_copy_bound(
-            &request.source_path,
-            &descriptor.source_identity,
-            observation_plan,
-        )
-        .await
-        .map_err(|error| {
-            TransferFailure::role(TransferPhase::Metadata, TransferSide::Source, error)
-        })?;
-    let (ownership_mode, ownership_policy) = match target.ownership {
-        CopiedOwnershipTarget::Numeric => (OwnershipTarget::Numeric, MetadataPolicy::RequireExact),
-        CopiedOwnershipTarget::Unsupported => (
-            OwnershipTarget::NotApplicable,
-            MetadataPolicy::AllowKnownLoss,
-        ),
-        CopiedOwnershipTarget::ModeOnly => {
-            (OwnershipTarget::ModeOnly, MetadataPolicy::AllowKnownLoss)
-        }
-    };
-    let target = MetadataTarget {
-        // What the destination accepts, translated across the layer boundary: `storage` cannot
-        // name `metadata`'s vocabulary, and this is the layer that sees both. Whether a family is
-        // carried at all is the caller's request, which reaches the compiler as a policy below.
-        acl: match target.acl {
-            CopiedAclTarget::Encoding(encoding) => AclTarget::Encoding(encoding),
-            CopiedAclTarget::Unsupported => AclTarget::Unsupported,
-        },
-        xattrs: match target.xattrs {
-            CopiedValueTarget::Supported => ValueTarget::Supported,
-            CopiedValueTarget::Unsupported => ValueTarget::Unsupported,
-        },
-        tags: ValueTarget::NotApplicable,
-        ownership_mode,
-        timestamps: TimestampTargetCapability::Supported(TimestampTarget {
-            precision: target.timestamp_precision,
-            accessed: false,
-            modified: true,
-            created: false,
-        }),
-    };
-    let ownership_policy = if observations.mode_without_ownership.is_some() {
-        MetadataPolicy::AllowKnownLoss
-    } else {
-        ownership_policy
-    };
-    let policies = MetadataPolicies::default()
-        .with_ownership_mode(ownership_policy)
-        .with_timestamps(MetadataPolicy::AllowKnownLoss)
-        .with_acl(requested.acl())
-        .with_xattrs(requested.xattrs());
-    compile_copied_metadata_plan(
-        &MetadataPlanRequest {
-            observations: &observations.observations,
-            target,
-            policies,
-            principal_mapper: None,
-        },
-        observations.mode_without_ownership,
-    )
-    .map(|plan| Some(CopiedMetadataPlan { plan }))
-    .map_err(|error| TransferFailure::orchestration(TransferPhase::Metadata, refusal(error)))
-}
-
-/// Names the refusal a caller can act on. "One side cannot store ACLs at all" and "both sides can
-/// but their encodings differ" lead to different decisions, and a single message for every
-/// planning refusal hides which one happened. `TransferFailure` carries a `&'static str`, so the
-/// distinctions that matter get their own sentence and the rest share one.
-const fn refusal(error: MetadataPlanError) -> &'static str {
-    match (error.family(), error.kind()) {
-        (MetadataFamily::Acl, MetadataPlanErrorKind::Unsupported) => {
-            "copied ACL: one side does not support ACLs"
-        }
-        (MetadataFamily::Acl, MetadataPlanErrorKind::ExternalMappingRequired) => {
-            "copied ACL: the two sides use different encodings and need an external mapping"
-        }
-        (MetadataFamily::Acl, _) => "copied ACL: refused by policy",
-        (MetadataFamily::Xattrs, MetadataPlanErrorKind::Unsupported) => {
-            "copied extended attributes: one side does not support them"
-        }
-        (MetadataFamily::Xattrs, _) => "copied extended attributes: refused by policy",
-        _ => "copied metadata could not be planned",
-    }
-}
-
-/// What a family that was asked for but cannot be reached means for the transfer.
-///
-/// `BestEffort` is the one policy that says "carry it if you can" rather than "carry it", so it
-/// is the only one that may proceed with the baseline alone. Anything else asked for a family
-/// that no longer has a route, and silently dropping it is exactly the failure this parameter
-/// exists to prevent.
-fn refuse_unavailable(
-    requested: CopiedMetadataRequest,
-    reason: &'static str,
-) -> Result<Option<CopiedMetadataPlan>, TransferFailure> {
-    let demanded = [requested.acl(), requested.xattrs()]
-        .into_iter()
-        .any(|policy| !matches!(policy, MetadataPolicy::Omit | MetadataPolicy::BestEffort));
-    if demanded {
-        return Err(TransferFailure::orchestration(
-            TransferPhase::Metadata,
-            reason,
-        ));
-    }
-    Ok(None)
-}
-
-/// Translates a copy policy into how hard the source should look. `Omit` leaves the backend's own
-/// baseline alone rather than overriding it.
-fn observation_mode(policy: MetadataPolicy) -> crate::model::ObservationMode {
-    match policy {
-        MetadataPolicy::Omit => crate::model::ObservationMode::Omit,
-        MetadataPolicy::BestEffort => crate::model::ObservationMode::BestEffort,
-        MetadataPolicy::RequireExact | MetadataPolicy::AllowKnownLoss => {
-            crate::model::ObservationMode::Required
-        }
     }
 }
 
@@ -1655,82 +1475,6 @@ fn failure_side(error: &StorageRoleFailure) -> TransferSide {
             TransferSide::Source
         }
         StorageRoleFailure::Entry(_) | StorageRoleFailure::Session(_) => TransferSide::Destination,
-    }
-}
-
-#[cfg(test)]
-mod negotiation_tests {
-    use super::*;
-
-    /// `Omit` must leave the backend's own baseline plan alone rather than overriding it with
-    /// `Omit`, and the two demanding policies must both make the source actually look.
-    #[test]
-    fn a_policy_decides_how_hard_the_source_looks() {
-        assert_eq!(
-            observation_mode(MetadataPolicy::Omit),
-            crate::model::ObservationMode::Omit
-        );
-        assert_eq!(
-            observation_mode(MetadataPolicy::BestEffort),
-            crate::model::ObservationMode::BestEffort
-        );
-        for policy in [MetadataPolicy::AllowKnownLoss, MetadataPolicy::RequireExact] {
-            assert_eq!(
-                observation_mode(policy),
-                crate::model::ObservationMode::Required
-            );
-        }
-    }
-
-    /// A family that was asked for and has no route must not be dropped quietly — silently
-    /// copying less than asked is the failure this parameter exists to prevent. `BestEffort` is
-    /// the one policy that permits it, because it asks rather than requires.
-    #[test]
-    fn a_route_that_does_not_exist_is_only_tolerated_by_best_effort() {
-        let reason = "no route";
-        assert!(refuse_unavailable(CopiedMetadataRequest::default(), reason).is_ok());
-        assert!(
-            refuse_unavailable(
-                CopiedMetadataRequest::default().with_acl(MetadataPolicy::BestEffort),
-                reason
-            )
-            .is_ok()
-        );
-        for policy in [MetadataPolicy::AllowKnownLoss, MetadataPolicy::RequireExact] {
-            assert!(
-                refuse_unavailable(CopiedMetadataRequest::default().with_acl(policy), reason)
-                    .is_err(),
-                "{policy:?} asked for the ACL and must not proceed without it"
-            );
-            assert!(
-                refuse_unavailable(CopiedMetadataRequest::default().with_xattrs(policy), reason)
-                    .is_err()
-            );
-        }
-    }
-
-    /// "Neither side can" and "both can but they disagree on the encoding" send a caller to
-    /// different places, so they must not share a message.
-    #[test]
-    fn a_refusal_says_which_kind_it_was() {
-        let unsupported = refusal(MetadataPlanError::new(
-            MetadataFamily::Acl,
-            MetadataPlanErrorKind::Unsupported,
-        ));
-        let mapping = refusal(MetadataPlanError::new(
-            MetadataFamily::Acl,
-            MetadataPlanErrorKind::ExternalMappingRequired,
-        ));
-        assert_ne!(unsupported, mapping);
-        assert!(unsupported.contains("does not support"));
-        assert!(mapping.contains("encodings"));
-        assert_ne!(
-            refusal(MetadataPlanError::new(
-                MetadataFamily::Xattrs,
-                MetadataPlanErrorKind::Unsupported,
-            )),
-            unsupported
-        );
     }
 }
 

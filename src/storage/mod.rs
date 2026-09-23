@@ -3,6 +3,7 @@
 pub(crate) mod artifacts;
 pub(crate) mod backends;
 mod capability;
+mod copied_metadata;
 mod create_dir;
 mod delete_tree;
 pub(crate) mod durability;
@@ -23,6 +24,10 @@ pub use capability::{
     BackendCapabilities, Capability, CapabilityAvailability, CapabilityUnavailable,
     CapabilityValueError, PreflightPolicy, UnsupportedReason, ValidationGate,
 };
+pub use copied_metadata::{
+    CopiedAclTarget, CopiedMetadataObservation, CopiedMetadataTarget, CopiedOwnershipTarget,
+    CopiedValueTarget,
+};
 pub use create_dir::{CreateDirectoryAllFailure, create_directory_all};
 pub use delete_tree::{
     DeleteTreeCompletion, DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest, DeleteTreeSession,
@@ -34,13 +39,12 @@ pub use factory::{
 };
 pub use handle::Storage;
 pub use roles::{
-    ByteStream, CheckpointObservation, CopiedAclTarget, CopiedMetadataObservation,
-    CopiedMetadataTarget, CopiedOwnershipTarget, CopiedValueTarget, FinalDestination, Metadata,
-    MetadataMutation, Namespace, NamespaceRequest, NamespaceResult, PositionedByteStream,
-    PositionedChunk, PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence,
-    PublicationFailure, PublishRequest, ReadRequest, ReadSource, RecoverRequest, RecoveryIdentity,
-    RecoveryValueError, SourceDescriptor, StagedDestination, StagedMetadataApplicationFailure,
-    StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    ByteStream, CheckpointObservation, FinalDestination, Metadata, MetadataMutation, Namespace,
+    NamespaceRequest, NamespaceResult, PositionedByteStream, PositionedChunk, PrepareRequest,
+    PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
+    ReadRequest, ReadSource, RecoverRequest, RecoveryIdentity, RecoveryValueError,
+    SourceDescriptor, StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure,
+    VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 pub(crate) use roles::{CheckpointRegistration, DeferredCheckpoint};
 
