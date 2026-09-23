@@ -1,15 +1,17 @@
 //! Deterministic metadata planning, semantic-loss reporting, and application.
 
 use std::fmt;
+use std::mem;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    AclEncoding, MappedOwnership, MetadataObservation, MetadataObservations, OwnershipMode,
-    StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata,
+    AclEncoding, FailureClass, MappedOwnership, MetadataObservation, MetadataObservations,
+    OwnershipMode, StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata,
 };
 use crate::storage::{
-    Metadata, MetadataMutation, PreparedStage, StagedDestination, StorageRoleFailure,
+    Metadata, MetadataMutation, PreparedStage, StagedDestination, StagedMetadataApplicationFailure,
+    StorageRoleFailure,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -290,31 +292,14 @@ impl MetadataPlan {
         cancel: CancellationToken,
     ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
         let mut outcomes = self.planned_outcomes();
-        let Some((first_family, _)) = self.mutations.first() else {
-            return Ok(MetadataApplicationReport {
-                outcomes,
-                losses: self.losses.clone(),
-            });
-        };
-        if cancel.is_cancelled() {
-            return Err(MetadataApplicationFailure {
-                family: *first_family,
-                error: None,
-                report: MetadataApplicationReport {
-                    outcomes,
-                    losses: self.losses.clone(),
-                },
-            });
+        let mut pending = self.mutations.iter().collect::<Vec<_>>();
+        if let Some((family, _)) = pending.first()
+            && cancel.is_cancelled()
+        {
+            return Err(self.failure(*family, None, outcomes));
         }
-        // A tolerant family that fails is skipped and the rest of the batch is sent again from
-        // the next mutation. Resuming rather than reordering is deliberate: the order families
-        // are applied in is itself an invariant (a mode written after an ACL rewrites it), so
-        // moving the tolerant ones to the end to make one batch would trade one silent
-        // corruption for another.
-        let mut start = 0;
-        while start < self.mutations.len() {
-            let remaining = &self.mutations[start..];
-            let mutations = remaining
+        while !pending.is_empty() {
+            let mutations = pending
                 .iter()
                 .map(|(_, mutation)| mutation.clone())
                 .collect::<Vec<_>>();
@@ -322,36 +307,70 @@ impl MetadataPlan {
                 .apply_metadata_batch(stage, mutations, cancel.clone())
                 .await
             else {
-                for (family, _) in remaining {
+                for (family, _) in &pending {
                     set_outcome(&mut outcomes, *family, ApplicationOutcome::Applied);
                 }
                 break;
             };
-            let failed_index = failure.failed_index.min(remaining.len() - 1);
-            for (family, _) in remaining.iter().take(failure.completed) {
-                set_outcome(&mut outcomes, *family, ApplicationOutcome::Applied);
-            }
-            let family = remaining[failed_index].0;
-            if failure.error.is_some() {
-                set_outcome(&mut outcomes, family, ApplicationOutcome::Failed);
-            }
-            if self.tolerant.contains(&family) {
-                start += failed_index + 1;
-                continue;
-            }
-            return Err(MetadataApplicationFailure {
-                family,
-                error: failure.error.map(Box::new),
-                report: MetadataApplicationReport {
-                    outcomes,
-                    losses: self.losses.clone(),
-                },
-            });
+            pending = self.resume_after(&pending, failure, &mut outcomes, &cancel)?;
         }
         Ok(MetadataApplicationReport {
             outcomes,
             losses: self.losses.clone(),
         })
+    }
+
+    /// Records what one failed batch did and returns what still has to be sent, or the failure
+    /// when the family that failed cannot be tolerated.
+    ///
+    /// A tolerant family that fails is skipped and everything not yet applied is sent again.
+    /// Resuming rather than reordering is deliberate: the order families are applied in is itself
+    /// an invariant (a mode written after an ACL rewrites it), so moving the tolerant ones to the
+    /// end to make one batch would trade one silent corruption for another.
+    fn resume_after<'a>(
+        &self,
+        pending: &[&'a (MetadataFamily, MetadataMutation)],
+        failure: StagedMetadataApplicationFailure,
+        outcomes: &mut Vec<FamilyApplication>,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<&'a (MetadataFamily, MetadataMutation)>, MetadataApplicationFailure> {
+        let failed_index = failure.failed_index.min(pending.len() - 1);
+        // A backend may reject the batch before applying any of it, so what precedes the failed
+        // index is not necessarily applied: only `completed` says that.
+        let completed = failure.completed.min(failed_index);
+        for (family, _) in &pending[..completed] {
+            set_outcome(outcomes, *family, ApplicationOutcome::Applied);
+        }
+        let family = pending[failed_index].0;
+        let cancelled = cancel.is_cancelled() || failure.error.as_ref().is_none_or(is_cancellation);
+        if cancelled || !self.tolerant.contains(&family) {
+            if !cancelled {
+                set_outcome(outcomes, family, ApplicationOutcome::Failed);
+            }
+            return Err(self.failure(family, failure.error, mem::take(outcomes)));
+        }
+        set_outcome(outcomes, family, ApplicationOutcome::Failed);
+        Ok(pending[completed..failed_index]
+            .iter()
+            .chain(&pending[failed_index + 1..])
+            .copied()
+            .collect())
+    }
+
+    fn failure(
+        &self,
+        family: MetadataFamily,
+        error: Option<StorageRoleFailure>,
+        outcomes: Vec<FamilyApplication>,
+    ) -> MetadataApplicationFailure {
+        MetadataApplicationFailure {
+            family,
+            error: error.map(Box::new),
+            report: MetadataApplicationReport {
+                outcomes,
+                losses: self.losses.clone(),
+            },
+        }
     }
 
     async fn apply_to(
@@ -372,8 +391,11 @@ impl MetadataPlan {
                 });
             }
             if let Err(error) = target.apply(mutation.clone(), cancel.clone()).await {
-                set_outcome(&mut outcomes, *family, ApplicationOutcome::Failed);
-                if self.tolerant.contains(family) {
+                let cancelled = cancel.is_cancelled() || is_cancellation(&error);
+                if !cancelled {
+                    set_outcome(&mut outcomes, *family, ApplicationOutcome::Failed);
+                }
+                if !cancelled && self.tolerant.contains(family) {
                     continue;
                 }
                 return Err(MetadataApplicationFailure {
@@ -940,6 +962,17 @@ fn planned_outcome(decision: &MappingDecision, has_mutation: bool) -> Applicatio
         }
         MappingDecision::ObservationFailed => ApplicationOutcome::Failed,
     }
+}
+
+/// `BestEffort` tolerates a destination refusing a write. Cancellation is not a refusal and is
+/// never tolerated, whichever family it lands on — including a `Cancelled` a server reports on its
+/// own (SMB `STATUS_CANCELLED`): upstream re-enqueues cancelled work, so stopping is what lets it.
+fn is_cancellation(error: &StorageRoleFailure) -> bool {
+    let class = match error {
+        StorageRoleFailure::Entry(error) => error.class(),
+        StorageRoleFailure::Session(error) => error.class(),
+    };
+    class == FailureClass::Cancelled
 }
 
 fn set_outcome(

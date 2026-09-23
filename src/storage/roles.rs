@@ -132,10 +132,18 @@ pub enum StorageRoleFailure {
 }
 
 /// Failure while applying an ordered batch of staged metadata mutations.
+///
+/// The caller resends what was not applied after a tolerated refusal, so these fields are a
+/// contract, not diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedMetadataApplicationFailure {
+    /// Index in the batch of the mutation that failed.
     pub failed_index: usize,
+    /// How many leading mutations were applied, never more than `failed_index`. It may be less:
+    /// a backend that rejects the batch before touching it reports zero, and the mutations
+    /// between the two are then resent in order.
     pub completed: usize,
+    /// `None` means the batch stopped because it was cancelled.
     pub error: Option<StorageRoleFailure>,
 }
 

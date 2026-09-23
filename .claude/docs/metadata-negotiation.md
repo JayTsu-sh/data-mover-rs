@@ -29,6 +29,7 @@ atime / ctime 任何情况下都不拷。
 | 两端都支持但编码不同（Posix ↔ NfsV4 ↔ WindowsSecurityDescriptor） | 跳过 | **失败** | **失败** | 记后继续 |
 | 源端观测失败（GETACL 报错） | 跳过 | **失败** | **失败** | 记 `Failed` 后继续 |
 | 目的端**应用期**拒绝（能力位为真但 SETACL 被拒） | — | **失败** | **失败** | 记 `Failed` 后继续，**传输仍然成功** |
+| 应用期**取消**（token 已触发，或 backend 报 `Cancelled`，含服务端的 `STATUS_CANCELLED`） | — | **停止** | **停止** | **停止**，该族保持规划期结果、不记 `Failed` |
 | 不适用（symlink 上的 ACL） | 跳过 | 跳过 | 跳过 | 跳过 |
 
 **分野是「降级」与「缺席」**：`AllowKnownLoss` 容忍降级、不容忍缺席；`BestEffort` 两者都容忍。
@@ -69,9 +70,17 @@ atime / ctime 任何情况下都不拷。
    所以 `compile_ownership` 必须排在 `compile_acl` 之前；替换 ownership 的那个 `Mode` mutation
    插在**队首**。由 `acl_is_applied_after_the_mode_that_would_rewrite_it` 与
    `the_mode_that_replaces_ownership_is_applied_before_the_acl_too` 看守。
-2. **容忍不能靠重排实现。** `BestEffort` 的族失败后，批量路径是**从下一条继续重发**，
-   不是把容忍的族挪到队尾凑成一批 —— 后者会让 `BestEffort` 的 ownership 跑到
+2. **容忍不能靠重排实现。** `BestEffort` 的族失败后，批量路径重发**所有尚未应用的**、
+   去掉被拒那一条：`pending[completed..failed_index] ++ pending[failed_index + 1..]`
+   （`MetadataPlan::resume_after`）。不能从 `failed_index + 1` 续 —— backend 可以在动手前整批拒绝
+   （Local 的预校验就是，`completed = 0` 而 `failed_index > 0`），那样前面的族会被静默跳过。
+   也不是把容忍的族挪到队尾凑成一批 —— 后者会让 `BestEffort` 的 ownership 跑到
    `RequireExact` 的 ACL 后面，重新制造第 1 条要防的静默覆盖。
+   `StagedMetadataApplicationFailure` 的三条字段约定（`src/storage/roles.rs`）就是这条的前提。
+   由 `src/metadata/stage_tests.rs` 看守。
+
+**取消永远不被容忍。** `BestEffort` 吸收的是「目的端说不」，取消不是。两条路径都按
+「token 已触发 **或** 失败类别为 `Cancelled`」判定 —— 被打断的请求可能报成别的类别。
 
 ## 代价
 
