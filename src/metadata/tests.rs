@@ -8,6 +8,31 @@ use crate::model::{
     OwnershipMode, Transience,
 };
 
+/// Looks a family's outcome up by name. Indexing into `outcomes()` ties a test to the order the
+/// plan happens to compile families in, and that order is a deliberate invariant of its own
+/// ([`acl_is_applied_after_the_mode_that_would_rewrite_it`]) rather than something every other
+/// test should have an opinion about.
+fn outcome_for(report: &MetadataApplicationReport, family: MetadataFamily) -> ApplicationOutcome {
+    report
+        .outcomes()
+        .iter()
+        .find(|value| value.family == family)
+        .map_or_else(
+            || panic!("no outcome for {family:?}"),
+            |value| value.outcome,
+        )
+}
+
+fn decision_for(plan: &MetadataPlan, family: MetadataFamily) -> MappingDecision {
+    plan.mappings()
+        .iter()
+        .find(|value| value.family == family)
+        .map_or_else(
+            || panic!("no mapping for {family:?}"),
+            |value| value.decision.clone(),
+        )
+}
+
 struct RecordingMetadata {
     mutations: Mutex<Vec<MetadataMutation>>,
     fail_at: Option<usize>,
@@ -92,6 +117,68 @@ fn exact_target() -> MetadataTarget {
             created: true,
         }),
     }
+}
+
+/// Writing permission bits recomputes the ACL — the POSIX mask entry, and on most `NFSv4` servers
+/// (ONTAP among them) the whole ACL. A plan's mutation order is also the order they are applied
+/// in, so an ACL compiled ahead of ownership would be overwritten by the mode that follows it
+/// while the report still said it was applied. Nothing else pins this.
+#[test]
+fn acl_is_applied_after_the_mode_that_would_rewrite_it() {
+    let observations = exact_observations();
+    let plan = compile_metadata_plan(&MetadataPlanRequest {
+        observations: &observations,
+        target: exact_target(),
+        policies: all_exact(),
+        principal_mapper: None,
+    })
+    .unwrap();
+    assert!(
+        family_order(&plan, MetadataFamily::OwnershipMode)
+            < family_order(&plan, MetadataFamily::Acl),
+        "ownership must precede the ACL it would rewrite: {:?}",
+        families(&plan)
+    );
+}
+
+/// The copy path can lose numeric ownership and keep the mode, and that replacement mode is
+/// inserted into an already compiled plan. It has to land ahead of the ACL for the same reason.
+#[test]
+fn the_mode_that_replaces_ownership_is_applied_before_the_acl_too() {
+    let observations = exact_observations();
+    let plan = compile_copied_metadata_plan(
+        &MetadataPlanRequest {
+            observations: &observations,
+            target: exact_target(),
+            policies: all_exact().with_ownership_mode(MetadataPolicy::AllowKnownLoss),
+            principal_mapper: None,
+        },
+        Some(0o640),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            plan.mutations.first(),
+            Some((MetadataFamily::OwnershipMode, MetadataMutation::Mode(_)))
+        ),
+        "the replacement mode must be applied first: {:?}",
+        families(&plan)
+    );
+    assert!(
+        family_order(&plan, MetadataFamily::OwnershipMode)
+            < family_order(&plan, MetadataFamily::Acl)
+    );
+}
+
+fn families(plan: &MetadataPlan) -> Vec<MetadataFamily> {
+    plan.mutations.iter().map(|(family, _)| *family).collect()
+}
+
+fn family_order(plan: &MetadataPlan, family: MetadataFamily) -> usize {
+    families(plan)
+        .iter()
+        .position(|value| *value == family)
+        .unwrap_or_else(|| panic!("no mutation for {family:?}"))
 }
 
 fn all_exact() -> MetadataPolicies {
@@ -210,7 +297,7 @@ async fn unsupported_and_not_applicable_have_distinct_results() {
         .await
         .unwrap();
     assert_eq!(
-        application.outcomes()[2].outcome,
+        outcome_for(&application, MetadataFamily::Tags),
         ApplicationOutcome::OmittedByPolicy
     );
 
@@ -223,7 +310,7 @@ async fn unsupported_and_not_applicable_have_distinct_results() {
     })
     .unwrap();
     assert_eq!(
-        unsupported.mappings()[2].decision,
+        decision_for(&unsupported, MetadataFamily::Tags),
         MappingDecision::Unsupported
     );
     assert!(

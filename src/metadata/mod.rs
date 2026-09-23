@@ -477,6 +477,12 @@ pub fn compile_metadata_plan(
         mutations: Vec::with_capacity(5),
         losses: LossReport::default(),
     };
+    // Ownership first, and mode with it: writing permission bits recomputes the ACL — the POSIX
+    // mask entry, and on most NFSv4 servers (ONTAP among them) the whole ACL. Compiling the ACL
+    // first would put it earlier in `mutations`, which is also the order they are applied in, so
+    // the copied ACL would be silently overwritten by the mode that follows it and the report
+    // would still say it was applied.
+    compile_ownership(request, &mut plan)?;
     compile_acl(request, &mut plan)?;
     compile_value(
         MetadataFamily::Xattrs,
@@ -494,7 +500,6 @@ pub fn compile_metadata_plan(
         &mut plan,
         |value| MetadataMutation::Tags(value.clone()),
     )?;
-    compile_ownership(request, &mut plan)?;
     compile_timestamps(request, &mut plan)?;
     Ok(plan)
 }
@@ -538,13 +543,11 @@ pub(crate) fn compile_copied_metadata_plan(
             },
         )?;
         if supported {
-            let index = plan
-                .mutations
-                .iter()
-                .position(|(value, _)| *value == MetadataFamily::Timestamps)
-                .unwrap_or(plan.mutations.len());
+            // The ownership mutation was just retained away, so every mutation left is one that
+            // has to observe the new mode: the ACL is recomputed by it, and the timestamps have
+            // to be stamped after it. Front of the queue is the only correct place.
             plan.mutations
-                .insert(index, (family, MetadataMutation::Mode(mode & 0o7777)));
+                .insert(0, (family, MetadataMutation::Mode(mode & 0o7777)));
         }
     }
     Ok(plan)
