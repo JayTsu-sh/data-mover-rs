@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use data_mover::error::StorageError;
 use data_mover::storage_enum::create_storage;
 use data_mover::{EntryEnum, Result, StorageEntryMessage};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -82,6 +83,7 @@ async fn main() -> Result<()> {
             },
         )
         .await?;
+    let mut errors = 0_u64;
     while let Some(msg) = iter.next().await {
         match msg {
             StorageEntryMessage::Scanned(entry) => match &*entry {
@@ -97,6 +99,7 @@ async fn main() -> Result<()> {
                 EntryEnum::S3(_) | EntryEnum::HDFS(_) => {}
             },
             StorageEntryMessage::Error { path, reason, .. } => {
+                errors += 1;
                 println!("Error for {}: {}", path.display(), reason);
             }
             _ => {}
@@ -116,5 +119,11 @@ async fn main() -> Result<()> {
     println!("Files: {}", stats.files);
     println!("Scan time: {duration:?}");
 
+    // A walk that could not read part of the tree is not a success.
+    if errors > 0 {
+        return Err(StorageError::OperationError(format!(
+            "{errors} error(s) during the walk"
+        )));
+    }
     Ok(())
 }

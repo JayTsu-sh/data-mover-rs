@@ -14,12 +14,19 @@ def nfs_url(
     port: int | None = None,
     uid: int = 1000,
     gid: int = 1000,
+    options: str = "",
 ) -> str:
+    """`options` is appended to the query as given, e.g. `version=4.1&noresvport=true`.
+
+    Leave `uid` / `gid` out of `options`: nfs-rs takes the first match, so the ones built from the
+    arguments win.
+    """
     host_part = f"{host}:{port}" if port else host
     path = f"/{export.lstrip('/')}"
     if sub_path:
         path += ":/" + sub_path.lstrip("/")
-    return f"nfs://{host_part}{path}?uid={uid}&gid={gid}"
+    extra = f"&{options.lstrip('?&')}" if options else ""
+    return f"nfs://{host_part}{path}?uid={uid}&gid={gid}{extra}"
 
 
 def s3_url(
