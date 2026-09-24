@@ -2,6 +2,7 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use md5::{Digest as _, Md5};
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{FailureClass, ObjectTag, StorageTimestamp, Transience};
@@ -90,6 +91,51 @@ impl S3WriteFacts {
     }
 }
 
+/// The `ETag` S3 gives an object completed from parts whose `ETag`s are `part_etags`, in part
+/// order: the quoted hex MD5 of the concatenated binary part MD5s, a dash and the part count
+/// (`"<md5>-<n>"`). `None` when there are no parts or any part `ETag` is not a quoted 32-hex MD5
+/// (server-side encryption with KMS and some stores report other values): then no composite can
+/// be computed.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by Direct writes to S3, ADR-0006 C14c")
+)]
+pub(crate) fn composite_etag(part_etags: &[String]) -> Option<String> {
+    if part_etags.is_empty() {
+        return None;
+    }
+    let mut digests = Vec::with_capacity(part_etags.len() * 16);
+    for etag in part_etags {
+        digests.extend_from_slice(&md5_of_etag(etag)?);
+    }
+    Some(format!(
+        "\"{:x}-{}\"",
+        Md5::digest(&digests),
+        part_etags.len()
+    ))
+}
+
+/// The binary MD5 a quoted 32-hex `ETag` spells; `None` for any other shape.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by Direct writes to S3, ADR-0006 C14c")
+)]
+fn md5_of_etag(etag: &str) -> Option<[u8; 16]> {
+    let hex = etag.strip_prefix('"')?.strip_suffix('"')?;
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut digest = [0_u8; 16];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let pair = hex.get(index * 2..index * 2 + 2)?;
+        if !pair.bytes().all(|digit| digit.is_ascii_hexdigit()) {
+            return None;
+        }
+        *byte = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(digest)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct S3PartFacts {
     pub number: i32,
@@ -142,21 +188,36 @@ pub(crate) trait S3Protocol: Send + Sync {
         content_md5_base64: &str,
     ) -> S3Result<S3WriteFacts>;
     async fn begin_multipart(&self, key: &str) -> S3Result<String>;
+    /// Uploads one part carrying `content_md5_base64`, so the server rejects a part corrupted in
+    /// flight (`BadDigest`, a transient `Corruption` entry failure). Returns the part's `ETag`.
     async fn upload_part(
         &self,
         key: &str,
         upload_id: &str,
         part_number: i32,
         bytes: Bytes,
+        content_md5_base64: &str,
     ) -> S3Result<String>;
+    /// Completes an upload from `parts` (number, `ETag`), in ascending part order. A part the
+    /// upload does not hold, or a list out of order, is a permanent `Conflict`
+    /// (`InvalidPart` / `InvalidPartOrder`); a part other than the last below the minimum part
+    /// size is a permanent `Corruption` (`EntityTooSmall`). Reports the object's `ETag` and the
+    /// version the completion created.
     async fn complete_multipart(
         &self,
         key: &str,
         upload_id: &str,
         parts: &[(i32, String)],
-    ) -> S3Result<()>;
+    ) -> S3Result<S3WriteFacts>;
     async fn abort_multipart(&self, key: &str, upload_id: &str) -> S3Result<()>;
     async fn list_parts(&self, key: &str, upload_id: &str) -> S3Result<Vec<S3PartFacts>>;
+    /// The ids of the multipart uploads in progress on exactly `key` — not on keys that merely
+    /// start with it (some stores list by prefix, `MinIO` by exact key).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by Direct writes to S3, ADR-0006 C14c")
+    )]
+    async fn list_uploads(&self, key: &str) -> S3Result<Vec<String>>;
     async fn copy_object(&self, from: &str, to: &str) -> S3Result<()>;
     async fn native_copy(
         &self,

@@ -151,6 +151,18 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   → `Conflict`），再按我们的 versionId 读；桶无版本时带 `If-Match: <我们的 ETag>` 读。
 - 大于 T、大小未知、原生 S3→S3 仍走 temp key 分段上传 + CopyObject（C15 / C18 再改）；`Direct` 仍拒绝（C14c）。
 
+### 分段积木（ADR-0006 C15a，行为不变）
+
+- `S3Protocol::upload_part` 每段带 `Content-MD5`（不符 → `BadDigest`，条目 `Corruption` / Transient）；
+  `complete_multipart` 返回 `S3WriteFacts`（对象 `ETag` + 规范化后的 versionId）；`list_uploads(key)` 只返回
+  **恰好这个 key** 上进行中的 upload id（按前缀列再过滤 `Key == key`：MinIO 只按精确 key 列，AWS / Ceph /
+  StorageGRID 按前缀列）。实现在 `src/s3/role_protocol/multipart.rs`。
+- `composite_etag(part_etags)`（`protocol.rs`）：`"<各段二进制 MD5 拼接后的 MD5>-<段数>"`；任一段 `ETag`
+  不是带引号的 32 位 hex MD5（SSE-KMS 等）→ `None`，不做检查。
+- `InvalidPart` / `InvalidPartOrder` → 条目 `Conflict` / Permanent；`EntityTooSmall` → 条目 `Corruption` / Permanent。
+- `MemoryS3`：分段校验 MD5、同号分段覆盖、Complete 核对 (号, ETag) 表并按表拼对象、返回复合 ETag 与版本、
+  `complete_commits_then_fails` 注入「已提交但回复丢失」、`part_failure` 注入某段失败。
+
 ### legacy 列举隐藏传输 artifact（ADR-0006 C3）
 
 - `walkdir` / `walkdir_2`（含版本化桶的版本与删除标记）跳过相对存储根的任意一段以 `.data-mover-` 开头的

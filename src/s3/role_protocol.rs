@@ -33,6 +33,7 @@ macro_rules! classify_sdk {
     };
 }
 
+mod multipart;
 mod native;
 
 fn decode_parts(
@@ -246,25 +247,10 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         upload_id: &str,
         part_number: i32,
         bytes: Bytes,
-    ) -> crate::storage::backends::s3::S3Result<String> {
-        self.client
-            .upload_part()
-            .bucket(&self.bucket_name)
-            .key(self.build_full_key(key))
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(aws_sdk_s3::primitives::ByteStream::from(bytes))
-            .send()
+        content_md5_base64: &str,
+    ) -> S3Result<String> {
+        self.role_upload_part(key, upload_id, part_number, bytes, content_md5_base64)
             .await
-            .map_err(|error| classify_sdk!(error, "S3 UploadPart request failed"))?
-            .e_tag()
-            .map(str::to_string)
-            .ok_or_else(|| {
-                s3_role_entry(
-                    crate::model::FailureClass::Corruption,
-                    "S3 UploadPart response omitted ETag",
-                )
-            })
     }
 
     async fn complete_multipart(
@@ -272,29 +258,12 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         key: &str,
         upload_id: &str,
         parts: &[(i32, String)],
-    ) -> crate::storage::backends::s3::S3Result<()> {
-        let completed: Vec<CompletedPart> = parts
-            .iter()
-            .map(|(number, etag)| {
-                CompletedPart::builder()
-                    .part_number(*number)
-                    .e_tag(etag)
-                    .build()
-            })
-            .collect();
-        let upload = aws_sdk_s3::types::CompletedMultipartUpload::builder()
-            .set_parts(Some(completed))
-            .build();
-        self.client
-            .complete_multipart_upload()
-            .bucket(&self.bucket_name)
-            .key(self.build_full_key(key))
-            .upload_id(upload_id)
-            .multipart_upload(upload)
-            .send()
-            .await
-            .map(|_| ())
-            .map_err(|error| classify_sdk!(error, "S3 CompleteMultipartUpload request failed"))
+    ) -> S3Result<S3WriteFacts> {
+        self.role_complete_multipart(key, upload_id, parts).await
+    }
+
+    async fn list_uploads(&self, key: &str) -> S3Result<Vec<String>> {
+        self.role_list_uploads(key).await
     }
 
     async fn abort_multipart(
@@ -550,6 +519,15 @@ pub(super) fn s3_role_remote_failure(
         // The body did not match its digest: corrupted in flight, a resend may succeed.
         (_, Some("BadDigest")) => {
             crate::storage::backends::s3::S3ProtocolFailure::corrupted_upload(diagnostic)
+        }
+        // The completion named a part the upload does not hold, or out of order: our part list
+        // disagrees with the server's, and sending it again cannot change that.
+        (_, Some("InvalidPart" | "InvalidPartOrder")) => {
+            S3ProtocolFailure::entry(FailureClass::Conflict, Transience::Permanent, diagnostic)
+        }
+        // A part other than the last is below the minimum part size: the parts are wrong.
+        (_, Some("EntityTooSmall")) => {
+            S3ProtocolFailure::entry(FailureClass::Corruption, Transience::Permanent, diagnostic)
         }
         // The digest header itself is malformed: our request is wrong, and stays wrong.
         (_, Some("InvalidDigest")) => crate::storage::backends::s3::S3ProtocolFailure::entry(

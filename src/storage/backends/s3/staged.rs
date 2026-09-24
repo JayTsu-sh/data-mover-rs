@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
+use md5::{Digest as _, Md5};
 use tokio::sync::Mutex;
 
 use crate::model::{BackendIdentity, FailureClass, Operation, Transience};
@@ -70,8 +73,9 @@ async fn upload<P: S3Protocol>(
             "S3 multipart part limit exceeded",
         ));
     }
+    let content_md5 = BASE64_STANDARD.encode(Md5::digest(&bytes));
     let etag = protocol
-        .upload_part(&key, &upload_id, number, bytes)
+        .upload_part(&key, &upload_id, number, bytes, &content_md5)
         .await?;
     Ok((number, etag))
 }
@@ -469,6 +473,7 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 })?);
             }
             parts.sort_by_key(|part| part.0);
+            // The temp key's facts are not needed: publication copies it to the final key.
             self.protocol
                 .complete_multipart(&key, &upload_id, &parts)
                 .await

@@ -276,6 +276,15 @@ our `ETag` when there is none. Discard of an unpublished single stage touches no
 unknown sizes and native S3→S3 copies (a single stage handed to the native path moves to the temp
 key) keep the temp-key multipart path until C15/C18; `Direct` stays refused until C14c.
 
+As built (C15a, multipart building blocks — no behaviour change): `upload_part` sends `Content-MD5`
+(a mismatch is `BadDigest`, a transient `Corruption`); `complete_multipart` reports the object's
+`ETag` and version (`S3WriteFacts`); `list_uploads(key)` lists the uploads in progress on exactly
+that key (`ListMultipartUploads` with the key as prefix, then an exact-key filter — MinIO lists
+exact keys only, AWS / Ceph / StorageGRID by prefix). `composite_etag` computes
+`"<md5 of the binary part MD5s>-<n>"`, or `None` when a part `ETag` is not a quoted 32-hex MD5
+(SSE-KMS). `InvalidPart` / `InvalidPartOrder` map to a permanent `Conflict`, `EntityTooSmall` to a
+permanent `Corruption`. The temp-key path passes part MD5s and ignores the completion's facts.
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS

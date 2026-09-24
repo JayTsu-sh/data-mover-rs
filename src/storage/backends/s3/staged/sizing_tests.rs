@@ -1,6 +1,6 @@
 use super::*;
 use crate::model::{EntryKind, IdentityStrength, SourceIdentity, StoragePath};
-use crate::storage::backends::s3::tests::{MemoryS3, identity};
+use crate::storage::backends::s3::tests::{MemoryS3, content_md5, identity};
 use crate::storage::{FinalDestination, SourceDescriptor};
 
 #[test]
@@ -167,7 +167,13 @@ async fn retry_completion_reuses_zero_sized_final_parts() -> Result<(), Box<dyn 
         let upload_state = destination.stage_state(&stage, Operation::Write).await?;
         let last = if has_payload {
             protocol
-                .upload_part(&key, &upload_state.upload_id, 1, Bytes::from(vec![7; size]))
+                .upload_part(
+                    &key,
+                    &upload_state.upload_id,
+                    1,
+                    Bytes::from(vec![7; size]),
+                    &content_md5(&vec![7; size]),
+                )
                 .await
                 .map_err(|error| format!("{error:?}"))?;
             2
@@ -175,7 +181,13 @@ async fn retry_completion_reuses_zero_sized_final_parts() -> Result<(), Box<dyn 
             1
         };
         protocol
-            .upload_part(&key, &upload_state.upload_id, last, Bytes::new())
+            .upload_part(
+                &key,
+                &upload_state.upload_id,
+                last,
+                Bytes::new(),
+                &content_md5(b""),
+            )
             .await
             .map_err(|error| format!("{error:?}"))?;
         let recovery = destination.recovery_identity(&stage).await?;

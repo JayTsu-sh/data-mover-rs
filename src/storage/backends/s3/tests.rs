@@ -52,9 +52,17 @@ pub(crate) struct MemoryS3 {
     /// The next `put_object` stores its object, then loses the reply (a transient connectivity
     /// failure).
     pub(crate) put_commits_then_fails: Mutex<bool>,
-    /// `PutObject` requests received, and multipart uploads begun.
+    /// The next `complete_multipart` stores its object, then loses the reply (a transient
+    /// connectivity failure).
+    pub(crate) complete_commits_then_fails: Mutex<bool>,
+    /// Uploading this part number fails with this failure (every time, until cleared).
+    pub(crate) part_failure: Mutex<Option<(i32, S3ProtocolFailure)>>,
+    /// `PutObject` requests received, multipart uploads begun, parts uploaded and completions
+    /// that stored an object.
     pub(crate) puts: Mutex<u32>,
     pub(crate) multipart_begins: Mutex<u32>,
+    pub(crate) part_uploads: Mutex<u32>,
+    pub(crate) completes: Mutex<u32>,
     /// Contents a multipart upload completed, by their MD5: real S3 gives such an object the
     /// `ETag` `"<MD5 of the part MD5s>-<parts>"`, not the MD5 of its bytes.
     multipart_etags: std::sync::Mutex<HashMap<[u8; 16], String>>,
@@ -146,6 +154,52 @@ impl MemoryS3 {
             .cloned()
             .ok_or_else(not_found)
     }
+}
+
+fn missing_upload(diagnostic: &str) -> S3ProtocolFailure {
+    S3ProtocolFailure::entry(
+        crate::model::FailureClass::NotFound,
+        crate::model::Transience::Permanent,
+        diagnostic,
+    )
+}
+
+/// The smallest part S3 accepts anywhere but last: 5 MiB.
+const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+
+/// The stored parts a completion names, in its order — refused as S3 refuses them: a list out of
+/// ascending order (`InvalidPartOrder`) or naming a part the upload does not hold under that
+/// `ETag` (`InvalidPart`) is a permanent `Conflict`, a part other than the last below 5 MiB
+/// (`EntityTooSmall`) a permanent `Corruption`.
+fn listed_parts(stored: &[(i32, Bytes)], listed: &[(i32, String)]) -> S3Result<Vec<Bytes>> {
+    let refused = |class, diagnostic| {
+        S3ProtocolFailure::entry(class, crate::model::Transience::Permanent, diagnostic)
+    };
+    if listed.is_empty() || listed.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return Err(refused(
+            crate::model::FailureClass::Conflict,
+            "InvalidPartOrder",
+        ));
+    }
+    let mut parts = Vec::with_capacity(listed.len());
+    for (number, etag) in listed {
+        let bytes = stored
+            .iter()
+            .find(|part| part.0 == *number && etag_of(&part.1) == *etag)
+            .map(|part| part.1.clone())
+            .ok_or_else(|| refused(crate::model::FailureClass::Conflict, "InvalidPart"))?;
+        parts.push(bytes);
+    }
+    if parts[..parts.len() - 1]
+        .iter()
+        .any(|part| part.len() < MIN_PART_SIZE)
+    {
+        return Err(refused(
+            crate::model::FailureClass::Corruption,
+            "EntityTooSmall",
+        ));
+    }
+    Ok(parts)
 }
 
 fn not_found() -> S3ProtocolFailure {
@@ -277,41 +331,68 @@ impl S3Protocol for MemoryS3 {
         id: &str,
         number: i32,
         bytes: Bytes,
+        content_md5_base64: &str,
     ) -> S3Result<String> {
-        self.uploads
-            .lock()
-            .await
+        *self.part_uploads.lock().await += 1;
+        if let Some((failed, failure)) = &*self.part_failure.lock().await
+            && *failed == number
+        {
+            return Err(failure.clone());
+        }
+        if content_md5(&bytes) != content_md5_base64 {
+            return Err(S3ProtocolFailure::corrupted_upload(
+                "S3 UploadPart request failed",
+            ));
+        }
+        let etag = etag_of(&bytes);
+        let mut uploads = self.uploads.lock().await;
+        let parts = &mut uploads
             .get_mut(id)
-            .ok_or_else(|| S3ProtocolFailure::protocol("missing upload"))?
-            .1
-            .push((number, bytes));
-        Ok(format!("etag-{number}"))
+            .ok_or_else(|| missing_upload("S3 UploadPart request failed"))?
+            .1;
+        // Uploading a part number again replaces the part, as S3 does.
+        parts.retain(|part| part.0 != number);
+        parts.push((number, bytes));
+        Ok(etag)
     }
     async fn complete_multipart(
         &self,
         _key: &str,
         id: &str,
-        _parts: &[(i32, String)],
-    ) -> S3Result<()> {
-        let (key, mut parts) = self
+        parts: &[(i32, String)],
+    ) -> S3Result<S3WriteFacts> {
+        let (key, stored) = self
             .uploads
             .lock()
             .await
-            .remove(id)
-            .ok_or_else(|| S3ProtocolFailure::protocol("missing upload"))?;
-        parts.sort_by_key(|part| part.0);
+            .get(id)
+            .cloned()
+            .ok_or_else(|| missing_upload("S3 CompleteMultipartUpload request failed"))?;
+        let listed = listed_parts(&stored, parts)?;
+        self.uploads.lock().await.remove(id);
         let mut part_digests = Vec::new();
-        for part in &parts {
-            part_digests.extend_from_slice(&Md5::digest(&part.1));
+        for part in &listed {
+            part_digests.extend_from_slice(&Md5::digest(part));
         }
-        let composite = format!("\"{:x}-{}\"", Md5::digest(&part_digests), parts.len());
-        let bytes: Vec<u8> = parts.into_iter().flat_map(|part| part.1).collect();
+        let composite = format!("\"{:x}-{}\"", Md5::digest(&part_digests), listed.len());
+        let bytes: Vec<u8> = listed
+            .iter()
+            .flat_map(|part| part.iter().copied())
+            .collect();
         self.multipart_etags
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(Md5::digest(&bytes).into(), composite);
-        self.objects.lock().await.insert(key, Bytes::from(bytes));
-        Ok(())
+            .insert(Md5::digest(&bytes).into(), composite.clone());
+        let version = self.store_written(&key, Bytes::from(bytes)).await;
+        *self.completes.lock().await += 1;
+        if mem::take(&mut *self.complete_commits_then_fails.lock().await) {
+            return Err(S3ProtocolFailure::session(
+                crate::model::FailureClass::Connectivity,
+                crate::model::Transience::Transient,
+                "complete response lost",
+            ));
+        }
+        Ok(S3WriteFacts::new(composite, version))
     }
     async fn abort_multipart(&self, _key: &str, id: &str) -> S3Result<()> {
         if let Some(failure) = self.abort_failure.lock().await.clone() {
@@ -339,9 +420,21 @@ impl S3Protocol for MemoryS3 {
             .map(|(number, bytes)| S3PartFacts {
                 number: *number,
                 size: bytes.len() as u64,
-                etag: format!("etag-{number}"),
+                etag: etag_of(bytes),
             })
             .collect())
+    }
+    async fn list_uploads(&self, key: &str) -> S3Result<Vec<String>> {
+        let mut ids: Vec<String> = self
+            .uploads
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, upload)| upload.0 == key)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        Ok(ids)
     }
     async fn copy_object(&self, from: &str, to: &str) -> S3Result<()> {
         let bytes = self
@@ -533,3 +626,6 @@ mod roles;
 
 #[path = "version_tests.rs"]
 mod versions;
+
+#[path = "multipart_tests.rs"]
+mod multipart;
