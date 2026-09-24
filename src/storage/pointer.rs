@@ -27,10 +27,6 @@ const CHECKSUM_BYTES: usize = 32;
 /// Largest backend extension a pointer carries.
 const MAX_EXTENSION_BYTES: usize = 4096;
 /// Largest encoded pointer; a reader never needs more.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read bound for backends moving in ADR-0006 C8")
-)]
 pub(crate) const MAX_POINTER_BYTES: usize = HEADER_BYTES + MAX_EXTENSION_BYTES + CHECKSUM_BYTES;
 
 /// A pointer that does not decode: wrong length, magic, flags, checksum, or an oversized extension.
@@ -51,10 +47,6 @@ pub(crate) struct DestinationPointer {
     pub(crate) extension: Bytes,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "written by backends moving in ADR-0006 C8")
-)]
 impl DestinationPointer {
     /// Encodes the pointer.
     ///

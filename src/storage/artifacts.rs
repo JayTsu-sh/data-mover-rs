@@ -65,35 +65,42 @@ pub(crate) fn stage_base<'a>(name: &'a str, destination: &str) -> Option<&'a str
 }
 
 /// What one deterministic destination artifact holds (ADR-0006 "Destination artifacts").
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used as backends move to destination-resident recovery, ADR-0006 C8"
-    )
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArtifactKind {
     /// The staged content.
     Stage,
     /// The durable-prefix record of a file stage.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "NFS and CIFS keep a separate checkpoint, ADR-0006 C10/C11"
+        )
+    )]
     Checkpoint,
     /// An exclusive claim on the final name.
     Claim,
     /// The pointer that holds the recovery binding.
     Pointer,
     /// An S3 multipart upload's record.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "written by S3 multipart at the final key, ADR-0006 C15"
+        )
+    )]
     Upload,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used as backends move to destination-resident recovery, ADR-0006 C8"
-    )
-)]
 impl ArtifactKind {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the leftover sweep parses artifact names, ADR-0006 C9"
+        )
+    )]
     const ALL: [Self; 5] = [
         Self::Stage,
         Self::Checkpoint,
@@ -121,13 +128,6 @@ const TEMPORARY_SUFFIX: &str = ".tmp";
 /// `blake3("data-mover/artifact-name/v1\0" ‖ u64le(len) ‖ final name)`, as lowercase hex. Only the
 /// file's own name goes in — artifacts sit beside it in the same parent — so no process state, and no
 /// random part, is needed to find them again.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used as backends move to destination-resident recovery, ADR-0006 C8"
-    )
-)]
 pub(crate) fn final_name_digest(final_name: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"data-mover/artifact-name/v1\0");
@@ -138,13 +138,6 @@ pub(crate) fn final_name_digest(final_name: &str) -> String {
 
 /// `.data-mover-<digest(final name)>.<kind>`: at most 55 bytes, 59 as a temporary, whatever the
 /// final name's length.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used as backends move to destination-resident recovery, ADR-0006 C8"
-    )
-)]
 pub(crate) fn artifact_name(final_name: &str, kind: ArtifactKind) -> String {
     format!(
         "{ARTIFACT_PREFIX}{}.{}",
@@ -156,13 +149,6 @@ pub(crate) fn artifact_name(final_name: &str, kind: ArtifactKind) -> String {
 /// The one temporary name an artifact is written under before it replaces the artifact. Fixed, so
 /// a crash leaves nothing a later prepare cannot find; one writer per final name is guaranteed
 /// by the in-process guard and the caller contract.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used as backends move to destination-resident recovery, ADR-0006 C8"
-    )
-)]
 pub(crate) fn artifact_temporary_name(final_name: &str, kind: ArtifactKind) -> String {
     format!("{}{TEMPORARY_SUFFIX}", artifact_name(final_name, kind))
 }
@@ -177,7 +163,7 @@ pub(crate) fn artifact_temporary_name(final_name: &str, kind: ArtifactKind) -> S
     not(test),
     expect(
         dead_code,
-        reason = "used as backends move to destination-resident recovery, ADR-0006 C8"
+        reason = "used by path-addressed destinations from ADR-0006 C10"
     )
 )]
 pub(crate) fn sibling_artifact(
@@ -199,7 +185,7 @@ pub(crate) fn sibling_artifact(
     not(test),
     expect(
         dead_code,
-        reason = "used as backends move to destination-resident recovery, ADR-0006 C8"
+        reason = "the leftover sweep parses artifact names, ADR-0006 C9"
     )
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,7 +201,7 @@ pub(crate) struct ParsedArtifact<'a> {
     not(test),
     expect(
         dead_code,
-        reason = "used as backends move to destination-resident recovery, ADR-0006 C8"
+        reason = "the leftover sweep parses artifact names, ADR-0006 C9"
     )
 )]
 pub(crate) fn parse_artifact_name(name: &str) -> Option<ParsedArtifact<'_>> {

@@ -64,7 +64,7 @@ pub(super) async fn recover(
         None,
     );
     let directory = adapter.stage_directory(&stage, Operation::Prepare).await?;
-    LocalStagedDestination::cache_stage(&mut stage, directory, None, false)?;
+    LocalStagedDestination::cache_stage(&mut stage, directory, None, false, None)?;
     let claim = adapter.acquire_claim(&stage, false).await?;
     stage.claim = std::sync::Mutex::new(Some(claim));
     stage.write_offset = adapter.reobserve_checkpoint(&stage).await?;

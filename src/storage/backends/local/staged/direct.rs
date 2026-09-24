@@ -92,6 +92,7 @@ impl LocalStagedDestination {
             relative,
             name,
             first_write: AtomicBool::new(true),
+            transfer_identity: None,
         }));
         Ok(target)
     }

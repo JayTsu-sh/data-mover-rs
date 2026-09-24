@@ -22,15 +22,16 @@ use crate::model::AclEncoding;
 use crate::model::{
     BackendIdentity, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
 };
-use crate::storage::artifacts::is_artifact_native;
+use crate::storage::artifacts::{ArtifactKind, is_artifact_native};
 use crate::storage::durability::sync_directory;
 use crate::storage::{
-    ByteStream, CheckpointObservation, MetadataMutation, PrepareRequest, PreparedStage,
-    PublicationEvidence, PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity,
-    StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure, VerificationEvidence,
-    VerifyRequest, WriteEvidence,
+    ByteStream, CheckpointObservation, DestinationPrepareRequest, MetadataMutation, PrepareRequest,
+    PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
+    RecoverRequest, RecoveryIdentity, StagedDestination, StagedMetadataApplicationFailure,
+    StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
+mod at_destination;
 mod checkpoint;
 mod direct;
 mod directory_sync;
@@ -103,6 +104,8 @@ struct LocalStageState {
     relative: PathBuf,
     name: std::ffi::OsString,
     first_write: AtomicBool,
+    /// The transfer identity a destination-kept stage's pointer records.
+    transfer_identity: Option<[u8; 32]>,
 }
 
 pub(crate) struct LocalStagedDestination {
@@ -241,6 +244,7 @@ impl LocalStagedDestination {
         directory: Arc<Dir>,
         file: Option<Arc<std::fs::File>>,
         fresh: bool,
+        transfer_identity: Option<[u8; 32]>,
     ) -> Result<(), StorageRoleFailure> {
         let relative = Self::stage_relative(stage, Operation::Prepare)?;
         let name = relative
@@ -261,6 +265,7 @@ impl LocalStagedDestination {
             relative,
             name,
             first_write: AtomicBool::new(fresh),
+            transfer_identity,
         }));
         Ok(())
     }
@@ -306,9 +311,32 @@ impl LocalStagedDestination {
         stage: &PreparedStage,
         operation: Operation,
     ) -> Result<std::ffi::OsString, StorageRoleFailure> {
+        if stage.at_destination {
+            return at_destination::artifact(
+                stage.final_destination.path(),
+                ArtifactKind::Pointer,
+                false,
+            );
+        }
         let mut name = self.stage_name(stage, operation)?;
         name.push(".checkpoint");
         Ok(name)
+    }
+
+    /// The transfer identity of a destination-kept stage, which its pointer records.
+    fn transfer_identity(
+        stage: &PreparedStage,
+        operation: Operation,
+    ) -> Result<[u8; 32], StorageRoleFailure> {
+        Self::local_state(stage, operation)?
+            .and_then(|state| state.transfer_identity)
+            .ok_or_else(|| {
+                failure(
+                    stage.final_destination.path(),
+                    operation,
+                    FailureClass::Corruption,
+                )
+            })
     }
 
     fn claim_name(
@@ -316,6 +344,13 @@ impl LocalStagedDestination {
         stage: &PreparedStage,
         operation: Operation,
     ) -> Result<std::ffi::OsString, StorageRoleFailure> {
+        if stage.at_destination {
+            return at_destination::artifact(
+                stage.final_destination.path(),
+                ArtifactKind::Claim,
+                false,
+            );
+        }
         let mut name = self.stage_name(stage, operation)?;
         name.push(".claim");
         Ok(name)
@@ -410,6 +445,14 @@ impl LocalStagedDestination {
         })?;
         let relative = Self::checked_relative(&storage_path, operation)?;
         let final_relative = Self::checked_relative(stage.final_destination.path(), operation)?;
+        // Only a destination-kept stage has the deterministic name; any other has a random one.
+        let deterministic = stage
+            .at_destination
+            .then(|| {
+                at_destination::artifact(stage.final_destination.path(), ArtifactKind::Stage, false)
+                    .ok()
+            })
+            .flatten();
         let colocated = relative.parent() == final_relative.parent()
             && relative
                 .file_name()
@@ -419,6 +462,9 @@ impl LocalStagedDestination {
                         name,
                         stage.final_destination.path().as_str(),
                     ) == Some(name)
+                        || deterministic
+                            .as_deref()
+                            .is_some_and(|expected| expected == name)
                 })
             && relative.extension() == Some(std::ffi::OsStr::new("stage"))
             && relative != final_relative;
@@ -708,6 +754,12 @@ impl LocalStagedDestination {
         persisted: u64,
     ) -> Result<(), StorageRoleFailure> {
         let first = !stage.recovery_enabled();
+        if stage.at_destination {
+            // The claim is held since prepare, and the pointer is the whole recovery record.
+            self.persist_checkpoint(stage, persisted).await?;
+            stage.recovery_enabled.store(true, Ordering::Release);
+            return Ok(());
+        }
         if first {
             let claim = self.acquire_claim(stage, true).await?;
             *stage
@@ -775,6 +827,9 @@ impl LocalStagedDestination {
         stage: &PreparedStage,
         operation: Operation,
     ) -> Result<(), StorageRoleFailure> {
+        if stage.at_destination {
+            return at_destination::cleanup(self, stage, operation).await;
+        }
         let stage_name = self.stage_name(stage, operation)?;
         let checkpoint_name = self.checkpoint_name(stage, operation)?;
         let mut guard_name = stage_name.clone();
@@ -853,6 +908,54 @@ impl LocalStagedDestination {
             return self.rollback_prepare(&stage, error).await;
         }
         Ok(stage)
+    }
+
+    /// After a store-kept stage became the final file: releases and removes its claim.
+    async fn finish_store_publication(
+        &self,
+        stage: &PreparedStage,
+        final_destination: StoragePath,
+        disposition: PublicationDisposition,
+    ) -> Result<PublicationEvidence, PublicationFailure> {
+        let precommit = |error| PublicationFailure {
+            error,
+            final_destination_changed: false,
+        };
+        stage.release_claim();
+        if !stage.recovery_enabled() {
+            return Ok(PublicationEvidence {
+                final_destination,
+                disposition,
+            });
+        }
+        let claim_name = self
+            .claim_name(stage, Operation::Publish)
+            .map_err(precommit)?;
+        let staging = self
+            .stage_directory(stage, Operation::Publish)
+            .await
+            .map_err(precommit)?;
+        tokio::task::spawn_blocking(move || {
+            publication::remove_if_present(&staging, &claim_name)?;
+            sync_directory(&staging)
+        })
+        .await
+        .map_err(|_| PublicationFailure {
+            error: failure(
+                &final_destination,
+                Operation::Publish,
+                FailureClass::Internal,
+            ),
+            final_destination_changed: true,
+        })?
+        .map_err(|error| PublicationFailure {
+            error: io_failure(&final_destination, Operation::Publish, &error),
+            final_destination_changed: true,
+        })?;
+        Ok(PublicationEvidence {
+            final_destination,
+            disposition,
+        })
     }
 
     fn initialize_ephemeral_stage(stage: PreparedStage) -> PreparedStage {
@@ -975,6 +1078,7 @@ impl LocalStagedDestination {
             Arc::clone(&staging),
             Some(Arc::clone(&file)),
             true,
+            None,
         )?;
         if !recovery_enabled {
             return Ok(Self::initialize_ephemeral_stage(stage));
@@ -1106,6 +1210,13 @@ impl StagedDestination for LocalStagedDestination {
 
     async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
         recovery::recover(self, request).await
+    }
+
+    async fn prepare_at_destination(
+        &self,
+        request: DestinationPrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        at_destination::prepare(self, request).await
     }
 
     fn supports_positioned_write(&self) -> bool {
@@ -1348,8 +1459,9 @@ impl StagedDestination for LocalStagedDestination {
         let stage_name = self
             .stage_name(stage, Operation::Publish)
             .map_err(precommit)?;
-        let checkpoint_name = stage
-            .recovery_enabled()
+        // A destination-kept stage may have a pointer even before recovery was enabled (a pointer
+        // written just before a failed directory sync), so it always removes one.
+        let checkpoint_name = (stage.recovery_enabled() || stage.at_destination)
             .then(|| self.checkpoint_name(stage, Operation::Publish))
             .transpose()
             .map_err(precommit)?;
@@ -1395,42 +1507,13 @@ impl StagedDestination for LocalStagedDestination {
             final_destination_changed: false,
         })?;
         match result {
-            Ok(disposition) => {
-                stage.release_claim();
-                if !stage.recovery_enabled() {
-                    return Ok(PublicationEvidence {
-                        final_destination,
-                        disposition,
-                    });
-                }
-                let claim_name = self
-                    .claim_name(stage, Operation::Publish)
-                    .map_err(precommit)?;
-                let staging = self
-                    .stage_directory(stage, Operation::Publish)
+            Ok(disposition) if stage.at_destination => {
+                at_destination::finish_publication(self, stage, final_destination, disposition)
                     .await
-                    .map_err(precommit)?;
-                tokio::task::spawn_blocking(move || {
-                    publication::remove_if_present(&staging, &claim_name)?;
-                    sync_directory(&staging)
-                })
-                .await
-                .map_err(|_| PublicationFailure {
-                    error: failure(
-                        &final_destination,
-                        Operation::Publish,
-                        FailureClass::Internal,
-                    ),
-                    final_destination_changed: true,
-                })?
-                .map_err(|error| PublicationFailure {
-                    error: io_failure(&final_destination, Operation::Publish, &error),
-                    final_destination_changed: true,
-                })?;
-                Ok(PublicationEvidence {
-                    final_destination,
-                    disposition,
-                })
+            }
+            Ok(disposition) => {
+                self.finish_store_publication(stage, final_destination, disposition)
+                    .await
             }
             Err(error) => Err(PublicationFailure {
                 error: io_failure(&final_destination, Operation::Publish, &error.error),

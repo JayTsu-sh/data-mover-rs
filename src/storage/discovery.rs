@@ -187,10 +187,6 @@ pub(crate) fn decide(found: &Found, request: &DestinationPrepareRequest) -> Deci
 
 /// The artifacts one final file's recovery looks at, as a destination backend exposes them.
 /// Removals are idempotent and also remove the artifact's temporary.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "implemented by backends moving in ADR-0006 C8")
-)]
 #[async_trait]
 pub(crate) trait DestinationArtifacts: Send + Sync {
     /// The pointer's bytes, read up to `limit` bytes (a longer one is corrupt); `None` if absent.
@@ -236,10 +232,6 @@ pub(crate) struct Discovery {
 /// the stage, so a crash in between leaves "stage without pointer", which the table also cleans.
 /// A leftover temporary beside an otherwise empty place is not looked at here; the reserved-name
 /// cleanup removes it.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by backends moving in ADR-0006 C8")
-)]
 pub(crate) async fn discover(
     artifacts: &dyn DestinationArtifacts,
     request: &DestinationPrepareRequest,
