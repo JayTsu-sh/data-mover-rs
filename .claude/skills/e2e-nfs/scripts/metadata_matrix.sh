@@ -32,9 +32,12 @@ case_() { # name, expected exit (0|1), grep marker, args...
 }
 echo "run=$RUN"
 if [ -n "${NFS_META_V3_URL:-}" ]; then
-case_ "v3->v4.1 acl+xattrs asked: copied, both skipped (source cannot read)" 0 "copied " \
+case_ "v3->v4.1 acl+xattrs asked: copied, both skipped, the ACL reason names the source" 0 "ACL skipped: the source cannot read it" \
   --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$V41" --destination-path v3-asked \
   --acl --xattrs --expect copied --expect-acl unsupported --expect-xattrs unsupported
+case_ "v3->v4.1 xattrs asked: skipped, the reason names the source" 0 "extended attributes skipped: the source cannot read it" \
+  --source "$NFS_META_V3_URL" --source-path "$NFS_META_V3_FILE" --destination "$V41" --destination-path v3-xattrs \
+  --xattrs --expect copied --expect-xattrs unsupported
 else echo "SKIP NFSv3 rung (NFS_META_V3_URL unset)"; fi
 case_ "v4.1->v4.1 acl asked, principal mark: carried" 0 "ACLs equal and marked: 4" \
   --source "$V41" --source-path src-principal --seed-bytes 4096 --mark-acl principal \
@@ -45,11 +48,11 @@ case_ "v4.1->v4.1 acl asked, EVERYONE@ WRITE_ACL mark: carried" 0 "ACLs equal an
 case_ "negative control: acl not asked loses the mark" 1 "lost the Principal mark" \
   --source "$V41" --source-path src-omit --seed-bytes 4096 --mark-acl principal \
   --destination "$V41" --destination-path omit-principal --expect copied --expect-acl omitted-by-policy --verify-acl
-case_ "v4.1->v4.1 xattrs asked: copied, skipped (export did not negotiate named attributes)" 0 "copied 4096" \
+case_ "v4.1->v4.1 xattrs asked: copied, skipped (export did not negotiate named attributes)" 0 "extended attributes skipped: the source cannot read it" \
   --source "$V41" --source-path src-principal --destination "$V41" --destination-path xattrs-asked \
   --xattrs --expect copied --expect-xattrs unsupported
 if [ -n "${CIFS_REAL_SERVER:-}" ]; then
-case_ "v4.1->cifs acl asked: copied, skipped (NfsV4 vs Windows SD, no conversion)" 0 "copied 4096" \
+case_ "v4.1->cifs acl asked: copied, skipped (NfsV4 vs Windows SD, no conversion)" 0 "ACL skipped: the source holds a NfsV4 ACL and the destination stores WindowsSecurityDescriptor" \
   --source "$V41" --source-path src-principal --destination "$CIFS" --destination-path acl-asked \
   --acl --expect copied --expect-acl unsupported
 else echo "SKIP CIFS rung (CIFS_REAL_* unset)"; fi

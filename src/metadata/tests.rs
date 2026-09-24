@@ -801,3 +801,6 @@ mod stage;
 
 #[path = "error_tests.rs"]
 mod errors;
+
+#[path = "skip_tests.rs"]
+mod skips;

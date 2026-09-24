@@ -17,7 +17,8 @@ pub enum MetadataPlanErrorKind {
 }
 
 /// Why one family could not be planned, precise enough to act on: which end lacks it, what the
-/// source reported, or which loss the policy refused.
+/// source reported, or which loss the policy refused. Also the reason a family asked for is
+/// skipped ([`super::SkippedFamily`]) — then only the variants that name an end lacking it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RefusalCause {
@@ -176,7 +177,7 @@ impl fmt::Display for MetadataPlanError {
 }
 
 /// The family as a person would name it.
-const fn family_name(family: MetadataFamily) -> &'static str {
+pub(super) const fn family_name(family: MetadataFamily) -> &'static str {
     match family {
         MetadataFamily::Acl => "ACL",
         MetadataFamily::Xattrs => "extended attributes",

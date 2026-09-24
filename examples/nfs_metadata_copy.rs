@@ -321,6 +321,9 @@ fn print_report(report: &MetadataApplicationReport) {
     for (family, loss) in report.loss_report().losses() {
         println!("loss {family:?}: {loss:?}");
     }
+    for skip in report.skipped() {
+        println!("{skip}");
+    }
 }
 
 async fn copied(args: &Args, outcome: TransferOutcome) -> Result {

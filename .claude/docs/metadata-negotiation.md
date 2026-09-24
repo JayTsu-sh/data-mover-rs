@@ -36,13 +36,20 @@ atime / ctime 任何情况下都不拷。
 |---|---|---|
 | 两端都能，精确 | 不读不写 | 拷 |
 | 两端都能，有损（精度降低、只保留 mode 等） | 不读不写 | 拷，损失记进报告 |
-| 源端读不了（NFSv3 的 ACL、未协商 named attributes 的 xattr） | 不读不写 | 跳过，记 `Unsupported`（`SourceCannotObserve`） |
-| 目的端存不了 | 不读不写 | 跳过，记 `Unsupported`（`DestinationCannotStore`） |
-| 两端都存但编码不同（Posix ↔ NfsV4 ↔ WindowsSecurityDescriptor） | 不读不写 | 跳过，记 `RequiresExternalMapping`；**不做任何转换** |
+| 源端读不了（NFSv3 的 ACL、未协商 named attributes 的 xattr） | 不读不写 | 跳过：outcome `Unsupported`，`skipped()` 记 `SourceCannotObserve` |
+| 目的端存不了 | 不读不写 | 跳过：outcome `Unsupported`，`skipped()` 记 `DestinationCannotStore` |
+| 两端都存但编码不同（Posix ↔ NfsV4 ↔ WindowsSecurityDescriptor） | 不读不写 | 跳过：outcome `Unsupported`，`skipped()` 记 `EncodingsDiffer { source, destination }`；**不做任何转换** |
 | 源端**读失败**（GETACL 报错） | — | **文件失败**（`SourceObservationFailed`，带 class） |
 | 目的端**写失败**（能力位为真但 SETACL 被拒） | — | 其余族照常应用，**文件最终失败**并列出所有失败的族 |
 | 应用期**取消** / **会话级失败** / **整批失败** | — | **立即停止**并失败 |
 | 不适用（symlink 上的 ACL） | 跳过 | 跳过 |
+
+**跳过的原因**：`MetadataApplicationReport::skipped()`（经 `TransferOutcome.metadata`；文件失败时在
+`MetadataApplicationFailure::report()` 里同样有）逐族给出 `SkippedFamily { family, reason: RefusalCause }`，
+Display 如 `ACL skipped: the source cannot read it`。不变式：outcome 为 `Unsupported` 的族在 `skipped()`
+里恰有一条，其余族没有（不要的 `OmittedByPolicy`、不适用的都不算跳过）。规划器 `compile.rs::unavailable()`
+是唯一产生跳过的地方。两端都不能时记源端（先查源端）。要了却没发观测（`NotRequested`，拷贝路径上不会
+发生：要的功能一定以 `BestEffort` 观测）记 `NotObserved`，不进 `skipped()`。
 
 `MetadataPolicy` 的四档（`RequireExact` / `AllowKnownLoss` / `BestEffort` / `Omit`）仍在
 `metadata` 模块里，给基线族与直接调用 `compile_metadata_plan` 的代码用；**不再出现在拷贝请求里**。
@@ -51,7 +58,10 @@ atime / ctime 任何情况下都不拷。
 
 1. **should** —— 不要的功能连观测都不发（默认）。
 2. **源端能不能读** —— 要的功能以 `ObservationMode::BestEffort` 叠加到 backend 的基线 plan 上；
-   backend 用 `MetadataObservation::{Unsupported, NotApplicable}` 说「读不了」，`Failed` 说「读失败」。
+   backend 用 `MetadataObservation::Unsupported` 说「读不了」（进 `skipped()`，带 `SourceCannotObserve`），
+   `NotApplicable` 只说「这一条没有」（symlink 上的 ACL，不算跳过），`Failed` 说「读失败」。
+   **待修**：CIFS 源的 xattr 仍返回 `NotApplicable`，要了会被无声丢掉。S3 源没有拷贝基线
+   （`copied_metadata_observation_plan` 为 `None`），整段元数据都不走，见下文与 K6 / K8。
 3. **目的端能不能存** —— `CopiedMetadataTarget.acl` / `.xattrs`。
 4. **规划期交叉** —— `compile_copied_metadata_plan` 按上表裁决。
 5. **应用期** —— 服务端可以在能力位说 yes 之后仍然拒绝：该文件失败（先应用完其余族）。

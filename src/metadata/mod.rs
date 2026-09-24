@@ -18,6 +18,7 @@ mod errors;
 
 pub(crate) use compile::compile_copied_metadata_plan;
 pub use compile::compile_metadata_plan;
+use errors::family_name;
 pub(crate) use errors::role_failure_text;
 pub use errors::{
     ApplicationFailureKind, FamilyFailure, MetadataApplicationFailure, MetadataPlanError,
@@ -207,6 +208,29 @@ impl LossReport {
     }
 }
 
+/// A family that was asked for and is not carried, because an end cannot do it — decided while
+/// planning, before any write, and not a failure. The reason names which end and what it lacks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SkippedFamily {
+    pub family: MetadataFamily,
+    /// Which end lacks the family: `SourceCannotObserve`, `DestinationCannotStore`,
+    /// `EncodingsDiffer`, or `PrincipalMapperMissing` — never a failure or a refused loss. When
+    /// both ends lack it, the source is named: it is checked first.
+    pub reason: RefusalCause,
+}
+
+impl fmt::Display for SkippedFamily {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} skipped: {}",
+            family_name(self.family),
+            self.reason
+        )
+    }
+}
+
 pub struct MetadataPlanRequest<'a> {
     pub observations: &'a MetadataObservations,
     pub target: MetadataTarget,
@@ -219,6 +243,7 @@ pub struct MetadataPlan {
     mappings: Vec<FamilyMapping>,
     mutations: Vec<(MetadataFamily, MetadataMutation)>,
     losses: LossReport,
+    skipped: Vec<SkippedFamily>,
 }
 
 impl MetadataPlan {
@@ -230,6 +255,12 @@ impl MetadataPlan {
     #[must_use]
     pub const fn loss_report(&self) -> &LossReport {
         &self.losses
+    }
+
+    /// The families asked for that one end cannot do, each with the reason.
+    #[must_use]
+    pub fn skipped(&self) -> &[SkippedFamily] {
+        &self.skipped
     }
 
     #[must_use]
@@ -297,10 +328,7 @@ impl MetadataPlan {
         outcomes: Vec<FamilyApplication>,
     ) -> Result<MetadataApplicationReport, MetadataApplicationFailure> {
         if failures.is_empty() {
-            return Ok(MetadataApplicationReport {
-                outcomes,
-                losses: self.losses.clone(),
-            });
+            return Ok(self.report(outcomes));
         }
         Err(self.failed(failures, outcomes))
     }
@@ -312,10 +340,7 @@ impl MetadataPlan {
     ) -> MetadataApplicationFailure {
         MetadataApplicationFailure {
             failures,
-            report: MetadataApplicationReport {
-                outcomes,
-                losses: self.losses.clone(),
-            },
+            report: self.report(outcomes),
         }
     }
 
@@ -350,6 +375,14 @@ impl MetadataPlan {
             }
         }
         self.finish(failures, outcomes)
+    }
+
+    fn report(&self, outcomes: Vec<FamilyApplication>) -> MetadataApplicationReport {
+        MetadataApplicationReport {
+            outcomes,
+            losses: self.losses.clone(),
+            skipped: self.skipped.clone(),
+        }
     }
 
     fn planned_outcomes(&self) -> Vec<FamilyApplication> {
@@ -470,6 +503,7 @@ pub struct FamilyApplication {
 pub struct MetadataApplicationReport {
     outcomes: Vec<FamilyApplication>,
     losses: LossReport,
+    skipped: Vec<SkippedFamily>,
 }
 
 impl MetadataApplicationReport {
@@ -482,6 +516,13 @@ impl MetadataApplicationReport {
     #[must_use]
     pub fn outcomes(&self) -> &[FamilyApplication] {
         &self.outcomes
+    }
+
+    /// The families asked for that were not carried because an end cannot do them, each with the
+    /// reason. An `Unsupported` outcome always has an entry here.
+    #[must_use]
+    pub fn skipped(&self) -> &[SkippedFamily] {
+        &self.skipped
     }
 }
 

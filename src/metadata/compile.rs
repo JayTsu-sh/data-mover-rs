@@ -4,7 +4,7 @@
 use super::{
     AclTarget, FamilyMapping, LossReport, MappingDecision, MetadataFamily, MetadataPlan,
     MetadataPlanError, MetadataPlanRequest, MetadataPolicies, MetadataPolicy, OwnershipTarget,
-    RefusalCause, SemanticLoss, TimestampTargetCapability, ValueTarget,
+    RefusalCause, SemanticLoss, SkippedFamily, TimestampTargetCapability, ValueTarget,
 };
 use crate::model::{
     MetadataObservation, StorageTimestamp, TimePrecision, TimestampMetadata, without_unowned_set_id,
@@ -22,6 +22,7 @@ pub fn compile_metadata_plan(
         mappings: Vec::with_capacity(5),
         mutations: Vec::with_capacity(5),
         losses: LossReport::default(),
+        skipped: Vec::new(),
     };
     // Ownership first, and mode with it: writing permission bits recomputes the ACL — the POSIX
     // mask entry, and on most NFSv4 servers (ONTAP among them) the whole ACL. Compiling the ACL
@@ -82,6 +83,7 @@ pub(crate) fn compile_copied_metadata_plan(
         plan.mappings.retain(|value| value.family != family);
         plan.mutations.retain(|(value, _)| *value != family);
         plan.losses.0.retain(|(value, _)| *value != family);
+        plan.skipped.retain(|value| value.family != family);
         let supported = matches!(
             request.target.ownership_mode,
             OwnershipTarget::Numeric | OwnershipTarget::ModeOnly
@@ -473,6 +475,10 @@ fn unavailable(
 ) -> Result<(), MetadataPlanError> {
     if policy == MetadataPolicy::BestEffort {
         plan.mappings.push(FamilyMapping { family, decision });
+        plan.skipped.push(SkippedFamily {
+            family,
+            reason: cause,
+        });
         return Ok(());
     }
     Err(MetadataPlanError::new(family, policy, cause))
