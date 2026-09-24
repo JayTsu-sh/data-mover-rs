@@ -245,15 +245,29 @@ pub(super) fn apply_metadata(
     mutation: MetadataMutation,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), StorageRoleFailure> {
-    let path = stage.final_destination.path();
+    let tags = pending_tags(
+        stage.final_destination.path(),
+        tags_supported,
+        mutation,
+        cancel,
+    )?;
+    single.lock().tags = Some(tags);
+    Ok(())
+}
+
+/// The tags a mutation sets on an object that does not exist yet, to be set right after it is
+/// written; any other mutation is refused, as the S3 metadata role refuses it.
+pub(super) fn pending_tags(
+    path: &StoragePath,
+    tags_supported: bool,
+    mutation: MetadataMutation,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Vec<ObjectTag>, StorageRoleFailure> {
     if cancel.is_cancelled() {
         return Err(cancelled(path, Operation::Metadata));
     }
     match mutation {
-        MetadataMutation::Tags(tags) if tags_supported => {
-            single.lock().tags = Some(tags);
-            Ok(())
-        }
+        MetadataMutation::Tags(tags) if tags_supported => Ok(tags),
         MetadataMutation::Tags(_) => Err(classified_entry(
             path,
             Operation::Metadata,

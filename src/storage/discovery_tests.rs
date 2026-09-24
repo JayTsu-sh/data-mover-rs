@@ -283,6 +283,25 @@ async fn an_equal_binding_resumes_from_the_recorded_prefix() -> TestResult {
     Ok(())
 }
 
+/// A pointer without a durable prefix (S3's, whose `ListParts` is the durable record) resumes from
+/// what the stage proves, without the backend opting into `continues_from_stage`.
+#[tokio::test]
+async fn a_pointer_without_a_prefix_resumes_from_the_proven_stage() -> TestResult {
+    let written = pointer(BINDING, IDENTITY, None);
+    let destination = memory(Some(written.encode().map_err(|_| "encode")?), Some(PREFIX));
+    assert!(!destination.continues_from_stage());
+    let found = discover(&destination, &request(ResumeMode::Discover)?).await?;
+    assert_eq!(found.fact, PrepareFact::Resumed { bytes: PREFIX });
+    assert_eq!(
+        found.resume,
+        Some(ResumePoint {
+            prefix: PREFIX,
+            pointer: written
+        })
+    );
+    Ok(())
+}
+
 /// A clean-up removes the pointer before the stage: a crash between the two leaves a stage
 /// without a pointer, which the table cleans next time.
 #[tokio::test]

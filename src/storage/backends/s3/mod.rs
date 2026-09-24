@@ -68,6 +68,52 @@ pub(crate) fn connect_configured<P>(
 where
     P: S3Protocol + 'static,
 {
+    connect_roles(
+        protocol,
+        identity,
+        native_context,
+        tag_support,
+        single_put_threshold,
+        |staged| staged,
+    )
+}
+
+/// S3 roles whose destination keeps its recovery state at the destination (ADR-0006 C15b), as
+/// C15c turns on for every connection, with `checkpoint_interval` as its automatic interval.
+#[cfg(test)]
+pub(crate) fn connect_at_destination<P>(
+    protocol: Arc<P>,
+    identity: BackendIdentity,
+    checkpoint_interval: u64,
+) -> Result<Storage, Box<dyn std::error::Error>>
+where
+    P: S3Protocol + 'static,
+{
+    connect_roles(
+        protocol,
+        identity,
+        None,
+        S3TagSupport::Supported,
+        Some(DEFAULT_SINGLE_PUT_THRESHOLD),
+        |staged| {
+            staged
+                .with_recovery_at_destination(true)
+                .with_checkpoint_interval(checkpoint_interval)
+        },
+    )
+}
+
+fn connect_roles<P>(
+    protocol: Arc<P>,
+    identity: BackendIdentity,
+    native_context: Option<S3NativeContext>,
+    tag_support: S3TagSupport,
+    single_put_threshold: Option<u64>,
+    configure: impl FnOnce(staged::S3StagedDestination<P>) -> staged::S3StagedDestination<P>,
+) -> Result<Storage, Box<dyn std::error::Error>>
+where
+    P: S3Protocol + 'static,
+{
     if identity.kind() != BackendKind::S3 {
         return Err("S3 roles require an S3 backend identity".into());
     }
@@ -80,12 +126,12 @@ where
         identity.clone(),
         tag_support,
     ));
-    let staged = Arc::new(
+    let staged = Arc::new(configure(
         staged::S3StagedDestination::new(protocol.clone(), identity.clone())
             .with_metadata(Arc::clone(&metadata))
             .with_tag_support(matches!(tag_support, S3TagSupport::Supported))
             .with_single_put_threshold(single_put_threshold),
-    );
+    ));
     let native = native_context.map(|context| {
         Arc::new(native::S3NativeEndpoint::new(
             protocol.clone(),

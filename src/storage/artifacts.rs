@@ -40,14 +40,7 @@ pub(crate) enum ArtifactKind {
     Claim,
     /// The pointer that holds the recovery binding.
     Pointer,
-    /// An S3 multipart upload's record.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "written by S3 multipart at the final key, ADR-0006 C15"
-        )
-    )]
+    /// An S3 multipart upload's record: the pointer object beside the final key.
     Upload,
 }
 

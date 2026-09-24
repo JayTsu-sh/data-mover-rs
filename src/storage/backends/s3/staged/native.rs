@@ -1,15 +1,15 @@
 use tokio_util::sync::CancellationToken;
 
-use crate::model::Operation;
+use crate::model::{FailureClass, Operation, Transience};
 use crate::storage::{
     NativeStageEvidence, NativeStageFailure, PreparedStage, StorageRoleFailure, WriteEvidence,
 };
 
-use super::super::source::{cancelled, entry, role_failure};
+use super::super::source::{cancelled, classified_entry, entry, role_failure};
 use super::super::{
     S3_NATIVE_COPY_SINGLE_MAX, S3NativeCopyEvidence, S3NativeCopySource, S3Protocol,
 };
-use super::{PART_SIZE, S3StagedDestination, StageState, cleanup_result, single};
+use super::{PART_SIZE, S3StagedDestination, StageState, at_destination, cleanup_result, single};
 
 struct NativeFillFailure {
     error: StorageRoleFailure,
@@ -46,6 +46,19 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         source: &S3NativeCopySource,
         cancel: &CancellationToken,
     ) -> Result<S3NativeCopyEvidence, NativeFillFailure> {
+        if at_destination::of(stage).is_some() {
+            // A native copy to the final key arrives with ADR-0006 C18.
+            return Err(native_role_failure(
+                classified_entry(
+                    stage.final_destination.path(),
+                    Operation::Write,
+                    FailureClass::Unsupported,
+                    Transience::Permanent,
+                    "a native S3 copy cannot fill an upload on the final key yet",
+                ),
+                0,
+            ));
+        }
         let baseline = u64::from(source.size > S3_NATIVE_COPY_SINGLE_MAX);
         self.adopt_single_stage(stage, source).await;
         let (key, upload_id) = self

@@ -305,6 +305,52 @@ exact keys only, AWS / Ceph / StorageGRID by prefix). `composite_etag` computes
 (SSE-KMS). `InvalidPart` / `InvalidPartOrder` map to a permanent `Conflict`, `EntityTooSmall` to a
 permanent `Corruption`. The temp-key path passes part MD5s and ignores the completion's facts.
 
+As built (C15b, S3 multipart on the final key — switch still off): `prepare_at_destination` gives an
+object of known size ≤ T a C14b single stage after looking only at the pointer (HEAD, then GET if one
+is there: a leftover is deleted with every upload on the key and reported as `Restarted` — `Requested`
+for a restart request or a pointer of this binding, else `PointerCorrupt` / `OtherTransfer` /
+`BindingChanged`; no upload listing, for cost). A larger or unknown-size object runs `discover` and
+gets a multipart upload **on the final key**. Its pointer is the `.data-mover-<d>.upload` object beside
+the key: `DMDPTR01` **without a durable prefix** (the service's `ListParts` is the durable record, and a
+pointer rewritten at every checkpoint would leave a version each time in a versioned bucket) with the
+extension `DMS3UP01 ‖ nonce16 ‖ u64le part size ‖ u16le len ‖ upload id` (upload id non-empty UTF-8,
+part size in [5 MiB, 5 GiB] and able to hold the source in 10 000 parts; anything else is refused and
+cleaned as `PointerCorrupt`). It is written with one `PutObject` carrying `Content-MD5` — atomic, no
+temporary; a failed PUT whose object reads back byte for byte counts as written — read with a HEAD and
+a ranged GET pinned to it, and deleted with `DeleteObject`. `observe_stage` with an accepted pointer is
+`ListParts` of its upload (`NoSuchUpload` → no stage) reduced to the **contiguous prefix**: parts
+`1..=k`, each exactly the pointer's part size and within the source's size, the last one shorter only
+if it ends exactly at the source's size, stopping at the source's size. **A gap is not corruption**
+(parts complete out of order, so a killed writer leaves some; the temp-key path still treats a gap as a
+permanent `Corruption` and aborts): the parts after it are uploaded again, and uploading a part number
+again replaces it; a part that would pass the source's end is re-uploaded too, so `StageBeyondSource`
+cannot arise. Without an accepted pointer the stage is "any upload listed on the exact key"
+(`StageWithoutPointer` cleans it); `remove_stage` aborts every upload on the key. `continues_from_stage`
+stays false: a pointer without a durable prefix already resumes from what the stage proves. A resume
+rewrites the pointer with a new nonce (take-over) and then aborts any other upload on the key; the
+stage's state (upload id, part size, the prefix's (number, `ETag`)s, fence, tags, completion facts)
+lives in `PreparedStage::backend_state`. A fresh or restarted stage begins its upload after discovery
+cleaned the key; a `recoverable` one writes its pointer at once, any other at its first deferred
+checkpoint — the first time the parts the service acknowledged in this `write` reach the interval —
+which also turns its recovery on. S3 declares the 64 MiB automatic interval only while the switch is
+on, so a checkpointed transfer of at most 64 MiB never writes a pointer (D3); with the switch off the
+store path's planning (register from the start) is unchanged. `write` streams the parts after the
+prefix and does not complete. `verification_point` is `AfterPublish`. `publish` checks the fence (the
+pointer must carry our nonce, or be absent if we never wrote one; otherwise a permanent `Conflict`, the
+final key unchanged) and completes with every (number, `ETag`); the composite check runs when every
+part this `write` sent came back with its MD5 (the parts of one upload share its encryption, so the
+resumed prefix answers the same way; with no part sent there is nothing to check). A failed completion
+is settled by `ListParts`: still listed → nothing completed (`final_destination_changed` false, stage
+kept); `NoSuchUpload` → our size and composite `ETag` at the final key count as published (no version
+claimed, as C14c), anything else is a `Conflict` with the final key changed. Tags applied before
+publication are set after the completion; then the pointer is deleted (if we found ours there) and
+the evidence carries the completion's version. Verify reads back pinned by version or `If-Match` (E1).
+`discard` checks the fence and, while the upload is still ours, deletes the pointer and then aborts
+the upload; it never touches the final key. A native copy refuses an upload on the final key
+(`Unsupported`) until C18, and such a stage has no local recovery identity. The fence is a check, not a
+lock, as on NFS / CIFS / HDFS. Real-machine verification (the 200 MiB cancel / SIGKILL matrix) comes
+with C15c, which turns the switch on.
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS

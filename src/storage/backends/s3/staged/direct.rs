@@ -201,6 +201,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             key: path.as_str(),
             upload_id,
             part_size: upload.part_size,
+            checkpoint: None,
         };
         let sent = self.upload_parts(&target, Vec::new(), input).await?;
         let size = sent.bytes;
@@ -388,7 +389,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
 }
 
 /// Whether `etag` has the multipart form `"<hex>-<parts>"`.
-fn is_composite(etag: &str) -> bool {
+pub(super) fn is_composite(etag: &str) -> bool {
     etag.trim_matches('"')
         .rsplit_once('-')
         .is_some_and(|(_, count)| {

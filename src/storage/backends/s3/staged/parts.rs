@@ -1,8 +1,10 @@
 //! Streaming a byte stream into the parts of one multipart upload, a few parts in flight: shared
-//! by the temp-key stage and the `Direct` upload on the final key.
+//! by the temp-key stage, the `Direct` upload on the final key and the checkpointed upload on the
+//! final key (ADR-0006 C15b), which also asks to be told when its first checkpoint is reached.
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::{Bytes, BytesMut};
@@ -23,6 +25,16 @@ pub(super) struct PartTarget<'a> {
     pub(super) key: &'a str,
     pub(super) upload_id: &'a str,
     pub(super) part_size: usize,
+    /// Reached once, as soon as the parts this call sent and the service acknowledged hold at
+    /// least `.0` bytes.
+    pub(super) checkpoint: Option<(u64, &'a dyn PartsCheckpoint)>,
+}
+
+/// What an upload does at its first checkpoint (the checkpointed upload on the final key writes
+/// its pointer there).
+#[async_trait]
+pub(super) trait PartsCheckpoint: Sync {
+    async fn reached(&self) -> Result<(), StorageRoleFailure>;
 }
 
 /// What [`S3StagedDestination::upload_parts`] sent.
@@ -45,21 +57,24 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     /// every part `part_size` bytes but the last, each with `Content-MD5`. An upload that would
     /// otherwise have no part gets one empty part.
     ///
-    /// A failed input waits for the parts in flight, then fails; a failed part fails at once.
+    /// A failed input waits for the parts in flight, then fails; a failed part — or a failed
+    /// checkpoint — fails at once.
     pub(super) async fn upload_parts(
         &self,
         target: &PartTarget<'_>,
         parts: Vec<(i32, String)>,
         mut input: ByteStream,
     ) -> Result<UploadedParts, StorageRoleFailure> {
-        let failed = |error| role_failure(target.path, Operation::Write, error);
-        let mut sent = UploadedParts {
-            parts,
-            bytes: 0,
-            md5_etags: true,
-        };
+        let mut progress = Progress::new(target, parts);
         let mut buffered = BytesMut::with_capacity(target.part_size);
-        let mut number = sent.parts.iter().map(|part| part.0).max().unwrap_or(0) + 1;
+        let mut number = progress
+            .sent
+            .parts
+            .iter()
+            .map(|part| part.0)
+            .max()
+            .unwrap_or(0)
+            + 1;
         let mut inflight = FuturesUnordered::new();
         while let Some(chunk) = input.next().await {
             let chunk = match chunk {
@@ -69,7 +84,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                     return Err(input_failure);
                 }
             };
-            sent.bytes += chunk.len() as u64;
+            progress.sent.bytes += chunk.len() as u64;
             buffered.extend_from_slice(&chunk);
             while buffered.len() >= target.part_size {
                 let part = buffered.split_to(target.part_size).freeze();
@@ -83,18 +98,18 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                             "S3 inflight upload disappeared",
                         ));
                     };
-                    sent.record(completed.map_err(failed)?);
+                    progress.record(completed).await?;
                 }
             }
         }
-        if !buffered.is_empty() || (sent.parts.is_empty() && inflight.is_empty()) {
+        if !buffered.is_empty() || (progress.sent.parts.is_empty() && inflight.is_empty()) {
             inflight.push(self.upload_part_to(target, number, buffered.freeze()));
         }
         while let Some(part) = inflight.next().await {
-            sent.record(part.map_err(failed)?);
+            progress.record(part).await?;
         }
-        sent.parts.sort_by_key(|part| part.0);
-        Ok(sent)
+        progress.sent.parts.sort_by_key(|part| part.0);
+        Ok(progress.sent)
     }
 
     fn upload_part_to(
@@ -102,14 +117,56 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         target: &PartTarget<'_>,
         number: i32,
         part: Bytes,
-    ) -> impl Future<Output = Result<SentPart, S3ProtocolFailure>> + use<P> {
-        upload(
+    ) -> impl Future<Output = (Result<SentPart, S3ProtocolFailure>, u64)> + use<P> {
+        let length = part.len() as u64;
+        let sent = upload(
             self.protocol.clone(),
             target.key.to_string(),
             target.upload_id.to_string(),
             number,
             part,
-        )
+        );
+        async move { (sent.await, length) }
+    }
+}
+
+/// The parts sent so far, and the checkpoint still to reach.
+struct Progress<'a> {
+    path: &'a StoragePath,
+    sent: UploadedParts,
+    acknowledged: u64,
+    checkpoint: Option<(u64, &'a dyn PartsCheckpoint)>,
+}
+
+impl<'a> Progress<'a> {
+    fn new(target: &PartTarget<'a>, parts: Vec<(i32, String)>) -> Self {
+        Self {
+            path: target.path,
+            sent: UploadedParts {
+                parts,
+                bytes: 0,
+                md5_etags: true,
+            },
+            acknowledged: 0,
+            checkpoint: target.checkpoint,
+        }
+    }
+
+    /// Records one acknowledged part; reaches the checkpoint once its bytes are acknowledged.
+    async fn record(
+        &mut self,
+        (part, length): (Result<SentPart, S3ProtocolFailure>, u64),
+    ) -> Result<(), StorageRoleFailure> {
+        let part = part.map_err(|error| role_failure(self.path, Operation::Write, error))?;
+        self.sent.record(part);
+        self.acknowledged += length;
+        if let Some((at, checkpoint)) = self.checkpoint
+            && self.acknowledged >= at
+        {
+            self.checkpoint = None;
+            checkpoint.reached().await?;
+        }
+        Ok(())
     }
 }
 

@@ -8,14 +8,15 @@ use tokio::sync::Mutex;
 use crate::model::{BackendIdentity, FailureClass, Operation, Transience};
 use crate::storage::artifacts::ARTIFACT_PREFIX;
 use crate::storage::{
-    ByteStream, CheckpointObservation, Metadata, MetadataMutation, PrepareRequest, PreparedStage,
-    PublicationEvidence, PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity,
-    StagedDestination, StorageRoleFailure, VerificationEvidence, VerificationPoint, VerifyRequest,
-    WriteEvidence,
+    ByteStream, CheckpointObservation, DestinationPrepareRequest, Metadata, MetadataMutation,
+    PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest,
+    RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure, VerificationEvidence,
+    VerificationPoint, VerifyRequest, WriteEvidence,
 };
 
 use super::source::{cancelled, classified_entry, entry, role_failure};
 
+mod at_destination;
 mod direct;
 #[cfg(test)]
 mod manifest_tests;
@@ -30,6 +31,8 @@ mod single;
 mod single_tests;
 #[cfg(test)]
 mod sizing_tests;
+mod upload_discovery;
+mod upload_pointer;
 use super::{S3Protocol, S3ProtocolFailure};
 use recovery::resumable_parts;
 pub(crate) use single::{DEFAULT_SINGLE_PUT_THRESHOLD, single_put_threshold};
@@ -76,6 +79,12 @@ pub(crate) struct S3StagedDestination<P> {
     /// every object through a multipart upload.
     single_put_threshold: Option<u64>,
     tags_supported: bool,
+    /// The transition switch of ADR-0006: whether recovery state is kept at the destination
+    /// (`prepare_at_destination`, C15b) instead of the local recovery store. Off until C15c.
+    recovery_at_destination: bool,
+    /// The automatic checkpoint interval on the at-destination route: where a checkpointed upload
+    /// writes its pointer.
+    checkpoint_interval: u64,
 }
 
 impl<P> S3StagedDestination<P> {
@@ -87,7 +96,24 @@ impl<P> S3StagedDestination<P> {
             metadata: None,
             single_put_threshold: Some(single::DEFAULT_SINGLE_PUT_THRESHOLD),
             tags_supported: true,
+            recovery_at_destination: false,
+            // Named in full: the architecture guard refuses imports between backend modules.
+            checkpoint_interval: crate::storage::backends::DEFAULT_CHECKPOINT_INTERVAL_BYTES,
         }
+    }
+
+    /// A shorter automatic checkpoint interval, so engine tests need not move 64 MiB.
+    #[cfg(test)]
+    pub(crate) fn with_checkpoint_interval(mut self, interval: u64) -> Self {
+        self.checkpoint_interval = interval;
+        self
+    }
+
+    /// Keeps recovery state at the destination (ADR-0006 C15b), as C15c will by default.
+    #[cfg(test)]
+    pub(crate) fn with_recovery_at_destination(mut self, enabled: bool) -> Self {
+        self.recovery_at_destination = enabled;
+        self
     }
 
     /// Sends sources of at most `threshold` bytes as one `PutObject`; `None` sends every object
@@ -263,6 +289,24 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         true
     }
 
+    fn recovery_at_destination(&self) -> bool {
+        self.recovery_at_destination
+    }
+
+    /// Only on the at-destination route: the local store keeps its own planning (every
+    /// checkpointed upload registers from the start) while the switch is off.
+    fn automatic_checkpoint_interval_bytes(&self) -> Option<u64> {
+        self.recovery_at_destination
+            .then_some(self.checkpoint_interval)
+    }
+
+    async fn prepare_at_destination(
+        &self,
+        request: DestinationPrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        self.prepare_at_destination_stage(request).await
+    }
+
     async fn prepare_direct(
         &self,
         request: PrepareRequest,
@@ -330,6 +374,16 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         stage: &PreparedStage,
     ) -> Result<RecoveryIdentity, StorageRoleFailure> {
         self.validate(stage)?;
+        if stage.at_destination {
+            // Its recovery state is the pointer beside the final key; nothing is kept locally.
+            return Err(classified_entry(
+                stage.final_destination.path(),
+                Operation::Prepare,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "an S3 stage kept at the destination has no local recovery identity",
+            ));
+        }
         RecoveryIdentity::from_bytes(stage.token.clone()).map_err(|e| {
             entry(
                 stage.final_destination.path(),
@@ -405,6 +459,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         if let Some(single) = single::of(stage) {
             return single::write(stage, single, input).await;
         }
+        if let Some(upload) = at_destination::of(stage) {
+            return self.write_final_upload(stage, upload, input).await;
+        }
         let initial = self.stage_state(stage, Operation::Write).await?;
         if initial.completed {
             return Ok(WriteEvidence {
@@ -419,6 +476,7 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
             key: &key,
             upload_id: &upload_id,
             part_size,
+            checkpoint: None,
         };
         let parts = self
             .upload_parts(&target, initial.parts, input)
@@ -465,6 +523,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
             return Ok(CheckpointObservation {
                 durable_prefix: single.written_len(),
             });
+        }
+        if let Some(upload) = at_destination::of(stage) {
+            return self.observe_final_upload(stage, upload).await;
         }
         let stage_state = self
             .states
@@ -518,6 +579,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         }
         if let Some(single) = single::of(stage) {
             return single::verify(self, stage, single, &request).await;
+        }
+        if let Some(upload) = at_destination::of(stage) {
+            return self.verify_final_upload(stage, upload, &request).await;
         }
         let key = self.validate(stage)?;
         let facts = self
@@ -576,6 +640,8 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 return Err(metadata_unavailable(stage));
             }
             return single::apply_metadata(stage, single, self.tags_supported, mutation, &cancel);
+        } else if let Some(upload) = at_destination::of(stage) {
+            return self.apply_final_upload_metadata(stage, upload, mutation, &cancel);
         }
         let path = crate::model::StoragePath::new(key).map_err(|error| {
             entry(
@@ -602,6 +668,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         if let Some(single) = single::of(stage) {
             return single::publish(self, stage, single, &request).await;
         }
+        if let Some(upload) = at_destination::of(stage) {
+            return self.publish_final_upload(stage, upload, &request).await;
+        }
         publication::publish(self, stage, request).await
     }
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
@@ -612,6 +681,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         if single::of(&stage).is_some() {
             // Nothing was sent before publication, and a published object is never deleted.
             return Ok(());
+        }
+        if let Some(upload) = at_destination::of(&stage) {
+            return self.discard_final_upload(&stage, upload).await;
         }
         let stage_state = self
             .states
@@ -647,10 +719,10 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         Ok(())
     }
 
-    /// A single PUT and a `Direct` write write the final key itself, so it is read back only
-    /// after publication.
+    /// A single PUT, a `Direct` write and an upload on the final key write the final key itself,
+    /// so it is read back only after publication.
     fn verification_point(&self, stage: &PreparedStage) -> VerificationPoint {
-        if stage.direct || single::of(stage).is_some() {
+        if stage.direct || single::of(stage).is_some() || at_destination::of(stage).is_some() {
             VerificationPoint::AfterPublish
         } else {
             VerificationPoint::BeforePublish

@@ -35,6 +35,8 @@ pub(crate) struct MemoryS3 {
     pub(super) uploads: Mutex<UploadParts>,
     tags: Mutex<HashMap<String, Vec<ObjectTag>>>,
     tag_reads: Mutex<u32>,
+    /// `AbortMultipartUpload` requests that got past `abort_failure`, whether or not the upload
+    /// was still there.
     pub(crate) aborts: Mutex<u32>,
     pub(super) abort_failure: Mutex<Option<S3ProtocolFailure>>,
     pub(crate) head_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
@@ -55,6 +57,11 @@ pub(crate) struct MemoryS3 {
     /// The next `complete_multipart` stores its object, then loses the reply (a transient
     /// connectivity failure).
     pub(crate) complete_commits_then_fails: Mutex<bool>,
+    /// The next `complete_multipart` fails with this, completing nothing.
+    pub(crate) complete_failure: Mutex<Option<S3ProtocolFailure>>,
+    /// The next `complete_multipart` that stores its object reports this `ETag` instead of the
+    /// composite one.
+    pub(crate) complete_etag: Mutex<Option<String>>,
     /// Uploading this part number fails with this failure (every time, until cleared).
     pub(crate) part_failure: Mutex<Option<(i32, S3ProtocolFailure)>>,
     /// `PutObject` requests received, multipart uploads begun, parts uploaded and completions
@@ -361,6 +368,9 @@ impl S3Protocol for MemoryS3 {
         id: &str,
         parts: &[(i32, String)],
     ) -> S3Result<S3WriteFacts> {
+        if let Some(failure) = self.complete_failure.lock().await.take() {
+            return Err(failure);
+        }
         let (key, stored) = self
             .uploads
             .lock()
@@ -392,15 +402,21 @@ impl S3Protocol for MemoryS3 {
                 "complete response lost",
             ));
         }
-        Ok(S3WriteFacts::new(composite, version))
+        let reported = self.complete_etag.lock().await.take().unwrap_or(composite);
+        Ok(S3WriteFacts::new(reported, version))
     }
     async fn abort_multipart(&self, _key: &str, id: &str) -> S3Result<()> {
         if let Some(failure) = self.abort_failure.lock().await.clone() {
             return Err(failure);
         }
-        self.uploads.lock().await.remove(id);
         *self.aborts.lock().await += 1;
-        Ok(())
+        // An upload that completed or was aborted is gone: `NoSuchUpload`, as S3 answers.
+        self.uploads
+            .lock()
+            .await
+            .remove(id)
+            .map(drop)
+            .ok_or_else(|| missing_upload("S3 AbortMultipartUpload request failed"))
     }
     async fn list_parts(&self, _key: &str, id: &str) -> S3Result<Vec<S3PartFacts>> {
         Ok(self

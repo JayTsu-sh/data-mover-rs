@@ -149,7 +149,8 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   回复丢失 → HEAD 对账（大小相同且 `ETag` = 我们的 MD5 算已发布），否则 `final_destination_changed`。
 - 校验在发布**之后**（`verification_point` = `AfterPublish`）：先 HEAD 当前对象（`ETag` / 版本已不是我们的
   → `Conflict`），再按我们的 versionId 读；桶无版本时带 `If-Match: <我们的 ETag>` 读。
-- 大于 T、大小未知、原生 S3→S3 仍走 temp key 分段上传 + CopyObject（C15 / C18 再改）。
+- 大于 T、大小未知、原生 S3→S3 仍走 temp key 分段上传 + CopyObject（开关打开后大对象走 C15b 的最终 key 分段上传；
+  原生拷贝 C18 再改）。
 
 ### `Direct`（ADR-0006 C14c）
 
@@ -179,6 +180,38 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - `MemoryS3`：分段校验 MD5、同号分段覆盖、Complete 核对 (号, ETag) 表并按表拼对象、返回复合 ETag 与版本、
   `complete_commits_then_fails` 注入「已提交但回复丢失」、`part_failure` 注入某段失败。
 
+### 最终 key 上的分段上传与 `.upload` 指针（ADR-0006 C15b，开关仍关）
+
+- 开关 `recovery_at_destination()`（`S3StagedDestination` 字段，真连接恒为 `false`，C15c 打开；测试用
+  `with_recovery_at_destination(true)` / `connect_at_destination`）。**开关开时**才声明自动 checkpoint 间隔
+  64 MiB（`automatic_checkpoint_interval_bytes`）：关着时 store 路径的规划（Checkpointed 从头登记）不变。
+- `prepare_at_destination`（`staged/at_destination.rs`）：已知大小 ≤ T → C14b single stage，但先只看指针
+  （HEAD，有才 GET；有遗留 → 删指针 + abort 该 key 上所有 upload，报 `Restarted{..}`；不列 upload，省请求）。
+  > T 或大小未知 → `discover`，然后在**最终 key** 上分段上传：
+  - 指针对象 `.data-mover-<d>.upload`（`sibling_artifact(final, Upload)`，`staged/upload_pointer.rs`）：
+    `DMDPTR01`，**无 durable prefix**（`ListParts` 才是持久记录；每个 checkpoint 重写会在版本化桶里各留一个版本），
+    扩展 `DMS3UP01 ‖ nonce16 ‖ u64le 分段大小 ‖ u16le 长度 ‖ upload id`。一次带 Content-MD5 的 `PutObject`
+    写入（原子，不用临时名；失败但读回逐字节相同算写成），HEAD + 钉住的 ranged GET 读，`DeleteObject` 删。
+    `accepts_pointer` 只认这个形状（无前缀、tag 对、id 非空 UTF-8、分段 ∈ [5 MiB, 5 GiB] 且 10000 段装得下）。
+  - `observe_stage`：有可接受指针 → `ListParts`（`NoSuchUpload` → 无 stage）取**连续前缀**：第 1..k 段，每段
+    恰为指针的分段大小且不超出源大小；只有最后一段可以更短，且必须恰好结束在源大小。**缺段不是错误**（SIGKILL 后
+    分段乱序完成会留缺口；旧 temp-key 路径把缺口当永久 `Corruption` 并 abort）：缺口后的分段重传，同号覆盖。
+    无指针 → 该 key 上有 upload 即 `Some(0)`（`StageWithoutPointer` 清掉）。`remove_stage` abort key 上所有 upload。
+  - Resume → 用新 nonce 重写指针（接管），再 abort key 上**其他** upload；Fresh / Restarted → discovery 已清场，
+    `CreateMultipartUpload`；`recoverable` 立即写指针，否则在第一个 deferred checkpoint（本次 write 被服务端确认的
+    分段字节数达到间隔时）写，并打开 recovery。
+- `write` 从前缀后的段号续传（复用 `parts.rs`，`PartTarget.checkpoint` 钩子），**不 Complete**；
+  `verification_point` = `AfterPublish`。
+- `publish`：先查栅栏（指针须带我们的 nonce；从未写过则须不存在；否则永久 `Conflict`，最终 key 未变）→
+  用全部 (段号, ETag) Complete → 本次 write 发出的段 ETag 都是其 MD5 时核对复合 ETag（不符 → 永久 `Corruption`，
+  最终 key 已变；同一 upload 的加密方式一致，所以续传前缀也适用）→ Complete 失败：`ListParts` 仍列得到 → 没完成，
+  `final_destination_changed=false`，保留 stage；`NoSuchUpload` → HEAD 大小 + 复合 ETag 对上算已发布（不认领版本，
+  同 C14c），否则 `Conflict` 且最终 key 已变 → 设 tags → 删指针（若是我们的）→ 证据带版本。
+- `discard`：查栅栏；仍是我们的 → 先删指针再 abort；被接管 → 什么都不动；从不碰最终 key。原生拷贝遇到这种
+  stage → `Unsupported`（C18）；它没有本地 recovery identity。
+- `MemoryS3` 新增：`complete_failure`（Complete 失败且不提交）、`complete_etag`（Complete 报告指定 ETag）；
+  abort 不存在的 upload → `NoSuchUpload`（NotFound），`aborts` 计请求数。
+
 ### legacy 列举隐藏传输 artifact（ADR-0006 C3）
 
 - `walkdir` / `walkdir_2`（含版本化桶的版本与删除标记）跳过相对存储根的任意一段以 `.data-mover-` 开头的
@@ -186,7 +219,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   列举；从根以下的 artifact 内开始遍历（`sub_path = ".data-mover-stage"`）则为空。
 - `delete_dir_all_with_progress` **不**过滤：删目录会连其中的 artifact 一起删，并为它们发 `DeleteEvent`
   （路径不曾出现在列举里，按删除数与列举数对账会差出这些）。今天 S3 stage 集中在根下 `.data-mover-stage/`，
-  删子目录删不到它的孤儿；同目录 `.upload` 指针要到 C14/C15。
+  删子目录删不到它的孤儿；同目录的 `.upload` 指针（C15b）会随目录一起删。
 - 代价：用户自己命名为 `.data-mover-*` 的对象从 S3 源端列举中消失；孤儿 `.data-mover-stage/` 只能用 S3
   原生工具（或 `resume_matrix.sh` 的清理）看到。
 - 真机（`examples/s3_listing`，2026-09-24）：MinIO / DXN / StorageGRID 非版本化，MinIO / DXN 临时版本化桶，
