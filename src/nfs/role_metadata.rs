@@ -1,14 +1,15 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 
 use super::{
-    MAX_STALE_RETRIES, NFSStorage, classify_role_error, invalidate_path_cache,
+    MAX_STALE_RETRIES, NFSFileHandle, NFSStorage, classify_role_error, invalidate_path_cache,
     is_retryable_with_invalidation,
 };
 use crate::storage::backends::nfs::metadata::{NfsMetadataInline, NfsMetadataProtocol};
+use crate::storage::backends::nfs::protocol::classify_error;
 use crate::storage::backends::nfs::source::NfsProtocolFailure;
 
 impl NFSStorage {
@@ -24,6 +25,27 @@ impl NFSStorage {
         let components = Self::collect_components(path).map_err(classify_role_error)?;
         invalidate_path_cache(&components, &cache_root);
         Ok(())
+    }
+
+    /// SETATTR for the metadata role. The server's refusal is classified from the nfs-rs error
+    /// itself — a refused chown is `PermissionDenied` and names `NFS4ERR_PERM` — rather than from
+    /// the legacy string wrapping, which made every refusal `Protocol` with no status.
+    async fn setattr_role(
+        &self,
+        path: &crate::model::StoragePath,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        mode: Option<u32>,
+    ) -> Result<(), NfsProtocolFailure> {
+        let native = Path::new(path.as_str());
+        let object = self.lookup_fh(native).await.map_err(classify_role_error)?;
+        let handle = NFSFileHandle::new(object.fh, PathBuf::from(native));
+        self.setattr_retrying(&handle, atime, mtime, uid, gid, mode)
+            .await
+            .map_err(classify_role_error)?
+            .map_err(classify_error)
     }
 }
 
@@ -70,9 +92,7 @@ impl NfsMetadataProtocol for NFSStorage {
                     self.invalidate_acl_lookup(native, generation).await?;
                 }
                 Err(error) => {
-                    return Err(crate::storage::backends::nfs::protocol::classify_error(
-                        error,
-                    ));
+                    return Err(classify_error(error));
                 }
             }
         }
@@ -116,9 +136,7 @@ impl NfsMetadataProtocol for NFSStorage {
                     self.invalidate_acl_lookup(native, generation).await?;
                 }
                 Err(error) => {
-                    return Err(crate::storage::backends::nfs::protocol::classify_error(
-                        error,
-                    ));
+                    return Err(classify_error(error));
                 }
             }
         }
@@ -146,8 +164,8 @@ impl NfsMetadataProtocol for NFSStorage {
         path: &crate::model::StoragePath,
         value: crate::model::OwnershipMode,
     ) -> Result<(), NfsProtocolFailure> {
-        self.update_metadata(
-            Path::new(path.as_str()),
+        self.setattr_role(
+            path,
             None,
             None,
             Some(value.uid),
@@ -155,7 +173,6 @@ impl NfsMetadataProtocol for NFSStorage {
             Some(value.mode),
         )
         .await
-        .map_err(classify_role_error)
     }
 
     async fn set_mode(
@@ -163,9 +180,8 @@ impl NfsMetadataProtocol for NFSStorage {
         path: &crate::model::StoragePath,
         mode: u32,
     ) -> Result<(), NfsProtocolFailure> {
-        self.update_metadata(Path::new(path.as_str()), None, None, None, None, Some(mode))
+        self.setattr_role(path, None, None, None, None, Some(mode))
             .await
-            .map_err(classify_role_error)
     }
 
     async fn set_timestamps(
@@ -183,8 +199,7 @@ impl NfsMetadataProtocol for NFSStorage {
             .map(|time| i64::try_from(time.unix_nanos()))
             .transpose()
             .map_err(|_| NfsProtocolFailure::protocol())?;
-        self.update_metadata(Path::new(path.as_str()), atime, mtime, None, None, None)
+        self.setattr_role(path, atime, mtime, None, None, None)
             .await
-            .map_err(classify_role_error)
     }
 }

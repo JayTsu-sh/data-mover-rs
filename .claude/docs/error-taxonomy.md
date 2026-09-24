@@ -82,6 +82,36 @@
 | `ENOSPC` | `InsufficientSpace(...)` |
 | 其他 | `NfsError(...)` |
 
+上表是 legacy `StorageError` 路径。role 路径（`src/storage/backends/nfs/protocol.rs::classify_error`）直接从
+nfs-rs 错误产出 `FailureClass` + `Transience`，并记下服务端状态名（诊断如
+`NFS role failed: NFS4ERR_PERM (permission denied)`）。**先看 nfs-rs 的 `OperationOutcome` 包装**：
+被包装的错误按恢复动作分类，里面的状态只用来命名（例如 `DoNotRetry` 包着 `NFS4ERR_PERM` 是
+`Protocol` / Permanent，不是 `PermissionDenied`）。
+
+| nfs-rs 错误 | FailureClass | Transience |
+|---|---|---|
+| `OperationOutcome` Retry / Remount | `Connectivity` | Transient |
+| `OperationOutcome` Reopen | `Protocol` | Transient |
+| `OperationOutcome` VerifyThenResume | `Protocol` | Unknown |
+| `OperationOutcome` DoNotRetry | `Protocol` | Permanent |
+| `Unsupported` | `Unsupported` | Permanent |
+| NOENT 类（`is_not_found`） | `NotFound` | Permanent |
+| `NFS3ERR_ACCES` / `NFS3ERR_PERM` / `NFS4ERR_ACCESS` / `NFS4ERR_PERM` | `PermissionDenied` | Permanent |
+| `NFS3ERR_NOSPC` / `NFS4ERR_NOSPC` | `Capacity` | Permanent |
+| `InvalidInput` | `InvalidInput` | Permanent |
+| `Io` PermissionDenied / NotFound | `PermissionDenied` / `NotFound` | Permanent |
+| `Io` ConnectionReset / TimedOut / WouldBlock | `Connectivity` | Transient |
+| 其他 `Io` / `Rpc` | `Connectivity` | Unknown |
+| `NFS4ERR_DELAY` | `Protocol` | Transient |
+| 其他服务端状态（如 `NFS4ERR_BADOWNER`、`NFS4ERR_STALE`） | `Protocol` | Unknown |
+
+`Connectivity` 经 `role_failure` 升为会话失败（metadata 阶段报 `SessionLost`，后面的族不再应用）；
+经 `entry_scoped` 的调用方（可选元数据的 Required 读取）不升级。
+
+元数据角色的 SETATTR（mode / owner / 时间）也走这张表（K3b，`setattr_role`）；此前经 legacy 字符串包装，
+被拒一律是 `Protocol` / Unknown、没有状态名、也从不升为会话失败。SETATTR 之前的 LOOKUP 与 stale 重试里的
+re-lookup 仍走 legacy `classify_role_error`，失败时没有状态。
+
 ### CIFS
 
 CIFS 只有 role-based 实现，不经过 `StorageError`；映射表在

@@ -124,9 +124,9 @@ flush 失败经 `classify` 成 Entry 级，被当成那一条的拒绝 —— �
 - Metadata 阶段的 `TransferFailure` 不实现 `source()`：Display 已经完整，链式打印会重复。
 - 读源端元数据失败：标题 "observing source metadata failed" + 存储失败及其诊断。
 
-诊断是适配器按契约已脱敏的文本（R8）。NFS 的 ACL 读写失败带服务端状态名，例如
-`NFS role failed: NFS4ERR_PERM (permission denied)`；mode / owner / 时间的 SETATTR 目前还没有
-（见 storage-nfs.md「Retry Taxonomy」的缺口）。
+诊断是适配器按契约已脱敏的文本（R8）。服务端拒绝 NFS 的 ACL 读写与 mode / owner / 时间的 SETATTR 时，
+诊断带服务端状态名，例如 chown 被拒是 `NFS role failed: NFS4ERR_PERM (permission denied)`；SETATTR 之前的
+LOOKUP 失败与 xattr 路径还没有（见 storage-nfs.md「Retry Taxonomy」的缺口）。
 
 ## 真机证据（2026-09-23，`examples/nfs_metadata_copy.rs`）
 

@@ -115,6 +115,21 @@ mod tests {
                 FailureClass::PermissionDenied,
                 Transience::Permanent,
             ),
+            // A refused chown: the metadata role's SETATTR reaches this arm unwrapped.
+            (
+                nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_PERM),
+                FailureClass::PermissionDenied,
+                Transience::Permanent,
+            ),
+            // The recovery wrapper decides the class before the status inside it does.
+            (
+                wrapped(
+                    nfs_rs::RecoveryAction::DoNotRetry,
+                    nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_PERM),
+                ),
+                FailureClass::Protocol,
+                Transience::Permanent,
+            ),
             (
                 nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_NOENT),
                 FailureClass::NotFound,

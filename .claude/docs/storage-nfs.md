@@ -55,8 +55,10 @@ NFS 错误必须按 commit `7eb3046` 的分类映射：
 诊断是 `NFS role failed: NFS4ERR_BADOWNER (bad owner)` / `NFS session failed: NFS4ERR_BADSESSION (...)`；
 nfs-rs 包在 `OperationOutcome` 里的状态也会取出来。传输 / 客户端侧失败没有状态，诊断仍是
 `NFS role failed`。分类（class / transience）不受影响。
-**缺口**：走 legacy `StorageError` 再 `classify_role_error` 的路径（`nfs.rs` 的 SETATTR —— mode /
-owner / 时间 —— xattr、namespace、staged 的多数操作）在转成字符串时丢了 nfs-rs 错误，没有状态。
+元数据角色的 SETATTR（mode / owner / 时间）经 `NFSStorage::setattr_retrying` 保留服务端对 SETATTR 的
+回答，也走 `classify_error`（分类见 [error-taxonomy.md](error-taxonomy.md)）。
+**缺口**：仍走 legacy `StorageError` 再 `classify_role_error` 的路径（SETATTR 之前的 LOOKUP / re-lookup、
+xattr、namespace、staged 的多数操作）在转成字符串时丢了 nfs-rs 错误，没有状态。
 
 ## NfsEnrich
 
