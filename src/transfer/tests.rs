@@ -879,6 +879,44 @@ async fn a_second_concurrent_transfer_is_refused_at_prepare()
     Ok(())
 }
 
+/// A Direct transfer of a file an interrupted checkpointed run left a stage for cleans the stage
+/// up first and says so in its outcome (ADR-0006 C9c).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_direct_transfer_reports_the_stage_it_cleaned_up()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = TestRoot::new("direct-clean-source")?;
+    let destination_root = TestRoot::new("direct-clean-destination")?;
+    let payload = vec![0x45; 3 * 64 * 1024 + 5];
+    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    let (destination, role) =
+        test_destination_storage_with_role(destination_root.path(), "direct-clean-destination")?;
+    role.set_automatic_checkpoint_interval(64 * 1024);
+    let request = |policy| -> Result<TransferRequest, Box<dyn std::error::Error>> {
+        Ok(transfer_request(
+            local_source(source_root.path())?,
+            destination.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        )?
+        .with_transfer_policy(policy))
+    };
+    drop(run_until_transferred(request(TransferPolicy::Checkpointed)?).await?);
+    assert!(staging_entry_count(destination_root.path())? > 0);
+    let outcome = transfer(request(TransferPolicy::Direct)?).await?;
+    assert_eq!(
+        outcome.prepare,
+        PrepareFact::Restarted {
+            reason: RestartReason::Requested
+        }
+    );
+    assert_eq!(
+        std::fs::read(destination_root.path().join("final.bin"))?,
+        payload
+    );
+    assert_eq!(staging_entry_count(destination_root.path())?, 0);
+    Ok(())
+}
+
 /// Local keeps its recovery state at the destination (ADR-0006 C8): neither an interrupted
 /// transfer nor its resume leaves anything in the local recovery store.
 #[tokio::test]

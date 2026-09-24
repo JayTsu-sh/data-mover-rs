@@ -76,9 +76,8 @@ pub(super) async fn prepare(
         identity: request.identity,
         // Only a checkpointed transfer that keeps checkpoints may continue a stage; AtomicReplace
         // cleans up whatever it finds and starts from zero. Direct writes the final file in place
-        // through `prepare_direct` and does not look at the artifacts at all: a stage an earlier
-        // checkpointed run left stays until a checkpointed run resumes or cleans it, or the
-        // reserved-name sweep (ADR-0006 C9) removes it.
+        // through `prepare_direct`; a destination that keeps artifacts cleans them there (Local
+        // since ADR-0006 C9c).
         resumable: request.transfer_policy == TransferPolicy::Checkpointed
             && (plan.recovery_enabled || plan.automatic_interval.is_some()),
         recoverable: plan.recovery_enabled,

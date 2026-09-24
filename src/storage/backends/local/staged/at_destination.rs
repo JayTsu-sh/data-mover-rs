@@ -24,13 +24,15 @@ use cap_std::fs::{Dir, OpenOptions};
 use super::{LocalStagedDestination, failure, failure_with_transience, io_failure, publication};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::artifacts::{ArtifactKind, artifact_name, artifact_temporary_name};
-use crate::storage::discovery::{DestinationArtifacts, discover};
+use crate::storage::discovery::{DestinationArtifacts, Discovery, discover};
 use crate::storage::durability::sync_directory;
 use crate::storage::pointer::DestinationPointer;
 use crate::storage::{
     DestinationPrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence,
     PublicationFailure, StorageRoleFailure,
 };
+#[cfg(unix)]
+use crate::storage::{PrepareFact, PrepareRequest, ResumeMode};
 
 /// The extension every Local pointer carries: the pointer is the stage's checkpoint record.
 pub(super) const POINTER_TAG: &[u8] = b"DMLSTG03";
@@ -303,13 +305,10 @@ pub(super) async fn prepare(
         0,
         Some(claim),
     );
-    let found = match discover(&artifacts, &request).await {
+    let found = match look(&artifacts, &request, &final_path).await {
         Ok(found) => found,
         Err(error) => return Err(abandon(&stage, &directory, error).await),
     };
-    if let Err(error) = sweep(&artifacts.directory, &final_path).await {
-        return Err(abandon(&stage, &directory, error).await);
-    }
     stage.mark_at_destination(found.fact);
     let Some(point) = found.resume else {
         return start(adapter, stage, &artifacts, &request).await;
@@ -330,6 +329,51 @@ pub(super) async fn prepare(
     }
     stage.write_offset = point.prefix;
     Ok(stage)
+}
+
+/// Before a direct write of the final file: removes what a checkpointed run left for it, as a
+/// restarting prepare would, and lets the claim go again. A live stage of another process holds
+/// the claim, so the direct write is refused (`Conflict`, transient) rather than racing it. The
+/// usual case — nothing there — costs three `lstat`s and takes no claim.
+#[cfg(unix)]
+pub(super) async fn clear_before_direct(
+    adapter: &LocalStagedDestination,
+    request: &PrepareRequest,
+) -> Result<PrepareFact, StorageRoleFailure> {
+    let final_path = request.final_destination.path().clone();
+    let relative = LocalStagedDestination::checked_relative(&final_path, Operation::Prepare)?;
+    let parent = relative.parent().map(Path::to_path_buf).unwrap_or_default();
+    let names = [
+        parent.join(artifact(&final_path, ArtifactKind::Stage, false)?),
+        parent.join(artifact(&final_path, ArtifactKind::Pointer, false)?),
+        parent.join(artifact(&final_path, ArtifactKind::Pointer, true)?),
+    ];
+    let root = Arc::clone(&adapter.root_dir);
+    let found = tokio::task::spawn_blocking(move || {
+        for name in &names {
+            match root.symlink_metadata(name) {
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                // A missing or non-directory parent holds no artifacts either.
+                Err(error) if error.kind() == io::ErrorKind::NotADirectory => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    })
+    .await
+    .map_err(|_| failure(&final_path, Operation::Prepare, FailureClass::Internal))?
+    .map_err(|error| io_failure(&final_path, Operation::Prepare, &error))?;
+    if !found {
+        return Ok(PrepareFact::Fresh);
+    }
+    let restart = DestinationPrepareRequest::new(request.clone(), [0; 32])
+        .with_resume(ResumeMode::Restart)
+        .with_recoverable(false);
+    let stage = prepare(adapter, restart).await?;
+    let fact = stage.prepare_fact;
+    cleanup(adapter, &stage, Operation::Prepare).await?;
+    Ok(fact)
 }
 
 /// Opens (or creates) the final file's directory and takes the claim in it.
@@ -353,6 +397,17 @@ async fn claim_directory(
     .await
     .map_err(|_| failure(final_path, Operation::Prepare, FailureClass::Internal))?
     .map_err(|error| claim_failure(final_path, &error))
+}
+
+/// Discovery, then the sweep of every other leftover of the same final name, both under the claim.
+async fn look(
+    artifacts: &LocalArtifacts,
+    request: &DestinationPrepareRequest,
+    final_path: &StoragePath,
+) -> Result<Discovery, StorageRoleFailure> {
+    let found = discover(artifacts, request).await?;
+    sweep(&artifacts.directory, final_path).await?;
+    Ok(found)
 }
 
 /// Every name derived from the final file's name that is neither its live stage, its pointer nor
@@ -381,7 +436,14 @@ async fn sweep(directory: &Arc<Dir>, final_path: &StoragePath) -> Result<(), Sto
     let directory = Arc::clone(directory);
     tokio::task::spawn_blocking(move || {
         for name in &names {
-            publication::remove_if_present(&directory, name)?;
+            match publication::remove_if_present(&directory, name) {
+                // Something that is not a file holds a reserved name: a conflict, as at the
+                // stage and pointer names.
+                Err(error) if error.kind() == io::ErrorKind::IsADirectory => {
+                    return Err(not_regular());
+                }
+                other => other?,
+            }
         }
         Ok::<_, io::Error>(())
     })

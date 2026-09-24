@@ -494,6 +494,98 @@ async fn a_prepare_sweeps_its_own_final_names_leftovers_only() -> TestResult {
     Ok(())
 }
 
+/// A direct write cleans up what an interrupted checkpointed run left for its final file, is
+/// refused while another stage of the file is live, and takes no claim when nothing is there.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_direct_write_clears_the_files_leftovers_first() -> TestResult {
+    let bytes = content(CHECKPOINT * 2);
+    let direct = || -> Result<PrepareRequest, Box<dyn std::error::Error>> {
+        Ok(discover_request(bytes.len())?.prepare)
+    };
+    let cancel = tokio_util::sync::CancellationToken::new;
+
+    let root = Root::new()?;
+    let adapter = adapter(&root)?;
+    let fresh = adapter.prepare_direct(direct()?, cancel()).await?;
+    assert_eq!(fresh.prepare_fact, PrepareFact::Fresh);
+    assert!(!root.artifact(ArtifactKind::Claim).exists());
+    adapter.discard(fresh).await?;
+
+    interrupt_after_one_checkpoint(&root, &bytes).await?;
+    let held = adapter
+        .prepare_at_destination(discover_request(bytes.len())?)
+        .await?;
+    let refused = adapter
+        .prepare_direct(direct()?, cancel())
+        .await
+        .err()
+        .ok_or("a live stage must refuse a direct write")?;
+    assert_eq!(
+        class(&refused),
+        Some((FailureClass::Conflict, Transience::Transient))
+    );
+    drop(held);
+
+    let stage = adapter.prepare_direct(direct()?, cancel()).await?;
+    assert_eq!(
+        stage.prepare_fact,
+        PrepareFact::Restarted {
+            reason: RestartReason::Requested
+        }
+    );
+    assert_eq!(root.artifacts_left()?, Vec::<String>::new());
+    adapter.write(&stage, chunks(&bytes)).await?;
+    publish(&adapter, &stage, &bytes).await?;
+    assert_eq!(std::fs::read(root.0.join("dir/final.bin"))?, bytes);
+    assert_eq!(root.artifacts_left()?, Vec::<String>::new());
+    Ok(())
+}
+
+/// With no stage or pointer of the file there, a direct write takes no claim — a claim someone
+/// else holds does not refuse it — and only a lone pointer temporary sends it through a clean-up.
+/// A clean-up that fails for another reason leaves the leftovers and still writes in place.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_direct_write_takes_no_claim_unless_something_is_there() -> TestResult {
+    let cancel = tokio_util::sync::CancellationToken::new;
+    let root = Root::new()?;
+    let adapter = adapter(&root)?;
+    let claim = std::fs::File::create(root.artifact(ArtifactKind::Claim))?;
+    claim.try_lock()?;
+    let stage = adapter
+        .prepare_direct(discover_request(10)?.prepare, cancel())
+        .await?;
+    assert_eq!(stage.prepare_fact, PrepareFact::Fresh);
+    adapter.discard(stage).await?;
+    drop(claim);
+    std::fs::remove_file(root.artifact(ArtifactKind::Claim))?;
+
+    let temporary = root
+        .0
+        .join("dir")
+        .join(artifact_temporary_name("final.bin", ArtifactKind::Pointer));
+    std::fs::write(&temporary, b"half a pointer")?;
+    let stage = adapter
+        .prepare_direct(discover_request(10)?.prepare, cancel())
+        .await?;
+    assert_eq!(stage.prepare_fact, PrepareFact::Fresh);
+    assert!(!temporary.exists());
+    adapter.discard(stage).await?;
+    assert_eq!(root.artifacts_left()?, Vec::<String>::new());
+
+    std::fs::create_dir(root.artifact(ArtifactKind::Pointer))?;
+    let bytes = content(10);
+    let stage = adapter
+        .prepare_direct(discover_request(bytes.len())?.prepare, cancel())
+        .await?;
+    adapter.write(&stage, chunks(&bytes)).await?;
+    publish(&adapter, &stage, &bytes).await?;
+    assert_eq!(std::fs::read(root.0.join("dir/final.bin"))?, bytes);
+    assert!(root.artifact(ArtifactKind::Pointer).is_dir());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_symlink_at_an_artifact_name_is_refused_and_its_target_untouched() -> TestResult {

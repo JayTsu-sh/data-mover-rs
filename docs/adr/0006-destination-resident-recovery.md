@@ -184,9 +184,20 @@ only once nothing else can fail; a clean-up by a stage that no longer holds its 
 The claim is per kernel: Local paths on network or drvfs mounts rely on the caller contract and the
 in-process lease. The old Local `recover` / DMLRCV01 path is no longer reached (removed in C8d).
 A second concurrent transfer of one Local file now fails at `Prepare` (`Conflict`, transient) where
-it used to fail at `RecoveryRegistration`. `Direct` writes the final file in place and does not look
-at the artifacts; a stage an earlier checkpointed run left, and random-name stages from before C8,
-stay until a checkpointed run of the same file or the reserved-name sweep (C9) removes them.
+it used to fail at `RecoveryRegistration`.
+
+As built (C9): there is no directory-wide sweep — the claim is per kernel, so another host's live
+stage for a different file would look stale, and listing per prepare is quadratic in a large
+directory. A Local prepare instead removes, under its claim and by name only, every leftover derived
+from its own final name that is not its live stage, pointer or claim (a lone pointer temporary, other
+kinds and temporaries). A `Direct` write first looks for the file's stage and pointer (three
+`lstat`s); if any is there it runs a restarting prepare under the claim and discards it, reporting
+`Restarted { Requested }`. A live stage of another process refuses the direct write with
+`Conflict` / transient once its stage file exists (between that process taking its claim and
+creating its stage, the caller contract applies); any other failure to clean up is logged and the
+in-place write goes ahead, leaving the leftovers. Something that is not a file at a swept name is a
+`Conflict`, as at the stage and pointer names. Random-name stages from before C8, and artifacts under another spelling on a
+case-insensitive volume, are left to the drain-before-upgrade rule and `delete_tree`.
 
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process

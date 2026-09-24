@@ -10,6 +10,16 @@ use super::{Arc, AtomicBool, Bytes, LocalStageState, OpenOptions, Path};
 
 impl LocalStagedDestination {
     #[cfg(unix)]
+    fn is_held_elsewhere(error: &StorageRoleFailure) -> bool {
+        matches!(
+            error,
+            StorageRoleFailure::Entry(entry)
+                if entry.class() == FailureClass::Conflict
+                    && entry.transience() == crate::model::Transience::Transient
+        )
+    }
+
+    #[cfg(unix)]
     pub(super) async fn open_direct(
         &self,
         request: PrepareRequest,
@@ -17,6 +27,21 @@ impl LocalStagedDestination {
     ) -> Result<PreparedStage, StorageRoleFailure> {
         use cap_std::fs::OpenOptionsExt as _;
         Self::validate_prepare_request(&request)?;
+        let fact = match super::at_destination::clear_before_direct(self, &request).await {
+            Ok(fact) => fact,
+            // Another process's live stage of this file: refuse rather than race it.
+            Err(error) if Self::is_held_elsewhere(&error) => return Err(error),
+            // Anything else (a directory the caller may not write, a reserved name that is not a
+            // file) must not stop an in-place write that needs neither; the leftovers stay.
+            Err(error) => {
+                tracing::warn!(
+                    path = %request.final_destination.path().as_str(),
+                    ?error,
+                    "could not clear transfer artifacts before a direct write; leaving them"
+                );
+                crate::storage::PrepareFact::Fresh
+            }
+        };
         let path = request.final_destination.path().clone();
         let relative = Self::checked_relative(&path, Operation::Prepare)?;
         let name = relative
@@ -84,6 +109,7 @@ impl LocalStagedDestination {
         .disable_recovery();
         target.direct = true;
         target.durable_publication = false;
+        target.prepare_fact = fact;
         target.backend_state = Some(Arc::new(LocalStageState {
             directory,
             file: std::sync::Mutex::new(Some(file)),
