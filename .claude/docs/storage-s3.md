@@ -78,6 +78,10 @@ match aws_sdk_s3::operation::get_object::GetObjectError::from(...) {
 拷贝路径每个对象多一次 HEAD（describe、read 各已有一次；复用扫描期观测需要用户决定，暂不做）。
 真机（MinIO）：S3 → Local 的文件 mtime 与 HEAD 的 `Last-Modified` 逐秒相等；改前是拷贝时刻。
 
+对象在 describe 之后被替换（身份判定统一走 `source.rs` 的 `object_identity`：真实 versionId 标识版本，
+`"null"` / 空 / 无 versionId 以 ETag 标识）：`read`、native 的 `bind_source`、`observe_bound` 三处都报
+`Conflict` / Permanent（不是可重试的 Protocol / Unknown），按条目失败。
+
 - **列举与 HEAD 精度不同**（MinIO 实测）：`ListObjects` 给毫秒（`04:30:34.882Z`），HEAD 只给秒
   （`04:30:34 GMT`）。拷贝落到目的端的是秒。上层若拿列举（legacy `walkdir` 的毫秒 i64，无精度标记）去比
   目的端文件 mtime，永远不等 → 每次重拷；**比较前按秒截断**，或像 `integrity` 那样按两边较粗精度比。

@@ -4,13 +4,13 @@ use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{BackendIdentity, Operation};
+use crate::model::{BackendIdentity, FailureClass, Operation, Transience};
 use crate::storage::{
     NativeAffinity, NativeEndpoint, NativeSourceBinding, NativeStageEvidence, NativeStageFailure,
     SourceDescriptor, StorageRoleFailure,
 };
 
-use super::source::{entry, object_identity, role_failure};
+use super::source::{classified_entry, entry, object_identity, role_failure};
 use super::staged::S3StagedDestination;
 use super::{S3NativeCopySource, S3Protocol};
 
@@ -133,9 +133,12 @@ fn validate_identity(
     if identity == source.source_identity {
         Ok(())
     } else {
-        Err(entry(
+        // Same class as a changed object seen by `read` or by the metadata observation.
+        Err(classified_entry(
             &source.path,
             Operation::Read,
+            FailureClass::Conflict,
+            Transience::Permanent,
             "S3 source identity changed",
         ))
     }
@@ -197,5 +200,45 @@ fn stage_failure(stage: &crate::storage::PreparedStage, diagnostic: &str) -> Nat
         ),
         native_bytes: 0,
         native_requests: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{object_identity, validate_identity};
+    use crate::model::{EntryKind, FailureClass, StoragePath, Transience};
+    use crate::storage::backends::s3::S3ObjectFacts;
+    use crate::storage::backends::s3::tests::identity;
+    use crate::storage::{SourceDescriptor, StorageRoleFailure};
+
+    fn facts(etag: &str) -> S3ObjectFacts {
+        S3ObjectFacts {
+            size: 5,
+            etag: etag.to_string(),
+            version_id: None,
+            last_modified: None,
+        }
+    }
+
+    /// An object replaced between describe and the native bind is a conflict, as `read` and the
+    /// metadata observation report it — not an unknown protocol failure an engine might retry.
+    #[test]
+    fn a_changed_object_at_bind_is_a_permanent_conflict() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let described = SourceDescriptor::new(
+            StoragePath::new("source")?,
+            EntryKind::File,
+            Some(5),
+            object_identity(&identity(), &facts("\"before\""))?,
+        );
+        assert!(validate_identity(&described, &identity(), &facts("\"before\"")).is_ok());
+        let Err(StorageRoleFailure::Entry(failure)) =
+            validate_identity(&described, &identity(), &facts("\"after\""))
+        else {
+            return Err("a changed object was bound".into());
+        };
+        assert_eq!(failure.class(), FailureClass::Conflict);
+        assert_eq!(failure.transience(), Transience::Permanent);
+        Ok(())
     }
 }
