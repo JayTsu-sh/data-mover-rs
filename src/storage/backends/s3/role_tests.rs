@@ -2,6 +2,7 @@
 //! cancellation, publication.
 
 use super::*;
+use crate::model::SourceVersion;
 
 #[test]
 fn certified_standard_s3_roles_are_available_in_production()
@@ -49,6 +50,7 @@ async fn every_range_is_bound_and_overwrites_cannot_mix_content()
                 read_budget: None,
                 cancel: CancellationToken::new(),
                 source_qos: None,
+                version: SourceVersion::Current,
             })
             .await?;
         assert_eq!(
@@ -98,6 +100,7 @@ async fn range_stream_multipart_verify_publish_and_readback()
             read_budget: None,
             cancel: CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     assert_eq!(
@@ -236,6 +239,7 @@ async fn failed_input_preserves_checkpoint_until_explicit_discard()
                 content_version: None,
                 inline_timestamps: None,
                 inline_mode: None,
+                version: SourceVersion::Current,
             },
             recovery_binding: [9; 32],
         })
@@ -280,6 +284,7 @@ async fn cancellation_remains_a_typed_entry_outcome() -> Result<(), Box<dyn std:
             read_budget: None,
             cancel,
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await;
     let Err(failure) = result else {
@@ -321,6 +326,7 @@ async fn overwrite_publication_does_not_head_the_existing_destination()
                 content_version: None,
                 inline_timestamps: None,
                 inline_mode: None,
+                version: SourceVersion::Current,
             },
             recovery_binding: [4; 32],
         })
@@ -384,6 +390,7 @@ async fn multipart_checkpoint_is_reobserved_and_resumed_after_reconnect()
         content_version: None,
         inline_timestamps: None,
         inline_mode: None,
+        version: SourceVersion::Current,
     };
     let prepare = PrepareRequest {
         final_destination: FinalDestination::new(final_path.clone()),
@@ -497,6 +504,7 @@ async fn publication_reconciles_a_committed_copy_with_a_lost_response()
                 content_version: None,
                 inline_timestamps: None,
                 inline_mode: None,
+                version: SourceVersion::Current,
             },
             recovery_binding: [2; 32],
         })

@@ -11,10 +11,13 @@ use super::SourceDescriptor;
 use super::copied_metadata::{CopiedMetadataObservation, CopiedMetadataTarget};
 use crate::runtime::qos::SourceQosBudget;
 
+mod version;
+use version::version_unsupported;
+
 use crate::model::{
     AclMetadata, BackendSessionFailure, EntryOperationFailure, ExtendedAttribute, FailureClass,
     MappedOwnership, MetadataObservations, ObjectTag, ObservationPlan, Operation, OwnershipMode,
-    SourceIdentity, StoragePath, SymlinkTarget, TimestampMetadata, Transience,
+    SourceIdentity, SourceVersion, StoragePath, SymlinkTarget, TimestampMetadata, Transience,
 };
 
 /// A bounded payload stream. Implementations own request sizing and backpressure.
@@ -45,6 +48,10 @@ pub struct ReadRequest {
     pub read_budget: Option<super::ReadBudget>,
     pub cancel: CancellationToken,
     pub source_qos: Option<SourceQosBudget>,
+    /// The source version to read: the one the describe pinned ([`SourceDescriptor::version`]).
+    /// `Id` only reaches a source whose [`ReadSource::supports_source_versions`] is true; every
+    /// other source refuses it rather than read the current version instead.
+    pub version: SourceVersion,
 }
 
 /// Backend-neutral failure scope for a role operation.
@@ -144,6 +151,25 @@ pub trait ReadSource: Send + Sync {
         usize::MAX
     }
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure>;
+    /// Whether this source keeps versions a transfer can select ([`SourceVersion::Id`]).
+    fn supports_source_versions(&self) -> bool {
+        false
+    }
+    /// Describes one version of `path`. The descriptor pins the version it describes, which a
+    /// versioned source resolves from `Current` to the version it found.
+    ///
+    /// The default serves sources without versions: `Current` is [`ReadSource::describe`], and
+    /// `Id` is `Unsupported`.
+    async fn describe_version(
+        &self,
+        path: &StoragePath,
+        version: &SourceVersion,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
+        match version {
+            SourceVersion::Current => self.describe(path).await,
+            SourceVersion::Id(_) => Err(version_unsupported(path, Operation::Observe)),
+        }
+    }
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure>;
 }
 
@@ -701,6 +727,20 @@ pub trait Metadata: Send + Sync {
             mode_without_ownership: None,
             owner_names_unmapped: false,
         })
+    }
+    /// [`Metadata::observe_copy_bound`] for one pinned source version. The default serves stores
+    /// without versions: `Current` observes as usual, and `Id` is `Unsupported`.
+    async fn observe_copy_bound_version(
+        &self,
+        path: &StoragePath,
+        expected: &SourceIdentity,
+        version: &SourceVersion,
+        plan: ObservationPlan,
+    ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
+        match version {
+            SourceVersion::Current => self.observe_copy_bound(path, expected, plan).await,
+            SourceVersion::Id(_) => Err(version_unsupported(path, Operation::Metadata)),
+        }
     }
     async fn apply(
         &self,

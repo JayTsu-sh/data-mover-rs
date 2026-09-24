@@ -9,7 +9,7 @@ use futures::stream::{FuturesOrdered, FuturesUnordered};
 
 use crate::model::{
     BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass,
-    IdentityStrength, Operation, SourceIdentity, StoragePath, Transience,
+    IdentityStrength, Operation, SourceIdentity, SourceVersion, StoragePath, Transience,
 };
 use crate::storage::{
     ByteStream, PositionedByteStream, PositionedChunk, ReadRequest, ReadSource, SourceDescriptor,
@@ -113,6 +113,7 @@ impl NfsReadSourceAdapter {
             content_version: Some(observed.content_version),
             inline_timestamps: None,
             inline_mode: None,
+            version: SourceVersion::Current,
         })
     }
 }
@@ -135,6 +136,7 @@ impl ReadSource for NfsReadSourceAdapter {
     }
 
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure> {
+        request.require_current()?;
         let state = self.open_state(request, false).await?;
         Ok(Box::pin(
             futures::stream::try_unfold(state, read_next)
@@ -146,6 +148,7 @@ impl ReadSource for NfsReadSourceAdapter {
         &self,
         request: ReadRequest,
     ) -> Result<PositionedByteStream, StorageRoleFailure> {
+        request.require_current()?;
         let state = self.open_state(request, true).await?;
         Ok(Box::pin(futures::stream::try_unfold(state, read_next)))
     }

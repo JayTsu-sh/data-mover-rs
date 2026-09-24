@@ -1,5 +1,5 @@
 use super::source::{CifsReadCursor, ReadState};
-use crate::model::StoragePath;
+use crate::model::{SourceVersion, StoragePath};
 use crate::storage::{InflightConfig, InflightRuntime, ReadBudget, ReadRequest};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -76,6 +76,7 @@ async fn reads_overlap_but_emit_in_order_and_obey_all_budgets()
                 read_budget: Some(budget.clone()),
                 cancel,
                 source_qos: None,
+                version: SourceVersion::Current,
             },
         });
         let mut offset = 0;
@@ -125,6 +126,7 @@ async fn read_pipeline_can_fill_configured_depth_above_eight()
                 read_budget: None,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 source_qos: None,
+                version: SourceVersion::Current,
             },
         });
         let mut result = Vec::new();
@@ -160,6 +162,7 @@ async fn positioned_reads_emit_completed_ranges_before_the_delayed_prefix()
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         },
     });
     let first = stream.next().await.ok_or("no first chunk")??;

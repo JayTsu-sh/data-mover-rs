@@ -3,7 +3,7 @@
 
 use bytes::Bytes;
 
-use crate::model::{EntryKind, SourceIdentity, StoragePath, TimestampMetadata};
+use crate::model::{EntryKind, SourceIdentity, SourceVersion, StoragePath, TimestampMetadata};
 
 /// A stable neutral source description.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,6 +28,10 @@ pub struct SourceDescriptor {
     /// from `FILE_ATTRIBUTE_READONLY`, which listings carry; the `Stat` verb builds its
     /// descriptor from facts without the attribute and leaves it `None`.
     pub(crate) inline_mode: Option<u32>,
+    /// The source version this description is of, as the describe resolved it: a versioned store
+    /// turns `Current` into the version it found, so every later read, metadata observation and
+    /// native copy uses the same one. `Current` where the store has no version to pin.
+    pub(crate) version: SourceVersion,
 }
 
 impl SourceDescriptor {
@@ -48,7 +52,14 @@ impl SourceDescriptor {
             content_version: None,
             inline_timestamps: None,
             inline_mode: None,
+            version: SourceVersion::Current,
         }
+    }
+
+    /// The source version this description pins.
+    #[must_use]
+    pub const fn version(&self) -> &SourceVersion {
+        &self.version
     }
 
     pub(crate) fn with_backend_fact(mut self, fact: Bytes) -> Self {

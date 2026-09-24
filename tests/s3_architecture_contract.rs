@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use data_mover::model::{
-    BackendIdentity, BackendKind, EntryKind, IdentityStrength, SourceIdentity, StoragePath,
+    BackendIdentity, BackendKind, EntryKind, IdentityStrength, SourceIdentity, SourceVersion,
+    StoragePath,
 };
 use data_mover::storage::{
     FinalDestination, MetadataMutation, PreflightPolicy, PrepareRequest, PublishRequest,
@@ -310,6 +311,7 @@ async fn verify_range_and_cancellation(
             read_budget: None,
             cancel: CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let mut actual = Vec::new();
@@ -329,6 +331,7 @@ async fn verify_range_and_cancellation(
             read_budget: None,
             cancel,
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await;
     assert!(matches!(

@@ -8,8 +8,8 @@ use super::identity::{BindingSource, binding_hash};
 use super::model::{InflightLimits, RecoveryContext, RecoveryRegistrationFailure};
 use super::{ReadBackVerification, TransferPolicy, TransferRequest};
 use crate::model::{
-    EntryKind, EntryOperationFailure, FailureClass, Operation, SourceIdentity, StoragePath,
-    Transience,
+    EntryKind, EntryOperationFailure, FailureClass, Operation, SourceIdentity, SourceVersion,
+    StoragePath, Transience,
 };
 use crate::runtime::inflight::{
     InflightConfig, InflightFailure, InflightRuntime, OrderedChunks, ReadRange, SequentialRanges,
@@ -790,8 +790,10 @@ async fn describe_source(
             "transfer was cancelled",
         ));
     }
+    // C6c lets the request select a version; until then every transfer copies `Current`, which a
+    // versioned source pins at this describe.
     let descriptor = source
-        .describe(&request.source_path)
+        .describe_version(&request.source_path, &SourceVersion::Current)
         .await
         .map_err(|error| {
             TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
@@ -1164,6 +1166,7 @@ async fn transfer_stage(
             source: Arc::clone(&source),
             path: descriptor.path.clone(),
             source_identity: descriptor.source_identity.clone(),
+            version: descriptor.version.clone(),
             cancel: request.cancel.clone(),
             runtime,
             failure: Arc::clone(&source_failure),
@@ -1250,6 +1253,8 @@ struct ProducerRequest {
     source: Arc<dyn ReadSource>,
     path: StoragePath,
     source_identity: SourceIdentity,
+    /// The version the describe pinned; every read of this producer reads it.
+    version: SourceVersion,
     cancel: tokio_util::sync::CancellationToken,
     runtime: InflightRuntime,
     failure: Arc<Mutex<Option<StorageRoleFailure>>>,
@@ -1298,6 +1303,7 @@ async fn open_producer_stream(
             read_budget: budgeted.then(|| budget.clone()),
             cancel: request.cancel.clone(),
             source_qos: request.source_qos.clone(),
+            version: request.version.clone(),
         })
         .await;
     let stream = match stream {
@@ -1411,6 +1417,7 @@ async fn read_exact_range(
     source: &dyn ReadSource,
     path: &StoragePath,
     source_identity: &SourceIdentity,
+    version: &SourceVersion,
     cancel: &tokio_util::sync::CancellationToken,
     source_qos: Option<SourceQosBudget>,
     range: ReadRange,
@@ -1425,6 +1432,7 @@ async fn read_exact_range(
             read_budget: None,
             cancel: cancel.clone(),
             source_qos,
+            version: version.clone(),
         })
         .await?;
     let mut output = BytesMut::with_capacity(range.length);

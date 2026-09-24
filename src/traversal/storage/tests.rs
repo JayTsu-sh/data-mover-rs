@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use super::*;
 use crate::model::{
     BackendIdentity, BackendKind as Kind, IdentityStrength, MetadataObservation,
-    MetadataObservations, MetadataProvenance, ObservationPlan, SourceIdentity, SymlinkTarget,
-    SymlinkTargetEncoding, TimestampMetadata,
+    MetadataObservations, MetadataProvenance, ObservationPlan, SourceIdentity, SourceVersion,
+    SymlinkTarget, SymlinkTargetEncoding, TimestampMetadata,
 };
 use crate::storage::{MetadataMutation, NamespaceRequest};
 
@@ -42,6 +42,7 @@ fn descriptor(value: &str, kind: EntryKind) -> SourceDescriptor {
         content_version: None,
         inline_timestamps: None,
         inline_mode: None,
+        version: SourceVersion::Current,
     }
 }
 

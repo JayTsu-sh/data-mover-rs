@@ -71,6 +71,18 @@
 | HeadObject 404 | `FileNotFound(key)` |
 | 网络错误 | `S3Error(...)` (走 delay_backoff) |
 
+role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
+
+| 来源 | 映射到 |
+|---|---|
+| 404 / `NoSuchKey` / `NoSuchUpload` / `NoSuchVersion` | 条目 `NotFound` / Permanent |
+| **带 versionId 的** HEAD / GET 返回 405（该版本是删除标记）；`Current` 在版本化桶上也会钉成 versionId，所以普通读也属此类 | 条目 `NotFound` / Permanent |
+| **带 versionId 的** GET 返回 400 且错误码 `InvalidArgument`（versionId 格式错） | 条目 `InvalidInput` / Permanent |
+| 其余 400（`ExpiredToken`、region 错……；HEAD 没有错误码，其 400 一律在此） | 仍按通用映射（会话级）—— 这些关乎整个会话 |
+| 不带 versionId 的 405 | 仍按通用映射（会话 `Protocol` / Unknown）—— DXN / SG 对不支持的操作也可能回 405 |
+| describe 之后对象被替换（`read` / native bind / `observe_bound`） | 条目 `Conflict` / Permanent |
+| 请求 `Id(v)` 而 HEAD 回来的不是版本 v（存储忽略 `?versionId=`） | 条目 `Unsupported` / Permanent |
+
 ### NFS
 
 | 来源 errno | 映射到 |

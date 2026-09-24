@@ -17,8 +17,8 @@ use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    EntryKind, FailureClass, MetadataObservation, ObservationMode, ObservationPlan, StoragePath,
-    StorageTimestamp,
+    EntryKind, FailureClass, MetadataObservation, ObservationMode, ObservationPlan, SourceVersion,
+    StoragePath, StorageTimestamp,
 };
 use crate::storage::{
     CapabilityUnavailable, CopiedTimestampTarget, Metadata, PreflightPolicy, ReadRequest,
@@ -245,6 +245,10 @@ impl Endpoint {
                 read_budget: None,
                 cancel: cancel.clone(),
                 source_qos: None,
+                // An integrity check compares what is current now, and its mtime comes from the
+                // current object: a version that changed since the describe must surface as a
+                // conflict, not be read as the pinned one beside the new one's time.
+                version: SourceVersion::Current,
             })
             .await
             .map_err(|failure| self.attribute(failure))?;

@@ -179,6 +179,7 @@ async fn hash_source(
             source,
             &descriptor.path,
             &descriptor.source_identity,
+            &descriptor.version,
             &request.cancel,
             source_qos.clone(),
             range,

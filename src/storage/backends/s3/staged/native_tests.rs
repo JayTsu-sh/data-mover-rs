@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::model::{EntryKind, IdentityStrength, SourceIdentity, StoragePath};
+use crate::model::{EntryKind, IdentityStrength, SourceIdentity, SourceVersion, StoragePath};
 use crate::storage::PrepareRequest;
 use crate::storage::backends::s3::{S3_NATIVE_COPY_SINGLE_MAX, S3NativeCopySource};
 use crate::storage::{FinalDestination, SourceDescriptor};
@@ -28,6 +28,7 @@ fn native_prepare() -> TestResult<PrepareRequest> {
             content_version: None,
             inline_timestamps: None,
             inline_mode: None,
+            version: SourceVersion::Current,
         },
         recovery_binding: [5; 32],
     })

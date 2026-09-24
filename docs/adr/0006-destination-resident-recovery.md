@@ -163,6 +163,15 @@ with versionId, latest flag and delete-marker flag, oldest to newest per key). B
   `ExpertDestinationRequest::new` derives it (`with_identity_override`, session `identity()`);
   `TransferOutcome` gains `identity` (C5), `prepare`, `reused_bytes`, `destination_version`; the two recovery `TransferPhase`
   variants go; `DATA_MOVER_RECOVERY_DIR` goes.
+- Storage roles (C6b): `SourceVersion` (`model`), `ReadRequest.version` (a public field, so every
+  literal names it), `ReadSource::supports_source_versions` / `describe_version`,
+  `Metadata::observe_copy_bound_version`, `SourceDescriptor::version()` (the version the describe
+  pinned). Sources without versions keep the defaults and refuse `Id` at describe, read and metadata
+  observation. S3 describes with the `ETag` as the content version, so every S3-source binding changes
+  once (covered by the C5 drain). **`Current` now pins**: on a versioned bucket a transfer finishes
+  with the version it described even if a newer one appears, where a later read used to fail with
+  `Conflict`; objects without a real version (none, empty, `"null"`) are not pinned and behave as
+  before. The expert halves copy `Current` only.
 - Configs lose `identity`; `S3Storage::architecture_storage` / `HDFSStorage::architecture_storage` /
   `nfs::create_nfs_role_storage` lose their identity argument and `cifs::create_cifs_role_storage` is
   crate-private (C4b). `BackendIdentity::new` stays public for fixtures and snapshot decoding.

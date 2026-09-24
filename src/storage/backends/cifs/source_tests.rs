@@ -15,7 +15,8 @@ use super::source::{
     file_handle_bytes,
 };
 use crate::model::{
-    BackendIdentity, BackendKind, EntryKind, IdentityStrength, Operation, StoragePath,
+    BackendIdentity, BackendKind, EntryKind, IdentityStrength, Operation, SourceVersion,
+    StoragePath,
 };
 use crate::storage::{
     Namespace, NamespaceRequest, NamespaceResult, ReadRequest, ReadSource, SourceQosGroup,
@@ -186,6 +187,7 @@ async fn source_stream_honours_negotiated_chunks_without_short_reads()
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let mut chunks = Vec::new();
@@ -237,6 +239,7 @@ async fn active_source_cancellation_stops_prefetch_and_closes()
             read_budget: None,
             cancel: cancel.clone(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     assert!(stream.next().await.transpose()?.is_some());
@@ -280,6 +283,7 @@ async fn opened_identity_change_fails_before_read_and_closes_resource()
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await;
     assert!(matches!(
@@ -326,6 +330,7 @@ async fn source_qos_limits_each_real_read_and_accounts_only_source_io()
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: Some(budget.clone()),
+            version: SourceVersion::Current,
         })
         .await?;
     while stream.next().await.transpose()?.is_some() {}
@@ -427,6 +432,7 @@ async fn real_share_exercises_domain_roles_without_wire_api()
                 read_budget: None,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 source_qos: None,
+                version: SourceVersion::Current,
             })
             .await?;
         let mut observed = 0_u64;
@@ -672,6 +678,7 @@ async fn assert_real_payload(
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let mut actual = Vec::new();
@@ -738,6 +745,7 @@ async fn assert_real_failure_isolation(
             read_budget: None,
             cancel,
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await;
     assert!(matches!(
@@ -1024,6 +1032,7 @@ async fn with_a_file_id_an_edited_source_still_opens_because_identity_is_the_fil
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let mut rebuilt = Vec::new();

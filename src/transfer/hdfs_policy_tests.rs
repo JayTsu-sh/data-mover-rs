@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
-use crate::model::StoragePath;
+use crate::model::{SourceVersion, StoragePath};
 use crate::storage::backends::hdfs::{connect, contract_tests::MemoryHdfs, test_identity};
 use crate::storage::{InflightConfig, InflightRuntime, PreflightPolicy, ReadBudget, ReadRequest};
 use crate::transfer::{
@@ -246,6 +246,7 @@ async fn source_prefetch_obeys_chunks_bytes_and_operations() -> Result {
                 read_budget: Some(budget.clone()),
                 cancel,
                 source_qos: None,
+                version: SourceVersion::Current,
             })
             .await?;
         for offset in [0, 2] {

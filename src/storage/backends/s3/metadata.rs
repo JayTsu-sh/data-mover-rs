@@ -4,10 +4,10 @@ use async_trait::async_trait;
 
 use crate::model::{
     BackendIdentity, FailureClass, MetadataObservation, MetadataObservations, MetadataProvenance,
-    ObjectTag, ObservationMode, ObservationPlan, Operation, SourceIdentity, StoragePath,
-    TimestampMetadata, Transience,
+    ObjectTag, ObservationMode, ObservationPlan, Operation, SourceIdentity, SourceVersion,
+    StoragePath, TimestampMetadata, Transience,
 };
-use crate::storage::{Metadata, MetadataMutation, StorageRoleFailure};
+use crate::storage::{CopiedMetadataObservation, Metadata, MetadataMutation, StorageRoleFailure};
 
 use super::source::{cancelled, classified_entry, entry, object_identity, role_failure};
 use super::{S3ObjectFacts, S3Protocol};
@@ -80,11 +80,40 @@ fn timestamps(
 }
 
 impl<P: S3Protocol + 'static> S3Metadata<P> {
-    async fn head(&self, path: &StoragePath) -> Result<S3ObjectFacts, StorageRoleFailure> {
-        self.protocol
-            .head(path.as_str())
-            .await
-            .map_err(|e| role_failure(path, Operation::Metadata, e))
+    async fn head(
+        &self,
+        path: &StoragePath,
+        version: &SourceVersion,
+    ) -> Result<S3ObjectFacts, StorageRoleFailure> {
+        match version.version_id() {
+            None => self.protocol.head(path.as_str()).await,
+            Some(version) => self.protocol.head_version(path.as_str(), version).await,
+        }
+        .map_err(|e| role_failure(path, Operation::Metadata, e))
+    }
+
+    /// Observes `version` of `path` in one HEAD that must still show the expected identity, so a
+    /// replaced object is a conflict rather than the new object's time on the old object's bytes.
+    async fn observe_version_bound(
+        &self,
+        path: &StoragePath,
+        expected: &SourceIdentity,
+        version: &SourceVersion,
+        plan: ObservationPlan,
+    ) -> Result<MetadataObservations, StorageRoleFailure> {
+        let facts = self.head(path, version).await?;
+        let observed = object_identity(&self.identity, &facts)
+            .map_err(|e| entry(path, Operation::Metadata, e.to_string()))?;
+        if observed != *expected {
+            return Err(classified_entry(
+                path,
+                Operation::Metadata,
+                FailureClass::Conflict,
+                Transience::Permanent,
+                "S3 source identity changed",
+            ));
+        }
+        self.observations(path, plan, Some(&facts), version).await
     }
 
     async fn observations(
@@ -92,11 +121,12 @@ impl<P: S3Protocol + 'static> S3Metadata<P> {
         path: &StoragePath,
         plan: ObservationPlan,
         facts: Option<&S3ObjectFacts>,
+        version: &SourceVersion,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
         MetadataObservations::new(
             cannot_read(plan.acl()),
             cannot_read(plan.xattrs()),
-            self.tags(path, plan.tags()).await?,
+            self.tags(path, plan.tags(), version.version_id()).await?,
             omitted(plan.ownership_mode()),
             timestamps(plan.timestamps(), facts),
         )
@@ -107,25 +137,28 @@ impl<P: S3Protocol + 'static> S3Metadata<P> {
         &self,
         path: &StoragePath,
         mode: ObservationMode,
+        version: Option<&str>,
     ) -> Result<MetadataObservation<Vec<ObjectTag>>, StorageRoleFailure> {
         Ok(if matches!(self.tag_support, S3TagSupport::Supported) {
             match mode {
                 ObservationMode::Omit => MetadataObservation::NotRequested,
                 ObservationMode::InlineOnly => MetadataObservation::Unsupported,
-                ObservationMode::BestEffort => match self.protocol.get_tags(path.as_str()).await {
-                    Ok(value) => MetadataObservation::Value {
-                        value,
-                        provenance: MetadataProvenance::AdditionalCall,
-                    },
-                    Err(_) => MetadataObservation::Failed {
-                        class: FailureClass::Protocol,
-                        transience: Transience::Unknown,
-                    },
-                },
+                ObservationMode::BestEffort => {
+                    match self.protocol.get_tags(path.as_str(), version).await {
+                        Ok(value) => MetadataObservation::Value {
+                            value,
+                            provenance: MetadataProvenance::AdditionalCall,
+                        },
+                        Err(_) => MetadataObservation::Failed {
+                            class: FailureClass::Protocol,
+                            transience: Transience::Unknown,
+                        },
+                    }
+                }
                 ObservationMode::Required => MetadataObservation::Value {
                     value: self
                         .protocol
-                        .get_tags(path.as_str())
+                        .get_tags(path.as_str(), version)
                         .await
                         .map_err(|e| role_failure(path, Operation::Metadata, e))?,
                     provenance: MetadataProvenance::AdditionalCall,
@@ -157,11 +190,15 @@ impl<P: S3Protocol + 'static> Metadata for S3Metadata<P> {
         path: &StoragePath,
         plan: ObservationPlan,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
+        let current = SourceVersion::Current;
         let facts = match plan.timestamps() {
-            ObservationMode::BestEffort | ObservationMode::Required => Some(self.head(path).await?),
+            ObservationMode::BestEffort | ObservationMode::Required => {
+                Some(self.head(path, &current).await?)
+            }
             ObservationMode::Omit | ObservationMode::InlineOnly => None,
         };
-        self.observations(path, plan, facts.as_ref()).await
+        self.observations(path, plan, facts.as_ref(), &current)
+            .await
     }
 
     /// Binds the time to the object the copy described: the `Last-Modified` comes from a HEAD whose
@@ -173,19 +210,26 @@ impl<P: S3Protocol + 'static> Metadata for S3Metadata<P> {
         expected: &SourceIdentity,
         plan: ObservationPlan,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
-        let facts = self.head(path).await?;
-        let observed = object_identity(&self.identity, &facts)
-            .map_err(|e| entry(path, Operation::Metadata, e.to_string()))?;
-        if observed != *expected {
-            return Err(classified_entry(
-                path,
-                Operation::Metadata,
-                FailureClass::Conflict,
-                Transience::Permanent,
-                "S3 source identity changed",
-            ));
-        }
-        self.observations(path, plan, Some(&facts)).await
+        self.observe_version_bound(path, expected, &SourceVersion::Current, plan)
+            .await
+    }
+
+    /// The copy baseline of the version the describe pinned: its own `Last-Modified` and tags,
+    /// also when a newer version became current meanwhile.
+    async fn observe_copy_bound_version(
+        &self,
+        path: &StoragePath,
+        expected: &SourceIdentity,
+        version: &SourceVersion,
+        plan: ObservationPlan,
+    ) -> Result<CopiedMetadataObservation, StorageRoleFailure> {
+        Ok(CopiedMetadataObservation {
+            observations: self
+                .observe_version_bound(path, expected, version, plan)
+                .await?,
+            mode_without_ownership: None,
+            owner_names_unmapped: false,
+        })
     }
 
     async fn apply(

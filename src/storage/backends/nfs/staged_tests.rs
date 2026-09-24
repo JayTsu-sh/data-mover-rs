@@ -3,7 +3,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity};
+    use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, SourceVersion};
     use crate::storage::{FinalDestination, SourceDescriptor};
     use futures::stream;
 
@@ -972,6 +972,7 @@ mod tests {
                 content_version: None,
                 inline_timestamps: None,
                 inline_mode: None,
+                version: SourceVersion::Current,
             },
             recovery_binding: [7; 32],
         }

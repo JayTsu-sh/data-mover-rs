@@ -37,6 +37,60 @@ pub(crate) struct MemoryS3 {
     pub(crate) copy_commits_then_fails: Mutex<bool>,
     pub(crate) native_copies: Mutex<u64>,
     pub(crate) native_failure: Mutex<Option<S3ProtocolFailure>>,
+    /// Stored versions by (key, version id); `None` is a delete marker.
+    pub(crate) versions: Mutex<HashMap<(String, String), Option<Bytes>>>,
+    /// The version id each tag read asked for.
+    pub(crate) tag_versions: Mutex<Vec<Option<String>>>,
+    /// Behave like a store that ignores `?versionId=` and answers with the current object.
+    pub(crate) ignores_version_id: Mutex<bool>,
+}
+
+impl MemoryS3 {
+    /// Stores `bytes` as version `id` of `key` and makes it the current object.
+    pub(crate) async fn put_version(&self, key: &str, id: &str, bytes: Bytes) {
+        self.versions
+            .lock()
+            .await
+            .insert((key.to_string(), id.to_string()), Some(bytes.clone()));
+        self.objects.lock().await.insert(key.to_string(), bytes);
+        *self.version.lock().await = Some(id.to_string());
+    }
+
+    /// Adds a delete marker as version `id` of `key`; the current object is gone.
+    pub(crate) async fn put_delete_marker(&self, key: &str, id: &str) {
+        self.versions
+            .lock()
+            .await
+            .insert((key.to_string(), id.to_string()), None);
+        self.objects.lock().await.remove(key);
+    }
+
+    /// The bytes of `key` at `version` when that version is stored, else of the current object.
+    async fn bytes_at(&self, key: &str, version: Option<&str>) -> S3Result<Bytes> {
+        if let Some(version) = version
+            && let Some(stored) = self
+                .versions
+                .lock()
+                .await
+                .get(&(key.to_string(), version.to_string()))
+        {
+            return stored.clone().ok_or_else(not_found);
+        }
+        self.objects
+            .lock()
+            .await
+            .get(key)
+            .cloned()
+            .ok_or_else(not_found)
+    }
+}
+
+fn not_found() -> S3ProtocolFailure {
+    S3ProtocolFailure::entry(
+        crate::model::FailureClass::NotFound,
+        crate::model::Transience::Permanent,
+        "not found",
+    )
 }
 
 #[async_trait]
@@ -62,6 +116,30 @@ impl S3Protocol for MemoryS3 {
             last_modified: *self.last_modified.lock().await,
         })
     }
+    async fn head_version(&self, key: &str, version_id: &str) -> S3Result<S3ObjectFacts> {
+        if *self.ignores_version_id.lock().await {
+            return self.head(key).await;
+        }
+        let stored = self
+            .versions
+            .lock()
+            .await
+            .get(&(key.to_string(), version_id.to_string()))
+            .cloned();
+        let bytes = match stored {
+            Some(stored) => stored.ok_or_else(not_found)?,
+            None if self.version.lock().await.as_deref() == Some(version_id) => {
+                return self.head(key).await;
+            }
+            None => return Err(not_found()),
+        };
+        Ok(S3ObjectFacts {
+            size: bytes.len() as u64,
+            etag: blake3::hash(&bytes).to_hex().to_string(),
+            version_id: Some(version_id.to_string()),
+            last_modified: *self.last_modified.lock().await,
+        })
+    }
     async fn get_range(
         &self,
         key: &str,
@@ -69,15 +147,8 @@ impl S3Protocol for MemoryS3 {
         observed: &S3ObjectFacts,
     ) -> S3Result<Bytes> {
         self.range_observations.lock().await.push(observed.clone());
-        let objects = self.objects.lock().await;
-        let bytes = objects.get(key).ok_or_else(|| {
-            S3ProtocolFailure::entry(
-                crate::model::FailureClass::NotFound,
-                crate::model::Transience::Permanent,
-                "not found",
-            )
-        })?;
-        if observed.etag != blake3::hash(bytes).to_hex().as_str() {
+        let bytes = self.bytes_at(key, observed.version_id.as_deref()).await?;
+        if observed.etag != blake3::hash(&bytes).to_hex().as_str() {
             return Err(S3ProtocolFailure::entry(
                 crate::model::FailureClass::Conflict,
                 crate::model::Transience::Permanent,
@@ -216,12 +287,9 @@ impl S3Protocol for MemoryS3 {
             });
         }
         let bytes = self
-            .objects
-            .lock()
+            .bytes_at(&source.key, source.version_id.as_deref())
             .await
-            .get(&source.key)
-            .cloned()
-            .ok_or_else(|| S3NativeCopyFailure {
+            .map_err(|_| S3NativeCopyFailure {
                 error: S3ProtocolFailure::protocol("not found"),
                 bytes: 0,
                 requests: 1,
@@ -250,8 +318,12 @@ impl S3Protocol for MemoryS3 {
         self.objects.lock().await.remove(key);
         Ok(())
     }
-    async fn get_tags(&self, key: &str) -> S3Result<Vec<ObjectTag>> {
+    async fn get_tags(&self, key: &str, version_id: Option<&str>) -> S3Result<Vec<ObjectTag>> {
         *self.tag_reads.lock().await += 1;
+        self.tag_versions
+            .lock()
+            .await
+            .push(version_id.map(str::to_string));
         Ok(self.tags.lock().await.get(key).cloned().unwrap_or_default())
     }
     async fn put_tags(&self, key: &str, tags: &[ObjectTag]) -> S3Result<()> {
@@ -277,3 +349,6 @@ pub(crate) fn native_context() -> S3NativeContext {
 
 #[path = "role_tests.rs"]
 mod roles;
+
+#[path = "version_tests.rs"]
+mod versions;

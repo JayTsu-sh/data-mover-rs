@@ -63,9 +63,10 @@ pub(super) async fn copied_metadata_plan(
         .with_acl(observation_mode(requested.acl()))
         .with_xattrs(observation_mode(requested.xattrs()));
     let observations = metadata
-        .observe_copy_bound(
+        .observe_copy_bound_version(
             &request.source_path,
             &descriptor.source_identity,
+            &descriptor.version,
             observation_plan,
         )
         .await

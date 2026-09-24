@@ -5,7 +5,8 @@ use bytes::Bytes;
 use super::tests::{MemoryS3, identity, native_context, validation_policy};
 use super::{S3ProtocolFailure, connect};
 use crate::model::{
-    EntryKind, FailureClass, IdentityStrength, SourceIdentity, StoragePath, Transience,
+    EntryKind, FailureClass, IdentityStrength, SourceIdentity, SourceVersion, StoragePath,
+    Transience,
 };
 use crate::storage::{
     FinalDestination, PrepareRequest, PreparedStage, RecoverRequest, RecoveryIdentity,
@@ -34,6 +35,7 @@ async fn fixture(name: &str, binding: [u8; 32]) -> TestResult<Fixture> {
         content_version: None,
         inline_timestamps: None,
         inline_mode: None,
+        version: SourceVersion::Current,
     };
     let prepare = PrepareRequest {
         final_destination: FinalDestination::new(StoragePath::new(name)?),

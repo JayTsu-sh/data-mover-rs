@@ -2,7 +2,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use crate::model::{BackendKind, FailureClass};
+use crate::model::{BackendKind, FailureClass, SourceVersion};
 
 struct FakeProtocol {
     payload: Bytes,
@@ -105,6 +105,7 @@ async fn one_stream_uses_one_open_cursor_and_exact_ranges() -> Result<(), Box<dy
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let mut total = 0;
@@ -161,6 +162,7 @@ async fn shared_budget_bounds_nfs_prefetch_without_serializing_reads()
             read_budget: Some(budget.clone()),
             cancel,
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let mut offset = 0;
@@ -210,6 +212,7 @@ async fn opened_identity_detects_change_and_precancel_avoids_another_open()
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await;
     assert!(
@@ -228,6 +231,7 @@ async fn opened_identity_detects_change_and_precancel_avoids_another_open()
             read_budget: None,
             cancel,
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await;
     assert!(
@@ -269,6 +273,7 @@ async fn negotiated_protocol_limit_prevents_internal_read_resplitting()
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let mut chunks = Vec::new();

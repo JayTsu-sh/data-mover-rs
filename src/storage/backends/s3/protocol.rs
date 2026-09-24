@@ -95,6 +95,9 @@ pub(crate) type S3NativeCopyResult = Result<S3NativeCopyEvidence, S3NativeCopyFa
 #[async_trait]
 pub(crate) trait S3Protocol: Send + Sync {
     async fn head(&self, key: &str) -> S3Result<S3ObjectFacts>;
+    /// HEAD one stored version. A delete marker, or a version the store does not have, is a
+    /// `NotFound` entry failure — a per-entry outcome, never a session failure.
+    async fn head_version(&self, key: &str, version_id: &str) -> S3Result<S3ObjectFacts>;
     async fn get_range(
         &self,
         key: &str,
@@ -126,6 +129,7 @@ pub(crate) trait S3Protocol: Send + Sync {
         cancel: &CancellationToken,
     ) -> S3NativeCopyResult;
     async fn delete_object(&self, key: &str) -> S3Result<()>;
-    async fn get_tags(&self, key: &str) -> S3Result<Vec<ObjectTag>>;
+    /// Tags of the current object, or of one stored version.
+    async fn get_tags(&self, key: &str, version_id: Option<&str>) -> S3Result<Vec<ObjectTag>>;
     async fn put_tags(&self, key: &str, tags: &[ObjectTag]) -> S3Result<()>;
 }

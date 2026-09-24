@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 use crate::model::{
     BackendIdentity, EntryKind, FailureClass, IdentityStrength, Operation, SourceIdentity,
-    Transience,
+    SourceVersion, StoragePath, Transience,
 };
 use crate::storage::{ByteStream, ReadRequest, ReadSource, SourceDescriptor, StorageRoleFailure};
 
-use super::{S3Protocol, S3ProtocolFailure};
+use super::{S3ObjectFacts, S3Protocol, S3ProtocolFailure};
 
 pub(crate) struct S3ReadSource<P> {
     protocol: Arc<P>,
@@ -26,15 +27,56 @@ impl<P> S3ReadSource<P> {
     }
 }
 
+/// A real version id: not absent, empty or `"null"` — the id an unversioned bucket, or an object
+/// written before versioning, reports.
+fn real_version(facts: &S3ObjectFacts) -> Option<&str> {
+    facts
+        .version_id
+        .as_deref()
+        .filter(|version| !version.is_empty() && *version != "null")
+}
+
+/// The version a describe pins: the requested one, or for `Current` the real version it found.
+/// An object without one stays `Current`, guarded by its `ETag` alone, as before versions.
+fn pinned_version(facts: &S3ObjectFacts, requested: &SourceVersion) -> SourceVersion {
+    match requested {
+        SourceVersion::Id(_) => requested.clone(),
+        SourceVersion::Current => real_version(facts).map_or(SourceVersion::Current, |version| {
+            SourceVersion::Id(version.to_string())
+        }),
+    }
+}
+
+/// Whether a HEAD for `requested` answered with that version. The `"null"` version is reported as
+/// `"null"` or not at all.
+fn answers_version(facts: &S3ObjectFacts, requested: &str) -> bool {
+    match facts.version_id.as_deref() {
+        Some(reported) => reported == requested,
+        None => requested == "null",
+    }
+}
+
+impl<P: S3Protocol + 'static> S3ReadSource<P> {
+    async fn head(
+        &self,
+        path: &StoragePath,
+        version: &SourceVersion,
+        operation: Operation,
+    ) -> Result<S3ObjectFacts, StorageRoleFailure> {
+        match version.version_id() {
+            None => self.protocol.head(path.as_str()).await,
+            Some(version) => self.protocol.head_version(path.as_str(), version).await,
+        }
+        .map_err(|e| role_failure(path, operation, e))
+    }
+}
+
 pub(super) fn object_identity(
     backend: &BackendIdentity,
     facts: &super::S3ObjectFacts,
 ) -> Result<SourceIdentity, crate::model::ModelValueError> {
     // The null version can be replaced; its ETag must remain part of source identity.
-    let version = facts
-        .version_id
-        .as_deref()
-        .filter(|version| !version.is_empty() && *version != "null");
+    let version = real_version(facts);
     SourceIdentity::new(
         backend.clone(),
         if version.is_some() {
@@ -56,11 +98,35 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
         &self,
         path: &crate::model::StoragePath,
     ) -> Result<SourceDescriptor, StorageRoleFailure> {
-        let facts = self
-            .protocol
-            .head(path.as_str())
-            .await
-            .map_err(|e| role_failure(path, Operation::Observe, e))?;
+        self.describe_version(path, &SourceVersion::Current).await
+    }
+
+    fn supports_source_versions(&self) -> bool {
+        true
+    }
+
+    /// Describes one version, pinning it for every later read: `Current` becomes the real version
+    /// it found. The `ETag` is the content version, so a binding changes when the bytes of a
+    /// version do.
+    async fn describe_version(
+        &self,
+        path: &StoragePath,
+        version: &SourceVersion,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
+        let facts = self.head(path, version, Operation::Observe).await?;
+        if let Some(requested) = version.version_id()
+            && !answers_version(&facts, requested)
+        {
+            // A store that ignores `?versionId=` answers with the current object; copying that
+            // under the requested version's name would be silently wrong.
+            return Err(classified_entry(
+                path,
+                Operation::Observe,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "the S3 store did not answer with the requested version",
+            ));
+        }
         let source_identity = object_identity(&self.identity, &facts)
             .map_err(|e| entry(path, Operation::Observe, e.to_string()))?;
         Ok(SourceDescriptor {
@@ -69,9 +135,11 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             size: Some(facts.size),
             source_identity,
             backend_fact: None,
-            content_version: None,
+            content_version: (!facts.etag.is_empty())
+                .then(|| Bytes::copy_from_slice(facts.etag.as_bytes())),
             inline_timestamps: None,
             inline_mode: None,
+            version: pinned_version(&facts, version),
         })
     }
 
@@ -87,10 +155,8 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             ));
         }
         let facts = self
-            .protocol
-            .head(request.path.as_str())
-            .await
-            .map_err(|e| role_failure(&request.path, Operation::Read, e))?;
+            .head(&request.path, &request.version, Operation::Read)
+            .await?;
         let opened_identity = object_identity(&self.identity, &facts)
             .map_err(|e| entry(&request.path, Operation::Read, e.to_string()))?;
         if request

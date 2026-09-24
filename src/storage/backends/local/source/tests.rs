@@ -2,7 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::model::{BackendIdentity, BackendKind, StoragePath};
+use crate::model::{BackendIdentity, BackendKind, SourceVersion, StoragePath};
 use crate::storage::{ReadRequest, ReadSource};
 
 #[tokio::test]
@@ -34,6 +34,7 @@ async fn prefetch_waits_for_shared_payload_capacity_before_reading()
                 read_budget: Some(budget.clone()),
                 cancel,
                 source_qos: None,
+                version: SourceVersion::Current,
             })
             .await?;
         let first = stream
@@ -92,6 +93,7 @@ async fn role_describes_and_reads_an_exact_local_range() -> Result<(), Box<dyn s
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
 
@@ -120,6 +122,7 @@ async fn role_splits_large_ranges_into_bounded_chunks() -> Result<(), Box<dyn st
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let mut rebuilt = Vec::new();
@@ -154,6 +157,7 @@ async fn caller_chunk_ceiling_negotiates_below_local_maximum()
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let mut rebuilt = Vec::new();
@@ -190,6 +194,7 @@ async fn one_stream_reads_inflight_but_emits_in_admission_order()
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let reading = tokio::spawn(async move {
@@ -253,6 +258,7 @@ async fn inflight_stream_fast_fails_when_a_later_range_becomes_short()
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
 
@@ -296,6 +302,7 @@ async fn cancellation_stops_an_active_inflight_stream_without_waiting_for_reads(
             read_budget: None,
             cancel: cancel.clone(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let reading = tokio::spawn(async move { stream.next().await });
@@ -341,6 +348,7 @@ async fn one_stream_remains_bound_to_the_file_opened_at_read_start()
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let first = stream
@@ -383,6 +391,7 @@ async fn expected_identity_rejects_replacement_between_describe_and_read()
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await;
 
@@ -439,6 +448,7 @@ async fn positioned_read_delivers_later_chunk_before_blocked_prefix()
             read_budget: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             source_qos: None,
+            version: SourceVersion::Current,
         })
         .await?;
     let later = tokio::time::timeout(std::time::Duration::from_secs(3), input.next()).await;

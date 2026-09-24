@@ -61,6 +61,7 @@ impl ReadSource for HdfsReadSource {
         &self,
         request: ReadRequest,
     ) -> Result<PositionedByteStream, StorageRoleFailure> {
+        request.require_current()?;
         Ok(Box::pin(try_unfold(
             self.read_state(request, false).await?,
             read_next,
@@ -68,6 +69,7 @@ impl ReadSource for HdfsReadSource {
     }
 
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure> {
+        request.require_current()?;
         Ok(Box::pin(
             try_unfold(self.read_state(request, true).await?, read_next)
                 .map(|item| item.map(|chunk| chunk.data)),

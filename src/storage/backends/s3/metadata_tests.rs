@@ -3,7 +3,7 @@
 use bytes::Bytes;
 
 use super::*;
-use crate::model::{BackendKind, StorageTimestamp, TimePrecision};
+use crate::model::{BackendKind, SourceVersion, StorageTimestamp, TimePrecision};
 use crate::storage::backends::s3::tests::MemoryS3;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -175,6 +175,37 @@ async fn an_object_deleted_after_describe_is_not_found() -> Result {
         matches!(&result, Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound),
         "{:?}",
         result.err()
+    );
+    Ok(())
+}
+
+/// The copy baseline of a pinned version is that version's: its tags are asked for by version id,
+/// and a newer current version does not make it a conflict.
+#[tokio::test]
+async fn a_pinned_version_is_observed_as_itself() -> Result {
+    let (protocol, metadata) = fixture(Some(modified()?)).await?;
+    protocol
+        .put_version(PATH, "v1", Bytes::from_static(b"first"))
+        .await;
+    let expected = described(&protocol, &metadata).await?;
+    protocol
+        .put_version(PATH, "v2", Bytes::from_static(b"second"))
+        .await;
+    let plan = ObservationPlan::default().with_tags(ObservationMode::Required);
+    let path = StoragePath::new(PATH)?;
+    metadata
+        .observe_copy_bound_version(&path, &expected, &SourceVersion::Id("v1".into()), plan)
+        .await?;
+    assert_eq!(
+        *protocol.tag_versions.lock().await,
+        vec![Some("v1".to_string())]
+    );
+    // Observing the current object instead finds it replaced.
+    assert!(
+        metadata
+            .observe_bound(&path, &expected, plan)
+            .await
+            .is_err()
     );
     Ok(())
 }

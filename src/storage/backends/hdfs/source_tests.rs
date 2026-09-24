@@ -1,6 +1,6 @@
 use super::super::protocol::{HdfsReadCursor, HdfsWriteSession};
 use super::*;
-use crate::model::BackendKind;
+use crate::model::{BackendKind, SourceVersion};
 use std::{
     ops::Range,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -174,6 +174,7 @@ fn request(range: Range<u64>) -> Result<ReadRequest, Box<dyn std::error::Error>>
         read_budget: None,
         cancel: CancellationToken::new(),
         source_qos: None,
+        version: SourceVersion::Current,
     })
 }
 

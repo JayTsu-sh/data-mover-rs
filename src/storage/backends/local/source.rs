@@ -15,8 +15,8 @@ use futures::stream::{FuturesOrdered, FuturesUnordered};
 
 use super::observation::{LocalObservationAdapter, classify_io, source_identity};
 use crate::model::{
-    BackendIdentity, EntryOperationFailure, FailureClass, Operation, SourceIdentity, StoragePath,
-    Transience,
+    BackendIdentity, EntryOperationFailure, FailureClass, Operation, SourceIdentity, SourceVersion,
+    StoragePath, Transience,
 };
 use crate::storage::{
     ByteStream, PositionedByteStream, PositionedChunk, ReadRequest, ReadSource, SourceDescriptor,
@@ -201,6 +201,7 @@ impl ReadSource for LocalReadSource {
             content_version: Some(version),
             inline_timestamps: None,
             inline_mode: None,
+            version: SourceVersion::Current,
         })
     }
 
@@ -212,6 +213,7 @@ impl ReadSource for LocalReadSource {
         &self,
         request: ReadRequest,
     ) -> Result<PositionedByteStream, StorageRoleFailure> {
+        request.require_current()?;
         let state = self.read_state(request, false).await?;
         Ok(Box::pin(futures::stream::try_unfold(
             state,
@@ -220,6 +222,7 @@ impl ReadSource for LocalReadSource {
     }
 
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure> {
+        request.require_current()?;
         let state = self.read_state(request, true).await?;
         Ok(Box::pin(
             futures::stream::try_unfold(state, read_next_chunk)

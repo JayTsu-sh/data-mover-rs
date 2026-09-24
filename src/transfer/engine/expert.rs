@@ -160,6 +160,7 @@ impl ExpertSourceSession {
             hash_content: true,
             source: self.source,
             path: self.descriptor.path.clone(),
+            version: self.descriptor.version,
             source_identity: self.descriptor.source_identity,
             cancel: self.cancel,
             runtime,

@@ -9,8 +9,8 @@ use super::{NdxWalkRequest, ndx_walk};
 use crate::dir_tree::{DirPageResult, NdxEvent};
 use crate::model::{
     BackendIdentity, BackendKind, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
-    ObservedEntry, Operation, SourceIdentity, StoragePath, StorageTimestamp, TimePrecision,
-    TimestampMetadata, Transience,
+    ObservedEntry, Operation, SourceIdentity, SourceVersion, StoragePath, StorageTimestamp,
+    TimePrecision, TimestampMetadata, Transience,
 };
 use crate::storage::{
     BackendCapabilities, CapabilityAvailability, Namespace, NamespaceRequest, NamespaceResult,
@@ -88,6 +88,7 @@ fn descriptor(full_path: &str, kind: EntryKind, timestamps: bool) -> Result<Sour
         content_version: None,
         inline_timestamps: None,
         inline_mode: None,
+        version: SourceVersion::Current,
     };
     if !timestamps {
         return Ok(descriptor);

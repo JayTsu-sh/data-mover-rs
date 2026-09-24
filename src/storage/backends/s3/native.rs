@@ -76,11 +76,14 @@ impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
         &self,
         source: &SourceDescriptor,
     ) -> Result<NativeSourceBinding, StorageRoleFailure> {
-        let facts = self
-            .protocol
-            .head(source.path.as_str())
-            .await
-            .map_err(|failure| role_failure(&source.path, Operation::Read, failure))?;
+        // Bind the version the describe pinned, so a copy made after a newer version appeared
+        // still copies the described one.
+        let key = source.path.as_str();
+        let facts = match source.version().version_id() {
+            None => self.protocol.head(key).await,
+            Some(version) => self.protocol.head_version(key, version).await,
+        }
+        .map_err(|failure| role_failure(&source.path, Operation::Read, failure))?;
         validate_identity(source, &self.identity, &facts)?;
         let native = S3NativeCopySource {
             bucket: self.context.bucket.clone(),

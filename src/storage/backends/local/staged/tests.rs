@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures::stream;
 
 use super::*;
-use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity};
+use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, SourceVersion};
 use crate::storage::{FinalDestination, SourceDescriptor};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -52,6 +52,7 @@ fn request(identity: &BackendIdentity, destination: &str) -> PrepareRequest {
             content_version: None,
             inline_timestamps: None,
             inline_mode: None,
+            version: SourceVersion::Current,
         },
         recovery_binding: [7; 32],
     }

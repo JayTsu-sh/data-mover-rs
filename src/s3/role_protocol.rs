@@ -88,11 +88,12 @@ fn continuation_marker(
     Ok(Some(next.to_string()))
 }
 
-#[async_trait::async_trait]
-impl crate::storage::backends::s3::S3Protocol for S3Storage {
-    async fn head(
+impl S3Storage {
+    /// HEAD the current object, or one stored version of it.
+    async fn head_object(
         &self,
         key: &str,
+        version_id: Option<&str>,
     ) -> crate::storage::backends::s3::S3Result<crate::storage::backends::s3::S3ObjectFacts> {
         let full_key = self.build_full_key(key);
         let response = self
@@ -100,9 +101,23 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .head_object()
             .bucket(&self.bucket_name)
             .key(&full_key)
+            .set_version_id(version_id.map(str::to_string))
             .send()
             .await
-            .map_err(|error| classify_sdk!(error, "S3 HeadObject request failed"))?;
+            .map_err(|error| {
+                let failure = classify_sdk!(error, "S3 HeadObject request failed");
+                if version_id.is_some() {
+                    versioned_failure(
+                        error.raw_response().map(|r| r.status().as_u16()),
+                        error
+                            .as_service_error()
+                            .and_then(ProvideErrorMetadata::code),
+                        failure,
+                    )
+                } else {
+                    failure
+                }
+            })?;
         let size = response
             .content_length()
             .and_then(|n| u64::try_from(n).ok())
@@ -120,6 +135,24 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
                 .last_modified()
                 .and_then(|time| http_last_modified(time.secs())),
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage::backends::s3::S3Protocol for S3Storage {
+    async fn head(
+        &self,
+        key: &str,
+    ) -> crate::storage::backends::s3::S3Result<crate::storage::backends::s3::S3ObjectFacts> {
+        self.head_object(key, None).await
+    }
+
+    async fn head_version(
+        &self,
+        key: &str,
+        version_id: &str,
+    ) -> crate::storage::backends::s3::S3Result<crate::storage::backends::s3::S3ObjectFacts> {
+        self.head_object(key, Some(version_id)).await
     }
 
     async fn get_range(
@@ -141,7 +174,20 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .if_match(&observed.etag)
             .send()
             .await
-            .map_err(|error| classify_sdk!(error, "S3 GetObject range request failed"))?;
+            .map_err(|error| {
+                let failure = classify_sdk!(error, "S3 GetObject range request failed");
+                if observed.version_id.is_some() {
+                    versioned_failure(
+                        error.raw_response().map(|r| r.status().as_u16()),
+                        error
+                            .as_service_error()
+                            .and_then(ProvideErrorMetadata::code),
+                        failure,
+                    )
+                } else {
+                    failure
+                }
+            })?;
         response
             .body
             .collect()
@@ -333,12 +379,14 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
     async fn get_tags(
         &self,
         key: &str,
+        version_id: Option<&str>,
     ) -> crate::storage::backends::s3::S3Result<Vec<crate::model::ObjectTag>> {
         let response = self
             .client
             .get_object_tagging()
             .bucket(&self.bucket_name)
             .key(self.build_full_key(key))
+            .set_version_id(version_id.map(str::to_string))
             .send()
             .await
             .map_err(|error| classify_sdk!(error, "S3 GetObjectTagging request failed"))?;
@@ -385,6 +433,30 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .await
             .map(|_| ())
             .map_err(|error| classify_sdk!(error, "S3 PutObjectTagging request failed"))
+    }
+}
+
+/// Remaps the failure of a request that named a version. S3 answers a request for a delete marker
+/// with 405, and a malformed version id with 400 `InvalidArgument`; both concern this one entry,
+/// where the generic mapping would call them session-wide protocol failures. Only versioned
+/// requests are remapped — some S3-compatible stores send 405 for operations they do not support —
+/// and a 400 only with that code: S3 also answers 400 for an expired token or a wrong region, which
+/// concern the whole session. A HEAD carries no code, so its 400 keeps the generic mapping.
+fn versioned_failure(
+    status: Option<u16>,
+    code: Option<&str>,
+    failure: S3ProtocolFailure,
+) -> S3ProtocolFailure {
+    match (status, code) {
+        (Some(405), _) => s3_role_entry(
+            crate::model::FailureClass::NotFound,
+            "the S3 version is a delete marker",
+        ),
+        (Some(400), Some("InvalidArgument")) => s3_role_entry(
+            crate::model::FailureClass::InvalidInput,
+            "the S3 version id is invalid",
+        ),
+        _ => failure,
     }
 }
 
@@ -442,7 +514,7 @@ pub(super) fn s3_role_remote_failure(
                 diagnostic,
             )
         }
-        (Some(404), _) | (_, Some("NoSuchKey" | "NoSuchUpload")) => {
+        (Some(404), _) | (_, Some("NoSuchKey" | "NoSuchUpload" | "NoSuchVersion")) => {
             crate::storage::backends::s3::S3ProtocolFailure::entry(
                 FailureClass::NotFound,
                 Transience::Permanent,
@@ -472,8 +544,48 @@ pub(super) fn s3_role_remote_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SourceVersion;
     use crate::storage::backends::s3::S3Protocol as _;
     use crate::storage::backends::s3::S3ProtocolFailure;
+
+    /// A request that named a version: 405 is a delete marker and 400 `InvalidArgument` a
+    /// malformed version id, both about this one entry. A 400 without that code (an expired token,
+    /// a wrong region — or any HEAD, which carries no code) keeps the generic mapping.
+    #[test]
+    fn versioned_request_failures_concern_the_entry() {
+        use crate::model::{FailureClass, Transience};
+        let generic = || s3_role_remote_failure(Some(400), None, "request");
+        assert!(matches!(generic(), S3ProtocolFailure::Session { .. }));
+        for (status, code, class) in [
+            (405, None, FailureClass::NotFound),
+            (400, Some("InvalidArgument"), FailureClass::InvalidInput),
+        ] {
+            assert!(
+                matches!(
+                    versioned_failure(Some(status), code, generic()),
+                    S3ProtocolFailure::Entry { class: got, transience: Transience::Permanent, .. }
+                        if got == class
+                ),
+                "{status}"
+            );
+        }
+        for (status, code) in [(400, None), (400, Some("ExpiredToken")), (503, None)] {
+            assert!(
+                matches!(
+                    versioned_failure(Some(status), code, generic()),
+                    S3ProtocolFailure::Session { .. }
+                ),
+                "{status} {code:?}"
+            );
+        }
+        assert!(matches!(
+            s3_role_remote_failure(Some(404), Some("NoSuchVersion"), "get"),
+            S3ProtocolFailure::Entry {
+                class: FailureClass::NotFound,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn http_errors_keep_scope_class_and_transience() {
@@ -602,6 +714,7 @@ mod tests {
             content_version: None,
             inline_timestamps: None,
             inline_mode: None,
+            version: SourceVersion::Current,
         };
         let path = StoragePath::new(format!(
             "{}.manifest",

@@ -24,6 +24,7 @@ pub(super) async fn transfer(
             read_budget: None,
             cancel: request.cancel.clone(),
             source_qos,
+            version: descriptor.version.clone(),
         })
         .await
         .map_err(source_error)?;

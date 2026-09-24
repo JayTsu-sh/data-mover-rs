@@ -27,6 +27,7 @@ pub(super) async fn transfer(
         source,
         path: descriptor.path.clone(),
         source_identity: descriptor.source_identity.clone(),
+        version: descriptor.version.clone(),
         cancel: request.cancel.clone(),
         runtime,
         failure: Arc::default(),
@@ -152,6 +153,7 @@ async fn produce_positioned(
             read_budget: Some(budget.clone()),
             cancel: request.cancel.clone(),
             source_qos: request.source_qos.clone(),
+            version: request.version.clone(),
         })
         .await?;
     let mut prefix = DigestPrefix {
@@ -266,6 +268,7 @@ mod tests {
                     b"source",
                 )
                 .unwrap(),
+                version: SourceVersion::Current,
                 cancel,
                 runtime,
                 failure: Arc::default(),

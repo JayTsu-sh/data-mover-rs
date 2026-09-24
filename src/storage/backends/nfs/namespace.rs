@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use super::source::{NfsProtocolFailure, entry_failure, role_failure};
 use crate::model::{
     BackendIdentity, EntryKind, FailureClass, IdentityStrength, Operation, SourceIdentity,
-    StoragePath, SymlinkTarget, SymlinkTargetEncoding, Transience,
+    SourceVersion, StoragePath, SymlinkTarget, SymlinkTargetEncoding, Transience,
 };
 use crate::storage::artifacts::is_artifact_native;
 use crate::storage::{
@@ -146,6 +146,7 @@ fn descriptor(
         content_version: None,
         inline_timestamps: entry.timestamps,
         inline_mode: entry.mode,
+        version: SourceVersion::Current,
     })
 }
 

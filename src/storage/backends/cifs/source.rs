@@ -156,6 +156,7 @@ impl ReadSource for CifsReadSource {
         &self,
         request: ReadRequest,
     ) -> Result<crate::storage::PositionedByteStream, StorageRoleFailure> {
+        request.require_current()?;
         if request.cancel.is_cancelled() {
             return Err(entry_failure(
                 &request.path,
@@ -176,6 +177,7 @@ impl ReadSource for CifsReadSource {
     }
 
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure> {
+        request.require_current()?;
         if request.cancel.is_cancelled() {
             return Err(entry_failure(
                 &request.path,
