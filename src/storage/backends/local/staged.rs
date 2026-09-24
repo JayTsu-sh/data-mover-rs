@@ -46,7 +46,6 @@ mod verification;
 use owner_privilege::OwnerPrivilege;
 use probe::WriteProbe;
 
-const STAGING_DIRECTORY: &str = ".data-mover-staging";
 /// Maximum size of one positional write submitted by the Local destination.
 ///
 /// This is independent of the Local source's 2 MiB read ceiling. Upstream
@@ -131,19 +130,6 @@ impl LocalStagedDestination {
         let relative =
             Self::checked_relative(request.final_destination.path(), Operation::Prepare)?;
         if is_artifact_native(&relative) {
-            return Err(failure(
-                request.final_destination.path(),
-                Operation::Prepare,
-                FailureClass::Conflict,
-            ));
-        }
-        let reserved = Path::new(request.final_destination.path().as_str())
-            .components()
-            .next()
-            .is_some_and(|component| {
-                matches!(component, Component::Normal(value) if value == STAGING_DIRECTORY)
-            });
-        if reserved {
             return Err(failure(
                 request.final_destination.path(),
                 Operation::Prepare,

@@ -741,7 +741,7 @@ async fn nested_stages_recover_in_the_parent() -> io::Result<()> {
         stage_path.parent(),
         Some(root.0.join("nested/deep").as_path())
     );
-    assert!(!root.0.join(STAGING_DIRECTORY).exists());
+    assert!(!root.0.join(".data-mover-staging").exists());
     ok(adapter
         .write(&stage, owned_bytes(vec![Bytes::from_static(b"new-bytes")]))
         .await);
@@ -1256,9 +1256,4 @@ async fn positioned_sparse_completion_crosses_multiple_intervals_once() -> io::R
     );
     ok(adapter.discard(stage).await);
     Ok(())
-}
-
-#[test]
-fn staging_directory_is_a_transfer_artifact() {
-    assert!(STAGING_DIRECTORY.starts_with(crate::storage::artifacts::ARTIFACT_PREFIX));
 }
