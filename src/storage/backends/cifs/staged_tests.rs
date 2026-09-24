@@ -11,8 +11,11 @@ use crate::model::{
     BackendIdentity, BackendKind, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
     Operation, SourceIdentity, StoragePath, Transience,
 };
+use crate::storage::artifacts::{ArtifactKind, artifact_name};
+use crate::storage::roles::{CheckpointRegistration, DeferredCheckpoint};
 use crate::storage::{
-    ByteStream, FinalDestination, PrepareRequest, PublishRequest, RecoverRequest, SourceDescriptor,
+    ByteStream, DestinationPrepareRequest, FinalDestination, PrepareFact, PrepareRequest,
+    PreparedStage, PublishRequest, RecoverRequest, RecoveryIdentity, ResumeMode, SourceDescriptor,
     StagedDestination, StorageRoleFailure, VerifyRequest,
 };
 
@@ -25,9 +28,13 @@ struct MemoryProtocol {
     closes: Arc<AtomicUsize>,
     writes: Arc<Mutex<Vec<(u64, usize)>>>,
     fail_rename_after_commit: AtomicBool,
-    fail_checkpoint_delete: AtomicBool,
-    /// Every flushed path, in order.
+    fail_pointer_delete: AtomicBool,
+    /// Every flushed path, in order — the pointer's temporary too. The counters above (`flushes`,
+    /// `closes`, `writes`, `activity`) see the stage and final files only.
     flushed: Arc<Mutex<Vec<String>>>,
+    /// Handles opened and closed on the pointer or its temporary: every one must be closed.
+    pointer_opens: AtomicUsize,
+    pointer_closes: Arc<AtomicUsize>,
 }
 
 struct MemoryFile {
@@ -39,6 +46,7 @@ struct MemoryFile {
     closes: Arc<AtomicUsize>,
     writes: Arc<Mutex<Vec<(u64, usize)>>>,
     flushed: Arc<Mutex<Vec<String>>>,
+    pointer_closes: Arc<AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -47,6 +55,13 @@ struct WriteActivity {
     active: AtomicUsize,
     peak: AtomicUsize,
     completed: tokio::sync::Notify,
+}
+
+impl MemoryFile {
+    /// Whether this is the pointer or its temporary, which the data counters do not see.
+    fn is_pointer(&self) -> bool {
+        self.path.contains(".pointer")
+    }
 }
 
 #[async_trait]
@@ -77,14 +92,14 @@ impl CifsStageFile for MemoryFile {
     }
 
     async fn write_all_at(&self, offset: u64, bytes: Bytes) -> smb_domain::Result<()> {
-        if !self.path.contains(".checkpoint") && self.activity.delayed.load(Ordering::SeqCst) {
+        if !self.is_pointer() && self.activity.delayed.load(Ordering::SeqCst) {
             let active = self.activity.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.activity.peak.fetch_max(active, Ordering::SeqCst);
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             self.activity.active.fetch_sub(1, Ordering::SeqCst);
             self.activity.completed.notify_one();
         }
-        if !self.path.contains(".checkpoint") {
+        if !self.is_pointer() {
             self.writes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -112,7 +127,9 @@ impl CifsStageFile for MemoryFile {
             0,
             "FLUSH raced an outstanding write"
         );
-        self.flushes.fetch_add(1, Ordering::SeqCst);
+        if !self.is_pointer() {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+        }
         self.flushed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -126,7 +143,11 @@ impl CifsStageFile for MemoryFile {
     }
 
     async fn close(self: Box<Self>) -> smb_domain::Result<()> {
-        self.closes.fetch_add(1, Ordering::SeqCst);
+        if self.is_pointer() {
+            self.pointer_closes.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 }
@@ -155,6 +176,9 @@ impl CifsStagedProtocol for MemoryProtocol {
         {
             return Err(smb_domain::Error::NotFound(path.as_str().into()));
         }
+        if path.as_str().contains(".pointer") {
+            self.pointer_opens.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(Box::new(MemoryFile {
             path: path.as_str().into(),
             files: Arc::clone(&self.files),
@@ -164,6 +188,7 @@ impl CifsStagedProtocol for MemoryProtocol {
             closes: Arc::clone(&self.closes),
             writes: Arc::clone(&self.writes),
             flushed: Arc::clone(&self.flushed),
+            pointer_closes: Arc::clone(&self.pointer_closes),
         }))
     }
 
@@ -202,8 +227,8 @@ impl CifsStagedProtocol for MemoryProtocol {
     }
 
     async fn delete(&self, path: &StoragePath) -> smb_domain::Result<()> {
-        if path.as_str().ends_with(".checkpoint")
-            && self.fail_checkpoint_delete.swap(false, Ordering::SeqCst)
+        if path.as_str().ends_with(".pointer")
+            && self.fail_pointer_delete.swap(false, Ordering::SeqCst)
         {
             return Err(smb_domain::Error::InvalidState(
                 "injected cleanup failure".into(),
@@ -237,6 +262,83 @@ fn prepare_request(
     })
 }
 
+fn at_destination(request: PrepareRequest, recoverable: bool) -> DestinationPrepareRequest {
+    DestinationPrepareRequest::new(request, [3; 32])
+        .with_resume(ResumeMode::Restart)
+        .with_recoverable(recoverable)
+}
+
+/// A fresh stage that records prefix zero in its pointer before any byte is written.
+async fn prepare_stage(
+    destination: &CifsStagedDestination,
+    request: PrepareRequest,
+) -> Result<PreparedStage, StorageRoleFailure> {
+    destination
+        .prepare_at_destination(at_destination(request, true))
+        .await
+}
+
+/// A fresh stage whose first pointer waits for its first checkpoint.
+async fn prepare_ephemeral_stage(
+    destination: &CifsStagedDestination,
+    request: PrepareRequest,
+) -> Result<PreparedStage, StorageRoleFailure> {
+    destination
+        .prepare_at_destination(at_destination(request, false))
+        .await
+}
+
+/// Where the stage of `final_path` lives: its deterministic name, beside the final file.
+fn stage_file(final_path: &str) -> String {
+    let (parent, name) = final_path.rsplit_once('/').unwrap_or(("", final_path));
+    let stage = artifact_name(name, ArtifactKind::Stage);
+    if parent.is_empty() {
+        stage
+    } else {
+        format!("{parent}/{stage}")
+    }
+}
+
+/// Every handle opened on the pointer or its temporary was closed again (resource handles: S99).
+fn assert_pointer_handles_closed(protocol: &MemoryProtocol) {
+    let opened = protocol.pointer_opens.load(Ordering::SeqCst);
+    assert!(opened > 0, "no pointer handle was opened");
+    assert_eq!(opened, protocol.pointer_closes.load(Ordering::SeqCst));
+}
+
+/// How many pointers were written: each is flushed under the pointer's temporary name.
+fn pointer_writes(protocol: &MemoryProtocol) -> usize {
+    protocol
+        .flushed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|path| path.ends_with(".pointer.tmp"))
+        .count()
+}
+
+/// A destination-kept stage never registers a checkpoint where data-mover runs.
+struct NeverRegistered;
+
+#[async_trait]
+impl CheckpointRegistration for NeverRegistered {
+    async fn register(
+        &self,
+        _stage: &PreparedStage,
+        _identity: RecoveryIdentity,
+    ) -> Result<(), StorageRoleFailure> {
+        panic!("a CIFS stage registered a checkpoint outside the destination")
+    }
+}
+
+fn deferred(interval_bytes: u64, source_size: u64) -> DeferredCheckpoint {
+    DeferredCheckpoint {
+        interval_bytes,
+        source_size,
+        registration: Arc::new(NeverRegistered),
+    }
+}
+
 fn input(parts: &'static [&'static [u8]]) -> ByteStream {
     Box::pin(stream::iter(
         parts.iter().map(|part| Ok(Bytes::from_static(part))),
@@ -262,7 +364,7 @@ async fn final_paths_the_share_would_rename_are_refused() -> Result<(), Box<dyn 
     ] {
         let mut request = prepare_request(&identity)?;
         request.final_destination = FinalDestination::new(StoragePath::new(path)?);
-        let refused = destination.prepare(request).await;
+        let refused = prepare_stage(&destination, request).await;
         assert!(
             matches!(
                 refused,
@@ -288,7 +390,7 @@ async fn staged_lifecycle_flushes_verifies_and_atomically_publishes()
     let protocol = Arc::new(MemoryProtocol::default());
     let identity = identity()?;
     let destination = CifsStagedDestination::new(Arc::clone(&protocol), identity.clone());
-    let stage = destination.prepare(prepare_request(&identity)?).await?;
+    let stage = prepare_stage(&destination, prepare_request(&identity)?).await?;
     let written = destination.write(&stage, input(&[b"abcdef"])).await?;
     assert_eq!(written.persisted_bytes, 6);
     assert_eq!(
@@ -298,7 +400,9 @@ async fn staged_lifecycle_flushes_verifies_and_atomically_publishes()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
         vec![(0, 4), (4, 2)]
     );
-    assert_eq!(protocol.flushes.load(Ordering::SeqCst), 2);
+    assert_eq!(protocol.flushes.load(Ordering::SeqCst), 1);
+    // Prefix zero at prepare, then the flushed six bytes.
+    assert_eq!(pointer_writes(&protocol), 2);
     assert_eq!(
         destination.observe_checkpoint(&stage).await?.durable_prefix,
         6
@@ -329,84 +433,25 @@ async fn staged_lifecycle_flushes_verifies_and_atomically_publishes()
         )
         .await
         .map_err(|failure| failure.error)?;
-    assert_eq!(
-        protocol
-            .files
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get("final.bin"),
-        Some(&b"abcdef".to_vec())
-    );
-    assert_eq!(protocol.closes.load(Ordering::SeqCst), 4);
+    let files = protocol
+        .files
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(files.get("final.bin"), Some(&b"abcdef".to_vec()));
+    assert_eq!(files.len(), 1, "no artifact is left");
+    // The stage's handles: the write and the verification.
+    assert_eq!(protocol.closes.load(Ordering::SeqCst), 2);
+    assert_pointer_handles_closed(&protocol);
     Ok(())
 }
 
-#[tokio::test]
-async fn recovery_claim_reobserves_durable_prefix_before_resuming()
--> Result<(), Box<dyn std::error::Error>> {
-    let protocol = Arc::new(MemoryProtocol::default());
-    let identity = identity()?;
-    let first = CifsStagedDestination::new(Arc::clone(&protocol), identity.clone());
-    let request = prepare_request(&identity)?;
-    let stage = first.prepare(request.clone()).await?;
-    first.write(&stage, input(&[b"abc"])).await?;
-    let recovery_identity = first.recovery_identity(&stage).await?;
-
-    let resumed = CifsStagedDestination::new(Arc::clone(&protocol), identity);
-    let stage = resumed
-        .recover(RecoverRequest {
-            identity: recovery_identity,
-            final_destination: request.final_destination,
-            source: request.source,
-            recovery_binding: request.recovery_binding,
-            claim_token: [9; 32],
-        })
-        .await?;
-    assert_eq!(resumed.observe_checkpoint(&stage).await?.durable_prefix, 3);
-    assert_eq!(
-        resumed
-            .write(&stage, input(&[b"def"]))
-            .await?
-            .persisted_bytes,
-        6
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn repeated_recovery_reobserves_the_same_claim_after_a_lost_response()
--> Result<(), Box<dyn std::error::Error>> {
-    let protocol = Arc::new(MemoryProtocol::default());
-    let identity = identity()?;
-    let owner = CifsStagedDestination::new(Arc::clone(&protocol), identity.clone());
-    let prepare = prepare_request(&identity)?;
-    let stage = owner.prepare(prepare.clone()).await?;
-    owner.write(&stage, input(&[b"abc"])).await?;
-    let recovery_identity = owner.recovery_identity(&stage).await?;
-    let request = RecoverRequest {
-        final_destination: stage.final_destination.clone(),
-        source: prepare.source,
-        identity: recovery_identity,
-        recovery_binding: stage.recovery_binding,
-        claim_token: [9; 32],
-    };
-    let first = CifsStagedDestination::new(Arc::clone(&protocol), identity.clone())
-        .recover(request.clone())
-        .await?;
-    let repeated = CifsStagedDestination::new(protocol, identity)
-        .recover(request)
-        .await?;
-    assert_eq!(first.token, repeated.token);
-    assert_eq!(repeated.write_offset, 3);
-    Ok(())
-}
 #[tokio::test]
 async fn lost_rename_response_reconciles_committed_final_content()
 -> Result<(), Box<dyn std::error::Error>> {
     let protocol = Arc::new(MemoryProtocol::default());
     let identity = identity()?;
     let destination = CifsStagedDestination::new(Arc::clone(&protocol), identity.clone());
-    let stage = destination.prepare(prepare_request(&identity)?).await?;
+    let stage = prepare_stage(&destination, prepare_request(&identity)?).await?;
     destination.write(&stage, input(&[b"abcdef"])).await?;
     protocol
         .fail_rename_after_commit
@@ -436,7 +481,7 @@ async fn cancelled_publication_leaves_the_stage_and_final_unchanged()
     let protocol = Arc::new(MemoryProtocol::default());
     let identity = identity()?;
     let destination = CifsStagedDestination::new(Arc::clone(&protocol), identity.clone());
-    let stage = destination.prepare(prepare_request(&identity)?).await?;
+    let stage = prepare_stage(&destination, prepare_request(&identity)?).await?;
     destination.write(&stage, input(&[b"abcdef"])).await?;
     let cancel = tokio_util::sync::CancellationToken::new();
     cancel.cancel();
@@ -474,7 +519,7 @@ async fn cancelled_verification_fast_fails_and_preserves_the_checkpoint()
     let protocol = Arc::new(MemoryProtocol::default());
     let identity = identity()?;
     let destination = CifsStagedDestination::new(Arc::clone(&protocol), identity.clone());
-    let stage = destination.prepare(prepare_request(&identity)?).await?;
+    let stage = prepare_stage(&destination, prepare_request(&identity)?).await?;
     destination.write(&stage, input(&[b"abcdef"])).await?;
     let cancel = tokio_util::sync::CancellationToken::new();
     cancel.cancel();
@@ -502,7 +547,7 @@ async fn cancelled_input_stops_inflight_write_without_flushing()
     let protocol = Arc::new(MemoryProtocol::default());
     let identity = identity()?;
     let destination = CifsStagedDestination::new(Arc::clone(&protocol), identity.clone());
-    let stage = destination.prepare(prepare_request(&identity)?).await?;
+    let stage = prepare_stage(&destination, prepare_request(&identity)?).await?;
     let cancelled = StorageRoleFailure::Entry(EntryOperationFailure::new(
         StoragePath::new("source.bin")?,
         Operation::Read,
@@ -520,19 +565,8 @@ async fn cancelled_input_stops_inflight_write_without_flushing()
     Ok(())
 }
 
-struct Registration(AtomicUsize);
-#[async_trait]
-impl crate::storage::roles::CheckpointRegistration for Registration {
-    async fn register(
-        &self,
-        _stage: &crate::storage::PreparedStage,
-        _identity: crate::storage::RecoveryIdentity,
-    ) -> Result<(), StorageRoleFailure> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
+/// A deferred checkpoint writes the stage's first pointer; a new connection resumes from the
+/// prefix it records, not from the stage's length, which includes a hole.
 #[tokio::test]
 async fn periodic_checkpoint_resumes_recorded_prefix_not_sparse_file_length()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -540,13 +574,8 @@ async fn periodic_checkpoint_resumes_recorded_prefix_not_sparse_file_length()
     let owner = CifsStagedDestination::new(protocol.clone(), identity()?);
     let mut request = prepare_request(&identity()?)?;
     request.source.size = Some(12);
-    let mut stage = owner.prepare_ephemeral(request.clone()).await?;
-    let registration = Arc::new(Registration(AtomicUsize::new(0)));
-    stage.deferred_checkpoint = Some(crate::storage::roles::DeferredCheckpoint {
-        interval_bytes: 4,
-        source_size: 12,
-        registration: registration.clone(),
-    });
+    let mut stage = prepare_ephemeral_stage(&owner, request.clone()).await?;
+    stage.deferred_checkpoint = Some(deferred(4, 12));
     let failure = EntryOperationFailure::new(
         StoragePath::new("source.bin")?,
         Operation::Read,
@@ -559,27 +588,21 @@ async fn periodic_checkpoint_resumes_recorded_prefix_not_sparse_file_length()
         Err(StorageRoleFailure::Entry(failure)),
     ]));
     assert!(owner.write(&stage, stream).await.is_err());
-    assert_eq!(registration.0.load(Ordering::SeqCst), 1);
-    let old_path = super::staged::token_path(&stage.token, stage.final_destination.path())?;
+    assert_eq!(pointer_writes(&protocol), 1);
     // Simulate out-of-order writes after the durable checkpoint: EOF includes a hole.
     protocol
         .files
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get_mut(old_path.as_str())
+        .get_mut(&stage_file("final.bin"))
         .ok_or("stage missing")?
         .extend_from_slice(b"\0\0\0\0ijkl");
-    let recovery = owner.recovery_identity(&stage).await?;
+    drop(stage);
     let fresh = CifsStagedDestination::new(protocol.clone(), identity()?);
     let recovered = fresh
-        .recover(RecoverRequest {
-            identity: recovery,
-            final_destination: request.final_destination,
-            source: request.source,
-            recovery_binding: request.recovery_binding,
-            claim_token: [42; 32],
-        })
+        .prepare_at_destination(at_destination(request, true).with_resume(ResumeMode::Discover))
         .await?;
+    assert_eq!(recovered.prepare_fact(), PrepareFact::Resumed { bytes: 4 });
     assert_eq!(recovered.write_offset, 4);
     fresh.write(&recovered, input(&[b"efghijkl"])).await?;
     fresh
@@ -612,10 +635,12 @@ async fn atomic_replace_omits_flush_and_checkpoint_and_colocates_stage()
     let owner = CifsStagedDestination::new(protocol.clone(), identity()?);
     let mut request = prepare_request(&identity()?)?;
     request.final_destination = FinalDestination::new(StoragePath::new("nested/final.bin")?);
-    let mut stage = owner.prepare_ephemeral(request).await?;
+    let mut stage = prepare_ephemeral_stage(&owner, request).await?;
     stage.durable_publication = false;
-    let path = super::staged::token_path(&stage.token, stage.final_destination.path())?;
-    assert!(path.as_str().starts_with("nested/.data-mover-"));
+    assert_eq!(
+        stage.token.as_ref(),
+        stage_file("nested/final.bin").as_bytes()
+    );
     owner.write(&stage, input(&[b"abcdef"])).await?;
     assert_eq!(protocol.flushes.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -656,18 +681,11 @@ async fn below_threshold_retains_final_flush_without_checkpoint()
         owner.automatic_checkpoint_interval_bytes(),
         Some(64 * 1024 * 1024)
     );
-    let mut stage = owner
-        .prepare_ephemeral(prepare_request(&identity()?)?)
-        .await?;
-    let registration = Arc::new(Registration(AtomicUsize::new(0)));
-    stage.deferred_checkpoint = Some(crate::storage::roles::DeferredCheckpoint {
-        interval_bytes: 6,
-        source_size: 6,
-        registration: registration.clone(),
-    });
+    let mut stage = prepare_ephemeral_stage(&owner, prepare_request(&identity()?)?).await?;
+    stage.deferred_checkpoint = Some(deferred(6, 6));
     owner.write(&stage, input(&[b"abcdef"])).await?;
     assert_eq!(protocol.flushes.load(Ordering::SeqCst), 1);
-    assert_eq!(registration.0.load(Ordering::SeqCst), 0);
+    assert_eq!(pointer_writes(&protocol), 0);
     assert_eq!(
         protocol
             .files
@@ -688,23 +706,15 @@ async fn below_threshold_retains_final_flush_without_checkpoint()
 }
 
 #[tokio::test]
-async fn failed_flush_does_not_create_or_register_checkpoint()
--> Result<(), Box<dyn std::error::Error>> {
+async fn failed_flush_does_not_write_a_pointer() -> Result<(), Box<dyn std::error::Error>> {
     let protocol = Arc::new(MemoryProtocol::default());
     let owner = CifsStagedDestination::new(protocol.clone(), identity()?);
-    let mut stage = owner
-        .prepare_ephemeral(prepare_request(&identity()?)?)
-        .await?;
-    let registration = Arc::new(Registration(AtomicUsize::new(0)));
-    stage.deferred_checkpoint = Some(crate::storage::roles::DeferredCheckpoint {
-        interval_bytes: 4,
-        source_size: 6,
-        registration: registration.clone(),
-    });
+    let mut stage = prepare_ephemeral_stage(&owner, prepare_request(&identity()?)?).await?;
+    stage.deferred_checkpoint = Some(deferred(4, 6));
     protocol.fail_flush.store(true, Ordering::SeqCst);
     assert!(owner.write(&stage, input(&[b"abcdef"])).await.is_err());
     assert_eq!(protocol.closes.load(Ordering::SeqCst), 1);
-    assert_eq!(registration.0.load(Ordering::SeqCst), 0);
+    assert_eq!(pointer_writes(&protocol), 0);
     assert!(!stage.recovery_enabled());
     assert_eq!(
         protocol
@@ -727,7 +737,7 @@ async fn writes_overlap_and_drain_before_flush() -> Result<(), Box<dyn std::erro
             .with_write_inflight(std::num::NonZeroUsize::new(depth).ok_or("zero depth")?);
         let mut request = prepare_request(&identity()?)?;
         request.source.size = Some(100);
-        let stage = owner.prepare_ephemeral(request).await?;
+        let stage = prepare_ephemeral_stage(&owner, request).await?;
         owner.write(&stage, input(&[&[42; 100]])).await?;
         assert_eq!(protocol.activity.peak.load(Ordering::SeqCst), depth);
         assert_eq!(protocol.activity.active.load(Ordering::SeqCst), 0);
@@ -744,9 +754,7 @@ async fn pending_input_does_not_prevent_issued_write_progress()
     let protocol = Arc::new(MemoryProtocol::default());
     protocol.activity.delayed.store(true, Ordering::SeqCst);
     let owner = CifsStagedDestination::new(protocol.clone(), identity()?);
-    let stage = owner
-        .prepare_ephemeral(prepare_request(&identity()?)?)
-        .await?;
+    let stage = prepare_ephemeral_stage(&owner, prepare_request(&identity()?)?).await?;
     let activity = protocol.activity.clone();
     let input = stream::unfold((0, activity), |(index, activity)| async move {
         match index {
@@ -774,10 +782,10 @@ async fn committed_cleanup_is_retryable_and_preserves_final_file()
     for fail_cleanup in [true, false] {
         let protocol = Arc::new(MemoryProtocol::default());
         let owner = CifsStagedDestination::new(protocol.clone(), identity()?);
-        let stage = owner.prepare(prepare_request(&identity()?)?).await?;
+        let stage = prepare_stage(&owner, prepare_request(&identity()?)?).await?;
         owner.write(&stage, input(&[b"abcdef"])).await?;
         protocol
-            .fail_checkpoint_delete
+            .fail_pointer_delete
             .store(fail_cleanup, Ordering::SeqCst);
         let result = owner
             .publish(
@@ -802,6 +810,51 @@ async fn committed_cleanup_is_retryable_and_preserves_final_file()
         assert_eq!(files.len(), 1);
         assert_eq!(files.get("final.bin").ok_or("final missing")?, b"abcdef");
     }
+    Ok(())
+}
+
+/// The store-era entry points are gone: CIFS prepares every stage at the destination.
+#[tokio::test]
+async fn store_era_entry_points_are_unsupported() -> Result<(), Box<dyn std::error::Error>> {
+    let protocol = Arc::new(MemoryProtocol::default());
+    let identity = identity()?;
+    let destination = CifsStagedDestination::new(Arc::clone(&protocol), identity.clone());
+    let unsupported = |result: Result<PreparedStage, StorageRoleFailure>| {
+        matches!(
+            result,
+            Err(StorageRoleFailure::Entry(ref error)) if error.class() == FailureClass::Unsupported
+        )
+    };
+    let request = prepare_request(&identity)?;
+    assert!(unsupported(destination.prepare(request.clone()).await));
+    assert!(unsupported(
+        destination.prepare_ephemeral(request.clone()).await
+    ));
+    let stage = prepare_stage(&destination, request.clone()).await?;
+    let identity_refused = destination.recovery_identity(&stage).await;
+    assert!(matches!(
+        identity_refused,
+        Err(StorageRoleFailure::Entry(ref error)) if error.class() == FailureClass::Unsupported
+    ));
+    assert!(destination.handoff_recovery(&stage).await.is_err());
+    let recovered = destination
+        .recover(RecoverRequest {
+            identity: RecoveryIdentity::from_bytes(Bytes::from_static(b"old"))?,
+            final_destination: request.final_destination,
+            source: request.source,
+            recovery_binding: request.recovery_binding,
+            claim_token: [9; 32],
+        })
+        .await;
+    assert!(unsupported(recovered));
+    destination.discard(stage).await?;
+    assert!(
+        protocol
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
     Ok(())
 }
 

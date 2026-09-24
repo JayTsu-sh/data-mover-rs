@@ -31,53 +31,11 @@ pub(crate) fn is_artifact_path(path: &str) -> bool {
         .any(|segment| segment.starts_with(ARTIFACT_PREFIX))
 }
 
-pub(crate) fn stage_name(destination: &str) -> String {
-    format!(
-        "{ARTIFACT_PREFIX}{}-{}.stage",
-        &blake3::hash(destination.as_bytes()).to_hex()[..16],
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
-pub(crate) fn temporary_name(checkpoint: &str) -> String {
-    format!("{checkpoint}.tmp-{}", uuid::Uuid::new_v4().simple())
-}
-
-/// Returns the immutable base name, accepting an optional NFS claim suffix.
-pub(crate) fn stage_base<'a>(name: &'a str, destination: &str) -> Option<&'a str> {
-    let base = if let Some((base, claim)) = name.split_once(".claim-") {
-        if !hex(claim, 32) {
-            return None;
-        }
-        base
-    } else {
-        name
-    };
-    let body = base.strip_prefix(ARTIFACT_PREFIX)?.strip_suffix(".stage")?;
-    let (target, id) = body.split_once('-')?;
-    if !hex(target, 16)
-        || !hex(id, 32)
-        || target != &blake3::hash(destination.as_bytes()).to_hex()[..16]
-    {
-        return None;
-    }
-    Some(base)
-}
-
 /// What one deterministic destination artifact holds (ADR-0006 "Destination artifacts").
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArtifactKind {
     /// The staged content.
     Stage,
-    /// The durable-prefix record of a file stage.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "NFS and CIFS keep a separate checkpoint, ADR-0006 C10/C11"
-        )
-    )]
-    Checkpoint,
     /// An exclusive claim on the final name.
     Claim,
     /// The pointer that holds the recovery binding.
@@ -94,18 +52,11 @@ pub(crate) enum ArtifactKind {
 }
 
 impl ArtifactKind {
-    pub(crate) const ALL: [Self; 5] = [
-        Self::Stage,
-        Self::Checkpoint,
-        Self::Claim,
-        Self::Pointer,
-        Self::Upload,
-    ];
+    pub(crate) const ALL: [Self; 4] = [Self::Stage, Self::Claim, Self::Pointer, Self::Upload];
 
     pub(crate) const fn suffix(self) -> &'static str {
         match self {
             Self::Stage => "stage",
-            Self::Checkpoint => "checkpoint",
             Self::Claim => "claim",
             Self::Pointer => "pointer",
             Self::Upload => "upload",
@@ -283,7 +234,10 @@ mod tests {
             ".data-mover-0123.stage",
             ".data-mover-37b14e7406c1d03de316e3fdf5c615c7.unknown",
             "file.bin",
-            &stage_name("file.bin"),
+            // The random stage name used before ADR-0006 C8.
+            ".data-mover-0123456789abcdef-0123456789abcdef0123456789abcdef.stage",
+            // A kind no longer written (the checkpoint record before ADR-0006 C10d / C11d).
+            ".data-mover-37b14e7406c1d03de316e3fdf5c615c7.checkpoint",
         ] {
             assert_eq!(parse_artifact_name(other), None, "{other}");
         }
@@ -313,23 +267,5 @@ mod tests {
             None
         );
         Ok(())
-    }
-
-    #[test]
-    fn claimed_names_preserve_the_base_and_reject_wrong_destinations() {
-        let base = stage_name("nested/file.bin");
-        assert_ne!(base, stage_name("nested/file.bin"));
-        let claimed = format!("{base}.claim-{}", "a".repeat(32));
-        assert_eq!(stage_base(&claimed, "nested/file.bin"), Some(base.as_str()));
-        assert_eq!(stage_base(&base, "nested/file.bin"), Some(base.as_str()));
-        assert!(stage_base(&claimed, "other/file.bin").is_none());
-        assert!(stage_base(&format!("{base}.claim-invalid"), "nested/file.bin").is_none());
-        assert!(
-            stage_base(
-                &format!("{claimed}.claim-{}", "b".repeat(32)),
-                "nested/file.bin"
-            )
-            .is_none()
-        );
     }
 }

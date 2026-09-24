@@ -515,10 +515,10 @@ async fn recoverable_write_advances_a_durable_prefix_before_input_ends() -> io::
 #[test]
 fn only_the_deterministic_stage_name_is_accepted() {
     let deterministic = crate::storage::artifacts::artifact_name("final.bin", ArtifactKind::Stage);
-    let random = crate::storage::artifacts::stage_name("final.bin");
+    let random = ".data-mover-0123456789abcdef-0123456789abcdef0123456789abcdef.stage";
     for (token, at_destination, accepted) in [
         // The random name stages had before ADR-0006 C8, even for a stage kept at the destination.
-        (random.as_str(), true, false),
+        (random, true, false),
         (".data-mover-staging/old.stage", true, false),
         // The deterministic name, only for a stage prepared at the destination.
         (deterministic.as_str(), false, false),

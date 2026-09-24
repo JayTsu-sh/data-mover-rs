@@ -229,6 +229,8 @@ longer than the source at prepare). CIFS transfers in flight at the upgrade (ran
 without following links (`open_metadata`: a reparse point is not a regular file). Final paths with a
 backslash, a colon, or an empty, `.`, `..` or artifact segment are refused (C11a). Verified on the
 FAS2750: e2e-cifs twice and the resume matrix (192 MiB, cancel and SIGKILL, local state wiped).
+The old CIFS random-name stage, `DMCCKP01` checkpoint, `data-mover:cifs-recovery:v1` recover and
+claim rename are no longer reached (removed in C11d).
 
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process

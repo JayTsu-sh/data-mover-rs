@@ -85,7 +85,8 @@ pub(super) fn artifact_path(
     StoragePath::new(path).map_err(|_| invalid())
 }
 
-/// The stage path a destination-kept stage's token must name.
+/// The stage path a stage's token must name: the deterministic name beside the final file, and
+/// only for a stage prepared at the destination.
 pub(super) fn stage_path(stage: &PreparedStage) -> Result<StoragePath, StorageRoleFailure> {
     let final_path = stage.final_destination.path();
     let expected = artifact_path(final_path, ArtifactKind::Stage, false)?;
@@ -109,13 +110,7 @@ fn accepts(pointer: &DestinationPointer) -> bool {
 }
 
 fn fence(stage: &PreparedStage) -> Result<&Fence, StorageRoleFailure> {
-    state(stage)?.fence.as_ref().ok_or_else(|| {
-        entry_failure(
-            stage.final_destination.path(),
-            Operation::Observe,
-            FailureClass::Internal,
-        )
-    })
+    Ok(&state(stage)?.fence)
 }
 
 fn not_regular(path: &StoragePath, operation: Operation) -> StorageRoleFailure {
@@ -259,8 +254,8 @@ pub(super) async fn prepare(
         None,
     );
     stage.backend_state = Some(Arc::new(CifsStageState {
-        fence: Some(Fence::new(request.transfer_identity)),
-        ..CifsStageState::default()
+        published: AtomicBool::new(false),
+        fence: Fence::new(request.transfer_identity),
     }));
     stage.mark_at_destination(found.fact);
     let Some(point) = found.resume else {
@@ -352,9 +347,7 @@ pub(super) async fn write_pointer(
     let pointer = artifact_path(final_path, ArtifactKind::Pointer, false)?;
     let temporary = artifact_path(final_path, ArtifactKind::Pointer, true)?;
     delete_if_present(adapter, &temporary, Operation::Write).await?;
-    if let Err(error) =
-        super::checkpoint::write_record(adapter, &temporary, Bytes::from(bytes.clone())).await
-    {
+    if let Err(error) = write_record(adapter, &temporary, Bytes::from(bytes.clone())).await {
         let _ = adapter.protocol.delete(&temporary).await;
         return Err(error);
     }
@@ -405,6 +398,48 @@ pub(super) async fn reobserve(
         return Err(corrupt());
     }
     Ok(prefix)
+}
+
+/// Creates `path` and writes `bytes` to it, flushed before it is closed.
+async fn write_record(
+    adapter: &CifsStagedDestination,
+    path: &StoragePath,
+    mut bytes: Bytes,
+) -> Result<(), StorageRoleFailure> {
+    let failed = |error: &smb_domain::Error| classify(path, Operation::Write, error);
+    adapter
+        .protocol
+        .create_empty(path)
+        .await
+        .map_err(|error| failed(&error))?;
+    let file = adapter
+        .protocol
+        .open(path)
+        .await
+        .map_err(|error| failed(&error))?;
+    let result = async {
+        let maximum = file.maximum_write_chunk() as usize;
+        if maximum == 0 {
+            return Err(entry_failure(
+                path,
+                Operation::Write,
+                FailureClass::Protocol,
+            ));
+        }
+        let mut offset = 0;
+        while !bytes.is_empty() {
+            let part = bytes.split_to(bytes.len().min(maximum));
+            let length = part.len() as u64;
+            file.write_all_at(offset, part)
+                .await
+                .map_err(|error| failed(&error))?;
+            offset += length;
+        }
+        file.flush().await.map_err(|error| failed(&error))
+    }
+    .await;
+    let close = file.close().await.map_err(|error| failed(&error));
+    result.and(close)
 }
 
 /// Before the stage becomes the final file: it must still be this stage's.

@@ -1,10 +1,11 @@
 use std::collections::HashSet;
-use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
+use super::at_destination::{Fence, remove_pointer};
 use super::source::{classify, entry_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath};
 use crate::storage::artifacts::is_artifact_path;
@@ -46,12 +47,10 @@ pub(super) trait CifsStagedProtocol: Send + Sync {
     async fn delete(&self, path: &StoragePath) -> smb_domain::Result<()>;
 }
 
-#[derive(Default)]
 pub(super) struct CifsStageState {
-    pub(super) checkpoint_created: std::sync::atomic::AtomicBool,
-    pub(super) published: std::sync::atomic::AtomicBool,
-    /// Set for a stage kept at the destination (ADR-0006): its pointer's nonce and identity.
-    pub(super) fence: Option<super::at_destination::Fence>,
+    pub(super) published: AtomicBool,
+    /// The stage's pointer's nonce and transfer identity (ADR-0006).
+    pub(super) fence: Fence,
 }
 
 pub(super) fn state(stage: &PreparedStage) -> Result<&CifsStageState, StorageRoleFailure> {
@@ -127,17 +126,14 @@ impl CifsStagedDestination {
                 FailureClass::Conflict,
             ));
         }
-        if stage.at_destination {
-            return super::at_destination::stage_path(stage);
-        }
-        token_path(&stage.token, stage.final_destination.path())
+        super::at_destination::stage_path(stage)
     }
 
-    pub(super) fn claim(&self, token: Bytes) -> bool {
+    pub(super) fn claim(&self, token: Bytes) {
         self.owned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(token)
+            .insert(token);
     }
 
     pub(super) fn release(&self, token: &Bytes) {
@@ -206,25 +202,6 @@ impl CifsStagedDestination {
         Ok(*hasher.finalize().as_bytes())
     }
 
-    /// Removes what recorded the stage's durable prefix: the pointer of a stage kept at the
-    /// destination, or the checkpoint record of one kept in the local store.
-    async fn remove_recovery_record(
-        &self,
-        stage: &PreparedStage,
-        stage_path: &StoragePath,
-    ) -> Result<(), StorageRoleFailure> {
-        if stage.at_destination {
-            return super::at_destination::remove_pointer(self, stage).await;
-        }
-        if state(stage)?
-            .checkpoint_created
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            super::checkpoint::remove(self, stage_path).await?;
-        }
-        Ok(())
-    }
-
     async fn reconcile_rename(
         &self,
         stage: &PreparedStage,
@@ -251,8 +228,8 @@ impl CifsStagedDestination {
             state(stage)
                 .map_err(publication_unchanged)?
                 .published
-                .store(true, std::sync::atomic::Ordering::Release);
-            self.remove_recovery_record(stage, stage_path)
+                .store(true, Ordering::Release);
+            remove_pointer(self, stage)
                 .await
                 .map_err(|error| PublicationFailure {
                     error,
@@ -290,57 +267,17 @@ impl StagedDestination for CifsStagedDestination {
     fn automatic_checkpoint_interval_bytes(&self) -> Option<u64> {
         Some(64 * 1024 * 1024)
     }
+    /// CIFS keeps its recovery state at the destination: every stage is prepared through
+    /// [`StagedDestination::prepare_at_destination`].
     async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        validate_final(request.final_destination.path())?;
-        let destination = request.final_destination.path().as_str();
-        let name = crate::storage::artifacts::stage_name(destination);
-        let token = match destination.rsplit_once('/') {
-            Some((parent, _)) => format!("{parent}/{name}"),
-            None => name,
-        };
-        let path = StoragePath::new(&token).map_err(|_| {
-            entry_failure(
-                request.final_destination.path(),
-                Operation::Prepare,
-                FailureClass::InvalidInput,
-            )
-        })?;
-        self.protocol.create_empty(&path).await.map_err(|error| {
-            classify(request.final_destination.path(), Operation::Prepare, &error)
-        })?;
-        let token = Bytes::from(token);
-        let _ = self.claim(token.clone());
-        let mut stage = PreparedStage::new(
-            self.identity.clone(),
-            request.final_destination,
-            token,
-            request.recovery_binding,
-            0,
-            None,
-        );
-        stage.backend_state = Some(Arc::new(CifsStageState::default()));
-        Ok(stage)
+        Err(unsupported(request.final_destination.path()))
     }
 
     async fn recovery_identity(
         &self,
         stage: &PreparedStage,
     ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        let _ = self.stage_path(stage)?;
-        let mut value = BytesMut::new();
-        value.extend_from_slice(b"data-mover:cifs-recovery:v1\0");
-        value.extend_from_slice(&stage.recovery_binding);
-        value.extend_from_slice(
-            blake3::hash(stage.final_destination.path().as_str().as_bytes()).as_bytes(),
-        );
-        value.extend_from_slice(&stage.token);
-        RecoveryIdentity::from_bytes(value.freeze()).map_err(|_| {
-            entry_failure(
-                stage.final_destination.path(),
-                Operation::Observe,
-                FailureClass::Protocol,
-            )
-        })
+        Err(unsupported(stage.final_destination.path()))
     }
 
     fn recovery_at_destination(&self) -> bool {
@@ -355,89 +292,7 @@ impl StagedDestination for CifsStagedDestination {
     }
 
     async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        let bytes = request.identity.as_bytes();
-        let header = b"data-mover:cifs-recovery:v1\0";
-        let fixed = header.len() + 64;
-        if bytes.len() <= fixed
-            || &bytes[..header.len()] != header
-            || bytes[header.len()..header.len() + 32] != request.recovery_binding
-            || bytes[header.len() + 32..fixed]
-                != *blake3::hash(request.final_destination.path().as_str().as_bytes()).as_bytes()
-        {
-            return Err(entry_failure(
-                request.final_destination.path(),
-                Operation::Prepare,
-                FailureClass::Conflict,
-            ));
-        }
-        let original = Bytes::copy_from_slice(&bytes[fixed..]);
-        let original_path = token_path(&original, request.final_destination.path())?;
-        let (parent, name) = original_path
-            .as_str()
-            .rsplit_once('/')
-            .unwrap_or(("", original_path.as_str()));
-        let base = name.split_once(".claim-").map_or(name, |(base, _)| base);
-        let prefix = if parent.is_empty() {
-            String::new()
-        } else {
-            format!("{parent}/")
-        };
-        let claim = format!("{prefix}{base}.claim-{}", hex_prefix(&request.claim_token));
-        let claimed_path = StoragePath::new(&claim).map_err(|_| {
-            entry_failure(
-                request.final_destination.path(),
-                Operation::Prepare,
-                FailureClass::InvalidInput,
-            )
-        })?;
-        if let Err(rename_error) = self
-            .protocol
-            .rename(&original_path, &claimed_path, false)
-            .await
-        {
-            if !matches!(self.protocol.size(&original_path).await, Err(ref error) if is_not_found(error))
-            {
-                return Err(classify(
-                    request.final_destination.path(),
-                    Operation::Prepare,
-                    &rename_error,
-                ));
-            }
-            self.protocol.size(&claimed_path).await.map_err(|_| {
-                classify(
-                    request.final_destination.path(),
-                    Operation::Prepare,
-                    &rename_error,
-                )
-            })?;
-        }
-        let size = self.protocol.size(&claimed_path).await.map_err(|error| {
-            classify(request.final_destination.path(), Operation::Observe, &error)
-        })?;
-        let write_offset =
-            super::checkpoint::load(self, &claimed_path, &request.recovery_binding).await?;
-        if size < write_offset || request.source.size.is_none_or(|expected| size > expected) {
-            return Err(entry_failure(
-                &claimed_path,
-                Operation::Prepare,
-                FailureClass::Corruption,
-            ));
-        }
-        let token = Bytes::from(claim);
-        let _ = self.claim(token.clone());
-        let mut stage = PreparedStage::new(
-            self.identity.clone(),
-            request.final_destination,
-            token,
-            request.recovery_binding,
-            write_offset,
-            None,
-        );
-        stage.backend_state = Some(Arc::new(CifsStageState {
-            checkpoint_created: std::sync::atomic::AtomicBool::new(true),
-            ..CifsStageState::default()
-        }));
-        Ok(stage)
+        Err(unsupported(request.final_destination.path()))
     }
 
     async fn write(
@@ -489,10 +344,8 @@ impl StagedDestination for CifsStagedDestination {
         stage: &PreparedStage,
     ) -> Result<CheckpointObservation, StorageRoleFailure> {
         let path = self.stage_path(stage)?;
-        let durable_prefix = if stage.at_destination && stage.recovery_enabled() {
+        let durable_prefix = if stage.recovery_enabled() {
             super::at_destination::reobserve(self, stage).await?
-        } else if stage.recovery_enabled() {
-            super::checkpoint::load(self, &path, &stage.recovery_binding).await?
         } else {
             self.protocol
                 .size(&path)
@@ -582,11 +435,9 @@ impl StagedDestination for CifsStagedDestination {
                 FailureClass::Cancelled,
             )));
         }
-        if stage.at_destination {
-            super::at_destination::before_publication(self, stage)
-                .await
-                .map_err(publication_unchanged)?;
-        }
+        super::at_destination::before_publication(self, stage)
+            .await
+            .map_err(publication_unchanged)?;
         let rename = self
             .protocol
             .rename(&path, stage.final_destination.path(), true)
@@ -597,8 +448,8 @@ impl StagedDestination for CifsStagedDestination {
         state(stage)
             .map_err(publication_unchanged)?
             .published
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.remove_recovery_record(stage, &path)
+            .store(true, Ordering::Release);
+        remove_pointer(self, stage)
             .await
             .map_err(|error| PublicationFailure {
                 error,
@@ -616,38 +467,7 @@ impl StagedDestination for CifsStagedDestination {
                 FailureClass::Conflict,
             )
         })?;
-        if stage.at_destination {
-            return super::at_destination::discard(self, &stage).await;
-        }
-        let published = state(&stage)?
-            .published
-            .load(std::sync::atomic::Ordering::Acquire);
-        let path = if published {
-            token_path(&stage.token, stage.final_destination.path())?
-        } else {
-            self.stage_path(&stage)?
-        };
-        if !published {
-            match self.protocol.delete(&path).await {
-                Ok(()) => {}
-                Err(error) if is_not_found(&error) => {}
-                Err(error) => {
-                    return Err(classify(
-                        stage.final_destination.path(),
-                        Operation::Namespace,
-                        &error,
-                    ));
-                }
-            }
-        }
-        if state(&stage)?
-            .checkpoint_created
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            super::checkpoint::remove(self, &path).await?;
-        }
-        self.release(&stage.token);
-        Ok(())
+        super::at_destination::discard(self, &stage).await
     }
 }
 
@@ -672,30 +492,8 @@ pub(super) fn validate_final(path: &StoragePath) -> Result<(), StorageRoleFailur
     Ok(())
 }
 
-pub(super) fn token_path(
-    token: &Bytes,
-    final_path: &StoragePath,
-) -> Result<StoragePath, StorageRoleFailure> {
-    let invalid = || entry_failure(final_path, Operation::Observe, FailureClass::Conflict);
-    let token = std::str::from_utf8(token).map_err(|_| invalid())?;
-    let (parent, name) = token.rsplit_once('/').unwrap_or(("", token));
-    let expected_parent = final_path
-        .as_str()
-        .rsplit_once('/')
-        .map_or("", |(parent, _)| parent);
-    if parent != expected_parent
-        || crate::storage::artifacts::stage_base(name, final_path.as_str()).is_none()
-    {
-        return Err(invalid());
-    }
-    StoragePath::new(token).map_err(|_| invalid())
-}
-
-fn hex_prefix(value: &[u8; 32]) -> String {
-    value[..16].iter().fold(String::new(), |mut output, byte| {
-        let _ = write!(output, "{byte:02x}");
-        output
-    })
+fn unsupported(path: &StoragePath) -> StorageRoleFailure {
+    entry_failure(path, Operation::Prepare, FailureClass::Unsupported)
 }
 
 fn publication_unchanged(error: StorageRoleFailure) -> PublicationFailure {

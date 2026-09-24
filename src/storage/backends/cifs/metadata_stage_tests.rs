@@ -51,7 +51,7 @@ async fn metadata_flush_obeys_publication_policy_and_closes_on_failure()
         let identity = identity()?;
         let destination = CifsStagedDestination::new(protocol.clone(), identity.clone())
             .with_metadata(metadata.clone());
-        let mut stage = destination.prepare(prepare_request(&identity)?).await?;
+        let mut stage = prepare_stage(&destination, prepare_request(&identity)?).await?;
         stage.durable_publication = durable;
         protocol.fail_flush.store(fail_flush, Ordering::SeqCst);
         let closes = protocol.closes.load(Ordering::SeqCst);

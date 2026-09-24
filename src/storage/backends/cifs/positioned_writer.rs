@@ -9,7 +9,7 @@ use std::{
 use futures::{StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
 
 use super::{
-    checkpoint,
+    at_destination::write_pointer,
     source::{classify, entry_failure},
     staged::{CifsStageFile, CifsStagedDestination},
     writer,
@@ -296,7 +296,7 @@ impl<'a> Writer<'a> {
             })?;
         }
         if self.stage.recovery_enabled() {
-            checkpoint::persist(self.adapter, self.stage, self.completed.prefix).await?;
+            write_pointer(self.adapter, self.stage, self.completed.prefix, false).await?;
         }
         Ok(self.completed.prefix)
     }

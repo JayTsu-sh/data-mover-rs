@@ -1,11 +1,13 @@
 //! Concurrent positioned writes with a contiguous FLUSH barrier at each checkpoint.
+use std::sync::atomic::Ordering;
+
 use super::{
-    checkpoint,
+    at_destination::write_pointer,
     source::{classify, entry_failure},
     staged::{CifsStageFile, CifsStagedDestination},
 };
 use crate::model::{FailureClass, Operation};
-use crate::storage::{ByteStream, PreparedStage, StagedDestination, StorageRoleFailure};
+use crate::storage::{ByteStream, PreparedStage, StorageRoleFailure};
 use bytes::Bytes;
 use futures::{StreamExt as _, stream::FuturesUnordered};
 
@@ -103,7 +105,7 @@ pub(super) async fn write(
             .map_err(|e| classify(path, Operation::Write, &e))?;
     }
     if stage.recovery_enabled() {
-        checkpoint::persist(adapter, stage, offset).await?;
+        write_pointer(adapter, stage, offset, false).await?;
     }
     Ok(offset)
 }
@@ -117,29 +119,8 @@ pub(super) async fn save(
     file.flush()
         .await
         .map_err(|e| classify(stage.final_destination.path(), Operation::Write, &e))?;
-    checkpoint::persist(adapter, stage, offset).await?;
-    if stage.at_destination {
-        // The pointer is the whole recovery record; nothing registers where data-mover runs.
-        stage
-            .recovery_enabled
-            .store(true, std::sync::atomic::Ordering::Release);
-        return Ok(());
-    }
-    if !stage.recovery_enabled() {
-        let deferred = stage.deferred_checkpoint.as_ref().ok_or_else(|| {
-            entry_failure(
-                stage.final_destination.path(),
-                Operation::Write,
-                FailureClass::Internal,
-            )
-        })?;
-        deferred
-            .registration
-            .register(stage, adapter.recovery_identity(stage).await?)
-            .await?;
-        stage
-            .recovery_enabled
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
+    // The pointer is the whole recovery record: nothing registers where data-mover runs.
+    write_pointer(adapter, stage, offset, false).await?;
+    stage.recovery_enabled.store(true, Ordering::Release);
     Ok(())
 }

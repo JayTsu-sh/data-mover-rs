@@ -1,7 +1,6 @@
 //! CIFS adapter facade.
 
 mod at_destination;
-mod checkpoint;
 mod metadata;
 mod namespace;
 mod positioned_writer;

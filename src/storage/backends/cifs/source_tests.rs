@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt as _;
-use futures::TryStreamExt as _;
 use futures::stream;
 
 use super::metadata::CifsInlineMetadata;
@@ -18,13 +17,14 @@ use crate::model::{
     BackendIdentity, BackendKind, EntryKind, IdentityStrength, Operation, SourceVersion,
     StoragePath,
 };
+use crate::storage::artifacts::{ArtifactKind, artifact_name, artifact_temporary_name};
 use crate::storage::{
-    Namespace, NamespaceRequest, NamespaceResult, ReadRequest, ReadSource, SourceQosGroup,
-    SourceQosPolicy,
+    DestinationPrepareRequest, Namespace, NamespaceRequest, NamespaceResult, PrepareFact,
+    PrepareRequest, ReadRequest, ReadSource, ResumeMode, SourceQosGroup, SourceQosPolicy,
 };
 
 const REAL_RECOVERY_BINDING: [u8; 32] = [11; 32];
-const REAL_RECOVERY_CLAIM: [u8; 32] = [12; 32];
+const REAL_TRANSFER_IDENTITY: [u8; 32] = [12; 32];
 
 struct MemoryCifs {
     payload: Bytes,
@@ -456,19 +456,20 @@ async fn real_share_exercises_domain_roles_without_wire_api()
             crate::model::IdentityStrength::PathScoped,
             b"real-negative-source",
         )?;
+        let prepare = PrepareRequest {
+            final_destination: crate::storage::FinalDestination::new(StoragePath::new(
+                "data-mover-read-only-probe.bin",
+            )?),
+            source: crate::storage::SourceDescriptor::new(
+                StoragePath::new("source")?,
+                EntryKind::File,
+                Some(0),
+                source_identity,
+            ),
+            recovery_binding: [1; 32],
+        };
         let result = destination
-            .prepare(crate::storage::PrepareRequest {
-                final_destination: crate::storage::FinalDestination::new(StoragePath::new(
-                    "data-mover-read-only-probe.bin",
-                )?),
-                source: crate::storage::SourceDescriptor::new(
-                    StoragePath::new("source")?,
-                    EntryKind::File,
-                    Some(0),
-                    source_identity,
-                ),
-                recovery_binding: [1; 32],
-            })
+            .prepare_at_destination(DestinationPrepareRequest::new(prepare, [1; 32]))
             .await;
         assert!(matches!(
             result,
@@ -492,7 +493,7 @@ async fn real_share_recovers_durable_prefix_across_lifs() -> Result<(), Box<dyn 
     let recovery = write_durable_prefix(&first.storage, &policy, &fixture).await;
     first.close().await;
     let result = match recovery {
-        Ok(identity) => run_recovered_half(&second.storage, &policy, &fixture, identity).await,
+        Ok(()) => run_recovered_half(&second.storage, &policy, &fixture).await,
         Err(error) => Err(error),
     };
     let cleanup = cleanup_real_fixture(&second.share, config.root.as_deref(), &fixture).await;
@@ -571,6 +572,16 @@ struct RecoveryFixture {
 }
 
 impl RecoveryFixture {
+    /// The stage and pointer are found again by the final name alone, over any LIF.
+    fn prepare(&self) -> DestinationPrepareRequest {
+        let prepare = PrepareRequest {
+            final_destination: crate::storage::FinalDestination::new(self.final_path.clone()),
+            source: self.source.clone(),
+            recovery_binding: REAL_RECOVERY_BINDING,
+        };
+        DestinationPrepareRequest::new(prepare, REAL_TRANSFER_IDENTITY)
+    }
+
     fn new(identity: &BackendIdentity) -> Result<Self, Box<dyn std::error::Error>> {
         let payload = Bytes::from_static(b"durable-prefix-across-fas2750-lifs");
         Ok(Self {
@@ -605,15 +616,12 @@ async fn write_durable_prefix(
     storage: &crate::storage::Storage,
     policy: &crate::storage::PreflightPolicy,
     fixture: &RecoveryFixture,
-) -> Result<crate::storage::RecoveryIdentity, Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let destination = storage.staged_destination(policy)?;
     let stage = destination
-        .prepare(crate::storage::PrepareRequest {
-            final_destination: crate::storage::FinalDestination::new(fixture.final_path.clone()),
-            source: fixture.source.clone(),
-            recovery_binding: REAL_RECOVERY_BINDING,
-        })
+        .prepare_at_destination(fixture.prepare())
         .await?;
+    assert_eq!(stage.prepare_fact(), PrepareFact::Fresh);
     destination
         .write(
             &stage,
@@ -626,25 +634,24 @@ async fn write_durable_prefix(
         destination.observe_checkpoint(&stage).await?.durable_prefix,
         fixture.split as u64
     );
-    Ok(destination.recovery_identity(&stage).await?)
+    Ok(())
 }
 
 async fn run_recovered_half(
     storage: &crate::storage::Storage,
     policy: &crate::storage::PreflightPolicy,
     fixture: &RecoveryFixture,
-    identity: crate::storage::RecoveryIdentity,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let destination = storage.staged_destination(policy)?;
     let stage = destination
-        .recover(crate::storage::RecoverRequest {
-            identity,
-            final_destination: crate::storage::FinalDestination::new(fixture.final_path.clone()),
-            source: fixture.source.clone(),
-            recovery_binding: REAL_RECOVERY_BINDING,
-            claim_token: REAL_RECOVERY_CLAIM,
-        })
+        .prepare_at_destination(fixture.prepare().with_resume(ResumeMode::Discover))
         .await?;
+    assert_eq!(
+        stage.prepare_fact(),
+        PrepareFact::Resumed {
+            bytes: fixture.split as u64
+        }
+    );
     assert_eq!(stage.write_offset, fixture.split as u64);
     destination
         .write(
@@ -814,25 +821,13 @@ async fn cleanup_real_fixture(
     fixture: &RecoveryFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     delete_real_path_if_present(share, root, fixture.final_path.as_str()).await?;
-    let directory = match share
-        .open_directory(
-            &real_share_path(root, "")?,
-            smb_domain::DirectoryOpenOptions::open_existing(),
-        )
-        .await
-    {
-        Ok(directory) => directory,
-        Err(error) if real_not_found(&error) => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let entries = directory.entries("*").try_collect::<Vec<_>>().await;
-    close_real_directory(directory).await?;
-    let digest = blake3::hash(fixture.final_path.as_str().as_bytes()).to_hex();
-    let prefix = format!(".data-mover-{}-", &digest[..16]);
-    for entry in entries? {
-        if entry.name().starts_with(&prefix) {
-            let path = entry.name().to_owned();
-            delete_real_path_if_present(share, root, &path).await?;
+    let name = fixture.final_path.as_str();
+    for kind in [ArtifactKind::Stage, ArtifactKind::Pointer] {
+        for artifact in [
+            artifact_name(name, kind),
+            artifact_temporary_name(name, kind),
+        ] {
+            delete_real_path_if_present(share, root, &artifact).await?;
         }
     }
     Ok(())
@@ -876,12 +871,6 @@ fn real_share_path(
 
 async fn close_real_file(file: smb_domain::File) -> Result<(), Box<dyn std::error::Error>> {
     require_real_close(file.close().await?)
-}
-
-async fn close_real_directory(
-    directory: smb_domain::Directory,
-) -> Result<(), Box<dyn std::error::Error>> {
-    require_real_close(directory.close().await?)
 }
 
 fn require_real_close(outcome: smb_domain::CloseOutcome) -> Result<(), Box<dyn std::error::Error>> {

@@ -19,9 +19,7 @@ async fn later_read_writes_before_missing_prefix_arrives() -> Result<(), Box<dyn
 {
     let protocol = Arc::new(MemoryProtocol::default());
     let destination = CifsStagedDestination::new(protocol.clone(), identity()?);
-    let stage = destination
-        .prepare_ephemeral(prepare_request(&identity()?)?)
-        .await?;
+    let stage = prepare_ephemeral_stage(&destination, prepare_request(&identity()?)?).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     tx.send(Ok(PositionedChunk {
         offset: 4,
@@ -52,38 +50,31 @@ async fn later_read_writes_before_missing_prefix_arrives() -> Result<(), Box<dyn
     let (written, sent) = tokio::join!(destination.write_positioned(&stage, input), feeder);
     sent?;
     assert_eq!(written?.persisted_bytes, 6);
-    let path = super::super::staged::token_path(&stage.token, stage.final_destination.path())?;
     assert_eq!(
-        protocol.files.lock().unwrap().get(path.as_str()),
+        protocol.files.lock().unwrap().get(&stage_file("final.bin")),
         Some(&b"abcdef".to_vec())
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn gap_or_overlap_never_creates_a_checkpoint() -> Result<(), Box<dyn std::error::Error>> {
+async fn gap_or_overlap_never_writes_a_pointer() -> Result<(), Box<dyn std::error::Error>> {
     for parts in [
         vec![(4, &b"ef"[..])],
         vec![(4, &b"ef"[..]), (4, &b"ef"[..])],
     ] {
         let protocol = Arc::new(MemoryProtocol::default());
         let destination = CifsStagedDestination::new(protocol.clone(), identity()?);
-        let mut stage = destination
-            .prepare_ephemeral(prepare_request(&identity()?)?)
-            .await?;
-        let registration = Arc::new(Registration(AtomicUsize::new(0)));
-        stage.deferred_checkpoint = Some(crate::storage::roles::DeferredCheckpoint {
-            interval_bytes: 4,
-            source_size: 6,
-            registration: registration.clone(),
-        });
+        let mut stage =
+            prepare_ephemeral_stage(&destination, prepare_request(&identity()?)?).await?;
+        stage.deferred_checkpoint = Some(deferred(4, 6));
         assert!(
             destination
                 .write_positioned(&stage, positioned(&parts))
                 .await
                 .is_err()
         );
-        assert_eq!(registration.0.load(Ordering::SeqCst), 0);
+        assert_eq!(pointer_writes(&protocol), 0);
         assert_eq!(protocol.flushes.load(Ordering::SeqCst), 0);
         assert_eq!(protocol.closes.load(Ordering::SeqCst), 1);
     }
@@ -96,9 +87,7 @@ async fn cancellation_drains_positioned_writes_before_close()
     let protocol = Arc::new(MemoryProtocol::default());
     protocol.activity.delayed.store(true, Ordering::SeqCst);
     let destination = CifsStagedDestination::new(protocol.clone(), identity()?);
-    let stage = destination
-        .prepare_ephemeral(prepare_request(&identity()?)?)
-        .await?;
+    let stage = prepare_ephemeral_stage(&destination, prepare_request(&identity()?)?).await?;
     let cancelled = StorageRoleFailure::Entry(EntryOperationFailure::new(
         StoragePath::new("source.bin")?,
         Operation::Read,
@@ -132,13 +121,8 @@ async fn checkpoint_records_contiguous_prefix_despite_completed_later_range()
     let destination = CifsStagedDestination::new(protocol.clone(), identity()?);
     let mut request = prepare_request(&identity()?)?;
     request.source.size = Some(12);
-    let mut stage = destination.prepare_ephemeral(request).await?;
-    let registration = Arc::new(Registration(AtomicUsize::new(0)));
-    stage.deferred_checkpoint = Some(crate::storage::roles::DeferredCheckpoint {
-        interval_bytes: 4,
-        source_size: 12,
-        registration: registration.clone(),
-    });
+    let mut stage = prepare_ephemeral_stage(&destination, request).await?;
+    stage.deferred_checkpoint = Some(deferred(4, 12));
     let (tx, rx) = tokio::sync::mpsc::channel(2);
     for (offset, data) in [(8, &b"ijkl"[..]), (0, &b"abcd"[..])] {
         tx.send(Ok(PositionedChunk {
@@ -152,7 +136,7 @@ async fn checkpoint_records_contiguous_prefix_despite_completed_later_range()
     }));
     let feeder = async {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while registration.0.load(Ordering::SeqCst) == 0 {
+            while pointer_writes(&protocol) == 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -175,13 +159,12 @@ async fn checkpoint_records_contiguous_prefix_despite_completed_later_range()
         destination.observe_checkpoint(&stage).await?.durable_prefix,
         4
     );
-    let path = super::super::staged::token_path(&stage.token, stage.final_destination.path())?;
     assert_eq!(
         protocol
             .files
             .lock()
             .unwrap()
-            .get(path.as_str())
+            .get(&stage_file("final.bin"))
             .map(Vec::len),
         Some(12)
     );
@@ -189,23 +172,19 @@ async fn checkpoint_records_contiguous_prefix_despite_completed_later_range()
 }
 
 #[tokio::test]
-async fn crossing_checkpoint_threshold_registers_even_when_drain_reaches_eof()
+async fn crossing_checkpoint_threshold_writes_the_pointer_even_when_drain_reaches_eof()
 -> Result<(), Box<dyn std::error::Error>> {
     let protocol = Arc::new(MemoryProtocol::default());
-    let destination = CifsStagedDestination::new(protocol, identity()?);
+    let destination = CifsStagedDestination::new(protocol.clone(), identity()?);
     let mut request = prepare_request(&identity()?)?;
     request.source.size = Some(8);
-    let mut stage = destination.prepare_ephemeral(request).await?;
-    let registration = Arc::new(Registration(AtomicUsize::new(0)));
-    stage.deferred_checkpoint = Some(crate::storage::roles::DeferredCheckpoint {
-        interval_bytes: 4,
-        source_size: 8,
-        registration: registration.clone(),
-    });
+    let mut stage = prepare_ephemeral_stage(&destination, request).await?;
+    stage.deferred_checkpoint = Some(deferred(4, 8));
     destination
         .write_positioned(&stage, positioned(&[(4, b"efgh"), (0, b"abcd")]))
         .await?;
-    assert_eq!(registration.0.load(Ordering::SeqCst), 1);
+    // The first pointer at the threshold (4), then the final prefix (8).
+    assert_eq!(pointer_writes(&protocol), 2);
     assert_eq!(
         destination.observe_checkpoint(&stage).await?.durable_prefix,
         8

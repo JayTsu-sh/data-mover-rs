@@ -344,14 +344,21 @@ async fn the_pointer_follows_a_flush_on_both_writers() -> TestResult {
             write(&destination, &stage, b"abcdef").await?;
         }
         let stage_name = name(ArtifactKind::Stage, false);
+        // The last pointer written (under its temporary name) comes after the stage's last flush.
+        let flushed = protocol
+            .flushed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let last_stage = flushed.iter().rposition(|path| *path == stage_name);
+        let last_pointer = flushed
+            .iter()
+            .rposition(|path| path.ends_with(".pointer.tmp"));
         assert!(
-            protocol
-                .flushed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&stage_name),
-            "positioned={positioned}"
+            matches!((last_stage, last_pointer), (Some(stage), Some(pointer)) if stage < pointer),
+            "positioned={positioned}: {flushed:?}"
         );
+        super::assert_pointer_handles_closed(&protocol);
         assert_eq!(
             destination.observe_checkpoint(&stage).await?.durable_prefix,
             6,

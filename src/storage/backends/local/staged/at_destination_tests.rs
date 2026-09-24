@@ -473,7 +473,7 @@ async fn a_prepare_sweeps_its_own_final_names_leftovers_only() -> TestResult {
     let leftovers = [
         artifact_temporary_name("final.bin", ArtifactKind::Pointer),
         artifact_temporary_name("final.bin", ArtifactKind::Stage),
-        artifact_name("final.bin", ArtifactKind::Checkpoint),
+        artifact_name("final.bin", ArtifactKind::Upload),
     ];
     for name in &leftovers {
         std::fs::write(dir.join(name), b"left by a crash")?;

@@ -187,7 +187,7 @@ result
 - 最终文件旁 `.data-mover-<d>.stage` / `.pointer`（+ 固定 `.pointer.tmp`），**没有 claim 文件**（smb-rs 门面没有
   share mode / lease 控制；用 share mode 做跨主机 claim 是后续，需新 API + D9 升级）。
 - 指针 = `DMDPTR01{binding, 传输标识, 持久前缀, "DMCSTG01" ‖ 16 字节 nonce}`，只在 stage FLUSH 之后写（两个写者在
-  记录前缀前都 FLUSH，不论 durable_publication）；经 `checkpoint::write_record`（建、写、FLUSH、关）再 rename 覆盖。
+  记录前缀前都 FLUSH，不论 durable_publication）；经 `at_destination::write_record`（建、写、FLUSH、关）再 rename 覆盖。
 - nonce 围栏同 NFS：续传先重写指针接管；之后每次重写指针、发布 rename 前、清理前读回比对，不同 → `Conflict`（永久）。
 - **不截断**：门面不能设 EOF，续传从前缀重写到源大小。stage 只有被 data-mover 之外的东西写过才会更长（绑定钉住
   源大小）；开读回校验时报 Corruption 被 `54f7bfb` 清理，**关读回时多出的尾巴会被发布** —— 待补：prepare 时拒绝
@@ -196,17 +196,19 @@ result
   精确读（SMB 在文件尾读报错，不返回空）。
 - 最终路径含 `\`、`:`、空 / `.` / `..` 段或 artifact 段 → `InvalidInput`（C11a）。
 - 真机：FAS2750 e2e-cifs ×2、resume_matrix 192 MiB cancel / SIGKILL 已验（2026-09-25）。
-- 下面描述的随机名 stage / DMCCKP01 / claim rename 是旧路径（C11d 删除）。
+- 旧路径已在 C11d 删除：随机名 stage（`.data-mover-<target-hash>-<uuid>.stage`）、`<stage>.checkpoint`
+  （`DMCCKP01`）、`data-mover:cifs-recovery:v1` 恢复身份与 `.claim-` 改名恢复。`StagedDestination::prepare` /
+  `recovery_identity` / `recover` 对 CIFS 返回 `Unsupported`（`prepare_ephemeral` / `handoff_recovery` 用 trait 默认
+  实现，因此同样不可用）；stage 只能经 `prepare_at_destination` 准备，`stage_path` 只接受 at_destination 的确定名
+  stage。单测在 `staged_tests.rs` 用 `prepare_stage` / `prepare_ephemeral_stage` 辅助函数（Restart，recoverable /
+  非 recoverable）；`MemoryProtocol` 的 `flushes` / `closes` / `writes` 只数 stage 与最终文件，指针写入数
+  `flushed` 里的 `.pointer.tmp`。
 
 - 与 NFS 共用 `Checkpointed` / `AtomicReplace` 策略，CIFS 不支持 `Direct`。
-- stage 位于最终文件的父目录，采用共享的 `.data-mover-<target-hash>-<uuid>.stage` 命名。
-- `Checkpointed` 默认间隔 64 MiB；文件大于间隔且源端多块时延迟建立恢复记录。
-  每个检查点等待所有已发出写入完成，FLUSH 数据，写入并 FLUSH checkpoint 临时文件，
-  原子替换 `.stage.checkpoint`，再注册恢复信息。结束时 FLUSH 数据。
-- `AtomicReplace` 不创建 checkpoint，也不主动 FLUSH；关闭 stage 后原子 rename 发布。
-- recovery identity 是 opaque envelope；恢复时先把 stage 原子 rename 到 claim-token 派生路径，
-  验证 checkpoint 的 binding、路径、校验和，只使用记录的连续前缀，不用 EOF 推断进度。
-- checkpoint 名称不随 claim 改变；发布/丢弃时仅清理自己创建的 checkpoint。
+- `Checkpointed` 默认间隔 64 MiB；文件大于间隔且源端多块时，第一个指针推迟到第一个检查点（非 recoverable 的
+  prepare）。每个检查点等待所有已发出写入完成，FLUSH 数据，再写指针；不向运行 data-mover 的机器注册任何东西。
+  结束时 FLUSH 数据。
+- `AtomicReplace` 不写指针，也不主动 FLUSH；关闭 stage 后原子 rename 发布。
 - publish 使用 smb-rs `File::rename_replace`。响应丢失时沿用既有 publication reconciliation。
 - SMB FLUSH 不等于 POSIX 目录 fsync；不额外宣称目录元数据持久化保证。
 

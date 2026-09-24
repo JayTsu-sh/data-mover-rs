@@ -555,9 +555,10 @@ durability. Other protocols may retain their required persistence operations. It
 recovery control accepted from terrasync. Data-mover selects the effective behavior after route and
 source-read planning and reports it as `EffectiveRecovery`.
 
-(Local and NFS no longer take this path since ADR-0006 C8 / C10 — see "Local destination-resident
-recovery" and "NFS execution and automatic recovery" below; this paragraph and the next describe the
-destinations that still use the local recovery store.)
+(Local, NFS and CIFS no longer take this path since ADR-0006 C8 / C10 / C11 — see "Local
+destination-resident recovery", "NFS execution and automatic recovery" and "CIFS destination-resident
+recovery" below; this paragraph and the next describe the destinations that still use the local
+recovery store.)
 For eligible multi-source-chunk streaming with `Checkpointed`, data-mover opens its private recovery store,
 exclusively claims the transfer binding, recovers or prepares backend-owned staged state, and
 atomically persists the backend's versioned opaque identity. Ordinary HDFS defers registration until
@@ -602,6 +603,7 @@ process. Local holds its
 publication or discard. NFS (since ADR-0006 C10) has no claim and no recovery identity: it takes a
 stage over by rewriting the pointer with its own nonce, and every later pointer write, the
 publication and a clean-up first check that nonce (see "NFS execution and automatic recovery").
+CIFS (since ADR-0006 C11) works the same way: no claim, no recovery identity, a nonce-fenced pointer.
 
 Backend mechanisms:
 
@@ -759,15 +761,18 @@ Local destination-resident recovery (ADR-0006 C8): Local no longer uses the loca
 `RecoveryIdentity`. Its stage, pointer and claim sit beside the final file under deterministic names
 (`.data-mover-<digest>.{stage,pointer,claim}`); the pointer is the checkpoint record and carries the
 durable prefix; the flock'd claim is held from prepare until publication or discard. NFS moved to
-the same deterministic names in C10 (stage and pointer, no claim). The random-name layout below
-still describes CIFS until it moves (C11).
+the same deterministic names in C10 (stage and pointer, no claim), CIFS in C11.
 
-CIFS artifact naming (Local and NFS used it too until ADR-0006 C8 / C10): new stages use the shared
-`.data-mover-<destination-path-hash-16>-<uuid-32>.stage` base name in the final parent.
-Checkpoints append `.checkpoint`; checkpoint update temporaries append `.tmp-<uuid-32>`.
-A recovery claim renames the stage by appending `.claim-<claim-id-32>` to its base name, while its
-checkpoint name remains based on the unchanged base. RecoveryIdentity carries one current stage token. Only the unified naming format is
-accepted for recovery; legacy stage names and the old centralized staging layout are rejected.
+CIFS destination-resident recovery (ADR-0006 C11): stage and pointer are the deterministic hidden
+siblings `.data-mover-<digest>.{stage,pointer}` of the final file, and pointer updates go through the
+fixed `.pointer.tmp`, written and FLUSHed, then renamed over the pointer. There is no claim file (the
+smb-rs facade offers no share-mode or lease control); as on NFS, the pointer carries a per-prepare
+nonce that fences a stage another writer took over. The pointer records only FLUSHed bytes; SMB
+cannot shorten a file, so a resume rewrites from the recorded prefix on. Final paths holding `\`,
+`:`, empty / `.` / `..` or artifact segments are refused (C11a). The earlier random-name stage
+(`.data-mover-<destination-path-hash-16>-<uuid-32>.stage`), `DMCCKP01` checkpoint file,
+`data-mover:cifs-recovery:v1` recovery identity and `.claim-` rename were removed in C11d; no
+backend uses that naming any more.
 
 
 ### HDFS source baseline metadata
