@@ -86,7 +86,8 @@ async fn range_stream_multipart_verify_publish_and_readback()
         .lock()
         .await
         .insert("source".into(), Bytes::from_static(b"0123456789"));
-    let storage = connect(protocol.clone(), identity(), Some(native_context()))?;
+    // The multipart path itself: an object this small would otherwise be one PUT.
+    let storage = connect_multipart_only(protocol.clone(), identity(), Some(native_context()))?;
     let policy = validation_policy();
     let source = storage.read_source(&policy)?;
     let descriptor = source.describe(&StoragePath::new("source")?).await?;
@@ -307,7 +308,8 @@ async fn cancellation_remains_a_typed_entry_outcome() -> Result<(), Box<dyn std:
 async fn overwrite_publication_does_not_head_the_existing_destination()
 -> Result<(), Box<dyn std::error::Error>> {
     let protocol = Arc::new(MemoryS3::default());
-    let storage = connect(protocol.clone(), identity(), Some(native_context()))?;
+    // The copy from the temp key: an object this small would otherwise be one PUT.
+    let storage = connect_multipart_only(protocol.clone(), identity(), Some(native_context()))?;
     let destination = storage.staged_destination(&validation_policy())?;
     let path = StoragePath::new("final")?;
     let source_identity = crate::model::SourceIdentity::new(
@@ -485,7 +487,8 @@ async fn multipart_checkpoint_is_reobserved_and_resumed_after_reconnect()
 async fn publication_reconciles_a_committed_copy_with_a_lost_response()
 -> Result<(), Box<dyn std::error::Error>> {
     let protocol = Arc::new(MemoryS3::default());
-    let storage = connect(protocol.clone(), identity(), Some(native_context()))?;
+    // The copy from the temp key: an object this small would otherwise be one PUT.
+    let storage = connect_multipart_only(protocol.clone(), identity(), Some(native_context()))?;
     let policy = validation_policy();
     let destination = storage.staged_destination(&policy)?;
     let payload = Bytes::from_static(b"ambiguous publication payload");

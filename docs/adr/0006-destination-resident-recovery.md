@@ -258,6 +258,24 @@ undone and is reported as a `Verify` failure with `final_destination_changed` an
 expert destination half does the same. `PublicationEvidence` gains `version` (and becomes
 `#[non_exhaustive]`), and `TransferOutcome` gains `destination_version`.
 
+As built (C14b, S3 small objects): `S3BackendConfig.single_put_threshold` (`None` = 8 MiB; outside
+[5 MiB, 5 GiB] an S3 `BackendConnectError` "invalid configuration" at connect, before any network
+I/O). A source of known size ≤ T gets a
+"single" stage: prepare starts no upload, the stage's state (buffer, pending tags, write facts) lives
+in `PreparedStage::backend_state` rather than the adapter's stage map, so an abandoned stage frees its
+bytes, and recovery is off (`disable_recovery`). The engine then releases any local recovery record
+for the binding instead of registering one (`EffectiveRecovery::SkippedBelowCheckpointThreshold`); a
+single-stage identity handed to `recover` anyway starts a fresh single stage. `write` buffers (more
+than the source size is `InvalidInput`); `publish` is one `PutObject` with Content-MD5 to the final
+key. A definite refusal (`BadDigest` → transient `Corruption`, 4xx) leaves the final unchanged; any
+other failure is settled by HEAD — our size and our MD5 `ETag` count as published (facts from the
+HEAD), otherwise the failure reports `final_destination_changed`. Tags applied to the stage are set
+on the object right after the PUT. `verification_point` is `AfterPublish`; verify HEADs the current
+object (another `ETag` or version → `Conflict`), then reads it by our versionId, or with `If-Match` on
+our `ETag` when there is none. Discard of an unpublished single stage touches nothing. Sizes above T,
+unknown sizes and native S3→S3 copies (a single stage handed to the native path moves to the temp
+key) keep the temp-key multipart path until C15/C18; `Direct` stays refused until C14c.
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS

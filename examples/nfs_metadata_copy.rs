@@ -169,6 +169,7 @@ async fn connect(endpoint: &str) -> Result<Storage> {
         BackendConfig::S3(S3BackendConfig {
             url: s3_url(prefix)?,
             block_size: None,
+            single_put_threshold: None,
         })
     } else {
         fs::create_dir_all(endpoint)?;

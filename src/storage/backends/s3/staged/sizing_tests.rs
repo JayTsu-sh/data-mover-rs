@@ -100,7 +100,9 @@ async fn aligned_uploads_do_not_append_empty_parts_but_empty_files_have_one()
 -> Result<(), Box<dyn std::error::Error>> {
     for count in 0..=4 {
         let protocol = Arc::new(MemoryS3::default());
-        let destination = S3StagedDestination::new(protocol, identity());
+        // The multipart path itself: objects this small would otherwise be one PUT.
+        let destination =
+            S3StagedDestination::new(protocol, identity()).with_single_put_threshold(None);
         let size = count * PART_SIZE;
         let stage = destination.prepare(prepare_for_size(size as u64)?).await?;
         let bytes = Bytes::from(vec![7; size]);
@@ -157,7 +159,8 @@ async fn retry_completion_reuses_zero_sized_final_parts() -> Result<(), Box<dyn 
     for has_payload in [false, true] {
         let size = if has_payload { PART_SIZE } else { 0 };
         let protocol = Arc::new(MemoryS3::default());
-        let destination = S3StagedDestination::new(protocol.clone(), identity());
+        let destination =
+            S3StagedDestination::new(protocol.clone(), identity()).with_single_put_threshold(None);
         let request = prepare_for_size(size as u64)?;
         let stage = destination.prepare(request.clone()).await?;
         let key = S3StagedDestination::<MemoryS3>::key(&stage)?;
@@ -177,7 +180,8 @@ async fn retry_completion_reuses_zero_sized_final_parts() -> Result<(), Box<dyn 
             .map_err(|error| format!("{error:?}"))?;
         let recovery = destination.recovery_identity(&stage).await?;
         drop(destination);
-        let destination = S3StagedDestination::new(protocol.clone(), identity());
+        let destination =
+            S3StagedDestination::new(protocol.clone(), identity()).with_single_put_threshold(None);
         let recovered = destination
             .recover(RecoverRequest {
                 identity: recovery,

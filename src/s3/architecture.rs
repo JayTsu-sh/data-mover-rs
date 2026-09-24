@@ -3,6 +3,7 @@ use std::sync::Arc;
 use super::{S3Compatibility, S3Storage};
 use crate::model::BackendIdentity;
 use crate::storage::Storage;
+pub(super) use crate::storage::backends::s3::DEFAULT_SINGLE_PUT_THRESHOLD;
 use crate::storage::backends::s3::{S3NativeContext, S3TagSupport};
 use crate::storage::endpoint::{self, EndpointError};
 
@@ -20,7 +21,12 @@ pub(super) fn identity(
     )
 }
 
-pub(super) fn connect(storage: &S3Storage) -> Result<Storage, Box<dyn std::error::Error>> {
+/// Connects the S3 roles of `storage`; sources of at most `single_put_threshold` bytes are
+/// written as one `PutObject`.
+pub(super) fn connect(
+    storage: &S3Storage,
+    single_put_threshold: u64,
+) -> Result<Storage, Box<dyn std::error::Error>> {
     let identity = identity(
         &storage.endpoint,
         &storage.bucket_name,
@@ -41,7 +47,7 @@ pub(super) fn connect(storage: &S3Storage) -> Result<Storage, Box<dyn std::error
             storage.prefix.clone(),
         )
     });
-    crate::storage::backends::s3::connect_with_tag_support(
+    crate::storage::backends::s3::connect_configured(
         Arc::new(storage.clone()),
         identity,
         native,
@@ -49,5 +55,6 @@ pub(super) fn connect(storage: &S3Storage) -> Result<Storage, Box<dyn std::error
             S3Compatibility::Dxn => S3TagSupport::Unsupported,
             _ => S3TagSupport::Supported,
         },
+        Some(single_put_threshold),
     )
 }

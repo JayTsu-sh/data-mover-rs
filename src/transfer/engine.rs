@@ -987,8 +987,29 @@ async fn run_with_store(
 fn final_recovery(stage: &PreparedStage, plan: TransferPlan) -> EffectiveRecovery {
     if stage.recovery_enabled() {
         EffectiveRecovery::Checkpointed
+    } else if plan.effective_recovery == EffectiveRecovery::Checkpointed {
+        // The destination declined recovery for this stage (see `release_declined_recovery`).
+        EffectiveRecovery::SkippedBelowCheckpointThreshold
     } else {
         plan.effective_recovery
+    }
+}
+
+/// A destination may keep no recovery state for a stage it prepared — an S3 object small enough
+/// for one `PutObject` (ADR-0006 C14b). Its record in the local store, if any, is released
+/// rather than registered, so nothing about the transfer outlives it.
+pub(super) async fn release_declined_recovery(
+    stage: &PreparedStage,
+    recovery: Option<RecoveryContext>,
+) -> Result<Option<RecoveryContext>, TransferFailure> {
+    match recovery {
+        Some(_) if !stage.recovery_enabled() => {
+            super::recovery_store::complete(stage.recovery_binding())
+                .await
+                .map_err(TransferFailure::registration)?;
+            Ok(None)
+        }
+        recovery => Ok(recovery),
     }
 }
 
@@ -1101,6 +1122,12 @@ async fn register_prepared_stage(
     let Some(recovery) = recovery else {
         return Ok(());
     };
+    if !stage.recovery_enabled() {
+        // The destination declined recovery for this stage (see `release_declined_recovery`).
+        return super::recovery_store::complete(stage.recovery_binding())
+            .await
+            .map_err(TransferFailure::registration);
+    }
     let identity = destination
         .recovery_identity(stage)
         .await

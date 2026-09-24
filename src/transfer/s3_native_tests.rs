@@ -219,6 +219,17 @@ async fn native_failure_retains_cleanup_authority_without_changing_final() -> Te
     assert_eq!(error.source_qos().source_read_operations, 4);
     assert!(!protocol.objects.lock().await.contains_key("final"));
     error.discard_stage().await?;
+    // The small object's stage never had an upload: the discard aborts nothing and removes the
+    // temp key the copy was writing (reviewer HIGH: it used to abort an empty upload id).
+    assert_eq!(*protocol.aborts.lock().await, 0);
+    assert!(
+        !protocol
+            .objects
+            .lock()
+            .await
+            .keys()
+            .any(|key| key.starts_with(".data-mover-stage/"))
+    );
     Ok(())
 }
 

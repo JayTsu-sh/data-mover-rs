@@ -11,7 +11,8 @@ use crate::storage::artifacts::ARTIFACT_PREFIX;
 use crate::storage::{
     ByteStream, CheckpointObservation, Metadata, MetadataMutation, PrepareRequest, PreparedStage,
     PublicationEvidence, PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity,
-    StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    StagedDestination, StorageRoleFailure, VerificationEvidence, VerificationPoint, VerifyRequest,
+    WriteEvidence,
 };
 
 use super::source::{cancelled, classified_entry, entry, role_failure};
@@ -23,10 +24,16 @@ mod native;
 mod native_tests;
 mod publication;
 mod recovery;
+mod single;
+#[cfg(test)]
+mod single_tests;
 #[cfg(test)]
 mod sizing_tests;
 use super::{S3Protocol, S3ProtocolFailure};
 use recovery::resumable_parts;
+pub(crate) use single::{DEFAULT_SINGLE_PUT_THRESHOLD, single_put_threshold};
+#[cfg(test)]
+pub(crate) use single::{MAX_SINGLE_PUT_THRESHOLD, MIN_SINGLE_PUT_THRESHOLD};
 
 const PART_SIZE: usize = 8 * 1024 * 1024;
 const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
@@ -84,6 +91,10 @@ pub(crate) struct S3StagedDestination<P> {
     identity: BackendIdentity,
     states: Mutex<HashMap<Vec<u8>, StageState>>,
     metadata: Option<Arc<dyn Metadata>>,
+    /// Sources of at most this many bytes go as one `PutObject` (ADR-0006 C14b); `None` sends
+    /// every object through a multipart upload.
+    single_put_threshold: Option<u64>,
+    tags_supported: bool,
 }
 
 impl<P> S3StagedDestination<P> {
@@ -93,7 +104,21 @@ impl<P> S3StagedDestination<P> {
             identity,
             states: Mutex::new(HashMap::new()),
             metadata: None,
+            single_put_threshold: Some(single::DEFAULT_SINGLE_PUT_THRESHOLD),
+            tags_supported: true,
         }
+    }
+
+    /// Sends sources of at most `threshold` bytes as one `PutObject`; `None` sends every object
+    /// through a multipart upload. A configured value is validated by `single_put_threshold`.
+    pub(crate) fn with_single_put_threshold(mut self, threshold: Option<u64>) -> Self {
+        self.single_put_threshold = threshold;
+        self
+    }
+
+    pub(crate) fn with_tag_support(mut self, supported: bool) -> Self {
+        self.tags_supported = supported;
+        self
     }
 
     pub(crate) fn with_metadata(mut self, metadata: Arc<dyn Metadata>) -> Self {
@@ -252,7 +277,32 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         })
     }
 
+    async fn write_single(
+        &self,
+        stage: &PreparedStage,
+        data: Bytes,
+    ) -> Result<WriteEvidence, StorageRoleFailure> {
+        self.validate(stage)?;
+        match single::of(stage) {
+            Some(single) => single::write_single(stage, single, data),
+            None => {
+                self.write(
+                    stage,
+                    Box::pin(futures::stream::once(async move { Ok(data) })),
+                )
+                .await
+            }
+        }
+    }
+
     async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
+        if let Some(size) = request
+            .source
+            .size
+            .filter(|size| self.is_single_put(Some(*size)))
+        {
+            return Ok(self.prepare_single(request, size));
+        }
         let part_size = planned_part_size(request.source.size, request.final_destination.path())?;
         let key = Self::temp_key(&request);
         let upload_id =
@@ -299,6 +349,18 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         // Source size is bound into recovery_binding, so retry selects the same sizing.
         let part_size = planned_part_size(request.source.size, request.final_destination.path())?;
         let (token, key, upload_id) = Self::validated_recovery(&request)?;
+        if upload_id == single::SINGLE_MARKER {
+            // A single PUT keeps nothing to resume: start it again.
+            let size = request.source.size.unwrap_or(0);
+            return Ok(self.prepare_single(
+                PrepareRequest {
+                    final_destination: request.final_destination,
+                    source: request.source,
+                    recovery_binding: request.recovery_binding,
+                },
+                size,
+            ));
+        }
         // Who may resume is settled before this call: the engine holds the recovery record's
         // exclusive lease for the whole attempt, and one destination key is never written by two
         // transfers at once. S3 needs no marker object of its own — the conditional PUT that one
@@ -343,6 +405,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         mut input: ByteStream,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
         let key = self.validate(stage)?;
+        if let Some(single) = single::of(stage) {
+            return single::write(stage, single, input).await;
+        }
         let initial = self.stage_state(stage, Operation::Write).await?;
         if initial.completed {
             return Ok(WriteEvidence {
@@ -439,6 +504,11 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         stage: &PreparedStage,
     ) -> Result<CheckpointObservation, StorageRoleFailure> {
         let key = self.validate(stage)?;
+        if let Some(single) = single::of(stage) {
+            return Ok(CheckpointObservation {
+                durable_prefix: single.written_len(),
+            });
+        }
         let stage_state = self
             .states
             .lock()
@@ -486,6 +556,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         stage: &PreparedStage,
         request: VerifyRequest,
     ) -> Result<VerificationEvidence, StorageRoleFailure> {
+        if let Some(single) = single::of(stage) {
+            return single::verify(self, stage, single, &request).await;
+        }
         let key = self.validate(stage)?;
         let facts = self
             .protocol
@@ -535,6 +608,12 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
         let key = self.validate(stage)?;
+        if let Some(single) = single::of(stage) {
+            if self.metadata.is_none() {
+                return Err(metadata_unavailable(stage));
+            }
+            return single::apply_metadata(stage, single, self.tags_supported, mutation, &cancel);
+        }
         let path = crate::model::StoragePath::new(key).map_err(|error| {
             entry(
                 stage.final_destination.path(),
@@ -542,15 +621,10 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 error.to_string(),
             )
         })?;
-        let metadata = self.metadata.as_ref().ok_or_else(|| {
-            classified_entry(
-                stage.final_destination.path(),
-                Operation::Metadata,
-                FailureClass::Unsupported,
-                Transience::Permanent,
-                "staged S3 metadata is unavailable",
-            )
-        })?;
+        let metadata = self
+            .metadata
+            .as_ref()
+            .ok_or_else(|| metadata_unavailable(stage))?;
         metadata.apply(&path, mutation, cancel).await
     }
 
@@ -559,10 +633,17 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         stage: &PreparedStage,
         request: PublishRequest,
     ) -> Result<PublicationEvidence, PublicationFailure> {
+        if let Some(single) = single::of(stage) {
+            return single::publish(self, stage, single, &request).await;
+        }
         publication::publish(self, stage, request).await
     }
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
         let key = self.validate(&stage)?;
+        if single::of(&stage).is_some() {
+            // Nothing was sent before publication, and a published object is never deleted.
+            return Ok(());
+        }
         let stage_state = self
             .states
             .lock()
@@ -576,7 +657,7 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                     "S3 stage is not claimed",
                 )
             })?;
-        if stage_state.completed {
+        if stage_state.completed || stage_state.upload_id.is_empty() {
             cleanup_result(
                 stage.final_destination.path(),
                 self.protocol.delete_object(&key).await,
@@ -596,4 +677,23 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         self.states.lock().await.remove(stage.token.as_ref());
         Ok(())
     }
+
+    /// A single PUT writes the final key itself, so it is read back only after publication.
+    fn verification_point(&self, stage: &PreparedStage) -> VerificationPoint {
+        if single::of(stage).is_some() {
+            VerificationPoint::AfterPublish
+        } else {
+            VerificationPoint::BeforePublish
+        }
+    }
+}
+
+fn metadata_unavailable(stage: &PreparedStage) -> StorageRoleFailure {
+    classified_entry(
+        stage.final_destination.path(),
+        Operation::Metadata,
+        FailureClass::Unsupported,
+        Transience::Permanent,
+        "staged S3 metadata is unavailable",
+    )
 }

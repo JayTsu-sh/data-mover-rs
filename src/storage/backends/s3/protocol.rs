@@ -73,10 +73,6 @@ pub(crate) fn is_real_version_id(version: &str) -> bool {
 }
 
 /// What a write that created an object reported about it.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the single PUT, ADR-0006 C14b")
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct S3WriteFacts {
     pub etag: String,
@@ -86,10 +82,6 @@ pub(crate) struct S3WriteFacts {
 
 impl S3WriteFacts {
     /// Keeps `reported_version` only when it is a real version id (see [`is_real_version_id`]).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the single PUT, ADR-0006 C14b")
-    )]
     pub(crate) fn new(etag: String, reported_version: Option<String>) -> Self {
         Self {
             etag,
@@ -143,10 +135,6 @@ pub(crate) trait S3Protocol: Send + Sync {
     ) -> S3Result<Bytes>;
     /// One `PutObject` of `body` to `key`, carrying `content_md5_base64` so the server rejects a
     /// body corrupted in flight (`BadDigest`, a transient `Corruption` entry failure).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the single PUT, ADR-0006 C14b")
-    )]
     async fn put_object(
         &self,
         key: &str,

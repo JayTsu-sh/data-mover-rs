@@ -9,7 +9,7 @@ use super::super::source::{cancelled, entry, role_failure};
 use super::super::{
     S3_NATIVE_COPY_SINGLE_MAX, S3NativeCopyEvidence, S3NativeCopySource, S3Protocol,
 };
-use super::{S3StagedDestination, cleanup_result};
+use super::{PART_SIZE, S3StagedDestination, StageState, cleanup_result, single};
 
 struct NativeFillFailure {
     error: StorageRoleFailure,
@@ -47,6 +47,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         cancel: &CancellationToken,
     ) -> Result<S3NativeCopyEvidence, NativeFillFailure> {
         let baseline = u64::from(source.size > S3_NATIVE_COPY_SINGLE_MAX);
+        self.adopt_single_stage(stage, source).await;
         let (key, upload_id) = self
             .prepare_native_ownership(stage, source, cancel, baseline)
             .await?;
@@ -76,7 +77,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             )));
         }
         let multipart = source.size > S3_NATIVE_COPY_SINGLE_MAX;
-        if !multipart {
+        if !multipart && !record.upload_id.is_empty() {
             cleanup_result(
                 stage.final_destination.path(),
                 self.protocol.abort_multipart(&key, &record.upload_id).await,
@@ -90,6 +91,25 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             .await
             .insert(stage.token.to_vec(), record);
         Ok((key, upload_id))
+    }
+
+    /// A native copy still fills the temp key (until C18): a stage prepared for one `PutObject`
+    /// moves to that path, with no upload to abort.
+    async fn adopt_single_stage(&self, stage: &PreparedStage, source: &S3NativeCopySource) {
+        let Some(single) = single::of(stage) else {
+            return;
+        };
+        single.mark_native();
+        self.states.lock().await.insert(
+            stage.token.to_vec(),
+            StageState {
+                expected_size: Some(source.size),
+                part_size: PART_SIZE,
+                // No upload exists to abort: a discard only removes the temp key the copy wrote.
+                completed: true,
+                ..StageState::default()
+            },
+        );
     }
 
     async fn invoke_native_copy(

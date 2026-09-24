@@ -713,7 +713,17 @@ impl S3Storage {
     pub fn architecture_storage(
         &self,
     ) -> std::result::Result<crate::storage::Storage, Box<dyn std::error::Error>> {
-        architecture::connect(self)
+        architecture::connect(self, architecture::DEFAULT_SINGLE_PUT_THRESHOLD)
+    }
+
+    /// [`S3Storage::architecture_storage`] with a configured single-PUT threshold: sources of at
+    /// most `single_put_threshold` bytes (default 8 MiB, within `[5 MiB, 5 GiB]`) are written as
+    /// one `PutObject`.
+    pub(crate) fn architecture_storage_with_single_put_threshold(
+        &self,
+        single_put_threshold: u64,
+    ) -> std::result::Result<crate::storage::Storage, Box<dyn std::error::Error>> {
+        architecture::connect(self, single_put_threshold)
     }
 
     /// Overrides the per-file read and write concurrency for this adapter.

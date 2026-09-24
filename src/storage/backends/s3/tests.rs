@@ -30,14 +30,14 @@ pub(super) type UploadParts = HashMap<String, (String, Vec<(i32, Bytes)>)>;
 pub(crate) struct MemoryS3 {
     pub(crate) version: Mutex<Option<String>>,
     pub(crate) last_modified: Mutex<Option<crate::model::StorageTimestamp>>,
-    range_observations: Mutex<Vec<S3ObjectFacts>>,
+    pub(crate) range_observations: Mutex<Vec<S3ObjectFacts>>,
     pub(crate) objects: Mutex<HashMap<String, Bytes>>,
     pub(super) uploads: Mutex<UploadParts>,
     tags: Mutex<HashMap<String, Vec<ObjectTag>>>,
     tag_reads: Mutex<u32>,
-    pub(super) aborts: Mutex<u32>,
+    pub(crate) aborts: Mutex<u32>,
     pub(super) abort_failure: Mutex<Option<S3ProtocolFailure>>,
-    head_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
+    pub(crate) head_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
     pub(crate) copy_commits_then_fails: Mutex<bool>,
     pub(crate) native_copies: Mutex<u64>,
     pub(crate) native_failure: Mutex<Option<S3ProtocolFailure>>,
@@ -49,6 +49,12 @@ pub(crate) struct MemoryS3 {
     pub(crate) ignores_version_id: Mutex<bool>,
     /// The next `put_object` fails with `BadDigest`, as if its body was corrupted in flight.
     pub(crate) bad_digest_next_put: Mutex<bool>,
+    /// The next `put_object` stores its object, then loses the reply (a transient connectivity
+    /// failure).
+    pub(crate) put_commits_then_fails: Mutex<bool>,
+    /// `PutObject` requests received, and multipart uploads begun.
+    pub(crate) puts: Mutex<u32>,
+    pub(crate) multipart_begins: Mutex<u32>,
     /// Contents a multipart upload completed, by their MD5: real S3 gives such an object the
     /// `ETag` `"<MD5 of the part MD5s>-<parts>"`, not the MD5 of its bytes.
     multipart_etags: std::sync::Mutex<HashMap<[u8; 16], String>>,
@@ -234,6 +240,7 @@ impl S3Protocol for MemoryS3 {
         body: Bytes,
         content_md5_base64: &str,
     ) -> S3Result<S3WriteFacts> {
+        *self.puts.lock().await += 1;
         let corrupted = mem::take(&mut *self.bad_digest_next_put.lock().await);
         if corrupted || content_md5(&body) != content_md5_base64 {
             return Err(S3ProtocolFailure::corrupted_upload(
@@ -246,9 +253,17 @@ impl S3Protocol for MemoryS3 {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&<[u8; 16]>::from(Md5::digest(&body)));
         let version = self.store_written(key, body).await;
+        if mem::take(&mut *self.put_commits_then_fails.lock().await) {
+            return Err(S3ProtocolFailure::session(
+                crate::model::FailureClass::Connectivity,
+                crate::model::Transience::Transient,
+                "put response lost",
+            ));
+        }
         Ok(S3WriteFacts::new(etag, version))
     }
     async fn begin_multipart(&self, key: &str) -> S3Result<String> {
+        *self.multipart_begins.lock().await += 1;
         let id = format!("upload-{}", self.next_id().await);
         self.uploads
             .lock()
@@ -417,6 +432,22 @@ impl S3Protocol for MemoryS3 {
             .insert(key.to_string(), tags.to_vec());
         Ok(())
     }
+}
+
+/// S3 roles that send every object through a multipart upload, however small: for tests of that
+/// path with payloads below the single-PUT threshold.
+pub(crate) fn connect_multipart_only(
+    protocol: Arc<MemoryS3>,
+    identity: BackendIdentity,
+    native_context: Option<S3NativeContext>,
+) -> Result<crate::storage::Storage, Box<dyn std::error::Error>> {
+    connect_configured(
+        protocol,
+        identity,
+        native_context,
+        S3TagSupport::Supported,
+        None,
+    )
 }
 
 pub(crate) fn identity() -> BackendIdentity {

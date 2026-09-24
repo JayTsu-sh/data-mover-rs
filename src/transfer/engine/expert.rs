@@ -415,6 +415,14 @@ impl ExpertDestinationSession {
         }
         let mut stage =
             prepare_destination_stage(&request, &destination, &source, recovery_enabled).await?;
+        // The destination may decline recovery for this stage (a single S3 PUT).
+        let recovery_enabled = recovery_enabled && stage.recovery_enabled();
+        let effective_recovery = match effective_recovery {
+            super::EffectiveRecovery::Checkpointed if !recovery_enabled => {
+                super::EffectiveRecovery::SkippedBelowCheckpointThreshold
+            }
+            effective_recovery => effective_recovery,
+        };
         stage.durable_publication = request.transfer_policy == TransferPolicy::Checkpointed;
         Ok(Self {
             identity: request.identity,
@@ -628,6 +636,10 @@ async fn prepare_destination_stage(
             reason: RestartReason::Requested,
         };
     }
+    let recovery = match super::release_declined_recovery(&stage, recovery).await {
+        Ok(recovery) => recovery,
+        Err(error) => return Err(error.with_stage(Arc::clone(destination), stage)),
+    };
     if let Some(recovery) = &recovery {
         let identity = match destination.recovery_identity(&stage).await {
             Ok(identity) => identity,

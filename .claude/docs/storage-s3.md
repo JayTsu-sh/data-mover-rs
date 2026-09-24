@@ -116,7 +116,8 @@ HEAD 当前 → 404、HEAD 旧版本 → 200。传输中途上传新版本，钉
 ### 目的端写入策略基线（C0，改造前，2026-09-24，VM 102 MinIO RELEASE.2023-03-20）
 
 `bash .claude/skills/e2e-s3/scripts/staged_matrix.sh`（驱动 `examples/transfer_resume.rs`，只写/删 `staged-<run>/`）。
-今天所有策略都是「temp key 分段上传 → CopyObject 到 final → 删 temp」，1 KiB 也不例外。
+C0 时所有策略都是「temp key 分段上传 → CopyObject 到 final → 删 temp」，1 KiB 也不例外（C14b 起 ≤ T 的对象
+改为一次 PutObject，见上）。
 
 | 用例 | 结果 / 耗时 |
 |---|---|
@@ -136,6 +137,19 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 （terrasync 保证，用户确认）。直接调用 `recover` 的代码要自己保证独占，`claim_token` 对 S3 无意义。修后真机：取消 / SIGKILL
 后续传都成功（200 MiB，读回校验通过），记录随后清除。旧版本在 AWS 上成功 claim 后崩溃留下的 `<temp>.claim`
 对象新代码不再认也不再删：不会自动清理；它和 temp 对象都在 `.data-mover-stage/` 下，legacy 列举已不再报告它们（见下）。已知：3 s / 20 MiB/s 中断后只有 1 个分段（8 MiB）可复用，粒度待查。
+
+### 小对象：一次 PutObject 到最终 key（ADR-0006 C14b）
+
+- 阈值 T = `S3BackendConfig.single_put_threshold`（`None` = 8 MiB，范围 [5 MiB, 5 GiB]，越界在 connect
+  时、联网前报 S3 的 `BackendConnectError`「invalid configuration」；storage 层按架构守卫不能引用
+  `crate::error`，所以不是 `StorageError::ConfigError`）。已知大小 ≤ T（含 0 B）的对象：prepare 不开 upload、不建 temp key；stage
+  状态（缓冲、待设 tags、写入事实）放在 `PreparedStage::backend_state`（`staged/single.rs`），不进适配器的
+  stage 表 —— 丢弃的 stage 不会滞留缓冲。无续传（`disable_recovery`），引擎因此不登记、并清掉本地恢复记录。
+- publish = 一次带 Content-MD5 的 `PutObject` 到最终 key。`BadDigest` 等明确拒绝 → 最终对象未变；
+  回复丢失 → HEAD 对账（大小相同且 `ETag` = 我们的 MD5 算已发布），否则 `final_destination_changed`。
+- 校验在发布**之后**（`verification_point` = `AfterPublish`）：先 HEAD 当前对象（`ETag` / 版本已不是我们的
+  → `Conflict`），再按我们的 versionId 读；桶无版本时带 `If-Match: <我们的 ETag>` 读。
+- 大于 T、大小未知、原生 S3→S3 仍走 temp key 分段上传 + CopyObject（C15 / C18 再改）；`Direct` 仍拒绝（C14c）。
 
 ### legacy 列举隐藏传输 artifact（ADR-0006 C3）
 

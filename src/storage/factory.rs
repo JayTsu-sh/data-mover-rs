@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::hdfs::HdfsConfig;
 use crate::model::{BackendIdentity, BackendKind};
+use crate::storage::backends::s3::single_put_threshold;
 use crate::storage::{Storage, endpoint};
 use crate::url_redact::redact_storage_url;
 
@@ -92,6 +93,12 @@ pub struct S3BackendConfig {
     /// `s3://AK:SK@bucket.host[:port]/prefix`; the key pair is never printed by `Debug`.
     pub url: String,
     pub block_size: Option<u64>,
+    /// Objects of at most this many bytes are written as one `PutObject` to the final key,
+    /// verified after publication; larger ones go through a multipart upload. `None` = 8 MiB;
+    /// a value outside `[5 MiB, 5 GiB]` is refused at connect. Such an object is held in memory
+    /// whole until it is published, outside the inflight read budget: the threshold times the
+    /// number of concurrent transfers bounds that memory.
+    pub single_put_threshold: Option<u64>,
 }
 
 impl fmt::Debug for S3BackendConfig {
@@ -100,6 +107,7 @@ impl fmt::Debug for S3BackendConfig {
             .debug_struct("S3BackendConfig")
             .field("url", &redact_storage_url(&self.url))
             .field("block_size", &self.block_size)
+            .field("single_put_threshold", &self.single_put_threshold)
             .finish()
     }
 }
@@ -240,11 +248,14 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
                 .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))
         }
         BackendConfig::S3(config) => {
+            // Checked before any network I/O, so an invalid threshold fails fast.
+            let threshold = single_put_threshold(config.single_put_threshold)
+                .map_err(|error| BackendConnectError::new(BackendKind::S3, error))?;
             let storage = crate::s3::S3Storage::new(&config.url, config.block_size)
                 .await
                 .map_err(|error| BackendConnectError::new(BackendKind::S3, error))?;
             storage
-                .architecture_storage()
+                .architecture_storage_with_single_put_threshold(threshold)
                 .map_err(|error| BackendConnectError::new(BackendKind::S3, error))
         }
         BackendConfig::Hdfs(config) => {

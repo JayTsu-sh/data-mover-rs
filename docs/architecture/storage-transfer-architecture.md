@@ -608,7 +608,9 @@ CIFS (since ADR-0006 C11) works the same way: no claim, no recovery identity, a 
 Backend mechanisms:
 
 - Local/NFS/CIFS: persisted contiguous durable prefix; writes beyond a gap are not reusable;
-- S3/DXN: service-enumerated multipart parts named by the validated upload identity; no adapter
+- S3/DXN: objects up to the single-PUT threshold (`S3BackendConfig.single_put_threshold`, default
+  8 MiB) are one `PutObject` to the final key, verified after publication, with no recovery state;
+  larger ones: service-enumerated multipart parts named by the validated upload identity; no adapter
   claim (it relied on a conditional PUT that MinIO `RELEASE.2023-03-20` rejects with 404, failing
   every resume there) — exclusivity is the engine's per-host recovery lease, and one destination
   key is never written by two transfers at once (caller contract);

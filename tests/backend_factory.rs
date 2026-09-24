@@ -33,6 +33,7 @@ fn s3_config_debug_never_exposes_the_key_pair() {
     let config = BackendConfig::S3(S3BackendConfig {
         url: "s3://SENSITIVEAK:wJalr/XUtn+FEMI=@bucket.host:9000/prefix".to_string(),
         block_size: None,
+        single_put_threshold: None,
     });
 
     let debug = format!("{config:?}");
@@ -43,6 +44,28 @@ fn s3_config_debug_never_exposes_the_key_pair() {
         "{debug}"
     );
     assert!(debug.contains("bucket.host:9000/prefix"), "{debug}");
+}
+
+/// A single-PUT threshold outside [5 MiB, 5 GiB] is a configuration error, refused before any
+/// network I/O (the endpoint below is never contacted).
+#[tokio::test]
+async fn s3_single_put_threshold_outside_its_range_is_refused_at_connect() {
+    for threshold in [5 * 1024 * 1024 - 1, 5 * 1024 * 1024 * 1024 + 1] {
+        let result = connect_backend(BackendConfig::S3(S3BackendConfig {
+            url: "s3://AK:SK@bucket.127.0.0.1:1/prefix".to_string(),
+            block_size: None,
+            single_put_threshold: Some(threshold),
+        }))
+        .await;
+        let Err(error) = result else {
+            panic!("threshold {threshold} was accepted");
+        };
+        assert_eq!(error.kind(), data_mover::model::BackendKind::S3);
+        assert!(
+            error.to_string().contains("single_put_threshold"),
+            "{error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -131,6 +154,7 @@ fn network_endpoint_identities_are_derived_offline_without_credentials()
     let s3 = endpoint_identity(&BackendConfig::S3(S3BackendConfig {
         url: "s3+https://SENSITIVEAK:wJal/r+X=@Data-Mover-Test.10.131.9.11:9000/resume-base".into(),
         block_size: None,
+        single_put_threshold: None,
     }))?;
     assert_eq!(
         s3.stable_id(),
