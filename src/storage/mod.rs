@@ -51,7 +51,7 @@ pub use roles::{
     PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
     ReadRequest, ReadSource, RecoverRequest, RecoveryIdentity, RecoveryValueError,
     StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure, VerificationEvidence,
-    VerifyRequest, WriteEvidence,
+    VerificationPoint, VerifyRequest, WriteEvidence,
 };
 pub(crate) use roles::{CheckpointRegistration, DeferredCheckpoint};
 

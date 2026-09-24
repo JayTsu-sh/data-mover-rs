@@ -201,6 +201,7 @@ impl LocalStagedDestination {
         Ok(PublicationEvidence {
             final_destination: path,
             disposition: crate::storage::PublicationDisposition::Published,
+            version: None,
         })
     }
 }

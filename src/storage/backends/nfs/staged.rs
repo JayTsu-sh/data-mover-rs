@@ -471,6 +471,7 @@ impl NfsStagedDestinationAdapter {
                     Ok(PublicationEvidence {
                         final_destination: stage.final_destination.path().clone(),
                         disposition: PublicationDisposition::Published,
+                        version: None,
                     })
                 } else {
                     Err(PublicationFailure {
@@ -505,6 +506,7 @@ impl NfsStagedDestinationAdapter {
                 Ok(PublicationEvidence {
                     final_destination: stage.final_destination.path().clone(),
                     disposition: PublicationDisposition::Published,
+                    version: None,
                 })
             }
             Ok(_) => Err(PublicationFailure {
@@ -758,6 +760,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
         Ok(PublicationEvidence {
             final_destination: stage.final_destination.path().clone(),
             disposition: PublicationDisposition::Published,
+            version: None,
         })
     }
 

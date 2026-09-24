@@ -142,6 +142,7 @@ fn evidence(stage: &PreparedStage, disposition: PublicationDisposition) -> Publi
     PublicationEvidence {
         final_destination: stage.final_destination.path().clone(),
         disposition,
+        version: None,
     }
 }
 

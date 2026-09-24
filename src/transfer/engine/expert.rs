@@ -15,8 +15,8 @@ use crate::model::{EntryIdentityKey, EntryKind, ObservedEntry, SourceVersion, St
 use crate::storage::{
     CheckpointObservation, FinalDestination, PreflightPolicy, PrepareFact, PrepareRequest,
     PublicationEvidence, PublishRequest, ReadSource, RestartReason, SourceDescriptor,
-    SourceQosBudget, SourceQosGroup, SourceQosStats, StagedDestination, Storage, VerifyRequest,
-    WriteEvidence,
+    SourceQosBudget, SourceQosGroup, SourceQosStats, StagedDestination, Storage, VerificationPoint,
+    VerifyRequest, WriteEvidence,
 };
 use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy};
 
@@ -686,25 +686,85 @@ impl ExpertDestinationTransferred {
             && evidence.identity_key == self.source.source_identity.identity_key()
     }
 
+    /// Everything before publication: verification of the stage (unless the destination verifies
+    /// after publication, when only the evidence is checked), then metadata.
+    async fn before_publication(
+        &self,
+        evidence: ExpertSourceEvidence,
+        verify_after: bool,
+    ) -> Result<Option<crate::metadata::MetadataApplicationReport>, (TransferFailure, StagedContent)>
+    {
+        if verify_after {
+            self.check_evidence(evidence)
+                .map_err(|failure| (failure, StagedContent::NotJudged))?;
+        } else {
+            self.verify_stage(evidence).await?;
+        }
+        self.apply_metadata_stage()
+            .await
+            .map_err(|failure| (failure, StagedContent::NotJudged))
+    }
+
+    /// Marks the local record publishing (store path only) and publishes. A failure says whether
+    /// the final destination changed (clean-up owed) or not (the stage is kept).
+    async fn publish_stage(
+        &self,
+        evidence: ExpertSourceEvidence,
+    ) -> Result<PublicationEvidence, (TransferFailure, bool)> {
+        if self.stage.recovery_enabled()
+            && self.stage.uses_recovery_store()
+            && let Err(error) =
+                super::super::recovery_store::mark_publishing(self.stage.recovery_binding()).await
+        {
+            return Err((TransferFailure::registration(error), false));
+        }
+        self.destination
+            .publish(
+                &self.stage,
+                PublishRequest {
+                    expected_size: self.source_size,
+                    expected_blake3: Some(evidence.blake3),
+                    cancel: self.cancel.clone(),
+                },
+            )
+            .await
+            .map_err(|publication| {
+                let changed = publication.final_destination_changed;
+                let mut failure = TransferFailure::role(
+                    TransferPhase::Publish,
+                    TransferSide::Destination,
+                    publication.error,
+                );
+                failure.final_destination_changed = changed;
+                (failure, changed)
+            })
+    }
+
+    /// The source evidence must be the prepared observation's, and the transfer not cancelled.
+    fn check_evidence(&self, evidence: ExpertSourceEvidence) -> Result<(), TransferFailure> {
+        if !self.evidence_matches(evidence) {
+            return Err(TransferFailure::orchestration(
+                TransferPhase::Verify,
+                "source evidence differs from prepared observation",
+            ));
+        }
+        if self.cancel.is_cancelled() {
+            return Err(TransferFailure::orchestration(
+                TransferPhase::Verify,
+                "transfer was cancelled before verification or publication",
+            ));
+        }
+        Ok(())
+    }
+
     /// Verifies the stage; a failure says whether the staged bytes themselves did not match
     /// (the only failure that makes a resumed stage stale).
     async fn verify_stage(
         &self,
         evidence: ExpertSourceEvidence,
     ) -> Result<(), (TransferFailure, StagedContent)> {
-        let other = |failure| (failure, StagedContent::NotJudged);
-        if !self.evidence_matches(evidence) {
-            return Err(other(TransferFailure::orchestration(
-                TransferPhase::Verify,
-                "source evidence differs from prepared observation",
-            )));
-        }
-        if self.cancel.is_cancelled() {
-            return Err(other(TransferFailure::orchestration(
-                TransferPhase::Verify,
-                "transfer was cancelled before verification",
-            )));
-        }
+        self.check_evidence(evidence)
+            .map_err(|failure| (failure, StagedContent::NotJudged))?;
         let verification = self
             .destination
             .verify(
@@ -713,6 +773,7 @@ impl ExpertDestinationTransferred {
                     expected_size: self.checkpoint.durable_prefix,
                     expected_blake3: evidence.blake3,
                     cancel: self.cancel.clone(),
+                    published: None,
                 },
             )
             .await
@@ -737,10 +798,13 @@ impl ExpertDestinationTransferred {
             ));
         }
         if self.cancel.is_cancelled() {
-            return Err(other(TransferFailure::orchestration(
-                TransferPhase::Verify,
-                "transfer was cancelled before metadata application",
-            )));
+            return Err((
+                TransferFailure::orchestration(
+                    TransferPhase::Verify,
+                    "transfer was cancelled before metadata application",
+                ),
+                StagedContent::NotJudged,
+            ));
         }
         Ok(())
     }
@@ -774,8 +838,10 @@ impl ExpertDestinationTransferred {
         self,
         evidence: ExpertSourceEvidence,
     ) -> Result<TransferOutcome, TransferFailure> {
-        match self.verify_stage(evidence).await {
-            Ok(()) => {}
+        let verify_after =
+            self.destination.verification_point(&self.stage) == VerificationPoint::AfterPublish;
+        let metadata = match self.before_publication(evidence, verify_after).await {
+            Ok(metadata) => metadata,
             Err((failure, StagedContent::Mismatched)) => {
                 let failure = failure.with_source_qos(evidence.source_qos);
                 return Err(
@@ -787,52 +853,15 @@ impl ExpertDestinationTransferred {
                     .with_stage(Arc::clone(&self.destination), self.stage)
                     .with_source_qos(evidence.source_qos));
             }
-        }
-        let metadata = match self.apply_metadata_stage().await {
-            Ok(metadata) => metadata,
-            Err(failure) => {
+        };
+        let publication = match self.publish_stage(evidence).await {
+            Ok(publication) => publication,
+            Err((failure, true)) => {
                 return Err(failure
-                    .with_stage(Arc::clone(&self.destination), self.stage)
+                    .with_committed_cleanup(self.destination, self.stage)
                     .with_source_qos(evidence.source_qos));
             }
-        };
-        if self.stage.recovery_enabled()
-            && self.stage.uses_recovery_store()
-            && let Err(error) =
-                super::super::recovery_store::mark_publishing(self.stage.recovery_binding()).await
-        {
-            return Err(TransferFailure::registration(error)
-                .with_stage(Arc::clone(&self.destination), self.stage)
-                .with_source_qos(evidence.source_qos));
-        }
-        let publication = self
-            .destination
-            .publish(
-                &self.stage,
-                PublishRequest {
-                    expected_size: self.source_size,
-                    expected_blake3: Some(evidence.blake3),
-                    cancel: self.cancel,
-                },
-            )
-            .await;
-        let PublicationEvidence {
-            final_destination,
-            disposition,
-        } = match publication {
-            Ok(publication) => publication,
-            Err(publication) => {
-                let mut failure = TransferFailure::role(
-                    TransferPhase::Publish,
-                    TransferSide::Destination,
-                    publication.error,
-                );
-                failure.final_destination_changed = publication.final_destination_changed;
-                if publication.final_destination_changed {
-                    return Err(failure
-                        .with_committed_cleanup(self.destination, self.stage)
-                        .with_source_qos(evidence.source_qos));
-                }
+            Err((failure, false)) => {
                 return Err(failure
                     .with_stage(self.destination, self.stage)
                     .with_source_qos(evidence.source_qos));
@@ -854,6 +883,24 @@ impl ExpertDestinationTransferred {
                 .with_committed_cleanup(self.destination, self.stage)
                 .with_source_qos(evidence.source_qos));
         }
+        if verify_after {
+            super::verify_published(
+                &self.destination,
+                &self.stage,
+                &publication,
+                self.source_size,
+                Some(evidence.blake3),
+                self.cancel,
+            )
+            .await
+            .map_err(|failure| failure.with_source_qos(evidence.source_qos))?;
+        }
+        let PublicationEvidence {
+            final_destination,
+            disposition,
+            version: destination_version,
+            ..
+        } = publication;
         let prepare = self.stage.prepare_fact;
         Ok(TransferOutcome {
             identity: self.identity,
@@ -868,6 +915,7 @@ impl ExpertDestinationTransferred {
             metadata,
             route: super::TransferRoute::Streaming,
             recovery: self.effective_recovery,
+            destination_version,
         })
     }
 }

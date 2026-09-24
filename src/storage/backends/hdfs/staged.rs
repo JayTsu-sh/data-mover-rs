@@ -694,6 +694,7 @@ async fn publish(
     Ok(PublicationEvidence {
         final_destination: stage.final_destination.path().clone(),
         disposition: PublicationDisposition::Published,
+        version: None,
     })
 }
 

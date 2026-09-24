@@ -133,6 +133,7 @@ async fn range_stream_multipart_verify_publish_and_readback()
                 expected_size: payload.len() as u64,
                 expected_blake3: digest,
                 cancel: CancellationToken::new(),
+                published: None,
             },
         )
         .await?;
@@ -453,6 +454,7 @@ async fn multipart_checkpoint_is_reobserved_and_resumed_after_reconnect()
                 expected_size: full.len() as u64,
                 expected_blake3: digest,
                 cancel: CancellationToken::new(),
+                published: None,
             },
         )
         .await?;

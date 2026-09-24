@@ -62,6 +62,16 @@ struct MemoryDestination {
     written: AtomicU64,
     /// Calls into the recovery-store prepare / recover path, which must never happen.
     legacy_calls: AtomicUsize,
+    /// Verify after publication, from the final object (as S3 does).
+    verify_after: std::sync::atomic::AtomicBool,
+    /// Publish different bytes than the stage holds (a published object gone wrong).
+    corrupt_publication: std::sync::atomic::AtomicBool,
+    /// The version a publication reports.
+    version: Mutex<Option<String>>,
+    /// `verify` and `publish` calls, in order.
+    calls: Mutex<Vec<&'static str>>,
+    /// Cancelled once a write has taken all its input (a cancel that lands before publication).
+    cancel_after_write: Mutex<Option<CancellationToken>>,
 }
 
 impl MemoryDestination {
@@ -73,7 +83,26 @@ impl MemoryDestination {
             fail_at: Mutex::default(),
             written: AtomicU64::new(0),
             legacy_calls: AtomicUsize::new(0),
+            verify_after: std::sync::atomic::AtomicBool::new(false),
+            corrupt_publication: std::sync::atomic::AtomicBool::new(false),
+            version: Mutex::default(),
+            calls: Mutex::default(),
+            cancel_after_write: Mutex::default(),
         }))
+    }
+
+    fn record(&self, call: &'static str) {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(call);
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn files(&self) -> std::sync::MutexGuard<'_, HashMap<StoragePath, Vec<u8>>> {
@@ -265,6 +294,14 @@ impl StagedDestination for MemoryDestination {
             }
         }
         let length = self.files().get(&stage_path).map_or(0, Vec::len) as u64;
+        if let Some(cancel) = self
+            .cancel_after_write
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            cancel.cancel();
+        }
         Ok(WriteEvidence {
             persisted_bytes: length,
         })
@@ -285,8 +322,13 @@ impl StagedDestination for MemoryDestination {
         stage: &PreparedStage,
         _request: VerifyRequest,
     ) -> Result<VerificationEvidence, StorageRoleFailure> {
-        let stage_path = Self::artifact(stage.final_destination.path(), ArtifactKind::Stage)?;
-        let bytes = self.files().get(&stage_path).cloned().unwrap_or_default();
+        self.record("verify");
+        let read = if self.verify_after.load(Ordering::SeqCst) {
+            stage.final_destination.path().clone()
+        } else {
+            Self::artifact(stage.final_destination.path(), ArtifactKind::Stage)?
+        };
+        let bytes = self.files().get(&read).cloned().unwrap_or_default();
         Ok(VerificationEvidence {
             verified_bytes: bytes.len() as u64,
             blake3: *blake3::hash(&bytes).as_bytes(),
@@ -298,6 +340,7 @@ impl StagedDestination for MemoryDestination {
         stage: &PreparedStage,
         _request: PublishRequest,
     ) -> Result<PublicationEvidence, PublicationFailure> {
+        self.record("publish");
         let final_path = stage.final_destination.path().clone();
         let stage_path = Self::artifact(&final_path, ArtifactKind::Stage).map_err(|error| {
             PublicationFailure {
@@ -306,15 +349,34 @@ impl StagedDestination for MemoryDestination {
             }
         })?;
         let mut files = self.files();
-        let bytes = files.remove(&stage_path).unwrap_or_default();
+        let mut bytes = files.remove(&stage_path).unwrap_or_default();
+        if self.corrupt_publication.load(Ordering::SeqCst)
+            && let Some(first) = bytes.first_mut()
+        {
+            *first ^= 0xff;
+        }
         files.insert(final_path.clone(), bytes);
         if let Some(pointer) = sibling_artifact(&final_path, ArtifactKind::Pointer) {
             files.remove(&pointer);
         }
+        drop(files);
         Ok(PublicationEvidence {
             final_destination: final_path,
             disposition: PublicationDisposition::Published,
+            version: self
+                .version
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
         })
+    }
+
+    fn verification_point(&self, _stage: &PreparedStage) -> crate::storage::VerificationPoint {
+        if self.verify_after.load(Ordering::SeqCst) {
+            crate::storage::VerificationPoint::AfterPublish
+        } else {
+            crate::storage::VerificationPoint::BeforePublish
+        }
     }
 
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
@@ -642,5 +704,108 @@ async fn the_expert_half_also_cleans_up_a_stale_resumed_stage() -> TestResult {
     let outcome = expert_run(source.path(), &destination).await??;
     assert_eq!(outcome.prepare, PrepareFact::Fresh);
     assert_eq!(final_bytes(&destination)?, payload(9));
+    Ok(())
+}
+
+/// A destination that writes at the final name verifies after publication, reading the final
+/// object; the version its publication created reaches the outcome (ADR-0006 C13).
+#[tokio::test]
+async fn an_after_publish_destination_verifies_after_publication() -> TestResult {
+    let source = source_root(21)?;
+    let destination = MemoryDestination::new("after-publish")?;
+    destination.verify_after.store(true, Ordering::SeqCst);
+    *destination
+        .version
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some("v1".to_owned());
+    let outcome = transfer(request(source.path(), &destination)?).await?;
+    assert_eq!(destination.calls(), ["publish", "verify"]);
+    assert_eq!(outcome.destination_version.as_deref(), Some("v1"));
+    assert!(outcome.blake3.is_some());
+    assert_eq!(final_bytes(&destination)?, payload(21));
+
+    // With read-back off nothing is read at all.
+    destination
+        .calls
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    let unread = transfer(
+        request(source.path(), &destination)?
+            .with_read_back_verification(crate::transfer::ReadBackVerification::Disabled),
+    )
+    .await?;
+    assert_eq!(destination.calls(), ["publish"]);
+    assert_eq!(unread.blake3, None);
+    Ok(())
+}
+
+/// A published object that does not match fails verification — after publication, so nothing can
+/// be undone: the failure says the final destination changed and keeps no stage.
+#[tokio::test]
+async fn an_after_publish_mismatch_reports_the_changed_final_destination() -> TestResult {
+    let source = source_root(22)?;
+    let destination = MemoryDestination::new("after-publish-mismatch")?;
+    destination.verify_after.store(true, Ordering::SeqCst);
+    destination
+        .corrupt_publication
+        .store(true, Ordering::SeqCst);
+    let failure = transfer(request(source.path(), &destination)?)
+        .await
+        .err()
+        .ok_or("a corrupt publication must fail verification")?;
+    assert_eq!(failure.phase(), TransferPhase::Verify);
+    assert!(failure.final_destination_changed());
+    assert!(!failure.has_unpublished_stage());
+    assert!(!failure.has_pending_cleanup());
+    assert_eq!(destination.calls(), ["publish", "verify"]);
+    // Publication left nothing but the final object: no stage or pointer to clean up.
+    assert_eq!(destination.files().len(), 1);
+    Ok(())
+}
+
+/// The expert destination half verifies after publication too, for such a destination.
+#[tokio::test]
+async fn the_expert_half_verifies_after_publication_too() -> TestResult {
+    let source = source_root(23)?;
+    let destination = MemoryDestination::new("expert-after-publish")?;
+    destination.verify_after.store(true, Ordering::SeqCst);
+    expert_run(source.path(), &destination).await??;
+    assert_eq!(destination.calls(), ["publish", "verify"]);
+    assert_eq!(final_bytes(&destination)?, payload(23));
+    Ok(())
+}
+
+/// The default order is unchanged: verify the stage, then publish.
+#[tokio::test]
+async fn a_before_publish_destination_verifies_first() -> TestResult {
+    let source = source_root(24)?;
+    let destination = MemoryDestination::new("before-publish")?;
+    transfer(request(source.path(), &destination)?).await?;
+    assert_eq!(destination.calls(), ["verify", "publish"]);
+    Ok(())
+}
+
+/// A cancel that lands after the writes but before publication keeps the stage and publishes
+/// nothing, rather than publishing content it would then fail to verify.
+#[tokio::test]
+async fn an_after_publish_transfer_cancelled_before_publication_keeps_its_stage() -> TestResult {
+    let source = source_root(25)?;
+    let destination = MemoryDestination::new("after-publish-cancel")?;
+    destination.verify_after.store(true, Ordering::SeqCst);
+    let request = request(source.path(), &destination)?;
+    *destination
+        .cancel_after_write
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(request.cancel.clone());
+    let failure = transfer(request)
+        .await
+        .err()
+        .ok_or("a cancelled transfer must not succeed")?;
+    assert!(!failure.final_destination_changed());
+    assert!(failure.has_unpublished_stage());
+    assert!(!destination.calls().contains(&"publish"));
+    assert!(final_bytes(&destination)?.is_empty());
+    failure.discard_stage().await?;
     Ok(())
 }

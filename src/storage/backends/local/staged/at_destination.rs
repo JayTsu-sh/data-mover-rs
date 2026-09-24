@@ -703,6 +703,7 @@ pub(super) async fn finish_publication(
     Ok(PublicationEvidence {
         final_destination,
         disposition,
+        version: None,
     })
 }
 

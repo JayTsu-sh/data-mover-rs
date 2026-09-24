@@ -863,6 +863,7 @@ pub(super) mod tests {
                     expected_size: expected.len() as u64,
                     expected_blake3: *blake3::hash(&expected).as_bytes(),
                     cancel: tokio_util::sync::CancellationToken::new(),
+                    published: None,
                 },
             )
             .await
@@ -899,6 +900,7 @@ pub(super) mod tests {
                     expected_size: 6,
                     expected_blake3: *blake3::hash(b"abcdef").as_bytes(),
                     cancel: tokio_util::sync::CancellationToken::new(),
+                    published: None,
                 },
             )
             .await
@@ -935,6 +937,7 @@ pub(super) mod tests {
                         expected_size: 6,
                         expected_blake3: *blake3::hash(b"abcdef").as_bytes(),
                         cancel: tokio_util::sync::CancellationToken::new(),
+                        published: None,
                     },
                 )
                 .await
@@ -1159,7 +1162,8 @@ pub(super) mod tests {
                     VerifyRequest {
                         expected_size: 6,
                         expected_blake3: hash,
-                        cancel: tokio_util::sync::CancellationToken::new()
+                        cancel: tokio_util::sync::CancellationToken::new(),
+                        published: None,
                     }
                 )
                 .await
@@ -1244,7 +1248,8 @@ pub(super) mod tests {
                     VerifyRequest {
                         expected_size: 0,
                         expected_blake3: *blake3::hash(b"").as_bytes(),
-                        cancel
+                        cancel,
+                        published: None,
                     }
                 )
                 .await

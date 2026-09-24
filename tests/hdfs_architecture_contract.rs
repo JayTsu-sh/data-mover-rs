@@ -283,6 +283,7 @@ async fn recover_tail_and_publish(
                 expected_size: payload.len() as u64,
                 expected_blake3: digest,
                 cancel: CancellationToken::new(),
+                published: None,
             },
         )
         .await?;

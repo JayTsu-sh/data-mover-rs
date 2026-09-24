@@ -277,6 +277,10 @@ pub struct VerifyRequest {
     pub expected_size: u64,
     pub expected_blake3: [u8; 32],
     pub cancel: CancellationToken,
+    /// For a destination that verifies after publication ([`VerificationPoint::AfterPublish`]):
+    /// what the publication reported, so the read can be pinned to the object it created (its
+    /// version). `None` before publication.
+    pub published: Option<PublicationEvidence>,
 }
 
 /// Evidence that staged content passed verification.
@@ -310,10 +314,25 @@ pub enum PublicationDisposition {
 }
 
 /// Evidence that staged state was published; content verification is reported separately.
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublicationEvidence {
     pub final_destination: StoragePath,
     pub disposition: PublicationDisposition,
+    /// The version the publication created, for a destination that versions its objects (an S3
+    /// `versionId`; never the literal `"null"` of an unversioned bucket).
+    pub version: Option<String>,
+}
+
+/// When read-back verification reads the destination: before publication, from the stage — or,
+/// for a destination that writes at the final name (S3), only after publication, from the final
+/// object. A failure after publication cannot be undone; it is reported with
+/// `final_destination_changed`.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerificationPoint {
+    BeforePublish,
+    AfterPublish,
 }
 
 /// Destination role owning prepare, write, checkpoint, verify, publish, and discard.
@@ -462,6 +481,10 @@ pub trait StagedDestination: Send + Sync {
         &self,
         stage: &PreparedStage,
     ) -> Result<CheckpointObservation, StorageRoleFailure>;
+    /// Reads the content back and compares it with the source's evidence. Before publication
+    /// (the default [`VerificationPoint`]) it reads the stage; a destination that verifies after
+    /// publication reads the final object, pinned by `request.published`, and is called with a
+    /// stage that is already published.
     async fn verify(
         &self,
         stage: &PreparedStage,
@@ -524,6 +547,9 @@ pub trait StagedDestination: Send + Sync {
         }
         Ok(())
     }
+    /// Makes the stage the final object. On success nothing of the stage is left at the
+    /// destination — no stage, no pointer — so a verification that fails after publication can
+    /// drop the stage without cleaning anything up.
     async fn publish(
         &self,
         stage: &PreparedStage,
@@ -533,6 +559,10 @@ pub trait StagedDestination: Send + Sync {
     /// before the staged content, so a clean-up that fails halfway never leaves a pointer that
     /// would resume the stage (ADR-0006).
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure>;
+    /// When read-back verification of `stage` happens (see [`VerificationPoint`]).
+    fn verification_point(&self, _stage: &PreparedStage) -> VerificationPoint {
+        VerificationPoint::BeforePublish
+    }
 }
 
 /// One coherent namespace operation.

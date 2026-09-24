@@ -507,6 +507,7 @@ fn published(path: &StoragePath) -> PublicationEvidence {
     PublicationEvidence {
         final_destination: path.clone(),
         disposition: PublicationDisposition::Published,
+        version: None,
     }
 }
 

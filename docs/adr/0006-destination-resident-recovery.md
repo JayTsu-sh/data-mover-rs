@@ -250,6 +250,14 @@ only when the stage is gone and the final file has the expected size and BLAKE3.
 verification (resume matrix on the Kerberos lab through the runner) is still to do; the switch
 stays off until it passes (C12c).
 
+As built (C13): a destination says when read-back verification reads it
+(`StagedDestination::verification_point(stage)`: `BeforePublish` by default, `AfterPublish` for one
+that writes at the final name — S3 from C14). For `AfterPublish` the engine applies metadata,
+publishes, then verifies the final object; a failure there — including cancellation — cannot be
+undone and is reported as a `Verify` failure with `final_destination_changed` and no stage. The
+expert destination half does the same. `PublicationEvidence` gains `version` (and becomes
+`#[non_exhaustive]`), and `TransferOutcome` gains `destination_version`.
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS

@@ -709,6 +709,7 @@ async fn verify_and_publish(
                 expected_size: fixture.payload.len() as u64,
                 expected_blake3: hash,
                 cancel: tokio_util::sync::CancellationToken::new(),
+                published: None,
             },
         )
         .await?;

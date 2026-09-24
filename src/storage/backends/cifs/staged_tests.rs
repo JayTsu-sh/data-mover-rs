@@ -416,6 +416,7 @@ async fn staged_lifecycle_flushes_verifies_and_atomically_publishes()
                     expected_size: 6,
                     expected_blake3: hash,
                     cancel: tokio_util::sync::CancellationToken::new(),
+                    published: None,
                 },
             )
             .await?
@@ -530,6 +531,7 @@ async fn cancelled_verification_fast_fails_and_preserves_the_checkpoint()
                 expected_size: 6,
                 expected_blake3: *blake3::hash(b"abcdef").as_bytes(),
                 cancel,
+                published: None,
             },
         )
         .await;

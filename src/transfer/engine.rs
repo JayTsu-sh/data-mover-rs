@@ -18,7 +18,7 @@ use crate::storage::{
     CheckpointObservation, FinalDestination, NativePair, PreflightPolicy, PrepareFact,
     PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublishRequest,
     ReadRequest, ReadSource, RestartReason, SourceDescriptor, SourceQosBudget, SourceQosStats,
-    StagedDestination, StorageRoleFailure, VerifyRequest, WriteEvidence,
+    StagedDestination, StorageRoleFailure, VerificationPoint, VerifyRequest, WriteEvidence,
 };
 use negotiation::{CopiedMetadataPlan, apply_copied_metadata, copied_metadata_plan};
 
@@ -398,6 +398,7 @@ pub(crate) struct Transferred {
 }
 
 /// Successful final outcome of one transfer attempt.
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferOutcome {
     /// The identity the transfer ran under: derived from its endpoints and paths, or the
@@ -418,6 +419,8 @@ pub struct TransferOutcome {
     pub metadata: Option<crate::metadata::MetadataApplicationReport>,
     pub route: TransferRoute,
     pub recovery: EffectiveRecovery,
+    /// The version the publication created, for a destination that versions its objects.
+    pub destination_version: Option<String>,
 }
 
 /// Transfers, optionally verifies by read-back, and publishes one request.
@@ -445,7 +448,12 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
     let route = transfer_route(transferred.data_path);
     let recovery = transferred.effective_recovery;
     let source_qos = transferred_source_qos(&transferred);
-    let transferred = if read_back == ReadBackVerification::Enabled {
+    let verify_after = read_back == ReadBackVerification::Enabled
+        && transferred
+            .destination
+            .verification_point(&transferred.stage)
+            == VerificationPoint::AfterPublish;
+    let transferred = if read_back == ReadBackVerification::Enabled && !verify_after {
         verify_transferred(transferred, cancel.clone(), source_qos)
             .await?
             .0
@@ -474,17 +482,42 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
                 .with_source_qos(source_qos));
         }
     };
-    let PublicationEvidence {
-        final_destination,
-        disposition,
-    } = publish_transferred(
+    if verify_after && (cancel.is_cancelled() || source_digest.is_none()) {
+        // Nothing is published yet: stop here, keeping the stage, rather than publish content
+        // that could not be verified afterwards.
+        return Err(TransferFailure::orchestration(
+            TransferPhase::Verify,
+            "transfer was cancelled, or has no source digest, before publication",
+        )
+        .with_stage(Arc::clone(&transferred.destination), transferred.stage)
+        .with_source_qos(source_qos));
+    }
+    let (evidence, transferred) = publish_transferred(
         transferred,
         expected_size,
         source_digest,
-        cancel,
+        cancel.clone(),
         source_qos,
     )
     .await?;
+    if verify_after {
+        verify_published(
+            &transferred.destination,
+            &transferred.stage,
+            &evidence,
+            expected_size,
+            source_digest,
+            cancel,
+        )
+        .await
+        .map_err(|failure| failure.with_source_qos(source_qos))?;
+    }
+    let PublicationEvidence {
+        final_destination,
+        disposition,
+        version: destination_version,
+        ..
+    } = evidence;
     Ok(TransferOutcome {
         identity,
         final_destination,
@@ -498,7 +531,56 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
         metadata,
         route,
         recovery,
+        destination_version,
     })
+}
+
+/// Read-back verification of content already published at its final name (a destination whose
+/// [`VerificationPoint`] is `AfterPublish`). Nothing can be rolled back any more: a failure —
+/// including cancellation — is reported with `final_destination_changed` and keeps no stage.
+pub(super) async fn verify_published(
+    destination: &Arc<dyn StagedDestination>,
+    stage: &PreparedStage,
+    published: &PublicationEvidence,
+    expected_size: u64,
+    source_digest: Option<[u8; 32]>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), TransferFailure> {
+    let changed = |mut failure: TransferFailure| {
+        failure.final_destination_changed = true;
+        failure
+    };
+    let Some(expected_blake3) = source_digest else {
+        return Err(changed(TransferFailure::orchestration(
+            TransferPhase::Verify,
+            "source digest is unavailable for verification",
+        )));
+    };
+    let verification = destination
+        .verify(
+            stage,
+            VerifyRequest {
+                expected_size,
+                expected_blake3,
+                cancel,
+                published: Some(published.clone()),
+            },
+        )
+        .await
+        .map_err(|error| {
+            changed(TransferFailure::role(
+                TransferPhase::Verify,
+                TransferSide::Destination,
+                error,
+            ))
+        })?;
+    if verification.verified_bytes != expected_size || verification.blake3 != expected_blake3 {
+        return Err(changed(TransferFailure::orchestration(
+            TransferPhase::Verify,
+            "published content differs from source evidence",
+        )));
+    }
+    Ok(())
 }
 
 /// Publishes verified staged content: marks the local record publishing (store path only),
@@ -509,7 +591,7 @@ async fn publish_transferred(
     source_digest: Option<[u8; 32]>,
     cancel: tokio_util::sync::CancellationToken,
     source_qos: SourceQosStats,
-) -> Result<PublicationEvidence, TransferFailure> {
+) -> Result<(PublicationEvidence, Transferred), TransferFailure> {
     if transferred.stage.recovery_enabled()
         && transferred.stage.uses_recovery_store()
         && let Err(error) =
@@ -558,7 +640,7 @@ async fn publish_transferred(
     {
         return Err(recovery_completion_failure(transferred, source_qos));
     }
-    Ok(evidence)
+    Ok((evidence, transferred))
 }
 
 const fn transfer_route(data_path: TransferDataPath) -> TransferRoute {
@@ -597,6 +679,7 @@ async fn verify_transferred(
                 expected_size: transferred.checkpoint.durable_prefix,
                 expected_blake3: source_blake3,
                 cancel: cancel.clone(),
+                published: None,
             },
         )
         .await;

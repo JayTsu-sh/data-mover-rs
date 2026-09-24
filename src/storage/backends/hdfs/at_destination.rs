@@ -498,6 +498,7 @@ pub(super) async fn publish(
     Ok(PublicationEvidence {
         final_destination: final_path.clone(),
         disposition: PublicationDisposition::Published,
+        version: None,
     })
 }
 

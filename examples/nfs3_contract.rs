@@ -544,6 +544,7 @@ async fn validate_recovery(source: &Storage, destination: Storage, url: &str) ->
                 expected_size: payload.len() as u64,
                 expected_blake3: hash,
                 cancel: CancellationToken::new(),
+                published: None,
             },
         )
         .await?;
