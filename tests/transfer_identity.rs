@@ -170,11 +170,9 @@ fn checkpointed_half(
     .with_transfer_policy(TransferPolicy::Checkpointed))
 }
 
-/// Two concurrent transfers of the same pair now share an identity and so a binding: while one
-/// holds the recovery lease, the other is refused before it writes anything, and the holder's
-/// stage is left intact. (Distinct caller labels used to keep them apart; with derived identities
-/// the per-file lease is what stops two writers of one destination file in one host. The lease
-/// lives in the local recovery store, which C21 removes: revisit this test then.)
+/// Two concurrent transfers of the same pair share an identity and so a binding: while one holds
+/// the destination file (the in-process lease, and Local's claim beside the file), the other is
+/// refused at prepare before it writes anything, and the holder's stage is left intact.
 #[tokio::test]
 async fn a_concurrent_transfer_of_the_same_pair_is_refused() -> TestResult {
     let source = tempfile::tempdir()?;
@@ -194,25 +192,26 @@ async fn a_concurrent_transfer_of_the_same_pair_is_refused() -> TestResult {
     let Err(failure) = refused else {
         return Err("a second transfer of the same pair was admitted".into());
     };
-    assert_eq!(
-        failure.phase(),
-        TransferPhase::RecoveryRegistration,
-        "{failure}"
-    );
-    assert!(!failure.has_recoverable_stage());
-    let stage_names = |root: &Path| -> TestResult<Vec<String>> {
-        let mut names = std::fs::read_dir(root)?
+    assert_eq!(failure.phase(), TransferPhase::Prepare, "{failure}");
+    assert!(!failure.has_unpublished_stage());
+    let artifact_suffixes = |root: &Path| -> TestResult<Vec<String>> {
+        let mut suffixes = std::fs::read_dir(root)?
             .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-            .collect::<TestResult<Vec<_>>>()?;
-        names.sort();
-        Ok(names)
+            .collect::<TestResult<Vec<_>>>()?
+            .into_iter()
+            .filter(|name| name.starts_with(".data-mover-"))
+            .filter_map(|name| name.rsplit_once('.').map(|(_, suffix)| suffix.to_owned()))
+            .collect::<Vec<_>>();
+        suffixes.sort();
+        Ok(suffixes)
     };
-    let before = stage_names(destination.path())?;
-    assert!(
-        before.iter().any(|name| name.starts_with(".data-mover-")),
-        "the holder has a stage: {before:?}"
+    // The holder's stage, pointer and claim are all still there.
+    assert_eq!(
+        artifact_suffixes(destination.path())?,
+        ["claim", "pointer", "stage"]
     );
     held.discard().await?;
+    assert_eq!(artifact_suffixes(destination.path())?, Vec::<String>::new());
     assert!(!destination.path().join("out.bin").exists());
     Ok(())
 }

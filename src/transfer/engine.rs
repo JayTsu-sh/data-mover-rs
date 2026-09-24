@@ -703,6 +703,16 @@ impl Transferred {
         self.checkpoint.durable_prefix
     }
 
+    #[cfg(test)]
+    pub(crate) const fn recovery_binding(&self) -> [u8; 32] {
+        self.stage.recovery_binding()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recovery_enabled(&self) -> bool {
+        self.stage.recovery_enabled()
+    }
+
     pub(crate) const fn data_path(&self) -> TransferDataPath {
         self.data_path
     }
@@ -1709,8 +1719,10 @@ mod plan_tests {
         Ok(())
     }
 
+    /// A publication that committed but failed before removing its pointer leaves a pointer
+    /// without a stage; the next transfer restarts instead of stranding on it.
     #[tokio::test]
-    async fn publishing_record_with_missing_stage_restarts_instead_of_stranding()
+    async fn a_pointer_left_after_publication_restarts_instead_of_stranding()
     -> Result<(), Box<dyn std::error::Error>> {
         let nonce = uuid::Uuid::new_v4();
         let source_root = std::env::temp_dir().join(format!("data-mover-publish-source-{nonce}"));
@@ -1732,9 +1744,6 @@ mod plan_tests {
             InflightLimits::new(2, 2 * 64 * 1024, 2)?,
             tokio_util::sync::CancellationToken::new(),
         )
-        .with_identity_override(crate::transfer::TransferIdentity::from_label(
-            "publishing-recovery",
-        )?)
         .with_transfer_policy(TransferPolicy::Checkpointed);
 
         let transferred = run_until_transferred(request.clone()).await?;
@@ -1745,9 +1754,8 @@ mod plan_tests {
             source_qos,
         )
         .await?;
-        crate::transfer::recovery_store::mark_publishing(transferred.stage.recovery_binding())
-            .await?;
-        transferred
+        role.fail_after_publication_commit();
+        let failed = transferred
             .destination
             .publish(
                 &transferred.stage,
@@ -1758,12 +1766,28 @@ mod plan_tests {
                 },
             )
             .await
-            .map_err(|failure| failure.error)?;
+            .err()
+            .ok_or("the injected post-commit failure")?;
+        assert!(failed.final_destination_changed);
         drop(transferred);
 
         let outcome = transfer(request).await?;
+        assert_eq!(
+            outcome.prepare,
+            PrepareFact::Restarted {
+                reason: RestartReason::PointerWithoutStage
+            }
+        );
         assert_eq!(outcome.transferred_bytes, payload.len() as u64);
         assert_eq!(std::fs::read(destination_root.join("final.bin"))?, payload);
+        // The unlocked claim the dropped stage left goes with the restarted run's artifacts.
+        for entry in std::fs::read_dir(&destination_root)? {
+            let name = entry?.file_name();
+            assert!(
+                !name.to_string_lossy().starts_with(".data-mover-"),
+                "{name:?}"
+            );
+        }
         std::fs::remove_dir_all(source_root)?;
         std::fs::remove_dir_all(destination_root)?;
         Ok(())

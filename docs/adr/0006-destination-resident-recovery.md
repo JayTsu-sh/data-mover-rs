@@ -168,6 +168,26 @@ old path reports its facts too: a recovered stage is `Resumed`, a published reco
 is `Restarted { PointerWithoutStage }`, an atomic replace that discarded a stage is
 `Restarted { Requested }`. `TransferOutcome` gains `prepare` and `reused_bytes`.
 
+As built (C8, Local): the Local destination keeps its recovery state beside the final file:
+`.data-mover-<d>.stage`, `.data-mover-<d>.pointer` (the pointer is the checkpoint record: `DMDPTR01`
+with a durable prefix and the extension `DMLSTG03`; a pointer without either is refused and cleaned
+as corrupt, so a possibly sparse stage length is never a resume offset) and `.data-mover-<d>.claim`,
+flock'd from prepare until the stage is published or discarded. Prepare takes the claim before
+discovery (a held claim → `Conflict` / transient; after locking, the claim's inode is compared with
+the name so a lock on an unlinked claim does not count), opens artifact names only as regular files
+(a symlink or directory there → `Conflict`), and on resume truncates the stage to the pointer's prefix
+and restores its owner's write permission (metadata applied before a crash may have removed it). The
+pointer is written only after the stage's data is synced, through the fixed `.tmp`, which is removed
+before an exclusive create so a planted symlink is never written through. Publication renames the
+stage over the final file, then removes the pointer, the temporary and the claim, and lets the claim go
+only once nothing else can fail; a clean-up by a stage that no longer holds its claim removes nothing.
+The claim is per kernel: Local paths on network or drvfs mounts rely on the caller contract and the
+in-process lease. The old Local `recover` / DMLRCV01 path is no longer reached (removed in C8d).
+A second concurrent transfer of one Local file now fails at `Prepare` (`Conflict`, transient) where
+it used to fail at `RecoveryRegistration`. `Direct` writes the final file in place and does not look
+at the artifacts; a stage an earlier checkpointed run left, and random-name stages from before C8,
+stay until a checkpointed run of the same file or the reserved-name sweep (C9) removes them.
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS

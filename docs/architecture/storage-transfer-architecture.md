@@ -555,6 +555,8 @@ durability. Other protocols may retain their required persistence operations. It
 recovery control accepted from terrasync. Data-mover selects the effective behavior after route and
 source-read planning and reports it as `EffectiveRecovery`.
 
+(Local no longer takes this path since ADR-0006 C8 — see "Local destination-resident recovery" below;
+this paragraph and the next describe the destinations that still use the local recovery store.)
 For eligible multi-source-chunk streaming with `Checkpointed`, data-mover opens its private recovery store,
 exclusively claims the transfer binding, recovers or prepares backend-owned staged state, and
 atomically persists the backend's versioned opaque identity. Ordinary Local, NFS and HDFS defer registration until
@@ -750,6 +752,12 @@ EOF boundaries so pNFS layout synchronization remains protocol-owned.
 
 `TransferRequest::with_read_back_verification` selects `ReadBackVerification::Enabled` or `Disabled`. Outcomes carry that selection and `blake3: Option<[u8; 32]>`; `None` explicitly means destination read-back was not performed. The expert interface continues to require verified evidence.
 
+
+Local destination-resident recovery (ADR-0006 C8): Local no longer uses the local recovery store or
+`RecoveryIdentity`. Its stage, pointer and claim sit beside the final file under deterministic names
+(`.data-mover-<digest>.{stage,pointer,claim}`); the pointer is the checkpoint record and carries the
+durable prefix; the flock'd claim is held from prepare until publication or discard. The random-name
+layout below still describes NFS and CIFS until they move (C10, C11).
 
 Local/NFS artifact naming follow-up: new stages use the shared
 `.data-mover-<destination-path-hash-16>-<uuid-32>.stage` base name in the final parent.

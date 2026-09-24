@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::PrepareFact;
 use crate::transfer::{EffectiveRecovery, ReadBackVerification};
 
 #[tokio::test]
@@ -154,8 +155,10 @@ async fn assert_automatic_resume(
     Ok(())
 }
 
+/// A second transfer of a final file that another one is writing is refused before it touches
+/// anything, and the first one's stage and pointer survive for it to resume.
 #[tokio::test]
-async fn losing_deferred_registration_does_not_delete_the_winners_record()
+async fn a_losing_concurrent_transfer_does_not_touch_the_winners_stage()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("auto-competing-source")?;
     let destination_root = TestRoot::new("auto-competing-destination")?;
@@ -163,9 +166,8 @@ async fn losing_deferred_registration_does_not_delete_the_winners_record()
     std::fs::write(source_root.path().join("source.bin"), &payload)?;
     std::fs::write(destination_root.path().join("final.bin"), b"old")?;
     let (source_a, role_a) = test_source_storage(source_root.path(), "auto-competing-source")?;
-    let (source_b, role_b) = test_source_storage(source_root.path(), "auto-competing-source")?;
+    let (source_b, _) = test_source_storage(source_root.path(), "auto-competing-source")?;
     let gate_a = role_a.gate_read_at(0);
-    let gate_b = role_b.gate_read_at(0);
     let (destination, role) =
         test_destination_storage_with_role(destination_root.path(), "auto-competing-destination")?;
     role.set_automatic_checkpoint_interval(128 * 1024);
@@ -182,23 +184,27 @@ async fn losing_deferred_registration_does_not_delete_the_winners_record()
     )?
     .with_transfer_policy(TransferPolicy::Checkpointed);
     let first = tokio::spawn(run_until_transferred(request_a.clone()));
-    let second = tokio::spawn(transfer(request_b));
     tokio::time::timeout(Duration::from_secs(5), gate_a.wait_started()).await?;
-    tokio::time::timeout(Duration::from_secs(5), gate_b.wait_started()).await?;
+    let loser = tokio::time::timeout(Duration::from_secs(5), transfer(request_b))
+        .await?
+        .err()
+        .ok_or("the per-file lease must refuse a second writer")?;
+    assert_eq!(loser.phase(), TransferPhase::Prepare);
+    assert!(!loser.has_unpublished_stage());
     gate_a.release();
     let winner = tokio::time::timeout(Duration::from_secs(5), first).await???;
-    gate_b.release();
-    let loser = tokio::time::timeout(Duration::from_secs(5), second)
-        .await??
-        .err()
-        .ok_or("registration lease must conflict")?;
-    assert_eq!(loser.phase(), TransferPhase::Transfer);
-    loser.discard_stage().await?;
+    assert!(staging_entry_count(destination_root.path())? > 0);
     drop(winner);
     let writes_before = role.write_completion_count();
     gate_a.release();
     let outcome = tokio::time::timeout(Duration::from_secs(5), transfer(request_a)).await??;
     assert_eq!(outcome.recovery, EffectiveRecovery::Checkpointed);
+    assert_eq!(
+        outcome.prepare,
+        PrepareFact::Resumed {
+            bytes: payload.len() as u64
+        }
+    );
     assert_eq!(role.write_completion_count(), writes_before);
     assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,

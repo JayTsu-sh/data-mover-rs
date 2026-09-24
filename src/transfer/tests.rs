@@ -18,13 +18,13 @@ use crate::model::{
 };
 
 use crate::model::StoragePath;
-use crate::storage::PublicationDisposition;
 use crate::storage::RecoveryIdentity;
 use crate::storage::Storage;
 use crate::storage::backends::local::{
     source::LocalReadSource, test_destination_storage, test_destination_storage_with_role,
     test_source_storage, test_unsupported_storage,
 };
+use crate::storage::{PrepareFact, PublicationDisposition, RestartReason};
 
 fn observed<T>(value: T) -> MetadataObservation<T> {
     MetadataObservation::Value {
@@ -614,6 +614,13 @@ async fn enabled_identity_reuses_a_reobserved_complete_local_prefix()
     .await?;
 
     assert_eq!(outcome.transferred_bytes, payload.len() as u64);
+    assert_eq!(
+        outcome.prepare,
+        PrepareFact::Resumed {
+            bytes: payload.len() as u64
+        }
+    );
+    assert_eq!(outcome.reused_bytes, payload.len() as u64);
     assert_eq!(role.write_completion_count(), writes_before_resume);
     assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,
@@ -676,6 +683,7 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
     // A request built afresh, with no label, derives the interrupted transfer's identity and
     // resumes it: only the two chunks after the durable prefix are written.
     assert_eq!(outcome.identity, interrupted_identity);
+    assert_eq!(outcome.prepare, PrepareFact::Resumed { bytes: 64 * 1024 });
     assert_eq!(destination_role.write_completion_count() - writes_before, 2);
     assert_eq!(outcome.source_qos.logical_bytes, payload.len() as u64);
     assert_eq!(
@@ -736,7 +744,7 @@ async fn recovery_restarts_after_same_size_source_edit() -> Result<(), Box<dyn s
             .set_modified(original_mtime)?;
         #[cfg(not(unix))]
         let _ = original_mtime;
-        transfer(
+        let outcome = transfer(
             recoverable_request(
                 transfer_request(
                     local_source(source_root.path())?,
@@ -748,6 +756,12 @@ async fn recovery_restarts_after_same_size_source_edit() -> Result<(), Box<dyn s
             .with_read_back_verification(verification),
         )
         .await?;
+        assert_eq!(
+            outcome.prepare,
+            PrepareFact::Restarted {
+                reason: RestartReason::BindingChanged
+            }
+        );
         assert_eq!(destination_role.write_completion_count() - writes_before, 3);
         assert_eq!(
             std::fs::read(destination_root.path().join("final.bin"))?,
@@ -791,6 +805,12 @@ async fn quick_discards_persisted_stage_before_reupload() -> Result<(), Box<dyn 
 
     assert_eq!(outcome.recovery, super::engine::EffectiveRecovery::Disabled);
     assert_eq!(
+        outcome.prepare,
+        PrepareFact::Restarted {
+            reason: RestartReason::Requested
+        }
+    );
+    assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,
         payload
     );
@@ -799,7 +819,7 @@ async fn quick_discards_persisted_stage_before_reupload() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
-async fn one_recovery_binding_can_have_only_one_active_attempt()
+async fn a_second_concurrent_transfer_is_refused_at_prepare()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("claim-source")?;
     let destination_root = TestRoot::new("claim-destination")?;
@@ -839,18 +859,55 @@ async fn one_recovery_binding_can_have_only_one_active_attempt()
         tokio::join!(transfer(first_request), transfer(second_request));
     let successes = usize::from(first_result.is_ok()) + usize::from(second_result.is_ok());
     assert_eq!(successes, 1);
-    let failure = if let Err(error) = first_result {
-        error
-    } else if let Err(error) = second_result {
-        error
-    } else {
-        return Err("both concurrent recoveries unexpectedly succeeded".into());
+    let ((Ok(winner), Err(failure)) | (Err(failure), Ok(winner))) = (first_result, second_result)
+    else {
+        return Err("exactly one of two concurrent transfers must succeed".into());
     };
-    assert_eq!(failure.phase(), TransferPhase::RecoveryRegistration);
+    // The run dropped above left its whole stage and pointer; the winner resumes them.
+    assert_eq!(
+        winner.prepare,
+        PrepareFact::Resumed {
+            bytes: payload.len() as u64
+        }
+    );
+    assert_eq!(failure.phase(), TransferPhase::Prepare);
+    assert!(!failure.has_unpublished_stage());
     assert_eq!(
         std::fs::read(destination_root.path().join("final.bin"))?,
         payload
     );
+    Ok(())
+}
+
+/// Local keeps its recovery state at the destination (ADR-0006 C8): neither an interrupted
+/// transfer nor its resume leaves anything in the local recovery store.
+#[tokio::test]
+async fn a_local_transfer_never_touches_the_local_recovery_store()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = TestRoot::new("no-store-source")?;
+    let destination_root = TestRoot::new("no-store-destination")?;
+    let payload = vec![0x44; 3 * 64 * 1024 + 5];
+    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    let (destination, role) =
+        test_destination_storage_with_role(destination_root.path(), "no-store-destination")?;
+    role.set_automatic_checkpoint_interval(64 * 1024);
+    let request = || -> Result<TransferRequest, Box<dyn std::error::Error>> {
+        Ok(transfer_request(
+            local_source(source_root.path())?,
+            destination.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        )?
+        .with_transfer_policy(TransferPolicy::Checkpointed))
+    };
+    let interrupted = run_until_transferred(request()?).await?;
+    let binding = interrupted.recovery_binding();
+    assert!(interrupted.recovery_enabled());
+    drop(interrupted);
+    assert!(!super::recovery_store::has_entry(binding));
+    let outcome = transfer(request()?).await?;
+    assert!(matches!(outcome.prepare, PrepareFact::Resumed { .. }));
+    assert!(!super::recovery_store::has_entry(binding));
+    assert_eq!(staging_entry_count(destination_root.path())?, 0);
     Ok(())
 }
 

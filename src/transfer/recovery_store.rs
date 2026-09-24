@@ -123,6 +123,13 @@ fn mark_publishing_sync(binding: [u8; 32]) -> Result<(), RecoveryRegistrationFai
     .map_err(|_| RecoveryRegistrationFailure::unavailable())
 }
 
+/// Whether the store holds anything for `binding`: a record or its lease file.
+#[cfg(test)]
+pub(super) fn has_entry(binding: [u8; 32]) -> bool {
+    let root = recovery_root();
+    record_path(&root, binding).exists() || lock_path(&root, binding).exists()
+}
+
 fn recovery_root() -> PathBuf {
     if let Some(path) = std::env::var_os("DATA_MOVER_RECOVERY_DIR").filter(|path| !path.is_empty())
     {
