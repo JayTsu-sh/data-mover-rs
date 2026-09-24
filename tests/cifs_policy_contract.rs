@@ -58,9 +58,10 @@ async fn real_share_checkpointed_and_atomic_replace_roundtrip() -> Result {
                 )?;
                 let copied =
                     roundtrip(&local, &remote, &destination, &name, &payload, policy).await;
-                let cleanup = cleanup_case(&share, &name).await;
+                let artifacts = cleanup_case(&share, &name).await;
                 copied?;
-                cleanup?;
+                // A case that succeeded leaves nothing beside its files (ADR-0006).
+                assert_eq!(artifacts?, 0, "{name}: transfer artifacts left behind");
             }
         }
         Ok(())
@@ -180,15 +181,31 @@ async fn roundtrip(
     Ok(())
 }
 
-async fn cleanup_case(share: &smb_domain::Share, name: &str) -> Result {
+/// The artifact-name digest of a final name (ADR-0006: the first 16 bytes of
+/// `blake3("data-mover/artifact-name/v1\0" ‖ u64le(len) ‖ name)`, in hex).
+fn artifact_prefix(final_name: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"data-mover/artifact-name/v1\0");
+    hasher.update(&(final_name.len() as u64).to_le_bytes());
+    hasher.update(final_name.as_bytes());
+    format!(".data-mover-{}.", &hasher.finalize().to_hex()[..32])
+}
+
+/// Removes a case's files and any transfer artifact named after them; returns how many artifacts
+/// there were.
+async fn cleanup_case(share: &smb_domain::Share, name: &str) -> Result<usize> {
     let names = [name.to_owned(), format!("{name}-copied")];
+    // The random names stages had before ADR-0006, in case a regression brings them back.
     let prefixes: Vec<_> = names
         .iter()
-        .map(|path| {
-            format!(
-                ".data-mover-{}-",
-                &blake3::hash(path.as_bytes()).to_hex()[..16]
-            )
+        .flat_map(|path| {
+            [
+                artifact_prefix(path),
+                format!(
+                    ".data-mover-{}-",
+                    &blake3::hash(path.as_bytes()).to_hex()[..16]
+                ),
+            ]
         })
         .collect();
     let directory = share
@@ -201,16 +218,17 @@ async fn cleanup_case(share: &smb_domain::Share, name: &str) -> Result {
     let closed = directory.close().await;
     let entries = entries?;
     confirmed(closed?)?;
+    let mut artifacts = 0;
     for entry in entries {
-        if names.iter().any(|name| name == entry.name())
-            || prefixes
-                .iter()
-                .any(|prefix| entry.name().starts_with(prefix))
-        {
+        let artifact = prefixes
+            .iter()
+            .any(|prefix| entry.name().starts_with(prefix));
+        if artifact || names.iter().any(|name| name == entry.name()) {
+            artifacts += usize::from(artifact);
             delete_file(share, entry.name()).await?;
         }
     }
-    Ok(())
+    Ok(artifacts)
 }
 
 async fn delete_file(share: &smb_domain::Share, path: &str) -> Result {

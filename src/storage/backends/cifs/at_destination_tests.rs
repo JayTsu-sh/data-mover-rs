@@ -364,3 +364,12 @@ async fn the_pointer_follows_a_flush_on_both_writers() -> TestResult {
     }
     Ok(())
 }
+
+/// CIFS keeps its recovery state at the destination: the engine routes it through
+/// `prepare_at_destination` and never through the local recovery store (ADR-0006 C11c).
+#[test]
+fn cifs_keeps_recovery_at_the_destination() -> TestResult {
+    let (protocol, backend) = share()?;
+    assert!(adapter(&protocol, &backend).recovery_at_destination());
+    Ok(())
+}

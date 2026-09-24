@@ -30,13 +30,14 @@ CIFS_REAL_GUEST_POLICY=allow-unsigned   # 可选，对匿名/guest share 跑契�
 因为测试账号是本地用户、不经过 DC。这一档也不在 `run.py` 的默认步骤里 (`.env` 不设
 `CIFS_REAL_GUEST_POLICY`)。详见 `.claude/docs/storage-cifs.md` 的"真实环境证据"表。
 
-`DATA_MOVER_RECOVERY_DIR` 未设置时 runner 自动创建临时目录。
+恢复状态在目的端（ADR-0006 C11）：不需要 `DATA_MOVER_RECOVERY_DIR`；每个用例成功后断言最终文件旁没有
+`.data-mover-*` 残留。
 
 ## 步骤
 
 1. `cargo build --release --example cifs_mount_comparison`
 2. `cargo test --release --test cifs_policy_contract -- --ignored --nocapture`
-   - Checkpointed：checkpoint 落盘、claim、按记录前缀恢复
+   - Checkpointed：指针在目的端、按记录前缀续传、成功后无 artifact 残留
    - AtomicReplace：stage 关闭后原子 rename 发布
    - 目录 / 文件 mtime 复制、ACL best-effort
 3. `cargo test --release --test cifs_namespace_contract -- --ignored --nocapture`
@@ -67,4 +68,5 @@ RUST_LOG=smb=trace ...   # 加上原始帧，定位未知 NTSTATUS 时需要
 - 认证失败 → 只支持 NTLM；检查 CIFS_REAL_USER / CIFS_REAL_PASS
 - 服务器要求签名而失败 → `CifsSigningPolicy::Required`，见 `.claude/docs/storage-cifs.md` "签名策略"
 - 句柄泄漏 (长跑后 hang) → `protocol.rs` 的 `close_resource` 检查
-- 恢复失败 → 检查 `DATA_MOVER_RECOVERY_DIR` 可写且两次运行一致
+- 续传不生效 → 看最终文件旁 `.data-mover-<d>.pointer` 是否在、`prepare` 是否报 Restarted 及原因；
+  跑 `DEST=smb: bash .claude/skills/_shared/resume_matrix.sh`

@@ -6,7 +6,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -37,9 +36,6 @@ def main() -> int:
         if key in env:
             child_env[key] = env[key]
     child_env.setdefault("CIFS_REAL_SECOND_SERVER", child_env["CIFS_REAL_SERVER"])
-    child_env.setdefault(
-        "DATA_MOVER_RECOVERY_DIR", tempfile.mkdtemp(prefix="data-mover-cifs-recovery-")
-    )
 
     # role-based 传输入口必须能编译；实际传输由 policy contract 覆盖。
     run(

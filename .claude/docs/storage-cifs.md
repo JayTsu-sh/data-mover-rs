@@ -182,6 +182,22 @@ result
 
 ### Staged destination 与恢复
 
+**目的端恢复（ADR-0006 C11，`src/storage/backends/cifs/at_destination.rs`）**：`recovery_at_destination()`
+为 true，引擎只经 `prepare_at_destination`，运行 data-mover 的机器上什么都不存。与 NFS 同一设计：
+- 最终文件旁 `.data-mover-<d>.stage` / `.pointer`（+ 固定 `.pointer.tmp`），**没有 claim 文件**（smb-rs 门面没有
+  share mode / lease 控制；用 share mode 做跨主机 claim 是后续，需新 API + D9 升级）。
+- 指针 = `DMDPTR01{binding, 传输标识, 持久前缀, "DMCSTG01" ‖ 16 字节 nonce}`，只在 stage FLUSH 之后写（两个写者在
+  记录前缀前都 FLUSH，不论 durable_publication）；经 `checkpoint::write_record`（建、写、FLUSH、关）再 rename 覆盖。
+- nonce 围栏同 NFS：续传先重写指针接管；之后每次重写指针、发布 rename 前、清理前读回比对，不同 → `Conflict`（永久）。
+- **不截断**：门面不能设 EOF，续传从前缀重写到源大小。stage 只有被 data-mover 之外的东西写过才会更长（绑定钉住
+  源大小）；开读回校验时报 Corruption 被 `54f7bfb` 清理，**关读回时多出的尾巴会被发布** —— 待补：prepare 时拒绝
+  比源大的 stage。升级前在途的旧格式 CIFS 传输不会续传，需排空（D6）。
+- `stat` 用 `open_metadata`（只读属性、不跟随链接，reparse point 被门面拒绝 → 不是普通文件）；读指针按 stat 的大小
+  精确读（SMB 在文件尾读报错，不返回空）。
+- 最终路径含 `\`、`:`、空 / `.` / `..` 段或 artifact 段 → `InvalidInput`（C11a）。
+- 真机：FAS2750 e2e-cifs ×2、resume_matrix 192 MiB cancel / SIGKILL 已验（2026-09-25）。
+- 下面描述的随机名 stage / DMCCKP01 / claim rename 是旧路径（C11d 删除）。
+
 - 与 NFS 共用 `Checkpointed` / `AtomicReplace` 策略，CIFS 不支持 `Direct`。
 - stage 位于最终文件的父目录，采用共享的 `.data-mover-<target-hash>-<uuid>.stage` 命名。
 - `Checkpointed` 默认间隔 64 MiB；文件大于间隔且源端多块时延迟建立恢复记录。

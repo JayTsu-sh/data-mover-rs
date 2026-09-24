@@ -215,6 +215,21 @@ cache forget the path and everything below it (C10a). Verified on ONTAP NFSv4.1 
 matrix); NFSv3 on real hardware is still open. The old NFS random-name stage, `DMNCKP01` checkpoint,
 `DMNRCV03` recover and claim rename are no longer reached (removed in C10d).
 
+As built (C11, CIFS): the same design as NFS — `.data-mover-<d>.stage` and `.pointer` beside the
+final file, no claim file, a `DMCSTG01 ‖ nonce` fence. The smb-rs facade offers no share-mode or lease
+control, so a server-enforced claim (a handle opened without sharing, dying with its session) is a
+follow-up that needs a new facade API. The pointer records only flushed bytes (both writers FLUSH
+before it, whether or not publication asks for durability). The facade cannot shorten a file, so a
+resume does not truncate: the writer rewrites from the prefix to the source's size. A stage can only
+be longer than that if something outside data-mover wrote to it (the binding pins the source size,
+and the writers stop there); with read-back verification such a stage fails as `Corruption` and is
+cleaned up, without it the extra tail would be published — a missing safeguard to add (refuse a stage
+longer than the source at prepare). CIFS transfers in flight at the upgrade (random-name stages,
+`.checkpoint`, `.claim-*`, local store records) are not resumed: drain before upgrading (D6). Artifact names are checked
+without following links (`open_metadata`: a reparse point is not a regular file). Final paths with a
+backslash, a colon, or an empty, `.`, `..` or artifact segment are refused (C11a). Verified on the
+FAS2750: e2e-cifs twice and the resume matrix (192 MiB, cancel and SIGKILL, local state wiped).
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS

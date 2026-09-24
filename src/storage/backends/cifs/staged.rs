@@ -343,6 +343,10 @@ impl StagedDestination for CifsStagedDestination {
         })
     }
 
+    fn recovery_at_destination(&self) -> bool {
+        true
+    }
+
     async fn prepare_at_destination(
         &self,
         request: crate::storage::DestinationPrepareRequest,
