@@ -1,8 +1,8 @@
 //! Transfer identity and recovery binding (ADR-0006 identity layers 2 and 3).
 //!
-//! The transfer identity names "this source file goes to that destination file". data-mover derives
-//! it from the two canonical endpoints and paths, so a process with no local state computes the same
-//! value for the same pair. The recovery binding adds what the source looked like when a stage was
+//! The transfer identity names "this source file (this version of it) goes to that destination
+//! file". data-mover derives it from the two canonical endpoints and paths and the source version
+//! selector, so a process with no local state computes the same value for the same pair. The recovery binding adds what the source looked like when a stage was
 //! written; a stored binding that differs from the current one means restart, not resume.
 //!
 //! Every variable-length field is length-prefixed, and each hash has its own domain prefix: a derived
@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use crate::model::{BackendIdentity, EntryIdentityKey, StoragePath};
+use crate::model::{BackendIdentity, EntryIdentityKey, SourceVersion, StoragePath};
 
 use super::model::TransferValueError;
 
@@ -19,12 +19,14 @@ const DERIVED_DOMAIN: &[u8] = b"data-mover/transfer-identity/v1\0";
 const LABEL_DOMAIN: &[u8] = b"data-mover/transfer-identity/override/v1\0";
 const BINDING_DOMAIN: &[u8] = b"data-mover/recovery-binding/v3\0";
 
-/// Which version of the source a transfer copies. Only the current version exists until source
-/// version selection lands (ADR-0006 C6), which adds a selector with its own, non-zero tag.
+/// The selector tags: `Current` is one byte, a named version its own tag and length-prefixed id, so
+/// no version id — not even one spelled "current" — can equal `Current`.
 const CURRENT_VERSION_TAG: u8 = 0x00;
+const NAMED_VERSION_TAG: u8 = 0x01;
 
-/// A stable 32-byte name for one logical transfer: which source file goes to which destination
-/// file. It does not change across attempts, reschedules or source updates.
+/// A stable 32-byte name for one logical transfer: which source file — and which selected version of
+/// it — goes to which destination file. It does not change across attempts, reschedules or source
+/// updates.
 ///
 /// It is not secret — it hashes endpoints and paths, never credentials — and displays as 64
 /// lowercase hex digits.
@@ -32,13 +34,14 @@ const CURRENT_VERSION_TAG: u8 = 0x00;
 pub struct TransferIdentity([u8; 32]);
 
 impl TransferIdentity {
-    /// Derives the identity of copying the current version of `source_path` on `source` to
+    /// Derives the identity of copying `source_version` of `source_path` on `source` to
     /// `final_path` on `destination`. The endpoints are the canonical ones data-mover derives from
     /// the backend configuration; the paths are taken literally.
     #[must_use]
     pub fn derive(
         source: &BackendIdentity,
         source_path: &StoragePath,
+        source_version: &SourceVersion,
         destination: &BackendIdentity,
         final_path: &StoragePath,
     ) -> Self {
@@ -46,7 +49,15 @@ impl TransferIdentity {
         hasher.update(DERIVED_DOMAIN);
         update_endpoint(&mut hasher, source);
         update_field(&mut hasher, source_path.as_str().as_bytes());
-        hasher.update(&[CURRENT_VERSION_TAG]);
+        match source_version {
+            SourceVersion::Current => {
+                hasher.update(&[CURRENT_VERSION_TAG]);
+            }
+            SourceVersion::Id(version) => {
+                hasher.update(&[NAMED_VERSION_TAG]);
+                update_field(&mut hasher, version.as_bytes());
+            }
+        }
         update_endpoint(&mut hasher, destination);
         update_field(&mut hasher, final_path.as_str().as_bytes());
         Self(*hasher.finalize().as_bytes())

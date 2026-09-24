@@ -28,6 +28,7 @@ mod native;
 mod negotiation;
 mod positioned;
 mod single;
+mod version;
 pub use expert::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertDestinationTransferred,
     ExpertSourceEvidence, ExpertSourceOffer, ExpertSourcePayload, ExpertSourceRequest,
@@ -790,10 +791,10 @@ async fn describe_source(
             "transfer was cancelled",
         ));
     }
-    // C6c lets the request select a version; until then every transfer copies `Current`, which a
-    // versioned source pins at this describe.
+    version::preflight_source_version(request, source)?;
+    // A versioned source pins the version it describes, `Current` included.
     let descriptor = source
-        .describe_version(&request.source_path, &SourceVersion::Current)
+        .describe_version(&request.source_path, &request.source_version)
         .await
         .map_err(|error| {
             TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)

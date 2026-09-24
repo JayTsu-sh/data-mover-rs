@@ -76,16 +76,19 @@ its lease, the `Publishing` state, `recover` / `RecoverRequest` / `RecoveryIdent
    `storage::endpoint_identity(&BackendConfig)` derives it without connecting (C4b).
 2. **TransferIdentity**, derived by default:
    `blake3(source endpoint, source path, source version selector, destination endpoint, final path)`.
-   It names "this file goes to that file" for logs, reports and caller records, and excludes the source
-   version, so it is stable across reschedules and source updates. A caller may override it, which
+   It names "this file goes to that file" for logs, reports and caller records. It includes the
+   selector (`Current` or a named version) but not the version `Current` resolves to, so it is stable
+   across reschedules and source updates. A caller may override it, which
    opts out of cross-job resume.
    Encoding (C5, `src/transfer/identity.rs`): `blake3("data-mover/transfer-identity/v1\0" ‖ source kind
    ‖ source endpoint ‖ source path ‖ selector ‖ destination kind ‖ destination endpoint ‖ final path)`,
-   every variable field prefixed with its u64 little-endian length; paths are literal; `Current` is the
-   selector byte `0x00`. An override is
+   every variable field prefixed with its u64 little-endian length; paths are literal; the selector is
+   `0x00` for `Current` and `0x01 ‖ len(versionId) ‖ versionId` for `Id` (C6c), so adding it changed
+   no `Current` identity. An override is
    `blake3("data-mover/transfer-identity/override/v1\0" ‖ len(label) ‖ label)`; the two domains
    differ, so an override can never equal a derived identity. 32 bytes, shown as 64 lowercase hex digits; it holds no
-   credentials. A frozen test vector, computed independently of the code, pins the encoding.
+   credentials. Frozen test vectors (`Current`, a named version, `"null"`, a label), computed independently
+   of the code, pin the encoding.
 3. **Recovery binding**: `TransferIdentity` + the source path and observed identity + size + content
    version + the destination. It is stored inside the destination pointer and decides resume versus restart.
    Binding v3 (C5): `blake3("data-mover/recovery-binding/v3\0" ‖ identity ‖ source path ‖ source
@@ -106,6 +109,17 @@ its lease, the `Publishing` state, `recover` / `RecoverRequest` / `RecoveryIdent
 HEAD and native copy are pinned to it). The selector is encoded with a tag byte in the identity, so no
 versionId can collide with `Current`. Non-S3 sources accept only `Current`; `Id` fails with
 `Unsupported` before any destination write. A deleted version is a per-entry `NotFound`.
+As built (C6b/C6c): `TransferRequest::with_source_version` (an identity override wins in either
+order); the engine checks at preflight that an `Id` is well formed (non-empty, ≤ 1024 bytes, no NUL →
+`InvalidInput`) and that the source keeps versions (`Unsupported`). `Current` pins only a real
+versionId — an object without one (none, empty, `"null"`) stays guarded by its ETag. `Id("null")` is
+sent as is. A delete marker answers a versioned HEAD with 405 and becomes a per-entry `NotFound`; a
+store that answers `Id(v)` with another version is refused (`Unsupported`) rather than copied under
+the wrong name. Known limit: an id that passes preflight but the store rejects as malformed (MinIO
+wants a UUID) answers the versioned HEAD with a bare 400, which carries no code and so keeps the
+session-level mapping — S3 answers expired tokens and wrong regions with 400 too. One mistyped id
+therefore fails the session, not just its entry. Follow-up: on a versioned HEAD 400, repeat the
+request as a ranged GET, whose error body names `InvalidArgument`.
 History migration (documented, not a feature): the caller submits `Id` transfers oldest to newest,
 one at a time; each creates one destination version; delete-marker replication is the caller's choice.
 

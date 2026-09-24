@@ -387,7 +387,8 @@ cancellation, inflight bounds, and optional shared source QoS.
 
 `TransferIdentity` names one logical transfer — this source file to that destination file — and is
 stable across attempts; it is not a job ID and contains no backend state. data-mover derives it
-(ADR-0006, C5) from the source endpoint and path and the destination endpoint and final path, so a
+(ADR-0006, C5/C6) from the source endpoint, path and version selector and the destination endpoint
+and final path, so a
 process with no state of its own names the same transfer; `with_identity_override` replaces it with a
 caller label. The expert destination session derives it from the `ObservedEntry` it receives; the
 expert source session takes none. Every execution receives a distinct attempt

@@ -6,6 +6,7 @@ mod identity;
 mod model;
 mod recovery_store;
 
+pub use crate::model::SourceVersion;
 pub use crate::storage::{SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError};
 pub use engine::{
     EffectiveRecovery, ExpertDestinationRequest, ExpertDestinationSession,
@@ -25,5 +26,7 @@ mod hdfs_policy_tests;
 mod hdfs_tests;
 #[cfg(test)]
 mod s3_native_tests;
+#[cfg(test)]
+mod source_version_tests;
 #[cfg(test)]
 mod tests;

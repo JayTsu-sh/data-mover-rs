@@ -14,6 +14,9 @@
 //! (`DATA_MOVER_RECOVERY_DIR`) survived; ADR-0006 moves them to the destination. `--identity`
 //! replaces the derived identity with a label, which a resume must then repeat.
 //!
+//! `--source-version <versionId>` copies one stored version of an S3 source; the selector is part of
+//! the derived identity, so a resume must repeat it.
+//!
 //! The identity goes to stderr as soon as the request is built, so a run killed before it reports
 //! still leaves it behind, and into the stdout line as `identity`.
 //!
@@ -34,8 +37,8 @@ use clap::{Parser, ValueEnum};
 use data_mover::model::StoragePath;
 use data_mover::storage::{Storage, create_directory_all};
 use data_mover::transfer::{
-    InflightLimits, ReadBackVerification, SourceQosGroup, SourceQosPolicy, TransferFailure,
-    TransferIdentity, TransferOutcome, TransferPolicy, TransferRequest, transfer,
+    InflightLimits, ReadBackVerification, SourceQosGroup, SourceQosPolicy, SourceVersion,
+    TransferFailure, TransferIdentity, TransferOutcome, TransferPolicy, TransferRequest, transfer,
 };
 use endpoint_support::{Result, artifacts, connect, remove_run};
 use serde_json::{Value, json};
@@ -64,6 +67,10 @@ struct Args {
     /// Override the derived transfer identity with this label; a resume must repeat it.
     #[arg(long)]
     identity: Option<String>,
+    /// Copy this stored version of an S3 source (its versionId) instead of the current object.
+    /// Any other source fails at preflight, before the destination is touched.
+    #[arg(long)]
+    source_version: Option<String>,
     /// Hard limit on source read bandwidth, so an interruption lands mid-transfer.
     #[arg(long)]
     bandwidth: Option<u64>,
@@ -164,6 +171,9 @@ fn request(
         OnOff::On => ReadBackVerification::Enabled,
         OnOff::Off => ReadBackVerification::Disabled,
     });
+    if let Some(version) = &args.source_version {
+        request = request.with_source_version(SourceVersion::Id(version.clone()));
+    }
     if let Some(label) = &args.identity {
         request = request.with_identity_override(TransferIdentity::from_label(label.as_str())?);
     }
@@ -256,12 +266,17 @@ async fn main() -> Result {
     let started = Instant::now();
     let request = request(&args, source, (destination, destination_path), cancel)?;
     let identity = request.identity().to_string();
-    eprintln!("{}", json!({ "event": "start", "identity": identity }));
+    let source_version = args.source_version.clone();
+    eprintln!(
+        "{}",
+        json!({ "event": "start", "identity": identity, "source_version": source_version })
+    );
     let result = transfer(request).await;
     let mut line = report(&result, started.elapsed().as_millis());
     if let (Some(line), Some(endpoints)) = (line.as_object_mut(), endpoints.as_object()) {
         line.extend(endpoints.clone());
         line.insert("identity".to_string(), Value::String(identity));
+        line.insert("source_version".to_string(), json!(source_version));
     }
     println!("{line}");
     if result.is_err() {

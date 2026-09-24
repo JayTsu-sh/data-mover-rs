@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::model::StoragePath;
+use crate::model::{SourceVersion, StoragePath};
 use crate::storage::{RecoveryIdentity, SourceQosGroup, Storage};
 
 use super::TransferIdentity;
@@ -170,6 +170,9 @@ impl InflightLimits {
 #[derive(Clone)]
 pub struct TransferRequest {
     pub(crate) identity: TransferIdentity,
+    /// Whether `identity` is a caller override, which a source version must not re-derive.
+    identity_overridden: bool,
+    pub(crate) source_version: SourceVersion,
     pub(crate) source: Storage,
     pub(crate) source_path: StoragePath,
     pub(crate) destination: Storage,
@@ -256,11 +259,14 @@ impl TransferRequest {
         let identity = TransferIdentity::derive(
             source.identity(),
             &source_path,
+            &SourceVersion::Current,
             destination.identity(),
             &final_path,
         );
         Self {
             identity,
+            identity_overridden: false,
+            source_version: SourceVersion::Current,
             source,
             source_path,
             destination,
@@ -281,7 +287,33 @@ impl TransferRequest {
     #[must_use]
     pub const fn with_identity_override(mut self, identity: TransferIdentity) -> Self {
         self.identity = identity;
+        self.identity_overridden = true;
         self
+    }
+
+    /// Copies one stored version of the source instead of the current one (`SourceVersion::Id`,
+    /// S3 only: any other source fails at preflight, before the destination is touched). The
+    /// selector is part of the derived identity, so each version is its own transfer; an identity
+    /// override stays as given, whichever of the two is called first.
+    #[must_use]
+    pub fn with_source_version(mut self, version: SourceVersion) -> Self {
+        if !self.identity_overridden {
+            self.identity = TransferIdentity::derive(
+                self.source.identity(),
+                &self.source_path,
+                &version,
+                self.destination.identity(),
+                &self.final_path,
+            );
+        }
+        self.source_version = version;
+        self
+    }
+
+    /// The source version this request copies.
+    #[must_use]
+    pub const fn source_version(&self) -> &SourceVersion {
+        &self.source_version
     }
 
     /// The identity this request transfers under: derived, or the override.

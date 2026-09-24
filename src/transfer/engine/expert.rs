@@ -10,7 +10,7 @@ use super::{
 };
 use crate::metadata::MetadataPlan;
 use crate::model::observation::PrivateBackendEntryFacts;
-use crate::model::{EntryIdentityKey, EntryKind, ObservedEntry, StoragePath};
+use crate::model::{EntryIdentityKey, EntryKind, ObservedEntry, SourceVersion, StoragePath};
 use crate::storage::{
     CheckpointObservation, FinalDestination, PreflightPolicy, PrepareRequest, PublicationEvidence,
     PublishRequest, ReadSource, SourceDescriptor, SourceQosBudget, SourceQosGroup, SourceQosStats,
@@ -305,9 +305,11 @@ impl ExpertDestinationRequest {
         inflight: InflightLimits,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
+        // The expert halves copy the current version only.
         let identity = TransferIdentity::derive(
             source.source_identity().backend(),
             source.path(),
+            &SourceVersion::Current,
             destination.identity(),
             &final_path,
         );

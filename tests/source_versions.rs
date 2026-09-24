@@ -9,6 +9,9 @@ use data_mover::storage::{
     BackendConfig, LocalBackendConfig, PreflightPolicy, ReadRequest, Storage, StorageRoleFailure,
     connect_backend,
 };
+use data_mover::transfer::{
+    InflightLimits, TransferPhase, TransferRequest, TransferSide, transfer,
+};
 use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -68,5 +71,36 @@ async fn a_source_without_versions_refuses_a_named_version_everywhere() -> TestR
         )
         .await;
     assert!(unsupported(&observed), "a named version was observed");
+    Ok(())
+}
+
+/// A transfer asking a source without versions for one fails at preflight, before the destination
+/// is touched: no final file and no `.data-mover-*` artifact.
+#[tokio::test]
+async fn a_named_version_from_a_source_without_versions_fails_before_any_write() -> TestResult {
+    let source_root = tempfile::tempdir()?;
+    std::fs::write(source_root.path().join("file"), b"payload")?;
+    let destination_root = tempfile::tempdir()?;
+    let request = TransferRequest::new(
+        local(source_root.path()).await?,
+        StoragePath::new("file")?,
+        local(destination_root.path()).await?,
+        StoragePath::new("copy")?,
+        InflightLimits::new(2, 64 * 1024, 2)?,
+        CancellationToken::new(),
+    )
+    .with_source_version(SourceVersion::Id("v1".into()));
+    let Err(failure) = transfer(request).await else {
+        return Err("a named version was copied from Local".into());
+    };
+    assert_eq!(failure.phase(), TransferPhase::Preflight);
+    assert_eq!(failure.side(), TransferSide::Source);
+    let role = std::error::Error::source(&failure)
+        .and_then(|cause| cause.downcast_ref::<StorageRoleFailure>());
+    assert!(
+        matches!(role, Some(StorageRoleFailure::Entry(entry)) if entry.class() == FailureClass::Unsupported),
+        "{failure:?}"
+    );
+    assert_eq!(std::fs::read_dir(destination_root.path())?.count(), 0);
     Ok(())
 }

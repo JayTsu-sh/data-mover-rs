@@ -2,7 +2,8 @@ use std::error::Error;
 use std::fmt::Write as _;
 
 use crate::model::{
-    BackendIdentity, BackendKind, EntryIdentityKey, IdentityStrength, SourceIdentity, StoragePath,
+    BackendIdentity, BackendKind, EntryIdentityKey, IdentityStrength, SourceIdentity,
+    SourceVersion, StoragePath,
 };
 
 use super::{BindingSource, TransferIdentity, binding_hash};
@@ -35,6 +36,7 @@ fn reference() -> Result<TransferIdentity, Box<dyn Error>> {
     Ok(TransferIdentity::derive(
         &nfs("nfs://src/export")?,
         &path("a/b.txt")?,
+        &SourceVersion::Current,
         &s3("s3://dst/bucket/prefix")?,
         &path("a/b.txt")?,
     ))
@@ -56,6 +58,43 @@ fn derived_identity_matches_the_frozen_vector() -> TestResult {
     Ok(())
 }
 
+fn reference_at(version: &str) -> Result<TransferIdentity, Box<dyn Error>> {
+    Ok(TransferIdentity::derive(
+        &nfs("nfs://src/export")?,
+        &path("a/b.txt")?,
+        &SourceVersion::Id(version.into()),
+        &s3("s3://dst/bucket/prefix")?,
+        &path("a/b.txt")?,
+    ))
+}
+
+/// Pins a named version's encoding (`0x01 ‖ len ‖ versionId`), computed independently in Python.
+/// `Current` keeps its own vector above: adding the selector changed no existing identity.
+#[test]
+fn a_named_version_matches_the_frozen_vector() -> TestResult {
+    assert_eq!(
+        reference_at("3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY")?.to_string(),
+        "24d2878e71768f65eca486c675e3366f32b033e5d41db219d0311860fd7a8dc0"
+    );
+    assert_eq!(
+        reference_at("null")?.to_string(),
+        "552d6bc107aafb1a5630883b5c235660da238cb35ebd4c8b26ca4a94d7ec2420"
+    );
+    Ok(())
+}
+
+/// Every selector is its own transfer; a version id spelled like a tag is still a version id. The
+/// length prefix itself is pinned by the frozen vectors above.
+#[test]
+fn every_selector_names_its_own_transfer() -> TestResult {
+    let current = reference()?;
+    for version in ["null", "a", "b", "current", "\u{0}"] {
+        assert_ne!(reference_at(version)?, current, "{version:?}");
+    }
+    assert_ne!(reference_at("a")?, reference_at("b")?);
+    Ok(())
+}
+
 #[test]
 fn equal_inputs_derive_equal_identities_from_independent_values() -> TestResult {
     assert_eq!(reference()?, reference()?);
@@ -72,29 +111,45 @@ fn every_field_changes_the_identity() -> TestResult {
         TransferIdentity::derive(
             &endpoint("local", "nfs://src/export")?,
             &same_path,
+            &SourceVersion::Current,
             &destination,
             &same_path,
         ),
         TransferIdentity::derive(
             &nfs("nfs://src/other")?,
             &same_path,
+            &SourceVersion::Current,
             &destination,
             &same_path,
         ),
-        TransferIdentity::derive(&source, &path("a/c.txt")?, &destination, &same_path),
+        TransferIdentity::derive(
+            &source,
+            &path("a/c.txt")?,
+            &SourceVersion::Current,
+            &destination,
+            &same_path,
+        ),
         TransferIdentity::derive(
             &source,
             &same_path,
+            &SourceVersion::Current,
             &endpoint("nfs", "s3://dst/bucket/prefix")?,
             &same_path,
         ),
         TransferIdentity::derive(
             &source,
             &same_path,
+            &SourceVersion::Current,
             &s3("s3://dst/bucket/other")?,
             &same_path,
         ),
-        TransferIdentity::derive(&source, &same_path, &destination, &path("a/c.txt")?),
+        TransferIdentity::derive(
+            &source,
+            &same_path,
+            &SourceVersion::Current,
+            &destination,
+            &path("a/c.txt")?,
+        ),
     ];
     for (index, variant) in variants.iter().enumerate() {
         assert_ne!(*variant, reference, "variant {index}");
@@ -109,8 +164,8 @@ fn swapping_the_two_sides_changes_the_identity() -> TestResult {
     let right = nfs("nfs://host/b")?;
     let file = path("f")?;
     assert_ne!(
-        TransferIdentity::derive(&left, &file, &right, &file),
-        TransferIdentity::derive(&right, &file, &left, &file)
+        TransferIdentity::derive(&left, &file, &SourceVersion::Current, &right, &file),
+        TransferIdentity::derive(&right, &file, &SourceVersion::Current, &left, &file)
     );
     Ok(())
 }
@@ -121,8 +176,20 @@ fn field_boundaries_are_unambiguous() -> TestResult {
     let destination = nfs("nfs://dst/export")?;
     let file = path("f")?;
     assert_ne!(
-        TransferIdentity::derive(&nfs("nfs://src/a")?, &path("b/c")?, &destination, &file),
-        TransferIdentity::derive(&nfs("nfs://src/a/b")?, &path("c")?, &destination, &file)
+        TransferIdentity::derive(
+            &nfs("nfs://src/a")?,
+            &path("b/c")?,
+            &SourceVersion::Current,
+            &destination,
+            &file
+        ),
+        TransferIdentity::derive(
+            &nfs("nfs://src/a/b")?,
+            &path("c")?,
+            &SourceVersion::Current,
+            &destination,
+            &file
+        )
     );
     Ok(())
 }

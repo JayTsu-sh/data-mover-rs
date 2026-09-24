@@ -5,7 +5,7 @@
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use data_mover::model::{ObservedEntry, StoragePath};
+use data_mover::model::{ObservedEntry, SourceVersion, StoragePath};
 use data_mover::storage::{
     BackendConfig, LocalBackendConfig, PreflightPolicy, Storage, connect_backend,
 };
@@ -65,6 +65,7 @@ async fn independent_connections_derive_one_identity() -> TestResult {
         TransferIdentity::derive(
             source_storage.identity(),
             &StoragePath::new("in.bin")?,
+            &SourceVersion::Current,
             destination_storage.identity(),
             &StoragePath::new("out.bin")?,
         )
