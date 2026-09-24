@@ -212,7 +212,8 @@ until its first checkpoint; both are two writers of one key, which the caller co
 read-back verification catches mixed bytes. A lost RENAME reply is settled by reading back (pointer)
 or by the final file's content (publication). `rmdir` and `rename` now make the directory-handle
 cache forget the path and everything below it (C10a). Verified on ONTAP NFSv4.1 (contract and resume
-matrix); NFSv3 on real hardware is still open.
+matrix); NFSv3 on real hardware is still open. The old NFS random-name stage, `DMNCKP01` checkpoint,
+`DMNRCV03` recover and claim rename are no longer reached (removed in C10d).
 
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process

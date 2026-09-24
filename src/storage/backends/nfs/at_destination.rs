@@ -78,11 +78,12 @@ pub(super) fn artifact_path(
     sibling_path(final_path, &artifact)
 }
 
-/// The stage path a destination-kept stage's token must name.
+/// The stage path a stage's token must name: the deterministic name beside the final file, and
+/// only for a stage prepared at the destination.
 pub(super) fn stage_path(stage: &PreparedStage) -> Result<StoragePath, StorageRoleFailure> {
     let final_path = stage.final_destination.path();
     let expected = artifact_path(final_path, ArtifactKind::Stage, false)?;
-    if stage.token.as_ref() == expected.as_str().as_bytes() {
+    if stage.at_destination && stage.token.as_ref() == expected.as_str().as_bytes() {
         Ok(expected)
     } else {
         Err(invalid(final_path, FailureClass::Conflict))
@@ -102,7 +103,7 @@ fn fence(stage: &PreparedStage) -> Result<&Fence, StorageRoleFailure> {
         .backend_state
         .as_ref()
         .and_then(|state| state.downcast_ref::<NfsStageState>())
-        .and_then(|state| state.fence.as_ref())
+        .map(|state| &state.fence)
         .ok_or_else(|| invalid(stage.final_destination.path(), FailureClass::Corruption))
 }
 
@@ -227,8 +228,7 @@ pub(super) async fn prepare(
         None,
     );
     stage.backend_state = Some(Arc::new(NfsStageState {
-        checkpoint_created: AtomicBool::new(false),
-        fence: Some(Fence::new(request.transfer_identity)),
+        fence: Fence::new(request.transfer_identity),
     }));
     stage.mark_at_destination(found.fact);
     let Some(point) = found.resume else {

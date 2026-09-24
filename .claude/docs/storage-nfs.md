@@ -147,6 +147,11 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 - **nonce 围栏**：每次 prepare 取新 nonce；续传先用自己的 nonce 重写指针（接管）再截断 stage；之后每次重写指针、
   发布 rename 前、清理前都读回指针，nonce 不同（或写过后指针没了）→ `Conflict`（永久），不碰那些名字。围栏是检查
   不是锁；非 recoverable 的 stage 在第一个检查点之前没有指针可比 —— 都靠调用方契约兜底，读回校验抓混写的字节。
+- 旧路径已在 C10d 删除：随机名 stage、`<stage>.checkpoint`（`DMNCKP01`）、`DMNRCV03` 恢复身份与 `.claim-` 改名
+  恢复。`StagedDestination::prepare` / `recovery_identity` / `recover` 对 NFS 返回 `Unsupported`（`prepare_ephemeral`
+  / `handoff_recovery` 用 trait 默认实现，因此同样不可用）；stage 只能经 `prepare_at_destination` 准备，`validate`
+  只接受 at_destination 的确定名 stage。单测在 `staged_tests.rs` 用 `prepare_stage` / `prepare_ephemeral_stage` /
+  `resume_stage` 辅助函数（Restart / 非 recoverable / Discover）。
 - 续传遇 `PermissionDenied`（元数据已施加）→ 经元数据角色设回 0600 再打开。
 - `rmdir` / `rename` 成功后 `GLOBAL_CACHE` 会忘掉该路径及其下所有目录句柄（C10a），否则改名后重建的目录会被
   解析到旧目录里。

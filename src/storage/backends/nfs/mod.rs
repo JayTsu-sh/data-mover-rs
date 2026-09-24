@@ -2,14 +2,12 @@
 
 mod acl;
 mod at_destination;
-mod checkpoint;
 pub(crate) mod common;
 #[allow(dead_code)]
 pub(crate) mod metadata;
 #[allow(dead_code)]
 pub(crate) mod namespace;
 pub(crate) mod protocol;
-mod recovery;
 #[allow(dead_code)]
 pub(crate) mod source;
 #[allow(dead_code)]

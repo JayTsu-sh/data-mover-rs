@@ -4,7 +4,10 @@ pub(super) mod tests {
     use std::collections::HashMap;
 
     use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, SourceVersion};
-    use crate::storage::{FinalDestination, SourceDescriptor};
+    use crate::storage::artifacts::{ArtifactKind, artifact_name};
+    use crate::storage::{
+        DestinationPrepareRequest, FinalDestination, PrepareFact, ResumeMode, SourceDescriptor,
+    };
     use futures::stream;
 
     #[derive(Default)]
@@ -36,6 +39,8 @@ pub(super) mod tests {
         checkpoint_gate: Arc<Mutex<Option<Arc<CheckpointGate>>>>,
         unstable_pressure: Arc<std::sync::atomic::AtomicBool>,
         size_calls: std::sync::atomic::AtomicU64,
+        /// Writes of a pointer (through its temporary): one per recorded checkpoint.
+        pointer_writes: Arc<std::sync::atomic::AtomicU64>,
     }
 
     struct FakeFile {
@@ -55,19 +60,21 @@ pub(super) mod tests {
         failed_write_offset: Arc<Mutex<Option<u64>>>,
         checkpoint_gate: Arc<Mutex<Option<Arc<CheckpointGate>>>>,
         unstable_pressure: Arc<std::sync::atomic::AtomicBool>,
+        pointer_writes: Arc<std::sync::atomic::AtomicU64>,
     }
 
-    struct CountingRegistration(Arc<std::sync::atomic::AtomicU64>);
+    /// A destination-kept stage records its checkpoints in its pointer and never registers one
+    /// where data-mover runs.
+    struct NeverRegistered;
 
     #[async_trait]
-    impl crate::storage::CheckpointRegistration for CountingRegistration {
+    impl crate::storage::CheckpointRegistration for NeverRegistered {
         async fn register(
             &self,
             _stage: &PreparedStage,
             _identity: RecoveryIdentity,
         ) -> Result<(), StorageRoleFailure> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
+            panic!("an NFS stage keeps its recovery state at the destination");
         }
     }
 
@@ -103,7 +110,9 @@ pub(super) mod tests {
         }
 
         async fn write_at(&self, offset: u64, data: Bytes) -> Result<u64, NfsProtocolFailure> {
-            if self.path.contains(".checkpoint") {
+            if self.path.contains(".pointer") {
+                self.pointer_writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let gate = self
                     .checkpoint_gate
                     .lock()
@@ -236,7 +245,7 @@ pub(super) mod tests {
         }
 
         async fn close(&self) -> Result<(), NfsProtocolFailure> {
-            if !self.path.contains(".checkpoint") {
+            if !self.path.contains(".pointer") {
                 self.closes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -308,7 +317,7 @@ pub(super) mod tests {
                     Transience::Permanent,
                 ));
             }
-            if !path.as_str().contains(".checkpoint") {
+            if !path.as_str().contains(".pointer") {
                 self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             Ok(Box::new(FakeFile {
@@ -328,6 +337,7 @@ pub(super) mod tests {
                 failed_write_offset: Arc::clone(&self.failed_write_offset),
                 checkpoint_gate: Arc::clone(&self.checkpoint_gate),
                 unstable_pressure: Arc::clone(&self.unstable_pressure),
+                pointer_writes: Arc::clone(&self.pointer_writes),
             }))
         }
 
@@ -391,8 +401,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn ephemeral_prepare_reuses_created_handle_for_first_write() {
         let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare_ephemeral(prepare_request(&identity))
+        let stage = prepare_ephemeral_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(protocol.opens.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -443,8 +452,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn atomic_replace_uses_unstable_writes_without_a_commit_checkpoint() {
         let (adapter, protocol, identity) = adapter();
-        let mut stage = adapter
-            .prepare_ephemeral(prepare_request(&identity))
+        let mut stage = prepare_ephemeral_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         stage.durable_publication = false;
@@ -504,10 +512,9 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpointed_below_threshold_commits_final_data_without_registering_recovery() {
+    async fn checkpointed_below_threshold_commits_final_data_without_a_pointer() {
         let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare_ephemeral(prepare_request(&identity))
+        let stage = prepare_ephemeral_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
 
@@ -548,14 +555,12 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn checkpointed_registers_recovery_after_the_first_durable_interval() {
+    async fn checkpointed_writes_its_pointer_after_the_first_durable_interval() {
         let (adapter, protocol, identity) = adapter();
-        let registrations = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let mut stage = adapter
-            .prepare_ephemeral(prepare_request(&identity))
+        let mut stage = prepare_ephemeral_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        enable_deferred_checkpointed(&mut stage, 4, 8, Arc::clone(&registrations));
+        enable_deferred_checkpointed(&mut stage, 4, 8);
 
         adapter
             .write(
@@ -568,7 +573,13 @@ pub(super) mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
 
-        assert_eq!(registrations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The first interval's pointer, then the final prefix's.
+        assert_eq!(
+            protocol
+                .pointer_writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
         assert!(stage.recovery_enabled());
         assert_eq!(
             protocol
@@ -576,7 +587,7 @@ pub(super) mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             2
         );
-        // Registration overlaps subsequent writes: either tracked mode is safe.
+        // The pointer write overlaps subsequent writes: either tracked mode is safe.
         let deferred = protocol
             .deferred_writes
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -590,12 +601,10 @@ pub(super) mod tests {
     #[tokio::test]
     async fn checkpointed_persists_every_completed_checkpoint_interval() {
         let (adapter, protocol, identity) = adapter();
-        let registrations = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let mut stage = adapter
-            .prepare_ephemeral(prepare_request(&identity))
+        let mut stage = prepare_ephemeral_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        enable_deferred_checkpointed(&mut stage, 4, 13, Arc::clone(&registrations));
+        enable_deferred_checkpointed(&mut stage, 4, 13);
         let input_error = failure(
             stage.final_destination.path(),
             FailureClass::Protocol,
@@ -615,7 +624,13 @@ pub(super) mod tests {
             .await;
 
         assert!(result.is_err());
-        assert_eq!(registrations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            protocol
+                .pointer_writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "one pointer per completed interval"
+        );
         assert_eq!(
             adapter
                 .observe_checkpoint(&stage)
@@ -636,14 +651,13 @@ pub(super) mod tests {
     #[tokio::test]
     async fn checkpointed_prepare_keeps_the_created_handle_for_first_write() {
         let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare(prepare_request(&identity))
+        let stage = prepare_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(
             protocol.opens.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "checkpoint registration must not force the create handle to close"
+            "the first pointer must not force the create handle to close"
         );
 
         adapter
@@ -675,14 +689,17 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn stages_with_the_same_binding_keep_independent_checkpoints() {
+    async fn discarding_one_files_stage_leaves_another_files_stage_and_pointer() {
         let (adapter, protocol, identity) = adapter();
-        let first = adapter
-            .prepare(prepare_request(&identity))
+        let first = prepare_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        let second = adapter
-            .prepare(prepare_request(&identity))
+        // One file has one stage at a time: the second stage is another file's.
+        let mut other = prepare_request(&identity);
+        other.final_destination = FinalDestination::new(
+            StoragePath::new("other.bin").unwrap_or_else(|error| panic!("{error}")),
+        );
+        let second = prepare_stage(&adapter, other)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
 
@@ -705,7 +722,7 @@ pub(super) mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
             2,
-            "the first stage and its checkpoint must remain"
+            "the first stage and its pointer must remain"
         );
         adapter
             .discard(first)
@@ -723,8 +740,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn ephemeral_discard_closes_created_handle_and_removes_stage() {
         let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare_ephemeral(prepare_request(&identity))
+        let stage = prepare_ephemeral_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
 
@@ -746,8 +762,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn staged_write_keeps_multiple_nfs_writes_inflight() {
         let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare(prepare_request(&identity))
+        let stage = prepare_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let input: ByteStream = Box::pin(stream::iter([
@@ -778,8 +793,7 @@ pub(super) mod tests {
             .failed_write_offset
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(0);
-        let stage = adapter
-            .prepare(prepare_request(&identity))
+        let stage = prepare_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
 
@@ -807,8 +821,7 @@ pub(super) mod tests {
         protocol
             .maximum_write_chunk
             .store(3, std::sync::atomic::Ordering::SeqCst);
-        let stage = adapter
-            .prepare(prepare_request(&identity))
+        let stage = prepare_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let input: ByteStream = Box::pin(stream::iter([Ok(Bytes::from_static(b"abcdefgh"))]));
@@ -828,8 +841,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn staged_verification_keeps_multiple_ordered_nfs_reads_inflight() {
         let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare(prepare_request(&identity))
+        let stage = prepare_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let piece = Bytes::from(vec![7; 1024 * 1024]);
@@ -866,8 +878,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn staged_verification_does_not_issue_a_separate_size_rpc() {
         let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare(prepare_request(&identity))
+        let stage = prepare_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         adapter
@@ -905,8 +916,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn staged_verification_rejects_a_trailing_byte() {
         let (adapter, _protocol, identity) = adapter();
-        let stage = adapter
-            .prepare(prepare_request(&identity))
+        let stage = prepare_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         adapter
@@ -927,6 +937,24 @@ pub(super) mod tests {
                         cancel: tokio_util::sync::CancellationToken::new(),
                     },
                 )
+                .await
+                .is_err()
+        );
+    }
+
+    /// NFS stages are prepared only at the destination: the store-era entry points refuse, so a
+    /// caller that bypassed the engine's `recovery_at_destination` check fails loudly.
+    #[tokio::test]
+    async fn store_era_entry_points_are_unsupported() {
+        let (adapter, _, identity) = adapter();
+        let refused = adapter.prepare(prepare_request(&identity)).await;
+        assert!(matches!(
+            refused,
+            Err(StorageRoleFailure::Entry(ref error)) if error.class() == FailureClass::Unsupported
+        ));
+        assert!(
+            adapter
+                .prepare_ephemeral(prepare_request(&identity))
                 .await
                 .is_err()
         );
@@ -982,13 +1010,53 @@ pub(super) mod tests {
         stage: &mut PreparedStage,
         interval_bytes: u64,
         source_size: u64,
-        registrations: Arc<std::sync::atomic::AtomicU64>,
     ) {
         stage.deferred_checkpoint = Some(crate::storage::DeferredCheckpoint {
             interval_bytes,
             source_size,
-            registration: Arc::new(CountingRegistration(registrations)),
+            registration: Arc::new(NeverRegistered),
         });
+    }
+
+    /// A fresh stage whose pointer is written at prepare: whatever an earlier stage of the file
+    /// left is cleaned up first.
+    async fn prepare_stage(
+        adapter: &NfsStagedDestinationAdapter,
+        request: PrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        adapter
+            .prepare_at_destination(at_destination(request, ResumeMode::Restart, true))
+            .await
+    }
+
+    /// A fresh stage whose first pointer waits for a checkpoint.
+    async fn prepare_ephemeral_stage(
+        adapter: &NfsStagedDestinationAdapter,
+        request: PrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        adapter
+            .prepare_at_destination(at_destination(request, ResumeMode::Restart, false))
+            .await
+    }
+
+    /// Resumes what an earlier stage of the file left, as a new process would.
+    async fn resume_stage(
+        adapter: &NfsStagedDestinationAdapter,
+        request: PrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        adapter
+            .prepare_at_destination(at_destination(request, ResumeMode::Discover, true))
+            .await
+    }
+
+    fn at_destination(
+        request: PrepareRequest,
+        resume: ResumeMode,
+        recoverable: bool,
+    ) -> DestinationPrepareRequest {
+        DestinationPrepareRequest::new(request, [3; 32])
+            .with_resume(resume)
+            .with_recoverable(recoverable)
     }
 
     #[test]
@@ -1011,76 +1079,48 @@ pub(super) mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn nested_stage_is_colocated_and_identity_carries_only_its_current_token() {
-        let (adapter, protocol, identity) = adapter();
-        let mut request = prepare_request(&identity);
-        request.final_destination = FinalDestination::new(
-            StoragePath::new("nested/dir/final.bin").unwrap_or_else(|error| panic!("{error}")),
-        );
-        let stage = adapter
-            .prepare(request.clone())
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        let initial_id =
-            NfsStagedDestinationAdapter::stage_id(&stage.token, stage.final_destination.path())
-                .unwrap_or_else(|error| panic!("{error}"));
-        let stage_path = std::str::from_utf8(&stage.token).unwrap_or_default();
-        assert!(stage_path.starts_with("nested/dir/.data-mover-"));
-        assert!(stage_path.strip_suffix(".stage").is_some());
-
-        let recovery_identity = adapter
-            .handoff_recovery(&stage)
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(
-            recovery_identity.as_bytes().len(),
-            74 + stage.token.len() + 32,
-            "identity contains one length-prefixed stage token and its checksum"
-        );
-        let restarted = NfsStagedDestinationAdapter::new(protocol, identity);
-        let recovered = restarted
-            .recover(RecoverRequest {
-                identity: recovery_identity,
-                final_destination: request.final_destination,
-                source: request.source,
-                recovery_binding: request.recovery_binding,
-                claim_token: [3; 32],
-            })
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        let recovered_id = NfsStagedDestinationAdapter::stage_id(
-            &recovered.token,
-            recovered.final_destination.path(),
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(recovered_id, initial_id);
-        assert!(
-            std::str::from_utf8(&recovered.token)
-                .unwrap_or_default()
-                .contains(".claim-")
-        );
-        restarted
-            .discard(recovered)
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-    }
-
     #[test]
-    fn old_stage_names_are_rejected() {
-        let destination = StoragePath::new("final.bin").unwrap_or_else(|error| panic!("{error}"));
-        for name in [
-            format!(".data-mover-{}-fresh.stage", "a".repeat(32)),
-            format!(
-                ".data-mover-{}-claim-{}.stage",
-                "a".repeat(32),
-                "b".repeat(32)
+    fn only_the_deterministic_stage_name_is_accepted() {
+        let (_, _, identity) = adapter();
+        let deterministic = artifact_name("final.bin", ArtifactKind::Stage);
+        for (token, at_destination, accepted) in [
+            // The random names stages had before ADR-0006 C10, even for a destination-kept stage.
+            (
+                format!(".data-mover-{}-fresh.stage", "a".repeat(32)),
+                true,
+                false,
             ),
-            ".data-mover-staging/old.part".to_owned(),
+            (
+                format!(
+                    ".data-mover-{}-claim-{}.stage",
+                    "a".repeat(32),
+                    "b".repeat(32)
+                ),
+                true,
+                false,
+            ),
+            (".data-mover-staging/old.part".to_owned(), true, false),
+            // The deterministic name, only for a stage prepared at the destination.
+            (deterministic.clone(), false, false),
+            (deterministic, true, true),
         ] {
-            assert!(
-                NfsStagedDestinationAdapter::validate_token_shape(&Bytes::from(name), &destination)
-                    .is_err()
+            let mut stage = PreparedStage::new(
+                identity.clone(),
+                FinalDestination::new(
+                    StoragePath::new("final.bin").unwrap_or_else(|error| panic!("{error}")),
+                ),
+                Bytes::from(token.clone()),
+                [7; 32],
+                0,
+                None,
+            );
+            if at_destination {
+                stage.mark_at_destination(PrepareFact::Fresh);
+            }
+            assert_eq!(
+                super::super::at_destination::stage_path(&stage).is_ok(),
+                accepted,
+                "{token} at_destination={at_destination}"
             );
         }
     }
@@ -1088,8 +1128,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn staged_lifecycle_writes_verifies_publishes_and_closes_handles() {
         let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare(prepare_request(&identity))
+        let stage = prepare_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let input: ByteStream = Box::pin(stream::iter([
@@ -1151,262 +1190,49 @@ pub(super) mod tests {
         assert_eq!(protocol.closes.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
+    /// A process that resumed a stage and died before using it leaves a stage the next process
+    /// resumes again, from the same prefix.
     #[tokio::test]
-    async fn recovery_identity_snapshot_retains_authority_until_explicit_handoff() {
+    async fn a_resume_whose_result_is_lost_is_resumed_again() {
         let (adapter, protocol, identity) = adapter();
         let request = prepare_request(&identity);
-        let stage = adapter
-            .prepare(request.clone())
+        let stage = prepare_stage(&adapter, request.clone())
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        let input: ByteStream = Box::pin(stream::iter([Ok(Bytes::from_static(b"abc"))]));
         adapter
-            .write(&stage, input)
+            .write(
+                &stage,
+                Box::pin(stream::iter([Ok(Bytes::from_static(b"abc"))])),
+            )
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        let recovery_identity = adapter
-            .recovery_identity(&stage)
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(
-            adapter
-                .observe_checkpoint(&stage)
-                .await
-                .unwrap_or_else(|error| panic!("{error}"))
-                .durable_prefix,
-            3
-        );
-        let handed_off_identity = adapter
-            .handoff_recovery(&stage)
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(handed_off_identity.as_bytes(), recovery_identity.as_bytes());
-        assert!(adapter.observe_checkpoint(&stage).await.is_err());
-        protocol
-            .files
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(std::str::from_utf8(&stage.token).unwrap_or_default())
-            .unwrap_or_else(|| panic!("handed-off stage should remain available"))
-            .extend_from_slice(b"inflight-tail");
+        drop(stage);
+        drop(adapter);
 
-        let recovered_adapter = NfsStagedDestinationAdapter::new(protocol.clone(), identity);
-        let recovered = recovered_adapter
-            .recover(RecoverRequest {
-                identity: handed_off_identity,
-                final_destination: request.final_destination,
-                source: request.source,
-                recovery_binding: request.recovery_binding,
-                claim_token: [1; 32],
-            })
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(recovered.write_offset, 3);
-        assert_eq!(
-            recovered_adapter
-                .observe_checkpoint(&recovered)
-                .await
-                .unwrap_or_else(|error| panic!("{error}"))
-                .durable_prefix,
-            3
-        );
-        recovered_adapter
-            .discard(recovered)
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-    }
-
-    #[tokio::test]
-    async fn recovery_identity_is_atomically_consumed_across_adapters() {
-        let (adapter, protocol, identity) = adapter();
-        let request = prepare_request(&identity);
-        let stage = adapter
-            .prepare(request.clone())
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        let recovery_identity = adapter
-            .handoff_recovery(&stage)
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
         let first = NfsStagedDestinationAdapter::new(protocol.clone(), identity.clone());
-        let second = NfsStagedDestinationAdapter::new(protocol, identity);
-        let first_request = RecoverRequest {
-            identity: recovery_identity.clone(),
-            final_destination: request.final_destination.clone(),
-            source: request.source.clone(),
-            recovery_binding: request.recovery_binding,
-            claim_token: [1; 32],
-        };
-        let second_request = RecoverRequest {
-            identity: recovery_identity,
-            final_destination: request.final_destination,
-            source: request.source,
-            recovery_binding: request.recovery_binding,
-            claim_token: [2; 32],
-        };
-        let (first_result, second_result) =
-            tokio::join!(first.recover(first_request), second.recover(second_request));
-        let (winner, loser) = match (first_result, second_result) {
-            (Ok(stage), Err(error)) => ((&first, stage), error),
-            (Err(error), Ok(stage)) => ((&second, stage), error),
-            (left, right) => panic!("exactly one recovery must win: {left:?}, {right:?}"),
-        };
-        assert!(matches!(
-            loser,
-            StorageRoleFailure::Entry(error)
-                if matches!(error.class(), FailureClass::Conflict | FailureClass::NotFound)
-        ));
-        winner
-            .0
-            .discard(winner.1)
+        let lost = resume_stage(&first, request.clone())
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-    }
-
-    #[tokio::test]
-    async fn recovery_reconciles_an_ambiguous_committed_claim() {
-        let (adapter, protocol, identity) = adapter();
-        let request = prepare_request(&identity);
-        let stage = adapter
-            .prepare(request.clone())
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        let recovery_identity = adapter
-            .handoff_recovery(&stage)
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        protocol
-            .rename_mode
-            .store(4, std::sync::atomic::Ordering::SeqCst);
-        let recovered = adapter
-            .recover(RecoverRequest {
-                identity: recovery_identity,
-                final_destination: request.final_destination,
-                source: request.source,
-                recovery_binding: request.recovery_binding,
-                claim_token: [3; 32],
-            })
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        protocol
-            .rename_mode
-            .store(0, std::sync::atomic::Ordering::SeqCst);
-        adapter
-            .discard(recovered)
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-    }
-
-    #[tokio::test]
-    async fn persisted_claim_token_reenters_after_process_loses_recover_result() {
-        let (adapter, protocol, identity) = adapter();
-        let request = prepare_request(&identity);
-        let stage = adapter
-            .prepare(request.clone())
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        let recovery_identity = adapter
-            .handoff_recovery(&stage)
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        let recover = || RecoverRequest {
-            identity: recovery_identity.clone(),
-            final_destination: request.final_destination.clone(),
-            source: request.source.clone(),
-            recovery_binding: request.recovery_binding,
-            claim_token: [9; 32],
-        };
-        let first = NfsStagedDestinationAdapter::new(protocol.clone(), identity.clone());
-        let lost = first
-            .recover(recover())
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(lost.prepare_fact, PrepareFact::Resumed { bytes: 3 });
         drop(lost);
         drop(first);
 
         let restarted = NfsStagedDestinationAdapter::new(protocol, identity);
-        let recovered = restarted
-            .recover(recover())
+        let resumed = resume_stage(&restarted, request)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(recovered.write_offset, 0);
+        assert_eq!(resumed.prepare_fact, PrepareFact::Resumed { bytes: 3 });
+        assert_eq!(resumed.write_offset, 3);
         restarted
-            .discard(recovered)
+            .discard(resumed)
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-    }
-
-    #[tokio::test]
-    async fn recovery_rejects_tampering_binding_changes_and_missing_remote_stage() {
-        let (adapter, protocol, identity) = adapter();
-        let request = prepare_request(&identity);
-        let stage = adapter
-            .prepare(request.clone())
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-        let recovery_identity = adapter
-            .recovery_identity(&stage)
-            .await
-            .unwrap_or_else(|error| panic!("{error}"));
-
-        let mut tampered = recovery_identity.as_bytes().to_vec();
-        let last = tampered.len() - 1;
-        tampered[last] ^= 1;
-        let corrupt =
-            RecoveryIdentity::from_bytes(tampered).unwrap_or_else(|error| panic!("{error}"));
-        assert!(matches!(
-            adapter
-                .recover(RecoverRequest {
-                    identity: corrupt,
-                    final_destination: request.final_destination.clone(),
-                    source: request.source.clone(),
-                    recovery_binding: request.recovery_binding,
-                    claim_token: [4; 32],
-                })
-                .await,
-            Err(StorageRoleFailure::Entry(error))
-                if error.class() == FailureClass::Conflict
-        ));
-
-        assert!(matches!(
-            adapter
-                .recover(RecoverRequest {
-                    identity: recovery_identity.clone(),
-                    final_destination: request.final_destination.clone(),
-                    source: request.source.clone(),
-                    recovery_binding: [8; 32],
-                    claim_token: [5; 32],
-                })
-                .await,
-            Err(StorageRoleFailure::Entry(error))
-                if error.class() == FailureClass::Conflict
-        ));
-
-        protocol
-            .files
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        assert!(matches!(
-            adapter
-                .recover(RecoverRequest {
-                    identity: recovery_identity,
-                    final_destination: request.final_destination,
-                    source: request.source,
-                    recovery_binding: request.recovery_binding,
-                    claim_token: [6; 32],
-                })
-                .await,
-            Err(StorageRoleFailure::Entry(error))
-                if error.class() == FailureClass::NotFound
-        ));
     }
 
     #[tokio::test]
     async fn precancelled_verification_does_not_open_remote_state() {
         let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare(prepare_request(&identity))
+        let stage = prepare_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -1435,8 +1261,7 @@ pub(super) mod tests {
     async fn missing_stage_makes_rename_failure_ambiguous_when_final_is_missing_or_mismatched() {
         for mode in [2, 3] {
             let (adapter, protocol, identity) = adapter();
-            let stage = adapter
-                .prepare(prepare_request(&identity))
+            let stage = prepare_stage(&adapter, prepare_request(&identity))
                 .await
                 .unwrap_or_else(|error| panic!("{error}"));
             protocol
@@ -1469,8 +1294,7 @@ pub(super) mod tests {
     async fn eight_slot_write_starts_before_input_refill() {
         use std::sync::atomic::Ordering;
         let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare_ephemeral(prepare_request(&identity))
+        let stage = prepare_ephemeral_stage(&adapter, prepare_request(&identity))
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         let native = adapter
@@ -1513,11 +1337,10 @@ pub(super) mod tests {
             for fail_record in [false, true] {
                 let (adapter, protocol, identity) = adapter();
                 protocol.maximum_write_chunk.store(2, Ordering::SeqCst);
-                let mut stage = adapter
-                    .prepare_ephemeral(prepare_request(&identity))
+                let mut stage = prepare_ephemeral_stage(&adapter, prepare_request(&identity))
                     .await
                     .unwrap_or_else(|error| panic!("{error}"));
-                enable_deferred_checkpointed(&mut stage, 4, size, Arc::default());
+                enable_deferred_checkpointed(&mut stage, 4, size);
                 let gate = Arc::new(CheckpointGate::default());
                 gate.fail.store(fail_record, Ordering::SeqCst);
                 *protocol
@@ -1589,7 +1412,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn periodic_checkpoints_own_commit_cadence_before_and_after_recovery_registration() {
+    async fn periodic_checkpoints_own_commit_cadence_before_and_after_the_first_pointer() {
         use std::sync::atomic::Ordering;
         for already_registered in [true, false] {
             for unstable in [true, false] {
@@ -1597,12 +1420,12 @@ pub(super) mod tests {
                 protocol.maximum_write_chunk.store(1, Ordering::SeqCst);
                 protocol.unstable_pressure.store(unstable, Ordering::SeqCst);
                 let mut stage = if already_registered {
-                    adapter.prepare(prepare_request(&identity)).await
+                    prepare_stage(&adapter, prepare_request(&identity)).await
                 } else {
-                    adapter.prepare_ephemeral(prepare_request(&identity)).await
+                    prepare_ephemeral_stage(&adapter, prepare_request(&identity)).await
                 }
                 .unwrap_or_else(|error| panic!("{error}"));
-                enable_deferred_checkpointed(&mut stage, 4, 13, Arc::default());
+                enable_deferred_checkpointed(&mut stage, 4, 13);
                 let evidence = adapter
                     .write(
                         &stage,
@@ -1636,8 +1459,7 @@ pub(super) mod tests {
             let (adapter, protocol, identity) = adapter();
             protocol.maximum_write_chunk.store(1, Ordering::SeqCst);
             protocol.unstable_pressure.store(unstable, Ordering::SeqCst);
-            let stage = adapter
-                .prepare(prepare_request(&identity))
+            let stage = prepare_stage(&adapter, prepare_request(&identity))
                 .await
                 .unwrap_or_else(|error| panic!("{error}"));
             assert!(stage.deferred_checkpoint.is_none());

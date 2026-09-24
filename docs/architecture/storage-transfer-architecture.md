@@ -555,11 +555,12 @@ durability. Other protocols may retain their required persistence operations. It
 recovery control accepted from terrasync. Data-mover selects the effective behavior after route and
 source-read planning and reports it as `EffectiveRecovery`.
 
-(Local no longer takes this path since ADR-0006 C8 — see "Local destination-resident recovery" below;
-this paragraph and the next describe the destinations that still use the local recovery store.)
+(Local and NFS no longer take this path since ADR-0006 C8 / C10 — see "Local destination-resident
+recovery" and "NFS execution and automatic recovery" below; this paragraph and the next describe the
+destinations that still use the local recovery store.)
 For eligible multi-source-chunk streaming with `Checkpointed`, data-mover opens its private recovery store,
 exclusively claims the transfer binding, recovers or prepares backend-owned staged state, and
-atomically persists the backend's versioned opaque identity. Ordinary Local, NFS and HDFS defer registration until
+atomically persists the backend's versioned opaque identity. Ordinary HDFS defers registration until
 the first durable checkpoint; destinations without deferred support register before payload. Successful publication
 and explicit discard clear that record. Before publication, the record atomically enters a
 `Publishing` state. After a restart, only that state may reconcile a missing stage by clearing the
@@ -596,13 +597,11 @@ for BLAKE3 but emits writes only after the re-observed durable prefix. A supplie
 strict recovery semantics: a missing, invalid, conflicting, or mismatched backend state fails
 without deleting unknown state or restarting implicitly. Observing a recovery identity is
 non-mutating. Only explicit failure handoff transfers recovery authority out of the current
-process; NFS releases its adapter-local claim during that handoff. Local holds its
+process. Local holds its
 `.data-mover-<digest>.claim` beside the final file under an exclusive OS file lock from prepare until
-publication or discard. NFS recovery additionally requires a
-caller-persisted, per-attempt claim token: the adapter derives a deterministic claimed path from
-the opaque identity and token, then atomically renames the old stage. The same token makes a
-lost result idempotently re-enterable after process restart; different tokens ensure competing
-processes cannot acquire the same lifecycle authority.
+publication or discard. NFS (since ADR-0006 C10) has no claim and no recovery identity: it takes a
+stage over by rewriting the pointer with its own nonce, and every later pointer write, the
+publication and a clean-up first check that nonce (see "NFS execution and automatic recovery").
 
 Backend mechanisms:
 
@@ -733,14 +732,15 @@ Single-source-chunk transfers bypass the producer/channel but preserve source le
 Ordinary NFS transfers use the same fixed 64 MiB Checkpointed eligibility interval, independent of
 negotiated protocol chunk sizes. Checkpointed sends UNSTABLE WRITEs while retaining their verifier evidence.
 It COMMITs at the first eligible recovery boundary or at EOF, so files below the threshold pay only
-the final COMMIT. Eligible copies register recovery only after the first interval is a contiguous
-committed prefix and its per-stage checkpoint file has been atomically replaced. Every later 64 MiB
-boundary replaces that record after its data barrier. Recovery trusts the record instead of stage
-length and truncates any inflight tail before resume. Stage and checkpoint are hidden siblings of
-the final file. The current stage token embeds an immutable, unique stage ID that remains present
-across claim renames, so recovery derives the checkpoint from the single token carried by recovery
-identity while isolating competing attempts for the same binding. NFS traversal omits the reserved
-`.data-mover-` siblings.
+the final COMMIT. Eligible copies turn recovery on only after the first interval is a contiguous
+committed prefix and the destination pointer recording it has been atomically replaced (ADR-0006
+C10); nothing is registered where data-mover runs. Every later 64 MiB boundary replaces the pointer
+after its data barrier. Resume trusts the pointer's prefix instead of the stage length and truncates
+any inflight tail. Stage and pointer are the deterministic hidden siblings
+`.data-mover-<digest>.{stage,pointer}` of the final file; the pointer carries a per-prepare nonce
+that fences a stage another writer took over. The earlier random-name stage, `DMNCKP01` checkpoint
+file, `DMNRCV03` recovery identity and claim rename were removed in C10d. NFS traversal omits the
+reserved `.data-mover-` siblings.
 Once recovery is active, bounded batch COMMITs may occur more frequently to release retry payloads,
 but they do not advance the recorded recovery prefix. AtomicReplace uses bounded UNSTABLE WRITEs without COMMIT, then closes and atomically renames
 the stage; it creates no recovery record and does not promise server-crash durability. Both modes
@@ -758,15 +758,15 @@ EOF boundaries so pNFS layout synchronization remains protocol-owned.
 Local destination-resident recovery (ADR-0006 C8): Local no longer uses the local recovery store or
 `RecoveryIdentity`. Its stage, pointer and claim sit beside the final file under deterministic names
 (`.data-mover-<digest>.{stage,pointer,claim}`); the pointer is the checkpoint record and carries the
-durable prefix; the flock'd claim is held from prepare until publication or discard. The random-name
-layout below still describes NFS and CIFS until they move (C10, C11).
+durable prefix; the flock'd claim is held from prepare until publication or discard. NFS moved to
+the same deterministic names in C10 (stage and pointer, no claim). The random-name layout below
+still describes CIFS until it moves (C11).
 
-NFS artifact naming (Local used it too until ADR-0006 C8): new stages use the shared
+CIFS artifact naming (Local and NFS used it too until ADR-0006 C8 / C10): new stages use the shared
 `.data-mover-<destination-path-hash-16>-<uuid-32>.stage` base name in the final parent.
 Checkpoints append `.checkpoint`; checkpoint update temporaries append `.tmp-<uuid-32>`.
-NFS claim rename appends `.claim-<claim-id-32>`
-to the stage base name, while its checkpoint name remains based on the unchanged base.
-RecoveryIdentity still carries one current stage token. Only the unified naming format is
+A recovery claim renames the stage by appending `.claim-<claim-id-32>` to its base name, while its
+checkpoint name remains based on the unchanged base. RecoveryIdentity carries one current stage token. Only the unified naming format is
 accepted for recovery; legacy stage names and the old centralized staging layout are rejected.
 
 

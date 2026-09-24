@@ -15,9 +15,7 @@ fn positioned_input(parts: &[(u64, &'static [u8])]) -> crate::storage::Positione
 async fn positioned_nfs_writes_completed_later_read_before_prefix_arrives()
 -> Result<(), Box<dyn std::error::Error>> {
     let (adapter, protocol, identity) = adapter();
-    let stage = adapter
-        .prepare_ephemeral(prepare_request(&identity))
-        .await?;
+    let stage = prepare_ephemeral_stage(&adapter, prepare_request(&identity)).await?;
     let path = adapter.validate(&stage)?;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     tx.send(Ok(crate::storage::PositionedChunk {
@@ -75,9 +73,8 @@ async fn positioned_nfs_checkpoint_tracks_prefix_with_sparse_accepted_suffix()
         protocol.unstable_pressure.store(unstable, Ordering::SeqCst);
         let mut request = prepare_request(&identity);
         request.source.size = Some(12);
-        let mut stage = adapter.prepare_ephemeral(request).await?;
-        let registrations = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        enable_deferred_checkpointed(&mut stage, 4, 12, registrations.clone());
+        let mut stage = prepare_ephemeral_stage(&adapter, request).await?;
+        enable_deferred_checkpointed(&mut stage, 4, 12);
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         for (offset, data) in [(8, &b"ijkl"[..]), (0, &b"abcd"[..])] {
             tx.send(Ok(crate::storage::PositionedChunk {
@@ -91,7 +88,8 @@ async fn positioned_nfs_checkpoint_tracks_prefix_with_sparse_accepted_suffix()
         }));
         let feeder = async {
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while registrations.load(Ordering::SeqCst) == 0 {
+                // Recovery turns on once the first pointer is written.
+                while !stage.recovery_enabled() {
                     tokio::task::yield_now().await;
                 }
             })
@@ -130,9 +128,7 @@ async fn positioned_nfs_rejects_holes_and_overlap_and_drains_writes()
         vec![(4, &b"ef"[..]), (4, &b"ef"[..])],
     ] {
         let (adapter, protocol, identity) = adapter();
-        let stage = adapter
-            .prepare_ephemeral(prepare_request(&identity))
-            .await?;
+        let stage = prepare_ephemeral_stage(&adapter, prepare_request(&identity)).await?;
         assert!(
             adapter
                 .write_positioned(&stage, positioned_input(&parts))
@@ -146,21 +142,19 @@ async fn positioned_nfs_rejects_holes_and_overlap_and_drains_writes()
 }
 
 #[tokio::test]
-async fn positioned_nfs_threshold_crossing_at_eof_still_registers_checkpoint()
+async fn positioned_nfs_threshold_crossing_at_eof_still_writes_its_pointer()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::atomic::Ordering;
     for unstable in [false, true] {
         let (adapter, protocol, identity) = adapter();
         protocol.unstable_pressure.store(unstable, Ordering::SeqCst);
-        let mut stage = adapter
-            .prepare_ephemeral(prepare_request(&identity))
-            .await?;
-        let registrations = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        enable_deferred_checkpointed(&mut stage, 4, 6, registrations.clone());
+        let mut stage = prepare_ephemeral_stage(&adapter, prepare_request(&identity)).await?;
+        enable_deferred_checkpointed(&mut stage, 4, 6);
         adapter
             .write_positioned(&stage, positioned_input(&[(4, b"ef"), (0, b"abcd")]))
             .await?;
-        assert_eq!(registrations.load(Ordering::SeqCst), 1);
+        assert!(stage.recovery_enabled());
+        assert!(protocol.pointer_writes.load(Ordering::SeqCst) > 0);
         assert_eq!(adapter.observe_checkpoint(&stage).await?.durable_prefix, 6);
         assert_eq!(protocol.deferred_writes.load(Ordering::SeqCst), 0);
         assert_eq!(protocol.checkpoint_pending_writes.load(Ordering::SeqCst), 2);
@@ -172,9 +166,7 @@ async fn positioned_nfs_threshold_crossing_at_eof_still_registers_checkpoint()
 async fn ordered_nfs_writer_preserves_empty_chunk_and_empty_file_support()
 -> Result<(), Box<dyn std::error::Error>> {
     let (adapter, _, identity) = adapter();
-    let stage = adapter
-        .prepare_ephemeral(prepare_request(&identity))
-        .await?;
+    let stage = prepare_ephemeral_stage(&adapter, prepare_request(&identity)).await?;
     assert_eq!(
         adapter
             .write_single(&stage, Bytes::new())
@@ -240,9 +232,8 @@ async fn positioned_nfs_checkpoint_coalesces_thresholds_and_rebases_next_interva
         protocol.maximum_write_chunk.store(32, Ordering::SeqCst);
         let mut request = prepare_request(&identity);
         request.source.size = Some(24);
-        let mut stage = adapter.prepare_ephemeral(request).await?;
-        let registrations = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        enable_deferred_checkpointed(&mut stage, 4, 24, registrations.clone());
+        let mut stage = prepare_ephemeral_stage(&adapter, request).await?;
+        enable_deferred_checkpointed(&mut stage, 4, 24);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let input = Box::pin(stream::unfold(rx, |mut rx| async {
             rx.recv().await.map(|item| (item, rx))
@@ -259,7 +250,8 @@ async fn positioned_nfs_checkpoint_coalesces_thresholds_and_rebases_next_interva
                 })).await?;
                 wait_positioned_nfs_writes(&protocol, index + 1).await;
                 if prefix == 0 {
-                    assert_eq!(registrations.load(Ordering::SeqCst), 0);
+                    assert!(!stage.recovery_enabled());
+                    assert_eq!(protocol.pointer_writes.load(Ordering::SeqCst), 0);
                     assert_eq!(protocol.checkpoints.load(Ordering::SeqCst), 0);
                 } else {
                     wait_positioned_nfs_checkpoint(&adapter, &stage, prefix).await;

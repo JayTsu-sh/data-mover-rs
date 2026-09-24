@@ -7,6 +7,7 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream::FuturesOrdered;
 
+use super::at_destination::{remove_pointer, write_pointer};
 use super::source::{NfsProtocolFailure, entry_failure, role_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::artifacts::is_artifact_native;
@@ -112,9 +113,8 @@ pub(crate) struct NfsStagedDestinationAdapter {
 }
 
 pub(super) struct NfsStageState {
-    pub(super) checkpoint_created: std::sync::atomic::AtomicBool,
-    /// Set for a stage kept at the destination (ADR-0006): its pointer's nonce and identity.
-    pub(super) fence: Option<super::at_destination::Fence>,
+    /// The stage's pointer's nonce and transfer identity (ADR-0006).
+    pub(super) fence: super::at_destination::Fence,
 }
 
 struct NfsWriteProgress {
@@ -167,11 +167,7 @@ impl NfsStagedDestinationAdapter {
                 Transience::Permanent,
             )
         })?;
-        let path = if stage.at_destination {
-            super::at_destination::stage_path(stage)?
-        } else {
-            Self::validate_token_shape(&stage.token, stage.final_destination.path())?
-        };
+        let path = super::at_destination::stage_path(stage)?;
         if !self
             .owned_stages
             .lock()
@@ -238,92 +234,11 @@ impl NfsStagedDestinationAdapter {
             .map_err(|error| role_failure(stage.final_destination.path(), Operation::Write, error))
     }
 
-    async fn prepare_stage(
-        &self,
-        request: PrepareRequest,
-    ) -> Result<PreparedStage, StorageRoleFailure> {
-        checked_final(request.final_destination.path())?;
-        let name = crate::storage::artifacts::stage_name(request.final_destination.path().as_str());
-        let native = sibling_path(request.final_destination.path(), &name)?;
-        let token = Bytes::copy_from_slice(native.as_str().as_bytes());
-        let open_handle: Arc<dyn NfsStageFile> = self
-            .protocol
-            .create_empty_open(&native)
-            .await
-            .map_err(|error| {
-                role_failure(request.final_destination.path(), Operation::Prepare, error)
-            })?
-            .into();
-        let _ = self.claim_authority(token.clone());
-        self.prepared_handles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(token.clone(), open_handle);
-        let mut stage = PreparedStage::new(
-            self.identity.clone(),
-            request.final_destination,
-            token.clone(),
-            request.recovery_binding,
-            0,
-            None,
-        );
-        stage.backend_state = Some(Arc::new(NfsStageState {
-            checkpoint_created: std::sync::atomic::AtomicBool::new(false),
-            fence: None,
-        }));
-        Ok(stage)
-    }
-
-    pub(super) fn validate_token_shape(
-        token: &Bytes,
-        final_path: &StoragePath,
-    ) -> Result<StoragePath, StorageRoleFailure> {
-        Self::stage_token(token, final_path).map(|(path, _)| path)
-    }
-
-    pub(super) fn stage_id(
-        token: &Bytes,
-        final_path: &StoragePath,
-    ) -> Result<String, StorageRoleFailure> {
-        Self::stage_token(token, final_path).map(|(_, stage_id)| stage_id)
-    }
-
-    fn stage_token(
-        token: &Bytes,
-        final_path: &StoragePath,
-    ) -> Result<(StoragePath, String), StorageRoleFailure> {
-        let token = std::str::from_utf8(token)
-            .map_err(|_| failure(final_path, FailureClass::Corruption, Transience::Permanent))?;
-        let path = PathBuf::from(token);
-        let final_native = PathBuf::from(final_path.as_str());
-        let expected_parent = final_native
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new(""));
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| failure(final_path, FailureClass::Corruption, Transience::Permanent))?;
-        let stage_id = crate::storage::artifacts::stage_base(name, final_path.as_str())
-            .ok_or_else(|| failure(final_path, FailureClass::Conflict, Transience::Permanent))?;
-        if path.parent().unwrap_or_else(|| std::path::Path::new("")) != expected_parent
-            || path == final_native
-        {
-            return Err(failure(
-                final_path,
-                FailureClass::Conflict,
-                Transience::Permanent,
-            ));
-        }
-        let path = StoragePath::new(path.to_string_lossy())
-            .map_err(|_| failure(final_path, FailureClass::Corruption, Transience::Permanent))?;
-        Ok((path, stage_id.to_owned()))
-    }
-
-    pub(super) fn claim_authority(&self, token: Bytes) -> bool {
+    pub(super) fn claim_authority(&self, token: Bytes) {
         self.owned_stages
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(token)
+            .insert(token);
     }
 
     pub(super) fn release_authority(&self, stage: &PreparedStage) {
@@ -398,27 +313,9 @@ impl NfsStagedDestinationAdapter {
         stage: &PreparedStage,
         durable_prefix: u64,
     ) -> Result<(), StorageRoleFailure> {
-        // The caller has already confirmed this prefix durable. Later writes may proceed.
-        super::checkpoint::persist(self, stage, durable_prefix).await?;
-        if stage.recovery_enabled() {
-            return Ok(());
-        }
-        if stage.at_destination {
-            // The pointer is the whole recovery record; nothing registers where data-mover runs.
-            stage
-                .recovery_enabled
-                .store(true, std::sync::atomic::Ordering::Release);
-            return Ok(());
-        }
-        let identity = super::recovery::export(self, stage).await?;
-        let checkpoint = stage.deferred_checkpoint.as_ref().ok_or_else(|| {
-            failure(
-                stage.final_destination.path(),
-                FailureClass::Internal,
-                Transience::Permanent,
-            )
-        })?;
-        checkpoint.registration.register(stage, identity).await?;
+        // The caller has already confirmed this prefix durable. Later writes may proceed. The
+        // pointer is the whole recovery record: nothing registers where data-mover runs.
+        write_pointer(self, stage, durable_prefix, false).await?;
         stage
             .recovery_enabled
             .store(true, std::sync::atomic::Ordering::Release);
@@ -442,30 +339,6 @@ impl NfsStagedDestinationAdapter {
             .checkpoint()
             .await
             .map_err(|error| role_failure(stage.final_destination.path(), Operation::Write, error))
-    }
-
-    pub(super) async fn reobserve_checkpoint(
-        &self,
-        stage: &PreparedStage,
-    ) -> Result<u64, StorageRoleFailure> {
-        if stage.at_destination {
-            return super::at_destination::reobserve(self, stage).await;
-        }
-        let durable_prefix = super::checkpoint::load(
-            self,
-            stage.recovery_binding,
-            stage.final_destination.path(),
-            &Self::stage_id(&stage.token, stage.final_destination.path())?,
-        )
-        .await?;
-        if self.size(stage).await? < durable_prefix {
-            return Err(failure(
-                stage.final_destination.path(),
-                FailureClass::Corruption,
-                Transience::Permanent,
-            ));
-        }
-        Ok(durable_prefix)
     }
 
     async fn hash(
@@ -588,7 +461,7 @@ impl NfsStagedDestinationAdapter {
                 ..
             }) => {
                 if final_equivalent {
-                    super::checkpoint::remove(self, stage)
+                    remove_pointer(self, stage)
                         .await
                         .map_err(|error| PublicationFailure {
                             error,
@@ -622,7 +495,7 @@ impl NfsStagedDestinationAdapter {
                         ),
                         final_destination_changed: true,
                     })?;
-                super::checkpoint::remove(self, stage)
+                remove_pointer(self, stage)
                     .await
                     .map_err(|error| PublicationFailure {
                         error,
@@ -677,45 +550,21 @@ impl StagedDestination for NfsStagedDestinationAdapter {
         Some(crate::storage::backends::DEFAULT_CHECKPOINT_INTERVAL_BYTES)
     }
 
+    /// NFS keeps its recovery state at the destination: every stage is prepared through
+    /// [`StagedDestination::prepare_at_destination`].
     async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        let stage = self.prepare_stage(request).await?;
-        if let Err(error) = super::checkpoint::persist(self, &stage, 0).await {
-            let native = Self::validate_token_shape(&stage.token, stage.final_destination.path())?;
-            if let Some(handle) = self.take_prepared_handle(&stage.token) {
-                let _ = handle.close().await;
-            }
-            let _ = self.protocol.delete(&native).await;
-            self.release_authority(&stage);
-            return Err(error);
-        }
-        Ok(stage)
-    }
-
-    async fn prepare_ephemeral(
-        &self,
-        request: PrepareRequest,
-    ) -> Result<PreparedStage, StorageRoleFailure> {
-        self.prepare_stage(request)
-            .await
-            .map(PreparedStage::disable_recovery)
+        Err(unsupported(request.final_destination.path()))
     }
 
     async fn recovery_identity(
         &self,
         stage: &PreparedStage,
     ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        super::recovery::export(self, stage).await
-    }
-
-    async fn handoff_recovery(
-        &self,
-        stage: &PreparedStage,
-    ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        super::recovery::handoff(self, stage).await
+        Err(unsupported(stage.final_destination.path()))
     }
 
     async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        super::recovery::recover(self, request).await
+        Err(unsupported(request.final_destination.path()))
     }
 
     fn recovery_at_destination(&self) -> bool {
@@ -761,7 +610,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             ));
         }
         if stage.recovery_enabled() {
-            super::checkpoint::persist(self, stage, progress.persisted).await?;
+            write_pointer(self, stage, progress.persisted, false).await?;
         }
         Ok(WriteEvidence {
             persisted_bytes: progress.persisted,
@@ -804,7 +653,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             ));
         }
         if stage.recovery_enabled() {
-            super::checkpoint::persist(self, stage, progress.persisted).await?;
+            write_pointer(self, stage, progress.persisted, false).await?;
         }
         Ok(WriteEvidence {
             persisted_bytes: progress.persisted,
@@ -817,7 +666,7 @@ impl StagedDestination for NfsStagedDestinationAdapter {
     ) -> Result<CheckpointObservation, StorageRoleFailure> {
         Ok(CheckpointObservation {
             durable_prefix: if stage.recovery_enabled() {
-                self.reobserve_checkpoint(stage).await?
+                super::at_destination::reobserve(self, stage).await?
             } else {
                 self.size(stage).await?
             },
@@ -888,20 +737,18 @@ impl StagedDestination for NfsStagedDestinationAdapter {
             final_destination_changed: false,
         })?;
         let final_path = stage.final_destination.path().clone();
-        if stage.at_destination {
-            super::at_destination::before_publication(self, stage)
-                .await
-                .map_err(|error| PublicationFailure {
-                    error,
-                    final_destination_changed: false,
-                })?;
-        }
+        super::at_destination::before_publication(self, stage)
+            .await
+            .map_err(|error| PublicationFailure {
+                error,
+                final_destination_changed: false,
+            })?;
         if let Err(rename_error) = self.protocol.rename(&staged, &final_path).await {
             return self
                 .reconcile_rename_failure(stage, final_path, &request, rename_error)
                 .await;
         }
-        super::checkpoint::remove(self, stage)
+        remove_pointer(self, stage)
             .await
             .map_err(|error| PublicationFailure {
                 error,
@@ -915,40 +762,8 @@ impl StagedDestination for NfsStagedDestinationAdapter {
     }
 
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
-        let native = self.validate(&stage)?;
-        if stage.at_destination {
-            return super::at_destination::discard(self, &stage).await;
-        }
-        let close_failure = if let Some(handle) = self.take_prepared_handle(&stage.token) {
-            handle.close().await.err()
-        } else {
-            None
-        };
-        let stage_delete_failure = match self.protocol.delete(&native).await {
-            Ok(())
-            | Err(NfsProtocolFailure {
-                class: FailureClass::NotFound,
-                ..
-            }) => None,
-            Err(error) => Some(role_failure(
-                stage.final_destination.path(),
-                Operation::Write,
-                error,
-            )),
-        };
-        let checkpoint_delete_failure = super::checkpoint::remove(self, &stage).await.err();
-        if let Some(error) = stage_delete_failure.or(checkpoint_delete_failure) {
-            return Err(error);
-        }
-        self.release_authority(&stage);
-        if let Some(error) = close_failure {
-            return Err(role_failure(
-                stage.final_destination.path(),
-                Operation::Write,
-                error,
-            ));
-        }
-        Ok(())
+        self.validate(&stage)?;
+        super::at_destination::discard(self, &stage).await
     }
 }
 
@@ -1024,6 +839,15 @@ pub(super) fn sibling_path(
 
 fn failure(path: &StoragePath, class: FailureClass, transience: Transience) -> StorageRoleFailure {
     entry_failure(path, Operation::Write, class, transience)
+}
+
+fn unsupported(path: &StoragePath) -> StorageRoleFailure {
+    entry_failure(
+        path,
+        Operation::Prepare,
+        FailureClass::Unsupported,
+        Transience::Permanent,
+    )
 }
 
 fn publication_failure(
