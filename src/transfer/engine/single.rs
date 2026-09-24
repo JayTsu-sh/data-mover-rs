@@ -130,7 +130,7 @@ mod tests {
 
     use super::*;
     use crate::model::{IdentityStrength, SourceIdentity};
-    use crate::storage::{ByteStream, FinalDestination, PrepareRequest};
+    use crate::storage::{ByteStream, DestinationPrepareRequest, FinalDestination, PrepareRequest};
     use crate::transfer::{InflightLimits, TransferIdentity};
 
     struct CancelsAtEof {
@@ -195,11 +195,14 @@ mod tests {
         );
         let final_destination = FinalDestination::new(StoragePath::new("final")?);
         let stage = destination_role
-            .prepare(PrepareRequest {
-                final_destination: final_destination.clone(),
-                source: descriptor.clone(),
-                recovery_binding: [41; 32],
-            })
+            .prepare_at_destination(DestinationPrepareRequest::new(
+                PrepareRequest {
+                    final_destination: final_destination.clone(),
+                    source: descriptor.clone(),
+                    recovery_binding: [41; 32],
+                },
+                [41; 32],
+            ))
             .await?;
         let cancel = tokio_util::sync::CancellationToken::new();
         let request = TransferRequest::new(

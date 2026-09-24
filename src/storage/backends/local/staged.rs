@@ -26,9 +26,9 @@ use crate::storage::artifacts::{ArtifactKind, is_artifact_native};
 use crate::storage::durability::sync_directory;
 use crate::storage::{
     ByteStream, CheckpointObservation, DestinationPrepareRequest, MetadataMutation, PrepareRequest,
-    PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
-    RecoverRequest, RecoveryIdentity, StagedDestination, StagedMetadataApplicationFailure,
-    StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest, RecoverRequest,
+    RecoveryIdentity, StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure,
+    VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 mod at_destination;
@@ -40,7 +40,6 @@ mod owner_privilege;
 mod positioned;
 mod probe;
 mod publication;
-mod recovery;
 mod verification;
 
 #[cfg(unix)]
@@ -311,16 +310,14 @@ impl LocalStagedDestination {
         stage: &PreparedStage,
         operation: Operation,
     ) -> Result<std::ffi::OsString, StorageRoleFailure> {
-        if stage.at_destination {
-            return at_destination::artifact(
+        stage.validate_owner(&self.identity).map_err(|_| {
+            failure(
                 stage.final_destination.path(),
-                ArtifactKind::Pointer,
-                false,
-            );
-        }
-        let mut name = self.stage_name(stage, operation)?;
-        name.push(".checkpoint");
-        Ok(name)
+                operation,
+                FailureClass::Conflict,
+            )
+        })?;
+        at_destination::artifact(stage.final_destination.path(), ArtifactKind::Pointer, false)
     }
 
     /// The transfer identity of a destination-kept stage, which its pointer records.
@@ -337,58 +334,6 @@ impl LocalStagedDestination {
                     FailureClass::Corruption,
                 )
             })
-    }
-
-    fn claim_name(
-        &self,
-        stage: &PreparedStage,
-        operation: Operation,
-    ) -> Result<std::ffi::OsString, StorageRoleFailure> {
-        if stage.at_destination {
-            return at_destination::artifact(
-                stage.final_destination.path(),
-                ArtifactKind::Claim,
-                false,
-            );
-        }
-        let mut name = self.stage_name(stage, operation)?;
-        name.push(".claim");
-        Ok(name)
-    }
-
-    async fn acquire_claim(
-        &self,
-        stage: &PreparedStage,
-        create: bool,
-    ) -> Result<std::fs::File, StorageRoleFailure> {
-        let name = self.claim_name(stage, Operation::Prepare)?;
-        let staging = self.stage_directory(stage, Operation::Prepare).await?;
-        let path = stage.final_destination.path().clone();
-        tokio::task::spawn_blocking(move || {
-            let mut options = OpenOptions::new();
-            options
-                .read(true)
-                .write(true)
-                .create(create)
-                .create_new(create);
-            let file = staging.open_with(name, &options)?.into_std();
-            file.try_lock()?;
-            Ok::<_, io::Error>(file)
-        })
-        .await
-        .map_err(|_| failure(&path, Operation::Prepare, FailureClass::Internal))?
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::WouldBlock {
-                failure_with_transience(
-                    &path,
-                    Operation::Prepare,
-                    FailureClass::Conflict,
-                    Transience::Transient,
-                )
-            } else {
-                io_failure(&path, Operation::Prepare, &error)
-            }
-        })
     }
 
     async fn persist_checkpoint(
@@ -445,29 +390,13 @@ impl LocalStagedDestination {
         })?;
         let relative = Self::checked_relative(&storage_path, operation)?;
         let final_relative = Self::checked_relative(stage.final_destination.path(), operation)?;
-        // Only a destination-kept stage has the deterministic name; any other has a random one.
-        let deterministic = stage
-            .at_destination
-            .then(|| {
-                at_destination::artifact(stage.final_destination.path(), ArtifactKind::Stage, false)
-                    .ok()
-            })
-            .flatten();
-        let colocated = relative.parent() == final_relative.parent()
-            && relative
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    crate::storage::artifacts::stage_base(
-                        name,
-                        stage.final_destination.path().as_str(),
-                    ) == Some(name)
-                        || deterministic
-                            .as_deref()
-                            .is_some_and(|expected| expected == name)
-                })
-            && relative.extension() == Some(std::ffi::OsStr::new("stage"))
-            && relative != final_relative;
+        // The only stage name is the deterministic one beside the final file, and only a stage
+        // prepared at the destination has it.
+        let expected =
+            at_destination::artifact(stage.final_destination.path(), ArtifactKind::Stage, false)?;
+        let colocated = stage.at_destination
+            && relative.parent() == final_relative.parent()
+            && relative.file_name() == Some(expected.as_os_str());
         if !colocated {
             return Err(failure(
                 stage.final_destination.path(),
@@ -753,34 +682,10 @@ impl LocalStagedDestination {
         stage: &PreparedStage,
         persisted: u64,
     ) -> Result<(), StorageRoleFailure> {
-        let first = !stage.recovery_enabled();
-        if stage.at_destination {
-            // The claim is held since prepare, and the pointer is the whole recovery record.
-            self.persist_checkpoint(stage, persisted).await?;
-            stage.recovery_enabled.store(true, Ordering::Release);
-            return Ok(());
-        }
-        if first {
-            let claim = self.acquire_claim(stage, true).await?;
-            *stage
-                .claim
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(claim);
-        }
+        // The claim is held since prepare, and the pointer is the whole recovery record. Once it
+        // exists, failures must preserve the recoverable stage.
         self.persist_checkpoint(stage, persisted).await?;
-        if first {
-            // Once the durable checkpoint exists, failures must preserve recoverable stage state.
-            stage.recovery_enabled.store(true, Ordering::Release);
-            let checkpoint = stage.deferred_checkpoint.as_ref().ok_or_else(|| {
-                failure(
-                    stage.final_destination.path(),
-                    Operation::Prepare,
-                    FailureClass::Internal,
-                )
-            })?;
-            let identity = recovery::export(self, stage).await?;
-            checkpoint.registration.register(stage, identity).await?;
-        }
+        stage.recovery_enabled.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -827,139 +732,7 @@ impl LocalStagedDestination {
         stage: &PreparedStage,
         operation: Operation,
     ) -> Result<(), StorageRoleFailure> {
-        if stage.at_destination {
-            return at_destination::cleanup(self, stage, operation).await;
-        }
-        let stage_name = self.stage_name(stage, operation)?;
-        let checkpoint_name = self.checkpoint_name(stage, operation)?;
-        let mut guard_name = stage_name.clone();
-        guard_name.push(".existing");
-        let claim_name = self.claim_name(stage, operation)?;
-        let path = stage.final_destination.path();
-        let staging = self.stage_directory(stage, operation).await?;
-        let claim_staging = if stage.recovery_enabled() || stage.deferred_checkpoint.is_some() {
-            Some(
-                staging
-                    .try_clone()
-                    .map_err(|error| io_failure(path, operation, &error))?,
-            )
-        } else {
-            None
-        };
-        tokio::task::spawn_blocking(move || {
-            let stage_result = publication::remove_if_present(&staging, &stage_name);
-            let checkpoint_result = publication::remove_if_present(&staging, &checkpoint_name);
-            let guard_result = publication::remove_if_present(&staging, &guard_name);
-            let sync_result = sync_directory(&staging);
-            stage_result
-                .and(checkpoint_result)
-                .and(guard_result)
-                .and(sync_result)
-        })
-        .await
-        .map_err(|_| failure(path, operation, FailureClass::Internal))?
-        .map_err(|error| io_failure(path, operation, &error))?;
-
-        #[cfg(test)]
-        {
-            self.write_probe
-                .discard_contents_removed
-                .store(true, Ordering::SeqCst);
-            if self
-                .write_probe
-                .slow_discard_before_release
-                .load(Ordering::SeqCst)
-            {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-
-        stage.release_claim();
-        let Some(claim_staging) = claim_staging else {
-            return Ok(());
-        };
-        tokio::task::spawn_blocking(move || {
-            publication::remove_if_present(&claim_staging, &claim_name)?;
-            sync_directory(&claim_staging)
-        })
-        .await
-        .map_err(|_| failure(path, operation, FailureClass::Internal))?
-        .map_err(|error| io_failure(path, operation, &error))
-    }
-
-    async fn initialize_stage(
-        &self,
-        stage: PreparedStage,
-        file: Arc<std::fs::File>,
-        staging: Arc<Dir>,
-    ) -> Result<PreparedStage, StorageRoleFailure> {
-        let path = stage.final_destination.path();
-        let sync_result = tokio::task::spawn_blocking(move || {
-            file.sync_all()?;
-            sync_directory(&staging)
-        })
-        .await
-        .map_err(|_| failure(path, Operation::Prepare, FailureClass::Internal))?
-        .map_err(|error| io_failure(path, Operation::Prepare, &error));
-        if let Err(error) = sync_result {
-            return self.rollback_prepare(&stage, error).await;
-        }
-        if let Err(error) = self.persist_checkpoint(&stage, 0).await {
-            return self.rollback_prepare(&stage, error).await;
-        }
-        Ok(stage)
-    }
-
-    /// After a store-kept stage became the final file: releases and removes its claim.
-    async fn finish_store_publication(
-        &self,
-        stage: &PreparedStage,
-        final_destination: StoragePath,
-        disposition: PublicationDisposition,
-    ) -> Result<PublicationEvidence, PublicationFailure> {
-        let precommit = |error| PublicationFailure {
-            error,
-            final_destination_changed: false,
-        };
-        stage.release_claim();
-        if !stage.recovery_enabled() {
-            return Ok(PublicationEvidence {
-                final_destination,
-                disposition,
-            });
-        }
-        let claim_name = self
-            .claim_name(stage, Operation::Publish)
-            .map_err(precommit)?;
-        let staging = self
-            .stage_directory(stage, Operation::Publish)
-            .await
-            .map_err(precommit)?;
-        tokio::task::spawn_blocking(move || {
-            publication::remove_if_present(&staging, &claim_name)?;
-            sync_directory(&staging)
-        })
-        .await
-        .map_err(|_| PublicationFailure {
-            error: failure(
-                &final_destination,
-                Operation::Publish,
-                FailureClass::Internal,
-            ),
-            final_destination_changed: true,
-        })?
-        .map_err(|error| PublicationFailure {
-            error: io_failure(&final_destination, Operation::Publish, &error),
-            final_destination_changed: true,
-        })?;
-        Ok(PublicationEvidence {
-            final_destination,
-            disposition,
-        })
-    }
-
-    fn initialize_ephemeral_stage(stage: PreparedStage) -> PreparedStage {
-        stage.disable_recovery()
+        at_destination::cleanup(self, stage, operation).await
     }
 
     #[cfg(test)]
@@ -974,20 +747,6 @@ impl LocalStagedDestination {
         self.write_probe
             .checkpoint_failure
             .store(point, Ordering::SeqCst);
-    }
-
-    async fn rollback_prepare(
-        &self,
-        stage: &PreparedStage,
-        original: StorageRoleFailure,
-    ) -> Result<PreparedStage, StorageRoleFailure> {
-        match self
-            .cleanup_stage_artifacts(stage, Operation::Prepare)
-            .await
-        {
-            Ok(()) => Err(original),
-            Err(cleanup) => Err(cleanup),
-        }
     }
 
     fn open_or_create_parent(root: &Dir, parent: &Path) -> io::Result<Dir> {
@@ -1016,79 +775,6 @@ impl LocalStagedDestination {
             directory = next;
         }
         Ok(directory)
-    }
-
-    async fn prepare_mode(
-        &self,
-        request: PrepareRequest,
-        recovery_enabled: bool,
-    ) -> Result<PreparedStage, StorageRoleFailure> {
-        Self::validate_prepare_request(&request)?;
-        let root = Arc::clone(&self.root_dir);
-        let destination_path = request.final_destination.path().as_str().to_owned();
-        let relative =
-            Self::checked_relative(request.final_destination.path(), Operation::Prepare)?;
-        let parent = relative
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_owned();
-        let token_parent = relative
-            .parent()
-            .unwrap_or_else(|| Path::new(""))
-            .to_owned();
-        // Directory resolution and exclusive file creation are one blocking operation.
-        let (staging, file, name) = tokio::task::spawn_blocking(move || {
-            let staging = Self::open_or_create_parent(&root, &parent)?;
-            let mut options = OpenOptions::new();
-            options.create_new(true).read(true).write(true);
-            for _ in 0..32 {
-                let name = crate::storage::artifacts::stage_name(&destination_path);
-                match staging.open_with(&name, &options) {
-                    Ok(file) => return Ok((Arc::new(staging), file.into_std(), name)),
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(io::Error::from(io::ErrorKind::AlreadyExists))
-        })
-        .await
-        .map_err(|_| {
-            failure(
-                request.final_destination.path(),
-                Operation::Prepare,
-                FailureClass::Internal,
-            )
-        })?
-        .map_err(|error| {
-            io_failure(request.final_destination.path(), Operation::Prepare, &error)
-        })?;
-        let token = token_parent.join(name).to_string_lossy().into_owned();
-        let mut stage = PreparedStage::new(
-            self.identity.clone(),
-            request.final_destination,
-            Bytes::from(token),
-            request.recovery_binding,
-            0,
-            None,
-        );
-        let file = Arc::new(file);
-        Self::cache_stage(
-            &mut stage,
-            Arc::clone(&staging),
-            Some(Arc::clone(&file)),
-            true,
-            None,
-        )?;
-        if !recovery_enabled {
-            return Ok(Self::initialize_ephemeral_stage(stage));
-        }
-        let claim = match self.acquire_claim(&stage, true).await {
-            Ok(claim) => claim,
-            Err(error) => return self.rollback_prepare(&stage, error).await,
-        };
-        stage.claim = std::sync::Mutex::new(Some(claim));
-        self.initialize_stage(stage, file, staging).await
     }
 }
 
@@ -1183,33 +869,33 @@ impl StagedDestination for LocalStagedDestination {
         })
     }
 
+    /// Local keeps its recovery state at the destination: every stage is prepared through
+    /// [`StagedDestination::prepare_at_destination`].
     async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        self.prepare_mode(request, true).await
-    }
-
-    async fn prepare_ephemeral(
-        &self,
-        request: PrepareRequest,
-    ) -> Result<PreparedStage, StorageRoleFailure> {
-        self.prepare_mode(request, false).await
+        Err(failure(
+            request.final_destination.path(),
+            Operation::Prepare,
+            FailureClass::Unsupported,
+        ))
     }
 
     async fn recovery_identity(
         &self,
         stage: &PreparedStage,
     ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        if !stage.recovery_enabled() {
-            return Err(failure(
-                stage.final_destination.path(),
-                Operation::Prepare,
-                FailureClass::Unsupported,
-            ));
-        }
-        recovery::export(self, stage).await
+        Err(failure(
+            stage.final_destination.path(),
+            Operation::Prepare,
+            FailureClass::Unsupported,
+        ))
     }
 
     async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        recovery::recover(self, request).await
+        Err(failure(
+            request.final_destination.path(),
+            Operation::Prepare,
+            FailureClass::Unsupported,
+        ))
     }
 
     fn recovery_at_destination(&self) -> bool {
@@ -1463,11 +1149,10 @@ impl StagedDestination for LocalStagedDestination {
         let stage_name = self
             .stage_name(stage, Operation::Publish)
             .map_err(precommit)?;
-        // A destination-kept stage may have a pointer even before recovery was enabled (a pointer
-        // written just before a failed directory sync), so it always removes one.
-        let checkpoint_name = (stage.recovery_enabled() || stage.at_destination)
-            .then(|| self.checkpoint_name(stage, Operation::Publish))
-            .transpose()
+        // The pointer may exist even before recovery was enabled (one written just before a failed
+        // directory sync), so publication always removes it.
+        let checkpoint_name = self
+            .checkpoint_name(stage, Operation::Publish)
             .map_err(precommit)?;
         let final_relative =
             Self::checked_relative(stage.final_destination.path(), Operation::Publish)
@@ -1495,7 +1180,7 @@ impl StagedDestination for LocalStagedDestination {
                     durable,
                 },
                 &stage_name,
-                checkpoint_name.as_deref(),
+                Some(checkpoint_name.as_os_str()),
                 &final_relative,
                 &request,
                 &probe,
@@ -1511,12 +1196,8 @@ impl StagedDestination for LocalStagedDestination {
             final_destination_changed: false,
         })?;
         match result {
-            Ok(disposition) if stage.at_destination => {
-                at_destination::finish_publication(self, stage, final_destination, disposition)
-                    .await
-            }
             Ok(disposition) => {
-                self.finish_store_publication(stage, final_destination, disposition)
+                at_destination::finish_publication(self, stage, final_destination, disposition)
                     .await
             }
             Err(error) => Err(PublicationFailure {

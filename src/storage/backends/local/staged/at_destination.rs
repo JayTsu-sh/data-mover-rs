@@ -514,15 +514,17 @@ pub(super) async fn cleanup(
     stage: &PreparedStage,
     operation: Operation,
 ) -> Result<(), StorageRoleFailure> {
-    if !holds_claim(stage) {
-        return Ok(());
-    }
     let path = stage.final_destination.path();
+    // A stage that is not this adapter's, or whose token is not the stage beside its final file,
+    // fails here, before anything is looked at.
     let names = [
         artifact(path, ArtifactKind::Pointer, false)?,
         artifact(path, ArtifactKind::Pointer, true)?,
         adapter.stage_name(stage, operation)?,
     ];
+    if !holds_claim(stage) {
+        return Ok(());
+    }
     let claim = artifact(path, ArtifactKind::Claim, false)?;
     let directory = adapter.stage_directory(stage, operation).await?;
     let contents = Arc::clone(&directory);

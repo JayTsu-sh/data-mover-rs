@@ -4,7 +4,7 @@ use futures::stream;
 
 use super::*;
 use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, SourceVersion};
-use crate::storage::{FinalDestination, SourceDescriptor};
+use crate::storage::{FinalDestination, PrepareFact, RestartReason, ResumeMode, SourceDescriptor};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -56,6 +56,46 @@ fn request(identity: &BackendIdentity, destination: &str) -> PrepareRequest {
         },
         recovery_binding: [7; 32],
     }
+}
+
+/// A fresh stage: whatever an earlier stage of the file left is cleaned up first.
+async fn prepare_stage(
+    adapter: &LocalStagedDestination,
+    request: PrepareRequest,
+) -> Result<PreparedStage, StorageRoleFailure> {
+    adapter
+        .prepare_at_destination(at_destination(request, ResumeMode::Restart, true))
+        .await
+}
+
+/// A fresh stage whose first pointer waits for a checkpoint.
+async fn prepare_ephemeral_stage(
+    adapter: &LocalStagedDestination,
+    request: PrepareRequest,
+) -> Result<PreparedStage, StorageRoleFailure> {
+    adapter
+        .prepare_at_destination(at_destination(request, ResumeMode::Restart, false))
+        .await
+}
+
+/// Resumes what an earlier stage of the file left, as a new process would.
+async fn resume_stage(
+    adapter: &LocalStagedDestination,
+    request: PrepareRequest,
+) -> Result<PreparedStage, StorageRoleFailure> {
+    adapter
+        .prepare_at_destination(at_destination(request, ResumeMode::Discover, true))
+        .await
+}
+
+fn at_destination(
+    request: PrepareRequest,
+    resume: ResumeMode,
+    recoverable: bool,
+) -> DestinationPrepareRequest {
+    DestinationPrepareRequest::new(request, [3; 32])
+        .with_resume(resume)
+        .with_recoverable(recoverable)
 }
 
 fn bytes(items: &[&'static [u8]]) -> ByteStream {
@@ -116,8 +156,7 @@ async fn assert_checkpoint_failure_rolls_back(point: u64) -> io::Result<()> {
         .store(point, Ordering::SeqCst);
 
     assert!(
-        adapter
-            .prepare(request(&backend, "final.bin"))
+        prepare_stage(&adapter, request(&backend, "final.bin"))
             .await
             .is_err()
     );
@@ -145,7 +184,7 @@ async fn prepare_write_flush_checkpoint_and_discard_leave_final_unchanged() -> i
         .write_probe
         .force_out_of_order
         .store(true, Ordering::SeqCst);
-    let stage = ok(adapter.prepare(request(&backend, "final.bin")).await);
+    let stage = ok(prepare_stage(&adapter, request(&backend, "final.bin")).await);
 
     assert_eq!(
         tokio::fs::read(root.0.join("final.bin")).await?,
@@ -183,9 +222,11 @@ async fn write_submits_an_eight_mib_input_as_one_piece() -> io::Result<()> {
     let backend = identity("local-eight-mib-write-test");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
     let payload = Bytes::from(vec![0x5a; LOCAL_MAX_WRITE_CHUNK_BYTES]);
-    let stage = ok(adapter
-        .prepare(request_with_size(&backend, "final.bin", payload.len()))
-        .await);
+    let stage = ok(prepare_stage(
+        &adapter,
+        request_with_size(&backend, "final.bin", payload.len()),
+    )
+    .await);
 
     let evidence = ok(adapter
         .write(&stage, owned_bytes(vec![payload.clone()]))
@@ -228,9 +269,11 @@ async fn write_splits_an_oversized_input_and_preserves_the_tail() -> io::Result<
     let backend = identity("local-oversized-write-test");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
     let payload = Bytes::from(vec![0xa5; LOCAL_MAX_WRITE_CHUNK_BYTES + 17]);
-    let stage = ok(adapter
-        .prepare(request_with_size(&backend, "final.bin", payload.len()))
-        .await);
+    let stage = ok(prepare_stage(
+        &adapter,
+        request_with_size(&backend, "final.bin", payload.len()),
+    )
+    .await);
 
     let evidence = ok(adapter
         .write(&stage, owned_bytes(vec![payload.clone()]))
@@ -269,14 +312,13 @@ fn positional_write_retries_interrupted_and_completes_short_writes() {
 }
 
 #[tokio::test]
-async fn discard_keeps_recovery_claim_until_owned_contents_are_removed() -> io::Result<()> {
+async fn discard_keeps_the_claim_until_owned_contents_are_removed() -> io::Result<()> {
     let root = TestRoot::new().await?;
     let backend = identity("local-discard-recover-race-test");
     let adapter = Arc::new(ok(LocalStagedDestination::new(&root.0, backend.clone(), 1)));
     let prepare = request(&backend, "final.bin");
-    let stage = ok(adapter.prepare(prepare.clone()).await);
+    let stage = ok(prepare_stage(&adapter, prepare.clone()).await);
     ok(adapter.write(&stage, bytes(&[b"partial"])).await);
-    let recovery_identity = ok(adapter.recovery_identity(&stage).await);
     adapter.slow_discard_before_release();
 
     let discarding = {
@@ -287,39 +329,48 @@ async fn discard_keeps_recovery_claim_until_owned_contents_are_removed() -> io::
         tokio::task::yield_now().await;
     }
 
+    // Contents are gone but the claim is still held: a contender is refused, not handed a
+    // half-removed stage.
     let contender = ok(LocalStagedDestination::new(&root.0, backend, 1));
-    let recovery = contender
-        .recover(RecoverRequest {
-            identity: recovery_identity,
-            final_destination: prepare.final_destination,
-            source: prepare.source,
-            recovery_binding: prepare.recovery_binding,
-            claim_token: [1; 32],
-        })
-        .await;
-    assert!(recovery.is_err());
+    let refused = resume_stage(&contender, prepare.clone()).await;
+    assert!(matches!(
+        refused,
+        Err(StorageRoleFailure::Entry(ref error))
+            if error.class() == FailureClass::Conflict
+                && error.transience() == Transience::Transient
+    ));
     ok(discarding.await.map_err(io::Error::other)?);
     assert!(staging_is_empty(&root.0)?);
+    let after = ok(resume_stage(&contender, prepare).await);
+    assert_eq!(after.prepare_fact, PrepareFact::Fresh);
+    ok(contender.discard(after).await);
     Ok(())
 }
 
 #[tokio::test]
-async fn restart_prepares_distinct_empty_state_without_touching_final() -> io::Result<()> {
+async fn restart_cleans_the_earlier_stage_without_touching_final() -> io::Result<()> {
     let root = TestRoot::new().await?;
     tokio::fs::write(root.0.join("final.bin"), b"keep").await?;
     let backend = identity("local-restart-test");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
-    let first = ok(adapter.prepare(request(&backend, "final.bin")).await);
+    let first = ok(prepare_stage(&adapter, request(&backend, "final.bin")).await);
     ok(adapter.write(&first, bytes(&[b"old"])).await);
-    let restarted = ok(adapter.prepare(request(&backend, "final.bin")).await);
+    drop(first);
+    let restarted = ok(prepare_stage(&adapter, request(&backend, "final.bin")).await);
 
-    assert_ne!(first.token, restarted.token);
+    assert_eq!(
+        restarted.prepare_fact,
+        PrepareFact::Restarted {
+            reason: RestartReason::Requested
+        }
+    );
     assert_eq!(
         ok(adapter.observe_checkpoint(&restarted).await).durable_prefix,
         0
     );
+    let staged = ok(adapter.stage_full_path(&restarted, Operation::Verify));
+    assert_eq!(tokio::fs::metadata(staged).await?.len(), 0);
     assert_eq!(tokio::fs::read(root.0.join("final.bin")).await?, b"keep");
-    ok(adapter.discard(first).await);
     ok(adapter.discard(restarted).await);
     Ok(())
 }
@@ -329,7 +380,7 @@ async fn reobserved_checkpoint_rejects_truncated_staged_content() -> io::Result<
     let root = TestRoot::new().await?;
     let backend = identity("local-checkpoint-truncation-test");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
-    let stage = ok(adapter.prepare(request(&backend, "final.bin")).await);
+    let stage = ok(prepare_stage(&adapter, request(&backend, "final.bin")).await);
     ok(adapter.write(&stage, bytes(&[b"abcdef"])).await);
     let staged_path = ok(adapter.stage_full_path(&stage, Operation::Verify));
     tokio::fs::OpenOptions::new()
@@ -349,12 +400,12 @@ async fn reobserved_checkpoint_rejects_tampered_record() -> io::Result<()> {
     let root = TestRoot::new().await?;
     let backend = identity("local-checkpoint-tamper-test");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 1));
-    let stage = ok(adapter.prepare(request(&backend, "final.bin")).await);
+    let stage = ok(prepare_stage(&adapter, request(&backend, "final.bin")).await);
     ok(adapter.write(&stage, bytes(&[b"abc"])).await);
-    let stage_path = ok(adapter.stage_full_path(&stage, Operation::Verify));
-    let mut checkpoint_name = stage_path.file_name().unwrap_or_default().to_os_string();
-    checkpoint_name.push(".checkpoint");
-    let checkpoint_path = stage_path.with_file_name(checkpoint_name);
+    let checkpoint_path = root.0.join(crate::storage::artifacts::artifact_name(
+        "final.bin",
+        ArtifactKind::Pointer,
+    ));
     let mut record = tokio::fs::read(&checkpoint_path).await?;
     record[10] ^= 0x80;
     tokio::fs::write(checkpoint_path, record).await?;
@@ -375,7 +426,7 @@ async fn entry_failure_and_cancellation_preserve_unpublished_stage() -> io::Resu
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(0, Duration::from_millis(100));
-    let stage = ok(adapter.prepare(request(&backend, "final.bin")).await);
+    let stage = ok(prepare_stage(&adapter, request(&backend, "final.bin")).await);
     let failure = failure(
         &ok(StoragePath::new("source.bin")),
         Operation::Read,
@@ -415,8 +466,7 @@ async fn recoverable_write_advances_a_durable_prefix_before_input_ends() -> io::
         .force_out_of_order
         .store(true, Ordering::SeqCst);
     let prepare = request_with_size(&backend, "final.bin", CHECKPOINT_BYTES + 1);
-    let stage = Arc::new(ok(adapter.prepare(prepare.clone()).await));
-    let recovery_identity = ok(adapter.recovery_identity(&stage).await);
+    let stage = Arc::new(ok(prepare_stage(&adapter, prepare.clone()).await));
     let input: ByteStream = Box::pin(
         stream::iter((0..4).map(|_| Ok(Bytes::from(vec![0x63; 64 * 1024]))))
             .chain(stream::pending::<Result<Bytes, StorageRoleFailure>>()),
@@ -447,15 +497,13 @@ async fn recoverable_write_advances_a_durable_prefix_before_input_ends() -> io::
     drop(adapter);
 
     let reconnected = ok(LocalStagedDestination::new(&root.0, backend, 1));
-    let recovered = ok(reconnected
-        .recover(RecoverRequest {
-            identity: recovery_identity,
-            final_destination: prepare.final_destination,
-            source: prepare.source,
-            recovery_binding: prepare.recovery_binding,
-            claim_token: [3; 32],
-        })
-        .await);
+    let recovered = ok(resume_stage(&reconnected, prepare).await);
+    assert_eq!(
+        recovered.prepare_fact,
+        PrepareFact::Resumed {
+            bytes: CHECKPOINT_BYTES as u64
+        }
+    );
     assert_eq!(
         ok(reconnected.observe_checkpoint(&recovered).await).durable_prefix,
         CHECKPOINT_BYTES as u64
@@ -465,12 +513,18 @@ async fn recoverable_write_advances_a_durable_prefix_before_input_ends() -> io::
 }
 
 #[test]
-fn legacy_local_stage_names_are_rejected() {
-    for token in [
-        ".data-mover-0123456789abcdef-00003039-0000000000000001.stage",
-        ".data-mover-staging/old.stage",
+fn only_the_deterministic_stage_name_is_accepted() {
+    let deterministic = crate::storage::artifacts::artifact_name("final.bin", ArtifactKind::Stage);
+    let random = crate::storage::artifacts::stage_name("final.bin");
+    for (token, at_destination, accepted) in [
+        // The random name stages had before ADR-0006 C8, even for a stage kept at the destination.
+        (random.as_str(), true, false),
+        (".data-mover-staging/old.stage", true, false),
+        // The deterministic name, only for a stage prepared at the destination.
+        (deterministic.as_str(), false, false),
+        (deterministic.as_str(), true, true),
     ] {
-        let stage = PreparedStage::new(
+        let mut stage = PreparedStage::new(
             identity("legacy-name-test"),
             FinalDestination::new(ok(StoragePath::new("final.bin"))),
             Bytes::copy_from_slice(token.as_bytes()),
@@ -478,7 +532,14 @@ fn legacy_local_stage_names_are_rejected() {
             0,
             None,
         );
-        assert!(LocalStagedDestination::stage_relative(&stage, Operation::Prepare).is_err());
+        if at_destination {
+            stage.mark_at_destination(PrepareFact::Fresh);
+        }
+        assert_eq!(
+            LocalStagedDestination::stage_relative(&stage, Operation::Prepare).is_ok(),
+            accepted,
+            "{token} at_destination={at_destination}"
+        );
     }
 }
 
@@ -488,14 +549,12 @@ async fn paths_and_stage_ownership_are_confined_to_the_backend_root() -> io::Res
     let backend = identity("local-confinement-test");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 1));
     assert!(
-        adapter
-            .prepare(request(&backend, "../escape.bin"))
+        prepare_stage(&adapter, request(&backend, "../escape.bin"))
             .await
             .is_err()
     );
     assert!(
-        adapter
-            .prepare(request(&backend, ".data-mover-staging/final.bin"))
+        prepare_stage(&adapter, request(&backend, ".data-mover-staging/final.bin"))
             .await
             .is_err()
     );
@@ -534,8 +593,7 @@ async fn staging_symlink_cannot_escape_the_capability_root() -> io::Result<()> {
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 1));
 
     assert!(
-        adapter
-            .prepare(request(&backend, "subdir/final.bin"))
+        prepare_stage(&adapter, request(&backend, "subdir/final.bin"))
             .await
             .is_err()
     );
@@ -553,9 +611,11 @@ async fn cancelled_publication_preserves_destination_and_stage() -> io::Result<(
         let backend = identity("local-cancelled-publication-test");
         let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 1));
         let payload = Bytes::from_static(b"new bytes");
-        let stage = ok(adapter
-            .prepare_ephemeral(request_with_size(&backend, "final.bin", payload.len()))
-            .await);
+        let stage = ok(prepare_ephemeral_stage(
+            &adapter,
+            request_with_size(&backend, "final.bin", payload.len()),
+        )
+        .await);
         ok(adapter
             .write(&stage, owned_bytes(vec![payload.clone()]))
             .await);
@@ -596,9 +656,11 @@ async fn single_source_chunk_splits_into_concurrent_destination_writes() -> io::
     let backend = identity("single-source-concurrent-write");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
     let payload = Bytes::from(vec![0xa7; LOCAL_MAX_WRITE_CHUNK_BYTES + 4096]);
-    let stage = ok(adapter
-        .prepare_ephemeral(request_with_size(&backend, "final.bin", payload.len()))
-        .await);
+    let stage = ok(prepare_ephemeral_stage(
+        &adapter,
+        request_with_size(&backend, "final.bin", payload.len()),
+    )
+    .await);
     adapter
         .write_probe
         .force_out_of_order
@@ -627,7 +689,7 @@ async fn checkpoint_persistence_overlaps_the_next_write_window() -> io::Result<(
     let root = TestRoot::new().await?;
     let backend = identity("checkpoint-overlap");
     let adapter = Arc::new(ok(LocalStagedDestination::new(&root.0, backend.clone(), 2)));
-    let stage = ok(adapter.prepare(request(&backend, "final.bin")).await);
+    let stage = ok(prepare_stage(&adapter, request(&backend, "final.bin")).await);
     let probe = Arc::clone(&adapter.write_probe);
     probe.pause_checkpoint.store(true, Ordering::SeqCst);
     let writing = Arc::clone(&adapter);
@@ -673,7 +735,7 @@ async fn nested_stages_recover_in_the_parent() -> io::Result<()> {
     let backend = identity("nested-stage-recovery");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
     let prepare = request(&backend, "nested/deep/final.bin");
-    let stage = ok(adapter.prepare(prepare.clone()).await);
+    let stage = ok(prepare_stage(&adapter, prepare.clone()).await);
     let stage_path = ok(adapter.stage_full_path(&stage, Operation::Read));
     assert_eq!(
         stage_path.parent(),
@@ -683,17 +745,8 @@ async fn nested_stages_recover_in_the_parent() -> io::Result<()> {
     ok(adapter
         .write(&stage, owned_bytes(vec![Bytes::from_static(b"new-bytes")]))
         .await);
-    let recovery = ok(adapter.recovery_identity(&stage).await);
     drop(stage);
-    let recovered = ok(adapter
-        .recover(RecoverRequest {
-            identity: recovery,
-            final_destination: prepare.final_destination,
-            source: prepare.source,
-            recovery_binding: prepare.recovery_binding,
-            claim_token: [3; 32],
-        })
-        .await);
+    let recovered = ok(resume_stage(&adapter, prepare).await);
     assert_eq!(recovered.write_offset, 9);
     ok(adapter
         .publish(
@@ -719,9 +772,7 @@ async fn publication_resolves_a_replaced_parent_and_preserves_existing_entries()
     let root = TestRoot::new().await?;
     let backend = identity("replaced-publication-parent");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
-    let stage = ok(adapter
-        .prepare_ephemeral(request(&backend, "nested/final.bin"))
-        .await);
+    let stage = ok(prepare_ephemeral_stage(&adapter, request(&backend, "nested/final.bin")).await);
     ok(adapter
         .write(&stage, owned_bytes(vec![Bytes::from_static(b"new-bytes")]))
         .await);
@@ -763,9 +814,7 @@ async fn repeated_writes_normalize_the_previous_tail() -> io::Result<()> {
         let root = TestRoot::new().await?;
         let backend = identity("repeated-stage-length");
         let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
-        let stage = ok(adapter
-            .prepare_ephemeral(request(&backend, "final.bin"))
-            .await);
+        let stage = ok(prepare_ephemeral_stage(&adapter, request(&backend, "final.bin")).await);
         for payload in [b"long payload".as_slice(), b"new", b""] {
             let data = Bytes::copy_from_slice(payload);
             if single {
@@ -793,24 +842,17 @@ async fn recovered_stage_with_no_remaining_input_removes_uncheckpointed_tail() -
     let root = TestRoot::new().await?;
     let backend = identity("recovered-stage-tail");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
-    let stage = ok(adapter.prepare(request(&backend, "final.bin")).await);
+    let stage = ok(prepare_stage(&adapter, request(&backend, "final.bin")).await);
     ok(adapter.write(&stage, bytes(&[b"abc"])).await);
-    let recovery = ok(adapter.recovery_identity(&stage).await);
     let path = ok(adapter.stage_full_path(&stage, Operation::Write));
     std::fs::OpenOptions::new()
         .write(true)
         .open(&path)?
         .set_len(128)?;
-    stage.release_claim();
-    let recovered = ok(adapter
-        .recover(RecoverRequest {
-            final_destination: stage.final_destination.clone(),
-            recovery_binding: stage.recovery_binding,
-            identity: recovery,
-            source: request(&backend, "final.bin").source,
-            claim_token: [3; 32],
-        })
-        .await);
+    drop(stage);
+    let recovered = ok(resume_stage(&adapter, request(&backend, "final.bin")).await);
+    // Resuming already drops what lies past the durable prefix; writing nothing keeps it so.
+    assert_eq!(tokio::fs::metadata(&path).await?.len(), 3);
     ok(adapter.write(&recovered, bytes(&[])).await);
     assert_eq!(tokio::fs::read(path).await?, b"abc");
     ok(adapter.discard(recovered).await);
@@ -822,9 +864,7 @@ async fn failed_first_write_does_not_skip_length_normalization_on_retry() -> io:
     let root = TestRoot::new().await?;
     let backend = identity("failed-stage-retry");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
-    let stage = ok(adapter
-        .prepare_ephemeral(request(&backend, "final.bin"))
-        .await);
+    let stage = ok(prepare_ephemeral_stage(&adapter, request(&backend, "final.bin")).await);
     let error = failure(
         stage.final_destination.path(),
         Operation::Write,
@@ -851,12 +891,8 @@ async fn cached_stage_rejects_a_rebound_token() -> io::Result<()> {
     let root = TestRoot::new().await?;
     let backend = identity("cached-stage-binding");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
-    let mut first = ok(adapter
-        .prepare_ephemeral(request(&backend, "final.bin"))
-        .await);
-    let second = ok(adapter
-        .prepare_ephemeral(request(&backend, "final.bin"))
-        .await);
+    let mut first = ok(prepare_ephemeral_stage(&adapter, request(&backend, "final.bin")).await);
+    let second = ok(prepare_ephemeral_stage(&adapter, request(&backend, "other.bin")).await);
     let original = first.token.clone();
     first.token = second.token.clone();
     assert!(
@@ -883,9 +919,7 @@ async fn positioned_write_stores_later_chunk_before_receiving_prefix() -> io::Re
     let root = TestRoot::new().await?;
     let backend = identity("positioned-write");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
-    let stage = ok(adapter
-        .prepare(request_with_size(&backend, "final.bin", 8))
-        .await);
+    let stage = ok(prepare_stage(&adapter, request_with_size(&backend, "final.bin", 8)).await);
     let path = ok(adapter.stage_full_path(&stage, Operation::Read));
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     let input = Box::pin(stream::unfold(receiver, |mut receiver| async move {
@@ -937,9 +971,7 @@ async fn positioned_cancel_preserves_only_contiguous_prefix() -> io::Result<()> 
     let root = TestRoot::new().await?;
     let backend = identity("positioned-cancel");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 3));
-    let stage = ok(adapter
-        .prepare(request_with_size(&backend, "final.bin", 12))
-        .await);
+    let stage = ok(prepare_stage(&adapter, request_with_size(&backend, "final.bin", 12)).await);
     let cancelled = failure(
         stage.final_destination.path(),
         Operation::Read,
@@ -978,9 +1010,7 @@ async fn positioned_eof_with_hole_is_corruption_not_checkpointed_length() -> io:
     let root = TestRoot::new().await?;
     let backend = identity("positioned-hole");
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 2));
-    let stage = ok(adapter
-        .prepare(request_with_size(&backend, "final.bin", 8))
-        .await);
+    let stage = ok(prepare_stage(&adapter, request_with_size(&backend, "final.bin", 8)).await);
     let input = Box::pin(stream::iter(vec![Ok(PositionedChunk {
         offset: 4,
         data: Bytes::from_static(b"efgh"),
@@ -1007,7 +1037,7 @@ async fn positioned_checkpoint_persistence_overlaps_the_next_write_window() -> i
     let root = TestRoot::new().await?;
     let backend = identity("positioned-checkpoint-overlap");
     let adapter = Arc::new(ok(LocalStagedDestination::new(&root.0, backend.clone(), 2)));
-    let stage = ok(adapter.prepare(request(&backend, "final.bin")).await);
+    let stage = ok(prepare_stage(&adapter, request(&backend, "final.bin")).await);
     let probe = Arc::clone(&adapter.write_probe);
     probe.pause_checkpoint.store(true, Ordering::SeqCst);
     let writing = Arc::clone(&adapter);
@@ -1074,9 +1104,11 @@ async fn positioned_checkpoint_distinguishes_final_crossing_from_earlier_boundar
         let root = TestRoot::new().await?;
         let backend = identity("positioned-checkpoint-boundaries");
         let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 3));
-        let mut stage = ok(adapter
-            .prepare_ephemeral(request_with_size(&backend, "final.bin", size))
-            .await);
+        let mut stage = ok(prepare_ephemeral_stage(
+            &adapter,
+            request_with_size(&backend, "final.bin", size),
+        )
+        .await);
         let registration = Arc::new(PositionedRegistration(AtomicU64::new(0)));
         stage.deferred_checkpoint = Some(DeferredCheckpoint {
             interval_bytes: 6,
@@ -1093,7 +1125,13 @@ async fn positioned_checkpoint_distinguishes_final_crossing_from_earlier_boundar
             ok(adapter.write_positioned(&stage, input).await).persisted_bytes,
             size as u64
         );
-        assert_eq!(registration.0.load(Ordering::SeqCst), expected);
+        // The pointer is the only record: a checkpoint shows as a pointer write, never as a
+        // registration.
+        assert_eq!(registration.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            observed_checkpoint_prefixes(&adapter).is_empty(),
+            expected == 0
+        );
         assert_eq!(stage.recovery_enabled(), expected != 0);
         ok(adapter.discard(stage).await);
     }
@@ -1156,9 +1194,8 @@ async fn positioned_sparse_completion_crosses_multiple_intervals_once() -> io::R
     let backend = identity("positioned-sparse-threshold");
     // Depth one makes the next input poll an acknowledgement barrier for the prior write.
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 1));
-    let mut stage = ok(adapter
-        .prepare_ephemeral(request_with_size(&backend, "final.bin", 24))
-        .await);
+    let mut stage =
+        ok(prepare_ephemeral_stage(&adapter, request_with_size(&backend, "final.bin", 24)).await);
     let registration = Arc::new(PositionedRegistration(AtomicU64::new(0)));
     stage.deferred_checkpoint = Some(DeferredCheckpoint {
         interval_bytes: 4,
@@ -1181,19 +1218,11 @@ async fn positioned_sparse_completion_crosses_multiple_intervals_once() -> io::R
         tokio::time::timeout(Duration::from_secs(3), polled.recv()).await?;
         send_positioned_then_wait_for_next_poll(&sender, &mut polled, 16, 4).await?;
         send_positioned_then_wait_for_next_poll(&sender, &mut polled, 4, 8).await?;
-        assert_eq!(registration.0.load(Ordering::SeqCst), 0);
         assert!(!stage.recovery_enabled());
         assert!(observed_checkpoint_prefixes(&adapter).is_empty());
         // Filling 0..4 joins 4..12. The sparse 16..20 suffix is still ineligible.
         send_positioned_then_wait_for_next_poll(&sender, &mut polled, 0, 4).await?;
         wait_for_durable_prefix(&adapter, &stage, 12).await?;
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while registration.0.load(Ordering::SeqCst) != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await?;
-        assert_eq!(registration.0.load(Ordering::SeqCst), 1);
         assert_eq!(observed_checkpoint_prefixes(&adapter), [12]);
         assert_eq!(
             tokio::fs::metadata(ok(adapter.stage_full_path(&stage, Operation::Read)))
@@ -1220,7 +1249,7 @@ async fn positioned_sparse_completion_crosses_multiple_intervals_once() -> io::R
     assert_eq!(ok(written).persisted_bytes, 24);
     // Two periodic checkpoints plus the final checkpoint, no redundant threshold replay.
     assert_eq!(observed_checkpoint_prefixes(&adapter), [12, 20, 24]);
-    assert_eq!(registration.0.load(Ordering::SeqCst), 1);
+    assert_eq!(registration.0.load(Ordering::SeqCst), 0);
     assert_eq!(
         tokio::fs::read(ok(adapter.stage_full_path(&stage, Operation::Read))).await?,
         vec![42; 24]

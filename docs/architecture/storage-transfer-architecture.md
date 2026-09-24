@@ -585,8 +585,9 @@ non-Unix platforms); NFS captures the server's mtime and ctime. Atime is exclude
 in-place edit therefore selects a fresh binding instead of reusing an old durable prefix, even
 when read-back verification is disabled.
 
-The Local identity binds the transfer identity, source identity/path/size/version, destination backend
-identity, final destination, stage token, and checkpoint record. Its checkpoint records only a contiguous prefix after the
+Local (since ADR-0006 C8) records its checkpoint in the destination pointer beside the final file,
+bound to the recovery binding and transfer identity; there is no Local recovery identity, stage token
+or claim file in the local store. Its pointer records only a contiguous prefix after the
 staged file has crossed a persistence barrier. Recoverable Local writes pause input after each
 backend-owned 256 MiB interval, drain inflight positional writes, verify the completed range is
 contiguous, synchronize file data and length, and atomically replace the checkpoint record before
@@ -595,8 +596,9 @@ for BLAKE3 but emits writes only after the re-observed durable prefix. A supplie
 strict recovery semantics: a missing, invalid, conflicting, or mismatched backend state fails
 without deleting unknown state or restarting implicitly. Observing a recovery identity is
 non-mutating. Only explicit failure handoff transfers recovery authority out of the current
-process; NFS releases its adapter-local claim during that handoff. Local holds a persistent
-per-stage claim file under an exclusive OS file lock. NFS recovery additionally requires a
+process; NFS releases its adapter-local claim during that handoff. Local holds its
+`.data-mover-<digest>.claim` beside the final file under an exclusive OS file lock from prepare until
+publication or discard. NFS recovery additionally requires a
 caller-persisted, per-attempt claim token: the adapter derives a deterministic claimed path from
 the opaque identity and token, then atomically renames the old stage. The same token makes a
 lost result idempotently re-enterable after process restart; different tokens ensure competing
@@ -722,7 +724,7 @@ changes `acceptance-gates.md`. No document duplicates another's authority.
 
 ### Local execution and automatic recovery
 
-The accepted decision is [ADR-0001](../adr/0001-local-transfer-execution-and-recovery.md). Ordinary Local transfers default to automatic recovery: a 64 MiB destination checkpoint interval, with eligibility requiring a file strictly larger than that interval and more than one effective source chunk, selected once before payload I/O. Checkpointed uses this rule; a checkpoint boundary reached at end of file skips the periodic checkpoint and proceeds to final synchronization and publication. Eligible fresh stages are registered only at their first durable checkpoint. Smaller multi-chunk transfers still use inflight reads and writes without checkpoint registration. AtomicReplace skips new checkpoints and Local final durability barriers. See [ADR-0002](../adr/0002-auto-and-quick-policy.md).
+The accepted decision is [ADR-0001](../adr/0001-local-transfer-execution-and-recovery.md). Ordinary Local transfers default to automatic recovery: a 64 MiB destination checkpoint interval, with eligibility requiring a file strictly larger than that interval and more than one effective source chunk, selected once before payload I/O. Checkpointed uses this rule; a checkpoint boundary reached at end of file skips the periodic checkpoint and proceeds to final synchronization and publication. Eligible fresh stages write their first destination pointer at their first durable checkpoint (destinations that still use the local recovery store register there instead). Smaller multi-chunk transfers still use inflight reads and writes without checkpoint registration. AtomicReplace skips new checkpoints and Local final durability barriers. See [ADR-0002](../adr/0002-auto-and-quick-policy.md).
 
 Single-source-chunk transfers bypass the producer/channel but preserve source length checks, cancellation and atomic publication; final durability follows Checkpointed or AtomicReplace. Backend write ceilings independently govern splitting and concurrent writes. `Bytes` slices retain their allocations; Local does not concatenate source fragments to fill its maximum write size. Prepared stages reuse directory capabilities within an attempt.
 
@@ -759,10 +761,10 @@ Local destination-resident recovery (ADR-0006 C8): Local no longer uses the loca
 durable prefix; the flock'd claim is held from prepare until publication or discard. The random-name
 layout below still describes NFS and CIFS until they move (C10, C11).
 
-Local/NFS artifact naming follow-up: new stages use the shared
+NFS artifact naming (Local used it too until ADR-0006 C8): new stages use the shared
 `.data-mover-<destination-path-hash-16>-<uuid-32>.stage` base name in the final parent.
 Checkpoints append `.checkpoint`; checkpoint update temporaries append `.tmp-<uuid-32>`.
-Local retains its `.claim` file lock. NFS claim rename appends `.claim-<claim-id-32>`
+NFS claim rename appends `.claim-<claim-id-32>`
 to the stage base name, while its checkpoint name remains based on the unchanged base.
 RecoveryIdentity still carries one current stage token. Only the unified naming format is
 accepted for recovery; legacy stage names and the old centralized staging layout are rejected.
