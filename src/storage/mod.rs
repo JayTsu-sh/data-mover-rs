@@ -8,8 +8,6 @@ mod create_dir;
 mod delete_tree;
 mod descriptor;
 pub(crate) mod durability;
-// Wired into every backend's connect path by ADR-0006 C4b.
-#[allow(dead_code)]
 pub(crate) mod endpoint;
 mod factory;
 mod handle;
@@ -41,6 +39,7 @@ pub use descriptor::SourceDescriptor;
 pub use factory::{
     BackendConfig, BackendConnectError, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy,
     HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, connect_backend,
+    endpoint_identity,
 };
 pub use handle::Storage;
 pub use roles::{

@@ -8,14 +8,16 @@ pub struct HDFSStorage {
 }
 
 impl HDFSStorage {
-    /// Builds the architecture-ready role handle for this connected HDFS backend.
+    /// Builds the architecture-ready role handle for this connected HDFS backend. Its identity is
+    /// the location's canonical endpoint (ADR-0006), the one
+    /// [`crate::storage::endpoint_identity`] derives from the same location.
     ///
     /// # Errors
-    /// Returns an error when the identity is not HDFS or roles contradict capabilities.
+    /// Returns an error when no endpoint can be derived or roles contradict capabilities.
     pub fn architecture_storage(
         &self,
-        identity: crate::model::BackendIdentity,
     ) -> Result<crate::storage::Storage, Box<dyn std::error::Error>> {
+        let identity = self.location.endpoint_identity()?;
         crate::storage::backends::hdfs::connect(Arc::new(self.clone()), identity)
     }
 

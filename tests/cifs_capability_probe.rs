@@ -6,7 +6,7 @@ mod common;
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use data_mover::model::{BackendIdentity, BackendKind, FailureClass, StoragePath};
+use data_mover::model::{FailureClass, StoragePath};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, NamespaceRequest,
     PreflightPolicy, StorageRoleFailure, connect_backend,
@@ -323,7 +323,6 @@ async fn probe_symlink_named(share: &smb_domain::Share, target: &Endpoint, name:
         ensure_dir: false,
         username: target.user.clone(),
         password: target.pass.clone(),
-        identity: BackendIdentity::new(BackendKind::Cifs, "symlink-probe")?,
     }))
     .await?;
     let namespace = storage.namespace(&PreflightPolicy::production())?;
@@ -352,10 +351,6 @@ async fn probe_namespace_role(target: &Endpoint) -> Result {
         ensure_dir: false,
         username: target.user.clone(),
         password: target.pass.clone(),
-        identity: BackendIdentity::new(
-            BackendKind::Cifs,
-            format!("{}/{}", target.server, target.share),
-        )?,
     }))
     .await?;
     let namespace = storage.namespace(&PreflightPolicy::production())?;

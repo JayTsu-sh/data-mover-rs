@@ -2,13 +2,12 @@
 
 use std::io;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 
-use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
 
 pub(crate) mod namespace;
@@ -22,15 +21,16 @@ pub(crate) mod source;
 #[allow(dead_code)]
 pub(crate) mod staged;
 
+/// Connects the Local roles over `root`, which must exist. The identity is `file:///<realpath>`
+/// (ADR-0006) and every role is given that same canonical root (a role may canonicalize it again;
+/// a symlink swapped in between would be the only way for them to diverge).
 pub(crate) fn connect_transfer(
-    root: PathBuf,
-    identity: BackendIdentity,
+    root: &Path,
     read_concurrency: NonZeroUsize,
     write_concurrency: NonZeroUsize,
 ) -> Result<Storage, Box<dyn std::error::Error>> {
-    if identity.kind() != BackendKind::Local {
-        return Err("Local roles require a Local backend identity".into());
-    }
+    let root = std::fs::canonicalize(root)?;
+    let identity = crate::storage::endpoint::local(&root)?;
     let source = Arc::new(source::LocalReadSource::new(
         &root,
         identity.clone(),
@@ -68,8 +68,7 @@ pub(crate) fn connect_transfer(
 
 /// Opens the root directory capability shared by the observation and namespace roles.
 fn open_root(root: &Path) -> io::Result<Arc<Dir>> {
-    let canonical = std::fs::canonicalize(root)?;
-    Dir::open_ambient_dir(canonical, ambient_authority()).map(Arc::new)
+    Dir::open_ambient_dir(std::fs::canonicalize(root)?, ambient_authority()).map(Arc::new)
 }
 
 #[cfg(test)]

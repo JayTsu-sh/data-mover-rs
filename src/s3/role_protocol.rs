@@ -575,7 +575,6 @@ mod tests {
 
     struct InvalidManifestFixture {
         backend: S3Storage,
-        identity: crate::model::BackendIdentity,
         prepare: crate::storage::PrepareRequest,
         recovery: crate::storage::RecoveryIdentity,
     }
@@ -588,7 +587,7 @@ mod tests {
         use crate::storage::{FinalDestination, PreflightPolicy, PrepareRequest, SourceDescriptor};
         let backend = S3Storage::new(&std::env::var("LAB_S3_ARCHITECTURE_URL")?, None).await?;
         let identity = BackendIdentity::new(BackendKind::S3, "standard-s3-invalid-recovery")?;
-        let storage = backend.architecture_storage(identity.clone())?;
+        let storage = backend.architecture_storage()?;
         let destination = storage.staged_destination(&PreflightPolicy::production())?;
         let source = SourceDescriptor {
             path: StoragePath::new("generated-source")?,
@@ -627,7 +626,6 @@ mod tests {
             .await?;
         Ok(InvalidManifestFixture {
             backend,
-            identity: storage.identity().clone(),
             prepare,
             recovery,
         })
@@ -639,7 +637,7 @@ mod tests {
         use crate::storage::{PreflightPolicy, RecoverRequest};
         let reconnected = fixture
             .backend
-            .architecture_storage(fixture.identity)?
+            .architecture_storage()?
             .staged_destination(&PreflightPolicy::production())?;
         let result = reconnected
             .recover(RecoverRequest {

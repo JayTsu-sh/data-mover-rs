@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use data_mover::model::{BackendIdentity, BackendKind, ObservedEntry, StoragePath};
+use data_mover::model::{ObservedEntry, StoragePath};
 use data_mover::storage::{
     BackendConfig, LocalBackendConfig, PreflightPolicy, Storage, connect_backend,
 };
@@ -12,10 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-async fn local_storage(root: &std::path::Path, stable_id: &str) -> TestResult<Storage> {
+async fn local_storage(root: &std::path::Path) -> TestResult<Storage> {
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
         root: root.to_path_buf(),
-        identity: BackendIdentity::new(BackendKind::Local, stable_id)?,
         read_concurrency: NonZeroUsize::new(2).ok_or("non-zero read concurrency")?,
         write_concurrency: NonZeroUsize::new(2).ok_or("non-zero write concurrency")?,
     }))
@@ -41,7 +40,7 @@ async fn expert_source_hashes_the_whole_file_but_emits_only_after_durable_prefix
         .map(|index| u8::try_from(index % 251).unwrap_or_else(|_| unreachable!()))
         .collect::<Vec<_>>();
     tokio::fs::write(root.path().join("payload.bin"), &payload).await?;
-    let storage = local_storage(root.path(), "expert-source").await?;
+    let storage = local_storage(root.path()).await?;
     let observation = observe(&storage, "payload.bin").await?;
     let session = ExpertSourceSession::open(ExpertSourceRequest::new(
         TransferIdentity::new("expert-source-attempt")?,
@@ -74,9 +73,8 @@ async fn expert_source_and_destination_share_verified_publication_lifecycle() ->
     let destination_root = tempfile::tempdir()?;
     let payload = vec![0x5a; 256 * 1024 + 17];
     tokio::fs::write(source_root.path().join("payload.bin"), &payload).await?;
-    let source_storage = local_storage(source_root.path(), "expert-e2e-source").await?;
-    let destination_storage =
-        local_storage(destination_root.path(), "expert-e2e-destination").await?;
+    let source_storage = local_storage(source_root.path()).await?;
+    let destination_storage = local_storage(destination_root.path()).await?;
     let observation = observe(&source_storage, "payload.bin").await?;
     let identity = TransferIdentity::new("expert-e2e")?;
     let limits = InflightLimits::new(2, 128 * 1024, 2)?;
@@ -138,9 +136,8 @@ async fn expert_destination_checkpoints_only_multi_source_chunk_payloads() -> Te
     )
     .await?;
     tokio::fs::write(source_root.path().join("small.bin"), vec![4; 4 * 1024]).await?;
-    let source_storage = local_storage(source_root.path(), "expert-recovery-source").await?;
-    let destination_storage =
-        local_storage(destination_root.path(), "expert-recovery-destination").await?;
+    let source_storage = local_storage(source_root.path()).await?;
+    let destination_storage = local_storage(destination_root.path()).await?;
     let limits = InflightLimits::new(2, 128 * 1024, 2)?;
 
     let large = ExpertDestinationSession::prepare(

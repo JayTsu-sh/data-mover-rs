@@ -301,6 +301,22 @@ impl HdfsLocation {
     pub fn root(&self) -> &str {
         &self.root
     }
+
+    /// The canonical endpoint identity of this location (ADR-0006): `hdfs://nameservice[/root]` or
+    /// `hdfs://namenode:port[/root]`, without the user or principal.
+    pub(crate) fn endpoint_identity(&self) -> Result<crate::model::BackendIdentity, StorageError> {
+        crate::storage::endpoint::hdfs(&self.endpoint, &self.root)
+            .map_err(|error| StorageError::ConfigError(error.to_string()))
+    }
+}
+
+/// The canonical endpoint identity of an HDFS location without connecting (ADR-0006), parsed
+/// exactly as [`create_hdfs_storage`] parses it.
+pub(crate) fn endpoint_identity(
+    location: &str,
+    config: &HdfsConfig,
+) -> Result<crate::model::BackendIdentity, StorageError> {
+    HdfsLocation::parse_configured(location, config)?.endpoint_identity()
 }
 
 impl HdfsConfig {

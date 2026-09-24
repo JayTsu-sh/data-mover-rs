@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use data_mover::dir_tree::NdxEvent;
-use data_mover::model::{BackendIdentity, BackendKind, EntryKind, ObservationPlan, StoragePath};
+use data_mover::model::{EntryKind, ObservationPlan, StoragePath};
 use data_mover::ndx_walk::{NdxWalkRequest, ndx_walk};
 use data_mover::storage::{
     BackendConfig, DeleteTreeCompletion, DeleteTreeOutcome, DeleteTreeRequest, LocalBackendConfig,
@@ -27,7 +27,6 @@ fn nonzero(value: usize) -> Result<NonZeroUsize> {
 async fn connect(root: &Path) -> Result<Storage> {
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
         root: root.to_path_buf(),
-        identity: BackendIdentity::new(BackendKind::Local, "local-namespace-contract")?,
         read_concurrency: nonzero(2)?,
         write_concurrency: nonzero(2)?,
     }))

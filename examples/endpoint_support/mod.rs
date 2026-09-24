@@ -4,7 +4,7 @@
 //! - `smb:<sub-path>` — that sub-path of the share named by `CIFS_REAL_SERVER` / `CIFS_REAL_SHARE` /
 //!   `CIFS_REAL_USER` / `CIFS_REAL_PASS` (the e2e-cifs `.env`);
 //! - `s3:<prefix>` — that prefix of the bucket named by `S3_HOST` / `S3_BUCKET` / `S3_AK` / `S3_SK` /
-//!   `S3_USE_HTTPS` (the e2e-s3 `.env`);
+//!   `S3_USE_HTTPS` / `S3_COMPAT` (the e2e-s3 `.env`, or its `dxn/` / `storagegrid/` siblings);
 //! - `hdfs://…` — an HDFS location, with `LAB_HDFS_CONFIG_DIR` / `LAB_HDFS_KEYTAB` for the client;
 //! - anything else — a local directory, created if missing.
 
@@ -15,7 +15,7 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
+use data_mover::model::StoragePath;
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, DeleteTreeRequest,
     HdfsBackendConfig, LocalBackendConfig, NamespaceRequest, NfsBackendConfig, PreflightPolicy,
@@ -30,13 +30,21 @@ fn env_var(name: &str) -> Result<String> {
     env::var(name).map_err(|_| format!("{name} is not set (source the skill's .env)").into())
 }
 
-/// `s3://AK:SK@bucket.host/prefix` — the crate takes the key and secret as written, undecoded.
+/// `s3[+sg|+dxn][+https]://AK:SK@bucket.host/prefix` — the crate takes the key and secret as
+/// written, undecoded. `S3_COMPAT=sg|dxn` selects the `StorageGRID` / DXN profile.
 fn s3_url(prefix: &str) -> Result<String> {
-    let scheme = if env::var("S3_USE_HTTPS").is_ok_and(|value| value == "true") {
-        "s3+https"
-    } else {
-        "s3"
+    let compat = match env::var("S3_COMPAT").unwrap_or_default().as_str() {
+        "" | "standard" => "",
+        "sg" => "+sg",
+        "dxn" => "+dxn",
+        _ => return Err("S3_COMPAT must be standard, sg or dxn".into()),
     };
+    let tls = if env::var("S3_USE_HTTPS").is_ok_and(|value| value == "true") {
+        "+https"
+    } else {
+        ""
+    };
+    let scheme = format!("s3{compat}{tls}");
     Ok(format!(
         "{scheme}://{}:{}@{}.{}/{}",
         env_var("S3_AK")?,
@@ -60,12 +68,11 @@ fn hdfs_client() -> data_mover::HdfsConfig {
     }
 }
 
-/// Connects one endpoint; `side` only labels the backend identity.
-pub async fn connect(endpoint: &str, side: &str) -> Result<Storage> {
+/// Connects one endpoint; its identity is the endpoint data-mover derives (ADR-0006).
+pub async fn connect(endpoint: &str) -> Result<Storage> {
     let config = if endpoint.starts_with("nfs://") {
         BackendConfig::Nfs(NfsBackendConfig {
             url: endpoint.to_owned(),
-            identity: BackendIdentity::new(BackendKind::Nfs, side)?,
             block_size: None,
             ensure_dir: true,
         })
@@ -79,20 +86,17 @@ pub async fn connect(endpoint: &str, side: &str) -> Result<Storage> {
             password: env_var("CIFS_REAL_PASS")?,
             signing_policy: CifsSigningPolicy::default(),
             guest_policy: CifsGuestPolicy::default(),
-            identity: BackendIdentity::new(BackendKind::Cifs, side)?,
         })
     } else if endpoint.starts_with("s3://") {
         return Err("give `s3:<prefix>` with the e2e-s3 .env, not an s3:// URL".into());
     } else if let Some(prefix) = endpoint.strip_prefix("s3:") {
         BackendConfig::S3(S3BackendConfig {
             url: s3_url(prefix)?,
-            identity: BackendIdentity::new(BackendKind::S3, side)?,
             block_size: None,
         })
     } else if endpoint.starts_with("hdfs://") {
         BackendConfig::Hdfs(HdfsBackendConfig {
             location: endpoint.to_owned(),
-            identity: BackendIdentity::new(BackendKind::Hdfs, side)?,
             client: hdfs_client(),
             block_size: None,
             ensure_dir: true,
@@ -102,7 +106,6 @@ pub async fn connect(endpoint: &str, side: &str) -> Result<Storage> {
         let slots = NonZeroUsize::new(4).ok_or("non-zero")?;
         BackendConfig::Local(LocalBackendConfig {
             root: endpoint.into(),
-            identity: BackendIdentity::new(BackendKind::Local, side)?,
             read_concurrency: slots,
             write_concurrency: slots,
         })
@@ -141,7 +144,7 @@ pub async fn remove_run(endpoint: &str, dir: &str) -> Result<Vec<String>> {
         fs::remove_dir_all(Path::new(endpoint).join(dir))?;
         return Ok(removed);
     }
-    let storage = connect(endpoint, "cleanup").await?;
+    let storage = connect(endpoint).await?;
     let mut session = delete_tree(
         &storage,
         DeleteTreeRequest {
@@ -181,7 +184,7 @@ async fn names(endpoint: &str, dir: &str) -> Result<Vec<String>> {
         return Ok(names);
     }
     if endpoint.starts_with("smb:") || endpoint.starts_with("hdfs://") {
-        let listed = connect(endpoint, "artifacts")
+        let listed = connect(endpoint)
             .await?
             .namespace(&PreflightPolicy::production())?
             .execute(NamespaceRequest::List(StoragePath::new(dir)?))

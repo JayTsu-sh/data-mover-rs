@@ -124,7 +124,8 @@ pub enum BackendKind { Local, Nfs, Cifs, S3, Hdfs }
 Callers provide a typed `BackendConfig`; backend kind is never inferred from an arbitrary
 path. Construction returns a connected `Storage`/`StorageEnum` instance whose only public
 responsibilities are identity, diagnostics, clone lifecycle, capability description, and
-role lending.
+role lending. The identity is the backend's canonical endpoint, derived by data-mover from its
+config (ADR-0006, `src/storage/endpoint.rs`); callers never supply it.
 
 ```rust
 impl StorageEnum {

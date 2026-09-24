@@ -226,8 +226,13 @@ async fn main() -> Result {
             bytes,
         )?;
     }
-    let source = connect(source_root, "source").await?;
-    let destination = connect(&args.destination, "destination").await?;
+    let source = connect(source_root).await?;
+    let destination = connect(&args.destination).await?;
+    // The endpoints data-mover derived (ADR-0006): a resume from a fresh process must print the same.
+    let endpoints = json!({
+        "source_endpoint": source.identity().stable_id(),
+        "destination_endpoint": destination.identity().stable_id(),
+    });
     // The caller creates the parent, as terrasync does: CIFS `prepare` does not.
     if let Some((parent, _)) = destination_path.rsplit_once('/')
         && !args.destination.starts_with("s3:")
@@ -245,7 +250,11 @@ async fn main() -> Result {
     let started = Instant::now();
     let request = request(&args, source, (destination, destination_path), cancel)?;
     let result = transfer(request).await;
-    println!("{}", report(&result, started.elapsed().as_millis()));
+    let mut line = report(&result, started.elapsed().as_millis());
+    if let (Some(line), Some(endpoints)) = (line.as_object_mut(), endpoints.as_object()) {
+        line.extend(endpoints.clone());
+    }
+    println!("{line}");
     if result.is_err() {
         exit(1);
     }

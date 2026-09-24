@@ -30,7 +30,6 @@ async fn local_metadata_copies_mode_and_mtime_to_hdfs_without_replacing_principa
     let source = crate::storage::connect_backend(crate::storage::BackendConfig::Local(
         crate::storage::LocalBackendConfig {
             root: root.path().into(),
-            identity: crate::storage::backends::local::test_identity("hdfs-metadata-source"),
             read_concurrency: NonZeroUsize::new(2).ok_or("invalid read concurrency")?,
             write_concurrency: NonZeroUsize::new(2).ok_or("invalid write concurrency")?,
         },
@@ -312,7 +311,6 @@ async fn hdfs_to_local_copies_mode_mtime_and_verifies_positioned_content() -> Re
         let destination = crate::storage::connect_backend(crate::storage::BackendConfig::Local(
             crate::storage::LocalBackendConfig {
                 root: root.path().into(),
-                identity: crate::storage::backends::local::test_identity("hdfs-local-mode"),
                 read_concurrency: NonZeroUsize::new(4).ok_or("read depth")?,
                 write_concurrency: NonZeroUsize::new(4).ok_or("write depth")?,
             },

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
-use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
+use data_mover::model::StoragePath;
 use data_mover::storage::{BackendConfig, LocalBackendConfig, connect_backend};
 use data_mover::transfer::{
     InflightLimits, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest,
@@ -135,14 +135,12 @@ async fn optimized_copy(args: &Args) -> Result<(u64, u128), Box<dyn std::error::
     let write_concurrency = non_zero(args.write_inflight, "write inflight")?;
     let source = connect_backend(BackendConfig::Local(LocalBackendConfig {
         root: args.source.clone(),
-        identity: BackendIdentity::new(BackendKind::Local, "local-comparison-source")?,
         read_concurrency,
         write_concurrency,
     }))
     .await?;
     let destination = connect_backend(BackendConfig::Local(LocalBackendConfig {
         root: args.destination.clone(),
-        identity: BackendIdentity::new(BackendKind::Local, "local-comparison-destination")?,
         read_concurrency,
         write_concurrency,
     }))

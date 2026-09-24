@@ -24,8 +24,7 @@ use data_mover::integrity::{
     IntegrityMode, IntegrityOptions, IntegrityRequest, compare as compare_objects,
 };
 use data_mover::model::{
-    BackendIdentity, BackendKind, ObservationMode, ObservationPlan, ObservedEntry, StoragePath,
-    StorageTimestamp,
+    ObservationMode, ObservationPlan, ObservedEntry, StoragePath, StorageTimestamp,
 };
 use data_mover::ndx_walk::{NdxWalkRequest, ndx_walk};
 use data_mover::storage::{
@@ -156,18 +155,16 @@ enum Command {
     },
 }
 
-async fn connect(backend: Backend, root: &str, side: &str, depth: usize) -> Result<Storage, Error> {
+async fn connect(backend: Backend, root: &str, depth: usize) -> Result<Storage, Error> {
     let slots = NonZeroUsize::new(depth).ok_or("concurrency must be non-zero")?;
     let config = match backend {
         Backend::Local => BackendConfig::Local(LocalBackendConfig {
             root: root.into(),
-            identity: BackendIdentity::new(BackendKind::Local, format!("{side}:{root}"))?,
             read_concurrency: slots,
             write_concurrency: slots,
         }),
         Backend::Nfs => BackendConfig::Nfs(NfsBackendConfig {
             url: std::env::var("NFS_REAL_URL")?,
-            identity: BackendIdentity::new(BackendKind::Nfs, format!("{side}:{root}"))?,
             block_size: None,
             ensure_dir: false,
         }),
@@ -188,7 +185,6 @@ async fn connect(backend: Backend, root: &str, side: &str, depth: usize) -> Resu
             } else {
                 CifsGuestPolicy::default()
             },
-            identity: BackendIdentity::new(BackendKind::Cifs, format!("{side}:{root}"))?,
         }),
     };
     Ok(connect_backend(config).await?)
@@ -349,7 +345,6 @@ async fn seed(storage: &Storage, args: &Args, command: &Command) -> Result<(), E
     let source = connect(
         Backend::Local,
         &local_root.path().to_string_lossy(),
-        "seed",
         args.concurrency,
     )
     .await?;
@@ -427,7 +422,7 @@ async fn compare(storage: Storage, args: &Args, command: &Command) -> Result<(),
     else {
         unreachable!("dispatched by the caller")
     };
-    let destination = connect(args.backend, other_root, "destination", args.concurrency).await?;
+    let destination = connect(args.backend, other_root, args.concurrency).await?;
     let report = compare_objects(IntegrityRequest {
         source: storage,
         source_path: StoragePath::new(path.clone())?,
@@ -457,7 +452,7 @@ async fn compare(storage: Storage, args: &Args, command: &Command) -> Result<(),
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
-    let storage = connect(args.backend, &args.root, "source", args.concurrency).await?;
+    let storage = connect(args.backend, &args.root, args.concurrency).await?;
     match &args.command {
         Command::Seed { .. } => seed(&storage, &args, &args.command).await,
         Command::Traverse { .. } => traverse(&storage, &args, &args.command).await,

@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 
-use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
+use data_mover::model::StoragePath;
 use data_mover::storage::{BackendConfig, LocalBackendConfig, Storage, connect_backend};
 use data_mover::transfer::{
     InflightLimits, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest,
@@ -13,10 +13,9 @@ use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-async fn local(root: &Path, identity: &str) -> TestResult<Storage> {
+async fn local(root: &Path) -> TestResult<Storage> {
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
         root: root.to_owned(),
-        identity: BackendIdentity::new(BackendKind::Local, identity)?,
         read_concurrency: NonZeroUsize::new(8).ok_or("invalid concurrency")?,
         write_concurrency: NonZeroUsize::new(8).ok_or("invalid concurrency")?,
     }))
@@ -26,9 +25,9 @@ async fn local(root: &Path, identity: &str) -> TestResult<Storage> {
 async fn request(source: &Path, destination: &Path) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
         TransferIdentity::new("native-runtime")?,
-        local(source, "native-source").await?,
+        local(source).await?,
         StoragePath::new("file.bin")?,
-        local(destination, "native-destination").await?,
+        local(destination).await?,
         StoragePath::new("file.bin")?,
         InflightLimits::new(8, 8 * 1024 * 1024, 8)?,
         CancellationToken::new(),
@@ -94,9 +93,9 @@ async fn precancelled_copy_preserves_existing_destination() -> TestResult {
         cancel.cancel();
         let request = TransferRequest::new(
             TransferIdentity::new("native-cancel")?,
-            local(source.path(), "native-source").await?,
+            local(source.path()).await?,
             StoragePath::new("file.bin")?,
-            local(destination.path(), "native-destination").await?,
+            local(destination.path()).await?,
             StoragePath::new("file.bin")?,
             InflightLimits::new(1, 1024 * 1024, 128)?,
             cancel,
@@ -145,9 +144,9 @@ async fn checkpointed_syncs_new_parent_directories() -> TestResult {
     std::fs::write(source.path().join("file.bin"), b"new parent")?;
     let request = TransferRequest::new(
         TransferIdentity::new("native-new-parent")?,
-        local(source.path(), "native-source").await?,
+        local(source.path()).await?,
         StoragePath::new("file.bin")?,
-        local(destination.path(), "native-destination").await?,
+        local(destination.path()).await?,
         StoragePath::new("new/child/file.bin")?,
         InflightLimits::new(1, 1024 * 1024, 1)?,
         CancellationToken::new(),

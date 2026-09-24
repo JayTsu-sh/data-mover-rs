@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
+use data_mover::model::StoragePath;
 use data_mover::storage::{BackendConfig, NfsBackendConfig, connect_backend};
 use data_mover::transfer::TransferPolicy;
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
@@ -113,14 +113,12 @@ async fn legacy_copy(args: &CopyArgs) -> Result<(u64, u128), Box<dyn std::error:
 async fn optimized_copy(args: &CopyArgs) -> Result<(u64, u128), Box<dyn std::error::Error>> {
     let source = connect_backend(BackendConfig::Nfs(NfsBackendConfig {
         url: args.source.clone(),
-        identity: BackendIdentity::new(BackendKind::Nfs, "nfs-comparison-source")?,
         block_size: Some(u64::try_from(args.chunk_bytes)?),
         ensure_dir: false,
     }))
     .await?;
     let destination = connect_backend(BackendConfig::Nfs(NfsBackendConfig {
         url: args.destination.clone(),
-        identity: BackendIdentity::new(BackendKind::Nfs, "nfs-comparison-destination")?,
         block_size: Some(u64::try_from(args.chunk_bytes)?),
         ensure_dir: true,
     }))

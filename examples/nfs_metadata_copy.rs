@@ -23,7 +23,7 @@ use std::process;
 
 use clap::{Parser, ValueEnum};
 use data_mover::metadata::{ApplicationOutcome, MetadataApplicationReport, MetadataFamily};
-use data_mover::model::{BackendIdentity, BackendKind, FailureClass, StoragePath};
+use data_mover::model::{FailureClass, StoragePath};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, LocalBackendConfig,
     NfsBackendConfig, PreflightPolicy, S3BackendConfig, Storage, StorageRoleFailure,
@@ -144,12 +144,11 @@ fn s3_url(prefix: &str) -> Result<String> {
     ))
 }
 
-async fn connect(endpoint: &str, side: &str) -> Result<Storage> {
+async fn connect(endpoint: &str) -> Result<Storage> {
     let slots = NonZeroUsize::new(4).ok_or("non-zero")?;
     let config = if endpoint.starts_with("nfs://") {
         BackendConfig::Nfs(NfsBackendConfig {
             url: endpoint.to_owned(),
-            identity: BackendIdentity::new(BackendKind::Nfs, side)?,
             block_size: None,
             ensure_dir: true,
         })
@@ -163,21 +162,18 @@ async fn connect(endpoint: &str, side: &str) -> Result<Storage> {
             password: env_var("CIFS_REAL_PASS")?,
             signing_policy: CifsSigningPolicy::default(),
             guest_policy: CifsGuestPolicy::default(),
-            identity: BackendIdentity::new(BackendKind::Cifs, side)?,
         })
     } else if endpoint.starts_with("s3://") {
         return Err("give `s3:<prefix>` with the e2e-s3 .env, not an s3:// URL".into());
     } else if let Some(prefix) = endpoint.strip_prefix("s3:") {
         BackendConfig::S3(S3BackendConfig {
             url: s3_url(prefix)?,
-            identity: BackendIdentity::new(BackendKind::S3, side)?,
             block_size: None,
         })
     } else {
         fs::create_dir_all(endpoint)?;
         BackendConfig::Local(LocalBackendConfig {
             root: endpoint.into(),
-            identity: BackendIdentity::new(BackendKind::Local, side)?,
             read_concurrency: slots,
             write_concurrency: slots,
         })
@@ -216,7 +212,7 @@ async fn seed(source: &Storage, path: &str, bytes: usize) -> Result {
     }
     let local = tempfile::tempdir()?;
     fs::write(local.path().join("seed"), vec![b'x'; bytes])?;
-    let local = connect(&local.path().to_string_lossy(), "seed").await?;
+    let local = connect(&local.path().to_string_lossy()).await?;
     transfer(request(&local, "seed", source, path)?).await?;
     println!("seeded {path} bytes={bytes}");
     Ok(())
@@ -393,8 +389,8 @@ async fn main() -> Result {
     if same_file(&args) {
         return Err("source and destination are the same file".into());
     }
-    let source = connect(&args.source, "source").await?;
-    let destination = connect(&args.destination, "destination").await?;
+    let source = connect(&args.source).await?;
+    let destination = connect(&args.destination).await?;
     if let Some(bytes) = args.seed_bytes {
         seed(&source, &args.source_path, bytes).await?;
     }

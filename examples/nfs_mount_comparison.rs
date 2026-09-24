@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use data_mover::TransferConcurrency;
-use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
+use data_mover::model::{BackendKind, StoragePath};
 use data_mover::storage::{BackendConfig, LocalBackendConfig, NfsBackendConfig, connect_backend};
 use data_mover::transfer::{
     InflightLimits, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest,
@@ -63,14 +63,12 @@ async fn endpoint(
     let config = match transport {
         Transport::Mounted => BackendConfig::Local(LocalBackendConfig {
             root: root.into(),
-            identity: BackendIdentity::new(BackendKind::Local, side)?,
             read_concurrency: NonZeroUsize::new(concurrency.read()).ok_or("invalid concurrency")?,
             write_concurrency: NonZeroUsize::new(concurrency.write())
                 .ok_or("invalid concurrency")?,
         }),
         Transport::Client => BackendConfig::Nfs(NfsBackendConfig {
             url: root.into(),
-            identity: BackendIdentity::new(BackendKind::Nfs, side)?,
             block_size: Some(u64::try_from(args.chunk_bytes)?),
             ensure_dir: side == "destination",
         }),

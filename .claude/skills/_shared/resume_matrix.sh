@@ -73,6 +73,10 @@ artifacts() {
   fi
 }
 records() { find "$1" -name '*.state' 2>/dev/null | wc -l; }
+# The destination endpoint a run derived (ADR-0006 C4); empty when the run printed no JSON.
+endpoint_of() { python3 -c 'import json,sys
+try: print(json.loads(sys.argv[1]).get("destination_endpoint",""))
+except Exception: print("")' "$1"; }
 # S3 today: the orphaned upload is only findable through the local record.
 remember_s3_upload() {
   [[ "$DEST" == s3:* ]] || return 0
@@ -113,6 +117,10 @@ for mode in cancel kill; do
   second=$(env -i "${FRESH_ENV[@]}" "$BIN" "${args[@]}" --read-back off --bandwidth "$UNLIMITED" 2>&1 | tail -1)
   echo "[$mode] resumed:     $second"
   echo "[$mode]   destination artifacts after=$(artifacts)"
+  # The fresh process must derive the endpoint the interrupted one did (a killed run prints none).
+  seen=$(endpoint_of "$first"); again=$(endpoint_of "$second")
+  if [ -n "$seen" ]; then same=$([ "$seen" = "$again" ] && echo yes || echo NO); else same="n/a (no output)"; fi
+  echo "[$mode]   destination endpoint=$again  same as interrupted run: $same"
 done
 
 echo "-- cleanup"

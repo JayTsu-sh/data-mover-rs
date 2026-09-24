@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use data_mover::TransferConcurrency;
-use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
+use data_mover::model::{BackendKind, StoragePath};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, LocalBackendConfig,
     connect_backend,
@@ -77,7 +77,6 @@ async fn endpoint(
     let config = match transport {
         Transport::Mounted => BackendConfig::Local(LocalBackendConfig {
             root: root.into(),
-            identity: BackendIdentity::new(BackendKind::Local, side)?,
             read_concurrency: NonZeroUsize::new(concurrency.read()).ok_or("invalid concurrency")?,
             write_concurrency: NonZeroUsize::new(concurrency.write())
                 .ok_or("invalid concurrency")?,
@@ -98,7 +97,6 @@ async fn endpoint(
             password: std::env::var("CIFS_REAL_PASS")?,
             root: Some(root.to_owned()),
             ensure_dir: side == "destination",
-            identity: BackendIdentity::new(BackendKind::Cifs, format!("{side}:{root}"))?,
         }),
     };
     Ok(connect_backend(config).await?)

@@ -1,5 +1,5 @@
 use super::*;
-use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
+use data_mover::model::StoragePath;
 use data_mover::storage::{HdfsBackendConfig, Storage, connect_backend};
 use data_mover::transfer::{
     InflightLimits, TransferIdentity, TransferPolicy, TransferRequest, transfer,
@@ -24,7 +24,6 @@ async fn fixture(case: &str) -> TestResult<(data_mover::HDFSStorage, Storage)> {
     let storage = connect_backend(data_mover::storage::BackendConfig::Hdfs(
         HdfsBackendConfig {
             location: location.clone(),
-            identity: BackendIdentity::new(BackendKind::Hdfs, location)?,
             client: hdfs_lab_config(),
             block_size: None,
             ensure_dir: true,
@@ -169,7 +168,6 @@ async fn nightly_lab_local_source_metadata_to_hdfs_policies() -> TestResult {
     let source = connect_backend(data_mover::storage::BackendConfig::Local(
         LocalBackendConfig {
             root: local_root.clone(),
-            identity: BackendIdentity::new(BackendKind::Local, "hdfs-lab-local-source")?,
             read_concurrency: NonZeroUsize::new(2).ok_or("invalid read concurrency")?,
             write_concurrency: NonZeroUsize::new(2).ok_or("invalid write concurrency")?,
         },

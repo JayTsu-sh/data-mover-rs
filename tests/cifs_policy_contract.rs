@@ -2,7 +2,7 @@
 mod common;
 
 use bytes::Bytes;
-use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
+use data_mover::model::StoragePath;
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, LocalBackendConfig,
     Storage, connect_backend,
@@ -80,7 +80,6 @@ async fn connect_remote(server: &str, share: &str) -> Result<Storage> {
         ensure_dir: false,
         username: std::env::var("CIFS_REAL_USER")?,
         password: std::env::var("CIFS_REAL_PASS")?,
-        identity: BackendIdentity::new(BackendKind::Cifs, format!("{server}/{share}"))?,
     }))
     .await?)
 }
@@ -88,7 +87,6 @@ async fn connect_remote(server: &str, share: &str) -> Result<Storage> {
 async fn connect_local(root: &std::path::Path) -> Result<Storage> {
     Ok(connect_backend(BackendConfig::Local(LocalBackendConfig {
         root: root.to_path_buf(),
-        identity: BackendIdentity::new(BackendKind::Local, root.to_string_lossy())?,
         read_concurrency: std::num::NonZeroUsize::new(8).ok_or("invalid depth")?,
         write_concurrency: std::num::NonZeroUsize::new(8).ok_or("invalid depth")?,
     }))

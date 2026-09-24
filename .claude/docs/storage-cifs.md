@@ -23,7 +23,9 @@
 ## 连接配置
 
 没有 URL。`CifsBackendConfig` 字段：`server` / `share` / `username` / `password` /
-`root: Option<String>` (share 内子路径) / `identity: BackendIdentity` / `signing_policy`。
+`root: Option<String>` (share 内子路径) / `signing_policy`。存储标识由 data-mover 推导为
+`smb://server/share[/root]`（server、share 小写，root 保留大小写；ADR-0006 C4，`src/storage/endpoint.rs`），
+调用方不再提供。
 凭据只有 NTLM (`smb_domain::Credentials::ntlm`)；facade 没有 multichannel 开关。
 协商**始终**直接发 SMB2 NEGOTIATE，不再需要 legacy 的 `smb2_only` 开关 (smb-rs #73)。
 

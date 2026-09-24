@@ -4,13 +4,12 @@ use std::path::PathBuf;
 
 use crate::hdfs::HdfsConfig;
 use crate::model::{BackendIdentity, BackendKind};
-use crate::storage::Storage;
+use crate::storage::{Storage, endpoint};
 use crate::url_redact::redact_storage_url;
 
 #[derive(Clone, Debug)]
 pub struct LocalBackendConfig {
     pub root: PathBuf,
-    pub identity: BackendIdentity,
     pub read_concurrency: NonZeroUsize,
     pub write_concurrency: NonZeroUsize,
 }
@@ -18,7 +17,6 @@ pub struct LocalBackendConfig {
 #[derive(Clone, Debug)]
 pub struct NfsBackendConfig {
     pub url: String,
-    pub identity: BackendIdentity,
     pub block_size: Option<u64>,
     pub ensure_dir: bool,
 }
@@ -71,7 +69,6 @@ pub struct CifsBackendConfig {
     pub signing_policy: CifsSigningPolicy,
     /// Guest / anonymous session policy; see [`CifsGuestPolicy`].
     pub guest_policy: CifsGuestPolicy,
-    pub identity: BackendIdentity,
 }
 
 impl fmt::Debug for CifsBackendConfig {
@@ -86,7 +83,6 @@ impl fmt::Debug for CifsBackendConfig {
             .field("password", &"<redacted>")
             .field("signing_policy", &self.signing_policy)
             .field("guest_policy", &self.guest_policy)
-            .field("identity", &self.identity)
             .finish()
     }
 }
@@ -95,7 +91,6 @@ impl fmt::Debug for CifsBackendConfig {
 pub struct S3BackendConfig {
     /// `s3://AK:SK@bucket.host[:port]/prefix`; the key pair is never printed by `Debug`.
     pub url: String,
-    pub identity: BackendIdentity,
     pub block_size: Option<u64>,
 }
 
@@ -104,7 +99,6 @@ impl fmt::Debug for S3BackendConfig {
         formatter
             .debug_struct("S3BackendConfig")
             .field("url", &redact_storage_url(&self.url))
-            .field("identity", &self.identity)
             .field("block_size", &self.block_size)
             .finish()
     }
@@ -113,7 +107,6 @@ impl fmt::Debug for S3BackendConfig {
 #[derive(Clone, Debug)]
 pub struct HdfsBackendConfig {
     pub location: String,
-    pub identity: BackendIdentity,
     pub client: HdfsConfig,
     pub block_size: Option<u64>,
     pub ensure_dir: bool,
@@ -160,7 +153,42 @@ impl fmt::Display for BackendConnectError {
 
 impl std::error::Error for BackendConnectError {}
 
+/// The identity `config` connects as: its canonical endpoint (ADR-0006), derived without any
+/// network I/O — protocol, address, share or bucket, and prefix, never credentials. Every
+/// [`Storage`] returned by [`connect_backend`] for this config carries exactly this identity, so a
+/// caller can rebuild it offline, e.g. to decode snapshots taken from this endpoint.
+///
+/// A Local root is canonicalized (symlinks resolved) and must exist. An S3 or HDFS location is
+/// parsed as its backend parses it; see `src/storage/endpoint.rs` for the rules.
+///
+/// # Errors
+/// Returns a backend-attributed error when the configuration cannot name an endpoint.
+pub fn endpoint_identity(config: &BackendConfig) -> Result<BackendIdentity, BackendConnectError> {
+    match config {
+        BackendConfig::Local(config) => std::fs::canonicalize(&config.root)
+            .map_err(|error| BackendConnectError::new(BackendKind::Local, error))
+            .and_then(|root| {
+                endpoint::local(&root)
+                    .map_err(|error| BackendConnectError::new(BackendKind::Local, error))
+            }),
+        BackendConfig::Nfs(config) => endpoint::nfs(&config.url)
+            .map_err(|error| BackendConnectError::new(BackendKind::Nfs, error)),
+        BackendConfig::Cifs(config) => {
+            endpoint::smb(&config.server, &config.share, config.root.as_deref())
+                .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))
+        }
+        BackendConfig::S3(config) => crate::s3::endpoint_identity(&config.url)
+            .map_err(|error| BackendConnectError::new(BackendKind::S3, error)),
+        BackendConfig::Hdfs(config) => {
+            crate::hdfs::endpoint_identity(&config.location, &config.client)
+                .map_err(|error| BackendConnectError::new(BackendKind::Hdfs, error))
+        }
+    }
+}
+
 /// Connects exactly one explicitly selected backend without path-based type inference.
+///
+/// The returned storage's [`Storage::identity`] is [`endpoint_identity`] of `config`.
 ///
 /// # Errors
 /// Returns a backend-attributed connection error when configuration, authentication, root
@@ -168,21 +196,20 @@ impl std::error::Error for BackendConnectError {}
 pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendConnectError> {
     match config {
         BackendConfig::Local(config) => crate::storage::backends::local::connect_transfer(
-            config.root,
-            config.identity,
+            &config.root,
             config.read_concurrency,
             config.write_concurrency,
         )
         .map_err(|error| BackendConnectError::new(BackendKind::Local, error)),
-        BackendConfig::Nfs(config) => crate::nfs::create_nfs_role_storage(
-            &config.url,
-            config.block_size,
-            config.ensure_dir,
-            config.identity,
-        )
-        .await
-        .map_err(|error| BackendConnectError::new(BackendKind::Nfs, error)),
+        BackendConfig::Nfs(config) => {
+            crate::nfs::create_nfs_role_storage(&config.url, config.block_size, config.ensure_dir)
+                .await
+                .map_err(|error| BackendConnectError::new(BackendKind::Nfs, error))
+        }
         BackendConfig::Cifs(config) => {
+            // Derived before any network I/O, so a config that names no endpoint fails fast.
+            let identity = endpoint::smb(&config.server, &config.share, config.root.as_deref())
+                .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))?;
             let signing = match config.signing_policy {
                 CifsSigningPolicy::Required => smb_domain::SigningPolicy::Required,
                 CifsSigningPolicy::WhenRequired => smb_domain::SigningPolicy::WhenRequired,
@@ -208,21 +235,16 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
                 )
                 .await
                 .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))?;
-            crate::cifs::create_cifs_role_storage(
-                share,
-                config.root,
-                config.ensure_dir,
-                config.identity,
-            )
-            .await
-            .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))
+            crate::cifs::create_cifs_role_storage(share, config.root, config.ensure_dir, identity)
+                .await
+                .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))
         }
         BackendConfig::S3(config) => {
             let storage = crate::s3::S3Storage::new(&config.url, config.block_size)
                 .await
                 .map_err(|error| BackendConnectError::new(BackendKind::S3, error))?;
             storage
-                .architecture_storage(config.identity)
+                .architecture_storage()
                 .map_err(|error| BackendConnectError::new(BackendKind::S3, error))
         }
         BackendConfig::Hdfs(config) => {
@@ -235,7 +257,7 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
             .await
             .map_err(|error| BackendConnectError::new(BackendKind::Hdfs, error))?;
             storage
-                .architecture_storage(config.identity)
+                .architecture_storage()
                 .map_err(|error| BackendConnectError::new(BackendKind::Hdfs, error))
         }
     }

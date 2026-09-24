@@ -6,8 +6,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use data_mover::model::{
-    BackendIdentity, BackendKind, FailureClass, MetadataObservation, ObservationMode,
-    ObservationPlan, OwnershipMode, StoragePath, Transience,
+    FailureClass, MetadataObservation, ObservationMode, ObservationPlan, OwnershipMode,
+    StoragePath, Transience,
 };
 use data_mover::storage::{
     ByteStream, FinalDestination, MetadataMutation, PreflightPolicy, PrepareRequest,
@@ -97,10 +97,6 @@ async fn validate_stale_retry(
 
 fn path(value: &str) -> ContractResult<StoragePath> {
     Ok(StoragePath::new(value)?)
-}
-
-fn identity(id: &str) -> ContractResult<BackendIdentity> {
-    Ok(BackendIdentity::new(BackendKind::Nfs, id)?)
 }
 
 fn nonzero(value: usize) -> ContractResult<NonZeroUsize> {
@@ -271,13 +267,7 @@ async fn validate_nfs4_stale_retry(
 }
 
 async fn connect_destination(url: &str) -> ContractResult<Storage> {
-    Ok(data_mover::nfs::create_nfs_role_storage(
-        url,
-        Some(64 * 1024),
-        true,
-        identity("nfs3-contract-destination")?,
-    )
-    .await?)
+    Ok(data_mover::nfs::create_nfs_role_storage(url, Some(64 * 1024), true).await?)
 }
 
 fn validate_fixture_metadata(
@@ -573,20 +563,10 @@ async fn main() -> ContractResult {
         seed_nfs4_fixture(mount, root, args.expect_setacl_unsupported).await?;
     }
     eprintln!("contract stage: connect production role handles");
-    let source = data_mover::nfs::create_nfs_role_storage(
-        &args.source,
-        Some(64 * 1024),
-        false,
-        identity("nfs3-contract-source")?,
-    )
-    .await?;
-    let destination = data_mover::nfs::create_nfs_role_storage(
-        &args.destination,
-        Some(64 * 1024),
-        true,
-        identity("nfs3-contract-destination")?,
-    )
-    .await?;
+    let source =
+        data_mover::nfs::create_nfs_role_storage(&args.source, Some(64 * 1024), false).await?;
+    let destination =
+        data_mover::nfs::create_nfs_role_storage(&args.destination, Some(64 * 1024), true).await?;
     validate_stale_retry(
         &source,
         args.stale_ready_file.as_deref(),

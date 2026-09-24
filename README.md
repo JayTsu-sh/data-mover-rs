@@ -228,7 +228,6 @@ The `storage_integrity_check` example exposes the same behavior through
 SMB/CIFS has no URL form. Connect it explicitly through the role-based factory:
 
 ```rust
-use data_mover::model::{BackendIdentity, BackendKind};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, connect_backend,
 };
@@ -241,9 +240,15 @@ let storage = connect_backend(BackendConfig::Cifs(CifsBackendConfig {
     username: "admin".into(),
     password: "password".into(),
     root: Some("data/2024".into()),
-    identity: BackendIdentity::new(BackendKind::Cifs, "nas01/shared")?,
+    ensure_dir: false,
 })).await?;
+// storage.identity().stable_id() == "smb://nas01/shared/data/2024"
 ```
+
+Every connected storage's identity is its canonical endpoint, derived by data-mover — protocol,
+address, share or bucket and prefix, never credentials (`nfs://…`, `smb://…`, `s3://…`, `hdfs://…`,
+`file:///…`). `data_mover::storage::endpoint_identity(&config)` derives the same value without
+connecting. See `docs/adr/0006-destination-resident-recovery.md`.
 
 Credentials are NTLM only. Anonymous or guest shares need
 `guest_policy: CifsGuestPolicy::AllowUnsigned`: servers map unknown or password-less users

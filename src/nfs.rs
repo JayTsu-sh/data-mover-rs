@@ -4716,8 +4716,10 @@ pub async fn create_nfs_role_storage(
     url: &str,
     block_size: Option<u64>,
     ensure_dir: bool,
-    identity: crate::model::BackendIdentity,
 ) -> Result<crate::storage::Storage> {
+    // The canonical endpoint (ADR-0006), derived before mounting so a bad URL fails fast.
+    let identity = crate::storage::endpoint::nfs(url)
+        .map_err(|error| StorageError::UrlParseError(error.to_string()))?;
     let (storage, root_dir) = NFSStorage::mount_and_build(url, block_size).await?;
     let storage = storage.attach_root(root_dir, ensure_dir).await?;
     crate::storage::backends::nfs::connect(Arc::new(storage), identity)

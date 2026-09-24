@@ -49,11 +49,18 @@ its lease, the `Publishing` state, `recover` / `RecoverRequest` / `RecoveryIdent
 1. **Endpoint identity**, derived by data-mover from each `BackendConfig` (callers no longer supply a
    label; `stable_id` becomes this value). Protocol + address + share or bucket + optional prefix, never
    credentials:
-   `nfs://host[:port]/export[/prefix]` (NFS version excluded), `smb://server[:port]/share[/prefix]`,
+   `nfs://host[:port]/export[/prefix]` (NFS version and options excluded), `smb://server[:port]/share[/prefix]`,
    `s3://endpoint[:port]/bucket[/prefix]` (keys, TLS and compatibility profile excluded),
    `hdfs://nameservice|namenode:port[/prefix]`, `file:///canonical-path` (no hostname).
-   Normalized: lowercase host, default ports dropped, repeated `/` collapsed, `.`/`..` resolved.
-   An IP address and a hostname for the same server are different endpoints.
+   Normalized: DNS hosts lowercased, IPv6 in canonical `[addr]` form, default ports dropped, path names
+   percent-encoded. An IP address and a hostname for the same server are different endpoints.
+   Per-scheme rules (`src/storage/endpoint.rs`, C4a): NFS export and prefix are read the way the backend
+   uses them (the export as nfs-rs parses its URL, the prefix literally with `..` confined to the export);
+   SMB server and share are case-insensitive; **S3 prefixes are literal** — keys are not paths, so `a//`,
+   `a/` and `/a/` stay distinct and only the backend's trailing `/` is removed — and http/https and ports
+   80/443 are one endpoint; **HDFS keeps its port** (no port marks a NameService, whose name keeps its
+   case); Local is the realpath, so a volume mounted at another path is another endpoint.
+   `storage::endpoint_identity(&BackendConfig)` derives it without connecting (C4b).
 2. **TransferIdentity**, derived by default:
    `blake3(source endpoint, source path, source version selector, destination endpoint, final path)`.
    It names "this file goes to that file" for logs, reports and caller records, and excludes the source
@@ -124,6 +131,9 @@ with versionId, latest flag and delete-marker flag, oldest to newest per key). B
   identity argument and gains `with_source_version` / `with_identity_override`; `TransferOutcome` gains
   `identity`, `prepare`, `reused_bytes`, `destination_version`; the two recovery `TransferPhase`
   variants go; `DATA_MOVER_RECOVERY_DIR` goes.
+- Configs lose `identity`; `S3Storage::architecture_storage` / `HDFSStorage::architecture_storage` /
+  `nfs::create_nfs_role_storage` lose their identity argument and `cifs::create_cifs_role_storage` is
+  crate-private (C4b). `BackendIdentity::new` stays public for fixtures and snapshot decoding.
 - `EntryIdentityKey` and observation snapshots change once (derived `stable_id`); terrasync's first
   incremental run after the upgrade is effectively full.
 - S3 content becomes visible before read-back; per-part Content-MD5, the part-list check and the

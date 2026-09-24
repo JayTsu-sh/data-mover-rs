@@ -244,6 +244,14 @@ struct ParsedS3Url {
     compatibility: S3Compatibility,
 }
 
+/// The canonical endpoint identity of an S3 URL without connecting (ADR-0006): parsed exactly as
+/// [`S3Storage::new`] parses it, so it equals the connected storage's identity.
+pub(crate) fn endpoint_identity(url: &str) -> Result<crate::model::BackendIdentity> {
+    let parsed = parse_s3_url(url)?;
+    architecture::identity(&parsed.endpoint, &parsed.bucket_name, &parsed.prefix)
+        .map_err(|error| StorageError::ConfigError(error.to_string()))
+}
+
 fn parse_s3_url(url: &str) -> Result<ParsedS3Url> {
     let (scheme_str, access_key, secret_key, host_and_path) = extract_s3_credentials(url)?;
 
@@ -697,13 +705,15 @@ fn s3_timeout_config() -> TimeoutConfig {
 impl S3Storage {
     /// Builds the `ArchitectureReady` role handle for this connected standard S3 backend.
     ///
+    /// The storage's identity is its canonical endpoint (`s3://host[:port]/bucket[/prefix]`,
+    /// ADR-0006), the same one [`crate::storage::endpoint_identity`] derives from its URL.
+    ///
     /// # Errors
-    /// Returns an error when the identity is not S3 or connected roles contradict capabilities.
+    /// Returns an error when no endpoint can be derived or connected roles contradict capabilities.
     pub fn architecture_storage(
         &self,
-        identity: crate::model::BackendIdentity,
     ) -> std::result::Result<crate::storage::Storage, Box<dyn std::error::Error>> {
-        architecture::connect(self, identity)
+        architecture::connect(self)
     }
 
     /// Overrides the per-file read and write concurrency for this adapter.

@@ -1,9 +1,7 @@
 //! Optional real SMB namespace-role contract, confined to unique entry names.
 mod common;
 
-use data_mover::model::{
-    BackendIdentity, BackendKind, EntryKind, FailureClass, IdentityStrength, StoragePath,
-};
+use data_mover::model::{EntryKind, FailureClass, IdentityStrength, StoragePath};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, Namespace,
     NamespaceRequest, NamespaceResult, PreflightPolicy, Storage, StorageRoleFailure,
@@ -263,7 +261,6 @@ async fn connect_remote(server: &str, share: &str) -> Result<Storage> {
         ensure_dir: false,
         username: std::env::var("CIFS_REAL_USER")?,
         password: std::env::var("CIFS_REAL_PASS")?,
-        identity: BackendIdentity::new(BackendKind::Cifs, format!("{server}/{share}"))?,
     }))
     .await?)
 }

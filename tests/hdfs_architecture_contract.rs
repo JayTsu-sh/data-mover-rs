@@ -4,8 +4,7 @@ use std::path::Path;
 
 use bytes::Bytes;
 use data_mover::model::{
-    BackendIdentity, BackendKind, EntryOperationFailure, FailureClass, ObservationPlan, Operation,
-    StoragePath, Transience,
+    EntryOperationFailure, FailureClass, ObservationPlan, Operation, StoragePath, Transience,
 };
 use data_mover::storage::{
     ByteStream, FinalDestination, PreflightPolicy, PrepareRequest, PreparedStage, PublishRequest,
@@ -145,14 +144,8 @@ async fn architecture_roles_traverse_stream_verify_and_overwrite() -> TestResult
     .await?;
     let payload = Bytes::from(vec![0x5a; 1024 * 1024 + 31]);
     create_file(&source, "nested/source.bin", payload.clone()).await?;
-    let source_roles = source.architecture_storage(BackendIdentity::new(
-        BackendKind::Hdfs,
-        "architecture-source",
-    )?)?;
-    let destination_roles = destination.architecture_storage(BackendIdentity::new(
-        BackendKind::Hdfs,
-        "architecture-destination",
-    )?)?;
+    let source_roles = source.architecture_storage()?;
+    let destination_roles = destination.architecture_storage()?;
     assert!(observes_nested_source(&source_roles).await?);
     destination
         .create_dir_all(Path::new("published"), 0o755)
@@ -229,8 +222,7 @@ async fn interrupt_and_export_recovery(
     backend: &HDFSStorage,
     payload: &Bytes,
 ) -> TestResult<(RecoveryIdentity, SourceDescriptor)> {
-    let storage =
-        backend.architecture_storage(BackendIdentity::new(BackendKind::Hdfs, "recovery")?)?;
+    let storage = backend.architecture_storage()?;
     let descriptor = storage
         .read_source(&PreflightPolicy::production())?
         .describe(&StoragePath::new("source.bin")?)
@@ -264,8 +256,7 @@ async fn recover_tail_and_publish(
     descriptor: SourceDescriptor,
 ) -> TestResult {
     let reconnected = create_hdfs_storage(location, &lab_config(), None, true).await?;
-    let roles =
-        reconnected.architecture_storage(BackendIdentity::new(BackendKind::Hdfs, "recovery")?)?;
+    let roles = reconnected.architecture_storage()?;
     let staged = roles.staged_destination(&PreflightPolicy::production())?;
     let recovered = staged
         .recover(RecoverRequest {

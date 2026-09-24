@@ -27,7 +27,7 @@ use crate::transfer_concurrency::TransferConcurrency;
 /// # Errors
 /// Returns an error when the identity is not CIFS, when a root component exists but is not a
 /// directory, when root creation fails, or when connected roles contradict capabilities.
-pub async fn create_cifs_role_storage(
+pub(crate) async fn create_cifs_role_storage(
     share: smb_domain::Share,
     root: Option<String>,
     ensure_dir: bool,

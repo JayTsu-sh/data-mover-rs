@@ -13,14 +13,9 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Fixed instant both fixtures are pinned to, so comparisons test content rather than clocks.
 const FIXED_MTIME: filetime::FileTime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
 
-fn storage(root: &Path, name: &str) -> Result<Storage> {
+fn storage(root: &Path) -> Result<Storage> {
     let depth = NonZeroUsize::new(2).ok_or("constant is nonzero")?;
-    crate::storage::backends::local::connect_transfer(
-        root.to_path_buf(),
-        BackendIdentity::new(BackendKind::Local, name)?,
-        depth,
-        depth,
-    )
+    crate::storage::backends::local::connect_transfer(root, depth, depth)
 }
 
 fn write(root: &Path, name: &str, payload: &[u8]) -> Result {
@@ -52,9 +47,9 @@ impl Fixture {
 
     fn request(&self, mode: IntegrityMode) -> Result<IntegrityRequest> {
         Ok(IntegrityRequest {
-            source: storage(self.source_root.path(), "integrity-source")?,
+            source: storage(self.source_root.path())?,
             source_path: StoragePath::new("object.bin")?,
-            destination: storage(self.destination_root.path(), "integrity-destination")?,
+            destination: storage(self.destination_root.path())?,
             destination_path: StoragePath::new("object.bin")?,
             options: IntegrityOptions {
                 mode,
@@ -320,7 +315,7 @@ async fn a_backend_that_cannot_report_mtime_is_not_a_difference() -> Result {
     // match, because one side simply cannot report the fact.
     let fixture = Fixture::new(Some(b"payload"), None)?;
     let mixed = IntegrityRequest {
-        source: storage(fixture.source_root.path(), "integrity-local-source")?,
+        source: storage(fixture.source_root.path())?,
         source_path: StoragePath::new("object.bin")?,
         destination: timeless_storage("integrity-timeless-only", b"payload")?,
         destination_path: StoragePath::new("object.bin")?,
@@ -353,7 +348,7 @@ async fn an_object_stores_upload_time_so_its_mtime_is_not_compared() -> Result {
         TimePrecision::Seconds,
     )?);
     let request = IntegrityRequest {
-        source: storage(fixture.source_root.path(), "integrity-local-source")?,
+        source: storage(fixture.source_root.path())?,
         source_path: StoragePath::new("object.bin")?,
         destination: crate::storage::backends::s3::connect(
             protocol,

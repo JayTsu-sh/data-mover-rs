@@ -15,10 +15,10 @@ use tokio_util::sync::CancellationToken;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const PART_SIZE: usize = 8 * 1024 * 1024;
 
-async fn connected(url: &str, identity: BackendIdentity) -> TestResult<Storage> {
+async fn connected(url: &str) -> TestResult<Storage> {
     data_mover::s3::S3Storage::new(url, None)
         .await?
-        .architecture_storage(identity)
+        .architecture_storage()
 }
 
 #[tokio::test]
@@ -103,12 +103,12 @@ async fn verify_stale_upload_restart(
         source: source.clone(),
         recovery_binding: [9; 32],
     };
-    let storage = connected(url, identity.clone()).await?;
+    let storage = connected(url).await?;
     let destination = storage.staged_destination(&PreflightPolicy::production())?;
     let stale = destination.prepare(prepare.clone()).await?;
     let recovery = destination.recovery_identity(&stale).await?;
     destination.discard(stale).await?;
-    let storage = connected(url, identity.clone()).await?;
+    let storage = connected(url).await?;
     let destination = storage.staged_destination(&PreflightPolicy::production())?;
     let result = destination
         .recover(RecoverRequest {
@@ -135,7 +135,7 @@ async fn stage_with_reconnect(
     payload: &Bytes,
 ) -> TestResult<(Storage, data_mover::storage::PreparedStage)> {
     eprintln!("S3 contract stage: prepare multipart destination");
-    let storage = connected(url, identity.clone()).await?;
+    let storage = connected(url).await?;
     let destination = storage.staged_destination(&PreflightPolicy::production())?;
     let source = source_descriptor(identity, payload.len())?;
     let prepare = PrepareRequest {
@@ -155,7 +155,7 @@ async fn stage_with_reconnect(
     let checkpoint = destination.observe_checkpoint(&stage).await?.durable_prefix;
     assert!((PART_SIZE as u64..=(PART_SIZE * 4) as u64).contains(&checkpoint));
     assert_eq!(checkpoint % PART_SIZE as u64, 0);
-    let storage = connected(url, identity.clone()).await?;
+    let storage = connected(url).await?;
     let destination = storage.staged_destination(&PreflightPolicy::production())?;
     eprintln!("S3 contract stage: recover multipart destination after reconnect");
     let resumed = destination
