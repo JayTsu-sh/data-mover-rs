@@ -116,6 +116,25 @@ impl SingleStage {
         Ok((body, guard.tags.clone()))
     }
 
+    /// The source size the stage was prepared for.
+    pub(super) fn expected_size(&self) -> u64 {
+        self.expected_size
+    }
+
+    /// What the `PutObject` reported, once it was sent.
+    pub(super) fn published(&self) -> Option<S3WriteFacts> {
+        self.lock().published.clone()
+    }
+
+    /// Bytes the object holds once sent, otherwise bytes buffered so far.
+    pub(super) fn durable_len(&self) -> u64 {
+        if self.lock().published.is_some() {
+            self.expected_size
+        } else {
+            self.written_len()
+        }
+    }
+
     pub(super) fn written_len(&self) -> u64 {
         self.lock()
             .written
@@ -262,7 +281,23 @@ pub(super) async fn publish<P: S3Protocol>(
     if request.cancel.is_cancelled() {
         return Err(unchanged(cancelled(path, Operation::Publish)));
     }
-    let (body, tags) = single.content(path, request.expected_size)?;
+    let facts = send(adapter, path, single, request.expected_size).await?;
+    Ok(PublicationEvidence {
+        final_destination: path.clone(),
+        disposition: PublicationDisposition::Published,
+        version: facts.version_id,
+    })
+}
+
+/// Sends the buffered content, which must be `expected_size` bytes, as one `PutObject` with
+/// `Content-MD5` and sets the pending tags; the object is then visible at `path`.
+pub(super) async fn send<P: S3Protocol>(
+    adapter: &S3StagedDestination<P>,
+    path: &StoragePath,
+    single: &SingleStage,
+    expected_size: u64,
+) -> Result<S3WriteFacts, PublicationFailure> {
+    let (body, tags) = single.content(path, expected_size)?;
     let digest = Md5::digest(&body);
     let quoted_md5 = format!("\"{digest:x}\"");
     let facts = match adapter
@@ -274,9 +309,7 @@ pub(super) async fn publish<P: S3Protocol>(
         Err(failure) if definite_refusal(&failure) => {
             return Err(unchanged(role_failure(path, Operation::Publish, failure)));
         }
-        Err(failure) => {
-            reconcile(adapter, path, request.expected_size, &quoted_md5, failure).await?
-        }
+        Err(failure) => reconcile(adapter, path, expected_size, &quoted_md5, failure).await?,
     };
     if let Some(tags) = tags {
         adapter
@@ -285,18 +318,11 @@ pub(super) async fn publish<P: S3Protocol>(
             .await
             .map_err(|failure| changed(role_failure(path, Operation::Publish, failure)))?;
     }
-    let version = facts.version_id.clone();
-    {
-        let mut guard = single.lock();
-        guard.published = Some(facts);
-        // The content is on the server now; verification reads it back from there.
-        guard.written = None;
-    }
-    Ok(PublicationEvidence {
-        final_destination: path.clone(),
-        disposition: PublicationDisposition::Published,
-        version,
-    })
+    let mut guard = single.lock();
+    guard.published = Some(facts.clone());
+    // The content is on the server now; verification reads it back from there.
+    guard.written = None;
+    Ok(facts)
 }
 
 /// A refusal the service answered before writing anything; every other failure (a lost or
@@ -333,9 +359,7 @@ async fn reconcile<P: S3Protocol>(
     }
 }
 
-/// Reads the published object back, pinned to what the PUT created (E1): by its version when it
-/// has one, otherwise with `If-Match` on its `ETag`. A current object that is no longer ours is
-/// `Conflict`.
+/// Reads the published object back, pinned to what the PUT created (E1).
 pub(super) async fn verify<P: S3Protocol>(
     adapter: &S3StagedDestination<P>,
     stage: &PreparedStage,
@@ -344,21 +368,33 @@ pub(super) async fn verify<P: S3Protocol>(
 ) -> Result<VerificationEvidence, StorageRoleFailure> {
     let path = stage.final_destination.path();
     adapter.validate(stage)?;
-    let published = single.lock().published.clone().ok_or_else(|| {
+    let published = single.published().ok_or_else(|| {
         entry(
             path,
             Operation::Verify,
             "S3 object is verified only after publication",
         )
     })?;
+    verify_written(adapter, path, published, request).await
+}
+
+/// Reads an object written at its final key back, pinned to what the write created: by its
+/// version when it has one, otherwise with `If-Match` on its `ETag`. A current object that is no
+/// longer ours is `Conflict`.
+pub(super) async fn verify_written<P: S3Protocol>(
+    adapter: &S3StagedDestination<P>,
+    path: &StoragePath,
+    written: S3WriteFacts,
+    request: &VerifyRequest,
+) -> Result<VerificationEvidence, StorageRoleFailure> {
     let version = request
         .published
         .as_ref()
         .and_then(|evidence| evidence.version.clone())
-        .or(published.version_id);
+        .or(written.version_id);
     let pinned = S3ObjectFacts {
         size: request.expected_size,
-        etag: published.etag,
+        etag: written.etag,
         version_id: version,
         last_modified: None,
     };
@@ -434,8 +470,10 @@ async fn read_pinned<P: S3Protocol>(
     Ok(*hasher.finalize().as_bytes())
 }
 
-fn same_etag(left: &str, right: &str) -> bool {
-    left.trim_matches('"') == right.trim_matches('"')
+/// Whether two `ETag`s are the same, ignoring quotes and the case of hex digits.
+pub(super) fn same_etag(left: &str, right: &str) -> bool {
+    left.trim_matches('"')
+        .eq_ignore_ascii_case(right.trim_matches('"'))
 }
 
 fn unchanged(error: StorageRoleFailure) -> PublicationFailure {

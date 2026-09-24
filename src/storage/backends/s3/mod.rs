@@ -13,15 +13,10 @@ use std::sync::Arc;
 use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
 
-#[cfg_attr(
-    not(test),
-    expect(unused_imports, reason = "used by Direct writes to S3, ADR-0006 C14c")
-)]
-pub(crate) use protocol::composite_etag;
 pub(crate) use protocol::{
     S3_NATIVE_COPY_SINGLE_MAX, S3NativeCopyEvidence, S3NativeCopyFailure, S3NativeCopyResult,
     S3NativeCopySource, S3ObjectFacts, S3PartFacts, S3Protocol, S3ProtocolFailure, S3Result,
-    S3WriteFacts, is_real_version_id,
+    S3WriteFacts, composite_etag, is_real_version_id,
 };
 
 pub(crate) use metadata::S3TagSupport;

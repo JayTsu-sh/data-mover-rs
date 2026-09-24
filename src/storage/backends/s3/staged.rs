@@ -2,11 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use bytes::{Bytes, BytesMut};
-use futures::StreamExt;
-use md5::{Digest as _, Md5};
+use bytes::Bytes;
 use tokio::sync::Mutex;
 
 use crate::model::{BackendIdentity, FailureClass, Operation, Transience};
@@ -20,11 +16,13 @@ use crate::storage::{
 
 use super::source::{cancelled, classified_entry, entry, role_failure};
 
+mod direct;
 #[cfg(test)]
 mod manifest_tests;
 mod native;
 #[cfg(test)]
 mod native_tests;
+mod parts;
 mod publication;
 mod recovery;
 mod single;
@@ -57,27 +55,6 @@ fn planned_part_size(
     }
     usize::try_from(part)
         .map_err(|_| entry(path, Operation::Prepare, "S3 part cannot fit address space"))
-}
-
-async fn upload<P: S3Protocol>(
-    protocol: Arc<P>,
-    key: String,
-    upload_id: String,
-    number: i32,
-    bytes: Bytes,
-) -> Result<(i32, String), S3ProtocolFailure> {
-    if !(1..=10_000).contains(&number) {
-        return Err(S3ProtocolFailure::entry(
-            FailureClass::InvalidInput,
-            Transience::Permanent,
-            "S3 multipart part limit exceeded",
-        ));
-    }
-    let content_md5 = BASE64_STANDARD.encode(Md5::digest(&bytes));
-    let etag = protocol
-        .upload_part(&key, &upload_id, number, bytes, &content_md5)
-        .await?;
-    Ok((number, etag))
 }
 
 #[derive(Clone, Default)]
@@ -281,6 +258,19 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         })
     }
 
+    /// `Direct` writes the object at its final key (ADR-0006 C14c).
+    fn supports_direct(&self) -> bool {
+        true
+    }
+
+    async fn prepare_direct(
+        &self,
+        request: PrepareRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        self.prepare_direct_stage(request, &cancel)
+    }
+
     async fn write_single(
         &self,
         stage: &PreparedStage,
@@ -288,8 +278,8 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
     ) -> Result<WriteEvidence, StorageRoleFailure> {
         self.validate(stage)?;
         match single::of(stage) {
-            Some(single) => single::write_single(stage, single, data),
-            None => {
+            Some(single) if !stage.direct => single::write_single(stage, single, data),
+            _ => {
                 self.write(
                     stage,
                     Box::pin(futures::stream::once(async move { Ok(data) })),
@@ -406,9 +396,12 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
     async fn write(
         &self,
         stage: &PreparedStage,
-        mut input: ByteStream,
+        input: ByteStream,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
         let key = self.validate(stage)?;
+        if stage.direct {
+            return self.write_direct(stage, input).await;
+        }
         if let Some(single) = single::of(stage) {
             return single::write(stage, single, input).await;
         }
@@ -420,68 +413,22 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         }
         let upload_id = initial.upload_id.clone();
         let part_size = initial.part_size;
-        let mut buffered = BytesMut::with_capacity(part_size);
-        let mut parts = initial.parts;
-        let mut number = parts.iter().map(|part| part.0).max().unwrap_or(0) + 1;
-        let result: Result<u64, StorageRoleFailure> = async {
-            let mut inflight = futures::stream::FuturesUnordered::new();
-            while let Some(chunk) = input.next().await {
-                let chunk = match chunk {
-                    Ok(chunk) => chunk,
-                    Err(input_failure) => {
-                        while inflight.next().await.is_some() {}
-                        return Err(input_failure);
-                    }
-                };
-                buffered.extend_from_slice(&chunk);
-                while buffered.len() >= part_size {
-                    let part = buffered.split_to(part_size).freeze();
-                    inflight.push(upload(
-                        self.protocol.clone(),
-                        key.clone(),
-                        upload_id.clone(),
-                        number,
-                        part,
-                    ));
-                    number += 1;
-                    if inflight.len() >= MAX_INFLIGHT_PARTS {
-                        let Some(completed) = inflight.next().await else {
-                            return Err(entry(
-                                stage.final_destination.path(),
-                                Operation::Write,
-                                "S3 inflight upload disappeared",
-                            ));
-                        };
-                        parts.push(completed.map_err(|e| {
-                            role_failure(stage.final_destination.path(), Operation::Write, e)
-                        })?);
-                    }
-                }
-            }
-            if !buffered.is_empty() || (parts.is_empty() && inflight.is_empty()) {
-                inflight.push(upload(
-                    self.protocol.clone(),
-                    key.clone(),
-                    upload_id.clone(),
-                    number,
-                    buffered.freeze(),
-                ));
-            }
-            while let Some(part) = inflight.next().await {
-                parts.push(part.map_err(|e| {
-                    role_failure(stage.final_destination.path(), Operation::Write, e)
-                })?);
-            }
-            parts.sort_by_key(|part| part.0);
-            // The temp key's facts are not needed: publication copies it to the final key.
-            self.protocol
-                .complete_multipart(&key, &upload_id, &parts)
-                .await
-                .map_err(|e| role_failure(stage.final_destination.path(), Operation::Write, e))?;
-            Ok(parts.iter().map(|_| 0u64).sum())
-        }
-        .await;
-        result?;
+        let path = stage.final_destination.path();
+        let target = parts::PartTarget {
+            path,
+            key: &key,
+            upload_id: &upload_id,
+            part_size,
+        };
+        let parts = self
+            .upload_parts(&target, initial.parts, input)
+            .await?
+            .parts;
+        // The temp key's facts are not needed: publication copies it to the final key.
+        self.protocol
+            .complete_multipart(&key, &upload_id, &parts)
+            .await
+            .map_err(|e| role_failure(path, Operation::Write, e))?;
         let persisted = self
             .protocol
             .head(&key)
@@ -509,6 +456,11 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         stage: &PreparedStage,
     ) -> Result<CheckpointObservation, StorageRoleFailure> {
         let key = self.validate(stage)?;
+        if stage.direct {
+            return Ok(CheckpointObservation {
+                durable_prefix: Self::direct_durable_bytes(stage),
+            });
+        }
         if let Some(single) = single::of(stage) {
             return Ok(CheckpointObservation {
                 durable_prefix: single.written_len(),
@@ -561,6 +513,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         stage: &PreparedStage,
         request: VerifyRequest,
     ) -> Result<VerificationEvidence, StorageRoleFailure> {
+        if stage.direct {
+            return self.verify_direct(stage, &request).await;
+        }
         if let Some(single) = single::of(stage) {
             return single::verify(self, stage, single, &request).await;
         }
@@ -612,8 +567,11 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         mutation: MetadataMutation,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), StorageRoleFailure> {
-        let key = self.validate(stage)?;
-        if let Some(single) = single::of(stage) {
+        let mut key = self.validate(stage)?;
+        if stage.direct {
+            // The object is already at its final key.
+            key = stage.final_destination.path().as_str().to_string();
+        } else if let Some(single) = single::of(stage) {
             if self.metadata.is_none() {
                 return Err(metadata_unavailable(stage));
             }
@@ -638,6 +596,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         stage: &PreparedStage,
         request: PublishRequest,
     ) -> Result<PublicationEvidence, PublicationFailure> {
+        if stage.direct {
+            return self.publish_direct(stage);
+        }
         if let Some(single) = single::of(stage) {
             return single::publish(self, stage, single, &request).await;
         }
@@ -645,6 +606,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
     }
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
         let key = self.validate(&stage)?;
+        if stage.direct {
+            return self.discard_direct(&stage).await;
+        }
         if single::of(&stage).is_some() {
             // Nothing was sent before publication, and a published object is never deleted.
             return Ok(());
@@ -683,9 +647,10 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         Ok(())
     }
 
-    /// A single PUT writes the final key itself, so it is read back only after publication.
+    /// A single PUT and a `Direct` write write the final key itself, so it is read back only
+    /// after publication.
     fn verification_point(&self, stage: &PreparedStage) -> VerificationPoint {
-        if single::of(stage).is_some() {
+        if stage.direct || single::of(stage).is_some() {
             VerificationPoint::AfterPublish
         } else {
             VerificationPoint::BeforePublish

@@ -2,10 +2,12 @@
 # Role-based S3 write-strategy matrix against a real server (examples/transfer_resume.rs).
 # Prints one line per case plus what it left behind (stage objects, incomplete multipart uploads),
 # then removes everything under its own prefix. Not an assertion suite: it records a baseline to
-# compare write strategies across commits.
+# compare write strategies across commits — except the Direct rows, which since ADR-0006 C14c must
+# succeed: each is downloaded and compared with its source, and the uploads left on its exact key
+# are counted (`direct: equal=yes key_uploads=0` is the expected verdict).
 #
-# Env: .claude/skills/e2e-s3/.env (S3_HOST, S3_BUCKET, S3_AK, S3_SK). Only keys under
-# staged-<run>/ are written or deleted.
+# Env: .claude/skills/e2e-s3/.env (S3_HOST, S3_BUCKET, S3_AK, S3_SK); PREFIX overrides the key
+# prefix (default staged-<run>). Only keys under that prefix are written or deleted.
 set -u
 ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$ROOT"
@@ -13,7 +15,13 @@ set -a; . .claude/skills/e2e-s3/.env; set +a
 # `a-bucket` holds Milvus data on the lab MinIO; never write there.
 [ "${S3_BUCKET:-}" = a-bucket ] && { echo "refusing to write to bucket a-bucket" >&2; exit 1; }
 RUN=${RUN:-$(date +%s)}
-PREFIX=staged-$RUN
+# The run's prefix: its cleanup deletes every object and upload under it, so it must look like one
+# of ours (an inherited generic PREFIX must never be taken).
+PREFIX=${S3_MATRIX_PREFIX:-staged-$RUN}
+case "$PREFIX" in
+  staged-*|data-mover-*) ;;
+  *) echo "S3_MATRIX_PREFIX must start with staged- or data-mover-: $PREFIX" >&2; exit 1 ;;
+esac
 WORK=/tmp/data-mover-s3-staged-$RUN
 export DATA_MOVER_RECOVERY_DIR=$WORK/recovery
 mkdir -p "$WORK/src" "$DATA_MOVER_RECOVERY_DIR"
@@ -63,8 +71,17 @@ case_() { # label, args...
   local line; line=$("$BIN" "$@" 2>&1 | tail -1)
   printf '%-44s %s  | stage=%s uploads=%s\n' "$label" "$line" "$(stage_objects)" "$(open_uploads)"
 }
+# Direct writes the final key itself: the object must equal its source and leave no upload on
+# that exact key (MinIO lists uploads for an exact key only, which is what this asks for).
+direct_verdict() { # destination key, source file
+  local equal=no
+  curl -s -o "$WORK/check" "${SIG[@]}" "$B/$PREFIX/$1" && cmp -s "$WORK/check" "$2" && equal=yes
+  rm -f "$WORK/check"
+  local uploads; uploads=$(curl -s "${SIG[@]}" "$B?uploads&prefix=$PREFIX/$1" | grep -c '<UploadId>')
+  echo "   direct: equal=$equal key_uploads=$uploads"
+}
 
-SIZES=("z0:0" "k1:1024" "m8:8388608" "m8p1:8388609" "m200:209715200")
+SIZES=("z0:0" "k1:1024" "m8:8388608" "m8p1:8388609" "m20:20971520" "m200:209715200")
 # RESUME_ONLY=1 runs only the interrupt-then-resume cases.
 RESUME_ONLY=${RESUME_ONLY:-0}
 echo "run=$RUN prefix=$PREFIX"
@@ -80,6 +97,7 @@ done
       case_ "$policy rb=$rb $name" --source "$WORK/src" --source-path "$name" \
         --destination "s3:$PREFIX" --destination-path "$policy-$rb-$name" \
         --policy "$policy" --read-back "$rb" --identity "m-$RUN-$policy-$rb-$name"
+      [ "$policy" = direct ] && direct_verdict "$policy-$rb-$name" "$WORK/src/$name"
     done
   done
 done

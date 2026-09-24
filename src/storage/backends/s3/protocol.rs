@@ -96,10 +96,6 @@ impl S3WriteFacts {
 /// (`"<md5>-<n>"`). `None` when there are no parts or any part `ETag` is not a quoted 32-hex MD5
 /// (server-side encryption with KMS and some stores report other values): then no composite can
 /// be computed.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by Direct writes to S3, ADR-0006 C14c")
-)]
 pub(crate) fn composite_etag(part_etags: &[String]) -> Option<String> {
     if part_etags.is_empty() {
         return None;
@@ -116,10 +112,6 @@ pub(crate) fn composite_etag(part_etags: &[String]) -> Option<String> {
 }
 
 /// The binary MD5 a quoted 32-hex `ETag` spells; `None` for any other shape.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by Direct writes to S3, ADR-0006 C14c")
-)]
 fn md5_of_etag(etag: &str) -> Option<[u8; 16]> {
     let hex = etag.strip_prefix('"')?.strip_suffix('"')?;
     if hex.len() != 32 {
@@ -213,10 +205,6 @@ pub(crate) trait S3Protocol: Send + Sync {
     async fn list_parts(&self, key: &str, upload_id: &str) -> S3Result<Vec<S3PartFacts>>;
     /// The ids of the multipart uploads in progress on exactly `key` — not on keys that merely
     /// start with it (some stores list by prefix, `MinIO` by exact key).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Direct writes to S3, ADR-0006 C14c")
-    )]
     async fn list_uploads(&self, key: &str) -> S3Result<Vec<String>>;
     async fn copy_object(&self, from: &str, to: &str) -> S3Result<()>;
     async fn native_copy(

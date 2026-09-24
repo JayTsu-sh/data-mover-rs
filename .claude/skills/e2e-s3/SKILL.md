@@ -25,8 +25,10 @@ S3_PREFIX=test                   # bucket 内的子路径
 3. **404 验证**：用 `s3_walkdir <bucket>/this-key-does-not-exist-{timestamp}` 触发 NoSuchKey，应映射为 `FileNotFound`，**不重试**。
 
 4. **写入策略矩阵**（role-based 目的端）：`bash .claude/skills/e2e-s3/scripts/staged_matrix.sh` ——
-   大小 0 / 1 KiB / 8 MiB / 8 MiB+1 / 200 MiB × Checkpointed / AtomicReplace / Direct × 读回开关，原生 S3→S3，
-   取消与 SIGKILL 后续传。每行打印结果、耗时和遗留（stage 对象、未完成上传）。只写/删 `staged-<run>/`。
+   大小 0 / 1 KiB / 8 MiB / 8 MiB+1 / 20 MiB / 200 MiB × Checkpointed / AtomicReplace / Direct × 读回开关，原生 S3→S3，
+   取消与 SIGKILL 后续传。每行打印结果、耗时和遗留（stage 对象、未完成上传）。只写/删 `staged-<run>/`
+   （`S3_MATRIX_PREFIX=` 可改，必须以 `staged-` 或 `data-mover-` 开头 —— 清理会删掉它下面的一切）。Direct 行（ADR-0006 C14c 起必须成功）另打印 `direct: equal=… key_uploads=…`：下载比对源文件、
+   数该精确 key 上未完成的上传，期望 `equal=yes key_uploads=0`。
    注意 MinIO 2023 的 `ListMultipartUploads` 只认精确 key，脚本里的 `uploads=` 在那里恒为 0，不能当证据。
    基线与解读见 `.claude/docs/storage-s3.md`「目的端写入策略基线」。
 

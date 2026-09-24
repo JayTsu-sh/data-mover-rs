@@ -125,7 +125,7 @@ C0 时所有策略都是「temp key 分段上传 → CopyObject 到 final → �
 | 8 MiB / 8 MiB+1，读回开 | 1.1–2.2 s；读回关 0.7–0.9 s |
 | 200 MiB，Checkpointed，读回开 / 关 | 18.3 s / 9.4 s（读回约占一半） |
 | 200 MiB，AtomicReplace，读回开 / 关 | 19.6 s / 9.2 s |
-| Direct，任意大小 | Preflight 拒绝：S3 不支持 direct |
+| Direct，任意大小 | Preflight 拒绝：S3 不支持 direct（C14c 起支持，见下） |
 | 原生 S3→S3 1 KiB / 200 MiB | 0.1 s / 25.3 s（两次服务端全量 copy） |
 | Checkpointed 200 MiB 取消后续传 | **续传失败**：Prepare `NotFound`（见下）→ 去掉 claim 后成功 |
 | SIGKILL 后续传 | **续传失败**：同上 → 去掉 claim 后成功 |
@@ -149,7 +149,23 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   回复丢失 → HEAD 对账（大小相同且 `ETag` = 我们的 MD5 算已发布），否则 `final_destination_changed`。
 - 校验在发布**之后**（`verification_point` = `AfterPublish`）：先 HEAD 当前对象（`ETag` / 版本已不是我们的
   → `Conflict`），再按我们的 versionId 读；桶无版本时带 `If-Match: <我们的 ETag>` 读。
-- 大于 T、大小未知、原生 S3→S3 仍走 temp key 分段上传 + CopyObject（C15 / C18 再改）；`Direct` 仍拒绝（C14c）。
+- 大于 T、大小未知、原生 S3→S3 仍走 temp key 分段上传 + CopyObject（C15 / C18 再改）。
+
+### `Direct`（ADR-0006 C14c）
+
+- `supports_direct() = true`；`prepare_direct` 拒绝「写回自己的源对象」（`Conflict`），已知大小 ≤ T → single stage，
+  否则 multipart stage；都标 `direct`、不续传、`durable_publication = false`（`staged/direct.rs`）。
+- `write` 内完成全部写入：≤ T 缓冲后一次 `PutObject`（复用 C14b 的发送与对账）；> T / 大小未知 → 先 abort 最终 key
+  上前人留下的 upload（`list_uploads`，失败只告警），**在 `write` 里**才 `CreateMultipartUpload`（写之前就失败的
+  传输不会留 upload），每段带 `Content-MD5`（MD5 在 `spawn_blocking` 里算），Complete。各段 `ETag` 都等于本段 MD5
+  （SSE-KMS 下不是）且对象 `ETag` 是 `…-N` 形式时，必须等于各段 `ETag` 的复合值（否则条目 `Corruption` / Permanent；
+  MinIO 实测一致）。Complete 任何失败（回复丢失、SDK 重试后 `NoSuchUpload`……）→ HEAD，大小与复合 `ETag` 都对才算
+  完成。任何失败都在 `write` 里 abort（试两次；引擎不保留失败的 Direct stage，仍 abort 不掉的 upload 留给下一次
+  同 key 的 Direct 写或桶的 lifecycle 规则）。
+- `publish` 只返回写入事实（带 versionId）；`verification_point` = `AfterPublish`，按版本 / `If-Match` 读最终对象；
+  `discard` 只 abort 仍开着的 upload，**从不删最终 key**；元数据经 metadata 角色直接写到最终对象。
+- 真机：`PREFIX=data-mover-c14c-<ts> bash .claude/skills/e2e-s3/scripts/staged_matrix.sh`，Direct 行下载比对并数精确
+  key 上的 upload（`direct: equal=yes key_uploads=0`）。
 
 ### 分段积木（ADR-0006 C15a，行为不变）
 

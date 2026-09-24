@@ -14,10 +14,6 @@ use crate::model::FailureClass;
 
 /// Where the next page of a truncated `ListMultipartUploads` starts: (key marker, upload id
 /// marker).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by Direct writes to S3, ADR-0006 C14c")
-)]
 type UploadsMarker = (Option<String>, Option<String>);
 
 impl S3Storage {
@@ -89,10 +85,6 @@ impl S3Storage {
     }
 
     /// `ListMultipartUploads` with the key as prefix, keeping only uploads on exactly that key.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by Direct writes to S3, ADR-0006 C14c")
-    )]
     pub(super) async fn role_list_uploads(&self, key: &str) -> S3Result<Vec<String>> {
         let full_key = self.build_full_key(key);
         let mut marker: UploadsMarker = (None, None);
@@ -118,10 +110,6 @@ impl S3Storage {
 }
 
 /// The upload ids of `response` whose key is exactly `full_key`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by Direct writes to S3, ADR-0006 C14c")
-)]
 fn uploads_on_key(response: &ListMultipartUploadsOutput, full_key: &str) -> Vec<String> {
     response
         .uploads()
@@ -131,10 +119,6 @@ fn uploads_on_key(response: &ListMultipartUploadsOutput, full_key: &str) -> Vec<
         .collect()
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by Direct writes to S3, ADR-0006 C14c")
-)]
 fn next_uploads_marker(
     response: &ListMultipartUploadsOutput,
     previous: &UploadsMarker,

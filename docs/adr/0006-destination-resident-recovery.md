@@ -276,6 +276,26 @@ our `ETag` when there is none. Discard of an unpublished single stage touches no
 unknown sizes and native S3→S3 copies (a single stage handed to the native path moves to the temp
 key) keep the temp-key multipart path until C15/C18; `Direct` stays refused until C14c.
 
+As built (C14c, S3 `Direct`): the S3 destination supports `Direct` (the engine's generic
+`supports_direct` check now passes; native copies are never used for `Direct`). `prepare_direct`
+refuses an object that is its own source (`Conflict`), then gives a known size ≤ T a single stage
+and anything else a multipart stage, both marked `direct`, without recovery or durable publication.
+`write` does the whole job at the final key: a single stage buffers and sends its `PutObject`
+(C14b's send, reconciliation included); a multipart stage aborts the uploads an earlier writer left
+on the final key (`list_uploads`, best effort), begins its upload there — inside `write`, so a
+transfer failing before it writes leaves no upload — sends every part with `Content-MD5`, and
+completes. When every part came back with its MD5 as `ETag` (not so under SSE-KMS) and the
+completion `ETag` has the multipart form, it must equal the composite of the part `ETag`s (else a
+permanent `Corruption`; MinIO matches). Any failed completion — a lost reply, or a retried one
+answered `NoSuchUpload` — counts as done when the final object has our size and that composite.
+Any failure aborts the upload inside `write` (tried twice: the engine keeps no failed `Direct`
+stage to discard, so an upload that still cannot be aborted is left to the next `Direct` write of
+the key, or to a lifecycle rule). `publish` only returns
+the write's facts (`PublicationEvidence.version`), `verification_point` is `AfterPublish` and
+verify reads the final object pinned by version or `If-Match` (C14b's code, generalised);
+`discard` aborts an upload still open and never deletes the final key. Metadata goes to the final
+object through the metadata role.
+
 As built (C15a, multipart building blocks — no behaviour change): `upload_part` sends `Content-MD5`
 (a mismatch is `BadDigest`, a transient `Corruption`); `complete_multipart` reports the object's
 `ETag` and version (`S3WriteFacts`); `list_uploads(key)` lists the uploads in progress on exactly

@@ -1,3 +1,4 @@
+use super::parts::upload;
 use super::*;
 use crate::model::{EntryKind, IdentityStrength, SourceIdentity, StoragePath};
 use crate::storage::backends::s3::tests::{MemoryS3, content_md5, identity};
