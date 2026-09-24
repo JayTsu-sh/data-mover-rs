@@ -93,6 +93,31 @@ match aws_sdk_s3::operation::get_object::GetObjectError::from(...) {
 `examples/nfs_metadata_copy.rs` 的 `s3:<prefix>` 端点。**URL 里的 AK/SK 原样使用、不做百分号解码**
 （e2e-s3 的 `url_builder.py` 会 quote，含特殊字符的 SK 会因此出错）。
 
+### 目的端写入策略基线（C0，改造前，2026-09-24，VM 102 MinIO RELEASE.2023-03-20）
+
+`bash .claude/skills/e2e-s3/scripts/staged_matrix.sh`（驱动 `examples/s3_staged_copy.rs`，只写/删 `staged-<run>/`）。
+今天所有策略都是「temp key 分段上传 → CopyObject 到 final → 删 temp」，1 KiB 也不例外。
+
+| 用例 | 结果 / 耗时 |
+|---|---|
+| 0 B / 1 KiB，任意策略 | 成功，40–110 ms |
+| 8 MiB / 8 MiB+1，读回开 | 1.1–2.2 s；读回关 0.7–0.9 s |
+| 200 MiB，Checkpointed，读回开 / 关 | 18.3 s / 9.4 s（读回约占一半） |
+| 200 MiB，AtomicReplace，读回开 / 关 | 19.6 s / 9.2 s |
+| Direct，任意大小 | Preflight 拒绝：S3 不支持 direct |
+| 原生 S3→S3 1 KiB / 200 MiB | 0.1 s / 25.3 s（两次服务端全量 copy） |
+| Checkpointed 200 MiB 取消后续传 | **续传失败**：Prepare `NotFound`（见下） |
+| SIGKILL 后续传 | **续传失败**：同上 |
+
+**续传在这台 MinIO 上完全不可用**：`recover` 第一步是 claim（`PutObject` + `If-None-Match: *`，`staged.rs:480`），
+MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成 `NotFound` → Prepare 失败。取消后上传其实还在
+（ListParts 有 1 个分段），不是上传丢了。去掉 rename 的改造里一并去掉 claim（用户确认同一目的 key 不会并发写）。
+
+**MinIO 2023 的其他实测行为**：`ListMultipartUploads` 只按**精确 key** 返回（按前缀或整桶都是 0）—— 孤儿上传
+无法按前缀发现，只能靠 key 精确查询或服务端 `stale_uploads_expiry` 回收；Content-MD5 不符 → 400 BadDigest；
+Complete 成功后再 Complete → 404 NoSuchUpload；`If-Match` 对分段 ETag（`…-1`）有效；分段号上限 10000；
+单 PUT 上限 5 GiB；版本控制下最后一个 Complete 成为当前版本，`GET ?versionId=` 读到指定版本。
+
 ## 已知陷阱
 
 | 陷阱 | 应对 |

@@ -24,6 +24,12 @@ S3_PREFIX=test                   # bucket 内的子路径
 2. s3_walkdir 列 bucket — 应返回。
 3. **404 验证**：用 `s3_walkdir <bucket>/this-key-does-not-exist-{timestamp}` 触发 NoSuchKey，应映射为 `FileNotFound`，**不重试**。
 
+4. **写入策略矩阵**（role-based 目的端）：`bash .claude/skills/e2e-s3/scripts/staged_matrix.sh` ——
+   大小 0 / 1 KiB / 8 MiB / 8 MiB+1 / 200 MiB × Checkpointed / AtomicReplace / Direct × 读回开关，原生 S3→S3，
+   取消与 SIGKILL 后续传。每行打印结果、耗时和遗留（stage 对象、未完成上传）。只写/删 `staged-<run>/`。
+   注意 MinIO 2023 的 `ListMultipartUploads` 只认精确 key，脚本里的 `uploads=` 在那里恒为 0，不能当证据。
+   基线与解读见 `.claude/docs/storage-s3.md`「目的端写入策略基线」。
+
 ## 成功判据
 
 - s3_walkdir 列 bucket 退出码 = 0
