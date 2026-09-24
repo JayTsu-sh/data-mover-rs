@@ -134,6 +134,7 @@ impl CifsNamespaceProtocol for MemoryCifs {
                     modified: stamp,
                     created: stamp,
                     readonly: Some(false),
+                    reparse_point: false,
                 },
             ),
             (
@@ -151,6 +152,7 @@ impl CifsNamespaceProtocol for MemoryCifs {
                     modified: stamp,
                     created: stamp,
                     readonly: Some(false),
+                    reparse_point: false,
                 },
             ),
         ])

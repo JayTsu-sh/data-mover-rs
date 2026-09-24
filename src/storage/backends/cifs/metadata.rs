@@ -24,6 +24,9 @@ pub(super) struct CifsInlineMetadata {
     /// so `list` and `metadata` fill it. It stays optional for protocols whose records omit it,
     /// so an unknown attribute is never reported as a writable entry.
     pub(super) readonly: Option<bool>,
+    /// `FILE_ATTRIBUTE_REPARSE_POINT` (symbolic link, junction, …) as the record reported it;
+    /// `false` when it carried no attributes. A recursive delete never descends into one.
+    pub(super) reparse_point: bool,
 }
 
 #[async_trait]
@@ -382,6 +385,7 @@ mod tests {
                 modified: std::time::UNIX_EPOCH,
                 created: std::time::UNIX_EPOCH,
                 readonly: None,
+                reparse_point: false,
             })
         }
 

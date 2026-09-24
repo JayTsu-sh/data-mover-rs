@@ -157,7 +157,8 @@ with versionId, latest flag and delete-marker flag, oldest to newest per key). B
 
 C1 this ADR · C2 cross-backend resume example and container-restart matrix, baseline · C3 legacy S3
 listing filters `.data-mover-*` · C3b the same for the legacy Local / NFS / HDFS listings and the CIFS /
-HDFS role-based namespace and traversal (one shared `ARTIFACT_PREFIX`) · C4 endpoint identity (C4a
+HDFS role-based namespace and traversal (one shared `ARTIFACT_PREFIX`; directory deletes still remove
+artifacts — legacy NFS walks them, role Local / CIFS sweep an artifact-only directory) · C4 endpoint identity (C4a
 derivation, C4b wiring, C4c snapshots without the identity) · C5 TransferIdentity and binding v3 · C6 source
 version selector (C6a: native identity ignores the `"null"` version) · C7 destination discovery seam ·
 C8 Local · C9 Local reserved-name cleanup · C10 NFS · C11 CIFS · C12 HDFS · C13 verification point ·

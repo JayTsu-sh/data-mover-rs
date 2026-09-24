@@ -10,6 +10,10 @@
 //! Directory changes that create or move entries are made durable by synchronizing the parent
 //! directories; `Delete` is not, because a recursive delete would otherwise pay one directory
 //! sync per entry.
+//!
+//! Transfer artifacts (`.data-mover-*`, ADR-0006) are invisible here: `List` hides them and no
+//! verb addresses them. `Delete` of a directory that only artifacts keep non-empty — empty as
+//! seen through `List` — removes them with it.
 
 use std::borrow::Cow;
 use std::ffi::OsStr;
@@ -362,15 +366,61 @@ fn in_parent<T>(
 
 /// Removes one entry of `parent` without following a symlink.
 ///
-/// A directory must already be empty: this verb never deletes recursively.
+/// A directory must be empty as seen through `List`: transfer artifacts left in it are removed
+/// with it, but a visible entry keeps the directory and the error, and no artifact beside it is
+/// touched. Nothing else is deleted recursively.
 fn delete_entry(parent: &Dir, leaf: &OsStr) -> io::Result<()> {
     if parent.symlink_metadata(leaf)?.is_dir() {
-        return parent.remove_dir(leaf);
+        return match parent.remove_dir(leaf) {
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                remove_artifact_children(parent, leaf, error)?;
+                parent.remove_dir(leaf)
+            }
+            result => result,
+        };
     }
     match parent.remove_file(leaf) {
         // A directory symlink on Windows is removed as a directory; the link, not its target.
         #[cfg(windows)]
         Err(file_error) => parent.remove_dir(leaf).map_err(|_| file_error),
+        result => result,
+    }
+}
+
+/// Removes every child of `parent/leaf` when all of them are transfer artifacts (artifact
+/// directories with their contents, never following a symlink); otherwise returns `refused` and
+/// removes nothing. An artifact that vanishes meanwhile (a writer published it) is not an error:
+/// the caller's final `remove_dir` decides.
+fn remove_artifact_children(parent: &Dir, leaf: &OsStr, refused: io::Error) -> io::Result<()> {
+    let directory = open_directory(parent, Path::new(leaf))?;
+    let mut children = Vec::new();
+    for entry in directory.entries()? {
+        let entry = entry?;
+        if !is_artifact_name(&entry.file_name()) {
+            return Err(refused);
+        }
+        children.push((entry.file_name(), entry.file_type()?));
+    }
+    for (name, kind) in children {
+        let removed = if kind.is_dir() {
+            directory.remove_dir_all(&name)
+        } else {
+            remove_link_or_file(&directory, &name)
+        };
+        match removed {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Removes a file or a symlink itself; on Windows a directory symlink or junction is removed as a
+/// directory, like `delete_entry` does.
+fn remove_link_or_file(directory: &Dir, name: &OsStr) -> io::Result<()> {
+    match directory.remove_file(name) {
+        #[cfg(windows)]
+        Err(file_error) => directory.remove_dir(name).map_err(|_| file_error),
         result => result,
     }
 }

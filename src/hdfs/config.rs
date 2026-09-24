@@ -23,6 +23,7 @@ use crate::HDFSEntry;
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::{HdfsErrorKind, StorageError};
 use crate::filter::{FilterInput, should_skip};
+use crate::storage::artifacts::is_artifact_native;
 
 const DEFAULT_BLOCK_SIZE: u64 = 128 * crate::MB;
 const MAX_TRANSFER_CHUNK_SIZE: u64 = 2 * crate::MB;

@@ -274,6 +274,7 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
                         modified: entry.written(),
                         created: entry.created(),
                         readonly: Some(entry.is_readonly()),
+                        reparse_point: entry.is_reparse_point(),
                     },
                 ))
             })
@@ -506,6 +507,7 @@ impl CifsMetadataProtocol for SmbDomainProtocol {
             modified: metadata.written(),
             created: metadata.created(),
             readonly: Some(metadata.is_readonly()),
+            reparse_point: metadata.is_reparse_point(),
         })
     }
 

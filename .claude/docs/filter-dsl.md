@@ -156,6 +156,12 @@ role-based 路径同理：`traversal` 模块不依赖 `crate::filter` (架构依
 backend (Local / NFS / CIFS / HDFS) 都走它。
 可运行入口见 `examples/storage_role_operations.rs`。
 
+## 传输 artifact 不进三元组
+
+所有列举（legacy 与 role-based，全部后端）在调用 `should_skip` **之前**就丢掉相对根任一段以 `.data-mover-`
+开头的条目 (ADR-0006 C3b)。放在后面的话，「跳过但继续下探」分支会走进 `.data-mover-stage/` 把里面名字普通的
+子项报出来。三元组语义本身不变。
+
 ## 已知陷阱
 
 | 陷阱 | 应对 |

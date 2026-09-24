@@ -88,8 +88,12 @@ P1 复现过：`delete_tree` 的根是链接时会删光链接目标里的文件
   `DirectoryNotEmpty` → `Conflict`，`NotADirectory` → `InvalidInput`，共享的 `classify_io` 不变。
 - `CreateDirectory` / `Rename` 成功后目录同步失败，照 §10 报为该动词失败；调用方若重试
   `Rename` 会得到 `NotFound` (已经移走了)。
-- 被隐藏的 `.data-mover-*` 孤儿临时文件会让所在目录删不掉：`delete_tree` 报 `Conflict`，
-  但列举里看不到是哪个子项。
+- `Delete` 目录时若只剩被隐藏的 `.data-mover-*`（经 `List` 看是空的），先把它们删掉（artifact 目录
+  连内容，不跟随符号链接）再删目录；只要还有可见子项就照旧 `Conflict`，旁边的 artifact 一个不动
+  (ADR-0006 C3b)。代价：同一目录里并发写入的 stage 会被一起删 —— 调用方契约本就是一个 key 一个写者，
+  且调用方正在删这个目录。
+- legacy `walkdir` / `walkdir_2` 同样隐藏 `.data-mover-*`（按相对根的路径，先于过滤与 stat；NDX 编号与
+  没有它们时相同）；legacy `delete_dir_all` 是原始递归删除，照删。
 - Windows：`Rename` 到已存在的目录会被拒 (报 `PermissionDenied`，不重映射)；只读文件 `Delete`
   失败；`cap-primitives` 打开目录不带 `FILE_SHARE_DELETE`，某个动词持有目录句柄期间，另一个
   任务对该目录的 rename/delete 会遇到共享冲突 (`Protocol`)。`delete_tree` 按深度倒序删目录，

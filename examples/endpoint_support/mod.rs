@@ -18,8 +18,8 @@ use std::path::Path;
 use data_mover::model::StoragePath;
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, DeleteTreeRequest,
-    HdfsBackendConfig, LocalBackendConfig, NamespaceRequest, NfsBackendConfig, PreflightPolicy,
-    S3BackendConfig, Storage, connect_backend, delete_tree,
+    HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, Storage,
+    connect_backend, delete_tree,
 };
 use futures::TryStreamExt as _;
 use tokio_util::sync::CancellationToken;
@@ -114,8 +114,9 @@ pub async fn connect(endpoint: &str) -> Result<Storage> {
 }
 
 /// Names starting with `.data-mover-` in `dir` of `endpoint`: what a transfer left next to its final
-/// file. Read below the storage roles where those hide them (Local traversal, NFS namespace), so a
-/// check sees exactly what is on the server. S3 is listed by its bucket listing instead.
+/// file. Every listing data-mover offers hides them (ADR-0006 C3b), so this reads below the storage
+/// layer — a raw NFS mount, SMB directory query, HDFS `list_status`, or `std::fs` — and sees exactly
+/// what is on the server. S3 is listed by its bucket listing instead.
 pub async fn artifacts(endpoint: &str, dir: &str) -> Result<Vec<String>> {
     Ok(names(endpoint, dir)
         .await?
@@ -134,6 +135,8 @@ pub async fn remove_run(endpoint: &str, dir: &str) -> Result<Vec<String>> {
         );
     }
     let removed = artifacts(endpoint, dir).await?;
+    // SMB and HDFS need no separate pass: deleting a directory removes the artifacts in it (the
+    // CIFS namespace sweeps them, HDFS deletes recursively).
     if endpoint.starts_with("nfs://") {
         // The NFS namespace refuses `.data-mover-*` paths, so they go through a raw mount first.
         let (mount, directory) = nfs_mount(endpoint, dir).await?;
@@ -183,18 +186,21 @@ async fn names(endpoint: &str, dir: &str) -> Result<Vec<String>> {
             .await?;
         return Ok(names);
     }
-    if endpoint.starts_with("smb:") || endpoint.starts_with("hdfs://") {
-        let listed = connect(endpoint)
-            .await?
-            .namespace(&PreflightPolicy::production())?
-            .execute(NamespaceRequest::List(StoragePath::new(dir)?))
-            .await?
-            .into_listing()
-            .ok_or("the namespace returned no listing")?;
-        return Ok(listed
-            .0
+    if let Some(root) = endpoint.strip_prefix("smb:") {
+        return smb_names(root, dir).await;
+    }
+    if endpoint.starts_with("hdfs://") {
+        let storage =
+            data_mover::hdfs::create_hdfs_storage(endpoint, &hdfs_client(), None, false).await?;
+        let path = format!(
+            "{}/{}",
+            storage.location().root().trim_end_matches('/'),
+            dir.trim_matches('/')
+        );
+        let statuses = storage.client().list_status(&path, false).await?;
+        return Ok(statuses
             .iter()
-            .filter_map(|entry| entry.path.as_str().rsplit('/').next().map(str::to_owned))
+            .filter_map(|status| status.path.rsplit('/').next().map(str::to_owned))
             .collect());
     }
     if endpoint.starts_with("s3:") {
@@ -203,6 +209,38 @@ async fn names(endpoint: &str, dir: &str) -> Result<Vec<String>> {
     Ok(fs::read_dir(Path::new(endpoint).join(dir))?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<io::Result<Vec<_>>>()?)
+}
+
+/// The names in `dir` below the share sub-path `root`, read with a plain SMB directory query.
+async fn smb_names(root: &str, dir: &str) -> Result<Vec<String>> {
+    let client = smb_domain::Client::with_policies(
+        smb_domain::SigningPolicy::WhenRequired,
+        smb_domain::GuestPolicy::Deny,
+    );
+    let target =
+        smb_domain::ShareTarget::new(&env_var("CIFS_REAL_SERVER")?, &env_var("CIFS_REAL_SHARE")?)?;
+    let share = client
+        .connect_share(
+            &target,
+            smb_domain::Credentials::ntlm(env_var("CIFS_REAL_USER")?, env_var("CIFS_REAL_PASS")?),
+        )
+        .await?;
+    let path = join(root, dir).replace('/', "\\");
+    let path = smb_domain::SharePath::new(if path.is_empty() {
+        ".".to_owned()
+    } else {
+        path
+    })?;
+    let directory = share
+        .open_directory(&path, smb_domain::DirectoryOpenOptions::open_existing())
+        .await?;
+    let entries = directory.entries("*").try_collect::<Vec<_>>().await;
+    directory.close().await?;
+    Ok(entries?
+        .iter()
+        .map(|entry| entry.name().to_owned())
+        .filter(|name| !matches!(name.as_str(), "." | ".."))
+        .collect())
 }
 
 /// A raw mount of the export behind an `nfs://host/export[:root]?…` endpoint, and `dir` as a path

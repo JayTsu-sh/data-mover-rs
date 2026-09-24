@@ -334,6 +334,19 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 6. **提交**：单独一个 `chore(deps): smb-domain 固定到 smb-rs main <rev>` commit，body 写清 smb-rs
    提交范围、跑过的矩阵和结果；不要和功能改动混在一起，出问题能单独 revert。
 
+## 传输 artifact 与 namespace (ADR-0006 C3b)
+
+- `List` 隐藏相对根任一段以 `.data-mover-` 开头的子项；六个动词对这类路径一律 `InvalidInput`（与 Local /
+  NFS 一致）。
+- `Delete(dir)` 遇 `STATUS_DIRECTORY_NOT_EMPTY` 时原始列举一次：全部是 artifact 就先规划、再逐个删（artifact
+  目录后序删内容）、最后重删一次；还有可见子项则原样返回 `Conflict`，不碰任何 artifact。
+- 规划阶段不删任何东西：artifact 里任何一层有 reparse point（符号链接 / junction，`CifsInlineMetadata.reparse_point`
+  取自列举记录的 `FILE_ATTRIBUTE_REPARSE_POINT`）就整体放弃、返回原 `Conflict`，绝不穿过链接。
+- 清扫中某个 artifact 已不在（写者刚发布）按成功处理，由最后的删目录决定结果；所有失败都记在调用方要删的
+  那个路径上，不暴露隐藏路径。列举为空（期间已被清空）就直接再删一次。
+- `examples/endpoint_support` 的 artifact 计数因此改用原始 SMB 目录查询（`smb_names`），不能再走 role 列举。
+- 未改：`validate_final` 只检查首段 `.data-mover-staging`，更深的 artifact 名作为最终路径不拒（C11 处理）。
+
 ## 已知陷阱
 
 | 陷阱 | 应对 |

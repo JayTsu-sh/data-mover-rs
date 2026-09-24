@@ -261,7 +261,8 @@ impl HDFSStorage {
         self.resolve_path(relative_path)
     }
 
-    /// List exactly the immediate children of one directory below this root.
+    /// List exactly the immediate children of one directory below this root, transfer artifacts
+    /// (`.data-mover-*`, ADR-0006) included: walks hide them, raw callers must see them.
     ///
     /// # Errors
     ///
@@ -286,6 +287,26 @@ impl HDFSStorage {
         self.entries_from_listing(statuses, &directory.relative_path)
     }
 
+    /// [`Self::list_directory`] without transfer artifacts (ADR-0006 C3b): what `walkdir` and
+    /// `walkdir_2` report. The raw listing stays available for callers that must see them.
+    pub(crate) async fn list_visible(
+        &self,
+        relative_path: &std::path::Path,
+    ) -> Result<Vec<HDFSEntry>, StorageError> {
+        let mut entries = self.list_directory(relative_path).await?;
+        entries.retain(|entry| {
+            let artifact = is_artifact_native(&entry.relative_path);
+            if artifact {
+                tracing::trace!(
+                    "[HDFS] listing skips transfer artifact {}",
+                    entry.relative_path.display()
+                );
+            }
+            !artifact
+        });
+        Ok(entries)
+    }
+
     fn entries_from_listing(
         &self,
         statuses: Vec<hdfs_native::client::FileStatus>,
@@ -306,7 +327,8 @@ impl HDFSStorage {
     }
 
     /// Start a bounded recursive HDFS scan without applying common walk
-    /// filtering or message semantics.
+    /// filtering or message semantics. Transfer artifacts are never reported
+    /// (a namespace rule, ADR-0006 C3b, not a walk filter).
     ///
     /// # Errors
     ///
@@ -400,7 +422,7 @@ impl HDFSStorage {
         let crate::dir_tree::DirHandle::Hdfs(relative_path) = handle else {
             return Err(StorageError::MismatchedType);
         };
-        let entries = self.list_directory(relative_path).await?;
+        let entries = self.list_visible(relative_path).await?;
         Ok(hdfs_read_result(dir_path, entries, ctx))
     }
 

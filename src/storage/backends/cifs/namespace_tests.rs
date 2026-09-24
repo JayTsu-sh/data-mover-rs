@@ -404,6 +404,7 @@ impl CifsNamespaceProtocol for ListingProtocol {
                         modified: stamp,
                         created: stamp,
                         readonly: *readonly,
+                        reparse_point: false,
                     },
                 ))
             })
@@ -470,5 +471,256 @@ async fn stat_never_claims_permission_bits() -> Result {
         None,
         "a metadata open carries no attribute bits, so stat must not invent permission bits"
     );
+    Ok(())
+}
+
+/// An in-memory share: `remove` refuses a directory that still has children, as SMB does.
+struct TreeProtocol {
+    entries: Mutex<std::collections::BTreeMap<String, EntryKind>>,
+    /// Entries listed with the reparse-point attribute.
+    reparse: Vec<String>,
+    /// Entries that disappear on their own just before `remove` reaches them.
+    vanishing: Vec<String>,
+}
+
+impl TreeProtocol {
+    fn new(entries: &[(&str, EntryKind)]) -> Arc<Self> {
+        Self::with(entries, &[], &[])
+    }
+
+    fn with(entries: &[(&str, EntryKind)], reparse: &[&str], vanishing: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            entries: Mutex::new(
+                entries
+                    .iter()
+                    .map(|(path, kind)| ((*path).to_owned(), *kind))
+                    .collect(),
+            ),
+            reparse: reparse.iter().map(|path| (*path).to_owned()).collect(),
+            vanishing: vanishing.iter().map(|path| (*path).to_owned()).collect(),
+        })
+    }
+
+    fn paths(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn children(&self, parent: &str) -> Vec<(String, EntryKind)> {
+        let prefix = if parent.is_empty() {
+            String::new()
+        } else {
+            format!("{parent}/")
+        };
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(path, _)| {
+                path.strip_prefix(&prefix)
+                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+            })
+            .map(|(path, kind)| (path.clone(), *kind))
+            .collect()
+    }
+}
+
+#[async_trait]
+impl CifsNamespaceProtocol for TreeProtocol {
+    async fn stat(&self, _path: &StoragePath) -> smb_domain::Result<CifsSourceFacts> {
+        Err(smb_domain::Error::UnexpectedMessageStatus(
+            STATUS_OBJECT_NAME_NOT_FOUND,
+        ))
+    }
+
+    async fn list(
+        &self,
+        path: &StoragePath,
+    ) -> smb_domain::Result<Vec<(StoragePath, CifsInlineMetadata)>> {
+        let stamp = std::time::UNIX_EPOCH;
+        self.children(path.as_str())
+            .into_iter()
+            .map(|(child, kind)| {
+                let reparse_point = self.reparse.contains(&child);
+                let child = StoragePath::new(child)
+                    .map_err(|_| smb_domain::Error::InvalidArgument("invalid path".into()))?;
+                Ok((
+                    child,
+                    CifsInlineMetadata {
+                        facts: CifsSourceFacts {
+                            kind,
+                            size: 0,
+                            identity: Bytes::from_static(b"tree"),
+                            file_id: None,
+                            maximum_read_chunk: u32::MAX,
+                        },
+                        accessed: stamp,
+                        modified: stamp,
+                        created: stamp,
+                        readonly: None,
+                        reparse_point,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    async fn create_directory(&self, _path: &StoragePath) -> smb_domain::Result<()> {
+        Ok(())
+    }
+
+    async fn remove(&self, path: &StoragePath) -> smb_domain::Result<()> {
+        if self.vanishing.iter().any(|gone| gone == path.as_str()) {
+            self.entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(path.as_str());
+            return Err(smb_domain::Error::UnexpectedMessageStatus(
+                STATUS_OBJECT_NAME_NOT_FOUND,
+            ));
+        }
+        if !self.children(path.as_str()).is_empty() {
+            return Err(smb_domain::Error::UnexpectedMessageStatus(
+                STATUS_DIRECTORY_NOT_EMPTY,
+            ));
+        }
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(path.as_str());
+        Ok(())
+    }
+
+    async fn rename_entry(&self, _from: &StoragePath, _to: &StoragePath) -> smb_domain::Result<()> {
+        Ok(())
+    }
+}
+
+fn tree_namespace(protocol: &Arc<TreeProtocol>) -> Result<CifsNamespace> {
+    Ok(CifsNamespace::new(
+        Arc::clone(protocol),
+        BackendIdentity::new(BackendKind::Cifs, "smb://h/s")?,
+    ))
+}
+
+/// ADR-0006 C3b: artifacts are hidden from `List` and unaddressable by any verb.
+#[tokio::test]
+async fn artifacts_are_hidden_from_listing_and_refused_by_every_verb() -> Result {
+    let protocol = TreeProtocol::new(&[
+        ("dir", EntryKind::Directory),
+        ("dir/a.txt", EntryKind::File),
+        ("dir/.data-mover-0123.stage", EntryKind::File),
+        ("dir/.data-mover-staging", EntryKind::Directory),
+    ]);
+    let namespace = tree_namespace(&protocol)?;
+    let listed = namespace
+        .execute(NamespaceRequest::List(path("dir")?))
+        .await?;
+    let NamespaceResult::Entries(entries) = listed else {
+        return Err("list must return entries".into());
+    };
+    let names = entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["dir/a.txt"]);
+    for request in [
+        NamespaceRequest::Stat(path("dir/.data-mover-0123.stage")?),
+        NamespaceRequest::Delete(path("dir/.data-mover-0123.stage")?),
+        NamespaceRequest::List(path("dir/.data-mover-staging")?),
+        NamespaceRequest::Rename {
+            from: path("dir/a.txt")?,
+            to: path("dir/.data-mover-x.stage")?,
+        },
+    ] {
+        assert_eq!(
+            failure_class(namespace.execute(request).await)?,
+            FailureClass::InvalidInput
+        );
+    }
+    assert_eq!(protocol.paths().len(), 4, "a refused verb touches nothing");
+    Ok(())
+}
+
+/// A directory only artifacts keep non-empty is emptied of them and deleted; one with a visible
+/// entry keeps the conflict and every artifact beside it.
+#[tokio::test]
+async fn deleting_a_directory_sweeps_only_artifact_only_contents() -> Result {
+    let protocol = TreeProtocol::new(&[
+        ("gone", EntryKind::Directory),
+        ("gone/.data-mover-0123.stage", EntryKind::File),
+        ("gone/.data-mover-staging", EntryKind::Directory),
+        ("gone/.data-mover-staging/old", EntryKind::Directory),
+        ("gone/.data-mover-staging/old/part", EntryKind::File),
+        ("kept", EntryKind::Directory),
+        ("kept/visible.txt", EntryKind::File),
+        ("kept/.data-mover-0123.stage", EntryKind::File),
+    ]);
+    let namespace = tree_namespace(&protocol)?;
+    namespace
+        .execute(NamespaceRequest::Delete(path("gone")?))
+        .await?;
+    assert_eq!(
+        failure_class(
+            namespace
+                .execute(NamespaceRequest::Delete(path("kept")?))
+                .await
+        )?,
+        FailureClass::Conflict
+    );
+    assert_eq!(
+        protocol.paths(),
+        vec!["kept", "kept/.data-mover-0123.stage", "kept/visible.txt"]
+    );
+    Ok(())
+}
+
+/// A link or junction among the artifacts is never descended into: the delete keeps its conflict
+/// and removes nothing, at the top level or deeper.
+#[tokio::test]
+async fn a_reparse_point_among_artifacts_stops_the_sweep() -> Result {
+    for reparse in ["dir/.data-mover-link", "dir/.data-mover-staging/inner"] {
+        let entries = [
+            ("dir", EntryKind::Directory),
+            ("dir/.data-mover-0123.stage", EntryKind::File),
+            ("dir/.data-mover-link", EntryKind::Directory),
+            ("dir/.data-mover-staging", EntryKind::Directory),
+            ("dir/.data-mover-staging/inner", EntryKind::Directory),
+        ];
+        let protocol = TreeProtocol::with(&entries, &[reparse], &[]);
+        let outcome = tree_namespace(&protocol)?
+            .execute(NamespaceRequest::Delete(path("dir")?))
+            .await;
+        assert_eq!(failure_class(outcome)?, FailureClass::Conflict, "{reparse}");
+        assert_eq!(
+            protocol.paths().len(),
+            entries.len(),
+            "{reparse}: nothing removed"
+        );
+    }
+    Ok(())
+}
+
+/// A stage that disappears mid-sweep (its writer published) does not fail the delete, and the
+/// final remove still decides: the directory really is gone.
+#[tokio::test]
+async fn an_artifact_vanishing_mid_sweep_is_not_an_error() -> Result {
+    let protocol = TreeProtocol::with(
+        &[
+            ("dir", EntryKind::Directory),
+            ("dir/.data-mover-0123.stage", EntryKind::File),
+            ("dir/.data-mover-0123.stage.checkpoint", EntryKind::File),
+        ],
+        &[],
+        &["dir/.data-mover-0123.stage"],
+    );
+    tree_namespace(&protocol)?
+        .execute(NamespaceRequest::Delete(path("dir")?))
+        .await?;
+    assert!(protocol.paths().is_empty());
     Ok(())
 }

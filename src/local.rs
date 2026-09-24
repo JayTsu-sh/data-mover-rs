@@ -26,6 +26,7 @@ use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
 use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
+use crate::storage::artifacts::is_artifact_native;
 use crate::storage_enum::StorageEnum;
 use crate::time_util;
 use crate::transfer_concurrency::{
@@ -177,7 +178,21 @@ pub struct LocalStorage {
     pub(crate) config: StorageConfig,
 }
 
+/// Whether a root-relative path is a transfer artifact, which no listing reports (ADR-0006 C3b).
+fn hides_artifact(relative: &Path) -> bool {
+    let artifact = is_artifact_native(relative);
+    if artifact {
+        trace!(
+            "[Local] listing skips transfer artifact {}",
+            relative.display()
+        );
+    }
+    artifact
+}
+
 impl LocalStorage {
+    /// The entry's path relative to the root; `None` for a transfer artifact (hidden, checked
+    /// before any filter or stat) or a path outside the root (reported).
     async fn relative_entry_path(
         &self,
         full_path: &Path,
@@ -185,7 +200,7 @@ impl LocalStorage {
         producer_id: usize,
     ) -> Option<PathBuf> {
         if let Ok(path) = full_path.strip_prefix(&*self.root_path) {
-            return Some(path.to_path_buf());
+            return (!hides_artifact(path)).then(|| path.to_path_buf());
         }
         error!("[Producer {producer_id}] Failed to strip prefix from {full_path:?}");
         let _ = tx
@@ -197,6 +212,15 @@ impl LocalStorage {
             })
             .await;
         None
+    }
+
+    /// `relative_entry_path` for a paged listing: a path outside the root is recorded in `errors`.
+    fn listed_relative_path(&self, full_path: &Path, errors: &mut Vec<String>) -> Option<PathBuf> {
+        let Ok(path) = full_path.strip_prefix(&*self.root_path) else {
+            errors.push(format!("Failed to strip prefix: {}", full_path.display()));
+            return None;
+        };
+        (!hides_artifact(path)).then(|| path.to_path_buf())
     }
 
     async fn entry_metadata(
@@ -753,6 +777,8 @@ impl LocalStorage {
         Ok(())
     }
 
+    /// Walks the tree below `sub_path`. Transfer artifacts (`.data-mover-*` in any path segment,
+    /// ADR-0006) are never reported.
     ///
     /// # Errors
     ///
@@ -1392,14 +1418,10 @@ impl LocalStorage {
             }
 
             let entry_full_path = entry.path();
-            let Ok(relative_path) = entry_full_path.strip_prefix(&*self.root_path) else {
-                errors.push(format!(
-                    "Failed to strip prefix: {}",
-                    entry_full_path.display()
-                ));
+            let Some(relative_path) = self.listed_relative_path(&entry_full_path, &mut errors)
+            else {
                 continue;
             };
-            let relative_path = relative_path.to_path_buf();
 
             let metadata = match tokio::fs::symlink_metadata(&entry_full_path).await {
                 Ok(m) => m,

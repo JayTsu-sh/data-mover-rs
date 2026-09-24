@@ -1,5 +1,6 @@
-//! Lists a legacy S3 storage through `StorageEnum` and prints one line per entry, so a script can
-//! check exactly which paths a walk reports; optionally deletes one directory first.
+//! Lists a legacy storage through `StorageEnum` — any URL `create_storage` takes (S3, NFS, HDFS, a
+//! local path) — and prints one line per entry, so a script can check exactly which paths a walk
+//! reports; optionally deletes one directory first.
 //!
 //! ```text
 //! cargo run --example s3_listing -- 's3://AK:SK@bucket.host:9000/prefix' [--sub dir] [--walkdir-2]

@@ -128,6 +128,14 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 
 上游：nfs-rs 0.8.4 `src/nfs4/attrs.rs:654`（`parse_numeric_owner`）应暴露「映射不了」而不是伪造 nobody。
 
+## 传输 artifact 与列举 (ADR-0006 C3b)
+
+- legacy `walkdir` / `walkdir_2` 与 role namespace `List` 都隐藏 `.data-mover-*`（相对根的任一段，先于过滤
+  与 GETATTR）；role namespace 拒绝寻址它们。
+- legacy `delete_dir_all(_with_progress)` 内部走 `walk_listing(.., hide_artifacts=false)`：不这样的话
+  含 artifact 的目录 `rmdir` 会失败，而事件只记日志、`error: None`，静默删不干净。role `Delete(dir)`
+  走的就是它，所以 NFS 的 `delete_tree` 不需要额外清扫。
+
 ## 测试
 
 - `examples/nfs_walkdir.rs` — 遍历 export。

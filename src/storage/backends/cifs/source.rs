@@ -306,6 +306,31 @@ pub(super) fn classify(
     entry_failure_with_transience(path, operation, class, transience, &diagnostic)
 }
 
+/// Whether the entry was already gone.
+pub(super) fn is_not_found(error: &smb_domain::Error) -> bool {
+    use smb_domain::protocol::Status;
+    matches!(
+        error,
+        smb_domain::Error::ReceivedErrorMessage(status, _)
+            | smb_domain::Error::UnexpectedMessageStatus(status)
+            if matches!(
+                Status::try_from(*status),
+                Ok(Status::ObjectNameNotFound | Status::ObjectPathNotFound)
+            )
+    )
+}
+
+/// Whether removing a directory failed because it still has children.
+pub(super) fn is_directory_not_empty(error: &smb_domain::Error) -> bool {
+    use smb_domain::protocol::Status;
+    matches!(
+        error,
+        smb_domain::Error::ReceivedErrorMessage(status, _)
+            | smb_domain::Error::UnexpectedMessageStatus(status)
+            if matches!(Status::try_from(*status), Ok(Status::DirectoryNotEmpty))
+    )
+}
+
 fn classify_status(status: u32) -> (FailureClass, Transience) {
     use smb_domain::protocol::Status;
 

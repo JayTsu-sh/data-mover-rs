@@ -647,7 +647,7 @@ impl HDFSStorage {
                 };
                 let storage = self.clone();
                 active.push(async move {
-                    let result = storage.list_directory(&directory).await;
+                    let result = storage.list_visible(&directory).await;
                     (directory, depth, result)
                 });
             }

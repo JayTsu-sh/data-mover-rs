@@ -24,6 +24,7 @@ use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
 use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
+use crate::storage::artifacts::is_artifact_path;
 use crate::storage::backends::nfs::common::{
     NfsFactsError, NfsFactsProvider, NfsFailureCode, NfsInstanceFacts, NfsRetryAction,
     NfsRetryPolicy,
@@ -60,6 +61,8 @@ struct NfsWalkRuntime<'a> {
     total_file_count: &'a Arc<AtomicUsize>,
     packaged: bool,
     package_depth: usize,
+    /// Hide transfer artifacts (ADR-0006 C3b); only directory delete walks them.
+    hide_artifacts: bool,
 }
 
 /// 将 `nfs_rs::Time` 转换为纳秒时间戳
@@ -501,6 +504,33 @@ impl NfsSourceProtocol for NFSStorage {
             identity,
         ))
     }
+}
+
+/// Whether a root-relative path is a transfer artifact, which no listing reports (ADR-0006 C3b);
+/// checked before any filter or GETATTR.
+fn hides_artifact(relative: &str) -> bool {
+    let artifact = is_artifact_path(relative);
+    if artifact {
+        trace!("[NFS] listing skips transfer artifact {relative}");
+    }
+    artifact
+}
+
+/// The attributes a paged listing reports for `entry`: none for a hidden transfer artifact, and
+/// none — recorded in `errors` — when the server sent no attributes.
+fn visible_attrs(
+    relative_path: &str,
+    file_name: &str,
+    attr: Option<Attr>,
+    errors: &mut Vec<String>,
+) -> Option<Attr> {
+    if hides_artifact(relative_path) {
+        return None;
+    }
+    if attr.is_none() {
+        errors.push(format!("{file_name}: missing attributes"));
+    }
+    attr
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2467,14 +2497,15 @@ impl NFSStorage {
         let sub_path = relative_path.map(std::path::Path::to_path_buf);
 
         tokio::spawn(async move {
-            // 1. 复用现有 walkdir 并行遍历（支持子目录）
+            // 1. 复用 walkdir 并行遍历（支持子目录）；连同传输 artifact 一起列出，否则目录删不掉
             let walkdir_result = match storage
-                .walkdir(
+                .walk_listing(
                     sub_path.as_deref(),
                     crate::WalkOptions {
                         concurrency,
                         ..Default::default()
                     },
+                    false,
                 )
                 .await
             {
@@ -3125,6 +3156,8 @@ impl NFSStorage {
         })
     }
 
+    /// Walks the tree below `sub_path`. Transfer artifacts (`.data-mover-*` in any path segment,
+    /// ADR-0006) are never reported.
     ///
     /// # Errors
     ///
@@ -3133,6 +3166,17 @@ impl NFSStorage {
         &self,
         sub_path: Option<&Path>,
         options: crate::WalkOptions,
+    ) -> Result<WalkDirAsyncIterator> {
+        self.walk_listing(sub_path, options, true).await
+    }
+
+    /// `walkdir`, reporting transfer artifacts only when `hide_artifacts` is false: directory
+    /// delete must see them to remove them.
+    async fn walk_listing(
+        &self,
+        sub_path: Option<&Path>,
+        options: crate::WalkOptions,
+        hide_artifacts: bool,
     ) -> Result<WalkDirAsyncIterator> {
         // 解析起始目录：sub_path 为 None 时从根开始，否则从子目录开始
         let (start_fh, start_root) = match sub_path {
@@ -3167,6 +3211,7 @@ impl NFSStorage {
                     start_fh,
                     tx_clone.clone(),
                     options,
+                    hide_artifacts,
                     total_file_count_clone,
                 )
                 .await
@@ -3193,6 +3238,7 @@ impl NFSStorage {
         root_fh: Bytes,
         tx: async_channel::Sender<StorageEntryMessage>,
         options: crate::WalkOptions,
+        hide_artifacts: bool,
         total_file_count: Arc<AtomicUsize>,
     ) -> Result<()> {
         let crate::WalkOptions {
@@ -3242,6 +3288,7 @@ impl NFSStorage {
                                 total_file_count: &total_file_count_clone,
                                 packaged,
                                 package_depth,
+                                hide_artifacts,
                             },
                         )
                     },
@@ -3352,6 +3399,10 @@ impl NFSStorage {
         inline: Option<Attr>,
         runtime: &NfsWalkRuntime<'_>,
     ) -> Option<Attr> {
+        // Transfer artifacts are skipped here, before any GETATTR (ADR-0006 C3b).
+        if runtime.hide_artifacts && hides_artifact(relative_path) {
+            return None;
+        }
         if inline.is_some() {
             return inline;
         }
@@ -4423,13 +4474,14 @@ impl NFSStorage {
                     }
                 };
 
-                let Some(attrs) = entry.attr else {
-                    errors.push(format!("{}: missing attributes", entry.file_name));
+                let relative_path = self.build_relative_path(&nfs_dir_path, &entry.file_name);
+                let Some(attrs) =
+                    visible_attrs(&relative_path, &entry.file_name, entry.attr, &mut errors)
+                else {
                     continue;
                 };
 
                 let is_dir = attrs.type_ == FType3::NF3DIR as u32;
-                let relative_path = self.build_relative_path(&nfs_dir_path, &entry.file_name);
                 let extension = entry
                     .file_name
                     .rsplit_once('.')
