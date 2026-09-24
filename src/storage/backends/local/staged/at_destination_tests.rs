@@ -464,6 +464,36 @@ async fn a_leftover_pointer_temporary_is_overwritten() -> TestResult {
     Ok(())
 }
 
+/// A prepare removes every leftover named after its final file — even when it writes no pointer
+/// of its own — and nothing named after another file.
+#[tokio::test]
+async fn a_prepare_sweeps_its_own_final_names_leftovers_only() -> TestResult {
+    let root = Root::new()?;
+    let dir = root.0.join("dir");
+    let leftovers = [
+        artifact_temporary_name("final.bin", ArtifactKind::Pointer),
+        artifact_temporary_name("final.bin", ArtifactKind::Stage),
+        artifact_name("final.bin", ArtifactKind::Checkpoint),
+    ];
+    for name in &leftovers {
+        std::fs::write(dir.join(name), b"left by a crash")?;
+    }
+    let others = artifact_name("other.bin", ArtifactKind::Stage);
+    std::fs::write(dir.join(&others), b"another file's stage")?;
+    let adapter = adapter(&root)?;
+    let stage = adapter
+        .prepare_at_destination(request(10, [7; 32], ResumeMode::Discover, false)?)
+        .await?;
+    assert_eq!(stage.prepare_fact, PrepareFact::Fresh);
+    for name in &leftovers {
+        assert!(!dir.join(name).exists(), "{name}");
+    }
+    assert_eq!(std::fs::read(dir.join(&others))?, b"another file's stage");
+    adapter.discard(stage).await?;
+    assert_eq!(root.artifacts_left()?, vec![others]);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_symlink_at_an_artifact_name_is_refused_and_its_target_untouched() -> TestResult {

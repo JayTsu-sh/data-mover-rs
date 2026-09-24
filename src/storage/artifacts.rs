@@ -94,14 +94,7 @@ pub(crate) enum ArtifactKind {
 }
 
 impl ArtifactKind {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the leftover sweep parses artifact names, ADR-0006 C9"
-        )
-    )]
-    const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Stage,
         Self::Checkpoint,
         Self::Claim,
@@ -185,7 +178,7 @@ pub(crate) fn sibling_artifact(
     not(test),
     expect(
         dead_code,
-        reason = "the leftover sweep parses artifact names, ADR-0006 C9"
+        reason = "for a listing-based sweep of other files' leftovers (backlog)"
     )
 )]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,7 +194,7 @@ pub(crate) struct ParsedArtifact<'a> {
     not(test),
     expect(
         dead_code,
-        reason = "the leftover sweep parses artifact names, ADR-0006 C9"
+        reason = "for a listing-based sweep of other files' leftovers (backlog)"
     )
 )]
 pub(crate) fn parse_artifact_name(name: &str) -> Option<ParsedArtifact<'_>> {

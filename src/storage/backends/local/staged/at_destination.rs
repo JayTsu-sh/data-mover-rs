@@ -307,6 +307,9 @@ pub(super) async fn prepare(
         Ok(found) => found,
         Err(error) => return Err(abandon(&stage, &directory, error).await),
     };
+    if let Err(error) = sweep(&artifacts.directory, &final_path).await {
+        return Err(abandon(&stage, &directory, error).await);
+    }
     stage.mark_at_destination(found.fact);
     let Some(point) = found.resume else {
         return start(adapter, stage, &artifacts, &request).await;
@@ -350,6 +353,41 @@ async fn claim_directory(
     .await
     .map_err(|_| failure(final_path, Operation::Prepare, FailureClass::Internal))?
     .map_err(|error| claim_failure(final_path, &error))
+}
+
+/// Every name derived from the final file's name that is neither its live stage, its pointer nor
+/// its claim: a pointer temporary a crash left beside nothing (which discovery never looks at),
+/// and the kinds and temporaries Local does not write. Removed under the claim, by name — the
+/// directory is never listed, so other files' artifacts are never touched.
+fn leftover_names(final_path: &StoragePath) -> Result<Vec<OsString>, StorageRoleFailure> {
+    let mut names = Vec::new();
+    for kind in ArtifactKind::ALL {
+        for temporary in [false, true] {
+            let live = !temporary
+                && matches!(
+                    kind,
+                    ArtifactKind::Stage | ArtifactKind::Pointer | ArtifactKind::Claim
+                );
+            if !live {
+                names.push(artifact(final_path, kind, temporary)?);
+            }
+        }
+    }
+    Ok(names)
+}
+
+async fn sweep(directory: &Arc<Dir>, final_path: &StoragePath) -> Result<(), StorageRoleFailure> {
+    let names = leftover_names(final_path)?;
+    let directory = Arc::clone(directory);
+    tokio::task::spawn_blocking(move || {
+        for name in &names {
+            publication::remove_if_present(&directory, name)?;
+        }
+        Ok::<_, io::Error>(())
+    })
+    .await
+    .map_err(|_| failure(final_path, Operation::Prepare, FailureClass::Internal))?
+    .map_err(|error| io_failure(final_path, Operation::Prepare, &error))
 }
 
 fn claim_failure(final_path: &StoragePath, error: &io::Error) -> StorageRoleFailure {

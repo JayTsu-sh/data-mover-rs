@@ -230,8 +230,8 @@ pub(crate) struct Discovery {
 
 /// Looks at the destination and carries out the decision. A clean-up removes the pointer before
 /// the stage, so a crash in between leaves "stage without pointer", which the table also cleans.
-/// A leftover temporary beside an otherwise empty place is not looked at here; the reserved-name
-/// cleanup removes it.
+/// A leftover temporary beside an otherwise empty place is not looked at here; the backend removes
+/// it by name while it holds the final file (Local: at prepare, under its claim).
 pub(crate) async fn discover(
     artifacts: &dyn DestinationArtifacts,
     request: &DestinationPrepareRequest,
