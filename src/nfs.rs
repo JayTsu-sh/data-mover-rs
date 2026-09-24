@@ -244,8 +244,24 @@ static GLOBAL_CACHE: LazyLock<Cache<(PathBuf, Bytes), Bytes>> = LazyLock::new(||
     Cache::builder()
         .max_capacity(500_000)
         .expire_after(DepthAwareExpiry)
+        .support_invalidation_closures()
         .build()
 });
+
+/// Forgets the cached handles of `prefix` and of every directory below it on one server. After a
+/// directory is removed or renamed away, those handles still resolve — into the moved directory,
+/// or into nothing — and a directory recreated at the same path would never be looked up again.
+/// Keys use the `collect_components` form (`NFSStorage::cache_path`); `Path::starts_with`
+/// compares whole components, so `a/bc` is not below `a/b`.
+fn invalidate_subtree_cache(prefix: PathBuf, root_fh: Bytes) {
+    let registered = GLOBAL_CACHE
+        .invalidate_entries_if(move |key, _| key.1 == root_fh && key.0.starts_with(&prefix));
+    if registered.is_err() {
+        // Only possible if the cache was built without closure support; forgetting everything is
+        // always safe, just slower.
+        GLOBAL_CACHE.invalidate_all();
+    }
+}
 
 /// `nfs_url` → `server_id` 映射表。
 /// 相同 NFS 端点的所有 worker 共享同一 `server_id，从而共享` `GLOBAL_CACHE` 条目，
@@ -2408,6 +2424,14 @@ impl NFSStorage {
         file_type == FType3::NF3DIR as u32 && !handle.is_empty()
     }
 
+    /// [`invalidate_subtree_cache`] for `path` on this server.
+    fn forget_subtree(&self, path: &Path) {
+        // A path whose handles could never have been cached has nothing to forget.
+        if let Ok(prefix) = Self::cache_path(path) {
+            invalidate_subtree_cache(prefix, self.get_root_fh());
+        }
+    }
+
     fn cache_directory(cache_key: (PathBuf, Bytes), file_handle: Bytes) {
         trace!(
             "Inserting into global cache: key={:?}, value_len={}",
@@ -2439,7 +2463,10 @@ impl NFSStorage {
 
             // 删除目录
             match self.mount.rmdir(parent_obj.fh.clone(), &dirname).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.forget_subtree(relative_path);
+                    return Ok(());
+                }
                 Err(e) => {
                     // 目录已不存在：幂等语义，视为成功
                     if e.is_not_found() {
@@ -2447,6 +2474,7 @@ impl NFSStorage {
                             "Directory {:?} already gone, treating as success",
                             relative_path
                         );
+                        self.forget_subtree(relative_path);
                         return Ok(());
                     }
                     if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
@@ -2838,7 +2866,13 @@ impl NFSStorage {
                 )
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    // A renamed directory's handles now point below `to`; whatever `to` was is
+                    // gone.
+                    self.forget_subtree(from);
+                    self.forget_subtree(to);
+                    return Ok(());
+                }
                 Err(e) => {
                     if is_retryable_with_invalidation(&e) && attempt < MAX_STALE_RETRIES {
                         debug!(
@@ -4821,6 +4855,32 @@ mod tests {
     /// A handle cached under a key `lookup_fh` never asks for is written and never read, which
     /// looks exactly like a cache that does not help — no failure, just the LOOKUP it was meant
     /// to remove. The raw `join` is the shape that gets this wrong.
+    /// Removing or renaming a directory forgets its cached handle and every handle below it on
+    /// the same server, and nothing else.
+    #[test]
+    fn a_removed_or_renamed_directory_forgets_its_cached_subtree() {
+        let server = Bytes::from(uuid::Uuid::new_v4().as_bytes().to_vec());
+        let other_server = Bytes::from(uuid::Uuid::new_v4().as_bytes().to_vec());
+        let key = |path: &str, root: &Bytes| (PathBuf::from(path), root.clone());
+        let entries = [
+            key("a", &server),
+            key("a/b", &server),
+            key("a/b/c", &server),
+            key("a/bc", &server),
+            key("a/b", &other_server),
+        ];
+        for entry in &entries {
+            GLOBAL_CACHE.insert(entry.clone(), Bytes::from_static(b"handle"));
+        }
+        invalidate_subtree_cache(PathBuf::from("a/b"), server.clone());
+        let cached = |entry: &(PathBuf, Bytes)| GLOBAL_CACHE.get(entry).is_some();
+        assert!(!cached(&key("a/b", &server)));
+        assert!(!cached(&key("a/b/c", &server)));
+        assert!(cached(&key("a", &server)));
+        assert!(cached(&key("a/bc", &server)));
+        assert!(cached(&key("a/b", &other_server)));
+    }
+
     #[test]
     fn a_backfilled_cache_key_is_the_one_lookup_will_ask_for() {
         for (parent, name, expected) in [
