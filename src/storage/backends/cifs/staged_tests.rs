@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream;
 
-use super::staged::{CifsStageFile, CifsStagedDestination, CifsStagedProtocol, STAGING_DIRECTORY};
+use super::staged::{CifsStageFile, CifsStagedDestination, CifsStagedProtocol};
 use crate::model::{
     BackendIdentity, BackendKind, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
     Operation, SourceIdentity, StoragePath, Transience,
@@ -233,6 +233,45 @@ fn input(parts: &'static [&'static [u8]]) -> ByteStream {
     Box::pin(stream::iter(
         parts.iter().map(|part| Ok(Bytes::from_static(part))),
     ))
+}
+
+/// A final path the share could not hold under exactly that name is refused before anything is
+/// created: a backslash adds a directory level on the server, a colon names an alternate data
+/// stream, and empty, `.`, `..` or transfer-artifact segments are never a file's name.
+#[tokio::test]
+async fn final_paths_the_share_would_rename_are_refused() -> Result<(), Box<dyn std::error::Error>>
+{
+    let protocol = Arc::new(MemoryProtocol::default());
+    let identity = identity()?;
+    let destination = CifsStagedDestination::new(Arc::clone(&protocol), identity.clone());
+    for path in [
+        "dir\\final.bin",
+        "final.bin:stream",
+        "dir/./final.bin",
+        "dir/../final.bin",
+        "dir/.data-mover-0123.stage",
+        ".data-mover-staging/final.bin",
+    ] {
+        let mut request = prepare_request(&identity)?;
+        request.final_destination = FinalDestination::new(StoragePath::new(path)?);
+        let refused = destination.prepare(request).await;
+        assert!(
+            matches!(
+                refused,
+                Err(StorageRoleFailure::Entry(ref error))
+                    if error.class() == FailureClass::InvalidInput
+            ),
+            "{path}: {refused:?}"
+        );
+    }
+    assert!(
+        protocol
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -764,8 +803,3 @@ mod metadata_stage_tests;
 #[allow(clippy::unwrap_used)]
 #[path = "positioned_tests.rs"]
 mod positioned_tests;
-
-#[test]
-fn staging_directory_is_a_transfer_artifact() {
-    assert!(STAGING_DIRECTORY.starts_with(crate::storage::artifacts::ARTIFACT_PREFIX));
-}

@@ -7,6 +7,7 @@ use bytes::{Bytes, BytesMut};
 
 use super::source::{classify, entry_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath};
+use crate::storage::artifacts::is_artifact_path;
 use crate::storage::{
     ByteStream, CheckpointObservation, Metadata, MetadataMutation, PrepareRequest, PreparedStage,
     PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
@@ -14,7 +15,6 @@ use crate::storage::{
     VerifyRequest, WriteEvidence,
 };
 
-pub(super) const STAGING_DIRECTORY: &str = ".data-mover-staging";
 const VERIFY_CHUNK: u32 = 1024 * 1024;
 
 #[async_trait]
@@ -606,10 +606,17 @@ impl StagedDestination for CifsStagedDestination {
     }
 }
 
+/// A final path the share can hold under exactly that name. `/` is the only separator data-mover
+/// gives a CIFS path: a `\` would add a directory level on the server (and put the artifacts
+/// named after the file somewhere else), and a `:` would name an alternate data stream. Empty, `.`
+/// and `..` segments and any transfer-artifact segment are refused too.
 fn validate_final(path: &StoragePath) -> Result<(), StorageRoleFailure> {
-    if path.as_str().is_empty()
-        || path.as_str().split('/').any(|part| part == "..")
-        || path.as_str().starts_with(STAGING_DIRECTORY)
+    let text = path.as_str();
+    if text.is_empty()
+        || text
+            .split('/')
+            .any(|part| matches!(part, "" | "." | "..") || part.contains(['\\', ':']))
+        || is_artifact_path(text)
     {
         return Err(entry_failure(
             path,
