@@ -156,6 +156,18 @@ leaves a stage without a pointer, which the next prepare cleans. The seam is a t
 destination (`recovery_at_destination`, `false` until each backend moves) and a separate
 `DestinationPrepareRequest`, so `PrepareRequest` and its callers are unchanged until C21.
 
+As built (C7e): the engine asks the destination once per transfer (`recovery_at_destination`); a
+destination that says yes is prepared only through `prepare_at_destination`, and no transfer ever
+reaches the local recovery store for it (every store call is gated on the stage). Before preparing,
+the engine takes an in-process lease on (destination endpoint, final path); a second transfer of the
+same file fails at Prepare with `Conflict` / transient, and the stage holds the lease until it is
+published or discarded — also inside a failure that keeps it. Only `Checkpointed` with checkpoints
+may continue a stage; every other policy asks for a restart. A resumed stage that fails verification
+is cleaned up in place (its pointer would otherwise resume it on every retry, across restarts). The
+old path reports its facts too: a recovered stage is `Resumed`, a published record without its stage
+is `Restarted { PointerWithoutStage }`, an atomic replace that discarded a stage is
+`Restarted { Requested }`. `TransferOutcome` gains `prepare` and `reused_bytes`.
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS

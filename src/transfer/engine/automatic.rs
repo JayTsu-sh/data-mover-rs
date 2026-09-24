@@ -44,6 +44,21 @@ impl CheckpointRegistration for Registration {
     }
 }
 
+/// The deferred checkpoint of a stage kept at the destination: the destination writes its own
+/// pointer, so there is nothing to register where data-mover runs.
+pub(super) struct AtDestination;
+
+#[async_trait::async_trait]
+impl CheckpointRegistration for AtDestination {
+    async fn register(
+        &self,
+        _stage: &crate::storage::PreparedStage,
+        _identity: RecoveryIdentity,
+    ) -> Result<(), StorageRoleFailure> {
+        Ok(())
+    }
+}
+
 fn registration_failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure {
     StorageRoleFailure::Entry(
         EntryOperationFailure::new(

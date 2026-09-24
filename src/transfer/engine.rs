@@ -15,15 +15,17 @@ use crate::runtime::inflight::{
     InflightConfig, InflightFailure, InflightRuntime, OrderedChunks, ReadRange, SequentialRanges,
 };
 use crate::storage::{
-    CheckpointObservation, FinalDestination, NativePair, PreflightPolicy, PrepareRequest,
-    PreparedStage, PublicationDisposition, PublicationEvidence, PublishRequest, ReadRequest,
-    ReadSource, SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination,
-    StorageRoleFailure, VerifyRequest, WriteEvidence,
+    CheckpointObservation, FinalDestination, NativePair, PreflightPolicy, PrepareFact,
+    PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublishRequest,
+    ReadRequest, ReadSource, RestartReason, SourceDescriptor, SourceQosBudget, SourceQosStats,
+    StagedDestination, StorageRoleFailure, VerifyRequest, WriteEvidence,
 };
 use negotiation::{CopiedMetadataPlan, apply_copied_metadata, copied_metadata_plan};
 
+mod at_destination;
 mod automatic;
 mod expert;
+mod guard;
 mod native;
 mod negotiation;
 mod positioned;
@@ -247,6 +249,8 @@ impl TransferFailure {
     }
 
     /// Whether the failed attempt retains unpublished state that may be explicitly discarded.
+    /// A resumed stage kept at the destination that failed verification is not retained: it was
+    /// cleaned up in place, so its pointer cannot resume it again.
     #[must_use]
     pub const fn has_unpublished_stage(&self) -> bool {
         self.failed_stage.is_some()
@@ -298,7 +302,8 @@ impl TransferFailure {
             .take()
             .ok_or_else(|| source_failure(&StoragePath::root(), FailureClass::InvalidInput))?;
         let binding = failed.stage.recovery_binding();
-        let recovery_enabled = failed.stage.owns_recovery_registration();
+        let recovery_enabled =
+            failed.stage.owns_recovery_registration() && failed.stage.uses_recovery_store();
         failed.destination.discard(failed.stage).await?;
         if recovery_enabled {
             super::recovery_store::complete(binding)
@@ -320,7 +325,8 @@ impl TransferFailure {
             .take()
             .ok_or_else(|| source_failure(&StoragePath::root(), FailureClass::InvalidInput))?;
         let binding = pending.stage.recovery_binding();
-        let recovery_enabled = pending.stage.owns_recovery_registration();
+        let recovery_enabled =
+            pending.stage.owns_recovery_registration() && pending.stage.uses_recovery_store();
         pending.destination.discard(pending.stage).await?;
         if recovery_enabled {
             super::recovery_store::complete(binding)
@@ -398,6 +404,11 @@ pub struct TransferOutcome {
     /// caller's override.
     pub identity: super::TransferIdentity,
     pub final_destination: StoragePath,
+    /// What prepare found at the destination and did about it.
+    pub prepare: PrepareFact,
+    /// Bytes the destination already held and the transfer did not write again
+    /// (`prepare.reused_bytes()`); the source may still have been read for them, for the digest.
+    pub reused_bytes: u64,
     pub disposition: PublicationDisposition,
     pub transferred_bytes: u64,
     /// Present only when destination read-back verification was performed.
@@ -424,7 +435,8 @@ pub struct TransferOutcome {
 ///
 /// # Errors
 /// Returns a phase- and side-attributed failure while retaining an owned staged state whenever
-/// publication has not completed.
+/// publication has not completed — except a resumed stage kept at the destination that failed
+/// verification, which is cleaned up in place.
 pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, TransferFailure> {
     let read_back = request.read_back;
     let cancel = request.cancel.clone();
@@ -442,6 +454,7 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
     };
     let expected_size = transferred.checkpoint.durable_prefix;
     let source_digest = transferred.source_blake3;
+    let prepare = transferred.stage.prepare_fact;
     let blake3 = if read_back == ReadBackVerification::Enabled {
         source_digest
     } else {
@@ -461,7 +474,44 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
                 .with_source_qos(source_qos));
         }
     };
+    let PublicationEvidence {
+        final_destination,
+        disposition,
+    } = publish_transferred(
+        transferred,
+        expected_size,
+        source_digest,
+        cancel,
+        source_qos,
+    )
+    .await?;
+    Ok(TransferOutcome {
+        identity,
+        final_destination,
+        prepare,
+        reused_bytes: prepare.reused_bytes(),
+        disposition,
+        transferred_bytes: expected_size,
+        blake3,
+        read_back,
+        source_qos,
+        metadata,
+        route,
+        recovery,
+    })
+}
+
+/// Publishes verified staged content: marks the local record publishing (store path only),
+/// publishes, and clears the record.
+async fn publish_transferred(
+    transferred: Transferred,
+    expected_size: u64,
+    source_digest: Option<[u8; 32]>,
+    cancel: tokio_util::sync::CancellationToken,
+    source_qos: SourceQosStats,
+) -> Result<PublicationEvidence, TransferFailure> {
     if transferred.stage.recovery_enabled()
+        && transferred.stage.uses_recovery_store()
         && let Err(error) =
             super::recovery_store::mark_publishing(transferred.stage.recovery_binding()).await
     {
@@ -481,11 +531,9 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
         )
         .await;
     let recovery_binding = transferred.stage.recovery_binding();
-    let recovery_enabled = transferred.stage.recovery_enabled();
-    let PublicationEvidence {
-        final_destination,
-        disposition,
-    } = match publication {
+    let recovery_enabled =
+        transferred.stage.recovery_enabled() && transferred.stage.uses_recovery_store();
+    let evidence = match publication {
         Ok(evidence) => evidence,
         Err(publication) => {
             let mut failure = TransferFailure::role(
@@ -510,18 +558,7 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
     {
         return Err(recovery_completion_failure(transferred, source_qos));
     }
-    Ok(TransferOutcome {
-        identity,
-        final_destination,
-        disposition,
-        transferred_bytes: expected_size,
-        blake3,
-        read_back,
-        source_qos,
-        metadata,
-        route,
-        recovery,
-    })
+    Ok(evidence)
 }
 
 const fn transfer_route(data_path: TransferDataPath) -> TransferRoute {
@@ -578,12 +615,12 @@ async fn verify_transferred(
     if verification.verified_bytes != transferred.checkpoint.durable_prefix
         || verification.blake3 != source_blake3
     {
-        return Err(TransferFailure::orchestration(
+        let failure = TransferFailure::orchestration(
             TransferPhase::Verify,
             "destination verification evidence differs from source evidence",
         )
-        .with_stage(Arc::clone(&transferred.destination), transferred.stage)
-        .with_source_qos(source_qos));
+        .with_source_qos(source_qos);
+        return Err(discard_stale_resume(transferred, failure).await);
     }
     if cancel.is_cancelled() {
         return Err(TransferFailure::orchestration(
@@ -594,6 +631,34 @@ async fn verify_transferred(
         .with_source_qos(source_qos));
     }
     Ok((transferred, verification))
+}
+
+/// A resumed stage kept at the destination that fails verification is stale — its pointer would
+/// resume it again on every retry, surviving restarts. It is cleaned up in place, and the failure
+/// keeps no stage; any other failing stage stays with the failure as before.
+async fn discard_stale_resume(
+    transferred: Transferred,
+    failure: TransferFailure,
+) -> TransferFailure {
+    discard_stale_stage(transferred.destination, transferred.stage, failure).await
+}
+
+/// [`discard_stale_resume`] for a bare stage, shared with the expert destination half.
+pub(super) async fn discard_stale_stage(
+    destination: Arc<dyn StagedDestination>,
+    stage: PreparedStage,
+    failure: TransferFailure,
+) -> TransferFailure {
+    let resumed_here =
+        stage.at_destination && matches!(stage.prepare_fact, PrepareFact::Resumed { .. });
+    if !resumed_here {
+        return failure.with_stage(destination, stage);
+    }
+    // `discard` removes the pointer before the stage (the backend contract), so even a clean-up
+    // that fails halfway leaves no pointer to resume from: the next prepare restarts. The failure
+    // to report is the verification either way.
+    let _cleanup = destination.discard(stage).await;
+    failure
 }
 
 async fn complete_published_recovery(
@@ -644,7 +709,8 @@ impl Transferred {
 
     pub(crate) async fn discard(self) -> Result<(), StorageRoleFailure> {
         let binding = self.stage.recovery_binding();
-        let recovery_enabled = self.stage.owns_recovery_registration();
+        let recovery_enabled =
+            self.stage.owns_recovery_registration() && self.stage.uses_recovery_store();
         self.destination.discard(self.stage).await?;
         if recovery_enabled {
             super::recovery_store::complete(binding)
@@ -681,26 +747,66 @@ async fn run_until_transferred_inner(
     let descriptor = describe_source(&request, &*source, source_qos.as_ref()).await?;
     let copied_metadata_plan = copied_metadata_plan(&request, &descriptor).await?;
     let recovery_binding = recovery_binding(&request, &descriptor);
-    let (plan, native_pair, recovery) = plan_with_recovery(
+    // Asked once: a transfer never mixes the two recovery models.
+    if destination.recovery_at_destination() {
+        return at_destination::run_until_transferred(
+            &request,
+            (source, destination),
+            descriptor,
+            copied_metadata_plan,
+            recovery_binding,
+            source_qos,
+        )
+        .await;
+    }
+    run_with_store(
         &request,
+        (source, destination),
+        descriptor,
+        copied_metadata_plan,
+        recovery_binding,
+        source_qos,
+    )
+    .await
+}
+
+/// The transfer up to verification for a destination whose recovery state the local recovery
+/// store keeps (every destination until it moves, ADR-0006 C8–C15).
+async fn run_with_store(
+    request: &TransferRequest,
+    (source, destination): (Arc<dyn ReadSource>, Arc<dyn StagedDestination>),
+    descriptor: SourceDescriptor,
+    copied_metadata_plan: Option<CopiedMetadataPlan>,
+    recovery_binding: [u8; 32],
+    source_qos: Option<SourceQosBudget>,
+) -> Result<Transferred, TransferFailure> {
+    let (plan, native_pair, recovery) = plan_with_recovery(
+        request,
         &*source,
         &*destination,
         &descriptor,
         recovery_binding,
     )
     .await?;
-    if request.transfer_policy == TransferPolicy::AtomicReplace {
-        discard_prior_recovery(
+    let discarded = request.transfer_policy == TransferPolicy::AtomicReplace
+        && discard_prior_recovery(
             &destination,
             &request.final_path,
             &descriptor,
             recovery_binding,
         )
         .await?;
-    }
+    let restarted = |mut transferred: Transferred| {
+        if discarded && transferred.stage.prepare_fact == PrepareFact::Fresh {
+            transferred.stage.prepare_fact = PrepareFact::Restarted {
+                reason: RestartReason::Requested,
+            };
+        }
+        transferred
+    };
     if let Some(pair) = native_pair {
         return native::transfer_native(
-            &request,
+            request,
             native::NativeTransferInput {
                 source,
                 destination,
@@ -709,14 +815,15 @@ async fn run_until_transferred_inner(
                 recovery_binding,
                 source_qos,
                 plan,
-                recovery,
+                preparation: native::Preparation::Store(recovery),
                 copied_metadata_plan,
             },
         )
-        .await;
+        .await
+        .map(restarted);
     }
     let mut stage = select_stage(
-        &request,
+        request,
         &destination,
         &descriptor,
         recovery_binding,
@@ -736,12 +843,12 @@ async fn run_until_transferred_inner(
         });
     }
     let registration =
-        register_prepared_stage(&request, &destination, &stage, recovery.as_ref()).await;
+        register_prepared_stage(request, &destination, &stage, recovery.as_ref()).await;
     if let Err(error) = registration {
         return Err(error.with_stage(destination, stage));
     }
     let evidence = match transfer_stage(
-        &request,
+        request,
         source,
         &destination,
         &descriptor,
@@ -755,7 +862,7 @@ async fn run_until_transferred_inner(
         Err(error) => return Err(error.with_stage(destination, stage)),
     };
     let effective_recovery = final_recovery(&stage, plan);
-    Ok(Transferred {
+    Ok(restarted(Transferred {
         identity: request.identity,
         destination,
         stage,
@@ -769,7 +876,7 @@ async fn run_until_transferred_inner(
         native_requests: 0,
         effective_recovery,
         copied_metadata_plan,
-    })
+    }))
 }
 
 fn final_recovery(stage: &PreparedStage, plan: TransferPlan) -> EffectiveRecovery {
@@ -939,7 +1046,12 @@ async fn select_stage(
             })
             .await;
         match recovered {
-            Ok(stage) => return Ok(stage),
+            Ok(mut stage) => {
+                stage.prepare_fact = PrepareFact::Resumed {
+                    bytes: stage.write_offset,
+                };
+                return Ok(stage);
+            }
             Err(error)
                 if recovery.is_some_and(|context| context.publication_pending)
                     && role_failure_class(&error) == FailureClass::NotFound =>
@@ -947,6 +1059,15 @@ async fn select_stage(
                 super::recovery_store::complete(recovery_binding)
                     .await
                     .map_err(TransferFailure::registration)?;
+                // The record outlived a published stage: what follows starts over.
+                return fresh_stage(request, destination, prepare(), recovery_enabled)
+                    .await
+                    .map(|mut stage| {
+                        stage.prepare_fact = PrepareFact::Restarted {
+                            reason: RestartReason::PointerWithoutStage,
+                        };
+                        stage
+                    });
             }
             Err(error) => {
                 return Err(TransferFailure::role(
@@ -957,34 +1078,45 @@ async fn select_stage(
             }
         }
     }
+    fresh_stage(request, destination, prepare(), recovery_enabled).await
+}
+
+async fn fresh_stage(
+    request: &TransferRequest,
+    destination: &Arc<dyn StagedDestination>,
+    prepare: PrepareRequest,
+    recovery_enabled: bool,
+) -> Result<PreparedStage, TransferFailure> {
     let prepared = if request.transfer_policy == TransferPolicy::Direct {
         destination
-            .prepare_direct(prepare(), request.cancel.clone())
+            .prepare_direct(prepare, request.cancel.clone())
             .await
     } else if recovery_enabled {
-        destination.prepare(prepare()).await
+        destination.prepare(prepare).await
     } else {
-        destination.prepare_ephemeral(prepare()).await
+        destination.prepare_ephemeral(prepare).await
     };
     prepared.map_err(|error| {
         TransferFailure::role(TransferPhase::Prepare, TransferSide::Destination, error)
     })
 }
 
+/// Discards an earlier attempt's recoverable stage before an atomic replace; `true` when there was
+/// one, so the outcome can report the restart.
 async fn discard_prior_recovery(
     destination: &Arc<dyn StagedDestination>,
     final_path: &StoragePath,
     descriptor: &SourceDescriptor,
     recovery_binding: [u8; 32],
-) -> Result<(), TransferFailure> {
+) -> Result<bool, TransferFailure> {
     let Some(recovery) = super::recovery_store::open_existing(recovery_binding)
         .await
         .map_err(TransferFailure::registration)?
     else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(identity) = recovery.identity.clone() else {
-        return Ok(());
+        return Ok(false);
     };
     match destination
         .recover(crate::storage::RecoverRequest {
@@ -1012,7 +1144,8 @@ async fn discard_prior_recovery(
     }
     super::recovery_store::complete(recovery_binding)
         .await
-        .map_err(TransferFailure::registration)
+        .map_err(TransferFailure::registration)?;
+    Ok(true)
 }
 
 fn role_failure_class(error: &StorageRoleFailure) -> FailureClass {

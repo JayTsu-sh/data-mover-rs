@@ -192,6 +192,8 @@ fn report(result: &Result<TransferOutcome, TransferFailure>, elapsed_ms: u128) -
             "bytes": outcome.transferred_bytes,
             "route": format!("{:?}", outcome.route),
             "recovery": format!("{:?}", outcome.recovery),
+            "prepare": format!("{:?}", outcome.prepare),
+            "reused_bytes": outcome.reused_bytes,
             "read_back": format!("{:?}", outcome.read_back),
             "source_streamed_bytes": outcome.source_qos.client_streamed_shaped_bytes,
             "source_read_operations": outcome.source_qos.source_read_operations,

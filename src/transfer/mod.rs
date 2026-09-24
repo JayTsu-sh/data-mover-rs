@@ -7,6 +7,7 @@ mod model;
 mod recovery_store;
 
 pub use crate::model::SourceVersion;
+pub use crate::storage::{PrepareFact, RestartReason};
 pub use crate::storage::{SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError};
 pub use engine::{
     EffectiveRecovery, ExpertDestinationRequest, ExpertDestinationSession,
@@ -20,6 +21,8 @@ pub use model::{
     TransferPolicy, TransferRequest, TransferValueError,
 };
 
+#[cfg(test)]
+mod at_destination_tests;
 #[cfg(test)]
 mod hdfs_policy_tests;
 #[cfg(test)]

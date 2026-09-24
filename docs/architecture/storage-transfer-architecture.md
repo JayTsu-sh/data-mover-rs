@@ -536,7 +536,11 @@ reporting why). The recovery binding (v3, C5) is `TransferIdentity` (derived fro
 source path, version selector, destination endpoint and final path) plus the source path and observed
 identity, size, content version and the destination. The
 local store, its lease, the `Publishing` state and `DATA_MOVER_RECOVERY_DIR` remain in force until
-commit C21 removes them.
+commit C21 removes them. The seam is in place since C7: a destination whose
+`recovery_at_destination()` is true is prepared through `prepare_at_destination` (the decision table
+in `src/storage/discovery.rs`, the pointer codec in `src/storage/pointer.rs`) under an in-process lease
+per (destination endpoint, final path), and never touches the local store; backends switch one at a
+time from C8.
 
 Local namespace durability uses a shared directory-handle helper. On Windows it opens the
 existing directory capability with read/write access and `FILE_FLAG_BACKUP_SEMANTICS` before

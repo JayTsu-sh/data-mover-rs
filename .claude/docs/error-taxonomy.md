@@ -83,6 +83,9 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | describe 之后对象被替换（`read` / native bind / `observe_bound`） | 条目 `Conflict` / Permanent |
 | 请求 `Id(v)` 而 HEAD 回来的不是版本 v（存储忽略 `?versionId=`） | 条目 `Unsupported` / Permanent |
 
+引擎（ADR-0006 C7）：同一进程里另一个传输正在写同一目的端文件（按（目的端点, 最终路径）的租约）→ Prepare 阶段
+条目 `Conflict` / **Transient**，调用方可稍后重排。
+
 ### NFS
 
 | 来源 errno | 映射到 |

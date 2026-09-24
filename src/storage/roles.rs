@@ -529,6 +529,9 @@ pub trait StagedDestination: Send + Sync {
         stage: &PreparedStage,
         request: PublishRequest,
     ) -> Result<PublicationEvidence, PublicationFailure>;
+    /// Removes an unpublished stage. A stage kept at the destination removes its pointer
+    /// before the staged content, so a clean-up that fails halfway never leaves a pointer that
+    /// would resume the stage (ADR-0006).
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure>;
 }
 

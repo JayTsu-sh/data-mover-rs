@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
+use super::at_destination;
 use super::{
     ProducerRequest, TransferFailure, TransferOutcome, TransferPhase, TransferSide,
     inflight_channel, inflight_role_failure, produce, recovery_binding_for,
@@ -12,9 +13,10 @@ use crate::metadata::MetadataPlan;
 use crate::model::observation::PrivateBackendEntryFacts;
 use crate::model::{EntryIdentityKey, EntryKind, ObservedEntry, SourceVersion, StoragePath};
 use crate::storage::{
-    CheckpointObservation, FinalDestination, PreflightPolicy, PrepareRequest, PublicationEvidence,
-    PublishRequest, ReadSource, SourceDescriptor, SourceQosBudget, SourceQosGroup, SourceQosStats,
-    StagedDestination, Storage, VerifyRequest, WriteEvidence,
+    CheckpointObservation, FinalDestination, PreflightPolicy, PrepareFact, PrepareRequest,
+    PublicationEvidence, PublishRequest, ReadSource, RestartReason, SourceDescriptor,
+    SourceQosBudget, SourceQosGroup, SourceQosStats, StagedDestination, Storage, VerifyRequest,
+    WriteEvidence,
 };
 use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy};
 
@@ -434,6 +436,12 @@ impl ExpertDestinationSession {
         self.identity
     }
 
+    /// What prepare found at the destination and did about it.
+    #[must_use]
+    pub const fn prepare_fact(&self) -> PrepareFact {
+        self.stage.prepare_fact
+    }
+
     #[must_use]
     pub const fn write_offset(&self) -> u64 {
         self.stage.write_offset
@@ -455,7 +463,7 @@ impl ExpertDestinationSession {
     /// Returns the destination cleanup failure.
     pub async fn discard(self) -> Result<(), crate::storage::StorageRoleFailure> {
         let binding = self.stage.recovery_binding();
-        let recovery_enabled = self.stage.recovery_enabled();
+        let recovery_enabled = self.stage.recovery_enabled() && self.stage.uses_recovery_store();
         self.destination.discard(self.stage).await?;
         if recovery_enabled {
             super::super::recovery_store::complete(binding)
@@ -532,6 +540,30 @@ impl ExpertDestinationSession {
     }
 }
 
+/// The expert destination half's prepare for a destination that keeps its recovery state.
+async fn prepare_at_destination(
+    request: &ExpertDestinationRequest,
+    destination: &Arc<dyn StagedDestination>,
+    source: &SourceDescriptor,
+    binding: [u8; 32],
+    recovery_enabled: bool,
+) -> Result<crate::storage::PreparedStage, TransferFailure> {
+    let lease = at_destination::acquire_for(request.destination.identity(), &request.final_path)?;
+    let spec = at_destination::Spec {
+        policy: request.transfer_policy,
+        identity: request.identity,
+        resumable: request.transfer_policy == TransferPolicy::Checkpointed && recovery_enabled,
+        recoverable: recovery_enabled,
+        cancel: request.cancel.clone(),
+    };
+    let prepare = PrepareRequest {
+        final_destination: FinalDestination::new(request.final_path.clone()),
+        source: source.clone(),
+        recovery_binding: binding,
+    };
+    at_destination::prepare_with(destination, prepare, &spec, lease).await
+}
+
 async fn prepare_destination_stage(
     request: &ExpertDestinationRequest,
     destination: &Arc<dyn StagedDestination>,
@@ -544,6 +576,10 @@ async fn prepare_destination_stage(
         &request.final_path,
         source,
     );
+    if destination.recovery_at_destination() {
+        return prepare_at_destination(request, destination, source, binding, recovery_enabled)
+            .await;
+    }
     let recovery = if recovery_enabled {
         Some(
             super::super::recovery_store::open(binding)
@@ -553,9 +589,8 @@ async fn prepare_destination_stage(
     } else {
         None
     };
-    if request.transfer_policy == TransferPolicy::AtomicReplace {
-        super::discard_prior_recovery(destination, &request.final_path, source, binding).await?;
-    }
+    let discarded = request.transfer_policy == TransferPolicy::AtomicReplace
+        && super::discard_prior_recovery(destination, &request.final_path, source, binding).await?;
     let prepare = || PrepareRequest {
         final_destination: FinalDestination::new(request.final_path.clone()),
         source: source.clone(),
@@ -574,14 +609,25 @@ async fn prepare_destination_stage(
                 claim_token: recovery.as_ref().map_or([0; 32], |context| context.claim),
             })
             .await
+            .map(|mut stage| {
+                stage.prepare_fact = PrepareFact::Resumed {
+                    bytes: stage.write_offset,
+                };
+                stage
+            })
     } else if recovery_enabled {
         destination.prepare(prepare()).await
     } else {
         destination.prepare_ephemeral(prepare()).await
     };
-    let stage = stage_result.map_err(|error| {
+    let mut stage = stage_result.map_err(|error| {
         TransferFailure::role(TransferPhase::Prepare, TransferSide::Destination, error)
     })?;
+    if discarded && stage.prepare_fact == PrepareFact::Fresh {
+        stage.prepare_fact = PrepareFact::Restarted {
+            reason: RestartReason::Requested,
+        };
+    }
     if let Some(recovery) = &recovery {
         let identity = match destination.recovery_identity(&stage).await {
             Ok(identity) => identity,
@@ -626,24 +672,38 @@ pub struct ExpertDestinationTransferred {
     effective_recovery: super::EffectiveRecovery,
 }
 
+/// What a failed verification says about the staged bytes.
+enum StagedContent {
+    /// They were read and do not match the source.
+    Mismatched,
+    /// The failure came before they could be judged.
+    NotJudged,
+}
+
 impl ExpertDestinationTransferred {
     fn evidence_matches(&self, evidence: ExpertSourceEvidence) -> bool {
         evidence.source_size == self.source_size
             && evidence.identity_key == self.source.source_identity.identity_key()
     }
 
-    async fn verify_stage(&self, evidence: ExpertSourceEvidence) -> Result<(), TransferFailure> {
+    /// Verifies the stage; a failure says whether the staged bytes themselves did not match
+    /// (the only failure that makes a resumed stage stale).
+    async fn verify_stage(
+        &self,
+        evidence: ExpertSourceEvidence,
+    ) -> Result<(), (TransferFailure, StagedContent)> {
+        let other = |failure| (failure, StagedContent::NotJudged);
         if !self.evidence_matches(evidence) {
-            return Err(TransferFailure::orchestration(
+            return Err(other(TransferFailure::orchestration(
                 TransferPhase::Verify,
                 "source evidence differs from prepared observation",
-            ));
+            )));
         }
         if self.cancel.is_cancelled() {
-            return Err(TransferFailure::orchestration(
+            return Err(other(TransferFailure::orchestration(
                 TransferPhase::Verify,
                 "transfer was cancelled before verification",
-            ));
+            )));
         }
         let verification = self
             .destination
@@ -657,20 +717,27 @@ impl ExpertDestinationTransferred {
             )
             .await
             .map_err(|error| {
-                TransferFailure::role(TransferPhase::Verify, TransferSide::Destination, error)
+                other(TransferFailure::role(
+                    TransferPhase::Verify,
+                    TransferSide::Destination,
+                    error,
+                ))
             })?;
         if verification.verified_bytes != self.source_size || verification.blake3 != evidence.blake3
         {
-            return Err(TransferFailure::orchestration(
-                TransferPhase::Verify,
-                "destination verification evidence differs from source evidence",
+            return Err((
+                TransferFailure::orchestration(
+                    TransferPhase::Verify,
+                    "destination verification evidence differs from source evidence",
+                ),
+                StagedContent::Mismatched,
             ));
         }
         if self.cancel.is_cancelled() {
-            return Err(TransferFailure::orchestration(
+            return Err(other(TransferFailure::orchestration(
                 TransferPhase::Verify,
                 "transfer was cancelled before metadata application",
-            ));
+            )));
         }
         Ok(())
     }
@@ -704,10 +771,19 @@ impl ExpertDestinationTransferred {
         self,
         evidence: ExpertSourceEvidence,
     ) -> Result<TransferOutcome, TransferFailure> {
-        if let Err(failure) = self.verify_stage(evidence).await {
-            return Err(failure
-                .with_stage(Arc::clone(&self.destination), self.stage)
-                .with_source_qos(evidence.source_qos));
+        match self.verify_stage(evidence).await {
+            Ok(()) => {}
+            Err((failure, StagedContent::Mismatched)) => {
+                let failure = failure.with_source_qos(evidence.source_qos);
+                return Err(
+                    super::discard_stale_stage(self.destination, self.stage, failure).await,
+                );
+            }
+            Err((failure, StagedContent::NotJudged)) => {
+                return Err(failure
+                    .with_stage(Arc::clone(&self.destination), self.stage)
+                    .with_source_qos(evidence.source_qos));
+            }
         }
         let metadata = match self.apply_metadata_stage().await {
             Ok(metadata) => metadata,
@@ -718,6 +794,7 @@ impl ExpertDestinationTransferred {
             }
         };
         if self.stage.recovery_enabled()
+            && self.stage.uses_recovery_store()
             && let Err(error) =
                 super::super::recovery_store::mark_publishing(self.stage.recovery_binding()).await
         {
@@ -760,6 +837,7 @@ impl ExpertDestinationTransferred {
         };
         let recovery_binding = self.stage.recovery_binding();
         if self.stage.recovery_enabled()
+            && self.stage.uses_recovery_store()
             && super::super::recovery_store::complete(recovery_binding)
                 .await
                 .is_err()
@@ -773,9 +851,12 @@ impl ExpertDestinationTransferred {
                 .with_committed_cleanup(self.destination, self.stage)
                 .with_source_qos(evidence.source_qos));
         }
+        let prepare = self.stage.prepare_fact;
         Ok(TransferOutcome {
             identity: self.identity,
             final_destination,
+            prepare,
+            reused_bytes: prepare.reused_bytes(),
             disposition,
             transferred_bytes: self.source_size,
             blake3: Some(evidence.blake3),
