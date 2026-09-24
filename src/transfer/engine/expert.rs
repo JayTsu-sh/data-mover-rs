@@ -21,7 +21,6 @@ use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy};
 /// Inputs owned by the source process for one expert transfer attempt.
 #[derive(Clone)]
 pub struct ExpertSourceRequest {
-    identity: TransferIdentity,
     source: Storage,
     observation: ObservedEntry,
     inflight: InflightLimits,
@@ -32,14 +31,12 @@ pub struct ExpertSourceRequest {
 impl ExpertSourceRequest {
     #[must_use]
     pub fn new(
-        identity: TransferIdentity,
         source: Storage,
         observation: ObservedEntry,
         inflight: InflightLimits,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
         Self {
-            identity,
             source,
             observation,
             inflight,
@@ -74,7 +71,6 @@ pub struct ExpertSourceEvidence {
 
 /// Revalidated source state for a single transport-neutral payload stream.
 pub struct ExpertSourceSession {
-    _identity: TransferIdentity,
     source: Arc<dyn ReadSource>,
     descriptor: SourceDescriptor,
     inflight: InflightLimits,
@@ -128,7 +124,6 @@ impl ExpertSourceSession {
             identity_key: descriptor.source_identity.identity_key(),
         };
         Ok(Self {
-            _identity: request.identity,
             source,
             descriptor,
             inflight: request.inflight,
@@ -297,9 +292,11 @@ pub struct ExpertDestinationRequest {
 }
 
 impl ExpertDestinationRequest {
+    /// The transfer identity is derived, as for
+    /// [`TransferRequest::new`](crate::transfer::TransferRequest::new), from the source endpoint
+    /// and path the observation carries and from the destination endpoint and final path.
     #[must_use]
     pub fn new(
-        identity: TransferIdentity,
         source: ObservedEntry,
         source_maximum_chunk_bytes: usize,
         destination: Storage,
@@ -307,6 +304,12 @@ impl ExpertDestinationRequest {
         inflight: InflightLimits,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
+        let identity = TransferIdentity::derive(
+            source.source_identity().backend(),
+            source.path(),
+            destination.identity(),
+            &final_path,
+        );
         Self {
             identity,
             source,
@@ -326,6 +329,13 @@ impl ExpertDestinationRequest {
         self
     }
 
+    /// Names the transfer with a caller-chosen identity instead of the derived one.
+    #[must_use]
+    pub const fn with_identity_override(mut self, identity: TransferIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
     /// Supplies a plan compiled from the source observation and destination target profile.
     #[must_use]
     pub fn with_metadata_plan(mut self, plan: MetadataPlan) -> Self {
@@ -336,6 +346,7 @@ impl ExpertDestinationRequest {
 
 /// Prepared destination half. Its opaque stage never crosses the process boundary.
 pub struct ExpertDestinationSession {
+    identity: TransferIdentity,
     destination: Arc<dyn StagedDestination>,
     source: SourceDescriptor,
     source_size: u64,
@@ -401,6 +412,7 @@ impl ExpertDestinationSession {
             prepare_destination_stage(&request, &destination, &source, recovery_enabled).await?;
         stage.durable_publication = request.transfer_policy == TransferPolicy::Checkpointed;
         Ok(Self {
+            identity: request.identity,
             destination,
             source,
             source_size,
@@ -411,6 +423,12 @@ impl ExpertDestinationSession {
             cancel: request.cancel,
             metadata_plan: request.metadata_plan,
         })
+    }
+
+    /// The identity this transfer runs under.
+    #[must_use]
+    pub const fn identity(&self) -> TransferIdentity {
+        self.identity
     }
 
     #[must_use]
@@ -497,6 +515,7 @@ impl ExpertDestinationSession {
             .with_stage(self.destination, self.stage));
         }
         Ok(ExpertDestinationTransferred {
+            identity: self.identity,
             destination: self.destination,
             source: self.source,
             source_size: self.source_size,
@@ -592,6 +611,7 @@ async fn prepare_destination_stage(
 /// Destination state after completed writes and before verification/publication.
 /// Local `AtomicReplace` does not promise crash-durable payload.
 pub struct ExpertDestinationTransferred {
+    identity: TransferIdentity,
     destination: Arc<dyn StagedDestination>,
     source: SourceDescriptor,
     source_size: u64,
@@ -751,6 +771,7 @@ impl ExpertDestinationTransferred {
                 .with_source_qos(evidence.source_qos));
         }
         Ok(TransferOutcome {
+            identity: self.identity,
             final_destination,
             disposition,
             transferred_bytes: self.source_size,

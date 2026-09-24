@@ -48,7 +48,6 @@ async fn local_metadata_copies_mode_and_mtime_to_hdfs_without_replacing_principa
         )?;
         transfer(
             TransferRequest::new(
-                TransferIdentity::new(format!("hdfs-metadata-{policy:?}"))?,
                 source.clone(),
                 StoragePath::new("source")?,
                 destination,
@@ -56,6 +55,9 @@ async fn local_metadata_copies_mode_and_mtime_to_hdfs_without_replacing_principa
                 InflightLimits::new(2, 128, 2)?,
                 CancellationToken::new(),
             )
+            .with_identity_override(TransferIdentity::from_label(format!(
+                "hdfs-metadata-{policy:?}"
+            ))?)
             .with_transfer_policy(policy)
             .with_read_back_verification(ReadBackVerification::Disabled),
         )
@@ -88,7 +90,6 @@ async fn direct_failure_never_exposes_stage_cleanup() -> Result {
     protocol.fail_writes();
     let storage = connect(protocol.clone(), test_identity("direct-failure")?)?;
     let request = TransferRequest::new(
-        TransferIdentity::new("direct-hdfs-failure")?,
         storage.clone(),
         StoragePath::new("source")?,
         storage,
@@ -96,6 +97,7 @@ async fn direct_failure_never_exposes_stage_cleanup() -> Result {
         InflightLimits::new(2, 128, 2)?,
         CancellationToken::new(),
     )
+    .with_identity_override(TransferIdentity::from_label("direct-hdfs-failure")?)
     .with_transfer_policy(TransferPolicy::Direct);
     let failure = transfer(request)
         .await
@@ -128,7 +130,6 @@ async fn checkpointed_registers_only_after_hsync_and_resumes_durable_prefix() ->
         )?;
         let request = || -> std::result::Result<TransferRequest, Box<dyn std::error::Error>> {
             Ok(TransferRequest::new(
-                TransferIdentity::new(format!("hdfs-checkpoint-{}-{size}", std::process::id()))?,
                 source.clone(),
                 StoragePath::new("source")?,
                 destination.clone(),
@@ -136,6 +137,10 @@ async fn checkpointed_registers_only_after_hsync_and_resumes_durable_prefix() ->
                 InflightLimits::new(4, 8 * 1024 * 1024, 4)?,
                 CancellationToken::new(),
             )
+            .with_identity_override(TransferIdentity::from_label(format!(
+                "hdfs-checkpoint-{}-{size}",
+                std::process::id()
+            ))?)
             .with_transfer_policy(TransferPolicy::Checkpointed)
             .with_read_back_verification(ReadBackVerification::Disabled))
         };
@@ -191,7 +196,6 @@ async fn all_policies_copy_with_independent_read_and_write_limits() -> Result {
                 protocol.fail_rename_after_commit();
             }
             let request = TransferRequest::new(
-                TransferIdentity::new(format!("hdfs-policy-{policy:?}-{read}"))?,
                 connect(protocol.clone(), test_identity("source-policy")?)?,
                 StoragePath::new("source")?,
                 connect(protocol.clone(), test_identity("target-policy")?)?,
@@ -199,6 +203,9 @@ async fn all_policies_copy_with_independent_read_and_write_limits() -> Result {
                 InflightLimits::new(8, 128, 8)?,
                 CancellationToken::new(),
             )
+            .with_identity_override(TransferIdentity::from_label(format!(
+                "hdfs-policy-{policy:?}-{read}"
+            ))?)
             .with_transfer_policy(policy)
             .with_read_back_verification(ReadBackVerification::Disabled);
             transfer(request).await?;
@@ -273,7 +280,6 @@ async fn direct_refuses_same_source_and_target() -> Result {
         .await;
     let storage = connect(protocol.clone(), test_identity("same")?)?;
     let request = TransferRequest::new(
-        TransferIdentity::new("same-hdfs")?,
         storage.clone(),
         StoragePath::new("file")?,
         storage,
@@ -281,6 +287,7 @@ async fn direct_refuses_same_source_and_target() -> Result {
         InflightLimits::new(2, 128, 2)?,
         CancellationToken::new(),
     )
+    .with_identity_override(TransferIdentity::from_label("same-hdfs")?)
     .with_transfer_policy(TransferPolicy::Direct);
     assert!(transfer(request).await.is_err());
     assert_eq!(
@@ -318,7 +325,6 @@ async fn hdfs_to_local_copies_mode_mtime_and_verifies_positioned_content() -> Re
         .await?;
         let outcome = transfer(
             TransferRequest::new(
-                TransferIdentity::new(format!("hdfs-local-{policy:?}"))?,
                 source.clone(),
                 StoragePath::new("source")?,
                 destination,
@@ -326,6 +332,9 @@ async fn hdfs_to_local_copies_mode_mtime_and_verifies_positioned_content() -> Re
                 InflightLimits::new(4, 512, 4)?,
                 CancellationToken::new(),
             )
+            .with_identity_override(TransferIdentity::from_label(format!(
+                "hdfs-local-{policy:?}"
+            ))?)
             .with_transfer_policy(policy)
             .with_read_back_verification(ReadBackVerification::Enabled),
         )

@@ -52,12 +52,14 @@ impl TransferIdentity {
         Self(*hasher.finalize().as_bytes())
     }
 
-    /// An identity named by the caller instead of derived. Two transfers with the same label share
-    /// an identity whatever they copy, so a label opts out of finding a transfer from its files.
+    /// An identity named by the caller instead of derived, for
+    /// [`TransferRequest::with_identity_override`](super::TransferRequest::with_identity_override).
+    /// Two transfers with the same label share an identity whatever they copy, so a label opts out
+    /// of finding a transfer from its files alone.
     ///
     /// # Errors
     /// Returns an error for blank, NUL-containing, or unbounded labels.
-    pub fn new(label: impl Into<String>) -> Result<Self, TransferValueError> {
+    pub fn from_label(label: impl Into<String>) -> Result<Self, TransferValueError> {
         let label = label.into();
         if label.trim().is_empty() || label.contains('\0') || label.len() > MAX_LABEL_BYTES {
             return Err(TransferValueError::new(

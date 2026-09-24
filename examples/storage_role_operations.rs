@@ -370,15 +370,20 @@ async fn seed(storage: &Storage, args: &Args, command: &Command) -> Result<(), E
         } else {
             format!("{path}/{name}")
         };
-        let outcome = transfer(TransferRequest::new(
-            TransferIdentity::new(format!("seed-{}-{index}", std::process::id()))?,
-            source.clone(),
-            StoragePath::new(name)?,
-            storage.clone(),
-            StoragePath::new(&destination)?,
-            inflight,
-            CancellationToken::new(),
-        ))
+        let outcome = transfer(
+            TransferRequest::new(
+                source.clone(),
+                StoragePath::new(name)?,
+                storage.clone(),
+                StoragePath::new(&destination)?,
+                inflight,
+                CancellationToken::new(),
+            )
+            .with_identity_override(TransferIdentity::from_label(format!(
+                "seed-{}-{index}",
+                std::process::id()
+            ))?),
+        )
         .await?;
         println!("seeded {destination} bytes={}", outcome.transferred_bytes);
     }

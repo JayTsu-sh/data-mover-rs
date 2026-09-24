@@ -188,14 +188,17 @@ fn request(
     destination_path: &str,
 ) -> Result<TransferRequest> {
     Ok(TransferRequest::new(
-        TransferIdentity::new(format!("metadata-copy-{}", process::id()))?,
         source.clone(),
         StoragePath::new(source_path)?,
         destination.clone(),
         StoragePath::new(destination_path)?,
         InflightLimits::new(4, 4 << 20, 4)?,
         CancellationToken::new(),
-    ))
+    )
+    .with_identity_override(TransferIdentity::from_label(format!(
+        "metadata-copy-{}",
+        process::id()
+    ))?))
 }
 
 /// Writes a fresh file, refusing to overwrite one: `--seed-bytes` pointed at a real fixture tree

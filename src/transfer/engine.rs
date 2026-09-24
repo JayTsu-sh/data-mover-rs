@@ -393,6 +393,9 @@ pub(crate) struct Transferred {
 /// Successful final outcome of one transfer attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferOutcome {
+    /// The identity the transfer ran under: derived from its endpoints and paths, or the
+    /// caller's override.
+    pub identity: super::TransferIdentity,
     pub final_destination: StoragePath,
     pub disposition: PublicationDisposition,
     pub transferred_bytes: u64,
@@ -425,6 +428,7 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
     let read_back = request.read_back;
     let cancel = request.cancel.clone();
     let transferred = run_until_transferred(request).await?;
+    let identity = transferred.identity;
     let route = transfer_route(transferred.data_path);
     let recovery = transferred.effective_recovery;
     let source_qos = transferred_source_qos(&transferred);
@@ -506,6 +510,7 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
         return Err(recovery_completion_failure(transferred, source_qos));
     }
     Ok(TransferOutcome {
+        identity,
         final_destination,
         disposition,
         transferred_bytes: expected_size,
@@ -1578,7 +1583,6 @@ mod plan_tests {
             test_destination_storage_with_role(&destination_root, "publishing-destination")?;
         role.set_automatic_checkpoint_interval(64 * 1024);
         let request = TransferRequest::new(
-            crate::transfer::TransferIdentity::new("publishing-recovery")?,
             source,
             StoragePath::new("source.bin")?,
             destination,
@@ -1586,6 +1590,9 @@ mod plan_tests {
             InflightLimits::new(2, 2 * 64 * 1024, 2)?,
             tokio_util::sync::CancellationToken::new(),
         )
+        .with_identity_override(crate::transfer::TransferIdentity::from_label(
+            "publishing-recovery",
+        )?)
         .with_transfer_policy(TransferPolicy::Checkpointed);
 
         let transferred = run_until_transferred(request.clone()).await?;

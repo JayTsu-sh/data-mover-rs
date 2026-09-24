@@ -43,7 +43,6 @@ async fn expert_source_hashes_the_whole_file_but_emits_only_after_durable_prefix
     let storage = local_storage(root.path()).await?;
     let observation = observe(&storage, "payload.bin").await?;
     let session = ExpertSourceSession::open(ExpertSourceRequest::new(
-        TransferIdentity::new("expert-source-attempt")?,
         storage,
         observation,
         InflightLimits::new(2, 128 * 1024, 2)?,
@@ -76,10 +75,9 @@ async fn expert_source_and_destination_share_verified_publication_lifecycle() ->
     let source_storage = local_storage(source_root.path()).await?;
     let destination_storage = local_storage(destination_root.path()).await?;
     let observation = observe(&source_storage, "payload.bin").await?;
-    let identity = TransferIdentity::new("expert-e2e")?;
+    let identity = TransferIdentity::from_label("expert-e2e")?;
     let limits = InflightLimits::new(2, 128 * 1024, 2)?;
     let source = ExpertSourceSession::open(ExpertSourceRequest::new(
-        identity,
         source_storage,
         observation.clone(),
         limits,
@@ -88,7 +86,6 @@ async fn expert_source_and_destination_share_verified_publication_lifecycle() ->
     .await?;
     let destination = ExpertDestinationSession::prepare(
         ExpertDestinationRequest::new(
-            identity,
             observation,
             source.offer().maximum_chunk_bytes,
             destination_storage,
@@ -96,6 +93,7 @@ async fn expert_source_and_destination_share_verified_publication_lifecycle() ->
             limits,
             CancellationToken::new(),
         )
+        .with_identity_override(identity)
         .with_transfer_policy(TransferPolicy::AtomicReplace),
     )
     .await?;
@@ -142,7 +140,6 @@ async fn expert_destination_checkpoints_only_multi_source_chunk_payloads() -> Te
 
     let large = ExpertDestinationSession::prepare(
         ExpertDestinationRequest::new(
-            TransferIdentity::new("expert-recoverable")?,
             observe(&source_storage, "large.bin").await?,
             64 * 1024,
             destination_storage.clone(),
@@ -150,6 +147,7 @@ async fn expert_destination_checkpoints_only_multi_source_chunk_payloads() -> Te
             limits,
             CancellationToken::new(),
         )
+        .with_identity_override(TransferIdentity::from_label("expert-recoverable")?)
         .with_transfer_policy(TransferPolicy::Checkpointed),
     )
     .await?;
@@ -158,7 +156,6 @@ async fn expert_destination_checkpoints_only_multi_source_chunk_payloads() -> Te
 
     let small = ExpertDestinationSession::prepare(
         ExpertDestinationRequest::new(
-            TransferIdentity::new("expert-ephemeral")?,
             observe(&source_storage, "small.bin").await?,
             64 * 1024,
             destination_storage,
@@ -166,6 +163,7 @@ async fn expert_destination_checkpoints_only_multi_source_chunk_payloads() -> Te
             limits,
             CancellationToken::new(),
         )
+        .with_identity_override(TransferIdentity::from_label("expert-ephemeral")?)
         .with_transfer_policy(TransferPolicy::Checkpointed),
     )
     .await?;

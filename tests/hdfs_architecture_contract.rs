@@ -88,15 +88,17 @@ async fn transfer_and_assert(
     destination_backend: &HDFSStorage,
     payload: &Bytes,
 ) -> TestResult {
-    let outcome = transfer(TransferRequest::new(
-        TransferIdentity::new("hdfs-architecture-contract")?,
-        source,
-        StoragePath::new("nested/source.bin")?,
-        destination,
-        StoragePath::new("published/final.bin")?,
-        InflightLimits::new(2, 128 * 1024, 2)?,
-        CancellationToken::new(),
-    ))
+    let outcome = transfer(
+        TransferRequest::new(
+            source,
+            StoragePath::new("nested/source.bin")?,
+            destination,
+            StoragePath::new("published/final.bin")?,
+            InflightLimits::new(2, 128 * 1024, 2)?,
+            CancellationToken::new(),
+        )
+        .with_identity_override(TransferIdentity::from_label("hdfs-architecture-contract")?),
+    )
     .await?;
     assert_eq!(outcome.blake3, Some(*blake3::hash(payload).as_bytes()));
     let published = destination_backend

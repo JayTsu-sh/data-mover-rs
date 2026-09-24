@@ -73,7 +73,7 @@ A data-mover operation that streams bytes from one storage backend to another th
 _Avoid_: Job, migration task, synchronization session
 
 **TransferIdentity**:
-A caller-provided stable identity for one logical transfer across recovery attempts. Data-mover treats it as opaque; it is neither an application job identity nor a container for backend recovery state.
+A stable 32-byte name for one logical transfer — this source file to that destination file — across recovery attempts. Data-mover derives it from the source endpoint and path and the destination endpoint and final path (ADR-0006); a caller may override it with a label. It is neither an application job identity nor a container for backend recovery state.
 _Avoid_: Job ID, upload ID, recovery token
 
 **Transfer attempt**:

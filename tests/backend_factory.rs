@@ -65,14 +65,14 @@ async fn explicit_factory_handles_source_and_destination_without_pair_dispatch()
     .await?;
     let path = StoragePath::new("payload.bin")?;
     let request = TransferRequest::new(
-        TransferIdentity::new("factory-transfer")?,
         source,
         path.clone(),
         destination,
         path,
         InflightLimits::new(2, 128 * 1024, 2)?,
         CancellationToken::new(),
-    );
+    )
+    .with_identity_override(TransferIdentity::from_label("factory-transfer")?);
 
     let outcome = transfer(request).await?;
 

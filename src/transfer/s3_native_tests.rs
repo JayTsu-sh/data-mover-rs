@@ -18,14 +18,14 @@ fn request(
     destination: crate::storage::Storage,
 ) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
-        TransferIdentity::new("native-s3")?,
         source,
         StoragePath::new("source")?,
         destination,
         StoragePath::new("final")?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
-    ))
+    )
+    .with_identity_override(TransferIdentity::from_label("native-s3")?))
 }
 
 #[tokio::test]
@@ -236,14 +236,14 @@ async fn cancellation_before_planning_performs_no_native_or_final_mutation() -> 
     cancel.cancel();
     let mut request = request(source, destination)?;
     request = TransferRequest::new(
-        TransferIdentity::new("cancel-native")?,
         request.source,
         StoragePath::new("source")?,
         request.destination,
         StoragePath::new("final")?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         cancel,
-    );
+    )
+    .with_identity_override(TransferIdentity::from_label("cancel-native")?);
 
     assert!(transfer(request).await.is_err());
     assert_eq!(*protocol.native_copies.lock().await, 0);

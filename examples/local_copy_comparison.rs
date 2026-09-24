@@ -158,17 +158,17 @@ async fn optimized_copy(args: &Args) -> Result<(u64, u128), Box<dyn std::error::
             async move {
                 let path = StoragePath::new(copy_path(args, index))?;
                 let request = TransferRequest::new(
-                    TransferIdentity::new(format!(
-                        "local-comparison-{}-{index}",
-                        std::process::id(),
-                    ))?,
                     source,
                     path.clone(),
                     destination,
                     path,
                     InflightLimits::new(inflight, inflight_bytes, inflight)?,
                     CancellationToken::new(),
-                );
+                )
+                .with_identity_override(TransferIdentity::from_label(format!(
+                    "local-comparison-{}-{index}",
+                    std::process::id(),
+                ))?);
                 let request = if args.atomic_replace {
                     request.with_transfer_policy(TransferPolicy::AtomicReplace)
                 } else {

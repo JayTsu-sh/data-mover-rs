@@ -91,8 +91,6 @@ async fn complete_expert_transfer(
     let limits = InflightLimits::new(2, 128 * 1024, 2)
         .unwrap_or_else(|error| panic!("valid test inflight limits: {error}"));
     let source = ExpertSourceSession::open(ExpertSourceRequest::new(
-        TransferIdentity::new(identity)
-            .unwrap_or_else(|error| panic!("valid test identity: {error}")),
         source,
         observation.clone(),
         limits,
@@ -101,8 +99,6 @@ async fn complete_expert_transfer(
     .await?;
     let destination = ExpertDestinationSession::prepare(
         ExpertDestinationRequest::new(
-            TransferIdentity::new(identity)
-                .unwrap_or_else(|error| panic!("valid test identity: {error}")),
             observation,
             source.offer().maximum_chunk_bytes,
             destination,
@@ -110,6 +106,10 @@ async fn complete_expert_transfer(
                 .unwrap_or_else(|error| panic!("valid test destination: {error}")),
             limits,
             tokio_util::sync::CancellationToken::new(),
+        )
+        .with_identity_override(
+            TransferIdentity::from_label(identity)
+                .unwrap_or_else(|error| panic!("valid test identity: {error}")),
         )
         .with_transfer_policy(policy)
         .with_metadata_plan(plan),
@@ -222,8 +222,8 @@ async fn expert_metadata_failure_does_not_publish_and_retains_the_stage()
 
 #[test]
 fn transfer_inputs_reject_ambiguous_identity_and_unbounded_limits() {
-    assert!(TransferIdentity::new("").is_err());
-    assert!(TransferIdentity::new("logical-copy-7").is_ok());
+    assert!(TransferIdentity::from_label("").is_err());
+    assert!(TransferIdentity::from_label("logical-copy-7").is_ok());
     assert!(InflightLimits::new(0, 64 * 1024, 1).is_err());
     assert!(InflightLimits::new(2, 0, 1).is_err());
     assert!(InflightLimits::new(2, 64 * 1024, 0).is_err());
@@ -482,7 +482,6 @@ async fn streaming_transfer_uses_one_source_stream_with_inflight_reads()
     let (source, source_role) = test_source_storage(source_root.path(), "inflight-source")?;
     source_role.delay_reads(Duration::from_millis(30));
     let request = TransferRequest::new(
-        TransferIdentity::new("source-range-inflight")?,
         source,
         StoragePath::new("source.bin")?,
         local_destination(destination_root.path())?,
@@ -490,6 +489,7 @@ async fn streaming_transfer_uses_one_source_stream_with_inflight_reads()
         InflightLimits::new(4, CHUNK_BYTES, 4)?,
         tokio_util::sync::CancellationToken::new(),
     )
+    .with_identity_override(TransferIdentity::from_label("source-range-inflight")?)
     .with_transfer_policy(TransferPolicy::AtomicReplace);
 
     transfer(request).await?;
@@ -637,9 +637,10 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
     destination_role.set_automatic_checkpoint_interval(64 * 1024);
     let cancel = tokio_util::sync::CancellationToken::new();
     let request = recoverable_request(
-        transfer_request(source, destination.clone(), cancel.clone())?,
+        derived_transfer_request(source, destination.clone(), cancel.clone())?,
         None,
     );
+    let interrupted_identity = request.identity();
     let task = tokio::spawn(transfer(request));
     second_read.wait_started().await;
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -661,7 +662,7 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
 
     let outcome = transfer(
         recoverable_request(
-            transfer_request(
+            derived_transfer_request(
                 local_source(source_root.path())?,
                 destination,
                 tokio_util::sync::CancellationToken::new(),
@@ -672,6 +673,9 @@ async fn cancellation_preserves_and_resumes_a_partial_durable_prefix()
     )
     .await?;
     assert_eq!(outcome.transferred_bytes, payload.len() as u64);
+    // A request built afresh, with no label, derives the interrupted transfer's identity and
+    // resumes it: only the two chunks after the durable prefix are written.
+    assert_eq!(outcome.identity, interrupted_identity);
     assert_eq!(destination_role.write_completion_count() - writes_before, 2);
     assert_eq!(outcome.source_qos.logical_bytes, payload.len() as u64);
     assert_eq!(
@@ -862,14 +866,14 @@ async fn local_transfer_reaches_durable_unpublished_state() -> Result<(), Box<dy
     let destination = local_destination(destination_root.path())?;
     let request = recoverable_request(
         TransferRequest::new(
-            TransferIdentity::new("local-copy")?,
             source,
             StoragePath::new("source.bin")?,
             destination,
             StoragePath::new("final.bin")?,
             InflightLimits::new(2, 64 * 1024, 2)?,
             tokio_util::sync::CancellationToken::new(),
-        ),
+        )
+        .with_identity_override(TransferIdentity::from_label("local-copy")?),
         None,
     );
 
@@ -895,14 +899,14 @@ async fn cancellation_before_prepare_leaves_no_staged_or_final_mutation()
     let cancel = tokio_util::sync::CancellationToken::new();
     cancel.cancel();
     let request = TransferRequest::new(
-        TransferIdentity::new("cancelled-copy")?,
         local_source(source_root.path())?,
         StoragePath::new("source.bin")?,
         local_destination(destination_root.path())?,
         StoragePath::new("final.bin")?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         cancel,
-    );
+    )
+    .with_identity_override(TransferIdentity::from_label("cancelled-copy")?);
 
     let Err(error) = run_until_transferred(request).await else {
         return Err("pre-cancelled transfer unexpectedly succeeded".into());
@@ -925,14 +929,14 @@ async fn preflight_refusal_happens_before_destination_mutation()
     std::fs::write(source_root.path().join("source.bin"), b"payload")?;
     let destination = test_unsupported_storage("unsupported-destination")?;
     let request = TransferRequest::new(
-        TransferIdentity::new("preflight-copy")?,
         local_source(source_root.path())?,
         StoragePath::new("source.bin")?,
         destination,
         StoragePath::new("final.bin")?,
         InflightLimits::new(1, 4096, 1)?,
         tokio_util::sync::CancellationToken::new(),
-    );
+    )
+    .with_identity_override(TransferIdentity::from_label("preflight-copy")?);
 
     let Err(error) = run_until_transferred(request).await else {
         return Err("unsupported destination unexpectedly transferred".into());
@@ -1079,8 +1083,17 @@ fn transfer_request(
     destination: Storage,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<TransferRequest, Box<dyn std::error::Error>> {
+    Ok(derived_transfer_request(source, destination, cancel)?
+        .with_identity_override(TransferIdentity::from_label("active-cancel-copy")?))
+}
+
+/// `source.bin` → `final.bin` under the identity data-mover derives from the two endpoints.
+fn derived_transfer_request(
+    source: Storage,
+    destination: Storage,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<TransferRequest, Box<dyn std::error::Error>> {
     Ok(TransferRequest::new(
-        TransferIdentity::new("active-cancel-copy")?,
         source,
         StoragePath::new("source.bin")?,
         destination,

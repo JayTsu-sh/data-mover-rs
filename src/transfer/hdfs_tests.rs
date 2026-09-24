@@ -25,14 +25,14 @@ fn recoverable_request(request: TransferRequest, _resume_marker: Option<()>) -> 
 
 fn request(source: Storage, destination: Storage) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
-        TransferIdentity::new("hdfs-role-contract")?,
         source,
         StoragePath::new("source")?,
         destination,
         StoragePath::new("final")?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
-    ))
+    )
+    .with_identity_override(TransferIdentity::from_label("hdfs-role-contract")?))
 }
 
 async fn prepared_stage(

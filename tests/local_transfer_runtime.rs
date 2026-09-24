@@ -24,7 +24,6 @@ async fn local(root: &Path) -> TestResult<Storage> {
 
 async fn request(source: &Path, destination: &Path) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
-        TransferIdentity::new("native-runtime")?,
         local(source).await?,
         StoragePath::new("file.bin")?,
         local(destination).await?,
@@ -92,7 +91,6 @@ async fn precancelled_copy_preserves_existing_destination() -> TestResult {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let request = TransferRequest::new(
-            TransferIdentity::new("native-cancel")?,
             local(source.path()).await?,
             StoragePath::new("file.bin")?,
             local(destination.path()).await?,
@@ -100,6 +98,7 @@ async fn precancelled_copy_preserves_existing_destination() -> TestResult {
             InflightLimits::new(1, 1024 * 1024, 128)?,
             cancel,
         )
+        .with_identity_override(TransferIdentity::from_label("native-cancel")?)
         .with_transfer_policy(policy);
         assert!(transfer(request).await.is_err());
         assert_eq!(
@@ -143,7 +142,6 @@ async fn checkpointed_syncs_new_parent_directories() -> TestResult {
     let destination = tempfile::tempdir()?;
     std::fs::write(source.path().join("file.bin"), b"new parent")?;
     let request = TransferRequest::new(
-        TransferIdentity::new("native-new-parent")?,
         local(source.path()).await?,
         StoragePath::new("file.bin")?,
         local(destination.path()).await?,
@@ -151,6 +149,7 @@ async fn checkpointed_syncs_new_parent_directories() -> TestResult {
         InflightLimits::new(1, 1024 * 1024, 1)?,
         CancellationToken::new(),
     )
+    .with_identity_override(TransferIdentity::from_label("native-new-parent")?)
     .with_transfer_policy(TransferPolicy::Checkpointed);
     transfer(request).await?;
     let parent = destination.path().join("new/child");

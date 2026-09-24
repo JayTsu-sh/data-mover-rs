@@ -130,11 +130,6 @@ async fn optimized_copy(args: &CopyArgs) -> Result<(u64, u128), Box<dyn std::err
         .checked_mul(inflight)
         .ok_or("inflight byte budget overflowed")?;
     let request = TransferRequest::new(
-        TransferIdentity::new(format!(
-            "nfs-comparison-{}-{}",
-            std::process::id(),
-            args.path
-        ))?,
         source,
         path.clone(),
         destination,
@@ -142,6 +137,11 @@ async fn optimized_copy(args: &CopyArgs) -> Result<(u64, u128), Box<dyn std::err
         InflightLimits::new(inflight, inflight_bytes, inflight)?,
         CancellationToken::new(),
     )
+    .with_identity_override(TransferIdentity::from_label(format!(
+        "nfs-comparison-{}-{}",
+        std::process::id(),
+        args.path
+    ))?)
     .with_transfer_policy(match args.transfer_policy {
         TransferMode::Checkpointed => TransferPolicy::Checkpointed,
         TransferMode::AtomicReplace => TransferPolicy::AtomicReplace,

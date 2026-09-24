@@ -202,14 +202,14 @@ mod tests {
             .await?;
         let cancel = tokio_util::sync::CancellationToken::new();
         let request = TransferRequest::new(
-            TransferIdentity::new("single-cancel")?,
             source_storage,
             descriptor.path.clone(),
             destination_storage,
             final_destination.path().clone(),
             InflightLimits::new(1, 64 * 1024, 1)?,
             cancel,
-        );
+        )
+        .with_identity_override(TransferIdentity::from_label("single-cancel")?);
         let source: Arc<dyn ReadSource> = Arc::new(CancelsAtEof {
             descriptor: descriptor.clone(),
             payload: Bytes::from_static(b"payload"),

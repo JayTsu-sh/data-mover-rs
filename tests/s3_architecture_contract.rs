@@ -80,14 +80,16 @@ fn transfer_request(
     identity: &str,
 ) -> TestResult<TransferRequest> {
     Ok(TransferRequest::new(
-        TransferIdentity::new(format!("s3-contract-{identity}"))?,
         storage.clone(),
         source.clone(),
         storage.clone(),
         final_path,
         InflightLimits::new(4, PART_SIZE, 4)?,
         CancellationToken::new(),
-    ))
+    )
+    .with_identity_override(TransferIdentity::from_label(format!(
+        "s3-contract-{identity}"
+    ))?))
 }
 
 async fn verify_stale_upload_restart(

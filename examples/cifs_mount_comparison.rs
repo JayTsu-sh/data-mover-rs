@@ -160,10 +160,6 @@ async fn main() -> Result<(), Error> {
                     format!("{}/{index}.bin", args.path)
                 })?;
                 let request = TransferRequest::new(
-                    TransferIdentity::new(format!(
-                        "cifs-mount-compare-{}-{index}",
-                        std::process::id()
-                    ))?,
                     source,
                     path.clone(),
                     destination,
@@ -171,6 +167,10 @@ async fn main() -> Result<(), Error> {
                     inflight,
                     CancellationToken::new(),
                 )
+                .with_identity_override(TransferIdentity::from_label(format!(
+                    "cifs-mount-compare-{}-{index}",
+                    std::process::id()
+                ))?)
                 .with_transfer_policy(policy)
                 .with_read_back_verification(if args.read_back {
                     ReadBackVerification::Enabled

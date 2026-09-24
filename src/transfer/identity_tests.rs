@@ -50,7 +50,7 @@ fn derived_identity_matches_the_frozen_vector() -> TestResult {
         "23082950a6e642af339e0dbf47cac5c1c808e66ab13ec12e42f01c1a5e46ad28"
     );
     assert_eq!(
-        TransferIdentity::new("logical-copy-7")?.to_string(),
+        TransferIdentity::from_label("logical-copy-7")?.to_string(),
         "e8cdb2c64b3e406705a02aa3779bf2e5cf5509391eb823b24db79045280288ea"
     );
     Ok(())
@@ -129,18 +129,18 @@ fn field_boundaries_are_unambiguous() -> TestResult {
 
 #[test]
 fn a_label_is_validated_and_names_one_identity() -> TestResult {
-    assert!(TransferIdentity::new("").is_err());
-    assert!(TransferIdentity::new("  ").is_err());
-    assert!(TransferIdentity::new("a\0b").is_err());
-    assert!(TransferIdentity::new("x".repeat(1025)).is_err());
-    assert!(TransferIdentity::new("x".repeat(1024)).is_ok());
+    assert!(TransferIdentity::from_label("").is_err());
+    assert!(TransferIdentity::from_label("  ").is_err());
+    assert!(TransferIdentity::from_label("a\0b").is_err());
+    assert!(TransferIdentity::from_label("x".repeat(1025)).is_err());
+    assert!(TransferIdentity::from_label("x".repeat(1024)).is_ok());
     assert_eq!(
-        TransferIdentity::new("job-1")?,
-        TransferIdentity::new("job-1")?
+        TransferIdentity::from_label("job-1")?,
+        TransferIdentity::from_label("job-1")?
     );
     assert_ne!(
-        TransferIdentity::new("job-1")?,
-        TransferIdentity::new("job-2")?
+        TransferIdentity::from_label("job-1")?,
+        TransferIdentity::from_label("job-2")?
     );
     Ok(())
 }
@@ -295,7 +295,7 @@ fn a_source_change_keeps_the_identity_and_changes_the_binding() -> TestResult {
 /// an S3 object's identity key is its `versionId` or `ETag`, so two keys with equal content share it.
 #[test]
 fn a_reused_label_binds_each_source_and_destination_separately() -> TestResult {
-    let label = TransferIdentity::new("nightly")?;
+    let label = TransferIdentity::from_label("nightly")?;
     let original = binding(&label, BASE)?;
     for (name, changed) in [
         (
@@ -322,6 +322,9 @@ fn a_reused_label_binds_each_source_and_destination_separately() -> TestResult {
     ] {
         assert_ne!(binding(&label, changed)?, original, "{name}");
     }
-    assert_ne!(binding(&TransferIdentity::new("weekly")?, BASE)?, original);
+    assert_ne!(
+        binding(&TransferIdentity::from_label("weekly")?, BASE)?,
+        original
+    );
     Ok(())
 }

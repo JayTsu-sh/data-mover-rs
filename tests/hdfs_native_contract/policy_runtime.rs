@@ -47,7 +47,6 @@ async fn nightly_lab_transfer_policies_and_chunk_boundaries() -> TestResult {
         ] {
             create_hdfs_file(&legacy, "final", bytes::Bytes::from_static(b"old target")).await?;
             let request = TransferRequest::new(
-                TransferIdentity::new(format!("lab-hdfs-{policy:?}-{size}"))?,
                 storage.clone(),
                 StoragePath::new("source")?,
                 storage.clone(),
@@ -55,6 +54,9 @@ async fn nightly_lab_transfer_policies_and_chunk_boundaries() -> TestResult {
                 InflightLimits::new(8, 16 * 1024 * 1024, 8)?,
                 tokio_util::sync::CancellationToken::new(),
             )
+            .with_identity_override(TransferIdentity::from_label(format!(
+                "lab-hdfs-{policy:?}-{size}"
+            ))?)
             .with_transfer_policy(policy);
             let result = transfer(request).await?;
             assert_eq!(result.transferred_bytes, size as u64);
@@ -182,7 +184,6 @@ async fn nightly_lab_local_source_metadata_to_hdfs_policies() -> TestResult {
         let final_path = format!("final-{policy:?}").to_ascii_lowercase();
         let outcome = transfer(
             TransferRequest::new(
-                TransferIdentity::new(format!("hdfs-lab-local-metadata-{policy:?}"))?,
                 source.clone(),
                 StoragePath::new("source")?,
                 destination.clone(),
@@ -190,6 +191,9 @@ async fn nightly_lab_local_source_metadata_to_hdfs_policies() -> TestResult {
                 InflightLimits::new(2, 128, 2)?,
                 tokio_util::sync::CancellationToken::new(),
             )
+            .with_identity_override(TransferIdentity::from_label(format!(
+                "hdfs-lab-local-metadata-{policy:?}"
+            ))?)
             .with_transfer_policy(policy)
             .with_read_back_verification(ReadBackVerification::Enabled),
         )

@@ -241,9 +241,11 @@ impl CopiedMetadataRequest {
 
 impl TransferRequest {
     /// Creates one transfer attempt from connected storage backends.
+    ///
+    /// Its [`TransferIdentity`] is derived from the two endpoints and paths, so any process
+    /// building the same request — with no state of its own — names the same transfer.
     #[must_use]
     pub fn new(
-        identity: TransferIdentity,
         source: Storage,
         source_path: StoragePath,
         destination: Storage,
@@ -251,6 +253,12 @@ impl TransferRequest {
         inflight: InflightLimits,
         cancel: CancellationToken,
     ) -> Self {
+        let identity = TransferIdentity::derive(
+            source.identity(),
+            &source_path,
+            destination.identity(),
+            &final_path,
+        );
         Self {
             identity,
             source,
@@ -265,6 +273,21 @@ impl TransferRequest {
             read_back: ReadBackVerification::default(),
             copied_metadata: CopiedMetadataRequest::default(),
         }
+    }
+
+    /// Names the transfer with a caller-chosen identity instead of the derived one. The binding
+    /// still covers both paths and the destination, but an interrupted transfer is only resumed
+    /// by a request carrying the same override.
+    #[must_use]
+    pub const fn with_identity_override(mut self, identity: TransferIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    /// The identity this request transfers under: derived, or the override.
+    #[must_use]
+    pub const fn identity(&self) -> TransferIdentity {
+        self.identity
     }
 
     /// Asks the copy to carry optional metadata families. Left alone, a transfer carries the

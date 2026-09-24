@@ -385,8 +385,12 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
 overwrite/publication requirements, resumability, verification policy, metadata policy,
 cancellation, inflight bounds, and optional shared source QoS.
 
-`TransferIdentity` is caller-supplied and stable across attempts of one logical transfer; it
-is not a job ID and contains no backend state. Every execution receives a distinct attempt
+`TransferIdentity` names one logical transfer — this source file to that destination file — and is
+stable across attempts; it is not a job ID and contains no backend state. data-mover derives it
+(ADR-0006, C5) from the source endpoint and path and the destination endpoint and final path, so a
+process with no state of its own names the same transfer; `with_identity_override` replaces it with a
+caller label. The expert destination session derives it from the `ObservedEntry` it receives; the
+expert source session takes none. Every execution receives a distinct attempt
 identity. A `TransferOutcome` includes both identities, selected data path, prepare fact,
 total and reused bytes, verification evidence, publication guarantee, per-family metadata
 results, warnings, `final_destination_changed`, and source-deletion-safety. A
@@ -527,8 +531,9 @@ source-deletion-safety fact for terrasync policy.
 store described below: artifacts are named from the final file name in its parent directory, the
 destination holds a pointer with the full recovery binding, and prepare decides resume or restart from
 what it finds there (resume on an equal binding; otherwise clean up in place and start from zero,
-reporting why). The recovery binding becomes `TransferIdentity` (derived from source endpoint, source
-path, version selector, destination endpoint and final path) plus the observed source version. The
+reporting why). The recovery binding (v3, C5) is `TransferIdentity` (derived from source endpoint,
+source path, version selector, destination endpoint and final path) plus the source path and observed
+identity, size, content version and the destination. The
 local store, its lease, the `Publishing` state and `DATA_MOVER_RECOVERY_DIR` remain in force until
 commit C21 removes them.
 

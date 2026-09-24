@@ -9,9 +9,13 @@
 //! ```
 //!
 //! Endpoints: see `endpoint_support` (`nfs://…`, `smb:<sub-path>`, `s3:<prefix>`, `hdfs://…`, or a
-//! local directory). A second run with the same `--identity` resumes what the first left behind —
-//! today only where the engine's recovery records (`DATA_MOVER_RECOVERY_DIR`) survived; ADR-0006
-//! moves them to the destination.
+//! local directory). A second run with the same endpoints and paths derives the same transfer
+//! identity and resumes what the first left behind — today only where the engine's recovery records
+//! (`DATA_MOVER_RECOVERY_DIR`) survived; ADR-0006 moves them to the destination. `--identity`
+//! replaces the derived identity with a label, which a resume must then repeat.
+//!
+//! The identity goes to stderr as soon as the request is built, so a run killed before it reports
+//! still leaves it behind, and into the stdout line as `identity`.
 //!
 //! `source_streamed_bytes` is what the engine actually read from the source; it is counted only
 //! under a source budget, so a run that must report it passes `--bandwidth` (a high value if the
@@ -57,9 +61,9 @@ struct Args {
     policy: Policy,
     #[arg(long, value_enum, default_value_t = OnOff::On)]
     read_back: OnOff,
-    /// Transfer identity; reuse it to resume what an interrupted run left behind.
-    #[arg(long, default_value = "transfer-resume")]
-    identity: String,
+    /// Override the derived transfer identity with this label; a resume must repeat it.
+    #[arg(long)]
+    identity: Option<String>,
     /// Hard limit on source read bandwidth, so an interruption lands mid-transfer.
     #[arg(long)]
     bandwidth: Option<u64>,
@@ -144,7 +148,6 @@ fn request(
 ) -> Result<TransferRequest> {
     let source_path = args.source_path.as_deref().ok_or("--source-path")?;
     let mut request = TransferRequest::new(
-        TransferIdentity::new(args.identity.clone())?,
         source,
         StoragePath::new(source_path)?,
         destination,
@@ -161,6 +164,9 @@ fn request(
         OnOff::On => ReadBackVerification::Enabled,
         OnOff::Off => ReadBackVerification::Disabled,
     });
+    if let Some(label) = &args.identity {
+        request = request.with_identity_override(TransferIdentity::from_label(label.as_str())?);
+    }
     if let Some(rate) = args.bandwidth {
         let policy = SourceQosPolicy::new(Some((rate, rate, Duration::ZERO)), 8 << 20, None)?;
         request = request.with_source_qos(SourceQosGroup::new(policy));
@@ -249,10 +255,13 @@ async fn main() -> Result {
     }
     let started = Instant::now();
     let request = request(&args, source, (destination, destination_path), cancel)?;
+    let identity = request.identity().to_string();
+    eprintln!("{}", json!({ "event": "start", "identity": identity }));
     let result = transfer(request).await;
     let mut line = report(&result, started.elapsed().as_millis());
     if let (Some(line), Some(endpoints)) = (line.as_object_mut(), endpoints.as_object()) {
         line.extend(endpoints.clone());
+        line.insert("identity".to_string(), Value::String(identity));
     }
     println!("{line}");
     if result.is_err() {

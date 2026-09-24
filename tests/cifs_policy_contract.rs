@@ -104,7 +104,6 @@ async fn copy(
     let started = std::time::Instant::now();
     let copied = transfer(
         TransferRequest::new(
-            TransferIdentity::new(format!("{from}-{to}"))?,
             source.clone(),
             StoragePath::new(from)?,
             destination.clone(),
@@ -112,6 +111,7 @@ async fn copy(
             InflightLimits::new(8, 16 * 1024 * 1024, 8)?,
             tokio_util::sync::CancellationToken::new(),
         )
+        .with_identity_override(TransferIdentity::from_label(format!("{from}-{to}"))?)
         .with_transfer_policy(policy)
         .with_read_back_verification(read_back),
     )

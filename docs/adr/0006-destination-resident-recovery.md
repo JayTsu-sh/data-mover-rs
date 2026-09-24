@@ -145,8 +145,10 @@ with versionId, latest flag and delete-marker flag, oldest to newest per key). B
 ## Consequences
 
 - Public API breaks (terrasync adapts): configs lose `identity`; `TransferRequest::new` loses the
-  identity argument and gains `with_source_version` / `with_identity_override`; `TransferOutcome` gains
-  `identity`, `prepare`, `reused_bytes`, `destination_version`; the two recovery `TransferPhase`
+  identity argument and gains `with_identity_override` / `identity()` (C5) and `with_source_version`
+  (C6); `TransferIdentity::new` becomes `from_label`; `ExpertSourceRequest::new` loses the identity and
+  `ExpertDestinationRequest::new` derives it (`with_identity_override`, session `identity()`);
+  `TransferOutcome` gains `identity` (C5), `prepare`, `reused_bytes`, `destination_version`; the two recovery `TransferPhase`
   variants go; `DATA_MOVER_RECOVERY_DIR` goes.
 - Configs lose `identity`; `S3Storage::architecture_storage` / `HDFSStorage::architecture_storage` /
   `nfs::create_nfs_role_storage` lose their identity argument and `cifs::create_cifs_role_storage` is

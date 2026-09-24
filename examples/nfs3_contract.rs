@@ -395,7 +395,6 @@ async fn validate_acl(
 async fn validate_streaming_copy(source: &Storage, destination: &Storage) -> ContractResult {
     let outcome = transfer(
         TransferRequest::new(
-            TransferIdentity::new("nfs3-contract-stream-copy")?,
             source.clone(),
             path("fixture.bin")?,
             destination.clone(),
@@ -403,6 +402,7 @@ async fn validate_streaming_copy(source: &Storage, destination: &Storage) -> Con
             InflightLimits::new(4, 256 * 1024, 4)?,
             CancellationToken::new(),
         )
+        .with_identity_override(TransferIdentity::from_label("nfs3-contract-stream-copy")?)
         .with_source_qos(SourceQosGroup::new(SourceQosPolicy::new(
             Some((1024 * 1024, 1024 * 1024, Duration::ZERO)),
             64 * 1024,
@@ -422,7 +422,6 @@ async fn validate_streaming_copy(source: &Storage, destination: &Storage) -> Con
 async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) -> ContractResult {
     let cancel = CancellationToken::new();
     let request = TransferRequest::new(
-        TransferIdentity::new("nfs-contract-cancel")?,
         source.clone(),
         path("cancellation.bin")?,
         destination.clone(),
@@ -430,6 +429,7 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
         InflightLimits::new(1, 64 * 1024, 1)?,
         cancel.clone(),
     )
+    .with_identity_override(TransferIdentity::from_label("nfs-contract-cancel")?)
     .with_source_qos(SourceQosGroup::new(SourceQosPolicy::new(
         Some((64 * 1024, 64 * 1024, Duration::ZERO)),
         64 * 1024,
@@ -449,7 +449,6 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
 
     let outcome = transfer(
         TransferRequest::new(
-            TransferIdentity::new("nfs-contract-restart")?,
             source.clone(),
             path("cancellation.bin")?,
             destination.clone(),
@@ -457,6 +456,7 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
             InflightLimits::new(4, 256 * 1024, 4)?,
             CancellationToken::new(),
         )
+        .with_identity_override(TransferIdentity::from_label("nfs-contract-restart")?)
         .with_transfer_policy(TransferPolicy::Checkpointed),
     )
     .await?;
