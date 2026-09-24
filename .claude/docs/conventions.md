@@ -103,7 +103,7 @@ delay_backoff)。详见 .claude/docs/error-taxonomy.md。
 | `debug!` | 调试细节 (协议字段、retry 次数) |
 | `trace!` | 极详细 (每个 RPC) |
 
-**所有打印 URL 的日志先过 `url_redact::redact_url`** — 隐藏 ak/sk/密码。
+**所有打印 URL 的日志先过 `url_redact::redact_storage_url`** — 隐藏 ak/sk/密码。
 
 ## 测试
 

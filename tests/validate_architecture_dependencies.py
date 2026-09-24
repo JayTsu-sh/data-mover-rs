@@ -19,7 +19,8 @@ ALLOWED = {
     "runtime": {"model"},
 }
 FILE_ALLOWED = {
-    "storage/factory.rs": {"cifs", "hdfs", "nfs", "s3"},
+    # The composition point: legacy backends, plus the leaf credential redactor its Debug uses.
+    "storage/factory.rs": {"cifs", "hdfs", "nfs", "s3", "url_redact"},
 }
 CRATE_REFERENCE = re.compile(r"\bcrate::\s*([A-Za-z_]\w*)")
 CRATE_GROUP = re.compile(r"\bcrate::\s*\{([^{}]*)\}", re.DOTALL)

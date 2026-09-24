@@ -49,7 +49,7 @@
 
 **verify**: `grep -E 'format!.*url' src/*.rs` 检查是否过 `url_redact`。
 **why**: 错误信息可能写日志、上报错误追踪服务、贴 issue。
-**how to apply**: 任何包含 URL 的错误消息必须先 `url_redact::redact_url(&url)`。
+**how to apply**: 任何包含 URL 的错误消息必须先 `url_redact::redact_storage_url(&url)`。
 
 ## R9 · 时间转换走 `time_util`
 

@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use data_mover::model::{BackendIdentity, BackendKind, StoragePath};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, LocalBackendConfig,
-    connect_backend,
+    S3BackendConfig, connect_backend,
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use tokio_util::sync::CancellationToken;
@@ -26,6 +26,26 @@ fn cifs_config_debug_never_exposes_credentials() -> Result<(), Box<dyn std::erro
 
     assert!(!debug.contains("sensitive-user"));
     assert!(!debug.contains("sensitive-password"));
+    Ok(())
+}
+
+#[test]
+fn s3_config_debug_never_exposes_the_key_pair() -> Result<(), Box<dyn std::error::Error>> {
+    // A secret with `/`, `+` and `=` is exactly what a URL parser cannot find.
+    let config = BackendConfig::S3(S3BackendConfig {
+        url: "s3://SENSITIVEAK:wJalr/XUtn+FEMI=@bucket.host:9000/prefix".to_string(),
+        identity: BackendIdentity::new(BackendKind::S3, "s3-fixture")?,
+        block_size: None,
+    });
+
+    let debug = format!("{config:?}");
+
+    assert!(!debug.contains("SENSITIVEAK"), "{debug}");
+    assert!(
+        !debug.contains("wJalr") && !debug.contains("FEMI"),
+        "{debug}"
+    );
+    assert!(debug.contains("bucket.host:9000/prefix"), "{debug}");
     Ok(())
 }
 

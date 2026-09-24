@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::hdfs::HdfsConfig;
 use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::Storage;
+use crate::url_redact::redact_storage_url;
 
 #[derive(Clone, Debug)]
 pub struct LocalBackendConfig {
@@ -90,11 +91,23 @@ impl fmt::Debug for CifsBackendConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct S3BackendConfig {
+    /// `s3://AK:SK@bucket.host[:port]/prefix`; the key pair is never printed by `Debug`.
     pub url: String,
     pub identity: BackendIdentity,
     pub block_size: Option<u64>,
+}
+
+impl fmt::Debug for S3BackendConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S3BackendConfig")
+            .field("url", &redact_storage_url(&self.url))
+            .field("identity", &self.identity)
+            .field("block_size", &self.block_size)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
