@@ -55,6 +55,9 @@ if [ -n "${CIFS_REAL_SERVER:-}" ]; then
 case_ "v4.1->cifs acl asked: copied, skipped (NfsV4 vs Windows SD, no conversion)" 0 "ACL skipped: the source holds a NfsV4 ACL and the destination stores WindowsSecurityDescriptor" \
   --source "$V41" --source-path src-principal --destination "$CIFS" --destination-path acl-asked \
   --acl --expect copied --expect-acl unsupported
+case_ "cifs->v4.1 xattrs asked: copied, skipped (smb-rs exposes no EA query)" 0 "extended attributes skipped: the source cannot read it" \
+  --source "$CIFS" --source-path src-cifs --seed-bytes 4096 --destination "$V41" --destination-path cifs-xattrs \
+  --xattrs --expect copied --expect-xattrs unsupported
 else echo "SKIP CIFS rung (CIFS_REAL_* unset)"; fi
 case_ "guard: seeding an existing path is refused" 1 "already exists" \
   --source "$V41" --source-path src-principal --seed-bytes 1 --destination "$V41" --destination-path never \

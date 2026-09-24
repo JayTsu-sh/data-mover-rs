@@ -224,8 +224,9 @@ result
   两端都无显式 ACE 且保护位相同时跳过 `SET_INFO`。与 `copy_acl` 的差异：源无显式 ACE 时
   这里会清掉目标端多余的显式 ACE (严格镜像源端)，`copy_acl` 则直接跳过。编码仍是 self-relative `SecurityDescriptor` 字节
   (`AclEncoding::WindowsSecurityDescriptor`)，与 `acl::get_acl_bytes` 的格式相同。
-- CIFS xattr、tags、numeric ownership 当前按 typed not-applicable/unsupported 体现，
-  不通过 storage enum 做协议配对分支。
+- 作为源端：要了 xattr 时观测为 `Unsupported`（读不了 —— SMB 有 EA，smb-rs 领域 API 没暴露，上游请求 S2），
+  拷贝报告里记 `extended attributes skipped: the source cannot read it`；tags、numeric ownership 是
+  `NotApplicable`（ownership 是基线族，报 `Unsupported` 会让整个文件失败）。不通过 storage enum 做协议配对分支。
 
 ### FileTime ↔ Unix nanos
 

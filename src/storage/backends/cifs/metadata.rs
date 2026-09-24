@@ -80,7 +80,7 @@ impl CifsMetadata {
         };
         MetadataObservations::new(
             acl,
-            not_applicable(plan.xattrs()),
+            cannot_read(plan.xattrs()),
             not_applicable(plan.tags()),
             not_applicable(plan.ownership_mode()),
             timestamps,
@@ -296,6 +296,17 @@ async fn observe_acl(
     }
 }
 
+/// A family this adapter cannot read at all — extended attributes: SMB carries them, but the
+/// smb-rs domain API exposes no EA query (upstream request S2). Saying `NotApplicable` instead
+/// would claim the file has none, and a copy that asked for them would drop them without a reason.
+fn cannot_read<T>(mode: ObservationMode) -> MetadataObservation<T> {
+    if mode == ObservationMode::Omit {
+        MetadataObservation::NotRequested
+    } else {
+        MetadataObservation::Unsupported
+    }
+}
+
 fn not_applicable<T>(mode: ObservationMode) -> MetadataObservation<T> {
     if mode == ObservationMode::Omit {
         MetadataObservation::NotRequested
@@ -491,6 +502,29 @@ mod tests {
             )?))
             .is_err()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn xattrs_asked_for_are_unreadable_not_absent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let metadata = CifsMetadata::new(
+            Arc::new(ProbeProtocol::default()),
+            BackendIdentity::new(crate::model::BackendKind::Cifs, "test")?,
+        );
+        let path = StoragePath::new("file")?;
+        let omitted = metadata.observe(&path, ObservationPlan::default()).await?;
+        assert_eq!(omitted.xattrs(), &MetadataObservation::NotRequested);
+        for mode in [ObservationMode::BestEffort, ObservationMode::Required] {
+            let asked = metadata
+                .observe(&path, ObservationPlan::default().with_xattrs(mode))
+                .await?;
+            assert_eq!(
+                asked.xattrs(),
+                &MetadataObservation::Unsupported,
+                "{mode:?}"
+            );
+        }
         Ok(())
     }
 

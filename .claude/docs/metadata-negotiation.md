@@ -60,8 +60,9 @@ Display 如 `ACL skipped: the source cannot read it`。不变式：outcome 为 `
 2. **源端能不能读** —— 要的功能以 `ObservationMode::BestEffort` 叠加到 backend 的基线 plan 上；
    backend 用 `MetadataObservation::Unsupported` 说「读不了」（进 `skipped()`，带 `SourceCannotObserve`），
    `NotApplicable` 只说「这一条没有」（symlink 上的 ACL，不算跳过），`Failed` 说「读失败」。
-   **待修**：CIFS 源的 xattr 仍返回 `NotApplicable`，要了会被无声丢掉。S3 源没有拷贝基线
-   （`copied_metadata_observation_plan` 为 `None`），整段元数据都不走，见下文与 K6 / K8。
+   CIFS 源的 xattr 是 `Unsupported`（smb-rs 领域 API 没有 EA 查询，上游请求 S2）。
+   **待修**：S3 源没有拷贝基线（`copied_metadata_observation_plan` 为 `None`），整段元数据都不走，
+   见下文与 K6 / K8。
 3. **目的端能不能存** —— `CopiedMetadataTarget.acl` / `.xattrs`。
 4. **规划期交叉** —— `compile_copied_metadata_plan` 按上表裁决。
 5. **应用期** —— 服务端可以在能力位说 yes 之后仍然拒绝：该文件失败（先应用完其余族）。
