@@ -917,6 +917,57 @@ async fn a_direct_transfer_reports_the_stage_it_cleaned_up()
     Ok(())
 }
 
+/// A resumed stage whose durable prefix no longer matches the source fails verification — real
+/// backends report that as `Corruption` — and is cleaned up in place, so the next attempt starts
+/// over instead of resuming the same bad prefix on every retry.
+#[tokio::test]
+async fn a_resumed_stage_that_fails_verification_is_not_resumed_again()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_root = TestRoot::new("stale-resume-source")?;
+    let destination_root = TestRoot::new("stale-resume-destination")?;
+    let payload = vec![0x46; 3 * 64 * 1024 + 5];
+    std::fs::write(source_root.path().join("source.bin"), &payload)?;
+    let (destination, role) =
+        test_destination_storage_with_role(destination_root.path(), "stale-resume-destination")?;
+    role.set_automatic_checkpoint_interval(64 * 1024);
+    let request = || -> Result<TransferRequest, Box<dyn std::error::Error>> {
+        Ok(transfer_request(
+            local_source(source_root.path())?,
+            destination.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        )?
+        .with_transfer_policy(TransferPolicy::Checkpointed))
+    };
+    drop(run_until_transferred(request()?).await?);
+    let stage = std::fs::read_dir(destination_root.path())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "stage")
+        })
+        .ok_or("the interrupted run left its stage")?;
+    let mut damaged = std::fs::read(&stage)?;
+    damaged[10] ^= 0xff;
+    std::fs::write(&stage, damaged)?;
+
+    let failure = transfer(request()?)
+        .await
+        .err()
+        .ok_or("a damaged resumed prefix must fail verification")?;
+    assert_eq!(failure.phase(), TransferPhase::Verify);
+    assert!(!failure.has_unpublished_stage());
+    assert_eq!(staging_entry_count(destination_root.path())?, 0);
+
+    let outcome = transfer(request()?).await?;
+    assert_eq!(outcome.prepare, PrepareFact::Fresh);
+    assert_eq!(
+        std::fs::read(destination_root.path().join("final.bin"))?,
+        payload
+    );
+    Ok(())
+}
+
 /// Local keeps its recovery state at the destination (ADR-0006 C8): neither an interrupted
 /// transfer nor its resume leaves anything in the local recovery store.
 #[tokio::test]

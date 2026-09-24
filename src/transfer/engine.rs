@@ -602,6 +602,12 @@ async fn verify_transferred(
         .await;
     let verification = match verification {
         Ok(verification) => verification,
+        Err(error) if content_mismatch(&error) => {
+            let failure =
+                TransferFailure::role(TransferPhase::Verify, TransferSide::Destination, error)
+                    .with_source_qos(source_qos);
+            return Err(discard_stale_resume(transferred, failure).await);
+        }
         Err(error) => {
             return Err(TransferFailure::role(
                 TransferPhase::Verify,
@@ -631,6 +637,12 @@ async fn verify_transferred(
         .with_source_qos(source_qos));
     }
     Ok((transferred, verification))
+}
+
+/// Whether a failed verification judged the staged content — the backend read it and it differs —
+/// rather than failing to look. Backends report a mismatch as `Corruption`, not as evidence.
+pub(super) fn content_mismatch(error: &StorageRoleFailure) -> bool {
+    matches!(error, StorageRoleFailure::Entry(entry) if entry.class() == FailureClass::Corruption)
 }
 
 /// A resumed stage kept at the destination that fails verification is stale — its pointer would

@@ -717,11 +717,14 @@ impl ExpertDestinationTransferred {
             )
             .await
             .map_err(|error| {
-                other(TransferFailure::role(
-                    TransferPhase::Verify,
-                    TransferSide::Destination,
-                    error,
-                ))
+                let content = if super::content_mismatch(&error) {
+                    StagedContent::Mismatched
+                } else {
+                    StagedContent::NotJudged
+                };
+                let failure =
+                    TransferFailure::role(TransferPhase::Verify, TransferSide::Destination, error);
+                (failure, content)
             })?;
         if verification.verified_bytes != self.source_size || verification.blake3 != evidence.blake3
         {
