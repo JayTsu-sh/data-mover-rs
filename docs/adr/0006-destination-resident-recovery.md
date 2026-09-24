@@ -129,13 +129,17 @@ with versionId, latest flag and delete-marker flag, oldest to newest per key). B
 - S3 content becomes visible before read-back; per-part Content-MD5, the part-list check and the
   composite ETag run before publication.
 - A crash between publication and pointer deletion costs one re-copy.
+- Every listing hides `.data-mover-*` names (any path segment), so a user object named that way is no
+  longer seen as a source entry; the same name must be hidden on every backend, or a mirror could treat
+  it as an extra destination file.
 - Stages in flight in the old format are not recognized: drain transfers before upgrading; manual
   cleanup of `.data-mover-*` stages, `.claim-*` names and S3 `.data-mover-stage/` is documented.
 
 ## Commit sequence
 
 C1 this ADR · C2 cross-backend resume example and container-restart matrix, baseline · C3 legacy S3
-listing filters `.data-mover-*` · C4 endpoint identity · C5 TransferIdentity and binding v3 · C6 source
+listing filters `.data-mover-*` · C3b the same for the legacy Local / NFS / HDFS listings and the CIFS /
+HDFS role-based namespace and traversal (one shared `ARTIFACT_PREFIX`) · C4 endpoint identity · C5 TransferIdentity and binding v3 · C6 source
 version selector (C6a: native identity ignores the `"null"` version) · C7 destination discovery seam ·
 C8 Local · C9 Local reserved-name cleanup · C10 NFS · C11 CIFS · C12 HDFS · C13 verification point ·
 C14 S3 small objects, threshold, Direct · C15 S3 multipart on the final key · C16 resume granularity ·

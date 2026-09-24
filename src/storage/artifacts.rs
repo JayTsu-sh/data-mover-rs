@@ -1,7 +1,20 @@
 //! Shared names for sibling transfer artifacts; ownership remains backend-specific.
+
+/// Every transfer artifact name, on every backend, starts with this.
+pub(crate) const ARTIFACT_PREFIX: &str = ".data-mover-";
+
+/// Whether a `/`-separated path names a transfer artifact or lies inside one: any segment starts
+/// with [`ARTIFACT_PREFIX`]. Listings hide these; pass the path relative to the storage root so a
+/// root that itself sits inside an artifact still lists. A walk started *below* the root inside an
+/// artifact (`sub_path = ".data-mover-stage"`) therefore lists nothing.
+pub(crate) fn is_artifact_path(path: &str) -> bool {
+    path.split('/')
+        .any(|segment| segment.starts_with(ARTIFACT_PREFIX))
+}
+
 pub(crate) fn stage_name(destination: &str) -> String {
     format!(
-        ".data-mover-{}-{}.stage",
+        "{ARTIFACT_PREFIX}{}-{}.stage",
         &blake3::hash(destination.as_bytes()).to_hex()[..16],
         uuid::Uuid::new_v4().simple()
     )
@@ -21,7 +34,7 @@ pub(crate) fn stage_base<'a>(name: &'a str, destination: &str) -> Option<&'a str
     } else {
         name
     };
-    let body = base.strip_prefix(".data-mover-")?.strip_suffix(".stage")?;
+    let body = base.strip_prefix(ARTIFACT_PREFIX)?.strip_suffix(".stage")?;
     let (target, id) = body.split_once('-')?;
     if !hex(target, 16)
         || !hex(id, 32)
@@ -42,6 +55,17 @@ fn hex(value: &str, length: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_paths_match_any_segment_but_not_lookalikes() {
+        assert!(is_artifact_path(".data-mover-0123-abcd.stage"));
+        assert!(is_artifact_path("dir/.data-mover-stage/"));
+        assert!(is_artifact_path("dir/.data-mover-stage/binding/hash"));
+        assert!(!is_artifact_path("dir/data-mover-file"));
+        assert!(!is_artifact_path("dir/x.data-mover-y"));
+        assert!(!is_artifact_path(".data-mover"));
+        assert!(!is_artifact_path(""));
+    }
 
     #[test]
     fn claimed_names_preserve_the_base_and_reject_wrong_destinations() {

@@ -51,6 +51,7 @@ use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
 use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
+use crate::storage::artifacts::is_artifact_path;
 use crate::storage_enum::{StorageEnum, path_to_s3_key};
 use crate::third_party::hcp::client::HCPRestClient;
 use crate::transfer_concurrency::{
@@ -1905,6 +1906,15 @@ impl S3Storage {
         }
     }
 
+    /// A transfer artifact below the storage root (ADR-0006); listings never report it.
+    fn is_artifact_key(&self, key: &str) -> bool {
+        let artifact = is_artifact_path(self.calculate_relative_path(key));
+        if artifact {
+            trace!("[S3] listing skips transfer artifact {key}");
+        }
+        artifact
+    }
+
     /// 计算相对路径：移除存储的基本前缀和末尾斜杠
     #[inline]
     fn calculate_relative_path<'a>(&self, full_path: &'a str) -> &'a str {
@@ -3528,7 +3538,9 @@ impl S3Storage {
                 }
             };
             for common_prefix in response.common_prefixes() {
-                if let Some(prefix_name) = common_prefix.prefix() {
+                if let Some(prefix_name) = common_prefix.prefix()
+                    && !self.is_artifact_key(prefix_name)
+                {
                     self.process_directory(
                         prefix_name,
                         current_depth,
@@ -3543,7 +3555,7 @@ impl S3Storage {
                 let Some(key) = object.key() else {
                     continue;
                 };
-                if prefix == key {
+                if prefix == key || self.is_artifact_key(key) {
                     continue;
                 }
                 let size = object
@@ -3602,7 +3614,9 @@ impl S3Storage {
                 }
             };
             for common_prefix in response.common_prefixes() {
-                if let Some(prefix_name) = common_prefix.prefix() {
+                if let Some(prefix_name) = common_prefix.prefix()
+                    && !self.is_artifact_key(prefix_name)
+                {
                     self.process_directory(
                         prefix_name,
                         current_depth,
@@ -3616,13 +3630,21 @@ impl S3Storage {
             let versions = response
                 .versions()
                 .iter()
-                .filter(|version| version.key().is_some_and(|key| key != prefix))
+                .filter(|version| {
+                    version
+                        .key()
+                        .is_some_and(|key| key != prefix && !self.is_artifact_key(key))
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             let delete_markers = response
                 .delete_markers()
                 .iter()
-                .filter(|marker| marker.key().is_some_and(|key| key != prefix))
+                .filter(|marker| {
+                    marker
+                        .key()
+                        .is_some_and(|key| key != prefix && !self.is_artifact_key(key))
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             self.process_versioned_entries(VersionedScan {
@@ -3809,6 +3831,9 @@ impl S3Storage {
             let Some(prefix) = prefix.prefix() else {
                 continue;
             };
+            if self.is_artifact_key(prefix) {
+                continue;
+            }
             let relative_path = self.calculate_relative_path(prefix);
             let clean_path = relative_path.trim_end_matches('/');
             if clean_path.is_empty() {
@@ -3874,7 +3899,7 @@ impl S3Storage {
                 let Some(key) = object.key() else {
                     continue;
                 };
-                if key == prefix_key || key.ends_with('/') {
+                if key == prefix_key || key.ends_with('/') || self.is_artifact_key(key) {
                     continue;
                 }
                 let relative_path = self.calculate_relative_path(key);
@@ -4093,7 +4118,7 @@ impl S3Storage {
 
                 // 处理每个 object 的版本
                 for (key, versions) in version_groups {
-                    if key == prefix_key {
+                    if key == prefix_key || self.is_artifact_key(&key) {
                         continue;
                     }
                     self.append_object_versions(
@@ -5048,6 +5073,19 @@ mod tests {
     fn test_build_full_key_without_prefix() {
         let storage = make_test_storage(None);
         assert_eq!(storage.build_full_key("dir/file.txt"), "dir/file.txt");
+    }
+
+    #[test]
+    fn artifact_keys_are_judged_below_the_storage_root() {
+        let storage = make_test_storage(Some("data/"));
+        assert!(storage.is_artifact_key("data/.data-mover-stage/b/h"));
+        assert!(storage.is_artifact_key("data/sub/.data-mover-x/"));
+        assert!(storage.is_artifact_key("data/sub/.data-mover-x/y"));
+        assert!(!storage.is_artifact_key("data/sub/file.data-mover-x"));
+        // A storage root that itself sits inside an artifact still lists its children.
+        let inside = make_test_storage(Some("data/.data-mover-stage/"));
+        assert!(!inside.is_artifact_key("data/.data-mover-stage/x"));
+        assert!(inside.is_artifact_key("data/.data-mover-stage/x/.data-mover-y"));
     }
 
     #[test]

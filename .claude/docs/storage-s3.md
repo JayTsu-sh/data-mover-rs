@@ -118,7 +118,20 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 **本机**文件锁，覆盖整个尝试；跨主机或共享恢复目录不受它保护）决定，且同一目的 key 不会被两个传输并发写
 （terrasync 保证，用户确认）。直接调用 `recover` 的代码要自己保证独占，`claim_token` 对 S3 无意义。修后真机：取消 / SIGKILL
 后续传都成功（200 MiB，读回校验通过），记录随后清除。旧版本在 AWS 上成功 claim 后崩溃留下的 `<temp>.claim`
-对象新代码不再认也不再删：不会自动清理，且对以该 bucket 为源的遍历可见（temp 对象今天也一样）。已知：3 s / 20 MiB/s 中断后只有 1 个分段（8 MiB）可复用，粒度待查。
+对象新代码不再认也不再删：不会自动清理；它和 temp 对象都在 `.data-mover-stage/` 下，legacy 列举已不再报告它们（见下）。已知：3 s / 20 MiB/s 中断后只有 1 个分段（8 MiB）可复用，粒度待查。
+
+### legacy 列举隐藏传输 artifact（ADR-0006 C3）
+
+- `walkdir` / `walkdir_2`（含版本化桶的版本与删除标记）跳过相对存储根的任意一段以 `.data-mover-` 开头的
+  key 与公共前缀（`storage::artifacts::is_artifact_path`），命中打 `trace!`。存储根本身在 artifact 里时照常
+  列举；从根以下的 artifact 内开始遍历（`sub_path = ".data-mover-stage"`）则为空。
+- `delete_dir_all_with_progress` **不**过滤：删目录会连其中的 artifact 一起删，并为它们发 `DeleteEvent`
+  （路径不曾出现在列举里，按删除数与列举数对账会差出这些）。今天 S3 stage 集中在根下 `.data-mover-stage/`，
+  删子目录删不到它的孤儿；同目录 `.upload` 指针要到 C14/C15。
+- 代价：用户自己命名为 `.data-mover-*` 的对象从 S3 源端列举中消失；孤儿 `.data-mover-stage/` 只能用 S3
+  原生工具（或 `resume_matrix.sh` 的清理）看到。
+- 真机（`examples/s3_listing`，2026-09-24）：MinIO / DXN / StorageGRID 非版本化，MinIO / DXN 临时版本化桶，
+  artifact 全部隐藏，普通对象、多版本与删除标记行为不变。
 
 **MinIO 2023 的其他实测行为**：`ListMultipartUploads` 只按**精确 key** 返回（按前缀或整桶都是 0）—— 孤儿上传
 无法按前缀发现，只能靠 key 精确查询或服务端 `stale_uploads_expiry` 回收；Content-MD5 不符 → 400 BadDigest；
