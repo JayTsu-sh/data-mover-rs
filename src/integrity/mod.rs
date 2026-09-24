@@ -21,8 +21,8 @@ use crate::model::{
     StorageTimestamp,
 };
 use crate::storage::{
-    CapabilityUnavailable, Metadata, PreflightPolicy, ReadRequest, ReadSource, SourceDescriptor,
-    Storage, StorageRoleFailure,
+    CapabilityUnavailable, CopiedTimestampTarget, Metadata, PreflightPolicy, ReadRequest,
+    ReadSource, SourceDescriptor, Storage, StorageRoleFailure,
 };
 
 /// Which side of a comparison a fact or failure came from.
@@ -160,6 +160,10 @@ struct Endpoint {
     read_source: std::sync::Arc<dyn ReadSource>,
     metadata: std::sync::Arc<dyn Metadata>,
     path: StoragePath,
+    /// Whether this side's modification time is the copied one. A destination that declares it
+    /// does not store the time (an object store stamps its own) never received the source's, so
+    /// its time is no evidence of a difference.
+    mtime_copied: bool,
 }
 
 impl Endpoint {
@@ -169,11 +173,20 @@ impl Endpoint {
         path: StoragePath,
     ) -> Result<Self, CapabilityUnavailable> {
         let policy = PreflightPolicy::production();
+        let mtime_copied = side == IntegritySide::Source
+            || storage
+                .staged_destination(&policy)
+                .ok()
+                .and_then(|destination| destination.copied_metadata_target())
+                .is_none_or(|target| {
+                    !matches!(target.timestamps, CopiedTimestampTarget::NotStored)
+                });
         Ok(Self {
             side,
             read_source: storage.read_source(&policy)?,
             metadata: storage.metadata(&policy)?,
             path,
+            mtime_copied,
         })
     }
 
@@ -194,6 +207,9 @@ impl Endpoint {
     }
 
     async fn modified(&self) -> Result<ObservedMtime, IntegrityFailure> {
+        if !self.mtime_copied {
+            return Ok(ObservedMtime::Unobservable);
+        }
         let plan = ObservationPlan::default().with_timestamps(ObservationMode::BestEffort);
         let observed = self
             .metadata
@@ -202,8 +218,8 @@ impl Endpoint {
             .map_err(|failure| self.attribute(failure))?;
         Ok(match observed.timestamps() {
             MetadataObservation::Value { value, .. } => ObservedMtime::Observed(value.modified),
-            // The backend cannot report modification time at all (S3 object metadata has no
-            // neutral mtime family). That is not evidence of a difference.
+            // The backend cannot report modification time at all. That is not evidence of a
+            // difference.
             MetadataObservation::NotRequested
             | MetadataObservation::NotApplicable
             | MetadataObservation::Unsupported

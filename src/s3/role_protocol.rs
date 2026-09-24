@@ -9,6 +9,7 @@ use crate::storage::backends::s3::{
     S3NativeCopyEvidence, S3NativeCopyFailure, S3NativeCopyResult, S3NativeCopySource,
     S3ProtocolFailure, S3Result,
 };
+use crate::time_util::http_last_modified;
 
 macro_rules! classify_sdk {
     ($error:expr, $diagnostic:literal) => {
@@ -115,6 +116,9 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             size,
             etag: response.e_tag().unwrap_or_default().to_string(),
             version_id: response.version_id().map(str::to_string),
+            last_modified: response
+                .last_modified()
+                .and_then(|time| http_last_modified(time.secs())),
         })
     }
 

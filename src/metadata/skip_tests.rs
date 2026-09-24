@@ -285,3 +285,35 @@ async fn a_destination_that_stores_nothing_skips_everything_asked_for() {
         assert_eq!(outcome.outcome, expected, "{outcome:?}");
     }
 }
+
+/// A source that gave no time at all has nothing to carry: no empty write, and nothing reported
+/// as applied — nor as skipped, since no end lacked the family.
+#[test]
+fn a_source_with_no_time_carries_no_timestamps() {
+    let observations = MetadataObservations {
+        timestamps: value(TimestampMetadata {
+            accessed: None,
+            modified: None,
+            created: None,
+        }),
+        ..exact_observations()
+    };
+    let plan = compile_metadata_plan(&MetadataPlanRequest {
+        observations: &observations,
+        target: exact_target(),
+        policies: all_exact(),
+        principal_mapper: None,
+    })
+    .unwrap();
+    assert_eq!(
+        decision_for(&plan, MetadataFamily::Timestamps),
+        MappingDecision::NotApplicable
+    );
+    assert!(
+        !plan
+            .mutations
+            .iter()
+            .any(|(family, _)| *family == MetadataFamily::Timestamps)
+    );
+    assert_eq!(plan.skipped(), []);
+}

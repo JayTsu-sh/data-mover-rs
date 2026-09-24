@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{FailureClass, ObjectTag, Transience};
+use crate::model::{FailureClass, ObjectTag, StorageTimestamp, Transience};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum S3ProtocolFailure {
@@ -56,6 +56,9 @@ pub(crate) struct S3ObjectFacts {
     pub size: u64,
     pub etag: String,
     pub version_id: Option<String>,
+    /// The `Last-Modified` the same response gave, so it belongs to this `etag` / `version_id`;
+    /// `None` when the server sent none.
+    pub last_modified: Option<StorageTimestamp>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

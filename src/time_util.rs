@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use filetime::FileTime;
 
+use crate::model::{StorageTimestamp, TimePrecision};
+
 pub(crate) const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 /// Windows FILETIME 纪元 (1601-01-01) 与 Unix 纪元 (1970-01-01) 之间的差，
@@ -51,6 +53,18 @@ pub fn system_time_to_nanos(st: SystemTime) -> i64 {
         Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
         Err(error) => i64::try_from(error.duration().as_nanos()).map_or(i64::MIN, |nanos| -nanos),
     }
+}
+
+/// An object's `Last-Modified` as a timestamp. HTTP dates carry whole seconds, so the precision
+/// is `Seconds` and any fraction a client library reports is dropped rather than invented.
+/// `None` only for a time outside the representable range — never "now" in its place.
+#[must_use]
+pub(crate) fn http_last_modified(secs: i64) -> Option<StorageTimestamp> {
+    StorageTimestamp::new(
+        i128::from(secs) * i128::from(NANOS_PER_SEC),
+        TimePrecision::Seconds,
+    )
+    .ok()
 }
 
 #[inline]
@@ -159,5 +173,19 @@ mod tests {
         // nanos_to_secs(nanos) must fall within [before, after] (same-second or adjacent second)
         let secs_from_nanos = nanos_to_secs(nanos);
         assert!(secs_from_nanos >= before && secs_from_nanos <= after + 1);
+    }
+
+    /// Whole seconds at `Seconds` precision; pre-epoch objects keep their time.
+    #[test]
+    fn http_last_modified_is_whole_seconds() {
+        let Some(value) = http_last_modified(1_700_000_000) else {
+            panic!("a representable time");
+        };
+        assert_eq!(value.unix_nanos(), 1_700_000_000_000_000_000);
+        assert_eq!(value.precision(), TimePrecision::Seconds);
+        assert_eq!(
+            http_last_modified(-1).map(StorageTimestamp::unix_nanos),
+            Some(-1_000_000_000)
+        );
     }
 }

@@ -50,8 +50,11 @@ where
         protocol.clone(),
         identity.clone(),
     ));
-    let metadata: Arc<dyn crate::storage::Metadata> =
-        Arc::new(metadata::S3Metadata::new(protocol.clone(), tag_support));
+    let metadata: Arc<dyn crate::storage::Metadata> = Arc::new(metadata::S3Metadata::new(
+        protocol.clone(),
+        identity.clone(),
+        tag_support,
+    ));
     let staged = Arc::new(
         staged::S3StagedDestination::new(protocol.clone(), identity.clone())
             .with_metadata(Arc::clone(&metadata)),
@@ -110,6 +113,7 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct MemoryS3 {
         version: Mutex<Option<String>>,
+        pub(crate) last_modified: Mutex<Option<crate::model::StorageTimestamp>>,
         range_observations: Mutex<Vec<S3ObjectFacts>>,
         pub(crate) objects: Mutex<HashMap<String, Bytes>>,
         pub(super) uploads: Mutex<UploadParts>,
@@ -144,6 +148,7 @@ pub(crate) mod tests {
                 size: bytes.len() as u64,
                 etag: blake3::hash(bytes).to_hex().to_string(),
                 version_id: self.version.lock().await.clone(),
+                last_modified: *self.last_modified.lock().await,
             })
         }
         async fn get_range(

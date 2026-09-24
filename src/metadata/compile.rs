@@ -279,6 +279,12 @@ fn compile_ownership(
     }
 }
 
+const NO_TIMES: TimestampMetadata = TimestampMetadata {
+    accessed: None,
+    modified: None,
+    created: None,
+};
+
 /// Carries the mode without owner and group, naming why they are not carried.
 fn carry_mode_only(
     plan: &mut MetadataPlan,
@@ -362,6 +368,15 @@ fn compile_timestamps(
             &mut losses,
         ),
     };
+    if losses.is_empty() && mapped == NO_TIMES {
+        // The source gave no time at all (an S3 server that sent no `Last-Modified`): nothing to
+        // carry, and nothing to report as applied.
+        plan.mappings.push(FamilyMapping {
+            family,
+            decision: MappingDecision::NotApplicable,
+        });
+        return Ok(());
+    }
     if losses.is_empty() {
         exact(plan, family, MetadataMutation::Timestamps(mapped));
         return Ok(());

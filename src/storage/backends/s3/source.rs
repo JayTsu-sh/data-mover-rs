@@ -26,7 +26,7 @@ impl<P> S3ReadSource<P> {
     }
 }
 
-fn object_identity(
+pub(super) fn object_identity(
     backend: &BackendIdentity,
     facts: &super::S3ObjectFacts,
 ) -> Result<SourceIdentity, crate::model::ModelValueError> {

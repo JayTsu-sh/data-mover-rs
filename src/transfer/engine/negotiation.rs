@@ -125,8 +125,8 @@ struct MetadataRoles {
 }
 
 /// Both ends' metadata roles, or `None` when an end has none. The copy then goes on without
-/// metadata and without a report — today only a source with no copy baseline (S3, K8), since
-/// every staged destination but a non-unix Local declares a target.
+/// metadata and without a report — today only a non-unix Local, the one role without a copy
+/// baseline or a destination target.
 fn metadata_roles(request: &TransferRequest) -> Option<MetadataRoles> {
     let source = request
         .source

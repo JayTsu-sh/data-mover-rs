@@ -204,7 +204,8 @@ fn timestamps_compare_at_the_coarser_observed_precision() -> Result {
 // ---------------------------------------------------------------------------------------------
 
 /// Read source over one in-memory object, paired with a metadata role that reports timestamps
-/// as `NotApplicable` exactly as the S3 adapter does.
+/// as `NotApplicable` — a backend with no modification time at all. (S3 does report its
+/// `Last-Modified`; see [`an_object_stores_upload_time_so_its_mtime_is_not_compared`].)
 struct TimelessBackend {
     identity: crate::model::BackendIdentity,
     payload: bytes::Bytes,
@@ -330,6 +331,43 @@ async fn a_backend_that_cannot_report_mtime_is_not_a_difference() -> Result {
         cancel: tokio_util::sync::CancellationToken::new(),
     };
     let report = compare(mixed).await?;
+    assert!(report.matches(), "unexpected {:?}", report.differences());
+    Ok(())
+}
+
+/// An S3 destination reports its `Last-Modified`, but that is when the object was written: a copy
+/// never carries the source's time there (the destination declares it `NotStored`). Comparing it
+/// would flag every object ever copied to S3.
+#[tokio::test]
+async fn an_object_stores_upload_time_so_its_mtime_is_not_compared() -> Result {
+    use crate::storage::backends::s3::tests::MemoryS3;
+
+    let fixture = Fixture::new(Some(b"payload"), None)?;
+    let protocol = std::sync::Arc::new(MemoryS3::default());
+    protocol.objects.lock().await.insert(
+        "object.bin".to_owned(),
+        bytes::Bytes::from_static(b"payload"),
+    );
+    *protocol.last_modified.lock().await = Some(StorageTimestamp::new(
+        1_800_000_000_000_000_000,
+        TimePrecision::Seconds,
+    )?);
+    let request = IntegrityRequest {
+        source: storage(fixture.source_root.path(), "integrity-local-source")?,
+        source_path: StoragePath::new("object.bin")?,
+        destination: crate::storage::backends::s3::connect(
+            protocol,
+            BackendIdentity::new(BackendKind::S3, "integrity-s3-destination")?,
+            None,
+        )?,
+        destination_path: StoragePath::new("object.bin")?,
+        options: IntegrityOptions {
+            mode: IntegrityMode::Content,
+            ..IntegrityOptions::default()
+        },
+        cancel: tokio_util::sync::CancellationToken::new(),
+    };
+    let report = compare(request).await?;
     assert!(report.matches(), "unexpected {:?}", report.differences());
     Ok(())
 }

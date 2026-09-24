@@ -62,8 +62,10 @@ Display 如 `ACL skipped: the source cannot read it`。不变式：outcome 为 `
    backend 用 `MetadataObservation::Unsupported` 说「读不了」（进 `skipped()`，带 `SourceCannotObserve`），
    `NotApplicable` 只说「这一条没有」（symlink 上的 ACL，不算跳过），`Failed` 说「读失败」。
    CIFS 源的 xattr 是 `Unsupported`（smb-rs 领域 API 没有 EA 查询，上游请求 S2）。
-   **待修**：S3 源没有拷贝基线（`copied_metadata_observation_plan` 为 `None`），整段元数据都不走，
-   见 K8。
+   S3 源（K8）：拷贝基线是 mtime（对象自己的 `Last-Modified`，秒精度，与 ETag / version 出自同一个 HEAD
+   并校验仍是被描述的那个对象，换了就 `Conflict`；服务端没给就 `modified: None`，**绝不用拷贝时刻**；
+   不看 legacy `x-amz-meta-last-modified`）；owner/mode 是 `NotApplicable`（对象没有，无损失）；
+   要了 ACL / xattr 是 `Unsupported`（`skipped()` 记 `SourceCannotObserve`）。
 3. **目的端能不能存** —— `CopiedMetadataTarget`：`timestamps`（`Stored(精度)` / `NotStored`）、`ownership`、
    `acl`、`xattrs`。
 4. **规划期交叉** —— `compile_copied_metadata_plan` 按上表裁决。
@@ -75,7 +77,7 @@ Display 如 `ACL skipped: the source cannot read it`。不变式：outcome 为 `
 `DestinationCannotStore`。报告如 `timestamps skipped: the destination cannot store it`。此前 S3 目的端没声明
 target，整段元数据无声跳过、连报告都没有。只存一部分的目的端若 `NotStored` mtime，走正常观测路径，
 mtime 按 `BestEffort` 规划 → 同样记跳过，不让文件失败。
-源端没有元数据角色（今天的 S3 源）时仍整段跳过（K8）。
+源端没有拷贝基线时整段跳过、没有报告 —— K8 之后只剩非 unix 的 Local 源。
 
 **已知不一致**（后续单独 commit，需 FAS2750）：同样声明 `CopiedOwnershipTarget::Unsupported`，CIFS 目的端的
 owner/group/mode 记成**损失** `OwnershipModeDropped`（走 `OwnershipTarget::NotApplicable`），S3 目的端记成
@@ -89,6 +91,7 @@ owner/group/mode 记成**损失** `OwnershipModeDropped`（走 `OwnershipTarget:
 | Local | unix 下数字（作目的端时逐文件问能不能设这个 owner，见下节） | unix 下 `Posix` | unix 下支持 | 非 unix 整体不参与拷贝 |
 | CIFS | 读不到（`NotApplicable`） | `WindowsSecurityDescriptor`（只保留 account 类 ACE） | 不支持 | `cifs/metadata.rs` 的 decode 只认这一种 |
 | HDFS | 字符串，走「只有 mode」（`OwnerAndGroupDropped`） | 不支持 | 不支持 | 观测侧也一律 `unavailable` |
+| S3（源端） | 没有（`NotApplicable`）；mtime 读 `Last-Modified`（秒） | 读不了 | 读不了 | 每文件一次绑定身份的 HEAD |
 | S3（目的端） | 存不了（跳过，`DestinationCannotStore`） | 存不了 | 存不了 | `stores_nothing()`，mtime 也 `NotStored` |
 
 ### 目的端没有 chown 特权（K5，Local）
