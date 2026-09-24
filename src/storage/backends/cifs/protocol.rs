@@ -414,7 +414,7 @@ fn is_not_found(error: &smb_domain::Error) -> bool {
         )
 }
 
-fn is_collision(error: &smb_domain::Error) -> bool {
+pub(super) fn is_collision(error: &smb_domain::Error) -> bool {
     error_status(error) == Some(STATUS_OBJECT_NAME_COLLISION)
 }
 
@@ -455,6 +455,25 @@ impl CifsStagedProtocol for SmbDomainProtocol {
         let metadata = file.opened_metadata();
         close_file(file).await?;
         Ok(metadata.len())
+    }
+
+    async fn stat(&self, path: &StoragePath) -> smb_domain::Result<(bool, u64)> {
+        let path = self.share_path(path)?;
+        // Opened for attributes only and without following a link: the facade refuses a reparse
+        // point, which is never a regular file here.
+        let resource = match self
+            .share
+            .open_metadata(&path, smb_domain::MetadataOpenOptions::default())
+            .await
+        {
+            Ok(resource) => resource,
+            Err(smb_domain::Error::UnsupportedOperation(_)) => return Ok((false, 0)),
+            Err(error) => return Err(error),
+        };
+        let file = matches!(resource, smb_domain::Resource::File(_));
+        let metadata = resource.opened_metadata();
+        close_resource(resource).await?;
+        Ok((file, metadata?.len()))
     }
 
     async fn rename(

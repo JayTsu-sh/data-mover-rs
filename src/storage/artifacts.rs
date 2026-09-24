@@ -152,13 +152,6 @@ pub(crate) fn artifact_temporary_name(final_name: &str, kind: ArtifactKind) -> S
 /// `/` is the only separator here. A backend whose native paths also treat `\` as one (CIFS,
 /// Windows Local) must refuse or split such final paths itself, or the artifacts would land outside
 /// the final file's parent.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "for destinations that address artifacts by storage path, ADR-0006 C11"
-    )
-)]
 pub(crate) fn sibling_artifact(
     final_path: &StoragePath,
     kind: ArtifactKind,

@@ -96,7 +96,8 @@ pub(super) async fn write(
     if let Some(error) = failure {
         return Err(error);
     }
-    if stage.durable_publication {
+    // A recorded prefix must be flushed data, whether or not publication asks for durability.
+    if stage.durable_publication || stage.recovery_enabled() {
         file.flush()
             .await
             .map_err(|e| classify(path, Operation::Write, &e))?;
@@ -117,6 +118,13 @@ pub(super) async fn save(
         .await
         .map_err(|e| classify(stage.final_destination.path(), Operation::Write, &e))?;
     checkpoint::persist(adapter, stage, offset).await?;
+    if stage.at_destination {
+        // The pointer is the whole recovery record; nothing registers where data-mover runs.
+        stage
+            .recovery_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
+        return Ok(());
+    }
     if !stage.recovery_enabled() {
         let deferred = stage.deferred_checkpoint.as_ref().ok_or_else(|| {
             entry_failure(

@@ -285,7 +285,8 @@ impl<'a> Writer<'a> {
         {
             return Err(self.invalid());
         }
-        if self.stage.durable_publication {
+        // A recorded prefix must be flushed data, whether or not publication asks for durability.
+        if self.stage.durable_publication || self.stage.recovery_enabled() {
             self.file.flush().await.map_err(|error| {
                 classify(
                     self.stage.final_destination.path(),

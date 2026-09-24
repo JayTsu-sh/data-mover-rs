@@ -26,6 +26,8 @@ struct MemoryProtocol {
     writes: Arc<Mutex<Vec<(u64, usize)>>>,
     fail_rename_after_commit: AtomicBool,
     fail_checkpoint_delete: AtomicBool,
+    /// Every flushed path, in order.
+    flushed: Arc<Mutex<Vec<String>>>,
 }
 
 struct MemoryFile {
@@ -36,6 +38,7 @@ struct MemoryFile {
     activity: Arc<WriteActivity>,
     closes: Arc<AtomicUsize>,
     writes: Arc<Mutex<Vec<(u64, usize)>>>,
+    flushed: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Default)]
@@ -110,6 +113,10 @@ impl CifsStageFile for MemoryFile {
             "FLUSH raced an outstanding write"
         );
         self.flushes.fetch_add(1, Ordering::SeqCst);
+        self.flushed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(self.path.clone());
         if self.fail_flush.load(Ordering::SeqCst) {
             return Err(smb_domain::Error::InvalidState(
                 "injected FLUSH failure".into(),
@@ -156,6 +163,7 @@ impl CifsStagedProtocol for MemoryProtocol {
             activity: self.activity.clone(),
             closes: Arc::clone(&self.closes),
             writes: Arc::clone(&self.writes),
+            flushed: Arc::clone(&self.flushed),
         }))
     }
 
@@ -799,6 +807,9 @@ async fn committed_cleanup_is_retryable_and_preserves_final_file()
 
 #[path = "metadata_stage_tests.rs"]
 mod metadata_stage_tests;
+
+#[path = "at_destination_tests.rs"]
+mod at_destination_tests;
 
 #[allow(clippy::unwrap_used)]
 #[path = "positioned_tests.rs"]

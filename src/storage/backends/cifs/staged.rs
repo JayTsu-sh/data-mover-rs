@@ -32,6 +32,11 @@ pub(super) trait CifsStagedProtocol: Send + Sync {
     async fn create_empty(&self, path: &StoragePath) -> smb_domain::Result<()>;
     async fn open(&self, path: &StoragePath) -> smb_domain::Result<Box<dyn CifsStageFile>>;
     async fn size(&self, path: &StoragePath) -> smb_domain::Result<u64>;
+    /// Whether `path` is a regular file (not a directory or reparse point), and its size. The
+    /// default treats whatever `size` answers for as a file.
+    async fn stat(&self, path: &StoragePath) -> smb_domain::Result<(bool, u64)> {
+        self.size(path).await.map(|size| (true, size))
+    }
     async fn rename(
         &self,
         from: &StoragePath,
@@ -44,7 +49,9 @@ pub(super) trait CifsStagedProtocol: Send + Sync {
 #[derive(Default)]
 pub(super) struct CifsStageState {
     pub(super) checkpoint_created: std::sync::atomic::AtomicBool,
-    published: std::sync::atomic::AtomicBool,
+    pub(super) published: std::sync::atomic::AtomicBool,
+    /// Set for a stage kept at the destination (ADR-0006): its pointer's nonce and identity.
+    pub(super) fence: Option<super::at_destination::Fence>,
 }
 
 pub(super) fn state(stage: &PreparedStage) -> Result<&CifsStageState, StorageRoleFailure> {
@@ -93,7 +100,14 @@ impl CifsStagedDestination {
         self
     }
 
-    fn stage_path(&self, stage: &PreparedStage) -> Result<StoragePath, StorageRoleFailure> {
+    pub(super) const fn identity(&self) -> &BackendIdentity {
+        &self.identity
+    }
+
+    pub(super) fn stage_path(
+        &self,
+        stage: &PreparedStage,
+    ) -> Result<StoragePath, StorageRoleFailure> {
         stage.validate_owner(&self.identity).map_err(|_| {
             entry_failure(
                 stage.final_destination.path(),
@@ -113,17 +127,20 @@ impl CifsStagedDestination {
                 FailureClass::Conflict,
             ));
         }
+        if stage.at_destination {
+            return super::at_destination::stage_path(stage);
+        }
         token_path(&stage.token, stage.final_destination.path())
     }
 
-    fn claim(&self, token: Bytes) -> bool {
+    pub(super) fn claim(&self, token: Bytes) -> bool {
         self.owned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(token)
     }
 
-    fn release(&self, token: &Bytes) {
+    pub(super) fn release(&self, token: &Bytes) {
         self.owned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -189,6 +206,25 @@ impl CifsStagedDestination {
         Ok(*hasher.finalize().as_bytes())
     }
 
+    /// Removes what recorded the stage's durable prefix: the pointer of a stage kept at the
+    /// destination, or the checkpoint record of one kept in the local store.
+    async fn remove_recovery_record(
+        &self,
+        stage: &PreparedStage,
+        stage_path: &StoragePath,
+    ) -> Result<(), StorageRoleFailure> {
+        if stage.at_destination {
+            return super::at_destination::remove_pointer(self, stage).await;
+        }
+        if state(stage)?
+            .checkpoint_created
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            super::checkpoint::remove(self, stage_path).await?;
+        }
+        Ok(())
+    }
+
     async fn reconcile_rename(
         &self,
         stage: &PreparedStage,
@@ -216,18 +252,12 @@ impl CifsStagedDestination {
                 .map_err(publication_unchanged)?
                 .published
                 .store(true, std::sync::atomic::Ordering::Release);
-            if state(stage)
-                .map_err(publication_unchanged)?
-                .checkpoint_created
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                super::checkpoint::remove(self, stage_path)
-                    .await
-                    .map_err(|error| PublicationFailure {
-                        error,
-                        final_destination_changed: true,
-                    })?;
-            }
+            self.remove_recovery_record(stage, stage_path)
+                .await
+                .map_err(|error| PublicationFailure {
+                    error,
+                    final_destination_changed: true,
+                })?;
             self.release(&stage.token);
             return Ok(published(final_path));
         }
@@ -311,6 +341,13 @@ impl StagedDestination for CifsStagedDestination {
                 FailureClass::Protocol,
             )
         })
+    }
+
+    async fn prepare_at_destination(
+        &self,
+        request: crate::storage::DestinationPrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        super::at_destination::prepare(self, request).await
     }
 
     async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
@@ -448,7 +485,9 @@ impl StagedDestination for CifsStagedDestination {
         stage: &PreparedStage,
     ) -> Result<CheckpointObservation, StorageRoleFailure> {
         let path = self.stage_path(stage)?;
-        let durable_prefix = if stage.recovery_enabled() {
+        let durable_prefix = if stage.at_destination && stage.recovery_enabled() {
+            super::at_destination::reobserve(self, stage).await?
+        } else if stage.recovery_enabled() {
             super::checkpoint::load(self, &path, &stage.recovery_binding).await?
         } else {
             self.protocol
@@ -539,6 +578,11 @@ impl StagedDestination for CifsStagedDestination {
                 FailureClass::Cancelled,
             )));
         }
+        if stage.at_destination {
+            super::at_destination::before_publication(self, stage)
+                .await
+                .map_err(publication_unchanged)?;
+        }
         let rename = self
             .protocol
             .rename(&path, stage.final_destination.path(), true)
@@ -550,18 +594,12 @@ impl StagedDestination for CifsStagedDestination {
             .map_err(publication_unchanged)?
             .published
             .store(true, std::sync::atomic::Ordering::Release);
-        if state(stage)
-            .map_err(publication_unchanged)?
-            .checkpoint_created
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            super::checkpoint::remove(self, &path)
-                .await
-                .map_err(|error| PublicationFailure {
-                    error,
-                    final_destination_changed: true,
-                })?;
-        }
+        self.remove_recovery_record(stage, &path)
+            .await
+            .map_err(|error| PublicationFailure {
+                error,
+                final_destination_changed: true,
+            })?;
         self.release(&stage.token);
         Ok(published(stage.final_destination.path()))
     }
@@ -574,6 +612,9 @@ impl StagedDestination for CifsStagedDestination {
                 FailureClass::Conflict,
             )
         })?;
+        if stage.at_destination {
+            return super::at_destination::discard(self, &stage).await;
+        }
         let published = state(&stage)?
             .published
             .load(std::sync::atomic::Ordering::Acquire);
@@ -610,7 +651,7 @@ impl StagedDestination for CifsStagedDestination {
 /// gives a CIFS path: a `\` would add a directory level on the server (and put the artifacts
 /// named after the file somewhere else), and a `:` would name an alternate data stream. Empty, `.`
 /// and `..` segments and any transfer-artifact segment are refused too.
-fn validate_final(path: &StoragePath) -> Result<(), StorageRoleFailure> {
+pub(super) fn validate_final(path: &StoragePath) -> Result<(), StorageRoleFailure> {
     let text = path.as_str();
     if text.is_empty()
         || text

@@ -389,7 +389,7 @@ pub(super) fn entry_failure(
     )
 }
 
-fn entry_failure_with_transience(
+pub(super) fn entry_failure_with_transience(
     path: &StoragePath,
     operation: Operation,
     class: FailureClass,

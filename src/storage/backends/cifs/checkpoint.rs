@@ -29,6 +29,9 @@ pub(super) async fn persist(
     stage: &PreparedStage,
     prefix: u64,
 ) -> Result<(), StorageRoleFailure> {
+    if stage.at_destination {
+        return super::at_destination::write_pointer(adapter, stage, prefix, false).await;
+    }
     let stage_path = token_path(&stage.token, stage.final_destination.path())?;
     let checkpoint = path(&stage_path)?;
     let temporary = StoragePath::new(crate::storage::artifacts::temporary_name(
@@ -61,7 +64,8 @@ pub(super) async fn persist(
     Ok(())
 }
 
-async fn write_record(
+/// Creates `path` and writes `bytes` to it, flushed before it is closed.
+pub(super) async fn write_record(
     adapter: &CifsStagedDestination,
     path: &StoragePath,
     mut bytes: Bytes,
