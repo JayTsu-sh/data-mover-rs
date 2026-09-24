@@ -19,6 +19,23 @@ and of the architecture document's §10 once C21 lands.
   `.claude/docs/storage-s3.md`).
 - Versioned S3 buckets need exact per-version handling on both ends.
 
+### Baseline before the change (C2, 2026-09-24)
+
+`.claude/skills/_shared/resume_matrix.sh` with 200 MiB, the first run limited to 20 MiB/s and cut at
+6 s (cancel, then SIGKILL) — about 100 MiB streamed, one local recovery record written — then every
+local file deleted and the transfer resumed from a fresh process with a fresh `HOME`, read-back off.
+
+| Destination | Resume | Source bytes streamed by the resume | Left at the destination per interruption |
+|---|---|---|---|
+| Local | ok | 200 MiB of 200 MiB | stage + checkpoint + claim |
+| NFS (ONTAP, v4.1) | ok | 200 MiB of 200 MiB | stage + checkpoint |
+| CIFS (FAS2750) | ok | 200 MiB of 200 MiB | stage + checkpoint |
+| S3 (MinIO `RELEASE.2023-03-20`) | ok | 200 MiB of 200 MiB | one open multipart upload |
+
+Nothing is reused and the leftovers accumulate. Local, NFS and CIFS leftovers are `.data-mover-*`
+siblings a directory listing finds; the S3 upload is not an object and MinIO lists uploads only by
+exact key, so only the lost local record named it. HDFS runs on the lab runner and is recorded with C12.
+
 ## Decision
 
 ### Nothing is kept where data-mover runs

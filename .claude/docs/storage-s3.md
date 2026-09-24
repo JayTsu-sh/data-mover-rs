@@ -95,7 +95,7 @@ match aws_sdk_s3::operation::get_object::GetObjectError::from(...) {
 
 ### 目的端写入策略基线（C0，改造前，2026-09-24，VM 102 MinIO RELEASE.2023-03-20）
 
-`bash .claude/skills/e2e-s3/scripts/staged_matrix.sh`（驱动 `examples/s3_staged_copy.rs`，只写/删 `staged-<run>/`）。
+`bash .claude/skills/e2e-s3/scripts/staged_matrix.sh`（驱动 `examples/transfer_resume.rs`，只写/删 `staged-<run>/`）。
 今天所有策略都是「temp key 分段上传 → CopyObject 到 final → 删 temp」，1 KiB 也不例外。
 
 | 用例 | 结果 / 耗时 |

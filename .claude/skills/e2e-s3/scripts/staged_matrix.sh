@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Role-based S3 write-strategy matrix against a real server (examples/s3_staged_copy.rs).
+# Role-based S3 write-strategy matrix against a real server (examples/transfer_resume.rs).
 # Prints one line per case plus what it left behind (stage objects, incomplete multipart uploads),
 # then removes everything under its own prefix. Not an assertion suite: it records a baseline to
 # compare write strategies across commits.
@@ -10,28 +10,35 @@ set -u
 ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$ROOT"
 set -a; . .claude/skills/e2e-s3/.env; set +a
+# `a-bucket` holds Milvus data on the lab MinIO; never write there.
+[ "${S3_BUCKET:-}" = a-bucket ] && { echo "refusing to write to bucket a-bucket" >&2; exit 1; }
 RUN=${RUN:-$(date +%s)}
 PREFIX=staged-$RUN
 WORK=/tmp/data-mover-s3-staged-$RUN
 export DATA_MOVER_RECOVERY_DIR=$WORK/recovery
 mkdir -p "$WORK/src" "$DATA_MOVER_RECOVERY_DIR"
-BIN=target/debug/examples/s3_staged_copy
-cargo build -q --example s3_staged_copy 2>&1 | grep -v -e binrw -e future-incompat -e '^note'
-B="http://$S3_HOST/$S3_BUCKET"
+BIN=target/debug/examples/transfer_resume
+build=$(cargo build -q --example transfer_resume 2>&1) || { echo "$build" >&2; exit 1; }
+SCHEME=http; [ "${S3_USE_HTTPS:-}" = true ] && SCHEME=https
+B="$SCHEME://$S3_HOST/$S3_BUCKET"
 SIG=(--aws-sigv4 "aws:amz:us-east-1:s3" --user "$S3_AK:$S3_SK")
 
 stage_objects() { curl -s "${SIG[@]}" "$B?list-type=2&prefix=$PREFIX/" | grep -o '<Key>[^<]*</Key>' | grep -c '\.data-mover-stage/'; }
 # MinIO 2023 lists multipart uploads only for an exact key, so a prefix count is 0 there whatever
 # exists; the interrupt cases below read the exact key and upload id from the recovery record.
 open_uploads() { curl -s "${SIG[@]}" "$B?uploads&prefix=$PREFIX/" | grep -c '<UploadId>'; }
-# The S3 recovery identity inside a record is the stage token `<key>\0<upload id>`; reads it exactly
+# The S3 recovery identity inside a record is the stage token `<key>\0<upload id>`, stored behind a
+# 4-byte little-endian length; reads exactly that many bytes
 # (a `strings` scrape of the binary record can pick up the wrong run of printable bytes).
 record_token() { # record -> "key upload_id"
   python3 - "$1" <<'PY'
-import re, sys
+import sys
 data = open(sys.argv[1], 'rb').read()
-m = re.search(rb'(\.data-mover-stage/[0-9a-f]{64}/[0-9a-f]{64})\x00([A-Za-z0-9+/=_.-]+)', data)
-print(f"{m.group(1).decode()} {m.group(2).decode()}" if m else "")
+start = data.find(b'.data-mover-stage/')
+# The stage token `<key>\0<upload id>` is stored with a 4-byte little-endian length in front.
+token = data[start:start + int.from_bytes(data[start - 4:start], 'little')] if start >= 4 else b''
+key, _, upload = token.partition(b'\0')
+print(f"{key.decode()} {upload.decode()}" if key and upload else "")
 PY
 }
 # Parts of the upload a recovery record points at: "<parts>" or "gone" (NoSuchUpload), "none" (no record).
