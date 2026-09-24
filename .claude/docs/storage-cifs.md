@@ -190,8 +190,7 @@ result
   记录前缀前都 FLUSH，不论 durable_publication）；经 `at_destination::write_record`（建、写、FLUSH、关）再 rename 覆盖。
 - nonce 围栏同 NFS：续传先重写指针接管；之后每次重写指针、发布 rename 前、清理前读回比对，不同 → `Conflict`（永久）。
 - **不截断**：门面不能设 EOF，续传从前缀重写到源大小。stage 只有被 data-mover 之外的东西写过才会更长（绑定钉住
-  源大小）；开读回校验时报 Corruption 被 `54f7bfb` 清理，**关读回时多出的尾巴会被发布** —— 待补：prepare 时拒绝
-  比源大的 stage。升级前在途的旧格式 CIFS 传输不会续传，需排空（D6）。
+  源大小）；这样的 stage 在 prepare 时按 `Restarted{StageBeyondSource}` 清理（C12a 决策表新行，所有后端）。升级前在途的旧格式 CIFS 传输不会续传，需排空（D6）。
 - `stat` 用 `open_metadata`（只读属性、不跟随链接，reparse point 被门面拒绝 → 不是普通文件）；读指针按 stat 的大小
   精确读（SMB 在文件尾读报错，不返回空）。
 - 最终路径含 `\`、`:`、空 / `.` / `..` 段或 artifact 段 → `InvalidInput`（C11a）。

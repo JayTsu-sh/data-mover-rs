@@ -15,6 +15,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 const BINDING: [u8; 32] = [1; 32];
 const IDENTITY: [u8; 32] = [2; 32];
 const PREFIX: u64 = 100;
+const SOURCE_SIZE: u64 = 1000;
 
 fn request(resume: ResumeMode) -> Result<DestinationPrepareRequest, Box<dyn std::error::Error>> {
     let path = StoragePath::new("dir/file.bin")?;
@@ -26,7 +27,7 @@ fn request(resume: ResumeMode) -> Result<DestinationPrepareRequest, Box<dyn std:
     Ok(DestinationPrepareRequest::new(
         PrepareRequest {
             final_destination: FinalDestination::new(path.clone()),
-            source: SourceDescriptor::new(path, EntryKind::File, Some(1000), identity),
+            source: SourceDescriptor::new(path, EntryKind::File, Some(SOURCE_SIZE), identity),
             recovery_binding: BINDING,
         },
         IDENTITY,
@@ -61,6 +62,7 @@ fn expected(
     pointer: PointerCase,
     stage: Option<u64>,
     prefix: Option<u64>,
+    continues: bool,
 ) -> Result<Option<u64>, RestartReason> {
     use PointerCase as P;
     use RestartReason as R;
@@ -77,8 +79,12 @@ fn expected(
         (P::Same, Some(_)) => {}
     }
     let stage = stage.unwrap_or(0);
+    if stage > SOURCE_SIZE {
+        return Err(R::StageBeyondSource);
+    }
     match prefix {
         Some(prefix) if stage < prefix => Err(R::StageBehindPointer),
+        Some(_) if continues => Ok(Some(stage)),
         Some(prefix) => Ok(Some(prefix)),
         None => Ok(Some(stage)),
     }
@@ -96,8 +102,17 @@ fn the_decision_table_matches_the_adr_in_every_combination() -> TestResult {
             PointerCase::OtherIdentity,
             PointerCase::OtherTransferBoth,
         ] {
-            for stage in [None, Some(PREFIX - 1), Some(PREFIX), Some(PREFIX + 1)] {
-                for prefix in [Some(PREFIX), None] {
+            for stage in [
+                None,
+                Some(PREFIX - 1),
+                Some(PREFIX),
+                Some(PREFIX + 1),
+                Some(SOURCE_SIZE),
+                Some(SOURCE_SIZE + 1),
+            ] {
+                for (prefix, continues) in
+                    [(Some(PREFIX), false), (Some(PREFIX), true), (None, false)]
+                {
                     let found_pointer = match case {
                         PointerCase::Absent => FoundPointer::Absent,
                         PointerCase::Corrupt => FoundPointer::Corrupt,
@@ -118,6 +133,7 @@ fn the_decision_table_matches_the_adr_in_every_combination() -> TestResult {
                         &Found {
                             pointer: found_pointer,
                             stage_bytes: stage,
+                            continues_from_stage: continues,
                         },
                         &request,
                     );
@@ -128,13 +144,31 @@ fn the_decision_table_matches_the_adr_in_every_combination() -> TestResult {
                     };
                     assert_eq!(
                         got,
-                        expected(mode, case, stage, prefix),
-                        "{mode:?} {case:?} stage={stage:?} prefix={prefix:?}"
+                        expected(mode, case, stage, prefix, continues),
+                        "{mode:?} {case:?} stage={stage:?} prefix={prefix:?} continues={continues}"
                     );
                 }
             }
         }
     }
+    Ok(())
+}
+
+/// A source of unknown size never triggers the beyond-source row: the stage's length has nothing to
+/// be compared with, so the old result stands.
+#[test]
+fn an_unknown_source_size_skips_the_beyond_source_row() -> TestResult {
+    let mut request = request(ResumeMode::Discover)?;
+    request.prepare.source.size = None;
+    let decision = decide(
+        &Found {
+            pointer: FoundPointer::Present(pointer(BINDING, IDENTITY, Some(PREFIX))),
+            stage_bytes: Some(SOURCE_SIZE + 1),
+            continues_from_stage: false,
+        },
+        &request,
+    );
+    assert!(matches!(decision, Decision::Resume(point) if point.prefix == PREFIX));
     Ok(())
 }
 

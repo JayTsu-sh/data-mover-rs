@@ -199,6 +199,14 @@ in-place write goes ahead, leaving the leftovers. Something that is not a file a
 `Conflict`, as at the stage and pointer names. Random-name stages from before C8, and artifacts under another spelling on a
 case-insensitive volume, are left to the drain-before-upgrade rule and `delete_tree`.
 
+As built (C12a): the decision table gains two rules for every backend. A stage longer than the source
+(`prepare.source.size`, when known) is cleaned up as `Restarted { StageBeyondSource }` — a row after
+the binding check and before `StageBehindPointer`; the binding
+pins the source's size and a writer stops there, so only an outside writer makes it longer. And a
+backend may opt in (`continues_from_stage`) to resuming from the length its stage proves rather than
+from the pointer's prefix, which stays a lower bound (`StageBehindPointer` still applies): only for a
+stage whose length is itself proven and that cannot be shortened — HDFS after lease recovery.
+
 As built (C10, NFS): the NFS destination keeps `.data-mover-<d>.stage` and `.data-mover-<d>.pointer`
 (through the fixed `.tmp`) beside the final file and no claim file: NFS has no lock every host honours.
 The pointer's extension is `DMNSTG01` followed by a 16-byte nonce drawn at every prepare; its durable
@@ -222,9 +230,8 @@ follow-up that needs a new facade API. The pointer records only flushed bytes (b
 before it, whether or not publication asks for durability). The facade cannot shorten a file, so a
 resume does not truncate: the writer rewrites from the prefix to the source's size. A stage can only
 be longer than that if something outside data-mover wrote to it (the binding pins the source size,
-and the writers stop there); with read-back verification such a stage fails as `Corruption` and is
-cleaned up, without it the extra tail would be published — a missing safeguard to add (refuse a stage
-longer than the source at prepare). CIFS transfers in flight at the upgrade (random-name stages,
+and the writers stop there); such a stage is cleaned up at prepare (`Restarted { StageBeyondSource }`,
+a decision-table row added in C12a for every backend) instead of being resumed. CIFS transfers in flight at the upgrade (random-name stages,
 `.checkpoint`, `.claim-*`, local store records) are not resumed: drain before upgrading (D6). Artifact names are checked
 without following links (`open_metadata`: a reparse point is not a regular file). Final paths with a
 backslash, a colon, or an empty, `.`, `..` or artifact segment are refused (C11a). Verified on the

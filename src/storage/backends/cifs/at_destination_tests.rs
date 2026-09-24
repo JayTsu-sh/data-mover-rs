@@ -380,3 +380,38 @@ fn cifs_keeps_recovery_at_the_destination() -> TestResult {
     assert!(adapter(&protocol, &backend).recovery_at_destination());
     Ok(())
 }
+
+/// SMB cannot shorten a stage, so a stage that something outside data-mover made longer than the
+/// source is cleaned up at prepare rather than resumed (its tail would otherwise be published when
+/// read-back verification is off).
+#[tokio::test]
+async fn a_stage_longer_than_the_source_is_not_resumed() -> TestResult {
+    let (protocol, backend) = share()?;
+    let first = adapter(&protocol, &backend);
+    let stage = first
+        .prepare_at_destination(request(&backend, 6, BINDING, ResumeMode::Discover)?)
+        .await?;
+    write(&first, &stage, b"abc").await?;
+    drop(stage);
+    put(
+        &protocol,
+        &name(ArtifactKind::Stage, false),
+        b"abcdefXYZ".to_vec(),
+    );
+    let fresh = adapter(&protocol, &backend);
+    let stage = fresh
+        .prepare_at_destination(request(&backend, 6, BINDING, ResumeMode::Discover)?)
+        .await?;
+    assert_eq!(
+        stage.prepare_fact(),
+        PrepareFact::Restarted {
+            reason: RestartReason::StageBeyondSource
+        }
+    );
+    assert_eq!(
+        file(&protocol, &name(ArtifactKind::Stage, false)),
+        Some(Vec::new())
+    );
+    fresh.discard(stage).await?;
+    Ok(())
+}

@@ -848,7 +848,8 @@ async fn recovered_stage_with_no_remaining_input_removes_uncheckpointed_tail() -
     std::fs::OpenOptions::new()
         .write(true)
         .open(&path)?
-        .set_len(128)?;
+        // A torn tail past the durable prefix, still within the source's nine bytes.
+        .set_len(9)?;
     drop(stage);
     let recovered = ok(resume_stage(&adapter, request(&backend, "final.bin")).await);
     // Resuming already drops what lies past the durable prefix; writing nothing keeps it so.

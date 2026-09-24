@@ -12,8 +12,9 @@
 //! | a stage without a pointer | clean up, start from zero (`StageWithoutPointer`) |
 //! | another transfer's pointer | clean up, start from zero (`OtherTransfer`) |
 //! | this transfer, another binding (the source changed) | clean up, start from zero (`BindingChanged`) |
+//! | a stage longer than the source (when its size is known) | clean up, start from zero (`StageBeyondSource`) |
 //! | a stage proving less than the pointer's prefix | clean up, start from zero (`StageBehindPointer`) |
-//! | otherwise | resume from the durable prefix |
+//! | otherwise | resume from the durable prefix — or, for a backend that opts in (`continues_from_stage`), from the length the stage proves |
 //!
 //! The identity is checked before the binding because the binding hashes the identity: another
 //! transfer's pointer differs in both.
@@ -78,6 +79,9 @@ pub enum RestartReason {
     StageWithoutPointer,
     /// The stage holds less than the pointer's durable prefix.
     StageBehindPointer,
+    /// The stage holds more than the source has: something other than this transfer wrote to it
+    /// (the binding pins the source's size, and a writer stops there).
+    StageBeyondSource,
 }
 
 /// A prepare that looks at the destination first.
@@ -139,6 +143,9 @@ pub(crate) struct Found {
     /// The prefix the stage durably proves (see [`DestinationArtifacts::observe_stage`]), or
     /// `None` without a stage.
     pub(crate) stage_bytes: Option<u64>,
+    /// Whether a resume continues from `stage_bytes` rather than from the pointer's prefix
+    /// (see [`DestinationArtifacts::continues_from_stage`]).
+    pub(crate) continues_from_stage: bool,
 }
 
 /// What to do about it.
@@ -174,8 +181,17 @@ pub(crate) fn decide(found: &Found, request: &DestinationPrepareRequest) -> Deci
         return clean(RestartReason::BindingChanged);
     }
     let stage_bytes = found.stage_bytes.unwrap_or(0);
+    if request
+        .prepare
+        .source
+        .size
+        .is_some_and(|size| stage_bytes > size)
+    {
+        return clean(RestartReason::StageBeyondSource);
+    }
     let prefix = match pointer.durable_prefix {
         Some(prefix) if stage_bytes < prefix => return clean(RestartReason::StageBehindPointer),
+        Some(_) if found.continues_from_stage => stage_bytes,
         Some(prefix) => prefix,
         None => stage_bytes,
     };
@@ -210,6 +226,13 @@ pub(crate) trait DestinationArtifacts: Send + Sync {
     /// a durable prefix, so a file length is never taken as the resume offset.
     fn accepts_pointer(&self, _pointer: &DestinationPointer) -> bool {
         true
+    }
+    /// Whether a resume continues from the length `observe_stage` proves rather than from the
+    /// pointer's prefix. Only for a backend whose stage length is itself proven — HDFS after lease
+    /// recovery, where bytes past the last hsync were acknowledged by the whole pipeline — and
+    /// which cannot shorten the stage to the prefix. The pointer's prefix stays a lower bound.
+    fn continues_from_stage(&self) -> bool {
+        false
     }
 }
 
@@ -250,6 +273,7 @@ pub(crate) async fn discover(
     let found = Found {
         pointer,
         stage_bytes: artifacts.observe_stage(final_path).await?,
+        continues_from_stage: artifacts.continues_from_stage(),
     };
     match decide(&found, request) {
         Decision::Fresh => Ok(Discovery {
