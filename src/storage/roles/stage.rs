@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use super::{FinalDestination, RecoveryIdentity, StorageRoleFailure};
+use crate::storage::PrepareFact;
 
 /// Opaque linear prepared destination state bound to one backend and final destination.
 pub struct PreparedStage {
@@ -24,6 +25,12 @@ pub struct PreparedStage {
     pub(crate) backend_state: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     pub(crate) claim: std::sync::Mutex<Option<std::fs::File>>,
     pub(crate) recovery_lease: std::sync::Mutex<Option<std::sync::Arc<std::fs::File>>>,
+    /// What prepare found at the destination and did about it.
+    pub(crate) prepare_fact: PrepareFact,
+    /// Whether this stage keeps its recovery state at the destination, not in the local store.
+    pub(crate) at_destination: bool,
+    /// An exclusivity lease held for as long as the stage lives (the engine's per-key guard).
+    pub(crate) exclusive: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 #[allow(dead_code)]
@@ -54,7 +61,21 @@ impl PreparedStage {
             backend_state: None,
             claim: std::sync::Mutex::new(claim),
             recovery_lease: std::sync::Mutex::new(None),
+            prepare_fact: PrepareFact::Fresh,
+            at_destination: false,
+            exclusive: None,
         }
+    }
+
+    /// Marks a stage prepared at the destination, with what its prepare found.
+    pub(crate) fn mark_at_destination(&mut self, fact: PrepareFact) {
+        self.at_destination = true;
+        self.prepare_fact = fact;
+    }
+
+    /// Whether the engine's local recovery store keeps this stage's recovery state.
+    pub(crate) const fn uses_recovery_store(&self) -> bool {
+        !self.at_destination
     }
 
     pub(crate) fn disable_recovery(self) -> Self {
@@ -122,6 +143,9 @@ impl fmt::Debug for PreparedStage {
             .field("durable_publication", &self.durable_publication)
             .field("direct", &self.direct)
             .field("backend_state", &"<opaque>")
+            .field("prepare_fact", &self.prepare_fact)
+            .field("at_destination", &self.at_destination)
+            .field("exclusive", &self.exclusive.is_some())
             .finish()
     }
 }

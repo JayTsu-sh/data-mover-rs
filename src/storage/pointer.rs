@@ -38,10 +38,6 @@ pub(crate) const MAX_POINTER_BYTES: usize = HEADER_BYTES + MAX_EXTENSION_BYTES +
 pub(crate) struct PointerCorrupt;
 
 /// What the destination records about the stage beside a final file.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "written by backends moving in ADR-0006 C8")
-)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DestinationPointer {
     /// The recovery binding the stage was written under; resume requires it to be equal.

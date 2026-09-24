@@ -343,6 +343,30 @@ pub trait StagedDestination: Send + Sync {
             .unwrap_or_else(|_| unreachable!("the static positioned-I/O diagnostic is valid")),
         ))
     }
+    /// Whether this destination keeps its recovery state at the destination (ADR-0006): its prepare
+    /// is [`StagedDestination::prepare_at_destination`], and nothing about the transfer is recorded
+    /// where data-mover runs. A transition flag, `false` until each backend moves (C8–C15).
+    fn recovery_at_destination(&self) -> bool {
+        false
+    }
+    /// Prepares by looking at the destination first: resumes an equal binding found there, or
+    /// cleans up what it finds and starts fresh. The returned stage reports the
+    /// [`PrepareFact`](super::PrepareFact).
+    async fn prepare_at_destination(
+        &self,
+        request: super::DestinationPrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        Err(StorageRoleFailure::Entry(
+            EntryOperationFailure::new(
+                request.prepare.final_destination.path().clone(),
+                Operation::Prepare,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "this destination keeps no recovery state at the destination",
+            )
+            .unwrap_or_else(|_| unreachable!("the static prepare diagnostic is valid")),
+        ))
+    }
     /// Whether this backend can prepare an in-place target for the shared writer.
     fn supports_direct(&self) -> bool {
         false

@@ -7,6 +7,7 @@ mod copied_metadata;
 mod create_dir;
 mod delete_tree;
 mod descriptor;
+pub(crate) mod discovery;
 pub(crate) mod durability;
 pub(crate) mod endpoint;
 mod factory;
@@ -37,6 +38,7 @@ pub use delete_tree::{
     DeleteTreeTerminalFailure, delete_tree,
 };
 pub use descriptor::SourceDescriptor;
+pub use discovery::{DestinationPrepareRequest, PrepareFact, RestartReason, ResumeMode};
 pub use factory::{
     BackendConfig, BackendConnectError, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy,
     HdfsBackendConfig, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, connect_backend,

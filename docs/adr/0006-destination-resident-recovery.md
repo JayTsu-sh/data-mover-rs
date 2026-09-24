@@ -146,6 +146,16 @@ formats a newer binary must still read, so each carries its version (`v1`, `01`)
 vector. The name uses the final name as spelled: on a case-insensitive destination another spelling
 of the same file finds nothing and restarts, and the old artifacts wait for the reserved-name cleanup.
 
+As built (C7c, `src/storage/discovery.rs`): the table gains two rows and a fixed precedence — nothing
+→ fresh; a requested restart → clean; a corrupt pointer; a pointer without a stage; a stage without a
+pointer; another transfer's pointer (`OtherTransfer`, checked before the binding, which hashes the
+identity); a changed binding; a stage proving less than the pointer's prefix (`StageBehindPointer`);
+otherwise resume. A stage's length in this table is always the prefix it durably proves, never a file
+length that may be sparse. A clean-up removes the pointer before the stage, so a crash between the two
+leaves a stage without a pointer, which the next prepare cleans. The seam is a transition flag on the
+destination (`recovery_at_destination`, `false` until each backend moves) and a separate
+`DestinationPrepareRequest`, so `PrepareRequest` and its callers are unchanged until C21.
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS
