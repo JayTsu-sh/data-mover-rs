@@ -924,6 +924,18 @@ impl S3Storage {
         }
     }
 
+    /// The listing prefix of the directory at `relative_path`: its full key ending in `/`, so a
+    /// delimiter listing returns its children rather than the directory itself, and a sibling that
+    /// shares the name as a prefix (`sub` vs `subway/`) is not included. The storage root (empty
+    /// path) keeps the configured prefix as it is.
+    pub(crate) fn directory_prefix_key(&self, relative_path: &str) -> String {
+        let mut key = self.build_full_key(relative_path);
+        if !relative_path.is_empty() && !key.ends_with('/') {
+            key.push('/');
+        }
+        key
+    }
+
     /// Get the bucket name
     #[must_use]
     pub fn bucket(&self) -> &str {
@@ -1082,7 +1094,7 @@ impl S3Storage {
         let (tx, rx) = async_channel::bounded::<DeleteEvent>(1000);
         let storage = self.clone();
         let prefix = match relative_path {
-            Some(p) => storage.build_full_key(p),
+            Some(p) => storage.directory_prefix_key(p),
             None => storage.prefix.clone().unwrap_or_default(),
         };
 
@@ -3381,17 +3393,15 @@ impl S3Storage {
         // 全局文件总数计数器
         let total_file_count = Arc::new(AtomicUsize::new(0));
 
-        // 如果指定了子路径，调整 prefix 以从子目录开始遍历
-        let mut self_clone = self.clone();
-        if let Some(p) = sub_path {
-            let full_key = self.build_full_key(p);
-            self_clone.prefix = Some(full_key);
-        }
+        // 从子目录开始列举；`self.prefix` 不变，条目路径仍相对存储根 (与 Local / NFS / walkdir_2 一致)
+        let start_prefix = self.directory_prefix_key(sub_path.unwrap_or_default());
+        let self_clone = self.clone();
         let tx_clone = tx.clone();
         tokio::spawn(async move {
             if let Err(e) = self_clone
                 .iterative_walkdir(
                     tx_clone.clone(),
+                    start_prefix,
                     options,
                     self_clone.is_bucket_versioned,
                     total_file_count,
@@ -3417,6 +3427,7 @@ impl S3Storage {
     async fn iterative_walkdir(
         &self,
         tx: async_channel::Sender<StorageEntryMessage>,
+        start_prefix: String,
         options: crate::WalkOptions,
         is_versioned: bool,
         total_file_count: Arc<AtomicUsize>,
@@ -3430,7 +3441,6 @@ impl S3Storage {
             packaged,
             package_depth,
         } = options;
-        let start_prefix = self.prefix.clone().unwrap_or_default();
         debug!("[S3] 使用起始前缀: {:?}", start_prefix);
 
         let contexts =
@@ -4027,7 +4037,7 @@ impl S3Storage {
         use crate::dir_tree::{DirHandle, ReadResult, SubdirEntry};
 
         let prefix_key = match handle {
-            DirHandle::S3Prefix(p) => self.build_full_key(p),
+            DirHandle::S3Prefix(p) => self.directory_prefix_key(p),
             _ => {
                 return Err(StorageError::OperationError(
                     "DirHandle type mismatch: expected S3Prefix".into(),
@@ -5029,6 +5039,18 @@ mod tests {
     fn test_build_full_key_without_prefix() {
         let storage = make_test_storage(None);
         assert_eq!(storage.build_full_key("dir/file.txt"), "dir/file.txt");
+    }
+
+    #[test]
+    fn directory_prefix_keys_end_in_a_delimiter_except_at_the_root() {
+        let storage = make_test_storage(Some("data/"));
+        assert_eq!(storage.directory_prefix_key("sub"), "data/sub/");
+        assert_eq!(storage.directory_prefix_key("sub/"), "data/sub/");
+        assert_eq!(storage.directory_prefix_key("a/b"), "data/a/b/");
+        assert_eq!(storage.directory_prefix_key(""), "data/");
+        let bucket_root = make_test_storage(None);
+        assert_eq!(bucket_root.directory_prefix_key("sub"), "sub/");
+        assert_eq!(bucket_root.directory_prefix_key(""), "");
     }
 
     #[test]
