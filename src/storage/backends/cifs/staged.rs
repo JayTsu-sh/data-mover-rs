@@ -244,7 +244,9 @@ impl StagedDestination for CifsStagedDestination {
         self.metadata
             .as_ref()
             .map(|_| crate::storage::CopiedMetadataTarget {
-                timestamp_precision: crate::model::TimePrecision::HundredNanoseconds,
+                timestamps: crate::storage::CopiedTimestampTarget::Stored(
+                    crate::model::TimePrecision::HundredNanoseconds,
+                ),
                 ownership: crate::storage::CopiedOwnershipTarget::Unsupported,
                 // `metadata::decode` accepts only this encoding, so anything else has to be
                 // refused as a mapping problem rather than written wrong.

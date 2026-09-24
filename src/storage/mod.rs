@@ -27,7 +27,7 @@ pub use capability::{
 };
 pub use copied_metadata::{
     CopiedAclTarget, CopiedMetadataObservation, CopiedMetadataTarget, CopiedOwnershipTarget,
-    CopiedValueTarget,
+    CopiedTimestampTarget, CopiedValueTarget,
 };
 pub use create_dir::{CreateDirectoryAllFailure, create_directory_all};
 pub use delete_tree::{

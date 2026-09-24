@@ -242,7 +242,9 @@ impl StagedDestination for HdfsStagedDestination {
         self.metadata
             .as_ref()
             .map(|_| crate::storage::CopiedMetadataTarget {
-                timestamp_precision: crate::model::TimePrecision::Milliseconds,
+                timestamps: crate::storage::CopiedTimestampTarget::Stored(
+                    crate::model::TimePrecision::Milliseconds,
+                ),
                 ownership: crate::storage::CopiedOwnershipTarget::ModeOnly,
                 // The metadata role reports both families unavailable on observation too.
                 acl: crate::storage::CopiedAclTarget::Unsupported,

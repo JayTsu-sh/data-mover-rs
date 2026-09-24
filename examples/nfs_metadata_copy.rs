@@ -11,7 +11,9 @@
 //!
 //! An endpoint starting with `nfs://` is an NFS URL; `cifs:<sub-path>` is that sub-path of the
 //! share named by `CIFS_REAL_SERVER` / `CIFS_REAL_SHARE` / `CIFS_REAL_USER` / `CIFS_REAL_PASS`
-//! (the e2e-cifs `.env`); anything else is a local directory.
+//! (the e2e-cifs `.env`); `s3:<prefix>` is that prefix of the bucket named by `S3_HOST` /
+//! `S3_BUCKET` / `S3_AK` / `S3_SK` / `S3_USE_HTTPS` (the e2e-s3 `.env`); anything else is a local
+//! directory.
 
 use std::env;
 use std::error::Error;
@@ -24,7 +26,8 @@ use data_mover::metadata::{ApplicationOutcome, MetadataApplicationReport, Metada
 use data_mover::model::{BackendIdentity, BackendKind, FailureClass, StoragePath};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, LocalBackendConfig,
-    NfsBackendConfig, PreflightPolicy, Storage, StorageRoleFailure, connect_backend,
+    NfsBackendConfig, PreflightPolicy, S3BackendConfig, Storage, StorageRoleFailure,
+    connect_backend,
 };
 use data_mover::transfer::{
     CopiedMetadataRequest, InflightLimits, TransferIdentity, TransferOutcome, TransferRequest,
@@ -120,7 +123,25 @@ impl From<ApplicationOutcome> for Outcome {
 }
 
 fn env_var(name: &str) -> Result<String> {
-    env::var(name).map_err(|_| format!("{name} is not set (source the e2e-cifs .env)").into())
+    env::var(name)
+        .map_err(|_| format!("{name} is not set (source the e2e-cifs / e2e-s3 .env)").into())
+}
+
+/// `s3://AK:SK@bucket.host/prefix` — the crate takes the key and secret as written, undecoded.
+fn s3_url(prefix: &str) -> Result<String> {
+    let scheme = if env::var("S3_USE_HTTPS").is_ok_and(|value| value == "true") {
+        "s3+https"
+    } else {
+        "s3"
+    };
+    Ok(format!(
+        "{scheme}://{}:{}@{}.{}/{}",
+        env_var("S3_AK")?,
+        env_var("S3_SK")?,
+        env_var("S3_BUCKET")?,
+        env_var("S3_HOST")?,
+        prefix.trim_start_matches('/')
+    ))
 }
 
 async fn connect(endpoint: &str, side: &str) -> Result<Storage> {
@@ -143,6 +164,14 @@ async fn connect(endpoint: &str, side: &str) -> Result<Storage> {
             signing_policy: CifsSigningPolicy::default(),
             guest_policy: CifsGuestPolicy::default(),
             identity: BackendIdentity::new(BackendKind::Cifs, side)?,
+        })
+    } else if endpoint.starts_with("s3://") {
+        return Err("give `s3:<prefix>` with the e2e-s3 .env, not an s3:// URL".into());
+    } else if let Some(prefix) = endpoint.strip_prefix("s3:") {
+        BackendConfig::S3(S3BackendConfig {
+            url: s3_url(prefix)?,
+            identity: BackendIdentity::new(BackendKind::S3, side)?,
+            block_size: None,
         })
     } else {
         fs::create_dir_all(endpoint)?;

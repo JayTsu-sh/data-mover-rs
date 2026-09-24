@@ -1000,7 +1000,9 @@ impl StagedDestination for LocalStagedDestination {
         #[cfg(unix)]
         {
             Some(crate::storage::CopiedMetadataTarget {
-                timestamp_precision: crate::model::TimePrecision::Nanoseconds,
+                timestamps: crate::storage::CopiedTimestampTarget::Stored(
+                    crate::model::TimePrecision::Nanoseconds,
+                ),
                 ownership: crate::storage::CopiedOwnershipTarget::Numeric,
                 acl: crate::storage::CopiedAclTarget::Encoding(crate::model::AclEncoding::Posix),
                 xattrs: crate::storage::CopiedValueTarget::Supported,

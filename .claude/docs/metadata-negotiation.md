@@ -47,8 +47,9 @@ atime / ctime 任何情况下都不拷。
 **跳过的原因**：`MetadataApplicationReport::skipped()`（经 `TransferOutcome.metadata`；文件失败时在
 `MetadataApplicationFailure::report()` 里同样有）逐族给出 `SkippedFamily { family, reason: RefusalCause }`，
 Display 如 `ACL skipped: the source cannot read it`。不变式：outcome 为 `Unsupported` 的族在 `skipped()`
-里恰有一条，其余族没有（不要的 `OmittedByPolicy`、不适用的都不算跳过）。规划器 `compile.rs::unavailable()`
-是唯一产生跳过的地方。两端都不能时记源端（先查源端）。要了却没发观测（`NotRequested`，拷贝路径上不会
+里恰有一条，其余族没有（不要的 `OmittedByPolicy`、不适用的都不算跳过）。产生跳过的只有规划器
+`compile.rs::unavailable()` 与「目的端什么都不存」的 `compile_nothing_stored_plan`。两端都不能时记源端（先查源端）
+—— 目的端什么都不存时例外：不读源端，记目的端。要了却没发观测（`NotRequested`，拷贝路径上不会
 发生：要的功能一定以 `BestEffort` 观测）记 `NotObserved`，不进 `skipped()`。
 
 `MetadataPolicy` 的四档（`RequireExact` / `AllowKnownLoss` / `BestEffort` / `Omit`）仍在
@@ -62,23 +63,33 @@ Display 如 `ACL skipped: the source cannot read it`。不变式：outcome 为 `
    `NotApplicable` 只说「这一条没有」（symlink 上的 ACL，不算跳过），`Failed` 说「读失败」。
    CIFS 源的 xattr 是 `Unsupported`（smb-rs 领域 API 没有 EA 查询，上游请求 S2）。
    **待修**：S3 源没有拷贝基线（`copied_metadata_observation_plan` 为 `None`），整段元数据都不走，
-   见下文与 K6 / K8。
-3. **目的端能不能存** —— `CopiedMetadataTarget.acl` / `.xattrs`。
+   见 K8。
+3. **目的端能不能存** —— `CopiedMetadataTarget`：`timestamps`（`Stored(精度)` / `NotStored`）、`ownership`、
+   `acl`、`xattrs`。
 4. **规划期交叉** —— `compile_copied_metadata_plan` 按上表裁决。
 5. **应用期** —— 服务端可以在能力位说 yes 之后仍然拒绝：该文件失败（先应用完其余族）。
 
-源端没有元数据角色、目的端没有 target（今天的 S3 目的端）时整段跳过，**包括 mtime** ——
-「mtime 必拷、S3 目的端除外」尚未落实，是下一步。
+**目的端什么都不存**（`CopiedMetadataTarget::stores_nothing()`，今天就是 S3 目的端，K6）：不读源端 ——
+没有哪个源端的值能改变结果，省掉每文件一次 stat —— 直接由 `compile_nothing_stored_plan` 把每个要的族
+（基线的 owner/group/mode、mtime，以及调用方要的 ACL / xattr）记成 `skipped()`，原因
+`DestinationCannotStore`。报告如 `timestamps skipped: the destination cannot store it`。此前 S3 目的端没声明
+target，整段元数据无声跳过、连报告都没有。只存一部分的目的端若 `NotStored` mtime，走正常观测路径，
+mtime 按 `BestEffort` 规划 → 同样记跳过，不让文件失败。
+源端没有元数据角色（今天的 S3 源）时仍整段跳过（K8）。
+
+**已知不一致**（后续单独 commit，需 FAS2750）：同样声明 `CopiedOwnershipTarget::Unsupported`，CIFS 目的端的
+owner/group/mode 记成**损失** `OwnershipModeDropped`（走 `OwnershipTarget::NotApplicable`），S3 目的端记成
+**跳过** `DestinationCannotStore`。统计「没带上的」要同时看 `loss_report()` 与 `skipped()`。
 
 ## 各 backend 的能力
 
-| backend | owner/group（源端） | ACL | xattrs | 依据 |
+| backend | owner/group（源端读；目的端另注） | ACL | xattrs | 依据 |
 |---|---|---|---|---|
 | NFS | v3 数字；v4 字符串，nfs-rs 映射不了的名字走「只有 mode」（`OwnerAndGroupUnmapped`，见 `storage-nfs.md`） | 协商到才有，报 `NfsV4` | nfs-rs 0.8.4 永远报未协商 | `mount.capabilities().acl` / `.named_attributes` |
 | Local | unix 下数字（作目的端时逐文件问能不能设这个 owner，见下节） | unix 下 `Posix` | unix 下支持 | 非 unix 整体不参与拷贝 |
 | CIFS | 读不到（`NotApplicable`） | `WindowsSecurityDescriptor`（只保留 account 类 ACE） | 不支持 | `cifs/metadata.rs` 的 decode 只认这一种 |
 | HDFS | 字符串，走「只有 mode」（`OwnerAndGroupDropped`） | 不支持 | 不支持 | 观测侧也一律 `unavailable` |
-| S3（目的端） | 不参与 | 不参与 | 不参与 | 未实现 `copied_metadata_target` |
+| S3（目的端） | 存不了（跳过，`DestinationCannotStore`） | 存不了 | 存不了 | `stores_nothing()`，mtime 也 `NotStored` |
 
 ### 目的端没有 chown 特权（K5，Local）
 

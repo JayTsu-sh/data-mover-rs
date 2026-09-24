@@ -16,8 +16,8 @@ use crate::storage::{
 mod compile;
 mod errors;
 
-pub(crate) use compile::compile_copied_metadata_plan;
 pub use compile::compile_metadata_plan;
+pub(crate) use compile::{compile_copied_metadata_plan, compile_nothing_stored_plan};
 use errors::family_name;
 pub(crate) use errors::role_failure_text;
 pub use errors::{
@@ -225,7 +225,8 @@ pub struct SkippedFamily {
     pub family: MetadataFamily,
     /// Which end lacks the family: `SourceCannotObserve`, `DestinationCannotStore`,
     /// `EncodingsDiffer`, or `PrincipalMapperMissing` — never a failure or a refused loss. When
-    /// both ends lack it, the source is named: it is checked first.
+    /// both ends lack it, the source is named: it is checked first — except for a destination
+    /// that stores nothing at all, whose copies do not read the source and name the destination.
     pub reason: RefusalCause,
 }
 

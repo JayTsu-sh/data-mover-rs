@@ -109,6 +109,44 @@ pub(crate) fn compile_copied_metadata_plan(
     Ok(plan)
 }
 
+/// The plan for a destination that stores nothing a copy carries: every family the policies ask
+/// for is skipped because of the destination, the rest omitted — decided without reading the
+/// source, since no value there could change it. Any policy but `Omit` counts as asked, whatever
+/// its strength: what a destination cannot store at all is not the copy's to refuse. The reason
+/// is always the destination's, even where the source could not have read the family either.
+pub(crate) fn compile_nothing_stored_plan(policies: MetadataPolicies) -> MetadataPlan {
+    let mut plan = MetadataPlan {
+        mappings: Vec::with_capacity(5),
+        mutations: Vec::new(),
+        losses: LossReport::default(),
+        skipped: Vec::new(),
+    };
+    for family in [
+        MetadataFamily::OwnershipMode,
+        MetadataFamily::Acl,
+        MetadataFamily::Xattrs,
+        MetadataFamily::Tags,
+        MetadataFamily::Timestamps,
+    ] {
+        if policies.get(family) == MetadataPolicy::Omit {
+            plan.mappings.push(FamilyMapping {
+                family,
+                decision: MappingDecision::OmittedByPolicy,
+            });
+            continue;
+        }
+        plan.mappings.push(FamilyMapping {
+            family,
+            decision: MappingDecision::Unsupported,
+        });
+        plan.skipped.push(SkippedFamily {
+            family,
+            reason: RefusalCause::DestinationCannotStore,
+        });
+    }
+    plan
+}
+
 fn compile_acl(
     request: &MetadataPlanRequest<'_>,
     plan: &mut MetadataPlan,

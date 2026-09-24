@@ -67,6 +67,15 @@ match aws_sdk_s3::operation::get_object::GetObjectError::from(...) {
 - 不暴露给用户配置 — 是安全 trade-off，library 决定。
 - 修改前必须 PR 说明。
 
+### 作为拷贝目的端的元数据
+
+`S3StagedDestination::copied_metadata_target` 声明什么都不存（mtime `NotStored`、owner/ACL/xattr 都
+`Unsupported`）：拷贝不读源端元数据，报告把每个要的族记成 `skipped()`（`DestinationCannotStore`）。对象的
+时间是写入时间。见 [metadata-negotiation.md](metadata-negotiation.md)「目的端什么都不存」。
+真机：VM 102 的 MinIO（`.claude/skills/e2e-s3/.env`，bucket `data-mover-test`），
+`examples/nfs_metadata_copy.rs` 的 `s3:<prefix>` 端点。**URL 里的 AK/SK 原样使用、不做百分号解码**
+（e2e-s3 的 `url_builder.py` 会 quote，含特殊字符的 SK 会因此出错）。
+
 ## 已知陷阱
 
 | 陷阱 | 应对 |

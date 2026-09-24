@@ -410,7 +410,8 @@ pub struct TransferOutcome {
 /// ownership, and mtime facts automatically. Local and NFS preserve numeric uid/gid and mode;
 /// HDFS preserves mode while retaining its destination-native owner/group principals. Metadata
 /// is observed against the described source identity and applied before publication; callers
-/// need not apply it again.
+/// need not apply it again. A destination that stores none of it (S3) has every family reported
+/// as skipped, without the source being read for metadata.
 /// Access time and change time are not part of any copy. ACLs and extended attributes are not
 /// part of the default one either, but a caller can ask for them with
 /// [`TransferRequest::with_copied_metadata`]; whether they are carried then depends on what both

@@ -241,3 +241,47 @@ async fn the_copied_plan_keeps_the_reasons() {
         .unwrap();
     assert_eq!(report.skipped(), expected);
 }
+
+/// A destination that stores nothing (an object store) skips every family asked for — the
+/// baseline included — because of the destination, without the source having been read.
+#[tokio::test]
+async fn a_destination_that_stores_nothing_skips_everything_asked_for() {
+    let plan = compile_nothing_stored_plan(
+        MetadataPolicies::default()
+            .with_ownership_mode(MetadataPolicy::AllowKnownLoss)
+            .with_timestamps(MetadataPolicy::AllowKnownLoss)
+            .with_acl(MetadataPolicy::BestEffort),
+    );
+    let skipped = |family| SkippedFamily {
+        family,
+        reason: RefusalCause::DestinationCannotStore,
+    };
+    let expected = [
+        skipped(MetadataFamily::OwnershipMode),
+        skipped(MetadataFamily::Acl),
+        skipped(MetadataFamily::Timestamps),
+    ];
+    assert_eq!(plan.skipped(), expected);
+    assert!(!plan.has_mutations());
+    let report = plan
+        .apply(
+            &recording(),
+            &StoragePath::new("object").unwrap(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.skipped(), expected);
+    for outcome in report.outcomes() {
+        let explained = report
+            .skipped()
+            .iter()
+            .any(|skip| skip.family == outcome.family);
+        let expected = if explained {
+            ApplicationOutcome::Unsupported
+        } else {
+            ApplicationOutcome::OmittedByPolicy
+        };
+        assert_eq!(outcome.outcome, expected, "{outcome:?}");
+    }
+}

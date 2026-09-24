@@ -466,7 +466,10 @@ pub trait StagedDestination: Send + Sync {
             .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
         ))
     }
-    /// Target capabilities for baseline metadata copied by the ordinary transfer entry.
+    /// Target capabilities for baseline metadata copied by the ordinary transfer entry. `None`
+    /// takes the destination out of metadata altogether — no plan, no report — so a destination
+    /// that stores nothing should say so with a target whose `stores_nothing()` holds: every
+    /// family is then reported as skipped because of it.
     fn copied_metadata_target(&self) -> Option<CopiedMetadataTarget> {
         None
     }

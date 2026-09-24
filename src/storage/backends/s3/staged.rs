@@ -416,6 +416,19 @@ impl<P: S3Protocol> S3StagedDestination<P> {
 
 #[async_trait]
 impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
+    /// An object stores none of a file's metadata: its time is when it was written, and owner,
+    /// mode, ACL and extended attributes have nowhere to go. Declared rather than left undeclared,
+    /// so a copy reports each family as skipped because of the destination instead of silently
+    /// carrying nothing.
+    fn copied_metadata_target(&self) -> Option<crate::storage::CopiedMetadataTarget> {
+        Some(crate::storage::CopiedMetadataTarget {
+            timestamps: crate::storage::CopiedTimestampTarget::NotStored,
+            ownership: crate::storage::CopiedOwnershipTarget::Unsupported,
+            acl: crate::storage::CopiedAclTarget::Unsupported,
+            xattrs: crate::storage::CopiedValueTarget::Unsupported,
+        })
+    }
+
     async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
         let part_size = planned_part_size(request.source.size, request.final_destination.path())?;
         let key = Self::temp_key(&request);

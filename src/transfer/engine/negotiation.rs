@@ -9,12 +9,13 @@ use crate::metadata::{
     AclTarget, MetadataApplicationFailure, MetadataPlan, MetadataPlanError, MetadataPlanRequest,
     MetadataPolicies, MetadataPolicy, MetadataTarget, OwnershipTarget, RefusalSide,
     TimestampTarget, TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
-    role_failure_text,
+    compile_nothing_stored_plan, role_failure_text,
 };
 use crate::model::{MetadataObservation, MetadataObservations, ObservationMode, ObservationPlan};
 use crate::storage::{
-    CopiedAclTarget, CopiedMetadataTarget, CopiedOwnershipTarget, CopiedValueTarget, Metadata,
-    PreflightPolicy, SourceDescriptor, StagedDestination, StorageRoleFailure,
+    CopiedAclTarget, CopiedMetadataTarget, CopiedOwnershipTarget, CopiedTimestampTarget,
+    CopiedValueTarget, Metadata, PreflightPolicy, SourceDescriptor, StagedDestination,
+    StorageRoleFailure,
 };
 use crate::transfer::{CopiedMetadataRequest, TransferRequest};
 
@@ -54,6 +55,10 @@ pub(super) async fn copied_metadata_plan(
     else {
         return Ok(None);
     };
+    if target.stores_nothing() {
+        return Ok(Some(nothing_stored(requested)));
+    }
+    let timestamps_stored = matches!(target.timestamps, CopiedTimestampTarget::Stored(_));
     let observation_plan = baseline
         .with_acl(observation_mode(requested.acl()))
         .with_xattrs(observation_mode(requested.xattrs()));
@@ -79,6 +84,7 @@ pub(super) async fn copied_metadata_plan(
         requested,
         ownership_policy,
         observations.mode_without_ownership.is_some(),
+        timestamps_stored,
     );
     compile_copied_metadata_plan(
         &MetadataPlanRequest {
@@ -94,6 +100,21 @@ pub(super) async fn copied_metadata_plan(
     .map_err(TransferFailure::refused_metadata)
 }
 
+/// A destination that keeps nothing a copy carries: nothing the source holds could change the
+/// outcome, so the source is not read — no request per file just to report that the destination
+/// keeps none of it. The baseline and whatever the caller asked for are each skipped with that
+/// reason. The source identity is still enforced by every read of the data.
+fn nothing_stored(requested: CopiedMetadataRequest) -> CopiedMetadataPlan {
+    let policies = MetadataPolicies::default()
+        .with_ownership_mode(MetadataPolicy::AllowKnownLoss)
+        .with_timestamps(MetadataPolicy::AllowKnownLoss)
+        .with_acl(optional_policy(requested.acl()))
+        .with_xattrs(optional_policy(requested.xattrs()));
+    CopiedMetadataPlan {
+        plan: compile_nothing_stored_plan(policies),
+    }
+}
+
 /// The source's metadata role with the baseline it observes for a copy, and what the destination
 /// accepts.
 struct MetadataRoles {
@@ -104,7 +125,8 @@ struct MetadataRoles {
 }
 
 /// Both ends' metadata roles, or `None` when an end has none. The copy then goes on without
-/// metadata — mtime included, which the mandatory-mtime rule still has to close.
+/// metadata and without a report — today only a source with no copy baseline (S3, K8), since
+/// every staged destination but a non-unix Local declares a target.
 fn metadata_roles(request: &TransferRequest) -> Option<MetadataRoles> {
     let source = request
         .source
@@ -171,22 +193,29 @@ fn metadata_target(
         },
         tags: ValueTarget::NotApplicable,
         ownership_mode,
-        timestamps: TimestampTargetCapability::Supported(TimestampTarget {
-            precision: target.timestamp_precision,
-            accessed: false,
-            modified: true,
-            created: false,
-        }),
+        timestamps: match target.timestamps {
+            CopiedTimestampTarget::Stored(precision) => {
+                TimestampTargetCapability::Supported(TimestampTarget {
+                    precision,
+                    accessed: false,
+                    modified: true,
+                    created: false,
+                })
+            }
+            CopiedTimestampTarget::NotStored => TimestampTargetCapability::Unsupported,
+        },
     };
     (target, ownership_policy)
 }
 
 /// The baseline every copy carries — ownership/mode as the target allows, mtime — plus the
-/// optional families at whatever the caller asked for.
+/// optional families at whatever the caller asked for. A destination that does not store the
+/// modification time has it skipped with that reason; it is not the copy's to refuse.
 fn copied_policies(
     requested: CopiedMetadataRequest,
     ownership_policy: MetadataPolicy,
     mode_without_ownership: bool,
+    timestamps_stored: bool,
 ) -> MetadataPolicies {
     let ownership_policy = if mode_without_ownership {
         MetadataPolicy::AllowKnownLoss
@@ -195,7 +224,11 @@ fn copied_policies(
     };
     MetadataPolicies::default()
         .with_ownership_mode(ownership_policy)
-        .with_timestamps(MetadataPolicy::AllowKnownLoss)
+        .with_timestamps(if timestamps_stored {
+            MetadataPolicy::AllowKnownLoss
+        } else {
+            MetadataPolicy::BestEffort
+        })
         .with_acl(optional_policy(requested.acl()))
         .with_xattrs(optional_policy(requested.xattrs()))
 }
@@ -277,7 +310,7 @@ mod tests {
 
     fn numeric_destination() -> CopiedMetadataTarget {
         CopiedMetadataTarget {
-            timestamp_precision: crate::model::TimePrecision::Nanoseconds,
+            timestamps: CopiedTimestampTarget::Stored(crate::model::TimePrecision::Nanoseconds),
             ownership: CopiedOwnershipTarget::Numeric,
             acl: CopiedAclTarget::Unsupported,
             xattrs: CopiedValueTarget::Unsupported,
@@ -319,6 +352,67 @@ mod tests {
             |_, _| false,
             &MetadataObservations::default()
         ));
+    }
+
+    /// A destination that keeps owner and mode but not the modification time: mtime is skipped
+    /// because of the destination, and the file is not failed for it.
+    #[test]
+    fn a_modification_time_the_destination_does_not_store_is_skipped_not_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (target, ownership_policy) = metadata_target(
+            CopiedMetadataTarget {
+                timestamps: CopiedTimestampTarget::NotStored,
+                ..numeric_destination()
+            },
+            true,
+        );
+        assert_eq!(target.timestamps, TimestampTargetCapability::Unsupported);
+        let policies = copied_policies(
+            CopiedMetadataRequest::default(),
+            ownership_policy,
+            false,
+            false,
+        );
+        let observations = MetadataObservations {
+            timestamps: MetadataObservation::Value {
+                value: crate::model::TimestampMetadata {
+                    accessed: None,
+                    modified: Some(crate::model::StorageTimestamp::new(
+                        1_000_000_000,
+                        crate::model::TimePrecision::Nanoseconds,
+                    )?),
+                    created: None,
+                },
+                provenance: crate::model::MetadataProvenance::Inline,
+            },
+            ownership_mode: MetadataObservation::Value {
+                value: crate::model::OwnershipMode {
+                    uid: 1000,
+                    gid: 1000,
+                    mode: 0o100_644,
+                },
+                provenance: crate::model::MetadataProvenance::Inline,
+            },
+            ..MetadataObservations::default()
+        };
+        let plan = compile_copied_metadata_plan(
+            &MetadataPlanRequest {
+                observations: &observations,
+                target,
+                policies,
+                principal_mapper: None,
+            },
+            None,
+            false,
+        )?;
+        assert_eq!(
+            plan.skipped(),
+            [crate::metadata::SkippedFamily {
+                family: MetadataFamily::Timestamps,
+                reason: RefusalCause::DestinationCannotStore,
+            }]
+        );
+        Ok(())
     }
 
     fn refused(cause: RefusalCause) -> String {
