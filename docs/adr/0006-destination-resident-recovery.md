@@ -138,6 +138,14 @@ state:
 | pointer without stage (probably published) | delete the pointer, start from zero |
 | stage without pointer | delete the stage, start from zero |
 
+As built (C7b): the name digest is the first 16 bytes of `blake3("data-mover/artifact-name/v1\0" ‖
+u64le(len) ‖ final name)` in hex (names ≤ 55 bytes, 59 with the fixed `.tmp` temporary); the pointer is
+`DMDPTR01` ‖ flags ‖ reserved ‖ u16 extension length ‖ binding ‖ transfer identity ‖ u64 durable prefix
+‖ extension (≤ 4 KiB) ‖ `blake3` of everything before (`src/storage/pointer.rs`). Both are on-disk
+formats a newer binary must still read, so each carries its version (`v1`, `01`) and has a frozen
+vector. The name uses the final name as spelled: on a case-insensitive destination another spelling
+of the same file finds nothing and restarts, and the old artifacts wait for the reserved-name cleanup.
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS

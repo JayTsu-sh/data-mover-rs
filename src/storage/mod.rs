@@ -12,6 +12,7 @@ pub(crate) mod endpoint;
 mod factory;
 mod handle;
 mod native;
+pub(crate) mod pointer;
 mod roles;
 
 pub(crate) use native::{
