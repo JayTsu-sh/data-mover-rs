@@ -165,22 +165,27 @@ For clients created from either StorageGRID scheme, data-mover removes the
 exact `x-id` query parameter immediately before SigV4 signing. Other query
 parameters and their encoded bytes are preserved. The scheme applies to both
 bucket listing and normal S3 data operations and does not change credentials,
-path-style addressing, or general checksum configuration. For multi-object
-delete, it also supplies the legacy signed `Content-MD5` required by older
-StorageGRID releases.
+path-style addressing, or general checksum configuration.
 
-Standard `s3://`, `s3+http://`, and `s3+https://` clients never enable this
-workaround, so standard S3 and StorageGRID endpoints can safely coexist in one
-process. There is no environment-variable override.
+Standard `s3://`, `s3+http://`, and `s3+https://` clients never remove `x-id`,
+so standard S3 and StorageGRID endpoints can safely coexist in one process.
+There is no environment-variable override.
+
+Every profile, standard included, adds a body-matching, SigV4-signed
+`Content-MD5` to multi-object delete requests. The AWS SDK's own checksum for
+that request is `x-amz-checksum-crc32`, which older S3 implementations ignore
+and then reject the request: older StorageGRID releases, MinIO
+`RELEASE.2023-03-20` and Ceph RGW Octopus (DXN) all answer `MissingContentMD5`.
+Every S3 implementation accepts `Content-MD5`.
 
 ### DXN compatibility
 
 Select DXN compatibility per endpoint with `s3+dxn://` for HTTP or
-`s3+dxn+https://` for HTTPS. DXN clients add a body-matching, SigV4-signed
+`s3+dxn+https://` for HTTPS. Like every profile, DXN clients add the signed
 `Content-MD5` to multi-object delete requests. Unlike StorageGRID compatibility,
 DXN compatibility does not remove the AWS SDK's `x-id` query parameter.
 
-Standard S3 clients remain unchanged. The HTTPS form skips certificate
+The HTTPS form skips certificate
 verification and is intended only for trusted private deployments with
 self-signed certificates.
 

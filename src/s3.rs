@@ -438,10 +438,19 @@ fn build_s3_config(sdk_config: &SdkConfig, compatibility: S3Compatibility) -> aw
     let builder = aws_sdk_s3::config::Builder::from(sdk_config)
         .force_path_style(true)
         .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired);
+    configure_compatibility(builder, compatibility).build()
+}
+
+/// Per-profile request adjustments. Every profile signs a body-matching Content-MD5 into
+/// `DeleteObjects`; `StorageGRID` also strips `x-id`.
+fn configure_compatibility(
+    builder: aws_sdk_s3::config::Builder,
+    compatibility: S3Compatibility,
+) -> aws_sdk_s3::config::Builder {
     match compatibility {
-        S3Compatibility::Standard => builder.build(),
-        S3Compatibility::StorageGrid => storagegrid::configure(builder).build(),
-        S3Compatibility::Dxn => dxn::configure(builder).build(),
+        S3Compatibility::Standard => delete_objects_md5::configure(builder),
+        S3Compatibility::StorageGrid => storagegrid::configure(builder),
+        S3Compatibility::Dxn => dxn::configure(builder),
     }
 }
 

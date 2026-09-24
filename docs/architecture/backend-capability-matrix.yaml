@@ -237,7 +237,7 @@ profiles:
       symlink: unsupported
       hardlink_topology: not_applicable
       rename: {state: unsupported, reason: dxn_verified_semantic_limit}
-      delete: {state: required, semantics: dxn_checksum_request_contract}
+      delete: required  # signed Content-MD5 is base S3 behaviour for every profile
       acl: unsupported
       xattr: not_applicable
       tags: {state: unsupported, reason: dxn_verified_semantic_limit}
@@ -285,11 +285,12 @@ device_compatibility_overlays:
     matrix_profile: false
     reason: no_durable_shared_real_environment
     required_gate: DM-STORAGEGRID-REQUEST-CONTRACT
-    semantics: [exact_x_id_removal, delete_content_md5]
+    # delete Content-MD5 is base S3 behaviour for every profile since 2026-09-24, not an overlay.
+    semantics: [exact_x_id_removal]
   dxn:
     backend_kind: s3
     matrix_profile: true
-    semantics: [delete_checksum, rename_limit, tag_limit, multipart_restart]
+    semantics: [rename_limit, tag_limit, multipart_restart]
   fas2750:
     backend_kind: cifs
     matrix_profile: true

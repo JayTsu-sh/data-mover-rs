@@ -61,7 +61,7 @@ cargo test --test s3_architecture_contract dxn_s3_architecture_roles_and_known_l
   -- --ignored --exact --test-threads=1
 cargo test --lib s3::dxn::tests::multipart_rename_limit_preserves_source_when_lab_is_configured \
   -- --exact --test-threads=1
-cargo test s3::storagegrid::tests::standard_s3_delete_objects_does_not_add_storagegrid_content_md5 -- \
+cargo test s3::storagegrid::tests::standard_s3_delete_objects_adds_signed_content_md5_without_stripping_x_id -- \
   --exact --test-threads=1
 cargo test s3::storagegrid::tests::dxn_delete_objects_adds_signed_content_md5_without_stripping_x_id -- \
   --exact --test-threads=1

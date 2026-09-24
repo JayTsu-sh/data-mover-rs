@@ -92,6 +92,7 @@ mod tests {
     struct CapturedDeleteRequest {
         uri: String,
         content_md5: Option<String>,
+        crc32: Option<String>,
         authorization: Option<String>,
         body: Vec<u8>,
     }
@@ -131,6 +132,10 @@ mod tests {
             let captured = CapturedDeleteRequest {
                 uri: request.uri().to_owned(),
                 content_md5: request.headers().get("content-md5").map(str::to_owned),
+                crc32: request
+                    .headers()
+                    .get("x-amz-checksum-crc32")
+                    .map(str::to_owned),
                 authorization: request.headers().get("authorization").map(str::to_owned),
                 body: request.body().bytes().unwrap_or_default().to_vec(),
             };
@@ -173,11 +178,7 @@ mod tests {
             .endpoint_url("http://storagegrid.test")
             .force_path_style(true)
             .http_client(http_client);
-        let config = match compatibility {
-            super::super::S3Compatibility::Standard => builder.build(),
-            super::super::S3Compatibility::StorageGrid => configure(builder).build(),
-            super::super::S3Compatibility::Dxn => super::super::dxn::configure(builder).build(),
-        };
+        let config = super::super::configure_compatibility(builder, compatibility).build();
 
         let result = aws_sdk_s3::Client::from_conf(config)
             .list_buckets()
@@ -217,12 +218,11 @@ mod tests {
             .region(Region::new("us-east-1"))
             .endpoint_url("http://storagegrid.test")
             .force_path_style(true)
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
             .http_client(http_client);
-        let config = match compatibility {
-            super::super::S3Compatibility::Standard => builder.build(),
-            super::super::S3Compatibility::StorageGrid => configure(builder).build(),
-            super::super::S3Compatibility::Dxn => super::super::dxn::configure(builder).build(),
-        };
+        let config = super::super::configure_compatibility(builder, compatibility).build();
         let object = ObjectIdentifier::builder()
             .key("prefix/object.txt")
             .build()
@@ -321,10 +321,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_s3_delete_objects_does_not_add_storagegrid_content_md5() {
+    async fn standard_s3_delete_objects_adds_signed_content_md5_without_stripping_x_id() {
         let request =
             captured_delete_objects_request(super::super::S3Compatibility::Standard).await;
-        assert!(request.content_md5.is_none());
+        let expected = BASE64_STANDARD.encode(Md5::digest(&request.body));
+        let control_uri = captured_list_buckets_uri(super::super::S3Compatibility::Standard).await;
+
+        assert_eq!(request.content_md5.as_deref(), Some(expected.as_str()));
+        // The SDK's own checksum still goes out; AWS verifies both.
+        assert!(request.crc32.is_some(), "CRC32 must still be sent");
+        assert!(control_uri.contains("x-id="));
+        assert!(
+            request
+                .authorization
+                .as_deref()
+                .is_some_and(|value| value.contains("content-md5")),
+            "Content-MD5 must be covered by SigV4: {:?}",
+            request.authorization
+        );
     }
 
     #[tokio::test]

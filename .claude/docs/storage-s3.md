@@ -27,8 +27,11 @@ scheme：
 - `s3://` — HTTP (默认 endpoint port 80)。
 - `s3+https://` — HTTPS (默认 port 443，自签证书允许)。
 - `s3+sg://` / `s3+sg+https://` — StorageGRID endpoint overlay；仍属于 S3 backend，
-  仅在签名前精确删除 `x-id`，并为 multi-object delete 添加 body-matching、
-  SigV4-signed `Content-MD5`，不新增 validation profile。
+  仅在签名前精确删除 `x-id`，不新增 validation profile。
+- 所有 profile（含标准 `s3://`）都为 multi-object delete 加 body-matching、SigV4-signed
+  `Content-MD5`（`s3/delete_objects_md5.rs`，由 `s3.rs` 的 `configure_compatibility` 统一挂载）：SDK 默认只发
+  `x-amz-checksum-crc32`，MinIO `RELEASE.2023-03-20`、Ceph RGW Octopus (DXN)、旧 StorageGRID 都回
+  `MissingContentMD5`。
 
 ## 关键行为
 
@@ -140,7 +143,8 @@ Complete 成功后再 Complete → 404 NoSuchUpload；`If-Match` 对分段 ETag�
 - skill 内置一个"读不存在的 key 应返回 FileNotFound"的回归测试。
 - `DM-STORAGEGRID-REQUEST-CONTRACT`：
   `cargo test s3::storagegrid::tests --locked`，在 capturing Smithy connector seam
-  验证 StorageGRID 请求变换及 standard S3/DXN 隔离；PR 与 release workflow 均独立执行。
+  验证只有 StorageGRID 去 `x-id`、所有 profile 的 DeleteObjects 都带签名 MD5；PR 与 release workflow 均独立执行。
+- `examples/s3_listing.rs` — walkdir / walkdir_2 / `--sub` / `--delete-dir`，逐条打印路径（真机验遍历与删除范围）。
 
 ## 改 S3 时
 

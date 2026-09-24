@@ -233,10 +233,12 @@ HA failover, Kerberos, cancellation, memory budget, and safe retry.
 
 ### StorageGRID overlay
 
-`DM-STORAGEGRID-REQUEST-CONTRACT` verifies exact `x-id` removal and required delete
-`Content-MD5` without changing standard S3 requests. StorageGRID is not a ninth matrix
-profile until a durable shared endpoint exists; the request contract remains a ReleaseReady
-device overlay.
+`DM-STORAGEGRID-REQUEST-CONTRACT` verifies that exact `x-id` removal is StorageGRID-only
+and that every profile, standard included, signs a body-matching delete `Content-MD5`
+(MinIO `RELEASE.2023-03-20` and Ceph RGW Octopus reject multi-object delete without it).
+StorageGRID is not a ninth matrix profile yet; a shared StorageGRID 11.5.0 endpoint exists
+since 2026-09-24, so promoting it is now possible. Until then the request contract remains a
+ReleaseReady device overlay.
 
 ## 7. Recovery and failure gates
 
