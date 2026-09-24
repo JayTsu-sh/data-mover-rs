@@ -34,6 +34,7 @@ use std::process::exit;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
+use data_mover::integrity::{IntegrityMode, IntegrityOptions, IntegrityRequest, compare};
 use data_mover::model::StoragePath;
 use data_mover::storage::{Storage, create_directory_all};
 use data_mover::transfer::{
@@ -83,6 +84,10 @@ struct Args {
     /// Instead of copying, remove this directory of the destination with its artifacts and files.
     #[arg(long)]
     remove_run: Option<String>,
+    /// Instead of copying, compare the source file with the destination file byte for byte and
+    /// print both BLAKE3 digests.
+    #[arg(long)]
+    compare: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -221,7 +226,40 @@ async fn inspect(args: &Args) -> Result<Option<Value>> {
         let found = artifacts(&args.destination, dir).await?;
         return Ok(Some(json!({ "artifacts": found })));
     }
+    if args.compare {
+        return Ok(Some(compare_content(args).await?));
+    }
     Ok(None)
+}
+
+/// `--compare`: whether the destination file holds exactly the source file's bytes.
+async fn compare_content(args: &Args) -> Result<Value> {
+    let report = compare(IntegrityRequest {
+        source: connect(args.source.as_deref().ok_or("--source")?).await?,
+        source_path: StoragePath::new(args.source_path.as_deref().ok_or("--source-path")?)?,
+        destination: connect(&args.destination).await?,
+        destination_path: StoragePath::new(
+            args.destination_path
+                .as_deref()
+                .ok_or("--destination-path")?,
+        )?,
+        options: IntegrityOptions {
+            mode: IntegrityMode::Content,
+            ..IntegrityOptions::default()
+        },
+        cancel: CancellationToken::new(),
+    })
+    .await?;
+    let hex = |digest: [u8; 32]| blake3::Hash::from_bytes(digest).to_hex().to_string();
+    let (source, destination) = report
+        .digests()
+        .ok_or("no digests in a content comparison")?;
+    Ok(json!({
+        "content_equal": source == destination,
+        "source_blake3": hex(source),
+        "destination_blake3": hex(destination),
+        "compared_bytes": report.compared_bytes(),
+    }))
 }
 
 #[tokio::main]

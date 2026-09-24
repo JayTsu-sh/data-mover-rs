@@ -18,10 +18,13 @@
 #
 # Both runs derive the transfer identity from the endpoints and paths (no --identity); each line
 # reports whether the resumed run derived the interrupted run's identity and endpoint.
+# "prepare" / "reused_bytes" say what the resuming run found at the destination, and the content
+# check compares the final file with the source by BLAKE3.
 # "streamed" is what the resuming run read from the source (it runs with read-back off and a
 # non-limiting budget, so the engine counts it): SIZE means nothing was reused. "records" is how
-# many recovery records the interrupted run left locally — 0 means the cut came before the first
-# checkpoint and the run says nothing about resume.
+# many recovery records the interrupted run left locally. For a destination that still uses the
+# local recovery store, 0 means the cut came before the first checkpoint; a destination that keeps
+# its recovery state beside the final file (ADR-0006: Local from C8) always shows 0.
 set -u
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$ROOT"
@@ -146,6 +149,17 @@ for mode in cancel kill; do
 try: print(json.loads(sys.argv[1]).get("source_streamed_bytes","?"))
 except Exception: print("?")' "$second")
   echo "[$mode]   streamed=$streamed of $SIZE"
+  # What prepare found at the destination and how much it reused (ADR-0006 C7e); Resumed with
+  # reused + streamed = SIZE is a resume, Fresh / Restarted re-copied everything.
+  python3 -c 'import json,sys
+try: out = json.loads(sys.argv[1])
+except Exception: out = {}
+print("[%s]   prepare=%s reused_bytes=%s" % (sys.argv[2], out.get("prepare", "?"), out.get("reused_bytes", "?")))' "$second" "$mode"
+  same=$("$BIN" --source "$WORK/src" --source-path src "${TARGET[@]}" --destination-path "$(path_of "$mode")" \
+    --compare 2>&1 | tail -1 | python3 -c 'import json,sys
+try: print("yes" if json.load(sys.stdin)["content_equal"] else "NO")
+except Exception: print("? (no comparison)")')
+  echo "[$mode]   destination BLAKE3 equals source: $same"
   # A failed resume may have opened an upload of its own: record it before its state goes.
   remember_s3_upload "$state"
   rm -rf "$state"
