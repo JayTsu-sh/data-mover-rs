@@ -6,7 +6,11 @@ use super::{
 };
 
 const MAGIC: &[u8; 4] = b"DMES";
-const VERSION: u8 = 4;
+/// v5 (ADR-0006 C4c): the backend identity is no longer stored — every entry of one scan shares it,
+/// and the caller supplies it when decoding; a 4-byte endpoint fingerprint tells a wrong endpoint
+/// from a corrupted key. v4 carried the identity per entry and still decodes.
+const VERSION: u8 = 5;
+const VERSION_WITH_BACKEND_ID: u8 = 4;
 
 /// How strongly a source identity survives namespace changes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -388,9 +392,23 @@ impl ObservedEntry {
     /// Encodes a lossless, versioned snapshot owned by data-mover.
     #[must_use]
     pub fn encode_snapshot(&self) -> EntrySnapshot {
+        self.encode(false)
+    }
+
+    /// The pre-C4c (v4) layout, which stored the backend identity; kept to test that v4 decodes.
+    #[cfg(test)]
+    fn encode_snapshot_v4(&self) -> EntrySnapshot {
+        self.encode(true)
+    }
+
+    fn encode(&self, with_backend_id: bool) -> EntrySnapshot {
         let mut output = Vec::new();
         output.extend_from_slice(MAGIC);
-        output.push(VERSION);
+        output.push(if with_backend_id {
+            VERSION_WITH_BACKEND_ID
+        } else {
+            VERSION
+        });
         output.push(backend_tag(self.backend_kind));
         put_bytes(&mut output, self.path.as_str().as_bytes());
         encode_kind(&mut output, self.kind);
@@ -408,10 +426,14 @@ impl ObservedEntry {
         encode_size(&mut output, self.size);
         encode_time(&mut output, self.modified);
         output.push(self.source_identity.strength.tag());
-        put_bytes(
-            &mut output,
-            self.source_identity.backend.stable_id().as_bytes(),
-        );
+        if with_backend_id {
+            put_bytes(
+                &mut output,
+                self.source_identity.backend.stable_id().as_bytes(),
+            );
+        } else {
+            output.extend_from_slice(&endpoint_fingerprint(&self.source_identity.backend));
+        }
         put_bytes(&mut output, &self.source_identity.stable_bytes);
         output.push(2);
         super::metadata_observation::encode(&self.metadata, &mut output);
@@ -420,12 +442,29 @@ impl ObservedEntry {
         EntrySnapshot(output)
     }
 
-    /// Reconstructs an observation solely from an unchanged snapshot.
+    /// Reconstructs an observation from an unchanged snapshot taken on `backend`.
+    ///
+    /// A snapshot does not store the backend identity (every entry of one scan shares it): the
+    /// caller passes the identity of the storage the scan ran on — `Storage::identity()`, or
+    /// `storage::endpoint_identity(&config)` without connecting — and the stored identity key is
+    /// recomputed from it. A snapshot taken on another endpoint or backend kind fails with
+    /// [`SnapshotDecodeError::BackendMismatch`]. When that happens for a whole generation (the
+    /// endpoint moved, or is spelled differently: IP versus hostname, another export alias), the
+    /// caller treats it as having no previous generation, not as corruption.
+    ///
+    /// Snapshots written before ADR-0006 C4c (format v4) carry their own identity and keep it: only
+    /// the backend kind is checked against `backend`, and the entry's key stays the old one (post-C4
+    /// keys differ anyway). Re-encoding such an entry writes a v5 snapshot under that old identity,
+    /// which no derived endpoint decodes — copy v4 bytes forward instead of re-encoding them.
     ///
     /// # Errors
-    /// Returns a typed error for malformed, unsupported, inconsistent, or trailing encoding.
-    pub fn decode_snapshot(bytes: &[u8]) -> Result<Self, SnapshotDecodeError> {
-        decode_snapshot(bytes)
+    /// Returns a typed error for malformed, unsupported, inconsistent, or trailing encoding, or for
+    /// a snapshot taken on another backend.
+    pub fn decode_snapshot(
+        bytes: &[u8],
+        backend: &BackendIdentity,
+    ) -> Result<Self, SnapshotDecodeError> {
+        decode_snapshot(bytes, backend)
     }
 }
 
@@ -452,13 +491,25 @@ impl fmt::Debug for EntrySnapshot {
 
 /// Stable failure categories for snapshot reconstruction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SnapshotDecodeError {
+    /// Not an entry snapshot.
     InvalidMagic,
+    /// A snapshot format this build does not read.
     UnsupportedVersion,
+    /// The bytes end before the snapshot does.
     Truncated,
+    /// A field exceeds the model limits.
     FieldTooLarge,
+    /// A field holds an impossible value.
     Malformed,
+    /// The stored identity key disagrees with the fields it is derived from: a corrupted entry.
     IdentityMismatch,
+    /// The snapshot was taken on another backend kind or endpoint than the one supplied — typically
+    /// the whole generation, when the endpoint moved or is spelled differently. A lone occurrence in
+    /// a generation that otherwise decodes is a corrupted row, not a moved endpoint.
+    BackendMismatch,
+    /// Bytes follow the end of the snapshot.
     TrailingData,
 }
 
@@ -507,43 +558,26 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn decode_snapshot(bytes: &[u8]) -> Result<ObservedEntry, SnapshotDecodeError> {
+fn decode_snapshot(
+    bytes: &[u8],
+    backend: &BackendIdentity,
+) -> Result<ObservedEntry, SnapshotDecodeError> {
     let mut cursor = Cursor::new(bytes);
     if cursor.take(4)? != MAGIC {
         return Err(SnapshotDecodeError::InvalidMagic);
     }
-    if cursor.byte()? != VERSION {
+    let version = cursor.byte()?;
+    if version != VERSION && version != VERSION_WITH_BACKEND_ID {
         return Err(SnapshotDecodeError::UnsupportedVersion);
     }
     let backend_kind = backend_from_tag(cursor.byte()?).ok_or(SnapshotDecodeError::Malformed)?;
     let path = std::str::from_utf8(cursor.bytes()?).map_err(|_| SnapshotDecodeError::Malformed)?;
     let path = StoragePath::new(path).map_err(|_| SnapshotDecodeError::Malformed)?;
     let kind = decode_kind(&mut cursor)?;
-    let symlink_target = match cursor.byte()? {
-        0 if kind != EntryKind::Symlink => None,
-        1 if kind == EntryKind::Symlink => {
-            let encoding = match cursor.byte()? {
-                0 => SymlinkTargetEncoding::UnixBytes,
-                1 => SymlinkTargetEncoding::WindowsWide,
-                _ => return Err(SnapshotDecodeError::Malformed),
-            };
-            Some(
-                SymlinkTarget::new(encoding, cursor.bytes()?.to_vec())
-                    .map_err(|_| SnapshotDecodeError::Malformed)?,
-            )
-        }
-        _ => return Err(SnapshotDecodeError::Malformed),
-    };
+    let symlink_target = decode_symlink_target(&mut cursor, kind)?;
     let size = decode_size(&mut cursor)?;
     let modified = decode_time(&mut cursor)?;
-    let strength =
-        IdentityStrength::from_tag(cursor.byte()?).ok_or(SnapshotDecodeError::Malformed)?;
-    let backend_id =
-        std::str::from_utf8(cursor.bytes()?).map_err(|_| SnapshotDecodeError::Malformed)?;
-    let backend = BackendIdentity::new(backend_kind, backend_id)
-        .map_err(|_| SnapshotDecodeError::Malformed)?;
-    let source_identity = SourceIdentity::new(backend, strength, cursor.bytes()?)
-        .map_err(|_| SnapshotDecodeError::Malformed)?;
+    let source_identity = decode_source_identity(&mut cursor, version, backend_kind, backend)?;
     let schema_version = cursor.byte()?;
     if schema_version != 2 {
         return Err(SnapshotDecodeError::Malformed);
@@ -571,6 +605,66 @@ fn decode_snapshot(bytes: &[u8]) -> Result<ObservedEntry, SnapshotDecodeError> {
         metadata,
         backend_fact,
     })
+}
+
+/// The source identity of a snapshot: strength, backend (the caller's for v5, checked by kind and
+/// endpoint fingerprint; the stored one for v4, checked by kind), and stable bytes.
+fn decode_source_identity(
+    cursor: &mut Cursor<'_>,
+    version: u8,
+    backend_kind: BackendKind,
+    backend: &BackendIdentity,
+) -> Result<SourceIdentity, SnapshotDecodeError> {
+    let strength =
+        IdentityStrength::from_tag(cursor.byte()?).ok_or(SnapshotDecodeError::Malformed)?;
+    if backend.kind() != backend_kind {
+        return Err(SnapshotDecodeError::BackendMismatch);
+    }
+    let backend = if version == VERSION_WITH_BACKEND_ID {
+        let backend_id =
+            std::str::from_utf8(cursor.bytes()?).map_err(|_| SnapshotDecodeError::Malformed)?;
+        BackendIdentity::new(backend_kind, backend_id)
+            .map_err(|_| SnapshotDecodeError::Malformed)?
+    } else if cursor.take(4)? == endpoint_fingerprint(backend) {
+        backend.clone()
+    } else {
+        return Err(SnapshotDecodeError::BackendMismatch);
+    };
+    SourceIdentity::new(backend, strength, cursor.bytes()?)
+        .map_err(|_| SnapshotDecodeError::Malformed)
+}
+
+/// Four bytes of the endpoint's hash: enough to tell a wrong endpoint from a corrupted key, which
+/// the 32-byte identity key check then decides for the rest (a wrong endpoint sharing the four
+/// bytes, 1 in 2^32, is reported as `IdentityMismatch`).
+fn endpoint_fingerprint(backend: &BackendIdentity) -> [u8; 4] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"data-mover/endpoint-fingerprint/v1\0");
+    hasher.update(backend.stable_id().as_bytes());
+    let hash = hasher.finalize();
+    let mut fingerprint = [0; 4];
+    fingerprint.copy_from_slice(&hash.as_bytes()[..4]);
+    fingerprint
+}
+
+fn decode_symlink_target(
+    cursor: &mut Cursor<'_>,
+    kind: EntryKind,
+) -> Result<Option<SymlinkTarget>, SnapshotDecodeError> {
+    match cursor.byte()? {
+        0 if kind != EntryKind::Symlink => Ok(None),
+        1 if kind == EntryKind::Symlink => {
+            let encoding = match cursor.byte()? {
+                0 => SymlinkTargetEncoding::UnixBytes,
+                1 => SymlinkTargetEncoding::WindowsWide,
+                _ => return Err(SnapshotDecodeError::Malformed),
+            };
+            SymlinkTarget::new(encoding, cursor.bytes()?.to_vec())
+                .map(Some)
+                .map_err(|_| SnapshotDecodeError::Malformed)
+        }
+        _ => Err(SnapshotDecodeError::Malformed),
+    }
 }
 
 pub(super) fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
@@ -700,49 +794,5 @@ fn decode_facts(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn private_backend_facts_roundtrip_without_public_inspection() {
-        let backend = BackendIdentity::new(BackendKind::Nfs, "cluster")
-            .unwrap_or_else(|error| panic!("{error}"));
-        let source = SourceIdentity::new(backend, IdentityStrength::StableWithinBackend, b"fh")
-            .unwrap_or_else(|error| panic!("{error}"));
-        let entry = ObservedEntry::new(StoragePath::root(), EntryKind::File, None, None, source)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let entry = entry
-            .with_backend_fact_bytes(vec![0, 1, 255])
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert!(!format!("{entry:?}").contains("255"));
-        let rebuilt = ObservedEntry::decode_snapshot(entry.encode_snapshot().as_bytes())
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(rebuilt.backend_fact, entry.backend_fact);
-    }
-
-    #[test]
-    fn symlink_without_target_is_rejected_at_construction_and_decode() {
-        let backend = BackendIdentity::new(BackendKind::Local, "local")
-            .unwrap_or_else(|error| panic!("{error}"));
-        let source = SourceIdentity::new(backend, IdentityStrength::StableWithinBackend, b"inode")
-            .unwrap_or_else(|error| panic!("{error}"));
-        assert!(
-            ObservedEntry::new(
-                StoragePath::root(),
-                EntryKind::Symlink,
-                None,
-                None,
-                source.clone(),
-            )
-            .is_err()
-        );
-        let file = ObservedEntry::new(StoragePath::root(), EntryKind::File, None, None, source)
-            .unwrap_or_else(|error| panic!("{error}"));
-        let mut malformed = file.encode_snapshot().as_bytes().to_vec();
-        malformed[10] = 2;
-        assert_eq!(
-            ObservedEntry::decode_snapshot(&malformed),
-            Err(SnapshotDecodeError::Malformed)
-        );
-    }
-}
+#[path = "observation_tests.rs"]
+mod tests;

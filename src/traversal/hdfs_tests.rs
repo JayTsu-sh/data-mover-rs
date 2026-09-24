@@ -33,7 +33,10 @@ async fn hdfs_facts_survive_snapshot_without_backend_requery()
     let Some(TraversalItem::Entry(entry)) = session.next_item().await else {
         return Err("HDFS traversal did not return an entry".into());
     };
-    let rebuilt = ObservedEntry::decode_snapshot(entry.encode_snapshot().as_bytes())?;
+    let rebuilt = ObservedEntry::decode_snapshot(
+        entry.encode_snapshot().as_bytes(),
+        entry.source_identity().backend(),
+    )?;
     assert_eq!(*entry, rebuilt);
     while let Some(item) = session.next_item().await {
         assert!(crate::traversal::is_completion(&item));

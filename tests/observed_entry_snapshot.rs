@@ -4,9 +4,13 @@ use data_mover::model::{
     SourceIdentity, StoragePath, StorageTimestamp, TimePrecision,
 };
 
+fn backend(kind: BackendKind) -> Result<BackendIdentity, Box<dyn std::error::Error>> {
+    Ok(BackendIdentity::new(kind, format!("test-{kind}"))?)
+}
+
 fn source(kind: BackendKind, value: &[u8]) -> Result<SourceIdentity, Box<dyn std::error::Error>> {
     Ok(SourceIdentity::new(
-        BackendIdentity::new(kind, format!("test-{kind}"))?,
+        backend(kind)?,
         IdentityStrength::StableWithinBackend,
         value,
     )?)
@@ -60,13 +64,41 @@ fn snapshot_roundtrip_reconstructs_without_backend_access() -> Result<(), Box<dy
         source(BackendKind::Nfs, b"nfs-file-handle")?,
     )?;
     let encoded = observed.encode_snapshot();
-    let rebuilt = ObservedEntry::decode_snapshot(encoded.as_bytes())?;
+    let rebuilt = ObservedEntry::decode_snapshot(encoded.as_bytes(), &backend(BackendKind::Nfs)?)?;
     assert_eq!(rebuilt.identity_key(), observed.identity_key());
     assert_eq!(rebuilt.backend_kind(), BackendKind::Nfs);
     assert_eq!(rebuilt.path().as_str(), "dir/file");
     assert_eq!(rebuilt.kind(), EntryKind::File);
     assert_eq!(rebuilt.size(), Some(123));
     assert_eq!(rebuilt.modified(), observed.modified());
+    Ok(())
+}
+
+/// Decoding needs the endpoint the scan ran on; another endpoint or backend kind is reported as
+/// such, distinct from a corrupted entry.
+#[test]
+fn snapshot_decodes_only_against_the_endpoint_it_was_taken_on()
+-> Result<(), Box<dyn std::error::Error>> {
+    let endpoint =
+        BackendIdentity::new(BackendKind::Nfs, "nfs://10.128.61.200/ontap_lisaauto_nfs")?;
+    let observed = ObservedEntry::new(
+        StoragePath::new("dir/file")?,
+        EntryKind::File,
+        Some(9),
+        None,
+        SourceIdentity::new(endpoint.clone(), IdentityStrength::PathScoped, b"dir/file")?,
+    )?;
+    let bytes = observed.encode_snapshot().as_bytes().to_vec();
+    assert_eq!(ObservedEntry::decode_snapshot(&bytes, &endpoint)?, observed);
+    for other in [
+        BackendIdentity::new(BackendKind::Nfs, "nfs://10.128.61.201/ontap_lisaauto_nfs")?,
+        BackendIdentity::new(BackendKind::Cifs, "nfs://10.128.61.200/ontap_lisaauto_nfs")?,
+    ] {
+        assert_eq!(
+            ObservedEntry::decode_snapshot(&bytes, &other),
+            Err(SnapshotDecodeError::BackendMismatch)
+        );
+    }
     Ok(())
 }
 
@@ -81,15 +113,16 @@ fn decoder_rejects_unknown_truncated_tampered_and_trailing_data()
         source(BackendKind::Local, b"inode:1")?,
     )?;
     let valid = observed.encode_snapshot().as_bytes().to_vec();
+    let local = backend(BackendKind::Local)?;
 
     let mut unknown_version = valid.clone();
     unknown_version[4] = 99;
     assert_eq!(
-        ObservedEntry::decode_snapshot(&unknown_version),
+        ObservedEntry::decode_snapshot(&unknown_version, &local),
         Err(SnapshotDecodeError::UnsupportedVersion)
     );
     assert_eq!(
-        ObservedEntry::decode_snapshot(&valid[..valid.len() - 1]),
+        ObservedEntry::decode_snapshot(&valid[..valid.len() - 1], &local),
         Err(SnapshotDecodeError::Truncated)
     );
 
@@ -97,14 +130,14 @@ fn decoder_rejects_unknown_truncated_tampered_and_trailing_data()
     let last = tampered.len() - 1;
     tampered[last] ^= 1;
     assert_eq!(
-        ObservedEntry::decode_snapshot(&tampered),
+        ObservedEntry::decode_snapshot(&tampered, &local),
         Err(SnapshotDecodeError::IdentityMismatch)
     );
 
     let mut trailing = valid;
     trailing.push(0);
     assert_eq!(
-        ObservedEntry::decode_snapshot(&trailing),
+        ObservedEntry::decode_snapshot(&trailing, &local),
         Err(SnapshotDecodeError::TrailingData)
     );
     Ok(())

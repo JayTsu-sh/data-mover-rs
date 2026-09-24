@@ -253,7 +253,12 @@ crate-private same-backend native planner may consume private backend facts.
 is not a content hash. Backend facts are losslessly snapshot-encoded by data-mover through a
 versioned opaque codec. Terrasync stores the bytes and separate query columns, then returns
 the snapshot unchanged when reconstruction is required. Reconstruction never re-queries the
-backend.
+backend, but it needs the endpoint the scan ran on: snapshots (schema v5, ADR-0006 C4c) do not
+store the backend identity, so `ObservedEntry::decode_snapshot(bytes, &identity)` takes it from
+the caller (`Storage::identity()`, or `storage::endpoint_identity(&config)` offline).
+`SnapshotDecodeError::BackendMismatch` for a whole generation means the endpoint moved or is
+spelled differently — treat it as no previous generation, not corruption. v4 snapshots keep
+their own identity; copy them forward as bytes rather than re-encoding them.
 
 ### Optional observations
 
@@ -365,7 +370,8 @@ conflated. Data-mover returns a structured loss report; terrasync selects `Requi
 `AllowKnownLoss`, `BestEffort`, or `Omit`. Destination-side metadata reads return native
 observations and require no terrasync conversion. S3 prefixes are not called directories,
 and hardlink topology is outside this architecture. Object tags are a first-class bounded,
-redacted observation family in snapshot schema v4; they are not encoded as xattrs.
+redacted observation family in the entry snapshot (since schema v4); they are not encoded as
+xattrs.
 
 ## 8. Transfer interfaces
 

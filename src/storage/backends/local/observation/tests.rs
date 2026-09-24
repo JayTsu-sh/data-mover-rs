@@ -232,7 +232,9 @@ async fn required_xattrs_capture_empty_and_nonempty_values() -> io::Result<()> {
     assert_eq!(attributes[1].value(), b"metadata");
     let snapshot = observed.encode_snapshot();
     std::fs::remove_file(file)?;
-    let rebuilt = ObservedEntry::decode_snapshot(snapshot.as_bytes()).map_err(io::Error::other)?;
+    let rebuilt =
+        ObservedEntry::decode_snapshot(snapshot.as_bytes(), observed.source_identity().backend())
+            .map_err(io::Error::other)?;
     assert_eq!(rebuilt.metadata(), observed.metadata());
     Ok(())
 }
@@ -283,7 +285,9 @@ async fn required_acl_captures_access_and_directory_default_losslessly() -> io::
     assert_eq!(value.default_acl(), Some(acl.as_slice()));
     let snapshot = observed.encode_snapshot();
     std::fs::remove_dir(directory)?;
-    let rebuilt = ObservedEntry::decode_snapshot(snapshot.as_bytes()).map_err(io::Error::other)?;
+    let rebuilt =
+        ObservedEntry::decode_snapshot(snapshot.as_bytes(), observed.source_identity().backend())
+            .map_err(io::Error::other)?;
     assert_eq!(rebuilt.metadata().acl(), observed.metadata().acl());
     Ok(())
 }
@@ -318,8 +322,11 @@ async fn observes_symlink_without_following_target() -> io::Result<()> {
         if name == "link" {
             let snapshot = observed.encode_snapshot();
             std::fs::remove_file(root.0.join(name))?;
-            let rebuilt =
-                ObservedEntry::decode_snapshot(snapshot.as_bytes()).map_err(io::Error::other)?;
+            let rebuilt = ObservedEntry::decode_snapshot(
+                snapshot.as_bytes(),
+                observed.source_identity().backend(),
+            )
+            .map_err(io::Error::other)?;
             assert_eq!(rebuilt.symlink_target(), observed.symlink_target());
         }
     }
@@ -494,7 +501,9 @@ async fn snapshot_rebuild_preserves_private_local_facts_without_requery() -> io:
     let snapshot = observed.encode_snapshot();
     std::fs::remove_file(root.0.join("file"))?;
 
-    let rebuilt = ObservedEntry::decode_snapshot(snapshot.as_bytes()).map_err(io::Error::other)?;
+    let rebuilt =
+        ObservedEntry::decode_snapshot(snapshot.as_bytes(), observed.source_identity().backend())
+            .map_err(io::Error::other)?;
     assert_eq!(rebuilt, observed);
     let PrivateBackendEntryFacts::Local(facts) = rebuilt.backend_facts() else {
         panic!("expected local backend facts");

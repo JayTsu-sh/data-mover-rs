@@ -134,6 +134,14 @@ with versionId, latest flag and delete-marker flag, oldest to newest per key). B
 - Configs lose `identity`; `S3Storage::architecture_storage` / `HDFSStorage::architecture_storage` /
   `nfs::create_nfs_role_storage` lose their identity argument and `cifs::create_cifs_role_storage` is
   crate-private (C4b). `BackendIdentity::new` stays public for fixtures and snapshot decoding.
+- Observation snapshots stop storing the backend identity (format v5, C4c): every entry of a scan shares
+  it, so `ObservedEntry::decode_snapshot(bytes, &BackendIdentity)` takes it from the caller
+  (`Storage::identity()` or `storage::endpoint_identity`). A 4-byte endpoint fingerprint makes another
+  endpoint or kind fail with `BackendMismatch` (for a whole generation: the endpoint moved or is spelled
+  differently — no previous generation), distinct from a corrupted key (`IdentityMismatch`). v4 snapshots
+  still decode with the identity they carry (kind checked); re-encoding such an entry keeps that old
+  identity, so callers copy v4 bytes forward. Measured on `m1-source/d000/d000` (134,735 NFS entries):
+  217.3 B per entry in v5, 255.3 B with the endpoint stored, 223.3 B before C4.
 - `EntryIdentityKey` and observation snapshots change once (derived `stable_id`); terrasync's first
   incremental run after the upgrade is effectively full.
 - S3 content becomes visible before read-back; per-part Content-MD5, the part-list check and the
@@ -149,7 +157,8 @@ with versionId, latest flag and delete-marker flag, oldest to newest per key). B
 
 C1 this ADR · C2 cross-backend resume example and container-restart matrix, baseline · C3 legacy S3
 listing filters `.data-mover-*` · C3b the same for the legacy Local / NFS / HDFS listings and the CIFS /
-HDFS role-based namespace and traversal (one shared `ARTIFACT_PREFIX`) · C4 endpoint identity · C5 TransferIdentity and binding v3 · C6 source
+HDFS role-based namespace and traversal (one shared `ARTIFACT_PREFIX`) · C4 endpoint identity (C4a
+derivation, C4b wiring, C4c snapshots without the identity) · C5 TransferIdentity and binding v3 · C6 source
 version selector (C6a: native identity ignores the `"null"` version) · C7 destination discovery seam ·
 C8 Local · C9 Local reserved-name cleanup · C10 NFS · C11 CIFS · C12 HDFS · C13 verification point ·
 C14 S3 small objects, threshold, Direct · C15 S3 multipart on the final key · C16 resume granularity ·

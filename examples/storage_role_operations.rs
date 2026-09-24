@@ -103,6 +103,9 @@ enum Command {
         /// traversal rather than this example's formatting.
         #[arg(long)]
         quiet: bool,
+        /// Also sum the size of every entry's encoded snapshot (what a caller persists per entry).
+        #[arg(long)]
+        snapshot_bytes: bool,
     },
     /// Stream an NDX-paged depth-first traversal, printing one line per page.
     NdxWalk {
@@ -198,6 +201,7 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
         order,
         path,
         quiet,
+        snapshot_bytes,
     } = command
     else {
         unreachable!("dispatched by the caller")
@@ -216,11 +220,14 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
         max_depth: max_depth.and_then(NonZeroUsize::new),
     };
     let mut session = StorageTraversalSource::new(storage)?.traverse(request);
-    let (mut entries, mut failures) = (0_u64, 0_u64);
+    let (mut entries, mut failures, mut snapshots) = (0_u64, 0_u64, 0_u64);
     while let Some(item) = session.next_item().await {
         match item {
             TraversalItem::Entry(entry) => {
                 entries += 1;
+                if *snapshot_bytes {
+                    snapshots += entry.encode_snapshot().as_bytes().len() as u64;
+                }
                 if !*quiet {
                     println!("{:?} {}", entry.kind(), entry.path());
                 }
@@ -255,6 +262,12 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
     }
     let outcome = session.finish().await?;
     println!("entries={entries} failures={failures} outcome={outcome:?}");
+    if *snapshot_bytes {
+        println!(
+            "snapshot_bytes={snapshots} endpoint_bytes={}",
+            storage.identity().stable_id().len()
+        );
+    }
     Ok(())
 }
 
