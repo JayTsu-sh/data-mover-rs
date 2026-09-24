@@ -22,6 +22,7 @@ use crate::model::AclEncoding;
 use crate::model::{
     BackendIdentity, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
 };
+use crate::storage::artifacts::is_artifact_native;
 use crate::storage::durability::sync_directory;
 use crate::storage::{
     ByteStream, CheckpointObservation, MetadataMutation, PrepareRequest, PreparedStage,
@@ -127,8 +128,12 @@ impl LocalStagedDestination {
         }
         let relative =
             Self::checked_relative(request.final_destination.path(), Operation::Prepare)?;
-        if relative.components().any(|component| matches!(component, Component::Normal(name) if name.to_str().is_some_and(|name| name.starts_with(".data-mover-")))) {
-            return Err(failure(request.final_destination.path(), Operation::Prepare, FailureClass::Conflict));
+        if is_artifact_native(&relative) {
+            return Err(failure(
+                request.final_destination.path(),
+                Operation::Prepare,
+                FailureClass::Conflict,
+            ));
         }
         let reserved = Path::new(request.final_destination.path().as_str())
             .components()

@@ -230,7 +230,11 @@ impl HdfsTransferRequest {
         binding.update(&source_fingerprint.digest);
         binding.update(final_path_text.as_bytes());
         let binding = binding.finalize().to_hex();
-        let partial_name = format!(".data-mover-{}.part", &binding[..32]);
+        let partial_name = format!(
+            "{}{}.part",
+            crate::storage::artifacts::ARTIFACT_PREFIX,
+            &binding[..32]
+        );
         let partial_path = final_path.with_file_name(partial_name);
         Ok(Self {
             identity_digest,

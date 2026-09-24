@@ -14,7 +14,7 @@ use crate::storage::{
     VerifyRequest, WriteEvidence,
 };
 
-const STAGING_DIRECTORY: &str = ".data-mover-staging";
+pub(super) const STAGING_DIRECTORY: &str = ".data-mover-staging";
 const VERIFY_CHUNK: u32 = 1024 * 1024;
 
 #[async_trait]

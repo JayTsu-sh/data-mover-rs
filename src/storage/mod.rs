@@ -52,12 +52,6 @@ pub use roles::{
 };
 pub(crate) use roles::{CheckpointRegistration, DeferredCheckpoint};
 
-/// Local transfer files use a reserved hidden namespace in destination parents.
-pub(crate) fn is_local_transfer_artifact(name: &std::ffi::OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|name| name.starts_with(".data-mover-"))
-}
-
 pub use crate::runtime::read_budget::ReadBudget;
 
 // Keep backend prefetch coupled to storage admission, not runtime internals.

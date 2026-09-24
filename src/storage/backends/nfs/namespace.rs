@@ -1,4 +1,4 @@
-use std::path::{Component, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,6 +8,7 @@ use crate::model::{
     BackendIdentity, EntryKind, FailureClass, IdentityStrength, Operation, SourceIdentity,
     StoragePath, SymlinkTarget, SymlinkTargetEncoding, Transience,
 };
+use crate::storage::artifacts::is_artifact_native;
 use crate::storage::{
     Namespace, NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure,
 };
@@ -173,9 +174,7 @@ fn checked_allow_root(path: &StoragePath) -> Result<PathBuf, StorageRoleFailure>
 }
 
 fn is_internal(path: &StoragePath) -> bool {
-    PathBuf::from(path.as_str()).components().any(|component| {
-        matches!(component, Component::Normal(name) if name.to_str().is_some_and(|name| name.starts_with(super::staged::INTERNAL_PREFIX)))
-    })
+    is_artifact_native(Path::new(path.as_str()))
 }
 
 fn invalid(path: &StoragePath) -> StorageRoleFailure {

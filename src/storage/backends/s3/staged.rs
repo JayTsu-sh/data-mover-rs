@@ -7,6 +7,7 @@ use futures::StreamExt;
 use tokio::sync::Mutex;
 
 use crate::model::{BackendIdentity, FailureClass, Operation, Transience};
+use crate::storage::artifacts::ARTIFACT_PREFIX;
 use crate::storage::{
     ByteStream, CheckpointObservation, Metadata, MetadataMutation, PrepareRequest, PreparedStage,
     PublicationEvidence, PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity,
@@ -102,7 +103,7 @@ impl<P> S3StagedDestination<P> {
 
     fn temp_key(request: &PrepareRequest) -> String {
         format!(
-            ".data-mover-stage/{}/{}",
+            "{ARTIFACT_PREFIX}stage/{}/{}",
             blake3::Hash::from_bytes(request.recovery_binding).to_hex(),
             blake3::hash(request.final_destination.path().as_str().as_bytes()).to_hex()
         )

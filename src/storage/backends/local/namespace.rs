@@ -32,10 +32,10 @@ use crate::model::{
     BackendIdentity, BackendSessionFailure, EntryFailureIdentity, EntryKind, EntryOperationFailure,
     FailureClass, Operation, StoragePath, SymlinkTarget, Transience,
 };
+use crate::storage::artifacts::is_artifact_name;
 use crate::storage::durability::sync_directory;
 use crate::storage::{
     Namespace, NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure,
-    is_local_transfer_artifact,
 };
 
 /// Namespace role for one Local root.
@@ -272,7 +272,7 @@ fn list_blocking(
             }
         };
         let name = entry.file_name();
-        if is_local_transfer_artifact(&name) {
+        if is_artifact_name(&name) {
             continue;
         }
         let child = child_path(native, &name);
@@ -407,7 +407,7 @@ fn checked(
     let mut native = PathBuf::new();
     for component in Path::new(path.as_str()).components() {
         match component {
-            Component::Normal(name) if !is_local_transfer_artifact(name) => native.push(name),
+            Component::Normal(name) if !is_artifact_name(name) => native.push(name),
             Component::CurDir => {}
             _ => return Err(invalid()),
         }

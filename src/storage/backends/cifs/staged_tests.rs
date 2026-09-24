@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream;
 
-use super::staged::{CifsStageFile, CifsStagedDestination, CifsStagedProtocol};
+use super::staged::{CifsStageFile, CifsStagedDestination, CifsStagedProtocol, STAGING_DIRECTORY};
 use crate::model::{
     BackendIdentity, BackendKind, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
     Operation, SourceIdentity, StoragePath, Transience,
@@ -764,3 +764,8 @@ mod metadata_stage_tests;
 #[allow(clippy::unwrap_used)]
 #[path = "positioned_tests.rs"]
 mod positioned_tests;
+
+#[test]
+fn staging_directory_is_a_transfer_artifact() {
+    assert!(STAGING_DIRECTORY.starts_with(crate::storage::artifacts::ARTIFACT_PREFIX));
+}

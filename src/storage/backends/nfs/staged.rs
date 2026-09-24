@@ -9,6 +9,7 @@ use futures::stream::FuturesOrdered;
 
 use super::source::{NfsProtocolFailure, entry_failure, role_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath, Transience};
+use crate::storage::artifacts::is_artifact_native;
 use crate::storage::{
     ByteStream, CheckpointObservation, Metadata, MetadataMutation, PrepareRequest, PreparedStage,
     PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
@@ -18,8 +19,6 @@ use crate::storage::{
 
 #[path = "positioned_writer.rs"]
 mod positioned_writer;
-
-pub(crate) const INTERNAL_PREFIX: &str = ".data-mover-";
 
 #[async_trait]
 pub(crate) trait NfsStageFile: Send + Sync {
@@ -918,9 +917,7 @@ fn checked_final(path: &StoragePath) -> Result<(), StorageRoleFailure> {
                     | std::path::Component::Prefix(_)
             )
         })
-        || native.components().any(|component| {
-            matches!(component, std::path::Component::Normal(name) if name.to_str().is_some_and(|name| name.starts_with(INTERNAL_PREFIX)))
-        })
+        || is_artifact_native(&native)
     {
         Err(failure(
             path,

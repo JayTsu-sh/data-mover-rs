@@ -1227,3 +1227,8 @@ async fn positioned_sparse_completion_crosses_multiple_intervals_once() -> io::R
     ok(adapter.discard(stage).await);
     Ok(())
 }
+
+#[test]
+fn staging_directory_is_a_transfer_artifact() {
+    assert!(STAGING_DIRECTORY.starts_with(crate::storage::artifacts::ARTIFACT_PREFIX));
+}

@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::protocol::{HdfsProtocol, cancelled, entry_failure};
 use crate::model::{BackendIdentity, EntryKind, FailureClass, Operation, StoragePath, Transience};
+use crate::storage::artifacts::ARTIFACT_PREFIX;
 use crate::storage::{
     ByteStream, CheckpointObservation, FinalDestination, Metadata, MetadataMutation,
     PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure,
@@ -579,7 +580,7 @@ fn claimed_path(base: &StoragePath, claim: [u8; 32]) -> Result<StoragePath, Stor
     let digest = hasher.finalize().to_hex();
     StoragePath::new(
         base_path
-            .with_file_name(format!(".data-mover-{}.claimed", &digest[..32]))
+            .with_file_name(format!("{ARTIFACT_PREFIX}{}.claimed", &digest[..32]))
             .to_string_lossy(),
     )
     .map_err(|_| failure(base, Operation::Prepare, FailureClass::InvalidInput))
@@ -676,7 +677,7 @@ fn partial_path(
     let digest = hasher.finalize().to_hex();
     StoragePath::new(
         final_path
-            .with_file_name(format!(".data-mover-{}.part", &digest[..32]))
+            .with_file_name(format!("{ARTIFACT_PREFIX}{}.part", &digest[..32]))
             .to_string_lossy(),
     )
     .map_err(|_| {
