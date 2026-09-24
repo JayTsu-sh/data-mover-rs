@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::collections::HashMap;
 
@@ -15,11 +15,11 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeProtocol {
-        files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    pub(in crate::storage::backends::nfs) struct FakeProtocol {
+        pub(in crate::storage::backends::nfs) files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         opens: std::sync::atomic::AtomicU64,
         closes: Arc<std::sync::atomic::AtomicU64>,
-        rename_mode: std::sync::atomic::AtomicU8,
+        pub(in crate::storage::backends::nfs) rename_mode: std::sync::atomic::AtomicU8,
         active_writes: Arc<std::sync::atomic::AtomicUsize>,
         maximum_active_writes: Arc<std::sync::atomic::AtomicUsize>,
         active_reads: Arc<std::sync::atomic::AtomicUsize>,
@@ -932,7 +932,7 @@ mod tests {
         );
     }
 
-    fn adapter() -> (
+    pub(in crate::storage::backends::nfs) fn adapter() -> (
         NfsStagedDestinationAdapter,
         Arc<FakeProtocol>,
         BackendIdentity,

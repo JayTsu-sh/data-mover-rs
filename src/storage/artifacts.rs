@@ -156,7 +156,7 @@ pub(crate) fn artifact_temporary_name(final_name: &str, kind: ArtifactKind) -> S
     not(test),
     expect(
         dead_code,
-        reason = "used by path-addressed destinations from ADR-0006 C10"
+        reason = "for destinations that address artifacts by storage path, ADR-0006 C11"
     )
 )]
 pub(crate) fn sibling_artifact(

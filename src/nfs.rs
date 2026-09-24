@@ -1107,6 +1107,16 @@ impl NfsStagedProtocol for NFSStorage {
             .map(|(_, attrs)| attrs.filesize)
     }
 
+    async fn stat(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<(bool, u64), NfsProtocolFailure> {
+        // nfs-rs reports both versions' types in the v3 numbering (NF4REG is also 1).
+        self.role_lookup_with_attrs(path)
+            .await
+            .map(|(_, attrs)| (attrs.type_ == FType3::NF3REG as u32, attrs.filesize))
+    }
+
     async fn rename(
         &self,
         from: &crate::model::StoragePath,

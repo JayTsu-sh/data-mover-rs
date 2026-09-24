@@ -1,6 +1,7 @@
 //! NFS adapter facade.
 
 mod acl;
+mod at_destination;
 mod checkpoint;
 pub(crate) mod common;
 #[allow(dead_code)]

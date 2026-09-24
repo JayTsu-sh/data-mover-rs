@@ -14,6 +14,9 @@ pub(super) async fn persist(
     stage: &PreparedStage,
     durable_prefix: u64,
 ) -> Result<(), StorageRoleFailure> {
+    if stage.at_destination {
+        return super::at_destination::write_pointer(adapter, stage, durable_prefix, false).await;
+    }
     let final_path = stage.final_destination.path();
     let stage_id = NfsStagedDestinationAdapter::stage_id(&stage.token, final_path)?;
     let checkpoint = checkpoint_path(&stage_id, final_path)?;
@@ -87,6 +90,9 @@ pub(super) async fn remove(
     adapter: &NfsStagedDestinationAdapter,
     stage: &PreparedStage,
 ) -> Result<(), StorageRoleFailure> {
+    if stage.at_destination {
+        return super::at_destination::remove_pointer(adapter, stage).await;
+    }
     let final_path = stage.final_destination.path();
     let stage_state = checkpoint_state(stage)?;
     if !stage_state

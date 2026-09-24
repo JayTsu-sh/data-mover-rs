@@ -81,6 +81,7 @@ pub(super) async fn recover(
     );
     stage.backend_state = Some(std::sync::Arc::new(NfsStageState {
         checkpoint_created: std::sync::atomic::AtomicBool::new(true),
+        fence: None,
     }));
     Ok(stage)
 }
