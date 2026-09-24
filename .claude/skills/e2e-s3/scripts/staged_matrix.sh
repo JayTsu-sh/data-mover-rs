@@ -24,12 +24,22 @@ stage_objects() { curl -s "${SIG[@]}" "$B?list-type=2&prefix=$PREFIX/" | grep -o
 # MinIO 2023 lists multipart uploads only for an exact key, so a prefix count is 0 there whatever
 # exists; the interrupt cases below read the exact key and upload id from the recovery record.
 open_uploads() { curl -s "${SIG[@]}" "$B?uploads&prefix=$PREFIX/" | grep -c '<UploadId>'; }
+# The S3 recovery identity inside a record is the stage token `<key>\0<upload id>`; reads it exactly
+# (a `strings` scrape of the binary record can pick up the wrong run of printable bytes).
+record_token() { # record -> "key upload_id"
+  python3 - "$1" <<'PY'
+import re, sys
+data = open(sys.argv[1], 'rb').read()
+m = re.search(rb'(\.data-mover-stage/[0-9a-f]{64}/[0-9a-f]{64})\x00([A-Za-z0-9+/=_.-]+)', data)
+print(f"{m.group(1).decode()} {m.group(2).decode()}" if m else "")
+PY
+}
 # Parts of the upload a recovery record points at: "<parts>" or "gone" (NoSuchUpload), "none" (no record).
 recorded_upload() {
   local record; record=$(ls "$DATA_MOVER_RECOVERY_DIR"/*.state 2>/dev/null | head -1)
   [ -z "$record" ] && { echo none; return; }
-  local key id; key=$(strings -n 20 "$record" | grep '\.data-mover-stage/' | head -1)
-  id=$(strings -n 20 "$record" | grep -v '\.data-mover-stage/' | grep -v DMRECOV | head -1)
+  local key id; read -r key id <<<"$(record_token "$record")"
+  [ -z "$key" ] && { echo unparsed; return; }
   local out; out=$(curl -s "${SIG[@]}" "$B/$PREFIX/$key?uploadId=$id")
   if echo "$out" | grep -q NoSuchUpload; then echo gone; else echo "$out" | grep -c '<PartNumber>'; fi
 }
@@ -37,9 +47,8 @@ recorded_upload() {
 abort_recorded() {
   for record in "$DATA_MOVER_RECOVERY_DIR"/*.state; do
     [ -f "$record" ] || continue
-    local key id; key=$(strings -n 20 "$record" | grep '\.data-mover-stage/' | head -1)
-    id=$(strings -n 20 "$record" | grep -v '\.data-mover-stage/' | grep -v DMRECOV | head -1)
-    curl -s -o /dev/null "${SIG[@]}" -X DELETE "$B/$PREFIX/$key?uploadId=$id"
+    local key id; read -r key id <<<"$(record_token "$record")"
+    [ -n "$key" ] && curl -s -o /dev/null "${SIG[@]}" -X DELETE "$B/$PREFIX/$key?uploadId=$id"
   done
 }
 case_() { # label, args...
@@ -49,13 +58,15 @@ case_() { # label, args...
 }
 
 SIZES=("z0:0" "k1:1024" "m8:8388608" "m8p1:8388609" "m200:209715200")
+# RESUME_ONLY=1 runs only the interrupt-then-resume cases.
+RESUME_ONLY=${RESUME_ONLY:-0}
 echo "run=$RUN prefix=$PREFIX"
 for entry in "${SIZES[@]}"; do
   name=${entry%%:*}; bytes=${entry#*:}
   "$BIN" --source "$WORK/src" --source-path "$name" --seed-bytes "$bytes" --destination "$WORK/seed-probe" \
     --destination-path "$name" --policy atomic --read-back off --identity "seed-$RUN-$name" >/dev/null 2>&1
 done
-for policy in checkpointed atomic direct; do
+[ "$RESUME_ONLY" = 1 ] || for policy in checkpointed atomic direct; do
   for rb in on off; do
     for entry in "${SIZES[@]}"; do
       name=${entry%%:*}
@@ -67,7 +78,7 @@ for policy in checkpointed atomic direct; do
 done
 
 echo "-- native S3 -> S3"
-for name in k1 m200; do
+[ "$RESUME_ONLY" = 1 ] || for name in k1 m200; do
   case_ "native $name" --source "s3:$PREFIX" --source-path "atomic-off-$name" \
     --destination "s3:$PREFIX" --destination-path "native-$name" --policy checkpointed \
     --identity "n-$RUN-$name"
