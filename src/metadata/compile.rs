@@ -86,7 +86,7 @@ pub(crate) fn compile_copied_metadata_plan(
         plan.skipped.retain(|value| value.family != family);
         let supported = matches!(
             request.target.ownership_mode,
-            OwnershipTarget::Numeric | OwnershipTarget::ModeOnly
+            OwnershipTarget::Numeric | OwnershipTarget::ModeOnly | OwnershipTarget::NotPermitted
         );
         drop_with_loss(
             &mut plan,
@@ -216,24 +216,18 @@ fn compile_ownership(
             exact(plan, family, MetadataMutation::MappedOwnership(ownership));
             Ok(())
         }
-        OwnershipTarget::ModeOnly => {
-            let losses = vec![SemanticLoss::OwnerAndGroupDropped];
-            if policy == MetadataPolicy::RequireExact {
-                return Err(MetadataPlanError::new(
-                    family,
-                    policy,
-                    RefusalCause::LossRejected(SemanticLoss::OwnerAndGroupDropped),
-                ));
-            }
-            plan.losses.0.push((family, losses[0]));
-            plan.mappings.push(FamilyMapping {
-                family,
-                decision: MappingDecision::Lossy(losses),
-            });
-            plan.mutations
-                .push((family, MetadataMutation::Mode(value.mode & 0o7777)));
-            Ok(())
-        }
+        OwnershipTarget::ModeOnly => carry_mode_only(
+            plan,
+            policy,
+            SemanticLoss::OwnerAndGroupDropped,
+            value.mode & 0o7777,
+        ),
+        OwnershipTarget::NotPermitted => carry_mode_only(
+            plan,
+            policy,
+            SemanticLoss::OwnerAndGroupNotPermitted,
+            mode_only(value.mode),
+        ),
         OwnershipTarget::Unsupported => unavailable(
             plan,
             family,
@@ -245,6 +239,30 @@ fn compile_ownership(
             drop_with_loss(plan, family, policy, SemanticLoss::OwnershipModeDropped)
         }
     }
+}
+
+/// Carries the mode without owner and group, naming why they are not carried.
+fn carry_mode_only(
+    plan: &mut MetadataPlan,
+    policy: MetadataPolicy,
+    loss: SemanticLoss,
+    mode: u32,
+) -> Result<(), MetadataPlanError> {
+    let family = MetadataFamily::OwnershipMode;
+    if policy == MetadataPolicy::RequireExact {
+        return Err(MetadataPlanError::new(
+            family,
+            policy,
+            RefusalCause::LossRejected(loss),
+        ));
+    }
+    plan.losses.0.push((family, loss));
+    plan.mappings.push(FamilyMapping {
+        family,
+        decision: MappingDecision::Lossy(vec![loss]),
+    });
+    plan.mutations.push((family, MetadataMutation::Mode(mode)));
+    Ok(())
 }
 
 fn compile_timestamps(

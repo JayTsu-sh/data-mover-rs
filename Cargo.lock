@@ -1473,6 +1473,7 @@ dependencies = [
  "rayon",
  "remove_dir_all",
  "reqwest 0.13.2",
+ "rustix",
  "rustls 0.23.39",
  "serde",
  "serde_json",

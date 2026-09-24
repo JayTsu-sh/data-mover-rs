@@ -105,10 +105,15 @@ pub enum ValueTarget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum OwnershipTarget {
     Numeric,
     ExternalMapping,
     ModeOnly,
+    /// Stores numeric owner and group, but whoever writes the copy may not give it this one (no
+    /// privilege to chown to another user): the mode is kept without its set-id bits, since the
+    /// file stays owned by the writer.
+    NotPermitted,
     Unsupported,
     NotApplicable,
 }
@@ -167,6 +172,10 @@ pub enum SemanticLoss {
     /// Owner and group dropped because the source named them and the names could not be mapped
     /// to ids; the mode is kept.
     OwnerAndGroupUnmapped,
+    /// Owner and group dropped because the writer may not give the file this owner or this group
+    /// (no `CAP_CHOWN`, and not its own uid with a group it is in); the mode is kept without its
+    /// set-id bits.
+    OwnerAndGroupNotPermitted,
     TimestampPrecisionReduced,
     AccessedTimestampDropped,
     ModifiedTimestampDropped,

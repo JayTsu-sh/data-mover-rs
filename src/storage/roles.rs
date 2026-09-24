@@ -470,6 +470,14 @@ pub trait StagedDestination: Send + Sync {
     fn copied_metadata_target(&self) -> Option<CopiedMetadataTarget> {
         None
     }
+    /// Whether a copy may give the file this owner and group, when `copied_metadata_target`
+    /// declares numeric ownership. Answered per file from facts fixed when the destination
+    /// connected: an unprivileged Local writer keeps its own files' owners but cannot give a file
+    /// to someone else. A `false` carries the mode alone and reports the loss instead of failing
+    /// the file on the refused write.
+    fn may_set_owner(&self, _uid: u32, _gid: u32) -> bool {
+        true
+    }
 
     /// Automatic checkpoint spacing, when deferred recovery is supported by this destination.
     fn automatic_checkpoint_interval_bytes(&self) -> Option<u64> {

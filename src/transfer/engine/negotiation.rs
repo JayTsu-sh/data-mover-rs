@@ -11,10 +11,10 @@ use crate::metadata::{
     TimestampTarget, TimestampTargetCapability, ValueTarget, compile_copied_metadata_plan,
     role_failure_text,
 };
-use crate::model::{ObservationMode, ObservationPlan};
+use crate::model::{MetadataObservation, MetadataObservations, ObservationMode, ObservationPlan};
 use crate::storage::{
     CopiedAclTarget, CopiedMetadataTarget, CopiedOwnershipTarget, CopiedValueTarget, Metadata,
-    PreflightPolicy, SourceDescriptor, StorageRoleFailure,
+    PreflightPolicy, SourceDescriptor, StagedDestination, StorageRoleFailure,
 };
 use crate::transfer::{CopiedMetadataRequest, TransferRequest};
 
@@ -48,6 +48,7 @@ pub(super) async fn copied_metadata_plan(
     let Some(MetadataRoles {
         source: metadata,
         baseline,
+        destination,
         target,
     }) = metadata_roles(request)
     else {
@@ -69,7 +70,11 @@ pub(super) async fn copied_metadata_plan(
             failure.message = "observing source metadata failed";
             failure
         })?;
-    let (target, ownership_policy) = metadata_target(target);
+    let owner_permitted = owner_permitted(
+        |uid, gid| destination.may_set_owner(uid, gid),
+        &observations.observations,
+    );
+    let (target, ownership_policy) = metadata_target(target, owner_permitted);
     let policies = copied_policies(
         requested,
         ownership_policy,
@@ -94,6 +99,7 @@ pub(super) async fn copied_metadata_plan(
 struct MetadataRoles {
     source: Arc<dyn Metadata>,
     baseline: ObservationPlan,
+    destination: Arc<dyn StagedDestination>,
     target: CopiedMetadataTarget,
 }
 
@@ -113,17 +119,39 @@ fn metadata_roles(request: &TransferRequest) -> Option<MetadataRoles> {
     Some(MetadataRoles {
         source,
         baseline,
+        destination,
         target,
     })
+}
+
+/// Whether the destination may give this file the source's owner and group — asked per file,
+/// because an unprivileged writer may keep its own files' owners but not give files away.
+fn owner_permitted(
+    may_set_owner: impl Fn(u32, u32) -> bool,
+    observations: &MetadataObservations,
+) -> bool {
+    match observations.ownership_mode() {
+        MetadataObservation::Value { value, .. } => may_set_owner(value.uid, value.gid),
+        _ => true,
+    }
 }
 
 /// Translates what the destination accepts across the layer boundary — `storage` cannot name
 /// `metadata`'s vocabulary, and this is the layer that sees both — together with the ownership
 /// policy that target implies. Whether a family is carried at all is the caller's request, which
 /// reaches the compiler as a policy.
-fn metadata_target(target: CopiedMetadataTarget) -> (MetadataTarget, MetadataPolicy) {
+fn metadata_target(
+    target: CopiedMetadataTarget,
+    owner_permitted: bool,
+) -> (MetadataTarget, MetadataPolicy) {
     let (ownership_mode, ownership_policy) = match target.ownership {
-        CopiedOwnershipTarget::Numeric => (OwnershipTarget::Numeric, MetadataPolicy::RequireExact),
+        CopiedOwnershipTarget::Numeric if owner_permitted => {
+            (OwnershipTarget::Numeric, MetadataPolicy::RequireExact)
+        }
+        CopiedOwnershipTarget::Numeric => (
+            OwnershipTarget::NotPermitted,
+            MetadataPolicy::AllowKnownLoss,
+        ),
         CopiedOwnershipTarget::Unsupported => (
             OwnershipTarget::NotApplicable,
             MetadataPolicy::AllowKnownLoss,
@@ -245,6 +273,52 @@ mod tests {
         assert_eq!(observation_mode(true), ObservationMode::BestEffort);
         assert_eq!(optional_policy(false), MetadataPolicy::Omit);
         assert_eq!(optional_policy(true), MetadataPolicy::BestEffort);
+    }
+
+    fn numeric_destination() -> CopiedMetadataTarget {
+        CopiedMetadataTarget {
+            timestamp_precision: crate::model::TimePrecision::Nanoseconds,
+            ownership: CopiedOwnershipTarget::Numeric,
+            acl: CopiedAclTarget::Unsupported,
+            xattrs: CopiedValueTarget::Unsupported,
+        }
+    }
+
+    /// A numeric destination that may not give this file its source owner carries the mode alone,
+    /// as a known loss — never a refusal that fails the file on the write.
+    #[test]
+    fn an_owner_the_writer_may_not_set_becomes_mode_only_with_a_named_loss() {
+        let (target, policy) = metadata_target(numeric_destination(), true);
+        assert_eq!(target.ownership_mode, OwnershipTarget::Numeric);
+        assert_eq!(policy, MetadataPolicy::RequireExact);
+        let (target, policy) = metadata_target(numeric_destination(), false);
+        assert_eq!(target.ownership_mode, OwnershipTarget::NotPermitted);
+        assert_eq!(policy, MetadataPolicy::AllowKnownLoss);
+    }
+
+    /// The destination is asked about the owner the source actually has; with no owner observed
+    /// there is nothing to ask, and nothing to lose.
+    #[test]
+    fn the_destination_is_asked_about_this_files_owner() {
+        let owned_by = |uid, gid| MetadataObservations {
+            ownership_mode: MetadataObservation::Value {
+                value: crate::model::OwnershipMode {
+                    uid,
+                    gid,
+                    mode: 0o100_644,
+                },
+                provenance: crate::model::MetadataProvenance::Inline,
+            },
+            ..MetadataObservations::default()
+        };
+        let only_mine = |uid, gid| uid == 1000 && gid == 1000;
+        assert!(owner_permitted(only_mine, &owned_by(1000, 1000)));
+        assert!(!owner_permitted(only_mine, &owned_by(0, 0)));
+        assert!(!owner_permitted(only_mine, &owned_by(1000, 0)));
+        assert!(owner_permitted(
+            |_, _| false,
+            &MetadataObservations::default()
+        ));
     }
 
     fn refused(cause: RefusalCause) -> String {

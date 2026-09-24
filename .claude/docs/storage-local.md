@@ -36,6 +36,12 @@ C:\Windows\path  (Windows)
 - `ino` (inode number，作为 join key)。
 - `mtime` / `atime` / `ctime` (走 time_util)。
 
+### 作为目的端设 owner
+
+非 root 且没有 `CAP_CHOWN` 时，只能把文件留给自己（uid 是自己、gid 是所在组）。`LocalStagedDestination` 连接时
+读一次（`staged/owner_privilege.rs`），`may_set_owner` 逐文件回答；不能设的只拷 mode（去 set-id），报
+`OwnerAndGroupNotPermitted`。详见 [metadata-negotiation.md](metadata-negotiation.md)「目的端没有 chown 特权」。
+
 ### Windows 元数据
 
 通过 `acl.rs` + `windows` crate (`#[cfg(windows)]`)：

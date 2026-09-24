@@ -33,12 +33,16 @@ use crate::storage::{
 mod checkpoint;
 mod direct;
 mod directory_sync;
+#[cfg(unix)]
+mod owner_privilege;
 mod positioned;
 mod probe;
 mod publication;
 mod recovery;
 mod verification;
 
+#[cfg(unix)]
+use owner_privilege::OwnerPrivilege;
 use probe::WriteProbe;
 
 const STAGING_DIRECTORY: &str = ".data-mover-staging";
@@ -108,6 +112,8 @@ pub(crate) struct LocalStagedDestination {
     write_concurrency: usize,
     write_probe: Arc<WriteProbe>,
     directory_sync: Arc<directory_sync::DirectorySync>,
+    #[cfg(unix)]
+    owner_privilege: OwnerPrivilege,
 }
 
 impl LocalStagedDestination {
@@ -163,6 +169,8 @@ impl LocalStagedDestination {
             write_concurrency,
             write_probe: Arc::new(WriteProbe::default()),
             directory_sync: Arc::new(directory_sync::DirectorySync::default()),
+            #[cfg(unix)]
+            owner_privilege: OwnerPrivilege::current(),
         })
     }
 
@@ -1002,6 +1010,11 @@ impl StagedDestination for LocalStagedDestination {
         {
             None
         }
+    }
+
+    #[cfg(unix)]
+    fn may_set_owner(&self, uid: u32, gid: u32) -> bool {
+        self.owner_privilege.permits(uid, gid)
     }
 
     fn automatic_checkpoint_interval_bytes(&self) -> Option<u64> {

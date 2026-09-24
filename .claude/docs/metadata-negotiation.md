@@ -75,10 +75,34 @@ Display 如 `ACL skipped: the source cannot read it`。不变式：outcome 为 `
 | backend | owner/group（源端） | ACL | xattrs | 依据 |
 |---|---|---|---|---|
 | NFS | v3 数字；v4 字符串，nfs-rs 映射不了的名字走「只有 mode」（`OwnerAndGroupUnmapped`，见 `storage-nfs.md`） | 协商到才有，报 `NfsV4` | nfs-rs 0.8.4 永远报未协商 | `mount.capabilities().acl` / `.named_attributes` |
-| Local | unix 下数字 | unix 下 `Posix` | unix 下支持 | 非 unix 整体不参与拷贝 |
+| Local | unix 下数字（作目的端时逐文件问能不能设这个 owner，见下节） | unix 下 `Posix` | unix 下支持 | 非 unix 整体不参与拷贝 |
 | CIFS | 读不到（`NotApplicable`） | `WindowsSecurityDescriptor`（只保留 account 类 ACE） | 不支持 | `cifs/metadata.rs` 的 decode 只认这一种 |
 | HDFS | 字符串，走「只有 mode」（`OwnerAndGroupDropped`） | 不支持 | 不支持 | 观测侧也一律 `unavailable` |
 | S3（目的端） | 不参与 | 不参与 | 不参与 | 未实现 `copied_metadata_target` |
+
+### 目的端没有 chown 特权（K5，Local）
+
+用户规则（2026-09-24）：**自己的文件不报损失，按文件比对 owner**。Local 目的端连接时读一次本进程的事实
+（`staged/owner_privilege.rs`，rustix）：Linux 上**只看有效集里的 `CAP_CHOWN`**（euid 0 本身不够 —— 丢了能力的
+容器里的 root 照样被拒；读不到能力时才退回看 euid 0）→ 什么 owner 都能设；否则只能设「uid 是自己、gid 是自己
+所在的组（egid 或附加组）」。无论哪种，id 必须在本 user namespace 的 `/proc/self/{uid,gid}_map` 里（rootless
+容器里映射外的 id 内核直接 `EINVAL`）。协商在观测到源端 owner 后逐文件问
+`StagedDestination::may_set_owner(uid, gid)`（默认 `true`，其他 backend 不变）：
+
+| 情形 | 结果 |
+|---|---|
+| 能设（特权，或自己的文件、自己的组） | 精确拷 owner/group/mode，无损失 |
+| 不能设 | `OwnershipTarget::NotPermitted`：只拷 mode，**去掉 setuid / setgid**（文件归写入者所有），损失 `OwnerAndGroupNotPermitted`；不因此失败 |
+
+之前非 root 拷别人的文件会发 chown、收 EPERM，**整个文件失败**。真机（uid 1000）：`/etc/hostname`（root）、
+m1-source NFSv3 文件 → Local 均成功并报该损失；`/usr/bin/passwd`（`-rwsr-xr-x root`）拷成 `-rwxr-xr-x 1000`；
+自己的文件无损失。NFS 目的端的 root_squash 同类问题尚未处理（需真机确认）。
+
+偏保守的角落（报损失，从不失败）：uid 是自己但 gid 不在所在组时，整族按 `OwnerAndGroupNotPermitted` 记、
+set-id 也去掉，尽管 uid 实际留住了；内核还允许 chgrp 到文件**当前**的 gid（从 setgid 父目录继承来的组），
+这里不认。能力在连接时读一次：之后凭据变少会回到「写被拒、文件失败」，不会静默出错。
+专家接口 `with_metadata_plan` 给的 `Numeric` 不经这一步，调用方可自己问 `may_set_owner`；
+legacy `src/local.rs` 的 `lchown` 未改。
 
 ## 两条必须记住的不变式
 
