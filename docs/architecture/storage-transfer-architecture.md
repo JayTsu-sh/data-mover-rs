@@ -567,7 +567,10 @@ processes cannot acquire the same lifecycle authority.
 Backend mechanisms:
 
 - Local/NFS/CIFS: persisted contiguous durable prefix; writes beyond a gap are not reusable;
-- S3/DXN: service-enumerated multipart parts named by the validated upload identity;
+- S3/DXN: service-enumerated multipart parts named by the validated upload identity; no adapter
+  claim (it relied on a conditional PUT that MinIO `RELEASE.2023-03-20` rejects with 404, failing
+  every resume there) — exclusivity is the engine's per-host recovery lease, and one destination
+  key is never written by two transfers at once (caller contract);
 - HDFS: deterministic request-bound partial and continuous verified tail append.
 
 The HDFS architecture adapter is split at a protocol boundary: `storage/backends/hdfs`

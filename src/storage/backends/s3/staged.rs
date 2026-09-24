@@ -21,7 +21,7 @@ mod native_tests;
 mod publication;
 #[cfg(test)]
 mod sizing_tests;
-use super::{S3ClaimOutcome, S3Protocol, S3ProtocolFailure};
+use super::{S3Protocol, S3ProtocolFailure};
 
 const PART_SIZE: usize = 8 * 1024 * 1024;
 const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;
@@ -72,7 +72,6 @@ struct StageState {
     upload_id: String,
     parts: Vec<(i32, String)>,
     completed: bool,
-    claim_key: Option<String>,
 }
 
 pub(crate) struct S3StagedDestination<P> {
@@ -258,33 +257,6 @@ impl<P: S3Protocol> S3StagedDestination<P> {
         Ok((token, key, upload_id))
     }
 
-    async fn claim_recovery(
-        &self,
-        request: &RecoverRequest,
-        key: &str,
-    ) -> Result<String, StorageRoleFailure> {
-        let claim_key = format!("{key}.claim");
-        let claim = self
-            .protocol
-            .claim(&claim_key, request.claim_token)
-            .await
-            .map_err(|failure| {
-                role_failure(
-                    request.final_destination.path(),
-                    Operation::Prepare,
-                    failure,
-                )
-            })?;
-        if claim == S3ClaimOutcome::Conflict {
-            return Err(entry(
-                request.final_destination.path(),
-                Operation::Prepare,
-                "S3 recovery state is claimed by another attempt",
-            ));
-        }
-        Ok(claim_key)
-    }
-
     async fn recovered_state(
         &self,
         request: &RecoverRequest,
@@ -337,20 +309,9 @@ impl<P: S3Protocol> S3StagedDestination<P> {
         request: &RecoverRequest,
         key: &str,
         upload_id: &str,
-        claim_key: &str,
     ) -> Result<(), StorageRoleFailure> {
         self.protocol
             .abort_multipart(key, upload_id)
-            .await
-            .map_err(|failure| {
-                role_failure(
-                    request.final_destination.path(),
-                    Operation::Prepare,
-                    failure,
-                )
-            })?;
-        self.protocol
-            .release_claim(claim_key)
             .await
             .map_err(|failure| {
                 role_failure(
@@ -446,7 +407,6 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 upload_id,
                 parts: Vec::new(),
                 completed: false,
-                claim_key: None,
             },
         );
         Ok(PreparedStage::new(
@@ -477,7 +437,10 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         // Source size is bound into recovery_binding, so retry selects the same sizing.
         let part_size = planned_part_size(request.source.size, request.final_destination.path())?;
         let (token, key, upload_id) = Self::validated_recovery(&request)?;
-        let claim_key = self.claim_recovery(&request, &key).await?;
+        // Who may resume is settled before this call: the engine holds the recovery record's
+        // exclusive lease for the whole attempt, and one destination key is never written by two
+        // transfers at once. S3 needs no marker object of its own — the conditional PUT that one
+        // relied on is not supported everywhere (MinIO RELEASE.2023-03-20 answers 404).
         let observed = self.recovered_state(&request, &key, &upload_id).await;
         let (persisted, parts, completed) = match observed {
             Ok(state) => state,
@@ -485,23 +448,11 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 if matches!(&error, StorageRoleFailure::Entry(failure)
                     if failure.class() == FailureClass::Corruption) =>
             {
-                self.remove_invalid_upload(&request, &key, &upload_id, &claim_key)
+                self.remove_invalid_upload(&request, &key, &upload_id)
                     .await?;
                 return Err(error);
             }
-            Err(error) => {
-                self.protocol
-                    .release_claim(&claim_key)
-                    .await
-                    .map_err(|failure| {
-                        role_failure(
-                            request.final_destination.path(),
-                            Operation::Prepare,
-                            failure,
-                        )
-                    })?;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         self.states.lock().await.insert(
             token.to_vec(),
@@ -512,7 +463,6 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 upload_id,
                 parts,
                 completed,
-                claim_key: Some(claim_key),
             },
         );
         Ok(PreparedStage::new(
@@ -615,7 +565,6 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 upload_id,
                 parts,
                 completed: true,
-                claim_key: initial.claim_key,
             },
         );
         Ok(WriteEvidence {
@@ -663,7 +612,6 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                     upload_id: stage_state.upload_id,
                     parts,
                     completed: false,
-                    claim_key: stage_state.claim_key,
                 },
             );
             persisted
@@ -782,18 +730,6 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 stage.final_destination.path(),
                 self.protocol.delete_object(&key).await,
             )?;
-        }
-        if let Some(claim_key) = stage_state.claim_key {
-            self.protocol
-                .release_claim(&claim_key)
-                .await
-                .map_err(|failure| {
-                    role_failure(
-                        stage.final_destination.path(),
-                        Operation::Namespace,
-                        failure,
-                    )
-                })?;
         }
         self.states.lock().await.remove(stage.token.as_ref());
         Ok(())

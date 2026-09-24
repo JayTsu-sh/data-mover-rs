@@ -106,12 +106,16 @@ match aws_sdk_s3::operation::get_object::GetObjectError::from(...) {
 | 200 MiB，AtomicReplace，读回开 / 关 | 19.6 s / 9.2 s |
 | Direct，任意大小 | Preflight 拒绝：S3 不支持 direct |
 | 原生 S3→S3 1 KiB / 200 MiB | 0.1 s / 25.3 s（两次服务端全量 copy） |
-| Checkpointed 200 MiB 取消后续传 | **续传失败**：Prepare `NotFound`（见下） |
-| SIGKILL 后续传 | **续传失败**：同上 |
+| Checkpointed 200 MiB 取消后续传 | **续传失败**：Prepare `NotFound`（见下）→ 去掉 claim 后成功 |
+| SIGKILL 后续传 | **续传失败**：同上 → 去掉 claim 后成功 |
 
-**续传在这台 MinIO 上完全不可用**：`recover` 第一步是 claim（`PutObject` + `If-None-Match: *`，`staged.rs:480`），
-MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成 `NotFound` → Prepare 失败。取消后上传其实还在
-（ListParts 有 1 个分段），不是上传丢了。去掉 rename 的改造里一并去掉 claim（用户确认同一目的 key 不会并发写）。
+**续传曾在这台 MinIO 上完全不可用**（已修）：`recover` 第一步是 claim（`PutObject` + `If-None-Match: *`），
+MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成 `NotFound` → Prepare 失败；取消后上传其实还在。
+修复：S3 续传不再写任何标记对象 —— 谁能续传由引擎的恢复记录独占租约（`recovery_store.rs` `open_lease`，
+**本机**文件锁，覆盖整个尝试；跨主机或共享恢复目录不受它保护）决定，且同一目的 key 不会被两个传输并发写
+（terrasync 保证，用户确认）。直接调用 `recover` 的代码要自己保证独占，`claim_token` 对 S3 无意义。修后真机：取消 / SIGKILL
+后续传都成功（200 MiB，读回校验通过），记录随后清除。旧版本在 AWS 上成功 claim 后崩溃留下的 `<temp>.claim`
+对象新代码不再认也不再删：不会自动清理，且对以该 bucket 为源的遍历可见（temp 对象今天也一样）。已知：3 s / 20 MiB/s 中断后只有 1 个分段（8 MiB）可复用，粒度待查。
 
 **MinIO 2023 的其他实测行为**：`ListMultipartUploads` 只按**精确 key** 返回（按前缀或整桶都是 0）—— 孤儿上传
 无法按前缀发现，只能靠 key 精确查询或服务端 `stale_uploads_expiry` 回收；Content-MD5 不符 → 400 BadDigest；

@@ -135,7 +135,6 @@ async fn invalid_manifest_is_owned_cleaned_and_rejected() -> TestResult {
             .await
             .contains_key(&upload_id)
     );
-    assert!(fixture.protocol.claims.lock().await.is_empty());
     assert_eq!(*fixture.protocol.aborts.lock().await, 1);
     Ok(())
 }
@@ -161,7 +160,7 @@ async fn recovery_reuses_a_contiguous_native_copy_prefix() -> TestResult {
 }
 
 #[tokio::test]
-async fn missing_upload_releases_claim_and_allows_fresh_prepare() -> TestResult {
+async fn missing_upload_allows_fresh_prepare() -> TestResult {
     let fixture = fixture("missing-final", [4; 32]).await?;
     let recovery = fixture
         .destination
@@ -175,7 +174,6 @@ async fn missing_upload_releases_claim_and_allows_fresh_prepare() -> TestResult 
         .await;
     assert!(matches!(result, Err(StorageRoleFailure::Entry(ref failure))
         if failure.class() == FailureClass::NotFound));
-    assert!(fixture.protocol.claims.lock().await.is_empty());
     assert_eq!(
         fixture
             .destination
@@ -188,7 +186,7 @@ async fn missing_upload_releases_claim_and_allows_fresh_prepare() -> TestResult 
 }
 
 #[tokio::test]
-async fn invalid_cleanup_failure_retains_claim_and_upload() -> TestResult {
+async fn invalid_cleanup_failure_retains_upload() -> TestResult {
     let fixture = fixture("cleanup-final", [8; 32]).await?;
     let recovery = fixture
         .destination
@@ -210,7 +208,6 @@ async fn invalid_cleanup_failure_retains_claim_and_upload() -> TestResult {
             .await
             .contains_key(&upload_id)
     );
-    assert_eq!(fixture.protocol.claims.lock().await.len(), 1);
     Ok(())
 }
 
@@ -234,5 +231,64 @@ async fn discard_failure_can_reconnect_and_retry_cleanup() -> TestResult {
         .await?;
     reconnected.discard(recovered).await?;
     assert_eq!(*fixture.protocol.aborts.lock().await, 1);
+    Ok(())
+}
+
+/// A resume picks the upload up where it stopped and writes nothing of its own: no marker object
+/// (the conditional PUT one used is answered with 404 by `MinIO` `RELEASE.2023-03-20`, which
+/// failed every resume there), no abort, no new upload. Who may resume is the engine's recovery
+/// lease, not the adapter's.
+#[tokio::test]
+async fn a_resume_keeps_its_parts_and_writes_nothing_else() -> TestResult {
+    let fixture = fixture("resume-final", [5; 32]).await?;
+    let recovery = fixture
+        .destination
+        .recovery_identity(&fixture.stage)
+        .await?;
+    let upload_id = upload_id(&fixture.stage)?;
+    let part = Bytes::from(vec![3; 8 * 1024 * 1024]);
+    fixture
+        .protocol
+        .uploads
+        .lock()
+        .await
+        .get_mut(&upload_id)
+        .ok_or("missing upload")?
+        .1
+        .push((1, part.clone()));
+    let objects_before: Vec<String> = fixture
+        .protocol
+        .objects
+        .lock()
+        .await
+        .keys()
+        .cloned()
+        .collect();
+    let reconnected = connect(fixture.protocol.clone(), identity(), Some(native_context()))?
+        .staged_destination(&validation_policy())?;
+
+    let recovered = reconnected
+        .recover(recover_request(recovery, &fixture.prepare, [9; 32]))
+        .await?;
+
+    assert_eq!(recovered.write_offset, part.len() as u64);
+    let objects_after: Vec<String> = fixture
+        .protocol
+        .objects
+        .lock()
+        .await
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(objects_before, objects_after, "a resume writes no object");
+    let uploads = fixture.protocol.uploads.lock().await;
+    assert_eq!(uploads.len(), 1, "a resume starts no upload");
+    assert_eq!(
+        uploads.get(&upload_id).map(|upload| upload.1.len()),
+        Some(1)
+    );
+    drop(uploads);
+    assert_eq!(*fixture.protocol.aborts.lock().await, 0);
+    reconnected.discard(recovered).await?;
     Ok(())
 }

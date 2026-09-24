@@ -206,6 +206,10 @@ pub struct RecoverRequest {
     pub source: SourceDescriptor,
     pub recovery_binding: [u8; 32],
     /// Caller-persisted identity for one recovery attempt, stable across process restart.
+    /// Backends that must fence competing processes themselves use it (NFS, HDFS, CIFS). S3
+    /// ignores it and takes no claim of its own: exclusivity is the caller's — the transfer
+    /// engine holds the recovery record's per-host lease for the whole attempt — and a direct
+    /// caller of `recover` must provide the same.
     pub claim_token: [u8; 32],
 }
 

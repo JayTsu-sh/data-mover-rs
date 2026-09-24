@@ -386,64 +386,6 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .map(|_| ())
             .map_err(|error| classify_sdk!(error, "S3 PutObjectTagging request failed"))
     }
-
-    async fn claim(
-        &self,
-        key: &str,
-        token: [u8; 32],
-    ) -> crate::storage::backends::s3::S3Result<crate::storage::backends::s3::S3ClaimOutcome> {
-        let key = self.build_full_key(key);
-        let result = self
-            .client
-            .put_object()
-            .bucket(&self.bucket_name)
-            .key(&key)
-            .if_none_match("*")
-            .body(aws_sdk_s3::primitives::ByteStream::from(
-                Bytes::copy_from_slice(&token),
-            ))
-            .send()
-            .await;
-        match result {
-            Ok(_) => Ok(crate::storage::backends::s3::S3ClaimOutcome::Acquired),
-            Err(error)
-                if error
-                    .raw_response()
-                    .is_some_and(|response| response.status().as_u16() == 412) =>
-            {
-                let existing = self
-                    .client
-                    .get_object()
-                    .bucket(&self.bucket_name)
-                    .key(&key)
-                    .send()
-                    .await
-                    .map_err(|error| classify_sdk!(error, "S3 recovery claim read failed"))?
-                    .body
-                    .collect()
-                    .await
-                    .map_err(|e| s3_role_session(format!("S3 recovery claim body failed: {e}")))?
-                    .into_bytes();
-                if existing.as_ref() == token {
-                    Ok(crate::storage::backends::s3::S3ClaimOutcome::AlreadyOwned)
-                } else {
-                    Ok(crate::storage::backends::s3::S3ClaimOutcome::Conflict)
-                }
-            }
-            Err(error) => Err(classify_sdk!(error, "S3 recovery claim request failed")),
-        }
-    }
-
-    async fn release_claim(&self, key: &str) -> crate::storage::backends::s3::S3Result<()> {
-        self.client
-            .delete_object()
-            .bucket(&self.bucket_name)
-            .key(self.build_full_key(key))
-            .send()
-            .await
-            .map(|_| ())
-            .map_err(|error| classify_sdk!(error, "S3 recovery claim cleanup failed"))
-    }
 }
 
 fn s3_role_session(diagnostic: String) -> crate::storage::backends::s3::S3ProtocolFailure {
@@ -636,7 +578,6 @@ mod tests {
         identity: crate::model::BackendIdentity,
         prepare: crate::storage::PrepareRequest,
         recovery: crate::storage::RecoveryIdentity,
-        key: String,
     }
 
     async fn prepare_invalid_manifest_fixture()
@@ -689,7 +630,6 @@ mod tests {
             identity: storage.identity().clone(),
             prepare,
             recovery,
-            key,
         })
     }
 
@@ -714,19 +654,6 @@ mod tests {
             matches!(result, Err(crate::storage::StorageRoleFailure::Entry(ref failure))
             if failure.class() == crate::model::FailureClass::Corruption)
         );
-        assert_eq!(
-            fixture
-                .backend
-                .claim(&format!("{}.claim", fixture.key), [2; 32])
-                .await
-                .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?,
-            crate::storage::backends::s3::S3ClaimOutcome::Acquired
-        );
-        fixture
-            .backend
-            .release_claim(&format!("{}.claim", fixture.key))
-            .await
-            .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
         let fresh = reconnected.prepare(fixture.prepare).await?;
         reconnected.discard(fresh).await?;
         Ok(())

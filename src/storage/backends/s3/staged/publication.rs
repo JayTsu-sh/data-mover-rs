@@ -134,22 +134,6 @@ async fn cleanup<P: S3Protocol>(
             error: role_failure(stage.final_destination.path(), Operation::Publish, failure),
             final_destination_changed: changed,
         })?;
-    let claim = adapter
-        .states
-        .lock()
-        .await
-        .get(stage.token.as_ref())
-        .and_then(|state| state.claim_key.clone());
-    if let Some(claim_key) = claim {
-        adapter
-            .protocol
-            .release_claim(&claim_key)
-            .await
-            .map_err(|failure| PublicationFailure {
-                error: role_failure(stage.final_destination.path(), Operation::Publish, failure),
-                final_destination_changed: changed,
-            })?;
-    }
     adapter.states.lock().await.remove(stage.token.as_ref());
     Ok(())
 }

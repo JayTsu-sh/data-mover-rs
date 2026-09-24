@@ -92,13 +92,6 @@ pub(crate) struct S3NativeCopyFailure {
 
 pub(crate) type S3NativeCopyResult = Result<S3NativeCopyEvidence, S3NativeCopyFailure>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum S3ClaimOutcome {
-    Acquired,
-    AlreadyOwned,
-    Conflict,
-}
-
 #[async_trait]
 pub(crate) trait S3Protocol: Send + Sync {
     async fn head(&self, key: &str) -> S3Result<S3ObjectFacts>;
@@ -135,6 +128,4 @@ pub(crate) trait S3Protocol: Send + Sync {
     async fn delete_object(&self, key: &str) -> S3Result<()>;
     async fn get_tags(&self, key: &str) -> S3Result<Vec<ObjectTag>>;
     async fn put_tags(&self, key: &str, tags: &[ObjectTag]) -> S3Result<()>;
-    async fn claim(&self, key: &str, token: [u8; 32]) -> S3Result<S3ClaimOutcome>;
-    async fn release_claim(&self, key: &str) -> S3Result<()>;
 }

@@ -14,9 +14,8 @@ use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
 
 pub(crate) use protocol::{
-    S3_NATIVE_COPY_SINGLE_MAX, S3ClaimOutcome, S3NativeCopyEvidence, S3NativeCopyFailure,
-    S3NativeCopyResult, S3NativeCopySource, S3ObjectFacts, S3PartFacts, S3Protocol,
-    S3ProtocolFailure, S3Result,
+    S3_NATIVE_COPY_SINGLE_MAX, S3NativeCopyEvidence, S3NativeCopyFailure, S3NativeCopyResult,
+    S3NativeCopySource, S3ObjectFacts, S3PartFacts, S3Protocol, S3ProtocolFailure, S3Result,
 };
 
 pub(crate) use metadata::S3TagSupport;
@@ -122,7 +121,6 @@ pub(crate) mod tests {
         pub(super) aborts: Mutex<u32>,
         pub(super) abort_failure: Mutex<Option<S3ProtocolFailure>>,
         head_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
-        pub(super) claims: Mutex<HashMap<String, [u8; 32]>>,
         pub(crate) copy_commits_then_fails: Mutex<bool>,
         pub(crate) native_copies: Mutex<u64>,
         pub(crate) native_failure: Mutex<Option<S3ProtocolFailure>>,
@@ -348,21 +346,6 @@ pub(crate) mod tests {
                 .lock()
                 .await
                 .insert(key.to_string(), tags.to_vec());
-            Ok(())
-        }
-        async fn claim(&self, key: &str, token: [u8; 32]) -> S3Result<S3ClaimOutcome> {
-            let mut claims = self.claims.lock().await;
-            match claims.get(key) {
-                None => {
-                    claims.insert(key.to_string(), token);
-                    Ok(S3ClaimOutcome::Acquired)
-                }
-                Some(existing) if existing == &token => Ok(S3ClaimOutcome::AlreadyOwned),
-                Some(_) => Ok(S3ClaimOutcome::Conflict),
-            }
-        }
-        async fn release_claim(&self, key: &str) -> S3Result<()> {
-            self.claims.lock().await.remove(key);
             Ok(())
         }
     }
@@ -790,7 +773,6 @@ pub(crate) mod tests {
 
         let second_storage = connect(protocol.clone(), identity(), Some(native_context()))?;
         let resumed_destination = second_storage.staged_destination(&policy)?;
-        let persisted_recovery = recovery.as_bytes().clone();
         let resumed = resumed_destination
             .recover(crate::storage::RecoverRequest {
                 identity: recovery,
@@ -807,21 +789,6 @@ pub(crate) mod tests {
                 .durable_prefix,
             checkpoint
         );
-        let competing = connect(protocol.clone(), identity(), Some(native_context()))?
-            .staged_destination(&policy)?;
-        let conflict = competing
-            .recover(crate::storage::RecoverRequest {
-                identity: crate::storage::RecoveryIdentity::from_bytes(persisted_recovery)?,
-                final_destination: prepare.final_destination,
-                source: source.clone(),
-                recovery_binding: prepare.recovery_binding,
-                claim_token: [9; 32],
-            })
-            .await;
-        assert!(matches!(
-            conflict,
-            Err(crate::storage::StorageRoleFailure::Entry(_))
-        ));
         let full = vec![5u8; 4 * 8 * 1024 * 1024 + 17];
         let checkpoint = usize::try_from(checkpoint)?;
         resumed_destination
