@@ -4,13 +4,13 @@ use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{BackendIdentity, IdentityStrength, Operation, SourceIdentity};
+use crate::model::{BackendIdentity, Operation};
 use crate::storage::{
     NativeAffinity, NativeEndpoint, NativeSourceBinding, NativeStageEvidence, NativeStageFailure,
     SourceDescriptor, StorageRoleFailure,
 };
 
-use super::source::{entry, role_failure};
+use super::source::{entry, object_identity, role_failure};
 use super::staged::S3StagedDestination;
 use super::{S3NativeCopySource, S3Protocol};
 
@@ -81,12 +81,7 @@ impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
             .head(source.path.as_str())
             .await
             .map_err(|failure| role_failure(&source.path, Operation::Read, failure))?;
-        validate_identity(
-            source,
-            &self.identity,
-            &facts.etag,
-            facts.version_id.as_deref(),
-        )?;
+        validate_identity(source, &self.identity, &facts)?;
         let native = S3NativeCopySource {
             bucket: self.context.bucket.clone(),
             key: self.context.full_key(source.path.as_str()),
@@ -125,22 +120,16 @@ impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
     }
 }
 
+/// Checks the object is still the one described, judging its identity exactly as `describe` did:
+/// a `"null"` or empty `versionId` (an unversioned bucket, or an object written before versioning)
+/// is no version at all, so the `ETag` identifies it.
 fn validate_identity(
     source: &SourceDescriptor,
     backend: &BackendIdentity,
-    etag: &str,
-    version: Option<&str>,
+    facts: &super::S3ObjectFacts,
 ) -> Result<(), StorageRoleFailure> {
-    let identity = SourceIdentity::new(
-        backend.clone(),
-        if version.is_some() {
-            IdentityStrength::VersionScoped
-        } else {
-            IdentityStrength::PathScoped
-        },
-        version.unwrap_or(etag),
-    )
-    .map_err(|error| entry(&source.path, Operation::Read, error.to_string()))?;
+    let identity = object_identity(backend, facts)
+        .map_err(|error| entry(&source.path, Operation::Read, error.to_string()))?;
     if identity == source.source_identity {
         Ok(())
     } else {

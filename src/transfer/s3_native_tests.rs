@@ -250,3 +250,30 @@ async fn cancellation_before_planning_performs_no_native_or_final_mutation() -> 
     assert!(!protocol.objects.lock().await.contains_key("final"));
     Ok(())
 }
+
+/// An unversioned bucket, or an object written before versioning, reports `versionId` `"null"` (or
+/// nothing). Describe identifies such an object by its `ETag`, so the native binding must too, or the
+/// same untouched object reads as "changed" and every native copy of it fails.
+#[tokio::test]
+async fn native_binding_accepts_a_null_or_empty_version_id() -> TestResult {
+    // A real version is the control: it is identified by itself and must still bind.
+    for version in [None, Some("null"), Some(""), Some("version-1")] {
+        let protocol = Arc::new(MemoryS3::default());
+        *protocol.version.lock().await = version.map(str::to_string);
+        let payload = Bytes::from_static(b"unversioned payload");
+        protocol
+            .objects
+            .lock()
+            .await
+            .insert("source".into(), payload.clone());
+        let source = connect(protocol.clone(), identity(), Some(native_context()))?;
+        let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+
+        let outcome = transfer(request(source, destination)?).await?;
+
+        assert_eq!(outcome.route, TransferRoute::Native, "{version:?}");
+        assert_eq!(*protocol.native_copies.lock().await, 1, "{version:?}");
+        assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
+    }
+    Ok(())
+}

@@ -24,7 +24,7 @@ pub(super) type UploadParts = HashMap<String, (String, Vec<(i32, Bytes)>)>;
 
 #[derive(Default)]
 pub(crate) struct MemoryS3 {
-    version: Mutex<Option<String>>,
+    pub(crate) version: Mutex<Option<String>>,
     pub(crate) last_modified: Mutex<Option<crate::model::StorageTimestamp>>,
     range_observations: Mutex<Vec<S3ObjectFacts>>,
     pub(crate) objects: Mutex<HashMap<String, Bytes>>,
