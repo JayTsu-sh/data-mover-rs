@@ -4,11 +4,15 @@
 #![allow(clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
+use md5::{Digest as _, Md5};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -43,6 +47,24 @@ pub(crate) struct MemoryS3 {
     pub(crate) tag_versions: Mutex<Vec<Option<String>>>,
     /// Behave like a store that ignores `?versionId=` and answers with the current object.
     pub(crate) ignores_version_id: Mutex<bool>,
+    /// The next `put_object` fails with `BadDigest`, as if its body was corrupted in flight.
+    pub(crate) bad_digest_next_put: Mutex<bool>,
+    /// Contents a multipart upload completed, by their MD5: real S3 gives such an object the
+    /// `ETag` `"<MD5 of the part MD5s>-<parts>"`, not the MD5 of its bytes.
+    multipart_etags: std::sync::Mutex<HashMap<[u8; 16], String>>,
+    /// Source of upload ids and minted version ids, so none repeats.
+    next_id: Mutex<u64>,
+}
+
+/// The `ETag` S3 reports for an object written by one `PutObject`: the quoted hex MD5 of its body.
+/// The `ETag` of a single `PutObject` of `bytes` (no server-side encryption): its quoted MD5.
+pub(crate) fn etag_of(bytes: &[u8]) -> String {
+    format!("\"{:x}\"", Md5::digest(bytes))
+}
+
+/// The base64 `Content-MD5` of `bytes`.
+pub(crate) fn content_md5(bytes: &[u8]) -> String {
+    BASE64_STANDARD.encode(Md5::digest(bytes))
 }
 
 impl MemoryS3 {
@@ -63,6 +85,41 @@ impl MemoryS3 {
             .await
             .insert((key.to_string(), id.to_string()), None);
         self.objects.lock().await.remove(key);
+    }
+
+    async fn next_id(&self) -> u64 {
+        let mut next = self.next_id.lock().await;
+        *next += 1;
+        *next
+    }
+
+    /// Stores a written object: on a versioned fake (its current version is a real one) the write
+    /// mints a new current version, as a versioned bucket does; otherwise it reports none.
+    /// The `ETag` S3 reports for an object holding `bytes`: the composite one if a multipart
+    /// upload completed it, else its MD5.
+    fn etag_for(&self, bytes: &[u8]) -> String {
+        self.multipart_etags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&<[u8; 16]>::from(Md5::digest(bytes)))
+            .cloned()
+            .unwrap_or_else(|| etag_of(bytes))
+    }
+
+    async fn store_written(&self, key: &str, bytes: Bytes) -> Option<String> {
+        let versioned = self
+            .version
+            .lock()
+            .await
+            .as_deref()
+            .is_some_and(is_real_version_id);
+        if !versioned {
+            self.objects.lock().await.insert(key.to_string(), bytes);
+            return None;
+        }
+        let id = format!("v-put-{}", self.next_id().await);
+        self.put_version(key, &id, bytes).await;
+        Some(id)
     }
 
     /// The bytes of `key` at `version` when that version is stored, else of the current object.
@@ -111,7 +168,7 @@ impl S3Protocol for MemoryS3 {
         })?;
         Ok(S3ObjectFacts {
             size: bytes.len() as u64,
-            etag: blake3::hash(bytes).to_hex().to_string(),
+            etag: self.etag_for(bytes),
             version_id: self.version.lock().await.clone(),
             last_modified: *self.last_modified.lock().await,
         })
@@ -135,7 +192,7 @@ impl S3Protocol for MemoryS3 {
         };
         Ok(S3ObjectFacts {
             size: bytes.len() as u64,
-            etag: blake3::hash(&bytes).to_hex().to_string(),
+            etag: self.etag_for(&bytes),
             version_id: Some(version_id.to_string()),
             last_modified: *self.last_modified.lock().await,
         })
@@ -148,7 +205,7 @@ impl S3Protocol for MemoryS3 {
     ) -> S3Result<Bytes> {
         self.range_observations.lock().await.push(observed.clone());
         let bytes = self.bytes_at(key, observed.version_id.as_deref()).await?;
-        if observed.etag != blake3::hash(&bytes).to_hex().as_str() {
+        if observed.etag != self.etag_for(&bytes) {
             return Err(S3ProtocolFailure::entry(
                 crate::model::FailureClass::Conflict,
                 crate::model::Transience::Permanent,
@@ -171,8 +228,28 @@ impl S3Protocol for MemoryS3 {
         })?;
         Ok(bytes.slice(start..end))
     }
+    async fn put_object(
+        &self,
+        key: &str,
+        body: Bytes,
+        content_md5_base64: &str,
+    ) -> S3Result<S3WriteFacts> {
+        let corrupted = mem::take(&mut *self.bad_digest_next_put.lock().await);
+        if corrupted || content_md5(&body) != content_md5_base64 {
+            return Err(S3ProtocolFailure::corrupted_upload(
+                "S3 PutObject request failed",
+            ));
+        }
+        let etag = etag_of(&body);
+        self.multipart_etags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&<[u8; 16]>::from(Md5::digest(&body)));
+        let version = self.store_written(key, body).await;
+        Ok(S3WriteFacts::new(etag, version))
+    }
     async fn begin_multipart(&self, key: &str) -> S3Result<String> {
-        let id = format!("upload-{key}");
+        let id = format!("upload-{}", self.next_id().await);
         self.uploads
             .lock()
             .await
@@ -208,7 +285,16 @@ impl S3Protocol for MemoryS3 {
             .remove(id)
             .ok_or_else(|| S3ProtocolFailure::protocol("missing upload"))?;
         parts.sort_by_key(|part| part.0);
+        let mut part_digests = Vec::new();
+        for part in &parts {
+            part_digests.extend_from_slice(&Md5::digest(&part.1));
+        }
+        let composite = format!("\"{:x}-{}\"", Md5::digest(&part_digests), parts.len());
         let bytes: Vec<u8> = parts.into_iter().flat_map(|part| part.1).collect();
+        self.multipart_etags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(Md5::digest(&bytes).into(), composite);
         self.objects.lock().await.insert(key, Bytes::from(bytes));
         Ok(())
     }
@@ -294,9 +380,7 @@ impl S3Protocol for MemoryS3 {
                 bytes: 0,
                 requests: 1,
             })?;
-        if blake3::hash(&bytes).to_hex().as_str() != source.etag
-            || bytes.len() as u64 != source.size
-        {
+        if self.etag_for(&bytes) != source.etag || bytes.len() as u64 != source.size {
             return Err(S3NativeCopyFailure {
                 error: S3ProtocolFailure::entry(
                     crate::model::FailureClass::Conflict,
@@ -345,6 +429,72 @@ pub(super) fn validation_policy() -> crate::storage::PreflightPolicy {
 
 pub(crate) fn native_context() -> S3NativeContext {
     S3NativeContext::new("memory://s3", "standard", "memory".into(), None)
+}
+
+/// A single PUT stores the body and reports what real S3 does: the quoted hex MD5 as `ETag`, and
+/// no version on an unversioned bucket.
+#[tokio::test]
+async fn memory_put_object_reports_md5_etag_and_no_version() {
+    let s3 = MemoryS3::default();
+    let body = Bytes::from_static(b"payload");
+    let facts = s3
+        .put_object("key", body.clone(), &content_md5(&body))
+        .await
+        .expect("put succeeds");
+    assert_eq!(facts.etag, "\"321c3cf486ed509164edec1e1981fec8\"");
+    assert_eq!(facts.version_id, None);
+    let head = s3.head("key").await.expect("object exists");
+    assert_eq!(head.etag, facts.etag);
+}
+
+/// On a versioned fake each PUT mints a new current version and reports it.
+#[tokio::test]
+async fn memory_put_object_on_a_versioned_fake_reports_a_new_version() {
+    let s3 = MemoryS3::default();
+    s3.put_version("key", "v1", Bytes::from_static(b"old"))
+        .await;
+    let body = Bytes::from_static(b"new");
+    let facts = s3
+        .put_object("key", body.clone(), &content_md5(&body))
+        .await
+        .expect("put succeeds");
+    let version = facts
+        .version_id
+        .expect("a versioned write reports its version");
+    assert_ne!(version, "v1");
+    assert_eq!(s3.version.lock().await.as_deref(), Some(version.as_str()));
+}
+
+/// A `Content-MD5` that does not match the body, or the injected corruption, is `BadDigest`: a
+/// transient `Corruption` of the entry, storing nothing. The injection covers one PUT only.
+#[tokio::test]
+async fn memory_put_object_refuses_a_bad_digest() {
+    let s3 = MemoryS3::default();
+    let body = Bytes::from_static(b"payload");
+    let expected = S3ProtocolFailure::corrupted_upload("S3 PutObject request failed");
+    let wrong = s3
+        .put_object("key", body.clone(), &content_md5(b"other"))
+        .await;
+    assert_eq!(wrong, Err(expected.clone()));
+    *s3.bad_digest_next_put.lock().await = true;
+    let injected = s3
+        .put_object("key", body.clone(), &content_md5(&body))
+        .await;
+    assert_eq!(injected, Err(expected));
+    assert!(s3.objects.lock().await.is_empty());
+    s3.put_object("key", body.clone(), &content_md5(&body))
+        .await
+        .expect("the injection covers one PUT");
+}
+
+/// Two uploads on one key get distinct ids.
+#[tokio::test]
+async fn memory_upload_ids_do_not_collide_on_one_key() {
+    let s3 = MemoryS3::default();
+    let first = s3.begin_multipart("key").await.expect("begin");
+    let second = s3.begin_multipart("key").await.expect("begin");
+    assert_ne!(first, second);
+    assert_eq!(s3.uploads.lock().await.len(), 2);
 }
 
 #[path = "role_tests.rs"]

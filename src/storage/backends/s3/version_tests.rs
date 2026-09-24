@@ -58,7 +58,7 @@ async fn describing_current_pins_only_a_real_version() -> TestResult {
         assert_eq!(*descriptor.version(), pinned, "{reported:?}");
         assert_eq!(
             descriptor.content_version.as_deref(),
-            Some(blake3::hash(b"payload").to_hex().as_bytes()),
+            Some(etag_of(b"payload").as_bytes()),
             "{reported:?}"
         );
     }

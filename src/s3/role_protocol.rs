@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::storage::backends::s3::{
     S3NativeCopyEvidence, S3NativeCopyFailure, S3NativeCopyResult, S3NativeCopySource,
-    S3ProtocolFailure, S3Result,
+    S3ProtocolFailure, S3Result, S3WriteFacts,
 };
 use crate::time_util::http_last_modified;
 
@@ -194,6 +194,32 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .await
             .map(aws_smithy_types::byte_stream::AggregatedBytes::into_bytes)
             .map_err(|error| s3_role_session(error.to_string()))
+    }
+
+    async fn put_object(
+        &self,
+        key: &str,
+        body: Bytes,
+        content_md5_base64: &str,
+    ) -> S3Result<S3WriteFacts> {
+        let response = self
+            .client
+            .put_object()
+            .bucket(&self.bucket_name)
+            .key(self.build_full_key(key))
+            .body(aws_sdk_s3::primitives::ByteStream::from(body))
+            .content_md5(content_md5_base64)
+            .send()
+            .await
+            .map_err(|error| classify_sdk!(error, "S3 PutObject request failed"))?;
+        // The object was written; only the response is malformed.
+        let etag = response
+            .e_tag()
+            .ok_or_else(|| S3ProtocolFailure::protocol("S3 PutObject response omitted ETag"))?;
+        Ok(S3WriteFacts::new(
+            etag.to_string(),
+            response.version_id().map(str::to_string),
+        ))
     }
 
     async fn begin_multipart(&self, key: &str) -> crate::storage::backends::s3::S3Result<String> {
@@ -521,6 +547,16 @@ pub(super) fn s3_role_remote_failure(
                 diagnostic,
             )
         }
+        // The body did not match its digest: corrupted in flight, a resend may succeed.
+        (_, Some("BadDigest")) => {
+            crate::storage::backends::s3::S3ProtocolFailure::corrupted_upload(diagnostic)
+        }
+        // The digest header itself is malformed: our request is wrong, and stays wrong.
+        (_, Some("InvalidDigest")) => crate::storage::backends::s3::S3ProtocolFailure::entry(
+            FailureClass::InvalidInput,
+            Transience::Permanent,
+            diagnostic,
+        ),
         (Some(409 | 412), _) => crate::storage::backends::s3::S3ProtocolFailure::entry(
             FailureClass::Conflict,
             Transience::Permanent,
@@ -630,6 +666,79 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A body that does not match its `Content-MD5` was corrupted in flight: an entry failure a
+    /// resend may cure, whatever the status code carrying it.
+    #[test]
+    fn digest_mismatch_is_a_transient_corruption_of_the_entry() {
+        use crate::model::{FailureClass, Transience};
+        for status in [Some(400), None] {
+            assert!(
+                matches!(
+                    s3_role_remote_failure(status, Some("BadDigest"), "put"),
+                    S3ProtocolFailure::Entry {
+                        class: FailureClass::Corruption,
+                        transience: Transience::Transient,
+                        ..
+                    }
+                ),
+                "{status:?}"
+            );
+        }
+        // A malformed digest header is our own request's fault: resending it cannot help.
+        assert!(matches!(
+            s3_role_remote_failure(Some(400), Some("InvalidDigest"), "put"),
+            S3ProtocolFailure::Entry {
+                class: FailureClass::InvalidInput,
+                transience: Transience::Permanent,
+                ..
+            }
+        ));
+    }
+
+    /// Real lab: a `PutObject` whose `Content-MD5` does not match its body is refused with
+    /// `BadDigest` and leaves no object; the matching digest then writes it, reporting the quoted
+    /// hex MD5 as its `ETag`.
+    #[tokio::test]
+    #[ignore = "requires the shared standard S3 lab"]
+    async fn bad_content_md5_is_bad_digest_on_lab() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::model::{FailureClass, Transience};
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        use md5::{Digest as _, Md5};
+        let backend = S3Storage::new(&std::env::var("LAB_S3_ARCHITECTURE_URL")?, None).await?;
+        let key = format!(
+            "{}.c14a-bad-digest",
+            std::env::var("LAB_S3_ARCHITECTURE_KEY")?
+        );
+        let body = Bytes::from_static(b"c14a single put payload");
+        let digest = Md5::digest(&body);
+        let wrong = STANDARD.encode(Md5::digest(b"something else"));
+        let refused = backend.put_object(&key, body.clone(), &wrong).await;
+        assert!(
+            matches!(
+                refused,
+                Err(S3ProtocolFailure::Entry {
+                    class: FailureClass::Corruption,
+                    transience: Transience::Transient,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            backend.head(&key).await.is_err(),
+            "a refused PUT stores nothing"
+        );
+        let written = backend
+            .put_object(&key, body, &STANDARD.encode(digest))
+            .await
+            .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
+        let deleted = backend.delete_object(&key).await;
+        assert_eq!(written.etag, format!("\"{digest:x}\""));
+        deleted.map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
+        Ok(())
     }
 
     #[tokio::test]

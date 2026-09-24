@@ -46,6 +46,11 @@ impl S3ProtocolFailure {
     pub(crate) fn protocol(diagnostic: impl Into<String>) -> Self {
         Self::session(FailureClass::Protocol, Transience::Unknown, diagnostic)
     }
+    /// The body the server received does not match the `Content-MD5` sent with it (`BadDigest`,
+    /// `InvalidDigest`): the upload was corrupted in flight, and resending it may succeed.
+    pub(crate) fn corrupted_upload(diagnostic: impl Into<String>) -> Self {
+        Self::entry(FailureClass::Corruption, Transience::Transient, diagnostic)
+    }
 }
 
 pub(crate) type S3Result<T> = Result<T, S3ProtocolFailure>;
@@ -59,6 +64,38 @@ pub(crate) struct S3ObjectFacts {
     /// The `Last-Modified` the same response gave, so it belongs to this `etag` / `version_id`;
     /// `None` when the server sent none.
     pub last_modified: Option<StorageTimestamp>,
+}
+
+/// Whether a reported `versionId` names a real version: not empty and not the literal `"null"`,
+/// which an unversioned bucket, or an object written before versioning, reports.
+pub(crate) fn is_real_version_id(version: &str) -> bool {
+    !version.is_empty() && version != "null"
+}
+
+/// What a write that created an object reported about it.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the single PUT, ADR-0006 C14b")
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct S3WriteFacts {
+    pub etag: String,
+    /// The version the write created; `None` when the response named no real version.
+    pub version_id: Option<String>,
+}
+
+impl S3WriteFacts {
+    /// Keeps `reported_version` only when it is a real version id (see [`is_real_version_id`]).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the single PUT, ADR-0006 C14b")
+    )]
+    pub(crate) fn new(etag: String, reported_version: Option<String>) -> Self {
+        Self {
+            etag,
+            version_id: reported_version.filter(|version| is_real_version_id(version)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +141,18 @@ pub(crate) trait S3Protocol: Send + Sync {
         range: Range<u64>,
         observed: &S3ObjectFacts,
     ) -> S3Result<Bytes>;
+    /// One `PutObject` of `body` to `key`, carrying `content_md5_base64` so the server rejects a
+    /// body corrupted in flight (`BadDigest`, a transient `Corruption` entry failure).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the single PUT, ADR-0006 C14b")
+    )]
+    async fn put_object(
+        &self,
+        key: &str,
+        body: Bytes,
+        content_md5_base64: &str,
+    ) -> S3Result<S3WriteFacts>;
     async fn begin_multipart(&self, key: &str) -> S3Result<String>;
     async fn upload_part(
         &self,

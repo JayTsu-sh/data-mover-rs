@@ -9,7 +9,7 @@ use crate::model::{
 };
 use crate::storage::{ByteStream, ReadRequest, ReadSource, SourceDescriptor, StorageRoleFailure};
 
-use super::{S3ObjectFacts, S3Protocol, S3ProtocolFailure};
+use super::{S3ObjectFacts, S3Protocol, S3ProtocolFailure, is_real_version_id};
 
 pub(crate) struct S3ReadSource<P> {
     protocol: Arc<P>,
@@ -33,7 +33,7 @@ fn real_version(facts: &S3ObjectFacts) -> Option<&str> {
     facts
         .version_id
         .as_deref()
-        .filter(|version| !version.is_empty() && *version != "null")
+        .filter(|version| is_real_version_id(version))
 }
 
 /// The version a describe pins: the requested one, or for `Current` the real version it found.

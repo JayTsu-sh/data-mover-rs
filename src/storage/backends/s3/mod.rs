@@ -16,6 +16,7 @@ use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
 pub(crate) use protocol::{
     S3_NATIVE_COPY_SINGLE_MAX, S3NativeCopyEvidence, S3NativeCopyFailure, S3NativeCopyResult,
     S3NativeCopySource, S3ObjectFacts, S3PartFacts, S3Protocol, S3ProtocolFailure, S3Result,
+    S3WriteFacts, is_real_version_id,
 };
 
 pub(crate) use metadata::S3TagSupport;

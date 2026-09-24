@@ -76,6 +76,8 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | 来源 | 映射到 |
 |---|---|
 | 404 / `NoSuchKey` / `NoSuchUpload` / `NoSuchVersion` | 条目 `NotFound` / Permanent |
+| `BadDigest`（收到的 body 与 `Content-MD5` 不符，传输中损坏；ADR-0006 C14a） | 条目 `Corruption` / **Transient** —— 重发即可（`S3ProtocolFailure::corrupted_upload`） |
+| `InvalidDigest`（`Content-MD5` 头本身格式错，是我们的请求错） | 条目 `InvalidInput` / Permanent —— 重发同样失败 |
 | **带 versionId 的** HEAD / GET 返回 405（该版本是删除标记）；`Current` 在版本化桶上也会钉成 versionId，所以普通读也属此类 | 条目 `NotFound` / Permanent |
 | **带 versionId 的** GET 返回 400 且错误码 `InvalidArgument`（versionId 格式错） | 条目 `InvalidInput` / Permanent |
 | 其余 400（`ExpiredToken`、region 错……；HEAD 没有错误码，其 400 一律在此） | 仍按通用映射（会话级）—— 这些关乎整个会话 |
