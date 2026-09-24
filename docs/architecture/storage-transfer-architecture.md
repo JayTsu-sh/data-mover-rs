@@ -39,10 +39,14 @@ data-mover-rs ──must not know──> terrasync-rs
 ### data-mover-rs owns
 
 - connected backend clients, protocol handles, caches, and negotiated facts;
-- backend identity, capabilities, and typed unsupported/uncertified results;
+- backend identity — the canonical endpoint derived from each connection config (target, see
+  [ADR-0006](../adr/0006-destination-resident-recovery.md)) — capabilities, and typed
+  unsupported/uncertified results;
 - storage traversal and immutable observations;
 - source streaming, staged writes, checkpoint validation, verification, and publication;
-- per-transfer recovery-state persistence, exclusive attempt claims, and cleanup;
+- per-transfer recovery state kept **at the destination**, next to the final file (target, ADR-0006;
+  until C21 the engine still uses a local recovery store), plus claims and cleanup;
+- derived transfer identity and source version selection (`SourceVersion::{Current, Id}`);
 - deterministic metadata conversion and semantic-loss reporting;
 - source-only transfer QoS enforcement and neutral transfer outcomes;
 - versioned opaque observation snapshot and recovery-identity codecs.
@@ -58,7 +62,10 @@ data-mover-rs ──must not know──> terrasync-rs
 
 terrasync persists opaque observation snapshots but does not receive recovery identities, staged
 paths, upload IDs, parts, offsets, hashes, or checkpoint ranges. Its only per-job recovery input to
-data-mover is `TransferPolicy`.
+data-mover is `TransferPolicy`. Under ADR-0006 data-mover keeps no state where it runs either: it may run
+in a non-persistent container, and a resume after a restart is found at the destination. The caller
+contract that one destination key is never written by two transfers at once carries the exclusivity
+that a local lease provided.
 
 ## 3. Target module tree and dependency rules
 
@@ -473,7 +480,10 @@ the described source size; the staged file remains unpublished for verification 
 
 With read-back verification enabled (the default), copy-time generic transfer computes source BLAKE3 during the initial complete sequential
 read, then sequentially rereads the complete durable staged destination and compares its
-BLAKE3 before publication. Recovery includes reused content in the complete verification.
+BLAKE3 before publication. A destination whose staged object cannot be read before publication (S3
+under ADR-0006: parts are invisible until `CompleteMultipartUpload`) declares its verification point
+after publication; it rereads exactly the version it wrote and reports a mismatch or a newer current
+version with `final_destination_changed`. Recovery includes reused content in the complete verification.
 The Local implementation performs both passes through bounded buffers, checks cancellation
 between staged reads, and returns a recoverable unpublished stage on verification failure.
 Backend-native success is evidence only when the adapter declares `NativeStorageGuarantee`;
@@ -505,6 +515,15 @@ post-publication metadata workaround, never deletes its source, and returns only
 source-deletion-safety fact for terrasync policy.
 
 ## 10. Recovery contract
+
+**Transition.** [ADR-0006](../adr/0006-destination-resident-recovery.md) replaces the local recovery
+store described below: artifacts are named from the final file name in its parent directory, the
+destination holds a pointer with the full recovery binding, and prepare decides resume or restart from
+what it finds there (resume on an equal binding; otherwise clean up in place and start from zero,
+reporting why). The recovery binding becomes `TransferIdentity` (derived from source endpoint, source
+path, version selector, destination endpoint and final path) plus the observed source version. The
+local store, its lease, the `Publishing` state and `DATA_MOVER_RECOVERY_DIR` remain in force until
+commit C21 removes them.
 
 Local namespace durability uses a shared directory-handle helper. On Windows it opens the
 existing directory capability with read/write access and `FILE_FLAG_BACKUP_SEMANTICS` before
