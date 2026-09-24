@@ -10,9 +10,14 @@
 #   SIZE   bytes of the source file (default 200 MiB); BW source bandwidth in bytes/s while the first
 #          run is cut (default 20 MiB/s); CUT_MS when the cut lands (default 6000, so the first
 #          64 MiB checkpoint is durable at the default BW)
+#   KEEP_STATE=1  keep the local recovery records across the restart (still a fresh process and
+#          HOME). Neither run names the transfer: the resume can only find the record through the
+#          identity data-mover derives (ADR-0006 C5), so "streamed" below SIZE proves it did.
 # Writes only under <DEST>/resume-<run>/ and removes all of it at the end: final files, orphaned
 # stages and checkpoints, and (S3) the multipart uploads the interrupted runs recorded.
 #
+# Both runs derive the transfer identity from the endpoints and paths (no --identity); each line
+# reports whether the resumed run derived the interrupted run's identity and endpoint.
 # "streamed" is what the resuming run read from the source (it runs with read-back off and a
 # non-limiting budget, so the engine counts it): SIZE means nothing was reused. "records" is how
 # many recovery records the interrupted run left locally — 0 means the cut came before the first
@@ -24,7 +29,8 @@ for env in .claude/skills/e2e-s3/.env .claude/skills/e2e-cifs/.env; do
   [ -f "$env" ] && { set -a; . "$env"; set +a; }
 done
 : "${DEST:?set DEST to the destination endpoint}"
-SIZE=${SIZE:-209715200}; BW=${BW:-20971520}; CUT_MS=${CUT_MS:-6000}
+SIZE=${SIZE:-209715200}; BW=${BW:-20971520}; CUT_MS=${CUT_MS:-6000}; KEEP_STATE=${KEEP_STATE:-0}
+case "$KEEP_STATE" in 0|1) ;; *) echo "KEEP_STATE must be 0 or 1" >&2; exit 1 ;; esac
 UNLIMITED=10737418240
 RUN=${RUN:-$(date +%s)}
 DIR=resume-$RUN
@@ -77,6 +83,13 @@ records() { find "$1" -name '*.state' 2>/dev/null | wc -l; }
 endpoint_of() { python3 -c 'import json,sys
 try: print(json.loads(sys.argv[1]).get("destination_endpoint",""))
 except Exception: print("")' "$1"; }
+# The transfer identity a run derived (ADR-0006 C5), from the start line it writes as soon as the
+# request is built — so a run killed mid-transfer has one too (one killed while connecting does not).
+identity_of() { python3 -c 'import json,sys
+for line in open(sys.argv[1], errors="replace"):
+    try: event = json.loads(line)
+    except Exception: continue
+    if event.get("event") == "start": print(event.get("identity", "")); break' "$1"; }
 # S3 today: the orphaned upload is only findable through the local record.
 remember_s3_upload() {
   [[ "$DEST" == s3:* ]] || return 0
@@ -93,34 +106,49 @@ PY
 }
 
 "$BIN" --source "$WORK/src" --source-path src --seed-bytes "$SIZE" --destination "$WORK/probe" \
-  --destination-path src --policy atomic --read-back off >/dev/null
-echo "run=$RUN dest=$DEST size=$SIZE bw=$BW cut_ms=$CUT_MS"
+  --destination-path src --policy atomic --read-back off >"$WORK/seed.out" 2>&1 ||
+  { cat "$WORK/seed.out" >&2; exit 1; }
+echo "run=$RUN dest=$DEST size=$SIZE bw=$BW cut_ms=$CUT_MS keep_state=$KEEP_STATE"
 for mode in cancel kill; do
   state=$WORK/state-$mode
   export DATA_MOVER_RECOVERY_DIR=$state
   args=(--source "$WORK/src" --source-path src "${TARGET[@]}" --destination-path "$(path_of "$mode")"
-        --identity "resume-$RUN-$mode" --policy checkpointed)
+        --policy checkpointed)
   if [ $mode = cancel ]; then
-    first=$("$BIN" "${args[@]}" --bandwidth "$BW" --cancel-after-ms "$CUT_MS" 2>&1 | tail -1)
+    "$BIN" "${args[@]}" --bandwidth "$BW" --cancel-after-ms "$CUT_MS" >"$WORK/first.out" 2>&1
+    first=$(tail -1 "$WORK/first.out")
   else
     timeout -s KILL "$(printf '%d.%03d' $((CUT_MS / 1000)) $((CUT_MS % 1000)))" \
-      "$BIN" "${args[@]}" --bandwidth "$BW" >"$WORK/kill.out" 2>&1
+      "$BIN" "${args[@]}" --bandwidth "$BW" >"$WORK/first.out" 2>&1
     status=$?
-    if [ $status = 137 ]; then first='{"result":"killed"}'; else first="exit $status: $(tail -1 "$WORK/kill.out")"; fi
+    if [ $status = 137 ]; then first='{"result":"killed"}'; else first="exit $status: $(tail -1 "$WORK/first.out")"; fi
   fi
+  first_identity=$(identity_of "$WORK/first.out")
   echo "[$mode] interrupted: $first"
   remember_s3_upload "$state"
   echo "[$mode]   local records=$(records "$state")  destination artifacts=$(artifacts)"
-  # The container restarts: nothing local survives.
-  rm -rf "$state"; unset DATA_MOVER_RECOVERY_DIR
+  # The container restarts: nothing local survives, unless KEEP_STATE=1 keeps the records.
+  unset DATA_MOVER_RECOVERY_DIR
   fresh_env
-  second=$(env -i "${FRESH_ENV[@]}" "$BIN" "${args[@]}" --read-back off --bandwidth "$UNLIMITED" 2>&1 | tail -1)
+  if [ "$KEEP_STATE" = 1 ]; then FRESH_ENV+=("DATA_MOVER_RECOVERY_DIR=$state"); else rm -rf "$state"; fi
+  env -i "${FRESH_ENV[@]}" "$BIN" "${args[@]}" --read-back off --bandwidth "$UNLIMITED" >"$WORK/second.out" 2>&1
+  second=$(tail -1 "$WORK/second.out")
   echo "[$mode] resumed:     $second"
   echo "[$mode]   destination artifacts after=$(artifacts)"
   # The fresh process must derive the endpoint the interrupted one did (a killed run prints none).
   seen=$(endpoint_of "$first"); again=$(endpoint_of "$second")
   if [ -n "$seen" ]; then same=$([ "$seen" = "$again" ] && echo yes || echo NO); else same="n/a (no output)"; fi
   echo "[$mode]   destination endpoint=$again  same as interrupted run: $same"
+  ours=$(identity_of "$WORK/second.out")
+  if [ -n "$first_identity" ]; then same=$([ "$first_identity" = "$ours" ] && echo yes || echo NO); else same="n/a (no start line)"; fi
+  echo "[$mode]   transfer identity=$ours  same as interrupted run: $same"
+  streamed=$(python3 -c 'import json,sys
+try: print(json.loads(sys.argv[1]).get("source_streamed_bytes","?"))
+except Exception: print("?")' "$second")
+  echo "[$mode]   streamed=$streamed of $SIZE"
+  # A failed resume may have opened an upload of its own: record it before its state goes.
+  remember_s3_upload "$state"
+  rm -rf "$state"
 done
 
 echo "-- cleanup"
@@ -133,6 +161,7 @@ else
   "$BIN" --destination "$DEST" --remove-run "$DIR" 2>&1 | tail -1
   # Listing the removed run directory must now fail with NotFound.
   left=$("$BIN" --destination "$DEST" --list-artifacts "$DIR" 2>&1 | tail -1)
-  case "$left" in *NotFound*|*NOENT*) echo "left: nothing ($DIR/ removed)";; *) echo "left: $left";; esac
+  # SMB reports a missing directory as raw STATUS_OBJECT_NAME_NOT_FOUND (0xC0000034 = 3221225524).
+  case "$left" in *NotFound*|*NOENT*|*3221225524*) echo "left: nothing ($DIR/ removed)";; *) echo "left: $left";; esac
 fi
 rm -rf "$WORK"

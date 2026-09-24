@@ -36,6 +36,19 @@ Nothing is reused and the leftovers accumulate. Local, NFS and CIFS leftovers ar
 siblings a directory listing finds; the S3 upload is not an object and MinIO lists uploads only by
 exact key, so only the lost local record named it. HDFS runs on the lab runner and is recorded with C12.
 
+After C5 (2026-09-24, same matrix, no `--identity`: both runs derive the transfer identity) the table
+above is unchanged, and on every destination the resumed run derived the interrupted run's identity,
+killed runs included. `KEEP_STATE=1` keeps the local records across the restart (still a fresh process
+and `HOME`); neither run names the transfer, so a resume can only find its record through the derived
+identity — and does:
+
+| Destination | Streamed by the resume, cancel / kill (of 200 MiB) |
+|---|---|
+| Local (a separate run the same day) | 97.8 / 136.0 MiB |
+| NFS (ONTAP, v4.1) | 136.0 / 136.0 MiB |
+| CIFS (FAS2750) | 135.6 / 135.2 MiB |
+| S3 (MinIO) | 128.0 / 160.0 MiB |
+
 ## Decision
 
 ### Nothing is kept where data-mover runs
