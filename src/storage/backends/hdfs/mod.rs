@@ -1,5 +1,6 @@
 //! HDFS adapter facade.
 
+mod at_destination;
 #[cfg(test)]
 pub(crate) mod contract_tests;
 mod metadata;

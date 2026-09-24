@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::protocol::{HdfsProtocol, cancelled, entry_failure};
 use crate::model::{BackendIdentity, EntryKind, FailureClass, Operation, StoragePath, Transience};
-use crate::storage::artifacts::ARTIFACT_PREFIX;
+use crate::storage::artifacts::{ARTIFACT_PREFIX, ArtifactKind};
 use crate::storage::{
     ByteStream, CheckpointObservation, FinalDestination, Metadata, MetadataMutation,
     PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure,
@@ -198,6 +198,26 @@ fn array<const N: usize>(bytes: &[u8], path: &StoragePath) -> Result<[u8; N], St
         .map_err(|_| failure(path, Operation::Prepare, FailureClass::Corruption))
 }
 
+/// What a stage kept at the destination carries beyond its token (ADR-0006).
+pub(super) struct HdfsStageState {
+    pub(super) fence: super::at_destination::Fence,
+}
+
+/// The token of a stage kept at the destination: its deterministic path, for both the base and
+/// the partial path, and the size it must reach.
+pub(super) fn stage_token(
+    path: &StoragePath,
+    expected_size: u64,
+) -> Result<Bytes, StorageRoleFailure> {
+    HdfsStageToken {
+        expected_size,
+        nonce: [0; 16],
+        base_path: path.clone(),
+        partial_path: path.clone(),
+    }
+    .encode()
+}
+
 pub(super) struct HdfsStagedDestination {
     pub(super) protocol: Arc<dyn HdfsProtocol>,
     identity: BackendIdentity,
@@ -221,6 +241,10 @@ impl HdfsStagedDestination {
         self
     }
 
+    pub(super) const fn identity(&self) -> &BackendIdentity {
+        &self.identity
+    }
+
     pub(super) fn part(&self, stage: &PreparedStage) -> Result<StoragePath, StorageRoleFailure> {
         stage.validate_owner(&self.identity).map_err(|_| {
             failure(
@@ -229,7 +253,22 @@ impl HdfsStagedDestination {
                 FailureClass::Conflict,
             )
         })?;
-        Ok(HdfsStageToken::decode(stage)?.partial_path)
+        let partial = HdfsStageToken::decode(stage)?.partial_path;
+        if stage.at_destination {
+            let expected = super::at_destination::artifact_path(
+                stage.final_destination.path(),
+                ArtifactKind::Stage,
+                false,
+            )?;
+            if partial != expected {
+                return Err(failure(
+                    stage.final_destination.path(),
+                    Operation::Prepare,
+                    FailureClass::Conflict,
+                ));
+            }
+        }
+        Ok(partial)
     }
 }
 
@@ -354,6 +393,13 @@ impl StagedDestination for HdfsStagedDestination {
         recover(self, request).await
     }
 
+    async fn prepare_at_destination(
+        &self,
+        request: crate::storage::DestinationPrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        super::at_destination::prepare(self, request).await
+    }
+
     async fn write(
         &self,
         stage: &PreparedStage,
@@ -366,6 +412,11 @@ impl StagedDestination for HdfsStagedDestination {
         &self,
         stage: &PreparedStage,
     ) -> Result<CheckpointObservation, StorageRoleFailure> {
+        if stage.at_destination {
+            let durable_prefix =
+                super::at_destination::reobserve(self, stage, &self.part(stage)?).await?;
+            return Ok(CheckpointObservation { durable_prefix });
+        }
         let token = HdfsStageToken::decode(stage)?;
         let durable_prefix = observe_prefix(self, &self.part(stage)?, token.expected_size)
             .await?
@@ -434,6 +485,10 @@ impl StagedDestination for HdfsStagedDestination {
     async fn discard(&self, stage: PreparedStage) -> Result<(), StorageRoleFailure> {
         if stage.direct {
             return Ok(());
+        }
+        if stage.at_destination {
+            self.part(&stage)?;
+            return super::at_destination::discard(self, &stage).await;
         }
         self.protocol
             .delete(&self.part(&stage)?, EntryKind::File)
@@ -586,7 +641,7 @@ fn claimed_path(base: &StoragePath, claim: [u8; 32]) -> Result<StoragePath, Stor
     .map_err(|_| failure(base, Operation::Prepare, FailureClass::InvalidInput))
 }
 
-async fn hash_file(
+pub(super) async fn hash_file(
     protocol: &dyn HdfsProtocol,
     native: &StoragePath,
     diagnostic_path: &StoragePath,
@@ -626,6 +681,9 @@ async fn publish(
         )));
     }
     let part = adapter.part(stage).map_err(publication_failure)?;
+    if stage.at_destination {
+        return super::at_destination::publish(adapter, stage, &part, &request).await;
+    }
     if !stage.direct {
         adapter
             .protocol
@@ -639,14 +697,14 @@ async fn publish(
     })
 }
 
-fn publication_failure(error: StorageRoleFailure) -> PublicationFailure {
+pub(super) fn publication_failure(error: StorageRoleFailure) -> PublicationFailure {
     PublicationFailure {
         error,
         final_destination_changed: false,
     }
 }
 
-fn publication_may_have_changed(error: StorageRoleFailure) -> PublicationFailure {
+pub(super) fn publication_may_have_changed(error: StorageRoleFailure) -> PublicationFailure {
     let final_destination_changed = !matches!(
         &error,
         StorageRoleFailure::Entry(value) if value.class() == FailureClass::Conflict

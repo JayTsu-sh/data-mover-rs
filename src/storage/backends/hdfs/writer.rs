@@ -129,6 +129,12 @@ async fn register_durable_prefix(
     if observed.size != Some(expected_prefix) {
         return Err(invalid(stage));
     }
+    if stage.at_destination {
+        // The pointer is the whole recovery record; nothing registers where data-mover runs.
+        super::at_destination::write_pointer(adapter, stage, expected_prefix, false).await?;
+        stage.recovery_enabled.store(true, Ordering::Release);
+        return Ok(());
+    }
     if stage.recovery_enabled() {
         return Ok(());
     }

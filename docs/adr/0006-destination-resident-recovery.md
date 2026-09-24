@@ -239,6 +239,17 @@ FAS2750: e2e-cifs twice and the resume matrix (192 MiB, cancel and SIGKILL, loca
 The old CIFS random-name stage, `DMCCKP01` checkpoint, `data-mover:cifs-recovery:v1` recover and
 claim rename are no longer reached (removed in C11d).
 
+As built (C12b, HDFS — switch still off): `.data-mover-<d>.stage` and `.pointer` beside the final file,
+no claim file, a `DMHSTG01 ‖ nonce` fence as on NFS and CIFS. The HDFS lease cannot stand in for a
+claim — it exists only while a writer has the file open and belongs to the process, not the
+transfer. The pointer records the last hsync'd prefix as a lower bound; a resume continues from the
+stage's length after forced lease recovery (`continues_from_stage`, C12a), which also fences the dead
+writer. Lease recovery runs only for a stage the same discovery is going to resume (its pointer
+decodes and matches this transfer), never before a clean-up. A lost publication reply counts as done
+only when the stage is gone and the final file has the expected size and BLAKE3. Real-machine
+verification (resume matrix on the Kerberos lab through the runner) is still to do; the switch
+stays off until it passes (C12c).
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS
