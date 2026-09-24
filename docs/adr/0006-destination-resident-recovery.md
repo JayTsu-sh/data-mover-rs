@@ -199,6 +199,21 @@ in-place write goes ahead, leaving the leftovers. Something that is not a file a
 `Conflict`, as at the stage and pointer names. Random-name stages from before C8, and artifacts under another spelling on a
 case-insensitive volume, are left to the drain-before-upgrade rule and `delete_tree`.
 
+As built (C10, NFS): the NFS destination keeps `.data-mover-<d>.stage` and `.data-mover-<d>.pointer`
+(through the fixed `.tmp`) beside the final file and no claim file: NFS has no lock every host honours.
+The pointer's extension is `DMNSTG01` followed by a 16-byte nonce drawn at every prepare; its durable
+prefix is written only after the stage handle's `checkpoint()` (COMMIT with a matching verifier, or
+FILE_SYNC) proved it. A resume takes the stage over by rewriting the pointer with its own nonce before
+it truncates the stage to the prefix. Before a later pointer rewrite, the publication rename, and a
+clean-up, a stage reads the pointer back; another nonce, or no pointer after it wrote one, is a
+`Conflict` (permanent: retrying would take the stage back and forth) and the names are left alone.
+The fence is a check, not a lock, and a stage prepared without a pointer has nothing to fence with
+until its first checkpoint; both are two writers of one key, which the caller contract excludes, and
+read-back verification catches mixed bytes. A lost RENAME reply is settled by reading back (pointer)
+or by the final file's content (publication). `rmdir` and `rename` now make the directory-handle
+cache forget the path and everything below it (C10a). Verified on ONTAP NFSv4.1 (contract and resume
+matrix); NFSv3 on real hardware is still open.
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS

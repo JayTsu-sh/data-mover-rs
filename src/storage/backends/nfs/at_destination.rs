@@ -448,11 +448,16 @@ pub(super) async fn before_publication(
     }
 }
 
-/// Removes the pointer and its temporary once the stage is the final file (or gone).
+/// Removes the pointer and its temporary once the stage is the final file (or gone). A stage that
+/// never wrote a pointer has none to remove — and one there now is another writer's — so it sends
+/// nothing: two fewer round trips per small file.
 pub(super) async fn remove_pointer(
     adapter: &NfsStagedDestinationAdapter,
     stage: &PreparedStage,
 ) -> Result<(), StorageRoleFailure> {
+    if !fence(stage)?.written.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let final_path = stage.final_destination.path();
     for path in [
         artifact_path(final_path, ArtifactKind::Pointer, false)?,

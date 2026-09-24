@@ -136,6 +136,24 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   含 artifact 的目录 `rmdir` 会失败，而事件只记日志、`error: None`，静默删不干净。role `Delete(dir)`
   走的就是它，所以 NFS 的 `delete_tree` 不需要额外清扫。
 
+## 目的端恢复（ADR-0006 C10，`src/storage/backends/nfs/at_destination.rs`）
+
+`recovery_at_destination()` 为 true：续传状态全在最终文件旁，运行 data-mover 的机器上什么都不存。
+- 名字只由最终文件名决定：`.data-mover-<d>.stage` / `.pointer`（+ 固定 `.pointer.tmp`）。**没有 claim 文件**：
+  NFS 没有所有主机都遵守的锁。
+- 指针 = `DMDPTR01{binding, 传输标识, 持久前缀, "DMNSTG01" ‖ 16 字节 nonce}`，只在句柄 `checkpoint()`（COMMIT /
+  FILE_SYNC）证明前缀之后写；写法：删临时名 → 独占创建 → `write_at`（nfs-rs 返回前已 COMMIT）→ close → rename 覆盖。
+  rename 回复丢失 → 读回比较字节。
+- **nonce 围栏**：每次 prepare 取新 nonce；续传先用自己的 nonce 重写指针（接管）再截断 stage；之后每次重写指针、
+  发布 rename 前、清理前都读回指针，nonce 不同（或写过后指针没了）→ `Conflict`（永久），不碰那些名字。围栏是检查
+  不是锁；非 recoverable 的 stage 在第一个检查点之前没有指针可比 —— 都靠调用方契约兜底，读回校验抓混写的字节。
+- 续传遇 `PermissionDenied`（元数据已施加）→ 经元数据角色设回 0600 再打开。
+- `rmdir` / `rename` 成功后 `GLOBAL_CACHE` 会忘掉该路径及其下所有目录句柄（C10a），否则改名后重建的目录会被
+  解析到旧目录里。
+- 真机：`examples/nfs3_contract.rs --dialect nfs41`（`validate_recovery` 覆盖续传与接管），`resume_matrix.sh`
+  `DEST=nfs://…`。ONTAP NFSv4.1 已验（2026-09-25）；NFSv3 真机待定（WSL 下 ONTAP v3 MOUNT 被拒，m1-target 的 v3
+  导出路径未知）。
+
 ## 测试
 
 - `examples/nfs_walkdir.rs` — 遍历 export。

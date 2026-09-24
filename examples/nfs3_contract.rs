@@ -10,8 +10,9 @@ use data_mover::model::{
     StoragePath, Transience,
 };
 use data_mover::storage::{
-    ByteStream, FinalDestination, MetadataMutation, PreflightPolicy, PrepareRequest,
-    PublishRequest, RecoverRequest, Storage, StorageRoleFailure, VerifyRequest,
+    ByteStream, DestinationPrepareRequest, FinalDestination, MetadataMutation, PreflightPolicy,
+    PrepareFact, PrepareRequest, PublishRequest, ResumeMode, Storage, StorageRoleFailure,
+    VerifyRequest,
 };
 use data_mover::transfer::{
     InflightLimits, SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferPolicy,
@@ -442,8 +443,10 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
     let Err(failure) = result else {
         return Err("in-flight cancellation unexpectedly succeeded".into());
     };
-    if !failure.has_recoverable_stage() {
-        return Err("in-flight cancellation did not preserve a recoverable stage".into());
+    // 512 KiB is below the automatic checkpoint interval (ADR-0001): the cancelled attempt keeps
+    // its unpublished stage for an explicit discard, but has no checkpoint to resume from.
+    if !failure.has_unpublished_stage() || failure.has_recoverable_stage() {
+        return Err("in-flight cancellation did not keep exactly an unpublished stage".into());
     }
     failure.discard_stage().await?;
 
@@ -463,76 +466,78 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
     if outcome.transferred_bytes != 8 * 64 * 1024 {
         return Err("restart upload did not publish the complete source".into());
     }
+    // The discard removed the cancelled stage, so the restart found nothing to clean.
+    if outcome.prepare != PrepareFact::Fresh {
+        return Err(format!("restart upload found leftovers: {:?}", outcome.prepare).into());
+    }
     Ok(())
 }
 
+/// Recovery kept at the destination (ADR-0006): a stage and its pointer survive the connection
+/// that wrote them; a new connection resumes from the pointer's durable prefix, and a second one
+/// that resumes the same stage takes it over, so the first can no longer publish.
 async fn validate_recovery(source: &Storage, destination: Storage, url: &str) -> ContractResult {
     let policy = PreflightPolicy::production();
     let descriptor = source
         .read_source(&policy)?
         .describe(&path("fixture.bin")?)
         .await?;
+    let request = || -> Result<DestinationPrepareRequest, Box<dyn Error>> {
+        Ok(DestinationPrepareRequest::new(
+            PrepareRequest {
+                final_destination: FinalDestination::new(path("recovered.bin")?),
+                source: descriptor.clone(),
+                recovery_binding: [42; 32],
+            },
+            [43; 32],
+        )
+        .with_resume(ResumeMode::Discover)
+        .with_recoverable(true))
+    };
     let destination_role = destination.staged_destination(&policy)?;
-    let recovery_binding = [42; 32];
-    let stage = destination_role
-        .prepare(PrepareRequest {
-            final_destination: FinalDestination::new(path("recovered.bin")?),
-            source: descriptor.clone(),
-            recovery_binding,
-        })
-        .await?;
+    let stage = destination_role.prepare_at_destination(request()?).await?;
+    assert_eq!(stage.prepare_fact(), PrepareFact::Fresh);
     let payload = b"nfs3 durable recovery contract";
     let partial: ByteStream = Box::pin(stream::iter([Ok(Bytes::copy_from_slice(&payload[..11]))]));
     destination_role.write(&stage, partial).await?;
-    let recovery_identity = destination_role.recovery_identity(&stage).await?;
+    drop(stage);
     drop(destination_role);
     drop(destination);
 
     let first = connect_destination(url).await?;
-    let second = connect_destination(url).await?;
     let first_role = first.staged_destination(&policy)?;
+    let held = first_role.prepare_at_destination(request()?).await?;
+    assert_eq!(held.prepare_fact(), PrepareFact::Resumed { bytes: 11 });
+    let second = connect_destination(url).await?;
     let second_role = second.staged_destination(&policy)?;
-    let first_request = RecoverRequest {
-        identity: recovery_identity.clone(),
-        final_destination: FinalDestination::new(path("recovered.bin")?),
-        source: descriptor.clone(),
-        recovery_binding,
-        claim_token: [1; 32],
+    let recovered = second_role.prepare_at_destination(request()?).await?;
+    assert_eq!(recovered.prepare_fact(), PrepareFact::Resumed { bytes: 11 });
+
+    let hash = *blake3::hash(payload).as_bytes();
+    let publication = |expected_blake3| PublishRequest {
+        expected_size: payload.len() as u64,
+        expected_blake3,
+        cancel: CancellationToken::new(),
     };
-    let second_request = RecoverRequest {
-        identity: recovery_identity,
-        final_destination: FinalDestination::new(path("recovered.bin")?),
-        source: descriptor,
-        recovery_binding,
-        claim_token: [2; 32],
-    };
-    let (first_result, second_result) = tokio::join!(
-        first_role.recover(first_request),
-        second_role.recover(second_request)
-    );
-    let (recovered_role, recovered, loser) = match (first_result, second_result) {
-        (Ok(stage), Err(error)) => (first_role, stage, error),
-        (Err(error), Ok(stage)) => (second_role, stage, error),
-        (left, right) => {
-            return Err(format!(
-                "exactly one real NFS recovery claim must succeed: {left:?}, {right:?}"
-            )
-            .into());
-        }
-    };
+    let refused = first_role
+        .publish(&held, publication(Some(hash)))
+        .await
+        .err()
+        .ok_or("a stage another connection took over must not publish")?;
     assert!(
         matches!(
-            &loser,
-        StorageRoleFailure::Entry(error)
-            if matches!(error.class(), FailureClass::Conflict | FailureClass::NotFound)
+            &refused.error,
+            StorageRoleFailure::Entry(error) if error.class() == FailureClass::Conflict
         ),
-        "unexpected losing recovery claim: {loser:?}"
+        "unexpected refusal of the taken-over stage: {refused:?}"
     );
+    assert!(!refused.final_destination_changed);
+    first_role.discard(held).await?;
+
     let remainder: ByteStream =
         Box::pin(stream::iter([Ok(Bytes::copy_from_slice(&payload[11..]))]));
-    recovered_role.write(&recovered, remainder).await?;
-    let hash = *blake3::hash(payload).as_bytes();
-    recovered_role
+    second_role.write(&recovered, remainder).await?;
+    second_role
         .verify(
             &recovered,
             VerifyRequest {
@@ -542,15 +547,8 @@ async fn validate_recovery(source: &Storage, destination: Storage, url: &str) ->
             },
         )
         .await?;
-    recovered_role
-        .publish(
-            &recovered,
-            PublishRequest {
-                expected_size: payload.len() as u64,
-                expected_blake3: Some(hash),
-                cancel: CancellationToken::new(),
-            },
-        )
+    second_role
+        .publish(&recovered, publication(Some(hash)))
         .await
         .map_err(|failure| failure.error)?;
     Ok(())

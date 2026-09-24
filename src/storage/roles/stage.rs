@@ -67,6 +67,13 @@ impl PreparedStage {
         }
     }
 
+    /// What prepare found at the destination and did about it: `Fresh`, `Resumed`, or
+    /// `Restarted` with its reason.
+    #[must_use]
+    pub const fn prepare_fact(&self) -> PrepareFact {
+        self.prepare_fact
+    }
+
     /// Marks a stage prepared at the destination, with what its prepare found.
     pub(crate) fn mark_at_destination(&mut self, fact: PrepareFact) {
         self.at_destination = true;
