@@ -125,7 +125,13 @@ pub(crate) fn test_destination_storage_with_role(
     ),
     Box<dyn std::error::Error>,
 > {
-    let identity = test_identity(name);
+    // The root is part of the identity, as it is of a real Local endpoint: two tests reusing a
+    // label and a final path in different directories are different destinations, while two
+    // handles to one root stay one. The engine's per-destination guard keys on it.
+    let identity = test_identity(&format!(
+        "{name}#{}",
+        std::fs::canonicalize(root)?.display()
+    ));
     let destination = std::sync::Arc::new(staged::LocalStagedDestination::new(
         root,
         identity.clone(),
