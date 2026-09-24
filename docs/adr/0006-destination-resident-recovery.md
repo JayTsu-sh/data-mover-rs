@@ -66,8 +66,25 @@ its lease, the `Publishing` state, `recover` / `RecoverRequest` / `RecoveryIdent
    It names "this file goes to that file" for logs, reports and caller records, and excludes the source
    version, so it is stable across reschedules and source updates. A caller may override it, which
    opts out of cross-job resume.
-3. **Recovery binding**: `TransferIdentity` + the observed source identity/version + size + content
-   version. It is stored inside the destination pointer and decides resume versus restart.
+   Encoding (C5, `src/transfer/identity.rs`): `blake3("data-mover/transfer-identity/v1\0" ‖ source kind
+   ‖ source endpoint ‖ source path ‖ selector ‖ destination kind ‖ destination endpoint ‖ final path)`,
+   every variable field prefixed with its u64 little-endian length; paths are literal; `Current` is the
+   selector byte `0x00`. An override is
+   `blake3("data-mover/transfer-identity/override/v1\0" ‖ len(label) ‖ label)`; the two domains
+   differ, so an override can never equal a derived identity. 32 bytes, shown as 64 lowercase hex digits; it holds no
+   credentials. A frozen test vector, computed independently of the code, pins the encoding.
+3. **Recovery binding**: `TransferIdentity` + the source path and observed identity + size + content
+   version + the destination. It is stored inside the destination pointer and decides resume versus restart.
+   Binding v3 (C5): `blake3("data-mover/recovery-binding/v3\0" ‖ identity ‖ source path ‖ source
+   identity key ‖ size? ‖ content version? ‖ destination kind ‖ destination endpoint ‖ final path)`,
+   variable fields length-prefixed, optional ones tagged present/absent (v2 wrote an unknown size as
+   `u64::MAX`). The source path and the destination repeat what a derived identity already names,
+   because an override label names neither, and the source identity key does not always name the
+   entry: an S3 object's is its versionId or ETag, not its key. A frozen vector pins it too.
+   v2 bindings never equal v3 ones: a transfer interrupted before the upgrade restarts from zero, and
+   what it left — recovery-store `<binding>.state` / `.lock` files, stage files named from the binding,
+   S3 stages under `.data-mover-stage/<binding>/` with their incomplete multipart uploads — is orphaned.
+   Drain transfers before upgrading.
 
 ### Source version selector
 

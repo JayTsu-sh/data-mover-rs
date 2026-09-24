@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
 
+use super::identity::{BindingSource, binding_hash};
 use super::model::{InflightLimits, RecoveryContext, RecoveryRegistrationFailure};
 use super::{ReadBackVerification, TransferPolicy, TransferRequest};
 use crate::model::{
@@ -749,7 +750,7 @@ async fn run_until_transferred_inner(
     };
     let effective_recovery = final_recovery(&stage, plan);
     Ok(Transferred {
-        identity: request.identity.clone(),
+        identity: request.identity,
         destination,
         stage,
         write: evidence.write,
@@ -1028,24 +1029,17 @@ pub(super) fn recovery_binding_for(
     final_path: &StoragePath,
     descriptor: &SourceDescriptor,
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"data-mover/recovery-binding/v2\0");
-    hasher.update(&(identity.as_bytes().len() as u64).to_le_bytes());
-    hasher.update(identity.as_bytes());
-    hasher.update(descriptor.source_identity.identity_key().as_bytes());
-    hasher.update(descriptor.path.as_str().as_bytes());
-    hasher.update(&descriptor.size.unwrap_or(u64::MAX).to_le_bytes());
-    hasher.update(&[u8::from(descriptor.content_version.is_some())]);
-    if let Some(version) = &descriptor.content_version {
-        hasher.update(&(version.len() as u64).to_le_bytes());
-        hasher.update(version);
-    }
-    let destination_identity = destination.identity();
-    hasher.update(destination_identity.kind().as_str().as_bytes());
-    hasher.update(&(destination_identity.stable_id().len() as u64).to_le_bytes());
-    hasher.update(destination_identity.stable_id().as_bytes());
-    hasher.update(final_path.as_str().as_bytes());
-    *hasher.finalize().as_bytes()
+    binding_hash(
+        identity,
+        &BindingSource {
+            path: &descriptor.path,
+            identity_key: descriptor.source_identity.identity_key(),
+            size: descriptor.size,
+            content_version: descriptor.content_version.as_deref(),
+        },
+        destination.identity(),
+        final_path,
+    )
 }
 
 struct TransferRoles {

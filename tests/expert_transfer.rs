@@ -79,7 +79,7 @@ async fn expert_source_and_destination_share_verified_publication_lifecycle() ->
     let identity = TransferIdentity::new("expert-e2e")?;
     let limits = InflightLimits::new(2, 128 * 1024, 2)?;
     let source = ExpertSourceSession::open(ExpertSourceRequest::new(
-        identity.clone(),
+        identity,
         source_storage,
         observation.clone(),
         limits,

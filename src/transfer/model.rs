@@ -7,11 +7,17 @@ use tokio_util::sync::CancellationToken;
 use crate::model::StoragePath;
 use crate::storage::{RecoveryIdentity, SourceQosGroup, Storage};
 
-const MAX_IDENTITY_BYTES: usize = 1024;
+use super::TransferIdentity;
 
 /// Failure to construct a transfer-domain value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransferValueError(&'static str);
+
+impl TransferValueError {
+    pub(crate) const fn new(message: &'static str) -> Self {
+        Self(message)
+    }
+}
 
 impl fmt::Display for TransferValueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -85,37 +91,6 @@ impl RecoveryContext {
             registrar,
             lease,
         }
-    }
-}
-
-/// Caller-provided stable identity for one logical transfer.
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct TransferIdentity(String);
-
-impl TransferIdentity {
-    /// Creates an opaque identity that remains stable across attempts.
-    ///
-    /// # Errors
-    /// Returns an error for blank, NUL-containing, or unbounded values.
-    pub fn new(value: impl Into<String>) -> Result<Self, TransferValueError> {
-        let value = value.into();
-        if value.trim().is_empty() || value.contains('\0') || value.len() > MAX_IDENTITY_BYTES {
-            Err(TransferValueError(
-                "transfer identity must be non-blank and bounded",
-            ))
-        } else {
-            Ok(Self(value))
-        }
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-}
-
-impl fmt::Debug for TransferIdentity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("TransferIdentity(<opaque>)")
     }
 }
 

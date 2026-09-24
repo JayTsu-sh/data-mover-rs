@@ -147,7 +147,7 @@ async fn finish_native(
         .with_source_qos(native_stats));
     }
     Ok(Transferred {
-        identity: request.identity.clone(),
+        identity: request.identity,
         destination: input.destination,
         stage,
         write: native.write,

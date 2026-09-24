@@ -2,6 +2,7 @@
 
 #[allow(dead_code)]
 mod engine;
+mod identity;
 mod model;
 mod recovery_store;
 
@@ -12,9 +13,10 @@ pub use engine::{
     ExpertSourceRequest, ExpertSourceSession, TransferFailure, TransferOutcome, TransferPhase,
     TransferRoute, TransferSide, transfer,
 };
+pub use identity::TransferIdentity;
 pub use model::{
     CopiedMetadataRequest, InflightLimits, PayloadShapingPolicy, ReadBackVerification,
-    TransferIdentity, TransferPolicy, TransferRequest, TransferValueError,
+    TransferPolicy, TransferRequest, TransferValueError,
 };
 
 #[cfg(test)]
