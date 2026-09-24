@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import time
@@ -19,16 +20,26 @@ from protocol_constants import PROJECT_ROOT  # noqa: E402
 from url_builder import s3_url  # noqa: E402
 
 
+# `scheme://user:secret@host` — the lab URL carries the access key and secret in its userinfo.
+# A secret may hold `/`, so everything up to the token's last `@` is userinfo.
+_USERINFO = re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^\s]*@", re.IGNORECASE)
+
+
+def redact(text: str) -> str:
+    """Hides the credentials of any URL in `text` before it is printed."""
+    return _USERINFO.sub(r"\1***@", text)
+
+
 def run(label: str, cmd: list[str], expected: int = 0, capture: bool = False) -> str:
-    print(f"\n[skill e2e-s3] $ {' '.join(cmd)}")
+    print(f"\n[skill e2e-s3] $ {redact(' '.join(cmd))}")
     if capture:
         result = subprocess.run(
             cmd, cwd=PROJECT_ROOT, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
         )
-        print(result.stdout)
+        print(redact(result.stdout))
         if result.stderr:
-            print("[stderr]", result.stderr)
+            print("[stderr]", redact(result.stderr))
         assert_exit_code(label, result.returncode, expected)
         return result.stdout + result.stderr
     result = subprocess.run(cmd, cwd=PROJECT_ROOT)
