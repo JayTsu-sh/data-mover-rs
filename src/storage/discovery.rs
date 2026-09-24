@@ -209,6 +209,12 @@ pub(crate) trait DestinationArtifacts: Send + Sync {
     ) -> Result<Option<u64>, StorageRoleFailure>;
     async fn remove_pointer(&self, final_path: &StoragePath) -> Result<(), StorageRoleFailure>;
     async fn remove_stage(&self, final_path: &StoragePath) -> Result<(), StorageRoleFailure>;
+    /// Whether a pointer that decodes is one this backend wrote. A refused one is cleaned up as
+    /// corrupt: a backend whose `observe_stage` only confirms the stage refuses a pointer without
+    /// a durable prefix, so a file length is never taken as the resume offset.
+    fn accepts_pointer(&self, _pointer: &DestinationPointer) -> bool {
+        true
+    }
 }
 
 /// Where a resume starts, and the pointer it continues. Stage bytes past `prefix` are not proven
@@ -244,9 +250,10 @@ pub(crate) async fn discover(
         .await?
     {
         None => FoundPointer::Absent,
-        Some(bytes) => {
-            DestinationPointer::decode(&bytes).map_or(FoundPointer::Corrupt, FoundPointer::Present)
-        }
+        Some(bytes) => match DestinationPointer::decode(&bytes) {
+            Ok(pointer) if artifacts.accepts_pointer(&pointer) => FoundPointer::Present(pointer),
+            _ => FoundPointer::Corrupt,
+        },
     };
     let found = Found {
         pointer,

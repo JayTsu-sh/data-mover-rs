@@ -146,6 +146,8 @@ struct Memory {
     stage: Mutex<Option<u64>>,
     removed: Mutex<Vec<&'static str>>,
     fail_stage_removal: bool,
+    /// Refuses a pointer without a durable prefix, as a backend that only confirms its stage does.
+    requires_prefix: bool,
 }
 
 #[async_trait]
@@ -207,6 +209,9 @@ impl DestinationArtifacts for Memory {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         Ok(())
+    }
+    fn accepts_pointer(&self, pointer: &DestinationPointer) -> bool {
+        !self.requires_prefix || pointer.durable_prefix.is_some()
     }
 }
 
@@ -314,6 +319,33 @@ async fn an_interrupted_clean_up_is_finished_by_the_next_prepare() -> TestResult
         }
     );
     assert_eq!(*destination.stage.lock().map_err(|_| "poisoned")?, None);
+    Ok(())
+}
+
+/// A pointer that decodes but that the backend refuses is cleaned up like a corrupt one — here, a
+/// pointer without a prefix, which would otherwise resume from the stage's length.
+#[tokio::test]
+async fn a_refused_pointer_is_cleaned_as_corrupt() -> TestResult {
+    let without_prefix = pointer(BINDING, IDENTITY, None);
+    let destination = Memory {
+        requires_prefix: true,
+        ..memory(
+            Some(without_prefix.encode().map_err(|_| "encode")?),
+            Some(PREFIX),
+        )
+    };
+    let found = discover(&destination, &request(ResumeMode::Discover)?).await?;
+    assert_eq!(
+        found.fact,
+        PrepareFact::Restarted {
+            reason: RestartReason::PointerCorrupt
+        }
+    );
+    assert_eq!(found.resume, None);
+    assert_eq!(
+        *destination.removed.lock().map_err(|_| "poisoned")?,
+        ["pointer", "stage"]
+    );
     Ok(())
 }
 
