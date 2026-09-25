@@ -203,6 +203,20 @@ Namespace::list_stream(&self, ListRequest) -> ListingStream
   - FAS2750 CIFS：5 万条目录在 c=1/4/32 下逐行一致；挂起句柄压测；大小写混合树与 NFS 的 NameBytes 输出一致。
   - MinIO：100 万对象平铺前缀的 RSS 与首条时间；版本数超过一页的 key。
 
+## 补充（architect 第三轮，2026-09-25）
+
+第三轮细化出 27 个问题（完整版在会话 scratchpad 的 `p7-streaming-listing-design.html`），与上面 D1–D14 基本对应。
+新增的要点：
+
+- **178 MB 常驻内存至今没解释清楚**：m1-source 每个目录只有约 35 项，帧里持有的东西应只有几 MB。建议 Phase A 之前先在
+  node1 上用驻留探针跑一遍，并对照 `MALLOC_ARENA_MAX=2`（怀疑 glibc 多 arena）。
+- **排序键改为 git tree 序**（目录按 `名字 + /` 比较，即 D5 的 (K)）：S3 原生键序因此天然有序、可真正流式；代价是推翻
+  P4 已推送的定义、FAS2750 证据要重跑。
+- **HDFS 与 Local 的列举同样会因一个坏子项整目录失败**：HDFS 也有 `collect::<Result<Vec<_>>>()?`，与 CIFS / NFS 同类。
+- **多版本的顺序**：真正需要你定的是由旧到新（现状，latest 最后）还是由新到旧（与服务端列举顺序一致、无需扣留）。
+- **双进程比较的拓扑**：两个遍历并行（双活）归并，还是两进程逐目录列举后比较 —— 建议前者（见第 3 节）。
+- **会话失败后的续传**：调用方凭已收到的 `SubtreeComplete` 跳过已完成子树重扫，是否需要库提供更显式的续传点。
+
 ## 需要你拍板的问题
 
 | # | 问题 | 推荐 |
