@@ -10,9 +10,9 @@
 //!
 //! Endpoints: see `endpoint_support` (`nfs://…`, `smb:<sub-path>`, `s3:<prefix>`, `hdfs://…`, or a
 //! local directory). A second run with the same endpoints and paths derives the same transfer
-//! identity and resumes what the first left behind — today only where the engine's recovery records
-//! (`DATA_MOVER_RECOVERY_DIR`) survived; ADR-0006 moves them to the destination. `--identity`
-//! replaces the derived identity with a label, which a resume must then repeat.
+//! identity and resumes what the first left behind at the destination: nothing is recorded where
+//! data-mover runs (ADR-0006), so the second run may be a fresh process with a fresh `HOME`.
+//! `--identity` replaces the derived identity with a label, which a resume must then repeat.
 //!
 //! `--source-version <versionId>` copies one stored version of an S3 source; the selector is part of
 //! the derived identity, so a resume must repeat it. `--client-shaped` streams an S3→S3 copy instead

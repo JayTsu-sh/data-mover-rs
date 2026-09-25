@@ -1,11 +1,10 @@
-//! The prepared destination stage and its deferred checkpoint registration.
+//! The prepared destination stage and its deferred checkpoint.
 
 use std::fmt;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 
-use super::{FinalDestination, RecoveryIdentity, StorageRoleFailure};
+use super::FinalDestination;
 use crate::storage::PrepareFact;
 
 /// Opaque linear prepared destination state bound to one backend and final destination.
@@ -16,7 +15,6 @@ pub struct PreparedStage {
     pub(crate) recovery_binding: [u8; 32],
     pub(crate) write_offset: u64,
     pub(crate) recovery_enabled: std::sync::atomic::AtomicBool,
-    pub(crate) registration_owned: std::sync::atomic::AtomicBool,
     pub(crate) deferred_checkpoint: Option<DeferredCheckpoint>,
     /// Whether the caller requires final publication persistence barriers.
     pub(crate) durable_publication: bool,
@@ -24,10 +22,10 @@ pub struct PreparedStage {
     pub(crate) direct: bool,
     pub(crate) backend_state: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     pub(crate) claim: std::sync::Mutex<Option<std::fs::File>>,
-    pub(crate) recovery_lease: std::sync::Mutex<Option<std::sync::Arc<std::fs::File>>>,
     /// What prepare found at the destination and did about it.
     pub(crate) prepare_fact: PrepareFact,
-    /// Whether this stage keeps its recovery state at the destination, not in the local store.
+    /// Whether this stage was prepared at the destination (`prepare_at_destination`, or marked so
+    /// by the engine for a direct write) rather than built by hand, as backend unit tests do.
     pub(crate) at_destination: bool,
     /// An exclusivity lease held for as long as the stage lives (the engine's per-key guard).
     pub(crate) exclusive: Option<Box<dyn std::any::Any + Send + Sync>>,
@@ -54,13 +52,11 @@ impl PreparedStage {
             recovery_binding,
             write_offset,
             recovery_enabled: std::sync::atomic::AtomicBool::new(true),
-            registration_owned: std::sync::atomic::AtomicBool::new(true),
             deferred_checkpoint: None,
             durable_publication: true,
             direct: false,
             backend_state: None,
             claim: std::sync::Mutex::new(claim),
-            recovery_lease: std::sync::Mutex::new(None),
             prepare_fact: PrepareFact::Fresh,
             at_destination: false,
             exclusive: None,
@@ -80,15 +76,8 @@ impl PreparedStage {
         self.prepare_fact = fact;
     }
 
-    /// Whether the engine's local recovery store keeps this stage's recovery state.
-    pub(crate) const fn uses_recovery_store(&self) -> bool {
-        !self.at_destination
-    }
-
     pub(crate) fn disable_recovery(self) -> Self {
         self.recovery_enabled
-            .store(false, std::sync::atomic::Ordering::Release);
-        self.registration_owned
             .store(false, std::sync::atomic::Ordering::Release);
         self
     }
@@ -98,11 +87,7 @@ impl PreparedStage {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub(crate) fn owns_recovery_registration(&self) -> bool {
-        self.registration_owned
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
+    #[cfg(test)]
     pub(crate) const fn recovery_binding(&self) -> [u8; 32] {
         self.recovery_binding
     }
@@ -124,13 +109,6 @@ impl PreparedStage {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
     }
-
-    pub(crate) fn retain_recovery_lease(&self, lease: std::sync::Arc<std::fs::File>) {
-        *self
-            .recovery_lease
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lease);
-    }
 }
 
 impl fmt::Debug for PreparedStage {
@@ -144,8 +122,6 @@ impl fmt::Debug for PreparedStage {
             .field("write_offset", &self.write_offset)
             .field("recovery_enabled", &self.recovery_enabled())
             .field("claim", &"<exclusive-lock>")
-            .field("recovery_lease", &"<exclusive-lock>")
-            .field("registration_owned", &self.owns_recovery_registration())
             .field("deferred_checkpoint", &self.deferred_checkpoint.is_some())
             .field("durable_publication", &self.durable_publication)
             .field("direct", &self.direct)
@@ -157,25 +133,9 @@ impl fmt::Debug for PreparedStage {
     }
 }
 
+/// Automatic checkpoint spacing the engine arms for a stage; the destination writes its own
+/// pointer when a checkpoint is due.
 pub(crate) struct DeferredCheckpoint {
     pub(crate) interval_bytes: u64,
     pub(crate) source_size: u64,
-    #[expect(
-        dead_code,
-        reason = "no destination registers a checkpoint since ADR-0006 C12d; removed with the recovery store (C21)"
-    )]
-    pub(crate) registration: std::sync::Arc<dyn CheckpointRegistration>,
-}
-
-#[async_trait]
-pub(crate) trait CheckpointRegistration: Send + Sync {
-    #[expect(
-        dead_code,
-        reason = "no destination registers a checkpoint since ADR-0006 C12d; removed with the recovery store (C21)"
-    )]
-    async fn register(
-        &self,
-        stage: &PreparedStage,
-        identity: RecoveryIdentity,
-    ) -> Result<(), StorageRoleFailure>;
 }

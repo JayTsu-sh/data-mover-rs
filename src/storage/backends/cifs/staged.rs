@@ -10,10 +10,9 @@ use super::source::{classify, entry_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath};
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::{
-    ByteStream, CheckpointObservation, Metadata, MetadataMutation, PrepareRequest, PreparedStage,
+    ByteStream, CheckpointObservation, Metadata, MetadataMutation, PreparedStage,
     PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
-    RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure, VerificationEvidence,
-    VerifyRequest, WriteEvidence,
+    StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 const VERIFY_CHUNK: u32 = 1024 * 1024;
@@ -267,32 +266,12 @@ impl StagedDestination for CifsStagedDestination {
     fn automatic_checkpoint_interval_bytes(&self) -> Option<u64> {
         Some(64 * 1024 * 1024)
     }
-    /// CIFS keeps its recovery state at the destination: every stage is prepared through
-    /// [`StagedDestination::prepare_at_destination`].
-    async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(unsupported(request.final_destination.path()))
-    }
-
-    async fn recovery_identity(
-        &self,
-        stage: &PreparedStage,
-    ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        Err(unsupported(stage.final_destination.path()))
-    }
-
-    fn recovery_at_destination(&self) -> bool {
-        true
-    }
 
     async fn prepare_at_destination(
         &self,
         request: crate::storage::DestinationPrepareRequest,
     ) -> Result<PreparedStage, StorageRoleFailure> {
         super::at_destination::prepare(self, request).await
-    }
-
-    async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(unsupported(request.final_destination.path()))
     }
 
     async fn write(
@@ -490,10 +469,6 @@ pub(super) fn validate_final(path: &StoragePath) -> Result<(), StorageRoleFailur
         ));
     }
     Ok(())
-}
-
-fn unsupported(path: &StoragePath) -> StorageRoleFailure {
-    entry_failure(path, Operation::Prepare, FailureClass::Unsupported)
 }
 
 fn publication_unchanged(error: StorageRoleFailure) -> PublicationFailure {

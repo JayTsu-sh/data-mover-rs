@@ -4,7 +4,6 @@
 mod engine;
 mod identity;
 mod model;
-mod recovery_store;
 
 pub use crate::model::SourceVersion;
 pub use crate::storage::{PrepareFact, RestartReason};

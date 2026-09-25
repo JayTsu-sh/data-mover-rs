@@ -15,8 +15,8 @@ use crate::storage::backends::s3::S3TagSupport;
 use crate::storage::backends::s3::metadata::S3Metadata;
 use crate::storage::backends::s3::tests::{MemoryS3, content_md5, identity};
 use crate::storage::{
-    CheckpointRegistration, DeferredCheckpoint, FinalDestination, PrepareRequest, RecoveryIdentity,
-    SourceDescriptor, StagedDestination, VerificationPoint,
+    DeferredCheckpoint, FinalDestination, PrepareRequest, SourceDescriptor, StagedDestination,
+    VerificationPoint,
 };
 use crate::storage::{RestartReason, ResumeMode};
 
@@ -89,28 +89,10 @@ fn failing_after(bytes: &[u8]) -> TestResult<ByteStream> {
     Ok(Box::pin(stream::iter(pieces)))
 }
 
-struct NeverRegistered;
-
-#[async_trait]
-impl CheckpointRegistration for NeverRegistered {
-    async fn register(
-        &self,
-        _stage: &PreparedStage,
-        _identity: RecoveryIdentity,
-    ) -> Result<(), StorageRoleFailure> {
-        Err(entry(
-            &StoragePath::root(),
-            Operation::Prepare,
-            "a stage kept at the destination never registers",
-        ))
-    }
-}
-
 fn with_checkpoint(stage: &mut PreparedStage, interval: usize, size: usize) {
     stage.deferred_checkpoint = Some(DeferredCheckpoint {
         interval_bytes: interval as u64,
         source_size: size as u64,
-        registration: Arc::new(NeverRegistered),
     });
 }
 
@@ -749,12 +731,10 @@ async fn tags_are_set_on_the_completed_object() -> TestResult {
     Ok(())
 }
 
-/// S3 keeps its recovery state at the destination (ADR-0006 C15c; the temp-key path is gone
-/// since C19) with the 64 MiB automatic interval.
+/// S3 checkpoints at the 64 MiB automatic interval (ADR-0006 D3).
 #[test]
-fn s3_keeps_recovery_at_the_destination() {
+fn s3_checkpoints_at_the_64_mib_interval() {
     let on = S3StagedDestination::new(Arc::new(MemoryS3::default()), identity());
-    assert!(on.recovery_at_destination());
     assert_eq!(
         on.automatic_checkpoint_interval_bytes(),
         Some(64 * MIB as u64)

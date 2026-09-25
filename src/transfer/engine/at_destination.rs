@@ -1,4 +1,4 @@
-//! The engine side of destination-resident recovery (ADR-0006): for a destination that keeps its
+//! The engine side of destination-resident recovery (ADR-0006): every destination keeps its
 //! recovery state beside the final file, prepare asks the destination — under the per-file guard —
 //! and nothing about the transfer is recorded where data-mover runs.
 
@@ -6,7 +6,7 @@ use super::guard::{self, DestinationLease};
 use super::{
     Arc, CopiedMetadataPlan, NativePair, PreparedStage, ReadSource, SourceDescriptor,
     SourceQosBudget, StagedDestination, TransferFailure, TransferPhase, TransferPlan,
-    TransferPolicy, TransferRequest, TransferSide, Transferred, automatic, final_recovery, native,
+    TransferPolicy, TransferRequest, TransferSide, Transferred, final_recovery, native,
     plan_request, transfer_stage,
 };
 use tokio_util::sync::CancellationToken;
@@ -127,7 +127,7 @@ pub(super) async fn prepare_with(
     Ok(stage)
 }
 
-/// The whole transfer up to verification, for a destination that keeps its recovery state.
+/// The whole transfer up to verification.
 pub(super) async fn run_until_transferred(
     request: &TransferRequest,
     roles: (Arc<dyn ReadSource>, Arc<dyn StagedDestination>),
@@ -162,11 +162,10 @@ pub(super) async fn run_until_transferred(
     .await?;
     stage.durable_publication = request.transfer_policy == TransferPolicy::Checkpointed;
     if let Some(interval_bytes) = plan.automatic_interval {
-        // The destination writes its own pointer at the deferred checkpoint; nothing registers here.
+        // The destination writes its own pointer at the deferred checkpoint.
         stage.deferred_checkpoint = Some(crate::storage::DeferredCheckpoint {
             interval_bytes,
             source_size: plan.source_size,
-            registration: Arc::new(automatic::AtDestination),
         });
     }
     let evidence = match transfer_stage(
@@ -220,9 +219,9 @@ async fn native_transfer(
             recovery_binding,
             source_qos,
             plan,
-            preparation: native::Preparation::AtDestination(lease),
             copied_metadata_plan,
         },
+        lease,
     )
     .await
 }

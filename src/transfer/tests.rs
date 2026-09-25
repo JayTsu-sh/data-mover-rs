@@ -18,7 +18,6 @@ use crate::model::{
 };
 
 use crate::model::StoragePath;
-use crate::storage::RecoveryIdentity;
 use crate::storage::Storage;
 use crate::storage::backends::local::{
     source::LocalReadSource, test_destination_storage, test_destination_storage_with_role,
@@ -228,10 +227,6 @@ fn transfer_inputs_reject_ambiguous_identity_and_unbounded_limits() {
     assert!(InflightLimits::new(2, 0, 1).is_err());
     assert!(InflightLimits::new(2, 64 * 1024, 0).is_err());
     assert!(InflightLimits::new(2, 64 * 1024, 1).is_ok());
-    assert!(RecoveryIdentity::from_bytes(bytes::Bytes::new()).is_err());
-    let opaque = RecoveryIdentity::from_bytes(bytes::Bytes::from_static(b"secret-stage"))
-        .unwrap_or_else(|error| panic!("unexpected recovery identity failure: {error}"));
-    assert_eq!(format!("{opaque:?}"), "RecoveryIdentity(<opaque>)");
 }
 
 #[tokio::test]
@@ -968,10 +963,10 @@ async fn a_resumed_stage_that_fails_verification_is_not_resumed_again()
     Ok(())
 }
 
-/// Local keeps its recovery state at the destination (ADR-0006 C8): neither an interrupted
-/// transfer nor its resume leaves anything in the local recovery store.
+/// Local keeps its recovery state at the destination (ADR-0006 C8): a transfer dropped after its
+/// checkpoints resumes from what it left beside the final file, and the resume leaves nothing.
 #[tokio::test]
-async fn a_local_transfer_never_touches_the_local_recovery_store()
+async fn a_dropped_local_transfer_resumes_from_the_destination()
 -> Result<(), Box<dyn std::error::Error>> {
     let source_root = TestRoot::new("no-store-source")?;
     let destination_root = TestRoot::new("no-store-destination")?;
@@ -989,13 +984,10 @@ async fn a_local_transfer_never_touches_the_local_recovery_store()
         .with_transfer_policy(TransferPolicy::Checkpointed))
     };
     let interrupted = run_until_transferred(request()?).await?;
-    let binding = interrupted.recovery_binding();
     assert!(interrupted.recovery_enabled());
     drop(interrupted);
-    assert!(!super::recovery_store::has_entry(binding));
     let outcome = transfer(request()?).await?;
     assert!(matches!(outcome.prepare, PrepareFact::Resumed { .. }));
-    assert!(!super::recovery_store::has_entry(binding));
     assert_eq!(staging_entry_count(destination_root.path())?, 0);
     Ok(())
 }

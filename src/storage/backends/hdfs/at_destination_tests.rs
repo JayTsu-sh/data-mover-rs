@@ -284,21 +284,8 @@ async fn a_lost_publication_reply_with_other_content_is_not_published() -> TestR
     Ok(())
 }
 
-struct NeverRegistered;
-
-#[async_trait::async_trait]
-impl crate::storage::CheckpointRegistration for NeverRegistered {
-    async fn register(
-        &self,
-        _stage: &PreparedStage,
-        _identity: crate::storage::RecoveryIdentity,
-    ) -> Result<(), StorageRoleFailure> {
-        unreachable!("a stage kept at the destination never registers")
-    }
-}
-
-/// A deferred checkpoint writes the stage's first pointer (after hsync) instead of registering,
-/// and a later prepare that finds the stage shorter than that pointer's prefix starts over.
+/// A deferred checkpoint writes the stage's first pointer (after hsync), and a later prepare that
+/// finds the stage shorter than that pointer's prefix starts over.
 #[tokio::test]
 async fn checkpoints_write_the_pointer_and_a_shorter_stage_restarts() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());
@@ -310,7 +297,6 @@ async fn checkpoints_write_the_pointer_and_a_shorter_stage_restarts() -> TestRes
     stage.deferred_checkpoint = Some(crate::storage::DeferredCheckpoint {
         interval_bytes: 4,
         source_size: PAYLOAD.len() as u64,
-        registration: Arc::new(NeverRegistered),
     });
     destination.write(&stage, input(PAYLOAD)).await?;
     assert!(stage.recovery_enabled());
@@ -343,56 +329,8 @@ async fn checkpoints_write_the_pointer_and_a_shorter_stage_restarts() -> TestRes
     Ok(())
 }
 
-/// HDFS keeps its recovery state at the destination: the engine routes it through
-/// `prepare_at_destination` and never through the local recovery store (ADR-0006 C12c).
-#[test]
-fn hdfs_keeps_recovery_at_the_destination() -> TestResult {
-    let protocol = Arc::new(MemoryHdfs::default());
-    assert!(adapter(&protocol)?.recovery_at_destination());
-    Ok(())
-}
-
-fn is_unsupported<T>(result: &Result<T, StorageRoleFailure>) -> bool {
-    matches!(
-        result,
-        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Unsupported
-    )
-}
-
-/// The store-era entry points are gone: HDFS prepares every staged transfer at the destination
-/// (ADR-0006 C12d), and none of them touches it.
-#[tokio::test]
-async fn store_era_entry_points_are_unsupported() -> TestResult {
-    let protocol = Arc::new(MemoryHdfs::default());
-    let destination = adapter(&protocol)?;
-    let prepare = request(BINDING, ResumeMode::Discover, true)?.prepare;
-    assert!(is_unsupported(&destination.prepare(prepare.clone()).await));
-    assert!(is_unsupported(
-        &destination.prepare_ephemeral(prepare.clone()).await
-    ));
-    assert_eq!(protocol.len().await, 0);
-    let stage = destination
-        .prepare_at_destination(request(BINDING, ResumeMode::Discover, true)?)
-        .await?;
-    assert!(is_unsupported(&destination.recovery_identity(&stage).await));
-    assert!(is_unsupported(&destination.handoff_recovery(&stage).await));
-    let recovered = destination
-        .recover(crate::storage::RecoverRequest {
-            identity: crate::storage::RecoveryIdentity::from_bytes(Bytes::from_static(b"old"))?,
-            final_destination: prepare.final_destination,
-            source: prepare.source,
-            recovery_binding: BINDING,
-            claim_token: [9; 32],
-        })
-        .await;
-    assert!(is_unsupported(&recovered));
-    destination.discard(stage).await?;
-    assert_eq!(protocol.len().await, 0);
-    Ok(())
-}
-
-/// Only a stage kept at the destination, or a direct one, is this adapter's: any other stage (as
-/// the store era prepared them) is refused before anything is touched.
+/// Only a stage kept at the destination, or a direct one, is this adapter's: any other stage (one
+/// built by hand) is refused before anything is touched.
 #[tokio::test]
 async fn a_stage_neither_at_the_destination_nor_direct_is_refused() -> TestResult {
     let protocol = Arc::new(MemoryHdfs::default());

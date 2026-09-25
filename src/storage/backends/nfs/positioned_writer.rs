@@ -313,7 +313,7 @@ impl<'a> Writer<'a> {
         let write_handle = Arc::clone(self.handle);
         let periodic_checkpoint = self.stage.deferred_checkpoint.is_some();
         self.writes.push(Box::pin(async move {
-            // A periodic checkpoint owns COMMIT cadence even after registration.
+            // A periodic checkpoint owns COMMIT cadence even once recovery is on.
             let result = if recovery_enabled && !periodic_checkpoint {
                 write_handle.write_deferred_at(offset, piece).await
             } else if checkpoint_pending {

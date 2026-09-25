@@ -13,8 +13,8 @@ use crate::runtime::qos::SourceQosBudget;
 
 mod stage;
 mod version;
+pub(crate) use stage::DeferredCheckpoint;
 pub use stage::PreparedStage;
-pub(crate) use stage::{CheckpointRegistration, DeferredCheckpoint};
 use version::version_unsupported;
 
 use crate::model::{
@@ -184,64 +184,6 @@ pub struct PrepareRequest {
     pub recovery_binding: [u8; 32],
 }
 
-/// Failure to reconstruct an opaque recovery identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RecoveryValueError;
-
-impl fmt::Display for RecoveryValueError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("recovery identity must be non-empty and bounded")
-    }
-}
-
-impl Error for RecoveryValueError {}
-
-/// Versioned opaque backend recovery identity persisted without interpretation.
-#[derive(Clone, Eq, PartialEq)]
-pub struct RecoveryIdentity(Bytes);
-
-impl RecoveryIdentity {
-    /// Reconstructs a bounded identity from persisted bytes.
-    ///
-    /// # Errors
-    /// Returns an error for empty or oversized identities.
-    pub fn from_bytes(bytes: impl Into<Bytes>) -> Result<Self, RecoveryValueError> {
-        let bytes = bytes.into();
-        if bytes.is_empty() || bytes.len() > 4096 {
-            Err(RecoveryValueError)
-        } else {
-            Ok(Self(bytes))
-        }
-    }
-
-    /// Returns opaque bytes for persistence.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &Bytes {
-        &self.0
-    }
-}
-
-impl fmt::Debug for RecoveryIdentity {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("RecoveryIdentity(<opaque>)")
-    }
-}
-
-/// Inputs used by a backend to revalidate one recovery identity.
-#[derive(Clone, Debug)]
-pub struct RecoverRequest {
-    pub identity: RecoveryIdentity,
-    pub final_destination: FinalDestination,
-    pub source: SourceDescriptor,
-    pub recovery_binding: [u8; 32],
-    /// Caller-persisted identity for one recovery attempt, stable across process restart.
-    /// Backends that must fence competing processes themselves use it (NFS, HDFS, CIFS). S3
-    /// ignores it and takes no claim of its own: exclusivity is the caller's — the transfer
-    /// engine holds the recovery record's per-host lease for the whole attempt — and a direct
-    /// caller of `recover` must provide the same.
-    pub claim_token: [u8; 32],
-}
-
 /// A typed destination that remains unchanged until publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FinalDestination(StoragePath);
@@ -362,30 +304,14 @@ pub trait StagedDestination: Send + Sync {
             .unwrap_or_else(|_| unreachable!("the static positioned-I/O diagnostic is valid")),
         ))
     }
-    /// Whether this destination keeps its recovery state at the destination (ADR-0006): its prepare
-    /// is [`StagedDestination::prepare_at_destination`], and nothing about the transfer is recorded
-    /// where data-mover runs. A transition flag, `false` until each backend moves (C8–C15).
-    fn recovery_at_destination(&self) -> bool {
-        false
-    }
     /// Prepares by looking at the destination first: resumes an equal binding found there, or
     /// cleans up what it finds and starts fresh. The returned stage reports the
-    /// [`PrepareFact`](super::PrepareFact).
+    /// [`PrepareFact`](super::PrepareFact). Every destination keeps its recovery state beside the
+    /// final file (ADR-0006): nothing about the transfer is recorded where data-mover runs.
     async fn prepare_at_destination(
         &self,
         request: super::DestinationPrepareRequest,
-    ) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(StorageRoleFailure::Entry(
-            EntryOperationFailure::new(
-                request.prepare.final_destination.path().clone(),
-                Operation::Prepare,
-                FailureClass::Unsupported,
-                Transience::Permanent,
-                "this destination keeps no recovery state at the destination",
-            )
-            .unwrap_or_else(|_| unreachable!("the static prepare diagnostic is valid")),
-        ))
-    }
+    ) -> Result<PreparedStage, StorageRoleFailure>;
     /// Whether this backend can prepare an in-place target for the shared writer.
     fn supports_direct(&self) -> bool {
         false
@@ -442,36 +368,6 @@ pub trait StagedDestination: Send + Sync {
         .await
     }
 
-    async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure>;
-    /// Prepares unpublished state that must never be resumed after this attempt.
-    ///
-    /// The default preserves backend staging and atomic-publication behavior while marking the
-    /// returned state as ineligible for recovery. Backends with persistent checkpoint setup may
-    /// override this method to omit that work.
-    async fn prepare_ephemeral(
-        &self,
-        request: PrepareRequest,
-    ) -> Result<PreparedStage, StorageRoleFailure> {
-        self.prepare(request)
-            .await
-            .map(PreparedStage::disable_recovery)
-    }
-    async fn recovery_identity(
-        &self,
-        stage: &PreparedStage,
-    ) -> Result<RecoveryIdentity, StorageRoleFailure>;
-    /// Transfers recovery authority out of the current process.
-    ///
-    /// The default identity snapshot is sufficient for backends whose authority is held by the
-    /// stage itself. Backends with adapter-local claims may override this to release that claim
-    /// only after the identity has been created successfully.
-    async fn handoff_recovery(
-        &self,
-        stage: &PreparedStage,
-    ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        self.recovery_identity(stage).await
-    }
-    async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure>;
     async fn write(
         &self,
         stage: &PreparedStage,

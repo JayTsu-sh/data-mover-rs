@@ -83,10 +83,10 @@ async fn a_small_object_is_one_put_verified_after_publication() -> TestResult {
     Ok(())
 }
 
-/// A checkpointed transfer of a small object keeps nothing in the local recovery store: the
-/// destination declines recovery for a single PUT, and the outcome says it was skipped.
+/// A checkpointed transfer of a small object keeps no recovery state: the destination declines
+/// recovery for a single PUT, and the outcome says it was skipped.
 #[tokio::test]
-async fn a_checkpointed_small_object_keeps_no_recovery_record() -> TestResult {
+async fn a_checkpointed_small_object_keeps_no_recovery_state() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let payload = Bytes::from(vec![4; 200 * 1024]);
     protocol
@@ -99,16 +99,13 @@ async fn a_checkpointed_small_object_keeps_no_recovery_record() -> TestResult {
             .map(|request| request.with_transfer_policy(TransferPolicy::Checkpointed))
     };
     let interrupted = run_until_transferred(checkpointed()?).await?;
-    let binding = interrupted.recovery_binding();
     assert!(!interrupted.recovery_enabled());
-    assert!(!super::recovery_store::has_entry(binding));
     interrupted.discard().await?;
     let outcome = transfer(checkpointed()?).await?;
     assert_eq!(
         outcome.recovery,
         EffectiveRecovery::SkippedBelowCheckpointThreshold
     );
-    assert!(!super::recovery_store::has_entry(binding));
     assert_eq!(outcome.destination_version, None);
     assert_eq!(
         protocol.objects.lock().await.get("checkpointed-final"),

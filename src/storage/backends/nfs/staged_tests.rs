@@ -6,7 +6,8 @@ pub(super) mod tests {
     use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, SourceVersion};
     use crate::storage::artifacts::{ArtifactKind, artifact_name};
     use crate::storage::{
-        DestinationPrepareRequest, FinalDestination, PrepareFact, ResumeMode, SourceDescriptor,
+        DestinationPrepareRequest, FinalDestination, PrepareFact, PrepareRequest, ResumeMode,
+        SourceDescriptor,
     };
     use futures::stream;
 
@@ -61,21 +62,6 @@ pub(super) mod tests {
         checkpoint_gate: Arc<Mutex<Option<Arc<CheckpointGate>>>>,
         unstable_pressure: Arc<std::sync::atomic::AtomicBool>,
         pointer_writes: Arc<std::sync::atomic::AtomicU64>,
-    }
-
-    /// A destination-kept stage records its checkpoints in its pointer and never registers one
-    /// where data-mover runs.
-    struct NeverRegistered;
-
-    #[async_trait]
-    impl crate::storage::CheckpointRegistration for NeverRegistered {
-        async fn register(
-            &self,
-            _stage: &PreparedStage,
-            _identity: RecoveryIdentity,
-        ) -> Result<(), StorageRoleFailure> {
-            panic!("an NFS stage keeps its recovery state at the destination");
-        }
     }
 
     #[async_trait]
@@ -945,24 +931,6 @@ pub(super) mod tests {
         );
     }
 
-    /// NFS stages are prepared only at the destination: the store-era entry points refuse, so a
-    /// caller that bypassed the engine's `recovery_at_destination` check fails loudly.
-    #[tokio::test]
-    async fn store_era_entry_points_are_unsupported() {
-        let (adapter, _, identity) = adapter();
-        let refused = adapter.prepare(prepare_request(&identity)).await;
-        assert!(matches!(
-            refused,
-            Err(StorageRoleFailure::Entry(ref error)) if error.class() == FailureClass::Unsupported
-        ));
-        assert!(
-            adapter
-                .prepare_ephemeral(prepare_request(&identity))
-                .await
-                .is_err()
-        );
-    }
-
     pub(in crate::storage::backends::nfs) fn adapter() -> (
         NfsStagedDestinationAdapter,
         Arc<FakeProtocol>,
@@ -1017,7 +985,6 @@ pub(super) mod tests {
         stage.deferred_checkpoint = Some(crate::storage::DeferredCheckpoint {
             interval_bytes,
             source_size,
-            registration: Arc::new(NeverRegistered),
         });
     }
 

@@ -272,7 +272,7 @@ fn binding(identity: &TransferIdentity, case: Case<'_>) -> Result<[u8; 32], Box<
     ))
 }
 
-/// Pins the binding encoding, which is persisted in every stage and recovery record. Computed
+/// Pins the binding encoding, which is persisted in every destination pointer. Computed
 /// independently from the documented encoding (Python `blake3`), not copied from this code.
 #[test]
 fn binding_matches_the_frozen_vector() -> TestResult {

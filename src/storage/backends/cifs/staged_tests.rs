@@ -12,11 +12,11 @@ use crate::model::{
     Operation, SourceIdentity, StoragePath, Transience,
 };
 use crate::storage::artifacts::{ArtifactKind, artifact_name};
-use crate::storage::roles::{CheckpointRegistration, DeferredCheckpoint};
+use crate::storage::roles::DeferredCheckpoint;
 use crate::storage::{
     ByteStream, DestinationPrepareRequest, FinalDestination, PrepareFact, PrepareRequest,
-    PreparedStage, PublishRequest, RecoverRequest, RecoveryIdentity, ResumeMode, SourceDescriptor,
-    StagedDestination, StorageRoleFailure, VerifyRequest,
+    PreparedStage, PublishRequest, ResumeMode, SourceDescriptor, StagedDestination,
+    StorageRoleFailure, VerifyRequest,
 };
 
 #[derive(Default)]
@@ -317,25 +317,10 @@ fn pointer_writes(protocol: &MemoryProtocol) -> usize {
         .count()
 }
 
-/// A destination-kept stage never registers a checkpoint where data-mover runs.
-struct NeverRegistered;
-
-#[async_trait]
-impl CheckpointRegistration for NeverRegistered {
-    async fn register(
-        &self,
-        _stage: &PreparedStage,
-        _identity: RecoveryIdentity,
-    ) -> Result<(), StorageRoleFailure> {
-        panic!("a CIFS stage registered a checkpoint outside the destination")
-    }
-}
-
 fn deferred(interval_bytes: u64, source_size: u64) -> DeferredCheckpoint {
     DeferredCheckpoint {
         interval_bytes,
         source_size,
-        registration: Arc::new(NeverRegistered),
     }
 }
 
@@ -812,51 +797,6 @@ async fn committed_cleanup_is_retryable_and_preserves_final_file()
         assert_eq!(files.len(), 1);
         assert_eq!(files.get("final.bin").ok_or("final missing")?, b"abcdef");
     }
-    Ok(())
-}
-
-/// The store-era entry points are gone: CIFS prepares every stage at the destination.
-#[tokio::test]
-async fn store_era_entry_points_are_unsupported() -> Result<(), Box<dyn std::error::Error>> {
-    let protocol = Arc::new(MemoryProtocol::default());
-    let identity = identity()?;
-    let destination = CifsStagedDestination::new(Arc::clone(&protocol), identity.clone());
-    let unsupported = |result: Result<PreparedStage, StorageRoleFailure>| {
-        matches!(
-            result,
-            Err(StorageRoleFailure::Entry(ref error)) if error.class() == FailureClass::Unsupported
-        )
-    };
-    let request = prepare_request(&identity)?;
-    assert!(unsupported(destination.prepare(request.clone()).await));
-    assert!(unsupported(
-        destination.prepare_ephemeral(request.clone()).await
-    ));
-    let stage = prepare_stage(&destination, request.clone()).await?;
-    let identity_refused = destination.recovery_identity(&stage).await;
-    assert!(matches!(
-        identity_refused,
-        Err(StorageRoleFailure::Entry(ref error)) if error.class() == FailureClass::Unsupported
-    ));
-    assert!(destination.handoff_recovery(&stage).await.is_err());
-    let recovered = destination
-        .recover(RecoverRequest {
-            identity: RecoveryIdentity::from_bytes(Bytes::from_static(b"old"))?,
-            final_destination: request.final_destination,
-            source: request.source,
-            recovery_binding: request.recovery_binding,
-            claim_token: [9; 32],
-        })
-        .await;
-    assert!(unsupported(recovered));
-    destination.discard(stage).await?;
-    assert!(
-        protocol
-            .files
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-    );
     Ok(())
 }
 

@@ -1,10 +1,10 @@
 //! The engine against a destination that keeps its recovery state beside the final file (ADR-0006
 //! C7): an in-memory destination built on the real artifact names, pointer codec and discovery
-//! driver. No backend has moved yet, so this is the only thing that drives the path.
+//! driver, which drives the engine's prepare / resume / clean-up rules without a backend.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -22,10 +22,9 @@ use crate::storage::discovery::{DestinationArtifacts, discover};
 use crate::storage::pointer::DestinationPointer;
 use crate::storage::{
     BackendCapabilities, ByteStream, CapabilityAvailability, CheckpointObservation,
-    DestinationPrepareRequest, PrepareRequest, PreparedStage, PublicationDisposition,
-    PublicationEvidence, PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity,
-    StagedDestination, Storage, StorageRoleFailure, UnsupportedReason, VerificationEvidence,
-    VerifyRequest, WriteEvidence,
+    DestinationPrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence,
+    PublicationFailure, PublishRequest, StagedDestination, Storage, StorageRoleFailure,
+    UnsupportedReason, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 use crate::transfer::{
     InflightLimits, PrepareFact, RestartReason, TransferIdentity, TransferPhase, TransferPolicy,
@@ -60,8 +59,6 @@ struct MemoryDestination {
     fail_at: Mutex<Option<u64>>,
     /// Bytes written by `write`, over all transfers.
     written: AtomicU64,
-    /// Calls into the recovery-store prepare / recover path, which must never happen.
-    legacy_calls: AtomicUsize,
     /// Verify after publication, from the final object (as S3 does).
     verify_after: std::sync::atomic::AtomicBool,
     /// Publish different bytes than the stage holds (a published object gone wrong).
@@ -82,7 +79,6 @@ impl MemoryDestination {
             identities: Mutex::default(),
             fail_at: Mutex::default(),
             written: AtomicU64::new(0),
-            legacy_calls: AtomicUsize::new(0),
             verify_after: std::sync::atomic::AtomicBool::new(false),
             corrupt_publication: std::sync::atomic::AtomicBool::new(false),
             version: Mutex::default(),
@@ -137,11 +133,6 @@ impl MemoryDestination {
         ) {
             self.files().insert(path, bytes);
         }
-    }
-
-    fn legacy(&self, path: &StoragePath) -> StorageRoleFailure {
-        self.legacy_calls.fetch_add(1, Ordering::SeqCst);
-        failure(path, Operation::Prepare, FailureClass::Unsupported)
     }
 
     fn storage(self: &Arc<Self>) -> TestResult<Storage> {
@@ -199,10 +190,6 @@ impl DestinationArtifacts for MemoryDestination {
 
 #[async_trait]
 impl StagedDestination for MemoryDestination {
-    fn recovery_at_destination(&self) -> bool {
-        true
-    }
-
     async fn prepare_at_destination(
         &self,
         request: DestinationPrepareRequest,
@@ -240,25 +227,6 @@ impl StagedDestination for MemoryDestination {
         }
         stage.mark_at_destination(found.fact);
         Ok(stage)
-    }
-
-    async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(self.legacy(request.final_destination.path()))
-    }
-    async fn prepare_ephemeral(
-        &self,
-        request: PrepareRequest,
-    ) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(self.legacy(request.final_destination.path()))
-    }
-    async fn recovery_identity(
-        &self,
-        stage: &PreparedStage,
-    ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        Err(self.legacy(stage.final_destination.path()))
-    }
-    async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(self.legacy(request.final_destination.path()))
     }
 
     async fn write(
@@ -448,7 +416,6 @@ async fn a_fresh_transfer_prepares_at_the_destination_only() -> TestResult {
     assert_eq!(outcome.prepare, PrepareFact::Fresh);
     assert_eq!(outcome.reused_bytes, 0);
     assert_eq!(final_bytes(&destination)?, payload(1));
-    assert_eq!(destination.legacy_calls.load(Ordering::SeqCst), 0);
     // Published: no artifact is left beside the final file.
     assert_eq!(destination.files().len(), 1);
     Ok(())
@@ -473,7 +440,6 @@ async fn an_interrupted_transfer_resumes_from_the_pointer_left_at_the_destinatio
         SIZE as u64 - bytes
     );
     assert_eq!(final_bytes(&destination)?, payload(2));
-    assert_eq!(destination.legacy_calls.load(Ordering::SeqCst), 0);
     Ok(())
 }
 

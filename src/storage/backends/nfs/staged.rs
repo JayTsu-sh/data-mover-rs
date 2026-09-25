@@ -12,10 +12,9 @@ use super::source::{NfsProtocolFailure, entry_failure, role_failure};
 use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::artifacts::is_artifact_native;
 use crate::storage::{
-    ByteStream, CheckpointObservation, Metadata, MetadataMutation, PrepareRequest, PreparedStage,
+    ByteStream, CheckpointObservation, Metadata, MetadataMutation, PreparedStage,
     PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
-    RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure, VerificationEvidence,
-    VerifyRequest, WriteEvidence,
+    StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 #[path = "positioned_writer.rs"]
@@ -552,27 +551,6 @@ impl StagedDestination for NfsStagedDestinationAdapter {
         Some(crate::storage::backends::DEFAULT_CHECKPOINT_INTERVAL_BYTES)
     }
 
-    /// NFS keeps its recovery state at the destination: every stage is prepared through
-    /// [`StagedDestination::prepare_at_destination`].
-    async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(unsupported(request.final_destination.path()))
-    }
-
-    async fn recovery_identity(
-        &self,
-        stage: &PreparedStage,
-    ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        Err(unsupported(stage.final_destination.path()))
-    }
-
-    async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(unsupported(request.final_destination.path()))
-    }
-
-    fn recovery_at_destination(&self) -> bool {
-        true
-    }
-
     async fn prepare_at_destination(
         &self,
         request: crate::storage::DestinationPrepareRequest,
@@ -842,15 +820,6 @@ pub(super) fn sibling_path(
 
 fn failure(path: &StoragePath, class: FailureClass, transience: Transience) -> StorageRoleFailure {
     entry_failure(path, Operation::Write, class, transience)
-}
-
-fn unsupported(path: &StoragePath) -> StorageRoleFailure {
-    entry_failure(
-        path,
-        Operation::Prepare,
-        FailureClass::Unsupported,
-        Transience::Permanent,
-    )
 }
 
 fn publication_failure(

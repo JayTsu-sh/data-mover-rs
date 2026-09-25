@@ -14,9 +14,9 @@ use crate::model::observation::PrivateBackendEntryFacts;
 use crate::model::{EntryIdentityKey, EntryKind, ObservedEntry, SourceVersion, StoragePath};
 use crate::storage::{
     CheckpointObservation, FinalDestination, PreflightPolicy, PrepareFact, PrepareRequest,
-    PublicationEvidence, PublishRequest, ReadSource, RestartReason, SourceDescriptor,
-    SourceQosBudget, SourceQosGroup, SourceQosStats, StagedDestination, Storage, VerificationPoint,
-    VerifyRequest, WriteEvidence,
+    PublicationEvidence, PublishRequest, ReadSource, SourceDescriptor, SourceQosBudget,
+    SourceQosGroup, SourceQosStats, StagedDestination, Storage, VerificationPoint, VerifyRequest,
+    WriteEvidence,
 };
 use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy};
 
@@ -364,10 +364,12 @@ pub struct ExpertDestinationSession {
 }
 
 impl ExpertDestinationSession {
-    /// Prepares staged state; Checkpointed registers recoverable identities before payload.
+    /// Prepares the stage at the destination, under the per-file lease: a `Checkpointed` transfer
+    /// that keeps checkpoints resumes what an earlier attempt left there; otherwise what is found
+    /// is cleaned up and the stage starts from zero.
     ///
     /// # Errors
-    /// Returns a phase-attributed preflight, recovery, registration, or destination failure.
+    /// Returns a phase-attributed preflight or destination failure.
     pub async fn prepare(request: ExpertDestinationRequest) -> Result<Self, TransferFailure> {
         if request.source_maximum_chunk_bytes == 0 {
             return Err(TransferFailure::orchestration(
@@ -470,20 +472,7 @@ impl ExpertDestinationSession {
     /// # Errors
     /// Returns the destination cleanup failure.
     pub async fn discard(self) -> Result<(), crate::storage::StorageRoleFailure> {
-        let binding = self.stage.recovery_binding();
-        let recovery_enabled = self.stage.recovery_enabled() && self.stage.uses_recovery_store();
-        self.destination.discard(self.stage).await?;
-        if recovery_enabled {
-            super::super::recovery_store::complete(binding)
-                .await
-                .map_err(|_| {
-                    super::source_failure(
-                        &StoragePath::root(),
-                        crate::model::FailureClass::Internal,
-                    )
-                })?;
-        }
-        Ok(())
+        self.destination.discard(self.stage).await
     }
 
     /// Writes the caller-owned bounded transport stream into the prepared destination.
@@ -548,14 +537,19 @@ impl ExpertDestinationSession {
     }
 }
 
-/// The expert destination half's prepare for a destination that keeps its recovery state.
-async fn prepare_at_destination(
+/// The expert destination half's prepare, under the per-file lease.
+async fn prepare_destination_stage(
     request: &ExpertDestinationRequest,
     destination: &Arc<dyn StagedDestination>,
     source: &SourceDescriptor,
-    binding: [u8; 32],
     recovery_enabled: bool,
 ) -> Result<crate::storage::PreparedStage, TransferFailure> {
+    let binding = recovery_binding_for(
+        &request.identity,
+        &request.destination,
+        &request.final_path,
+        source,
+    );
     let lease = at_destination::acquire_for(request.destination.identity(), &request.final_path)?;
     let spec = at_destination::Spec {
         policy: request.transfer_policy,
@@ -570,103 +564,6 @@ async fn prepare_at_destination(
         recovery_binding: binding,
     };
     at_destination::prepare_with(destination, prepare, &spec, lease).await
-}
-
-async fn prepare_destination_stage(
-    request: &ExpertDestinationRequest,
-    destination: &Arc<dyn StagedDestination>,
-    source: &SourceDescriptor,
-    recovery_enabled: bool,
-) -> Result<crate::storage::PreparedStage, TransferFailure> {
-    let binding = recovery_binding_for(
-        &request.identity,
-        &request.destination,
-        &request.final_path,
-        source,
-    );
-    if destination.recovery_at_destination() {
-        return prepare_at_destination(request, destination, source, binding, recovery_enabled)
-            .await;
-    }
-    let recovery = if recovery_enabled {
-        Some(
-            super::super::recovery_store::open(binding)
-                .await
-                .map_err(TransferFailure::registration)?,
-        )
-    } else {
-        None
-    };
-    let discarded = request.transfer_policy == TransferPolicy::AtomicReplace
-        && super::discard_prior_recovery(destination, &request.final_path, source, binding).await?;
-    let prepare = || PrepareRequest {
-        final_destination: FinalDestination::new(request.final_path.clone()),
-        source: source.clone(),
-        recovery_binding: binding,
-    };
-    let stage_result = if let Some(identity) = recovery
-        .as_ref()
-        .and_then(|context| context.identity.clone())
-    {
-        destination
-            .recover(crate::storage::RecoverRequest {
-                identity,
-                final_destination: FinalDestination::new(request.final_path.clone()),
-                source: source.clone(),
-                recovery_binding: binding,
-                claim_token: recovery.as_ref().map_or([0; 32], |context| context.claim),
-            })
-            .await
-            .map(|mut stage| {
-                stage.prepare_fact = PrepareFact::Resumed {
-                    bytes: stage.write_offset,
-                };
-                stage
-            })
-    } else if recovery_enabled {
-        destination.prepare(prepare()).await
-    } else {
-        destination.prepare_ephemeral(prepare()).await
-    };
-    let mut stage = stage_result.map_err(|error| {
-        TransferFailure::role(TransferPhase::Prepare, TransferSide::Destination, error)
-    })?;
-    if discarded && stage.prepare_fact == PrepareFact::Fresh {
-        stage.prepare_fact = PrepareFact::Restarted {
-            reason: RestartReason::Requested,
-        };
-    }
-    let recovery = match super::release_declined_recovery(&stage, recovery).await {
-        Ok(recovery) => recovery,
-        Err(error) => return Err(error.with_stage(Arc::clone(destination), stage)),
-    };
-    if let Some(recovery) = &recovery {
-        let identity = match destination.recovery_identity(&stage).await {
-            Ok(identity) => identity,
-            Err(error) => {
-                return Err(TransferFailure::role(
-                    TransferPhase::RecoveryRegistration,
-                    TransferSide::Destination,
-                    error,
-                )
-                .with_stage(Arc::clone(destination), stage));
-            }
-        };
-        if let Err(error) = recovery.registrar.register(identity).await {
-            return Err(
-                TransferFailure::registration(error).with_stage(Arc::clone(destination), stage)
-            );
-        }
-        stage.retain_recovery_lease(Arc::clone(&recovery.lease));
-        if request.cancel.is_cancelled() {
-            return Err(TransferFailure::orchestration(
-                TransferPhase::RecoveryRegistration,
-                "transfer was cancelled after recovery registration",
-            )
-            .with_stage(Arc::clone(destination), stage));
-        }
-    }
-    Ok(stage)
 }
 
 /// Destination state after completed writes and before verification/publication.
@@ -717,19 +614,12 @@ impl ExpertDestinationTransferred {
             .map_err(|failure| (failure, StagedContent::NotJudged))
     }
 
-    /// Marks the local record publishing (store path only) and publishes. A failure says whether
-    /// the final destination changed (clean-up owed) or not (the stage is kept).
+    /// Publishes the stage. A failure says whether the final destination changed (clean-up owed)
+    /// or not (the stage is kept).
     async fn publish_stage(
         &self,
         evidence: ExpertSourceEvidence,
     ) -> Result<PublicationEvidence, (TransferFailure, bool)> {
-        if self.stage.recovery_enabled()
-            && self.stage.uses_recovery_store()
-            && let Err(error) =
-                super::super::recovery_store::mark_publishing(self.stage.recovery_binding()).await
-        {
-            return Err((TransferFailure::registration(error), false));
-        }
         self.destination
             .publish(
                 &self.stage,
@@ -879,22 +769,6 @@ impl ExpertDestinationTransferred {
                     .with_source_qos(evidence.source_qos));
             }
         };
-        let recovery_binding = self.stage.recovery_binding();
-        if self.stage.recovery_enabled()
-            && self.stage.uses_recovery_store()
-            && super::super::recovery_store::complete(recovery_binding)
-                .await
-                .is_err()
-        {
-            let mut failure = TransferFailure::orchestration(
-                TransferPhase::RecoveryCompletion,
-                "published transfer recovery state could not be cleared",
-            );
-            failure.final_destination_changed = true;
-            return Err(failure
-                .with_committed_cleanup(self.destination, self.stage)
-                .with_source_qos(evidence.source_qos));
-        }
         if verify_after {
             super::verify_published(
                 &self.destination,

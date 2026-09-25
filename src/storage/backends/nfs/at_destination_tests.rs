@@ -389,11 +389,3 @@ async fn a_lost_publication_reply_still_removes_the_pointer() -> TestResult {
     assert_eq!(artifacts_left(&protocol), Vec::<String>::new());
     Ok(())
 }
-
-/// NFS keeps its recovery state at the destination: the engine routes it through
-/// `prepare_at_destination` and never through the local recovery store (ADR-0006 C10c).
-#[test]
-fn nfs_keeps_recovery_at_the_destination() {
-    let (adapter, _, _) = adapter();
-    assert!(adapter.recovery_at_destination());
-}

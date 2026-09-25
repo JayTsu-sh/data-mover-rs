@@ -16,8 +16,8 @@ use crate::storage::{
     ByteStream, CheckpointObservation, CopiedAclTarget, CopiedMetadataTarget,
     CopiedOwnershipTarget, CopiedTimestampTarget, CopiedValueTarget, DestinationPrepareRequest,
     Metadata, MetadataMutation, PrepareRequest, PreparedStage, PublicationDisposition,
-    PublicationEvidence, PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity,
-    StagedDestination, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    PublicationEvidence, PublicationFailure, PublishRequest, StagedDestination, StorageRoleFailure,
+    VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 const STAGE_TOKEN_MAGIC: &[u8] = b"hdfs-stage-v2\0";
@@ -189,27 +189,6 @@ impl StagedDestination for HdfsStagedDestination {
         stage.direct = true;
         stage.durable_publication = false;
         Ok(stage)
-    }
-
-    /// HDFS keeps its recovery state at the destination: every staged transfer is prepared
-    /// through [`StagedDestination::prepare_at_destination`].
-    async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(unsupported(request.final_destination.path()))
-    }
-
-    async fn recovery_identity(
-        &self,
-        stage: &PreparedStage,
-    ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        Err(unsupported(stage.final_destination.path()))
-    }
-
-    async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(unsupported(request.final_destination.path()))
-    }
-
-    fn recovery_at_destination(&self) -> bool {
-        true
     }
 
     async fn prepare_at_destination(
@@ -387,10 +366,6 @@ pub(super) fn publication_may_have_changed(error: StorageRoleFailure) -> Publica
 
 pub(super) fn expected_size(stage: &PreparedStage) -> Result<u64, StorageRoleFailure> {
     Ok(HdfsStageToken::decode(stage)?.expected_size)
-}
-
-fn unsupported(path: &StoragePath) -> StorageRoleFailure {
-    failure(path, Operation::Prepare, FailureClass::Unsupported)
 }
 
 fn failure(path: &StoragePath, operation: Operation, class: FailureClass) -> StorageRoleFailure {

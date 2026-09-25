@@ -1,5 +1,5 @@
 //! S3 role behaviour over the in-memory bucket: ranges, uploads on the final key, tags,
-//! resumes, cancellation, publication, and the store-era entry points removed in ADR-0006 C19.
+//! resumes, cancellation, and publication.
 
 use super::*;
 use crate::model::{
@@ -7,8 +7,8 @@ use crate::model::{
 };
 use crate::storage::backends::s3::staged::S3StagedDestination;
 use crate::storage::{
-    ByteStream, DestinationPrepareRequest, PrepareFact, PreparedStage, RecoverRequest,
-    RecoveryIdentity, ResumeMode, SourceDescriptor, StagedDestination, StorageRoleFailure,
+    ByteStream, DestinationPrepareRequest, PrepareFact, PreparedStage, ResumeMode,
+    SourceDescriptor, StagedDestination, StorageRoleFailure,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -455,50 +455,6 @@ async fn an_upload_is_resumed_from_the_destination_after_reconnect() -> TestResu
         Some(full.as_slice())
     );
     assert_eq!(objects.len(), 1, "the pointer is gone");
-    Ok(())
-}
-
-/// The store era's entry points are gone (ADR-0006 C19): S3 is prepared only at the
-/// destination, nothing is recorded where data-mover runs, and none of them touches the bucket.
-#[tokio::test]
-async fn store_era_entry_points_are_unsupported() -> TestResult {
-    let protocol = Arc::new(MemoryS3::default());
-    let destination = connect(protocol.clone(), identity(), Some(native_context()))?
-        .staged_destination(&validation_policy())?;
-    let request = at_destination("final", described(None)?, [8; 32], ResumeMode::Discover)?;
-    let prepare = request.prepare.clone();
-    assert_eq!(
-        class(&destination.prepare(prepare.clone()).await),
-        Some(FailureClass::Unsupported)
-    );
-    assert_eq!(
-        class(&destination.prepare_ephemeral(prepare.clone()).await),
-        Some(FailureClass::Unsupported)
-    );
-    assert_eq!(*protocol.multipart_begins.lock().await, 0);
-    assert!(protocol.objects.lock().await.is_empty());
-    let stage = destination.prepare_at_destination(request).await?;
-    assert_eq!(
-        class(&destination.recovery_identity(&stage).await),
-        Some(FailureClass::Unsupported)
-    );
-    assert_eq!(
-        class(&destination.handoff_recovery(&stage).await),
-        Some(FailureClass::Unsupported)
-    );
-    let recovered = destination
-        .recover(RecoverRequest {
-            identity: RecoveryIdentity::from_bytes(Bytes::from_static(b"old\0upload"))?,
-            final_destination: prepare.final_destination,
-            source: prepare.source,
-            recovery_binding: prepare.recovery_binding,
-            claim_token: [9; 32],
-        })
-        .await;
-    assert_eq!(class(&recovered), Some(FailureClass::Unsupported));
-    destination.discard(stage).await?;
-    assert!(protocol.uploads.lock().await.is_empty());
-    assert!(protocol.objects.lock().await.is_empty());
     Ok(())
 }
 

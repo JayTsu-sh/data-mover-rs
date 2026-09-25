@@ -1,9 +1,8 @@
 use super::guard::DestinationLease;
 use super::{
-    Arc, CopiedMetadataPlan, NativePair, ReadSource, RecoveryContext, SequentialRanges,
-    SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination, TransferFailure,
-    TransferPhase, TransferPlan, TransferPolicy, TransferRequest, TransferSide, Transferred,
-    read_exact_range, register_prepared_stage, select_stage,
+    Arc, CopiedMetadataPlan, NativePair, ReadSource, SequentialRanges, SourceDescriptor,
+    SourceQosBudget, SourceQosStats, StagedDestination, TransferFailure, TransferPhase,
+    TransferPlan, TransferPolicy, TransferRequest, TransferSide, Transferred, read_exact_range,
 };
 use crate::storage::{
     DestinationPrepareRequest, FinalDestination, PrepareRequest, PreparedStage, ResumeMode,
@@ -17,14 +16,6 @@ pub(super) fn eligible_native_pair(request: &TransferRequest) -> Option<NativePa
     }
 }
 
-/// Where the native route's stage comes from.
-pub(super) enum Preparation {
-    /// The local recovery store keeps the recovery state (destinations not yet moved).
-    Store(Option<RecoveryContext>),
-    /// The destination keeps it; the lease guards the final file.
-    AtDestination(DestinationLease),
-}
-
 pub(super) struct NativeTransferInput {
     pub source: Arc<dyn ReadSource>,
     pub destination: Arc<dyn StagedDestination>,
@@ -33,43 +24,14 @@ pub(super) struct NativeTransferInput {
     pub recovery_binding: [u8; 32],
     pub source_qos: Option<SourceQosBudget>,
     pub plan: TransferPlan,
-    pub preparation: Preparation,
     pub copied_metadata_plan: Option<CopiedMetadataPlan>,
 }
 
+/// The native route's stage (ADR-0006 C18): the destination's native endpoint prepares it at the
+/// final file, looking at what an earlier attempt — native or streamed — left there: a
+/// `Checkpointed` copy resumes an equal binding, any other policy cleans up and starts from zero.
+/// Nothing is recorded where data-mover runs; the stage carries the per-file lease.
 async fn prepare_native_stage(
-    request: &TransferRequest,
-    input: &mut NativeTransferInput,
-) -> Result<PreparedStage, TransferFailure> {
-    match std::mem::replace(&mut input.preparation, Preparation::Store(None)) {
-        Preparation::Store(recovery) => {
-            let stage = select_stage(
-                request,
-                &input.destination,
-                &input.descriptor,
-                input.recovery_binding,
-                input.plan.recovery_enabled,
-                recovery.as_ref(),
-            )
-            .await?;
-            if let Err(error) =
-                register_prepared_stage(request, &input.destination, &stage, recovery.as_ref())
-                    .await
-            {
-                return Err(error.with_stage(Arc::clone(&input.destination), stage));
-            }
-            Ok(stage)
-        }
-        Preparation::AtDestination(lease) => prepare_at_destination(request, input, lease).await,
-    }
-}
-
-/// The native route's stage for a destination that keeps its recovery state (ADR-0006 C18): the
-/// destination's native endpoint prepares it at the final file, looking at what an earlier
-/// attempt — native or streamed — left there: a `Checkpointed` copy resumes an equal binding, any
-/// other policy cleans up and starts from zero. Nothing is recorded where data-mover runs; the
-/// stage carries the per-file lease.
-async fn prepare_at_destination(
     request: &TransferRequest,
     input: &NativeTransferInput,
     lease: DestinationLease,
@@ -105,7 +67,8 @@ async fn prepare_at_destination(
 
 pub(super) async fn transfer_native(
     request: &TransferRequest,
-    mut input: NativeTransferInput,
+    input: NativeTransferInput,
+    lease: DestinationLease,
 ) -> Result<Transferred, TransferFailure> {
     let binding = input
         .pair
@@ -128,7 +91,7 @@ pub(super) async fn transfer_native(
     } else {
         None
     };
-    let stage = prepare_native_stage(request, &mut input).await?;
+    let stage = prepare_native_stage(request, &input, lease).await?;
     let native = match input
         .pair
         .copy_into_stage(

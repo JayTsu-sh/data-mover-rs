@@ -13,8 +13,8 @@ use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath, Transi
 use crate::storage::{
     ByteStream, CheckpointObservation, DestinationPrepareRequest, Metadata, MetadataMutation,
     PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest,
-    RecoverRequest, RecoveryIdentity, StagedDestination, StorageRoleFailure, VerificationEvidence,
-    VerificationPoint, VerifyRequest, WriteEvidence,
+    StagedDestination, StorageRoleFailure, VerificationEvidence, VerificationPoint, VerifyRequest,
+    WriteEvidence,
 };
 
 use super::source::{classified_entry, entry, role_failure};
@@ -206,12 +206,6 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         true
     }
 
-    /// S3 keeps its recovery state at the destination (ADR-0006 C15c): every staged transfer is
-    /// prepared through [`StagedDestination::prepare_at_destination`].
-    fn recovery_at_destination(&self) -> bool {
-        true
-    }
-
     /// The 64 MiB interval (D3: a checkpointed object up to it never writes a pointer).
     fn automatic_checkpoint_interval_bytes(&self) -> Option<u64> {
         Some(self.checkpoint_interval)
@@ -248,25 +242,6 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 .await
             }
         }
-    }
-
-    /// The store-era prepare (a temp key under `.data-mover-stage/`) was removed in ADR-0006
-    /// C19: use [`StagedDestination::prepare_at_destination`].
-    async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(unsupported(request.final_destination.path()))
-    }
-
-    /// Nothing is recorded where data-mover runs: the pointer beside the final key is the
-    /// recovery state.
-    async fn recovery_identity(
-        &self,
-        stage: &PreparedStage,
-    ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        Err(unsupported(stage.final_destination.path()))
-    }
-
-    async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(unsupported(request.final_destination.path()))
     }
 
     async fn write(
@@ -396,18 +371,8 @@ fn metadata_unavailable(stage: &PreparedStage) -> StorageRoleFailure {
     )
 }
 
-fn unsupported(path: &StoragePath) -> StorageRoleFailure {
-    classified_entry(
-        path,
-        Operation::Prepare,
-        FailureClass::Unsupported,
-        Transience::Permanent,
-        "S3 keeps its recovery state at the destination: prepare it there",
-    )
-}
-
-/// A stage this adapter did not prepare at the destination, nor as `Direct` (the store era's
-/// temp-key stage, ADR-0006 C19): refused before anything is touched.
+/// A stage this adapter did not prepare at the destination, nor as `Direct` (another adapter's
+/// stage): refused before anything is touched.
 fn foreign(stage: &PreparedStage, operation: Operation) -> StorageRoleFailure {
     classified_entry(
         stage.final_destination.path(),

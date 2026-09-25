@@ -104,7 +104,7 @@ impl fmt::Debug for TransferIdentity {
     }
 }
 
-/// What a stage was written from, as stored in its recovery record.
+/// What a stage was written from, as bound into its destination pointer.
 pub(crate) struct BindingSource<'a> {
     pub(crate) path: &'a StoragePath,
     pub(crate) identity_key: EntryIdentityKey,

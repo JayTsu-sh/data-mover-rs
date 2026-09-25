@@ -26,9 +26,9 @@ use crate::storage::artifacts::{ArtifactKind, is_artifact_native};
 use crate::storage::durability::sync_directory;
 use crate::storage::{
     ByteStream, CheckpointObservation, DestinationPrepareRequest, MetadataMutation, PrepareRequest,
-    PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest, RecoverRequest,
-    RecoveryIdentity, StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure,
-    VerificationEvidence, VerifyRequest, WriteEvidence,
+    PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest, StagedDestination,
+    StagedMetadataApplicationFailure, StorageRoleFailure, VerificationEvidence, VerifyRequest,
+    WriteEvidence,
 };
 
 mod at_destination;
@@ -853,39 +853,6 @@ impl StagedDestination for LocalStagedDestination {
         Ok(WriteEvidence {
             persisted_bytes: written,
         })
-    }
-
-    /// Local keeps its recovery state at the destination: every stage is prepared through
-    /// [`StagedDestination::prepare_at_destination`].
-    async fn prepare(&self, request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(failure(
-            request.final_destination.path(),
-            Operation::Prepare,
-            FailureClass::Unsupported,
-        ))
-    }
-
-    async fn recovery_identity(
-        &self,
-        stage: &PreparedStage,
-    ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        Err(failure(
-            stage.final_destination.path(),
-            Operation::Prepare,
-            FailureClass::Unsupported,
-        ))
-    }
-
-    async fn recover(&self, request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        Err(failure(
-            request.final_destination.path(),
-            Operation::Prepare,
-            FailureClass::Unsupported,
-        ))
-    }
-
-    fn recovery_at_destination(&self) -> bool {
-        true
     }
 
     async fn prepare_at_destination(

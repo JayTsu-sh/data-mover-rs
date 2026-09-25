@@ -7,9 +7,9 @@ use bytes::Bytes;
 use super::*;
 use crate::model::{BackendIdentity, BackendKind, BackendSessionFailure};
 use crate::storage::{
-    ByteStream, CheckpointObservation, FinalDestination, PrepareRequest, PublicationEvidence,
-    PublicationFailure, PublishRequest, RecoverRequest, RecoveryIdentity,
-    StagedMetadataApplicationFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    ByteStream, CheckpointObservation, DestinationPrepareRequest, FinalDestination,
+    PublicationEvidence, PublicationFailure, PublishRequest, StagedMetadataApplicationFailure,
+    VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 /// How the fake reports the families it refuses. Everything else is accepted.
@@ -225,17 +225,11 @@ impl StagedDestination for ScriptedStage {
         Err(batch_failure(index, completed, self.refusal_error(&cancel)))
     }
 
-    async fn prepare(&self, _request: PrepareRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        panic!("metadata tests never prepare")
-    }
-    async fn recovery_identity(
+    async fn prepare_at_destination(
         &self,
-        _stage: &PreparedStage,
-    ) -> Result<RecoveryIdentity, StorageRoleFailure> {
-        panic!("metadata tests never recover")
-    }
-    async fn recover(&self, _request: RecoverRequest) -> Result<PreparedStage, StorageRoleFailure> {
-        panic!("metadata tests never recover")
+        _request: DestinationPrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        panic!("metadata tests never prepare")
     }
     async fn write(
         &self,

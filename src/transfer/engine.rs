@@ -5,7 +5,7 @@ use bytes::{Bytes, BytesMut};
 use futures::StreamExt as _;
 
 use super::identity::{BindingSource, binding_hash};
-use super::model::{InflightLimits, RecoveryContext, RecoveryRegistrationFailure};
+use super::model::InflightLimits;
 use super::{ReadBackVerification, TransferPolicy, TransferRequest};
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, Operation, SourceIdentity, SourceVersion,
@@ -15,15 +15,14 @@ use crate::runtime::inflight::{
     InflightConfig, InflightFailure, InflightRuntime, OrderedChunks, ReadRange, SequentialRanges,
 };
 use crate::storage::{
-    CheckpointObservation, FinalDestination, NativePair, PreflightPolicy, PrepareFact,
-    PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence, PublishRequest,
-    ReadRequest, ReadSource, RestartReason, SourceDescriptor, SourceQosBudget, SourceQosStats,
-    StagedDestination, StorageRoleFailure, VerificationPoint, VerifyRequest, WriteEvidence,
+    CheckpointObservation, NativePair, PreflightPolicy, PrepareFact, PreparedStage,
+    PublicationDisposition, PublicationEvidence, PublishRequest, ReadRequest, ReadSource,
+    SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination, StorageRoleFailure,
+    VerificationPoint, VerifyRequest, WriteEvidence,
 };
 use negotiation::{CopiedMetadataPlan, apply_copied_metadata, copied_metadata_plan};
 
 mod at_destination;
-mod automatic;
 mod expert;
 mod guard;
 mod native;
@@ -43,8 +42,6 @@ pub enum TransferPhase {
     Preflight,
     Describe,
     Prepare,
-    RecoveryRegistration,
-    RecoveryCompletion,
     Transfer,
     Checkpoint,
     Verify,
@@ -106,7 +103,6 @@ pub struct TransferFailure {
     side: TransferSide,
     message: &'static str,
     role: Option<Box<StorageRoleFailure>>,
-    registration: Option<Box<RecoveryRegistrationFailure>>,
     metadata: Option<Box<crate::metadata::MetadataApplicationFailure>>,
     /// Why copied metadata was refused while planning, before anything was written.
     refusal: Option<crate::metadata::MetadataPlanError>,
@@ -134,7 +130,6 @@ impl TransferFailure {
             side,
             message: "storage role failed",
             role: Some(Box::new(role)),
-            registration: None,
             metadata: None,
             refusal: None,
             failed_stage: None,
@@ -150,7 +145,6 @@ impl TransferFailure {
             side: TransferSide::Orchestration,
             message,
             role: None,
-            registration: None,
             metadata: None,
             refusal: None,
             failed_stage: None,
@@ -166,23 +160,6 @@ impl TransferFailure {
             side,
             message,
             role: None,
-            registration: None,
-            metadata: None,
-            refusal: None,
-            failed_stage: None,
-            committed_cleanup: None,
-            final_destination_changed: false,
-            source_qos: SourceQosStats::default(),
-        }
-    }
-
-    fn registration(error: RecoveryRegistrationFailure) -> Self {
-        Self {
-            phase: TransferPhase::RecoveryRegistration,
-            side: TransferSide::Orchestration,
-            message: "recovery identity registration failed",
-            role: None,
-            registration: Some(Box::new(error)),
             metadata: None,
             refusal: None,
             failed_stage: None,
@@ -198,7 +175,6 @@ impl TransferFailure {
             side: TransferSide::Destination,
             message: "staged metadata application failed",
             role: None,
-            registration: None,
             metadata: Some(Box::new(error)),
             refusal: None,
             failed_stage: None,
@@ -309,16 +285,7 @@ impl TransferFailure {
             .failed_stage
             .take()
             .ok_or_else(|| source_failure(&StoragePath::root(), FailureClass::InvalidInput))?;
-        let binding = failed.stage.recovery_binding();
-        let recovery_enabled =
-            failed.stage.owns_recovery_registration() && failed.stage.uses_recovery_store();
-        failed.destination.discard(failed.stage).await?;
-        if recovery_enabled {
-            super::recovery_store::complete(binding)
-                .await
-                .map_err(|_| source_failure(&StoragePath::root(), FailureClass::Internal))?;
-        }
-        Ok(())
+        failed.destination.discard(failed.stage).await
     }
 
     /// Consumes a failure after publication committed — or may have — and idempotently removes
@@ -335,16 +302,7 @@ impl TransferFailure {
             .committed_cleanup
             .take()
             .ok_or_else(|| source_failure(&StoragePath::root(), FailureClass::InvalidInput))?;
-        let binding = pending.stage.recovery_binding();
-        let recovery_enabled =
-            pending.stage.owns_recovery_registration() && pending.stage.uses_recovery_store();
-        pending.destination.discard(pending.stage).await?;
-        if recovery_enabled {
-            super::recovery_store::complete(binding)
-                .await
-                .map_err(|_| source_failure(&StoragePath::root(), FailureClass::Internal))?;
-        }
-        Ok(())
+        pending.destination.discard(pending.stage).await
     }
 }
 
@@ -378,11 +336,6 @@ impl std::error::Error for TransferFailure {
         self.role
             .as_ref()
             .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))
-            .or_else(|| {
-                self.registration
-                    .as_ref()
-                    .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))
-            })
             .or_else(|| {
                 self.metadata
                     .as_ref()
@@ -594,8 +547,7 @@ pub(super) async fn verify_published(
     Ok(())
 }
 
-/// Publishes verified staged content: marks the local record publishing (store path only),
-/// publishes, and clears the record.
+/// Publishes verified staged content.
 async fn publish_transferred(
     transferred: Transferred,
     expected_size: u64,
@@ -603,15 +555,6 @@ async fn publish_transferred(
     cancel: tokio_util::sync::CancellationToken,
     source_qos: SourceQosStats,
 ) -> Result<(PublicationEvidence, Transferred), TransferFailure> {
-    if transferred.stage.recovery_enabled()
-        && transferred.stage.uses_recovery_store()
-        && let Err(error) =
-            super::recovery_store::mark_publishing(transferred.stage.recovery_binding()).await
-    {
-        return Err(TransferFailure::registration(error)
-            .with_stage(Arc::clone(&transferred.destination), transferred.stage)
-            .with_source_qos(source_qos));
-    }
     let publication = transferred
         .destination
         .publish(
@@ -623,9 +566,6 @@ async fn publish_transferred(
             },
         )
         .await;
-    let recovery_binding = transferred.stage.recovery_binding();
-    let recovery_enabled =
-        transferred.stage.recovery_enabled() && transferred.stage.uses_recovery_store();
     let evidence = match publication {
         Ok(evidence) => evidence,
         Err(publication) => {
@@ -645,12 +585,6 @@ async fn publish_transferred(
                 .with_source_qos(source_qos));
         }
     };
-    if complete_published_recovery(recovery_enabled, recovery_binding)
-        .await
-        .is_err()
-    {
-        return Err(recovery_completion_failure(transferred, source_qos));
-    }
     Ok((evidence, transferred))
 }
 
@@ -767,31 +701,6 @@ pub(super) async fn discard_stale_stage(
     failure
 }
 
-async fn complete_published_recovery(
-    enabled: bool,
-    binding: [u8; 32],
-) -> Result<(), RecoveryRegistrationFailure> {
-    if enabled {
-        super::recovery_store::complete(binding).await
-    } else {
-        Ok(())
-    }
-}
-
-fn recovery_completion_failure(
-    transferred: Transferred,
-    source_qos: SourceQosStats,
-) -> TransferFailure {
-    let mut failure = TransferFailure::orchestration(
-        TransferPhase::RecoveryCompletion,
-        "published transfer recovery state could not be cleared",
-    );
-    failure.final_destination_changed = true;
-    failure
-        .with_committed_cleanup(transferred.destination, transferred.stage)
-        .with_source_qos(source_qos)
-}
-
 fn transferred_source_qos(transferred: &Transferred) -> SourceQosStats {
     transferred.source_qos.as_ref().map_or(
         SourceQosStats {
@@ -810,11 +719,6 @@ impl Transferred {
     }
 
     #[cfg(test)]
-    pub(crate) const fn recovery_binding(&self) -> [u8; 32] {
-        self.stage.recovery_binding()
-    }
-
-    #[cfg(test)]
     pub(crate) fn recovery_enabled(&self) -> bool {
         self.stage.recovery_enabled()
     }
@@ -824,16 +728,7 @@ impl Transferred {
     }
 
     pub(crate) async fn discard(self) -> Result<(), StorageRoleFailure> {
-        let binding = self.stage.recovery_binding();
-        let recovery_enabled =
-            self.stage.owns_recovery_registration() && self.stage.uses_recovery_store();
-        self.destination.discard(self.stage).await?;
-        if recovery_enabled {
-            super::recovery_store::complete(binding)
-                .await
-                .map_err(|_| source_failure(&StoragePath::root(), FailureClass::Internal))?;
-        }
-        Ok(())
+        self.destination.discard(self.stage).await
     }
 }
 
@@ -863,19 +758,7 @@ async fn run_until_transferred_inner(
     let descriptor = describe_source(&request, &*source, source_qos.as_ref()).await?;
     let copied_metadata_plan = copied_metadata_plan(&request, &descriptor).await?;
     let recovery_binding = recovery_binding(&request, &descriptor);
-    // Asked once: a transfer never mixes the two recovery models.
-    if destination.recovery_at_destination() {
-        return at_destination::run_until_transferred(
-            &request,
-            (source, destination),
-            descriptor,
-            copied_metadata_plan,
-            recovery_binding,
-            source_qos,
-        )
-        .await;
-    }
-    run_with_store(
+    at_destination::run_until_transferred(
         &request,
         (source, destination),
         descriptor,
@@ -886,141 +769,15 @@ async fn run_until_transferred_inner(
     .await
 }
 
-/// The transfer up to verification for a destination whose recovery state the local recovery
-/// store keeps (every destination until it moves, ADR-0006 C8–C15).
-async fn run_with_store(
-    request: &TransferRequest,
-    (source, destination): (Arc<dyn ReadSource>, Arc<dyn StagedDestination>),
-    descriptor: SourceDescriptor,
-    copied_metadata_plan: Option<CopiedMetadataPlan>,
-    recovery_binding: [u8; 32],
-    source_qos: Option<SourceQosBudget>,
-) -> Result<Transferred, TransferFailure> {
-    let (plan, native_pair, recovery) = plan_with_recovery(
-        request,
-        &*source,
-        &*destination,
-        &descriptor,
-        recovery_binding,
-    )
-    .await?;
-    let discarded = request.transfer_policy == TransferPolicy::AtomicReplace
-        && discard_prior_recovery(
-            &destination,
-            &request.final_path,
-            &descriptor,
-            recovery_binding,
-        )
-        .await?;
-    let restarted = |mut transferred: Transferred| {
-        if discarded && transferred.stage.prepare_fact == PrepareFact::Fresh {
-            transferred.stage.prepare_fact = PrepareFact::Restarted {
-                reason: RestartReason::Requested,
-            };
-        }
-        transferred
-    };
-    if let Some(pair) = native_pair {
-        return native::transfer_native(
-            request,
-            native::NativeTransferInput {
-                source,
-                destination,
-                descriptor,
-                pair,
-                recovery_binding,
-                source_qos,
-                plan,
-                preparation: native::Preparation::Store(recovery),
-                copied_metadata_plan,
-            },
-        )
-        .await
-        .map(restarted);
-    }
-    let mut stage = select_stage(
-        request,
-        &destination,
-        &descriptor,
-        recovery_binding,
-        plan.recovery_enabled,
-        recovery.as_ref(),
-    )
-    .await?;
-    stage.durable_publication = request.transfer_policy == TransferPolicy::Checkpointed;
-    if let Some(interval_bytes) = plan.automatic_interval {
-        stage.deferred_checkpoint = Some(crate::storage::DeferredCheckpoint {
-            interval_bytes,
-            source_size: plan.source_size,
-            registration: Arc::new(automatic::Registration::new(
-                recovery_binding,
-                request.final_path.clone(),
-            )),
-        });
-    }
-    let registration =
-        register_prepared_stage(request, &destination, &stage, recovery.as_ref()).await;
-    if let Err(error) = registration {
-        return Err(error.with_stage(destination, stage));
-    }
-    let evidence = match transfer_stage(
-        request,
-        source,
-        &destination,
-        &descriptor,
-        &stage,
-        plan,
-        source_qos.clone(),
-    )
-    .await
-    {
-        Ok(evidence) => evidence,
-        Err(error) => return Err(error.with_stage(destination, stage)),
-    };
-    let effective_recovery = final_recovery(&stage, plan);
-    Ok(restarted(Transferred {
-        identity: request.identity,
-        destination,
-        stage,
-        write: evidence.write,
-        checkpoint: evidence.checkpoint,
-        source: descriptor,
-        data_path: plan.data_path,
-        source_blake3: evidence.source_blake3,
-        source_qos,
-        native_bytes: 0,
-        native_requests: 0,
-        effective_recovery,
-        copied_metadata_plan,
-    }))
-}
-
 fn final_recovery(stage: &PreparedStage, plan: TransferPlan) -> EffectiveRecovery {
     if stage.recovery_enabled() {
         EffectiveRecovery::Checkpointed
     } else if plan.effective_recovery == EffectiveRecovery::Checkpointed {
-        // The destination declined recovery for this stage (see `release_declined_recovery`).
+        // The destination declined recovery for this stage (reachable only for a destination
+        // without an automatic interval: `plan_request` already reports the others).
         EffectiveRecovery::SkippedBelowCheckpointThreshold
     } else {
         plan.effective_recovery
-    }
-}
-
-/// A destination may keep no recovery state for a stage it prepared — an S3 object small enough
-/// for one `PutObject` (ADR-0006 C14b). Its record in the local store, if any, is released
-/// rather than registered, so nothing about the transfer outlives it.
-pub(super) async fn release_declined_recovery(
-    stage: &PreparedStage,
-    recovery: Option<RecoveryContext>,
-) -> Result<Option<RecoveryContext>, TransferFailure> {
-    match recovery {
-        Some(_) if !stage.recovery_enabled() => {
-            super::recovery_store::complete(stage.recovery_binding())
-                .await
-                .map_err(TransferFailure::registration)?;
-            Ok(None)
-        }
-        recovery => Ok(recovery),
     }
 }
 
@@ -1091,214 +848,6 @@ fn plan_request(
         }
     }
     Ok((plan, native_pair))
-}
-
-async fn plan_with_recovery(
-    request: &TransferRequest,
-    source: &dyn ReadSource,
-    destination: &dyn StagedDestination,
-    descriptor: &SourceDescriptor,
-    recovery_binding: [u8; 32],
-) -> Result<(TransferPlan, Option<NativePair>, Option<RecoveryContext>), TransferFailure> {
-    let (mut plan, native_pair) = plan_request(request, source, destination, descriptor)?;
-    let recovery = if plan.automatic_interval.is_some() {
-        super::recovery_store::open_existing(recovery_binding)
-            .await
-            .map_err(TransferFailure::registration)?
-    } else {
-        open_recovery_context(recovery_binding, plan.recovery_enabled).await?
-    };
-    if recovery.is_some() && plan.automatic_interval.is_some() {
-        plan.recovery_enabled = true;
-    }
-    Ok((plan, native_pair, recovery))
-}
-
-async fn open_recovery_context(
-    recovery_binding: [u8; 32],
-    recovery_enabled: bool,
-) -> Result<Option<RecoveryContext>, TransferFailure> {
-    if !recovery_enabled {
-        return Ok(None);
-    }
-    super::recovery_store::open(recovery_binding)
-        .await
-        .map(Some)
-        .map_err(TransferFailure::registration)
-}
-
-async fn register_prepared_stage(
-    request: &TransferRequest,
-    destination: &Arc<dyn StagedDestination>,
-    stage: &PreparedStage,
-    recovery: Option<&RecoveryContext>,
-) -> Result<(), TransferFailure> {
-    let Some(recovery) = recovery else {
-        return Ok(());
-    };
-    if !stage.recovery_enabled() {
-        // The destination declined recovery for this stage (see `release_declined_recovery`).
-        return super::recovery_store::complete(stage.recovery_binding())
-            .await
-            .map_err(TransferFailure::registration);
-    }
-    let identity = destination
-        .recovery_identity(stage)
-        .await
-        .map_err(|error| {
-            TransferFailure::role(
-                TransferPhase::RecoveryRegistration,
-                TransferSide::Destination,
-                error,
-            )
-        })?;
-    recovery
-        .registrar
-        .register(identity)
-        .await
-        .map_err(TransferFailure::registration)?;
-    stage.retain_recovery_lease(Arc::clone(&recovery.lease));
-    if request.cancel.is_cancelled() {
-        return Err(TransferFailure::orchestration(
-            TransferPhase::RecoveryRegistration,
-            "transfer was cancelled after recovery registration",
-        ));
-    }
-    Ok(())
-}
-
-async fn select_stage(
-    request: &TransferRequest,
-    destination: &Arc<dyn StagedDestination>,
-    descriptor: &SourceDescriptor,
-    recovery_binding: [u8; 32],
-    recovery_enabled: bool,
-    recovery: Option<&RecoveryContext>,
-) -> Result<PreparedStage, TransferFailure> {
-    let prepare = || PrepareRequest {
-        final_destination: FinalDestination::new(request.final_path.clone()),
-        source: descriptor.clone(),
-        recovery_binding,
-    };
-    if let Some(identity) = recovery.and_then(|context| context.identity.clone()) {
-        debug_assert!(recovery_enabled);
-        let recovered = destination
-            .recover(crate::storage::RecoverRequest {
-                identity,
-                final_destination: FinalDestination::new(request.final_path.clone()),
-                source: descriptor.clone(),
-                recovery_binding,
-                claim_token: recovery.map_or([0; 32], |context| context.claim),
-            })
-            .await;
-        match recovered {
-            Ok(mut stage) => {
-                stage.prepare_fact = PrepareFact::Resumed {
-                    bytes: stage.write_offset,
-                };
-                return Ok(stage);
-            }
-            Err(error)
-                if recovery.is_some_and(|context| context.publication_pending)
-                    && role_failure_class(&error) == FailureClass::NotFound =>
-            {
-                super::recovery_store::complete(recovery_binding)
-                    .await
-                    .map_err(TransferFailure::registration)?;
-                // The record outlived a published stage: what follows starts over.
-                return fresh_stage(request, destination, prepare(), recovery_enabled)
-                    .await
-                    .map(|mut stage| {
-                        stage.prepare_fact = PrepareFact::Restarted {
-                            reason: RestartReason::PointerWithoutStage,
-                        };
-                        stage
-                    });
-            }
-            Err(error) => {
-                return Err(TransferFailure::role(
-                    TransferPhase::Prepare,
-                    TransferSide::Destination,
-                    error,
-                ));
-            }
-        }
-    }
-    fresh_stage(request, destination, prepare(), recovery_enabled).await
-}
-
-async fn fresh_stage(
-    request: &TransferRequest,
-    destination: &Arc<dyn StagedDestination>,
-    prepare: PrepareRequest,
-    recovery_enabled: bool,
-) -> Result<PreparedStage, TransferFailure> {
-    let prepared = if request.transfer_policy == TransferPolicy::Direct {
-        destination
-            .prepare_direct(prepare, request.cancel.clone())
-            .await
-    } else if recovery_enabled {
-        destination.prepare(prepare).await
-    } else {
-        destination.prepare_ephemeral(prepare).await
-    };
-    prepared.map_err(|error| {
-        TransferFailure::role(TransferPhase::Prepare, TransferSide::Destination, error)
-    })
-}
-
-/// Discards an earlier attempt's recoverable stage before an atomic replace; `true` when there was
-/// one, so the outcome can report the restart.
-async fn discard_prior_recovery(
-    destination: &Arc<dyn StagedDestination>,
-    final_path: &StoragePath,
-    descriptor: &SourceDescriptor,
-    recovery_binding: [u8; 32],
-) -> Result<bool, TransferFailure> {
-    let Some(recovery) = super::recovery_store::open_existing(recovery_binding)
-        .await
-        .map_err(TransferFailure::registration)?
-    else {
-        return Ok(false);
-    };
-    let Some(identity) = recovery.identity.clone() else {
-        return Ok(false);
-    };
-    match destination
-        .recover(crate::storage::RecoverRequest {
-            identity,
-            final_destination: FinalDestination::new(final_path.clone()),
-            source: descriptor.clone(),
-            recovery_binding,
-            claim_token: recovery.claim,
-        })
-        .await
-    {
-        Ok(stage) => destination.discard(stage).await.map_err(|error| {
-            TransferFailure::role(TransferPhase::Prepare, TransferSide::Destination, error)
-        })?,
-        Err(error)
-            if recovery.publication_pending
-                && role_failure_class(&error) == FailureClass::NotFound => {}
-        Err(error) => {
-            return Err(TransferFailure::role(
-                TransferPhase::Prepare,
-                TransferSide::Destination,
-                error,
-            ));
-        }
-    }
-    super::recovery_store::complete(recovery_binding)
-        .await
-        .map_err(TransferFailure::registration)?;
-    Ok(true)
-}
-
-fn role_failure_class(error: &StorageRoleFailure) -> FailureClass {
-    match error {
-        StorageRoleFailure::Entry(error) => error.class(),
-        StorageRoleFailure::Session(error) => error.class(),
-    }
 }
 
 fn recovery_binding(request: &TransferRequest, descriptor: &SourceDescriptor) -> [u8; 32] {
@@ -1799,6 +1348,7 @@ fn failure_side(error: &StorageRoleFailure) -> TransferSide {
 mod plan_tests {
     use super::*;
     use crate::model::{BackendIdentity, IdentityStrength};
+    use crate::storage::RestartReason;
     use crate::storage::backends::local::{
         test_destination_storage_with_role, test_source_storage,
     };

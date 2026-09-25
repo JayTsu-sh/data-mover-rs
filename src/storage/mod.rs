@@ -45,15 +45,14 @@ pub use factory::{
     endpoint_identity,
 };
 pub use handle::Storage;
+pub(crate) use roles::DeferredCheckpoint;
 pub use roles::{
     ByteStream, CheckpointObservation, FinalDestination, Metadata, MetadataMutation, Namespace,
     NamespaceRequest, NamespaceResult, PositionedByteStream, PositionedChunk, PrepareRequest,
     PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
-    ReadRequest, ReadSource, RecoverRequest, RecoveryIdentity, RecoveryValueError,
-    StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure, VerificationEvidence,
-    VerificationPoint, VerifyRequest, WriteEvidence,
+    ReadRequest, ReadSource, StagedDestination, StagedMetadataApplicationFailure,
+    StorageRoleFailure, VerificationEvidence, VerificationPoint, VerifyRequest, WriteEvidence,
 };
-pub(crate) use roles::{CheckpointRegistration, DeferredCheckpoint};
 
 pub use crate::runtime::read_budget::ReadBudget;
 

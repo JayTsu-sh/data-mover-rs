@@ -1083,20 +1083,6 @@ async fn positioned_checkpoint_persistence_overlaps_the_next_write_window() -> i
     Ok(())
 }
 
-struct PositionedRegistration(AtomicU64);
-
-#[async_trait]
-impl crate::storage::roles::CheckpointRegistration for PositionedRegistration {
-    async fn register(
-        &self,
-        _stage: &PreparedStage,
-        _identity: RecoveryIdentity,
-    ) -> Result<(), StorageRoleFailure> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn positioned_checkpoint_distinguishes_final_crossing_from_earlier_boundary() -> io::Result<()>
 {
@@ -1110,11 +1096,9 @@ async fn positioned_checkpoint_distinguishes_final_crossing_from_earlier_boundar
             request_with_size(&backend, "final.bin", size),
         )
         .await);
-        let registration = Arc::new(PositionedRegistration(AtomicU64::new(0)));
         stage.deferred_checkpoint = Some(DeferredCheckpoint {
             interval_bytes: 6,
             source_size: size as u64,
-            registration: registration.clone(),
         });
         let input = Box::pin(stream::iter(offsets.into_iter().map(|offset| {
             Ok(PositionedChunk {
@@ -1126,9 +1110,7 @@ async fn positioned_checkpoint_distinguishes_final_crossing_from_earlier_boundar
             ok(adapter.write_positioned(&stage, input).await).persisted_bytes,
             size as u64
         );
-        // The pointer is the only record: a checkpoint shows as a pointer write, never as a
-        // registration.
-        assert_eq!(registration.0.load(Ordering::SeqCst), 0);
+        // The pointer is the only record: a checkpoint shows as a pointer write.
         assert_eq!(
             observed_checkpoint_prefixes(&adapter).is_empty(),
             expected == 0
@@ -1197,11 +1179,9 @@ async fn positioned_sparse_completion_crosses_multiple_intervals_once() -> io::R
     let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 1));
     let mut stage =
         ok(prepare_ephemeral_stage(&adapter, request_with_size(&backend, "final.bin", 24)).await);
-    let registration = Arc::new(PositionedRegistration(AtomicU64::new(0)));
     stage.deferred_checkpoint = Some(DeferredCheckpoint {
         interval_bytes: 4,
         source_size: 24,
-        registration: registration.clone(),
     });
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     let (poll_sender, mut polled) = tokio::sync::mpsc::unbounded_channel();
@@ -1250,7 +1230,6 @@ async fn positioned_sparse_completion_crosses_multiple_intervals_once() -> io::R
     assert_eq!(ok(written).persisted_bytes, 24);
     // Two periodic checkpoints plus the final checkpoint, no redundant threshold replay.
     assert_eq!(observed_checkpoint_prefixes(&adapter), [12, 20, 24]);
-    assert_eq!(registration.0.load(Ordering::SeqCst), 0);
     assert_eq!(
         tokio::fs::read(ok(adapter.stage_full_path(&stage, Operation::Read))).await?,
         vec![42; 24]

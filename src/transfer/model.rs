@@ -1,11 +1,9 @@
 use std::fmt;
-use std::sync::Arc;
 
-use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{SourceVersion, StoragePath};
-use crate::storage::{RecoveryIdentity, SourceQosGroup, Storage};
+use crate::storage::{SourceQosGroup, Storage};
 
 use super::TransferIdentity;
 
@@ -26,73 +24,6 @@ impl fmt::Display for TransferValueError {
 }
 
 impl std::error::Error for TransferValueError {}
-
-/// Failure to durably register a recovery identity inside data-mover.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RecoveryRegistrationFailure {
-    /// The persistence or IPC path is temporarily unavailable.
-    Unavailable,
-    /// A persisted record failed validation.
-    Rejected,
-}
-
-impl RecoveryRegistrationFailure {
-    #[must_use]
-    pub(crate) const fn unavailable() -> Self {
-        Self::Unavailable
-    }
-
-    #[must_use]
-    pub(crate) const fn rejected() -> Self {
-        Self::Rejected
-    }
-}
-
-impl fmt::Display for RecoveryRegistrationFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unavailable => formatter.write_str("recovery registration is unavailable"),
-            Self::Rejected => formatter.write_str("recovery state validation failed"),
-        }
-    }
-}
-
-impl std::error::Error for RecoveryRegistrationFailure {}
-
-/// Data-mover-owned persistence seam for one opaque recovery identity.
-#[async_trait]
-pub(crate) trait RecoveryRegistrar: Send + Sync {
-    async fn register(&self, identity: RecoveryIdentity)
-    -> Result<(), RecoveryRegistrationFailure>;
-}
-
-/// Recovery inputs opened internally only after planning proves a checkpoint is useful.
-pub(crate) struct RecoveryContext {
-    pub(crate) identity: Option<RecoveryIdentity>,
-    pub(crate) claim: [u8; 32],
-    pub(crate) publication_pending: bool,
-    pub(crate) registrar: Arc<dyn RecoveryRegistrar>,
-    pub(crate) lease: Arc<std::fs::File>,
-}
-
-impl RecoveryContext {
-    #[must_use]
-    pub(crate) fn new(
-        identity: Option<RecoveryIdentity>,
-        claim: [u8; 32],
-        publication_pending: bool,
-        registrar: Arc<dyn RecoveryRegistrar>,
-        lease: Arc<std::fs::File>,
-    ) -> Self {
-        Self {
-            identity,
-            claim,
-            publication_pending,
-            registrar,
-            lease,
-        }
-    }
-}
 
 /// Explicit chunk, payload-byte, and source-operation admission bounds.
 ///
