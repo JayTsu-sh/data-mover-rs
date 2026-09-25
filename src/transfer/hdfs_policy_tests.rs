@@ -8,7 +8,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{SourceVersion, StoragePath};
 use crate::storage::backends::hdfs::{connect, contract_tests::MemoryHdfs, test_identity};
-use crate::storage::{InflightConfig, InflightRuntime, PreflightPolicy, ReadBudget, ReadRequest};
+use crate::storage::{
+    InflightConfig, InflightRuntime, PreflightPolicy, PrepareFact, ReadBudget, ReadRequest,
+};
 use crate::transfer::{
     InflightLimits, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest,
     transfer,
@@ -158,6 +160,18 @@ async fn checkpointed_registers_only_after_hsync_and_resumes_durable_prefix() ->
             drop(failure);
         }
         let outcome = transfer(request()?).await?;
+        // The resume found its stage through the pointer beside the final file (ADR-0006 C12c):
+        // nothing was recorded where data-mover runs.
+        if size > INTERVAL {
+            assert!(
+                matches!(outcome.prepare, PrepareFact::Resumed { bytes } if bytes >= INTERVAL as u64),
+                "{:?}",
+                outcome.prepare
+            );
+            assert!(outcome.reused_bytes >= INTERVAL as u64);
+        } else {
+            assert_eq!(outcome.prepare, PrepareFact::Fresh);
+        }
         assert_eq!(
             outcome.recovery,
             if size > INTERVAL {
@@ -171,6 +185,57 @@ async fn checkpointed_registers_only_after_hsync_and_resumes_durable_prefix() ->
         assert_eq!(protocol.io_peaks().2, if size > INTERVAL { 2 } else { 1 });
         assert_eq!(protocol.hsync_calls(), usize::from(size > INTERVAL));
     }
+    Ok(())
+}
+
+/// ADR-0006 C12c: the pointer write at the first checkpoint fails — the transfer fails with no
+/// recoverable stage and the final file untouched; a writer that died there left a stage without a
+/// pointer, which the next transfer cleans up and starts over.
+#[tokio::test]
+async fn a_failed_first_pointer_leaves_nothing_to_resume() -> Result {
+    const SIZE: usize = 64 * 1024 * 1024 + 1;
+    let protocol = Arc::new(MemoryHdfs::default());
+    let content = Bytes::from(vec![47; SIZE]);
+    protocol.insert("source", content.clone()).await;
+    protocol.insert("final", Bytes::from_static(b"old")).await;
+    let storage = connect(protocol.clone(), test_identity("pointer-failure")?)?;
+    let request = || -> std::result::Result<TransferRequest, Box<dyn std::error::Error>> {
+        Ok(TransferRequest::new(
+            storage.clone(),
+            StoragePath::new("source")?,
+            storage.clone(),
+            StoragePath::new("final")?,
+            InflightLimits::new(4, 8 * 1024 * 1024, 4)?,
+            CancellationToken::new(),
+        )
+        .with_identity_override(TransferIdentity::from_label("hdfs-pointer-failure")?)
+        .with_transfer_policy(TransferPolicy::Checkpointed)
+        .with_read_back_verification(ReadBackVerification::Disabled))
+    };
+    protocol.fail_once_on_pointer_write();
+    let failure = transfer(request()?)
+        .await
+        .err()
+        .ok_or("the failed pointer must fail the transfer")?;
+    assert!(!failure.final_destination_changed());
+    assert!(!failure.has_recoverable_stage());
+    assert_eq!(
+        protocol.get("final").await,
+        Some(Bytes::from_static(b"old"))
+    );
+    drop(failure);
+    let outcome = transfer(request()?).await?;
+    assert!(
+        matches!(outcome.prepare, PrepareFact::Restarted { .. }),
+        "{:?}",
+        outcome.prepare
+    );
+    assert_eq!(protocol.get("final").await, Some(content));
+    assert_eq!(
+        protocol.len().await,
+        2,
+        "only the source and the final file remain"
+    );
     Ok(())
 }
 

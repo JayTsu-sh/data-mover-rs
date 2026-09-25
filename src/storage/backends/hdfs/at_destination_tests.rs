@@ -342,3 +342,12 @@ async fn checkpoints_write_the_pointer_and_a_shorter_stage_restarts() -> TestRes
     assert!(no_artifacts(&protocol).await);
     Ok(())
 }
+
+/// HDFS keeps its recovery state at the destination: the engine routes it through
+/// `prepare_at_destination` and never through the local recovery store (ADR-0006 C12c).
+#[test]
+fn hdfs_keeps_recovery_at_the_destination() -> TestResult {
+    let protocol = Arc::new(MemoryHdfs::default());
+    assert!(adapter(&protocol)?.recovery_at_destination());
+    Ok(())
+}

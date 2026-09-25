@@ -250,6 +250,24 @@ only when the stage is gone and the final file has the expected size and BLAKE3.
 verification (resume matrix on the Kerberos lab through the runner) is still to do; the switch
 stays off until it passes (C12c).
 
+As built (C12c, HDFS — switch on, breaking): the HDFS destination answers `recovery_at_destination()`,
+so every non-`Direct` HDFS transfer goes through the in-process lease and `prepare_at_destination`,
+and nothing is recorded where data-mover runs; `Direct` takes the lease and goes through
+`prepare_direct`. The engine marks a `Direct` stage at-destination too; HDFS keeps
+its `.stage` / `.pointer` paths only for a resident stage (`at_destination && !direct`), so a direct
+write still goes to the final path. The old `prepare` / `recover` / `recovery_identity` stay until
+C12d removes them. Breaking: HDFS transfers in flight at the upgrade (`.part` / `.claimed` names
+and local records) are not resumed — drain first (D6); their `.part` / `.claimed` files stay on
+HDFS, hidden from listings, until removed by hand. A failed pointer write at the first checkpoint
+fails the transfer with no recoverable stage; the stage it leaves has no pointer, and the next
+transfer cleans it up and starts over (`a_failed_first_pointer_leaves_nothing_to_resume`). Verified on the Kerberos lab (runner VM 102,
+principal `hdfs/terrasync-runner`, NameNode 10.131.9.30:9000, run root
+`/tmp/data-mover-nightly/nightly-c12c-<ts>/hdfs`, removed afterwards): the resume matrix (200 MiB,
+20 MiB/s, 6 s cut, local state wiped) — cancel left no local record and two artifacts, resumed
+`Resumed { 106326012 }` with 103389188 streamed; SIGKILL resumed `Resumed { 106267648 }` with
+103447552 streamed; both equal by BLAKE3 with no artifact left. `hdfs_architecture_contract` (3) and
+the HDFS smoke suite (19 `nightly_lab_*`, including the engine policy and chunk-boundary cases) pass.
+
 As built (C13): a destination says when read-back verification reads it
 (`StagedDestination::verification_point(stage)`: `BeforePublish` by default, `AfterPublish` for one
 that writes at the final name — S3 from C14). For `AfterPublish` the engine applies metadata,

@@ -254,7 +254,7 @@ impl HdfsStagedDestination {
             )
         })?;
         let partial = HdfsStageToken::decode(stage)?.partial_path;
-        if stage.at_destination {
+        if super::at_destination::resident(stage) {
             let expected = super::at_destination::artifact_path(
                 stage.final_destination.path(),
                 ArtifactKind::Stage,
@@ -393,6 +393,10 @@ impl StagedDestination for HdfsStagedDestination {
         recover(self, request).await
     }
 
+    fn recovery_at_destination(&self) -> bool {
+        true
+    }
+
     async fn prepare_at_destination(
         &self,
         request: crate::storage::DestinationPrepareRequest,
@@ -412,7 +416,7 @@ impl StagedDestination for HdfsStagedDestination {
         &self,
         stage: &PreparedStage,
     ) -> Result<CheckpointObservation, StorageRoleFailure> {
-        if stage.at_destination {
+        if super::at_destination::resident(stage) {
             let durable_prefix =
                 super::at_destination::reobserve(self, stage, &self.part(stage)?).await?;
             return Ok(CheckpointObservation { durable_prefix });
@@ -486,7 +490,7 @@ impl StagedDestination for HdfsStagedDestination {
         if stage.direct {
             return Ok(());
         }
-        if stage.at_destination {
+        if super::at_destination::resident(&stage) {
             self.part(&stage)?;
             return super::at_destination::discard(self, &stage).await;
         }
@@ -681,7 +685,7 @@ async fn publish(
         )));
     }
     let part = adapter.part(stage).map_err(publication_failure)?;
-    if stage.at_destination {
+    if super::at_destination::resident(stage) {
         return super::at_destination::publish(adapter, stage, &part, &request).await;
     }
     if !stage.direct {

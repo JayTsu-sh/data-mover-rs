@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use super::protocol::{HdfsEntryFacts, HdfsProtocol, HdfsWriteSession, entry_failure};
 use crate::model::{EntryKind, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::StorageRoleFailure;
+use crate::storage::artifacts::{ArtifactKind, parse_artifact_name};
 
 #[derive(Default)]
 pub(crate) struct MemoryHdfs {
@@ -24,15 +25,29 @@ pub(crate) struct MemoryHdfs {
     recovered_tail: Mutex<Option<Bytes>>,
     hsync_calls: AtomicUsize,
     fail_after_hsync: std::sync::atomic::AtomicBool,
+    fail_pointer_write: std::sync::atomic::AtomicBool,
     hsync_completed: std::sync::atomic::AtomicBool,
     delayed_reads: std::sync::atomic::AtomicBool,
     fail_write: std::sync::atomic::AtomicBool,
     fail_rename_after_commit: std::sync::atomic::AtomicBool,
 }
 
+/// Whether `path` names a pointer artifact or its temporary, exactly (not a data file whose name
+/// merely contains "pointer").
+fn is_pointer(path: &StoragePath) -> bool {
+    let name = path.as_str().rsplit('/').next().unwrap_or_default();
+    parse_artifact_name(name).is_some_and(|parsed| parsed.kind == ArtifactKind::Pointer)
+}
+
 impl MemoryHdfs {
+    /// Fails the first data write after an hsync: the pointer an at-destination checkpoint
+    /// writes right after its hsync is not data and goes through.
     pub(crate) fn fail_once_after_hsync(&self) {
         self.fail_after_hsync.store(true, Ordering::SeqCst);
+    }
+    /// Fails the next write of a pointer (or its temporary).
+    pub(crate) fn fail_once_on_pointer_write(&self) {
+        self.fail_pointer_write.store(true, Ordering::SeqCst);
     }
     pub(crate) fn configure_io(&self, read: usize, write: usize) {
         self.read_limit.store(read, Ordering::SeqCst);
@@ -272,7 +287,10 @@ impl HdfsProtocol for MemoryHdfs {
         start_offset: u64,
         direct: bool,
     ) -> Result<Box<dyn HdfsWriteSession + '_>, StorageRoleFailure> {
-        self.append_calls.fetch_add(1, Ordering::SeqCst);
+        // Data writers only: the pointer an at-destination stage writes is not an append of it.
+        if !is_pointer(path) {
+            self.append_calls.fetch_add(1, Ordering::SeqCst);
+        }
         if self.fail_write.load(Ordering::SeqCst) {
             return Err(entry_failure(
                 path,
@@ -373,8 +391,15 @@ struct MemoryWriteSession<'a> {
 #[async_trait]
 impl HdfsWriteSession for MemoryWriteSession<'_> {
     async fn write(&mut self, data: Bytes) -> Result<usize, StorageRoleFailure> {
-        if self.storage.hsync_completed.load(Ordering::SeqCst)
-            && self.storage.fail_after_hsync.swap(false, Ordering::SeqCst)
+        let pointer = is_pointer(&self.path);
+        if (pointer
+            && self
+                .storage
+                .fail_pointer_write
+                .swap(false, Ordering::SeqCst))
+            || (self.storage.hsync_completed.load(Ordering::SeqCst)
+                && !pointer
+                && self.storage.fail_after_hsync.swap(false, Ordering::SeqCst))
         {
             return Err(entry_failure(
                 &self.path,

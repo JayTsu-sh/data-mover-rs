@@ -76,6 +76,12 @@ fn is_not_found(error: &StorageRoleFailure) -> bool {
     matches!(error, StorageRoleFailure::Entry(entry) if entry.class() == FailureClass::NotFound)
 }
 
+/// Whether `stage` keeps its state at the destination (`.stage` + `.pointer`). A direct stage
+/// writes the final path itself; the engine marks it at-destination too, so it is excluded here.
+pub(super) const fn resident(stage: &PreparedStage) -> bool {
+    stage.at_destination && !stage.direct
+}
+
 /// A final path HDFS holds under exactly that name, with its artifacts beside it: no empty, `.` or
 /// `..` segment and no transfer-artifact segment.
 pub(super) fn validate_final(path: &StoragePath) -> Result<(), StorageRoleFailure> {
