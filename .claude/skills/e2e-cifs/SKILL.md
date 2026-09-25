@@ -30,7 +30,7 @@ CIFS_REAL_GUEST_POLICY=allow-unsigned   # 可选，对匿名/guest share 跑契�
 因为测试账号是本地用户、不经过 DC。这一档也不在 `run.py` 的默认步骤里 (`.env` 不设
 `CIFS_REAL_GUEST_POLICY`)。详见 `.claude/docs/storage-cifs.md` 的"真实环境证据"表。
 
-恢复状态在目的端（ADR-0006 C11）：不需要 `DATA_MOVER_RECOVERY_DIR`；每个用例成功后断言最终文件旁没有
+恢复状态在目的端（ADR-0006 C11；C21 删了本地恢复存储，运行处什么都不记）：每个用例成功后断言最终文件旁没有
 `.data-mover-*` 残留。
 
 ## 步骤

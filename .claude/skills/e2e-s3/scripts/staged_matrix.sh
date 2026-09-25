@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Role-based S3 write-strategy matrix against a real server (examples/transfer_resume.rs).
-# Prints one line per case plus what it left behind (`.data-mover-*` objects, local recovery
-# records, uploads open on the case's key), then removes everything under its own prefix. Not an
-# assertion suite: it records a baseline to compare write strategies across commits — except the Direct rows, which since ADR-0006 C14c must
+# Prints one line per case plus what it left behind (`.data-mover-*` objects, uploads open on the
+# case's key), then removes everything under its own prefix. Not an assertion suite: it records a
+# baseline to compare write strategies across commits — except the Direct rows, which since ADR-0006 C14c must
 # succeed: each is downloaded and compared with its source, and the uploads left on its exact key
 # are counted (`direct: equal=yes key_uploads=0` is the expected verdict) — and the native rows,
 # which since C18 write the final key: `native: equal=yes stage_objects=0 key_uploads=0`.
@@ -24,10 +24,7 @@ case "$PREFIX" in
   *) echo "S3_MATRIX_PREFIX must start with staged- or data-mover-: $PREFIX" >&2; exit 1 ;;
 esac
 WORK=/tmp/data-mover-s3-staged-$RUN
-# Only to count records: since ADR-0006 C15c an S3 destination keeps its recovery state at the
-# destination and writes none here.
-export DATA_MOVER_RECOVERY_DIR=$WORK/recovery
-mkdir -p "$WORK/src" "$DATA_MOVER_RECOVERY_DIR"
+mkdir -p "$WORK/src"
 BIN=target/debug/examples/transfer_resume
 build=$(cargo build -q --example transfer_resume 2>&1) || { echo "$build" >&2; exit 1; }
 SCHEME=http; [ "${S3_USE_HTTPS:-}" = true ] && SCHEME=https
@@ -39,8 +36,6 @@ s3c() { curl -s --aws-sigv4 "aws:amz:us-east-1:s3" -K <(printf 'user = "%s:%s"\n
 # `.data-mover-*` objects under the run's prefix: the `.upload` pointers of uploads on the final key
 # (ADR-0006 C15b). Native copies write the final key since C18: no `.data-mover-stage/` object.
 artifacts() { s3c "$B?list-type=2&prefix=$PREFIX/" | grep -o '<Key>[^<]*</Key>' | grep -c '\.data-mover-'; }
-# Local recovery records: since ADR-0006 C15c an S3 destination keeps none (always 0).
-records() { find "$DATA_MOVER_RECOVERY_DIR" -name '*.state' 2>/dev/null | wc -l; }
 # The multipart uploads open on exactly key $1 (under the prefix), one id per line:
 # ListMultipartUploads with the key as prefix, then an exact-key filter (MinIO 2023 lists exact
 # keys only, AWS / Ceph / StorageGRID by prefix). A reply that is not a listing prints "?".
@@ -65,8 +60,8 @@ case_() { # label, destination key, args...
   local label=$1 key=$2; shift 2
   remember_key "$key"
   local line; line=$("$BIN" "$@" 2>&1 | tail -1)
-  printf '%-44s %s  | artifacts=%s records=%s key_uploads=%s\n' "$label" "$line" "$(artifacts)" \
-    "$(records)" "$(key_uploads "$key")"
+  printf '%-44s %s  | artifacts=%s key_uploads=%s\n' "$label" "$line" "$(artifacts)" \
+    "$(key_uploads "$key")"
 }
 # A native copy writes the final key (ADR-0006 C18): it must equal its source, and neither a temp
 # key under `.data-mover-stage/` (the path C19 removed; `stage_objects` guards that none is ever
@@ -91,7 +86,7 @@ direct_verdict() { # destination key, source file
 left_at() { # destination key
   local pointers
   pointers=$(s3c "$B?list-type=2&prefix=$PREFIX/" | grep -o '<Key>[^<]*</Key>' | grep -c '\.upload<')
-  echo "   left at the destination: prefix pointers=$pointers key_uploads=$(key_uploads "$1") records=$(records)"
+  echo "   left at the destination: prefix pointers=$pointers key_uploads=$(key_uploads "$1")"
 }
 
 SIZES=("z0:0" "k1:1024" "m8:8388608" "m8p1:8388609" "m20:20971520" "m200:209715200")
@@ -140,8 +135,8 @@ remember_key resume-kill
 timeout -s KILL 12 "$BIN" --source "$WORK/src" --source-path m200 --destination "s3:$PREFIX" \
   --destination-path resume-kill --policy checkpointed --identity "r-$RUN-kill" \
   --bandwidth 20971520 >/dev/null 2>&1
-printf '%-44s %s  | artifacts=%s records=%s key_uploads=%s\n' "killed after 12 s" "exit=$?" "$(artifacts)" \
-  "$(records)" "$(key_uploads resume-kill)"
+printf '%-44s %s  | artifacts=%s key_uploads=%s\n' "killed after 12 s" "exit=$?" "$(artifacts)" \
+  "$(key_uploads resume-kill)"
 left_at resume-kill
 case_ "resume (same identity)" resume-kill --source "$WORK/src" --source-path m200 --destination "s3:$PREFIX" \
   --destination-path resume-kill --policy checkpointed --identity "r-$RUN-kill"

@@ -27,7 +27,7 @@ S3_PREFIX=test                   # bucket 内的子路径
 4. **写入策略矩阵**（role-based 目的端）：`bash .claude/skills/e2e-s3/scripts/staged_matrix.sh` ——
    大小 0 / 1 KiB / 8 MiB / 8 MiB+1 / 20 MiB / 200 MiB × Checkpointed / AtomicReplace / Direct × 读回开关，原生 S3→S3，
    取消与 SIGKILL 后续传。每行打印结果（含 `prepare` / `reused_bytes` / `native_bytes` / `native_requests`）、耗时和遗留：
-   `artifacts=`（前缀下的 `.data-mover-*` 对象：`.upload` 指针；C18 起原生拷贝不再有 temp key）、`records=`（本地恢复记录，C15c 起 S3 恒为 0）、
+   `artifacts=`（前缀下的 `.data-mover-*` 对象：`.upload` 指针；C18 起原生拷贝不再有 temp key）、
    `key_uploads=`（该用例精确 key 上未完成的上传）。续传段另打印 `left at the destination: pointers=… key_uploads=…`
    （切断后期望 1 / 1，续传完成后 0 / 0）。只写/删 `staged-<run>/`
    （`S3_MATRIX_PREFIX=` 可改，必须以 `staged-` 或 `data-mover-` 开头 —— 清理会 abort 本次写过的每个 key 上的上传，再删
@@ -39,8 +39,8 @@ S3_PREFIX=test                   # bucket 内的子路径
    基线与解读见 `.claude/docs/storage-s3.md`「目的端写入策略基线」。
 
 5. **容器重启后续传**：`DEST=s3:data-mover-<ts> bash .claude/skills/_shared/resume_matrix.sh`。
-   ADR-0006 C15c 起 S3 的恢复状态在目的端（最终 key 上的 upload + `.data-mover-<d>.upload` 指针），续传**不需要**
-   `DATA_MOVER_RECOVERY_DIR`：期望本地记录 0、切断后 `1 objects + 1 open uploads`、续传 `Resumed{…}`、
+   S3 的恢复状态在目的端（最终 key 上的 upload + `.data-mover-<d>.upload` 指针），运行处什么都不记（C21 删了本地恢复存储）：
+   期望每次运行 `fresh HOME=empty`（否则脚本退出 1）、切断后 `1 objects + 1 open uploads`、续传 `Resumed{…}`、
    reused + streamed = SIZE、BLAKE3 相等、之后 0 / 0。C16 起 > 64 MiB 的 checkpointed upload 一开始就写指针，默认 6 s
    切断（早于第一个 64 MiB checkpoint）也会续传：cancel 与 SIGKILL 都 `Resumed{…}`（取消丢不到一段，SIGKILL 丢在途分段）。
 

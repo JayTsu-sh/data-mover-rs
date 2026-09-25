@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Container-restart resume matrix (ADR-0006): interrupt a transfer, wipe every piece of local state,
-# resume from a fresh process with a fresh HOME, and report what was reused and what was left behind.
-# Not an assertion suite: it records how each backend behaves, before and after the migration.
+# Container-restart resume matrix (ADR-0006): interrupt a transfer, resume it from a fresh process
+# with a fresh HOME, and report what was reused and what was left behind. It records how each
+# backend behaves; the one thing it asserts is that no run writes under its fresh HOME.
 #
 # Usage: DEST=<endpoint> bash .claude/skills/_shared/resume_matrix.sh
 #   DEST   destination endpoint, as examples/transfer_resume.rs takes it: a local directory,
@@ -13,9 +13,6 @@
 #          upload begins (ADR-0006 C16), so a SIGKILL resumes even before that checkpoint)
 #   S3_BUCKET_OVERRIDE  (s3: only) another bucket of the same server, e.g. a temporary versioned
 #          one (ADR-0006 C17), instead of the .env's S3_BUCKET — never by editing the .env
-#   KEEP_STATE=1  keep the local recovery records across the restart (still a fresh process and
-#          HOME). Neither run names the transfer: the resume can only find the record through the
-#          identity data-mover derives (ADR-0006 C5), so "streamed" below SIZE proves it did.
 # Writes only under <DEST>/resume-<run>/ and removes all of it at the end: final files, orphaned
 # stages and checkpoints, and (S3) every multipart upload still open on the run's keys.
 #
@@ -24,12 +21,13 @@
 # "prepare" / "reused_bytes" say what the resuming run found at the destination, and the content
 # check compares the final file with the source by BLAKE3.
 # "streamed" is what the resuming run read from the source (it runs with read-back off and a
-# non-limiting budget, so the engine counts it): SIZE means nothing was reused. "records" is how
-# many recovery records the interrupted run left locally. For a destination that still uses the
-# local recovery store, 0 means the cut came before the first checkpoint; a destination that keeps
-# its recovery state beside the final file (ADR-0006: Local from C8, NFS C10, CIFS C11, HDFS C12c,
-# S3 C15c) always shows 0. For S3 "destination artifacts" is the `.data-mover-*` objects (the
-# `.upload` pointer) plus the multipart uploads open on the run's final keys.
+# non-limiting budget, so the engine counts it): SIZE means nothing was reused. For S3
+# "destination artifacts" is the `.data-mover-*` objects (the `.upload` pointer) plus the multipart
+# uploads open on the run's final keys.
+# Nothing is kept where data-mover runs (ADR-0006 C21): both runs get their own fresh, empty HOME
+# (and nothing else of this machine's environment but PATH and the backend credentials), and each
+# line "fresh HOME" reports what a run left there — "empty" is the acceptance criterion; anything
+# else is listed and makes the script exit 1 at the end.
 set -u
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$ROOT"
@@ -37,8 +35,7 @@ for env in .claude/skills/e2e-s3/.env .claude/skills/e2e-cifs/.env; do
   [ -f "$env" ] && { set -a; . "$env"; set +a; }
 done
 : "${DEST:?set DEST to the destination endpoint}"
-SIZE=${SIZE:-209715200}; BW=${BW:-20971520}; CUT_MS=${CUT_MS:-6000}; KEEP_STATE=${KEEP_STATE:-0}
-case "$KEEP_STATE" in 0|1) ;; *) echo "KEEP_STATE must be 0 or 1" >&2; exit 1 ;; esac
+SIZE=${SIZE:-209715200}; BW=${BW:-20971520}; CUT_MS=${CUT_MS:-6000}
 UNLIMITED=10737418240
 RUN=${RUN:-$(date +%s)}
 DIR=resume-$RUN
@@ -65,10 +62,10 @@ build=$(cargo build -q --example transfer_resume 2>&1) || { echo "$build" >&2; e
 mkdir -p "$WORK/src"
 
 # Everything a fresh container would still have: the binary, PATH, and the backend credentials.
-# Fills FRESH_ENV (an array: PATH may contain spaces).
+# Fills FRESH_ENV (an array: PATH may contain spaces) and FRESH_HOME, a new empty directory.
 fresh_env() {
-  local home; home=$(mktemp -d "$WORK/home-XXXX")
-  FRESH_ENV=("HOME=$home" "PATH=$PATH")
+  FRESH_HOME=$(mktemp -d "$WORK/home-XXXX")
+  FRESH_ENV=("HOME=$FRESH_HOME" "PATH=$PATH")
   local name
   for name in $(compgen -e); do
     case "$name" in S3_*|CIFS_REAL_*|LAB_HDFS_*|RUST_LOG) FRESH_ENV+=("$name=${!name}") ;; esac
@@ -121,7 +118,18 @@ artifacts() {
       python3 -c 'import json,sys; print(len(json.load(sys.stdin)["artifacts"]))' 2>/dev/null || echo "?"
   fi
 }
-records() { find "$1" -name '*.state' 2>/dev/null | wc -l; }
+# What a run left in its fresh HOME (ADR-0006: nothing is kept where data-mover runs): sets
+# HOME_VERDICT to "empty" or to the paths it created. Not called in $(…): a subshell would lose
+# HOME_DIRTY, which fails the script at the end when anything was left (or the HOME is unreadable).
+HOME_DIRTY=0
+home_check() {
+  local left
+  if ! left=$(cd "$1" 2>/dev/null && find . -mindepth 1 | sort); then
+    HOME_DIRTY=1; HOME_VERDICT="? (cannot list $1)"; return
+  fi
+  if [ -z "$left" ]; then HOME_VERDICT=empty
+  else HOME_DIRTY=1; HOME_VERDICT="NOT EMPTY: $(tr '\n' ' ' <<<"$left")"; fi
+}
 # The destination endpoint a run derived (ADR-0006 C4); empty when the run printed no JSON.
 endpoint_of() { python3 -c 'import json,sys
 try: print(json.loads(sys.argv[1]).get("destination_endpoint",""))
@@ -137,32 +145,32 @@ for line in open(sys.argv[1], errors="replace"):
 "$BIN" --source "$WORK/src" --source-path src --seed-bytes "$SIZE" --destination "$WORK/probe" \
   --destination-path src --policy atomic --read-back off >"$WORK/seed.out" 2>&1 ||
   { cat "$WORK/seed.out" >&2; exit 1; }
-echo "run=$RUN dest=$DEST size=$SIZE bw=$BW cut_ms=$CUT_MS keep_state=$KEEP_STATE"
+echo "run=$RUN dest=$DEST size=$SIZE bw=$BW cut_ms=$CUT_MS"
 for mode in cancel kill; do
-  state=$WORK/state-$mode
-  export DATA_MOVER_RECOVERY_DIR=$state
   args=(--source "$WORK/src" --source-path src "${TARGET[@]}" --destination-path "$(path_of "$mode")"
         --policy checkpointed)
+  fresh_env
   if [ $mode = cancel ]; then
-    "$BIN" "${args[@]}" --bandwidth "$BW" --cancel-after-ms "$CUT_MS" >"$WORK/first.out" 2>&1
+    env -i "${FRESH_ENV[@]}" "$BIN" "${args[@]}" --bandwidth "$BW" --cancel-after-ms "$CUT_MS" \
+      >"$WORK/first.out" 2>&1
     first=$(tail -1 "$WORK/first.out")
   else
     timeout -s KILL "$(printf '%d.%03d' $((CUT_MS / 1000)) $((CUT_MS % 1000)))" \
-      "$BIN" "${args[@]}" --bandwidth "$BW" >"$WORK/first.out" 2>&1
+      env -i "${FRESH_ENV[@]}" "$BIN" "${args[@]}" --bandwidth "$BW" >"$WORK/first.out" 2>&1
     status=$?
     if [ $status = 137 ]; then first='{"result":"killed"}'; else first="exit $status: $(tail -1 "$WORK/first.out")"; fi
   fi
   first_identity=$(identity_of "$WORK/first.out")
   echo "[$mode] interrupted: $first"
-  echo "[$mode]   local records=$(records "$state")  destination artifacts=$(artifacts)"
-  # The container restarts: nothing local survives, unless KEEP_STATE=1 keeps the records.
-  unset DATA_MOVER_RECOVERY_DIR
+  home_check "$FRESH_HOME"
+  echo "[$mode]   fresh HOME=$HOME_VERDICT  destination artifacts=$(artifacts)"
+  # The container restarts: a fresh process with another fresh HOME.
   fresh_env
-  if [ "$KEEP_STATE" = 1 ]; then FRESH_ENV+=("DATA_MOVER_RECOVERY_DIR=$state"); else rm -rf "$state"; fi
   env -i "${FRESH_ENV[@]}" "$BIN" "${args[@]}" --read-back off --bandwidth "$UNLIMITED" >"$WORK/second.out" 2>&1
   second=$(tail -1 "$WORK/second.out")
   echo "[$mode] resumed:     $second"
-  echo "[$mode]   destination artifacts after=$(artifacts)"
+  home_check "$FRESH_HOME"
+  echo "[$mode]   fresh HOME=$HOME_VERDICT  destination artifacts after=$(artifacts)"
   # The fresh process must derive the endpoint the interrupted one did (a killed run prints none).
   seen=$(endpoint_of "$first"); again=$(endpoint_of "$second")
   if [ -n "$seen" ]; then same=$([ "$seen" = "$again" ] && echo yes || echo NO); else same="n/a (no output)"; fi
@@ -186,7 +194,6 @@ try: print("yes" if json.load(sys.stdin)["content_equal"] else "NO")
 except Exception: print("? (no comparison)")')
   echo "[$mode]   destination BLAKE3 equals source: $same"
   [[ "$DEST" == s3:* ]] && echo "[$mode]   $(s3_versions "$RUNKEY/$mode")"
-  rm -rf "$state"
 done
 
 echo "-- cleanup"
@@ -205,3 +212,5 @@ else
   case "$left" in *NotFound*|*NOENT*|*3221225524*) echo "left: nothing ($DIR/ removed)";; *) echo "left: $left";; esac
 fi
 rm -rf "$WORK"
+if [ "$HOME_DIRTY" = 1 ]; then echo "FAIL: a run wrote under its fresh HOME" >&2; exit 1; fi
+echo "fresh HOME: every run left it empty"
