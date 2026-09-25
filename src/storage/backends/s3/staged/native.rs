@@ -11,10 +11,10 @@ use super::super::{
 };
 use super::{PART_SIZE, S3StagedDestination, StageState, at_destination, cleanup_result, single};
 
-struct NativeFillFailure {
-    error: StorageRoleFailure,
-    bytes: u64,
-    requests: u64,
+pub(super) struct NativeFillFailure {
+    pub(super) error: StorageRoleFailure,
+    pub(super) bytes: u64,
+    pub(super) requests: u64,
 }
 
 impl<P: S3Protocol + 'static> S3StagedDestination<P> {
@@ -23,11 +23,16 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         stage: &PreparedStage,
         source: S3NativeCopySource,
         cancel: CancellationToken,
+        operations: usize,
     ) -> Result<NativeStageEvidence, NativeStageFailure> {
-        match self.fill_native_stage(stage, &source, &cancel).await {
+        match self
+            .fill_native_stage(stage, &source, (&cancel, operations))
+            .await
+        {
+            // A resumed upload already held `write_offset` bytes; `bytes` is what this copy added.
             Ok(copy) => Ok(NativeStageEvidence {
                 write: WriteEvidence {
-                    persisted_bytes: copy.bytes,
+                    persisted_bytes: stage.write_offset + copy.bytes,
                 },
                 native_bytes: copy.bytes,
                 native_requests: copy.requests,
@@ -44,21 +49,33 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         &self,
         stage: &PreparedStage,
         source: &S3NativeCopySource,
-        cancel: &CancellationToken,
+        (cancel, operations): (&CancellationToken, usize),
     ) -> Result<S3NativeCopyEvidence, NativeFillFailure> {
-        if at_destination::of(stage).is_some() {
-            // A native copy to the final key arrives with ADR-0006 C18.
-            return Err(native_role_failure(
-                classified_entry(
-                    stage.final_destination.path(),
-                    Operation::Write,
-                    FailureClass::Unsupported,
-                    Transience::Permanent,
-                    "a native S3 copy cannot fill an upload on the final key yet",
-                ),
-                0,
-            ));
+        self.validate(stage)
+            .map_err(|error| native_role_failure(error, 0))?;
+        // Prepared at the destination (ADR-0006 C18): the copy goes to the final key.
+        if let Some(upload) = at_destination::of(stage) {
+            return self
+                .fill_native_upload(stage, upload, source, (cancel, operations))
+                .await;
         }
+        if stage.at_destination {
+            return match single::of(stage) {
+                Some(single) => fill_native_single(stage, single, source),
+                // Never the temp key for a stage kept at the destination.
+                None => Err(native_role_failure(
+                    classified_entry(
+                        stage.final_destination.path(),
+                        Operation::Write,
+                        FailureClass::Internal,
+                        Transience::Permanent,
+                        "a native S3 copy got a stage it cannot fill",
+                    ),
+                    0,
+                )),
+            };
+        }
+        // The temp-key path, reachable only with recovery at the destination off (C19 removes it).
         let baseline = u64::from(source.size > S3_NATIVE_COPY_SINGLE_MAX);
         self.adopt_single_stage(stage, source).await;
         let (key, upload_id) = self
@@ -106,8 +123,8 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         Ok((key, upload_id))
     }
 
-    /// A native copy still fills the temp key (until C18): a stage prepared for one `PutObject`
-    /// moves to that path, with no upload to abort.
+    /// On the temp-key path a stage prepared for one `PutObject` moves to that path, with no
+    /// upload to abort.
     async fn adopt_single_stage(&self, stage: &PreparedStage, source: &S3NativeCopySource) {
         let Some(single) = single::of(stage) else {
             return;
@@ -187,7 +204,34 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     }
 }
 
-fn native_role_failure(error: StorageRoleFailure, requests: u64) -> NativeFillFailure {
+/// A stage for one `CopyObject` to the final key: publication sends it, so the fill only records
+/// the source. The copy (its bytes and its one request) is counted here, the only place the engine
+/// takes native counts from — so a copy refused at publication still reports them.
+fn fill_native_single(
+    stage: &PreparedStage,
+    single: &single::SingleStage,
+    source: &S3NativeCopySource,
+) -> Result<S3NativeCopyEvidence, NativeFillFailure> {
+    if single.expected_size() != source.size {
+        return Err(native_role_failure(
+            classified_entry(
+                stage.final_destination.path(),
+                Operation::Write,
+                FailureClass::InvalidInput,
+                Transience::Permanent,
+                "the native S3 source differs from the prepared size",
+            ),
+            0,
+        ));
+    }
+    single.set_native_source(source.clone());
+    Ok(S3NativeCopyEvidence {
+        bytes: source.size,
+        requests: 1,
+    })
+}
+
+pub(super) fn native_role_failure(error: StorageRoleFailure, requests: u64) -> NativeFillFailure {
     NativeFillFailure {
         error,
         bytes: 0,

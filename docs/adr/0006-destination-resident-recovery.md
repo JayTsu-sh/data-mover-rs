@@ -292,7 +292,8 @@ on the object right after the PUT. `verification_point` is `AfterPublish`; verif
 object (another `ETag` or version → `Conflict`), then reads it by our versionId, or with `If-Match` on
 our `ETag` when there is none. Discard of an unpublished single stage touches nothing. Sizes above T,
 unknown sizes and native S3→S3 copies (a single stage handed to the native path moves to the temp
-key) keep the temp-key multipart path until C15/C18; `Direct` stays refused until C14c.
+key) keep the temp-key multipart path until C15/C18 (both done: C15c, and C18 for native copies);
+`Direct` stays refused until C14c.
 
 As built (C14c, S3 `Direct`): the S3 destination supports `Direct` (the engine's generic
 `supports_direct` check now passes; native copies are never used for `Direct`). `prepare_direct`
@@ -366,7 +367,8 @@ publication are set after the completion; then the pointer is deleted (if we fou
 the evidence carries the completion's version. Verify reads back pinned by version or `If-Match` (E1).
 `discard` checks the fence and, while the upload is still ours, deletes the pointer and then aborts
 the upload; it never touches the final key. A native copy refuses an upload on the final key
-(`Unsupported`) until C18, and such a stage has no local recovery identity. The fence is a check, not a
+(`Unsupported`) until C18 (C18 fills it with `UploadPartCopy`), and such a stage has no local recovery
+identity. The fence is a check, not a
 lock, as on NFS / CIFS / HDFS. Real-machine verification (the 200 MiB cancel / SIGKILL matrix) comes
 with C15c, which turns the switch on.
 
@@ -377,7 +379,8 @@ in-process lease, nothing is recorded where data-mover runs, and the automatic i
 C19. Four fixes came first. (1) A native S3→S3 pair on the at-destination route takes the
 destination's ordinary ephemeral prepare (the temp key, copied to the final key at publication),
 marked at-destination and `Fresh` and holding the lease: a native copy cannot fill an upload on the
-final key until C18, and every native copy over T would otherwise fail `Unsupported`; a native plan
+final key until C18 (C18 replaced this branch: see As built (C18)), and every native copy over T would
+otherwise fail `Unsupported`; a native plan
 keeps no recovery state, so nothing is recorded anywhere, and leftovers of an earlier streaming
 attempt on the key wait for that key's next streaming prepare. (2) A fresh upload writes its pointer
 at prepare only when it is `recoverable` **and** its known size exceeds the automatic interval (or is
@@ -461,11 +464,13 @@ falls back to the HEAD and claims none. `Direct` aborts first: an upload already
 could still be aborted never completed, so an identical earlier object still counts (C14c) but no
 version is claimed. The C15c rule for `final_destination_changed` is unchanged. Suspended versioning
 reports `"null"` (MinIO's completion reports no version at all): no `destination_version`. A native
-S3→S3 copy still goes through the temp key until C18; the temp key (this stage's alone) is now deleted
+S3→S3 copy still goes through the temp key until C18 (since C18 only with the switch off); the temp key
+(this stage's alone) is now deleted
 entry by entry as its version listing shows it — the `"null"` version and markers included, and
 nothing at all when the listing is empty — so no full-size copy stays behind a marker, and a `CopyObject` that succeeded
 reports the final key's current version (one LIST and one HEAD more per native publication, until
-C18). Still open: pointer versions and markers left before C17 stay hidden under their markers, and a
+C18, which writes the final key and reports the version its own `CopyObject` / completion returned). Still
+open: pointer versions and markers left before C17 stay hidden under their markers, and a
 single `PutObject` whose reply was lost still claims the HEAD's version (C14b). Verified on MinIO (VM 102) with `versioning_matrix.sh` in two temporary buckets (one
 versioned, one with Object Lock; both deleted afterwards, versions, markers, holds and uploads
 included; run three times, the last two after review fixes, with the same results): 4 MiB and 200 MiB checkpointed copies, `Direct`
@@ -478,6 +483,72 @@ matrix (200 MiB, 20 MiB/s, 6 s cut) resumed `Resumed { 75497472 }` after a cance
 hold placed on the pointer version during a 200 MiB copy left the transfer successful with its
 version, one warning and the pointer behind one marker; with versioning suspended every write path
 reported no version and left one `"null"` version.
+
+As built (C18, native S3→S3 to the final key): the engine's at-destination native branch no longer
+takes the destination's ephemeral prepare (the temp key). It asks the pair's destination endpoint
+(`NativeEndpoint::prepare_native`, crate-private) with a `DestinationPrepareRequest` — `Discover` for a
+`Checkpointed` copy, `Restart` otherwise, never `recoverable` — and the S3 endpoint prepares at the
+final key, reporting `Fresh`, `Resumed` or `Restarted` like a streamed prepare. The S3 protocol gains
+`copy_from` (`CopyObject` pinned by `x-amz-copy-source-if-match` to the bound `ETag` and, when the
+binding has one, `?versionId=`; reports the copy's `ETag` and version) and `upload_part_copy`
+(`UploadPartCopy` pinned the same way; returns the part's `ETag`). A source of at most 64 MiB is a
+single stage that records the source instead of bytes; before it only the pointer is looked at (a
+leftover is removed with the uploads on the key, as before a single `PutObject`), and publication is
+one `CopyObject` to the final key: a refusal the service answered before copying (a changed source is
+412 → `Conflict`, a gone one `NotFound`, access …) leaves the final key unchanged; any other failure is
+settled by HEAD — the source's size and `ETag` count as copied, otherwise the final key is reported
+changed. The fill counts that copy (its bytes and one request) — the engine takes native counts only
+from the fill — so a copy refused at publication still reports them. A larger source is an upload on
+the final key prepared through the same discovery as a streamed one: parts of `max(64 MiB,
+ceil(size / 10 000))` (5 GiB at most), filled with `UploadPartCopy`, `min(6, InflightLimits.operations)` in flight (the operation bound
+reaches the fill through `copy_into_stage`), and completed at
+publication by the streamed upload's code — fence, the C15c/C17
+rules for a failed or ambiguous completion (`ListObjectVersions`, version claimed), tags, pointer deleted
+by version, `AfterPublish` read-back pinned to the completion. The completion is **not** held to the
+composite of the part `ETag`s: those are the store's own, not MD5s computed here, so nothing proves
+they are MD5s (SSE-KMS), and a mismatch would fail a committed copy as `Corruption`; the read-back
+checks the content, and the composite still identifies our object when an ambiguous completion is
+settled (MinIO reports each copied part's MD5 and completes with their composite, measured). A
+`Checkpointed` copy of known size over
+the interval writes its pointer when the upload begins (the C16 rule), and its recovery turns on once
+the parts this fill copied reach the interval; an atomic one writes none and is never recoverable. A
+cancellation starts no more parts and waits for those in flight, so every copied part counts for the
+next attempt; a failed part fails the copy at once; the failure keeps the stage (discard: pointer by
+version, then abort). **Part sizes across routes**: a resume continues at the part size the pointer
+records, whichever route wrote it — a native copy continues a streamed upload with `UploadPartCopy`
+parts of 8 MiB (more requests, no client memory), a streamed attempt continues a native upload with
+64 MiB parts, with as many in flight as fit in the bytes of the four parts it would plan itself (at
+least one: 128 MiB in all, not 320 MiB; the writer's part buffers are outside `InflightLimits.bytes`,
+which its rustdoc now says); no route restarts over a part size, and the C15c open point (a
+native copy left an earlier streaming attempt's pointer and upload behind) is closed: a native prepare
+resumes what it may and cleans up the rest (`OtherTransfer`, `BindingChanged`, `Requested` for an atomic
+copy …). `EffectiveRecovery` still reports `NotApplicableNative`; `prepare` / `reused_bytes` say what was
+reused. Nothing in the at-destination native route reaches the temp key; the temp-key code (and its
+extra LIST + HEAD per publication) is reachable only with `recovery_at_destination` off, from tests, and
+goes in C19. The `CopyObject` sends `x-amz-metadata-directive` and `x-amz-tagging-directive` `REPLACE`
+with no metadata and no tags, so no copy carries the source's user metadata, content type or tags —
+as the `UploadPartCopy` and streamed routes carry none — and the destination's metadata does not depend
+on the size; tags the metadata plan asks for are set afterwards. MinIO accepts `REPLACE` without a
+content type and stores `binary/octet-stream`, as it does for the other routes (measured: a 4 MiB
+source stored with `text/plain`, `x-amz-meta-origin` and the tag `class=gold` gave a native copy with
+`binary/octet-stream`, no user metadata and no tag; a 200 MiB native copy after the change still
+compared equal). A 416 `InvalidRange`
+(the source no longer holds the range) is a permanent `Conflict`. Verified on MinIO (VM 102,
+`data-mover-test`, prefix `data-mover-c18-<ts>`, removed afterwards: 0 objects, 0 uploads): native
+copies of 4 MiB, 64 MiB, 65 MiB and 200 MiB (1, 1, 2, 4 native requests) each equal to the source
+(`--compare` BLAKE3) with nothing else left; with read-back off 200 MiB took 0.31 s and 1 GiB (16 parts)
+1.14 s, so an interruption must land within about a second: a 1 GiB copy cancelled at 300 ms had copied
+402653184 bytes (the six parts in flight finished) and left one pointer and one upload, and resumed
+`Resumed { 402653184 }` with ten more part copies; cancelled at 500 ms / 700 ms it resumed `Resumed {
+805306368 }`; SIGKILL at 0.8 s resumed `Resumed { 402653184 }` (at 0.6 s `Resumed { 0 }` — the upload and
+pointer but no part; at 0.45 s nothing had been prepared, `Fresh`), each equal to the source and leaving
+nothing. MinIO gives a `CopyObject` of an object uploaded in parts a new plain-MD5 `ETag` (source
+`"…-8"`, copy `"39d5…"`), as AWS does, so a lost `CopyObject` reply for such a source reports the final
+key changed; a single-part source keeps its `ETag`. `staged_matrix.sh`: the native k1 and m200 rows are
+`equal=yes stage_objects=0 key_uploads=0`. `versioning_matrix.sh` (temporary buckets, deleted): native
+4 MiB and 200 MiB each one version, no marker, no artifact, `destination_version` the latest; v1 then v2
+(100 MiB each) copied natively by `--source-version` gave two versions, newest first v2 then v1, each
+equal to its source version.
 
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process

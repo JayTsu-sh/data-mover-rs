@@ -17,9 +17,10 @@ use md5::{Digest as _, Md5};
 
 use super::super::source::{cancelled, classified_entry, entry, role_failure};
 use super::super::{
-    S3ObjectFacts, S3Protocol, S3ProtocolFailure, S3WriteFacts, is_real_version_id,
+    S3NativeCopySource, S3ObjectFacts, S3Protocol, S3ProtocolFailure, S3WriteFacts,
+    is_real_version_id,
 };
-use super::{PART_SIZE, S3StagedDestination};
+use super::{PART_SIZE, S3StagedDestination, native_final};
 use crate::model::{FailureClass, ObjectTag, Operation, StoragePath, Transience};
 use crate::storage::{
     ByteStream, MetadataMutation, PrepareRequest, PreparedStage, PublicationDisposition,
@@ -81,8 +82,12 @@ struct SingleState {
     written: Option<Bytes>,
     tags: Option<Vec<ObjectTag>>,
     published: Option<S3WriteFacts>,
-    /// A native copy filled this stage through the temp-key path instead (until C18).
+    /// A native copy filled this stage through the temp-key path instead (only with recovery at
+    /// the destination off; C19 removes it).
     native: bool,
+    /// The source a native copy publishes with one `CopyObject` instead of a `PutObject`
+    /// (ADR-0006 C18).
+    native_source: Option<S3NativeCopySource>,
 }
 
 impl SingleStage {
@@ -116,6 +121,25 @@ impl SingleStage {
         Ok((body, guard.tags.clone()))
     }
 
+    /// Publishes this stage with one `CopyObject` of `source` (ADR-0006 C18): nothing is sent
+    /// before publication.
+    pub(super) fn set_native_source(&self, source: S3NativeCopySource) {
+        self.lock().native_source = Some(source);
+    }
+
+    /// The tags waiting for the object.
+    pub(super) fn pending(&self) -> Option<Vec<ObjectTag>> {
+        self.lock().tags.clone()
+    }
+
+    /// Records what the write that published the object reported.
+    pub(super) fn record_published(&self, facts: S3WriteFacts) {
+        let mut guard = self.lock();
+        guard.published = Some(facts);
+        // The content is on the server now; verification reads it back from there.
+        guard.written = None;
+    }
+
     /// The source size the stage was prepared for.
     pub(super) fn expected_size(&self) -> u64 {
         self.expected_size
@@ -136,10 +160,11 @@ impl SingleStage {
     }
 
     pub(super) fn written_len(&self) -> u64 {
-        self.lock()
-            .written
-            .as_ref()
-            .map_or(0, |bytes| bytes.len() as u64)
+        let guard = self.lock();
+        match (&guard.native_source, &guard.written) {
+            (Some(source), _) => source.size,
+            (None, written) => written.as_ref().map_or(0, |bytes| bytes.len() as u64),
+        }
     }
 }
 
@@ -311,6 +336,10 @@ pub(super) async fn send<P: S3Protocol>(
     single: &SingleStage,
     expected_size: u64,
 ) -> Result<S3WriteFacts, PublicationFailure> {
+    let native = single.lock().native_source.clone();
+    if let Some(source) = native {
+        return native_final::send_copy(adapter, path, single, &source, expected_size).await;
+    }
     let (body, tags) = single.content(path, expected_size)?;
     let digest = Md5::digest(&body);
     let quoted_md5 = format!("\"{digest:x}\"");
@@ -332,10 +361,7 @@ pub(super) async fn send<P: S3Protocol>(
             .await
             .map_err(|failure| changed(role_failure(path, Operation::Publish, failure)))?;
     }
-    let mut guard = single.lock();
-    guard.published = Some(facts.clone());
-    // The content is on the server now; verification reads it back from there.
-    guard.written = None;
+    single.record_published(facts.clone());
     Ok(facts)
 }
 
@@ -490,14 +516,14 @@ pub(super) fn same_etag(left: &str, right: &str) -> bool {
         .eq_ignore_ascii_case(right.trim_matches('"'))
 }
 
-fn unchanged(error: StorageRoleFailure) -> PublicationFailure {
+pub(super) fn unchanged(error: StorageRoleFailure) -> PublicationFailure {
     PublicationFailure {
         error,
         final_destination_changed: false,
     }
 }
 
-fn changed(error: StorageRoleFailure) -> PublicationFailure {
+pub(super) fn changed(error: StorageRoleFailure) -> PublicationFailure {
     PublicationFailure {
         error,
         final_destination_changed: true,

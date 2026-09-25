@@ -19,9 +19,13 @@ use super::source::{cancelled, classified_entry, entry, role_failure};
 mod at_destination;
 mod completion;
 mod direct;
+mod final_upload;
 #[cfg(test)]
 mod manifest_tests;
 mod native;
+mod native_final;
+#[cfg(test)]
+mod native_final_tests;
 #[cfg(test)]
 mod native_tests;
 mod parts;
@@ -35,6 +39,7 @@ mod sizing_tests;
 mod upload_discovery;
 mod upload_pointer;
 use super::{S3Protocol, S3ProtocolFailure};
+use native_final::NativeSizing;
 use recovery::resumable_parts;
 pub(crate) use single::{DEFAULT_SINGLE_PUT_THRESHOLD, single_put_threshold};
 #[cfg(test)]
@@ -48,8 +53,18 @@ fn planned_part_size(
     size: Option<u64>,
     path: &crate::model::StoragePath,
 ) -> Result<usize, StorageRoleFailure> {
+    part_size_at_least(size, PART_SIZE as u64, path)
+}
+
+/// The part size for `size` bytes in at most 10 000 parts, and at least `minimum`; parts over
+/// 5 GiB are refused.
+fn part_size_at_least(
+    size: Option<u64>,
+    minimum: u64,
+    path: &crate::model::StoragePath,
+) -> Result<usize, StorageRoleFailure> {
     let size = size.unwrap_or(0);
-    let part = size.div_ceil(10_000).max(PART_SIZE as u64);
+    let part = size.div_ceil(10_000).max(minimum);
     if part > 5 * 1024 * 1024 * 1024 {
         return Err(entry(
             path,
@@ -87,6 +102,8 @@ pub(crate) struct S3StagedDestination<P> {
     /// The automatic checkpoint interval on the at-destination route: where a checkpointed upload
     /// writes its pointer.
     checkpoint_interval: u64,
+    /// How a native copy to the final key is split (ADR-0006 C18).
+    native: NativeSizing,
 }
 
 impl<P> S3StagedDestination<P> {
@@ -101,7 +118,18 @@ impl<P> S3StagedDestination<P> {
             recovery_at_destination: true,
             // Named in full: the architecture guard refuses imports between backend modules.
             checkpoint_interval: crate::storage::backends::DEFAULT_CHECKPOINT_INTERVAL_BYTES,
+            native: NativeSizing::default(),
         }
+    }
+
+    /// Smaller native copy sizes, so engine tests need not copy 64 MiB objects.
+    #[cfg(test)]
+    pub(crate) fn with_native_sizing(mut self, single_max: u64, part_size: u64) -> Self {
+        self.native = NativeSizing {
+            single_max,
+            part_size,
+        };
+        self
     }
 
     /// A shorter automatic checkpoint interval, so engine tests need not move 64 MiB.
@@ -480,6 +508,7 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
             key: &key,
             upload_id: &upload_id,
             part_size,
+            max_inflight: MAX_INFLIGHT_PARTS,
             checkpoint: None,
         };
         let parts = self

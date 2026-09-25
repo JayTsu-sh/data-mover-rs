@@ -234,55 +234,70 @@ async fn different_endpoint_affinity_falls_back_to_streaming() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn native_failure_retains_cleanup_authority_without_changing_final() -> TestResult {
+/// A small native copy whose one `CopyObject` (sent at publication, ADR-0006 C18) fails with
+/// `failure` before it copies anything; the failure, and the fake.
+async fn failed_small_native_copy(
+    failure: S3ProtocolFailure,
+) -> TestResult<(crate::transfer::TransferFailure, Arc<MemoryS3>)> {
     let protocol = Arc::new(MemoryS3::default());
     protocol
         .objects
         .lock()
         .await
         .insert("source".into(), Bytes::from_static(b"failure"));
-    *protocol.native_failure.lock().await = Some(S3ProtocolFailure::session(
-        FailureClass::Connectivity,
-        Transience::Transient,
-        "injected native failure",
-    ));
-    let source = connect(
-        protocol.clone(),
-        endpoint_of(&protocol),
-        Some(native_context()),
-    )?;
-    let destination = connect(
-        protocol.clone(),
-        endpoint_of(&protocol),
-        Some(native_context()),
-    )?;
+    *protocol.native_failure.lock().await = Some(failure);
+    let storage = || {
+        connect(
+            protocol.clone(),
+            endpoint_of(&protocol),
+            Some(native_context()),
+        )
+    };
     let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 2, None)?);
-
-    let Err(error) = transfer(request(source, destination)?.with_source_qos(qos)).await else {
+    let Err(error) = transfer(request(storage()?, storage()?)?.with_source_qos(qos)).await else {
         return Err("native failure unexpectedly succeeded".into());
     };
-
-    assert!(!error.has_recoverable_stage());
-    assert!(error.has_unpublished_stage());
-    assert!(!error.final_destination_changed());
-    assert_eq!(error.source_qos().native_bytes, 0);
+    // The copy was counted when the stage was filled; publication sent it.
     assert_eq!(error.source_qos().native_requests, 1);
     assert_eq!(error.source_qos().client_streamed_shaped_bytes, 7);
     assert_eq!(error.source_qos().source_read_operations, 4);
     assert!(!protocol.objects.lock().await.contains_key("final"));
-    error.discard_stage().await?;
-    // The small object's stage never had an upload: the discard aborts nothing and removes the
-    // temp key the copy was writing (reviewer HIGH: it used to abort an empty upload id).
-    assert_eq!(*protocol.aborts.lock().await, 0);
-    assert!(
-        !protocol
-            .objects
-            .lock()
-            .await
-            .keys()
-            .any(|key| key.starts_with(".data-mover-stage/"))
+    assert_eq!(*protocol.native_copies.lock().await, 0);
+    Ok((error, protocol))
+}
+
+/// A refusal the service answers before copying leaves the final key unchanged and the stage with
+/// the failure; its discard aborts nothing and leaves no artifact.
+#[tokio::test]
+async fn native_failure_retains_cleanup_authority_without_changing_final() -> TestResult {
+    let denied = S3ProtocolFailure::entry(
+        FailureClass::PermissionDenied,
+        Transience::Permanent,
+        "injected native refusal",
     );
+    let (error, protocol) = failed_small_native_copy(denied).await?;
+    assert!(!error.has_recoverable_stage());
+    assert!(error.has_unpublished_stage());
+    assert!(!error.final_destination_changed());
+    error.discard_stage().await?;
+    assert_eq!(*protocol.aborts.lock().await, 0);
+    let objects = protocol.objects.lock().await;
+    assert!(!objects.keys().any(|key| key.contains(".data-mover-")));
+    Ok(())
+}
+
+/// A transport failure (no answer) may have copied: with nothing of the source's size and `ETag`
+/// at the final key it cannot be settled, so the final key is reported changed.
+#[tokio::test]
+async fn an_unanswered_native_copy_reports_the_final_key_changed() -> TestResult {
+    let reset = S3ProtocolFailure::session(
+        FailureClass::Connectivity,
+        Transience::Transient,
+        "injected native failure",
+    );
+    let (error, _) = failed_small_native_copy(reset).await?;
+    assert!(error.final_destination_changed());
+    assert!(!error.has_unpublished_stage());
     Ok(())
 }
 
@@ -358,12 +373,11 @@ async fn native_binding_accepts_a_null_or_empty_version_id() -> TestResult {
     Ok(())
 }
 
-/// With recovery kept at the destination (ADR-0006 C15c), a native copy above the single-PUT
-/// threshold still goes to the temp key and is copied to the final key at publication — never
-/// through an upload on the final key, which a native copy cannot fill until C18. Nothing is
-/// left behind: no pointer, no staged object, no open upload.
+/// With recovery kept at the destination (ADR-0006 C18), a native copy above the single-PUT
+/// threshold but within the 64 MiB single-copy limit is one `CopyObject` to the final key at
+/// publication — no temp key, no upload, no pointer — whatever the policy.
 #[tokio::test]
-async fn a_native_copy_above_the_threshold_keeps_the_temp_key_path() -> TestResult {
+async fn a_native_copy_up_to_64_mib_is_one_copy_to_the_final_key() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let payload = Bytes::from((0..=250_u8).cycle().take(9 << 20).collect::<Vec<_>>());
     protocol
@@ -399,6 +413,7 @@ async fn a_native_copy_above_the_threshold_keeps_the_temp_key_path() -> TestResu
     }
     assert_eq!(*protocol.native_copies.lock().await, 2);
     assert_eq!(*protocol.puts.lock().await, 0);
+    assert_eq!(*protocol.multipart_begins.lock().await, 0);
     let open = protocol.list_uploads("final").await;
     assert!(open.is_ok_and(|uploads| uploads.is_empty()));
     let objects = protocol.objects.lock().await;

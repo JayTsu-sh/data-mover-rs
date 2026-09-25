@@ -48,6 +48,12 @@ pub(crate) struct MemoryS3 {
     pub(crate) copy_commits_then_fails: Mutex<bool>,
     pub(crate) native_copies: Mutex<u64>,
     pub(crate) native_failure: Mutex<Option<S3ProtocolFailure>>,
+    /// `UploadPartCopy` requests received, and the part whose copy cancels a token (see
+    /// [`memory_native`]).
+    pub(crate) part_copies: Mutex<u32>,
+    part_copies_active: Mutex<u32>,
+    pub(crate) part_copies_peak: Mutex<u32>,
+    cancel_on_part_copy: Mutex<Option<(i32, CancellationToken)>>,
     /// Stored versions by (key, version id); `None` is a delete marker.
     pub(crate) versions: Mutex<HashMap<(String, String), Option<Bytes>>>,
     /// The version id each tag read asked for.
@@ -632,6 +638,20 @@ impl S3Protocol for MemoryS3 {
             requests: 1,
         })
     }
+    async fn copy_from(&self, source: &S3NativeCopySource, to: &str) -> S3Result<S3WriteFacts> {
+        self.memory_copy_from(source, to).await
+    }
+    async fn upload_part_copy(
+        &self,
+        source: &S3NativeCopySource,
+        key: &str,
+        upload_id: &str,
+        number: i32,
+        range: Range<u64>,
+    ) -> S3Result<String> {
+        self.memory_upload_part_copy(source, (key, upload_id), number, range)
+            .await
+    }
     async fn delete_object(&self, key: &str) -> S3Result<()> {
         if !self.versioned_delete(key).await {
             self.objects.lock().await.remove(key);
@@ -699,71 +719,11 @@ pub(crate) fn native_context() -> S3NativeContext {
     S3NativeContext::new("memory://s3", "standard", "memory".into(), None)
 }
 
-/// A single PUT stores the body and reports what real S3 does: the quoted hex MD5 as `ETag`, and
-/// no version on an unversioned bucket.
-#[tokio::test]
-async fn memory_put_object_reports_md5_etag_and_no_version() {
-    let s3 = MemoryS3::default();
-    let body = Bytes::from_static(b"payload");
-    let facts = s3
-        .put_object("key", body.clone(), &content_md5(&body))
-        .await
-        .expect("put succeeds");
-    assert_eq!(facts.etag, "\"321c3cf486ed509164edec1e1981fec8\"");
-    assert_eq!(facts.version_id, None);
-    let head = s3.head("key").await.expect("object exists");
-    assert_eq!(head.etag, facts.etag);
-}
+#[path = "memory_tests.rs"]
+mod memory;
 
-/// On a versioned fake each PUT mints a new current version and reports it.
-#[tokio::test]
-async fn memory_put_object_on_a_versioned_fake_reports_a_new_version() {
-    let s3 = MemoryS3::default();
-    s3.put_version("key", "v1", Bytes::from_static(b"old"))
-        .await;
-    let body = Bytes::from_static(b"new");
-    let facts = s3
-        .put_object("key", body.clone(), &content_md5(&body))
-        .await
-        .expect("put succeeds");
-    let version = facts
-        .version_id
-        .expect("a versioned write reports its version");
-    assert_ne!(version, "v1");
-    assert_eq!(s3.version.lock().await.as_deref(), Some(version.as_str()));
-}
-
-/// A `Content-MD5` that does not match the body, or the injected corruption, is `BadDigest`: a
-/// transient `Corruption` of the entry, storing nothing. The injection covers one PUT only.
-#[tokio::test]
-async fn memory_put_object_refuses_a_bad_digest() {
-    let s3 = MemoryS3::default();
-    let body = Bytes::from_static(b"payload");
-    let expected = S3ProtocolFailure::corrupted_upload("S3 PutObject request failed");
-    let wrong = s3
-        .put_object("key", body.clone(), &content_md5(b"other"))
-        .await;
-    assert_eq!(wrong, Err(expected.clone()));
-    *s3.bad_digest_next_put.lock().await = true;
-    let injected = s3
-        .put_object("key", body.clone(), &content_md5(&body))
-        .await;
-    assert_eq!(injected, Err(expected));
-    assert!(s3.objects.lock().await.is_empty());
-    s3.put_object("key", body.clone(), &content_md5(&body))
-        .await
-        .expect("the injection covers one PUT");
-}
-
-/// Two uploads on one key get distinct ids.
-#[tokio::test]
-async fn memory_upload_ids_do_not_collide_on_one_key() {
-    let s3 = MemoryS3::default();
-    let first = s3.begin_multipart("key").await.expect("begin");
-    let second = s3.begin_multipart("key").await.expect("begin");
-    assert_ne!(first, second);
-    assert_eq!(s3.uploads.lock().await.len(), 2);
-}
+#[path = "memory_native.rs"]
+mod memory_native;
 
 #[path = "memory_versions.rs"]
 mod memory_versions;

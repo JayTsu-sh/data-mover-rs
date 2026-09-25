@@ -2,10 +2,12 @@ use super::guard::DestinationLease;
 use super::{
     Arc, CopiedMetadataPlan, NativePair, ReadSource, RecoveryContext, SequentialRanges,
     SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination, TransferFailure,
-    TransferPhase, TransferPlan, TransferRequest, TransferSide, Transferred, read_exact_range,
-    register_prepared_stage, select_stage,
+    TransferPhase, TransferPlan, TransferPolicy, TransferRequest, TransferSide, Transferred,
+    read_exact_range, register_prepared_stage, select_stage,
 };
-use crate::storage::{FinalDestination, PrepareFact, PrepareRequest, PreparedStage};
+use crate::storage::{
+    DestinationPrepareRequest, FinalDestination, PrepareRequest, PreparedStage, ResumeMode,
+};
 
 pub(super) fn eligible_native_pair(request: &TransferRequest) -> Option<NativePair> {
     if request.payload_shaping == super::super::PayloadShapingPolicy::RequireClientShaped {
@@ -62,28 +64,41 @@ async fn prepare_native_stage(
     }
 }
 
-/// The native route's stage for a destination that keeps its recovery state (ADR-0006 C15c):
-/// until a native copy can fill an upload on the final key (C18), it keeps the destination's
-/// ordinary ephemeral prepare — S3's temp key. A native plan keeps no recovery state, so nothing
-/// is recorded anywhere; the stage carries the per-file lease. Leftovers of an earlier streaming
-/// attempt on the key are left to that key's next streaming prepare.
+/// The native route's stage for a destination that keeps its recovery state (ADR-0006 C18): the
+/// destination's native endpoint prepares it at the final file, looking at what an earlier
+/// attempt — native or streamed — left there: a `Checkpointed` copy resumes an equal binding, any
+/// other policy cleans up and starts from zero. Nothing is recorded where data-mover runs; the
+/// stage carries the per-file lease.
 async fn prepare_at_destination(
     request: &TransferRequest,
     input: &NativeTransferInput,
     lease: DestinationLease,
 ) -> Result<PreparedStage, TransferFailure> {
+    let resume = if request.transfer_policy == TransferPolicy::Checkpointed {
+        ResumeMode::Discover
+    } else {
+        ResumeMode::Restart
+    };
+    let prepare = PrepareRequest {
+        final_destination: FinalDestination::new(request.final_path.clone()),
+        source: input.descriptor.clone(),
+        recovery_binding: input.recovery_binding,
+    };
     let mut stage = input
-        .destination
-        .prepare_ephemeral(PrepareRequest {
-            final_destination: FinalDestination::new(request.final_path.clone()),
-            source: input.descriptor.clone(),
-            recovery_binding: input.recovery_binding,
-        })
+        .pair
+        .prepare_native(
+            DestinationPrepareRequest::new(prepare, *request.identity.as_bytes())
+                .with_resume(resume)
+                .with_recoverable(false),
+        )
         .await
         .map_err(|error| {
             TransferFailure::role(TransferPhase::Prepare, TransferSide::Destination, error)
         })?;
-    stage.mark_at_destination(PrepareFact::Fresh);
+    if !stage.at_destination {
+        let fact = stage.prepare_fact;
+        stage.mark_at_destination(fact);
+    }
     stage.exclusive = Some(Box::new(lease));
     Ok(stage)
 }
@@ -116,7 +131,12 @@ pub(super) async fn transfer_native(
     let stage = prepare_native_stage(request, &mut input).await?;
     let native = match input
         .pair
-        .copy_into_stage(binding, &stage, request.cancel.clone())
+        .copy_into_stage(
+            binding,
+            &stage,
+            request.cancel.clone(),
+            request.inflight.operations,
+        )
         .await
     {
         Ok(native) => native,

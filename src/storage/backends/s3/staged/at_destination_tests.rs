@@ -6,8 +6,9 @@ use futures::stream;
 use tokio_util::sync::CancellationToken;
 
 use super::super::upload_discovery::contiguous_prefix;
+use super::super::upload_pointer::UploadRecord;
 use super::*;
-use crate::model::{EntryKind, IdentityStrength, SourceIdentity};
+use crate::model::{EntryKind, IdentityStrength, ObjectTag, SourceIdentity};
 use crate::storage::artifacts::{ArtifactKind, artifact_name};
 use crate::storage::backends::s3::S3PartFacts;
 use crate::storage::backends::s3::S3TagSupport;

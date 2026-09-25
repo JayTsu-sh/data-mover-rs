@@ -1072,7 +1072,8 @@ fn plan_request(
         request.transfer_policy == TransferPolicy::Checkpointed,
     )?;
     // S3's `pointer_before_checkpoint` mirrors when this arms the interval (a `Discover` prepare
-    // of a known size over it): keep the two in step.
+    // of a known size over it): keep the two in step. A native copy arms none; its S3 fill turns
+    // recovery on itself (ADR-0006 C18).
     if request.transfer_policy == TransferPolicy::Checkpointed
         && native_pair.is_none()
         && let Some(interval) = destination

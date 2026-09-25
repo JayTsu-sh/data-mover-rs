@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use super::{PreparedStage, StorageRoleFailure, WriteEvidence};
+use super::{DestinationPrepareRequest, PreparedStage, StorageRoleFailure, WriteEvidence};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct NativeAffinity([u8; 32]);
@@ -55,11 +55,22 @@ pub(crate) trait NativeEndpoint: Send + Sync {
         source: &super::SourceDescriptor,
     ) -> Result<NativeSourceBinding, StorageRoleFailure>;
 
+    /// Prepares the stage this endpoint's native copy fills, as a destination that keeps its
+    /// recovery state beside the final file (ADR-0006 C18): what is found there is resumed or
+    /// cleaned up, and the stage reports that fact.
+    async fn prepare_native(
+        &self,
+        request: DestinationPrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure>;
+
+    /// Copies `source` into `stage`, with at most `operations` copy requests in flight (the
+    /// transfer's `InflightLimits` operation bound).
     async fn copy_into_stage(
         &self,
         source: NativeSourceBinding,
         stage: &PreparedStage,
         cancel: CancellationToken,
+        operations: usize,
     ) -> Result<NativeStageEvidence, NativeStageFailure>;
 }
 
@@ -86,14 +97,23 @@ impl NativePair {
         self.source.bind_source(source).await
     }
 
+    /// The destination's [`NativeEndpoint::prepare_native`].
+    pub(crate) async fn prepare_native(
+        &self,
+        request: DestinationPrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        self.destination.prepare_native(request).await
+    }
+
     pub(crate) async fn copy_into_stage(
         &self,
         source: NativeSourceBinding,
         stage: &PreparedStage,
         cancel: CancellationToken,
+        operations: usize,
     ) -> Result<NativeStageEvidence, NativeStageFailure> {
         self.destination
-            .copy_into_stage(source, stage, cancel)
+            .copy_into_stage(source, stage, cancel, operations)
             .await
     }
 }

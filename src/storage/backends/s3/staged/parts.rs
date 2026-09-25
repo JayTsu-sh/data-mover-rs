@@ -15,7 +15,7 @@ use tokio::task;
 
 use super::super::source::{entry, role_failure};
 use super::super::{S3Protocol, S3ProtocolFailure};
-use super::{MAX_INFLIGHT_PARTS, S3StagedDestination, single};
+use super::{S3StagedDestination, single};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{ByteStream, StorageRoleFailure};
 
@@ -25,6 +25,8 @@ pub(super) struct PartTarget<'a> {
     pub(super) key: &'a str,
     pub(super) upload_id: &'a str,
     pub(super) part_size: usize,
+    /// Parts in flight at most (at least one); the writer also buffers the part being filled.
+    pub(super) max_inflight: usize,
     /// Reached once, as soon as the parts this call sent and the service acknowledged hold at
     /// least `.0` bytes.
     pub(super) checkpoint: Option<(u64, &'a dyn PartsCheckpoint)>,
@@ -90,7 +92,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                 let part = buffered.split_to(target.part_size).freeze();
                 inflight.push(self.upload_part_to(target, number, part));
                 number += 1;
-                if inflight.len() >= MAX_INFLIGHT_PARTS {
+                if inflight.len() >= target.max_inflight.max(1) {
                     let Some(completed) = inflight.next().await else {
                         return Err(entry(
                             target.path,

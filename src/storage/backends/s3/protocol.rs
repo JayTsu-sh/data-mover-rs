@@ -229,6 +229,21 @@ pub(crate) trait S3Protocol: Send + Sync {
     /// start with it (some stores list by prefix, `MinIO` by exact key).
     async fn list_uploads(&self, key: &str) -> S3Result<Vec<String>>;
     async fn copy_object(&self, from: &str, to: &str) -> S3Result<()>;
+    /// One `CopyObject` of `source` to `to` (ADR-0006 C18), pinned by
+    /// `x-amz-copy-source-if-match` to its `ETag` and, when it names one, to its version
+    /// (`?versionId=`). Reports the new object's `ETag` and version. A source that changed is a
+    /// permanent `Conflict` (412), one that is gone a `NotFound`.
+    async fn copy_from(&self, source: &S3NativeCopySource, to: &str) -> S3Result<S3WriteFacts>;
+    /// One `UploadPartCopy` of the bytes `range` of `source`, pinned as [`Self::copy_from`] pins
+    /// it, as part `part_number` of upload `upload_id` on `key`. Returns the part's `ETag`.
+    async fn upload_part_copy(
+        &self,
+        source: &S3NativeCopySource,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        range: Range<u64>,
+    ) -> S3Result<String>;
     async fn native_copy(
         &self,
         source: &S3NativeCopySource,

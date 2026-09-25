@@ -12,9 +12,10 @@ use tokio_util::sync::CancellationToken;
 use crate::model::{FailureClass, StoragePath, Transience};
 use crate::storage::PrepareFact;
 use crate::storage::artifacts::{ArtifactKind, is_artifact_path, sibling_artifact};
-use crate::storage::backends::s3::tests::{MemoryS3, Versioning, endpoint_of, native_context};
+use crate::storage::backends::s3::tests::{MemoryS3, Versioning, endpoint_of};
 use crate::storage::backends::s3::{
-    S3Protocol as _, S3ProtocolFailure, S3VersionFacts, connect, connect_at_destination,
+    S3Protocol as _, S3ProtocolFailure, S3VersionFacts, connect_at_destination,
+    connect_native_at_destination,
 };
 use crate::transfer::{
     InflightLimits, SourceVersion, TransferOutcome, TransferPolicy, TransferRequest, TransferRoute,
@@ -146,34 +147,97 @@ async fn every_write_path_reports_the_version_it_made() -> TestResult {
     Ok(())
 }
 
-/// A native S3→S3 copy (until ADR-0006 C18 through the temp key, copied to the final key at
-/// publication) reports the version the copy made, and deletes every version of its temp key by
-/// id: no full-size temp version or delete marker is left in a versioned bucket.
+/// A native S3→S3 request to `final_key` (ADR-0006 C18) whose destination copies up to one part
+/// with `CopyObject` and anything larger with `UploadPartCopy` parts of `PART`.
+fn native(protocol: &Arc<MemoryS3>, final_key: &str) -> TestResult<TransferRequest> {
+    let storage = || {
+        connect_native_at_destination(
+            protocol.clone(),
+            endpoint_of(protocol),
+            INTERVAL as u64,
+            (PART as u64, PART as u64),
+        )
+    };
+    Ok(TransferRequest::new(
+        storage()?,
+        StoragePath::new("source")?,
+        storage()?,
+        StoragePath::new(final_key)?,
+        InflightLimits::new(4, 4 * MIB, 4)?,
+        CancellationToken::new(),
+    ))
+}
+
+/// A native S3→S3 copy goes to the final key (ADR-0006 C18) — one `CopyObject`, or an upload
+/// filled with `UploadPartCopy` — and reports the version it made, the key's only one: no temp
+/// key, no pointer version, no delete marker.
 #[tokio::test]
 async fn a_native_copy_reports_its_version_and_leaves_no_temp_version() -> TestResult {
     for size in [1024, 3 * PART] {
         let data = payload(size, 11);
         let protocol = bucket(Versioning::Enabled, &[("s1", &data)]).await;
-        let storage = || {
-            connect(
-                protocol.clone(),
-                endpoint_of(&protocol),
-                Some(native_context()),
-            )
-        };
-        let request = TransferRequest::new(
-            storage()?,
-            StoragePath::new("source")?,
-            storage()?,
-            StoragePath::new("native")?,
-            InflightLimits::new(4, 4 * MIB, 4)?,
-            CancellationToken::new(),
-        );
-        let outcome = transfer(request).await?;
+        let outcome = transfer(native(&protocol, "native")?).await?;
         assert_eq!(outcome.route, TransferRoute::Native, "{size}");
-        assert_eq!(*protocol.native_copies.lock().await, 1, "{size}");
+        let (copies, parts) = if size > PART { (0, 3) } else { (1, 0) };
+        assert_eq!(*protocol.native_copies.lock().await, copies, "{size}");
+        assert_eq!(*protocol.part_copies.lock().await, parts, "{size}");
         clean_versions(&protocol, "native", 1, Some(version(&outcome)?)).await?;
     }
+    Ok(())
+}
+
+/// Stored versions copied natively by id, oldest first — the large one part by part, the small
+/// one in one copy — arrive as two versions in that order, each holding its source version; an
+/// interrupted native copy by id resumes into one version.
+#[tokio::test]
+async fn native_copies_by_id_arrive_in_order_and_resume_into_one_version() -> TestResult {
+    let (v1, v2) = (payload(3 * PART, 12), payload(PART / 2, 13));
+    let protocol = bucket(Versioning::Enabled, &[("s1", &v1), ("s2", &v2)]).await;
+    let by_id = |key: &str, id: &str| {
+        native(&protocol, key)
+            .map(|request| request.with_source_version(SourceVersion::Id(id.into())))
+    };
+    let mut made = Vec::new();
+    for id in ["s1", "s2"] {
+        let outcome = transfer(by_id("history", id)?).await?;
+        assert_eq!(outcome.route, TransferRoute::Native);
+        made.push(version(&outcome)?.to_string());
+    }
+    clean_versions(&protocol, "history", 2, Some(&made[1])).await?;
+    assert_eq!(entries(&protocol, "history").await?[1].version_id, made[0]);
+    assert_eq!(
+        stored(&protocol, "history", &made[0]).await,
+        Some(v1.clone())
+    );
+    assert_eq!(
+        stored(&protocol, "history", &made[1]).await,
+        Some(v2.clone())
+    );
+
+    let outcome = cut_then_resume(&protocol, by_id("cut", "s1")?, by_id("cut", "s1")?).await?;
+    let resumed = version(&outcome)?.to_string();
+    clean_versions(&protocol, "cut", 1, Some(&resumed)).await?;
+    assert_eq!(stored(&protocol, "cut", &resumed).await, Some(v1));
+    Ok(())
+}
+
+/// The bytes stored as version `id` of `key`.
+async fn stored(protocol: &MemoryS3, key: &str, id: &str) -> Option<Bytes> {
+    let versions = protocol.versions.lock().await;
+    versions.get(&(key.to_string(), id.to_string())).cloned()?
+}
+
+/// A native multipart copy whose completion reply is lost claims the version it made, as a
+/// streamed one does.
+#[tokio::test]
+async fn an_ambiguous_native_completion_claims_the_version_it_made() -> TestResult {
+    let data = payload(3 * PART, 14);
+    let protocol = bucket(Versioning::Enabled, &[("s1", &data)]).await;
+    *protocol.complete_commits_then_fails.lock().await = true;
+    let outcome = transfer(native(&protocol, "ambiguous-native")?).await?;
+    assert_eq!(outcome.route, TransferRoute::Native);
+    assert_eq!(*protocol.completes.lock().await, 1);
+    clean_versions(&protocol, "ambiguous-native", 1, Some(version(&outcome)?)).await?;
     Ok(())
 }
 

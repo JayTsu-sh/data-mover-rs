@@ -55,7 +55,7 @@ async fn multipart_native_failure_retains_upload_for_discard_retry() -> TestResu
     let adapter = S3StagedDestination::new(protocol.clone(), identity());
     let stage = adapter.prepare(native_prepare()?).await?;
     let Err(failure) = adapter
-        .fill_native(&stage, native_source(), CancellationToken::new())
+        .fill_native(&stage, native_source(), CancellationToken::new(), 6)
         .await
     else {
         return Err("multipart native failure unexpectedly succeeded".into());
@@ -76,7 +76,10 @@ async fn multipart_native_cancellation_keeps_abort_authority() -> TestResult {
     let stage = adapter.prepare(native_prepare()?).await?;
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let Err(failure) = adapter.fill_native(&stage, native_source(), cancel).await else {
+    let Err(failure) = adapter
+        .fill_native(&stage, native_source(), cancel, 6)
+        .await
+    else {
         return Err("cancelled multipart native copy succeeded".into());
     };
     assert_eq!(failure.native_bytes, 0);

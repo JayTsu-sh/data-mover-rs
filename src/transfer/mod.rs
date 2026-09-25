@@ -32,6 +32,8 @@ mod s3_at_destination_tests;
 #[cfg(test)]
 mod s3_direct_tests;
 #[cfg(test)]
+mod s3_native_final_tests;
+#[cfg(test)]
 mod s3_native_tests;
 #[cfg(test)]
 mod s3_single_put_tests;

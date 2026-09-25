@@ -95,6 +95,13 @@ impl RecoveryContext {
 }
 
 /// Explicit chunk, payload-byte, and source-operation admission bounds.
+///
+/// `operations` also caps the server-side copy requests a native copy keeps in flight (S3
+/// `UploadPartCopy`, at most six). `bytes` bounds what the engine reads ahead; a destination
+/// writer's own part buffers are outside it: an S3 multipart writer buffers the part it fills plus
+/// up to four in flight — 8 MiB parts by default, larger for objects over 80 GiB — and a streamed
+/// resume of a native S3 copy's upload uses that upload's 64 MiB parts, with as many in flight as
+/// fit in the four default-sized ones (at least one: 128 MiB in all).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InflightLimits {
     pub(crate) chunks: usize,

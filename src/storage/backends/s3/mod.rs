@@ -100,6 +100,33 @@ where
     )
 }
 
+/// S3 roles able to copy natively (the in-memory native context) with `checkpoint_interval` as the
+/// automatic interval and a native copy split as `native` says — (single-copy limit, part size) —
+/// instead of 64 MiB each (ADR-0006 C18).
+#[cfg(test)]
+pub(crate) fn connect_native_at_destination<P>(
+    protocol: Arc<P>,
+    identity: BackendIdentity,
+    checkpoint_interval: u64,
+    native: (u64, u64),
+) -> Result<Storage, Box<dyn std::error::Error>>
+where
+    P: S3Protocol + 'static,
+{
+    connect_roles(
+        protocol,
+        identity,
+        Some(tests::native_context()),
+        S3TagSupport::Supported,
+        Some(DEFAULT_SINGLE_PUT_THRESHOLD),
+        |staged| {
+            staged
+                .with_checkpoint_interval(checkpoint_interval)
+                .with_native_sizing(native.0, native.1)
+        },
+    )
+}
+
 fn connect_roles<P>(
     protocol: Arc<P>,
     identity: BackendIdentity,

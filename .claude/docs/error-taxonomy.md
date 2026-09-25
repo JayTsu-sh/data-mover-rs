@@ -79,6 +79,7 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | `BadDigest`（收到的 body 与 `Content-MD5` 不符，传输中损坏；ADR-0006 C14a） | 条目 `Corruption` / **Transient** —— 重发即可（`S3ProtocolFailure::corrupted_upload`） |
 | `InvalidDigest`（`Content-MD5` 头本身格式错，是我们的请求错） | 条目 `InvalidInput` / Permanent —— 重发同样失败 |
 | `InvalidPart` / `InvalidPartOrder`（Complete 的分段表与服务端持有的分段不符或乱序；ADR-0006 C15a） | 条目 `Conflict` / Permanent —— 同一分段表重发不会变 |
+| 412 `PreconditionFailed`（`copy-source-if-match` / `If-Match` 不符）、409；416 `InvalidRange`（`UploadPartCopy` / 读取的范围源里已没有：源缩短或被替换；ADR-0006 C18） | 条目 `Conflict` / Permanent —— 源变了，重发不会变 |
 | `EntityTooSmall`（非最后一段小于 5 MiB 最小分段；C15a） | 条目 `Corruption` / Permanent —— 分段本身错了 |
 | **带 versionId 的** HEAD / GET 返回 405（该版本是删除标记）；`Current` 在版本化桶上也会钉成 versionId，所以普通读也属此类 | 条目 `NotFound` / Permanent |
 | **带 versionId 的** GET 返回 400 且错误码 `InvalidArgument`（versionId 格式错） | 条目 `InvalidInput` / Permanent |

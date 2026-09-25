@@ -361,6 +361,21 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         native::copy(self, source, to, multipart_upload_id, cancel).await
     }
 
+    async fn copy_from(&self, source: &S3NativeCopySource, to: &str) -> S3Result<S3WriteFacts> {
+        native::copy_from(self, source, to).await
+    }
+
+    async fn upload_part_copy(
+        &self,
+        source: &S3NativeCopySource,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        range: std::ops::Range<u64>,
+    ) -> S3Result<String> {
+        native::upload_part_copy(self, source, key, upload_id, part_number, range).await
+    }
+
     async fn delete_object(&self, key: &str) -> crate::storage::backends::s3::S3Result<()> {
         self.client
             .delete_object()
@@ -544,7 +559,7 @@ pub(super) fn s3_role_remote_failure(
             Transience::Permanent,
             diagnostic,
         ),
-        (Some(409 | 412), _) => crate::storage::backends::s3::S3ProtocolFailure::entry(
+        (Some(409 | 412 | 416), _) => crate::storage::backends::s3::S3ProtocolFailure::entry(
             FailureClass::Conflict,
             Transience::Permanent,
             diagnostic,

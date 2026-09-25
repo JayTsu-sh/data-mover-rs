@@ -23,23 +23,23 @@
 //! is settled through the key's versions, claiming the version it made (see
 //! [`completion`](super::completion)).
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use super::super::source::{cancelled, classified_entry, entry, role_failure};
 use super::super::{S3Protocol, S3ProtocolFailure, S3WriteFacts, composite_etag};
 use super::completion::completed_object;
 use super::direct::is_composite;
-use super::parts::{PartTarget, PartsCheckpoint, UploadedParts};
+use super::final_upload::FinalUpload;
+pub(super) use super::final_upload::of;
+use super::parts::{PartTarget, PartsCheckpoint};
 use super::upload_discovery::{S3Artifacts, leftover_reason};
-use super::upload_pointer::{self, NONCE_BYTES, UploadRecord, pointer_path};
+use super::upload_pointer::{self, pointer_path};
 use super::{S3StagedDestination, cleanup_result, metadata_unavailable, planned_part_size, single};
-use crate::model::{FailureClass, ObjectTag, Operation, StoragePath, Transience};
+use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::discovery::discover;
 use crate::storage::pointer::{DestinationPointer, MAX_POINTER_BYTES};
 use crate::storage::{
@@ -47,132 +47,6 @@ use crate::storage::{
     PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
     ResumeMode, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
-
-/// A multipart upload on the final key, kept at the destination.
-pub(super) struct FinalUpload {
-    upload_id: String,
-    part_size: usize,
-    /// The source's size, when known: a different byte count is never completed.
-    expected_size: Option<u64>,
-    transfer_identity: [u8; 32],
-    nonce: [u8; NONCE_BYTES],
-    pointer: StoragePath,
-    /// Whether this stage wrote its pointer; a pointer gone after that was removed by another
-    /// writer.
-    pointer_written: AtomicBool,
-    state: Mutex<UploadState>,
-}
-
-#[derive(Default)]
-struct UploadState {
-    /// Every part the completion names (number, `ETag`): the resumed prefix, then what `write`
-    /// sent.
-    parts: Vec<(i32, String)>,
-    /// Whether every part `write` sent came back with its MD5 as `ETag`; `None` when it sent none.
-    /// The parts of one upload share its encryption, so the resumed prefix answers the same way.
-    md5_etags: Option<bool>,
-    /// The bytes the parts hold once `write` finished.
-    written: Option<u64>,
-    /// Tags to set once the object exists.
-    tags: Option<Vec<ObjectTag>>,
-    /// What the completion reported.
-    published: Option<S3WriteFacts>,
-    /// The version this stage's pointer write reported (`"null"` included), which deleting it
-    /// names; `None` in an unversioned bucket — or when a resume could not delete the version it
-    /// replaced, so that a plain delete hides both behind a marker.
-    pointer_version: Option<String>,
-    /// Contents no pointer version may keep once ours is deleted: ours, and a replaced one's.
-    stale_pointers: Vec<Vec<u8>>,
-}
-
-impl FinalUpload {
-    fn new(
-        request: &DestinationPrepareRequest,
-        upload_id: String,
-        part_size: u64,
-        pointer: StoragePath,
-    ) -> Result<Self, StorageRoleFailure> {
-        let path = request.prepare.final_destination.path();
-        Ok(Self {
-            upload_id,
-            part_size: usize::try_from(part_size)
-                .map_err(|_| failure(path, Operation::Prepare, FailureClass::Unsupported))?,
-            expected_size: request.prepare.source.size,
-            transfer_identity: request.transfer_identity,
-            nonce: *Uuid::new_v4().as_bytes(),
-            pointer,
-            pointer_written: AtomicBool::new(false),
-            state: Mutex::new(UploadState::default()),
-        })
-    }
-
-    fn lock(&self) -> MutexGuard<'_, UploadState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn pointer_written(&self) -> bool {
-        self.pointer_written.load(Ordering::Acquire)
-    }
-
-    /// Records what `write` sent: `size` bytes in all, which must be the source's size when it is
-    /// known.
-    fn record_written(
-        &self,
-        path: &StoragePath,
-        sent: UploadedParts,
-        resumed_parts: usize,
-        size: u64,
-    ) -> Result<(), StorageRoleFailure> {
-        if self.expected_size.is_some_and(|expected| expected != size) {
-            return Err(classified_entry(
-                path,
-                Operation::Write,
-                FailureClass::InvalidInput,
-                Transience::Permanent,
-                "the S3 upload input differs from the source's size",
-            ));
-        }
-        let mut state = self.lock();
-        state.md5_etags = (sent.parts.len() > resumed_parts).then_some(sent.md5_etags);
-        state.parts = sent.parts;
-        state.written = Some(size);
-        Ok(())
-    }
-
-    /// Records the pointer this stage wrote: the version its write reported and its bytes.
-    fn record_pointer(&self, version: Option<String>, bytes: Vec<u8>) {
-        let mut state = self.lock();
-        state.pointer_version = version;
-        state.stale_pointers.push(bytes);
-    }
-
-    /// Records the pointer a resume replaced. When its version could not be deleted, deleting
-    /// ours by version would make it current again: ours is then hidden behind a delete marker.
-    fn forget_replaced(&self, bytes: Vec<u8>, deleted: bool) {
-        let mut state = self.lock();
-        state.stale_pointers.push(bytes);
-        if !deleted {
-            state.pointer_version = None;
-        }
-    }
-
-    fn extension(&self) -> Option<Bytes> {
-        UploadRecord {
-            nonce: self.nonce,
-            part_size: self.part_size as u64,
-            upload_id: self.upload_id.clone(),
-        }
-        .encode()
-    }
-}
-
-/// The upload on the final key `stage` is, if it is one.
-pub(super) fn of(stage: &PreparedStage) -> Option<&FinalUpload> {
-    stage
-        .backend_state
-        .as_deref()?
-        .downcast_ref::<FinalUpload>()
-}
 
 /// Whether the pointer is still this stage's.
 enum Fence {
@@ -267,9 +141,24 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         let pointer = pointer_path(&path)?;
         let size = request.prepare.source.size;
         if let Some(size) = size.filter(|size| self.is_single_put(Some(*size))) {
-            return self.prepare_small(request, size, &pointer).await;
+            let fact = self.clear_leftover(&request, &pointer).await?;
+            let mut stage = self.prepare_single(request.prepare, size);
+            stage.mark_at_destination(fact);
+            return Ok(stage);
         }
         let part_size = planned_part_size(size, &path)?;
+        self.prepare_final_upload(request, part_size, pointer).await
+    }
+
+    /// A multipart upload on the final key with parts of `part_size` bytes: the one discovery
+    /// found, resumed at the part size its pointer records, or a new one.
+    pub(super) async fn prepare_final_upload(
+        &self,
+        request: DestinationPrepareRequest,
+        part_size: usize,
+        pointer: StoragePath,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        let path = request.prepare.final_destination.path().clone();
         let artifacts = S3Artifacts::new(&*self.protocol, &path, &pointer, &request);
         let found = discover(&artifacts, &request).await?;
         let Some(point) = found.resume else {
@@ -302,30 +191,26 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         Ok(stage)
     }
 
-    /// A single stage (ADR-0006 C14b). Only the pointer is looked at — no listing, for cost: a
-    /// leftover one is removed with the uploads on the key, and the prepare reports the restart.
-    async fn prepare_small(
+    /// Before an object written in one request (a single `PutObject`, C14b, or one `CopyObject`,
+    /// C18) only the pointer is looked at — no listing, for cost: a leftover one is removed with
+    /// the uploads on the key, and the prepare reports the restart.
+    pub(super) async fn clear_leftover(
         &self,
-        request: DestinationPrepareRequest,
-        size: u64,
+        request: &DestinationPrepareRequest,
         pointer: &StoragePath,
-    ) -> Result<PreparedStage, StorageRoleFailure> {
+    ) -> Result<PrepareFact, StorageRoleFailure> {
         let path = request.prepare.final_destination.path();
-        let fact =
-            match upload_pointer::read(&*self.protocol, pointer, MAX_POINTER_BYTES + 1).await? {
-                None => PrepareFact::Fresh,
-                Some(found) => {
-                    let reason = leftover_reason(&request, &found.bytes);
-                    let stale = [found.bytes.as_slice()];
-                    let version = found.version.as_deref();
-                    upload_pointer::delete(&*self.protocol, pointer, version, &stale).await?;
-                    upload_pointer::abort_uploads(&*self.protocol, path, None).await?;
-                    PrepareFact::Restarted { reason }
-                }
-            };
-        let mut stage = self.prepare_single(request.prepare, size);
-        stage.mark_at_destination(fact);
-        Ok(stage)
+        let Some(found) =
+            upload_pointer::read(&*self.protocol, pointer, MAX_POINTER_BYTES + 1).await?
+        else {
+            return Ok(PrepareFact::Fresh);
+        };
+        let reason = leftover_reason(request, &found.bytes);
+        let stale = [found.bytes.as_slice()];
+        let version = found.version.as_deref();
+        upload_pointer::delete(&*self.protocol, pointer, version, &stale).await?;
+        upload_pointer::abort_uploads(&*self.protocol, path, None).await?;
+        Ok(PrepareFact::Restarted { reason })
     }
 
     fn upload_stage(
@@ -408,10 +293,11 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
 
     /// Whether an upload that is not recoverable yet still writes its pointer at once: a
     /// resumable one of known size over the automatic interval — the one the engine arms a
-    /// deferred checkpoint for (`plan_request` in `transfer/engine.rs`; keep the two in step). A crash (a killed container) before that checkpoint then leaves an
-    /// upload the next prepare resumes from its listed parts, instead of up to one interval of
-    /// parts without a pointer, which it could only abort. Recovery still turns on at the
-    /// checkpoint: a failure or cancellation before it discards the upload and the pointer.
+    /// deferred checkpoint for (`plan_request` in `transfer/engine.rs`; keep the two in step), and a
+    /// `Checkpointed` native copy, whose fill turns recovery on at the interval (ADR-0006 C18). A
+    /// crash before that checkpoint then leaves an upload the next prepare resumes from its listed
+    /// parts, instead of parts without a pointer, which it could only abort. Recovery still turns
+    /// on at the checkpoint: a failure or cancellation before it discards the upload and pointer.
     fn pointer_before_checkpoint(&self, request: &DestinationPrepareRequest) -> bool {
         request.resume == ResumeMode::Discover
             && request
@@ -499,6 +385,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             key: path.as_str(),
             upload_id: &upload.upload_id,
             part_size: upload.part_size,
+            max_inflight: upload.streamed_inflight(),
             checkpoint,
         };
         let sent = self.upload_parts(&target, prefix, input).await?;

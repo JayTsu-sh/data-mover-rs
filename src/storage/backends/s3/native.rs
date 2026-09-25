@@ -6,8 +6,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{BackendIdentity, FailureClass, Operation, Transience};
 use crate::storage::{
-    NativeAffinity, NativeEndpoint, NativeSourceBinding, NativeStageEvidence, NativeStageFailure,
-    SourceDescriptor, StorageRoleFailure,
+    DestinationPrepareRequest, NativeAffinity, NativeEndpoint, NativeSourceBinding,
+    NativeStageEvidence, NativeStageFailure, PreparedStage, SourceDescriptor, StorageRoleFailure,
 };
 
 use super::source::{classified_entry, entry, object_identity, role_failure};
@@ -105,11 +105,20 @@ impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
         })
     }
 
+    /// One `CopyObject` or an upload on the final key (ADR-0006 C18).
+    async fn prepare_native(
+        &self,
+        request: DestinationPrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        self.staged.prepare_native_stage(request).await
+    }
+
     async fn copy_into_stage(
         &self,
         source: NativeSourceBinding,
-        stage: &crate::storage::PreparedStage,
+        stage: &PreparedStage,
         cancel: CancellationToken,
+        operations: usize,
     ) -> Result<NativeStageEvidence, NativeStageFailure> {
         if source.affinity != self.context.affinity {
             return Err(stage_failure(stage, "native pair affinity changed"));
@@ -119,7 +128,9 @@ impl<P: S3Protocol + 'static> NativeEndpoint for S3NativeEndpoint<P> {
         if native.size != source.size {
             return Err(stage_failure(stage, "native source size changed"));
         }
-        self.staged.fill_native(stage, native, cancel).await
+        self.staged
+            .fill_native(stage, native, cancel, operations)
+            .await
     }
 }
 
@@ -194,7 +205,7 @@ fn take_string(token: &mut Bytes) -> Result<String, ()> {
     String::from_utf8(token.copy_to_bytes(length).to_vec()).map_err(|_| ())
 }
 
-fn stage_failure(stage: &crate::storage::PreparedStage, diagnostic: &str) -> NativeStageFailure {
+fn stage_failure(stage: &PreparedStage, diagnostic: &str) -> NativeStageFailure {
     NativeStageFailure {
         error: entry(
             stage.final_destination.path(),

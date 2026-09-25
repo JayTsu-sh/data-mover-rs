@@ -16,7 +16,9 @@
 //!
 //! `--source-version <versionId>` copies one stored version of an S3 source; the selector is part of
 //! the derived identity, so a resume must repeat it. `--client-shaped` streams an S3→S3 copy instead
-//! of copying it natively (a native copy is not resumable until ADR-0006 C18).
+//! of copying it natively; a native copy goes to the final key and a checkpointed one over 64 MiB
+//! resumes like a streamed one (ADR-0006 C18). `native_bytes` / `native_requests` count what the
+//! server copied (a resumed copy counts only what it added).
 //!
 //! With `RUST_LOG` set, the library's tracing (warnings included) goes to stderr.
 //!
@@ -214,6 +216,8 @@ fn report(result: &Result<TransferOutcome, TransferFailure>, elapsed_ms: u128) -
             "read_back": format!("{:?}", outcome.read_back),
             "source_streamed_bytes": outcome.source_qos.client_streamed_shaped_bytes,
             "source_read_operations": outcome.source_qos.source_read_operations,
+            "native_bytes": outcome.source_qos.native_bytes,
+            "native_requests": outcome.source_qos.native_requests,
         }),
         Err(failure) => json!({
             "result": "failed",
@@ -224,6 +228,8 @@ fn report(result: &Result<TransferOutcome, TransferFailure>, elapsed_ms: u128) -
             "recoverable_stage": failure.has_recoverable_stage(),
             "source_streamed_bytes": failure.source_qos().client_streamed_shaped_bytes,
             "source_read_operations": failure.source_qos().source_read_operations,
+            "native_bytes": failure.source_qos().native_bytes,
+            "native_requests": failure.source_qos().native_requests,
         }),
     }
 }
