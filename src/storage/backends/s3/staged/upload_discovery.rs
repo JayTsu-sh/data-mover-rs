@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use super::super::source::role_failure;
 use super::super::{S3PartFacts, S3Protocol, S3ProtocolFailure};
-use super::upload_pointer::{self, StoredPointer, UploadRecord, accepted};
+use super::upload_pointer::{self, Removal, StoredPointer, UploadRecord, accepted};
 use crate::model::{FailureClass, Operation, StoragePath};
 use crate::storage::discovery::DestinationArtifacts;
 use crate::storage::pointer::DestinationPointer;
@@ -66,6 +66,8 @@ pub(super) struct S3Artifacts<'a, P> {
     /// The pointer `read_pointer` found (bytes and version), whether accepted or not: a clean-up
     /// deletes exactly that version, and a resume deletes it once its own pointer replaced it.
     found_pointer: Mutex<Option<StoredPointer>>,
+    /// The bytes of the pointer `remove_pointer` had to leave in place (Object Lock).
+    held: Mutex<Option<Vec<u8>>>,
 }
 
 /// What discovery left for a resume: the accepted pointer's upload record, that pointer as read
@@ -91,7 +93,17 @@ impl<'a, P> S3Artifacts<'a, P> {
             found: Mutex::new(None),
             prefix: Mutex::new(Vec::new()),
             found_pointer: Mutex::new(None),
+            held: Mutex::new(None),
         }
+    }
+
+    /// The bytes of a leftover pointer the clean-up could not remove: Object Lock holds it and
+    /// the store refused a delete marker too. The new upload's fence treats it as no pointer.
+    pub(super) fn held_pointer(&self) -> Option<Vec<u8>> {
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// What discovery left: what a resume continues.
@@ -177,18 +189,27 @@ impl<P: S3Protocol> DestinationArtifacts for S3Artifacts<'_, P> {
         }
     }
 
+    /// Removes the pointer read; one Object Lock keeps in place (the store refuses a delete
+    /// marker too) is left there with a warning and remembered (see [`Self::held_pointer`]), so
+    /// a held leftover does not stop every later transfer of the key.
     async fn remove_pointer(&self, _final_path: &StoragePath) -> Result<(), StorageRoleFailure> {
         let Some(found) = self.found_pointer() else {
-            return upload_pointer::delete(self.protocol, self.pointer, None, &[]).await;
+            return upload_pointer::delete(self.protocol, self.pointer, None, &[])
+                .await
+                .map(drop);
         };
         let stale = [found.bytes.as_slice()];
-        upload_pointer::delete(
+        let removal = upload_pointer::delete(
             self.protocol,
             self.pointer,
             found.version.as_deref(),
             &stale,
         )
-        .await
+        .await?;
+        if removal == Removal::Held {
+            *self.held.lock().unwrap_or_else(PoisonError::into_inner) = Some(found.bytes);
+        }
+        Ok(())
     }
 
     async fn remove_stage(&self, _final_path: &StoragePath) -> Result<(), StorageRoleFailure> {

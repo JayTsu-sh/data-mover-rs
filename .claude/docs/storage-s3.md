@@ -285,8 +285,21 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   （未开版本的桶）→ 仍是普通 DeleteObject。
 - **Object Lock**：删指针版本被拒（`PermissionDenied`：legal hold / retention，或策略只给 DeleteObject 不给
   DeleteObjectVersion）、存储不支持按版本删（`Unsupported`）、或拒绝它自己报的 `"null"`（`InvalidInput`）→
-  `tracing::warn!`，改发普通 DeleteObject 用删除标记盖住它；传输照常成功并报版本，下次 prepare 看不到指针。标记也发不
-  出去才算失败。
+  `tracing::warn!`，改发普通 DeleteObject 用删除标记盖住它；传输照常成功并报版本，下次 prepare 看不到指针。
+  **标记也被拒**（`PermissionDenied`：Ceph RGW / DXN 在当前版本有 legal hold 时连普通 DELETE 也回 403 `AccessDenied`，
+  2026-09-25 实测；AWS / MinIO 加标记）→ 再一条告警，指针**留在原处**（`upload_pointer::Removal::Held`），调用方照常
+  继续：发布报版本、discard 照样 abort（删指针的其他失败也先 abort 再报错）、小对象 / 原生单拷贝的 `clear_leftover` 直接继续
+  （single stage 没有指针栅栏）、discovery 清遗留时把它的字节记下（`S3Artifacts::held_pointer`），新 upload 的
+  `FinalUpload.held_pointer` 让栅栏在自己写指针前把「恰好是这份字节的指针」当成没有指针（不是别人接管）—— 否则不写指针的
+  upload（原子 / 不可续）发布时会报 `Conflict`，这个 key 以后每次都卡住。之后该 key 每次 prepare 都会看到它
+  （`PointerWithoutStage`，多几个请求 + 告警），直到 hold 撤掉后被清掉。桶策略同时拒绝 `DeleteObjectVersion` 与
+  `DeleteObject`（同样 403）也落到这里：每次传输都留一个指针版本、各一条告警，越积越多 —— 看到这条告警先查权限。栅栏
+  例外只认**那份字节**且只在本 stage 写指针之前：别人盖在上面的指针、或我们写过之后它又变回当前（我们的被别人删了）
+  都照旧是接管（`a_held_leftover_excuses_no_take_over`）。不带版本的普通删除（未开版本的桶）失败照旧是失败。
+- **发布后删不掉指针只告警**（DXN 修复，2026-09-25）：Complete 成功（或结果不明但已认领）之后，删自己的指针**任何**失败
+  （锁、断连、5xx）都只 `tracing::warn!`，传输照常报已发布与版本 —— 对象已提交，报失败会让重试再加一个版本；留下的指针
+  （upload 已没了）下次 prepare 按 `PointerWithoutStage` 清。以前是 `changed` 失败：DXN 的锁行因此报
+  `Publish failed … Namespace failed at .data-mover-….upload (PermissionDenied, Permanent)`，而最终 key 已写好。
 - **最终 key 从不发普通 DELETE**：审计过所有路径，只有 artifact（指针；C19 前还有 temp key）会被普通删除。`MemoryS3` 记录每个
   普通删除，`plain_deletes_of_final_keys()` 在所有版本化测试里断言为空（`the_fake_records_plain_deletes_of_final_keys`
   证明这个断言有效）。
@@ -307,6 +320,9 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   发布多一个 LIST + 一个 HEAD（C18 的最终 key 路径没有这两个请求：版本取自 CopyObject / Complete 的回复）。
 - 未解决：C17 之前留下的指针版本 + 标记都在标记下面，不清理。单 PUT 丢回复的对账（C14b）仍认领 HEAD 的版本，内容相同
   的旧对象也会被认领（后续可比照分段改成列版本）。
+- `MemoryS3` 另有（DXN 修复）：`lock_refuses_delete_markers()`（当前版本被扣时普通删除也回 `PermissionDenied`）、
+  `delete_failure`（删某 key 一律失败）、`copy_omits_version`（CopyObject 回复不带版本）、`version_lists`（ListObjectVersions
+  计数）；普通删除在被拒之前就记进 `plain_deletes`，`plain_deletes_of_final_keys()` 也看得到被拒的。
 - `MemoryS3` 版本化模式（`memory_versions.rs`）：`set_versioning(Enabled | Suspended)`、每 key 有序的版本与标记、
   `delete_version` / `list_versions`、`lock_versions(key)`（按版本删被拒、普通删允许）、`version_deletes()`、
   `keys_with_versions()`、`written_after_lost_completion`（丢回复的 Complete 之后另一个写者覆盖）。
@@ -337,6 +353,19 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - 协议新增：`copy_from(source, to)` = `CopyObject`，`x-amz-copy-source-if-match` 钉 ETag、有版本就带 `?versionId=`，
   返回副本的 `ETag` + 版本；`upload_part_copy(source, key, upload_id, n, range)` = `UploadPartCopy`，同样钉住，返回段 ETag。
   源变了 → 412 → `Conflict`；源没了 → `NotFound`。
+- **`UploadPartCopy` 带 `Content-Length: 0`**（所有 profile，2026-09-25）：SDK 对没有 body 的请求不发长度（hyper 对空
+  body 不加），Ceph RGW（DXN）把 `UploadPartCopy` 当分段上传处理、要求声明长度，缺了回 `411 MissingContentLength` ——
+  DXN 上每个 > 64 MiB 的原生拷贝都因此失败。`copy_part` 用 `customize().mutate_request` 加上它（RFC 9110：PUT 应带长度；
+  MinIO 实测接受）。`CopyObject` 不加：RGW 另走一条路，缺长度照样接受（DXN 实测）。wire 测试
+  `role_protocol::native::tests::copies_pin_the_source_and_copy_no_metadata` 断言两者。legacy `multipart_rename` 的
+  `UploadPartCopy` 没改（在 DXN 上大概率同样 411，未验证）。
+- **`CopyObject` 回复不带版本**（DXN：版本化桶里也不回 `x-amz-version-id`，2026-09-25 实测）：`send_copy` 在回复
+  **没有版本头**（`reported_version` 为 `None`，不是 `"null"`）且连接时桶的版本状态是 `Enabled`
+  （`S3Protocol::versioning_enabled`，即 `S3Storage.is_bucket_versioned`）时，按 C17 结算结果不明 Complete 的办法认领：
+  ListObjectVersions 该 key，**最新**条目是版本且大小 + 副本回复的 ETag 对上 → 报它的版本；认领不到（列不出、不是最新）
+  → 告警、不报版本（拷贝本身成功）。只在这种情况下多一个 LIST：AWS / MinIO 回版本头、暂停版本回 `"null"`、未开版本的桶
+  都不多发请求。残余风险同 C17：另一个写者紧接着写入相同内容会被认领（调用约定排除）；存储的列表落后于拷贝时，
+  同一源较早拷到这个 key 的相同版本会被认领（字节相同，只是版本可能旧）。
 - **≤ 64 MiB**：single stage 记下源（不缓冲字节）；prepare 只看指针（有遗留 → 删指针 + abort key 上的 upload，
   `Restarted{..}`），发布 = 一次 `CopyObject` 到最终 key，再设待设 tags。提交前的明确拒绝 → 最终 key 未变；其他失败 →
   HEAD：大小与**源的** ETag 都对算已拷，否则报已变。MinIO（与 AWS 一样）给分段上传出来的源的副本一个新的普通 MD5 ETag，
@@ -383,6 +412,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   0.45 s：还没 prepare，`Fresh`），都相等、无遗留。`staged_matrix.sh` 原生 k1 / m200 `equal=yes stage_objects=0
   key_uploads=0`；`versioning_matrix.sh` 原生 4 / 200 MiB 各 1 版本 0 标记 0 artifact，按 id 原生拷 v1、v2（各 100 MiB）
   两个版本按序、各与源版本相同，临时桶已删。
+- 真机 DXN：见「DXN（Ceph RGW Octopus）实测行为」。
 
 ### 删除 temp-key 路径（ADR-0006 C19，破坏性）
 
@@ -553,6 +583,32 @@ Complete 成功后再 Complete → 404 NoSuchUpload；`If-Match` 对分段 ETag�
 单 PUT 上限 5 GiB；版本控制下最后一个 Complete 成为当前版本，`GET ?versionId=` 读到指定版本；
 `ListMultipartUploads` 列出的 upload id 是签发的 base64url(`<deployment>.<uuid>`) 里的裸 uuid（C15c）。
 
+### DXN（Ceph RGW Octopus）实测行为（2026-09-25）
+
+`versioning_matrix.sh` 在 DXN 临时桶（`BUCKET_PREFIX=data-mover-dxn`，`S3_LOCATION=magnascale:tos_placement`，见 e2e-s3
+SKILL.md）上跑出来的差异，以及各自的处理：
+
+| 行为 | MinIO / AWS | DXN | 处理 |
+|---|---|---|---|
+| `UploadPartCopy` 不带 `Content-Length` | 接受 | `411 MissingContentLength` | 一律带 `Content-Length: 0`（见 C18 节） |
+| `CopyObject` 不带 `Content-Length` | 接受 | 接受 | 不改 |
+| 版本化桶里 `CopyObject` 的回复 | 带 `x-amz-version-id` | **不带** | 回复没版本且桶开了版本 → 列版本认领（见 C18 节） |
+| legal hold 下删指针版本 | 拒（403 / MinIO 400 WORM） | 403 `AccessDenied` | 告警，改发普通 DELETE |
+| legal hold 下普通 DELETE（当前版本被扣） | 加删除标记 | **403 `AccessDenied`** | 告警，指针留在原处，传输照常（见 C17 节） |
+| 带 Object Lock 建桶 | 同时开版本 | **不开版本**（`ObjectLockEnabled=Enabled`，版本 off） | 矩阵脚本检测到后自己开版本 |
+| 重试一个仍在完成中的 `CompleteMultipartUpload` | MinIO 404 `NoSuchUpload` | 500 `InternalError`「This multipart completion is already in progress」 | 会话 `Connectivity` / Transient：不是提交前的拒绝 → `ListParts`；还列得到 → 报已变 + transient（C15c） |
+| 完成后 `ListParts` | MinIO 404 `NoSuchUpload` | 404 `NoSuchKey` | 同为 `NotFound` → 按版本结算（C17）；单测 `dxn_answers_to_a_completion_in_progress_and_after_it` |
+| `x-amz-server-side-encryption: aws:kms` 不给 key id | （AWS 用默认 key） | 403 `InvalidAccessKeyId` | 只记录：DXN 上用 SSE-KMS 必须给 `x-amz-server-side-encryption-aws-kms-key-id` |
+
+修复后 DXN 真机（临时桶 `data-mover-dxn-1790336656` 与 `-lock-`，跑完已删，DXN 上只剩 `data-mover-test`）：矩阵全部通过 ——
+流式 / Direct / 原生 4 MiB 与 200 MiB 各 1 版本、0 标记、0 artifact、`destination_version` = 最新；按 id 拷 v1、v2（流式与
+原生）按序、各与源相同；按 id 3 s 取消后 `Resumed { 8388608 }`、1 版本；续传矩阵 cancel `Resumed { 75497472 }`、SIGKILL
+`Resumed { 33554432 }`，BLAKE3 相等；锁行 `result=ok` 带版本、2 条告警、0 标记、1 个 artifact（被扣住的指针版本）；暂停版本
+`destination_version=null`。
+
+其他 DXN 限制（UploadPartCopy 源 key 字符、CreateMultipartUpload 丢 tagging、DeleteObjects 要 Content-MD5）见 README
+「Known DXN limitations」。
+
 ## 已知陷阱
 
 | 陷阱 | 应对 |
@@ -561,6 +617,8 @@ Complete 成功后再 Complete → 404 NoSuchUpload；`If-Match` 对分段 ETag�
 | Multipart 失败留垃圾 | 必须 abort |
 | MinIO 列出的 upload id 与签发的写法不同 | 比较 upload id 用 `upload_pointer::same_upload`，别逐字节比 |
 | 自签证书 ECS endpoint 失败 | 用 `s3+https://` (而不是 `https` 显式) |
+| Ceph RGW / DXN 对无 body 的 `UploadPartCopy` 回 411 | 显式 `Content-Length: 0`（`role_protocol/native.rs`） |
+| DXN 版本化桶的 `CopyObject` 不回版本 | 桶开了版本且回复无版本 → 列版本认领（`native_final::settle_copy_version`） |
 | `bucket.host` 解析错误 (path-style vs virtual-hosted) | 检查 endpoint 是否支持 virtual-hosted |
 | URL 中的 `:` 在 secret 里被切错 | secret 必须 percent-encode |
 | 把 MinIO 的 `NextKeyMarker`（`p/z[minio_cache:v2,return:]`）当 key 用 | 续页 token / marker 只原样回传（C20 / C22） |

@@ -16,7 +16,9 @@
 //! checkpoint; both are two writers of one key, which the caller contract excludes.
 //!
 //! Publication completes the upload; nothing is written to the final key before it, and the final
-//! key is never deleted. Verification reads the object back after publication.
+//! key is never deleted. Once the upload completed, failing to delete the pointer is a warning
+//! (the next prepare of the key cleans it up). Verification reads the object back after
+//! publication.
 //!
 //! In a versioned bucket (ADR-0006 C17) the pointer is deleted by the version its write reported,
 //! a resume deletes the version of the pointer it replaced, and a completion whose reply was lost
@@ -39,7 +41,7 @@ use super::parts::{PartTarget, PartsCheckpoint};
 use super::upload_discovery::{S3Artifacts, leftover_reason};
 use super::upload_pointer::{self, pointer_path};
 use super::{S3StagedDestination, cleanup_result, metadata_unavailable, planned_part_size, single};
-use crate::model::{FailureClass, Operation, StoragePath, Transience};
+use crate::model::{FailureClass, ObjectTag, Operation, StoragePath, Transience};
 use crate::storage::discovery::discover;
 use crate::storage::pointer::{DestinationPointer, MAX_POINTER_BYTES};
 use crate::storage::{
@@ -162,8 +164,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         let artifacts = S3Artifacts::new(&*self.protocol, &path, &pointer, &request);
         let found = discover(&artifacts, &request).await?;
         let Some(point) = found.resume else {
+            let held = artifacts.held_pointer();
             return self
-                .start_upload(&request, part_size, pointer, found.fact)
+                .start_upload(&request, part_size, pointer, found.fact, held)
                 .await;
         };
         let left = artifacts.into_found();
@@ -238,13 +241,15 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     /// Begins a new upload on the final key (discovery aborted any other). A recoverable stage
     /// over the automatic interval writes its pointer at once, and so does a resumable one of
     /// known size over it (ADR-0006 C16); any other at its first deferred checkpoint, if it has
-    /// one.
+    /// one. `held` is a leftover pointer Object Lock kept in place (see
+    /// [`FinalUpload::held_pointer`]).
     async fn start_upload(
         &self,
         request: &DestinationPrepareRequest,
         part_size: usize,
         pointer: StoragePath,
         fact: PrepareFact,
+        held: Option<Vec<u8>>,
     ) -> Result<PreparedStage, StorageRoleFailure> {
         let path = request.prepare.final_destination.path();
         let upload_id = self
@@ -252,7 +257,8 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             .begin_multipart(path.as_str())
             .await
             .map_err(|error| role_failure(path, Operation::Prepare, error))?;
-        let upload = FinalUpload::new(request, upload_id, part_size as u64, pointer)?;
+        let mut upload = FinalUpload::new(request, upload_id, part_size as u64, pointer)?;
+        upload.held_pointer = held;
         let mut stage = self.upload_stage(request, upload, 0, fact);
         if !self.pointer_at_prepare(request) {
             stage = stage.disable_recovery();
@@ -313,6 +319,13 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         Ok(match found {
             None if upload.pointer_written() => Fence::TakenOver,
             None => Fence::Ours { pointer: false },
+            // The leftover Object Lock kept in place: no pointer of anyone's, until ours is written.
+            Some(stored)
+                if !upload.pointer_written()
+                    && upload.held_pointer.as_deref() == Some(stored.bytes.as_slice()) =>
+            {
+                Fence::Ours { pointer: false }
+            }
             Some(stored)
                 if DestinationPointer::decode(&stored.bytes)
                     .is_ok_and(|found| Some(found.extension) == upload.extension()) =>
@@ -464,20 +477,39 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             .complete_final_upload(path, upload, &parts, md5_etags, request.expected_size)
             .await?;
         upload.lock().published = Some(facts.clone());
+        self.finish_published(path, upload, tags, pointer).await?;
+        Ok(PublicationEvidence {
+            final_destination: path.clone(),
+            disposition: PublicationDisposition::Published,
+            version: facts.version_id,
+        })
+    }
+
+    /// After the completion: sets the pending tags (a failure reports the final key changed), then
+    /// deletes the pointer, when this stage has one. The object is committed, so failing to delete
+    /// the pointer is only a warning: the pointer, its upload gone, is cleaned up by the key's next
+    /// prepare, and failing now would have a retry add another version.
+    async fn finish_published(
+        &self,
+        path: &StoragePath,
+        upload: &FinalUpload,
+        tags: Option<Vec<ObjectTag>>,
+        pointer: bool,
+    ) -> Result<(), PublicationFailure> {
         if let Some(tags) = tags {
             self.protocol
                 .put_tags(path.as_str(), &tags)
                 .await
                 .map_err(|error| changed(role_failure(path, Operation::Publish, error)))?;
         }
-        if pointer {
-            self.delete_own_pointer(upload).await.map_err(changed)?;
+        if pointer && let Err(error) = self.delete_own_pointer(upload).await {
+            tracing::warn!(
+                pointer = %upload.pointer.as_str(),
+                ?error,
+                "could not delete the S3 upload pointer after publishing; the next prepare of the key cleans it up"
+            );
         }
-        Ok(PublicationEvidence {
-            final_destination: path.clone(),
-            disposition: PublicationDisposition::Published,
-            version: facts.version_id,
-        })
+        Ok(())
     }
 
     /// `CompleteMultipartUpload` with every part. When every part this stage sent came back with
@@ -569,7 +601,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     }
 
     /// Removes the pointer, then aborts the upload — only while the pointer is still this
-    /// stage's: a taken-over upload is the other writer's now. The final key is never touched.
+    /// stage's: a taken-over upload is the other writer's now. A pointer that cannot be deleted
+    /// does not stop the abort (a held one is no failure at all, another failure is reported
+    /// after the abort). The final key is never touched.
     pub(super) async fn discard_final_upload(
         &self,
         stage: &PreparedStage,
@@ -578,20 +612,28 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         let Fence::Ours { pointer } = self.fence(upload).await? else {
             return Ok(());
         };
-        if pointer {
-            self.delete_own_pointer(upload).await?;
-        }
+        // The upload is aborted even when the pointer could not be deleted; that failure is
+        // still reported.
+        let removed = if pointer {
+            self.delete_own_pointer(upload).await.map(drop)
+        } else {
+            Ok(())
+        };
         let path = stage.final_destination.path();
         cleanup_result(
             path,
             self.protocol
                 .abort_multipart(path.as_str(), &upload.upload_id)
                 .await,
-        )
+        )?;
+        removed
     }
 
     /// Deletes the pointer this stage wrote, by the version its write reported (ADR-0006 C17).
-    async fn delete_own_pointer(&self, upload: &FinalUpload) -> Result<(), StorageRoleFailure> {
+    async fn delete_own_pointer(
+        &self,
+        upload: &FinalUpload,
+    ) -> Result<upload_pointer::Removal, StorageRoleFailure> {
         let (version, stale) = {
             let state = upload.lock();
             (state.pointer_version.clone(), state.stale_pointers.clone())

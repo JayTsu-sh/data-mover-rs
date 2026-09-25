@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::S3WriteFacts;
 use super::super::source::{cancelled, classified_entry, role_failure};
 use super::super::{S3NativeCopyEvidence, S3NativeCopySource, S3Protocol, S3ProtocolFailure};
+use super::completion::completed_object;
 use super::final_upload::FinalUpload;
 use super::native::{NativeFillFailure, native_role_failure};
 use super::parts::UploadedParts;
@@ -299,7 +300,7 @@ pub(super) async fn send_copy<P: S3Protocol>(
         )));
     }
     let facts = match adapter.protocol.copy_from(source, path.as_str()).await {
-        Ok(facts) => facts,
+        Ok(facts) => settle_copy_version(&*adapter.protocol, path, source.size, facts).await,
         Err(failure) if single::definite_refusal(&failure) => {
             return Err(unchanged(role_failure(path, Operation::Publish, failure)));
         }
@@ -319,4 +320,36 @@ pub(super) async fn send_copy<P: S3Protocol>(
     }
     single.record_published(facts.clone());
     Ok(facts)
+}
+
+/// The version a `CopyObject` made when its reply named none although the bucket has versioning
+/// enabled (DXN's Ceph RGW sends no `x-amz-version-id` for a copy): settled as an ambiguous
+/// completion is (ADR-0006 C17) — the key's **latest** version, when it has our size and the
+/// `ETag` the copy returned, is claimed. Under the caller contract (one writer per key) nothing
+/// was written after the copy; a later identical write by another writer would be claimed too.
+/// The same holds for an identical earlier copy of the same source to the key if the store's
+/// listing lags behind the copy: the bytes are ours either way, only the version may be older.
+/// Only then is anything asked: a reply that names a version (AWS, `MinIO`), or `"null"`
+/// (suspended), or an unversioned bucket costs no request. When none can be claimed (the
+/// listing fails or its latest entry is not the copy) the copy still succeeded, and is reported
+/// without a version.
+async fn settle_copy_version<P: S3Protocol>(
+    protocol: &P,
+    path: &StoragePath,
+    size: u64,
+    facts: S3WriteFacts,
+) -> S3WriteFacts {
+    if facts.reported_version.is_some() || !protocol.versioning_enabled() {
+        return facts;
+    }
+    match completed_object(protocol, path, size, &facts.etag, true).await {
+        Some(settled) if settled.version_id.is_some() => settled,
+        _ => {
+            tracing::warn!(
+                path = %path.as_str(),
+                "the S3 CopyObject reply named no version and none could be claimed from the key's versions; reporting none"
+            );
+            facts
+        }
+    }
 }

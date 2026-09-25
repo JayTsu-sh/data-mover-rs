@@ -597,6 +597,40 @@ and the temp key's delete by version (C17), the temp-key native copy (`S3Protoco
 `recovery_identity` and `recover` answer `Unsupported`. Temp keys left before C15c, and their uploads,
 are not cleaned up automatically (`.claude/docs/storage-s3.md` says how to remove them).
 
+As built (DXN follow-up to C17 / C18, 2026-09-25): C17 and C18 had been verified on MinIO only. On DXN
+(Ceph RGW Octopus 15.2.13) `versioning_matrix.sh` found three gaps, now fixed. (1) RGW handles
+`UploadPartCopy` as a part upload that must state its length, and the SDK sends no `Content-Length`
+for a request without a body: every native copy over 64 MiB failed with `411 MissingContentLength`.
+`UploadPartCopy` now always sends `Content-Length: 0` (RFC 9110; MinIO accepts it); `CopyObject`, which
+RGW accepts without a length, is unchanged. (2) RGW's `CopyObject` reply carries no `x-amz-version-id`
+even in a versioned bucket, so a native copy up to 64 MiB reported no `destination_version`. When a copy
+reply names no version and the bucket had versioning enabled at connect time
+(`S3Protocol::versioning_enabled`), the version is settled as an ambiguous completion is: the key's
+latest version, if it has our size and the copy's `ETag`, is claimed (one `ListObjectVersions`; replies
+that name a version, `"null"`, and unversioned buckets cost nothing more; same residual risk as the
+completion settlement). (3) Under a legal hold RGW refuses the delete by version **and** the plain
+`DeleteObject` (403 `AccessDenied`) that C17 falls back to, so the transfer failed at publication
+although the final key was written. The rule stated above — a lock refusal on a pointer is a warning — now
+holds there too: a pointer the store will not hide behind a marker is left in place with a warning
+(`Removal::Held`); after the upload completed, any failure to delete the pointer is a warning (the object
+is committed, and failing would have a retry add a version); discard still aborts the upload; discovery
+leaves a held leftover in place and remembers its bytes, and the new upload's fence treats exactly that
+pointer as none until it writes its own, so a held leftover does not wedge later transfers of the key
+(each prepare of the key sees it, as `PointerWithoutStage`, until the hold is lifted). Also seen on DXN
+and classified without change: a retried `CompleteMultipartUpload` still completing answers 500
+`InternalError` (a transient session failure: not a refusal before commit, so `ListParts` decides) and
+`ListParts` after completion answers 404 `NoSuchKey` (`NotFound`, like `NoSuchUpload`: settled through
+the versions); creating a bucket with Object Lock leaves versioning off; SSE `aws:kms` without a key id is
+refused (403 `InvalidAccessKeyId`). Verified on DXN (temporary buckets `data-mover-dxn-<run>` and
+`data-mover-dxn-lock-<run>`, deleted afterwards; only `data-mover-test` remains): every row of
+`versioning_matrix.sh` passed — streamed, `Direct` and native 4 MiB / 200 MiB copies one version each,
+no marker, no artifact, `destination_version` the latest; v1 then v2 by `--source-version`, streamed
+and native, two versions in order, each equal to its source; an `Id` copy cancelled at 3 s resumed
+`Resumed { 8388608 }` into one version; the resume matrix resumed `Resumed { 75497472 }` after a
+cancellation and `Resumed { 33554432 }` after a SIGKILL, BLAKE3 equal; the Object Lock row succeeded with
+its version, two warnings and the held pointer version left in place (no marker); suspended versioning
+reported no version.
+
 As built (C21, breaking): the local recovery store is gone — `src/transfer/recovery_store.rs`
 (`<binding>.state` records with the `Publishing` state, `<binding>.lock` leases,
 `.lease-namespace.lock`, rooted at `DATA_MOVER_RECOVERY_DIR` → `XDG_STATE_HOME` → `HOME`) and

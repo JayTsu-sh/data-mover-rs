@@ -28,6 +28,10 @@ pub(super) struct FinalUpload {
     /// Whether this stage wrote its pointer; a pointer gone after that was removed by another
     /// writer.
     pub(super) pointer_written: AtomicBool,
+    /// The bytes of a leftover pointer discovery could not remove — Object Lock holds it and the
+    /// store refuses a delete marker too (Ceph RGW / DXN). Until this stage writes its own, a
+    /// pointer holding exactly these bytes fences as no pointer, not as another writer's.
+    pub(super) held_pointer: Option<Vec<u8>>,
     pub(super) state: Mutex<UploadState>,
 }
 
@@ -77,6 +81,7 @@ impl FinalUpload {
             nonce: *Uuid::new_v4().as_bytes(),
             pointer,
             pointer_written: AtomicBool::new(false),
+            held_pointer: None,
             state: Mutex::new(UploadState::default()),
         })
     }

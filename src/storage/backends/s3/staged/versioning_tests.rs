@@ -307,6 +307,163 @@ async fn a_locked_pointer_is_hidden_behind_a_delete_marker() -> TestResult {
     Ok(())
 }
 
+/// Ceph RGW (DXN) under a legal hold refuses both the delete by version and the delete marker.
+/// Our pointer's version held so: publication still succeeds and reports the version it made,
+/// leaving the pointer (a warning). The key's next transfer finds that pointer without its upload,
+/// leaves it in place, and publishes on top of it: every later transfer of the key still works.
+#[tokio::test]
+async fn a_pointer_held_against_markers_does_not_fail_publication() -> TestResult {
+    let protocol = versioned();
+    protocol.lock_refuses_delete_markers();
+    let destination = destination(&protocol);
+    let data = payload(3 * PART);
+    let request = || request(data.len(), BINDING, ResumeMode::Discover, true);
+    let stage = destination.prepare_at_destination(request()?).await?;
+    let ours = listed(&protocol, &pointer_key()).await?;
+    assert_eq!(ours.len(), 1);
+    protocol.lock_version(&pointer_key(), &ours[0].0);
+    destination.write(&stage, chunks(&data)).await?;
+    let evidence = publish_and_verify(&destination, &stage, &data).await?;
+    let finals = listed(&protocol, FINAL).await?;
+    assert_eq!(evidence.version, Some(finals[0].0.clone()));
+    assert_eq!(
+        listed(&protocol, &pointer_key()).await?,
+        ours,
+        "held, no marker"
+    );
+    assert!(uploads(&protocol).await?.is_empty());
+
+    let stage = destination.prepare_at_destination(request()?).await?;
+    assert_eq!(
+        stage.prepare_fact(),
+        PrepareFact::Restarted {
+            reason: RestartReason::PointerWithoutStage
+        }
+    );
+    destination.write(&stage, chunks(&data)).await?;
+    let evidence = publish_and_verify(&destination, &stage, &data).await?;
+    let finals = listed(&protocol, FINAL).await?;
+    assert_eq!(finals.len(), 2);
+    assert_eq!(evidence.version, Some(finals[0].0.clone()));
+    // Ours went by version; the held leftover is current again, and nothing else is there.
+    assert_eq!(listed(&protocol, &pointer_key()).await?, ours);
+    assert!(uploads(&protocol).await?.is_empty());
+    assert!(protocol.plain_deletes_of_final_keys().is_empty());
+    Ok(())
+}
+
+/// Once the upload completed, any failure to delete the pointer (here a dropped connection) is a
+/// warning: the transfer reports the version it made, and the key's next prepare cleans up the
+/// pointer left without its upload.
+#[tokio::test]
+async fn a_pointer_that_cannot_be_deleted_after_completion_is_a_warning() -> TestResult {
+    let protocol = versioned();
+    let destination = destination(&protocol);
+    let data = payload(3 * PART);
+    let request = || request(data.len(), BINDING, ResumeMode::Discover, true);
+    let stage = destination.prepare_at_destination(request()?).await?;
+    destination.write(&stage, chunks(&data)).await?;
+    let reset =
+        S3ProtocolFailure::session(FailureClass::Connectivity, Transience::Transient, "reset");
+    *protocol.delete_failure.lock().await = Some((pointer_key(), reset));
+    let evidence = publish_and_verify(&destination, &stage, &data).await?;
+    assert_eq!(
+        evidence.version,
+        Some(listed(&protocol, FINAL).await?[0].0.clone())
+    );
+    assert!(pointer(&protocol).await.is_some(), "left behind");
+    *protocol.delete_failure.lock().await = None;
+    let stage = destination.prepare_at_destination(request()?).await?;
+    assert_eq!(
+        stage.prepare_fact(),
+        PrepareFact::Restarted {
+            reason: RestartReason::PointerWithoutStage
+        }
+    );
+    destination.discard(stage).await?;
+    assert_eq!(protocol.keys_with_versions(), [FINAL.to_string()]);
+    Ok(())
+}
+
+/// A held leftover pointer that cannot be removed is not another writer's: a new upload that
+/// writes no pointer of its own (a restart, not recoverable) still publishes over it, and a
+/// discard whose own pointer is held too still aborts its upload.
+#[tokio::test]
+async fn a_held_leftover_pointer_fences_as_no_pointer() -> TestResult {
+    let protocol = versioned();
+    protocol.lock_refuses_delete_markers();
+    protocol.lock_versions(&pointer_key());
+    put_pointer(&protocol, [9; 32], record("gone")?).await?;
+    let leftover = listed(&protocol, &pointer_key()).await?;
+    let destination = destination(&protocol);
+    let data = payload(3 * PART);
+    let restart = request(data.len(), BINDING, ResumeMode::Restart, false)?;
+    let stage = destination.prepare_at_destination(restart).await?;
+    destination.write(&stage, chunks(&data)).await?;
+    let evidence = publish_and_verify(&destination, &stage, &data).await?;
+    assert_eq!(
+        evidence.version,
+        Some(listed(&protocol, FINAL).await?[0].0.clone())
+    );
+    assert_eq!(listed(&protocol, &pointer_key()).await?, leftover);
+
+    let resumable = request(data.len(), BINDING, ResumeMode::Discover, true)?;
+    let stage = destination.prepare_at_destination(resumable).await?;
+    assert_eq!(
+        listed(&protocol, &pointer_key()).await?.len(),
+        2,
+        "ours on top"
+    );
+    destination.write(&stage, chunks(&data)).await?;
+    destination.discard(stage).await?;
+    assert!(uploads(&protocol).await?.is_empty());
+    assert_eq!(listed(&protocol, FINAL).await?.len(), 1);
+    assert!(protocol.plain_deletes_of_final_keys().is_empty());
+    Ok(())
+}
+
+/// The held leftover is excused only as exactly itself and only before this stage writes its
+/// own pointer: another writer's pointer written over it, or the held leftover current again
+/// after ours was written (ours deleted by someone else), is a take-over — `Conflict`, the final
+/// key untouched.
+#[tokio::test]
+async fn a_held_leftover_excuses_no_take_over() -> TestResult {
+    for ours_first in [false, true] {
+        let protocol = versioned();
+        protocol.lock_refuses_delete_markers();
+        put_pointer(&protocol, [9; 32], record("gone")?).await?;
+        let leftover = listed(&protocol, &pointer_key()).await?;
+        protocol.lock_version(&pointer_key(), &leftover[0].0);
+        let destination = destination(&protocol);
+        let data = payload(3 * PART);
+        let request = request(data.len(), BINDING, ResumeMode::Restart, ours_first)?;
+        let stage = destination.prepare_at_destination(request).await?;
+        if ours_first {
+            let written = listed(&protocol, &pointer_key()).await?;
+            assert_eq!(written.len(), 2, "ours on top of the held one");
+            protocol
+                .delete_version(&pointer_key(), &written[0].0)
+                .await
+                .map_err(|failure| format!("{failure:?}"))?;
+        } else {
+            put_pointer(&protocol, [8; 32], record("other")?).await?;
+        }
+        destination.write(&stage, chunks(&data)).await?;
+        let failure = publish(&destination, &stage, &data)
+            .await
+            .err()
+            .ok_or("a take-over must refuse publication")?;
+        assert_eq!(
+            class(&failure.error),
+            Some(FailureClass::Conflict),
+            "{ours_first}"
+        );
+        assert!(!failure.final_destination_changed, "{ours_first}");
+        assert!(listed(&protocol, FINAL).await?.is_empty(), "{ours_first}");
+    }
+    Ok(())
+}
+
 /// A completion whose reply was lost while a later write replaced our object (a writer the caller
 /// contract excludes): the latest version is not ours, so nothing is claimed — a `Conflict` with
 /// the final key changed.

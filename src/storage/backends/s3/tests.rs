@@ -45,9 +45,14 @@ pub(crate) struct MemoryS3 {
     pub(crate) aborts: Mutex<u32>,
     pub(super) abort_failure: Mutex<Option<S3ProtocolFailure>>,
     pub(crate) head_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
+    /// Deleting this key — by version or not — fails with this failure (every time, until
+    /// cleared), deleting nothing.
+    pub(crate) delete_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
     pub(crate) copy_commits_then_fails: Mutex<bool>,
     pub(crate) native_copies: Mutex<u64>,
     pub(crate) native_failure: Mutex<Option<S3ProtocolFailure>>,
+    /// `CopyObject` replies carry no version header, even in a versioned bucket (DXN's Ceph RGW).
+    pub(crate) copy_omits_version: Mutex<bool>,
     /// `UploadPartCopy` requests received, and the part whose copy cancels a token (see
     /// [`memory_native`]).
     pub(crate) part_copies: Mutex<u32>,
@@ -94,6 +99,8 @@ pub(crate) struct MemoryS3 {
     pub(crate) multipart_begins: Mutex<u32>,
     pub(crate) part_uploads: Mutex<u32>,
     pub(crate) completes: Mutex<u32>,
+    /// `ListObjectVersions` requests of one key (`list_versions`).
+    pub(crate) version_lists: Mutex<u32>,
     /// Contents a multipart upload completed, by their MD5: real S3 gives such an object the
     /// `ETag` `"<MD5 of the part MD5s>-<parts>"`, not the MD5 of its bytes.
     multipart_etags: std::sync::Mutex<HashMap<[u8; 16], String>>,
@@ -162,6 +169,13 @@ impl MemoryS3 {
             .insert((key.to_string(), id.to_string()), None);
         self.objects.lock().await.remove(key);
         self.record_version(key, id);
+    }
+
+    async fn injected_delete_failure(&self, key: &str) -> S3Result<()> {
+        match &*self.delete_failure.lock().await {
+            Some((failed, failure)) if failed == key => Err(failure.clone()),
+            _ => Ok(()),
+        }
     }
 
     async fn next_id(&self) -> u64 {
@@ -307,6 +321,9 @@ fn not_found() -> S3ProtocolFailure {
 
 #[async_trait]
 impl S3Protocol for MemoryS3 {
+    fn versioning_enabled(&self) -> bool {
+        self.versioning_is_enabled()
+    }
     async fn head(&self, key: &str) -> S3Result<S3ObjectFacts> {
         if let Some((failed_key, failure)) = &*self.head_failure.lock().await
             && failed_key == key
@@ -581,15 +598,19 @@ impl S3Protocol for MemoryS3 {
             .await
     }
     async fn delete_object(&self, key: &str) -> S3Result<()> {
-        if !self.versioned_delete(key).await {
+        self.record_plain_delete(key);
+        self.injected_delete_failure(key).await?;
+        if !self.versioned_delete(key).await? {
             self.objects.lock().await.remove(key);
         }
         Ok(())
     }
     async fn delete_version(&self, key: &str, version_id: &str) -> S3Result<()> {
+        self.injected_delete_failure(key).await?;
         self.delete_one_version(key, version_id).await
     }
     async fn list_versions(&self, key: &str) -> S3Result<Vec<S3VersionFacts>> {
+        *self.version_lists.lock().await += 1;
         self.versions_of(key).await
     }
     async fn list_objects_page(&self, prefix: &str, token: Option<&str>) -> S3Result<S3ObjectPage> {

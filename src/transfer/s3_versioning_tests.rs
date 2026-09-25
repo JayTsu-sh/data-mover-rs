@@ -409,6 +409,65 @@ async fn a_locked_pointer_does_not_fail_the_transfer() -> TestResult {
     Ok(())
 }
 
+/// Ceph RGW (DXN) refuses a delete marker over a held pointer as well as its deletion by version:
+/// still a warning — the transfer succeeds and names its version, the pointer stays — and the
+/// key's next transfer is not stopped by it.
+#[tokio::test]
+async fn a_pointer_held_against_markers_does_not_fail_the_transfer() -> TestResult {
+    let data = payload(3 * PART, 16);
+    let protocol = bucket(Versioning::Enabled, &[("s1", &data)]).await;
+    protocol.lock_refuses_delete_markers();
+    let pointer = pointer_of("held")?;
+    protocol.lock_versions(&pointer);
+    for made in 1..=2 {
+        let request = request(&protocol, "held", TransferPolicy::Checkpointed)?;
+        let outcome = transfer(request).await?;
+        let finals = entries(&protocol, "held").await?;
+        assert_eq!(finals.len(), made);
+        assert_eq!(finals[0].version_id, version(&outcome)?);
+        let kept = entries(&protocol, &pointer).await?;
+        assert_eq!(kept.len(), made, "one held pointer version per transfer");
+        assert!(kept.iter().all(|entry| !entry.delete_marker), "{kept:?}");
+    }
+    assert_eq!(
+        protocol
+            .list_uploads("held")
+            .await
+            .map_err(|f| format!("{f:?}"))?
+            .len(),
+        0
+    );
+    assert_eq!(protocol.plain_deletes_of_final_keys(), Vec::<String>::new());
+    Ok(())
+}
+
+/// A `CopyObject` reply without a version in a versioned bucket (DXN) claims the key's latest
+/// version, which holds the copy — one listing; a reply that names its version, and a bucket
+/// without versioning, list nothing.
+#[tokio::test]
+async fn a_copy_reply_without_a_version_claims_the_latest_version() -> TestResult {
+    for (mode, omitted, lists) in [
+        (Versioning::Enabled, true, 1),
+        (Versioning::Enabled, false, 0),
+        (Versioning::Off, true, 0),
+    ] {
+        let data = payload(1024, 17);
+        let protocol = bucket(mode, &[("s1", &data)]).await;
+        *protocol.copy_omits_version.lock().await = omitted;
+        let outcome = transfer(native(&protocol, "copied")?).await?;
+        assert_eq!(outcome.route, TransferRoute::Native);
+        assert_eq!(*protocol.native_copies.lock().await, 1);
+        let label = format!("{mode:?} omitted={omitted}");
+        assert_eq!(*protocol.version_lists.lock().await, lists, "{label}");
+        if mode == Versioning::Enabled {
+            clean_versions(&protocol, "copied", 1, Some(version(&outcome)?)).await?;
+        } else {
+            assert_eq!(outcome.destination_version, None, "{label}");
+        }
+    }
+    Ok(())
+}
+
 /// A completion whose reply is lost — on the checkpointed upload and on a `Direct` one — is
 /// settled through the key's versions: the latest has our size and composite `ETag`, so its
 /// version is claimed.

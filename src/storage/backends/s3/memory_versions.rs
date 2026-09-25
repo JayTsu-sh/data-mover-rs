@@ -7,7 +7,9 @@
 //!   prove none was sent to a final key.
 //! - `delete_version` removes one entry for good (none is fine); the newest remaining entry becomes
 //!   current. A key under a legal hold ([`MemoryS3::lock_versions`]) refuses it with
-//!   `PermissionDenied`, as Object Lock does — an unversioned delete (a marker) is still allowed.
+//!   `PermissionDenied`, as Object Lock does — an unversioned delete (a marker) is still allowed,
+//!   as on AWS and `MinIO`, unless [`MemoryS3::lock_refuses_delete_markers`] (Ceph RGW / DXN
+//!   refuses it too while the current version is held).
 //! - `list_versions` reports a key's entries newest first.
 //!
 //! With versioning off (the default) the fake behaves as before, and lists an existing object as
@@ -52,7 +54,9 @@ pub(crate) struct VersionedBucket {
     locked: HashSet<String>,
     /// Single versions that refuse deletion (a legal hold on one version).
     locked_versions: HashSet<(String, String)>,
-    /// Keys an unversioned `DeleteObject` was sent to.
+    /// A held current version also refuses an unversioned `DeleteObject` (Ceph RGW / DXN).
+    locks_refuse_markers: bool,
+    /// Keys an unversioned `DeleteObject` was sent to, whether it was accepted or not.
     plain_deletes: Vec<String>,
     /// (key, version) of every `delete_version` that removed an entry.
     version_deletes: Vec<(String, String)>,
@@ -82,6 +86,13 @@ impl VersionedBucket {
     fn newest(&self, key: &str) -> Option<String> {
         self.order.get(key)?.last().cloned()
     }
+
+    fn held(&self, key: &str, id: &str) -> bool {
+        self.locked.contains(key)
+            || self
+                .locked_versions
+                .contains(&(key.to_string(), id.to_string()))
+    }
 }
 
 impl MemoryS3 {
@@ -93,6 +104,11 @@ impl MemoryS3 {
         self.bucket().mode
     }
 
+    /// Whether versioning is enabled (not off, not suspended).
+    pub(super) fn versioning_is_enabled(&self) -> bool {
+        self.versioning() == Versioning::Enabled
+    }
+
     /// Switches the bucket's versioning (enabling or suspending keeps what is stored).
     pub(crate) fn set_versioning(&self, mode: Versioning) {
         self.bucket().mode = mode;
@@ -101,6 +117,12 @@ impl MemoryS3 {
     /// Places a legal hold on every version of `key`: deleting one is refused.
     pub(crate) fn lock_versions(&self, key: &str) {
         self.bucket().locked.insert(key.to_string());
+    }
+
+    /// From now on a held current version refuses an unversioned `DeleteObject` too
+    /// (`PermissionDenied`), as Ceph RGW (DXN) does; AWS and `MinIO` add the delete marker.
+    pub(crate) fn lock_refuses_delete_markers(&self) {
+        self.bucket().locks_refuse_markers = true;
     }
 
     /// Places a legal hold on version `id` of `key` only.
@@ -139,6 +161,11 @@ impl MemoryS3 {
         self.bucket().version_deletes.clone()
     }
 
+    /// Logs an unversioned `DeleteObject` of `key` as it is sent, before anything may refuse it.
+    pub(super) fn record_plain_delete(&self, key: &str) {
+        self.bucket().plain_deletes.push(key.to_string());
+    }
+
     /// Records `id` as the newest entry of `key` when the bucket is versioned.
     pub(super) fn record_version(&self, key: &str, id: &str) {
         let mut bucket = self.bucket();
@@ -174,13 +201,21 @@ impl MemoryS3 {
     }
 
     /// An unversioned `DeleteObject` in a versioned bucket: adds a delete marker. `false` when
-    /// versioning is off (the caller removes the object).
-    pub(super) async fn versioned_delete(&self, key: &str) -> bool {
+    /// versioning is off (the caller removes the object). Refused (`PermissionDenied`) when the
+    /// current version is held and [`Self::lock_refuses_delete_markers`] is set.
+    pub(super) async fn versioned_delete(&self, key: &str) -> S3Result<bool> {
         let id = {
             let mut bucket = self.bucket();
-            bucket.plain_deletes.push(key.to_string());
             if bucket.mode == Versioning::Off {
-                return false;
+                return Ok(false);
+            }
+            let current = bucket.newest(key);
+            if bucket.locks_refuse_markers && current.is_some_and(|id| bucket.held(key, &id)) {
+                return Err(S3ProtocolFailure::entry(
+                    FailureClass::PermissionDenied,
+                    Transience::Permanent,
+                    "AccessDenied: the current S3 version is protected by Object Lock",
+                ));
             }
             let id = bucket.mint(key);
             bucket.push(key, &id);
@@ -191,7 +226,7 @@ impl MemoryS3 {
             .await
             .insert((key.to_string(), id), None);
         self.objects.lock().await.remove(key);
-        true
+        Ok(true)
     }
 
     /// HEAD of the current object in a versioned bucket; `None` when versioning is off.
@@ -247,8 +282,7 @@ impl MemoryS3 {
     /// Removes `version_id` from the order of `key`, unless Object Lock holds the key.
     fn forget_version(&self, key: &str, version_id: &str) -> S3Result<Forgotten> {
         let mut bucket = self.bucket();
-        let held = (key.to_string(), version_id.to_string());
-        if bucket.locked.contains(key) || bucket.locked_versions.contains(&held) {
+        if bucket.held(key, version_id) {
             return Err(S3ProtocolFailure::entry(
                 FailureClass::PermissionDenied,
                 Transience::Permanent,

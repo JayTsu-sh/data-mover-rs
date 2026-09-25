@@ -86,6 +86,10 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | 其余 400（`ExpiredToken`、region 错……；HEAD 没有错误码，其 400 一律在此） | 仍按通用映射（会话级）—— 这些关乎整个会话 |
 | 不带 versionId 的 405 | 仍按通用映射（会话 `Protocol` / Unknown）—— DXN / SG 对不支持的操作也可能回 405 |
 | **按 versionId 的** DeleteObject 被 Object Lock 拒绝：AWS 403 `AccessDenied`，MinIO 400 `InvalidRequest`（"Object is WORM protected"，RELEASE.2023-03-20 实测），或 `ObjectLocked`（ADR-0006 C17，`role_protocol/versions.rs`） | 条目 `PermissionDenied` / Permanent —— 只关乎这个版本；删指针版本时降级为告警 + 删除标记（`upload_pointer::delete`），不算传输失败 |
+| **不带** versionId 的 DeleteObject 也被 Object Lock 拒绝（Ceph RGW / DXN：当前版本有 legal hold 时 403 `AccessDenied`，2026-09-25 实测；AWS / MinIO 加删除标记） | 条目 `PermissionDenied` / Permanent（映射不变）；删指针时（先按版本被拒之后）降级为告警、指针留在原处（`upload_pointer::Removal::Held`），不算传输失败 |
+| Complete 之后删自己的指针失败（任何类别） | 映射不变；`publish_final_upload` 只告警、照常报已发布（对象已提交，重试会多一个版本；遗留指针下次 prepare 清） |
+| DXN 重试一个仍在完成中的 Complete：500 `InternalError`（"This multipart completion is already in progress"） | 通用 5xx：会话 `Connectivity` / Transient —— 不是提交前的拒绝，`settle_completion` 查 `ListParts` |
+| DXN 完成后的 `ListParts`：404 `NoSuchKey`（MinIO 回 `NoSuchUpload`） | 条目 `NotFound` / Permanent（同上第一行）—— 与 `NoSuchUpload` 一样进入按版本结算（C17） |
 | 按 versionId 删除一个不存在的版本 | 成功（S3 / MinIO 回 204），不是错误 |
 | 按 versionId 的 DeleteObject 回 405（存储不支持按版本删） | 条目 `Unsupported` / Permanent —— **不是**带版本读的「删除标记」`NotFound`（清理会把它当成已删）；删指针时降级为普通删除 + 告警 |
 | describe 之后对象被替换（`read` / native bind / `observe_bound`） | 条目 `Conflict` / Permanent |

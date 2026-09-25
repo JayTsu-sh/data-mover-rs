@@ -139,6 +139,10 @@ impl S3Storage {
 
 #[async_trait::async_trait]
 impl crate::storage::backends::s3::S3Protocol for S3Storage {
+    fn versioning_enabled(&self) -> bool {
+        self.is_bucket_versioned
+    }
+
     async fn head(
         &self,
         key: &str,
@@ -618,6 +622,36 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// DXN (Ceph RGW) answers a retried `CompleteMultipartUpload` whose first attempt is still
+    /// completing with 500 `InternalError` ("This multipart completion is already in progress";
+    /// `MinIO` answers 404 `NoSuchUpload`), and `ListParts` after the completion with 404
+    /// `NoSuchKey` (`MinIO`: `NoSuchUpload`). The first is no refusal before commit — a transient
+    /// session failure, which the completion settles as changed — and the second is the same
+    /// `NotFound` as `NoSuchUpload`, which sends the settlement to the key's versions.
+    #[test]
+    fn dxn_answers_to_a_completion_in_progress_and_after_it() {
+        use crate::model::{FailureClass, Transience};
+        assert!(matches!(
+            s3_role_remote_failure(Some(500), Some("InternalError"), "complete"),
+            S3ProtocolFailure::Session {
+                class: FailureClass::Connectivity,
+                transience: Transience::Transient,
+                ..
+            }
+        ));
+        for code in ["NoSuchKey", "NoSuchUpload"] {
+            assert_eq!(
+                s3_role_remote_failure(Some(404), Some(code), "list parts"),
+                S3ProtocolFailure::entry(
+                    FailureClass::NotFound,
+                    Transience::Permanent,
+                    "list parts"
+                ),
+                "{code}"
+            );
+        }
     }
 
     /// A body that does not match its `Content-MD5` was corrupted in flight: an entry failure a

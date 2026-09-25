@@ -202,13 +202,32 @@ pub(super) async fn put<P: S3Protocol>(
     }
 }
 
+/// What deleting a pointer did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Removal {
+    /// The version is gone for good (or there was none to delete); in a bucket that reports no
+    /// version, a plain `DeleteObject` removed the object.
+    Deleted,
+    /// A plain `DeleteObject` removed it: in a versioned bucket a delete marker hides it.
+    Hidden,
+    /// Object Lock holds it and the store refused the plain `DeleteObject` too (Ceph RGW — DXN —
+    /// does under a legal hold on the current version; AWS and `MinIO` add the marker): the
+    /// pointer stays current until the hold is lifted. A bucket policy that denies both
+    /// `DeleteObjectVersion` and `DeleteObject` lands here too (the same 403): then every
+    /// pointer version stays, one per transfer of the key, each with a warning. See [`delete`].
+    Held,
+}
+
 /// Deletes the pointer; an absent one is fine. Named by `version` (what its write or read
 /// reported), it is deleted for good: in a versioned bucket a plain `DeleteObject` would keep the
 /// version behind a delete marker. A version that cannot be deleted by id — Object Lock refuses it,
 /// the store does not delete by version, or refuses `versionId=null` — falls back to a plain
 /// `DeleteObject`, with a warning: in a versioned bucket a delete marker then hides it, and a retry
-/// could never delete it either. Without a version (an unversioned bucket) it is a plain
-/// `DeleteObject`.
+/// could never delete it either. A store that refuses that plain delete as well
+/// (`PermissionDenied`: Object Lock on the current version, as Ceph RGW does) leaves the pointer
+/// in place — [`Removal::Held`], with a warning — since no retry could remove it before the hold
+/// is lifted; the caller carries on (ADR-0006 C17: a lock refusal on a pointer is a warning).
+/// Without a version (an unversioned bucket) it is a plain `DeleteObject`, and any failure is one.
 ///
 /// `stale` lists the contents a pointer version may hold that must not outlive this deletion (the
 /// deleted pointer's own bytes, and those of a pointer a resume replaced): after a delete by id,
@@ -219,36 +238,57 @@ pub(super) async fn delete<P: S3Protocol>(
     pointer: &StoragePath,
     version: Option<&str>,
     stale: &[&[u8]],
-) -> Result<(), StorageRoleFailure> {
+) -> Result<Removal, StorageRoleFailure> {
     let Some(version) = version else {
-        return cleanup_result(pointer, protocol.delete_object(pointer.as_str()).await);
+        return cleanup_result(pointer, protocol.delete_object(pointer.as_str()).await)
+            .map(|()| Removal::Deleted);
     };
-    if delete_by_id(protocol, pointer, version).await? {
+    let removal = delete_by_id(protocol, pointer, version).await?;
+    if removal == Removal::Deleted {
         sweep(protocol, pointer, version, stale).await;
     }
-    Ok(())
+    Ok(removal)
 }
 
-/// Deletes one pointer version by id; `false` when it had to be hidden behind a delete marker
-/// instead (see [`delete`]).
+/// Deletes one pointer version by id, or hides it behind a delete marker, or leaves it held (see
+/// [`delete`]).
 async fn delete_by_id<P: S3Protocol>(
     protocol: &P,
     pointer: &StoragePath,
     version: &str,
-) -> Result<bool, StorageRoleFailure> {
-    match protocol.delete_version(pointer.as_str(), version).await {
-        Err(error) if not_deletable_by_version(&error, version) => {
+) -> Result<Removal, StorageRoleFailure> {
+    let error = match protocol.delete_version(pointer.as_str(), version).await {
+        Err(error) if not_deletable_by_version(&error, version) => error,
+        deleted => return cleanup_result(pointer, deleted).map(|()| Removal::Deleted),
+    };
+    tracing::warn!(
+        pointer = %pointer.as_str(),
+        version,
+        ?error,
+        "could not delete the S3 upload pointer's version (Object Lock?); hiding it behind a delete marker"
+    );
+    match protocol.delete_object(pointer.as_str()).await {
+        Err(refused) if is_permission_denied(&refused) => {
             tracing::warn!(
                 pointer = %pointer.as_str(),
                 version,
-                ?error,
-                "could not delete the S3 upload pointer's version (Object Lock?); hiding it behind a delete marker"
+                error = ?refused,
+                "the store refused a delete marker over the held S3 upload pointer too; leaving it in place until the hold is lifted"
             );
-            cleanup_result(pointer, protocol.delete_object(pointer.as_str()).await)?;
-            Ok(false)
+            Ok(Removal::Held)
         }
-        deleted => cleanup_result(pointer, deleted).map(|()| true),
+        hidden => cleanup_result(pointer, hidden).map(|()| Removal::Hidden),
     }
+}
+
+fn is_permission_denied(failure: &S3ProtocolFailure) -> bool {
+    matches!(
+        failure,
+        S3ProtocolFailure::Entry {
+            class: FailureClass::PermissionDenied,
+            ..
+        }
+    )
 }
 
 /// The most versions [`sweep`] deletes after one pointer deletion.
@@ -275,8 +315,8 @@ async fn sweep<P: S3Protocol>(protocol: &P, pointer: &StoragePath, deleted: &str
             return;
         };
         match delete_by_id(protocol, pointer, &version).await {
-            Ok(true) => last = version,
-            Ok(false) => return,
+            Ok(Removal::Deleted) => last = version,
+            Ok(Removal::Hidden | Removal::Held) => return,
             Err(error) => {
                 tracing::warn!(pointer = %pointer.as_str(), version, ?error, "could not delete a stale S3 upload pointer version");
                 return;

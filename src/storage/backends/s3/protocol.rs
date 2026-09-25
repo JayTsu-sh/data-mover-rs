@@ -224,6 +224,10 @@ pub(crate) struct S3NativeCopyEvidence {
 
 #[async_trait]
 pub(crate) trait S3Protocol: Send + Sync {
+    /// Whether the bucket had versioning enabled when it was connected (`GetBucketVersioning`
+    /// answered `Enabled`; HCP always). A write there whose reply names no version is settled
+    /// through the key's versions (ADR-0006 C18: DXN's `CopyObject` sends no `x-amz-version-id`).
+    fn versioning_enabled(&self) -> bool;
     async fn head(&self, key: &str) -> S3Result<S3ObjectFacts>;
     /// HEAD one stored version. A delete marker, or a version the store does not have, is a
     /// `NotFound` entry failure — a per-entry outcome, never a session failure.

@@ -3,9 +3,10 @@
 //!
 //! - A source whose bytes (at its pinned version) no longer carry the pinned `ETag` is a
 //!   permanent `Conflict` (S3 answers 412), a missing one `NotFound`.
-//! - `CopyObject` counts in `native_copies`, obeys `native_failure` (fails, copies nothing) and
-//!   `copy_commits_then_fails` (stores the copy, then loses the reply), and stores the copy as a
-//!   write: a new version on a versioned fake.
+//! - `CopyObject` counts in `native_copies`, obeys `native_failure` (fails, copies nothing),
+//!   `copy_commits_then_fails` (stores the copy, then loses the reply) and `copy_omits_version`
+//!   (the reply names no version, as DXN's does), and stores the copy as a write: a new version on
+//!   a versioned fake.
 //! - `UploadPartCopy` names an upload of exactly its key (else `NoSuchUpload`), counts in
 //!   `part_copies` (and, while in flight, `part_copies_active` / `part_copies_peak`), obeys `part_failure` / `part_failure_waits` like
 //!   `UploadPart`, and cancels `cancel_on_part_copy`'s token when that part is copied (after
@@ -60,7 +61,11 @@ impl MemoryS3 {
         }
         let bytes = self.pinned_source(source).await?;
         let etag = self.etag_for(&bytes);
-        let version = self.store_written(to, bytes).await;
+        let omit_version = *self.copy_omits_version.lock().await;
+        let version = self
+            .store_written(to, bytes)
+            .await
+            .filter(|_| !omit_version);
         *self.native_copies.lock().await += 1;
         if *self.copy_commits_then_fails.lock().await {
             return Err(lost_reply());
