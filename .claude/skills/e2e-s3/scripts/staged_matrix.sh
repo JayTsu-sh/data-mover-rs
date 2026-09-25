@@ -4,7 +4,8 @@
 # records, uploads open on the case's key), then removes everything under its own prefix. Not an
 # assertion suite: it records a baseline to compare write strategies across commits — except the Direct rows, which since ADR-0006 C14c must
 # succeed: each is downloaded and compared with its source, and the uploads left on its exact key
-# are counted (`direct: equal=yes key_uploads=0` is the expected verdict).
+# are counted (`direct: equal=yes key_uploads=0` is the expected verdict) — and the native rows,
+# which since C18 write the final key: `native: equal=yes stage_objects=0 key_uploads=0`.
 #
 # Env: .claude/skills/e2e-s3/.env (S3_HOST, S3_BUCKET, S3_AK, S3_SK); PREFIX overrides the key
 # prefix (default staged-<run>). Only keys under that prefix are written or deleted.
@@ -31,18 +32,20 @@ BIN=target/debug/examples/transfer_resume
 build=$(cargo build -q --example transfer_resume 2>&1) || { echo "$build" >&2; exit 1; }
 SCHEME=http; [ "${S3_USE_HTTPS:-}" = true ] && SCHEME=https
 B="$SCHEME://$S3_HOST/$S3_BUCKET"
-SIG=(--aws-sigv4 "aws:amz:us-east-1:s3" --user "$S3_AK:$S3_SK")
+# The credentials reach curl through a config on a file descriptor, never on its command line.
+esc() { local v=${1//\\/\\\\}; printf '%s' "${v//\"/\\\"}"; }
+s3c() { curl -s --aws-sigv4 "aws:amz:us-east-1:s3" -K <(printf 'user = "%s:%s"\n' "$(esc "$S3_AK")" "$(esc "$S3_SK")") "$@"; }
 
 # `.data-mover-*` objects under the run's prefix: the `.upload` pointers of uploads on the final key
-# (ADR-0006 C15b) and, for native copies (temp key until C18), `.data-mover-stage/` objects.
-artifacts() { curl -s "${SIG[@]}" "$B?list-type=2&prefix=$PREFIX/" | grep -o '<Key>[^<]*</Key>' | grep -c '\.data-mover-'; }
+# (ADR-0006 C15b). Native copies write the final key since C18: no `.data-mover-stage/` object.
+artifacts() { s3c "$B?list-type=2&prefix=$PREFIX/" | grep -o '<Key>[^<]*</Key>' | grep -c '\.data-mover-'; }
 # Local recovery records: since ADR-0006 C15c an S3 destination keeps none (always 0).
 records() { find "$DATA_MOVER_RECOVERY_DIR" -name '*.state' 2>/dev/null | wc -l; }
 # The multipart uploads open on exactly key $1 (under the prefix), one id per line:
 # ListMultipartUploads with the key as prefix, then an exact-key filter (MinIO 2023 lists exact
 # keys only, AWS / Ceph / StorageGRID by prefix). A reply that is not a listing prints "?".
 key_upload_ids() {
-  curl -s "${SIG[@]}" "$B?uploads&prefix=$PREFIX/$1" | python3 -c 'import sys, xml.etree.ElementTree as ET
+  s3c "$B?uploads&prefix=$PREFIX/$1" | python3 -c 'import sys, xml.etree.ElementTree as ET
 try: root = ET.fromstring(sys.stdin.read())
 except ET.ParseError: print("?"); sys.exit()
 ns = root.tag[:root.tag.index("}") + 1] if root.tag.startswith("{") else ""
@@ -65,11 +68,20 @@ case_() { # label, destination key, args...
   printf '%-44s %s  | artifacts=%s records=%s key_uploads=%s\n' "$label" "$line" "$(artifacts)" \
     "$(records)" "$(key_uploads "$key")"
 }
+# A native copy writes the final key (ADR-0006 C18): it must equal its source, and neither a temp
+# key under `.data-mover-stage/` nor an upload on the key may be left.
+native_verdict() { # destination key, source file
+  local equal=no stage
+  s3c -o "$WORK/check" "$B/$PREFIX/$1" && cmp -s "$WORK/check" "$2" && equal=yes
+  rm -f "$WORK/check"
+  stage=$(s3c "$B?list-type=2&prefix=$PREFIX/" | grep -o '<Key>[^<]*</Key>' | grep -c '\.data-mover-stage/')
+  echo "   native: equal=$equal stage_objects=$stage key_uploads=$(key_uploads "$1")"
+}
 # Direct writes the final key itself: the object must equal its source and leave no upload on
 # that exact key.
 direct_verdict() { # destination key, source file
   local equal=no
-  curl -s -o "$WORK/check" "${SIG[@]}" "$B/$PREFIX/$1" && cmp -s "$WORK/check" "$2" && equal=yes
+  s3c -o "$WORK/check" "$B/$PREFIX/$1" && cmp -s "$WORK/check" "$2" && equal=yes
   rm -f "$WORK/check"
   echo "   direct: equal=$equal key_uploads=$(key_uploads "$1")"
 }
@@ -77,7 +89,7 @@ direct_verdict() { # destination key, source file
 # its key (ADR-0006 C15c/C16: one pointer + one open upload after a cut that was not discarded).
 left_at() { # destination key
   local pointers
-  pointers=$(curl -s "${SIG[@]}" "$B?list-type=2&prefix=$PREFIX/" | grep -o '<Key>[^<]*</Key>' | grep -c '\.upload<')
+  pointers=$(s3c "$B?list-type=2&prefix=$PREFIX/" | grep -o '<Key>[^<]*</Key>' | grep -c '\.upload<')
   echo "   left at the destination: prefix pointers=$pointers key_uploads=$(key_uploads "$1") records=$(records)"
 }
 
@@ -107,6 +119,7 @@ echo "-- native S3 -> S3"
   case_ "native $name" "native-$name" --source "s3:$PREFIX" --source-path "atomic-off-$name" \
     --destination "s3:$PREFIX" --destination-path "native-$name" --policy checkpointed \
     --identity "n-$RUN-$name"
+  native_verdict "native-$name" "$WORK/src/$name"
 done
 
 # The cut lands after the first 64 MiB checkpoint (the parts the service acknowledged, up to four
@@ -138,19 +151,19 @@ echo "-- cleanup of $PREFIX/"
 # listing still shows (stores that list by prefix), then every object.
 for key in "${KEYS[@]}"; do
   key_upload_ids "$key" | grep -v '^?$' | while read -r id; do
-    curl -s -o /dev/null "${SIG[@]}" -X DELETE "$B/$PREFIX/$key?uploadId=$id"; done
+    s3c -o /dev/null -X DELETE "$B/$PREFIX/$key?uploadId=$id"; done
 done
-curl -s "${SIG[@]}" "$B?uploads&prefix=$PREFIX/" | sed 's/<Upload>/\n<Upload>/g' | grep '^<Upload>' | while read -r u; do
+s3c "$B?uploads&prefix=$PREFIX/" | sed 's/<Upload>/\n<Upload>/g' | grep '^<Upload>' | while read -r u; do
   k=$(echo "$u" | grep -o '<Key>[^<]*' | sed 's/<Key>//'); id=$(echo "$u" | grep -o '<UploadId>[^<]*' | sed 's/<UploadId>//')
-  curl -s -o /dev/null "${SIG[@]}" -X DELETE "$B/$k?uploadId=$id"; done
+  s3c -o /dev/null -X DELETE "$B/$k?uploadId=$id"; done
 while :; do
-  keys=$(curl -s "${SIG[@]}" "$B?list-type=2&prefix=$PREFIX/" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g')
+  keys=$(s3c "$B?list-type=2&prefix=$PREFIX/" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g')
   [ -z "$keys" ] && break
-  echo "$keys" | while read -r k; do curl -s -o /dev/null "${SIG[@]}" -X DELETE "$B/$k"; done
+  echo "$keys" | while read -r k; do s3c -o /dev/null -X DELETE "$B/$k"; done
 done
 open=0
 for key in "${KEYS[@]}"; do
   n=$(key_uploads "$key"); if [ "$n" = '?' ]; then open='?'; break; fi; open=$((open + n))
 done
-echo "left: objects=$(curl -s "${SIG[@]}" "$B?list-type=2&prefix=$PREFIX/" | grep -c '<Key>') key_uploads=$open"
+echo "left: objects=$(s3c "$B?list-type=2&prefix=$PREFIX/" | grep -c '<Key>') key_uploads=$open"
 rm -rf "$WORK"

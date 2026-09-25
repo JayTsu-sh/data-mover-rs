@@ -26,13 +26,15 @@ S3_PREFIX=test                   # bucket 内的子路径
 
 4. **写入策略矩阵**（role-based 目的端）：`bash .claude/skills/e2e-s3/scripts/staged_matrix.sh` ——
    大小 0 / 1 KiB / 8 MiB / 8 MiB+1 / 20 MiB / 200 MiB × Checkpointed / AtomicReplace / Direct × 读回开关，原生 S3→S3，
-   取消与 SIGKILL 后续传。每行打印结果（含 `prepare` / `reused_bytes`）、耗时和遗留：`artifacts=`（前缀下的
-   `.data-mover-*` 对象：`.upload` 指针、原生拷贝的 temp key）、`records=`（本地恢复记录，C15c 起 S3 恒为 0）、
+   取消与 SIGKILL 后续传。每行打印结果（含 `prepare` / `reused_bytes` / `native_bytes` / `native_requests`）、耗时和遗留：
+   `artifacts=`（前缀下的 `.data-mover-*` 对象：`.upload` 指针；C18 起原生拷贝不再有 temp key）、`records=`（本地恢复记录，C15c 起 S3 恒为 0）、
    `key_uploads=`（该用例精确 key 上未完成的上传）。续传段另打印 `left at the destination: pointers=… key_uploads=…`
    （切断后期望 1 / 1，续传完成后 0 / 0）。只写/删 `staged-<run>/`
    （`S3_MATRIX_PREFIX=` 可改，必须以 `staged-` 或 `data-mover-` 开头 —— 清理会 abort 本次写过的每个 key 上的上传，再删
    前缀下的一切）。Direct 行（ADR-0006 C14c 起必须成功）另打印 `direct: equal=… key_uploads=…`：下载比对源文件、
-   数该精确 key 上未完成的上传，期望 `equal=yes key_uploads=0`。
+   数该精确 key 上未完成的上传，期望 `equal=yes key_uploads=0`。原生行（C18 起写最终 key）另打印
+   `native: equal=… stage_objects=… key_uploads=…`，期望 `equal=yes stage_objects=0 key_uploads=0`。凭据经
+   `curl -K <(…)` 传入，不上命令行。
    MinIO 2023 的 `ListMultipartUploads` 只认精确 key，所以脚本都按精确 key 数上传（按前缀列再过滤 Key）。
    基线与解读见 `.claude/docs/storage-s3.md`「目的端写入策略基线」。
 
@@ -53,12 +55,18 @@ S3_PREFIX=test                   # bucket 内的子路径
    建桶不是 200（例如同名桶已存在，409）就停下，清理只碰本次建出来的桶；`RUN` 必须匹配 `[a-z0-9-]{1,30}`；
    凭据经 `curl -K <(…)` 传入，不上命令行。
    用例：4 MiB checkpointed（单 PUT）、200 MiB checkpointed（指针）、Direct 4 MiB / 20 MiB；`--source-version` 按 id
-   拷 v1 再 v2（`--client-shaped` 流式，两版本按序、各与源逐字节相同）；按 id 拷贝 3 s 取消后续传；`resume_matrix.sh`
+   拷 v1 再 v2（`--client-shaped` 流式，两版本按序、各与源逐字节相同），再原生按 id 拷一遍（C18：
+   `CopyObject` / `UploadPartCopy` 带 `?versionId=`，写到 `hist/ndst`，期望同样按序、各与源相同）；按 id 拷贝 3 s 取消后续传；`resume_matrix.sh`
    cancel / SIGKILL；Object Lock 桶里拷贝进行中给指针版本加 legal hold；暂停版本后三种写法。每行打印 `result` /
    `prepare` / `reused` / `destination_version`，再打印该用例前缀下 `final versions=… delete markers=… artifact entries=…
    version=latest: yes`。期望：每次拷贝 1 个版本、0 标记、0 artifact，`destination_version` 就是最新版本；Object Lock
    行 `result=ok`、1 条告警、1 个标记 + 2 个 artifact 条目（被扣住的指针版本与盖在上面的标记）；暂停版本
    `destination_version=null`。`SKIP_RESUME=1` 跳过续传矩阵。
+
+7. **原生 S3→S3 切断续传**（C18）：MinIO 上服务端拷贝很快（读回关时 1 GiB ≈ 1.1 s），`--bandwidth` 不限原生拷贝，
+   所以用 1 GiB 源、读回关、`--cancel-after-ms 300`（或 `timeout -s KILL 0.8`）切断：期望切断后 1 指针 + 1 upload，
+   同参数再跑一次 `Resumed { … }`（取消时在途的段都拷完，SIGKILL 丢在途的段），`--compare` 相等，之后 0 / 0。
+   源先用本地 → `s3:<prefix>` 上传，再 `--source s3:<prefix> --destination s3:<prefix>`（同 endpoint 才走原生）。
 
 ## 成功判据
 

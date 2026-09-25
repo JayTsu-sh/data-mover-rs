@@ -152,7 +152,7 @@ case_ "checkpointed 200 MiB (pointer)" "$VB" large obj "${LOCAL[@]}" --source-pa
 case_ "direct 4 MiB" "$VB" direct-small obj "${LOCAL[@]}" --source-path m4 --policy direct
 case_ "direct 20 MiB (multipart)" "$VB" direct-large obj "${LOCAL[@]}" --source-path m20 --policy direct
 
-echo "-- native S3 -> S3 (temp key until C18): one version, no temp-key version or marker"
+echo "-- native S3 -> S3 to the final key (C18): one version, no temp-key version or marker"
 case_ "native 4 MiB" "$VB" native-small obj --source s3:small --source-path obj --policy checkpointed
 case_ "native 200 MiB" "$VB" native-large obj --source s3:large --source-path obj --policy checkpointed
 
@@ -173,6 +173,20 @@ for pair in "$D1:h1" "$D2:h2"; do
   echo "   version ${pair%%:*} holds ${pair#*:}: $same"
 done
 echo "   listed newest first: $order (expected: $D2 $D1)"
+
+echo "-- v1 -> v2 by --source-version, native (C18: CopyObject / UploadPartCopy with ?versionId=)"
+NSRC=(--source "s3:hist" --source-path src --policy checkpointed)
+case_ "native copy of v1" "$VB" hist ndst "${NSRC[@]}" --source-version "$V1"
+N1=$(field "$LAST" destination_version)
+case_ "native copy of v2" "$VB" hist ndst "${NSRC[@]}" --source-version "$V2"
+N2=$(field "$LAST" destination_version)
+order=$(entries "$VB" hist/ndst | awk -F'\t' '$1 == "hist/ndst" && $3 == 0 {print $2}' | paste -sd' ')
+for pair in "$N1:h1" "$N2:h2"; do
+  s3c -o "$WORK/check" "$H/$VB/hist/ndst?versionId=${pair%%:*}"
+  cmp -s "$WORK/check" "$WORK/src/${pair#*:}" && same=yes || same=NO
+  echo "   version ${pair%%:*} holds ${pair#*:}: $same"
+done
+echo "   listed newest first: $order (expected: $N2 $N1)"
 
 echo "-- interrupted copy of v1 (cancel after 3 s at 20 MiB/s), then resumed"
 case_ "cut" "$VB" hist-cut dst "${S3SRC[@]}" --source-version "$V1" --bandwidth 20971520 --cancel-after-ms 3000
