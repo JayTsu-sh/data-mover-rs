@@ -7,10 +7,17 @@
 //!     [--delete-dir dir]
 //! ```
 //!
-//! `walkdir` prints `ENTRY <path relative to the storage root> <versionId or ->`, `walkdir_2` prints
-//! `FILE|DIR <path>`, and `ERROR …` for a reported error (exit 1). A walk that has not finished within
+//! Without the URL argument the URL is read from `S3_LISTING_URL`, so a script need not put
+//! credentials on a command line.
+//!
+//! `walkdir` prints `ENTRY <path relative to the storage root> <versionId or -> latest=<0|1>
+//! marker=<0|1> count=<version count or ->` (a versioned bucket lists every version and delete
+//! marker), `walkdir_2` prints `FILE <path>` with the same four fields and `DIR <path>`, and
+//! `ERROR …` for a reported error (exit 1). `count` is the key's entries in `walkdir` (versions and
+//! delete markers) but its versions only in `walkdir_2`, which lists no markers. A walk that has not finished within
 //! `--timeout-secs` exits 2: a walk that re-lists a directory forever must not hang the caller.
 
+use std::env;
 use std::path::Path;
 use std::process::exit;
 use std::time::Duration;
@@ -19,13 +26,16 @@ use clap::Parser;
 use data_mover::dir_tree::NdxEvent;
 use data_mover::error::StorageError;
 use data_mover::storage_enum::{StorageEnum, create_storage};
-use data_mover::{CreateStorageOptions, Result, StorageEntryMessage, WalkOptions};
+use data_mover::{CreateStorageOptions, EntryEnum, Result, StorageEntryMessage, WalkOptions};
 use tokio::time::timeout;
+
+/// Where the URL is read from when it is not given as an argument.
+const URL_ENV: &str = "S3_LISTING_URL";
 
 #[derive(Debug, Parser)]
 struct Args {
-    /// `s3://AK:SK@bucket.host:port/prefix` (or any `s3+…://` profile).
-    url: String,
+    /// `s3://AK:SK@bucket.host:port/prefix` (or any `s3+…://` profile); `S3_LISTING_URL` if absent.
+    url: Option<String>,
     /// Walk from this directory below the storage root.
     #[arg(long)]
     sub: Option<String>,
@@ -58,17 +68,27 @@ async fn delete_dir(storage: &StorageEnum, dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// `<path> <versionId or -> latest=<0|1> marker=<0|1> count=<version count or ->`.
+fn describe(entry: &EntryEnum) -> String {
+    format!(
+        "{} {} latest={} marker={} count={}",
+        entry.get_relative_path().display(),
+        entry.get_version_id().unwrap_or("-"),
+        u8::from(entry.get_is_latest()),
+        u8::from(entry.get_is_delete_marker()),
+        entry
+            .get_version_count()
+            .map_or_else(|| "-".to_string(), |count| count.to_string())
+    )
+}
+
 /// Returns whether the walk reported an error.
 async fn walk(storage: &StorageEnum, sub: Option<&Path>) -> Result<bool> {
     let mut failed = false;
     let entries = storage.walkdir(sub, WalkOptions::default()).await?;
     while let Some(message) = entries.next().await {
         match message {
-            StorageEntryMessage::Scanned(entry) => println!(
-                "ENTRY {} {}",
-                entry.get_relative_path().display(),
-                entry.get_version_id().unwrap_or("-")
-            ),
+            StorageEntryMessage::Scanned(entry) => println!("ENTRY {}", describe(&entry)),
             StorageEntryMessage::Error { path, reason, .. } => {
                 println!("ERROR {}: {reason}", path.display());
                 failed = true;
@@ -87,7 +107,7 @@ async fn walk_2(storage: &StorageEnum, sub: Option<&Path>) -> Result<bool> {
         match event {
             NdxEvent::Page(page) => {
                 for file in &page.files {
-                    println!("FILE {}", file.entry.get_relative_path().display());
+                    println!("FILE {}", describe(&file.entry));
                 }
                 for dir in &page.subdirs {
                     println!("DIR {}", dir.entry.get_relative_path().display());
@@ -105,8 +125,13 @@ async fn walk_2(storage: &StorageEnum, sub: Option<&Path>) -> Result<bool> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
-    let storage = create_storage(&args.url, CreateStorageOptions::default()).await?;
+    let mut args = Args::parse();
+    let Some(url) = args.url.take().or_else(|| env::var(URL_ENV).ok()) else {
+        return Err(StorageError::ConfigError(format!(
+            "give the storage URL or set {URL_ENV}"
+        )));
+    };
+    let storage = create_storage(&url, CreateStorageOptions::default()).await?;
     if let Some(dir) = &args.delete_dir {
         delete_dir(&storage, dir).await?;
     }
