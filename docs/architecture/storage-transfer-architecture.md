@@ -832,16 +832,20 @@ copy one object's versions into a versioned destination bucket:
    `version()` gives the version id (`None` for `"null"`), the latest flag and the delete-marker
    flag, one key's entries contiguous and oldest first, a key whose newest entry is a delete marker
    included; `source_version()` is the selector to copy it with (`None` for a marker). The legacy
-   listing below still works but has the limits it describes. With the legacy listing
+   listing below also works, with the limits it describes. With the legacy listing
    (`StorageEnum::walkdir` or `walkdir_2` on
    an S3 source whose bucket has versioning `Enabled`): Every entry is an `EntryEnum::S3` with
    `get_version_id()`, `get_is_latest()` and `get_is_delete_marker()`; each key's entries arrive
    oldest first, also when `ListObjectVersions` paging splits the key (C20), but `walkdir` may
    interleave other keys between them, so group by `get_relative_path()`. `walkdir` lists delete
-   markers too, `walkdir_2` versions only. A key
-   whose newest entry is a delete marker is not listed at all, so its history cannot be enumerated
-   this way; a bucket with versioning suspended is listed with `ListObjectsV2` (current objects,
-   no version ids).
+   markers too, `walkdir_2` versions only. A key whose newest entry is a delete marker is listed
+   as well (user decision D4, a follow-up after C22; before, it was not listed at all): `walkdir`
+   sends all its versions and markers oldest first, the marker last with `get_is_latest()` and
+   `get_is_delete_marker()` true; `walkdir_2` sends its versions with none latest, since the key
+   has no current object (a key holding only markers gives no entry); a consumer that copies every
+   latest entry must also test `get_is_delete_marker()`. `walkdir` judges markers by `name` /
+   `path` / `extension` filters (never by `size`: they have none). A bucket with versioning
+   suspended is listed with `ListObjectsV2` (current objects, no version ids), unchanged.
 2. **Copy** each version with
    `TransferRequest::new(..).with_source_version(SourceVersion::Id(version_id))`, oldest to newest,
    **one at a time per key**, each only after the previous one succeeded. Streamed and native

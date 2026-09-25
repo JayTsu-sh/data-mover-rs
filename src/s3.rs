@@ -62,7 +62,9 @@ use crate::{
     DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, Result, S3Entry,
     StorageEntryMessage, Tag, WalkDirAsyncIterator, datetime_to_string,
 };
-use version_listing::{VersionOrDeleteMarker, VersionPages, oldest_first_by_key};
+use version_listing::{
+    VersionOrDeleteMarker, VersionPages, oldest_first_by_key, versions_with_latest,
+};
 
 struct S3WalkRuntime<'a> {
     tx: &'a async_channel::Sender<StorageEntryMessage>,
@@ -114,6 +116,8 @@ mod dxn;
 mod multipart_rename;
 mod storagegrid;
 mod version_listing;
+#[cfg(test)]
+mod versioned_walk_tests;
 
 /// S3 桶信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2239,23 +2243,11 @@ impl S3Storage {
         } = scan;
         let object_versions = oldest_first_by_key(version_entries, delete_marker_entries);
 
-        // 处理每个对象的所有版本（已按写入时间从旧到新排好，跨页的 key 已合并）
+        // 处理每个对象的所有版本（已按写入时间从旧到新排好，跨页的 key 已合并）。最新条目是删除标记的
+        // key 也列（ADR-0006 D4）：它的版本与标记照常发，标记最后、`is_latest`
         for (_key, sorted_versions) in object_versions {
-            // 计算该对象的版本总数
+            // 计算该对象的版本总数（版本 + 删除标记）
             let version_count = u32::try_from(sorted_versions.len()).unwrap_or(u32::MAX);
-
-            // 检查最后一个版本是否是删除标记，如果是则跳过整个对象
-            let should_skip_object = match sorted_versions.last() {
-                Some(VersionOrDeleteMarker::DeleteMarker(_)) => {
-                    debug!("[S3] 跳过对象，因为最后一个版本是删除标记");
-                    true
-                }
-                _ => false,
-            };
-
-            if should_skip_object {
-                continue;
-            }
 
             // 依次处理每个版本
             for version_or_delete_marker in sorted_versions {
@@ -2336,14 +2328,49 @@ impl S3Storage {
                         }
                     }
                     VersionOrDeleteMarker::DeleteMarker(delete_marker) => {
-                        self.send_delete_marker(tx, &delete_marker, version_count)
-                            .await?;
+                        if !self.marker_is_filtered(
+                            &delete_marker,
+                            match_expressions,
+                            exclude_expressions,
+                        ) {
+                            self.send_delete_marker(tx, &delete_marker, version_count)
+                                .await?;
+                        }
                     }
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Whether the filter hides a delete marker: judged like a file without a size, so a `size`
+    /// condition is a `LazyMatch` and never hides it, while `name` / `path` / `extension` do —
+    /// otherwise a key the filter excludes would still send its latest marker (ADR-0006 D4).
+    fn marker_is_filtered(
+        &self,
+        marker: &DeleteMarkerEntry,
+        match_expressions: Option<&FilterExpression>,
+        exclude_expressions: Option<&FilterExpression>,
+    ) -> bool {
+        let Some(key) = marker.key() else {
+            return true;
+        };
+        let relative_path = self.calculate_relative_path(key);
+        let (file_name, extension) = Self::get_file_info(relative_path);
+        should_skip(
+            match_expressions,
+            exclude_expressions,
+            FilterInput {
+                file_name: Some(&file_name),
+                file_path: Some(relative_path),
+                file_type: Some("file"),
+                size: None,
+                extension: extension.as_deref().or(Some("")),
+                ..FilterInput::default()
+            },
+        )
+        .0
     }
 
     async fn send_delete_marker(
@@ -3955,8 +3982,9 @@ impl S3Storage {
             .0
     }
 
-    /// `entries`: one key's versions and delete markers, oldest first. A key whose newest entry is
-    /// a delete marker is skipped; otherwise its versions are listed (markers are not).
+    /// `entries`: one key's versions and delete markers, oldest first. Its versions are listed
+    /// (markers are not), the newest latest — none when a delete marker is newer: such a key has
+    /// no current object, but its history is still listed (ADR-0006 D4).
     async fn append_object_versions(
         &self,
         key: &str,
@@ -3964,21 +3992,10 @@ impl S3Storage {
         ctx: &crate::dir_tree::ReadContext,
         files: &mut Vec<Arc<EntryEnum>>,
     ) {
-        if matches!(entries.last(), Some(VersionOrDeleteMarker::DeleteMarker(_))) {
-            return;
-        }
-        let versions = entries
-            .into_iter()
-            .filter_map(|entry| match entry {
-                VersionOrDeleteMarker::Version(version) => {
-                    Some((datatime_to_i64(version.last_modified()), version))
-                }
-                VersionOrDeleteMarker::DeleteMarker(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let versions = versions_with_latest(entries);
         let version_count = u32::try_from(versions.len()).unwrap_or(u32::MAX);
-        let latest_index = versions.len().saturating_sub(1);
-        for (index, (modified, version)) in versions.into_iter().enumerate() {
+        for (version, latest) in versions {
+            let modified = datatime_to_i64(version.last_modified());
             let relative_path = self.calculate_relative_path(key);
             let (file_name, extension) = Self::get_file_info(relative_path);
             let size = version
@@ -4012,7 +4029,7 @@ impl S3Storage {
                 modified,
                 tags,
                 version_id.as_deref(),
-                index == latest_index,
+                latest,
                 false,
                 Some(version_count),
                 false,
@@ -4981,7 +4998,7 @@ mod tests {
 
     // --- 构造测试用 S3Storage（不连接实际 S3 服务） ---
 
-    fn make_test_storage(prefix: Option<&str>) -> S3Storage {
+    pub(super) fn make_test_storage(prefix: Option<&str>) -> S3Storage {
         let credentials = Credentials::new("test-ak", "test-sk", None, None, "test");
         let credentials_provider = SharedCredentialsProvider::new(credentials);
         let sdk_config = SdkConfig::builder()

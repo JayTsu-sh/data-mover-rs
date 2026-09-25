@@ -132,7 +132,20 @@ hold back the page's greatest key until the listing moves past it (not `NextKeyM
 answers it with a token such as `p/z[minio_cache:v2,return:]`) and order each key oldest first,
 entries of one millisecond by listing order with the latest last (`src/s3/version_listing.rs`).
 Unchanged: a key whose newest entry is a delete marker is not listed at all, and a bucket with
-versioning suspended is listed without versions. Verified on MinIO (VM 102, temporary bucket
+versioning suspended is listed without versions. Follow-up (D4 — user decision 2026-09-25: every S3
+traversal, legacy or role-based, supports versioned buckets, deleted keys included — after C22):
+such a key is now listed — `walkdir` sends its versions and markers oldest first, the marker last
+and latest; `walkdir_2` sends its versions with none latest (`version_listing::versions_with_latest`);
+`walkdir` now judges a marker by the filter too (`name` / `path` / `extension`; a `size` condition
+never hides one), so an excluded deleted key sends nothing. Verified on MinIO (VM 102, temporary
+buckets `data-mover-fu-<ts>` versioned and `data-mover-fu-<ts>-u` unversioned, both deleted, the
+server then listing only `a-bucket` and `data-mover-test`): `h/gone` (two versions, then a
+delete) lists in `walkdir` as both versions and a `latest=1 marker=1 count=3` marker and in
+`walkdir_2` as both versions, `latest=0 count=2`; `h/obj` (v1, v2, marker, v3) and `h/live` as
+before; the unversioned bucket lists `u/a` only (`u/b` deleted), without versions, as before (run
+without a filter, before marker filtering was added, which changes nothing without one; the
+filtering is covered by `s3::versioned_walk_tests`).
+What follows describes the listing as C20 verified it, before D4. Verified on MinIO (VM 102, temporary bucket
 `data-mover-c20-<run>`, deleted afterwards): `v1, v2, marker, v3` lists as those four in order in
 `walkdir` (versions only in `walkdir_2`), a deleted key and an artifact are absent, and a key whose
 three versions straddle the first page boundary (999 keys before it) lists as `z1, z2, z3`,
@@ -701,7 +714,7 @@ the first 1 000-entry page) lists as 1, 2, 3 B; `n` written twice with versionin
 as `version=null latest=1`; no artifact appears (`.data-mover-x`, `d/.data-mover-stage/y`), the
 zero-byte `d/` is skipped; 1 015 entries in `All`, 1 008 in `Current`, 5 directories, both
 `Completed`, root subtree exhaustive; `--order name-bytes` gives identical output at concurrency 1,
-4 and 32. The legacy `walkdir` / `walkdir_2` are unchanged.
+4 and 32. The legacy `walkdir` / `walkdir_2` are unchanged by C22.
 
 ## Consequences
 
@@ -740,6 +753,11 @@ zero-byte `d/` is skipped; 1 015 entries in `All`, 1 008 in `Current`, 5 directo
   `SkippedBelowCheckpointThreshold` or `Disabled`, as a streamed copy of the same stage reports;
   `NotApplicableNative` only for a `TransferPolicy::Checkpointed` single `CopyObject`, where every
   native copy used to report it.
+- Legacy S3 listing (D4, after C22): on a bucket listed with `ListObjectVersions` (versioning
+  `Enabled`, and every HCP namespace) `walkdir` now sends a latest entry that is a delete marker
+  (`get_is_latest()` and `get_is_delete_marker()` both true) and `walkdir_2` the versions of a
+  deleted key, none latest; a consumer that copies every latest entry must test
+  `get_is_delete_marker()` too. `walkdir` markers now obey `name` / `path` / `extension` filters.
 - Traversal (C22): `TraversalRequest` gains the public `versions` field (every literal names it);
   S3 lends a `Namespace` role (`Stat` / `List` / `list_versions`; mutations refused) and
   `ObservedEntry` gains `version()` / `source_version()`; version entries snapshot as v6.

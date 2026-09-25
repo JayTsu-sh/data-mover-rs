@@ -7,6 +7,10 @@
 //! in until the listing moves past it, and [`oldest_first_by_key`] puts each complete key's
 //! entries in the order they were written.
 //!
+//! A key whose newest entry is a delete marker is listed too (ADR-0006 D4): `walkdir` sends every
+//! version and marker, the marker last and latest; `walkdir_2`, which lists versions only, sends
+//! its versions with none latest ([`versions_with_latest`]).
+//!
 //! The key a page ended in is its greatest key, not `NextKeyMarker`: `MinIO` answers that with a
 //! continuation token of its own (`p/z[minio_cache:v2,return:]` for the key `p/z`, measured on
 //! RELEASE.2023-03-20), which only works as the next request's `key-marker`.
@@ -145,12 +149,32 @@ pub(super) fn oldest_first_by_key(
     grouped
 }
 
+/// The versions of one key's entries (oldest first, as [`oldest_first_by_key`] gives them), each
+/// with whether it is the key's latest entry: the newest version is, unless a delete marker was
+/// written after it — then none is, and the key has no current object.
+pub(super) fn versions_with_latest(
+    entries: Vec<VersionOrDeleteMarker>,
+) -> Vec<(ObjectVersion, bool)> {
+    let deleted = matches!(entries.last(), Some(VersionOrDeleteMarker::DeleteMarker(_)));
+    let mut versions: Vec<_> = entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            VersionOrDeleteMarker::Version(version) => Some((version, false)),
+            VersionOrDeleteMarker::DeleteMarker(_) => None,
+        })
+        .collect();
+    if !deleted && let Some(newest) = versions.last_mut() {
+        newest.1 = true;
+    }
+    versions
+}
+
 #[cfg(test)]
 mod tests {
     use aws_sdk_s3::primitives::DateTime;
     use aws_sdk_s3::types::{DeleteMarkerEntry, ObjectVersion};
 
-    use super::{VersionOrDeleteMarker, VersionPages, oldest_first_by_key};
+    use super::{VersionOrDeleteMarker, VersionPages, oldest_first_by_key, versions_with_latest};
 
     fn version(key: &str, id: &str, millis: i64, latest: bool) -> ObjectVersion {
         ObjectVersion::builder()
@@ -315,5 +339,39 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(ids(&grouped["k"]), ["u1", "u2", "v3"]);
+    }
+
+    fn latest_flags(entries: Vec<VersionOrDeleteMarker>) -> Vec<(String, bool)> {
+        versions_with_latest(entries)
+            .into_iter()
+            .map(|(version, latest)| (version.version_id().unwrap_or_default().to_string(), latest))
+            .collect()
+    }
+
+    #[test]
+    fn versions_only_mark_the_newest_latest_unless_a_marker_is_newer() {
+        let listed = |v2_latest, markers| {
+            let mut grouped = oldest_first_by_key(
+                vec![
+                    version("k", "v2", 20, v2_latest),
+                    version("k", "v1", 10, false),
+                ],
+                markers,
+            );
+            grouped.remove("k").unwrap_or_default()
+        };
+        // A marker between the versions: v2 is still the key's latest entry.
+        assert_eq!(
+            latest_flags(listed(true, vec![marker("k", "m", 15, false)])),
+            [("v1".to_string(), false), ("v2".to_string(), true)]
+        );
+        // The newest entry is a marker (D4): both versions are listed, neither latest.
+        assert_eq!(
+            latest_flags(listed(false, vec![marker("k", "m", 30, true)])),
+            [("v1".to_string(), false), ("v2".to_string(), false)]
+        );
+        // Only markers: no version to list.
+        let only = oldest_first_by_key(Vec::new(), vec![marker("k", "m", 30, true)]);
+        assert!(latest_flags(only.into_values().flatten().collect()).is_empty());
     }
 }

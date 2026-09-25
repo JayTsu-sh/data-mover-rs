@@ -438,10 +438,22 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
    版本的桶走 `ListObjectsV2`，只有当前对象、没有 versionId）。每条 `EntryEnum::S3` 带 `get_version_id()` /
    `get_is_latest()` / `get_is_delete_marker()` / `get_version_count()`（`S3Entry` 字段都是 `pub`）。
    - `walkdir`：版本 + 删除标记，同一 key 从旧到新，但多个 worker 共用一个 channel，别的 key 的条目可能插在中间
-     （按 `get_relative_path()` 分组）；`version_count` 数版本 + 标记；key 之间顺序不定（HashMap、多 worker）。过滤表达式按版本逐条判断（没有 `modified`），删除标记不过滤。
-   - `walkdir_2`：只有版本（没有标记），按名字稳定排序，同一 key 从旧到新；`is_latest` = 最后一个；
-     `version_count` 只数版本；过滤含 `modified`。
-   - 两者：最新条目是删除标记的 key **整个不列**（它的历史用 legacy 列举拿不到）；`.data-mover-*` 不列（C3）；
+     （按 `get_relative_path()` 分组）；`version_count` 数版本 + 标记；key 之间顺序不定（HashMap、多 worker）。过滤表达式按版本逐条判断（没有 `modified`）；删除标记按
+     `name` / `path` / `extension` 判断、没有 size（`size` 条件对它是 `LazyMatch`，放行）—— D4 之前标记完全不过滤（只涉及历史中间的标记）；D4 列出已删 key 后若仍不过滤，
+     被排除的已删 key 会漏出它的 latest 标记。
+   - `walkdir_2`：只有版本（没有标记），按名字稳定排序，同一 key 从旧到新；`is_latest` = 最后一个版本，
+     但最新条目是删除标记时**一个都不标 latest**（该 key 没有当前对象）；`version_count` 只数版本；过滤含 `modified`。
+   - 两者：最新条目是删除标记的 key **也列**（用户决定 D4：每种 S3 遍历都要支持版本化桶，C22 之后的 follow-up；
+     之前整个不列，历史拿不到）：`walkdir` 发它的全部版本与标记、从旧到新、标记最后且 `is_latest = true`、
+     `is_delete_marker = true`；`walkdir_2` 发它的版本、`is_latest` 全是 `false`（只有标记的 key 不出条目）。只影响走
+     `ListObjectVersions` 的桶（版本 `Enabled`，或 HCP）；未开 / 暂停版本的桶走 `ListObjectsV2`，行为不变。
+     判断在 `version_listing::versions_with_latest`，测试 `s3::versioned_walk_tests`（离线构造 `S3Storage`，不带标签就不发请求）。
+     **对调用方是契约变化**：按 `get_is_latest()` 拷贝的调用方必须同时看 `get_is_delete_marker()`；HCP 永远走
+     `ListObjectVersions`，也受影响。真机（MinIO VM 102，2026-09-25，临时桶 `data-mover-fu-<ts>`（版本化）与
+     `-u`（未开版本），跑完都删，服务器只剩 `a-bucket` / `data-mover-test`）：`h/gone`（两个版本后删除）`walkdir` 列两个
+     版本 + `latest=1 marker=1 count=3` 的标记、`walkdir_2` 列两个版本 `latest=0 count=2`；未开版本的桶仍只列当前对象（不带过滤表达式跑，在加标记过滤之前；
+     不带过滤时两者输出相同，标记过滤由单测覆盖）。
+     `.data-mover-*` 不列（C3）；
      `mtime` = 该版本的 `LastModified`（纳秒，服务端毫秒精度）；`include_tags` 时按 versionId 取标签。
    - **C20 修复**：`ListObjectVersions` 一页最多 1000 条，一页可能停在某个 key 的版本中间（key 升序、每个 key 新→旧）。
      以前按页分组：跨页的 key 分成两组，先发新的一段，`version_count` 按页算，`walkdir_2` 还有两条 `latest`。
@@ -474,7 +486,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   写完后设置）给到目的端版本。
 - 真机（MinIO VM 102，2026-09-25，临时桶 `data-mover-c20-<run>`，跑完删除，服务器只剩 `a-bucket` /
   `data-mover-test`）：`h/obj` 写 v1、v2、删除标记、v3 → `walkdir` 按序列出这 4 条（标记 `marker=1`、只有 v3
-  `latest=1`、`count=4`），`walkdir_2` 列 v1、v2、v3（`count=3`）；`h/gone`（最新是标记）与
+  `latest=1`、`count=4`），`walkdir_2` 列 v1、v2、v3（`count=3`）；`h/gone`（最新是标记；当时不列，D4 之后列）与
   `h/.data-mover-*.upload` 不列。999 个单版本 key 之后的 `p/z`（3 个版本，第一页停在 z3）：修复前 `walkdir` 发
   z3（`count=1`）、z1、z2（`count=2`），`walkdir_2` 两条 `latest=1`；修复后都是 z1、z2、z3，`count=3`，只有 z3 latest。
   `versioning_matrix.sh`（`data-mover-c17{,-lock}-1790313057`，已删）结果与 C18 相同：按 id 拷 v1、v2（流式与原生）
@@ -527,7 +539,8 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   `.claude/skills/e2e-s3/scripts/traversal_versions.sh`（临时桶，见 SKILL 第 8 步）。MinIO VM 102 2026-09-25 通过：
   `k` = 2 B、3 B、标记、4 B，`gone` = 版本 + latest 标记，999 个 key 后的 `p/z` 跨页仍 1、2、3 B，暂停版本写的 `n` =
   `version=null latest=1`，无 artifact；All 1015 条、Current 1008 条；`name-bytes` 并发 1/4/32 输出相同；桶已删。
-- legacy `walkdir` / `walkdir_2` 不变（仍有 C20 所述限制：最新为标记的 key 不列）。
+- legacy `walkdir` / `walkdir_2` 不受 C22 影响；C20 所述「最新为标记的 key 不列」的限制已由 D4 follow-up 去掉（见上
+  「历史版本迁移」第 1 步）。
 
 **MinIO 2023 的其他实测行为**：`ListMultipartUploads` 只按**精确 key** 返回（按前缀或整桶都是 0）—— 孤儿上传
 无法按前缀发现，只能靠 key 精确查询或服务端 `stale_uploads_expiry` 回收；Content-MD5 不符 → 400 BadDigest
