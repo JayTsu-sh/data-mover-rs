@@ -114,16 +114,6 @@ impl RoleHdfsProtocol for HDFSStorage {
             .map_err(|error| hdfs_role_error(from, RoleOperation::Publish, error))
     }
 
-    async fn claim_stage(
-        &self,
-        from: &RoleStoragePath,
-        claimed: &RoleStoragePath,
-    ) -> Result<(), RoleFailure> {
-        self.rename_with_overwrite(Path::new(from.as_str()), Path::new(claimed.as_str()), false)
-            .await
-            .map_err(|error| hdfs_role_error(from, RoleOperation::Prepare, error))
-    }
-
     async fn create_empty_stage_exclusive(
         &self,
         path: &RoleStoragePath,

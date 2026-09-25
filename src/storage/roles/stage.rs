@@ -160,11 +160,19 @@ impl fmt::Debug for PreparedStage {
 pub(crate) struct DeferredCheckpoint {
     pub(crate) interval_bytes: u64,
     pub(crate) source_size: u64,
+    #[expect(
+        dead_code,
+        reason = "no destination registers a checkpoint since ADR-0006 C12d; removed with the recovery store (C21)"
+    )]
     pub(crate) registration: std::sync::Arc<dyn CheckpointRegistration>,
 }
 
 #[async_trait]
 pub(crate) trait CheckpointRegistration: Send + Sync {
+    #[expect(
+        dead_code,
+        reason = "no destination registers a checkpoint since ADR-0006 C12d; removed with the recovery store (C21)"
+    )]
     async fn register(
         &self,
         stage: &PreparedStage,

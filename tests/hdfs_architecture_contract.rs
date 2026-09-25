@@ -7,9 +7,9 @@ use data_mover::model::{
     EntryOperationFailure, FailureClass, ObservationPlan, Operation, StoragePath, Transience,
 };
 use data_mover::storage::{
-    ByteStream, FinalDestination, PreflightPolicy, PrepareRequest, PreparedStage, PublishRequest,
-    RecoverRequest, RecoveryIdentity, SourceDescriptor, StagedDestination, Storage,
-    StorageRoleFailure, VerifyRequest,
+    ByteStream, DestinationPrepareRequest, FinalDestination, PreflightPolicy, PrepareFact,
+    PrepareRequest, PreparedStage, PublishRequest, ResumeMode, SourceDescriptor, StagedDestination,
+    Storage, StorageRoleFailure, VerifyRequest,
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
@@ -215,28 +215,37 @@ async fn architecture_stage_recovers_durable_prefix_after_reconnect() -> TestRes
     let backend = create_hdfs_storage(&location, &lab_config(), None, true).await?;
     let payload = Bytes::from(vec![0x6d; 2 * 1024 * 1024]);
     create_file(&backend, "source.bin", payload.clone()).await?;
-    let (identity, descriptor) = interrupt_and_export_recovery(&backend, &payload).await?;
+    let descriptor = interrupt_stage(&backend, &payload).await?;
     drop(backend);
-    recover_tail_and_publish(&location, payload, identity, descriptor).await
+    resume_tail_and_publish(&location, payload, descriptor).await
 }
 
-async fn interrupt_and_export_recovery(
-    backend: &HDFSStorage,
-    payload: &Bytes,
-) -> TestResult<(RecoveryIdentity, SourceDescriptor)> {
+/// The at-destination prepare of `final.bin` both connections make: same binding, same transfer.
+fn resume_request(descriptor: &SourceDescriptor) -> TestResult<DestinationPrepareRequest> {
+    Ok(DestinationPrepareRequest::new(
+        PrepareRequest {
+            final_destination: FinalDestination::new(StoragePath::new("final.bin")?),
+            source: descriptor.clone(),
+            recovery_binding: [0x34; 32],
+        },
+        [0x51; 32],
+    ))
+}
+
+/// Prepares `final.bin` at the destination, writes the first MiB, fails the input and drops the
+/// stage: what a killed process leaves behind — the stage and its pointer, beside the final file.
+async fn interrupt_stage(backend: &HDFSStorage, payload: &Bytes) -> TestResult<SourceDescriptor> {
     let storage = backend.architecture_storage()?;
     let descriptor = storage
         .read_source(&PreflightPolicy::production())?
         .describe(&StoragePath::new("source.bin")?)
         .await?;
     let staged = storage.staged_destination(&PreflightPolicy::production())?;
+    // A stage an earlier failed run left in this root is cleaned up, not resumed.
     let stage = staged
-        .prepare(PrepareRequest {
-            final_destination: FinalDestination::new(StoragePath::new("final.bin")?),
-            source: descriptor.clone(),
-            recovery_binding: [0x34; 32],
-        })
+        .prepare_at_destination(resume_request(&descriptor)?.with_resume(ResumeMode::Restart))
         .await?;
+    assert!(!matches!(stage.prepare_fact(), PrepareFact::Resumed { .. }));
     assert!(
         staged
             .write(&stage, interrupted_input(payload.slice(..1024 * 1024))?)
@@ -247,38 +256,37 @@ async fn interrupt_and_export_recovery(
         staged.observe_checkpoint(&stage).await?.durable_prefix,
         1024 * 1024
     );
-    let identity = staged.recovery_identity(&stage).await?;
-    Ok((identity, descriptor))
+    drop(stage);
+    Ok(descriptor)
 }
 
-async fn recover_tail_and_publish(
+/// A fresh connection finds the stage by its deterministic name, resumes it after the first MiB,
+/// writes the tail and publishes; nothing of the stage is left.
+async fn resume_tail_and_publish(
     location: &str,
     payload: Bytes,
-    identity: RecoveryIdentity,
     descriptor: SourceDescriptor,
 ) -> TestResult {
     let reconnected = create_hdfs_storage(location, &lab_config(), None, true).await?;
     let roles = reconnected.architecture_storage()?;
     let staged = roles.staged_destination(&PreflightPolicy::production())?;
-    let recovered = staged
-        .recover(RecoverRequest {
-            identity,
-            final_destination: FinalDestination::new(StoragePath::new("final.bin")?),
-            source: descriptor,
-            recovery_binding: [0x34; 32],
-            claim_token: [0x51; 32],
-        })
+    let resumed = staged
+        .prepare_at_destination(resume_request(&descriptor)?)
         .await?;
+    assert_eq!(
+        resumed.prepare_fact(),
+        PrepareFact::Resumed { bytes: 1024 * 1024 }
+    );
     staged
         .write(
-            &recovered,
+            &resumed,
             Box::pin(futures::stream::iter([Ok(payload.slice(1024 * 1024..))])),
         )
         .await?;
     let digest = *blake3::hash(&payload).as_bytes();
     staged
         .verify(
-            &recovered,
+            &resumed,
             VerifyRequest {
                 expected_size: payload.len() as u64,
                 expected_blake3: digest,
@@ -287,8 +295,29 @@ async fn recover_tail_and_publish(
             },
         )
         .await?;
-    publish_recovered(staged.as_ref(), &recovered, payload.len() as u64, digest).await?;
+    publish_recovered(staged.as_ref(), &resumed, payload.len() as u64, digest).await?;
+    let published = reconnected.open_file(Path::new("final.bin")).await?;
+    assert_eq!(
+        reconnected
+            .read_at(&published, 0, payload.len() as u64)
+            .await?,
+        payload
+    );
+    assert_no_artifacts(&reconnected).await?;
     reconnected.delete_storage_root().await?;
+    Ok(())
+}
+
+/// The raw listing of the storage root shows no transfer artifact.
+async fn assert_no_artifacts(storage: &HDFSStorage) -> TestResult {
+    let leftovers = storage
+        .list_directory(Path::new(""))
+        .await?
+        .into_iter()
+        .filter(|entry| entry.name.starts_with(".data-mover-"))
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    assert!(leftovers.is_empty(), "artifacts left: {leftovers:?}");
     Ok(())
 }
 

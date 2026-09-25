@@ -27,9 +27,9 @@
 # non-limiting budget, so the engine counts it): SIZE means nothing was reused. "records" is how
 # many recovery records the interrupted run left locally. For a destination that still uses the
 # local recovery store, 0 means the cut came before the first checkpoint; a destination that keeps
-# its recovery state beside the final file (ADR-0006: Local from C8, NFS C10, CIFS C11, S3 C15c)
-# always shows 0. For S3 "destination artifacts" is the `.data-mover-*` objects (the `.upload`
-# pointer) plus the multipart uploads open on the run's final keys.
+# its recovery state beside the final file (ADR-0006: Local from C8, NFS C10, CIFS C11, HDFS C12c,
+# S3 C15c) always shows 0. For S3 "destination artifacts" is the `.data-mover-*` objects (the
+# `.upload` pointer) plus the multipart uploads open on the run's final keys.
 set -u
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$ROOT"

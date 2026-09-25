@@ -5,12 +5,11 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use futures::StreamExt as _;
 
+use super::at_destination::{resident, write_pointer};
 use super::protocol::entry_failure;
 use super::staged::{HdfsStagedDestination, expected_size};
 use crate::model::{FailureClass, Operation, Transience};
-use crate::storage::{
-    ByteStream, PreparedStage, StagedDestination, StorageRoleFailure, WriteEvidence,
-};
+use crate::storage::{ByteStream, PreparedStage, StorageRoleFailure, WriteEvidence};
 
 struct Input {
     stream: ByteStream,
@@ -101,7 +100,7 @@ async fn consume(
 
         if next_checkpoint == Some(offset) && offset < expected {
             writer.hsync().await?;
-            register_durable_prefix(adapter, stage, offset).await?;
+            record_durable_prefix(adapter, stage, offset).await?;
             next_checkpoint = interval.map(|step| offset.saturating_add(step).min(expected));
         }
     }
@@ -120,32 +119,21 @@ async fn consume(
     Ok(offset)
 }
 
-async fn register_durable_prefix(
+async fn record_durable_prefix(
     adapter: &HdfsStagedDestination,
     stage: &PreparedStage,
     expected_prefix: u64,
 ) -> Result<(), StorageRoleFailure> {
+    // Only a stage kept at the destination checkpoints: its pointer beside the final file is the
+    // whole recovery record, and nothing registers where data-mover runs.
+    if !resident(stage) {
+        return Err(invalid(stage));
+    }
     let observed = adapter.protocol.stat(&adapter.part(stage)?).await?;
     if observed.size != Some(expected_prefix) {
         return Err(invalid(stage));
     }
-    if super::at_destination::resident(stage) {
-        // The pointer is the whole recovery record; nothing registers where data-mover runs.
-        super::at_destination::write_pointer(adapter, stage, expected_prefix, false).await?;
-        stage.recovery_enabled.store(true, Ordering::Release);
-        return Ok(());
-    }
-    if stage.recovery_enabled() {
-        return Ok(());
-    }
-    let checkpoint = stage
-        .deferred_checkpoint
-        .as_ref()
-        .ok_or_else(|| invalid(stage))?;
-    checkpoint
-        .registration
-        .register(stage, adapter.recovery_identity(stage).await?)
-        .await?;
+    write_pointer(adapter, stage, expected_prefix, false).await?;
     stage.recovery_enabled.store(true, Ordering::Release);
     Ok(())
 }

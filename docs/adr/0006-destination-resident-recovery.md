@@ -267,6 +267,8 @@ principal `hdfs/terrasync-runner`, NameNode 10.131.9.30:9000, run root
 `Resumed { 106326012 }` with 103389188 streamed; SIGKILL resumed `Resumed { 106267648 }` with
 103447552 streamed; both equal by BLAKE3 with no artifact left. `hdfs_architecture_contract` (3) and
 the HDFS smoke suite (19 `nightly_lab_*`, including the engine policy and chunk-boundary cases) pass.
+The old HDFS random `.part` stage, `hdfs-recovery-v1` recovery identity, `.claimed` claim rename and
+the writer's store registration are no longer reached (removed in C12d).
 
 As built (C13): a destination says when read-back verification reads it
 (`StagedDestination::verification_point(stage)`: `BeforePublish` by default, `AfterPublish` for one

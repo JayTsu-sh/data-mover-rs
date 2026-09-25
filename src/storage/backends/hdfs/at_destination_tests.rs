@@ -351,3 +351,151 @@ fn hdfs_keeps_recovery_at_the_destination() -> TestResult {
     assert!(adapter(&protocol)?.recovery_at_destination());
     Ok(())
 }
+
+fn is_unsupported<T>(result: &Result<T, StorageRoleFailure>) -> bool {
+    matches!(
+        result,
+        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Unsupported
+    )
+}
+
+/// The store-era entry points are gone: HDFS prepares every staged transfer at the destination
+/// (ADR-0006 C12d), and none of them touches it.
+#[tokio::test]
+async fn store_era_entry_points_are_unsupported() -> TestResult {
+    let protocol = Arc::new(MemoryHdfs::default());
+    let destination = adapter(&protocol)?;
+    let prepare = request(BINDING, ResumeMode::Discover, true)?.prepare;
+    assert!(is_unsupported(&destination.prepare(prepare.clone()).await));
+    assert!(is_unsupported(
+        &destination.prepare_ephemeral(prepare.clone()).await
+    ));
+    assert_eq!(protocol.len().await, 0);
+    let stage = destination
+        .prepare_at_destination(request(BINDING, ResumeMode::Discover, true)?)
+        .await?;
+    assert!(is_unsupported(&destination.recovery_identity(&stage).await));
+    assert!(is_unsupported(&destination.handoff_recovery(&stage).await));
+    let recovered = destination
+        .recover(crate::storage::RecoverRequest {
+            identity: crate::storage::RecoveryIdentity::from_bytes(Bytes::from_static(b"old"))?,
+            final_destination: prepare.final_destination,
+            source: prepare.source,
+            recovery_binding: BINDING,
+            claim_token: [9; 32],
+        })
+        .await;
+    assert!(is_unsupported(&recovered));
+    destination.discard(stage).await?;
+    assert_eq!(protocol.len().await, 0);
+    Ok(())
+}
+
+/// Only a stage kept at the destination, or a direct one, is this adapter's: any other stage (as
+/// the store era prepared them) is refused before anything is touched.
+#[tokio::test]
+async fn a_stage_neither_at_the_destination_nor_direct_is_refused() -> TestResult {
+    let protocol = Arc::new(MemoryHdfs::default());
+    let destination = adapter(&protocol)?;
+    let final_path = StoragePath::new("dir/final.bin")?;
+    let stage_path = artifact_path(&final_path, ArtifactKind::Stage, false)?;
+    let stage = PreparedStage::new(
+        backend()?,
+        FinalDestination::new(final_path),
+        stage_token(&stage_path, PAYLOAD.len() as u64),
+        BINDING,
+        0,
+        None,
+    );
+    let refused = destination
+        .write(&stage, input(PAYLOAD))
+        .await
+        .err()
+        .ok_or("a stage not prepared at the destination must not be written")?;
+    assert!(matches!(
+        refused,
+        StorageRoleFailure::Entry(ref entry) if entry.class() == FailureClass::Conflict
+    ));
+    assert!(destination.discard(stage).await.is_err());
+    assert_eq!(protocol.len().await, 0);
+    Ok(())
+}
+
+fn is_conflict<T>(result: &Result<T, StorageRoleFailure>) -> bool {
+    matches!(
+        result,
+        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Conflict
+    )
+}
+
+/// A stage whose token names another path than its kind allows — a direct stage aimed at another
+/// file (a direct writer overwrites), or a kept stage aimed at another file's `.stage` — is refused
+/// before anything is written, published or removed.
+#[tokio::test]
+async fn a_stage_token_naming_another_path_is_refused() -> TestResult {
+    let protocol = Arc::new(MemoryHdfs::default());
+    protocol
+        .insert("dir/other.bin", Bytes::from_static(b"keep"))
+        .await;
+    let destination = adapter(&protocol)?;
+    let other = StoragePath::new("dir/other.bin")?;
+    let foreign = |path: &StoragePath| -> Result<PreparedStage, Box<dyn std::error::Error>> {
+        Ok(PreparedStage::new(
+            backend()?,
+            FinalDestination::new(StoragePath::new("dir/final.bin")?),
+            stage_token(path, PAYLOAD.len() as u64),
+            BINDING,
+            0,
+            None,
+        ))
+    };
+    let mut direct = foreign(&other)?;
+    direct.direct = true;
+    direct.mark_at_destination(PrepareFact::Fresh);
+    let mut kept = foreign(&artifact_path(&other, ArtifactKind::Stage, false)?)?;
+    kept.mark_at_destination(PrepareFact::Fresh);
+    for stage in [&direct, &kept] {
+        assert!(is_conflict(&destination.write(stage, input(PAYLOAD)).await));
+        assert!(is_conflict(&destination.observe_checkpoint(stage).await));
+        let refused = publish(&destination, stage)
+            .await
+            .err()
+            .ok_or("a foreign stage must not publish")?;
+        assert!(!refused.final_destination_changed);
+    }
+    assert!(is_conflict(&destination.discard(kept).await));
+    assert_eq!(protocol.len().await, 1);
+    assert_eq!(
+        protocol.get("dir/other.bin").await.as_deref(),
+        Some(b"keep".as_slice())
+    );
+    Ok(())
+}
+
+/// A direct stage writes the final path itself: its length is what it wrote, publication renames
+/// nothing, and nothing is left beside it.
+#[tokio::test]
+async fn a_direct_stage_writes_and_publishes_the_final_path() -> TestResult {
+    let protocol = Arc::new(MemoryHdfs::default());
+    let destination = adapter(&protocol)?;
+    let prepare = request(BINDING, ResumeMode::Discover, true)?.prepare;
+    let mut stage = destination
+        .prepare_direct(prepare, tokio_util::sync::CancellationToken::new())
+        .await?;
+    stage.mark_at_destination(PrepareFact::Fresh);
+    destination.write(&stage, input(PAYLOAD)).await?;
+    assert_eq!(
+        destination.observe_checkpoint(&stage).await?.durable_prefix,
+        PAYLOAD.len() as u64
+    );
+    publish(&destination, &stage)
+        .await
+        .map_err(|failure| failure.error)?;
+    destination.discard(stage).await?;
+    assert_eq!(
+        protocol.get("dir/final.bin").await.as_deref(),
+        Some(PAYLOAD)
+    );
+    assert_eq!(protocol.len().await, 1);
+    Ok(())
+}

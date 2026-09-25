@@ -114,13 +114,6 @@ impl HdfsProtocol for ReadProtocol {
     ) -> Result<(), StorageRoleFailure> {
         Err(unsupported(from))
     }
-    async fn claim_stage(
-        &self,
-        from: &StoragePath,
-        _claimed: &StoragePath,
-    ) -> Result<(), StorageRoleFailure> {
-        Err(unsupported(from))
-    }
     async fn create_empty_stage_exclusive(
         &self,
         path: &StoragePath,

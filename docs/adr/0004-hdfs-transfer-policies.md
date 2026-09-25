@@ -9,6 +9,13 @@ The ordinary `transfer` entry accepts `TransferPolicy::Checkpointed`, `AtomicRep
 | AtomicReplace | exclusive sibling `.part` file | none | close then overwrite rename |
 | Direct | final path, recreated with overwrite | none | close; no stage or rename |
 
+Superseded in part by [ADR-0006](0006-destination-resident-recovery.md): since C12c the staged
+policies write a deterministic `.data-mover-<digest>.stage` beside the final file and record their
+checkpoints in a `.pointer` there, nothing is registered in a local recovery store, and a resume
+forces lease recovery on the stage found at the destination; the `.part` stage, the recovery
+identity and the claim rename described below were removed in C12d. The hsync and lease-recovery
+mechanics below still apply.
+
 Checkpoint eligibility matches Local/NFS: the file must be larger than 64 MiB and span more
 than one effective source chunk. Exactly 64 MiB creates no recovery registration. The final
 writer closes normally without registering a new checkpoint. The shared private recovery
@@ -95,8 +102,10 @@ admission limits, overwrite, same-path rejection, the exact 64 MiB eligibility b
 resumption after a failure following the first synchronized prefix. The real-cluster test is
 `policy_runtime::nightly_lab_transfer_policies_and_chunk_boundaries` in `hdfs_native_contract`;
 it checks all three policies at 4 KiB, 2 MiB + 1, and 64 MiB + 1, with read-back enabled.
-`nightly_lab_recovers_closed_hdfs_prefix` additionally injects an input cancellation, reclaims
-the real HDFS partial, appends only the suffix, and checks the published content.
+`nightly_lab_recovers_closed_hdfs_prefix` additionally injects an input cancellation, resumes the
+real HDFS stage from a fresh connection (since ADR-0006 C12d through `prepare_at_destination`,
+which must report `Resumed`), appends only the suffix, checks the published content, and checks
+that no `.data-mover-*` artifact is left.
 
 On 2026-09-15 the working tree based on `fe0f35f` passed the real HA/Kerberos tests against
 the configured `hdfs-ha` namespace: all nine policy/size combinations and interrupted-prefix

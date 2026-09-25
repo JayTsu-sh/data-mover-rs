@@ -1,6 +1,11 @@
 use super::*;
+use std::path::Path;
+
 use data_mover::model::StoragePath;
-use data_mover::storage::{HdfsBackendConfig, Storage, connect_backend};
+use data_mover::storage::{
+    DestinationPrepareRequest, FinalDestination, HdfsBackendConfig, PreflightPolicy, PrepareFact,
+    PrepareRequest, ResumeMode, SourceDescriptor, Storage, connect_backend,
+};
 use data_mover::transfer::{
     InflightLimits, TransferIdentity, TransferPolicy, TransferRequest, transfer,
 };
@@ -69,26 +74,34 @@ async fn nightly_lab_transfer_policies_and_chunk_boundaries() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-#[ignore = "requires the nightly lab HDFS cluster"]
-async fn nightly_lab_recovers_closed_hdfs_prefix() -> TestResult {
-    use data_mover::storage::{FinalDestination, PreflightPolicy, PrepareRequest, RecoverRequest};
-    let (legacy, storage) = fixture("policy-runtime-recovery").await?;
-    let content = bytes::Bytes::from(vec![91; 2 * 1024 * 1024 + 1]);
-    create_hdfs_file(&legacy, "source", content.clone()).await?;
+/// The at-destination prepare of `final` both connections make: same binding, same transfer.
+fn resume_request(descriptor: &SourceDescriptor) -> TestResult<DestinationPrepareRequest> {
+    Ok(DestinationPrepareRequest::new(
+        PrepareRequest {
+            final_destination: FinalDestination::new(StoragePath::new("final")?),
+            source: descriptor.clone(),
+            recovery_binding: [19; 32],
+        },
+        [21; 32],
+    ))
+}
+
+/// Writes the first 2 MiB of a stage prepared at the destination, fails the input and drops the
+/// stage, as a killed process would.
+async fn interrupt_stage(
+    storage: &Storage,
+    content: &bytes::Bytes,
+) -> TestResult<SourceDescriptor> {
     let descriptor = storage
         .read_source(&PreflightPolicy::production())?
         .describe(&StoragePath::new("source")?)
         .await?;
     let destination = storage.staged_destination(&PreflightPolicy::production())?;
-    let final_destination = FinalDestination::new(StoragePath::new("final")?);
+    // A stage an earlier failed run left in this root is cleaned up, not resumed.
     let stage = destination
-        .prepare(PrepareRequest {
-            final_destination: final_destination.clone(),
-            source: descriptor.clone(),
-            recovery_binding: [19; 32],
-        })
+        .prepare_at_destination(resume_request(&descriptor)?.with_resume(ResumeMode::Restart))
         .await?;
+    assert!(!matches!(stage.prepare_fact(), PrepareFact::Resumed { .. }));
     let error = data_mover::storage::StorageRoleFailure::Entry(
         data_mover::model::EntryOperationFailure::new(
             StoragePath::new("source")?,
@@ -107,20 +120,34 @@ async fn nightly_lab_recovers_closed_hdfs_prefix() -> TestResult {
         destination.observe_checkpoint(&stage).await?.durable_prefix,
         2 * 1024 * 1024
     );
-    let identity = destination.recovery_identity(&stage).await?;
     drop(stage);
-    let recovered = destination
-        .recover(RecoverRequest {
-            identity,
-            final_destination,
-            source: descriptor,
-            recovery_binding: [19; 32],
-            claim_token: [21; 32],
-        })
+    Ok(descriptor)
+}
+
+#[tokio::test]
+#[ignore = "requires the nightly lab HDFS cluster"]
+async fn nightly_lab_recovers_closed_hdfs_prefix() -> TestResult {
+    let (legacy, storage) = fixture("policy-runtime-recovery").await?;
+    let content = bytes::Bytes::from(vec![91; 2 * 1024 * 1024 + 1]);
+    create_hdfs_file(&legacy, "source", content.clone()).await?;
+    let descriptor = interrupt_stage(&storage, &content).await?;
+    drop((legacy, storage));
+
+    // A fresh connection finds the stage beside the final file and resumes it.
+    let (legacy, storage) = fixture("policy-runtime-recovery").await?;
+    let destination = storage.staged_destination(&PreflightPolicy::production())?;
+    let resumed = destination
+        .prepare_at_destination(resume_request(&descriptor)?)
         .await?;
+    assert_eq!(
+        resumed.prepare_fact(),
+        PrepareFact::Resumed {
+            bytes: 2 * 1024 * 1024
+        }
+    );
     destination
         .write(
-            &recovered,
+            &resumed,
             Box::pin(futures::stream::iter([
                 Ok(content.slice(2 * 1024 * 1024..)),
             ])),
@@ -128,7 +155,7 @@ async fn nightly_lab_recovers_closed_hdfs_prefix() -> TestResult {
         .await?;
     destination
         .publish(
-            &recovered,
+            &resumed,
             data_mover::storage::PublishRequest {
                 expected_size: content.len() as u64,
                 expected_blake3: Some(*blake3::hash(&content).as_bytes()),
@@ -137,13 +164,26 @@ async fn nightly_lab_recovers_closed_hdfs_prefix() -> TestResult {
         )
         .await
         .map_err(|error| error.error)?;
-    let file = legacy.open_file(std::path::Path::new("final")).await?;
+    let file = legacy.open_file(Path::new("final")).await?;
     assert_eq!(
         legacy.read_at(&file, 0, content.len() as u64).await?,
         content
     );
-    destination.discard(recovered).await?;
+    assert_no_artifacts(&legacy).await?;
     legacy.delete_storage_root().await?;
+    Ok(())
+}
+
+/// The raw listing of the run's storage root shows no transfer artifact.
+async fn assert_no_artifacts(storage: &data_mover::HDFSStorage) -> TestResult {
+    let leftovers = storage
+        .list_directory(Path::new(""))
+        .await?
+        .into_iter()
+        .filter(|entry| entry.name.starts_with(".data-mover-"))
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    assert!(leftovers.is_empty(), "artifacts left: {leftovers:?}");
     Ok(())
 }
 

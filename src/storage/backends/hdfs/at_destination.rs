@@ -299,7 +299,7 @@ pub(super) async fn prepare(
     let mut stage = PreparedStage::new(
         adapter.identity().clone(),
         request.prepare.final_destination.clone(),
-        stage_token(&artifacts.stage, expected_size)?,
+        stage_token(&artifacts.stage, expected_size),
         request.prepare.recovery_binding,
         0,
         None,

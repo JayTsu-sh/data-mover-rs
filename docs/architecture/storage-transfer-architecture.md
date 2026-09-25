@@ -555,14 +555,15 @@ durability. Other protocols may retain their required persistence operations. It
 recovery control accepted from terrasync. Data-mover selects the effective behavior after route and
 source-read planning and reports it as `EffectiveRecovery`.
 
-(Local, NFS and CIFS no longer take this path since ADR-0006 C8 / C10 / C11 — see "Local
-destination-resident recovery", "NFS execution and automatic recovery" and "CIFS destination-resident
-recovery" below; this paragraph and the next describe the destinations that still use the local
-recovery store.)
+(Local, NFS, CIFS and HDFS no longer take this path since ADR-0006 C8 / C10 / C11 / C12 — see
+"Local destination-resident recovery", "NFS execution and automatic recovery", "CIFS
+destination-resident recovery" and "HDFS destination-resident recovery" below; this paragraph and
+the next describe the destinations that still use the local recovery store.)
 For eligible multi-source-chunk streaming with `Checkpointed`, data-mover opens its private recovery store,
 exclusively claims the transfer binding, recovers or prepares backend-owned staged state, and
-atomically persists the backend's versioned opaque identity. Ordinary HDFS defers registration until
-the first durable checkpoint; destinations without deferred support register before payload. Successful publication
+atomically persists the backend's versioned opaque identity; the remaining store-era destinations
+register before payload (since ADR-0006 C12d no destination registers at a deferred checkpoint —
+the engine's deferred registration goes with the recovery store in C21). Successful publication
 and explicit discard clear that record. Before publication, the record atomically enters a
 `Publishing` state. After a restart, only that state may reconcile a missing stage by clearing the
 ambiguous record and starting fresh; an ordinary missing staged object remains a strict failure.
@@ -603,7 +604,8 @@ process. Local holds its
 publication or discard. NFS (since ADR-0006 C10) has no claim and no recovery identity: it takes a
 stage over by rewriting the pointer with its own nonce, and every later pointer write, the
 publication and a clean-up first check that nonce (see "NFS execution and automatic recovery").
-CIFS (since ADR-0006 C11) works the same way: no claim, no recovery identity, a nonce-fenced pointer.
+CIFS (since ADR-0006 C11) and HDFS (since C12) work the same way: no claim, no recovery identity, a
+nonce-fenced pointer.
 
 Backend mechanisms:
 
@@ -614,17 +616,15 @@ Backend mechanisms:
   claim (it relied on a conditional PUT that MinIO `RELEASE.2023-03-20` rejects with 404, failing
   every resume there) — exclusivity is the engine's per-host recovery lease, and one destination
   key is never written by two transfers at once (caller contract);
-- HDFS: deterministic request-bound partial and continuous verified tail append.
+- HDFS: deterministic `.stage` beside the final file, its length after forced lease recovery, and
+  continuous verified tail append.
 
 The HDFS architecture adapter is split at a protocol boundary: `storage/backends/hdfs`
 owns neutral facts, traversal, range reads, staged publication, and metadata semantics,
 while the existing `HDFSStorage` owns Hadoop clients, Kerberos/HA configuration, and
-protocol error translation. Each transfer attempt uses an isolated, deterministic-after-
-creation same-directory partial, bounded chunks, BLAKE3 readback, and rename publication.
-An opaque recovery identity binds that partial to the source, destination, and expected
-size. Recovery atomically renames it to a claim-token-derived path, re-observes the HDFS
-continuous durable prefix, and appends only the remaining tail. Invalid identities fail without
-deleting unknown state or starting a replacement stage. HDFS
+protocol error translation. A staged transfer writes the deterministic same-directory `.stage`
+(see "HDFS destination-resident recovery"), with bounded chunks, BLAKE3 readback, and rename
+publication; `Direct` writes the final path. HDFS
 string owner/group, replication, block size, and mode are persisted as backend facts;
 the current neutral ownership observation cannot yet expose string principals. ACL
 and xattr are reported unsupported until public dependency APIs are bound, rather
@@ -775,6 +775,16 @@ cannot shorten a file, so a resume rewrites from the recorded prefix on. Final p
 (`.data-mover-<destination-path-hash-16>-<uuid-32>.stage`), `DMCCKP01` checkpoint file,
 `data-mover:cifs-recovery:v1` recovery identity and `.claim-` rename were removed in C11d; no
 backend uses that naming any more.
+
+HDFS destination-resident recovery (ADR-0006 C12): stage and pointer are the deterministic hidden
+siblings `.data-mover-<digest>.{stage,pointer}` of the final file; pointer updates go through the
+fixed `.pointer.tmp`, created exclusively, written and closed, then renamed over the pointer. There is
+no claim file — the HDFS lease exists only while a writer has the file open and belongs to the
+process — so, as on NFS and CIFS, the pointer carries a per-prepare nonce that fences a stage another
+writer took over. The pointer records the last hsync'd prefix as a lower bound; a resume forces lease
+recovery on the stage (which also fences the dead writer) and continues from its closed length. The
+earlier random `.data-mover-<digest>.part` stage, the `hdfs-recovery-v1` recovery identity and the
+`.claimed` rename were removed in C12d.
 
 
 ### HDFS source baseline metadata
