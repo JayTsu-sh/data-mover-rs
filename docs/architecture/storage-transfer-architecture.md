@@ -797,6 +797,61 @@ write reported. The earlier temp key under `.data-mover-stage/`, copied to the f
 publication and resumed from a local recovery identity, was removed in C19; `prepare`,
 `recovery_identity` and `recover` answer `Unsupported` for S3.
 
+### S3 version history migration (ADR-0006 C20)
+
+History migration is a caller procedure built on `SourceVersion`, not a data-mover operation. To
+copy one object's versions into a versioned destination bucket:
+
+1. **Enumerate** the versions with the legacy listing (`StorageEnum::walkdir` or `walkdir_2` on
+   an S3 source whose bucket has versioning `Enabled`). Every entry is an `EntryEnum::S3` with
+   `get_version_id()`, `get_is_latest()` and `get_is_delete_marker()`; each key's entries arrive
+   oldest first, also when `ListObjectVersions` paging splits the key (C20), but `walkdir` may
+   interleave other keys between them, so group by `get_relative_path()`. `walkdir` lists delete
+   markers too, `walkdir_2` versions only. A key
+   whose newest entry is a delete marker is not listed at all, so its history cannot be enumerated
+   this way; a bucket with versioning suspended is listed with `ListObjectsV2` (current objects,
+   no version ids).
+2. **Copy** each version with
+   `TransferRequest::new(..).with_source_version(SourceVersion::Id(version_id))`, oldest to newest,
+   **one at a time per key**, each only after the previous one succeeded. Streamed and native
+   S3→S3 routes both pin the version (`GET ?versionId=`; `CopyObject` / `UploadPartCopy` with
+   `?versionId=` and the bound `ETag`, C18).
+3. **Record** `TransferOutcome.destination_version` per source version. Each successful transfer
+   adds exactly one destination version at the final key; `None` means the destination reported no
+   real version.
+
+Semantics the procedure relies on:
+
+- **Identity.** The selector is part of the derived `TransferIdentity`, so every version is its own
+  transfer. Resubmitting the same request (same `Id`) from any process with no local state resumes
+  it: a `Checkpointed` object over 64 MiB leaves a multipart upload and a `.upload` pointer on the
+  final key and reports `prepare = Resumed { bytes }`; anything else (objects up to 64 MiB,
+  `AtomicReplace`, `Direct`) restarts from zero. An interrupted version must
+  be finished before the next one: the next version's prepare finds the pointer of another identity,
+  aborts that upload and removes the pointer (`Restarted { OtherTransfer }`, or `BindingChanged`
+  under a shared `with_identity_override`), and the version then lands out of order when copied
+  later.
+- **Order.** Destination versions are ordered by when each copy published, not by the source's
+  timestamps; parallel submissions to one key scramble that order and clean up each other's
+  pointers. Within one process the per-destination guard refuses the second one at prepare
+  (`Conflict`, transient, "another transfer in this process is writing this destination file");
+  across processes one writer per key is the caller's contract.
+- **Duplicates.** Nothing is skipped as already copied: running a finished version again adds
+  another destination version. A failure with `final_destination_changed` may already have created
+  one.
+- **Delete markers.** A marker has no content: `Id(marker)` answers the versioned `HEAD` with 405
+  and fails that entry as `NotFound`. data-mover never writes a delete marker to a final key;
+  replaying one (a plain `DeleteObject` on the destination key between the versions around it) is
+  the caller's decision.
+- **Destinations without versioning.** In a suspended or unversioned bucket every copy replaces the
+  single `"null"` version, so only the last copied version remains and `destination_version` is
+  `None`.
+- **Not preserved.** Destination versions get new version ids and `Last-Modified` times (write
+  time). `transfer` carries no tags, user metadata, content type, Object Lock retention or legal
+  hold, storage class or encryption settings from the source version (the S3 destination declares
+  `stores_nothing()`; see `.claude/docs/metadata-negotiation.md`). Tags reach a destination version
+  only through a caller's metadata plan (`MetadataMutation::Tags`, applied after the write).
+
 ### HDFS source baseline metadata
 
 Automatic copy observes HDFS mode and timestamps in the same stat that validates the described

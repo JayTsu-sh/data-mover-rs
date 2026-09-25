@@ -122,6 +122,26 @@ therefore fails the session, not just its entry. Follow-up: on a versioned HEAD 
 request as a ranged GET, whose error body names `InvalidArgument`.
 History migration (documented, not a feature): the caller submits `Id` transfers oldest to newest,
 one at a time; each creates one destination version; delete-marker replication is the caller's choice.
+As built (C20): the procedure and its limits are written down in the architecture document ("S3
+version history migration") and `.claude/docs/storage-s3.md`. The legacy listing already carried
+the versionId, latest flag and delete-marker flag on every `S3Entry` (public fields and `EntryEnum`
+getters) and filtered `.data-mover-*` names (C3), but it grouped each `ListObjectVersions` page on
+its own: a key split across two pages (1 000 entries a page) came out as two groups — newest part
+first, a per-page `version_count`, and in `walkdir_2` two entries marked latest. Both listings now
+hold back the page's greatest key until the listing moves past it (not `NextKeyMarker`: MinIO
+answers it with a token such as `p/z[minio_cache:v2,return:]`) and order each key oldest first,
+entries of one millisecond by listing order with the latest last (`src/s3/version_listing.rs`).
+Unchanged: a key whose newest entry is a delete marker is not listed at all, and a bucket with
+versioning suspended is listed without versions. Verified on MinIO (VM 102, temporary bucket
+`data-mover-c20-<run>`, deleted afterwards): `v1, v2, marker, v3` lists as those four in order in
+`walkdir` (versions only in `walkdir_2`), a deleted key and an artifact are absent, and a key whose
+three versions straddle the first page boundary (999 keys before it) lists as `z1, z2, z3`,
+`count=3`, one latest (before: `z3, z1, z2`). `versioning_matrix.sh` (temporary buckets, deleted)
+unchanged: v1 then v2 by `--source-version`, streamed and native, each gave two versions in order
+equal to their sources. Follow-up (older than C20): a `ListObjectVersions` / `ListObjectsV2` page
+that fails in `walkdir` is only logged — the walk ends that prefix without an error message, so a
+caller enumerating history cannot tell a short listing from a complete one (`walkdir_2` reports it
+in the page's errors).
 
 ### Destination artifacts
 

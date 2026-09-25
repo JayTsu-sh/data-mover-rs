@@ -426,6 +426,57 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - 真机（`examples/s3_listing`，2026-09-24）：MinIO / DXN / StorageGRID 非版本化，MinIO / DXN 临时版本化桶，
   artifact 全部隐藏，普通对象、多版本与删除标记行为不变。
 
+### 历史版本迁移（ADR-0006 C20）
+
+把一个对象的全部版本迁到**开了版本**的目的桶，是调用方按下面步骤做的事，不是 data-mover 的一个操作
+（全文见 `docs/architecture/storage-transfer-architecture.md`「S3 version history migration」）：
+
+1. **列版本**：legacy `walkdir` / `walkdir_2`，源桶版本状态须是 `Enabled`（`detect_bucket_versioning`；暂停
+   版本的桶走 `ListObjectsV2`，只有当前对象、没有 versionId）。每条 `EntryEnum::S3` 带 `get_version_id()` /
+   `get_is_latest()` / `get_is_delete_marker()` / `get_version_count()`（`S3Entry` 字段都是 `pub`）。
+   - `walkdir`：版本 + 删除标记，同一 key 从旧到新，但多个 worker 共用一个 channel，别的 key 的条目可能插在中间
+     （按 `get_relative_path()` 分组）；`version_count` 数版本 + 标记；key 之间顺序不定（HashMap、多 worker）。过滤表达式按版本逐条判断（没有 `modified`），删除标记不过滤。
+   - `walkdir_2`：只有版本（没有标记），按名字稳定排序，同一 key 从旧到新；`is_latest` = 最后一个；
+     `version_count` 只数版本；过滤含 `modified`。
+   - 两者：最新条目是删除标记的 key **整个不列**（它的历史用 legacy 列举拿不到）；`.data-mover-*` 不列（C3）；
+     `mtime` = 该版本的 `LastModified`（纳秒，服务端毫秒精度）；`include_tags` 时按 versionId 取标签。
+   - **C20 修复**：`ListObjectVersions` 一页最多 1000 条，一页可能停在某个 key 的版本中间（key 升序、每个 key 新→旧）。
+     以前按页分组：跨页的 key 分成两组，先发新的一段，`version_count` 按页算，`walkdir_2` 还有两条 `latest`。
+     现在 `src/s3/version_listing.rs` 把一页里最大的 key 留到下一页合并（**不能用 `NextKeyMarker`**：MinIO
+     回的是 `p/z[minio_cache:v2,return:]` 这种自己的续页标记，只能原样当下一次的 `key-marker`），每个 key 按
+     `(LastModified, is_latest)` 稳定排序、同一毫秒内按列举顺序反过来。
+2. **逐个拷**：`TransferRequest::new(..).with_source_version(SourceVersion::Id(version_id))`，**同一 key 从旧到新、
+   一次一个、前一个成功后再下一个**。流式与原生 S3→S3 都钉住版本（C6 / C18）。`transfer_resume` 例子的
+   `--source-version` 是手工入口。
+3. **记结果**：每次成功在最终 key 上**恰好加一个版本**，`TransferOutcome.destination_version` 是它（`None` =
+   目的端没报真版本）。
+
+要点：
+
+- 选择器进派生身份，每个版本是独立的传输。同一请求（同一 `Id`）从任何无状态进程重提即续传：`Checkpointed` 且
+  > 64 MiB 的对象在最终 key 上留分段上传 + `.upload` 指针，`prepare = Resumed { bytes }`；其余（≤ 64 MiB、
+  `AtomicReplace`、`Direct`）从零重来。**中断的版本要先续完再拷下一个**：下一个版本 prepare 看到别的身份的指针，
+  abort 上传、删指针（`Restarted { OtherTransfer }`；共用 `with_identity_override` 时是 `BindingChanged`），被清掉的
+  版本日后再拷就乱序了。
+- 目的端版本顺序 = 各次发布的先后，与源端时间无关。同一 key 并行提交会打乱顺序、互删指针；同进程内
+  per-destination guard 在 prepare 拒绝第二个（`Conflict` / Transient，「another transfer in this process is writing
+  this destination file」）；跨进程靠调用约定（一个 key 一个写者）。
+- 不去重：已完成的版本再跑一次就再加一个版本；带 `final_destination_changed` 的失败可能已经生成了一个版本。
+- 删除标记没有内容：`Id(标记)` 的带版本 HEAD 回 405 → 条目 `NotFound`。data-mover 从不往最终 key 写删除标记；
+  要在目的端重放（在相邻两个版本之间对目的 key 发一次普通 DeleteObject）由调用方决定。
+- 目的桶暂停 / 未开版本：每次拷贝覆盖唯一的 `"null"` 版本，只剩最后拷的那个，`destination_version` 为 `None`。
+- 不保留：目的端版本是新 versionId、`LastModified` 是写入时间；`transfer` 不带源版本的标签、用户元数据、
+  content type、Object Lock retention / legal hold、存储类别、加密设置（S3 目的端 `stores_nothing()`，见
+  [metadata-negotiation.md](metadata-negotiation.md)）。标签只能由调用方的元数据计划（`MetadataMutation::Tags`，
+  写完后设置）给到目的端版本。
+- 真机（MinIO VM 102，2026-09-25，临时桶 `data-mover-c20-<run>`，跑完删除，服务器只剩 `a-bucket` /
+  `data-mover-test`）：`h/obj` 写 v1、v2、删除标记、v3 → `walkdir` 按序列出这 4 条（标记 `marker=1`、只有 v3
+  `latest=1`、`count=4`），`walkdir_2` 列 v1、v2、v3（`count=3`）；`h/gone`（最新是标记）与
+  `h/.data-mover-*.upload` 不列。999 个单版本 key 之后的 `p/z`（3 个版本，第一页停在 z3）：修复前 `walkdir` 发
+  z3（`count=1`）、z1、z2（`count=2`），`walkdir_2` 两条 `latest=1`；修复后都是 z1、z2、z3，`count=3`，只有 z3 latest。
+  `versioning_matrix.sh`（`data-mover-c17{,-lock}-1790313057`，已删）结果与 C18 相同：按 id 拷 v1、v2（流式与原生）
+  各得 2 个版本、新→旧 v2、v1、内容与源相同；按 id 中断续传 `Resumed { 16777216 }`、1 个版本。
+
 **MinIO 2023 的其他实测行为**：`ListMultipartUploads` 只按**精确 key** 返回（按前缀或整桶都是 0）—— 孤儿上传
 无法按前缀发现，只能靠 key 精确查询或服务端 `stale_uploads_expiry` 回收；Content-MD5 不符 → 400 BadDigest
 （role 协议把 `BadDigest` 映射成条目 `Corruption` / Transient：传输中损坏，重发即可；`InvalidDigest` —— 摘要头本身
@@ -454,7 +505,8 @@ Complete 成功后再 Complete → 404 NoSuchUpload；`If-Match` 对分段 ETag�
 - `DM-STORAGEGRID-REQUEST-CONTRACT`：
   `cargo test s3::storagegrid::tests --locked`，在 capturing Smithy connector seam
   验证只有 StorageGRID 去 `x-id`、所有 profile 的 DeleteObjects 都带签名 MD5；PR 与 release workflow 均独立执行。
-- `examples/s3_listing.rs` — walkdir / walkdir_2 / `--sub` / `--delete-dir`，逐条打印路径（真机验遍历与删除范围）。
+- `examples/s3_listing.rs` — walkdir / walkdir_2 / `--sub` / `--delete-dir`，逐条打印路径与 versionId / `latest=` /
+  `marker=` / `count=`（真机验遍历、版本与删除范围）；不给 URL 参数时读 `S3_LISTING_URL`（凭据不上命令行）。
 
 ## 改 S3 时
 
