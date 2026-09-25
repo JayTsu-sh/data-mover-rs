@@ -1,5 +1,5 @@
 // 标准库
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -62,6 +62,7 @@ use crate::{
     DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, Result, S3Entry,
     StorageEntryMessage, Tag, WalkDirAsyncIterator, datetime_to_string,
 };
+use version_listing::{VersionOrDeleteMarker, VersionPages, oldest_first_by_key};
 
 struct S3WalkRuntime<'a> {
     tx: &'a async_channel::Sender<StorageEntryMessage>,
@@ -99,27 +100,20 @@ struct BufferedPartUpload {
 
 struct VersionedScan<'a> {
     tx: &'a async_channel::Sender<StorageEntryMessage>,
-    versions: &'a [ObjectVersion],
-    delete_markers: &'a [DeleteMarkerEntry],
+    versions: Vec<ObjectVersion>,
+    delete_markers: Vec<DeleteMarkerEntry>,
     include_tags: bool,
     match_expressions: Option<&'a FilterExpression>,
     exclude_expressions: Option<&'a FilterExpression>,
     total_file_count: Arc<AtomicUsize>,
 }
 
-enum VersionOrDeleteMarker {
-    Version(ObjectVersion),
-    DeleteMarker(DeleteMarkerEntry),
-}
-
-type ReadVersionGroups = HashMap<String, Vec<(i64, ObjectVersion)>>;
-type ReadDeleteMarkers = HashMap<String, Vec<DeleteMarkerEntry>>;
-
 mod architecture;
 mod delete_objects_md5;
 mod dxn;
 mod multipart_rename;
 mod storagegrid;
+mod version_listing;
 
 /// S3 桶信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2243,20 +2237,16 @@ impl S3Storage {
             exclude_expressions,
             total_file_count,
         } = scan;
-        let object_versions = Self::group_object_versions(version_entries, delete_marker_entries);
+        let object_versions = oldest_first_by_key(version_entries, delete_marker_entries);
 
-        // 处理每个对象的所有版本
-        for (_key, versions) in object_versions {
-            // 按时间从旧到新排序
-            let mut sorted_versions = versions;
-            sorted_versions.sort_by_key(|a| a.0);
-
+        // 处理每个对象的所有版本（已按写入时间从旧到新排好，跨页的 key 已合并）
+        for (_key, sorted_versions) in object_versions {
             // 计算该对象的版本总数
             let version_count = u32::try_from(sorted_versions.len()).unwrap_or(u32::MAX);
 
             // 检查最后一个版本是否是删除标记，如果是则跳过整个对象
             let should_skip_object = match sorted_versions.last() {
-                Some((_, VersionOrDeleteMarker::DeleteMarker(_))) => {
+                Some(VersionOrDeleteMarker::DeleteMarker(_)) => {
                     debug!("[S3] 跳过对象，因为最后一个版本是删除标记");
                     true
                 }
@@ -2268,7 +2258,7 @@ impl S3Storage {
             }
 
             // 依次处理每个版本
-            for (_, version_or_delete_marker) in sorted_versions {
+            for version_or_delete_marker in sorted_versions {
                 match version_or_delete_marker {
                     VersionOrDeleteMarker::Version(version) => {
                         // 处理版本对象
@@ -2384,36 +2374,6 @@ impl S3Storage {
         tx.send(StorageEntryMessage::Scanned(Arc::new(entry)))
             .await
             .map_err(|_| StorageError::OperationError("接收端已关闭".to_string()))
-    }
-
-    fn group_object_versions(
-        versions: &[ObjectVersion],
-        delete_markers: &[DeleteMarkerEntry],
-    ) -> HashMap<String, Vec<(i64, VersionOrDeleteMarker)>> {
-        let mut grouped = HashMap::new();
-        for version in versions {
-            if let Some(key) = version.key() {
-                grouped
-                    .entry(key.to_string())
-                    .or_insert_with(Vec::new)
-                    .push((
-                        datatime_to_i64(version.last_modified()),
-                        VersionOrDeleteMarker::Version(version.clone()),
-                    ));
-            }
-        }
-        for marker in delete_markers {
-            if let Some(key) = marker.key() {
-                grouped
-                    .entry(key.to_string())
-                    .or_insert_with(Vec::new)
-                    .push((
-                        datatime_to_i64(marker.last_modified()),
-                        VersionOrDeleteMarker::DeleteMarker(marker.clone()),
-                    ));
-            }
-        }
-        grouped
     }
 
     /// 通过rx接收到`DataChunk`, 并将其写入到目标S3文件中（`MULTIPART_THRESHOLD`以下的文件一次性写入整个文件）
@@ -3613,6 +3573,7 @@ impl S3Storage {
     ) -> Result<()> {
         let mut key_marker = None;
         let mut version_id_marker = None;
+        let mut pages = VersionPages::default();
         loop {
             let mut request = self
                 .client
@@ -3647,38 +3608,40 @@ impl S3Storage {
                     .await?;
                 }
             }
-            let versions = response
-                .versions()
-                .iter()
-                .filter(|version| {
-                    version
-                        .key()
-                        .is_some_and(|key| key != prefix && !self.is_artifact_key(key))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let delete_markers = response
-                .delete_markers()
-                .iter()
-                .filter(|marker| {
-                    marker
-                        .key()
-                        .is_some_and(|key| key != prefix && !self.is_artifact_key(key))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+            key_marker = response.next_key_marker().map(str::to_string);
+            version_id_marker = response.next_version_id_marker().map(str::to_string);
+            // 一页可能停在某个 key 的版本中间：该 key 留到下一页合并后再发
+            let (versions, delete_markers) = pages.complete_keys(
+                response
+                    .versions()
+                    .iter()
+                    .filter(|version| {
+                        version
+                            .key()
+                            .is_some_and(|key| key != prefix && !self.is_artifact_key(key))
+                    })
+                    .cloned(),
+                response
+                    .delete_markers()
+                    .iter()
+                    .filter(|marker| {
+                        marker
+                            .key()
+                            .is_some_and(|key| key != prefix && !self.is_artifact_key(key))
+                    })
+                    .cloned(),
+                key_marker.is_some(),
+            );
             self.process_versioned_entries(VersionedScan {
                 tx: runtime.tx,
-                versions: &versions,
-                delete_markers: &delete_markers,
+                versions,
+                delete_markers,
                 include_tags: runtime.include_tags,
                 match_expressions: runtime.match_expr,
                 exclude_expressions: runtime.exclude_expr,
                 total_file_count: runtime.total_file_count.clone(),
             })
             .await?;
-            key_marker = response.next_key_marker().map(str::to_string);
-            version_id_marker = response.next_version_id_marker().map(str::to_string);
             if key_marker.is_none() {
                 break;
             }
@@ -3992,51 +3955,27 @@ impl S3Storage {
             .0
     }
 
-    fn group_read_versions(
-        versions: &[ObjectVersion],
-        markers: &[DeleteMarkerEntry],
-    ) -> (ReadVersionGroups, ReadDeleteMarkers) {
-        let mut grouped_versions = HashMap::new();
-        for version in versions {
-            if let Some(key) = version.key() {
-                grouped_versions
-                    .entry(key.to_string())
-                    .or_insert_with(Vec::new)
-                    .push((datatime_to_i64(version.last_modified()), version.clone()));
-            }
-        }
-        let mut grouped_markers = HashMap::new();
-        for marker in markers {
-            if let Some(key) = marker.key() {
-                grouped_markers
-                    .entry(key.to_string())
-                    .or_insert_with(Vec::new)
-                    .push(marker.clone());
-            }
-        }
-        (grouped_versions, grouped_markers)
-    }
-
+    /// `entries`: one key's versions and delete markers, oldest first. A key whose newest entry is
+    /// a delete marker is skipped; otherwise its versions are listed (markers are not).
     async fn append_object_versions(
         &self,
         key: &str,
-        mut versions: Vec<(i64, ObjectVersion)>,
-        markers: Option<&Vec<DeleteMarkerEntry>>,
+        entries: Vec<VersionOrDeleteMarker>,
         ctx: &crate::dir_tree::ReadContext,
         files: &mut Vec<Arc<EntryEnum>>,
     ) {
-        let latest_marker = markers
-            .into_iter()
-            .flatten()
-            .filter_map(|marker| marker.last_modified())
-            .map(|time| datatime_to_i64(Some(time)))
-            .max()
-            .unwrap_or(0);
-        let latest_version = versions.iter().map(|(time, _)| *time).max().unwrap_or(0);
-        if latest_marker > latest_version {
+        if matches!(entries.last(), Some(VersionOrDeleteMarker::DeleteMarker(_))) {
             return;
         }
-        versions.sort_by_key(|(time, _)| *time);
+        let versions = entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                VersionOrDeleteMarker::Version(version) => {
+                    Some((datatime_to_i64(version.last_modified()), version))
+                }
+                VersionOrDeleteMarker::DeleteMarker(_) => None,
+            })
+            .collect::<Vec<_>>();
         let version_count = u32::try_from(versions.len()).unwrap_or(u32::MAX);
         let latest_index = versions.len().saturating_sub(1);
         for (index, (modified, version)) in versions.into_iter().enumerate() {
@@ -4107,6 +4046,7 @@ impl S3Storage {
             // === Versioned 模式 ===
             let mut key_marker: Option<String> = None;
             let mut version_id_marker: Option<String> = None;
+            let mut pages = VersionPages::default();
 
             loop {
                 let mut request = self
@@ -4133,30 +4073,24 @@ impl S3Storage {
 
                 self.append_common_prefixes(response.common_prefixes(), ctx, &mut subdirs);
 
-                let (version_groups, delete_markers) =
-                    Self::group_read_versions(response.versions(), response.delete_markers());
+                key_marker = response.next_key_marker().map(str::to_string);
+                version_id_marker = response.next_version_id_marker().map(str::to_string);
+                // 一页可能停在某个 key 的版本中间：该 key 留到下一页合并后再处理
+                let (versions, markers) = pages.complete_keys(
+                    response.versions().iter().cloned(),
+                    response.delete_markers().iter().cloned(),
+                    key_marker.is_some(),
+                );
 
                 // 处理每个 object 的版本
-                for (key, versions) in version_groups {
+                for (key, entries) in oldest_first_by_key(versions, markers) {
                     if key == prefix_key || self.is_artifact_key(&key) {
                         continue;
                     }
-                    self.append_object_versions(
-                        &key,
-                        versions,
-                        delete_markers.get(&key),
-                        ctx,
-                        &mut files,
-                    )
-                    .await;
+                    self.append_object_versions(&key, entries, ctx, &mut files)
+                        .await;
                 }
 
-                key_marker = response
-                    .next_key_marker()
-                    .map(std::string::ToString::to_string);
-                version_id_marker = response
-                    .next_version_id_marker()
-                    .map(std::string::ToString::to_string);
                 if key_marker.is_none() {
                     break;
                 }
