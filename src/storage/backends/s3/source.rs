@@ -173,6 +173,7 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
                 .then(|| Bytes::copy_from_slice(facts.etag.as_bytes())),
             inline_timestamps: None,
             inline_mode: None,
+            inline_ownership: None,
             version: pinned_version(&facts, version),
             listing: ListingFacts::default(),
         })

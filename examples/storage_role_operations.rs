@@ -31,8 +31,8 @@ use data_mover::integrity::{
     IntegrityMode, IntegrityOptions, IntegrityRequest, compare as compare_objects,
 };
 use data_mover::model::{
-    BackendKind, HistoryOrder, ObservationMode, ObservationPlan, ObservedEntry, StoragePath,
-    StorageTimestamp,
+    BackendKind, HistoryOrder, MetadataObservation, ObservationMode, ObservationPlan,
+    ObservedEntry, StoragePath, StorageTimestamp,
 };
 use data_mover::ndx_walk::{NdxWalkRequest, ndx_walk};
 use data_mover::storage::{
@@ -142,6 +142,17 @@ enum Command {
         /// (hex), e.g. to see that two objects with the same content at two keys differ.
         #[arg(long)]
         identity: bool,
+        /// Also ask for numeric ownership and print each entry's owner, group and mode (or why
+        /// there is none). NFS and Local answer it from the listing itself.
+        #[arg(long)]
+        ownership: bool,
+        /// Also ask for the ACL, best effort, and print what its observation was (not the ACL).
+        /// Where the mount or filesystem can read ACLs this sends every entry through the
+        /// metadata role, so a run with and one without `--acl` compare ownership read from the
+        /// listing against a per-entry GETATTR/lstat; `acl=Value…` or `acl=Failed…` on the
+        /// output shows the role really was asked (`Unsupported` could come from either).
+        #[arg(long)]
+        acl: bool,
     },
     /// Stream an NDX-paged depth-first traversal, printing one line per page.
     NdxWalk {
@@ -245,6 +256,8 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
         quiet,
         snapshot_bytes,
         identity,
+        ownership,
+        acl,
         ..
     } = command
     else {
@@ -266,8 +279,16 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
                     } else {
                         String::new()
                     };
+                    let mut owner = if *ownership {
+                        ownership_of(entry)
+                    } else {
+                        String::new()
+                    };
+                    if *acl {
+                        owner.push_str(&acl_of(entry));
+                    }
                     println!(
-                        "{:?} {}{}{identity}",
+                        "{:?} {}{}{identity}{owner}",
                         entry.kind(),
                         entry.path(),
                         version_of(entry)
@@ -300,11 +321,20 @@ fn traversal_request(args: &Args, command: &Command) -> Result<TraversalRequest,
         order,
         versions,
         path,
+        ownership,
+        acl,
         ..
     } = command
     else {
         unreachable!("dispatched by the caller")
     };
+    let mut plan = ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly);
+    if *ownership {
+        plan = plan.with_ownership_mode(ObservationMode::InlineOnly);
+    }
+    if *acl {
+        plan = plan.with_acl(ObservationMode::BestEffort);
+    }
     let filter =
         DslTraversalFilter::parse(match_expression.as_deref(), exclude_expression.as_deref())?;
     let slots = NonZeroUsize::new(args.concurrency).ok_or("concurrency must be non-zero")?;
@@ -313,7 +343,7 @@ fn traversal_request(args: &Args, command: &Command) -> Result<TraversalRequest,
         order: TraversalOrder::from(*order),
         max_inflight_operations: slots,
         max_buffered_items: slots,
-        observation_plan: ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly),
+        observation_plan: plan,
         cancel: CancellationToken::new(),
         filter: (!filter.is_empty()).then(|| Arc::new(filter) as Arc<_>),
         max_depth: max_depth.and_then(NonZeroUsize::new),
@@ -367,6 +397,29 @@ fn version_of(entry: &ObservedEntry) -> String {
             }
         )
     })
+}
+
+/// ` owner=<uid>:<gid>:<mode, octal>/<provenance>`, or the observation that stands in for it.
+fn ownership_of(entry: &ObservedEntry) -> String {
+    match entry.metadata().ownership_mode() {
+        MetadataObservation::Value { value, provenance } => format!(
+            " owner={}:{}:{:o}/{provenance:?}",
+            value.uid, value.gid, value.mode
+        ),
+        other => format!(" owner={other:?}"),
+    }
+}
+
+/// ` acl=<what the observation was>`, without the ACL itself.
+fn acl_of(entry: &ObservedEntry) -> String {
+    let observed = match entry.metadata().acl() {
+        MetadataObservation::Value { provenance, .. } => format!("Value/{provenance:?}"),
+        MetadataObservation::NotRequested => "NotRequested".to_owned(),
+        MetadataObservation::NotApplicable => "NotApplicable".to_owned(),
+        MetadataObservation::Unsupported => "Unsupported".to_owned(),
+        MetadataObservation::Failed { class, .. } => format!("Failed/{class:?}"),
+    };
+    format!(" acl={observed}")
 }
 
 /// ` identity=<strength>:<first 8 bytes of the identity key, hex>`.

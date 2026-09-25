@@ -114,6 +114,7 @@ impl NfsReadSourceAdapter {
             content_version: Some(observed.content_version),
             inline_timestamps: None,
             inline_mode: None,
+            inline_ownership: None,
             version: SourceVersion::Current,
             listing: ListingFacts::default(),
         })

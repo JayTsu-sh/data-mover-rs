@@ -18,7 +18,12 @@ use crate::model::{
     SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding,
     TimePrecision, TimestampMetadata, Transience,
 };
-use crate::storage::{Metadata as MetadataRole, MetadataMutation, StorageRoleFailure};
+use crate::storage::{
+    Metadata as MetadataRole, MetadataMutation, SourceDescriptor, StorageRoleFailure,
+};
+
+#[path = "observation_listed.rs"]
+mod listed;
 
 pub(crate) struct LocalObservationAdapter {
     root: Arc<Dir>,
@@ -374,6 +379,16 @@ impl MetadataRole for LocalObservationAdapter {
         {
             None
         }
+    }
+
+    /// The listing's own `lstat` already answers ownership and timestamps; see
+    /// [`listed::observe_listed`].
+    fn observe_listed(
+        &self,
+        descriptor: &SourceDescriptor,
+        plan: ObservationPlan,
+    ) -> Option<Result<MetadataObservations, StorageRoleFailure>> {
+        listed::observe_listed(descriptor, plan)
     }
 
     async fn observe(

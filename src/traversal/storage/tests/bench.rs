@@ -209,7 +209,7 @@ fn assembly_cost_per_entry() {
         let started = Instant::now();
         let mut assembled = Vec::with_capacity(count);
         for descriptor in batch {
-            match observe_listed(descriptor, plan) {
+            match observe_listed(&FakeMetadata, descriptor, plan) {
                 Listed::Observed(Ok(entry)) => assembled.push(entry),
                 _ => panic!("a plain file needs no I/O"),
             }

@@ -70,6 +70,30 @@ impl ObservationPlan {
     }
 }
 
+#[cfg(test)]
+impl ObservationPlan {
+    /// Every combination of the four modes over the five families, for tests that must hold
+    /// under any plan.
+    pub(crate) fn every() -> impl Iterator<Item = Self> {
+        const MODES: [ObservationMode; 4] = [
+            ObservationMode::Omit,
+            ObservationMode::InlineOnly,
+            ObservationMode::BestEffort,
+            ObservationMode::Required,
+        ];
+        (0..MODES.len().pow(5)).map(|index| {
+            let mode = |family: u32| MODES[index / MODES.len().pow(family) % MODES.len()];
+            Self {
+                acl: mode(0),
+                xattrs: mode(1),
+                tags: mode(2),
+                ownership_mode: mode(3),
+                timestamps: mode(4),
+            }
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataProvenance {
     Inline,

@@ -14,10 +14,14 @@ use super::{
     TraversalRequest, TraversalSession, TraversalSource, TraversalTerminalFailure,
     TraversalVersions,
 };
+#[cfg(unix)]
+use crate::model::ObservationMode;
 use crate::model::{EntryKind, FailureClass, ObservationPlan, Operation, StoragePath};
 use crate::storage::backends::local::namespace::LocalNamespace;
 use crate::storage::backends::local::observation::LocalObservationAdapter;
 use crate::storage::backends::local::test_traversal_storage;
+#[cfg(unix)]
+use crate::storage::{Metadata as MetadataRole, Namespace as _, NamespaceRequest, NamespaceResult};
 
 struct Fixture {
     source: StorageTraversalSource,
@@ -137,7 +141,7 @@ async fn literal_backslash_is_distinct_from_nested_path() -> io::Result<()> {
 #[cfg(unix)]
 #[tokio::test]
 async fn traversal_applies_one_optional_metadata_plan_to_each_entry() -> io::Result<()> {
-    use crate::model::{MetadataObservation, MetadataProvenance, ObservationMode};
+    use crate::model::{MetadataObservation, MetadataProvenance};
 
     let root = tempfile::tempdir()?;
     std::fs::write(root.path().join("file"), b"value")?;
@@ -333,8 +337,9 @@ async fn finish_before_eof_cannot_claim_completeness() -> io::Result<()> {
     Ok(())
 }
 
-/// The default plan is served from the listing alone, so an explicit ownership plan is what
-/// sends every entry through the Metadata role, whose probe delays the first observation.
+/// The default plan is served from the listing alone, and so is ownership (the listing's own
+/// `lstat` carries it), so asking for xattrs is what sends every entry through the Metadata
+/// role, whose probe delays the first observation.
 #[cfg(unix)]
 #[tokio::test]
 async fn out_of_order_completion_is_reordered_and_backpressured() -> io::Result<()> {
@@ -344,8 +349,7 @@ async fn out_of_order_completion_is_reordered_and_backpressured() -> io::Result<
     }
     let fixture = fixture(root.path())?;
     let mut request = request(CancellationToken::new(), 3, 1);
-    request.observation_plan =
-        ObservationPlan::default().with_ownership_mode(crate::model::ObservationMode::InlineOnly);
+    request.observation_plan = ObservationPlan::default().with_xattrs(ObservationMode::BestEffort);
     let mut session = fixture.source.traverse(request);
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let (started_before_drain, _) = fixture.adapter.probe_orders();
@@ -445,5 +449,91 @@ async fn a_source_without_versions_refuses_to_list_every_version() -> io::Result
         }
         other => panic!("expected an Unsupported session failure, got {other:?}"),
     }
+    Ok(())
+}
+
+/// Every plan, answered from what a listing's `lstat` carried, is exactly what the observation
+/// role's own `lstat` gives for a file, a directory and a symlink; it declines only when an ACL
+/// or xattrs are really wanted, which take a call.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_listed_child_is_observed_exactly_as_its_own_lstat_would() -> io::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("file"), b"x")?;
+    std::fs::create_dir(root.path().join("dir"))?;
+    std::os::unix::fs::symlink("file", root.path().join("link"))?;
+    let fixture = fixture(root.path())?;
+    let listed = match fixture
+        .namespace
+        .execute(NamespaceRequest::List(StoragePath::root()))
+        .await
+        .map_err(io::Error::other)?
+    {
+        NamespaceResult::Entries(entries) => entries,
+        other => return Err(io::Error::other(format!("unexpected listing {other:?}"))),
+    };
+    assert_eq!(listed.len(), 3);
+    let mut answered = 0;
+    for (descriptor, plan) in listed
+        .iter()
+        .flat_map(|descriptor| ObservationPlan::every().map(move |plan| (descriptor, plan)))
+    {
+        let calls = |mode| {
+            descriptor.kind != EntryKind::Symlink
+                && matches!(
+                    mode,
+                    ObservationMode::BestEffort | ObservationMode::Required
+                )
+        };
+        let needs_call = calls(plan.acl()) || calls(plan.xattrs());
+        let Some(from_listing) = fixture.adapter.observe_listed(descriptor, plan) else {
+            assert!(needs_call, "{plan:?} declined for {}", descriptor.path);
+            continue;
+        };
+        assert!(!needs_call, "{plan:?} answered without its call");
+        let from_lstat =
+            MetadataRole::observe(fixture.adapter.as_ref(), &descriptor.path, plan).await;
+        assert_eq!(
+            format!("{from_listing:?}"),
+            format!("{from_lstat:?}"),
+            "{plan:?} for {}",
+            descriptor.path
+        );
+        answered += 1;
+    }
+    assert!(answered > 300, "{answered}");
+    Ok(())
+}
+
+/// Ownership is carried by the listing's `lstat`, so a traversal that asks for it observes
+/// nothing through the metadata role and still reports it on every entry.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_ownership_plan_costs_no_observation_per_entry() -> io::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::create_dir(root.path().join("dir"))?;
+    for name in ["a", "dir/b", "dir/c"] {
+        std::fs::write(root.path().join(name), b"x")?;
+    }
+    let fixture = fixture(root.path())?;
+    let mut request = request(CancellationToken::new(), 4, 4);
+    request.observation_plan = ObservationPlan::default()
+        .with_ownership_mode(ObservationMode::Required)
+        .with_timestamps(ObservationMode::InlineOnly);
+    let mut session = fixture.source.traverse(request);
+    let items = drain(&mut session).await;
+    let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
+    assert_eq!(completion.observed_entries, 4);
+    for item in &items {
+        if let TraversalItem::Entry(entry) = item {
+            assert!(
+                entry.metadata().ownership_mode().value().is_some(),
+                "{}",
+                entry.path()
+            );
+        }
+    }
+    let (started, _) = fixture.adapter.probe_orders();
+    assert!(started.is_empty(), "observed through the role: {started:?}");
     Ok(())
 }

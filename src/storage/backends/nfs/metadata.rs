@@ -3,13 +3,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::acl;
+use super::namespace::inline_ownership;
 use super::source::NfsProtocolFailure;
 use crate::model::{
-    ExtendedAttribute, MetadataObservation, MetadataObservations, MetadataProvenance,
+    EntryKind, ExtendedAttribute, MetadataObservation, MetadataObservations, MetadataProvenance,
     ObservationMode, ObservationPlan, OwnershipMode, StoragePath, StorageTimestamp, TimePrecision,
     TimestampMetadata,
 };
-use crate::storage::{CopiedMetadataObservation, Metadata, MetadataMutation, StorageRoleFailure};
+use crate::storage::{
+    CopiedMetadataObservation, InlineOwnership, Metadata, MetadataMutation, SourceDescriptor,
+    StorageRoleFailure,
+};
 
 pub(crate) struct NfsMetadataAdapter {
     protocol: Arc<dyn NfsMetadataProtocol>,
@@ -81,38 +85,17 @@ impl NfsMetadataAdapter {
         plan: ObservationPlan,
         entry: NfsMetadataInline,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
-        if plan.ownership_mode() == ObservationMode::Required
-            && (entry.uid.is_none() || entry.gid.is_none())
-        {
-            return Err(unsupported(path));
-        }
+        let owner = inline_ownership(entry.uid, entry.gid, entry.mode);
+        refuse_unmapped(path, plan, owner)?;
         let (acl, xattrs) = self
             .observe_optional_families(path, plan, entry.symlink)
             .await?;
-        let ownership = ownership(plan.ownership_mode(), &entry);
-        let timestamps = inline(
-            plan.timestamps(),
-            TimestampMetadata {
-                accessed: timestamp(entry.atime),
-                modified: timestamp(entry.mtime),
-                created: timestamp(entry.ctime),
-            },
-        );
-        MetadataObservations::new(
-            acl,
-            xattrs,
-            optional_not_applicable(plan.tags()),
-            ownership,
-            timestamps,
-        )
-        .map_err(|_| {
-            super::source::entry_failure(
-                path,
-                crate::model::Operation::Metadata,
-                crate::model::FailureClass::Protocol,
-                crate::model::Transience::Permanent,
-            )
-        })
+        let timestamps = TimestampMetadata {
+            accessed: timestamp(entry.atime),
+            modified: timestamp(entry.mtime),
+            created: timestamp(entry.ctime),
+        };
+        observations(path, plan, owner, timestamps, (acl, xattrs))
     }
 
     /// ACL and xattrs: never for a symlink, otherwise one extra call each when asked for and the
@@ -184,8 +167,98 @@ impl NfsMetadataAdapter {
     }
 }
 
+/// A plan that requires ownership cannot be met by an owner or group that maps to no number.
+fn refuse_unmapped(
+    path: &StoragePath,
+    plan: ObservationPlan,
+    owner: InlineOwnership,
+) -> Result<(), StorageRoleFailure> {
+    if plan.ownership_mode() == ObservationMode::Required && owner == InlineOwnership::Unmapped {
+        return Err(unsupported(path));
+    }
+    Ok(())
+}
+
+type OptionalFamilies = (
+    MetadataObservation<crate::model::AclMetadata>,
+    MetadataObservation<Vec<ExtendedAttribute>>,
+);
+
+/// Everything one attribute set says under `plan`, whether it came from a GETATTR or from the
+/// READDIRPLUS entry that listed the child: both go through here, so they cannot disagree.
+fn observations(
+    path: &StoragePath,
+    plan: ObservationPlan,
+    owner: InlineOwnership,
+    timestamps: TimestampMetadata,
+    (acl, xattrs): OptionalFamilies,
+) -> Result<MetadataObservations, StorageRoleFailure> {
+    // An owner or group the server named and nfs-rs could not map has no number to report, and
+    // one made up would be written as the owner (see `nfs::owner_id`).
+    let ownership = match owner {
+        InlineOwnership::Known(value) => inline(plan.ownership_mode(), value),
+        InlineOwnership::Unmapped => unmapped(plan.ownership_mode()),
+    };
+    MetadataObservations::new(
+        acl,
+        xattrs,
+        optional_not_applicable(plan.tags()),
+        ownership,
+        inline(plan.timestamps(), timestamps),
+    )
+    .map_err(|_| {
+        super::source::entry_failure(
+            path,
+            crate::model::Operation::Metadata,
+            crate::model::FailureClass::Protocol,
+            crate::model::Transience::Permanent,
+        )
+    })
+}
+
+/// ACL or xattrs of a listed child when answering takes no call: what
+/// [`NfsMetadataAdapter::observe_optional_families`] reports without reaching the server.
+fn listed_optional<T>(
+    mode: ObservationMode,
+    symlink: bool,
+    supported: bool,
+) -> Option<MetadataObservation<T>> {
+    if symlink {
+        return Some(optional_not_applicable(mode));
+    }
+    match mode {
+        ObservationMode::Omit | ObservationMode::InlineOnly => {
+            Some(MetadataObservation::NotRequested)
+        }
+        ObservationMode::BestEffort | ObservationMode::Required if !supported => {
+            Some(MetadataObservation::Unsupported)
+        }
+        ObservationMode::BestEffort | ObservationMode::Required => None,
+    }
+}
+
 #[async_trait]
 impl Metadata for NfsMetadataAdapter {
+    /// READDIRPLUS carries the same attributes a GETATTR would return (`NFSv4` asks for the same
+    /// bitmap in both), so ownership and timestamps of a listed child need no second round
+    /// trip; only an ACL or xattrs the plan really wants do.
+    fn observe_listed(
+        &self,
+        descriptor: &SourceDescriptor,
+        plan: ObservationPlan,
+    ) -> Option<Result<MetadataObservations, StorageRoleFailure>> {
+        let symlink = descriptor.kind == EntryKind::Symlink;
+        let acl = listed_optional(plan.acl(), symlink, self.protocol.supports_acl())?;
+        let xattrs = listed_optional(plan.xattrs(), symlink, self.protocol.supports_xattrs())?;
+        let owner = descriptor.inline_ownership?;
+        let timestamps = descriptor.inline_timestamps?;
+        let path = &descriptor.path;
+        Some(
+            refuse_unmapped(path, plan, owner)
+                .and_then(|()| observations(path, plan, owner, timestamps, (acl, xattrs))),
+        )
+    }
+
     fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
         Some(
             ObservationPlan::default()
@@ -330,25 +403,6 @@ fn inline<T>(mode: ObservationMode, value: T) -> MetadataObservation<T> {
                 provenance: MetadataProvenance::Inline,
             }
         }
-    }
-}
-
-/// An owner or group the server named and nfs-rs could not map has no number to report, and one
-/// made up would be written as the owner (see `nfs::owner_id`).
-fn ownership(
-    mode: ObservationMode,
-    entry: &NfsMetadataInline,
-) -> MetadataObservation<OwnershipMode> {
-    match (entry.uid, entry.gid) {
-        (Some(uid), Some(gid)) => inline(
-            mode,
-            OwnershipMode {
-                uid,
-                gid,
-                mode: entry.mode,
-            },
-        ),
-        _ => unmapped(mode),
     }
 }
 

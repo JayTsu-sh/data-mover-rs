@@ -137,6 +137,12 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   `post_op_fh3` FALSE、v4 属性里没有 `FATTR4_FILEHANDLE`）——
   报成该子项自己的 `Protocol` / Unknown 条目失败，兄弟照常，列举 `Partial`（之前整个目录失败；P7 评审现存问题 2）。
   只有 LOOKUP 目录、READDIRPLUS 流本身出错才让整个列举失败。后续可考虑对缺属性 / 句柄的项补一次 LOOKUP。
+- role `List` 的描述符带 `inline_timestamps` + `inline_ownership`（P7 C0）：同一份 READDIRPLUS 属性，owner / group
+  经同一个 `owner_id` 映射（映射不了 → `Unmapped`，与 GETATTR 路径一样报 `Unsupported`，`Required` 时同样拒绝）。
+  v4 READDIR 与 GETATTR 请求同一个 `standard_getattr_bitmap`，v3 READDIRPLUS 带完整 fattr3，所以
+  `NfsMetadataAdapter::observe_listed` 对只要 ownership / timestamps（ACL / xattr 为 Omit / InlineOnly 或 mount
+  不支持）的计划直接用列举属性作答，遍历不再每条目一次 GETATTR；两条路径共用 `observations()`，
+  `metadata_tests.rs::a_listed_child_is_observed_exactly_as_a_getattr_would` 逐计划比对。
 - legacy `delete_dir_all(_with_progress)` 内部走 `walk_listing(.., hide_artifacts=false)`：不这样的话
   含 artifact 的目录 `rmdir` 会失败，而事件只记日志、`error: None`，静默删不干净。role `Delete(dir)`
   走的就是它，所以 NFS 的 `delete_tree` 不需要额外清扫。

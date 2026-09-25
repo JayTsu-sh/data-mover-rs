@@ -533,9 +533,17 @@ fn prepare_child(
         }
         Some(decision) => {
             prepared.tally(shared, kind, &descriptor.path, work.child_depth, decision);
-            observe_listed(descriptor, shared.policy.observation_plan)
+            observe_listed(
+                shared.metadata.as_ref(),
+                descriptor,
+                shared.policy.observation_plan,
+            )
         }
-        None => observe_listed(descriptor, shared.policy.observation_plan),
+        None => observe_listed(
+            shared.metadata.as_ref(),
+            descriptor,
+            shared.policy.observation_plan,
+        ),
     };
     let deferred = match (&listed, immediate) {
         (_, Some(_)) => None,

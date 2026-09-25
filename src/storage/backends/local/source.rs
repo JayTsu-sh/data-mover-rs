@@ -202,6 +202,7 @@ impl ReadSource for LocalReadSource {
             content_version: Some(version),
             inline_timestamps: None,
             inline_mode: None,
+            inline_ownership: None,
             version: SourceVersion::Current,
             listing: ListingFacts::default(),
         })

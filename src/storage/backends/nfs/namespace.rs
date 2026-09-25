@@ -6,10 +6,11 @@ use async_trait::async_trait;
 use super::source::{NfsProtocolFailure, entry_failure, role_failure};
 use crate::model::{
     BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength, Operation,
-    SourceIdentity, SourceVersion, StoragePath, SymlinkTarget, SymlinkTargetEncoding, Transience,
+    OwnershipMode, SourceIdentity, SourceVersion, StoragePath, SymlinkTarget,
+    SymlinkTargetEncoding, Transience,
 };
-use crate::storage::ListingFacts;
 use crate::storage::artifacts::is_artifact_native;
+use crate::storage::{InlineOwnership, ListingFacts};
 use crate::storage::{
     Namespace, NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure,
 };
@@ -30,6 +31,18 @@ pub(crate) struct NfsNamespaceObservation {
     pub(crate) timestamps: Option<crate::model::TimestampMetadata>,
     /// POSIX permission bits from the same attributes.
     pub(crate) mode: Option<u32>,
+    /// Numeric ownership from the same attributes, mapped the way the NFS metadata role maps a
+    /// GETATTR (`nfs::owner_id`), so a plan asking for ownership costs no extra round trip.
+    pub(crate) ownership: Option<InlineOwnership>,
+}
+
+/// The inline ownership of one attribute set: known only when both owner and group map to a
+/// number. `mode` is the full attribute mode, which is what the metadata role reports.
+pub(crate) fn inline_ownership(uid: Option<u32>, gid: Option<u32>, mode: u32) -> InlineOwnership {
+    match (uid, gid) {
+        (Some(uid), Some(gid)) => InlineOwnership::Known(OwnershipMode { uid, gid, mode }),
+        _ => InlineOwnership::Unmapped,
+    }
 }
 
 /// A listed child the listing could not describe.
@@ -206,6 +219,7 @@ fn descriptor(
         content_version: None,
         inline_timestamps: entry.timestamps,
         inline_mode: entry.mode,
+        inline_ownership: entry.ownership,
         version: SourceVersion::Current,
         listing: ListingFacts::default(),
     })
@@ -264,6 +278,7 @@ mod tests {
             file_handle: bytes::Bytes::from(value.to_owned()),
             timestamps: None,
             mode: None,
+            ownership: None,
         }
     }
 

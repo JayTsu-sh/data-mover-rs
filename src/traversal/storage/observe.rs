@@ -96,10 +96,12 @@ fn listed_observations(
     .map_err(|_| StorageRoleFailure::Entry(entry_failure(&descriptor.path, FailureClass::Protocol)))
 }
 
-/// The metadata of `descriptor` when the listing alone answers it: a listing-only child, or a
-/// plan that asks for nothing the listing did not carry. `None` means the metadata role must be
-/// asked, which is I/O.
+/// The metadata of `descriptor` when the listing alone answers it: a listing-only child, a plan
+/// that asks for nothing the listing did not carry, or one the metadata role can answer from the
+/// listing's own attributes ([`Metadata::observe_listed`]). `None` means the metadata role must
+/// be asked, which is I/O. A listed version is always asked: its observation is bound to it.
 fn metadata_without_io(
+    metadata_role: &dyn Metadata,
     plan: ObservationPlan,
     descriptor: &SourceDescriptor,
 ) -> Option<Result<MetadataObservations, StorageRoleFailure>> {
@@ -108,6 +110,9 @@ fn metadata_without_io(
     }
     if !needs_metadata_role(plan, descriptor) {
         return Some(inline_observations(plan, descriptor));
+    }
+    if descriptor.listing.version.is_none() {
+        return metadata_role.observe_listed(descriptor, plan);
     }
     None
 }
@@ -229,11 +234,15 @@ impl Listed {
 
 /// Observes `descriptor` without I/O, inside the listing's task, when nothing about it needs
 /// any.
-pub(super) fn observe_listed(descriptor: SourceDescriptor, plan: ObservationPlan) -> Listed {
+pub(super) fn observe_listed(
+    metadata_role: &dyn Metadata,
+    descriptor: SourceDescriptor,
+    plan: ObservationPlan,
+) -> Listed {
     if descriptor.kind == EntryKind::Symlink {
         return Listed::Unobserved(Box::new(descriptor));
     }
-    match metadata_without_io(plan, &descriptor) {
+    match metadata_without_io(metadata_role, plan, &descriptor) {
         Some(Ok(metadata)) => Listed::Observed(assemble(descriptor, metadata, None).map(Box::new)),
         Some(Err(failure)) => Listed::Observed(Err(failure)),
         None => Listed::Unobserved(Box::new(descriptor)),
@@ -247,7 +256,7 @@ pub(super) async fn observe(
     descriptor: SourceDescriptor,
     plan: ObservationPlan,
 ) -> Result<ObservedEntry, StorageRoleFailure> {
-    let metadata = match metadata_without_io(plan, &descriptor) {
+    let metadata = match metadata_without_io(metadata_role, plan, &descriptor) {
         Some(metadata) => metadata?,
         None => role_observations(metadata_role, &descriptor, plan).await?,
     };

@@ -37,8 +37,8 @@ pub use delete_tree::{
     DeleteTreeCompletion, DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest, DeleteTreeSession,
     DeleteTreeTerminalFailure, delete_tree,
 };
-pub(crate) use descriptor::ListingFacts;
 pub use descriptor::SourceDescriptor;
+pub(crate) use descriptor::{InlineOwnership, ListingFacts};
 pub use discovery::{DestinationPrepareRequest, PrepareFact, RestartReason, ResumeMode};
 pub use factory::{
     BackendConfig, BackendConnectError, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy,

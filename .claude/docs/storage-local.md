@@ -75,7 +75,7 @@ P1 复现过：`delete_tree` 的根是链接时会删光链接目标里的文件
 
 | 动词 | 行为 |
 |---|---|
-| `List` | 打开目录后 `entries()` + 逐子项 `DirEntry::metadata()` (不跟随)。描述符的身份、backend fact、content version、时间戳与观察角色同源；unix 上 `inline_mode = mode & 0o7777`。过滤 `.data-mover-*` 传输临时文件。子项拼不成 `StoragePath` (非 UTF-8、超长) → 带独立身份的逐项失败 (`NamespaceResult::Listing`)；读目录到 stat 之间消失的子项直接跳过 |
+| `List` | 打开目录后 `entries()` + 逐子项 `DirEntry::metadata()` (不跟随)。描述符的身份、backend fact、content version、时间戳与观察角色同源；unix 上 `inline_mode = mode & 0o7777`，另带 `inline_ownership`（uid / gid / 完整 mode，与观察角色同源的 lstat；`observe_listed` 据此回答只要 ownership / timestamps 的计划，遍历不再每条目再 lstat 一次，P7 C0）。过滤 `.data-mover-*` 传输临时文件。子项拼不成 `StoragePath` (非 UTF-8、超长) → 带独立身份的逐项失败 (`NamespaceResult::Listing`)；读目录到 stat 之间消失的子项直接跳过 |
 | `Stat` | 父目录句柄里 `symlink_metadata`；根用 `dir_metadata` |
 | `ReadLink` | `read_link_contents` (原样返回链接文本；`read_link` 会把绝对目标当越界拒绝) |
 | `CreateDirectory` | 只建一级；已存在 → `Conflict`，父缺失 → `NotFound`；之后同步父目录 |

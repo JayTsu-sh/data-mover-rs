@@ -91,6 +91,7 @@ fn descriptor(full_path: &str, kind: EntryKind, timestamps: bool) -> Result<Sour
         content_version: None,
         inline_timestamps: None,
         inline_mode: None,
+        inline_ownership: None,
         version: SourceVersion::Current,
         listing: ListingFacts::default(),
     };

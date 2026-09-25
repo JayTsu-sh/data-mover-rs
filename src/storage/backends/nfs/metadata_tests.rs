@@ -401,3 +401,79 @@ async fn mode_only_apply_never_observes_or_rewrites_numeric_ownership()
     assert_eq!(protocol.sets.load(Ordering::SeqCst), 0o640);
     Ok(())
 }
+
+/// Every plan, answered from a listed child's READDIRPLUS attributes, is exactly what a GETATTR
+/// of the same attributes gives — values, provenance and the `Required`-ownership refusal — and
+/// it declines only when an ACL or xattrs the mount supports are really wanted.
+#[tokio::test]
+async fn a_listed_child_is_observed_exactly_as_a_getattr_would() {
+    let path = StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
+    let mut answered = 0;
+    for (owner_unmapped, xattrs_supported) in [(false, false), (false, true), (true, true)] {
+        let protocol = Arc::new(CancellingProtocol {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            sets: AtomicUsize::new(0),
+            xattrs_supported,
+            owner_unmapped,
+        });
+        let identity = crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "src")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let adapter = NfsMetadataAdapter::new(Arc::clone(&protocol) as _, identity.clone());
+        let listed = listed_like_stat(&protocol, &path, identity).await;
+        for plan in ObservationPlan::every() {
+            let wants = |mode, supported| {
+                supported
+                    && matches!(
+                        mode,
+                        ObservationMode::BestEffort | ObservationMode::Required
+                    )
+            };
+            let needs_call = wants(plan.acl(), true) || wants(plan.xattrs(), xattrs_supported);
+            match adapter.observe_listed(&listed, plan) {
+                Some(from_listing) => {
+                    assert!(!needs_call, "{plan:?} answered without its call");
+                    let from_getattr = adapter.observe(&path, plan).await;
+                    assert_eq!(
+                        format!("{from_listing:?}"),
+                        format!("{from_getattr:?}"),
+                        "{plan:?} unmapped={owner_unmapped}"
+                    );
+                    answered += 1;
+                }
+                None => assert!(needs_call, "{plan:?} declined without a reason"),
+            }
+        }
+    }
+    assert!(answered > 300, "{answered}");
+}
+
+/// The descriptor an NFS listing builds from the attributes the fake's GETATTR returns.
+async fn listed_like_stat(
+    protocol: &CancellingProtocol,
+    path: &StoragePath,
+    identity: crate::model::BackendIdentity,
+) -> SourceDescriptor {
+    let attrs = protocol
+        .stat(path)
+        .await
+        .unwrap_or_else(|_| panic!("the fake's GETATTR always answers"));
+    let source_identity = crate::model::SourceIdentity::new(
+        identity,
+        crate::model::IdentityStrength::StableWithinBackend,
+        &attrs.file_handle,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let mut listed = SourceDescriptor::new(
+        path.clone(),
+        crate::model::EntryKind::File,
+        Some(1),
+        source_identity,
+    )
+    .with_inline_timestamps(TimestampMetadata {
+        accessed: timestamp(attrs.atime),
+        modified: timestamp(attrs.mtime),
+        created: timestamp(attrs.ctime),
+    });
+    listed.inline_ownership = Some(inline_ownership(attrs.uid, attrs.gid, attrs.mode));
+    listed
+}

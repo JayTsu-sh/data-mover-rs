@@ -49,6 +49,24 @@ impl NFSStorage {
     }
 }
 
+/// What the metadata role reads from one GETATTR's attributes.
+pub(super) fn metadata_inline(
+    file_handle: Bytes,
+    attrs: &super::Attr,
+    owners_are_strings: bool,
+) -> NfsMetadataInline {
+    NfsMetadataInline {
+        file_handle,
+        symlink: attrs.type_ == super::FType3::NF3LNK as u32,
+        uid: super::owner_id(&attrs.owner, attrs.uid, owners_are_strings),
+        gid: super::owner_id(&attrs.owner_group, attrs.gid, owners_are_strings),
+        mode: attrs.file_mode,
+        atime: super::time_to_i64(attrs.atime),
+        mtime: super::time_to_i64(attrs.mtime),
+        ctime: super::time_to_i64(attrs.ctime),
+    }
+}
+
 #[async_trait]
 impl NfsMetadataProtocol for NFSStorage {
     async fn stat(
@@ -56,16 +74,11 @@ impl NfsMetadataProtocol for NFSStorage {
         path: &crate::model::StoragePath,
     ) -> Result<NfsMetadataInline, NfsProtocolFailure> {
         let (file_handle, attrs) = self.role_lookup_with_attrs(path).await?;
-        Ok(NfsMetadataInline {
+        Ok(metadata_inline(
             file_handle,
-            symlink: attrs.type_ == super::FType3::NF3LNK as u32,
-            uid: super::owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
-            gid: super::owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
-            mode: attrs.file_mode,
-            atime: super::time_to_i64(attrs.atime),
-            mtime: super::time_to_i64(attrs.mtime),
-            ctime: super::time_to_i64(attrs.ctime),
-        })
+            &attrs,
+            self.owners_are_strings(),
+        ))
     }
 
     fn supports_acl(&self) -> bool {

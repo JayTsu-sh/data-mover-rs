@@ -31,7 +31,7 @@ use crate::storage::backends::nfs::common::{
 };
 use crate::storage::backends::nfs::namespace::{
     NfsListedChild, NfsNamespaceObservation, NfsNamespaceProtocol, NfsUndescribedChild,
-    undescribed_child,
+    inline_ownership, undescribed_child,
 };
 use crate::storage::backends::nfs::source::{
     NfsProtocolFailure, NfsReadCursor, NfsSourceObservation, NfsSourceProtocol,
@@ -637,7 +637,7 @@ fn role_observation(
     };
     let path = crate::model::StoragePath::new(child.to_string_lossy())
         .map_err(|_| undescribed_child(directory, child, "its name cannot be spelled"))?;
-    let (timestamps, mode) = match entry {
+    let (timestamps, mode, ownership) = match entry {
         EntryEnum::NAS(nas) => (
             Some(crate::model::TimestampMetadata {
                 accessed: nfs_timestamp(nas.atime),
@@ -645,8 +645,12 @@ fn role_observation(
                 created: nfs_timestamp(nas.ctime),
             }),
             Some(nas.mode),
+            // `nas.mode` has the set-id bits of an owner it could not map stripped
+            // (`without_unowned_set_id`), but only then is it not the raw attribute mode, and
+            // then the ownership is `Unmapped` and carries no mode at all.
+            Some(inline_ownership(nas.uid, nas.gid, nas.mode)),
         ),
-        _ => (None, None),
+        _ => (None, None, None),
     };
     Ok(NfsNamespaceObservation {
         path,
@@ -655,6 +659,7 @@ fn role_observation(
         file_handle,
         timestamps,
         mode,
+        ownership,
     })
 }
 
@@ -685,6 +690,11 @@ impl NfsNamespaceProtocol for NFSStorage {
             file_handle,
             timestamps: Some(attrs_timestamps(&attrs)),
             mode: Some(attrs.file_mode),
+            ownership: Some(inline_ownership(
+                owner_id(&attrs.owner, attrs.uid, self.owners_are_strings()),
+                owner_id(&attrs.owner_group, attrs.gid, self.owners_are_strings()),
+                attrs.file_mode,
+            )),
         })
     }
 
@@ -4734,9 +4744,10 @@ impl NFSStorage {
             &attrs,
             entry.handle,
             // The only consumer of this listing is `role_observation`, which reads the handle,
-            // the kind, the path, the timestamps, the mode and the size — never the ACL, owner or
-            // group. Filling them would clone two `String`s and an `Acl` per entry for nothing,
-            // which at fifty million entries is not nothing. Restore `from_attrs` here the moment
+            // the kind, the path, the timestamps, the mode, the numeric uid / gid and the size —
+            // never the ACL or the raw owner and group strings (the numeric ids are mapped from
+            // them before this). Filling those would clone two `String`s and an `Acl` per entry
+            // for nothing, which at fifty million entries is not nothing. Restore `from_attrs` here the moment
             // that observation starts reporting them.
             NfsEnrich::default(),
             owners_are_strings,
@@ -5475,6 +5486,93 @@ mod tests {
             },
             false,
         )
+    }
+
+    /// A child READDIRPLUS listed carries the ownership and timestamps the metadata role reads
+    /// from a GETATTR of the same attributes — through `NASEntry::from_nfs_attrs` (set-id bits
+    /// stripped for an owner it cannot map, owner strings mapped by `owner_id`) and
+    /// `role_observation` — for files, directories and symlinks with set-id bits, and for the
+    /// owner forms `NFSv3`, ONTAP and an LDAP-backed server send.
+    #[test]
+    fn a_listed_childs_ownership_and_times_are_what_a_getattr_reports() {
+        let directory =
+            crate::model::StoragePath::new("dir").unwrap_or_else(|error| panic!("{error}"));
+        let owners = [
+            (false, "", "", 1000),
+            (true, "1000", "1000", 1000),
+            (true, "root@localdomain", "0", 0),
+            (true, "alice@example.com", "1000", 65534),
+            (true, "", "", 0),
+        ];
+        let mut checked = 0;
+        for (type_, mode) in [
+            (FType3::NF3REG, 0o106_755),
+            (FType3::NF3DIR, 0o042_775),
+            (FType3::NF3LNK, 0o120_777),
+        ] {
+            for (owners_are_strings, owner, group, parsed) in owners {
+                let attrs = nfs_rs::Attr {
+                    type_: type_ as u32,
+                    file_mode: mode,
+                    uid: parsed,
+                    gid: 1000,
+                    atime: Time {
+                        seconds: 1_700_000_000,
+                        nseconds: 5,
+                    },
+                    mtime: Time {
+                        seconds: 1_700_000_100,
+                        nseconds: 6,
+                    },
+                    ctime: Time {
+                        seconds: 1_700_000_200,
+                        nseconds: 7,
+                    },
+                    owner: owner.to_owned(),
+                    owner_group: group.to_owned(),
+                    ..nfs_rs::Attr::default()
+                };
+                let child = NFSStorage::role_listed_entry(
+                    PathBuf::from("dir/x"),
+                    nfs_rs::ReaddirplusEntry {
+                        fileid: 1,
+                        file_name: "x".to_owned(),
+                        attr: Some(attrs.clone()),
+                        handle: Bytes::from_static(b"h"),
+                    },
+                    owners_are_strings,
+                );
+                let listed = role_child(&directory, &child)
+                    .unwrap_or_else(|_| panic!("a child with attributes is described"));
+                let getattr = role_metadata::metadata_inline(
+                    Bytes::from_static(b"h"),
+                    &attrs,
+                    owners_are_strings,
+                );
+                let context = format!("{type_:?} {owner:?}/{group:?}");
+                assert_eq!(
+                    listed.ownership,
+                    Some(inline_ownership(getattr.uid, getattr.gid, getattr.mode)),
+                    "{context}"
+                );
+                assert_eq!(
+                    listed.timestamps,
+                    Some(crate::model::TimestampMetadata {
+                        accessed: nfs_timestamp(getattr.atime),
+                        modified: nfs_timestamp(getattr.mtime),
+                        created: nfs_timestamp(getattr.ctime),
+                    }),
+                    "{context}"
+                );
+                assert_eq!(
+                    listed.kind == crate::model::EntryKind::Symlink,
+                    getattr.symlink,
+                    "{context}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 15);
     }
 
     fn regular() -> nfs_rs::Attr {

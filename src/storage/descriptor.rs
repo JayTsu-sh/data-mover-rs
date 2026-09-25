@@ -4,8 +4,21 @@
 use bytes::Bytes;
 
 use crate::model::{
-    EntryKind, EntryVersion, SourceIdentity, SourceVersion, StoragePath, TimestampMetadata,
+    EntryKind, EntryVersion, OwnershipMode, SourceIdentity, SourceVersion, StoragePath,
+    TimestampMetadata,
 };
+
+/// Numeric ownership the enumerating operation already returned, in the form the backend's own
+/// metadata role would report it from the same attributes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InlineOwnership {
+    /// Owner, group and the full mode, exactly as the metadata role's ownership observation.
+    Known(OwnershipMode),
+    /// The attributes named an owner or group the backend cannot turn into a number (an `NFSv4`
+    /// name nfs-rs could not map); the metadata role reports such an entry's ownership as
+    /// unsupported, never as a made-up id.
+    Unmapped,
+}
 
 /// What a versioned listing adds to a child (ADR-0006 C22); the default for every other listing.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -43,6 +56,11 @@ pub struct SourceDescriptor {
     /// from `FILE_ATTRIBUTE_READONLY`, which listings carry; the `Stat` verb builds its
     /// descriptor from facts without the attribute and leaves it `None`.
     pub(crate) inline_mode: Option<u32>,
+    /// Numeric ownership from the same attributes as the timestamps, so a plan that asks for
+    /// ownership needs no per-entry metadata round trip either. `None` when the enumerating
+    /// operation carried none; only a backend whose metadata role reads ownership from those
+    /// very attributes fills it (NFS, Local on Unix).
+    pub(crate) inline_ownership: Option<InlineOwnership>,
     /// The source version this description is of, as the describe resolved it: a versioned store
     /// turns `Current` into the version it found, so every later read, metadata observation and
     /// native copy uses the same one. `Current` where the store has no version to pin.
@@ -69,6 +87,7 @@ impl SourceDescriptor {
             content_version: None,
             inline_timestamps: None,
             inline_mode: None,
+            inline_ownership: None,
             version: SourceVersion::Current,
             listing: ListingFacts::default(),
         }
@@ -102,6 +121,14 @@ impl SourceDescriptor {
     #[must_use]
     pub(crate) const fn with_inline_mode(mut self, mode: u32) -> Self {
         self.inline_mode = Some(mode);
+        self
+    }
+
+    /// Attaches numeric ownership the enumerating operation already returned.
+    #[must_use]
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) const fn with_inline_ownership(mut self, ownership: InlineOwnership) -> Self {
+        self.inline_ownership = Some(ownership);
         self
     }
 

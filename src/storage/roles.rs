@@ -582,6 +582,18 @@ pub trait Metadata: Send + Sync {
         path: &StoragePath,
         plan: ObservationPlan,
     ) -> Result<MetadataObservations, StorageRoleFailure>;
+    /// The observations of a listed child that its listing already answers under `plan`, with
+    /// no I/O: exactly what [`Self::observe`] would report from the same attributes, failures
+    /// included. `None` when answering takes a call, which is the default; a traversal then
+    /// calls [`Self::observe`] instead.
+    fn observe_listed(
+        &self,
+        descriptor: &SourceDescriptor,
+        plan: ObservationPlan,
+    ) -> Option<Result<MetadataObservations, StorageRoleFailure>> {
+        let _ = (descriptor, plan);
+        None
+    }
     /// Observes metadata only when the same operation confirms the expected source identity.
     /// Roles that advertise copied metadata should override this method.
     async fn observe_bound(

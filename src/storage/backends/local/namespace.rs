@@ -32,10 +32,14 @@ use super::observation::{
     backend_facts, classify_io, content_version, entry_kind, path_bytes, source_identity,
     timestamp_metadata,
 };
+#[cfg(unix)]
+use crate::model::OwnershipMode;
 use crate::model::{
     BackendIdentity, BackendSessionFailure, EntryFailureIdentity, EntryKind, EntryOperationFailure,
     FailureClass, Operation, StoragePath, SymlinkTarget, Transience,
 };
+#[cfg(unix)]
+use crate::storage::InlineOwnership;
 use crate::storage::artifacts::is_artifact_name;
 use crate::storage::durability::sync_directory;
 use crate::storage::{
@@ -331,7 +335,15 @@ fn describe(
     #[cfg(unix)]
     {
         use cap_std::fs::MetadataExt as _;
-        descriptor = descriptor.with_inline_mode(metadata.mode() & 0o7777);
+        // Ownership exactly as the observation role reads it from this same lstat, so a plan
+        // that asks for ownership needs no second one per entry.
+        descriptor = descriptor
+            .with_inline_mode(metadata.mode() & 0o7777)
+            .with_inline_ownership(InlineOwnership::Known(OwnershipMode {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                mode: metadata.mode(),
+            }));
     }
     Ok(descriptor)
 }

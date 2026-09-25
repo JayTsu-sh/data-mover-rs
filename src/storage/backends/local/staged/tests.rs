@@ -53,6 +53,7 @@ fn request(identity: &BackendIdentity, destination: &str) -> PrepareRequest {
             content_version: None,
             inline_timestamps: None,
             inline_mode: None,
+            inline_ownership: None,
             version: SourceVersion::Current,
             listing: ListingFacts::default(),
         },
