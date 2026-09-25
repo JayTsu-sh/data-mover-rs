@@ -1,7 +1,7 @@
 # P7 流式列举：设计评审稿
 
 > 状态：**待评审**（2026-09-25）。拍板后再写成 ADR 并实现。
-> **以文末「修订版（不考虑兼容性）」为准**：它与前文冲突之处覆盖前文，前文的 D1–D14 由修订版的 17 个问题取代。
+> **以文末「定型版」为准**：它与前文冲突之处覆盖前文，前文的问题清单由定型版的 16 个问题取代。
 > 完整 HTML 版在 `root@10.131.9.10:/root/p7-streaming-listing-design.html`。
 > 来源：architect 两轮方案（主方案 + 针对需求 R1–R5 的增补），行号基于 `6c6ac22`。
 
@@ -238,48 +238,68 @@ Namespace::list_stream(&self, ListRequest) -> ListingStream
 | D13 | 页大小：内部常量 1024，还是公开成请求字段 | 内部常量 |
 | D14 | S3 的 500 万上限：流式模式去掉，`NameBytes` 在 P8 前保留为物化上限 | 是 |
 
-## 修订版（不考虑兼容性，2026-09-25 第二次修订，覆盖前文）
+## 定型版（2026-09-25，覆盖前文；完整见 HTML D1–D14）
 
-设计改动：
+**两种扫描方式**：
 
-- **Namespace 接口**：列举只剩一个流式入口 `list(ListRequest) -> ListingStream`，其余动词改为各自带类型的方法；
-  删除现有请求枚举、`list_versions`、`listings_are_abortable`，16 个测试替身重写。
-- **列举页只带名字**：子项只存名字不存完整路径，P9 去掉重复路径前缀时不必再改 Namespace。
-- **遍历模式**：`TraversalOrder = Unordered | Blocks { siblings: Listing | NameBytes }`。今天的 `Admission` 即
-  `Blocks { siblings: Listing }`（保留）；排序只是块序模式的一个选项。列举接口 `Namespace::list(ListRequest) -> ListingStream`
-  不带顺序参数，有序 / 无序全在遍历层处理；Namespace 改为一个操作一个方法（stat / list / read_link / create_directory /
-  delete / rename），删除请求枚举与结果枚举。
-- **目录完成事件**：`DirectoryListed { outcome: Complete | Interrupted | Unreadable, counts, order }`；列举失败写在事件里，
-  不再占一个 `EntryFailure` 项。
-  删除 `Admission`。
-- **排序键改为 git tree 序**：目录按「名字 + `/`」比较，即 S3 原生键序，S3 的有序模式可边读边出；任何声称有序的流都逐项
-  检查单调性。
-- **目录完成事件重设计**：结局（Complete / Interrupted / Unreadable）与计数分开；计数满足
-  listed = emitted + filtered + failed + vanished；整场汇总以根目录汇总为准。
-- **错误处理**：新增 `FailureClass::Throttled`（S3 SlowDown / 503 退避重试，不再结束整场遍历）；CIFS / NFS / HDFS 单个子项
-  失败只报该项；列出后又消失的条目记为 `vanished`，不算失败；会话失败时带回已完成部分的汇总；请求新增 `assume_complete`
-  （调用方声明已完成的子树）与 `max_child_failures`（失败数上限）。
-- **多版本**：每个版本一项，服务端列举顺序（最旧在前、最新在最后），不按 LastModified；库里另提供按同名聚组的适配器。
+```
+enum TraversalOrder {
+    Unordered,  // 无序 DFS：列到一页就发一页，不同目录的项可交错；默认
+    Blocks,     // 块序 DFS：一个目录的直接子项连续成块，块内按列举顺序不排序；
+                //           块读完后按子目录名的原始 UTF-8 字节序深度优先下钻
+}
+```
 
-需要拍板的问题（括号内为建议）：
+- 遍历里不再整块读进内存：文件一律随页流出，块序只需记住子目录（今天本来就有这份记录）。
+- 删除兄弟排序：P4 的 `sort_by_name` / `sibling_key`、`ChildOrder`、`DirectoryListed.child_order`；物化上限、S3 原生有序、
+  HDFS 有符号字节序、git tree 排序键这些问题随之消失。P8 只剩「子目录返回点写盘 / 名字 arena」。
+- 两进程比较：两侧都用 `Blocks`，下钻顺序一致，按目录同步推进；块内文件由消费方按名字哈希匹配（内存与单目录大小成正比）。
+
+**事件模型**：
+
+```
+enum TraversalItem {
+    Entry(Box<ObservedEntry>),
+    Failure(ScanFailure),             // 两种模式都有；scope: Child（只是这个子项）| Listing（这个目录没列完，带 delivered）
+    DirectoryListed(DirectoryListed), // 只有 Blocks 发：每个被列举的目录（含空目录）在最后一个子项之后
+}
+struct DirectoryListed { path, outcome: Complete | Interrupted | Unreadable, counts }
+TraversalCompletion { totals }        // 两种模式都有全局总数
+```
+
+- `SubtreeComplete` 两种模式都删；`Unordered` 不发任何目录事件，只用全局原子计数（结构近似 legacy）。
+- **删除安全规则（写进契约）**：只有会话以 `Completed` 结束才做删除检测；出现 `scope == Listing` 失败的目录整棵旧子树
+  不参与删除；`scope == Child` 失败的条目本身不参与删除；用了 filter / `max_depth` 时旧代条目按同样条件判定。
+- 计数：`listed = emitted + filtered + failed + vanished`；列举后才消失的条目计入 `vanished`，不发失败项。
+
+**断点续扫（仅 Blocks）**：会话失败（重连与退避都用尽）或取消时返回路径 `P`；下次带 `resume_after: P` 从 `P` 之后续扫
+（取消 = 暂停）。续扫时重列根到 `P` 的每层祖先、只取排在 `P` 之后的子目录；没收到 `DirectoryListed` 的目录一律视为没收到、
+整目录重列；filter / `max_depth` / 根的指纹不符在任何请求前拒绝。用名字路径而非协议位置（cookie / token / 句柄不能跨会话
+重用）；游标由调用方保存。`Unordered` 失败只能重扫。
+
+**错误**：新增 `FailureClass::Throttled`（单个列举累计退避约 2 分钟后报 `scope == Listing`）；CIFS / NFS / HDFS 单个子项失败
+只报该项；列举中被修改的目录可能重复或漏项，写进契约由消费方按（父目录, 名字）去重（S3 在遍历内去重）。
+
+**多版本**：每版本一项，服务端顺序（最旧在前），同一 key 连续；库里提供按 key 分组的适配器；单 key 上限 10 万，超过只让该 key
+报 `Capacity`。
+
+### 待拍板（建议）
 
 | # | 问题 | 建议 |
 |---|---|---|
-| 1 | 块序模式：下钻一律按名字序（目录读完时对内存中已有的子目录列表排一次，O(d log d)，内存与今天相同，不同存储上目录访问顺序一致），块内顺序为选项：`Listing`（默认，成本同今天的 Admission）或 `NameBytes`（逐文件对照用；S3 上便宜，NFS / CIFS / Local 要整块内存与排序，待 P8）。代价：预取在目录读完前只能按到达顺序猜；块内不排序时 terrasync 逐文件比较需每目录建哈希表 | 采用（取代按列举序下钻的 Admission） |
-| 2 | `Unordered` 下父目录的 `DirectoryListed` 不再保证早于子目录的事件，换来发现即下钻、无头阻塞 | 接受 |
-| 3 | 块序模式的排序键改为 git tree 序（目录按「名字 + /」），推翻 P4 已推送的定义 | 同意 |
-| 4 | terrasync 比较拓扑：两侧各跑整棵树再合并（09-21 所定），还是两进程逐目录列举再合并 | 待定 |
-| 5 | 大小写不敏感 / Unicode 规范化目的端：排序与匹配仍按字节，Namespace 报告名字语义，消费方遇「折叠后相同、字节不同」不删并报冲突；还是遍历里按折叠键排序 | 前者 |
-| 6 | HDFS 原生顺序在真机证实为无符号字节序前一律重排 | 是 |
-| 7 | 多版本：每版本一项、服务端顺序、同对象连续，外加库侧分组适配器 | 同意 |
-| 8 | 单对象版本数上限（超过只让该对象 `Capacity`） | 10 万 |
-| 9 | P8 溢写前，非原生有序后端在 `NameBytes` 下单目录物化上限（超过报 `Capacity`） | 500 万 |
-| 10 | CIFS 预取挂起的未读完目录句柄数（先在 FAS2750 测 ONTAP 空闲句柄回收时间） | 8 |
-| 11 | 节流时单个列举最多累计退避多久，超过算中断 | 约 2 分钟，指数退避加抖动 |
-| 12 | 「列出后又消失的条目」与「列出了但去列时已不存在的子目录」都记 `vanished`，不算失败、不影响穷尽性 | 同意 |
-| 13 | 列举中目录被修改可能有重复或遗漏，写进契约，由使用方按（父目录, 名字）去重 | 是 |
-| 14 | 改 nfs-rs 上游公开 READDIRPLUS 分页接口（cookie + verifier），使 NFS 可从中断处续列 | 做，单独 `chore(deps)` commit |
-| 15 | 先做 C0（去掉每条目 spawn）并在 node1 测量，之前先补测 `8a1348b` 后的 CPU / 内存基线（含 `MALLOC_ARENA_MAX=2` 与驻留探针） | 是（178 MB 来源未查清） |
-| 16 | `Unordered` 验收门槛（node1、5337 万条、并发 64、与 legacy 交替四轮） | CPU ≤ 1.3 倍 legacy、RSS ≤ 50 MB、耗时 ≤ legacy + 5% |
-| 17 | 排序键与遍历模式变更单独写 ADR | 写，ADR-0008 |
-
+| 1 | 默认扫描方式 | `Unordered` |
+| 2 | `SubtreeComplete` 两种模式都删 | 删 |
+| 3 | 计数放置：Blocks 的 `DirectoryListed` 带本目录计数，两种模式 `TraversalCompletion` 带全局总数 | 同意 |
+| 4 | data-mover 是否提供逐目录配对辅助（两侧都发 `DirectoryListed` 后才判定一侧缺失） | 提供 |
+| 5 | 断点续扫：现在定 API（`TraversalRequest.resume_after`，取消与会话失败都带回游标），P7 主体完成后实现 | 现在定 API |
+| 6 | Blocks 下钻按原始 UTF-8 字节，不做大小写折叠与 Unicode 规范化 | 是 |
+| 7 | 大小写 / 规范化不敏感的目标：公开名字语义，折叠后相同、字节不同时报冲突不删除 | 是 |
+| 8 | 多版本形状与单 key 上限 | 每版本一项 + 分组适配器，10 万 |
+| 9 | CIFS 预取同时打开的目录句柄上限（先在 FAS2750 测 ONTAP 空闲句柄回收） | 8 |
+| 10 | 节流：`FailureClass::Throttled`，单列举累计退避约 2 分钟后报 Listing 失败 | 是 |
+| 11 | 列举后消失的条目只计 `vanished`，不发失败项 | 是 |
+| 12 | 修改中的目录可能重复 / 漏项，写进契约由消费方去重 | 是 |
+| 13 | 改 nfs-rs 上游公开 READDIRPLUS 分页接口，NFS 可从断点续列 | 做，单独 `chore(deps)` |
+| 14 | 先做 C0（去掉每条目 spawn）并在 node1 补测基线（`MALLOC_ARENA_MAX=2`、驻留探针） | 是 |
+| 15 | `Unordered` 验收门槛（node1、5337 万条、c=64、与 legacy 交替四轮） | CPU ≤ 1.3× legacy、RSS ≤ 50 MB、耗时 ≤ legacy + 5% |
+| 16 | 写 ADR-0008（两种扫描方式 + 事件模型） | 写 |
