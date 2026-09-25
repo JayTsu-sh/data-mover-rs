@@ -477,6 +477,55 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   `versioning_matrix.sh`（`data-mover-c17{,-lock}-1790313057`，已删）结果与 C18 相同：按 id 拷 v1、v2（流式与原生）
   各得 2 个版本、新→旧 v2、v1、内容与源相同；按 id 中断续传 `Resumed { 16777216 }`、1 个版本。
 
+### role-based 遍历与版本模式（ADR-0006 C22）
+
+- **形态**：S3 出借 `Namespace`（`src/storage/backends/s3/namespace.rs`），由通用的深度优先
+  `StorageTraversalSource` 驱动；不做扁平 `TraversalSource` —— P3/P4 的块顺序（目录的全部子项先于任何孙项）
+  与 `NameBytes` 下，扁平 `ListObjectsV2` 要把根下的全部 key 攒在内存里才能交出根的块。
+- **一个目录 = 一个前缀**：`List(p)` = `ListObjectsV2(prefix = "p/", delimiter = "/")`；All 模式
+  `list_versions(p)` = `ListObjectVersions` 同参数。**一个目录的所有页收齐再建块**（`listing.rs`），所以跨页的
+  key 天然是整的，不需要 C20 的“留下一页最大 key”；续页 token / marker **原样回传**，只拿来判“绕回来了”（本目录
+  跟过的所有 token 记在一个集合里，任何一个再出现 → 会话级 `Protocol` 失败，防止 A、B、A… 死循环），从不当 key
+  比较或去前缀。代价：每个目录至少一次请求、整个目录在内存里（P7 流式列举之前各后端一样）。
+- **翻页上限**（`paging.rs`）：一个目录最多 500 万条（对象 + 版本 + 标记 + 前缀）→ 超了该目录 `Capacity` 失败；连续
+  16 页空页却还说有下一页 → 该目录 `Protocol` 失败；都是块 `Failed`，不会悄悄截断。`IsTruncated` 缺失但有 token
+  → 继续翻（同 legacy）；没有 VersionId 的条目当 `"null"`；跨页重复的对象 / 版本只留第一次。`Stat` 的前缀探测也按
+  同样上限翻过空页，不把“第一页空但有下一页”当成不存在。
+- **取消即停**：S3 的列举不持有句柄（`Namespace::listings_are_abortable() = true`），遍历取消时进行中的列举直接丢弃，
+  不在后台继续翻页；CIFS 这类持有目录句柄的列举仍跑完再关句柄。
+- **不存在的前缀**：非根路径下一条都没列到（没有对象、版本、标记、前缀，也没有自己的 `p/` 标记）→ `NotFound`
+  条目失败；遍历根拼错时根的列举是 `Failed`、summary 不 exhaustive，不会被当成“源端为空”。存储根永远存在。
+- **子项顺序**：S3 key 序，公共前缀带尾 `/` 比较（`a` < `a!` < `a-0` < `a.txt` < `a/`）；同名的对象 `a` 与目录
+  `a` 并存。`NameBytes` 排序键是 `(名字, 是否目录, rank)`：对象先于目录、同一 key 的版本从旧到新。
+- **异常 key**：目录自己的零字节标记对象 `p/` 跳过；有内容的 `p/`（All 模式下它**任何一个旧版本**有内容也算，
+  所以 Current 干净的目录在 All 下可能是 `Partial`）、空段 / `.` / `..` 段（`a//`、根下的 `/x`、`./x`、`a/./b`、
+  `a/..`）是逐子项失败（报在服务器拼写的路径上，列举 `Partial`），不会被并进别的路径 —— 目的端的路径处理会把
+  `a/./b` 折成 `a/b`，两个对象写到同一个文件；`List("a/")` / `"a//b"` / `"a/."` 这类路径 `InvalidInput`。不理 delimiter 的存储
+  平铺返回的深层 key 在客户端收拢成一级前缀（去重）。`.data-mover-*` 两种模式都隐藏（key 或任意一段前缀）。
+- **Current**：只有当前对象（最新是删除标记的 key 不出现）；身份 `PathScoped(ETag)`（`ListObjectsV2` 不带
+  versionId）；时间 = 列举的 `LastModified`（毫秒精度，HEAD 只有秒），`modified` 过滤器不发 HEAD；目录无时间。
+- **All**：每个版本与删除标记各一条，同一 key 连续、从旧到新、latest 最后（`history.rs`）：版本、标记**各自**按
+  服务器列举顺序反过来（这个顺序是权威的，节点时钟不一致或没有时间都不改它），`LastModified` 只决定两条序列
+  怎么交错（同一毫秒版本在前，同 C20）；latest 不论在哪条序列都排最后。与 C20 不同：C20 按时间排序，时钟偏差时会乱。删除标记是 `File`、`size` 为 `None`：DSL 的 `size`
+  条件对它是 `LazyMatch`（放行），要排除标记按 `version().is_delete_marker()` 在调用方过滤。
+  `ObservedEntry::version()` = `EntryVersion { id（"null" → None）, latest, 删除标记 }`；`source_version()`：真版本
+  `Id(id)`、latest 的 `"null"` → `Current`、非 latest 的 `"null"` → `Id("null")`、删除标记 → `None`（标记无 size，
+  也不 HEAD）。身份 `VersionScoped(id)`（与带版本 describe 一致）。可选元数据按该版本取（`observe_copy_bound_version`，
+  标签用它的 versionId）；前缀与删除标记不问元数据角色。快照：带版本的条目 v6，其余仍是 v5 原字节。
+- **专家传输（terrasync）**：源端半程用 describe 复核观察；版本化桶上 Current 观察是 `PathScoped(ETag)`、describe 钉住
+  `VersionScoped(id)`，`ReadSource::observation_matches` 在 describe 到的版本 ETag 等于列举的 ETag 时认作同一对象，
+  对象被替换则仍报 "source differs"；offer / evidence 带观察的身份键（目的端半程比对它），读仍钉在 describe 到的版本。
+  All 模式里只有 latest 版本能走专家传输：旧版本报 "older version"（用 `with_source_version` 拷），删除标记报
+  "delete marker"。
+- **拒绝**：非 S3 源请求 `All` → 会话在任何 I/O 前以 `Session(Unsupported)` 结束、零条目（不会退化成当前对象）。
+  S3 的变更动词 `Unsupported`；`delete_tree` / `create_directory_all` / `ndx_walk` 在 I/O 前拒绝 S3（同以前）。
+- **例子与真机**：`S3_LISTING_URL=… cargo run --example storage_role_operations -- --backend s3 traverse
+  --versions all [--order name-bytes]`（每条版本打印 `version= latest= marker= size=`）；
+  `.claude/skills/e2e-s3/scripts/traversal_versions.sh`（临时桶，见 SKILL 第 8 步）。MinIO VM 102 2026-09-25 通过：
+  `k` = 2 B、3 B、标记、4 B，`gone` = 版本 + latest 标记，999 个 key 后的 `p/z` 跨页仍 1、2、3 B，暂停版本写的 `n` =
+  `version=null latest=1`，无 artifact；All 1015 条、Current 1008 条；`name-bytes` 并发 1/4/32 输出相同；桶已删。
+- legacy `walkdir` / `walkdir_2` 不变（仍有 C20 所述限制：最新为标记的 key 不列）。
+
 **MinIO 2023 的其他实测行为**：`ListMultipartUploads` 只按**精确 key** 返回（按前缀或整桶都是 0）—— 孤儿上传
 无法按前缀发现，只能靠 key 精确查询或服务端 `stale_uploads_expiry` 回收；Content-MD5 不符 → 400 BadDigest
 （role 协议把 `BadDigest` 映射成条目 `Corruption` / Transient：传输中损坏，重发即可；`InvalidDigest` —— 摘要头本身
@@ -495,6 +544,8 @@ Complete 成功后再 Complete → 404 NoSuchUpload；`If-Match` 对分段 ETag�
 | 自签证书 ECS endpoint 失败 | 用 `s3+https://` (而不是 `https` 显式) |
 | `bucket.host` 解析错误 (path-style vs virtual-hosted) | 检查 endpoint 是否支持 virtual-hosted |
 | URL 中的 `:` 在 secret 里被切错 | secret 必须 percent-encode |
+| 把 MinIO 的 `NextKeyMarker`（`p/z[minio_cache:v2,return:]`）当 key 用 | 续页 token / marker 只原样回传（C20 / C22） |
+| 同一目录里对象 `a` 与前缀 `a/` 同名 | 按路径做键的消费方会撞；`NameBytes` 下对象在前（C22） |
 | Region 推断 | endpoint host 推断，必要时显式设 `AWS_REGION` |
 
 ## 测试

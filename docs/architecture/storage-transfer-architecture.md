@@ -201,6 +201,12 @@ Owns coherent namespace semantics: stat/list, create/delete, rename, and support
 operations. Fine-grained semantics are typed; providing the role does not imply that every
 verb exists. An unavailable operation fails preflight before remote side effects.
 
+S3 lends `Stat` and `List` only (ADR-0006 C22): `List` of a path is one delimiter listing of the
+prefix `<path>/`, so a common prefix is a directory; `Namespace::list_versions` lists every stored
+version and delete marker (`supports_versions()`). Its mutating verbs are `Unsupported`, and it
+says so through `Namespace::mutations_unsupported()`: recursive delete and recursive create refuse
+such a storage before any I/O. `ndx_walk` refuses S3 by kind: a prefix has no modification time.
+
 ### Metadata
 
 Owns backend metadata observation and application plus backend-private encoding. ACL,
@@ -288,6 +294,14 @@ the traversal observes the entry before deciding and, if the plan omitted timest
 that already returns timestamps satisfies a timestamps-only plan without a second call.
 All states, provenance, empty values, and failures are retained in the opaque entry snapshot.
 
+An entry from a traversal of every version (`TraversalVersions::All`, S3 only) also carries its
+listed version: `ObservedEntry::version()` (`EntryVersion`: version id, `None` for `"null"`;
+latest; delete marker) and `ObservedEntry::source_version()`, the `SourceVersion` that copies
+exactly that version (`Id(id)`; `Current` for the latest `"null"` version; `Id("null")` for an
+older one; `None` for a delete marker). Such an entry is snapshot-encoded as v6 (v5 plus the version
+record before the identity key); every entry without a version is still written as v5, byte for
+byte, so existing generations do not change. v4, v5 and v6 all decode.
+
 ### Traversal contract
 
 There is one bounded, cancellable, backpressured item stream paired with mandatory completion
@@ -320,6 +334,22 @@ admission window and item channel are bounded, so a slow consumer backpressures 
 without allowing the reorder buffer to grow without limit. Backend operations already started
 are never aborted on cancellation or termination; they run to completion in the background so
 any handle they opened is closed.
+
+`TraversalRequest::versions` selects what a versioned store contributes (ADR-0006 C22):
+`Current` (default) emits current objects only — a key whose newest entry is a delete marker is
+absent — and `All` emits every stored version and delete marker, each key's entries contiguous,
+oldest first, the latest last. A source that keeps no versions ends an `All` traversal before any
+I/O with an `Unsupported` session failure (`StorageTraversalSource::supports_versions()` asks
+first); it never returns current entries in place of versions. Both modes hide `.data-mover-*`
+names. On S3 a name can repeat in one directory — the object `a` beside the prefix `a/`, and in
+`All` one child per version — so `NameBytes` orders ties: the object before the directory (S3's own
+key order), versions oldest first; the merge key is `(parent, name, kind, version position)`. The
+optional metadata of a version entry is observed bound to that version, and a prefix or a delete
+marker asks the metadata role nothing. S3 listings (per directory, all pages collected before the
+block is built) cost at least one request per directory and hold a whole directory in memory, as
+every backend's listing does until streaming listings (traversal plan P7). S3 has no directories:
+a traversal rooted at a prefix under which nothing is stored fails the root's listing (`NotFound`)
+rather than completing as an empty, exhaustive source.
 
 Terrasync projects this same stream in three ways:
 
@@ -792,8 +822,15 @@ publication and resumed from a local recovery identity, was removed in C19; the 
 History migration is a caller procedure built on `SourceVersion`, not a data-mover operation. To
 copy one object's versions into a versioned destination bucket:
 
-1. **Enumerate** the versions with the legacy listing (`StorageEnum::walkdir` or `walkdir_2` on
-   an S3 source whose bucket has versioning `Enabled`). Every entry is an `EntryEnum::S3` with
+1. **Enumerate** the versions with the role-based traversal (ADR-0006 C22):
+   `StorageTraversalSource` over the S3 storage with `TraversalRequest::versions =
+   TraversalVersions::All`. Every stored version and delete marker is an `ObservedEntry` whose
+   `version()` gives the version id (`None` for `"null"`), the latest flag and the delete-marker
+   flag, one key's entries contiguous and oldest first, a key whose newest entry is a delete marker
+   included; `source_version()` is the selector to copy it with (`None` for a marker). The legacy
+   listing below still works but has the limits it describes. With the legacy listing
+   (`StorageEnum::walkdir` or `walkdir_2` on
+   an S3 source whose bucket has versioning `Enabled`): Every entry is an `EntryEnum::S3` with
    `get_version_id()`, `get_is_latest()` and `get_is_delete_marker()`; each key's entries arrive
    oldest first, also when `ListObjectVersions` paging splits the key (C20), but `walkdir` may
    interleave other keys between them, so group by `get_relative_path()`. `walkdir` lists delete

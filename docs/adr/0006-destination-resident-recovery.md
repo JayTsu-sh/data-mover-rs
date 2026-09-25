@@ -638,6 +638,65 @@ Both the legacy listing and the role-based S3 traversal support versioned bucket
 traversal gets a version mode: `Current` (default; delete marker = absent) or `All` (every version
 with versionId, latest flag and delete-marker flag, oldest to newest per key). Both filter
 `.data-mover-*` names.
+As built (C22, traversal plan P5): the role-based S3 traversal is the generic depth-first
+`StorageTraversalSource` over a new S3 `Namespace` role, not a dedicated flat source. The P3/P4
+contract delivers every child of a directory before any grandchild (block order, `NameBytes`); a
+flat `ListObjectsV2` returns the root's last child only after the whole `a/…` subtree, so a flat
+source would have to hold everything under the root. The namespace lists one prefix at a time with
+delimiter `/` (`List`; `Stat` is a HEAD, then a one-page prefix probe); every page of a directory
+is collected before its block is built, so a key whose versions straddle a page boundary is whole
+and continuation tokens / markers are passed back verbatim (MinIO's `NextKeyMarker` is a token, not
+a key). Children come in S3 key order (`a` before `a/`); keys below a deeper `/` from a store that
+ignores the delimiter roll up into one prefix; the directory's own zero-byte `<path>/` object is
+skipped, while a non-empty one and a key or prefix with an empty, `.` or `..` segment (`a//`, a
+leading `/`, `./x`, `a/./b` — which a destination would fold into `a/b`) are per-child failures (a
+`Partial` listing), never merged into another path. A non-root prefix under which nothing is stored
+is `NotFound` (a mistyped traversal root fails its listing instead of reading as an empty source);
+every token or marker a directory's listing followed is remembered, and one that comes back ends the
+session instead of paging forever; more than 16 empty pages in a row that still claim more follow,
+or more than 5 million entries in one directory, fail that directory's listing (`Protocol` /
+`Capacity`, the block `Failed`, never silently cut short). A token present with `IsTruncated`
+absent is followed; a listed entry without a version id is the `"null"` version; an entry repeated
+across a page boundary is kept once. S3 listings are abortable (`Namespace::listings_are_abortable`:
+nothing is held between pages), so a cancelled traversal drops them at once instead of letting
+them page on in the background as it does for handle-holding CIFS listings. Its mutating verbs are
+`Unsupported`; `Namespace::mutations_unsupported()` keeps recursive delete / create refusing S3
+before any I/O, and `ndx_walk` refuses S3 by kind. API: `TraversalRequest` gains `pub versions:
+TraversalVersions` (`Current` default, `All`; every struct literal names it); `Namespace` gains
+defaulted `supports_versions` / `list_versions` / `mutations_unsupported`;
+`StorageTraversalSource::supports_versions`; `model::EntryVersion`; `ObservedEntry::version()` /
+`source_version()`. `All` on a source without versions ends before any I/O with a
+`Session(Unsupported)` terminal failure and no items. Versions: each key's history is rebuilt from
+the separate version and marker lists: each list's own listing order (reversed, oldest first) is
+kept as the server gave it, whatever `LastModified` says — clock skew between a store's nodes
+cannot reorder versions, and entries without a time keep their place — and the times only decide
+how versions and markers interleave (a version before a marker of the same millisecond, as in C20;
+the latest entry, whichever list holds it, last); the `"null"` version has no id and selects `Current`
+while latest, `Id("null")` once newer versions exist; a marker selects nothing, has no size, and is
+never looked up (neither is a prefix); optional metadata of every listed version, the latest
+`"null"` one included, is observed bound to it (`observe_copy_bound_version`, its own tags). `NameBytes` ties are ordered (object before directory,
+versions oldest first). Snapshots of version entries are v6 (v5 plus the version record); every
+other entry stays v5, byte for byte. Identities: `Current` entries are `PathScoped(ETag)`
+(`ListObjectsV2` carries no versionId), version entries `VersionScoped(id)` as a versioned describe
+gives them, so `Current` and `All` snapshots of one bucket do not join. The expert source half
+revalidates an observation with a describe, which on a versioned bucket pins `VersionScoped(id)`;
+`ReadSource::observation_matches` (default: identity equality) lets S3 accept a `PathScoped(ETag)`
+observation when the described version's `ETag` is the listed one — the same unchanged object —
+and still refuse a replaced object ("source differs"). The offer and evidence then carry the
+observation's identity key, which the destination half compares with, while the reads stay pinned
+to the described version. From an `All` traversal only the latest version is an expert source:
+an older version is refused as such (copy it with `TransferRequest::with_source_version`), a
+delete marker as having nothing to copy. Verified on MinIO (VM 102,
+temporary bucket `data-mover-c22-<run>`, deleted afterwards, the server then listing only
+`a-bucket` and `data-mover-test`; `.claude/skills/e2e-s3/scripts/traversal_versions.sh`): `k`
+written v1, v2, deleted, v3 lists in `All` as 2 B, 3 B, marker, 4 B with only v3 latest and in
+`Current` as v3 only; `gone` (written, deleted) lists as a version and a latest marker in `All` and
+not at all in `Current`; `p/z` written three times after 999 keys `p/a000…` (its versions straddle
+the first 1 000-entry page) lists as 1, 2, 3 B; `n` written twice with versioning suspended lists
+as `version=null latest=1`; no artifact appears (`.data-mover-x`, `d/.data-mover-stage/y`), the
+zero-byte `d/` is skipped; 1 015 entries in `All`, 1 008 in `Current`, 5 directories, both
+`Completed`, root subtree exhaustive; `--order name-bytes` gives identical output at concurrency 1,
+4 and 32. The legacy `walkdir` / `walkdir_2` are unchanged.
 
 ## Consequences
 
@@ -672,6 +731,9 @@ with versionId, latest flag and delete-marker flag, oldest to newest per key). B
 - S3 content becomes visible before read-back; per-part Content-MD5, the part-list check and the
   composite ETag run before publication.
 - A crash between publication and pointer deletion costs one re-copy.
+- Traversal (C22): `TraversalRequest` gains the public `versions` field (every literal names it);
+  S3 lends a `Namespace` role (`Stat` / `List` / `list_versions`; mutations refused) and
+  `ObservedEntry` gains `version()` / `source_version()`; version entries snapshot as v6.
 - Every listing hides `.data-mover-*` names (any path segment), so a user object named that way is no
   longer seen as a source entry; the same name must be hidden on every backend, or a mirror could treat
   it as an extra destination file.

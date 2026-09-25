@@ -87,8 +87,10 @@ deferred 决定随 `Settled::Child.descent` 走。两条路的 `max_depth` 与 f
 
 **覆盖面**：
 
-1. S3 **不出借 `Namespace` 角色**，上面四个 helper 在 S3 上于 preflight 处返回
-   `CapabilityUnavailable`。其余四个 backend (Local / NFS / CIFS / HDFS) 都出借。
+1. 五个 backend 都出借 `Namespace`。S3 只有 `Stat` / `List`（ADR-0006 C22，按 `<path>/` 前缀
+   delimiter 列举，另有 `Namespace::list_versions` 供 `TraversalVersions::All`），变更动词 `Unsupported`；
+   `delete_tree` / `create_directory_all` 经 `Storage::mutable_namespace`（看
+   `Namespace::mutations_unsupported()`）、`ndx_walk` 按 kind 在任何 I/O 之前返回 `CapabilityUnavailable`。
    Local 的 namespace 在 `src/storage/backends/local/namespace.rs`，与观察角色共用同一个
    `cap_std::Dir` 沙箱；路径逐段用 `open_dir_nofollow` 解析，**任何一段**是 symlink 都拒绝，
    最后一段在父目录句柄里操作 (描述/删除的是链接本身)。
