@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::HistoryOrder;
 
 #[test]
 fn private_backend_facts_roundtrip_without_public_inspection() {
@@ -171,7 +172,8 @@ fn symlink_without_target_is_rejected_at_construction_and_decode() {
 fn a_listed_version_rides_in_a_v6_snapshot() {
     let plain = nfs_entry("versions");
     assert_eq!(plain.encode_snapshot().as_bytes()[4], 5);
-    let version = EntryVersion::from_listing("v1", false, true).unwrap_or_else(|e| panic!("{e}"));
+    let version = EntryVersion::from_listing("v1", false, true, HistoryOrder::Server)
+        .unwrap_or_else(|e| panic!("{e}"));
     let entry = nfs_entry("versions").with_version(Some(Box::new(version)));
     let bytes = entry.encode_snapshot().as_bytes().to_vec();
     assert_eq!(bytes[4], 6);
@@ -180,6 +182,28 @@ fn a_listed_version_rides_in_a_v6_snapshot() {
         ObservedEntry::decode_snapshot(&bytes, &backend).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(rebuilt, entry);
     assert_eq!(rebuilt.source_version(), None);
+    // An inferred history order survives the round trip.
+    let inferred = EntryVersion::from_listing("v1", false, true, HistoryOrder::Inferred)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let inferred = nfs_entry("versions").with_version(Some(Box::new(inferred)));
+    let rebuilt = ObservedEntry::decode_snapshot(inferred.encode_snapshot().as_bytes(), &backend)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(rebuilt, inferred);
+    assert_eq!(
+        rebuilt.version().map(EntryVersion::order),
+        Some(HistoryOrder::Inferred)
+    );
+    // A v6 snapshot written before the order was recorded (flag bit 8 clear) was merged by time:
+    // it decodes as inferred, never as the server's order.
+    let mut before = bytes.clone();
+    let flags_at = before.len() - 32 - 2 - 4 - 1;
+    assert_eq!(before[flags_at] & 8, 8);
+    before[flags_at] &= !8;
+    let old = ObservedEntry::decode_snapshot(&before, &backend).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        old.version().map(EntryVersion::order),
+        Some(HistoryOrder::Inferred)
+    );
     // flags(1) + id length(4) + "v1"(2) + identity key(32) end the snapshot.
     let mut bad = bytes.clone();
     let flags = bad.len() - 32 - 2 - 4 - 1;

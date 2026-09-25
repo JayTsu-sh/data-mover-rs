@@ -38,6 +38,9 @@ pub(crate) struct ListingKnobs {
     pub(crate) same_instant: bool,
     /// List every key under the prefix flat, as a store that ignores the delimiter does.
     pub(crate) ignore_delimiter: bool,
+    /// A non-conforming store: each key's versions are listed oldest first (the latest last)
+    /// instead of newest first.
+    pub(crate) oldest_first_versions: bool,
     /// A broken server: every page is truncated and its continuation cycles through this many
     /// tokens (0: off).
     pub(crate) cycle_tokens: usize,
@@ -178,7 +181,10 @@ impl MemoryS3 {
     }
 
     async fn version_elements(&self, prefix: &str) -> S3Result<Vec<Element>> {
-        let same_instant = self.listing().same_instant;
+        let (same_instant, oldest_first) = {
+            let knobs = self.listing();
+            (knobs.same_instant, knobs.oldest_first_versions)
+        };
         let mut elements = Vec::new();
         for key in self.keys_under(prefix, true).await {
             if let Some(common) = self.rolled_up(prefix, &key) {
@@ -189,18 +195,27 @@ impl MemoryS3 {
             }
             let history: Vec<S3VersionFacts> = self.versions_of(&key).await?;
             let count = history.len();
-            for (newest_first, facts) in history.into_iter().enumerate() {
-                let written = if same_instant {
-                    1
-                } else {
-                    count - newest_first
-                };
-                elements.push(Element::Version(S3ListedVersion {
-                    key: key.clone(),
-                    facts,
-                    last_modified: instant(i128::try_from(written).unwrap_or(i128::MAX)),
-                }));
+            let mut listed: Vec<Element> = history
+                .into_iter()
+                .enumerate()
+                .map(|(newest_first, facts)| {
+                    let written = if same_instant {
+                        1
+                    } else {
+                        count - newest_first
+                    };
+                    Element::Version(S3ListedVersion {
+                        key: key.clone(),
+                        facts,
+                        last_modified: instant(i128::try_from(written).unwrap_or(i128::MAX)),
+                        position: None,
+                    })
+                })
+                .collect();
+            if oldest_first {
+                listed.reverse();
             }
+            elements.extend(listed);
         }
         Ok(elements)
     }
@@ -296,13 +311,20 @@ impl MemoryS3 {
             next: cycled.or(next),
             ..S3VersionPage::default()
         };
+        // The page's document order: versions and markers counted together, as S3 sends them.
+        let mut position = 0;
         for element in page {
             match element {
                 Element::Prefix(prefix) => listed.prefixes.push(prefix),
-                Element::Version(version) if version.facts.delete_marker => {
-                    listed.markers.push(version);
+                Element::Version(mut version) => {
+                    version.position = Some(position);
+                    position += 1;
+                    if version.facts.delete_marker {
+                        listed.markers.push(version);
+                    } else {
+                        listed.versions.push(version);
+                    }
                 }
-                Element::Version(version) => listed.versions.push(version),
                 Element::Object(_) => {}
             }
         }

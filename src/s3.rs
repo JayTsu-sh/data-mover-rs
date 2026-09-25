@@ -18,7 +18,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CommonPrefix, CompletedPart, Delete, DeleteMarkerEntry,
-    ObjectIdentifier, ObjectVersion,
+    ObjectIdentifier,
 };
 use aws_smithy_runtime_api::client::http::{
     HttpConnector as SdkHttpConnector, HttpConnectorFuture, SharedHttpClient, SharedHttpConnector,
@@ -50,8 +50,10 @@ use url::Url;
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
 use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
+use crate::model::HistoryOrder;
 use crate::qos::QosManager;
 use crate::storage::artifacts::is_artifact_path;
+use crate::storage::backends::s3::KeyHistory;
 use crate::storage_enum::{StorageEnum, path_to_s3_key};
 use crate::third_party::hcp::client::HCPRestClient;
 use crate::transfer_concurrency::{
@@ -63,8 +65,9 @@ use crate::{
     StorageEntryMessage, Tag, WalkDirAsyncIterator, datetime_to_string,
 };
 use version_listing::{
-    VersionOrDeleteMarker, VersionPages, oldest_first_by_key, versions_with_latest,
+    ListedEntry, VersionOrDeleteMarker, VersionPages, oldest_first_by_key, versions_with_latest,
 };
+use version_order::send_in_document_order;
 
 struct S3WalkRuntime<'a> {
     tx: &'a async_channel::Sender<StorageEntryMessage>,
@@ -102,8 +105,8 @@ struct BufferedPartUpload {
 
 struct VersionedScan<'a> {
     tx: &'a async_channel::Sender<StorageEntryMessage>,
-    versions: Vec<ObjectVersion>,
-    delete_markers: Vec<DeleteMarkerEntry>,
+    /// Complete keys' versions and delete markers, with their places in the listing's order.
+    entries: Vec<ListedEntry>,
     include_tags: bool,
     match_expressions: Option<&'a FilterExpression>,
     exclude_expressions: Option<&'a FilterExpression>,
@@ -116,6 +119,7 @@ mod dxn;
 mod multipart_rename;
 mod storagegrid;
 mod version_listing;
+mod version_order;
 #[cfg(test)]
 mod versioned_walk_tests;
 
@@ -558,7 +562,23 @@ async fn forward_byte_stream_with_qos(
 }
 
 macro_rules! build_s3_entry {
-    ($name:expr, $path:expr, $extension:expr, $size:expr, $mtime:expr, $tags:expr, $version_id:expr, $latest:expr, $delete_marker:expr, $version_count:expr, $is_dir:expr $(,)?) => {{
+    ($name:expr, $path:expr, $extension:expr, $size:expr, $mtime:expr, $tags:expr, $version_id:expr, $latest:expr, $delete_marker:expr, $version_count:expr, $is_dir:expr $(,)?) => {
+        build_s3_entry!(
+            $name,
+            $path,
+            $extension,
+            $size,
+            $mtime,
+            $tags,
+            $version_id,
+            $latest,
+            $delete_marker,
+            $version_count,
+            $is_dir,
+            false
+        )
+    };
+    ($name:expr, $path:expr, $extension:expr, $size:expr, $mtime:expr, $tags:expr, $version_id:expr, $latest:expr, $delete_marker:expr, $version_count:expr, $is_dir:expr, $order_inferred:expr $(,)?) => {{
         let version_id: Option<&str> = $version_id;
         EntryEnum::S3(S3Entry {
             name: $name,
@@ -572,6 +592,7 @@ macro_rules! build_s3_entry {
             is_delete_marker: $delete_marker,
             version_count: $version_count,
             is_dir: $is_dir,
+            version_order_inferred: $order_inferred,
         })
     }};
 }
@@ -2234,18 +2255,20 @@ impl S3Storage {
     async fn process_versioned_entries(&self, scan: VersionedScan<'_>) -> Result<()> {
         let VersionedScan {
             tx,
-            versions: version_entries,
-            delete_markers: delete_marker_entries,
+            entries,
             include_tags,
             match_expressions,
             exclude_expressions,
             total_file_count,
         } = scan;
-        let object_versions = oldest_first_by_key(version_entries, delete_marker_entries);
+        let object_versions = oldest_first_by_key(entries);
 
-        // 处理每个对象的所有版本（已按写入时间从旧到新排好，跨页的 key 已合并）。最新条目是删除标记的
-        // key 也列（ADR-0006 D4）：它的版本与标记照常发，标记最后、`is_latest`
-        for (_key, sorted_versions) in object_versions {
+        // 处理每个对象的所有版本（已按服务端顺序从旧到新排好，跨页的 key 已合并；顺序校验不过的 key
+        // 按 LastModified 推断并标 `version_order_inferred`）。最新条目是删除标记的 key 也列
+        // （ADR-0006 D4）：它的版本与标记照常发，标记最后、`is_latest`
+        for history in object_versions {
+            let order_inferred = history.order == HistoryOrder::Inferred;
+            let sorted_versions = history.entries;
             // 计算该对象的版本总数（版本 + 删除标记）
             let version_count = u32::try_from(sorted_versions.len()).unwrap_or(u32::MAX);
 
@@ -2307,6 +2330,7 @@ impl S3Storage {
                                     false,
                                     Some(version_count),
                                     false,
+                                    order_inferred,
                                 );
 
                                 total_file_count.fetch_add(1, Ordering::Relaxed);
@@ -2333,8 +2357,13 @@ impl S3Storage {
                             match_expressions,
                             exclude_expressions,
                         ) {
-                            self.send_delete_marker(tx, &delete_marker, version_count)
-                                .await?;
+                            self.send_delete_marker(
+                                tx,
+                                &delete_marker,
+                                version_count,
+                                order_inferred,
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -2378,6 +2407,7 @@ impl S3Storage {
         tx: &async_channel::Sender<StorageEntryMessage>,
         marker: &DeleteMarkerEntry,
         version_count: u32,
+        order_inferred: bool,
     ) -> Result<()> {
         let Some(key) = marker.key() else {
             return Ok(());
@@ -2396,6 +2426,7 @@ impl S3Storage {
             true,
             Some(version_count),
             false,
+            order_inferred,
         );
         trace!("[S3] 发送删除标记 EntryEnum : {:?}", entry);
         tx.send(StorageEntryMessage::Scanned(Arc::new(entry)))
@@ -3614,13 +3645,14 @@ impl S3Storage {
                     request = request.version_id_marker(version_marker);
                 }
             }
-            let response = match request.send().await {
-                Ok(response) => response,
+            let listed = match send_in_document_order(request).await {
+                Ok(listed) => listed,
                 Err(error) => {
                     error!("ListObjectVersions failed for prefix {prefix}: {error:?}");
                     return Ok(());
                 }
             };
+            let response = &listed.output;
             for common_prefix in response.common_prefixes() {
                 if let Some(prefix_name) = common_prefix.prefix()
                     && !self.is_artifact_key(prefix_name)
@@ -3638,31 +3670,12 @@ impl S3Storage {
             key_marker = response.next_key_marker().map(str::to_string);
             version_id_marker = response.next_version_id_marker().map(str::to_string);
             // 一页可能停在某个 key 的版本中间：该 key 留到下一页合并后再发
-            let (versions, delete_markers) = pages.complete_keys(
-                response
-                    .versions()
-                    .iter()
-                    .filter(|version| {
-                        version
-                            .key()
-                            .is_some_and(|key| key != prefix && !self.is_artifact_key(key))
-                    })
-                    .cloned(),
-                response
-                    .delete_markers()
-                    .iter()
-                    .filter(|marker| {
-                        marker
-                            .key()
-                            .is_some_and(|key| key != prefix && !self.is_artifact_key(key))
-                    })
-                    .cloned(),
-                key_marker.is_some(),
-            );
+            let entries =
+                pages.positioned(&listed, |key| key != prefix && !self.is_artifact_key(key));
+            let entries = pages.complete_keys(entries, key_marker.is_some());
             self.process_versioned_entries(VersionedScan {
                 tx: runtime.tx,
-                versions,
-                delete_markers,
+                entries,
                 include_tags: runtime.include_tags,
                 match_expressions: runtime.match_expr,
                 exclude_expressions: runtime.exclude_expr,
@@ -3987,12 +4000,13 @@ impl S3Storage {
     /// no current object, but its history is still listed (ADR-0006 D4).
     async fn append_object_versions(
         &self,
-        key: &str,
-        entries: Vec<VersionOrDeleteMarker>,
+        history: KeyHistory<VersionOrDeleteMarker>,
         ctx: &crate::dir_tree::ReadContext,
         files: &mut Vec<Arc<EntryEnum>>,
     ) {
-        let versions = versions_with_latest(entries);
+        let key = history.key.as_str();
+        let order_inferred = history.order == HistoryOrder::Inferred;
+        let versions = versions_with_latest(history.entries);
         let version_count = u32::try_from(versions.len()).unwrap_or(u32::MAX);
         for (version, latest) in versions {
             let modified = datatime_to_i64(version.last_modified());
@@ -4033,6 +4047,7 @@ impl S3Storage {
                 false,
                 Some(version_count),
                 false,
+                order_inferred,
             )));
         }
     }
@@ -4080,32 +4095,29 @@ impl S3Storage {
                     request = request.version_id_marker(vim);
                 }
 
-                let response = match request.send().await {
-                    Ok(r) => r,
+                let listed = match send_in_document_order(request).await {
+                    Ok(listed) => listed,
                     Err(e) => {
                         errors.push(format!("list_object_versions failed: {e:?}"));
                         break;
                     }
                 };
+                let response = &listed.output;
 
                 self.append_common_prefixes(response.common_prefixes(), ctx, &mut subdirs);
 
                 key_marker = response.next_key_marker().map(str::to_string);
                 version_id_marker = response.next_version_id_marker().map(str::to_string);
                 // 一页可能停在某个 key 的版本中间：该 key 留到下一页合并后再处理
-                let (versions, markers) = pages.complete_keys(
-                    response.versions().iter().cloned(),
-                    response.delete_markers().iter().cloned(),
-                    key_marker.is_some(),
-                );
+                let entries = pages.positioned(&listed, |_| true);
+                let entries = pages.complete_keys(entries, key_marker.is_some());
 
                 // 处理每个 object 的版本
-                for (key, entries) in oldest_first_by_key(versions, markers) {
-                    if key == prefix_key || self.is_artifact_key(&key) {
+                for history in oldest_first_by_key(entries) {
+                    if history.key == prefix_key || self.is_artifact_key(&history.key) {
                         continue;
                     }
-                    self.append_object_versions(&key, entries, ctx, &mut files)
-                        .await;
+                    self.append_object_versions(history, ctx, &mut files).await;
                 }
 
                 if key_marker.is_none() {

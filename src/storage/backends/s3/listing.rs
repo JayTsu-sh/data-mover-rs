@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 
-use super::history::oldest_first;
+use super::history::{KeyHistory, oldest_first, warn_inferred};
 use super::paging::{ListingLimits, Paging};
 use super::source::{object_identity, path_scoped_bytes, role_failure};
 use super::{
@@ -25,7 +25,7 @@ use super::{
     is_real_version_id,
 };
 use crate::model::{
-    BackendIdentity, EntryKind, EntryOperationFailure, EntryVersion, FailureClass,
+    BackendIdentity, EntryKind, EntryOperationFailure, EntryVersion, FailureClass, HistoryOrder,
     IdentityStrength, Operation, SourceIdentity, SourceVersion, StoragePath, StorageTimestamp,
     TimestampMetadata, Transience,
 };
@@ -39,13 +39,14 @@ const NULL_MARKER_IDENTITY: &[u8] = b"\0s3-null-delete-marker";
 enum Child {
     Prefix(String),
     Object(S3ListedObject),
-    History(String, Vec<S3ListedVersion>),
+    History(KeyHistory<S3ListedVersion>),
 }
 
 impl Child {
     fn key(&self) -> &str {
         match self {
-            Self::Prefix(key) | Self::History(key, _) => key,
+            Self::Prefix(key) => key,
+            Self::History(history) => &history.key,
             Self::Object(object) => &object.key,
         }
     }
@@ -99,14 +100,19 @@ pub(super) async fn list_all<P: S3Protocol + ?Sized>(
     let mut paging = Paging::new(limits);
     let mut marker: Option<S3VersionMarker> = None;
     let (mut versions, mut markers, mut prefixes) = (Vec::new(), Vec::new(), Vec::new());
+    // Positions are per page; a later page's follow the earlier pages' (document order of the
+    // whole listing).
+    let mut listed_before = 0_u64;
     loop {
         let page = protocol
             .list_versions_page(&prefix, marker.as_ref())
             .await
             .map_err(|e| role_failure(directory, Operation::Traverse, e))?;
-        let listed = page.versions.len() + page.markers.len() + page.prefixes.len();
-        versions.extend(page.versions);
-        markers.extend(page.markers);
+        let entries = page.versions.len() + page.markers.len();
+        let listed = entries + page.prefixes.len();
+        versions.extend(listing_wide(page.versions, listed_before));
+        markers.extend(listing_wide(page.markers, listed_before));
+        listed_before += entries as u64;
         prefixes.extend(page.prefixes);
         marker = paging.advance(directory, listed, page.next)?;
         if marker.is_none() {
@@ -120,13 +126,23 @@ pub(super) async fn list_all<P: S3Protocol + ?Sized>(
     let mut block = Block::new(identity, directory, &prefix);
     block.own_marker(placed_versions.own.iter().any(|entry| entry.facts.size > 0));
     let histories = oldest_first(placed_versions.children, placed_markers.children);
-    let children = histories
-        .into_iter()
-        .map(|(key, entries)| Child::History(key, entries));
+    warn_inferred(directory.as_str(), &histories);
+    let children = histories.into_iter().map(Child::History);
     let mut rolled = placed_versions.rolled;
     rolled.extend(placed_markers.rolled);
     block.build(merge(children, prefixes, rolled));
     Ok(block.finish())
+}
+
+/// `entries` of one page with their positions moved after the `before` entries of earlier pages.
+fn listing_wide(
+    entries: Vec<S3ListedVersion>,
+    before: u64,
+) -> impl Iterator<Item = S3ListedVersion> {
+    entries.into_iter().map(move |mut entry| {
+        entry.position = entry.position.map(|position| before + position);
+        entry
+    })
 }
 
 /// S3 has no directories: a prefix under which nothing at all is stored does not exist. The
@@ -265,7 +281,7 @@ impl<'a> Block<'a> {
             let result = match child {
                 Child::Prefix(key) => self.prefix_child(&key),
                 Child::Object(object) => self.object_child(&object),
-                Child::History(key, entries) => self.history_child(&key, &entries),
+                Child::History(history) => self.history_child(&history),
             };
             if let Err(failure) = result {
                 self.failures.push(failure);
@@ -354,16 +370,21 @@ impl<'a> Block<'a> {
 
     fn history_child(
         &mut self,
-        key: &str,
-        entries: &[S3ListedVersion],
+        history: &KeyHistory<S3ListedVersion>,
     ) -> Result<(), EntryOperationFailure> {
+        let key = history.key.as_str();
         let name = key.get(self.prefix.len()..).unwrap_or_default();
         let Some(path) = self.child_path(key, name)? else {
             return Ok(());
         };
-        for (rank, entry) in entries.iter().enumerate() {
+        for (rank, entry) in history.entries.iter().enumerate() {
             let rank = u32::try_from(rank).unwrap_or(u32::MAX);
-            let descriptor = version_descriptor(self.identity, path.clone(), entry, rank)?;
+            let listed = Listed {
+                entry,
+                rank,
+                order: history.order,
+            };
+            let descriptor = version_descriptor(self.identity, path.clone(), &listed)?;
             self.entries.push(descriptor);
         }
         Ok(())
@@ -454,17 +475,28 @@ pub(super) fn file_descriptor(
     Ok(descriptor)
 }
 
-/// One entry of a key's history, `rank` its position oldest first.
+/// One entry of a key's history: `rank` its place oldest first, `order` where that came from.
+#[derive(Clone, Copy)]
+struct Listed<'a> {
+    entry: &'a S3ListedVersion,
+    rank: u32,
+    order: HistoryOrder,
+}
+
 fn version_descriptor(
     identity: &BackendIdentity,
     path: StoragePath,
-    entry: &S3ListedVersion,
-    rank: u32,
+    listed: &Listed<'_>,
 ) -> Result<SourceDescriptor, EntryOperationFailure> {
+    let Listed { entry, rank, order } = *listed;
     let facts = &entry.facts;
-    let version =
-        EntryVersion::from_listing(&facts.version_id, facts.is_latest, facts.delete_marker)
-            .map_err(|_| child_failure(&path, FailureClass::Protocol, "invalid S3 version id"))?;
+    let version = EntryVersion::from_listing(
+        &facts.version_id,
+        facts.is_latest,
+        facts.delete_marker,
+        order,
+    )
+    .map_err(|_| child_failure(&path, FailureClass::Protocol, "invalid S3 version id"))?;
     let mut descriptor = if facts.delete_marker {
         marker_descriptor(identity, path, &facts.version_id, entry.last_modified)?
     } else {

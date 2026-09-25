@@ -3871,6 +3871,7 @@ async fn nightly_lab_mutates_hdfs_native_metadata_safely() -> Result<(), Box<dyn
         is_delete_marker: false,
         version_count: Some(2),
         is_dir: false,
+        version_order_inferred: false,
     });
     storage.set_entry_metadata(&s3_entry).await?;
     let after_s3 = hdfs.get_metadata(std::path::Path::new("file.bin")).await?;

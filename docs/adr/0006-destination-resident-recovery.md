@@ -170,6 +170,15 @@ equal to their sources. Follow-up (older than C20): a `ListObjectVersions` / `Li
 that fails in `walkdir` is only logged — the walk ends that prefix without an error message, so a
 caller enumerating history cannot tell a short listing from a complete one (`walkdir_2` reports it
 in the page's errors).
+Follow-up (P7 review, existing issue 8 / Q29): each key was ordered by `(LastModified, is_latest)`,
+which cannot order entries of one millisecond, and concurrent writes share milliseconds (MinIO: one
+key, 12 PUT + 4 DELETE × 3 rounds — 44 entries, 20 sharing a millisecond with another; the time
+order was wrong from the fourth entry). Both legacy listings now take each key's order from the
+server's document order, with the role-based traversal's rules and code (C22 follow-up below); a key
+the server's order cannot be used for is inferred from `LastModified` (the latest last) and its entries carry
+`S3Entry.version_order_inferred = true` (`EntryEnum::get_version_order_inferred()`; `s3_listing`
+prints ` order=inferred`). `walkdir` now also sends complete keys in ascending key order within a
+page (a `HashMap` before).
 
 ### Destination artifacts
 
@@ -735,23 +744,34 @@ TraversalVersions` (`Current` default, `All`; every struct literal names it); `N
 defaulted `supports_versions` / `list_versions` / `mutations_unsupported`;
 `StorageTraversalSource::supports_versions`; `model::EntryVersion`; `ObservedEntry::version()` /
 `source_version()`. `All` on a source without versions ends before any I/O with a
-`Session(Unsupported)` terminal failure and no items. Versions: each key's history is rebuilt from
-the separate version and marker lists: each list's own listing order (reversed, oldest first) is
-kept as the server gave it, whatever `LastModified` says — clock skew between a store's nodes
-cannot reorder versions, and entries without a time keep their place — and the times only decide
-how versions and markers interleave (a version before a marker of the same millisecond, as in C20;
-the latest entry, whichever list holds it, last); the `"null"` version has no id and selects `Current`
+`Session(Unsupported)` terminal failure and no items. Versions: each key's history is the server's
+order reversed (oldest first, the latest last). The SDK parses `<Version>` and `<DeleteMarker>` into
+two lists, so a per-request interceptor keeps the raw response and every entry gets its place in the
+document's element sequence (`s3/version_order.rs`; used only when the raw elements name exactly
+the SDK's entries); positions of later pages follow earlier ones. A key is taken in the server's
+order when all its entries have positions, they are contiguous in the directory's listing (across
+pages), and exactly one is the latest and it comes first. Otherwise every entry of the key reports
+`EntryVersion::order() == HistoryOrder::Inferred`, the latest last: a key with an entry the response
+order could not place keeps each list's own order and lets `LastModified` interleave the two (the
+merge as first built); a key that fails the checks (a store whose listing order is wrong) is sorted
+by `LastModified` alone. A listing with an inferred key logs one warning. Snapshot flag bit 8 marks
+`Server`; a v6 snapshot written before it decodes as `Inferred`, which is what it was. As first built (before the
+P7 review, existing issue 8 / Q29) every key was merged from the two lists by `LastModified`, which
+cannot order entries of one millisecond: on MinIO's concurrent-write listing it was wrong from the
+fourth entry. Clock skew between a store's nodes cannot reorder a server-ordered history; the
+`"null"` version has no id and selects `Current`
 while latest, `Id("null")` once newer versions exist; a marker selects nothing, has no size, and is
 never looked up (neither is a prefix); optional metadata of every listed version, the latest
 `"null"` one included, is observed bound to it (`observe_copy_bound_version`, its own tags). `NameBytes` ties are ordered (object before directory,
 versions oldest first). Snapshots of version entries are v6 (v5 plus the version record); every
-other entry stays v5, byte for byte. Identities: `Current` entries are `PathScoped(ETag)`
-(`ListObjectsV2` carries no versionId), version entries `VersionScoped(id)` as a versioned describe
-gives them, so `Current` and `All` snapshots of one bucket do not join. The expert source half
-revalidates an observation with a describe, which on a versioned bucket pins `VersionScoped(id)`;
-`ReadSource::observation_matches` (default: identity equality) lets S3 accept a `PathScoped(ETag)`
-observation when the described version's `ETag` is the listed one — the same unchanged object —
-and still refuse a replaced object ("source differs"). The offer and evidence then carry the
+other entry stays v5, byte for byte. Identities: `Current` entries are `PathScoped(path, ETag)`
+(`ListObjectsV2` carries no versionId; the `ETag` alone as first built, see the C6 follow-up), version
+entries `VersionScoped(id)` as a versioned describe gives them, so `Current` and `All` snapshots of
+one bucket do not join. The expert source half revalidates an observation with a describe, which on
+a versioned bucket pins `VersionScoped(id)`; `ReadSource::observation_matches` (default: identity
+equality) lets S3 accept a `PathScoped(path, ETag)` observation when it names the described path and
+the described version's `ETag` — the same unchanged object — and still refuse a replaced object
+("source differs"). The offer and evidence then carry the
 observation's identity key, which the destination half compares with, while the reads stay pinned
 to the described version. From an `All` traversal only the latest version is an expert source:
 an older version is refused as such (copy it with `TransferRequest::with_source_version`), a
@@ -817,6 +837,12 @@ zero-byte `d/` is skipped; 1 015 entries in `All`, 1 008 in `Current`, 5 directo
   generations (one scan sees those entries as deleted and added) and recovery bindings (drain
   resumable transfers from unversioned S3 sources before upgrading). `VersionScoped` keys are
   unchanged.
+- S3 version order (P7 review Q29, C20 / C22 follow-ups): histories follow the server's listing
+  order; public additions `model::HistoryOrder`, `EntryVersion::order()`, the `S3Entry` field
+  `version_order_inferred` (every struct literal names it; serde default `false`) and
+  `EntryEnum::get_version_order_inferred()`. A v6 snapshot of a server-ordered entry sets flag bit 8,
+  which builds before this change refuse (`Malformed`); v6 snapshots written before it decode as
+  `HistoryOrder::Inferred` (their histories were merged by time).
 - Every listing hides `.data-mover-*` names (any path segment), so a user object named that way is no
   longer seen as a source entry; the same name must be hidden on every backend, or a mirror could treat
   it as an extra destination file.

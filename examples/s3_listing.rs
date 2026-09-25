@@ -12,7 +12,9 @@
 //!
 //! `walkdir` prints `ENTRY <path relative to the storage root> <versionId or -> latest=<0|1>
 //! marker=<0|1> count=<version count or ->` (a versioned bucket lists every version and delete
-//! marker), `walkdir_2` prints `FILE <path>` with the same four fields and `DIR <path>`, and
+//! marker; ` order=inferred` follows when the key's history was ordered by `LastModified` because
+//! the server's listing order failed its checks), `walkdir_2` prints `FILE <path>` with the same
+//! four fields and `DIR <path>`, and
 //! `ERROR …` for a reported error (exit 1). `count` is the key's entries in `walkdir` (versions and
 //! delete markers) but its versions only in `walkdir_2`, which lists no markers. A walk that has not finished within
 //! `--timeout-secs` exits 2: a walk that re-lists a directory forever must not hang the caller.
@@ -68,17 +70,24 @@ async fn delete_dir(storage: &StorageEnum, dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// `<path> <versionId or -> latest=<0|1> marker=<0|1> count=<version count or ->`.
+/// `<path> <versionId or -> latest=<0|1> marker=<0|1> count=<version count or ->`, then
+/// ` order=inferred` when the key's history was ordered by `LastModified` rather than by the
+/// server's listing order.
 fn describe(entry: &EntryEnum) -> String {
     format!(
-        "{} {} latest={} marker={} count={}",
+        "{} {} latest={} marker={} count={}{}",
         entry.get_relative_path().display(),
         entry.get_version_id().unwrap_or("-"),
         u8::from(entry.get_is_latest()),
         u8::from(entry.get_is_delete_marker()),
         entry
             .get_version_count()
-            .map_or_else(|| "-".to_string(), |count| count.to_string())
+            .map_or_else(|| "-".to_string(), |count| count.to_string()),
+        if entry.get_version_order_inferred() {
+            " order=inferred"
+        } else {
+            ""
+        }
     )
 }
 

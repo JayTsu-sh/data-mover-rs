@@ -21,6 +21,7 @@ pub(crate) use protocol::{
     S3VersionMarker, S3VersionPage, S3WriteFacts, composite_etag, is_real_version_id,
 };
 
+pub(crate) use history::{KeyHistory, ListedFacts, key_histories, warn_inferred};
 pub(crate) use metadata::S3TagSupport;
 pub(crate) use native::S3NativeContext;
 pub(crate) use staged::DEFAULT_SINGLE_PUT_THRESHOLD;

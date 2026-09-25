@@ -58,6 +58,12 @@
    XML 顺序正确，但合并结果第 4 条起错（`IsLatest` 仍对）。修法：拦截 ListObjectVersions 原始 XML 取位置，按服务端位置倒序组装、
    完全不用时间；逐项校验（每 key 恰一条 `IsLatest` 且在最前、同 key 连续），不符则退回按时间推断并标 `order: Inferred`；把这次
    并发响应存成回归数据。MinIO 另一偏差：最新已是删除标记时再 DELETE 不新建标记。（Q29）
+   **已修**（`fix(s3)!: 版本历史按服务端顺序组装`）：`src/s3/version_order.rs` 按请求挂拦截器留下原始响应体，
+   quick-xml 读出 `<Version>` / `<DeleteMarker>` 序列并与 SDK 两个列表逐条对齐（种类、key、versionId 都对上才用）；
+   `history.rs` 的通用核心按位置倒序组装（role-based C22 与 legacy `walkdir` / `walkdir_2` 共用），逐 key 校验（有位置、
+   整个列举里连续 —— legacy 只在每批已完整的 key 内查 ——、恰一条 `IsLatest` 且在最前），不符的 key 按 `LastModified` 推断（latest 最后）并标
+   `HistoryOrder::Inferred`（`EntryVersion::order()`、legacy `S3Entry.version_order_inferred`）。回归数据
+   `tests/data/s3/minio-concurrent-versions{,-paged}.xml`。
 
 ## 待拍板（每条附建议）
 
@@ -118,7 +124,7 @@
 | Q26 | 用 `GetBucketVersioning` 判定多版本桶（`Enabled` / `Suspended` 列全部历史，从未开过走 ListObjectsV2），查询被拒时一律列全部历史 | 同意 |
 | Q27 | terrasync 落库时把一个对象的历史展开成每版本一行（沿用 base 表按 `(relative_path, version_id, identity_key)` 的结构） | 每版本一行 |
 | Q28 | 现存问题 7（S3 身份缺路径）独立先修 | 先修 —— 已修（`fix(s3)!: PathScoped 身份包含路径`） |
-| Q29 | 现存问题 8（版本历史并发排错）按原始 XML 顺序独立先修 | 先修 |
+| Q29 | 现存问题 8（版本历史并发排错）按原始 XML 顺序独立先修 | 先修 —— 已修（`fix(s3)!: 版本历史按服务端顺序组装`） |
 | Q30 | 在 DXN 与 StorageGRID 上跑同一组版本顺序测试（临时桶，跑完删光） | 待批准（StorageGRID 只批过前缀写入、未批建桶） |
 
 **多版本形状已改（用户决定，覆盖 Q7–Q9 的旧建议）**：去掉 `versions` 参数；多版本桶上一个对象一项 `ObjectHistory { records,

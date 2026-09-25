@@ -7,7 +7,7 @@ use tokio::time::timeout;
 
 use super::*;
 use crate::model::Transience;
-use crate::model::{EntryKind, FailureClass, SourceVersion};
+use crate::model::{EntryKind, EntryVersion, FailureClass, HistoryOrder, SourceVersion};
 use crate::storage::backends::s3::namespace::S3Namespace;
 use crate::storage::backends::s3::paging::ListingLimits;
 use crate::storage::{
@@ -261,6 +261,54 @@ async fn one_instant_keeps_the_written_order() -> TestResult {
     protocol.listing().same_instant = true;
     let (rows, _) = listed(namespace(&protocol)?.as_ref(), "", true).await?;
     assert_eq!(rows, expected_history());
+    Ok(())
+}
+
+/// The order every listed version reports for its key's history.
+async fn history_orders(namespace: &dyn Namespace) -> TestResult<Vec<HistoryOrder>> {
+    let (entries, _) = namespace
+        .list_versions(&StoragePath::root())
+        .await?
+        .into_listing()
+        .ok_or("not a listing")?;
+    Ok(entries
+        .iter()
+        .filter_map(|entry| entry.listing.version.as_deref().map(EntryVersion::order))
+        .collect())
+}
+
+/// A store listing in S3's order gives server-ordered histories, even when every entry was written
+/// in one instant and pages split the keys; a store that lists each key oldest first (a
+/// non-conforming listing) is not trusted — its histories are inferred from `LastModified` (here
+/// still right: every version has its own second) and marked so.
+#[tokio::test]
+async fn a_non_conforming_store_is_ordered_by_time_and_marked_inferred() -> TestResult {
+    let protocol = versioned_history().await?;
+    let namespace = namespace(&protocol)?;
+    {
+        let mut knobs = protocol.listing();
+        knobs.same_instant = true;
+        knobs.page_size = 2;
+    }
+    assert_eq!(
+        listed(namespace.as_ref(), "", true).await?.0,
+        expected_history()
+    );
+    let orders = history_orders(namespace.as_ref()).await?;
+    assert!(orders.iter().all(|order| *order == HistoryOrder::Server));
+    {
+        let mut knobs = protocol.listing();
+        knobs.same_instant = false;
+        knobs.page_size = 0;
+        knobs.oldest_first_versions = true;
+    }
+    assert_eq!(
+        listed(namespace.as_ref(), "", true).await?.0,
+        expected_history()
+    );
+    let orders = history_orders(namespace.as_ref()).await?;
+    assert_eq!(orders.len(), 9);
+    assert!(orders.iter().all(|order| *order == HistoryOrder::Inferred));
     Ok(())
 }
 

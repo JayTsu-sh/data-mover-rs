@@ -31,7 +31,8 @@ use data_mover::integrity::{
     IntegrityMode, IntegrityOptions, IntegrityRequest, compare as compare_objects,
 };
 use data_mover::model::{
-    BackendKind, ObservationMode, ObservationPlan, ObservedEntry, StoragePath, StorageTimestamp,
+    BackendKind, HistoryOrder, ObservationMode, ObservationPlan, ObservedEntry, StoragePath,
+    StorageTimestamp,
 };
 use data_mover::ndx_walk::{NdxWalkRequest, ndx_walk};
 use data_mover::storage::{
@@ -347,17 +348,23 @@ fn print_completion(item: &TraversalItem, quiet: bool, root: &str) {
 }
 
 /// ` version=<id|null> latest=<0|1> marker=<0|1> size=<n|->` for an entry of a traversal of
-/// every version; nothing otherwise.
+/// every version, then ` order=inferred` when its key's history was ordered by `LastModified`
+/// rather than by the server's listing order; nothing otherwise.
 fn version_of(entry: &ObservedEntry) -> String {
     entry.version().map_or_else(String::new, |version| {
         format!(
-            " version={} latest={} marker={} size={}",
+            " version={} latest={} marker={} size={}{}",
             version.id().unwrap_or("null"),
             u8::from(version.is_latest()),
             u8::from(version.is_delete_marker()),
             entry
                 .size()
-                .map_or_else(|| "-".to_string(), |size| size.to_string())
+                .map_or_else(|| "-".to_string(), |size| size.to_string()),
+            if version.order() == HistoryOrder::Inferred {
+                " order=inferred"
+            } else {
+                ""
+            }
         )
     })
 }

@@ -1194,6 +1194,7 @@ mod tests {
             is_delete_marker: false,
             version_count: None,
             is_dir: false,
+            version_order_inferred: false,
         });
 
         destination

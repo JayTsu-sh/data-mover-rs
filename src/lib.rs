@@ -380,6 +380,17 @@ impl EntryEnum {
         }
     }
 
+    /// Whether this S3 version entry's place in its key's history was inferred from
+    /// `LastModified` rather than taken from the server's listing order (see
+    /// `S3Entry::version_order_inferred`); `false` for every other entry.
+    #[must_use]
+    pub fn get_version_order_inferred(&self) -> bool {
+        match self {
+            EntryEnum::NAS(_) | EntryEnum::HDFS(_) => false,
+            EntryEnum::S3(entry) => entry.version_order_inferred,
+        }
+    }
+
     pub fn get_is_latest(&self) -> bool {
         match self {
             EntryEnum::NAS(_) | EntryEnum::HDFS(_) => true,
@@ -639,6 +650,9 @@ pub struct Tag {
     pub value: String,
 }
 
+// Each flag mirrors an independent field of the S3 listing (latest, delete marker, prefix,
+// inferred history order); no two of them form one state.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct S3Entry {
     /// 通用属性
@@ -666,6 +680,11 @@ pub struct S3Entry {
     pub version_count: Option<u32>,
     /// 是否为目录（S3 prefix）
     pub is_dir: bool,
+    /// 多版本列举时，该 key 历史的顺序（`version_count` 个条目的先后）是否为推断的：服务端列举顺序
+    /// 未通过校验（同一 key 的条目不连续、最新条目不是恰好一条且排在最前），或读不到响应的原始顺序时，
+    /// 按 `LastModified` 推断（毫秒精度，同毫秒内的条目可能排错）。`false`：按服务端顺序。非多版本条目恒为 `false`。
+    #[serde(default)]
+    pub version_order_inferred: bool,
 }
 
 impl fmt::Display for S3Entry {
@@ -681,7 +700,8 @@ impl fmt::Display for S3Entry {
         write!(f, "is_latest: {}, ", self.is_latest)?;
         write!(f, "is_delete_marker: {}, ", self.is_delete_marker)?;
         write!(f, "version_count: {:?}, ", self.version_count)?;
-        write!(f, "is_dir: {}", self.is_dir)?;
+        write!(f, "is_dir: {}, ", self.is_dir)?;
+        write!(f, "version_order_inferred: {}", self.version_order_inferred)?;
         write!(f, "}}")
     }
 }

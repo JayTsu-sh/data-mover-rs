@@ -139,6 +139,11 @@ pub(crate) struct S3ListedVersion {
     pub facts: S3VersionFacts,
     /// The listing's `LastModified` (millisecond precision); `None` when it gave none.
     pub last_modified: Option<StorageTimestamp>,
+    /// Where the server placed this entry in its response: the index among the page's
+    /// `<Version>` and `<DeleteMarker>` elements counted together, in document order. `None`
+    /// when the response's document order could not be read (the key's history is then
+    /// inferred from `LastModified`).
+    pub position: Option<u64>,
 }
 
 /// Where the next page of a versions listing starts. Both values are opaque server tokens, passed
@@ -151,8 +156,9 @@ pub(crate) struct S3VersionMarker {
 }
 
 /// One page of a delimiter listing of versions under one prefix. Versions and delete markers are
-/// each in listing order (keys ascending, each key's entries newest first); how the two lists
-/// interleave is lost, as the SDK parses them apart.
+/// each in listing order (keys ascending, each key's entries newest first); the SDK parses them
+/// apart, so how the two interleave is carried by each entry's `position` (the server's document
+/// order), read from the raw response.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct S3VersionPage {
     pub versions: Vec<S3ListedVersion>,

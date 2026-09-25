@@ -7,7 +7,7 @@ use super::{
     SymlinkTargetEncoding,
 };
 use crate::model::metadata_observation;
-use crate::model::{SpecialFileKind, TimePrecision};
+use crate::model::{HistoryOrder, SpecialFileKind, TimePrecision};
 
 const MAGIC: &[u8; 4] = b"DMES";
 /// v5 (ADR-0006 C4c): the backend identity is no longer stored — every entry of one scan shares it,
@@ -368,10 +368,14 @@ fn decode_facts(
     }
 }
 
-/// Flags of the v6 version record.
+/// Flags of the v6 version record. `VERSION_ORDER_SERVER` (the key's history is in the server's
+/// listing order, `HistoryOrder::Server`) was added after the first v6 snapshots, whose histories
+/// were merged by `LastModified`: they never set it and decode as `HistoryOrder::Inferred`, which
+/// is what they were. A build older than the flag refuses a snapshot that sets it (`Malformed`).
 const VERSION_LATEST: u8 = 1;
 const VERSION_DELETE_MARKER: u8 = 2;
 const VERSION_HAS_ID: u8 = 4;
+const VERSION_ORDER_SERVER: u8 = 8;
 
 fn encode_version(output: &mut Vec<u8>, version: &EntryVersion) {
     let mut flags = 0;
@@ -384,6 +388,9 @@ fn encode_version(output: &mut Vec<u8>, version: &EntryVersion) {
     if version.id().is_some() {
         flags |= VERSION_HAS_ID;
     }
+    if version.order() == HistoryOrder::Server {
+        flags |= VERSION_ORDER_SERVER;
+    }
     output.push(flags);
     if let Some(id) = version.id() {
         put_bytes(output, id.as_bytes());
@@ -392,7 +399,8 @@ fn encode_version(output: &mut Vec<u8>, version: &EntryVersion) {
 
 fn decode_version(cursor: &mut Cursor<'_>) -> Result<EntryVersion, SnapshotDecodeError> {
     let flags = cursor.byte()?;
-    if flags & !(VERSION_LATEST | VERSION_DELETE_MARKER | VERSION_HAS_ID) != 0 {
+    let known = VERSION_LATEST | VERSION_DELETE_MARKER | VERSION_HAS_ID | VERSION_ORDER_SERVER;
+    if flags & !known != 0 {
         return Err(SnapshotDecodeError::Malformed);
     }
     let id = if flags & VERSION_HAS_ID == 0 {
@@ -406,6 +414,11 @@ fn decode_version(cursor: &mut Cursor<'_>) -> Result<EntryVersion, SnapshotDecod
         id,
         flags & VERSION_LATEST != 0,
         flags & VERSION_DELETE_MARKER != 0,
+        if flags & VERSION_ORDER_SERVER == 0 {
+            HistoryOrder::Inferred
+        } else {
+            HistoryOrder::Server
+        },
     )
     .map_err(|_| SnapshotDecodeError::Malformed)
 }

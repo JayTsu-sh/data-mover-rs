@@ -10,7 +10,7 @@ mod metadata_observation;
 pub(crate) mod observation;
 mod ownership;
 mod source_version;
-pub use entry_version::EntryVersion;
+pub use entry_version::{EntryVersion, HistoryOrder};
 pub use metadata_observation::{
     AclEncoding, AclMetadata, ExtendedAttribute, MappedOwnership, MetadataObservation,
     MetadataObservations, MetadataProvenance, ObjectTag, ObservationMode, ObservationPlan,

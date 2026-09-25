@@ -12,6 +12,7 @@ use super::{
     s3_role_transport_failure,
 };
 use crate::model::{FailureClass, StorageTimestamp, Transience};
+use crate::s3::version_order::{DocumentOrder, send_in_document_order};
 use crate::storage::backends::s3::{
     S3ListedObject, S3ListedVersion, S3ObjectPage, S3VersionFacts, S3VersionMarker, S3VersionPage,
 };
@@ -49,20 +50,25 @@ impl S3Storage {
         prefix: &str,
         marker: Option<&S3VersionMarker>,
     ) -> S3Result<S3VersionPage> {
-        let response = self
+        let request = self
             .client
             .list_object_versions()
             .bucket(&self.bucket_name)
             .prefix(self.build_full_key(prefix))
             .delimiter("/")
             .set_key_marker(marker.map(|marker| marker.key_marker.clone()))
-            .set_version_id_marker(marker.and_then(|marker| marker.version_id_marker.clone()))
-            .send()
-            .await
-            .map_err(|error| {
-                listing_failure(classify_sdk!(error, "S3 ListObjectVersions request failed"))
-            })?;
-        version_page(&response, self.listing_root())
+            .set_version_id_marker(marker.and_then(|marker| marker.version_id_marker.clone()));
+        let response = send_in_document_order(request).await.map_err(|error| {
+            listing_failure(classify_sdk!(
+                *error,
+                "S3 ListObjectVersions request failed"
+            ))
+        })?;
+        version_page(
+            &response.output,
+            response.order.as_ref(),
+            self.listing_root(),
+        )
     }
 }
 
@@ -153,7 +159,11 @@ fn listed_version_id(id: Option<&str>) -> String {
     id.filter(|id| !id.is_empty()).unwrap_or("null").to_string()
 }
 
-fn listed_version(version: &ObjectVersion, root: &str) -> S3Result<S3ListedVersion> {
+fn listed_version(
+    version: &ObjectVersion,
+    root: &str,
+    position: Option<u64>,
+) -> S3Result<S3ListedVersion> {
     Ok(S3ListedVersion {
         key: relative(version.key(), root)?,
         facts: S3VersionFacts {
@@ -164,10 +174,15 @@ fn listed_version(version: &ObjectVersion, root: &str) -> S3Result<S3ListedVersi
             etag: version.e_tag().unwrap_or_default().to_string(),
         },
         last_modified: listed_time(version.last_modified()),
+        position,
     })
 }
 
-fn listed_marker(marker: &DeleteMarkerEntry, root: &str) -> S3Result<S3ListedVersion> {
+fn listed_marker(
+    marker: &DeleteMarkerEntry,
+    root: &str,
+    position: Option<u64>,
+) -> S3Result<S3ListedVersion> {
     Ok(S3ListedVersion {
         key: relative(marker.key(), root)?,
         facts: S3VersionFacts {
@@ -178,10 +193,17 @@ fn listed_marker(marker: &DeleteMarkerEntry, root: &str) -> S3Result<S3ListedVer
             etag: String::new(),
         },
         last_modified: listed_time(marker.last_modified()),
+        position,
     })
 }
 
-fn version_page(response: &ListObjectVersionsOutput, root: &str) -> S3Result<S3VersionPage> {
+/// One page of versions; `order` (the response's document order, when it could be read) gives
+/// every entry its position.
+fn version_page(
+    response: &ListObjectVersionsOutput,
+    order: Option<&DocumentOrder>,
+    root: &str,
+) -> S3Result<S3VersionPage> {
     let next = continuation(
         response.is_truncated(),
         response.next_key_marker(),
@@ -195,12 +217,18 @@ fn version_page(response: &ListObjectVersionsOutput, root: &str) -> S3Result<S3V
         versions: response
             .versions()
             .iter()
-            .map(|version| listed_version(version, root))
+            .enumerate()
+            .map(|(index, version)| {
+                listed_version(version, root, order.and_then(|order| order.version(index)))
+            })
             .collect::<S3Result<_>>()?,
         markers: response
             .delete_markers()
             .iter()
-            .map(|marker| listed_marker(marker, root))
+            .enumerate()
+            .map(|(index, marker)| {
+                listed_marker(marker, root, order.and_then(|order| order.marker(index)))
+            })
             .collect::<S3Result<_>>()?,
         prefixes: prefixes(response.common_prefixes(), root)?,
         next,
@@ -241,7 +269,7 @@ mod tests {
             .is_truncated(true)
             .next_key_marker("root/d/k[minio_cache:v2,return:]")
             .build();
-        let page = version_page(&response, "root/").map_err(|e| format!("{e:?}"))?;
+        let page = version_page(&response, None, "root/").map_err(|e| format!("{e:?}"))?;
         assert_eq!(page.versions[0].key, "d/k");
         assert_eq!(
             page.versions[0]
@@ -283,12 +311,12 @@ mod tests {
         let idless = ListObjectVersionsOutput::builder()
             .versions(ObjectVersion::builder().key("k").size(1).build())
             .build();
-        let page = version_page(&idless, "").unwrap_or_else(|e| panic!("{e:?}"));
+        let page = version_page(&idless, None, "").unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(page.versions[0].facts.version_id, "null");
         let markerless = ListObjectVersionsOutput::builder()
             .is_truncated(true)
             .build();
-        assert!(version_page(&markerless, "").is_err());
+        assert!(version_page(&markerless, None, "").is_err());
         let token = ListObjectsV2Output::builder()
             .contents(Object::builder().key("a").size(1).build())
             .common_prefixes(common("b/"))

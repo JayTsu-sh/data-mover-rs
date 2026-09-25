@@ -6,6 +6,23 @@ use super::{ModelValueError, SourceVersion};
 /// The version id an unversioned bucket, or an object written before versioning, reports.
 const NULL_VERSION: &str = "null";
 
+/// Where the order of a key's history — its versions and delete markers, oldest first — came from.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum HistoryOrder {
+    /// The server's own listing order: `ListObjectVersions` lists each key's entries newest first,
+    /// versions and delete markers interleaved in one sequence, and the listing passed the checks
+    /// (every entry of the key listed together, exactly one latest entry and it first). Exact even
+    /// for entries written in the same millisecond.
+    Server,
+    /// Inferred from `LastModified` (millisecond resolution; the latest entry last) because the
+    /// server's order could not be used: the listing broke one of the checks (a store whose
+    /// listing order is wrong), or the response's document order could not be read. Entries
+    /// written in the same millisecond may be out of order. Also what a v6 snapshot written before
+    /// the order was recorded decodes as: its history was merged by `LastModified`.
+    Inferred,
+}
+
 /// One stored version, or delete marker, of an object as the listing reported it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct EntryVersion {
@@ -13,6 +30,7 @@ pub struct EntryVersion {
     id: Option<String>,
     latest: bool,
     delete_marker: bool,
+    order: HistoryOrder,
 }
 
 impl EntryVersion {
@@ -24,16 +42,18 @@ impl EntryVersion {
         reported_id: &str,
         latest: bool,
         delete_marker: bool,
+        order: HistoryOrder,
     ) -> Result<Self, ModelValueError> {
         let id = (!reported_id.is_empty() && reported_id != NULL_VERSION)
             .then(|| reported_id.to_string());
-        Self::new(id, latest, delete_marker)
+        Self::new(id, latest, delete_marker, order)
     }
 
     pub(crate) fn new(
         id: Option<String>,
         latest: bool,
         delete_marker: bool,
+        order: HistoryOrder,
     ) -> Result<Self, ModelValueError> {
         if let Some(id) = &id {
             SourceVersion::Id(id.clone()).validate()?;
@@ -48,6 +68,7 @@ impl EntryVersion {
             id,
             latest,
             delete_marker,
+            order,
         })
     }
 
@@ -67,6 +88,14 @@ impl EntryVersion {
     #[must_use]
     pub const fn is_delete_marker(&self) -> bool {
         self.delete_marker
+    }
+
+    /// Where this entry's place in its key's history (its rank, oldest first) came from: the
+    /// server's listing order, or inferred from `LastModified` (see [`HistoryOrder`]). Every entry
+    /// of one key has the same value.
+    #[must_use]
+    pub const fn order(&self) -> HistoryOrder {
+        self.order
     }
 
     /// The selector that copies exactly this version with `TransferRequest::with_source_version`.
@@ -92,10 +121,11 @@ impl EntryVersion {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryVersion, SourceVersion};
+    use super::{EntryVersion, HistoryOrder, SourceVersion};
 
     fn listed(id: &str, latest: bool, marker: bool) -> EntryVersion {
-        EntryVersion::from_listing(id, latest, marker).unwrap_or_else(|error| panic!("{error}"))
+        EntryVersion::from_listing(id, latest, marker, HistoryOrder::Server)
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     #[test]
@@ -135,8 +165,9 @@ mod tests {
 
     #[test]
     fn malformed_ids_are_refused() {
-        assert!(EntryVersion::from_listing(&"x".repeat(1025), true, false).is_err());
-        assert!(EntryVersion::from_listing("a\0b", true, false).is_err());
-        assert!(EntryVersion::new(Some("null".into()), true, false).is_err());
+        let order = HistoryOrder::Server;
+        assert!(EntryVersion::from_listing(&"x".repeat(1025), true, false, order).is_err());
+        assert!(EntryVersion::from_listing("a\0b", true, false, order).is_err());
+        assert!(EntryVersion::new(Some("null".into()), true, false, order).is_err());
     }
 }

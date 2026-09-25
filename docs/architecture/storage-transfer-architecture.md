@@ -338,7 +338,9 @@ any handle they opened is closed.
 `TraversalRequest::versions` selects what a versioned store contributes (ADR-0006 C22):
 `Current` (default) emits current objects only — a key whose newest entry is a delete marker is
 absent — and `All` emits every stored version and delete marker, each key's entries contiguous,
-oldest first, the latest last. A source that keeps no versions ends an `All` traversal before any
+oldest first, the latest last, in the server's listing order (never `LastModified`, which
+concurrent writes share; a key whose listing fails the order checks is ordered by time and reports
+`EntryVersion::order() == HistoryOrder::Inferred`). A source that keeps no versions ends an `All` traversal before any
 I/O with an `Unsupported` session failure (`StorageTraversalSource::supports_versions()` asks
 first); it never returns current entries in place of versions. Both modes hide `.data-mover-*`
 names. On S3 a name can repeat in one directory — the object `a` beside the prefix `a/`, and in
@@ -836,7 +838,9 @@ copy one object's versions into a versioned destination bucket:
    (`StorageEnum::walkdir` or `walkdir_2` on
    an S3 source whose bucket has versioning `Enabled`): Every entry is an `EntryEnum::S3` with
    `get_version_id()`, `get_is_latest()` and `get_is_delete_marker()`; each key's entries arrive
-   oldest first, also when `ListObjectVersions` paging splits the key (C20), but `walkdir` may
+   oldest first in the server's listing order (inferred from time, with
+   `get_version_order_inferred()` true, when that order fails its checks), also when
+   `ListObjectVersions` paging splits the key (C20), but `walkdir` may
    interleave other keys between them, so group by `get_relative_path()`. `walkdir` lists delete
    markers too, `walkdir_2` versions only. A key whose newest entry is a delete marker is listed
    as well (user decision D4, a follow-up after C22; before, it was not listed at all): `walkdir`

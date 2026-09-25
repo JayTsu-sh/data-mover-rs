@@ -10,7 +10,7 @@ use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::{DeleteMarkerEntry, ObjectVersion};
 
 use super::tests::make_test_storage;
-use super::version_listing::oldest_first_by_key;
+use super::version_listing::{ListedEntry, VersionOrDeleteMarker, oldest_first_by_key};
 use super::{S3Storage, VersionedScan};
 use crate::dir_tree::ReadContext;
 use crate::filter::{FilterExpression, parse_filter_expression};
@@ -18,38 +18,49 @@ use crate::{EntryEnum, StorageEntryMessage};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-fn version(key: &str, id: &str, millis: i64, latest: bool) -> ObjectVersion {
-    ObjectVersion::builder()
-        .key(key)
-        .version_id(id)
-        .size(3)
-        .is_latest(latest)
-        .last_modified(DateTime::from_millis(millis))
-        .build()
+fn version(key: &str, id: &str, millis: i64, latest: bool) -> VersionOrDeleteMarker {
+    VersionOrDeleteMarker::Version(
+        ObjectVersion::builder()
+            .key(key)
+            .version_id(id)
+            .size(3)
+            .is_latest(latest)
+            .last_modified(DateTime::from_millis(millis))
+            .build(),
+    )
 }
 
-fn marker(key: &str, id: &str, millis: i64, latest: bool) -> DeleteMarkerEntry {
-    DeleteMarkerEntry::builder()
-        .key(key)
-        .version_id(id)
-        .is_latest(latest)
-        .last_modified(DateTime::from_millis(millis))
-        .build()
+fn marker(key: &str, id: &str, millis: i64, latest: bool) -> VersionOrDeleteMarker {
+    VersionOrDeleteMarker::DeleteMarker(
+        DeleteMarkerEntry::builder()
+            .key(key)
+            .version_id(id)
+            .is_latest(latest)
+            .last_modified(DateTime::from_millis(millis))
+            .build(),
+    )
 }
 
 /// `live`: v1, v2 (latest). `gone`: g1, g2, then a latest marker. `k`: v1, a marker, v2 (latest).
-fn page() -> (Vec<ObjectVersion>, Vec<DeleteMarkerEntry>) {
-    (
-        vec![
-            version("gone", "g2", 20, false),
-            version("gone", "g1", 10, false),
-            version("k", "k2", 30, true),
-            version("k", "k1", 10, false),
-            version("live", "l2", 20, true),
-            version("live", "l1", 10, false),
-        ],
-        vec![marker("gone", "gm", 30, true), marker("k", "km", 20, false)],
-    )
+/// In the server's order (each key newest first), each entry at its document position.
+fn page() -> Vec<ListedEntry> {
+    let listed = vec![
+        marker("gone", "gm", 30, true),
+        version("gone", "g2", 20, false),
+        version("gone", "g1", 10, false),
+        version("k", "k2", 30, true),
+        marker("k", "km", 20, false),
+        version("k", "k1", 10, false),
+        version("live", "l2", 20, true),
+        version("live", "l1", 10, false),
+    ];
+    (0..)
+        .zip(listed)
+        .map(|(position, entry)| ListedEntry {
+            position: Some(position),
+            entry,
+        })
+        .collect()
 }
 
 /// `(version id, latest, delete marker, version count)` of every entry listed for `key`, in the
@@ -73,19 +84,16 @@ fn row(id: &str, latest: bool, deleted: bool, count: u32) -> (String, bool, bool
     (id.to_string(), latest, deleted, Some(count))
 }
 
-type Page = (Vec<ObjectVersion>, Vec<DeleteMarkerEntry>);
-
 /// What `walkdir` sends for `page` under the `match` / `exclude` expressions.
 async fn walkdir_page(
     storage: &S3Storage,
-    (versions, delete_markers): Page,
+    entries: Vec<ListedEntry>,
     filters: [Option<&FilterExpression>; 2],
 ) -> Result<Vec<Arc<EntryEnum>>, Box<dyn Error>> {
     let (tx, rx) = async_channel::unbounded();
     let scan = VersionedScan {
         tx: &tx,
-        versions,
-        delete_markers,
+        entries,
         include_tags: false,
         match_expressions: filters[0],
         exclude_expressions: filters[1],
@@ -133,7 +141,10 @@ async fn walkdir_lists_a_key_whose_newest_entry_is_a_delete_marker() -> TestResu
 #[tokio::test]
 async fn walkdir_lists_a_key_holding_only_a_marker() -> TestResult {
     let storage = make_test_storage(None);
-    let only = (Vec::new(), vec![marker("ghost", "gm", 5, true)]);
+    let only = vec![ListedEntry {
+        position: Some(0),
+        entry: marker("ghost", "gm", 5, true),
+    }];
     let sent = walkdir_page(&storage, only, [None, None]).await?;
     assert_eq!(rows(&sent, "ghost"), [row("gm", true, true, 1)]);
     Ok(())
@@ -171,13 +182,10 @@ async fn walkdir_2_lists_a_deleted_keys_versions_with_none_latest() -> TestResul
         include_tags: false,
         is_versioned: true,
     };
-    let (versions, markers) = page();
     let mut files = Vec::new();
-    for key in ["gone", "k", "live"] {
-        let mut grouped = oldest_first_by_key(versions.clone(), markers.clone());
-        let entries = grouped.remove(key).ok_or(key)?;
+    for history in oldest_first_by_key(page()) {
         storage
-            .append_object_versions(key, entries, &ctx, &mut files)
+            .append_object_versions(history, &ctx, &mut files)
             .await;
     }
     assert_eq!(

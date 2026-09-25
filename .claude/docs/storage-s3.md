@@ -504,7 +504,10 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
      以前按页分组：跨页的 key 分成两组，先发新的一段，`version_count` 按页算，`walkdir_2` 还有两条 `latest`。
      现在 `src/s3/version_listing.rs` 把一页里最大的 key 留到下一页合并（**不能用 `NextKeyMarker`**：MinIO
      回的是 `p/z[minio_cache:v2,return:]` 这种自己的续页标记，只能原样当下一次的 `key-marker`），每个 key 按
-     `(LastModified, is_latest)` 稳定排序、同一毫秒内按列举顺序反过来。
+     `(LastModified, is_latest)` 稳定排序、同一毫秒内按列举顺序反过来。**Q29 起改为服务端顺序**（见下「版本历史顺序」）：
+     并发写入的同一毫秒条目按时间排不出来；校验不过的 key 仍按时间推断并标 `S3Entry.version_order_inferred = true`
+     （`EntryEnum::get_version_order_inferred()`，`s3_listing` 打印 ` order=inferred`）。`walkdir` 一页内完整的 key 现按 key
+     升序发（以前是 HashMap 序）。
 2. **逐个拷**：`TransferRequest::new(..).with_source_version(SourceVersion::Id(version_id))`，**同一 key 从旧到新、
    一次一个、前一个成功后再下一个**。流式与原生 S3→S3 都钉住版本（C6 / C18）。`transfer_resume` 例子的
    `--source-version` 是手工入口。
@@ -563,21 +566,21 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   `a/..`）是逐子项失败（报在服务器拼写的路径上，列举 `Partial`），不会被并进别的路径 —— 目的端的路径处理会把
   `a/./b` 折成 `a/b`，两个对象写到同一个文件；`List("a/")` / `"a//b"` / `"a/."` 这类路径 `InvalidInput`。不理 delimiter 的存储
   平铺返回的深层 key 在客户端收拢成一级前缀（去重）。`.data-mover-*` 两种模式都隐藏（key 或任意一段前缀）。
-- **Current**：只有当前对象（最新是删除标记的 key 不出现）；身份 `PathScoped(ETag)`（`ListObjectsV2` 不带
-  versionId）；时间 = 列举的 `LastModified`（毫秒精度，HEAD 只有秒），`modified` 过滤器不发 HEAD；目录无时间。
-- **All**：每个版本与删除标记各一条，同一 key 连续、从旧到新、latest 最后（`history.rs`）：版本、标记**各自**按
-  服务器列举顺序反过来（这个顺序是权威的，节点时钟不一致或没有时间都不改它），`LastModified` 只决定两条序列
-  怎么交错（同一毫秒版本在前，同 C20）；latest 不论在哪条序列都排最后。与 C20 不同：C20 按时间排序，时钟偏差时会乱。删除标记是 `File`、`size` 为 `None`：DSL 的 `size`
+- **Current**：只有当前对象（最新是删除标记的 key 不出现）；身份 `PathScoped(路径, ETag)`（`ListObjectsV2` 不带
+  versionId；Q28 之前只有 ETag）；时间 = 列举的 `LastModified`（毫秒精度，HEAD 只有秒），`modified` 过滤器不发 HEAD；目录无时间。
+- **All**：每个版本与删除标记各一条，同一 key 连续、从旧到新、latest 最后（`history.rs`）：按**服务端文档顺序**倒过来
+  （见下「版本历史顺序」，Q29 之前是按 `LastModified` 交错两条序列，并发写入时排错）；校验不过的 key 按时间推断，
+  `EntryVersion::order() == HistoryOrder::Inferred`（例子打印 ` order=inferred`）。删除标记是 `File`、`size` 为 `None`：DSL 的 `size`
   条件对它是 `LazyMatch`（放行），要排除标记按 `version().is_delete_marker()` 在调用方过滤。这是**有意的规则**
   （用户决定 2026-09-25）：`size` 条件不滤删除标记，所以按大小筛的历史迁移仍带上大文件的删除记录 —— 标记不带数据，
   目的端该 key 上没有对象时，重放一个从没拷过的 key 的删除不改任何数据（有对象时重放会把它藏到新标记后面，是否重放
   由调用方判断）；表达式里的其他条件（`name` / `path` …）照常作用于标记。
-  `ObservedEntry::version()` = `EntryVersion { id（"null" → None）, latest, 删除标记 }`；`source_version()`：真版本
+  `ObservedEntry::version()` = `EntryVersion { id（"null" → None）, latest, 删除标记, order }`；`source_version()`：真版本
   `Id(id)`、latest 的 `"null"` → `Current`、非 latest 的 `"null"` → `Id("null")`、删除标记 → `None`（标记无 size，
   也不 HEAD）。身份 `VersionScoped(id)`（与带版本 describe 一致）。可选元数据按该版本取（`observe_copy_bound_version`，
   标签用它的 versionId）；前缀与删除标记不问元数据角色。快照：带版本的条目 v6，其余仍是 v5 原字节。
-- **专家传输（terrasync）**：源端半程用 describe 复核观察；版本化桶上 Current 观察是 `PathScoped(ETag)`、describe 钉住
-  `VersionScoped(id)`，`ReadSource::observation_matches` 在 describe 到的版本 ETag 等于列举的 ETag 时认作同一对象，
+- **专家传输（terrasync）**：源端半程用 describe 复核观察；版本化桶上 Current 观察是 `PathScoped(路径, ETag)`、describe 钉住
+  `VersionScoped(id)`，`ReadSource::observation_matches` 在 describe 到的路径与版本 ETag 拼出的身份等于列举的身份时认作同一对象，
   对象被替换则仍报 "source differs"；offer / evidence 带观察的身份键（目的端半程比对它），读仍钉在 describe 到的版本。
   All 模式里只有 latest 版本能走专家传输：旧版本报 "older version"（用 `with_source_version` 拷），删除标记报
   "delete marker"。
@@ -598,6 +601,53 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 Complete 成功后再 Complete → 404 NoSuchUpload；`If-Match` 对分段 ETag（`…-1`）有效；分段号上限 10000；
 单 PUT 上限 5 GiB；版本控制下最后一个 Complete 成为当前版本，`GET ?versionId=` 读到指定版本；
 `ListMultipartUploads` 列出的 upload id 是签发的 base64url(`<deployment>.<uuid>`) 里的裸 uuid（C15c）。
+
+### 版本历史顺序（P7 评审现存问题 8 / Q29）
+
+`ListObjectVersions` 把每个 key 的版本与删除标记按**一条**序列新→旧列出（`<Version>` 与 `<DeleteMarker>` 交错），
+SDK 却把两种元素解析成两个列表，交错顺序丢了；`LastModified` 只有毫秒，并发写入同一 key 时大量同毫秒，按时间合并
+会排错。现在：
+
+- `src/s3/version_order.rs`：`send_in_document_order(request)` 给这一次请求挂拦截器（`read_after_deserialization`，
+  非流式响应此时体已在内存；只收 2xx，重试时留最后一次），quick-xml 读根元素下 `<Version>` / `<DeleteMarker>` 的
+  序列（实体、字符引用、CDATA 都解），与 SDK 的 `versions()` / `delete_markers()` 逐条对齐 —— 种类、`Key`、`VersionId`
+  全对上才给位置（`DocumentOrder`），否则整页没有位置。其余字段仍取 SDK 的解析。每页多一次响应体拷贝（≤ 1000 条，
+  约几百 KB）。role 协议（`role_protocol/listing.rs`）与 legacy 两处 `ListObjectVersions`（`walkdir` 的
+  `process_versioned_prefix`、`walkdir_2` 的 `read_dir_sorted`）都走它；`role_list_versions`（单 key、只看 `IsLatest`）不用。
+- `S3ListedVersion.position` = 页内文档位置；`listing.rs::list_all` 与 legacy `VersionPages::positioned` 把后页的位置接在
+  前页之后（整个目录列举一条序列）。
+- `backends/s3/history.rs::key_histories`（两条路径共用）逐 key：**全部有位置、在整个列举里连续（跨页也算；legacy 只在每批已完整的 key 内查，被页末扣留的 key 隔开或释放后再出现的 key 查不出）、恰一条
+  `IsLatest` 且排最前** → 按位置倒序（旧→新），`HistoryOrder::Server`，完全不用时间；否则 `HistoryOrder::Inferred`，
+  latest 都排最后、同毫秒可能排错，分两种：该 key 有条目**没有位置**（读不到原始顺序，存储本身可能没错）→ 修复前的
+  合并（版本、标记各自保持列举顺序倒过来，`LastModified` 只决定两条怎么交错，同毫秒版本在前）；有位置但**校验不过**
+  （顺序不对的存储）→ 列举顺序一概不信，按 `LastModified` 稳定排序（各列表列举顺序倒过来只作平手序）。有 key 推断时
+  每次列举打一条 `warn`（`history::warn_inferred`），不会悄悄退化。跨页重复列出的同一条（同 key、versionId、种类）只留
+  第一次。校验只看得到进来的条目：先被滤掉的（artifact、目录自己的标记、收拢进前缀的深层 key）或没有位置的条目夹在某
+  key 中间时发现不了它被拆开 —— 只影响本来就不合规的存储。
+- 标记：role-based `EntryVersion::order()`（快照 v6 flag bit 8 = `Server`；没有这一位的老 v6 快照读成 `Inferred` —— 它们
+  确实是按时间合并的；老版本读到这一位报 `Malformed`），
+  例子 `storage_role_operations` 打印 ` order=inferred`；legacy `S3Entry.version_order_inferred`（serde 默认 false）/
+  `EntryEnum::get_version_order_inferred()`，例子 `s3_listing` 打印 ` order=inferred`。只在推断时打印，服务端顺序时
+  输出与以前逐字节相同（`traversal_versions.sh` 的正则不变）。
+- 测试：回归数据 `tests/data/s3/minio-concurrent-versions.xml`（一页）与 `…-paged.xml`（同一列举 `max-keys=2`，22 页，
+  key 跨每个页边界），MinIO RELEASE.2023-03-20 真机抓取：同一 key 并发 12 PUT + 4 DELETE × 3 轮，44 条（36 版本、
+  8 标记：最新已是标记时 MinIO 再 DELETE 不新建标记），20 条与别的条目同毫秒。`s3::version_order::tests` 用重放
+  连接器（`Replay`，按顺序回放响应体）跑真实 SDK + 拦截器：role 列举、22 页跨页、legacy `walkdir_2`（`read_dir_sorted`）
+  都等于服务端顺序倒序，同一数据按时间合并（去掉位置）≠ 该顺序且标 `Inferred`；503 重试后取成功那次的体；另有实体 /
+  字符引用 / CDATA / 空元素 / 带前缀命名空间 / 不一致 / 截断体。
+  `backends::s3::history::tests`（同毫秒交错、时钟偏差、跨页位置、分裂 / latest 不在最前 / 两个 latest / 没有 latest →
+  按时间、缺位置 → 两列表合并、重复条目）、`s3::version_listing::tests`（legacy 同样规则 + 跨页扣留 + 被滤掉的条目仍占
+  位置）、`namespace_tests::
+  a_non_conforming_store_is_ordered_by_time_and_marked_inferred`（`MemoryS3` 新旋钮 `oldest_first_versions`：每个 key
+  旧→新列出的不合规存储）。变异：永远不用服务端顺序（退回按时间）→ 13 个测试红（含三个真机数据测试）；去掉校验
+  （盲信顺序）→ 4 个红；legacy 位置不跨页累计 → 2 个红。
+- 真机（MinIO VM 102，2026-09-25，临时桶 `data-mover-fix-1790348583`，跑完删光，服务器只剩 `a-bucket` /
+  `data-mover-test`；临时脚本，扩展自 architect 的 `probe_race.sh`，未入库）：`race`（并发 3 轮，44 条 / 8 标记，11 条同毫秒）、`d/race`
+  （前缀下并发 1 轮，15 条 / 3 标记）、`seq`（顺序写 20 次 PUT / DELETE，6 标记）。role `traverse --versions all` 与
+  legacy `walkdir` 三个 key 都**逐条等于服务端原始 XML 倒序**、全部 `Server`；`walkdir_2` 等于其中的版本；`seq` 等于
+  写入时记录的 versionId 顺序。修复前的按时间合并在 `race` 第 5 条、`d/race` 第 4 条起就与服务端顺序不同。并发写入
+  没有客户端可见的“真实顺序”（客户端完成时间受响应延迟影响，21 对相差 ≥ 50 ms 的完成时间与列举相反，但服务端
+  `LastModified` 在这 21 对上都与列举一致），以服务端提交顺序为准。
 
 ### DXN（Ceph RGW Octopus）实测行为（2026-09-25）
 
@@ -639,6 +689,7 @@ SKILL.md）上跑出来的差异，以及各自的处理：
 | URL 中的 `:` 在 secret 里被切错 | secret 必须 percent-encode |
 | 把 MinIO 的 `NextKeyMarker`（`p/z[minio_cache:v2,return:]`）当 key 用 | 续页 token / marker 只原样回传（C20 / C22） |
 | 同一目录里对象 `a` 与前缀 `a/` 同名 | 按路径做键的消费方会撞；`NameBytes` 下对象在前（C22） |
+| 按 `LastModified` 排同一 key 的版本与删除标记 | 毫秒精度，并发写入同毫秒；用服务端文档顺序（`version_order.rs` + `history.rs`，Q29） |
 | `PathScoped` 身份只放内容事实（ETag） | 同内容不同 key 撞身份键；稳定字节必须含路径（Q28） |
 | Region 推断 | endpoint host 推断，必要时显式设 `AWS_REGION` |
 
