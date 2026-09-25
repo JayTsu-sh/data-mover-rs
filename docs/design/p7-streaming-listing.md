@@ -308,6 +308,15 @@ TraversalCompletion { totals }        // 两种模式都有全局总数
 - terrasync 现状（10.131.9.10，`8edd400`，只读查看）：`FullStats` 只在内存、重发即重复计数；临时表是普通 `MergeTree` 不去重；
   ClickHouse 无跨语句事务；批量写库并发、批间无屏障；`TimeRange` 按「现在」分桶，续扫后同一文件会落进不同的桶。
 
+**消费方写入路径（D17，terrasync 的事，只写进设计）**：统计准不准主要取决于 terrasync 往 ClickHouse 的批量写入。ClickHouse
+本身确认过的批次不丢（`async_insert=1` + `wait_for_async_insert=1`），丢在确认之外：全量扫描写失败只重试约 0.7 s 就丢掉整批
+且任务照样报成功；重试可能写出重复行（临时表普通 `MergeTree`）；统计从广播逐条累加、与是否入库无关；增量扫描临时表插入
+无重试；崩溃需整场重扫；示例批大小 100（53M 条约 53 万次写）。建议 terrasync：不再丢批、退避按分钟扛过一次重启、每批带
+`(run_id, epoch, batch_seq)` 读时去重（`LIMIT 1 BY` 或 `ReplacingMergeTree + FINAL`，并固定 ClickHouse 镜像版本）、一批不跨
+检查点、检查点最后写、续扫换新 `run_id` 不做 DELETE（有效行 = 旧 run 刀 k 前 + 新 run 全部）、最终报告以库中已确认数据
+SQL 聚合、提交前核对发出数、批大小 1 万–10 万。data-mover 只负责检查点本身：续扫恰好重发刀后内容、保存刀前遍历计数、
+结束时给出发出条目数与带类型的失败。
+
 ### 待拍板（建议）
 
 | # | 问题 | 建议 |
@@ -319,7 +328,9 @@ TraversalCompletion { totals }        // 两种模式都有全局总数
 | 5 | 采用「下一刀 + 刀后回滚」的精确续扫模型（两种模式都支持，检查点默认关、terrasync 扫描时打开） | 同意 |
 | 5a | 分布统计的最终来源：结束时用 SQL 聚合，还是内存累加器随检查点保存、续扫时恢复 | SQL 聚合 |
 | 5b | 分工：遍历看得见的计数由 data-mover 精确维护，分布统计（分桶边界、扩展名大小写等业务口径）留在 terrasync | 同意 |
-| 5c | terrasync 需改三处（临时表加 `epoch` 列并改 `ReplacingMergeTree` 兜底、下刀前等所有写库完成、时间分桶改用扫描开始时间），只写进设计、不动 terrasync 代码 | 是 |
+| 5c | 上述 terrasync 写入路径的改动（含 epoch / run_id、下刀前等写库、时间分桶基准）只写进设计、不改 terrasync 代码 | 是 |
+| 5d | 幂等写：读时去重（`LIMIT 1 BY` / `ReplacingMergeTree + FINAL`）还是写时 `insert_deduplication_token`（与 `async_insert` 的配合需实测）；并固定 ClickHouse 镜像版本 | 读时去重 + 固定版本 |
+| 5e | 全量扫描改为与增量一样先写临时表（或带 `run_id`）、核对通过再生效 | 改 |
 | 6 | Blocks 下钻按原始 UTF-8 字节，不做大小写折叠与 Unicode 规范化 | 是 |
 | 7 | 大小写 / 规范化不敏感的目标：公开名字语义，折叠后相同、字节不同时报冲突不删除 | 是 |
 | 8 | 多版本形状与单 key 上限 | 每版本一项 + 分组适配器，10 万 |
