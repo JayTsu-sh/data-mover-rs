@@ -216,3 +216,65 @@ fn a_listed_version_rides_in_a_v6_snapshot() {
     downgraded[4] = 5;
     assert!(ObservedEntry::decode_snapshot(&downgraded, &backend).is_err());
 }
+
+/// Identity bytes held inline and on the heap are the same identity: the bytes read back, the
+/// key derived from them (the one formula, whatever the storage), equality, and a snapshot's
+/// round trip all agree on either side of the inline limit.
+#[test]
+fn identity_bytes_mean_the_same_whether_held_inline_or_not() {
+    let backend =
+        BackendIdentity::new(BackendKind::Nfs, "cluster").unwrap_or_else(|error| panic!("{error}"));
+    for len in [
+        1,
+        16,
+        32,
+        INLINE_STABLE_BYTES - 1,
+        INLINE_STABLE_BYTES,
+        INLINE_STABLE_BYTES + 1,
+        64,
+        300,
+    ] {
+        let bytes: Vec<u8> = (0..len)
+            .map(|index| u8::try_from(index * 7 % 251).unwrap_or(0))
+            .collect();
+        let source = SourceIdentity::new(
+            backend.clone(),
+            IdentityStrength::StableWithinBackend,
+            &bytes,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            matches!(source.stable_bytes, StableBytes::Inline { .. }),
+            len <= INLINE_STABLE_BYTES,
+            "{len}"
+        );
+        assert_eq!(source.stable_bytes(), Some(bytes.as_slice()), "{len}");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"data-mover/source-identity/v1\0");
+        hasher.update(&[backend_tag(BackendKind::Nfs), 1]);
+        hasher.update(&("cluster".len() as u64).to_le_bytes());
+        hasher.update(b"cluster");
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+        assert_eq!(
+            source.identity_key().as_bytes(),
+            hasher.finalize().as_bytes(),
+            "{len}"
+        );
+        assert_eq!(source.clone(), source, "{len}");
+        let mut other = bytes.clone();
+        other[len - 1] ^= 1;
+        let differs = SourceIdentity::new(
+            backend.clone(),
+            IdentityStrength::StableWithinBackend,
+            &other,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_ne!(differs, source, "{len}");
+        let entry = ObservedEntry::new(StoragePath::root(), EntryKind::File, None, None, source)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let rebuilt = ObservedEntry::decode_snapshot(entry.encode_snapshot().as_bytes(), &backend)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(rebuilt, entry, "{len}");
+    }
+}

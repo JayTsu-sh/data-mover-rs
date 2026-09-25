@@ -11,6 +11,7 @@
 //! reports wall time alone.
 
 use std::collections::HashMap;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use super::super::observe::{Listed, observe_listed};
@@ -219,6 +220,74 @@ fn assembly_cost_per_entry() {
         println!(
             "round {round}: {count} entries assembled in {spent:?} ({} ns/entry)",
             spent.as_nanos() / count as u128
+        );
+    }
+}
+
+/// What a listing and the traversal pay together for one child: describing it the way a
+/// backend's listing does (the storage's identity, the handle bytes, the listed timestamps),
+/// then assembling it. This is where the per-entry copies of the backend identity and of the
+/// identity bytes show up.
+#[test]
+#[ignore = "timing, not correctness; run by hand with --release"]
+fn describe_and_assemble_cost_per_entry() {
+    const ENTRIES: u64 = 200_000;
+    let identity = BackendIdentity::new(Kind::Nfs, "bench.example:/export")
+        .unwrap_or_else(|error| panic!("{error}"));
+    let paths: Vec<String> = (0..ENTRIES)
+        .map(|index| format!("dir-{:05}/file-{index:07}.dat", index / 100))
+        .collect();
+    for round in 0..5 {
+        let started = Instant::now();
+        let mut assembled = Vec::with_capacity(paths.len());
+        for (seed, value) in (0_u64..).zip(&paths) {
+            let descriptor = nfs_like(&identity, value, EntryKind::File, seed);
+            match observe_listed(&FakeMetadata, descriptor, ObservationPlan::default()) {
+                Listed::Observed(Ok(entry)) => assembled.push(entry),
+                _ => panic!("a plain file needs no I/O"),
+            }
+        }
+        let spent = started.elapsed();
+        println!(
+            "round {round}: {ENTRIES} entries described and assembled in {spent:?} ({} ns/entry)",
+            spent.as_nanos() / u128::from(ENTRIES)
+        );
+    }
+}
+
+/// [`describe_and_assemble_cost_per_entry`] on four threads at once, every entry described
+/// against the one storage identity and dropped again, as listing tasks on several workers and a
+/// consumer do. Shows what sharing anything per entry across threads costs.
+#[test]
+#[ignore = "timing, not correctness; run by hand with --release"]
+fn describe_and_assemble_on_four_threads() {
+    const PER_THREAD: u64 = 100_000;
+    let identity = BackendIdentity::new(Kind::Nfs, "bench.example:/export")
+        .unwrap_or_else(|error| panic!("{error}"));
+    for round in 0..5 {
+        let started = Instant::now();
+        thread::scope(|scope| {
+            for thread in 0..4_u64 {
+                let identity = &identity;
+                scope.spawn(move || {
+                    for seed in thread * PER_THREAD..(thread + 1) * PER_THREAD {
+                        let value = format!("dir-{:05}/file-{seed:07}.dat", seed / 100);
+                        let descriptor = nfs_like(identity, &value, EntryKind::File, seed);
+                        let Listed::Observed(Ok(entry)) =
+                            observe_listed(&FakeMetadata, descriptor, ObservationPlan::default())
+                        else {
+                            panic!("a plain file needs no I/O")
+                        };
+                        drop(entry);
+                    }
+                });
+            }
+        });
+        let spent = started.elapsed();
+        println!(
+            "round {round}: {} entries on 4 threads in {spent:?} ({} ns/entry wall)",
+            4 * PER_THREAD,
+            spent.as_nanos() / u128::from(4 * PER_THREAD)
         );
     }
 }

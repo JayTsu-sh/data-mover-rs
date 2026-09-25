@@ -50,12 +50,58 @@ impl IdentityStrength {
     }
 }
 
+/// Longest identity held without an allocation. ONTAP's 32-byte NFS handles, a CIFS file id (16)
+/// and a Local device + inode (16) fit; longer NFS handles (up to 64 bytes on `NFSv3`, 128 on
+/// `NFSv4`) and an S3 path + `ETag` go to the heap. 46 is what fits beside the tag and the
+/// length in the same 48 bytes the heap variant's alignment takes anyway.
+const INLINE_STABLE_BYTES: usize = 46;
+const _: () = assert!(size_of::<StableBytes>() == 48);
+
+/// The bytes of a source identity, inline when small so that describing an entry costs no
+/// allocation for them.
+#[derive(Clone)]
+enum StableBytes {
+    Inline {
+        len: u8,
+        bytes: [u8; INLINE_STABLE_BYTES],
+    },
+    Heap(Box<[u8]>),
+}
+
+impl StableBytes {
+    fn new(value: &[u8]) -> Self {
+        match u8::try_from(value.len()) {
+            Ok(len) if value.len() <= INLINE_STABLE_BYTES => {
+                let mut bytes = [0; INLINE_STABLE_BYTES];
+                bytes[..value.len()].copy_from_slice(value);
+                Self::Inline { len, bytes }
+            }
+            _ => Self::Heap(value.into()),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..usize::from(*len)],
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
+
+impl PartialEq for StableBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for StableBytes {}
+
 /// A small backend-issued identity used only to derive an entry identity key.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SourceIdentity {
     backend: BackendIdentity,
     strength: IdentityStrength,
-    stable_bytes: Vec<u8>,
+    stable_bytes: StableBytes,
 }
 
 impl fmt::Debug for SourceIdentity {
@@ -93,7 +139,7 @@ impl SourceIdentity {
         Ok(Self {
             backend,
             strength,
-            stable_bytes: stable_bytes.to_vec(),
+            stable_bytes: StableBytes::new(stable_bytes),
         })
     }
 
@@ -127,8 +173,9 @@ impl SourceIdentity {
         hasher.update(&[backend_tag(self.backend.kind()), self.strength.tag()]);
         hasher.update(&(self.backend.stable_id().len() as u64).to_le_bytes());
         hasher.update(self.backend.stable_id().as_bytes());
-        hasher.update(&(self.stable_bytes.len() as u64).to_le_bytes());
-        hasher.update(&self.stable_bytes);
+        let stable_bytes = self.stable_bytes.as_slice();
+        hasher.update(&(stable_bytes.len() as u64).to_le_bytes());
+        hasher.update(stable_bytes);
         EntryIdentityKey(*hasher.finalize().as_bytes())
     }
 }

@@ -69,7 +69,7 @@ impl ObservedEntry {
         } else {
             output.extend_from_slice(&endpoint_fingerprint(&self.source_identity.backend));
         }
-        put_bytes(&mut output, &self.source_identity.stable_bytes);
+        put_bytes(&mut output, self.source_identity.stable_bytes.as_slice());
         output.push(2);
         metadata_observation::encode(&self.metadata, &mut output);
         self.backend_fact.encode(&mut output);

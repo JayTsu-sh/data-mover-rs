@@ -70,6 +70,10 @@ filter 决定 (deferred 的除外)，所以已预读、游标还没走到的目�
 游标准入时把子项喂给它，任务内 `FuturesUnordered` 并发，结果逐个回送，总量受准入窗口约束 —— 不再每条目
 一个任务。重排缓冲 (`output.rs`) 对恰好是下一个序号的槽位走就绪队列，乱序到达的才进 `BTreeMap`。
 单条组装与端到端每条目成本见 `storage/tests/bench.rs` (ignored，`--release --ignored --nocapture` 手跑)。
+身份的分配 (P7 C0 第四项)：`SourceIdentity` 的稳定字节 ≤ 46 字节时内联 (`StableBytes`，ONTAP 的 32 字节 NFS 句柄、
+CIFS file id、Local dev+inode 放得下；更长的 NFS 句柄与 S3 路径 + ETag 仍在堆上)，省掉每条目一次分配；`BackendIdentity` 改 `Arc` 共享在本机交替实测里
+反而更慢 (单线程描述 + 组装 380 → 444 ns，四线程 170 → 184 ns，端到端无差别)，没有采用 —— 共享引用计数
+是每条目一次原子读改写，glibc tcache 下复制二十来字节的字符串并不比它贵。
 取消或结束时在途的列举和观察都 detach 而非 abort (CIFS 句柄)；观察任务在块的 feed 被丢弃后跑完手上的
 才退出。
 
