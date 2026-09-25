@@ -203,8 +203,11 @@ async fn produce_positioned(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
-    use crate::model::IdentityStrength;
+    use crate::model::{IdentityStrength, SourceIdentity, SourceVersion};
+    use crate::runtime::inflight::{InflightConfig, InflightRuntime, OrderedChunks};
     use async_trait::async_trait;
 
     struct ReversedSource {
