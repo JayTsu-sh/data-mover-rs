@@ -36,11 +36,11 @@ S3_PREFIX=test                   # bucket 内的子路径
    MinIO 2023 的 `ListMultipartUploads` 只认精确 key，所以脚本都按精确 key 数上传（按前缀列再过滤 Key）。
    基线与解读见 `.claude/docs/storage-s3.md`「目的端写入策略基线」。
 
-5. **容器重启后续传**：`DEST=s3:data-mover-<ts> CUT_MS=12000 bash .claude/skills/_shared/resume_matrix.sh`。
+5. **容器重启后续传**：`DEST=s3:data-mover-<ts> bash .claude/skills/_shared/resume_matrix.sh`。
    ADR-0006 C15c 起 S3 的恢复状态在目的端（最终 key 上的 upload + `.data-mover-<d>.upload` 指针），续传**不需要**
    `DATA_MOVER_RECOVERY_DIR`：期望本地记录 0、切断后 `1 objects + 1 open uploads`、续传 `Resumed{…}`、
-   reused + streamed = SIZE、BLAKE3 相等、之后 0 / 0。S3 的 checkpoint 数的是服务端确认的分段（读端最多领先 4 段），
-   默认 6 s 切断时还不到 64 MiB，续传会是 `Restarted{StageWithoutPointer}`，所以用 12 s。
+   reused + streamed = SIZE、BLAKE3 相等、之后 0 / 0。C16 起 > 64 MiB 的 checkpointed upload 一开始就写指针，默认 6 s
+   切断（早于第一个 64 MiB checkpoint）也会续传：cancel 与 SIGKILL 都 `Resumed{…}`（取消丢不到一段，SIGKILL 丢在途分段）。
 
 ## 成功判据
 
@@ -54,5 +54,6 @@ S3_PREFIX=test                   # bucket 内的子路径
 - multipart 失败留垃圾 → 必须 abort，看 s3.rs multipart upload 路径
 - 续传的 write 报 `NoSuchUpload`（NotFound）→ 自己的 upload 被当成别人的 abort 了：MinIO 列出的 upload id 与签发的
   写法不同，比较必须走 `upload_pointer::same_upload`
-- 续传总是 `Restarted{StageWithoutPointer}` → 切断早于第一个 64 MiB checkpoint（服务端确认的分段），加大 `CUT_MS`
+- 续传是 `Restarted{StageWithoutPointer}` → 开始时没写指针：对象不超过 64 MiB（D3，不续传），或 prepare 不是
+  `ResumeMode::Discover`（看 `pointer_before_checkpoint`）
 - 自签证书拒绝 → 用 s3+https 不是 https；检查 hyper-rustls verifier 配置

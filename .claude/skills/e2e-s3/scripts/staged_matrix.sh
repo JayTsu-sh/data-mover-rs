@@ -74,7 +74,7 @@ direct_verdict() { # destination key, source file
   echo "   direct: equal=$equal key_uploads=$(key_uploads "$1")"
 }
 # What an interrupted checkpointed upload left at the destination: its pointer and the uploads on
-# its key (ADR-0006 C15c: one pointer + one open upload after a cut past the first checkpoint).
+# its key (ADR-0006 C15c/C16: one pointer + one open upload after a cut that was not discarded).
 left_at() { # destination key
   local pointers
   pointers=$(curl -s "${SIG[@]}" "$B?list-type=2&prefix=$PREFIX/" | grep -o '<Key>[^<]*</Key>' | grep -c '\.upload<')
@@ -110,8 +110,8 @@ echo "-- native S3 -> S3"
 done
 
 # The cut lands after the first 64 MiB checkpoint (the parts the service acknowledged, up to four
-# 8 MiB parts behind the reads): 12 s at 20 MiB/s. Earlier, the resume restarts
-# (`StageWithoutPointer`).
+# 8 MiB parts behind the reads): 12 s at 20 MiB/s, so the cancelled stage is recoverable. An earlier
+# SIGKILL resumes too (the pointer is written when the upload begins, ADR-0006 C16).
 echo "-- interrupt (cancel) then resume, checkpointed m200 at 20 MiB/s"
 case_ "cancel after 12 s" resume-cancel --source "$WORK/src" --source-path m200 --destination "s3:$PREFIX" \
   --destination-path resume-cancel --policy checkpointed --identity "r-$RUN-cancel" \

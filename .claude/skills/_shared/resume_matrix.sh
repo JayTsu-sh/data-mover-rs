@@ -9,9 +9,8 @@
 #          prefix required), hdfs://... (LAB_HDFS_* env)
 #   SIZE   bytes of the source file (default 200 MiB); BW source bandwidth in bytes/s while the first
 #          run is cut (default 20 MiB/s); CUT_MS when the cut lands (default 6000, so the first
-#          64 MiB checkpoint is durable at the default BW — except on S3, whose checkpoint counts
-#          only the parts the service acknowledged, up to four 8 MiB parts behind the reads: use
-#          CUT_MS=12000 there, or the resume reports `Restarted { StageWithoutPointer }`)
+#          64 MiB checkpoint is durable at the default BW; on S3 the pointer is written when the
+#          upload begins (ADR-0006 C16), so a SIGKILL resumes even before that checkpoint)
 #   KEEP_STATE=1  keep the local recovery records across the restart (still a fresh process and
 #          HOME). Neither run names the transfer: the resume can only find the record through the
 #          identity data-mover derives (ADR-0006 C5), so "streamed" below SIZE proves it did.
