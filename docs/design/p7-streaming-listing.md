@@ -238,14 +238,19 @@ Namespace::list_stream(&self, ListRequest) -> ListingStream
 | D13 | 页大小：内部常量 1024，还是公开成请求字段 | 内部常量 |
 | D14 | S3 的 500 万上限：流式模式去掉，`NameBytes` 在 P8 前保留为物化上限 | 是 |
 
-## 修订版（不考虑兼容性，2026-09-25，覆盖前文）
+## 修订版（不考虑兼容性，2026-09-25 第二次修订，覆盖前文）
 
 设计改动：
 
 - **Namespace 接口**：列举只剩一个流式入口 `list(ListRequest) -> ListingStream`，其余动词改为各自带类型的方法；
   删除现有请求枚举、`list_versions`、`listings_are_abortable`，16 个测试替身重写。
 - **列举页只带名字**：子项只存名字不存完整路径，P9 去掉重复路径前缀时不必再改 Namespace。
-- **遍历模式只留两种**：`Unordered`（默认，成本接近 legacy，保留逐目录完成事件、穷尽性与计数）和 `NameBytes`（有序）；
+- **遍历模式**：`TraversalOrder = Unordered | Blocks { siblings: Listing | NameBytes }`。今天的 `Admission` 即
+  `Blocks { siblings: Listing }`（保留）；排序只是块序模式的一个选项。列举接口 `Namespace::list(ListRequest) -> ListingStream`
+  不带顺序参数，有序 / 无序全在遍历层处理；Namespace 改为一个操作一个方法（stat / list / read_link / create_directory /
+  delete / rename），删除请求枚举与结果枚举。
+- **目录完成事件**：`DirectoryListed { outcome: Complete | Interrupted | Unreadable, counts, order }`；列举失败写在事件里，
+  不再占一个 `EntryFailure` 项。
   删除 `Admission`。
 - **排序键改为 git tree 序**：目录按「名字 + `/`」比较，即 S3 原生键序，S3 的有序模式可边读边出；任何声称有序的流都逐项
   检查单调性。
@@ -260,9 +265,9 @@ Namespace::list_stream(&self, ListRequest) -> ListingStream
 
 | # | 问题 | 建议 |
 |---|---|---|
-| 1 | 删除 `Admission`，只留 `Unordered`（默认）与 `NameBytes`？是否有使用方依赖「后端原生顺序 + 同目录连续」（如 tar 打包、按目录应用元数据） | 删 |
+| 1 | 「块序」指哪一种：A 一个目录的全部直接子项连续成一块、块与块不交错（即今天的 Admission）；B 只有子目录成块、文件随页无序 | A（两进程按名字比较只有 A 能在块内排序） |
 | 2 | `Unordered` 下父目录的 `DirectoryListed` 不再保证早于子目录的事件，换来发现即下钻、无头阻塞 | 接受 |
-| 3 | 排序键改为 git tree 序，推翻 P4 已推送的定义 | 同意 |
+| 3 | 块序模式的排序键改为 git tree 序（目录按「名字 + /」），推翻 P4 已推送的定义 | 同意 |
 | 4 | terrasync 比较拓扑：两侧各跑整棵树再合并（09-21 所定），还是两进程逐目录列举再合并 | 待定 |
 | 5 | 大小写不敏感 / Unicode 规范化目的端：排序与匹配仍按字节，Namespace 报告名字语义，消费方遇「折叠后相同、字节不同」不删并报冲突；还是遍历里按折叠键排序 | 前者 |
 | 6 | HDFS 原生顺序在真机证实为无符号字节序前一律重排 | 是 |
