@@ -17,7 +17,7 @@
 //! HEAD and a ranged GET pinned to what the HEAD saw, and deleted with `DeleteObject`.
 
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use md5::{Digest as _, Md5};
 
@@ -202,16 +202,34 @@ pub(super) async fn abort_uploads<P: S3Protocol>(
         .await
         .map_err(|error| role_failure(path, Operation::Namespace, error))?;
     for upload in uploads {
-        if keep != Some(upload.as_str()) {
+        if !keep.is_some_and(|kept| same_upload(kept, &upload)) {
             cleanup_result(path, protocol.abort_multipart(path.as_str(), &upload).await)?;
         }
     }
     Ok(())
 }
 
+/// Whether `listed`, an id `ListMultipartUploads` reported, names the upload `issued`, the id
+/// `CreateMultipartUpload` returned. They are equal on most stores; `MinIO` issues
+/// base64url(`<deployment id>.<upload uuid>`) but lists the bare uuid (seen on
+/// RELEASE.2023-03-20), and accepts either afterwards — so a resume that compared the two
+/// spellings byte for byte aborted its own upload.
+pub(super) fn same_upload(issued: &str, listed: &str) -> bool {
+    issued == listed
+        || URL_SAFE_NO_PAD
+            .decode(issued)
+            .ok()
+            .and_then(|decoded| String::from_utf8(decoded).ok())
+            .is_some_and(|decoded| {
+                decoded
+                    .rsplit_once('.')
+                    .is_some_and(|(deployment, uuid)| !deployment.is_empty() && uuid == listed)
+            })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{UploadRecord, accepted};
+    use super::{UploadRecord, accepted, same_upload};
     use crate::storage::pointer::DestinationPointer;
 
     fn record(upload_id: &str) -> UploadRecord {
@@ -290,5 +308,17 @@ mod tests {
         assert!(record.holds(None));
         assert!(record.holds(Some(10_000 * (8 << 20))));
         assert!(!record.holds(Some(10_000 * (8 << 20) + 1)));
+    }
+
+    /// `MinIO` lists the bare uuid of an upload it issued as base64url(`<deployment>.<uuid>`).
+    #[test]
+    fn a_minio_upload_is_the_same_under_either_spelling() {
+        let issued = "MjhhZjQzOGUtYzAxMC00MGUxLWI1MDctNmE2MzE3MWNhMDgzLjg1MDM0NWEzLThmZjAtNDk1OS1hMWQzLTE4MTUxYWQ0ZTY2YQ";
+        let listed = "850345a3-8ff0-4959-a1d3-18151ad4e66a";
+        assert!(same_upload(issued, listed));
+        assert!(same_upload(listed, listed));
+        assert!(!same_upload(issued, "150345a3-8ff0-4959-a1d3-18151ad4e66a"));
+        assert!(!same_upload(listed, issued));
+        assert!(!same_upload("upload-1", "upload-2"));
     }
 }
