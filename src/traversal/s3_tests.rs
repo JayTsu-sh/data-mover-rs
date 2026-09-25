@@ -482,3 +482,65 @@ async fn cancellation_stops_an_s3_listing_between_pages() -> TestResult {
     );
     Ok(())
 }
+
+/// A directory whose listing pages in a loop (a MinIO-style server serving its first page again,
+/// the same continuation marker coming back) fails that directory alone: the traversal lists the
+/// directories beside it and finishes, in both version modes.
+#[tokio::test]
+async fn a_looping_listing_fails_only_its_directory() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
+    for key in ["a/x", "a/y", "b/z", "c"] {
+        put(&protocol, key, b"1").await?;
+    }
+    {
+        let mut knobs = protocol.listing();
+        knobs.page_size = 1;
+        knobs.minio_markers = true;
+        knobs.restart_prefix = Some("a/".to_string());
+    }
+    for versions in [TraversalVersions::Current, TraversalVersions::All] {
+        let traversal = traverse(&protocol, request(versions));
+        let (items, outcome) = tokio::time::timeout(Duration::from_secs(10), traversal).await??;
+        let files = |item: &String| item.starts_with("b/z File") || item.starts_with("c File");
+        let rendered = rendered(&items);
+        assert_eq!(
+            rendered.iter().filter(|item| files(item)).count(),
+            2,
+            "{rendered:?}"
+        );
+        let about_a = ["failure a", "listed a Failed", "subtree a false"];
+        let around_a: Vec<&String> = rendered
+            .iter()
+            .filter(|item| item.starts_with("a/") || about_a.contains(&item.as_str()))
+            .collect();
+        assert_eq!(
+            around_a,
+            ["failure a", "listed a Failed", "subtree a false"],
+            "{versions:?}: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&"listed b Complete".to_string()),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains(&"subtree  false".to_string()),
+            "{rendered:?}"
+        );
+        let failure = items.iter().find_map(|item| match item {
+            TraversalItem::EntryFailure(failure) => Some(failure),
+            _ => None,
+        });
+        assert!(
+            failure
+                .is_some_and(|f| f.class() == FailureClass::Protocol
+                    && f.transience() == Transience::Permanent),
+            "{failure:?}"
+        );
+        assert!(
+            matches!(outcome, TraversalOutcome::Completed(_)),
+            "{versions:?}: {outcome:?}"
+        );
+    }
+    Ok(())
+}

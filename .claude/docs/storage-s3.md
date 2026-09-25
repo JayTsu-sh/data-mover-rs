@@ -530,7 +530,8 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - **一个目录 = 一个前缀**：`List(p)` = `ListObjectsV2(prefix = "p/", delimiter = "/")`；All 模式
   `list_versions(p)` = `ListObjectVersions` 同参数。**一个目录的所有页收齐再建块**（`listing.rs`），所以跨页的
   key 天然是整的，不需要 C20 的“留下一页最大 key”；续页 token / marker **原样回传**，只拿来判“绕回来了”（本目录
-  跟过的所有 token 记在一个集合里，任何一个再出现 → 会话级 `Protocol` 失败，防止 A、B、A… 死循环），从不当 key
+  跟过的所有 token 记在一个集合里，任何一个再出现 → **该目录**的 `Protocol` / Permanent 条目失败、块 `Failed`，遍历继续兄弟，
+  防止 A、B、A… 死循环；之前是会话级失败、一个目录就结束整场遍历，P7 评审现存问题 3 修复），从不当 key
   比较或去前缀。代价：每个目录至少一次请求、整个目录在内存里（P7 流式列举之前各后端一样）。
 - **翻页上限**（`paging.rs`）：一个目录最多 500 万条（对象 + 版本 + 标记 + 前缀）→ 超了该目录 `Capacity` 失败；连续
   16 页空页却还说有下一页 → 该目录 `Protocol` 失败；都是块 `Failed`，不会悄悄截断。`IsTruncated` 缺失但有 token

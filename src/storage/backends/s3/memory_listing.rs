@@ -45,6 +45,9 @@ pub(crate) struct ListingKnobs {
     cycled_pages: usize,
     /// A broken server: every page is empty yet names a new continuation.
     pub(crate) endless_empty: bool,
+    /// A broken server: listing this prefix ignores the continuation and serves the first page
+    /// again, so the first page's continuation comes back on the second.
+    pub(crate) restart_prefix: Option<String>,
     /// Each page answers after this long.
     pub(crate) page_delay: Option<Duration>,
     /// Listing this prefix fails with this failure.
@@ -112,6 +115,11 @@ impl MemoryS3 {
         }
         knobs.cycled_pages += 1;
         Some(format!("empty:{}", knobs.cycled_pages))
+    }
+
+    /// Whether listing `prefix` ignores its continuation.
+    fn restarts(&self, prefix: &str) -> bool {
+        self.listing().restart_prefix.as_deref() == Some(prefix)
     }
 
     /// The next token of a cycling server, if the fake is one.
@@ -226,6 +234,7 @@ impl MemoryS3 {
             });
         }
         let elements = self.object_elements(prefix).await;
+        let token = token.filter(|_| !self.restarts(prefix));
         let after = token.map(|token| (token.trim_start_matches("token:"), None));
         let (page, more) = Self::page_of(elements, after, size);
         let next = more
@@ -265,6 +274,7 @@ impl MemoryS3 {
         }
         let minio = self.listing().minio_markers;
         let elements = self.version_elements(prefix).await?;
+        let marker = marker.filter(|_| !self.restarts(prefix));
         let after = marker.map(|marker| {
             (
                 marker

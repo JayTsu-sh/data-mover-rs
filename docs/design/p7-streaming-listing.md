@@ -30,7 +30,10 @@
 1. **一次 S3 SlowDown / 503 就可能结束整场遍历**：限流被归为会话失败（`src/s3/role_protocol.rs:518-523`），且没有配置重试策略。
 2. **CIFS、NFS、HDFS 因一个坏子项让整个目录列举失败**：`collect::<Result<Vec<_>>>()?`（`cifs/namespace.rs:92`、
    `nfs/namespace.rs:83-85`，NFS 缺属性时 `nfs.rs:4657-4659`，HDFS 同类），违反「逐子项失败逐子项报」的契约。
+   **已修**（`fix(storage): 列举里一个描述不出的子项只让它自己失败`，commit 待提交）：三者都改为逐子项 `EntryOperationFailure`
+   + `NamespaceResult::Listing`，遍历报 `Partial`。
 3. **S3 翻页出现重复 token 被当成会话失败**（`paging.rs:69-71`），它只是一个目录的问题。
+   **已修**（`fix(s3): 翻页 token 绕圈只让该目录失败`，commit 待提交）：改为该目录的 `Protocol` / Permanent 条目失败，块 `Failed`，遍历继续兄弟。
 4. **legacy 版本列举假设服务端按 key 升序**（`src/s3/version_listing.rs`，C20）：靠扣住每页最大的 key 拼一个 key 的完整历史，
    在无序 S3 上会把一个 key 的历史拆成多组、`version_count` 与 latest 标记出错。
 5. **role-based 遍历在 NFS 上常驻 178 MB，来源未查清**：m1-source 每目录约 35 项，帧里的东西应只有几 MB。待 C0 前用驻留探针

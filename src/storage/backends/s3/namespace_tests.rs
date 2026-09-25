@@ -487,9 +487,10 @@ async fn an_absent_prefix_is_not_found() -> TestResult {
 }
 
 /// A server whose continuation comes back — on the very next page or later — would page forever;
-/// the listing ends with a session failure instead.
+/// that directory's listing fails instead (`Protocol`, `Permanent`, at the directory), and the
+/// session goes on.
 #[tokio::test]
-async fn a_repeating_continuation_ends_the_listing() -> TestResult {
+async fn a_repeating_continuation_fails_the_directory() -> TestResult {
     let protocol = bucket(&[("a", b"1"), ("b", b"1")]).await?;
     let namespace = namespace(&protocol)?;
     for cycle in [1, 2, 3] {
@@ -507,10 +508,55 @@ async fn a_repeating_continuation_ends_the_listing() -> TestResult {
             // Bounded, so a regression fails here instead of paging forever.
             let result = timeout(Duration::from_secs(5), listing).await?;
             assert!(
-                matches!(result, Err(StorageRoleFailure::Session(_))),
+                matches!(
+                    result,
+                    Err(StorageRoleFailure::Entry(ref f))
+                        if f.class() == FailureClass::Protocol
+                            && f.transience() == Transience::Permanent
+                            && f.path() == &StoragePath::root()
+                ),
                 "cycle {cycle}: {result:?}"
             );
         }
+    }
+    Ok(())
+}
+
+/// A server that ignores the continuation of one prefix serves its first page again, naming the
+/// same continuation (for versions, `MinIO`'s `<key>[minio_cache:v2,return:]` marker): that
+/// directory fails, the prefix beside it lists whole.
+#[tokio::test]
+async fn a_restarting_minio_listing_fails_only_that_directory() -> TestResult {
+    let protocol = bucket(&[("a/x", b"1"), ("a/y", b"1"), ("b/z", b"1")]).await?;
+    {
+        let mut knobs = protocol.listing();
+        knobs.page_size = 1;
+        knobs.minio_markers = true;
+        knobs.restart_prefix = Some("a/".to_string());
+    }
+    let namespace = namespace(&protocol)?;
+    for all in [false, true] {
+        let list = |name: &'static str| {
+            let namespace = &namespace;
+            async move {
+                if all {
+                    namespace.list_versions(&path(name)).await
+                } else {
+                    namespace.execute(NamespaceRequest::List(path(name))).await
+                }
+            }
+        };
+        let looping = timeout(Duration::from_secs(5), list("a")).await?;
+        assert!(
+            matches!(
+                looping,
+                Err(StorageRoleFailure::Entry(ref f))
+                    if f.class() == FailureClass::Protocol && f.path() == &path("a")
+            ),
+            "all={all}: {looping:?}"
+        );
+        let sibling = timeout(Duration::from_secs(5), list("b")).await??;
+        assert_eq!(sibling.into_listing().map(|(e, _)| e.len()), Some(1));
     }
     Ok(())
 }

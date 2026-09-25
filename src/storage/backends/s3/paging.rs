@@ -1,13 +1,12 @@
 //! Bounds on paging through one S3 directory (ADR-0006 C22). A listing collects every page of a
 //! directory before its block is built, so a directory is held in memory whole; these bounds keep
 //! a huge directory or a broken server from paging (and growing) without end. Hitting one fails
-//! that directory's listing — the traversal reports it `Failed`, never a silently truncated block.
+//! that directory's listing — the traversal reports it `Failed` and goes on with its siblings,
+//! never a silently truncated block and never the end of the session.
 
 use std::collections::HashSet;
 use std::hash::Hash;
 
-use super::S3ProtocolFailure;
-use super::source::role_failure;
 use crate::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::StorageRoleFailure;
 
@@ -51,9 +50,10 @@ impl<T: Clone + Eq + Hash> Paging<T> {
     /// Records a page of `listed` entries continuing at `next`, and returns where to continue.
     ///
     /// # Errors
-    /// A continuation followed before (on the previous page or any earlier one) ends the session:
-    /// the server would page forever. Too many entries, or too many empty pages in a row, fail
-    /// this directory.
+    /// Each fails this directory only (entry-scoped, `Permanent`), so the traversal goes on with
+    /// its siblings and reports this listing `Failed`: a continuation followed before (on the
+    /// previous page or any earlier one), since the server would page this directory forever
+    /// (`Protocol`); too many entries (`Capacity`); too many empty pages in a row (`Protocol`).
     pub(super) fn advance(
         &mut self,
         directory: &StoragePath,
@@ -80,8 +80,11 @@ impl<T: Clone + Eq + Hash> Paging<T> {
             ));
         }
         if !self.seen.insert(next.clone()) {
-            let stalled = S3ProtocolFailure::protocol("S3 listing continuation did not advance");
-            return Err(role_failure(directory, Operation::Traverse, stalled));
+            return Err(failure(
+                directory,
+                FailureClass::Protocol,
+                "the S3 listing continuation came back: paging would never end",
+            ));
         }
         Ok(Some(next))
     }
@@ -117,12 +120,17 @@ mod tests {
     }
 
     #[test]
-    fn a_continuation_seen_before_ends_the_session() {
+    fn a_continuation_seen_before_fails_the_directory() {
         let mut paging = Paging::new(ListingLimits::PRODUCTION);
         assert_eq!(paging.advance(&directory(), 1, Some(1)), Ok(Some(1)));
         assert_eq!(paging.advance(&directory(), 1, Some(2)), Ok(Some(2)));
         let repeated = paging.advance(&directory(), 1, Some(1));
-        assert_eq!(class(&repeated), Some((true, FailureClass::Protocol)));
+        assert_eq!(class(&repeated), Some((false, FailureClass::Protocol)));
+        let Err(StorageRoleFailure::Entry(failure)) = repeated else {
+            panic!("a looping continuation must fail the directory: {repeated:?}");
+        };
+        assert_eq!(failure.path(), &directory());
+        assert_eq!(failure.transience(), Transience::Permanent);
     }
 
     #[test]

@@ -704,9 +704,11 @@ skipped, while a non-empty one and a key or prefix with an empty, `.` or `..` se
 leading `/`, `./x`, `a/./b` — which a destination would fold into `a/b`) are per-child failures (a
 `Partial` listing), never merged into another path. A non-root prefix under which nothing is stored
 is `NotFound` (a mistyped traversal root fails its listing instead of reading as an empty source);
-every token or marker a directory's listing followed is remembered, and one that comes back ends the
-session instead of paging forever; more than 16 empty pages in a row that still claim more follow,
-or more than 5 million entries in one directory, fail that directory's listing (`Protocol` /
+every token or marker a directory's listing followed is remembered, and one that comes back fails
+that directory's listing (`Protocol`, `Permanent`; the traversal goes on with its siblings) instead
+of paging forever — as first built it ended the session, fixed after the P7 review; more than 16
+empty pages in a row that still claim more follow, or more than 5 million entries in one directory,
+fail that directory's listing (`Protocol` /
 `Capacity`, the block `Failed`, never silently cut short). A token present with `IsTruncated`
 absent is followed; a listed entry without a version id is the `"null"` version; an entry repeated
 across a page boundary is kept once. S3 listings are abortable (`Namespace::listings_are_abortable`:

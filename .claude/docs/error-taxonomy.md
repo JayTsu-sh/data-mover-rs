@@ -94,6 +94,8 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | 按 versionId 的 DeleteObject 回 405（存储不支持按版本删） | 条目 `Unsupported` / Permanent —— **不是**带版本读的「删除标记」`NotFound`（清理会把它当成已删）；删指针时降级为普通删除 + 告警 |
 | describe 之后对象被替换（`read` / native bind / `observe_bound`） | 条目 `Conflict` / Permanent |
 | 请求 `Id(v)` 而 HEAD 回来的不是版本 v（存储忽略 `?versionId=`） | 条目 `Unsupported` / Permanent |
+| 一个目录的列举翻页：续页 token / marker 绕回来过、连续空页超限（`paging.rs`，C22） | **该目录**的条目 `Protocol` / Permanent（报在目录上，块 `Failed`，遍历继续兄弟；不结束会话 —— 之前 token 绕圈是会话失败，P7 评审现存问题 3） |
+| 一个目录的条目超过 500 万（`paging.rs`） | 该目录的条目 `Capacity` / Permanent（同上） |
 
 引擎（ADR-0006 C7）：同一进程里另一个传输正在写同一目的端文件（按（目的端点, 最终路径）的租约）→ Prepare 阶段
 条目 `Conflict` / **Transient**，调用方可稍后重排。
@@ -181,6 +183,21 @@ smb-rs 的 Display 只含 NTSTATUS / 传输原因 / UNC 路径，不含凭据。
 | `NotFound` | `FileNotFound(...)` 或 `DirectoryNotFound(...)` (按上下文) |
 | `PermissionDenied` | `PermissionDenied(...)` |
 | 其他 | `IoError(...)` |
+
+### 列举：整个目录失败 vs 单个子项失败（role-based `Namespace` 的 `List`）
+
+契约：只有**关乎目录本身**的错误让整个列举失败；某个子项描述不出来时报成该子项的条目失败，兄弟照常交付，
+backend 返回 `NamespaceResult::Listing { entries, failures }`，遍历把它报成 `EntryFailure` + 块 `Partial`。
+Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修复。S3 对拼不出的名字（空段、`.` / `..`）
+同样逐项报，但单个对象的 size 缺失 / 为负、key 越出前缀仍是**会话**失败（`src/s3/role_protocol/listing.rs`、
+`src/storage/backends/s3/listing.rs` 的 `place`），属同类问题，待修。
+
+| 情况 | 范围 | FailureClass / Transience |
+|---|---|---|
+| 目录打不开 / 读不了、READDIRPLUS 流出错、HDFS `list_status` 失败、目录不存在 | 整个列举（报在目录上，块 `Failed`；`Connectivity` 照常升会话） | 按上面各 backend 的映射 |
+| NFS READDIRPLUS 某项没带属性（v3 `post_op_attr` 可省；v4 属性解不出也是这样）或没带文件句柄 | 子项（报在子项路径；名字拼不出 `StoragePath` 时报在目录上） | `Protocol` / Unknown |
+| CIFS 子项的身份字节超出模型上限（造不出 `SourceIdentity`） | 子项 | `Protocol` / Permanent |
+| HDFS 子项的 status 转换不了（时间超出 `i64` 纳秒等）、路径拼不出 `StoragePath` | 子项；不是本目录直接子项的（越出根、嵌套）或拼不出的报在目录路径上 | `Protocol` / Permanent |
 
 ## 改 error 时
 
