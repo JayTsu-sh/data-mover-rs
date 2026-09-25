@@ -104,7 +104,7 @@ P1 复现过：`delete_tree` 的根是链接时会删光链接目标里的文件
 
 ### 目的端恢复（ADR-0006 C8，`src/storage/backends/local/staged/at_destination.rs`）
 
-`recovery_at_destination()` 为 true：续传状态全在最终文件旁，运行 data-mover 的机器上什么都不存。
+续传状态全在最终文件旁，运行 data-mover 的机器上什么都不存（C21 起所有后端都如此，本地恢复存储已删除）。
 - 名字只由最终文件名决定：`.data-mover-<d>.stage` / `.pointer`（+ 固定 `.pointer.tmp`）/ `.claim`，
   `<d>` = `artifacts::final_name_digest`。列举会隐藏它们。
 - 指针即检查点：`DMDPTR01{binding, 传输标识, 持久前缀, "DMLSTG03"}`，只在 stage `sync_data` 之后写；
@@ -112,7 +112,7 @@ P1 复现过：`delete_tree` 的根是链接时会删光链接目标里的文件
 - claim：prepare 先取（flock，锁后比 dev/ino），被占 → `Conflict` / 瞬时；stage 活着就一直持有；删除时持锁删名字。
   flock 只在同一内核内有效：NFS / drvfs（`/mnt/c`）上的 Local 路径只靠调用方契约与进程内租约。
 - artifact 名字处只接受普通文件：symlink / 目录 → `Conflict`，目标不动。
-- 真机矩阵：`DEST=<目录> KEEP_STATE=0 bash .claude/skills/_shared/resume_matrix.sh`，应见 `prepare=Resumed`、
+- 真机矩阵：`DEST=<目录> bash .claude/skills/_shared/resume_matrix.sh`，应见 `prepare=Resumed`、
   `reused_bytes > 0`、BLAKE3 相等、成功后无 `.data-mover-*`。
 
 ## 已知陷阱

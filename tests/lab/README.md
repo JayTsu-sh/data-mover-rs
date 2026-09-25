@@ -322,8 +322,9 @@ target StorageGRID version.
 
 `tests/cifs_policy_contract.rs` uses an explicitly configured writable share through
 `CIFS_REAL_SERVER`, `CIFS_REAL_SECOND_SERVER`, `CIFS_REAL_SHARE`, `CIFS_REAL_USER`,
-and `CIFS_REAL_PASS`. Use a separate `DATA_MOVER_RECOVERY_DIR` and run with
-`cargo test --release --test cifs_policy_contract -- --ignored --nocapture`.
+and `CIFS_REAL_PASS`. Run with
+`cargo test --release --test cifs_policy_contract -- --ignored --nocapture`; recovery state lives
+beside the final file on the share, nothing is recorded where the test runs (ADR-0006).
 `CIFS_POLICY_TEST_BYTES` optionally supplies comma-separated file sizes. The test
 uses unique names, exercises both policies with read-back enabled, and cleans up
 its own final/stage/checkpoint files. See the [FAS2750 validation report](../../docs/reports/2026-09-16-cifs-policy-validation.md)

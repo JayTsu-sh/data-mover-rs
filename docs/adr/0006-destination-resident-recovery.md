@@ -2,7 +2,7 @@
 
 Status: accepted 2026-09-24; implementation in progress (commit sequence C1–C22 below).
 Supersedes the recovery-store parts of [ADR-0001](0001-local-transfer-execution-and-recovery.md)
-and of the architecture document's §10 once C21 lands.
+and of the architecture document's §10 (the store was removed in C21).
 
 ## Context
 
@@ -174,7 +174,8 @@ otherwise resume. A stage's length in this table is always the prefix it durably
 length that may be sparse. A clean-up removes the pointer before the stage, so a crash between the two
 leaves a stage without a pointer, which the next prepare cleans. The seam is a transition flag on the
 destination (`recovery_at_destination`, `false` until each backend moves) and a separate
-`DestinationPrepareRequest`, so `PrepareRequest` and its callers are unchanged until C21.
+`DestinationPrepareRequest`, so `PrepareRequest` and its callers are unchanged until C21 (which kept
+`PrepareRequest` as it is: `prepare_direct` takes it and `DestinationPrepareRequest` wraps it).
 
 As built (C7e): the engine asks the destination once per transfer (`recovery_at_destination`); a
 destination that says yes is prepared only through `prepare_at_destination`, and no transfer ever
@@ -577,6 +578,35 @@ and the temp key's delete by version (C17), the temp-key native copy (`S3Protoco
 `with_recovery_at_destination(false)` are no longer reached (removed in C19); S3's `prepare`,
 `recovery_identity` and `recover` answer `Unsupported`. Temp keys left before C15c, and their uploads,
 are not cleaned up automatically (`.claude/docs/storage-s3.md` says how to remove them).
+
+As built (C21, breaking): the local recovery store is gone — `src/transfer/recovery_store.rs`
+(`<binding>.state` records with the `Publishing` state, `<binding>.lock` leases,
+`.lease-namespace.lock`, rooted at `DATA_MOVER_RECOVERY_DIR` → `XDG_STATE_HOME` → `HOME`) and
+everything only it needed: the engine's store branches (`run_with_store`, `discard_prior_recovery`,
+`register_prepared_stage`, the recover / fresh-prepare selection, the store-side native and expert
+prepares, the `mark_publishing` / `complete` calls around publication and discard), the deferred
+checkpoint's registration (`CheckpointRegistration`, `DeferredCheckpoint.registration`,
+`engine/automatic.rs`), the stage's `registration_owned` / `recovery_lease`, and
+`RecoveryRegistrationFailure` / `RecoveryRegistrar` / `RecoveryContext`. The transition flag
+`StagedDestination::recovery_at_destination()` goes with it (every backend answered `true` since
+C15c): the engine always takes the at-destination route, so no path that runs changed. Public API
+removed: `storage::{RecoverRequest, RecoveryIdentity, RecoveryValueError}`; the `StagedDestination`
+methods `prepare`, `prepare_ephemeral`, `recovery_identity`, `handoff_recovery`, `recover` and
+`recovery_at_destination` (`prepare_at_destination` is now required — an implementor outside the
+crate must provide it); `TransferPhase::{RecoveryRegistration, RecoveryCompletion}`. `EffectiveRecovery`
+keeps every variant (all are still reported). `PreparedStage.at_destination` stays: backends use it to
+tell a stage prepared at the destination (or marked by the engine for `Direct`) from one built by
+hand. `.claude/skills/_shared/resume_matrix.sh` now runs the interrupted run too in a fresh process
+with its own empty `HOME` (`env -i`, only `PATH` and the backend credentials) and fails when any run
+leaves anything there — the acceptance criterion "nothing is written where data-mover runs"; its
+`KEEP_STATE` / local-record count and the S3 matrix's `records=` column went with the store. Verified
+(200 MiB, 20 MiB/s, 6 s cut; CIFS 192 MiB), every run's fresh `HOME` empty, BLAKE3 equal, nothing
+left: Local `Resumed { 106745444 }` after a cancellation and `Resumed { 67109120 }` after a SIGKILL;
+MinIO (VM 102) `Resumed { 75497472 }` / `Resumed { 41943040 }`, one version, no marker, 0 objects and 0
+uploads under the run prefix, e2e-s3 passing; FAS2750 CIFS `Resumed { 67528552 }` both, e2e-cifs
+passing; ONTAP NFSv4.1 `Resumed { 67109120 }` both (a first run's resumed cancellation failed once
+with a transient NFS write `Protocol` error while the Local matrix ran on the same host, and passed on
+the rerun). HDFS was checked only by the in-memory tests (the lab runner was not used for this step).
 
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process

@@ -95,10 +95,13 @@ Every family executes the functional fixture set and asserts:
 - independent byte-stream validation stops at the first mismatch/read failure;
 - cancellation and injected source/destination/verification/publication failures leave no
   partial final destination and return truthful staged/recovery disposition;
-- valid streaming checkpoints resume; missing, invalid, or unavailable internal state fails
-  without silently restarting, while explicit discard/reupload starts from zero;
-- recoverable fresh and recovered stages are durably persisted by data-mover before streaming
-  payload; single-source-chunk and all native paths perform no recovery-store interaction;
+- valid streaming checkpoints resume from the pointer beside the final file; a missing stage,
+  corrupt pointer, another transfer's pointer or a changed binding is cleaned up in place and
+  restarts from zero, reporting why (`PrepareFact::Restarted`), and explicit discard/reupload
+  starts from zero;
+- recovery state lives only at the destination (ADR-0006): nothing is written where data-mover
+  runs — `.claude/skills/_shared/resume_matrix.sh` fails when a run leaves anything in its fresh
+  `HOME`; single-source-chunk streaming writes no pointer;
 - entry failures and backend-session failures have different propagation;
 - capability rejection happens before remote mutation;
 - metadata and namespace result equals the cell declaration;

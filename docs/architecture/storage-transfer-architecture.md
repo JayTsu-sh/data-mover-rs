@@ -44,12 +44,12 @@ data-mover-rs ──must not know──> terrasync-rs
   unsupported/uncertified results;
 - storage traversal and immutable observations;
 - source streaming, staged writes, checkpoint validation, verification, and publication;
-- per-transfer recovery state kept **at the destination**, next to the final file (target, ADR-0006;
-  until C21 the engine still uses a local recovery store), plus claims and cleanup;
+- per-transfer recovery state kept **at the destination**, next to the final file (ADR-0006; nothing
+  is kept where data-mover runs), plus claims and cleanup;
 - derived transfer identity and source version selection (`SourceVersion::{Current, Id}`);
 - deterministic metadata conversion and semantic-loss reporting;
 - source-only transfer QoS enforcement and neutral transfer outcomes;
-- versioned opaque observation snapshot and recovery-identity codecs.
+- versioned observation snapshot and destination-pointer codecs.
 
 ### terrasync-rs owns
 
@@ -528,25 +528,23 @@ source-deletion-safety fact for terrasync policy.
 
 ## 10. Recovery contract
 
-**Transition.** [ADR-0006](../adr/0006-destination-resident-recovery.md) replaces the local recovery
-store described below: artifacts are named from the final file name in its parent directory, the
-destination holds a pointer with the full recovery binding, and prepare decides resume or restart from
-what it finds there (resume on an equal binding; otherwise clean up in place and start from zero,
-reporting why). The recovery binding (v3, C5) is `TransferIdentity` (derived from source endpoint,
-source path, version selector, destination endpoint and final path) plus the source path and observed
-identity, size, content version and the destination. The
-local store, its lease, the `Publishing` state and `DATA_MOVER_RECOVERY_DIR` remain in force until
-commit C21 removes them. The seam is in place since C7: a destination whose
-`recovery_at_destination()` is true is prepared through `prepare_at_destination` (the decision table
-in `src/storage/discovery.rs`, the pointer codec in `src/storage/pointer.rs`) under an in-process lease
-per (destination endpoint, final path), and never touches the local store; backends switch one at a
-time from C8.
+**Nothing is kept where data-mover runs** ([ADR-0006](../adr/0006-destination-resident-recovery.md)):
+artifacts are named from the final file name in its parent directory, the destination holds a pointer
+with the full recovery binding, and prepare decides resume or restart from what it finds there (resume
+on an equal binding; otherwise clean up in place and start from zero, reporting why). The recovery
+binding (v3, C5) is `TransferIdentity` (derived from source endpoint, source path, version selector,
+destination endpoint and final path) plus the source path and observed identity, size, content version
+and the destination. Every destination is prepared through `prepare_at_destination` (the decision
+table in `src/storage/discovery.rs`, the pointer codec in `src/storage/pointer.rs`) under an
+in-process lease per (destination endpoint, final path). The local recovery store that preceded it —
+`<binding>.state` records and `.lock` leases under `DATA_MOVER_RECOVERY_DIR` / `XDG_STATE_HOME` /
+`HOME`, its `Publishing` state, the `recover` / `RecoveryIdentity` role surface and the
+`RecoveryRegistration` / `RecoveryCompletion` phases — was removed in C21.
 
 Local namespace durability uses a shared directory-handle helper. On Windows it opens the
 existing directory capability with read/write access and `FILE_FLAG_BACKUP_SEMANTICS` before
 `sync_all()`; read-only directory handles cannot satisfy `FlushFileBuffers`. Publication,
-checkpoints, claim cleanup, new parent directories, and recovery-store registration retain
-real directory synchronization, and synchronization failures remain errors.
+checkpoints, claim cleanup and new parent directories retain real directory synchronization, and synchronization failures remain errors.
 
 `TransferPolicy` offers `Checkpointed` (the default), `AtomicReplace`, and Local/HDFS `Direct`. Local Direct writes the final inode without staging, rename, checkpoints, or final persistence barriers; see [ADR-0003](../adr/0003-transfer-policy-direct.md). HDFS uses ordered append and close-based checkpoint barriers; see [ADR-0004](../adr/0004-hdfs-transfer-policies.md). AtomicReplace restarts from zero without
 creating checkpoints; Local and NFS skip final persistence barriers but retain staging,
@@ -555,20 +553,17 @@ durability. Other protocols may retain their required persistence operations. It
 recovery control accepted from terrasync. Data-mover selects the effective behavior after route and
 source-read planning and reports it as `EffectiveRecovery`.
 
-(Local, NFS, CIFS and HDFS no longer take this path since ADR-0006 C8 / C10 / C11 / C12 — see
-"Local destination-resident recovery", "NFS execution and automatic recovery", "CIFS
-destination-resident recovery" and "HDFS destination-resident recovery" below; this paragraph and
-the next describe the destinations that still use the local recovery store.)
-For eligible multi-source-chunk streaming with `Checkpointed`, data-mover opens its private recovery store,
-exclusively claims the transfer binding, recovers or prepares backend-owned staged state, and
-atomically persists the backend's versioned opaque identity; the remaining store-era destinations
-register before payload (since ADR-0006 C12d no destination registers at a deferred checkpoint —
-the engine's deferred registration goes with the recovery store in C21). Successful publication
-and explicit discard clear that record. Before publication, the record atomically enters a
-`Publishing` state. After a restart, only that state may reconcile a missing stage by clearing the
-ambiguous record and starting fresh; an ordinary missing staged object remains a strict failure.
-Invalid persisted records fail validation; they are never
-silently interpreted by terrasync.
+For eligible multi-source-chunk streaming with `Checkpointed`, the destination looks for what an
+earlier attempt left beside the final file and resumes an equal binding from the durable prefix it
+re-observes, or cleans up and starts from zero; it writes its pointer at the first durable
+checkpoint (at prepare for a `recoverable` stage, and for an S3 upload over the interval). Successful
+publication and explicit discard remove the pointer and the stage — the pointer first, so a clean-up
+that fails halfway never leaves a pointer that would resume. A pointer without its stage (probably
+published before the pointer went) is deleted and the transfer restarts
+(`Restarted { PointerWithoutStage }`); a corrupt pointer is cleaned up the same way. Pointers are
+never interpreted by terrasync. See "Local destination-resident recovery", "NFS execution and
+automatic recovery", "CIFS destination-resident recovery", "HDFS destination-resident recovery" and
+"S3 destination-resident recovery" below.
 
 A streaming transfer that fits within one effective source-read chunk uses an ephemeral stage even
 under `Checkpointed`, because it has no useful intermediate checkpoint. This decision does not use
@@ -579,8 +574,8 @@ from zero.
 
 A checkpoint is valid only when the backend re-observes the staged state, binds it to the
 same transfer/source/destination, independently observes reusable bytes or parts, and meets
-the requested verification guarantee. `RecoveryIdentity` is versioned, integrity-checked,
-opaque, and validated before any destructive action.
+the requested verification guarantee. The destination pointer is versioned, integrity-checked
+(BLAKE3 over its bytes) and validated before any destructive action.
 
 Recovery bindings also include a source content-version observation, separate from object identity.
 Local captures mtime and ctime from the same stat as its descriptor (mtime and creation time on
@@ -589,17 +584,13 @@ in-place edit therefore selects a fresh binding instead of reusing an old durabl
 when read-back verification is disabled.
 
 Local (since ADR-0006 C8) records its checkpoint in the destination pointer beside the final file,
-bound to the recovery binding and transfer identity; there is no Local recovery identity, stage token
-or claim file in the local store. Its pointer records only a contiguous prefix after the
+bound to the recovery binding and transfer identity; nothing is kept where data-mover runs. Its pointer records only a contiguous prefix after the
 staged file has crossed a persistence barrier. Recoverable Local writes pause input after each
 backend-owned 256 MiB interval, drain inflight positional writes, verify the completed range is
 contiguous, synchronize file data and length, and atomically replace the checkpoint record before
 issuing later offsets. Resume rereads the complete source sequentially
-for BLAKE3 but emits writes only after the re-observed durable prefix. A supplied identity has
-strict recovery semantics: a missing, invalid, conflicting, or mismatched backend state fails
-without deleting unknown state or restarting implicitly. Observing a recovery identity is
-non-mutating. Only explicit failure handoff transfers recovery authority out of the current
-process. Local holds its
+for BLAKE3 but emits writes only after the re-observed durable prefix. What prepare finds decides
+resume or restart (the decision table above); a restart reports its reason. Local holds its
 `.data-mover-<digest>.claim` beside the final file under an exclusive OS file lock from prepare until
 publication or discard. NFS (since ADR-0006 C10) has no claim and no recovery identity: it takes a
 stage over by rewriting the pointer with its own nonce, and every later pointer write, the
@@ -698,7 +689,7 @@ identity. A backend performs only safe protocol retries; terrasync owns job retr
 | NDX/pages/tree events | Move to terrasync |
 | `StorageEntryMessage`, `ErrorEvent`, `ChangeKind` | Move to terrasync |
 | `copy_file`, `copy_file_resumable`, three-stage compatibility surface | Replace with `transfer` and expert session |
-| `ResumeContext` | Replace with opaque `RecoveryIdentity` |
+| `ResumeContext` | Replaced by the destination pointer beside the final file (ADR-0006) |
 | `StreamHandle`, `DataChunk`, commit callbacks | Make crate-private runtime details or delete |
 | `storage_resume_compat`, `hdfs_legacy_resume`, `.terrasync-part` | Delete |
 | scattered metadata/copy ACL/xattr helpers | Replace with Metadata role; backend codecs private |
@@ -728,7 +719,7 @@ changes `acceptance-gates.md`. No document duplicates another's authority.
 
 ### Local execution and automatic recovery
 
-The accepted decision is [ADR-0001](../adr/0001-local-transfer-execution-and-recovery.md). Ordinary Local transfers default to automatic recovery: a 64 MiB destination checkpoint interval, with eligibility requiring a file strictly larger than that interval and more than one effective source chunk, selected once before payload I/O. Checkpointed uses this rule; a checkpoint boundary reached at end of file skips the periodic checkpoint and proceeds to final synchronization and publication. Eligible fresh stages write their first destination pointer at their first durable checkpoint (destinations that still use the local recovery store register there instead). Smaller multi-chunk transfers still use inflight reads and writes without checkpoint registration. AtomicReplace skips new checkpoints and Local final durability barriers. See [ADR-0002](../adr/0002-auto-and-quick-policy.md).
+The accepted decision is [ADR-0001](../adr/0001-local-transfer-execution-and-recovery.md). Ordinary Local transfers default to automatic recovery: a 64 MiB destination checkpoint interval, with eligibility requiring a file strictly larger than that interval and more than one effective source chunk, selected once before payload I/O. Checkpointed uses this rule; a checkpoint boundary reached at end of file skips the periodic checkpoint and proceeds to final synchronization and publication. Eligible fresh stages write their first destination pointer at their first durable checkpoint. Smaller multi-chunk transfers still use inflight reads and writes without checkpoints. AtomicReplace skips new checkpoints and Local final durability barriers. See [ADR-0002](../adr/0002-auto-and-quick-policy.md).
 
 Single-source-chunk transfers bypass the producer/channel but preserve source length checks, cancellation and atomic publication; final durability follows Checkpointed or AtomicReplace. Backend write ceilings independently govern splitting and concurrent writes. `Bytes` slices retain their allocations; Local does not concatenate source fragments to fill its maximum write size. Prepared stages reuse directory capabilities within an attempt.
 
@@ -760,8 +751,7 @@ EOF boundaries so pNFS layout synchronization remains protocol-owned.
 `TransferRequest::with_read_back_verification` selects `ReadBackVerification::Enabled` or `Disabled`. Outcomes carry that selection and `blake3: Option<[u8; 32]>`; `None` explicitly means destination read-back was not performed. The expert interface continues to require verified evidence.
 
 
-Local destination-resident recovery (ADR-0006 C8): Local no longer uses the local recovery store or
-`RecoveryIdentity`. Its stage, pointer and claim sit beside the final file under deterministic names
+Local destination-resident recovery (ADR-0006 C8): Local keeps nothing where data-mover runs. Its stage, pointer and claim sit beside the final file under deterministic names
 (`.data-mover-<digest>.{stage,pointer,claim}`); the pointer is the checkpoint record and carries the
 durable prefix; the flock'd claim is held from prepare until publication or discard. NFS moved to
 the same deterministic names in C10 (stage and pointer, no claim), CIFS in C11.
@@ -794,8 +784,8 @@ interval (or of unknown size) is named by the `.data-mover-<digest>.upload` poin
 key (upload id, part size, per-prepare nonce; no durable prefix — `ListParts` is the durable record). Publication completes
 the upload; verification reads the object back after publication, pinned to the version or `ETag` the
 write reported. The earlier temp key under `.data-mover-stage/`, copied to the final key at
-publication and resumed from a local recovery identity, was removed in C19; `prepare`,
-`recovery_identity` and `recover` answer `Unsupported` for S3.
+publication and resumed from a local recovery identity, was removed in C19; the store-era `prepare`,
+`recovery_identity` and `recover` role methods went with the local recovery store in C21.
 
 ### S3 version history migration (ADR-0006 C20)
 

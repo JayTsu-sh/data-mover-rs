@@ -146,7 +146,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   时、联网前报 S3 的 `BackendConnectError`「invalid configuration」；storage 层按架构守卫不能引用
   `crate::error`，所以不是 `StorageError::ConfigError`）。已知大小 ≤ T（含 0 B）的对象：prepare 不开 upload、不建 temp key；stage
   状态（缓冲、待设 tags、写入事实）放在 `PreparedStage::backend_state`（`staged/single.rs`），不进适配器的
-  stage 表 —— 丢弃的 stage 不会滞留缓冲。无续传（`disable_recovery`），引擎因此不登记、并清掉本地恢复记录。
+  stage 表 —— 丢弃的 stage 不会滞留缓冲。无续传（`disable_recovery`），运行处也不记任何东西。
 - publish = 一次带 Content-MD5 的 `PutObject` 到最终 key。`BadDigest` 等明确拒绝 → 最终对象未变；
   回复丢失 → HEAD 对账（大小相同且 `ETag` = 我们的 MD5 算已发布），否则 `final_destination_changed`。
 - 校验在发布**之后**（`verification_point` = `AfterPublish`）：先 HEAD 当前对象（`ETag` / 版本已不是我们的
@@ -184,7 +184,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 ### 最终 key 上的分段上传与 `.upload` 指针（ADR-0006 C15b；C15c 起默认打开）
 
 - 开关 `recovery_at_destination()`（C15b 时真连接恒为 `false`，C15c 起恒为 `true`；C19 删掉字段与测试开关，
-  直接返回 `true`；`connect_at_destination` 只是把自动间隔换小的测试连接）。自动 checkpoint 间隔 64 MiB
+  直接返回 `true`；C21 连同本地恢复存储把这个开关从 trait 删掉；`connect_at_destination` 只是把自动间隔换小的测试连接）。自动 checkpoint 间隔 64 MiB
   （`automatic_checkpoint_interval_bytes`）。
 - `prepare_at_destination`（`staged/at_destination.rs`）：已知大小 ≤ T → C14b single stage，但先只看指针
   （HEAD，有才 GET；有遗留 → 删指针 + abort 该 key 上所有 upload，报 `Restarted{..}`；不列 upload，省请求）。
@@ -389,8 +389,8 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   stage 表、`S3StagedDestination::with_recovery_at_destination` 与字段、`S3Protocol::copy_object` / `native_copy`
   （连同 `S3NativeCopyFailure` / `S3NativeCopyResult` / `S3_NATIVE_COPY_SINGLE_MAX` 与 `role_protocol/native.rs` 的
   旧整段 / 分段拷贝）。single stage 的 token 改用最终 key（不再借 temp key 名）。
-- `StagedDestination::prepare` / `recovery_identity` / `recover` 对 S3 返回 `Unsupported`（`prepare_ephemeral` /
-  `handoff_recovery` 用默认实现，同样 `Unsupported`）；不是在目的端 prepare、也不是 `Direct` 的 stage（例如 store
+- `StagedDestination::prepare` / `recovery_identity` / `recover` 当时对 S3 返回 `Unsupported`（C21 已把它们连同
+  `prepare_ephemeral` / `handoff_recovery` 从 trait 删除）；不是在目的端 prepare、也不是 `Direct` 的 stage（例如 store
   时代的 temp-key stage）`write` / `publish` / `discard` 等一律 `Conflict`（永久），什么都不碰。`verification_point`
   恒为 `AfterPublish`。破坏性：直接调这些角色方法的调用方要改用 `prepare_at_destination`。
 - legacy 列举对 `.data-mover-*` 的过滤（C3）**保留**：它也隐藏 `.upload` 指针与其他后端的 artifact。

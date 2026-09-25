@@ -2,6 +2,8 @@
 
 Policy names and final durability below are superseded by [ADR-0002](0002-auto-and-quick-policy.md): current public policies are Checkpointed (formerly Auto) and AtomicReplace (formerly Quick). The follow-ups below retain their historical rationale.
 
+The recovery-store parts below (engine-owned local records, recovery identities, registration) are superseded by [ADR-0006](0006-destination-resident-recovery.md): recovery state lives beside the final file, and the local recovery store was removed in C21.
+
 Accepted 2026-09-09. Source and destination chunks determine scheduling, not publication guarantees. Local single-source-chunk transfers avoid an inflight producer/channel; multi-source-chunk transfers retain the existing inflight read/write pipeline. Local writes split shared `Bytes` slices at their own 5 MiB ceiling; Local does not require smaller source chunks to be copied or aggregated into a contiguous allocation. A complete source chunk larger than the destination ceiling still uses bounded concurrent positional writes.
 
 Read-back verification is explicitly optional and defaults to enabled. When disabled, skip staged read-back and source content hashing. Successful outcomes expose `read_back` and an optional BLAKE3 digest; absent verification never produces verified-content evidence. Size checks, source identity binding, I/O errors, cancellation, data synchronization and atomic publication remain mandatory.

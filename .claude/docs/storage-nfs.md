@@ -138,7 +138,7 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 
 ## 目的端恢复（ADR-0006 C10，`src/storage/backends/nfs/at_destination.rs`）
 
-`recovery_at_destination()` 为 true：续传状态全在最终文件旁，运行 data-mover 的机器上什么都不存。
+续传状态全在最终文件旁，运行 data-mover 的机器上什么都不存（C21 起所有后端都如此，本地恢复存储已删除）。
 - 名字只由最终文件名决定：`.data-mover-<d>.stage` / `.pointer`（+ 固定 `.pointer.tmp`）。**没有 claim 文件**：
   NFS 没有所有主机都遵守的锁。
 - 指针 = `DMDPTR01{binding, 传输标识, 持久前缀, "DMNSTG01" ‖ 16 字节 nonce}`，只在句柄 `checkpoint()`（COMMIT /
@@ -148,8 +148,8 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   发布 rename 前、清理前都读回指针，nonce 不同（或写过后指针没了）→ `Conflict`（永久），不碰那些名字。围栏是检查
   不是锁；非 recoverable 的 stage 在第一个检查点之前没有指针可比 —— 都靠调用方契约兜底，读回校验抓混写的字节。
 - 旧路径已在 C10d 删除：随机名 stage、`<stage>.checkpoint`（`DMNCKP01`）、`DMNRCV03` 恢复身份与 `.claim-` 改名
-  恢复。`StagedDestination::prepare` / `recovery_identity` / `recover` 对 NFS 返回 `Unsupported`（`prepare_ephemeral`
-  / `handoff_recovery` 用 trait 默认实现，因此同样不可用）；stage 只能经 `prepare_at_destination` 准备，`validate`
+  恢复；store 时代的 `StagedDestination::prepare` / `recovery_identity` / `recover` / `prepare_ephemeral` /
+  `handoff_recovery` 已在 C21 从 trait 删除。stage 只能经 `prepare_at_destination` 准备，`validate`
   只接受 at_destination 的确定名 stage。单测在 `staged_tests.rs` 用 `prepare_stage` / `prepare_ephemeral_stage` /
   `resume_stage` 辅助函数（Restart / 非 recoverable / Discover）。
 - 续传遇 `PermissionDenied`（元数据已施加）→ 经元数据角色设回 0600 再打开。

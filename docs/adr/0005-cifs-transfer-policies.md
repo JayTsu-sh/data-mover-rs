@@ -2,6 +2,10 @@
 
 Status: implemented, 2026-09-16.
 
+Superseded in part by [ADR-0006](0006-destination-resident-recovery.md): since C11 the CIFS stage and
+pointer are deterministic siblings of the final file, the random-name stage, `.checkpoint` file and
+claim rename below were removed in C11d, and the engine recovery store in C21.
+
 CIFS uses the domain facade from JayTsu-sh/smb-rs master, pinned to
 `d8291b3a3157b026074ab6b0f305dfd99af17f1e`. The legacy StorageEnum adapter
 continues to use its separate historical dependency until it is removed.

@@ -110,7 +110,7 @@ legacy `CifsStorage` 的能力在 role-based backend 里的去向 —— 有对�
   `describe` → `CifsSourceFacts`，没有 readonly 字段，`inline_mode` 仍只在 list 路径有。
 - **升级影响 (一次性，必读)**：CIFS 身份的 `identity_key` 变了 (strength tag 与字节都不同)，
   `content_version` 从 `None` 变为 `Some`。
-  (1) 恢复记录按 recovery binding 的哈希做 key (`engine.rs` `recovery_store::open_existing(binding)`)，
+  (1) (历史，本地恢复存储已在 ADR-0006 C21 删除) 恢复记录按 recovery binding 的哈希做 key (当时 `engine.rs` `recovery_store::open_existing(binding)`)，
   而 binding 同时含 `identity_key` 与 `content_version` (`engine.rs:1104-1110`)。CIFS 作源时两者
   都变 → 新 binding **查不到**旧记录 → `recover` 根本不会被调用，直接走全新 `prepare`。真实后果
   不是报错，而是升级前在途的 `Checkpointed` 传输在目标端留下的 stage 文件和 recovery-store 记录
@@ -182,8 +182,8 @@ result
 
 ### Staged destination 与恢复
 
-**目的端恢复（ADR-0006 C11，`src/storage/backends/cifs/at_destination.rs`）**：`recovery_at_destination()`
-为 true，引擎只经 `prepare_at_destination`，运行 data-mover 的机器上什么都不存。与 NFS 同一设计：
+**目的端恢复（ADR-0006 C11，`src/storage/backends/cifs/at_destination.rs`）**：引擎只经
+`prepare_at_destination`，运行 data-mover 的机器上什么都不存（C21 起本地恢复存储已删除）。与 NFS 同一设计：
 - 最终文件旁 `.data-mover-<d>.stage` / `.pointer`（+ 固定 `.pointer.tmp`），**没有 claim 文件**（smb-rs 门面没有
   share mode / lease 控制；用 share mode 做跨主机 claim 是后续，需新 API + D9 升级）。
 - 指针 = `DMDPTR01{binding, 传输标识, 持久前缀, "DMCSTG01" ‖ 16 字节 nonce}`，只在 stage FLUSH 之后写（两个写者在
@@ -196,9 +196,9 @@ result
 - 最终路径含 `\`、`:`、空 / `.` / `..` 段或 artifact 段 → `InvalidInput`（C11a）。
 - 真机：FAS2750 e2e-cifs ×2、resume_matrix 192 MiB cancel / SIGKILL 已验（2026-09-25）。
 - 旧路径已在 C11d 删除：随机名 stage（`.data-mover-<target-hash>-<uuid>.stage`）、`<stage>.checkpoint`
-  （`DMCCKP01`）、`data-mover:cifs-recovery:v1` 恢复身份与 `.claim-` 改名恢复。`StagedDestination::prepare` /
-  `recovery_identity` / `recover` 对 CIFS 返回 `Unsupported`（`prepare_ephemeral` / `handoff_recovery` 用 trait 默认
-  实现，因此同样不可用）；stage 只能经 `prepare_at_destination` 准备，`stage_path` 只接受 at_destination 的确定名
+  （`DMCCKP01`）、`data-mover:cifs-recovery:v1` 恢复身份与 `.claim-` 改名恢复；store 时代的
+  `StagedDestination::prepare` / `recovery_identity` / `recover` / `prepare_ephemeral` / `handoff_recovery` 已在 C21
+  从 trait 删除。stage 只能经 `prepare_at_destination` 准备，`stage_path` 只接受 at_destination 的确定名
   stage。单测在 `staged_tests.rs` 用 `prepare_stage` / `prepare_ephemeral_stage` 辅助函数（Restart，recoverable /
   非 recoverable）；`MemoryProtocol` 的 `flushes` / `closes` / `writes` 只数 stage 与最终文件，指针写入数
   `flushed` 里的 `.pointer.tmp`。
