@@ -68,6 +68,14 @@ S3_PREFIX=test                   # bucket 内的子路径
    同参数再跑一次 `Resumed { … }`（取消时在途的段都拷完，SIGKILL 丢在途的段），`--compare` 相等，之后 0 / 0。
    源先用本地 → `s3:<prefix>` 上传，再 `--source s3:<prefix> --destination s3:<prefix>`（同 endpoint 才走原生）。
 
+8. **role-based 遍历的版本模式**（ADR-0006 C22）：`bash .claude/skills/e2e-s3/scripts/traversal_versions.sh`。新建**一个**
+   临时版本化桶 `data-mover-c22-<run>`，写 `k`（v1、v2、删除、v3）、`gone`（写后删）、两个 artifact、零字节 `d/` 与
+   `d/e`、`sub/deep/f`、`p/a000..a998` 加三次 `p/z`（跨第一页 1000 条），再暂停版本写两次 `n`；用
+   `storage_role_operations --backend s3 traverse --versions all|current`（`S3_LISTING_URL` 只在脚本环境里）列举并断言：
+   All 的 `k` = 2 B、3 B、标记、4 B 只有最后一个 latest，`gone` = 版本 + latest 标记，`p/z` = 1、2、3 B，`n` =
+   `version=null latest=1`；Current 只有 `k`（4 B）没有 `gone`；无 artifact；`--order name-bytes` 并发 1 / 4 / 32 输出
+   相同。退出时按 id 删光版本与标记、删桶，打印 `cleanup: … deleted` 与剩下的桶；只有全部通过且桶已删才退出 0（编译失败、桶不是本次建的也以非 0 退出，trap 保留原退出码）。
+
 ## 成功判据
 
 - s3_walkdir 列 bucket 退出码 = 0
