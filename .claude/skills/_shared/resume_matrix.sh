@@ -9,12 +9,14 @@
 #          prefix required), hdfs://... (LAB_HDFS_* env)
 #   SIZE   bytes of the source file (default 200 MiB); BW source bandwidth in bytes/s while the first
 #          run is cut (default 20 MiB/s); CUT_MS when the cut lands (default 6000, so the first
-#          64 MiB checkpoint is durable at the default BW)
+#          64 MiB checkpoint is durable at the default BW — except on S3, whose checkpoint counts
+#          only the parts the service acknowledged, up to four 8 MiB parts behind the reads: use
+#          CUT_MS=12000 there, or the resume reports `Restarted { StageWithoutPointer }`)
 #   KEEP_STATE=1  keep the local recovery records across the restart (still a fresh process and
 #          HOME). Neither run names the transfer: the resume can only find the record through the
 #          identity data-mover derives (ADR-0006 C5), so "streamed" below SIZE proves it did.
 # Writes only under <DEST>/resume-<run>/ and removes all of it at the end: final files, orphaned
-# stages and checkpoints, and (S3) the multipart uploads the interrupted runs recorded.
+# stages and checkpoints, and (S3) every multipart upload still open on the run's keys.
 #
 # Both runs derive the transfer identity from the endpoints and paths (no --identity); each line
 # reports whether the resumed run derived the interrupted run's identity and endpoint.
@@ -24,7 +26,9 @@
 # non-limiting budget, so the engine counts it): SIZE means nothing was reused. "records" is how
 # many recovery records the interrupted run left locally. For a destination that still uses the
 # local recovery store, 0 means the cut came before the first checkpoint; a destination that keeps
-# its recovery state beside the final file (ADR-0006: Local from C8) always shows 0.
+# its recovery state beside the final file (ADR-0006: Local from C8, NFS C10, CIFS C11, S3 C15c)
+# always shows 0. For S3 "destination artifacts" is the `.data-mover-*` objects (the `.upload`
+# pointer) plus the multipart uploads open on the run's final keys.
 set -u
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$ROOT"
@@ -66,15 +70,32 @@ fresh_env() {
   done
 }
 s3_keys() { curl -s "${SIG[@]}" "$B?list-type=2&prefix=$RUNKEY/" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g'; }
-# `.data-mover-*` names in the run directory. S3 adds the recorded multipart uploads still open: an
-# open upload is not an object, and MinIO lists uploads by exact key only.
+# The multipart uploads open on exactly key $1, one id per line: ListMultipartUploads with the key
+# as prefix, then an exact-key filter (MinIO lists exact keys only, AWS / Ceph / StorageGRID by
+# prefix). A reply that is not a listing prints "?".
+key_uploads() {
+  curl -s "${SIG[@]}" "$B?uploads&prefix=$1" | python3 -c 'import sys, xml.etree.ElementTree as ET
+try: root = ET.fromstring(sys.stdin.read())
+except ET.ParseError: print("?"); sys.exit()
+ns = root.tag[:root.tag.index("}") + 1] if root.tag.startswith("{") else ""
+if root.tag != ns + "ListMultipartUploadsResult": print("?"); sys.exit()
+for upload in root.iter(ns + "Upload"):
+    if upload.findtext(ns + "Key") == sys.argv[1]: print(upload.findtext(ns + "UploadId"))' "$1"
+}
+# The final keys of the run: one per interrupt mode.
+S3_RUN_KEYS=(cancel kill)
+# `.data-mover-*` names in the run directory. S3 adds the multipart uploads open on the run's keys:
+# an open upload is not an object.
 artifacts() {
   if [[ "$DEST" == s3:* ]]; then
-    local objects open=0 key id
+    local objects open=0 key ids
     objects=$(s3_keys | grep -c '\.data-mover-')
-    [ -f "$WORK/s3-uploads" ] && while read -r key id; do
-      [ "$(curl -s -o /dev/null -w '%{http_code}' "${SIG[@]}" "$B/$RUNKEY/$key?uploadId=$id")" = 200 ] && open=$((open + 1))
-    done <"$WORK/s3-uploads"
+    for key in "${S3_RUN_KEYS[@]}"; do
+      ids=$(key_uploads "$RUNKEY/$key")
+      # A failed listing is "?", not an open upload.
+      if grep -qx '?' <<<"$ids"; then open='?'; break; fi
+      open=$((open + $(grep -c . <<<"$ids")))
+    done
     echo "$objects objects + $open open uploads"
   else
     "$BIN" --destination "$DEST" --list-artifacts "$DIR" 2>/dev/null |
@@ -93,20 +114,6 @@ for line in open(sys.argv[1], errors="replace"):
     try: event = json.loads(line)
     except Exception: continue
     if event.get("event") == "start": print(event.get("identity", "")); break' "$1"; }
-# S3 today: the orphaned upload is only findable through the local record.
-remember_s3_upload() {
-  [[ "$DEST" == s3:* ]] || return 0
-  local record; record=$(ls "$1"/*.state 2>/dev/null | head -1)
-  [ -n "$record" ] && python3 - "$record" >>"$WORK/s3-uploads" <<'PY'
-import sys
-data = open(sys.argv[1], 'rb').read()
-start = data.find(b'.data-mover-stage/')
-# The stage token `<key>\0<upload id>` is stored with a 4-byte little-endian length in front.
-token = data[start:start + int.from_bytes(data[start - 4:start], 'little')] if start >= 4 else b''
-key, _, upload = token.partition(b'\0')
-if key and upload: print(key.decode(), upload.decode())
-PY
-}
 
 "$BIN" --source "$WORK/src" --source-path src --seed-bytes "$SIZE" --destination "$WORK/probe" \
   --destination-path src --policy atomic --read-back off >"$WORK/seed.out" 2>&1 ||
@@ -128,7 +135,6 @@ for mode in cancel kill; do
   fi
   first_identity=$(identity_of "$WORK/first.out")
   echo "[$mode] interrupted: $first"
-  remember_s3_upload "$state"
   echo "[$mode]   local records=$(records "$state")  destination artifacts=$(artifacts)"
   # The container restarts: nothing local survives, unless KEEP_STATE=1 keeps the records.
   unset DATA_MOVER_RECOVERY_DIR
@@ -160,17 +166,17 @@ print("[%s]   prepare=%s reused_bytes=%s" % (sys.argv[2], out.get("prepare", "?"
 try: print("yes" if json.load(sys.stdin)["content_equal"] else "NO")
 except Exception: print("? (no comparison)")')
   echo "[$mode]   destination BLAKE3 equals source: $same"
-  # A failed resume may have opened an upload of its own: record it before its state goes.
-  remember_s3_upload "$state"
   rm -rf "$state"
 done
 
 echo "-- cleanup"
 if [[ "$DEST" == s3:* ]]; then
-  [ -f "$WORK/s3-uploads" ] && while read -r key id; do
-    curl -s -o /dev/null "${SIG[@]}" -X DELETE "$B/$RUNKEY/$key?uploadId=$id"; done <"$WORK/s3-uploads"
+  for key in "${S3_RUN_KEYS[@]}"; do
+    key_uploads "$RUNKEY/$key" | grep -v '^?$' | while read -r id; do
+      curl -s -o /dev/null "${SIG[@]}" -X DELETE "$B/$RUNKEY/$key?uploadId=$id"; done
+  done
   s3_keys | while read -r k; do curl -s -o /dev/null "${SIG[@]}" -X DELETE "$B/$k"; done
-  echo "left under $RUNKEY/: $(s3_keys | wc -l) objects, recorded uploads: $(artifacts | sed 's/.*+ //')"
+  echo "left under $RUNKEY/: $(s3_keys | wc -l) objects, open uploads on the run's keys: $(artifacts | sed 's/.*+ //')"
 else
   "$BIN" --destination "$DEST" --remove-run "$DIR" 2>&1 | tail -1
   # Listing the removed run directory must now fail with NotFound.

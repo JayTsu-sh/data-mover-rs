@@ -61,7 +61,8 @@ def main() -> int:
     run("build s3_walkdir", ["cargo", "build", "--example", "s3_walkdir"])
 
     url = s3_url(bucket, host, ak, sk, prefix=prefix, use_https=use_https)
-    run("s3_walkdir bucket list", ["cargo", "run", "--example", "s3_walkdir", "--", url])
+    # Captured so it is redacted: cargo's `Running …` line echoes the URL with its credentials.
+    run("s3_walkdir bucket list", ["cargo", "run", "--example", "s3_walkdir", "--", url], capture=True)
 
     # 不存在 prefix 验证：S3 ListObjectsV2 对不存在的 prefix 返回 200 + 空列表
     # （这是 S3 语义，不是 404）。断言：空结果 + 干净退出 + 无 retry/backoff。
