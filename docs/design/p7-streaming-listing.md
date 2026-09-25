@@ -272,10 +272,15 @@ TraversalCompletion { totals }        // 两种模式都有全局总数
   不参与删除；`scope == Child` 失败的条目本身不参与删除；用了 filter / `max_depth` 时旧代条目按同样条件判定。
 - 计数：`listed = emitted + filtered + failed + vanished`；列举后才消失的条目计入 `vanished`，不发失败项。
 
-**断点续扫（仅 Blocks）**：会话失败（重连与退避都用尽）或取消时返回路径 `P`；下次带 `resume_after: P` 从 `P` 之后续扫
-（取消 = 暂停）。续扫时重列根到 `P` 的每层祖先、只取排在 `P` 之后的子目录；没收到 `DirectoryListed` 的目录一律视为没收到、
-整目录重列；filter / `max_depth` / 根的指纹不符在任何请求前拒绝。用名字路径而非协议位置（cookie / token / 句柄不能跨会话
-重用）；游标由调用方保存。`Unordered` 失败只能重扫。
+**断点续扫（流内检查点，两种模式，D15 更正 D14）**：遍历按间隔（如每 10 万项或 10 秒）在流里插入 `Checkpoint` 项
+（带版本号的不透明字节），约定其之前的所有项已覆盖它记下的进度；调用方把检查点与之前的项在同一事务里提交，续扫时传
+`TraversalRequest.resume_from(checkpoint)`；检查点之后的项会重发一次（调用方按路径 upsert）；取消与会话失败同一套逻辑
+（取消即暂停）。D14「失败时返回游标」有漏洞：通道里已发出但调用方未存下的项会丢失，续扫点必须与调用方已提交的内容对齐。
+- Blocks：检查点记深度优先位置（路径 + 每层下一个要进的子目录名，几百字节）；续扫重列各级父目录但不重发，没列完的目录整个重列。
+- Unordered：检查点记前沿（已发现未列完的目录及其深度 / filter 状态；5337 万条的树约 6400 条路径、约 300 KB）；
+  取检查点时短暂停止启动新列举；正在列的目录整个重列并重发，已扫完的子目录可能再扫一遍；前沿大小与待处理目录数成正比
+  （单目录 1000 万子目录会让前沿变 1000 万条，待 P8 / P9）；删除检测要合并前后两次运行的 Listing 失败，且最后一次以
+  `Completed` 结束。
 
 **错误**：新增 `FailureClass::Throttled`（单个列举累计退避约 2 分钟后报 `scope == Listing`）；CIFS / NFS / HDFS 单个子项失败
 只报该项；列举中被修改的目录可能重复或漏项，写进契约由消费方按（父目录, 名字）去重（S3 在遍历内去重）。
@@ -291,7 +296,7 @@ TraversalCompletion { totals }        // 两种模式都有全局总数
 | 2 | `SubtreeComplete` 两种模式都删 | 删 |
 | 3 | 计数放置：Blocks 的 `DirectoryListed` 带本目录计数，两种模式 `TraversalCompletion` 带全局总数 | 同意 |
 | 4 | data-mover 是否提供逐目录配对辅助（两侧都发 `DirectoryListed` 后才判定一侧缺失） | 提供 |
-| 5 | 断点续扫：现在定 API（`TraversalRequest.resume_after`，取消与会话失败都带回游标），P7 主体完成后实现 | 现在定 API |
+| 5 | 断点续扫：(a) 两种模式都做流内 `Checkpoint` + `resume_from`；(b) 只做 Blocks；(c) 都不做只留 API。Unordered 检查点是否另带「未列完目录里已扫完的子目录」名单以免重扫 | (a)，API 在 P7 定、实现在 P7 主体之后；名单先不带，node1 量过重扫量再定 |
 | 6 | Blocks 下钻按原始 UTF-8 字节，不做大小写折叠与 Unicode 规范化 | 是 |
 | 7 | 大小写 / 规范化不敏感的目标：公开名字语义，折叠后相同、字节不同时报冲突不删除 | 是 |
 | 8 | 多版本形状与单 key 上限 | 每版本一项 + 分组适配器，10 万 |
