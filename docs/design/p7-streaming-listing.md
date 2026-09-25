@@ -1,133 +1,980 @@
-# P7 流式列举：设计评审稿（定型版）
+# 扫描（遍历）P7 设计：流式列举、两种扫描方式、事件、计数、错误与续扫
 
-> 状态：**待拍板**（2026-09-25）。用户与 architect 逐轮迭代（D1–D20）后定型；拍板后写成 ADR-0008 再实现。
-> 完整设计（16 节：现状实测、两种扫描方式、事件模型、Namespace 接口与各后端、调度与内存、计数、错误模型、断点续扫、
-> 多版本、与 terrasync 写库的配合、性能、破坏性变更清单、实施计划 C0–C12、问题清单、否决方案附录）以
-> `root@10.131.9.10:/root/p7-streaming-listing-design.html` 为准；逐轮修订的过程稿在同目录
-> `p7-streaming-listing-design-draft.html`。本文件只收录结论、现存风险与待拍板问题；本文件的逐轮历史见 git log。
+> **状态：定稿**（2026-09-25，用户同意了全部建议，第 15 节的问题已全部转为决定）。实现按第 14 节的计划进行，ADR-0008 在 C12 写。
+>
+> - 本文件**取代**此前的评审稿（Q1–Q30 问题清单、“待拍板”）。评审稿保留在 git 历史里，最后一个评审稿 commit 是 `fef8f2a`。
+> - 权威 HTML 副本在 `root@10.131.9.10:/root/p7-design/p7-streaming-listing-design.html`（本文件据其 sha256 前缀 `4e16e7c4` 的版本转写）；
+>   讨论过程稿在同目录 `p7-streaming-listing-design-draft.html`。两者不一致时以 HTML 为准，并同步本文件。
+> - 原稿元信息：分支 `implement/storage-transfer-architecture` · 基线 `6c6ac22` · terrasync-rs 对照 `8edd400` · 2026-09-25 ·
+>   只有设计，没有实现。本版按讨论中的全部结论重新组织；DXN / StorageGRID 版本顺序实测已完成（10.2.1）；性能目标见 12.6。
+> - 与原稿相比，本文件只多了三处：各处对已修问题的状态标注、文末“设计过程中发现的现存问题”（沿用评审稿编号，更新了状态）、
+>   文末“收尾：清理扫描相关旧代码”。另外 11.3 / 11.4、12.5 / 12.6 按编号排序（原稿里是倒过来的），原稿对用户的称呼“你”改为“用户”。
 
-## 目标
+## 目录
 
-扫描时列举一页一页地流进遍历，不再把整个目录读进内存；提供两种扫描方式，其中无序方式的成本接近 legacy `walkdir`，
-同时保留 legacy 没有的东西：带类型的失败、完整性判定（删除检测的前提）、准确的计数，以及可选的断点续扫。
-原则（用户定）：不考虑兼容性，怎么合理怎么设计，现有结构需要改就改。
+1. 目标与结论摘要
+2. 现状与实测
+3. 两种扫描方式（3.2 扫描入口与参数）
+4. 事件模型（4.1 消费方的删除安全规则）
+5. 流式列举：Namespace 接口与各 backend（5.4 接口逐项说明）
+6. 调度与内存
+7. 计数
+8. 错误模型
+9. 断点续扫（9.1 接口与检查点时机）
+10. 多版本对象：每个 key 一项（10.2 版本顺序实测）
+11. 与 terrasync 写库的配合（ClickHouse）
+12. 性能（12.5 按页并发、12.6 性能目标与 O1–O6）
+13. 破坏性变更清单
+14. 实施计划（PLAN / CHANGE / CREATE / RISK / VERIFY）
+15. 决定记录（全部采纳）
+16. 附录：否决的方案与理由
 
-## 已经定下的
+附：设计过程中发现的现存问题（状态）；收尾：清理扫描相关旧代码
 
-| # | 决定 | 理由 |
+## 1. 目标与结论摘要
+
+**目标**：扫描时列举一页一页地流进遍历，不再把整个目录读进内存；提供两种扫描方式，其中无序方式的成本接近 legacy `walkdir`，同时保留 legacy 没有的东西：typed 失败、完整性判定（删除检测的前提）、准确的计数，以及可选的断点续扫。
+
+**原则**（用户定的）：不考虑兼容性，怎么合理怎么设计，现有结构需要改就改。
+
+### 已经定下的
+
+| # | 决定 | 一句话理由 |
 |---|---|---|
-| 1 | 扫描只有两种方式：`Unordered`（无序 DFS）与 `Blocks`（块序 DFS：一个目录的直接子项连续成块，块内按列举顺序、不排序；块读完后按子目录名字节序深度优先下钻） | 列举场景只有这两种；`Blocks` 的内存和 CPU 与今天的 `Admission` 基本相同，只多一次子目录排序 |
-| 2 | 不做兄弟排序（删除 P4 的 `NameBytes` 兄弟排序与 `ChildOrder`） | 全排要整块物化加 O(N log N)；两进程对比的文件匹配由消费方按名字做 |
-| 3 | `DirectoryListed` 只在 `Blocks` 里发；`Unordered` 不发任何正常路径的目录事件 | 块边界只在 `Blocks` 有用；`Unordered` 省掉计数树和每目录两项 |
-| 4 | `Namespace` 只有一个流式列举入口 `list(ListRequest) -> ListingStream`，逐页返回，页里只带名字 | 两种方式共用；页形状为 P9（路径不重复存前缀）预留 |
+| 1 | 扫描只有两种方式：**Unordered**（无序 DFS）与 **Blocks**（块序 DFS：一个目录的直接子项连续成块，块内按列举顺序、不排序；块读完后按子目录名字节序深度优先下钻） | 列举场景只有这两种；Blocks 的内存和 CPU 与今天的 `Admission` 基本相同，只多一次子目录排序 |
+| 2 | 不做兄弟排序（删除 P4 的 `NameBytes` 兄弟排序与 `ChildOrder`） | 全排要整块物化 + O(N log N)；两进程对比的文件匹配由消费方按名字做 |
+| 3 | `DirectoryListed` 只在 Blocks 里发；Unordered 不发任何正常路径的目录事件 | 块边界只在 Blocks 有用；Unordered 省掉计数树和每目录两项 |
+| 4 | Namespace 只有一个流式列举入口 `list(ListRequest) -> ListingStream`，逐页返回，页里只带名字 | 两种方式共用；页形状为 P9（路径不重复存前缀）预留 |
 | 5 | 断点续扫是扫描入参（`resumable` / `resume_from`），默认关，由上层决定 | data-mover 不决定策略；关闭时零开销 |
-| 6 | 续扫不求精确：从最近一个已落库的检查点重来，重扫部分靠库去重；唯一硬性要求是「进度不领先于已落库的数据」 | 重复扫描代价小；真正的问题是 ClickHouse 批没写下去而进度前进了 |
+| 6 | 续扫**不求精确**：从最近一个已落库的检查点重来，重扫部分靠库去重；唯一硬性要求是“进度不领先于已落库的数据” | 重复扫描代价小；真正的问题是 ClickHouse 批没写下去而进度前进了 |
 | 7 | terrasync 的临时表不用改 | 每批一张新临时表、比较后并入 `ReplacingMergeTree` 的 base，跨批重复天然被吸收 |
-| 8 | S3 列举不假设有序 | 用户遇到过无序的 S3 实现 |
+| 8 | S3 列举**不假设有序** | 用户遇到过无序的 S3 实现 |
+| 10 | 检查点默认间隔 **1 分钟**（Q14） | 用户定的 |
+| 13 | `should_scan` 只放需要额外接口调用的项（`Acl / Xattrs / Tags / SymlinkTarget`），是一个集合、没有档位；列举顺带的信息一律收下（Q31） | 用户定的 |
+| 11 | `rename` 保留在 Namespace（Q23） | 用户定的 |
+| 12 | terrasync 写库的改动在 terrasync 里做，本设计只列要求（Q16） | 用户确认 |
+| 9 | **没有 `versions` 参数**：多版本桶上每个历史版本和删除标记都要列出来；一个对象的全部历史（含删除标记）是**每个 key 一项**，不是每个版本一项 | 用户定的；历史是对象的属性，不是另一种扫描方式 |
 
-## 设计过程中发现的现存问题（今天的代码，与 P7 是否实施无关）
+### 决定记录与仍待处理的事项
 
-1. **一次 S3 SlowDown / 503 就可能结束整场遍历**：限流被归为会话失败（`src/s3/role_protocol.rs:518-523`），且没有配置重试策略。
-2. **CIFS、NFS、HDFS 因一个坏子项让整个目录列举失败**：`collect::<Result<Vec<_>>>()?`（`cifs/namespace.rs:92`、
-   `nfs/namespace.rs:83-85`，NFS 缺属性时 `nfs.rs:4657-4659`，HDFS 同类），违反「逐子项失败逐子项报」的契约。
-   **已修**（`fix(storage): 列举里一个描述不出的子项只让它自己失败`，`b6aff40`）：三者都改为逐子项 `EntryOperationFailure`
-   + `NamespaceResult::Listing`，遍历报 `Partial`。
-3. **S3 翻页出现重复 token 被当成会话失败**（`paging.rs:69-71`），它只是一个目录的问题。
-   **已修**（`fix(s3): 翻页 token 绕圈只让该目录失败`，`1a68f41`）：改为该目录的 `Protocol` / Permanent 条目失败，块 `Failed`，遍历继续兄弟。
-4. **legacy 版本列举假设服务端按 key 升序**（`src/s3/version_listing.rs`，C20）：靠扣住每页最大的 key 拼一个 key 的完整历史，
-   在无序 S3 上会把一个 key 的历史拆成多组、`version_count` 与 latest 标记出错。
-5. **role-based 遍历在 NFS 上常驻 178 MB，来源未查清**：m1-source 每目录约 35 项，帧里的东西应只有几 MB。待 C0 前用驻留探针
-   与 `MALLOC_ARENA_MAX=2` 对照。
-6. **terrasync 写 ClickHouse 的路径在异常时会丢数据**（10.131.9.10，`8edd400`，只读查看）：全量扫描写失败只重试约 0.7 s 就丢掉
-   整批且任务报成功；数据库消费者退出后广播给它的数据被静默丢弃；统计按广播逐条累加、与是否入库无关；全量扫描直接写 base、
-   崩溃即留下半场数据。改法见完整设计第 11 节，按用户指示只写进设计、不改 terrasync 代码。
+全部问题的最终决定见 第 15 节。目前没有待用户决定的问题。
 
-7. **S3 当前对象的 `PathScoped` 身份里没有路径**（`s3/source.rs:75-89`，稳定字节只有 ETag）：内容相同、路径不同的对象共用一个
-   身份键（所有空对象共用 `d41d8cd98f00b204e9800998ecf8427e`）；terrasync 按身份键 `INNER JOIN`（`clickhouse.rs:379-392`）会让 N 个
-   同内容对象交叉配对成 N×N 行、全被当成改名或变更。修法：契约写明「`PathScoped` 的稳定字节必须包含路径」，S3 改为路径 + ETag
-   （与 HDFS / CIFS 一致）；terrasync 只对 `StableWithinBackend` 按身份键关联（只写进设计）。代价：已有扫描里 S3 条目的身份键全变，
-   下一次扫描一次性看成「新增 + 删除」。（Q28）
-   **已修**（`fix(s3)!: PathScoped 身份包含路径`）：`IdentityStrength::PathScoped` 文档写明契约；S3 当前对象、
-   `"null"` 版本（`source.rs` `object_identity` / `path_etag_identity`）与 `"null"` 删除标记（`listing.rs`）的稳定字节改为
-   u32 大端路径长度 + 路径 + ETag（与 CIFS 同一写法）；describe / 列举 / read / native 绑定 / 元数据观察 / 专家
-   `observation_matches` 全走同一构造，`VersionScoped`（真版本号）不变。破坏性：S3 `PathScoped` 条目的身份键（快照、
-   terrasync 世代、恢复绑定）一次性全变。
-8. **版本与删除标记交错时按 LastModified 合并，并发写入时排错**：aws-sdk-s3 把 `<Version>` 与 `<DeleteMarker>` 解析成两个列表，丢了
-   交错顺序（`src/s3/role_protocol/versions.rs:107,123`），`history.rs`（C22）与 legacy `version_listing.rs`（C20）只能按时间合并。MinIO
-   实测（RELEASE.2023-03-20，临时桶已删）：同一 key 并发 12 PUT + 4 DELETE 三轮，44 条记录里 20 条与别的记录毫秒级同时，服务端
-   XML 顺序正确，但合并结果第 4 条起错（`IsLatest` 仍对）。修法：拦截 ListObjectVersions 原始 XML 取位置，按服务端位置倒序组装、
-   完全不用时间；逐项校验（每 key 恰一条 `IsLatest` 且在最前、同 key 连续），不符则退回按时间推断并标 `order: Inferred`；把这次
-   并发响应存成回归数据。MinIO 另一偏差：最新已是删除标记时再 DELETE 不新建标记。（Q29）
-   **已修**（`fix(s3)!: 版本历史按服务端顺序组装`）：`src/s3/version_order.rs` 按请求挂拦截器留下原始响应体，
-   quick-xml 读出 `<Version>` / `<DeleteMarker>` 序列并与 SDK 两个列表逐条对齐（种类、key、versionId 都对上才用）；
-   `history.rs` 的通用核心按位置倒序组装（role-based C22 与 legacy `walkdir` / `walkdir_2` 共用），逐 key 校验（有位置、
-   整个列举里连续 —— legacy 只在每批已完整的 key 内查 ——、恰一条 `IsLatest` 且在最前），不符的 key 按 `LastModified` 推断（latest 最后）并标
-   `HistoryOrder::Inferred`（`EntryVersion::order()`、legacy `S3Entry.version_order_inferred`）。回归数据
-   `tests/data/s3/minio-concurrent-versions{,-paged}.xml`。
+## 2. 现状与实测
 
-## 待拍板（每条附建议）
+### 2.1 今天的遍历怎么工作
 
-**扫描方式与事件**
+- **一种调度**：准入游标（`src/traversal/storage/cursor.rs`），块序 DFS。一个目录的全部直接子项连续输出（`cursor.rs:1-18`）；块完全准入后才下钻（`cursor.rs:297-303`）；
+  下钻顺序 = 子目录在块中出现的顺序（`cursor.rs:483-497, 375-393`）。`Admission` 用列举顺序，`NameBytes` 把块排序（`cursor.rs:507-534`）。
+- **每个目录整块读进内存**：所有 backend 的 `List` 都返回整个目录的 `Vec<SourceDescriptor>`（`src/storage/roles.rs:474-521`）。
+  在飞列举 ≤ P = min(max_inflight, 64)，已到未取 ≤ 2P（`cursor.rs:228-237`），每份都是整个目录，大小没有上限。
+- **每个子项一个任务**：`admit()` 对每个子项 `tasks.spawn`（`src/traversal/storage.rs:422`）。默认观察计划下这个任务不做任何 I/O（`observe.rs:17-28, 95-97`），
+  只是把描述转成 `ObservedEntry`，然后 `join_next` 再唤醒驱动。
+- **事件**：每个被列举目录发 `DirectoryListed` 与 `SubtreeComplete`，在输出侧按序汇总（`output.rs`）。
 
-| # | 问题 | 建议 |
+### 2.2 实测（node1，m1-source NFS，53,368,420 条 / 3,368,421 目录，c=64）
+
+|  | wall | CPU (user+sys) | RSS | futex / 条 |
+|---|---|---|---|---|
+| legacy `walkdir` | 998 s | 240 s | 15 MB | 0.30 |
+| 角色版（`8a1348b` 之前） | 1145 s | 724 s（3.0×） | 178 MB（11.9×） | 1.9 |
+| 角色版（`8a1348b` 之后） | 1053 s | 未重测 | 未重测 | 未重测 |
+
+- 已修：每目录多一次 LOOKUP（`8a1348b`，从 READDIRPLUS 回填目录句柄，`nfs.rs:4661-4669`）；无条件排序（`5e9cc39`）。
+- 未修：每条目一次跨线程交接（上面的 spawn），这是 CPU 差距的主因。
+- **178 MB 没解释清楚**：驻留探针在小树上说帧只持有 O(最宽单目录 + 2P)，这棵树每目录才 35 项。首要怀疑 glibc 多 arena（每条目的任务在 32 个线程间分配 / 释放）。
+
+### 2.3 各 backend 今天的列举
+
+| backend | 今天 | 位置模型（跨页） | 值得注意的问题 |
+|---|---|---|---|
+| Local | `spawn_blocking` 读完整目录（`local/namespace.rs:140-153, 257-297`） | fd，无超时 | 列举级错误与子项错误都记在目录路径上（`:271-275`），分不清 |
+| NFS | 收完整个 `readdirplus` 流；出错整目录从头重试（`nfs.rs:4610-4691`） | cookie + verifier，无状态；但 nfs-rs 0.8.4 不公开页游标（`mount.rs:28` `pub(crate)`） | 一个子项缺属性 → 整目录失败（`nfs.rs:4657-4659`）；一个子项描述失败 → 整目录失败（`backends/nfs/namespace.rs:75-86`） |
+| CIFS | open → `entries("*").try_collect()` → close（`cifs/protocol.rs:230-246`） | **真实目录句柄**（CREATE 出来的） | 一个子项失败 → 整目录失败（`cifs/namespace.rs:92`） |
+| S3 | 收齐所有页再建块，500 万上限（`s3/listing.rs:55-130`，`paging.rs:24-29`） | continuation token，无状态 | 对象去重用 O(N) HashSet（`listing.rs:79-81`）；token 重复 → 会话失败（`paging.rs:83-86`）；429/503/SlowDown → 会话失败（`src/s3/role_protocol.rs:518-523`） |
+| HDFS | `get_metadata` + `list_status` 全量（`src/hdfs/namespace.rs:271-288`） | startAfter，无状态 | 每目录多一次 RPC（`:275`）；一个子项失败 → 整目录失败（`backends/hdfs/namespace.rs:44-52`） |
+
+## 3. 两种扫描方式
+
+```
+enum TraversalOrder {
+    Unordered,   // 无序 DFS
+    Blocks,      // 块序 DFS：块内列举序；块读完后按子目录名字节序深度优先下钻
+}
+```
+
+|  | Unordered | Blocks |
 |---|---|---|
-| Q1 | 默认用哪种扫描方式 | `Unordered` |
-| Q2 | `SubtreeComplete` 两种方式都删（`Blocks` 里可由名字序 DFS + `DirectoryListed` 推出，续扫用检查点） | 删 |
-| Q3 | 计数：两种方式都在 `TraversalCompletion` 给总数；`Blocks` 的 `DirectoryListed` 另带本块计数；`Unordered` 没有每目录计数 | 可以 |
-| Q4 | data-mover 是否提供 `Blocks` 两进程逐目录配对的辅助（封装「两侧都到 `DirectoryListed` 才判定缺失」） | 提供，这条规则写错就是删数据 |
-| Q5 | `Blocks` 的下钻键用子目录名的原始 UTF-8 字节，不做大小写折叠与 Unicode 规范化 | 是 |
-| Q6 | 大小写 / 规范化不敏感的目标：`NamespaceCapabilities` 公开名字语义，消费方遇到「折叠后相等、字节不等」报冲突、不删除 | 是 |
+| 输出 | 页到即发；不同目录的项可以交错 | 一个目录的直接子项连续成块；块内是 backend 列举序 |
+| 下钻 | 子目录一发现就入 worker 栈 | 块读完后，按子目录名的原始 UTF-8 字节排序（O(d log d)，只排子目录），依次深度优先 |
+| 目录事件 | 无 | 每个被列举目录一个 `DirectoryListed`，在块的最后一项之后，**空目录也发** |
+| 确定性 | 无 | 下钻顺序跨 backend 一致；块内顺序取决于 backend |
+| 完整性 | 会话 `Completed` + 失败清单 | 同左，另有每目录 `DirectoryListed.outcome` |
+| 续扫检查点 | 前沿 + 正在列的目录 | 块边界上的 DFS 位置 |
+| 典型用途 | 扫描写库、拷贝 | 需要逐目录边界、两侧按目录同步推进的对比 |
 
-**多版本与 S3**
+### 3.1 为什么 Blocks 下钻排序、块内不排序
 
-| # | 问题 | 建议 |
+块序本来就要在块读完之前记住这个目录的全部子目录（槽位要等块关闭才开始消费）。所以只排下钻顺序几乎不花钱：内存与今天的 `Admission` 相同，多一次 O(d log d)。换来的是“各 backend 访问目录的顺序一致”，
+两侧按目录同步推进时漂移可界。块内全排则要整块物化（1000 万文件约 4.5 GB）并且首项要等整个目录列完。
+
+代价：块内文件无序，两进程逐文件对比时，消费方按名字做哈希匹配（内存 O(单目录)），并且要等两侧都到了该目录的 `DirectoryListed` 才能判定“一侧缺失”。
+
+### 3.2 扫描入口与参数（对照 legacy `walkdir`）
+
+**入口**：`StorageTraversalSource::new(&storage)?.traverse(request) -> TraversalSession`（`src/traversal/storage.rs:56, 114`；
+trait 在 `src/traversal/mod.rs:515`）。会话逐项给出 `TraversalItem`，结束后给出结局（`Completed(TraversalCompletion)` / `Cancelled` / 会话失败）。
+两种扫描方式都是这一个入口。
+
+```
+let request = TraversalRequest::new(root)
+    .order(TraversalOrder::Unordered)                         // 或 Blocks
+    .filter(Arc::new(DslTraversalFilter::parse(match_expr, exclude_expr)?))   // 与 legacy 同一套 DSL
+    .max_depth(NonZeroUsize::new(3))                          // None = 不限
+    .should_scan([Extra::Acl, Extra::Tags])                   // 只放需要额外调用的，见下
+    .max_inflight_operations(64)
+    .max_buffered_items(1024)
+    .resumable(Resumable::Off)
+    .cancel(token);
+let session = StorageTraversalSource::new(&storage)?.traverse(request);
+```
+
+#### legacy `WalkOptions`（`src/storage_options.rs:13-21`）→ 新请求
+
+| legacy | 新 | 说明 |
 |---|---|---|
-| Q7 | 多版本：每版本一项、服务端顺序由旧到新、同 key 连续，另提供分组适配器；不做「每 key 一项、按 LastModified 排序」 | 同意 |
-| Q8 | 单 key 版本上限（超限该 key 报 `Capacity`，其余照常） | 10 万 |
-| Q9 | S3 `All` 按目录物化（不能假设同 key 版本连续），上限 500 万、超限 `Capacity` | 接受 |
+| `depth` | `max_depth` | 根的子项是深度 1；深度为 d 的目录只在 d < max_depth 时被列举 |
+| `match_expressions` / `exclude_expressions` | `filter: Arc<dyn TraversalFilter>` | DSL 适配器 `DslTraversalFilter`（`src/filter_traversal.rs`）包的就是 legacy 的 `should_skip` 三元组，映射为 `TraversalDecision { emit, descend, filter_children }`。DSL 能引用的字段（名字、路径、类型、扩展名、大小、修改时间）都来自列举本身，不需要额外调用（S3 前缀没有修改时间） |
+| `concurrency` | `max_inflight_operations` | 同时进行的观察数；列举预取另有上限 min(它, 64) |
+| `include_tags` | `should_scan(… Extra::Tags …)` | 见下表 |
+| NFS 的 ACL / owner / xattr 充实（legacy `NfsEnrich`，`src/nfs.rs:97-150`） | ACL / xattr → `should_scan`；owner / mode → 列举顺带，无参数 | 见下表 |
+| `packaged` / `package_depth` | 不在扫描里 | tar 打包是消费方的事；打包深度用 `max_depth` 表达 |
 
-**资源与失败策略**
+#### should_scan：只放**需要额外接口调用**才能拿到的东西
 
-| # | 问题 | 建议 |
+> **原则（用户定的）**：列举本身已经返回的信息（大小、类型、时间、uid / gid / mode、身份）**一律收下**，不需要参数，也不会为它多发任何请求；`should_scan` 里只列“每条要额外调用才能拿到的”。
+
+```
+.should_scan([Extra::Acl, Extra::Tags])        // 一个集合，没有档位
+
+enum Extra { Acl, Xattrs, Tags, SymlinkTarget }  // 以后可加：S3 用户元数据、HDFS ACL / xattr
+```
+
+- 取代今天的 `ObservationPlan` 在扫描里的用法：`Omit` = 不在集合里；`InlineOnly` 不再需要（列举有的总会收下）；时间与 ownership **不再是可选族**，
+  在 `ObservedEntry` 里是普通的 `Option` 字段，列举没给就是 `None`。
+- **只有一档（Q31 已定，不要 BestEffort）**：要了就必须拿到。
+  - backend 做不到的项：在任何 I/O 之前拒绝整个扫描（看 `NamespaceCapabilities` / 元数据能力），不会扫到一半才发现。
+  - 对某条目没有意义的项（S3 前缀的 tags、符号链接的 ACL / xattr、目录的符号链接目标）：记为不适用，不算失败。
+  - 单条取失败：先在有界退避内重试瞬时错误；仍失败 → 这一条发 `Failure{scope: Child}`，不发 `Entry`，计入 `failed_children`。按删除安全规则（4.1 第 3 条），这一条不参与删除。
+- 传输侧拷贝元数据时自己的观察（`copied_metadata_observation_plan`）不受影响，那是拷贝前按需取的，不属于扫描。
+
+#### 各 backend：列举顺带收下的（无参数）
+
+|  | Local | NFS | CIFS | S3 | HDFS |
+|---|---|---|---|---|---|
+| 时间 | 有（Unix 列举时逐项 fstatat；Windows 从目录读回的属性） | 有（READDIRPLUS） | 有（QUERY_DIRECTORY） | 对象有 LastModified；前缀没有 | 有 |
+| uid / gid / mode | 有 | 有（READDIRPLUS；**今天没保留，要补**） | 没有（只有从只读属性推出的展示用 mode） | 没有 | mode 有；owner 是名字不是 uid |
+
+#### 各 backend：`should_scan` 里可以要的额外项（每条至少一次往返）
+
+| 额外项 | Local | NFS | CIFS | S3 | HDFS |
+|---|---|---|---|---|---|
+| `Acl` | 开 fd 读 POSIX access / default ACL | GETACL（挂载协商了 ACL 才可用） | CREATE + 查询安全描述符 + CLOSE（最贵） | 不支持 | 今天不支持（有 getAclStatus，可补） |
+| `Xattrs` | listxattr / getxattr | NFSv4.2 xattr（服务端支持才有） | 不支持 | 不支持（`x-amz-meta-*` 是否算作这一项待定） | 今天不支持（有 getXAttrs，可补） |
+| `Tags` | — | — | — | GetObjectTagging，每个对象（多版本时每个版本）一次 | — |
+| `SymlinkTarget` | readlink | READLINK | 不支持 | — | — |
+
+默认是空集合：扫描不做任何额外调用，每条的成本只剩列举本身。
+
+#### 这一原则顺带修掉的两个问题
+
+1. **NFS 的 ownership 被当成额外调用**：今天只要计划里要了任何可选族，遍历就调元数据角色（`observe.rs:17-28`），NFS 的元数据角色先对路径发一次 GETATTR（`nfs/metadata.rs:231-239`），
+   而 READDIRPLUS 早已返回了 uid / gid / mode，只是列举描述里没保留（`nfs/namespace.rs:195-212`）。改为列举直接带上。
+2. **symlink 目标今天是无条件额外读取**：每个链接都 `read_link`（`observe.rs:127-136`），不在任何计划里。改为 `Extra::SymlinkTarget`；没要时链接条目的目标为 `None`（Q33）。
+
+## 4. 事件模型
+
+```
+#[non_exhaustive]
+enum TraversalItem {
+    Entry(Box<ObservedEntry>),
+    Failure(ScanFailure),               // 两种方式都有
+    DirectoryListed(DirectoryListed),   // 只有 Blocks
+    Checkpoint(Checkpoint),             // 只在 resumable = On 时
+}
+
+struct ScanFailure {
+    path: StoragePath,
+    scope: FailureScope,                // Child：这一个子项；Listing：这个目录的列举不完整
+    failure: EntryOperationFailure,     // class / transience / diagnostic
+    delivered: Option<u64>,             // scope == Listing：失败前已发出的子项数（0 = 一页都没读到）
+}
+
+struct DirectoryListed {                // Blocks
+    path: StoragePath,
+    outcome: ListingOutcome,            // Complete | Interrupted | Unreadable
+    counts: BlockCounts,                // 见第 7 节
+}
+
+struct TraversalCompletion { totals: ScanTotals }   // 见第 7 节
+```
+
+- **删除**：`SubtreeComplete`、`SubtreeSummary`、`DirectoryListing`（带优先级的互斥枚举）、`ChildOrder`、
+  `DirectoryListed.child_order / pruned_children / truncated_children`（后两者进 `counts`）。
+  `SubtreeComplete` 在 Blocks 里可以由“名字序 DFS + `DirectoryListed`”推出（Q2）。
+- **`scope` 必须有**：今天列举级失败和“列举里某个子项描述不出来”都是 `EntryFailure`，路径都可能是目录本身，消费方分不清“目录没列完”和“目录里有个坏子项”。
+- 列举级失败不再单独占一个 `EntryFailure` 项；在 Blocks 里它同时体现在 `DirectoryListed.outcome`。
+
+### 4.1 消费方的删除安全规则（写进契约）
+
+1. 只有会话结局是 `Completed` 才能做删除检测。
+2. 任何 `scope == Listing` 的目录，**其整棵旧子树**都不参与删除：列举中断后，下面的子目录可能根本没被看到。
+3. `scope == Child` 的条目本身不参与删除。
+4. 有 filter 或 `max_depth` 时，旧代条目也要用同一个 filter / 深度判定，被排除或截断的不参与删除（这些信息来自请求本身）。
+5. 大小写或 Unicode 规范化不敏感的目标上，“折叠后相等、字节不等”的一对名字报冲突，不删除（Q6）。
+
+## 5. 流式列举：Namespace 接口与各 backend
+
+### 5.1 接口
+
+```
+trait Namespace {                       // 类型化动词，删除 NamespaceRequest / NamespaceResult / execute
+    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure>;
+    fn list(&self, request: ListRequest) -> ListingStream;          // 唯一的列举入口
+    async fn read_link(&self, path: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure>;
+    async fn create_directory(&self, path: &StoragePath) -> Result<(), StorageRoleFailure>;
+    async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure>;
+    async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), StorageRoleFailure>;
+    fn capabilities(&self) -> NamespaceCapabilities;  // histories / mutations / symlinks / 名字语义（大小写、规范化）
+}
+struct ListRequest  { path: StoragePath, cancel: CancellationToken, page_hint: NonZeroUsize }
+struct ListingPage  { children: Vec<ListedChild>,  // 名字 + kind + size + inline 时间/mode + 身份 + backend fact
+                      failures: Vec<ChildFailure>,  // 按名字；拼不出名字时带原始字节
+                      internal_hidden: u32 }        // .data-mover-*，只计数
+type ListingStream = Pin<Box<dyn Stream<Item = Result<ListingPage, StorageRoleFailure>> + Send + 'static>>;
+```
+
+- **契约**：任何时刻 drop 流都不得泄漏服务端资源。
+- **机制**：每个列举一个生产者任务 + 容量 1 的 channel（`ListingStream::from_producer`，新文件 `src/storage/listing.rs`）。channel 满即停止翻页（背压到协议层，预读一页）。
+  接收端消失 → 生产者的 `send` 失败 → 走自己的 `close_resource` 路径退出。CIFS 句柄在结构上不会泄漏，与 P2 “detach 不 abort” 一致。
+  今天的 `listings_are_abortable()`（`roles.rs:552`）因此删除。
+- **页里只带名字**：目录路径只在请求里出现一次，不再给每个子项拼完整路径（同一个父前缀存 N 遍）。`ObservedEntry` 构造时才拼（直到 P9）。
+- 单目录调用方（`delete_tree.rs:263`、`ndx_walk.rs:211`）用 `collect_listing(stream, limits)`。
+
+### 5.2 各 backend
+
+| backend | 流式做法 | 中途出错 |
 |---|---|---|
-| Q10 | CIFS 预取挂起的目录句柄上限 | 8，先在 FAS2750 测 ONTAP 空闲回收 |
-| Q11 | 节流：新增 `FailureClass::Throttled`，单个列举累计退避约 2 分钟后报 `Interrupted` | 是 |
-| Q12 | 列举后消失的条目、父列出后已不存在的子目录：计入 `vanished`，不发失败项、不破坏完整性 | 是 |
-| Q13 | 列举可能重复或遗漏子项（目录正在被修改、S3 跨页重复）：写进契约，由消费方按（父, 名）去重；遍历只对子目录去重 | 是 |
+| Local | 每页一次 `spawn_blocking`，把 `ReadDir` 带进带出；停车时不占 blocking 线程 | readdir 错误基本不是瞬时的 → `Interrupted` |
+| NFS | 生产者任务消费 `readdirplus` 流，按 `page_hint` 攒页 | **首页交出之前**可以整目录从头重试（legacy 就是这条规则，`nfs.rs:3364-3366`）；之后只能从 cookie 续（需要 nfs-rs 公开页接口，Q18），否则 `Interrupted` |
+| CIFS | 生产者任务持有 `Directory`，逐条 `entries` 攒页；所有出口都 close | 句柄失效无法续 → `Interrupted` |
+| S3 | 未开过版本控制的桶：ListObjectsV2，每页转一页；多版本桶：ListObjectVersions，按目录组装每个 key 的历史（见 5.3、第 10 节） | 同一 token 重发（无状态，安全）；节流退避 |
+| HDFS | `list_status_iter`（hdfs-native `client.rs:734`）；去掉列举前的 `get_metadata` | startAfter 续读 |
 
-**续扫与统计**
+### 5.3 S3：不假设有序
 
-| # | 问题 | 建议 |
+| 逻辑 | 做法 | 内存 |
 |---|---|---|
-| Q14 | 检查点默认间隔 | 每 10 万项或 10 秒，先到先发；前沿过大时自适应 |
-| Q15 | 遍历侧计数（listed / filtered / internal / vanished / 列举失败）续扫后是近似的（重扫部分重复计） | 可以；精确的分布统计以库为准 |
-| Q16 | 完整设计第 11.2 节的 terrasync 写库改动在 terrasync 里做，本设计只列要求、不改那边代码 | 是 |
-| Q17 | 全量扫描是否与增量扫描一样加 generation 闸门（写完并校验后再生效） | 要 |
+| 对象跨页重复 | 遍历里不去重，由库去重吸收；`listed` 计数可能含少量重复（写明） | O(页) |
+| 公共前缀跨页重复、不认 delimiter 的 rolled-up 前缀 | 每个列举一个前缀集合，必须去重，否则整棵子树扫两遍 | O(本目录子目录数) |
+| 分页循环检测 | continuation token 集合（今天的 `Paging.seen`，`paging.rs:34`）+ 页数上限；循环 → 该列举 `Interrupted(Protocol)`，不再结束整场 | O(页数) |
+| 多版本桶：把一个 key 的全部历史组装成一项 | 无序存储上一个 key 的版本可能在任意页，**只有列完整个目录才知道某个 key 的历史完整** → 默认按目录物化（今天 `history.rs` 的 `BTreeMap` 分组本来就不依赖顺序），上限 500 万条版本记录，超限 `Capacity`。见第 10 节与 Q9 | O(目录) |
+| “前缀下什么都没有” | 列完仍为空才判定 `NotFound`（今天的 `refuse_absent`） | — |
 
-**依赖、顺序与验收**
+### 5.4 接口逐项说明
 
-| # | 问题 | 建议 |
+下面每个函数都注明**今天对应的是什么**、**谁在调用**、**各 backend 的行为**。所有函数的错误都是 `StorageRoleFailure`：`Entry(EntryOperationFailure)` 只关乎这一个路径，调用方可以继续；
+`Session(BackendSessionFailure)` 表示连接或会话不可用，调用方应当停止。
+
+#### 5.4.1 函数
+
+| 函数 | 做什么 | 今天 / 调用方 | 各 backend |
+|---|---|---|---|
+| `stat(path) -> SourceDescriptor` | 描述**一个**条目本身，不跟随最后一段的符号链接（链接就描述链接）。不存在 → `Entry(NotFound)` | `execute(Stat)`；`create_dir.rs:137`（建目录遇冲突时确认已有的是不是目录） | Local：逐段不跟随 symlink 解析后 `symlink_metadata`；NFS：LOOKUP + GETATTR；CIFS：CREATE + 查询属性 + 关闭；S3：先 HEAD 对象，没有再看前缀下是否有东西（前缀算目录）；HDFS：`get_file_info` |
+| `list(ListRequest) -> ListingStream` | 列一个目录的**直接子项**，一页一页返回（见 5.4.2–5.4.4） | 今天的 `execute(List)` + `list_versions`（后者删除）；遍历（`cursor.rs:576-577`）、`delete_tree.rs:263`、`ndx_walk.rs:211` | 见 5.2 |
+| `read_link(path) -> SymlinkTarget` | 读符号链接**本身存的文本**，不解析、不跟随。`SymlinkTarget` = 编码（`UnixBytes` 或 `WindowsWide`）+ 原始字节，不假设是合法路径 | `execute(ReadLink)`；遍历观察 symlink 子项时调用（`observe.rs:127-136`） | Local、NFS 支持；CIFS（smb-rs 不暴露 reparse point，列举里 reparse point 记为 File）、S3、HDFS → `Unsupported` |
+| `create_directory(path)` | **只建一层**；已存在 → `Entry(Conflict)`，由调用方决定是否当成功 | `execute(CreateDirectory)`；递归建目录 `create_dir.rs:125` 逐层调用 | Local、NFS、CIFS、HDFS 支持；S3 → `Unsupported`（没有目录） |
+| `delete(path)` | 删**一个**文件 / 链接本身 / **空**目录。只剩 `.data-mover-*` 的目录视为空，先清掉 artifact 再删；还有别的东西 → `Conflict`，什么都不删 | `execute(Delete)`；递归删除 `delete_tree.rs:301, 355` | Local、NFS、CIFS、HDFS 支持；S3 → `Unsupported` |
+| `rename(from, to)` | 改名一个文件或目录，目标已存在则覆盖（在协议允许的范围内） | `execute(Rename)`；**生产代码里没有调用方**，只有测试（`tests/cifs_namespace_contract.rs`）。传输发布走 `StagedDestination::publish`，不走这里 | Local、NFS、CIFS、HDFS 支持；S3 → `Unsupported`。**保留（Q23 已定）** |
+| `capabilities() -> NamespaceCapabilities` | 不做 I/O，回答“这个命名空间能做什么、名字怎么比较”，让调用方**在任何 I/O 之前**拒绝做不到的事 | 取代今天的 `supports_versions()`（改为 `histories`）（`storage.rs:90, 115`）、`mutations_unsupported()`（`handle.rs:190`）、`listings_are_abortable()`（删） | 见 5.4.5 |
+
+#### 5.4.2 `ListRequest`
+
+| 字段 | 含义 | 为什么需要 |
 |---|---|---|
-| Q18 | 改 nfs-rs 上游，公开 READDIRPLUS 页接口（cookie + verifier），让 NFS 列举中途出错后从断点续读 | 做，单独的 `chore(deps)` commit |
-| Q19 | 先做 C0（去掉每条目一次的 spawn）并在 node1 补测 `8a1348b` 之后的 CPU / RSS 基线（含 `MALLOC_ARENA_MAX=2` 与驻留探针），再做破坏性重构 | 是 |
-| Q20 | `Unordered` 的验收门槛（node1、5337 万条、c=64、与 legacy 交替四轮） | CPU ≤ 1.3× legacy，RSS ≤ 50 MB，墙钟 ≤ legacy + 5% |
-| Q21 | 两种扫描方式 + 事件模型 + 续扫写一篇 ADR | 写，ADR-0008 |
-| Q22 | 遇到的无序 S3 是哪一家、哪个版本、实验室里能否访问（能则加进 e2e-s3 矩阵；也决定现存问题 4 的修复排期） | 待告知 |
+| `path: StoragePath` | 要列的目录，相对存储根；空路径 = 根 | — |
+| （没有 `versions`） | 已删除。多版本桶上列举**总是**返回每个 key 的完整历史；不保存版本的命名空间没有历史 | 用户定的：历史是对象的属性，不是一种列举模式。今天的 `list_versions`（`roles.rs:534`）与 `TraversalVersions`（`mod.rs:65-86`）一并删除 |
+| `cancel: CancellationToken` | 取消后尽快停止翻页 | 今天 Namespace 请求不带令牌，S3 取消后会在后台继续翻页（C22 的遗留）。drop 流也会停，令牌的额外作用是打断**正在等待的那个请求**：S3 / HDFS 是无状态请求，立即放弃；CIFS 要等当前 QUERY_DIRECTORY 返回再关句柄 |
+| `page_hint: NonZeroUsize` | 每页最多多少个子项（例如 1024）。backend 可以更少（服务端一页更小），**不能更多** | 它决定遍历里每个打开的列举最多占多少内存。原生页大小各不相同：S3 最多 1000 个 key，NFS 一次回复约 32 KB，CIFS 约 64 KB 缓冲，HDFS 默认 1000 |
 
-**后续追加（architect 与用户对话中产生，见 HTML 5.4、5.4.6、5.4.7、10.2、10.3）**
+#### 5.4.3 `ListingStream` 的语义
 
-| # | 问题 | 建议 |
+- 依次产出 `Ok(ListingPage)`；**流正常结束 = 这个目录列完了（读到 EOF）**。这是遍历判定“列举完整”的唯一依据。
+- `Err(Entry(failure))`：这个目录的列举失败，之后流结束。还没出过页 → 遍历记 `Unreadable`；出过页 → `Interrupted { delivered }`。
+- `Err(Session(failure))`：会话不可用，遍历终止。
+- backend 内部的重试（节流退避、S3 同一 token 重发、NFS 首页前从头重来）对调用方不可见；只有放弃时才产出错误。
+- 任何时刻 drop 都不得泄漏服务端资源。
+- 不保证任何顺序；同一子项可能在跨页时重复出现（写进契约，Q13）。
+
+#### 5.4.4 `ListingPage`、`ListedChild`、`ChildFailure`
+
+| 字段 | 含义 | 谁用 / 今天的对应 |
 |---|---|---|
-| Q23 | `rename` 生产代码无调用方（发布走 `StagedDestination::publish`），从 Namespace 删掉 | 删 |
-| Q24 | `rank` 随兄弟排序删掉 | 已解决（随「一个对象一项」删） |
-| Q25 | 名字语义查不到（`Unknown`）时按「不敏感」处理，不据字节差异删除 | 是 |
-| Q26 | 用 `GetBucketVersioning` 判定多版本桶（`Enabled` / `Suspended` 列全部历史，从未开过走 ListObjectsV2），查询被拒时一律列全部历史 | 同意 |
-| Q27 | terrasync 落库时把一个对象的历史展开成每版本一行（沿用 base 表按 `(relative_path, version_id, identity_key)` 的结构） | 每版本一行 |
-| Q28 | 现存问题 7（S3 身份缺路径）独立先修 | 先修 —— 已修（`fix(s3)!: PathScoped 身份包含路径`） |
-| Q29 | 现存问题 8（版本历史并发排错）按原始 XML 顺序独立先修 | 先修 —— 已修（`fix(s3)!: 版本历史按服务端顺序组装`） |
-| Q30 | 在 DXN 与 StorageGRID 上跑同一组版本顺序测试（临时桶，跑完删光） | 待批准（StorageGRID 只批过前缀写入、未批建桶） |
+| **ListingPage** |  |  |
+| `children: Vec<ListedChild>` | 这一页里描述成功的子项 | 今天 `NamespaceResult::Entries / Listing.entries`，但那是整个目录 |
+| `failures: Vec<ChildFailure>` | 列举**返回了**、却描述不出来的子项：名字拼不成路径（空段、`.` / `..`、非 UTF-8）、缺属性、版本 id 非法、S3 键以 `/` 结尾而有内容…… | 遍历把它们发成 `Failure{scope: Child}`，计入 `failed_children`。今天 CIFS / NFS / HDFS 遇到这种子项会让整个目录失败 |
+| `internal_hidden: u32` | 这一页里被隐藏的 `.data-mover-*`（传输过程中的 stage / 指针 artifact）个数 | 它们不是子项，不进 `listed`，单独计入 `internal_hidden`（需求 4）。今天各 backend 直接丢弃、从不计数 |
+| **ListedChild**（今天的 `SourceDescriptor`，`src/storage/descriptor.rs`，把完整路径换成名字） |  |  |
+| `name` | 最后一段名字。完整路径 = 请求的 `path` + `/` + `name`，**由契约规定**。backend 自己的拼法与之不一致时，必须报 `ChildFailure`，不能交一个拼不回去的名字（这正是 `storage/tests/slots.rs` 钉住的护栏：下钻目标必须逐字等于列举给的拼写） | 遍历拼路径、Blocks 下钻排序 |
+| `kind` | `File` / `Directory` / `Symlink` / `Special`。CIFS 的 reparse point 记为 `File`（读不了链接目标） | 决定是否下钻、是否 `read_link` |
+| `size: Option<u64>` | 文件大小；没有意义时为 `None`（S3 前缀、删除标记） | 统计字节、filter `size` 条件 |
+| `source_identity` | 稳定身份 = 哪个后端 + 强度 + 稳定字节。强度：`PathScoped`（只在路径不变时稳定，如 S3 ETag）、`StableWithinBackend`（在这个命名空间里稳定，如 NFS 文件句柄、CIFS file id）、`VersionScoped`（一个不可变版本，如 S3 version id） | 算出 32 字节 `EntryIdentityKey`（blake3）；terrasync 按它关联新旧两代（`OBSERVATION_IDENTITY_JOIN_CLAUSE`），用于识别改名 |
+| `content_version: Option<Bytes>` | 内容变化的标记，与身份分开（S3 记 ETag） | 变更检测；native copy 绑定“拷的正是列出来的那一份” |
+| `inline_timestamps: Option<TimestampMetadata>` | 列举**顺带**返回的时间（accessed / modified / created）；`None` = 列举没给 | 默认观察计划下不用再调元数据角色；有 `modified` 时 filter 可以即时决定（C0b） |
+| `inline_mode: Option<u32>` | 列举顺带能推出的权限位，**仅供展示**（CIFS 由只读属性推出），永远不用于拷贝元数据 | 扫描输出 |
+| `backend_fact: Option<Bytes>` | backend 私有的不透明事实（例如 NFS 文件句柄），外部不可解读 | 编进条目快照；只有同 backend 的 native 规划器会读 |
+| `history: Option<Box<ObjectHistory>>` | 多版本桶上的对象：这个 key 的全部历史，每条 `VersionRecord` 一个版本或一个删除标记，见第 10 节。其他情况为 `None` | 取代今天的 `version` / `listing.version` / `listing.rank`（每版本一个子项的设计） |
+| `listing_only: bool` | 这个子项背后没有东西可以观察（S3 前缀） | 遍历只用列举给的信息，不再问元数据角色 |
+| **ChildFailure** |  |  |
+| `name: Option<String>` / `raw_name: Option<Bytes>` | 能拼出名字就给名字；拼不出（非 UTF-8 等）给原始字节 | 失败项的路径与诊断 |
+| `failure: EntryOperationFailure` | 分类（`FailureClass`）、是否瞬时（`Transience`）、诊断文本 | 发成 `Failure{scope: Child}` |
 
-**多版本形状已改（用户决定，覆盖 Q7–Q9 的旧建议）**：去掉 `versions` 参数；多版本桶上一个对象一项 `ObjectHistory { records,
-complete, order: Server | Inferred }`，记录按服务端顺序最旧在前、最新在最后，含删除标记；`history.current()` 给当前状态；超过单 key
-上限时分段发多项（每段 `complete: false`，最后一段 `true`）；带历史的条目快照用 v7（取代 C22 的 v6）。身份键仍在构造时计算；C0
-加入「身份分配优化」（`BackendIdentity` 改 `Arc` 共享、稳定字节用内联小缓冲）。
+#### 5.4.5 `NamespaceCapabilities`
+
+| 字段 | 含义 | 谁用 | 各 backend |
+|---|---|---|---|
+| `histories: bool` | 这个命名空间的对象是否可能带历史（`ListedChild.history`） | 消费方决定是否准备处理历史 | 多版本 S3 桶 true，其余 false |
+| `mutations: Result<(), &'static str>` | 能否 `create_directory` / `delete`（/ `rename`）；不能时给出原因 | 递归删除、递归建目录在 I/O 前拒绝（今天 `handle.rs:190`） | S3 不能，其余能 |
+| `symlinks: bool` | 能否 `read_link` | 遍历决定 symlink 子项是否需要读目标 | Local、NFS true；其余 false |
+| `names: NameSemantics { case: Sensitive \| Insensitive \| Unknown, normalization: None \| Nfc \| Nfd \| Unknown }` | 这个命名空间怎么判断“两个名字是同一个” | 消费方的删除安全规则（第 4.1 节第 5 条，Q6）：不敏感的目标上，“折叠后相等、字节不等”报冲突、不删除 | CIFS：连接时查询卷属性里的 `FILE_CASE_SENSITIVE_SEARCH`；NFS：v3 `PATHCONF` / v4 `case_insensitive` 属性；Local：按平台（Linux 敏感，Windows / macOS 默认不敏感）；S3、HDFS：敏感。查不到就是 `Unknown`，按不敏感处理（Q25） |
+
+#### 5.4.6 为什么每个 `ObservedEntry` 都带 `SourceIdentity` 和 blake3 身份键
+
+**两者的分工**：`SourceIdentity` = 后端标识（哪个端点）+ 稳定程度 + 稳定字节（NFS 文件句柄、CIFS file id、S3 ETag 或 version id），是原始事实；`EntryIdentityKey` 是对它加域分隔、
+长度前缀后做的 blake3，固定 32 字节（`src/model/observation.rs:111-121`），是它的**可比较、可落库、不泄露内容**的投影。它**不是内容哈希**。
+
+| 用途 | 用的是哪个 | 代码 | 为什么需要 |
+|---|---|---|---|
+| 1. 拷贝前确认“要拷的还是扫描时看到的那个对象” | `SourceIdentity` | `expert_observation.rs:52`（`observation_matches`）；各 backend：`roles.rs:182`、`s3/source.rs:152-162`、`cifs/source.rs:124`、`hdfs/source.rs:100, 128` | 扫描和拷贝之间文件可能被替换（同路径、不同文件）。身份对不上就报 `Conflict`，不拷一个不是扫描结果的东西 |
+| 2. 跨代识别改名 | `SourceIdentity::stable_bytes()`（只在 `StableWithinBackend` 时给）+ 身份键 | terrasync `OBSERVATION_IDENTITY_JOIN_CLAUSE = t.identity_key = b.identity_key`，`identity_key` 列带 bloom filter 索引 | NFS 文件句柄、CIFS file id 改名后不变：新旧两代按它关联，把“删 A + 建 B”识别为“A 改名为 B”，拷贝时不重传数据 |
+| 3. 目的端恢复绑定 | 身份键 | `transfer/engine/plan.rs:112-129`（`recovery_binding_for`） | ADR-0006：续传用的 stage 只能被**同一个**源对象续上。路径相同但文件已被替换时，绑定对不上，不会把两个文件的字节拼在一起 |
+| 4. 远程传输两半之间的核对 | 身份键 | `expert.rs:125`（源端在 offer 里给出），`expert.rs:576`（目的端核对 evidence） | 两个进程（terrasync 经 QUIC）之间只传 32 字节，不把 backend 私有的句柄字节送过网络 |
+| 5. 快照完整性 | 身份键 | `observation_codec.rs:170-182` | 解码时重算并与存的键比较，不一致报 `IdentityMismatch`，发现损坏或拼错端点 |
+
+**为什么要做 blake3，而不直接用原始字节**：
+
+- **定长**：稳定字节长度不一，最长可到 16 MiB（`MAX_MODEL_FIELD_BYTES`）；32 字节适合做数据库列与索引。
+- **不泄露**：NFS 文件句柄拿到手就能绕过路径直接访问服务器上的文件；`Debug` 已经把稳定字节打码。落库、上日志、跨网络的只应是不可逆的键。
+- **绑定端点**：键里混入了后端标识，同样的句柄字节出现在两个不同的端点上，键也不同，不会误关联。
+- **域分隔**：前缀 `data-mover/source-identity/v1` + 长度前缀，保证不同字段组合不会产生相同的输入。
+
+**成本与可以优化的地方**：剖面里 blake3 约占 1%（每条约 100–200 ns，53M 条约 5–10 s CPU）。更贵的其实是**分配**：每条都克隆一份 `BackendIdentity`（内含字符串，
+`model/mod.rs:359-362`），再为稳定字节分配一个 `Vec`。建议并入 C0：
+
+1. `BackendIdentity` 改为 `Arc` 共享（一个存储一份），每条只加一次引用计数；
+2. 稳定字节用小缓冲内联（NFS 句柄 ≤ 64 字节、CIFS file id 16 字节、ETag 约 34 字节，几乎都放得下）；
+3. 身份键保持**在构造时计算**：扫描写库的每一条都要用到它（terrasync 的 `ObservedEntryRecord::capture`），推迟计算省不下什么，反而要处理并发缓存。
+
+#### 5.4.7 稳定程度（`IdentityStrength`）是什么
+
+稳定程度回答的是：**这串稳定字节在什么变化之下保持不变**，也就是它能不能用来认出“还是同一个对象”。它决定消费方可以拿这个身份做什么（`src/model/observation.rs:17-24, 95-107`）。
+
+| 稳定程度 | 含义 | 改名后 | 改内容后 | 同路径删了再建 | 谁产生（代码） |
+|---|---|---|---|---|---|
+| `StableWithinBackend` | 存储自己给对象的身份，与路径、内容无关 | 不变 | 不变（内容变化另由 `content_version` / size+mtime 判断） | 变 | NFS 文件句柄（`nfs/source.rs:104`）；CIFS file id，服务端给了才有（`cifs/source.rs:240`）；Local Unix 的 dev+inode（`local/observation.rs:700`） |
+| `PathScoped` | 只在这条路径上有意义，通常还混入了内容事实 | 变（看起来像删一个、建一个） | 通常变 | 通常变 | HDFS：路径 + size + mtime（`hdfs/source.rs:314-323`）；CIFS 没有 file id 时：路径 + 事实（`:251`）；Local 非 Unix：路径（`local/observation.rs:714`）；S3 当前对象或 `"null"` 版本：ETag（`s3/source.rs:75-89`） |
+| `VersionScoped` | 一个不可变版本的身份 | —（S3 没有改名） | 版本本身不会变；新内容是新版本 | 新版本 | S3 有真实 version id 的版本（`s3/source.rs:84`） |
+
+**消费方能做什么**：
+
+- 只有 `StableWithinBackend` 才公开原始字节（`stable_bytes()` 返回 `Some`），可以跨代关联、识别改名。
+- 三种都可以用来做“扫描与拷贝之间对象有没有被替换”的核对（第 5.4.6 节用途 1）。
+- `PathScoped` 必须和路径一起用；`VersionScoped` 必须和 key 一起用。
+
+**要知道的局限**：Local 的 dev+inode 没有代数（generation），文件删掉后 inode 可能被新文件复用，新文件会被误认成旧文件改名而来。NFS 文件句柄里通常带代数，没有这个问题。
+消费方识别改名时仍应核对 size / mtime。
+
+> **发现的问题：S3 的 `PathScoped` 身份里没有路径**。S3 当前对象的稳定字节**只有 ETag**（`s3/source.rs:75-89`），而 HDFS、CIFS、Local 的 `PathScoped` 都把路径放了进去。
+> ETag 由内容决定，所以**内容相同、路径不同的对象身份键相同**。空对象的 ETag 全都是 `d41d8cd98f00b204e9800998ecf8427e`，一个桶里所有空对象共用同一个身份键。
+>
+> terrasync 的 `detect_changed_observations`（`crates/db/src/clickhouse.rs:379-392`）**只按 `identity_key` 做 INNER JOIN**，
+> 并把 `relative_path` 不同的配对报成“变更”。结果是内容相同的对象两两交叉配对：N 个空对象产生 N×N 行，全部被当成改名或变更。`stable_bytes()` 的文档说 `PathScoped` 的字节“随路径变化”，
+> 这个前提对 S3 不成立。
+>
+> **修法**（Q28）：(1) data-mover 的契约写明“`PathScoped` 的稳定字节必须包含路径”，S3 改为 路径 + ETag，与 HDFS / CIFS 一致；
+> (2) terrasync 只对 `StableWithinBackend` 按身份键关联，其余按 `(relative_path, version_id)` 关联。两边都改。改 S3 身份后，已有代的 S3 条目身份键全部变化，
+> 下一次扫描会把它们一次性看成“新增 + 删除”。按“不考虑兼容”的原则可以接受，但要在变更说明里写明，或者在 terrasync 侧做一次重建。
+>
+> **状态**：data-mover 侧已修（`4fa5aa5`，现存问题 7）；terrasync 侧的关联方式改动仍待在 terrasync 里做。
+
+## 6. 调度与内存
+
+### 6.1 Unordered
+
+- K 个 worker，各自 LIFO 栈（深度优先，压住待处理集合），栈空时窃取别人栈底最浅的目录（抢最大子树）。页直接进条目通道，不经重排缓冲。
+- 没有序号、没有目录事件、没有计数树；只有全局原子计数。
+- 内存：O(在飞列举 × 页) + O(待处理目录)。LIFO 下待处理 ≈ 深度 × 扇出 × worker，与 legacy 的任务队列同量级。
+- 保证：目录的 `Entry` 先于它的任何子项（发现子目录时先发它的 Entry 再入栈）。
+
+### 6.2 Blocks
+
+- 现有准入游标改为逐页消费：`Frame.children` 从整块 `VecDeque` 变为“已到页 + 仍打开的流”；块关闭条件改为“缓冲空且流读尽”；过滤决定逐页做。
+- 块关闭时对槽位（子目录）按名字字节排序，然后按序下钻。
+- 祖先帧的流在下钻前已读尽，**栈上没有横跨子树的打开游标**。只有“已预取、游标还没走到”的目录会停在半路（≤ 2P 个）：NFS/S3/HDFS 停车什么都不占；Local 占一个 fd；**CIFS 占一个真实句柄**，单设上限（Q10）。
+- 预取语义从“整份列举到齐”变成“首页到齐”。小目录（多数）一两页就读完，行为与今天相同、句柄立即关闭。
+- 内存：O(打开的列举 × 2 页) + O(当前与已预取目录的子目录数)。后者（槽位）P7 压不住，归 P8/P9（名字 arena / 溢写）。
+
+### 6.3 驻留探针
+
+`storage/residency.rs` 加 `pages_buffered`、`parked_listings`、`parked_handles`。验收：平铺 N 文件目录的待准入子项峰值与 N 无关。
+
+## 7. 计数
+
+```
+struct ScanTotals {                 // TraversalCompletion 里，两种方式都有
+    listed, emitted, filtered, failed_children, vanished, internal_hidden,
+    listing_failures, interrupted_listings,
+    pruned_dirs, truncated_dirs,
+    bytes, files, directories, symlinks, other,
+}
+struct BlockCounts { /* 同上的每目录版本，只在 Blocks 的 DirectoryListed 里 */ }
+
+不变式：listed == emitted + filtered + failed_children + vanished
+       （internal_hidden 不在 listed 里；pruned / truncated 与之正交：子目录可以既 emitted 又没下钻）
+```
+
+- 即时与 deferred 两条过滤路径合并计入 `filtered`；deferred 且观察失败的目录计 `failed_children`，仍照常下钻（`storage.rs:528-541`）。
+- 列举级失败不是子项，不进不变式；`listed` 只数失败前真正返回的。
+- Unordered 下每条目只是几次 `u64` 自增，无分配。
+- 分布统计（扩展名、大小区间、时间区间、深度、名字长度）是业务口径，放在 terrasync，从库里 SQL 聚合（第 11 节）。
+- 续扫后遍历侧计数是近似的（重扫的部分会重复计），Q15。
+
+## 8. 错误模型
+
+三层载体：**子项失败**（`Failure{scope: Child}`，流继续）、**列举失败**（`Failure{scope: Listing}`，该目录不完整，兄弟继续）、
+**会话终止**（`TraversalTerminalFailure::Session`，流结束）。取消是 `TraversalOutcome::Cancelled`，不是错误（R10）。
+
+| 类 | 例子 | 行为 | FailureClass / Transience | 今天 |
+|---|---|---|---|---|
+| 子项 | 名字拼不成路径 / 点段 / 非 UTF-8 | 子项失败，继续 | `Unsupported` / Permanent | Local、S3 逐子项；**CIFS、NFS、HDFS 整目录失败** |
+| 子项 | 列举项缺属性（NFS） | 子项失败 | `Protocol` / Unknown | **NFS 整目录失败** |
+| 子项 | 单个子项 stat / 权限 / 可选元数据失败 | 子项失败 | 按映射表 | 已如此 |
+| 消失 | 列举后、观察前消失；父列出后子目录已不存在 | 计入 `vanished`，不发失败项，不破坏完整性（Q12）。遍历根不存在仍是列举失败 | `NotFound` | 今天是失败项 → 活跃目录上删除检测常被禁用 |
+| 列举 | 无权限 / 打不开 | `Unreadable` | `PermissionDenied` / Permanent | 已如此 |
+| 列举 | 第 k 页失败（已发出 N 个） | 先重试（首页前可从头，之后只能从位置续）；续不了 → `Interrupted { delivered: N }` | 按原因 | 不存在（整块物化） |
+| 列举 | cookie / token 循环、空页不前进 | 该列举 `Interrupted`，不结束整场 | `Protocol` / Permanent | S3 → 会话失败（`paging.rs:83-86`） |
+| 会话 | 连接重置、服务器宕、SMB session / Kerberos 票据过期 | 重连属于 backend 会话层；无状态位置在恢复后续页；CIFS 句柄失效 → 该列举 `Interrupted`；恢复不了 → 终止（Resumable 时带最后检查点） | `Connectivity` / Transient；`Authentication` / Permanent | 任何会话失败都结束遍历（`cursor.rs:476-478`） |
+| 会话 | S3 凭据过期（`ExpiredToken`） | 终止 | 会话 / Permanent | 已如此 |
+| 节流 | S3 429 / 503 / SlowDown；NFS JUKEBOX / DELAY | **退避，不是失败**：生产者内有界、带抖动、看取消令牌；预算耗尽才 `Interrupted`（Q11） | **新增 `FailureClass::Throttled`** / Transient | **S3 一次（SDK 重试后的）SlowDown 就结束整场遍历**（`role_protocol.rs:518-523`） |
+| 资源上限 | 多版本桶目录上限、单 key 记录上限、失败数阈值 | `Capacity` / Permanent（列举级或单 key）；可选 `max_child_failures` 快速失败 | `Capacity` | S3 500 万 |
+| 取消 | 令牌 | 结局 `Cancelled`；流被 drop，生产者自己关句柄 | — | 已如此 |
+
+**legacy 对照**：legacy NFS 只在处理任何条目之前对可失效句柄 / 服务端忙从头重试，固定 sleep 500 ms（`nfs.rs:3389-3418`）；之后的读失败只 `error!` + 一条 `ErrorEvent::Scan`，
+没有“目录不完整”的结构化信号，所以 terrasync 遇任何扫描错误就整场禁用删除检测。
+
+## 9. 断点续扫
+
+### 9.1 接口：扫描入参，由上层决定
+
+```
+TraversalRequest::new(root)                 // non_exhaustive + 构造器
+    .order(TraversalOrder::Unordered | TraversalOrder::Blocks)
+    .resumable(Resumable::Off)              // 默认
+    // .resumable(Resumable::On { every: Duration::from_secs(60) })   // 默认 1 分钟
+    .resume_from(Option<Checkpoint>)        // None = 从头扫
+
+struct Checkpoint(Bytes);   // 不透明、带版本；绑定 root / order / filter / max_depth 的指纹
+```
+
+- **Off**：不跟踪前沿、不取快照、流里没有 `Checkpoint` 项，开销为零。
+- **On**：按间隔在流里发 `TraversalItem::Checkpoint`。
+- `resume_from` 的指纹与本次请求不一致时，在任何 I/O 之前返回 typed 失败。
+- **间隔的含义**：每约 1 分钟在流里**发出**一个检查点，记录发出那一刻的位置；不是“延迟一分钟再保存”。上层收到后等它之前的批写库确认，立刻落库（等的是批量写入的延迟，通常几秒）。崩溃后最多重做约 1 分钟的扫描加上未落库的批。
+  不到 1 分钟就结束的扫描不产生检查点。
+- **取消时补发一个检查点**：取消时遍历在结束前立即发一个检查点，不等满 1 分钟，所以“取消”就是“暂停”，续扫几乎不重做。会话失败时如果还能发，也补发一个。
+
+### 9.2 语义：不求精确，只要求进度不领先于已落库的数据
+
+> **不变式**：检查点、generation 提交、任务成功，只能建立在 ClickHouse **已确认**的写入之上。满足这一条，从更早的检查点重来、重复扫一段都不会丢数据。
+
+|  | Blocks | Unordered |
+|---|---|---|
+| 检查点内容 | 块边界上的 DFS 位置（根到当前目录 + 每层下一个要下钻的名字），O(深度) | 前沿（已发现未开始列的目录）+ 正在列的目录，各带深度与 filter 状态；53M 树约 6400 条路径、约 300 KB |
+| 续扫时 | 重列祖先（d 次列举，不重发）；没收到 `DirectoryListed` 的块整块重列 | 正在列的目录整块重列，它们已发现的子树可能重扫 |
+| 一致性 | 块边界天然一致 | “出栈”与“登记为在列”在同一把 worker 锁下；窃取先登记再出受害者栈。任何时刻每个未完成目录都在集合里，最坏重复登记（多列一次），不会漏；不需要全局暂停 |
+| 开销（On） | 可忽略 | 每目录 2 次登记（非每条目），约 < 0.5% CPU；取快照每分钟约 1 ms |
+
+- **退化情况**：一个目录有 1000 万子目录时前沿巨大（约 0.5–1 GB），检查点间隔随前沿大小自适应，或者停止发检查点并在流里明说“此后不可续扫”。
+- **可接受的小误差**：检查点与崩溃点之间扫到、又在两次运行之间被删的条目，第一次写下的行会留在库里。数量不超过一个检查点间隔，与“扫描不是快照”同类。
+- **删除检测**：只有最后一次运行 `Completed`，且两次运行的列举失败都已并入异常清单时才能做。
+
+## 10. 多版本对象：每个 key 一项
+
+### 10.1 形状
+
+```
+struct ObjectHistory {
+    records: Vec<VersionRecord>,     // 服务端列举顺序反转：最旧在前，最新的一条在最后
+    order: HistoryOrder,             // Server（取自原始 XML 的位置）| Inferred（存储不守规矩，按时间推断）
+    complete: bool,                  // false = 这个 key 的记录超过上限，只装了一部分（Q8）
+}
+struct VersionRecord {
+    version: VersionId,              // 真实 id，或 "null"（未开版本控制时写入 / 暂停期间写入）
+    latest: bool,
+    kind: Object { size, etag, last_modified } | DeleteMarker { last_modified },
+    identity: SourceIdentity,        // VersionScoped(id)；"null" 为 PathScoped(ETag)
+    source: Option<SourceVersion>,   // 拷这一版用的选择器；删除标记为 None
+    metadata: MetadataObservations,  // 按观察计划、绑定这一版观察；失败只记在这一条上
+}
+```
+
+- **一个 key 一项**：`ObservedEntry` 的路径就是这个 key，`history()` 给出全部记录。目录（前缀）没有历史。
+- **列出全部**：没有参数；多版本桶上一律列出每个版本和每个删除标记。最新一条是删除标记的 key（“当前已删”）**也出现**，由消费方看 `history.current()`（最新一条是对象时返回它，否则 `None`）判断现状。
+- **顺序以服务端为准**，不按 LastModified 排。依据见 10.2 的实测，方案见 10.3。
+- **桶怎么判定“多版本”**：连接时 `GetBucketVersioning`。`Enabled` 或 `Suspended`（暂停后旧历史仍在）→ ListObjectVersions；从未开启 → ListObjectsV2，
+  `history = None`。查询被拒时一律用 ListObjectVersions（对未开版本的桶它返回每个 key 一条 `"null"`，结果正确，只是慢一些）（Q26）。
+
+### 10.2 实测：MinIO 的版本顺序（2026-09-25）
+
+**环境**：实验室 MinIO `RELEASE.2023-03-20`（10.131.9.11:9000），临时桶 `data-mover-vorder-<run>`，开启版本控制，结束时按 id 删除全部版本并删桶（两次都返回 204）。
+每次写入都记录响应头里的 `x-amz-version-id` 作为**真实写入顺序**，再与 ListObjectVersions **原始 XML** 的元素顺序比较。脚本在本地 scratchpad 的 `vorder/probe.sh`、
+`probe_race.sh`，实现时可以原样搬进 `.claude/skills/e2e-s3/scripts/`。
+
+| 场景 | 结果 |
+|---|---|
+| A 同一 key 快速交替：PUT PUT DEL PUT DEL PUT（间隔约 13 ms） | XML 顺序 = 写入顺序的倒序；`<Version>` 与 `<DeleteMarker>` **按真实顺序交错**；`IsLatest` 在第一条 |
+| B 间隔 1.2 s 的 PUT DEL PUT DEL | 同上 |
+| C 两个 key 交替写 | 每个 key 的记录在 XML 里**连续**，key 之间有序 |
+| D 暂停版本控制后写两次（`null`），再开启并写入、删除 | `null` 版本只保留最后一次（被覆盖），位置正确 |
+| 分页 `max-keys=2` | 一个 key 的记录跨越多页，拼起来与单页完全一致 |
+| LastModified 精度 | 列举里是**毫秒**（`…:57.875Z`）；`HEAD` 的 `Last-Modified` 只有**秒**（HTTP 日期格式） |
+| **E 并发**：同一 key 同时发 12 个 PUT + 4 个 DELETE，3 轮（共 48 次写） | **44 条记录里有 20 个同毫秒并列（13 组）**，并列里既有版本也有删除标记。XML 顺序仍是服务端的存入顺序，LastModified 非增。**用今天的做法（两张表按 LastModified 合并、并列时版本在前）重建出来的顺序与服务端不一致**，第 4 条就错了（服务端是删除标记，合并结果是版本）。`IsLatest` 仍正确 |
+| MinIO 的一个偏差 | 当前最新已是删除标记时再 DELETE，MinIO **不新建**删除标记，而是返回已有那个的 id（12 次 DELETE 只产生 8 个标记）。据我所知 AWS 每次都会新建一个。对顺序没有影响，但历史迁移到 MinIO 目标时，连续的删除标记会被合并 |
+
+**结论**：
+
+1. “按存入顺序、最近的在前，版本与删除标记在 XML 里交错”在 MinIO 上**成立**，而且是唯一可靠的顺序来源。
+2. LastModified 即使有毫秒精度也**不够**：并发写入时大量并列。今天 `history.rs` 的合并规则在并发场景下会**排错**，这是一个现存 bug，与 P7 无关（已修：`40c1ac9`，现存问题 8）。
+3. 顺序在 SDK 解析时就丢了：aws-sdk-s3 把 `<Version>` 和 `<DeleteMarker>` 拆成两个列表（`src/s3/role_protocol/versions.rs:107, 123`）。
+
+#### 10.2.1 三家对照：MinIO / DXN（Ceph RGW Octopus）/ StorageGRID 11.5（2026-09-25，Q30 已批准）
+
+同一组脚本，各用临时桶 `data-mover-vorder-<run>`，跑完按 id 删除全部版本并删桶（全部返回 204）。
+
+| 事实 | MinIO 2023-03-20 | DXN（RGW，3 个网关） | StorageGRID 11.5 |
+|---|---|---|---|
+| 原始 XML 顺序 = 存入顺序（最新在前），版本与删除标记交错 | 是 | 是 | 是 |
+| 同 key 连续、`IsLatest` 在第一条、分页拼接保序 | 是 | 是 | 是 |
+| 列举 LastModified 精度 / HEAD 精度 | 毫秒 / 秒 | 毫秒 / 秒 | 毫秒 / 秒 |
+| 并发写同一 key：同毫秒并列 | 44 条中 20 条 | 42 条中 17 条 | 48 条中 20 条 |
+| 并发写：XML 顺序与 LastModified 是否一致（除并列外） | 一致 | **不一致**：6 处相邻记录时间“倒挂”，含版本对版本（多网关各自打时间） | 一致 |
+| 今天 `history.rs` 的 LastModified 合并能否还原服务端顺序 | **不能**（第 4 条起错） | **不能**（第 17 条起错） | **不能**（第 1 条就错） |
+| 最新已是删除标记时再 DELETE | 不新建，返回已有标记 | 不新建，返回已有标记 | 每次新建一个（与 AWS 一致） |
+| 暂停版本控制期间 PUT 的响应头 `x-amz-version-id` | 返回 `null` | 不返回 | 不返回 |
+| **只有 null 版本的 key，重新开启版本控制后写入，再普通 DELETE** | null 版本保留 | **null 版本被删掉**：列举里消失，`GET ?versionId=null` 404（AWS 语义下开启状态的普通 DELETE 只加删除标记） | null 版本保留 |
+| 无请求体的 PUT（建桶） | 可以 | 需 LocationConstraint | 必须带 `Content-Length: 0`，否则 411 |
+
+**结论（加强）**：
+
+1. 三家都按“存入顺序、版本与删除标记交错”返回原始 XML，这是**唯一可靠**的顺序来源。
+2. LastModified 在三家上都会并列；在 DXN 上甚至与真实顺序矛盾，所以 F2（改为原始 XML 位置）是必须的，不是优化。
+3. DXN 的 null 版本丢失是存储自身的缺陷：作为源，它的历史里本来就没有了；作为**目标**，往 DXN 写删除标记会删掉目标上已有的 null 版本。历史迁移到 DXN 时要在报告里说明，
+   或者避免在目标上对曾有 null 版本的 key 写删除标记。写进 `.claude/docs/storage-s3.md` 的 DXN 差异。
+4. MinIO / DXN 会合并连续的删除标记，StorageGRID 不会；迁移到前两者时计入“目标合并了 N 个删除标记”。
+5. Q22 的无序存储目前无法访问：用内存 fake 的“打乱顺序”模式覆盖，拿到后再加入矩阵。
+
+### 10.3 方案
+
+1. **从原始响应体取顺序**：给 ListObjectVersions 加一个读取原始响应体的拦截器（代码里已有拦截器的先例：`src/s3/dxn.rs` 的 `DxnCompatibilityInterceptor`），
+   按文档顺序解析 `<Version>` / `<DeleteMarker>`，得到 `(key, versionId, 位置)`。XML 解析器已在依赖树里（`aws-smithy-xml`、`quick-xml`、`roxmltree`），
+   不需要新依赖；是否把其中一个提升为直接依赖，实现时确认。SDK 解析出的字段照用，只用原始 XML 补上“位置”。
+2. **每个 key 的历史 = 该 key 的记录按服务端位置反转**（最旧在前、最新的一条在最后），**完全不用 LastModified**。
+3. **边走边校验**：同一个 key 里 `IsLatest` 必须恰好一条且在最前；同一个 key 的记录必须连续；分页拼接后位置单调。任何一条不成立，说明这个存储不按规矩给顺序（用户遇到过的那种）
+   → 该 key 退回“按 LastModified 推断、`IsLatest` 放最后”，并在 `ObjectHistory` 上标 `order: Inferred`（正常为 `order: Server`），让消费方知道这段历史的顺序是推断的。
+4. **分页**：位置按“页号 + 页内序号”累计，跨页的 key 自然拼接；有序存储上可以只攥住当前 key，无序存储上按目录物化（第 5.3 节）。
+5. **测试**：
+   - 单元测试：合成 XML（交错、同毫秒并列、跨页、`IsLatest` 不在最前、同 key 不连续）。第一条就是把 10.3 场景 E 的真实响应存为 fixture：今天的实现在它上面必须失败，新实现必须通过。
+   - e2e：把 `probe.sh` / `probe_race.sh` 并入 e2e-s3，在 MinIO 上每次跑。
+   - DXN（Ceph RGW Octopus）与 StorageGRID 11.5 上跑同一组：**已完成（10.2.1）**，脚本并入 e2e-s3 后三家都跑。
+6. **目的端**：写历史到 MinIO 时，连续的删除标记会被合并（10.3 最后一行）。这属于目标存储的限制，拷贝报告里记为“目标合并了 N 个删除标记”，不算失败。
+
+### 10.4 要处理的后果
+
+| 后果 | 处理 |
+|---|---|
+| 单 key 版本数没有上限（一个频繁覆盖的对象可以有上百万版本），一项可能极大 | 单 key 记录上限 10 万条；超过时**分段**：一个 key 发多项，每项带段号和 `complete: false`，最后一段 `complete: true`（Q8 已定） |
+| 无序存储上一个 key 的记录可能分散在任意页 | 按目录物化后组装（O(目录)，上限 500 万条记录，Q9）。有序存储本可以只攥住一个 key，但无法事先知道存储是否有序 |
+| 一项的观察可能要做很多次 I/O（每个版本单独读 tags / 元数据） | 只在观察计划要求时才做；每条记录的观察结果与失败各自独立，一条失败不让整项失败；一项内的 I/O 受同一个并发窗口约束 |
+| 拷贝 | 消费方按 `records` 顺序逐条处理：对象版本用 `record.source`（`SourceVersion::Id`，最新的 `"null"` 为 `Current`）交给 `TransferRequest::with_source_version`；删除标记在多版本目标上写删除标记 |
+| 身份与改名识别 | 项的 `source_identity` 是 key 级的 `PathScoped`；每条记录另有自己的 `VersionScoped` 身份，拷贝前按记录核对 |
+| 快照 | 带历史的条目用新快照版本（v7，取代 C22 的 v6 每版本条目）；不带历史的仍是 v5，逐字节不变 |
+| 计数 | `listed` / `emitted` 按 key 计；另加 `versions`（对象版本数）与 `delete_markers`；`bytes` 分为“当前版本字节”和“全部版本字节” |
+| terrasync 落库 | 把一项展开成每版本一行，沿用今天 base 表的排序键 `(relative_path, version_id, identity_key)`（`clickhouse.rs:569`）与去重（Q27 已定） |
+
+## 11. 与 terrasync 写库的配合（ClickHouse）
+
+统计准不准，主要取决于批量写库。以下基于 terrasync-rs `8edd400`（10.131.9.10）。这些改动在 terrasync 里做，本设计只列要求（Q16）。
+
+### 11.1 现状里对的部分
+
+- 写入用 `async_insert=1` + `wait_for_async_insert=1`（`crates/db/src/clickhouse.rs:326-327`），`end()` 返回时服务端已 flush，**确认过的批不会丢**。
+- 增量扫描每批一张新临时表：插入 → 与 base 比较（`NOT IN base`，`clickhouse.rs:200-219`）→ 并入 base（`ReplacingMergeTree`，`:569`）
+  → 删表（`app/src/scan.rs:823-850, 889-942`）。续扫重扫的条目、已并入后的重试都落在后面的批里，比较时 base 里已有且未变，不产生事件，并入时被去重。**所以临时表不用改**。
+
+### 11.2 会丢数据或让统计失真的地方（都属于“批没写下去，进度却前进了”）
+
+| 现状 | 后果 | 改法 |
+|---|---|---|
+| 全量扫描批写重试 3 次（100/200/400 ms，约 0.7 s，`consumer/database.rs:19-21, 52-75`）后**丢弃这一批**（`:395-401`）；`database_consumer_result` 只对增量扫描报错（`:40-48`） | 全量扫描静默丢行，任务仍成功 | 重试耗尽 = 失败；退避按分钟计（能跨过一次服务端重启），期间背压传回遍历 |
+| 崩溃时内存里的未满批（每 worker ≤ `batch_size`）与通道缓冲（每消费者 1000）丢失，没有持久进度点 | 只能整场重扫 | 检查点写进状态表，**只在它之前的所有批都确认后才写**；收到检查点先 flush 未满批；并发批按“未确认数归零”判定 |
+| 数据库消费者退出后，广播对它的发送失败被静默忽略（`broadcast.rs:36-44`） | 后面的项全没落库，扫描却继续“成功” | 数据库消费者退出 = 整个扫描失败 |
+| 统计按广播逐条累加，与写库结果无关（`stats/accumulator.rs:265-272`） | 丢批时统计仍全数计入 | 最终统计用 SQL 在 base（`FINAL`）上聚合；时间分桶用扫描开始时间；内存累加只做进度条 |
+| 增量扫描临时表插入不重试（`scan.rs:853-883`） | 一次瞬时错误就不能提交 generation | 重试时**换一张新临时表**（先删再建），不往半成功的表里再插 |
+| 全量扫描（`JobType::Scan`）直接写 base，没有 generation 闸门 | 崩溃留下半场数据 | 与增量扫描一样，写完并校验后再生效（Q17） |
+| 示例 `batch_size = 100`（`utils/src/app_config.rs:443`） | 53M 条约 53 万次 INSERT | 调到 1 万–10 万 |
+| docker 镜像未固定版本（`docker/docker-compose.yml:5`） | 行为随版本漂移 | 固定版本 |
+
+### 11.3 可选
+
+- 列举本身的同批重复（S3 跨页重复对象、NFS 变化中的目录在 cookie 边界重复一项）很少见，会多发一次 New；
+  要消掉只需在检测 SQL 上加 `LIMIT 1 BY t.relative_path, t.version_id`（代码里已有这种写法，`clickhouse.rs:1216`）。
+- 提交前交叉校验：data-mover 报告的 `emitted` 与本轮写入行数对得上才提交。
+
+### 11.4 generation 闸门是什么（Q17）
+
+**generation（代）**：terrasync 的 base 表每一行带一个 `current_state`（0 或 1），表示这一行属于哪一次扫描；状态表（`state_<job>`，`ReplacingMergeTree`，一行）
+记着**已提交的是哪一代**。
+
+**增量扫描今天的流程**（`crates/app/src/scan.rs:34-83, 484-716`，`crates/db/src/clickhouse.rs:724-738, 1059-1093`）：
+
+1. `begin_scan_generation`：读出已提交代 c，本轮工作代 w = 1 − c；先把上一轮没提交留下的 w 行改回 c（`rebase_uncommitted_generation`）。
+2. 扫描：每批进临时表，与 base 比较得出新增 / 变更，再并入 base，行标记为 w。
+3. 任何失败（walk 报错、批写失败、取消、消费者失败）都会把 `IncrementalScanSafety.snapshot_complete` 置为 false。
+4. 只有 `snapshot_complete` 仍为 true 时才做删除检测（base 里仍是旧代 c、本轮没刷新到的行 = 已删除），并调用 `commit_scan_generation`：把 w 写进状态表，从此 w 就是“当前”。
+5. 否则**不提交**：状态表仍指向 c，本轮的结果不生效，下次 begin 时回滚。
+
+这就是**闸门**：“这次扫描完整、所有写入都成功”之前，它的结果不会成为新的基线，也不会触发删除。
+
+**全量扫描没有这道闸门**：
+
+- `run_full_scan`（`scan.rs:333-417`）不调 begin / commit，数据库消费者把行直接写进 base（当前代 0）。
+- 取消时也走到 `“Scan job … completed successfully”` 并返回 `Ok`（`scan.rs:398-417`）。
+- 批写失败会被丢弃且不报错（11.2 第 1 行）。
+- 下一次运行时，`determine_scan_type` 只看 base 表是否存在（`scan.rs:138-156`），存在就走增量。于是**一次只扫了一半的首次扫描会被当成完整的基线**：没扫到的部分在下一次增量里全被当成“新增”，
+  它们的统计也从那一次开始才算对。
+
+**建议**：全量扫描同样 begin / commit。首次扫描没提交时，状态表记“无已提交代”，`determine_scan_type` 据此判为“仍需全量”（开了续扫时从检查点继续）；取消或失败如实返回错误。
+
+## 12. 性能
+
+### 12.1 C0：先修每条目一次的跨线程交接（不依赖 P7）
+
+- 无 I/O 的观察（`needs_metadata_role() == false` 且非 symlink）在列举任务里逐页构造 `ObservedEntry`，驱动收到“已观察的页”，每页一次交接；需要 I/O 的（ACL / xattr / tags、
+  symlink、S3 带版本观察）才 spawn。
+- 重排缓冲快路径：序号正好是下一个时直接发，不进 `BTreeMap`（`output.rs:139-162`）。
+- 身份的分配：`BackendIdentity` 改为 `Arc` 共享，稳定字节内联（见 5.4.6）。
+- C0b：列举已带 mtime 时 filter 立即决定（`storage.rs:369-371` 今天只要 `needs_modified()` 就一律 deferred）。值与观察得到的完全相同；
+  DSL 主线的 deferred 决定从约 N 降到约 0。
+
+### 12.2 估算（推测，未测）
+
+| 53M 树 | CPU | RSS |
+|---|---|---|
+| 今天（`8a1348b` 后） | 约 700 s | 约 180 MB |
+| C0 后 | 约 330–420 s（futex 1.9 → 约 0.3–0.5 / 条） | 下降，原因待探针与 `MALLOC_ARENA_MAX=2` 查明 |
+| Blocks 流式后 | 与 C0 相近（这棵树每目录 35 项，流式对它几乎没有 CPU 收益；对宽目录是数量级的内存收益） | 同上 |
+| Unordered | 再省约 5–10%（记账、缓冲、事件），且没有头阻塞 | 与 legacy 同量级 |
+
+### 12.3 Unordered 相对 legacy 仍然存在的成本
+
+- `ObservedEntry` 构造：`SourceIdentity` + blake3 身份键（剖面约 1%）、元数据观察结构、`Box`、路径拼接、backend fact 拷贝。这是契约的一部分（快照、身份），不能省。
+- 条目通道每项一次 send：与 legacy 相同。
+
+### 12.4 宽目录（1000 万文件平铺）
+
+|  | 今天 | P7 后 |
+|---|---|---|
+| 驻留 | 约 4.5 GB（每条 400–500 B），预取最多 2P+1 份同时驻留 | O(页) |
+| 首项 | 整个目录列完（S3 1 万页 × 约 50 ms ≈ 8 分钟） | 首页之后 |
+| 1000 万个子目录 | 槽位约 1.5 GB | 不变，归 P8/P9 |
+
+### 12.5 组装 `ObservedEntry` 的并发
+
+**结论**：可以并发，而且应该并发，但**并发的粒度必须是“页”，不能是“条”**。今天慢的原因恰恰是按条并发。
+
+| 每条目的成本（估算，未测） | 量级 |
+|---|---|
+| 组装本身：身份（克隆 `BackendIdentity` 字符串、分配稳定字节）、blake3 身份键、元数据观察结构、路径拼接、`Box` | 约 0.5–1.5 µs |
+| 今天为它付出的跨线程交接：每条 spawn 一个任务 + `join_next` 唤醒驱动（每条约 1.9 次 futex） | 约 5–10 µs |
+| 实测总账（53M 树） | 角色版约 13.6 µs CPU / 条，legacy 约 4.5 µs / 条 |
+
+交接比工作本身贵好几倍，所以按条并发越多越慢。
+
+#### 按页并发（C0 的做法）
+
+- **组装放在列举的生产者任务里**：每个列举一个任务，页读到后在同一个任务里把整页组装成 `ObservedEntry`，再**整页**交给驱动。每页一次交接，而不是每条一次。
+- **并行度来自多个目录同时列举**：
+  - Unordered：K 个 worker 各自列举、各自组装，天然 K 路并行，没有单点。
+  - Blocks：在飞的预取列举（≤ P 个）各自组装，驱动只负责排序号、发出。
+- **条目通道也按页**：内部通道传 `Vec<TraversalItem>`，`TraversalSession::next_item()` 从缓冲的页里逐条取，对外接口不变，通道操作从每条一次降到每页一次。
+- **需要额外 I/O 的条目**（`should_scan` 里的 ACL / tags 等）：本来就是 I/O 等待，按条并发是对的，但不必每条 spawn。改为每页一个任务，里面用 `FuturesUnordered` 并发发这一页的请求，
+  受 `max_inflight_operations` 约束。
+
+#### 还可以更进一步，但先量再做
+
+- **单个超大目录**（例如千万级平铺目录）在 Blocks 下只有一个生产者，组装是串行的。按约 1 µs / 条算，一个核每秒能组装约 100 万条；NFS 一页约 300 条要一次往返，列举本身更慢。所以通常不是瓶颈。真成为瓶颈时，把一页切成几块、
+  分给几个任务组装，按块号还原顺序。
+- **降低单条成本**比加并发更划算：`BackendIdentity` 改为 `Arc`、稳定字节内联（5.4.6）、页内共享父路径（P9）。
+- **快照编码**（`encode_snapshot`）在消费方（terrasync `ObservedEntryRecord::capture`）里做，由写库的批量 worker 并发，不占遍历的线程。
+- **并发过度的风险**：线程越多，分配器的 arena 越多（178 MB 的首要怀疑对象），Blocks 的重排缓冲也越大。以 node1 的实测（CPU、RSS、futex / 条）决定，不凭感觉加。
+
+**验证**：C0 之后在 node1 上用 `strace -c` 看 futex / 条（目标约 0.3，与 legacy 相当），并加一个组装单条耗时的微基准，确认 0.5–1.5 µs 的估算。
+
+### 12.6 性能目标与达不到时的优化路线
+
+> **要求（用户定的）**：Unordered 与 legacy **基本持平**；Blocks 不能差太多；差距大就找优化方案。
+
+| 指标（node1、m1-source 53M 树、c=64、与 legacy 交替四轮取均值） | Unordered | Blocks |
+|---|---|---|
+| wall | ≤ legacy × 1.05 | ≤ legacy × 1.15 |
+| CPU（user + sys） | ≤ legacy × 1.15 | ≤ legacy × 1.4 |
+| RSS 峰值 | ≤ 30 MB（legacy 15 MB） | ≤ 100 MB，且不随树规模增长 |
+| futex / 条（strace -c） | ≤ 0.4（legacy 0.30） | ≤ 0.5 |
+
+**比较口径**：两边的消费方做同样的事（只计数、不落库），同一棵树、同一台机器、交替运行，防止缓存偏袒一方。
+
+**诚实的预估**：legacy 的 CPU 只有 24%，是 I/O 受限的，wall 持平可以做到。CPU 持平更难：角色版每条多做的“契约内”工作（身份键 blake3、元数据观察结构、快照所需字段）约 1–1.5 µs，53M 条约多 55–80 s，
+相对 legacy 的 240 s 是 1.2–1.3 倍。所以要做到 CPU ≤ 1.15×，下面的 O3 大概率需要。
+
+**达不到时，按预期收益从高到低**：
+
+1. **O1 按页组装、按页交接**（C0，12.5）：消掉每条一次的 spawn 和跨线程交接。这是现在 3 倍 CPU 的主因。
+2. **O2 减分配**：`BackendIdentity` 用 `Arc`；稳定字节内联小缓冲；页只带名字、页内共享父路径（D2 / P9 方向）；复用页缓冲。
+3. **O3 把与契约相关、但扫描本身用不到的计算推迟到用到时**：身份键改为首次调用 `identity_key()` 时计算并缓存；这样只计数或只按路径处理的消费方不付 blake3，写库的消费方在自己的批量 worker 里并行计算。
+   这推翻了 5.4.6 “构造时计算”的建议，只在 O1、O2 后仍不达标时采用。
+4. **O4 分配器**：先试 `MALLOC_ARENA_MAX=2`（零代码）；仍有问题再评估 mimalloc / jemalloc（新增依赖，需要单独决定）。
+5. **O5 Blocks 专用**：序号按页分配而不是按条（一页一个序号区间），重排缓冲按页存；预取窗口按实测调（深链 + 宽树两种形状）。
+6. **O6 条目通道**：若 futex 仍高，`TraversalSession` 增加 `next_page()`，让消费方整页取，免去逐条唤醒。
+
+**剖析手段**：node1 装不了 perf，用 `strace -c` 数系统调用；另加一个 feature 门控的内部计数器（每阶段耗时：列举、组装、交接、发出），以及单条组装的微基准。每一步优化都要在 node1 上复测并记录，达标即停。
+
+## 13. 破坏性变更清单
+
+| 项 | 变化 |
+|---|---|
+| `Namespace`（`roles.rs:474-555`） | 类型化动词；`list(ListRequest) -> ListingStream`；删 `NamespaceRequest`、`NamespaceResult`、`execute`、`list_versions`、`listings_are_abortable`、`mutations_unsupported`（并入 `capabilities`） |
+| `TraversalOrder`（`mod.rs:27-63`） | `{Admission, NameBytes}` → `{Unordered, Blocks}`；删兄弟排序 |
+| `TraversalItem`（`mod.rs:250-257`） | `{Entry, Failure, DirectoryListed(仅 Blocks), Checkpoint}`；删 `SubtreeComplete` |
+| `DirectoryListed` / `DirectoryListing` / `ChildOrder` / `SubtreeSummary`（`mod.rs:262-361`） | 重定型为 `{path, outcome, counts}`；后三个类型删除 |
+| `TraversalCompletion`（`mod.rs:380-387`） | `{ totals: ScanTotals }` |
+| `TraversalRequest`（`mod.rs:151-166`） | `non_exhaustive` + 构造器；新增 `resumable`、`resume_from`、`max_child_failures` |
+| `TraversalTerminalFailure`（`mod.rs:409-412`） | `non_exhaustive`；Resumable 时携带最后检查点 |
+| `FailureClass` | 新增 `Throttled` |
+| 扫描的观察参数 | `TraversalRequest.observation_plan: ObservationPlan` → `should_scan: 额外项集合`（`Acl / Xattrs / Tags / SymlinkTarget`，无档位）；`ObservedEntry` 的时间与 uid/gid/mode 变为普通 `Option` 字段；symlink 目标不再无条件读取 |
+| S3 身份 | `PathScoped` 身份含路径（F1），已有代的 S3 条目身份键一次性全部变化 |
+| 多版本（`mod.rs:65-86`，`ObservedEntry::version / source_version`，`storage/descriptor.rs` 的 `ListingFacts`，快照 v6） | 删除 `TraversalVersions` 与 `list_versions`；每版本一项改为每 key 一项（`ObservedEntry::history()`）；快照 v6 由 v7 取代 |
+| 行为 | 大目录中途的瞬时错误：今天（物化）从头重来会成功，P7 后首页之后不能从头重来 → 可能 `Interrupted`（NFS 需 nfs-rs 页接口才能续） |
+| 测试 / 例子 | `storage/tests/order.rs`、`tests/local_namespace_contract.rs` 的兄弟有序断言删改；`examples/storage_role_operations.rs` 的 `--order`；16 个测试 fake 改用 `ListingStream::from_pages` |
+
+## 14. 实施计划
+
+```
+PLAN
+====
+列举按页流入遍历，提供 Unordered / Blocks 两种扫描方式，异常-only 事件模型，准确计数，
+typed 错误分层，可选断点续扫。
+why: 千万级平铺目录今天整块驻留、首项要等整个目录列完；每条目一次 spawn 让 NFS 整树 CPU 是
+     legacy 的 3 倍；terrasync 需要可靠的完整性判定与统计。
+
+CHANGE
+======
+（与 P7 无关、先做的两个独立修复）
+F1  fix(s3)!: PathScoped 身份含路径（路径 + ETag），契约写明（Q28）      —— 已完成：4fa5aa5
+    - src/storage/backends/s3/source.rs:75-89；src/model/observation.rs:95-107 的文档
+F2  fix(s3): 版本历史顺序取自 ListObjectVersions 原始 XML，不再用 LastModified 合并（Q29） —— 已完成：40c1ac9
+    - src/s3/role_protocol/versions.rs:100-130（拦截器取原始响应体，参照 src/s3/dxn.rs）
+    - src/storage/backends/s3/history.rs:1-80；fixture：MinIO 并发实测响应
+C0  perf(traversal): 页级观察 + 重排缓冲快路径；C0b 有 mtime 时即时决定；
+    列举带 inline ownership（NFS / Local），InlineOnly 不再额外 GETATTR；BackendIdentity 用 Arc
+    - src/traversal/storage/cursor.rs:550-594   列举任务里构造无 I/O 的 ObservedEntry
+    - src/traversal/storage.rs:364-382, 391-427 immediate_decision / admit
+    - src/traversal/storage/observe.rs:17-28, 114-162  拆出同步 observe_inline
+    - src/traversal/storage/output.rs:139-162   快路径
+C1  refactor(storage)!: Namespace 类型化动词 + ListRequest / ListingPage / ListingStream；各 backend 先各产一页
+    - src/storage/roles.rs:474-555；src/storage/backends/{local,nfs,cifs,s3,hdfs}/namespace.rs
+    - src/storage/delete_tree.rs:263；src/ndx_walk.rs:211；src/traversal/storage/observe.rs:128-136
+C2  feat(traversal)!: 事件模型（Entry / Failure{scope} / DirectoryListed / Checkpoint）+ ScanTotals / BlockCounts
+    - src/traversal/mod.rs:250-387；src/traversal/storage/output.rs（删子树聚合 :90-107, :224-285）
+C3  feat!: 错误模型（Throttled、逐子项失败、vanished、TraversalRequest 构造器、TerminalFailure non_exhaustive）
+    - src/model/mod.rs:512-537；src/s3/role_protocol.rs:518-523；各 backend namespace 的 collect 改逐子项
+C4  refactor(traversal)!: Blocks 游标逐页消费；块关闭时按名字排下钻；删兄弟排序；TraversalOrder::{Blocks}
+    - src/traversal/storage/cursor.rs:66-129, 195-238, 340-393, 467-534
+C5  feat(storage): Local 流式            - src/storage/backends/local/namespace.rs:125-153, 257-297
+C6  feat(storage): S3 流式（Current；前缀集合；All 物化；节流退避）
+    - src/storage/backends/s3/{listing.rs:55-130, paging.rs, namespace.rs:109-146}
+C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:4610-4691
+C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
+C9  feat(storage): CIFS 流式（生产者持有句柄；停车句柄上限） - src/storage/backends/cifs/{protocol.rs:230-280, namespace.rs:59-94}
+C10 feat(traversal): Unordered 调度器（worker LIFO + 窃最浅 + 全局计数，内部通道按页），设为默认
+C11 feat(traversal): Resumable（Checkpoint 项每约 1 分钟 + 取消时补发、resume_from、指纹），两种方式
+C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 v7），删除 TraversalVersions / list_versions
+C12 docs: docs/architecture/storage-transfer-architecture.md §5/§6；.claude/docs/{architecture,error-taxonomy,storage-*}.md；ADR-0008
+（terrasync 侧，另起：不丢批、分钟级退避、检查点落库顺序、消费者退出即失败、统计以库为准、全量扫描 generation 闸门、
+  身份键只对 StableWithinBackend 关联、多版本每项展开成每版本一行）
+（可选）chore(deps): nfs-rs 公开 READDIRPLUS 页接口并升级（Q18）
+
+CREATE
+======
+- src/storage/listing.rs: ListingStream::from_producer / from_pages / collect_listing
+- src/traversal/unordered.rs（+ unordered/ 子模块）: Unordered 调度器
+- src/traversal/checkpoint.rs: Checkpoint 编解码、指纹
+- src/traversal/storage/tests/streaming.rs: 多页 fake（Notify 逐页放行）——逐页准入、块序、驻留与 N 无关、半途失败、首页前重试
+- src/traversal/storage/tests/counts.rs: 不变式（即时 / deferred 两遍结果相同）
+- src/traversal/unordered_tests.rs: G2、失败清单、计数、检查点前沿不漏
+- src/storage/backends/s3/streaming_tests.rs: 打乱页内 / 页间顺序、对象与前缀跨页重复、同 key 版本分散在不相邻页、token 循环
+- tests/local_streaming_contract.rs: 真文件系统 20 万平铺文件，首项延迟与驻留
+
+RISK
+====
+- HIGH: CIFS 句柄。生产者任务每个出口都必须 close_resource；ONTAP 停车句柄空闲回收阈值未知 → FAS2750 专测（停车 30 分钟再取）。
+- HIGH: 半途失败。首页之后从头重试会重复发出子项 → “首页已交出”闸门 + 注入测试（第 2 页失败）。
+- HIGH: Unordered 检查点漏登记 → 续扫后整棵子树丢失。窃取与出栈的登记顺序要有注入测试（故意先出栈后登记 → 必须变红）。
+- HIGH: S3 节流今天结束整场遍历；C3/C6 改列举路径的映射时不能改写路径（error-taxonomy 同步）。
+- MEDIUM: 预取视野从“整份到齐”变成“首页到齐”，FAS2750 上复跑 1f13247 那组深链 + 宽树对比 wall。
+- MEDIUM: 删 SubtreeComplete / 兄弟排序后，现有 events / order 测试大改；防止“改测试迁就实现”——每个删掉的断言要在新测试里有对应的新契约断言。
+- MEDIUM: S3 All 物化上限默认 500 万，超限报 Capacity，不能静默降级。
+- LOW: nfs-rs 升级是依赖风险，本计划不依赖它。
+- LOW: 178 MB 的来源未明，可能与遍历结构无关（malloc arena）。
+
+VERIFY
+======
+- timeout 900 make ci；clippy --lib --tests --examples --all-features 零警告
+- 故障注入（看失败的形状）：closed 不等流读尽 → 块被截断；首页后从头重试 → 重复项；生产者某出口不 close → 句柄计数不归零；
+  Interrupted 不进完整性 → 删除规则误放行；Unordered 先出栈后登记 → 续扫丢子树
+- node1 + m1-source 53M 树（c=64，--quiet）：C0 前重测基线（含 MALLOC_ARENA_MAX=2、驻留探针、strace -c futex）、C0 后、
+  Blocks 流式后、Unordered 后；与 legacy 交替四轮；条目数必须 53,368,420
+- FAS2750：e2e-cifs；cifs_namespace_contract；深链 + 宽树 c=1/4/32；停车句柄 30 分钟；CIFS 与 NFS 的 Blocks 下钻顺序逐行一致
+- MinIO（10.131.9.11:9000，data-mover-test，临时前缀）：100 万对象平铺前缀的首项延迟与 RSS；版本化桶（traversal_versions.sh）
+- 无序 S3：内存 fake 的打乱模式；若能拿到用户遇到的那种存储，加入 e2e-s3 矩阵（Q22）
+- HDFS 真机（10.131.9.11 runner）需要用户批准
+```
+
+## 15. 决定记录（2026-09-25 全部采纳）
+
+下面每一条都是已定结论。编号沿用讨论时的问题编号，便于对照过程稿。
+
+### 15.1 扫描方式、事件与接口
+
+| 编号 | 决定 | 见 |
+|---|---|---|
+| Q1 | 默认扫描方式为 `Unordered` | §3 |
+| Q2 | 删除 `SubtreeComplete`（两种方式都删）；`DirectoryListed` 只在 Blocks 发，空目录也发 | §4 |
+| Q3 | 两种方式都在 `TraversalCompletion` 给总数；Blocks 的 `DirectoryListed` 另带本块计数；Unordered 没有每目录计数 | §7 |
+| Q4 | data-mover 提供 Blocks 两进程逐目录配对的辅助（封装“两侧都到 `DirectoryListed` 才判定缺失”） | §3.1 |
+| Q5 | Blocks 下钻键 = 子目录名的原始 UTF-8 字节，不做大小写折叠、不做 Unicode 规范化 | §3 |
+| Q6 | 名字语义由 `NamespaceCapabilities.names` 公开；不敏感的目标上“折叠后相等、字节不等”报冲突，不删除 | §4.1、§5.4.5 |
+| Q23 | `rename` 保留在 Namespace | §5.4.1 |
+| Q24 | `ListedChild.rank` 删除 | §5.4.4 |
+| Q25 | 名字语义查不到（`Unknown`）按不敏感处理，更保守 | §5.4.5 |
+| Q31 | `should_scan` 是额外项的集合（`Acl / Xattrs / Tags / SymlinkTarget`），没有 BestEffort：要了就必须拿到，单条拿不到发子项失败，backend 做不到则在 I/O 之前拒绝；列举顺带的信息（时间、uid/gid/mode 等）一律收下，并入 C0 修掉 NFS ownership 的额外 GETATTR | §3.2 |
+| Q32 | HDFS ACL / xattr、S3 `x-amz-meta-*` 作为后续单独的元数据工作，不放进 P7 | §3.2 |
+| Q33 | symlink 目标改为 `Extra::SymlinkTarget`，没要时为 `None` | §3.2 |
+
+### 15.2 多版本与 S3
+
+| 编号 | 决定 | 见 |
+|---|---|---|
+| Q7 | 一个 key 的历史内部以服务端列举顺序为准（反转成最旧在前、最新在后），不按 LastModified 排序 | §10 |
+| Q8 | 单 key 记录上限 10 万条，超过时分段发多项（`complete: false` + 段号） | §10.4 |
+| Q9 | 多版本桶按目录物化后组装历史，上限 500 万条记录，超限 `Capacity` | §5.3 |
+| Q26 | 用 `GetBucketVersioning` 判定多版本（`Enabled` / `Suspended` → 列全部历史；从未开启 → 普通列举）；查询被拒时一律列全部历史 | §10.1 |
+| Q27 | terrasync 落库时把一项展开成每版本一行，沿用现有表结构 | §10.4 |
+| Q28 | **独立先修**：S3 `PathScoped` 身份改为 路径 + ETag，契约规定 `PathScoped` 必须含路径；terrasync 只对 `StableWithinBackend` 按身份键关联。**data-mover 侧已修：`4fa5aa5`** | §5.4.7 |
+| Q29 | **独立先修**：ListObjectVersions 读原始 XML 取服务端位置，历史顺序完全不用 LastModified；校验不过的 key 标 `order: Inferred`；MinIO 并发实测响应存为回归 fixture。**已修：`40c1ac9`** | §10.2、§10.3 |
+| Q12 | 列举可能重复或遗漏子项写进契约，消费方按 (父, 名) 去重；遍历只对子目录（S3 前缀）去重 | §5.3 |
+
+### 15.3 资源、失败与续扫
+
+| 编号 | 决定 | 见 |
+|---|---|---|
+| Q10 | CIFS 预取停车句柄上限 8（先在 FAS2750 上测 ONTAP 空闲回收） | §6.2 |
+| Q11 | 新增 `FailureClass::Throttled`；单个列举累计退避约 2 分钟后报 `Interrupted` | §8 |
+| Q12（消失） | 列举后消失的条目、父列出后已不存在的子目录计入 `vanished`，不发失败项，不破坏完整性 | §8 |
+| Q13 | 同 Q12：重复 / 遗漏写进契约 | §5.4.3 |
+| Q14 | 检查点默认每约 1 分钟发出一次；取消时补发一个 | §9.1 |
+| Q15 | 遍历侧计数续扫后为近似值；精确的分布统计以库为准 | §7、§11 |
+| Q16 | terrasync 写库改动在 terrasync 里做，本设计只列要求 | §11 |
+| Q17 | 全量扫描同样走 generation 闸门：首次扫描没提交时下次仍按全量（或从检查点续扫）；取消 / 失败如实报错 | §11.4 |
+
+### 15.4 依赖、顺序与验收
+
+| 编号 | 决定 | 见 |
+|---|---|---|
+| Q18 | 改 nfs-rs 上游公开 READDIRPLUS 页接口（cookie + verifier），单独的 `chore(deps)` commit | §5.2 |
+| Q19 | 先做 C0，并在 node1 上补测 `8a1348b` 之后的 CPU / RSS 基线（含 `MALLOC_ARENA_MAX=2` 与驻留探针），再做破坏性重构 | §12 |
+| Q20 | 验收：Unordered 与 legacy 基本持平（wall ≤ 1.05×、CPU ≤ 1.15×、RSS ≤ 30 MB），Blocks 不能差太多（wall ≤ 1.15×、CPU ≤ 1.4×、RSS ≤ 100 MB）；达不到按 O1–O6 优化 | §12.6 |
+| Q21 | 写 ADR-0008：两种扫描方式、事件模型、续扫、每 key 历史 | §14 |
+
+### 15.5 最后两项
+
+| 编号 | 决定 / 结果 | 见 |
+|---|---|---|
+| Q22 | 用户遇到的无序 S3 目前无法访问：用内存 fake 的打乱顺序模式覆盖，拿到后再加入 e2e-s3 矩阵 | §5.3 |
+| Q30 | 已批准并完成：DXN 与 StorageGRID 实测见 10.2.1。新发现 DXN 的 null 版本丢失缺陷与多网关时间倒挂 | §10.2.1 |
+
+**目前没有待用户决定的问题。**
+
+## 16. 附录：否决的方案与理由
+
+| 方案 | 否决理由 |
+|---|---|
+| 块内按名字全排（P4 的 `NameBytes`） | 整块物化 + O(N log N)，首项要等整个目录；用户选了只排下钻 |
+| 按列举顺序下钻（今天的 `Admission`） | 各 backend 访问目录的顺序不一致；排下钻几乎不花钱 |
+| 排序键改为 git tree 序，让 S3 原生有序直接流 | S3 不一定有序；兄弟排序本身已不做 |
+| Unordered 也发 `DirectoryListed` / `SubtreeComplete`（父指针计数树） | 用户确认 Unordered 不需要；省掉每目录两项与计数树 |
+| 多版本“每版本一项 + 同 key 连续”（设计稿原先的建议） | 用户定为每 key 一项：历史是对象的属性；版本数无上限的问题用上限 + 分段解决 |
+| 历史内按 LastModified 排序 | 时钟漂移、同毫秒并列、最新的一条不一定时间最大 |
+| `versions: Current \| All` 参数 | 用户定为不需要：多版本桶一律列出全部历史 |
+| 精确续扫（刀后恰好重发、epoch 列、续扫时 DELETE、有效性谓词、幂等写令牌） | 用户确认续扫不需要精确；重复由库去重吸收，只需保证进度不领先于落库 |
+| 临时表改 `ReplacingMergeTree` | 每批一张新临时表 + 并入 base 已吸收跨批重复 |
+| 续扫用协议位置（NFS cookie、S3 token、`StartAfter`） | 不能跨会话 / 进程可靠复用；`StartAfter` 依赖顺序 |
+| M1：每页一个 future、游标在驱动里停车 | CIFS 句柄在 detach 后无法 await close，会泄漏 |
+| Namespace 加带默认实现的 `list_pages`，保留 `execute(List)` | 为兼容而设；两条列举路径会漂移 |
+| 在遍历里做大小写折叠排序 | 折叠表各家不同（NTFS $UpCase、ONTAP、Samba），贵且易错 |
+
+## 附：设计过程中发现的现存问题（今天的代码，与 P7 是否实施无关）
+
+沿用评审稿的编号（commit message 与 Q28 / Q29 引用的就是这些编号）。状态截至 `40c1ac9`。
+
+| # | 问题 | 状态 |
+|---|---|---|
+| 1 | **一次 S3 SlowDown / 503 就可能结束整场遍历**：限流被归为会话失败（`src/s3/role_protocol.rs:518-523`），且没有配置重试策略 | 未修；由 C3 / C6 解决（`FailureClass::Throttled`、生产者内有界退避，见 §8、Q11） |
+| 2 | **CIFS、NFS、HDFS 因一个坏子项让整个目录列举失败**：`collect::<Result<Vec<_>>>()?`（`cifs/namespace.rs:92`、`nfs/namespace.rs:83-85`，NFS 缺属性时 `nfs.rs:4657-4659`，HDFS 同类），违反“逐子项失败逐子项报”的契约 | **已修** `b6aff40`（`fix(storage): 列举里一个描述不出的子项只让它自己失败`）：三者都改为逐子项 `EntryOperationFailure` + `NamespaceResult::Listing`，遍历报 `Partial` |
+| 3 | **S3 翻页出现重复 token 被当成会话失败**（`paging.rs`），它只是一个目录的问题 | **已修** `1a68f41`（`fix(s3): 翻页 token 绕圈只让该目录失败`）：改为该目录的 `Protocol` / Permanent 条目失败，块 `Failed`，遍历继续兄弟 |
+| 4 | **legacy 版本列举假设服务端按 key 升序**（`src/s3/version_listing.rs`，C20）：靠扣住每页最大的 key 拼一个 key 的完整历史，在无序 S3 上会把一个 key 的历史拆成多组、`version_count` 与 latest 标记出错 | 未修；legacy 版本列举在收尾清理中删除（见下节），role-based 按目录物化（§5.3、Q9） |
+| 5 | **role-based 遍历在 NFS 上常驻 178 MB，来源未查清**：m1-source 每目录约 35 项，帧里的东西应只有几 MB | 未查；C0 前用驻留探针与 `MALLOC_ARENA_MAX=2` 对照（Q19、§12.2） |
+| 6 | **terrasync 写 ClickHouse 的路径在异常时会丢数据**（10.131.9.10，`8edd400`）：全量扫描写失败只重试约 0.7 s 就丢掉整批且任务报成功；数据库消费者退出后广播给它的数据被静默丢弃；统计按广播逐条累加、与是否入库无关；全量扫描直接写 base、崩溃即留下半场数据 | 在 terrasync 里改，本设计只列要求（§11、Q16、Q17） |
+| 7 | **S3 当前对象的 `PathScoped` 身份里没有路径**（稳定字节只有 ETag）：内容相同、路径不同的对象共用一个身份键，terrasync 按身份键 `INNER JOIN` 会交叉配对成 N×N 行（§5.4.7、F1 / Q28） | **已修** `4fa5aa5`（`fix(s3)!: PathScoped 身份包含路径`）：S3 当前对象、`"null"` 版本与 `"null"` 删除标记的稳定字节改为 u32 大端路径长度 + 路径 + ETag；契约写进 `IdentityStrength::PathScoped` 文档。破坏性：S3 `PathScoped` 身份键一次性全变。terrasync 侧“只对 `StableWithinBackend` 按身份键关联”仍待在 terrasync 里做 |
+| 8 | **版本与删除标记交错时按 LastModified 合并，并发写入时排错**：aws-sdk-s3 把 `<Version>` 与 `<DeleteMarker>` 解析成两个列表，丢了交错顺序（`src/s3/role_protocol/versions.rs:107, 123`）（§10.2、F2 / Q29） | **已修** `40c1ac9`（`fix(s3)!: 版本历史按服务端顺序组装`）：`src/s3/version_order.rs` 拦截原始响应体、按服务端位置倒序组装，校验不过的 key 标 `HistoryOrder::Inferred`；`history.rs` 的核心由 role-based 与 legacy `walkdir` / `walkdir_2` 共用。差别：role-based 在整个目录列举（跨页）上校验同 key 连续；**legacy `walkdir` 只在每批已释放的完整 key 内校验连续**。回归数据 `tests/data/s3/minio-concurrent-versions{,-paged}.xml` |
+
+## 收尾：清理扫描相关旧代码
+
+**用户要求（2026-09-25）**：“最后本项目中和扫描相关的都要按照方案进行清理。”
+
+C12 完成后做，作为 P7 的最后一步：
+
+1. **盘点**全部与扫描相关的旧代码，逐项标注“删除”或“迁到新接口”，至少包括：
+   - legacy `StorageEnum` 的 `walkdir` / `walkdir_2` 及各 backend（Local / NFS / S3 / HDFS）的实现；
+   - `walk_scheduler` / `async_receiver` / `dir_tree`；
+   - `ndx_walk`；
+   - legacy `version_listing`（现存问题 4）；
+   - `NfsEnrich`；
+   - 旧的 Namespace 请求类型（`NamespaceRequest` / `NamespaceResult` / `execute` 等，§13）；
+   - 使用它们的 examples / tests / skills / docs（含 `CLAUDE.md` 路由表与 `.claude/docs/` 中的相应段落）。
+2. **删除前先取 legacy 性能基线**（node1 + m1-source 53M 树，口径同 §12.6），记录在案；此后与 legacy 的对比从 git 历史编译。
+3. **逐块删除**：每一块单独一个 commit，commit message 写明“最后一个还包含它的 commit”，便于以后从历史里找回。
+
+---
+
+依据：data-mover-rs `src/traversal/**`、`src/storage/roles.rs`、各 backend 的 namespace / listing、nfs-rs 0.8.4、smb-rs 91e6cfb、
+hdfs-native 695fc47、`.claude/docs/{architecture,error-taxonomy}.md`；terrasync-rs 8edd400 的 `crates/db`、
+`crates/app/src/{scan.rs,broadcast.rs,consumer/**}`；记忆中的 node1 / FAS2750 实测。性能数字除第 2.2 节外均为推测，未经测量。
