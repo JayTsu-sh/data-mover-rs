@@ -19,6 +19,7 @@
 //! cargo run --example storage_role_operations -- compare --backend local --root /tmp/a \
 //!     --other-root /tmp/b --path object.bin --content
 //! ```
+use std::fmt::Write as _;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -136,6 +137,10 @@ enum Command {
         /// Also sum the size of every entry's encoded snapshot (what a caller persists per entry).
         #[arg(long)]
         snapshot_bytes: bool,
+        /// Also print each entry's identity strength and the first 8 bytes of its identity key
+        /// (hex), e.g. to see that two objects with the same content at two keys differ.
+        #[arg(long)]
+        identity: bool,
     },
     /// Stream an NDX-paged depth-first traversal, printing one line per page.
     NdxWalk {
@@ -238,6 +243,7 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
         path,
         quiet,
         snapshot_bytes,
+        identity,
         ..
     } = command
     else {
@@ -254,7 +260,17 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
                     snapshots += entry.encode_snapshot().as_bytes().len() as u64;
                 }
                 if !*quiet {
-                    println!("{:?} {}{}", entry.kind(), entry.path(), version_of(entry));
+                    let identity = if *identity {
+                        identity_of(entry)
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "{:?} {}{}{identity}",
+                        entry.kind(),
+                        entry.path(),
+                        version_of(entry)
+                    );
                 }
             }
             TraversalItem::EntryFailure(error) => {
@@ -344,6 +360,17 @@ fn version_of(entry: &ObservedEntry) -> String {
                 .map_or_else(|| "-".to_string(), |size| size.to_string())
         )
     })
+}
+
+/// ` identity=<strength>:<first 8 bytes of the identity key, hex>`.
+fn identity_of(entry: &ObservedEntry) -> String {
+    let key = entry.identity_key().as_bytes()[..8]
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+    format!(" identity={:?}:{key}", entry.source_identity().strength())
 }
 
 async fn ndx_walk_pages(storage: &Storage, args: &Args, command: &Command) -> Result<(), Error> {

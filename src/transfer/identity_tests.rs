@@ -359,7 +359,7 @@ fn a_source_change_keeps_the_identity_and_changes_the_binding() -> TestResult {
 
 /// One label reused for two sources or two destinations must not share a binding, or a stage
 /// could be resumed into the wrong file. The source path matters even with an equal identity key:
-/// an S3 object's identity key is its `versionId` or `ETag`, so two keys with equal content share it.
+/// an S3 version's identity key is its `versionId`, which does not name its key.
 #[test]
 fn a_reused_label_binds_each_source_and_destination_separately() -> TestResult {
     let label = TransferIdentity::from_label("nightly")?;

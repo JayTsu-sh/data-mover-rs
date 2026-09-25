@@ -102,7 +102,7 @@ impl<P: S3Protocol + 'static> S3Metadata<P> {
         plan: ObservationPlan,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
         let facts = self.head(path, version).await?;
-        let observed = object_identity(&self.identity, &facts)
+        let observed = object_identity(&self.identity, path, &facts)
             .map_err(|e| entry(path, Operation::Metadata, e.to_string()))?;
         if observed != *expected {
             return Err(classified_entry(

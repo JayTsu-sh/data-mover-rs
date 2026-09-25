@@ -78,9 +78,24 @@ match aws_sdk_s3::operation::get_object::GetObjectError::from(...) {
 拷贝路径每个对象多一次 HEAD（describe、read 各已有一次；复用扫描期观测需要用户决定，暂不做）。
 真机（MinIO）：S3 → Local 的文件 mtime 与 HEAD 的 `Last-Modified` 逐秒相等；改前是拷贝时刻。
 
-对象在 describe 之后被替换（身份判定统一走 `source.rs` 的 `object_identity`：真实 versionId 标识版本，
-`"null"` / 空 / 无 versionId 以 ETag 标识）：`read`、native 的 `bind_source`、`observe_bound` 三处都报
-`Conflict` / Permanent（不是可重试的 Protocol / Unknown），按条目失败。
+对象在 describe 之后被替换（身份判定统一走 `source.rs` 的 `object_identity`：真实 versionId 标识版本
+（`VersionScoped`），`"null"` / 空 / 无 versionId 以**路径 + ETag** 标识（`PathScoped`，见下「身份包含路径」））：
+`read`、native 的 `bind_source`、`observe_bound` 三处都报 `Conflict` / Permanent（不是可重试的 Protocol / Unknown），
+按条目失败。
+
+### 身份包含路径（P7 评审现存问题 7 / Q28，破坏性）
+
+`PathScoped` 的契约（`model::IdentityStrength::PathScoped` 文档）：稳定字节**必须包含路径**。S3 以前只放 ETag，内容
+相同、路径不同的对象共用一个身份键（所有空对象都是 `d41d8cd98f00b204e9800998ecf8427e`），按身份键关联两次扫描的消费方
+（terrasync 的 `INNER JOIN`）会把它们交叉配对。现在没有真实版本的对象 —— `ListObjectsV2` 列出的当前对象、`"null"`
+版本、暂停版本桶的 `"null"` 删除标记 —— 稳定字节 = u32 大端路径长度 + 路径 + ETag（标记是固定标签），与 CIFS 无 file id
+时同一写法；构造只有一处（`source.rs` 的 `object_identity` / `path_etag_identity` / `path_scoped_bytes`），describe、
+两种列举、read、native 绑定、元数据观察、专家 `observation_matches` 都走它，所以列举到的对象与随后 describe 到的同一
+未变对象仍判为相等、被替换的对象仍被拒。无真实版本且无 ETag 的对象照旧拒绝（没有东西守护内容）。`VersionScoped`
+（真实 versionId）不变。**破坏性**：S3 所有 `PathScoped` 身份键一次性全变 —— 快照、terrasync 世代（升级后第一次扫描
+把这些条目看成删除 + 新增）、无真实版本的 S3 源的恢复绑定（这种源的可续传传输升级后从零开始，升级前排空）。
+测试 `backends::s3::tests::versions::the_same_content_at_two_keys_has_two_identities`（describe、列举、`"null"` 标记）；
+`storage_role_operations traverse --identity` 打印每条的强度与身份键前 8 字节。
 
 - **列举与 HEAD 精度不同**（MinIO 实测）：`ListObjects` 给毫秒（`04:30:34.882Z`），HEAD 只给秒
   （`04:30:34 GMT`）。拷贝落到目的端的是秒。上层若拿列举（legacy `walkdir` 的毫秒 i64，无精度标记）去比
@@ -624,6 +639,7 @@ SKILL.md）上跑出来的差异，以及各自的处理：
 | URL 中的 `:` 在 secret 里被切错 | secret 必须 percent-encode |
 | 把 MinIO 的 `NextKeyMarker`（`p/z[minio_cache:v2,return:]`）当 key 用 | 续页 token / marker 只原样回传（C20 / C22） |
 | 同一目录里对象 `a` 与前缀 `a/` 同名 | 按路径做键的消费方会撞；`NameBytes` 下对象在前（C22） |
+| `PathScoped` 身份只放内容事实（ETag） | 同内容不同 key 撞身份键；稳定字节必须含路径（Q28） |
 | Region 推断 | endpoint host 推断，必要时显式设 `AWS_REGION` |
 
 ## 测试

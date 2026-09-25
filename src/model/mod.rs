@@ -31,7 +31,7 @@ pub struct ModelValueError {
 }
 
 impl ModelValueError {
-    const fn new(field: &'static str, reason: &'static str) -> Self {
+    pub(crate) const fn new(field: &'static str, reason: &'static str) -> Self {
         Self { field, reason }
     }
 

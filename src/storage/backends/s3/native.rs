@@ -142,7 +142,7 @@ fn validate_identity(
     backend: &BackendIdentity,
     facts: &super::S3ObjectFacts,
 ) -> Result<(), StorageRoleFailure> {
-    let identity = object_identity(backend, facts)
+    let identity = object_identity(backend, &source.path, facts)
         .map_err(|error| entry(&source.path, Operation::Read, error.to_string()))?;
     if identity == source.source_identity {
         Ok(())
@@ -239,11 +239,12 @@ mod tests {
     #[test]
     fn a_changed_object_at_bind_is_a_permanent_conflict() -> Result<(), Box<dyn std::error::Error>>
     {
+        let path = StoragePath::new("source")?;
         let described = SourceDescriptor::new(
-            StoragePath::new("source")?,
+            path.clone(),
             EntryKind::File,
             Some(5),
-            object_identity(&identity(), &facts("\"before\""))?,
+            object_identity(&identity(), &path, &facts("\"before\""))?,
         );
         assert!(validate_identity(&described, &identity(), &facts("\"before\"")).is_ok());
         let Err(StorageRoleFailure::Entry(failure)) =

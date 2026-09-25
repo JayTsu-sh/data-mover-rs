@@ -19,7 +19,7 @@ use bytes::Bytes;
 
 use super::history::oldest_first;
 use super::paging::{ListingLimits, Paging};
-use super::source::{object_identity, role_failure};
+use super::source::{object_identity, path_scoped_bytes, role_failure};
 use super::{
     S3ListedObject, S3ListedVersion, S3ObjectFacts, S3Protocol, S3ProtocolFailure, S3VersionMarker,
     is_real_version_id,
@@ -429,16 +429,16 @@ pub(super) fn directory_descriptor(
 }
 
 /// A current object, or one stored version when `facts` names it. A stored version gets the
-/// identity `ReadSource::describe_version` gives it (`VersionScoped(id)`, or `PathScoped(ETag)` for
-/// `"null"`), so a bound observation recognises it. A current object from `ListObjectsV2` has no
-/// version id to carry, so it is `PathScoped(ETag)` even in a versioned bucket, where a describe
-/// pins `VersionScoped(id)`.
+/// identity `ReadSource::describe_version` gives it (`VersionScoped(id)`, or `PathScoped(path,
+/// ETag)` for `"null"`), so a bound observation recognises it. A current object from
+/// `ListObjectsV2` has no version id to carry, so it is `PathScoped(path, ETag)` even in a
+/// versioned bucket, where a describe pins `VersionScoped(id)`.
 pub(super) fn file_descriptor(
     identity: &BackendIdentity,
     path: StoragePath,
     facts: &S3ObjectFacts,
 ) -> Result<SourceDescriptor, EntryOperationFailure> {
-    let source_identity = object_identity(identity, facts)
+    let source_identity = object_identity(identity, &path, facts)
         .map_err(|_| child_failure(&path, FailureClass::Protocol, "invalid S3 object identity"))?;
     let mut descriptor =
         SourceDescriptor::new(path, EntryKind::File, Some(facts.size), source_identity);
@@ -497,9 +497,16 @@ fn marker_descriptor(
     last_modified: Option<StorageTimestamp>,
 ) -> Result<SourceDescriptor, EntryOperationFailure> {
     let (strength, bytes) = if is_real_version_id(version_id) {
-        (IdentityStrength::VersionScoped, version_id.as_bytes())
+        (
+            IdentityStrength::VersionScoped,
+            version_id.as_bytes().to_vec(),
+        )
     } else {
-        (IdentityStrength::PathScoped, NULL_MARKER_IDENTITY)
+        // Path-scoped identities include the path: every key's `"null"` marker is its own.
+        (
+            IdentityStrength::PathScoped,
+            path_scoped_bytes(&path, NULL_MARKER_IDENTITY),
+        )
     };
     let source_identity = SourceIdentity::new(identity.clone(), strength, bytes)
         .map_err(|_| child_failure(&path, FailureClass::Protocol, "invalid S3 marker identity"))?;

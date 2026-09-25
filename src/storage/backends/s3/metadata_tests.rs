@@ -35,7 +35,11 @@ fn modified() -> Result<StorageTimestamp> {
 
 async fn described(protocol: &MemoryS3, metadata: &S3Metadata<MemoryS3>) -> Result<SourceIdentity> {
     let facts = protocol.head(PATH).await.map_err(|_| "head failed")?;
-    Ok(object_identity(&metadata.identity, &facts)?)
+    Ok(object_identity(
+        &metadata.identity,
+        &StoragePath::new(PATH)?,
+        &facts,
+    )?)
 }
 
 #[tokio::test]

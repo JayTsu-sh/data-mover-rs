@@ -16,6 +16,14 @@ pub(super) use codec::{Cursor, decode_time, encode_time, put_bytes};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdentityStrength {
     /// Stable only while the entry remains at the same path.
+    ///
+    /// Contract: the stable bytes of a `PathScoped` identity **must include the path**: CIFS
+    /// without a file id and S3 (current objects, `"null"` versions and delete markers) put the
+    /// length-prefixed path before what identifies the content, HDFS a domain tag, the
+    /// length-prefixed path, size and mtime, Local off Unix the path alone. Content facts alone
+    /// (an S3 `ETag`, a size and time) are shared by entries at different paths — every empty S3
+    /// object has the same `ETag` — and would give them one identity key, so a consumer joining
+    /// two scans by identity key would cross-match them.
     PathScoped,
     /// Stable within the connected backend namespace.
     StableWithinBackend,
@@ -65,7 +73,8 @@ impl SourceIdentity {
     pub(crate) const fn backend(&self) -> &BackendIdentity {
         &self.backend
     }
-    /// Creates a backend-bound identity from stable opaque bytes.
+    /// Creates a backend-bound identity from stable opaque bytes. A `PathScoped` identity's bytes
+    /// must include the entry's path (see [`IdentityStrength::PathScoped`]).
     ///
     /// # Errors
     /// Returns an error when the bytes are empty or exceed the snapshot field limit.
@@ -101,6 +110,9 @@ impl SourceIdentity {
     /// consumer may use as a `file_handle`-style join key across scans. `None` for
     /// `PathScoped` and `VersionScoped` identities: their bytes change with the path or the
     /// object version, so joining on them would turn every rename into a delete plus a create.
+    /// A `PathScoped` identity's bytes always include the path, so its identity key is never
+    /// shared by two paths; still, only `StableWithinBackend` identities are rename-stable join
+    /// keys.
     #[must_use]
     pub fn stable_bytes(&self) -> Option<&[u8]> {
         matches!(self.strength, IdentityStrength::StableWithinBackend)

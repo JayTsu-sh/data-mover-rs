@@ -1,6 +1,6 @@
 //! The expert halves fed an observation the way the S3 traversal makes it (ADR-0006 C22): from a
 //! delimiter listing, not a describe. A listing of current objects has no version id, so on a
-//! versioned bucket the observation (`PathScoped(ETag)`) and the describe (`VersionScoped(id)`)
+//! versioned bucket the observation (`PathScoped(path, ETag)`) and the describe (`VersionScoped(id)`)
 //! differ in identity while naming the same object.
 
 use std::error::Error;

@@ -4,7 +4,8 @@
 use futures::StreamExt as _;
 
 use super::*;
-use crate::model::{FailureClass, SourceVersion};
+use crate::model::{EntryKind, FailureClass, IdentityStrength, SourceVersion};
+use crate::storage::backends::s3::source::path_scoped_bytes;
 use crate::storage::{ReadSource, SourceDescriptor, StorageRoleFailure};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -156,6 +157,120 @@ async fn a_store_ignoring_the_version_id_is_refused() -> TestResult {
     assert!(
         matches!(&result, Err(StorageRoleFailure::Entry(failure)) if failure.class() == FailureClass::Unsupported),
         "{result:?}"
+    );
+    Ok(())
+}
+
+/// `PathScoped` identities include the path (P7 review, existing issue 7 / Q28): two keys holding
+/// the same bytes — every empty object has the same `ETag` — never share an identity key, whether
+/// listed or described, and the listing and a describe of one unchanged object still agree. The
+/// `"null"` delete markers of a suspended bucket are one per key too.
+#[tokio::test]
+async fn the_same_content_at_two_keys_has_two_identities() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    for key in ["a", "b", "d/a"] {
+        let empty = Bytes::new();
+        protocol
+            .put_object(key, empty.clone(), &content_md5(&empty))
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+    }
+    let storage = connect(protocol.clone(), identity(), None)?;
+    let source = storage.read_source(&validation_policy())?;
+    let mut keys = std::collections::HashSet::new();
+    for key in ["a", "b", "d/a"] {
+        let described = source.describe(&StoragePath::new(key)?).await?;
+        assert_eq!(
+            described.source_identity.strength(),
+            IdentityStrength::PathScoped
+        );
+        assert!(
+            keys.insert(described.source_identity.identity_key()),
+            "{key}"
+        );
+    }
+    let namespace = storage.namespace(&validation_policy())?;
+    let listing = namespace
+        .execute(crate::storage::NamespaceRequest::List(StoragePath::root()))
+        .await?;
+    let (entries, _) = listing.into_listing().ok_or("not a listing")?;
+    for listed in entries.iter().filter(|entry| entry.kind == EntryKind::File) {
+        let described = source.describe(&listed.path).await?;
+        assert_eq!(listed.source_identity, described.source_identity);
+    }
+
+    protocol.set_versioning(Versioning::Suspended);
+    for key in ["a", "b"] {
+        protocol
+            .delete_object(key)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+    }
+    let markers: Vec<SourceDescriptor> = namespace
+        .list_versions(&StoragePath::root())
+        .await?
+        .into_listing()
+        .ok_or("not a listing")?
+        .0
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .listing
+                .version
+                .as_ref()
+                .is_some_and(|v| v.is_delete_marker())
+        })
+        .collect();
+    assert_eq!(markers.len(), 2);
+    assert_ne!(
+        markers[0].source_identity.identity_key(),
+        markers[1].source_identity.identity_key()
+    );
+    Ok(())
+}
+
+/// A listed identity names its path: the expert revalidation never takes an object listed at one
+/// key for a describe of another key with the same bytes (a versioned describe goes through the
+/// `ETag` override, so that is where a path mix-up would slip in).
+#[tokio::test]
+async fn a_listed_identity_never_matches_another_keys_describe() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
+    for key in ["a", "b"] {
+        let bytes = Bytes::from_static(b"same");
+        protocol
+            .put_object(key, bytes.clone(), &content_md5(&bytes))
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+    }
+    let storage = connect(protocol.clone(), identity(), None)?;
+    let source = storage.read_source(&validation_policy())?;
+    let listing = storage
+        .namespace(&validation_policy())?
+        .execute(crate::storage::NamespaceRequest::List(StoragePath::root()))
+        .await?;
+    let (entries, _) = listing.into_listing().ok_or("not a listing")?;
+    let listed_a = entries
+        .iter()
+        .find(|entry| entry.path.as_str() == "a")
+        .ok_or("a not listed")?;
+    let described_a = source.describe(&StoragePath::new("a")?).await?;
+    let described_b = source.describe(&StoragePath::new("b")?).await?;
+    assert_eq!(
+        described_b.source_identity.strength(),
+        IdentityStrength::VersionScoped
+    );
+    assert!(source.observation_matches(&listed_a.source_identity, &described_a));
+    assert!(!source.observation_matches(&listed_a.source_identity, &described_b));
+    Ok(())
+}
+
+/// The path is length-prefixed, so no path / `ETag` split can spell another's bytes.
+#[test]
+fn the_path_is_length_prefixed() -> TestResult {
+    assert_ne!(
+        path_scoped_bytes(&StoragePath::new("ab")?, b"c"),
+        path_scoped_bytes(&StoragePath::new("a")?, b"bc")
     );
     Ok(())
 }

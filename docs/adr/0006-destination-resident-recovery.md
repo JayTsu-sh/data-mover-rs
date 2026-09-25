@@ -120,6 +120,21 @@ wants a UUID) answers the versioned HEAD with a bare 400, which carries no code 
 session-level mapping — S3 answers expired tokens and wrong regions with 400 too. One mistyped id
 therefore fails the session, not just its entry. Follow-up: on a versioned HEAD 400, repeat the
 request as a ranged GET, whose error body names `InvalidArgument`.
+Follow-up (P7 review, existing issue 7 / Q28; breaking): an S3 object without a real version — a
+current object as `ListObjectsV2` lists it, the `"null"` version, and a suspended bucket's `"null"`
+delete marker — was `PathScoped` with the `ETag` alone as its stable bytes, so objects with the same
+content at two keys (every empty object: `d41d8cd98f00b204e9800998ecf8427e`) shared one identity key,
+and a consumer joining scans by identity key (terrasync's `INNER JOIN`) cross-matched them. The stable
+bytes are now the path (u32 big-endian length, then the bytes) followed by the `ETag` (the marker: a
+fixed tag), as CIFS spells a path-scoped identity; `IdentityStrength::PathScoped` documents the
+contract (the stable bytes must include the path — HDFS, CIFS without a file id and Local off Unix
+already did). One constructor (`s3/source.rs` `object_identity` / `path_etag_identity`) serves
+describe, the listings, `read`, the native bind, the metadata observation and the expert
+`observation_matches`, so a listed object still validates against a later describe and a replaced
+one is still refused. `VersionScoped` (a real version id) is unchanged. Consequence: every S3
+`PathScoped` identity key changes once — snapshots, terrasync generations (the first scan after the
+upgrade sees each such entry as deleted and added), and the recovery binding of an S3 source without
+a real version (an interrupted resumable transfer from one restarts from zero: drain first).
 History migration (documented, not a feature): the caller submits `Id` transfers oldest to newest,
 one at a time; each creates one destination version; delete-marker replication is the caller's choice.
 As built (C20): the procedure and its limits are written down in the architecture document ("S3
@@ -797,6 +812,11 @@ zero-byte `d/` is skipped; 1 015 entries in `All`, 1 008 in `Current`, 5 directo
 - Traversal (C22): `TraversalRequest` gains the public `versions` field (every literal names it);
   S3 lends a `Namespace` role (`Stat` / `List` / `list_versions`; mutations refused) and
   `ObservedEntry` gains `version()` / `source_version()`; version entries snapshot as v6.
+- S3 identity (P7 review Q28, C6 follow-up): the `PathScoped` identity of an S3 object without a
+  real version includes its path, so every such identity key changes once — snapshots, terrasync
+  generations (one scan sees those entries as deleted and added) and recovery bindings (drain
+  resumable transfers from unversioned S3 sources before upgrading). `VersionScoped` keys are
+  unchanged.
 - Every listing hides `.data-mover-*` names (any path segment), so a user object named that way is no
   longer seen as a source entry; the same name must be hidden on every backend, or a mirror could treat
   it as an extra destination file.

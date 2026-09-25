@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::model::{
-    BackendIdentity, EntryKind, FailureClass, IdentityStrength, Operation, SourceIdentity,
-    SourceVersion, StoragePath, Transience,
+    BackendIdentity, EntryKind, FailureClass, IdentityStrength, ModelValueError, Operation,
+    SourceIdentity, SourceVersion, StoragePath, Transience,
 };
 use crate::storage::ListingFacts;
 use crate::storage::{ByteStream, ReadRequest, ReadSource, SourceDescriptor, StorageRoleFailure};
@@ -72,21 +72,54 @@ impl<P: S3Protocol + 'static> S3ReadSource<P> {
     }
 }
 
+/// The identity of the object at `path` as `facts` describe it: `VersionScoped(version id)` for a
+/// real version, otherwise `PathScoped(path, ETag)` — the `"null"` version can be replaced, so its
+/// `ETag` stays part of the identity, and the path keeps two objects with the same content at two
+/// keys (every empty object has the same `ETag`) from sharing one identity key. An object without
+/// an `ETag` and without a real version has nothing to guard its content and is refused.
 pub(super) fn object_identity(
     backend: &BackendIdentity,
+    path: &StoragePath,
     facts: &super::S3ObjectFacts,
-) -> Result<SourceIdentity, crate::model::ModelValueError> {
-    // The null version can be replaced; its ETag must remain part of source identity.
-    let version = real_version(facts);
+) -> Result<SourceIdentity, ModelValueError> {
+    match real_version(facts) {
+        Some(version) => {
+            SourceIdentity::new(backend.clone(), IdentityStrength::VersionScoped, version)
+        }
+        None => path_etag_identity(backend, path, &facts.etag),
+    }
+}
+
+/// `PathScoped` identity of the current (or `"null"`) object at `path` with `etag`: the path's
+/// length (u32, big-endian), the path, then the `ETag` — the length-prefixed path layout of the
+/// CIFS path-scoped identity. An empty `ETag` is refused, as before the path was included.
+pub(super) fn path_etag_identity(
+    backend: &BackendIdentity,
+    path: &StoragePath,
+    etag: impl AsRef<[u8]>,
+) -> Result<SourceIdentity, ModelValueError> {
+    let etag = etag.as_ref();
+    if etag.is_empty() {
+        return Err(ModelValueError::new(
+            "source_identity",
+            "an S3 object without a version has no ETag to identify it",
+        ));
+    }
     SourceIdentity::new(
         backend.clone(),
-        if version.is_some() {
-            IdentityStrength::VersionScoped
-        } else {
-            IdentityStrength::PathScoped
-        },
-        version.unwrap_or(&facts.etag),
+        IdentityStrength::PathScoped,
+        path_scoped_bytes(path, etag),
     )
+}
+
+/// `path` length-prefixed (u32, big-endian), then `tail`.
+pub(super) fn path_scoped_bytes(path: &StoragePath, tail: &[u8]) -> Vec<u8> {
+    let path = path.as_str().as_bytes();
+    let mut bytes = Vec::with_capacity(4 + path.len() + tail.len());
+    bytes.extend_from_slice(&u32::try_from(path.len()).unwrap_or(u32::MAX).to_be_bytes());
+    bytes.extend_from_slice(path);
+    bytes.extend_from_slice(tail);
+    bytes
 }
 
 #[async_trait]
@@ -128,7 +161,7 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
                 "the S3 store did not answer with the requested version",
             ));
         }
-        let source_identity = object_identity(&self.identity, &facts)
+        let source_identity = object_identity(&self.identity, path, &facts)
             .map_err(|e| entry(path, Operation::Observe, e.to_string()))?;
         Ok(SourceDescriptor {
             path: path.clone(),
@@ -146,9 +179,10 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
     }
 
     /// A listing of current objects cannot see a version id, so it identifies an object by its
-    /// `ETag` (`PathScoped`), where a describe on a versioned bucket pins the version
-    /// (`VersionScoped`). The two name the same object when the listed `ETag` is the described
-    /// version's `ETag`; any other difference — another `ETag`, another version — does not match.
+    /// path and `ETag` (`PathScoped`), where a describe on a versioned bucket pins the version
+    /// (`VersionScoped`). The two name the same object when the listed identity is the described
+    /// path with the described version's `ETag`; any other difference — another `ETag`, another
+    /// version, another path — does not match.
     fn observation_matches(&self, observed: &SourceIdentity, described: &SourceDescriptor) -> bool {
         if observed == &described.source_identity {
             return true;
@@ -157,7 +191,7 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             return false;
         };
         observed.strength() == IdentityStrength::PathScoped
-            && SourceIdentity::new(self.identity.clone(), IdentityStrength::PathScoped, etag)
+            && path_etag_identity(&self.identity, &described.path, etag)
                 .is_ok_and(|listed| &listed == observed)
     }
 
@@ -175,7 +209,7 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
         let facts = self
             .head(&request.path, &request.version, Operation::Read)
             .await?;
-        let opened_identity = object_identity(&self.identity, &facts)
+        let opened_identity = object_identity(&self.identity, &request.path, &facts)
             .map_err(|e| entry(&request.path, Operation::Read, e.to_string()))?;
         if request
             .expected_source

@@ -47,6 +47,11 @@
    同内容对象交叉配对成 N×N 行、全被当成改名或变更。修法：契约写明「`PathScoped` 的稳定字节必须包含路径」，S3 改为路径 + ETag
    （与 HDFS / CIFS 一致）；terrasync 只对 `StableWithinBackend` 按身份键关联（只写进设计）。代价：已有扫描里 S3 条目的身份键全变，
    下一次扫描一次性看成「新增 + 删除」。（Q28）
+   **已修**（`fix(s3)!: PathScoped 身份包含路径`）：`IdentityStrength::PathScoped` 文档写明契约；S3 当前对象、
+   `"null"` 版本（`source.rs` `object_identity` / `path_etag_identity`）与 `"null"` 删除标记（`listing.rs`）的稳定字节改为
+   u32 大端路径长度 + 路径 + ETag（与 CIFS 同一写法）；describe / 列举 / read / native 绑定 / 元数据观察 / 专家
+   `observation_matches` 全走同一构造，`VersionScoped`（真版本号）不变。破坏性：S3 `PathScoped` 条目的身份键（快照、
+   terrasync 世代、恢复绑定）一次性全变。
 8. **版本与删除标记交错时按 LastModified 合并，并发写入时排错**：aws-sdk-s3 把 `<Version>` 与 `<DeleteMarker>` 解析成两个列表，丢了
    交错顺序（`src/s3/role_protocol/versions.rs:107,123`），`history.rs`（C22）与 legacy `version_listing.rs`（C20）只能按时间合并。MinIO
    实测（RELEASE.2023-03-20，临时桶已删）：同一 key 并发 12 PUT + 4 DELETE 三轮，44 条记录里 20 条与别的记录毫秒级同时，服务端
@@ -112,7 +117,7 @@
 | Q25 | 名字语义查不到（`Unknown`）时按「不敏感」处理，不据字节差异删除 | 是 |
 | Q26 | 用 `GetBucketVersioning` 判定多版本桶（`Enabled` / `Suspended` 列全部历史，从未开过走 ListObjectsV2），查询被拒时一律列全部历史 | 同意 |
 | Q27 | terrasync 落库时把一个对象的历史展开成每版本一行（沿用 base 表按 `(relative_path, version_id, identity_key)` 的结构） | 每版本一行 |
-| Q28 | 现存问题 7（S3 身份缺路径）独立先修 | 先修 |
+| Q28 | 现存问题 7（S3 身份缺路径）独立先修 | 先修 —— 已修（`fix(s3)!: PathScoped 身份包含路径`） |
 | Q29 | 现存问题 8（版本历史并发排错）按原始 XML 顺序独立先修 | 先修 |
 | Q30 | 在 DXN 与 StorageGRID 上跑同一组版本顺序测试（临时桶，跑完删光） | 待批准（StorageGRID 只批过前缀写入、未批建桶） |
 

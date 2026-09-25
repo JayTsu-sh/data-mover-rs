@@ -115,8 +115,9 @@ pub(crate) struct BindingSource<'a> {
 /// The recovery binding: the transfer identity, which source entry and what it looked like, and
 /// where the stage lands. The source path and the destination are repeated although a derived
 /// identity already names them: a label override names neither, and the source identity key does
-/// not always name the entry (an S3 object's is its `versionId` or `ETag`, not its key). One label
-/// reused for two sources or two destinations must not share a binding.
+/// not always name the entry (an S3 version's is its `versionId`, not its key; a `PathScoped`
+/// identity includes the path, but a caller may supply any identity). One label reused for two
+/// sources or two destinations must not share a binding.
 pub(crate) fn binding_hash(
     identity: &TransferIdentity,
     source: &BindingSource<'_>,
