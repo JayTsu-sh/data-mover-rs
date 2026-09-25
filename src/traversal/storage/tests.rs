@@ -9,7 +9,7 @@ use crate::model::{
     SymlinkTarget, SymlinkTargetEncoding, TimestampMetadata,
 };
 use crate::storage::ListingFacts;
-use crate::storage::{MetadataMutation, NamespaceRequest};
+use crate::storage::{MetadataMutation, NamespaceRequest, NamespaceResult};
 
 struct FakeNamespace;
 struct FakeMetadata;
@@ -467,10 +467,12 @@ async fn the_admission_window_bounds_entries_waiting_to_be_emitted_not_only_infl
     ));
 }
 
+mod bench;
 mod cancel;
 mod events;
 mod filter;
 mod order;
+mod pages;
 mod prefetch;
 mod residency;
 mod slots;

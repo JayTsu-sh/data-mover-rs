@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::JoinSet;
 
 use super::{
     ChildOrder, TraversalCandidate, TraversalCompletion, TraversalDecision, TraversalFilter,
@@ -14,8 +16,8 @@ use crate::model::{
     ObservationPlan, ObservedEntry, Operation, StoragePath, Transience,
 };
 use crate::storage::{
-    CapabilityUnavailable, Metadata, Namespace, NamespaceResult, PreflightPolicy, SourceDescriptor,
-    Storage, StorageRoleFailure,
+    CapabilityUnavailable, Metadata, Namespace, PreflightPolicy, SourceDescriptor, Storage,
+    StorageRoleFailure,
 };
 
 mod cursor;
@@ -24,8 +26,8 @@ mod output;
 #[cfg(test)]
 mod residency;
 
-use cursor::{Cursor, Step};
-use observe::observe;
+use cursor::{Arrival, Cursor, Decisions, Step};
+use observe::{Feed, Job, Listed, Observations, Observed};
 use output::{BlockFacts, ChildDescent, Output, Settled};
 #[cfg(test)]
 use residency::ResidencyPeak;
@@ -34,11 +36,40 @@ use residency::ResidencyPeak;
 ///
 /// A field rather than a `#[cfg(test)]` parameter so the one call site stays single: outside
 /// tests this is a zero-sized type, cloning it is free, and [`Cursor::residency`] does not
-/// exist at all, so nothing walks the stack in a release build.
+/// exist at all, so nothing walks the stack in a release build. In tests only a source built
+/// with [`StorageTraversalSource::with_roles_probed`] samples: a sample walks every held
+/// block, which would otherwise dominate any test that times the driver.
 #[derive(Clone, Default)]
 struct Probe {
     #[cfg(test)]
-    peak: Arc<ResidencyPeak>,
+    peak: Option<Arc<ResidencyPeak>>,
+    /// Observation tasks the traversal started, for the tests that count hand-offs.
+    #[cfg(test)]
+    observers: Option<Arc<ObserverCounts>>,
+}
+
+#[cfg(test)]
+impl Probe {
+    fn record_observers(&self, observations: &Observations) {
+        if let Some(observers) = self.observers.as_ref() {
+            observers
+                .started
+                .store(observations.spawned, Ordering::SeqCst);
+            observers
+                .peak_held
+                .store(observations.peak_held, Ordering::SeqCst);
+        }
+    }
+}
+
+/// What a counting source records about its observation tasks when a traversal ends.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ObserverCounts {
+    /// Tasks started.
+    started: AtomicUsize,
+    /// The most tasks held at once, finished ones included.
+    peak_held: AtomicUsize,
 }
 
 /// Protocol-neutral traversal assembled from one connected storage's namespace and metadata roles.
@@ -77,9 +108,23 @@ impl StorageTraversalSource {
         namespace: Arc<dyn Namespace>,
         metadata: Arc<dyn Metadata>,
     ) -> (Self, Arc<ResidencyPeak>) {
-        let source = Self::with_roles(namespace, metadata);
-        let peak = Arc::clone(&source.probe.peak);
+        let mut source = Self::with_roles(namespace, metadata);
+        let peak = Arc::new(ResidencyPeak::default());
+        source.probe.peak = Some(Arc::clone(&peak));
         (source, peak)
+    }
+
+    /// Same as [`Self::with_roles`], plus a count of the observation tasks each traversal
+    /// started, stored when it ends.
+    #[cfg(test)]
+    fn with_roles_counting(
+        namespace: Arc<dyn Namespace>,
+        metadata: Arc<dyn Metadata>,
+    ) -> (Self, Arc<ObserverCounts>) {
+        let mut source = Self::with_roles(namespace, metadata);
+        let observers = Arc::new(ObserverCounts::default());
+        source.probe.observers = Some(Arc::clone(&observers));
+        (source, observers)
     }
 }
 
@@ -150,13 +195,7 @@ struct Deferred {
     kind: EntryKind,
 }
 
-type ObservationTask = JoinSet<(
-    u64,
-    Result<ObservedEntry, StorageRoleFailure>,
-    Option<Deferred>,
-)>;
-
-type ListingTask = JoinSet<(StoragePath, Result<NamespaceResult, StorageRoleFailure>)>;
+type ListingTask = JoinSet<(StoragePath, Arrival)>;
 
 /// Output sequencing: every admitted entry and every queued listing failure owns one sequence
 /// number, assigned in output order by the cursor. Allocation lives here; releasing the slots
@@ -230,11 +269,18 @@ impl Policy {
     }
 }
 
-struct Runtime<'a> {
-    namespace: &'a Arc<dyn Namespace>,
-    metadata: &'a Arc<dyn Metadata>,
-    request: &'a TraversalRequest,
+/// What the driver and the tasks it starts share for one traversal.
+struct Shared {
+    namespace: Arc<dyn Namespace>,
+    metadata: Arc<dyn Metadata>,
+    request: TraversalRequest,
     policy: Policy,
+}
+
+struct Runtime<'a> {
+    shared: &'a Arc<Shared>,
+    request: &'a TraversalRequest,
+    policy: &'a Policy,
     items: &'a mpsc::Sender<TraversalItem>,
 }
 
@@ -258,32 +304,42 @@ async fn run(
             TraversalOrder::NameBytes => ChildOrder::NameBytes,
         },
     );
-    let mut tasks = JoinSet::new();
+    let mut observations = Observations::new();
     let mut listings = JoinSet::new();
-    let runtime = Runtime {
-        namespace: &namespace,
-        metadata: &metadata,
-        request: &request,
+    let shared = Arc::new(Shared {
+        namespace,
+        metadata,
         policy: Policy::new(&request),
+        request,
+    });
+    let runtime = Runtime {
+        shared: &shared,
+        request: &shared.request,
+        policy: &shared.policy,
         items: &items,
     };
     let result = drive(
         &runtime,
         &mut cursor,
         &mut listings,
-        &mut tasks,
+        &mut observations,
         &mut state,
         &probe,
     )
     .await;
+    #[cfg(test)]
+    probe.record_observers(&observations);
     // Never abort a backend operation: it may hold an open handle between two awaits (a CIFS
     // listing holds its directory handle, a CIFS observation opens, reads attributes, then
     // closes), and dropping the future there leaks it. Detached operations run to completion in
     // the background and close what they opened; their results are simply discarded, and both
-    // sets are bounded by the request's budgets.
-    tasks.detach_all();
+    // sets are bounded by the request's budgets. Dropping the cursor drops every block's feed,
+    // which is what lets each observation task end once it has drained.
+    observations.detach();
     listings.detach_all();
+    drop(cursor);
     drop(items);
+    let request = &shared.request;
     let terminal = if request.cancel.is_cancelled() {
         Ok(TraversalOutcome::Cancelled)
     } else {
@@ -304,7 +360,7 @@ async fn drive(
     runtime: &Runtime<'_>,
     cursor: &mut Cursor,
     listings: &mut ListingTask,
-    tasks: &mut ObservationTask,
+    observations: &mut Observations,
     state: &mut State,
     probe: &Probe,
 ) -> Result<(), TraversalTerminalFailure> {
@@ -315,41 +371,55 @@ async fn drive(
         if runtime.request.cancel.is_cancelled() {
             return Ok(());
         }
-        let step = cursor.advance(runtime, tasks, state)?;
+        // Takes every listing that finished meanwhile, not only the one the cursor may be
+        // waiting for: a prefetched directory's subdirectories are only known, and prefetched in
+        // turn, once its block has been taken from its task.
+        while let Some(joined) = listings.try_join_next() {
+            let (path, arrival) = joined.map_err(|_| TraversalTerminalFailure::Internal)?;
+            cursor.listed(&path, arrival)?;
+        }
+        let step = cursor.advance(runtime, observations, state)?;
         cursor.start_listings(runtime, listings);
         // After `start_listings`, so the listings it just began count towards the peak; before
         // `flush`, so the sample is taken while the block is still held rather than after the
         // reorder buffer has drained it.
         #[cfg(test)]
-        probe.peak.record(cursor.residency());
+        if let Some(peak) = probe.peak.as_ref() {
+            peak.record(cursor.residency());
+        }
         state.output.flush(runtime).await?;
         match step {
-            Step::Done if tasks.is_empty() => return Ok(()),
+            Step::Done if observations.is_idle() => return Ok(()),
             // Nothing in flight means every admitted entry has settled, so the flush above
             // emitted them all and the window is open again.
-            Step::WindowFull if tasks.is_empty() => {}
-            _ => wait(runtime, cursor, listings, tasks, state).await?,
+            Step::WindowFull if observations.is_idle() => {}
+            _ => wait(runtime, cursor, listings, observations, state).await?,
         }
     }
 }
 
-/// Waits for one listing or one observation to finish, or for cancellation.
+/// Waits for one listing or some observations to finish, or for cancellation. Observations that
+/// arrived together are settled together, so a burst costs the driver one pass.
 async fn wait(
     runtime: &Runtime<'_>,
     cursor: &mut Cursor,
     listings: &mut ListingTask,
-    tasks: &mut ObservationTask,
+    observations: &mut Observations,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
     tokio::select! {
         biased;
         () = runtime.request.cancel.cancelled() => Ok(()),
         Some(joined) = listings.join_next(), if !listings.is_empty() => {
-            let (path, result) = joined.map_err(|_| TraversalTerminalFailure::Internal)?;
-            cursor.listed(runtime, &path, result)
+            let (path, arrival) = joined.map_err(|_| TraversalTerminalFailure::Internal)?;
+            cursor.listed(&path, arrival)
         }
-        Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
-            settle(runtime, cursor, state, joined)
+        observed = observations.next(), if !observations.is_idle() => {
+            settle(runtime, cursor.decisions(), state, observed?)?;
+            while let Some(observed) = observations.ready() {
+                settle(runtime, cursor.decisions(), state, observed)?;
+            }
+            Ok(())
         }
         // The cursor only waits on work it started, so this means that invariant broke.
         else => Err(TraversalTerminalFailure::Internal),
@@ -362,15 +432,15 @@ async fn wait(
 /// waits for the child's observation. Made once per child, when the listing arrives, so that a
 /// prefetched directory's subdirectories are known before the cursor reaches it.
 fn immediate_decision(
-    runtime: &Runtime<'_>,
+    shared: &Shared,
     parent: &DirectoryWork,
     descriptor: &SourceDescriptor,
 ) -> Option<TraversalDecision> {
-    if runtime.policy.deferred && parent.filter_children {
+    if shared.policy.deferred && parent.filter_children {
         return None;
     }
     let candidate = TraversalCandidate {
-        path: relative_to(&runtime.request.root, &descriptor.path),
+        path: relative_to(&shared.request.root, &descriptor.path),
         name: entry_name(&descriptor.path),
         kind: descriptor.kind,
         size: descriptor.size,
@@ -378,52 +448,56 @@ fn immediate_decision(
             .inline_timestamps
             .and_then(|value| value.modified),
     };
-    Some(runtime.policy.decide(parent.filter_children, &candidate))
+    Some(shared.policy.decide(parent.filter_children, &candidate))
 }
 
-/// Admits one listed child: spawns its observation, or drops it. `decision` is the child's
-/// [`immediate_decision`].
+/// Admits one listed child into its output slot: settles it at once when its listing's task
+/// already observed it, or hands it to its block's observation task. `decision` is the child's
+/// [`immediate_decision`]; a child that decision hides was only counted, and never gets here.
 ///
-/// Where an immediate decision descends to was settled when the listing arrived, so this only
-/// tallies what an output slot cannot show: a child the filter hides never gets one, and the
-/// output side would never see it. A deferred decision still needs a slot here, because the slot
-/// is keyed by the sequence this function allocates.
+/// Where an immediate decision descends to was settled when the listing arrived. A deferred
+/// decision still needs a slot here, because the slot is keyed by the sequence this function
+/// allocates.
 fn admit(
     runtime: &Runtime<'_>,
-    parent: &DirectoryWork,
+    block: &mut Admitting<'_>,
     child: cursor::Child,
-    cursor_slots: &mut VecDeque<cursor::Slot>,
-    facts: &mut BlockFacts,
-    tasks: &mut ObservationTask,
+    decisions: &mut Decisions,
+    observations: &mut Observations,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
     let cursor::Child {
-        descriptor,
+        kind,
+        listed,
         decision,
     } = child;
-    let depth = parent.child_depth;
-    if let Some(decision) = decision
-        && !decision.emit
-    {
-        facts.hidden = facts.hidden.saturating_add(1);
-        return Ok(());
-    }
     let sequence = state.allocate()?;
-    let context = decision.is_none().then_some(Deferred {
-        depth,
-        kind: descriptor.kind,
+    let deferred = decision.is_none().then_some(Deferred {
+        depth: block.work.child_depth,
+        kind,
     });
-    if context.is_some_and(|context| awaits_slot(runtime.request, context)) {
-        cursor_slots.push_back(cursor::Slot::Pending(sequence));
+    if deferred.is_some_and(|deferred| awaits_slot(runtime.request, deferred)) {
+        block.slots.push_back(cursor::Slot::Pending(sequence));
     }
-    let namespace = Arc::clone(runtime.namespace);
-    let metadata = Arc::clone(runtime.metadata);
-    let plan = runtime.policy.observation_plan;
-    tasks.spawn(async move {
-        let result = observe(namespace, metadata, descriptor, plan).await;
-        (sequence, result, context)
-    });
-    Ok(())
+    match listed {
+        Listed::Observed(result) => settle(runtime, decisions, state, (sequence, result, deferred)),
+        Listed::Unobserved(descriptor) => observations.start(
+            runtime.shared,
+            block.feed,
+            Job {
+                sequence,
+                descriptor,
+                deferred,
+            },
+        ),
+    }
+}
+
+/// The parts of the block being admitted that admitting one of its children writes to.
+struct Admitting<'a> {
+    work: &'a DirectoryWork,
+    slots: &'a mut VecDeque<cursor::Slot>,
+    feed: &'a mut Option<Feed>,
 }
 
 /// Whether a deferred child can be descended into at all, so its decision fills a slot.
@@ -488,22 +562,15 @@ fn entry_name(path: &StoragePath) -> &str {
     path.as_str().rsplit('/').next().unwrap_or_default()
 }
 
-type Joined = Result<
-    (
-        u64,
-        Result<ObservedEntry, StorageRoleFailure>,
-        Option<Deferred>,
-    ),
-    JoinError,
->;
-
+/// Puts one observation into its output slot, and records the descend decision a deferred one
+/// makes.
 fn settle(
     runtime: &Runtime<'_>,
-    cursor: &mut Cursor,
+    decisions: &mut Decisions,
     state: &mut State,
-    joined: Joined,
+    observed: Observed,
 ) -> Result<(), TraversalTerminalFailure> {
-    let (sequence, result, deferred) = joined.map_err(|_| TraversalTerminalFailure::Internal)?;
+    let (sequence, result, deferred) = observed;
     let (item, below) = match result {
         Ok(entry) => settle_entry(runtime, entry, deferred),
         Err(StorageRoleFailure::Entry(error)) => settle_failure(runtime, error, deferred),
@@ -514,7 +581,7 @@ fn settle(
     let descent =
         deferred.and_then(|deferred| deferred_descent(runtime.request, deferred, below.is_some()));
     if deferred.is_some_and(|deferred| awaits_slot(runtime.request, deferred)) {
-        cursor.decide(sequence, below);
+        decisions.insert(sequence, below);
     }
     state
         .output
@@ -543,11 +610,11 @@ fn settle_failure(
 /// Applies a deferred decision now that the observation (and therefore `modified`) is known.
 fn settle_entry(
     runtime: &Runtime<'_>,
-    entry: ObservedEntry,
+    entry: Box<ObservedEntry>,
     deferred: Option<Deferred>,
 ) -> (Option<TraversalItem>, Option<DirectoryWork>) {
     let Some(deferred) = deferred else {
-        return (Some(TraversalItem::Entry(Box::new(entry))), None);
+        return (Some(TraversalItem::Entry(entry)), None);
     };
     let candidate = TraversalCandidate {
         path: relative_to(&runtime.request.root, entry.path()),
@@ -564,7 +631,7 @@ fn settle_entry(
             filter_children: decision.filter_children,
         });
     (
-        decision.emit.then(|| TraversalItem::Entry(Box::new(entry))),
+        decision.emit.then_some(TraversalItem::Entry(entry)),
         descend,
     )
 }

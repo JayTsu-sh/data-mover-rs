@@ -9,8 +9,12 @@
 //! block's end marker comes up, every slot in that block has already gone past, deferred
 //! decisions included; and when a subtree's end marker comes up, so has every block below it.
 //! The cursor could only have estimated both.
+//!
+//! Most slots settle in order — every child its listing's task already observed settles the
+//! moment it is admitted — so a slot that is next in line goes straight onto a ready queue, and
+//! only one that settles ahead of an earlier one waits in the ordered map.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use super::Runtime;
 use crate::model::StoragePath;
@@ -21,9 +25,9 @@ use crate::traversal::{
 
 /// Where one child's own subtree went.
 ///
-/// A decision made when the listing arrived is tallied on the block as the child is admitted,
-/// because a child the filter hides never gets an output slot at all and would otherwise be
-/// invisible here. A deferred decision is not known until the child's observation settles, so
+/// A decision made when the listing arrived is tallied by the listing's task and carried on the
+/// block's facts, because a child the filter hides never gets an output slot at all and would
+/// otherwise be invisible here. A deferred decision is not known until the child's observation settles, so
 /// its slot carries the outcome and the tally happens at the block's end marker instead.
 #[derive(Clone, Copy)]
 pub(super) enum ChildDescent {
@@ -99,7 +103,9 @@ pub(super) struct Output {
     observed: u64,
     failed: u64,
     listed: u64,
-    /// Settled slots waiting for their turn.
+    /// Settled slots whose turn has come: `next`, `next + 1`, … in order, none missing.
+    ready: VecDeque<Settled>,
+    /// Settled slots waiting behind one that has not settled yet.
     pending: BTreeMap<u64, Settled>,
     block: BlockCounts,
     /// Directories whose block has ended, innermost last.
@@ -113,6 +119,7 @@ impl Output {
             observed: 0,
             failed: 0,
             listed: 0,
+            ready: VecDeque::new(),
             pending: BTreeMap::new(),
             block: BlockCounts::new(),
             open: Vec::new(),
@@ -137,7 +144,24 @@ impl Output {
     }
 
     pub(super) fn settle(&mut self, sequence: u64, settled: Settled) {
-        self.pending.insert(sequence, settled);
+        if sequence != self.ready_end() {
+            self.pending.insert(sequence, settled);
+            return;
+        }
+        self.ready.push_back(settled);
+        // The slot just settled may have been the gap that held later ones back.
+        while !self.pending.is_empty() {
+            let Some(settled) = self.pending.remove(&self.ready_end()) else {
+                break;
+            };
+            self.ready.push_back(settled);
+        }
+    }
+
+    /// The sequence the ready queue continues with.
+    fn ready_end(&self) -> u64 {
+        self.next
+            .saturating_add(u64::try_from(self.ready.len()).unwrap_or(u64::MAX))
     }
 
     /// Emits every settled slot that is next in sequence.
@@ -145,18 +169,20 @@ impl Output {
         &mut self,
         runtime: &Runtime<'_>,
     ) -> Result<(), TraversalTerminalFailure> {
-        while let Some(settled) = self.pending.remove(&self.next) {
+        while let Some(settled) = self.ready.pop_front() {
             let item = match settled {
                 Settled::Child { item, descent } => self.settle_child(item, descent),
                 Settled::BlockEnd { path, facts } => Some(self.close_block(path, facts)),
                 Settled::SubtreeEnd { path } => Some(self.end_subtree(&path)?),
             };
+            // Counted as passed before the send, so the ready queue keeps starting at `next`
+            // even when cancellation wins the send and ends the flush.
+            self.next += 1;
             if let Some(item) = item
                 && !self.emit(runtime, item).await?
             {
                 return Ok(());
             }
-            self.next += 1;
         }
         Ok(())
     }

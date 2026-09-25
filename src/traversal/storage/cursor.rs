@@ -13,19 +13,21 @@
 //! strictly by sequence. That is what makes the output deterministic for a given tree.
 //!
 //! Listings are prefetched ahead of the cursor in the same depth-first order. A listing is
-//! *prepared* when it arrives: each child's admission decision is made then (unless it waits for
-//! a deferred observation), so the subdirectories of a prefetched directory are known, and can
-//! be prefetched in turn, before the cursor reaches it.
+//! *prepared* by its own task as it arrives: each child's admission decision is made then
+//! (unless it waits for a deferred observation), so the subdirectories of a prefetched directory
+//! are known, and can be prefetched in turn, before the cursor reaches it; and every child that
+//! needs no I/O is observed then too, so the driver takes a finished block in one hand-off.
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+use super::observe::{Feed, Listed, Observations, observe_listed};
 use super::output::BlockFacts;
 #[cfg(test)]
 use super::residency::Residency;
 use super::{
-    DescendOutcome, DirectoryWork, ListingTask, ObservationTask, Runtime, State, admit,
+    Admitting, DescendOutcome, DirectoryWork, ListingTask, Runtime, Shared, State, admit,
     descend_outcome, entry_failure, entry_name, immediate_decision, queue_block_end, queue_failure,
     queue_subtree_end,
 };
@@ -55,15 +57,20 @@ pub(super) enum Slot {
     Pending(u64),
 }
 
-/// One listed child with the decision made when its listing arrived; `None` waits for a
-/// deferred observation.
+/// One listed child the output will show, with the decision made when its listing arrived;
+/// `None` waits for a deferred observation. A child an immediate decision hides never becomes
+/// one: it is only counted.
 pub(super) struct Child {
-    pub(super) descriptor: SourceDescriptor,
+    pub(super) kind: EntryKind,
+    pub(super) listed: Listed,
     pub(super) decision: Option<TraversalDecision>,
 }
 
+/// Deferred descend decisions by the sequence of the observation that settles them.
+pub(super) type Decisions = HashMap<u64, Option<DirectoryWork>>;
+
 /// A listing turned into a block, ready for the cursor.
-struct Prepared {
+pub(super) struct Prepared {
     failures: Vec<EntryOperationFailure>,
     children: VecDeque<Child>,
     /// Where the cursor goes after this block, in the block's own order.
@@ -77,11 +84,16 @@ struct Prepared {
     /// at. Counted here for the same reason the slots are built here.
     pruned: u64,
     truncated: u64,
+    /// Children an immediate decision kept out of the output.
+    hidden: u64,
 }
 
-/// A started listing: the directory, and its prepared result once it has arrived.
+/// What a listing's task hands the driver: the block, the directory's own failure, or the end
+/// of the session.
+pub(super) type Arrival = Result<Result<Prepared, EntryOperationFailure>, TraversalTerminalFailure>;
+
+/// A started listing: its prepared result once it has arrived.
 struct Listing {
-    work: DirectoryWork,
     arrived: Option<Result<Prepared, EntryOperationFailure>>,
 }
 
@@ -92,6 +104,9 @@ struct Frame {
     children: Option<VecDeque<Child>>,
     /// Subdirectories to descend into once the block is admitted.
     slots: VecDeque<Slot>,
+    /// The block's observation task, from its first child that needs I/O until its last child
+    /// is admitted.
+    feed: Option<Feed>,
     /// What this block knows that no output slot records.
     facts: BlockFacts,
     /// Whether the block's end marker has been queued. `next_after_block` runs once per slot,
@@ -108,6 +123,7 @@ impl Frame {
             work,
             children: None,
             slots: VecDeque::new(),
+            feed: None,
             facts: BlockFacts {
                 child_order,
                 ..BlockFacts::default()
@@ -123,7 +139,7 @@ pub(super) struct Cursor {
     /// `BlockFacts` so a future per-directory degradation can report itself.
     child_order: ChildOrder,
     /// Deferred descend decisions, filled as their observations settle.
-    decisions: HashMap<u64, Option<DirectoryWork>>,
+    decisions: Decisions,
     /// Listings started for frames the cursor has not taken yet.
     listings: HashMap<StoragePath, Listing>,
 }
@@ -164,11 +180,11 @@ impl Cursor {
             if let Some(pending) = frame.children.as_ref() {
                 sample.path_bytes += pending
                     .iter()
-                    .map(|child| child.descriptor.path.as_str().len())
+                    .map(|child| child.listed.path_len())
                     .sum::<usize>();
             }
         }
-        for listing in self.listings.values() {
+        for (path, listing) in &self.listings {
             match listing.arrived.as_ref() {
                 None => sample.listings_inflight += 1,
                 Some(arrived) => {
@@ -181,27 +197,26 @@ impl Cursor {
                     }
                 }
             }
-            sample.path_bytes += listing.work.path.as_str().len();
+            sample.path_bytes += path.as_str().len();
         }
         sample
     }
 
-    /// Records a deferred observation's descend decision.
-    pub(super) fn decide(&mut self, sequence: u64, descend: Option<DirectoryWork>) {
-        self.decisions.insert(sequence, descend);
+    /// Where deferred observations record their descend decisions.
+    pub(super) const fn decisions(&mut self) -> &mut Decisions {
+        &mut self.decisions
     }
 
-    /// Prepares a finished listing. A lost session ends the traversal at once.
+    /// Takes a listing its task has prepared. A lost session ends the traversal at once.
     pub(super) fn listed(
         &mut self,
-        runtime: &Runtime<'_>,
         path: &StoragePath,
-        result: Result<NamespaceResult, StorageRoleFailure>,
+        arrival: Arrival,
     ) -> Result<(), TraversalTerminalFailure> {
         let Some(listing) = self.listings.get_mut(path) else {
             return Err(TraversalTerminalFailure::Internal);
         };
-        listing.arrived = Some(prepare(runtime, &listing.work, result)?);
+        listing.arrived = Some(arrival?);
         Ok(())
     }
 
@@ -271,7 +286,7 @@ impl Cursor {
     pub(super) fn advance(
         &mut self,
         runtime: &Runtime<'_>,
-        tasks: &mut ObservationTask,
+        observations: &mut Observations,
         state: &mut State,
     ) -> Result<Step, TraversalTerminalFailure> {
         loop {
@@ -289,11 +304,13 @@ impl Cursor {
                 .as_ref()
                 .is_some_and(|children| !children.is_empty())
             {
-                match admit_next_child(runtime, frame, tasks, state)? {
+                match admit_next_child(runtime, frame, &mut self.decisions, observations, state)? {
                     ControlFlow::Break(step) => return Ok(step),
                     ControlFlow::Continue(()) => continue,
                 }
             }
+            // Every child is admitted, so the block's observation task gets no more.
+            frame.feed = None;
             if !frame.closed {
                 if state.admitted() >= runtime.request.max_inflight_operations.get() {
                     return Ok(Step::WindowFull);
@@ -356,6 +373,7 @@ impl Cursor {
                 }
                 frame.facts.pruned = frame.facts.pruned.saturating_add(prepared.pruned);
                 frame.facts.truncated = frame.facts.truncated.saturating_add(prepared.truncated);
+                frame.facts.hidden = frame.facts.hidden.saturating_add(prepared.hidden);
                 frame.slots = prepared.slots;
                 frame.children = Some(prepared.children);
             }
@@ -397,7 +415,8 @@ impl Cursor {
 fn admit_next_child(
     runtime: &Runtime<'_>,
     frame: &mut Frame,
-    tasks: &mut ObservationTask,
+    decisions: &mut Decisions,
+    observations: &mut Observations,
     state: &mut State,
 ) -> Result<ControlFlow<Step>, TraversalTerminalFailure> {
     if state.admitted() >= runtime.request.max_inflight_operations.get() {
@@ -406,15 +425,12 @@ fn admit_next_child(
     let Some(child) = frame.children.as_mut().and_then(VecDeque::pop_front) else {
         return Ok(ControlFlow::Continue(()));
     };
-    admit(
-        runtime,
-        &frame.work,
-        child,
-        &mut frame.slots,
-        &mut frame.facts,
-        tasks,
-        state,
-    )?;
+    let mut block = Admitting {
+        work: &frame.work,
+        slots: &mut frame.slots,
+        feed: &mut frame.feed,
+    };
+    admit(runtime, &mut block, child, decisions, observations, state)?;
     Ok(ControlFlow::Continue(()))
 }
 
@@ -462,13 +478,14 @@ impl Search<'_> {
     }
 }
 
-/// Turns a finished listing into a block: listing-level failures stay failures, and every child
-/// gets its admission decision now.
+/// Turns a finished listing into a block, inside the listing's own task: listing-level failures
+/// stay failures, every child gets its admission decision now, and every child that needs no
+/// I/O is observed now.
 fn prepare(
-    runtime: &Runtime<'_>,
+    shared: &Shared,
     work: &DirectoryWork,
     result: Result<NamespaceResult, StorageRoleFailure>,
-) -> Result<Result<Prepared, EntryOperationFailure>, TraversalTerminalFailure> {
+) -> Arrival {
     let (entries, failures) = match result.map(NamespaceResult::into_listing) {
         Ok(Some(listing)) => listing,
         Ok(None) => return Ok(Err(entry_failure(&work.path, FailureClass::Protocol))),
@@ -477,21 +494,27 @@ fn prepare(
             return Err(TraversalTerminalFailure::Session(error));
         }
     };
+    let plan = shared.policy.observation_plan;
     let mut children = VecDeque::with_capacity(entries.len());
     let mut slots = VecDeque::new();
-    let (mut pruned, mut truncated) = (0_u64, 0_u64);
+    let (mut pruned, mut truncated, mut hidden) = (0_u64, 0_u64, 0_u64);
     for descriptor in entries {
-        let decision = immediate_decision(runtime, work, &descriptor);
+        let decision = immediate_decision(shared, work, &descriptor);
         if let Some(decision) = decision {
-            match descend_outcome(runtime.request, &descriptor, work.child_depth, decision) {
+            match descend_outcome(&shared.request, &descriptor, work.child_depth, decision) {
                 DescendOutcome::Into(below) => slots.push_back(Slot::Descend(below)),
                 DescendOutcome::Pruned => pruned = pruned.saturating_add(1),
                 DescendOutcome::Truncated => truncated = truncated.saturating_add(1),
                 DescendOutcome::NotDirectory => {}
             }
+            if !decision.emit {
+                hidden = hidden.saturating_add(1);
+                continue;
+            }
         }
         children.push_back(Child {
-            descriptor,
+            kind: descriptor.kind,
+            listed: observe_listed(descriptor, plan),
             decision,
         });
     }
@@ -501,6 +524,7 @@ fn prepare(
         slots,
         pruned,
         truncated,
+        hidden,
     }))
 }
 
@@ -554,25 +578,20 @@ fn spawn_listing(
     work: DirectoryWork,
 ) {
     let path = work.path.clone();
-    started.insert(
-        path.clone(),
-        Listing {
-            work,
-            arrived: None,
-        },
-    );
-    let namespace = Arc::clone(runtime.namespace);
-    // Sorting rides on the listing's own task rather than the driver's, so a directory of
-    // millions is scheduled like the listing I/O already is instead of sitting between two of
-    // the driver loop's await points. On a current-thread runtime it still shares the thread;
-    // only `spawn_blocking` would change that, and no listing so far has been worth it.
-    let order = runtime.request.order;
-    let versions = runtime.request.versions;
-    let cancel = namespace
+    started.insert(path.clone(), Listing { arrived: None });
+    let shared = Arc::clone(runtime.shared);
+    // Sorting and preparing ride on the listing's own task rather than the driver's, so a
+    // directory of millions is scheduled like the listing I/O already is instead of sitting
+    // between two of the driver loop's await points, and several listings prepare in parallel.
+    // On a current-thread runtime it still shares the thread; only `spawn_blocking` would change
+    // that, and no listing so far has been worth it.
+    let cancel = shared
+        .namespace
         .listings_are_abortable()
         .then(|| runtime.request.cancel.clone());
     listings.spawn(async move {
-        let listing = match versions {
+        let namespace = shared.namespace.as_ref();
+        let listing = match shared.request.versions {
             TraversalVersions::Current => namespace.execute(NamespaceRequest::List(path.clone())),
             TraversalVersions::All => namespace.list_versions(&path),
         };
@@ -586,10 +605,11 @@ fn spawn_listing(
             },
             None => listing.await,
         };
-        if order == TraversalOrder::NameBytes {
+        if shared.request.order == TraversalOrder::NameBytes {
             sort_by_name(&mut result);
         }
-        (path, result)
+        let arrival = prepare(&shared, &work, result);
+        (path, arrival)
     });
 }
 
@@ -603,7 +623,7 @@ fn prepared_path_bytes(prepared: &Prepared) -> usize {
     prepared
         .children
         .iter()
-        .map(|child| child.descriptor.path.as_str().len())
+        .map(|child| child.listed.path_len())
         .chain(prepared.slots.iter().map(|slot| match slot {
             Slot::Descend(work) => work.path.as_str().len(),
             Slot::Pending(_) => 0,

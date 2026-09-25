@@ -56,10 +56,18 @@ Storage (roles)
 游标分配，重排缓冲按序号输出，所以列举/观察乱序完成不影响顺序。列举预读额度
 `min(max_inflight_operations, 64)` 只计**在途**，在途 + 已列出待消费合计另限 2 倍额度 (否则早期预读的
 浅层兄弟会占住额度，饿死深层)；与观察窗口分开；游标马上需要的列举不计额度 (防饿死)。
-deferred filter 已决定下钻的 `Pending` 槽位也会预读。列举结果**到达时**就对每个子项做
+deferred filter 已决定下钻的 `Pending` 槽位也会预读。列举结果**在列举自己的任务里**就对每个子项做
 filter 决定 (deferred 的除外)，所以已预读、游标还没走到的目录，其子目录也能继续预读；候选按
-输出顺序深度优先展开 (`cursor.rs` 的 `Search`)。
-取消或结束时在途的列举和观察都 detach 而非 abort (CIFS 句柄)。
+输出顺序深度优先展开 (`cursor.rs` 的 `Search`)。驱动每轮先 `try_join_next` 收下所有已完成的列举，
+不只是游标正等的那个 —— 否则已预读目录的子目录不会被展开预读。
+**按页观察 (P7 C0)**：不需要 I/O 的子项 (非 symlink，且列举已带齐观察计划要的元数据) 也在列举任务里
+组装成 `ObservedEntry`，驱动一块只被唤醒一次、准入时直接落槽；filter 隐藏的子项在那里只计数、不进块。
+需要 I/O 的 (symlink 目标、列举没带的元数据) 每块一个观察任务 (`observe.rs` 的 `Observations`)，
+游标准入时把子项喂给它，任务内 `FuturesUnordered` 并发，结果逐个回送，总量受准入窗口约束 —— 不再每条目
+一个任务。重排缓冲 (`output.rs`) 对恰好是下一个序号的槽位走就绪队列，乱序到达的才进 `BTreeMap`。
+单条组装与端到端每条目成本见 `storage/tests/bench.rs` (ignored，`--release --ignored --nocapture` 手跑)。
+取消或结束时在途的列举和观察都 detach 而非 abort (CIFS 句柄)；观察任务在块的 feed 被丢弃后跑完手上的
+才退出。
 
 **目录完成事件**。游标在两处排入 marker 槽位：块被完全准入时排 `DirectoryListed`，帧弹出前排
 `SubtreeComplete`。于是一个被列举的目录 D 的输出是：D 的块 → `DirectoryListed(D)` → 各子目录
