@@ -50,11 +50,13 @@ entries() {
   local km="" vm="" out
   while :; do
     out=$(s3c "$H/$1?versions&prefix=$(enc "$2")&key-marker=$(enc "$km")&version-id-marker=$(enc "$vm")")
+    # On stdin: a 1 000-entry page is too long for one argument ("argument list too long"), and
+    # the cleanup would then leave the bucket behind.
     python3 -c 'import sys, xml.etree.ElementTree as ET
-root = ET.fromstring(sys.argv[1]); ns = root.tag[:root.tag.index("}") + 1]
+root = ET.fromstring(sys.stdin.read()); ns = root.tag[:root.tag.index("}") + 1]
 for tag, marker in (("Version", False), ("DeleteMarker", True)):
     for e in root.iter(ns + tag):
-        print("%s\t%s\t%d\t%d" % (e.findtext(ns + "Key"), e.findtext(ns + "VersionId"), marker, e.findtext(ns + "IsLatest") == "true"))' "$out"
+        print("%s\t%s\t%d\t%d" % (e.findtext(ns + "Key"), e.findtext(ns + "VersionId"), marker, e.findtext(ns + "IsLatest") == "true"))' <<<"$out"
     grep -q '<IsTruncated>true' <<<"$out" || break
     km=$(grep -o '<NextKeyMarker>[^<]*' <<<"$out" | sed 's/<NextKeyMarker>//')
     vm=$(grep -o '<NextVersionIdMarker>[^<]*' <<<"$out" | sed 's/<NextVersionIdMarker>//')
@@ -116,14 +118,14 @@ print("null" if v is None else v)' "$1" "$2"; }
 verdict() {
   local rows; rows=$(entries "$1" "$2/")
   python3 -c 'import sys
-rows = [r.split("\t") for r in sys.argv[1].splitlines() if r]
-key, version = sys.argv[2], sys.argv[3]
+rows = [r.split("\t") for r in sys.stdin.read().splitlines() if r]
+key, version = sys.argv[1], sys.argv[2]
 finals = [r for r in rows if r[0] == key and r[2] == "0"]
 latest = next((r[1] for r in finals if r[3] == "1"), None)
 markers = sum(1 for r in rows if r[2] == "1")
 artifacts = sum(1 for r in rows if ".data-mover-" in r[0])
 match = "n/a" if version in ("null", "?") else ("yes" if version == latest else "NO")
-print("   final versions=%d delete markers=%d artifact entries=%d version=latest: %s (latest=%s)" % (len(finals), markers, artifacts, match, latest))' "$rows" "$2/$3" "$4"
+print("   final versions=%d delete markers=%d artifact entries=%d version=latest: %s (latest=%s)" % (len(finals), markers, artifacts, match, latest))' "$2/$3" "$4" <<<"$rows"
 }
 case_() { # label, bucket, prefix, key, args...
   local label=$1 bucket=$2 prefix=$3 key=$4; shift 4
