@@ -15,22 +15,32 @@
 # marker, p/z as 1, 2, 3, n as version=null latest=1, no artifact; Current lists k (4 B) without
 # gone; --order name-bytes gives the same lines at concurrency 1, 4 and 32.
 #
-# Env: .claude/skills/e2e-s3/.env (S3_HOST, S3_AK, S3_SK). Exit status 0 only when every check
-# passed and the bucket is gone.
+# Also: whether the server honours `delimiter` on ListObjectVersions (raw request, printed), and the
+# legacy walkdir / walkdir_2 (examples/s3_listing, versioning re-enabled first: a suspended bucket
+# is walked by ListObjectsV2) — k as v1, v2, marker, v3 (ids as written), gone as its version then a
+# latest marker (D4), p/z whole across the page, no artifact.
+#
+# Env: S3_ENV (default .claude/skills/e2e-s3/.env; e.g. .claude/skills/e2e-s3/dxn/.env) with S3_HOST,
+# S3_AK, S3_SK (S3_COMPAT / S3_USE_HTTPS pick the URL scheme). BUCKET_PREFIX names the bucket (default
+# data-mover-c22 → <prefix>-<run>); S3_LOCATION, when set, is the CreateBucket LocationConstraint
+# (DXN). Exit status 0 only when every check passed and the bucket is gone.
 set -u
 ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$ROOT"
-set -a; . .claude/skills/e2e-s3/.env; set +a
+S3_ENV=${S3_ENV:-.claude/skills/e2e-s3/.env}
+set -a; . "$S3_ENV"; set +a
 RUN=${RUN:-$(date +%s)}
 [[ $RUN =~ ^[a-z0-9-]{1,30}$ ]] || { echo "RUN must match [a-z0-9-]{1,30}: $RUN" >&2; exit 1; }
-VB=data-mover-c22-$RUN
+BUCKET_PREFIX=${BUCKET_PREFIX:-data-mover-c22}
+[[ $BUCKET_PREFIX =~ ^data-mover-[a-z0-9-]{1,20}$ ]] || { echo "BUCKET_PREFIX must be data-mover-<[a-z0-9-]>: $BUCKET_PREFIX" >&2; exit 1; }
+VB=$BUCKET_PREFIX-$RUN
 SCHEME=http; [ "${S3_USE_HTTPS:-}" = true ] && SCHEME=https
 H="$SCHEME://$S3_HOST"
 # The credentials reach curl through a config on a file descriptor, never on its command line.
 esc() { local v=${1//\\/\\\\}; printf '%s' "${v//\"/\\\"}"; }
 s3c() { curl -s --aws-sigv4 "aws:amz:us-east-1:s3" -K <(printf 'user = "%s:%s"\n' "$(esc "$S3_AK")" "$(esc "$S3_SK")") "$@"; }
 enc() { python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=sys.argv[2]))' "$1" "${2:-}"; }
-WORK=/tmp/data-mover-c22-$RUN
+WORK=/tmp/$BUCKET_PREFIX-$RUN
 mkdir -p "$WORK"
 CREATED=0
 FAILED=0
@@ -70,21 +80,26 @@ cleanup() {
 # cleanup; a clean exit still fails when a check or the cleanup did.
 trap 'rc=$?; cleanup; exit $(( rc || FAILED ))' EXIT
 
+# Every write appends key<TAB>x-amz-version-id to $WORK/ids (the order the versions were made).
+written() { printf '%s\t%s\n' "$1" "$(tr -d '\r' <"$WORK/headers" | sed -n 's/^x-amz-version-id: *//Ip')" >>"$WORK/ids"; }
 put() { # key, body
   printf '%s' "$2" >"$WORK/body"
-  local code; code=$(s3c -o /dev/null -w '%{http_code}' -X PUT "$H/$VB/$(enc "$1" /)" --data-binary @"$WORK/body")
+  local code; code=$(s3c -D "$WORK/headers" -o /dev/null -w '%{http_code}' -X PUT "$H/$VB/$(enc "$1" /)" --data-binary @"$WORK/body")
   [ "$code" = 200 ] || { echo "PUT $1: $code" >&2; FAILED=1; }
+  written "$1"
 }
-del() { s3c -o /dev/null -X DELETE "$H/$VB/$(enc "$1" /)"; }
+del() { s3c -D "$WORK/headers" -o /dev/null -X DELETE "$H/$VB/$(enc "$1" /)"; written "$1"; }
 versioning() {
   printf '<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>%s</Status></VersioningConfiguration>' "$1" >"$WORK/v.xml"
   s3c -o /dev/null -w "versioning $1: %{http_code}\n" -X PUT "$H/$VB?versioning" --data-binary @"$WORK/v.xml"
 }
 
-build=$(cargo build -q --example storage_role_operations 2>&1) || { echo "$build" >&2; exit 1; }
-code=$(s3c -o /dev/null -w '%{http_code}' -X PUT "$H/$VB")
+build=$(cargo build -q --example storage_role_operations --example s3_listing 2>&1) || { echo "$build" >&2; exit 1; }
+LOCATION=()
+[ -n "${S3_LOCATION:-}" ] && LOCATION=(--data-binary "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>$S3_LOCATION</LocationConstraint></CreateBucketConfiguration>")
+code=$(s3c -o "$WORK/create.out" -w '%{http_code}' -X PUT "$H/$VB" "${LOCATION[@]}")
 echo "create $VB: $code"
-[ "$code" = 200 ] || { echo "bucket $VB was not created by this run; stopping" >&2; exit 1; }
+[ "$code" = 200 ] || { cat "$WORK/create.out" >&2; echo "bucket $VB was not created by this run; stopping" >&2; exit 1; }
 CREATED=1
 versioning Enabled
 put k v1; put k 'v2!'; del k; put k 'v3!!'
@@ -98,7 +113,9 @@ echo "server entries: $(entries | wc -l)"
 
 # Raw, as examples/endpoint_support builds it: the URL parser splits the key pair at the first
 # ':' and the host at the last '@' and does not percent-decode. Only in this script's environment.
-export S3_LISTING_URL="s3://$S3_AK:$S3_SK@$VB.$S3_HOST/"
+case "${S3_COMPAT:-}" in sg) COMPAT=+sg ;; dxn) COMPAT=+dxn ;; *) COMPAT= ;; esac
+TLS=; [ "${S3_USE_HTTPS:-}" = true ] && TLS=+https
+export S3_LISTING_URL="s3$COMPAT$TLS://$S3_AK:$S3_SK@$VB.$S3_HOST/"
 BIN=target/debug/examples/storage_role_operations
 traverse() { # concurrency, args...
   "$BIN" --backend s3 --concurrency "$1" traverse "${@:2}" 2>"$WORK/stderr" \
@@ -146,4 +163,58 @@ for name, (got, want) in checks.items():
     print("%-18s %s%s" % (name, "ok" if ok else "FAIL", "" if ok else " got=%r want=%r" % (got, want)))
 sys.exit(1 if bad else 0)
 PY
+echo "-- raw root listings with delimiter=/ (does the server honour it?)"
+for q in "versions&delimiter=%2F" "list-type=2&delimiter=%2F"; do
+  s3c "$H/$VB?$q" | python3 -c 'import sys, xml.etree.ElementTree as ET
+root = ET.fromstring(sys.stdin.read()); ns = root.tag[:root.tag.index("}") + 1] if root.tag.startswith("{") else ""
+keys = [e.findtext(ns + "Key") for tag in ("Version", "DeleteMarker", "Contents") for e in root.iter(ns + tag)]
+prefixes = [p.findtext(ns + "Prefix") for p in root.iter(ns + "CommonPrefixes")]
+deep = sum("/" in k for k in keys)
+print("%-24s entries=%d distinct keys=%s keys with a /=%d CommonPrefixes=%s truncated=%s -> delimiter %s" % (
+    sys.argv[1], len(keys), sorted(set(keys)) if len(set(keys)) < 10 else len(set(keys)), deep, prefixes,
+    root.findtext(ns + "IsTruncated"), "honoured" if prefixes and not deep else "IGNORED"))' "$q"
+done
+
+echo "-- legacy walkdir / walkdir_2 (versioning re-enabled: a suspended bucket is walked by ListObjectsV2)"
+versioning Enabled
+LEG=target/debug/examples/s3_listing
+"$LEG" >"$WORK/walk" 2>"$WORK/walk.err" || { echo "walkdir failed:"; tail -5 "$WORK/walk.err"; FAILED=1; }
+"$LEG" --walkdir-2 >"$WORK/walk2" 2>"$WORK/walk2.err" || { echo "walkdir_2 failed:"; tail -5 "$WORK/walk2.err"; FAILED=1; }
+echo "walkdir (without p/a*):"; grep -v ' p/a' "$WORK/walk" | sed 's/^/   /'
+echo "walkdir_2 (without p/a*):"; grep -v ' p/a' "$WORK/walk2" | sed 's/^/   /'
+python3 - "$WORK/walk" "$WORK/walk2" "$WORK/ids" <<'PY2' || FAILED=1
+import re, sys
+def rows(path, kind):
+    out = {}
+    for line in open(path):
+        m = re.match(kind + r" (\S+) (\S+) latest=(\d) marker=(\d) count=(\S+)$", line.strip())
+        if m:
+            out.setdefault(m.group(1), []).append(m.groups()[1:])
+    return out
+ids = {}
+for line in open(sys.argv[3]):
+    k, _, v = line.rstrip("\n").partition("\t")
+    ids.setdefault(k, []).append(v)
+w, w2 = rows(sys.argv[1], "ENTRY"), rows(sys.argv[2], "FILE")
+k, g, z = ids["k"], ids["gone"], ids["p/z"]
+checks = {
+    "walkdir k": (w.get("k"), [(k[0], "0", "0", "4"), (k[1], "0", "0", "4"), (k[2], "0", "1", "4"), (k[3], "1", "0", "4")]),
+    "walkdir gone (D4)": (w.get("gone"), [(g[0], "0", "0", "2"), (g[1], "1", "1", "2")]),
+    "walkdir p/z": (w.get("p/z"), [(z[0], "0", "0", "3"), (z[1], "0", "0", "3"), (z[2], "1", "0", "3")]),
+    "walkdir n": ([r[1:] for r in w.get("n", [])], [("1", "0", "1")]),
+    "walkdir p/a count": (sum(1 for p in w if p.startswith("p/a")), 999),
+    "walkdir_2 k": (w2.get("k"), [(k[0], "0", "0", "3"), (k[1], "0", "0", "3"), (k[3], "1", "0", "3")]),
+    "walkdir_2 gone (D4)": (w2.get("gone"), [(g[0], "0", "0", "1")]),
+    "walkdir_2 p/z": (w2.get("p/z"), [(z[0], "0", "0", "3"), (z[1], "0", "0", "3"), (z[2], "1", "0", "3")]),
+    "walkdir_2 p/a count": (sum(1 for p in w2 if p.startswith("p/a")), 999),
+    "legacy no artifacts": (sum(".data-mover" in l for f in sys.argv[1:3] for l in open(f)), 0),
+    "legacy no errors": (sum(l.startswith(("ERROR", "TIMEOUT")) for f in sys.argv[1:3] for l in open(f)), 0),
+}
+bad = 0
+for name, (got, want) in checks.items():
+    ok = got == want
+    bad += not ok
+    print("%-20s %s%s" % (name, "ok" if ok else "FAIL", "" if ok else " got=%r want=%r" % (got, want)))
+sys.exit(1 if bad else 0)
+PY2
 [ "$FAILED" = 0 ] && echo "RESULT: pass" || echo "RESULT: FAIL"

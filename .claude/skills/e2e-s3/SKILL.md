@@ -60,8 +60,24 @@ S3_PREFIX=test                   # bucket 内的子路径
    cancel / SIGKILL；Object Lock 桶里拷贝进行中给指针版本加 legal hold；暂停版本后三种写法。每行打印 `result` /
    `prepare` / `reused` / `destination_version`，再打印该用例前缀下 `final versions=… delete markers=… artifact entries=…
    version=latest: yes`。期望：每次拷贝 1 个版本、0 标记、0 artifact，`destination_version` 就是最新版本；Object Lock
-   行 `result=ok`、1 条告警、1 个标记 + 2 个 artifact 条目（被扣住的指针版本与盖在上面的标记）；暂停版本
-   `destination_version=null`。`SKIP_RESUME=1` 跳过续传矩阵。
+   行 `result=ok`、带版本：AWS / MinIO 1 条告警、1 个标记 + 2 个 artifact 条目（被扣住的指针版本与盖在上面的标记）；
+   Ceph RGW / DXN 连标记也拒 → 2 条告警、0 标记、1 个 artifact 条目（被扣住的指针版本留在原处）；暂停版本
+   `destination_version=null`。`SKIP_RESUME=1` 跳过续传矩阵；`LOG_DIR=<目录>` 保留各次传输的 stderr。
+
+   **别的服务器（DXN / StorageGRID）**：`S3_ENV=<该服务器的 .env>` 选服务器（默认 `.claude/skills/e2e-s3/.env`），
+   `BUCKET_PREFIX=data-mover-<名字>` 给临时桶换名（默认 `data-mover-c17`，必须匹配 `data-mover-[a-z0-9-]{1,20}`），
+   `S3_LOCATION=<LocationConstraint>` 建桶时带上（DXN 的 zonegroup 没有默认 placement，不带就
+   `ZonegroupDefaultPlacementMisconfiguration`）。DXN（用户批准的临时桶 `data-mover-dxn-<ts>` / `data-mover-dxn-lock-<ts>`，
+   不碰别的桶，也不给 `data-mover-test` 开版本）：
+
+   ```bash
+   S3_ENV=.claude/skills/e2e-s3/dxn/.env BUCKET_PREFIX=data-mover-dxn S3_LOCATION=magnascale:tos_placement \
+     timeout 5400 bash .claude/skills/e2e-s3/scripts/versioning_matrix.sh
+   ```
+
+   Ceph RGW 带 Object Lock 建的桶**不开版本**（`ObjectLockEnabled=Enabled`、版本 off），脚本检测到就自己开版本再跑锁行；
+   服务器不让建锁桶就跳过锁行。`resume_matrix.sh` 同样认 `S3_ENV`。DXN 的其他差异见 storage-s3.md「DXN（Ceph RGW
+   Octopus）实测行为」。
 
 7. **原生 S3→S3 切断续传**（C18）：MinIO 上服务端拷贝很快（读回关时 1 GiB ≈ 1.1 s），`--bandwidth` 不限原生拷贝，
    所以用 1 GiB 源、读回关、`--cancel-after-ms 300`（或 `timeout -s KILL 0.8`）切断：期望切断后 1 指针 + 1 upload，
@@ -74,7 +90,11 @@ S3_PREFIX=test                   # bucket 内的子路径
    `storage_role_operations --backend s3 traverse --versions all|current`（`S3_LISTING_URL` 只在脚本环境里）列举并断言：
    All 的 `k` = 2 B、3 B、标记、4 B 只有最后一个 latest，`gone` = 版本 + latest 标记，`p/z` = 1、2、3 B，`n` =
    `version=null latest=1`；Current 只有 `k`（4 B）没有 `gone`；无 artifact；`--order name-bytes` 并发 1 / 4 / 32 输出
-   相同。退出时按 id 删光版本与标记、删桶，打印 `cleanup: … deleted` 与剩下的桶；只有全部通过且桶已删才退出 0（编译失败、桶不是本次建的也以非 0 退出，trap 保留原退出码）。
+   相同。另外直接发一次带 `delimiter` 的 ListObjectVersions（打印服务器是否按 delimiter 折叠），并用 `examples/s3_listing`
+   跑 legacy `walkdir` / `walkdir_2`（先重新开版本：暂停版本的桶走 ListObjectsV2）：`k` 按写入的 id 列 v1、v2、标记、v3，
+   `gone` 列版本再列 latest 标记（D4），`p/z` 跨页完整，无 artifact。
+   退出时按 id 删光版本与标记、删桶，打印 `cleanup: … deleted` 与剩下的桶；只有全部通过且桶已删才退出 0（编译失败、桶不是本次建的也以非 0 退出，trap 保留原退出码）。
+   同样认 `S3_ENV` / `BUCKET_PREFIX`（默认 `data-mover-c22`）/ `S3_LOCATION`。
 
 ## 成功判据
 

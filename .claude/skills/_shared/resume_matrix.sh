@@ -11,6 +11,7 @@
 #          run is cut (default 20 MiB/s); CUT_MS when the cut lands (default 6000, so the first
 #          64 MiB checkpoint is durable at the default BW; on S3 the pointer is written when the
 #          upload begins (ADR-0006 C16), so a SIGKILL resumes even before that checkpoint)
+#   S3_ENV (s3: only) the server's .env, default .claude/skills/e2e-s3/.env (DXN: its dxn/.env)
 #   S3_BUCKET_OVERRIDE  (s3: only) another bucket of the same server, e.g. a temporary versioned
 #          one (ADR-0006 C17), instead of the .env's S3_BUCKET — never by editing the .env
 # Writes only under <DEST>/resume-<run>/ and removes all of it at the end: final files, orphaned
@@ -31,7 +32,8 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$ROOT"
-for env in .claude/skills/e2e-s3/.env .claude/skills/e2e-cifs/.env; do
+# S3_ENV picks the S3 server's .env (e.g. .claude/skills/e2e-s3/dxn/.env); default the e2e-s3 one.
+for env in "${S3_ENV:-.claude/skills/e2e-s3/.env}" .claude/skills/e2e-cifs/.env; do
   [ -f "$env" ] && { set -a; . "$env"; set +a; }
 done
 : "${DEST:?set DEST to the destination endpoint}"

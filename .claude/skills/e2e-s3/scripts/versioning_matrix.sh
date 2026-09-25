@@ -11,16 +11,24 @@
 # copy, 0 markers, 0 artifact entries, version=latest. The cancel / SIGKILL resume rows come from
 # .claude/skills/_shared/resume_matrix.sh (S3_BUCKET_OVERRIDE) and print the same counts.
 #
-# Env: .claude/skills/e2e-s3/.env (S3_HOST, S3_AK, S3_SK). SKIP_RESUME=1 skips the resume matrix.
+# Env: S3_ENV (default .claude/skills/e2e-s3/.env; e.g. .claude/skills/e2e-s3/dxn/.env) with S3_HOST,
+# S3_AK, S3_SK (S3_COMPAT picks the crate's profile). BUCKET_PREFIX names the temporary buckets
+# (default data-mover-c17 → <prefix>-<run> and <prefix>-lock-<run>). S3_LOCATION, when set, is sent as
+# the CreateBucket LocationConstraint (DXN: its zonegroup has no default placement). A lock bucket
+# the server refuses to create is reported and its checks skipped. SKIP_RESUME=1 skips the resume
+# matrix.
 set -u
 ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$ROOT"
-set -a; . .claude/skills/e2e-s3/.env; set +a
+S3_ENV=${S3_ENV:-.claude/skills/e2e-s3/.env}
+set -a; . "$S3_ENV"; set +a
 RUN=${RUN:-$(date +%s)}
 # RUN names the buckets and the work directory: nothing that could leave either (no "/" or "..").
 [[ $RUN =~ ^[a-z0-9-]{1,30}$ ]] || { echo "RUN must match [a-z0-9-]{1,30}: $RUN" >&2; exit 1; }
-VB=data-mover-c17-$RUN
-LB=data-mover-c17-lock-$RUN
+BUCKET_PREFIX=${BUCKET_PREFIX:-data-mover-c17}
+[[ $BUCKET_PREFIX =~ ^data-mover-[a-z0-9-]{1,20}$ ]] || { echo "BUCKET_PREFIX must be data-mover-<[a-z0-9-]>: $BUCKET_PREFIX" >&2; exit 1; }
+VB=$BUCKET_PREFIX-$RUN
+LB=$BUCKET_PREFIX-lock-$RUN
 SCHEME=http; [ "${S3_USE_HTTPS:-}" = true ] && SCHEME=https
 H="$SCHEME://$S3_HOST"
 # The credentials reach curl through a config on a file descriptor, never on its command line.
@@ -31,15 +39,19 @@ s3c() { curl -s --aws-sigv4 "aws:amz:us-east-1:s3" -K <(printf 'user = "%s:%s"\n
 CREATED=()
 ours() { case "$1" in "$VB"|"$LB") ;; *) echo "refusing bucket $1" >&2; return 1 ;; esac; }
 created() { [[ " ${CREATED[*]} " == *" $1 "* ]]; }
-create() { # bucket, extra curl args...
-  local code; code=$(s3c -o /dev/null -w '%{http_code}' -X PUT "$H/$1" "${@:2}")
+# The CreateBucket body: a LocationConstraint only when S3_LOCATION is set.
+LOCATION=()
+[ -n "${S3_LOCATION:-}" ] && LOCATION=(--data-binary "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>$S3_LOCATION</LocationConstraint></CreateBucketConfiguration>")
+try_create() { # bucket, extra curl args... — 0 only when this run created it (200)
+  local code; code=$(s3c -o "$WORK/create.out" -w '%{http_code}' -X PUT "$H/$1" "${LOCATION[@]}" "${@:2}")
   echo "create $1: $code"
-  [ "$code" = 200 ] || { echo "bucket $1 was not created by this run; stopping" >&2; exit 1; }
+  [ "$code" = 200 ] || { sed 's/^/   /' "$WORK/create.out"; echo; return 1; }
   CREATED+=("$1")
 }
+create() { try_create "$@" || { echo "bucket $1 was not created by this run; stopping" >&2; exit 1; }; }
 # Percent-encodes a key (keeping "/") or a query value.
 enc() { python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=sys.argv[2]))' "$1" "${2:-}"; }
-WORK=/tmp/data-mover-c17-$RUN
+WORK=/tmp/$BUCKET_PREFIX-$RUN
 BIN=target/debug/examples/transfer_resume
 build=$(cargo build -q --example transfer_resume 2>&1) || { echo "$build" >&2; exit 1; }
 mkdir -p "$WORK/src"
@@ -100,7 +112,12 @@ nuke() { # bucket, deletes it completely — only one this run created
   if s3c "$H/" | grep -q "<Name>$1</Name>"; then echo "cleanup: $1 STILL PRESENT (delete=$code)"; else echo "cleanup: $1 deleted"; fi
 }
 KEYS=()
-cleanup() { nuke "$VB"; nuke "$LB"; rm -rf "$WORK"; }
+# LOG_DIR keeps the transfers' stderr (RUST_LOG) after the run.
+cleanup() {
+  nuke "$VB"; nuke "$LB"
+  [ -n "${LOG_DIR:-}" ] && mkdir -p "$LOG_DIR" && cp "$WORK"/*.log "$WORK"/*.err "$LOG_DIR"/ 2>/dev/null
+  rm -rf "$WORK"
+}
 trap cleanup EXIT
 
 seed() { # name, bytes
@@ -134,6 +151,7 @@ case_() { # label, bucket, prefix, key, args...
   printf '%-40s result=%s prepare=%s reused=%s destination_version=%s\n' "$label" "$(field "$line" result)" \
     "$(field "$line" prepare)" "$(field "$line" reused_bytes)" "$(field "$line" destination_version)"
   LAST=$line
+  [ "$(field "$line" result)" = ok ] || echo "   failure: $(field "$line" failure)"
   verdict "$bucket" "$prefix" "$key" "$(field "$line" destination_version)"
 }
 versioning() { # bucket, Enabled|Suspended
@@ -144,7 +162,14 @@ versioning() { # bucket, Enabled|Suspended
 ours "$VB" && ours "$LB" || exit 1
 create "$VB"
 versioning "$VB" Enabled
-create "$LB" -H 'x-amz-bucket-object-lock-enabled: true'
+LOCK=1
+try_create "$LB" -H 'x-amz-bucket-object-lock-enabled: true' || { LOCK=0; echo "no Object Lock bucket: lock checks skipped"; }
+# AWS and MinIO turn versioning on with Object Lock; Ceph RGW (DXN) reports Object Lock enabled but
+# leaves versioning off (unversioned PUTs, no version ids). The lock checks assume a versioned bucket.
+if [ "$LOCK" = 1 ] && ! s3c "$H/$LB?versioning" | grep -q '<Status>Enabled'; then
+  echo "lock bucket $LB: versioning not enabled by Object Lock ($(s3c "$H/$LB?object-lock" | grep -o '<ObjectLockEnabled>[^<]*')); enabling it"
+  versioning "$LB" Enabled
+fi
 for entry in m4:4194304 m20:20971520 m200:209715200 h1:104857600 h2:104857600; do seed "${entry%%:*}" "${entry#*:}"; done
 LOCAL=(--source "$WORK/src")
 
@@ -198,10 +223,11 @@ s3c -o "$WORK/check" "$H/$VB/hist-cut/dst"; cmp -s "$WORK/check" "$WORK/src/h1" 
 if [ "${SKIP_RESUME:-0}" != 1 ]; then
   echo "-- resume matrix (cancel / SIGKILL at 6 s, 200 MiB) into $VB"
   KEYS+=("resume/resume-$RUN/cancel" "resume/resume-$RUN/kill")
-  RUN=$RUN S3_BUCKET_OVERRIDE=$VB DEST=s3:resume bash .claude/skills/_shared/resume_matrix.sh 2>&1 |
+  RUN=$RUN S3_ENV=$S3_ENV S3_BUCKET_OVERRIDE=$VB DEST=s3:resume bash .claude/skills/_shared/resume_matrix.sh 2>&1 |
     grep -E '^\[|interrupted|resumed' | grep -Ev 'destination endpoint=|transfer identity='
 fi
 
+if [ "$LOCK" = 1 ]; then
 echo "-- Object Lock: a legal hold on the pointer while the copy runs"
 KEYS+=(locked/obj)
 env S3_BUCKET="$LB" RUST_LOG=warn "$BIN" "${LOCAL[@]}" --source-path m200 --destination s3:locked \
@@ -222,9 +248,13 @@ done
 wait $pid
 line=$(tail -1 "$WORK/lock.out")
 echo "locked pointer (hold placed: $held)         result=$(field "$line" result) destination_version=$(field "$line" destination_version)"
+[ "$(field "$line" result)" = ok ] || echo "   failure: $(field "$line" failure)"
 echo "   warnings: $(grep -c 'WARN' "$WORK/lock.err") ($(grep -o 'could not delete the S3 upload pointer[^;]*' "$WORK/lock.err" | head -1))"
 verdict "$LB" locked obj "$(field "$line" destination_version)"
-echo "   (expected here: 1 delete marker, 2 artifact entries — the held pointer version and the marker over it)"
+echo "   held pointer left in place (store refused the marker too): $(grep -c 'refused a delete marker over the held' "$WORK/lock.err")"
+echo "   (expected: AWS / MinIO 1 delete marker, 2 artifact entries — the held pointer version and the marker over it;"
+echo "    Ceph RGW / DXN refuses the marker too: 0 markers, 1 artifact entry — the held pointer version, 2 warnings)"
+fi
 
 echo "-- suspended versioning: destination_version null"
 versioning "$VB" Suspended
