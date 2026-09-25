@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::source::{cancelled, classified_entry, entry, role_failure};
 use super::super::{S3Protocol, S3ProtocolFailure, S3WriteFacts, composite_etag};
+use super::completion::completed_object;
 use super::parts::{PartTarget, UploadedParts};
 use super::{S3StagedDestination, cleanup_result, planned_part_size, single};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
@@ -231,7 +232,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     /// encrypts with KMS reports other part `ETag`s, one that reports another object `ETag` form
     /// computes no comparable composite: neither is checked). A failed completion — a lost reply, or the retry of a
     /// completion that already committed answered `NoSuchUpload` — counts as completed when the
-    /// final object has our size and that composite `ETag`.
+    /// final object has our size and that composite `ETag` (see [`Self::settle_direct_completion`]).
     async fn complete_direct(
         &self,
         path: &StoragePath,
@@ -248,20 +249,8 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         {
             Ok(facts) => facts,
             Err(failure) => {
-                let facts = self
-                    .reconcile_completion(path, size, expected.as_deref(), failure)
-                    .await?;
-                // The object matches, but it may be an identical earlier one while our upload
-                // never completed: abort it (a completed one answers not-found), and claim no
-                // version we cannot be sure we created.
-                let aborted = self
-                    .protocol
-                    .abort_multipart(path.as_str(), upload_id)
-                    .await;
-                if let Err(error) = cleanup_result(path, aborted) {
-                    tracing::warn!(path = %path.as_str(), ?error, "could not abort a reconciled S3 upload");
-                }
-                S3WriteFacts::new(facts.etag, None)
+                self.settle_direct_completion(path, upload_id, size, expected.as_deref(), failure)
+                    .await?
             }
         };
         match expected {
@@ -282,21 +271,38 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         }
     }
 
-    async fn reconcile_completion(
+    /// Settles a failed completion by aborting the upload first. One already gone (`NoSuchUpload`)
+    /// completed: the object is ours when it is the key's latest version with our size and
+    /// composite `ETag`, and that version is claimed (ADR-0006 C17). One that could still be
+    /// aborted — or whose abort failed — may never have completed, and an identical earlier object
+    /// would match as well: it counts as written, but no version is claimed.
+    async fn settle_direct_completion(
         &self,
         path: &StoragePath,
+        upload_id: &str,
         size: u64,
         expected: Option<&str>,
         failure: S3ProtocolFailure,
     ) -> Result<S3WriteFacts, StorageRoleFailure> {
-        match (self.protocol.head(path.as_str()).await, expected) {
-            (Ok(facts), Some(expected))
-                if facts.size == size && single::same_etag(&facts.etag, expected) =>
-            {
-                Ok(S3WriteFacts::new(facts.etag, facts.version_id))
-            }
-            _ => Err(role_failure(path, Operation::Write, failure)),
+        let aborted = self
+            .protocol
+            .abort_multipart(path.as_str(), upload_id)
+            .await;
+        let gone = matches!(
+            &aborted,
+            Err(S3ProtocolFailure::Entry {
+                class: FailureClass::NotFound,
+                ..
+            })
+        );
+        if let Err(error) = cleanup_result(path, aborted) {
+            tracing::warn!(path = %path.as_str(), ?error, "could not abort a failed Direct S3 upload");
         }
+        let found = match expected {
+            Some(expected) => completed_object(&*self.protocol, path, size, expected, gone).await,
+            None => None,
+        };
+        found.ok_or_else(|| role_failure(path, Operation::Write, failure))
     }
 
     /// Aborts the stage's open upload, if any, trying twice. The engine keeps no failed `Direct`

@@ -84,6 +84,9 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | **带 versionId 的** GET 返回 400 且错误码 `InvalidArgument`（versionId 格式错） | 条目 `InvalidInput` / Permanent |
 | 其余 400（`ExpiredToken`、region 错……；HEAD 没有错误码，其 400 一律在此） | 仍按通用映射（会话级）—— 这些关乎整个会话 |
 | 不带 versionId 的 405 | 仍按通用映射（会话 `Protocol` / Unknown）—— DXN / SG 对不支持的操作也可能回 405 |
+| **按 versionId 的** DeleteObject 被 Object Lock 拒绝：AWS 403 `AccessDenied`，MinIO 400 `InvalidRequest`（"Object is WORM protected"，RELEASE.2023-03-20 实测），或 `ObjectLocked`（ADR-0006 C17，`role_protocol/versions.rs`） | 条目 `PermissionDenied` / Permanent —— 只关乎这个版本；删指针版本时降级为告警 + 删除标记（`upload_pointer::delete`），不算传输失败 |
+| 按 versionId 删除一个不存在的版本 | 成功（S3 / MinIO 回 204），不是错误 |
+| 按 versionId 的 DeleteObject 回 405（存储不支持按版本删） | 条目 `Unsupported` / Permanent —— **不是**带版本读的「删除标记」`NotFound`（清理会把它当成已删）；删指针时降级为普通删除 + 告警 |
 | describe 之后对象被替换（`read` / native bind / `observe_bound`） | 条目 `Conflict` / Permanent |
 | 请求 `Id(v)` 而 HEAD 回来的不是版本 v（存储忽略 `?versionId=`） | 条目 `Unsupported` / Permanent |
 

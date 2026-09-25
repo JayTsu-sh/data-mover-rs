@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::storage::backends::s3::{
     S3NativeCopyEvidence, S3NativeCopyFailure, S3NativeCopyResult, S3NativeCopySource,
-    S3ProtocolFailure, S3Result, S3WriteFacts,
+    S3ProtocolFailure, S3Result, S3VersionFacts, S3WriteFacts,
 };
 use crate::time_util::http_last_modified;
 
@@ -35,6 +35,7 @@ macro_rules! classify_sdk {
 
 mod multipart;
 mod native;
+mod versions;
 
 fn decode_parts(
     parts: &[aws_sdk_s3::types::Part],
@@ -369,6 +370,14 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .await
             .map(|_| ())
             .map_err(|error| classify_sdk!(error, "S3 DeleteObject request failed"))
+    }
+
+    async fn delete_version(&self, key: &str, version_id: &str) -> S3Result<()> {
+        self.role_delete_version(key, version_id).await
+    }
+
+    async fn list_versions(&self, key: &str) -> S3Result<Vec<S3VersionFacts>> {
+        self.role_list_versions(key).await
     }
 
     async fn get_tags(

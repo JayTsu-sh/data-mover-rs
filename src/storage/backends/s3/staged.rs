@@ -17,6 +17,7 @@ use crate::storage::{
 use super::source::{cancelled, classified_entry, entry, role_failure};
 
 mod at_destination;
+mod completion;
 mod direct;
 #[cfg(test)]
 mod manifest_tests;
@@ -704,7 +705,7 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         if stage_state.completed || stage_state.upload_id.is_empty() {
             cleanup_result(
                 stage.final_destination.path(),
-                self.protocol.delete_object(&key).await,
+                publication::delete_temp_key(&*self.protocol, &key).await,
             )?;
         } else {
             cleanup_result(
@@ -715,7 +716,7 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
             )?;
             cleanup_result(
                 stage.final_destination.path(),
-                self.protocol.delete_object(&key).await,
+                publication::delete_temp_key(&*self.protocol, &key).await,
             )?;
         }
         self.states.lock().await.remove(stage.token.as_ref());

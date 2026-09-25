@@ -59,9 +59,16 @@ pub(crate) struct MemoryS3 {
     /// The next `put_object` stores its object, then loses the reply (a transient connectivity
     /// failure).
     pub(crate) put_commits_then_fails: Mutex<bool>,
+    /// The next `put_object` is stored twice, as when the SDK re-sends a PUT whose first attempt
+    /// committed but lost its reply: a versioned bucket keeps two identical versions.
+    pub(crate) put_stored_twice: Mutex<bool>,
+    /// `put_object` replies carry no version header (some stores, even with versioning suspended).
+    pub(crate) put_omits_version: Mutex<bool>,
     /// The next `complete_multipart` stores its object, then loses the reply (a transient
     /// connectivity failure).
     pub(crate) complete_commits_then_fails: Mutex<bool>,
+    /// Written to the key right after that lost completion (a later writer).
+    pub(crate) written_after_lost_completion: Mutex<Option<Bytes>>,
     /// The next `complete_multipart` fails with this, completing nothing.
     pub(crate) complete_failure: Mutex<Option<S3ProtocolFailure>>,
     /// The next `complete_multipart` that stores its object reports this `ETag` instead of the
@@ -88,6 +95,8 @@ pub(crate) struct MemoryS3 {
     md5_cache: std::sync::Mutex<Md5Cache>,
     /// Source of upload ids and minted version ids, so none repeats.
     next_id: Mutex<u64>,
+    /// The versioned mode (ADR-0006 C17): see [`memory_versions`].
+    bucket: std::sync::Mutex<memory_versions::VersionedBucket>,
 }
 
 /// The `ETag` S3 reports for an object written by one `PutObject`: the quoted hex MD5 of its body.
@@ -134,6 +143,7 @@ impl MemoryS3 {
             .insert((key.to_string(), id.to_string()), Some(bytes.clone()));
         self.objects.lock().await.insert(key.to_string(), bytes);
         *self.version.lock().await = Some(id.to_string());
+        self.record_version(key, id);
     }
 
     /// Adds a delete marker as version `id` of `key`; the current object is gone.
@@ -143,6 +153,7 @@ impl MemoryS3 {
             .await
             .insert((key.to_string(), id.to_string()), None);
         self.objects.lock().await.remove(key);
+        self.record_version(key, id);
     }
 
     async fn next_id(&self) -> u64 {
@@ -181,6 +192,9 @@ impl MemoryS3 {
     }
 
     async fn store_written(&self, key: &str, bytes: Bytes) -> Option<String> {
+        if let Some(id) = self.versioned_store(key, &bytes).await {
+            return Some(id);
+        }
         let versioned = self
             .version
             .lock()
@@ -291,6 +305,9 @@ impl S3Protocol for MemoryS3 {
         {
             return Err(failure.clone());
         }
+        if let Some(facts) = self.versioned_head(key).await {
+            return facts;
+        }
         let objects = self.objects.lock().await;
         let bytes = objects.get(key).ok_or_else(|| {
             S3ProtocolFailure::entry(
@@ -379,7 +396,14 @@ impl S3Protocol for MemoryS3 {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&<[u8; 16]>::from(Md5::digest(&body)));
-        let version = self.store_written(key, body).await;
+        if mem::take(&mut *self.put_stored_twice.lock().await) {
+            self.store_written(key, body.clone()).await;
+        }
+        let omit_version = *self.put_omits_version.lock().await;
+        let version = self
+            .store_written(key, body)
+            .await
+            .filter(|_| !omit_version);
         if mem::take(&mut *self.put_commits_then_fails.lock().await) {
             return Err(S3ProtocolFailure::session(
                 crate::model::FailureClass::Connectivity,
@@ -471,6 +495,9 @@ impl S3Protocol for MemoryS3 {
         let version = self.store_written(&key, Bytes::from(bytes)).await;
         *self.completes.lock().await += 1;
         if mem::take(&mut *self.complete_commits_then_fails.lock().await) {
+            if let Some(later) = self.written_after_lost_completion.lock().await.take() {
+                self.store_written(&key, later).await;
+            }
             return Err(S3ProtocolFailure::session(
                 crate::model::FailureClass::Connectivity,
                 crate::model::Transience::Transient,
@@ -539,7 +566,9 @@ impl S3Protocol for MemoryS3 {
             .get(from)
             .cloned()
             .ok_or_else(|| S3ProtocolFailure::protocol("not found"))?;
-        self.objects.lock().await.insert(to.to_string(), bytes);
+        if self.versioned_store(to, &bytes).await.is_none() {
+            self.objects.lock().await.insert(to.to_string(), bytes);
+        }
         if *self.copy_commits_then_fails.lock().await {
             Err(S3ProtocolFailure::session(
                 crate::model::FailureClass::Connectivity,
@@ -594,7 +623,9 @@ impl S3Protocol for MemoryS3 {
                 requests: 1,
             });
         }
-        self.objects.lock().await.insert(to.to_string(), bytes);
+        if self.versioned_store(to, &bytes).await.is_none() {
+            self.objects.lock().await.insert(to.to_string(), bytes);
+        }
         *self.native_copies.lock().await += 1;
         Ok(S3NativeCopyEvidence {
             bytes: source.size,
@@ -602,8 +633,16 @@ impl S3Protocol for MemoryS3 {
         })
     }
     async fn delete_object(&self, key: &str) -> S3Result<()> {
-        self.objects.lock().await.remove(key);
+        if !self.versioned_delete(key).await {
+            self.objects.lock().await.remove(key);
+        }
         Ok(())
+    }
+    async fn delete_version(&self, key: &str, version_id: &str) -> S3Result<()> {
+        self.delete_one_version(key, version_id).await
+    }
+    async fn list_versions(&self, key: &str) -> S3Result<Vec<S3VersionFacts>> {
+        self.versions_of(key).await
     }
     async fn get_tags(&self, key: &str, version_id: Option<&str>) -> S3Result<Vec<ObjectTag>> {
         *self.tag_reads.lock().await += 1;
@@ -725,6 +764,10 @@ async fn memory_upload_ids_do_not_collide_on_one_key() {
     assert_ne!(first, second);
     assert_eq!(s3.uploads.lock().await.len(), 2);
 }
+
+#[path = "memory_versions.rs"]
+mod memory_versions;
+pub(crate) use memory_versions::Versioning;
 
 #[path = "role_tests.rs"]
 mod roles;

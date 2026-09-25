@@ -15,6 +15,11 @@
 //!
 //! It is written with one `PutObject` carrying `Content-MD5` (atomic: no temporary), read with a
 //! HEAD and a ranged GET pinned to what the HEAD saw, and deleted with `DeleteObject`.
+//!
+//! In a versioned bucket (ADR-0006 C17) a pointer is deleted by the version its write or read
+//! reported, so no delete marker is left and no pointer version piles up; a version Object Lock
+//! will not let go is hidden behind a delete marker instead, with a warning. A bucket that reports
+//! no version (unversioned) gets a plain `DeleteObject`, as before.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
@@ -22,7 +27,7 @@ use bytes::Bytes;
 use md5::{Digest as _, Md5};
 
 use super::super::source::{classified_entry, role_failure};
-use super::super::{S3Protocol, S3ProtocolFailure};
+use super::super::{S3Protocol, S3ProtocolFailure, is_real_version_id};
 use super::{MIN_MULTIPART_PART_SIZE, cleanup_result};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::StorageRoleFailure;
@@ -136,59 +141,204 @@ fn is_not_found(failure: &S3ProtocolFailure) -> bool {
     )
 }
 
-/// The pointer's bytes, up to `limit` of them; `None` when it is absent (or went away between the
-/// HEAD and the GET).
+/// A pointer as read: its bytes and the version the HEAD reported (as spelled, `"null"`
+/// included; `None` in an unversioned bucket).
+#[derive(Clone, Default)]
+pub(super) struct StoredPointer {
+    pub(super) bytes: Vec<u8>,
+    pub(super) version: Option<String>,
+}
+
+/// The pointer's bytes, up to `limit` of them, and its version; `None` when it is absent (or went
+/// away between the HEAD and the GET).
 pub(super) async fn read<P: S3Protocol>(
     protocol: &P,
     pointer: &StoragePath,
     limit: usize,
-) -> Result<Option<Vec<u8>>, StorageRoleFailure> {
+) -> Result<Option<StoredPointer>, StorageRoleFailure> {
     let facts = match protocol.head(pointer.as_str()).await {
         Ok(facts) => facts,
         Err(error) if is_not_found(&error) => return Ok(None),
         Err(error) => return Err(role_failure(pointer, Operation::Observe, error)),
     };
+    let version = facts.version_id.clone();
     let length = facts.size.min(limit as u64);
-    if length == 0 {
-        return Ok(Some(Vec::new()));
-    }
-    match protocol
-        .get_range(pointer.as_str(), 0..length, &facts)
-        .await
-    {
-        Ok(bytes) => Ok(Some(bytes.to_vec())),
-        Err(error) if is_not_found(&error) => Ok(None),
-        Err(error) => Err(role_failure(pointer, Operation::Observe, error)),
-    }
+    let bytes = if length == 0 {
+        Vec::new()
+    } else {
+        match protocol
+            .get_range(pointer.as_str(), 0..length, &facts)
+            .await
+        {
+            Ok(bytes) => bytes.to_vec(),
+            Err(error) if is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(role_failure(pointer, Operation::Observe, error)),
+        }
+    };
+    Ok(Some(StoredPointer { bytes, version }))
 }
 
-/// Writes the pointer with one `PutObject` carrying `Content-MD5`. A failed PUT whose object is
-/// there anyway, byte for byte (a lost reply), counts as written.
+/// Writes the pointer with one `PutObject` carrying `Content-MD5` and returns the version it
+/// created, as reported (see [`StoredPointer::version`]). A failed PUT whose object is there
+/// anyway, byte for byte (a lost reply), counts as written; its version is the one the read-back
+/// saw — the bytes carry this prepare's nonce, so no other write made them.
 pub(super) async fn put<P: S3Protocol>(
     protocol: &P,
     pointer: &StoragePath,
     bytes: Vec<u8>,
-) -> Result<(), StorageRoleFailure> {
+) -> Result<Option<String>, StorageRoleFailure> {
     let digest = BASE64_STANDARD.encode(Md5::digest(&bytes));
     let limit = bytes.len() + 1;
-    let Err(error) = protocol
+    let error = match protocol
         .put_object(pointer.as_str(), Bytes::from(bytes.clone()), &digest)
         .await
-    else {
-        return Ok(());
+    {
+        Ok(facts) => return Ok(facts.reported_version),
+        Err(error) => error,
     };
     match read(protocol, pointer, limit).await {
-        Ok(Some(found)) if found == bytes => Ok(()),
+        Ok(Some(found)) if found.bytes == bytes => Ok(found.version),
         _ => Err(role_failure(pointer, Operation::Write, error)),
     }
 }
 
-/// Deletes the pointer; an absent one is fine.
+/// Deletes the pointer; an absent one is fine. Named by `version` (what its write or read
+/// reported), it is deleted for good: in a versioned bucket a plain `DeleteObject` would keep the
+/// version behind a delete marker. A version that cannot be deleted by id — Object Lock refuses it,
+/// the store does not delete by version, or refuses `versionId=null` — falls back to a plain
+/// `DeleteObject`, with a warning: in a versioned bucket a delete marker then hides it, and a retry
+/// could never delete it either. Without a version (an unversioned bucket) it is a plain
+/// `DeleteObject`.
+///
+/// `stale` lists the contents a pointer version may hold that must not outlive this deletion (the
+/// deleted pointer's own bytes, and those of a pointer a resume replaced): after a delete by id,
+/// the version below becomes current, and a `PutObject` the SDK re-sent after a lost reply leaves
+/// a byte-identical version there. See [`sweep`].
 pub(super) async fn delete<P: S3Protocol>(
     protocol: &P,
     pointer: &StoragePath,
+    version: Option<&str>,
+    stale: &[&[u8]],
 ) -> Result<(), StorageRoleFailure> {
-    cleanup_result(pointer, protocol.delete_object(pointer.as_str()).await)
+    let Some(version) = version else {
+        return cleanup_result(pointer, protocol.delete_object(pointer.as_str()).await);
+    };
+    if delete_by_id(protocol, pointer, version).await? {
+        sweep(protocol, pointer, version, stale).await;
+    }
+    Ok(())
+}
+
+/// Deletes one pointer version by id; `false` when it had to be hidden behind a delete marker
+/// instead (see [`delete`]).
+async fn delete_by_id<P: S3Protocol>(
+    protocol: &P,
+    pointer: &StoragePath,
+    version: &str,
+) -> Result<bool, StorageRoleFailure> {
+    match protocol.delete_version(pointer.as_str(), version).await {
+        Err(error) if not_deletable_by_version(&error, version) => {
+            tracing::warn!(
+                pointer = %pointer.as_str(),
+                version,
+                ?error,
+                "could not delete the S3 upload pointer's version (Object Lock?); hiding it behind a delete marker"
+            );
+            cleanup_result(pointer, protocol.delete_object(pointer.as_str()).await)?;
+            Ok(false)
+        }
+        deleted => cleanup_result(pointer, deleted).map(|()| true),
+    }
+}
+
+/// The most versions [`sweep`] deletes after one pointer deletion.
+const MAX_SWEEPS: usize = 4;
+
+/// After a pointer version was deleted by id: while the pointer that is current now holds one of
+/// the `stale` contents (a duplicate the SDK's retry of a committed `PutObject` left, or the
+/// version a resume replaced), deletes that version too, at most [`MAX_SWEEPS`] times. Another
+/// writer's pointer is left alone. Best effort: the object is already published or discarded, so a
+/// failure here is logged — the next prepare of the key cleans up what is left.
+async fn sweep<P: S3Protocol>(protocol: &P, pointer: &StoragePath, deleted: &str, stale: &[&[u8]]) {
+    let limit = stale.iter().map(|bytes| bytes.len()).max().unwrap_or(0) + 1;
+    let mut last = deleted.to_string();
+    for _ in 0..MAX_SWEEPS {
+        let found = match read(protocol, pointer, limit).await {
+            Ok(Some(found)) if stale.contains(&found.bytes.as_slice()) => found,
+            Ok(_) => return,
+            Err(error) => {
+                tracing::warn!(pointer = %pointer.as_str(), ?error, "could not check the S3 upload pointer after deleting it");
+                return;
+            }
+        };
+        let Some(version) = found.version.filter(|version| *version != last) else {
+            return;
+        };
+        match delete_by_id(protocol, pointer, &version).await {
+            Ok(true) => last = version,
+            Ok(false) => return,
+            Err(error) => {
+                tracing::warn!(pointer = %pointer.as_str(), version, ?error, "could not delete a stale S3 upload pointer version");
+                return;
+            }
+        }
+    }
+    tracing::warn!(pointer = %pointer.as_str(), "stale S3 upload pointer versions remain after {MAX_SWEEPS} deletions");
+}
+
+/// Deletes an earlier writer's pointer version after a take-over wrote a new one over it, so it
+/// cannot come back once ours is deleted. Best effort: a failure is logged and reported as `false`
+/// — the replaced version is still there, so ours must then be hidden behind a delete marker rather
+/// than deleted by version, or the replaced one would become current again.
+///
+/// A replaced `"null"` was overwritten by our write unless ours reported a real version: in a
+/// suspended or unversioned bucket there is only one `"null"` version, now ours (some stores send
+/// no version header for it), so deleting `"null"` would delete our own pointer.
+pub(super) async fn delete_replaced<P: S3Protocol>(
+    protocol: &P,
+    pointer: &StoragePath,
+    replaced: Option<&str>,
+    ours: Option<&str>,
+) -> bool {
+    let overwritten = |replaced: &str| {
+        Some(replaced) == ours || (replaced == "null" && !ours.is_some_and(is_real_version_id))
+    };
+    let Some(replaced) = replaced.filter(|replaced| !overwritten(replaced)) else {
+        return true;
+    };
+    let deleted = protocol.delete_version(pointer.as_str(), replaced).await;
+    match cleanup_result(pointer, deleted) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                pointer = %pointer.as_str(),
+                version = replaced,
+                ?error,
+                "could not delete the S3 upload pointer version a resume replaced"
+            );
+            false
+        }
+    }
+}
+
+/// A version that a delete by id cannot remove: Object Lock (a legal hold or retention) or a
+/// policy without `DeleteObjectVersion` (`PermissionDenied`), a store that does not delete by
+/// version (`Unsupported`), or one that refuses the id `"null"` it reported (`InvalidInput`).
+pub(super) fn not_deletable_by_version(failure: &S3ProtocolFailure, version: &str) -> bool {
+    matches!(
+        failure,
+        S3ProtocolFailure::Entry {
+            class: FailureClass::PermissionDenied | FailureClass::Unsupported,
+            ..
+        }
+    ) || (version == "null"
+        && matches!(
+            failure,
+            S3ProtocolFailure::Entry {
+                class: FailureClass::InvalidInput,
+                ..
+            }
+        ))
 }
 
 /// Aborts every upload in progress on exactly `key` except `keep`; an upload already gone is fine.

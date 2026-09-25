@@ -15,7 +15,10 @@
 //! replaces the derived identity with a label, which a resume must then repeat.
 //!
 //! `--source-version <versionId>` copies one stored version of an S3 source; the selector is part of
-//! the derived identity, so a resume must repeat it.
+//! the derived identity, so a resume must repeat it. `--client-shaped` streams an S3→S3 copy instead
+//! of copying it natively (a native copy is not resumable until ADR-0006 C18).
+//!
+//! With `RUST_LOG` set, the library's tracing (warnings included) goes to stderr.
 //!
 //! The identity goes to stderr as soon as the request is built, so a run killed before it reports
 //! still leaves it behind, and into the stdout line as `identity`.
@@ -26,9 +29,10 @@
 
 mod endpoint_support;
 
+use std::env;
 use std::error::Error;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Write as _, stderr};
 use std::path::Path;
 use std::process::exit;
 use std::time::{Duration, Instant};
@@ -38,8 +42,9 @@ use data_mover::integrity::{IntegrityMode, IntegrityOptions, IntegrityRequest, c
 use data_mover::model::StoragePath;
 use data_mover::storage::{Storage, create_directory_all};
 use data_mover::transfer::{
-    InflightLimits, ReadBackVerification, SourceQosGroup, SourceQosPolicy, SourceVersion,
-    TransferFailure, TransferIdentity, TransferOutcome, TransferPolicy, TransferRequest, transfer,
+    InflightLimits, PayloadShapingPolicy, ReadBackVerification, SourceQosGroup, SourceQosPolicy,
+    SourceVersion, TransferFailure, TransferIdentity, TransferOutcome, TransferPolicy,
+    TransferRequest, transfer,
 };
 use endpoint_support::{Result, artifacts, connect, remove_run};
 use serde_json::{Value, json};
@@ -72,6 +77,9 @@ struct Args {
     /// Any other source fails at preflight, before the destination is touched.
     #[arg(long)]
     source_version: Option<String>,
+    /// Stream the payload through this process even where a native (server-side) copy is possible.
+    #[arg(long)]
+    client_shaped: bool,
     /// Hard limit on source read bandwidth, so an interruption lands mid-transfer.
     #[arg(long)]
     bandwidth: Option<u64>,
@@ -179,6 +187,9 @@ fn request(
     if let Some(version) = &args.source_version {
         request = request.with_source_version(SourceVersion::Id(version.clone()));
     }
+    if args.client_shaped {
+        request = request.with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
+    }
     if let Some(label) = &args.identity {
         request = request.with_identity_override(TransferIdentity::from_label(label.as_str())?);
     }
@@ -263,9 +274,22 @@ async fn compare_content(args: &Args) -> Result<Value> {
     }))
 }
 
+/// `RUST_LOG=warn` shows the library's warnings (an S3 pointer version Object Lock kept, ADR-0006
+/// C17) on stderr; stdout keeps its one JSON line.
+fn init_tracing() {
+    if env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_ansi(false)
+            .with_writer(stderr)
+            .try_init();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result {
     let args = Args::parse();
+    init_tracing();
     if let Some(line) = inspect(&args).await? {
         println!("{line}");
         return Ok(());

@@ -409,6 +409,58 @@ before the first checkpoint that is discarded now leaves a pointer version and a
 restarted from zero) MinIO now resumed 75497472 bytes after a cancellation and 41943040 after a
 SIGKILL, BLAKE3 equal, nothing left.
 
+As built (C17, S3 versioning): the S3 protocol gains `delete_version` (`DeleteObject` with a
+`versionId`: the version is gone for good, no delete marker; a version the store does not hold is
+fine; Object Lock refusing it is a permanent `PermissionDenied` of the entry — AWS answers 403
+`AccessDenied`, MinIO 400 `InvalidRequest` "Object is WORM protected"; a 405 is `Unsupported`, not
+the delete-marker `NotFound` a versioned read gets) and `list_versions`
+(`ListObjectVersions` with the key as prefix, exact-key entries only). A write keeps the version id as
+the response spelled it (`S3WriteFacts.reported_version`, `"null"` included). The `.upload` pointer is
+deleted by the version its PUT reported; a PUT whose reply was lost and whose object reads back byte
+for byte takes the version the read-back HEAD saw (the bytes carry this prepare's nonce). Discovery
+deletes a leftover pointer by the version it read, and a resume, once its own pointer is written,
+deletes the version it replaced — otherwise that one would become current again when ours goes; if
+that fails (logged), its own pointer is later hidden with a plain delete instead, one marker covering
+both. A replaced `"null"` is left alone when our write reported no real version: it was the one
+`"null"` version, which our write overwrote. After any delete by id the pointer is read again: the
+SDK's retry of a `PutObject` that committed but lost its reply leaves a byte-identical version below
+the one we know, so a current pointer holding the bytes just deleted (or those a resume replaced) is
+deleted by its version too, at most four times; another writer's pointer is left alone. `"null"` (suspended versioning) is deleted as `versionId=null`; a bucket that reports
+no version keeps the plain `DeleteObject`. A pointer version that cannot be deleted by id (Object Lock,
+a policy without `DeleteObjectVersion`, a store without delete-by-version, a refused `"null"`) is hidden
+behind a delete marker with a warning: the transfer
+still succeeds and reports its version, and the next prepare finds no pointer. No path sends an
+unversioned `DeleteObject` to a final key (only the pointer and the temp key are ever deleted so); the
+in-memory S3 logs plain deletes and the versioning tests assert none reached a final key. A completion
+that was not refused before it could commit and whose upload `ListParts` reports gone is settled
+through the key's versions: the **latest** entry must be a version with our size and composite `ETag`,
+and its version is claimed — under the caller contract (one writer per key) the gone upload committed
+and nothing was written after it (the residual cases: anything that aborts our upload before it
+completes — a lifecycle rule, another writer's prepare aborting uploads on the key — leaves an
+identical earlier latest version to be claimed, and a later identical write by another writer would
+be claimed too; the bytes match either way); a store that cannot list versions, or lists none,
+falls back to the HEAD and claims none. `Direct` aborts first: an upload already gone completed and is settled the same way; one that
+could still be aborted never completed, so an identical earlier object still counts (C14c) but no
+version is claimed. The C15c rule for `final_destination_changed` is unchanged. Suspended versioning
+reports `"null"` (MinIO's completion reports no version at all): no `destination_version`. A native
+S3→S3 copy still goes through the temp key until C18; the temp key (this stage's alone) is now deleted
+entry by entry as its version listing shows it — the `"null"` version and markers included, and
+nothing at all when the listing is empty — so no full-size copy stays behind a marker, and a `CopyObject` that succeeded
+reports the final key's current version (one LIST and one HEAD more per native publication, until
+C18). Still open: pointer versions and markers left before C17 stay hidden under their markers, and a
+single `PutObject` whose reply was lost still claims the HEAD's version (C14b). Verified on MinIO (VM 102) with `versioning_matrix.sh` in two temporary buckets (one
+versioned, one with Object Lock; both deleted afterwards, versions, markers, holds and uploads
+included; run three times, the last two after review fixes, with the same results): 4 MiB and 200 MiB checkpointed copies, `Direct`
+4 MiB / 20 MiB and native S3→S3 4 MiB / 200 MiB each left one version of the key, no delete marker
+and no `.data-mover-*` entry, and reported that version; v1 then v2 copied
+by `--source-version` (100 MiB each, streamed) gave two versions in that order, each equal to its
+source; an `Id` copy cancelled at 3 s resumed `Resumed { 16777216 }` into one version; the resume
+matrix (200 MiB, 20 MiB/s, 6 s cut) resumed `Resumed { 75497472 }` after a cancellation and
+`Resumed { 41943040 }` after a SIGKILL, BLAKE3 equal, one version, no marker, no artifact; a legal
+hold placed on the pointer version during a 200 MiB copy left the transfer successful with its
+version, one warning and the pointer behind one marker; with versioning suspended every write path
+reported no version and left one `"null"` version.
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS

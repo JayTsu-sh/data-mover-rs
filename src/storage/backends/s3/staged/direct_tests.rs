@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::DEFAULT_SINGLE_PUT_THRESHOLD;
 use super::*;
 use crate::model::{EntryKind, IdentityStrength, SourceIdentity};
-use crate::storage::backends::s3::tests::{MemoryS3, identity};
+use crate::storage::backends::s3::tests::{MemoryS3, Versioning, identity};
 use crate::storage::{
     FinalDestination, PublishRequest, SourceDescriptor, StagedDestination, VerificationPoint,
 };
@@ -215,9 +215,9 @@ async fn a_failed_input_aborts_the_upload() -> TestResult {
 }
 
 /// A completion whose reply is lost counts as done when the final object has our size and the
-/// composite `ETag` of our parts. The upload is aborted anyway — the match may be an identical
-/// earlier object while ours never completed (a completed one answers not-found) — and no version
-/// is claimed.
+/// composite `ETag` of our parts. The upload is aborted first: a completed one answers not-found,
+/// and its version — none in this unversioned bucket — is taken from the key's versions
+/// (ADR-0006 C17).
 #[tokio::test]
 async fn a_lost_completion_reply_is_reconciled() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
@@ -229,6 +229,32 @@ async fn a_lost_completion_reply_is_reconciled() -> TestResult {
     assert_eq!(*protocol.aborts.lock().await, 1);
     assert!(protocol.uploads.lock().await.is_empty());
     publish_and_verify(&destination, &stage, &payload).await?;
+    Ok(())
+}
+
+/// A completion that failed without committing, over an identical earlier object: the upload
+/// could still be aborted, so ours never completed. The earlier object counts as the write (C14c),
+/// but its version is not claimed — only a hidden completion's is (ADR-0006 C17).
+#[tokio::test]
+async fn an_unfinished_completion_over_an_identical_object_claims_no_version() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
+    let destination = destination(&protocol);
+    let payload = Bytes::from(vec![7; 9 * MIB]);
+    let first = prepared(&destination, Some(payload.len() as u64)).await?;
+    destination.write(&first, chunks(&payload)).await?;
+    let first = publish_and_verify(&destination, &first, &payload).await?;
+    assert!(first.version.is_some());
+    *protocol.complete_failure.lock().await = Some(S3ProtocolFailure::session(
+        FailureClass::Connectivity,
+        Transience::Transient,
+        "complete reset",
+    ));
+    let second = prepared(&destination, Some(payload.len() as u64)).await?;
+    destination.write(&second, chunks(&payload)).await?;
+    assert!(protocol.uploads.lock().await.is_empty());
+    let second = publish_and_verify(&destination, &second, &payload).await?;
+    assert_eq!(second.version, None);
     Ok(())
 }
 

@@ -79,16 +79,38 @@ pub(crate) struct S3WriteFacts {
     pub etag: String,
     /// The version the write created; `None` when the response named no real version.
     pub version_id: Option<String>,
+    /// The version id exactly as the response spelled it — `"null"` included, which a bucket with
+    /// versioning suspended reports — or `None` when it named none (an unversioned bucket). A
+    /// delete of exactly this object names it ([`S3Protocol::delete_version`]).
+    pub reported_version: Option<String>,
 }
 
 impl S3WriteFacts {
-    /// Keeps `reported_version` only when it is a real version id (see [`is_real_version_id`]).
+    /// Keeps `reported_version` as the object's version only when it is a real version id (see
+    /// [`is_real_version_id`]).
     pub(crate) fn new(etag: String, reported_version: Option<String>) -> Self {
         Self {
             etag,
-            version_id: reported_version.filter(|version| is_real_version_id(version)),
+            version_id: reported_version
+                .clone()
+                .filter(|version| is_real_version_id(version)),
+            reported_version,
         }
     }
+}
+
+/// One stored version, or delete marker, of a key as `ListObjectVersions` reports it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct S3VersionFacts {
+    /// As the listing spells it: `"null"` for the object an unversioned (or suspended) bucket
+    /// holds.
+    pub version_id: String,
+    pub is_latest: bool,
+    pub delete_marker: bool,
+    /// Zero for a delete marker.
+    pub size: u64,
+    /// Empty for a delete marker.
+    pub etag: String,
 }
 
 /// The `ETag` S3 gives an object completed from parts whose `ETag`s are `part_etags`, in part
@@ -214,7 +236,18 @@ pub(crate) trait S3Protocol: Send + Sync {
         multipart_upload_id: Option<&str>,
         cancel: &CancellationToken,
     ) -> S3NativeCopyResult;
+    /// An unversioned `DeleteObject`: in a versioned bucket it adds a delete marker and keeps every
+    /// version. Never sent to a final key (ADR-0006 C17); only transfer artifacts are deleted so.
     async fn delete_object(&self, key: &str) -> S3Result<()>;
+    /// Deletes one stored version (or delete marker) of `key` for good, adding no delete marker.
+    /// A version the store does not hold is not an error (S3 answers 204). A version Object Lock
+    /// protects is a permanent `PermissionDenied` entry failure (AWS answers 403 `AccessDenied`,
+    /// `MinIO` 400 `InvalidRequest`).
+    async fn delete_version(&self, key: &str, version_id: &str) -> S3Result<()>;
+    /// Every stored version and delete marker of exactly `key` — not of keys that merely start
+    /// with it — in no guaranteed order: `is_latest` marks the current entry. An unversioned
+    /// bucket lists its object as version `"null"`.
+    async fn list_versions(&self, key: &str) -> S3Result<Vec<S3VersionFacts>>;
     /// Tags of the current object, or of one stored version.
     async fn get_tags(&self, key: &str, version_id: Option<&str>) -> S3Result<Vec<ObjectTag>>;
     async fn put_tags(&self, key: &str, tags: &[ObjectTag]) -> S3Result<()>;

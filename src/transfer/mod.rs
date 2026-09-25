@@ -36,6 +36,8 @@ mod s3_native_tests;
 #[cfg(test)]
 mod s3_single_put_tests;
 #[cfg(test)]
+mod s3_versioning_tests;
+#[cfg(test)]
 mod source_version_tests;
 #[cfg(test)]
 mod tests;

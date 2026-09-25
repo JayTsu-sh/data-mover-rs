@@ -535,8 +535,9 @@ async fn written_stage(
 }
 
 /// A completion whose reply is lost, with the upload gone afterwards: our size and composite
-/// `ETag` at the final key count as published — without claiming a version, even in a versioned
-/// bucket — and the pointer is removed.
+/// `ETag` at the final key count as published and the pointer is removed. The key's versions list
+/// the object as `"null"` here, so no version is claimed (a versioned bucket's is: ADR-0006 C17,
+/// `transfer::s3_versioning_tests`).
 #[tokio::test]
 async fn a_lost_completion_reply_of_a_gone_upload_counts_as_published() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
@@ -841,3 +842,6 @@ fn only_a_last_part_that_ends_at_the_source_size_may_be_short() {
     );
     assert_eq!((bytes, numbers(&prefix)), (2 * PART as u64, vec![1, 2]));
 }
+
+#[path = "versioning_tests.rs"]
+mod versioning;

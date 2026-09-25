@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 use super::super::source::role_failure;
 use super::super::{S3PartFacts, S3Protocol, S3ProtocolFailure};
-use super::upload_pointer::{self, UploadRecord, accepted};
+use super::upload_pointer::{self, StoredPointer, UploadRecord, accepted};
 use crate::model::{FailureClass, Operation, StoragePath};
 use crate::storage::discovery::DestinationArtifacts;
 use crate::storage::pointer::DestinationPointer;
@@ -63,6 +63,17 @@ pub(super) struct S3Artifacts<'a, P> {
     found: Mutex<Option<UploadRecord>>,
     /// That upload's contiguous prefix, as `observe_stage` listed it.
     prefix: Mutex<Vec<(i32, String)>>,
+    /// The pointer `read_pointer` found (bytes and version), whether accepted or not: a clean-up
+    /// deletes exactly that version, and a resume deletes it once its own pointer replaced it.
+    found_pointer: Mutex<Option<StoredPointer>>,
+}
+
+/// What discovery left for a resume: the accepted pointer's upload record, that pointer as read
+/// (its version and bytes), and the upload's contiguous prefix.
+pub(super) struct Found {
+    pub(super) record: Option<UploadRecord>,
+    pub(super) pointer: Option<StoredPointer>,
+    pub(super) prefix: Vec<(i32, String)>,
 }
 
 impl<'a, P> S3Artifacts<'a, P> {
@@ -79,20 +90,33 @@ impl<'a, P> S3Artifacts<'a, P> {
             request,
             found: Mutex::new(None),
             prefix: Mutex::new(Vec::new()),
+            found_pointer: Mutex::new(None),
         }
     }
 
-    /// The accepted pointer's upload record and that upload's contiguous prefix, as discovery
-    /// left them: what a resume continues.
-    pub(super) fn into_found(self) -> (Option<UploadRecord>, Vec<(i32, String)>) {
-        (
-            self.found
+    /// What discovery left: what a resume continues.
+    pub(super) fn into_found(self) -> Found {
+        Found {
+            record: self
+                .found
                 .into_inner()
                 .unwrap_or_else(PoisonError::into_inner),
-            self.prefix
+            pointer: self
+                .found_pointer
                 .into_inner()
                 .unwrap_or_else(PoisonError::into_inner),
-        )
+            prefix: self
+                .prefix
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+
+    fn found_pointer(&self) -> Option<StoredPointer> {
+        self.found_pointer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn accepts(&self, pointer: &DestinationPointer) -> Option<UploadRecord> {
@@ -107,12 +131,17 @@ impl<P: S3Protocol> DestinationArtifacts for S3Artifacts<'_, P> {
         _final_path: &StoragePath,
         limit: usize,
     ) -> Result<Option<Vec<u8>>, StorageRoleFailure> {
-        let bytes = upload_pointer::read(self.protocol, self.pointer, limit).await?;
+        let stored = upload_pointer::read(self.protocol, self.pointer, limit).await?;
+        let bytes = stored.as_ref().map(|stored| stored.bytes.clone());
         let record = bytes
             .as_deref()
             .and_then(|bytes| DestinationPointer::decode(bytes).ok())
             .and_then(|pointer| self.accepts(&pointer));
         *self.found.lock().unwrap_or_else(PoisonError::into_inner) = record;
+        *self
+            .found_pointer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = stored;
         Ok(bytes)
     }
 
@@ -149,7 +178,17 @@ impl<P: S3Protocol> DestinationArtifacts for S3Artifacts<'_, P> {
     }
 
     async fn remove_pointer(&self, _final_path: &StoragePath) -> Result<(), StorageRoleFailure> {
-        upload_pointer::delete(self.protocol, self.pointer).await
+        let Some(found) = self.found_pointer() else {
+            return upload_pointer::delete(self.protocol, self.pointer, None, &[]).await;
+        };
+        let stale = [found.bytes.as_slice()];
+        upload_pointer::delete(
+            self.protocol,
+            self.pointer,
+            found.version.as_deref(),
+            &stale,
+        )
+        .await
     }
 
     async fn remove_stage(&self, _final_path: &StoragePath) -> Result<(), StorageRoleFailure> {
