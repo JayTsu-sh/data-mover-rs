@@ -2,15 +2,15 @@ use std::fmt;
 
 use super::{
     BackendIdentity, BackendKind, EntryKind, MAX_MODEL_FIELD_BYTES, MetadataObservations,
-    ModelValueError, SpecialFileKind, StoragePath, StorageTimestamp, TimePrecision,
+    ModelValueError, StoragePath, StorageTimestamp,
 };
 
-const MAGIC: &[u8; 4] = b"DMES";
-/// v5 (ADR-0006 C4c): the backend identity is no longer stored — every entry of one scan shares it,
-/// and the caller supplies it when decoding; a 4-byte endpoint fingerprint tells a wrong endpoint
-/// from a corrupted key. v4 carried the identity per entry and still decodes.
-const VERSION: u8 = 5;
-const VERSION_WITH_BACKEND_ID: u8 = 4;
+#[path = "observation_codec.rs"]
+mod codec;
+#[cfg(test)]
+use codec::VERSION_WITH_BACKEND_ID;
+use codec::backend_tag;
+pub(super) use codec::{Cursor, decode_time, encode_time, put_bytes};
 
 /// How strongly a source identity survives namespace changes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -216,21 +216,6 @@ impl fmt::Debug for PrivateBackendEntryFacts {
     }
 }
 
-impl PrivateBackendEntryFacts {
-    fn encode(&self, output: &mut Vec<u8>) {
-        let (tag, bytes) = match self {
-            Self::None => (0, &[][..]),
-            Self::Local(bytes) => (1, bytes.as_slice()),
-            Self::Nfs(bytes) => (2, bytes.as_slice()),
-            Self::Cifs(bytes) => (3, bytes.as_slice()),
-            Self::S3(bytes) => (4, bytes.as_slice()),
-            Self::Hdfs(bytes) => (5, bytes.as_slice()),
-        };
-        output.push(tag);
-        put_bytes(output, bytes);
-    }
-}
-
 /// An immutable point-in-time observation of one storage entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservedEntry {
@@ -401,47 +386,6 @@ impl ObservedEntry {
         self.encode(true)
     }
 
-    fn encode(&self, with_backend_id: bool) -> EntrySnapshot {
-        let mut output = Vec::new();
-        output.extend_from_slice(MAGIC);
-        output.push(if with_backend_id {
-            VERSION_WITH_BACKEND_ID
-        } else {
-            VERSION
-        });
-        output.push(backend_tag(self.backend_kind));
-        put_bytes(&mut output, self.path.as_str().as_bytes());
-        encode_kind(&mut output, self.kind);
-        match &self.symlink_target {
-            Some(target) => {
-                output.push(1);
-                output.push(match target.encoding() {
-                    SymlinkTargetEncoding::UnixBytes => 0,
-                    SymlinkTargetEncoding::WindowsWide => 1,
-                });
-                put_bytes(&mut output, target.as_bytes());
-            }
-            None => output.push(0),
-        }
-        encode_size(&mut output, self.size);
-        encode_time(&mut output, self.modified);
-        output.push(self.source_identity.strength.tag());
-        if with_backend_id {
-            put_bytes(
-                &mut output,
-                self.source_identity.backend.stable_id().as_bytes(),
-            );
-        } else {
-            output.extend_from_slice(&endpoint_fingerprint(&self.source_identity.backend));
-        }
-        put_bytes(&mut output, &self.source_identity.stable_bytes);
-        output.push(2);
-        super::metadata_observation::encode(&self.metadata, &mut output);
-        self.backend_fact.encode(&mut output);
-        output.extend_from_slice(self.identity_key.as_bytes());
-        EntrySnapshot(output)
-    }
-
     /// Reconstructs an observation from an unchanged snapshot taken on `backend`.
     ///
     /// A snapshot does not store the backend identity (every entry of one scan shares it): the
@@ -464,7 +408,7 @@ impl ObservedEntry {
         bytes: &[u8],
         backend: &BackendIdentity,
     ) -> Result<Self, SnapshotDecodeError> {
-        decode_snapshot(bytes, backend)
+        codec::decode_snapshot(bytes, backend)
     }
 }
 
@@ -520,278 +464,6 @@ impl fmt::Display for SnapshotDecodeError {
 }
 
 impl std::error::Error for SnapshotDecodeError {}
-
-pub(super) struct Cursor<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-impl<'a> Cursor<'a> {
-    pub(super) fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-    fn take(&mut self, len: usize) -> Result<&'a [u8], SnapshotDecodeError> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or(SnapshotDecodeError::FieldTooLarge)?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or(SnapshotDecodeError::Truncated)?;
-        self.offset = end;
-        Ok(value)
-    }
-    pub(super) fn byte(&mut self) -> Result<u8, SnapshotDecodeError> {
-        Ok(self.take(1)?[0])
-    }
-    pub(super) fn u32(&mut self) -> Result<u32, SnapshotDecodeError> {
-        let mut value = [0; 4];
-        value.copy_from_slice(self.take(4)?);
-        Ok(u32::from_le_bytes(value))
-    }
-    pub(super) fn bytes(&mut self) -> Result<&'a [u8], SnapshotDecodeError> {
-        let len = self.u32()? as usize;
-        if len > MAX_MODEL_FIELD_BYTES {
-            return Err(SnapshotDecodeError::FieldTooLarge);
-        }
-        self.take(len)
-    }
-}
-
-fn decode_snapshot(
-    bytes: &[u8],
-    backend: &BackendIdentity,
-) -> Result<ObservedEntry, SnapshotDecodeError> {
-    let mut cursor = Cursor::new(bytes);
-    if cursor.take(4)? != MAGIC {
-        return Err(SnapshotDecodeError::InvalidMagic);
-    }
-    let version = cursor.byte()?;
-    if version != VERSION && version != VERSION_WITH_BACKEND_ID {
-        return Err(SnapshotDecodeError::UnsupportedVersion);
-    }
-    let backend_kind = backend_from_tag(cursor.byte()?).ok_or(SnapshotDecodeError::Malformed)?;
-    let path = std::str::from_utf8(cursor.bytes()?).map_err(|_| SnapshotDecodeError::Malformed)?;
-    let path = StoragePath::new(path).map_err(|_| SnapshotDecodeError::Malformed)?;
-    let kind = decode_kind(&mut cursor)?;
-    let symlink_target = decode_symlink_target(&mut cursor, kind)?;
-    let size = decode_size(&mut cursor)?;
-    let modified = decode_time(&mut cursor)?;
-    let source_identity = decode_source_identity(&mut cursor, version, backend_kind, backend)?;
-    let schema_version = cursor.byte()?;
-    if schema_version != 2 {
-        return Err(SnapshotDecodeError::Malformed);
-    }
-    let metadata = super::metadata_observation::decode(&mut cursor)?;
-    let backend_fact = decode_facts(&mut cursor, backend_kind)?;
-    let mut encoded_key = [0; 32];
-    encoded_key.copy_from_slice(cursor.take(32)?);
-    if cursor.offset != bytes.len() {
-        return Err(SnapshotDecodeError::TrailingData);
-    }
-    let identity_key = source_identity.identity_key();
-    if encoded_key != *identity_key.as_bytes() {
-        return Err(SnapshotDecodeError::IdentityMismatch);
-    }
-    Ok(ObservedEntry {
-        identity_key,
-        backend_kind,
-        path,
-        kind,
-        size,
-        modified,
-        symlink_target,
-        source_identity,
-        metadata,
-        backend_fact,
-    })
-}
-
-/// The source identity of a snapshot: strength, backend (the caller's for v5, checked by kind and
-/// endpoint fingerprint; the stored one for v4, checked by kind), and stable bytes.
-fn decode_source_identity(
-    cursor: &mut Cursor<'_>,
-    version: u8,
-    backend_kind: BackendKind,
-    backend: &BackendIdentity,
-) -> Result<SourceIdentity, SnapshotDecodeError> {
-    let strength =
-        IdentityStrength::from_tag(cursor.byte()?).ok_or(SnapshotDecodeError::Malformed)?;
-    if backend.kind() != backend_kind {
-        return Err(SnapshotDecodeError::BackendMismatch);
-    }
-    let backend = if version == VERSION_WITH_BACKEND_ID {
-        let backend_id =
-            std::str::from_utf8(cursor.bytes()?).map_err(|_| SnapshotDecodeError::Malformed)?;
-        BackendIdentity::new(backend_kind, backend_id)
-            .map_err(|_| SnapshotDecodeError::Malformed)?
-    } else if cursor.take(4)? == endpoint_fingerprint(backend) {
-        backend.clone()
-    } else {
-        return Err(SnapshotDecodeError::BackendMismatch);
-    };
-    SourceIdentity::new(backend, strength, cursor.bytes()?)
-        .map_err(|_| SnapshotDecodeError::Malformed)
-}
-
-/// Four bytes of the endpoint's hash: enough to tell a wrong endpoint from a corrupted key, which
-/// the 32-byte identity key check then decides for the rest (a wrong endpoint sharing the four
-/// bytes, 1 in 2^32, is reported as `IdentityMismatch`).
-fn endpoint_fingerprint(backend: &BackendIdentity) -> [u8; 4] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"data-mover/endpoint-fingerprint/v1\0");
-    hasher.update(backend.stable_id().as_bytes());
-    let hash = hasher.finalize();
-    let mut fingerprint = [0; 4];
-    fingerprint.copy_from_slice(&hash.as_bytes()[..4]);
-    fingerprint
-}
-
-fn decode_symlink_target(
-    cursor: &mut Cursor<'_>,
-    kind: EntryKind,
-) -> Result<Option<SymlinkTarget>, SnapshotDecodeError> {
-    match cursor.byte()? {
-        0 if kind != EntryKind::Symlink => Ok(None),
-        1 if kind == EntryKind::Symlink => {
-            let encoding = match cursor.byte()? {
-                0 => SymlinkTargetEncoding::UnixBytes,
-                1 => SymlinkTargetEncoding::WindowsWide,
-                _ => return Err(SnapshotDecodeError::Malformed),
-            };
-            SymlinkTarget::new(encoding, cursor.bytes()?.to_vec())
-                .map(Some)
-                .map_err(|_| SnapshotDecodeError::Malformed)
-        }
-        _ => Err(SnapshotDecodeError::Malformed),
-    }
-}
-
-pub(super) fn put_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
-    let Ok(len) = u32::try_from(bytes.len()) else {
-        unreachable!("model field invariant limits encoded lengths");
-    };
-    output.extend_from_slice(&len.to_le_bytes());
-    output.extend_from_slice(bytes);
-}
-const fn backend_tag(kind: BackendKind) -> u8 {
-    match kind {
-        BackendKind::Local => 0,
-        BackendKind::Nfs => 1,
-        BackendKind::Cifs => 2,
-        BackendKind::S3 => 3,
-        BackendKind::Hdfs => 4,
-    }
-}
-const fn backend_from_tag(tag: u8) -> Option<BackendKind> {
-    match tag {
-        0 => Some(BackendKind::Local),
-        1 => Some(BackendKind::Nfs),
-        2 => Some(BackendKind::Cifs),
-        3 => Some(BackendKind::S3),
-        4 => Some(BackendKind::Hdfs),
-        _ => None,
-    }
-}
-fn encode_kind(output: &mut Vec<u8>, kind: EntryKind) {
-    let tag = match kind {
-        EntryKind::File => 0,
-        EntryKind::Directory => 1,
-        EntryKind::Symlink => 2,
-        EntryKind::Special(SpecialFileKind::BlockDevice) => 3,
-        EntryKind::Special(SpecialFileKind::CharacterDevice) => 4,
-        EntryKind::Special(SpecialFileKind::Fifo) => 5,
-        EntryKind::Special(SpecialFileKind::Socket) => 6,
-    };
-    output.push(tag);
-}
-fn decode_kind(cursor: &mut Cursor<'_>) -> Result<EntryKind, SnapshotDecodeError> {
-    match cursor.byte()? {
-        0 => Ok(EntryKind::File),
-        1 => Ok(EntryKind::Directory),
-        2 => Ok(EntryKind::Symlink),
-        3 => Ok(EntryKind::Special(SpecialFileKind::BlockDevice)),
-        4 => Ok(EntryKind::Special(SpecialFileKind::CharacterDevice)),
-        5 => Ok(EntryKind::Special(SpecialFileKind::Fifo)),
-        6 => Ok(EntryKind::Special(SpecialFileKind::Socket)),
-        _ => Err(SnapshotDecodeError::Malformed),
-    }
-}
-fn encode_size(output: &mut Vec<u8>, size: Option<u64>) {
-    match size {
-        Some(value) => {
-            output.push(1);
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        None => output.push(0),
-    }
-}
-fn decode_size(cursor: &mut Cursor<'_>) -> Result<Option<u64>, SnapshotDecodeError> {
-    match cursor.byte()? {
-        0 => Ok(None),
-        1 => {
-            let mut value = [0; 8];
-            value.copy_from_slice(cursor.take(8)?);
-            Ok(Some(u64::from_le_bytes(value)))
-        }
-        _ => Err(SnapshotDecodeError::Malformed),
-    }
-}
-pub(super) fn encode_time(output: &mut Vec<u8>, time: Option<StorageTimestamp>) {
-    match time {
-        Some(value) => {
-            output.push(1);
-            output.extend_from_slice(&value.unix_nanos().to_le_bytes());
-            output.push(match value.precision() {
-                TimePrecision::Seconds => 0,
-                TimePrecision::Milliseconds => 1,
-                TimePrecision::Microseconds => 2,
-                TimePrecision::Nanoseconds => 3,
-                TimePrecision::HundredNanoseconds => 4,
-            });
-        }
-        None => output.push(0),
-    }
-}
-pub(super) fn decode_time(
-    cursor: &mut Cursor<'_>,
-) -> Result<Option<StorageTimestamp>, SnapshotDecodeError> {
-    match cursor.byte()? {
-        0 => Ok(None),
-        1 => {
-            let mut value = [0; 16];
-            value.copy_from_slice(cursor.take(16)?);
-            let precision = match cursor.byte()? {
-                0 => TimePrecision::Seconds,
-                1 => TimePrecision::Milliseconds,
-                2 => TimePrecision::Microseconds,
-                3 => TimePrecision::Nanoseconds,
-                4 => TimePrecision::HundredNanoseconds,
-                _ => return Err(SnapshotDecodeError::Malformed),
-            };
-            StorageTimestamp::new(i128::from_le_bytes(value), precision)
-                .map(Some)
-                .map_err(|_| SnapshotDecodeError::Malformed)
-        }
-        _ => Err(SnapshotDecodeError::Malformed),
-    }
-}
-fn decode_facts(
-    cursor: &mut Cursor<'_>,
-    kind: BackendKind,
-) -> Result<PrivateBackendEntryFacts, SnapshotDecodeError> {
-    let tag = cursor.byte()?;
-    let bytes = cursor.bytes()?.to_vec();
-    match (tag, kind) {
-        (0, _) if bytes.is_empty() => Ok(PrivateBackendEntryFacts::None),
-        (1, BackendKind::Local) => Ok(PrivateBackendEntryFacts::Local(bytes)),
-        (2, BackendKind::Nfs) => Ok(PrivateBackendEntryFacts::Nfs(bytes)),
-        (3, BackendKind::Cifs) => Ok(PrivateBackendEntryFacts::Cifs(bytes)),
-        (4, BackendKind::S3) => Ok(PrivateBackendEntryFacts::S3(bytes)),
-        (5, BackendKind::Hdfs) => Ok(PrivateBackendEntryFacts::Hdfs(bytes)),
-        _ => Err(SnapshotDecodeError::Malformed),
-    }
-}
 
 #[cfg(test)]
 #[path = "observation_tests.rs"]
