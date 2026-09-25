@@ -749,21 +749,16 @@ async fn tags_are_set_on_the_completed_object() -> TestResult {
     Ok(())
 }
 
-/// S3 keeps its recovery state at the destination (ADR-0006 C15c) with the 64 MiB automatic
-/// interval; the test hook that puts the old temp-key path back plans no automatic checkpoints
-/// (the store path registers every checkpointed upload from the start).
+/// S3 keeps its recovery state at the destination (ADR-0006 C15c; the temp-key path is gone
+/// since C19) with the 64 MiB automatic interval.
 #[test]
 fn s3_keeps_recovery_at_the_destination() {
-    let protocol = Arc::new(MemoryS3::default());
-    let on = S3StagedDestination::new(protocol.clone(), identity());
+    let on = S3StagedDestination::new(Arc::new(MemoryS3::default()), identity());
     assert!(on.recovery_at_destination());
     assert_eq!(
         on.automatic_checkpoint_interval_bytes(),
         Some(64 * MIB as u64)
     );
-    let off = S3StagedDestination::new(protocol, identity()).with_recovery_at_destination(false);
-    assert!(!off.recovery_at_destination());
-    assert_eq!(off.automatic_checkpoint_interval_bytes(), None);
 }
 
 /// D3 for the expert destination half, which asks for a recoverable prepare of every

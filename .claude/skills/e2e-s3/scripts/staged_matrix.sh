@@ -69,7 +69,8 @@ case_() { # label, destination key, args...
     "$(records)" "$(key_uploads "$key")"
 }
 # A native copy writes the final key (ADR-0006 C18): it must equal its source, and neither a temp
-# key under `.data-mover-stage/` nor an upload on the key may be left.
+# key under `.data-mover-stage/` (the path C19 removed; `stage_objects` guards that none is ever
+# written again) nor an upload on the key may be left.
 native_verdict() { # destination key, source file
   local equal=no stage
   s3c -o "$WORK/check" "$B/$PREFIX/$1" && cmp -s "$WORK/check" "$2" && equal=yes

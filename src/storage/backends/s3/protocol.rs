@@ -3,7 +3,6 @@ use std::ops::Range;
 use async_trait::async_trait;
 use bytes::Bytes;
 use md5::{Digest as _, Md5};
-use tokio_util::sync::CancellationToken;
 
 use crate::model::{FailureClass, ObjectTag, StorageTimestamp, Transience};
 
@@ -55,7 +54,6 @@ impl S3ProtocolFailure {
 }
 
 pub(crate) type S3Result<T> = Result<T, S3ProtocolFailure>;
-pub(crate) const S3_NATIVE_COPY_SINGLE_MAX: u64 = 5 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct S3ObjectFacts {
@@ -172,15 +170,6 @@ pub(crate) struct S3NativeCopyEvidence {
     pub requests: u64,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct S3NativeCopyFailure {
-    pub error: S3ProtocolFailure,
-    pub bytes: u64,
-    pub requests: u64,
-}
-
-pub(crate) type S3NativeCopyResult = Result<S3NativeCopyEvidence, S3NativeCopyFailure>;
-
 #[async_trait]
 pub(crate) trait S3Protocol: Send + Sync {
     async fn head(&self, key: &str) -> S3Result<S3ObjectFacts>;
@@ -228,7 +217,6 @@ pub(crate) trait S3Protocol: Send + Sync {
     /// The ids of the multipart uploads in progress on exactly `key` — not on keys that merely
     /// start with it (some stores list by prefix, `MinIO` by exact key).
     async fn list_uploads(&self, key: &str) -> S3Result<Vec<String>>;
-    async fn copy_object(&self, from: &str, to: &str) -> S3Result<()>;
     /// One `CopyObject` of `source` to `to` (ADR-0006 C18), pinned by
     /// `x-amz-copy-source-if-match` to its `ETag` and, when it names one, to its version
     /// (`?versionId=`). Reports the new object's `ETag` and version. A source that changed is a
@@ -244,15 +232,8 @@ pub(crate) trait S3Protocol: Send + Sync {
         part_number: i32,
         range: Range<u64>,
     ) -> S3Result<String>;
-    async fn native_copy(
-        &self,
-        source: &S3NativeCopySource,
-        to: &str,
-        multipart_upload_id: Option<&str>,
-        cancel: &CancellationToken,
-    ) -> S3NativeCopyResult;
     /// An unversioned `DeleteObject`: in a versioned bucket it adds a delete marker and keeps every
-    /// version. Never sent to a final key (ADR-0006 C17); only transfer artifacts are deleted so.
+    /// version. Never sent to a final key (ADR-0006 C17); only the `.upload` pointer is deleted so.
     async fn delete_object(&self, key: &str) -> S3Result<()>;
     /// Deletes one stored version (or delete marker) of `key` for good, adding no delete marker.
     /// A version the store does not hold is not an error (S3 answers 204). A version Object Lock

@@ -1,6 +1,6 @@
 //! Streaming a byte stream into the parts of one multipart upload, a few parts in flight: shared
-//! by the temp-key stage, the `Direct` upload on the final key and the checkpointed upload on the
-//! final key (ADR-0006 C15b), which also asks to be told when its first checkpoint is reached.
+//! by the `Direct` upload on the final key and the checkpointed upload on the final key (ADR-0006
+//! C15b), which also asks to be told when its first checkpoint is reached.
 
 use std::sync::Arc;
 

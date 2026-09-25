@@ -137,6 +137,8 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 （terrasync 保证，用户确认）。直接调用 `recover` 的代码要自己保证独占，`claim_token` 对 S3 无意义。修后真机：取消 / SIGKILL
 后续传都成功（200 MiB，读回校验通过），记录随后清除。旧版本在 AWS 上成功 claim 后崩溃留下的 `<temp>.claim`
 对象新代码不再认也不再删：不会自动清理；它和 temp 对象都在 `.data-mover-stage/` 下，legacy 列举已不再报告它们（见下）。已知：3 s / 20 MiB/s 中断后只有 1 个分段（8 MiB）可复用，粒度待查。
+（以上是 C0 的历史：C15c 起 S3 不再走 temp key 与本地记录，C19 删掉了整条 temp-key 路径，`recover` 对 S3 报
+`Unsupported`；遗留对象怎么清见「删除 temp-key 路径（C19）」。）
 
 ### 小对象：一次 PutObject 到最终 key（ADR-0006 C14b）
 
@@ -181,9 +183,9 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 
 ### 最终 key 上的分段上传与 `.upload` 指针（ADR-0006 C15b；C15c 起默认打开）
 
-- 开关 `recovery_at_destination()`（`S3StagedDestination` 字段；C15b 时真连接恒为 `false`，C15c 起恒为 `true`，
-  见下节；`connect_at_destination` 现在只是把自动间隔换小的测试连接）。**开关开时**才声明自动 checkpoint 间隔
-  64 MiB（`automatic_checkpoint_interval_bytes`）：关着时 store 路径的规划（Checkpointed 从头登记）不变。
+- 开关 `recovery_at_destination()`（C15b 时真连接恒为 `false`，C15c 起恒为 `true`；C19 删掉字段与测试开关，
+  直接返回 `true`；`connect_at_destination` 只是把自动间隔换小的测试连接）。自动 checkpoint 间隔 64 MiB
+  （`automatic_checkpoint_interval_bytes`）。
 - `prepare_at_destination`（`staged/at_destination.rs`）：已知大小 ≤ T → C14b single stage，但先只看指针
   （HEAD，有才 GET；有遗留 → 删指针 + abort 该 key 上所有 upload，报 `Restarted{..}`；不列 upload，省请求）。
   > T 或大小未知 → `discover`，然后在**最终 key** 上分段上传：
@@ -216,8 +218,8 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 
 - `recovery_at_destination()` 对每个 S3 连接恒为 `true`：引擎经进程内租约 + `prepare_at_destination`，
   **不再碰本地 recovery store**，S3 续传不需要 `DATA_MOVER_RECOVERY_DIR`；自动 checkpoint 间隔 64 MiB（D3：
-  ≤ 64 MiB 的 Checkpointed 对象从不写指针）。`with_recovery_at_destination(false)`（仅测试）把旧 temp-key 路径 +
-  store 放回来，旧路径 C19 删。
+  ≤ 64 MiB 的 Checkpointed 对象从不写指针）。当时还留着仅测试可达的 `with_recovery_at_destination(false)`
+  （旧 temp-key 路径 + store），C19 已删。
 - **原生 S3→S3**（C15c–C17，C18 已改写）：引擎的 at-destination 原生分支当时改用目的端普通的 `prepare_ephemeral`
   （S3 = temp key，发布时 CopyObject），标 `at_destination`、Fresh、带租约；同 key 上以前流式传输留下的指针 / upload
   不清。C18 起原生拷贝直接写最终 key，并按 discovery 续传或清理这些遗留。
@@ -285,7 +287,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   DeleteObjectVersion）、存储不支持按版本删（`Unsupported`）、或拒绝它自己报的 `"null"`（`InvalidInput`）→
   `tracing::warn!`，改发普通 DeleteObject 用删除标记盖住它；传输照常成功并报版本，下次 prepare 看不到指针。标记也发不
   出去才算失败。
-- **最终 key 从不发普通 DELETE**：审计过所有路径，只有 artifact（指针、temp key）会被普通删除。`MemoryS3` 记录每个
+- **最终 key 从不发普通 DELETE**：审计过所有路径，只有 artifact（指针；C19 前还有 temp key）会被普通删除。`MemoryS3` 记录每个
   普通删除，`plain_deletes_of_final_keys()` 在所有版本化测试里断言为空（`the_fake_records_plain_deletes_of_final_keys`
   证明这个断言有效）。
 - **Complete 结果不明**（`staged/completion.rs`）：最终 key 分段上传 —— 不是提交前的明确拒绝、`ListParts` 回
@@ -298,7 +300,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   `NoSuchUpload`（已完成）→ 同上认领；abort 成功（我们的没完成）或失败 → 仍按 C14c 只 HEAD 比对，相同的旧对象算写成，
   但**不认领版本**。
 - 暂停版本：PUT 回 `x-amz-version-id: null`，MinIO 的 Complete 不回版本头 → `destination_version` 都是 `None`。
-- **原生 S3→S3 的 temp key 路径**（C18 起只在开关关掉时可达，C19 删）：temp key 按 key 名只属于这个 stage，删除改为 `publication::delete_temp_key`
+- **原生 S3→S3 的 temp key 路径**（历史：C18 起只在开关关掉时可达，C19 已删，下面的 `delete_temp_key` 随之删除）：temp key 按 key 名只属于这个 stage，删除改为 `publication::delete_temp_key`
   —— 列出它的每个条目（版本、删除标记、`"null"` 版本都算）逐个按 id 删（版本化桶里普通删除会把整份对象留在删除标记
   下面；`[null(最新), v1]` 这种先开版本后暂停的情况两个都删）；列表为空 → 什么都不发（不加空删除标记）；列不出
   （告警）/ 按 id 被拒（锁、不支持；`"null"` 删不掉一律）→ 普通删除；版本已不在算成功；其他失败照常报错。`CopyObject` 成功后 HEAD 最终 key 取当前版本作 `destination_version`（对账路径不认领）。每次原生
@@ -313,7 +315,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   `staged::at_destination::tests::versioning`（丢回复的指针 PUT、重复存了两份的指针 PUT（发布与 discovery 都扫掉）、续传
   越过重复指针、暂停版本下续传不删自己的 `"null"` 指针、discard、discovery 按读到的版本删、续传删被替换的版本、
   锁住的指针被标记盖住、续传删不掉被替换的锁住版本仍被标记盖住、Complete 后被覆盖 → Conflict）、`direct::tests::an_unfinished_completion_over_an_identical_object_claims_no_version`、
-  `completion::tests`、`role_protocol::versions::tests`、`publication::tests`（temp key 的 `"null"` 版本、空 key 不加标记）。
+  `completion::tests`、`role_protocol::versions::tests`（`publication::tests` 随 temp key 在 C19 删除）。
   `MemoryS3` 另有 `put_stored_twice`（SDK 重发已提交的 PUT）、`put_omits_version`（PUT 回复不带版本头）、
   `lock_version(key, id)`。
 - 真机（MinIO VM 102，`versioning_matrix.sh` 跑三次，临时桶 `data-mover-c17{,-lock}-1790298684`、`…-1790299956`、
@@ -330,8 +332,8 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - 引擎 at-destination 原生分支不再 `prepare_ephemeral`（temp key），改问 native pair 的目的端
   `NativeEndpoint::prepare_native`（crate 内部），请求 `Checkpointed` → `Discover`、其他 → `Restart`，`recoverable = false`；
   S3 在最终 key 上 prepare（`staged/native_final.rs`），报 `Fresh` / `Resumed` / `Restarted` 与流式相同。
-  **开关开时原生路径碰不到 temp key**；temp-key 代码（与它每次发布多出的 LIST + HEAD）只在
-  `with_recovery_at_destination(false)` 的测试里可达，C19 删。
+  **开关开时原生路径碰不到 temp key**；temp-key 代码（与它每次发布多出的 LIST + HEAD）当时只在
+  `with_recovery_at_destination(false)` 的测试里可达，C19 已删。
 - 协议新增：`copy_from(source, to)` = `CopyObject`，`x-amz-copy-source-if-match` 钉 ETag、有版本就带 `?versionId=`，
   返回副本的 `ETag` + 版本；`upload_part_copy(source, key, upload_id, n, range)` = `UploadPartCopy`，同样钉住，返回段 ETag。
   源变了 → 412 → `Conflict`；源没了 → `NotFound`。
@@ -379,16 +381,48 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   key_uploads=0`；`versioning_matrix.sh` 原生 4 / 200 MiB 各 1 版本 0 标记 0 artifact，按 id 原生拷 v1、v2（各 100 MiB）
   两个版本按序、各与源版本相同，临时桶已删。
 
+### 删除 temp-key 路径（ADR-0006 C19，破坏性）
+
+- C15c 起真连接走不到、C18 起原生拷贝也走不到的 temp-key 路径整体删除：`staged/recovery.rs`（store 时代的
+  recovery identity / `recover` / `resumable_parts`）、`staged/publication.rs`（从 temp key `CopyObject` 到最终 key、
+  C17 的 `delete_temp_key`）、temp-key 原生拷贝（`staged/native.rs` 只剩「填最终 key 上的 stage」）、`StageState`
+  stage 表、`S3StagedDestination::with_recovery_at_destination` 与字段、`S3Protocol::copy_object` / `native_copy`
+  （连同 `S3NativeCopyFailure` / `S3NativeCopyResult` / `S3_NATIVE_COPY_SINGLE_MAX` 与 `role_protocol/native.rs` 的
+  旧整段 / 分段拷贝）。single stage 的 token 改用最终 key（不再借 temp key 名）。
+- `StagedDestination::prepare` / `recovery_identity` / `recover` 对 S3 返回 `Unsupported`（`prepare_ephemeral` /
+  `handoff_recovery` 用默认实现，同样 `Unsupported`）；不是在目的端 prepare、也不是 `Direct` 的 stage（例如 store
+  时代的 temp-key stage）`write` / `publish` / `discard` 等一律 `Conflict`（永久），什么都不碰。`verification_point`
+  恒为 `AfterPublish`。破坏性：直接调这些角色方法的调用方要改用 `prepare_at_destination`。
+- legacy 列举对 `.data-mover-*` 的过滤（C3）**保留**：它也隐藏 `.upload` 指针与其他后端的 artifact。
+- **升级遗留（手工清理）**：C15c 之前在途的传输在存储根下留下的 `.data-mover-stage/<binding hex>/<路径 hash hex>`
+  对象（以及旧版本在 AWS 上留下的 `<temp>.claim`）和这些 key 上的未完成 upload，新代码不认、不删、列举也看不到。
+  确认没有 C15c 之前的进程还在跑之后，用 S3 原生工具删（`<root>` = 存储 URL 的前缀，没有前缀就去掉 `<root>/`）：
+  - 对象：`aws s3 rm --recursive s3://<bucket>/<root>/.data-mover-stage/`（MinIO：`mc rm --recursive --force
+    <alias>/<bucket>/<root>/.data-mover-stage/`）。
+  - 版本化桶：普通删除只加删除标记，整份对象还在；`aws s3api list-object-versions --bucket <bucket> --prefix
+    <root>/.data-mover-stage/` 列出每个版本与删除标记，逐个 `aws s3api delete-object --bucket <bucket> --key <Key>
+    --version-id <VersionId>`（MinIO：`mc rm --recursive --versions --force …`）。Object Lock 保护的版本要等保留期过。
+  - 未完成的 upload：AWS / Ceph / StorageGRID 按前缀列 —— `aws s3api list-multipart-uploads --bucket <bucket>
+    --prefix <root>/.data-mover-stage/`，逐个 `abort-multipart-upload --key <Key> --upload-id <UploadId>`；或给桶配
+    `AbortIncompleteMultipartUpload` 生命周期规则。MinIO 2023 只按精确 key 列 upload，按前缀找不到：靠服务端
+    `api.stale_uploads_expiry`（默认 24 h）回收。
+- 测试：删 `recovery_tests.rs`、`staged/manifest_tests.rs`、`staged/native_tests.rs`、`publication::tests`（只测旧路径；
+  缺口 / 连续前缀、续传、discard 失败、原生失败保留 stage 已由 `at_destination_tests`、`native_final_tests`、
+  `transfer::s3_*` 覆盖；旧 manifest 的空分段用例移到 `upload_discovery::tests::an_empty_part_counts_only_as_an_empty_source`）与 `role_protocol` 的两个 store 时代实验室 ignored 测试；`role_tests` / `single_tests` /
+  `sizing_tests` 改走 `prepare_at_destination`（重连续传、较大分段跨连接续传、对齐上传不补空段），新增
+  `store_era_entry_points_are_unsupported`、`a_temp_key_stage_is_refused`。`staged_matrix.sh` 的 `stage_objects=`
+  保留，守住「再也不写 temp key」。
+
 ### legacy 列举隐藏传输 artifact（ADR-0006 C3）
 
 - `walkdir` / `walkdir_2`（含版本化桶的版本与删除标记）跳过相对存储根的任意一段以 `.data-mover-` 开头的
   key 与公共前缀（`storage::artifacts::is_artifact_path`），命中打 `trace!`。存储根本身在 artifact 里时照常
   列举；从根以下的 artifact 内开始遍历（`sub_path = ".data-mover-stage"`）则为空。
 - `delete_dir_all_with_progress` **不**过滤：删目录会连其中的 artifact 一起删，并为它们发 `DeleteEvent`
-  （路径不曾出现在列举里，按删除数与列举数对账会差出这些）。今天 S3 stage 集中在根下 `.data-mover-stage/`，
-  删子目录删不到它的孤儿；同目录的 `.upload` 指针（C15b）会随目录一起删。
+  （路径不曾出现在列举里，按删除数与列举数对账会差出这些）。同目录的 `.upload` 指针（C15b）会随目录一起删；
+  C15c 前的 S3 stage 集中在根下 `.data-mover-stage/`，删子目录删不到这些孤儿（C19 起不再写，清理见下节）。
 - 代价：用户自己命名为 `.data-mover-*` 的对象从 S3 源端列举中消失；孤儿 `.data-mover-stage/` 只能用 S3
-  原生工具（或 `resume_matrix.sh` 的清理）看到。
+  原生工具看到。**过滤必须保留**：它隐藏的是一切 `.data-mover-*` 名字（`.upload` 指针、别的后端的 stage），不只 temp key。
 - 真机（`examples/s3_listing`，2026-09-24）：MinIO / DXN / StorageGRID 非版本化，MinIO / DXN 临时版本化桶，
   artifact 全部隐藏，普通对象、多版本与删除标记行为不变。
 

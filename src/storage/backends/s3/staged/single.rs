@@ -37,7 +37,7 @@ pub(crate) const MAX_SINGLE_PUT_THRESHOLD: u64 = 5 * 1024 * 1024 * 1024;
 
 /// The upload-id half of a single stage's token. A real upload id is printable, so it never
 /// starts with a control character.
-pub(super) const SINGLE_MARKER: &str = "\u{1}single-put";
+const SINGLE_MARKER: &str = "\u{1}single-put";
 
 /// A configured single-PUT threshold outside `[5 MiB, 5 GiB]`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,9 +82,6 @@ struct SingleState {
     written: Option<Bytes>,
     tags: Option<Vec<ObjectTag>>,
     published: Option<S3WriteFacts>,
-    /// A native copy filled this stage through the temp-key path instead (only with recovery at
-    /// the destination off; C19 removes it).
-    native: bool,
     /// The source a native copy publishes with one `CopyObject` instead of a `PutObject`
     /// (ADR-0006 C18).
     native_source: Option<S3NativeCopySource>,
@@ -93,11 +90,6 @@ struct SingleState {
 impl SingleStage {
     fn lock(&self) -> MutexGuard<'_, SingleState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Hands the stage to the temp-key path: a native copy fills it there.
-    pub(super) fn mark_native(&self) {
-        self.lock().native = true;
     }
 
     /// The buffered content, which must be `expected_size` bytes, and the tags waiting for it.
@@ -168,13 +160,12 @@ impl SingleStage {
     }
 }
 
-/// The single stage `stage` is, unless a native copy moved it to the temp-key path.
+/// The single stage `stage` is, if it is one.
 pub(super) fn of(stage: &PreparedStage) -> Option<&SingleStage> {
     stage
         .backend_state
         .as_deref()?
         .downcast_ref::<SingleStage>()
-        .filter(|single| !single.lock().native)
 }
 
 impl<P: S3Protocol> S3StagedDestination<P> {
@@ -185,7 +176,7 @@ impl<P: S3Protocol> S3StagedDestination<P> {
 
     /// A fresh single stage: nothing is sent until publication, and nothing can be resumed.
     pub(super) fn prepare_single(&self, request: PrepareRequest, size: u64) -> PreparedStage {
-        let token = Self::encode_token(&Self::temp_key(&request), SINGLE_MARKER);
+        let token = Self::encode_token(request.final_destination.path().as_str(), SINGLE_MARKER);
         let mut stage = PreparedStage::new(
             self.identity.clone(),
             request.final_destination,

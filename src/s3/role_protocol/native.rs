@@ -1,51 +1,15 @@
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use tokio_util::sync::CancellationToken;
+//! Native S3→S3 copies to the final key (ADR-0006 C18): one `CopyObject`, or `UploadPartCopy`
+//! parts of an upload on the final key, each pinned to the bound source.
 
 use std::ops::Range;
 
 use aws_sdk_s3::types::{MetadataDirective, TaggingDirective};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
 use super::{
-    COPY_PART_SIZE, CompletedPart, ProvideErrorMetadata, S3NativeCopyEvidence, S3NativeCopyFailure,
-    S3NativeCopyResult, S3NativeCopySource, S3ProtocolFailure, S3Result, S3Storage, S3WriteFacts,
-    build_copy_source, s3_role_remote_failure, s3_role_transport_failure,
+    CompletedPart, ProvideErrorMetadata, S3NativeCopySource, S3ProtocolFailure, S3Result,
+    S3Storage, S3WriteFacts, build_copy_source, s3_role_remote_failure, s3_role_transport_failure,
 };
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CopyStrategy {
-    Single,
-    Multipart,
-}
-
-const fn strategy(size: u64) -> CopyStrategy {
-    if size <= super::COPY_SINGLE_MAX {
-        CopyStrategy::Single
-    } else {
-        CopyStrategy::Multipart
-    }
-}
-
-pub(super) async fn copy(
-    storage: &S3Storage,
-    source: &S3NativeCopySource,
-    to: &str,
-    multipart_upload_id: Option<&str>,
-    cancel: &CancellationToken,
-) -> S3NativeCopyResult {
-    match strategy(source.size) {
-        CopyStrategy::Single => copy_single(storage, source, to, cancel).await,
-        CopyStrategy::Multipart => {
-            let upload_id = multipart_upload_id.ok_or_else(|| {
-                failure(
-                    S3ProtocolFailure::protocol("native multipart copy has no owned upload ID"),
-                    0,
-                    0,
-                )
-            })?;
-            copy_multipart(storage, source, to, upload_id, cancel).await
-        }
-    }
-}
 
 fn copy_source(source: &S3NativeCopySource) -> String {
     let mut value = build_copy_source(&source.bucket, &source.key);
@@ -54,129 +18,6 @@ fn copy_source(source: &S3NativeCopySource) -> String {
         value.push_str(&utf8_percent_encode(version, NON_ALPHANUMERIC).to_string());
     }
     value
-}
-
-fn cancelled() -> S3ProtocolFailure {
-    S3ProtocolFailure::entry(
-        crate::model::FailureClass::Cancelled,
-        crate::model::Transience::Permanent,
-        "S3 native copy cancelled",
-    )
-}
-
-fn failure(error: S3ProtocolFailure, bytes: u64, requests: u64) -> S3NativeCopyFailure {
-    S3NativeCopyFailure {
-        error,
-        bytes,
-        requests,
-    }
-}
-
-pub(super) async fn copy_single(
-    storage: &S3Storage,
-    source: &S3NativeCopySource,
-    to: &str,
-    cancel: &CancellationToken,
-) -> S3NativeCopyResult {
-    if cancel.is_cancelled() {
-        return Err(failure(cancelled(), 0, 0));
-    }
-    storage
-        .client
-        .copy_object()
-        .bucket(&storage.bucket_name)
-        .key(storage.build_full_key(to))
-        .copy_source(copy_source(source))
-        .copy_source_if_match(&source.etag)
-        .send()
-        .await
-        .map_err(|error| {
-            failure(
-                classify_sdk!(error, "S3 native CopyObject request failed"),
-                0,
-                1,
-            )
-        })?;
-    if cancel.is_cancelled() {
-        return Err(failure(cancelled(), source.size, 1));
-    }
-    Ok(S3NativeCopyEvidence {
-        bytes: source.size,
-        requests: 1,
-    })
-}
-
-pub(super) async fn copy_multipart(
-    storage: &S3Storage,
-    source: &S3NativeCopySource,
-    to: &str,
-    upload_id: &str,
-    cancel: &CancellationToken,
-) -> S3NativeCopyResult {
-    copy_multipart_with_part_size(storage, source, to, upload_id, COPY_PART_SIZE, cancel).await
-}
-
-pub(super) async fn copy_multipart_with_part_size(
-    storage: &S3Storage,
-    source: &S3NativeCopySource,
-    to: &str,
-    upload_id: &str,
-    part_size: u64,
-    cancel: &CancellationToken,
-) -> S3NativeCopyResult {
-    if cancel.is_cancelled() {
-        return Err(failure(cancelled(), 0, 0));
-    }
-    let key = storage.build_full_key(to);
-    let (parts, copied_bytes, part_requests) =
-        copy_parts(storage, source, &key, upload_id, part_size, cancel).await?;
-    storage
-        .complete_multipart_upload(&key, upload_id, &parts)
-        .await
-        .map_err(|error| {
-            failure(
-                S3ProtocolFailure::protocol(error.to_string()),
-                copied_bytes,
-                part_requests + 1,
-            )
-        })?;
-    Ok(S3NativeCopyEvidence {
-        bytes: source.size,
-        requests: part_requests + 1,
-    })
-}
-
-async fn copy_parts(
-    storage: &S3Storage,
-    source: &S3NativeCopySource,
-    key: &str,
-    upload_id: &str,
-    part_size: u64,
-    cancel: &CancellationToken,
-) -> Result<(Vec<CompletedPart>, u64, u64), S3NativeCopyFailure> {
-    let ranges = super::super::multipart_rename::copy_part_ranges(source.size, part_size);
-    let mut parts = Vec::with_capacity(ranges.len());
-    let mut copied_bytes = 0;
-    let mut requests = 0;
-    for (index, (start, end)) in ranges.into_iter().enumerate() {
-        if cancel.is_cancelled() {
-            return Err(failure(cancelled(), copied_bytes, requests));
-        }
-        let number = i32::try_from(index + 1).map_err(|_| {
-            failure(
-                S3ProtocolFailure::protocol("native multipart part overflow"),
-                copied_bytes,
-                requests,
-            )
-        })?;
-        let part = copy_part(storage, source, key, upload_id, number, start..=end)
-            .await
-            .map_err(|error| failure(error, copied_bytes, requests + 1))?;
-        copied_bytes += end - start + 1;
-        requests += 1;
-        parts.push(part);
-    }
-    Ok((parts, copied_bytes, requests))
 }
 
 async fn copy_part(
@@ -296,58 +137,6 @@ mod tests {
 
     use super::*;
 
-    #[derive(Clone, Copy, Debug)]
-    enum ResponseMode {
-        Success,
-        FailParts,
-        FailComplete,
-        CancelAfterFirst,
-    }
-
-    #[derive(Clone, Debug)]
-    struct MultipartConnector {
-        methods: Arc<Mutex<Vec<String>>>,
-        mode: ResponseMode,
-        cancel: CancellationToken,
-    }
-
-    impl HttpConnector for MultipartConnector {
-        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-            let method = request.method().to_string();
-            self.methods
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(method.clone());
-            if matches!(self.mode, ResponseMode::CancelAfterFirst) {
-                self.cancel.cancel();
-            }
-            if matches!(self.mode, ResponseMode::FailParts) && method == "PUT"
-                || matches!(self.mode, ResponseMode::FailComplete) && method == "POST"
-            {
-                return connector_failure();
-            }
-            connector_response(&method)
-        }
-    }
-
-    fn connector_failure() -> HttpConnectorFuture {
-        HttpConnectorFuture::ready(Err(ConnectorError::io(Box::new(std::io::Error::other(
-            "injected request failure",
-        )))))
-    }
-
-    fn connector_response(method: &str) -> HttpConnectorFuture {
-        let body = if method == "PUT" {
-            r"<CopyPartResult><ETag>&quot;part&quot;</ETag></CopyPartResult>"
-        } else {
-            r"<CompleteMultipartUploadResult><ETag>&quot;complete&quot;</ETag></CompleteMultipartUploadResult>"
-        };
-        let response = StatusCode::try_from(200)
-            .map(|status| HttpResponse::new(status, SdkBody::from(body)))
-            .map_err(|error| ConnectorError::other(Box::new(error), None));
-        HttpConnectorFuture::ready(response)
-    }
-
     fn storage(connector: impl HttpConnector + Clone + 'static) -> S3Storage {
         let http_client = http_client_fn(move |_settings, _components| {
             SharedHttpConnector::new(connector.clone())
@@ -377,134 +166,11 @@ mod tests {
     fn source() -> S3NativeCopySource {
         S3NativeCopySource {
             bucket: "source".into(),
-            key: "large.bin".into(),
+            key: "object.bin".into(),
             etag: "\"source-etag\"".into(),
             version_id: None,
-            size: super::super::COPY_SINGLE_MAX + 1,
+            size: 10,
         }
-    }
-
-    #[test]
-    fn native_strategy_changes_only_above_copy_object_limit() {
-        assert_eq!(
-            strategy(super::super::COPY_SINGLE_MAX),
-            CopyStrategy::Single
-        );
-        assert_eq!(
-            strategy(super::super::COPY_SINGLE_MAX + 1),
-            CopyStrategy::Multipart
-        );
-        let ranges = super::super::super::multipart_rename::copy_part_ranges(
-            super::super::COPY_SINGLE_MAX + 1,
-            COPY_PART_SIZE,
-        );
-        assert!(ranges.len() > 1);
-        assert_eq!(ranges.first().map(|range| range.0), Some(0));
-        assert_eq!(
-            ranges.last().map(|range| range.1),
-            Some(super::super::COPY_SINGLE_MAX)
-        );
-        assert_eq!(
-            u64::try_from(ranges.len()).ok().map(|parts| parts + 2),
-            Some(8)
-        );
-    }
-
-    #[tokio::test]
-    async fn multipart_requests_complete_and_report_all_native_calls() {
-        let methods = Arc::new(Mutex::new(Vec::new()));
-        let cancel = CancellationToken::new();
-        let connector = MultipartConnector {
-            methods: Arc::clone(&methods),
-            mode: ResponseMode::Success,
-            cancel: cancel.clone(),
-        };
-        let evidence = copy(
-            &storage(connector),
-            &source(),
-            "stage",
-            Some("upload-1"),
-            &cancel,
-        )
-        .await
-        .unwrap_or_else(|error| panic!("multipart copy failed: {error:?}"));
-        // The stage owner accounts for CreateMultipartUpload separately.
-        assert_eq!(evidence.requests, 7);
-        let methods = methods
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(methods.iter().filter(|method| *method == "PUT").count(), 6);
-        assert_eq!(methods.iter().filter(|method| *method == "POST").count(), 1);
-    }
-
-    #[tokio::test]
-    async fn multipart_part_and_complete_failures_leave_abort_to_stage_owner() {
-        for mode in [ResponseMode::FailParts, ResponseMode::FailComplete] {
-            let methods = Arc::new(Mutex::new(Vec::new()));
-            let cancel = CancellationToken::new();
-            let connector = MultipartConnector {
-                methods: Arc::clone(&methods),
-                mode,
-                cancel: cancel.clone(),
-            };
-            let Err(failure) = copy(
-                &storage(connector),
-                &source(),
-                "stage",
-                Some("owned"),
-                &cancel,
-            )
-            .await
-            else {
-                panic!("injected multipart failure succeeded");
-            };
-            match mode {
-                ResponseMode::FailParts => {
-                    assert_eq!(failure.bytes, 0);
-                    assert_eq!(failure.requests, 1);
-                }
-                ResponseMode::FailComplete => {
-                    assert_eq!(failure.bytes, source().size);
-                    assert_eq!(failure.requests, 7);
-                }
-                _ => unreachable!("test only exercises failure modes"),
-            }
-            let methods = methods
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert!(!methods.iter().any(|method| method == "DELETE"));
-        }
-    }
-
-    #[tokio::test]
-    async fn multipart_cancellation_stops_before_another_part() {
-        let methods = Arc::new(Mutex::new(Vec::new()));
-        let cancel = CancellationToken::new();
-        let connector = MultipartConnector {
-            methods: Arc::clone(&methods),
-            mode: ResponseMode::CancelAfterFirst,
-            cancel: cancel.clone(),
-        };
-        let Err(failure) = copy(
-            &storage(connector),
-            &source(),
-            "stage",
-            Some("owned"),
-            &cancel,
-        )
-        .await
-        else {
-            panic!("cancelled multipart copy succeeded");
-        };
-        assert_eq!(failure.bytes, COPY_PART_SIZE);
-        assert_eq!(failure.requests, 1);
-        assert_eq!(
-            methods
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .len(),
-            1
-        );
     }
 
     /// The headers a copy request carried that pin or shape it, as (name, value).
@@ -575,7 +241,7 @@ mod tests {
                     Some("\"source-etag\"")
                 );
                 let named = header(headers, "x-amz-copy-source").unwrap_or_default();
-                assert!(named.starts_with("source/large.bin"), "{named}");
+                assert!(named.starts_with("source/object.bin"), "{named}");
                 assert_eq!(
                     named.contains("?versionId=v%201"),
                     version.is_some(),

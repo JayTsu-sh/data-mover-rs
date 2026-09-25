@@ -3,8 +3,6 @@
 mod metadata;
 mod native;
 mod protocol;
-#[cfg(test)]
-mod recovery_tests;
 mod source;
 mod staged;
 
@@ -14,9 +12,8 @@ use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
 
 pub(crate) use protocol::{
-    S3_NATIVE_COPY_SINGLE_MAX, S3NativeCopyEvidence, S3NativeCopyFailure, S3NativeCopyResult,
-    S3NativeCopySource, S3ObjectFacts, S3PartFacts, S3Protocol, S3ProtocolFailure, S3Result,
-    S3VersionFacts, S3WriteFacts, composite_etag, is_real_version_id,
+    S3NativeCopyEvidence, S3NativeCopySource, S3ObjectFacts, S3PartFacts, S3Protocol,
+    S3ProtocolFailure, S3Result, S3VersionFacts, S3WriteFacts, composite_etag, is_real_version_id,
 };
 
 pub(crate) use metadata::S3TagSupport;

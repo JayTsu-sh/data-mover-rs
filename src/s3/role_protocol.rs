@@ -1,13 +1,8 @@
-use super::{
-    COPY_PART_SIZE, COPY_SINGLE_MAX, CompletedPart, ProvideErrorMetadata, S3Storage,
-    build_copy_source,
-};
+use super::{CompletedPart, ProvideErrorMetadata, S3Storage, build_copy_source};
 use bytes::Bytes;
-use tokio_util::sync::CancellationToken;
 
 use crate::storage::backends::s3::{
-    S3NativeCopyEvidence, S3NativeCopyFailure, S3NativeCopyResult, S3NativeCopySource,
-    S3ProtocolFailure, S3Result, S3VersionFacts, S3WriteFacts,
+    S3NativeCopySource, S3ProtocolFailure, S3Result, S3VersionFacts, S3WriteFacts,
 };
 use crate::time_util::http_last_modified;
 
@@ -311,56 +306,6 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         }
     }
 
-    async fn copy_object(
-        &self,
-        from: &str,
-        to: &str,
-    ) -> crate::storage::backends::s3::S3Result<()> {
-        let from = self.build_full_key(from);
-        let to = self.build_full_key(to);
-        let size = self
-            .client
-            .head_object()
-            .bucket(&self.bucket_name)
-            .key(&from)
-            .send()
-            .await
-            .map_err(|error| classify_sdk!(error, "S3 publication source HeadObject failed"))?
-            .content_length()
-            .and_then(|n| u64::try_from(n).ok())
-            .ok_or_else(|| {
-                s3_role_entry(
-                    crate::model::FailureClass::Corruption,
-                    "S3 publication source has invalid size",
-                )
-            })?;
-        if size <= COPY_SINGLE_MAX {
-            self.client
-                .copy_object()
-                .bucket(&self.bucket_name)
-                .key(to)
-                .copy_source(build_copy_source(&self.bucket_name, &from))
-                .send()
-                .await
-                .map(|_| ())
-                .map_err(|error| classify_sdk!(error, "S3 CopyObject request failed"))
-        } else {
-            self.multipart_copy_object(&from, &to, size, COPY_PART_SIZE, None)
-                .await
-                .map_err(|error| s3_role_legacy_failure(error.to_string()))
-        }
-    }
-
-    async fn native_copy(
-        &self,
-        source: &S3NativeCopySource,
-        to: &str,
-        multipart_upload_id: Option<&str>,
-        cancel: &CancellationToken,
-    ) -> S3NativeCopyResult {
-        native::copy(self, source, to, multipart_upload_id, cancel).await
-    }
-
     async fn copy_from(&self, source: &S3NativeCopySource, to: &str) -> S3Result<S3WriteFacts> {
         native::copy_from(self, source, to).await
     }
@@ -493,14 +438,6 @@ fn s3_role_transport_failure(
     s3_role_session(diagnostic.to_string())
 }
 
-fn s3_role_legacy_failure(diagnostic: String) -> crate::storage::backends::s3::S3ProtocolFailure {
-    crate::storage::backends::s3::S3ProtocolFailure::session(
-        crate::model::FailureClass::Protocol,
-        crate::model::Transience::Unknown,
-        diagnostic,
-    )
-}
-
 fn s3_role_entry(
     class: crate::model::FailureClass,
     diagnostic: &str,
@@ -582,7 +519,6 @@ pub(super) fn s3_role_remote_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SourceVersion;
     use crate::storage::backends::s3::S3Protocol as _;
     use crate::storage::backends::s3::S3ProtocolFailure;
 
@@ -741,157 +677,5 @@ mod tests {
         assert_eq!(written.etag, format!("\"{digest:x}\""));
         deleted.map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
         Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore = "requires the shared standard S3 lab"]
-    async fn standard_s3_invalid_manifest_is_aborted_and_restartable()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = prepare_invalid_manifest_fixture().await?;
-        assert_restartable_after_rejection(fixture).await
-    }
-
-    #[tokio::test]
-    #[ignore = "requires the shared standard S3 lab"]
-    async fn standard_s3_native_multipart_copy_uses_owned_upload()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let backend = S3Storage::new(&std::env::var("LAB_S3_ARCHITECTURE_URL")?, None).await?;
-        let source_path = std::env::var("LAB_S3_ARCHITECTURE_KEY")?;
-        let destination = format!("{source_path}.native-multipart");
-        let facts = backend
-            .head(&source_path)
-            .await
-            .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
-        let source = S3NativeCopySource {
-            bucket: backend.bucket_name.clone(),
-            key: backend.build_full_key(&source_path),
-            etag: facts.etag,
-            version_id: facts.version_id,
-            size: facts.size,
-        };
-        let upload_id = backend
-            .begin_multipart(&destination)
-            .await
-            .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
-        let result = native::copy_multipart_with_part_size(
-            &backend,
-            &source,
-            &destination,
-            &upload_id,
-            5 * 1024 * 1024,
-            &CancellationToken::new(),
-        )
-        .await
-        .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
-        assert!(result.requests > 3);
-        let copied = backend
-            .head(&destination)
-            .await
-            .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
-        assert_eq!(copied.size, source.size);
-        backend
-            .delete_object(&destination)
-            .await
-            .map_err(|failure| std::io::Error::other(format!("{failure:?}")))?;
-        Ok(())
-    }
-
-    struct InvalidManifestFixture {
-        backend: S3Storage,
-        prepare: crate::storage::PrepareRequest,
-        recovery: crate::storage::RecoveryIdentity,
-    }
-
-    async fn prepare_invalid_manifest_fixture()
-    -> Result<InvalidManifestFixture, Box<dyn std::error::Error>> {
-        use crate::model::{
-            BackendIdentity, BackendKind, EntryKind, IdentityStrength, SourceIdentity, StoragePath,
-        };
-        use crate::storage::{FinalDestination, PreflightPolicy, PrepareRequest, SourceDescriptor};
-        let backend = S3Storage::new(&std::env::var("LAB_S3_ARCHITECTURE_URL")?, None).await?;
-        let identity = BackendIdentity::new(BackendKind::S3, "standard-s3-invalid-recovery")?;
-        let storage = backend.architecture_storage()?;
-        let destination = storage.staged_destination(&PreflightPolicy::production())?;
-        let source = SourceDescriptor {
-            path: StoragePath::new("generated-source")?,
-            kind: EntryKind::File,
-            size: None,
-            source_identity: SourceIdentity::new(
-                identity,
-                IdentityStrength::PathScoped,
-                b"invalid-source",
-            )?,
-            backend_fact: None,
-            content_version: None,
-            inline_timestamps: None,
-            inline_mode: None,
-            version: SourceVersion::Current,
-        };
-        let path = StoragePath::new(format!(
-            "{}.manifest",
-            std::env::var("LAB_S3_ARCHITECTURE_KEY")?
-        ))?;
-        let prepare = PrepareRequest {
-            final_destination: FinalDestination::new(path),
-            source: source.clone(),
-            recovery_binding: [7; 32],
-        };
-        let stage = destination.prepare(prepare.clone()).await?;
-        let recovery = destination.recovery_identity(&stage).await?;
-        let (key, upload_id) = split_recovery(&recovery)?;
-        backend
-            .upload_part_with_stream(
-                &backend.build_full_key(&key),
-                &upload_id,
-                2,
-                vec![Bytes::from(vec![3; 8 * 1024 * 1024])],
-                8 * 1024 * 1024,
-            )
-            .await?;
-        Ok(InvalidManifestFixture {
-            backend,
-            prepare,
-            recovery,
-        })
-    }
-
-    async fn assert_restartable_after_rejection(
-        fixture: InvalidManifestFixture,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::storage::{PreflightPolicy, RecoverRequest};
-        let reconnected = fixture
-            .backend
-            .architecture_storage()?
-            .staged_destination(&PreflightPolicy::production())?;
-        let result = reconnected
-            .recover(RecoverRequest {
-                identity: fixture.recovery,
-                final_destination: fixture.prepare.final_destination.clone(),
-                source: fixture.prepare.source.clone(),
-                recovery_binding: fixture.prepare.recovery_binding,
-                claim_token: [1; 32],
-            })
-            .await;
-        assert!(
-            matches!(result, Err(crate::storage::StorageRoleFailure::Entry(ref failure))
-            if failure.class() == crate::model::FailureClass::Corruption)
-        );
-        let fresh = reconnected.prepare(fixture.prepare).await?;
-        reconnected.discard(fresh).await?;
-        Ok(())
-    }
-
-    fn split_recovery(
-        identity: &crate::storage::RecoveryIdentity,
-    ) -> Result<(String, String), Box<dyn std::error::Error>> {
-        let split = identity
-            .as_bytes()
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or("missing recovery separator")?;
-        Ok((
-            String::from_utf8(identity.as_bytes()[..split].to_vec())?,
-            String::from_utf8(identity.as_bytes()[split + 1..].to_vec())?,
-        ))
     }
 }

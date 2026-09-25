@@ -551,6 +551,12 @@ key changed; a single-part source keeps its `ETag`. `staged_matrix.sh`: the nati
 4 MiB and 200 MiB each one version, no marker, no artifact, `destination_version` the latest; v1 then v2
 (100 MiB each) copied natively by `--source-version` gave two versions, newest first v2 then v1, each
 equal to its source version.
+The S3 temp-key path — `.data-mover-stage/` temp objects, publication by `CopyObject` from the temp key
+and the temp key's delete by version (C17), the temp-key native copy (`S3Protocol::copy_object` /
+`native_copy`), the store-era recovery identity and `recover` — and the test-only
+`with_recovery_at_destination(false)` are no longer reached (removed in C19); S3's `prepare`,
+`recovery_identity` and `recover` answer `Unsupported`. Temp keys left before C15c, and their uploads,
+are not cleaned up automatically (`.claude/docs/storage-s3.md` says how to remove them).
 
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process

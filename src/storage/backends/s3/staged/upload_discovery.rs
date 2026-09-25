@@ -220,3 +220,41 @@ pub(super) fn leftover_reason(request: &DestinationPrepareRequest, bytes: &[u8])
         Some(_) => RestartReason::Requested,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::contiguous_prefix;
+    use crate::storage::backends::s3::S3PartFacts;
+
+    const PART: u64 = 8 * 1024 * 1024;
+
+    fn part(number: i32, size: u64) -> S3PartFacts {
+        S3PartFacts {
+            number,
+            size,
+            etag: format!("etag-{number}"),
+        }
+    }
+
+    /// An empty part counts only as the whole of an empty source; after a prefix that already
+    /// ends at the source's size nothing more is taken, and an empty part of an unknown size, or
+    /// before the end, stops the prefix.
+    #[test]
+    fn an_empty_part_counts_only_as_an_empty_source() {
+        assert_eq!(
+            contiguous_prefix(vec![part(1, 0)], PART, Some(0)),
+            (0, vec![(1, "etag-1".to_string())])
+        );
+        let (bytes, prefix) = contiguous_prefix(vec![part(1, PART), part(2, 0)], PART, Some(PART));
+        assert_eq!((bytes, prefix.len()), (PART, 1));
+        assert_eq!(contiguous_prefix(vec![part(1, 0)], PART, None), (0, vec![]));
+        assert_eq!(
+            contiguous_prefix(vec![part(1, 0)], PART, Some(1)),
+            (0, vec![])
+        );
+        assert_eq!(
+            contiguous_prefix(vec![part(1, 0), part(2, PART)], PART, Some(PART)),
+            (0, vec![])
+        );
+    }
+}

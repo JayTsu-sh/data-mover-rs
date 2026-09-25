@@ -1,8 +1,97 @@
-//! S3 role behaviour over the in-memory bucket: ranges, multipart staging, tags, checkpoints,
-//! cancellation, publication.
+//! S3 role behaviour over the in-memory bucket: ranges, uploads on the final key, tags,
+//! resumes, cancellation, publication, and the store-era entry points removed in ADR-0006 C19.
 
 use super::*;
-use crate::model::SourceVersion;
+use crate::model::{
+    EntryKind, FailureClass, IdentityStrength, SourceIdentity, SourceVersion, Transience,
+};
+use crate::storage::backends::s3::staged::S3StagedDestination;
+use crate::storage::{
+    ByteStream, DestinationPrepareRequest, PrepareFact, PreparedStage, RecoverRequest,
+    RecoveryIdentity, ResumeMode, SourceDescriptor, StagedDestination, StorageRoleFailure,
+};
+
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+/// A source named `source` of `size` bytes (`None`: unknown).
+fn described(size: Option<u64>) -> TestResult<SourceDescriptor> {
+    Ok(SourceDescriptor::new(
+        StoragePath::new("source")?,
+        EntryKind::File,
+        size,
+        SourceIdentity::new(identity(), IdentityStrength::PathScoped, b"source")?,
+    ))
+}
+
+/// A prepare at the destination (ADR-0006: the only S3 prepare since C19) of `source` to `path`.
+fn at_destination(
+    path: &str,
+    source: SourceDescriptor,
+    binding: [u8; 32],
+    resume: ResumeMode,
+) -> TestResult<DestinationPrepareRequest> {
+    let prepare = PrepareRequest {
+        final_destination: FinalDestination::new(StoragePath::new(path)?),
+        source,
+        recovery_binding: binding,
+    };
+    Ok(DestinationPrepareRequest::new(prepare, [3; 32]).with_resume(resume))
+}
+
+/// A fresh upload on the final key `final` of `source`, holding `payload`: nothing is published.
+async fn written_to_final(
+    destination: &dyn StagedDestination,
+    source: SourceDescriptor,
+    payload: &Bytes,
+) -> TestResult<PreparedStage> {
+    let request = at_destination("final", source, [7; 32], ResumeMode::Restart)?;
+    let stage = destination.prepare_at_destination(request).await?;
+    let input = Box::pin(futures::stream::iter([Ok(payload.clone())]));
+    let written = destination.write(&stage, input).await?;
+    assert_eq!(written.persisted_bytes, payload.len() as u64);
+    Ok(stage)
+}
+
+/// Publishes `stage`, then reads the object back pinned to what the publication reported (an S3
+/// stage is verified after publication).
+async fn publish_and_verify(
+    destination: &dyn StagedDestination,
+    stage: &PreparedStage,
+    content: &[u8],
+) -> TestResult {
+    let digest = *blake3::hash(content).as_bytes();
+    let size = content.len() as u64;
+    let published = destination
+        .publish(
+            stage,
+            PublishRequest {
+                expected_size: size,
+                expected_blake3: Some(digest),
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .map_err(|failure| failure.error)?;
+    destination
+        .verify(
+            stage,
+            VerifyRequest {
+                expected_size: size,
+                expected_blake3: digest,
+                cancel: CancellationToken::new(),
+                published: Some(published),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+fn class<T>(result: &Result<T, StorageRoleFailure>) -> Option<FailureClass> {
+    match result {
+        Err(StorageRoleFailure::Entry(error)) => Some(error.class()),
+        _ => None,
+    }
+}
 
 #[test]
 fn certified_standard_s3_roles_are_available_in_production()
@@ -114,43 +203,16 @@ async fn range_stream_multipart_verify_publish_and_readback()
 
     let destination = storage.staged_destination(&policy)?;
     let payload = Bytes::from_static(b"streamed multipart payload");
-    let stage = destination
-        .prepare(PrepareRequest {
-            final_destination: FinalDestination::new(StoragePath::new("final")?),
-            source: descriptor,
-            recovery_binding: [7; 32],
-        })
-        .await?;
-    let input = Box::pin(futures::stream::iter([Ok(payload.clone())]));
-    assert_eq!(
-        destination.write(&stage, input).await?.persisted_bytes,
-        payload.len() as u64
+    // An upload on the final key completes only the source's size.
+    let mut descriptor = descriptor;
+    descriptor.size = Some(payload.len() as u64);
+    let stage = written_to_final(&*destination, descriptor, &payload).await?;
+    assert!(
+        !protocol.objects.lock().await.contains_key("final"),
+        "nothing is visible before publication"
     );
-    let digest = *blake3::hash(&payload).as_bytes();
-    destination
-        .verify(
-            &stage,
-            VerifyRequest {
-                expected_size: payload.len() as u64,
-                expected_blake3: digest,
-                cancel: CancellationToken::new(),
-                published: None,
-            },
-        )
-        .await?;
-    destination
-        .publish(
-            &stage,
-            PublishRequest {
-                expected_size: payload.len() as u64,
-                expected_blake3: Some(digest),
-                cancel: CancellationToken::new(),
-            },
-        )
-        .await
-        .map_err(|failure| failure.error)?;
+    publish_and_verify(&*destination, &stage, &payload).await?;
     assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
-    assert!(destination.observe_checkpoint(&stage).await.is_err());
     Ok(())
 }
 
@@ -223,28 +285,13 @@ async fn failed_input_preserves_checkpoint_until_explicit_discard()
     let protocol = Arc::new(MemoryS3::default());
     let storage = connect(protocol.clone(), identity(), Some(native_context()))?;
     let destination = storage.staged_destination(&validation_policy())?;
-    let path = StoragePath::new("final")?;
-    let source_identity = crate::model::SourceIdentity::new(
-        identity(),
-        crate::model::IdentityStrength::PathScoped,
-        b"source",
-    )?;
     let stage = destination
-        .prepare(PrepareRequest {
-            final_destination: FinalDestination::new(path.clone()),
-            source: crate::storage::SourceDescriptor {
-                path,
-                kind: crate::model::EntryKind::File,
-                size: None,
-                source_identity,
-                backend_fact: None,
-                content_version: None,
-                inline_timestamps: None,
-                inline_mode: None,
-                version: SourceVersion::Current,
-            },
-            recovery_binding: [9; 32],
-        })
+        .prepare_at_destination(at_destination(
+            "final",
+            described(None)?,
+            [9; 32],
+            ResumeMode::Restart,
+        )?)
         .await?;
     let failure = super::source::entry(
         &StoragePath::new("source")?,
@@ -261,6 +308,8 @@ async fn failed_input_preserves_checkpoint_until_explicit_discard()
     assert!(!protocol.objects.lock().await.contains_key("final"));
     destination.discard(stage).await?;
     assert_eq!(*protocol.aborts.lock().await, 1);
+    assert!(protocol.uploads.lock().await.is_empty());
+    assert!(protocol.objects.lock().await.is_empty(), "nor a pointer");
     Ok(())
 }
 
@@ -308,47 +357,23 @@ async fn cancellation_remains_a_typed_entry_outcome() -> Result<(), Box<dyn std:
 async fn overwrite_publication_does_not_head_the_existing_destination()
 -> Result<(), Box<dyn std::error::Error>> {
     let protocol = Arc::new(MemoryS3::default());
-    // The copy from the temp key: an object this small would otherwise be one PUT.
+    // The completion of an upload: an object this small would otherwise be one PUT.
     let storage = connect_multipart_only(protocol.clone(), identity(), Some(native_context()))?;
     let destination = storage.staged_destination(&validation_policy())?;
-    let path = StoragePath::new("final")?;
-    let source_identity = crate::model::SourceIdentity::new(
-        identity(),
-        crate::model::IdentityStrength::PathScoped,
-        b"source",
-    )?;
-    let stage = destination
-        .prepare(PrepareRequest {
-            final_destination: FinalDestination::new(path),
-            source: crate::storage::SourceDescriptor {
-                path: StoragePath::new("source")?,
-                kind: crate::model::EntryKind::File,
-                size: Some(7),
-                source_identity,
-                backend_fact: None,
-                content_version: None,
-                inline_timestamps: None,
-                inline_mode: None,
-                version: SourceVersion::Current,
-            },
-            recovery_binding: [4; 32],
-        })
-        .await?;
     let payload = Bytes::from_static(b"payload");
-    destination
-        .write(
-            &stage,
-            Box::pin(futures::stream::iter([Ok(payload.clone())])),
-        )
-        .await?;
-    *protocol.head_failure.lock().await = Some((
-        "final".into(),
-        S3ProtocolFailure::session(
-            crate::model::FailureClass::Connectivity,
-            crate::model::Transience::Transient,
-            "endpoint unavailable",
-        ),
-    ));
+    let stage = written_to_final(&*destination, described(Some(7))?, &payload).await?;
+    let previous = Bytes::from_static(b"previous");
+    protocol
+        .objects
+        .lock()
+        .await
+        .insert("final".into(), previous);
+    let unavailable = S3ProtocolFailure::session(
+        FailureClass::Connectivity,
+        Transience::Transient,
+        "endpoint unavailable",
+    );
+    *protocol.head_failure.lock().await = Some(("final".into(), unavailable));
     let result = destination
         .publish(
             &stage,
@@ -371,172 +396,173 @@ async fn overwrite_publication_does_not_head_the_existing_destination()
     Ok(())
 }
 
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn multipart_checkpoint_is_reobserved_and_resumed_after_reconnect()
--> Result<(), Box<dyn std::error::Error>> {
-    let protocol = Arc::new(MemoryS3::default());
-    let first_storage = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let policy = validation_policy();
-    let destination = first_storage.staged_destination(&policy)?;
-    let final_path = StoragePath::new("resumed-final")?;
-    let source = crate::storage::SourceDescriptor {
-        path: StoragePath::new("source")?,
-        kind: crate::model::EntryKind::File,
-        size: None,
-        source_identity: crate::model::SourceIdentity::new(
-            identity(),
-            crate::model::IdentityStrength::PathScoped,
-            b"stable-source",
-        )?,
-        backend_fact: None,
-        content_version: None,
-        inline_timestamps: None,
-        inline_mode: None,
-        version: SourceVersion::Current,
-    };
-    let prepare = PrepareRequest {
-        final_destination: FinalDestination::new(final_path.clone()),
-        source: source.clone(),
-        recovery_binding: [6; 32],
-    };
-    let stage = destination.prepare(prepare.clone()).await?;
-    let recovery = destination.recovery_identity(&stage).await?;
+/// `parts` parts of 8 MiB of `5`, then a failed read.
+fn interrupted_after(parts: usize) -> TestResult<ByteStream> {
     let part = Bytes::from(vec![5u8; 8 * 1024 * 1024]);
-    let injected = super::source::entry(&source.path, crate::model::Operation::Read, "interrupted");
-    let interrupted = futures::stream::iter([
-        Ok(part.clone()),
-        Ok(part.clone()),
-        Ok(part.clone()),
-        Ok(part.clone()),
-        Err(injected),
-    ]);
+    let mut input: Vec<_> = (0..parts).map(|_| Ok(part.clone())).collect();
+    input.push(Err(super::source::entry(
+        &StoragePath::new("source")?,
+        crate::model::Operation::Read,
+        "interrupted",
+    )));
+    Ok(Box::pin(futures::stream::iter(input)))
+}
+
+/// An upload interrupted after four parts is picked up from the destination by a fresh
+/// connection: the pointer names the upload, the listed parts are the durable prefix, and only
+/// the rest is sent.
+#[tokio::test]
+async fn an_upload_is_resumed_from_the_destination_after_reconnect() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    let request = || at_destination("resumed", described(None)?, [6; 32], ResumeMode::Discover);
+    let connected = || {
+        connect(protocol.clone(), identity(), Some(native_context()))?
+            .staged_destination(&validation_policy())
+            .map_err(Into::<Box<dyn std::error::Error>>::into)
+    };
+    let destination = connected()?;
+    let stage = destination.prepare_at_destination(request()?).await?;
+    assert!(
+        stage.recovery_enabled(),
+        "an unknown size writes its pointer at once"
+    );
     assert!(
         destination
-            .write(&stage, Box::pin(interrupted))
+            .write(&stage, interrupted_after(4)?)
             .await
             .is_err()
     );
-    let checkpoint = destination.observe_checkpoint(&stage).await?.durable_prefix;
-    assert_eq!(checkpoint, (part.len() * 4) as u64);
+    drop((stage, destination));
 
-    let second_storage = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let resumed_destination = second_storage.staged_destination(&policy)?;
-    let resumed = resumed_destination
-        .recover(crate::storage::RecoverRequest {
-            identity: recovery,
-            final_destination: prepare.final_destination.clone(),
-            source: source.clone(),
-            recovery_binding: prepare.recovery_binding,
-            claim_token: [8; 32],
-        })
-        .await?;
+    let destination = connected()?;
+    let resumed = destination.prepare_at_destination(request()?).await?;
+    let checkpoint = 4 * 8 * 1024 * 1024;
     assert_eq!(
-        resumed_destination
-            .observe_checkpoint(&resumed)
-            .await?
-            .durable_prefix,
-        checkpoint
+        resumed.prepare_fact(),
+        PrepareFact::Resumed { bytes: checkpoint }
     );
+    assert_eq!(resumed.write_offset, checkpoint);
+    let observed = destination.observe_checkpoint(&resumed).await?;
+    assert_eq!(observed.durable_prefix, checkpoint);
     let full = vec![5u8; 4 * 8 * 1024 * 1024 + 17];
-    let checkpoint = usize::try_from(checkpoint)?;
-    resumed_destination
-        .write(
-            &resumed,
-            Box::pin(futures::stream::iter([Ok(Bytes::copy_from_slice(
-                &full[checkpoint..],
-            ))])),
-        )
-        .await?;
-    let digest = *blake3::hash(&full).as_bytes();
-    resumed_destination
-        .verify(
-            &resumed,
-            VerifyRequest {
-                expected_size: full.len() as u64,
-                expected_blake3: digest,
-                cancel: CancellationToken::new(),
-                published: None,
-            },
-        )
-        .await?;
-    resumed_destination
-        .publish(
-            &resumed,
-            PublishRequest {
-                expected_size: full.len() as u64,
-                expected_blake3: Some(digest),
-                cancel: CancellationToken::new(),
-            },
-        )
-        .await
-        .map_err(|failure| failure.error)?;
+    let rest = Bytes::copy_from_slice(&full[usize::try_from(checkpoint)?..]);
+    let input = Box::pin(futures::stream::iter([Ok(rest)]));
+    destination.write(&resumed, input).await?;
+    publish_and_verify(&*destination, &resumed, &full).await?;
+    let objects = protocol.objects.lock().await;
     assert_eq!(
-        protocol
-            .objects
-            .lock()
-            .await
-            .get(final_path.as_str())
-            .map(Bytes::as_ref),
+        objects.get("resumed").map(Bytes::as_ref),
         Some(full.as_slice())
     );
+    assert_eq!(objects.len(), 1, "the pointer is gone");
     Ok(())
 }
 
+/// The store era's entry points are gone (ADR-0006 C19): S3 is prepared only at the
+/// destination, nothing is recorded where data-mover runs, and none of them touches the bucket.
 #[tokio::test]
-async fn publication_reconciles_a_committed_copy_with_a_lost_response()
--> Result<(), Box<dyn std::error::Error>> {
+async fn store_era_entry_points_are_unsupported() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
-    // The copy from the temp key: an object this small would otherwise be one PUT.
-    let storage = connect_multipart_only(protocol.clone(), identity(), Some(native_context()))?;
-    let policy = validation_policy();
-    let destination = storage.staged_destination(&policy)?;
-    let payload = Bytes::from_static(b"ambiguous publication payload");
-    let path = StoragePath::new("ambiguous-final")?;
-    let stage = destination
-        .prepare(PrepareRequest {
-            final_destination: FinalDestination::new(path.clone()),
-            source: crate::storage::SourceDescriptor {
-                path: StoragePath::new("source")?,
-                kind: crate::model::EntryKind::File,
-                size: Some(payload.len() as u64),
-                source_identity: crate::model::SourceIdentity::new(
-                    identity(),
-                    crate::model::IdentityStrength::PathScoped,
-                    b"source",
-                )?,
-                backend_fact: None,
-                content_version: None,
-                inline_timestamps: None,
-                inline_mode: None,
-                version: SourceVersion::Current,
-            },
-            recovery_binding: [2; 32],
-        })
-        .await?;
-    destination
-        .write(
-            &stage,
-            Box::pin(futures::stream::iter([Ok(payload.clone())])),
-        )
-        .await?;
-    *protocol.copy_commits_then_fails.lock().await = true;
-    let digest = *blake3::hash(&payload).as_bytes();
-    let published = destination
-        .publish(
-            &stage,
-            PublishRequest {
-                expected_size: payload.len() as u64,
-                expected_blake3: Some(digest),
-                cancel: CancellationToken::new(),
-            },
-        )
-        .await
-        .map_err(|failure| failure.error)?;
-    assert_eq!(published.final_destination, path);
+    let destination = connect(protocol.clone(), identity(), Some(native_context()))?
+        .staged_destination(&validation_policy())?;
+    let request = at_destination("final", described(None)?, [8; 32], ResumeMode::Discover)?;
+    let prepare = request.prepare.clone();
     assert_eq!(
-        protocol.objects.lock().await.get("ambiguous-final"),
-        Some(&payload)
+        class(&destination.prepare(prepare.clone()).await),
+        Some(FailureClass::Unsupported)
     );
+    assert_eq!(
+        class(&destination.prepare_ephemeral(prepare.clone()).await),
+        Some(FailureClass::Unsupported)
+    );
+    assert_eq!(*protocol.multipart_begins.lock().await, 0);
+    assert!(protocol.objects.lock().await.is_empty());
+    let stage = destination.prepare_at_destination(request).await?;
+    assert_eq!(
+        class(&destination.recovery_identity(&stage).await),
+        Some(FailureClass::Unsupported)
+    );
+    assert_eq!(
+        class(&destination.handoff_recovery(&stage).await),
+        Some(FailureClass::Unsupported)
+    );
+    let recovered = destination
+        .recover(RecoverRequest {
+            identity: RecoveryIdentity::from_bytes(Bytes::from_static(b"old\0upload"))?,
+            final_destination: prepare.final_destination,
+            source: prepare.source,
+            recovery_binding: prepare.recovery_binding,
+            claim_token: [9; 32],
+        })
+        .await;
+    assert_eq!(class(&recovered), Some(FailureClass::Unsupported));
+    destination.discard(stage).await?;
+    assert!(protocol.uploads.lock().await.is_empty());
+    assert!(protocol.objects.lock().await.is_empty());
+    Ok(())
+}
+
+/// The store era's temp-key stage: `.data-mover-stage/…` and an upload id, no backend state.
+fn temp_key_stage() -> TestResult<PreparedStage> {
+    Ok(PreparedStage::new(
+        identity(),
+        FinalDestination::new(StoragePath::new("final")?),
+        Bytes::from_static(b".data-mover-stage/binding/final\0upload-1"),
+        [8; 32],
+        0,
+        None,
+    ))
+}
+
+/// A stage this destination did not prepare at the destination, nor as `Direct` — the store
+/// era's temp-key stage — is refused by every role method with a permanent `Conflict`, before
+/// anything is touched.
+#[tokio::test]
+async fn a_temp_key_stage_is_refused() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    let destination = connect(protocol.clone(), identity(), Some(native_context()))?
+        .staged_destination(&validation_policy())?;
+    let conflict = Some(FailureClass::Conflict);
+    let stage = temp_key_stage()?;
+    let input = Box::pin(futures::stream::iter([Ok(Bytes::from_static(b"data"))]));
+    assert_eq!(class(&destination.write(&stage, input).await), conflict);
+    assert_eq!(
+        class(&destination.observe_checkpoint(&stage).await),
+        conflict
+    );
+    let verify = VerifyRequest {
+        expected_size: 4,
+        expected_blake3: [0; 32],
+        cancel: CancellationToken::new(),
+        published: None,
+    };
+    assert_eq!(class(&destination.verify(&stage, verify).await), conflict);
+    let tags = MetadataMutation::Tags(Vec::new());
+    let applied = destination.apply_metadata(&stage, tags, CancellationToken::new());
+    assert_eq!(class(&applied.await), conflict);
+    let publish = PublishRequest {
+        expected_size: 4,
+        expected_blake3: None,
+        cancel: CancellationToken::new(),
+    };
+    let refused = destination.publish(&stage, publish).await.err();
+    let refused = refused.ok_or("a temp-key stage was published")?;
+    assert_eq!(class(&Err::<(), _>(refused.error)), conflict);
+    assert!(!refused.final_destination_changed);
+    let source = S3NativeCopySource {
+        bucket: "memory".into(),
+        key: "source".into(),
+        etag: "\"etag\"".into(),
+        version_id: None,
+        size: 4,
+    };
+    let adapter = S3StagedDestination::new(protocol.clone(), identity());
+    let filled = adapter.fill_native(&stage, source, CancellationToken::new(), 1);
+    let refused = filled.await.err().ok_or("a temp-key stage was filled")?;
+    assert_eq!(class(&Err::<(), _>(refused.error)), conflict);
+    assert_eq!(class(&destination.discard(stage).await), conflict);
+    assert_eq!(*protocol.aborts.lock().await, 0);
+    assert_eq!(*protocol.puts.lock().await, 0);
+    assert!(protocol.objects.lock().await.is_empty());
     Ok(())
 }

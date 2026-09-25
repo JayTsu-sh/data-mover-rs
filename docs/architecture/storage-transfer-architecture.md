@@ -612,10 +612,11 @@ Backend mechanisms:
 - Local/NFS/CIFS: persisted contiguous durable prefix; writes beyond a gap are not reusable;
 - S3/DXN: objects up to the single-PUT threshold (`S3BackendConfig.single_put_threshold`, default
   8 MiB) are one `PutObject` to the final key, verified after publication, with no recovery state;
-  larger ones: service-enumerated multipart parts named by the validated upload identity; no adapter
-  claim (it relied on a conditional PUT that MinIO `RELEASE.2023-03-20` rejects with 404, failing
-  every resume there) — exclusivity is the engine's per-host recovery lease, and one destination
-  key is never written by two transfers at once (caller contract);
+  larger ones: a multipart upload on the final key, whose contiguous prefix of service-enumerated
+  parts a resume continues from, named by the nonce-fenced `.upload` pointer beside the key (see
+  "S3 destination-resident recovery"); no adapter claim (the conditional PUT one relied on is
+  rejected with 404 by MinIO `RELEASE.2023-03-20`) — one destination key is never written by two
+  transfers at once (caller contract), plus the engine's in-process per-key guard;
 - HDFS: deterministic `.stage` beside the final file, its length after forced lease recovery, and
   continuous verified tail append.
 
@@ -786,6 +787,15 @@ recovery on the stage (which also fences the dead writer) and continues from its
 earlier random `.data-mover-<digest>.part` stage, the `hdfs-recovery-v1` recovery identity and the
 `.claimed` rename were removed in C12d.
 
+S3 destination-resident recovery (ADR-0006 C14–C19): every S3 stage writes the final key. An object
+up to the single-PUT threshold is one `PutObject` (a native copy up to 64 MiB one `CopyObject`); a
+larger one is a multipart upload on the final key, and a checkpointed one over the 64 MiB automatic
+interval (or of unknown size) is named by the `.data-mover-<digest>.upload` pointer object beside the
+key (upload id, part size, per-prepare nonce; no durable prefix — `ListParts` is the durable record). Publication completes
+the upload; verification reads the object back after publication, pinned to the version or `ETag` the
+write reported. The earlier temp key under `.data-mover-stage/`, copied to the final key at
+publication and resumed from a local recovery identity, was removed in C19; `prepare`,
+`recovery_identity` and `recover` answer `Unsupported` for S3.
 
 ### HDFS source baseline metadata
 

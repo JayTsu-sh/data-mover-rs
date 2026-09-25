@@ -5,8 +5,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::model::{EntryKind, IdentityStrength, SourceIdentity, StoragePath};
+use crate::storage::artifacts::ARTIFACT_PREFIX;
 use crate::storage::backends::s3::tests::{MemoryS3, etag_of, identity};
-use crate::storage::{FinalDestination, SourceDescriptor};
+use crate::storage::{FinalDestination, ResumeMode, SourceDescriptor};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -23,6 +24,14 @@ fn prepare_request(size: u64) -> TestResult<PrepareRequest> {
         final_destination: FinalDestination::new(StoragePath::new("final")?),
         recovery_binding: [61; 32],
     })
+}
+
+/// A prepare at the destination that resumes nothing.
+fn restart(size: u64) -> TestResult<DestinationPrepareRequest> {
+    Ok(
+        DestinationPrepareRequest::new(prepare_request(size)?, [63; 32])
+            .with_resume(ResumeMode::Restart),
+    )
 }
 
 fn destination(protocol: &Arc<MemoryS3>) -> S3StagedDestination<MemoryS3> {
@@ -52,7 +61,7 @@ async fn written(
     payload: &Bytes,
 ) -> TestResult<PreparedStage> {
     let stage = destination
-        .prepare(prepare_request(payload.len() as u64)?)
+        .prepare_at_destination(restart(payload.len() as u64)?)
         .await?;
     let input = Box::pin(futures::stream::iter([Ok(payload.clone())]));
     assert_eq!(
@@ -132,24 +141,21 @@ async fn an_object_of_exactly_the_threshold_is_one_put() -> TestResult {
     Ok(())
 }
 
-/// One byte over T keeps today's multipart upload on the temp key, verified before publication.
+/// One byte over T is a multipart upload on the final key, also verified after publication.
 #[tokio::test]
-async fn one_byte_over_the_threshold_is_still_multipart() -> TestResult {
+async fn one_byte_over_the_threshold_is_an_upload_on_the_final_key() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let destination = destination(&protocol);
-    let stage = destination.prepare(prepare_request(T + 1)?).await?;
+    let stage = destination.prepare_at_destination(restart(T + 1)?).await?;
     assert_eq!(*protocol.multipart_begins.lock().await, 1);
-    assert!(
-        destination
-            .stage_state(&stage, Operation::Write)
-            .await
-            .is_ok()
-    );
+    assert!(at_destination::of(&stage).is_some());
+    assert!(single::of(&stage).is_none());
     assert_eq!(
         destination.verification_point(&stage),
-        VerificationPoint::BeforePublish
+        VerificationPoint::AfterPublish
     );
     destination.discard(stage).await?;
+    assert!(protocol.uploads.lock().await.is_empty());
     Ok(())
 }
 
@@ -158,7 +164,7 @@ async fn one_byte_over_the_threshold_is_still_multipart() -> TestResult {
 async fn an_empty_object_is_one_put() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let destination = destination(&protocol);
-    let stage = destination.prepare(prepare_request(0)?).await?;
+    let stage = destination.prepare_at_destination(restart(0)?).await?;
     let evidence = destination
         .write(&stage, Box::pin(futures::stream::empty()))
         .await?;
@@ -182,7 +188,7 @@ async fn an_empty_object_is_one_put() -> TestResult {
 async fn more_bytes_than_the_source_size_are_invalid_input() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let destination = destination(&protocol);
-    let stage = destination.prepare(prepare_request(3)?).await?;
+    let stage = destination.prepare_at_destination(restart(3)?).await?;
     let input = Box::pin(futures::stream::iter([
         Ok(Bytes::from_static(b"ab")),
         Ok(Bytes::from_static(b"cd")),
@@ -422,43 +428,12 @@ async fn discarding_an_unpublished_single_stage_sends_nothing() -> TestResult {
     Ok(())
 }
 
-/// Asked to recover a single stage anyway, the destination starts it again from nothing.
-#[tokio::test]
-async fn recovering_a_single_stage_restarts_it_fresh() -> TestResult {
-    let protocol = Arc::new(MemoryS3::default());
-    let destination = destination(&protocol);
-    let payload = Bytes::from_static(b"restart me");
-    let stage = written(&destination, &payload).await?;
-    let identity = destination.recovery_identity(&stage).await?;
-    let request = prepare_request(payload.len() as u64)?;
-    let recovered = destination
-        .recover(RecoverRequest {
-            identity,
-            final_destination: request.final_destination,
-            source: request.source,
-            recovery_binding: request.recovery_binding,
-            claim_token: [62; 32],
-        })
-        .await?;
-    assert_eq!(recovered.write_offset, 0);
-    assert!(!recovered.recovery_enabled());
-    assert_eq!(
-        destination.observe_checkpoint(&recovered).await?,
-        CheckpointObservation { durable_prefix: 0 }
-    );
-    assert_eq!(
-        destination.verification_point(&recovered),
-        VerificationPoint::AfterPublish
-    );
-    Ok(())
-}
-
 /// A configured threshold of `None` sends every object through a multipart upload.
 #[tokio::test]
 async fn without_a_threshold_every_object_is_multipart() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let destination = destination(&protocol).with_single_put_threshold(None);
-    let stage = destination.prepare(prepare_request(1)?).await?;
+    let stage = destination.prepare_at_destination(restart(1)?).await?;
     assert_eq!(*protocol.multipart_begins.lock().await, 1);
     destination.discard(stage).await?;
     Ok(())
@@ -472,7 +447,7 @@ async fn staged_tags_are_set_on_the_published_object() -> TestResult {
     let destination = storage.staged_destination(&crate::storage::PreflightPolicy::production())?;
     let payload = Bytes::from_static(b"tagged");
     let stage = destination
-        .prepare(prepare_request(payload.len() as u64)?)
+        .prepare_at_destination(restart(payload.len() as u64)?)
         .await?;
     destination.write_single(&stage, payload.clone()).await?;
     let tag = crate::model::ObjectTag::new("class", "gold")?;
