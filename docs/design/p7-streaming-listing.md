@@ -340,6 +340,22 @@ generation 提交、任务成功）只在 ClickHouse 确认写入之后才前进
   再输出」拼出一个 key 的完整历史，其模块注释明确假设「服务端按 key 升序列举」。在无序 S3 上，一个 key 的历史可能被拆成
   多组、`version_count` 与 latest 标记出错。需要单独修（例如按目录收齐再分组），待 Q12b 确认是哪家存储后排期。
 
+**续扫开关作为入参（D20）与临时表不改**：
+
+```
+TraversalRequest::new(root)
+    .order(TraversalOrder::Unordered | TraversalOrder::Blocks)
+    .resumable(Resumable::Off)                    // 默认；或 Resumable::On { every_items, every }
+    .resume_from(Option<Checkpoint>)              // None = 从头扫
+```
+
+- Off 不记录未扫目录、不发 `Checkpoint`，零开销；On 按条数或时间间隔发 `Checkpoint`，上层等其前所有批确认写入后才存。
+- 检查点绑定 root / order / filter / max_depth，续扫时不一致就在任何请求前报类型化失败；哪些场景开续扫由上层定。
+- terrasync 临时表不用改（覆盖 D18「临时表去重」前提）：增量扫描每批一张新临时表 → 与 base 比较（`NOT IN base` 与内容变化）
+  → 并入 base（`ReplacingMergeTree` 按主键去重）→ 删临时表，跨批重复本就无害。只剩同批重复：临时表插入重试时先删表换新表再插；
+  列举自身的重复（S3 跨页、NFS 目录变化时两页交界）落在同一批时会多发一次 New，需要时在检测 SQL 加
+  `LIMIT 1 BY t.relative_path, t.version_id`（改查询不改表）。最终统计从 base（带 `FINAL`）算。
+
 ### 待拍板（建议）
 
 | # | 问题 | 建议 |
@@ -348,8 +364,8 @@ generation 提交、任务成功）只在 ClickHouse 确认写入之后才前进
 | 2 | `SubtreeComplete` 两种模式都删 | 删 |
 | 3 | 计数放置：Blocks 的 `DirectoryListed` 带本目录计数，两种模式 `TraversalCompletion` 带全局总数 | 同意 |
 | 4 | data-mover 是否提供逐目录配对辅助（两侧都发 `DirectoryListed` 后才判定一侧缺失） | 提供 |
-| 5 | 按 D18 的简化模型续扫，data-mover 发检查点，默认关 | 同意 |
-| 5a | 两个前提：临时表去重、最终统计从去重后的库里算 | 同意 |
+| 5 | 续扫不要求精确、只要求进度不领先于已入库数据；接口 `resumable` + `resume_from`，默认关，上层决定何时开 | 同意 |
+| 5a | 临时表不改；剩三条：临时表插入重试换新表、检测 SQL 可选加 `LIMIT 1 BY`、最终统计来自 base | 同意 |
 | 5b | 列出 / 被过滤 / `.data-mover-*` / 消失 / 列举失败这几项只有遍历知道，续扫后是近似值 —— 接受，还是也要精确 | 接受近似 |
 | 5c | 上述 terrasync 改动只写进设计、不改 terrasync 代码 | 是 |
 | 5e | 全量扫描也加「写完校验通过才生效」 | 加 |
