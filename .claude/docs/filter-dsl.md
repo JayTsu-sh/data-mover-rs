@@ -64,7 +64,7 @@
 | `file_name` | 最后一段 |
 | `file_type` | `file` / `dir` / `symlink` / `special` |
 | `extension` | 与 `Path::extension` 一致：最后一个 `.` 之后，且该 `.` 前必须有内容，所以 `.bashrc` 没有扩展名。永不为 `None` |
-| `size` | 目录取 `Some(0)`，否则 `size` 条件会退化成放行的 `LazyMatch` |
+| `size` | 目录取 `Some(0)`，否则 `size` 条件会退化成放行的 `LazyMatch`。S3 删除标记（`TraversalVersions::All`）取 `None`，**有意保留**这个 `LazyMatch`（用户决定 2026-09-25）：`size` 条件本身从不滤掉标记（表达式里的其他条件照常判断），这样历史迁移会带上大文件的删除记录 —— 标记不带数据；目的端该 key 上没有对象时，重放一个从没拷过的 key 的删除不改任何数据（有对象时重放会把它藏到新标记后面，是否重放由调用方判断） |
 
 **`modified` 缺失时不能先评估**：缺 `modified` 的 `Modified` 条件返回 `LazyMatch`，而
 `LazyMatch` 会被组合子吸收 (`Match & Lazy = Match`、`MisMatch | Lazy = MisMatch`)，

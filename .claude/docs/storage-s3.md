@@ -522,7 +522,10 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - **All**：每个版本与删除标记各一条，同一 key 连续、从旧到新、latest 最后（`history.rs`）：版本、标记**各自**按
   服务器列举顺序反过来（这个顺序是权威的，节点时钟不一致或没有时间都不改它），`LastModified` 只决定两条序列
   怎么交错（同一毫秒版本在前，同 C20）；latest 不论在哪条序列都排最后。与 C20 不同：C20 按时间排序，时钟偏差时会乱。删除标记是 `File`、`size` 为 `None`：DSL 的 `size`
-  条件对它是 `LazyMatch`（放行），要排除标记按 `version().is_delete_marker()` 在调用方过滤。
+  条件对它是 `LazyMatch`（放行），要排除标记按 `version().is_delete_marker()` 在调用方过滤。这是**有意的规则**
+  （用户决定 2026-09-25）：`size` 条件不滤删除标记，所以按大小筛的历史迁移仍带上大文件的删除记录 —— 标记不带数据，
+  目的端该 key 上没有对象时，重放一个从没拷过的 key 的删除不改任何数据（有对象时重放会把它藏到新标记后面，是否重放
+  由调用方判断）；表达式里的其他条件（`name` / `path` …）照常作用于标记。
   `ObservedEntry::version()` = `EntryVersion { id（"null" → None）, latest, 删除标记 }`；`source_version()`：真版本
   `Id(id)`、latest 的 `"null"` → `Current`、非 latest 的 `"null"` → `Id("null")`、删除标记 → `None`（标记无 size，
   也不 HEAD）。身份 `VersionScoped(id)`（与带版本 describe 一致）。可选元数据按该版本取（`observe_copy_bound_version`，
