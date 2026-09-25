@@ -62,6 +62,10 @@ filter 决定 (deferred 的除外)，所以已预读、游标还没走到的目�
 不只是游标正等的那个 —— 否则已预读目录的子目录不会被展开预读。
 **按页观察 (P7 C0)**：不需要 I/O 的子项 (非 symlink，且列举已带齐观察计划要的元数据) 也在列举任务里
 组装成 `ObservedEntry`，驱动一块只被唤醒一次、准入时直接落槽；filter 隐藏的子项在那里只计数、不进块。
+需要 `modified` 的 filter (C0b)：子项在列举任务里已组装好时，就用这条 entry 当场决定 (与 deferred 读到的值
+是同一个)，只有要 I/O 或观察失败的子项才 deferred；deferred 的下钻槽位在 prepare 时就按块内顺序放进
+`slots`，用列举任务发的 ticket (`Shared.tickets`) 作键，而不是准入时的输出序号 —— 否则即时与 deferred
+混在一块时下钻顺序会乱。
 需要 I/O 的 (symlink 目标、列举没带的元数据) 每块一个观察任务 (`observe.rs` 的 `Observations`)，
 游标准入时把子项喂给它，任务内 `FuturesUnordered` 并发，结果逐个回送，总量受准入窗口约束 —— 不再每条目
 一个任务。重排缓冲 (`output.rs`) 对恰好是下一个序号的槽位走就绪队列，乱序到达的才进 `BTreeMap`。

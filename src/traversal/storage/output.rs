@@ -41,11 +41,12 @@ pub(super) enum ChildDescent {
 pub(super) struct BlockFacts {
     /// The directory could not be listed. Its block holds only that failure.
     pub(super) listing_failed: bool,
-    /// Children an immediate decision kept out of the output. These have no slot at all.
+    /// Children a decision made in the listing's task kept out of the output. These have no
+    /// slot at all.
     pub(super) hidden: u64,
-    /// Subdirectories an immediate decision did not descend into.
+    /// Subdirectories a decision made in the listing's task did not descend into.
     pub(super) pruned: u64,
-    /// Subdirectories `max_depth` stopped at, by an immediate decision.
+    /// Subdirectories `max_depth` stopped at, by a decision made in the listing's task.
     pub(super) truncated: u64,
     /// The order the block's children were admitted in.
     pub(super) child_order: ChildOrder,

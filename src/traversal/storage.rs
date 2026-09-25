@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -193,6 +193,9 @@ struct Deferred {
     /// Carried so a failed observation of a directory can still be descended rather than
     /// silently dropping its whole subtree.
     kind: EntryKind,
+    /// The ticket of the descend slot the decision fills, when the child is a directory the
+    /// request may descend into at all ([`awaits_slot`]).
+    ticket: Option<u64>,
 }
 
 type ListingTask = JoinSet<(StoragePath, Arrival)>;
@@ -275,6 +278,8 @@ struct Shared {
     metadata: Arc<dyn Metadata>,
     request: TraversalRequest,
     policy: Policy,
+    /// Keys for deferred descend slots, handed out by the listing tasks that place them.
+    tickets: AtomicU64,
 }
 
 struct Runtime<'a> {
@@ -311,6 +316,7 @@ async fn run(
         metadata,
         policy: Policy::new(&request),
         request,
+        tickets: AtomicU64::new(0),
     });
     let runtime = Runtime {
         shared: &shared,
@@ -429,7 +435,8 @@ async fn wait(
 /// The admission decision for one listed child, when it can be made from the listing alone.
 ///
 /// `None` means the filter needs `modified` and still applies below `parent`, so the decision
-/// waits for the child's observation. Made once per child, when the listing arrives, so that a
+/// is made from the child's observation instead: at once in the listing's task when that needed
+/// no I/O, otherwise once it settles. Made once per child, when the listing arrives, so that a
 /// prefetched directory's subdirectories are known before the cursor reaches it.
 fn immediate_decision(
     shared: &Shared,
@@ -452,38 +459,24 @@ fn immediate_decision(
 }
 
 /// Admits one listed child into its output slot: settles it at once when its listing's task
-/// already observed it, or hands it to its block's observation task. `decision` is the child's
-/// [`immediate_decision`]; a child that decision hides was only counted, and never gets here.
-///
-/// Where an immediate decision descends to was settled when the listing arrived. A deferred
-/// decision still needs a slot here, because the slot is keyed by the sequence this function
-/// allocates.
+/// already observed it, or hands it to its block's observation task. A child a decision made in
+/// the listing's task hides was only counted there, and never gets here; a deferred one already
+/// has its descend slot, placed in the block's order when the listing was prepared.
 fn admit(
     runtime: &Runtime<'_>,
-    block: &mut Admitting<'_>,
+    feed: &mut Option<Feed>,
     child: cursor::Child,
     decisions: &mut Decisions,
     observations: &mut Observations,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
-    let cursor::Child {
-        kind,
-        listed,
-        decision,
-    } = child;
+    let cursor::Child { listed, deferred } = child;
     let sequence = state.allocate()?;
-    let deferred = decision.is_none().then_some(Deferred {
-        depth: block.work.child_depth,
-        kind,
-    });
-    if deferred.is_some_and(|deferred| awaits_slot(runtime.request, deferred)) {
-        block.slots.push_back(cursor::Slot::Pending(sequence));
-    }
     match listed {
         Listed::Observed(result) => settle(runtime, decisions, state, (sequence, result, deferred)),
         Listed::Unobserved(descriptor) => observations.start(
             runtime.shared,
-            block.feed,
+            feed,
             Job {
                 sequence,
                 descriptor,
@@ -491,13 +484,6 @@ fn admit(
             },
         ),
     }
-}
-
-/// The parts of the block being admitted that admitting one of its children writes to.
-struct Admitting<'a> {
-    work: &'a DirectoryWork,
-    slots: &'a mut VecDeque<cursor::Slot>,
-    feed: &'a mut Option<Feed>,
 }
 
 /// Whether a deferred child can be descended into at all, so its decision fills a slot.
@@ -518,11 +504,12 @@ enum DescendOutcome {
 /// same order, so the two paths agree.
 fn descend_outcome(
     request: &TraversalRequest,
-    descriptor: &SourceDescriptor,
+    kind: EntryKind,
+    path: &StoragePath,
     depth: usize,
     decision: TraversalDecision,
 ) -> DescendOutcome {
-    if descriptor.kind != EntryKind::Directory {
+    if kind != EntryKind::Directory {
         return DescendOutcome::NotDirectory;
     }
     if !request.admits_depth(depth) {
@@ -532,7 +519,7 @@ fn descend_outcome(
         return DescendOutcome::Pruned;
     }
     DescendOutcome::Into(DirectoryWork {
-        path: descriptor.path.clone(),
+        path: path.clone(),
         child_depth: depth.saturating_add(1),
         filter_children: decision.filter_children,
     })
@@ -573,15 +560,15 @@ fn settle(
     let (sequence, result, deferred) = observed;
     let (item, below) = match result {
         Ok(entry) => settle_entry(runtime, entry, deferred),
-        Err(StorageRoleFailure::Entry(error)) => settle_failure(runtime, error, deferred),
+        Err(StorageRoleFailure::Entry(error)) => settle_failure(error, deferred),
         Err(StorageRoleFailure::Session(error)) => {
             return Err(TraversalTerminalFailure::Session(error));
         }
     };
     let descent =
         deferred.and_then(|deferred| deferred_descent(runtime.request, deferred, below.is_some()));
-    if deferred.is_some_and(|deferred| awaits_slot(runtime.request, deferred)) {
-        decisions.insert(sequence, below);
+    if let Some(ticket) = deferred.and_then(|deferred| deferred.ticket) {
+        decisions.insert(ticket, below);
     }
     state
         .output
@@ -593,18 +580,29 @@ fn settle(
 /// pruning would silently drop the whole subtree, so a directory is still listed; the caller sees
 /// the failure item and keeps a complete enumeration below it.
 fn settle_failure(
-    runtime: &Runtime<'_>,
     error: EntryOperationFailure,
     deferred: Option<Deferred>,
 ) -> (Option<TraversalItem>, Option<DirectoryWork>) {
     let descend = deferred
-        .filter(|deferred| awaits_slot(runtime.request, *deferred))
+        .filter(|deferred| deferred.ticket.is_some())
         .map(|deferred| DirectoryWork {
             path: error.path().clone(),
             child_depth: deferred.depth.saturating_add(1),
             filter_children: true,
         });
     (Some(TraversalItem::EntryFailure(error)), descend)
+}
+
+/// What the filter sees of an observed child: the same candidate whether the decision is made in
+/// the listing's task or once a deferred observation settles.
+fn entry_candidate<'a>(root: &StoragePath, entry: &'a ObservedEntry) -> TraversalCandidate<'a> {
+    TraversalCandidate {
+        path: relative_to(root, entry.path()),
+        name: entry_name(entry.path()),
+        kind: entry.kind(),
+        size: entry.size(),
+        modified: entry.modified(),
+    }
 }
 
 /// Applies a deferred decision now that the observation (and therefore `modified`) is known.
@@ -616,20 +614,14 @@ fn settle_entry(
     let Some(deferred) = deferred else {
         return (Some(TraversalItem::Entry(entry)), None);
     };
-    let candidate = TraversalCandidate {
-        path: relative_to(&runtime.request.root, entry.path()),
-        name: entry_name(entry.path()),
-        kind: entry.kind(),
-        size: entry.size(),
-        modified: entry.modified(),
-    };
-    let decision = runtime.policy.decide(true, &candidate);
-    let descend =
-        (decision.descend && awaits_slot(runtime.request, deferred)).then(|| DirectoryWork {
-            path: entry.path().clone(),
-            child_depth: deferred.depth.saturating_add(1),
-            filter_children: decision.filter_children,
-        });
+    let decision = runtime
+        .policy
+        .decide(true, &entry_candidate(&runtime.request.root, &entry));
+    let descend = (decision.descend && deferred.ticket.is_some()).then(|| DirectoryWork {
+        path: entry.path().clone(),
+        child_depth: deferred.depth.saturating_add(1),
+        filter_children: decision.filter_children,
+    });
     (
         decision.emit.then_some(TraversalItem::Entry(entry)),
         descend,

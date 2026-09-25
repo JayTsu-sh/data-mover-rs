@@ -21,15 +21,16 @@
 use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use super::observe::{Feed, Listed, Observations, observe_listed};
 use super::output::BlockFacts;
 #[cfg(test)]
 use super::residency::Residency;
 use super::{
-    Admitting, DescendOutcome, DirectoryWork, ListingTask, Runtime, Shared, State, admit,
-    descend_outcome, entry_failure, entry_name, immediate_decision, queue_block_end, queue_failure,
-    queue_subtree_end,
+    Deferred, DescendOutcome, DirectoryWork, ListingTask, Runtime, Shared, State, admit,
+    awaits_slot, descend_outcome, entry_candidate, entry_failure, entry_name, immediate_decision,
+    queue_block_end, queue_failure, queue_subtree_end,
 };
 use crate::model::{EntryKind, EntryOperationFailure, FailureClass, StoragePath};
 use crate::storage::{NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure};
@@ -53,20 +54,21 @@ pub(super) enum Step {
 /// Where the cursor goes after a block, in the block's own order.
 pub(super) enum Slot {
     Descend(DirectoryWork),
-    /// A deferred decision, keyed by the sequence of the observation that settles it.
+    /// A deferred decision, keyed by the ticket its listing's task gave the child. A ticket
+    /// rather than the child's output sequence, because the slot is placed when the listing is
+    /// prepared, in the block's order, before the child is admitted and has a sequence.
     Pending(u64),
 }
 
-/// One listed child the output will show, with the decision made when its listing arrived;
-/// `None` waits for a deferred observation. A child an immediate decision hides never becomes
-/// one: it is only counted.
+/// One listed child the output will show. `deferred` is set when its decision waits for an
+/// observation that needs I/O; otherwise the decision was made when the listing arrived. A child
+/// a decision made then hides never becomes one: it is only counted.
 pub(super) struct Child {
-    pub(super) kind: EntryKind,
     pub(super) listed: Listed,
-    pub(super) decision: Option<TraversalDecision>,
+    pub(super) deferred: Option<Deferred>,
 }
 
-/// Deferred descend decisions by the sequence of the observation that settles them.
+/// Deferred descend decisions by the ticket of the slot they fill.
 pub(super) type Decisions = HashMap<u64, Option<DirectoryWork>>;
 
 /// A listing turned into a block, ready for the cursor.
@@ -76,15 +78,16 @@ pub(super) struct Prepared {
     /// Where the cursor goes after this block, in the block's own order.
     ///
     /// Built here rather than as each child is admitted, so one listing yields one table instead
-    /// of two copies of it, and [`descend_outcome`] runs once per child instead of twice. Empty
-    /// when the filter defers its decisions: those slots carry an observation's sequence, which
-    /// only exists once the child is admitted.
+    /// of two copies of it, and [`descend_outcome`] runs once per child instead of twice. A
+    /// directory whose decision waits for an observation that needs I/O gets its `Pending` slot
+    /// here too, keyed by a ticket, so the table keeps the block's order however the decisions
+    /// were made.
     slots: VecDeque<Slot>,
-    /// Subdirectories an immediate decision did not descend into, and those `max_depth` stopped
-    /// at. Counted here for the same reason the slots are built here.
+    /// Subdirectories a decision made in the listing's task did not descend into, and those
+    /// `max_depth` stopped at. Counted here for the same reason the slots are built here.
     pruned: u64,
     truncated: u64,
-    /// Children an immediate decision kept out of the output.
+    /// Children a decision made in the listing's task kept out of the output.
     hidden: u64,
 }
 
@@ -253,9 +256,11 @@ impl Cursor {
     }
 
     /// Up to `room` directories to prefetch, in output order, examining at most `scan_cap`
-    /// candidates so a huge fan-out does not make every wake-up cost that fan-out. Undecided
-    /// `Pending` slots are skipped without counting: there are at most as many as observations
-    /// in flight.
+    /// candidates so a huge fan-out does not make every wake-up cost that fan-out. An undecided
+    /// `Pending` slot is passed over like a decided skip and counts towards the cap: a block's
+    /// deferred slots are all placed when its listing is prepared, so there can be as many as
+    /// the block has subdirectories. Passing over one means a later sibling may be prefetched
+    /// ahead of it, which only changes what is read early, never the output.
     fn prefetch_candidates(&self, room: usize, scan_cap: usize) -> Vec<DirectoryWork> {
         let mut search = Search {
             listings: &self.listings,
@@ -270,10 +275,7 @@ impl Cursor {
         for slot in self.stack.iter().rev().flat_map(|frame| frame.slots.iter()) {
             let candidate = match slot {
                 Slot::Descend(work) => Some(work),
-                Slot::Pending(sequence) => match self.decisions.get(sequence) {
-                    Some(decision) => decision.as_ref(),
-                    None => continue,
-                },
+                Slot::Pending(ticket) => self.decisions.get(ticket).and_then(Option::as_ref),
             };
             if search.visit(candidate).is_break() {
                 break;
@@ -396,8 +398,8 @@ impl Cursor {
         };
         match frame.slots.front() {
             None => Next::Pop,
-            Some(Slot::Pending(sequence)) => {
-                let Some(decision) = self.decisions.remove(sequence) else {
+            Some(Slot::Pending(ticket)) => {
+                let Some(decision) = self.decisions.remove(ticket) else {
                     return Next::Wait;
                 };
                 frame.slots.pop_front();
@@ -425,12 +427,14 @@ fn admit_next_child(
     let Some(child) = frame.children.as_mut().and_then(VecDeque::pop_front) else {
         return Ok(ControlFlow::Continue(()));
     };
-    let mut block = Admitting {
-        work: &frame.work,
-        slots: &mut frame.slots,
-        feed: &mut frame.feed,
-    };
-    admit(runtime, &mut block, child, decisions, observations, state)?;
+    admit(
+        runtime,
+        &mut frame.feed,
+        child,
+        decisions,
+        observations,
+        state,
+    )?;
     Ok(ControlFlow::Continue(()))
 }
 
@@ -494,38 +498,92 @@ fn prepare(
             return Err(TraversalTerminalFailure::Session(error));
         }
     };
-    let plan = shared.policy.observation_plan;
-    let mut children = VecDeque::with_capacity(entries.len());
-    let mut slots = VecDeque::new();
-    let (mut pruned, mut truncated, mut hidden) = (0_u64, 0_u64, 0_u64);
-    for descriptor in entries {
-        let decision = immediate_decision(shared, work, &descriptor);
-        if let Some(decision) = decision {
-            match descend_outcome(&shared.request, &descriptor, work.child_depth, decision) {
-                DescendOutcome::Into(below) => slots.push_back(Slot::Descend(below)),
-                DescendOutcome::Pruned => pruned = pruned.saturating_add(1),
-                DescendOutcome::Truncated => truncated = truncated.saturating_add(1),
-                DescendOutcome::NotDirectory => {}
-            }
-            if !decision.emit {
-                hidden = hidden.saturating_add(1);
-                continue;
-            }
-        }
-        children.push_back(Child {
-            kind: descriptor.kind,
-            listed: observe_listed(descriptor, plan),
-            decision,
-        });
-    }
-    Ok(Ok(Prepared {
+    let mut prepared = Prepared {
         failures,
-        children,
-        slots,
-        pruned,
-        truncated,
-        hidden,
-    }))
+        children: VecDeque::with_capacity(entries.len()),
+        slots: VecDeque::new(),
+        pruned: 0,
+        truncated: 0,
+        hidden: 0,
+    };
+    for descriptor in entries {
+        prepare_child(shared, work, descriptor, &mut prepared);
+    }
+    Ok(Ok(prepared))
+}
+
+/// Decides and, when it needs no I/O, observes one child, and files it into the block.
+///
+/// A filter that needs `modified` still decides here whenever the child needed no I/O: its entry
+/// is already assembled, so the decision reads exactly the value a deferred one would have read
+/// once the observation settled. Only a child whose observation needs I/O, or failed, waits.
+fn prepare_child(
+    shared: &Shared,
+    work: &DirectoryWork,
+    descriptor: SourceDescriptor,
+    prepared: &mut Prepared,
+) {
+    let kind = descriptor.kind;
+    let immediate = immediate_decision(shared, work, &descriptor);
+    let listed = match immediate {
+        Some(decision) if !decision.emit => {
+            prepared.tally(shared, kind, &descriptor.path, work.child_depth, decision);
+            prepared.hidden = prepared.hidden.saturating_add(1);
+            return;
+        }
+        Some(decision) => {
+            prepared.tally(shared, kind, &descriptor.path, work.child_depth, decision);
+            observe_listed(descriptor, shared.policy.observation_plan)
+        }
+        None => observe_listed(descriptor, shared.policy.observation_plan),
+    };
+    let deferred = match (&listed, immediate) {
+        (_, Some(_)) => None,
+        (Listed::Observed(Ok(entry)), None) => {
+            let decision = shared
+                .policy
+                .decide(true, &entry_candidate(&shared.request.root, entry));
+            prepared.tally(shared, kind, entry.path(), work.child_depth, decision);
+            if !decision.emit {
+                prepared.hidden = prepared.hidden.saturating_add(1);
+                return;
+            }
+            None
+        }
+        (_, None) => {
+            let mut deferred = Deferred {
+                depth: work.child_depth,
+                kind,
+                ticket: None,
+            };
+            if awaits_slot(&shared.request, deferred) {
+                let ticket = shared.tickets.fetch_add(1, Ordering::Relaxed);
+                deferred.ticket = Some(ticket);
+                prepared.slots.push_back(Slot::Pending(ticket));
+            }
+            Some(deferred)
+        }
+    };
+    prepared.children.push_back(Child { listed, deferred });
+}
+
+impl Prepared {
+    /// Records where a decided child's subtree goes.
+    fn tally(
+        &mut self,
+        shared: &Shared,
+        kind: EntryKind,
+        path: &StoragePath,
+        depth: usize,
+        decision: TraversalDecision,
+    ) {
+        match descend_outcome(&shared.request, kind, path, depth, decision) {
+            DescendOutcome::Into(below) => self.slots.push_back(Slot::Descend(below)),
+            DescendOutcome::Pruned => self.pruned = self.pruned.saturating_add(1),
+            DescendOutcome::Truncated => self.truncated = self.truncated.saturating_add(1),
+            DescendOutcome::NotDirectory => {}
+        }
+    }
 }
 
 /// Sorts a listing's described children by the bytes of their final path component.

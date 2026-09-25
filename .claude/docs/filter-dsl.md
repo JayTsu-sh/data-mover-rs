@@ -70,7 +70,8 @@
 `LazyMatch` 会被组合子吸收 (`Match & Lazy = Match`、`MisMatch | Lazy = MisMatch`)，
 结果既不是上界也不是下界 — 可能误剪枝，也可能误收。因此
 `FilterExpression::referenced_fields().modified` 为真时，traversal 先做元数据观察再决策
-(`TraversalFilter::needs_modified`)，绝不用缺 `modified` 的评估结果。
+(`TraversalFilter::needs_modified`)，绝不用缺 `modified` 的评估结果。列举已带 `modified`、观察不需要 I/O 时
+(NFS / CIFS / Local / S3 / HDFS 的列举都带 `modified`，默认计划下都是)，这次观察就在列举任务里当场完成、当场决策 (P7 C0b)，值与 deferred 路径完全相同。
 
 ## 表达式形式
 
