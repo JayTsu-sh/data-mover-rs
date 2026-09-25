@@ -42,6 +42,24 @@ S3_PREFIX=test                   # bucket 内的子路径
    reused + streamed = SIZE、BLAKE3 相等、之后 0 / 0。C16 起 > 64 MiB 的 checkpointed upload 一开始就写指针，默认 6 s
    切断（早于第一个 64 MiB checkpoint）也会续传：cancel 与 SIGKILL 都 `Resumed{…}`（取消丢不到一段，SIGKILL 丢在途分段）。
 
+   在版本化桶里跑：`S3_BUCKET_OVERRIDE=<临时桶>` 指向同一服务器上的另一个桶（绝不改 `.env`），每个模式另打印
+   `final versions=… markers=… artifact entries=…`（ListObjectVersions：版本化桶期望 1 / 0 / 0；未开版本的桶把对象列成
+   `"null"` 版本，也是 1 / 0 / 0）。
+
+6. **版本化桶矩阵**（ADR-0006 C17）：`bash .claude/skills/e2e-s3/scripts/versioning_matrix.sh`。在 `.env` 的服务器上
+   **新建两个临时桶** `data-mover-c17-<run>`（开版本）与 `data-mover-c17-lock-<run>`（带 Object Lock），退出时（trap）
+   彻底删除：去掉 legal hold、按 id 删每个版本与删除标记、abort 每个上传、删桶，并打印 `cleanup: <桶> deleted`。
+   只用可撤销的 legal hold，**从不设 retention**（COMPLIANCE / GOVERNANCE 可能让桶删不掉）；不碰 `.env` 的桶。
+   建桶不是 200（例如同名桶已存在，409）就停下，清理只碰本次建出来的桶；`RUN` 必须匹配 `[a-z0-9-]{1,30}`；
+   凭据经 `curl -K <(…)` 传入，不上命令行。
+   用例：4 MiB checkpointed（单 PUT）、200 MiB checkpointed（指针）、Direct 4 MiB / 20 MiB；`--source-version` 按 id
+   拷 v1 再 v2（`--client-shaped` 流式，两版本按序、各与源逐字节相同）；按 id 拷贝 3 s 取消后续传；`resume_matrix.sh`
+   cancel / SIGKILL；Object Lock 桶里拷贝进行中给指针版本加 legal hold；暂停版本后三种写法。每行打印 `result` /
+   `prepare` / `reused` / `destination_version`，再打印该用例前缀下 `final versions=… delete markers=… artifact entries=…
+   version=latest: yes`。期望：每次拷贝 1 个版本、0 标记、0 artifact，`destination_version` 就是最新版本；Object Lock
+   行 `result=ok`、1 条告警、1 个标记 + 2 个 artifact 条目（被扣住的指针版本与盖在上面的标记）；暂停版本
+   `destination_version=null`。`SKIP_RESUME=1` 跳过续传矩阵。
+
 ## 成功判据
 
 - s3_walkdir 列 bucket 退出码 = 0
@@ -56,4 +74,7 @@ S3_PREFIX=test                   # bucket 内的子路径
   写法不同，比较必须走 `upload_pointer::same_upload`
 - 续传是 `Restarted{StageWithoutPointer}` → 开始时没写指针：对象不超过 64 MiB（D3，不续传），或 prepare 不是
   `ResumeMode::Discover`（看 `pointer_before_checkpoint`）
+- 版本化桶里留下 `.data-mover-*.upload` 版本或删除标记 → 指针没按版本删：看 `upload_pointer::delete` 拿到的版本
+  （写入回的 `reported_version`、读回 HEAD 的版本、discovery 读到的版本）；`MemoryS3` 的
+  `plain_deletes_of_final_keys()` 必须一直为空
 - 自签证书拒绝 → 用 s3+https 不是 https；检查 hyper-rustls verifier 配置

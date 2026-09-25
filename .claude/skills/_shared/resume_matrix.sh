@@ -11,6 +11,8 @@
 #          run is cut (default 20 MiB/s); CUT_MS when the cut lands (default 6000, so the first
 #          64 MiB checkpoint is durable at the default BW; on S3 the pointer is written when the
 #          upload begins (ADR-0006 C16), so a SIGKILL resumes even before that checkpoint)
+#   S3_BUCKET_OVERRIDE  (s3: only) another bucket of the same server, e.g. a temporary versioned
+#          one (ADR-0006 C17), instead of the .env's S3_BUCKET — never by editing the .env
 #   KEEP_STATE=1  keep the local recovery records across the restart (still a fresh process and
 #          HOME). Neither run names the transfer: the resume can only find the record through the
 #          identity data-mover derives (ADR-0006 C5), so "streamed" below SIZE proves it did.
@@ -43,12 +45,16 @@ DIR=resume-$RUN
 WORK=/tmp/data-mover-resume-$RUN
 BIN=target/debug/examples/transfer_resume
 if [[ "$DEST" == s3:* ]]; then
+  [ -n "${S3_BUCKET_OVERRIDE:-}" ] && S3_BUCKET=$S3_BUCKET_OVERRIDE
   PREFIX=${DEST#s3:}; PREFIX=${PREFIX#/}; PREFIX=${PREFIX%/}
   [ -n "$PREFIX" ] || { echo "DEST=s3:<prefix> needs a non-empty prefix" >&2; exit 1; }
   # `a-bucket` holds Milvus data on the lab MinIO; never write there.
   [ "${S3_BUCKET:-}" = a-bucket ] && { echo "refusing to write to bucket a-bucket" >&2; exit 1; }
   SCHEME=http; [ "${S3_USE_HTTPS:-}" = true ] && SCHEME=https
-  B="$SCHEME://$S3_HOST/$S3_BUCKET"; SIG=(--aws-sigv4 "aws:amz:us-east-1:s3" --user "$S3_AK:$S3_SK")
+  B="$SCHEME://$S3_HOST/$S3_BUCKET"
+  # The credentials reach curl through a config on a file descriptor, never on its command line.
+  esc() { local v=${1//\\/\\\\}; printf '%s' "${v//\"/\\\"}"; }
+  s3c() { curl -s --aws-sigv4 "aws:amz:us-east-1:s3" -K <(printf 'user = "%s:%s"\n' "$(esc "$S3_AK")" "$(esc "$S3_SK")") "$@"; }
   RUNKEY=$PREFIX/$DIR
   # Stage keys are relative to the backend prefix, so the run directory is the endpoint itself.
   TARGET=(--destination "s3:$RUNKEY"); path_of() { echo "$1"; }
@@ -68,18 +74,32 @@ fresh_env() {
     case "$name" in S3_*|CIFS_REAL_*|LAB_HDFS_*|RUST_LOG) FRESH_ENV+=("$name=${!name}") ;; esac
   done
 }
-s3_keys() { curl -s "${SIG[@]}" "$B?list-type=2&prefix=$RUNKEY/" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g'; }
+s3_keys() { s3c "$B?list-type=2&prefix=$RUNKEY/" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g'; }
 # The multipart uploads open on exactly key $1, one id per line: ListMultipartUploads with the key
 # as prefix, then an exact-key filter (MinIO lists exact keys only, AWS / Ceph / StorageGRID by
 # prefix). A reply that is not a listing prints "?".
 key_uploads() {
-  curl -s "${SIG[@]}" "$B?uploads&prefix=$1" | python3 -c 'import sys, xml.etree.ElementTree as ET
+  s3c "$B?uploads&prefix=$1" | python3 -c 'import sys, xml.etree.ElementTree as ET
 try: root = ET.fromstring(sys.stdin.read())
 except ET.ParseError: print("?"); sys.exit()
 ns = root.tag[:root.tag.index("}") + 1] if root.tag.startswith("{") else ""
 if root.tag != ns + "ListMultipartUploadsResult": print("?"); sys.exit()
 for upload in root.iter(ns + "Upload"):
     if upload.findtext(ns + "Key") == sys.argv[1]: print(upload.findtext(ns + "UploadId"))' "$1"
+}
+# ListObjectVersions under the run (ADR-0006 C17): versions of final key $1, delete markers and
+# `.data-mover-*` entries anywhere under the run. An unversioned bucket lists each object once, as
+# version "null"; a versioned one must show exactly one version of the key and nothing else.
+s3_versions() {
+  s3c "$B?versions&prefix=$RUNKEY/" | python3 -c 'import sys, xml.etree.ElementTree as ET
+try: root = ET.fromstring(sys.stdin.read())
+except ET.ParseError: print("versions=?"); sys.exit()
+ns = root.tag[:root.tag.index("}") + 1] if root.tag.startswith("{") else ""
+versions = [(v.findtext(ns + "Key"), v.findtext(ns + "VersionId")) for v in root.iter(ns + "Version")]
+markers = [m.findtext(ns + "Key") for m in root.iter(ns + "DeleteMarker")]
+final = [v for k, v in versions if k == sys.argv[1]]
+artifacts = [k for k, _ in versions if ".data-mover-" in k] + [k for k in markers if ".data-mover-" in k]
+print("final versions=%d markers=%d artifact entries=%d" % (len(final), len(markers), len(artifacts)))' "$1"
 }
 # The final keys of the run: one per interrupt mode.
 S3_RUN_KEYS=(cancel kill)
@@ -165,6 +185,7 @@ print("[%s]   prepare=%s reused_bytes=%s" % (sys.argv[2], out.get("prepare", "?"
 try: print("yes" if json.load(sys.stdin)["content_equal"] else "NO")
 except Exception: print("? (no comparison)")')
   echo "[$mode]   destination BLAKE3 equals source: $same"
+  [[ "$DEST" == s3:* ]] && echo "[$mode]   $(s3_versions "$RUNKEY/$mode")"
   rm -rf "$state"
 done
 
@@ -172,9 +193,9 @@ echo "-- cleanup"
 if [[ "$DEST" == s3:* ]]; then
   for key in "${S3_RUN_KEYS[@]}"; do
     key_uploads "$RUNKEY/$key" | grep -v '^?$' | while read -r id; do
-      curl -s -o /dev/null "${SIG[@]}" -X DELETE "$B/$RUNKEY/$key?uploadId=$id"; done
+      s3c -o /dev/null -X DELETE "$B/$RUNKEY/$key?uploadId=$id"; done
   done
-  s3_keys | while read -r k; do curl -s -o /dev/null "${SIG[@]}" -X DELETE "$B/$k"; done
+  s3_keys | while read -r k; do s3c -o /dev/null -X DELETE "$B/$k"; done
   echo "left under $RUNKEY/: $(s3_keys | wc -l) objects, open uploads on the run's keys: $(artifacts | sed 's/.*+ //')"
 else
   "$BIN" --destination "$DEST" --remove-run "$DIR" 2>&1 | tail -1
