@@ -149,8 +149,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   回复丢失 → HEAD 对账（大小相同且 `ETag` = 我们的 MD5 算已发布），否则 `final_destination_changed`。
 - 校验在发布**之后**（`verification_point` = `AfterPublish`）：先 HEAD 当前对象（`ETag` / 版本已不是我们的
   → `Conflict`），再按我们的 versionId 读；桶无版本时带 `If-Match: <我们的 ETag>` 读。
-- 大于 T、大小未知、原生 S3→S3 仍走 temp key 分段上传 + CopyObject（开关打开后大对象走 C15b 的最终 key 分段上传；
-  原生拷贝 C18 再改）。
+- 大于 T、大小未知的对象走 C15b 的最终 key 分段上传（C15c 起）；原生 S3→S3 仍走 temp key + CopyObject（C18 再改）。
 
 ### `Direct`（ADR-0006 C14c）
 
@@ -180,10 +179,10 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - `MemoryS3`：分段校验 MD5、同号分段覆盖、Complete 核对 (号, ETag) 表并按表拼对象、返回复合 ETag 与版本、
   `complete_commits_then_fails` 注入「已提交但回复丢失」、`part_failure` 注入某段失败。
 
-### 最终 key 上的分段上传与 `.upload` 指针（ADR-0006 C15b，开关仍关）
+### 最终 key 上的分段上传与 `.upload` 指针（ADR-0006 C15b；C15c 起默认打开）
 
-- 开关 `recovery_at_destination()`（`S3StagedDestination` 字段，真连接恒为 `false`，C15c 打开；测试用
-  `with_recovery_at_destination(true)` / `connect_at_destination`）。**开关开时**才声明自动 checkpoint 间隔
+- 开关 `recovery_at_destination()`（`S3StagedDestination` 字段；C15b 时真连接恒为 `false`，C15c 起恒为 `true`，
+  见下节；`connect_at_destination` 现在只是把自动间隔换小的测试连接）。**开关开时**才声明自动 checkpoint 间隔
   64 MiB（`automatic_checkpoint_interval_bytes`）：关着时 store 路径的规划（Checkpointed 从头登记）不变。
 - `prepare_at_destination`（`staged/at_destination.rs`）：已知大小 ≤ T → C14b single stage，但先只看指针
   （HEAD，有才 GET；有遗留 → 删指针 + abort 该 key 上所有 upload，报 `Restarted{..}`；不列 upload，省请求）。
@@ -205,12 +204,45 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - `publish`：先查栅栏（指针须带我们的 nonce；从未写过则须不存在；否则永久 `Conflict`，最终 key 未变）→
   用全部 (段号, ETag) Complete → 本次 write 发出的段 ETag 都是其 MD5 时核对复合 ETag（不符 → 永久 `Corruption`，
   最终 key 已变；同一 upload 的加密方式一致，所以续传前缀也适用）→ Complete 失败：`ListParts` 仍列得到 → 没完成，
-  `final_destination_changed=false`，保留 stage；`NoSuchUpload` → HEAD 大小 + 复合 ETag 对上算已发布（不认领版本，
+  `final_destination_changed=false`，保留 stage（C15c 改为只有提交前的明确拒绝才算没变，见下节）；`NoSuchUpload` → HEAD 大小 + 复合 ETag 对上算已发布（不认领版本，
   同 C14c），否则 `Conflict` 且最终 key 已变 → 设 tags → 删指针（若是我们的）→ 证据带版本。
 - `discard`：查栅栏；仍是我们的 → 先删指针再 abort；被接管 → 什么都不动；从不碰最终 key。原生拷贝遇到这种
-  stage → `Unsupported`（C18）；它没有本地 recovery identity。
+  stage → `Unsupported`（C18；C15c 起引擎不再把原生拷贝交给这种 stage）；它没有本地 recovery identity。
 - `MemoryS3` 新增：`complete_failure`（Complete 失败且不提交）、`complete_etag`（Complete 报告指定 ETag）；
   abort 不存在的 upload → `NoSuchUpload`（NotFound），`aborts` 计请求数。
+
+### 目的端恢复打开（ADR-0006 C15c，破坏性）
+
+- `recovery_at_destination()` 对每个 S3 连接恒为 `true`：引擎经进程内租约 + `prepare_at_destination`，
+  **不再碰本地 recovery store**，S3 续传不需要 `DATA_MOVER_RECOVERY_DIR`；自动 checkpoint 间隔 64 MiB（D3：
+  ≤ 64 MiB 的 Checkpointed 对象从不写指针）。`with_recovery_at_destination(false)`（仅测试）把旧 temp-key 路径 +
+  store 放回来，旧路径 C19 删。
+- **原生 S3→S3**：引擎的 at-destination 原生分支改用目的端普通的 `prepare_ephemeral`（S3 = temp key，发布时
+  CopyObject），标 `at_destination`、Fresh、带租约；原生计划本就无 recovery，所以哪里都不记。原生拷贝填不了最终 key
+  上的 upload（C18 才做），否则 > 8 MiB 的原生拷贝全部 `Unsupported`。同 key 上以前流式传输留下的指针 / upload
+  不在这里清，留给该 key 下一次流式 prepare。
+- **指针只给 > 64 MiB**：`recoverable` 的新 upload 只有已知大小超过自动间隔（或大小未知）才在 prepare 时写指针，
+  否则 `disable_recovery`（expert 目的端半程对每个超过一个 chunk 的 Checkpointed 对象都要 recoverable；现在
+  ≤ 64 MiB 的报 `SkippedBelowCheckpointThreshold`）。
+- **Complete 失败从严**：只有服务端在提交前就明确拒绝（`single::definite_refusal` 的 4xx 类：`InvalidPart` /
+  `InvalidPartOrder` → `Conflict`，`EntityTooSmall` → `Corruption`，`AccessDenied`、签名 / 凭据……；**`NoSuchUpload` 除外**，
+  它也是「重试一个已提交的 Complete」的回答）才报 `final_destination_changed = false` 并保留 stage。其他失败（重置、
+  超时、5xx、无法解析）即使 `ListParts` 仍列得到 upload 也报 **已变**：超时的 Complete 可能之后在服务端完成，之后的
+  discard 再 abort 得到 `NoSuchUpload` 会被当成功。`NoSuchUpload` 的对账（HEAD 大小 + 复合 ETag）不变。`Direct` 的
+  Complete 失败本来就经引擎报已变（`with_stage` 对 direct stage 恒置 changed），不是同一问题，只补了测试。
+- **MinIO 的 upload id 两种写法**：`CreateMultipartUpload` 发 base64url(`<deployment id>.<uuid>`)，
+  `ListMultipartUploads` 却列裸 `uuid`（RELEASE.2023-03-20 实测），两种写法之后都被接受。续传接管后「abort 该 key
+  上**其他** upload」逐字节比较会把自己的 upload 当成别人的 abort 掉（续传的 write 随即 `NoSuchUpload`）——
+  `upload_pointer::same_upload` 认这两种写法。`MemoryS3.minio_upload_ids` 模拟它。
+- 破坏性：升级时在途的 temp-key 传输（`.data-mover-stage/…` + 本地记录）不再续传，升级前排空（D6）；版本化目的桶里
+  每个 > 64 MiB 的对象会留下一个指针版本 + 删除标记（C17 前）。
+- `MemoryS3`：`part_failure_waits`（失败的分段等更低号分段都存好再失败，切断点确定）、`minio_upload_ids`、按分配缓存
+  MD5（每次 ranged 读都核对 ETag，大对象测试原来要几十秒）；`tests::endpoint_of(&protocol)` 每个内存桶一个
+  endpoint —— 所有 S3 传输现在都拿引擎的进程内租约（按 endpoint + 路径），并发测试写同一个 key 会 `Conflict`。
+- 真机（MinIO，VM 102）：`resume_matrix.sh` 200 MiB、20 MiB/s、`CUT_MS=12000`、`KEEP_STATE=0` —— cancel 与 SIGKILL
+  都是本地记录 0、切断后 1 指针 + 1 upload、续传 `Resumed{…}`、BLAKE3 相等、之后 0 / 0。默认 `CUT_MS=6000` 时
+  S3 只确认了不到 64 MiB（checkpoint 数的是服务端确认的分段，读端领先最多 4 段），两次都是
+  `Restarted{StageWithoutPointer}` 全量重拷 —— S3 要 12 s。
 
 ### legacy 列举隐藏传输 artifact（ADR-0006 C3）
 
@@ -230,7 +262,8 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 （role 协议把 `BadDigest` 映射成条目 `Corruption` / Transient：传输中损坏，重发即可；`InvalidDigest` —— 摘要头本身
 格式错 —— 映射成条目 `InvalidInput` / Permanent；C14a）；
 Complete 成功后再 Complete → 404 NoSuchUpload；`If-Match` 对分段 ETag（`…-1`）有效；分段号上限 10000；
-单 PUT 上限 5 GiB；版本控制下最后一个 Complete 成为当前版本，`GET ?versionId=` 读到指定版本。
+单 PUT 上限 5 GiB；版本控制下最后一个 Complete 成为当前版本，`GET ?versionId=` 读到指定版本；
+`ListMultipartUploads` 列出的 upload id 是签发的 base64url(`<deployment>.<uuid>`) 里的裸 uuid（C15c）。
 
 ## 已知陷阱
 
@@ -238,6 +271,7 @@ Complete 成功后再 Complete → 404 NoSuchUpload；`If-Match` 对分段 ETag�
 |---|---|
 | 404 被当 retry | 已修，必须 → `FileNotFound` |
 | Multipart 失败留垃圾 | 必须 abort |
+| MinIO 列出的 upload id 与签发的写法不同 | 比较 upload id 用 `upload_pointer::same_upload`，别逐字节比 |
 | 自签证书 ECS endpoint 失败 | 用 `s3+https://` (而不是 `https` 显式) |
 | `bucket.host` 解析错误 (path-style vs virtual-hosted) | 检查 endpoint 是否支持 virtual-hosted |
 | URL 中的 `:` 在 secret 里被切错 | secret 必须 percent-encode |

@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{FailureClass, StoragePath, Transience};
 use crate::storage::PrepareFact;
-use crate::storage::backends::s3::tests::{MemoryS3, identity};
+use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of};
 use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure, connect};
 use crate::transfer::{
     EffectiveRecovery, InflightLimits, TransferPolicy, TransferRequest, TransferRoute, transfer,
@@ -20,7 +20,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const MIB: usize = 1024 * 1024;
 
 fn direct_request(protocol: &Arc<MemoryS3>) -> TestResult<TransferRequest> {
-    let storage = || connect(protocol.clone(), identity(), None);
+    let storage = || connect(protocol.clone(), endpoint_of(protocol), None);
     Ok(TransferRequest::new(
         storage()?,
         StoragePath::new("source")?,
@@ -124,6 +124,27 @@ async fn a_failed_direct_upload_leaves_no_upload() -> TestResult {
     assert!(!failure.has_unpublished_stage());
     assert_eq!(*protocol.aborts.lock().await, 1);
     assert!(!protocol.objects.lock().await.contains_key("direct-final"));
+    assert!(leaves_nothing_behind(&protocol).await?);
+    Ok(())
+}
+
+/// A completion that failed without a definite refusal may still complete on the server: like
+/// every failed `Direct` write it reports the final key changed (ADR-0006 C15c applies the same
+/// rule to the upload completed at publication), and the upload is aborted inside `write`.
+#[tokio::test]
+async fn an_ambiguous_direct_completion_failure_reports_the_final_key_changed() -> TestResult {
+    let (protocol, _) = seeded(20 * MIB).await;
+    *protocol.complete_failure.lock().await = Some(S3ProtocolFailure::session(
+        FailureClass::Connectivity,
+        Transience::Transient,
+        "reset",
+    ));
+    let failure = transfer(direct_request(&protocol)?)
+        .await
+        .err()
+        .ok_or("a failed completion must fail the transfer")?;
+    assert!(failure.final_destination_changed());
+    assert!(!failure.has_unpublished_stage());
     assert!(leaves_nothing_behind(&protocol).await?);
     Ok(())
 }

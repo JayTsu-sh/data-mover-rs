@@ -56,8 +56,12 @@ fn request(
         .with_recoverable(recoverable))
 }
 
+/// The automatic interval of [`destination`]: a recoverable upload over it writes its pointer at
+/// prepare.
+const INTERVAL: usize = 2 * PART;
+
 fn destination(protocol: &Arc<MemoryS3>) -> S3StagedDestination<MemoryS3> {
-    S3StagedDestination::new(protocol.clone(), identity()).with_recovery_at_destination(true)
+    S3StagedDestination::new(protocol.clone(), identity()).with_checkpoint_interval(INTERVAL as u64)
 }
 
 fn chunks(bytes: &[u8]) -> ByteStream {
@@ -280,38 +284,45 @@ async fn an_upload_that_reaches_no_checkpoint_never_writes_a_pointer() -> TestRe
 }
 
 /// A write cut after its checkpoint leaves the upload and its pointer; the next prepare resumes
-/// from the parts the service lists and uploads only the rest.
+/// from the parts the service lists and uploads only the rest — also on a store that lists the
+/// upload under another spelling of its id than it issued (`MinIO`), where the resume must not take
+/// its own upload for another writer's and abort it.
 #[tokio::test]
 async fn an_interrupted_upload_resumes_from_its_listed_parts() -> TestResult {
-    let protocol = Arc::new(MemoryS3::default());
-    let destination = destination(&protocol);
-    let data = payload(7 * PART);
-    let request = || request(data.len(), BINDING, ResumeMode::Discover, false);
-    let mut stage = destination.prepare_at_destination(request()?).await?;
-    with_checkpoint(&mut stage, 2 * PART, data.len());
-    let cut = destination
-        .write(&stage, failing_after(&data[..6 * PART])?)
-        .await;
-    assert!(cut.is_err());
-    assert!(stage.recovery_enabled());
-    let first = pointer(&protocol).await.ok_or("pointer")?;
-    drop(stage);
+    for minio in [false, true] {
+        let protocol = Arc::new(MemoryS3::default());
+        *protocol.minio_upload_ids.lock().await = minio;
+        let destination = destination(&protocol);
+        let data = payload(7 * PART);
+        let request = || request(data.len(), BINDING, ResumeMode::Discover, false);
+        let mut stage = destination.prepare_at_destination(request()?).await?;
+        with_checkpoint(&mut stage, 2 * PART, data.len());
+        let cut = destination
+            .write(&stage, failing_after(&data[..6 * PART])?)
+            .await;
+        assert!(cut.is_err());
+        assert!(stage.recovery_enabled());
+        let first = pointer(&protocol).await.ok_or("pointer")?;
+        drop(stage);
 
-    let stage = destination.prepare_at_destination(request()?).await?;
-    let resumed = 6 * PART as u64;
-    assert_eq!(
-        stage.prepare_fact(),
-        PrepareFact::Resumed { bytes: resumed }
-    );
-    assert_eq!(stage.write_offset, resumed);
-    let second = pointer(&protocol).await.ok_or("pointer")?;
-    assert_ne!(first.extension, second.extension, "a resume takes over");
-    let sent = *protocol.part_uploads.lock().await;
-    destination.write(&stage, chunks(&data[6 * PART..])).await?;
-    assert_eq!(*protocol.part_uploads.lock().await, sent + 1);
-    publish_and_verify(&destination, &stage, &data).await?;
-    assert_eq!(protocol.objects.lock().await.get(FINAL), Some(&data));
-    assert!(pointer(&protocol).await.is_none());
+        let stage = destination.prepare_at_destination(request()?).await?;
+        let resumed = 6 * PART as u64;
+        assert_eq!(
+            stage.prepare_fact(),
+            PrepareFact::Resumed { bytes: resumed },
+            "minio={minio}"
+        );
+        assert_eq!(stage.write_offset, resumed);
+        assert_eq!(uploads(&protocol).await?.len(), 1, "minio={minio}");
+        let second = pointer(&protocol).await.ok_or("pointer")?;
+        assert_ne!(first.extension, second.extension, "a resume takes over");
+        let sent = *protocol.part_uploads.lock().await;
+        destination.write(&stage, chunks(&data[6 * PART..])).await?;
+        assert_eq!(*protocol.part_uploads.lock().await, sent + 1);
+        publish_and_verify(&destination, &stage, &data).await?;
+        assert_eq!(protocol.objects.lock().await.get(FINAL), Some(&data));
+        assert!(pointer(&protocol).await.is_none());
+    }
     Ok(())
 }
 
@@ -458,17 +469,18 @@ async fn a_lost_completion_reply_of_a_gone_upload_counts_as_published() -> TestR
     Ok(())
 }
 
-/// A failed completion of an upload the service still lists completed nothing: the final key is
-/// unchanged, the stage (upload and pointer) is kept, and publishing again succeeds.
+/// A completion the service refused before it could commit (`InvalidPart`, a permanent
+/// `Conflict`) left the final key unchanged: the stage (upload and pointer) is kept, and
+/// publishing again succeeds.
 #[tokio::test]
-async fn a_failed_completion_of_a_listed_upload_keeps_the_stage() -> TestResult {
+async fn a_refused_completion_keeps_the_stage() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let data = payload(3 * PART);
     let (destination, stage) = written_stage(&protocol, &data).await?;
-    *protocol.complete_failure.lock().await = Some(S3ProtocolFailure::session(
-        FailureClass::Connectivity,
-        Transience::Transient,
-        "reset",
+    *protocol.complete_failure.lock().await = Some(S3ProtocolFailure::entry(
+        FailureClass::Conflict,
+        Transience::Permanent,
+        "InvalidPart",
     ));
     let failed = publish(&destination, &stage, &data)
         .await
@@ -480,6 +492,39 @@ async fn a_failed_completion_of_a_listed_upload_keeps_the_stage() -> TestResult 
     assert!(pointer(&protocol).await.is_some());
     publish_and_verify(&destination, &stage, &data).await?;
     assert!(pointer(&protocol).await.is_none());
+    Ok(())
+}
+
+/// A completion that failed without a definite refusal (a reset, a timeout, a server error) may
+/// still complete on the server even while `ListParts` lists the upload: the final key is
+/// reported changed. Cleaning up afterwards removes the pointer and aborts the upload — or finds
+/// it completed — and never touches the final key.
+#[tokio::test]
+async fn an_ambiguous_completion_failure_reports_the_final_key_changed() -> TestResult {
+    let ambiguous = [
+        (FailureClass::Connectivity, Transience::Transient),
+        (FailureClass::Internal, Transience::Transient),
+        (FailureClass::Protocol, Transience::Unknown),
+    ];
+    for (failure_class, transience) in ambiguous {
+        let protocol = Arc::new(MemoryS3::default());
+        let data = payload(3 * PART);
+        let (destination, stage) = written_stage(&protocol, &data).await?;
+        *protocol.complete_failure.lock().await = Some(S3ProtocolFailure::session(
+            failure_class,
+            transience,
+            "reset",
+        ));
+        let failed = publish(&destination, &stage, &data)
+            .await
+            .err()
+            .ok_or("the completion failed")?;
+        assert!(failed.final_destination_changed, "{failure_class:?}");
+        assert_eq!(uploads(&protocol).await?.len(), 1, "still listed");
+        destination.discard(stage).await?;
+        assert!(pointer(&protocol).await.is_none());
+        assert!(uploads(&protocol).await?.is_empty());
+    }
     Ok(())
 }
 
@@ -618,20 +663,46 @@ async fn tags_are_set_on_the_completed_object() -> TestResult {
     Ok(())
 }
 
-/// The transition switch: off, the destination plans no automatic checkpoints (the store path
-/// registers every checkpointed upload from the start, as before); on, the 64 MiB interval.
+/// S3 keeps its recovery state at the destination (ADR-0006 C15c) with the 64 MiB automatic
+/// interval; the test hook that puts the old temp-key path back plans no automatic checkpoints
+/// (the store path registers every checkpointed upload from the start).
 #[test]
-fn the_interval_follows_the_switch() {
+fn s3_keeps_recovery_at_the_destination() {
     let protocol = Arc::new(MemoryS3::default());
-    let off = S3StagedDestination::new(protocol.clone(), identity());
-    assert!(!off.recovery_at_destination());
-    assert_eq!(off.automatic_checkpoint_interval_bytes(), None);
-    let on = destination(&protocol);
+    let on = S3StagedDestination::new(protocol.clone(), identity());
     assert!(on.recovery_at_destination());
     assert_eq!(
         on.automatic_checkpoint_interval_bytes(),
         Some(64 * MIB as u64)
     );
+    let off = S3StagedDestination::new(protocol, identity()).with_recovery_at_destination(false);
+    assert!(!off.recovery_at_destination());
+    assert_eq!(off.automatic_checkpoint_interval_bytes(), None);
+}
+
+/// D3 for the expert destination half, which asks for a recoverable prepare of every
+/// checkpointed object over one chunk: only an object over the interval writes its pointer at
+/// prepare; a smaller one writes none and is not resumable.
+#[tokio::test]
+async fn a_recoverable_prepare_writes_a_pointer_only_over_the_interval() -> TestResult {
+    for (size, pointer_written) in [(INTERVAL, false), (3 * PART, true)] {
+        let protocol = Arc::new(MemoryS3::default());
+        let destination = destination(&protocol);
+        let data = payload(size);
+        let request = request(size, BINDING, ResumeMode::Discover, true)?;
+        let stage = destination.prepare_at_destination(request).await?;
+        assert_eq!(stage.recovery_enabled(), pointer_written, "{size}");
+        assert_eq!(
+            pointer(&protocol).await.is_some(),
+            pointer_written,
+            "{size}"
+        );
+        destination.write(&stage, chunks(&data)).await?;
+        publish_and_verify(&destination, &stage, &data).await?;
+        assert_eq!(*protocol.puts.lock().await, u32::from(pointer_written));
+        assert!(pointer(&protocol).await.is_none());
+    }
+    Ok(())
 }
 
 fn part(number: i32, size: usize) -> S3PartFacts {

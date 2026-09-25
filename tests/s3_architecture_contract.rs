@@ -4,8 +4,9 @@ use data_mover::model::{
     StoragePath,
 };
 use data_mover::storage::{
-    FinalDestination, MetadataMutation, PreflightPolicy, PrepareRequest, PublishRequest,
-    ReadRequest, RecoverRequest, SourceDescriptor, Storage, VerifyRequest,
+    DestinationPrepareRequest, FinalDestination, MetadataMutation, PreflightPolicy, PrepareFact,
+    PrepareRequest, PublishRequest, ReadRequest, RestartReason, ResumeMode, SourceDescriptor,
+    Storage, VerifyRequest,
 };
 use data_mover::transfer::{
     InflightLimits, PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferIdentity,
@@ -15,6 +16,11 @@ use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const PART_SIZE: usize = 8 * 1024 * 1024;
+/// Over the 64 MiB automatic interval: only such a checkpointed object keeps a resume pointer
+/// (ADR-0006 D3).
+const PAYLOAD_SIZE: usize = PART_SIZE * 9 + 137;
+/// The transfer identity every prepare in this contract records.
+const TRANSFER_IDENTITY: [u8; 32] = [8; 32];
 
 async fn connected(url: &str) -> TestResult<Storage> {
     data_mover::s3::S3Storage::new(url, None)
@@ -28,7 +34,7 @@ async fn standard_s3_architecture_roles_stage_publish_and_read_back() -> TestRes
     let url = std::env::var("LAB_S3_ARCHITECTURE_URL")?;
     let path = StoragePath::new(std::env::var("LAB_S3_ARCHITECTURE_KEY")?)?;
     let identity = BackendIdentity::new(BackendKind::S3, "standard-s3-contract")?;
-    let payload = Bytes::from(vec![0x5a; PART_SIZE * 5 + 137]);
+    let payload = Bytes::from(vec![0x5a; PAYLOAD_SIZE]);
     let (storage, stage) = stage_with_reconnect(&url, &path, &identity, &payload).await?;
     verify_publish_and_metadata(&storage, &stage, &path, &payload, true).await?;
     verify_range_and_cancellation(&storage, &path, &payload).await?;
@@ -42,7 +48,7 @@ async fn dxn_s3_architecture_roles_and_known_limits() -> TestResult {
     let url = std::env::var("LAB_DXN_S3_ARCHITECTURE_URL")?;
     let path = StoragePath::new(std::env::var("LAB_DXN_S3_ARCHITECTURE_KEY")?)?;
     let identity = BackendIdentity::new(BackendKind::S3, "dxn-s3-contract")?;
-    let payload = Bytes::from(vec![0x6b; PART_SIZE * 5 + 137]);
+    let payload = Bytes::from(vec![0x6b; PAYLOAD_SIZE]);
     let (storage, stage) = stage_with_reconnect(&url, &path, &identity, &payload).await?;
     verify_publish_and_metadata(&storage, &stage, &path, &payload, false).await?;
     verify_range_and_cancellation(&storage, &path, &payload).await?;
@@ -93,6 +99,28 @@ fn transfer_request(
     ))?))
 }
 
+/// A recoverable prepare kept at the destination (ADR-0006 C15c), resuming or cleaning up in place.
+fn prepare_request(
+    path: &StoragePath,
+    source: &SourceDescriptor,
+    binding: [u8; 32],
+    resume: ResumeMode,
+) -> DestinationPrepareRequest {
+    DestinationPrepareRequest::new(
+        PrepareRequest {
+            final_destination: FinalDestination::new(path.clone()),
+            source: source.clone(),
+            recovery_binding: binding,
+        },
+        TRANSFER_IDENTITY,
+    )
+    .with_resume(resume)
+    .with_recoverable(true)
+}
+
+/// What a later prepare finds at the destination, in fresh connections: another binding's
+/// leftovers are cleaned up (`BindingChanged`), a requested restart cleans up its own
+/// (`Requested`), and after a discard nothing is left (`Fresh`).
 async fn verify_stale_upload_restart(
     url: &str,
     path: &StoragePath,
@@ -101,85 +129,88 @@ async fn verify_stale_upload_restart(
 ) -> TestResult {
     let restart_path = StoragePath::new(format!("{}.restart", path.as_str()))?;
     let source = source_descriptor(identity, size)?;
-    let prepare = PrepareRequest {
-        final_destination: FinalDestination::new(restart_path),
-        source: source.clone(),
-        recovery_binding: [9; 32],
-    };
-    let storage = connected(url).await?;
-    let destination = storage.staged_destination(&PreflightPolicy::production())?;
-    let stale = destination.prepare(prepare.clone()).await?;
-    let recovery = destination.recovery_identity(&stale).await?;
-    destination.discard(stale).await?;
-    let storage = connected(url).await?;
-    let destination = storage.staged_destination(&PreflightPolicy::production())?;
-    let result = destination
-        .recover(RecoverRequest {
-            identity: recovery,
-            final_destination: prepare.final_destination.clone(),
-            source,
-            recovery_binding: prepare.recovery_binding,
-            claim_token: [8; 32],
-        })
-        .await;
-    assert!(
-        matches!(result, Err(data_mover::storage::StorageRoleFailure::Entry(ref failure))
-        if failure.class() == data_mover::model::FailureClass::NotFound)
+    let request = |binding, resume| prepare_request(&restart_path, &source, binding, resume);
+    let policy = PreflightPolicy::production();
+    let destination = connected(url).await?.staged_destination(&policy)?;
+    // Whatever a crashed earlier run left on the key goes first.
+    let earlier = destination
+        .prepare_at_destination(request([9; 32], ResumeMode::Restart))
+        .await?;
+    destination.discard(earlier).await?;
+    let stale = destination
+        .prepare_at_destination(request([9; 32], ResumeMode::Discover))
+        .await?;
+    assert_eq!(stale.prepare_fact(), PrepareFact::Fresh);
+    drop(stale);
+    let destination = connected(url).await?.staged_destination(&policy)?;
+    let changed = destination
+        .prepare_at_destination(request([10; 32], ResumeMode::Discover))
+        .await?;
+    assert_eq!(
+        changed.prepare_fact(),
+        PrepareFact::Restarted {
+            reason: RestartReason::BindingChanged
+        }
     );
-    let fresh = destination.prepare(prepare).await?;
+    drop(changed);
+    let restarted = destination
+        .prepare_at_destination(request([10; 32], ResumeMode::Restart))
+        .await?;
+    assert_eq!(
+        restarted.prepare_fact(),
+        PrepareFact::Restarted {
+            reason: RestartReason::Requested
+        }
+    );
+    destination.discard(restarted).await?;
+    let fresh = destination
+        .prepare_at_destination(request([10; 32], ResumeMode::Discover))
+        .await?;
+    assert_eq!(fresh.prepare_fact(), PrepareFact::Fresh);
     destination.discard(fresh).await?;
     Ok(())
 }
 
+/// A multipart upload on the final key cut after four parts, resumed through a fresh connection
+/// from the parts the service lists (its `.upload` pointer names the upload), then written to
+/// the end — not yet published.
 async fn stage_with_reconnect(
     url: &str,
     path: &StoragePath,
     identity: &BackendIdentity,
     payload: &Bytes,
 ) -> TestResult<(Storage, data_mover::storage::PreparedStage)> {
-    eprintln!("S3 contract stage: prepare multipart destination");
+    eprintln!("S3 contract stage: prepare an upload on the final key");
+    let policy = PreflightPolicy::production();
     let storage = connected(url).await?;
-    let destination = storage.staged_destination(&PreflightPolicy::production())?;
+    let destination = storage.staged_destination(&policy)?;
     let source = source_descriptor(identity, payload.len())?;
-    let prepare = PrepareRequest {
-        final_destination: FinalDestination::new(path.clone()),
-        source: source.clone(),
-        recovery_binding: [3; 32],
-    };
-    let stage = destination.prepare(prepare.clone()).await?;
-    let recovery = destination.recovery_identity(&stage).await?;
+    let request = || prepare_request(path, &source, [3; 32], ResumeMode::Discover);
+    let stage = destination.prepare_at_destination(request()).await?;
+    assert_eq!(stage.prepare_fact(), PrepareFact::Fresh);
     assert!(
         destination
             .write(&stage, interrupted_input(payload, &source)?)
             .await
             .is_err()
     );
-    eprintln!("S3 contract stage: observe interrupted multipart checkpoint");
-    let checkpoint = destination.observe_checkpoint(&stage).await?.durable_prefix;
-    assert!((PART_SIZE as u64..=(PART_SIZE * 4) as u64).contains(&checkpoint));
-    assert_eq!(checkpoint % PART_SIZE as u64, 0);
+    drop(stage);
     let storage = connected(url).await?;
-    let destination = storage.staged_destination(&PreflightPolicy::production())?;
-    eprintln!("S3 contract stage: recover multipart destination after reconnect");
-    let resumed = destination
-        .recover(RecoverRequest {
-            identity: recovery,
-            final_destination: prepare.final_destination,
-            source,
-            recovery_binding: prepare.recovery_binding,
-            claim_token: [4; 32],
-        })
-        .await?;
-    let resumed_checkpoint = destination
-        .observe_checkpoint(&resumed)
-        .await?
-        .durable_prefix;
-    assert!(resumed_checkpoint >= checkpoint);
-    let resumed_offset = usize::try_from(resumed_checkpoint)?;
+    let destination = storage.staged_destination(&policy)?;
+    eprintln!("S3 contract stage: resume the upload after reconnect");
+    let resumed = destination.prepare_at_destination(request()).await?;
+    // A failed input waits for the parts in flight: all four are listed.
+    let prefix = PART_SIZE * 4;
+    assert_eq!(
+        resumed.prepare_fact(),
+        PrepareFact::Resumed {
+            bytes: prefix as u64
+        }
+    );
     destination
         .write(
             &resumed,
-            Box::pin(futures::stream::iter([Ok(payload.slice(resumed_offset..))])),
+            Box::pin(futures::stream::iter([Ok(payload.slice(prefix..))])),
         )
         .await?;
     Ok((storage, resumed))
@@ -228,18 +259,8 @@ async fn verify_publish_and_metadata(
     let policy = PreflightPolicy::production();
     let destination = storage.staged_destination(&policy)?;
     let digest = *blake3::hash(payload).as_bytes();
-    destination
-        .verify(
-            stage,
-            VerifyRequest {
-                expected_size: payload.len() as u64,
-                expected_blake3: digest,
-                cancel: CancellationToken::new(),
-                published: None,
-            },
-        )
-        .await?;
-    destination
+    // An upload on the final key is read back after publication (`VerificationPoint::AfterPublish`).
+    let published = destination
         .publish(
             stage,
             PublishRequest {
@@ -250,6 +271,17 @@ async fn verify_publish_and_metadata(
         )
         .await
         .map_err(|failure| failure.error)?;
+    destination
+        .verify(
+            stage,
+            VerifyRequest {
+                expected_size: payload.len() as u64,
+                expected_blake3: digest,
+                cancel: CancellationToken::new(),
+                published: Some(published),
+            },
+        )
+        .await?;
     let tag = data_mover::model::ObjectTag::new("contract", "standard-s3")?;
     let metadata = storage.metadata(&policy)?;
     if !supports_tags {

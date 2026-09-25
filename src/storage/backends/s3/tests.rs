@@ -4,16 +4,19 @@
 #![allow(clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::mem;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use md5::{Digest as _, Md5};
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -25,6 +28,8 @@ use crate::storage::{
 };
 
 pub(super) type UploadParts = HashMap<String, (String, Vec<(i32, Bytes)>)>;
+/// MD5s by (address, length) of a body, each with a clone that keeps the body allocated.
+type Md5Cache = HashMap<(usize, usize), (Bytes, [u8; 16])>;
 
 #[derive(Default)]
 pub(crate) struct MemoryS3 {
@@ -64,6 +69,12 @@ pub(crate) struct MemoryS3 {
     pub(crate) complete_etag: Mutex<Option<String>>,
     /// Uploading this part number fails with this failure (every time, until cleared).
     pub(crate) part_failure: Mutex<Option<(i32, S3ProtocolFailure)>>,
+    /// The failing part answers only once every lower-numbered part of its upload is stored (a
+    /// slow failure), so a write it cuts leaves exactly the parts before it.
+    pub(crate) part_failure_waits: Mutex<bool>,
+    /// Issue upload ids as `MinIO` does — base64url(`<deployment>.<id>`) — while
+    /// `ListMultipartUploads` reports the bare id; every call accepts either spelling.
+    pub(crate) minio_upload_ids: Mutex<bool>,
     /// `PutObject` requests received, multipart uploads begun, parts uploaded and completions
     /// that stored an object.
     pub(crate) puts: Mutex<u32>,
@@ -73,6 +84,8 @@ pub(crate) struct MemoryS3 {
     /// Contents a multipart upload completed, by their MD5: real S3 gives such an object the
     /// `ETag` `"<MD5 of the part MD5s>-<parts>"`, not the MD5 of its bytes.
     multipart_etags: std::sync::Mutex<HashMap<[u8; 16], String>>,
+    /// MD5s of stored bodies by (address, length), each with a clone that keeps it allocated.
+    md5_cache: std::sync::Mutex<Md5Cache>,
     /// Source of upload ids and minted version ids, so none repeats.
     next_id: Mutex<u64>,
 }
@@ -81,6 +94,30 @@ pub(crate) struct MemoryS3 {
 /// The `ETag` of a single `PutObject` of `bytes` (no server-side encryption): its quoted MD5.
 pub(crate) fn etag_of(bytes: &[u8]) -> String {
     format!("\"{:x}\"", Md5::digest(bytes))
+}
+
+/// The deployment id the fake's `MinIO`-style upload ids carry.
+const MINIO_DEPLOYMENT: &str = "28af438e-c010-40e1-b507-6a63171ca083";
+
+/// The id an upload is stored under, from either of its `MinIO` spellings.
+fn bare_upload_id(id: &str) -> String {
+    URL_SAFE_NO_PAD
+        .decode(id)
+        .ok()
+        .and_then(|decoded| String::from_utf8(decoded).ok())
+        .and_then(|decoded| {
+            decoded
+                .strip_prefix(&format!("{MINIO_DEPLOYMENT}."))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn hex(digest: &[u8]) -> String {
+    digest.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
 }
 
 /// The base64 `Content-MD5` of `bytes`.
@@ -118,13 +155,29 @@ impl MemoryS3 {
     /// mints a new current version, as a versioned bucket does; otherwise it reports none.
     /// The `ETag` S3 reports for an object holding `bytes`: the composite one if a multipart
     /// upload completed it, else its MD5.
-    fn etag_for(&self, bytes: &[u8]) -> String {
+    fn etag_for(&self, bytes: &Bytes) -> String {
+        let digest = self.md5_of(bytes);
         self.multipart_etags
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&<[u8; 16]>::from(Md5::digest(bytes)))
+            .get(&digest)
             .cloned()
-            .unwrap_or_else(|| etag_of(bytes))
+            .unwrap_or_else(|| format!("\"{}\"", hex(&digest)))
+    }
+
+    /// The MD5 of a stored body, computed once per allocation: every range read checks the
+    /// object's `ETag`, and hashing the whole object each time made large-object tests slow. The
+    /// cache holds a clone, so the allocation (and with it the key) cannot be reused while cached.
+    fn md5_of(&self, bytes: &Bytes) -> [u8; 16] {
+        let key = (bytes.as_ptr() as usize, bytes.len());
+        let mut cache = self
+            .md5_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .entry(key)
+            .or_insert_with(|| (bytes.clone(), Md5::digest(bytes).into()))
+            .1
     }
 
     async fn store_written(&self, key: &str, bytes: Bytes) -> Option<String> {
@@ -141,6 +194,19 @@ impl MemoryS3 {
         let id = format!("v-put-{}", self.next_id().await);
         self.put_version(key, &id, bytes).await;
         Some(id)
+    }
+
+    /// Waits (up to a few seconds) until parts `1..number` of upload `id` are stored.
+    async fn wait_for_parts_below(&self, id: &str, number: i32) {
+        for _ in 0..5_000 {
+            let stored = self.uploads.lock().await.get(id).is_some_and(|upload| {
+                (1..number).all(|lower| upload.1.iter().any(|part| part.0 == lower))
+            });
+            if stored {
+                return;
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
     }
 
     /// The bytes of `key` at `version` when that version is stored, else of the current object.
@@ -330,6 +396,9 @@ impl S3Protocol for MemoryS3 {
             .lock()
             .await
             .insert(id.clone(), (key.to_string(), Vec::new()));
+        if *self.minio_upload_ids.lock().await {
+            return Ok(URL_SAFE_NO_PAD.encode(format!("{MINIO_DEPLOYMENT}.{id}")));
+        }
         Ok(id)
     }
     async fn upload_part(
@@ -341,10 +410,14 @@ impl S3Protocol for MemoryS3 {
         content_md5_base64: &str,
     ) -> S3Result<String> {
         *self.part_uploads.lock().await += 1;
-        if let Some((failed, failure)) = &*self.part_failure.lock().await
-            && *failed == number
-        {
-            return Err(failure.clone());
+        let id = bare_upload_id(id);
+        let id = id.as_str();
+        let failing = self.part_failure.lock().await.clone();
+        if let Some((_, failure)) = failing.filter(|(failed, _)| *failed == number) {
+            if *self.part_failure_waits.lock().await {
+                self.wait_for_parts_below(id, number).await;
+            }
+            return Err(failure);
         }
         if content_md5(&bytes) != content_md5_base64 {
             return Err(S3ProtocolFailure::corrupted_upload(
@@ -368,6 +441,8 @@ impl S3Protocol for MemoryS3 {
         id: &str,
         parts: &[(i32, String)],
     ) -> S3Result<S3WriteFacts> {
+        let id = bare_upload_id(id);
+        let id = id.as_str();
         if let Some(failure) = self.complete_failure.lock().await.take() {
             return Err(failure);
         }
@@ -406,6 +481,8 @@ impl S3Protocol for MemoryS3 {
         Ok(S3WriteFacts::new(reported, version))
     }
     async fn abort_multipart(&self, _key: &str, id: &str) -> S3Result<()> {
+        let id = bare_upload_id(id);
+        let id = id.as_str();
         if let Some(failure) = self.abort_failure.lock().await.clone() {
             return Err(failure);
         }
@@ -419,6 +496,8 @@ impl S3Protocol for MemoryS3 {
             .ok_or_else(|| missing_upload("S3 AbortMultipartUpload request failed"))
     }
     async fn list_parts(&self, _key: &str, id: &str) -> S3Result<Vec<S3PartFacts>> {
+        let id = bare_upload_id(id);
+        let id = id.as_str();
         Ok(self
             .uploads
             .lock()
@@ -557,6 +636,16 @@ pub(crate) fn connect_multipart_only(
         S3TagSupport::Supported,
         None,
     )
+}
+
+/// The endpoint of one in-memory bucket, named after it: engine tests that run at once and write
+/// the same key must not share the engine's per-file lease (keyed on endpoint and path).
+pub(crate) fn endpoint_of(protocol: &Arc<MemoryS3>) -> BackendIdentity {
+    BackendIdentity::new(
+        BackendKind::S3,
+        format!("memory-bucket-{:p}", Arc::as_ptr(protocol)),
+    )
+    .expect("valid identity")
 }
 
 pub(crate) fn identity() -> BackendIdentity {

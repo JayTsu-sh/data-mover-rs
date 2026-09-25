@@ -341,7 +341,7 @@ pub(super) async fn send<P: S3Protocol>(
 
 /// A refusal the service answered before writing anything; every other failure (a lost or
 /// malformed reply, a server error) may have stored the object.
-fn definite_refusal(failure: &S3ProtocolFailure) -> bool {
+pub(super) fn definite_refusal(failure: &S3ProtocolFailure) -> bool {
     let (S3ProtocolFailure::Entry { class, .. } | S3ProtocolFailure::Session { class, .. }) =
         failure;
     matches!(

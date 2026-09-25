@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use super::engine::run_until_transferred;
 use crate::model::StoragePath;
 use crate::storage::backends::s3::connect;
-use crate::storage::backends::s3::tests::{MemoryS3, etag_of, identity, native_context};
+use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, etag_of, native_context};
 use crate::transfer::{
     EffectiveRecovery, InflightLimits, PayloadShapingPolicy, TransferPolicy, TransferRequest,
     TransferRoute, transfer,
@@ -19,8 +19,16 @@ use crate::transfer::{
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 fn request(protocol: &Arc<MemoryS3>, final_path: &str) -> TestResult<TransferRequest> {
-    let source = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let source = connect(
+        protocol.clone(),
+        endpoint_of(protocol),
+        Some(native_context()),
+    )?;
+    let destination = connect(
+        protocol.clone(),
+        endpoint_of(protocol),
+        Some(native_context()),
+    )?;
     Ok(TransferRequest::new(
         source,
         StoragePath::new("source")?,

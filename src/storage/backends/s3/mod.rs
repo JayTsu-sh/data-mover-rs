@@ -78,8 +78,9 @@ where
     )
 }
 
-/// S3 roles whose destination keeps its recovery state at the destination (ADR-0006 C15b), as
-/// C15c turns on for every connection, with `checkpoint_interval` as its automatic interval.
+/// S3 roles with `checkpoint_interval` as the destination's automatic interval instead of 64 MiB,
+/// so engine tests of recovery at the destination (on for every connection since ADR-0006 C15c)
+/// need not move that much.
 #[cfg(test)]
 pub(crate) fn connect_at_destination<P>(
     protocol: Arc<P>,
@@ -95,11 +96,7 @@ where
         None,
         S3TagSupport::Supported,
         Some(DEFAULT_SINGLE_PUT_THRESHOLD),
-        |staged| {
-            staged
-                .with_recovery_at_destination(true)
-                .with_checkpoint_interval(checkpoint_interval)
-        },
+        |staged| staged.with_checkpoint_interval(checkpoint_interval),
     )
 }
 

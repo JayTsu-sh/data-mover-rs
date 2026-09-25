@@ -4,11 +4,12 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{FailureClass, StoragePath, Transience};
-use crate::storage::backends::s3::tests::{MemoryS3, identity, native_context};
-use crate::storage::backends::s3::{S3NativeContext, S3ProtocolFailure, connect};
+use crate::storage::PrepareFact;
+use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, native_context};
+use crate::storage::backends::s3::{S3NativeContext, S3Protocol as _, S3ProtocolFailure, connect};
 use crate::transfer::{
     EffectiveRecovery, InflightLimits, PayloadShapingPolicy, ReadBackVerification, SourceQosGroup,
-    SourceQosPolicy, TransferIdentity, TransferRequest, TransferRoute, transfer,
+    SourceQosPolicy, TransferIdentity, TransferPolicy, TransferRequest, TransferRoute, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -37,8 +38,16 @@ async fn same_connected_pair_uses_native_stage_and_reports_unshaped_payload() ->
         .lock()
         .await
         .insert("source".into(), payload.clone());
-    let source = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let source = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
+    let destination = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
     let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 4, None)?);
 
     let outcome = transfer(request(source, destination)?.with_source_qos(qos)).await?;
@@ -66,8 +75,16 @@ async fn disabled_read_back_native_copy_skips_client_source_hashing() -> TestRes
         .lock()
         .await
         .insert("source".into(), payload.clone());
-    let source = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let source = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
+    let destination = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
     let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 4, None)?);
 
     let outcome = transfer(
@@ -98,8 +115,16 @@ async fn disabled_read_back_reconciles_a_committed_native_publication() -> TestR
         .await
         .insert("source".into(), payload.clone());
     *protocol.copy_commits_then_fails.lock().await = true;
-    let source = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let source = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
+    let destination = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
     let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 4, None)?);
 
     let outcome = transfer(
@@ -125,8 +150,16 @@ async fn native_copy_never_enables_streaming_recovery() -> TestResult {
         .lock()
         .await
         .insert("source".into(), payload.clone());
-    let source = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let source = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
+    let destination = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
 
     let outcome = transfer(request(source, destination)?).await?;
 
@@ -148,8 +181,16 @@ async fn strict_shaping_falls_back_before_native_mutation() -> TestResult {
         .lock()
         .await
         .insert("source".into(), Bytes::from_static(b"stream me"));
-    let source = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let source = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
+    let destination = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
     let outcome = transfer(
         request(source, destination)?
             .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped),
@@ -173,14 +214,18 @@ async fn different_endpoint_affinity_falls_back_to_streaming() -> TestResult {
         .lock()
         .await
         .insert("source".into(), Bytes::from_static(b"fallback"));
-    let source = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let source = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
     let other = Some(S3NativeContext::new(
         "memory://other",
         "standard",
         "memory".into(),
         None,
     ));
-    let destination = connect(protocol.clone(), identity(), other)?;
+    let destination = connect(protocol.clone(), endpoint_of(&protocol), other)?;
 
     let outcome = transfer(request(source, destination)?).await?;
 
@@ -202,8 +247,16 @@ async fn native_failure_retains_cleanup_authority_without_changing_final() -> Te
         Transience::Transient,
         "injected native failure",
     ));
-    let source = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let source = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
+    let destination = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
     let qos = SourceQosGroup::new(SourceQosPolicy::new(None, 2, None)?);
 
     let Err(error) = transfer(request(source, destination)?.with_source_qos(qos)).await else {
@@ -241,8 +294,16 @@ async fn cancellation_before_planning_performs_no_native_or_final_mutation() -> 
         .lock()
         .await
         .insert("source".into(), Bytes::from_static(b"cancel"));
-    let source = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let source = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
+    let destination = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
     let cancel = CancellationToken::new();
     cancel.cancel();
     let mut request = request(source, destination)?;
@@ -277,8 +338,16 @@ async fn native_binding_accepts_a_null_or_empty_version_id() -> TestResult {
             .lock()
             .await
             .insert("source".into(), payload.clone());
-        let source = connect(protocol.clone(), identity(), Some(native_context()))?;
-        let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+        let source = connect(
+            protocol.clone(),
+            endpoint_of(&protocol),
+            Some(native_context()),
+        )?;
+        let destination = connect(
+            protocol.clone(),
+            endpoint_of(&protocol),
+            Some(native_context()),
+        )?;
 
         let outcome = transfer(request(source, destination)?).await?;
 
@@ -286,5 +355,53 @@ async fn native_binding_accepts_a_null_or_empty_version_id() -> TestResult {
         assert_eq!(*protocol.native_copies.lock().await, 1, "{version:?}");
         assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
     }
+    Ok(())
+}
+
+/// With recovery kept at the destination (ADR-0006 C15c), a native copy above the single-PUT
+/// threshold still goes to the temp key and is copied to the final key at publication — never
+/// through an upload on the final key, which a native copy cannot fill until C18. Nothing is
+/// left behind: no pointer, no staged object, no open upload.
+#[tokio::test]
+async fn a_native_copy_above_the_threshold_keeps_the_temp_key_path() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    let payload = Bytes::from((0..=250_u8).cycle().take(9 << 20).collect::<Vec<_>>());
+    protocol
+        .objects
+        .lock()
+        .await
+        .insert("source".into(), payload.clone());
+    let source = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
+    let destination = connect(
+        protocol.clone(),
+        endpoint_of(&protocol),
+        Some(native_context()),
+    )?;
+    for policy in [TransferPolicy::Checkpointed, TransferPolicy::AtomicReplace] {
+        let request = TransferRequest::new(
+            source.clone(),
+            StoragePath::new("source")?,
+            destination.clone(),
+            StoragePath::new("final")?,
+            InflightLimits::new(2, 4 << 20, 2)?,
+            CancellationToken::new(),
+        )
+        .with_transfer_policy(policy);
+        let outcome = transfer(request).await?;
+        assert_eq!(outcome.route, TransferRoute::Native, "{policy:?}");
+        assert_eq!(outcome.prepare, PrepareFact::Fresh);
+        assert_eq!(outcome.recovery, EffectiveRecovery::NotApplicableNative);
+        assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
+    }
+    assert_eq!(*protocol.native_copies.lock().await, 2);
+    assert_eq!(*protocol.puts.lock().await, 0);
+    let open = protocol.list_uploads("final").await;
+    assert!(open.is_ok_and(|uploads| uploads.is_empty()));
+    let objects = protocol.objects.lock().await;
+    assert!(!objects.keys().any(|key| key.contains(".data-mover-")));
     Ok(())
 }

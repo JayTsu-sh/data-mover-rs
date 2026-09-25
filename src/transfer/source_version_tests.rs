@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::model::{FailureClass, StoragePath};
 use crate::storage::StorageRoleFailure;
 use crate::storage::backends::s3::connect;
-use crate::storage::backends::s3::tests::{MemoryS3, identity, native_context};
+use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, native_context};
 use crate::transfer::{
     InflightLimits, PayloadShapingPolicy, SourceVersion, TransferIdentity, TransferPhase,
     TransferRequest, TransferRoute, TransferSide, transfer,
@@ -33,8 +33,16 @@ async fn versioned() -> Arc<MemoryS3> {
 }
 
 fn request(protocol: &Arc<MemoryS3>) -> TestResult<TransferRequest> {
-    let source = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let destination = connect(protocol.clone(), identity(), Some(native_context()))?;
+    let source = connect(
+        protocol.clone(),
+        endpoint_of(protocol),
+        Some(native_context()),
+    )?;
+    let destination = connect(
+        protocol.clone(),
+        endpoint_of(protocol),
+        Some(native_context()),
+    )?;
     Ok(TransferRequest::new(
         source,
         StoragePath::new("source")?,

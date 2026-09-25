@@ -79,8 +79,9 @@ pub(crate) struct S3StagedDestination<P> {
     /// every object through a multipart upload.
     single_put_threshold: Option<u64>,
     tags_supported: bool,
-    /// The transition switch of ADR-0006: whether recovery state is kept at the destination
-    /// (`prepare_at_destination`, C15b) instead of the local recovery store. Off until C15c.
+    /// Whether recovery state is kept at the destination (`prepare_at_destination`, ADR-0006
+    /// C15b) instead of the local recovery store: on since C15c; off only in tests of the old
+    /// temp-key path, which C19 removes.
     recovery_at_destination: bool,
     /// The automatic checkpoint interval on the at-destination route: where a checkpointed upload
     /// writes its pointer.
@@ -96,7 +97,7 @@ impl<P> S3StagedDestination<P> {
             metadata: None,
             single_put_threshold: Some(single::DEFAULT_SINGLE_PUT_THRESHOLD),
             tags_supported: true,
-            recovery_at_destination: false,
+            recovery_at_destination: true,
             // Named in full: the architecture guard refuses imports between backend modules.
             checkpoint_interval: crate::storage::backends::DEFAULT_CHECKPOINT_INTERVAL_BYTES,
         }
@@ -109,7 +110,8 @@ impl<P> S3StagedDestination<P> {
         self
     }
 
-    /// Keeps recovery state at the destination (ADR-0006 C15b), as C15c will by default.
+    /// Whether recovery state is kept at the destination (the default since ADR-0006 C15c);
+    /// `false` puts the old temp-key path and the local recovery store back, for its tests.
     #[cfg(test)]
     pub(crate) fn with_recovery_at_destination(mut self, enabled: bool) -> Self {
         self.recovery_at_destination = enabled;
@@ -293,8 +295,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         self.recovery_at_destination
     }
 
-    /// Only on the at-destination route: the local store keeps its own planning (every
-    /// checkpointed upload registers from the start) while the switch is off.
+    /// The 64 MiB interval (D3: a checkpointed object up to it never writes a pointer). Only on the
+    /// at-destination route: the old store path keeps its own planning (every checkpointed upload
+    /// registers from the start).
     fn automatic_checkpoint_interval_bytes(&self) -> Option<u64> {
         self.recovery_at_destination
             .then_some(self.checkpoint_interval)

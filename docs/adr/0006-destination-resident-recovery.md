@@ -351,6 +351,41 @@ the upload; it never touches the final key. A native copy refuses an upload on t
 lock, as on NFS / CIFS / HDFS. Real-machine verification (the 200 MiB cancel / SIGKILL matrix) comes
 with C15c, which turns the switch on.
 
+As built (C15c, S3 — switch on, breaking): every S3 connection answers `recovery_at_destination()`
+with `true`, so an S3 destination is prepared only through `prepare_at_destination` under the
+in-process lease, nothing is recorded where data-mover runs, and the automatic interval is 64 MiB
+(D3). The temp-key path stays reachable only from tests (`with_recovery_at_destination(false)`) until
+C19. Four fixes came first. (1) A native S3→S3 pair on the at-destination route takes the
+destination's ordinary ephemeral prepare (the temp key, copied to the final key at publication),
+marked at-destination and `Fresh` and holding the lease: a native copy cannot fill an upload on the
+final key until C18, and every native copy over T would otherwise fail `Unsupported`; a native plan
+keeps no recovery state, so nothing is recorded anywhere, and leftovers of an earlier streaming
+attempt on the key wait for that key's next streaming prepare. (2) A fresh upload writes its pointer
+at prepare only when it is `recoverable` **and** its known size exceeds the automatic interval (or is
+unknown); a smaller one is not resumable. The expert destination half asks for a recoverable prepare
+of every checkpointed object over one chunk, so without this it wrote a pointer for every object over
+T. (3) A failed completion leaves the final key unchanged only when the service refused it before it
+could commit — a definite 4xx refusal (`InvalidPart`, `InvalidPartOrder`, `EntityTooSmall`, access,
+signature), never `NoSuchUpload`, which also answers a retried completion that already committed. Any
+other failure (a reset, a timeout, a 5xx) reports `final_destination_changed` even while `ListParts`
+still lists the upload, because a completion whose reply timed out can still finish on the server
+(a later discard's abort then gets `NoSuchUpload`, which clean-up takes as done). The `NoSuchUpload`
+reconciliation is unchanged. A failed `Direct` write already reports the final key changed (the
+engine marks every failed direct stage so). (4) MinIO issues an upload id as
+base64url(`<deployment id>.<uuid>`) but lists the bare uuid (RELEASE.2023-03-20) and accepts either:
+the resume's "abort every other upload on the key" compared the two byte for byte and aborted its own
+upload, so every resume failed with `NoSuchUpload` on MinIO; ids are now compared under both
+spellings (`same_upload`). Breaking: S3 transfers in flight on the temp-key path at the upgrade
+(`.data-mover-stage/` objects and local store records) are not resumed — drain first (D6); in a
+versioned destination bucket each object over 64 MiB leaves a pointer version and a delete marker
+until C17. Every S3 transfer now takes the engine's per-file lease, so two transfers of one key in a
+process fail at `Prepare` (`Conflict`, transient). Verified on MinIO (VM 102): the resume matrix (200
+MiB, 20 MiB/s, `CUT_MS=12000`, local state wiped) — cancel and SIGKILL both left no local record, one
+pointer and one open upload, resumed `Resumed { 150994944 }` / `Resumed { 125829120 }` with reused +
+streamed = 200 MiB, equal BLAKE3, and nothing left. At the default 6 s cut the service had
+acknowledged less than 64 MiB (the checkpoint counts acknowledged parts, up to four parts behind the
+reads), so both restarted as `StageWithoutPointer`.
+
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process
 per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim renames and HDFS

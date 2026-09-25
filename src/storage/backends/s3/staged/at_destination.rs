@@ -185,6 +185,12 @@ fn is_not_found(failure: &S3ProtocolFailure) -> bool {
     )
 }
 
+/// A completion the service refused before it could commit anything. `NoSuchUpload` is not one:
+/// it is also how a retried completion that already committed is answered.
+fn refused_before_commit(failure: &S3ProtocolFailure) -> bool {
+    single::definite_refusal(failure) && !is_not_found(failure)
+}
+
 fn unchanged(error: StorageRoleFailure) -> PublicationFailure {
     PublicationFailure {
         error,
@@ -302,7 +308,8 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     }
 
     /// Begins a new upload on the final key (discovery aborted any other). A recoverable stage
-    /// writes its pointer at once; any other at its first deferred checkpoint, if it has one.
+    /// over the automatic interval writes its pointer at once; any other at its first deferred
+    /// checkpoint, if it has one.
     async fn start_upload(
         &self,
         request: &DestinationPrepareRequest,
@@ -318,7 +325,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             .map_err(|error| role_failure(path, Operation::Prepare, error))?;
         let upload = FinalUpload::new(request, upload_id, part_size as u64, pointer)?;
         let stage = self.upload_stage(request, upload, 0, fact);
-        if !request.recoverable {
+        if !self.pointer_at_prepare(request) {
             return Ok(stage.disable_recovery());
         }
         let upload =
@@ -336,6 +343,19 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             return Err(error);
         }
         Ok(stage)
+    }
+
+    /// Whether a fresh upload writes its pointer at prepare: only a `recoverable` one over the
+    /// automatic interval (D3: a pointer only for checkpointed objects over 64 MiB). The expert
+    /// destination half asks for every checkpointed object over one chunk; a smaller one keeps
+    /// no pointer and is not resumable.
+    fn pointer_at_prepare(&self, request: &DestinationPrepareRequest) -> bool {
+        request.recoverable
+            && request
+                .prepare
+                .source
+                .size
+                .is_none_or(|size| size > self.checkpoint_interval)
     }
 
     async fn fence(&self, upload: &FinalUpload) -> Result<Fence, StorageRoleFailure> {
@@ -553,11 +573,14 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         }
     }
 
-    /// Settles a failed completion. An upload the service still lists was not completed: the
-    /// final key is unchanged and the stage is kept. One that is gone (`NoSuchUpload`) completed
-    /// if the final object has our size and composite `ETag` — then no version is claimed, since
-    /// an identical earlier object would match too; otherwise something else happened to the
-    /// key (`Conflict`, changed).
+    /// Settles a failed completion. Only a refusal the service answered before it could commit
+    /// (a 4xx such as `InvalidPart`, `EntityTooSmall`, `AccessDenied`) leaves the final key
+    /// unchanged. Any other failure may still complete on the server — a completion whose reply
+    /// timed out can finish after `ListParts` still lists the upload — so an upload still listed,
+    /// or one that cannot be listed, reports the final key changed. One that is gone
+    /// (`NoSuchUpload`) completed if the final object has our size and composite `ETag` — then no
+    /// version is claimed, since an identical earlier object would match too; otherwise
+    /// something else happened to the key (`Conflict`, changed).
     async fn settle_completion(
         &self,
         path: &StoragePath,
@@ -566,13 +589,13 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         expected: Option<&str>,
         error: S3ProtocolFailure,
     ) -> Result<S3WriteFacts, PublicationFailure> {
+        if refused_before_commit(&error) {
+            return Err(unchanged(role_failure(path, Operation::Publish, error)));
+        }
         let key = path.as_str();
         match self.protocol.list_parts(key, &upload.upload_id).await {
-            Ok(_) => return Err(unchanged(role_failure(path, Operation::Publish, error))),
-            Err(listed) if !is_not_found(&listed) => {
-                return Err(changed(role_failure(path, Operation::Publish, error)));
-            }
-            Err(_) => {}
+            Err(listed) if is_not_found(&listed) => {}
+            _ => return Err(changed(role_failure(path, Operation::Publish, error))),
         }
         match (self.protocol.head(key).await, expected) {
             (Ok(facts), Some(expected))

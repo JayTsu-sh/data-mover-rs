@@ -256,13 +256,18 @@ impl TransferFailure {
         self.failed_stage.is_some()
     }
 
-    /// Whether publication committed but staged artifacts still require cleanup.
+    /// Whether publication committed — or may have: an S3 completion that failed without a
+    /// definite refusal is reported so (ADR-0006 C15c) — and staged artifacts still require
+    /// cleanup. Not proof that the new content is published.
     #[must_use]
     pub const fn has_pending_cleanup(&self) -> bool {
         self.committed_cleanup.is_some()
     }
 
-    /// Whether publication committed or a direct attempt may have modified the final target.
+    /// Whether publication committed — or may have (an S3 completion that failed without a
+    /// definite refusal, ADR-0006 C15c) — or a direct attempt may have modified the final
+    /// target. Not proof that the new content is published: retry according to the error's
+    /// transience.
     #[must_use]
     pub const fn final_destination_changed(&self) -> bool {
         self.final_destination_changed
@@ -313,9 +318,12 @@ impl TransferFailure {
         Ok(())
     }
 
-    /// Consumes a post-commit failure and idempotently removes staged artifacts only.
+    /// Consumes a failure after publication committed — or may have — and idempotently removes
+    /// staged artifacts only.
     ///
-    /// This never removes or rolls back the published final destination.
+    /// This never removes or rolls back the final destination. After an S3 completion that may
+    /// not have committed (ADR-0006 C15c), cleanup aborts the upload: the final key then keeps
+    /// whatever it held, so retry the transfer instead when the failure is transient.
     ///
     /// # Errors
     /// Returns a storage-role failure if no committed cleanup is pending or cleanup fails.

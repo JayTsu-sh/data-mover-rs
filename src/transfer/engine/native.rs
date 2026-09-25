@@ -1,9 +1,11 @@
+use super::guard::DestinationLease;
 use super::{
     Arc, CopiedMetadataPlan, NativePair, ReadSource, RecoveryContext, SequentialRanges,
     SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination, TransferFailure,
     TransferPhase, TransferPlan, TransferRequest, TransferSide, Transferred, read_exact_range,
     register_prepared_stage, select_stage,
 };
+use crate::storage::{FinalDestination, PrepareFact, PrepareRequest, PreparedStage};
 
 pub(super) fn eligible_native_pair(request: &TransferRequest) -> Option<NativePair> {
     if request.payload_shaping == super::super::PayloadShapingPolicy::RequireClientShaped {
@@ -18,7 +20,7 @@ pub(super) enum Preparation {
     /// The local recovery store keeps the recovery state (destinations not yet moved).
     Store(Option<RecoveryContext>),
     /// The destination keeps it; the lease guards the final file.
-    AtDestination(super::guard::DestinationLease),
+    AtDestination(DestinationLease),
 }
 
 pub(super) struct NativeTransferInput {
@@ -36,7 +38,7 @@ pub(super) struct NativeTransferInput {
 async fn prepare_native_stage(
     request: &TransferRequest,
     input: &mut NativeTransferInput,
-) -> Result<crate::storage::PreparedStage, TransferFailure> {
+) -> Result<PreparedStage, TransferFailure> {
     match std::mem::replace(&mut input.preparation, Preparation::Store(None)) {
         Preparation::Store(recovery) => {
             let stage = select_stage(
@@ -56,18 +58,34 @@ async fn prepare_native_stage(
             }
             Ok(stage)
         }
-        Preparation::AtDestination(lease) => {
-            super::at_destination::prepare(
-                request,
-                &input.destination,
-                &input.descriptor,
-                input.recovery_binding,
-                input.plan,
-                lease,
-            )
-            .await
-        }
+        Preparation::AtDestination(lease) => prepare_at_destination(request, input, lease).await,
     }
+}
+
+/// The native route's stage for a destination that keeps its recovery state (ADR-0006 C15c):
+/// until a native copy can fill an upload on the final key (C18), it keeps the destination's
+/// ordinary ephemeral prepare — S3's temp key. A native plan keeps no recovery state, so nothing
+/// is recorded anywhere; the stage carries the per-file lease. Leftovers of an earlier streaming
+/// attempt on the key are left to that key's next streaming prepare.
+async fn prepare_at_destination(
+    request: &TransferRequest,
+    input: &NativeTransferInput,
+    lease: DestinationLease,
+) -> Result<PreparedStage, TransferFailure> {
+    let mut stage = input
+        .destination
+        .prepare_ephemeral(PrepareRequest {
+            final_destination: FinalDestination::new(request.final_path.clone()),
+            source: input.descriptor.clone(),
+            recovery_binding: input.recovery_binding,
+        })
+        .await
+        .map_err(|error| {
+            TransferFailure::role(TransferPhase::Prepare, TransferSide::Destination, error)
+        })?;
+    stage.mark_at_destination(PrepareFact::Fresh);
+    stage.exclusive = Some(Box::new(lease));
+    Ok(stage)
 }
 
 pub(super) async fn transfer_native(
@@ -127,7 +145,7 @@ pub(super) async fn transfer_native(
 fn native_failure(
     failure: crate::storage::NativeStageFailure,
     destination: &Arc<dyn StagedDestination>,
-    stage: crate::storage::PreparedStage,
+    stage: PreparedStage,
     stats: SourceQosStats,
 ) -> TransferFailure {
     let transfer = TransferFailure::role(
@@ -142,7 +160,7 @@ fn native_failure(
 async fn finish_native(
     request: &TransferRequest,
     input: NativeTransferInput,
-    stage: crate::storage::PreparedStage,
+    stage: PreparedStage,
     native: crate::storage::NativeStageEvidence,
     digest: Option<[u8; 32]>,
 ) -> Result<Transferred, TransferFailure> {
