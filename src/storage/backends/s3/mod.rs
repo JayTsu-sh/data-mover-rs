@@ -1,7 +1,11 @@
 //! Standard S3 roles for the `ArchitectureReady` storage seam.
 
+mod history;
+mod listing;
 mod metadata;
+mod namespace;
 mod native;
+mod paging;
 mod protocol;
 mod source;
 mod staged;
@@ -9,11 +13,12 @@ mod staged;
 use std::sync::Arc;
 
 use crate::model::{BackendIdentity, BackendKind};
-use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
+use crate::storage::{BackendCapabilities, CapabilityAvailability, Namespace, Storage};
 
 pub(crate) use protocol::{
-    S3NativeCopyEvidence, S3NativeCopySource, S3ObjectFacts, S3PartFacts, S3Protocol,
-    S3ProtocolFailure, S3Result, S3VersionFacts, S3WriteFacts, composite_etag, is_real_version_id,
+    S3ListedObject, S3ListedVersion, S3NativeCopyEvidence, S3NativeCopySource, S3ObjectFacts,
+    S3ObjectPage, S3PartFacts, S3Protocol, S3ProtocolFailure, S3Result, S3VersionFacts,
+    S3VersionMarker, S3VersionPage, S3WriteFacts, composite_etag, is_real_version_id,
 };
 
 pub(crate) use metadata::S3TagSupport;
@@ -153,6 +158,10 @@ where
             .with_tag_support(matches!(tag_support, S3TagSupport::Supported))
             .with_single_put_threshold(single_put_threshold),
     ));
+    let namespace: Arc<dyn Namespace> = Arc::new(namespace::S3Namespace::new(
+        protocol.clone(),
+        identity.clone(),
+    ));
     let native = native_context.map(|context| {
         Arc::new(native::S3NativeEndpoint::new(
             protocol.clone(),
@@ -167,14 +176,12 @@ where
         BackendCapabilities::new(
             CapabilityAvailability::Supported,
             CapabilityAvailability::Supported,
-            CapabilityAvailability::Unsupported(crate::storage::UnsupportedReason::new(
-                "namespace role is delivered by traversal",
-            )?),
+            CapabilityAvailability::Supported,
             CapabilityAvailability::Supported,
         ),
         Some(source),
         Some(staged),
-        None,
+        Some(namespace),
         Some(metadata),
         native,
     )

@@ -20,7 +20,7 @@ use data_mover::transfer::{
 };
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest,
-    TraversalSource,
+    TraversalSource, TraversalVersions,
 };
 use futures::stream;
 use tokio_util::sync::CancellationToken;
@@ -312,6 +312,7 @@ async fn validate_traversal(source: &Storage, dialect: ContractDialect) -> Contr
         cancel: CancellationToken::new(),
         filter: None,
         max_depth: None,
+        versions: TraversalVersions::Current,
     });
     let mut saw_fixture = false;
     let mut saw_link = false;

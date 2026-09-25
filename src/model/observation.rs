@@ -1,8 +1,8 @@
 use std::fmt;
 
 use super::{
-    BackendIdentity, BackendKind, EntryKind, MAX_MODEL_FIELD_BYTES, MetadataObservations,
-    ModelValueError, StoragePath, StorageTimestamp,
+    BackendIdentity, BackendKind, EntryKind, EntryVersion, MAX_MODEL_FIELD_BYTES,
+    MetadataObservations, ModelValueError, SourceVersion, StoragePath, StorageTimestamp,
 };
 
 #[path = "observation_codec.rs"]
@@ -229,6 +229,9 @@ pub struct ObservedEntry {
     source_identity: SourceIdentity,
     metadata: MetadataObservations,
     backend_fact: PrivateBackendEntryFacts,
+    /// The listed version this entry is, when it comes from a traversal of every version
+    /// (`TraversalVersions::All`); `None` for every other entry. Boxed: almost no entry has one.
+    version: Option<Box<EntryVersion>>,
 }
 
 impl ObservedEntry {
@@ -262,6 +265,7 @@ impl ObservedEntry {
             source_identity,
             metadata: MetadataObservations::default(),
             backend_fact: PrivateBackendEntryFacts::None,
+            version: None,
         })
     }
 
@@ -288,6 +292,7 @@ impl ObservedEntry {
             source_identity,
             metadata: MetadataObservations::default(),
             backend_fact: PrivateBackendEntryFacts::None,
+            version: None,
         })
     }
 
@@ -315,6 +320,11 @@ impl ObservedEntry {
 
     pub(crate) fn with_metadata(mut self, metadata: MetadataObservations) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    pub(crate) fn with_version(mut self, version: Option<Box<EntryVersion>>) -> Self {
+        self.version = version;
         self
     }
 
@@ -372,6 +382,22 @@ impl ObservedEntry {
     #[must_use]
     pub const fn metadata(&self) -> &MetadataObservations {
         &self.metadata
+    }
+    /// The listed version this entry is: present only on entries of a traversal of every version
+    /// (`TraversalVersions::All`), one per stored version and delete marker.
+    #[must_use]
+    pub fn version(&self) -> Option<&EntryVersion> {
+        self.version.as_deref()
+    }
+    /// The selector that copies exactly this entry with `TransferRequest::with_source_version`:
+    /// the entry's own version when it is one of several ([`EntryVersion::source_version`]), and
+    /// `Current` for any other entry (only a file entry can be copied). `None` for a delete
+    /// marker, which holds nothing to copy.
+    #[must_use]
+    pub fn source_version(&self) -> Option<SourceVersion> {
+        self.version
+            .as_deref()
+            .map_or(Some(SourceVersion::Current), EntryVersion::source_version)
     }
 
     /// Encodes a lossless, versioned snapshot owned by data-mover.

@@ -103,6 +103,8 @@ pub(crate) struct MemoryS3 {
     next_id: Mutex<u64>,
     /// The versioned mode (ADR-0006 C17): see [`memory_versions`].
     bucket: std::sync::Mutex<memory_versions::VersionedBucket>,
+    /// Paging and failures of delimiter listings (ADR-0006 C22): see [`memory_listing`].
+    listing: std::sync::Mutex<memory_listing::ListingKnobs>,
 }
 
 /// The `ETag` S3 reports for an object written by one `PutObject`: the quoted hex MD5 of its body.
@@ -590,6 +592,16 @@ impl S3Protocol for MemoryS3 {
     async fn list_versions(&self, key: &str) -> S3Result<Vec<S3VersionFacts>> {
         self.versions_of(key).await
     }
+    async fn list_objects_page(&self, prefix: &str, token: Option<&str>) -> S3Result<S3ObjectPage> {
+        self.list_objects_page_in_memory(prefix, token).await
+    }
+    async fn list_versions_page(
+        &self,
+        prefix: &str,
+        marker: Option<&S3VersionMarker>,
+    ) -> S3Result<S3VersionPage> {
+        self.list_versions_page_in_memory(prefix, marker).await
+    }
     async fn get_tags(&self, key: &str, version_id: Option<&str>) -> S3Result<Vec<ObjectTag>> {
         *self.tag_reads.lock().await += 1;
         self.tag_versions
@@ -651,6 +663,9 @@ mod memory;
 #[path = "memory_native.rs"]
 mod memory_native;
 
+#[path = "memory_listing.rs"]
+mod memory_listing;
+
 #[path = "memory_versions.rs"]
 mod memory_versions;
 pub(crate) use memory_versions::Versioning;
@@ -663,3 +678,6 @@ mod versions;
 
 #[path = "multipart_tests.rs"]
 mod multipart;
+
+#[path = "namespace_tests.rs"]
+mod namespace;

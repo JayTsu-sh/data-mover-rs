@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest, TraversalSource,
+    TraversalVersions,
 };
 use crate::model::{ObservationPlan, ObservedEntry, StoragePath};
 use crate::storage::backends::hdfs::contract_tests::MemoryHdfs;
@@ -29,6 +30,7 @@ async fn hdfs_facts_survive_snapshot_without_backend_requery()
         cancel: CancellationToken::new(),
         filter: None,
         max_depth: None,
+        versions: TraversalVersions::Current,
     });
     let Some(TraversalItem::Entry(entry)) = session.next_item().await else {
         return Err("HDFS traversal did not return an entry".into());

@@ -4,6 +4,7 @@ use futures::stream;
 
 use super::*;
 use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, SourceVersion};
+use crate::storage::ListingFacts;
 use crate::storage::{FinalDestination, PrepareFact, RestartReason, ResumeMode, SourceDescriptor};
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -53,6 +54,7 @@ fn request(identity: &BackendIdentity, destination: &str) -> PrepareRequest {
             inline_timestamps: None,
             inline_mode: None,
             version: SourceVersion::Current,
+            listing: ListingFacts::default(),
         },
         recovery_binding: [7; 32],
     }

@@ -20,8 +20,9 @@
 //!   A listing that does not is reported as an error rather than emitted with an epoch
 //!   timestamp — an epoch would silently tell an incremental sync that every entry changed, and
 //!   would disable every `modified` filter condition.
-//! - **S3 lends no namespace role**, so it fails preflight here rather than producing an empty
-//!   walk.
+//! - **S3 is refused before any I/O.** Its namespace role lists prefixes (ADR-0006 C22), but a
+//!   prefix has no modification time, so every directory would be reported as an error; S3 is
+//!   walked with [`crate::traversal::StorageTraversalSource`] instead.
 //! - **Pages carry [`ObservedEntry`], not `EntryEnum`.** That is the same immutable observation
 //!   [`crate::traversal::StorageTraversalSource`] emits, so both role-layer walkers describe an
 //!   entry the same way and `EntryEnum` — which is on its way out — gains no new caller here.
@@ -56,8 +57,8 @@ use crate::model::{
     MetadataProvenance, ObservedEntry, StoragePath,
 };
 use crate::storage::{
-    CapabilityUnavailable, Namespace, NamespaceRequest, NamespaceResult, PreflightPolicy,
-    SourceDescriptor, Storage, StorageRoleFailure,
+    Capability, CapabilityUnavailable, Namespace, NamespaceRequest, NamespaceResult,
+    PreflightPolicy, SourceDescriptor, Storage, StorageRoleFailure,
 };
 use crate::traversal::relative_to;
 
@@ -96,6 +97,12 @@ pub fn ndx_walk(
     request: NdxWalkRequest,
 ) -> Result<NdxWalkIterator, CapabilityUnavailable> {
     let namespace = storage.namespace(&PreflightPolicy::production())?;
+    if storage.kind() == BackendKind::S3 {
+        return Err(CapabilityUnavailable::unsupported(
+            Capability::Namespace,
+            "an NDX walk needs directory modification times, which S3 prefixes lack",
+        ));
+    }
     let concurrency = request.concurrency.get().min(TransferConcurrency::MAX);
     let (request_sender, request_receiver) = async_channel::bounded::<
         crate::dir_tree::ReadRequest<ObservedEntry>,
@@ -176,8 +183,8 @@ fn root_handle(kind: BackendKind) -> DirHandle {
             fh: bytes::Bytes::new(),
             path: String::new(),
         },
-        // S3 lends no namespace role, so preflight already refused it; it shares Local's
-        // handle only because the match must be exhaustive.
+        // `ndx_walk` refuses S3 before it starts; it shares Local's handle only because the
+        // match must be exhaustive.
         BackendKind::Local | BackendKind::S3 => DirHandle::Local(PathBuf::new()),
     }
 }

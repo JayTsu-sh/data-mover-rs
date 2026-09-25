@@ -3,6 +3,7 @@ pub(super) mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    use crate::storage::ListingFacts;
     use crate::model::{BackendKind, EntryKind, IdentityStrength, SourceIdentity, SourceVersion};
     use crate::storage::artifacts::{ArtifactKind, artifact_name};
     use crate::storage::{
@@ -972,6 +973,7 @@ pub(super) mod tests {
                 inline_timestamps: None,
                 inline_mode: None,
                 version: SourceVersion::Current,
+                listing: ListingFacts::default(),
             },
             recovery_binding: [7; 32],
         }

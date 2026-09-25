@@ -29,9 +29,11 @@ use super::{
     descend_outcome, entry_failure, entry_name, immediate_decision, queue_block_end, queue_failure,
     queue_subtree_end,
 };
-use crate::model::{EntryOperationFailure, FailureClass, StoragePath};
+use crate::model::{EntryKind, EntryOperationFailure, FailureClass, StoragePath};
 use crate::storage::{NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure};
-use crate::traversal::{ChildOrder, TraversalDecision, TraversalOrder, TraversalTerminalFailure};
+use crate::traversal::{
+    ChildOrder, TraversalDecision, TraversalOrder, TraversalTerminalFailure, TraversalVersions,
+};
 
 /// Why the cursor stopped advancing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -505,18 +507,30 @@ fn prepare(
 /// Sorts a listing's described children by the bytes of their final path component.
 ///
 /// Unstable, so a directory of millions does not also pay the half-length temporary a stable
-/// sort allocates. A tie needs no defined order: two children of one directory normally cannot
-/// share a name, and where one still arrives twice — an NFS readdir crossing a cookie boundary
-/// on a directory being written to — both descriptors spell the same path, so which one wins
-/// cannot change the emitted sequence. `failures` keep their place ahead of the block: a child
-/// the listing could not describe has no name to sort by.
+/// sort allocates, which is why the key is total. Names can repeat on S3 (ADR-0006 C22): an
+/// object and the prefix of the same name, the object first as in S3's own key order (`a` <
+/// `a/`), and in a listing of every version one child per version, kept in listing order (oldest
+/// first) by their rank. Anything left tied after that — an NFS readdir that crosses a cookie
+/// boundary on a directory being written to can return one child twice — spells the same path,
+/// so which one wins cannot change the emitted sequence. `failures` keep their place ahead of the
+/// block: a child the listing could not describe has no name to sort by.
 fn sort_by_name(result: &mut Result<NamespaceResult, StorageRoleFailure>) {
     let Ok(listing) = result else { return };
     let entries = match listing {
         NamespaceResult::Entries(entries) | NamespaceResult::Listing { entries, .. } => entries,
         NamespaceResult::Completed | NamespaceResult::LinkTarget(_) => return,
     };
-    entries.sort_unstable_by(|left, right| entry_name(&left.path).cmp(entry_name(&right.path)));
+    entries.sort_unstable_by(|left, right| sibling_key(left).cmp(&sibling_key(right)));
+}
+
+/// The total order [`sort_by_name`] sorts by: name bytes, then files before directories, then
+/// listing rank.
+fn sibling_key(descriptor: &SourceDescriptor) -> (&str, bool, u32) {
+    (
+        entry_name(&descriptor.path),
+        descriptor.kind == EntryKind::Directory,
+        descriptor.listing.rank,
+    )
 }
 
 /// Upper bound on listings started ahead of the cursor, whatever the request allows.
@@ -553,15 +567,34 @@ fn spawn_listing(
     // the driver loop's await points. On a current-thread runtime it still shares the thread;
     // only `spawn_blocking` would change that, and no listing so far has been worth it.
     let order = runtime.request.order;
+    let versions = runtime.request.versions;
+    let cancel = namespace
+        .listings_are_abortable()
+        .then(|| runtime.request.cancel.clone());
     listings.spawn(async move {
-        let mut result = namespace
-            .execute(NamespaceRequest::List(path.clone()))
-            .await;
+        let listing = match versions {
+            TraversalVersions::Current => namespace.execute(NamespaceRequest::List(path.clone())),
+            TraversalVersions::All => namespace.list_versions(&path),
+        };
+        // An abortable listing stops at cancellation instead of paging on in the background; the
+        // traversal is ending, so what it returns is never used.
+        let mut result = match cancel {
+            Some(cancel) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(cancelled_listing(&path)),
+                result = listing => result,
+            },
+            None => listing.await,
+        };
         if order == TraversalOrder::NameBytes {
             sort_by_name(&mut result);
         }
         (path, result)
     });
+}
+
+fn cancelled_listing(path: &StoragePath) -> StorageRoleFailure {
+    StorageRoleFailure::Entry(entry_failure(path, FailureClass::Cancelled))
 }
 
 /// Path text held by one arrived-but-untaken listing.

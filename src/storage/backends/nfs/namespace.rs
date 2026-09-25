@@ -8,6 +8,7 @@ use crate::model::{
     BackendIdentity, EntryKind, FailureClass, IdentityStrength, Operation, SourceIdentity,
     SourceVersion, StoragePath, SymlinkTarget, SymlinkTargetEncoding, Transience,
 };
+use crate::storage::ListingFacts;
 use crate::storage::artifacts::is_artifact_native;
 use crate::storage::{
     Namespace, NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure,
@@ -147,6 +148,7 @@ fn descriptor(
         inline_timestamps: entry.timestamps,
         inline_mode: entry.mode,
         version: SourceVersion::Current,
+        listing: ListingFacts::default(),
     })
 }
 

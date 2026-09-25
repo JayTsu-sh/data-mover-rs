@@ -176,6 +176,26 @@ impl Storage {
             .ok_or_else(|| CapabilityUnavailable::missing_role(Capability::Namespace))
     }
 
+    /// Lends the namespace role for an operation that changes the namespace, refusing one whose
+    /// mutating verbs are all unsupported (S3: [`Namespace::mutations_unsupported`]) before any
+    /// I/O, as if it lent no namespace at all.
+    ///
+    /// # Errors
+    /// Returns a typed preflight refusal before the role can perform backend I/O.
+    pub(crate) fn mutable_namespace(
+        &self,
+        policy: &PreflightPolicy,
+    ) -> Result<Arc<dyn Namespace>, CapabilityUnavailable> {
+        let namespace = self.namespace(policy)?;
+        match namespace.mutations_unsupported() {
+            Some(reason) => Err(CapabilityUnavailable::unsupported(
+                Capability::Namespace,
+                reason,
+            )),
+            None => Ok(namespace),
+        }
+    }
+
     /// Lends the metadata role after typed preflight.
     ///
     /// # Errors

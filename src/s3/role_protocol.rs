@@ -2,7 +2,8 @@ use super::{CompletedPart, ProvideErrorMetadata, S3Storage, build_copy_source};
 use bytes::Bytes;
 
 use crate::storage::backends::s3::{
-    S3NativeCopySource, S3ProtocolFailure, S3Result, S3VersionFacts, S3WriteFacts,
+    S3NativeCopySource, S3ObjectPage, S3ProtocolFailure, S3Result, S3VersionFacts, S3VersionMarker,
+    S3VersionPage, S3WriteFacts,
 };
 use crate::time_util::http_last_modified;
 
@@ -28,6 +29,7 @@ macro_rules! classify_sdk {
     };
 }
 
+mod listing;
 mod multipart;
 mod native;
 mod versions;
@@ -338,6 +340,18 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
 
     async fn list_versions(&self, key: &str) -> S3Result<Vec<S3VersionFacts>> {
         self.role_list_versions(key).await
+    }
+
+    async fn list_objects_page(&self, prefix: &str, token: Option<&str>) -> S3Result<S3ObjectPage> {
+        self.role_list_objects_page(prefix, token).await
+    }
+
+    async fn list_versions_page(
+        &self,
+        prefix: &str,
+        marker: Option<&S3VersionMarker>,
+    ) -> S3Result<S3VersionPage> {
+        self.role_list_versions_page(prefix, marker).await
     }
 
     async fn get_tags(

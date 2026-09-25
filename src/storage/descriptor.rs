@@ -3,7 +3,22 @@
 
 use bytes::Bytes;
 
-use crate::model::{EntryKind, SourceIdentity, SourceVersion, StoragePath, TimestampMetadata};
+use crate::model::{
+    EntryKind, EntryVersion, SourceIdentity, SourceVersion, StoragePath, TimestampMetadata,
+};
+
+/// What a versioned listing adds to a child (ADR-0006 C22); the default for every other listing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ListingFacts {
+    /// The listed version, from a listing of every version; carried onto the observed entry.
+    pub(crate) version: Option<Box<EntryVersion>>,
+    /// Position among the children that share this child's name and kind, in listing order: a
+    /// key's versions oldest first. Orders them when a traversal sorts children by name.
+    pub(crate) rank: u32,
+    /// Nothing behind the child can be observed: an S3 common prefix or a delete marker. The
+    /// traversal takes what the listing gave and asks the metadata role nothing.
+    pub(crate) listing_only: bool,
+}
 
 /// A stable neutral source description.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +47,8 @@ pub struct SourceDescriptor {
     /// turns `Current` into the version it found, so every later read, metadata observation and
     /// native copy uses the same one. `Current` where the store has no version to pin.
     pub(crate) version: SourceVersion,
+    /// Facts only a versioned or synthetic listing supplies; see [`ListingFacts`].
+    pub(crate) listing: ListingFacts,
 }
 
 impl SourceDescriptor {
@@ -53,6 +70,7 @@ impl SourceDescriptor {
             inline_timestamps: None,
             inline_mode: None,
             version: SourceVersion::Current,
+            listing: ListingFacts::default(),
         }
     }
 

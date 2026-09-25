@@ -7,6 +7,7 @@ use crate::model::{
     BackendIdentity, EntryKind, FailureClass, IdentityStrength, Operation, SourceIdentity,
     SourceVersion, StoragePath, Transience,
 };
+use crate::storage::ListingFacts;
 use crate::storage::{ByteStream, ReadRequest, ReadSource, SourceDescriptor, StorageRoleFailure};
 
 use super::{S3ObjectFacts, S3Protocol, S3ProtocolFailure, is_real_version_id};
@@ -140,7 +141,24 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
             inline_timestamps: None,
             inline_mode: None,
             version: pinned_version(&facts, version),
+            listing: ListingFacts::default(),
         })
+    }
+
+    /// A listing of current objects cannot see a version id, so it identifies an object by its
+    /// `ETag` (`PathScoped`), where a describe on a versioned bucket pins the version
+    /// (`VersionScoped`). The two name the same object when the listed `ETag` is the described
+    /// version's `ETag`; any other difference — another `ETag`, another version — does not match.
+    fn observation_matches(&self, observed: &SourceIdentity, described: &SourceDescriptor) -> bool {
+        if observed == &described.source_identity {
+            return true;
+        }
+        let Some(etag) = described.content_version.as_ref() else {
+            return false;
+        };
+        observed.strength() == IdentityStrength::PathScoped
+            && SourceIdentity::new(self.identity.clone(), IdentityStrength::PathScoped, etag)
+                .is_ok_and(|listed| &listed == observed)
     }
 
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure> {

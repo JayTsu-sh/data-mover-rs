@@ -14,7 +14,7 @@ use data_mover::storage::{
 };
 use data_mover::traversal::{
     ChildOrder, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome,
-    TraversalRequest, TraversalSource,
+    TraversalRequest, TraversalSource, TraversalVersions,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -85,6 +85,7 @@ async fn traversal_lists_the_whole_tree_through_the_namespace_role() -> Result {
         cancel: CancellationToken::new(),
         filter: None,
         max_depth: None,
+        versions: TraversalVersions::Current,
     });
     let mut paths = Vec::new();
     while let Some(item) = session.next_item().await {
@@ -231,6 +232,7 @@ async fn directories_are_listed_as_directories_not_files() -> Result {
         cancel: CancellationToken::new(),
         filter: None,
         max_depth: None,
+        versions: TraversalVersions::Current,
     });
     let Some(TraversalItem::Entry(entry)) = session.next_item().await else {
         return Err("expected one entry".into());
@@ -267,6 +269,7 @@ async fn name_bytes_order_is_the_same_sequence_for_a_caller_outside_the_crate() 
         cancel: CancellationToken::new(),
         filter: None,
         max_depth: None,
+        versions: TraversalVersions::Current,
     });
     let mut paths = Vec::new();
     let mut listed = Vec::new();

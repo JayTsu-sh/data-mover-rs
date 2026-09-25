@@ -225,6 +225,13 @@ impl CapabilityUnavailable {
             )),
         }
     }
+    /// A role that is lent but cannot serve the operation asked of it, for `reason`.
+    pub(crate) fn unsupported(capability: Capability, reason: &str) -> Self {
+        Self {
+            capability,
+            availability: CapabilityAvailability::Unsupported(UnsupportedReason(reason.to_owned())),
+        }
+    }
     #[must_use]
     pub const fn capability(&self) -> Capability {
         self.capability

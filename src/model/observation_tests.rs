@@ -164,3 +164,31 @@ fn symlink_without_target_is_rejected_at_construction_and_decode() {
         Err(SnapshotDecodeError::Malformed)
     );
 }
+
+/// A listed version rides in a v6 snapshot, placed just before the identity key; an unknown flag
+/// bit there is malformed rather than silently dropped. An entry without one is still v5.
+#[test]
+fn a_listed_version_rides_in_a_v6_snapshot() {
+    let plain = nfs_entry("versions");
+    assert_eq!(plain.encode_snapshot().as_bytes()[4], 5);
+    let version = EntryVersion::from_listing("v1", false, true).unwrap_or_else(|e| panic!("{e}"));
+    let entry = nfs_entry("versions").with_version(Some(Box::new(version)));
+    let bytes = entry.encode_snapshot().as_bytes().to_vec();
+    assert_eq!(bytes[4], 6);
+    let backend = entry.source_identity().backend().clone();
+    let rebuilt =
+        ObservedEntry::decode_snapshot(&bytes, &backend).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(rebuilt, entry);
+    assert_eq!(rebuilt.source_version(), None);
+    // flags(1) + id length(4) + "v1"(2) + identity key(32) end the snapshot.
+    let mut bad = bytes.clone();
+    let flags = bad.len() - 32 - 2 - 4 - 1;
+    bad[flags] |= 0x80;
+    assert_eq!(
+        ObservedEntry::decode_snapshot(&bad, &backend),
+        Err(SnapshotDecodeError::Malformed)
+    );
+    let mut downgraded = bytes;
+    downgraded[4] = 5;
+    assert!(ObservedEntry::decode_snapshot(&downgraded, &backend).is_err());
+}

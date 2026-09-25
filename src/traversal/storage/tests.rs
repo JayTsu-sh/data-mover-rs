@@ -8,6 +8,7 @@ use crate::model::{
     MetadataObservations, MetadataProvenance, ObservationPlan, SourceIdentity, SourceVersion,
     SymlinkTarget, SymlinkTargetEncoding, TimestampMetadata,
 };
+use crate::storage::ListingFacts;
 use crate::storage::{MetadataMutation, NamespaceRequest};
 
 struct FakeNamespace;
@@ -43,6 +44,7 @@ fn descriptor(value: &str, kind: EntryKind) -> SourceDescriptor {
         inline_timestamps: None,
         inline_mode: None,
         version: SourceVersion::Current,
+        listing: ListingFacts::default(),
     }
 }
 
@@ -182,6 +184,7 @@ async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
         cancel: tokio_util::sync::CancellationToken::new(),
         filter: None,
         max_depth: None,
+        versions: TraversalVersions::Current,
     });
     let mut observed = Vec::new();
     while let Some(item) = session.next_item().await {
@@ -229,6 +232,7 @@ fn request(cancel: tokio_util::sync::CancellationToken) -> TraversalRequest {
         cancel,
         filter: None,
         max_depth: None,
+        versions: TraversalVersions::Current,
     }
 }
 

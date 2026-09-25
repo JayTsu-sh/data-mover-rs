@@ -16,6 +16,7 @@ use data_mover::storage::{
 use data_mover::storage_enum::{StorageEnum, create_storage};
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest, TraversalSource as _,
+    TraversalVersions,
 };
 use data_mover::{CreateStorageOptions, StorageEntryMessage, WalkOptions};
 use tokio_util::sync::CancellationToken;
@@ -153,6 +154,7 @@ async fn role_traversal_and_ndx_walk_hide_artifacts() -> TestResult {
         cancel: CancellationToken::new(),
         filter: None,
         max_depth: None,
+        versions: TraversalVersions::Current,
     });
     let mut traversed = Vec::new();
     while let Some(item) = session.next_item().await {

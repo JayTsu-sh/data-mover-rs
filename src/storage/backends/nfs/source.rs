@@ -11,6 +11,7 @@ use crate::model::{
     BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass,
     IdentityStrength, Operation, SourceIdentity, SourceVersion, StoragePath, Transience,
 };
+use crate::storage::ListingFacts;
 use crate::storage::{
     ByteStream, PositionedByteStream, PositionedChunk, ReadRequest, ReadSource, SourceDescriptor,
     StorageRoleFailure,
@@ -114,6 +115,7 @@ impl NfsReadSourceAdapter {
             inline_timestamps: None,
             inline_mode: None,
             version: SourceVersion::Current,
+            listing: ListingFacts::default(),
         })
     }
 }

@@ -111,6 +111,58 @@ pub(crate) struct S3VersionFacts {
     pub etag: String,
 }
 
+/// One current object of a delimiter listing (`ListObjectsV2`). Keys are relative to the storage
+/// root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct S3ListedObject {
+    pub key: String,
+    pub size: u64,
+    pub etag: String,
+    /// The listing's `LastModified` (millisecond precision); `None` when it gave none.
+    pub last_modified: Option<StorageTimestamp>,
+}
+
+/// One page of a delimiter listing of current objects under one prefix.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct S3ObjectPage {
+    pub objects: Vec<S3ListedObject>,
+    /// Common prefixes, relative to the storage root, each ending in `/`.
+    pub prefixes: Vec<String>,
+    /// The continuation token of the next page, passed back as is; `None` on the last page.
+    pub next: Option<String>,
+}
+
+/// One version or delete marker of a delimiter listing of versions (`ListObjectVersions`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct S3ListedVersion {
+    pub key: String,
+    pub facts: S3VersionFacts,
+    /// The listing's `LastModified` (millisecond precision); `None` when it gave none.
+    pub last_modified: Option<StorageTimestamp>,
+}
+
+/// Where the next page of a versions listing starts. Both values are opaque server tokens, passed
+/// back as is: `MinIO` answers `NextKeyMarker` with a token such as `p/z[minio_cache:v2,return:]`,
+/// which is not a key and must never be compared with one or have the storage prefix removed.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct S3VersionMarker {
+    pub key_marker: String,
+    pub version_id_marker: Option<String>,
+}
+
+/// One page of a delimiter listing of versions under one prefix. Versions and delete markers are
+/// each in listing order (keys ascending, each key's entries newest first); how the two lists
+/// interleave is lost, as the SDK parses them apart.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct S3VersionPage {
+    pub versions: Vec<S3ListedVersion>,
+    pub markers: Vec<S3ListedVersion>,
+    /// Common prefixes, relative to the storage root, each ending in `/`.
+    pub prefixes: Vec<String>,
+    /// `None` on the last page.
+    pub next: Option<S3VersionMarker>,
+}
+
 /// The `ETag` S3 gives an object completed from parts whose `ETag`s are `part_etags`, in part
 /// order: the quoted hex MD5 of the concatenated binary part MD5s, a dash and the part count
 /// (`"<md5>-<n>"`). `None` when there are no parts or any part `ETag` is not a quoted 32-hex MD5
@@ -244,6 +296,16 @@ pub(crate) trait S3Protocol: Send + Sync {
     /// with it — in no guaranteed order: `is_latest` marks the current entry. An unversioned
     /// bucket lists its object as version `"null"`.
     async fn list_versions(&self, key: &str) -> S3Result<Vec<S3VersionFacts>>;
+    /// One page of `ListObjectsV2` with delimiter `/` under `prefix` (relative to the storage root;
+    /// empty, or ending in `/`), continuing from `token`.
+    async fn list_objects_page(&self, prefix: &str, token: Option<&str>) -> S3Result<S3ObjectPage>;
+    /// One page of `ListObjectVersions` with delimiter `/` under `prefix`, continuing from
+    /// `marker`. A page can end inside one key's entries.
+    async fn list_versions_page(
+        &self,
+        prefix: &str,
+        marker: Option<&S3VersionMarker>,
+    ) -> S3Result<S3VersionPage>;
     /// Tags of the current object, or of one stored version.
     async fn get_tags(&self, key: &str, version_id: Option<&str>) -> S3Result<Vec<ObjectTag>>;
     async fn put_tags(&self, key: &str, tags: &[ObjectTag]) -> S3Result<()>;

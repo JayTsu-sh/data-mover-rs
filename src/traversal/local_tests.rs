@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     StorageTraversalSource, TraversalCompletion, TraversalItem, TraversalOrder, TraversalOutcome,
     TraversalRequest, TraversalSession, TraversalSource, TraversalTerminalFailure,
+    TraversalVersions,
 };
 use crate::model::{EntryKind, FailureClass, ObservationPlan, Operation, StoragePath};
 use crate::storage::backends::local::namespace::LocalNamespace;
@@ -47,6 +48,7 @@ fn request(cancel: CancellationToken, inflight: usize, buffered: usize) -> Trave
         cancel,
         filter: None,
         max_depth: None,
+        versions: TraversalVersions::Current,
     }
 }
 
@@ -421,5 +423,27 @@ async fn traversal_omits_reserved_local_transfer_artifacts() -> io::Result<()> {
     assert_eq!(entry_paths(&items), ["dir", "dir/final.bin"]);
     assert_eq!(completion.observed_entries, 2);
     assert_eq!(completion.entry_failures, 0);
+    Ok(())
+}
+
+/// A source without versions refuses a traversal of every version before any I/O, with a typed
+/// `Unsupported` session failure — never its current entries in place of the versions asked for.
+#[tokio::test]
+async fn a_source_without_versions_refuses_to_list_every_version() -> io::Result<()> {
+    let temp = tempfile::tempdir()?;
+    std::fs::write(temp.path().join("file"), b"x")?;
+    let fixture = fixture(temp.path())?;
+    assert!(!fixture.source.supports_versions());
+    let mut all = request(CancellationToken::new(), 4, 4);
+    all.versions = TraversalVersions::All;
+    let mut session = fixture.source.traverse(all);
+    assert!(drain(&mut session).await.is_empty());
+    match session.finish().await {
+        Err(TraversalTerminalFailure::Session(failure)) => {
+            assert_eq!(failure.class(), FailureClass::Unsupported);
+            assert_eq!(failure.operation(), Operation::Traverse);
+        }
+        other => panic!("expected an Unsupported session failure, got {other:?}"),
+    }
     Ok(())
 }

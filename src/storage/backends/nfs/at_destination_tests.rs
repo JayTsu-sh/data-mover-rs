@@ -4,6 +4,7 @@ use futures::stream;
 
 use super::*;
 use crate::model::{BackendIdentity, EntryKind, IdentityStrength, SourceIdentity, SourceVersion};
+use crate::storage::ListingFacts;
 use crate::storage::backends::nfs::staged::tests::{FakeProtocol, adapter};
 use crate::storage::{
     FinalDestination, PrepareFact, PrepareRequest, PublishRequest, RestartReason, ResumeMode,
@@ -37,6 +38,7 @@ fn request(
             inline_timestamps: None,
             inline_mode: None,
             version: SourceVersion::Current,
+            listing: ListingFacts::default(),
         },
         recovery_binding: binding,
     };

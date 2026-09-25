@@ -18,6 +18,7 @@ use crate::model::{
     BackendIdentity, EntryOperationFailure, FailureClass, Operation, SourceIdentity, SourceVersion,
     StoragePath, Transience,
 };
+use crate::storage::ListingFacts;
 use crate::storage::{
     ByteStream, PositionedByteStream, PositionedChunk, ReadRequest, ReadSource, SourceDescriptor,
     SourceQosBudget, StorageRoleFailure,
@@ -202,6 +203,7 @@ impl ReadSource for LocalReadSource {
             inline_timestamps: None,
             inline_mode: None,
             version: SourceVersion::Current,
+            listing: ListingFacts::default(),
         })
     }
 

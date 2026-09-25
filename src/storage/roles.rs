@@ -174,6 +174,14 @@ pub trait ReadSource: Send + Sync {
         }
     }
     async fn read(&self, request: ReadRequest) -> Result<ByteStream, StorageRoleFailure>;
+    /// Whether `observed` — the identity an enumeration of this source reported for
+    /// `described.path` — names the object a later `describe` found (`described`). The default
+    /// is identity equality. A source whose listing cannot report the identity a describe pins
+    /// (S3: `ListObjectsV2` has no version id, a versioned describe pins one) overrides it to
+    /// recognise the same unchanged object; a changed object must still not match.
+    fn observation_matches(&self, observed: &SourceIdentity, described: &SourceDescriptor) -> bool {
+        observed == &described.source_identity
+    }
 }
 
 /// Request to prepare unpublished destination state.
@@ -511,6 +519,39 @@ pub trait Namespace: Send + Sync {
         &self,
         request: NamespaceRequest,
     ) -> Result<NamespaceResult, StorageRoleFailure>;
+
+    /// Whether [`Namespace::list_versions`] lists stored versions (a versioned object store).
+    fn supports_versions(&self) -> bool {
+        false
+    }
+
+    /// Lists one directory with every stored version and delete marker of each child object, each
+    /// object's entries oldest first with the latest last, and its subdirectories once each
+    /// (ADR-0006 C22). Every entry carries its listed version.
+    ///
+    /// The default serves namespaces without versions: an `Unsupported` failure, never the
+    /// current entries instead.
+    async fn list_versions(
+        &self,
+        path: &StoragePath,
+    ) -> Result<NamespaceResult, StorageRoleFailure> {
+        Err(version_unsupported(path, Operation::Traverse))
+    }
+
+    /// Why this namespace refuses every mutating verb (`CreateDirectory`, `Delete`, `Rename`), if
+    /// it does: operations built on them (recursive delete, recursive create) refuse such a
+    /// namespace before any I/O instead of listing a tree they cannot change.
+    fn mutations_unsupported(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether a listing may be dropped half way without leaking anything. A listing that holds a
+    /// handle between its requests (a CIFS directory handle) must run to completion and close it,
+    /// so the default is `false`; a traversal cancels an abortable listing (S3: stateless pages)
+    /// at once rather than letting it page on in the background.
+    fn listings_are_abortable(&self) -> bool {
+        false
+    }
 }
 
 /// Metadata observation and application role. It never implicitly refetches omitted facts.

@@ -12,6 +12,9 @@ use crate::model::{
     ObservedEntry, Operation, SourceIdentity, SourceVersion, StoragePath, StorageTimestamp,
     TimePrecision, TimestampMetadata, Transience,
 };
+use crate::storage::ListingFacts;
+use crate::storage::backends::s3::connect;
+use crate::storage::backends::s3::tests::{MemoryS3, identity as identity_s3};
 use crate::storage::{
     BackendCapabilities, CapabilityAvailability, Namespace, NamespaceRequest, NamespaceResult,
     SourceDescriptor, Storage, StorageRoleFailure, UnsupportedReason,
@@ -89,6 +92,7 @@ fn descriptor(full_path: &str, kind: EntryKind, timestamps: bool) -> Result<Sour
         inline_timestamps: None,
         inline_mode: None,
         version: SourceVersion::Current,
+        listing: ListingFacts::default(),
     };
     if !timestamps {
         return Ok(descriptor);
@@ -763,25 +767,20 @@ async fn extension_conditions_use_path_extension_semantics() -> Result {
     Ok(())
 }
 
+/// A storage without a namespace role, and S3 — whose prefixes have no time an NDX page could
+/// carry (ADR-0006 C22) — are refused up front, before any listing.
 #[tokio::test]
-async fn a_storage_without_a_namespace_role_is_refused_before_any_listing() -> Result {
-    let absent =
-        CapabilityAvailability::Unsupported(UnsupportedReason::new("S3 lends no namespace role")?);
+async fn storages_that_cannot_page_are_refused_before_any_listing() -> Result {
+    let absent = CapabilityAvailability::Unsupported(UnsupportedReason::new("no namespace")?);
     let capabilities =
         BackendCapabilities::new(absent.clone(), absent.clone(), absent.clone(), absent);
-    let storage = Storage::connected(
-        BackendIdentity::new(BackendKind::S3, "ndx-walk-no-namespace")?,
-        capabilities,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )?;
-    assert!(
-        ndx_walk(&storage, request(StoragePath::root())?).is_err(),
-        "a storage without a namespace role is refused up front"
-    );
+    let identity = BackendIdentity::new(BackendKind::Local, "ndx-walk-no-namespace")?;
+    let storage = Storage::connected(identity, capabilities, None, None, None, None, None)?;
+    assert!(ndx_walk(&storage, request(StoragePath::root())?).is_err());
+    let s3 = Arc::new(MemoryS3::default());
+    let storage = connect(s3.clone(), identity_s3(), None)?;
+    assert!(ndx_walk(&storage, request(StoragePath::root())?).is_err());
+    assert!(s3.listing().calls.is_empty());
     Ok(())
 }
 

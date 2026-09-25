@@ -3,10 +3,16 @@
 //! integrity.
 //!
 //! Every backend here lends the namespace role, so all subcommands work on Local, NFS and CIFS.
+//! S3 lends `Stat` / `List` only (ADR-0006 C22): `traverse` and `compare` work on it, `--versions
+//! all` lists every stored version and delete marker, and `seed` writes objects without creating
+//! directories; `ndx-walk`, `create-dir` and `delete-tree` refuse it before any I/O. Its URL
+//! (with the prefix as the root) comes from `S3_LISTING_URL`.
 //!
 //! ```text
 //! cargo run --example storage_role_operations -- traverse --backend local --root /tmp/tree \
 //!     --match 'name == "*.log"' --max-depth 2
+//! S3_LISTING_URL=s3://AK:SK@bucket.host:9000/prefix cargo run --example \
+//!     storage_role_operations -- --backend s3 traverse --versions all --order name-bytes
 //! cargo run --example storage_role_operations -- ndx-walk --backend cifs --path scratch \
 //!     --entries
 //! cargo run --example storage_role_operations -- delete-tree --backend cifs --path scratch/old
@@ -24,17 +30,18 @@ use data_mover::integrity::{
     IntegrityMode, IntegrityOptions, IntegrityRequest, compare as compare_objects,
 };
 use data_mover::model::{
-    ObservationMode, ObservationPlan, ObservedEntry, StoragePath, StorageTimestamp,
+    BackendKind, ObservationMode, ObservationPlan, ObservedEntry, StoragePath, StorageTimestamp,
 };
 use data_mover::ndx_walk::{NdxWalkRequest, ndx_walk};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, DeleteTreeItem,
-    DeleteTreeRequest, LocalBackendConfig, NfsBackendConfig, Storage, connect_backend,
-    create_directory_all, delete_tree,
+    DeleteTreeRequest, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, Storage,
+    connect_backend, create_directory_all, delete_tree,
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest, TraversalSource as _,
+    TraversalVersions,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -45,6 +52,7 @@ enum Backend {
     Local,
     Cifs,
     Nfs,
+    S3,
 }
 
 #[derive(Debug, Parser)]
@@ -53,7 +61,8 @@ struct Args {
     #[arg(long, value_enum, default_value = "local")]
     backend: Backend,
 
-    /// Local directory, or the NFS/CIFS sub-path used as the backend root.
+    /// Local directory, or the NFS/CIFS sub-path used as the backend root (S3: the URL's
+    /// prefix, so this stays empty).
     #[arg(long, default_value = "")]
     root: String,
 
@@ -72,6 +81,24 @@ enum OrderArg {
     /// Sorted by the bytes of the final path component, descent included, so the same tree
     /// gives the same sequence on every backend.
     NameBytes,
+}
+
+/// Which entries a traversal emits for a versioned store.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum VersionsArg {
+    /// Current objects only.
+    Current,
+    /// Every stored version and delete marker, oldest first per key (S3 only).
+    All,
+}
+
+impl From<VersionsArg> for TraversalVersions {
+    fn from(value: VersionsArg) -> Self {
+        match value {
+            VersionsArg::Current => Self::Current,
+            VersionsArg::All => Self::All,
+        }
+    }
 }
 
 impl From<OrderArg> for TraversalOrder {
@@ -96,6 +123,9 @@ enum Command {
         /// Sibling and descent order.
         #[arg(long, value_enum, default_value_t = OrderArg::Admission)]
         order: OrderArg,
+        /// Current objects only, or every stored version (S3).
+        #[arg(long, value_enum, default_value_t = VersionsArg::Current)]
+        versions: VersionsArg,
         /// Sub-path to start from, relative to the backend root.
         #[arg(long, default_value = "")]
         path: String,
@@ -189,75 +219,49 @@ async fn connect(backend: Backend, root: &str, depth: usize) -> Result<Storage, 
                 CifsGuestPolicy::default()
             },
         }),
+        Backend::S3 => {
+            if !root.is_empty() {
+                return Err("S3 takes its root from the URL's prefix; leave --root empty".into());
+            }
+            BackendConfig::S3(S3BackendConfig {
+                url: std::env::var("S3_LISTING_URL")?,
+                block_size: None,
+                single_put_threshold: None,
+            })
+        }
     };
     Ok(connect_backend(config).await?)
 }
 
 async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(), Error> {
     let Command::Traverse {
-        match_expression,
-        exclude_expression,
-        max_depth,
-        order,
         path,
         quiet,
         snapshot_bytes,
+        ..
     } = command
     else {
         unreachable!("dispatched by the caller")
     };
-    let filter =
-        DslTraversalFilter::parse(match_expression.as_deref(), exclude_expression.as_deref())?;
-    let slots = NonZeroUsize::new(args.concurrency).ok_or("concurrency must be non-zero")?;
-    let request = TraversalRequest {
-        root: StoragePath::new(path.clone())?,
-        order: TraversalOrder::from(*order),
-        max_inflight_operations: slots,
-        max_buffered_items: slots,
-        observation_plan: ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly),
-        cancel: CancellationToken::new(),
-        filter: (!filter.is_empty()).then(|| Arc::new(filter) as Arc<_>),
-        max_depth: max_depth.and_then(NonZeroUsize::new),
-    };
-    let mut session = StorageTraversalSource::new(storage)?.traverse(request);
+    let mut session =
+        StorageTraversalSource::new(storage)?.traverse(traversal_request(args, command)?);
     let (mut entries, mut failures, mut snapshots) = (0_u64, 0_u64, 0_u64);
     while let Some(item) = session.next_item().await {
-        match item {
+        match &item {
             TraversalItem::Entry(entry) => {
                 entries += 1;
                 if *snapshot_bytes {
                     snapshots += entry.encode_snapshot().as_bytes().len() as u64;
                 }
                 if !*quiet {
-                    println!("{:?} {}", entry.kind(), entry.path());
+                    println!("{:?} {}{}", entry.kind(), entry.path(), version_of(entry));
                 }
             }
             TraversalItem::EntryFailure(error) => {
                 failures += 1;
                 eprintln!("entry failure {} {:?}", error.path(), error.class());
             }
-            TraversalItem::DirectoryListed(listed) if !*quiet => {
-                println!(
-                    "listed {} {:?} order={:?} pruned={} truncated={}",
-                    listed.path,
-                    listed.listing,
-                    listed.child_order,
-                    listed.pruned_children,
-                    listed.truncated_children
-                );
-            }
-            TraversalItem::SubtreeComplete(complete)
-                if !*quiet || complete.path.as_str() == path =>
-            {
-                println!(
-                    "subtree {} exhaustive={} {:?}",
-                    complete.path,
-                    complete.summary.is_exhaustive(),
-                    complete.summary
-                );
-            }
-            // `TraversalItem` is `#[non_exhaustive]`: a later item kind must not break this.
-            _ => {}
+            _ => print_completion(&item, *quiet, path),
         }
     }
     let outcome = session.finish().await?;
@@ -269,6 +273,77 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
         );
     }
     Ok(())
+}
+
+fn traversal_request(args: &Args, command: &Command) -> Result<TraversalRequest, Error> {
+    let Command::Traverse {
+        match_expression,
+        exclude_expression,
+        max_depth,
+        order,
+        versions,
+        path,
+        ..
+    } = command
+    else {
+        unreachable!("dispatched by the caller")
+    };
+    let filter =
+        DslTraversalFilter::parse(match_expression.as_deref(), exclude_expression.as_deref())?;
+    let slots = NonZeroUsize::new(args.concurrency).ok_or("concurrency must be non-zero")?;
+    Ok(TraversalRequest {
+        root: StoragePath::new(path.clone())?,
+        order: TraversalOrder::from(*order),
+        max_inflight_operations: slots,
+        max_buffered_items: slots,
+        observation_plan: ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly),
+        cancel: CancellationToken::new(),
+        filter: (!filter.is_empty()).then(|| Arc::new(filter) as Arc<_>),
+        max_depth: max_depth.and_then(NonZeroUsize::new),
+        versions: TraversalVersions::from(*versions),
+    })
+}
+
+/// Prints a directory's completion items; with `quiet`, only the traversal root's subtree.
+fn print_completion(item: &TraversalItem, quiet: bool, root: &str) {
+    match item {
+        TraversalItem::DirectoryListed(listed) if !quiet => {
+            println!(
+                "listed {} {:?} order={:?} pruned={} truncated={}",
+                listed.path,
+                listed.listing,
+                listed.child_order,
+                listed.pruned_children,
+                listed.truncated_children
+            );
+        }
+        TraversalItem::SubtreeComplete(complete) if !quiet || complete.path.as_str() == root => {
+            println!(
+                "subtree {} exhaustive={} {:?}",
+                complete.path,
+                complete.summary.is_exhaustive(),
+                complete.summary
+            );
+        }
+        // `TraversalItem` is `#[non_exhaustive]`: a later item kind must not break this.
+        _ => {}
+    }
+}
+
+/// ` version=<id|null> latest=<0|1> marker=<0|1> size=<n|->` for an entry of a traversal of
+/// every version; nothing otherwise.
+fn version_of(entry: &ObservedEntry) -> String {
+    entry.version().map_or_else(String::new, |version| {
+        format!(
+            " version={} latest={} marker={} size={}",
+            version.id().unwrap_or("null"),
+            u8::from(version.is_latest()),
+            u8::from(version.is_delete_marker()),
+            entry
+                .size()
+                .map_or_else(|| "-".to_string(), |size| size.to_string())
+        )
+    })
 }
 
 async fn ndx_walk_pages(storage: &Storage, args: &Args, command: &Command) -> Result<(), Error> {
@@ -348,8 +423,8 @@ async fn seed(storage: &Storage, args: &Args, command: &Command) -> Result<(), E
         unreachable!("dispatched by the caller")
     };
     // Staged prepare creates the file itself but not its parents; the role-layer helper
-    // creates every missing level idempotently.
-    if !path.is_empty() {
+    // creates every missing level idempotently. S3 has no directories to create.
+    if !path.is_empty() && storage.kind() != BackendKind::S3 {
         create_directory_all(storage, &StoragePath::new(path.clone())?).await?;
     }
     let local_root = tempfile::tempdir()?;

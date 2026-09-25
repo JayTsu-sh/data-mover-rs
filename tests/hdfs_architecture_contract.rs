@@ -14,6 +14,7 @@ use data_mover::storage::{
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest, TraversalSource as _,
+    TraversalVersions,
 };
 use data_mover::{
     DataChunk, HDFSStorage, HdfsConfig, HdfsKerberosCredentials, HdfsLocation, TransferConcurrency,
@@ -71,6 +72,7 @@ async fn observes_nested_source(storage: &Storage) -> TestResult<bool> {
         cancel: CancellationToken::new(),
         filter: None,
         max_depth: None,
+        versions: TraversalVersions::Current,
     });
     let mut observed = false;
     while let Some(item) = session.next_item().await {

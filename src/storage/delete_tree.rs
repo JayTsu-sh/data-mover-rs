@@ -127,12 +127,12 @@ impl DeleteTreeSession {
 ///
 /// # Errors
 /// Returns the capability failure when the storage lends no namespace role under production
-/// preflight policy, before any backend I/O.
+/// preflight policy, or one that cannot delete anything (S3), before any backend I/O.
 pub fn delete_tree(
     storage: &Storage,
     request: DeleteTreeRequest,
 ) -> Result<DeleteTreeSession, CapabilityUnavailable> {
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.mutable_namespace(&PreflightPolicy::production())?;
     Ok(delete_tree_with_namespace(namespace, request))
 }
 

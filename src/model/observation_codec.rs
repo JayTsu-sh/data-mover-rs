@@ -1,9 +1,10 @@
 //! The entry snapshot codec: `ObservedEntry` to and from its opaque, versioned bytes.
 
 use super::{
-    BackendIdentity, BackendKind, EntryKind, EntrySnapshot, IdentityStrength,
-    MAX_MODEL_FIELD_BYTES, ObservedEntry, PrivateBackendEntryFacts, SnapshotDecodeError,
-    SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding,
+    BackendIdentity, BackendKind, EntryIdentityKey, EntryKind, EntrySnapshot, EntryVersion,
+    IdentityStrength, MAX_MODEL_FIELD_BYTES, ObservedEntry, PrivateBackendEntryFacts,
+    SnapshotDecodeError, SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget,
+    SymlinkTargetEncoding,
 };
 use crate::model::metadata_observation;
 use crate::model::{SpecialFileKind, TimePrecision};
@@ -14,6 +15,10 @@ const MAGIC: &[u8; 4] = b"DMES";
 /// from a corrupted key. v4 carried the identity per entry and still decodes.
 const VERSION: u8 = 5;
 pub(super) const VERSION_WITH_BACKEND_ID: u8 = 4;
+/// v6 (ADR-0006 C22): v5 plus the listed version of an entry from a versioned traversal (its
+/// version id, whether it is the latest, whether it is a delete marker), before the identity key.
+/// Only an entry that carries a version is written as v6; every other entry stays v5, byte for byte.
+const VERSION_WITH_ENTRY_VERSION: u8 = 6;
 
 impl PrivateBackendEntryFacts {
     fn encode(&self, output: &mut Vec<u8>) {
@@ -34,10 +39,10 @@ impl ObservedEntry {
     pub(super) fn encode(&self, with_backend_id: bool) -> EntrySnapshot {
         let mut output = Vec::new();
         output.extend_from_slice(MAGIC);
-        output.push(if with_backend_id {
-            VERSION_WITH_BACKEND_ID
-        } else {
-            VERSION
+        output.push(match (with_backend_id, &self.version) {
+            (true, _) => VERSION_WITH_BACKEND_ID,
+            (false, None) => VERSION,
+            (false, Some(_)) => VERSION_WITH_ENTRY_VERSION,
         });
         output.push(backend_tag(self.backend_kind));
         put_bytes(&mut output, self.path.as_str().as_bytes());
@@ -68,6 +73,9 @@ impl ObservedEntry {
         output.push(2);
         metadata_observation::encode(&self.metadata, &mut output);
         self.backend_fact.encode(&mut output);
+        if !with_backend_id && let Some(version) = &self.version {
+            encode_version(&mut output, version);
+        }
         output.extend_from_slice(self.identity_key.as_bytes());
         EntrySnapshot(output)
     }
@@ -119,7 +127,7 @@ pub(super) fn decode_snapshot(
         return Err(SnapshotDecodeError::InvalidMagic);
     }
     let version = cursor.byte()?;
-    if version != VERSION && version != VERSION_WITH_BACKEND_ID {
+    if ![VERSION, VERSION_WITH_BACKEND_ID, VERSION_WITH_ENTRY_VERSION].contains(&version) {
         return Err(SnapshotDecodeError::UnsupportedVersion);
     }
     let backend_kind = backend_from_tag(cursor.byte()?).ok_or(SnapshotDecodeError::Malformed)?;
@@ -136,15 +144,10 @@ pub(super) fn decode_snapshot(
     }
     let metadata = metadata_observation::decode(&mut cursor)?;
     let backend_fact = decode_facts(&mut cursor, backend_kind)?;
-    let mut encoded_key = [0; 32];
-    encoded_key.copy_from_slice(cursor.take(32)?);
-    if cursor.offset != bytes.len() {
-        return Err(SnapshotDecodeError::TrailingData);
-    }
-    let identity_key = source_identity.identity_key();
-    if encoded_key != *identity_key.as_bytes() {
-        return Err(SnapshotDecodeError::IdentityMismatch);
-    }
+    let entry_version = (version == VERSION_WITH_ENTRY_VERSION)
+        .then(|| decode_version(&mut cursor).map(Box::new))
+        .transpose()?;
+    let identity_key = decode_identity_key(&mut cursor, bytes.len(), &source_identity)?;
     Ok(ObservedEntry {
         identity_key,
         backend_kind,
@@ -156,7 +159,27 @@ pub(super) fn decode_snapshot(
         source_identity,
         metadata,
         backend_fact,
+        version: entry_version,
     })
+}
+
+/// The stored identity key, which must end the snapshot and match the key `source_identity`
+/// derives.
+fn decode_identity_key(
+    cursor: &mut Cursor<'_>,
+    len: usize,
+    source_identity: &SourceIdentity,
+) -> Result<EntryIdentityKey, SnapshotDecodeError> {
+    let mut encoded_key = [0; 32];
+    encoded_key.copy_from_slice(cursor.take(32)?);
+    if cursor.offset != len {
+        return Err(SnapshotDecodeError::TrailingData);
+    }
+    let identity_key = source_identity.identity_key();
+    if encoded_key != *identity_key.as_bytes() {
+        return Err(SnapshotDecodeError::IdentityMismatch);
+    }
+    Ok(identity_key)
 }
 
 /// The source identity of a snapshot: strength, backend (the caller's for v5, checked by kind and
@@ -343,4 +366,46 @@ fn decode_facts(
         (5, BackendKind::Hdfs) => Ok(PrivateBackendEntryFacts::Hdfs(bytes)),
         _ => Err(SnapshotDecodeError::Malformed),
     }
+}
+
+/// Flags of the v6 version record.
+const VERSION_LATEST: u8 = 1;
+const VERSION_DELETE_MARKER: u8 = 2;
+const VERSION_HAS_ID: u8 = 4;
+
+fn encode_version(output: &mut Vec<u8>, version: &EntryVersion) {
+    let mut flags = 0;
+    if version.is_latest() {
+        flags |= VERSION_LATEST;
+    }
+    if version.is_delete_marker() {
+        flags |= VERSION_DELETE_MARKER;
+    }
+    if version.id().is_some() {
+        flags |= VERSION_HAS_ID;
+    }
+    output.push(flags);
+    if let Some(id) = version.id() {
+        put_bytes(output, id.as_bytes());
+    }
+}
+
+fn decode_version(cursor: &mut Cursor<'_>) -> Result<EntryVersion, SnapshotDecodeError> {
+    let flags = cursor.byte()?;
+    if flags & !(VERSION_LATEST | VERSION_DELETE_MARKER | VERSION_HAS_ID) != 0 {
+        return Err(SnapshotDecodeError::Malformed);
+    }
+    let id = if flags & VERSION_HAS_ID == 0 {
+        None
+    } else {
+        let id =
+            std::str::from_utf8(cursor.bytes()?).map_err(|_| SnapshotDecodeError::Malformed)?;
+        Some(id.to_string())
+    };
+    EntryVersion::new(
+        id,
+        flags & VERSION_LATEST != 0,
+        flags & VERSION_DELETE_MARKER != 0,
+    )
+    .map_err(|_| SnapshotDecodeError::Malformed)
 }

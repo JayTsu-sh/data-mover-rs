@@ -20,6 +20,9 @@ use crate::storage::{
 };
 use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy};
 
+#[path = "expert_observation.rs"]
+mod observation;
+
 /// Inputs owned by the source process for one expert transfer attempt.
 #[derive(Clone)]
 pub struct ExpertSourceRequest {
@@ -99,13 +102,7 @@ impl ExpertSourceSession {
                 "expert source transfer was cancelled",
             ));
         }
-        let descriptor = source
-            .describe(request.observation.path())
-            .await
-            .map_err(|error| {
-                TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
-            })?;
-        validate_observation(&request.observation, &descriptor)?;
+        let descriptor = observation::describe(source.as_ref(), &request.observation).await?;
         let source_size = descriptor.size.ok_or_else(|| {
             TransferFailure::orchestration(TransferPhase::Describe, "source has no byte size")
         })?;
@@ -120,10 +117,12 @@ impl ExpertSourceSession {
         if let Some(budget) = &source_qos {
             budget.set_logical_bytes(source_size);
         }
+        // The observation's key, which the destination half compares its evidence with; it
+        // names the object the describe pinned (`validate_observation`).
         let offer = ExpertSourceOffer {
             source_size,
             maximum_chunk_bytes,
-            identity_key: descriptor.source_identity.identity_key(),
+            identity_key: request.observation.identity_key(),
         };
         Ok(Self {
             source,
@@ -260,24 +259,6 @@ impl ExpertSourcePayload {
             ),
         })
     }
-}
-
-fn validate_observation(
-    observation: &ObservedEntry,
-    descriptor: &SourceDescriptor,
-) -> Result<(), TransferFailure> {
-    if observation.kind() != EntryKind::File
-        || descriptor.kind != EntryKind::File
-        || observation.path() != &descriptor.path
-        || observation.size() != descriptor.size
-        || observation.identity_key() != descriptor.source_identity.identity_key()
-    {
-        return Err(TransferFailure::orchestration(
-            TransferPhase::Describe,
-            "source differs from advertised observation",
-        ));
-    }
-    Ok(())
 }
 
 /// Inputs owned by the destination process for one expert transfer attempt.

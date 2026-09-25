@@ -7,11 +7,11 @@ use tokio::task::{JoinError, JoinSet};
 use super::{
     ChildOrder, TraversalCandidate, TraversalCompletion, TraversalDecision, TraversalFilter,
     TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest, TraversalSession,
-    TraversalSource, TraversalTerminalFailure, relative_to,
+    TraversalSource, TraversalTerminalFailure, TraversalVersions, relative_to,
 };
 use crate::model::{
-    EntryKind, EntryOperationFailure, FailureClass, ObservationMode, ObservationPlan,
-    ObservedEntry, Operation, StoragePath, Transience,
+    BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, ObservationMode,
+    ObservationPlan, ObservedEntry, Operation, StoragePath, Transience,
 };
 use crate::storage::{
     CapabilityUnavailable, Metadata, Namespace, NamespaceResult, PreflightPolicy, SourceDescriptor,
@@ -83,8 +83,38 @@ impl StorageTraversalSource {
     }
 }
 
+impl StorageTraversalSource {
+    /// Whether this source can list every stored version ([`TraversalVersions::All`]).
+    #[must_use]
+    pub fn supports_versions(&self) -> bool {
+        self.namespace.supports_versions()
+    }
+}
+
+/// A session that ends at once, before any I/O, with an `Unsupported` session failure: the
+/// request asked for every version of a source that keeps none. Returning its current entries
+/// instead would let a history migration believe it saw every version.
+fn refuse_versions(request: &TraversalRequest) -> TraversalSession {
+    let (producer, session) =
+        TraversalSession::bounded(request.max_buffered_items, request.cancel.clone());
+    let failure = match BackendSessionFailure::new(
+        Operation::Traverse,
+        FailureClass::Unsupported,
+        Transience::Permanent,
+        "this source keeps no versions to traverse",
+    ) {
+        Ok(failure) => TraversalTerminalFailure::Session(failure),
+        Err(_) => TraversalTerminalFailure::Internal,
+    };
+    producer.finish(Err(failure));
+    session
+}
+
 impl TraversalSource for StorageTraversalSource {
     fn traverse(&self, request: TraversalRequest) -> TraversalSession {
+        if request.versions == TraversalVersions::All && !self.supports_versions() {
+            return refuse_versions(&request);
+        }
         let (item_tx, item_rx) = mpsc::channel(request.max_buffered_items.get());
         let (completion_tx, completion_rx) = oneshot::channel();
         let cancel = request.cancel.clone();

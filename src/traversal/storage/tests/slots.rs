@@ -192,6 +192,7 @@ async fn spelled(
         cancel: tokio_util::sync::CancellationToken::new(),
         filter: None,
         max_depth: None,
+        versions: TraversalVersions::Current,
     });
     let mut items = Vec::new();
     while let Some(item) = session.next_item().await {

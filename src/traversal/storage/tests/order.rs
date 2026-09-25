@@ -60,6 +60,7 @@ fn ordered_request(order: TraversalOrder) -> TraversalRequest {
         cancel: tokio_util::sync::CancellationToken::new(),
         filter: None,
         max_depth: None,
+        versions: TraversalVersions::Current,
     }
 }
 

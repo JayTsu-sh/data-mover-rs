@@ -67,6 +67,18 @@ pub(crate) fn http_last_modified(secs: i64) -> Option<StorageTimestamp> {
     .ok()
 }
 
+/// An S3 listing's `LastModified` (`ListObjectsV2` / `ListObjectVersions`): an ISO 8601 time with
+/// milliseconds, where a HEAD's `Last-Modified` header has whole seconds. Anything finer than a
+/// millisecond is dropped rather than reported as precision the store does not have.
+pub(crate) fn s3_listing_time(secs: i64, subsec_nanos: u32) -> Option<StorageTimestamp> {
+    let millis = i128::from(subsec_nanos / 1_000_000);
+    StorageTimestamp::new(
+        i128::from(secs) * i128::from(NANOS_PER_SEC) + millis * 1_000_000,
+        TimePrecision::Milliseconds,
+    )
+    .ok()
+}
+
 #[inline]
 #[must_use]
 pub fn now_nanos() -> i64 {
@@ -173,6 +185,16 @@ mod tests {
         // nanos_to_secs(nanos) must fall within [before, after] (same-second or adjacent second)
         let secs_from_nanos = nanos_to_secs(nanos);
         assert!(secs_from_nanos >= before && secs_from_nanos <= after + 1);
+    }
+
+    /// A listing's time keeps its milliseconds and drops anything finer.
+    #[test]
+    fn s3_listing_time_keeps_milliseconds_only() {
+        let Some(value) = s3_listing_time(1_700_000_000, 123_456_789) else {
+            panic!("a representable time");
+        };
+        assert_eq!(value.unix_nanos(), 1_700_000_000_123_000_000);
+        assert_eq!(value.precision(), TimePrecision::Milliseconds);
     }
 
     /// Whole seconds at `Seconds` precision; pre-epoch objects keep their time.

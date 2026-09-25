@@ -18,6 +18,8 @@ pub use storage::StorageTraversalSource;
 mod hdfs_tests;
 #[cfg(test)]
 mod local_tests;
+#[cfg(test)]
+mod s3_tests;
 
 /// Traversal output order. Concurrent completion never changes admission order.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -51,7 +53,36 @@ pub enum TraversalOrder {
     /// and stay ahead of the block, outside the order: the guarantee covers described children,
     /// and two backends that fail to name the same two children may still put those two failures
     /// in two different sequences. A merge that walks the stream literally has to skip them.
+    ///
+    /// **On S3 a name can repeat within one directory**: an object `a` and the prefix `a/` are
+    /// both the child `a`, and a traversal of every version ([`TraversalVersions::All`]) emits one
+    /// child per version of a key. Ties are ordered — the object before the directory (S3's own
+    /// key order, `a` < `a/`), and one key's versions oldest first — so the stream is still a
+    /// total order, and the full merge key is `(parent directory, name, kind, version position)`.
     NameBytes,
+}
+
+/// Which entries a traversal emits for the objects of a versioned store (ADR-0006 C22).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TraversalVersions {
+    /// Current objects only. A key whose latest entry is a delete marker is absent, as it is
+    /// from the store's own current view. Every source supports it; entries carry no listed
+    /// version ([`ObservedEntry::version`] is `None`).
+    #[default]
+    Current,
+    /// Every stored version and delete marker of every object, each object's entries contiguous,
+    /// oldest first and the latest last. Each entry carries its [`EntryVersion`] (version id,
+    /// latest flag, delete-marker flag), and [`ObservedEntry::source_version`] is the selector
+    /// that copies exactly that version with `TransferRequest::with_source_version`. A delete
+    /// marker has no size and nothing to copy.
+    ///
+    /// Only a source that keeps versions (S3) supports it. Any other source ends the traversal
+    /// before any I/O with an `Unsupported` session failure, never with its current entries in
+    /// place of the versions asked for. Both modes hide `.data-mover-*` names.
+    ///
+    /// [`EntryVersion`]: crate::model::EntryVersion
+    All,
 }
 
 /// Facts known about one directory child when the traversal decides whether to emit it,
@@ -130,6 +161,8 @@ pub struct TraversalRequest {
     /// Maximum depth to enumerate. Children of `root` are depth 1; a directory at depth `d`
     /// is listed only when `d < max_depth`. `None` means unlimited.
     pub max_depth: Option<NonZeroUsize>,
+    /// Current objects only, or every stored version (see [`TraversalVersions`]).
+    pub versions: TraversalVersions,
 }
 
 /// Re-expresses a backend-relative path in the traversal root's frame of reference.

@@ -41,7 +41,8 @@ use crate::model::{
 /// Why a recursive directory creation could not complete.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CreateDirectoryAllFailure {
-    /// The storage lends no namespace role under the production preflight policy.
+    /// The storage lends no namespace role under the production preflight policy, or one whose
+    /// mutating verbs are all unsupported (S3).
     Capability(CapabilityUnavailable),
     /// One level could not be created, naming the level that failed.
     Role(StorageRoleFailure),
@@ -82,14 +83,14 @@ impl From<StorageRoleFailure> for CreateDirectoryAllFailure {
 /// Succeeds when the directory already exists.
 ///
 /// # Errors
-/// Returns [`CreateDirectoryAllFailure::Capability`] when the storage lends no namespace role,
-/// before any backend I/O, and [`CreateDirectoryAllFailure::Role`] when a level cannot be
+/// Returns [`CreateDirectoryAllFailure::Capability`] when the storage lends no namespace role, or
+/// one that cannot create anything (S3), before any backend I/O, and [`CreateDirectoryAllFailure::Role`] when a level cannot be
 /// created or the leaf turns out to be a non-directory.
 pub async fn create_directory_all(
     storage: &Storage,
     path: &StoragePath,
 ) -> Result<(), CreateDirectoryAllFailure> {
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.mutable_namespace(&PreflightPolicy::production())?;
     create_directory_all_with_namespace(namespace.as_ref(), path).await
 }
 
