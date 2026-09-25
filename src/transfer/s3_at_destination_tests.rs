@@ -93,8 +93,9 @@ async fn a_checkpointed_object_up_to_the_interval_writes_no_pointer() -> TestRes
     Ok(())
 }
 
-/// Above the interval the engine's first deferred checkpoint makes the destination write its
-/// pointer (one `PutObject`); publication completes the upload on the final key and removes it.
+/// Above the interval the destination writes its pointer once (one `PutObject`, at prepare since
+/// ADR-0006 C16) and its recovery turns on at the engine's first deferred checkpoint;
+/// publication completes the upload on the final key and removes the pointer.
 #[tokio::test]
 async fn a_checkpointed_object_over_the_interval_writes_one_pointer() -> TestResult {
     const FINAL: &str = "dir/large-checkpointed";
@@ -110,8 +111,8 @@ async fn a_checkpointed_object_over_the_interval_writes_one_pointer() -> TestRes
     Ok(())
 }
 
-/// A failed part before any checkpoint keeps an unrecoverable stage; discarding it aborts the
-/// upload and never touches the final key.
+/// A failed part before any checkpoint keeps an unrecoverable stage; discarding it deletes the
+/// pointer, aborts the upload and never touches the final key.
 #[tokio::test]
 async fn a_failed_upload_is_discarded_without_touching_the_final_key() -> TestResult {
     const FINAL: &str = "dir/failed-checkpointed";
@@ -185,6 +186,37 @@ async fn an_interrupted_transfer_resumes_in_a_fresh_connection() -> TestResult {
         assert_eq!(protocol.objects.lock().await.get(final_key), Some(&payload));
         assert!(leaves_nothing_behind(&protocol, final_key).await?);
     }
+    Ok(())
+}
+
+/// ADR-0006 C16: a transfer cut before its first checkpoint — at a 25 MiB interval, part 3 of 4
+/// fails once parts 1 and 2 are stored (part 4 may be too: 24 MiB at most) — has no recoverable
+/// stage, and a writer that dies there (a killed container) never discards it. The pointer
+/// prepare wrote lets a second `transfer` through fresh connections resume from the two listed
+/// parts instead of aborting them.
+#[tokio::test]
+async fn a_transfer_killed_before_its_first_checkpoint_resumes() -> TestResult {
+    const PART: usize = 8 * MIB;
+    let final_key = "dir/early";
+    let (protocol, payload) = seeded(4 * PART).await;
+    *protocol.part_failure.lock().await = Some((3, reset()));
+    *protocol.part_failure_waits.lock().await = true;
+    let failure = transfer(checkpointed_every(&protocol, final_key, 3 * PART + MIB)?)
+        .await
+        .err()
+        .ok_or("the failed part must cut the transfer")?;
+    assert!(failure.has_unpublished_stage() && !failure.has_recoverable_stage());
+    drop(failure);
+    assert_eq!(*protocol.puts.lock().await, 1, "the pointer, at prepare");
+
+    *protocol.part_failure.lock().await = None;
+    let outcome = transfer(checkpointed_every(&protocol, final_key, 3 * PART + MIB)?).await?;
+    let reused = 2 * PART as u64;
+    assert_eq!(outcome.prepare, PrepareFact::Resumed { bytes: reused });
+    assert_eq!(outcome.reused_bytes, reused);
+    assert_eq!(outcome.blake3, Some(*blake3::hash(&payload).as_bytes()));
+    assert_eq!(protocol.objects.lock().await.get(final_key), Some(&payload));
+    assert!(leaves_nothing_behind(&protocol, final_key).await?);
     Ok(())
 }
 

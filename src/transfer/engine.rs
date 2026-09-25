@@ -240,7 +240,10 @@ impl TransferFailure {
         self.side
     }
 
-    /// Whether the failed attempt retains unpublished state eligible for a later resume.
+    /// Whether the failed attempt retains unpublished state eligible for a later resume. `false`
+    /// does not mean nothing can be resumed: a destination may keep its pointer from prepare
+    /// (S3 since ADR-0006 C16), so an unrecoverable stage that is dropped instead of discarded
+    /// may still be resumed by the next attempt. Discard it to start over.
     #[must_use]
     pub fn has_recoverable_stage(&self) -> bool {
         self.failed_stage
@@ -1068,6 +1071,8 @@ fn plan_request(
         native_pair.is_some(),
         request.transfer_policy == TransferPolicy::Checkpointed,
     )?;
+    // S3's `pointer_before_checkpoint` mirrors when this arms the interval (a `Discover` prepare
+    // of a known size over it): keep the two in step.
     if request.transfer_policy == TransferPolicy::Checkpointed
         && native_pair.is_none()
         && let Some(interval) = destination

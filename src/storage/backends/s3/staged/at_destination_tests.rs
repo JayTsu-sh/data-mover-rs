@@ -216,11 +216,13 @@ fn class(error: &StorageRoleFailure) -> Option<FailureClass> {
     }
 }
 
-/// A checkpointed upload that is not recoverable from the start begins its upload on the final
-/// key and writes its pointer only at its first deferred checkpoint; publication completes it
-/// and removes the pointer.
+/// A checkpointed upload that is not recoverable from the start (the engine's automatic interval)
+/// begins its upload on the final key and writes its pointer at once (ADR-0006 C16), but turns its
+/// recovery on only at its first deferred checkpoint, without writing the pointer again;
+/// publication completes it and removes the pointer.
 #[tokio::test]
-async fn a_fresh_upload_writes_its_pointer_at_the_first_checkpoint() -> TestResult {
+async fn a_resumable_upload_writes_its_pointer_at_once_and_recovers_from_its_checkpoint()
+-> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let destination = destination(&protocol);
     let data = payload(40 * MIB);
@@ -234,11 +236,11 @@ async fn a_fresh_upload_writes_its_pointer_at_the_first_checkpoint() -> TestResu
     );
     let open = uploads(&protocol).await?;
     assert_eq!(open.len(), 1);
-    assert!(pointer(&protocol).await.is_none());
+    assert!(pointer(&protocol).await.is_some());
     with_checkpoint(&mut stage, 16 * MIB, data.len());
     destination.write(&stage, chunks(&data)).await?;
     assert!(stage.recovery_enabled());
-    let recorded = pointer(&protocol).await.ok_or("the checkpoint's pointer")?;
+    let recorded = pointer(&protocol).await.ok_or("the prepare's pointer")?;
     assert_eq!(
         (
             recorded.binding,
@@ -261,24 +263,107 @@ async fn a_fresh_upload_writes_its_pointer_at_the_first_checkpoint() -> TestResu
     Ok(())
 }
 
-/// D3: without a deferred checkpoint (a checkpointed transfer up to 64 MiB), or with one the
-/// upload never reaches, no pointer is ever written.
+/// D3: a checkpointed transfer up to the interval, or one that may not resume (`Restart`: an
+/// atomic replace), writes no pointer, whatever its size.
 #[tokio::test]
-async fn an_upload_that_reaches_no_checkpoint_never_writes_a_pointer() -> TestResult {
-    for interval in [None, Some(48 * MIB)] {
+async fn a_small_or_unresumable_upload_writes_no_pointer() -> TestResult {
+    for (size, resume) in [
+        (INTERVAL, ResumeMode::Discover),
+        (40 * MIB, ResumeMode::Restart),
+    ] {
         let protocol = Arc::new(MemoryS3::default());
         let destination = destination(&protocol);
-        let data = payload(40 * MIB);
-        let request = request(data.len(), BINDING, ResumeMode::Discover, false)?;
-        let mut stage = destination.prepare_at_destination(request).await?;
-        if let Some(interval) = interval {
-            with_checkpoint(&mut stage, interval, data.len());
-        }
+        let data = payload(size);
+        let request = request(data.len(), BINDING, resume, false)?;
+        let stage = destination.prepare_at_destination(request).await?;
         destination.write(&stage, chunks(&data)).await?;
         assert!(!stage.recovery_enabled());
         publish_and_verify(&destination, &stage, &data).await?;
-        assert_eq!(*protocol.puts.lock().await, 0, "{interval:?}");
+        assert_eq!(*protocol.puts.lock().await, 0, "{size} {resume:?}");
         assert!(uploads(&protocol).await?.is_empty());
+    }
+    Ok(())
+}
+
+/// ADR-0006 C16: a writer killed before its first deferred checkpoint (a container restart) left
+/// its pointer from prepare, so the next prepare resumes from the parts the service lists instead
+/// of aborting them as an upload without a pointer.
+#[tokio::test]
+async fn a_crash_before_the_first_checkpoint_still_resumes() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    let destination = destination(&protocol);
+    let data = payload(7 * PART);
+    let request = || request(data.len(), BINDING, ResumeMode::Discover, false);
+    let mut stage = destination.prepare_at_destination(request()?).await?;
+    with_checkpoint(&mut stage, 6 * PART, data.len());
+    let cut = destination
+        .write(&stage, failing_after(&data[..3 * PART])?)
+        .await;
+    assert!(cut.is_err());
+    assert!(!stage.recovery_enabled(), "the checkpoint was not reached");
+    drop(stage);
+
+    let stage = destination.prepare_at_destination(request()?).await?;
+    let resumed = 3 * PART as u64;
+    assert_eq!(
+        stage.prepare_fact(),
+        PrepareFact::Resumed { bytes: resumed }
+    );
+    assert_eq!(uploads(&protocol).await?.len(), 1);
+    destination.write(&stage, chunks(&data[3 * PART..])).await?;
+    publish_and_verify(&destination, &stage, &data).await?;
+    assert_eq!(protocol.objects.lock().await.get(FINAL), Some(&data));
+    assert!(pointer(&protocol).await.is_none());
+    Ok(())
+}
+
+/// ADR-0006 C16: the pointer written at prepare failing (a `BadDigest`: `Corruption`, transient)
+/// fails the prepare with that error and aborts the upload it began, leaving nothing on the key.
+#[tokio::test]
+async fn a_failed_pointer_at_prepare_aborts_the_new_upload() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    let destination = destination(&protocol);
+    *protocol.bad_digest_next_put.lock().await = true;
+    let request = request(3 * PART, BINDING, ResumeMode::Discover, false)?;
+    let error = destination
+        .prepare_at_destination(request)
+        .await
+        .err()
+        .ok_or("the pointer PUT must fail the prepare")?;
+    let StorageRoleFailure::Entry(entry) = &error else {
+        return Err("an entry failure".into());
+    };
+    assert_eq!(
+        (entry.class(), entry.transience()),
+        (FailureClass::Corruption, Transience::Transient)
+    );
+    assert_eq!(*protocol.multipart_begins.lock().await, 1);
+    assert!(uploads(&protocol).await?.is_empty());
+    assert!(pointer(&protocol).await.is_none());
+    Ok(())
+}
+
+/// A prepare that wrote no pointer (`Restart`) but is given a deferred checkpoint writes it at
+/// that checkpoint and turns recovery on — also when the pointer's `PutObject` stored it but lost
+/// the reply (it reads back byte for byte, so it counts as written).
+#[tokio::test]
+async fn a_checkpoint_writes_the_pointer_prepare_did_not() -> TestResult {
+    for lost_reply in [false, true] {
+        let protocol = Arc::new(MemoryS3::default());
+        let destination = destination(&protocol);
+        let data = payload(5 * PART);
+        let request = request(data.len(), BINDING, ResumeMode::Restart, false)?;
+        let mut stage = destination.prepare_at_destination(request).await?;
+        assert!(pointer(&protocol).await.is_none());
+        with_checkpoint(&mut stage, 2 * PART, data.len());
+        *protocol.put_commits_then_fails.lock().await = lost_reply;
+        destination.write(&stage, chunks(&data)).await?;
+        assert!(stage.recovery_enabled(), "lost_reply={lost_reply}");
+        let recorded = pointer(&protocol).await.ok_or("the checkpoint's pointer")?;
+        assert_eq!(recorded.binding, BINDING);
+        assert_eq!(*protocol.puts.lock().await, 1);
+        publish_and_verify(&destination, &stage, &data).await?;
+        assert!(pointer(&protocol).await.is_none());
     }
     Ok(())
 }
@@ -389,14 +474,13 @@ async fn leftovers_are_cleaned_up_and_the_upload_starts_over() -> TestResult {
             PrepareFact::Restarted { reason },
             "{case}"
         );
-        assert!(pointer(&protocol).await.is_none(), "{case}");
-        assert!(
-            !protocol.objects.lock().await.contains_key(&pointer_key()),
-            "{case}"
-        );
         let open = uploads(&protocol).await?;
         assert_eq!(open.len(), 1, "{case}");
         assert_ne!(open[0], old, "{case}");
+        // The old pointer is gone; the new upload's own (ADR-0006 C16) names it.
+        let fresh = pointer(&protocol).await.ok_or("the new upload's pointer")?;
+        let fresh = UploadRecord::decode(&fresh.extension).ok_or("upload record")?;
+        assert_eq!(fresh.upload_id, open[0], "{case}");
         destination.write(&stage, chunks(&data)).await?;
         publish_and_verify(&destination, &stage, &data).await?;
     }

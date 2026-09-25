@@ -330,7 +330,8 @@ stays false: a pointer without a durable prefix already resumes from what the st
 rewrites the pointer with a new nonce (take-over) and then aborts any other upload on the key; the
 stage's state (upload id, part size, the prefix's (number, `ETag`)s, fence, tags, completion facts)
 lives in `PreparedStage::backend_state`. A fresh or restarted stage begins its upload after discovery
-cleaned the key; a `recoverable` one writes its pointer at once, any other at its first deferred
+cleaned the key; a `recoverable` one writes its pointer at once (since C16 so does a resumable one of
+known size over the interval), any other at its first deferred
 checkpoint — the first time the parts the service acknowledged in this `write` reach the interval —
 which also turns its recovery on. S3 declares the 64 MiB automatic interval only while the switch is
 on, so a checkpointed transfer of at most 64 MiB never writes a pointer (D3); with the switch off the
@@ -385,6 +386,28 @@ pointer and one open upload, resumed `Resumed { 150994944 }` / `Resumed { 125829
 streamed = 200 MiB, equal BLAKE3, and nothing left. At the default 6 s cut the service had
 acknowledged less than 64 MiB (the checkpoint counts acknowledged parts, up to four parts behind the
 reads), so both restarted as `StageWithoutPointer`.
+
+As built (C16, S3 resume granularity): measured on MinIO after C15c (200 MiB, 20 MiB/s), what a cut
+loses. A cancellation loses less than one part: 161061888 bytes streamed at a 12 s cut, 159383552
+(19 parts) resumed — the parts in flight finish. A SIGKILL loses the parts in flight (up to four 8 MiB
+parts plus the one being read): 9 s → 75497472 resumed, 12 s → 117440512. Both are what the parts
+allow. The loss that was not: a writer killed before its first checkpoint — the first 64 MiB the
+service acknowledged, which at a slow source can take minutes — left an upload without a pointer,
+which the next prepare could only abort (`StageWithoutPointer`), so a container restarted in that
+window started over. A fresh upload that may be resumed (`ResumeMode::Discover`: the engine arms a
+deferred checkpoint for it) and whose known size is over the automatic interval now writes its pointer
+when it begins, like a `recoverable` one. Which objects get a pointer is unchanged (D3: checkpointed
+objects over 64 MiB, one pointer `PutObject` each), and the stage's recovery still turns on only at
+that checkpoint: before it, a failure reports no recoverable stage and a discard deletes the pointer
+and aborts the upload as before; a failure that is not discarded (a writer that dies there, or a
+caller that drops the failure) leaves the pointer, and the next prepare resumes from the listed parts.
+The upload is also fenced from the start. Consequences: such an undiscarded failure leaves a visible
+`.data-mover-*.upload` object even with no part sent (a bucket lifecycle rule aborts the upload, the
+pointer goes at the key's next prepare as `PointerWithoutStage`), and in a versioned bucket a failure
+before the first checkpoint that is discarded now leaves a pointer version and a delete marker too
+(until C17). At a 6 s cut (where C15c
+restarted from zero) MinIO now resumed 75497472 bytes after a cancellation and 41943040 after a
+SIGKILL, BLAKE3 equal, nothing left.
 
 The outcome reports `Fresh`, `Resumed { bytes }` or `Restarted { reason }`. Exclusivity rests on the
 caller contract that one destination key is never written by two transfers at once, plus an in-process

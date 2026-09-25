@@ -95,9 +95,12 @@ pub struct DestinationPrepareRequest {
     pub transfer_identity: [u8; 32],
     /// Whether an equal binding found at the destination may be resumed.
     pub resume: ResumeMode,
-    /// Whether a fresh stage writes its pointer from the start, so a crash can be resumed; `false`
-    /// is the ephemeral prepare, whose pointer (if any) is written at its first deferred
-    /// checkpoint. A resumed stage keeps its pointer either way.
+    /// Whether a fresh stage is recoverable from the start (it writes its pointer at once, so a
+    /// crash can be resumed); `false` is the ephemeral prepare, whose recovery turns on at its
+    /// first deferred checkpoint. Its pointer is written there — or, on S3 with `Discover` and a
+    /// size over the interval, already at prepare (ADR-0006 C16), so an attempt that fails before
+    /// that checkpoint and is not discarded can still be resumed. A resumed stage keeps its
+    /// pointer either way.
     pub recoverable: bool,
 }
 

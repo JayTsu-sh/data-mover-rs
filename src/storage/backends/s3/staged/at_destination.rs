@@ -39,7 +39,7 @@ use crate::storage::pointer::{DestinationPointer, MAX_POINTER_BYTES};
 use crate::storage::{
     ByteStream, CheckpointObservation, DestinationPrepareRequest, MetadataMutation, PrepareFact,
     PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
-    StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
+    ResumeMode, StorageRoleFailure, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 /// A multipart upload on the final key, kept at the destination.
@@ -205,7 +205,8 @@ fn changed(error: StorageRoleFailure) -> PublicationFailure {
     }
 }
 
-/// Writes the pointer at the upload's first deferred checkpoint.
+/// At the upload's first deferred checkpoint: writes the pointer unless prepare already did, and
+/// turns the stage's recovery on.
 struct PointerCheckpoint<'a, P> {
     adapter: &'a S3StagedDestination<P>,
     stage: &'a PreparedStage,
@@ -308,8 +309,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     }
 
     /// Begins a new upload on the final key (discovery aborted any other). A recoverable stage
-    /// over the automatic interval writes its pointer at once; any other at its first deferred
-    /// checkpoint, if it has one.
+    /// over the automatic interval writes its pointer at once, and so does a resumable one of
+    /// known size over it (ADR-0006 C16); any other at its first deferred checkpoint, if it has
+    /// one.
     async fn start_upload(
         &self,
         request: &DestinationPrepareRequest,
@@ -324,9 +326,12 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             .await
             .map_err(|error| role_failure(path, Operation::Prepare, error))?;
         let upload = FinalUpload::new(request, upload_id, part_size as u64, pointer)?;
-        let stage = self.upload_stage(request, upload, 0, fact);
+        let mut stage = self.upload_stage(request, upload, 0, fact);
         if !self.pointer_at_prepare(request) {
-            return Ok(stage.disable_recovery());
+            stage = stage.disable_recovery();
+            if !self.pointer_before_checkpoint(request) {
+                return Ok(stage);
+            }
         }
         let upload =
             of(&stage).ok_or_else(|| failure(path, Operation::Prepare, FailureClass::Internal))?;
@@ -345,8 +350,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         Ok(stage)
     }
 
-    /// Whether a fresh upload writes its pointer at prepare: only a `recoverable` one over the
-    /// automatic interval (D3: a pointer only for checkpointed objects over 64 MiB). The expert
+    /// Whether a fresh upload is recoverable from prepare, pointer written: a `recoverable` one
+    /// over the automatic interval (D3: a pointer only for checkpointed objects over 64 MiB). The
+    /// expert
     /// destination half asks for every checkpointed object over one chunk; a smaller one keeps
     /// no pointer and is not resumable.
     fn pointer_at_prepare(&self, request: &DestinationPrepareRequest) -> bool {
@@ -356,6 +362,21 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                 .source
                 .size
                 .is_none_or(|size| size > self.checkpoint_interval)
+    }
+
+    /// Whether an upload that is not recoverable yet still writes its pointer at once: a
+    /// resumable one of known size over the automatic interval — the one the engine arms a
+    /// deferred checkpoint for (`plan_request` in `transfer/engine.rs`; keep the two in step). A crash (a killed container) before that checkpoint then leaves an
+    /// upload the next prepare resumes from its listed parts, instead of up to one interval of
+    /// parts without a pointer, which it could only abort. Recovery still turns on at the
+    /// checkpoint: a failure or cancellation before it discards the upload and the pointer.
+    fn pointer_before_checkpoint(&self, request: &DestinationPrepareRequest) -> bool {
+        request.resume == ResumeMode::Discover
+            && request
+                .prepare
+                .source
+                .size
+                .is_some_and(|size| size > self.checkpoint_interval)
     }
 
     async fn fence(&self, upload: &FinalUpload) -> Result<Fence, StorageRoleFailure> {
@@ -399,8 +420,8 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         Ok(())
     }
 
-    /// Sends the parts after the resumed prefix; writes the pointer at the first deferred
-    /// checkpoint. The upload is completed by `publish`.
+    /// Sends the parts after the resumed prefix; the first deferred checkpoint turns recovery on
+    /// (and writes the pointer, if prepare did not). The upload is completed by `publish`.
     pub(super) async fn write_final_upload(
         &self,
         stage: &PreparedStage,
@@ -428,7 +449,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         let checkpoint = stage
             .deferred_checkpoint
             .as_ref()
-            .filter(|_| !upload.pointer_written())
+            .filter(|_| !stage.recovery_enabled())
             .map(|checkpoint| (checkpoint.interval_bytes, &hook as &dyn PartsCheckpoint));
         let target = PartTarget {
             path,
