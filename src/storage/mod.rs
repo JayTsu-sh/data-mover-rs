@@ -12,6 +12,7 @@ pub(crate) mod durability;
 pub(crate) mod endpoint;
 mod factory;
 mod handle;
+pub mod listing;
 mod native;
 pub(crate) mod pointer;
 mod roles;
@@ -46,13 +47,18 @@ pub use factory::{
     endpoint_identity,
 };
 pub use handle::Storage;
+pub use listing::{
+    ChildFailure, CollectLimits, ListRequest, ListedChild, ListingPage, ListingStream, PageSink,
+    collect_listing,
+};
 pub(crate) use roles::DeferredCheckpoint;
 pub use roles::{
-    ByteStream, CheckpointObservation, FinalDestination, Metadata, MetadataMutation, Namespace,
-    NamespaceRequest, NamespaceResult, PositionedByteStream, PositionedChunk, PrepareRequest,
-    PreparedStage, PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
-    ReadRequest, ReadSource, StagedDestination, StagedMetadataApplicationFailure,
-    StorageRoleFailure, VerificationEvidence, VerificationPoint, VerifyRequest, WriteEvidence,
+    ByteStream, CaseSensitivity, CheckpointObservation, FinalDestination, Metadata,
+    MetadataMutation, NameNormalization, NameSemantics, Namespace, NamespaceCapabilities,
+    PositionedByteStream, PositionedChunk, PrepareRequest, PreparedStage, PublicationDisposition,
+    PublicationEvidence, PublicationFailure, PublishRequest, ReadRequest, ReadSource,
+    StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure, VerificationEvidence,
+    VerificationPoint, VerifyRequest, WriteEvidence,
 };
 
 pub use crate::runtime::read_budget::ReadBudget;

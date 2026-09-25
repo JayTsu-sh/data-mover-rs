@@ -18,9 +18,10 @@ use crate::model::{
     StoragePath,
 };
 use crate::storage::artifacts::{ArtifactKind, artifact_name, artifact_temporary_name};
+use crate::storage::listing::testing::listed;
 use crate::storage::{
-    DestinationPrepareRequest, Namespace, NamespaceRequest, NamespaceResult, PrepareFact,
-    PrepareRequest, ReadRequest, ReadSource, ResumeMode, SourceQosGroup, SourceQosPolicy,
+    DestinationPrepareRequest, PrepareFact, PrepareRequest, ReadRequest, ReadSource, ResumeMode,
+    SourceQosGroup, SourceQosPolicy,
 };
 
 const REAL_RECOVERY_BINDING: [u8; 32] = [11; 32];
@@ -364,12 +365,8 @@ async fn namespace_list_returns_neutral_child_descriptors() -> Result<(), Box<dy
         protocol,
         BackendIdentity::new(BackendKind::Cifs, "test-share")?,
     );
-    let result = namespace
-        .execute(NamespaceRequest::List(StoragePath::new("root")?))
-        .await?;
-    let NamespaceResult::Entries(entries) = result else {
-        return Err("list did not return entries".into());
-    };
+    let (entries, failures) = listed(&namespace, &StoragePath::new("root")?).await?;
+    assert!(failures.is_empty(), "{failures:?}");
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].path.as_str(), "root/child.bin");
     assert_eq!(entries[0].kind, EntryKind::File);
@@ -412,12 +409,7 @@ async fn real_share_exercises_domain_roles_without_wire_api()
     )?;
     let policy = crate::storage::PreflightPolicy::production();
     let namespace = storage.namespace(&policy)?;
-    let NamespaceResult::Entries(entries) = namespace
-        .execute(NamespaceRequest::List(StoragePath::root()))
-        .await?
-    else {
-        return Err("real CIFS root did not return entries".into());
-    };
+    let (entries, _) = listed(namespace.as_ref(), &StoragePath::root()).await?;
     if let Some(file) = entries.iter().find(|entry| entry.kind == EntryKind::File) {
         let source = storage.read_source(&policy)?;
         let described = source.describe(&file.path).await?;

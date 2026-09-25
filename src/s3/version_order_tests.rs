@@ -28,6 +28,7 @@ use crate::s3::S3Storage;
 use crate::s3::tests::make_test_storage;
 use crate::s3::version_listing::{VersionOrDeleteMarker, VersionPages, oldest_first_by_key};
 use crate::storage::backends::s3::{S3Protocol, connect, tests::identity};
+use crate::storage::listing::testing::listed_versions;
 use crate::storage::{PreflightPolicy, SourceDescriptor};
 
 const FULL: &str = include_str!(concat!(
@@ -129,8 +130,7 @@ fn listed_ids(entries: &[SourceDescriptor]) -> Vec<String> {
 async fn list_all(storage: S3Storage) -> TestResult<Vec<SourceDescriptor>> {
     let roles = connect(Arc::new(storage), identity(), None)?;
     let namespace = roles.namespace(&PreflightPolicy::production())?;
-    let listing = namespace.list_versions(&StoragePath::root()).await?;
-    let (entries, failures) = listing.into_listing().ok_or("not a listing")?;
+    let (entries, failures) = listed_versions(&*namespace, &StoragePath::root()).await?;
     assert!(failures.is_empty(), "{failures:?}");
     Ok(entries)
 }

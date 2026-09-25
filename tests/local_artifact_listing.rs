@@ -10,8 +10,8 @@ use data_mover::filter::parse_filter_expression;
 use data_mover::model::{FailureClass, ObservationPlan, StoragePath};
 use data_mover::ndx_walk::{NdxWalkRequest, ndx_walk};
 use data_mover::storage::{
-    BackendConfig, DeleteTreeRequest, LocalBackendConfig, NamespaceRequest, PreflightPolicy,
-    Storage, StorageRoleFailure, connect_backend, delete_tree,
+    BackendConfig, DeleteTreeRequest, LocalBackendConfig, PreflightPolicy, Storage,
+    StorageRoleFailure, connect_backend, delete_tree,
 };
 use data_mover::storage_enum::{StorageEnum, create_storage};
 use data_mover::traversal::{
@@ -235,9 +235,7 @@ async fn deleting_a_directory_with_a_visible_entry_touches_no_artifact() -> Test
     let namespace = roles(root.path())
         .await?
         .namespace(&PreflightPolicy::production())?;
-    let refused = namespace
-        .execute(NamespaceRequest::Delete(StoragePath::new("sub")?))
-        .await;
+    let refused = namespace.delete(&StoragePath::new("sub")?).await;
     assert!(
         matches!(&refused, Err(StorageRoleFailure::Entry(failure)) if failure.class() == FailureClass::Conflict),
         "{refused:?}"
@@ -260,7 +258,7 @@ async fn sweeping_a_symlinked_artifact_removes_the_link_not_its_target() -> Test
     roles(root.path())
         .await?
         .namespace(&PreflightPolicy::production())?
-        .execute(NamespaceRequest::Delete(StoragePath::new("gone")?))
+        .delete(&StoragePath::new("gone")?)
         .await?;
     assert!(!root.path().join("gone").exists());
     assert!(outside.path().join("precious").exists());

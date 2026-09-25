@@ -43,16 +43,10 @@ impl LatencyNamespace {
     }
 }
 
-#[async_trait]
-impl Namespace for LatencyNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
+impl LatencyNamespace {
+    /// Answers one listing after its delay, counting it in flight meanwhile.
+    async fn children(&self, directory: &StoragePath) -> Vec<SourceDescriptor> {
         use std::sync::atomic::Ordering::SeqCst;
-        let NamespaceRequest::List(directory) = request else {
-            unreachable!("only List is issued")
-        };
         let now = self.inflight.fetch_add(1, SeqCst) + 1;
         self.peak.fetch_max(now, SeqCst);
         if let Some(gate) = &self.gate
@@ -66,8 +60,7 @@ impl Namespace for LatencyNamespace {
         .await;
         self.inflight.fetch_sub(1, SeqCst);
         self.finished.fetch_add(1, SeqCst);
-        let children = self
-            .tree
+        self.tree
             .get(directory.as_str())
             .map(|children| {
                 children
@@ -75,8 +68,23 @@ impl Namespace for LatencyNamespace {
                     .map(|(name, kind)| descriptor(name, *kind))
                     .collect()
             })
-            .unwrap_or_default();
-        Ok(NamespaceResult::Entries(children))
+            .unwrap_or_default()
+    }
+}
+
+/// The namespace role over a shared [`LatencyNamespace`], so each listing's producer can own the
+/// tree while the test keeps reading its counters.
+struct SharedLatency(Arc<LatencyNamespace>);
+
+#[async_trait]
+impl Namespace for SharedLatency {
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let tree = Arc::clone(&self.0);
+        ListingStream::from_producer(request.path.clone(), move |sink| async move {
+            let children = tree.children(&request.path).await;
+            let page = ListingPage::from_descriptors(&request.path, children, Vec::new(), 0);
+            sink.deliver(Ok(page), &request).await;
+        })
     }
 }
 
@@ -167,8 +175,10 @@ async fn dfs_order_does_not_depend_on_the_order_listings_finish_in() {
                 value % 100
             }
         });
-        let source =
-            StorageTraversalSource::with_roles(Arc::new(namespace), Arc::new(FakeMetadata));
+        let source = StorageTraversalSource::with_roles(
+            Arc::new(SharedLatency(Arc::new(namespace))),
+            Arc::new(FakeMetadata),
+        );
         let (paths, _) = collect(source.traverse(latency_request(8))).await;
         assert_eq!(paths, expected, "reversed = {reversed}");
     }
@@ -183,7 +193,7 @@ async fn concurrent_listings_stay_within_the_listing_budget() {
         let tree = vec![(String::new(), children)];
         let namespace = Arc::new(latency_namespace(&tree, |_| 10));
         let source = StorageTraversalSource::with_roles(
-            Arc::clone(&namespace) as Arc<dyn Namespace>,
+            Arc::new(SharedLatency(Arc::clone(&namespace))) as Arc<dyn Namespace>,
             Arc::new(FakeMetadata),
         );
         let (paths, _) = collect(source.traverse(latency_request(inflight))).await;
@@ -216,7 +226,7 @@ async fn sibling_chains_are_listed_in_parallel_while_the_cursor_is_deep() {
     }
     let namespace = Arc::new(latency_namespace(&tree, |_| 10));
     let source = StorageTraversalSource::with_roles(
-        Arc::clone(&namespace) as Arc<dyn Namespace>,
+        Arc::new(SharedLatency(Arc::clone(&namespace))) as Arc<dyn Namespace>,
         Arc::new(FakeMetadata),
     );
     let (paths, _) = collect(source.traverse(latency_request(8))).await;
@@ -239,7 +249,7 @@ async fn cancellation_lets_inflight_listings_finish() {
     let mut request = latency_request(4);
     request.cancel = cancel.clone();
     let source = StorageTraversalSource::with_roles(
-        Arc::clone(&namespace) as Arc<dyn Namespace>,
+        Arc::new(SharedLatency(Arc::clone(&namespace))) as Arc<dyn Namespace>,
         Arc::new(FakeMetadata),
     );
     let mut session = source.traverse(request);
@@ -297,7 +307,7 @@ async fn timed(
 ) -> (Vec<String>, usize, std::time::Duration) {
     let namespace = Arc::new(latency_namespace(tree, |_| 10));
     let source = StorageTraversalSource::with_roles(
-        Arc::clone(&namespace) as Arc<dyn Namespace>,
+        Arc::new(SharedLatency(Arc::clone(&namespace))) as Arc<dyn Namespace>,
         Arc::new(FakeMetadata),
     );
     let started = tokio::time::Instant::now();

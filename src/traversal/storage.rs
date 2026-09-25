@@ -132,7 +132,7 @@ impl StorageTraversalSource {
     /// Whether this source can list every stored version ([`TraversalVersions::All`]).
     #[must_use]
     pub fn supports_versions(&self) -> bool {
-        self.namespace.supports_versions()
+        self.namespace.capabilities().histories
     }
 }
 
@@ -383,6 +383,11 @@ async fn drive(
         while let Some(joined) = listings.try_join_next() {
             let (path, arrival) = joined.map_err(|_| TraversalTerminalFailure::Internal)?;
             cursor.listed(&path, arrival)?;
+        }
+        // A listing ends `Cancelled` only once the token fired (the request carries it), so
+        // checking again here keeps such a listing from being admitted as a failure (R10).
+        if runtime.request.cancel.is_cancelled() {
+            return Ok(());
         }
         let step = cursor.advance(runtime, observations, state)?;
         cursor.start_listings(runtime, listings);

@@ -4,7 +4,9 @@ use async_trait::async_trait;
 
 use super::*;
 use crate::model::{BackendIdentity, BackendKind, IdentityStrength, SourceIdentity};
-use crate::storage::SourceDescriptor;
+use crate::storage::listing::cancelled;
+use crate::storage::listing::testing::answer;
+use crate::storage::{ListingStream, SourceDescriptor};
 
 /// In-memory namespace: a flat map of path → kind with recorded deletes.
 struct MemoryTree {
@@ -17,6 +19,8 @@ struct MemoryTree {
     list_failure: Option<String>,
     /// Directory whose listing also reports one child the backend could not describe.
     partial_listing: Option<String>,
+    /// Directory whose listing ends cancelled, as a backend does once the request's token fires.
+    cancelled_listing: Option<String>,
     block_deletes: Option<CancellationToken>,
 }
 
@@ -34,6 +38,7 @@ impl MemoryTree {
             vanished: Vec::new(),
             list_failure: None,
             partial_listing: None,
+            cancelled_listing: None,
             block_deletes: None,
         }
     }
@@ -76,79 +81,77 @@ fn failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure {
 
 #[async_trait]
 impl Namespace for MemoryTree {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        match request {
-            NamespaceRequest::List(directory) => {
-                if self.list_failure.as_deref() == Some(directory.as_str()) {
-                    return Err(failure(&directory, FailureClass::PermissionDenied));
-                }
-                let prefix = if directory.as_str().is_empty() {
-                    String::new()
-                } else {
-                    format!("{}/", directory.as_str())
-                };
-                let entries = self
-                    .entries
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .iter()
-                    .filter(|(path, _)| {
-                        path.starts_with(&prefix)
-                            && !path[prefix.len()..].contains('/')
-                            && path.len() > prefix.len()
-                    })
-                    .map(|(path, kind)| Self::descriptor(path, *kind))
-                    .collect();
-                if self.partial_listing.as_deref() == Some(directory.as_str()) {
-                    let unnamed = StoragePath::new("@undescribable")
-                        .unwrap_or_else(|error| panic!("{error}"));
-                    return Ok(NamespaceResult::Listing {
-                        entries,
-                        failures: vec![entry_failure(
-                            &unnamed,
-                            Operation::Traverse,
-                            FailureClass::Unsupported,
-                        )],
-                    });
-                }
-                Ok(NamespaceResult::Entries(entries))
-            }
-            NamespaceRequest::Delete(path) => {
-                if let Some(token) = &self.block_deletes {
-                    token.cancelled().await;
-                }
-                self.deletes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(path.as_str().to_owned());
-                if let Some(class) = self.failing.get(path.as_str()) {
-                    return Err(failure(&path, *class));
-                }
-                let mut entries = self
-                    .entries
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if self.vanished.iter().any(|value| value == path.as_str()) {
-                    // Removed by someone else between listing and delete.
-                    entries.remove(path.as_str());
-                    return Err(failure(&path, FailureClass::NotFound));
-                }
-                let has_children = entries
-                    .keys()
-                    .any(|value| value.starts_with(&format!("{}/", path.as_str())));
-                if has_children {
-                    return Err(failure(&path, FailureClass::Conflict));
-                }
-                if entries.remove(path.as_str()).is_none() {
-                    return Err(failure(&path, FailureClass::NotFound));
-                }
-                Ok(NamespaceResult::Completed)
-            }
-            _ => Err(failure(&StoragePath::root(), FailureClass::Unsupported)),
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let directory = request.path;
+        if self.list_failure.as_deref() == Some(directory.as_str()) {
+            return answer(
+                &directory,
+                Err(failure(&directory, FailureClass::PermissionDenied)),
+            );
         }
+        if self.cancelled_listing.as_deref() == Some(directory.as_str()) {
+            return answer(&directory, Err(cancelled(&directory)));
+        }
+        let prefix = if directory.as_str().is_empty() {
+            String::new()
+        } else {
+            format!("{}/", directory.as_str())
+        };
+        let children = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(path, _)| {
+                path.starts_with(&prefix)
+                    && !path[prefix.len()..].contains('/')
+                    && path.len() > prefix.len()
+            })
+            .map(|(path, kind)| Self::descriptor(path, *kind))
+            .collect();
+        let mut failures = Vec::new();
+        if self.partial_listing.as_deref() == Some(directory.as_str()) {
+            let unnamed =
+                StoragePath::new("@undescribable").unwrap_or_else(|error| panic!("{error}"));
+            failures.push(entry_failure(
+                &unnamed,
+                Operation::Traverse,
+                FailureClass::Unsupported,
+            ));
+        }
+        answer(&directory, Ok((children, failures)))
+    }
+
+    async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+        if let Some(token) = &self.block_deletes {
+            token.cancelled().await;
+        }
+        self.deletes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(path.as_str().to_owned());
+        if let Some(class) = self.failing.get(path.as_str()) {
+            return Err(failure(path, *class));
+        }
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.vanished.iter().any(|value| value == path.as_str()) {
+            // Removed by someone else between listing and delete.
+            entries.remove(path.as_str());
+            return Err(failure(path, FailureClass::NotFound));
+        }
+        let has_children = entries
+            .keys()
+            .any(|value| value.starts_with(&format!("{}/", path.as_str())));
+        if has_children {
+            return Err(failure(path, FailureClass::Conflict));
+        }
+        if entries.remove(path.as_str()).is_none() {
+            return Err(failure(path, FailureClass::NotFound));
+        }
+        Ok(())
     }
 }
 
@@ -379,6 +382,31 @@ async fn cancellation_awaits_inflight_deletes_and_reports_cancelled() {
         namespace.remaining().contains(&"top".to_owned()),
         "no directory deletion after cancel"
     );
+}
+
+/// A listing that ends `Cancelled` is a signal, not a failure (R10): the run stops and reports
+/// `Cancelled`, without an entry failure and without deleting the directories above it.
+#[tokio::test]
+async fn a_cancelled_listing_stops_the_run_without_a_failure() {
+    let mut namespace = tree();
+    namespace.cancelled_listing = Some("top/sub".to_owned());
+    let namespace = Arc::new(namespace);
+    let (items, outcome) = collect(delete_tree_with_namespace(
+        Arc::clone(&namespace) as Arc<dyn Namespace>,
+        request("top", true),
+    ))
+    .await;
+    assert_eq!(outcome, Ok(DeleteTreeOutcome::Cancelled));
+    assert!(
+        !items
+            .iter()
+            .any(|item| matches!(item, DeleteTreeItem::EntryFailure(_))),
+        "{items:?}"
+    );
+    let remaining = namespace.remaining();
+    for kept in ["top", "top/sub", "top/sub/b.bin"] {
+        assert!(remaining.contains(&kept.to_owned()), "{kept} was deleted");
+    }
 }
 
 #[tokio::test]

@@ -2,10 +2,13 @@ use std::sync::Arc;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
+use tokio_util::sync::CancellationToken;
 
 use super::*;
 use crate::storage::backends::local::observation::LocalObservationAdapter;
 use crate::storage::backends::local::test_identity;
+use crate::storage::listing::testing::{Perform as _, Verb, listed};
+use crate::storage::{CollectLimits, collect_listing};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -26,19 +29,17 @@ fn path(value: &str) -> StoragePath {
 }
 
 async fn list(namespace: &LocalNamespace, directory: &str) -> Vec<SourceDescriptor> {
-    let result = namespace
-        .execute(NamespaceRequest::List(path(directory)))
+    let (mut entries, failures) = listed(namespace, &path(directory))
         .await
         .unwrap_or_else(|error| panic!("{error:?}"));
-    let Some((mut entries, failures)) = result.into_listing() else {
-        panic!("List did not return a listing")
-    };
     assert!(failures.is_empty(), "{failures:?}");
     entries.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
     entries
 }
 
-fn failure_class(result: std::result::Result<NamespaceResult, StorageRoleFailure>) -> FailureClass {
+fn failure_class<T: std::fmt::Debug>(
+    result: std::result::Result<T, StorageRoleFailure>,
+) -> FailureClass {
     match result {
         Err(StorageRoleFailure::Entry(error)) => error.class(),
         other => panic!("expected an entry failure, got {other:?}"),
@@ -112,11 +113,45 @@ async fn transfer_artifacts_are_neither_listed_nor_addressable() -> Result {
     assert_eq!(
         failure_class(
             namespace
-                .execute(NamespaceRequest::Delete(path(".data-mover-owned.stage")))
+                .perform(Verb::Delete(path(".data-mover-owned.stage")))
                 .await
         ),
         FailureClass::InvalidInput
     );
+    Ok(())
+}
+
+/// Hidden artifacts are counted on the page, never listed.
+#[tokio::test]
+async fn a_listing_page_counts_the_artifacts_it_hides() -> Result {
+    let temp = tempfile::tempdir()?;
+    std::fs::write(temp.path().join(".data-mover-a.stage"), b"internal")?;
+    std::fs::create_dir(temp.path().join(".data-mover-b.part"))?;
+    std::fs::write(temp.path().join("visible"), b"x")?;
+    let (namespace, _) = roles(temp.path())?;
+    let request = ListRequest::new(StoragePath::root(), CancellationToken::new());
+    let page = collect_listing(namespace.list(request), CollectLimits::UNBOUNDED)
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    assert_eq!(page.internal_hidden, 2);
+    assert_eq!(page.children.len(), 1);
+    assert_eq!(page.children[0].name(), "visible");
+    Ok(())
+}
+
+/// Children are spelled as the requested directory and their name, the listing contract,
+/// however the request spelled the directory: `./dir` lists `./dir/child`, not `dir/child`.
+#[tokio::test]
+async fn children_keep_the_requested_spelling_of_their_directory() -> Result {
+    let temp = tempfile::tempdir()?;
+    std::fs::create_dir(temp.path().join("dir"))?;
+    std::fs::write(temp.path().join("dir/child"), b"x")?;
+    let (namespace, _) = roles(temp.path())?;
+    for (directory, expected) in [("./dir", "./dir/child"), ("dir", "dir/child")] {
+        let listed = list(&namespace, directory).await;
+        let paths: Vec<&str> = listed.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(paths, [expected]);
+    }
     Ok(())
 }
 
@@ -125,23 +160,20 @@ async fn paths_are_confined_and_the_root_cannot_be_mutated() -> Result {
     let temp = tempfile::tempdir()?;
     let (namespace, _) = roles(temp.path())?;
     for request in [
-        NamespaceRequest::List(path("../escape")),
-        NamespaceRequest::Stat(path("a/../../escape")),
-        NamespaceRequest::Delete(StoragePath::root()),
-        NamespaceRequest::CreateDirectory(StoragePath::root()),
+        Verb::List(path("../escape")),
+        Verb::Stat(path("a/../../escape")),
+        Verb::Delete(StoragePath::root()),
+        Verb::CreateDirectory(StoragePath::root()),
         // Only `.` components name the root too.
-        NamespaceRequest::Delete(path(".")),
-        NamespaceRequest::Delete(path("./.")),
+        Verb::Delete(path(".")),
+        Verb::Delete(path("./.")),
     ] {
         assert_eq!(
-            failure_class(namespace.execute(request).await),
+            failure_class(namespace.perform(request).await),
             FailureClass::InvalidInput
         );
     }
-    match namespace
-        .execute(NamespaceRequest::List(path("../escape")))
-        .await
-    {
+    match namespace.perform(Verb::List(path("../escape"))).await {
         Err(StorageRoleFailure::Entry(error)) => assert_eq!(error.operation(), Operation::Traverse),
         other => panic!("expected an entry failure, got {other:?}"),
     }
@@ -153,22 +185,18 @@ async fn create_directory_creates_one_level_and_conflicts_when_present() -> Resu
     let temp = tempfile::tempdir()?;
     let (namespace, _) = roles(temp.path())?;
     namespace
-        .execute(NamespaceRequest::CreateDirectory(path("made")))
+        .perform(Verb::CreateDirectory(path("made")))
         .await
         .map_err(|error| format!("{error:?}"))?;
     assert!(temp.path().join("made").is_dir());
     assert_eq!(
-        failure_class(
-            namespace
-                .execute(NamespaceRequest::CreateDirectory(path("made")))
-                .await
-        ),
+        failure_class(namespace.perform(Verb::CreateDirectory(path("made"))).await),
         FailureClass::Conflict
     );
     assert_eq!(
         failure_class(
             namespace
-                .execute(NamespaceRequest::CreateDirectory(path("missing/child")))
+                .perform(Verb::CreateDirectory(path("missing/child")))
                 .await
         ),
         FailureClass::NotFound
@@ -186,17 +214,13 @@ async fn delete_removes_files_and_empty_directories_but_never_recurses() -> Resu
     let (namespace, _) = roles(temp.path())?;
     for target in ["file", "empty"] {
         namespace
-            .execute(NamespaceRequest::Delete(path(target)))
+            .perform(Verb::Delete(path(target)))
             .await
             .map_err(|error| format!("{error:?}"))?;
         assert!(!temp.path().join(target).exists());
     }
     assert_eq!(
-        failure_class(
-            namespace
-                .execute(NamespaceRequest::Delete(path("full")))
-                .await
-        ),
+        failure_class(namespace.perform(Verb::Delete(path("full"))).await),
         FailureClass::Conflict
     );
     assert!(temp.path().join("full/keep").exists());
@@ -213,7 +237,7 @@ async fn rename_replaces_a_file_and_moves_a_directory() -> Result {
     std::fs::create_dir(temp.path().join("elsewhere"))?;
     let (namespace, _) = roles(temp.path())?;
     namespace
-        .execute(NamespaceRequest::Rename {
+        .perform(Verb::Rename {
             from: path("new"),
             to: path("old"),
         })
@@ -222,7 +246,7 @@ async fn rename_replaces_a_file_and_moves_a_directory() -> Result {
     assert_eq!(std::fs::read(temp.path().join("old"))?, b"new");
     assert!(!temp.path().join("new").exists());
     namespace
-        .execute(NamespaceRequest::Rename {
+        .perform(Verb::Rename {
             from: path("dir"),
             to: path("elsewhere/dir"),
         })
@@ -237,21 +261,13 @@ async fn stat_describes_one_entry_and_reports_missing_ones() -> Result {
     let temp = tempfile::tempdir()?;
     std::fs::write(temp.path().join("file"), b"abcd")?;
     let (namespace, _) = roles(temp.path())?;
-    let result = namespace
-        .execute(NamespaceRequest::Stat(path("file")))
+    let entry = namespace
+        .stat(&path("file"))
         .await
         .map_err(|error| format!("{error:?}"))?;
-    let NamespaceResult::Entries(entries) = result else {
-        panic!("Stat did not return entries")
-    };
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].size, Some(4));
+    assert_eq!(entry.size, Some(4));
     assert_eq!(
-        failure_class(
-            namespace
-                .execute(NamespaceRequest::Stat(path("absent")))
-                .await
-        ),
+        failure_class(namespace.perform(Verb::Stat(path("absent"))).await),
         FailureClass::NotFound
     );
     Ok(())
@@ -265,12 +281,12 @@ async fn the_list_probe_fails_exactly_the_chosen_call() -> Result {
     namespace.fail_list_call(2);
     assert!(
         namespace
-            .execute(NamespaceRequest::List(StoragePath::root()))
+            .perform(Verb::List(StoragePath::root()))
             .await
             .is_ok()
     );
     assert_eq!(
-        failure_class(namespace.execute(NamespaceRequest::List(path("dir"))).await),
+        failure_class(namespace.perform(Verb::List(path("dir"))).await),
         FailureClass::PermissionDenied
     );
     assert_eq!(namespace.failed_list_path(), Some(path("dir")));
@@ -284,15 +300,10 @@ async fn the_list_probe_fails_a_chosen_path_on_every_call() -> Result {
     std::fs::create_dir(temp.path().join("b"))?;
     let (namespace, _) = roles(temp.path())?;
     namespace.fail_list_path(path("a"));
-    assert!(
-        namespace
-            .execute(NamespaceRequest::List(path("b")))
-            .await
-            .is_ok()
-    );
+    assert!(namespace.perform(Verb::List(path("b"))).await.is_ok());
     for _ in 0..2 {
         assert_eq!(
-            failure_class(namespace.execute(NamespaceRequest::List(path("a"))).await),
+            failure_class(namespace.perform(Verb::List(path("a"))).await),
             FailureClass::PermissionDenied
         );
     }
@@ -319,16 +330,13 @@ mod unix {
             .find(|entry| entry.path.as_str() == "link")
             .ok_or("link was not listed")?;
         assert_eq!(link.kind, EntryKind::Symlink);
-        let result = namespace
-            .execute(NamespaceRequest::ReadLink(path("link")))
+        let target = namespace
+            .read_link(&path("link"))
             .await
             .map_err(|error| format!("{error:?}"))?;
-        let NamespaceResult::LinkTarget(target) = result else {
-            panic!("ReadLink did not return a target")
-        };
         assert_eq!(target.as_bytes(), b"target");
         namespace
-            .execute(NamespaceRequest::Delete(path("link")))
+            .perform(Verb::Delete(path("link")))
             .await
             .map_err(|error| format!("{error:?}"))?;
         assert!(temp.path().join("target/precious").exists());
@@ -347,22 +355,22 @@ mod unix {
         std::os::unix::fs::symlink("precious", temp.path().join("link"))?;
         let (namespace, _) = roles(temp.path())?;
         for request in [
-            NamespaceRequest::List(path("link")),
-            NamespaceRequest::Stat(path("link/victim")),
-            NamespaceRequest::Delete(path("link/victim")),
-            NamespaceRequest::Delete(path("link/inner")),
-            NamespaceRequest::CreateDirectory(path("link/new")),
-            NamespaceRequest::Rename {
+            Verb::List(path("link")),
+            Verb::Stat(path("link/victim")),
+            Verb::Delete(path("link/victim")),
+            Verb::Delete(path("link/inner")),
+            Verb::CreateDirectory(path("link/new")),
+            Verb::Rename {
                 from: path("link/victim"),
                 to: path("moved"),
             },
-            NamespaceRequest::Rename {
+            Verb::Rename {
                 from: path("precious/victim"),
                 to: path("link/moved"),
             },
         ] {
             let description = format!("{request:?}");
-            let outcome = namespace.execute(request).await;
+            let outcome = namespace.perform(request).await;
             assert!(
                 matches!(outcome, Err(StorageRoleFailure::Entry(_))),
                 "{description} was not refused: {outcome:?}"
@@ -384,11 +392,7 @@ mod unix {
         let (namespace, _) = roles(temp.path())?;
         for target in ["link", "file"] {
             assert_eq!(
-                failure_class(
-                    namespace
-                        .execute(NamespaceRequest::List(path(target)))
-                        .await
-                ),
+                failure_class(namespace.perform(Verb::List(path(target))).await),
                 FailureClass::InvalidInput,
                 "{target}"
             );
@@ -401,13 +405,10 @@ mod unix {
         let temp = tempfile::tempdir()?;
         std::os::unix::fs::symlink("/etc/hostname", temp.path().join("abs"))?;
         let (namespace, _) = roles(temp.path())?;
-        let result = namespace
-            .execute(NamespaceRequest::ReadLink(path("abs")))
+        let target = namespace
+            .read_link(&path("abs"))
             .await
             .map_err(|error| format!("{error:?}"))?;
-        let NamespaceResult::LinkTarget(target) = result else {
-            panic!("ReadLink did not return a target")
-        };
         assert_eq!(target.as_bytes(), b"/etc/hostname");
         Ok(())
     }
@@ -421,13 +422,9 @@ mod unix {
         )?;
         std::fs::write(temp.path().join("fine"), b"b")?;
         let (namespace, _) = roles(temp.path())?;
-        let result = namespace
-            .execute(NamespaceRequest::List(StoragePath::root()))
+        let (entries, failures) = listed(&namespace, &StoragePath::root())
             .await
             .map_err(|error| format!("{error:?}"))?;
-        let NamespaceResult::Listing { entries, failures } = result else {
-            panic!("expected a partial listing, got {result:?}")
-        };
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path.as_str(), "fine");
         assert_eq!(failures.len(), 1);

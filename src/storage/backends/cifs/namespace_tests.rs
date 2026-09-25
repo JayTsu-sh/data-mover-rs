@@ -8,7 +8,8 @@ use super::namespace::{CifsNamespace, CifsNamespaceProtocol};
 use super::protocol::{CifsRootError, RootProtocol, ensure_root, identity_bytes, root_prefixes};
 use super::source::CifsSourceFacts;
 use crate::model::{BackendIdentity, BackendKind, EntryKind, FailureClass, StoragePath};
-use crate::storage::{Namespace, NamespaceRequest, NamespaceResult, StorageRoleFailure};
+use crate::storage::listing::testing::{Perform as _, Verb, listed};
+use crate::storage::{Namespace, SourceDescriptor, StorageRoleFailure};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -104,8 +105,8 @@ fn class(failure: &StorageRoleFailure) -> FailureClass {
     }
 }
 
-fn failure_class(
-    outcome: std::result::Result<NamespaceResult, StorageRoleFailure>,
+fn failure_class<T: std::fmt::Debug>(
+    outcome: std::result::Result<T, StorageRoleFailure>,
 ) -> Result<FailureClass> {
     match outcome {
         Err(failure) => Ok(class(&failure)),
@@ -116,13 +117,8 @@ fn failure_class(
 #[tokio::test]
 async fn stat_returns_one_descriptor_for_the_requested_path() -> Result {
     let protocol = RecordingProtocol::new(None);
-    let result = namespace(&protocol)?
-        .execute(NamespaceRequest::Stat(path("file.bin")?))
-        .await?;
-    let NamespaceResult::Entries(entries) = result else {
-        return Err("stat must return entries".into());
-    };
-    assert_eq!(entries.len(), 1);
+    let entry = namespace(&protocol)?.stat(&path("file.bin")?).await?;
+    let entries = [entry];
     assert_eq!(entries[0].path.as_str(), "file.bin");
     assert_eq!(entries[0].kind, EntryKind::File);
     assert_eq!(entries[0].size, Some(7));
@@ -135,18 +131,15 @@ async fn mutating_verbs_complete_and_forward_paths() -> Result {
     let protocol = RecordingProtocol::new(None);
     let namespace = namespace(&protocol)?;
     for request in [
-        NamespaceRequest::CreateDirectory(path("a/b")?),
-        NamespaceRequest::Rename {
+        Verb::CreateDirectory(path("a/b")?),
+        Verb::Rename {
             from: path("a/b/x.bin")?,
             to: path("a/b/y.bin")?,
         },
-        NamespaceRequest::Delete(path("a/b/y.bin")?),
-        NamespaceRequest::Delete(path("a/b")?),
+        Verb::Delete(path("a/b/y.bin")?),
+        Verb::Delete(path("a/b")?),
     ] {
-        assert_eq!(
-            namespace.execute(request).await?,
-            NamespaceResult::Completed
-        );
+        namespace.perform(request).await?;
     }
     assert_eq!(
         protocol.calls(),
@@ -164,7 +157,7 @@ async fn mutating_verbs_complete_and_forward_paths() -> Result {
 async fn read_link_is_a_typed_unsupported_refusal_without_protocol_calls() -> Result {
     let protocol = RecordingProtocol::new(None);
     let outcome = namespace(&protocol)?
-        .execute(NamespaceRequest::ReadLink(path("link")?))
+        .perform(Verb::ReadLink(path("link")?))
         .await;
     assert_eq!(failure_class(outcome)?, FailureClass::Unsupported);
     assert!(protocol.calls().is_empty());
@@ -175,11 +168,8 @@ async fn read_link_is_a_typed_unsupported_refusal_without_protocol_calls() -> Re
 async fn object_name_not_found_maps_to_not_found_for_stat_and_delete() -> Result {
     let protocol = RecordingProtocol::new(Some(STATUS_OBJECT_NAME_NOT_FOUND));
     let namespace = namespace(&protocol)?;
-    for request in [
-        NamespaceRequest::Stat(path("missing")?),
-        NamespaceRequest::Delete(path("missing")?),
-    ] {
-        let outcome = namespace.execute(request).await;
+    for request in [Verb::Stat(path("missing")?), Verb::Delete(path("missing")?)] {
+        let outcome = namespace.perform(request).await;
         assert_eq!(failure_class(outcome)?, FailureClass::NotFound);
     }
     Ok(())
@@ -189,7 +179,7 @@ async fn object_name_not_found_maps_to_not_found_for_stat_and_delete() -> Result
 async fn name_collision_on_create_directory_maps_to_conflict() -> Result {
     let protocol = RecordingProtocol::new(Some(STATUS_OBJECT_NAME_COLLISION));
     let outcome = namespace(&protocol)?
-        .execute(NamespaceRequest::CreateDirectory(path("exists")?))
+        .perform(Verb::CreateDirectory(path("exists")?))
         .await;
     assert_eq!(failure_class(outcome)?, FailureClass::Conflict);
     Ok(())
@@ -199,7 +189,7 @@ async fn name_collision_on_create_directory_maps_to_conflict() -> Result {
 async fn deleting_a_populated_directory_maps_to_conflict() -> Result {
     let protocol = RecordingProtocol::new(Some(STATUS_DIRECTORY_NOT_EMPTY));
     let outcome = namespace(&protocol)?
-        .execute(NamespaceRequest::Delete(path("populated")?))
+        .perform(Verb::Delete(path("populated")?))
         .await;
     assert_eq!(failure_class(outcome)?, FailureClass::Conflict);
     Ok(())
@@ -448,16 +438,9 @@ async fn listing_derives_mode_from_the_read_only_attribute_per_entry() -> Result
         protocol,
         BackendIdentity::new(BackendKind::Cifs, "cifs-readonly-test")?,
     );
-    let NamespaceResult::Entries(entries) = namespace
-        .execute(NamespaceRequest::List(path("dir")?))
-        .await?
-    else {
-        return Err("list must return entries".into());
-    };
-    let observed: Vec<Option<u32>> = entries
-        .iter()
-        .map(crate::storage::SourceDescriptor::inline_mode)
-        .collect();
+    let (entries, failures) = listed(&namespace, &path("dir")?).await?;
+    assert!(failures.is_empty(), "{failures:?}");
+    let observed: Vec<Option<u32>> = entries.iter().map(SourceDescriptor::inline_mode).collect();
     assert_eq!(
         observed,
         vec![Some(0o444), Some(0o644), Some(0o555), Some(0o755), None,],
@@ -467,8 +450,8 @@ async fn listing_derives_mode_from_the_read_only_attribute_per_entry() -> Result
 }
 
 /// A child that cannot be described is an entry failure at its own path; the listing itself
-/// succeeded, so its siblings are still delivered (a `Listing`, which traversal reports
-/// `Partial`), and a transfer artifact stays hidden either way.
+/// succeeded, so its siblings are still delivered (traversal reports the block `Partial`), and
+/// a transfer artifact stays hidden either way.
 #[tokio::test]
 async fn an_undescribable_child_fails_alone() -> Result {
     let protocol = Arc::new(ListingProtocol {
@@ -484,12 +467,7 @@ async fn an_undescribable_child_fails_alone() -> Result {
         protocol,
         BackendIdentity::new(BackendKind::Cifs, "cifs-undescribable-test")?,
     );
-    let NamespaceResult::Listing { entries, failures } = namespace
-        .execute(NamespaceRequest::List(path("dir")?))
-        .await?
-    else {
-        return Err("a listing with an undescribable child must be a partial listing".into());
-    };
+    let (entries, failures) = listed(&namespace, &path("dir")?).await?;
     let listed: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
     assert_eq!(listed, ["dir/before.bin", "dir/after.dir"]);
     assert_eq!(failures.len(), 1);
@@ -506,14 +484,9 @@ async fn an_undescribable_child_fails_alone() -> Result {
 #[tokio::test]
 async fn stat_never_claims_permission_bits() -> Result {
     let protocol = RecordingProtocol::new(None);
-    let NamespaceResult::Entries(entries) = namespace(&protocol)?
-        .execute(NamespaceRequest::Stat(path("file.bin")?))
-        .await?
-    else {
-        return Err("stat must return entries".into());
-    };
+    let entry = namespace(&protocol)?.stat(&path("file.bin")?).await?;
     assert_eq!(
-        entries[0].inline_mode(),
+        entry.inline_mode(),
         None,
         "a metadata open carries no attribute bits, so stat must not invent permission bits"
     );
@@ -663,28 +636,24 @@ async fn artifacts_are_hidden_from_listing_and_refused_by_every_verb() -> Result
         ("dir/.data-mover-staging", EntryKind::Directory),
     ]);
     let namespace = tree_namespace(&protocol)?;
-    let listed = namespace
-        .execute(NamespaceRequest::List(path("dir")?))
-        .await?;
-    let NamespaceResult::Entries(entries) = listed else {
-        return Err("list must return entries".into());
-    };
+    let (entries, failures) = listed(&namespace, &path("dir")?).await?;
+    assert!(failures.is_empty(), "{failures:?}");
     let names = entries
         .iter()
         .map(|entry| entry.path.as_str())
         .collect::<Vec<_>>();
     assert_eq!(names, vec!["dir/a.txt"]);
     for request in [
-        NamespaceRequest::Stat(path("dir/.data-mover-0123.stage")?),
-        NamespaceRequest::Delete(path("dir/.data-mover-0123.stage")?),
-        NamespaceRequest::List(path("dir/.data-mover-staging")?),
-        NamespaceRequest::Rename {
+        Verb::Stat(path("dir/.data-mover-0123.stage")?),
+        Verb::Delete(path("dir/.data-mover-0123.stage")?),
+        Verb::List(path("dir/.data-mover-staging")?),
+        Verb::Rename {
             from: path("dir/a.txt")?,
             to: path("dir/.data-mover-x.stage")?,
         },
     ] {
         assert_eq!(
-            failure_class(namespace.execute(request).await)?,
+            failure_class(namespace.perform(request).await)?,
             FailureClass::InvalidInput
         );
     }
@@ -707,15 +676,9 @@ async fn deleting_a_directory_sweeps_only_artifact_only_contents() -> Result {
         ("kept/.data-mover-0123.stage", EntryKind::File),
     ]);
     let namespace = tree_namespace(&protocol)?;
-    namespace
-        .execute(NamespaceRequest::Delete(path("gone")?))
-        .await?;
+    namespace.perform(Verb::Delete(path("gone")?)).await?;
     assert_eq!(
-        failure_class(
-            namespace
-                .execute(NamespaceRequest::Delete(path("kept")?))
-                .await
-        )?,
+        failure_class(namespace.perform(Verb::Delete(path("kept")?)).await)?,
         FailureClass::Conflict
     );
     assert_eq!(
@@ -739,7 +702,7 @@ async fn a_reparse_point_among_artifacts_stops_the_sweep() -> Result {
         ];
         let protocol = TreeProtocol::with(&entries, &[reparse], &[]);
         let outcome = tree_namespace(&protocol)?
-            .execute(NamespaceRequest::Delete(path("dir")?))
+            .perform(Verb::Delete(path("dir")?))
             .await;
         assert_eq!(failure_class(outcome)?, FailureClass::Conflict, "{reparse}");
         assert_eq!(
@@ -765,7 +728,7 @@ async fn an_artifact_vanishing_mid_sweep_is_not_an_error() -> Result {
         &["dir/.data-mover-0123.stage"],
     );
     tree_namespace(&protocol)?
-        .execute(NamespaceRequest::Delete(path("dir")?))
+        .perform(Verb::Delete(path("dir")?))
         .await?;
     assert!(protocol.paths().is_empty());
     Ok(())

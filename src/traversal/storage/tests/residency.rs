@@ -21,31 +21,24 @@ struct WideNamespace {
 
 #[async_trait]
 impl Namespace for WideNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        let NamespaceRequest::List(directory) = request else {
-            return Err(StorageRoleFailure::Entry(entry_failure(
-                &StoragePath::root(),
-                FailureClass::Unsupported,
-            )));
-        };
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let directory = request.path;
         if directory.as_str() != self.root {
             // Every child directory is empty, so descending into one costs a listing and holds
             // nothing: `descend_slots` stays the root's alone.
-            return Ok(NamespaceResult::Entries(Vec::new()));
+            return entries(&directory, Vec::new());
         }
         let kind = if self.subdirs {
             EntryKind::Directory
         } else {
             EntryKind::File
         };
-        Ok(NamespaceResult::Entries(
+        entries(
+            &directory,
             (0..self.fan_out)
                 .map(|index| descriptor(&format!("{}/child-{index:06}", self.root), kind))
                 .collect(),
-        ))
+        )
     }
 }
 
@@ -57,20 +50,12 @@ struct DeepNamespace {
 
 #[async_trait]
 impl Namespace for DeepNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        let NamespaceRequest::List(directory) = request else {
-            return Err(StorageRoleFailure::Entry(entry_failure(
-                &StoragePath::root(),
-                FailureClass::Unsupported,
-            )));
-        };
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let directory = request.path;
         let level =
             directory.as_str().matches('/').count() + usize::from(!directory.as_str().is_empty());
         if level >= self.depth {
-            return Ok(NamespaceResult::Entries(Vec::new()));
+            return entries(&directory, Vec::new());
         }
         let prefix = directory.as_str();
         let join = |name: &str| {
@@ -80,11 +65,11 @@ impl Namespace for DeepNamespace {
                 format!("{prefix}/{name}")
             }
         };
-        let mut entries: Vec<_> = (0..self.fan_out)
+        let mut children: Vec<_> = (0..self.fan_out)
             .map(|index| descriptor(&join(&format!("f{index}")), EntryKind::File))
             .collect();
-        entries.push(descriptor(&join("next"), EntryKind::Directory));
-        Ok(NamespaceResult::Entries(entries))
+        children.push(descriptor(&join("next"), EntryKind::Directory));
+        entries(&directory, children)
     }
 }
 
@@ -97,30 +82,25 @@ struct PrefetchedNamespace {
 
 #[async_trait]
 impl Namespace for PrefetchedNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        let NamespaceRequest::List(directory) = request else {
-            return Err(StorageRoleFailure::Entry(entry_failure(
-                &StoragePath::root(),
-                FailureClass::Unsupported,
-            )));
-        };
-        Ok(NamespaceResult::Entries(if directory.as_str().is_empty() {
-            (0..self.breadth)
-                .map(|index| descriptor(&format!("d{index:04}"), EntryKind::Directory))
-                .collect()
-        } else {
-            (0..self.leaves)
-                .map(|index| {
-                    descriptor(
-                        &format!("{}/leaf{index:04}", directory.as_str()),
-                        EntryKind::File,
-                    )
-                })
-                .collect()
-        }))
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let directory = request.path;
+        entries(
+            &directory,
+            if directory.as_str().is_empty() {
+                (0..self.breadth)
+                    .map(|index| descriptor(&format!("d{index:04}"), EntryKind::Directory))
+                    .collect()
+            } else {
+                (0..self.leaves)
+                    .map(|index| {
+                        descriptor(
+                            &format!("{}/leaf{index:04}", directory.as_str()),
+                            EntryKind::File,
+                        )
+                    })
+                    .collect()
+            },
+        )
     }
 }
 

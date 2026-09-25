@@ -86,7 +86,7 @@ StorageEnum 的步骤是：
 
 ### Namespace
 
-在 `NamespaceRequest` 中增加 `CreateSymlink { path, target }`，或增加语义等价的单个 namespace publication request。其语义固定为 Overwrite；Local implementation 隐藏直接创建与 `EEXIST` 后临时 sibling + rename 的选择。`ReadLink` 已存在。
+在 `Namespace` 中增加 `create_symlink(path, target)` 动词（P7 C1 起 namespace 是类型化动词；此前的写法是 `NamespaceRequest::CreateSymlink { path, target }`），或增加语义等价的单个 namespace publication request。其语义固定为 Overwrite；Local implementation 隐藏直接创建与 `EEXIST` 后临时 sibling + rename 的选择。`read_link` 已存在。
 
 Local transfer connection 需要提供 Namespace role；当前它明确声明 Namespace unsupported。
 

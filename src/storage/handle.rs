@@ -177,7 +177,7 @@ impl Storage {
     }
 
     /// Lends the namespace role for an operation that changes the namespace, refusing one whose
-    /// mutating verbs are all unsupported (S3: [`Namespace::mutations_unsupported`]) before any
+    /// mutating verbs are all unsupported (S3: [`super::NamespaceCapabilities::mutations`]) before any
     /// I/O, as if it lent no namespace at all.
     ///
     /// # Errors
@@ -187,12 +187,12 @@ impl Storage {
         policy: &PreflightPolicy,
     ) -> Result<Arc<dyn Namespace>, CapabilityUnavailable> {
         let namespace = self.namespace(policy)?;
-        match namespace.mutations_unsupported() {
-            Some(reason) => Err(CapabilityUnavailable::unsupported(
+        match namespace.capabilities().mutations {
+            Err(reason) => Err(CapabilityUnavailable::unsupported(
                 Capability::Namespace,
                 reason,
             )),
-            None => Ok(namespace),
+            Ok(()) => Ok(namespace),
         }
     }
 

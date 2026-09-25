@@ -26,19 +26,12 @@ struct PrebuiltNamespace {
 
 #[async_trait]
 impl Namespace for PrebuiltNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        let NamespaceRequest::List(directory) = request else {
-            return Err(StorageRoleFailure::Entry(entry_failure(
-                &StoragePath::root(),
-                FailureClass::Unsupported,
-            )));
-        };
-        Ok(NamespaceResult::Entries(
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let directory = request.path;
+        entries(
+            &directory,
             self.listings.get(&directory).cloned().unwrap_or_default(),
-        ))
+        )
     }
 }
 

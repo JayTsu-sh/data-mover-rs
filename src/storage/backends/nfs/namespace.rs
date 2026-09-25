@@ -10,11 +10,14 @@ use crate::model::{
     SymlinkTargetEncoding, Transience,
 };
 use crate::storage::artifacts::is_artifact_native;
+use crate::storage::listing::respelled;
 use crate::storage::{InlineOwnership, ListingFacts};
 use crate::storage::{
-    Namespace, NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure,
+    ListRequest, ListingPage, ListingStream, Namespace, NamespaceCapabilities, SourceDescriptor,
+    StorageRoleFailure,
 };
 
+#[derive(Clone)]
 pub(crate) struct NfsNamespaceAdapter {
     protocol: Arc<dyn NfsNamespaceProtocol>,
     identity: BackendIdentity,
@@ -101,10 +104,11 @@ impl NfsNamespaceAdapter {
         descriptor(&self.identity, path.clone(), &entry)
     }
 
-    /// Lists one directory. A child that cannot be described is reported on its own, beside the
-    /// siblings that could be: the directory itself was listed, so failing it whole would drop
-    /// them.
-    async fn list(&self, path: &StoragePath) -> Result<NamespaceResult, StorageRoleFailure> {
+    /// Lists one whole directory. A child that cannot be described is reported on its own,
+    /// beside the siblings that could be: the directory itself was listed, so failing it whole
+    /// would drop them. Children come back joined with `Path::join`, which folds a trailing `/`
+    /// of the request (`d/` gives `d/x`); each is spelled again as the request and its name.
+    async fn list_whole(&self, path: &StoragePath) -> Result<ListingPage, StorageRoleFailure> {
         checked_allow_root(path)?;
         let children = self
             .protocol
@@ -113,19 +117,24 @@ impl NfsNamespaceAdapter {
             .map_err(|error| role_failure(path, Operation::Namespace, error))?;
         let mut entries = Vec::with_capacity(children.len());
         let mut failures = Vec::new();
+        let mut hidden = 0_u32;
         for child in children {
             match child {
-                Ok(entry) if is_internal(&entry.path) => {}
-                Ok(entry) => match descriptor(&self.identity, entry.path.clone(), &entry) {
-                    Ok(descriptor) => entries.push(descriptor),
-                    Err(StorageRoleFailure::Entry(failure)) => failures.push(failure),
-                    Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
-                },
-                Err(child) if is_internal(&child.path) => {}
+                Ok(entry) if is_internal(&entry.path) => hidden = hidden.saturating_add(1),
+                Ok(entry) => {
+                    match descriptor(&self.identity, respelled(path, entry.path.clone()), &entry) {
+                        Ok(descriptor) => entries.push(descriptor),
+                        Err(StorageRoleFailure::Entry(failure)) => failures.push(failure),
+                        Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
+                    }
+                }
+                Err(child) if is_internal(&child.path) => hidden = hidden.saturating_add(1),
                 Err(child) => failures.push(undescribed(child)),
             }
         }
-        Ok(NamespaceResult::from_children(entries, failures))
+        Ok(ListingPage::from_descriptors(
+            path, entries, failures, hidden,
+        ))
     }
 }
 
@@ -149,52 +158,63 @@ fn undescribed(child: NfsUndescribedChild) -> EntryOperationFailure {
 
 #[async_trait]
 impl Namespace for NfsNamespaceAdapter {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        match request {
-            NamespaceRequest::Stat(path) => {
-                Ok(NamespaceResult::Entries(vec![self.describe(&path).await?]))
-            }
-            NamespaceRequest::List(path) => self.list(&path).await,
-            NamespaceRequest::ReadLink(path) => {
-                checked(&path)?;
-                let target = self
-                    .protocol
-                    .read_link(&path)
-                    .await
-                    .map_err(|error| role_failure(&path, Operation::Namespace, error))?;
-                let target = SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, target.to_vec())
-                    .map_err(|_| invalid(&path))?;
-                Ok(NamespaceResult::LinkTarget(target))
-            }
-            NamespaceRequest::CreateDirectory(path) => {
-                checked(&path)?;
-                self.protocol
-                    .create_directory(&path)
-                    .await
-                    .map_err(|error| role_failure(&path, Operation::Namespace, error))?;
-                Ok(NamespaceResult::Completed)
-            }
-            NamespaceRequest::Delete(path) => {
-                checked(&path)?;
-                let observed = self.describe(&path).await?;
-                self.protocol
-                    .delete(&path, observed.kind)
-                    .await
-                    .map_err(|error| role_failure(&path, Operation::Namespace, error))?;
-                Ok(NamespaceResult::Completed)
-            }
-            NamespaceRequest::Rename { from, to } => {
-                checked(&from)?;
-                checked(&to)?;
-                self.protocol
-                    .rename(&from, &to)
-                    .await
-                    .map_err(|error| role_failure(&from, Operation::Namespace, error))?;
-                Ok(NamespaceResult::Completed)
-            }
+    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+        self.describe(path).await
+    }
+
+    /// Reads the whole directory, then hands it over in pages (true paging comes with C7). The
+    /// listing runs to its end even when the stream is dropped: nothing is abandoned mid-RPC.
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let namespace = self.clone();
+        ListingStream::from_producer(request.path.clone(), move |sink| async move {
+            let listing = namespace.list_whole(&request.path).await;
+            sink.deliver(listing, &request).await;
+        })
+    }
+
+    async fn read_link(&self, path: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure> {
+        checked(path)?;
+        let target = self
+            .protocol
+            .read_link(path)
+            .await
+            .map_err(|error| role_failure(path, Operation::Namespace, error))?;
+        SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, target.to_vec())
+            .map_err(|_| invalid(path))
+    }
+
+    async fn create_directory(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+        checked(path)?;
+        self.protocol
+            .create_directory(path)
+            .await
+            .map_err(|error| role_failure(path, Operation::Namespace, error))
+    }
+
+    async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+        checked(path)?;
+        let observed = self.describe(path).await?;
+        self.protocol
+            .delete(path, observed.kind)
+            .await
+            .map_err(|error| role_failure(path, Operation::Namespace, error))
+    }
+
+    async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), StorageRoleFailure> {
+        checked(from)?;
+        checked(to)?;
+        self.protocol
+            .rename(from, to)
+            .await
+            .map_err(|error| role_failure(from, Operation::Namespace, error))
+    }
+
+    /// Name semantics stay unknown until `PATHCONF` (v3) or the `case_insensitive` attribute (v4)
+    /// is queried; unknown is treated as insensitive.
+    fn capabilities(&self) -> NamespaceCapabilities {
+        NamespaceCapabilities {
+            symlinks: true,
+            ..NamespaceCapabilities::BASIC
         }
     }
 }
@@ -264,7 +284,10 @@ fn invalid(path: &StoragePath) -> StorageRoleFailure {
 
 #[cfg(test)]
 mod tests {
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
+    use crate::storage::{CollectLimits, ListedChild, collect_listing};
 
     fn path(value: &str) -> StoragePath {
         StoragePath::new(value).unwrap_or_else(|error| panic!("{error}"))
@@ -334,6 +357,14 @@ mod tests {
         }
     }
 
+    async fn list(
+        namespace: &NfsNamespaceAdapter,
+        directory: &str,
+    ) -> Result<ListingPage, StorageRoleFailure> {
+        let request = ListRequest::new(path(directory), CancellationToken::new());
+        collect_listing(namespace.list(request), CollectLimits::UNBOUNDED).await
+    }
+
     fn adapter(listing: Listing) -> NfsNamespaceAdapter {
         let identity = BackendIdentity::new(crate::model::BackendKind::Nfs, "nfs-listing-test")
             .unwrap_or_else(|error| panic!("{error}"));
@@ -353,38 +384,52 @@ mod tests {
                 omitted("d/.data-mover-y.part"),
             ]
         })));
-        let result = namespace
-            .execute(NamespaceRequest::List(path("d")))
+        let page = list(&namespace, "d")
             .await
             .unwrap_or_else(|error| panic!("{error}"));
-        let NamespaceResult::Listing { entries, failures } = result else {
-            panic!("expected a partial listing, got {result:?}");
-        };
-        let listed: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
-        assert_eq!(listed, ["d/a", "d/c"]);
+        let listed: Vec<&str> = page.children.iter().map(ListedChild::name).collect();
+        assert_eq!(listed, ["a", "c"]);
+        assert_eq!(page.internal_hidden, 2);
+        let failures: Vec<_> = page.failures.iter().map(|f| &f.failure).collect();
         assert_eq!(failures.len(), 1);
+        assert_eq!(page.failures[0].name.as_deref(), Some("b"));
         assert_eq!(failures[0].path(), &path("d/b"));
         assert_eq!(failures[0].class(), FailureClass::Protocol);
         assert_eq!(failures[0].transience(), Transience::Unknown);
         assert!(failures[0].diagnostic().contains("omitted its attributes"));
     }
 
-    /// A listing whose every child is described is plain `Entries`; a directory that cannot be
+    /// A listing whose every child is described has no failures; a directory that cannot be
     /// listed still fails whole.
     #[tokio::test]
-    async fn a_whole_listing_is_entries_and_a_failed_directory_fails_whole() {
-        let complete = adapter(Listing(Some(|| vec![Ok(observed("d/a"))])))
-            .execute(NamespaceRequest::List(path("d")))
-            .await;
-        assert!(matches!(complete, Ok(NamespaceResult::Entries(ref e)) if e.len() == 1));
-        let refused = adapter(Listing(None))
-            .execute(NamespaceRequest::List(path("d")))
-            .await;
+    async fn a_whole_listing_has_no_failures_and_a_failed_directory_fails_whole() {
+        let complete = list(&adapter(Listing(Some(|| vec![Ok(observed("d/a"))]))), "d").await;
+        assert!(
+            matches!(complete, Ok(ref page) if page.children.len() == 1 && page.failures.is_empty())
+        );
+        let refused = list(&adapter(Listing(None)), "d").await;
         assert!(
             matches!(refused, Err(StorageRoleFailure::Entry(ref f))
                 if f.path() == &path("d") && f.class() == FailureClass::PermissionDenied),
             "{refused:?}"
         );
+    }
+
+    /// `Path::join` folds a trailing `/` of the request (`d/` lists `d/a`); the child is spelled
+    /// again as the request and its name, so it is listed, not refused as misspelled.
+    #[tokio::test]
+    async fn a_trailing_slash_request_keeps_its_spelling_in_the_children() {
+        let namespace = adapter(Listing(Some(|| vec![Ok(observed("d/a"))])));
+        let page = list(&namespace, "d/")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(page.failures.is_empty(), "{:?}", page.failures);
+        let (descriptors, _) = page.into_descriptors(&path("d/"));
+        let paths: Vec<&str> = descriptors
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(paths, ["d//a"]);
     }
 
     #[test]

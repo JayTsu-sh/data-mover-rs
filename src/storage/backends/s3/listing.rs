@@ -30,7 +30,7 @@ use crate::model::{
     TimestampMetadata, Transience,
 };
 use crate::storage::artifacts::is_artifact_path;
-use crate::storage::{ListingFacts, NamespaceResult, SourceDescriptor, StorageRoleFailure};
+use crate::storage::{ListingFacts, ListingPage, SourceDescriptor, StorageRoleFailure};
 
 /// Identity bytes of a delete marker that names no real version (a suspended bucket's `"null"`).
 const NULL_MARKER_IDENTITY: &[u8] = b"\0s3-null-delete-marker";
@@ -58,7 +58,7 @@ pub(super) async fn list_current<P: S3Protocol + ?Sized>(
     identity: &BackendIdentity,
     directory: &StoragePath,
     limits: ListingLimits,
-) -> Result<NamespaceResult, StorageRoleFailure> {
+) -> Result<ListingPage, StorageRoleFailure> {
     let prefix = directory_prefix(directory)?;
     let mut paging = Paging::new(limits);
     let mut token: Option<String> = None;
@@ -95,7 +95,7 @@ pub(super) async fn list_all<P: S3Protocol + ?Sized>(
     identity: &BackendIdentity,
     directory: &StoragePath,
     limits: ListingLimits,
-) -> Result<NamespaceResult, StorageRoleFailure> {
+) -> Result<ListingPage, StorageRoleFailure> {
     let prefix = directory_prefix(directory)?;
     let mut paging = Paging::new(limits);
     let mut marker: Option<S3VersionMarker> = None;
@@ -247,6 +247,8 @@ struct Block<'a> {
     prefix: &'a str,
     entries: Vec<SourceDescriptor>,
     failures: Vec<EntryOperationFailure>,
+    /// Transfer artifacts hidden: one per key or prefix, whatever its versions.
+    hidden: u32,
 }
 
 impl<'a> Block<'a> {
@@ -261,6 +263,7 @@ impl<'a> Block<'a> {
             prefix,
             entries: Vec::new(),
             failures: Vec::new(),
+            hidden: 0,
         }
     }
 
@@ -289,26 +292,20 @@ impl<'a> Block<'a> {
         }
     }
 
-    fn finish(self) -> NamespaceResult {
-        if self.failures.is_empty() {
-            NamespaceResult::Entries(self.entries)
-        } else {
-            NamespaceResult::Listing {
-                entries: self.entries,
-                failures: self.failures,
-            }
-        }
+    fn finish(self) -> ListingPage {
+        ListingPage::from_descriptors(self.directory, self.entries, self.failures, self.hidden)
     }
 
     /// Whether the child `key` named `name` is listed: `Ok(None)` for a transfer artifact, a
     /// failure (reported at `key`) for a name no path of this tree can spell.
     fn child_path(
-        &self,
+        &mut self,
         key: &str,
         name: &str,
     ) -> Result<Option<StoragePath>, EntryOperationFailure> {
         let path = self.path_of(key)?;
         if is_artifact_path(path.as_str()) {
+            self.hidden = self.hidden.saturating_add(1);
             return Ok(None);
         }
         if unspellable(name) {
@@ -335,6 +332,7 @@ impl<'a> Block<'a> {
             ));
         };
         if is_artifact_path(spelled) {
+            self.hidden = self.hidden.saturating_add(1);
             return Ok(());
         }
         if name.contains('/') {

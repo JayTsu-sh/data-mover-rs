@@ -8,8 +8,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use data_mover::model::{FailureClass, StoragePath};
 use data_mover::storage::{
-    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, NamespaceRequest,
-    PreflightPolicy, StorageRoleFailure, connect_backend,
+    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, PreflightPolicy,
+    StorageRoleFailure, connect_backend,
 };
 use futures::TryStreamExt as _;
 
@@ -326,10 +326,8 @@ async fn probe_symlink_named(share: &smb_domain::Share, target: &Endpoint, name:
     }))
     .await?;
     let namespace = storage.namespace(&PreflightPolicy::production())?;
-    let stat = namespace
-        .execute(NamespaceRequest::Stat(StoragePath::new(&name)?))
-        .await;
-    println!("[probe] symlink {name}: role Stat -> {}", describe(&stat));
+    let stat = namespace.stat(&StoragePath::new(&name)?).await;
+    println!("[probe] symlink {name}: role stat -> {}", describe(&stat));
     Ok(())
 }
 
@@ -358,23 +356,14 @@ async fn probe_namespace_role(target: &Endpoint) -> Result {
         "dm-cifs-probe-dir-{}",
         uuid::Uuid::new_v4().simple()
     ))?;
-    namespace
-        .execute(NamespaceRequest::CreateDirectory(dir.clone()))
-        .await?;
+    namespace.create_directory(&dir).await?;
     let moved = StoragePath::new(format!("{}-moved", dir.as_str()))?;
-    let rename = namespace
-        .execute(NamespaceRequest::Rename {
-            from: dir.clone(),
-            to: moved.clone(),
-        })
-        .await;
+    let rename = namespace.rename(&dir, &moved).await;
     println!("[probe] directory rename via role: {}", describe(&rename));
-    let _ = namespace.execute(NamespaceRequest::Delete(dir)).await;
-    let _ = namespace.execute(NamespaceRequest::Delete(moved)).await;
-    let link = namespace
-        .execute(NamespaceRequest::ReadLink(StoragePath::new(".")?))
-        .await;
-    println!("[probe] ReadLink via role: {}", describe(&link));
+    let _ = namespace.delete(&dir).await;
+    let _ = namespace.delete(&moved).await;
+    let link = namespace.read_link(&StoragePath::new(".")?).await;
+    println!("[probe] read_link via role: {}", describe(&link));
     Ok(())
 }
 

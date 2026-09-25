@@ -24,16 +24,8 @@ impl TreeNamespace {
 
 #[async_trait]
 impl Namespace for TreeNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        let NamespaceRequest::List(directory) = request else {
-            return Err(StorageRoleFailure::Entry(entry_failure(
-                &StoragePath::root(),
-                FailureClass::Unsupported,
-            )));
-        };
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let directory = request.path;
         self.lists
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -56,7 +48,7 @@ impl Namespace for TreeNamespace {
             "drop/y" => vec![descriptor("drop/y/z", EntryKind::File)],
             _ => Vec::new(),
         };
-        Ok(NamespaceResult::Entries(entries))
+        super::entries(&directory, entries)
     }
 }
 
@@ -285,29 +277,27 @@ async fn inline_timestamps_replace_the_metadata_round_trip() {
     struct InlineNamespace;
     #[async_trait]
     impl Namespace for InlineNamespace {
-        async fn execute(
-            &self,
-            request: NamespaceRequest,
-        ) -> Result<NamespaceResult, StorageRoleFailure> {
-            let NamespaceRequest::List(directory) = request else {
-                unreachable!("only List is issued")
-            };
+        fn list(&self, request: ListRequest) -> ListingStream {
+            let directory = request.path;
             if directory != StoragePath::root() {
-                return Ok(NamespaceResult::Entries(Vec::new()));
+                return entries(&directory, Vec::new());
             }
             let stamp = crate::model::StorageTimestamp::new(
                 42_000_000_000,
                 crate::model::TimePrecision::Seconds,
             )
             .unwrap_or_else(|error| panic!("{error}"));
-            Ok(NamespaceResult::Entries(vec![
-                descriptor("with", EntryKind::File).with_inline_timestamps(TimestampMetadata {
-                    accessed: None,
-                    modified: Some(stamp),
-                    created: None,
-                }),
-                descriptor("without", EntryKind::File),
-            ]))
+            entries(
+                &directory,
+                vec![
+                    descriptor("with", EntryKind::File).with_inline_timestamps(TimestampMetadata {
+                        accessed: None,
+                        modified: Some(stamp),
+                        created: None,
+                    }),
+                    descriptor("without", EntryKind::File),
+                ],
+            )
         }
     }
     let metadata = Arc::new(CountingMetadata::new());

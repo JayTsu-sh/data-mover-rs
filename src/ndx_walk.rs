@@ -1,10 +1,10 @@
 //! NDX-paged depth-first traversal driven by the [`Namespace`] role.
 //!
 //! Replaces the legacy per-backend `walkdir_2`: directories are listed through
-//! `NamespaceRequest::List` and handed to the shared DFS driver in [`crate::dir_tree`], which
-//! owns the prefetch window, the depth-first order and the NDX / gap numbering. Only the
-//! listing and the legacy-model conversion live here, so the adapter carries no
-//! protocol-specific code.
+//! [`Namespace::list`], collected whole, and handed to the shared DFS driver in
+//! [`crate::dir_tree`], which owns the prefetch window, the depth-first order and the NDX / gap
+//! numbering. Only the listing and the legacy-model conversion live here, so the adapter carries
+//! no protocol-specific code.
 //!
 //! It sits at the crate root, next to `filter_traversal`, rather than inside `storage`: it
 //! composes the `storage` roles with the filter DSL, `traversal::relative_to` and the legacy
@@ -57,8 +57,8 @@ use crate::model::{
     MetadataProvenance, ObservedEntry, StoragePath,
 };
 use crate::storage::{
-    Capability, CapabilityUnavailable, Namespace, NamespaceRequest, NamespaceResult,
-    PreflightPolicy, SourceDescriptor, Storage, StorageRoleFailure,
+    Capability, CapabilityUnavailable, CollectLimits, ListRequest, Namespace, PreflightPolicy,
+    SourceDescriptor, Storage, StorageRoleFailure, collect_listing,
 };
 use crate::traversal::relative_to;
 
@@ -208,10 +208,10 @@ async fn read_dir(
     cancel: &CancellationToken,
 ) -> crate::Result<ReadResult<ObservedEntry>> {
     let target = join_root(root, dir_path)?;
-    let listed = namespace.execute(NamespaceRequest::List(target)).await;
-    let (descriptors, failures) = match listed.map(NamespaceResult::into_listing) {
-        Ok(Some(listing)) => listing,
-        Ok(None) => return Err(StorageError::MismatchedType),
+    let request = ListRequest::new(target.clone(), cancel.clone());
+    let listed = collect_listing(namespace.list(request), CollectLimits::UNBOUNDED).await;
+    let (descriptors, failures) = match listed {
+        Ok(page) => page.into_descriptors(&target),
         Err(failure) => return listing_failure(dir_path, &failure, cancel),
     };
     let mut result = build_read_result(root, dir_path, &descriptors, ctx);

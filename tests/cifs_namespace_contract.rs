@@ -1,12 +1,16 @@
 //! Optional real SMB namespace-role contract, confined to unique entry names.
 mod common;
 
+use std::num::NonZeroUsize;
+
 use data_mover::model::{EntryKind, FailureClass, IdentityStrength, StoragePath};
 use data_mover::storage::{
-    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, Namespace,
-    NamespaceRequest, NamespaceResult, PreflightPolicy, Storage, StorageRoleFailure,
-    connect_backend,
+    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, CollectLimits,
+    ListRequest, ListedChild, ListingPage, Namespace, PreflightPolicy, SourceDescriptor, Storage,
+    StorageRoleFailure, collect_listing, connect_backend,
 };
+use futures::StreamExt as _;
+use tokio_util::sync::CancellationToken;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -44,20 +48,13 @@ async fn exercise(namespace: &dyn Namespace, share: &smb_domain::Share, dir: &st
     create_empty_file(share, &c).await?;
     exercise_rename(namespace, &b, &c).await?;
     exercise_refusals(namespace, dir).await?;
+    exercise_paging(namespace, share, dir).await?;
     exercise_delete(namespace, dir, &c).await
 }
 
 async fn exercise_directory(namespace: &dyn Namespace, dir: &str) -> Result {
-    completed(
-        namespace
-            .execute(NamespaceRequest::CreateDirectory(path(dir)?))
-            .await?,
-    )?;
-    let stat = single(
-        namespace
-            .execute(NamespaceRequest::Stat(path(dir)?))
-            .await?,
-    )?;
+    namespace.create_directory(&path(dir)?).await?;
+    let stat = namespace.stat(&path(dir)?).await?;
     assert_eq!(
         stat.kind,
         EntryKind::Directory,
@@ -65,21 +62,15 @@ async fn exercise_directory(namespace: &dyn Namespace, dir: &str) -> Result {
     );
     assert_eq!(stat.path.as_str(), dir);
     expect_class(
-        namespace
-            .execute(NamespaceRequest::CreateDirectory(path(dir)?))
-            .await,
+        namespace.create_directory(&path(dir)?).await,
         FailureClass::Conflict,
-        "second CreateDirectory on an existing directory",
+        "second create_directory on an existing directory",
     )
 }
 
 async fn exercise_listing(namespace: &dyn Namespace, dir: &str, file: &str) -> Result {
-    let listed = entries(
-        namespace
-            .execute(NamespaceRequest::List(path(dir)?))
-            .await?,
-    )?;
-    assert_eq!(listed.len(), 1, "List returns exactly the one fixture file");
+    let listed = entries(namespace, dir).await?;
+    assert_eq!(listed.len(), 1, "list returns exactly the one fixture file");
     assert_eq!(listed[0].path.as_str(), file);
     assert_eq!(listed[0].kind, EntryKind::File);
     assert_eq!(listed[0].size, Some(0));
@@ -88,22 +79,18 @@ async fn exercise_listing(namespace: &dyn Namespace, dir: &str, file: &str) -> R
         "the listing carries the timestamps its QUERY_DIRECTORY records already returned"
     );
     // A transfer validates a traversal observation against a fresh describe, so the identity a
-    // listing produces has to equal the identity Stat produces for the same unchanged entry.
-    let stat = single(
-        namespace
-            .execute(NamespaceRequest::Stat(path(file)?))
-            .await?,
-    )?;
+    // listing produces has to equal the identity stat produces for the same unchanged entry.
+    let stat = namespace.stat(&path(file)?).await?;
     assert_eq!(
         listed[0].source_identity.identity_key(),
         stat.source_identity.identity_key(),
-        "List and Stat must agree on identity for an unchanged entry"
+        "list and stat must agree on identity for an unchanged entry"
     );
     // The server must have answered with a file id on both paths — the wide directory class
-    // for List and the QFid create context for Stat — or rename detection silently degrades to
+    // for list and the QFid create context for stat — or rename detection silently degrades to
     // path joins. Print which one we got so a real-server run leaves evidence either way.
     println!(
-        "[identity] strength={:?} (List) / {:?} (Stat)",
+        "[identity] strength={:?} (list) / {:?} (stat)",
         listed[0].source_identity.strength(),
         stat.source_identity.strength()
     );
@@ -122,136 +109,127 @@ async fn exercise_listing(namespace: &dyn Namespace, dir: &str, file: &str) -> R
         IdentityStrength::StableWithinBackend,
         "session is not using file ids (see the connect-time identity-probe warning)"
     );
-    let directory = single(
-        namespace
-            .execute(NamespaceRequest::Stat(path(dir)?))
-            .await?,
-    )?;
+    let directory = namespace.stat(&path(dir)?).await?;
     assert_eq!(directory.kind, EntryKind::Directory);
     Ok(())
 }
 
 /// Rename moves `from` onto `to`, replacing an existing destination like the NFS and HDFS roles.
 async fn exercise_rename(namespace: &dyn Namespace, from: &str, to: &str) -> Result {
-    let before = single(
-        namespace
-            .execute(NamespaceRequest::Stat(path(from)?))
-            .await?,
-    )?;
-    completed(
-        namespace
-            .execute(NamespaceRequest::Rename {
-                from: path(from)?,
-                to: path(to)?,
-            })
-            .await?,
-    )?;
-    let after = single(namespace.execute(NamespaceRequest::Stat(path(to)?)).await?)?;
+    let before = namespace.stat(&path(from)?).await?;
+    namespace.rename(&path(from)?, &path(to)?).await?;
+    let after = namespace.stat(&path(to)?).await?;
     assert_eq!(
         before.source_identity.identity_key(),
         after.source_identity.identity_key(),
         "a rename must not change the identity — this is the property rename detection relies on"
     );
     expect_class(
-        namespace.execute(NamespaceRequest::Stat(path(from)?)).await,
+        namespace.stat(&path(from)?).await,
         FailureClass::NotFound,
-        "Stat of the renamed-away source",
+        "stat of the renamed-away source",
     )?;
-    assert_eq!(
-        single(namespace.execute(NamespaceRequest::Stat(path(to)?)).await?)?.kind,
-        EntryKind::File
-    );
+    assert_eq!(namespace.stat(&path(to)?).await?.kind, EntryKind::File);
     Ok(())
 }
 
 async fn exercise_refusals(namespace: &dyn Namespace, dir: &str) -> Result {
     let moved = format!("{dir}-moved");
-    completed(
-        namespace
-            .execute(NamespaceRequest::Rename {
-                from: path(dir)?,
-                to: path(&moved)?,
-            })
-            .await?,
-    )?;
+    namespace.rename(&path(dir)?, &path(&moved)?).await?;
     expect_class(
-        namespace.execute(NamespaceRequest::Stat(path(dir)?)).await,
+        namespace.stat(&path(dir)?).await,
         FailureClass::NotFound,
-        "Stat of the renamed-away directory",
+        "stat of the renamed-away directory",
     )?;
-    completed(
-        namespace
-            .execute(NamespaceRequest::Rename {
-                from: path(&moved)?,
-                to: path(dir)?,
-            })
-            .await?,
-    )?;
+    namespace.rename(&path(&moved)?, &path(dir)?).await?;
     assert_eq!(
-        single(
-            namespace
-                .execute(NamespaceRequest::Stat(path(dir)?))
-                .await?
-        )?
-        .kind,
+        namespace.stat(&path(dir)?).await?.kind,
         EntryKind::Directory,
         "directory renamed back keeps its kind"
     );
     expect_class(
-        namespace
-            .execute(NamespaceRequest::ReadLink(path(dir)?))
-            .await,
+        namespace.read_link(&path(dir)?).await,
         FailureClass::Unsupported,
-        "ReadLink",
+        "read_link",
+    )
+}
+
+/// A listing arrives in pages of at most the requested size, naming each child once; a listing
+/// dropped after its first page leaves nothing open that would keep the directory from being
+/// deleted.
+async fn exercise_paging(
+    namespace: &dyn Namespace,
+    share: &smb_domain::Share,
+    dir: &str,
+) -> Result {
+    let paged = format!("{dir}/paged");
+    namespace.create_directory(&path(&paged)?).await?;
+    let names: Vec<String> = (0..5).map(|index| format!("p{index}.bin")).collect();
+    for name in &names {
+        create_empty_file(share, &format!("{paged}/{name}")).await?;
+    }
+    let two = NonZeroUsize::new(2).ok_or("zero page size")?;
+    let request = ListRequest::new(path(&paged)?, CancellationToken::new()).with_page_hint(two);
+    let delivered: Vec<ListingPage> = namespace
+        .list(request)
+        .map(|page| page.map_err(|error| error.to_string()))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<std::result::Result<_, _>>()?;
+    let sizes: Vec<usize> = delivered.iter().map(|page| page.children.len()).collect();
+    assert_eq!(sizes, [2, 2, 1], "pages of at most the hint");
+    let mut listed: Vec<&str> = delivered
+        .iter()
+        .flat_map(|page| page.children.iter().map(ListedChild::name))
+        .collect();
+    listed.sort_unstable();
+    assert_eq!(listed, names);
+
+    let request = ListRequest::new(path(&paged)?, CancellationToken::new()).with_page_hint(two);
+    let mut stream = namespace.list(request);
+    let first = stream.next().await.ok_or("the listing ended at once")??;
+    assert_eq!(first.children.len(), 2);
+    drop(stream);
+    for name in &names {
+        namespace.delete(&path(&format!("{paged}/{name}"))?).await?;
+    }
+    namespace.delete(&path(&paged)?).await?;
+    expect_class(
+        namespace.stat(&path(&paged)?).await,
+        FailureClass::NotFound,
+        "stat of the deleted paged directory",
     )
 }
 
 async fn exercise_delete(namespace: &dyn Namespace, dir: &str, file: &str) -> Result {
-    completed(
-        namespace
-            .execute(NamespaceRequest::Delete(path(file)?))
-            .await?,
-    )?;
+    namespace.delete(&path(file)?).await?;
     expect_class(
-        namespace
-            .execute(NamespaceRequest::Delete(path(file)?))
-            .await,
+        namespace.delete(&path(file)?).await,
         FailureClass::NotFound,
-        "Delete of an already-deleted file",
+        "delete of an already-deleted file",
     )?;
-    completed(
-        namespace
-            .execute(NamespaceRequest::Delete(path(dir)?))
-            .await?,
-    )?;
+    namespace.delete(&path(dir)?).await?;
     expect_class(
-        namespace.execute(NamespaceRequest::Stat(path(dir)?)).await,
+        namespace.stat(&path(dir)?).await,
         FailureClass::NotFound,
-        "Stat of the deleted directory",
+        "stat of the deleted directory",
     )
 }
 
 async fn cleanup(namespace: &dyn Namespace, dir: &str) -> Result {
-    // A partial listing still names every child it could describe: delete those.
-    let Some((entries, _)) = namespace
-        .execute(NamespaceRequest::List(path(dir)?))
-        .await
-        .ok()
-        .and_then(NamespaceResult::into_listing)
-    else {
-        return Ok(());
-    };
-    for entry in entries {
-        let _ = namespace
-            .execute(NamespaceRequest::Delete(entry.path))
-            .await;
+    // A partial listing still names every child it could describe: delete those, one level of
+    // subdirectories included.
+    for sub in [format!("{dir}/paged"), dir.to_owned()] {
+        let Ok(children) = entries(namespace, &sub).await else {
+            continue;
+        };
+        for entry in children {
+            let _ = namespace.delete(&entry.path).await;
+        }
+        let _ = namespace.delete(&path(&sub)?).await;
     }
-    let _ = namespace
-        .execute(NamespaceRequest::Delete(path(dir)?))
-        .await;
-    let _ = namespace
-        .execute(NamespaceRequest::Delete(path(&format!("{dir}-moved"))?))
-        .await;
+    let _ = namespace.delete(&path(&format!("{dir}-moved"))?).await;
     Ok(())
 }
 
@@ -286,26 +264,17 @@ fn path(value: &str) -> Result<StoragePath> {
     Ok(StoragePath::new(value)?)
 }
 
-fn completed(result: NamespaceResult) -> Result {
-    match result {
-        NamespaceResult::Completed => Ok(()),
-        other => Err(format!("expected Completed, got {other:?}").into()),
-    }
-}
-
-fn entries(result: NamespaceResult) -> Result<Vec<data_mover::storage::SourceDescriptor>> {
-    match result {
-        NamespaceResult::Entries(entries) => Ok(entries),
-        other => Err(format!("expected Entries, got {other:?}").into()),
-    }
-}
-
-fn single(result: NamespaceResult) -> Result<data_mover::storage::SourceDescriptor> {
-    let mut entries = entries(result)?;
-    if entries.len() == 1 {
-        Ok(entries.remove(0))
+/// Every child of `dir` a whole listing describes, with full paths; a child it could not
+/// describe fails the call.
+async fn entries(namespace: &dyn Namespace, dir: &str) -> Result<Vec<SourceDescriptor>> {
+    let directory = path(dir)?;
+    let request = ListRequest::new(directory.clone(), CancellationToken::new());
+    let page = collect_listing(namespace.list(request), CollectLimits::UNBOUNDED).await?;
+    let (entries, failures) = page.into_descriptors(&directory);
+    if failures.is_empty() {
+        Ok(entries)
     } else {
-        Err(format!("expected one entry, got {}", entries.len()).into())
+        Err(format!("children could not be described: {failures:?}").into())
     }
 }
 
@@ -316,8 +285,8 @@ fn class(failure: &StorageRoleFailure) -> FailureClass {
     }
 }
 
-fn expect_class(
-    outcome: std::result::Result<NamespaceResult, StorageRoleFailure>,
+fn expect_class<T: std::fmt::Debug>(
+    outcome: std::result::Result<T, StorageRoleFailure>,
     expected: FailureClass,
     what: &str,
 ) -> Result {

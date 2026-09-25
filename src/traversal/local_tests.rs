@@ -17,11 +17,13 @@ use super::{
 #[cfg(unix)]
 use crate::model::ObservationMode;
 use crate::model::{EntryKind, FailureClass, ObservationPlan, Operation, StoragePath};
+#[cfg(unix)]
+use crate::storage::Metadata as MetadataRole;
 use crate::storage::backends::local::namespace::LocalNamespace;
 use crate::storage::backends::local::observation::LocalObservationAdapter;
 use crate::storage::backends::local::test_traversal_storage;
 #[cfg(unix)]
-use crate::storage::{Metadata as MetadataRole, Namespace as _, NamespaceRequest, NamespaceResult};
+use crate::storage::listing::testing::listed;
 
 struct Fixture {
     source: StorageTraversalSource,
@@ -463,15 +465,10 @@ async fn a_listed_child_is_observed_exactly_as_its_own_lstat_would() -> io::Resu
     std::fs::create_dir(root.path().join("dir"))?;
     std::os::unix::fs::symlink("file", root.path().join("link"))?;
     let fixture = fixture(root.path())?;
-    let listed = match fixture
-        .namespace
-        .execute(NamespaceRequest::List(StoragePath::root()))
+    let (listed, failures) = listed(fixture.namespace.as_ref(), &StoragePath::root())
         .await
-        .map_err(io::Error::other)?
-    {
-        NamespaceResult::Entries(entries) => entries,
-        other => return Err(io::Error::other(format!("unexpected listing {other:?}"))),
-    };
+        .map_err(io::Error::other)?;
+    assert!(failures.is_empty(), "unexpected failures {failures:?}");
     assert_eq!(listed.len(), 3);
     let mut answered = 0;
     for (descriptor, plan) in listed

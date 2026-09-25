@@ -103,10 +103,12 @@ deferred 决定随 `Settled::Child.descent` 走。两条路的 `max_depth` 与 f
 
 **覆盖面**：
 
-1. 五个 backend 都出借 `Namespace`。S3 只有 `Stat` / `List`（ADR-0006 C22，按 `<path>/` 前缀
-   delimiter 列举，另有 `Namespace::list_versions` 供 `TraversalVersions::All`），变更动词 `Unsupported`；
+1. 五个 backend 都出借 `Namespace`（P7 C1 起是类型化动词 `stat` / `list` / `read_link` /
+   `create_directory` / `delete` / `rename` / `capabilities`；`list(ListRequest) -> ListingStream` 是唯一
+   列举入口，页里带名字，`src/storage/listing.rs`）。S3 只有 `stat` / `list`（ADR-0006 C22，按 `<path>/` 前缀
+   delimiter 列举，另有 `Namespace::list_versions` 供 `TraversalVersions::All`，C11b 删），变更动词 `Unsupported`；
    `delete_tree` / `create_directory_all` 经 `Storage::mutable_namespace`（看
-   `Namespace::mutations_unsupported()`）、`ndx_walk` 按 kind 在任何 I/O 之前返回 `CapabilityUnavailable`。
+   `Namespace::capabilities().mutations`）、`ndx_walk` 按 kind 在任何 I/O 之前返回 `CapabilityUnavailable`。
    Local 的 namespace 在 `src/storage/backends/local/namespace.rs`，与观察角色共用同一个
    `cap_std::Dir` 沙箱；路径逐段用 `open_dir_nofollow` 解析，**任何一段**是 symlink 都拒绝，
    最后一段在父目录句柄里操作 (描述/删除的是链接本身)。
@@ -115,8 +117,8 @@ deferred 决定随 `Settled::Child.descent` 走。两条路的 `max_depth` 与 f
    CIFS (`QUERY_DIRECTORY`)、NFS (`readdirplus`)、HDFS (listing) 和 Local (unix 逐子项
    `fstatat`，Windows 直接取目录读回的属性) 都挂了，四个都可用。
 3. 列举里个别子项无法描述 (例如文件名拼不成 `StoragePath`、NFS READDIRPLUS 某项没带属性或
-   句柄、HDFS 某项 status 转换不了) 时，backend 返回 `NamespaceResult::Listing { entries, failures }`
-   (`NamespaceResult::from_children` 构造)，三个消费方用 `into_listing()` 统一处理：失败逐项上报，
+   句柄、HDFS 某项 status 转换不了) 时，backend 把它放进 `ListingPage::failures`（`ChildFailure`），
+   三个消费方经 `collect_listing` + `ListingPage::into_descriptors` 统一处理：失败逐项上报，
    兄弟条目照常。Local / CIFS / NFS / HDFS 都只让关乎目录本身的错误 (打不开、读目录失败) 整个失败；
    S3 的名字拼不出同样逐项报，但单个对象的 size / key 异常仍是会话失败 (待修)。分类见
    [error-taxonomy.md](error-taxonomy.md)「列举」。

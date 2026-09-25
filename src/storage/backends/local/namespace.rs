@@ -15,7 +15,6 @@
 //! verb addresses them. `Delete` of a directory that only artifacts keep non-empty — empty as
 //! seen through `List` — removes them with it.
 
-use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -42,11 +41,14 @@ use crate::model::{
 use crate::storage::InlineOwnership;
 use crate::storage::artifacts::is_artifact_name;
 use crate::storage::durability::sync_directory;
+use crate::storage::listing::child_path;
 use crate::storage::{
-    Namespace, NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure,
+    CaseSensitivity, ListRequest, ListingPage, ListingStream, NameNormalization, NameSemantics,
+    Namespace, NamespaceCapabilities, SourceDescriptor, StorageRoleFailure,
 };
 
 /// Namespace role for one Local root.
+#[derive(Clone)]
 pub(crate) struct LocalNamespace {
     root: Arc<Dir>,
     identity: BackendIdentity,
@@ -141,14 +143,18 @@ impl LocalNamespace {
             .map_err(|_| entry_failure(path, operation, FailureClass::Internal))?
     }
 
-    async fn list(&self, directory: StoragePath) -> Result<NamespaceResult, StorageRoleFailure> {
-        let native = checked(&directory, Operation::Traverse, true)?;
+    /// Reads one whole directory; [`Namespace::list`] hands it over page by page.
+    async fn list_whole(
+        &self,
+        directory: &StoragePath,
+        native: PathBuf,
+    ) -> Result<ListingPage, StorageRoleFailure> {
         #[cfg(test)]
-        if let Some(failure) = self.injected_list_failure(&directory) {
+        if let Some(failure) = self.injected_list_failure(directory) {
             return Err(failure);
         }
         let path = directory.clone();
-        self.blocking(&directory, Operation::Traverse, move |root, identity| {
+        self.blocking(directory, Operation::Traverse, move |root, identity| {
             let opened = open_directory(root, &native)
                 .map_err(|error| io_failure(&path, Operation::Traverse, &error))?;
             list_blocking(&opened, identity, &path, &native)
@@ -156,26 +162,28 @@ impl LocalNamespace {
         .await
     }
 
-    async fn stat(&self, path: StoragePath) -> Result<NamespaceResult, StorageRoleFailure> {
-        let native = checked(&path, Operation::Observe, true)?;
+    async fn stat_entry(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+        let native = checked(path, Operation::Observe, true)?;
         let target = path.clone();
-        self.blocking(&path, Operation::Observe, move |root, identity| {
+        self.blocking(path, Operation::Observe, move |root, identity| {
             let metadata = if native.as_os_str().is_empty() {
                 root.dir_metadata()
             } else {
                 in_parent(root, &native, |parent, leaf| parent.symlink_metadata(leaf))
             }
             .map_err(|error| io_failure(&target, Operation::Observe, &error))?;
-            let descriptor = describe(identity, target, &metadata, Operation::Observe)?;
-            Ok(NamespaceResult::Entries(vec![descriptor]))
+            describe(identity, target, &metadata, Operation::Observe)
         })
         .await
     }
 
-    async fn read_link(&self, path: StoragePath) -> Result<NamespaceResult, StorageRoleFailure> {
-        let native = checked(&path, Operation::Observe, false)?;
+    async fn read_link_entry(
+        &self,
+        path: &StoragePath,
+    ) -> Result<SymlinkTarget, StorageRoleFailure> {
+        let native = checked(path, Operation::Observe, false)?;
         let target = path.clone();
-        self.blocking(&path, Operation::Observe, move |root, _| {
+        self.blocking(path, Operation::Observe, move |root, _| {
             // `read_link_contents` returns the link text as stored; `read_link` would refuse
             // any absolute target as an escape, although nothing here resolves it.
             let link = in_parent(root, &native, |parent, leaf| {
@@ -184,53 +192,45 @@ impl LocalNamespace {
             .map_err(|error| io_failure(&target, Operation::Observe, &error))?;
             let (encoding, bytes) = path_bytes(&link)?;
             SymlinkTarget::new(encoding, bytes)
-                .map(NamespaceResult::LinkTarget)
                 .map_err(|_| entry_failure(&target, Operation::Observe, FailureClass::Protocol))
         })
         .await
     }
 
-    async fn create_directory(
-        &self,
-        path: StoragePath,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        let native = checked(&path, Operation::Namespace, false)?;
+    async fn create_directory_entry(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+        let native = checked(path, Operation::Namespace, false)?;
         let target = path.clone();
-        self.blocking(&path, Operation::Namespace, move |root, _| {
-            let failed = |error: io::Error| io_failure(&target, Operation::Namespace, &error);
+        self.blocking(path, Operation::Namespace, move |root, _| {
             in_parent(root, &native, |parent, leaf| {
                 parent.create_dir(leaf)?;
                 sync_directory(parent)
             })
-            .map_err(failed)?;
-            Ok(NamespaceResult::Completed)
+            .map_err(|error| io_failure(&target, Operation::Namespace, &error))
         })
         .await
     }
 
-    async fn delete(&self, path: StoragePath) -> Result<NamespaceResult, StorageRoleFailure> {
-        let native = checked(&path, Operation::Namespace, false)?;
+    async fn delete_one(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+        let native = checked(path, Operation::Namespace, false)?;
         let target = path.clone();
-        self.blocking(&path, Operation::Namespace, move |root, _| {
+        self.blocking(path, Operation::Namespace, move |root, _| {
             in_parent(root, &native, delete_entry)
-                .map_err(|error| io_failure(&target, Operation::Namespace, &error))?;
-            Ok(NamespaceResult::Completed)
+                .map_err(|error| io_failure(&target, Operation::Namespace, &error))
         })
         .await
     }
 
-    async fn rename(
+    async fn rename_one(
         &self,
-        from: StoragePath,
-        to: StoragePath,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        let source = checked(&from, Operation::Namespace, false)?;
-        let destination = checked(&to, Operation::Namespace, false)?;
+        from: &StoragePath,
+        to: &StoragePath,
+    ) -> Result<(), StorageRoleFailure> {
+        let source = checked(from, Operation::Namespace, false)?;
+        let destination = checked(to, Operation::Namespace, false)?;
         let target = from.clone();
-        self.blocking(&from, Operation::Namespace, move |root, _| {
-            let failed = |error: io::Error| io_failure(&target, Operation::Namespace, &error);
-            rename_entry(root, &source, &destination).map_err(failed)?;
-            Ok(NamespaceResult::Completed)
+        self.blocking(from, Operation::Namespace, move |root, _| {
+            rename_entry(root, &source, &destination)
+                .map_err(|error| io_failure(&target, Operation::Namespace, &error))
         })
         .await
     }
@@ -238,22 +238,72 @@ impl LocalNamespace {
 
 #[async_trait]
 impl Namespace for LocalNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        match request {
-            NamespaceRequest::List(path) => self.list(path).await,
-            NamespaceRequest::Stat(path) => self.stat(path).await,
-            NamespaceRequest::ReadLink(path) => self.read_link(path).await,
-            NamespaceRequest::CreateDirectory(path) => self.create_directory(path).await,
-            NamespaceRequest::Delete(path) => self.delete(path).await,
-            NamespaceRequest::Rename { from, to } => self.rename(from, to).await,
+    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+        self.stat_entry(path).await
+    }
+
+    /// Reads the whole directory in one blocking call and hands it over in pages (P7 C1; true
+    /// paging comes with C5).
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let native = match checked(&request.path, Operation::Traverse, true) {
+            Ok(native) => native,
+            Err(failure) => return ListingStream::failed(request.path, failure),
+        };
+        let namespace = self.clone();
+        ListingStream::from_producer(request.path.clone(), move |sink| async move {
+            let listing = namespace.list_whole(&request.path, native).await;
+            sink.deliver(listing, &request).await;
+        })
+    }
+
+    async fn read_link(&self, path: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure> {
+        self.read_link_entry(path).await
+    }
+
+    async fn create_directory(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+        self.create_directory_entry(path).await
+    }
+
+    async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+        self.delete_one(path).await
+    }
+
+    async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), StorageRoleFailure> {
+        self.rename_one(from, to).await
+    }
+
+    fn capabilities(&self) -> NamespaceCapabilities {
+        NamespaceCapabilities {
+            histories: false,
+            mutations: Ok(()),
+            symlinks: true,
+            names: platform_names(),
         }
     }
 }
 
-/// Lists one already opened directory without following symlinks.
+/// How the local filesystem compares names, by platform default: Linux filesystems are
+/// byte-exact, Windows and macOS default to case-insensitive volumes.
+const fn platform_names() -> NameSemantics {
+    if cfg!(target_os = "linux") {
+        NameSemantics::EXACT
+    } else if cfg!(windows) {
+        NameSemantics {
+            case: CaseSensitivity::Insensitive,
+            normalization: NameNormalization::None,
+        }
+    } else if cfg!(target_os = "macos") {
+        NameSemantics {
+            case: CaseSensitivity::Insensitive,
+            normalization: NameNormalization::Unknown,
+        }
+    } else {
+        NameSemantics::UNKNOWN
+    }
+}
+
+/// Lists one already opened directory without following symlinks. Children are spelled as
+/// `directory`, `/` and their name, the listing contract, whatever normalisation `native` had.
 ///
 /// A child that vanishes between the directory read and its stat is skipped: it no longer
 /// exists, which is what a listing taken a moment later would say too. Any other per-child
@@ -263,12 +313,13 @@ fn list_blocking(
     identity: &BackendIdentity,
     directory: &StoragePath,
     native: &Path,
-) -> Result<NamespaceResult, StorageRoleFailure> {
+) -> Result<ListingPage, StorageRoleFailure> {
     let entries = opened
         .entries()
         .map_err(|error| io_failure(directory, Operation::Traverse, &error))?;
     let mut described = Vec::new();
     let mut failures = Vec::new();
+    let mut hidden = 0_u32;
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -281,32 +332,29 @@ fn list_blocking(
         };
         let name = entry.file_name();
         if is_artifact_name(&name) {
+            hidden = hidden.saturating_add(1);
             continue;
         }
-        let child = child_path(native, &name);
-        match describe_child(identity, &child, &entry) {
+        match describe_child(identity, directory, native, &name, &entry) {
             Ok(Some(descriptor)) => described.push(descriptor),
             Ok(None) => {}
             Err(StorageRoleFailure::Entry(failure)) => failures.push(failure),
             Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
         }
     }
-    Ok(if failures.is_empty() {
-        NamespaceResult::Entries(described)
-    } else {
-        NamespaceResult::Listing {
-            entries: described,
-            failures,
-        }
-    })
+    Ok(ListingPage::from_descriptors(
+        directory, described, failures, hidden,
+    ))
 }
 
 fn describe_child(
     identity: &BackendIdentity,
-    child: &Path,
+    directory: &StoragePath,
+    native: &Path,
+    name: &OsStr,
     entry: &DirEntry,
 ) -> Result<Option<SourceDescriptor>, StorageRoleFailure> {
-    let path = spelled(identity, child).map_err(StorageRoleFailure::Entry)?;
+    let path = spelled(identity, directory, native, name).map_err(StorageRoleFailure::Entry)?;
     let metadata = match entry.metadata() {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -481,28 +529,19 @@ fn checked(
     Ok(native)
 }
 
-fn child_path(directory: &Path, name: &OsStr) -> PathBuf {
-    directory.join(name)
-}
-
-/// Spells a native child path as a `StoragePath`, or explains why it cannot be spelled.
-fn spelled(identity: &BackendIdentity, child: &Path) -> Result<StoragePath, EntryOperationFailure> {
-    let Some(encoded) = child.to_str() else {
-        return Err(unrepresentable_failure(identity, child));
+/// Spells child `name` of `directory` as a `StoragePath`, or explains why it cannot be spelled.
+/// The failure's stand-in path encodes the native child path, so it stays distinct.
+fn spelled(
+    identity: &BackendIdentity,
+    directory: &StoragePath,
+    native: &Path,
+    name: &OsStr,
+) -> Result<StoragePath, EntryOperationFailure> {
+    let unrepresentable = || unrepresentable_failure(identity, &native.join(name));
+    let Some(encoded) = name.to_str() else {
+        return Err(unrepresentable());
     };
-    StoragePath::new(portable_spelling(encoded))
-        .map_err(|_| unrepresentable_failure(identity, child))
-}
-
-fn portable_spelling(value: &str) -> Cow<'_, str> {
-    #[cfg(windows)]
-    {
-        Cow::Owned(value.replace('\\', "/"))
-    }
-    #[cfg(not(windows))]
-    {
-        Cow::Borrowed(value)
-    }
+    child_path(directory, encoded).map_err(|_| unrepresentable())
 }
 
 fn unrepresentable_failure(backend: &BackendIdentity, path: &Path) -> EntryOperationFailure {

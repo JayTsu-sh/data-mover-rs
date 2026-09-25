@@ -10,13 +10,14 @@ use crate::dir_tree::{DirPageResult, NdxEvent};
 use crate::model::{
     BackendIdentity, BackendKind, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
     ObservedEntry, Operation, SourceIdentity, SourceVersion, StoragePath, StorageTimestamp,
-    TimePrecision, TimestampMetadata, Transience,
+    SymlinkTarget, TimePrecision, TimestampMetadata, Transience,
 };
 use crate::storage::ListingFacts;
 use crate::storage::backends::s3::connect;
 use crate::storage::backends::s3::tests::{MemoryS3, identity as identity_s3};
+use crate::storage::listing::testing::{Described, answer, entries};
 use crate::storage::{
-    BackendCapabilities, CapabilityAvailability, Namespace, NamespaceRequest, NamespaceResult,
+    BackendCapabilities, CapabilityAvailability, ListRequest, ListingStream, Namespace,
     SourceDescriptor, Storage, StorageRoleFailure, UnsupportedReason,
 };
 
@@ -110,7 +111,7 @@ fn children(
     parent: &str,
     entries: &[(&'static str, EntryKind)],
     timestamps: bool,
-) -> Result<NamespaceResult> {
+) -> Result<Vec<SourceDescriptor>> {
     let mut built = Vec::new();
     for (name, kind) in entries {
         let full = if parent.is_empty() {
@@ -120,7 +121,7 @@ fn children(
         };
         built.push(descriptor(&full, *kind, timestamps)?);
     }
-    Ok(NamespaceResult::Entries(built))
+    Ok(built)
 }
 
 fn entry_failure(target: &StoragePath) -> StorageRoleFailure {
@@ -152,50 +153,68 @@ fn session_failure() -> StorageRoleFailure {
     )
 }
 
-#[async_trait]
-impl Namespace for TreeNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> std::result::Result<NamespaceResult, StorageRoleFailure> {
-        let NamespaceRequest::List(target) = request else {
-            self.non_list_requests
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(format!("{request:?}"));
-            return Err(entry_failure(&StoragePath::root()));
-        };
+impl TreeNamespace {
+    /// Records a verb other than a listing, which this adapter must never issue.
+    fn unexpected(&self, verb: String) -> StorageRoleFailure {
+        self.non_list_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(verb);
+        entry_failure(&StoragePath::root())
+    }
+
+    fn answer(&self, target: &StoragePath) -> std::result::Result<Described, StorageRoleFailure> {
         let key = target.as_str().to_owned();
         self.listed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(key.clone());
         match self.listings.get(&key) {
-            Some(Listing::Entries(entries)) => {
-                children(&key, entries, true).map_err(|_| entry_failure(&target))
-            }
-            Some(Listing::WithoutTimestamps(entries)) => {
-                children(&key, entries, false).map_err(|_| entry_failure(&target))
-            }
-            Some(Listing::EntryFailure) => Err(entry_failure(&target)),
+            Some(Listing::Entries(entries)) => children(&key, entries, true)
+                .map(|built| (built, Vec::new()))
+                .map_err(|_| entry_failure(target)),
+            Some(Listing::WithoutTimestamps(entries)) => children(&key, entries, false)
+                .map(|built| (built, Vec::new()))
+                .map_err(|_| entry_failure(target)),
+            Some(Listing::EntryFailure) => Err(entry_failure(target)),
             Some(Listing::SessionFailure) => Err(session_failure()),
-            Some(Listing::Cancelled) => Err(entry_failure_with(&target, FailureClass::Cancelled)),
+            Some(Listing::Cancelled) => Err(entry_failure_with(target, FailureClass::Cancelled)),
             Some(Listing::Partial(entries)) => {
-                let Ok(NamespaceResult::Entries(described)) = children(&key, entries, true) else {
-                    return Err(entry_failure(&target));
-                };
+                let described = children(&key, entries, true).map_err(|_| entry_failure(target))?;
                 let StorageRoleFailure::Entry(failure) =
-                    entry_failure_with(&target, FailureClass::Unsupported)
+                    entry_failure_with(target, FailureClass::Unsupported)
                 else {
                     unreachable!("entry_failure_with builds an entry failure")
                 };
-                Ok(NamespaceResult::Listing {
-                    entries: described,
-                    failures: vec![failure],
-                })
+                Ok((described, vec![failure]))
             }
-            None => Ok(NamespaceResult::Entries(Vec::new())),
+            None => Ok((Vec::new(), Vec::new())),
         }
+    }
+}
+
+#[async_trait]
+impl Namespace for TreeNamespace {
+    fn list(&self, request: ListRequest) -> ListingStream {
+        answer(&request.path, self.answer(&request.path))
+    }
+
+    async fn stat(
+        &self,
+        path: &StoragePath,
+    ) -> std::result::Result<SourceDescriptor, StorageRoleFailure> {
+        Err(self.unexpected(format!("stat {}", path.as_str())))
+    }
+
+    async fn read_link(
+        &self,
+        path: &StoragePath,
+    ) -> std::result::Result<SymlinkTarget, StorageRoleFailure> {
+        Err(self.unexpected(format!("read_link {}", path.as_str())))
+    }
+
+    async fn delete(&self, path: &StoragePath) -> std::result::Result<(), StorageRoleFailure> {
+        Err(self.unexpected(format!("delete {}", path.as_str())))
     }
 }
 
@@ -549,15 +568,10 @@ async fn a_present_record_without_a_modification_time_is_refused_too() -> Result
     struct UndatedNamespace;
     #[async_trait]
     impl Namespace for UndatedNamespace {
-        async fn execute(
-            &self,
-            request: NamespaceRequest,
-        ) -> std::result::Result<NamespaceResult, StorageRoleFailure> {
-            let NamespaceRequest::List(target) = request else {
-                return Err(entry_failure(&StoragePath::root()));
-            };
+        fn list(&self, request: ListRequest) -> ListingStream {
+            let target = request.path;
             if !target.as_str().is_empty() {
-                return Ok(NamespaceResult::Entries(Vec::new()));
+                return entries(&target, Vec::new());
             }
             let stamp = StorageTimestamp::new(MODIFIED_NANOS, TimePrecision::Nanoseconds)
                 .unwrap_or_else(|error| panic!("{error}"));
@@ -569,7 +583,7 @@ async fn a_present_record_without_a_modification_time_is_refused_too() -> Result
                     modified: None,
                     created: Some(stamp),
                 });
-            Ok(NamespaceResult::Entries(vec![descriptor]))
+            entries(&target, vec![descriptor])
         }
     }
 

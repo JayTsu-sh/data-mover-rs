@@ -29,11 +29,13 @@ use super::output::BlockFacts;
 use super::residency::Residency;
 use super::{
     Deferred, DescendOutcome, DirectoryWork, ListingTask, Runtime, Shared, State, admit,
-    awaits_slot, descend_outcome, entry_candidate, entry_failure, entry_name, immediate_decision,
-    queue_block_end, queue_failure, queue_subtree_end,
+    awaits_slot, descend_outcome, entry_candidate, entry_name, immediate_decision, queue_block_end,
+    queue_failure, queue_subtree_end,
 };
-use crate::model::{EntryKind, EntryOperationFailure, FailureClass, StoragePath};
-use crate::storage::{NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure};
+use crate::model::{EntryKind, EntryOperationFailure, StoragePath};
+use crate::storage::{
+    CollectLimits, ListRequest, SourceDescriptor, StorageRoleFailure, collect_listing,
+};
 use crate::traversal::{
     ChildOrder, TraversalDecision, TraversalOrder, TraversalTerminalFailure, TraversalVersions,
 };
@@ -482,17 +484,15 @@ impl Search<'_> {
     }
 }
 
+/// A whole listing: its children with their full paths, and the children it could not describe.
+type Collected = Result<(Vec<SourceDescriptor>, Vec<EntryOperationFailure>), StorageRoleFailure>;
+
 /// Turns a finished listing into a block, inside the listing's own task: listing-level failures
 /// stay failures, every child gets its admission decision now, and every child that needs no
 /// I/O is observed now.
-fn prepare(
-    shared: &Shared,
-    work: &DirectoryWork,
-    result: Result<NamespaceResult, StorageRoleFailure>,
-) -> Arrival {
-    let (entries, failures) = match result.map(NamespaceResult::into_listing) {
-        Ok(Some(listing)) => listing,
-        Ok(None) => return Ok(Err(entry_failure(&work.path, FailureClass::Protocol))),
+fn prepare(shared: &Shared, work: &DirectoryWork, result: Collected) -> Arrival {
+    let (entries, failures) = match result {
+        Ok(listing) => listing,
         Err(StorageRoleFailure::Entry(error)) => return Ok(Err(error)),
         Err(StorageRoleFailure::Session(error)) => {
             return Err(TraversalTerminalFailure::Session(error));
@@ -604,12 +604,8 @@ impl Prepared {
 /// boundary on a directory being written to can return one child twice — spells the same path,
 /// so which one wins cannot change the emitted sequence. `failures` keep their place ahead of the
 /// block: a child the listing could not describe has no name to sort by.
-fn sort_by_name(result: &mut Result<NamespaceResult, StorageRoleFailure>) {
-    let Ok(listing) = result else { return };
-    let entries = match listing {
-        NamespaceResult::Entries(entries) | NamespaceResult::Listing { entries, .. } => entries,
-        NamespaceResult::Completed | NamespaceResult::LinkTarget(_) => return,
-    };
+fn sort_by_name(result: &mut Collected) {
+    let Ok((entries, _)) = result else { return };
     entries.sort_unstable_by(|left, right| sibling_key(left).cmp(&sibling_key(right)));
 }
 
@@ -651,36 +647,26 @@ fn spawn_listing(
     // between two of the driver loop's await points, and several listings prepare in parallel.
     // On a current-thread runtime it still shares the thread; only `spawn_blocking` would change
     // that, and no listing so far has been worth it.
-    let cancel = shared
-        .namespace
-        .listings_are_abortable()
-        .then(|| runtime.request.cancel.clone());
+    //
+    // The request carries the traversal's token: the backend stops paging at cancellation (a
+    // stateless listing at once), and the traversal is ending then, so what it returns is never
+    // used. Collected whole until the cursor consumes pages (P7 C4).
+    let request = ListRequest::new(path.clone(), runtime.request.cancel.clone());
     listings.spawn(async move {
         let namespace = shared.namespace.as_ref();
-        let listing = match shared.request.versions {
-            TraversalVersions::Current => namespace.execute(NamespaceRequest::List(path.clone())),
-            TraversalVersions::All => namespace.list_versions(&path),
+        let stream = match shared.request.versions {
+            TraversalVersions::Current => namespace.list(request),
+            TraversalVersions::All => namespace.list_versions(request),
         };
-        // An abortable listing stops at cancellation instead of paging on in the background; the
-        // traversal is ending, so what it returns is never used.
-        let mut result = match cancel {
-            Some(cancel) => tokio::select! {
-                biased;
-                () = cancel.cancelled() => Err(cancelled_listing(&path)),
-                result = listing => result,
-            },
-            None => listing.await,
-        };
+        let mut result = collect_listing(stream, CollectLimits::UNBOUNDED)
+            .await
+            .map(|page| page.into_descriptors(&path));
         if shared.request.order == TraversalOrder::NameBytes {
             sort_by_name(&mut result);
         }
         let arrival = prepare(&shared, &work, result);
         (path, arrival)
     });
-}
-
-fn cancelled_listing(path: &StoragePath) -> StorageRoleFailure {
-    StorageRoleFailure::Entry(entry_failure(path, FailureClass::Cancelled))
 }
 
 /// Path text held by one arrived-but-untaken listing.

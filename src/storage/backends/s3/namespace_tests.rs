@@ -1,5 +1,5 @@
 //! The S3 namespace role (ADR-0006 C22): delimiter listings of current objects and of every
-//! version, `Stat`, and the verbs S3 cannot serve.
+//! version, `stat`, and the verbs S3 cannot serve.
 
 use std::num::NonZeroUsize;
 
@@ -10,9 +10,12 @@ use crate::model::Transience;
 use crate::model::{EntryKind, EntryVersion, FailureClass, HistoryOrder, SourceVersion};
 use crate::storage::backends::s3::namespace::S3Namespace;
 use crate::storage::backends::s3::paging::ListingLimits;
+use crate::storage::listing::testing::{
+    Described, Perform as _, Verb, listed as listed_current, listed_versions,
+};
 use crate::storage::{
-    Capability, CapabilityAvailability, DeleteTreeRequest, Namespace, NamespaceRequest,
-    NamespaceResult, SourceDescriptor, StorageRoleFailure, create_directory_all, delete_tree,
+    Capability, CapabilityAvailability, DeleteTreeRequest, Namespace, SourceDescriptor,
+    StorageRoleFailure, create_directory_all, delete_tree,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -58,20 +61,26 @@ fn row(descriptor: &SourceDescriptor) -> Row {
     (descriptor.path.to_string(), descriptor.kind, version)
 }
 
+/// Lists `directory` whole: every version when `all`, the current objects otherwise.
+async fn list_whole(
+    namespace: &(impl Namespace + ?Sized),
+    directory: &StoragePath,
+    all: bool,
+) -> Result<Described, StorageRoleFailure> {
+    if all {
+        listed_versions(namespace, directory).await
+    } else {
+        listed_current(namespace, directory).await
+    }
+}
+
 /// Rows and failure paths of one listing.
 async fn listed(
     namespace: &dyn Namespace,
     directory: &str,
     all: bool,
 ) -> TestResult<(Vec<Row>, Vec<String>)> {
-    let result = if all {
-        namespace.list_versions(&path(directory)).await
-    } else {
-        namespace
-            .execute(NamespaceRequest::List(path(directory)))
-            .await
-    };
-    let (entries, failures) = result?.into_listing().ok_or("not a listing")?;
+    let (entries, failures) = list_whole(namespace, &path(directory), all).await?;
     Ok((
         entries.iter().map(row).collect(),
         failures.iter().map(|f| f.path().to_string()).collect(),
@@ -160,7 +169,7 @@ async fn unspellable_keys_are_failures_not_silent_merges() -> TestResult {
         (vec![file("e/y")], vec!["e//".to_string()])
     );
     for bad in ["e/", "/e", "e//x"] {
-        let refused = namespace.execute(NamespaceRequest::List(path(bad))).await;
+        let refused = listed_current(&*namespace, &path(bad)).await;
         assert!(
             matches!(refused, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::InvalidInput),
             "{bad}: {refused:?}"
@@ -266,11 +275,7 @@ async fn one_instant_keeps_the_written_order() -> TestResult {
 
 /// The order every listed version reports for its key's history.
 async fn history_orders(namespace: &dyn Namespace) -> TestResult<Vec<HistoryOrder>> {
-    let (entries, _) = namespace
-        .list_versions(&StoragePath::root())
-        .await?
-        .into_listing()
-        .ok_or("not a listing")?;
+    let (entries, _) = listed_versions(namespace, &StoragePath::root()).await?;
     Ok(entries
         .iter()
         .filter_map(|entry| entry.listing.version.as_deref().map(EntryVersion::order))
@@ -318,11 +323,7 @@ async fn a_non_conforming_store_is_ordered_by_time_and_marked_inferred() -> Test
 async fn listed_versions_select_themselves_for_a_copy() -> TestResult {
     let protocol = versioned_history().await?;
     let namespace = namespace(&protocol)?;
-    let (entries, _) = namespace
-        .list_versions(&StoragePath::root())
-        .await?
-        .into_listing()
-        .ok_or("not a listing")?;
+    let (entries, _) = listed_versions(&*namespace, &StoragePath::root()).await?;
     let k: Vec<&SourceDescriptor> = entries.iter().filter(|e| e.path == path("k")).collect();
     assert_eq!(k[0].version, SourceVersion::Id("v0001".into()));
     assert_eq!(k[0].size, Some(2));
@@ -345,11 +346,7 @@ async fn the_null_version_selects_itself_for_a_copy() -> TestResult {
     put(&suspended, "s", b"real").await?;
     suspended.set_versioning(Versioning::Suspended);
     put(&suspended, "s", b"null").await?;
-    let (entries, _) = namespace(&suspended)?
-        .list_versions(&StoragePath::root())
-        .await?
-        .into_listing()
-        .ok_or("not a listing")?;
+    let (entries, _) = listed_versions(&*namespace(&suspended)?, &StoragePath::root()).await?;
     let selected: Vec<(Option<&str>, &SourceVersion)> = entries
         .iter()
         .map(|e| {
@@ -368,11 +365,7 @@ async fn the_null_version_selects_itself_for_a_copy() -> TestResult {
     );
     suspended.set_versioning(Versioning::Enabled);
     put(&suspended, "s", b"newer").await?;
-    let (entries, _) = namespace(&suspended)?
-        .list_versions(&StoragePath::root())
-        .await?
-        .into_listing()
-        .ok_or("not a listing")?;
+    let (entries, _) = listed_versions(&*namespace(&suspended)?, &StoragePath::root()).await?;
     assert_eq!(entries[1].version, SourceVersion::Id("null".into()));
     Ok(())
 }
@@ -381,13 +374,12 @@ async fn the_null_version_selects_itself_for_a_copy() -> TestResult {
 async fn stat_tells_objects_prefixes_and_absence_apart() -> TestResult {
     let protocol = bucket(&[("a", b"12"), ("d/e", b"1")]).await?;
     let namespace = namespace(&protocol)?;
-    let stat = |value: &str| namespace.execute(NamespaceRequest::Stat(path(value)));
-    let kind = |result: Result<NamespaceResult, StorageRoleFailure>| {
-        result.map(|result| match result {
-            NamespaceResult::Entries(entries) => entries.first().map(|entry| entry.kind),
-            _ => None,
-        })
+    let stat = |value: &'static str| {
+        let namespace = &namespace;
+        async move { namespace.stat(&path(value)).await }
     };
+    let kind =
+        |result: Result<SourceDescriptor, StorageRoleFailure>| result.map(|entry| Some(entry.kind));
     assert_eq!(kind(stat("a").await), Ok(Some(EntryKind::File)));
     assert_eq!(kind(stat("d").await), Ok(Some(EntryKind::Directory)));
     assert_eq!(kind(stat("").await), Ok(Some(EntryKind::Directory)));
@@ -414,18 +406,18 @@ async fn mutations_are_refused_before_any_io() -> TestResult {
         &CapabilityAvailability::Supported
     );
     let namespace = storage.namespace(&validation_policy())?;
-    assert!(namespace.supports_versions());
-    assert!(namespace.mutations_unsupported().is_some());
+    assert!(namespace.capabilities().histories);
+    assert!(namespace.capabilities().mutations.is_err());
     for request in [
-        NamespaceRequest::CreateDirectory(path("n")),
-        NamespaceRequest::Delete(path("d/e")),
-        NamespaceRequest::Rename {
+        Verb::CreateDirectory(path("n")),
+        Verb::Delete(path("d/e")),
+        Verb::Rename {
             from: path("d/e"),
             to: path("f"),
         },
-        NamespaceRequest::ReadLink(path("d/e")),
+        Verb::ReadLink(path("d/e")),
     ] {
-        let refused = namespace.execute(request).await;
+        let refused = namespace.perform(request).await;
         assert!(
             matches!(refused, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::Unsupported),
             "{refused:?}"
@@ -465,13 +457,13 @@ async fn listing_failures_keep_their_scope() -> TestResult {
         (S3ProtocolFailure::protocol("gone"), true),
     ] {
         protocol.listing().failure = Some(("d/".to_string(), failure));
-        let result = namespace.execute(NamespaceRequest::List(path("d"))).await;
+        let result = listed_current(&*namespace, &path("d")).await;
         assert_eq!(
             matches!(result, Err(StorageRoleFailure::Session(_))),
             session
         );
         assert!(result.is_err());
-        assert!(namespace.list_versions(&path("d")).await.is_err());
+        assert!(listed_versions(&*namespace, &path("d")).await.is_err());
     }
     Ok(())
 }
@@ -501,7 +493,7 @@ async fn dot_segments_are_failures_not_aliases() -> TestResult {
         assert_eq!(failures, ["a/.", "a/..", "a/./"]);
     }
     for bad in ["a/.", "./a", "a/../b"] {
-        let refused = namespace.execute(NamespaceRequest::List(path(bad))).await;
+        let refused = listed_current(&*namespace, &path(bad)).await;
         assert!(
             matches!(refused, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::InvalidInput),
             "{bad}: {refused:?}"
@@ -519,13 +511,7 @@ async fn an_absent_prefix_is_not_found() -> TestResult {
     let protocol = bucket(&[("d/e", b"1")]).await?;
     let namespace = namespace(&protocol)?;
     for all in [false, true] {
-        let result = if all {
-            namespace.list_versions(&path("missing")).await
-        } else {
-            namespace
-                .execute(NamespaceRequest::List(path("missing")))
-                .await
-        };
+        let result = list_whole(&*namespace, &path("missing"), all).await;
         assert!(
             matches!(result, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::NotFound),
             "{result:?}"
@@ -544,15 +530,8 @@ async fn a_repeating_continuation_fails_the_directory() -> TestResult {
     for cycle in [1, 2, 3] {
         for all in [false, true] {
             protocol.listing().cycle_tokens = cycle;
-            let listing = async {
-                if all {
-                    namespace.list_versions(&StoragePath::root()).await
-                } else {
-                    namespace
-                        .execute(NamespaceRequest::List(StoragePath::root()))
-                        .await
-                }
-            };
+            let root = StoragePath::root();
+            let listing = list_whole(&*namespace, &root, all);
             // Bounded, so a regression fails here instead of paging forever.
             let result = timeout(Duration::from_secs(5), listing).await?;
             assert!(
@@ -586,13 +565,7 @@ async fn a_restarting_minio_listing_fails_only_that_directory() -> TestResult {
     for all in [false, true] {
         let list = |name: &'static str| {
             let namespace = &namespace;
-            async move {
-                if all {
-                    namespace.list_versions(&path(name)).await
-                } else {
-                    namespace.execute(NamespaceRequest::List(path(name))).await
-                }
-            }
+            async move { list_whole(&**namespace, &path(name), all).await }
         };
         let looping = timeout(Duration::from_secs(5), list("a")).await?;
         assert!(
@@ -604,7 +577,7 @@ async fn a_restarting_minio_listing_fails_only_that_directory() -> TestResult {
             "all={all}: {looping:?}"
         );
         let sibling = timeout(Duration::from_secs(5), list("b")).await??;
-        assert_eq!(sibling.into_listing().map(|(e, _)| e.len()), Some(1));
+        assert_eq!(sibling.0.len(), 1);
     }
     Ok(())
 }
@@ -657,21 +630,10 @@ async fn a_directory_past_the_entry_limit_fails_whole() -> TestResult {
     protocol.listing().page_size = 1;
     for all in [false, true] {
         let at_limit = limited(&protocol, 3);
-        let listing = if all {
-            at_limit.list_versions(&StoragePath::root()).await
-        } else {
-            at_limit
-                .execute(NamespaceRequest::List(StoragePath::root()))
-                .await
-        };
-        assert_eq!(listing?.into_listing().map(|(e, _)| e.len()), Some(3));
+        let listing = list_whole(&at_limit, &StoragePath::root(), all).await;
+        assert_eq!(listing?.0.len(), 3);
         let over = limited(&protocol, 2);
-        let listing = if all {
-            over.list_versions(&StoragePath::root()).await
-        } else {
-            over.execute(NamespaceRequest::List(StoragePath::root()))
-                .await
-        };
+        let listing = list_whole(&over, &StoragePath::root(), all).await;
         assert!(
             matches!(listing, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::Capacity),
             "{listing:?}"
@@ -688,15 +650,8 @@ async fn endless_empty_pages_fail_the_directory() -> TestResult {
     protocol.listing().endless_empty = true;
     let namespace = limited(&protocol, 1000);
     for all in [false, true] {
-        let listing = async {
-            if all {
-                namespace.list_versions(&StoragePath::root()).await
-            } else {
-                namespace
-                    .execute(NamespaceRequest::List(StoragePath::root()))
-                    .await
-            }
-        };
+        let root = StoragePath::root();
+        let listing = list_whole(&namespace, &root, all);
         let result = timeout(Duration::from_secs(5), listing).await?;
         assert!(
             matches!(result, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::Protocol),
@@ -706,18 +661,14 @@ async fn endless_empty_pages_fail_the_directory() -> TestResult {
     Ok(())
 }
 
-/// `Stat` of a prefix pages past empty pages that name a continuation instead of calling the
+/// `stat` of a prefix pages past empty pages that name a continuation instead of calling the
 /// prefix absent; a server that never stops doing that fails within the listing bounds.
 #[tokio::test]
 async fn stat_pages_past_empty_pages() -> TestResult {
     let protocol = bucket(&[("d/e", b"1")]).await?;
     protocol.listing().endless_empty = true;
     let namespace = limited(&protocol, 1000);
-    let stat = timeout(
-        Duration::from_secs(5),
-        namespace.execute(NamespaceRequest::Stat(path("d"))),
-    )
-    .await?;
+    let stat = timeout(Duration::from_secs(5), namespace.stat(&path("d"))).await?;
     assert!(
         matches!(stat, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::Protocol),
         "{stat:?}"

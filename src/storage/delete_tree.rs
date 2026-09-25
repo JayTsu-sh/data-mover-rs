@@ -24,8 +24,8 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    CapabilityUnavailable, Namespace, NamespaceRequest, NamespaceResult, PreflightPolicy,
-    SourceDescriptor, Storage, StorageRoleFailure,
+    CapabilityUnavailable, CollectLimits, ListRequest, Namespace, PreflightPolicy,
+    SourceDescriptor, Storage, StorageRoleFailure, collect_listing,
 };
 use crate::model::{
     BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
@@ -152,11 +152,7 @@ pub(crate) fn delete_tree_with_namespace(
     }
 }
 
-type DeleteTasks = JoinSet<(
-    StoragePath,
-    EntryKind,
-    Result<NamespaceResult, StorageRoleFailure>,
-)>;
+type DeleteTasks = JoinSet<(StoragePath, EntryKind, Result<(), StorageRoleFailure>)>;
 
 struct Driver {
     namespace: Arc<dyn Namespace>,
@@ -253,17 +249,15 @@ impl Driver {
     ///
     /// Returns `None` when the directory itself could not be listed. A child the backend could
     /// not describe is reported and marks the directory incomplete, so it is never attempted:
-    /// it cannot be empty.
+    /// it cannot be empty. A cancelled listing is a signal, not a failure: the run stops.
     async fn list_directory(
         &mut self,
         directory: &StoragePath,
     ) -> Result<Option<Vec<SourceDescriptor>>, DeleteTreeTerminalFailure> {
-        let listed = self
-            .namespace
-            .execute(NamespaceRequest::List(directory.clone()))
-            .await;
-        match listed.map(NamespaceResult::into_listing) {
-            Ok(Some((entries, failures))) => {
+        let request = ListRequest::new(directory.clone(), self.request.cancel.clone());
+        let listed = collect_listing(self.namespace.list(request), CollectLimits::UNBOUNDED).await;
+        match listed.map(|page| page.into_descriptors(directory)) {
+            Ok((entries, failures)) => {
                 if !failures.is_empty() {
                     self.mark_incomplete(directory);
                 }
@@ -272,9 +266,9 @@ impl Driver {
                 }
                 Ok(Some(entries))
             }
-            Ok(None) => {
-                let failure = entry_failure(directory, Operation::Traverse, FailureClass::Protocol);
-                self.report_failure(failure).await?;
+            Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled => {
+                self.cancelled = true;
+                self.mark_incomplete(directory);
                 Ok(None)
             }
             Err(StorageRoleFailure::Entry(error)) => {
@@ -297,9 +291,7 @@ impl Driver {
         }
         let namespace = Arc::clone(&self.namespace);
         self.tasks.spawn(async move {
-            let result = namespace
-                .execute(NamespaceRequest::Delete(path.clone()))
-                .await;
+            let result = namespace.delete(&path).await;
             (path, kind, result)
         });
         Ok(())
@@ -350,10 +342,7 @@ impl Driver {
         if self.incomplete.contains(path.as_str()) {
             return self.report_incomplete(&path).await;
         }
-        let result = self
-            .namespace
-            .execute(NamespaceRequest::Delete(path.clone()))
-            .await;
+        let result = self.namespace.delete(&path).await;
         self.report_delete(path, EntryKind::Directory, result).await
     }
 
@@ -361,10 +350,10 @@ impl Driver {
         &mut self,
         path: StoragePath,
         kind: EntryKind,
-        result: Result<NamespaceResult, StorageRoleFailure>,
+        result: Result<(), StorageRoleFailure>,
     ) -> Result<(), DeleteTreeTerminalFailure> {
         match result {
-            Ok(_) => self.report_deleted(path, kind).await,
+            Ok(()) => self.report_deleted(path, kind).await,
             Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
                 self.report_deleted(path, kind).await
             }
@@ -442,6 +431,7 @@ impl Driver {
     }
 }
 
+#[cfg(test)]
 fn entry_failure(
     path: &StoragePath,
     operation: Operation,

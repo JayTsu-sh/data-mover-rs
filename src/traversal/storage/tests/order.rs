@@ -13,38 +13,37 @@ struct ReversedNamespace;
 
 #[async_trait]
 impl Namespace for ReversedNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        let NamespaceRequest::List(directory) = request else {
-            return Err(StorageRoleFailure::Entry(entry_failure(
-                &StoragePath::root(),
-                FailureClass::Unsupported,
-            )));
-        };
-        Ok(match directory.as_str() {
-            "" => NamespaceResult::Entries(vec![
-                descriptor("part", EntryKind::Directory),
-                descriptor("b", EntryKind::Directory),
-                descriptor("a.txt", EntryKind::File),
-                descriptor("a", EntryKind::Directory),
-                descriptor("B", EntryKind::File),
-            ]),
-            "a" => NamespaceResult::Entries(vec![descriptor("a/x", EntryKind::File)]),
-            "b" => NamespaceResult::Entries(vec![
-                descriptor("b/z", EntryKind::File),
-                descriptor("b/y", EntryKind::File),
-            ]),
-            "part" => NamespaceResult::Listing {
-                entries: vec![
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let directory = request.path;
+        let (children, failures) = match directory.as_str() {
+            "" => (
+                vec![
+                    descriptor("part", EntryKind::Directory),
+                    descriptor("b", EntryKind::Directory),
+                    descriptor("a.txt", EntryKind::File),
+                    descriptor("a", EntryKind::Directory),
+                    descriptor("B", EntryKind::File),
+                ],
+                Vec::new(),
+            ),
+            "a" => (vec![descriptor("a/x", EntryKind::File)], Vec::new()),
+            "b" => (
+                vec![
+                    descriptor("b/z", EntryKind::File),
+                    descriptor("b/y", EntryKind::File),
+                ],
+                Vec::new(),
+            ),
+            "part" => (
+                vec![
                     descriptor("part/q", EntryKind::File),
                     descriptor("part/p", EntryKind::File),
                 ],
-                failures: vec![entry_failure(&path("part/bad"), FailureClass::Protocol)],
-            },
+                vec![entry_failure(&path("part/bad"), FailureClass::Protocol)],
+            ),
             other => panic!("unexpected listing of {other}"),
-        })
+        };
+        answer(&directory, Ok((children, failures)))
     }
 }
 
@@ -169,9 +168,9 @@ async fn name_bytes_holds_below_the_root() {
     assert_eq!(block("part"), ["entry part/p", "entry part/q"]);
 }
 
-/// `part` arrives as `NamespaceResult::Listing`, the variant that carries per-child failures
-/// alongside the described children. Sorting only the plain `Entries` variant would leave this
-/// block in listing order while every other block looked right.
+/// `part` arrives with a per-child failure alongside the described children. Sorting only
+/// listings without failures would leave this block in listing order while every other block
+/// looked right.
 #[tokio::test]
 async fn name_bytes_sorts_listings_that_also_carry_failures() {
     let (rendered, _) = reversed_tree(TraversalOrder::NameBytes).await;
@@ -315,25 +314,13 @@ struct FailingListNamespace;
 
 #[async_trait]
 impl Namespace for FailingListNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        let NamespaceRequest::List(directory) = request else {
-            return Err(StorageRoleFailure::Entry(entry_failure(
-                &StoragePath::root(),
-                FailureClass::Unsupported,
-            )));
-        };
-        match directory.as_str() {
-            "" => Ok(NamespaceResult::Entries(vec![descriptor(
-                "sub",
-                EntryKind::Directory,
-            )])),
-            _ => Err(StorageRoleFailure::Entry(entry_failure(
-                &directory,
-                FailureClass::Protocol,
-            ))),
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let directory = request.path;
+        if directory.as_str().is_empty() {
+            entries(&directory, vec![descriptor("sub", EntryKind::Directory)])
+        } else {
+            let failure = entry_failure(&directory, FailureClass::Protocol);
+            answer(&directory, Err(StorageRoleFailure::Entry(failure)))
         }
     }
 }

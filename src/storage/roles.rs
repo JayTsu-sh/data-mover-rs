@@ -11,8 +11,12 @@ use super::SourceDescriptor;
 use super::copied_metadata::{CopiedMetadataObservation, CopiedMetadataTarget};
 use crate::runtime::qos::SourceQosBudget;
 
+mod namespace;
 mod stage;
 mod version;
+pub use namespace::{
+    CaseSensitivity, NameNormalization, NameSemantics, Namespace, NamespaceCapabilities,
+};
 pub(crate) use stage::DeferredCheckpoint;
 pub use stage::PreparedStage;
 use version::version_unsupported;
@@ -20,7 +24,7 @@ use version::version_unsupported;
 use crate::model::{
     AclMetadata, BackendSessionFailure, EntryOperationFailure, ExtendedAttribute, FailureClass,
     MappedOwnership, MetadataObservations, ObjectTag, ObservationPlan, Operation, OwnershipMode,
-    SourceIdentity, SourceVersion, StoragePath, SymlinkTarget, TimestampMetadata, Transience,
+    SourceIdentity, SourceVersion, StoragePath, TimestampMetadata, Transience,
 };
 
 /// A bounded payload stream. Implementations own request sizing and backpressure.
@@ -466,106 +470,6 @@ pub trait StagedDestination: Send + Sync {
     /// When read-back verification of `stage` happens (see [`VerificationPoint`]).
     fn verification_point(&self, _stage: &PreparedStage) -> VerificationPoint {
         VerificationPoint::BeforePublish
-    }
-}
-
-/// One coherent namespace operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum NamespaceRequest {
-    Stat(StoragePath),
-    List(StoragePath),
-    ReadLink(StoragePath),
-    CreateDirectory(StoragePath),
-    Delete(StoragePath),
-    Rename { from: StoragePath, to: StoragePath },
-}
-
-/// Neutral namespace result.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum NamespaceResult {
-    Completed,
-    Entries(Vec<SourceDescriptor>),
-    LinkTarget(SymlinkTarget),
-    /// A directory listing in which some children could not be described.
-    ///
-    /// The listing itself succeeded, so `entries` is every child that could be described and
-    /// `failures` holds one entry-scoped failure per child that could not (for example a name
-    /// that no `StoragePath` can spell). Failing the whole directory instead would drop valid
-    /// siblings; skipping silently would break completeness.
-    Listing {
-        entries: Vec<SourceDescriptor>,
-        failures: Vec<EntryOperationFailure>,
-    },
-}
-
-impl NamespaceResult {
-    /// A directory listing from the children that could be described and one entry-scoped
-    /// failure per child that could not: `Entries` when every child was described, `Listing`
-    /// otherwise.
-    #[must_use]
-    pub fn from_children(
-        entries: Vec<SourceDescriptor>,
-        failures: Vec<EntryOperationFailure>,
-    ) -> Self {
-        if failures.is_empty() {
-            Self::Entries(entries)
-        } else {
-            Self::Listing { entries, failures }
-        }
-    }
-
-    /// Splits a `List` or `Stat` result into described children and per-child failures.
-    ///
-    /// Returns `None` for results that are not listings.
-    #[must_use]
-    pub fn into_listing(self) -> Option<(Vec<SourceDescriptor>, Vec<EntryOperationFailure>)> {
-        match self {
-            Self::Entries(entries) => Some((entries, Vec::new())),
-            Self::Listing { entries, failures } => Some((entries, failures)),
-            Self::Completed | Self::LinkTarget(_) => None,
-        }
-    }
-}
-
-/// Coherent namespace role with typed verb availability behind one interface.
-#[async_trait]
-pub trait Namespace: Send + Sync {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure>;
-
-    /// Whether [`Namespace::list_versions`] lists stored versions (a versioned object store).
-    fn supports_versions(&self) -> bool {
-        false
-    }
-
-    /// Lists one directory with every stored version and delete marker of each child object, each
-    /// object's entries oldest first with the latest last, and its subdirectories once each
-    /// (ADR-0006 C22). Every entry carries its listed version.
-    ///
-    /// The default serves namespaces without versions: an `Unsupported` failure, never the
-    /// current entries instead.
-    async fn list_versions(
-        &self,
-        path: &StoragePath,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        Err(version_unsupported(path, Operation::Traverse))
-    }
-
-    /// Why this namespace refuses every mutating verb (`CreateDirectory`, `Delete`, `Rename`), if
-    /// it does: operations built on them (recursive delete, recursive create) refuse such a
-    /// namespace before any I/O instead of listing a tree they cannot change.
-    fn mutations_unsupported(&self) -> Option<&'static str> {
-        None
-    }
-
-    /// Whether a listing may be dropped half way without leaking anything. A listing that holds a
-    /// handle between its requests (a CIFS directory handle) must run to completion and close it,
-    /// so the default is `false`; a traversal cancels an abortable listing (S3: stateless pages)
-    /// at once rather than letting it page on in the background.
-    fn listings_are_abortable(&self) -> bool {
-        false
     }
 }
 

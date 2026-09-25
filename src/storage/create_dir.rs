@@ -1,25 +1,25 @@
 //! Recursive directory creation over the [`Namespace`] role.
 //!
 //! Replaces the legacy per-backend `create_dir_all`: each missing component is created in
-//! order through `NamespaceRequest::CreateDirectory`, so every backend that lends a namespace
+//! order through [`Namespace::create_directory`], so every backend that lends a namespace
 //! role gets it without protocol-specific code. Symmetric with [`super::delete_tree`].
 //!
 //! Semantics worth knowing before relying on it:
 //!
 //! - **Already-existing levels are success.** Backends disagree on how they report one: CIFS
 //!   answers `STATUS_OBJECT_NAME_COLLISION` (`Conflict`), while the NFS adapter's
-//!   `create_directory` is itself recursive and idempotent and simply answers `Completed`.
+//!   `create_directory` is itself recursive and idempotent and simply answers success.
 //!   Both are treated as "this level exists now".
-//! - **Only the leaf is verified on conflict.** A conflict costs one extra `Stat` at the leaf
+//! - **Only the leaf is verified on conflict.** A conflict costs one extra `stat` at the leaf
 //!   to prove the existing entry is a directory rather than a file. Intermediate levels skip
 //!   that check on CIFS and HDFS, where a file in the way makes the level below it fail, so
 //!   the mistake cannot pass silently — only the leaf could.
 //!
-//!   **NFS is the exception, and it is not this helper's doing.** Its `CreateDirectory`
+//!   **NFS is the exception, and it is not this helper's doing.** Its `create_directory`
 //!   forwards to `nfs::create_dir_all`, which deletes a non-directory blocking a component and
 //!   retries, by deliberate rsync-style migration semantics (`src/nfs.rs`, logged at `warn`).
 //!   So on NFS a file at any level — leaf included — is removed rather than reported, and the
-//!   leaf `Stat` then sees the directory that replaced it. Verifying intermediate levels here
+//!   leaf `stat` then sees the directory that replaced it. Verifying intermediate levels here
 //!   would not change that: the delete happens inside the one call this helper makes.
 //! - **No cross-call cache in this layer.** The legacy `DirExistsCache` lived in the backend
 //!   because there was no role layer; which destination directories a session already created
@@ -30,10 +30,7 @@
 
 use std::fmt;
 
-use super::{
-    CapabilityUnavailable, Namespace, NamespaceRequest, NamespaceResult, PreflightPolicy, Storage,
-    StorageRoleFailure,
-};
+use super::{CapabilityUnavailable, Namespace, PreflightPolicy, Storage, StorageRoleFailure};
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
 };
@@ -121,11 +118,8 @@ async fn create_level(
     level: StoragePath,
     is_leaf: bool,
 ) -> Result<(), CreateDirectoryAllFailure> {
-    let conflict = match namespace
-        .execute(NamespaceRequest::CreateDirectory(level.clone()))
-        .await
-    {
-        Ok(_) => return Ok(()),
+    let conflict = match namespace.create_directory(&level).await {
+        Ok(()) => return Ok(()),
         Err(failure) if class_of(&failure) == FailureClass::Conflict => failure,
         Err(failure) => return Err(failure.into()),
     };
@@ -134,14 +128,8 @@ async fn create_level(
     }
     // The leaf is the only level whose conflict could hide a file where the backend reports
     // one at all; see the NFS exception in the module docs.
-    match namespace.execute(NamespaceRequest::Stat(level)).await {
-        Ok(NamespaceResult::Entries(entries))
-            if entries
-                .first()
-                .is_some_and(|entry| entry.kind == EntryKind::Directory) =>
-        {
-            Ok(())
-        }
+    match namespace.stat(&level).await {
+        Ok(entry) if entry.kind == EntryKind::Directory => Ok(()),
         // Report the original conflict rather than the probe's outcome: the caller asked to
         // create a directory, and what stopped it was the entry already there.
         _ => Err(conflict.into()),

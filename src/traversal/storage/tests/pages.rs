@@ -76,28 +76,18 @@ impl MixedNamespace {
 
 #[async_trait]
 impl Namespace for MixedNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        match request {
-            NamespaceRequest::List(directory) => {
-                Ok(NamespaceResult::Entries(self.children(directory.as_str())))
-            }
-            NamespaceRequest::ReadLink(link) => {
-                // A read that takes a while, so role observations and link reads settle out of
-                // order against the children observed in the listing's task.
-                linger(link.as_str().len() % 3).await;
-                Ok(NamespaceResult::LinkTarget(
-                    SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, b"target".to_vec())
-                        .unwrap_or_else(|error| panic!("{error}")),
-                ))
-            }
-            _ => Err(StorageRoleFailure::Entry(entry_failure(
-                &StoragePath::root(),
-                FailureClass::Unsupported,
-            ))),
-        }
+    fn list(&self, request: ListRequest) -> ListingStream {
+        entries(&request.path, self.children(request.path.as_str()))
+    }
+
+    async fn read_link(&self, link: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure> {
+        // A read that takes a while, so role observations and link reads settle out of order
+        // against the children observed in the listing's task.
+        linger(link.as_str().len() % 3).await;
+        Ok(
+            SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, b"target".to_vec())
+                .unwrap_or_else(|error| panic!("{error}")),
+        )
     }
 }
 
@@ -315,40 +305,35 @@ struct SymlinkPerDirectory {
 
 #[async_trait]
 impl Namespace for SymlinkPerDirectory {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        match request {
-            NamespaceRequest::List(directory) if directory.as_str().is_empty() => {
-                Ok(NamespaceResult::Entries(
-                    (0..self.directories)
-                        .map(|index| descriptor(&format!("d{index:04}"), EntryKind::Directory))
-                        .collect(),
-                ))
-            }
-            NamespaceRequest::List(directory) => Ok(NamespaceResult::Entries(
-                ["file", "link-a", "link-b", "link-c"]
-                    .into_iter()
-                    .map(|name| {
-                        let kind = if name == "file" {
-                            EntryKind::File
-                        } else {
-                            EntryKind::Symlink
-                        };
-                        descriptor(&format!("{}/{name}", directory.as_str()), kind)
-                    })
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let directory = request.path;
+        if directory.as_str().is_empty() {
+            return entries(
+                &directory,
+                (0..self.directories)
+                    .map(|index| descriptor(&format!("d{index:04}"), EntryKind::Directory))
                     .collect(),
-            )),
-            NamespaceRequest::ReadLink(_) => Ok(NamespaceResult::LinkTarget(
-                SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, b"file".to_vec())
-                    .unwrap_or_else(|error| panic!("{error}")),
-            )),
-            _ => Err(StorageRoleFailure::Entry(entry_failure(
-                &StoragePath::root(),
-                FailureClass::Unsupported,
-            ))),
+            );
         }
+        let children = ["file", "link-a", "link-b", "link-c"]
+            .into_iter()
+            .map(|name| {
+                let kind = if name == "file" {
+                    EntryKind::File
+                } else {
+                    EntryKind::Symlink
+                };
+                descriptor(&format!("{}/{name}", directory.as_str()), kind)
+            })
+            .collect();
+        entries(&directory, children)
+    }
+
+    async fn read_link(&self, _link: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure> {
+        Ok(
+            SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, b"file".to_vec())
+                .unwrap_or_else(|error| panic!("{error}")),
+        )
     }
 }
 
@@ -444,30 +429,25 @@ struct OversizedFact;
 
 #[async_trait]
 impl Namespace for OversizedFact {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        let NamespaceRequest::List(directory) = request else {
-            return Err(StorageRoleFailure::Entry(entry_failure(
-                &StoragePath::root(),
-                FailureClass::Unsupported,
-            )));
-        };
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let directory = request.path;
         let listed =
             |value: &str, kind| descriptor(value, kind).with_inline_timestamps(time_of(value));
-        Ok(NamespaceResult::Entries(if directory.as_str().is_empty() {
-            let oversized = bytes::Bytes::from(vec![0_u8; MAX_MODEL_FIELD_BYTES + 1]);
-            vec![
-                listed("a", EntryKind::Directory),
-                listed("b", EntryKind::Directory).with_backend_fact(oversized),
-                listed("c", EntryKind::Directory),
-            ]
-        } else {
-            vec![listed(
-                &format!("{}/f", directory.as_str()),
-                EntryKind::File,
-            )]
-        }))
+        entries(
+            &directory,
+            if directory.as_str().is_empty() {
+                let oversized = bytes::Bytes::from(vec![0_u8; MAX_MODEL_FIELD_BYTES + 1]);
+                vec![
+                    listed("a", EntryKind::Directory),
+                    listed("b", EntryKind::Directory).with_backend_fact(oversized),
+                    listed("c", EntryKind::Directory),
+                ]
+            } else {
+                vec![listed(
+                    &format!("{}/f", directory.as_str()),
+                    EntryKind::File,
+                )]
+            },
+        )
     }
 }

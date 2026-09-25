@@ -22,9 +22,7 @@ use crate::model::{
     MetadataProvenance, ObservationMode, ObservationPlan, ObservedEntry, StoragePath,
     SymlinkTarget,
 };
-use crate::storage::{
-    Metadata, Namespace, NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure,
-};
+use crate::storage::{Metadata, Namespace, SourceDescriptor, StorageRoleFailure};
 use crate::traversal::TraversalTerminalFailure;
 
 /// Whether the metadata role must be consulted for `descriptor` under `plan`, or whether the
@@ -140,22 +138,6 @@ async fn role_observations(
         .map(|observed| observed.observations)
 }
 
-async fn read_link(
-    namespace: &dyn Namespace,
-    path: &StoragePath,
-) -> Result<SymlinkTarget, StorageRoleFailure> {
-    match namespace
-        .execute(NamespaceRequest::ReadLink(path.clone()))
-        .await?
-    {
-        NamespaceResult::LinkTarget(target) => Ok(target),
-        _ => Err(StorageRoleFailure::Entry(entry_failure(
-            path,
-            FailureClass::Protocol,
-        ))),
-    }
-}
-
 /// A model check that the ones in [`assemble`] should already have ruled out. Not blamed on any
 /// entry's path, which has moved into the entry by then: this is a defect, not a fact about it.
 fn internal() -> StorageRoleFailure {
@@ -261,7 +243,7 @@ pub(super) async fn observe(
         None => role_observations(metadata_role, &descriptor, plan).await?,
     };
     let target = if descriptor.kind == EntryKind::Symlink {
-        Some(read_link(namespace, &descriptor.path).await?)
+        Some(namespace.read_link(&descriptor.path).await?)
     } else {
         None
     };

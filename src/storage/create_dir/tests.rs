@@ -6,11 +6,10 @@ use async_trait::async_trait;
 use super::{CreateDirectoryAllFailure, create_directory_all_with_namespace};
 use crate::model::{
     BackendIdentity, BackendKind, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength,
-    Operation, SourceIdentity, StoragePath, Transience,
+    Operation, SourceIdentity, StoragePath, SymlinkTarget, Transience,
 };
-use crate::storage::{
-    Namespace, NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure,
-};
+use crate::storage::listing::testing::answer;
+use crate::storage::{ListRequest, ListingStream, Namespace, SourceDescriptor, StorageRoleFailure};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -147,64 +146,86 @@ fn descriptor(path: &StoragePath, kind: EntryKind) -> Result<SourceDescriptor> {
 
 #[async_trait]
 impl Namespace for FakeNamespace {
-    async fn execute(
+    async fn create_directory(
         &self,
-        request: NamespaceRequest,
-    ) -> std::result::Result<NamespaceResult, StorageRoleFailure> {
-        match request {
-            NamespaceRequest::CreateDirectory(path) => {
-                self.record(format!("mkdir {}", path.as_str()));
-                if self.session_failure_at.as_deref() == Some(path.as_str()) {
-                    return Err(session_failure());
-                }
-                if self.files.contains(path.as_str()) {
-                    // A file is in the way: backends report the same collision as for a
-                    // directory, which is exactly why the leaf gets verified.
-                    return Err(entry_failure(&path, FailureClass::Conflict));
-                }
-                if self.blocked_by_file_ancestor(path.as_str()) {
-                    // CIFS / HDFS behaviour: a file at an ancestor level makes the level below
-                    // it fail on its own, which is the argument for not verifying every level.
-                    return Err(entry_failure(&path, FailureClass::NotFound));
-                }
-                let fresh = self
-                    .directories
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(path.as_str().to_owned());
-                if fresh || self.existing == ExistingBehaviour::Completed {
-                    Ok(NamespaceResult::Completed)
-                } else {
-                    Err(entry_failure(&path, FailureClass::Conflict))
-                }
-            }
-            NamespaceRequest::Stat(path) => {
-                self.record(format!("stat {}", path.as_str()));
-                let kind = if self.files.contains(path.as_str()) {
-                    EntryKind::File
-                } else if self
-                    .directories
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .contains(path.as_str())
-                {
-                    EntryKind::Directory
-                } else {
-                    return Err(entry_failure(&path, FailureClass::NotFound));
-                };
-                let entry = descriptor(&path, kind)
-                    .map_err(|_| entry_failure(&path, FailureClass::Protocol))?;
-                Ok(NamespaceResult::Entries(vec![entry]))
-            }
-            other => {
-                self.record(format!("{other:?}"));
-                Err(entry_failure(
-                    &StoragePath::root(),
-                    FailureClass::Unsupported,
-                ))
-            }
+        path: &StoragePath,
+    ) -> std::result::Result<(), StorageRoleFailure> {
+        self.record(format!("mkdir {}", path.as_str()));
+        if self.session_failure_at.as_deref() == Some(path.as_str()) {
+            return Err(session_failure());
+        }
+        if self.files.contains(path.as_str()) {
+            // A file is in the way: backends report the same collision as for a directory,
+            // which is exactly why the leaf gets verified.
+            return Err(entry_failure(path, FailureClass::Conflict));
+        }
+        if self.blocked_by_file_ancestor(path.as_str()) {
+            // CIFS / HDFS behaviour: a file at an ancestor level makes the level below it fail
+            // on its own, which is the argument for not verifying every level.
+            return Err(entry_failure(path, FailureClass::NotFound));
+        }
+        let fresh = self
+            .directories
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.as_str().to_owned());
+        if fresh || self.existing == ExistingBehaviour::Completed {
+            Ok(())
+        } else {
+            Err(entry_failure(path, FailureClass::Conflict))
         }
     }
+
+    async fn stat(
+        &self,
+        path: &StoragePath,
+    ) -> std::result::Result<SourceDescriptor, StorageRoleFailure> {
+        self.record(format!("stat {}", path.as_str()));
+        let kind = if self.files.contains(path.as_str()) {
+            EntryKind::File
+        } else if self
+            .directories
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(path.as_str())
+        {
+            EntryKind::Directory
+        } else {
+            return Err(entry_failure(path, FailureClass::NotFound));
+        };
+        descriptor(path, kind).map_err(|_| entry_failure(path, FailureClass::Protocol))
+    }
+
+    fn list(&self, request: ListRequest) -> ListingStream {
+        self.record(format!("list {}", request.path.as_str()));
+        answer(&request.path, Err(unsupported()))
+    }
+
+    async fn read_link(
+        &self,
+        path: &StoragePath,
+    ) -> std::result::Result<SymlinkTarget, StorageRoleFailure> {
+        self.record(format!("read_link {}", path.as_str()));
+        Err(unsupported())
+    }
+
+    async fn delete(&self, path: &StoragePath) -> std::result::Result<(), StorageRoleFailure> {
+        self.record(format!("delete {}", path.as_str()));
+        Err(unsupported())
+    }
+
+    async fn rename(
+        &self,
+        from: &StoragePath,
+        to: &StoragePath,
+    ) -> std::result::Result<(), StorageRoleFailure> {
+        self.record(format!("rename {} {}", from.as_str(), to.as_str()));
+        Err(unsupported())
+    }
+}
+
+fn unsupported() -> StorageRoleFailure {
+    entry_failure(&StoragePath::root(), FailureClass::Unsupported)
 }
 
 fn path(value: &str) -> Result<StoragePath> {
@@ -317,17 +338,15 @@ async fn a_permission_failure_propagates_rather_than_being_treated_as_existing()
     struct DeniedNamespace;
     #[async_trait]
     impl Namespace for DeniedNamespace {
-        async fn execute(
+        async fn create_directory(
             &self,
-            request: NamespaceRequest,
-        ) -> std::result::Result<NamespaceResult, StorageRoleFailure> {
-            let NamespaceRequest::CreateDirectory(path) = request else {
-                return Err(entry_failure(
-                    &StoragePath::root(),
-                    FailureClass::Unsupported,
-                ));
-            };
-            Err(entry_failure(&path, FailureClass::PermissionDenied))
+            path: &StoragePath,
+        ) -> std::result::Result<(), StorageRoleFailure> {
+            Err(entry_failure(path, FailureClass::PermissionDenied))
+        }
+
+        fn list(&self, request: ListRequest) -> ListingStream {
+            answer(&request.path, Err(unsupported()))
         }
     }
 

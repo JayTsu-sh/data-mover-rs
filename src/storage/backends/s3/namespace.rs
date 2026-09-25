@@ -1,7 +1,7 @@
-//! The S3 namespace role (ADR-0006 C22): `Stat` and `List` (delimiter `/`, one prefix at a time),
+//! The S3 namespace role (ADR-0006 C22): `stat` and `list` (delimiter `/`, one prefix at a time),
 //! and the listing of every stored version that a traversal of all versions drives. S3 has no
 //! directories to create, delete or rename, so every mutating verb is refused, and
-//! [`Namespace::mutations_unsupported`] lets recursive delete and create refuse before any I/O.
+//! [`NamespaceCapabilities::mutations`] lets recursive delete and create refuse before any I/O.
 
 use std::sync::Arc;
 
@@ -14,11 +14,13 @@ use super::paging::{ListingLimits, Paging};
 use super::source::role_failure;
 use super::{S3Protocol, S3ProtocolFailure};
 use crate::model::{
-    BackendIdentity, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
+    BackendIdentity, EntryOperationFailure, FailureClass, Operation, StoragePath, SymlinkTarget,
+    Transience,
 };
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::{
-    Namespace, NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure,
+    ListRequest, ListingStream, NameSemantics, Namespace, NamespaceCapabilities, SourceDescriptor,
+    StorageRoleFailure,
 };
 
 const NO_MUTATIONS: &str = "S3 has no directories; namespace mutations are unsupported";
@@ -47,7 +49,7 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
 
     /// An object when one has the path as its key; otherwise a directory when anything lies
     /// under `<path>/`; otherwise `NotFound`.
-    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+    async fn stat_entry(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         if path.as_str().is_empty() {
             return directory_descriptor(&self.identity, path.clone())
                 .map_err(StorageRoleFailure::Entry);
@@ -97,51 +99,76 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
 
 #[async_trait]
 impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
-    async fn execute(
+    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+        refuse_artifact(path)?;
+        self.stat_entry(path).await
+    }
+
+    /// Reads the whole prefix, then hands it over in pages (true paging comes with C6). Pages
+    /// are stateless requests, so cancellation or a dropped stream abandons the listing at once.
+    fn list(&self, request: ListRequest) -> ListingStream {
+        if let Err(failure) = refuse_artifact(&request.path) {
+            return ListingStream::failed(request.path, failure);
+        }
+        let (protocol, identity, limits) = (
+            Arc::clone(&self.protocol),
+            self.identity.clone(),
+            self.limits,
+        );
+        ListingStream::from_producer(request.path.clone(), move |sink| async move {
+            let listing = list_current(protocol.as_ref(), &identity, &request.path, limits);
+            sink.deliver_abortable(listing, &request).await;
+        })
+    }
+
+    async fn read_link(&self, path: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure> {
+        Err(failure(
+            path,
+            FailureClass::Unsupported,
+            "S3 has no symbolic links",
+        ))
+    }
+
+    async fn create_directory(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+        Err(failure(path, FailureClass::Unsupported, NO_MUTATIONS))
+    }
+
+    async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+        Err(failure(path, FailureClass::Unsupported, NO_MUTATIONS))
+    }
+
+    async fn rename(
         &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        match request {
-            NamespaceRequest::Stat(path) => {
-                refuse_artifact(&path)?;
-                Ok(NamespaceResult::Entries(vec![self.stat(&path).await?]))
-            }
-            NamespaceRequest::List(path) => {
-                refuse_artifact(&path)?;
-                list_current(self.protocol.as_ref(), &self.identity, &path, self.limits).await
-            }
-            NamespaceRequest::ReadLink(path) => Err(failure(
-                &path,
-                FailureClass::Unsupported,
-                "S3 has no symbolic links",
-            )),
-            NamespaceRequest::CreateDirectory(path)
-            | NamespaceRequest::Delete(path)
-            | NamespaceRequest::Rename { from: path, .. } => {
-                Err(failure(&path, FailureClass::Unsupported, NO_MUTATIONS))
-            }
+        from: &StoragePath,
+        _to: &StoragePath,
+    ) -> Result<(), StorageRoleFailure> {
+        Err(failure(from, FailureClass::Unsupported, NO_MUTATIONS))
+    }
+
+    /// `histories` is what [`Namespace::list_versions`] serves on any bucket until P7 C11b
+    /// narrows it to versioned buckets.
+    fn capabilities(&self) -> NamespaceCapabilities {
+        NamespaceCapabilities {
+            histories: true,
+            mutations: Err(NO_MUTATIONS),
+            symlinks: false,
+            names: NameSemantics::EXACT,
         }
     }
 
-    fn supports_versions(&self) -> bool {
-        true
-    }
-
-    async fn list_versions(
-        &self,
-        path: &StoragePath,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        refuse_artifact(path)?;
-        list_all(self.protocol.as_ref(), &self.identity, path, self.limits).await
-    }
-
-    fn mutations_unsupported(&self) -> Option<&'static str> {
-        Some(NO_MUTATIONS)
-    }
-
-    /// Pages are stateless requests: nothing is left open between them.
-    fn listings_are_abortable(&self) -> bool {
-        true
+    fn list_versions(&self, request: ListRequest) -> ListingStream {
+        if let Err(failure) = refuse_artifact(&request.path) {
+            return ListingStream::failed(request.path, failure);
+        }
+        let (protocol, identity, limits) = (
+            Arc::clone(&self.protocol),
+            self.identity.clone(),
+            self.limits,
+        );
+        ListingStream::from_producer(request.path.clone(), move |sink| async move {
+            let listing = list_all(protocol.as_ref(), &identity, &request.path, limits);
+            sink.deliver_abortable(listing, &request).await;
+        })
     }
 }
 

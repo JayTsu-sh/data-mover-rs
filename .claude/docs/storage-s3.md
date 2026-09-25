@@ -555,8 +555,9 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   16 页空页却还说有下一页 → 该目录 `Protocol` 失败；都是块 `Failed`，不会悄悄截断。`IsTruncated` 缺失但有 token
   → 继续翻（同 legacy）；没有 VersionId 的条目当 `"null"`；跨页重复的对象 / 版本只留第一次。`Stat` 的前缀探测也按
   同样上限翻过空页，不把“第一页空但有下一页”当成不存在。
-- **取消即停**：S3 的列举不持有句柄（`Namespace::listings_are_abortable() = true`），遍历取消时进行中的列举直接丢弃，
-  不在后台继续翻页；CIFS 这类持有目录句柄的列举仍跑完再关句柄。
+- **取消即停**：S3 的列举不持有句柄，生产者用 `PageSink::deliver_abortable`：`ListRequest.cancel` 取消或流被 drop
+  时进行中的列举直接丢弃，不在后台继续翻页；CIFS 这类持有目录句柄的列举仍跑完再关句柄（P7 C1 删了
+  `listings_are_abortable()`）。
 - **不存在的前缀**：非根路径下一条都没列到（没有对象、版本、标记、前缀，也没有自己的 `p/` 标记）→ `NotFound`
   条目失败；遍历根拼错时根的列举是 `Failed`、summary 不 exhaustive，不会被当成“源端为空”。存储根永远存在。
 - **子项顺序**：S3 key 序，公共前缀带尾 `/` 比较（`a` < `a!` < `a-0` < `a.txt` < `a/`）；同名的对象 `a` 与目录

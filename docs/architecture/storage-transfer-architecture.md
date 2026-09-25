@@ -201,10 +201,10 @@ Owns coherent namespace semantics: stat/list, create/delete, rename, and support
 operations. Fine-grained semantics are typed; providing the role does not imply that every
 verb exists. An unavailable operation fails preflight before remote side effects.
 
-S3 lends `Stat` and `List` only (ADR-0006 C22): `List` of a path is one delimiter listing of the
+S3 lends `stat` and `list` only (ADR-0006 C22): `list` of a path is one delimiter listing of the
 prefix `<path>/`, so a common prefix is a directory; `Namespace::list_versions` lists every stored
-version and delete marker (`supports_versions()`). Its mutating verbs are `Unsupported`, and it
-says so through `Namespace::mutations_unsupported()`: recursive delete and recursive create refuse
+version and delete marker (`capabilities().histories`). Its mutating verbs are `Unsupported`, and it
+says so through `Namespace::capabilities().mutations`: recursive delete and recursive create refuse
 such a storage before any I/O. `ndx_walk` refuses S3 by kind: a prefix has no modification time.
 
 ### Metadata

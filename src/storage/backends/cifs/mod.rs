@@ -69,6 +69,8 @@ mod source_tests;
 mod staged_tests;
 
 #[cfg(test)]
+mod namespace_drop_tests;
+#[cfg(test)]
 mod namespace_tests;
 #[cfg(test)]
 mod pipeline_tests;

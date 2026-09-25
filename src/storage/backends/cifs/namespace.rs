@@ -7,13 +7,14 @@ use super::source::{
     CifsSourceFacts, classify, descriptor_from_facts, entry_failure, entry_failure_with_transience,
     is_directory_not_empty, is_not_found, smb_attributes_to_mode,
 };
-use crate::model::TimestampMetadata;
 use crate::model::{
     BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
+    SymlinkTarget, TimestampMetadata,
 };
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::{
-    Namespace, NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure,
+    ListRequest, ListingPage, ListingStream, Namespace, NamespaceCapabilities, SourceDescriptor,
+    StorageRoleFailure,
 };
 
 /// Protocol verbs behind the CIFS namespace role.
@@ -37,6 +38,7 @@ pub(super) trait CifsNamespaceProtocol: Send + Sync {
     async fn rename_entry(&self, from: &StoragePath, to: &StoragePath) -> smb_domain::Result<()>;
 }
 
+#[derive(Clone)]
 pub(super) struct CifsNamespace {
     protocol: Arc<dyn CifsNamespaceProtocol>,
     identity: BackendIdentity,
@@ -50,17 +52,18 @@ impl CifsNamespace {
         Self { protocol, identity }
     }
 
-    async fn stat(&self, path: &StoragePath) -> Result<NamespaceResult, StorageRoleFailure> {
+    async fn stat_entry(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         let facts = self
             .protocol
             .stat(path)
             .await
             .map_err(|error| classify(path, Operation::Observe, &error))?;
-        let entry = descriptor_from_facts(&self.identity, path, &facts, Operation::Observe)?;
-        Ok(NamespaceResult::Entries(vec![entry]))
+        descriptor_from_facts(&self.identity, path, &facts, Operation::Observe)
     }
 
-    async fn list(&self, path: &StoragePath) -> Result<NamespaceResult, StorageRoleFailure> {
+    /// Reads one whole directory; the protocol opens, reads and closes the directory handle
+    /// inside this one call, so nothing stays open between pages (true paging comes with C9).
+    async fn list_whole(&self, path: &StoragePath) -> Result<ListingPage, StorageRoleFailure> {
         let facts = self
             .protocol
             .list(path)
@@ -71,9 +74,11 @@ impl CifsNamespace {
         // itself was listed, so failing it whole would drop them.
         let mut entries = Vec::with_capacity(facts.len());
         let mut failures = Vec::new();
+        let mut hidden = 0_u32;
         for (child, inline) in facts {
             if is_artifact_path(child.as_str()) {
                 tracing::trace!("[CIFS] listing skips transfer artifact {}", child.as_str());
+                hidden = hidden.saturating_add(1);
                 continue;
             }
             match self.describe_listed(&child, &inline) {
@@ -84,7 +89,9 @@ impl CifsNamespace {
                 Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
             }
         }
-        Ok(NamespaceResult::from_children(entries, failures))
+        Ok(ListingPage::from_descriptors(
+            path, entries, failures, hidden,
+        ))
     }
 
     /// One listed child with the timestamps and mode its `QUERY_DIRECTORY` record carries.
@@ -116,7 +123,7 @@ impl CifsNamespace {
     /// conflict and nothing is removed. An artifact that vanishes meanwhile (a writer published it)
     /// is fine: the final remove decides. Every failure names `path`, the entry the caller asked
     /// for, never a hidden one.
-    async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+    async fn delete_entry(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
         let error = match self.protocol.remove(path).await {
             Ok(()) => return Ok(()),
             Err(error) => error,
@@ -207,15 +214,7 @@ fn undescribed(child: &StoragePath, failure: &EntryOperationFailure) -> EntryOpe
 
 /// Transfer artifacts are not addressable through the namespace (ADR-0006 C3b), as on Local and
 /// NFS: listings hide them, so no verb may reach them either.
-fn refuse_artifacts(request: &NamespaceRequest) -> Result<(), StorageRoleFailure> {
-    let paths: &[&StoragePath] = match request {
-        NamespaceRequest::Rename { from, to } => &[from, to],
-        NamespaceRequest::Stat(path)
-        | NamespaceRequest::List(path)
-        | NamespaceRequest::ReadLink(path)
-        | NamespaceRequest::CreateDirectory(path)
-        | NamespaceRequest::Delete(path) => &[path],
-    };
+fn refuse_artifacts(paths: &[&StoragePath]) -> Result<(), StorageRoleFailure> {
     match paths.iter().find(|path| is_artifact_path(path.as_str())) {
         Some(path) => Err(entry_failure(
             path,
@@ -228,37 +227,60 @@ fn refuse_artifacts(request: &NamespaceRequest) -> Result<(), StorageRoleFailure
 
 #[async_trait]
 impl Namespace for CifsNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        refuse_artifacts(&request)?;
-        match request {
-            NamespaceRequest::Stat(path) => self.stat(&path).await,
-            NamespaceRequest::List(path) => self.list(&path).await,
-            NamespaceRequest::ReadLink(path) => Err(entry_failure(
-                &path,
-                Operation::Observe,
-                FailureClass::Unsupported,
-            )),
-            NamespaceRequest::CreateDirectory(path) => {
-                self.protocol
-                    .create_directory(&path)
-                    .await
-                    .map_err(|error| classify(&path, Operation::Namespace, &error))?;
-                Ok(NamespaceResult::Completed)
-            }
-            NamespaceRequest::Delete(path) => {
-                self.delete(&path).await?;
-                Ok(NamespaceResult::Completed)
-            }
-            NamespaceRequest::Rename { from, to } => {
-                self.protocol
-                    .rename_entry(&from, &to)
-                    .await
-                    .map_err(|error| classify(&from, Operation::Namespace, &error))?;
-                Ok(NamespaceResult::Completed)
-            }
+    async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
+        refuse_artifacts(&[path])?;
+        self.stat_entry(path).await
+    }
+
+    /// The producer task owns the listing to its end, so a dropped stream never abandons an open
+    /// directory handle: the protocol call inside it always runs to its close.
+    fn list(&self, request: ListRequest) -> ListingStream {
+        if let Err(failure) = refuse_artifacts(&[&request.path]) {
+            return ListingStream::failed(request.path, failure);
+        }
+        let namespace = self.clone();
+        ListingStream::from_producer(request.path.clone(), move |sink| async move {
+            let listing = namespace.list_whole(&request.path).await;
+            sink.deliver(listing, &request).await;
+        })
+    }
+
+    async fn read_link(&self, path: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure> {
+        refuse_artifacts(&[path])?;
+        Err(entry_failure(
+            path,
+            Operation::Observe,
+            FailureClass::Unsupported,
+        ))
+    }
+
+    async fn create_directory(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+        refuse_artifacts(&[path])?;
+        self.protocol
+            .create_directory(path)
+            .await
+            .map_err(|error| classify(path, Operation::Namespace, &error))
+    }
+
+    async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
+        refuse_artifacts(&[path])?;
+        self.delete_entry(path).await
+    }
+
+    async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), StorageRoleFailure> {
+        refuse_artifacts(&[from, to])?;
+        self.protocol
+            .rename_entry(from, to)
+            .await
+            .map_err(|error| classify(from, Operation::Namespace, &error))
+    }
+
+    /// Name semantics stay unknown until the volume's `FILE_CASE_SENSITIVE_SEARCH` attribute is
+    /// queried at connect; unknown is treated as insensitive.
+    fn capabilities(&self) -> NamespaceCapabilities {
+        NamespaceCapabilities {
+            symlinks: false,
+            ..NamespaceCapabilities::BASIC
         }
     }
 }

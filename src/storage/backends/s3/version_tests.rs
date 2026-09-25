@@ -6,6 +6,7 @@ use futures::StreamExt as _;
 use super::*;
 use crate::model::{EntryKind, FailureClass, IdentityStrength, SourceVersion};
 use crate::storage::backends::s3::source::path_scoped_bytes;
+use crate::storage::listing::testing::{listed as listed_current, listed_versions};
 use crate::storage::{ReadSource, SourceDescriptor, StorageRoleFailure};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -190,10 +191,7 @@ async fn the_same_content_at_two_keys_has_two_identities() -> TestResult {
         );
     }
     let namespace = storage.namespace(&validation_policy())?;
-    let listing = namespace
-        .execute(crate::storage::NamespaceRequest::List(StoragePath::root()))
-        .await?;
-    let (entries, _) = listing.into_listing().ok_or("not a listing")?;
+    let (entries, _) = listed_current(&*namespace, &StoragePath::root()).await?;
     for listed in entries.iter().filter(|entry| entry.kind == EntryKind::File) {
         let described = source.describe(&listed.path).await?;
         assert_eq!(listed.source_identity, described.source_identity);
@@ -206,11 +204,8 @@ async fn the_same_content_at_two_keys_has_two_identities() -> TestResult {
             .await
             .map_err(|e| format!("{e:?}"))?;
     }
-    let markers: Vec<SourceDescriptor> = namespace
-        .list_versions(&StoragePath::root())
+    let markers: Vec<SourceDescriptor> = listed_versions(&*namespace, &StoragePath::root())
         .await?
-        .into_listing()
-        .ok_or("not a listing")?
         .0
         .into_iter()
         .filter(|entry| {
@@ -245,11 +240,8 @@ async fn a_listed_identity_never_matches_another_keys_describe() -> TestResult {
     }
     let storage = connect(protocol.clone(), identity(), None)?;
     let source = storage.read_source(&validation_policy())?;
-    let listing = storage
-        .namespace(&validation_policy())?
-        .execute(crate::storage::NamespaceRequest::List(StoragePath::root()))
-        .await?;
-    let (entries, _) = listing.into_listing().ok_or("not a listing")?;
+    let namespace = storage.namespace(&validation_policy())?;
+    let (entries, _) = listed_current(&*namespace, &StoragePath::root()).await?;
     let listed_a = entries
         .iter()
         .find(|entry| entry.path.as_str() == "a")

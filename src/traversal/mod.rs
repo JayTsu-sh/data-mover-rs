@@ -169,22 +169,32 @@ pub struct TraversalRequest {
 /// Re-expresses a backend-relative path in the traversal root's frame of reference.
 ///
 /// A leading `./` is stripped, so a `path` expression written against the scan root matches
-/// however the path was spelled. No backend emits one today; the Local namespace role spells
-/// root children without it.
+/// however the path was spelled.
 ///
 /// The root only matches on a component boundary. A raw string prefix would rewrite a sibling
 /// that merely starts with the root's spelling — `keeper/a` under root `keep` would become
 /// `er/a` — which silently corrupts both the emitted path and anything matched against it.
+///
+/// A listing spells every child as its directory's path verbatim, a `/` and the child's name
+/// (P7 C1), so a path below a root spelled `./x` or `x/` starts with that very spelling; it is
+/// stripped as it is before any `./` normalisation is tried.
 pub(crate) fn relative_to<'a>(root: &StoragePath, path: &'a StoragePath) -> &'a str {
-    let value = path.as_str().strip_prefix("./").unwrap_or(path.as_str());
     let root = root.as_str();
+    let value = path.as_str().strip_prefix("./").unwrap_or(path.as_str());
     if root.is_empty() {
         return value;
     }
-    value
-        .strip_prefix(root)
-        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
-        .map_or(value, |rest| rest.trim_start_matches('/'))
+    below(root, path.as_str())
+        .or_else(|| below(root, value))
+        .unwrap_or(value)
+}
+
+/// What follows `root` in `value`, when `value` is `root` itself or lies below it on a component
+/// boundary.
+fn below<'a>(root: &str, value: &'a str) -> Option<&'a str> {
+    let rest = value.strip_prefix(root)?;
+    (root.ends_with('/') || rest.is_empty() || rest.starts_with('/'))
+        .then(|| rest.trim_start_matches('/'))
 }
 
 #[cfg(test)]
@@ -203,6 +213,16 @@ mod relative_tests {
         assert_eq!(relative_to(&path("keep"), &path("./keep/a/b")), "a/b");
         // A path outside the root keeps its own spelling rather than being silently truncated.
         assert_eq!(relative_to(&path("keep"), &path("other/a")), "other/a");
+    }
+
+    /// Children spelled from the root verbatim (P7 C1): `./`, `./x` and `x/` roots.
+    #[test]
+    fn a_root_spelled_verbatim_in_its_children_is_stripped_as_spelled() {
+        assert_eq!(relative_to(&path("./"), &path(".//a/b")), "a/b");
+        assert_eq!(relative_to(&path("./x"), &path("./x/a")), "a");
+        assert_eq!(relative_to(&path("x/"), &path("x//a")), "a");
+        assert_eq!(relative_to(&path("x/"), &path("x/a")), "a");
+        assert_eq!(relative_to(&path("./x"), &path("./x")), "");
     }
 
     #[test]

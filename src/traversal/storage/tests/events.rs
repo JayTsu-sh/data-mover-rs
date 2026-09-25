@@ -159,22 +159,19 @@ struct FailingListNamespace;
 
 #[async_trait]
 impl Namespace for FailingListNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        match request {
-            NamespaceRequest::List(root) if root == StoragePath::root() => {
-                Ok(NamespaceResult::Entries(vec![
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let directory = request.path;
+        if directory == StoragePath::root() {
+            entries(
+                &directory,
+                vec![
                     descriptor("sub", EntryKind::Directory),
                     descriptor("file", EntryKind::File),
-                ]))
-            }
-            NamespaceRequest::List(directory) => Err(StorageRoleFailure::Entry(entry_failure(
-                &directory,
-                FailureClass::PermissionDenied,
-            ))),
-            _ => unreachable!("only List is issued"),
+                ],
+            )
+        } else {
+            let failure = entry_failure(&directory, FailureClass::PermissionDenied);
+            answer(&directory, Err(StorageRoleFailure::Entry(failure)))
         }
     }
 }

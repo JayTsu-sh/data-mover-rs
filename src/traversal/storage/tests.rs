@@ -9,7 +9,8 @@ use crate::model::{
     SymlinkTarget, SymlinkTargetEncoding, TimestampMetadata,
 };
 use crate::storage::ListingFacts;
-use crate::storage::{MetadataMutation, NamespaceRequest, NamespaceResult};
+use crate::storage::listing::testing::{answer, entries};
+use crate::storage::{ListRequest, ListingPage, ListingStream, MetadataMutation};
 
 struct FakeNamespace;
 struct FakeMetadata;
@@ -49,33 +50,38 @@ fn descriptor(value: &str, kind: EntryKind) -> SourceDescriptor {
     }
 }
 
+fn not_found() -> StorageRoleFailure {
+    StorageRoleFailure::Entry(entry_failure(&StoragePath::root(), FailureClass::NotFound))
+}
+
 #[async_trait]
 impl Namespace for FakeNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        match request {
-            NamespaceRequest::List(root) if root == StoragePath::root() => {
-                Ok(NamespaceResult::Entries(vec![
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let root = request.path;
+        if root == StoragePath::root() {
+            entries(
+                &root,
+                vec![
                     descriptor("dir", EntryKind::Directory),
                     descriptor("file", EntryKind::File),
                     descriptor("link", EntryKind::Symlink),
-                ]))
-            }
-            NamespaceRequest::List(root) if root == path("dir") => Ok(NamespaceResult::Entries(
-                vec![descriptor("dir/child", EntryKind::File)],
-            )),
-            NamespaceRequest::ReadLink(link) if link == path("link") => {
-                Ok(NamespaceResult::LinkTarget(
-                    SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, b"file".to_vec())
-                        .unwrap_or_else(|error| panic!("{error}")),
-                ))
-            }
-            _ => Err(StorageRoleFailure::Entry(entry_failure(
-                &StoragePath::root(),
-                FailureClass::NotFound,
-            ))),
+                ],
+            )
+        } else if root == path("dir") {
+            entries(&root, vec![descriptor("dir/child", EntryKind::File)])
+        } else {
+            answer(&root, Err(not_found()))
+        }
+    }
+
+    async fn read_link(&self, link: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure> {
+        if link == &path("link") {
+            Ok(
+                SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, b"file".to_vec())
+                    .unwrap_or_else(|error| panic!("{error}")),
+            )
+        } else {
+            Err(not_found())
         }
     }
 }
@@ -329,22 +335,20 @@ struct PartialListingNamespace;
 
 #[async_trait]
 impl Namespace for PartialListingNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        match request {
-            NamespaceRequest::List(root) if root == StoragePath::root() => Ok(
-                NamespaceResult::Entries(vec![descriptor("dir", EntryKind::Directory)]),
-            ),
-            NamespaceRequest::List(root) if root == path("dir") => Ok(NamespaceResult::Listing {
-                entries: vec![descriptor("dir/ok", EntryKind::File)],
-                failures: vec![entry_failure(&path("dir/bad"), FailureClass::Unsupported)],
-            }),
-            _ => Err(StorageRoleFailure::Entry(entry_failure(
-                &StoragePath::root(),
-                FailureClass::NotFound,
-            ))),
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let root = request.path;
+        if root == StoragePath::root() {
+            entries(&root, vec![descriptor("dir", EntryKind::Directory)])
+        } else if root == path("dir") {
+            answer(
+                &root,
+                Ok((
+                    vec![descriptor("dir/ok", EntryKind::File)],
+                    vec![entry_failure(&path("dir/bad"), FailureClass::Unsupported)],
+                )),
+            )
+        } else {
+            answer(&root, Err(not_found()))
         }
     }
 }
@@ -384,19 +388,17 @@ struct WideNamespace;
 
 #[async_trait]
 impl Namespace for WideNamespace {
-    async fn execute(
-        &self,
-        request: NamespaceRequest,
-    ) -> Result<NamespaceResult, StorageRoleFailure> {
-        match request {
-            NamespaceRequest::List(root) if root == StoragePath::root() => {
-                Ok(NamespaceResult::Entries(
-                    (0..12)
-                        .map(|index| descriptor(&format!("file-{index:02}"), EntryKind::File))
-                        .collect(),
-                ))
-            }
-            _ => Ok(NamespaceResult::Entries(Vec::new())),
+    fn list(&self, request: ListRequest) -> ListingStream {
+        let root = request.path;
+        if root == StoragePath::root() {
+            entries(
+                &root,
+                (0..12)
+                    .map(|index| descriptor(&format!("file-{index:02}"), EntryKind::File))
+                    .collect(),
+            )
+        } else {
+            entries(&root, Vec::new())
         }
     }
 }

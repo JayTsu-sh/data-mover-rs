@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 use crate::model::{EntryVersion, IdentityStrength, ObservedEntry, StoragePath};
 use crate::storage::backends::s3::tests::{MemoryS3, Versioning, content_md5, identity};
 use crate::storage::backends::s3::{S3Protocol as _, connect};
-use crate::storage::{NamespaceRequest, PreflightPolicy, SourceDescriptor, Storage};
+use crate::storage::listing::testing::{listed as listed_current, listed_versions};
+use crate::storage::{PreflightPolicy, SourceDescriptor, Storage};
 use crate::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest, ExpertSourceSession,
     InflightLimits, TransferOutcome,
@@ -55,14 +56,11 @@ fn observation(descriptor: &SourceDescriptor) -> TestResult<ObservedEntry> {
 /// Every listed `source` entry, current objects only or every version.
 async fn listed(storage: &Storage, all: bool) -> TestResult<Vec<ObservedEntry>> {
     let namespace = storage.namespace(&PreflightPolicy::production())?;
-    let result = if all {
-        namespace.list_versions(&StoragePath::root()).await?
+    let (entries, _) = if all {
+        listed_versions(&*namespace, &StoragePath::root()).await?
     } else {
-        namespace
-            .execute(NamespaceRequest::List(StoragePath::root()))
-            .await?
+        listed_current(&*namespace, &StoragePath::root()).await?
     };
-    let (entries, _) = result.into_listing().ok_or("not a listing")?;
     entries
         .iter()
         .filter(|entry| entry.path.as_str() == "source")
