@@ -98,9 +98,12 @@ deferred 决定随 `Settled::Child.descent` 走。两条路的 `max_depth` 与 f
    该目录报成错误而不是产出 epoch —— 填 epoch 会让增量同步认为所有条目都变了。目前
    CIFS (`QUERY_DIRECTORY`)、NFS (`readdirplus`)、HDFS (listing) 和 Local (unix 逐子项
    `fstatat`，Windows 直接取目录读回的属性) 都挂了，四个都可用。
-3. 列举里个别子项无法描述 (例如文件名拼不成 `StoragePath`) 时，backend 返回
-   `NamespaceResult::Listing { entries, failures }`，三个消费方用 `into_listing()` 统一
-   处理：失败逐项上报，兄弟条目照常。
+3. 列举里个别子项无法描述 (例如文件名拼不成 `StoragePath`、NFS READDIRPLUS 某项没带属性或
+   句柄、HDFS 某项 status 转换不了) 时，backend 返回 `NamespaceResult::Listing { entries, failures }`
+   (`NamespaceResult::from_children` 构造)，三个消费方用 `into_listing()` 统一处理：失败逐项上报，
+   兄弟条目照常。Local / CIFS / NFS / HDFS 都只让关乎目录本身的错误 (打不开、读目录失败) 整个失败；
+   S3 的名字拼不出同样逐项报，但单个对象的 size / key 异常仍是会话失败 (待修)。分类见
+   [error-taxonomy.md](error-taxonomy.md)「列举」。
 
 **关键点**：没有 `Storage` trait，没有 `dyn Storage`，没有 vtable。这是有意的 — 4 个 backend 协议差异极大，trait 抽象会塞 30+ 默认方法和大量 `Self`-bound 限制，不如 enum + match 直接。
 

@@ -4,13 +4,17 @@ use async_trait::async_trait;
 
 use super::metadata::{CifsInlineMetadata, timestamp};
 use super::source::{
-    CifsSourceFacts, classify, descriptor_from_facts, entry_failure, is_directory_not_empty,
-    is_not_found, smb_attributes_to_mode,
+    CifsSourceFacts, classify, descriptor_from_facts, entry_failure, entry_failure_with_transience,
+    is_directory_not_empty, is_not_found, smb_attributes_to_mode,
 };
 use crate::model::TimestampMetadata;
-use crate::model::{BackendIdentity, EntryKind, FailureClass, Operation, StoragePath};
+use crate::model::{
+    BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
+};
 use crate::storage::artifacts::is_artifact_path;
-use crate::storage::{Namespace, NamespaceRequest, NamespaceResult, StorageRoleFailure};
+use crate::storage::{
+    Namespace, NamespaceRequest, NamespaceResult, SourceDescriptor, StorageRoleFailure,
+};
 
 /// Protocol verbs behind the CIFS namespace role.
 ///
@@ -62,35 +66,47 @@ impl CifsNamespace {
             .list(path)
             .await
             .map_err(|error| classify(path, Operation::Traverse, &error))?;
-        // Transfer artifacts never appear in a listing (ADR-0006 C3b).
-        let entries = facts
-            .into_iter()
-            .filter(|(child, _)| {
-                let artifact = is_artifact_path(child.as_str());
-                if artifact {
-                    tracing::trace!("[CIFS] listing skips transfer artifact {}", child.as_str());
+        // Transfer artifacts never appear in a listing (ADR-0006 C3b). A child that cannot be
+        // described is reported on its own, beside the siblings that could be: the directory
+        // itself was listed, so failing it whole would drop them.
+        let mut entries = Vec::with_capacity(facts.len());
+        let mut failures = Vec::new();
+        for (child, inline) in facts {
+            if is_artifact_path(child.as_str()) {
+                tracing::trace!("[CIFS] listing skips transfer artifact {}", child.as_str());
+                continue;
+            }
+            match self.describe_listed(&child, &inline) {
+                Ok(descriptor) => entries.push(descriptor),
+                Err(StorageRoleFailure::Entry(failure)) => {
+                    failures.push(undescribed(&child, &failure));
                 }
-                !artifact
-            })
-            .map(|(child, inline)| {
-                descriptor_from_facts(&self.identity, &child, &inline.facts, Operation::Traverse)
-                    .map(|descriptor| {
-                        let descriptor = descriptor.with_inline_timestamps(TimestampMetadata {
-                            accessed: timestamp(inline.accessed),
-                            modified: timestamp(inline.modified),
-                            created: timestamp(inline.created),
-                        });
-                        match inline.readonly {
-                            Some(readonly) => descriptor.with_inline_mode(smb_attributes_to_mode(
-                                inline.facts.kind == EntryKind::Directory,
-                                readonly,
-                            )),
-                            None => descriptor,
-                        }
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(NamespaceResult::Entries(entries))
+                Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
+            }
+        }
+        Ok(NamespaceResult::from_children(entries, failures))
+    }
+
+    /// One listed child with the timestamps and mode its `QUERY_DIRECTORY` record carries.
+    fn describe_listed(
+        &self,
+        child: &StoragePath,
+        inline: &CifsInlineMetadata,
+    ) -> Result<SourceDescriptor, StorageRoleFailure> {
+        let descriptor =
+            descriptor_from_facts(&self.identity, child, &inline.facts, Operation::Traverse)?
+                .with_inline_timestamps(TimestampMetadata {
+                    accessed: timestamp(inline.accessed),
+                    modified: timestamp(inline.modified),
+                    created: timestamp(inline.created),
+                });
+        Ok(match inline.readonly {
+            Some(readonly) => descriptor.with_inline_mode(smb_attributes_to_mode(
+                inline.facts.kind == EntryKind::Directory,
+                readonly,
+            )),
+            None => descriptor,
+        })
     }
 
     /// Deletes one file or empty directory. A directory that only transfer artifacts keep
@@ -172,6 +188,20 @@ impl CifsNamespace {
             );
         }
         Ok(Some(removals))
+    }
+}
+
+/// A listed child's failure, saying that the listing could not describe it.
+fn undescribed(child: &StoragePath, failure: &EntryOperationFailure) -> EntryOperationFailure {
+    match entry_failure_with_transience(
+        child,
+        Operation::Traverse,
+        failure.class(),
+        failure.transience(),
+        "CIFS listing could not describe the entry",
+    ) {
+        StorageRoleFailure::Entry(failure) => failure,
+        StorageRoleFailure::Session(_) => unreachable!("an entry failure is built"),
     }
 }
 

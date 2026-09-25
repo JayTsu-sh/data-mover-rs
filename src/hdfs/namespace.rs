@@ -1,3 +1,22 @@
+/// A child of an HDFS listing that could not be described.
+#[derive(Debug)]
+pub(crate) struct UndescribedHdfsChild {
+    /// The child's path relative to the root, when the listing named an immediate child of the
+    /// listed directory; `None` blames the directory itself.
+    pub(crate) relative_path: Option<PathBuf>,
+    pub(crate) error: StorageError,
+}
+
+/// The legacy listing contract: every child, or the first child that could not be described.
+fn first_failure(
+    children: Vec<Result<HDFSEntry, UndescribedHdfsChild>>,
+) -> Result<Vec<HDFSEntry>, StorageError> {
+    children
+        .into_iter()
+        .map(|child| child.map_err(|undescribed| undescribed.error))
+        .collect()
+}
+
 /// Concrete HDFS client ownership and root-isolation shell.
 #[derive(Clone, Debug)]
 pub struct HDFSStorage {
@@ -272,6 +291,16 @@ impl HDFSStorage {
         &self,
         relative_path: &std::path::Path,
     ) -> Result<Vec<HDFSEntry>, StorageError> {
+        first_failure(self.list_directory_children(relative_path).await?)
+    }
+
+    /// [`Self::list_directory`] that keeps going past a child it cannot describe: each child is
+    /// its entry or why it could not be described, in listing order. Only a failure that concerns
+    /// the directory itself (missing, not a directory, the listing RPC) fails the whole call.
+    pub(crate) async fn list_directory_children(
+        &self,
+        relative_path: &std::path::Path,
+    ) -> Result<Vec<Result<HDFSEntry, UndescribedHdfsChild>>, StorageError> {
         let directory = self.get_metadata(relative_path).await?;
         if !directory.is_dir {
             return Err(StorageError::InvalidPath(format!(
@@ -284,7 +313,7 @@ impl HDFSStorage {
             self.client.list_status(&path, false)
         })
         .await?;
-        self.entries_from_listing(statuses, &directory.relative_path)
+        Ok(self.children_from_listing(statuses, &directory.relative_path))
     }
 
     /// [`Self::list_directory`] without transfer artifacts (ADR-0006 C3b): what `walkdir` and
@@ -307,19 +336,39 @@ impl HDFSStorage {
         Ok(entries)
     }
 
+    #[cfg(test)]
     fn entries_from_listing(
         &self,
         statuses: Vec<hdfs_native::client::FileStatus>,
         directory: &std::path::Path,
     ) -> Result<Vec<HDFSEntry>, StorageError> {
+        first_failure(self.children_from_listing(statuses, directory))
+    }
+
+    /// Converts one listing child by child. A child is blamed under its own path when that path
+    /// is an immediate child of `directory`; otherwise (outside the root, or not immediate) the
+    /// failure has no path of its own in this directory and is blamed on the directory.
+    fn children_from_listing(
+        &self,
+        statuses: Vec<hdfs_native::client::FileStatus>,
+        directory: &std::path::Path,
+    ) -> Vec<Result<HDFSEntry, UndescribedHdfsChild>> {
         statuses
             .into_iter()
             .map(|status| {
-                let entry = self.entry_from_status(status)?;
+                let own_path = strip_root(&status.path, self.location.root())
+                    .ok()
+                    .map(PathBuf::from)
+                    .filter(|path| path.parent() == Some(directory));
+                let undescribed = |error| UndescribedHdfsChild {
+                    relative_path: own_path.clone(),
+                    error,
+                };
+                let entry = self.entry_from_status(status).map_err(undescribed)?;
                 if entry.relative_path.parent() != Some(directory) {
-                    return Err(config_error(
+                    return Err(undescribed(config_error(
                         "HDFS directory listing returned a non-immediate child",
-                    ));
+                    )));
                 }
                 Ok(entry)
             })

@@ -140,6 +140,10 @@ legacy `CifsStorage` 的能力在 role-based backend 里的去向 —— 有对�
   `inline_mode` 只服务于 NDX 输出的直接后果。
   根治要给 smb-rs 的 `RuntimeMetadata` / `ResourceMetadata` 加属性位 —— 底层 stat 本来就在查
   `FileBasicInformation`，数据已在响应里、零额外往返，适合和 file id 合成同一个上游 PR。
+- **列举里单个子项描述不出来时只让它自己失败**：`namespace.rs list` 把 `descriptor_from_facts` 的条目失败
+  收进 `NamespaceResult::Listing` 的 `failures`（报在子项路径，`Protocol` / Permanent），兄弟照常，遍历报
+  `Partial`；之前一个坏子项让整个目录失败（P7 评审现存问题 2）。`protocol.rs list` 里子项名拼不成
+  `StoragePath`（只有含 NUL 或超 16 MiB 才会）仍让整个目录失败 —— SMB 名字不可能如此，没有为它改协议 trait。
 - **列举里的 reparse point 一律当普通文件**。`protocol.rs list` 明确不把它映射成 `Symlink`
   (facade 读不了 link target，`Symlink` 会把遍历送进不支持的 `ReadLink`)，所以
   `NASEntry.is_symlink` 恒 `false`，filter 表达式里的 `type == "symlink"` 在 CIFS 上恒不匹配。

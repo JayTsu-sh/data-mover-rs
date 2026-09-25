@@ -5,7 +5,9 @@ use bytes::{Bytes, BytesMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
-use super::protocol::{HdfsEntryFacts, HdfsProtocol, HdfsWriteSession, entry_failure};
+use super::protocol::{
+    HdfsEntryFacts, HdfsListedChild, HdfsProtocol, HdfsWriteSession, entry_failure,
+};
 use crate::model::{EntryKind, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::StorageRoleFailure;
 use crate::storage::artifacts::{ArtifactKind, parse_artifact_name};
@@ -30,6 +32,7 @@ pub(crate) struct MemoryHdfs {
     delayed_reads: std::sync::atomic::AtomicBool,
     fail_write: std::sync::atomic::AtomicBool,
     fail_rename_after_commit: std::sync::atomic::AtomicBool,
+    undescribable: Mutex<Vec<String>>,
 }
 
 /// Whether `path` names a pointer artifact or its temporary, exactly (not a data file whose name
@@ -70,6 +73,12 @@ impl MemoryHdfs {
     pub(crate) fn stabilize_calls(&self) -> usize {
         self.stabilize_calls.load(Ordering::SeqCst)
     }
+    /// Lists `path` as a child the listing cannot describe (as a real listing does for a status
+    /// whose time or size does not convert).
+    pub(crate) async fn make_undescribable(&self, path: &str) {
+        self.undescribable.lock().await.push(path.into());
+    }
+
     pub(crate) async fn insert(&self, path: &str, value: Bytes) {
         self.objects.lock().await.insert(path.into(), value);
     }
@@ -151,12 +160,13 @@ impl HdfsProtocol for MemoryHdfs {
         Ok(Self::facts(path, value.len() as u64))
     }
 
-    async fn list(&self, path: &StoragePath) -> Result<Vec<HdfsEntryFacts>, StorageRoleFailure> {
+    async fn list(&self, path: &StoragePath) -> Result<Vec<HdfsListedChild>, StorageRoleFailure> {
         let prefix = if path.as_str().is_empty() {
             String::new()
         } else {
             format!("{}/", path.as_str())
         };
+        let undescribable = self.undescribable.lock().await.clone();
         let objects = self.objects.lock().await;
         Ok(objects
             .iter()
@@ -164,7 +174,20 @@ impl HdfsProtocol for MemoryHdfs {
                 let relative = name.strip_prefix(&prefix)?;
                 (!relative.contains('/')).then(|| {
                     let path = StoragePath::new(name).unwrap_or_else(|error| panic!("{error}"));
-                    Self::facts(&path, value.len() as u64)
+                    if undescribable.contains(name) {
+                        return Err(
+                            match entry_failure(
+                                &path,
+                                Operation::Traverse,
+                                FailureClass::InvalidInput,
+                                Transience::Permanent,
+                            ) {
+                                StorageRoleFailure::Entry(failure) => failure,
+                                StorageRoleFailure::Session(_) => unreachable!("entry failure"),
+                            },
+                        );
+                    }
+                    Ok(Self::facts(&path, value.len() as u64))
                 })
             })
             .collect())

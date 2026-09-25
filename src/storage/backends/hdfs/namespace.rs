@@ -28,6 +28,29 @@ impl HdfsNamespace {
         let facts = self.protocol.stat(path).await?;
         descriptor(&self.identity, path.clone(), &facts)
     }
+
+    /// Transfer artifacts never appear in a listing (ADR-0006 C3b); the protocol listing stays
+    /// raw for callers that must find them. A child that cannot be described is reported on its
+    /// own, beside the siblings that could be.
+    async fn list(&self, path: &StoragePath) -> Result<NamespaceResult, StorageRoleFailure> {
+        let children = self.protocol.list(path).await?;
+        let mut entries = Vec::with_capacity(children.len());
+        let mut failures = Vec::new();
+        for child in children {
+            let described = match child {
+                Ok(facts) if is_artifact_path(facts.path.as_str()) => continue,
+                Ok(facts) => descriptor(&self.identity, facts.path.clone(), &facts),
+                Err(failure) if is_artifact_path(failure.path().as_str()) => continue,
+                Err(failure) => Err(StorageRoleFailure::Entry(failure)),
+            };
+            match described {
+                Ok(descriptor) => entries.push(descriptor),
+                Err(StorageRoleFailure::Entry(failure)) => failures.push(failure),
+                Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
+            }
+        }
+        Ok(NamespaceResult::from_children(entries, failures))
+    }
 }
 
 #[async_trait]
@@ -41,17 +64,7 @@ impl Namespace for HdfsNamespace {
             NamespaceRequest::Stat(path) => {
                 Ok(NamespaceResult::Entries(vec![self.stat(&path).await?]))
             }
-            NamespaceRequest::List(path) => {
-                let entries = self.protocol.list(&path).await?;
-                // Transfer artifacts never appear in a listing (ADR-0006 C3b); the protocol
-                // listing stays raw for callers that must find them.
-                let values = entries
-                    .iter()
-                    .filter(|facts| !is_artifact_path(facts.path.as_str()))
-                    .map(|facts| descriptor(&self.identity, facts.path.clone(), facts))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(NamespaceResult::Entries(values))
-            }
+            NamespaceRequest::List(path) => self.list(&path).await,
             NamespaceRequest::ReadLink(path) => Err(failure(&path, FailureClass::Unsupported)),
             NamespaceRequest::CreateDirectory(path) => {
                 refuse_root(&path)?;
@@ -161,6 +174,41 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(raw.len(), 2);
+    }
+
+    /// A child the listing could not describe is an entry failure at its own path; its
+    /// siblings are still listed, and an undescribable artifact stays hidden.
+    #[tokio::test]
+    async fn an_undescribable_child_fails_alone() {
+        let protocol = Arc::new(super::super::contract_tests::MemoryHdfs::default());
+        for name in ["a.txt", "bad.txt", "c.txt", ".data-mover-0123.part"] {
+            protocol.insert(name, bytes::Bytes::from_static(b"a")).await;
+        }
+        protocol.make_undescribable("bad.txt").await;
+        protocol.make_undescribable(".data-mover-0123.part").await;
+        let namespace = HdfsNamespace::new(
+            Arc::clone(&protocol),
+            BackendIdentity::new(crate::model::BackendKind::Hdfs, "hdfs://nn:8020")
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        let listed = namespace
+            .execute(NamespaceRequest::List(StoragePath::root()))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let NamespaceResult::Listing { entries, failures } = listed else {
+            panic!("expected a partial listing, got {listed:?}");
+        };
+        let mut names = entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, vec!["a.txt", "c.txt"]);
+        let failed = failures
+            .iter()
+            .map(|failure| failure.path().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(failed, vec!["bad.txt"]);
     }
 
     #[test]

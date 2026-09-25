@@ -29,7 +29,10 @@ use crate::storage::backends::nfs::common::{
     NfsFactsError, NfsFactsProvider, NfsFailureCode, NfsInstanceFacts, NfsRetryAction,
     NfsRetryPolicy,
 };
-use crate::storage::backends::nfs::namespace::{NfsNamespaceObservation, NfsNamespaceProtocol};
+use crate::storage::backends::nfs::namespace::{
+    NfsListedChild, NfsNamespaceObservation, NfsNamespaceProtocol, NfsUndescribedChild,
+    undescribed_child,
+};
 use crate::storage::backends::nfs::source::{
     NfsProtocolFailure, NfsReadCursor, NfsSourceObservation, NfsSourceProtocol,
 };
@@ -592,13 +595,39 @@ fn role_kind(attrs: &Attr) -> crate::model::EntryKind {
 
 use crate::storage::backends::nfs::metadata::timestamp as nfs_timestamp;
 
+/// A READDIRPLUS entry the role listing could not turn into an [`EntryEnum`].
+pub(crate) struct RoleOmittedEntry {
+    relative_path: PathBuf,
+    reason: &'static str,
+}
+
+/// One READDIRPLUS entry of a role listing, in the order the server sent it.
+pub(crate) type RoleListedEntry = std::result::Result<EntryEnum, RoleOmittedEntry>;
+
+/// One entry of a role listing as [`NfsNamespaceProtocol::list`] reports it.
+fn role_child(directory: &crate::model::StoragePath, child: &RoleListedEntry) -> NfsListedChild {
+    match child {
+        Ok(entry) => role_observation(directory, entry),
+        Err(omitted) => Err(undescribed_child(
+            directory,
+            &omitted.relative_path,
+            omitted.reason,
+        )),
+    }
+}
+
 fn role_observation(
+    directory: &crate::model::StoragePath,
     entry: &EntryEnum,
-) -> std::result::Result<NfsNamespaceObservation, NfsProtocolFailure> {
+) -> std::result::Result<NfsNamespaceObservation, NfsUndescribedChild> {
+    let child = entry.get_relative_path();
+    // An empty handle is what `post_op_fh3::FALSE` (v3) or a v4 entry whose attributes lack
+    // `FATTR4_FILEHANDLE` leaves: no identity can be built from it.
     let file_handle = entry
         .get_file_handle()
+        .filter(|handle| !handle.is_empty())
         .cloned()
-        .ok_or_else(NfsProtocolFailure::protocol)?;
+        .ok_or_else(|| undescribed_child(directory, child, "the server returned no file handle"))?;
     let kind = if entry.get_is_symlink() {
         crate::model::EntryKind::Symlink
     } else if entry.get_is_dir() {
@@ -606,8 +635,8 @@ fn role_observation(
     } else {
         crate::model::EntryKind::File
     };
-    let path = crate::model::StoragePath::new(entry.get_relative_path().to_string_lossy())
-        .map_err(|_| NfsProtocolFailure::protocol())?;
+    let path = crate::model::StoragePath::new(child.to_string_lossy())
+        .map_err(|_| undescribed_child(directory, child, "its name cannot be spelled"))?;
     let (timestamps, mode) = match entry {
         EntryEnum::NAS(nas) => (
             Some(crate::model::TimestampMetadata {
@@ -662,13 +691,14 @@ impl NfsNamespaceProtocol for NFSStorage {
     async fn list(
         &self,
         path: &crate::model::StoragePath,
-    ) -> std::result::Result<Vec<NfsNamespaceObservation>, NfsProtocolFailure> {
-        self.list_role_entries(&PathBuf::from(path.as_str()))
+    ) -> std::result::Result<Vec<NfsListedChild>, NfsProtocolFailure> {
+        Ok(self
+            .list_role_entries(&PathBuf::from(path.as_str()))
             .await
             .map_err(classify_role_error)?
             .iter()
-            .map(role_observation)
-            .collect()
+            .map(|child| role_child(path, child))
+            .collect())
     }
 
     async fn read_link(
@@ -4607,7 +4637,10 @@ impl NFSStorage {
     /// sorts in the cursor. Sorting here bought nothing: it cost an `O(n log n)` pass per
     /// directory, and it was the reason this backend looked ordered while the CIFS and Local
     /// namespaces, which do not sort, did not.
-    pub(crate) async fn list_role_entries(&self, relative_path: &Path) -> Result<Vec<EntryEnum>> {
+    pub(crate) async fn list_role_entries(
+        &self,
+        relative_path: &Path,
+    ) -> Result<Vec<RoleListedEntry>> {
         for attempt in 0..=MAX_STALE_RETRIES {
             match self.list_role_entries_once(relative_path).await? {
                 Ok(entries) => return Ok(entries),
@@ -4642,7 +4675,7 @@ impl NFSStorage {
     async fn list_role_entries_once(
         &self,
         relative_path: &Path,
-    ) -> Result<std::result::Result<Vec<EntryEnum>, NfsError>> {
+    ) -> Result<std::result::Result<Vec<RoleListedEntry>, NfsError>> {
         let directory = self.lookup_fh(relative_path).await?;
         let mount = self.mount.clone();
         let mut stream = mount.readdirplus(directory.fh).await;
@@ -4654,11 +4687,10 @@ impl NFSStorage {
                 // and keeping them would duplicate every entry read before the failure.
                 Err(error) => return Ok(Err(error)),
             };
-            let attrs = entry.attr.ok_or_else(|| {
-                StorageError::NfsError("NFS directory entry omitted attributes".to_owned())
-            })?;
             let child = relative_path.join(&entry.file_name);
-            if Self::caches_directory_handle(attrs.type_, &entry.handle) {
+            if let Some(attrs) = &entry.attr
+                && Self::caches_directory_handle(attrs.type_, &entry.handle)
+            {
                 // The listing already carries this directory's handle, so caching it is what
                 // spares the descent a LOOKUP. The handle is a slice of the readdirplus page
                 // buffer, so it is copied: keeping the slice would pin the whole 8 KiB page for
@@ -4668,26 +4700,47 @@ impl NFSStorage {
                     Bytes::copy_from_slice(&entry.handle),
                 );
             }
-            let extension = child
-                .extension()
-                .and_then(|value| value.to_str())
-                .map(str::to_owned);
-            entries.push(EntryEnum::NAS(NASEntry::from_nfs_attrs(
-                entry.file_name,
+            entries.push(Self::role_listed_entry(
                 child,
-                extension,
-                &attrs,
-                entry.handle,
-                // The only consumer of this listing is `role_observation`, which reads the
-                // handle, the kind, the path, the timestamps, the mode and the size — never the
-                // ACL, owner or group. Filling them would clone two `String`s and an `Acl` per
-                // entry for nothing, which at fifty million entries is not nothing. Restore
-                // `from_attrs` here the moment that observation starts reporting them.
-                NfsEnrich::default(),
+                entry,
                 self.owners_are_strings(),
-            )));
+            ));
         }
         Ok(Ok(entries))
+    }
+
+    /// One READDIRPLUS entry of a role listing. READDIRPLUS may leave an entry's attributes
+    /// out (`post_op_attr` is optional in v3): that entry cannot be described, its siblings still
+    /// can.
+    fn role_listed_entry(
+        child: PathBuf,
+        entry: nfs_rs::ReaddirplusEntry,
+        owners_are_strings: bool,
+    ) -> RoleListedEntry {
+        let Some(attrs) = entry.attr else {
+            return Err(RoleOmittedEntry {
+                relative_path: child,
+                reason: "the server omitted its attributes",
+            });
+        };
+        let extension = child
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_owned);
+        Ok(EntryEnum::NAS(NASEntry::from_nfs_attrs(
+            entry.file_name,
+            child,
+            extension,
+            &attrs,
+            entry.handle,
+            // The only consumer of this listing is `role_observation`, which reads the handle,
+            // the kind, the path, the timestamps, the mode and the size — never the ACL, owner or
+            // group. Filling them would clone two `String`s and an `Acl` per entry for nothing,
+            // which at fifty million entries is not nothing. Restore `from_attrs` here the moment
+            // that observation starts reporting them.
+            NfsEnrich::default(),
+            owners_are_strings,
+        )))
     }
 
     fn finish_read_dir(
@@ -5409,5 +5462,66 @@ mod tests {
         let (got, calls) = drive_read_loop(&content, 0, 0, 1024, usize::MAX);
         assert!(got.is_empty());
         assert!(calls.is_empty());
+    }
+
+    fn listed(name: &str, attr: Option<nfs_rs::Attr>, handle: &'static [u8]) -> RoleListedEntry {
+        NFSStorage::role_listed_entry(
+            PathBuf::from("dir").join(name),
+            nfs_rs::ReaddirplusEntry {
+                fileid: 1,
+                file_name: name.to_owned(),
+                attr,
+                handle: Bytes::from_static(handle),
+            },
+            false,
+        )
+    }
+
+    fn regular() -> nfs_rs::Attr {
+        nfs_rs::Attr {
+            type_: FType3::NF3REG as u32,
+            filesize: 3,
+            ..nfs_rs::Attr::default()
+        }
+    }
+
+    /// A READDIRPLUS entry without attributes, or without a file handle, cannot be described:
+    /// it becomes an entry failure at its own path (`Protocol`, retrying may or may not help),
+    /// while the entries beside it are still observed.
+    #[test]
+    fn an_entry_without_attributes_or_handle_fails_alone() {
+        let directory =
+            crate::model::StoragePath::new("dir").unwrap_or_else(|error| panic!("{error}"));
+        let children: Vec<NfsListedChild> = [
+            listed("before", Some(regular()), b"h1"),
+            listed("no-attrs", None, b"h2"),
+            listed("no-handle", Some(regular()), b""),
+            listed("after", Some(regular()), b"h3"),
+        ]
+        .iter()
+        .map(|child| role_child(&directory, child))
+        .collect();
+        let observed: Vec<&str> = children
+            .iter()
+            .filter_map(|child| child.as_ref().ok())
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(observed, ["dir/before", "dir/after"]);
+        let failed: Vec<(&str, &str)> = children
+            .iter()
+            .filter_map(|child| child.as_ref().err())
+            .map(|child| (child.path.as_str(), child.reason))
+            .collect();
+        assert_eq!(
+            failed,
+            [
+                ("dir/no-attrs", "the server omitted its attributes"),
+                ("dir/no-handle", "the server returned no file handle"),
+            ]
+        );
+        for child in children.iter().filter_map(|child| child.as_ref().err()) {
+            assert_eq!(child.failure.class, crate::model::FailureClass::Protocol);
+            assert_eq!(child.failure.transience, crate::model::Transience::Unknown);
+        }
     }
 }

@@ -132,6 +132,11 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 
 - legacy `walkdir` / `walkdir_2` 与 role namespace `List` 都隐藏 `.data-mover-*`（相对根的任一段，先于过滤
   与 GETATTR）；role namespace 拒绝寻址它们。
+- role `List`（`list_role_entries` → `role_listed_entry` / `role_observation`）里某项描述不出来 ——
+  READDIRPLUS 没带属性（v3 `post_op_attr` 可省；v4 的 fattr4 解不出时 nfs-rs 也给 None）、没带文件句柄（v3
+  `post_op_fh3` FALSE、v4 属性里没有 `FATTR4_FILEHANDLE`）——
+  报成该子项自己的 `Protocol` / Unknown 条目失败，兄弟照常，列举 `Partial`（之前整个目录失败；P7 评审现存问题 2）。
+  只有 LOOKUP 目录、READDIRPLUS 流本身出错才让整个列举失败。后续可考虑对缺属性 / 句柄的项补一次 LOOKUP。
 - legacy `delete_dir_all(_with_progress)` 内部走 `walk_listing(.., hide_artifacts=false)`：不这样的话
   含 artifact 的目录 `rmdir` 会失败，而事件只记日志、`error: None`，静默删不干净。role `Delete(dir)`
   走的就是它，所以 NFS 的 `delete_tree` 不需要额外清扫。

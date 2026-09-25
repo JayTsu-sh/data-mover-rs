@@ -24,6 +24,9 @@ pub(crate) struct HdfsEntryFacts {
     pub block_size: Option<u64>,
 }
 
+/// One child of a listing: its facts, or why it could not be described.
+pub(crate) type HdfsListedChild = Result<HdfsEntryFacts, EntryOperationFailure>;
+
 #[async_trait]
 pub(crate) trait HdfsReadCursor: Send + Sync {
     async fn read_range(&self, range: Range<u64>) -> Result<Bytes, StorageRoleFailure>;
@@ -55,7 +58,9 @@ pub(crate) trait HdfsProtocol: Send + Sync {
         Ok(None)
     }
     async fn stat(&self, path: &StoragePath) -> Result<HdfsEntryFacts, StorageRoleFailure>;
-    async fn list(&self, path: &StoragePath) -> Result<Vec<HdfsEntryFacts>, StorageRoleFailure>;
+    /// The immediate children of `path`, each described or the entry-scoped reason it could not
+    /// be; a failure of the directory itself fails the whole call.
+    async fn list(&self, path: &StoragePath) -> Result<Vec<HdfsListedChild>, StorageRoleFailure>;
     async fn read_range(
         &self,
         path: &StoragePath,

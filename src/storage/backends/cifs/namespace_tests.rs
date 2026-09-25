@@ -366,6 +366,9 @@ fn identity_bytes_track_content_change_and_ignore_directory_length() {
 /// Listing protocol whose records carry the read-only attribute, as `QUERY_DIRECTORY` does.
 struct ListingProtocol {
     entries: Vec<(String, EntryKind, Option<bool>)>,
+    /// The entry whose record carries identity bytes too large for any source identity: a child
+    /// the listing cannot describe.
+    undescribable: Option<&'static str>,
 }
 
 #[async_trait]
@@ -390,13 +393,18 @@ impl CifsNamespaceProtocol for ListingProtocol {
             .map(|(name, kind, readonly)| {
                 let child = StoragePath::new(format!("{}/{name}", path.as_str()))
                     .map_err(|_| smb_domain::Error::InvalidArgument("invalid path".into()))?;
+                let identity = if self.undescribable == Some(name.as_str()) {
+                    Bytes::from(vec![0_u8; 16 * 1024 * 1024 + 1])
+                } else {
+                    Bytes::from_static(b"listed")
+                };
                 Ok((
                     child,
                     CifsInlineMetadata {
                         facts: CifsSourceFacts {
                             kind: *kind,
                             size: 3,
-                            identity: Bytes::from_static(b"listed"),
+                            identity,
                             file_id: None,
                             maximum_read_chunk: u32::MAX,
                         },
@@ -434,6 +442,7 @@ async fn listing_derives_mode_from_the_read_only_attribute_per_entry() -> Result
             ("plain.dir".to_owned(), EntryKind::Directory, Some(false)),
             ("unknown.bin".to_owned(), EntryKind::File, None),
         ],
+        undescribable: None,
     });
     let namespace = CifsNamespace::new(
         protocol,
@@ -453,6 +462,43 @@ async fn listing_derives_mode_from_the_read_only_attribute_per_entry() -> Result
         observed,
         vec![Some(0o444), Some(0o644), Some(0o555), Some(0o755), None,],
         "a record without the attribute stays None instead of claiming the entry is writable"
+    );
+    Ok(())
+}
+
+/// A child that cannot be described is an entry failure at its own path; the listing itself
+/// succeeded, so its siblings are still delivered (a `Listing`, which traversal reports
+/// `Partial`), and a transfer artifact stays hidden either way.
+#[tokio::test]
+async fn an_undescribable_child_fails_alone() -> Result {
+    let protocol = Arc::new(ListingProtocol {
+        entries: vec![
+            ("before.bin".to_owned(), EntryKind::File, Some(false)),
+            ("bad.bin".to_owned(), EntryKind::File, Some(false)),
+            ("after.dir".to_owned(), EntryKind::Directory, Some(false)),
+            (".data-mover-x.part".to_owned(), EntryKind::File, None),
+        ],
+        undescribable: Some("bad.bin"),
+    });
+    let namespace = CifsNamespace::new(
+        protocol,
+        BackendIdentity::new(BackendKind::Cifs, "cifs-undescribable-test")?,
+    );
+    let NamespaceResult::Listing { entries, failures } = namespace
+        .execute(NamespaceRequest::List(path("dir")?))
+        .await?
+    else {
+        return Err("a listing with an undescribable child must be a partial listing".into());
+    };
+    let listed: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+    assert_eq!(listed, ["dir/before.bin", "dir/after.dir"]);
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].path().as_str(), "dir/bad.bin");
+    assert_eq!(failures[0].class(), FailureClass::Protocol);
+    assert!(failures[0].diagnostic().contains("could not describe"));
+    assert_eq!(
+        failures[0].transience(),
+        crate::model::Transience::Permanent
     );
     Ok(())
 }

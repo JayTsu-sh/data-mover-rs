@@ -499,6 +499,21 @@ pub enum NamespaceResult {
 }
 
 impl NamespaceResult {
+    /// A directory listing from the children that could be described and one entry-scoped
+    /// failure per child that could not: `Entries` when every child was described, `Listing`
+    /// otherwise.
+    #[must_use]
+    pub fn from_children(
+        entries: Vec<SourceDescriptor>,
+        failures: Vec<EntryOperationFailure>,
+    ) -> Self {
+        if failures.is_empty() {
+            Self::Entries(entries)
+        } else {
+            Self::Listing { entries, failures }
+        }
+    }
+
     /// Splits a `List` or `Stat` result into described children and per-child failures.
     ///
     /// Returns `None` for results that are not listings.

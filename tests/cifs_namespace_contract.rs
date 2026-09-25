@@ -232,8 +232,12 @@ async fn exercise_delete(namespace: &dyn Namespace, dir: &str, file: &str) -> Re
 }
 
 async fn cleanup(namespace: &dyn Namespace, dir: &str) -> Result {
-    let Ok(NamespaceResult::Entries(entries)) =
-        namespace.execute(NamespaceRequest::List(path(dir)?)).await
+    // A partial listing still names every child it could describe: delete those.
+    let Some((entries, _)) = namespace
+        .execute(NamespaceRequest::List(path(dir)?))
+        .await
+        .ok()
+        .and_then(NamespaceResult::into_listing)
     else {
         return Ok(());
     };

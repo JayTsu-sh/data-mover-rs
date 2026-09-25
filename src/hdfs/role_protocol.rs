@@ -4,11 +4,13 @@ use bytes::Bytes as RoleBytes;
 
 use crate::error::HdfsErrorKind as RoleHdfsErrorKind;
 use crate::model::{
-    EntryKind as RoleEntryKind, FailureClass as RoleFailureClass, Operation as RoleOperation,
+    EntryKind as RoleEntryKind, EntryOperationFailure as RoleEntryFailure,
+    FailureClass as RoleFailureClass, Operation as RoleOperation,
     StoragePath as RoleStoragePath, Transience as RoleTransience,
 };
 use crate::storage::backends::hdfs::protocol::{
-    HdfsEntryFacts as RoleHdfsEntryFacts, HdfsProtocol as RoleHdfsProtocol,
+    HdfsEntryFacts as RoleHdfsEntryFacts, HdfsListedChild as RoleHdfsListedChild,
+    HdfsProtocol as RoleHdfsProtocol,
     HdfsWriteSession as RoleHdfsWriteSession,
     entry_failure as role_entry_failure, session_failure as role_session_failure,
 };
@@ -43,24 +45,15 @@ impl RoleHdfsProtocol for HDFSStorage {
         Ok(hdfs_role_facts(path.clone(), entry))
     }
 
-    async fn list(&self, path: &RoleStoragePath) -> Result<Vec<RoleHdfsEntryFacts>, RoleFailure> {
-        self.list_directory(Path::new(path.as_str()))
+    async fn list(&self, path: &RoleStoragePath) -> Result<Vec<RoleHdfsListedChild>, RoleFailure> {
+        let children = self
+            .list_directory_children(Path::new(path.as_str()))
             .await
-            .map_err(|error| hdfs_role_error(path, RoleOperation::Traverse, error))?
+            .map_err(|error| hdfs_role_error(path, RoleOperation::Traverse, error))?;
+        Ok(children
             .into_iter()
-            .map(|entry| {
-                let entry_path = RoleStoragePath::new(entry.relative_path.to_string_lossy())
-                    .map_err(|_| {
-                        hdfs_role_entry(
-                            path,
-                            RoleOperation::Traverse,
-                            RoleFailureClass::Protocol,
-                            RoleTransience::Permanent,
-                        )
-                    })?;
-                Ok(hdfs_role_facts(entry_path, entry))
-            })
-            .collect()
+            .map(|child| hdfs_role_child(path, child))
+            .collect())
     }
 
     async fn read_range(
@@ -353,6 +346,33 @@ fn invalid_stage_chunk(path: &RoleStoragePath) -> RoleFailure {
         RoleFailureClass::InvalidInput,
         RoleTransience::Permanent,
     )
+}
+
+/// One child of a role listing. A child that cannot be described is an entry failure under its
+/// own path (under the directory's when it has none here): the name node sent a status this
+/// client cannot represent, so it is `Protocol` / `Permanent`, never the session's problem.
+fn hdfs_role_child(
+    directory: &RoleStoragePath,
+    child: Result<crate::HDFSEntry, UndescribedHdfsChild>,
+) -> RoleHdfsListedChild {
+    let blamed = match child {
+        Ok(entry) => match RoleStoragePath::new(entry.relative_path.to_string_lossy()) {
+            Ok(entry_path) => return Ok(hdfs_role_facts(entry_path, entry)),
+            Err(_) => directory.clone(),
+        },
+        Err(undescribed) => undescribed
+            .relative_path
+            .and_then(|path| RoleStoragePath::new(path.to_string_lossy()).ok())
+            .unwrap_or_else(|| directory.clone()),
+    };
+    Err(RoleEntryFailure::new(
+        blamed,
+        RoleOperation::Traverse,
+        RoleFailureClass::Protocol,
+        RoleTransience::Permanent,
+        "HDFS listing could not describe the entry",
+    )
+    .unwrap_or_else(|_| unreachable!("static HDFS listing diagnostic is valid")))
 }
 
 fn hdfs_role_facts(path: RoleStoragePath, entry: crate::HDFSEntry) -> RoleHdfsEntryFacts {

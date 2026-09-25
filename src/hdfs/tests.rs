@@ -2,7 +2,7 @@
 mod tests {
     use std::collections::HashMap;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,7 +10,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client,
+        HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation, RoleFailureClass,
+        RoleStoragePath, build_hdfs_client, hdfs_role_child,
     };
     use crate::error::StorageError;
 
@@ -993,6 +994,92 @@ mod tests {
         assert!(
             storage
                 .entries_from_listing(vec![status("/rooted/outside", false)], Path::new("目录"),)
+                .is_err()
+        );
+    }
+
+    /// One status the listing cannot convert (a time past `i64` nanoseconds, a non-immediate
+    /// child) fails alone: under its own path when it is a child of the
+    /// listed directory, under the directory otherwise; the role listing reports each as an
+    /// entry failure beside the siblings, and the legacy `list_directory` contract (first
+    /// failure fails the call) is unchanged.
+    #[test]
+    fn an_unconvertible_status_fails_only_its_child() {
+        let Ok((client, location)) =
+            build_hdfs_client("hdfs://user@127.0.0.1:9000/root", &HdfsConfig::default())
+        else {
+            panic!("explicit client construction failed");
+        };
+        let storage = super::HDFSStorage {
+            client,
+            location,
+            block_size: super::DEFAULT_BLOCK_SIZE,
+            transfer_concurrency: crate::TransferConcurrency::defaults(4, 1),
+        };
+        let status = |path: &str, modification_time: u64| {
+            hdfs_native::client::FileStatus {
+                path: path.to_string(),
+                length: 1,
+                isdir: false,
+                permission: 0o644,
+                owner: "user".to_string(),
+                group: "group".to_string(),
+                modification_time,
+                access_time: 0,
+                replication: None,
+                blocksize: None,
+            }
+        };
+        let children = storage.children_from_listing(
+            vec![
+                status("/root/d/a", 0),
+                status("/root/d/late", u64::MAX),
+                status("/root/d/sub/nested", 0),
+                status("/root/d/c", 0),
+            ],
+            Path::new("d"),
+        );
+        let blamed: Vec<Option<PathBuf>> = children
+            .iter()
+            .map(|child| match child {
+                Ok(_) => None,
+                Err(undescribed) => Some(
+                    undescribed
+                        .relative_path
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("<directory>")),
+                ),
+            })
+            .collect();
+        assert_eq!(
+            blamed,
+            [
+                None,
+                Some(PathBuf::from("d/late")),
+                Some(PathBuf::from("<directory>")),
+                None
+            ]
+        );
+        let directory = RoleStoragePath::new("d").unwrap_or_else(|error| panic!("{error}"));
+        let listed: Vec<Result<String, (String, RoleFailureClass)>> = children
+            .into_iter()
+            .map(|child| match hdfs_role_child(&directory, child) {
+                Ok(facts) => Ok(facts.path.as_str().to_string()),
+                Err(failure) => Err((failure.path().as_str().to_string(), failure.class())),
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                Ok("d/a".to_string()),
+                Err(("d/late".to_string(), RoleFailureClass::Protocol)),
+                Err(("d".to_string(), RoleFailureClass::Protocol)),
+                Ok("d/c".to_string()),
+            ]
+        );
+        assert!(
+            storage
+                .entries_from_listing(vec![status("/root/d/late", u64::MAX)], Path::new("d"))
                 .is_err()
         );
     }
