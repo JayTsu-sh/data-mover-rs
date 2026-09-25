@@ -1,8 +1,9 @@
 use super::guard::DestinationLease;
 use super::{
-    Arc, CopiedMetadataPlan, NativePair, ReadSource, SequentialRanges, SourceDescriptor,
-    SourceQosBudget, SourceQosStats, StagedDestination, TransferFailure, TransferPhase,
-    TransferPlan, TransferPolicy, TransferRequest, TransferSide, Transferred, read_exact_range,
+    Arc, CopiedMetadataPlan, EffectiveRecovery, NativePair, ReadSource, SequentialRanges,
+    SourceDescriptor, SourceQosBudget, SourceQosStats, StagedDestination, TransferFailure,
+    TransferPhase, TransferPlan, TransferPolicy, TransferRequest, TransferSide, Transferred,
+    final_recovery, read_exact_range,
 };
 use crate::storage::{
     DestinationPrepareRequest, FinalDestination, PrepareRequest, PreparedStage, ResumeMode,
@@ -179,6 +180,7 @@ async fn finish_native(
         .with_stage(input.destination, stage)
         .with_source_qos(native_stats));
     }
+    let effective_recovery = recovery(&stage, input.plan, native.single_operation);
     Ok(Transferred {
         identity: request.identity,
         destination: input.destination,
@@ -191,9 +193,26 @@ async fn finish_native(
         source_qos: input.source_qos,
         native_bytes: native.native_bytes,
         native_requests: native.native_requests,
-        effective_recovery: input.plan.effective_recovery,
+        effective_recovery,
         copied_metadata_plan: input.copied_metadata_plan,
     })
+}
+
+/// What a native copy reports (ADR-0006 C18): what a streamed copy of the same stage would —
+/// `Checkpointed` once the fill turned recovery on, `SkippedBelowCheckpointThreshold` for a
+/// `Checkpointed` upload that never reached the interval, `Disabled` for any other policy — except
+/// a `Checkpointed` copy that is one server-side operation, which has no recovery state:
+/// `NotApplicableNative`.
+fn recovery(
+    stage: &PreparedStage,
+    plan: TransferPlan,
+    single_operation: bool,
+) -> EffectiveRecovery {
+    match final_recovery(stage, plan) {
+        EffectiveRecovery::Disabled => EffectiveRecovery::Disabled,
+        _ if single_operation => EffectiveRecovery::NotApplicableNative,
+        streamed => streamed,
+    }
 }
 
 async fn hash_source(

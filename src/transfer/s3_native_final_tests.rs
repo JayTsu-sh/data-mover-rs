@@ -16,7 +16,8 @@ use crate::storage::backends::s3::{
 };
 use crate::storage::{PrepareFact, RestartReason, Storage};
 use crate::transfer::{
-    InflightLimits, PayloadShapingPolicy, TransferPolicy, TransferRequest, TransferRoute, transfer,
+    EffectiveRecovery, InflightLimits, PayloadShapingPolicy, TransferPolicy, TransferRequest,
+    TransferRoute, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -123,11 +124,18 @@ async fn cut_at_part_three(protocol: &MemoryS3, request: TransferRequest) -> Tes
 }
 
 /// Up to the single-copy limit a native copy is one `CopyObject` to the final key at publication,
-/// for either policy: no upload, no pointer, no temp key.
+/// for either policy: no upload, no pointer, no temp key — and no recovery state, so a
+/// checkpointed one reports `NotApplicableNative`.
 #[tokio::test]
 async fn a_small_native_copy_is_one_copy_object_to_the_final_key() -> TestResult {
     let (protocol, payloads) = seeded(&[("source", 4 * MIB)]).await;
-    for policy in [TransferPolicy::Checkpointed, TransferPolicy::AtomicReplace] {
+    for (policy, recovery) in [
+        (
+            TransferPolicy::Checkpointed,
+            EffectiveRecovery::NotApplicableNative,
+        ),
+        (TransferPolicy::AtomicReplace, EffectiveRecovery::Disabled),
+    ] {
         let request = request_with(
             &protocol,
             ("source", "small"),
@@ -136,6 +144,7 @@ async fn a_small_native_copy_is_one_copy_object_to_the_final_key() -> TestResult
         )?;
         let outcome = transfer(request).await?;
         assert_eq!(outcome.route, TransferRoute::Native, "{policy:?}");
+        assert_eq!(outcome.recovery, recovery, "{policy:?}");
         assert_eq!(outcome.prepare, PrepareFact::Fresh);
         assert_eq!(outcome.source_qos.native_requests, 1);
         assert_eq!(outcome.blake3, Some(*blake3::hash(&payloads[0]).as_bytes()));
@@ -152,14 +161,23 @@ async fn a_small_native_copy_is_one_copy_object_to_the_final_key() -> TestResult
 }
 
 /// Above it, an upload on the final key filled with `UploadPartCopy` and completed at
-/// publication; a checkpointed copy writes its pointer once, an atomic one none.
+/// publication; a checkpointed copy writes its pointer once and reports `Checkpointed`, as a
+/// streamed one would, an atomic one writes none and reports `Disabled`.
 #[tokio::test]
 async fn a_large_native_copy_fills_an_upload_on_the_final_key() -> TestResult {
     let size = 4 * PART + 3 * MIB;
     let (protocol, payloads) = seeded(&[("source", size)]).await;
-    for (policy, pointers) in [
-        (TransferPolicy::Checkpointed, 1),
-        (TransferPolicy::AtomicReplace, 0),
+    for (policy, pointers, recovery) in [
+        (
+            TransferPolicy::Checkpointed,
+            1,
+            EffectiveRecovery::Checkpointed,
+        ),
+        (
+            TransferPolicy::AtomicReplace,
+            0,
+            EffectiveRecovery::Disabled,
+        ),
     ] {
         let puts = *protocol.puts.lock().await;
         let request = request_with(
@@ -170,6 +188,7 @@ async fn a_large_native_copy_fills_an_upload_on_the_final_key() -> TestResult {
         )?;
         let outcome = transfer(request).await?;
         assert_eq!(outcome.route, TransferRoute::Native, "{policy:?}");
+        assert_eq!(outcome.recovery, recovery, "{policy:?}");
         assert_eq!(outcome.prepare, PrepareFact::Fresh);
         assert_eq!(outcome.source_qos.native_bytes, size as u64);
         assert_eq!(outcome.source_qos.native_requests, 5);
@@ -202,9 +221,42 @@ async fn an_interrupted_native_copy_resumes_from_the_parts_it_copied() -> TestRe
     assert_eq!(outcome.prepare, PrepareFact::Resumed { bytes: reused });
     assert_eq!(outcome.reused_bytes, reused);
     assert_eq!(outcome.route, TransferRoute::Native);
+    assert_eq!(outcome.recovery, EffectiveRecovery::Checkpointed);
     assert_eq!(*protocol.part_copies.lock().await, copied + 3);
     assert_eq!(protocol.objects.lock().await.get("cut"), Some(&payloads[0]));
     assert!(leaves_nothing_behind(&protocol, "cut").await?);
+    Ok(())
+}
+
+/// A checkpointed native upload whose source is not over the automatic interval writes no pointer
+/// and never turns recovery on: it reports `SkippedBelowCheckpointThreshold`, as a streamed copy
+/// of the same source does.
+#[tokio::test]
+async fn a_native_upload_below_the_interval_reports_what_a_streamed_copy_does() -> TestResult {
+    let (protocol, payloads) = seeded(&[("source", PART + 3 * MIB)]).await;
+    for (request, route) in [
+        (native(&protocol, "below")?, TransferRoute::Native),
+        (streamed(&protocol, "below")?, TransferRoute::Streaming),
+    ] {
+        let outcome = transfer(request).await?;
+        assert_eq!(outcome.route, route);
+        assert_eq!(
+            outcome.recovery,
+            EffectiveRecovery::SkippedBelowCheckpointThreshold,
+            "{route:?}"
+        );
+        assert_eq!(
+            protocol.objects.lock().await.get("below"),
+            Some(&payloads[0])
+        );
+        assert!(leaves_nothing_behind(&protocol, "below").await?);
+    }
+    assert_eq!(*protocol.part_copies.lock().await, 2, "native: two parts");
+    assert_eq!(
+        *protocol.puts.lock().await,
+        1,
+        "streamed: one PUT, no pointer"
+    );
     Ok(())
 }
 
@@ -227,6 +279,10 @@ async fn a_cancelled_native_copy_keeps_the_parts_in_flight() -> TestResult {
         .err()
         .ok_or("the cancellation must stop the copy")?;
     assert!(!failure.final_destination_changed());
+    assert!(
+        failure.has_recoverable_stage(),
+        "the parts copied reach the interval"
+    );
     drop(failure);
     let copied = u64::from(*protocol.part_copies.lock().await);
     assert!((6..11).contains(&copied), "{copied} parts copied");
@@ -235,6 +291,7 @@ async fn a_cancelled_native_copy_keeps_the_parts_in_flight() -> TestResult {
     let PrepareFact::Resumed { bytes } = outcome.prepare else {
         return Err(format!("not resumed: {:?}", outcome.prepare).into());
     };
+    assert_eq!(outcome.recovery, EffectiveRecovery::Checkpointed);
     // The six parts started before the cancellation (a seventh may follow part 1) all finished.
     assert!(bytes >= 6 * PART as u64 && bytes < size as u64, "{bytes}");
     assert_eq!(bytes % PART as u64, 0);

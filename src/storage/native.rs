@@ -38,6 +38,9 @@ pub(crate) struct NativeStageEvidence {
     pub write: WriteEvidence,
     pub native_bytes: u64,
     pub native_requests: u64,
+    /// Whether the copy is one server-side operation sent at publication (S3: one `CopyObject`
+    /// up to 64 MiB): no intermediate state it could recover from, whatever the policy.
+    pub single_operation: bool,
 }
 
 pub(crate) struct NativeStageFailure {

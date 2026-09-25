@@ -357,7 +357,10 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   这些写端分段缓冲**不在** `InflightLimits.bytes` 之内（其 rustdoc 已写明）。不因分段大小重来。
   C15c 的遗留问题（原生拷贝不清同 key 上流式留下的指针 / upload）已解决：原生 prepare 能续就续，其他按决策表清
   （`OtherTransfer` / `BindingChanged` / 原子拷贝 `Requested` …）。
-- `EffectiveRecovery` 仍报 `NotApplicableNative`；续传看 `prepare` / `reused_bytes`。`CopyObject` 带
+- `EffectiveRecovery` 报流式路径对同一 stage 会报的值（C22 后的 follow-up；C18 最初一律报 `NotApplicableNative`）：
+  fill 打开 recovery 后 `Checkpointed`，`Checkpointed` 但分段没到间隔（不写指针）`SkippedBelowCheckpointThreshold`，
+  `AtomicReplace` → `Disabled`；只有 `Checkpointed` 的单次 `CopyObject`（≤ 64 MiB，没有恢复状态）报 `NotApplicableNative`
+  （fill 在 `NativeStageEvidence::single_operation` 里说明）。续传看 `prepare` / `reused_bytes`。`CopyObject` 带
   `x-amz-metadata-directive: REPLACE` 与 `x-amz-tagging-directive: REPLACE`、不带元数据与 tags：源的用户元数据、内容类型、
   tags 都不带过去，与 `UploadPartCopy`、流式路径一致（目的端元数据不随大小变）；元数据计划要的 tags 之后照常设置。
   MinIO 实测：REPLACE 不带 Content-Type 被接受，副本 `binary/octet-stream`、无 `x-amz-meta-*`、无 tags —— 与 200 MiB

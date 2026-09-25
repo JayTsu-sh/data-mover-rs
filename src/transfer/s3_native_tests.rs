@@ -375,7 +375,8 @@ async fn native_binding_accepts_a_null_or_empty_version_id() -> TestResult {
 
 /// With recovery kept at the destination (ADR-0006 C18), a native copy above the single-PUT
 /// threshold but within the 64 MiB single-copy limit is one `CopyObject` to the final key at
-/// publication — no temp key, no upload, no pointer — whatever the policy.
+/// publication — no temp key, no upload, no pointer — whatever the policy. Having no recovery
+/// state, a checkpointed one reports `NotApplicableNative`; an atomic one `Disabled`.
 #[tokio::test]
 async fn a_native_copy_up_to_64_mib_is_one_copy_to_the_final_key() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
@@ -408,7 +409,12 @@ async fn a_native_copy_up_to_64_mib_is_one_copy_to_the_final_key() -> TestResult
         let outcome = transfer(request).await?;
         assert_eq!(outcome.route, TransferRoute::Native, "{policy:?}");
         assert_eq!(outcome.prepare, PrepareFact::Fresh);
-        assert_eq!(outcome.recovery, EffectiveRecovery::NotApplicableNative);
+        let recovery = if policy == TransferPolicy::Checkpointed {
+            EffectiveRecovery::NotApplicableNative
+        } else {
+            EffectiveRecovery::Disabled
+        };
+        assert_eq!(outcome.recovery, recovery, "{policy:?}");
         assert_eq!(protocol.objects.lock().await.get("final"), Some(&payload));
     }
     assert_eq!(*protocol.native_copies.lock().await, 2);

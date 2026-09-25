@@ -73,9 +73,12 @@ pub enum EffectiveRecovery {
     SkippedSingleSourceChunk,
     /// Automatic recovery was not worthwhile for the known payload size.
     SkippedBelowCheckpointThreshold,
-    /// Streaming transfer retains durable intermediate progress.
+    /// The transfer retains durable intermediate progress at the destination: a streamed one, or
+    /// a native multipart copy once its parts reach the automatic interval (ADR-0006 C18).
     Checkpointed,
-    /// Server-internal native copy restarts through its own operation semantics.
+    /// A native copy under `TransferPolicy::Checkpointed` that is one server-side operation (S3:
+    /// one `CopyObject` up to 64 MiB): it has no intermediate state and restarts through that
+    /// operation's own semantics.
     NotApplicableNative,
 }
 
@@ -773,8 +776,9 @@ fn final_recovery(stage: &PreparedStage, plan: TransferPlan) -> EffectiveRecover
     if stage.recovery_enabled() {
         EffectiveRecovery::Checkpointed
     } else if plan.effective_recovery == EffectiveRecovery::Checkpointed {
-        // The destination declined recovery for this stage (reachable only for a destination
-        // without an automatic interval: `plan_request` already reports the others).
+        // The destination declined recovery for this stage (reachable only for a native copy, or
+        // a streamed one to a destination without an automatic interval: `plan_request` reports
+        // the others).
         EffectiveRecovery::SkippedBelowCheckpointThreshold
     } else {
         plan.effective_recovery
@@ -937,10 +941,10 @@ fn plan_transfer(
         source_size,
         chunk_bytes,
         automatic_interval: None,
+        // A native copy arms no recovery here; its destination turns it on itself (ADR-0006 C18),
+        // and it reports what a streamed copy of the same stage would (`native::recovery`).
         recovery_enabled: recovery_allowed && !native && source_size > chunk_bytes as u64,
-        effective_recovery: if native {
-            EffectiveRecovery::NotApplicableNative
-        } else if !recovery_allowed {
+        effective_recovery: if !recovery_allowed {
             EffectiveRecovery::Disabled
         } else if source_size <= chunk_bytes as u64 {
             EffectiveRecovery::SkippedSingleSourceChunk
@@ -1386,6 +1390,8 @@ mod plan_tests {
         Ok(())
     }
 
+    /// The plan arms no recovery for a native copy — its destination turns it on itself — but
+    /// expects what a streamed copy would, so the outcome reports the same (ADR-0006 C18).
     #[test]
     fn native_copy_never_enables_checkpoint_recovery_regardless_of_size()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1398,10 +1404,7 @@ mod plan_tests {
         )?;
 
         assert!(!plan.recovery_enabled);
-        assert_eq!(
-            plan.effective_recovery,
-            EffectiveRecovery::NotApplicableNative
-        );
+        assert_eq!(plan.effective_recovery, EffectiveRecovery::Checkpointed);
         Ok(())
     }
 

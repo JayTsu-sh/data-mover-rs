@@ -598,7 +598,11 @@ automatic recovery", "CIFS destination-resident recovery", "HDFS destination-res
 A streaming transfer that fits within one effective source-read chunk uses an ephemeral stage even
 under `Checkpointed`, because it has no useful intermediate checkpoint. This decision does not use
 the destination write ceiling: a destination may split that one source chunk into multiple writes.
-All native copies report `NotApplicableNative` and do not open recovery state. Restart upload is an
+The engine arms no recovery for a native copy; the destination may turn it on itself (an S3
+multipart copy once its parts reach the automatic interval, ADR-0006 C18), and the outcome then
+reports what a streamed copy of the same stage would — `Checkpointed`, `SkippedBelowCheckpointThreshold`
+or `Disabled`. Only a `Checkpointed` native copy that is one server-side operation (S3: one
+`CopyObject` up to 64 MiB) reports `NotApplicableNative`: it has no recovery state. Restart upload is an
 explicit data-mover lifecycle action that discards its owned failed stage and state before starting
 from zero.
 

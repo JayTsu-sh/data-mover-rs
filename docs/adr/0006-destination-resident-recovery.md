@@ -545,7 +545,12 @@ least one: 128 MiB in all, not 320 MiB; the writer's part buffers are outside `I
 which its rustdoc now says); no route restarts over a part size, and the C15c open point (a
 native copy left an earlier streaming attempt's pointer and upload behind) is closed: a native prepare
 resumes what it may and cleans up the rest (`OtherTransfer`, `BindingChanged`, `Requested` for an atomic
-copy …). `EffectiveRecovery` still reports `NotApplicableNative`; `prepare` / `reused_bytes` say what was
+copy …). `EffectiveRecovery` reports what a streamed copy of the same stage would (a follow-up after
+C22; C18 as first built reported `NotApplicableNative` for every native copy): `Checkpointed` once the
+fill turned recovery on, `SkippedBelowCheckpointThreshold` for a `Checkpointed` upload that never
+reached the interval, `Disabled` for `AtomicReplace`; `NotApplicableNative` is left for a
+`Checkpointed` single `CopyObject`, which has no recovery state (the fill says so in
+`NativeStageEvidence::single_operation`). `prepare` / `reused_bytes` say what was
 reused. Nothing in the at-destination native route reaches the temp key; the temp-key code (and its
 extra LIST + HEAD per publication) is reachable only with `recovery_at_destination` off, from tests, and
 goes in C19. The `CopyObject` sends `x-amz-metadata-directive` and `x-amz-tagging-directive` `REPLACE`
@@ -731,6 +736,10 @@ zero-byte `d/` is skipped; 1 015 entries in `All`, 1 008 in `Current`, 5 directo
 - S3 content becomes visible before read-back; per-part Content-MD5, the part-list check and the
   composite ETag run before publication.
 - A crash between publication and pointer deletion costs one re-copy.
+- `TransferOutcome.recovery` of a native copy (C18 follow-up): `Checkpointed`,
+  `SkippedBelowCheckpointThreshold` or `Disabled`, as a streamed copy of the same stage reports;
+  `NotApplicableNative` only for a `TransferPolicy::Checkpointed` single `CopyObject`, where every
+  native copy used to report it.
 - Traversal (C22): `TraversalRequest` gains the public `versions` field (every literal names it);
   S3 lends a `Namespace` role (`Stat` / `List` / `list_versions`; mutations refused) and
   `ObservedEntry` gains `version()` / `source_version()`; version entries snapshot as v6.

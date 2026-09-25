@@ -38,6 +38,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                 },
                 native_bytes: copy.bytes,
                 native_requests: copy.requests,
+                single_operation: single::of(stage).is_some(),
             }),
             Err(failure) => Err(NativeStageFailure {
                 error: failure.error,
