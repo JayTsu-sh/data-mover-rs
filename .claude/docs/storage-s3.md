@@ -669,6 +669,41 @@ SDK 却把两种元素解析成两个列表，交错顺序丢了；`LastModified
   没有客户端可见的“真实顺序”（客户端完成时间受响应延迟影响，21 对相差 ≥ 50 ms 的完成时间与列举相反，但服务端
   `LastModified` 在这 21 对上都与列举一致），以服务端提交顺序为准。
 
+### ONTAP：带 delimiter 的版本列举缺 `NextVersionIdMarker`（P7 现存问题 10 / F4）
+
+ONTAP 9.19.1 的 `ListObjectVersions`（`delimiter=/`）在截断页里有 CommonPrefix、页又停在某个 key 的版本中间时，给
+`NextKeyMarker=<该 key>` 却**不给** `NextVersionIdMarker`；只带 key-marker 的下一页从该 key 之后开始，余下的版本被静默跳过
+（`mkl/a`、`mkl/x/中/y` + `mkl/z` 1000 个版本：默认 max-keys 只列出 998 个；max-keys 3 时 7 个版本只列出 1 个）。它还会在
+下一页重复上一页末尾的 CommonPrefix，并以一个空的末页结束列举。
+
+- 守卫：`VersionsInOrder::next_version_id_marker`（`src/s3/version_order.rs`）——服务端给了就原样用；没给、页截断、且
+  本页条目按**文档序**（F2 拦截器的位置；ONTAP 把 CommonPrefixes 放在条目之后）排成一列时，`NextKeyMarker` 那个 key 的
+  条目恰是这一列的**末尾一段** → 用最后一条的 versionId 作 version-id-marker（没有 id 的条目按列举的解码当 `"null"`）。
+  这就是 marker 对的语义：每个 key 的条目连成一段的存储（S3 的顺序、ONTAP）上都对，页恰好停在 key 的最后一条时两种续法
+  都落到下一个 key；MinIO 的 key-marker 是 token（`k[minio_cache:…]`）、且总给版本 marker，守卫不生效。**不猜**的情况 →
+  `UnknownResumePoint`：该 key 的条目不是末尾一段（像 RustFS 那样每页先列全部删除标记再列版本，现存问题 11 —— RustFS 实测
+  总给版本 marker，只是防它哪天不给）；读不到文档序且版本与删除标记都在该 key 上（只有一种在该 key 上时，key 升序，
+  那一种的最后一条就是末尾）。不猜的后果：role 为该目录的 `Protocol` / Permanent 失败；legacy `walkdir` 先发本页已完整
+  的 key，丢下停在其中的那个 key，发 `StorageEntryMessage::Error`（`ErrorEvent::Scan`）结束该前缀；`walkdir_2` 同样先列
+  完整的 key，再把原因放进 `errors`。
+- 三处都走它：role `role_protocol/listing.rs::version_page`、legacy `process_versioned_prefix`（`walkdir`）与
+  `read_dir_sorted`（`walkdir_2`）。`role_list_versions`（单 key、不带 delimiter）不受影响。
+- 重复的 CommonPrefix：role All 由 `merge` 去重（本来如此）；legacy `walkdir` 每个列举记已下钻的前缀（否则整棵子树再走
+  一遍），`walkdir_2` 记已加入的子目录。空末页：三处本来就容忍（测试覆盖）。
+- 回归数据（ONTAP 真机抓取，`data-mover-test-ver` 前缀 `f4-1790409358/`，已删）：`tests/data/s3/ontap-versions-delimiter-small.xml`
+  （max-keys 3：`mks/a`、`mks/x/中/y`、`mks/z` × 7，含只带 key-marker 的那一页与空末页）、`…-markers.xml`（max-keys 7：
+  带删除标记，首页停在 `z` 的一个删除标记上、前面是它的两个版本 —— 两种条目都在页上，末尾取自文档序）、`…-mixed.xml`
+  （max-keys 11：80 个含 `é` / `中` / `.` 的随机名、128 条、18 个子目录，缺 marker 与重复前缀都有）。
+  `s3::version_order::ontap_tests` 的 `MarkerReplay` 按请求的 prefix / key-marker / version-id-marker 找回显相同的那一页（未抓的
+  请求回空的完整页），经真实 SDK + 拦截器跑 role All、legacy `walkdir_2`、legacy `walkdir`（并数每个子前缀被列了几次）；
+  另有 RustFS 形状的合成页（标记组在前）验证三处都不猜、legacy 仍发出完整的 key。变异：去掉守卫 → 6 个全红；去掉“末尾一段”
+  检查 → 2 红；去掉 legacy 前缀去重 → 2 红；去掉 role `merge` 去重 → 1 红。
+- 真机（2026-09-26，ONTAP `data-mover-test-ver`，唯一前缀，跑完删光）：`mkl/z` 1000 个版本 role `traverse --versions all`、
+  legacy `walkdir`、`walkdir_2` 都列出 1000 个，四组数据（mkl / mks / mkp / rnd，1187 条）与不带 delimiter 的列举逐条相等、
+  无重复，每个目录一次。守卫对别的存储不改结果：`traversal_versions.sh` 在 MinIO、RustFS（`EXPECT_ORDER=inferred`，k / gone
+  标 inferred、其余 server，逐行精确）、DXN 的临时版本桶，与 ONTAP `data-mover-test-ver`（已有桶模式）上都 `RESULT: pass`，
+  临时桶已删、前缀已清空。
+
 ### DXN（Ceph RGW Octopus）实测行为（2026-09-25）
 
 `versioning_matrix.sh` 在 DXN 临时桶（`BUCKET_PREFIX=data-mover-dxn`，`S3_LOCATION=magnascale:tos_placement`，见 e2e-s3

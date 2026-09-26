@@ -96,7 +96,7 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | 按 versionId 的 DeleteObject 回 405（存储不支持按版本删） | 条目 `Unsupported` / Permanent —— **不是**带版本读的「删除标记」`NotFound`（清理会把它当成已删）；删指针时降级为普通删除 + 告警 |
 | describe 之后对象被替换（`read` / native bind / `observe_bound`） | 条目 `Conflict` / Permanent |
 | 请求 `Id(v)` 而 HEAD 回来的不是版本 v（存储忽略 `?versionId=`） | 条目 `Unsupported` / Permanent |
-| 一个目录的列举翻页：续页 token / marker 绕回来过、连续空页超限（`paging.rs`，C22） | **该目录**的条目 `Protocol` / Permanent（报在目录上，块 `Failed`，遍历继续兄弟；不结束会话 —— 之前 token 绕圈是会话失败，P7 评审现存问题 3） |
+| 一个目录的列举翻页：续页 token / marker 绕回来过、连续空页超限（`paging.rs`，C22）；版本列举的截断页停在某 key 中间却没给 `NextVersionIdMarker`、且读不到文档序无法确定续点（F4，`version_order::UnknownResumePoint`） | **该目录**的条目 `Protocol` / Permanent（报在目录上，块 `Failed`，遍历继续兄弟；不结束会话 —— 之前 token 绕圈是会话失败，P7 评审现存问题 3） |
 | 一个目录的条目超过 500 万（`paging.rs`） | 该目录的条目 `Capacity` / Permanent（同上） |
 
 引擎（ADR-0006 C7）：同一进程里另一个传输正在写同一目的端文件（按（目的端点, 最终路径）的租约）→ Prepare 阶段

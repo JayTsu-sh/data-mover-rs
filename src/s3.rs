@@ -1,5 +1,5 @@
 // 标准库
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -67,7 +67,7 @@ use crate::{
 use version_listing::{
     ListedEntry, VersionOrDeleteMarker, VersionPages, oldest_first_by_key, versions_with_latest,
 };
-use version_order::send_in_document_order;
+use version_order::{UnknownResumePoint, send_in_document_order};
 
 struct S3WalkRuntime<'a> {
     tx: &'a async_channel::Sender<StorageEntryMessage>,
@@ -111,6 +111,25 @@ struct VersionedScan<'a> {
     match_expressions: Option<&'a FilterExpression>,
     exclude_expressions: Option<&'a FilterExpression>,
     total_file_count: Arc<AtomicUsize>,
+}
+
+/// A versions listing whose resume point inside a key is unknown (F4) ends that prefix with an
+/// error the walk reports: the key's remaining versions are never skipped silently.
+async fn unknown_resume_point(
+    tx: &async_channel::Sender<StorageEntryMessage>,
+    prefix: &str,
+) -> Result<()> {
+    let reason = UnknownResumePoint::DIAGNOSTIC;
+    error!("ListObjectVersions for prefix {prefix}: {reason}");
+    let _ = tx
+        .send(StorageEntryMessage::Error {
+            event: ErrorEvent::Scan,
+            path: PathBuf::from(prefix),
+            entry: None,
+            reason: reason.to_string(),
+        })
+        .await;
+    Ok(())
 }
 
 mod architecture;
@@ -3632,6 +3651,7 @@ impl S3Storage {
         let mut key_marker = None;
         let mut version_id_marker = None;
         let mut pages = VersionPages::default();
+        let mut walked = HashSet::new();
         loop {
             let mut request = self
                 .client
@@ -3653,22 +3673,23 @@ impl S3Storage {
                 }
             };
             let response = &listed.output;
-            for common_prefix in response.common_prefixes() {
-                if let Some(prefix_name) = common_prefix.prefix()
-                    && !self.is_artifact_key(prefix_name)
-                {
-                    self.process_directory(
-                        prefix_name,
-                        current_depth,
-                        skip_filter,
-                        package_remaining,
-                        runtime,
-                    )
-                    .await?;
-                }
+            let fresh = response
+                .common_prefixes()
+                .iter()
+                .filter_map(CommonPrefix::prefix)
+                .filter(|name| !self.is_artifact_key(name) && walked.insert(name.to_string()));
+            for prefix_name in fresh {
+                self.process_directory(
+                    prefix_name,
+                    current_depth,
+                    skip_filter,
+                    package_remaining,
+                    runtime,
+                )
+                .await?;
             }
             key_marker = response.next_key_marker().map(str::to_string);
-            version_id_marker = response.next_version_id_marker().map(str::to_string);
+            let resume = listed.next_version_id_marker();
             // 一页可能停在某个 key 的版本中间：该 key 留到下一页合并后再发
             let entries =
                 pages.positioned(&listed, |key| key != prefix && !self.is_artifact_key(key));
@@ -3682,6 +3703,11 @@ impl S3Storage {
                 total_file_count: runtime.total_file_count.clone(),
             })
             .await?;
+            // The page's other keys are sent; the one it ended inside is held back and dropped.
+            let Ok(next_version) = resume else {
+                return unknown_resume_point(runtime.tx, prefix).await;
+            };
+            version_id_marker = next_version;
             if key_marker.is_none() {
                 break;
             }
@@ -3844,9 +3870,9 @@ impl S3Storage {
     // walkdir_2: 目录分页 + NDX 编号 + 并行预读
     // ============================================================
 
-    fn append_common_prefixes(
+    fn append_common_prefixes<'a>(
         &self,
-        prefixes: &[CommonPrefix],
+        prefixes: impl IntoIterator<Item = &'a CommonPrefix>,
         ctx: &crate::dir_tree::ReadContext,
         subdirs: &mut Vec<crate::dir_tree::SubdirEntry>,
     ) {
@@ -4079,6 +4105,7 @@ impl S3Storage {
             let mut key_marker: Option<String> = None;
             let mut version_id_marker: Option<String> = None;
             let mut pages = VersionPages::default();
+            let mut listed_prefixes = HashSet::new();
 
             loop {
                 let mut request = self
@@ -4104,10 +4131,14 @@ impl S3Storage {
                 };
                 let response = &listed.output;
 
-                self.append_common_prefixes(response.common_prefixes(), ctx, &mut subdirs);
+                // A store may repeat a prefix on the next page (ONTAP, P7 existing issue 10).
+                let fresh = response.common_prefixes().iter().filter(|common| {
+                    (common.prefix()).is_none_or(|name| listed_prefixes.insert(name.to_string()))
+                });
+                self.append_common_prefixes(fresh, ctx, &mut subdirs);
 
                 key_marker = response.next_key_marker().map(str::to_string);
-                version_id_marker = response.next_version_id_marker().map(str::to_string);
+                let resume = listed.next_version_id_marker();
                 // 一页可能停在某个 key 的版本中间：该 key 留到下一页合并后再处理
                 let entries = pages.positioned(&listed, |_| true);
                 let entries = pages.complete_keys(entries, key_marker.is_some());
@@ -4119,6 +4150,13 @@ impl S3Storage {
                     }
                     self.append_object_versions(history, ctx, &mut files).await;
                 }
+                // The page's other keys are listed; the one it ended inside is held back and
+                // dropped, and the listing reports why.
+                let Ok(next_version) = resume else {
+                    errors.push(UnknownResumePoint::DIAGNOSTIC.to_string());
+                    break;
+                };
+                version_id_marker = next_version;
 
                 if key_marker.is_none() {
                     break;

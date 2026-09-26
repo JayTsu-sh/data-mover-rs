@@ -38,6 +38,97 @@ pub(crate) struct VersionsInOrder {
     pub order: Option<DocumentOrder>,
 }
 
+/// A truncated page ended inside a key without naming the version to continue after, and which
+/// of its entries came last is unknown (P7 existing issue 10).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UnknownResumePoint;
+
+impl UnknownResumePoint {
+    pub(crate) const DIAGNOSTIC: &'static str = "a truncated S3 ListObjectVersions page ended inside a key \
+         without a NextVersionIdMarker, and the page's document order is unknown";
+}
+
+/// (key, version id) of one listed entry.
+type Named<'a> = (Option<&'a str>, Option<&'a str>);
+
+impl VersionsInOrder {
+    /// The `version-id-marker` of the next page request: `NextVersionIdMarker` as the server sent
+    /// it, or — when a truncated page ends inside the key it names as `NextKeyMarker` but sends
+    /// no `NextVersionIdMarker` — the version id of that key's last entry on the page (P7 existing
+    /// issue 10, F4).
+    ///
+    /// ONTAP 9.19.1 answers a delimiter listing so when the page also holds a common prefix: a
+    /// `key-marker` alone then resumes after the whole key, and the rest of its versions are
+    /// silently skipped (1 000 versions listed as 998). Resuming after the last entry the page
+    /// holds is what the marker pair means on a store that lists each key's entries as one run
+    /// (S3's order, ONTAP's; common prefixes come after the entries there): a page that ended
+    /// after the key's last entry resumes at the next key either way. A `MinIO` key marker is a
+    /// token (`k[minio_cache:v2,return:]`), never a key, and `MinIO` names its version marker: the
+    /// guard stays off. An entry without a version id is the `"null"` version, as the listing
+    /// decodes it.
+    ///
+    /// # Errors
+    /// [`UnknownResumePoint`] when the page ends inside the marker's key and which of its entries
+    /// came last is unknown: the key's entries are not the page's final run in document order (a
+    /// store that lists them apart, as `RustFS` groups delete markers before versions), or no
+    /// document order was read and both versions and delete markers are on the key.
+    pub(crate) fn next_version_id_marker(&self) -> Result<Option<String>, UnknownResumePoint> {
+        let output = &self.output;
+        if let Some(sent) = output.next_version_id_marker().filter(|id| !id.is_empty()) {
+            return Ok(Some(sent.to_string()));
+        }
+        let Some(key_marker) = output.next_key_marker() else {
+            return Ok(None);
+        };
+        if output.is_truncated() == Some(false) {
+            return Ok(None);
+        }
+        let on_key = |entry: &Named<'_>| entry.0 == Some(key_marker);
+        let versions: Vec<Named<'_>> = (output.versions().iter())
+            .map(|v| (v.key(), v.version_id()))
+            .collect();
+        let markers: Vec<Named<'_>> = (output.delete_markers().iter())
+            .map(|m| (m.key(), m.version_id()))
+            .collect();
+        let sequence = match (
+            &self.order,
+            versions.iter().any(on_key),
+            markers.iter().any(on_key),
+        ) {
+            (_, false, false) => return Ok(None),
+            (Some(order), _, _) => order.merge(versions, markers),
+            // Keys ascend: without the document order, one kind alone on the key is enough.
+            (None, true, false) => versions,
+            (None, false, true) => markers,
+            (None, true, true) => return Err(UnknownResumePoint),
+        };
+        resume_after_final_run(&sequence, key_marker)
+    }
+}
+
+/// The version id of `sequence`'s last entry, when the entries on `key` are its final run.
+fn resume_after_final_run(
+    sequence: &[Named<'_>],
+    key: &str,
+) -> Result<Option<String>, UnknownResumePoint> {
+    let on_key = sequence.iter().filter(|e| e.0 == Some(key)).count();
+    let final_run = sequence
+        .iter()
+        .rev()
+        .take_while(|e| e.0 == Some(key))
+        .count();
+    match sequence.last() {
+        Some(last) if on_key > 0 && final_run == on_key => Ok(Some(
+            last.1
+                .filter(|id| !id.is_empty())
+                .unwrap_or("null")
+                .to_string(),
+        )),
+        _ if on_key == 0 => Ok(None),
+        _ => Err(UnknownResumePoint),
+    }
+}
+
 /// Document positions (0-based, `<Version>` and `<DeleteMarker>` counted together), index-aligned
 /// with the SDK's `versions()` and `delete_markers()`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,6 +146,15 @@ impl DocumentOrder {
     /// The position of `delete_markers()[index]`.
     pub(crate) fn marker(&self, index: usize) -> Option<u64> {
         self.markers.get(index).copied()
+    }
+
+    /// `versions` and `markers` (index-aligned with this order) as one sequence in document order.
+    fn merge<T>(&self, versions: Vec<T>, markers: Vec<T>) -> Vec<T> {
+        let mut placed: Vec<(u64, T)> = (self.versions.iter().copied().zip(versions))
+            .chain(self.markers.iter().copied().zip(markers))
+            .collect();
+        placed.sort_unstable_by_key(|(position, _)| *position);
+        placed.into_iter().map(|(_, entry)| entry).collect()
     }
 
     /// Reads the element sequence of `body` and aligns it with the SDK's parse of the same
@@ -258,3 +358,7 @@ fn field_of(name: &[u8]) -> Option<Field> {
 #[cfg(test)]
 #[path = "version_order_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "version_order_ontap_tests.rs"]
+mod ontap_tests;

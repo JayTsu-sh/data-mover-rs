@@ -2,7 +2,6 @@
 //! `ListObjectVersions` under one prefix, with keys and common prefixes made relative to the
 //! storage root. Continuation tokens and markers are passed back exactly as the server sent them.
 
-use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
 use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
 use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::{CommonPrefix, DeleteMarkerEntry, Object, ObjectVersion};
@@ -12,7 +11,7 @@ use super::{
     s3_role_transport_failure,
 };
 use crate::model::{FailureClass, StorageTimestamp, Transience};
-use crate::s3::version_order::{DocumentOrder, send_in_document_order};
+use crate::s3::version_order::{UnknownResumePoint, VersionsInOrder, send_in_document_order};
 use crate::storage::backends::s3::{
     S3ListedObject, S3ListedVersion, S3ObjectPage, S3RejectedEntry, S3VersionFacts,
     S3VersionMarker, S3VersionPage,
@@ -65,11 +64,7 @@ impl S3Storage {
                 "S3 ListObjectVersions request failed"
             ))
         })?;
-        version_page(
-            &response.output,
-            response.order.as_ref(),
-            self.listing_root(),
-        )
+        version_page(&response, self.listing_root())
     }
 }
 
@@ -87,6 +82,16 @@ fn listing_failure(failure: S3ProtocolFailure) -> S3ProtocolFailure {
         ),
         other => other,
     }
+}
+
+/// A truncated versions page whose resume point inside a key is unknown (F4) fails this
+/// directory's listing: guessing would skip or repeat the rest of that key's versions.
+fn unknown_resume_point() -> S3ProtocolFailure {
+    S3ProtocolFailure::entry(
+        FailureClass::Protocol,
+        Transience::Permanent,
+        UnknownResumePoint::DIAGNOSTIC,
+    )
 }
 
 /// `key` relative to the storage root. A missing key, or one outside the root (the server ignored
@@ -239,22 +244,32 @@ fn listed_marker(
     })
 }
 
-/// One page of versions; `order` (the response's document order, when it could be read) gives
-/// every entry its position.
-fn version_page(
-    response: &ListObjectVersionsOutput,
-    order: Option<&DocumentOrder>,
-    root: &str,
-) -> S3Result<S3VersionPage> {
-    let next = continuation(
+/// One page of versions; the response's document order, when it could be read, gives every
+/// entry its position. The version id marker of the next page is guarded against a page that
+/// ends inside a key without one ([`VersionsInOrder::next_version_id_marker`], F4).
+///
+/// # Errors
+/// A truncated page without a key marker ends the session (`Protocol`); one whose resume point
+/// inside a key is unknown fails this directory's listing (`Protocol`, permanent), never skips
+/// the rest of that key's versions.
+fn version_page(listed: &VersionsInOrder, root: &str) -> S3Result<S3VersionPage> {
+    let (response, order) = (&listed.output, listed.order.as_ref());
+    let key_marker = continuation(
         response.is_truncated(),
         response.next_key_marker(),
         "truncated S3 ListObjectVersions page has no key marker",
-    )?
-    .map(|key_marker| S3VersionMarker {
-        key_marker: key_marker.to_string(),
-        version_id_marker: response.next_version_id_marker().map(str::to_string),
-    });
+    )?;
+    let next = key_marker
+        .map(|key_marker| {
+            let version_id_marker = listed
+                .next_version_id_marker()
+                .map_err(|UnknownResumePoint| unknown_resume_point())?;
+            Ok(S3VersionMarker {
+                key_marker: key_marker.to_string(),
+                version_id_marker,
+            })
+        })
+        .transpose()?;
     let mut rejected = Vec::new();
     let versions = decoded(
         response.versions().iter().enumerate(),
@@ -280,7 +295,17 @@ fn version_page(
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
+
     use super::*;
+
+    /// A response whose document order was not read.
+    fn without_order(output: ListObjectVersionsOutput) -> VersionsInOrder {
+        VersionsInOrder {
+            output,
+            order: None,
+        }
+    }
 
     fn common(prefix: &str) -> CommonPrefix {
         CommonPrefix::builder().prefix(prefix).build()
@@ -312,7 +337,7 @@ mod tests {
             .is_truncated(true)
             .next_key_marker("root/d/k[minio_cache:v2,return:]")
             .build();
-        let page = version_page(&response, None, "root/").map_err(|e| format!("{e:?}"))?;
+        let page = version_page(&without_order(response), "root/").map_err(|e| format!("{e:?}"))?;
         assert_eq!(page.versions[0].key, "d/k");
         assert_eq!(
             page.versions[0]
@@ -359,12 +384,12 @@ mod tests {
         let idless = ListObjectVersionsOutput::builder()
             .versions(ObjectVersion::builder().key("k").size(1).build())
             .build();
-        let page = version_page(&idless, None, "").unwrap_or_else(|e| panic!("{e:?}"));
+        let page = version_page(&without_order(idless), "").unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(page.versions[0].facts.version_id, "null");
         let markerless = ListObjectVersionsOutput::builder()
             .is_truncated(true)
             .build();
-        assert!(version_page(&markerless, None, "").is_err());
+        assert!(version_page(&without_order(markerless), "").is_err());
         let token = ListObjectsV2Output::builder()
             .contents(Object::builder().key("a").size(1).build())
             .common_prefixes(common("b/"))
@@ -402,7 +427,7 @@ mod tests {
                     .build(),
             )
             .build();
-        let page = version_page(&versions, None, "").unwrap_or_else(|e| panic!("{e:?}"));
+        let page = version_page(&without_order(versions), "").unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(page.versions.len(), 1);
         assert_eq!(page.rejected.len(), 1);
         assert_eq!(page.rejected[0].key.as_deref(), Some("k"));
