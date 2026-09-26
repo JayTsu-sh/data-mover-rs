@@ -1908,12 +1908,7 @@ impl NFSStorage {
                     let is_dir = file_type == FType3::NF3DIR as u32;
                     if is_dir {
                         // 将查询结果保存到缓存中
-                        trace!(
-                            "Inserting into global cache: key={:?}, value_len={}",
-                            cache_key,
-                            obj.fh.len()
-                        );
-                        GLOBAL_CACHE.insert(cache_key, obj.fh.clone());
+                        Self::cache_directory(cache_key, &obj.fh);
                     }
 
                     // 如果是最后一个组件，直接返回原始obj对象
@@ -2351,7 +2346,7 @@ impl NFSStorage {
                     // 目录创建成功，继续使用新句柄
                     current_fh = obj.fh.clone();
                     // 将创建的目录句柄保存到缓存中
-                    Self::cache_directory(cache_key, obj.fh);
+                    Self::cache_directory(cache_key, &obj.fh);
                 }
                 Err(e) => {
                     debug!("Error: dir {} {}", dirname, e);
@@ -2371,7 +2366,7 @@ impl NFSStorage {
                                     // 找到目录，继续使用现有句柄
                                     current_fh = obj.fh.clone();
                                     // 将查询结果保存到缓存中
-                                    Self::cache_directory(cache_key, obj.fh.clone());
+                                    Self::cache_directory(cache_key, &obj.fh);
                                 } else {
                                     // 同名非目录对象（残留文件/符号链接）挡住目录创建：
                                     // 迁移语义按 rsync 风格处理——删除后重走 create_dir_all。
@@ -2487,13 +2482,17 @@ impl NFSStorage {
         }
     }
 
-    fn cache_directory(cache_key: (PathBuf, Bytes), file_handle: Bytes) {
+    /// Caches a copy of `file_handle`, never the handle itself: nfs-rs decodes handles without
+    /// copying, so the `Bytes` it hands out is a slice of the whole RPC reply (a LOOKUP or MKDIR
+    /// reply, or a readdirplus page), and caching the slice would keep that buffer alive for as
+    /// long as the entry lives — hundreds of bytes to 8 KiB per cached directory.
+    fn cache_directory(cache_key: (PathBuf, Bytes), file_handle: &Bytes) {
         trace!(
             "Inserting into global cache: key={:?}, value_len={}",
             cache_key,
             file_handle.len()
         );
-        GLOBAL_CACHE.insert(cache_key, file_handle);
+        GLOBAL_CACHE.insert(cache_key, Bytes::copy_from_slice(file_handle));
     }
 
     async fn delete_dir(&self, relative_path: &Path) -> Result<()> {
@@ -4707,12 +4706,10 @@ impl NFSStorage {
                 && Self::caches_directory_handle(attrs.type_, &entry.handle)
             {
                 // The listing already carries this directory's handle, so caching it is what
-                // spares the descent a LOOKUP. The handle is a slice of the readdirplus page
-                // buffer, so it is copied: keeping the slice would pin the whole 8 KiB page for
-                // as long as the entry lives in the cache.
+                // spares the descent a LOOKUP (`cache_directory` copies it out of the page).
                 Self::cache_directory(
                     (Self::cache_path(&child)?, self.get_root_fh()),
-                    Bytes::copy_from_slice(&entry.handle),
+                    &entry.handle,
                 );
             }
             entries.push(Self::role_listed_entry(
@@ -4930,6 +4927,23 @@ fn next_read_want(cur: u64, end: u64, block_size: u64) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::AssertTestValue;
+
+    /// A cached handle owns its bytes: the reply it was decoded from can be freed.
+    #[test]
+    fn a_cached_handle_does_not_share_the_reply_buffer() {
+        let reply = Bytes::from(vec![7_u8; 512]);
+        let handle = reply.slice(100..132);
+        let key = (
+            PathBuf::from("pinned"),
+            Bytes::from(uuid::Uuid::new_v4().as_bytes().to_vec()),
+        );
+        NFSStorage::cache_directory(key.clone(), &handle);
+        let cached = GLOBAL_CACHE.get(&key).assert_value("the handle is cached");
+        assert_eq!(cached, handle);
+        let reply_range = reply.as_ptr_range();
+        assert!(!reply_range.contains(&cached.as_ptr()));
+        GLOBAL_CACHE.invalidate(&key);
+    }
 
     /// A handle cached under a key `lookup_fh` never asks for is written and never read, which
     /// looks exactly like a cache that does not help — no failure, just the LOOKUP it was meant
