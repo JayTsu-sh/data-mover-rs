@@ -39,6 +39,8 @@ mod s3_direct_tests;
 #[cfg(test)]
 mod s3_expert_listing_tests;
 #[cfg(test)]
+mod s3_nas_tests;
+#[cfg(test)]
 mod s3_native_final_tests;
 #[cfg(test)]
 mod s3_native_tests;

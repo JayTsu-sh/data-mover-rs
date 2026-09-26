@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 
 use super::at_destination;
-use super::directory_object::{refuse_oversized, refuse_unholdable};
+use super::directory_object::{refuse_unholdable, refuse_unwritable};
+use super::plan::expert_recovery;
 use super::{
     ProducerRequest, TransferFailure, TransferOutcome, TransferPhase, TransferSide,
     inflight_channel, inflight_role_failure, produce, recovery_binding_for,
@@ -385,15 +386,6 @@ impl ExpertDestinationSession {
             .inflight
             .negotiated_chunk_ceiling()
             .min(request.source_maximum_chunk_bytes);
-        let recovery_enabled = request.transfer_policy == TransferPolicy::Checkpointed
-            && source_size > maximum_chunk_bytes as u64;
-        let effective_recovery = if request.transfer_policy == TransferPolicy::AtomicReplace {
-            super::EffectiveRecovery::Disabled
-        } else if recovery_enabled {
-            super::EffectiveRecovery::Checkpointed
-        } else {
-            super::EffectiveRecovery::SkippedSingleSourceChunk
-        };
         let destination = request
             .destination
             .staged_destination(&PreflightPolicy::production())
@@ -403,9 +395,15 @@ impl ExpertDestinationSession {
                     "destination capability unavailable",
                 )
             })?;
-        // Before any destination I/O: a directory object one request of this destination can
-        // carry (P7 D13).
-        refuse_oversized(&request.final_path, source.size, &*destination)?;
+        // Before any destination I/O: what this destination cannot write, by name and size (a
+        // directory object one request cannot carry, P7 D13; an ONTAP NAS bucket's limits, §14.2).
+        refuse_unwritable(&request.final_path, source.size, &*destination)?;
+        let (recovery_enabled, effective_recovery) = expert_recovery(
+            request.transfer_policy,
+            destination.resumable_at_destination(),
+            source_size,
+            maximum_chunk_bytes,
+        );
         if request.cancel.is_cancelled() {
             return Err(TransferFailure::orchestration(
                 TransferPhase::Preflight,

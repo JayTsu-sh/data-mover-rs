@@ -367,6 +367,25 @@ pub trait StagedDestination: Send + Sync {
         None
     }
 
+    /// Whether this destination can keep a transfer's progress for a later attempt to resume
+    /// (ADR-0006). `false` for a destination that cannot (an S3 bucket without multipart uploads:
+    /// an ONTAP NAS bucket, P7 §14.2): a `TransferPolicy::Checkpointed` transfer to it reports
+    /// `EffectiveRecovery::UnsupportedByDestination`, prepares with `ResumeMode::Restart` and no
+    /// recovery, and every attempt starts from zero.
+    fn resumable_at_destination(&self) -> bool {
+        true
+    }
+
+    /// Why this destination cannot write a file at `path` holding `size` bytes (`None`: unknown),
+    /// decided from the name and size alone; `None` when it can. A transfer asks once the source
+    /// is described, before any destination I/O, and fails that entry at `Preflight` with
+    /// `Unsupported` (permanent) — no fallback. An ONTAP NAS bucket refuses objects over 5 GiB
+    /// (one `PutObject`, no multipart) and keys it would store under another name (P7 §14.2 N0).
+    /// The default refuses nothing.
+    fn final_refusal(&self, _path: &StoragePath, _size: Option<u64>) -> Option<String> {
+        None
+    }
+
     /// The most bytes a directory object (a final path ending in `/`, P7 F5) written here may
     /// hold, for a destination that writes one only in a single request: S3 sends it as one
     /// `PutObject` or `CopyObject`, at most 5 GiB (P7 D13). The transfer refuses a larger one, or

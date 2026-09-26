@@ -34,7 +34,7 @@ use super::native::{NativeFillFailure, native_role_failure};
 use super::parts::UploadedParts;
 use super::single::{self, SingleStage, changed, same_etag, unchanged};
 use super::upload_pointer::pointer_path;
-use super::{S3StagedDestination, directory_object, part_size_at_least};
+use super::{S3StagedDestination, directory_object, limits, part_size_at_least};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{
     DestinationPrepareRequest, PreparedStage, PublicationFailure, StorageRoleFailure,
@@ -130,6 +130,11 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         request: DestinationPrepareRequest,
     ) -> Result<PreparedStage, StorageRoleFailure> {
         let path = request.prepare.final_destination.path().clone();
+        limits::refuse(
+            self.protocol.bucket_capabilities(),
+            &path,
+            request.prepare.source.size,
+        )?;
         let one_request =
             directory_object::single_request_size(&path, request.prepare.source.size)?.is_some();
         let pointer = pointer_path(&path)?;

@@ -16,7 +16,8 @@
 //!   `CopyObject`, P7 D13) declares how much that request carries
 //!   ([`StagedDestination::directory_object_limit`]); once the source is described, a larger one
 //!   — or one of unknown size — is refused the same way, before any destination I/O, with no
-//!   fallback ([`refuse_oversized`]).
+//!   fallback ([`refuse_unwritable`], which also asks [`StagedDestination::final_refusal`] what
+//!   else the destination cannot write: an ONTAP NAS bucket's size and key limits, P7 §14.2).
 
 use crate::model::{
     EntryOperationFailure, EntryVersion, FailureClass, ObservedEntry, Operation, StoragePath,
@@ -87,28 +88,40 @@ pub(super) fn refuse_unholdable(
     Err(unsupported_at_preflight(path, side, operation, diagnostic))
 }
 
-/// P7 D13: a directory object bound for a destination that writes one only in a single request
-/// is refused when that request cannot carry it — more than
-/// [`StagedDestination::directory_object_limit`] bytes, or of unknown `size` — as the
-/// destination's `Unsupported` at `Preflight`, before any destination I/O. No fallback.
-pub(super) fn refuse_oversized(
+/// What the destination cannot write, decided from the final path and the described size alone,
+/// as the destination's `Unsupported` at `Preflight`, before any destination I/O; no fallback:
+///
+/// - P7 D13: a directory object bound for a destination that writes one only in a single request,
+///   when that request cannot carry it — more than [`StagedDestination::directory_object_limit`]
+///   bytes, or of unknown `size`;
+/// - anything [`StagedDestination::final_refusal`] refuses (an ONTAP NAS bucket: over 5 GiB, or a
+///   key it would store under another name, P7 §14.2).
+pub(super) fn refuse_unwritable(
     path: &StoragePath,
     size: Option<u64>,
     destination: &dyn StagedDestination,
 ) -> Result<(), TransferFailure> {
-    let Some(limit) = destination.directory_object_limit() else {
-        return Ok(());
-    };
-    if !path.names_directory_object() || size.is_some_and(|size| size <= limit) {
-        return Ok(());
+    if let Some(limit) = destination.directory_object_limit()
+        && path.names_directory_object()
+        && size.is_none_or(|size| size > limit)
+    {
+        return Err(unsupported_at_preflight(
+            path,
+            TransferSide::Destination,
+            Operation::Prepare,
+            "the destination writes a directory object (a key ending in '/') only in one request, \
+             which needs its size up front and cannot carry this one",
+        ));
     }
-    Err(unsupported_at_preflight(
-        path,
-        TransferSide::Destination,
-        Operation::Prepare,
-        "the destination writes a directory object (a key ending in '/') only in one request, \
-         which needs its size up front and cannot carry this one",
-    ))
+    match destination.final_refusal(path, size) {
+        Some(reason) => Err(unsupported_at_preflight(
+            path,
+            TransferSide::Destination,
+            Operation::Prepare,
+            &reason,
+        )),
+        None => Ok(()),
+    }
 }
 
 fn unsupported_at_preflight(
@@ -131,7 +144,7 @@ fn unsupported_at_preflight(
         ),
         Err(_) => TransferFailure::orchestration(
             TransferPhase::Preflight,
-            "a path ending in '/' is refused on this storage",
+            "the destination cannot write this path",
         ),
     }
 }

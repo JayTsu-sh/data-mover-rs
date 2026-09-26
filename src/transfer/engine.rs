@@ -79,6 +79,7 @@ pub enum TransferRoute {
 }
 
 /// Effective recovery behavior after route and source-chunk planning.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EffectiveRecovery {
     /// The request explicitly chose non-checkpointed transfer.
@@ -94,6 +95,11 @@ pub enum EffectiveRecovery {
     /// one `CopyObject` up to 64 MiB): it has no intermediate state and restarts through that
     /// operation's own semantics.
     NotApplicableNative,
+    /// `TransferPolicy::Checkpointed` was requested, but the destination keeps no progress for a
+    /// later attempt (`StagedDestination::resumable_at_destination`; an ONTAP NAS bucket, P7
+    /// §14.2): nothing was looked for or kept there, and a cancelled or failed attempt starts
+    /// again from zero. Reported for every size and route.
+    UnsupportedByDestination,
 }
 
 /// Backend-neutral data path selected during planning.
@@ -330,8 +336,8 @@ async fn run_until_transferred_inner(
         destination,
     } = lend_transfer_roles(&request)?;
     let descriptor = describe_source(&request, &*source, source_qos.as_ref()).await?;
-    // Before any destination I/O, now that the size is known (P7 D13).
-    directory_object::refuse_oversized(&request.final_path, descriptor.size, &*destination)?;
+    // Before any destination I/O, now that the size is known (P7 D13, §14.2).
+    directory_object::refuse_unwritable(&request.final_path, descriptor.size, &*destination)?;
     let copied_metadata_plan = copied_metadata_plan(&request, &descriptor).await?;
     let recovery_binding = recovery_binding(&request, &descriptor);
     at_destination::run_until_transferred(

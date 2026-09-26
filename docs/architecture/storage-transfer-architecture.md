@@ -615,7 +615,10 @@ The engine arms no recovery for a native copy; the destination may turn it on it
 multipart copy once its parts reach the automatic interval, ADR-0006 C18), and the outcome then
 reports what a streamed copy of the same stage would — `Checkpointed`, `SkippedBelowCheckpointThreshold`
 or `Disabled`. Only a `Checkpointed` native copy that is one server-side operation (S3: one
-`CopyObject` up to 64 MiB) reports `NotApplicableNative`: it has no recovery state. Restart upload is an
+`CopyObject` up to 64 MiB) reports `NotApplicableNative`: it has no recovery state. A `Checkpointed`
+transfer to a destination that keeps no progress (`StagedDestination::resumable_at_destination`
+false: an ONTAP NAS bucket, P7 §14.2) reports `UnsupportedByDestination` on every route and size,
+and prepares with nothing looked for. Restart upload is an
 explicit data-mover lifecycle action that discards its owned failed stage and state before starting
 from zero.
 

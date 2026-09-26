@@ -38,8 +38,9 @@ fn transfer_failure_cleanup_contract_is_public() {
         EffectiveRecovery::SkippedSingleSourceChunk,
         EffectiveRecovery::Checkpointed,
         EffectiveRecovery::NotApplicableNative,
+        EffectiveRecovery::UnsupportedByDestination,
     ];
-    assert_eq!(effective.len(), 4);
+    assert_eq!(effective.len(), 5);
     assert_ne!(TransferRoute::Streaming, TransferRoute::Native);
     assert_eq!(
         PayloadShapingPolicy::default(),

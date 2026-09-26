@@ -856,7 +856,9 @@ zero-byte `d/` is skipped; 1 015 entries in `All`, 1 008 in `Current`, 5 directo
 - `TransferOutcome.recovery` of a native copy (C18 follow-up): `Checkpointed`,
   `SkippedBelowCheckpointThreshold` or `Disabled`, as a streamed copy of the same stage reports;
   `NotApplicableNative` only for a `TransferPolicy::Checkpointed` single `CopyObject`, where every
-  native copy used to report it.
+  native copy used to report it — except on a destination that keeps no progress (P7 §14.2 N2:
+  `resumable_at_destination()` false, an ONTAP NAS bucket), where every `Checkpointed` transfer
+  reports `UnsupportedByDestination`.
 - Legacy S3 listing (D4, after C22): on a bucket listed with `ListObjectVersions` (versioning
   `Enabled`, and every HCP namespace) `walkdir` now sends a latest entry that is a delete marker
   (`get_is_latest()` and `get_is_delete_marker()` both true) and `walkdir_2` the versions of a

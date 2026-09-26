@@ -40,7 +40,9 @@ pub(super) use super::final_upload::of;
 use super::parts::{PartTarget, PartsCheckpoint};
 use super::upload_discovery::{S3Artifacts, leftover_reason};
 use super::upload_pointer::{self, pointer_path};
-use super::{S3StagedDestination, cleanup_result, metadata_unavailable, planned_part_size, single};
+use super::{
+    S3StagedDestination, cleanup_result, limits, metadata_unavailable, planned_part_size, single,
+};
 use crate::model::{FailureClass, ObjectTag, Operation, StoragePath, Transience};
 use crate::storage::discovery::discover;
 use crate::storage::pointer::{DestinationPointer, MAX_POINTER_BYTES};
@@ -142,6 +144,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     ) -> Result<PreparedStage, StorageRoleFailure> {
         let path = request.prepare.final_destination.path().clone();
         let size = request.prepare.source.size;
+        limits::refuse(self.protocol.bucket_capabilities(), &path, size)?;
         let single = self.single_put_size(&path, size)?;
         let pointer = pointer_path(&path)?;
         if let Some(size) = single {
@@ -163,6 +166,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         pointer: StoragePath,
     ) -> Result<PreparedStage, StorageRoleFailure> {
         let path = request.prepare.final_destination.path().clone();
+        limits::refuse_multipart(self.protocol.bucket_capabilities(), &path)?;
         let artifacts = S3Artifacts::new(&*self.protocol, &path, &pointer, &request);
         let found = discover(&artifacts, &request).await?;
         let Some(point) = found.resume else {
@@ -198,12 +202,16 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
 
     /// Before an object written in one request (a single `PutObject`, C14b, or one `CopyObject`,
     /// C18) only the pointer is looked at — no listing, for cost: a leftover one is removed with
-    /// the uploads on the key, and the prepare reports the restart.
+    /// the uploads on the key, and the prepare reports the restart. A bucket that keeps no
+    /// progress (P7 §14.2) holds no pointer to look for: nothing is asked, and the stage is fresh.
     pub(super) async fn clear_leftover(
         &self,
         request: &DestinationPrepareRequest,
         pointer: &StoragePath,
     ) -> Result<PrepareFact, StorageRoleFailure> {
+        if !self.protocol.bucket_capabilities().resumable {
+            return Ok(PrepareFact::Fresh);
+        }
         let path = request.prepare.final_destination.path();
         let Some(found) =
             upload_pointer::read(&*self.protocol, pointer, MAX_POINTER_BYTES + 1).await?

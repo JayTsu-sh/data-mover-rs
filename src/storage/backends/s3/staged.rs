@@ -29,6 +29,9 @@ mod directory_object;
 #[cfg(test)]
 mod directory_object_tests;
 mod final_upload;
+mod limits;
+#[cfg(test)]
+mod nas_tests;
 mod native;
 mod native_final;
 #[cfg(test)]
@@ -212,9 +215,24 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         true
     }
 
-    /// The 64 MiB interval (D3: a checkpointed object up to it never writes a pointer).
+    /// The 64 MiB interval (D3: a checkpointed object up to it never writes a pointer); none on a
+    /// bucket that keeps no progress.
     fn automatic_checkpoint_interval_bytes(&self) -> Option<u64> {
-        Some(self.checkpoint_interval)
+        self.protocol
+            .bucket_capabilities()
+            .resumable
+            .then_some(self.checkpoint_interval)
+    }
+
+    /// `false` on a bucket without multipart uploads (an ONTAP NAS bucket, P7 §14.2).
+    fn resumable_at_destination(&self) -> bool {
+        self.protocol.bucket_capabilities().resumable
+    }
+
+    /// The bucket's own limits ([`limits`]): an ONTAP NAS bucket refuses objects over 5 GiB and
+    /// keys it would store under another name.
+    fn final_refusal(&self, path: &StoragePath, size: Option<u64>) -> Option<String> {
+        limits::refusal(self.protocol.bucket_capabilities(), path, size)
     }
 
     /// 5 GiB: a directory object is one `PutObject` or `CopyObject` (P7 D13).

@@ -1009,7 +1009,8 @@ MinIO 对 `d/` 的 CreateMultipartUpload 回 `XMinioInvalidObjectName` → 该�
 `Direct` 一次 `PutObject`，native 一次 `CopyObject`，不看单 PUT 阈值（8 MiB）与 native 单次拷贝上限（64 MiB）；不写指针、不续传，
 失败从零开始（`staged/directory_object.rs::single_request_size`，at_destination / direct / native_final 三个 prepare 共用）。
 > 5 GiB 或源大小未知：新 `StagedDestination::directory_object_limit()`（默认 `None`，S3 = 5 GiB），引擎在描述源之后、租约与目的端
-任何 I/O 之前报 **Preflight**、目的端、条目 `Unsupported` / Permanent（`engine/directory_object.rs::refuse_oversized`，普通入口与
+任何 I/O 之前报 **Preflight**、目的端、条目 `Unsupported` / Permanent（`engine/directory_object.rs::refuse_oversized`，N2 起并入
+`refuse_unwritable`；普通入口与
 expert 目的端半边都查），不回退；S3 prepare 自己也在 I/O 前同样拒（直接调用角色时为 Prepare）。协议层兜底：role
 `begin_multipart` / `complete_multipart` 对拼上前缀后以 `/` 结尾的键不发请求、回条目 `Unsupported`；legacy
 `create_multipart_upload` / `multipart_begin` / multipart rename / 可续传路径（接管已开的上传之前）/ `complete_multipart_upload`

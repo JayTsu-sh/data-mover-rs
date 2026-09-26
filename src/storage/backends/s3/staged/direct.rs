@@ -17,7 +17,9 @@ use super::super::source::{cancelled, classified_entry, entry, role_failure};
 use super::super::{S3Protocol, S3ProtocolFailure, S3WriteFacts, composite_etag};
 use super::completion::completed_object;
 use super::parts::{PartTarget, UploadedParts};
-use super::{MAX_INFLIGHT_PARTS, S3StagedDestination, cleanup_result, planned_part_size, single};
+use super::{
+    MAX_INFLIGHT_PARTS, S3StagedDestination, cleanup_result, limits, planned_part_size, single,
+};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{
     ByteStream, PrepareRequest, PreparedStage, PublicationDisposition, PublicationEvidence,
@@ -86,6 +88,11 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         if cancel.is_cancelled() {
             return Err(cancelled(path, Operation::Prepare));
         }
+        limits::refuse(
+            self.protocol.bucket_capabilities(),
+            path,
+            request.source.size,
+        )?;
         if request.source.source_identity.backend() == &self.identity
             && request.source.path == *path
         {
@@ -100,6 +107,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         let mut stage = if let Some(size) = self.single_put_size(path, request.source.size)? {
             self.prepare_single(request, size)
         } else {
+            limits::refuse_multipart(self.protocol.bucket_capabilities(), path)?;
             let part_size = planned_part_size(request.source.size, path)?;
             let token = Self::encode_token(path.as_str(), DIRECT_MARKER);
             let mut stage = PreparedStage::new(

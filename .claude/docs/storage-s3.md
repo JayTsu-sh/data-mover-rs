@@ -48,6 +48,10 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
   `Content-Range` 总长、`Last-Modified` 必须等于描述时的，body 短于宣称长度按“已被替换”（`Conflict` / Permanent），读完
   再 `HEAD` 一次（`role_protocol/unpinned.rs`、`source.rs::confirm_unchanged`）；无源端版本、namespace
   `histories=false` / `directory_objects=false`；原生拷贝亲和 `ontap-nas` + 桶名（只与同一 NAS 桶配对）。
+  N2：目的端不续传（`resumable_at_destination() = false`、无自动间隔；Checkpointed 报
+  `EffectiveRecovery::UnsupportedByDestination`、prepare 按 Restart、不看指针不列 upload）；`final_refusal`（`staged/limits.rs`）
+  在 Preflight、目的端任何请求之前拒 > 5 GiB 与含空段 / `.` / `..` 段、段 > 255 字节的 key（条目 `Unsupported` / Permanent），
+  S3 的三个 prepare 再查一遍。
   **legacy `StorageEnum` 不理会这个 profile**（决定 13，只写文档）：legacy 读不带条件、不核对，写 > 5 MiB 走分段遇 501。
 - 所有 profile（含标准 `s3://`）都为 multi-object delete 加 body-matching、SigV4-signed
   `Content-MD5`（`s3/delete_objects_md5.rs`，由 `s3.rs` 的 `configure_compatibility` 统一挂载）：SDK 默认只发
@@ -432,6 +436,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - `EffectiveRecovery` 报流式路径对同一 stage 会报的值（C22 后的 follow-up；C18 最初一律报 `NotApplicableNative`）：
   fill 打开 recovery 后 `Checkpointed`，`Checkpointed` 但分段没到间隔（不写指针）`SkippedBelowCheckpointThreshold`，
   `AtomicReplace` → `Disabled`；只有 `Checkpointed` 的单次 `CopyObject`（≤ 64 MiB，没有恢复状态）报 `NotApplicableNative`
+  （NAS 桶目的端例外：一律 `UnsupportedByDestination`，P7 §14.2 N2）
   （fill 在 `NativeStageEvidence::single_operation` 里说明）。续传看 `prepare` / `reused_bytes`。`CopyObject` 带
   `x-amz-metadata-directive: REPLACE` 与 `x-amz-tagging-directive: REPLACE`、不带元数据与 tags：源的用户元数据、内容类型、
   tags 都不带过去，与 `UploadPartCopy`、流式路径一致（目的端元数据不随大小变）；元数据计划要的 tags 之后照常设置。

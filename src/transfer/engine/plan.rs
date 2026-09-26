@@ -17,7 +17,10 @@ use crate::transfer::identity::{BindingSource, binding_hash};
 use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy, TransferRequest};
 
 pub(super) fn final_recovery(stage: &PreparedStage, plan: TransferPlan) -> EffectiveRecovery {
-    if stage.recovery_enabled() {
+    if plan.effective_recovery == EffectiveRecovery::UnsupportedByDestination {
+        // The destination keeps no progress: whatever the stage says, nothing is kept.
+        EffectiveRecovery::UnsupportedByDestination
+    } else if stage.recovery_enabled() {
         EffectiveRecovery::Checkpointed
     } else if plan.effective_recovery == EffectiveRecovery::Checkpointed {
         // The destination declined recovery for this stage (reachable only for a native copy, a
@@ -95,7 +98,41 @@ pub(super) fn plan_request(
             plan.automatic_interval = Some(interval);
         }
     }
+    if request.transfer_policy == TransferPolicy::Checkpointed
+        && !destination.resumable_at_destination()
+    {
+        // Nothing is looked for or kept at the destination: the prepare restarts (`resumable` in
+        // `at_destination::prepare` follows from these two), every attempt starts from zero, and
+        // the outcome says why whatever the size or route.
+        plan.recovery_enabled = false;
+        plan.automatic_interval = None;
+        plan.effective_recovery = EffectiveRecovery::UnsupportedByDestination;
+    }
     Ok((plan, native_pair))
+}
+
+/// The recovery an expert destination half plans before it prepares: (whether the stage is
+/// recoverable from the start, what the outcome reports). `AtomicReplace` is `Disabled`; a
+/// `Checkpointed` transfer to a destination that keeps no progress is `UnsupportedByDestination`;
+/// otherwise a source over one chunk is `Checkpointed`, one within it `SkippedSingleSourceChunk`.
+pub(super) fn expert_recovery(
+    policy: TransferPolicy,
+    resumable: bool,
+    source_size: u64,
+    maximum_chunk_bytes: usize,
+) -> (bool, EffectiveRecovery) {
+    let checkpointed = policy == TransferPolicy::Checkpointed;
+    let recovery_enabled = checkpointed && resumable && source_size > maximum_chunk_bytes as u64;
+    let effective = if policy == TransferPolicy::AtomicReplace {
+        EffectiveRecovery::Disabled
+    } else if checkpointed && !resumable {
+        EffectiveRecovery::UnsupportedByDestination
+    } else if recovery_enabled {
+        EffectiveRecovery::Checkpointed
+    } else {
+        EffectiveRecovery::SkippedSingleSourceChunk
+    };
+    (recovery_enabled, effective)
 }
 
 pub(super) fn recovery_binding(

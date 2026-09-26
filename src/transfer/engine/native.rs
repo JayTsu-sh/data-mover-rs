@@ -37,7 +37,9 @@ async fn prepare_native_stage(
     input: &NativeTransferInput,
     lease: DestinationLease,
 ) -> Result<PreparedStage, TransferFailure> {
-    let resume = if request.transfer_policy == TransferPolicy::Checkpointed {
+    let resume = if request.transfer_policy == TransferPolicy::Checkpointed
+        && input.destination.resumable_at_destination()
+    {
         ResumeMode::Discover
     } else {
         ResumeMode::Restart
@@ -202,7 +204,8 @@ async fn finish_native(
 /// `Checkpointed` once the fill turned recovery on, `SkippedBelowCheckpointThreshold` for a
 /// `Checkpointed` upload that never reached the interval, `Disabled` for any other policy — except
 /// a `Checkpointed` copy that is one server-side operation, which has no recovery state:
-/// `NotApplicableNative`.
+/// `NotApplicableNative`. A destination that keeps no progress reports `UnsupportedByDestination`
+/// either way.
 fn recovery(
     stage: &PreparedStage,
     plan: TransferPlan,
@@ -210,6 +213,7 @@ fn recovery(
 ) -> EffectiveRecovery {
     match final_recovery(stage, plan) {
         EffectiveRecovery::Disabled => EffectiveRecovery::Disabled,
+        EffectiveRecovery::UnsupportedByDestination => EffectiveRecovery::UnsupportedByDestination,
         _ if single_operation => EffectiveRecovery::NotApplicableNative,
         streamed => streamed,
     }

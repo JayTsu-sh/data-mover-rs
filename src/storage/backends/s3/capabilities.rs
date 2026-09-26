@@ -2,6 +2,9 @@
 //! (`compat=` and `bucket_type=`) when the protocol is connected. No role branches on a vendor name;
 //! each branch reads one switch, so a future bucket type is one more row where the URL is mapped.
 
+/// 5 GiB: the most one `PutObject` or `CopyObject` carries.
+pub(crate) const MAX_SINGLE_REQUEST_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
 /// The switches of one S3 bucket: independent yes / no facts, one per behaviour a role branches on.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12,6 +15,19 @@ pub(crate) struct S3BucketCapabilities {
     /// body shorter than announced means the object was replaced mid-read, and a source read ends
     /// with one more `HEAD`.
     pub(crate) conditional_reads: bool,
+    /// Multipart uploads (`CreateMultipartUpload` …). Without them no multipart request is ever
+    /// sent: an object is one `PutObject`, at most [`Self::max_object_bytes`].
+    pub(crate) multipart: bool,
+    /// A transfer's progress can be kept at the destination for a later attempt (the `.upload`
+    /// pointer beside the key and `ListParts`, ADR-0006). Without it every attempt starts from
+    /// zero, and a prepare looks for nothing (no pointer `HEAD`, no `ListMultipartUploads`).
+    pub(crate) resumable: bool,
+    /// The largest object written here; `None` = no limit of the bucket's own.
+    pub(crate) max_object_bytes: Option<u64>,
+    /// Keys are file paths: each `/`-separated segment is a file name of at most 255 bytes, and
+    /// an empty, `.` or `..` segment is resolved away — the object would land under another key
+    /// (N0: `a/../x`, `a/./y`, `a//b` are silently rewritten; a longer segment answers 500).
+    pub(crate) file_backed_keys: bool,
     /// Stored versions: a source can be read at a version and a key's history listed.
     pub(crate) versions: bool,
     /// Content under a key ending in `/` (P7 F5).
@@ -24,6 +40,10 @@ impl S3BucketCapabilities {
     /// An object bucket of any S3 profile.
     pub(crate) const OBJECT: Self = Self {
         conditional_reads: true,
+        multipart: true,
+        resumable: true,
+        max_object_bytes: None,
+        file_backed_keys: false,
         versions: true,
         directory_objects: true,
         native_same_bucket_only: false,
@@ -37,6 +57,10 @@ impl S3BucketCapabilities {
     /// answers 501.
     pub(crate) const NAS: Self = Self {
         conditional_reads: false,
+        multipart: false,
+        resumable: false,
+        max_object_bytes: Some(MAX_SINGLE_REQUEST_BYTES),
+        file_backed_keys: true,
         versions: false,
         directory_objects: false,
         native_same_bucket_only: true,
