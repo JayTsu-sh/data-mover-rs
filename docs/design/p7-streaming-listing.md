@@ -89,7 +89,7 @@
 |---|---|---|---|
 | Local | `spawn_blocking` 读完整目录（`local/namespace.rs:140-153, 257-297`） | fd，无超时 | 列举级错误与子项错误都记在目录路径上（`:271-275`），分不清 |
 | NFS | 收完整个 `readdirplus` 流；出错整目录从头重试（`nfs.rs:4610-4691`） | cookie + verifier，无状态；但 nfs-rs 0.8.4 不公开页游标（`mount.rs:28` `pub(crate)`） | 一个子项缺属性 → 整目录失败（`nfs.rs:4657-4659`）；一个子项描述失败 → 整目录失败（`backends/nfs/namespace.rs:75-86`） |
-| CIFS | open → `entries("*").try_collect()` → close（`cifs/protocol.rs:230-246`） | **真实目录句柄**（CREATE 出来的） | 一个子项失败 → 整目录失败（`cifs/namespace.rs:92`） |
+| CIFS | open → `entries("*").try_collect()` → close（`cifs/protocol.rs:230-246`）；**C9 `936e20b` 起逐页流式** | **真实目录句柄**（CREATE 出来的） | 一个子项失败 → 整目录失败（`cifs/namespace.rs:92`） |
 | S3 | 收齐所有页再建块，500 万上限（`s3/listing.rs:55-130`，`paging.rs:24-29`） | continuation token，无状态 | 对象去重用 O(N) HashSet（`listing.rs:79-81`）；token 重复 → 会话失败（`paging.rs:83-86`）；429/503/SlowDown → 会话失败（`src/s3/role_protocol.rs:518-523`） |
 | HDFS | `get_metadata` + `list_status` 全量（`src/hdfs/namespace.rs:271-288`） | startAfter，无状态 | 每目录多一次 RPC（`:275`）；一个子项失败 → 整目录失败（`backends/hdfs/namespace.rs:44-52`） |
 
@@ -269,7 +269,7 @@ type ListingStream = Pin<Box<dyn Stream<Item = Result<ListingPage, StorageRoleFa
 |---|---|---|
 | Local | 每页一次 `spawn_blocking`，把 `ReadDir` 带进带出；停车时不占 blocking 线程 | readdir 错误基本不是瞬时的 → `Interrupted`（已交付过）/ `Unreadable`（没交付）；已读到的先交付。**已实现** `277f1f8`：20 万文件平铺目录首项 400 ms → 6 ms、RSS 217 → 22 MB |
 | NFS | 生产者任务消费 `readdirplus` 流，按 `page_hint` 攒页 | **首页交出之前**可以整目录从头重试（legacy 就是这条规则，`nfs.rs:3364-3366`）；之后只能从 cookie 续（需要 nfs-rs 公开页接口，Q18），否则 `Interrupted`。**已实现** `7da78ce`：首页前句柄失效 → 解析路径（至多 3 次）、`DELAY` / `JUKEBOX` / `GRACE` → 列举节流预算内退避、nfs-rs 认证可重发的传输失败 → 250 ms / 1 s / 2 s，都从头重读、不重复交出；首页后不重试，已读到的先交出再失败（可重发的传输失败只让该列举失败）；drop / 取消在下一条之前停、不放弃在途请求。C7b：v3 列出的缺属性 `.snapshot` 经一次 LOOKUP 确认是目录后隐藏（计入 `internal_hidden`，ONTAP 卷根，与 v4 一致），见 §14 C7b。5 万文件平铺目录首项 ONTAP v3 1.2 s → 0.05 s、v4.0 / v4.1 2.2 s → 0.07 s、DXN-2 v3 6 s → 0.14 s、v4.0 10 s → 0.2 s；RSS 69–75 → 17–20 MB（release）；五种环境与 legacy 基线逐行相同 |
-| CIFS | 生产者任务持有 `Directory`，逐条 `entries` 攒页；所有出口都 close | 句柄失效无法续 → `Interrupted` |
+| CIFS | 生产者任务持有目录句柄（`CifsDirectory`），逐条取 `QUERY_DIRECTORY` 记录按 `page_hint` 攒页；所有出口都 close，最后一页在关句柄之后交出；停车时句柄开着 → `Namespace::parked_listing_limit()` = 8，Blocks 游标让“已起、未读完”的预取列举不超过它（游标正要的那个总是起） | 首页交出之前句柄失效（smb-rs 重连后旧句柄上的 `InvalidState`、重连时在途的 `StaleObject`、`STATUS_FILE_CLOSED` / `STATUS_INVALID_HANDLE`）→ 重开目录从头读（50 ms / 250 ms / 1 s，至多 3 次，不重复交出）；之后句柄失效无法续 → 已读到的先交出，`Interrupted`（原分类，连接类升会话）。取消 / drop 在取下一条之前停、让在途记录到达；smb-rs 流已预发的下一条 `QUERY_DIRECTORY` 随流 drop 取消（#75/#76）。没有下钻提示（CREATE 按路径一次往返）。**已实现** `936e20b`（接缝 `70f85d1`）：5 万文件平铺目录首项 400 → 34–46 ms、RSS 65 → 21–25 MB（release）；10.3 万条整树 c=1/4/32 与 base 逐行相同（含顺序），RSS 84–118 → 30–44 MB；停车时 ONTAP 上恰 9 个打开的目录句柄（base 0）；与 NFSv3 / v4.1 同一棵树 Blocks 输出逐行相同；停车 30 分钟后照常读完（Q10） |
 | S3 | 未开过版本控制的桶：ListObjectsV2，每页转一页；多版本桶：ListObjectVersions，按目录组装每个 key 的历史（见 5.3、第 10 节） | 同一 token 重发（无状态，安全）；节流退避。**已实现** `f2cacdc`（Current 流式；All 仍按目录物化，C11b）：不假设 key 有序（只用不透明 token，前缀名集合去重，对象只与上一页比对，列完才判 `NotFound`）；节流按 C3 预算、其他瞬时失败同一 token 再发至多 3 次（读到一页即续满），首页前后一样；500 万上限不再限流式 Current 的对象数，只管驻留的前缀名集合与不可解码 key（续页 token 另限 500 万）；物化的 All 仍按条数计（用户 2026-09-26 定，**已修** `ffd37ca`；5,000,001 个对象的平铺前缀在生产上限下流完）。2 万对象平铺前缀首项 MinIO 3.5 s → 0.4 s、ONTAP 1.2 s → 0.13–0.25 s，RSS 68 → 54 / 66 → 50 MB（debug）；MinIO / ONTAP（含 NAS 桶）/ RustFS / DXN 的多版本与非多版本桶均已跑 |
 | HDFS | `list_status_iter`（hdfs-native `client.rs:734`）；去掉列举前的 `get_metadata` | 续读：hdfs-native 不公开 startAfter，可重试失败（I/O、单批 > 5 s）后重开列举、跳过到最后读到的名字之后（按 NameNode 的有符号字节序；只在失败时多读），首页前后都可续、不重复发子项；其他失败或预算用完 → `Interrupted`。**已实现** `9c8185f`；有符号字节序、列举文件回自身、缺目录 `FileNotFound` 三点待真机（runner 需用户批准） |
 
@@ -424,6 +424,9 @@ type ListingStream = Pin<Box<dyn Stream<Item = Result<ListingPage, StorageRoleFa
 - 现有准入游标改为逐页消费：`Frame.children` 从整块 `VecDeque` 变为“已到页 + 仍打开的流”；块关闭条件改为“缓冲空且流读尽”；过滤决定逐页做。
 - 块关闭时对槽位（子目录）按名字字节排序，然后按序下钻。
 - 祖先帧的流在下钻前已读尽，**栈上没有横跨子树的打开游标**。只有“已预取、游标还没走到”的目录会停在半路（≤ 2P 个）：NFS/S3/HDFS 停车什么都不占；Local 占一个 fd；**CIFS 占一个真实句柄**，单设上限（Q10）。
+  C9 `936e20b` 的实现：`Namespace::parked_listing_limit()`（默认 `None`，CIFS 8）；游标预取时“已起、未读完”（等页的 + 停车的）
+  列举数不超过它，所以停车的必在其中、上界严格，游标正要的那个不计、总是起，上限不会卡住遍历；打开的 CIFS 列举句柄 ≤ 8 + 1
+  （FAS2750 实测恰为 9）。代价：CIFS 上预取并发从 2 × min(c, 64) 降到 8；10.3 万条的树上 c=32 wall 未变差（0.81 → 0.67 s）。
 - 预取语义从“整份列举到齐”变成“首页到齐”。小目录（多数）一两页就读完，行为与今天相同、句柄立即关闭。
 - 内存：O(打开的列举 × 2 页) + O(当前与已预取目录的子目录数)。后者（槽位）P7 压不住，归 P8/P9（名字 arena / 溢写）。
 
@@ -904,6 +907,7 @@ C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:46
     + 子目录句柄作为下钻提示随工作项下传，列举不再写 GLOBAL_CACHE，无提示 / 失效回退 lookup_fh（§12.7 修法 A）
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
 C9  feat(storage): CIFS 流式（生产者持有句柄；停车句柄上限） - src/storage/backends/cifs/{protocol.rs:230-280, namespace.rs:59-94}
+    —— 已完成：70f85d1（接缝 open_directory + CifsDirectory，不改行为）、936e20b
 C10 feat(traversal): Unordered 调度器（worker LIFO + 窃最浅 + 全局计数，内部通道按页），设为默认
 C11 feat(traversal): Resumable（Checkpoint 项每约 1 分钟 + 取消时补发、resume_from、指纹），两种方式
 C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 v7），删除 TraversalVersions / list_versions
@@ -1138,7 +1142,7 @@ N1–N7 在 H1、C7 之后。完整方案（file:line）见会话 scratchpad `s3
 
 | 编号 | 决定 | 见 |
 |---|---|---|
-| Q10 | CIFS 预取停车句柄上限 8（先在 FAS2750 上测 ONTAP 空闲回收） | §6.2 |
+| Q10 | CIFS 预取停车句柄上限 8（先在 FAS2750 上测 ONTAP 空闲回收）。**实测（C9，2026-09-27，WSL → FAS2750）**：打开的目录句柄停 30 分钟（会话完全空闲，或每 20 s 一个请求）后照常读完；SVM 的 `client_session_timeout` = 900 s，但持有打开文件的会话过了 900 s 仍在（ONTAP 会话表 idle > 15 分钟、open_files = 1）—— 不按空闲回收；没有打开文件的空闲会话约 900 s 后被服务端 RST。C9 构建的停车测试 1800 s：1500 个子项的目录首页后停 1800 s，照常读完（1500 条，26 ms），随后 20 次首页后 drop、每次后会话照常；同一进程里另一条没有打开文件的空闲连接在约 15 分钟时被 RST（即 900 s），smb-rs 重连时有后台任务 panic（`engine.rs:703` “async fn resumed after completion”，上游缺陷，base 的 raw probe 同样出现，与 C9 无关）。会丢句柄的是连接断开：smb-rs 不重开目录句柄，重连后旧句柄 `InvalidState`（10.131.9.10 网段断连时观察到） | §6.2 |
 | Q11 | 新增 `FailureClass::Throttled`；单个列举累计退避约 2 分钟后报 `Interrupted` | §8 |
 | Q12（消失） | 列举后消失的条目、父列出后已不存在的子目录计入 `vanished`，不发失败项，不破坏完整性 | §8 |
 | Q13 | 同 Q12：重复 / 遗漏写进契约 | §5.4.3 |
