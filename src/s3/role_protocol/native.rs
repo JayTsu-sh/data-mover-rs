@@ -152,8 +152,7 @@ pub(super) mod tests {
             .http_client(http_client)
             .build();
         S3Storage {
-            storage_type: super::super::super::StorageType::S3,
-            compatibility: super::super::super::S3Compatibility::Standard,
+            options: super::super::super::S3UrlOptions::default(),
             endpoint: "http://native.test".into(),
             bucket_name: "destination".into(),
             prefix: None,

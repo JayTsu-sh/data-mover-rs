@@ -29,9 +29,7 @@ mod tests {
     use aws_smithy_types::body::SdkBody;
     use aws_types::region::Region;
 
-    use super::super::{
-        DEFAULT_BLOCK_SIZE, DEFAULT_TRANSFER_CONCURRENCY, S3Compatibility, S3Storage, StorageType,
-    };
+    use super::super::{DEFAULT_BLOCK_SIZE, DEFAULT_TRANSFER_CONCURRENCY, S3Storage, S3UrlOptions};
     use crate::AssertTestValue;
 
     /// Each request as (method, uri, `Content-Length`, has `x-amz-copy-source`).
@@ -94,8 +92,7 @@ mod tests {
             .http_client(http_client)
             .build();
         S3Storage {
-            storage_type: StorageType::S3,
-            compatibility: S3Compatibility::Standard,
+            options: S3UrlOptions::default(),
             endpoint: "http://copy.test".into(),
             bucket_name: "bucket".into(),
             prefix: None,

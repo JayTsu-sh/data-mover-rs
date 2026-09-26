@@ -32,17 +32,11 @@ pub(super) fn connect(
         &storage.bucket_name,
         storage.prefix.as_deref().unwrap_or_default(),
     )?;
-    let native = matches!(
-        storage.compatibility,
-        S3Compatibility::Standard | S3Compatibility::Dxn
-    )
-    .then(|| {
+    let compat = storage.options.compat;
+    let native = native_label(compat).map(|label| {
         S3NativeContext::new(
             &storage.endpoint,
-            match storage.compatibility {
-                S3Compatibility::Dxn => "dxn",
-                _ => "standard",
-            },
+            label,
             storage.bucket_name.clone(),
             storage.prefix.clone(),
         )
@@ -51,10 +45,23 @@ pub(super) fn connect(
         Arc::new(storage.clone()),
         identity,
         native,
-        match storage.compatibility {
+        match compat {
             S3Compatibility::Dxn => S3TagSupport::Unsupported,
-            _ => S3TagSupport::Supported,
+            S3Compatibility::Standard | S3Compatibility::StorageGrid | S3Compatibility::Hcp => {
+                S3TagSupport::Supported
+            }
         },
         Some(single_put_threshold),
     )
+}
+
+/// The native-copy affinity label of a profile: two storages copy natively only on the same
+/// endpoint under the same label. `StorageGRID` never copies natively; HCP keeps the standard
+/// label (its `CopyObject` is standard S3).
+fn native_label(compat: S3Compatibility) -> Option<&'static str> {
+    match compat {
+        S3Compatibility::Standard | S3Compatibility::Hcp => Some("standard"),
+        S3Compatibility::Dxn => Some("dxn"),
+        S3Compatibility::StorageGrid => None,
+    }
 }
