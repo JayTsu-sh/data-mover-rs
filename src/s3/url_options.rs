@@ -6,7 +6,7 @@
 //! ```text
 //! s3://AK:SK@bucket.host[:port][/prefix][?options]         HTTP
 //! s3+https://AK:SK@bucket.host[:port][/prefix][?options]   HTTPS
-//! options: compat=sg|dxn|hcp|ontap  tls_verify=false  bucket_type=nas
+//! options: compat=sg|dxn|ontap  tls_verify=false  bucket_type=nas
 //! ```
 //!
 //! Leaving an option out gives its default (standard S3, certificates verified, object bucket);
@@ -30,18 +30,15 @@ pub(crate) enum S3Compatibility {
     Standard,
     StorageGrid,
     Dxn,
-    /// Hitachi Content Platform: object tags are read through its REST annotation.
-    Hcp,
     /// `NetApp` ONTAP S3. No request differs from standard S3: every ONTAP quirk of an object bucket
     /// is handled generically. It owns `bucket_type=nas` and its own native-copy affinity.
     Ontap,
 }
 
 impl S3Compatibility {
-    const VALUES: [(&'static str, Self); 4] = [
+    const VALUES: [(&'static str, Self); 3] = [
         ("sg", Self::StorageGrid),
         ("dxn", Self::Dxn),
-        ("hcp", Self::Hcp),
         ("ontap", Self::Ontap),
     ];
 }
@@ -119,15 +116,20 @@ pub(crate) struct S3UrlParts<'a> {
 }
 
 /// The schemes that were replaced by options, with their new spelling. The old `+https` schemes
-/// accepted any certificate, hence `tls_verify=false` in their replacement.
+/// accepted any certificate, hence `tls_verify=false` in their replacement. HCP support was removed
+/// altogether: an HCP namespace is used as standard S3.
 const REMOVED_SCHEMES: [(&str, &str); 6] = [
     ("s3+http", "s3://…"),
     ("s3+sg", "s3://…?compat=sg"),
     ("s3+sg+https", "s3+https://…?compat=sg&tls_verify=false"),
     ("s3+dxn", "s3://…?compat=dxn"),
     ("s3+dxn+https", "s3+https://…?compat=dxn&tls_verify=false"),
-    ("s3+hcp", "s3://…?compat=hcp"),
+    ("s3+hcp", HCP_REMOVED),
 ];
+
+/// What the removed HCP spellings (`s3+hcp://`, `compat=hcp`) are told.
+const HCP_REMOVED: &str = "s3://… (HCP support was removed: the namespace is used as standard S3, \
+                           its tags as S3 object tagging, not the HCP BPM annotation)";
 
 /// Splits `scheme://AK:SK@location[?options]` into its parts.
 ///
@@ -235,6 +237,11 @@ fn read_query(query: &str) -> Result<Given> {
         }
         if value.is_empty() {
             return Err(invalid(format!("the S3 URL option {name} has no value")));
+        }
+        if name == "compat" && value == "hcp" {
+            return Err(invalid(format!(
+                "compat=hcp was removed; write {HCP_REMOVED}"
+            )));
         }
         match name {
             "compat" => set(

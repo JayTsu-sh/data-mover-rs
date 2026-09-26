@@ -106,12 +106,6 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | `bucket_type=nas`：PutObject（缓冲或流式）回 404 `NoSuchKey`（路径上某段是文件）或 409 `NameCollision`（要写成文件的位置是目录） | 条目 **`Conflict`** / Permanent（名字冲突；不是 `NotFound`，也不重试）；对象桶上 404 仍是 `NotFound` |
 | 目的端写不了的名字或大小（`StagedDestination::final_refusal`；`bucket_type=nas`：> 5 GiB 或大小未知、key 含空段 / `.` / `..` 段（服务器会静默改写到别的 key）、段 > 255 字节（服务器回看似可重试的 500）；P7 §14.2 N2） | `Preflight`、目的端、条目 `Unsupported` / Permanent，目的端任何请求之前；直接调角色时 S3 prepare 报同样的条目失败（Operation `Prepare`） |
 | **无条件读的桶**（`bucket_type=nas`，ONTAP NAS 桶，P7 §14.2 N1；`role_protocol/unpinned.rs`）：范围 GET 的响应 `ETag` 不等于描述时的、`Content-Range` 总长不等于描述时的大小、`Last-Modified` 不同（两边都有时）、缺 `ETag`；body 短于宣称长度**或读 body 途中出错**；读完后的 `HEAD` 看到别的 `ETag` / 大小 / `Last-Modified`，或对象已不在（`source.rs::confirm_unchanged`） | 条目 `Conflict` / Permanent（同 412）。body 出错按“已被替换”判是 N0 的决定：替换提交后 0.3–0.7 s 服务器断开进行中的 GET，收到的是旧内容的干净前缀；**代价**：同样被切断的普通断连也报成 `Conflict`、不重试（诊断里带原始错误）。对象桶上读 body 出错仍是会话 `Connectivity` / Transient（不变） |
-| `compat=hcp` 读标签走 HCP REST `BPM` 注解（`role_protocol/hcp_tags.rs`，P7 P4）：404 / 204 / 空回复 | 无标签（不分“没有注解”与“没有对象 / 版本”） |
-| 同上：其他状态（HCP 不给错误码，只按状态分类；带 `version=` 的 400 除外） | 通用映射（403 → 条目 `PermissionDenied`，429 / 503 → 会话 `Throttled`，5xx → 会话 `Connectivity` …） |
-| 同上：带 `version=` 的 400（HCP 不认按版本读注解，未在真机验证） | 条目 `Unsupported` / Permanent |
-| 同上：连接失败 / 超时（S3 连接的超时同样用于 REST） | 会话 `Connectivity` / Transient |
-| 同上：注解不是预期的 XML、超过 1 MiB | 条目 `Protocol` / Permanent（legacy 记日志当无标签） |
-| 同上：key 含 `.` / `..` 段（HTTP 路径表达不了，会读到别的对象） | 条目 `InvalidInput` / Permanent，不发请求 |
 | 请求 `Id(v)` 而 HEAD 回来的不是版本 v（存储忽略 `?versionId=`） | 条目 `Unsupported` / Permanent |
 | 一个目录的列举翻页：续页 token / marker 绕回来过、连续空页超限（`paging.rs`，C22）；版本列举的截断页停在某 key 中间却没给 `NextVersionIdMarker`、且读不到文档序无法确定续点（F4，`version_order::UnknownResumePoint`） | **该目录**的条目 `Protocol` / Permanent（报在目录上，块 `Failed`，遍历继续兄弟；不结束会话 —— 之前 token 绕圈是会话失败，P7 评审现存问题 3） |
 | 一个列举驻留的条目超过 500 万（`paging.rs`；整个读完的列举按列到的条数，流式 Current 只数前缀名集合与报过的 key、续页 token 另限 500 万，交出的对象不计） | 该目录的条目 `Capacity` / Permanent（同上） |

@@ -656,7 +656,7 @@ struct VersionRecord {
 
 ### 11.2b S3 URL 参数化（P1–P5）对 terrasync 的要求
 
-- 配置里的 S3 URL 要迁移：`s3+sg://` → `s3://…?compat=sg`，`s3+dxn://` → `s3://…?compat=dxn`，`s3+hcp://` → `s3://…?compat=hcp`，
+- 配置里的 S3 URL 要迁移：`s3+sg://` → `s3://…?compat=sg`，`s3+dxn://` → `s3://…?compat=dxn`，`s3+hcp://` → `s3://…`（HCP 支持已删除，按标准 S3），
   `s3+http://` → `s3://`；旧 `s3+sg+https://` / `s3+dxn+https://` → `s3+https://…?compat=sg|dxn&tls_verify=false`。旧写法连接时报
   `UrlParseError`，报错给出新写法。
 - `s3+https://` 现在**校验证书**：自签 / 私有 CA 端点要么把 CA 放进 `SSL_CERT_FILE` / `SSL_CERT_DIR`，要么 URL 加 `tls_verify=false`
@@ -1083,6 +1083,11 @@ N1–N7 在 H1、C7 之后。完整方案（file:line）见会话 scratchpad `s3
   DXN `?compat=dxn`（8184）、DXN 8182 `s3+https://…?compat=dxn&tls_verify=false` 全部通过；DXN 8182 不带 `tls_verify=false` 在连接时报
   `ConfigError`（`invalid peer certificate: UnknownIssuer`，带两条出路）；StorageGRID `?compat=sg` 通过；五个旧协议名都报出新写法、
   不含凭据。ONTAP 两个 `compat=ontap` URL 之间 S3→S3 走 Native（写入的对象已清理）。HCP 无实验环境。
+
+**HCP 支持删除（用户 2026-09-27）**：上文与 P1–P5 记录里的 `compat=hcp`、HCP REST 注解读标签（P4）、`s3+hcp://` 的改写提示都作废。
+`S3Compatibility::Hcp`、`src/third_party/hcp`（`HCPRestClient`，公开模块 `data_mover::third_party` 整个删除）、role 层 `hcp_tags.rs`、
+legacy 的 HCP 标签分支、“HCP 桶一律开版本”的捷径、直接依赖 reqwest 0.13 全部删除（reqwest 0.12 仍经 smb → sspi 引入）；`s3+hcp://` 与 `compat=hcp` 报 UrlParseError，提示按标准 S3
+写 `s3://…`。
 
 **N0 实测结论（2026-09-26，ONTAP 9.19.1，`data-mover-nas`，a–l 全部测完并清理）与对上文的修订**：
 - **决定 4 成立：NAS PUT 原子**。在 10 MiB / 100 MiB / 150 MiB / 差 1 字节处杀客户端、半关、close、Content-MD5 或签名 sha256 不符（400

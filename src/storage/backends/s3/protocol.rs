@@ -280,7 +280,7 @@ pub(crate) struct S3NativeCopyEvidence {
 #[async_trait]
 pub(crate) trait S3Protocol: Send + Sync {
     /// Whether the bucket had versioning enabled when it was connected (`GetBucketVersioning`
-    /// answered `Enabled`; HCP always). A write there whose reply names no version is settled
+    /// answered `Enabled`). A write there whose reply names no version is settled
     /// through the key's versions (ADR-0006 C18: DXN's `CopyObject` sends no `x-amz-version-id`).
     fn versioning_enabled(&self) -> bool;
     /// What the bucket can do, from the URL's profile (P7 §14.2); fixed for the connection.

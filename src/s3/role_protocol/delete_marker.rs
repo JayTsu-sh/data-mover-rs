@@ -10,10 +10,8 @@ use crate::s3::versioning_is_unsupported;
 use crate::storage::backends::s3::{S3BucketVersioning, S3DeleteReply};
 
 impl S3Storage {
-    /// `GetBucketVersioning`, asked now — of every store, HCP included (a namespace's versioning
-    /// can be off there too; the legacy read path's "HCP always versions" shortcut must not decide
-    /// a delete). A bucket that never had versioning, or a store without it (501 /
-    /// `NotImplemented`: the ONTAP NAS bucket), is `Off`.
+    /// `GetBucketVersioning`, asked now. A bucket that never had versioning, or a store without it
+    /// (501 / `NotImplemented`: the ONTAP NAS bucket), is `Off`.
     pub(super) async fn role_bucket_versioning(&self) -> S3Result<S3BucketVersioning> {
         match self
             .client

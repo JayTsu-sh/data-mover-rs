@@ -860,7 +860,7 @@ zero-byte `d/` is skipped; 1 015 entries in `All`, 1 008 in `Current`, 5 directo
   `resumable_at_destination()` false, an ONTAP NAS bucket), where every `Checkpointed` transfer
   reports `UnsupportedByDestination`.
 - Legacy S3 listing (D4, after C22): on a bucket listed with `ListObjectVersions` (versioning
-  `Enabled`, and every HCP namespace) `walkdir` now sends a latest entry that is a delete marker
+  `Enabled`; before 2026-09-27 also every HCP namespace, whose support was removed) `walkdir` now sends a latest entry that is a delete marker
   (`get_is_latest()` and `get_is_delete_marker()` both true) and `walkdir_2` the versions of a
   deleted key, none latest; a consumer that copies every latest entry must test
   `get_is_delete_marker()` too. `walkdir` markers now obey `name` / `path` / `extension` filters.

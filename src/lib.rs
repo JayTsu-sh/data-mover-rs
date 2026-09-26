@@ -48,7 +48,6 @@ mod storage_read_pipeline;
 mod storage_resume_compat;
 mod stream_handle;
 pub mod tar_pack;
-pub mod third_party;
 pub mod time_util;
 mod transfer_concurrency;
 pub mod url_redact;

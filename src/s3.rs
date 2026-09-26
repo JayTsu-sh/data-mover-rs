@@ -37,7 +37,6 @@ use crate::qos::QosManager;
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::backends::s3::KeyHistory;
 use crate::storage_enum::{StorageEnum, path_to_s3_key};
-use crate::third_party::hcp::client::{HCPRestClient, HcpTimeouts, HcpTransport};
 use crate::transfer_concurrency::{
     TransferBackend, TransferConcurrency, resolve_transfer_concurrency,
 };
@@ -188,7 +187,7 @@ fn parse_s3_endpoint_url(url: &str) -> Result<(String, String, String, S3UrlOpti
     Ok((parts.access_key, parts.secret_key, endpoint, parts.options))
 }
 
-// 使用 url 库解析标准 S3、StorageGRID 和 HCP URL。
+// 使用 url 库解析 S3 URL（标准 S3、StorageGRID、DXN、ONTAP）。
 // 注意：secret_key 可能包含 `+`、`/` 等特殊字符（Base64 编码），直接传给 Url::parse 会导致解析错误，
 // 因此先手动提取凭据，再用占位凭据构建安全 URL 交给 url crate 解析 host/port/path。
 struct ParsedS3Url {
@@ -197,8 +196,6 @@ struct ParsedS3Url {
     bucket_name: String,
     endpoint: String,
     prefix: String,
-    /// `host[:port]` of the endpoint.
-    authority: String,
     options: S3UrlOptions,
 }
 
@@ -262,7 +259,6 @@ fn parse_s3_url(url: &str) -> Result<ParsedS3Url> {
         bucket_name,
         endpoint,
         prefix,
-        authority: host_and_port,
         options,
     })
 }
@@ -281,7 +277,7 @@ fn configure_compatibility(
     compatibility: S3Compatibility,
 ) -> aws_sdk_s3::config::Builder {
     match compatibility {
-        S3Compatibility::Standard | S3Compatibility::Hcp | S3Compatibility::Ontap => {
+        S3Compatibility::Standard | S3Compatibility::Ontap => {
             delete_objects_md5::configure(builder)
         }
         S3Compatibility::StorageGrid => storagegrid::configure(builder),
@@ -477,7 +473,6 @@ pub struct S3Storage {
     bucket_name: String,
     prefix: Option<String>,
     client: Client,
-    hcp_client: Option<HCPRestClient>,
     pub block_size: u64,
     pub(crate) transfer_concurrency: TransferConcurrency,
     pub is_bucket_versioned: bool,
@@ -582,9 +577,6 @@ impl S3Storage {
         endpoint: &str,
         options: S3UrlOptions,
     ) -> Result<Option<BucketVersioningStatus>> {
-        if options.compat == S3Compatibility::Hcp {
-            return Ok(Some(BucketVersioningStatus::Enabled));
-        }
         match client
             .get_bucket_versioning()
             .bucket(bucket_name)
@@ -691,7 +683,6 @@ impl S3Storage {
             bucket_name,
             endpoint,
             prefix,
-            authority,
             options,
         } = parse_s3_url(url)?;
         let region = "us-east-1"; // MinIO 默认区域
@@ -736,36 +727,6 @@ impl S3Storage {
             Some(prefix)
         };
 
-        // 如果是HCP存储类型，创建HCP客户端
-        let hcp_client = if options.compat == S3Compatibility::Hcp {
-            let transport = if options.https {
-                HcpTransport::Https {
-                    verify_certificates: options.tls_verify,
-                }
-            } else {
-                HcpTransport::Http
-            };
-            let timeouts = s3_timeout_config();
-            let timeouts = HcpTimeouts {
-                connect: timeouts
-                    .connect_timeout()
-                    .unwrap_or(Duration::from_secs(DEFAULT_S3_CONNECT_TIMEOUT_SECS)),
-                request: timeouts
-                    .operation_timeout()
-                    .unwrap_or(Duration::from_secs(DEFAULT_S3_OPERATION_TIMEOUT_SECS)),
-            };
-            Some(HCPRestClient::try_new(
-                &bucket_name,
-                &authority,
-                transport,
-                timeouts,
-                &access_key,
-                &secret_key,
-            )?)
-        } else {
-            None
-        };
-
         // 检查桶是否启用了版本控制
         let versioning =
             Self::detect_bucket_versioning(&client, &bucket_name, &endpoint, options).await?;
@@ -789,7 +750,6 @@ impl S3Storage {
             bucket_name,
             prefix: prefix_option,
             client,
-            hcp_client,
             block_size: block_size.map_or(DEFAULT_BLOCK_SIZE, |size| {
                 std::cmp::max(size, DEFAULT_BLOCK_SIZE)
             }),
@@ -1745,10 +1705,7 @@ impl S3Storage {
         Ok(())
     }
 
-    /// 获取对象的标签
-    /// 根据兼容模式选择不同的获取方式：
-    /// - S3: 使用 AWS S3 SDK 的 `get_object_tagging`
-    /// - HCP: 使用 HCP REST API 的 `get_tags`
+    /// 获取对象的标签（S3 `GetObjectTagging`）
     async fn get_object_tags(
         &self,
         bucket: &str,
@@ -1759,23 +1716,6 @@ impl S3Storage {
             "获取对象标签, bucket: {}, object_key: {}, version_id: {:?}",
             bucket, object_key, version_id
         );
-        if self.options.compat == S3Compatibility::Hcp {
-            let Some(hcp_client) = &self.hcp_client else {
-                error!("HCP client 未初始化，无法获取标签");
-                return Ok(None);
-            };
-            let path = format!("/{object_key}");
-            return match hcp_client.get_tags(&path).await {
-                Ok(tags) => {
-                    trace!("tags are: {:?}", tags);
-                    Ok(Some(tags))
-                }
-                Err(e) => {
-                    error!("获取{}的标签失败，原因是：{:?}", object_key, e);
-                    Ok(None)
-                }
-            };
-        }
         let mut request = self
             .client
             .get_object_tagging()
@@ -4663,7 +4603,6 @@ mod tests {
             bucket_name: bucket,
             endpoint,
             prefix,
-            authority,
             options,
             ..
         } = parsed;
@@ -4672,7 +4611,6 @@ mod tests {
         assert_eq!(bucket, "bucket");
         assert_eq!(endpoint, "http://192.168.3.210:10444");
         assert_eq!(prefix, "");
-        assert_eq!(authority, "192.168.3.210:10444");
         assert_eq!(options.compat, S3Compatibility::Standard);
     }
 
@@ -4685,7 +4623,6 @@ mod tests {
             bucket_name: bucket,
             endpoint,
             prefix,
-            authority,
             options,
             ..
         } = parse_s3_url(url).assert_value("test value should be present");
@@ -4694,7 +4631,6 @@ mod tests {
         assert_eq!(bucket, "mybucket");
         assert_eq!(endpoint, "http://minio.example.com:9000");
         assert_eq!(prefix, "data/prefix/");
-        assert_eq!(authority, "minio.example.com:9000");
         assert_eq!(options.compat, S3Compatibility::Standard);
     }
 
@@ -4706,7 +4642,6 @@ mod tests {
             secret_key: sk,
             bucket_name: bucket,
             endpoint,
-            authority,
             options,
             ..
         } = parse_s3_url(url).assert_value("test value should be present");
@@ -4714,7 +4649,6 @@ mod tests {
         assert_eq!(sk, "sk");
         assert_eq!(bucket, "bucket");
         assert_eq!(endpoint, "https://host.com:443");
-        assert_eq!(authority, "host.com:443");
         assert_eq!(options.compat, S3Compatibility::Standard);
     }
 
@@ -4727,7 +4661,6 @@ mod tests {
             bucket_name: bucket,
             endpoint,
             prefix,
-            authority,
             ..
         } = parse_s3_url(url).assert_value("test value should be present");
         assert_eq!(ak, "ak");
@@ -4735,7 +4668,6 @@ mod tests {
         assert_eq!(bucket, "bucket");
         assert_eq!(endpoint, "http://host.com:9000");
         assert_eq!(prefix, "");
-        assert_eq!(authority, "host.com:9000");
     }
 
     #[test]
@@ -4837,7 +4769,6 @@ mod tests {
             bucket_name: "test-bucket".to_string(),
             prefix: prefix.map(std::string::ToString::to_string),
             client,
-            hcp_client: None,
             block_size: DEFAULT_BLOCK_SIZE,
             transfer_concurrency: DEFAULT_TRANSFER_CONCURRENCY,
             is_bucket_versioned: false,

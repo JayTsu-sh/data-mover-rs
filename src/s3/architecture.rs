@@ -49,10 +49,9 @@ pub(super) fn connect(
         native,
         match compat {
             S3Compatibility::Dxn => S3TagSupport::Unsupported,
-            S3Compatibility::Standard
-            | S3Compatibility::StorageGrid
-            | S3Compatibility::Hcp
-            | S3Compatibility::Ontap => S3TagSupport::Supported,
+            S3Compatibility::Standard | S3Compatibility::StorageGrid | S3Compatibility::Ontap => {
+                S3TagSupport::Supported
+            }
         },
         Some(single_put_threshold),
     )
@@ -68,14 +67,14 @@ pub(super) const fn bucket_capabilities(options: S3UrlOptions) -> S3BucketCapabi
 }
 
 /// The native-copy affinity label of a profile: two storages copy natively only on the same
-/// endpoint under the same label. `StorageGRID` never copies natively; HCP keeps the standard
-/// label (its `CopyObject` is standard S3); ONTAP has its own, so a copy between a `compat=ontap`
-/// URL and a standard URL of the same endpoint streams, and an ONTAP NAS bucket another one (with
-/// its bucket, see [`S3NativeContext::within_bucket`]), so it never pairs with an object bucket.
+/// endpoint under the same label. `StorageGRID` never copies natively; ONTAP has its own, so a
+/// copy between a `compat=ontap` URL and a standard URL of the same endpoint streams, and an ONTAP
+/// NAS bucket another one (with its bucket, see [`S3NativeContext::within_bucket`]), so it never
+/// pairs with an object bucket.
 fn native_label(options: S3UrlOptions) -> Option<&'static str> {
     match (options.compat, options.bucket_type) {
         (S3Compatibility::Ontap, S3BucketType::Nas) => Some("ontap-nas"),
-        (S3Compatibility::Standard | S3Compatibility::Hcp, _) => Some("standard"),
+        (S3Compatibility::Standard, _) => Some("standard"),
         (S3Compatibility::Dxn, _) => Some("dxn"),
         (S3Compatibility::Ontap, _) => Some("ontap"),
         (S3Compatibility::StorageGrid, _) => None,
@@ -95,13 +94,12 @@ mod tests {
     }
 
     /// Native copies pair only under one label: `compat=ontap` and a standard URL of the same
-    /// endpoint stream, HCP pairs with standard, `StorageGRID` never copies natively, and an
-    /// ONTAP NAS bucket has a label of its own.
+    /// endpoint stream, `StorageGRID` never copies natively, and an ONTAP NAS bucket has a label of
+    /// its own.
     #[test]
     fn native_labels() {
         let object = |compat| native_label(options(compat, S3BucketType::Object));
         assert_eq!(object(S3Compatibility::Standard), Some("standard"));
-        assert_eq!(object(S3Compatibility::Hcp), Some("standard"));
         assert_eq!(object(S3Compatibility::Dxn), Some("dxn"));
         assert_eq!(object(S3Compatibility::Ontap), Some("ontap"));
         assert_eq!(object(S3Compatibility::StorageGrid), None);

@@ -74,7 +74,7 @@ def main() -> int:
 
     run("build s3_walkdir", ["cargo", "build", "--example", "s3_walkdir"])
 
-    # S3_COMPAT=sg|dxn|hcp|ontap, S3_TLS_VERIFY=false (HTTPS, self-signed) and S3_BUCKET_TYPE=nas
+    # S3_COMPAT=sg|dxn|ontap, S3_TLS_VERIFY=false (HTTPS, self-signed) and S3_BUCKET_TYPE=nas
     # become the URL's options (?compat=dxn&tls_verify=false); empty = the default.
     def option(name: str) -> str:
         return env.get(name, "")

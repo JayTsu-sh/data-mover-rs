@@ -97,7 +97,6 @@ mod tests {
             bucket_name: "bucket".into(),
             prefix: None,
             client: aws_sdk_s3::Client::from_conf(config),
-            hcp_client: None,
             block_size: DEFAULT_BLOCK_SIZE,
             transfer_concurrency: DEFAULT_TRANSFER_CONCURRENCY,
             is_bucket_versioned: false,

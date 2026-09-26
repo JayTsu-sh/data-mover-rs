@@ -5,7 +5,7 @@
 #   s3_url <bucket> <prefix>
 #     S3_AK, S3_SK, S3_HOST (host[:port])
 #     S3_USE_HTTPS=true      → s3+https:// (otherwise s3://)
-#     S3_COMPAT=sg|dxn|hcp|ontap → ?compat=… (empty = standard S3)
+#     S3_COMPAT=sg|dxn|ontap → ?compat=… (empty = standard S3)
 #     S3_TLS_VERIFY=false    → tls_verify=false (s3+https:// only; self-signed endpoints; empty or
 #                            true = verify)
 #     S3_BUCKET_TYPE=nas     → bucket_type=nas (only with S3_COMPAT=ontap; empty or object = object)
@@ -18,8 +18,8 @@ s3_url() {
   [ "${S3_USE_HTTPS:-}" = true ] && scheme=s3+https
   case "${S3_COMPAT:-}" in
     '') ;;
-    sg|dxn|hcp|ontap) query+=("compat=$S3_COMPAT") ;;
-    *) echo "S3_COMPAT must be empty, sg, dxn, hcp or ontap: ${S3_COMPAT}" >&2; return 2 ;;
+    sg|dxn|ontap) query+=("compat=$S3_COMPAT") ;;
+    *) echo "S3_COMPAT must be empty, sg, dxn or ontap: ${S3_COMPAT}" >&2; return 2 ;;
   esac
   case "${S3_TLS_VERIFY:-}" in
     ''|true) ;;

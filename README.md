@@ -14,7 +14,6 @@ it has no `StorageEnum` variant and no URL form.
 | S3 (TLS) | `s3+https://access_key:secret_key@bucket.host/prefix` |
 | StorageGRID | `s3://access_key:secret_key@bucket.host:port/prefix?compat=sg` |
 | DXN | `s3://access_key:secret_key@bucket.host:port/prefix?compat=dxn` |
-| HCP | `s3://access_key:secret_key@namespace.tenant.host/prefix?compat=hcp` |
 | ONTAP S3 | `s3://access_key:secret_key@bucket.host/prefix?compat=ontap` |
 | SMB/CIFS | No URL. Use `connect_backend(BackendConfig::Cifs(CifsBackendConfig { .. }))` |
 
@@ -22,15 +21,16 @@ S3 URL options (the query; leave one out for its default):
 
 | Option | Values | Default |
 |--------|--------|---------|
-| `compat` | `sg`, `dxn`, `hcp`, `ontap` | standard S3 |
+| `compat` | `sg`, `dxn`, `ontap` | standard S3 |
 | `tls_verify` | `false` (only on `s3+https://`) | certificates verified |
 | `bucket_type` | `nas` (only with `compat=ontap`; not implemented yet, refused at connect) | object bucket |
 
 Writing a default (`compat=standard`, `tls_verify=true`, `bucket_type=object`), an unknown,
 repeated or empty option, `tls_verify` on `s3://` or `bucket_type=nas` without `compat=ontap`
 is a `UrlParseError`. The schemes `s3+http://`, `s3+sg[+https]://`, `s3+dxn[+https]://` and
-`s3+hcp://` were removed; their error names the new spelling. Options are not part of the
-endpoint identity.
+`s3+hcp://` were removed; their error names the new spelling. HCP support (`compat=hcp`,
+tags from the HCP REST annotation) was removed: an HCP namespace is used as standard S3.
+Options are not part of the endpoint identity.
 
 `s3+https://` verifies the server certificate against the system roots, which honour
 `SSL_CERT_FILE` / `SSL_CERT_DIR` (trust a private CA there). For a self-signed endpoint add

@@ -34,7 +34,7 @@ fn env_var(name: &str) -> Result<String> {
 }
 
 /// `s3[+https]://AK:SK@bucket.host/prefix[?options]` — the crate takes the key and secret as
-/// written, undecoded. `S3_USE_HTTPS=true` selects HTTPS; `S3_COMPAT=sg|dxn|hcp|ontap`,
+/// written, undecoded. `S3_USE_HTTPS=true` selects HTTPS; `S3_COMPAT=sg|dxn|ontap`,
 /// `S3_TLS_VERIFY=false` and `S3_BUCKET_TYPE=nas` become the URL's options (empty, `true` /
 /// `object` = the default), as `.claude/skills/_shared/s3_url.sh` builds them. The bucket is
 /// `S3_BUCKET` unless one is named. `S3_BUCKET_TYPE` describes `S3_BUCKET` alone: another bucket
@@ -63,8 +63,8 @@ fn s3_options(own_bucket: bool) -> Result<String> {
     let mut options = Vec::new();
     match var("S3_COMPAT").as_str() {
         "" => {}
-        compat @ ("sg" | "dxn" | "hcp" | "ontap") => options.push(format!("compat={compat}")),
-        _ => return Err("S3_COMPAT must be empty, sg, dxn, hcp or ontap".into()),
+        compat @ ("sg" | "dxn" | "ontap") => options.push(format!("compat={compat}")),
+        _ => return Err("S3_COMPAT must be empty, sg, dxn or ontap".into()),
     }
     match var("S3_TLS_VERIFY").as_str() {
         "" | "true" => {}

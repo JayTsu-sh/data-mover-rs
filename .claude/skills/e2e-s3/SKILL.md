@@ -15,7 +15,7 @@ S3_BUCKET=my-bucket
 S3_AK=ACCESS_KEY
 S3_SK=SECRET_KEY
 S3_USE_HTTPS=false               # true → s3+https://（默认校验证书）
-S3_COMPAT=                       # sg|dxn|hcp|ontap → ?compat=…（空 = 标准 S3）
+S3_COMPAT=                       # sg|dxn|ontap → ?compat=…（空 = 标准 S3）
 S3_TLS_VERIFY=                   # false → tls_verify=false（只配 S3_USE_HTTPS=true；自签证书，如 DXN 8182）
 S3_BUCKET_TYPE=                  # nas → bucket_type=nas（只配 S3_COMPAT=ontap；ONTAP NAS 桶 profile，P7 §14.2）
 S3_PREFIX=test                   # bucket 内的子路径

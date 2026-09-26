@@ -1,7 +1,7 @@
 //! Every spelling of an S3 URL's scheme and options, accepted and refused (P7 §14.2).
 
 use super::url_options::S3BucketType::{Nas, Object};
-use super::url_options::S3Compatibility::{Dxn, Hcp, Ontap, Standard, StorageGrid};
+use super::url_options::S3Compatibility::{Dxn, Ontap, Standard, StorageGrid};
 use super::url_options::{S3BucketType, S3Compatibility, S3UrlOptions, S3UrlTarget, split_s3_url};
 use super::{ParsedS3Url, S3Storage, endpoint_identity, parse_s3_endpoint_url, parse_s3_url};
 use crate::AssertTestValue;
@@ -58,7 +58,6 @@ fn accepted_spellings() {
         ("s3+https", "", with(true, Standard, Object)),
         ("s3", "?compat=sg", with(false, StorageGrid, Object)),
         ("s3", "?compat=dxn", with(false, Dxn, Object)),
-        ("s3", "?compat=hcp", with(false, Hcp, Object)),
         ("s3", "?compat=ontap", with(false, Ontap, Object)),
         ("s3", "?compat=%73g", with(false, StorageGrid, Object)),
         (
@@ -106,7 +105,7 @@ fn removed_schemes_name_their_replacement() {
             "s3+dxn+https",
             "write s3+https://…?compat=dxn&tls_verify=false",
         ),
-        ("s3+hcp", "write s3://…?compat=hcp"),
+        ("s3+hcp", "write s3://… (HCP support was removed"),
     ] {
         let message = refusal(&url(scheme, ""), S3UrlTarget::Bucket);
         assert!(
@@ -169,12 +168,17 @@ const REFUSED: &[(&str, &str, &str)] = &[
     (
         "s3",
         "?compat=SG",
-        "compat does not accept <2 bytes>; allowed: sg, dxn, hcp, ontap",
+        "compat does not accept <2 bytes>; allowed: sg, dxn, ontap",
+    ),
+    (
+        "s3",
+        "?compat=hcp",
+        "compat=hcp was removed; write s3://… (HCP support was removed",
     ),
     (
         "s3",
         "?compat=minio",
-        "compat does not accept `minio`; allowed: sg, dxn, hcp, ontap",
+        "compat does not accept `minio`; allowed: sg, dxn, ontap",
     ),
     (
         "s3+https",

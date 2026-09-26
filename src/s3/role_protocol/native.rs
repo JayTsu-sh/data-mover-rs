@@ -167,7 +167,6 @@ pub(super) mod tests {
             bucket_name: "destination".into(),
             prefix: None,
             client: aws_sdk_s3::Client::from_conf(config),
-            hcp_client: None,
             block_size: super::super::super::DEFAULT_BLOCK_SIZE,
             transfer_concurrency: super::super::super::DEFAULT_TRANSFER_CONCURRENCY,
             is_bucket_versioned: false,

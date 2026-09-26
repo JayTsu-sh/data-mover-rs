@@ -37,13 +37,13 @@ def s3_url(
     tls_verify: bool = True,
     bucket_type: str = "",
 ) -> str:
-    """`compat` (sg|dxn|hcp|ontap), `tls_verify=False` (HTTPS only) and `bucket_type` (nas, with
+    """`compat` (sg|dxn|ontap), `tls_verify=False` (HTTPS only) and `bucket_type` (nas, with
     compat=ontap) become the URL's options; the defaults are left out, as the crate requires.
 
     The crate takes the key pair as written (split at the last '@', not percent-decoded).
     """
-    if compat not in ("", "sg", "dxn", "hcp", "ontap"):
-        raise ValueError(f"compat must be empty, sg, dxn, hcp or ontap: {compat}")
+    if compat not in ("", "sg", "dxn", "ontap"):
+        raise ValueError(f"compat must be empty, sg, dxn or ontap: {compat}")
     if bucket_type not in ("", "nas"):
         raise ValueError(f"bucket_type must be empty or nas: {bucket_type}")
     if bucket_type == "nas" and compat != "ontap":

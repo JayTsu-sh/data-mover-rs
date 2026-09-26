@@ -74,6 +74,7 @@ fn test_s3_http() {
     );
 }
 
+/// `s3+hcp://` (HCP support was removed) is still S3, so it reaches the parser's error.
 #[test]
 fn test_s3_hcp() {
     assert_eq!(

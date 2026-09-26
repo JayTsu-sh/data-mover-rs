@@ -12,7 +12,7 @@
 ```
 s3://ak:sk@bucket.host[:port][/prefix][?参数]          HTTP
 s3+https://ak:sk@bucket.host[:port][/prefix][?参数]    HTTPS，默认校验证书
-参数：compat=sg|dxn|hcp|ontap   tls_verify=false（只用于 s3+https://）   bucket_type=nas（只与 compat=ontap）
+参数：compat=sg|dxn|ontap   tls_verify=false（只用于 s3+https://）   bucket_type=nas（只与 compat=ontap）
 ```
 
 示例：
@@ -31,15 +31,15 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
   未知 / 重复 / 空值参数、`tls_verify` 用在 `s3://` 上、`bucket_type=nas` 不带 `compat=ontap`、无桶端点 URL
   （`list_buckets`）带 `bucket_type` —— 全部 `UrlParseError`（D4：URL 文本能判定的都算）。报错不回显 URL 与凭据。
 - **旧协议名已删除**，报错给出新写法：`s3+http://` → `s3://`；`s3+sg://` → `s3://…?compat=sg`；`s3+dxn://` →
-  `s3://…?compat=dxn`；`s3+hcp://` → `s3://…?compat=hcp`；`s3+sg+https://` / `s3+dxn+https://` →
+  `s3://…?compat=dxn`；`s3+hcp://` → `s3://…`（HCP 支持已删除）；`s3+sg+https://` / `s3+dxn+https://` →
   `s3+https://…?compat=sg|dxn&tls_verify=false`（旧形式本来就不校验证书）。`detect_storage_type` 把任何
   `s3+…://` 判为 S3，所以旧写法走到这条报错而不是被当成本地路径。
 - **参数不进端点身份**：`s3://host[:port]/bucket[/prefix]` 与改参数前相同，TransferIdentity / 恢复绑定不变。
 - `compat=sg` — StorageGRID：签名前精确删除 `x-id`；不走原生拷贝。
 - `compat=dxn` — DXN（Ceph RGW Octopus）：标签不支持；原生拷贝亲和标签 `dxn`。
-- `compat=hcp` — HCP：桶一律按开版本处理；标签读 HCP REST 的 `BPM` 注解（legacy 与 role 两条路都是；role 路径
-  带 `version=` 读固定版本 —— **未在真机验证**），写标签仍是 PutObjectTagging（未验证）。REST 基址
-  `{scheme}://{bucket}.{host}[:port]`，协议 / 端口 / `tls_verify` 跟随 S3 URL；`hcp-ns-auth` cookie 在 `s3://` 下明文。
+- **HCP 支持已删除**（用户 2026-09-27）：没有 `compat=hcp`（报错提示按标准 S3 写），不再读 HCP REST 的 `BPM` 注解、
+  不再把 HCP 桶一律当作开版本；`src/third_party/hcp` 与直接依赖 reqwest 0.13 一并删除。HCP 命名空间按标准 S3 使用（标签走
+  S3 对象标签，版本按 GetBucketVersioning）。
 - `compat=ontap` — ONTAP：**不改任何线上请求**（对象桶的怪癖都已通用处理：F4、F6、空末页、CommonPrefix 计入
   max-keys、不回显 Delimiter）；原生拷贝亲和标签 `ontap`（与同端点的标准 URL 之间走流式）；承载 `bucket_type=nas`。
 - `bucket_type=nas` — ONTAP NAS 桶 profile（P7 §14.2，N1–N7）。能力开关 `S3BucketCapabilities`
@@ -115,7 +115,7 @@ URL 必须带 `ak:sk@`（解析器没有凭据就报 `UrlParseError`）；不读
 - `s3+https://` **默认校验证书**（P3 起）：系统根证书，认 `SSL_CERT_FILE` / `SSL_CERT_DIR` —— 私有 CA 这样信任。
 - 自签端点（DXN 8182、自建 MinIO、ECS 等）：信任其 CA，或 URL 加 `tls_verify=false`（每个连接告警一次）。
 - 证书不受信时**连接就失败**：`S3Storage::new` 的 GetBucketVersioning 探测遇证书错误报 `ConfigError`（不重试），写明两条出路；
-  `check_connectivity` / `list_buckets` 同样。`compat=hcp` 不发这次探测，错误在第一个请求出现。
+  `check_connectivity` / `list_buckets` 同样。
 - 不校验的客户端显式用 ring provider：依赖图同时打开了 rustls 的 ring 与 aws-lc-rs，`ClientConfig::builder()` 在
   进程没装默认 provider 时 panic（P3 之前的 `s3+https://` 就是这样）。
 - 代理：校验证书的连接走 SDK 默认客户端，认 `HTTPS_PROXY` / `NO_PROXY`；`tls_verify=false` 的客户端不认代理（与改前相同）。
@@ -550,10 +550,9 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
    - 两者：最新条目是删除标记的 key **也列**（用户决定 D4：每种 S3 遍历都要支持版本化桶，C22 之后的 follow-up；
      之前整个不列，历史拿不到）：`walkdir` 发它的全部版本与标记、从旧到新、标记最后且 `is_latest = true`、
      `is_delete_marker = true`；`walkdir_2` 发它的版本、`is_latest` 全是 `false`（只有标记的 key 不出条目）。只影响走
-     `ListObjectVersions` 的桶（版本 `Enabled`，或 HCP）；未开 / 暂停版本的桶走 `ListObjectsV2`，行为不变。
+     `ListObjectVersions` 的桶（版本 `Enabled`）；未开 / 暂停版本的桶走 `ListObjectsV2`，行为不变。
      判断在 `version_listing::versions_with_latest`，测试 `s3::versioned_walk_tests`（离线构造 `S3Storage`，不带标签就不发请求）。
-     **对调用方是契约变化**：按 `get_is_latest()` 拷贝的调用方必须同时看 `get_is_delete_marker()`；HCP 永远走
-     `ListObjectVersions`，也受影响。真机（MinIO VM 102，2026-09-25，临时桶 `data-mover-fu-<ts>`（版本化）与
+     **对调用方是契约变化**：按 `get_is_latest()` 拷贝的调用方必须同时看 `get_is_delete_marker()`。真机（MinIO VM 102，2026-09-25，临时桶 `data-mover-fu-<ts>`（版本化）与
      `-u`（未开版本），跑完都删，服务器只剩 `a-bucket` / `data-mover-test`）：`h/gone`（两个版本后删除）`walkdir` 列两个
      版本 + `latest=1 marker=1 count=3` 的标记、`walkdir_2` 列两个版本 `latest=0 count=2`；未开版本的桶仍只列当前对象（不带过滤表达式跑，在加标记过滤之前；
      不带过滤时两者输出相同，标记过滤由单测覆盖）。

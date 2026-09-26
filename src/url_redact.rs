@@ -116,8 +116,8 @@ mod tests {
             "hdfs://***:***@nn:8020/p"
         );
         assert_eq!(
-            redact_storage_url("s3://AK:S/K+=@ns.tenant.hcp.example/p?compat=hcp"),
-            "s3://***:***@ns.tenant.hcp.example/p?compat=hcp"
+            redact_storage_url("s3://AK:S/K+=@ns.tenant.s3.example/p?compat=dxn"),
+            "s3://***:***@ns.tenant.s3.example/p?compat=dxn"
         );
     }
 
