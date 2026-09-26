@@ -877,7 +877,7 @@ H1  （已完成，本系列最后一个提交）feat(s3): 目的端重放删除
 F5g fix(s3): 目录对象只用单次请求写（D13）：单 PUT / 单次 CopyObject，> 5 GiB Preflight Unsupported —— 已完成 `2352a6b`
     （前置 refactor `870f385`；五套对象存储版本 / 非版本真机全过）
 C7b fix(nfs): v3 READDIRPLUS 列出、却不给属性的 `.snapshot`（ONTAP 卷根）隐藏，与 NFSv4 一致（用户 2026-09-26 定，
-    不按 legacy 下钻进快照树）—— 已完成（本系列 fix(nfs) 提交）。真机先查清：ONTAP 的 `.snapshot` 与卷根 **fsid 相同**
+    不按 legacy 下钻进快照树）—— 已完成 `0064563`（前置 refactor `02e23b4`）。真机先查清：ONTAP 的 `.snapshot` 与卷根 **fsid 相同**
     （只有其中每个快照的 fsid 不同），READDIRPLUS 给句柄不给属性；名字被保留（任何目录里 MKDIR `.snapshot` 回 EXIST）；
     从任何目录 LOOKUP 都是同一个对象。定的规则（用户 2026-09-26 选方案 2，只限 v3）：名字恰为 `.snapshot` 且缺属性的项
     → 在被列目录里 LOOKUP 一次（回复无属性再 GETATTR）；是目录 → 隐藏（不列、不算失败、不下钻；计入页的 `internal_hidden`、
