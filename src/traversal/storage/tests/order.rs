@@ -2,7 +2,7 @@
 
 use super::events::events;
 use super::*;
-use crate::traversal::{ChildOrder, DirectoryListing, TraversalOrder};
+use crate::traversal::{ListingOutcome, TraversalOrder};
 
 /// A tree whose every listing arrives in the reverse of its byte order, so nothing passes by
 /// accident, plus the three shapes the contract makes claims about: `a`, `a/x` and `a.txt`
@@ -82,20 +82,16 @@ async fn admission_leaves_the_backend_listing_order_alone() {
             "entry a.txt",
             "entry a",
             "entry B",
-            "listed <root> Complete pruned=0 truncated=0",
-            "failure part/bad",
+            "listed <root> Complete listed=5 emitted=5",
+            "failure child part/bad",
             "entry part/q",
             "entry part/p",
-            "listed part Partial { failures: 1 } pruned=0 truncated=0",
-            "subtree part dirs=1 entries=2 partial=1 failures=1 exhaustive=false",
+            "listed part Complete listed=3 emitted=2 failed=1",
             "entry b/z",
             "entry b/y",
-            "listed b Complete pruned=0 truncated=0",
-            "subtree b dirs=1 entries=2 exhaustive=true",
+            "listed b Complete listed=2 emitted=2",
             "entry a/x",
-            "listed a Complete pruned=0 truncated=0",
-            "subtree a dirs=1 entries=1 exhaustive=true",
-            "subtree <root> dirs=4 entries=10 partial=1 failures=1 exhaustive=false",
+            "listed a Complete listed=1 emitted=1",
         ]
     );
 }
@@ -121,29 +117,28 @@ async fn name_bytes_orders_both_the_block_and_the_descent() {
             "entry a.txt",
             "entry b",
             "entry part",
-            "listed <root> Complete pruned=0 truncated=0",
+            "listed <root> Complete listed=5 emitted=5",
             "entry a/x",
-            "listed a Complete pruned=0 truncated=0",
-            "subtree a dirs=1 entries=1 exhaustive=true",
+            "listed a Complete listed=1 emitted=1",
             "entry b/y",
             "entry b/z",
-            "listed b Complete pruned=0 truncated=0",
-            "subtree b dirs=1 entries=2 exhaustive=true",
-            "failure part/bad",
+            "listed b Complete listed=2 emitted=2",
+            "failure child part/bad",
             "entry part/p",
             "entry part/q",
-            "listed part Partial { failures: 1 } pruned=0 truncated=0",
-            "subtree part dirs=1 entries=2 partial=1 failures=1 exhaustive=false",
-            "subtree <root> dirs=4 entries=10 partial=1 failures=1 exhaustive=false",
+            "listed part Complete listed=3 emitted=2 failed=1",
         ]
     );
     assert!(
         matches!(
             outcome,
             TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: 10,
-                entry_failures: 1,
-                directories_listed: 4,
+                totals: crate::traversal::ScanTotals {
+                    listed: 11,
+                    emitted: 10,
+                    failed_children: 1,
+                    ..
+                },
                 ..
             })
         ),
@@ -176,12 +171,15 @@ async fn name_bytes_sorts_listings_that_also_carry_failures() {
     let (rendered, _) = reversed_tree(TraversalOrder::NameBytes).await;
     let part = rendered
         .iter()
-        .skip_while(|line| *line != "failure part/bad")
+        .skip_while(|line| *line != "failure child part/bad")
         .take(3)
         .cloned()
         .collect::<Vec<_>>();
     // The failure has no name to sort by, so it stays ahead of the block, outside the order.
-    assert_eq!(part, ["failure part/bad", "entry part/p", "entry part/q"]);
+    assert_eq!(
+        part,
+        ["failure child part/bad", "entry part/p", "entry part/q"]
+    );
 }
 
 /// Ordering moves items; it must not change what is counted. Every marker and every tally is
@@ -202,27 +200,6 @@ async fn name_bytes_changes_the_order_and_nothing_else() {
         format!("{admission_outcome:?}"),
         format!("{sorted_outcome:?}")
     );
-}
-
-/// The per-directory report, which is what a consumer reads to know the order actually held.
-#[tokio::test]
-async fn child_order_is_reported_on_every_listed_directory() {
-    for (order, expected) in [
-        (TraversalOrder::Admission, ChildOrder::Listing),
-        (TraversalOrder::NameBytes, ChildOrder::NameBytes),
-    ] {
-        let source =
-            StorageTraversalSource::with_roles(Arc::new(ReversedNamespace), Arc::new(FakeMetadata));
-        let mut session = source.traverse(ordered_request(order));
-        let mut reported = 0;
-        while let Some(item) = session.next_item().await {
-            if let TraversalItem::DirectoryListed(listed) = item {
-                assert_eq!(listed.child_order, expected, "{:?}", listed.path);
-                reported += 1;
-            }
-        }
-        assert_eq!(reported, 4);
-    }
 }
 
 /// Hides one file wherever it appears, and can insist on `modified` so the traversal has to
@@ -271,19 +248,15 @@ async fn name_bytes_agrees_between_the_immediate_and_deferred_filter_paths() {
             "entry a.txt",
             "entry b",
             "entry part",
-            "listed <root> Complete pruned=0 truncated=0",
+            "listed <root> Complete listed=5 emitted=5",
             "entry a/x",
-            "listed a Complete pruned=0 truncated=0",
-            "subtree a dirs=1 entries=1 exhaustive=true",
+            "listed a Complete listed=1 emitted=1",
             "entry b/y",
-            "listed b Filtered pruned=0 truncated=0",
-            "subtree b dirs=1 entries=1 filtered=1 exhaustive=false",
-            "failure part/bad",
+            "listed b Complete listed=2 emitted=1 filtered=1",
+            "failure child part/bad",
             "entry part/p",
             "entry part/q",
-            "listed part Partial { failures: 1 } pruned=0 truncated=0",
-            "subtree part dirs=1 entries=2 partial=1 failures=1 exhaustive=false",
-            "subtree <root> dirs=4 entries=9 filtered=1 partial=1 failures=1 exhaustive=false",
+            "listed part Complete listed=3 emitted=2 failed=1",
         ]
     );
 }
@@ -325,38 +298,24 @@ impl Namespace for FailingListNamespace {
     }
 }
 
-/// A directory that could not be listed has an empty block, so there is nothing to put in order
-/// — but it still reports the order that was asked for. Reporting the default instead would read
-/// as "the request was not honored", and a consumer guarding its merge on `child_order` would
-/// trip on every unreadable directory rather than on the one thing that matters, `listing`.
+/// A directory that could not be listed has an empty block, so there is nothing to put in order;
+/// sorting must not turn it into anything but an unreadable listing.
 #[tokio::test]
-async fn a_directory_that_could_not_be_listed_still_reports_the_requested_order() {
+async fn a_directory_that_could_not_be_listed_is_unreadable_under_name_bytes_too() {
     let source =
         StorageTraversalSource::with_roles(Arc::new(FailingListNamespace), Arc::new(FakeMetadata));
     let mut session = source.traverse(ordered_request(TraversalOrder::NameBytes));
     let mut seen = Vec::new();
     while let Some(item) = session.next_item().await {
         if let TraversalItem::DirectoryListed(listed) = item {
-            seen.push((
-                listed.path.as_str().to_owned(),
-                listed.listing,
-                listed.child_order,
-            ));
+            seen.push((listed.path.as_str().to_owned(), listed.outcome));
         }
     }
     assert_eq!(
         seen,
         [
-            (
-                String::new(),
-                DirectoryListing::Complete,
-                ChildOrder::NameBytes
-            ),
-            (
-                "sub".to_owned(),
-                DirectoryListing::Failed,
-                ChildOrder::NameBytes
-            ),
+            (String::new(), ListingOutcome::Complete),
+            ("sub".to_owned(), ListingOutcome::Unreadable),
         ]
     );
 }

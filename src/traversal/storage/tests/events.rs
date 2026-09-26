@@ -1,10 +1,14 @@
-//! Directory completion items: their order against the entries, and what their tallies mean.
+//! Directory events: their order against the entries, what their counts mean, and how failures
+//! are scoped.
 
 use std::fmt::Write as _;
 
 use super::filter::{CountingMetadata, TreeNamespace};
 use super::*;
-use crate::traversal::{DirectoryListing, TraversalCandidate, TraversalDecision, TraversalFilter};
+use crate::traversal::{
+    BlockCounts, FailureScope, ListingOutcome, ScanTotals, TraversalCandidate, TraversalDecision,
+    TraversalFilter,
+};
 
 /// Root renders as an empty path, which is hard to read in an expected sequence.
 fn name(value: &StoragePath) -> &str {
@@ -15,50 +19,52 @@ fn name(value: &StoragePath) -> &str {
     }
 }
 
+/// `listed=… emitted=…`, then only the counts that are set, which keeps an expected sequence
+/// short while still pinning every field: transpose two of them in `close_block` and the number
+/// turns up under the other name.
+pub(super) fn render_counts(counts: &BlockCounts) -> String {
+    [
+        ("filtered", counts.filtered),
+        ("failed", counts.failed_children),
+        ("vanished", counts.vanished),
+        ("hidden", counts.internal_hidden),
+        ("pruned", counts.pruned_dirs),
+        ("truncated", counts.truncated_dirs),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .fold(
+        format!("listed={} emitted={}", counts.listed, counts.emitted),
+        |mut set, (label, count)| {
+            let _ = write!(set, " {label}={count}");
+            set
+        },
+    )
+}
+
 /// One line per item, so a whole event sequence can be asserted at once.
-fn render(item: &TraversalItem) -> String {
+pub(super) fn render(item: &TraversalItem) -> String {
     match item {
         TraversalItem::Entry(entry) => format!("entry {}", name(entry.path())),
-        TraversalItem::EntryFailure(error) => format!("failure {}", name(error.path())),
-        TraversalItem::DirectoryListed(listed) => format!(
-            "listed {} {:?} pruned={} truncated={}",
-            name(&listed.path),
-            listed.listing,
-            listed.pruned_children,
-            listed.truncated_children
+        TraversalItem::Failure(failure) => format!(
+            "failure {} {}",
+            match failure.scope {
+                FailureScope::Child => "child",
+                FailureScope::Listing => "listing",
+            },
+            name(&failure.path)
         ),
-        TraversalItem::SubtreeComplete(complete) => {
-            let summary = &complete.summary;
-            // Only the counts that are set are named, which keeps an expected sequence short
-            // while still pinning every field: transpose two of them in `close_block` or
-            // `absorb` and the number turns up under the other name.
-            let set = [
-                ("filtered", summary.filtered_listings),
-                ("partial", summary.partial_listings),
-                ("failed", summary.failed_listings),
-                ("failures", summary.entry_failures),
-                ("pruned", summary.pruned_directories),
-                ("truncated", summary.truncated_directories),
-            ]
-            .into_iter()
-            .filter(|(_, count)| *count > 0)
-            .fold(String::new(), |mut set, (label, count)| {
-                let _ = write!(set, " {label}={count}");
-                set
-            });
-            format!(
-                "subtree {} dirs={} entries={}{} exhaustive={}",
-                name(&complete.path),
-                summary.directories_listed,
-                summary.observed_entries,
-                set,
-                summary.is_exhaustive()
-            )
-        }
+        TraversalItem::DirectoryListed(listed) => format!(
+            "listed {} {:?} {}",
+            name(&listed.path),
+            listed.outcome,
+            render_counts(&listed.counts)
+        ),
+        TraversalItem::Checkpoint(_) => "checkpoint".to_owned(),
     }
 }
 
-async fn drain(mut session: TraversalSession) -> (Vec<TraversalItem>, TraversalOutcome) {
+pub(super) async fn drain(mut session: TraversalSession) -> (Vec<TraversalItem>, TraversalOutcome) {
     let mut items = Vec::new();
     while let Some(item) = session.next_item().await {
         items.push(item);
@@ -72,48 +78,95 @@ async fn drain(mut session: TraversalSession) -> (Vec<TraversalItem>, TraversalO
 
 pub(super) async fn events(session: TraversalSession) -> (Vec<String>, TraversalOutcome) {
     let (items, outcome) = drain(session).await;
-    assert_well_formed(&items);
+    assert_well_formed(&items, &outcome);
     (items.iter().map(render).collect(), outcome)
 }
 
-/// The guarantees that hold for any traversal that ran to completion: one `DirectoryListed` and
-/// one `SubtreeComplete` per listed directory, an ancestor listed before its descendants, and
-/// nothing but a directory's own descendants between its two items.
-fn assert_well_formed(items: &[TraversalItem]) {
-    let mut open: Vec<&StoragePath> = Vec::new();
+/// The directory `path` is in: the empty root path for a path with no `/`.
+fn parent(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// The guarantees that hold for any traversal that ran to completion (P7 §4, §7).
+///
+/// - One `DirectoryListed` per listed directory, after its parent's, and every block balanced.
+/// - A block's entries and child failures are exactly what its counts say were emitted and
+///   failed.
+/// - A listing failure precedes its own directory's `DirectoryListed`, inside that block, and
+///   the outcome is not `Complete`; a non-`Complete` outcome has a listing failure. Rule 2 of
+///   the deletion-safety contract rests on this pairing.
+/// - The completion's totals are the blocks' counts summed, and balanced.
+pub(super) fn assert_well_formed(items: &[TraversalItem], outcome: &TraversalOutcome) {
     let mut listed: Vec<&str> = Vec::new();
-    let mut completed: Vec<&str> = Vec::new();
+    let mut summed = ScanTotals::default();
+    let (mut emitted, mut failed) = (0_u64, 0_u64);
+    let mut listing_failure: Option<&str> = None;
     for item in items {
         match item {
+            TraversalItem::Entry(_) => emitted += 1,
+            TraversalItem::Failure(failure) => match failure.scope {
+                FailureScope::Child => failed += 1,
+                FailureScope::Listing => {
+                    assert!(
+                        listing_failure.is_none(),
+                        "two listing failures in one block"
+                    );
+                    listing_failure = Some(failure.path.as_str());
+                }
+            },
             TraversalItem::DirectoryListed(directory) => {
+                let path = directory.path.as_str();
                 assert!(
-                    !listed.contains(&directory.path.as_str()),
+                    !listed.contains(&path),
                     "{} was listed twice",
                     name(&directory.path)
                 );
-                listed.push(directory.path.as_str());
-                open.push(&directory.path);
-            }
-            TraversalItem::SubtreeComplete(complete) => {
-                let innermost = open.pop().unwrap_or_else(|| {
-                    panic!("{} completed without being listed", name(&complete.path))
-                });
-                assert_eq!(
-                    innermost.as_str(),
-                    complete.path.as_str(),
-                    "subtree items do not nest"
+                assert!(
+                    listed.is_empty() || listed.contains(&parent(path)),
+                    "{} was listed before its parent",
+                    name(&directory.path)
                 );
-                completed.push(complete.path.as_str());
+                listed.push(path);
+                let counts = &directory.counts;
+                assert!(
+                    counts.is_balanced(),
+                    "{}: {counts:?}",
+                    name(&directory.path)
+                );
+                assert_eq!(
+                    (counts.emitted, counts.failed_children),
+                    (emitted, failed),
+                    "{}: block items disagree with its counts",
+                    name(&directory.path)
+                );
+                assert_eq!(
+                    listing_failure.take().is_some_and(|failed| failed == path),
+                    !directory.outcome.is_complete(),
+                    "{}: a listing failure and a non-complete outcome go together",
+                    name(&directory.path)
+                );
+                summed.absorb(counts);
+                if !directory.outcome.is_complete() {
+                    summed.listing_failures += 1;
+                }
+                if directory.outcome == ListingOutcome::Interrupted {
+                    summed.interrupted_listings += 1;
+                }
+                (emitted, failed) = (0, 0);
             }
-            TraversalItem::Entry(_) | TraversalItem::EntryFailure(_) => {}
+            TraversalItem::Checkpoint(_) => {}
         }
     }
-    assert!(open.is_empty(), "a completed traversal left {open:?} open");
-    assert_eq!(listed.len(), completed.len());
+    assert_eq!((emitted, failed), (0, 0), "items after the last block");
     assert!(
-        matches!(items.last(), Some(TraversalItem::SubtreeComplete(_))),
-        "a completed traversal ends with the root's subtree item"
+        listing_failure.is_none(),
+        "a listing failure without its block"
     );
+    let TraversalOutcome::Completed(completion) = outcome else {
+        panic!("not completed: {outcome:?}")
+    };
+    assert_eq!(completion.totals, summed, "totals are the blocks summed");
+    assert!(completion.totals.is_balanced(), "{:?}", completion.totals);
 }
 
 /// Hides `a` but descends into it, and keeps `b` while refusing to descend: the two ways a
@@ -136,7 +189,7 @@ impl TraversalFilter for HideAndPrune {
                 filter_children: true,
             },
             // Emitted but not descended into. `keep/b` sits in a block with nothing hidden,
-            // which is what separates `pruned_children` from `Filtered`.
+            // which is what separates `pruned_dirs` from `filtered`.
             "keep/b" => TraversalDecision {
                 emit: true,
                 descend: false,
@@ -212,7 +265,7 @@ fn tree_source() -> StorageTraversalSource {
 }
 
 #[tokio::test]
-async fn a_directory_is_reported_after_its_children_and_again_after_its_subtree() {
+async fn a_directory_is_reported_after_its_children() {
     let (lines, outcome) =
         events(tree_source().traverse(request(tokio_util::sync::CancellationToken::new()))).await;
 
@@ -222,32 +275,40 @@ async fn a_directory_is_reported_after_its_children_and_again_after_its_subtree(
             "entry keep",
             "entry drop",
             "entry top",
-            "listed <root> Complete pruned=0 truncated=0",
+            "listed <root> Complete listed=3 emitted=3",
             "entry keep/a",
             "entry keep/b",
-            "listed keep Complete pruned=0 truncated=0",
+            "listed keep Complete listed=2 emitted=2",
             "entry keep/b/c",
-            "listed keep/b Complete pruned=0 truncated=0",
-            "subtree keep/b dirs=1 entries=1 exhaustive=true",
-            "subtree keep dirs=2 entries=3 exhaustive=true",
+            "listed keep/b Complete listed=1 emitted=1",
             "entry drop/x",
             "entry drop/y",
-            "listed drop Complete pruned=0 truncated=0",
+            "listed drop Complete listed=2 emitted=2",
             "entry drop/y/z",
-            "listed drop/y Complete pruned=0 truncated=0",
-            "subtree drop/y dirs=1 entries=1 exhaustive=true",
-            "subtree drop dirs=2 entries=3 exhaustive=true",
-            "subtree <root> dirs=5 entries=9 exhaustive=true",
+            "listed drop/y Complete listed=1 emitted=1",
         ]
     );
-    assert!(matches!(
-        outcome,
-        TraversalOutcome::Completed(TraversalCompletion {
-            observed_entries: 9,
-            entry_failures: 0,
-            directories_listed: 5,
-        })
-    ));
+    let TraversalOutcome::Completed(completion) = outcome else {
+        panic!("{outcome:?}")
+    };
+    let totals = completion.totals;
+    assert_eq!((totals.listed, totals.emitted), (9, 9));
+    assert_eq!((totals.files, totals.directories), (5, 4));
+    // The fake gives every file three bytes.
+    assert_eq!(totals.bytes, 15);
+    assert_eq!(totals.listing_failures, 0);
+}
+
+#[tokio::test]
+async fn an_empty_directory_is_reported_too() {
+    let source = StorageTraversalSource::with_roles(
+        Arc::new(WideNamespace) as Arc<dyn Namespace>,
+        Arc::new(FakeMetadata) as Arc<dyn Metadata>,
+    );
+    let mut traversal = request(tokio_util::sync::CancellationToken::new());
+    traversal.root = path("empty");
+    let (lines, _) = events(source.traverse(traversal)).await;
+    assert_eq!(lines, ["listed empty Complete listed=0 emitted=0"]);
 }
 
 #[tokio::test]
@@ -257,12 +318,13 @@ async fn the_event_sequence_does_not_depend_on_the_admission_window() {
         let mut traversal = request(tokio_util::sync::CancellationToken::new());
         traversal.max_inflight_operations =
             NonZeroUsize::new(window).unwrap_or_else(|| unreachable!("constant is nonzero"));
-        let (lines, _) = events(tree_source().traverse(traversal)).await;
-        sequences.push((window, lines));
+        let (lines, outcome) = events(tree_source().traverse(traversal)).await;
+        sequences.push((window, lines, outcome));
     }
-    let (_, first) = &sequences[0];
-    for (window, lines) in &sequences {
+    let (_, first, first_outcome) = &sequences[0];
+    for (window, lines, outcome) in &sequences {
         assert_eq!(lines, first, "window {window} changed the event sequence");
+        assert_eq!(outcome, first_outcome, "window {window} changed the totals");
     }
 }
 
@@ -271,30 +333,34 @@ async fn a_hidden_directory_is_still_reported_while_a_pruned_one_is_not() {
     for needs_modified in [false, true] {
         let mut traversal = request(tokio_util::sync::CancellationToken::new());
         traversal.filter = Some(Arc::new(HideAndPrune { needs_modified }));
-        let (lines, _) = events(tree_source().traverse(traversal)).await;
+        let (lines, outcome) = events(tree_source().traverse(traversal)).await;
 
         assert_eq!(
             lines,
             [
-                // `keep` and `drop` are both hidden, so the root's listing is `Filtered`, and
-                // `drop` is pruned on top of that: one child, counted in both places.
+                // `keep` and `drop` are both hidden, and `drop` is pruned on top of that: one
+                // child, counted as filtered and as pruned.
                 "entry top",
-                "listed <root> Filtered pruned=1 truncated=0",
+                "listed <root> Complete listed=3 emitted=1 filtered=2 pruned=1",
                 "entry keep/a",
                 "entry keep/b",
-                // Nothing in this block was hidden, so pruning `keep/b` leaves it `Complete`:
-                // a prune on its own is not a `Filtered` listing.
-                "listed keep Complete pruned=1 truncated=0",
-                "subtree keep dirs=1 entries=2 pruned=1 exhaustive=false",
-                "subtree <root> dirs=2 entries=3 filtered=1 pruned=2 exhaustive=false",
+                "listed keep Complete listed=2 emitted=2 pruned=1",
             ],
+            "needs_modified={needs_modified}"
+        );
+        let TraversalOutcome::Completed(completion) = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(
+            (completion.totals.filtered, completion.totals.pruned_dirs),
+            (2, 2),
             "needs_modified={needs_modified}"
         );
     }
 }
 
 #[tokio::test]
-async fn a_directory_max_depth_stops_at_is_emitted_without_completion_items() {
+async fn a_directory_max_depth_stops_at_is_emitted_without_a_directory_event() {
     let mut traversal = request(tokio_util::sync::CancellationToken::new());
     traversal.max_depth = NonZeroUsize::new(2);
     let (lines, _) = events(tree_source().traverse(traversal)).await;
@@ -305,84 +371,103 @@ async fn a_directory_max_depth_stops_at_is_emitted_without_completion_items() {
             "entry keep",
             "entry drop",
             "entry top",
-            "listed <root> Complete pruned=0 truncated=0",
+            "listed <root> Complete listed=3 emitted=3",
             "entry keep/a",
             "entry keep/b",
-            "listed keep Complete pruned=0 truncated=1",
-            "subtree keep dirs=1 entries=2 truncated=1 exhaustive=false",
+            "listed keep Complete listed=2 emitted=2 truncated=1",
             "entry drop/x",
             "entry drop/y",
-            "listed drop Complete pruned=0 truncated=1",
-            "subtree drop dirs=1 entries=2 truncated=1 exhaustive=false",
-            "subtree <root> dirs=3 entries=7 truncated=2 exhaustive=false",
+            "listed drop Complete listed=2 emitted=2 truncated=1",
         ]
     );
 }
 
+/// Deletion safety, rule 2 (P7 §4.1): a directory that could not be listed is a `Listing`
+/// failure, not a child's, and its own event says the listing is not complete. Were it reported
+/// `Complete`, or its failure scoped to a child, a consumer would read the empty block as "this
+/// directory is now empty" and delete everything it knew below it.
 #[tokio::test]
-async fn a_directory_that_cannot_be_listed_still_gets_both_items() {
+async fn a_directory_that_cannot_be_listed_is_a_listing_failure_and_not_complete() {
     let source =
         StorageTraversalSource::with_roles(Arc::new(FailingListNamespace), Arc::new(FakeMetadata));
-    let (lines, outcome) =
-        events(source.traverse(request(tokio_util::sync::CancellationToken::new()))).await;
+    let (items, outcome) =
+        drain(source.traverse(request(tokio_util::sync::CancellationToken::new()))).await;
+    assert_well_formed(&items, &outcome);
 
     assert_eq!(
-        lines,
+        items.iter().map(render).collect::<Vec<_>>(),
         [
             "entry sub",
             "entry file",
             // The root listed fine: the failure belongs to `sub`'s own block, not this one.
-            "listed <root> Complete pruned=0 truncated=0",
-            "failure sub",
-            "listed sub Failed pruned=0 truncated=0",
-            // The one failure counts in both denominators, as the summary's docs say.
-            "subtree sub dirs=1 entries=0 failed=1 failures=1 exhaustive=false",
-            "subtree <root> dirs=2 entries=2 failed=1 failures=1 exhaustive=false",
+            "listed <root> Complete listed=2 emitted=2",
+            "failure listing sub",
+            "listed sub Unreadable listed=0 emitted=0",
         ]
     );
-    assert!(matches!(
-        outcome,
-        TraversalOutcome::Completed(TraversalCompletion {
-            entry_failures: 1,
-            directories_listed: 2,
-            ..
-        })
-    ));
+    let failure = items.iter().find_map(|item| match item {
+        TraversalItem::Failure(failure) => Some(failure),
+        _ => None,
+    });
+    assert!(
+        matches!(
+            failure,
+            Some(failure) if failure.scope == FailureScope::Listing
+                && failure.path.as_str() == "sub"
+                && failure.delivered == Some(0)
+                && failure.failure.class() == FailureClass::PermissionDenied
+        ),
+        "{failure:?}"
+    );
+    let sub = items.iter().find_map(|item| match item {
+        TraversalItem::DirectoryListed(listed) if listed.path.as_str() == "sub" => {
+            Some(listed.outcome)
+        }
+        _ => None,
+    });
+    assert_eq!(sub, Some(ListingOutcome::Unreadable));
+    let TraversalOutcome::Completed(completion) = outcome else {
+        panic!("{outcome:?}")
+    };
+    // A listing failure is a directory's, not a child's: it is not in the child equation.
+    assert_eq!(completion.totals.listing_failures, 1);
+    assert_eq!(completion.totals.interrupted_listings, 0);
+    assert_eq!(completion.totals.failed_children, 0);
 }
 
+/// The other half of the scoping: a child the listing could not describe is that child's
+/// failure, and leaves its directory's listing complete.
 #[tokio::test]
-async fn an_undescribable_child_makes_the_listing_partial_and_not_merely_failed() {
+async fn an_undescribable_child_is_a_child_failure_in_a_complete_listing() {
     let source = StorageTraversalSource::with_roles(
         Arc::new(PartialListingNamespace),
         Arc::new(FakeMetadata),
     );
-    let (items, _) =
+    let (items, outcome) =
         drain(source.traverse(request(tokio_util::sync::CancellationToken::new()))).await;
-    assert_well_formed(&items);
+    assert_well_formed(&items, &outcome);
 
     assert_eq!(
         items.iter().map(render).collect::<Vec<_>>(),
         [
             "entry dir",
-            "listed <root> Complete pruned=0 truncated=0",
-            "failure dir/bad",
+            "listed <root> Complete listed=1 emitted=1",
+            "failure child dir/bad",
             "entry dir/ok",
-            "listed dir Partial { failures: 1 } pruned=0 truncated=0",
-            "subtree dir dirs=1 entries=1 partial=1 failures=1 exhaustive=false",
-            "subtree <root> dirs=2 entries=2 partial=1 failures=1 exhaustive=false",
+            "listed dir Complete listed=2 emitted=1 failed=1",
         ]
     );
-    let listing = items.iter().find_map(|item| match item {
-        TraversalItem::DirectoryListed(directory) if directory.path.as_str() == "dir" => {
-            Some(directory.listing)
-        }
-        _ => None,
-    });
-    assert_eq!(listing, Some(DirectoryListing::Partial { failures: 1 }));
+    let TraversalOutcome::Completed(completion) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(completion.totals.failed_children, 1);
+    assert_eq!(completion.totals.listing_failures, 0);
 }
 
+/// Totals are completion evidence: a cancelled traversal has none, so nothing it delivered can
+/// be read as a complete account.
 #[tokio::test]
-async fn cancellation_can_leave_a_listed_directory_without_its_subtree() {
+async fn cancellation_leaves_no_totals() {
     let cancel = tokio_util::sync::CancellationToken::new();
     let source = StorageTraversalSource::with_roles(
         Arc::new(FakeNamespace),
@@ -407,8 +492,8 @@ async fn cancellation_can_leave_a_listed_directory_without_its_subtree() {
         "{lines:?}"
     );
     assert!(
-        !lines.iter().any(|line| line.starts_with("subtree")),
-        "an unfinished subtree must not be reported complete: {lines:?}"
+        !lines.iter().any(|line| line.starts_with("listed dir ")),
+        "a directory whose children were held back must not be reported: {lines:?}"
     );
     assert_eq!(session.finish().await, Ok(TraversalOutcome::Cancelled));
 }

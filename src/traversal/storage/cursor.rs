@@ -30,14 +30,14 @@ use super::residency::Residency;
 use super::{
     Deferred, DescendOutcome, DirectoryWork, ListingTask, Runtime, Shared, State, admit,
     awaits_slot, descend_outcome, entry_candidate, entry_name, immediate_decision, queue_block_end,
-    queue_failure, queue_subtree_end,
+    queue_failure,
 };
 use crate::model::{EntryKind, EntryOperationFailure, StoragePath};
 use crate::storage::{
     CollectLimits, ListRequest, SourceDescriptor, StorageRoleFailure, collect_listing,
 };
 use crate::traversal::{
-    ChildOrder, TraversalDecision, TraversalOrder, TraversalTerminalFailure, TraversalVersions,
+    ScanFailure, TraversalDecision, TraversalOrder, TraversalTerminalFailure, TraversalVersions,
 };
 
 /// Why the cursor stopped advancing.
@@ -91,6 +91,10 @@ pub(super) struct Prepared {
     truncated: u64,
     /// Children a decision made in the listing's task kept out of the output.
     hidden: u64,
+    /// Children the listing returned, described or not.
+    listed: u64,
+    /// Transfer artifacts the listing hid.
+    internal_hidden: u64,
 }
 
 /// What a listing's task hands the driver: the block, the directory's own failure, or the end
@@ -120,19 +124,13 @@ struct Frame {
 }
 
 impl Frame {
-    /// `child_order` is set here rather than when the listing lands, so that a directory that
-    /// could not be listed at all still reports the order the request asked for instead of
-    /// falling back to the default and reading as if the option had been ignored.
-    fn new(work: DirectoryWork, child_order: ChildOrder) -> Self {
+    fn new(work: DirectoryWork) -> Self {
         Self {
             work,
             children: None,
             slots: VecDeque::new(),
             feed: None,
-            facts: BlockFacts {
-                child_order,
-                ..BlockFacts::default()
-            },
+            facts: BlockFacts::default(),
             closed: false,
         }
     }
@@ -140,9 +138,6 @@ impl Frame {
 
 pub(super) struct Cursor {
     stack: Vec<Frame>,
-    /// What every frame reports as its block's order. Per request today; the field lives on
-    /// `BlockFacts` so a future per-directory degradation can report itself.
-    child_order: ChildOrder,
     /// Deferred descend decisions, filled as their observations settle.
     decisions: Decisions,
     /// Listings started for frames the cursor has not taken yet.
@@ -158,10 +153,9 @@ enum Next {
 }
 
 impl Cursor {
-    pub(super) fn new(root: DirectoryWork, child_order: ChildOrder) -> Self {
+    pub(super) fn new(root: DirectoryWork) -> Self {
         Self {
-            stack: vec![Frame::new(root, child_order)],
-            child_order,
+            stack: vec![Frame::new(root)],
             decisions: HashMap::new(),
             listings: HashMap::new(),
         }
@@ -324,36 +318,14 @@ impl Cursor {
                 continue;
             }
             match self.next_after_block() {
-                Next::Pop => match self.end_top_subtree(runtime, state)? {
-                    ControlFlow::Break(step) => return Ok(step),
-                    ControlFlow::Continue(()) => {}
-                },
-                Next::Descend(work) => self.stack.push(Frame::new(work, self.child_order)),
+                Next::Pop => {
+                    self.stack.pop();
+                }
+                Next::Descend(work) => self.stack.push(Frame::new(work)),
                 Next::Skip => {}
                 Next::Wait => return Ok(Step::WaitObservation),
             }
         }
-    }
-
-    /// Queues the top frame's subtree marker and pops it.
-    ///
-    /// The window is checked here rather than before [`Self::next_after_block`] because that
-    /// call's other branches consume a slot: returning early there would drop a whole subtree,
-    /// and only when the window happened to be full. `Next::Pop` changes nothing, so stopping
-    /// after it is re-entrant.
-    fn end_top_subtree(
-        &mut self,
-        runtime: &Runtime<'_>,
-        state: &mut State,
-    ) -> Result<ControlFlow<Step>, TraversalTerminalFailure> {
-        if state.admitted() >= runtime.request.max_inflight_operations.get() {
-            return Ok(ControlFlow::Break(Step::WindowFull));
-        }
-        let Some(frame) = self.stack.pop() else {
-            return Err(TraversalTerminalFailure::Internal);
-        };
-        queue_subtree_end(state, frame.work.path)?;
-        Ok(ControlFlow::Continue(()))
     }
 
     /// Takes the top frame's arrived listing as its block, using an empty block when the
@@ -373,20 +345,26 @@ impl Cursor {
         match arrived {
             Ok(prepared) => {
                 for failure in prepared.failures {
-                    queue_failure(state, failure)?;
+                    queue_failure(state, ScanFailure::child(failure))?;
                 }
-                frame.facts.pruned = frame.facts.pruned.saturating_add(prepared.pruned);
-                frame.facts.truncated = frame.facts.truncated.saturating_add(prepared.truncated);
-                frame.facts.hidden = frame.facts.hidden.saturating_add(prepared.hidden);
+                frame.facts.listed = prepared.listed;
+                frame.facts.internal_hidden = prepared.internal_hidden;
+                frame.facts.pruned = prepared.pruned;
+                frame.facts.truncated = prepared.truncated;
+                frame.facts.filtered = prepared.hidden;
                 frame.slots = prepared.slots;
                 frame.children = Some(prepared.children);
             }
             Err(failure) => {
-                // A directory that could not be listed still closes like any other: an empty
-                // block, then the frame's normal pop. Keeping one close path means its
-                // completion items come out of the same code as everyone else's.
+                // A directory that could not be listed still closes like any other: its listing
+                // failure, an empty block, then the frame's normal pop. Keeping one close path
+                // means its `DirectoryListed` comes out of the same code as everyone else's.
+                // The whole listing is collected before any child is delivered (until P7 C4),
+                // so not one child was delivered.
+                // The block's outcome is derived from this failure where the block closes, so the
+                // two cannot disagree.
+                let failure = ScanFailure::listing(frame.work.path.clone(), failure, 0);
                 queue_failure(state, failure)?;
-                frame.facts.listing_failed = true;
                 frame.children = Some(VecDeque::new());
             }
         }
@@ -484,22 +462,36 @@ impl Search<'_> {
     }
 }
 
-/// A whole listing: its children with their full paths, and the children it could not describe.
-type Collected = Result<(Vec<SourceDescriptor>, Vec<EntryOperationFailure>), StorageRoleFailure>;
+/// A whole listing: its children with their full paths, the children it could not describe, and
+/// how many transfer artifacts it hid.
+struct Whole {
+    entries: Vec<SourceDescriptor>,
+    failures: Vec<EntryOperationFailure>,
+    internal_hidden: u64,
+}
+
+type Collected = Result<Whole, StorageRoleFailure>;
 
 /// Turns a finished listing into a block, inside the listing's own task: listing-level failures
 /// stay failures, every child gets its admission decision now, and every child that needs no
 /// I/O is observed now.
 fn prepare(shared: &Shared, work: &DirectoryWork, result: Collected) -> Arrival {
-    let (entries, failures) = match result {
+    let Whole {
+        entries,
+        failures,
+        internal_hidden,
+    } = match result {
         Ok(listing) => listing,
         Err(StorageRoleFailure::Entry(error)) => return Ok(Err(error)),
         Err(StorageRoleFailure::Session(error)) => {
             return Err(TraversalTerminalFailure::Session(error));
         }
     };
+    let listed = u64::try_from(entries.len().saturating_add(failures.len())).unwrap_or(u64::MAX);
     let mut prepared = Prepared {
         failures,
+        listed,
+        internal_hidden,
         children: VecDeque::with_capacity(entries.len()),
         slots: VecDeque::new(),
         pruned: 0,
@@ -605,8 +597,10 @@ impl Prepared {
 /// so which one wins cannot change the emitted sequence. `failures` keep their place ahead of the
 /// block: a child the listing could not describe has no name to sort by.
 fn sort_by_name(result: &mut Collected) {
-    let Ok((entries, _)) = result else { return };
-    entries.sort_unstable_by(|left, right| sibling_key(left).cmp(&sibling_key(right)));
+    let Ok(whole) = result else { return };
+    whole
+        .entries
+        .sort_unstable_by(|left, right| sibling_key(left).cmp(&sibling_key(right)));
 }
 
 /// The total order [`sort_by_name`] sorts by: name bytes, then files before directories, then
@@ -660,7 +654,15 @@ fn spawn_listing(
         };
         let mut result = collect_listing(stream, CollectLimits::UNBOUNDED)
             .await
-            .map(|page| page.into_descriptors(&path));
+            .map(|page| {
+                let internal_hidden = u64::from(page.internal_hidden);
+                let (entries, failures) = page.into_descriptors(&path);
+                Whole {
+                    entries,
+                    failures,
+                    internal_hidden,
+                }
+            });
         if shared.request.order == TraversalOrder::NameBytes {
             sort_by_name(&mut result);
         }

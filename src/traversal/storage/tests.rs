@@ -195,7 +195,7 @@ async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
     });
     let mut observed = Vec::new();
     while let Some(item) = session.next_item().await {
-        if crate::traversal::is_completion(&item) {
+        if crate::traversal::is_marker(&item) {
             continue;
         }
         let TraversalItem::Entry(entry) = item else {
@@ -217,8 +217,11 @@ async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
     assert!(matches!(
         session.finish().await,
         Ok(TraversalOutcome::Completed(TraversalCompletion {
-            observed_entries: 4,
-            entry_failures: 0,
+            totals: crate::traversal::ScanTotals {
+                emitted: 4,
+                failed_children: 0,
+                ..
+            },
             ..
         }))
     ));
@@ -252,18 +255,26 @@ async fn entry_failures_are_items_while_session_failures_are_terminal() {
     let mut session = source.traverse(request(tokio_util::sync::CancellationToken::new()));
     let mut failures = 0;
     while let Some(item) = session.next_item().await {
-        if crate::traversal::is_completion(&item) {
+        if crate::traversal::is_marker(&item) {
             continue;
         }
-        assert!(matches!(item, TraversalItem::EntryFailure(_)));
+        assert!(matches!(
+            item,
+            TraversalItem::Failure(failure)
+                if failure.scope == crate::traversal::FailureScope::Child
+        ));
         failures += 1;
     }
     assert_eq!(failures, 4);
     assert!(matches!(
         session.finish().await,
         Ok(TraversalOutcome::Completed(TraversalCompletion {
-            observed_entries: 0,
-            entry_failures: 4,
+            totals: crate::traversal::ScanTotals {
+                listed: 4,
+                emitted: 0,
+                failed_children: 4,
+                ..
+            },
             ..
         }))
     ));
@@ -315,7 +326,7 @@ async fn cancellation_while_inflight_is_full_terminates_without_spinning() {
 async fn collect(mut session: TraversalSession) -> (Vec<String>, TraversalOutcome) {
     let mut paths = Vec::new();
     while let Some(item) = session.next_item().await {
-        if crate::traversal::is_completion(&item) {
+        if crate::traversal::is_marker(&item) {
             continue;
         }
         let TraversalItem::Entry(entry) = item else {
@@ -367,8 +378,8 @@ async fn an_undescribable_child_is_a_failure_item_without_hiding_its_siblings() 
     while let Some(item) = session.next_item().await {
         match item {
             TraversalItem::Entry(entry) => entries.push(entry.path().as_str().to_owned()),
-            TraversalItem::EntryFailure(error) => failures.push(error.path().as_str().to_owned()),
-            TraversalItem::DirectoryListed(_) | TraversalItem::SubtreeComplete(_) => {}
+            TraversalItem::Failure(failure) => failures.push(failure.path.as_str().to_owned()),
+            TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_) => {}
         }
     }
     assert_eq!(entries, ["dir", "dir/ok"]);
@@ -376,8 +387,11 @@ async fn an_undescribable_child_is_a_failure_item_without_hiding_its_siblings() 
     assert!(matches!(
         session.finish().await,
         Ok(TraversalOutcome::Completed(TraversalCompletion {
-            observed_entries: 2,
-            entry_failures: 1,
+            totals: crate::traversal::ScanTotals {
+                emitted: 2,
+                failed_children: 1,
+                ..
+            },
             ..
         }))
     ));
@@ -452,7 +466,7 @@ async fn the_admission_window_bounds_entries_waiting_to_be_emitted_not_only_infl
     assert!(metadata.started.load(std::sync::atomic::Ordering::SeqCst) <= 3);
     let mut emitted = Vec::new();
     while let Some(item) = session.next_item().await {
-        if crate::traversal::is_completion(&item) {
+        if crate::traversal::is_marker(&item) {
             continue;
         }
         let TraversalItem::Entry(entry) = item else {
@@ -472,6 +486,7 @@ async fn the_admission_window_bounds_entries_waiting_to_be_emitted_not_only_infl
 
 mod bench;
 mod cancel;
+mod counts;
 mod events;
 mod filter;
 mod order;

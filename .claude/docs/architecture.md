@@ -77,29 +77,37 @@ CIFS file id、Local dev+inode 放得下；更长的 NFS 句柄与 S3 路径 + E
 取消或结束时在途的列举和观察都 detach 而非 abort (CIFS 句柄)；观察任务在块的 feed 被丢弃后跑完手上的
 才退出。
 
-**目录完成事件**。游标在两处排入 marker 槽位：块被完全准入时排 `DirectoryListed`，帧弹出前排
-`SubtreeComplete`。于是一个被列举的目录 D 的输出是：D 的块 → `DirectoryListed(D)` → 各子目录
-递归同样的序列 → `SubtreeComplete(D)`；跑完的遍历以根的 `SubtreeComplete` 收尾。**只有真被
-列举过的目录**才有这两项 —— `max_depth` 边界目录发了 Entry 却没列举，两项都没有；filter 隐藏
-但仍下钻的目录两项都有、却没有自己的 Entry。取消时 `DirectoryListed` 可以没有配对的
-`SubtreeComplete`，只有 `TraversalOutcome::Completed` 保证配对。
+**事件与计数 (P7 C2)**。`TraversalItem` 是 `Entry` / `Failure(ScanFailure)` / `DirectoryListed` /
+`Checkpoint` (C11 才发)。`ScanFailure.scope` 分 `Child` (这一个子项：列举描述不出，或观察失败) 与
+`Listing` (这个目录的列举不完整；`delivered` = 失败前已发出的子项数，C4 之前整目录收齐才发，恒为 0)。
+游标在块被完全准入时排一个 marker 槽位，输出侧把它变成 `DirectoryListed { path, outcome, counts }`：
+一个被列举的目录 D 的输出是 D 的块 → `DirectoryListed(D)` → 各子目录递归同样的序列 (空目录也发)。
+**只有真被列举过的目录**才有它 —— `max_depth` 边界目录发了 Entry 却没列举；filter 隐藏但仍下钻的目录
+有它、却没有自己的 Entry。列举失败的目录：块里是 `Failure{scope: Listing}`，然后
+`DirectoryListed.outcome = Unreadable` (有已发出子项时 `Interrupted`)；子项失败不改 outcome，只进
+`counts.failed_children`。消费方的删除安全规则写在 `ScanFailure` 的文档上 (P7 §4.1)：只有 `Completed`
+才能做删除检测；`Listing` 失败的目录整棵旧子树不参与删除；`Child` 失败的条目本身不参与。
+`SubtreeComplete` / `SubtreeSummary` / `DirectoryListing` / `ChildOrder` 已删 (Blocks 下可由
+名字序 DFS + `DirectoryListed` 推出)。
 
-marker **占准入窗口**的名额，不绕过它，所以两个 marker 都不会让 `admitted()` 越界。
+计数 (`src/traversal/counts.rs`)：每块 `BlockCounts`，全场 `ScanTotals` (在 `TraversalCompletion.totals`，
+只有 `Completed` 才有)。不变式 `listed == emitted + filtered + failed_children + vanished` (每块与全场都成立，
+`is_balanced()`)；`internal_hidden` (`.data-mover-*`) 不在 `listed` 里；pruned / truncated 与之正交；
+`vanished` 的分类在 C3，今天恒为 0。`files + directories + symlinks + other == emitted`，`bytes` 只加文件。
+
+marker **占准入窗口**的名额，不绕过它，所以不会让 `admitted()` 越界。
 (唯一的例外是既有的 `queue_failure`：`take_top_listing` 为列举自带的 N 个不可描述子项、以及
 列举失败本身排队失败项时不查窗口，`admitted()` 可短暂到 `max_inflight + N`。它们同步落盘、
-下一次 flush 就排空，且 N 受该次列举已在内存里的结果限制。这是 P2 之前就有的行为，P3 没有
-扩大它。) 重入安全靠位置：`DirectoryListed`
-由 `Frame.closed` 一次性标志守护 (`next_after_block` 每槽位调一次)；`SubtreeComplete` 的窗口
-检查必须在 `next_after_block` 返回 `Next::Pop` 之后、`stack.pop()` 之前 —— 放到调用之前会让
-`Descend` 分支已消费的槽位随提前返回一起丢掉，表现为整棵子目录静默消失。
+下一次 flush 就排空，且 N 受该次列举已在内存里的结果限制。) 重入安全靠位置：`DirectoryListed`
+由 `Frame.closed` 一次性标志守护 (`next_after_block` 每槽位调一次)。
 
-判定与汇总在**输出侧** (`storage/output.rs`) 而不是游标：槽位离开重排缓冲时比它早的槽位全部
-已经过去，所以在 `DirectoryListed` 处整个块 (含 deferred 决定) 已落定，在 `SubtreeComplete`
-处其下所有块也已落定，计数是精确的。`DirectoryListing` 四个状态互斥，同时成立取最强者
-`Failed > Partial > Filtered > Complete`。账目分两条路进来：立即决定隐藏的子项**根本不分配
-槽位** (给它分配会让一个排除百万文件的 filter 反过来被准入窗口节流)，记在 `BlockFacts`；
-deferred 决定随 `Settled::Child.descent` 走。两条路的 `max_depth` 与 filter 判定顺序统一为
+计数在**输出侧** (`storage/output.rs`) 而不是游标：槽位离开重排缓冲时比它早的槽位全部已经过去，
+所以在 `DirectoryListed` 处整个块 (含 deferred 决定) 已落定，计数是精确的；全场总数是各块之和。
+账目分两条路进来：立即决定隐藏的子项**根本不分配槽位** (给它分配会让一个排除百万文件的 filter
+反过来被准入窗口节流)，与 `listed` / `internal_hidden` 一起记在 `BlockFacts`；deferred 决定随
+`Settled::Child`(`None` = 被过滤) 与 `.descent` 走。两条路的 `max_depth` 与 filter 判定顺序统一为
 先判深度，否则同一个目录会因 filter 是否 deferred 而一会儿报 Pruned 一会儿报 Truncated。
+两条路计数相同由 `storage/tests/counts.rs` 钉住。
 
 **覆盖面**：
 
@@ -198,7 +206,7 @@ loop {
 
     ① 还没拿到列举 → take_top_listing()
          到了   → 装上；列举级 failures 先按序发出
-         失败   → facts.listing_failed = true，装一个空块   ← 失败与成功共用同一条收尾路径
+         失败   → 排 Failure{scope: Listing}，facts.outcome = Unreadable，装一个空块   ← 失败与成功共用同一条收尾路径
          没到   → return WaitListing
 
     ② 块里还有子项 → 窗口满? WindowFull
@@ -209,8 +217,7 @@ loop {
                       closed = true
 
     ④ 消费一个 slot (next_after_block)：
-         Pop     → 窗口满? WindowFull      ← 检查必须在返回 Pop 之后、stack.pop() 之前
-                   queue_subtree_end(); stack.pop()
+         Pop     → stack.pop()             (P7 C2 起没有 SubtreeComplete marker)
          Descend → stack.push(Frame::new(work))
          Skip    → {}
          Wait    → return WaitObservation
@@ -244,9 +251,9 @@ loop {
    无论背后是 `Vec` 还是归并迭代器。临时文件清理挂在取消路径上。
 5. **下钻序自动有序**：`descend` / `slots` 按排序后的顺序建立 (`prepare` 按 `entries` 顺序 →
    `admit` 同序 `push_back` → `next_after_block` 队首取)，所以排一次，块内序与下钻序同时有序。
-6. **事件**：`DirectoryListed.child_order = NameBytes`；列举级 failures 排在块首、**在序之外**
-   (它们可能没有合法名字)；观察失败的 `EntryFailure` 有真路径，留在自己的排序位上；
-   marker 多重集与每个 `SubtreeSummary` 的八个计数在两种模式下**必须完全相同**。
+6. **事件**：列举级 failures 排在块首、**在序之外** (它们可能没有合法名字)；观察失败的
+   `Failure{scope: Child}` 有真路径，留在自己的排序位上；事件多重集与每块 `BlockCounts`、全场
+   `ScanTotals` 在两种模式下**必须完全相同**。(`ChildOrder` 在 P7 C2 删除，兄弟排序本身在 C4 删除。)
 7. **消费者比较的键是 `(父目录, 名字)`，不是整条路径。** 块不交错 —— 一个目录的全部子项都排在
    任何孙子之前，目录本身按排序后的深度优先访问。所以 `a/`(含 `a/x`) 与 `a.txt` 给出
    `a, a.txt, …, a/x`：两者都是根的子项，都排在 `a` 之下的任何东西之前。**这不是"有序 DFS
@@ -359,6 +366,7 @@ if global_slot_bytes > BUDGET:
 
 **代价**：
 
+- (P7 前的规划稿；`SubtreeComplete` / `child_order` 已在 P7 C2 删除。)
 - **事件时序退化**：子目录的 `SubtreeComplete` 会早于父目录的 `DirectoryListed`。G1 (每个被
   列举目录一个完成事件、在其直接子项之后) 与 G2 (祖先先被列举) 仍成立，失去的是
   "`DirectoryListed(D)` 先于任何子目录事件" —— 即从**早通知**退化成**迟通知**。

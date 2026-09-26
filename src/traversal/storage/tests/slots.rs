@@ -11,7 +11,7 @@
 //!
 //! A backend whose own spelling of a child is not that join — one that resolves paths
 //! component-wise and hands `a/b/sub` back for a listing of `a//b` — must not have its child
-//! renamed silently: the directory's entry would then disagree with its own completion items,
+//! renamed silently: the directory's entry would then disagree with its own `DirectoryListed`,
 //! and a consumer merging two sides by path reads that as "the other side has something this
 //! side does not" and deletes. Such a child is a failure item at the path the backend spelled,
 //! never an entry and never descended into. These tests pin both halves.
@@ -27,6 +27,7 @@ use std::sync::{Mutex, PoisonError};
 
 use super::*;
 use crate::model::BackendSessionFailure;
+use crate::traversal::TraversalOrder;
 
 /// More listings than any tree here has directories, and few enough that a fault which re-lists
 /// one directory forever stops within a test's patience rather than the harness's.
@@ -113,11 +114,10 @@ impl Namespace for SpellingNamespace {
     }
 }
 
-/// Every directory with completion items also has an entry spelled identically.
+/// Every directory with a `DirectoryListed` also has an entry spelled identically.
 ///
-/// Returns what it checked, as `"<kind> <path>"` and sorted: the kind so that one
-/// `DirectoryListed` plus one `SubtreeComplete` cannot be confused with two of either, sorted
-/// because this file pins spelling agreement and not order — order is pinned in `events.rs` and
+/// Returns what it checked, as `"<kind> <path>"` and sorted: sorted because this file pins
+/// spelling agreement and not order — order is pinned in `events.rs` and
 /// `order.rs`. A caller asserts on the result, since an invariant that holds over an empty set
 /// proves nothing.
 fn assert_entries_and_markers_agree(items: &[TraversalItem], root: &str) -> Vec<String> {
@@ -132,7 +132,6 @@ fn assert_entries_and_markers_agree(items: &[TraversalItem], root: &str) -> Vec<
     for item in items {
         let (kind, path) = match item {
             TraversalItem::DirectoryListed(listed) => ("listed", listed.path.as_str()),
-            TraversalItem::SubtreeComplete(complete) => ("subtree", complete.path.as_str()),
             _ => continue,
         };
         // The traversal root is not one of its own entries, so it has nothing to agree with.
@@ -204,14 +203,14 @@ fn failures(items: &[TraversalItem]) -> Vec<&str> {
     items
         .iter()
         .filter_map(|item| match item {
-            TraversalItem::EntryFailure(failure) => Some(failure.path().as_str()),
+            TraversalItem::Failure(failure) => Some(failure.path.as_str()),
             _ => None,
         })
         .collect()
 }
 
 /// A traversal rooted at `a//b` keeps the doubled separator in every path below it: the children
-/// are `a//b/sub`, their entries and completion items agree, and every listing asked for is one
+/// are `a//b/sub`, their entries and directory events agree, and every listing asked for is one
 /// the backend handed out.
 #[tokio::test]
 async fn a_doubled_separator_is_kept_verbatim_in_entries_and_markers() {
@@ -231,7 +230,7 @@ async fn a_doubled_separator_is_kept_verbatim_in_entries_and_markers() {
     let checked = assert_entries_and_markers_agree(&items, "a//b");
     assert_eq!(
         checked,
-        ["listed a//b/sub", "subtree a//b/sub"],
+        ["listed a//b/sub"],
         "the doubled separator was not exercised: {checked:?}"
     );
 }
@@ -284,7 +283,7 @@ async fn a_dot_slash_root_is_part_of_every_path_below_it() {
     let checked = assert_entries_and_markers_agree(&items, ROOT);
     assert_eq!(
         checked,
-        ["listed ./t/d", "subtree ./t/d"],
+        ["listed ./t/d"],
         "the descend target lost the requested spelling: {checked:?}"
     );
 }

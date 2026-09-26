@@ -2,6 +2,7 @@
 //! `StorageTraversalSource` every other backend uses, in both version modes, against the
 //! in-memory S3 of the role tests.
 
+use std::fmt::Write as _;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +12,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    StorageTraversalSource, TraversalCandidate, TraversalCompletion, TraversalDecision,
+    FailureScope, ScanTotals, StorageTraversalSource, TraversalCandidate, TraversalDecision,
     TraversalFilter, TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest,
     TraversalSource, TraversalVersions,
 };
@@ -82,7 +83,7 @@ fn entries(items: &[TraversalItem]) -> Vec<&ObservedEntry> {
         .collect()
 }
 
-/// `path kind [id L M]` of an entry, `listed path listing`, `subtree path exhaustive`.
+/// `path kind [id L M]` of an entry, `failure scope path`, `listed path outcome [set counts]`.
 fn render(item: &TraversalItem) -> String {
     match item {
         TraversalItem::Entry(entry) => {
@@ -96,26 +97,48 @@ fn render(item: &TraversalItem) -> String {
             });
             format!("{} {:?}{version}", entry.path(), entry.kind())
         }
-        TraversalItem::EntryFailure(failure) => format!("failure {}", failure.path()),
+        TraversalItem::Failure(failure) => format!("failure {:?} {}", failure.scope, failure.path),
         TraversalItem::DirectoryListed(listed) => {
-            format!("listed {} {:?}", listed.path, listed.listing)
+            let counts = &listed.counts;
+            assert!(counts.is_balanced(), "{listed:?}");
+            [
+                ("hidden", counts.internal_hidden),
+                ("filtered", counts.filtered),
+                ("failed", counts.failed_children),
+                ("pruned", counts.pruned_dirs),
+                ("truncated", counts.truncated_dirs),
+            ]
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .fold(
+                format!("listed {} {:?}", listed.path, listed.outcome),
+                |mut line, (label, count)| {
+                    let _ = write!(line, " {label}={count}");
+                    line
+                },
+            )
         }
-        TraversalItem::SubtreeComplete(complete) => format!(
-            "subtree {} {}",
-            complete.path,
-            complete.summary.is_exhaustive()
-        ),
+        TraversalItem::Checkpoint(_) => "checkpoint".to_owned(),
     }
+}
+
+/// The totals of a completed traversal.
+fn totals(outcome: &TraversalOutcome) -> ScanTotals {
+    let TraversalOutcome::Completed(completion) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert!(completion.totals.is_balanced(), "{completion:?}");
+    completion.totals
 }
 
 fn rendered(items: &[TraversalItem]) -> Vec<String> {
     items.iter().map(render).collect()
 }
 
-/// Prefixes are directories: each listed one gets its block, its `DirectoryListed` and its
-/// `SubtreeComplete`, in block order, and the root's summary is exhaustive.
+/// Prefixes are directories: each listed one gets its block and its `DirectoryListed`, in block
+/// order, and a hidden transfer artifact is counted as hidden, not as a child.
 #[tokio::test]
-async fn prefixes_are_directories_with_completion_items() -> TestResult {
+async fn prefixes_are_directories_with_directory_events() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     for key in ["a/x", "a/y/z", "b", "k", ".data-mover-stage/s"] {
         put(&protocol, key, b"1").await?;
@@ -127,21 +150,18 @@ async fn prefixes_are_directories_with_completion_items() -> TestResult {
             "a Directory",
             "b File",
             "k File",
-            "listed  Complete",
+            "listed  Complete hidden=1",
             "a/x File",
             "a/y Directory",
             "listed a Complete",
             "a/y/z File",
             "listed a/y Complete",
-            "subtree a/y true",
-            "subtree a true",
-            "subtree  true",
         ]
     );
-    assert_eq!(
-        outcome,
-        TraversalOutcome::Completed(TraversalCompletion::new(6, 0, 3))
-    );
+    let totals = totals(&outcome);
+    assert_eq!((totals.listed, totals.emitted), (6, 6));
+    assert_eq!((totals.files, totals.directories), (4, 2));
+    assert_eq!(totals.listing_failures, 0);
     Ok(())
 }
 
@@ -165,10 +185,7 @@ async fn history() -> TestResult<Arc<MemoryS3>> {
 async fn current_and_all_on_one_history() -> TestResult {
     let protocol = history().await?;
     let (items, _) = traverse(&protocol, request(TraversalVersions::Current)).await?;
-    assert_eq!(
-        rendered(&items),
-        ["k File", "listed  Complete", "subtree  true"]
-    );
+    assert_eq!(rendered(&items), ["k File", "listed  Complete hidden=1"]);
     let current = entries(&items);
     assert_eq!(current[0].size(), Some(3));
     assert_eq!(current[0].source_version(), Some(SourceVersion::Current));
@@ -183,14 +200,13 @@ async fn current_and_all_on_one_history() -> TestResult {
             "k File v0002",
             "k File v0003 M",
             "k File v0004 L",
-            "listed  Complete",
-            "subtree  true",
+            "listed  Complete hidden=1",
         ]
     );
-    assert_eq!(
-        outcome,
-        TraversalOutcome::Completed(TraversalCompletion::new(6, 0, 1))
-    );
+    let totals = totals(&outcome);
+    // One child per version and marker; a marker has no size.
+    assert_eq!((totals.listed, totals.emitted, totals.files), (6, 6, 6));
+    assert_eq!(totals.bytes, 2 + 2 + 3 + 1);
     let all = entries(&items);
     let selected: Vec<Option<SourceVersion>> =
         all.iter().map(|entry| entry.source_version()).collect();
@@ -304,8 +320,7 @@ async fn pruned_and_truncated_prefixes_are_never_listed() -> TestResult {
             "keep Directory",
             "skip Directory",
             "top File null L",
-            "listed  Complete",
-            "subtree  false",
+            "listed  Complete truncated=2",
         ]
     );
     Ok(())
@@ -433,7 +448,7 @@ async fn the_null_version_is_observed_bound_to_itself() -> TestResult {
 }
 
 /// A traversal rooted at a prefix under which nothing is stored fails that root's listing, so
-/// its summary is not exhaustive: an absent source never reads as an empty one.
+/// its listing is unreadable: an absent source never reads as an empty one.
 #[tokio::test]
 async fn an_absent_root_is_not_an_empty_source() -> TestResult {
     let protocol = tree().await?;
@@ -442,11 +457,7 @@ async fn an_absent_root_is_not_an_empty_source() -> TestResult {
     let (items, _) = traverse(&protocol, missing).await?;
     assert_eq!(
         rendered(&items),
-        [
-            "failure missing",
-            "listed missing Failed",
-            "subtree missing false"
-        ]
+        ["failure Listing missing", "listed missing Unreadable",]
     );
     Ok(())
 }
@@ -509,37 +520,37 @@ async fn a_looping_listing_fails_only_its_directory() -> TestResult {
             2,
             "{rendered:?}"
         );
-        let about_a = ["failure a", "listed a Failed", "subtree a false"];
+        let about_a = ["failure Listing a", "listed a Unreadable"];
         let around_a: Vec<&String> = rendered
             .iter()
             .filter(|item| item.starts_with("a/") || about_a.contains(&item.as_str()))
             .collect();
         assert_eq!(
             around_a,
-            ["failure a", "listed a Failed", "subtree a false"],
+            ["failure Listing a", "listed a Unreadable"],
             "{versions:?}: {rendered:?}"
         );
         assert!(
             rendered.contains(&"listed b Complete".to_string()),
             "{rendered:?}"
         );
-        assert!(
-            rendered.contains(&"subtree  false".to_string()),
-            "{rendered:?}"
-        );
         let failure = items.iter().find_map(|item| match item {
-            TraversalItem::EntryFailure(failure) => Some(failure),
+            TraversalItem::Failure(failure) => Some(failure),
             _ => None,
         });
         assert!(
-            failure
-                .is_some_and(|f| f.class() == FailureClass::Protocol
-                    && f.transience() == Transience::Permanent),
+            failure.is_some_and(|f| f.scope == FailureScope::Listing
+                && f.failure.class() == FailureClass::Protocol
+                && f.failure.transience() == Transience::Permanent),
             "{failure:?}"
         );
-        assert!(
-            matches!(outcome, TraversalOutcome::Completed(_)),
-            "{versions:?}: {outcome:?}"
+        // The one looping directory is the scan's one listing failure: its subtree is out of
+        // any deletion, and nothing else is.
+        let totals = totals(&outcome);
+        assert_eq!(
+            (totals.listing_failures, totals.interrupted_listings),
+            (1, 0),
+            "{versions:?}: {totals:?}"
         );
     }
     Ok(())

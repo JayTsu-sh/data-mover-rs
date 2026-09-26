@@ -8,11 +8,16 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    BackendSessionFailure, EntryKind, EntryOperationFailure, ObservationPlan, ObservedEntry,
-    StoragePath, StorageTimestamp,
+    BackendSessionFailure, EntryKind, ObservationPlan, StoragePath, StorageTimestamp,
 };
 
+mod counts;
+mod events;
 mod storage;
+pub use counts::{BlockCounts, ScanTotals};
+pub use events::{
+    Checkpoint, DirectoryListed, FailureScope, ListingOutcome, ScanFailure, TraversalItem,
+};
 pub use storage::StorageTraversalSource;
 #[cfg(test)]
 mod hdfs_tests;
@@ -68,14 +73,15 @@ pub enum TraversalOrder {
 pub enum TraversalVersions {
     /// Current objects only. A key whose latest entry is a delete marker is absent, as it is
     /// from the store's own current view. Every source supports it; entries carry no listed
-    /// version ([`ObservedEntry::version`] is `None`).
+    /// version ([`ObservedEntry::version`](crate::model::ObservedEntry::version) is `None`).
     #[default]
     Current,
     /// Every stored version and delete marker of every object, each object's entries contiguous,
     /// oldest first and the latest last. Each entry carries its [`EntryVersion`] (version id,
-    /// latest flag, delete-marker flag), and [`ObservedEntry::source_version`] is the selector
-    /// that copies exactly that version with `TransferRequest::with_source_version`. A delete
-    /// marker has no size and nothing to copy.
+    /// latest flag, delete-marker flag), and
+    /// [`ObservedEntry::source_version`](crate::model::ObservedEntry::source_version) is the
+    /// selector that copies exactly that version with `TransferRequest::with_source_version`. A
+    /// delete marker has no size and nothing to copy.
     ///
     /// Only a source that keeps versions (S3) supports it. Any other source ends the traversal
     /// before any I/O with an `Unsupported` session failure, never with its current entries in
@@ -93,7 +99,7 @@ pub struct TraversalCandidate<'a> {
     ///
     /// This is the frame of reference the legacy walkers used, so an expression written against
     /// a scan root keeps matching. It is deliberately not the backend-relative path that the
-    /// emitted [`ObservedEntry`] carries.
+    /// emitted [`ObservedEntry`](crate::model::ObservedEntry) carries.
     pub path: &'a str,
     /// Final path component.
     pub name: &'a str,
@@ -249,173 +255,30 @@ impl TraversalRequest {
     }
 }
 
-/// One ordered traversal item. Entry failures do not terminate the session.
-///
-/// A listed directory `D` produces, in order: its block; then [`TraversalItem::DirectoryListed`]
-/// for `D`; then, for every subdirectory `D` descends into, that same sequence recursively; and
-/// last [`TraversalItem::SubtreeComplete`] for `D`. A traversal that runs to completion
-/// therefore ends with the root's `SubtreeComplete`.
-///
-/// `D`'s block holds one item per admitted child, in the order [`TraversalRequest::order`] asked
-/// for, except that children the listing itself could not describe come first as entry failures,
-/// ahead of every described child and outside any order.
-///
-/// Only a directory that was actually listed gets those two items. A directory `max_depth`
-/// stops at is emitted as an entry and never listed, so it has neither; a directory the filter
-/// hides but still descends into has both, with no [`TraversalItem::Entry`] of its own.
-///
-/// A `DirectoryListed` can arrive without its `SubtreeComplete`: cancellation stops the
-/// traversal wherever it stands, and only [`TraversalOutcome::Completed`] guarantees the pair.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum TraversalItem {
-    Entry(Box<ObservedEntry>),
-    EntryFailure(EntryOperationFailure),
-    /// Every direct child of one listed directory has been delivered.
-    DirectoryListed(DirectoryListed),
-    /// One listed directory's whole subtree has been delivered.
-    SubtreeComplete(Box<SubtreeComplete>),
-}
-
-/// Every direct child of one listed directory has been delivered.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub struct DirectoryListed {
-    pub path: StoragePath,
-    pub listing: DirectoryListing,
-    /// The order this block's children were delivered in.
-    pub child_order: ChildOrder,
-    /// Direct subdirectories the filter did not descend into. None of them has completion
-    /// items of its own.
-    ///
-    /// Whether such a subdirectory was itself emitted is a separate question, answered by
-    /// `listing`. The filter decides `emit` and `descend` independently, so a child can be both
-    /// pruned and hidden: it counts here *and* makes the listing `Filtered`. Neither this count
-    /// nor `truncated_children` is a count of emitted entries, and adding them to the entries
-    /// in the block does not give the number of children the directory has.
-    pub pruned_children: u64,
-    /// Direct subdirectories `max_depth` stopped at. None of them has completion items of its
-    /// own. A directory beyond the depth limit counts here rather than in `pruned_children`
-    /// whatever the filter said about descending, and, as there, the filter may independently
-    /// have kept it out of the output.
-    pub truncated_children: u64,
-}
-
-/// The order one directory's block was delivered in.
-///
-/// Orthogonal to [`DirectoryListing`]: how complete a block is and how it was ordered are
-/// separate questions, and one block can be `Partial` and sorted at the same time.
-///
-/// It confirms after the fact and cannot warn ahead of it, because the whole block is already
-/// past by the time its [`DirectoryListed`] arrives. A consumer that needs an order asks for it
-/// in the request; this only reports what happened.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ChildOrder {
-    /// Backend listing order.
-    #[default]
-    Listing,
-    /// Sorted by the bytes of the final path component; see [`TraversalOrder::NameBytes`].
-    NameBytes,
-}
-
-/// How complete one directory's block is.
-///
-/// The states are exclusive. When more than one applies, the strongest holds: `Failed` over
-/// `Partial` over `Filtered` over `Complete`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum DirectoryListing {
-    /// Every child was described and emitted.
-    Complete,
-    /// Every child was described, but the filter kept at least one out of the output. A
-    /// subdirectory that was merely not descended into does not make a listing `Filtered`,
-    /// because its own entry was still emitted; see [`DirectoryListed::pruned_children`].
-    Filtered,
-    /// The listing succeeded, but `failures` children produced an entry failure instead of an
-    /// entry: the listing could not name them, or observing them failed. Each one is an item in
-    /// this block.
-    Partial { failures: u64 },
-    /// The directory could not be listed at all. Why is in the `Operation::Traverse` entry
-    /// failure that is the only item in its block.
-    Failed,
-}
-
-/// One listed directory's whole subtree has been delivered.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub struct SubtreeComplete {
-    pub path: StoragePath,
-    pub summary: SubtreeSummary,
-}
-
-/// What one subtree, the directory at its root included, turned out to hold.
-///
-/// A listing that failed counts in both `entry_failures` and `failed_listings`: the first counts
-/// items, the second counts directories, and one failed listing is one of each.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[non_exhaustive]
-pub struct SubtreeSummary {
-    pub directories_listed: u64,
-    pub filtered_listings: u64,
-    pub partial_listings: u64,
-    pub failed_listings: u64,
-    pub observed_entries: u64,
-    pub entry_failures: u64,
-    /// Subdirectories the filter did not descend into.
-    pub pruned_directories: u64,
-    /// Subdirectories `max_depth` stopped at.
-    pub truncated_directories: u64,
-}
-
-impl SubtreeSummary {
-    /// Whether this subtree is a complete account of what the source holds: nothing hidden,
-    /// pruned, truncated or failed. Only then may a caller treat what it did not see as absent.
-    #[must_use]
-    pub const fn is_exhaustive(&self) -> bool {
-        self.filtered_listings == 0
-            && self.partial_listings == 0
-            && self.failed_listings == 0
-            && self.entry_failures == 0
-            && self.pruned_directories == 0
-            && self.truncated_directories == 0
-    }
-}
-
-/// Whether an item is a directory completion item rather than an entry. Tests about entry
-/// order skip these; the ones in `storage::tests::events` are about them.
-#[cfg(test)]
-pub(crate) const fn is_completion(item: &TraversalItem) -> bool {
-    matches!(
-        item,
-        TraversalItem::DirectoryListed(_) | TraversalItem::SubtreeComplete(_)
-    )
-}
-
-/// Positive evidence that enumeration reached its normal terminal boundary.
-///
-/// These are item tallies for the whole traversal. The structural account of what was and was
-/// not seen is [`SubtreeSummary`], carried by the root's [`TraversalItem::SubtreeComplete`].
+/// Positive evidence that enumeration reached its normal terminal boundary, with what it
+/// counted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct TraversalCompletion {
-    pub observed_entries: u64,
-    pub entry_failures: u64,
-    /// Directories the traversal tried to list, the traversal root included, and therefore the
-    /// number of [`TraversalItem::DirectoryListed`] items it emitted. A directory whose listing
-    /// failed counts too: it produced that item, carrying [`DirectoryListing::Failed`].
-    pub directories_listed: u64,
+    pub totals: ScanTotals,
 }
 
 impl TraversalCompletion {
+    /// Completion evidence carrying `totals`.
     #[must_use]
-    pub const fn new(observed_entries: u64, entry_failures: u64, directories_listed: u64) -> Self {
-        Self {
-            observed_entries,
-            entry_failures,
-            directories_listed,
-        }
+    pub const fn new(totals: ScanTotals) -> Self {
+        Self { totals }
     }
+}
+
+/// Whether an item is a directory event or a checkpoint rather than an entry or a failure.
+/// Tests about entry order skip these; the ones in `storage::tests::events` are about them.
+#[cfg(test)]
+pub(crate) const fn is_marker(item: &TraversalItem) -> bool {
+    matches!(
+        item,
+        TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_)
+    )
 }
 
 /// Normal terminal outcomes, distinct from backend/runtime failure.
@@ -552,13 +415,18 @@ mod producer_tests {
                 .send(failure())
                 .await
                 .unwrap_or_else(|_| panic!("session receiver dropped"));
+            let totals = ScanTotals {
+                listed: 1,
+                failed_children: 1,
+                ..ScanTotals::default()
+            };
             producer.finish(Ok(TraversalOutcome::Completed(TraversalCompletion::new(
-                0, 1, 0,
+                totals,
             ))));
         });
         assert!(matches!(
             session.next_item().await,
-            Some(TraversalItem::EntryFailure(_))
+            Some(TraversalItem::Failure(failure)) if failure.scope == FailureScope::Child
         ));
         assert!(session.next_item().await.is_none());
         assert!(matches!(
@@ -584,8 +452,8 @@ mod producer_tests {
     }
 
     fn failure() -> TraversalItem {
-        TraversalItem::EntryFailure(
-            EntryOperationFailure::new(
+        TraversalItem::Failure(Box::new(ScanFailure::child(
+            crate::model::EntryOperationFailure::new(
                 StoragePath::new("denied").unwrap_or_else(|error| panic!("{error}")),
                 crate::model::Operation::Observe,
                 crate::model::FailureClass::PermissionDenied,
@@ -593,6 +461,6 @@ mod producer_tests {
                 "denied",
             )
             .unwrap_or_else(|error| panic!("{error}")),
-        )
+        )))
     }
 }

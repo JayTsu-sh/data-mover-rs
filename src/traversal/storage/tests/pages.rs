@@ -253,7 +253,11 @@ async fn children_needing_io_cost_one_task_per_block() {
         .iter()
         .filter(|item| matches!(item, TraversalItem::Entry(_)))
         .count();
-    let blocks = usize::try_from(completion.directories_listed).unwrap_or(usize::MAX);
+    let blocks = items
+        .iter()
+        .filter(|item| matches!(item, TraversalItem::DirectoryListed(_)))
+        .count();
+    assert!(completion.totals.is_balanced(), "{:?}", completion.totals);
     assert!(
         entries > 10 * blocks,
         "{entries} entries in {blocks} blocks"
@@ -386,9 +390,9 @@ async fn an_observation_failing_in_the_listing_task_still_lists_the_directory_in
     while let Some(item) = session.next_item().await {
         match item {
             TraversalItem::Entry(entry) => entries.push(entry.path().as_str().to_owned()),
-            TraversalItem::EntryFailure(error) => failures.push(error.path().as_str().to_owned()),
+            TraversalItem::Failure(failure) => failures.push(failure.path.as_str().to_owned()),
             TraversalItem::DirectoryListed(done) => listed.push(done.path.as_str().to_owned()),
-            TraversalItem::SubtreeComplete(_) => {}
+            TraversalItem::Checkpoint(_) => {}
         }
     }
     assert!(matches!(

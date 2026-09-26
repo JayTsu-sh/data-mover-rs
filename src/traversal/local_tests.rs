@@ -10,9 +10,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    StorageTraversalSource, TraversalCompletion, TraversalItem, TraversalOrder, TraversalOutcome,
-    TraversalRequest, TraversalSession, TraversalSource, TraversalTerminalFailure,
-    TraversalVersions,
+    FailureScope, ListingOutcome, StorageTraversalSource, TraversalCompletion, TraversalItem,
+    TraversalOrder, TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
+    TraversalTerminalFailure, TraversalVersions,
 };
 #[cfg(unix)]
 use crate::model::ObservationMode;
@@ -66,12 +66,12 @@ async fn drain(session: &mut TraversalSession) -> Vec<TraversalItem> {
     items
 }
 
-/// Everything but the directory completion items, for tests that are about entry order.
+/// Everything but the directory events, for tests that are about entry order.
 async fn drain_entries(session: &mut TraversalSession) -> Vec<TraversalItem> {
     drain(session)
         .await
         .into_iter()
-        .filter(|item| !crate::traversal::is_completion(item))
+        .filter(|item| !crate::traversal::is_marker(item))
         .collect()
 }
 
@@ -87,9 +87,9 @@ fn entry_paths(items: &[TraversalItem]) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             TraversalItem::Entry(entry) => Some(entry.path().as_str().to_owned()),
-            TraversalItem::EntryFailure(_)
+            TraversalItem::Failure(_)
             | TraversalItem::DirectoryListed(_)
-            | TraversalItem::SubtreeComplete(_) => None,
+            | TraversalItem::Checkpoint(_) => None,
         })
         .collect()
 }
@@ -107,8 +107,9 @@ async fn traverses_recursively_and_returns_positive_completion() -> io::Result<(
 
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
-    assert_eq!(completion.observed_entries, 3);
-    assert_eq!(completion.entry_failures, 0);
+    assert_eq!(completion.totals.emitted, 3);
+    assert_eq!(completion.totals.failed_children, 0);
+    assert_eq!(completion.totals.listing_failures, 0);
     let mut paths = entry_paths(&items);
     paths.sort();
     // Root-relative paths carry no `./` prefix.
@@ -132,7 +133,8 @@ async fn literal_backslash_is_distinct_from_nested_path() -> io::Result<()> {
             .traverse(request(CancellationToken::new(), 2, 1));
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
-    assert_eq!(completion.entry_failures, 0);
+    assert_eq!(completion.totals.failed_children, 0);
+    assert_eq!(completion.totals.listing_failures, 0);
     let paths = entry_paths(&items);
     for name in [r"a\b", "a/b"] {
         assert!(paths.iter().any(|path| path == name), "{paths:?}");
@@ -219,7 +221,7 @@ async fn cancellation_preempts_optional_metadata_observation() -> io::Result<()>
 }
 
 #[tokio::test]
-async fn invalid_subtree_is_an_ordered_entry_failure_with_completion() -> io::Result<()> {
+async fn an_invalid_root_is_an_ordered_listing_failure_with_completion() -> io::Result<()> {
     let root = tempfile::tempdir()?;
     let mut request = request(CancellationToken::new(), 1, 1);
     request.root = StoragePath::new("../escape").map_err(io::Error::other)?;
@@ -227,29 +229,28 @@ async fn invalid_subtree_is_an_ordered_entry_failure_with_completion() -> io::Re
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
 
-    assert_eq!(completion.observed_entries, 0);
-    assert_eq!(completion.entry_failures, 1);
-    assert_eq!(completion.directories_listed, 1);
-    // The root could not be listed, so its block holds only that failure: the failure first,
-    // then the two completion items that say so. A consumer that ignores the completion items
-    // still sees the failure and cannot read this as an empty directory.
+    assert_eq!(completion.totals.emitted, 0);
+    assert_eq!(completion.totals.listed, 0);
+    assert_eq!(completion.totals.listing_failures, 1);
+    // The root could not be listed, so its block holds only that failure: the listing failure
+    // first, then the `DirectoryListed` that says so. A consumer that ignores the directory event
+    // still sees a listing failure and cannot read this as an empty directory.
     let [
-        TraversalItem::EntryFailure(error),
+        TraversalItem::Failure(failure),
         TraversalItem::DirectoryListed(listed),
-        TraversalItem::SubtreeComplete(complete),
     ] = items.as_slice()
     else {
         panic!("unexpected item sequence: {items:?}")
     };
-    assert_eq!(error.operation(), Operation::Traverse);
-    assert_eq!(listed.listing, crate::traversal::DirectoryListing::Failed);
-    assert_eq!(complete.summary.failed_listings, 1);
-    assert!(!complete.summary.is_exhaustive());
+    assert_eq!(failure.scope, FailureScope::Listing);
+    assert_eq!(failure.path, listed.path);
+    assert_eq!(failure.failure.operation(), Operation::Traverse);
+    assert_eq!(listed.outcome, ListingOutcome::Unreadable);
     Ok(())
 }
 
 #[tokio::test]
-async fn a_real_subtree_reports_an_exhaustive_summary() -> io::Result<()> {
+async fn a_real_tree_is_counted_exactly() -> io::Result<()> {
     let root = tempfile::tempdir()?;
     std::fs::create_dir(root.path().join("sub"))?;
     std::fs::write(root.path().join("top.txt"), b"value")?;
@@ -262,24 +263,35 @@ async fn a_real_subtree_reports_an_exhaustive_summary() -> io::Result<()> {
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
 
-    let Some(TraversalItem::SubtreeComplete(complete)) = items.last() else {
-        panic!("a completed traversal ends with the root's subtree item: {items:?}")
+    let listed: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            TraversalItem::DirectoryListed(listed) => Some(listed),
+            _ => None,
+        })
+        .collect();
+    let [root_block, sub_block] = listed.as_slice() else {
+        panic!("two directories were listed: {items:?}")
     };
-    assert_eq!(complete.path, StoragePath::root());
-    assert_eq!(complete.summary.directories_listed, 2);
-    assert_eq!(complete.summary.observed_entries, 3);
-    assert!(
-        complete.summary.is_exhaustive(),
-        "nothing was filtered, pruned, truncated or failed: {:?}",
-        complete.summary
-    );
+    assert_eq!(root_block.path, StoragePath::root());
+    assert_eq!(sub_block.path.as_str(), "sub");
+    for block in [root_block, sub_block] {
+        assert_eq!(block.outcome, ListingOutcome::Complete);
+        assert!(block.counts.is_balanced(), "{block:?}");
+    }
+    assert_eq!((root_block.counts.listed, sub_block.counts.listed), (2, 1));
+    let totals = completion.totals;
+    assert!(totals.is_balanced(), "{totals:?}");
+    assert_eq!((totals.listed, totals.emitted), (3, 3));
+    assert_eq!((totals.files, totals.directories), (2, 1));
+    assert_eq!(totals.bytes, 10);
     assert_eq!(
-        completion.directories_listed,
-        complete.summary.directories_listed
-    );
-    assert_eq!(
-        completion.observed_entries,
-        complete.summary.observed_entries
+        (
+            totals.filtered,
+            totals.failed_children,
+            totals.listing_failures
+        ),
+        (0, 0, 0)
     );
     Ok(())
 }
@@ -308,19 +320,28 @@ async fn directory_read_failure_is_ordered_and_siblings_continue() -> io::Result
         .ok_or_else(|| io::Error::other("failure probe was not exercised"))?;
     let failure_index = items
         .iter()
-        .position(|item| matches!(item, TraversalItem::EntryFailure(error) if error.path() == &failed_path))
-        .ok_or_else(|| io::Error::other("missing injected entry failure"))?;
+        .position(
+            |item| matches!(item, TraversalItem::Failure(failure) if failure.path == failed_path),
+        )
+        .ok_or_else(|| io::Error::other("missing injected listing failure"))?;
 
-    assert_eq!(completion.entry_failures, 1);
-    assert_eq!(completion.observed_entries, 3);
+    assert_eq!(completion.totals.listing_failures, 1);
+    assert_eq!(completion.totals.failed_children, 0);
+    assert_eq!(completion.totals.emitted, 3);
     // The sibling's subtree is still traversed. Where it lands relative to the failure depends
     // on the order the filesystem returns `a` and `b` in, so only its presence is asserted.
     assert!(entry_paths(&items).iter().any(|path| path == "b/child"));
     assert!(matches!(
         &items[failure_index],
-        TraversalItem::EntryFailure(error)
-            if error.operation() == Operation::Traverse
-                && error.class() == FailureClass::PermissionDenied
+        TraversalItem::Failure(failure)
+            if failure.scope == FailureScope::Listing
+                && failure.failure.operation() == Operation::Traverse
+                && failure.failure.class() == FailureClass::PermissionDenied
+    ));
+    assert!(matches!(
+        items.get(failure_index + 1),
+        Some(TraversalItem::DirectoryListed(listed))
+            if listed.path == failed_path && listed.outcome == ListingOutcome::Unreadable
     ));
     Ok(())
 }
@@ -360,7 +381,7 @@ async fn out_of_order_completion_is_reordered_and_backpressured() -> io::Result<
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
     let (started, finished) = fixture.adapter.probe_orders();
-    assert_eq!(completion.observed_entries, 12);
+    assert_eq!(completion.totals.emitted, 12);
     assert_eq!(entry_paths(&items), started);
     assert_ne!(finished, started);
     Ok(())
@@ -384,14 +405,15 @@ async fn non_utf8_entry_failures_keep_distinct_lossless_identities() -> io::Resu
     let failures = items
         .iter()
         .filter_map(|item| match item {
-            TraversalItem::EntryFailure(error) => Some(error),
-            TraversalItem::Entry(_)
-            | TraversalItem::DirectoryListed(_)
-            | TraversalItem::SubtreeComplete(_) => None,
+            TraversalItem::Failure(failure) if failure.scope == FailureScope::Child => {
+                Some(&failure.failure)
+            }
+            _ => None,
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(completion.entry_failures, 2);
+    assert_eq!(completion.totals.failed_children, 2);
+    assert_eq!(completion.totals.listed, 2);
     assert_eq!(failures.len(), 2);
     assert_ne!(failures[0].path(), failures[1].path());
     assert!(
@@ -427,8 +449,11 @@ async fn traversal_omits_reserved_local_transfer_artifacts() -> io::Result<()> {
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
     assert_eq!(entry_paths(&items), ["dir", "dir/final.bin"]);
-    assert_eq!(completion.observed_entries, 2);
-    assert_eq!(completion.entry_failures, 0);
+    assert_eq!(completion.totals.emitted, 2);
+    assert_eq!(completion.totals.failed_children, 0);
+    // Hidden, and counted as hidden rather than as children.
+    assert_eq!(completion.totals.internal_hidden, 3);
+    assert_eq!(completion.totals.listed, 2);
     Ok(())
 }
 
@@ -520,7 +545,7 @@ async fn an_ownership_plan_costs_no_observation_per_entry() -> io::Result<()> {
     let mut session = fixture.source.traverse(request);
     let items = drain(&mut session).await;
     let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
-    assert_eq!(completion.observed_entries, 4);
+    assert_eq!(completion.totals.emitted, 4);
     for item in &items {
         if let TraversalItem::Entry(entry) = item {
             assert!(

@@ -188,14 +188,21 @@ async fn immediate_filter_prunes_without_observing_and_hides_directories() {
     );
     let (paths, outcome) = collect(source.traverse(request)).await;
     assert_eq!(paths, ["top", "keep/a", "keep/b", "keep/b/c"]);
+    let totals = crate::traversal::ScanTotals {
+        // `top`, `keep`, `drop`; `keep/a`, `keep/b`; `keep/b/c`: `drop` is never listed.
+        listed: 6,
+        emitted: 4,
+        // `keep` (hidden, descended) and `drop` (hidden, pruned).
+        filtered: 2,
+        pruned_dirs: 1,
+        files: 3,
+        directories: 1,
+        bytes: 9,
+        ..crate::traversal::ScanTotals::default()
+    };
     assert_eq!(
         outcome,
-        TraversalOutcome::Completed(TraversalCompletion {
-            observed_entries: 4,
-            entry_failures: 0,
-            // One per listed directory, which is exactly what the namespace was asked for.
-            directories_listed: 3,
-        })
+        TraversalOutcome::Completed(TraversalCompletion::new(totals))
     );
     assert_eq!(
         namespace.listed(),
@@ -308,7 +315,7 @@ async fn inline_timestamps_replace_the_metadata_round_trip() {
     let mut session = source.traverse(request(tokio_util::sync::CancellationToken::new()));
     let mut modified = Vec::new();
     while let Some(item) = session.next_item().await {
-        if crate::traversal::is_completion(&item) {
+        if crate::traversal::is_marker(&item) {
             continue;
         }
         let TraversalItem::Entry(entry) = item else {
@@ -423,25 +430,40 @@ async fn a_deferred_observation_failure_still_lists_the_directory() {
         },
         None,
     );
-    let mut session = source.traverse(request);
+    let (items, outcome) = super::events::drain(source.traverse(request)).await;
+    // An entry failure is not terminal, and every block still balances.
+    super::events::assert_well_formed(&items, &outcome);
     let mut emitted = Vec::new();
     let mut failed = Vec::new();
-    while let Some(item) = session.next_item().await {
+    for item in &items {
         match item {
             TraversalItem::Entry(entry) => emitted.push(entry.path().as_str().to_owned()),
-            TraversalItem::EntryFailure(error) => failed.push(error.path().as_str().to_owned()),
-            TraversalItem::DirectoryListed(_) | TraversalItem::SubtreeComplete(_) => {}
+            TraversalItem::Failure(failure) => failed.push((failure.scope, failure.path.as_str())),
+            TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_) => {}
         }
     }
-    assert_eq!(failed, ["keep"]);
+    // The directory's own observation failed: that is its failure as a child, not its listing's.
+    assert_eq!(failed, [(crate::traversal::FailureScope::Child, "keep")]);
     assert!(
         emitted.contains(&"keep/a".to_owned()) && emitted.contains(&"keep/b/c".to_owned()),
         "the subtree below the failed directory is still enumerated: {emitted:?}"
     );
-    assert!(
-        session.finish().await.is_ok(),
-        "an entry failure is not terminal"
+    let TraversalOutcome::Completed(completion) = outcome else {
+        panic!("{outcome:?}")
+    };
+    let totals = completion.totals;
+    // `keep` counts as failed, not as filtered and not as pruned, although it was never decided;
+    // `drop` is the one filtered and pruned child.
+    assert_eq!(
+        (
+            totals.listed,
+            totals.emitted,
+            totals.filtered,
+            totals.failed_children
+        ),
+        (6, 4, 1, 1)
     );
+    assert_eq!((totals.pruned_dirs, totals.listing_failures), (1, 0));
 }
 
 #[tokio::test]

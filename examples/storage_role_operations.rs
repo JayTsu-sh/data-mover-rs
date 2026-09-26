@@ -42,8 +42,8 @@ use data_mover::storage::{
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
-    StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest, TraversalSource as _,
-    TraversalVersions,
+    BlockCounts, ScanTotals, StorageTraversalSource, TraversalItem, TraversalOrder,
+    TraversalOutcome, TraversalRequest, TraversalSource as _, TraversalVersions,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -252,7 +252,6 @@ async fn connect(backend: Backend, root: &str, depth: usize) -> Result<Storage, 
 
 async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(), Error> {
     let Command::Traverse {
-        path,
         quiet,
         snapshot_bytes,
         identity,
@@ -295,15 +294,32 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
                     );
                 }
             }
-            TraversalItem::EntryFailure(error) => {
+            TraversalItem::Failure(failure) => {
                 failures += 1;
-                eprintln!("entry failure {} {:?}", error.path(), error.class());
+                eprintln!(
+                    "failure scope={:?} {} {:?}",
+                    failure.scope,
+                    failure.path,
+                    failure.failure.class()
+                );
             }
-            _ => print_completion(&item, *quiet, path),
+            TraversalItem::DirectoryListed(listed) if !*quiet => {
+                println!(
+                    "listed {} {:?} {}",
+                    listed.path,
+                    listed.outcome,
+                    block_counts(&listed.counts)
+                );
+            }
+            // `TraversalItem` is `#[non_exhaustive]`: a later item kind must not break this.
+            _ => {}
         }
     }
     let outcome = session.finish().await?;
     println!("entries={entries} failures={failures} outcome={outcome:?}");
+    if let TraversalOutcome::Completed(completion) = &outcome {
+        println!("{}", totals(&completion.totals));
+    }
     if *snapshot_bytes {
         println!(
             "snapshot_bytes={snapshots} endpoint_bytes={}",
@@ -351,30 +367,51 @@ fn traversal_request(args: &Args, command: &Command) -> Result<TraversalRequest,
     })
 }
 
-/// Prints a directory's completion items; with `quiet`, only the traversal root's subtree.
-fn print_completion(item: &TraversalItem, quiet: bool, root: &str) {
-    match item {
-        TraversalItem::DirectoryListed(listed) if !quiet => {
-            println!(
-                "listed {} {:?} order={:?} pruned={} truncated={}",
-                listed.path,
-                listed.listing,
-                listed.child_order,
-                listed.pruned_children,
-                listed.truncated_children
-            );
-        }
-        TraversalItem::SubtreeComplete(complete) if !quiet || complete.path.as_str() == root => {
-            println!(
-                "subtree {} exhaustive={} {:?}",
-                complete.path,
-                complete.summary.is_exhaustive(),
-                complete.summary
-            );
-        }
-        // `TraversalItem` is `#[non_exhaustive]`: a later item kind must not break this.
-        _ => {}
-    }
+/// One directory's counts as `key=value` pairs, for scripts to parse.
+fn block_counts(counts: &BlockCounts) -> String {
+    format!(
+        "balanced={} listed={} emitted={} filtered={} failed={} vanished={} hidden={} pruned={} \
+         truncated={} bytes={} files={} dirs={} symlinks={} other={}",
+        counts.is_balanced(),
+        counts.listed,
+        counts.emitted,
+        counts.filtered,
+        counts.failed_children,
+        counts.vanished,
+        counts.internal_hidden,
+        counts.pruned_dirs,
+        counts.truncated_dirs,
+        counts.bytes,
+        counts.files,
+        counts.directories,
+        counts.symlinks,
+        counts.other
+    )
+}
+
+/// The whole traversal's counts as `totals key=value …`, for scripts to parse.
+fn totals(totals: &ScanTotals) -> String {
+    format!(
+        "totals balanced={} listed={} emitted={} filtered={} failed={} vanished={} hidden={} \
+         listing_failures={} interrupted={} pruned={} truncated={} bytes={} files={} dirs={} \
+         symlinks={} other={}",
+        totals.is_balanced(),
+        totals.listed,
+        totals.emitted,
+        totals.filtered,
+        totals.failed_children,
+        totals.vanished,
+        totals.internal_hidden,
+        totals.listing_failures,
+        totals.interrupted_listings,
+        totals.pruned_dirs,
+        totals.truncated_dirs,
+        totals.bytes,
+        totals.files,
+        totals.directories,
+        totals.symlinks,
+        totals.other
+    )
 }
 
 /// ` version=<id|null> latest=<0|1> marker=<0|1> size=<n|->` for an entry of a traversal of

@@ -13,7 +13,7 @@ use data_mover::storage::{
     Storage, connect_backend, create_directory_all, delete_tree,
 };
 use data_mover::traversal::{
-    ChildOrder, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome,
+    ListingOutcome, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome,
     TraversalRequest, TraversalSource, TraversalVersions,
 };
 use tokio_util::sync::CancellationToken;
@@ -91,8 +91,8 @@ async fn traversal_lists_the_whole_tree_through_the_namespace_role() -> Result {
     while let Some(item) = session.next_item().await {
         match item {
             TraversalItem::Entry(entry) => paths.push(entry.path().as_str().to_owned()),
-            // Directory completion items are ordering evidence, not entries.
-            TraversalItem::DirectoryListed(_) | TraversalItem::SubtreeComplete(_) => {}
+            // Directory events are ordering evidence, not entries.
+            TraversalItem::DirectoryListed(_) => {}
             other => return Err(format!("unexpected failure item: {other:?}").into()),
         }
     }
@@ -109,7 +109,11 @@ async fn traversal_lists_the_whole_tree_through_the_namespace_role() -> Result {
     );
     assert!(matches!(
         session.finish().await?,
-        TraversalOutcome::Completed(completion) if completion.entry_failures == 0
+        TraversalOutcome::Completed(completion)
+            if completion.totals.failed_children == 0
+                && completion.totals.listing_failures == 0
+                && completion.totals.emitted == 5
+                && completion.totals.is_balanced()
     ));
     Ok(())
 }
@@ -243,7 +247,7 @@ async fn directories_are_listed_as_directories_not_files() -> Result {
 }
 
 /// The ordered contract as a caller outside the crate sees it: the sequence is asserted without
-/// sorting it first, and `ChildOrder` has to be nameable from here at all.
+/// sorting it first, and each directory's event has to be readable from here at all.
 ///
 /// The three claims this pins, all on one tree:
 ///
@@ -278,14 +282,14 @@ async fn name_bytes_order_is_the_same_sequence_for_a_caller_outside_the_crate() 
             TraversalItem::Entry(entry) => paths.push(entry.path().as_str().to_owned()),
             TraversalItem::DirectoryListed(directory) => {
                 assert_eq!(
-                    directory.child_order,
-                    ChildOrder::NameBytes,
+                    directory.outcome,
+                    ListingOutcome::Complete,
                     "{}",
                     directory.path
                 );
+                assert!(directory.counts.is_balanced(), "{directory:?}");
                 listed.push(directory.path.as_str().to_owned());
             }
-            TraversalItem::SubtreeComplete(_) => {}
             other => return Err(format!("unexpected failure item: {other:?}").into()),
         }
     }

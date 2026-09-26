@@ -154,6 +154,8 @@ checks = {
     "no d/ marker": (sum(re.search(r" d/( |$)", l) is not None for f in (all_, cur) for l in open(f)), 0),
     "sub/deep/f": (len(rows(all_, "sub/deep/f")) + len(rows(cur, "sub/deep/f")), 2),
     "listed dirs": (sum(l.startswith("listed ") for l in open(all_)), 5),
+    "listings complete": (sum(l.startswith("listed ") and " Complete balanced=true " in l for l in open(all_)), 5),
+    "totals balanced": (sum(l.startswith("totals balanced=true ") for f in (all_, cur) for l in open(f)), 2),
     "completed": (sum("outcome=Completed" in l for f in (all_, cur) for l in open(f)), 2),
 }
 bad = 0

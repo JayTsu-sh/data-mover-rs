@@ -187,7 +187,8 @@ smb-rs 的 Display 只含 NTSTATUS / 传输原因 / UNC 路径，不含凭据。
 ### 列举：整个目录失败 vs 单个子项失败（role-based `Namespace` 的 `List`）
 
 契约：只有**关乎目录本身**的错误让整个列举失败；某个子项描述不出来时报成该子项的条目失败，兄弟照常交付，
-backend 把它放进 `ListingPage::failures`（`ChildFailure`），遍历把它报成 `EntryFailure` + 块 `Partial`。
+backend 把它放进 `ListingPage::failures`（`ChildFailure`），遍历把它报成 `Failure{scope: Child}`，计入块的 `counts.failed_children`，
+目录的 `outcome` 仍是 `Complete`（P7 C2）；整个列举失败才是 `Failure{scope: Listing}` + `outcome: Unreadable`。
 Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修复。S3 对拼不出的名字（空段、`.` / `..`）
 同样逐项报，但单个对象的 size 缺失 / 为负、key 越出前缀仍是**会话**失败（`src/s3/role_protocol/listing.rs`、
 `src/storage/backends/s3/listing.rs` 的 `place`），属同类问题，待修。

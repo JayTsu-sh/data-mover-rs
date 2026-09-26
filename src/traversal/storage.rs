@@ -7,9 +7,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use super::{
-    ChildOrder, TraversalCandidate, TraversalCompletion, TraversalDecision, TraversalFilter,
-    TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest, TraversalSession,
-    TraversalSource, TraversalTerminalFailure, TraversalVersions, relative_to,
+    ScanFailure, TraversalCandidate, TraversalCompletion, TraversalDecision, TraversalFilter,
+    TraversalItem, TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
+    TraversalTerminalFailure, TraversalVersions, relative_to,
 };
 use crate::model::{
     BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, ObservationMode,
@@ -298,17 +298,11 @@ async fn run(
     probe: Probe,
 ) {
     let mut state = State::new();
-    let mut cursor = Cursor::new(
-        DirectoryWork {
-            path: request.root.clone(),
-            child_depth: 1,
-            filter_children: request.filter.is_some(),
-        },
-        match request.order {
-            TraversalOrder::Admission => ChildOrder::Listing,
-            TraversalOrder::NameBytes => ChildOrder::NameBytes,
-        },
-    );
+    let mut cursor = Cursor::new(DirectoryWork {
+        path: request.root.clone(),
+        child_depth: 1,
+        filter_children: request.filter.is_some(),
+    });
     let mut observations = Observations::new();
     let mut listings = JoinSet::new();
     let shared = Arc::new(Shared {
@@ -349,13 +343,8 @@ async fn run(
     let terminal = if request.cancel.is_cancelled() {
         Ok(TraversalOutcome::Cancelled)
     } else {
-        result.map(|()| {
-            TraversalOutcome::Completed(TraversalCompletion {
-                observed_entries: state.output.observed(),
-                entry_failures: state.output.failed(),
-                directories_listed: state.output.listed(),
-            })
-        })
+        result
+            .map(|()| TraversalOutcome::Completed(TraversalCompletion::new(state.output.totals())))
     };
     let _ = completion.send(terminal);
 }
@@ -595,7 +584,10 @@ fn settle_failure(
             child_depth: deferred.depth.saturating_add(1),
             filter_children: true,
         });
-    (Some(TraversalItem::EntryFailure(error)), descend)
+    (
+        Some(TraversalItem::Failure(Box::new(ScanFailure::child(error)))),
+        descend,
+    )
 }
 
 /// What the filter sees of an observed child: the same candidate whether the decision is made in
@@ -633,15 +625,14 @@ fn settle_entry(
     )
 }
 
-fn queue_failure(
-    state: &mut State,
-    error: EntryOperationFailure,
-) -> Result<(), TraversalTerminalFailure> {
+/// Queues a failure the listing itself produced: a child it could not describe, or the
+/// directory's own listing failure.
+fn queue_failure(state: &mut State, failure: ScanFailure) -> Result<(), TraversalTerminalFailure> {
     let sequence = state.allocate()?;
     state.output.settle(
         sequence,
         Settled::Child {
-            item: Some(TraversalItem::EntryFailure(error)),
+            item: Some(TraversalItem::Failure(Box::new(failure))),
             descent: None,
         },
     );
@@ -658,13 +649,6 @@ fn queue_block_end(
     state
         .output
         .settle(sequence, Settled::BlockEnd { path, facts });
-    Ok(())
-}
-
-/// Queues the marker that closes one directory's whole subtree.
-fn queue_subtree_end(state: &mut State, path: StoragePath) -> Result<(), TraversalTerminalFailure> {
-    let sequence = state.allocate()?;
-    state.output.settle(sequence, Settled::SubtreeEnd { path });
     Ok(())
 }
 

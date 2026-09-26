@@ -48,13 +48,14 @@
 
 | `(emit, descend)` | 遍历输出 |
 |---|---|
-| `(false, true)` 隐藏但下钻 | 没有自己的 `Entry`，但有 `DirectoryListed` + `SubtreeComplete`；父目录的 listing 报 `Filtered` |
-| `(true, false)` 发出但不下钻 | 有 `Entry`，没有完成事件；只进父目录的 `DirectoryListed.pruned_children`，**不算** `Filtered` |
-| `(false, false)` 两者皆无 | 既无 `Entry` 也无完成事件；父目录同时报 `Filtered` 和 `pruned_children` |
+| `(false, true)` 隐藏但下钻 | 没有自己的 `Entry`，但有自己的 `DirectoryListed`；父目录块的 `counts.filtered` 加一 |
+| `(true, false)` 发出但不下钻 | 有 `Entry`，没有 `DirectoryListed`；只进父目录块的 `counts.pruned_dirs`，**不算** `filtered` |
+| `(false, false)` 两者皆无 | 既无 `Entry` 也无 `DirectoryListed`；父目录块同时计 `filtered` 和 `pruned_dirs` |
 
-所以 `Filtered` 只意味着"有子项没被输出"，与"有子树没被下钻"是两件事，别把它们合起来读 ——
-下游判断"能不能安全删除目的端多余条目"看的是 `SubtreeSummary::is_exhaustive()`，它要求隐藏、
-剪枝、截断、失败四者全为零。
+所以 `filtered` 只意味着"有子项没被输出"，与"有子树没被下钻"是两件事，别把它们合起来读
+(P7 C2 起计数见 `src/traversal/counts.rs`，`listed == emitted + filtered + failed_children + vanished`)。
+下游判断"能不能安全删除目的端多余条目"按 `ScanFailure` 文档上的删除安全规则 (P7 §4.1)：有 filter
+或 `max_depth` 时，旧代条目用同一个 filter / 深度判定，被排除或截断的不参与删除。
 
 `FilterInput` 各字段的取值口径（与 legacy walkdir 对齐）：
 
