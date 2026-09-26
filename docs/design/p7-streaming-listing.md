@@ -618,7 +618,7 @@ struct VersionRecord {
 | 一项的观察可能要做很多次 I/O（每个版本单独读 tags / 元数据） | 只在观察计划要求时才做；每条记录的观察结果与失败各自独立，一条失败不让整项失败；一项内的 I/O 受同一个并发窗口约束 |
 | 拷贝 | 消费方按 `records` 顺序逐条处理：对象版本用 `record.source`（`SourceVersion::Id`，最新的 `"null"` 为 `Current`）交给 `TransferRequest::with_source_version`；删除标记用 `transfer::write_delete_marker`（H1，只在 `Enabled` 的目标桶上；未开 / 暂停版本的目标只拷最新状态并记原因“目的桶未开版本，历史未重建”，D12）。一个 key 严格串行，重放不去重（D11）；参考 `examples/s3_history_replay.rs` |
 | 身份与改名识别 | 项的 `source_identity` 是 key 级的 `PathScoped`；每条记录另有自己的 `VersionScoped` 身份，拷贝前按记录核对 |
-| 快照 | **用户 2026-09-27 定：条目快照不考虑版本兼容**。C11b 只保留一种当前格式（版本字节升为 7，带历史的条目带完整 ObjectHistory 段，不带历史的条目同一格式），删除 v4 / v5 / v6 的编码与解码分支；旧快照解码报 `UnsupportedVersion`，调用方按首次扫描处理 |
+| 快照 | **用户 2026-09-27 定：条目快照不考虑版本兼容**。C11b 只保留一种当前格式（版本字节升为 7，带历史的条目带完整 ObjectHistory 段，不带历史的条目同一格式），删除 v4 / v5 / v6 的编码与解码分支；旧快照解码报 `UnsupportedVersion`，调用方按首次扫描处理。守则：① 保留 `DMES` 魔数与版本字节；② **格式任何变化都把版本字节加 1**（哪怕只加一个字段），并有 golden 字节测试（当前格式的编码与存下的字节不符即失败），防止同一版本号下新旧字节混存而被静默读错；③ 这是开发期规则，正式发布前重新决定（至少解码 N-1，或给 terrasync 迁移 / 重扫说明），写进 ADR-0008。目的端恢复指针 / binding 格式（ADR-0006）不在此列：它们关系在途传输能否续传，开发期也可以不兼容，但每次变更的 commit 要写明“升级前排空在途传输” |
 | 计数 | `listed` / `emitted` 按 key 计；另加 `versions`（对象版本数）与 `delete_markers`；`bytes` 分为“当前版本字节”和“全部版本字节” |
 | terrasync 落库 | 把一项展开成每版本一行，沿用今天 base 表的排序键 `(relative_path, version_id, identity_key)`（`clickhouse.rs:569`）与去重（Q27 已定） |
 
