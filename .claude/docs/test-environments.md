@@ -23,12 +23,12 @@
 | S3 | ONTAP S3 **NAS 桶** | S3（平铺列举**无序**） | WSL | 桶 `data-mover-nas` | `e2e-s3/ontap/.env` + `S3_BUCKET=data-mover-nas` |
 | S3 | RustFS 1.0.0（VM 105） | S3 | WSL（管理网 9001） | 桶 `data-mover-test`；临时 `data-mover-*` 桶 | `e2e-s3/rustfs/.env` |
 | S3 | DXN-1（Ceph RGW Octopus） | S3 | WSL | 桶 `data-mover-test`（**永不开版本**）；临时桶（长期批准） | `e2e-s3/dxn/.env` + `S3_LOCATION=magnascale:tos_placement` |
-| S3 | StorageGRID 11.5.0 | S3（明文 HTTP） | WSL | 仅 `storage-bucket1` 的 `data-mover-test/` 前缀；**建桶需逐次批准** | `e2e-s3/storagegrid/.env`（`s3+sg://`） |
+| S3 | StorageGRID 11.5.0（独立租户 `data-mover-test`） | S3（明文 HTTP） | WSL | 桶 `data-mover-test`（无版本）、`data-mover-test-ver`（开版本）；租户内临时 `data-mover-*` 桶（用完删光） | `e2e-s3/storagegrid/.env`（`s3+sg://`，URL 参数化后 `?compat=sg`） |
 | HDFS | Kerberos 集群（NameNode VM 301） | HDFS | **runner VM 102（逐次批准）** | 运行根 `/tmp/data-mover-nightly/<run>/` | `LAB_HDFS_*`（`tests/lab/README.md`） |
 | 性能 | node1 + m1-source 53M 树 | NFSv3 | node1 | 只读遍历 | 见 §4 |
 | Local | WSL 本机 | — | WSL | 临时目录 | `make ci` / e2e-local |
 
-**多版本 / 非多版本**：S3 的 ONTAP、RustFS、DXN 都要在两种桶上各验证一遍（用户 2026-09-26）：ONTAP 用 `data-mover-test-ver` /
+**多版本 / 非多版本**：S3 的 ONTAP、RustFS、DXN、StorageGRID 都要在两种桶上各验证一遍（用户 2026-09-26）：ONTAP 用 `data-mover-test-ver` /
 `data-mover-test`；RustFS、DXN 用 `data-mover-test` + 临时版本桶。NAS 桶不支持版本。
 
 ## 2. 按环境
@@ -108,9 +108,13 @@
 
 ### 2.5 StorageGRID 11.5.0
 
-- `http://10.131.7.236:10443`（端口像 HTTPS，实为明文 HTTP），`s3+sg://`，`e2e-s3/storagegrid/.env`。桶都是别人的；
-  **只允许写 `storage-bucket1` 的 `data-mover-test/` 前缀**，建临时桶要逐次批准。ListMultipartUploads 带前缀可用。
+- S3 `http://10.131.7.236:10443`（端口像 HTTPS，实为明文 HTTP），`e2e-s3/storagegrid/.env`；管理（Grid Manager API v3）`https://10.131.7.236`（root，凭据在 lab 文件）。
+- **我们的独立租户 `data-mover-test`**（2026-09-26 用户批准建，account id 76970436579964471308，配额 100 GB，S3 能力；租户 root 凭据在 lab 文件，
+  S3 密钥只在 `.env`）：桶 `data-mover-test`（无版本）、`data-mover-test-ver`（开版本）；租户内可建临时 `data-mover-*` 桶，用完删光。
+  其他 7 个租户（xuyh、shenxm、zy1、c1、ccma、zhangpeng、shenxm1）与旧 `storage-bucket1` 都是别人的，不碰。
+- 已知：**CreateBucket 必须带 `Content-Length: 0`**（否则 411）；ListMultipartUploads 带前缀可用；最新已是删除标记时再 DELETE 每次新建标记（不合并）；
   版本顺序实测（原始 XML 交错、同毫秒并列）见 P7 设计 §10.2.1。
+- 撤销：清空并删除两个桶（及残留临时桶）→ Grid Manager 删除租户 `data-mover-test`。
 
 ## 3. 跑测试的机器
 

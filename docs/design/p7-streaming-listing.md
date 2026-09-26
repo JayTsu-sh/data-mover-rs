@@ -900,7 +900,7 @@ VERIFY
   只能在 10.131.9.10 上以 root、特权端口跑，二进制从 WSL 拷过去；不改 lizy 设置；注意 v3 遍历 5400 条、v4.x 5399 条，C7 查清）+ **DXN-2（10.128.136.211）`/nfv3_v4` 下的 `data-mover-test/`，NFSv3 与 NFSv4.0 各一遍**
   （`e2e-nfs/dxn-v3/.env`、`dxn-v40/.env`，只写该子目录）；m1 NFSv3 用于大树 / node1 性能。每个动 NFS 的步骤（C7、C10、C11、收尾清理）都要过
 - **S3 真机（用户 2026-09-26 定：本次重构的 S3 实际测试环境）**，每个动 S3 的步骤（C6、F4、C10、C11、C11b、收尾清理）都要在下列每一套上过；
-  **ONTAP、RustFS、DXN 都要在多版本桶与非多版本桶上各验证一遍**（ONTAP：data-mover-test-ver / data-mover-test，另加 NAS 桶；RustFS、DXN：data-mover-test + 临时版本桶）：
+  **ONTAP、RustFS、DXN、StorageGRID 都要在多版本桶与非多版本桶上各验证一遍**（ONTAP：data-mover-test-ver / data-mover-test，另加 NAS 桶；RustFS、DXN：data-mover-test + 临时版本桶）：
   - MinIO（10.131.9.11:9000，`.claude/skills/e2e-s3/.env`，桶 data-mover-test + 临时版本桶）：100 万对象平铺前缀的首项延迟与 RSS；版本化桶（traversal_versions.sh）
   - ONTAP S3（FAS2750 ONTAP 9.19.1，SVM lizy，http://10.128.61.200:80，`ontap/.env`）：对象桶 data-mover-test / data-mover-test-ver，
     卷开后台重删 + 压缩；我们的用户不建桶 → 脚本用已有桶、跑完清空对象（不删桶）。已知：列举字节序；带 delimiter 的 ListObjectVersions
@@ -910,7 +910,7 @@ VERIFY
     ListObjectVersions 按“先 marker 组后 version 组”输出（现存问题 11，历史标 Inferred）；条件 PUT 支持（412）；ListMultipartUploads 支持前缀
   - DXN（Ceph RGW Octopus，`dxn/.env`）：用户 2026-09-26 长期批准建临时桶（`BUCKET_PREFIX=data-mover-dxn`、`S3_LOCATION=magnascale:tos_placement`，用完删光，用户上限 5 个桶）；
     已知差异见 `.claude/docs/storage-s3.md`「DXN」（UploadPartCopy 要 Content-Length: 0、CopyObject 不回版本、3 个网关各自打时间戳）
-  - StorageGRID 仍只在用户单独批准时用
+  - StorageGRID 11.5.0（独立租户 `data-mover-test`，用户 2026-09-26 批准并给出管理凭据）：桶 `data-mover-test` / `data-mover-test-ver`，租户内可建临时桶；CreateBucket 要 `Content-Length: 0`
 - 无序 S3：ONTAP NAS 桶（上面）+ 内存 fake 的打乱模式（Q22）
 - HDFS 真机（10.131.9.11 runner）每次需要用户批准（C8 已于 2026-09-26 批准并通过）
 ```
