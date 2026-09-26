@@ -10,4 +10,6 @@ include!("hdfs/namespace.rs");
 include!("hdfs/io.rs");
 include!("hdfs/support.rs");
 include!("hdfs/role_protocol.rs");
+include!("hdfs/listing.rs");
 include!("hdfs/tests.rs");
+include!("hdfs/listing_tests.rs");

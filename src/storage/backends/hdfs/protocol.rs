@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -26,6 +27,40 @@ pub(crate) struct HdfsEntryFacts {
 
 /// One child of a listing: its facts, or why it could not be described.
 pub(crate) type HdfsListedChild = Result<HdfsEntryFacts, EntryOperationFailure>;
+
+/// One listing of a directory's immediate children, read page by page (P7 C8).
+///
+/// An HDFS listing is stateless on the name node (each batch continues after the last name
+/// returned), so dropping it, even with a page request in flight, leaves nothing open.
+#[async_trait]
+pub(crate) trait HdfsListing: Send {
+    /// The next children in listing order, at most `max`, each described or the entry-scoped
+    /// reason it could not be; `Ok(None)` once the directory has been listed to its end. A
+    /// failure concerns the whole listing and ends it.
+    async fn next_page(
+        &mut self,
+        max: NonZeroUsize,
+    ) -> Result<Option<Vec<HdfsListedChild>>, StorageRoleFailure>;
+}
+
+/// A listing that fails its first page with a failure known before any request.
+pub(crate) struct FailedHdfsListing(Option<StorageRoleFailure>);
+
+impl FailedHdfsListing {
+    pub(crate) const fn new(failure: StorageRoleFailure) -> Self {
+        Self(Some(failure))
+    }
+}
+
+#[async_trait]
+impl HdfsListing for FailedHdfsListing {
+    async fn next_page(
+        &mut self,
+        _max: NonZeroUsize,
+    ) -> Result<Option<Vec<HdfsListedChild>>, StorageRoleFailure> {
+        self.0.take().map_or(Ok(None), Err)
+    }
+}
 
 #[async_trait]
 pub(crate) trait HdfsReadCursor: Send + Sync {
@@ -58,9 +93,10 @@ pub(crate) trait HdfsProtocol: Send + Sync {
         Ok(None)
     }
     async fn stat(&self, path: &StoragePath) -> Result<HdfsEntryFacts, StorageRoleFailure>;
-    /// The immediate children of `path`, each described or the entry-scoped reason it could not
-    /// be; a failure of the directory itself fails the whole call.
-    async fn list(&self, path: &StoragePath) -> Result<Vec<HdfsListedChild>, StorageRoleFailure>;
+    /// Starts a listing of `path`'s immediate children. Nothing is asked of the name node before
+    /// its first page; a failure of the directory itself (missing, not a directory, the listing
+    /// request) is the listing's failure.
+    async fn open_listing(&self, path: &StoragePath) -> Box<dyn HdfsListing>;
     async fn read_range(
         &self,
         path: &StoragePath,

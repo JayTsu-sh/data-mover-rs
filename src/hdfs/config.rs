@@ -93,10 +93,7 @@ where
         };
         let result = match result {
             Ok(result) => result,
-            Err(_) => Err(hdfs_native::HdfsError::IOError(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "HDFS adapter attempt deadline exceeded",
-            ))),
+            Err(_) => Err(adapter_deadline_error()),
         };
         match result {
             Ok(value) => return Ok(value),
@@ -125,6 +122,15 @@ where
         }
     }
     unreachable!("HDFS adapter retry loop always returns")
+}
+
+/// The failure of one adapter attempt that outlived [`HDFS_ADAPTER_ATTEMPT_TIMEOUT`]: a
+/// retryable I/O failure.
+fn adapter_deadline_error() -> HdfsError {
+    HdfsError::IOError(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "HDFS adapter attempt deadline exceeded",
+    ))
 }
 
 /// Private HDFS scan event consumed by the later common-walk adapter.

@@ -8,6 +8,8 @@ mod namespace;
 pub(crate) mod protocol;
 mod source;
 mod staged;
+#[cfg(test)]
+mod streaming_tests;
 mod writer;
 
 use std::sync::Arc;

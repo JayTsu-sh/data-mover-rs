@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::protocol::{HdfsProtocol, entry_failure};
+use super::protocol::{HdfsListedChild, HdfsProtocol, entry_failure};
 use super::source::descriptor;
 use crate::model::{
     BackendIdentity, FailureClass, Operation, StoragePath, SymlinkTarget, Transience,
 };
 use crate::storage::artifacts::is_artifact_path;
-use crate::storage::listing::respelled;
+use crate::storage::listing::{PageSink, cancelled, respelled};
 use crate::storage::{
     ListRequest, ListingPage, ListingStream, NameSemantics, Namespace, NamespaceCapabilities,
     SourceDescriptor, StorageRoleFailure,
@@ -33,15 +33,67 @@ impl HdfsNamespace {
         descriptor(&self.identity, path.clone(), &facts)
     }
 
-    /// Reads one whole directory (true paging comes with C8). Transfer artifacts never appear in
-    /// a listing (ADR-0006 C3b); the protocol listing stays raw for callers that must find them.
-    /// A child that cannot be described is reported on its own, beside the siblings that could
-    /// be.
+    /// Produces the listing of `request.path` into `sink` page by page (P7 C8). The protocol's
+    /// listing is stateless on the name node: cancellation, or the consumer dropping the stream,
+    /// abandons the page request in flight at once, as S3 does.
+    async fn produce_listing(self, request: ListRequest, sink: PageSink) {
+        let mut listing = self.protocol.open_listing(&request.path).await;
+        let mut sent = false;
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = request.cancel.cancelled() => {
+                    drop(listing);
+                    return sink.fail(cancelled(&request.path)).await;
+                }
+                () = sink.closed() => return,
+                next = listing.next_page(request.page_hint) => next,
+            };
+            let children = match next {
+                Ok(Some(children)) => children,
+                Ok(None) => {
+                    // An empty directory still hands over its one (empty) page.
+                    if !sent {
+                        let _ = sink.send(ListingPage::default()).await;
+                    }
+                    return;
+                }
+                Err(failure) => return sink.fail(failure).await,
+            };
+            let page = match self.describe_page(&request.path, children) {
+                Ok(page) => page,
+                Err(session) => return sink.fail(session).await,
+            };
+            if page.is_empty() && page.internal_hidden == 0 {
+                continue;
+            }
+            tokio::select! {
+                biased;
+                () = request.cancel.cancelled() => {
+                    drop(listing);
+                    return sink.fail(cancelled(&request.path)).await;
+                }
+                delivered = sink.send(page) => {
+                    if delivered.is_err() {
+                        return;
+                    }
+                }
+            }
+            sent = true;
+        }
+    }
+
+    /// One page of `path`'s children. Transfer artifacts never appear in a listing (ADR-0006
+    /// C3b); the protocol listing stays raw for callers that must find them. A child that cannot
+    /// be described is reported on its own, beside the siblings that could be.
     ///
     /// The server spells children normalised (`a/b/x` for a listing of `a//b`); each is spelled
     /// again as the requested path and its name, the listing contract.
-    async fn list_whole(&self, path: &StoragePath) -> Result<ListingPage, StorageRoleFailure> {
-        let children = self.protocol.list(path).await?;
+    fn describe_page(
+        &self,
+        path: &StoragePath,
+        children: Vec<HdfsListedChild>,
+    ) -> Result<ListingPage, StorageRoleFailure> {
         let mut entries = Vec::with_capacity(children.len());
         let mut failures = Vec::new();
         let mut hidden = 0_u32;
@@ -80,15 +132,15 @@ impl Namespace for HdfsNamespace {
         self.stat_entry(path).await
     }
 
-    /// The listing runs to its end in its producer even when the stream is dropped.
+    /// Streams the directory page by page, asking the name node for nothing but the listing
+    /// itself (no status of the directory first, P7 C8).
     fn list(&self, request: ListRequest) -> ListingStream {
         if let Err(failure) = refuse_artifacts(&[&request.path]) {
             return ListingStream::failed(request.path, failure);
         }
         let namespace = self.clone();
-        ListingStream::from_producer(request.path.clone(), move |sink| async move {
-            let listing = namespace.list_whole(&request.path).await;
-            sink.deliver(listing, &request).await;
+        ListingStream::from_producer(request.path.clone(), move |sink| {
+            namespace.produce_listing(request, sink)
         })
     }
 
@@ -149,6 +201,8 @@ fn failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -225,9 +279,12 @@ mod tests {
         assert_eq!(names, vec!["a.txt"]);
         assert_eq!(page.internal_hidden, 1);
         let raw = protocol
-            .list(&StoragePath::root())
+            .open_listing(&StoragePath::root())
             .await
-            .unwrap_or_else(|e| panic!("{e}"));
+            .next_page(NonZeroUsize::MAX)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_default();
         assert_eq!(raw.len(), 2);
     }
 

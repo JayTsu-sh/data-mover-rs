@@ -209,7 +209,9 @@ Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修�
 
 | 情况 | 范围 | FailureClass / Transience |
 |---|---|---|
-| 目录打不开 / 读不了、READDIRPLUS 流出错、HDFS `list_status` 失败、遍历根不存在 | 整个列举（报在目录上，块 `Unreadable`；`Connectivity` 照常升会话） | 按上面各 backend 的映射 |
+| 目录打不开 / 读不了、READDIRPLUS 流出错、HDFS `getListing` 失败（重试预算用尽或不可重试）、遍历根不存在 | 整个列举（报在目录上，块 `Unreadable`；`Connectivity` 照常升会话） | 按上面各 backend 的映射 |
+| HDFS 列举（P7 C8）：列举前不再 `get_file_info`；目录不存在 → `getListing` 的 `FileNotFound`；列的是文件（NameNode 回该文件自身的 status）→ 不是目录 | 整个列举，首页之前 | `NotFound` / `InvalidInput`，Permanent |
+| HDFS 列举中途的可重试失败（连接断开等 I/O、单批 `getListing` 超过 5 s）：首页前后都一样，重新打开列举、跳过最后读到的名字及之前的（按 NameNode 的有符号字节序；hdfs-native 不公开 `startAfter`，所以只在失败时重读此前的批），从它之后继续；退避 250 ms–2 s，无进展时至多 4 次，读到新名字即续满预算。子项从不重复交出 | 续上则无失败；不可重试或预算用尽 → 整个列举，先交出已读到的子项，块 `Interrupted { delivered }`（一项未交出则 `Unreadable`） | 按 HDFS 映射（I/O 类预算用尽后照常升会话） |
 | 已交出若干子项之后读目录失败（Local `getdents` 出错，P7 C5：此前记成目录上的子项失败，且 rustix 出错后不再给条目，列举会被读成“完整”） | 整个列举，先交出已读到的子项，块 `Interrupted { delivered }`；一项都没交出则 `Unreadable` | 按 Local 映射（`EIO` 等 → `Protocol` / Unknown） |
 | 列举返回的子项在描述 / 观察时已不存在 | 不是失败：`vanished` | `NotFound`（只用于分类） |
 | Local 名字不是 UTF-8 / 拼出的路径超长 | 无名子项（`raw_name` = Unix 原始字节，Windows UTF-16LE） | `Unsupported` / Permanent |

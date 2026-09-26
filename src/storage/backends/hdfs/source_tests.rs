@@ -1,4 +1,4 @@
-use super::super::protocol::{HdfsListedChild, HdfsReadCursor, HdfsWriteSession};
+use super::super::protocol::{FailedHdfsListing, HdfsListing, HdfsReadCursor, HdfsWriteSession};
 use super::*;
 use crate::model::{BackendKind, SourceVersion};
 use std::{
@@ -97,8 +97,8 @@ impl HdfsProtocol for ReadProtocol {
     ) -> Result<Bytes, StorageRoleFailure> {
         self.payload.read_range(range).await
     }
-    async fn list(&self, path: &StoragePath) -> Result<Vec<HdfsListedChild>, StorageRoleFailure> {
-        Err(unsupported(path))
+    async fn open_listing(&self, path: &StoragePath) -> Box<dyn HdfsListing> {
+        Box::new(FailedHdfsListing::new(unsupported(path)))
     }
     async fn create_directory(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
         Err(unsupported(path))

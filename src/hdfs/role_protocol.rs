@@ -45,15 +45,8 @@ impl RoleHdfsProtocol for HDFSStorage {
         Ok(hdfs_role_facts(path.clone(), entry))
     }
 
-    async fn list(&self, path: &RoleStoragePath) -> Result<Vec<RoleHdfsListedChild>, RoleFailure> {
-        let children = self
-            .list_directory_children(Path::new(path.as_str()))
-            .await
-            .map_err(|error| hdfs_role_error(path, RoleOperation::Traverse, error))?;
-        Ok(children
-            .into_iter()
-            .map(|child| hdfs_role_child(path, child))
-            .collect())
+    async fn open_listing(&self, path: &RoleStoragePath) -> Box<dyn RoleHdfsListing> {
+        self.role_listing(path)
     }
 
     async fn read_range(

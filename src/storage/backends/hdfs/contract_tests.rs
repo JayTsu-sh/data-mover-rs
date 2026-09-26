@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -6,9 +8,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 use super::protocol::{
-    HdfsEntryFacts, HdfsListedChild, HdfsProtocol, HdfsWriteSession, entry_failure,
+    HdfsEntryFacts, HdfsListedChild, HdfsListing, HdfsProtocol, HdfsWriteSession, entry_failure,
 };
-use crate::model::{EntryKind, FailureClass, Operation, StoragePath, Transience};
+use crate::model::{
+    EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
+};
 use crate::storage::StorageRoleFailure;
 use crate::storage::artifacts::{ArtifactKind, parse_artifact_name};
 
@@ -33,6 +37,70 @@ pub(crate) struct MemoryHdfs {
     fail_write: std::sync::atomic::AtomicBool,
     fail_rename_after_commit: std::sync::atomic::AtomicBool,
     undescribable: Mutex<Vec<String>>,
+    /// Statuses every listing has handed out, as a name node would have returned them.
+    listed_statuses: Arc<AtomicUsize>,
+    /// A listing fails once it has handed out this many statuses.
+    listing_fails_after: std::sync::Mutex<Option<usize>>,
+    /// A listing stops answering once it has handed out this many statuses.
+    listing_stalls_after: std::sync::Mutex<Option<usize>>,
+    /// Listings dropped so far.
+    listings_dropped: Arc<AtomicUsize>,
+}
+
+/// One listing of a snapshot of a [`MemoryHdfs`] directory, in name order, page by page.
+struct MemoryListing {
+    directory: StoragePath,
+    children: std::vec::IntoIter<HdfsListedChild>,
+    served: usize,
+    fail_after: Option<usize>,
+    stall_after: Option<usize>,
+    listed: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl Drop for MemoryListing {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl HdfsListing for MemoryListing {
+    async fn next_page(
+        &mut self,
+        max: NonZeroUsize,
+    ) -> Result<Option<Vec<HdfsListedChild>>, StorageRoleFailure> {
+        tokio::task::yield_now().await;
+        if self.stall_after.is_some_and(|limit| self.served >= limit) {
+            std::future::pending::<()>().await;
+        }
+        let room = match self.fail_after {
+            Some(limit) if self.served >= limit => {
+                self.fail_after = None;
+                self.children = Vec::new().into_iter();
+                return Err(StorageRoleFailure::Entry(listing_failure(
+                    &self.directory,
+                    FailureClass::Protocol,
+                )));
+            }
+            Some(limit) => max.get().min(limit - self.served),
+            None => max.get(),
+        };
+        let page: Vec<_> = self.children.by_ref().take(room).collect();
+        if page.is_empty() {
+            return Ok(None);
+        }
+        self.served += page.len();
+        self.listed.fetch_add(page.len(), Ordering::SeqCst);
+        Ok(Some(page))
+    }
+}
+
+fn listing_failure(path: &StoragePath, class: FailureClass) -> EntryOperationFailure {
+    match entry_failure(path, Operation::Traverse, class, Transience::Permanent) {
+        StorageRoleFailure::Entry(failure) => failure,
+        StorageRoleFailure::Session(_) => unreachable!("entry failure"),
+    }
 }
 
 /// Whether `path` names a pointer artifact or its temporary, exactly (not a data file whose name
@@ -77,6 +145,32 @@ impl MemoryHdfs {
     /// whose time or size does not convert).
     pub(crate) async fn make_undescribable(&self, path: &str) {
         self.undescribable.lock().await.push(path.into());
+    }
+
+    /// Makes every later listing fail once it has handed out `statuses` statuses.
+    pub(crate) fn fail_listings_after(&self, statuses: usize) {
+        *self
+            .listing_fails_after
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(statuses);
+    }
+
+    /// Makes every later listing stop answering once it has handed out `statuses` statuses.
+    pub(crate) fn stall_listings_after(&self, statuses: usize) {
+        *self
+            .listing_stalls_after
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(statuses);
+    }
+
+    /// Listings dropped so far.
+    pub(crate) fn listings_dropped(&self) -> usize {
+        self.listings_dropped.load(Ordering::SeqCst)
+    }
+
+    /// Statuses every listing so far has handed out.
+    pub(crate) fn listed_statuses(&self) -> usize {
+        self.listed_statuses.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn insert(&self, path: &str, value: Bytes) {
@@ -160,7 +254,7 @@ impl HdfsProtocol for MemoryHdfs {
         Ok(Self::facts(path, value.len() as u64))
     }
 
-    async fn list(&self, path: &StoragePath) -> Result<Vec<HdfsListedChild>, StorageRoleFailure> {
+    async fn open_listing(&self, path: &StoragePath) -> Box<dyn HdfsListing> {
         let prefix = if path.as_str().is_empty() {
             String::new()
         } else {
@@ -168,29 +262,39 @@ impl HdfsProtocol for MemoryHdfs {
         };
         let undescribable = self.undescribable.lock().await.clone();
         let objects = self.objects.lock().await;
-        Ok(objects
+        let mut names: Vec<(&String, &Bytes)> = objects
             .iter()
-            .filter_map(|(name, value)| {
-                let relative = name.strip_prefix(&prefix)?;
-                (!relative.contains('/')).then(|| {
-                    let path = StoragePath::new(name).unwrap_or_else(|error| panic!("{error}"));
-                    if undescribable.contains(name) {
-                        return Err(
-                            match entry_failure(
-                                &path,
-                                Operation::Traverse,
-                                FailureClass::InvalidInput,
-                                Transience::Permanent,
-                            ) {
-                                StorageRoleFailure::Entry(failure) => failure,
-                                StorageRoleFailure::Session(_) => unreachable!("entry failure"),
-                            },
-                        );
-                    }
-                    Ok(Self::facts(&path, value.len() as u64))
-                })
+            .filter(|(name, _)| {
+                name.strip_prefix(&prefix)
+                    .is_some_and(|relative| !relative.contains('/'))
             })
-            .collect())
+            .collect();
+        names.sort_unstable_by_key(|(name, _)| name.as_str());
+        let children = names
+            .into_iter()
+            .map(|(name, value)| {
+                let path = StoragePath::new(name).unwrap_or_else(|error| panic!("{error}"));
+                if undescribable.contains(name) {
+                    return Err(listing_failure(&path, FailureClass::InvalidInput));
+                }
+                Ok(Self::facts(&path, value.len() as u64))
+            })
+            .collect::<Vec<_>>();
+        Box::new(MemoryListing {
+            directory: path.clone(),
+            children: children.into_iter(),
+            served: 0,
+            fail_after: *self
+                .listing_fails_after
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            stall_after: *self
+                .listing_stalls_after
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            listed: Arc::clone(&self.listed_statuses),
+            dropped: Arc::clone(&self.listings_dropped),
+        })
     }
 
     async fn read_range(
