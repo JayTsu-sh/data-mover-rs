@@ -19,6 +19,7 @@ use crate::model::{
 
 use crate::model::StoragePath;
 use crate::storage::Storage;
+use crate::storage::artifacts::{ArtifactKind, artifact_name};
 use crate::storage::backends::local::{
     source::LocalReadSource, test_destination_storage, test_destination_storage_with_role,
     test_source_storage, test_unsupported_storage,
@@ -720,6 +721,17 @@ async fn recovery_restarts_after_same_size_source_edit() -> Result<(), Box<dyn s
         tokio::time::timeout(Duration::from_secs(1), async {
             while destination_role.write_completion_count() < 1 {
                 tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        // The checkpoint's pointer lands after the write completes; cancelling before it does
+        // leaves a stage without a pointer, which restarts for that reason instead.
+        let pointer = destination_root
+            .path()
+            .join(artifact_name("final.bin", ArtifactKind::Pointer));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pointer.exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await?;
