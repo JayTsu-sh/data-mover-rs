@@ -24,6 +24,9 @@
 # the first 1 000-entry page of ListObjectVersions; then (temporary bucket only), with versioning
 # suspended, n written twice (one "null" version).
 #
+# The zero-byte d/ is a directory object (P7 F5, D8): one zero-byte file entry d/ of d (Current), one
+# version of size 0 (All); the legacy walks still skip it (only a d/ holding content is reported).
+#
 # Checks (versioned): All lists k as 2, 3, marker, 4 with only the last latest, gone as a version
 # and a latest marker, p/z as 1, 2, 3, n as version=null latest=1, no artifact; Current lists k
 # (4 B) without gone; --order blocks gives the same lines at concurrency 1, 4 and 32. Legacy
@@ -31,6 +34,9 @@
 # k as v1, v2, marker, v3 (ids as written), gone as its version then a latest marker (D4), p/z
 # whole across the page, no artifact. Unversioned: Current and the legacy walks list each key once
 # (k 4 B, p/z 3 B, no gone, no artifact, 999 p/a*); blocks identical at 1, 4, 32.
+#
+# EXPECT_DIR_MARKER (default 1): how many current entries the zero-byte d/ gives (P7 F5); 0 for a
+# store that keeps no such object.
 #
 # History order: every version row of a key with a delete marker (k, gone) must carry
 # ` order=inferred` exactly when EXPECT_ORDER=inferred (RustFS 1.0.0 lists each page's delete
@@ -247,9 +253,9 @@ echo "-- current (without p/a*)"; grep -v ' p/a' "$WORK/current"
 cmp -s "$WORK/blocks-1" "$WORK/blocks-4" && cmp -s "$WORK/blocks-1" "$WORK/blocks-32" \
   && echo "blocks ($BLOCKS): identical at concurrency 1, 4, 32 ($(wc -l <"$WORK/blocks-1") lines)" \
   || { echo "blocks ($BLOCKS): output differs between concurrency levels"; FAILED=1; }
-python3 - "$WORK/all" "$WORK/current" "$MODE" "$EXPECT_ORDER" <<'PY' || FAILED=1
+python3 - "$WORK/all" "$WORK/current" "$MODE" "$EXPECT_ORDER" "${EXPECT_DIR_MARKER:-1}" <<'PY' || FAILED=1
 import re, sys
-all_, cur, mode, expect = sys.argv[1:5]
+all_, cur, mode, expect, dir_marker = sys.argv[1:6]
 def rows(path, name):
     out = []
     for line in open(path):
@@ -282,6 +288,7 @@ if mode != "unversioned":
         "all p/z": ([(r[1], r[3]) for r in rows(all_, "p/z")], [("0", "1"), ("0", "2"), ("1", "3")]),
         "all p/a count": (count(all_, lambda l: " p/a" in l), 999),
         "all d/e": (len(rows(all_, "d/e")), 1),
+        "all d/ marker": ([r[3] for r in rows(all_, "d/")], ["0"]),
         "all sub/deep/f": (len(rows(all_, "sub/deep/f")), 1),
         "listed dirs": (count(all_, lambda l: l.startswith("listed ")), 5),
         "listings complete": (count(all_, lambda l: l.startswith("listed ") and " Complete balanced=true " in l), 5),
@@ -297,7 +304,9 @@ if mode != "unversioned":
 files = (all_, cur) if mode != "unversioned" else (cur,)
 checks.update({
     "no artifacts": (sum(".data-mover" in l for f in files for l in open(f)), 0),
-    "no d/ marker": (sum(re.search(r" d/( |$)", l) is not None for f in files for l in open(f)), 0),
+    # P7 F5 (D8): the zero-byte marker d/ is a zero-byte file entry of d, once per listing
+    # (EXPECT_DIR_MARKER=0 for a store that keeps no such object, the ONTAP NAS bucket).
+    "current d/ marker": (len(rows(cur, "d/")), int(dir_marker)),
     "totals balanced": (sum(l.startswith("totals balanced=true ") for f in files for l in open(f)), len(files)),
     "completed": (sum("outcome=Completed" in l for f in files for l in open(f)), len(files)),
 })

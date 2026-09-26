@@ -708,3 +708,6 @@ mod listing_failures;
 
 #[path = "streaming_tests.rs"]
 mod streaming;
+
+#[path = "directory_object_tests.rs"]
+mod directory_objects;

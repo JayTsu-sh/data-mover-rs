@@ -29,7 +29,8 @@
 //!
 //! An entry the listing reported twice (a server repeating one across a page boundary) is kept
 //! once, first as listed. The checks only see the entries passed in: an entry removed before
-//! (another key's artifact, a directory's own marker, a key rolled up into a prefix) or one
+//! (another key's artifact, a key rolled up into a prefix; a directory's own key is ordered on
+//! its own) or one
 //! without a position cannot reveal that a key was split around it — a limit that only matters for
 //! a store whose listing is already wrong.
 

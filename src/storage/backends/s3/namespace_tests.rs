@@ -104,7 +104,8 @@ fn version(name: &str, id: &str, latest: bool, marker: bool) -> Row {
 }
 
 /// Children come out in S3 key order — the object `a` before the prefix `a/`, which sorts after
-/// `a!`, `a-0` and `a.txt` — with artifacts hidden and a zero-byte directory marker skipped.
+/// `a!`, `a-0` and `a.txt` — with artifacts hidden. A zero-byte directory marker `b/` is not a
+/// child of the root (it is the prefix `b`) but the zero-byte file `b/` of `b` itself (P7 F5, D8).
 #[tokio::test]
 async fn current_children_are_in_key_order_without_artifacts() -> TestResult {
     let protocol = bucket(&[
@@ -140,13 +141,14 @@ async fn current_children_are_in_key_order_without_artifacts() -> TestResult {
     );
     assert_eq!(
         listed(namespace.as_ref(), "b", false).await?,
-        (vec![], vec![])
+        (vec![file("b/")], vec![])
     );
     Ok(())
 }
 
-/// A marker object with content and a prefix with an empty segment have no path in this tree:
-/// each is a per-child failure, and the siblings are still listed.
+/// A prefix with an empty segment has no path in this tree: a per-child failure, and the siblings
+/// are still listed. A marker object with content is no such key: it is the file `c/` of `c`
+/// (P7 F5), never merged into the directory `c` nor into a file `c`.
 #[tokio::test]
 async fn unspellable_keys_are_failures_not_silent_merges() -> TestResult {
     let protocol = bucket(&[
@@ -162,7 +164,7 @@ async fn unspellable_keys_are_failures_not_silent_merges() -> TestResult {
     assert_eq!(rows, [dir("c"), dir("e")]);
     assert_eq!(failures, ["/"]);
     let (rows, failures) = listed(namespace.as_ref(), "c", false).await?;
-    assert_eq!((rows, failures), (vec![file("c/f")], vec!["c".to_string()]));
+    assert_eq!((rows, failures), (vec![file("c/"), file("c/f")], vec![]));
     let (rows, failures) = listed(namespace.as_ref(), "e", false).await?;
     assert_eq!(
         (rows, failures),

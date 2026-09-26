@@ -699,7 +699,8 @@ async fn an_unordered_store_lists_every_child_and_each_subdirectory_once() -> Te
 
 /// A prefix under which nothing is stored is `NotFound` only once it is listed to its end, and
 /// hands over no page before; one whose first pages are empty lists what follows. One holding
-/// only its own zero-byte marker, or only hidden artifacts, is an existing directory.
+/// only its own zero-byte marker (then its one child, P7 F5), or only hidden artifacts, is an
+/// existing directory.
 #[tokio::test]
 async fn absence_is_decided_at_the_end_and_before_any_page() -> TestResult {
     let protocol = bucket(["h/.data-mover-x".to_owned(), "d/e".to_owned()]).await?;
@@ -741,7 +742,14 @@ async fn absence_is_decided_at_the_end_and_before_any_page() -> TestResult {
         .collect()
         .await;
     assert!(
-        matches!(marker.as_slice(), [Ok(page)] if page.is_empty() && page.internal_hidden == 0),
+        matches!(
+            marker.as_slice(),
+            [Ok(page)] if page.failures.is_empty()
+                && page.internal_hidden == 0
+                && page.children.len() == 1
+                && page.children[0].is_directory_object()
+                && page.children[0].size == Some(0)
+        ),
         "{marker:?}"
     );
     let hidden: Vec<_> = listing(&namespace, "h", CancellationToken::new())?

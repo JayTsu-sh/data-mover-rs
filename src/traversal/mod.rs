@@ -26,6 +26,8 @@ mod local_tests;
 #[cfg(test)]
 mod nfs_tests;
 #[cfg(test)]
+mod s3_directory_object_tests;
+#[cfg(test)]
 mod s3_tests;
 
 /// How a traversal orders what it delivers (P7 §3). Concurrent completion never changes it.

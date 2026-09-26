@@ -13,9 +13,18 @@
 //!   its trailing `/`: the object `a` before the prefix `a/`.
 //! - A key below a deeper `/` that a store reported anyway (one that ignores the delimiter) is
 //!   rolled up into its first-level prefix.
-//! - The directory's own marker object (`<path>/`, zero bytes) is not a child. A non-empty one,
-//!   and a prefix with an empty segment (`a//`, a leading `/`), cannot be spelled as a path of
-//!   this tree and are reported as per-child failures, never silently merged or dropped.
+//! - **The directory's own object** (the key `<path>/` itself, P7 F5): every measured object
+//!   store keeps content under such a key, and only the listing of `<path>` sees it (the parent's
+//!   delimiter listing rolls it into the common prefix). It is handed over as a file child with
+//!   the empty name, so its path is exactly `<path>/` — whatever its size: a zero-byte folder
+//!   marker is a zero-byte file entry — and, listing every version, with its whole history,
+//!   delete markers included. It is neither the directory `<path>` nor a file `<path>`: its
+//!   identity is path-scoped to `<path>/` (or version-scoped). The storage root's own object (the
+//!   URL prefix's key) has no path in this tree: a zero-byte one, or a history of zero-byte
+//!   versions and markers, is a folder marker and ignored; one with content is a per-child
+//!   `Unsupported` failure at the root, never dropped silently.
+//! - A prefix with an empty segment (`a//`, a leading `/`) cannot be spelled as a path of this
+//!   tree and is reported as a per-child failure, never silently merged or dropped.
 //! - Transfer artifacts (`.data-mover-*` in any segment) are hidden in both modes.
 
 use std::collections::HashSet;
@@ -132,7 +141,12 @@ pub(super) async fn list_all<P: S3Protocol + ?Sized>(
     let mut block = Block::new(identity, directory, &prefix);
     block.outside(&placed_versions.outside);
     block.outside(&placed_markers.outside);
-    block.own_marker(placed_versions.own.iter().any(|entry| entry.facts.size > 0));
+    // The directory's own key has one history, whatever it holds (P7 F5, D5).
+    let own = oldest_first(placed_versions.own, placed_markers.own);
+    warn_inferred(directory.as_str(), &own);
+    for history in &own {
+        block.own_history(history);
+    }
     let histories = oldest_first(placed_versions.children, placed_markers.children);
     warn_inferred(directory.as_str(), &histories);
     let children = histories.into_iter().map(Child::History);
@@ -200,7 +214,7 @@ pub(super) fn directory_prefix(directory: &StoragePath) -> Result<String, Storag
 pub(super) struct Placed<T> {
     /// Directly in the directory.
     pub(super) children: Vec<T>,
-    /// The directory's own marker object, `<path>/`.
+    /// The directory's own object, the key `<path>/` itself (P7 F5).
     pub(super) own: Vec<T>,
     /// First-level prefixes of keys a store reported below a deeper `/`.
     pub(super) rolled: Vec<String>,
@@ -257,6 +271,8 @@ pub(super) struct Block<'a> {
     directory: &'a StoragePath,
     prefix: &'a str,
     entries: Vec<SourceDescriptor>,
+    /// The directory's own object `<path>/`: its current object, or every record of its history.
+    own: Vec<SourceDescriptor>,
     failures: Vec<EntryOperationFailure>,
     /// Children no path of this tree can name, with their raw keys.
     unnamed: Vec<ChildFailure>,
@@ -275,6 +291,7 @@ impl<'a> Block<'a> {
             directory,
             prefix,
             entries: Vec::new(),
+            own: Vec::new(),
             failures: Vec::new(),
             unnamed: Vec::new(),
             hidden: 0,
@@ -340,13 +357,71 @@ impl<'a> Block<'a> {
         }
     }
 
-    /// A marker object `<path>/` with content cannot be a child of `<path>`: no path spells it.
-    pub(super) fn own_marker(&mut self, has_content: bool) {
-        if has_content {
+    /// The directory's current own object `<path>/` (P7 F5): a file child with the empty name,
+    /// whatever its size. At the storage root it has no path: ignored when it is a zero-byte
+    /// folder marker, a failure when it holds content.
+    ///
+    /// An own key listed with no `ETag` and no bytes is no object: `MinIO` (RELEASE.2023-03-20)
+    /// keeps listing a directory object whose newest record is a delete marker that way (its HEAD
+    /// answers 404, and its parent still lists the prefix). The current listing lists current
+    /// objects only, so it is not handed over.
+    pub(super) fn own_object(&mut self, object: &S3ListedObject) {
+        if object.etag.is_empty() && object.size == 0 {
+            return;
+        }
+        if self.directory.as_str().is_empty() {
+            self.root_object(object.size > 0);
+            return;
+        }
+        let facts = object_facts(object.size, &object.etag, None, object.last_modified);
+        let described = self
+            .path_of(self.prefix)
+            .and_then(|path| file_descriptor(self.identity, path, &facts));
+        match described {
+            Ok(descriptor) => self.own.push(descriptor),
+            Err(failure) => self.failures.push(failure),
+        }
+    }
+
+    /// The whole history of the directory's own key `<path>/` (P7 F5, D5): every version, zero-byte
+    /// ones included, and every delete marker, oldest first. At the storage root it has no path:
+    /// ignored when no version holds content, a failure when one does.
+    pub(super) fn own_history(&mut self, history: &KeyHistory<S3ListedVersion>) {
+        if self.directory.as_str().is_empty() {
+            let content = history.entries.iter().any(|entry| entry.facts.size > 0);
+            self.root_object(content);
+            return;
+        }
+        let described = self.path_of(self.prefix).and_then(|path| {
+            history
+                .entries
+                .iter()
+                .map(|entry| {
+                    let listed = Listed {
+                        entry,
+                        order: history.order,
+                    };
+                    version_descriptor(self.identity, path.clone(), &listed)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        });
+        // Whole or not at all, as any other key's history (`history_child`).
+        match described {
+            Ok(records) => self.own.extend(records),
+            Err(failure) => self.failures.push(failure),
+        }
+    }
+
+    /// The storage root's own object (the URL prefix's key itself): no path of this tree spells
+    /// it, so one holding content is reported at the root rather than dropped; a zero-byte folder
+    /// marker stands for nothing the root does not already.
+    fn root_object(&mut self, content: bool) {
+        if content {
             self.failures.push(child_failure(
                 self.directory,
                 FailureClass::Unsupported,
-                "an S3 object key ends in '/'; it is not listed",
+                "the S3 object at the storage root's own key (ending in '/') holds content; no path \
+                 of this tree names it, so it is not listed",
             ));
         }
     }
@@ -365,9 +440,18 @@ impl<'a> Block<'a> {
         }
     }
 
+    /// The page: the directory's own object first — its key `<path>/` sorts before every key
+    /// below it, so the page stays in S3 key order — then the other children.
     pub(super) fn finish(self) -> ListingPage {
-        let mut page =
+        let mut page = ListingPage::default();
+        for own in self.own {
+            page.push_directory_object(self.directory, own);
+        }
+        let rest =
             ListingPage::from_descriptors(self.directory, self.entries, self.failures, self.hidden);
+        page.children.extend(rest.children);
+        page.failures.extend(rest.failures);
+        page.internal_hidden = rest.internal_hidden;
         for failure in self.unnamed {
             page.push_failure(failure);
         }

@@ -170,6 +170,26 @@ fn swapping_the_two_sides_changes_the_identity() -> TestResult {
     Ok(())
 }
 
+/// P7 F5: a directory object `p/d/`, the file `p/d` and the directory `p/d` are different paths,
+/// so a copy of each is its own transfer — the trailing `/` is never normalised away.
+#[test]
+fn a_directory_object_is_its_own_transfer() -> TestResult {
+    let (source, destination) = (s3("s3://src/bucket")?, s3("s3://dst/bucket")?);
+    let of = |value: &str| -> Result<TransferIdentity, Box<dyn Error>> {
+        let file = path(value)?;
+        Ok(TransferIdentity::derive(
+            &source,
+            &file,
+            &SourceVersion::Current,
+            &destination,
+            &file,
+        ))
+    };
+    assert_ne!(of("p/d/")?, of("p/d")?);
+    assert_ne!(of("d/")?, of("d")?);
+    Ok(())
+}
+
 /// Moving bytes between an endpoint and a path must not give the same input stream.
 #[test]
 fn field_boundaries_are_unambiguous() -> TestResult {

@@ -12,8 +12,11 @@
 //! - An object repeated across a page boundary is dropped when the previous page listed it
 //!   (memory: one page of keys). One repeated further apart is handed over again: the listing
 //!   contract allows a child twice, and a consumer deduplicates by (parent, name) (Q12, Q13).
-//! - Children are in S3 key order within a server page; across pages, in the order the store
-//!   returned its pages.
+//!   The directory's own object `<path>/` (P7 F5) is the exception: handed over once per listing,
+//!   on the first page that lists it, whatever a store repeats.
+//! - Children are in S3 key order within a server page (the directory's own object, whose key
+//!   sorts before every key below it, first); across pages, in the order the store returned its
+//!   pages.
 //!
 //! **Paging.** The continuation token is opaque and passed back as it came. A throttled or
 //! transiently failed page is requested again with the same token ([`PageRetry`]): the request is
@@ -65,7 +68,8 @@ pub(super) async fn produce_current<P: S3Protocol + ?Sized>(
             next = listing.next_page() => next,
         };
         match next {
-            // A page of nothing (empty, or only the directory's own marker) is not handed over.
+            // A page of nothing is not handed over. The directory's own object is a child (P7 F5),
+            // so a page holding only a zero-byte folder marker is not empty.
             Ok(Some(page)) if page.is_empty() && page.internal_hidden == 0 => {}
             Ok(Some(page)) => {
                 if sink.send_split(page, request).await.is_err() {
@@ -114,8 +118,9 @@ struct Seen {
     previous: HashSet<String>,
     /// Keys whose undecodable entry was reported.
     rejected: HashSet<String>,
-    /// Whether a directory marker with content was reported.
-    own_marker: bool,
+    /// Whether the directory's own object `<path>/` was handed over (once per listing, on
+    /// whichever page it appears; P7 F5).
+    own_object: bool,
 }
 
 impl Seen {
@@ -195,9 +200,11 @@ impl<'a, P: S3Protocol + ?Sized> CurrentListing<'a, P> {
         let placed = place(&self.prefix, objects, |object| &object.key);
         let mut block = Block::new(self.identity, self.directory, &self.prefix);
         block.outside(&placed.outside);
-        if !self.seen.own_marker && placed.own.iter().any(|object| object.size > 0) {
-            self.seen.own_marker = true;
-            block.own_marker(true);
+        if !self.seen.own_object
+            && let Some(own) = placed.own.first()
+        {
+            self.seen.own_object = true;
+            block.own_object(own);
         }
         let mut rolled = placed.rolled;
         block.rejected(rejected, &mut rolled, &mut self.seen.rejected);

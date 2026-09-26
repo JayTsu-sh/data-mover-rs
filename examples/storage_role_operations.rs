@@ -139,6 +139,11 @@ enum Command {
         /// Also sum the size of every entry's encoded snapshot (what a caller persists per entry).
         #[arg(long)]
         snapshot_bytes: bool,
+        /// Also print each entry's size (` size=<bytes>`, `-` for none) after its path, so a
+        /// script sees a directory object's bytes (`File d/ size=5`) in the current listing too.
+        /// A version entry already prints its size with its version.
+        #[arg(long)]
+        sizes: bool,
         /// Also print each entry's identity strength and the first 8 bytes of its identity key
         /// (hex), e.g. to see that two objects with the same content at two keys differ.
         #[arg(long)]
@@ -256,6 +261,7 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
     let Command::Traverse {
         quiet,
         snapshot_bytes,
+        sizes,
         identity,
         ownership,
         acl,
@@ -288,8 +294,15 @@ async fn traverse(storage: &Storage, args: &Args, command: &Command) -> Result<(
                     if *acl {
                         owner.push_str(&acl_of(entry));
                     }
+                    let size = if *sizes && entry.version().is_none() {
+                        entry
+                            .size()
+                            .map_or_else(|| " size=-".to_owned(), |size| format!(" size={size}"))
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "{:?} {}{}{identity}{owner}",
+                        "{:?} {}{size}{}{identity}{owner}",
                         entry.kind(),
                         entry.path(),
                         version_of(entry)

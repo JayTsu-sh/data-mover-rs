@@ -47,7 +47,9 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
     }
 
     /// An object when one has the path as its key; otherwise a directory when anything lies
-    /// under `<path>/`; otherwise `NotFound`.
+    /// under `<path>/`; otherwise `NotFound`. A path ending in `/` names a directory object
+    /// (P7 F5) and only that: gone, it is `NotFound` (a vanished entry), never the directory it
+    /// spells nor an invalid directory path.
     async fn stat_entry(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         if path.as_str().is_empty() {
             return directory_descriptor(&self.identity, path.clone())
@@ -56,6 +58,14 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
         match self.protocol.head(path.as_str()).await {
             Ok(facts) => file_descriptor(&self.identity, path.clone(), &facts)
                 .map_err(StorageRoleFailure::Entry),
+            Err(S3ProtocolFailure::Entry {
+                class: FailureClass::NotFound,
+                ..
+            }) if path.names_directory_object() => Err(failure(
+                path,
+                FailureClass::NotFound,
+                "no S3 object at this key ending in '/'",
+            )),
             Err(S3ProtocolFailure::Entry {
                 class: FailureClass::NotFound,
                 ..
@@ -145,14 +155,15 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
     }
 
     /// `histories` is what [`Namespace::list_versions`] serves on any bucket until P7 C11b
-    /// narrows it to versioned buckets.
+    /// narrows it to versioned buckets. Object stores keep content under keys ending in `/`
+    /// (`directory_objects`, P7 F5).
     fn capabilities(&self) -> NamespaceCapabilities {
         NamespaceCapabilities {
             histories: true,
             mutations: Err(NO_MUTATIONS),
             symlinks: false,
             names: NameSemantics::EXACT,
-            directory_objects: false,
+            directory_objects: true,
         }
     }
 

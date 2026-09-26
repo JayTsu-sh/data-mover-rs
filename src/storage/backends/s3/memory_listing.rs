@@ -15,7 +15,8 @@
 //!   prefix comes again wherever another of its keys falls, on any page; its continuation is a
 //!   position, not a key. [`ListingKnobs::disordered_prefixes`] returns each page's common prefixes
 //!   reversed, twice, and again on the next page; [`ListingKnobs::repeat_last_object`] starts each
-//!   page with the previous page's last object; [`ListingKnobs::leading_empty_pages`] starts each
+//!   page with the previous page's last object, [`ListingKnobs::repeat_first_object`] with the
+//!   listing's first object; [`ListingKnobs::leading_empty_pages`] starts each
 //!   listing with empty pages that claim more follow.
 //! - [`ListingKnobs::generated`] lists a directory of millions of children without storing them:
 //!   each page is made from its position when it is asked for.
@@ -96,6 +97,12 @@ pub(crate) struct ListingKnobs {
     pub(crate) repeat_last_object: bool,
     /// The last object of the previous object page, for `repeat_last_object`.
     last_object: Option<S3ListedObject>,
+    /// A store repeating an object on pages further apart: each object page after the first
+    /// starts with the first page's first object again. Remembered across calls of any prefix:
+    /// for a test that runs one listing at a time (as `repeat_last_object`).
+    pub(crate) repeat_first_object: bool,
+    /// The first object of the listing's first page, for `repeat_first_object`.
+    first_object: Option<S3ListedObject>,
     /// The continuation of every `ListObjectsV2` page requested, throttled and failed ones
     /// included, in order.
     pub(crate) tokens: Vec<Option<String>>,
@@ -432,6 +439,13 @@ impl MemoryS3 {
                 page.objects.insert(0, repeated);
             }
             knobs.last_object = last;
+        }
+        if knobs.repeat_first_object {
+            if first {
+                knobs.first_object = page.objects.first().cloned();
+            } else if let Some(repeated) = knobs.first_object.clone() {
+                page.objects.insert(0, repeated);
+            }
         }
     }
 
