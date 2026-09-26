@@ -874,7 +874,8 @@ F5  目录对象（键以 `/` 结尾的 S3 对象，现存问题 12；用户 202
     F5f docs（§4.1 路径逐字节、不去尾 `/`；§5.4.4；§5.4.5；§7；§10.3/10.4；§13；filter-dsl.md；storage-s3.md；ADR-0006）
 H1  （已完成，本系列最后一个提交）feat(s3): 目的端重放删除标记（StagedDestination::write_delete_marker + transfer::write_delete_marker；仅 Enabled 桶、每次调用前查
     GetBucketVersioning；结果 Written / Merged / NullVersionRemoved；examples/s3_history_replay.rs）—— F5 之后、C7 之前
-F5g fix(s3): 目录对象只用单次请求写（D13）：单 PUT / 单次 CopyObject，> 5 GiB Preflight Unsupported；MinIO、RustFS 真机复验
+F5g fix(s3): 目录对象只用单次请求写（D13）：单 PUT / 单次 CopyObject，> 5 GiB Preflight Unsupported —— 已完成 `2352a6b`
+    （前置 refactor `870f385`；五套对象存储版本 / 非版本真机全过）
 C7b fix(nfs): v3 READDIRPLUS 列出、却不给属性与句柄的 `.snapshot`（ONTAP 卷根）跳过，与 NFSv4 一致（用户 2026-09-26 定，
     不按 legacy 下钻进快照树）；只认“名字是 .snapshot 且缺属性 / 句柄”的条目，其余缺属性的子项仍是 Protocol 子项失败
 P1–P5  S3 URL 参数化（§14.2）—— F5 合入后，可与 C7 并行
@@ -967,23 +968,47 @@ VERIFY
 **实施结果（2026-09-26）**：F5a–F5f 与 H1 都已提交（§14）；真机矩阵用含 H1 的树跑。与计划的差别：扫描根自己的对象由遍历在根列举里处理
 （`stream::prepare`，Blocks；C10 的 Unordered 必须复用它）；页内自己的对象排最前（键 `d/` 比它下面的键都小，页仍是
 S3 键序）；MinIO 版本桶里最新是删除标记的 `d/` 仍被 ListObjectsV2 列成无 ETag 的 0 字节 Contents（HEAD 404）→ 不当子项；
-MinIO 对 `d/` 的 CreateMultipartUpload 回 `XMinioInvalidObjectName` → 该条目 `Unsupported`（只对这个请求 + 以 `/` 结尾
-的键改映射）。`ndx_walk` 仍拒绝 S3，它的 `entry_name` 对 `p/d/` 会给空名：放开 S3 前要一起修。
+MinIO 对 `d/` 的 CreateMultipartUpload 回 `XMinioInvalidObjectName` → 该条目 `Unsupported`（F5d 的专门映射；F5g 起这种请求
+不再发出，映射已删）。`ndx_walk` 仍拒绝 S3，它的 `entry_name` 对 `p/d/` 会给空名：放开 S3 前要一起修。
 
 真机矩阵（`directory_objects.sh`，2026-09-26；多版本 = 临时版本桶或 `data-mover-test-ver`，非多版本 = `data-mover-test`）：
 
 | 存储 | 多版本 | 非多版本 | 差异 |
 |---|---|---|---|
-| MinIO RELEASE.2023-03-20 | pass | pass | 拒绝对 `d/` 发 multipart（400 `XMinioInvalidObjectName`，单 PUT 可以）→ > 8 MiB 的 `d/` 写不了（typed `Unsupported`）；删除后的 `d/` 在 V2 列举里留无 ETag 的幻影、父目录仍列前缀；（H1 重放）合并连续删除标记，null 版本探测照常写标记 |
+| MinIO RELEASE.2023-03-20 | pass | pass | 拒绝对 `d/` 发 multipart（400 `XMinioInvalidObjectName`，单 PUT 可以）→ > 8 MiB 的 `d/` 写不了（typed `Unsupported`；F5g 起只发单次请求，已可写）；删除后的 `d/` 在 V2 列举里留无 ETag 的幻影、父目录仍列前缀；（H1 重放）合并连续删除标记，null 版本探测照常写标记 |
 | ONTAP 9.19.1 对象桶 | pass | pass | 一切按 S3；（H1）不合并连续删除标记 |
 | DXN（Ceph RGW Octopus） | pass | pass | UploadPartCopy 的 native 拷贝 `d/` 正常；（H1）合并连续删除标记；只有 null 版本的 key 重开版本、写新版本后再普通 DELETE：删掉 null 版本**并**写标记 |
 | StorageGRID 11.5 | pass | pass | `s3+sg` 的“native”走流式；ListObjectVersions 拒空 `version-id-marker`；（H1）已删除的 key 再 DELETE 每次新建标记（不合并） |
-| RustFS 1.0.0 | pass（脚本按探测到的差异断言） | pass（同左） | **对 `d/` 的 multipart 完成后存成 `d`（去掉 `/`，HEAD `d/` 404）**：我们的读回报 Verify `NotFound`（typed），但对象落在了同名文件 `d` 上 —— 会覆盖真实的文件 `d`；**版本桶里不给 `d/` 记版本**（每次写都是 `null`，DELETE 直接删掉）；native 从 `d/` 源 UploadPartCopy：版本桶里失败（会话 Connectivity，stage 与父目录指针留待续传），非版本桶里完成但同样存成 `d`；（H1）对未记版本的 `d/` 写删除标记不留记录 |
+| RustFS 1.0.0 | pass（脚本按探测到的差异断言） | pass（同左） | **对 `d/` 的 multipart 完成后存成 `d`（去掉 `/`，HEAD `d/` 404）**：我们的读回报 Verify `NotFound`（typed），但对象落在了同名文件 `d` 上 —— 会覆盖真实的文件 `d`（F5g 起不再发 multipart，真实文件不动）；**版本桶里不给 `d/` 记版本**（每次写都是 `null`，DELETE 直接删掉）；native 从 `d/` 源 UploadPartCopy：版本桶里失败（会话 Connectivity，stage 与父目录指针留待续传），非版本桶里完成但同样存成 `d`；（H1）对未记版本的 `d/` 写删除标记不留记录 |
 | ONTAP NAS 桶 `data-mover-nas`（D6） | — | 只记录 | 零字节 `d/`：PUT 200 但不留对象（只是目录 `d`），子项前后写都一样；有内容 `d/` 先写：存成**文件** `d`，之后 `d/c` PUT 404；有内容 `d/` 后写（子项已在）：PUT 409 Conflict |
+
+**F5g 实施结果（D13，`2352a6b`）**：S3 目的端对以 `/` 结尾的最终键一律走单次请求 —— 流式（Checkpointed / AtomicReplace）与
+`Direct` 一次 `PutObject`，native 一次 `CopyObject`，不看单 PUT 阈值（8 MiB）与 native 单次拷贝上限（64 MiB）；不写指针、不续传，
+失败从零开始（`staged/directory_object.rs::single_request_size`，at_destination / direct / native_final 三个 prepare 共用）。
+> 5 GiB 或源大小未知：新 `StagedDestination::directory_object_limit()`（默认 `None`，S3 = 5 GiB），引擎在描述源之后、租约与目的端
+任何 I/O 之前报 **Preflight**、目的端、条目 `Unsupported` / Permanent（`engine/directory_object.rs::refuse_oversized`，普通入口与
+expert 目的端半边都查），不回退；S3 prepare 自己也在 I/O 前同样拒（直接调用角色时为 Prepare）。协议层兜底：role
+`begin_multipart` / `complete_multipart` 对拼上前缀后以 `/` 结尾的键不发请求、回条目 `Unsupported`；legacy
+`create_multipart_upload` / `multipart_begin` / multipart rename / 可续传路径（接管已开的上传之前）/ `complete_multipart_upload`
+回 `UnsupportedType`（legacy 遍历本来不交出这种键，这是给把它交给 legacy 写入的调用方的兜底）。F5d 的 MinIO
+`XMinioInvalidObjectName` 专门映射（`begin_failure`）因不可达而删除。prepare 仍按父目录里的指针名清掉 F5g 之前的写入者留下的指针与
+上传（`directory_object_artifact` 保留）。前置 refactor `870f385`：`unsupported_at_preflight` 从 `refuse_unholdable` 提出。
+代价（需知）：流式目录对象与所有单 PUT 一样先整个缓冲在内存再发，每个进行中的传输最多 5 GiB；native 不缓冲。Checkpointed 的
+结果报 `SkippedBelowCheckpointThreshold`（单块时 `SkippedSingleSourceChunk`）。
+测试：fake 加 RustFS 旋钮（完成的 multipart `x/` 存成 `x`），目的端旁放真实文件 `dir/obj`：0 B / 5 B / 24 MiB 流式（两种 resume
+模式）、Direct 5 B / 24 MiB、native 3 B / 20 MiB（单次拷贝上限调到 5 MiB）都是一次请求、multipart / part / part copy 计数 0、真实
+文件不动；> 5 GiB 与大小未知在三个 prepare 都 `Unsupported`、植入的旧指针仍在；F5g 之前留下的指针与上传在 prepare 被清；引擎：12 MiB
+`d/` 在 Checkpointed / AtomicReplace / Direct / native 都一次请求，稀疏 5 GiB + 1 的本地源 → `d/` 在 Preflight 拒、旧指针仍在，
+expert 目的端同；线上：role 与 legacy 各入口对 `p/d/` 零请求。故障注入 13 项（去掉任一路由、引擎 / expert 守卫、协议 / legacy
+各守卫、5 GiB 上限、`directory_object_limit`，或把前缀拼接后的检查退回相对键）各让至少一个测试变红。
+真机（2026-09-26，`directory_objects.sh` 全矩阵 10 次：MinIO、RustFS 1.0.0、ONTAP 9.19.1 对象桶、DXN、StorageGRID 11.5 的版本与
+非版本桶）全部 `RESULT: pass`，清理后无 `dm-` 残留、无临时桶：12 MiB `mid/` 本地→S3 三种 policy、200 MiB `big/` 流式（切断后
+不留对象 / 指针 / 上传、重跑 `Fresh`）与 native（StorageGRID 为流式）都是一次请求（ETag 无 `-N`）、逐字节相等，同名真实文件
+`mid` / `big` 在 **RustFS** 与其余各家都不动；MinIO 上 > 8 MiB 的 `d/` 现在写得进去。
 
 D6 结论：零字节 `d/` 不会把目录变成文件（D6 的触发条件不成立）；**有内容的 `d/` 若先于子项写入，NAS 桶静默把它存成文件
 `d`**（我们的读回会报 `NotFound`，但文件 `d` 已在、之后子项全 404）。Blocks 下自己的对象在子项之前交出，按遍历顺序拷贝
-的消费方正好命中这种顺序。**用户 2026-09-26 定：D13（目录对象只用单次请求写）**，不加端点开关；NAS 桶由 §14.2 的 NAS profile（`directory_objects=false`）处理。
+的消费方正好命中这种顺序。**用户 2026-09-26 定：D13（目录对象只用单次请求写，F5g `2352a6b` 已实现）**，不加端点开关；NAS 桶由 §14.2 的 NAS profile（`directory_objects=false`）处理。
 
 风险要点：消费方若规范化尾 `/`，`p/d/` 与 `p/d` 会合并 → §4.1 写明路径逐字节比较、terrasync 要求同步；空名子项只经专用构造器；
 DeleteObject 在非 Enabled 桶上会删数据 → 每次调用前查；指针放父目录是 ADR-0006 新规则（`d` 与 `d/` 的 artifact 不冲突要有测试）。
@@ -1143,7 +1168,7 @@ N1–N7 在 H1、C7 之后。完整方案（file:line）见会话 scratchpad `s3
 | 9 | **legacy 版本列举假设 key 升序**：`src/s3/version_listing.rs` 的 `VersionPages::complete_keys` 把每页最大的 key 扣到下一页合并（C20），前提是 ListObjectVersions 按 key 升序返回。在无序存储上（ONTAP NAS 桶，Q22；NAS 桶不支持 ListObjectVersions，所以 ONTAP 上不会触发），同一个 key 的历史会被拆成几段、各自当成一个 key 发出（latest / `version_count` 错）；F2 的连续性校验在 legacy 里也只看每批 | 未修：legacy 在 P7 收尾整体删除；删除前若有调用方在无序存储上用 legacy 多版本列举，改为按整个目录物化分组（role-based 的做法）。role-based（C22 / C6）按目录物化分组，不受影响 |
 | 10 | **ONTAP `ListObjectVersions` 带 `delimiter=/` 会静默丢版本**（2026-09-26 实测，ONTAP 9.19.1）：截断页里有 CommonPrefix、且被收拢的 key 在列举前缀或该 CommonPrefix 之后紧跟多字节字符（如 `p/éb/x`、`p/x/中/y`）时，若页恰好停在后一个 key 的版本中间，服务端给 `NextKeyMarker=<key>` 却**不给** `NextVersionIdMarker`，下一页从该 key 之后开始，剩余版本被跳过（1000 个版本只回 998）。另：页停在 CommonPrefix 上时有时仍给 `NextVersionIdMarker`，下一页重复该前缀；恰好满页后跟一个空的末页；CommonPrefix 计入 max-keys。受影响：legacy `s3.rs` 两处 ListObjectVersions、role `s3/role_protocol/listing.rs` | **已修** `8d4b225`（F4）：截断页没有 `NextVersionIdMarker`、且 `NextKeyMarker` 那个 key 的条目恰是本页文档序的末尾一段时，用最后一条的 versionId 作 version-id-marker；续点不能确定（分组输出、读不到文档序且两种条目都在该 key 上）时不猜（role 该目录 `Protocol` 失败，legacy 先发完整的 key 再报错）；legacy 的 CommonPrefix 跨页去重（role 本来就去重）；空末页容忍。回归数据：ONTAP 实测响应 3 份（`tests/data/s3/ontap-versions-delimiter-*.xml`）；真机 `mkl/z` 1000 个版本 role / legacy 全列出 |
 | 11 | **RustFS 1.0.0 的 `ListObjectVersions` 原始 XML 不交错**（2026-09-26 实测，VM 105）：每页先列全部 `<DeleteMarker>`、再列全部 `<Version>`（各组内 key 升序、同 key 新→旧），所以一个 key 的条目在文档里不连续、第一条也不一定是 IsLatest。F2 的逐 key 校验会判不合格 → 该 key 标 `HistoryOrder::Inferred`、按 `LastModified` 排（同毫秒可能排错）。分页（key-marker / version-id-marker，max-keys 1/2/3）不丢不重 | 行为正确（回退如设计）；RustFS 上历史顺序只能推断。可选改进：对“分组输出”的存储（每页 marker 组 + version 组、各自按 key 升序新→旧）把两组当两条有序序列按 key 归并，同 key 内仍需时间决定交错 → 与今天的回退等价，不改。e2e-s3 的 RustFS 行期望 `order=inferred` |
-| 12 | **键以 `/` 结尾且有内容的 S3 对象**（“带内容的目录标记”）：MinIO、RustFS、ONTAP 对象桶、DXN 都允许（2026-09-26 实测，PUT 200）；ONTAP NAS 桶去掉末尾 `/` 存成普通文件。role 遍历把它报成该目录上的 `Failure{scope: Child}`（Unsupported），内容不列、不拷；**legacy walkdir（`src/s3.rs:3925`）静默跳过 —— 静默丢数据** | **已修**（F5a `ec3ee53` … F5f `43d0381`，历史重放 H1；§14.1）：role 遍历把它（以及零字节文件夹标记）列成文件条目 `d/`，S3→S3 拷贝，文件系统目的端 typed 跳过 / 拒绝；legacy 报 Scan 错误。遗留：MinIO / RustFS 上 > 8 MiB 的写入差异 → D13（F5g，只用单次请求写）；NAS 桶 → N 阶段 profile |
+| 12 | **键以 `/` 结尾且有内容的 S3 对象**（“带内容的目录标记”）：MinIO、RustFS、ONTAP 对象桶、DXN 都允许（2026-09-26 实测，PUT 200）；ONTAP NAS 桶去掉末尾 `/` 存成普通文件。role 遍历把它报成该目录上的 `Failure{scope: Child}`（Unsupported），内容不列、不拷；**legacy walkdir（`src/s3.rs:3925`）静默跳过 —— 静默丢数据** | **已修**（F5a `ec3ee53` … F5f `43d0381`，历史重放 H1；§14.1）：role 遍历把它（以及零字节文件夹标记）列成文件条目 `d/`，S3→S3 拷贝，文件系统目的端 typed 跳过 / 拒绝；legacy 报 Scan 错误。MinIO / RustFS 上 > 8 MiB 的写入差异已由 D13 消除（F5g `2352a6b`，只用单次请求写）；遗留：NAS 桶 → N 阶段 profile |
 
 ## 收尾：清理扫描相关旧代码
 
