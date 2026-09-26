@@ -42,7 +42,11 @@
 - **NFS**：卷 `ontap_lisaauto_nfs`（junction `/ontap_lisaauto_nfs`，unix，export policy default）。v3 / v4.0 / v4.1 都开着。
   - `mount_rootonly` 开着：**WSL 经 NAT 改写源端口，v3 MOUNT 被拒**（`AUTH_TOOWEAK` / “could not parse response due to bad status”）→ v3 在
     10.131.9.10 上以 root、特权端口跑（URL 不带 `noresvport`）。**不要改 SVM 设置**。v4.x 从 WSL 用 `noresvport=true`。
-  - 同一导出 v3 遍历 5400 条、v4.x 5399 条（2026-09-26，原因待查）。
+  - 同一导出 v3 比 v4.x 多一条：卷根的 `.snapshot`（2026-09-26 查清，P7 C7）。ONTAP 的 NFSv3 READDIRPLUS 列出它（未查 / 未改 SVM
+    设置），但不带描述所需的属性 / 句柄，所以 role 遍历把它报成一个 `Protocol` 子项失败（listed 5400 = 5399 + 1 失败，下钻不进去）；
+    NFSv4 的 READDIR 不列它。按名字 LOOKUP 两边都能进（目前列出来是空的）。除它之外 v3 / v4.1 的路径集合逐行相同。
+    legacy `walkdir` 用 GETATTR 补属性，把它当普通目录（3545 个目录）。对这类项补一次 LOOKUP 的修法已写好未提交：
+    补上之后 v3 会进入 `.snapshot`（卷上有快照时就是每个快照的整棵树），要不要进、要不要与 v4 一致地排除，待定。
 - **S3**（SVM `lizy` 的 object store server `s3lizy.com`，`http://10.128.61.200:80`，path-style），用户 `data-mover-test`（只在 `e2e-s3/ontap/.env`）：
   - `data-mover-test`（无版本，FlexGroup `fg_oss_1790405106`）、`data-mover-test-ver`（开版本，`fg_oss_1790405136`）：两个卷是建桶时 ONTAP 新建的
     （FAS2750_01_SSD_1 × 3 成员，thin 100 GB），后台重删 + 压缩。我们的用户**不能建桶**，脚本要用已有桶、跑完清空。

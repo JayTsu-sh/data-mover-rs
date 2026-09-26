@@ -265,7 +265,7 @@ type ListingStream = Pin<Box<dyn Stream<Item = Result<ListingPage, StorageRoleFa
 | backend | 流式做法 | 中途出错 |
 |---|---|---|
 | Local | 每页一次 `spawn_blocking`，把 `ReadDir` 带进带出；停车时不占 blocking 线程 | readdir 错误基本不是瞬时的 → `Interrupted`（已交付过）/ `Unreadable`（没交付）；已读到的先交付。**已实现** `277f1f8`：20 万文件平铺目录首项 400 ms → 6 ms、RSS 217 → 22 MB |
-| NFS | 生产者任务消费 `readdirplus` 流，按 `page_hint` 攒页 | **首页交出之前**可以整目录从头重试（legacy 就是这条规则，`nfs.rs:3364-3366`）；之后只能从 cookie 续（需要 nfs-rs 公开页接口，Q18），否则 `Interrupted` |
+| NFS | 生产者任务消费 `readdirplus` 流，按 `page_hint` 攒页 | **首页交出之前**可以整目录从头重试（legacy 就是这条规则，`nfs.rs:3364-3366`）；之后只能从 cookie 续（需要 nfs-rs 公开页接口，Q18），否则 `Interrupted`。**已实现** `7da78ce`：首页前句柄失效 → 解析路径（至多 3 次）、`DELAY` / `JUKEBOX` / `GRACE` → 列举节流预算内退避、nfs-rs 认证可重发的传输失败 → 250 ms / 1 s / 2 s，都从头重读、不重复交出；首页后不重试，已读到的先交出再失败（可重发的传输失败只让该列举失败）；drop / 取消在下一条之前停、不放弃在途请求。5 万文件平铺目录首项 ONTAP v3 1.2 s → 0.05 s、v4.0 / v4.1 2.2 s → 0.07 s、DXN-2 v3 6 s → 0.14 s、v4.0 10 s → 0.2 s；RSS 69–75 → 17–20 MB（release）；五种环境与 legacy 基线逐行相同 |
 | CIFS | 生产者任务持有 `Directory`，逐条 `entries` 攒页；所有出口都 close | 句柄失效无法续 → `Interrupted` |
 | S3 | 未开过版本控制的桶：ListObjectsV2，每页转一页；多版本桶：ListObjectVersions，按目录组装每个 key 的历史（见 5.3、第 10 节） | 同一 token 重发（无状态，安全）；节流退避。**已实现** `f2cacdc`（Current 流式；All 仍按目录物化，C11b）：不假设 key 有序（只用不透明 token，前缀名集合去重，对象只与上一页比对，列完才判 `NotFound`）；节流按 C3 预算、其他瞬时失败同一 token 再发至多 3 次（读到一页即续满），首页前后一样；500 万上限不再限流式 Current 的对象数，只管驻留的前缀名集合与不可解码 key（续页 token 另限 500 万）；物化的 All 仍按条数计（用户 2026-09-26 定，**已修** `ffd37ca`；5,000,001 个对象的平铺前缀在生产上限下流完）。2 万对象平铺前缀首项 MinIO 3.5 s → 0.4 s、ONTAP 1.2 s → 0.13–0.25 s，RSS 68 → 54 / 66 → 50 MB（debug）；MinIO / ONTAP（含 NAS 桶）/ RustFS / DXN 的多版本与非多版本桶均已跑 |
 | HDFS | `list_status_iter`（hdfs-native `client.rs:734`）；去掉列举前的 `get_metadata` | 续读：hdfs-native 不公开 startAfter，可重试失败（I/O、单批 > 5 s）后重开列举、跳过到最后读到的名字之后（按 NameNode 的有符号字节序；只在失败时多读），首页前后都可续、不重复发子项；其他失败或预算用完 → `Interrupted`。**已实现** `9c8185f`；有符号字节序、列举文件回自身、缺目录 `FileNotFound` 三点待真机（runner 需用户批准） |
@@ -783,6 +783,9 @@ RSS 从不封顶（21 → 192 MB）。子树 `d000`（16.8 万目录）即达 11
 （NFS 是 ≤ 64 B 的文件句柄，绝不引用 READDIRPLUS 页），`ListRequest` 增加可选的同类提示；有提示就直接 READDIRPLUS，
 没有或已失效（`NFS3ERR_STALE` / `BADHANDLE`）才回退 `lookup_fh(path)`；列举不再写 `GLOBAL_CACHE`（变更路径仍可用它）。
 内存变为“待处理目录数 × 约 64 B”，与 legacy 同形。落在 C7（NFS 侧）与 C4 / C10（调度器携带提示）。
+**已实现** `7da78ce`（NFS 侧；C4 的载体 `e86f87b`）：提示 = 8 字节命名空间标签 + 句柄拷贝（≤ 128 B），别的命名空间的提示不读；
+失效还包括 `NFS4ERR_STALE` / `FHEXPIRED`；`ndx_walk` / `delete_tree` 暂不带提示（每目录一次 LOOKUP，仍经 `lookup_fh` 缓存）。
+node1 整树的 RSS 复测归 Phase 6 的性能门。
 预计 Blocks ≤ 100 MB 容易达到；Unordered ≤ 30 MB 还可能要 O2 / O4（启动约 20 MB，其中 12 MB 是二进制映射）。
 CPU 的差距（1.51× 对 ≤ 1.4×）按 O2 → O3 在 Phase 6 处理。原始数据：node1 `/root/dm/p7-base/logs`、`/root/dm/p7-rss/`。
 
@@ -853,7 +856,7 @@ H1  feat(s3): 目的端重放删除标记（StagedDestination::write_delete_mark
 P1–P5  S3 URL 参数化（§14.2）—— F5 合入后，可与 C7 并行
 N0     NAS 桶实测（curl，§14.2）—— 立即
 N1–N7  `compat=ontap&bucket_type=nas` 的 NAS 桶 profile（§14.2）—— H1、C7 之后
-C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:4610-4691
+C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:4610-4691   —— 已完成：cdcc66d（搬移）、7da78ce
     + 子目录句柄作为下钻提示随工作项下传，列举不再写 GLOBAL_CACHE，无提示 / 失效回退 lookup_fh（§12.7 修法 A）
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
 C9  feat(storage): CIFS 流式（生产者持有句柄；停车句柄上限） - src/storage/backends/cifs/{protocol.rs:230-280, namespace.rs:59-94}
@@ -897,7 +900,7 @@ VERIFY
   Blocks 流式后、Unordered 后；与 legacy 交替四轮；条目数必须 53,368,420
 - FAS2750：e2e-cifs；cifs_namespace_contract；深链 + 宽树 c=1/4/32；停车句柄 30 分钟；CIFS 与 NFS 的 Blocks 下钻顺序逐行一致
 - **NFS 真机（用户 2026-09-26 定）**：ONTAP FAS2750（lizy `/ontap_lisaauto_nfs`）**NFSv3、NFSv4.0、NFSv4.1 三种**（v4.x 从 WSL；v3 因 mount_rootonly + WSL NAT
-  只能在 10.131.9.10 上以 root、特权端口跑，二进制从 WSL 拷过去；不改 lizy 设置；注意 v3 遍历 5400 条、v4.x 5399 条，C7 查清）+ **DXN-2（10.128.136.211）`/nfv3_v4` 下的 `data-mover-test/`，NFSv3 与 NFSv4.0 各一遍**
+  只能在 10.131.9.10 上以 root、特权端口跑，二进制从 WSL 拷过去；不改 lizy 设置；v3 遍历 5400 条、v4.x 5399 条已在 C7 查清：多出的是 v3 READDIRPLUS 列出的卷根 `.snapshot`，见 test-environments.md）+ **DXN-2（10.128.136.211）`/nfv3_v4` 下的 `data-mover-test/`，NFSv3 与 NFSv4.0 各一遍**
   （`e2e-nfs/dxn-v3/.env`、`dxn-v40/.env`，只写该子目录）；m1 NFSv3 用于大树 / node1 性能。每个动 NFS 的步骤（C7、C10、C11、收尾清理）都要过
 - **S3 真机（用户 2026-09-26 定：本次重构的 S3 实际测试环境）**，每个动 S3 的步骤（C6、F4、C10、C11、C11b、收尾清理）都要在下列每一套上过；
   **ONTAP、RustFS、DXN、StorageGRID 都要在多版本桶与非多版本桶上各验证一遍**（ONTAP：data-mover-test-ver / data-mover-test，另加 NAS 桶；RustFS、DXN：data-mover-test + 临时版本桶）：
