@@ -79,22 +79,30 @@ pub(super) fn refuse_unholdable(
             "the source holds no directory objects: a path ending in '/' names no file",
         ),
     };
-    let failure = EntryOperationFailure::new(
+    Err(unsupported_at_preflight(path, side, operation, diagnostic))
+}
+
+fn unsupported_at_preflight(
+    path: &StoragePath,
+    side: TransferSide,
+    operation: Operation,
+    diagnostic: &str,
+) -> TransferFailure {
+    match EntryOperationFailure::new(
         path.clone(),
         operation,
         FailureClass::Unsupported,
         Transience::Permanent,
         diagnostic,
-    )
-    .map_err(|_| {
-        TransferFailure::orchestration(
+    ) {
+        Ok(failure) => TransferFailure::role(
+            TransferPhase::Preflight,
+            side,
+            StorageRoleFailure::Entry(failure),
+        ),
+        Err(_) => TransferFailure::orchestration(
             TransferPhase::Preflight,
             "a path ending in '/' names no file on this storage",
-        )
-    })?;
-    Err(TransferFailure::role(
-        TransferPhase::Preflight,
-        side,
-        StorageRoleFailure::Entry(failure),
-    ))
+        ),
+    }
 }
