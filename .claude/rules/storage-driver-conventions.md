@@ -46,13 +46,17 @@ grep -nE 'retry|backoff|sleep' src/{nfs,s3,local}.rs src/storage/backends/cifs/*
 **verify**:
 
 ```bash
-grep -nE 'UrlParseError|ConfigError' src/{nfs,s3,local}.rs
+grep -nE 'UrlParseError|ConfigError' src/{nfs,s3,local}.rs src/s3/url_options.rs
 ```
 
-URL 解析阶段返回 `UrlParseError`；URL 解析后的语义校验返回 `ConfigError`。
+**URL 文本自己就能判定的错误**都返回 `UrlParseError`：语法、协议名（含已删除的旧协议名，报错给出新写法）、
+未知 / 重复 / 空值的参数、写出默认值的参数、参数之间的组合（例如 S3 的 `tls_verify` 用在 `s3://` 上、
+`bucket_type=nas` 不带 `compat=ontap`）。要看 URL 之外的东西（环境、另一份配置、服务端）才能判定的是
+`ConfigError`。
 
-**why**: 上游能精准区分"用户写错 URL" vs "配置缺字段"。
-**how to apply**: `url::Url::parse(...)?` 失败 → `UrlParseError`。后续提取字段失败 → `ConfigError`。
+**why**: 上游能精准区分"用户写错 URL" vs "配置缺字段"；同一段 URL 文本在任何环境下报同一个错。
+**how to apply**: `url::Url::parse(...)?` 失败、参数表校验失败 → `UrlParseError`；URL 本身合法、与其他配置
+矛盾 → `ConfigError`。S3 的参数表只在 `src/s3/url_options.rs` 一处。报错不回显 URL 与凭据（R8）。
 
 ## D5 · backend 内部不可反向依赖 `StorageEnum`
 

@@ -31,25 +31,26 @@ pub(crate) fn path_to_s3_key(path: &Path) -> Cow<'_, str> {
 
 /// Detects the storage type from a path by checking its prefix.
 /// This handles NFS and S3 paths specially by checking for their respective prefixes.
+///
+/// Any `s3+…://` scheme is S3, so a removed scheme (`s3+sg://`, …) reaches the S3 parser's error
+/// naming its replacement instead of being taken for a local path.
 #[must_use]
 pub fn detect_storage_type(path: &str) -> StorageType {
     match path {
         p if p.starts_with("hdfs://") => StorageType::Hdfs,
         p if p.starts_with("smb://") => StorageType::Cifs,
         p if p.starts_with("nfs://") => StorageType::Nfs,
-        p if p.starts_with("s3://")
-            || p.starts_with("s3+http://")
-            || p.starts_with("s3+https://")
-            || p.starts_with("s3+sg://")
-            || p.starts_with("s3+sg+https://")
-            || p.starts_with("s3+dxn://")
-            || p.starts_with("s3+dxn+https://")
-            || p.starts_with("s3+hcp://") =>
-        {
-            StorageType::S3
-        }
+        p if is_s3_scheme(p) => StorageType::S3,
         _ => StorageType::Local,
     }
+}
+
+/// `s3://` or `s3+<anything>://`, in any case.
+fn is_s3_scheme(path: &str) -> bool {
+    path.split_once("://").is_some_and(|(scheme, _)| {
+        let scheme = scheme.to_ascii_lowercase();
+        !scheme.contains('/') && (scheme == "s3" || scheme.starts_with("s3+"))
+    })
 }
 
 /// 根据路径前缀创建对应的存储实例

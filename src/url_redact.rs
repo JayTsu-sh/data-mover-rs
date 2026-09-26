@@ -10,7 +10,7 @@
 
 /// 屏蔽 URL 中的 `user:password@` 部分为 `***:***@`。
 ///
-/// 凭据段按「`://` 之后的**最后一个** `@`」切分，与 `s3::extract_s3_credentials` 读取 AK/SK 的规则
+/// 凭据段按「`://` 之后的**最后一个** `@`」切分，与 `s3::url_options::split_s3_url` 读取 AK/SK 的规则
 /// 一致：S3 SK 常含 `/`、`+`、`=`，标准 URL 解析器会把 `/` 当成 authority 的结束，看不到真正的
 /// userinfo（旧实现因此在解析失败或误拆时原样返回，泄漏 SK）。
 ///
@@ -45,8 +45,8 @@ mod tests {
     fn redacts_s3_credentials() {
         for url in [
             "s3://AKIA1234:secretXYZ@bucket.host:9000/prefix",
-            "s3+sg+https://AKIA1234:secretXYZ@bucket.storagegrid.example/prefix",
-            "s3+dxn://AKIA1234:secretXYZ@bucket.dxn.example/prefix",
+            "s3+https://AKIA1234:secretXYZ@bucket.storagegrid.example/prefix?compat=sg",
+            "s3://AKIA1234:secretXYZ@bucket.dxn.example/prefix?compat=dxn",
         ] {
             let out = redact_storage_url(url);
             assert!(out.contains("***:***@"));
@@ -55,7 +55,7 @@ mod tests {
     }
 
     /// S3 secret keys are base64-like and often contain `/`, `+` or `=`; the crate takes them as
-    /// written (`extract_s3_credentials` splits at the last `@`), so no URL parser sees the
+    /// written (`url_options::split_s3_url` splits at the last `@`), so no URL parser sees the
     /// userinfo where it is.
     #[test]
     fn redacts_secrets_that_a_url_parser_cannot_see() {
@@ -116,9 +116,27 @@ mod tests {
             "hdfs://***:***@nn:8020/p"
         );
         assert_eq!(
-            redact_storage_url("s3+hcp://AK:S/K+=@ns.tenant.hcp.example/p"),
-            "s3+hcp://***:***@ns.tenant.hcp.example/p"
+            redact_storage_url("s3://AK:S/K+=@ns.tenant.hcp.example/p?compat=hcp"),
+            "s3://***:***@ns.tenant.hcp.example/p?compat=hcp"
         );
+    }
+
+    /// S3 options follow the location and hold no secret: they stay readable. A secret key with
+    /// `?` is still cut at the last `@`, before the options.
+    #[test]
+    fn s3_options_stay_readable() {
+        assert_eq!(
+            redact_storage_url("s3+https://AK:S?K/+=@b.host:8182/p?compat=dxn&tls_verify=false"),
+            "s3+https://***:***@b.host:8182/p?compat=dxn&tls_verify=false"
+        );
+        assert_eq!(
+            redact_storage_url("s3://AK:SK@b.host/p?compat=ontap&bucket_type=nas"),
+            "s3://***:***@b.host/p?compat=ontap&bucket_type=nas"
+        );
+        // An `@` inside an option value (never a valid value) over-redacts, never leaks.
+        let out = redact_storage_url("s3://AK:SECRET@b.host/p?compat=a@b");
+        assert_eq!(out, "s3://***:***@b");
+        assert!(!out.contains("SECRET"));
     }
 
     #[test]

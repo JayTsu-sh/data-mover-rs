@@ -47,9 +47,10 @@ pub(super) fn connect(
         native,
         match compat {
             S3Compatibility::Dxn => S3TagSupport::Unsupported,
-            S3Compatibility::Standard | S3Compatibility::StorageGrid | S3Compatibility::Hcp => {
-                S3TagSupport::Supported
-            }
+            S3Compatibility::Standard
+            | S3Compatibility::StorageGrid
+            | S3Compatibility::Hcp
+            | S3Compatibility::Ontap => S3TagSupport::Supported,
         },
         Some(single_put_threshold),
     )
@@ -57,11 +58,29 @@ pub(super) fn connect(
 
 /// The native-copy affinity label of a profile: two storages copy natively only on the same
 /// endpoint under the same label. `StorageGRID` never copies natively; HCP keeps the standard
-/// label (its `CopyObject` is standard S3).
+/// label (its `CopyObject` is standard S3); ONTAP has its own, so a copy between a `compat=ontap`
+/// URL and a standard URL of the same endpoint streams.
 fn native_label(compat: S3Compatibility) -> Option<&'static str> {
     match compat {
         S3Compatibility::Standard | S3Compatibility::Hcp => Some("standard"),
         S3Compatibility::Dxn => Some("dxn"),
+        S3Compatibility::Ontap => Some("ontap"),
         S3Compatibility::StorageGrid => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{S3Compatibility, native_label};
+
+    /// Native copies pair only under one label: `compat=ontap` and a standard URL of the same
+    /// endpoint stream, HCP pairs with standard, `StorageGRID` never copies natively.
+    #[test]
+    fn native_labels() {
+        assert_eq!(native_label(S3Compatibility::Standard), Some("standard"));
+        assert_eq!(native_label(S3Compatibility::Hcp), Some("standard"));
+        assert_eq!(native_label(S3Compatibility::Dxn), Some("dxn"));
+        assert_eq!(native_label(S3Compatibility::Ontap), Some("ontap"));
+        assert_eq!(native_label(S3Compatibility::StorageGrid), None);
     }
 }

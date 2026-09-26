@@ -1,4 +1,5 @@
 use data_mover::HdfsConfig;
+use data_mover::error::StorageError;
 use data_mover::storage_enum::{
     BackendConfig, CreateStorageOptions, StorageType, create_storage, detect_storage_type,
 };
@@ -113,6 +114,25 @@ fn test_s3_dxn_https() {
     );
 }
 
+/// The URL options live in the query; any `s3+…://` scheme (e.g. a removed one) is S3, so it
+/// reaches the S3 parser's error naming the new spelling.
+#[test]
+fn test_s3_options_and_unknown_s3_schemes() {
+    for url in [
+        "s3://bucket.host/data?compat=dxn",
+        "s3+https://bucket.host/data?compat=sg&tls_verify=false",
+        "s3://bucket.host/data?compat=ontap&bucket_type=nas",
+        "S3://bucket.host/data",
+        "S3+HTTPS://bucket.host/data",
+        "s3+whatever://bucket.host/data",
+    ] {
+        assert_eq!(detect_storage_type(url), StorageType::S3, "{url}");
+    }
+    for path in ["s3+backup/dir", "./s3+x/y", "s3", "dir/s3://x"] {
+        assert_eq!(detect_storage_type(path), StorageType::Local, "{path}");
+    }
+}
+
 #[test]
 fn test_relative_path() {
     assert_eq!(detect_storage_type("./relative/path"), StorageType::Local);
@@ -121,6 +141,25 @@ fn test_relative_path() {
 #[test]
 fn test_empty_string() {
     assert_eq!(detect_storage_type(""), StorageType::Local);
+}
+
+/// A removed scheme fails before any network I/O, naming its replacement and never the key pair.
+#[tokio::test]
+async fn test_removed_s3_scheme_names_the_new_spelling() {
+    let error = create_storage(
+        "s3+dxn+https://AKIDREMOVED:SeCrEt/Removed@bucket.127.0.0.1:1/p",
+        CreateStorageOptions::default(),
+    )
+    .await
+    .err();
+    let Some(StorageError::UrlParseError(message)) = error else {
+        panic!("expected UrlParseError, got {error:?}");
+    };
+    assert!(
+        message.contains("s3+https://…?compat=dxn&tls_verify=false"),
+        "{message}"
+    );
+    assert!(!message.contains("AKIDREMOVED") && !message.contains("SeCrEt"));
 }
 
 #[tokio::test]

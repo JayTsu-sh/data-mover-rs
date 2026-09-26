@@ -160,6 +160,15 @@ fn network_endpoint_identities_are_derived_offline_without_credentials()
         s3.stable_id(),
         "s3://10.131.9.11:9000/data-mover-test/resume-base"
     );
+    // URL options are not part of the endpoint: changing one keeps every recovery binding.
+    let with_options = endpoint_identity(&BackendConfig::S3(S3BackendConfig {
+        url: "s3+https://SENSITIVEAK:wJal/r+X=@Data-Mover-Test.10.131.9.11:9000/resume-base\
+              ?compat=ontap&tls_verify=false"
+            .into(),
+        block_size: None,
+        single_put_threshold: None,
+    }))?;
+    assert_eq!(with_options.stable_id(), s3.stable_id());
     let nfs = endpoint_identity(&BackendConfig::Nfs(NfsBackendConfig {
         url: "nfs://10.128.61.200/ontap_lisaauto_nfs:/data?version=4.1&uid=0&gid=0".into(),
         block_size: None,

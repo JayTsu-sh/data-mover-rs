@@ -64,7 +64,7 @@ use crate::{
     DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, Result, S3Entry,
     StorageEntryMessage, Tag, WalkDirAsyncIterator, datetime_to_string,
 };
-use url_options::{S3Compatibility, S3UrlOptions, split_s3_url};
+use url_options::{S3BucketType, S3Compatibility, S3UrlOptions, S3UrlTarget, split_s3_url};
 use version_listing::{
     ListedEntry, VersionOrDeleteMarker, VersionPages, oldest_first_by_key, versions_with_latest,
 };
@@ -145,6 +145,8 @@ mod dxn;
 mod multipart_rename;
 mod storagegrid;
 mod url_options;
+#[cfg(test)]
+mod url_options_tests;
 mod version_listing;
 mod version_order;
 #[cfg(test)]
@@ -193,7 +195,7 @@ fn build_copy_source(bucket: &str, key: &str) -> String {
 /// 解析不含 bucket 的 S3 端点 URL。
 /// 返回 (`access_key`, `secret_key`, endpoint, options)
 fn parse_s3_endpoint_url(url: &str) -> Result<(String, String, String, S3UrlOptions)> {
-    let parts = split_s3_url(url)?;
+    let parts = split_s3_url(url, S3UrlTarget::Endpoint)?;
     let endpoint = format!(
         "{}://{}",
         parts.options.http_scheme(),
@@ -224,7 +226,7 @@ pub(crate) fn endpoint_identity(url: &str) -> Result<crate::model::BackendIdenti
 }
 
 fn parse_s3_url(url: &str) -> Result<ParsedS3Url> {
-    let parts = split_s3_url(url)?;
+    let parts = split_s3_url(url, S3UrlTarget::Bucket)?;
     let options = parts.options;
     let http_scheme = options.http_scheme();
 
@@ -236,7 +238,7 @@ fn parse_s3_url(url: &str) -> Result<ParsedS3Url> {
     // 获取主机名
     let host = parsed_url
         .host_str()
-        .ok_or_else(|| StorageError::InvalidPath("URL中缺少主机名".to_string()))?;
+        .ok_or_else(|| StorageError::UrlParseError("URL中缺少主机名".to_string()))?;
 
     // 解析bucket名称和主机信息
     let (bucket_name, host_and_port) = if let Some(first_dot_index) = host.find('.') {
@@ -408,7 +410,9 @@ fn configure_compatibility(
     compatibility: S3Compatibility,
 ) -> aws_sdk_s3::config::Builder {
     match compatibility {
-        S3Compatibility::Standard | S3Compatibility::Hcp => delete_objects_md5::configure(builder),
+        S3Compatibility::Standard | S3Compatibility::Hcp | S3Compatibility::Ontap => {
+            delete_objects_md5::configure(builder)
+        }
         S3Compatibility::StorageGrid => storagegrid::configure(builder),
         S3Compatibility::Dxn => dxn::configure(builder),
     }
@@ -809,6 +813,12 @@ impl S3Storage {
             host,
             options,
         } = parse_s3_url(url)?;
+        if options.bucket_type == S3BucketType::Nas {
+            return Err(StorageError::UnsupportedType(
+                "S3 bucket_type=nas (the ONTAP NAS bucket profile) is not implemented yet"
+                    .to_string(),
+            ));
+        }
 
         let region = "us-east-1"; // MinIO 默认区域
 
@@ -4800,104 +4810,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_storagegrid_url() {
-        let url = "s3+sg://ak:sk@bucket.storagegrid.example:8082/prefix";
-        let ParsedS3Url {
-            access_key: ak,
-            secret_key: sk,
-            bucket_name: bucket,
-            endpoint,
-            prefix,
-            host,
-            options,
-        } = parse_s3_url(url).assert_value("test value should be present");
-        assert_eq!(ak, "ak");
-        assert_eq!(sk, "sk");
-        assert_eq!(bucket, "bucket");
-        assert_eq!(endpoint, "http://storagegrid.example:8082");
-        assert_eq!(prefix, "prefix/");
-        assert_eq!(host, "storagegrid.example");
-        assert!(!options.skips_tls_verification());
-        assert_eq!(options.compat, S3Compatibility::StorageGrid);
-    }
-
-    #[test]
-    fn test_parse_storagegrid_https_url() {
-        let url = "s3+sg+https://ak:sk@bucket.storagegrid.example:443/prefix";
-        let ParsedS3Url {
-            endpoint, options, ..
-        } = parse_s3_url(url).assert_value("test value should be present");
-        assert_eq!(endpoint, "https://storagegrid.example:443");
-        assert!(options.skips_tls_verification());
-        assert_eq!(options.compat, S3Compatibility::StorageGrid);
-    }
-
-    #[test]
-    fn test_parse_dxn_urls() {
-        let url = "s3+dxn://ak:sk@bucket.dxn.example:8184/prefix";
-        let ParsedS3Url {
-            endpoint,
-            prefix,
-            host,
-            options,
-            ..
-        } = parse_s3_url(url).assert_value("test value should be present");
-        assert_eq!(endpoint, "http://dxn.example:8184");
-        assert_eq!(prefix, "prefix/");
-        assert_eq!(host, "dxn.example");
-        assert!(!options.skips_tls_verification());
-        assert_eq!(options.compat, S3Compatibility::Dxn);
-
-        let ParsedS3Url {
-            endpoint, options, ..
-        } = parse_s3_url("s3+dxn+https://ak:sk@bucket.dxn.example:443/prefix")
-            .assert_value("test value should be present");
-        assert_eq!(endpoint, "https://dxn.example:443");
-        assert!(options.skips_tls_verification());
-        assert_eq!(options.compat, S3Compatibility::Dxn);
-    }
-
-    #[test]
-    fn test_parse_hcp_url() {
-        let ParsedS3Url {
-            endpoint, options, ..
-        } = parse_s3_url("s3+hcp://ak:sk@ns.tenant.hcp.example/prefix")
-            .assert_value("test value should be present");
-        assert_eq!(endpoint, "http://tenant.hcp.example");
-        assert_eq!(options.compat, S3Compatibility::Hcp);
-        assert!(!options.skips_tls_verification());
-    }
-
-    /// One scheme table for bucket and endpoint URLs, matched without regard to case.
-    #[test]
-    fn test_scheme_table_is_shared_and_case_insensitive() {
-        let ParsedS3Url { options, .. } = parse_s3_url("S3+HTTPS://ak:sk@bucket.host.com/p")
-            .assert_value("test value should be present");
-        assert!(options.https && options.skips_tls_verification());
-        let (_, _, endpoint, options) = parse_s3_endpoint_url("S3+DXN+HTTPS://ak:sk@host.com")
-            .assert_value("test value should be present");
-        assert_eq!(endpoint, "https://host.com");
-        assert_eq!(options.compat, S3Compatibility::Dxn);
-        let (_, _, endpoint, options) = parse_s3_endpoint_url("s3+hcp://ak:sk@tenant.hcp.example")
-            .assert_value("test value should be present");
-        assert_eq!(endpoint, "http://tenant.hcp.example");
-        assert_eq!(options.compat, S3Compatibility::Hcp);
-        for url in ["http://ak:sk@bucket.host.com/p", "s3+foo://ak:sk@host.com"] {
-            assert!(
-                matches!(parse_s3_url(url), Err(StorageError::InvalidPath(_))),
-                "{url}"
-            );
-            assert!(
-                matches!(
-                    parse_s3_endpoint_url(url),
-                    Err(StorageError::InvalidPath(_))
-                ),
-                "{url}"
-            );
-        }
-    }
-
-    #[test]
     fn test_parse_s3_url_no_prefix() {
         let url = "s3://ak:sk@bucket.host.com:9000";
         let ParsedS3Url {
@@ -4984,39 +4896,6 @@ mod tests {
             parse_s3_endpoint_url(url).assert_value("test value should be present");
         assert!(!options.skips_tls_verification());
         assert_eq!(options.compat, S3Compatibility::Standard);
-    }
-
-    #[test]
-    fn test_parse_storagegrid_endpoint_urls() {
-        let (_, _, endpoint, options) =
-            parse_s3_endpoint_url("s3+sg://ak:sk@storagegrid.example:8082")
-                .assert_value("test value should be present");
-        assert_eq!(endpoint, "http://storagegrid.example:8082");
-        assert!(!options.skips_tls_verification());
-        assert_eq!(options.compat, S3Compatibility::StorageGrid);
-
-        let (_, _, endpoint, options) =
-            parse_s3_endpoint_url("s3+sg+https://ak:sk@storagegrid.example:443")
-                .assert_value("test value should be present");
-        assert_eq!(endpoint, "https://storagegrid.example:443");
-        assert!(options.skips_tls_verification());
-        assert_eq!(options.compat, S3Compatibility::StorageGrid);
-    }
-
-    #[test]
-    fn test_parse_dxn_endpoint_urls() {
-        let (_, _, endpoint, options) = parse_s3_endpoint_url("s3+dxn://ak:sk@dxn.example:8184")
-            .assert_value("test value should be present");
-        assert_eq!(endpoint, "http://dxn.example:8184");
-        assert!(!options.skips_tls_verification());
-        assert_eq!(options.compat, S3Compatibility::Dxn);
-
-        let (_, _, endpoint, options) =
-            parse_s3_endpoint_url("s3+dxn+https://ak:sk@dxn.example:443")
-                .assert_value("test value should be present");
-        assert_eq!(endpoint, "https://dxn.example:443");
-        assert!(options.skips_tls_verification());
-        assert_eq!(options.compat, S3Compatibility::Dxn);
     }
 
     // --- 构造测试用 S3Storage（不连接实际 S3 服务） ---
