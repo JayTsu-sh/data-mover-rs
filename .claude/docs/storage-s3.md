@@ -286,7 +286,8 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   `PermissionDenied` / Permanent（AWS 403 `AccessDenied`；MinIO 400 `InvalidRequest`「Object is WORM protected」，实测）；
   405（存储不支持按版本删）→ `Unsupported`，不是带版本读的「删除标记」`NotFound`。`list_versions(key)` =
   ListObjectVersions 以 key 为前缀、只留精确 key，一页里出现别的 key 就停（精确 key 排在它前缀的所有 key 之前）。
-  `S3WriteFacts.reported_version` 按响应原样保存版本（含 `"null"`），`version_id` 仍只放真版本。
+  `S3WriteFacts.reported_version` 按响应原样保存版本（含 `"null"`），`version_id` 仍只放真版本；例外：连接时桶是
+  Suspended 而回复没有版本头 → 记 `"null"`（`S3Storage::write_facts`，`958a3f9`；RustFS 1.0.0 暂停版本时 PUT 不回头）。
 - **指针按自己的版本删**（`upload_pointer::delete`）：PUT 回的版本；回复丢失但读回逐字节相同 → 用读回 HEAD 的版本
   （字节含本次 prepare 的 nonce，不可能是别人写的）；discovery 清遗留指针 → 删它读到的那个版本（`S3Artifacts`
   记 `found_version`）；续传接管写了新指针后，删被替换的旧指针版本（`delete_replaced`），否则我们的删掉后旧的会重新
@@ -296,8 +297,10 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - **扫尾**（`upload_pointer::sweep`）：SDK 重发一个首发已提交但丢了回复的 PutObject，会留下两个逐字节相同的版本，
   我们只知道后一个；按版本删掉它，前一个就成了当前。所以每次按版本删指针后再读一次当前指针：内容是「陈旧内容」之一
   （删掉的那份、续传替换掉的那份）就按它的版本再删，最多 4 次；别人的指针不动；失败只告警（对象已发布 / 已丢弃，下次
-  prepare 会清）。发布 / discard / discovery 清遗留 / 小对象清遗留都走它。暂停版本（PUT 回 `"null"`）→ `?versionId=null`（MinIO 在未开版本的桶上也接受）；响应不带版本
-  （未开版本的桶）→ 仍是普通 DeleteObject。
+  prepare 会清）。发布 / discard / discovery 清遗留 / 小对象清遗留都走它。暂停版本（PUT 回 `"null"`，或连接时 Suspended 而回复没版本头）→ `?versionId=null`（MinIO 在未开版本的桶上也接受；
+  RustFS 暂停桶里回 204 + `x-amz-delete-marker: false`）；响应不带版本且桶不是 Suspended（未开版本的桶）→ 仍是普通
+  DeleteObject。`958a3f9` 之前 RustFS 暂停桶里的指针走了普通 DELETE，按 S3 语义留下一个 `"null"` 删除标记
+  （`versioning_matrix.sh` 暂停 200 MiB 行 1 标记 + 1 artifact；MinIO 回 null 头所以没有）。
 - **Object Lock**：删指针版本被拒（`PermissionDenied`：legal hold / retention，或策略只给 DeleteObject 不给
   DeleteObjectVersion）、存储不支持按版本删（`Unsupported`）、或拒绝它自己报的 `"null"`（`InvalidInput`）→
   `tracing::warn!`，改发普通 DeleteObject 用删除标记盖住它；传输照常成功并报版本，下次 prepare 看不到指针。
@@ -327,7 +330,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   否则 `Conflict`、最终 key 已变。C15c 的 `final_destination_changed` 规则不变。`Direct`：先 abort —— 回
   `NoSuchUpload`（已完成）→ 同上认领；abort 成功（我们的没完成）或失败 → 仍按 C14c 只 HEAD 比对，相同的旧对象算写成，
   但**不认领版本**。
-- 暂停版本：PUT 回 `x-amz-version-id: null`，MinIO 的 Complete 不回版本头 → `destination_version` 都是 `None`。
+- 暂停版本：PUT 回 `x-amz-version-id: null`（RustFS 不回，见上），MinIO 的 Complete 不回版本头 → `destination_version` 都是 `None`。
 - **原生 S3→S3 的 temp key 路径**（历史：C18 起只在开关关掉时可达，C19 已删，下面的 `delete_temp_key` 随之删除）：temp key 按 key 名只属于这个 stage，删除改为 `publication::delete_temp_key`
   —— 列出它的每个条目（版本、删除标记、`"null"` 版本都算）逐个按 id 删（版本化桶里普通删除会把整份对象留在删除标记
   下面；`[null(最新), v1]` 这种先开版本后暂停的情况两个都删）；列表为空 → 什么都不发（不加空删除标记）；列不出
@@ -368,12 +371,14 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - 协议新增：`copy_from(source, to)` = `CopyObject`，`x-amz-copy-source-if-match` 钉 ETag、有版本就带 `?versionId=`，
   返回副本的 `ETag` + 版本；`upload_part_copy(source, key, upload_id, n, range)` = `UploadPartCopy`，同样钉住，返回段 ETag。
   源变了 → 412 → `Conflict`；源没了 → `NotFound`。
-- **`UploadPartCopy` 带 `Content-Length: 0`**（所有 profile，2026-09-25）：SDK 对没有 body 的请求不发长度（hyper 对空
-  body 不加），Ceph RGW（DXN）把 `UploadPartCopy` 当分段上传处理、要求声明长度，缺了回 `411 MissingContentLength` ——
-  DXN 上每个 > 64 MiB 的原生拷贝都因此失败。`copy_part` 用 `customize().mutate_request` 加上它（RFC 9110：PUT 应带长度；
-  MinIO 实测接受）。`CopyObject` 不加：RGW 另走一条路，缺长度照样接受（DXN 实测）。wire 测试
-  `role_protocol::native::tests::copies_pin_the_source_and_copy_no_metadata` 断言两者。legacy `multipart_rename` 的
-  `UploadPartCopy` 没改（在 DXN 上大概率同样 411，未验证）。
+- **拷贝请求都带 `Content-Length: 0`**（所有 profile）：SDK 对没有 body 的请求不发长度（hyper 对空 body 不加）。Ceph RGW
+  （DXN）把 `UploadPartCopy` 当分段上传处理、缺长度回 `411 MissingContentLength`（2026-09-25，`791f30d` 只给它加）；ONTAP
+  9.19.1 对**`CopyObject`** 缺长度也回 411（对象桶与 NAS 桶，2026-09-26）—— ≤ 64 MiB 的原生拷贝在 ONTAP 上因此必败。
+  `994828c` 起四处拷贝请求一律带（`src/s3/copy_request.rs::state_empty_body`，`customize().mutate_request`）：role
+  `CopyObject` / `UploadPartCopy`（`role_protocol/native.rs`）与 legacy `CopyObject`（`s3.rs::copy_object`）/ `UploadPartCopy`
+  （`multipart_rename.rs`）。curl 实测 MinIO、RustFS、DXN、ONTAP 都接受（RFC 9110：PUT 应带长度；AWS 未复测、
+  StorageGRID 未测）。wire 测试 `role_protocol::native::tests::copies_pin_the_source_and_copy_no_metadata`（role 两种）与
+  `copy_request::tests::legacy_copies_state_their_empty_body`（legacy 两种）。
 - **`CopyObject` 回复不带版本**（DXN：版本化桶里也不回 `x-amz-version-id`，2026-09-25 实测）：`send_copy` 在回复
   **没有版本头**（`reported_version` 为 `None`，不是 `"null"`）且连接时桶的版本状态是 `Enabled`
   （`S3Protocol::versioning_enabled`，即 `S3Storage.is_bucket_versioned`）时，按 C17 结算结果不明 Complete 的办法认领：
@@ -565,7 +570,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
     上限 / token 回绕 / 连续空页在首页之后触发时，先交出的页照常发出、触发的那一页不交出，遍历记 `Interrupted { delivered }`。
   - **重试**（`paging.rs` 的 `PageRetry`，Current 与 All 都用）：请求无状态，同一 token / marker 重发就是同一页，首页前后
     一样：节流（429 / 503 / `SlowDown`…）按 `throttle.rs` 有界退避（每个列举累计约 2 分钟，超了是该列举的 `Throttled` /
-    Transient）；其他瞬时失败（5xx、超时、连接断开，已在 SDK 内重试过）再发至多 3 次（250 ms / 1 s / 2 s，读到一页即
+    Transient）；其他瞬时失败（5xx 但不含 501、超时、连接断开，已在 SDK 内重试过）再发至多 3 次（250 ms / 1 s / 2 s，读到一页即
     续满），用尽则按原失败的作用域报（会话级的照常升会话）。不从头重列、不重复交出。
 - **All 仍按目录收齐**（`listing.rs` 的 `list_all`，§5.3 / Q9）：无序存储上一个 key 的版本可能在任意页，只有列完整个
   目录才知道历史完整；跨页的 key 天然是整的，不需要 C20 的“留下一页最大 key”（那个做法假设 key 升序）。每 key 一项在 C11b。
@@ -714,7 +719,7 @@ SKILL.md）上跑出来的差异，以及各自的处理：
 | 行为 | MinIO / AWS | DXN | 处理 |
 |---|---|---|---|
 | `UploadPartCopy` 不带 `Content-Length` | 接受 | `411 MissingContentLength` | 一律带 `Content-Length: 0`（见 C18 节） |
-| `CopyObject` 不带 `Content-Length` | 接受 | 接受 | 不改 |
+| `CopyObject` 不带 `Content-Length` | 接受 | 接受 | 仍一律带（ONTAP 要，`994828c`） |
 | 版本化桶里 `CopyObject` 的回复 | 带 `x-amz-version-id` | **不带** | 回复没版本且桶开了版本 → 列版本认领（见 C18 节） |
 | legal hold 下删指针版本 | 拒（403 / MinIO 400 WORM） | 403 `AccessDenied` | 告警，改发普通 DELETE |
 | legal hold 下普通 DELETE（当前版本被扣） | 加删除标记 | **403 `AccessDenied`** | 告警，指针留在原处，传输照常（见 C17 节） |
@@ -732,6 +737,30 @@ SKILL.md）上跑出来的差异，以及各自的处理：
 其他 DXN 限制（UploadPartCopy 源 key 字符、CreateMultipartUpload 丢 tagging、DeleteObjects 要 Content-MD5）见 README
 「Known DXN limitations」。
 
+### ONTAP S3 NAS 桶实测行为（2026-09-26，ONTAP 9.19.1，桶 `data-mover-nas`）
+
+NAS 桶（multiprotocol，底下是 FlexVol `dm_s3_nas`）与同一 SVM 的对象桶差别很大。curl（凭据经 0600 `-K` 文件）+
+`staged_matrix.sh` 实测：
+
+| 行为 | 对象桶（`data-mover-test`） | NAS 桶 | data-mover 的表现 |
+|---|---|---|---|
+| PUT 回的 `ETag` | 内容 MD5，与 HEAD 相同 | 内容 MD5（**只在 PUT 回复里**） | — |
+| HEAD / GET / 列举 / CopyObject 回复的 `ETag` | 同上 | **另一个不透明值，不是 MD5**；同内容每写一次都变，读之间稳定 | 读回校验 `ensure_current` 看到 ETag ≠ PUT 的 → `Verify … (Conflict, Permanent)`「the final S3 object was replaced after publication」（误导，见下） |
+| 条件 GET（`If-Match` / `If-None-Match`，任何值） | 支持 | **501 `NotImplemented`** | 钉住的读（读回、`--read-back` 时源端算 BLAKE3、role 源读）失败；`a65ae18`（见下）起报 `Unsupported, Permanent`，之前误报 `Connectivity, Transient` |
+| 条件 PUT `If-None-Match: *` | — | 支持（412） | — |
+| `CreateMultipartUpload` | 支持 | **501 `NotImplemented`**（不是权限问题） | Direct > 8 MiB：同上，现报 `Write … (Unsupported, Permanent)` |
+| `ListMultipartUploads` / `ListParts` | 支持 | **403**（NAS 桶的策略不能放行这两个动作） | Checkpointed / AtomicReplace > 8 MiB 在 Prepare 的 discovery 报 `Observe … (PermissionDenied, Permanent)` |
+| 单次 PUT > 8 MiB | 支持 | 支持（9 MiB 实测） | data-mover 目前 > 8 MiB 一律走分段，用不上 |
+| 同桶 `CopyObject` | 要 `Content-Length`（411） | 同样要 `Content-Length`（411），带 `Content-Length: 0` 后 200；`x-amz-copy-source-if-match` 认存储的 ETag（PUT 回的 MD5 → 412）；REPLACE 指令接受 | F6 起可用：读回关时原生 NAS→NAS 1 KiB 成功；读回开时源端 BLAKE3 的条件 GET 501 |
+| 对象桶 ↔ NAS 桶的 `CopyObject` | — | **501**（两个方向） | 同一 endpoint 不同桶走原生 → `Unsupported` |
+| `x-amz-meta-*`、`?tagging` | 支持 | 支持 | — |
+| `GetBucketVersioning` / `ListObjectVersions` | 支持 | 501（不支持版本） | 连接时当作未开版本 |
+| 删对象后的目录 | — | 目录留下；非空目录 `DELETE <dir>/` 403，空目录 204 | 清理按后序逐个 `DELETE <dir>/` |
+
+结论：NAS 桶**只适合作列举（无序）源**与**不读回的 ≤ 8 MiB 目的端**。钉住的读（`If-Match`）与分段上传是存储本身不
+支持，不是 data-mover 的缺陷；让 NAS 桶可写 / 可校验要做设计决定（能力探测或显式端点选项，P7 §14.1 D6 同类），未定前
+data-mover 按上表失败。唯一的 data-mover 缺陷是 501 被当成可重试的连接失败，已修。
+
 ## 已知陷阱
 
 | 陷阱 | 应对 |
@@ -740,7 +769,10 @@ SKILL.md）上跑出来的差异，以及各自的处理：
 | Multipart 失败留垃圾 | 必须 abort |
 | MinIO 列出的 upload id 与签发的写法不同 | 比较 upload id 用 `upload_pointer::same_upload`，别逐字节比 |
 | 自签证书 ECS endpoint 失败 | 用 `s3+https://` (而不是 `https` 显式) |
-| Ceph RGW / DXN 对无 body 的 `UploadPartCopy` 回 411 | 显式 `Content-Length: 0`（`role_protocol/native.rs`） |
+| DXN 对无 body 的 `UploadPartCopy`、ONTAP 对无 body 的 `CopyObject` 回 411 | 所有拷贝请求显式 `Content-Length: 0`（`copy_request.rs`，legacy 与 role） |
+| 把 501 `NotImplemented` 当断连重试 | 条目 `Unsupported` / Permanent（`a65ae18`）；ONTAP NAS 桶大量回 501 |
+| RustFS 暂停版本桶里 PUT 不回 `x-amz-version-id: null` | 连接时 Suspended → 按 `"null"` 记（`S3Storage::write_facts`），指针按 id 删 |
+| ONTAP NAS 桶 PUT 回的 ETag ≠ 之后 HEAD 的 ETag | 存储性质：读回校验报 `Conflict`；NAS 桶只作列举源，见「ONTAP S3 NAS 桶实测行为」 |
 | DXN 版本化桶的 `CopyObject` 不回版本 | 桶开了版本且回复无版本 → 列版本认领（`native_final::settle_copy_version`） |
 | `bucket.host` 解析错误 (path-style vs virtual-hosted) | 检查 endpoint 是否支持 virtual-hosted |
 | URL 中的 `:` 在 secret 里被切错 | secret 必须 percent-encode |

@@ -48,11 +48,19 @@
     （FAS2750_01_SSD_1 × 3 成员，thin 100 GB），后台重删 + 压缩。我们的用户**不能建桶**，脚本要用已有桶、跑完清空。
   - `data-mover-nas`：NAS 桶，FlexVol `dm_s3_nas`（`/dm_s3_nas`，20 GB thin，unix 777，重删 + 压缩；S3 用户映射到 `pcuser`）。
   - 该用户也能**读** `ontap-lisa-auto-bucket`（那个桶的原有策略放行）——**只写我们的三个桶**。
-  - **NAS 桶限制**（2026-09-26 实测）：ONTAP 不允许 NAS 桶的策略含 `ListBucketMultipartUploads` / `ListMultipartUploadParts`（及版本、锁、生命周期类）
-    → 列不出未完成上传，data-mover 的 > 8 MiB 写入在 Observe 报 PermissionDenied，读回校验报 Conflict、Direct multipart 报 Connectivity、native 拷贝失败
-    （原因待查，见 P7 设计）；只有 ≤ 8 MiB、不校验的单 PUT 成功。NAS 桶目前**只适合作列举（无序）源**。删对象后空目录会留下，
-    清理要按目录后序逐个 DELETE `<dir>/`。
-  - **ONTAP CopyObject 不带 `Content-Length` → 411 MissingContentLength**（对象桶，≤ 单次 CopyObject 阈值的 native 拷贝失败；UploadPartCopy 正常）。
+  - **NAS 桶限制**（2026-09-26 curl + staged 矩阵实测，详见 `storage-s3.md`「ONTAP S3 NAS 桶实测行为」）：
+    - PUT 回复的 `ETag` 是 MD5，但 HEAD / GET / 列举 / 拷贝回复给的是**另一个不透明值**（不是 MD5，同内容每写一次都变）
+      → 读回校验报 `Verify … (Conflict)`「replaced after publication」（误导，存储性质）；
+    - 条件 GET（`If-Match` / `If-None-Match`）**501 `NotImplemented`** → 钉住的读（读回、`--read-back` 时源端 BLAKE3）不可用；
+    - `CreateMultipartUpload` **501**（不支持分段，不是权限）；`ListBucketMultipartUploads` / `ListMultipartUploadParts` 策略不能放行（403）
+      → > 8 MiB 的 Checkpointed / AtomicReplace 在 Prepare 报 `Observe … (PermissionDenied)`，Direct > 8 MiB 报 `Write … (Unsupported)`；
+    - 同桶 CopyObject 可用（要 `Content-Length: 0`，`994828c` 起带），对象桶 ↔ NAS 桶的拷贝 501；单次 PUT > 8 MiB 可用（9 MiB 实测）；
+      条件 PUT `If-None-Match: *` 可用。
+    - `a65ae18` 起 501 报 `Unsupported, Permanent`（之前是 `Connectivity, Transient`）。能写的只有**不读回的 ≤ 8 MiB**，外加读回关的同桶原生拷贝。
+      NAS 桶目前**只适合作列举（无序）源**；要让它可写 / 可校验需要设计决定（能力探测或端点选项，待定）。
+    - 删对象后空目录会留下，清理要按目录后序逐个 DELETE `<dir>/`（非空目录的 DELETE 回 403）。
+  - **ONTAP CopyObject 不带 `Content-Length` → 411 MissingContentLength**（对象桶与 NAS 桶都是）：`994828c` 起所有拷贝请求都带
+    `Content-Length: 0`（legacy 与 role），ONTAP staged / versioning 矩阵原生行全部通过。CopyObjectResult 里的 `ETag` 不带引号（DXN 同）。
   - 已知行为：对象桶列举是 UTF-8 字节序（重删 / 压缩扫描前中后都是，11,101 个 key 实测）；**NAS 桶平铺列举是目录遍历序**（`/` 最小，
     NetApp KB CONTAP-675913），带 delimiter 逐层有序；CommonPrefix 计入 max-keys；满页后跟一个空末页；不回显 `Delimiter`；
     **带 `delimiter=/` 的 ListObjectVersions 可能只给 `NextKeyMarker` 不给 `NextVersionIdMarker`，下一页静默跳过该 key 余下的版本**
@@ -89,6 +97,8 @@
   - 测试环境：VM 105 `http://10.131.9.14:9001`，IAM 用户 `data-mover-test`（`s3:*` 仅 `data-mover-test` 与 `data-mover-*` 桶，可建临时桶），`e2e-s3/rustfs/.env`。
   - 已知：ListObjectVersions 每页先全部 DeleteMarker 再全部 Version（不交错 → 历史标 `Inferred`，P7 现存问题 11）；支持条件 PUT（412）；
     ListMultipartUploads 支持前缀；DeleteObjects / legal hold 不要 Content-MD5；建锁桶自动开版本；`GET ?partNumber=N` 不回 parts-count；
+    **暂停版本的桶里 PUT 不回 `x-amz-version-id: null`**（HEAD 回；MinIO 两者都回）—— `958a3f9` 起连接时是 Suspended 就按 `"null"` 记，
+    指针按 `?versionId=null` 删，不再留 null 删除标记；
     admin API `/rustfs/admin/v3/*` 明文 JSON。升级 / 下载：VM 访问 GitHub 约 90 KB/s，大文件在 WSL 下载后经 PVE 临时 HTTP 中转。
 - **HDFS**（Kerberos，`HDFS.LOCAL`）：NameNode 10.131.9.30（VM 301），DataNode 10.131.9.31/32，namenode2 10.131.9.33（VM 304）。keytab 与主机名映射
   只在 **runner = VM 102**：快照 tarball → MinIO 临时 key → VM 里下载 → `su - github-runner` 用 setsid nohup 构建运行 → 清理。
