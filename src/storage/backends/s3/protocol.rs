@@ -78,8 +78,10 @@ pub(crate) struct S3WriteFacts {
     /// The version the write created; `None` when the response named no real version.
     pub version_id: Option<String>,
     /// The version id exactly as the response spelled it — `"null"` included, which a bucket with
-    /// versioning suspended reports — or `None` when it named none (an unversioned bucket). A
-    /// delete of exactly this object names it ([`S3Protocol::delete_version`]).
+    /// versioning suspended reports — or `None` when it named none (an unversioned bucket). In a
+    /// bucket that was suspended when connected, a reply naming none is taken as `"null"` (`RustFS`
+    /// 1.0.0 omits the header; see `S3Storage::write_facts`). A delete of exactly this object
+    /// names it ([`S3Protocol::delete_version`]).
     pub reported_version: Option<String>,
 }
 

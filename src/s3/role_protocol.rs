@@ -36,6 +36,8 @@ mod native;
 #[cfg(test)]
 mod throttling_tests;
 mod versions;
+#[cfg(test)]
+mod write_facts_tests;
 
 fn decode_parts(
     parts: &[aws_sdk_s3::types::Part],
@@ -91,6 +93,18 @@ fn continuation_marker(
 }
 
 impl S3Storage {
+    /// What a write reported: its `ETag` and its version as spelled — `"null"` when the reply
+    /// named none in a bucket with versioning suspended. Every write there creates the `"null"`
+    /// version; AWS and `MinIO` say so (`x-amz-version-id: null`), `RustFS` 1.0.0 leaves the header
+    /// out, and a pointer whose `"null"` version goes unnamed is deleted with a plain `DELETE`,
+    /// which in a suspended bucket leaves a `"null"` delete marker behind.
+    pub(super) fn write_facts(&self, etag: &str, version: Option<&str>) -> S3WriteFacts {
+        let reported = version
+            .map(str::to_string)
+            .or_else(|| self.versioning_suspended.then(|| "null".to_string()));
+        S3WriteFacts::new(etag.to_string(), reported)
+    }
+
     /// HEAD the current object, or one stored version of it.
     async fn head_object(
         &self,
@@ -222,10 +236,7 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         let etag = response
             .e_tag()
             .ok_or_else(|| S3ProtocolFailure::protocol("S3 PutObject response omitted ETag"))?;
-        Ok(S3WriteFacts::new(
-            etag.to_string(),
-            response.version_id().map(str::to_string),
-        ))
+        Ok(self.write_facts(etag, response.version_id()))
     }
 
     async fn begin_multipart(&self, key: &str) -> crate::storage::backends::s3::S3Result<String> {

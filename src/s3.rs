@@ -685,6 +685,11 @@ pub struct S3Storage {
     pub block_size: u64,
     pub(crate) transfer_concurrency: TransferConcurrency,
     pub is_bucket_versioned: bool,
+    /// `GetBucketVersioning` answered `Suspended` when the bucket was connected: a write there
+    /// creates the `"null"` version, whether or not its reply says so (`RustFS` names none). A
+    /// snapshot, like `is_bucket_versioned`: changing the bucket's versioning while connected is
+    /// outside the contract.
+    versioning_suspended: bool,
 }
 
 const S3_CONNECT_TIMEOUT_ENV: &str = "S3_CONNECT_TIMEOUT";
@@ -777,9 +782,9 @@ impl S3Storage {
         client: &Client,
         bucket_name: &str,
         storage_type: &StorageType,
-    ) -> bool {
+    ) -> Option<BucketVersioningStatus> {
         if matches!(storage_type, StorageType::Hcp) {
-            return true;
+            return Some(BucketVersioningStatus::Enabled);
         }
         match client
             .get_bucket_versioning()
@@ -788,10 +793,9 @@ impl S3Storage {
             .await
         {
             Ok(response) => {
-                let status = response.status();
-                let enabled = status == Some(&BucketVersioningStatus::Enabled);
-                debug!("bucket {bucket_name} versioning status: {status:?}, enabled: {enabled}");
-                enabled
+                let status = response.status().cloned();
+                debug!("bucket {bucket_name} versioning status: {status:?}");
+                status
             }
             Err(error) => {
                 let code = error
@@ -805,7 +809,7 @@ impl S3Storage {
                 } else {
                     error!("failed to get versioning status for {bucket_name}: {error:?}");
                 }
-                false
+                None
             }
         }
     }
@@ -945,8 +949,9 @@ impl S3Storage {
         };
 
         // 检查桶是否启用了版本控制
-        let is_bucket_versioned =
-            Self::detect_bucket_versioning(&client, &bucket_name, &storage_type).await;
+        let versioning = Self::detect_bucket_versioning(&client, &bucket_name, &storage_type).await;
+        let is_bucket_versioned = versioning == Some(BucketVersioningStatus::Enabled);
+        let versioning_suspended = versioning == Some(BucketVersioningStatus::Suspended);
 
         Ok(Self {
             storage_type,
@@ -965,6 +970,7 @@ impl S3Storage {
                 None,
             )?,
             is_bucket_versioned,
+            versioning_suspended,
         })
     }
 
@@ -5081,6 +5087,7 @@ mod tests {
             block_size: DEFAULT_BLOCK_SIZE,
             transfer_concurrency: DEFAULT_TRANSFER_CONCURRENCY,
             is_bucket_versioned: false,
+            versioning_suspended: false,
         }
     }
 

@@ -76,10 +76,7 @@ pub(super) async fn copy_from(
         .copy_object_result()
         .and_then(|result| result.e_tag())
         .ok_or_else(|| S3ProtocolFailure::protocol("S3 CopyObject response omitted ETag"))?;
-    Ok(S3WriteFacts::new(
-        etag.to_string(),
-        response.version_id().map(str::to_string),
-    ))
+    Ok(storage.write_facts(etag, response.version_id()))
 }
 
 /// One `UploadPartCopy` of `range` of `source` into part `number` of an upload on `key` (a key
@@ -126,7 +123,7 @@ fn completed_part(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::{Arc, Mutex};
 
     use aws_credential_types::Credentials;
@@ -142,7 +139,7 @@ mod tests {
 
     use super::*;
 
-    fn storage(connector: impl HttpConnector + Clone + 'static) -> S3Storage {
+    pub(in crate::s3) fn storage(connector: impl HttpConnector + Clone + 'static) -> S3Storage {
         let http_client = http_client_fn(move |_settings, _components| {
             SharedHttpConnector::new(connector.clone())
         });
@@ -165,6 +162,7 @@ mod tests {
             block_size: super::super::super::DEFAULT_BLOCK_SIZE,
             transfer_concurrency: super::super::super::DEFAULT_TRANSFER_CONCURRENCY,
             is_bucket_versioned: false,
+            versioning_suspended: false,
         }
     }
 

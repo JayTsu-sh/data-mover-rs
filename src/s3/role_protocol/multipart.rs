@@ -78,10 +78,7 @@ impl S3Storage {
         let etag = response.e_tag().ok_or_else(|| {
             S3ProtocolFailure::protocol("S3 CompleteMultipartUpload response omitted ETag")
         })?;
-        Ok(S3WriteFacts::new(
-            etag.to_string(),
-            response.version_id().map(str::to_string),
-        ))
+        Ok(self.write_facts(etag, response.version_id()))
     }
 
     /// `ListMultipartUploads` with the key as prefix, keeping only uploads on exactly that key.

@@ -104,6 +104,7 @@ mod tests {
             block_size: DEFAULT_BLOCK_SIZE,
             transfer_concurrency: DEFAULT_TRANSFER_CONCURRENCY,
             is_bucket_versioned: false,
+            versioning_suspended: false,
         }
     }
 
