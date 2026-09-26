@@ -7,10 +7,12 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::model::{EntryKind, IdentityStrength, SourceIdentity};
-use crate::storage::backends::s3::S3Protocol as _;
+use crate::model::{EntryKind, IdentityStrength, ObjectTag, SourceIdentity};
 use crate::storage::backends::s3::tests::{MemoryS3, content_md5, identity};
-use crate::storage::{FinalDestination, ResumeMode, SourceDescriptor, StagedDestination};
+use crate::storage::backends::s3::{S3NativeCopySource, S3Protocol as _, S3ProtocolFailure};
+use crate::storage::{
+    FinalDestination, ResumeMode, SourceDescriptor, StagedDestination, VerifyRequest,
+};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -176,6 +178,142 @@ async fn a_lost_nas_single_put_is_settled_by_the_prepare_head() -> TestResult {
             return Err("a lost reply was published".into());
         };
         assert_eq!(failure.final_destination_changed, committed);
+    }
+    Ok(())
+}
+
+/// A NAS bucket holding `src` (and, when `existing`, an older `dst`) and a native stage copying
+/// `src` to `dst`, not yet published.
+async fn copy_stage(
+    existing: bool,
+) -> TestResult<(Arc<MemoryS3>, S3StagedDestination<MemoryS3>, PreparedStage)> {
+    let protocol = Arc::new(MemoryS3::nas_bucket());
+    for (key, body) in [("src", COPIED), ("dst", b"old")] {
+        if key == "dst" && !existing {
+            continue;
+        }
+        let body = Bytes::from_static(body);
+        protocol
+            .put_object(key, body.clone(), &content_md5(&body))
+            .await
+            .map_err(|failure| format!("{failure:?}"))?;
+    }
+    let source_etag = protocol
+        .head("src")
+        .await
+        .map_err(|failure| format!("{failure:?}"))?
+        .etag;
+    let destination = S3StagedDestination::new(protocol.clone(), identity())
+        .with_hold_limit(Duration::from_secs(1), Duration::from_millis(10));
+    let stage = destination
+        .prepare_native_stage(at_destination("dst", Some(7))?)
+        .await?;
+    single::of(&stage)
+        .ok_or("not a single stage")?
+        .set_native_source(S3NativeCopySource {
+            bucket: "memory".into(),
+            key: "src".into(),
+            etag: source_etag,
+            version_id: None,
+            size: 7,
+        });
+    Ok((protocol, destination, stage))
+}
+
+const COPIED: &[u8] = b"copy me";
+
+fn publish_request() -> PublishRequest {
+    PublishRequest {
+        expected_size: 7,
+        expected_blake3: None,
+        cancel: CancellationToken::new(),
+    }
+}
+
+/// A NAS `CopyObject` (N5) whose reply is lost is settled against the `HEAD` prepare made: it
+/// changed the key when the copy committed (the copy has an `ETag` of its own), not when it did
+/// not — whether or not an older object was there.
+#[tokio::test]
+async fn a_lost_nas_copy_reply_is_settled_by_the_prepare_head() -> TestResult {
+    for existing in [false, true] {
+        for committed in [true, false] {
+            let (protocol, destination, stage) = copy_stage(existing).await?;
+            if committed {
+                *protocol.copy_commits_then_fails.lock().await = true;
+            } else {
+                *protocol.native_failure.lock().await = Some(S3ProtocolFailure::session(
+                    FailureClass::Connectivity,
+                    Transience::Transient,
+                    "copy response lost",
+                ));
+            }
+            let Err(failure) = destination.publish(&stage, publish_request()).await else {
+                return Err("a lost copy reply was published".into());
+            };
+            assert_eq!(
+                failure.final_destination_changed, committed,
+                "existing {existing}, committed {committed}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Read back, a NAS copy must still carry the `ETag` its reply named (or, tagged, the one taken
+/// after tagging): replaced after the copy it is a `Conflict`; rewritten keeping the mtime (same
+/// `ETag`) it is a transient `Corruption`; untouched, or tagged, it verifies.
+#[tokio::test]
+async fn a_nas_copy_is_read_back_against_its_reply() -> TestResult {
+    for case in ["intact", "tagged", "replaced", "rewritten"] {
+        let (protocol, destination, stage) = copy_stage(false).await?;
+        if case == "tagged" {
+            let single = single::of(&stage).ok_or("not a single stage")?;
+            let tags = vec![ObjectTag::new("k", "v")?];
+            single::apply_metadata(
+                &stage,
+                single,
+                true,
+                MetadataMutation::Tags(tags),
+                &CancellationToken::new(),
+            )?;
+        }
+        let published = destination
+            .publish(&stage, publish_request())
+            .await
+            .map_err(|failure| failure.error)?;
+        let other = Bytes::from_static(b"another");
+        match case {
+            "replaced" => {
+                protocol
+                    .put_object("dst", other.clone(), &content_md5(&other))
+                    .await
+                    .map_err(|failure| format!("{failure:?}"))?;
+            }
+            "rewritten" => protocol.nas_rewrite_keeping_mtime("dst", other).await,
+            _ => {}
+        }
+        let verified = destination
+            .verify(
+                &stage,
+                VerifyRequest {
+                    expected_size: 7,
+                    expected_blake3: *blake3::hash(COPIED).as_bytes(),
+                    cancel: CancellationToken::new(),
+                    published: Some(published),
+                },
+            )
+            .await;
+        let class = match &verified {
+            Ok(_) => None,
+            Err(StorageRoleFailure::Entry(failure)) => Some(failure.class()),
+            Err(other) => return Err(format!("{case}: {other:?}").into()),
+        };
+        let expected = match case {
+            "replaced" => Some(FailureClass::Conflict),
+            "rewritten" => Some(FailureClass::Corruption),
+            _ => None,
+        };
+        assert_eq!(class, expected, "{case}: {verified:?}");
     }
     Ok(())
 }

@@ -465,3 +465,50 @@ async fn a_native_copy_confirms_no_upload_digest() -> TestResult {
     }
     Ok(())
 }
+
+/// A native copy within one NAS bucket (N5) is one `CopyObject` even over the native single-copy
+/// limit (no `UploadPartCopy`, no multipart request), read back bracketed, and reports
+/// `UnsupportedByDestination` under `Checkpointed`.
+#[tokio::test]
+async fn a_native_copy_within_a_nas_bucket_is_one_copy_object() -> TestResult {
+    let protocol = nas();
+    let body = Bytes::from(vec![6_u8; 12 * 1024 * 1024]);
+    protocol
+        .put_object("src/big", body.clone(), &content_md5(&body))
+        .await
+        .map_err(|failure| format!("{failure:?}"))?;
+    let connect = || {
+        connect_native_at_destination(
+            protocol.clone(),
+            endpoint_of(&protocol),
+            64 * 1024 * 1024,
+            (5 * 1024 * 1024, 5 * 1024 * 1024),
+        )
+    };
+    let outcome = transfer(
+        request(connect()?, "src/big", connect()?, "dst/big")?
+            .with_transfer_policy(TransferPolicy::Checkpointed)
+            .with_payload_shaping(PayloadShapingPolicy::AllowUnshapedNative),
+    )
+    .await?;
+    assert_eq!(outcome.route, TransferRoute::Native);
+    assert_eq!(
+        outcome.recovery,
+        EffectiveRecovery::UnsupportedByDestination
+    );
+    assert_eq!(
+        outcome.verification.read_back_method,
+        ReadBackMethod::EtagBracketed {
+            reason: UnpinnedReadReason::ConditionalReadsUnsupported,
+        }
+    );
+    assert_eq!(
+        outcome.verification.upload_digest,
+        UploadDigest::Unchecked(UploadDigestGap::NativeCopy)
+    );
+    assert_eq!(*protocol.native_copies.lock().await, 1);
+    assert_eq!(*protocol.part_copies.lock().await, 0);
+    assert_eq!(*protocol.multipart_begins.lock().await, 0);
+    assert_eq!(protocol.objects.lock().await.get("dst/big"), Some(&body));
+    Ok(())
+}

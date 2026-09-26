@@ -69,6 +69,11 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
   `EtagBracketed { ConditionalReadsUnsupported }`（对象桶 `Pinned`，读回关 `NotPerformed`），`upload_digest` = `Matched`
   （缓冲 PUT / 分段都带 Content-MD5；流式单 PUT 回复 ETag = 自算 MD5）或 `Unchecked(EtagNotMd5 | NativeCopy | PriorAttempt)`；
   不算失败。
+  N5：同一 NAS 桶内的原生拷贝一律**一次 `CopyObject`**（≤ 5 GiB，超过在 Preflight 拒；从不 `UploadPartCopy`，N0：同桶
+  CopyObject 是克隆，1 GiB 0.01 s），`x-amz-copy-source-if-match` 照带（NAS 桶认存储的不透明 ETag）；prepare 同样多一次 HEAD，
+  回复丢失按原状结算（副本的 ETag 由拷贝时刻的 mtime 派生，不能按源 ETag 认领）；读回的锚必须等于拷贝回复里的 ETag
+  （N0：拷贝回复的 ETag = 目标 HEAD 的不透明值），不等 → `Conflict`「replaced after the copy」。NAS 桶与对象桶之间、
+  两个 NAS 桶之间按 N1 的亲和走流式。
   **legacy `StorageEnum` 不理会这个 profile**（决定 13，只写文档）：legacy 读不带条件、不核对，写 > 5 MiB 走分段遇 501。
 - 所有 profile（含标准 `s3://`）都为 multi-object delete 加 body-matching、SigV4-signed
   `Content-MD5`（`s3/delete_objects_md5.rs`，由 `s3.rs` 的 `configure_compatibility` 统一挂载）：SDK 默认只发

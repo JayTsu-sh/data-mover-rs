@@ -123,6 +123,11 @@ impl SingleStage {
         self.lock().native_source = Some(source);
     }
 
+    /// What prepare found at the final key, where the bucket's `ETag`s cannot settle a lost reply.
+    pub(super) fn previous(&self) -> Option<&Previous> {
+        self.previous.as_ref()
+    }
+
     /// Whether this stage publishes a server-side copy rather than bytes it holds.
     pub(super) fn is_native(&self) -> bool {
         self.lock().native_source.is_some()
@@ -438,7 +443,8 @@ pub(super) fn definite_refusal(failure: &S3ProtocolFailure) -> bool {
     )
 }
 
-/// Reads the published object back, pinned to what the PUT created (E1).
+/// Reads the published object back, pinned to what the write created — the `PutObject`, or for a
+/// native stage the `CopyObject` (E1) — or bracketed where reads cannot be pinned.
 pub(super) async fn verify<P: S3Protocol>(
     adapter: &S3StagedDestination<P>,
     stage: &PreparedStage,
@@ -454,6 +460,9 @@ pub(super) async fn verify<P: S3Protocol>(
             "S3 object is verified only after publication",
         )
     })?;
+    if single.is_native() && !adapter.protocol.bucket_capabilities().conditional_reads {
+        return verify_bracketed(adapter, path, request, Some(&published.etag)).await;
+    }
     verify_written(adapter, path, published, request).await
 }
 
@@ -468,7 +477,7 @@ pub(super) async fn verify_written<P: S3Protocol>(
     request: &VerifyRequest,
 ) -> Result<VerificationEvidence, StorageRoleFailure> {
     if !adapter.protocol.bucket_capabilities().conditional_reads {
-        return verify_bracketed(adapter, path, request).await;
+        return verify_bracketed(adapter, path, request, None).await;
     }
     let version = request
         .published
@@ -502,28 +511,18 @@ pub(super) async fn verify_written<P: S3Protocol>(
 /// with the source's. Nothing links the anchor to the write — the bucket's `ETag` is not the MD5
 /// the `PutObject` reply carried — so content that differs (or a size that does) is a transient
 /// `Corruption` that says a replacement between the write and the read cannot be ruled out.
+///
+/// A server-side copy's reply names the `ETag` the copy has (N0: the same opaque value a `HEAD`
+/// gives), so for one (`copied`) the anchor must still be it, else the object was replaced after
+/// publication (`Conflict`, permanent) — a link the streamed writes cannot have, their reply
+/// carrying the MD5.
 async fn verify_bracketed<P: S3Protocol>(
     adapter: &S3StagedDestination<P>,
     path: &StoragePath,
     request: &VerifyRequest,
+    copied: Option<&str>,
 ) -> Result<VerificationEvidence, StorageRoleFailure> {
-    let anchor = match adapter.protocol.head(path.as_str()).await {
-        Ok(anchor) => anchor,
-        // Gone since publication: replaced, as a pinned read would report it.
-        Err(S3ProtocolFailure::Entry {
-            class: FailureClass::NotFound,
-            ..
-        }) => {
-            return Err(classified_entry(
-                path,
-                Operation::Verify,
-                FailureClass::Conflict,
-                Transience::Permanent,
-                "the final S3 object is gone since publication",
-            ));
-        }
-        Err(failure) => return Err(role_failure(path, Operation::Verify, failure)),
-    };
+    let anchor = anchor(adapter, path).await?;
     let differs = || {
         classified_entry(
             path,
@@ -534,6 +533,15 @@ async fn verify_bracketed<P: S3Protocol>(
              replacement between the write and this read cannot be ruled out",
         )
     };
+    if copied.is_some_and(|copied| !same_etag(&anchor.etag, copied)) {
+        return Err(classified_entry(
+            path,
+            Operation::Verify,
+            FailureClass::Conflict,
+            Transience::Permanent,
+            "the final S3 object was replaced after the copy",
+        ));
+    }
     if anchor.size != request.expected_size {
         return Err(differs());
     }
@@ -549,6 +557,28 @@ async fn verify_bracketed<P: S3Protocol>(
         verified_bytes: anchor.size,
         blake3: actual,
     })
+}
+
+/// The `HEAD` a bracketed read anchors on. Gone since publication is a replacement, as a pinned
+/// read would report it (`Conflict`, permanent).
+async fn anchor<P: S3Protocol>(
+    adapter: &S3StagedDestination<P>,
+    path: &StoragePath,
+) -> Result<S3ObjectFacts, StorageRoleFailure> {
+    match adapter.protocol.head(path.as_str()).await {
+        Ok(anchor) => Ok(anchor),
+        Err(S3ProtocolFailure::Entry {
+            class: FailureClass::NotFound,
+            ..
+        }) => Err(classified_entry(
+            path,
+            Operation::Verify,
+            FailureClass::Conflict,
+            Transience::Permanent,
+            "the final S3 object is gone since publication",
+        )),
+        Err(failure) => Err(role_failure(path, Operation::Verify, failure)),
+    }
 }
 
 async fn ensure_current<P: S3Protocol>(

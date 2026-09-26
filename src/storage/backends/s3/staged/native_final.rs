@@ -32,6 +32,7 @@ use super::completion::completed_object;
 use super::final_upload::FinalUpload;
 use super::native::{NativeFillFailure, native_role_failure};
 use super::parts::UploadedParts;
+use super::settle::{Settling, settle_unknown_write};
 use super::single::{self, SingleStage, changed, same_etag, unchanged};
 use super::upload_pointer::pointer_path;
 use super::{S3StagedDestination, directory_object, limits, part_size_at_least};
@@ -123,8 +124,10 @@ pub(super) fn part_ranges(
 
 impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     /// Prepares a native copy at the destination: one `CopyObject` up to the single-copy limit —
-    /// and for a directory object one request carries (P7 D13) — after cleaning up a leftover
-    /// pointer, otherwise an upload on the final key found by, or begun after, discovery.
+    /// for a directory object one request carries (P7 D13), and at any size its limits allow on a
+    /// bucket without multipart uploads (P7 §14.2) — after cleaning up a leftover pointer (and,
+    /// on a bucket whose `ETag`s are not MD5s, one `HEAD` of the final key), otherwise an upload
+    /// on the final key found by, or begun after, discovery.
     pub(in crate::storage::backends::s3) async fn prepare_native_stage(
         &self,
         request: DestinationPrepareRequest,
@@ -145,9 +148,13 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                 "a native S3 copy needs the source's size",
             )
         })?;
-        if one_request || size <= self.native.single_max {
+        // A bucket without multipart uploads (an ONTAP NAS bucket) copies with one `CopyObject`
+        // at any size its limits allow (5 GiB, refused above), never `UploadPartCopy` (P7 §14.2).
+        let multipart = self.protocol.bucket_capabilities().multipart;
+        if one_request || size <= self.native.single_max || !multipart {
             let fact = self.clear_leftover(&request, &pointer).await?;
-            let mut stage = self.prepare_single(request.prepare, size, None);
+            let previous = self.previous_object(&path).await?;
+            let mut stage = self.prepare_single(request.prepare, size, previous);
             stage.mark_at_destination(fact);
             return Ok(stage);
         }
@@ -291,9 +298,12 @@ async fn copy_part<P: S3Protocol>(
 
 /// Publishes a native single stage: one `CopyObject` of `source` to the final key, then the
 /// pending tags. A refusal the service answered before copying leaves the final key unchanged;
-/// any other failure is settled by HEAD — our size and the source's `ETag` count as copied (a
-/// copy of an object uploaded in parts gets a new `ETag` on some stores, and then reports the
-/// final key changed).
+/// any other failure is settled by HEAD — on a bucket whose `ETag`s are MD5s our size and the
+/// source's `ETag` count as copied (a copy of an object uploaded in parts gets a new `ETag` on
+/// some stores, and then reports the final key changed); on one whose are not (an ONTAP NAS
+/// bucket) only an unchanged key can be proven, against what prepare found
+/// ([`settle_unknown_write`]). There, tags set after the copy may touch the object, so its
+/// `ETag` is taken again afterwards: read-back checks the anchor against it.
 pub(super) async fn send_copy<P: S3Protocol>(
     adapter: &S3StagedDestination<P>,
     path: &StoragePath,
@@ -313,6 +323,16 @@ pub(super) async fn send_copy<P: S3Protocol>(
         Err(failure) if single::definite_refusal(&failure) => {
             return Err(unchanged(role_failure(path, Operation::Publish, failure)));
         }
+        Err(failure) if !adapter.protocol.bucket_capabilities().md5_etags => {
+            // A copy on such a bucket gets an `ETag` of its own (N0: from the copy's mtime), so
+            // nothing proves it ours: unchanged only when the key still holds what prepare found.
+            let settling = Settling {
+                size: source.size,
+                previous: single.previous(),
+                grace: adapter.settle_grace,
+            };
+            settle_unknown_write(&*adapter.protocol, path, &settling, None, failure).await?
+        }
         Err(failure) => match adapter.protocol.head(path.as_str()).await {
             Ok(head) if head.size == source.size && same_etag(&head.etag, &source.etag) => {
                 S3WriteFacts::new(head.etag, head.version_id)
@@ -320,12 +340,21 @@ pub(super) async fn send_copy<P: S3Protocol>(
             _ => return Err(changed(role_failure(path, Operation::Publish, failure))),
         },
     };
+    let mut facts = facts;
     if let Some(tags) = single.pending() {
         adapter
             .protocol
             .put_tags(path.as_str(), &tags)
             .await
             .map_err(|failure| changed(role_failure(path, Operation::Publish, failure)))?;
+        if !adapter.protocol.bucket_capabilities().md5_etags {
+            let tagged = adapter
+                .protocol
+                .head(path.as_str())
+                .await
+                .map_err(|failure| changed(role_failure(path, Operation::Publish, failure)))?;
+            facts = S3WriteFacts::new(tagged.etag, facts.version_id);
+        }
     }
     single.record_published(facts.clone());
     Ok(facts)
