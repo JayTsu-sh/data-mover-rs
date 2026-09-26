@@ -21,6 +21,8 @@
 //! ```
 use std::fmt::Write as _;
 use std::num::NonZeroUsize;
+use std::path::Path;
+use std::pin::pin;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -45,6 +47,7 @@ use data_mover::traversal::{
     BlockCounts, ScanTotals, StorageTraversalSource, TraversalItem, TraversalOrder,
     TraversalOutcome, TraversalRequest, TraversalSource as _, TraversalVersions,
 };
+use futures::stream::{self, StreamExt as _};
 use tokio_util::sync::CancellationToken;
 
 type Error = Box<dyn std::error::Error>;
@@ -168,7 +171,8 @@ enum Command {
         entries: bool,
     },
     /// Write a small fixture tree under the root, so the other subcommands have something
-    /// to work on. Each file is transferred from a local temporary directory.
+    /// to work on. Each file is transferred from a local temporary directory, `--concurrency`
+    /// transfers at a time.
     Seed {
         /// Sub-path under the root to populate.
         #[arg(long, default_value = "")]
@@ -561,21 +565,95 @@ async fn seed(storage: &Storage, args: &Args, command: &Command) -> Result<(), E
     )
     .await?;
     let inflight = InflightLimits::new(slots.get(), (*bytes).max(1) * slots.get(), slots.get())?;
-    for index in 0..*files {
+    let seeding = SeedFiles {
+        source: &source,
+        storage,
+        path,
+        local_root: local_root.path(),
+        payload: &payload,
+        inflight,
+    };
+    seeding.all(*files, slots.get()).await
+}
+
+/// Failed files after which `seed` stops trying the rest.
+const MAX_SEED_FAILURES: usize = 100;
+
+/// `error` and every error beneath it, `: `-separated.
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        let _ = write!(text, ": {next}");
+        cause = next.source();
+    }
+    text
+}
+
+/// What seeding one file needs.
+struct SeedFiles<'a> {
+    source: &'a Storage,
+    storage: &'a Storage,
+    path: &'a str,
+    local_root: &'a Path,
+    payload: &'a [u8],
+    inflight: InflightLimits,
+}
+
+impl SeedFiles<'_> {
+    /// Seeds `files` files, `concurrency` transfers at a time, so a wide directory seeds in
+    /// reasonable time. A file that fails is reported and the rest still seeded, so a flaky server
+    /// does not cut a large fixture short; any failure still fails the command, and a run where
+    /// everything fails gives up after `MAX_SEED_FAILURES`.
+    async fn all(&self, files: usize, concurrency: usize) -> Result<(), Error> {
+        let mut seeded = pin!(
+            stream::iter(0..files)
+                .map(|index| self.one(index))
+                .buffer_unordered(concurrency)
+        );
+        let mut failed = 0_usize;
+        while let Some(result) = seeded.next().await {
+            match result {
+                Ok((destination, bytes)) => println!("seeded {destination} bytes={bytes}"),
+                Err((destination, error)) => {
+                    failed += 1;
+                    eprintln!("seed failure {destination}: {}", chain(error.as_ref()));
+                    if failed >= MAX_SEED_FAILURES {
+                        return Err(format!("gave up after {failed} failed files").into());
+                    }
+                }
+            }
+        }
+        if failed > 0 {
+            return Err(format!("{failed} of {files} files failed to seed").into());
+        }
+        Ok(())
+    }
+
+    /// Writes `file-<index>.log` locally and transfers it below the root; a failure comes back
+    /// with the destination it was for.
+    async fn one(&self, index: usize) -> Result<(String, u64), (String, Error)> {
         let name = format!("file-{index}.log");
-        std::fs::write(local_root.path().join(&name), &payload)?;
-        let destination = if path.is_empty() {
+        let destination = if self.path.is_empty() {
             name.clone()
         } else {
-            format!("{path}/{name}")
+            format!("{}/{name}", self.path)
         };
+        self.transfer(index, name, &destination)
+            .await
+            .map(|bytes| (destination.clone(), bytes))
+            .map_err(|error| (destination, error))
+    }
+
+    async fn transfer(&self, index: usize, name: String, destination: &str) -> Result<u64, Error> {
+        std::fs::write(self.local_root.join(&name), self.payload)?;
         let outcome = transfer(
             TransferRequest::new(
-                source.clone(),
+                self.source.clone(),
                 StoragePath::new(name)?,
-                storage.clone(),
-                StoragePath::new(&destination)?,
-                inflight,
+                self.storage.clone(),
+                StoragePath::new(destination)?,
+                self.inflight,
                 CancellationToken::new(),
             )
             .with_identity_override(TransferIdentity::from_label(format!(
@@ -584,9 +662,8 @@ async fn seed(storage: &Storage, args: &Args, command: &Command) -> Result<(), E
             ))?),
         )
         .await?;
-        println!("seeded {destination} bytes={}", outcome.transferred_bytes);
+        Ok(outcome.transferred_bytes)
     }
-    Ok(())
 }
 
 async fn make_directory(storage: &Storage, command: &Command) -> Result<(), Error> {
