@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use data_mover::integrity::{IntegrityMode, IntegrityOptions, IntegrityRequest, compare};
 use data_mover::model::StoragePath;
-use data_mover::storage::{Storage, create_directory_all};
+use data_mover::storage::{Storage, StorageRoleFailure, create_directory_all};
 use data_mover::transfer::{
     InflightLimits, PayloadShapingPolicy, ReadBackVerification, SourceQosGroup, SourceQosPolicy,
     SourceVersion, TransferFailure, TransferIdentity, TransferOutcome, TransferPolicy,
@@ -144,6 +144,19 @@ fn seed(root: &str, path: &str, bytes: u64) -> Result {
     Ok(())
 }
 
+/// The storage failure's own diagnostic (the display leaves it out), if the chain holds one.
+fn diagnostic(error: &(dyn Error + 'static)) -> Option<String> {
+    let mut cause = Some(error);
+    while let Some(current) = cause {
+        match current.downcast_ref::<StorageRoleFailure>() {
+            Some(StorageRoleFailure::Entry(failure)) => return Some(failure.diagnostic().into()),
+            Some(StorageRoleFailure::Session(failure)) => return Some(failure.diagnostic().into()),
+            None => cause = current.source(),
+        }
+    }
+    None
+}
+
 /// The failure and every cause below it: the top-level Display names only the phase and side.
 fn chain(error: &dyn Error) -> String {
     let mut text = error.to_string();
@@ -229,6 +242,7 @@ fn report(result: &Result<TransferOutcome, TransferFailure>, elapsed_ms: u128) -
             "failure": chain(failure),
             "recoverable_stage": failure.has_recoverable_stage(),
             "final_destination_changed": failure.final_destination_changed(),
+            "diagnostic": diagnostic(failure),
             "source_streamed_bytes": failure.source_qos().client_streamed_shaped_bytes,
             "source_read_operations": failure.source_qos().source_read_operations,
             "native_bytes": failure.source_qos().native_bytes,

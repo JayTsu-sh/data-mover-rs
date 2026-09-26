@@ -6,6 +6,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::CompletedMultipartUpload;
 use bytes::Bytes;
 
+use super::hints;
 use super::{
     CompletedPart, ProvideErrorMetadata, S3ProtocolFailure, S3Result, S3Storage, S3WriteFacts,
     s3_role_entry, s3_role_remote_failure, s3_role_transport_failure,
@@ -96,7 +97,12 @@ impl S3Storage {
                 .set_upload_id_marker(marker.1.clone())
                 .send()
                 .await
-                .map_err(|error| classify_sdk!(error, "S3 ListMultipartUploads request failed"))?;
+                .map_err(|error| {
+                    hints::denied_listing(
+                        self.options,
+                        classify_sdk!(error, "S3 ListMultipartUploads request failed"),
+                    )
+                })?;
             uploads.extend(uploads_on_key(&response, &full_key));
             let Some(next) = next_uploads_marker(&response, &marker)? else {
                 return Ok(uploads);

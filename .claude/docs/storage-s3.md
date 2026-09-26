@@ -74,6 +74,10 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
   回复丢失按原状结算（副本的 ETag 由拷贝时刻的 mtime 派生，不能按源 ETag 认领）；读回的锚必须等于拷贝回复里的 ETag
   （N0：拷贝回复的 ETag = 目标 HEAD 的不透明值），不等 → `Conflict`「replaced after the copy」。NAS 桶与对象桶之间、
   两个 NAS 桶之间按 N1 的亲和走流式。
+  N6：URL 没写 `bucket_type=nas` 而桶其实是 NAS 桶时照旧失败，但诊断带提示「if this is an ONTAP NAS bucket, add
+  ?compat=ontap&bucket_type=nas to the URL」（`role_protocol/hints.rs`）：条件 GET、`CreateMultipartUpload`、`CopyObject` /
+  `UploadPartCopy` 回 501（`Unsupported`，任何 compat 都加，写了 `bucket_type=nas` 则不加）；`ListMultipartUploads` /
+  `ListParts` 回 403（`PermissionDenied`）只在 `compat=ontap` 下加（别处 403 是普通的策略拒绝）。类别不变。
   **legacy `StorageEnum` 不理会这个 profile**（决定 13，只写文档）：legacy 读不带条件、不核对，写 > 5 MiB 走分段遇 501。
 - 所有 profile（含标准 `s3://`）都为 multi-object delete 加 body-matching、SigV4-signed
   `Content-MD5`（`s3/delete_objects_md5.rs`，由 `s3.rs` 的 `configure_compatibility` 统一挂载）：SDK 默认只发

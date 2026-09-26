@@ -6,6 +6,7 @@ use std::ops::Range;
 use aws_sdk_s3::types::{MetadataDirective, TaggingDirective};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
+use super::hints;
 use super::{
     CompletedPart, ProvideErrorMetadata, S3NativeCopySource, S3ProtocolFailure, S3Result,
     S3Storage, S3WriteFacts, build_copy_source, s3_role_remote_failure, s3_role_transport_failure,
@@ -43,8 +44,12 @@ async fn copy_part(
         .mutate_request(state_empty_body)
         .send()
         .await;
-    let response =
-        response.map_err(|error| classify_sdk!(error, "S3 native UploadPartCopy failed"))?;
+    let response = response.map_err(|error| {
+        hints::not_implemented(
+            storage.options,
+            classify_sdk!(error, "S3 native UploadPartCopy failed"),
+        )
+    })?;
     completed_part(&response, number)
 }
 
@@ -70,7 +75,12 @@ pub(super) async fn copy_from(
         .mutate_request(state_empty_body)
         .send()
         .await
-        .map_err(|error| classify_sdk!(error, "S3 native CopyObject request failed"))?;
+        .map_err(|error| {
+            hints::not_implemented(
+                storage.options,
+                classify_sdk!(error, "S3 native CopyObject request failed"),
+            )
+        })?;
     // The object was written; only the response is malformed.
     let etag = response
         .copy_object_result()

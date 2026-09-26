@@ -20,7 +20,9 @@ use super::super::native::tests::storage;
 use super::{put_object, put_object_streaming};
 use crate::model::{FailureClass, Transience};
 use crate::s3::url_options::{S3BucketType, S3Compatibility};
-use crate::storage::backends::s3::S3ProtocolFailure;
+use crate::storage::backends::s3::{
+    S3NativeCopySource, S3ObjectFacts, S3Protocol as _, S3ProtocolFailure,
+};
 
 /// A request as the server saw it: its headers, and its body when the body arrived whole.
 type Request = (Vec<(String, String)>, Result<Vec<u8>, String>);
@@ -255,4 +257,81 @@ async fn a_nas_name_clash_on_a_buffered_put_is_a_permanent_conflict() {
             "{status}: {reply:?}"
         );
     }
+}
+
+/// Without `bucket_type=nas` an ONTAP NAS bucket fails as before, with a hint (N6): a 501 on
+/// `CreateMultipartUpload` names the parameters on any URL; a 403 on `ListMultipartUploads`
+/// only under `compat=ontap`; with the profile no hint is added.
+#[tokio::test]
+async fn a_nas_bucket_without_its_profile_gets_a_hint() {
+    let hinted = |failure: &S3ProtocolFailure| match failure {
+        S3ProtocolFailure::Entry { diagnostic, .. }
+        | S3ProtocolFailure::Session { diagnostic, .. } => diagnostic.contains("bucket_type=nas"),
+    };
+    let standard = storage(PutServer::answering(501, "NotImplemented"));
+    let refused = standard.begin_multipart("key").await;
+    assert!(
+        matches!(&refused, Err(failure) if hinted(failure)),
+        "{refused:?}"
+    );
+    let mut ontap = storage(PutServer::answering(403, "AccessDenied"));
+    ontap.options.compat = S3Compatibility::Ontap;
+    let denied = ontap.list_uploads("key").await;
+    assert!(
+        matches!(&denied, Err(failure) if hinted(failure)),
+        "{denied:?}"
+    );
+    let plain = storage(PutServer::answering(403, "AccessDenied"));
+    let denied = plain.list_uploads("key").await;
+    assert!(
+        matches!(&denied, Err(failure) if !hinted(failure)),
+        "{denied:?}"
+    );
+}
+
+/// Every request an ONTAP NAS bucket refuses carries the hint on a URL without the profile — a
+/// pinned GET and a `CopyObject` (501), `ListParts` under `compat=ontap` (403) — and none once the
+/// URL says `bucket_type=nas`.
+#[tokio::test]
+async fn every_nas_refusal_names_the_profile() {
+    let hinted = |failure: &S3ProtocolFailure| match failure {
+        S3ProtocolFailure::Entry { diagnostic, .. }
+        | S3ProtocolFailure::Session { diagnostic, .. } => diagnostic.contains("bucket_type=nas"),
+    };
+    let facts = S3ObjectFacts {
+        size: 10,
+        etag: "\"e\"".into(),
+        version_id: None,
+        last_modified: None,
+    };
+    let source = S3NativeCopySource {
+        bucket: "b".into(),
+        key: "k".into(),
+        etag: "\"e\"".into(),
+        version_id: None,
+        size: 10,
+    };
+    let standard = storage(PutServer::answering(501, "NotImplemented"));
+    let read = standard.get_range("key", 0..10, &facts).await;
+    assert!(matches!(&read, Err(failure) if hinted(failure)), "{read:?}");
+    let copied = standard.copy_from(&source, "to").await;
+    assert!(
+        matches!(&copied, Err(failure) if hinted(failure)),
+        "{copied:?}"
+    );
+    let mut ontap = storage(PutServer::answering(403, "AccessDenied"));
+    ontap.options.compat = S3Compatibility::Ontap;
+    let parts = ontap.list_parts("key", "upload").await;
+    assert!(
+        matches!(&parts, Err(failure) if hinted(failure)),
+        "{parts:?}"
+    );
+    let mut nas = storage(PutServer::answering(501, "NotImplemented"));
+    nas.options.compat = S3Compatibility::Ontap;
+    nas.options.bucket_type = S3BucketType::Nas;
+    let refused = nas.begin_multipart("key").await;
+    assert!(
+        matches!(&refused, Err(failure) if !hinted(failure)),
+        "{refused:?}"
+    );
 }

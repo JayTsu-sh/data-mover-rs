@@ -35,6 +35,7 @@ macro_rules! classify_sdk {
 
 mod delete_marker;
 mod hcp_tags;
+mod hints;
 mod listing;
 mod multipart;
 mod native;
@@ -209,7 +210,10 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .send()
             .await
             .map_err(|error| {
-                let failure = classify_sdk!(error, "S3 GetObject range request failed");
+                let failure = hints::not_implemented(
+                    self.options,
+                    classify_sdk!(error, "S3 GetObject range request failed"),
+                );
                 if observed.version_id.is_some() {
                     versioned_failure(
                         error.raw_response().map(|r| r.status().as_u16()),
@@ -274,7 +278,12 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .key(full_key)
             .send()
             .await
-            .map_err(|error| classify_sdk!(error, "S3 CreateMultipartUpload request failed"))?
+            .map_err(|error| {
+                hints::not_implemented(
+                    self.options,
+                    classify_sdk!(error, "S3 CreateMultipartUpload request failed"),
+                )
+            })?
             .upload_id()
             .map(str::to_string)
             .ok_or_else(|| {
@@ -353,7 +362,12 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
                 .set_part_number_marker(marker.clone())
                 .send()
                 .await
-                .map_err(|error| classify_sdk!(error, "S3 ListParts request failed"))?;
+                .map_err(|error| {
+                    hints::denied_listing(
+                        self.options,
+                        classify_sdk!(error, "S3 ListParts request failed"),
+                    )
+                })?;
             parts.extend(decode_parts(response.parts())?);
             let Some(next) = continuation_marker(&response, marker.as_deref())? else {
                 return Ok(parts);
