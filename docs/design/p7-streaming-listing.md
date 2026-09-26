@@ -618,7 +618,7 @@ struct VersionRecord {
 | 一项的观察可能要做很多次 I/O（每个版本单独读 tags / 元数据） | 只在观察计划要求时才做；每条记录的观察结果与失败各自独立，一条失败不让整项失败；一项内的 I/O 受同一个并发窗口约束 |
 | 拷贝 | 消费方按 `records` 顺序逐条处理：对象版本用 `record.source`（`SourceVersion::Id`，最新的 `"null"` 为 `Current`）交给 `TransferRequest::with_source_version`；删除标记用 `transfer::write_delete_marker`（H1，只在 `Enabled` 的目标桶上；未开 / 暂停版本的目标只拷最新状态并记原因“目的桶未开版本，历史未重建”，D12）。一个 key 严格串行，重放不去重（D11）；参考 `examples/s3_history_replay.rs` |
 | 身份与改名识别 | 项的 `source_identity` 是 key 级的 `PathScoped`；每条记录另有自己的 `VersionScoped` 身份，拷贝前按记录核对 |
-| 快照 | 带历史的条目用新快照版本（v7，取代 C22 的 v6 每版本条目）；不带历史的仍是 v5，逐字节不变 |
+| 快照 | **用户 2026-09-27 定：条目快照不考虑版本兼容**。C11b 只保留一种当前格式（版本字节升为 7，带历史的条目带完整 ObjectHistory 段，不带历史的条目同一格式），删除 v4 / v5 / v6 的编码与解码分支；旧快照解码报 `UnsupportedVersion`，调用方按首次扫描处理 |
 | 计数 | `listed` / `emitted` 按 key 计；另加 `versions`（对象版本数）与 `delete_markers`；`bytes` 分为“当前版本字节”和“全部版本字节” |
 | terrasync 落库 | 把一项展开成每版本一行，沿用今天 base 表的排序键 `(relative_path, version_id, identity_key)`（`clickhouse.rs:569`）与去重（Q27 已定） |
 
@@ -913,7 +913,7 @@ C9  feat(storage): CIFS 流式（生产者持有句柄；停车句柄上限） -
     —— 已完成：70f85d1（接缝 open_directory + CifsDirectory，不改行为）、936e20b
 C10 feat(traversal): Unordered 调度器（worker LIFO + 窃最浅 + 全局计数，内部通道按页），设为默认
 C11 feat(traversal): Resumable（Checkpoint 项每约 1 分钟 + 取消时补发、resume_from、指纹），两种方式
-C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 v7），删除 TraversalVersions / list_versions
+C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 v7），删除 TraversalVersions / list_versions；快照只留一种格式、不兼容旧版本（用户 2026-09-27）
 C12 docs: docs/architecture/storage-transfer-architecture.md §5/§6；.claude/docs/{architecture,error-taxonomy,storage-*}.md；ADR-0008
 （terrasync 侧，另起：不丢批、分钟级退避、检查点落库顺序、消费者退出即失败、统计以库为准、全量扫描 generation 闸门、
   身份键只对 StableWithinBackend 关联、多版本每项展开成每版本一行）
