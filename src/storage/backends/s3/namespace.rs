@@ -7,9 +7,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::listing::{
-    directory_descriptor, directory_prefix, file_descriptor, list_all, list_current,
-};
+use super::current::produce_current;
+use super::listing::{directory_descriptor, directory_prefix, file_descriptor, list_all};
 use super::paging::{ListingLimits, Paging};
 use super::source::role_failure;
 use super::{S3Protocol, S3ProtocolFailure};
@@ -104,8 +103,9 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
         self.stat_entry(path).await
     }
 
-    /// Reads the whole prefix, then hands it over in pages (true paging comes with C6). Pages
-    /// are stateless requests, so cancellation or a dropped stream abandons the listing at once.
+    /// Streams the current objects and subdirectories of the prefix, each server page handed
+    /// over as it arrives (P7 C6, [`produce_current`]). Pages are stateless requests, so
+    /// cancellation or a dropped stream abandons the listing at once.
     fn list(&self, request: ListRequest) -> ListingStream {
         if let Err(failure) = refuse_artifact(&request.path) {
             return ListingStream::failed(request.path, failure);
@@ -116,8 +116,7 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
             self.limits,
         );
         ListingStream::from_producer(request.path.clone(), move |sink| async move {
-            let listing = list_current(protocol.as_ref(), &identity, &request.path, limits);
-            sink.deliver_abortable(listing, &request).await;
+            produce_current(protocol.as_ref(), &identity, limits, &request, &sink).await;
         })
     }
 
@@ -156,6 +155,9 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
         }
     }
 
+    /// Every version of the prefix, gathered whole (P7 §5.3, Q9: on a store that does not keep
+    /// keys in order, a key's history is whole only once the directory is listed to its end),
+    /// then handed over in pages. Cancellation or a dropped stream abandons it at once.
     fn list_versions(&self, request: ListRequest) -> ListingStream {
         if let Err(failure) = refuse_artifact(&request.path) {
             return ListingStream::failed(request.path, failure);

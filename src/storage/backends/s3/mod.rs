@@ -1,5 +1,6 @@
 //! Standard S3 roles for the `ArchitectureReady` storage seam.
 
+mod current;
 mod history;
 mod listing;
 mod metadata;

@@ -705,3 +705,6 @@ mod namespace;
 
 #[path = "listing_failure_tests.rs"]
 mod listing_failures;
+
+#[path = "streaming_tests.rs"]
+mod streaming;

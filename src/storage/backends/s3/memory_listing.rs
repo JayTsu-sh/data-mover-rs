@@ -10,8 +10,19 @@
 //!   edits it loses entries.
 //! - Version `n` of a key (oldest is 1) was written at `n` seconds, or all at one instant with
 //!   [`ListingKnobs::same_instant`]. An unversioned bucket lists every object as version `"null"`.
+//! - A store that keeps no order ([`ListingKnobs::unordered`], as ONTAP S3 with deduplication or
+//!   compression does) lists the keys of a `ListObjectsV2` in a scrambled order, so a common
+//!   prefix comes again wherever another of its keys falls, on any page; its continuation is a
+//!   position, not a key. [`ListingKnobs::disordered_prefixes`] returns each page's common prefixes
+//!   reversed, twice, and again on the next page; [`ListingKnobs::repeat_last_object`] starts each
+//!   page with the previous page's last object; [`ListingKnobs::leading_empty_pages`] starts each
+//!   listing with empty pages that claim more follow.
 
-use std::sync::{MutexGuard, PoisonError};
+use std::future::pending;
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+use std::mem;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -56,8 +67,36 @@ pub(crate) struct ListingKnobs {
     /// Listing this prefix fails with this failure.
     pub(crate) failure: Option<(String, S3ProtocolFailure)>,
     /// The next this many page requests, of any prefix, fail with this failure (a throttling
-    /// service answers 503 `SlowDown` for a while).
+    /// service answers 503 `SlowDown` for a while) — once `throttled_after` requests were served.
     pub(crate) throttled: Option<(usize, S3ProtocolFailure)>,
+    /// Page requests served before `throttled` starts failing them (0: from the first).
+    pub(crate) throttled_after: usize,
+    /// Page requests (0-based, any prefix) that fail with the failure given, whatever they ask.
+    pub(crate) failing_calls: Vec<(usize, S3ProtocolFailure)>,
+    /// Page requests from this one on (0-based, any prefix) never answer.
+    pub(crate) hang_from_call: Option<usize>,
+    /// Page requests waiting on `hang_from_call` right now; a dropped request leaves.
+    pub(crate) hanging: Arc<AtomicUsize>,
+    /// A store keeping no order: a `ListObjectsV2` lists its keys scrambled (the same way every
+    /// time), each key below a deeper `/` as its common prefix where the key falls, and continues
+    /// from a position.
+    pub(crate) unordered: bool,
+    /// Each `ListObjectsV2` starts with this many empty pages that name a continuation.
+    pub(crate) leading_empty_pages: usize,
+    /// A store keeping no order: each object page's common prefixes come reversed and twice, and
+    /// the previous page's again. Remembered across calls of any prefix: for a test that runs one
+    /// listing at a time (as `repeat_last_object`).
+    pub(crate) disordered_prefixes: bool,
+    /// Common prefixes of the previous object page, for `disordered_prefixes`.
+    last_prefixes: Vec<String>,
+    /// A store repeating an object across a page boundary: each object page after the first
+    /// starts with the previous page's last object again.
+    pub(crate) repeat_last_object: bool,
+    /// The last object of the previous object page, for `repeat_last_object`.
+    last_object: Option<S3ListedObject>,
+    /// The continuation of every `ListObjectsV2` page requested, throttled and failed ones
+    /// included, in order.
+    pub(crate) tokens: Vec<Option<String>>,
     /// Elements the first page of this prefix could not decode.
     pub(crate) rejected: Vec<(String, S3RejectedEntry)>,
     /// Objects the first page of this prefix lists besides its own, keyed as given (a server
@@ -104,15 +143,33 @@ impl MemoryS3 {
             // listing that pages forever.
             None => yield_now().await,
         }
+        let hang = {
+            let mut knobs = self.listing();
+            knobs.calls.push(prefix.to_string());
+            let call = knobs.calls.len() - 1;
+            knobs
+                .hang_from_call
+                .is_some_and(|from| call >= from)
+                .then(|| Arc::clone(&knobs.hanging))
+        };
+        if let Some(hanging) = hang {
+            let _waiting = Waiting::new(hanging);
+            pending::<()>().await;
+        }
         let mut knobs = self.listing();
-        knobs.calls.push(prefix.to_string());
         if let Some((failed, failure)) = &knobs.failure
             && failed == prefix
         {
             return Err(failure.clone());
         }
+        let served = knobs.calls.len() - 1;
+        if let Some((_, failure)) = knobs.failing_calls.iter().find(|(call, _)| *call == served) {
+            return Err(failure.clone());
+        }
+        let after = knobs.throttled_after;
         if let Some((remaining, failure)) = knobs.throttled.as_mut()
             && *remaining > 0
+            && served >= after
         {
             *remaining -= 1;
             return Err(failure.clone());
@@ -172,13 +229,19 @@ impl MemoryS3 {
             .map(|end| format!("{prefix}{}", &rest[..=end]))
     }
 
-    async fn object_elements(&self, prefix: &str) -> Vec<Element> {
+    async fn object_elements(&self, prefix: &str, unordered: bool) -> Vec<Element> {
         let last_modified = *self.last_modified.lock().await;
         let objects = self.objects.lock().await.clone();
+        let mut keys = self.keys_under(prefix, false).await;
+        if unordered {
+            keys.sort_by_cached_key(|key| scrambled(key));
+        }
         let mut elements = Vec::new();
-        for key in self.keys_under(prefix, false).await {
+        for key in keys {
             if let Some(common) = self.rolled_up(prefix, &key) {
-                if !matches!(elements.last(), Some(Element::Prefix(last)) if *last == common) {
+                let repeated =
+                    matches!(elements.last(), Some(Element::Prefix(last)) if *last == common);
+                if unordered || !repeated {
                     elements.push(Element::Prefix(common));
                 }
                 continue;
@@ -255,23 +318,26 @@ impl MemoryS3 {
         prefix: &str,
         token: Option<&str>,
     ) -> S3Result<S3ObjectPage> {
+        let (unordered, leading) = {
+            let mut knobs = self.listing();
+            knobs.tokens.push(token.map(str::to_owned));
+            (knobs.unordered, knobs.leading_empty_pages)
+        };
         let size = self.listing_call(prefix).await?;
-        if let Some(next) = self.endless_page() {
+        let lead = lead_in(token, leading);
+        if let Some(next) = self.endless_page().or_else(|| lead.clone().err()) {
             return Ok(S3ObjectPage {
                 next: Some(next),
                 ..S3ObjectPage::default()
             });
         }
-        let elements = self.object_elements(prefix).await;
-        let token = token.filter(|_| !self.restarts(prefix));
-        let after = token.map(|token| (token.trim_start_matches("token:"), None));
-        let (page, more) = Self::page_of(elements, after, size);
-        let next = more
-            .then(|| {
-                page.last()
-                    .map(|last| format!("token:{}", last.position().0))
-            })
-            .flatten();
+        let token = lead.ok().flatten().filter(|_| !self.restarts(prefix));
+        let elements = self.object_elements(prefix, unordered).await;
+        let (page, next) = if unordered {
+            positional_page(elements, token, size)
+        } else {
+            keyed_page(elements, token, size)
+        };
         let mut listed = S3ObjectPage {
             next: self.cycled_token().or(next),
             ..S3ObjectPage::default()
@@ -290,7 +356,30 @@ impl MemoryS3 {
                 .extend(injected(&mut knobs.rejected, prefix));
             listed.objects.extend(injected(&mut knobs.stray, prefix));
         }
+        self.misbehave(&mut listed, token.is_none());
         Ok(listed)
+    }
+
+    /// What a store that keeps no order, or repeats an object across pages, does to `page`.
+    fn misbehave(&self, page: &mut S3ObjectPage, first: bool) {
+        let mut knobs = self.listing();
+        if knobs.disordered_prefixes {
+            let own = page.prefixes.clone();
+            let mut served: Vec<String> = own.iter().rev().cloned().collect();
+            served.extend(own.iter().cloned());
+            if !first {
+                served.extend(mem::take(&mut knobs.last_prefixes));
+            }
+            knobs.last_prefixes = own;
+            page.prefixes = served;
+        }
+        if knobs.repeat_last_object {
+            let last = page.objects.last().cloned();
+            if let Some(repeated) = knobs.last_object.take().filter(|_| !first) {
+                page.objects.insert(0, repeated);
+            }
+            knobs.last_object = last;
+        }
     }
 
     pub(super) async fn list_versions_page_in_memory(
@@ -358,9 +447,64 @@ impl MemoryS3 {
     }
 }
 
+/// Where a key falls in an unordered store's listing: the same place every time.
+fn scrambled(key: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The page of `elements` at the position `token` names (`at:<index>`; the start without one),
+/// and the continuation after it when more follow.
+fn positional_page(
+    elements: Vec<Element>,
+    token: Option<&str>,
+    size: usize,
+) -> (Vec<Element>, Option<String>) {
+    let start = token
+        .and_then(|token| token.strip_prefix("at:"))
+        .and_then(|index| index.parse::<usize>().ok())
+        .unwrap_or(0);
+    let more = elements.len() > start + size;
+    let page = elements.into_iter().skip(start).take(size).collect();
+    (page, more.then(|| format!("at:{}", start + size)))
+}
+
+/// The page of `elements` after the key `token` names (`token:<key>`; the start without one), and
+/// the continuation after its last element when more follow.
+fn keyed_page(
+    elements: Vec<Element>,
+    token: Option<&str>,
+    size: usize,
+) -> (Vec<Element>, Option<String>) {
+    let after = token.map(|token| (token.trim_start_matches("token:"), None));
+    let (page, more) = MemoryS3::page_of(elements, after, size);
+    let next = more
+        .then(|| {
+            page.last()
+                .map(|last| format!("token:{}", last.position().0))
+        })
+        .flatten();
+    (page, next)
+}
+
+/// The listing's continuation once its `leading` empty pages are served (`None`: the first page
+/// of content), or `Err` with the continuation of the next empty page to serve.
+fn lead_in(token: Option<&str>, leading: usize) -> Result<Option<&str>, String> {
+    match token.and_then(|token| token.strip_prefix("lead:")) {
+        Some("0") => Ok(None),
+        Some(left) => {
+            let left = left.parse::<usize>().unwrap_or(1).saturating_sub(1);
+            Err(format!("lead:{left}"))
+        }
+        None if token.is_none() && leading > 0 => Err(format!("lead:{}", leading - 1)),
+        None => Ok(token),
+    }
+}
+
 /// Takes the injected elements of `prefix`'s first page.
 fn injected<T>(knob: &mut Vec<(String, T)>, prefix: &str) -> Vec<T> {
-    let (served, kept): (Vec<_>, Vec<_>) = std::mem::take(knob)
+    let (served, kept): (Vec<_>, Vec<_>) = mem::take(knob)
         .into_iter()
         .partition(|(of, _)| of == prefix);
     *knob = kept;
@@ -377,5 +521,21 @@ fn next_marker(last: &Element, minio: bool) -> S3VersionMarker {
             key.to_string()
         },
         version_id_marker: version.map(str::to_string),
+    }
+}
+
+/// Counts a page request while it hangs, and stops counting it once it is dropped.
+struct Waiting(Arc<AtomicUsize>);
+
+impl Waiting {
+    fn new(hanging: Arc<AtomicUsize>) -> Self {
+        hanging.fetch_add(1, Ordering::SeqCst);
+        Self(hanging)
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }

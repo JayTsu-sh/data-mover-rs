@@ -489,7 +489,10 @@ async fn cancellation_stops_an_s3_listing_between_pages() -> TestResult {
 
 /// A directory whose listing pages in a loop (a MinIO-style server serving its first page again,
 /// the same continuation marker coming back) fails that directory alone: the traversal lists the
-/// directories beside it and finishes, in both version modes.
+/// directories beside it and finishes, in both version modes. The listing of current objects
+/// streams (P7 C6): its first page (`a/x`) was handed over before the loop showed, so that
+/// directory is `Interrupted` after it, never listed twice. The listing of every version is still
+/// gathered whole, so there nothing of `a` is handed over and it is `Unreadable`.
 #[tokio::test]
 async fn a_looping_listing_fails_only_its_directory() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
@@ -513,16 +516,19 @@ async fn a_looping_listing_fails_only_its_directory() -> TestResult {
             2,
             "{rendered:?}"
         );
-        let about_a = ["failure Listing a", "listed a Unreadable"];
+        let streamed = versions == TraversalVersions::Current;
+        let expected: &[&str] = if streamed {
+            &["a/x File", "failure Listing a", "listed a Interrupted"]
+        } else {
+            &["failure Listing a", "listed a Unreadable"]
+        };
         let around_a: Vec<&String> = rendered
             .iter()
-            .filter(|item| item.starts_with("a/") || about_a.contains(&item.as_str()))
+            .filter(|item| {
+                item.starts_with("a/") || item.ends_with(" a") || item.starts_with("listed a ")
+            })
             .collect();
-        assert_eq!(
-            around_a,
-            ["failure Listing a", "listed a Unreadable"],
-            "{versions:?}: {rendered:?}"
-        );
+        assert_eq!(around_a, expected, "{versions:?}: {rendered:?}");
         assert!(
             rendered.contains(&"listed b Complete".to_string()),
             "{rendered:?}"
@@ -542,7 +548,7 @@ async fn a_looping_listing_fails_only_its_directory() -> TestResult {
         let totals = totals(&outcome);
         assert_eq!(
             (totals.listing_failures, totals.interrupted_listings),
-            (1, 0),
+            (1, u64::from(streamed)),
             "{versions:?}: {totals:?}"
         );
     }

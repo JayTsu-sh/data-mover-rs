@@ -331,7 +331,7 @@ separate from the observation window, and at most twice that many started listin
 admission point, each stopped once it has handed over its first page. The traversal holds a few
 pages of each open listing however large its directory, so its memory is bounded by those pages
 plus the subdirectories still to descend into, never by the width of a directory; until each
-backend streams its listing for real (Local since P7 C5, HDFS since C8, the others in C6, C7 and C9), the backend's
+backend streams its listing for real (Local since P7 C5, S3's current objects since C6, HDFS since C8, NFS and CIFS in C7 and C9), the backend's
 own producer still reads the whole directory before the first page. A listing that fails after
 returning children is `Interrupted`, its failure carrying how many it returned (`delivered`).
 A session failure reported by a prefetched listing ends the traversal as soon as it arrives,
@@ -354,9 +354,11 @@ names. On S3 a name can repeat in one directory — the object `a` beside the pr
 `All` one child per version — and a block keeps them in listing order, a key's versions
 contiguous, oldest first; only the prefix is descended into. The
 optional metadata of a version entry is observed bound to that version, and a prefix or a delete
-marker asks the metadata role nothing. S3 listings cost at least one request per directory; the
-S3 backend still reads a whole directory before handing over its first page, until its own
-streaming listing (traversal plan P7 C6). S3 has no directories:
+marker asks the metadata role nothing. S3 listings cost at least one request per directory. The
+listing of current objects streams (traversal plan P7 C6): each `ListObjectsV2` page is handed
+over as it arrives, assuming no key order (a store may return keys unsorted and a common prefix
+on several pages; each subdirectory is handed over once, and an object may be handed over
+twice); the listing of every version is still gathered whole per directory. S3 has no directories:
 a traversal rooted at a prefix under which nothing is stored fails the root's listing (`NotFound`)
 rather than completing as an empty, exhaustive source.
 

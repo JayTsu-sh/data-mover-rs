@@ -1,15 +1,28 @@
-//! Bounds on paging through one S3 directory (ADR-0006 C22). A listing collects every page of a
-//! directory before its block is built, so a directory is held in memory whole; these bounds keep
-//! a huge directory or a broken server from paging (and growing) without end. Hitting one fails
-//! that directory's listing — the traversal reports it `Failed` and goes on with its siblings,
-//! never a silently truncated block and never the end of the session.
+//! How one S3 directory's listing pages (ADR-0006 C22, P7 C6): the bounds on paging, and how a
+//! page request that failed for a passing reason is sent again.
+//!
+//! - **Bounds.** A broken server can page without end (a continuation that comes back, empty pages
+//!   that claim more follow) and a huge directory can list more than a listing should hold (the
+//!   continuation and subdirectory sets of a streaming listing, a whole directory of versions).
+//!   Hitting a bound fails that directory's listing — the traversal reports it and goes on with its
+//!   siblings, never a silently truncated block and never the end of the session.
+//! - **Retries.** A page request is stateless: the same continuation sent again asks for the same
+//!   page, before the first page as after it (P7 §5.2, §8). Throttling backs off within its own
+//!   budget ([`ThrottleBackoff`]); any other transient failure (a lost connection, a 5xx) is sent
+//!   again a few times, the count starting over after every page that arrives. Only a failure that
+//!   outlasts both ends the listing, with its own scope.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::hash::Hash;
+use std::time::Duration;
 
+use tokio::time::sleep;
+
+use super::{S3ProtocolFailure, S3Result};
 use crate::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::StorageRoleFailure;
-use crate::storage::throttle::ThrottleBackoff;
+use crate::storage::throttle::{ThrottleBackoff, ThrottleBudget, retry_throttled};
 
 /// How far one directory's listing may page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,16 +33,117 @@ pub(super) struct ListingLimits {
     pub(super) max_empty_pages: usize,
     /// How long one listing backs off while the service throttles it (P7 §8, Q11).
     pub(super) throttle: ThrottleBackoff,
+    /// The delays before each resend of a page request that failed transiently (not throttled)
+    /// without a page arriving in between; one delay per resend.
+    pub(super) resends: &'static [Duration],
 }
 
 impl ListingLimits {
-    /// 5 million entries (5 000 full pages): about as much as one directory's descriptors should
-    /// hold in memory before listings stream (traversal plan P7).
+    /// 5 million entries (5 000 full pages), kept from before listings streamed (traversal plan
+    /// P7): a directory of versions is still held whole, and a streaming listing of current
+    /// objects still holds its continuations and subdirectory names. Three resends 0.25–2 s
+    /// apart, on top of the SDK's own attempts, as the HDFS listing does (P7 C8).
     pub(super) const PRODUCTION: Self = Self {
         max_entries: 5_000_000,
         max_empty_pages: 16,
         throttle: ThrottleBackoff::LISTING,
+        resends: &[
+            Duration::from_millis(250),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ],
     };
+}
+
+/// What one listing has left of its retries: the throttling budget, spent over the whole listing,
+/// and the resends of a transient failure, renewed by every page that arrives.
+pub(super) struct PageRetry {
+    throttle: ThrottleBudget,
+    resends: &'static [Duration],
+    /// Resends since the last page arrived.
+    resent: usize,
+}
+
+impl PageRetry {
+    pub(super) const fn new(limits: ListingLimits) -> Self {
+        Self {
+            throttle: limits.throttle.start(),
+            resends: limits.resends,
+            resent: 0,
+        }
+    }
+
+    /// Runs one page request, sent again while it is throttled (within the budget) or fails
+    /// transiently (within the resends). Each attempt is a new request for the same page: the
+    /// caller's continuation does not change. The sleeps are plain sleeps in this future, so
+    /// dropping it abandons them at once.
+    ///
+    /// # Errors
+    /// The failure that outlasted its retries, or any other failure as it came. Throttling past
+    /// the budget is this listing's `Throttled` / `Transient` failure ([`past_budget`]).
+    pub(super) async fn fetch<T, F, Fut>(&mut self, mut attempt: F) -> S3Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = S3Result<T>>,
+    {
+        loop {
+            match retry_throttled(&mut self.throttle, is_throttled, &mut attempt).await {
+                Ok(page) => {
+                    self.resent = 0;
+                    return Ok(page);
+                }
+                Err(failure) if resendable(&failure) => {
+                    let Some(delay) = self.resends.get(self.resent).copied() else {
+                        return Err(failure);
+                    };
+                    self.resent += 1;
+                    tracing::debug!(
+                        resend = self.resent,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        "S3 listing page failed transiently; sending the same request again"
+                    );
+                    sleep(delay).await;
+                }
+                Err(failure) => return Err(past_budget(failure)),
+            }
+        }
+    }
+}
+
+/// Whether the service asked this listing to slow down; it backs off rather than fails.
+fn is_throttled(failure: &S3ProtocolFailure) -> bool {
+    class_of(failure) == FailureClass::Throttled
+}
+
+/// A transient failure other than throttling (which has its own budget): the same request may
+/// well succeed a moment later.
+fn resendable(failure: &S3ProtocolFailure) -> bool {
+    let (S3ProtocolFailure::Entry { transience, .. }
+    | S3ProtocolFailure::Session { transience, .. }) = failure;
+    *transience == Transience::Transient && !is_throttled(failure)
+}
+
+const fn class_of(failure: &S3ProtocolFailure) -> FailureClass {
+    let (S3ProtocolFailure::Entry { class, .. } | S3ProtocolFailure::Session { class, .. }) =
+        failure;
+    *class
+}
+
+/// A listing still throttled once its backoff budget is spent fails that listing alone: the
+/// service is busy, the session is fine, and the traversal goes on (P7 §8, Q11).
+fn past_budget(failure: S3ProtocolFailure) -> S3ProtocolFailure {
+    match failure {
+        S3ProtocolFailure::Session {
+            class: FailureClass::Throttled,
+            diagnostic,
+            ..
+        } => S3ProtocolFailure::entry(
+            FailureClass::Throttled,
+            Transience::Transient,
+            format!("{diagnostic}; still throttled after the listing's backoff budget"),
+        ),
+        other => other,
+    }
 }
 
 /// The paging state of one directory's listing: continuations followed, entries listed, and the
@@ -64,7 +178,24 @@ impl<T: Clone + Eq + Hash> Paging<T> {
         listed: usize,
         next: Option<T>,
     ) -> Result<Option<T>, StorageRoleFailure> {
-        self.entries = self.entries.saturating_add(listed);
+        self.advance_keeping(directory, listed, listed, next)
+    }
+
+    /// [`Self::advance`] for a page of `listed` entries of which the listing kept `kept`: only
+    /// those count towards the entry limit (a streaming listing drops a common prefix it already
+    /// handed over, which an unordered store repeats wherever one of its keys falls), while
+    /// `listed` decides whether the page was empty.
+    ///
+    /// # Errors
+    /// As [`Self::advance`].
+    pub(super) fn advance_keeping(
+        &mut self,
+        directory: &StoragePath,
+        listed: usize,
+        kept: usize,
+        next: Option<T>,
+    ) -> Result<Option<T>, StorageRoleFailure> {
+        self.entries = self.entries.saturating_add(kept);
         if self.entries > self.limits.max_entries {
             return Err(failure(
                 directory,

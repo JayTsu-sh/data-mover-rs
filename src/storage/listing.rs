@@ -19,12 +19,13 @@
 //! Single-directory callers (recursive delete, the NDX walk) collect a whole listing with
 //! [`collect_listing`].
 //!
-//! **Where each backend stands.** Local (P7 C5) and HDFS (C8) read their directories page by
-//! page: a dropped or cancelled listing stops within a page (HDFS abandons its stateless request
-//! in flight at once). The other backends still read the whole directory first and then hand it
-//! over in pages, so backpressure and cancellation only act between pages: a dropped or cancelled
-//! listing of a large directory is still read to its end in the background (S3 excepted, which
-//! abandons its stateless requests at once). True paging comes per backend in C6, C7 and C9. A
+//! **Where each backend stands.** Local (P7 C5), S3's current objects (C6) and HDFS (C8) read
+//! their directories page by page: a dropped or cancelled listing stops within a page (S3 and HDFS
+//! abandon their stateless request in flight at once). S3's listing of every version is still
+//! gathered whole per directory (§5.3; it too abandons its requests at once). NFS and CIFS still
+//! read the whole directory first and then hand it over in pages, so backpressure and cancellation
+//! only act between pages: a dropped or cancelled listing of a large directory is still read to
+//! its end in the background. True paging comes for them in C7 and C9. A
 //! producer detached from a runtime that shuts down mid-listing is dropped with the runtime, as
 //! every other detached task is.
 
@@ -615,14 +616,34 @@ impl PageSink {
     /// children; the first page carries the failures and the hidden-artifact count. Stops at
     /// cancellation with a `Cancelled` failure, and as soon as the consumer is gone.
     pub(crate) async fn deliver(&self, listing: Item, request: &ListRequest) {
+        match listing {
+            Ok(page) => {
+                let _ = self.send_split(page, request).await;
+            }
+            Err(failure) => self.fail(failure).await,
+        }
+    }
+
+    /// Hands over `page` — one piece of a listing a backend read, however many children it
+    /// holds — in pages of at most `request.page_hint` children (at least one page, even an empty
+    /// one); the first carries the failures and the hidden-artifact count. A cancelled request
+    /// ends the listing before the next page, or while a page waits for the consumer to make
+    /// room (that page is dropped).
+    ///
+    /// # Errors
+    /// Returns [`ListingClosed`] when the listing is over: the consumer is gone, or the request
+    /// was cancelled and the listing has been ended with a `Cancelled` failure. The producer must
+    /// release what it holds and return.
+    pub(crate) async fn send_split(
+        &self,
+        page: ListingPage,
+        request: &ListRequest,
+    ) -> Result<(), ListingClosed> {
         let ListingPage {
             children,
             failures,
             internal_hidden,
-        } = match listing {
-            Ok(page) => page,
-            Err(failure) => return self.fail(failure).await,
-        };
+        } = page;
         let hint = request.page_hint.get();
         let mut children = children.into_iter();
         let mut page = ListingPage::new(
@@ -631,15 +652,19 @@ impl PageSink {
             internal_hidden,
         );
         loop {
-            if request.cancel.is_cancelled() {
-                return self.fail(cancelled(&request.path)).await;
-            }
-            if self.send(page).await.is_err() {
-                return;
-            }
+            let sent = tokio::select! {
+                biased;
+                () = request.cancel.cancelled() => None,
+                sent = self.send(page) => Some(sent),
+            };
+            let Some(sent) = sent else {
+                self.fail(cancelled(&request.path)).await;
+                return Err(ListingClosed);
+            };
+            sent?;
             let next: Vec<ListedChild> = children.by_ref().take(hint).collect();
             if next.is_empty() {
-                return;
+                return Ok(());
             }
             page = ListingPage::new(next, Vec::new(), 0);
         }

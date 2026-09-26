@@ -207,7 +207,7 @@ for entry in read_dir(dir):
 预读 (from_producer：channel 1 页 + 生产者手里 1 页)。偷看到的结束 (`End` / 失败) 不需要 credit：
 生产者正常返回不再占 channel 槽发 `End` 消息，而是先置 `finished` 标志再丢掉最后一个 sender，
 所以单页小目录的页一收到、结束就可见，页与结束一起到，驱动一次唤醒 (偷看没看到的结束要等游标取走前一页)。任务中途 panic 由 `Reporter` 的 Drop 报 `Internal`。
-**Local 自 C5 起逐页读目录**（每页一次 `spawn_blocking`，`ReadDir` 带进带出）；**HDFS 自 C8 起逐页列举**（`list_status_iter` 按页取，列举前不再 `get_file_info`，取消 / drop 立即放弃进行中的请求；中途可重试失败从最后读到的名字之后续读）；S3 / NFS / CIFS 在 C6 / C7 / C9 之前生产者仍整目录读完再按页交出，所以真机上"几页"的界目前只在遍历这一侧与 Local / HDFS 上成立。
+**Local 自 C5 起逐页读目录**（每页一次 `spawn_blocking`，`ReadDir` 带进带出）；**HDFS 自 C8 起逐页列举**（`list_status_iter` 按页取，列举前不再 `get_file_info`，取消 / drop 立即放弃进行中的请求；中途可重试失败从最后读到的名字之后续读）；**S3 当前对象自 C6 起逐页列举**（`ListObjectsV2` 每个服务端页一到就按 `page_hint` 交出，不假设 key 有序：公共前缀用集合去重、续页只用不透明 token、节流 / 瞬时失败用同一 token 重发；多版本 All 仍按目录收齐，C11b 改）；NFS / CIFS 在 C7 / C9 之前生产者仍整目录读完再按页交出，所以真机上"几页"的界目前只在遍历这一侧与 Local / S3 当前对象 / HDFS 上成立。
 
 驱动循环 (`storage.rs` 的 `drive`)：
 
