@@ -48,7 +48,7 @@
 | 5 | 断点续扫是扫描入参（`resumable` / `resume_from`），默认关，由上层决定 | data-mover 不决定策略；关闭时零开销 |
 | 6 | 续扫**不求精确**：从最近一个已落库的检查点重来，重扫部分靠库去重；唯一硬性要求是“进度不领先于已落库的数据” | 重复扫描代价小；真正的问题是 ClickHouse 批没写下去而进度前进了 |
 | 7 | terrasync 的临时表不用改 | 每批一张新临时表、比较后并入 `ReplacingMergeTree` 的 base，跨批重复天然被吸收 |
-| 8 | S3 列举**不假设有序** | 用户遇到过无序的 S3 实现 |
+| 8 | S3 列举**不假设有序** | 用户遇到过无序的 S3 实现：**ONTAP S3 在卷上配置了重删 / 压缩时，列举结果无序**（用户 2026-09-26，Q22） |
 | 10 | 检查点默认间隔 **1 分钟**（Q14） | 用户定的 |
 | 13 | `should_scan` 只放需要额外接口调用的项（`Acl / Xattrs / Tags / SymlinkTarget`），是一个集合、没有档位；列举顺带的信息一律收下（Q31） | 用户定的 |
 | 11 | `rename` 保留在 Namespace（Q23） | 用户定的 |
@@ -580,7 +580,7 @@ struct VersionRecord {
 3. DXN 的 null 版本丢失是存储自身的缺陷：作为源，它的历史里本来就没有了；作为**目标**，往 DXN 写删除标记会删掉目标上已有的 null 版本。历史迁移到 DXN 时要在报告里说明，
    或者避免在目标上对曾有 null 版本的 key 写删除标记。写进 `.claude/docs/storage-s3.md` 的 DXN 差异。
 4. MinIO / DXN 会合并连续的删除标记，StorageGRID 不会；迁移到前两者时计入“目标合并了 N 个删除标记”。
-5. Q22 的无序存储目前无法访问：用内存 fake 的“打乱顺序”模式覆盖，拿到后再加入矩阵。
+5. Q22 的无序存储是 **ONTAP S3（卷上配置重删 / 压缩时）**（用户 2026-09-26）。实验室里是否有可用的 ONTAP S3 端点待确认；在那之前用内存 fake 的“打乱顺序”模式覆盖，拿到后加入矩阵。
 
 ### 10.3 方案
 
@@ -948,7 +948,7 @@ VERIFY
 
 | 编号 | 决定 / 结果 | 见 |
 |---|---|---|
-| Q22 | 用户遇到的无序 S3 目前无法访问：用内存 fake 的打乱顺序模式覆盖，拿到后再加入 e2e-s3 矩阵 | §5.3 |
+| Q22 | 无序 S3 = ONTAP S3 在配置重删 / 压缩时（用户 2026-09-26）；有端点前用内存 fake 的打乱顺序模式覆盖，拿到后加入 e2e-s3 矩阵 | §5.3 |
 | Q30 | 已批准并完成：DXN 与 StorageGRID 实测见 10.2.1。新发现 DXN 的 null 版本丢失缺陷与多网关时间倒挂 | §10.2.1 |
 
 **目前没有待用户决定的问题。**
@@ -985,6 +985,7 @@ VERIFY
 | 6 | **terrasync 写 ClickHouse 的路径在异常时会丢数据**（10.131.9.10，`8edd400`）：全量扫描写失败只重试约 0.7 s 就丢掉整批且任务报成功；数据库消费者退出后广播给它的数据被静默丢弃；统计按广播逐条累加、与是否入库无关；全量扫描直接写 base、崩溃即留下半场数据 | 在 terrasync 里改，本设计只列要求（§11、Q16、Q17） |
 | 7 | **S3 当前对象的 `PathScoped` 身份里没有路径**（稳定字节只有 ETag）：内容相同、路径不同的对象共用一个身份键，terrasync 按身份键 `INNER JOIN` 会交叉配对成 N×N 行（§5.4.7、F1 / Q28） | **已修** `4fa5aa5`（`fix(s3)!: PathScoped 身份包含路径`）：S3 当前对象、`"null"` 版本与 `"null"` 删除标记的稳定字节改为 u32 大端路径长度 + 路径 + ETag；契约写进 `IdentityStrength::PathScoped` 文档。破坏性：S3 `PathScoped` 身份键一次性全变。terrasync 侧“只对 `StableWithinBackend` 按身份键关联”仍待在 terrasync 里做 |
 | 8 | **版本与删除标记交错时按 LastModified 合并，并发写入时排错**：aws-sdk-s3 把 `<Version>` 与 `<DeleteMarker>` 解析成两个列表，丢了交错顺序（`src/s3/role_protocol/versions.rs:107, 123`）（§10.2、F2 / Q29） | **已修** `40c1ac9`（`fix(s3)!: 版本历史按服务端顺序组装`）：`src/s3/version_order.rs` 拦截原始响应体、按服务端位置倒序组装，校验不过的 key 标 `HistoryOrder::Inferred`；`history.rs` 的核心由 role-based 与 legacy `walkdir` / `walkdir_2` 共用。差别：role-based 在整个目录列举（跨页）上校验同 key 连续；**legacy `walkdir` 只在每批已释放的完整 key 内校验连续**。回归数据 `tests/data/s3/minio-concurrent-versions{,-paged}.xml` |
+| 9 | **legacy 版本列举假设 key 升序**：`src/s3/version_listing.rs` 的 `VersionPages::complete_keys` 把每页最大的 key 扣到下一页合并（C20），前提是 ListObjectVersions 按 key 升序返回。ONTAP S3 配置重删 / 压缩时列举无序（Q22），同一个 key 的历史会被拆成几段、各自当成一个 key 发出（latest / `version_count` 错）；F2 的连续性校验在 legacy 里也只看每批 | 未修：legacy 在 P7 收尾整体删除；删除前若有调用方在无序存储上用 legacy 多版本列举，改为按整个目录物化分组（role-based 的做法）。role-based（C22 / C6）按目录物化分组，不受影响 |
 
 ## 收尾：清理扫描相关旧代码
 
