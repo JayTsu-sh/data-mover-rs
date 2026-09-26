@@ -883,7 +883,8 @@ VERIFY
 - node1 + m1-source 53M 树（c=64，--quiet）：C0 前重测基线（含 MALLOC_ARENA_MAX=2、驻留探针、strace -c futex）、C0 后、
   Blocks 流式后、Unordered 后；与 legacy 交替四轮；条目数必须 53,368,420
 - FAS2750：e2e-cifs；cifs_namespace_contract；深链 + 宽树 c=1/4/32；停车句柄 30 分钟；CIFS 与 NFS 的 Blocks 下钻顺序逐行一致
-- **S3 真机（用户 2026-09-26 定：本次重构的 S3 实际测试环境）**，每个动 S3 的步骤（C6、F4、C10、C11、C11b、收尾清理）都要三套都过：
+- **S3 真机（用户 2026-09-26 定：本次重构的 S3 实际测试环境）**，每个动 S3 的步骤（C6、F4、C10、C11、C11b、收尾清理）都要在下列每一套上过；
+  **ONTAP、RustFS、DXN 都要在多版本桶与非多版本桶上各验证一遍**（ONTAP：data-mover-test-ver / data-mover-test，另加 NAS 桶；RustFS、DXN：data-mover-test + 临时版本桶）：
   - MinIO（10.131.9.11:9000，`.claude/skills/e2e-s3/.env`，桶 data-mover-test + 临时版本桶）：100 万对象平铺前缀的首项延迟与 RSS；版本化桶（traversal_versions.sh）
   - ONTAP S3（FAS2750 ONTAP 9.19.1，SVM lizy，http://10.128.61.200:80，`ontap/.env`）：对象桶 data-mover-test / data-mover-test-ver，
     卷开后台重删 + 压缩；我们的用户不建桶 → 脚本用已有桶、跑完清空对象（不删桶）。已知：列举字节序；带 delimiter 的 ListObjectVersions
