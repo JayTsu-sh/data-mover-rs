@@ -898,11 +898,14 @@ C7b fix(nfs): v3 READDIRPLUS 列出、却不给属性的 `.snapshot`（ONTAP 卷
 P1–P5  S3 URL 参数化（§14.2）—— F5 合入后，可与 C7 并行
        —— 已完成：P1 `2fe52f1`、P2 `71fb411`、P3 `52710c7`（+ refactor `cc65fec` 移出 tls.rs）、
        P4 `db7fbb9`、P5 `4718183`（调用方与文档）；真机见 §14.2 实施记录
-N0     NAS 桶实测（curl，§14.2）—— 立即
+N0     NAS 桶实测（curl，§14.2）—— 已完成：`2893508`
 N1–N7  `compat=ontap&bucket_type=nas` 的 NAS 桶 profile（§14.2）—— H1、C7 之后
+       —— 已完成：N1 `a674ee0`、N2 `5779039`、N3 `cadbaf5`、N4 `8b279dc`、N5 `e712910`、N6 `566e72b`、N7 `1f1c739`；
+       真机见 §14.2 实施记录
 F5h fix(s3): 目录对象的单 PUT 改为流式（Content-Length = 源大小、UNSIGNED-PAYLOAD、边传边算 MD5 与回复 ETag 核对），不再整对象缓冲
     在内存里（F5g 现状：流式来源的 `d/` 整个读进内存再 PUT，最坏每个在途传输 5 GiB）。复用 N 阶段的流式单 PUT 原语：该原语先做成
     通用 S3 能力（不绑 NAS profile），F5h 与 NAS profile 共用；五套 S3 真机逐一确认接受 UNSIGNED-PAYLOAD 的流式单 PUT
+    —— 已完成 `f87512b`（五套 S3 版本 / 非版本桶 `directory_objects.sh` 全过，见 §14.2 实施记录）
 C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:4610-4691   —— 已完成：cdcc66d（搬移）、7da78ce
     + 子目录句柄作为下钻提示随工作项下传，列举不再写 GLOBAL_CACHE，无提示 / 失效回退 lookup_fh（§12.7 修法 A）
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
@@ -1105,6 +1108,50 @@ N1–N7 在 H1、C7 之后。完整方案（file:line）见会话 scratchpad `s3
 - 同桶 CopyObject 是克隆（1 GiB 0.01 s，副本互相独立，回复 ETag = 目标 HEAD 的不透明值）：原生拷贝亲和值得保留；> 5 GiB CopyObject 未测，维持单次 ≤ 5 GiB。
 - 其余：Range（含 `-100`、多段 → multipart/byteranges）与 416 正常；列举的 LastModified 截到秒（`.000Z`）；256 字节以上的 UTF-8 名字在 NFS 上
   被改名（`:S400001`），两个 key 指向同一对象；`dm_s3_nas` 每小时 :05 打快照，大对象测试须在下个快照前删除。测量脚本不含凭据，见 N0 报告。
+
+**N1–N7、F5h 实施记录（2026-09-27）**（提交：N1 `a674ee0`、N2 `5779039`、N3 `cadbaf5`、N4 `8b279dc`、N5 `e712910`、
+N6 `566e72b`、N7 `1f1c739`、F5h `f87512b`；细节见 `.claude/docs/storage-s3.md` URL 段的 N1–N6 与「ONTAP S3 NAS 桶实测行为」）：
+- 能力开关 `S3BucketCapabilities`（`storage/backends/s3/capabilities.rs`）：conditional_reads / multipart / resumable / max_object_bytes /
+  file_backed_keys / md5_etags / versions / directory_objects / native_same_bucket_only，OBJECT 与 NAS 两行；`S3Protocol::bucket_capabilities()`
+  由 `bucket_type` 决定（`compat` 只改请求）。
+- 引擎（破坏性）：`StagedDestination::resumable_at_destination()` / `final_refusal(path, size)`（N2）与 `read_back_method(stage)` /
+  `upload_digest(stage)`（N4）四个默认方法 —— 不给 `VerificationEvidence` / `PublicationEvidence` 加字段（它们在各 backend 里按字面量构造）；
+  `EffectiveRecovery::UnsupportedByDestination` + `#[non_exhaustive]`；`TransferOutcome.verification`（`ReadBackMethod` / `UploadDigest`）。
+  名字 / 大小预检与目录对象上限合并在 `refuse_unwritable`（Preflight，目的端任何 I/O 之前），三个 S3 prepare 再查一遍。
+- 流式单 PUT（N3，通用）：`S3Protocol::put_object_streaming` + `staged/streaming.rs`；实现中补的规则：SDK 的卡顿保护（stalled stream
+  protection）也要对这个请求关掉（否则扣住最后 1 字节几秒就被杀）；本请求强制 `WhenRequired` 校验和（否则 body 变 aws-chunked，NAS 拒）；
+  body 在凑满声明长度前被放弃时报错而不是正常结束；扣字节最长 300 s（`HOLD_LIMIT`，低于实测的 900 s）；publish 前请求若已结束（存储因 body
+  空闲断连、提前拒绝）报未变；结果不明的发布按 prepare HEAD 结算时隔 2 s 再 HEAD 一次才报未变（`SETTLE_GRACE`，存储已有完整 body，
+  回复丢失后仍可能提交）；Direct 等输入结束才送最后 1 字节。
+- 与计划的差别：NAS 源端 body 读到一半出错也按 N0 决定报 `Conflict`（普通断连同样不重试，诊断带原始错误）—— 见“待定”；
+  名字冲突映射认错误码（NoSuchKey / NameCollision），无错误码时才看 404 / 409；原生拷贝读回的锚必须等于拷贝回复（设过标签则是之后 HEAD）的 ETag；
+  NAS 桶上 `keeps_history` 不发 GetBucketVersioning；Direct 不做 prepare HEAD（它的失败一律报已变）。
+- 故障注入：N1 14 项、N2 11 项（1 项防御性、不可达，存活）、N3 14 项（`disable_payload_signing` 一项存活：SDK 对不可重放的 body 本来就发
+  UNSIGNED-PAYLOAD，显式关签名是双保险）、N4 9 项、N5 4 项、N6 4 项、F5h 5 项，其余都让至少一个测试变红，改回后逐字节还原。
+- 真机（2026-09-27，从 10.131.9.10 跑，它到各端点直连）：
+  - `nas_matrix.sh`（`data-mover-nas`）三轮 `RESULT: pass`（42 行）：0 B / 1 KiB / 8 MiB+1 / 200 MiB × 三种 policy × 读回开关，结果报
+    `EtagBracketed { ConditionalReadsUnsupported }` / `NotPerformed`、`upload_digest = Matched`、Checkpointed `UnsupportedByDestination`，
+    内容逐字节相等；1 GiB 流式单 PUT（读回开，39 s）与同桶原生 1 GiB 一次 CopyObject（25 s，读回开）；5 GiB + 1 与 `a/../x`、`a/./y`、`a//b`、
+    256 字节段在 Preflight 拒且未写；有文件 `clash` 时写 `clash/x` → `Conflict`；200 MiB 在 4 s 处取消与 SIGKILL 后旧对象 ETag 不变，重跑
+    `Fresh` + `UnsupportedByDestination`；NAS → 本地 200 MiB 相等、读的中途被 PUT 替换 → `Conflict`；同桶原生 1 KiB / 200 MiB 各一次
+    CopyObject；NAS ↔ `data-mover-test` 走 Streaming；参数写在对象桶上照常工作（Checkpointed 报 UnsupportedByDestination、括号式读回）；
+    NAS 桶漏写参数：8 MiB+1 在 Prepare 报 PermissionDenied，诊断带 `add ?compat=ontap&bucket_type=nas`。跑完 `nas-<run>/` 下 0 个对象 / 目录。
+  - 首轮冒烟（同一天较早）8 MiB 以上的流式行曾在 20 s 看门狗处失败（Connectivity / Transient），同一时段小请求也要 1–3 s、TCP 建连 3 s；
+    之后 curl 200 MiB 三次均约 1.8 s，冒烟与三轮全矩阵全部通过 —— 判断为当时的网络状况，记录在案（看门狗按设计报可重试）。
+  - F5h：`directory_objects.sh` 在 MinIO（临时版本桶 / `data-mover-test`）、ONTAP 对象桶（`data-mover-test-ver` / `data-mover-test`）、RustFS
+    （临时版本桶 / `data-mover-test`）、DXN（临时版本桶 / `data-mover-test`）、StorageGRID（`data-mover-test-ver` / `data-mover-test`）十次全部
+    `RESULT: pass`：12 MiB `mid/` 三种 policy 都走流式单 PUT（UNSIGNED-PAYLOAD，一次请求、ETag 无 `-N`、相等），200 MiB `big/` 切断后不留对象、
+    重跑 `Fresh` —— 五套存储都接受 UNSIGNED-PAYLOAD 的流式单 PUT（明文 HTTP）。
+  - 回归（同一棵树，F5h 之后）：`run.py` 在 MinIO、ONTAP 对象桶、ONTAP NAS 桶（`bucket_type=nas`）、RustFS、DXN、StorageGRID 全部
+    `all checks passed`；`staged_matrix.sh` 在 MinIO、ONTAP `data-mover-test`、RustFS、DXN、StorageGRID 各 40 行成功（唯一失败行是预期的
+    取消），Direct `equal=yes key_uploads=0`、原生 `equal=yes stage_objects=0 key_uploads=0`、取消与 SIGKILL 后 1 指针 + 1 upload、续传后
+    `0 / 0`、末行 `left: objects=0 key_uploads=0`；`traversal_versions.sh` 在 MinIO / ONTAP / RustFS / DXN 非版本桶、ONTAP `data-mover-test-ver`、
+    NAS 桶（`bucket_type=nas`，`EXPECT_DIR_MARKER=0`）全部 `RESULT: pass`；`nas_matrix.sh` 第四轮 `RESULT: pass`。跑完核对：各存储的桶与改前相同
+    （MinIO 另有别人建的 `data-mover-c10-1790460684`，ONTAP `data-mover-test-ver` 下别人的 `dm-1790460935/`，都不是本批写的，未动），我们的前缀无残留。
+    `versioning_matrix.sh` 未重跑（版本化桶的写入路径除结算函数的重构外未变，结算在 MD5 ETag 的桶上行为不变）。
+- 待定（需用户定）：NAS 源端读 body 途中出错一律报 `Conflict` / Permanent（N0 决定：服务器在替换提交后切断进行中的 GET）；普通网络断连因此
+  也不重试。可选的收窄：body 出错后先 HEAD，ETag 变了才 `Conflict`，没变按可重试的断连报。
+
 
 ## 15. 决定记录（2026-09-25 全部采纳）
 

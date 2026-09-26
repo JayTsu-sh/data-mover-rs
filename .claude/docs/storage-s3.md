@@ -834,6 +834,7 @@ NAS 桶（multiprotocol，底下是 FlexVol `dm_s3_nas`）与同一 SVM 的对�
 结论（N7 起）：写 `?compat=ontap&bucket_type=nas` 后 NAS 桶可作源（无序列举、无条件读 + 收尾 HEAD）与目的端（≤ 5 GiB，
 不续传，括号式读回，同桶原生拷贝），较弱的保证逐条写进结果（`EffectiveRecovery::UnsupportedByDestination`、
 `TransferOutcome.verification`）。不写参数时照旧失败，但 501 / 403 的诊断提示补参数。legacy `StorageEnum` 不理会这个 profile。
+真机（2026-09-27，`nas_matrix.sh` 四轮 `RESULT: pass`，行与结果见 P7 设计 §14.2「N1–N7、F5h 实施记录」）。
 
 **补充实测（N0，2026-09-26，原始 socket SigV4 客户端 + curl + 10.131.9.10 上 NFSv3 root 挂载）**，供 NAS profile（P7 §14.2）使用：
 
