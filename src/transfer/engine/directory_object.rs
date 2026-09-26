@@ -1,0 +1,100 @@
+//! Directory objects in transfers (P7 F5, §14.1 D2): a file an object store keeps under a key
+//! ending in `/` (`p/d/`), which a traversal lists as a file entry of `p/d`.
+//!
+//! - Between object stores it is copied like any file, to the same key.
+//! - A filesystem (Local, NFS, CIFS, HDFS) cannot store content on a directory. A consumer decides
+//!   each entry with [`directory_object_action`] before it builds any request: a zero-byte one (a
+//!   folder marker) or a delete marker is nothing to do — the directory entry already creates the
+//!   directory — and one holding content is skipped with [`DIRECTORY_OBJECT_SKIP_REASON`].
+//!   data-mover builds no sidecar file: any sidecar name can collide with a real key. A consumer
+//!   that wants one maps `final_path` itself; the engine copies that like any file.
+//! - The engine backstop stays strict whatever the size: a final path ending in `/` on a
+//!   destination that holds no directory objects, or a source path ending in `/` on a source that
+//!   holds none, is refused at `Preflight` with `Unsupported` at that path, before any I/O
+//!   ([`refuse_unholdable`]).
+
+use crate::model::{
+    EntryOperationFailure, EntryVersion, FailureClass, ObservedEntry, Operation, StoragePath,
+    Transience,
+};
+use crate::storage::{NamespaceCapabilities, Storage, StorageRoleFailure};
+
+use super::{TransferFailure, TransferPhase, TransferSide};
+
+/// Why a directory object holding content is not copied to a destination that cannot hold one.
+pub const DIRECTORY_OBJECT_SKIP_REASON: &str =
+    "the destination cannot store content on a directory (an object key ending in '/')";
+
+/// What a consumer does with one listed entry when copying to a destination (P7 F5, D2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DirectoryObjectAction {
+    /// Request the transfer as usual: the entry is no directory object, or the destination holds
+    /// directory objects (an object store: the key is recreated with its bytes).
+    Copy,
+    /// Nothing to copy: a zero-byte directory object (a folder marker) or a delete marker, bound
+    /// for a destination that cannot hold directory objects. The directory entry already creates
+    /// the directory; nothing is lost.
+    NothingToDo,
+    /// Do not copy; record the reason ([`DIRECTORY_OBJECT_SKIP_REASON`]): the entry holds content
+    /// the destination cannot store on a directory. Not a failure of the transfer job.
+    Skip(&'static str),
+}
+
+/// Decides one listed entry for `destination` (its namespace's capabilities). Only directory
+/// objects are decided here; any other entry is [`DirectoryObjectAction::Copy`] (the ordinary
+/// rules apply). An entry of a traversal of every version is one record: a consumer copying the
+/// current state to a filesystem passes the key's latest record, and a latest delete marker means
+/// the key holds nothing now. An entry without a size counts as holding nothing.
+#[must_use]
+pub fn directory_object_action(
+    entry: &ObservedEntry,
+    destination: &NamespaceCapabilities,
+) -> DirectoryObjectAction {
+    if !entry.is_directory_object() || destination.directory_objects {
+        return DirectoryObjectAction::Copy;
+    }
+    let delete_marker = entry.version().is_some_and(EntryVersion::is_delete_marker);
+    if delete_marker || entry.size().unwrap_or(0) == 0 {
+        DirectoryObjectAction::NothingToDo
+    } else {
+        DirectoryObjectAction::Skip(DIRECTORY_OBJECT_SKIP_REASON)
+    }
+}
+
+/// The engine's backstop: `path` ending in `/` on a `storage` that holds no directory objects is
+/// that side's `Unsupported` failure at `Preflight`, before any I/O.
+pub(super) fn refuse_unholdable(
+    path: &StoragePath,
+    storage: &Storage,
+    side: TransferSide,
+) -> Result<(), TransferFailure> {
+    if !path.names_directory_object() || storage.holds_directory_objects() {
+        return Ok(());
+    }
+    let (operation, diagnostic) = match side {
+        TransferSide::Destination => (Operation::Prepare, DIRECTORY_OBJECT_SKIP_REASON),
+        TransferSide::Source | TransferSide::Orchestration => (
+            Operation::Observe,
+            "the source holds no directory objects: a path ending in '/' names no file",
+        ),
+    };
+    let failure = EntryOperationFailure::new(
+        path.clone(),
+        operation,
+        FailureClass::Unsupported,
+        Transience::Permanent,
+        diagnostic,
+    )
+    .map_err(|_| {
+        TransferFailure::orchestration(
+            TransferPhase::Preflight,
+            "a path ending in '/' names no file on this storage",
+        )
+    })?;
+    Err(TransferFailure::role(
+        TransferPhase::Preflight,
+        side,
+        StorageRoleFailure::Entry(failure),
+    ))
+}

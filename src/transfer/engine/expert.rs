@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 
 use super::at_destination;
+use super::directory_object::refuse_unholdable;
 use super::{
     ProducerRequest, TransferFailure, TransferOutcome, TransferPhase, TransferSide,
     inflight_channel, inflight_role_failure, produce, recovery_binding_for,
@@ -96,6 +97,12 @@ impl ExpertSourceSession {
             .map_err(|_| {
                 TransferFailure::capability(TransferSide::Source, "source capability unavailable")
             })?;
+        // Before any I/O, as the ordinary entry: a directory object only on a source holding them.
+        refuse_unholdable(
+            request.observation.path(),
+            &request.source,
+            TransferSide::Source,
+        )?;
         if request.cancel.is_cancelled() {
             return Err(TransferFailure::orchestration(
                 TransferPhase::Preflight,
@@ -364,6 +371,12 @@ impl ExpertDestinationSession {
                 "Direct requires the ordinary transfer entry with source identity validation",
             ));
         }
+        // Before any I/O: a directory object only on a destination that holds them (P7 F5).
+        refuse_unholdable(
+            &request.final_path,
+            &request.destination,
+            TransferSide::Destination,
+        )?;
         let source = descriptor_from_observation(&request.source)?;
         let source_size = source.size.ok_or_else(|| {
             TransferFailure::orchestration(TransferPhase::Describe, "source has no byte size")

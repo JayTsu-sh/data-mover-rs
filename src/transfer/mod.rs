@@ -9,10 +9,11 @@ pub use crate::model::SourceVersion;
 pub use crate::storage::{PrepareFact, RestartReason};
 pub use crate::storage::{SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError};
 pub use engine::{
-    EffectiveRecovery, ExpertDestinationRequest, ExpertDestinationSession,
-    ExpertDestinationTransferred, ExpertSourceEvidence, ExpertSourceOffer, ExpertSourcePayload,
-    ExpertSourceRequest, ExpertSourceSession, TransferFailure, TransferOutcome, TransferPhase,
-    TransferRoute, TransferSide, transfer,
+    DIRECTORY_OBJECT_SKIP_REASON, DirectoryObjectAction, EffectiveRecovery,
+    ExpertDestinationRequest, ExpertDestinationSession, ExpertDestinationTransferred,
+    ExpertSourceEvidence, ExpertSourceOffer, ExpertSourcePayload, ExpertSourceRequest,
+    ExpertSourceSession, TransferFailure, TransferOutcome, TransferPhase, TransferRoute,
+    TransferSide, directory_object_action, transfer,
 };
 pub use identity::TransferIdentity;
 pub use model::{
@@ -22,6 +23,8 @@ pub use model::{
 
 #[cfg(test)]
 mod at_destination_tests;
+#[cfg(test)]
+mod directory_object_tests;
 #[cfg(test)]
 mod hdfs_policy_tests;
 #[cfg(test)]

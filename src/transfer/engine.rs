@@ -25,6 +25,7 @@ use publication::{
 };
 
 mod at_destination;
+mod directory_object;
 mod expert;
 mod failure;
 mod guard;
@@ -37,6 +38,9 @@ mod producer;
 mod publication;
 mod single;
 mod version;
+pub use directory_object::{
+    DIRECTORY_OBJECT_SKIP_REASON, DirectoryObjectAction, directory_object_action,
+};
 pub use expert::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertDestinationTransferred,
     ExpertSourceEvidence, ExpertSourceOffer, ExpertSourcePayload, ExpertSourceRequest,

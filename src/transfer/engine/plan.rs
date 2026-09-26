@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use super::directory_object::refuse_unholdable;
 use super::{
     EffectiveRecovery, TransferDataPath, TransferFailure, TransferPhase, TransferPlan,
     TransferSide, native, version,
@@ -149,6 +150,13 @@ pub(super) fn lend_transfer_roles(
                 "destination capability unavailable",
             )
         })?;
+    // A directory object (a path ending in '/', P7 F5) only on a side that holds them.
+    refuse_unholdable(
+        &request.final_path,
+        &request.destination,
+        TransferSide::Destination,
+    )?;
+    refuse_unholdable(&request.source_path, &request.source, TransferSide::Source)?;
     if request.transfer_policy == TransferPolicy::Direct && !destination.supports_direct() {
         return Err(TransferFailure::capability(
             TransferSide::Destination,

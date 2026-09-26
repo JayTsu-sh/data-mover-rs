@@ -424,7 +424,8 @@ impl ObservedEntry {
     }
     /// Whether this entry is a directory object (P7 F5): a file stored under a key ending in `/`,
     /// such as `p/d/`, listed by its directory `p/d`. A filesystem cannot store content on a
-    /// directory.
+    /// directory: a consumer copying there decides each such entry with
+    /// `transfer::directory_object_action` before it requests a transfer.
     #[must_use]
     pub fn is_directory_object(&self) -> bool {
         self.kind == EntryKind::File && self.path.names_directory_object()

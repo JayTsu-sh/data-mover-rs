@@ -176,6 +176,15 @@ impl Storage {
             .ok_or_else(|| CapabilityUnavailable::missing_role(Capability::Namespace))
     }
 
+    /// Whether this storage keeps directory objects — files at keys ending in `/` (P7 F5) — as its
+    /// namespace role reports ([`super::NamespaceCapabilities::directory_objects`]). A storage
+    /// that lends no namespace holds none. No I/O.
+    #[must_use]
+    pub fn holds_directory_objects(&self) -> bool {
+        self.namespace(&PreflightPolicy::production())
+            .is_ok_and(|namespace| namespace.capabilities().directory_objects)
+    }
+
     /// Lends the namespace role for an operation that changes the namespace, refusing one whose
     /// mutating verbs are all unsupported (S3: [`super::NamespaceCapabilities::mutations`]) before any
     /// I/O, as if it lent no namespace at all.
