@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use super::*;
-use crate::model::{BackendIdentity, BackendKind, IdentityStrength};
+use crate::model::{BackendIdentity, BackendKind, EntryKind, IdentityStrength, SourceIdentity};
 
 fn path(value: &str) -> StoragePath {
     StoragePath::new(value).unwrap_or_else(|error| panic!("{error}"))
