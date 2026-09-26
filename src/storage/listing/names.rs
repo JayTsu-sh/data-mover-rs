@@ -1,7 +1,7 @@
 //! The listing contract's path arithmetic: a child's path is its directory's path as requested,
 //! a `/`, and its name.
 
-use crate::model::{ModelValueError, StoragePath};
+use crate::model::{MAX_MODEL_FIELD_BYTES, ModelValueError, StoragePath};
 
 /// The full path of `name` in `directory`: the name itself at the root, otherwise the directory,
 /// `/` and the name. This is the listing contract; no normalisation is applied to either part.
@@ -18,6 +18,31 @@ pub fn child_path(directory: &StoragePath, name: &str) -> Result<StoragePath, Mo
     joined.push('/');
     joined.push_str(name);
     StoragePath::new(joined)
+}
+
+/// [`child_path`] built in `name`'s own allocation when it has the room (a backend that cut the
+/// name out of a full path keeps it), so a listed child costs no second string. Returns the name
+/// when the joined path cannot be a [`StoragePath`]: it would hold NUL or exceed the limit, which
+/// is everything [`StoragePath::new`] refuses (the directory, being one, holds no NUL).
+pub(super) fn child_path_owned(
+    directory: &StoragePath,
+    mut name: String,
+) -> Result<StoragePath, String> {
+    let parent = directory.as_str();
+    let joined = if parent.is_empty() {
+        name.len()
+    } else {
+        parent.len() + 1 + name.len()
+    };
+    if joined > MAX_MODEL_FIELD_BYTES || name.contains('\0') {
+        return Err(name);
+    }
+    if !parent.is_empty() {
+        name.reserve_exact(joined - name.len());
+        name.insert(0, '/');
+        name.insert_str(0, parent);
+    }
+    Ok(StoragePath::checked(name))
 }
 
 /// `child` spelled again as `directory`, `/` and its last segment, for a backend whose server

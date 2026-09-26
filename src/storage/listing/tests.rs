@@ -72,6 +72,39 @@ fn a_child_path_is_the_directory_a_slash_and_the_name_verbatim() {
     assert_eq!(child_path(&path("./t"), "d"), Ok(path("./t/d")));
 }
 
+/// The owned join spells exactly what `child_path` spells, in the name's own allocation when it
+/// has the room, and hands the name back for a path no `StoragePath` can hold.
+#[test]
+fn an_owned_child_path_is_the_same_join_in_the_names_allocation() {
+    for (directory, name) in [
+        ("", "a"),
+        ("d", "a"),
+        ("a//b", "c"),
+        ("./t", "d"),
+        ("x/", "y"),
+    ] {
+        let joined = super::names::child_path_owned(&path(directory), name.to_owned());
+        let expected = child_path(&path(directory), name).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(joined, Ok(expected), "{directory:?} + {name:?}");
+    }
+    let mut roomy = String::with_capacity(64);
+    roomy.push_str("leaf");
+    let before = roomy.as_ptr();
+    let joined = super::names::child_path_owned(&path("some/dir"), roomy)
+        .unwrap_or_else(|name| panic!("{name} refused"));
+    assert_eq!(joined.as_str(), "some/dir/leaf");
+    assert_eq!(joined.as_str().as_ptr(), before, "joined in place");
+    assert_eq!(
+        super::names::child_path_owned(&path("d"), "a\0b".to_owned()),
+        Err("a\0b".to_owned())
+    );
+    let long = "x".repeat(crate::model::MAX_MODEL_FIELD_BYTES);
+    assert_eq!(
+        super::names::child_path_owned(&path("d"), long.clone()),
+        Err(long)
+    );
+}
+
 #[test]
 fn a_child_name_is_one_segment() {
     for bad in ["", ".", "..", "a/b", "a\0b"] {

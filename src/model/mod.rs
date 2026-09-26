@@ -347,6 +347,19 @@ impl StoragePath {
         &self.0
     }
 
+    /// `value`, already checked by the caller exactly as [`Self::new`] checks it: no NUL, within
+    /// the model field limit.
+    pub(crate) fn checked(value: String) -> Self {
+        debug_assert!(!value.contains('\0') && value.len() <= MAX_MODEL_FIELD_BYTES);
+        Self(value)
+    }
+
+    /// The slash-separated relative representation, owned.
+    #[must_use]
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+
     /// Whether this path is spelled like a directory object (P7 F5): it ends in `/`, as the key of
     /// an object stored under `p/d/`. Such an entry is not the directory `p/d` nor the file `p/d`;
     /// paths are compared byte for byte and the trailing `/` is never normalised away. A listing

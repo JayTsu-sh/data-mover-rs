@@ -46,6 +46,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::mem;
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -64,9 +65,9 @@ pub use child::ListedChild;
 pub use collect::{CollectLimits, collect_listing};
 pub use failure::{ChildFailure, is_vanished};
 pub use hint::DescentHint;
-use names::child_name;
 pub use names::child_path;
 pub(crate) use names::respelled;
+use names::{child_name, child_path_owned};
 
 use crate::model::{
     BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
@@ -212,10 +213,10 @@ impl ListingPage {
     pub(crate) fn push_descriptor(
         &mut self,
         directory: &StoragePath,
-        descriptor: SourceDescriptor,
+        mut descriptor: SourceDescriptor,
         hint: Option<DescentHint>,
     ) {
-        let Some(name) = child_name(directory, &descriptor.path) else {
+        let Some(name_len) = child_name(directory, &descriptor.path).map(str::len) else {
             self.failures.push(ChildFailure {
                 name: None,
                 raw_name: None,
@@ -230,7 +231,9 @@ impl ListingPage {
             });
             return;
         };
-        let name = name.to_owned();
+        // The name is the path's tail: keep the path's own allocation for it rather than copy.
+        let mut name = mem::replace(&mut descriptor.path, StoragePath::root()).into_string();
+        name.drain(..name.len() - name_len);
         let mut child = ListedChild::from_descriptor(name, descriptor);
         child.descent_hint = hint;
         self.children.push(child);
@@ -273,9 +276,9 @@ impl ListingPage {
                 failures.push(failure);
                 continue;
             }
-            match child_path(directory, &child.name) {
+            match child_path_owned(directory, mem::take(&mut child.name)) {
                 Ok(path) => children.push(keep(child.at(path), hint)),
-                Err(_) => failures.push(too_long(directory, &child.name)),
+                Err(name) => failures.push(too_long(directory, &name)),
             }
         }
         (children, failures)
