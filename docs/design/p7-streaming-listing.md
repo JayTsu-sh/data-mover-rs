@@ -883,9 +883,15 @@ VERIFY
 - node1 + m1-source 53M 树（c=64，--quiet）：C0 前重测基线（含 MALLOC_ARENA_MAX=2、驻留探针、strace -c futex）、C0 后、
   Blocks 流式后、Unordered 后；与 legacy 交替四轮；条目数必须 53,368,420
 - FAS2750：e2e-cifs；cifs_namespace_contract；深链 + 宽树 c=1/4/32；停车句柄 30 分钟；CIFS 与 NFS 的 Blocks 下钻顺序逐行一致
-- MinIO（10.131.9.11:9000，data-mover-test，临时前缀）：100 万对象平铺前缀的首项延迟与 RSS；版本化桶（traversal_versions.sh）
-- 无序 S3：内存 fake 的打乱模式；若能拿到用户遇到的那种存储，加入 e2e-s3 矩阵（Q22）
-- HDFS 真机（10.131.9.11 runner）需要用户批准
+- **S3 真机三套（用户 2026-09-26 定：本次重构的 S3 实际测试环境）**，每个动 S3 的步骤（C6、F4、C10、C11、C11b、收尾清理）都要三套都过：
+  - MinIO（10.131.9.11:9000，`.claude/skills/e2e-s3/.env`，桶 data-mover-test + 临时版本桶）：100 万对象平铺前缀的首项延迟与 RSS；版本化桶（traversal_versions.sh）
+  - ONTAP S3（FAS2750 ONTAP 9.19.1，SVM lizy，http://10.128.61.200:80，`ontap/.env`）：对象桶 data-mover-test / data-mover-test-ver，
+    卷开后台重删 + 压缩；我们的用户不建桶 → 脚本用已有桶、跑完清空对象（不删桶）。已知：列举字节序；带 delimiter 的 ListObjectVersions
+    可能缺 NextVersionIdMarker 丢版本（现存问题 10 / F4）；CommonPrefix 计入 max-keys；满页后跟空末页
+  - RustFS 1.0.0（VM 105，管理网 http://10.131.9.14:9001 —— 控制台端口也提供 S3 API，`rustfs/.env`，数据可丢弃）
+  - DXN / StorageGRID 仍只在用户单独批准时用（临时桶）
+- 无序 S3：内存 fake 的打乱模式（真实无序的是 ONTAP NAS 桶，未建；Q22）
+- HDFS 真机（10.131.9.11 runner）每次需要用户批准（C8 已于 2026-09-26 批准并通过）
 ```
 
 ## 15. 决定记录（2026-09-25 全部采纳）
