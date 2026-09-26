@@ -2,7 +2,8 @@
 //! of `p/d`, in both version modes; the traversal root's own object is reported (content) or
 //! dropped (zero bytes), never emitted at the root's own relative path; and `p/d/`, the file
 //! `p/d` and the directory `p/d` never share an identity key or a snapshot (their transfer
-//! identities differ too: `transfer::identity_tests`).
+//! identities differ too: `transfer::identity_tests`). Every case runs in both traversal orders:
+//! the root's own object is taken out of the root's listing by the page preparation both share.
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -12,8 +13,8 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    FailureScope, ScanTotals, StorageTraversalSource, TraversalItem, TraversalOutcome,
-    TraversalRequest, TraversalSource, TraversalVersions,
+    FailureScope, ScanTotals, StorageTraversalSource, TraversalItem, TraversalOrder,
+    TraversalOutcome, TraversalRequest, TraversalSource, TraversalVersions,
 };
 use crate::model::{
     EntryKind, EntryVersion, FailureClass, ObservationMode, ObservationPlan, ObservedEntry,
@@ -24,9 +25,16 @@ use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure, connect};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-fn request(root: &str, versions: TraversalVersions) -> TestResult<TraversalRequest> {
+const ORDERS: [TraversalOrder; 2] = [TraversalOrder::Unordered, TraversalOrder::Blocks];
+
+fn request(
+    root: &str,
+    versions: TraversalVersions,
+    order: TraversalOrder,
+) -> TestResult<TraversalRequest> {
     let limit = NonZeroUsize::new(8).ok_or("nonzero")?;
     Ok(TraversalRequest::new(StoragePath::new(root)?)
+        .order(order)
         .max_inflight_operations(limit)
         .max_buffered_items(limit)
         .cancel(CancellationToken::new())
@@ -123,27 +131,29 @@ async fn tree() -> TestResult<Arc<MemoryS3>> {
 /// the parent sees the directory only.
 #[tokio::test]
 async fn directory_objects_are_entries_counted_as_files() -> TestResult {
-    let protocol = tree().await?;
-    for versions in [TraversalVersions::Current, TraversalVersions::All] {
-        let (items, outcome) = traverse(&protocol, request("", versions)?).await?;
-        let mut listed = rows(&items);
-        listed.sort();
-        assert_eq!(
-            listed,
-            [
-                "p Directory None",
-                "p/ File Some(5)",
-                "p/d Directory None",
-                "p/d/ File Some(0)",
-                "p/d/x File Some(1)",
-                "p/f File Some(1)",
-                "top File Some(1)",
-            ],
-            "{versions:?}"
-        );
-        let scan = totals(&outcome);
-        assert_eq!((scan.listed, scan.emitted, scan.failed_children), (7, 7, 0));
-        assert_eq!((scan.files, scan.directories, scan.bytes), (5, 2, 8));
+    for order in ORDERS {
+        let protocol = tree().await?;
+        for versions in [TraversalVersions::Current, TraversalVersions::All] {
+            let (items, outcome) = traverse(&protocol, request("", versions, order)?).await?;
+            let mut listed = rows(&items);
+            listed.sort();
+            assert_eq!(
+                listed,
+                [
+                    "p Directory None",
+                    "p/ File Some(5)",
+                    "p/d Directory None",
+                    "p/d/ File Some(0)",
+                    "p/d/x File Some(1)",
+                    "p/f File Some(1)",
+                    "top File Some(1)",
+                ],
+                "{order:?} {versions:?}"
+            );
+            let scan = totals(&outcome);
+            assert_eq!((scan.listed, scan.emitted, scan.failed_children), (7, 7, 0));
+            assert_eq!((scan.files, scan.directories, scan.bytes), (5, 2, 8));
+        }
     }
     Ok(())
 }
@@ -153,47 +163,55 @@ async fn directory_objects_are_entries_counted_as_files() -> TestResult {
 /// version of a history of content, zero-byte versions and markers: one failure, once.
 #[tokio::test]
 async fn the_traversal_roots_own_object_is_reported_not_emitted() -> TestResult {
-    let protocol = tree().await?;
-    let (items, outcome) = traverse(&protocol, request("p", TraversalVersions::Current)?).await?;
-    let listed = rows(&items);
-    assert_eq!(
-        listed
-            .iter()
-            .filter(|row| row.starts_with("failure"))
-            .collect::<Vec<_>>(),
-        ["failure Child p/ Unsupported"]
-    );
-    assert!(
-        !listed.iter().any(|row| row.starts_with("p/ ")),
-        "{listed:?}"
-    );
-    let scan = totals(&outcome);
-    assert_eq!((scan.emitted, scan.failed_children), (4, 1));
-    let (items, outcome) = traverse(&protocol, request("p/d", TraversalVersions::Current)?).await?;
-    assert_eq!(rows(&items), ["p/d/x File Some(1)"]);
-    assert_eq!(totals(&outcome).listed, 1);
+    for order in ORDERS {
+        let protocol = tree().await?;
+        let (items, outcome) =
+            traverse(&protocol, request("p", TraversalVersions::Current, order)?).await?;
+        let listed = rows(&items);
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|row| row.starts_with("failure"))
+                .collect::<Vec<_>>(),
+            ["failure Child p/ Unsupported"]
+        );
+        assert!(
+            !listed.iter().any(|row| row.starts_with("p/ ")),
+            "{listed:?}"
+        );
+        let scan = totals(&outcome);
+        assert_eq!((scan.emitted, scan.failed_children), (4, 1));
+        let (items, outcome) = traverse(
+            &protocol,
+            request("p/d", TraversalVersions::Current, order)?,
+        )
+        .await?;
+        assert_eq!(rows(&items), ["p/d/x File Some(1)"]);
+        assert_eq!(totals(&outcome).listed, 1);
 
-    let versioned = Arc::new(MemoryS3::default());
-    versioned.set_versioning(Versioning::Enabled);
-    put(&versioned, "m/", b"fives").await?;
-    put(&versioned, "m/", b"").await?;
-    delete(&versioned, "m/").await?;
-    put(&versioned, "m/", b"333").await?;
-    put(&versioned, "m/x", b"1").await?;
-    let (items, outcome) = traverse(&versioned, request("m", TraversalVersions::All)?).await?;
-    assert_eq!(
-        rows(&items),
-        ["failure Child m/ Unsupported", "m/x File Some(1)"]
-    );
-    assert_eq!(totals(&outcome).failed_children, 1);
-    // An all-zero history of the root's own key is dropped entirely.
-    let zero = Arc::new(MemoryS3::default());
-    zero.set_versioning(Versioning::Enabled);
-    put(&zero, "z/", b"").await?;
-    delete(&zero, "z/").await?;
-    put(&zero, "z/x", b"1").await?;
-    let (items, _) = traverse(&zero, request("z", TraversalVersions::All)?).await?;
-    assert_eq!(rows(&items), ["z/x File Some(1)"]);
+        let versioned = Arc::new(MemoryS3::default());
+        versioned.set_versioning(Versioning::Enabled);
+        put(&versioned, "m/", b"fives").await?;
+        put(&versioned, "m/", b"").await?;
+        delete(&versioned, "m/").await?;
+        put(&versioned, "m/", b"333").await?;
+        put(&versioned, "m/x", b"1").await?;
+        let (items, outcome) =
+            traverse(&versioned, request("m", TraversalVersions::All, order)?).await?;
+        assert_eq!(
+            rows(&items),
+            ["failure Child m/ Unsupported", "m/x File Some(1)"]
+        );
+        assert_eq!(totals(&outcome).failed_children, 1);
+        // An all-zero history of the root's own key is dropped entirely.
+        let zero = Arc::new(MemoryS3::default());
+        zero.set_versioning(Versioning::Enabled);
+        put(&zero, "z/", b"").await?;
+        delete(&zero, "z/").await?;
+        put(&zero, "z/x", b"1").await?;
+        let (items, _) = traverse(&zero, request("z", TraversalVersions::All, order)?).await?;
+        assert_eq!(rows(&items), ["z/x File Some(1)"]);
+    }
     Ok(())
 }
 
@@ -202,32 +220,38 @@ async fn the_traversal_roots_own_object_is_reported_not_emitted() -> TestResult 
 /// version).
 #[tokio::test]
 async fn directory_object_entries_survive_a_snapshot() -> TestResult {
-    let protocol = Arc::new(MemoryS3::default());
-    put(&protocol, "p/d", b"same").await?;
-    put(&protocol, "p/d/", b"same").await?;
-    put(&protocol, "p/d/x", b"1").await?;
-    for versions in [TraversalVersions::Current, TraversalVersions::All] {
-        let (items, _) = traverse(&protocol, request("", versions)?).await?;
-        let found = entries(&items);
-        let named: Vec<&ObservedEntry> = found
-            .into_iter()
-            .filter(|entry| entry.path().as_str().starts_with("p/d"))
-            .filter(|entry| entry.path().as_str() != "p/d/x")
-            .collect();
-        assert_eq!(named.len(), 3, "{versions:?}");
-        let keys: HashSet<_> = named.iter().map(|entry| entry.identity_key()).collect();
-        assert_eq!(keys.len(), 3, "identity keys must differ: {versions:?}");
-        let own = named
-            .iter()
-            .find(|entry| entry.is_directory_object())
-            .ok_or("p/d/ is listed")?;
-        assert_eq!(own.kind(), EntryKind::File);
-        for entry in &named {
-            let snapshot = entry.encode_snapshot();
-            let version_byte = if entry.version().is_some() { 6 } else { 5 };
-            assert_eq!(snapshot.as_bytes()[4], version_byte);
-            let rebuilt = ObservedEntry::decode_snapshot(snapshot.as_bytes(), &identity())?;
-            assert_eq!(&rebuilt, *entry);
+    for order in ORDERS {
+        let protocol = Arc::new(MemoryS3::default());
+        put(&protocol, "p/d", b"same").await?;
+        put(&protocol, "p/d/", b"same").await?;
+        put(&protocol, "p/d/x", b"1").await?;
+        for versions in [TraversalVersions::Current, TraversalVersions::All] {
+            let (items, _) = traverse(&protocol, request("", versions, order)?).await?;
+            let found = entries(&items);
+            let named: Vec<&ObservedEntry> = found
+                .into_iter()
+                .filter(|entry| entry.path().as_str().starts_with("p/d"))
+                .filter(|entry| entry.path().as_str() != "p/d/x")
+                .collect();
+            assert_eq!(named.len(), 3, "{order:?} {versions:?}");
+            let keys: HashSet<_> = named.iter().map(|entry| entry.identity_key()).collect();
+            assert_eq!(
+                keys.len(),
+                3,
+                "identity keys must differ: {order:?} {versions:?}"
+            );
+            let own = named
+                .iter()
+                .find(|entry| entry.is_directory_object())
+                .ok_or("p/d/ is listed")?;
+            assert_eq!(own.kind(), EntryKind::File);
+            for entry in &named {
+                let snapshot = entry.encode_snapshot();
+                let version_byte = if entry.version().is_some() { 6 } else { 5 };
+                assert_eq!(snapshot.as_bytes()[4], version_byte);
+                let rebuilt = ObservedEntry::decode_snapshot(snapshot.as_bytes(), &identity())?;
+                assert_eq!(&rebuilt, *entry);
+            }
         }
     }
     Ok(())
@@ -237,27 +261,30 @@ async fn directory_object_entries_survive_a_snapshot() -> TestResult {
 /// role) is counted vanished, not reported.
 #[tokio::test]
 async fn a_vanished_directory_object_is_counted_vanished() -> TestResult {
-    let protocol = Arc::new(MemoryS3::default());
-    put(&protocol, "d/", b"own").await?;
-    put(&protocol, "d/x", b"1").await?;
-    *protocol.head_failure.lock().await = Some((
-        "d/".to_string(),
-        S3ProtocolFailure::entry(FailureClass::NotFound, Transience::Permanent, "gone"),
-    ));
-    let mut asked = request("", TraversalVersions::Current)?;
-    asked.observation_plan = ObservationPlan::default().with_timestamps(ObservationMode::Required);
-    let (items, outcome) = traverse(&protocol, asked).await?;
-    let listed = rows(&items);
-    assert!(
-        !listed.iter().any(|row| row.starts_with("d/ ")),
-        "{listed:?}"
-    );
-    assert!(
-        !items.iter().any(
-            |item| matches!(item, TraversalItem::Failure(f) if f.scope == FailureScope::Child)
-        ),
-        "{listed:?}"
-    );
-    assert_eq!(totals(&outcome).vanished, 1);
+    for order in ORDERS {
+        let protocol = Arc::new(MemoryS3::default());
+        put(&protocol, "d/", b"own").await?;
+        put(&protocol, "d/x", b"1").await?;
+        *protocol.head_failure.lock().await = Some((
+            "d/".to_string(),
+            S3ProtocolFailure::entry(FailureClass::NotFound, Transience::Permanent, "gone"),
+        ));
+        let mut asked = request("", TraversalVersions::Current, order)?;
+        asked.observation_plan =
+            ObservationPlan::default().with_timestamps(ObservationMode::Required);
+        let (items, outcome) = traverse(&protocol, asked).await?;
+        let listed = rows(&items);
+        assert!(
+            !listed.iter().any(|row| row.starts_with("d/ ")),
+            "{listed:?}"
+        );
+        assert!(
+            !items.iter().any(
+                |item| matches!(item, TraversalItem::Failure(f) if f.scope == FailureScope::Child)
+            ),
+            "{listed:?}"
+        );
+        assert_eq!(totals(&outcome).vanished, 1);
+    }
     Ok(())
 }

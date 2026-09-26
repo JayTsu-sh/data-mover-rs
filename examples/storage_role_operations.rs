@@ -81,6 +81,9 @@ struct Args {
 /// How a traversal orders what it delivers.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum OrderArg {
+    /// No order but each directory's entry ahead of everything below it; no directory events.
+    /// The fastest, and the default.
+    Unordered,
     /// Each directory's children together in the order the backend listed them, then its
     /// subdirectories descended into by name bytes, so the same tree visits its directories in
     /// the same order on every backend.
@@ -108,6 +111,7 @@ impl From<VersionsArg> for TraversalVersions {
 impl From<OrderArg> for TraversalOrder {
     fn from(value: OrderArg) -> Self {
         match value {
+            OrderArg::Unordered => Self::Unordered,
             OrderArg::Blocks => Self::Blocks,
         }
     }
@@ -123,8 +127,8 @@ enum Command {
         exclude_expression: Option<String>,
         #[arg(long)]
         max_depth: Option<usize>,
-        /// Block and descent order.
-        #[arg(long, value_enum, default_value_t = OrderArg::Blocks)]
+        /// Unordered (the default), or blocks with directory events and a fixed descent order.
+        #[arg(long, value_enum, default_value_t = OrderArg::Unordered)]
         order: OrderArg,
         /// Current objects only, or every stored version (S3).
         #[arg(long, value_enum, default_value_t = VersionsArg::Current)]

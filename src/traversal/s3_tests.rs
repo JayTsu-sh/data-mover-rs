@@ -31,6 +31,7 @@ fn limit(value: usize) -> NonZeroUsize {
 
 fn request(versions: TraversalVersions) -> TraversalRequest {
     TraversalRequest::new(StoragePath::root())
+        .order(TraversalOrder::Blocks)
         .max_inflight_operations(limit(8))
         .max_buffered_items(limit(8))
         .cancel(CancellationToken::new())
@@ -602,6 +603,7 @@ async fn throttling_past_the_budget_fails_one_listing_not_the_traversal() -> Tes
     }
     protocol.listing().throttled = Some((usize::MAX, slow_down()));
     let listing_of_a = TraversalRequest::new(StoragePath::new("a")?)
+        .order(TraversalOrder::Blocks)
         .max_inflight_operations(limit(8))
         .max_buffered_items(limit(8));
     let (items, outcome) = traverse(&protocol, listing_of_a).await?;
@@ -627,5 +629,57 @@ async fn throttling_past_the_budget_fails_one_listing_not_the_traversal() -> Tes
         )]
     );
     assert_eq!(totals(&outcome).listing_failures, 1);
+    Ok(())
+}
+
+/// Unordered, every version: one object's versions stay together however its listing is paged
+/// and however the other directories' pages interleave — here a key of 1100 versions straddles
+/// two listing pages while eight workers deliver forty other directories side by side, and the
+/// session holds one batch at a time, so a worker waiting for room is let in between any two
+/// batches of another.
+///
+/// Fault injection: send each page's trailing run with that page (no carry), or let another
+/// worker's pieces land between a split batch's pieces, and a run is broken — red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unordered_keeps_every_version_of_an_object_together() -> TestResult {
+    const VERSIONS: usize = 1100;
+    let protocol = Arc::new(MemoryS3::default());
+    protocol.set_versioning(Versioning::Enabled);
+    for directory in 0..40 {
+        for index in 0..50 {
+            put(&protocol, &format!("d{directory}/o{index:03}"), b"1").await?;
+        }
+    }
+    put(&protocol, "v/a", b"1").await?;
+    for _ in 0..VERSIONS {
+        put(&protocol, "v/k", b"1").await?;
+    }
+    put(&protocol, "v/z", b"1").await?;
+    for round in 0..5 {
+        let request = request(TraversalVersions::All)
+            .order(TraversalOrder::Unordered)
+            .max_buffered_items(limit(1));
+        let (items, outcome) = traverse(&protocol, request).await?;
+        assert!(
+            matches!(outcome, TraversalOutcome::Completed(_)),
+            "{outcome:?}"
+        );
+        let keys: Vec<&str> = entries(&items)
+            .iter()
+            .filter(|entry| entry.kind() == EntryKind::File)
+            .map(|entry| entry.path().as_str())
+            .collect();
+        assert_eq!(keys.len(), 40 * 50 + VERSIONS + 2, "round {round}");
+        let mut runs: Vec<&str> = keys.clone();
+        runs.dedup();
+        let mut distinct = runs.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            runs.len(),
+            distinct.len(),
+            "round {round}: a key's versions were split"
+        );
+    }
     Ok(())
 }

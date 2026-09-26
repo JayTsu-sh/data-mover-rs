@@ -80,9 +80,11 @@ pub trait Namespace: Send + Sync {
     /// position is a cookie or token, or nothing) or only a local one (Local: one file
     /// descriptor).
     ///
-    /// A consumer that reads listings ahead of need (the traversal's prefetch) starts no more of
-    /// them than this while that many are unfinished; the listing it needs next always starts.
-    /// CIFS answers 8: each such listing holds an open directory handle.
+    /// A consumer that reads listings ahead of need (the Blocks traversal's prefetch) starts no
+    /// more of them than this while that many are unfinished; the listing it needs next always
+    /// starts. A consumer that keeps each listing open while it waits for its own consumer (the
+    /// Unordered traversal's workers) keeps no more than this many open at once. CIFS answers 8:
+    /// each such listing holds an open directory handle.
     fn parked_listing_limit(&self) -> Option<NonZeroUsize> {
         None
     }

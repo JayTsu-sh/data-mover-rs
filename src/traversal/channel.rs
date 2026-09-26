@@ -14,7 +14,8 @@
 //! free, takes all of it, and goes over alone).
 //!
 //! **A whole batch arrives whole.** It is one message, so no other sender's items land inside it:
-//! the consumer sees its items together and in order.
+//! the consumer sees its items together and in order. The Unordered workers, many senders, rely
+//! on it to keep one object's versions together (see `unordered::worker`).
 
 use std::mem;
 use std::num::NonZeroUsize;
@@ -105,6 +106,11 @@ impl ItemSender {
         // The receiver returns the permits once the consumer has taken the batch's last item.
         permit.forget();
         self.batches.send(items).map_err(|error| error.0)
+    }
+
+    /// Whether the receiver is gone.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.batches.is_closed()
     }
 
     /// Sends one item; see [`Self::send`].

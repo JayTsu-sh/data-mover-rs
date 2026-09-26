@@ -19,13 +19,13 @@ use crate::traversal::{FailureScope, TraversalCandidate, TraversalDecision, Trav
 
 /// One directory's listing: its pages of `(name, kind)`, then how it ends.
 #[derive(Clone)]
-struct Pages {
-    pages: Vec<Vec<(&'static str, EntryKind)>>,
+pub(super) struct Pages {
+    pub(super) pages: Vec<Vec<(&'static str, EntryKind)>>,
     /// `None` ends the listing normally; otherwise it fails with this after the pages.
-    then: Option<StorageRoleFailure>,
+    pub(super) then: Option<StorageRoleFailure>,
 }
 
-fn pages(pages: Vec<Vec<(&'static str, EntryKind)>>) -> Pages {
+pub(super) fn pages(pages: Vec<Vec<(&'static str, EntryKind)>>) -> Pages {
     Pages { pages, then: None }
 }
 
@@ -33,14 +33,14 @@ fn pages(pages: Vec<Vec<(&'static str, EntryKind)>>) -> Pages {
 /// first waits for one permit, so a test decides when the rest of a directory arrives. Every
 /// directory child is handed back with a descent hint (`hint:` and its path), and every request
 /// is recorded with the hint it carried.
-struct PagedTree {
+pub(super) struct PagedTree {
     listings: HashMap<&'static str, Pages>,
     gate: Option<Arc<Semaphore>>,
     requests: Mutex<Vec<(String, Option<Vec<u8>>)>>,
 }
 
 impl PagedTree {
-    fn new(listings: Vec<(&'static str, Pages)>) -> Self {
+    pub(super) fn new(listings: Vec<(&'static str, Pages)>) -> Self {
         Self {
             listings: listings.into_iter().collect(),
             gate: None,
@@ -54,7 +54,7 @@ impl PagedTree {
         (self, gate)
     }
 
-    fn requests(&self) -> Vec<(String, Option<Vec<u8>>)> {
+    pub(super) fn requests(&self) -> Vec<(String, Option<Vec<u8>>)> {
         self.requests
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -129,6 +129,7 @@ impl Namespace for PagedTree {
 
 pub(super) fn paged_request(window: usize) -> TraversalRequest {
     TraversalRequest::new(StoragePath::root())
+        .order(crate::traversal::TraversalOrder::Blocks)
         .max_inflight_operations(
             NonZeroUsize::new(window).unwrap_or_else(|| unreachable!("callers pass nonzero")),
         )
@@ -136,7 +137,7 @@ pub(super) fn paged_request(window: usize) -> TraversalRequest {
         .cancel(tokio_util::sync::CancellationToken::new())
 }
 
-fn paged_source(tree: PagedTree) -> (StorageTraversalSource, Arc<PagedTree>) {
+pub(super) fn paged_source(tree: PagedTree) -> (StorageTraversalSource, Arc<PagedTree>) {
     let tree = Arc::new(tree);
     let source = StorageTraversalSource::with_roles(
         Arc::clone(&tree) as Arc<dyn Namespace>,
@@ -271,14 +272,14 @@ async fn the_descent_waits_for_the_block_to_close_and_is_sorted_by_name() {
     }
 }
 
-fn denied(at: &str) -> StorageRoleFailure {
+pub(super) fn denied(at: &str) -> StorageRoleFailure {
     StorageRoleFailure::Entry(entry_failure(&path(at), FailureClass::PermissionDenied))
 }
 
 /// Hides every file whose name starts with `f`, and can insist on `modified`.
 #[derive(Debug)]
-struct HideFiles {
-    needs_modified: bool,
+pub(super) struct HideFiles {
+    pub(super) needs_modified: bool,
 }
 
 impl TraversalFilter for HideFiles {
@@ -625,7 +626,7 @@ async fn a_directory_listed_twice_is_descended_into_twice() {
 
 /// Panics at one name, as a broken filter would.
 #[derive(Debug)]
-struct PanicsAt(&'static str);
+pub(super) struct PanicsAt(pub(super) &'static str);
 
 impl TraversalFilter for PanicsAt {
     fn needs_modified(&self) -> bool {

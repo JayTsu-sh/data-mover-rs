@@ -159,6 +159,7 @@ async fn spelled(
     let source = StorageTraversalSource::with_roles(role, Arc::new(FakeMetadata));
     let mut session = source.traverse(
         TraversalRequest::new(path(root))
+            .order(crate::traversal::TraversalOrder::Blocks)
             .max_inflight_operations(
                 NonZeroUsize::new(4).unwrap_or_else(|| unreachable!("constant is nonzero")),
             )

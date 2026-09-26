@@ -24,6 +24,7 @@ async fn hdfs_facts_survive_snapshot_without_backend_requery()
     let traversal = StorageTraversalSource::new(&storage)?;
     let mut session = traversal.traverse(
         TraversalRequest::new(StoragePath::root())
+            .order(TraversalOrder::Blocks)
             .max_inflight_operations(NonZeroUsize::new(2).ok_or("invalid inflight")?)
             .max_buffered_items(NonZeroUsize::new(2).ok_or("invalid buffer")?)
             .cancel(CancellationToken::new()),
@@ -115,6 +116,7 @@ async fn a_listing_failing_after_the_first_page_is_interrupted()
     let traversal = StorageTraversalSource::new(&storage)?;
     let mut session = traversal.traverse(
         TraversalRequest::new(StoragePath::root())
+            .order(TraversalOrder::Blocks)
             .max_inflight_operations(NonZeroUsize::new(4).ok_or("invalid inflight")?)
             .max_buffered_items(NonZeroUsize::new(64).ok_or("invalid buffer")?)
             .cancel(CancellationToken::new()),

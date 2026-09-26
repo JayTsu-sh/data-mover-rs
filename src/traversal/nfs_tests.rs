@@ -74,6 +74,7 @@ async fn traverse_with_totals(
     let slots = NonZeroUsize::new(concurrency).ok_or("concurrency is not zero")?;
     let mut session = source.traverse(
         TraversalRequest::new(StoragePath::root())
+            .order(crate::traversal::TraversalOrder::Blocks)
             .max_inflight_operations(slots)
             .max_buffered_items(slots)
             .cancel(CancellationToken::new()),

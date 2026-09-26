@@ -244,15 +244,30 @@ traverse() { # concurrency, args...
   "$BIN" --backend s3 --concurrency "$1" traverse "${@:2}" 2>"$WORK/stderr" \
     || { echo "traverse $* failed:" >&2; cat "$WORK/stderr" >&2; return 1; }
 }
+# The checks below count directory events, which only Blocks delivers: pin it.
 if [ "$VERSIONED" = 1 ]; then
-  traverse 8 --versions all >"$WORK/all" || FAILED=1
+  traverse 8 --versions all --order blocks >"$WORK/all" || FAILED=1
   BLOCKS=all
 else
   : >"$WORK/all"
   BLOCKS=current
 fi
-traverse 8 --versions current >"$WORK/current" || FAILED=1
+traverse 8 --versions current --order blocks >"$WORK/current" || FAILED=1
 for c in 1 4 32; do traverse "$c" --versions "$BLOCKS" --order blocks >"$WORK/blocks-$c" || FAILED=1; done
+# Unordered (the default) delivers the same entries, each key's versions together and in the same
+# order: compare per key, and the whole set.
+for c in 1 32; do traverse "$c" --versions "$BLOCKS" >"$WORK/unordered-$c" || FAILED=1; done
+role_entries() { grep -E '^(File|Directory|Symlink) ' "$1" | sort; }
+key_runs() { grep -E '^File ' "$1" | awk '{print $2}' | uniq | sort; }
+for c in 1 32; do
+  if cmp -s <(role_entries "$WORK/blocks-1") <(role_entries "$WORK/unordered-$c") \
+    && cmp -s <(key_runs "$WORK/blocks-1") <(key_runs "$WORK/unordered-$c") \
+    && ! grep -q '^listed ' "$WORK/unordered-$c"; then
+    echo "unordered c=$c: same entries as blocks, each key's versions together, no directory events"
+  else
+    echo "unordered c=$c: differs from blocks"; FAILED=1
+  fi
+done
 [ "$VERSIONED" = 1 ] && { echo "-- all (without p/a*)"; grep -v ' p/a' "$WORK/all"; }
 echo "-- current (without p/a*)"; grep -v ' p/a' "$WORK/current"
 cmp -s "$WORK/blocks-1" "$WORK/blocks-4" && cmp -s "$WORK/blocks-1" "$WORK/blocks-32" \

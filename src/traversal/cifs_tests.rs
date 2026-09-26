@@ -1,6 +1,7 @@
-//! Traversals over the CIFS role listing (P7 C9): parked listings stay within the namespace's
-//! limit of open directory handles, every handle is closed by the end, and a directory whose
-//! listing fails after its first page is `Interrupted` after the children it delivered.
+//! Traversals over the CIFS role listing (P7 C9, C10): parked listings stay within the namespace's
+//! limit of open directory handles in both orders, every handle is closed by the end, and a
+//! directory whose listing fails after its first page is `Interrupted` after the children it
+//! delivered.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -10,8 +11,8 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    FailureScope, ListingOutcome, StorageTraversalSource, TraversalItem, TraversalOutcome,
-    TraversalRequest, TraversalSource as _,
+    FailureScope, ListingOutcome, StorageTraversalSource, TraversalItem, TraversalOrder,
+    TraversalOutcome, TraversalRequest, TraversalSource as _,
 };
 use crate::model::{EntryKind, MetadataObservations, ObservationPlan, StoragePath};
 use crate::storage::backends::cifs::listing_fake::{FakeCifs, Fault};
@@ -60,10 +61,19 @@ fn wide_tree() -> FakeCifs {
 /// Runs a traversal of the whole fake, taking items slowly for a while so prefetched listings
 /// park, and returns every item.
 async fn traverse(fake: &Arc<FakeCifs>, concurrency: usize) -> Result<Vec<TraversalItem>> {
+    traverse_in(fake, concurrency, TraversalOrder::Blocks).await
+}
+
+async fn traverse_in(
+    fake: &Arc<FakeCifs>,
+    concurrency: usize,
+    order: TraversalOrder,
+) -> Result<Vec<TraversalItem>> {
     let source = StorageTraversalSource::with_roles(fake.role(), Arc::new(NoMetadata));
     let slots = NonZeroUsize::new(concurrency).ok_or("concurrency is not zero")?;
     let mut session = source.traverse(
         TraversalRequest::new(StoragePath::root())
+            .order(order)
             .max_inflight_operations(slots)
             .max_buffered_items(slots)
             .cancel(CancellationToken::new()),
@@ -127,6 +137,53 @@ async fn parked_listings_stay_within_the_handle_limit() -> Result {
         orders.push(paths);
     }
     assert!(orders.windows(2).all(|pair| pair[0] == pair[1]));
+    Ok(())
+}
+
+/// Unordered keeps every worker's listing open while it waits for the consumer, so any open
+/// listing may be parked: it lists at most the namespace's limit of directories at once, whatever
+/// the concurrency. Every handle is closed by the end and the entries are the same as Blocks'.
+///
+/// Fault injection: size the workers by the concurrency alone and c = 32 opens 21 handles — red.
+#[tokio::test]
+async fn unordered_listings_stay_within_the_handle_limit() -> Result {
+    let limit = Arc::new(FakeCifs::new())
+        .role()
+        .parked_listing_limit()
+        .ok_or("CIFS limits parked listings")?
+        .get();
+    let blocks = {
+        let mut paths = entry_paths(&traverse(&Arc::new(wide_tree()), 4).await?);
+        paths.sort();
+        paths
+    };
+    for concurrency in [1, 4, 32] {
+        let fake = Arc::new(wide_tree());
+        let items = traverse_in(&fake, concurrency, TraversalOrder::Unordered).await?;
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, TraversalItem::DirectoryListed(_)))
+        );
+        let mut paths = entry_paths(&items);
+        paths.sort();
+        assert_eq!(paths, blocks, "concurrency {concurrency}");
+        let counts = &fake.counts;
+        let peak = FakeCifs::count(&counts.peak_open);
+        assert!(
+            peak <= limit,
+            "concurrency {concurrency}: {peak} directory handles open at once"
+        );
+        if concurrency == 32 {
+            assert!(peak > 2, "the workers never listed side by side: {peak}");
+        }
+        assert_eq!(FakeCifs::count(&counts.open_now), 0, "a handle left open");
+        assert_eq!(
+            FakeCifs::count(&counts.opens),
+            WIDE_DIRECTORIES + 1,
+            "each directory listed once"
+        );
+    }
     Ok(())
 }
 

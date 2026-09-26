@@ -23,14 +23,14 @@ use crate::traversal::{
 /// └── slow     file whose observation is throttled
 /// ```
 #[derive(Default)]
-struct VanishingTree {
-    listed: Mutex<Vec<String>>,
-    root: Root,
+pub(super) struct VanishingTree {
+    pub(super) listed: Mutex<Vec<String>>,
+    pub(super) root: Root,
 }
 
 /// What the root of a [`VanishingTree`] lists.
 #[derive(Clone, Copy, Default, PartialEq)]
-enum Root {
+pub(super) enum Root {
     /// The tree drawn above, without `busy` and `slow`.
     #[default]
     Plain,
@@ -154,7 +154,7 @@ impl Metadata for VanishingMetadata {
     }
 }
 
-fn source(tree: Arc<VanishingTree>) -> StorageTraversalSource {
+pub(super) fn source(tree: Arc<VanishingTree>) -> StorageTraversalSource {
     StorageTraversalSource::with_roles(tree, Arc::new(VanishingMetadata))
 }
 

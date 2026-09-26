@@ -10,8 +10,8 @@ use super::channel::{self, ItemSender};
 
 use super::{
     ScanFailure, TraversalCandidate, TraversalCompletion, TraversalDecision, TraversalFilter,
-    TraversalItem, TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
-    TraversalTerminalFailure, TraversalVersions, relative_to,
+    TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest, TraversalSession,
+    TraversalSource, TraversalTerminalFailure, TraversalVersions, relative_to,
 };
 use crate::model::{
     BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, ObservationMode,
@@ -28,6 +28,7 @@ mod output;
 #[cfg(test)]
 mod residency;
 mod stream;
+mod unordered;
 
 use cursor::{Cursor, Decisions, Step};
 use observe::{Feed, Job, Listed, Observations, Observed};
@@ -167,14 +168,24 @@ impl TraversalSource for StorageTraversalSource {
         let (item_tx, item_rx) = channel::channel(request.max_buffered_items);
         let (completion_tx, completion_rx) = oneshot::channel();
         let cancel = request.cancel.clone();
-        tokio::spawn(run(
-            Arc::clone(&self.namespace),
-            Arc::clone(&self.metadata),
-            request,
-            item_tx,
-            completion_tx,
-            self.probe.clone(),
-        ));
+        let (namespace, metadata) = (Arc::clone(&self.namespace), Arc::clone(&self.metadata));
+        let probe = self.probe.clone();
+        match request.order {
+            TraversalOrder::Unordered => {
+                let shared = Arc::new(Shared::new(namespace, metadata, request));
+                tokio::spawn(unordered::run(shared, item_tx, completion_tx, probe));
+            }
+            TraversalOrder::Blocks => {
+                tokio::spawn(run(
+                    namespace,
+                    metadata,
+                    request,
+                    item_tx,
+                    completion_tx,
+                    probe,
+                ));
+            }
+        }
         TraversalSession::new(item_rx, completion_rx, cancel)
     }
 }

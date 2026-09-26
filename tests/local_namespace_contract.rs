@@ -78,6 +78,7 @@ async fn traversal_lists_the_whole_tree_through_the_namespace_role() -> Result {
     let source = StorageTraversalSource::new(&storage)?;
     let mut session = source.traverse(
         TraversalRequest::new(path("tree")?)
+            .order(TraversalOrder::Blocks)
             .max_inflight_operations(nonzero(4)?)
             .max_buffered_items(nonzero(4)?)
             .cancel(CancellationToken::new()),
@@ -224,6 +225,7 @@ async fn directories_are_listed_as_directories_not_files() -> Result {
     let source = StorageTraversalSource::new(&storage)?;
     let mut session = source.traverse(
         TraversalRequest::new(StoragePath::root())
+            .order(TraversalOrder::Blocks)
             .max_inflight_operations(nonzero(1)?)
             .max_buffered_items(nonzero(1)?)
             .cancel(CancellationToken::new()),

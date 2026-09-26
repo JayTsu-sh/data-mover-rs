@@ -188,6 +188,47 @@ impl ScanTotals {
         ) && self.interrupted_listings <= self.listing_failures
     }
 
+    /// Adds another part's totals: what one Unordered worker counted. Destructured, so a field
+    /// added later cannot be left out of the sum without a compile error.
+    pub(crate) const fn merge(&mut self, other: &Self) {
+        let Self {
+            listed,
+            emitted,
+            filtered,
+            failed_children,
+            vanished,
+            internal_hidden,
+            listing_failures,
+            interrupted_listings,
+            vanished_listings,
+            pruned_dirs,
+            truncated_dirs,
+            bytes,
+            files,
+            directories,
+            symlinks,
+            other: others,
+        } = *other;
+        self.listed = self.listed.saturating_add(listed);
+        self.emitted = self.emitted.saturating_add(emitted);
+        self.filtered = self.filtered.saturating_add(filtered);
+        self.failed_children = self.failed_children.saturating_add(failed_children);
+        self.vanished = self.vanished.saturating_add(vanished);
+        self.internal_hidden = self.internal_hidden.saturating_add(internal_hidden);
+        self.listing_failures = self.listing_failures.saturating_add(listing_failures);
+        self.interrupted_listings = self
+            .interrupted_listings
+            .saturating_add(interrupted_listings);
+        self.vanished_listings = self.vanished_listings.saturating_add(vanished_listings);
+        self.pruned_dirs = self.pruned_dirs.saturating_add(pruned_dirs);
+        self.truncated_dirs = self.truncated_dirs.saturating_add(truncated_dirs);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.files = self.files.saturating_add(files);
+        self.directories = self.directories.saturating_add(directories);
+        self.symlinks = self.symlinks.saturating_add(symlinks);
+        self.other = self.other.saturating_add(others);
+    }
+
     /// Adds one directory's block.
     pub(crate) const fn absorb(&mut self, block: &BlockCounts) {
         self.listed = self.listed.saturating_add(block.listed);

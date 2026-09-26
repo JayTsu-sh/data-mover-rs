@@ -110,14 +110,18 @@ fn process_cpu() -> Option<Duration> {
     Some(Duration::from_millis(ticks * 10))
 }
 
-async fn run_once(namespace: &Arc<PrebuiltNamespace>, plan: ObservationPlan) -> u64 {
+async fn run_once(
+    namespace: &Arc<PrebuiltNamespace>,
+    plan: ObservationPlan,
+    order: crate::traversal::TraversalOrder,
+) -> u64 {
     let source = StorageTraversalSource::with_roles(
         Arc::clone(namespace) as Arc<dyn Namespace>,
         Arc::new(FakeMetadata),
     );
     let mut session = source.traverse(
         TraversalRequest::new(StoragePath::root())
-            .order(crate::traversal::TraversalOrder::Blocks)
+            .order(order)
             .max_inflight_operations(
                 NonZeroUsize::new(64).unwrap_or_else(|| unreachable!("constant is nonzero")),
             )
@@ -165,24 +169,29 @@ async fn measure(label: &str, plan: ObservationPlan) {
     const FILES: usize = 100;
     let namespace = Arc::new(tree(DIRECTORIES, FILES));
     let expected = u64::try_from(DIRECTORIES * (FILES + 1)).unwrap_or(u64::MAX);
-    assert_eq!(run_once(&namespace, plan).await, expected);
-    for round in 0..3 {
-        let (cpu, wall) = (process_cpu(), Instant::now());
-        let entries = run_once(&namespace, plan).await;
-        let wall = wall.elapsed();
-        assert_eq!(entries, expected);
-        let per_entry = |spent: Duration| spent.as_nanos() / u128::from(entries);
-        match cpu.zip(process_cpu()) {
-            Some((before, after)) => println!(
-                "{label} round {round}: {entries} entries, wall {wall:?} ({} ns/entry), cpu {:?} ({} ns/entry)",
-                per_entry(wall),
-                after.saturating_sub(before),
-                per_entry(after.saturating_sub(before)),
-            ),
-            None => println!(
-                "{label} round {round}: {entries} entries, wall {wall:?} ({} ns/entry)",
-                per_entry(wall)
-            ),
+    for order in [
+        crate::traversal::TraversalOrder::Blocks,
+        crate::traversal::TraversalOrder::Unordered,
+    ] {
+        assert_eq!(run_once(&namespace, plan, order).await, expected);
+        for round in 0..3 {
+            let (cpu, wall) = (process_cpu(), Instant::now());
+            let entries = run_once(&namespace, plan, order).await;
+            let wall = wall.elapsed();
+            assert_eq!(entries, expected);
+            let per_entry = |spent: Duration| spent.as_nanos() / u128::from(entries);
+            match cpu.zip(process_cpu()) {
+                Some((before, after)) => println!(
+                    "{label} {order:?} round {round}: {entries} entries, wall {wall:?} ({} ns/entry), cpu {:?} ({} ns/entry)",
+                    per_entry(wall),
+                    after.saturating_sub(before),
+                    per_entry(after.saturating_sub(before)),
+                ),
+                None => println!(
+                    "{label} {order:?} round {round}: {entries} entries, wall {wall:?} ({} ns/entry)",
+                    per_entry(wall)
+                ),
+            }
         }
     }
 }

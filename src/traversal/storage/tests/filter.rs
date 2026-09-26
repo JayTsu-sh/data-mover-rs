@@ -119,8 +119,8 @@ impl Metadata for CountingMetadata {
 /// Filter that prunes everything under `drop`, hides `keep` itself but descends into it,
 /// and stops filtering below `keep/b`.
 #[derive(Debug)]
-struct PathFilter {
-    needs_modified: bool,
+pub(super) struct PathFilter {
+    pub(super) needs_modified: bool,
 }
 
 impl crate::traversal::TraversalFilter for PathFilter {

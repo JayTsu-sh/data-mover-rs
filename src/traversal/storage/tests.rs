@@ -493,4 +493,5 @@ mod residency;
 mod slots;
 mod streaming;
 mod streaming_bounds;
+mod unordered;
 mod vanish;

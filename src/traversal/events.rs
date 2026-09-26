@@ -8,15 +8,19 @@ use crate::model::{EntryOperationFailure, ObservedEntry, StoragePath};
 
 /// One traversal item. Failures do not terminate the session.
 ///
-/// A listed directory `D` produces its block — one item per admitted child, in listing order, page
-/// by page, each page's children the listing could not describe ahead of that page's others, and
-/// last `D`'s own [`FailureScope::Listing`] failure if its listing stopped — then
-/// [`TraversalItem::DirectoryListed`] for `D`, and then, for every subdirectory `D` descends into,
-/// in the byte order of their names, that same sequence recursively
-/// ([`super::TraversalOrder::Blocks`]). Only a directory that was
-/// actually listed gets a `DirectoryListed`: a directory `max_depth` stops at is emitted as an
-/// entry and never listed, and a directory the filter hides but still descends into has its
-/// `DirectoryListed` and no [`TraversalItem::Entry`] of its own.
+/// Under [`super::TraversalOrder::Unordered`] (the default) items come in no order but one: a
+/// directory's entry precedes every item below it; one directory's items keep its listing's
+/// order, and its [`FailureScope::Listing`] failure follows the children it delivered. There is no
+/// [`TraversalItem::DirectoryListed`].
+///
+/// Under [`super::TraversalOrder::Blocks`], a listed directory `D` produces its block — one item
+/// per admitted child, in listing order, page by page, each page's children the listing could not
+/// describe ahead of that page's others, and last `D`'s own [`FailureScope::Listing`] failure if
+/// its listing stopped — then [`TraversalItem::DirectoryListed`] for `D`, and then, for every
+/// subdirectory `D` descends into, in the byte order of their names, that same sequence
+/// recursively. Only a directory that was actually listed gets a `DirectoryListed`: a directory
+/// `max_depth` stops at is emitted as an entry and never listed, and a directory the filter hides
+/// but still descends into has its `DirectoryListed` and no [`TraversalItem::Entry`] of its own.
 ///
 /// What a consumer may conclude from a traversal is governed by the deletion-safety rules on
 /// [`ScanFailure`]; only [`super::TraversalOutcome::Completed`] makes any of it final.

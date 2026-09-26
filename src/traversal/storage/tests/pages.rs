@@ -31,10 +31,10 @@ async fn linger(turns: usize) {
 
 /// Files, symlinks and directories, several levels deep; every child's timestamp is either
 /// carried by the listing (`inline`) or only known to [`TimesMetadata`].
-struct MixedNamespace {
-    inline: bool,
+pub(super) struct MixedNamespace {
+    pub(super) inline: bool,
     /// Keep every `d09` directory's timestamps out of the listing even when `inline`.
-    holdout: bool,
+    pub(super) holdout: bool,
 }
 
 impl MixedNamespace {
@@ -93,7 +93,7 @@ impl Namespace for MixedNamespace {
 
 /// Answers every child's timestamps with what [`MixedNamespace`] would have carried inline.
 #[derive(Default)]
-struct TimesMetadata {
+pub(super) struct TimesMetadata {
     calls: AtomicUsize,
 }
 
@@ -137,7 +137,7 @@ impl Metadata for TimesMetadata {
 /// Needs `modified`: hides some entries by it, prunes one directory name and stops filtering
 /// below another, so deferred decisions shape both the output and the descent.
 #[derive(Debug)]
-struct ByTime;
+pub(super) struct ByTime;
 
 impl TraversalFilter for ByTime {
     fn needs_modified(&self) -> bool {
@@ -156,7 +156,11 @@ impl TraversalFilter for ByTime {
     }
 }
 
-fn mixed_request(order: TraversalOrder, window: usize, filtered: bool) -> TraversalRequest {
+pub(super) fn mixed_request(
+    order: TraversalOrder,
+    window: usize,
+    filtered: bool,
+) -> TraversalRequest {
     let request = TraversalRequest::new(StoragePath::root())
         .order(order)
         .max_inflight_operations(

@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     FailureScope, ListingOutcome, StorageTraversalSource, TraversalCompletion, TraversalItem,
-    TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
+    TraversalOrder, TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
     TraversalTerminalFailure, TraversalVersions,
 };
 #[cfg(unix)]
@@ -45,6 +45,7 @@ fn fixture(root: &Path) -> io::Result<Fixture> {
 
 fn request(cancel: CancellationToken, inflight: usize, buffered: usize) -> TraversalRequest {
     TraversalRequest::new(StoragePath::root())
+        .order(TraversalOrder::Blocks)
         .max_inflight_operations(
             NonZeroUsize::new(inflight).unwrap_or_else(|| unreachable!("test limit is nonzero")),
         )
@@ -675,6 +676,7 @@ async fn a_subdirectory_removed_before_its_listing_is_a_vanished_listing() -> io
     assert!(totals.is_balanced());
 
     let missing = TraversalRequest::new(StoragePath::new("absent").map_err(io::Error::other)?)
+        .order(TraversalOrder::Blocks)
         .max_inflight_operations(NonZeroUsize::MIN);
     let mut session = fixture.source.traverse(missing);
     let items = drain(&mut session).await;

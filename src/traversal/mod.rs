@@ -27,16 +27,39 @@ mod hdfs_tests;
 #[cfg(test)]
 mod local_tests;
 #[cfg(test)]
+mod local_unordered_tests;
+#[cfg(test)]
 mod nfs_tests;
 #[cfg(test)]
 mod s3_directory_object_tests;
 #[cfg(test)]
 mod s3_tests;
 
-/// How a traversal orders what it delivers (P7 §3). Concurrent completion never changes it.
+/// How a traversal orders what it delivers (P7 §3).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TraversalOrder {
+    /// No order beyond one guarantee: **a directory's entry precedes every entry below it.** The
+    /// fastest way to see every entry, and the default (P7 Q1): directories are listed by
+    /// `min(max_inflight_operations, 64)` workers at once (fewer where an open listing holds a
+    /// server resource: CIFS, 8), each depth first, and each page is delivered as it is listed,
+    /// so entries of different directories interleave.
+    ///
+    /// Within one directory, its items keep the backend's listing order, the ones it could not
+    /// describe ahead of the others of the same page, and its [`FailureScope::Listing`] failure,
+    /// if its listing stopped, comes after the children it delivered. Listing every version,
+    /// one object's versions stay together.
+    ///
+    /// There are no [`TraversalItem::DirectoryListed`] events and no per-directory counts: a
+    /// listing that stopped is its [`FailureScope::Listing`] failure, and what the traversal
+    /// counted is in [`TraversalCompletion::totals`]. Completeness is the session's
+    /// [`TraversalOutcome::Completed`] and the failures delivered (the deletion-safety rules on
+    /// [`ScanFailure`]).
+    ///
+    /// Which directories are listed, and what is emitted, counted, pruned and truncated, is
+    /// exactly what [`Self::Blocks`] would list, emit and count for the same tree.
+    #[default]
+    Unordered,
     /// Depth-first by *blocks*. A block is every direct child of one listed directory, delivered
     /// contiguously **in the order the backend listed them** — not sorted — followed by the
     /// directory's [`TraversalItem::DirectoryListed`] (an empty directory has one too). Once a
@@ -65,7 +88,6 @@ pub enum TraversalOrder {
     /// listed, and what the traversal holds of one directory is a few pages, however large the
     /// directory. Only the subdirectories still to descend into are remembered whole (one slot
     /// each), because the descent is sorted once the listing has ended.
-    #[default]
     Blocks,
 }
 
@@ -294,8 +316,10 @@ impl TraversalRequest {
         self
     }
 
-    /// Operations (observations, listings) in flight at once, and entries admitted but not yet
-    /// delivered.
+    /// Operations in flight at once. Unordered: directories listed at once (at most 64, and at
+    /// most the namespace's parked-listing limit: CIFS, 8) and observations that need I/O at
+    /// once. Blocks: entries admitted and not yet delivered, and listings read ahead of the cursor
+    /// (at most 64).
     #[must_use]
     pub const fn max_inflight_operations(mut self, limit: NonZeroUsize) -> Self {
         self.max_inflight_operations = limit;
