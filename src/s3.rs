@@ -134,6 +134,8 @@ async fn unknown_resume_point(
 
 mod architecture;
 mod copy_request;
+#[cfg(test)]
+mod credential_log_tests;
 mod delete_objects_md5;
 mod dxn;
 mod multipart_rename;
@@ -888,9 +890,9 @@ impl S3Storage {
 
         let region = "us-east-1"; // MinIO 默认区域
 
+        // 凭据一个字符都不记（R8）：AK 与 SK 都不写，连 SK 的长度也不写。
         debug!("从URL解析结果:");
-        debug!("- 访问密钥: {}", access_key);
-        debug!("- 密钥: {}", "*".repeat(secret_key.len())); // 不显示实际密钥
+        debug!("- 凭据: ***:***");
         debug!("- 存储桶名称: {}", bucket_name);
         debug!("- 端点: {}", endpoint);
         debug!("- Prefix: {}", prefix);
