@@ -48,6 +48,11 @@
     （FAS2750_01_SSD_1 × 3 成员，thin 100 GB），后台重删 + 压缩。我们的用户**不能建桶**，脚本要用已有桶、跑完清空。
   - `data-mover-nas`：NAS 桶，FlexVol `dm_s3_nas`（`/dm_s3_nas`，20 GB thin，unix 777，重删 + 压缩；S3 用户映射到 `pcuser`）。
   - 该用户也能**读** `ontap-lisa-auto-bucket`（那个桶的原有策略放行）——**只写我们的三个桶**。
+  - **NAS 桶限制**（2026-09-26 实测）：ONTAP 不允许 NAS 桶的策略含 `ListBucketMultipartUploads` / `ListMultipartUploadParts`（及版本、锁、生命周期类）
+    → 列不出未完成上传，data-mover 的 > 8 MiB 写入在 Observe 报 PermissionDenied，读回校验报 Conflict、Direct multipart 报 Connectivity、native 拷贝失败
+    （原因待查，见 P7 设计）；只有 ≤ 8 MiB、不校验的单 PUT 成功。NAS 桶目前**只适合作列举（无序）源**。删对象后空目录会留下，
+    清理要按目录后序逐个 DELETE `<dir>/`。
+  - **ONTAP CopyObject 不带 `Content-Length` → 411 MissingContentLength**（对象桶，≤ 单次 CopyObject 阈值的 native 拷贝失败；UploadPartCopy 正常）。
   - 已知行为：对象桶列举是 UTF-8 字节序（重删 / 压缩扫描前中后都是，11,101 个 key 实测）；**NAS 桶平铺列举是目录遍历序**（`/` 最小，
     NetApp KB CONTAP-675913），带 delimiter 逐层有序；CommonPrefix 计入 max-keys；满页后跟一个空末页；不回显 `Delimiter`；
     **带 `delimiter=/` 的 ListObjectVersions 可能只给 `NextKeyMarker` 不给 `NextVersionIdMarker`，下一页静默跳过该 key 余下的版本**
