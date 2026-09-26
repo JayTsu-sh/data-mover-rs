@@ -42,7 +42,7 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
   `{scheme}://{bucket}.{host}[:port]`，协议 / 端口 / `tls_verify` 跟随 S3 URL；`hcp-ns-auth` cookie 在 `s3://` 下明文。
 - `compat=ontap` — ONTAP：**不改任何线上请求**（对象桶的怪癖都已通用处理：F4、F6、空末页、CommonPrefix 计入
   max-keys、不回显 Delimiter）；原生拷贝亲和标签 `ontap`（与同端点的标准 URL 之间走流式）；承载 `bucket_type=nas`。
-- `bucket_type=nas` — ONTAP NAS 桶 profile（P7 §14.2，N1–N7 实施中）。能力开关 `S3BucketCapabilities`
+- `bucket_type=nas` — ONTAP NAS 桶 profile（P7 §14.2，N1–N7）。能力开关 `S3BucketCapabilities`
   （`storage/backends/s3/capabilities.rs`，由 `s3/architecture.rs::bucket_capabilities` 按 `bucket_type` 定；`compat` 只改请求、
   不改能力）。N1：连接不再拒绝（桶若回版本状态只告警）；作源端无条件读 —— 不发 `If-Match`，每段响应的 `ETag`、
   `Content-Range` 总长、`Last-Modified` 必须等于描述时的，body 短于宣称长度按“已被替换”（`Conflict` / Permanent），读完
@@ -813,26 +813,27 @@ SKILL.md）上跑出来的差异，以及各自的处理：
 ### ONTAP S3 NAS 桶实测行为（2026-09-26，ONTAP 9.19.1，桶 `data-mover-nas`）
 
 NAS 桶（multiprotocol，底下是 FlexVol `dm_s3_nas`）与同一 SVM 的对象桶差别很大。curl（凭据经 0600 `-K` 文件）+
-`staged_matrix.sh` 实测：
+`staged_matrix.sh` 实测。第三列是**不写** `bucket_type=nas` 时 data-mover 的表现，第四列是 NAS profile
+（`?compat=ontap&bucket_type=nas`，P7 §14.2 N1–N7）：
 
-| 行为 | 对象桶（`data-mover-test`） | NAS 桶 | data-mover 的表现 |
-|---|---|---|---|
-| PUT 回的 `ETag` | 内容 MD5，与 HEAD 相同 | 内容 MD5（**只在 PUT 回复里**） | — |
-| HEAD / GET / 列举 / CopyObject 回复的 `ETag` | 同上 | **另一个不透明值，不是 MD5**；同内容每写一次都变，读之间稳定 | 读回校验 `ensure_current` 看到 ETag ≠ PUT 的 → `Verify … (Conflict, Permanent)`「the final S3 object was replaced after publication」（误导，见下） |
-| 条件 GET（`If-Match` / `If-None-Match`，任何值） | 支持 | **501 `NotImplemented`** | 钉住的读（读回、`--read-back` 时源端算 BLAKE3、role 源读）失败；`a65ae18`（见下）起报 `Unsupported, Permanent`，之前误报 `Connectivity, Transient` |
-| 条件 PUT `If-None-Match: *` | — | 支持（412） | — |
-| `CreateMultipartUpload` | 支持 | **501 `NotImplemented`**（不是权限问题） | Direct > 8 MiB：同上，现报 `Write … (Unsupported, Permanent)` |
-| `ListMultipartUploads` / `ListParts` | 支持 | **403**（NAS 桶的策略不能放行这两个动作） | Checkpointed / AtomicReplace > 8 MiB 在 Prepare 的 discovery 报 `Observe … (PermissionDenied, Permanent)` |
-| 单次 PUT > 8 MiB | 支持 | 支持（9 MiB 实测） | data-mover 目前 > 8 MiB 一律走分段，用不上 |
-| 同桶 `CopyObject` | 要 `Content-Length`（411） | 同样要 `Content-Length`（411），带 `Content-Length: 0` 后 200；`x-amz-copy-source-if-match` 认存储的 ETag（PUT 回的 MD5 → 412）；REPLACE 指令接受 | F6 起可用：读回关时原生 NAS→NAS 1 KiB 成功；读回开时源端 BLAKE3 的条件 GET 501 |
-| 对象桶 ↔ NAS 桶的 `CopyObject` | — | **501**（两个方向） | 同一 endpoint 不同桶走原生 → `Unsupported` |
-| `x-amz-meta-*`、`?tagging` | 支持 | 支持 | — |
-| `GetBucketVersioning` / `ListObjectVersions` | 支持 | 501（不支持版本） | 连接时当作未开版本 |
-| 删对象后的目录 | — | 目录留下；非空目录 `DELETE <dir>/` 403，空目录 204 | 清理按后序逐个 `DELETE <dir>/` |
+| 行为 | 对象桶（`data-mover-test`） | NAS 桶 | 不写参数 | NAS profile |
+|---|---|---|---|---|
+| PUT 回的 `ETag` | 内容 MD5，与 HEAD 相同 | 内容 MD5（**只在 PUT 回复里**） | — | 流式单 PUT 核对它（`upload_digest`） |
+| HEAD / GET / 列举 / CopyObject 回复的 `ETag` | 同上 | **另一个不透明值，不是 MD5**（由 mtime + size 派生，N0） | 读回报 `Verify … (Conflict)`「replaced after publication」（误导） | 身份 `PathScoped(路径 + ETag)`；读回括号式（N4） |
+| 条件 GET（`If-Match` / `If-None-Match`，任何值） | 支持 | **501 `NotImplemented`** | 钉住的读失败，`Unsupported` + 补参数提示（N6） | 不发条件，核对响应（N1） |
+| 条件 PUT `If-None-Match: *` | — | 支持（412） | — | 不用 |
+| `CreateMultipartUpload` | 支持 | **501 `NotImplemented`** | Direct > 8 MiB `Write … (Unsupported)` + 提示 | 从不发；> 8 MiB 流式单 PUT（N3） |
+| `ListMultipartUploads` / `ListParts` | 支持 | **403** | Prepare `Observe … (PermissionDenied)`（`compat=ontap` 下带提示） | 从不发（不续传，N2） |
+| 单次 PUT > 8 MiB | 支持 | 支持（5 GiB + 1 也收） | 用不上（> 8 MiB 走分段） | 8 MiB–5 GiB 流式单 PUT；> 5 GiB Preflight 拒 |
+| 同桶 `CopyObject` | 要 `Content-Length`（411） | 同样要（F6 起带）；`x-amz-copy-source-if-match` 认存储的 ETag；克隆 | 读回开时源端条件 GET 501 | 一次 CopyObject ≤ 5 GiB，读回锚定拷贝回复（N5） |
+| 对象桶 ↔ NAS 桶的 `CopyObject` | — | **501**（两个方向） | 同端点同 `compat=ontap` 走原生 → `Unsupported` | 亲和含桶名，走流式（N1） |
+| `x-amz-meta-*`、`?tagging` | 支持 | 支持 | — | — |
+| `GetBucketVersioning` / `ListObjectVersions` | 支持 | 501（不支持版本） | 连接时当作未开版本 | 无版本：源端不给版本，遍历全部版本在 I/O 前拒 |
+| 删对象后的目录 | — | 目录留下；非空目录 `DELETE <dir>/` 403，空目录 204 | 清理按后序逐个 `DELETE <dir>/` | 同左 |
 
-结论：NAS 桶**只适合作列举（无序）源**与**不读回的 ≤ 8 MiB 目的端**。钉住的读（`If-Match`）与分段上传是存储本身不
-支持，不是 data-mover 的缺陷；让 NAS 桶可写 / 可校验要做设计决定（能力探测或显式端点选项，P7 §14.1 D6 同类），未定前
-data-mover 按上表失败。唯一的 data-mover 缺陷是 501 被当成可重试的连接失败，已修。
+结论（N7 起）：写 `?compat=ontap&bucket_type=nas` 后 NAS 桶可作源（无序列举、无条件读 + 收尾 HEAD）与目的端（≤ 5 GiB，
+不续传，括号式读回，同桶原生拷贝），较弱的保证逐条写进结果（`EffectiveRecovery::UnsupportedByDestination`、
+`TransferOutcome.verification`）。不写参数时照旧失败，但 501 / 403 的诊断提示补参数。legacy `StorageEnum` 不理会这个 profile。
 
 **补充实测（N0，2026-09-26，原始 socket SigV4 客户端 + curl + 10.131.9.10 上 NFSv3 root 挂载）**，供 NAS profile（P7 §14.2）使用：
 
@@ -880,7 +881,7 @@ native（StorageGRID 为流式）都是一次请求（ETag 无 `-N`），同名�
 | DXN 对无 body 的 `UploadPartCopy`、ONTAP 对无 body 的 `CopyObject` 回 411 | 所有拷贝请求显式 `Content-Length: 0`（`copy_request.rs`，legacy 与 role） |
 | 把 501 `NotImplemented` 当断连重试 | 条目 `Unsupported` / Permanent（`a65ae18`）；ONTAP NAS 桶大量回 501 |
 | RustFS 暂停版本桶里 PUT 不回 `x-amz-version-id: null` | 连接时 Suspended → 按 `"null"` 记（`S3Storage::write_facts`），指针按 id 删 |
-| ONTAP NAS 桶 PUT 回的 ETag ≠ 之后 HEAD 的 ETag | 存储性质：读回校验报 `Conflict`；NAS 桶只作列举源，见「ONTAP S3 NAS 桶实测行为」 |
+| ONTAP NAS 桶 PUT 回的 ETag ≠ 之后 HEAD 的 ETag | 存储性质：URL 写 `?compat=ontap&bucket_type=nas`（NAS profile：括号式读回、prepare HEAD 结算），见「ONTAP S3 NAS 桶实测行为」 |
 | DXN 版本化桶的 `CopyObject` 不回版本 | 桶开了版本且回复无版本 → 列版本认领（`native_final::settle_copy_version`） |
 | `bucket.host` 解析错误 (path-style vs virtual-hosted) | 检查 endpoint 是否支持 virtual-hosted |
 | URL 里的凭据被切错 | AK 按第一个 `:`、凭据按最后一个 `@` 切：AK 不能含 `:`，SK 不能含 `@`；**不要** percent-encode（按原样取，编码过的 SK 签名错） |

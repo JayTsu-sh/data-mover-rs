@@ -1030,7 +1030,7 @@ expert 目的端同；线上：role 与 legacy 各入口对 `p/d/` 零请求。�
 不留对象 / 指针 / 上传、重跑 `Fresh`）与 native（StorageGRID 为流式）都是一次请求（ETag 无 `-N`）、逐字节相等，同名真实文件
 `mid` / `big` 在 **RustFS** 与其余各家都不动；MinIO 上 > 8 MiB 的 `d/` 现在写得进去。
 
-D6 结论：零字节 `d/` 不会把目录变成文件（D6 的触发条件不成立）；**有内容的 `d/` 若先于子项写入，NAS 桶静默把它存成文件
+D6 结论（N1 起按此实现：NAS profile 的 `directory_objects=false`，`d/` 在 Preflight 拒）：零字节 `d/` 不会把目录变成文件（D6 的触发条件不成立）；**有内容的 `d/` 若先于子项写入，NAS 桶静默把它存成文件
 `d`**（我们的读回会报 `NotFound`，但文件 `d` 已在、之后子项全 404）。Blocks 下自己的对象在子项之前交出，按遍历顺序拷贝
 的消费方正好命中这种顺序。**用户 2026-09-26 定：D13（目录对象只用单次请求写，F5g `2352a6b` 已实现）**，不加端点开关；NAS 桶由 §14.2 的 NAS profile（`directory_objects=false`）处理。
 

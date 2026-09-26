@@ -20,7 +20,7 @@
 | SMB | openfs m1-source / m1-target | SMB | — | — | guest 登录目前失败（§3.3） |
 | S3 | MinIO（VM 102） | S3 | WSL | 桶 `data-mover-test`；临时版本桶 `data-mover-*`（用完删光） | `.claude/skills/e2e-s3/.env` |
 | S3 | ONTAP S3 对象桶（SVM `lizy`） | S3 | WSL | 桶 `data-mover-test`（无版本）、`data-mover-test-ver`（开版本） | `e2e-s3/ontap/.env`（`S3_COMPAT=ontap`；`S3_BUCKET` 换桶） |
-| S3 | ONTAP S3 **NAS 桶** | S3（平铺列举**无序**） | WSL | 桶 `data-mover-nas` | `e2e-s3/ontap/.env` + `S3_BUCKET=data-mover-nas` |
+| S3 | ONTAP S3 **NAS 桶** | S3（平铺列举**无序**；NAS profile `?compat=ontap&bucket_type=nas`） | WSL / 10.131.9.10 | 桶 `data-mover-nas`（跑完删光；GB 级对象在下个 :05 快照前删） | `e2e-s3/ontap/.env` + `S3_BUCKET=data-mover-nas S3_BUCKET_TYPE=nas`（`nas_matrix.sh` 自己设） |
 | S3 | RustFS 1.0.0（VM 105） | S3 | WSL（管理网 9001） | 桶 `data-mover-test`；临时 `data-mover-*` 桶 | `e2e-s3/rustfs/.env` |
 | S3 | DXN-1（Ceph RGW Octopus） | S3（8184 明文；8182 HTTPS 自签证书，要 `S3_USE_HTTPS=true S3_TLS_VERIFY=false`） | WSL | 桶 `data-mover-test`（**永不开版本**）；临时桶（长期批准） | `e2e-s3/dxn/.env`（`S3_COMPAT=dxn`）+ `S3_LOCATION=magnascale:tos_placement` |
 | S3 | StorageGRID 11.5.0（独立租户 `data-mover-test`） | S3（明文 HTTP） | WSL | 桶 `data-mover-test`（无版本）、`data-mover-test-ver`（开版本）；租户内临时 `data-mover-*` 桶（用完删光） | `e2e-s3/storagegrid/.env`（`S3_COMPAT=sg` → `?compat=sg`） |
@@ -53,16 +53,11 @@
     （FAS2750_01_SSD_1 × 3 成员，thin 100 GB），后台重删 + 压缩。我们的用户**不能建桶**，脚本要用已有桶、跑完清空。
   - `data-mover-nas`：NAS 桶，FlexVol `dm_s3_nas`（`/dm_s3_nas`，20 GB thin，unix 777，重删 + 压缩；S3 用户映射到 `pcuser`）卷每小时 :05 打快照 `.snapshot/hourly.*`，GB 级测试对象要在下个快照前删掉，否则删除后空间要等快照轮转才回来）。
   - 该用户也能**读** `ontap-lisa-auto-bucket`（那个桶的原有策略放行）——**只写我们的三个桶**。
-  - **NAS 桶限制**（2026-09-26 curl + staged 矩阵实测，详见 `storage-s3.md`「ONTAP S3 NAS 桶实测行为」）：
-    - PUT 回复的 `ETag` 是 MD5，但 HEAD / GET / 列举 / 拷贝回复给的是**另一个不透明值**（不是 MD5，同内容每写一次都变）
-      → 读回校验报 `Verify … (Conflict)`「replaced after publication」（误导，存储性质）；
-    - 条件 GET（`If-Match` / `If-None-Match`）**501 `NotImplemented`** → 钉住的读（读回、`--read-back` 时源端 BLAKE3）不可用；
-    - `CreateMultipartUpload` **501**（不支持分段，不是权限）；`ListBucketMultipartUploads` / `ListMultipartUploadParts` 策略不能放行（403）
-      → > 8 MiB 的 Checkpointed / AtomicReplace 在 Prepare 报 `Observe … (PermissionDenied)`，Direct > 8 MiB 报 `Write … (Unsupported)`；
-    - 同桶 CopyObject 可用（要 `Content-Length: 0`，`994828c` 起带），对象桶 ↔ NAS 桶的拷贝 501；单次 PUT > 8 MiB 可用（9 MiB 实测）；
-      条件 PUT `If-None-Match: *` 可用。
-    - `a65ae18` 起 501 报 `Unsupported, Permanent`（之前是 `Connectivity, Transient`）。能写的只有**不读回的 ≤ 8 MiB**，外加读回关的同桶原生拷贝。
-      NAS 桶目前**只适合作列举（无序）源**；要让它可写 / 可校验需要设计决定（能力探测或端点选项，待定）。
+  - **NAS 桶**（2026-09-26 curl + staged 矩阵 + N0 实测，详见 `storage-s3.md`「ONTAP S3 NAS 桶实测行为」）：PUT 回复 `ETag` 是 MD5，
+    HEAD / GET / 列举 / 拷贝回复是由 mtime + size 派生的不透明值；条件 GET 与 `CreateMultipartUpload` 501，`ListMultipartUploads` /
+    `ListParts` 403；单 PUT 原子（中途断开保留旧对象），5 GiB + 1 也收；同桶 CopyObject 是克隆，对象桶 ↔ NAS 桶的拷贝 501。
+    **用 NAS profile**：URL 加 `?compat=ontap&bucket_type=nas`（`e2e-s3/ontap/.env` + `S3_BUCKET=data-mover-nas S3_BUCKET_TYPE=nas`），
+    源端与目的端都可用（≤ 5 GiB、不续传、括号式读回，P7 §14.2 N1–N7）；真机矩阵 `nas_matrix.sh`。不写参数照旧失败（诊断提示补参数）。
     - 删对象后空目录会留下，清理要按目录后序逐个 DELETE `<dir>/`（非空目录的 DELETE 回 403）。
   - **ONTAP CopyObject 不带 `Content-Length` → 411 MissingContentLength**（对象桶与 NAS 桶都是）：`994828c` 起所有拷贝请求都带
     `Content-Length: 0`（legacy 与 role），ONTAP staged / versioning 矩阵原生行全部通过。CopyObjectResult 里的 `ETag` 不带引号（DXN 同）。

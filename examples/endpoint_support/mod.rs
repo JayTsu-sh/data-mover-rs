@@ -6,7 +6,8 @@
 //! - `s3:<prefix>` — that prefix of the bucket named by `S3_HOST` / `S3_BUCKET` / `S3_AK` / `S3_SK` /
 //!   `S3_USE_HTTPS` / `S3_COMPAT` / `S3_TLS_VERIFY` / `S3_BUCKET_TYPE` (the e2e-s3 `.env`, or its
 //!   `dxn/` / `storagegrid/` / `ontap/` / `rustfs/` siblings);
-//! - `s3@<bucket>:<prefix>` — the same, in another bucket of that server;
+//! - `s3@<bucket>:<prefix>` — the same, in another bucket of that server (`S3_BUCKET_TYPE` applies to
+//!   `S3_BUCKET` only: another bucket is an object bucket);
 //! - `hdfs://…` — an HDFS location, with `LAB_HDFS_CONFIG_DIR` / `LAB_HDFS_KEYTAB` for the client;
 //! - anything else — a local directory, created if missing.
 
@@ -36,10 +37,14 @@ fn env_var(name: &str) -> Result<String> {
 /// written, undecoded. `S3_USE_HTTPS=true` selects HTTPS; `S3_COMPAT=sg|dxn|hcp|ontap`,
 /// `S3_TLS_VERIFY=false` and `S3_BUCKET_TYPE=nas` become the URL's options (empty, `true` /
 /// `object` = the default), as `.claude/skills/_shared/s3_url.sh` builds them. The bucket is
-/// `S3_BUCKET` unless one is named.
+/// `S3_BUCKET` unless one is named. `S3_BUCKET_TYPE` describes `S3_BUCKET` alone: another bucket
+/// named with `s3@<bucket>:` is an object bucket (an ONTAP NAS bucket and an object bucket of the
+/// same server in one copy).
 fn s3_url(bucket: Option<&str>, prefix: &str) -> Result<String> {
     let https = env::var("S3_USE_HTTPS").is_ok_and(|value| value == "true");
-    let query = s3_options()?;
+    let other_bucket =
+        bucket.is_some_and(|bucket| env::var("S3_BUCKET").ok().as_deref() != Some(bucket));
+    let query = s3_options(!other_bucket)?;
     Ok(format!(
         "{}://{}:{}@{}.{}/{}{query}",
         if https { "s3+https" } else { "s3" },
@@ -51,8 +56,9 @@ fn s3_url(bucket: Option<&str>, prefix: &str) -> Result<String> {
     ))
 }
 
-/// The query of the options the environment names (`""` for none).
-fn s3_options() -> Result<String> {
+/// The query of the options the environment names (`""` for none); `bucket_type` only for
+/// `S3_BUCKET` (`own_bucket`).
+fn s3_options(own_bucket: bool) -> Result<String> {
     let var = |name: &str| env::var(name).unwrap_or_default();
     let mut options = Vec::new();
     match var("S3_COMPAT").as_str() {
@@ -67,6 +73,7 @@ fn s3_options() -> Result<String> {
     }
     match var("S3_BUCKET_TYPE").as_str() {
         "" | "object" => {}
+        "nas" if !own_bucket => {}
         "nas" => options.push("bucket_type=nas".to_owned()),
         _ => return Err("S3_BUCKET_TYPE must be empty, object or nas".into()),
     }

@@ -17,7 +17,7 @@ S3_SK=SECRET_KEY
 S3_USE_HTTPS=false               # true → s3+https://（默认校验证书）
 S3_COMPAT=                       # sg|dxn|hcp|ontap → ?compat=…（空 = 标准 S3）
 S3_TLS_VERIFY=                   # false → tls_verify=false（只配 S3_USE_HTTPS=true；自签证书，如 DXN 8182）
-S3_BUCKET_TYPE=                  # nas → bucket_type=nas（只配 S3_COMPAT=ontap；NAS profile 尚未实现，连接报 Unsupported）
+S3_BUCKET_TYPE=                  # nas → bucket_type=nas（只配 S3_COMPAT=ontap；ONTAP NAS 桶 profile，P7 §14.2）
 S3_PREFIX=test                   # bucket 内的子路径
 ```
 
@@ -182,8 +182,14 @@ S3_ENV=$E S3_VERSIONED_BUCKET=data-mover-test-ver timeout 5400 bash $S/scripts/v
 
 # ONTAP NAS 桶 data-mover-nas：只有非多版本（GetBucketVersioning 501、ListObjectVersions 不实现）；平铺列举无序
 # 零字节 d/ 在 NAS 桶上不留对象（只是目录）→ EXPECT_DIR_MARKER=0
-S3_ENV=$E S3_BUCKET=data-mover-nas timeout 600  python3 $S/scripts/run.py
-S3_ENV=$E S3_BUCKET=data-mover-nas timeout 3600 bash $S/scripts/staged_matrix.sh
+# NAS profile（?compat=ontap&bucket_type=nas，P7 §14.2）的真机矩阵：nas_matrix.sh（自己设 S3_BUCKET / S3_COMPAT /
+# S3_BUCKET_TYPE；写 nas-<run>/，跑完删光 —— 卷每小时 :05 打快照，GB 级对象要在下个快照前删掉；目录自深向浅删）。
+# 行：本地 → NAS（0 B / 1 KiB / 8 MiB+1 × Checkpointed / AtomicReplace / Direct × 读回开关，200 MiB 读回开三种 + 读回关 atomic，核对
+# recovery / read_back_method / upload_digest 与内容）、1 GiB、5 GiB+1 与坏名字在 Preflight 拒、文件 / 目录冲突 → Conflict、
+# 取消与 SIGKILL 后旧对象不变、重跑 Fresh、NAS 作源（含读的中途被替换 → Conflict）、同桶原生一次 CopyObject、
+# NAS ↔ 对象桶（OBJECT_BUCKET，默认 data-mover-test）走流式。SKIP_BIG=1 / SKIP_NATIVE=1 跳过对应行。
+S3_ENV=$E timeout 5400 bash $S/scripts/nas_matrix.sh
+S3_ENV=$E S3_BUCKET=data-mover-nas S3_BUCKET_TYPE=nas timeout 600  python3 $S/scripts/run.py
 S3_ENV=$E S3_UNVERSIONED_BUCKET=data-mover-nas EXPECT_DIR_MARKER=0 timeout 1800 bash $S/scripts/traversal_versions.sh
 
 # RustFS（管理网 9001；非多版本 data-mover-test，多版本临时桶 data-mover-rustfs-*；绝不写 bigbucket）

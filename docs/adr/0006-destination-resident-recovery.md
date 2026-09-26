@@ -884,6 +884,21 @@ zero-byte `d/` is skipped; 1 015 entries in `All`, 1 008 in `Current`, 5 directo
 - Stages in flight in the old format are not recognized: drain transfers before upgrading; manual
   cleanup of `.data-mover-*` stages, `.claim-*` names and S3 `.data-mover-stage/` is documented.
 
+## Addendum (P7 §14.2 N2, 2026-09-27): a destination may declare no resume
+
+A destination that cannot keep a transfer's progress says so: `StagedDestination::resumable_at_destination()`
+(default `true`) is `false` for an S3 bucket without multipart uploads — an ONTAP NAS bucket, whose
+`CreateMultipartUpload` answers 501 and `ListMultipartUploads` / `ListParts` 403, so neither the
+`.upload` pointer nor `ListParts` can record anything. Every `TransferPolicy::Checkpointed` transfer to
+it reports `EffectiveRecovery::UnsupportedByDestination` (a new variant; the enum is `#[non_exhaustive]`
+since), on every route and size; the engine arms no interval and prepares with `ResumeMode::Restart` and
+not recoverable, and the destination looks for nothing (no pointer `HEAD`, no upload listing). Nothing
+is recorded where data-mover runs either: a cancelled or killed attempt starts again from zero, and its
+stage never commits before publication — the streamed `PutObject` holds its last byte until then (P7
+§14.2 N3), which such a store's atomic single PUT makes safe. `StagedDestination::final_refusal`
+(default none) lets the same destination refuse, at `Preflight` before any destination I/O, what it
+cannot write by name or size (over 5 GiB; keys the store would rewrite).
+
 ## Commit sequence
 
 C1 this ADR · C2 cross-backend resume example and container-restart matrix, baseline · C3 legacy S3
