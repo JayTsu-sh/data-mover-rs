@@ -1,6 +1,6 @@
 use super::{
     CompletedPart, Result, S3Storage, StorageError, Tag, build_copy_source, build_tagging_str,
-    copy_request, error,
+    copy_request, directory_objects, error,
 };
 
 const COPY_PART_MIN: u64 = 5 * 1024 * 1024;
@@ -82,6 +82,7 @@ impl S3Storage {
         requested_part_size: u64,
         tags: Option<&Vec<Tag>>,
     ) -> Result<()> {
+        directory_objects::refuse_multipart(to_key)?;
         let part_size = requested_part_size.max(size.div_ceil(MAX_COPY_PARTS));
         if !(COPY_PART_MIN..=COPY_PART_MAX).contains(&part_size) {
             return Err(StorageError::OperationError(format!(

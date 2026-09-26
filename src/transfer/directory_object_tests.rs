@@ -1,6 +1,7 @@
-//! Directory objects in transfers (P7 F5, D2): between buckets they are copied to the same key; a
-//! filesystem side refuses them at `Preflight` before any I/O; and `directory_object_action`
-//! tells a consumer what to do with each listed entry.
+//! Directory objects in transfers (P7 F5, D2): between buckets they are copied to the same key,
+//! by one request whatever their size (D13) — and refused at `Preflight`, before any destination
+//! I/O, when one request cannot carry them; a filesystem side refuses them at `Preflight` before
+//! any I/O; and `directory_object_action` tells a consumer what to do with each listed entry.
 
 use std::error::Error;
 use std::fs;
@@ -9,10 +10,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{EntryVersion, FailureClass, ObservedEntry, StoragePath};
+use crate::model::{
+    EntryKind, EntryVersion, FailureClass, IdentityStrength, ObservedEntry, SourceIdentity,
+    StoragePath,
+};
+use crate::storage::artifacts::{ArtifactKind, artifact_name};
 use crate::storage::backends::local::{test_destination_storage, test_source_storage};
 use crate::storage::backends::s3::tests::{
-    MemoryS3, Versioning, content_md5, endpoint_of, native_context,
+    MemoryS3, Versioning, content_md5, endpoint_of, identity, native_context,
 };
 use crate::storage::backends::s3::{S3Protocol as _, connect};
 use crate::storage::listing::testing::{listed, listed_versions};
@@ -22,8 +27,8 @@ use crate::storage::{
 use crate::transfer::{
     DIRECTORY_OBJECT_SKIP_REASON, DirectoryObjectAction, ExpertDestinationRequest,
     ExpertDestinationSession, ExpertSourceRequest, ExpertSourceSession, InflightLimits,
-    PayloadShapingPolicy, TransferFailure, TransferPhase, TransferRequest, TransferSide,
-    directory_object_action, transfer,
+    PayloadShapingPolicy, TransferFailure, TransferPhase, TransferPolicy, TransferRequest,
+    TransferRoute, TransferSide, directory_object_action, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -273,5 +278,140 @@ async fn directory_object_action_decides_per_destination() -> TestResult {
             ("m/".to_string(), true, nothing, copy),
         ]
     );
+    Ok(())
+}
+
+/// 12 MiB: over the 8 MiB single-PUT threshold.
+const OVER_THRESHOLD: usize = 12 * 1024 * 1024;
+/// One more byte than one `PutObject` or `CopyObject` carries.
+const OVER_ONE_REQUEST: u64 = 5 * 1024 * 1024 * 1024 + 1;
+
+/// A store that completes a multipart upload to `x/` as `x` (`RustFS` 1.0.0), holding the real
+/// file `dst/d` beside the directory object `dst/d/` a copy writes.
+async fn rustfs_like() -> Arc<MemoryS3> {
+    let protocol = Arc::new(MemoryS3::default());
+    *protocol.rustfs_multipart_directory_objects.lock().await = true;
+    protocol
+        .objects
+        .lock()
+        .await
+        .insert("dst/d".into(), Bytes::from_static(b"a real file"));
+    protocol
+}
+
+/// D13: a 12 MiB `d/` is copied by one request under every policy — no multipart request is
+/// made, and the real file `d` beside it is untouched. (The native row is one `CopyObject` at this
+/// size anyway; the staged tests cover a native `d/` over the single-copy limit.)
+#[tokio::test]
+async fn a_directory_object_over_the_single_put_threshold_is_one_request() -> TestResult {
+    let bytes = Bytes::from(
+        (0..=250_u8)
+            .cycle()
+            .take(OVER_THRESHOLD)
+            .collect::<Vec<_>>(),
+    );
+    for (policy, shaping, route) in [
+        (
+            TransferPolicy::Checkpointed,
+            PayloadShapingPolicy::RequireClientShaped,
+            TransferRoute::Streaming,
+        ),
+        (
+            TransferPolicy::AtomicReplace,
+            PayloadShapingPolicy::RequireClientShaped,
+            TransferRoute::Streaming,
+        ),
+        (
+            TransferPolicy::Direct,
+            PayloadShapingPolicy::RequireClientShaped,
+            TransferRoute::Streaming,
+        ),
+        (
+            TransferPolicy::Checkpointed,
+            PayloadShapingPolicy::AllowUnshapedNative,
+            TransferRoute::Native,
+        ),
+    ] {
+        let label = format!("{policy:?} {route:?}");
+        let protocol = rustfs_like().await;
+        protocol
+            .objects
+            .lock()
+            .await
+            .insert("src/d/".into(), bytes.clone());
+        let copy = request(bucket(&protocol)?, "src/d/", bucket(&protocol)?, "dst/d/")?
+            .with_transfer_policy(policy)
+            .with_payload_shaping(shaping);
+        let outcome = transfer(copy)
+            .await
+            .map_err(|e| format!("{label}: {e:?}"))?;
+        assert_eq!(outcome.route, route, "{label}");
+        let objects = protocol.objects.lock().await.clone();
+        assert_eq!(objects.get("dst/d/"), Some(&bytes), "{label}");
+        assert_eq!(
+            objects.get("dst/d").map(Bytes::as_ref),
+            Some(&b"a real file"[..]),
+            "{label}"
+        );
+        let multipart = (
+            *protocol.multipart_begins.lock().await,
+            *protocol.part_uploads.lock().await,
+            *protocol.part_copies.lock().await,
+        );
+        assert_eq!(multipart, (0, 0, 0), "{label}");
+    }
+    Ok(())
+}
+
+/// D13: more than one request carries is the destination's `Unsupported` at `Preflight`, before
+/// any destination I/O — a leftover pointer of `d/` is still there, nothing is written, no
+/// multipart request is made. The source is a sparse local file (only described); the expert
+/// destination half does the same from the observed size.
+#[tokio::test]
+async fn a_directory_object_one_request_cannot_carry_is_refused_at_preflight() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    let pointer = artifact_name("d/", ArtifactKind::Upload);
+    put(&protocol, &pointer, b"stale pointer").await?;
+    let root = tempfile::tempdir()?;
+    fs::File::create(root.path().join("big"))?.set_len(OVER_ONE_REQUEST)?;
+    let (local, _) = test_source_storage(root.path(), "directory-object-oversized")?;
+    let Err(failure) = transfer(request(local, "big", bucket(&protocol)?, "d/")?).await else {
+        return Err("a directory object over 5 GiB was written".into());
+    };
+    assert_eq!(
+        refusal(&failure),
+        refused_at_preflight(TransferSide::Destination)
+    );
+    let mut keys: Vec<String> = protocol.objects.lock().await.keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, [pointer.as_str()]);
+    assert_eq!(*protocol.puts.lock().await, 1, "only the planted pointer");
+    assert_eq!(*protocol.multipart_begins.lock().await, 0);
+
+    let observation = ObservedEntry::new(
+        StoragePath::new("src/big/")?,
+        EntryKind::File,
+        Some(OVER_ONE_REQUEST),
+        None,
+        SourceIdentity::new(identity(), IdentityStrength::PathScoped, b"big")?,
+    )?;
+    let prepared = ExpertDestinationSession::prepare(ExpertDestinationRequest::new(
+        observation,
+        1024,
+        bucket(&protocol)?,
+        StoragePath::new("d/")?,
+        InflightLimits::new(2, 1024, 2)?,
+        CancellationToken::new(),
+    ))
+    .await;
+    let Err(failure) = prepared else {
+        return Err("the expert destination prepared a directory object over 5 GiB".into());
+    };
+    assert_eq!(
+        refusal(&failure),
+        refused_at_preflight(TransferSide::Destination)
+    );
+    assert!(protocol.objects.lock().await.contains_key(&pointer));
+    assert_eq!(*protocol.puts.lock().await, 1);
     Ok(())
 }

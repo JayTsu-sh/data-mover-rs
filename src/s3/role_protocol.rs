@@ -241,20 +241,23 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
     }
 
     async fn begin_multipart(&self, key: &str) -> crate::storage::backends::s3::S3Result<String> {
+        let full_key = self.build_full_key(key);
+        if full_key.ends_with('/') {
+            // P7 D13: a directory object is written only by one request. The destination never
+            // asks for this; refused here unsent, since the stores differ (MinIO refuses such an
+            // upload, RustFS stores a completed one under the key without its '/').
+            return Err(s3_role_entry(
+                FailureClass::Unsupported,
+                "an S3 directory object (a key ending in '/') is never a multipart upload",
+            ));
+        }
         self.client
             .create_multipart_upload()
             .bucket(&self.bucket_name)
-            .key(self.build_full_key(key))
+            .key(full_key)
             .send()
             .await
-            .map_err(|error| {
-                let code = error
-                    .as_service_error()
-                    .and_then(ProvideErrorMetadata::code)
-                    .map(str::to_string);
-                let failure = classify_sdk!(error, "S3 CreateMultipartUpload request failed");
-                begin_failure(key, code.as_deref(), failure)
-            })?
+            .map_err(|error| classify_sdk!(error, "S3 CreateMultipartUpload request failed"))?
             .upload_id()
             .map(str::to_string)
             .ok_or_else(|| {
@@ -283,6 +286,14 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         upload_id: &str,
         parts: &[(i32, String)],
     ) -> S3Result<S3WriteFacts> {
+        // The request that stores the object: never on a directory object (P7 D13), even for an
+        // upload this process did not begin.
+        if self.build_full_key(key).ends_with('/') {
+            return Err(s3_role_entry(
+                FailureClass::Unsupported,
+                "an S3 directory object (a key ending in '/') is never a multipart upload",
+            ));
+        }
         self.role_complete_multipart(key, upload_id, parts).await
     }
 
@@ -477,21 +488,6 @@ fn versioned_failure(
     }
 }
 
-/// The failure of a `CreateMultipartUpload` on `key`. `MinIO` (RELEASE.2023-03-20) refuses one on a
-/// key ending in '/' — a directory object (P7 F5) — with 400 `XMinioInvalidObjectName`, though a
-/// single PUT of the same key succeeds: that object's `Unsupported`, not the session's failure.
-/// The code keeps the generic mapping anywhere else (a malformed root prefix concerns every key).
-fn begin_failure(key: &str, code: Option<&str>, failure: S3ProtocolFailure) -> S3ProtocolFailure {
-    if key.ends_with('/') && code == Some("XMinioInvalidObjectName") {
-        s3_role_entry(
-            crate::model::FailureClass::Unsupported,
-            "the S3 store refuses a multipart upload to a key ending in '/'",
-        )
-    } else {
-        failure
-    }
-}
-
 fn s3_role_session(diagnostic: String) -> crate::storage::backends::s3::S3ProtocolFailure {
     crate::storage::backends::s3::S3ProtocolFailure::session(
         crate::model::FailureClass::Connectivity,
@@ -659,36 +655,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    /// `MinIO` refuses a multipart upload to a directory object's key: that object's `Unsupported`.
-    /// The same code on another key, or another code, keeps the generic (session) mapping.
-    #[test]
-    fn a_refused_multipart_upload_to_a_directory_object_concerns_the_entry() {
-        use crate::model::{FailureClass, Transience};
-        let generic =
-            || s3_role_remote_failure(Some(400), Some("XMinioInvalidObjectName"), "begin");
-        assert!(matches!(generic(), S3ProtocolFailure::Session { .. }));
-        assert!(matches!(
-            begin_failure("p/d/", Some("XMinioInvalidObjectName"), generic()),
-            S3ProtocolFailure::Entry {
-                class: FailureClass::Unsupported,
-                transience: Transience::Permanent,
-                ..
-            }
-        ));
-        for (key, code) in [
-            ("p/d", Some("XMinioInvalidObjectName")),
-            ("p/d/", Some("InvalidRequest")),
-        ] {
-            assert!(
-                matches!(
-                    begin_failure(key, code, generic()),
-                    S3ProtocolFailure::Session { .. }
-                ),
-                "{key} {code:?}"
-            );
-        }
     }
 
     #[test]

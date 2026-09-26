@@ -93,6 +93,9 @@ pub(crate) struct MemoryS3 {
     /// Issue upload ids as `MinIO` does — base64url(`<deployment>.<id>`) — while
     /// `ListMultipartUploads` reports the bare id; every call accepts either spelling.
     pub(crate) minio_upload_ids: Mutex<bool>,
+    /// Complete a multipart upload to a key ending in '/' under the key without it, over whatever
+    /// is there — as `RustFS` 1.0.0 does (P7 D13).
+    pub(crate) rustfs_multipart_directory_objects: Mutex<bool>,
     /// `PutObject` requests received, multipart uploads begun, parts uploaded and completions
     /// that stored an object.
     pub(crate) puts: Mutex<u32>,
@@ -517,6 +520,11 @@ impl S3Protocol for MemoryS3 {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(Md5::digest(&bytes).into(), composite.clone());
+        let rekeyed = *self.rustfs_multipart_directory_objects.lock().await;
+        let key = match key.strip_suffix('/') {
+            Some(file) if rekeyed => file.to_string(),
+            _ => key.clone(),
+        };
         let version = self.store_written(&key, Bytes::from(bytes)).await;
         *self.completes.lock().await += 1;
         if mem::take(&mut *self.complete_commits_then_fails.lock().await) {

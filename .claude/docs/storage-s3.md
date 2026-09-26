@@ -601,8 +601,12 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   零字节 / 全零历史忽略，有内容 → 根上的 `Unsupported` 子项失败；扫描根 `p` 自己的 `p/` 同理（遍历处理）。`stat("p/")`
   只 HEAD，不存在 → `NotFound`。MinIO 2023：版本桶里最新是删除标记的 `p/` 仍被 ListObjectsV2 列成无 ETag、0 字节的
   Contents（HEAD 404）→ 不是子项。legacy `walkdir` / `walkdir_2` 不交出条目，对有内容的报 Scan 错误（F5a）。
-  目的端写 `p/d/`：单 PUT / multipart / native 都写这个键，`.upload` 指针在**父目录** `p/`，名字按 `d/` 算
-  （`p/.data-mover-<digest("d/")>.upload`，`artifacts::directory_object_artifact`），不放进 `d/` 里。
+  目的端写 `p/d/`（P7 D13，F5g）：**只用单次请求**，不看单 PUT 阈值与 native 单次拷贝上限 —— 流式 / `Direct` 一次
+  `PutObject`（整对象先缓冲在内存），native 一次 `CopyObject`；从不走 multipart / `UploadPartCopy`，不写指针、不续传
+  （失败从零开始；Checkpointed 的结果因此报 `SkippedBelowCheckpointThreshold` / `SkippedSingleSourceChunk`；流式的整个缓冲在内存，每个最多 5 GiB）。> 5 GiB 或源大小未知 → 该条目 `Unsupported` / Permanent，在 **Preflight**、目的端任何 I/O 之前
+  （`StagedDestination::directory_object_limit` = 5 GiB；S3 prepare 自己也在 I/O 前同样拒），不回退。role 协议与 legacy
+  写入对以 `/` 结尾的键从不发 `CreateMultipartUpload`（发出前就拒）。prepare 仍按父目录里的指针名
+  （`p/.data-mover-<digest("d/")>.upload`，`artifacts::directory_object_artifact`）清掉 F5g 之前的写入者留下的指针与上传。
   各存储差异见下「目录对象真机」。
 - **异常 key**：空段 / `.` / `..` 段（`a//`、根下的 `/x`、`./x`、`a/./b`、
   `a/..`）是逐子项失败（报在服务器拼写的路径上，列举 `Partial`），不会被并进别的路径 —— 目的端的路径处理会把
@@ -795,18 +799,20 @@ data-mover 按上表失败。唯一的 data-mover 缺陷是 501 被当成可重�
 
 ### 目录对象真机（P7 F5，2026-09-26，`directory_objects.sh`）
 
-| 存储 | 写 `d/`（单 PUT） | multipart 写 `d/` | 版本桶里的 `d/` | 其他 |
+| 存储 | 写 `d/`（单 PUT） | 存储自己对 multipart `d/` 的行为（curl 探测；data-mover 自 F5g 起不发） | 版本桶里的 `d/` | 其他 |
 |---|---|---|---|---|
-| MinIO RELEASE.2023-03-20 | 可以（含内容） | **拒绝**：400 `XMinioInvalidObjectName` → 条目 `Unsupported`（> 8 MiB 的 `d/` 写不了，native > 64 MiB 同样） | 正常记版本；最新是删除标记时 ListObjectsV2 仍列出无 ETag、0 字节的 `d/`（HEAD 404）→ 列举不当子项，父目录仍列前缀 `d/` | 合并连续删除标记 |
-| ONTAP 9.19.1 对象桶 | 可以 | 可以（指针在父目录，切断续传通过） | 正常 | 不合并删除标记 |
+| MinIO RELEASE.2023-03-20 | 可以（含内容） | **拒绝**：400 `XMinioInvalidObjectName` | 正常记版本；最新是删除标记时 ListObjectsV2 仍列出无 ETag、0 字节的 `d/`（HEAD 404）→ 列举不当子项，父目录仍列前缀 `d/` | 合并连续删除标记 |
+| ONTAP 9.19.1 对象桶 | 可以 | 可以 | 正常 | 不合并删除标记 |
 | DXN（Ceph RGW Octopus） | 可以 | 可以 | 正常 | 合并连续删除标记；只有 null 版本的 key 重开版本后写新版本再 DELETE：删掉 null 版本并写标记 |
 | StorageGRID 11.5 | 可以 | 可以（`s3+sg` 不走 native） | 正常 | 已删除的 key 再 DELETE 每次新建标记 |
-| RustFS 1.0.0 | 可以 | **完成后存成 `d`**（去掉 `/`，HEAD `d/` 404）：读回报 `NotFound`，但写到了同名文件 `d` 上 | **不记版本**：每次写都是 `null`，DELETE 直接删掉（`x-amz-delete-marker: false`） | native UploadPartCopy 从 `d/` 源：版本桶里会话 Connectivity 失败，非版本桶里同样被存成 `d` |
+| RustFS 1.0.0 | 可以 | **完成后存成 `d`**（去掉 `/`，HEAD `d/` 404），覆盖同名文件 `d` | **不记版本**：每次写都是 `null`，DELETE 直接删掉（`x-amz-delete-marker: false`） | 从 `d/` **源** 的 native UploadPartCopy（F5d 时测，目的键 `d/`）：版本桶里会话 Connectivity 失败、非版本桶里存成 `d`；目的键不以 `/` 结尾、源 > 64 MiB 的这条路线 D13 不管，未复测 |
 | ONTAP NAS 桶 | 零字节：200 但不留对象（只是目录）；有内容且先于子项：存成**文件 `d`**，之后子项 404；有内容且子项已在：409 | NAS 桶本来就只适合作源（见 test-environments） | 不支持版本 | 平铺列举无序 |
 
 写入目录对象的差异（MinIO 拒绝、RustFS 改名覆盖同名文件、NAS 桶先写变文件）：**用户 2026-09-26 定为目录对象只用单次请求写**
-（单 PUT / 单次 CopyObject，不走 multipart；> 5 GiB 在 I/O 之前逐条目 `Unsupported`），见 P7 §14.1 D13。NAS 桶由 NAS profile
-（`directory_objects=false`）处理。
+（D13，F5g 已实现：单 PUT / 单次 CopyObject，不走 multipart；> 5 GiB 在 Preflight、I/O 之前逐条目 `Unsupported`），见 P7 §14.1。
+NAS 桶由 NAS profile（`directory_objects=false`）处理。F5g 真机（2026-09-26，`directory_objects.sh`）：MinIO、RustFS、ONTAP 对象桶、
+DXN、StorageGRID 的版本与非版本桶全部 pass —— 12 MiB `mid/` 本地→S3 三种 policy、200 MiB `big/` 流式（切断后不留东西、重跑 `Fresh`）与
+native（StorageGRID 为流式）都是一次请求（ETag 无 `-N`），同名真实文件 `mid` / `big` 不动。
 
 ## 已知陷阱
 

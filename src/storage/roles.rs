@@ -367,6 +367,15 @@ pub trait StagedDestination: Send + Sync {
         None
     }
 
+    /// The most bytes a directory object (a final path ending in `/`, P7 F5) written here may
+    /// hold, for a destination that writes one only in a single request: S3 sends it as one
+    /// `PutObject` or `CopyObject`, at most 5 GiB (P7 D13). The transfer refuses a larger one, or
+    /// one of unknown size, at `Preflight` before any destination I/O. `None` (the default): no
+    /// such limit — a destination that holds no directory objects refuses every one anyway.
+    fn directory_object_limit(&self) -> Option<u64> {
+        None
+    }
+
     /// Writes one complete source chunk without requiring a separate producer task.
     async fn write_single(
         &self,

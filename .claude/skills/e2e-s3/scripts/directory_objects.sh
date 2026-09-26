@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # P7 F5: S3 "directory objects" — keys ending in '/' (with or without content) — against a real
 # server: the role-based traversal lists each as a file entry of its own directory, the legacy
-# walks report the ones with content, S3→S3 copies recreate them (single PUT, multipart with the
-# .upload pointer in the PARENT, cut and resumed, native), and S3→Local refuses them at Preflight.
+# walks report the ones with content, S3→S3 copies recreate them by ONE request whatever their size
+# (P7 D13: one PUT, or one CopyObject natively; never multipart, never resumed), and S3→Local
+# refuses them at Preflight.
 #
 # Bucket selection (as traversal_versions.sh; every bucket must be named data-mover-*):
 # - default: creates ONE temporary versioned bucket <BUCKET_PREFIX>-<run> on the .env's server and
@@ -14,7 +15,7 @@
 #
 # Seeded under the run's prefix: dirobj/ (5 B) + dirobj/child, lonely/ (6 B, no children),
 # emptydir/ (0 B) + emptydir/child, a console-style empty folder e/ (0 B), plain.txt, and big/
-# (BIG_MB MiB, default 200, uploaded from a local file: a multipart write of a directory object).
+# (BIG_MB MiB, default 200, written by data-mover from a local file: one PUT, D13).
 # Versioned buckets also get z/ = 0 B, delete marker, 0 B (all-zero history) and m/ = 5 B, 0 B,
 # delete marker, 3 B, delete marker (mixed history).
 #
@@ -28,10 +29,14 @@
 # - Legacy walkdir / walkdir_2: an ERROR naming each own object that holds content (dirobj/,
 #   lonely/, big/, and m/ in a versioned bucket), none for the zero-byte ones.
 # - Copies (transfer_resume, same bucket): dirobj/ and emptydir/ streamed (single PUT), dirobj/
-#   native, big/ streamed cut by --cancel-after-ms then resumed (pointer in copy/, none inside
-#   copy/big/, one open upload on copy/big/), big/ native; each compared byte for byte; S3→Local of
-#   dirobj/ fails at Preflight on the destination and writes no file (transfer_resume itself creates
-#   the parent directory, as a caller does).
+#   native; D13 — every write of a directory object is one request (its ETag has no -<parts>), a
+#   real file at the same key without the '/' (copy/mid, copy/big, native/big) is never touched
+#   (RustFS stores a completed multipart x/ as x): mid/ (12 MiB, over the 8 MiB single-PUT
+#   threshold) Local→S3 under each policy, big/ streamed cut by --cancel-after-ms (leaves nothing:
+#   no object, pointer or upload) then run again (starts over: Fresh), big/ native; each compared
+#   byte for byte. S3→Local of dirobj/ fails at Preflight on the destination and writes no file
+#   (transfer_resume itself creates the parent directory, as a caller does). > 5 GiB is refused
+#   before any I/O: covered by unit tests, not uploaded here.
 #
 # Versioned buckets also replay (P7 H1, examples/s3_history_replay.rs) the histories of m/, z/ and
 # dirobj/ oldest to newest into a versioned destination — a second temporary bucket <bucket>-r in
@@ -314,10 +319,10 @@ if [ "$VERSIONED" = 1 ]; then
   put m/ fives; put m/ ''; del m/; put m/ 333; del m/
 fi
 BIG=$((BIG_MB * 1024 * 1024))
-# Does the store take a multipart upload to a key ending in '/'? MinIO RELEASE.2023-03-20 does not
-# (400 XMinioInvalidObjectName, though a single PUT of the same key succeeds).
-# And does a completed one keep the key? RustFS 1.0.0 stores it without the '/' (HEAD x/ 404,
-# HEAD x 200). MPU_DIR: 1 kept, 0 refused, 2 stored under another key.
+# Recorded, not asserted (why data-mover never sends one, D13): does the store take a multipart
+# upload to a key ending in '/'? MinIO RELEASE.2023-03-20 does not (400 XMinioInvalidObjectName,
+# though a single PUT of the same key succeeds). And does a completed one keep the key? RustFS
+# 1.0.0 stores it without the '/' (HEAD x/ 404, HEAD x 200).
 probe=$(s3c -w '\n%{http_code}' -X POST "$H/$VB/$(enc "${P}probe/" /)?uploads")
 if [ "$(tail -1 <<<"$probe")" = 200 ]; then
   id=$(grep -o '<UploadId>[^<]*' <<<"$probe" | sed 's/<UploadId>//')
@@ -325,13 +330,12 @@ if [ "$(tail -1 <<<"$probe")" = 200 ]; then
   etag=$(s3c -D - -o /dev/null -X PUT "$H/$VB/$(enc "${P}probe/" /)?partNumber=1&uploadId=$(enc "$id")" --data-binary @"$WORK/part" | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: *//p')
   printf '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>' "$etag" >"$WORK/complete.xml"
   s3c -o /dev/null -X POST "$H/$VB/$(enc "${P}probe/" /)?uploadId=$(enc "$id")" --data-binary @"$WORK/complete.xml"
-  if [ "$(s3c -o /dev/null -I -w '%{http_code}' "$H/$VB/$(enc "${P}probe/" /)")" = 200 ]; then MPU_DIR=1
+  if [ "$(s3c -o /dev/null -I -w '%{http_code}' "$H/$VB/$(enc "${P}probe/" /)")" = 200 ]; then
+    echo "store keeps a multipart upload to probe/ at its key"
   else
-    MPU_DIR=2
     echo "store completes a multipart upload to probe/ under another key: HEAD probe/ $(s3c -o /dev/null -I -w '%{http_code}' "$H/$VB/$(enc "${P}probe/" /)"), HEAD probe $(s3c -o /dev/null -I -w '%{http_code}' "$H/$VB/$(enc "${P}probe" /)")"
   fi
 else
-  MPU_DIR=0
   echo "store refuses multipart uploads to keys ending in '/': $(tail -1 <<<"$probe") $(grep -o '<Code>[^<]*' <<<"$probe" | sed 's/<Code>//')"
 fi
 purge probe
@@ -342,24 +346,12 @@ if [ "$VERSIONED" = 1 ]; then
   n=$(entries | awk -F'\t' -v k="${P}z/" '$1 == k' | grep -c .)
   if [ "$n" != 3 ]; then DIR_VERSIONED=0; echo "store keeps $n record(s) of z/ (written 0 B, deleted, 0 B): no versions of keys ending in '/'"; fi
 fi
-if [ "$MPU_DIR" = 1 ]; then
-  out=$("$TR" --source "$LOCAL/src" --source-path big --seed-bytes "$BIG" --destination "s3:$P" --destination-path big/ 2>"$WORK/seed.err")
-  check "seed big/ ($BIG_MB MiB, multipart to a d/ key)" "$(jq -r .result <<<"$out" 2>/dev/null)" ok
-  [ "$(jq -r .result <<<"$out" 2>/dev/null)" = ok ] || { echo "   $out"; tail -3 "$WORK/seed.err" | sed 's/^/   /'; }
-else
-  head -c "$BIG" /dev/urandom >"$WORK/big"
-  check "seed big/ ($BIG_MB MiB, one PUT)" "$(s3c -o /dev/null -w '%{http_code}' -X PUT "$H/$VB/$(enc "${P}big/" /)" --data-binary @"$WORK/big")" 200
-  rm -f "$WORK/big"
-  out=$("$TR" --source "$LOCAL/src" --source-path big --seed-bytes "$BIG" --destination "s3:${P}seed/" --destination-path big/ 2>"$WORK/seed.err")
-  if [ "$MPU_DIR" = 0 ]; then
-    check "multipart write of a d/ key refused, typed" "$(jq -r '.result + " " + .phase' <<<"$out") $(jq -r .failure <<<"$out" | grep -c '(Unsupported, Permanent)')" "failed Prepare 1"
-  else
-    # The upload completes, but not at the key: the read-back of the key fails, typed.
-    check "multipart write of a d/ key caught at read-back" "$(jq -r '.result + " " + .phase' <<<"$out") $(jq -r .failure <<<"$out" | grep -c 'at big/ (NotFound')" "failed Verify 1"
-    echo "   the store kept it as: $(keys "${P}seed/" | tr '\n' ' ')"
-  fi
-  purge seed/
-fi
+# The ETag of an object one request wrote is its MD5 (or at least not a multipart -<parts> one): a
+# heuristic that holds on the stores listed in SKILL.md; the untouched real files below decide.
+one_request() { local e; e=$(s3c -I "$H/$VB/$(enc "$1" /)" | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: *//p'); [ -n "$e" ] && [[ $e != *-* ]] && echo yes || echo "no (ETag ${e:-none})"; }
+out=$("$TR" --source "$LOCAL/src" --source-path big --seed-bytes "$BIG" --destination "s3:$P" --destination-path big/ 2>"$WORK/seed.err")
+check "seed big/ ($BIG_MB MiB, one PUT to a d/ key)" "$(jq -r .result <<<"$out" 2>/dev/null) $(one_request "${P}big/")" "ok yes"
+[ "$(jq -r .result <<<"$out" 2>/dev/null)" = ok ] || { echo "   $out"; tail -3 "$WORK/seed.err" | sed 's/^/   /'; }
 
 echo "== role traversal, current objects"
 traverse "$WORK/cur" --versions current --sizes
@@ -448,36 +440,31 @@ copy "native dirobj/" ok --source "s3:$P" --source-path dirobj/ --destination "s
 [ "${S3_COMPAT:-}" = sg ] && want_route=Streaming || want_route=Native
 check "native dirobj/ route" "$(jq -r .route <<<"$LAST")" "$want_route"
 compare "native dirobj/" dirobj/ native/ dirobj/
+# D13: one request per directory object whatever its size — never multipart, never resumed —
+# and a real file at the same key without the '/' is never touched (RustFS stores a completed
+# multipart x/ as x).
+REAL='a real file'
+put copy/mid "$REAL"; put copy/big "$REAL"; put native/big "$REAL"
+MID=$((12 * 1024 * 1024))
+for policy in checkpointed atomic direct; do
+  copy "mid/ (12 MiB) Local→S3, $policy" ok --source "$LOCAL/src" --source-path mid --seed-bytes "$MID" --destination "s3:${P}copy/" --destination-path mid/ --policy "$policy"
+  check "mid/ ($policy): one request" "$(one_request "${P}copy/mid/")" yes
+  out=$("$TR" --source "$LOCAL/src" --source-path mid --destination "s3:${P}copy/" --destination-path mid/ --compare 2>&1)
+  check "mid/ ($policy) equal" "$(jq -r .content_equal <<<"$out" 2>/dev/null)" true
+done
 BIGARGS=(--source "s3:$P" --source-path big/ --destination "s3:${P}copy/" --destination-path big/ --client-shaped)
-if [ "$MPU_DIR" = 1 ]; then
 copy "streamed big/ cut" failed "${BIGARGS[@]}" --bandwidth 20971520 --cancel-after-ms 6000
-pointers=$(keys "${P}copy/.data-mover-" | grep -c '\.upload$')
-inside=$(keys "${P}copy/big/" | grep -c .)
-open=$(uploads "${P}copy/big/" | awk -F'\t' -v k="${P}copy/big/" '$1 == k' | grep -c .)
-check "cut: pointer in copy/, nothing in copy/big/, 1 upload" "$pointers $inside $open" "1 0 1"
-copy "streamed big/ resumed" ok "${BIGARGS[@]}"
-check "resumed big/ prepare" "$(jq -r .prepare <<<"$LAST" | cut -d' ' -f1)" Resumed
-compare "resumed big/" big/ copy/ big/
-check "after resume: no pointer, no upload" "$(keys "${P}copy/.data-mover-" | grep -c .) $(uploads "${P}copy/big/" | grep -c .)" "0 0"
+check "cut: no object, pointer or upload left" "$(keys "${P}copy/big/" | grep -c .) $(keys "${P}copy/.data-mover-" | grep -c .) $(uploads "${P}copy/big/" | grep -c .)" "0 0 0"
+copy "streamed big/ again" ok "${BIGARGS[@]}"
+check "again: starts over" "$(jq -r .prepare <<<"$LAST" | cut -d' ' -f1)" Fresh
+check "streamed big/: one request" "$(one_request "${P}copy/big/")" yes
+compare "streamed big/" big/ copy/ big/
 copy "native big/" ok --source "s3:$P" --source-path big/ --destination "s3:${P}native/" --destination-path big/
+check "native big/ route" "$(jq -r .route <<<"$LAST")" "$want_route"
+check "native big/: one request" "$(one_request "${P}native/big/")" yes
 compare "native big/" big/ native/ big/
-check "native: no pointer left" "$(keys "${P}native/.data-mover-" | grep -c .)" 0
-else
-[ "$MPU_DIR" = 0 ] && WANT='(Unsupported, Permanent)' || WANT='at big/ (NotFound'
-copy "streamed big/ (multipart refused or rekeyed)" failed "${BIGARGS[@]}"
-check "streamed big/ failed, typed" "$(jq -r .failure <<<"$LAST" | grep -c -- "$WANT")" 1
-copy "native big/ (multipart refused or rekeyed)" failed --source "s3:$P" --source-path big/ --destination "s3:${P}native/" --destination-path big/
-if [ "$MPU_DIR" = 0 ]; then
-  check "native big/ failed, typed" "$(jq -r .failure <<<"$LAST" | grep -c -- "$WANT")" 1
-  check "failed: no pointer left" "$(keys "${P}copy/.data-mover-" | grep -c .) $(keys "${P}native/.data-mover-" | grep -c .)" "0 0"
-else
-  # RustFS: whatever the native copy of a d/ source fails with is recorded, not asserted; a stage
-  # it keeps for a resume keeps its pointer (in native/, never inside native/big/).
-  echo "   native big/ on this store: $(jq -r .failure <<<"$LAST"); pointers left: copy/ $(keys "${P}copy/.data-mover-" | grep -c .), native/ $(keys "${P}native/.data-mover-" | grep -c .)"
-  check "failed: no pointer inside copy/big/ or native/big/" "$( { keys "${P}copy/big/"; keys "${P}native/big/"; } | grep -c .data-mover-)" 0
-fi
-[ "$MPU_DIR" = 2 ] && echo "   the store kept the copies as: $( { keys "${P}copy/"; keys "${P}native/"; } | grep -E '/big$' | tr '\n' ' ')"
-fi
+check "real files copy/mid, copy/big, native/big untouched" "$(for k in copy/mid copy/big native/big; do s3c "$H/$VB/$(enc "$P$k" /)"; echo; done | sort -u)" "$REAL"
+check "no pointer, no upload left" "$(keys "${P}copy/.data-mover-" | grep -c .) $(keys "${P}native/.data-mover-" | grep -c .) $(uploads "${P}copy/" | grep -c .) $(uploads "${P}native/" | grep -c .)" "0 0 0 0"
 copy "S3→Local dirobj/" failed --source "s3:$P" --source-path dirobj/ --destination "$LOCAL/dst" --destination-path dirobj/
 check "S3→Local refused at" "$(jq -r '.phase + " " + .side' <<<"$LAST")" "Preflight Destination"
 check "S3→Local failure" "$(jq -r .failure <<<"$LAST" | grep -c 'Prepare failed at dirobj/ (Unsupported, Permanent)')" 1

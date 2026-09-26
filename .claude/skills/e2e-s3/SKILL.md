@@ -133,15 +133,17 @@ S3_PREFIX=test                   # bucket 内的子路径
    `traversal_versions.sh`（默认建一个临时版本桶 `data-mover-f5-<run>`，退出删光；`S3_VERSIONED_BUCKET=` /
    `S3_UNVERSIONED_BUCKET=` 用已有桶的 `dm-<run>/` 前缀；建桶总带 body 或 `Content-Length: 0`，StorageGRID 缺长度回 411）。
    写 `dirobj/`（5 B）+ 子项、`lonely/`（6 B）、`emptydir/`（0 B）+ 子项、console 式空文件夹 `e/`、`plain.txt`、`big/`
-   （`BIG_MB`，默认 200 MiB、至少 150，经 multipart 写入；存储拒绝对 `x/` 发 multipart 时改用一次 PUT，并检查
-   data-mover 的 multipart 写入报 typed `Unsupported`；存储把完成的 `x/` 存到别的键上（RustFS）时检查读回报
-   Verify `NotFound` 并打印它存成了什么）；版本桶再写 `z/`（0 B、标记、0 B）与 `m/`（5 B、0 B、标记、3 B、标记）。
+   （`BIG_MB`，默认 200 MiB、至少 150，由 data-mover 从本地文件写入：一次 PUT，P7 D13）；版本桶再写 `z/`（0 B、标记、0 B）
+   与 `m/`（5 B、0 B、标记、3 B、标记）。先用 curl 探测并打印存储自己对 multipart `x/` 的行为（MinIO 拒绝、RustFS 存成
+   `x`），只记录，不影响断言 —— data-mover 从不对这种键发 multipart。
    检查：当前遍历（`--sizes`）每个 key 一次、目录对象是 `File <d>/ size=<n>`、零字节的也在，计数平衡、无失败，
    blocks 并发 1 / 4 / 32 一致；`--path dirobj` 报 `failure scope=Child dirobj/ Unsupported`、不交出，`--path emptydir`
    什么都不报；All 下 `z/`、`m/` 的整段历史按序；legacy 两种 walk 只对有内容的（`dirobj/`、`lonely/`、`big/`、版本桶的
-   `m/`）报 `ERROR`；拷贝（同桶）`dirobj/` / `emptydir/` 流式、`dirobj/` native、`big/` 流式切断（指针在 `copy/`、
-   `copy/big/` 里无对象、1 个上传）后续传 Resumed 且逐字节相等、`big/` native；S3→Local 在 Preflight 报目的端
-   `Unsupported`、不写文件。`D6=1 S3_UNVERSIONED_BUCKET=data-mover-nas`：只记录 NAS 桶对零字节 / 有内容的 `d/`
+   `m/`）报 `ERROR`；拷贝（同桶）`dirobj/` / `emptydir/` 流式、`dirobj/` native；D13：每次写目录对象都是一次请求
+   （ETag 不带 `-<段数>`），同名真实文件 `copy/mid`、`copy/big`、`native/big` 始终不动 —— `mid/`（12 MiB，超过 8 MiB 单
+   PUT 阈值）本地→S3 三种 policy 各一次、`big/` 流式切断后什么都不留（无对象、指针、上传）、再跑从零开始（`Fresh`）、
+   `big/` native，各自逐字节相等；S3→Local 在 Preflight 报目的端 `Unsupported`、不写文件。> 5 GiB 的拒绝由单测覆盖，
+   不在真机上传。`D6=1 S3_UNVERSIONED_BUCKET=data-mover-nas`：只记录 NAS 桶对零字节 / 有内容的 `d/`
    在子项前后写入时存成什么（不对存储断言），末行 `RESULT: D6 recorded (no assertions)`。其余模式期望
    `RESULT: pass` 与 `cleanup: … deleted` / `… emptied`（清理还核对未完成的上传，列不出就算失败）。临时桶只在
    HEAD 为 404 时才建。
@@ -209,7 +211,8 @@ S3_ENV=$E BUCKET_PREFIX=data-mover-dxn S3_LOCATION=magnascale:tos_placement time
   S3_ENV=$S/storagegrid/.env S3_VERSIONED_BUCKET=data-mover-test-ver timeout 3500 bash $S/scripts/directory_objects.sh
   S3_ENV=$S/storagegrid/.env S3_UNVERSIONED_BUCKET=data-mover-test timeout 3500 bash $S/scripts/directory_objects.sh
   ```
-  各存储的差异（MinIO 拒绝对 `x/` 发 multipart、RustFS 把 multipart 的 `x/` 存成 `x` 且不给 `x/` 记版本等）见
+  各存储的差异（MinIO 拒绝对 `x/` 发 multipart、RustFS 把 multipart 的 `x/` 存成 `x` 且不给 `x/` 记版本等 —— 所以
+  data-mover 只用单次请求写目录对象，D13）见
   `.claude/docs/storage-s3.md`「目录对象真机」。
 - 期望：`run.py` `all checks passed`；`staged_matrix.sh` 的 Direct 行 `equal=yes key_uploads=0`、原生行
   `equal=yes stage_objects=0 key_uploads=0`、续传后 `pointers=0 key_uploads=0`、末行 `left: objects=0 key_uploads=0`；

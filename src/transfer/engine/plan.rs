@@ -20,9 +20,9 @@ pub(super) fn final_recovery(stage: &PreparedStage, plan: TransferPlan) -> Effec
     if stage.recovery_enabled() {
         EffectiveRecovery::Checkpointed
     } else if plan.effective_recovery == EffectiveRecovery::Checkpointed {
-        // The destination declined recovery for this stage (reachable only for a native copy, or
-        // a streamed one to a destination without an automatic interval: `plan_request` reports
-        // the others).
+        // The destination declined recovery for this stage (reachable only for a native copy, a
+        // streamed one to a destination without an automatic interval — `plan_request` reports
+        // the others — or an S3 directory object, always one request: P7 D13).
         EffectiveRecovery::SkippedBelowCheckpointThreshold
     } else {
         plan.effective_recovery

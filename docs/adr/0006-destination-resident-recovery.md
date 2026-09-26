@@ -210,7 +210,9 @@ the `/`, so they never collide with the artifacts of the file `p/d` (`digest("d"
 derived from the final key alone. Not inside `d/`: that would make the prefix `p/d/` exist and sit in
 `d`'s own listing. A listing-based sweep of leftovers (backlog) must match a digest of `d/` found in `p/`
 against the prefix `p/d/`, not a sibling object. Filesystems hold no directory objects: the engine refuses
-such a final path at `Preflight` (`Unsupported`).
+such a final path at `Preflight` (`Unsupported`). Since P7 F5g (D13) no stage of a directory object writes
+an artifact — it is always one request, never resumed — so the name only finds, and cleans up at prepare,
+what a writer from before F5g left.
 
 As built (C7c, `src/storage/discovery.rs`): the table gains two rows and a fixed precedence — nothing
 → fresh; a requested restart → clean; a corrupt pointer; a pointer without a stage; a stage without a
@@ -716,11 +718,18 @@ per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim re
 - Versioned buckets: pointers are deleted by their own versionId, no unversioned DELETE is ever sent
   to a final key, an ambiguous Complete is reconciled via `ListObjectVersions`, an Object Lock refusal
   to delete a pointer is a warning, and the outcome carries the destination versionId.
-- Directory objects (P7 F5): a final key ending in `/` is written like any key — single PUT (zero bytes
-  included), multipart with the `.upload` pointer in the parent (see "Destination artifacts"), native —
-  where the store accepts it. Measured 2026-09-26: MinIO RELEASE.2023-03-20 refuses a multipart upload
-  to such a key (400 `XMinioInvalidObjectName` → `Unsupported` entry failure), RustFS 1.0.0 completes it
-  under the key without its `/` (read-back `NotFound`; see `.claude/docs/storage-s3.md`).
+- Directory objects (P7 F5, D13 / F5g): a final key ending in `/` is written by **one request** whatever
+  the threshold says — one `PutObject` (streamed, `Direct`, zero bytes included) or, natively, one
+  `CopyObject` — never a multipart upload or `UploadPartCopy`, and never resumed (no pointer; a failure
+  starts over). One request carries at most 5 GiB: a larger directory object, or one of unknown size, is
+  the entry's `Unsupported` at `Preflight`, before any destination I/O, with no fallback
+  (`StagedDestination::directory_object_limit`). Measured 2026-09-26: MinIO RELEASE.2023-03-20 refuses a
+  multipart upload to such a key (400 `XMinioInvalidObjectName`), RustFS 1.0.0 completes one under the key
+  without its `/` — over a real file there. The protocol never sends `CreateMultipartUpload` or
+  `CompleteMultipartUpload` for such a key (the role protocol and the legacy writers, the resumable path
+  included, refuse it unsent). Prepare still reads the parent's pointer name and cleans up what a writer
+  from before F5g left. Cost: a streamed directory object is buffered whole before its PUT, as any
+  single-PUT stage is — up to 5 GiB of memory per transfer in flight (a native one buffers nothing).
 - Delete markers (P7 H1): a transfer never writes one. Replaying a source history's delete marker is
   `transfer::write_delete_marker` (`StagedDestination::write_delete_marker`; every other destination
   refuses it): it holds the same per-destination lease as a transfer of that key, checks

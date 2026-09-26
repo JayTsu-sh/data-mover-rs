@@ -330,6 +330,8 @@ async fn run_until_transferred_inner(
         destination,
     } = lend_transfer_roles(&request)?;
     let descriptor = describe_source(&request, &*source, source_qos.as_ref()).await?;
+    // Before any destination I/O, now that the size is known (P7 D13).
+    directory_object::refuse_oversized(&request.final_path, descriptor.size, &*destination)?;
     let copied_metadata_plan = copied_metadata_plan(&request, &descriptor).await?;
     let recovery_binding = recovery_binding(&request, &descriptor);
     at_destination::run_until_transferred(

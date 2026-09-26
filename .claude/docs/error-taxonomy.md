@@ -81,7 +81,7 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | `InvalidPart` / `InvalidPartOrder`（Complete 的分段表与服务端持有的分段不符或乱序；ADR-0006 C15a） | 条目 `Conflict` / Permanent —— 同一分段表重发不会变 |
 | 412 `PreconditionFailed`（`copy-source-if-match` / `If-Match` 不符）、409；416 `InvalidRange`（`UploadPartCopy` / 读取的范围源里已没有：源缩短或被替换；ADR-0006 C18） | 条目 `Conflict` / Permanent —— 源变了，重发不会变 |
 | `EntityTooSmall`（非最后一段小于 5 MiB 最小分段；C15a） | 条目 `Corruption` / Permanent —— 分段本身错了 |
-| `XMinioInvalidObjectName`（MinIO 2023 拒绝对键以 `/` 结尾的目录对象发起 multipart，同一个键单 PUT 却可以；P7 F5） | 条目 `Unsupported` / Permanent —— 这个对象在这家存储上写不了，不是会话失败（之前落到兜底的会话 `Protocol`） |
+| `XMinioInvalidObjectName` | 通用映射。它的来源（MinIO 2023 拒绝对键以 `/` 结尾的目录对象发起 multipart）不会再出现：P7 D13（F5g）起目录对象只用单次请求写，对这种键的 `CreateMultipartUpload` 在协议层发出前就拒（见下「目录对象」），F5d 的专门映射已删 |
 | **带 versionId 的** HEAD / GET 返回 405（该版本是删除标记）；`Current` 在版本化桶上也会钉成 versionId，所以普通读也属此类 | 条目 `NotFound` / Permanent |
 | **带 versionId 的** GET 返回 400 且错误码 `InvalidArgument`（versionId 格式错） | 条目 `InvalidInput` / Permanent |
 | 其余 400（`ExpiredToken`、region 错……；HEAD 没有错误码，其 400 一律在此） | 仍按通用映射（会话级）—— 这些关乎整个会话 |
@@ -235,7 +235,8 @@ Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修�
 | 扫描根自己的目录对象有内容 | 该键（`<根>/`）上的 `Failure{Child}`，`Unsupported` / Permanent（零字节的忽略） |
 | S3 存储根自己的对象（URL 前缀本身）有内容 | 根路径 `""` 上的子项失败，`Unsupported` / Permanent（零字节的忽略） |
 | `stat` 以 `/` 结尾且对象不存在 | `NotFound`（算 vanished），不再是 `InvalidInput` |
-| MinIO 对 `d/` 的 CreateMultipartUpload：400 `XMinioInvalidObjectName` | 条目 `Unsupported` / Permanent（只对这个请求 + 以 `/` 结尾的键；见上 S3 表） |
+| 目录对象（最终路径以 `/` 结尾）写到 S3、一次请求装不下：> 5 GiB，或源大小未知（P7 D13，F5g） | `transfer` 在 **Preflight**（描述源之后、目的端任何 I/O 之前）报该路径上的条目 `Unsupported` / Permanent，不回退、无续传；expert 目的端半边对 > 5 GiB 同样（大小未知在那里本来就是 Describe 的编排失败 “source has no byte size”）；S3 目的端 prepare 自己也在 I/O 之前同样拒（`Prepare` 阶段，直接调用角色时） |
+| 以 `/` 结尾的键（含存储前缀拼上后以 `/` 结尾的）上的 multipart | 永不发出：role 协议 `begin_multipart` / `complete_multipart` 回条目 `Unsupported` / Permanent；legacy `create_multipart_upload` / `multipart_begin` / multipart rename / 可续传路径（接管已开的上传之前）/ `complete_multipart_upload` 回 `UnsupportedType`。都在任何请求之前（之前 MinIO 回 400 `XMinioInvalidObjectName`，RustFS 1.0.0 把完成的上传存成去掉 `/` 的键、覆盖同名文件） |
 | H1 删除标记（`transfer::write_delete_marker`）：目的桶版本此刻不是 `Enabled`，或目的端不存删除标记 | Publish 的条目 `Unsupported` / Permanent；与同一文件的传输抢租约 → Prepare 的 `Conflict` / Transient；根或 artifact 路径 → `InvalidInput`；发出前取消 → `Cancelled`；**DeleteObject 发出之后**（它自己超时 / 5xx，或读不到删除后的记录）→ 该键的条目、类别照旧、`Transience::Unknown`（结局未知，重放前比对目的端历史）；删除前后该键都没有新标记、最新也不是标记 → `Protocol` / Permanent（RustFS 对未记版本的 `d/`） |
 
 ## 改 error 时

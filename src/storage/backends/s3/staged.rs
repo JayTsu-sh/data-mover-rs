@@ -1,9 +1,10 @@
 //! The S3 destination (ADR-0006): every stage writes the final key. Up to the single-PUT
 //! threshold an object is one `PutObject` (a native copy up to 64 MiB one `CopyObject`); a larger
-//! one is a multipart upload on the final key, resumable through the `.upload` pointer beside it
-//! (a directory object's, `p/d/`, in its parent: P7 F5);
-//! a `Direct` write completes inside `write`. Nothing is recorded where data-mover runs, and no
-//! temp key is written (the `.data-mover-stage/` temp-key path was removed in C19).
+//! one is a multipart upload on the final key, resumable through the `.upload` pointer beside it;
+//! a `Direct` write completes inside `write`. A directory object (`p/d/`, P7 F5) is always one
+//! request, up to 5 GiB, never resumed ([`directory_object`], P7 D13). Nothing is recorded where
+//! data-mover runs, and no temp key is written (the `.data-mover-stage/` temp-key path was removed
+//! in C19).
 
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ mod at_destination;
 mod completion;
 mod delete_marker;
 mod direct;
+mod directory_object;
 #[cfg(test)]
 mod directory_object_tests;
 mod final_upload;
@@ -213,6 +215,11 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
     /// The 64 MiB interval (D3: a checkpointed object up to it never writes a pointer).
     fn automatic_checkpoint_interval_bytes(&self) -> Option<u64> {
         Some(self.checkpoint_interval)
+    }
+
+    /// 5 GiB: a directory object is one `PutObject` or `CopyObject` (P7 D13).
+    fn directory_object_limit(&self) -> Option<u64> {
+        Some(directory_object::MAX_DIRECTORY_OBJECT_BYTES)
     }
 
     async fn prepare_at_destination(

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 
 use super::at_destination;
-use super::directory_object::refuse_unholdable;
+use super::directory_object::{refuse_oversized, refuse_unholdable};
 use super::{
     ProducerRequest, TransferFailure, TransferOutcome, TransferPhase, TransferSide,
     inflight_channel, inflight_role_failure, produce, recovery_binding_for,
@@ -403,6 +403,9 @@ impl ExpertDestinationSession {
                     "destination capability unavailable",
                 )
             })?;
+        // Before any destination I/O: a directory object one request of this destination can
+        // carry (P7 D13).
+        refuse_oversized(&request.final_path, source.size, &*destination)?;
         if request.cancel.is_cancelled() {
             return Err(TransferFailure::orchestration(
                 TransferPhase::Preflight,

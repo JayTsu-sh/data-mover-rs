@@ -132,17 +132,19 @@ impl<P: S3Protocol + 'static> PartsCheckpoint for PointerCheckpoint<'_, P> {
 }
 
 impl<P: S3Protocol + 'static> S3StagedDestination<P> {
-    /// Prepares by looking at the destination first. Up to T a single stage (after cleaning up a
-    /// leftover pointer); above T, or of unknown size, a multipart upload on the final key that
-    /// resumes or starts over as the decision table says.
+    /// Prepares by looking at the destination first. Up to T — and a directory object of any size
+    /// one request carries (P7 D13) — a single stage (after cleaning up a leftover pointer); above
+    /// T, or of unknown size, a multipart upload on the final key that resumes or starts over as
+    /// the decision table says.
     pub(super) async fn prepare_at_destination_stage(
         &self,
         request: DestinationPrepareRequest,
     ) -> Result<PreparedStage, StorageRoleFailure> {
         let path = request.prepare.final_destination.path().clone();
-        let pointer = pointer_path(&path)?;
         let size = request.prepare.source.size;
-        if let Some(size) = size.filter(|size| self.is_single_put(Some(*size))) {
+        let single = self.single_put_size(&path, size)?;
+        let pointer = pointer_path(&path)?;
+        if let Some(size) = single {
             let fact = self.clear_leftover(&request, &pointer).await?;
             let mut stage = self.prepare_single(request.prepare, size);
             stage.mark_at_destination(fact);

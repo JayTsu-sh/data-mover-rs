@@ -1,9 +1,10 @@
-//! Writing a directory object (P7 F5): the final key `dir/obj/` ends in `/`. A small or empty
-//! one is one PUT with no pointer; a large one an upload on that key whose `.upload` pointer sits
-//! in the parent `dir/`, named after `obj/` — never inside `obj/`, never the file `dir/obj`'s —
-//! and resumes from it; a native copy writes it the same way.
+//! Writing a directory object (P7 F5, D13): the final key `dir/obj/` ends in `/`, and it is
+//! written by one request whatever its size — one PUT (streamed or `Direct`), or one `CopyObject`
+//! for a native copy — never a multipart upload or `UploadPartCopy`, and never resumed. The fake
+//! stores a completed multipart `dir/obj/` as `dir/obj`, as `RustFS` 1.0.0 does, so a regression
+//! would also overwrite the real file `dir/obj` these tests keep beside it. More than 5 GiB, or an
+//! unknown size, is `Unsupported` before any I/O.
 
-use std::iter;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -14,7 +15,7 @@ use super::*;
 use crate::model::{EntryKind, IdentityStrength, SourceIdentity, StoragePath};
 use crate::storage::artifacts::{ArtifactKind, artifact_name};
 use crate::storage::backends::s3::S3NativeCopySource;
-use crate::storage::backends::s3::tests::{MemoryS3, etag_of, identity};
+use crate::storage::backends::s3::tests::{MemoryS3, content_md5, etag_of, identity};
 use crate::storage::{
     DeferredCheckpoint, FinalDestination, PrepareFact, ResumeMode, SourceDescriptor,
     StagedDestination,
@@ -25,39 +26,63 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const MIB: usize = 1024 * 1024;
 const PART: usize = 8 * MIB;
 const FINAL: &str = "dir/obj/";
+/// The real file beside the directory object: a multipart `dir/obj/` would land on it (`RustFS`).
+const FILE: &str = "dir/obj";
+const FILE_BODY: &[u8] = b"a real file";
+const FIVE_GIB: u64 = 5 * 1024 * 1024 * 1024;
 
-/// Where the pointer of `dir/obj/` belongs: in `dir/`, named after `obj/`.
+/// Where a leftover pointer of `dir/obj/` would be: in `dir/`, named after `obj/`.
 fn parent_pointer() -> String {
     format!("dir/{}", artifact_name("obj/", ArtifactKind::Upload))
+}
+
+/// A pointer of `dir/obj/` left where a writer from before D13 put it.
+async fn plant_pointer(protocol: &MemoryS3) -> TestResult {
+    let stale = Bytes::from_static(b"stale pointer");
+    protocol
+        .put_object(&parent_pointer(), stale.clone(), &content_md5(&stale))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(())
 }
 
 fn payload(size: usize) -> Bytes {
     Bytes::from((0..=250_u8).cycle().take(size).collect::<Vec<_>>())
 }
 
-fn prepare(size: usize) -> TestResult<PrepareRequest> {
+fn prepare(size: Option<u64>) -> TestResult<PrepareRequest> {
     Ok(PrepareRequest {
         final_destination: FinalDestination::new(StoragePath::new(FINAL)?),
         source: SourceDescriptor::new(
             StoragePath::new("src/obj/")?,
             EntryKind::File,
-            Some(size as u64),
+            size,
             SourceIdentity::new(identity(), IdentityStrength::PathScoped, b"source")?,
         ),
         recovery_binding: [7; 32],
     })
 }
 
-fn request(size: usize, resume: ResumeMode) -> TestResult<DestinationPrepareRequest> {
+fn request(size: Option<u64>, resume: ResumeMode) -> TestResult<DestinationPrepareRequest> {
     Ok(DestinationPrepareRequest::new(prepare(size)?, [4; 32])
         .with_resume(resume)
-        .with_recoverable(false))
+        .with_recoverable(resume == ResumeMode::Discover))
 }
 
-fn destination(protocol: &Arc<MemoryS3>) -> S3StagedDestination<MemoryS3> {
-    S3StagedDestination::new(protocol.clone(), identity())
+/// A `RustFS`-like store holding the real file `dir/obj`, and a destination whose limits are
+/// small (checkpoint interval 16 MiB, native single copy 5 MiB) so the sizes here exceed them.
+async fn store() -> (Arc<MemoryS3>, S3StagedDestination<MemoryS3>) {
+    let protocol = Arc::new(MemoryS3::default());
+    *protocol.rustfs_multipart_directory_objects.lock().await = true;
+    protocol
+        .objects
+        .lock()
+        .await
+        .insert(FILE.into(), Bytes::from_static(FILE_BODY));
+    let destination = S3StagedDestination::new(protocol.clone(), identity())
         .with_checkpoint_interval(2 * PART as u64)
-        .with_native_sizing(5 * MIB as u64, 5 * MIB as u64)
+        .with_native_sizing(5 * MIB as u64, 5 * MIB as u64);
+    (protocol, destination)
 }
 
 fn chunks(bytes: &[u8]) -> ByteStream {
@@ -68,21 +93,18 @@ fn chunks(bytes: &[u8]) -> ByteStream {
     Box::pin(stream::iter(pieces))
 }
 
-fn publication(bytes: &Bytes) -> PublishRequest {
-    PublishRequest {
-        expected_size: bytes.len() as u64,
-        expected_blake3: Some(*blake3::hash(bytes).as_bytes()),
-        cancel: CancellationToken::new(),
-    }
-}
-
 async fn publish(
     destination: &S3StagedDestination<MemoryS3>,
     stage: &PreparedStage,
     data: &Bytes,
 ) -> TestResult<PublicationEvidence> {
+    let request = PublishRequest {
+        expected_size: data.len() as u64,
+        expected_blake3: Some(*blake3::hash(data).as_bytes()),
+        cancel: CancellationToken::new(),
+    };
     Ok(destination
-        .publish(stage, publication(data))
+        .publish(stage, request)
         .await
         .map_err(|failure| format!("{:?}", failure.error))?)
 }
@@ -101,136 +123,82 @@ async fn stored(protocol: &MemoryS3) -> Vec<String> {
     keys
 }
 
-/// Up to the single-PUT threshold, content or none: one PUT of the key `dir/obj/`, no pointer.
-#[tokio::test]
-async fn a_directory_object_key_is_written_by_single_put() -> TestResult {
-    for size in [0, 5] {
-        let protocol = Arc::new(MemoryS3::default());
-        let destination = destination(&protocol);
-        let data = payload(size);
-        let stage = destination
-            .prepare_at_destination(request(size, ResumeMode::Discover)?)
-            .await?;
-        destination.write(&stage, chunks(&data)).await?;
-        publish(&destination, &stage, &data).await?;
-        assert_eq!(protocol.objects.lock().await.get(FINAL), Some(&data));
-        assert_eq!(stored(&protocol).await, [FINAL], "size {size}");
-        assert_eq!(*protocol.multipart_begins.lock().await, 0);
-    }
-    Ok(())
+/// `dir/obj/` holds `data`, the real file `dir/obj` is untouched, nothing else is stored, and no
+/// multipart request — upload, part or part copy — was ever made.
+async fn written_in_one_request(protocol: &MemoryS3, data: &Bytes, label: &str) {
+    let objects = protocol.objects.lock().await.clone();
+    assert_eq!(objects.get(FINAL), Some(data), "{label}");
+    assert_eq!(
+        objects.get(FILE).map(Bytes::as_ref),
+        Some(FILE_BODY),
+        "{label}"
+    );
+    assert_eq!(stored(protocol).await, [FILE, FINAL], "{label}");
+    let multipart = (
+        *protocol.multipart_begins.lock().await,
+        *protocol.part_uploads.lock().await,
+        *protocol.part_copies.lock().await,
+    );
+    assert_eq!(multipart, (0, 0, 0), "{label}");
 }
 
-/// Above it: an upload on `dir/obj/` whose pointer is written at once in `dir/`, named after
-/// `obj/`; nothing is written inside `obj/` and nothing under the file `dir/obj`'s artifact name.
-/// Publication completes the upload and removes the pointer.
+/// Streamed at the destination, empty, small or over the single-PUT threshold (and the
+/// checkpoint interval), resumable or not: one PUT at publication, no pointer, no recovery.
 #[tokio::test]
-async fn a_multipart_directory_object_keeps_its_pointer_in_the_parent() -> TestResult {
-    let protocol = Arc::new(MemoryS3::default());
-    let destination = destination(&protocol);
-    let data = payload(5 * PART);
-    let stage = destination
-        .prepare_at_destination(request(data.len(), ResumeMode::Discover)?)
-        .await?;
-    // In `dir/`, named after `obj/`: nothing inside `obj/`, not the file `dir/obj`'s name.
-    assert_eq!(stored(&protocol).await, [parent_pointer()]);
-    assert_eq!(
-        protocol
-            .list_uploads(FINAL)
-            .await
-            .map_err(|e| format!("{e:?}"))?
-            .len(),
-        1
-    );
-    destination.write(&stage, chunks(&data)).await?;
-    publish(&destination, &stage, &data).await?;
-    assert_eq!(protocol.objects.lock().await.get(FINAL), Some(&data));
-    assert_eq!(stored(&protocol).await, [FINAL]);
-    Ok(())
-}
-
-/// A writer cut before its first checkpoint leaves the upload and the parent pointer; the next
-/// prepare finds them from the final key alone and resumes.
-#[tokio::test]
-async fn a_directory_object_resumes_from_its_parent_pointer() -> TestResult {
-    let protocol = Arc::new(MemoryS3::default());
-    let destination = destination(&protocol);
-    let data = payload(7 * PART);
-    let mut stage = destination
-        .prepare_at_destination(request(data.len(), ResumeMode::Discover)?)
-        .await?;
-    stage.deferred_checkpoint = Some(DeferredCheckpoint {
-        interval_bytes: 6 * PART as u64,
-        source_size: data.len() as u64,
-    });
-    let cut: Vec<_> = data[..3 * PART]
-        .chunks(MIB)
-        .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
-        .chain(iter::once(Err(classified_entry(
-            &StoragePath::new("src/obj/")?,
-            Operation::Read,
-            FailureClass::Connectivity,
-            Transience::Transient,
-            "cut",
-        ))))
-        .collect();
-    assert!(
-        destination
-            .write(&stage, Box::pin(stream::iter(cut)))
-            .await
-            .is_err()
-    );
-    drop(stage);
-    assert_eq!(stored(&protocol).await, [parent_pointer()]);
-
-    let stage = destination
-        .prepare_at_destination(request(data.len(), ResumeMode::Discover)?)
-        .await?;
-    assert_eq!(
-        stage.prepare_fact(),
-        PrepareFact::Resumed {
-            bytes: 3 * PART as u64
+async fn a_directory_object_is_one_put_at_any_size() -> TestResult {
+    for size in [0, 5, 3 * PART] {
+        for resume in [ResumeMode::Discover, ResumeMode::Restart] {
+            let label = format!("{size} B {resume:?}");
+            let (protocol, destination) = store().await;
+            let data = payload(size);
+            let mut stage = destination
+                .prepare_at_destination(request(Some(size as u64), resume)?)
+                .await?;
+            assert!(!stage.recovery_enabled(), "{label}");
+            // As the engine arms it for a checkpointed source over the interval: nothing changes.
+            stage.deferred_checkpoint = Some(DeferredCheckpoint {
+                interval_bytes: 2 * PART as u64,
+                source_size: size as u64,
+            });
+            destination.write(&stage, chunks(&data)).await?;
+            assert_eq!(
+                stored(&protocol).await,
+                [FILE],
+                "{label}: nothing before publication"
+            );
+            publish(&destination, &stage, &data).await?;
+            written_in_one_request(&protocol, &data, &label).await;
+            assert_eq!(*protocol.puts.lock().await, 1, "{label}");
         }
-    );
-    destination.write(&stage, chunks(&data[3 * PART..])).await?;
-    publish(&destination, &stage, &data).await?;
-    assert_eq!(protocol.objects.lock().await.get(FINAL), Some(&data));
-    assert_eq!(stored(&protocol).await, [FINAL]);
-    Ok(())
-}
-
-/// `Direct` writes `dir/obj/` inside `write`: one PUT when small, an upload completed there when
-/// large; no pointer either way.
-#[tokio::test]
-async fn a_directory_object_is_written_directly() -> TestResult {
-    for size in [5, 3 * PART] {
-        let protocol = Arc::new(MemoryS3::default());
-        let destination = destination(&protocol);
-        let data = payload(size);
-        let stage = destination
-            .prepare_direct(prepare(size)?, CancellationToken::new())
-            .await?;
-        destination.write(&stage, chunks(&data)).await?;
-        // Written inside `write`, by one PUT or one completed upload, and no pointer.
-        assert_eq!(stored(&protocol).await, [FINAL], "size {size}");
-        assert_eq!(
-            *protocol.multipart_begins.lock().await,
-            u32::from(size as u64 > DEFAULT_SINGLE_PUT_THRESHOLD),
-            "size {size}"
-        );
-        publish(&destination, &stage, &data).await?;
-        assert_eq!(protocol.objects.lock().await.get(FINAL), Some(&data));
-        assert_eq!(stored(&protocol).await, [FINAL], "size {size}");
     }
     Ok(())
 }
 
-/// A native copy writes `dir/obj/` too: one `CopyObject` when small, an upload filled by
-/// `UploadPartCopy` with its pointer in the parent when large.
+/// `Direct` writes `dir/obj/` inside `write`, by one PUT whatever its size.
 #[tokio::test]
-async fn a_directory_object_is_copied_natively() -> TestResult {
+async fn a_directory_object_is_written_directly_by_one_put() -> TestResult {
+    for size in [5, 3 * PART] {
+        let label = format!("{size} B");
+        let (protocol, destination) = store().await;
+        let data = payload(size);
+        let stage = destination
+            .prepare_direct(prepare(Some(size as u64))?, CancellationToken::new())
+            .await?;
+        destination.write(&stage, chunks(&data)).await?;
+        written_in_one_request(&protocol, &data, &label).await;
+        publish(&destination, &stage, &data).await?;
+        written_in_one_request(&protocol, &data, &label).await;
+        assert_eq!(*protocol.puts.lock().await, 1, "{label}");
+    }
+    Ok(())
+}
+
+/// A native copy of `dir/obj/` is one `CopyObject`, also above the single-copy limit.
+#[tokio::test]
+async fn a_directory_object_is_copied_natively_by_one_copy_object() -> TestResult {
     for size in [3, 4 * 5 * MIB + 3] {
-        let protocol = Arc::new(MemoryS3::default());
-        let destination = destination(&protocol);
+        let label = format!("{size} B");
+        let (protocol, destination) = store().await;
         let bytes = payload(size);
         protocol
             .objects
@@ -245,22 +213,98 @@ async fn a_directory_object_is_copied_natively() -> TestResult {
             size: size as u64,
         };
         let stage = destination
-            .prepare_native_stage(request(size, ResumeMode::Discover)?)
+            .prepare_native_stage(request(Some(size as u64), ResumeMode::Discover)?)
             .await?;
-        let large = size > 5 * MIB;
-        let pointers = if large {
-            vec![parent_pointer()]
-        } else {
-            vec![]
-        };
-        assert_eq!(stored(&protocol).await, pointers, "size {size}");
+        assert_eq!(stored(&protocol).await, [FILE], "{label}: no pointer");
         destination
             .fill_native(&stage, source, CancellationToken::new(), 4)
             .await
             .map_err(|failure| format!("{:?}", failure.error))?;
         publish(&destination, &stage, &bytes).await?;
-        assert_eq!(protocol.objects.lock().await.get(FINAL), Some(&bytes));
-        assert_eq!(stored(&protocol).await, [FINAL], "size {size}");
+        written_in_one_request(&protocol, &bytes, &label).await;
+        assert_eq!(*protocol.native_copies.lock().await, 1, "{label}");
     }
+    Ok(())
+}
+
+/// More than 5 GiB, or of unknown size: every prepare refuses it as `Unsupported` before any I/O
+/// (a planted leftover pointer is still there). Exactly 5 GiB is one request.
+#[tokio::test]
+async fn a_directory_object_one_request_cannot_carry_is_refused_before_any_io() -> TestResult {
+    let (protocol, destination) = store().await;
+    assert_eq!(destination.directory_object_limit(), Some(FIVE_GIB));
+    plant_pointer(&protocol).await?;
+    let unsupported = |result: Result<PreparedStage, StorageRoleFailure>| {
+        matches!(
+            result,
+            Err(StorageRoleFailure::Entry(failure))
+                if failure.class() == FailureClass::Unsupported
+                    && failure.transience() == Transience::Permanent
+                    && failure.operation() == Operation::Prepare
+                    && failure.path().as_str() == FINAL
+        )
+    };
+    for size in [Some(FIVE_GIB + 1), None] {
+        for resume in [ResumeMode::Discover, ResumeMode::Restart] {
+            let prepared = destination
+                .prepare_at_destination(request(size, resume)?)
+                .await;
+            assert!(unsupported(prepared), "{size:?} {resume:?}");
+        }
+        let direct = destination
+            .prepare_direct(prepare(size)?, CancellationToken::new())
+            .await;
+        assert!(unsupported(direct), "direct {size:?}");
+        let native = destination
+            .prepare_native_stage(request(size, ResumeMode::Discover)?)
+            .await;
+        assert!(unsupported(native), "native {size:?}");
+    }
+    assert_eq!(
+        stored(&protocol).await,
+        [parent_pointer(), FILE.to_string()]
+    );
+    assert_eq!(*protocol.puts.lock().await, 1, "only the planted pointer");
+    let multipart = (
+        *protocol.multipart_begins.lock().await,
+        *protocol.part_uploads.lock().await,
+        *protocol.part_copies.lock().await,
+        *protocol.aborts.lock().await,
+    );
+    assert_eq!(multipart, (0, 0, 0, 0));
+    let direct = destination
+        .prepare_direct(prepare(Some(FIVE_GIB))?, CancellationToken::new())
+        .await?;
+    assert!(single::of(&direct).is_some());
+    Ok(())
+}
+
+/// A pointer and an upload left on `dir/obj/` by a writer from before D13 are cleaned up at
+/// prepare — the pointer where such a writer put it, in the parent — and the object is one PUT.
+#[tokio::test]
+async fn a_leftover_multipart_stage_of_a_directory_object_is_cleaned_up() -> TestResult {
+    let (protocol, destination) = store().await;
+    plant_pointer(&protocol).await?;
+    protocol
+        .begin_multipart(FINAL)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    *protocol.multipart_begins.lock().await = 0;
+    let data = payload(3 * PART);
+    let stage = destination
+        .prepare_at_destination(request(Some(data.len() as u64), ResumeMode::Discover)?)
+        .await?;
+    assert!(matches!(
+        stage.prepare_fact(),
+        PrepareFact::Restarted { .. }
+    ));
+    let uploads = protocol
+        .list_uploads(FINAL)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(uploads.is_empty(), "{uploads:?}");
+    destination.write(&stage, chunks(&data)).await?;
+    publish(&destination, &stage, &data).await?;
+    written_in_one_request(&protocol, &data, "after a leftover").await;
     Ok(())
 }

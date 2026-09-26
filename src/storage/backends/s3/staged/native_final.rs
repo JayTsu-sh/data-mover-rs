@@ -2,7 +2,8 @@
 //!
 //! - A source of at most 64 MiB is one `CopyObject` to the final key at publication — a single
 //!   stage ([`single`](super::single)) that records the source instead of buffering bytes.
-//!   Before it, only the pointer is looked at (as for a single `PutObject`).
+//!   Before it, only the pointer is looked at (as for a single `PutObject`). A directory object
+//!   is always one `CopyObject`, up to 5 GiB (P7 D13, [`directory_object`]).
 //! - A larger source is a multipart upload on the final key ([`FinalUpload`]) filled with
 //!   `UploadPartCopy`, parts of `max(64 MiB, ceil(size / 10 000))`, up to six copied at once,
 //!   and completed at publication exactly as a streamed upload is. It is prepared through the same
@@ -33,7 +34,7 @@ use super::native::{NativeFillFailure, native_role_failure};
 use super::parts::UploadedParts;
 use super::single::{self, SingleStage, changed, same_etag, unchanged};
 use super::upload_pointer::pointer_path;
-use super::{S3StagedDestination, part_size_at_least};
+use super::{S3StagedDestination, directory_object, part_size_at_least};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{
     DestinationPrepareRequest, PreparedStage, PublicationFailure, StorageRoleFailure,
@@ -121,14 +122,16 @@ pub(super) fn part_ranges(
 }
 
 impl<P: S3Protocol + 'static> S3StagedDestination<P> {
-    /// Prepares a native copy at the destination: one `CopyObject` up to the single-copy limit
-    /// (after cleaning up a leftover pointer), otherwise an upload on the final key found by, or
-    /// begun after, discovery.
+    /// Prepares a native copy at the destination: one `CopyObject` up to the single-copy limit —
+    /// and for a directory object one request carries (P7 D13) — after cleaning up a leftover
+    /// pointer, otherwise an upload on the final key found by, or begun after, discovery.
     pub(in crate::storage::backends::s3) async fn prepare_native_stage(
         &self,
         request: DestinationPrepareRequest,
     ) -> Result<PreparedStage, StorageRoleFailure> {
         let path = request.prepare.final_destination.path().clone();
+        let one_request =
+            directory_object::single_request_size(&path, request.prepare.source.size)?.is_some();
         let pointer = pointer_path(&path)?;
         let size = request.prepare.source.size.ok_or_else(|| {
             refused(
@@ -137,7 +140,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                 "a native S3 copy needs the source's size",
             )
         })?;
-        if size <= self.native.single_max {
+        if one_request || size <= self.native.single_max {
             let fact = self.clear_leftover(&request, &pointer).await?;
             let mut stage = self.prepare_single(request.prepare, size);
             stage.mark_at_destination(fact);

@@ -19,7 +19,23 @@ use aws_sdk_s3::types::ObjectVersion;
 use tracing::warn;
 
 use super::version_listing::VersionOrDeleteMarker;
-use crate::{ErrorEvent, StorageEntryMessage};
+use crate::{ErrorEvent, Result, StorageEntryMessage, error::StorageError};
+
+/// Refuses a multipart upload (streamed or `UploadPartCopy`) to `key` ending in '/', before
+/// anything is sent: a directory object is written only by one request (P7 D13). `MinIO` refuses
+/// such an upload (400 `XMinioInvalidObjectName`); `RustFS` 1.0.0 stores a completed one under the
+/// key without its '/', over a real file there. The legacy walks never list such a key; this
+/// guards the legacy writers a caller hands one to: beginning an upload, taking an open one over
+/// (the resumable path), and completing one (whoever began it).
+pub(super) fn refuse_multipart(key: &str) -> Result<()> {
+    if key.ends_with('/') {
+        return Err(StorageError::UnsupportedType(format!(
+            "S3 multipart upload to {key}: a directory object (a key ending in '/') is written \
+             only by one request"
+        )));
+    }
+    Ok(())
+}
 
 /// A listed size in bytes; a missing or negative one counts as zero.
 pub(super) fn listed_bytes(size: Option<i64>) -> u64 {

@@ -137,6 +137,8 @@ mod copy_request;
 #[cfg(test)]
 mod credential_log_tests;
 mod delete_objects_md5;
+#[cfg(test)]
+mod directory_object_write_tests;
 mod directory_objects;
 mod dxn;
 mod multipart_rename;
@@ -2818,6 +2820,7 @@ impl S3Storage {
         tags: Option<&Vec<Tag>>,
         mtime: Option<i64>,
     ) -> Result<String> {
+        directory_objects::refuse_multipart(key)?;
         debug!("Creating multipart upload for key: {}", key);
 
         let client = self.client.clone();
@@ -2933,6 +2936,8 @@ impl S3Storage {
         upload_id: &str,
         parts: &[CompletedPart], // (part_number, etag) 的元组列表
     ) -> Result<usize> {
+        // The request that stores the object: never on a directory object, whoever began it.
+        directory_objects::refuse_multipart(key)?;
         debug!(
             "Completing multipart upload for key: {}, upload_id: {}",
             key, upload_id
@@ -3010,6 +3015,8 @@ impl S3Storage {
         mtime: Option<i64>,
     ) -> Result<(String, Vec<(u64, u64)>)> {
         let key = self.build_full_key(relative_path);
+        // Before looking for an upload to take over: a directory object is never one.
+        directory_objects::refuse_multipart(&key)?;
         if let Some(upload_id) = self.find_inprogress_upload(&key).await? {
             if let Some(committed) = self
                 .committed_intervals_from_parts(&key, &upload_id, size, part_size)

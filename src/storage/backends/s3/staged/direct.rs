@@ -1,13 +1,13 @@
 //! `Direct` writes to S3 (ADR-0006 C14c): the object appears at its final key inside `write`.
 //!
-//! A source of known size up to the single-PUT threshold T is buffered and sent as one
-//! `PutObject` at the end of `write`. Anything larger, or of unknown size, is a multipart upload
-//! on the final key that `write` begins, fills (every part with `Content-MD5`) and completes —
-//! checking the composite `ETag` when one can be computed — and aborts on any failure, so a failed
-//! `Direct` write leaves no upload behind. The upload is begun inside `write`, not at prepare: a
-//! transfer that fails before writing leaves nothing either. Publication has nothing left to do,
-//! verification reads the final object back pinned to what the write created, and discard never
-//! deletes the final key.
+//! A source of known size up to the single-PUT threshold T — or a directory object up to 5 GiB (P7
+//! D13) — is buffered and sent as one `PutObject` at the end of `write`. Anything larger, or of
+//! unknown size, is a multipart upload on the final key that `write` begins, fills (every part
+//! with `Content-MD5`) and completes — checking the composite `ETag` when one can be computed —
+//! and aborts on any failure, so a failed `Direct` write leaves no upload behind. The upload is
+//! begun inside `write`, not at prepare: a transfer that fails before writing leaves nothing
+//! either. Publication has nothing left to do, verification reads the final object back pinned to
+//! what the write created, and discard never deletes the final key.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -74,8 +74,9 @@ fn not_written(path: &StoragePath, operation: Operation) -> StorageRoleFailure {
 }
 
 impl<P: S3Protocol + 'static> S3StagedDestination<P> {
-    /// A `Direct` stage: a single stage for a known size up to T, otherwise a multipart one whose
-    /// upload `write` begins. Neither keeps recovery state.
+    /// A `Direct` stage: a single stage for a known size up to T, and for a directory object one
+    /// request carries (P7 D13), otherwise a multipart one whose upload `write` begins. Neither
+    /// keeps recovery state.
     pub(super) fn prepare_direct_stage(
         &self,
         request: PrepareRequest,
@@ -96,11 +97,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
                 "a Direct write cannot replace its own S3 source",
             ));
         }
-        let size = request
-            .source
-            .size
-            .filter(|size| self.is_single_put(Some(*size)));
-        let mut stage = if let Some(size) = size {
+        let mut stage = if let Some(size) = self.single_put_size(path, request.source.size)? {
             self.prepare_single(request, size)
         } else {
             let part_size = planned_part_size(request.source.size, path)?;

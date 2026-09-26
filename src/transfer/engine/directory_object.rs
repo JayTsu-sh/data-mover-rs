@@ -12,12 +12,17 @@
 //!   destination that holds no directory objects, or a source path ending in `/` on a source that
 //!   holds none, is refused at `Preflight` with `Unsupported` at that path, before any I/O
 //!   ([`refuse_unholdable`]).
+//! - A destination that writes a directory object only in one request (S3: one `PutObject` or
+//!   `CopyObject`, P7 D13) declares how much that request carries
+//!   ([`StagedDestination::directory_object_limit`]); once the source is described, a larger one
+//!   — or one of unknown size — is refused the same way, before any destination I/O, with no
+//!   fallback ([`refuse_oversized`]).
 
 use crate::model::{
     EntryOperationFailure, EntryVersion, FailureClass, ObservedEntry, Operation, StoragePath,
     Transience,
 };
-use crate::storage::{NamespaceCapabilities, Storage, StorageRoleFailure};
+use crate::storage::{NamespaceCapabilities, StagedDestination, Storage, StorageRoleFailure};
 
 use super::{TransferFailure, TransferPhase, TransferSide};
 
@@ -82,6 +87,30 @@ pub(super) fn refuse_unholdable(
     Err(unsupported_at_preflight(path, side, operation, diagnostic))
 }
 
+/// P7 D13: a directory object bound for a destination that writes one only in a single request
+/// is refused when that request cannot carry it — more than
+/// [`StagedDestination::directory_object_limit`] bytes, or of unknown `size` — as the
+/// destination's `Unsupported` at `Preflight`, before any destination I/O. No fallback.
+pub(super) fn refuse_oversized(
+    path: &StoragePath,
+    size: Option<u64>,
+    destination: &dyn StagedDestination,
+) -> Result<(), TransferFailure> {
+    let Some(limit) = destination.directory_object_limit() else {
+        return Ok(());
+    };
+    if !path.names_directory_object() || size.is_some_and(|size| size <= limit) {
+        return Ok(());
+    }
+    Err(unsupported_at_preflight(
+        path,
+        TransferSide::Destination,
+        Operation::Prepare,
+        "the destination writes a directory object (a key ending in '/') only in one request, \
+         which needs its size up front and cannot carry this one",
+    ))
+}
+
 fn unsupported_at_preflight(
     path: &StoragePath,
     side: TransferSide,
@@ -102,7 +131,7 @@ fn unsupported_at_preflight(
         ),
         Err(_) => TransferFailure::orchestration(
             TransferPhase::Preflight,
-            "a path ending in '/' names no file on this storage",
+            "a path ending in '/' is refused on this storage",
         ),
     }
 }

@@ -20,7 +20,7 @@ use super::super::{
     S3NativeCopySource, S3ObjectFacts, S3Protocol, S3ProtocolFailure, S3WriteFacts,
     is_real_version_id,
 };
-use super::{PART_SIZE, S3StagedDestination, native_final};
+use super::{PART_SIZE, S3StagedDestination, directory_object, native_final};
 use crate::model::{FailureClass, ObjectTag, Operation, StoragePath, Transience};
 use crate::storage::{
     ByteStream, MetadataMutation, PrepareRequest, PreparedStage, PublicationDisposition,
@@ -169,9 +169,21 @@ pub(super) fn of(stage: &PreparedStage) -> Option<&SingleStage> {
 }
 
 impl<P: S3Protocol> S3StagedDestination<P> {
-    /// Whether a source of `size` bytes goes as one `PutObject`.
-    pub(super) fn is_single_put(&self, size: Option<u64>) -> bool {
-        matches!((size, self.single_put_threshold), (Some(size), Some(limit)) if size <= limit)
+    /// The size of a source that goes as one `PutObject`, `None` for a multipart upload: a
+    /// directory object always (P7 D13; its `Unsupported` when one request cannot carry it), any
+    /// other key up to the single-PUT threshold. No I/O.
+    pub(super) fn single_put_size(
+        &self,
+        path: &StoragePath,
+        size: Option<u64>,
+    ) -> Result<Option<u64>, StorageRoleFailure> {
+        if let Some(size) = directory_object::single_request_size(path, size)? {
+            return Ok(Some(size));
+        }
+        Ok(match (size, self.single_put_threshold) {
+            (Some(size), Some(limit)) if size <= limit => Some(size),
+            _ => None,
+        })
     }
 
     /// A fresh single stage: nothing is sent until publication, and nothing can be resumed.
