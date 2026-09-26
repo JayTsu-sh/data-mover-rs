@@ -27,7 +27,6 @@ use std::sync::{Mutex, PoisonError};
 
 use super::*;
 use crate::model::BackendSessionFailure;
-use crate::traversal::TraversalOrder;
 
 /// More listings than any tree here has directories, and few enough that a fault which re-lists
 /// one directory forever stops within a test's patience rather than the harness's.
@@ -158,19 +157,16 @@ async fn spelled(
     let namespace = Arc::new(SpellingNamespace::new(listings));
     let role = Arc::clone(&namespace) as Arc<dyn Namespace>;
     let source = StorageTraversalSource::with_roles(role, Arc::new(FakeMetadata));
-    let mut session = source.traverse(TraversalRequest {
-        root: path(root),
-        order: TraversalOrder::Admission,
-        max_inflight_operations: NonZeroUsize::new(4)
-            .unwrap_or_else(|| unreachable!("constant is nonzero")),
-        max_buffered_items: NonZeroUsize::new(4)
-            .unwrap_or_else(|| unreachable!("constant is nonzero")),
-        observation_plan: ObservationPlan::default(),
-        cancel: tokio_util::sync::CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    });
+    let mut session = source.traverse(
+        TraversalRequest::new(path(root))
+            .max_inflight_operations(
+                NonZeroUsize::new(4).unwrap_or_else(|| unreachable!("constant is nonzero")),
+            )
+            .max_buffered_items(
+                NonZeroUsize::new(4).unwrap_or_else(|| unreachable!("constant is nonzero")),
+            )
+            .cancel(tokio_util::sync::CancellationToken::new()),
+    );
     let mut items = Vec::new();
     while let Some(item) = session.next_item().await {
         items.push(item);

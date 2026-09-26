@@ -48,19 +48,15 @@ impl Namespace for ReversedNamespace {
 }
 
 fn ordered_request(order: TraversalOrder) -> TraversalRequest {
-    TraversalRequest {
-        root: StoragePath::root(),
-        order,
-        max_inflight_operations: NonZeroUsize::new(2)
-            .unwrap_or_else(|| unreachable!("constant is nonzero")),
-        max_buffered_items: NonZeroUsize::new(1)
-            .unwrap_or_else(|| unreachable!("constant is nonzero")),
-        observation_plan: ObservationPlan::default(),
-        cancel: tokio_util::sync::CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    }
+    TraversalRequest::new(StoragePath::root())
+        .order(order)
+        .max_inflight_operations(
+            NonZeroUsize::new(2).unwrap_or_else(|| unreachable!("constant is nonzero")),
+        )
+        .max_buffered_items(
+            NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("constant is nonzero")),
+        )
+        .cancel(tokio_util::sync::CancellationToken::new())
 }
 
 async fn reversed_tree(order: TraversalOrder) -> (Vec<String>, TraversalOutcome) {

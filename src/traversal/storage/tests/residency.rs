@@ -126,19 +126,17 @@ impl TraversalFilter for KeepAll {
 }
 
 fn probed_request(root: &str, window: usize) -> TraversalRequest {
-    TraversalRequest {
-        root: path(root),
-        order: crate::traversal::TraversalOrder::Admission,
-        max_inflight_operations: NonZeroUsize::new(window)
-            .unwrap_or_else(|| unreachable!("callers pass a nonzero window")),
-        max_buffered_items: NonZeroUsize::new(window)
-            .unwrap_or_else(|| unreachable!("callers pass a nonzero window")),
-        observation_plan: ObservationPlan::default(),
-        cancel: tokio_util::sync::CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    }
+    TraversalRequest::new(path(root))
+        .order(crate::traversal::TraversalOrder::Admission)
+        .max_inflight_operations(
+            NonZeroUsize::new(window)
+                .unwrap_or_else(|| unreachable!("callers pass a nonzero window")),
+        )
+        .max_buffered_items(
+            NonZeroUsize::new(window)
+                .unwrap_or_else(|| unreachable!("callers pass a nonzero window")),
+        )
+        .cancel(tokio_util::sync::CancellationToken::new())
 }
 
 /// Runs to completion and returns the per-field high-water marks.

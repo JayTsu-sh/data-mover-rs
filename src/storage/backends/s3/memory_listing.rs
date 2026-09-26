@@ -21,8 +21,8 @@ use tokio::time::sleep;
 use super::MemoryS3;
 use crate::model::{StorageTimestamp, TimePrecision};
 use crate::storage::backends::s3::{
-    S3ListedObject, S3ListedVersion, S3ObjectPage, S3ProtocolFailure, S3Result, S3VersionFacts,
-    S3VersionMarker, S3VersionPage,
+    S3ListedObject, S3ListedVersion, S3ObjectPage, S3ProtocolFailure, S3RejectedEntry, S3Result,
+    S3VersionFacts, S3VersionMarker, S3VersionPage,
 };
 
 const MINIO_SUFFIX: &str = "[minio_cache:v2,return:]";
@@ -55,6 +55,14 @@ pub(crate) struct ListingKnobs {
     pub(crate) page_delay: Option<Duration>,
     /// Listing this prefix fails with this failure.
     pub(crate) failure: Option<(String, S3ProtocolFailure)>,
+    /// The next this many page requests, of any prefix, fail with this failure (a throttling
+    /// service answers 503 `SlowDown` for a while).
+    pub(crate) throttled: Option<(usize, S3ProtocolFailure)>,
+    /// Elements the first page of this prefix could not decode.
+    pub(crate) rejected: Vec<(String, S3RejectedEntry)>,
+    /// Objects the first page of this prefix lists besides its own, keyed as given (a server
+    /// that ignores the prefix lists keys outside it).
+    pub(crate) stray: Vec<(String, S3ListedObject)>,
     /// The prefix of every listing page requested.
     pub(crate) calls: Vec<String>,
 }
@@ -101,6 +109,12 @@ impl MemoryS3 {
         if let Some((failed, failure)) = &knobs.failure
             && failed == prefix
         {
+            return Err(failure.clone());
+        }
+        if let Some((remaining, failure)) = knobs.throttled.as_mut()
+            && *remaining > 0
+        {
+            *remaining -= 1;
             return Err(failure.clone());
         }
         Ok(if knobs.page_size == 0 {
@@ -269,6 +283,13 @@ impl MemoryS3 {
                 Element::Version(_) => {}
             }
         }
+        if token.is_none() {
+            let mut knobs = self.listing();
+            listed
+                .rejected
+                .extend(injected(&mut knobs.rejected, prefix));
+            listed.objects.extend(injected(&mut knobs.stray, prefix));
+        }
         Ok(listed)
     }
 
@@ -328,8 +349,22 @@ impl MemoryS3 {
                 Element::Object(_) => {}
             }
         }
+        if marker.is_none() {
+            listed
+                .rejected
+                .extend(injected(&mut self.listing().rejected, prefix));
+        }
         Ok(listed)
     }
+}
+
+/// Takes the injected elements of `prefix`'s first page.
+fn injected<T>(knob: &mut Vec<(String, T)>, prefix: &str) -> Vec<T> {
+    let (served, kept): (Vec<_>, Vec<_>) = std::mem::take(knob)
+        .into_iter()
+        .partition(|(of, _)| of == prefix);
+    *knob = kept;
+    served.into_iter().map(|(_, element)| element).collect()
 }
 
 /// The marker after `last`, spelled as `MinIO` spells it when `minio`.

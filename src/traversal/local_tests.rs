@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     FailureScope, ListingOutcome, StorageTraversalSource, TraversalCompletion, TraversalItem,
-    TraversalOrder, TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
+    TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
     TraversalTerminalFailure, TraversalVersions,
 };
 #[cfg(unix)]
@@ -43,19 +43,14 @@ fn fixture(root: &Path) -> io::Result<Fixture> {
 }
 
 fn request(cancel: CancellationToken, inflight: usize, buffered: usize) -> TraversalRequest {
-    TraversalRequest {
-        root: StoragePath::root(),
-        order: TraversalOrder::Admission,
-        max_inflight_operations: NonZeroUsize::new(inflight)
-            .unwrap_or_else(|| unreachable!("test limit is nonzero")),
-        max_buffered_items: NonZeroUsize::new(buffered)
-            .unwrap_or_else(|| unreachable!("test limit is nonzero")),
-        observation_plan: ObservationPlan::default(),
-        cancel,
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    }
+    TraversalRequest::new(StoragePath::root())
+        .max_inflight_operations(
+            NonZeroUsize::new(inflight).unwrap_or_else(|| unreachable!("test limit is nonzero")),
+        )
+        .max_buffered_items(
+            NonZeroUsize::new(buffered).unwrap_or_else(|| unreachable!("test limit is nonzero")),
+        )
+        .cancel(cancel)
 }
 
 async fn drain(session: &mut TraversalSession) -> Vec<TraversalItem> {
@@ -415,12 +410,23 @@ async fn non_utf8_entry_failures_keep_distinct_lossless_identities() -> io::Resu
     assert_eq!(completion.totals.failed_children, 2);
     assert_eq!(completion.totals.listed, 2);
     assert_eq!(failures.len(), 2);
-    assert_ne!(failures[0].path(), failures[1].path());
+    // Both are failures at the listed directory (P7 C3: no stand-in path), told apart by their
+    // raw names in the diagnostic and by their identities.
     assert!(
         failures
             .iter()
-            .all(|error| error.path().as_str().starts_with("@local-unix-hex:"))
+            .all(|error| error.path().as_str().is_empty())
     );
+    let mut raw: Vec<bool> = ["\\xff", "\\xfe"]
+        .iter()
+        .map(|name| {
+            failures
+                .iter()
+                .any(|error| error.diagnostic().contains(name))
+        })
+        .collect();
+    raw.dedup();
+    assert_eq!(raw, [true]);
     let identities = failures
         .iter()
         .filter_map(|error| error.identity())
@@ -557,5 +563,127 @@ async fn an_ownership_plan_costs_no_observation_per_entry() -> io::Result<()> {
     }
     let (started, _) = fixture.adapter.probe_orders();
     assert!(started.is_empty(), "observed through the role: {started:?}");
+    Ok(())
+}
+
+/// Removes `name` (a file or a link, relative to `root`) when a hook reaches it.
+fn remove_when(
+    root: &Path,
+    name: &'static str,
+) -> crate::storage::backends::local::namespace::Hook {
+    let root = root.to_path_buf();
+    Arc::new(move |native: &Path| {
+        if native == Path::new(name) {
+            let _ = std::fs::remove_file(root.join(native));
+        }
+    })
+}
+
+/// A real filesystem race, made deterministic by the namespace's test seams: one file deleted
+/// between `readdir` and its `lstat`, and one symlink deleted before its target is read. Both
+/// were listed and are gone: counted as vanished, not failed, and nothing is emitted for them
+/// (P7 §8, Q12). Fault injection: report the `lstat`'s `NotFound` as a child failure, or settle
+/// the link's `NotFound` as one, and `vanished` / `failed_children` go red.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_child_deleted_between_listing_and_observation_is_vanished() -> io::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("kept"), b"1")?;
+    std::fs::write(root.path().join("raced"), b"2")?;
+    std::os::unix::fs::symlink("kept", root.path().join("link"))?;
+    let fixture = fixture(root.path())?;
+    fixture
+        .namespace
+        .before_describe(remove_when(root.path(), "raced"));
+    fixture
+        .namespace
+        .before_read_link(remove_when(root.path(), "link"));
+    let mut session = fixture
+        .source
+        .traverse(request(CancellationToken::new(), 2, 4));
+    let items = drain(&mut session).await;
+    let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
+    assert_eq!(entry_paths(&items), ["kept"]);
+    assert!(
+        !items
+            .iter()
+            .any(|item| matches!(item, TraversalItem::Failure(_))),
+        "a vanished child is no failure"
+    );
+    let totals = completion.totals;
+    assert_eq!(
+        (
+            totals.listed,
+            totals.emitted,
+            totals.vanished,
+            totals.failed_children
+        ),
+        (3, 1, 2, 0)
+    );
+    assert!(totals.is_balanced());
+    assert!(!root.path().join("raced").exists() && !root.path().join("link").exists());
+    Ok(())
+}
+
+/// A subdirectory removed after its parent listed it and before its own listing: its listing is
+/// complete and empty, no failure, counted in `vanished_listings`. The root itself missing is a
+/// listing failure.
+#[tokio::test]
+async fn a_subdirectory_removed_before_its_listing_is_a_vanished_listing() -> io::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::create_dir(root.path().join("doomed"))?;
+    std::fs::write(root.path().join("doomed/inner"), b"1")?;
+    let fixture = fixture(root.path())?;
+    let doomed = root.path().join("doomed");
+    // `doomed` was listed and emitted as the root's child; it is removed, with its contents, just
+    // before its own listing opens it.
+    fixture
+        .namespace
+        .before_list(Arc::new(move |native: &Path| {
+            if native == Path::new("doomed") {
+                let _ = std::fs::remove_dir_all(&doomed);
+            }
+        }));
+    let mut session = fixture
+        .source
+        .traverse(request(CancellationToken::new(), 1, 4));
+    let items = drain(&mut session).await;
+    let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
+    assert_eq!(entry_paths(&items), ["doomed"]);
+    assert!(
+        !items
+            .iter()
+            .any(|item| matches!(item, TraversalItem::Failure(_)))
+    );
+    let doomed_listed = items.iter().find_map(|item| match item {
+        TraversalItem::DirectoryListed(listed) if listed.path.as_str() == "doomed" => {
+            Some((listed.outcome, listed.counts.listed))
+        }
+        _ => None,
+    });
+    assert_eq!(doomed_listed, Some((ListingOutcome::Complete, 0)));
+    let totals = completion.totals;
+    assert_eq!(
+        (
+            totals.listing_failures,
+            totals.vanished_listings,
+            totals.emitted
+        ),
+        (0, 1, 1)
+    );
+    assert!(totals.is_balanced());
+
+    let missing = TraversalRequest::new(StoragePath::new("absent").map_err(io::Error::other)?)
+        .max_inflight_operations(NonZeroUsize::MIN);
+    let mut session = fixture.source.traverse(missing);
+    let items = drain(&mut session).await;
+    let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
+    assert_eq!(completion.totals.listing_failures, 1);
+    assert!(items.iter().any(|item| matches!(
+        item,
+        TraversalItem::Failure(failure)
+            if failure.scope == FailureScope::Listing
+                && failure.failure.class() == FailureClass::NotFound
+    )));
     Ok(())
 }

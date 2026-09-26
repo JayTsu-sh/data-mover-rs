@@ -40,6 +40,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{InlineOwnership, ListingFacts, SourceDescriptor, StorageRoleFailure};
+pub use failure::{ChildFailure, is_vanished};
 pub use names::child_path;
 pub(crate) use names::respelled;
 use names::{child_name, is_segment};
@@ -90,7 +91,8 @@ impl ListRequest {
 pub struct ListingPage {
     /// Children this page describes.
     pub children: Vec<ListedChild>,
-    /// Children the listing returned but could not describe; each concerns that child alone.
+    /// Children the listing returned but could not describe; each concerns that child alone. One
+    /// whose class is `NotFound` vanished before it could be described ([`ChildFailure`]).
     pub failures: Vec<ChildFailure>,
     /// Transfer artifacts (`.data-mover-*`) this page hid. They are not children.
     pub internal_hidden: u32,
@@ -213,6 +215,11 @@ impl ListingPage {
         (descriptors, failures)
     }
 
+    /// Adds a child `self` could not describe.
+    pub fn push_failure(&mut self, failure: ChildFailure) {
+        self.failures.push(failure);
+    }
+
     /// Appends `page` to this one.
     fn absorb(&mut self, page: Self) {
         if self.children.is_empty() {
@@ -323,31 +330,6 @@ impl ListedChild {
             inline_ownership: self.inline_ownership,
             version: self.version,
             listing: self.listing,
-        }
-    }
-}
-
-/// A child the listing returned but could not describe.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChildFailure {
-    /// The child's name, when it could be spelled.
-    pub name: Option<String>,
-    /// The name's raw bytes, when it could not be spelled. No backend fills it yet (P7 C3); a
-    /// Local name that is not UTF-8 is carried by the failure's stand-in path instead.
-    pub raw_name: Option<Bytes>,
-    /// What went wrong, at the child's path — or at the directory's, when the child has none.
-    pub failure: EntryOperationFailure,
-}
-
-impl ChildFailure {
-    /// The failure of a child of `directory`, named when its path is one name below `directory`.
-    #[must_use]
-    pub fn from_failure(directory: &StoragePath, failure: EntryOperationFailure) -> Self {
-        let named = respelled(directory, failure.path().clone());
-        Self {
-            name: child_name(directory, &named).map(str::to_owned),
-            raw_name: None,
-            failure,
         }
     }
 }
@@ -743,6 +725,7 @@ fn listing_failure(
     .unwrap_or_else(|_| unreachable!("the static listing diagnostic is valid"))
 }
 
+mod failure;
 mod names;
 #[cfg(test)]
 pub(crate) mod testing;

@@ -70,8 +70,12 @@ pub(crate) fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
         nfs_rs::NfsError::Io(_) | nfs_rs::NfsError::Rpc(_) => {
             (FailureClass::Connectivity, Transience::Unknown)
         }
-        nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_DELAY) => {
-            (FailureClass::Protocol, Transience::Transient)
+        // The server asks the client to come back later: throttling, not a protocol fault
+        // (P7 §8). nfs-rs and the role listing back off on `NFS4ERR_DELAY` before this surfaces;
+        // `NFS3ERR_JUKEBOX` is not retried by either yet, so it surfaces at once.
+        nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_DELAY)
+        | nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_JUKEBOX) => {
+            (FailureClass::Throttled, Transience::Transient)
         }
         _ => (FailureClass::Protocol, Transience::Unknown),
     };
@@ -114,6 +118,17 @@ mod tests {
                 nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_ACCESS),
                 FailureClass::PermissionDenied,
                 Transience::Permanent,
+            ),
+            // A busy server is throttling, not a protocol fault (P7 §8).
+            (
+                nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_DELAY),
+                FailureClass::Throttled,
+                Transience::Transient,
+            ),
+            (
+                nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_JUKEBOX),
+                FailureClass::Throttled,
+                Transience::Transient,
             ),
             // A refused chown: the metadata role's SETATTR reaches this arm unwrapped.
             (

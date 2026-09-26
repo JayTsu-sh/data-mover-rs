@@ -30,9 +30,10 @@ use super::residency::Residency;
 use super::{
     Deferred, DescendOutcome, DirectoryWork, ListingTask, Runtime, Shared, State, admit,
     awaits_slot, descend_outcome, entry_candidate, entry_name, immediate_decision, queue_block_end,
-    queue_failure,
+    queue_failure, throttling_scoped_to,
 };
-use crate::model::{EntryKind, EntryOperationFailure, StoragePath};
+use crate::model::{EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath};
+use crate::storage::listing::is_vanished;
 use crate::storage::{
     CollectLimits, ListRequest, SourceDescriptor, StorageRoleFailure, collect_listing,
 };
@@ -93,6 +94,8 @@ pub(super) struct Prepared {
     hidden: u64,
     /// Children the listing returned, described or not.
     listed: u64,
+    /// Children the listing returned that were gone when it described them.
+    vanished: u64,
     /// Transfer artifacts the listing hid.
     internal_hidden: u64,
 }
@@ -124,6 +127,27 @@ struct Frame {
 }
 
 impl Frame {
+    /// Takes an arrived listing as this frame's block: its undescribed children are queued as
+    /// child failures first, and what no output slot records goes into the block's facts.
+    fn take_block(
+        &mut self,
+        prepared: Prepared,
+        state: &mut State,
+    ) -> Result<(), TraversalTerminalFailure> {
+        for failure in prepared.failures {
+            queue_failure(state, ScanFailure::child(failure))?;
+        }
+        self.facts.listed = prepared.listed;
+        self.facts.vanished = prepared.vanished;
+        self.facts.internal_hidden = prepared.internal_hidden;
+        self.facts.pruned = prepared.pruned;
+        self.facts.truncated = prepared.truncated;
+        self.facts.filtered = prepared.hidden;
+        self.slots = prepared.slots;
+        self.children = Some(prepared.children);
+        Ok(())
+    }
+
     fn new(work: DirectoryWork) -> Self {
         Self {
             work,
@@ -331,6 +355,7 @@ impl Cursor {
     /// Takes the top frame's arrived listing as its block, using an empty block when the
     /// directory could not be listed. Returns `false` while the listing is still outstanding.
     fn take_top_listing(&mut self, state: &mut State) -> Result<bool, TraversalTerminalFailure> {
+        let below_root = self.stack.len() > 1;
         let Some(frame) = self.stack.last_mut() else {
             return Ok(true);
         };
@@ -343,17 +368,14 @@ impl Cursor {
         };
         self.listings.remove(&frame.work.path);
         match arrived {
-            Ok(prepared) => {
-                for failure in prepared.failures {
-                    queue_failure(state, ScanFailure::child(failure))?;
-                }
-                frame.facts.listed = prepared.listed;
-                frame.facts.internal_hidden = prepared.internal_hidden;
-                frame.facts.pruned = prepared.pruned;
-                frame.facts.truncated = prepared.truncated;
-                frame.facts.filtered = prepared.hidden;
-                frame.slots = prepared.slots;
-                frame.children = Some(prepared.children);
+            Ok(prepared) => frame.take_block(prepared, state)?,
+            // A subdirectory gone since its parent listed it: nothing exists below it, which is
+            // a complete, empty listing and no failure (Q12). The traversal root is never one:
+            // a root that does not exist is a listing failure, so a mistyped root cannot read as
+            // an empty source.
+            Err(failure) if failure.class() == FailureClass::NotFound && below_root => {
+                frame.facts.vanished_listing = true;
+                frame.children = Some(VecDeque::new());
             }
             Err(failure) => {
                 // A directory that could not be listed still closes like any other: its listing
@@ -482,15 +504,22 @@ fn prepare(shared: &Shared, work: &DirectoryWork, result: Collected) -> Arrival 
         internal_hidden,
     } = match result {
         Ok(listing) => listing,
-        Err(StorageRoleFailure::Entry(error)) => return Ok(Err(error)),
-        Err(StorageRoleFailure::Session(error)) => {
-            return Err(TraversalTerminalFailure::Session(error));
+        Err(failure) => {
+            return match throttling_scoped_to(&work.path, Operation::Traverse, failure) {
+                StorageRoleFailure::Entry(error) => Ok(Err(error)),
+                StorageRoleFailure::Session(error) => Err(TraversalTerminalFailure::Session(error)),
+            };
         }
     };
     let listed = u64::try_from(entries.len().saturating_add(failures.len())).unwrap_or(u64::MAX);
+    // A child gone before the listing could describe it is counted, not reported (Q12).
+    let (vanished, failures): (Vec<_>, Vec<_>) = failures
+        .into_iter()
+        .partition(|failure| is_vanished(&work.path, failure));
     let mut prepared = Prepared {
         failures,
         listed,
+        vanished: u64::try_from(vanished.len()).unwrap_or(u64::MAX),
         internal_hidden,
         children: VecDeque::with_capacity(entries.len()),
         slots: VecDeque::new(),

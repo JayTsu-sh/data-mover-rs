@@ -102,3 +102,31 @@ fn tags_round_trip_without_debug_value_disclosure() {
 
     assert_eq!(decode(&mut Cursor::new(&bytes)), Ok(metadata));
 }
+
+/// Every failure class has its own snapshot tag and decodes back to itself; `Throttled` (P7 C3)
+/// took the next free tag, so snapshots written before it still decode unchanged.
+#[test]
+fn every_failure_class_round_trips_through_its_snapshot_tag() {
+    use crate::model::FailureClass;
+    let classes = [
+        FailureClass::Connectivity,
+        FailureClass::Authentication,
+        FailureClass::PermissionDenied,
+        FailureClass::NotFound,
+        FailureClass::InvalidInput,
+        FailureClass::Unsupported,
+        FailureClass::Conflict,
+        FailureClass::Capacity,
+        FailureClass::Corruption,
+        FailureClass::Protocol,
+        FailureClass::Cancelled,
+        FailureClass::Internal,
+        FailureClass::Throttled,
+    ];
+    for (tag, class) in classes.into_iter().enumerate() {
+        let tag = u8::try_from(tag).unwrap_or(u8::MAX);
+        assert_eq!(super::failure_tag(class), tag, "{class:?}");
+        assert_eq!(super::failure_from_tag(tag), Some(class));
+    }
+    assert_eq!(super::failure_from_tag(13), None);
+}

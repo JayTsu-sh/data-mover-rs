@@ -3,9 +3,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use bytes::Bytes;
-use data_mover::model::{
-    EntryOperationFailure, FailureClass, ObservationPlan, Operation, StoragePath, Transience,
-};
+use data_mover::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
 use data_mover::storage::{
     ByteStream, DestinationPrepareRequest, FinalDestination, PreflightPolicy, PrepareFact,
     PrepareRequest, PreparedStage, PublishRequest, ResumeMode, SourceDescriptor, StagedDestination,
@@ -13,8 +11,7 @@ use data_mover::storage::{
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
-    StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest, TraversalSource as _,
-    TraversalVersions,
+    StorageTraversalSource, TraversalItem, TraversalRequest, TraversalSource as _,
 };
 use data_mover::{
     DataChunk, HDFSStorage, HdfsConfig, HdfsKerberosCredentials, HdfsLocation, TransferConcurrency,
@@ -63,17 +60,12 @@ async fn create_file(storage: &HDFSStorage, path: &str, data: Bytes) -> TestResu
 
 async fn observes_nested_source(storage: &Storage) -> TestResult<bool> {
     let traversal = StorageTraversalSource::new(storage)?;
-    let mut session = traversal.traverse(TraversalRequest {
-        root: StoragePath::root(),
-        order: TraversalOrder::Admission,
-        max_inflight_operations: NonZeroUsize::new(2).ok_or("invalid inflight")?,
-        max_buffered_items: NonZeroUsize::new(2).ok_or("invalid buffer")?,
-        observation_plan: ObservationPlan::default(),
-        cancel: CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    });
+    let mut session = traversal.traverse(
+        TraversalRequest::new(StoragePath::root())
+            .max_inflight_operations(NonZeroUsize::new(2).ok_or("invalid inflight")?)
+            .max_buffered_items(NonZeroUsize::new(2).ok_or("invalid buffer")?)
+            .cancel(CancellationToken::new()),
+    );
     let mut observed = false;
     while let Some(item) = session.next_item().await {
         if let TraversalItem::Entry(entry) = item {

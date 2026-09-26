@@ -17,8 +17,9 @@ use crate::storage::{BackendCapabilities, CapabilityAvailability, Namespace, Sto
 
 pub(crate) use protocol::{
     S3ListedObject, S3ListedVersion, S3NativeCopyEvidence, S3NativeCopySource, S3ObjectFacts,
-    S3ObjectPage, S3PartFacts, S3Protocol, S3ProtocolFailure, S3Result, S3VersionFacts,
-    S3VersionMarker, S3VersionPage, S3WriteFacts, composite_etag, is_real_version_id,
+    S3ObjectPage, S3PartFacts, S3Protocol, S3ProtocolFailure, S3RejectedEntry, S3Result,
+    S3VersionFacts, S3VersionMarker, S3VersionPage, S3WriteFacts, composite_etag,
+    is_real_version_id,
 };
 
 pub(crate) use history::{KeyHistory, ListedFacts, key_histories, warn_inferred};

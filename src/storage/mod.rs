@@ -16,6 +16,7 @@ pub mod listing;
 mod native;
 pub(crate) mod pointer;
 mod roles;
+pub(crate) mod throttle;
 
 pub(crate) use native::{
     NativeAffinity, NativeEndpoint, NativePair, NativeSourceBinding, NativeStageEvidence,

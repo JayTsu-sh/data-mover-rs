@@ -93,7 +93,26 @@ CIFS file id、Local dev+inode 放得下；更长的 NFS 句柄与 S3 路径 + E
 计数 (`src/traversal/counts.rs`)：每块 `BlockCounts`，全场 `ScanTotals` (在 `TraversalCompletion.totals`，
 只有 `Completed` 才有)。不变式 `listed == emitted + filtered + failed_children + vanished` (每块与全场都成立，
 `is_balanced()`)；`internal_hidden` (`.data-mover-*`) 不在 `listed` 里；pruned / truncated 与之正交；
-`vanished` 的分类在 C3，今天恒为 0。`files + directories + symlinks + other == emitted`，`bytes` 只加文件。
+`files + directories + symlinks + other == emitted`，`bytes` 只加文件。
+
+**错误模型 (P7 C3，§8)**。三层：子项失败 (`Failure{scope: Child}`，流继续)、列举失败 (`Failure{scope: Listing}`，
+该目录不完整、兄弟继续)、会话终止 (`TraversalTerminalFailure::Session`，现为 `non_exhaustive`)。两种**不是失败**：
+- **消失** (`NotFound`，Q12)：列举返回了、描述或观察时已不存在的子项 (Local `readdir` 后 `lstat`、观察时的
+  元数据 / `read_link`；列举里是 `ChildFailure` 且 class 为 `NotFound`，`ChildFailure::is_vanished`) 计入
+  `vanished`，不发任何项、不进 `failed_children`；deferred 的目录消失了就不下钻。观察时的 `NotFound` 要先
+  `stat` 确认子项本身不在了才算消失 (子读取可能是别的东西 NotFound，如 xattr 在列举与读取之间被删)；子项还在
+  则是该子项的 `Conflict` / Transient 失败。父目录列出后、自己的列举开始前已不存在的**子目录**：块 `Complete`
+  且为空、`DirectoryListed.vanished = true`、不是列举失败，计入 `ScanTotals.vanished_listings` (它已作为父块的
+  子项计过——emitted，或列举时就定了下钻、观察时才发现消失——不再进子项方程)。**遍历根不存在仍是列举失败**。
+  判定“消失的子项”只用一个谓词 `listing::is_vanished`：class `NotFound` 且路径不是目录本身。
+- **节流** (`FailureClass::Throttled` / Transient，Q11)：S3 429 / 503 / `SlowDown` 等、NFS `DELAY` / `JUKEBOX`。
+  S3 列举在生产者内按页退避重试 (`src/storage/throttle.rs`，单个列举累计约 2 分钟、抖动、随取消停止)，预算耗尽
+  才是**该列举**的失败；遍历把任何 `Throttled` 会话失败收窄为那个列举 / 那个子项的失败
+  (`throttling_scoped_to`)，节流永远不结束遍历。
+拼不出路径的子项 (非 UTF-8、库有损解码出 U+FFFD、S3 键越出前缀) 是**无名**子项失败：路径是目录，
+`ChildFailure.raw_name` 与诊断里带原始字节，`EntryFailureIdentity` 由目录 + 原始名派生；不再用
+`@local-unix-hex:` 之类的替身路径。`TraversalRequest` 为 `non_exhaustive`，用 `TraversalRequest::new(root)`
+加 setter 构造。
 
 marker **占准入窗口**的名额，不绕过它，所以不会让 `admitted()` 越界。
 (唯一的例外是既有的 `queue_failure`：`take_top_listing` 为列举自带的 N 个不可描述子项、以及
@@ -105,7 +124,7 @@ marker **占准入窗口**的名额，不绕过它，所以不会让 `admitted()
 所以在 `DirectoryListed` 处整个块 (含 deferred 决定) 已落定，计数是精确的；全场总数是各块之和。
 账目分两条路进来：立即决定隐藏的子项**根本不分配槽位** (给它分配会让一个排除百万文件的 filter
 反过来被准入窗口节流)，与 `listed` / `internal_hidden` 一起记在 `BlockFacts`；deferred 决定随
-`Settled::Child`(`None` = 被过滤) 与 `.descent` 走。两条路的 `max_depth` 与 filter 判定顺序统一为
+`Settled::Child` (`ChildItem::Filtered` / `ChildItem::Vanished`) 与 `.descent` 走。两条路的 `max_depth` 与 filter 判定顺序统一为
 先判深度，否则同一个目录会因 filter 是否 deferred 而一会儿报 Pruned 一会儿报 Truncated。
 两条路计数相同由 `storage/tests/counts.rs` 钉住。
 

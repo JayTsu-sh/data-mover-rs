@@ -27,8 +27,10 @@ pub struct BlockCounts {
     pub filtered: u64,
     /// Children delivered as a [`super::FailureScope::Child`] failure instead of an entry.
     pub failed_children: u64,
-    /// Children that disappeared between the listing and their observation. Not yet classified
-    /// (P7 C3): such a child is still a failed child today.
+    /// Children that were gone by the time they were described or observed: the listing
+    /// returned them, and describing or observing them found nothing (`NotFound`). Not failures
+    /// and no item is emitted for them (P7 §8, Q12): the entry no longer exists, which is what a
+    /// listing taken a moment later would say too.
     pub vanished: u64,
     /// Transfer artifacts (`.data-mover-*`) the listing hid. Not children.
     pub internal_hidden: u64,
@@ -101,8 +103,8 @@ impl BlockCounts {
 
 /// What a whole traversal counted. Carried by [`super::TraversalCompletion`].
 ///
-/// The child counts are the sums of every [`BlockCounts`]; `listing_failures` and
-/// `interrupted_listings` count directories.
+/// The child counts are the sums of every [`BlockCounts`]; `listing_failures`,
+/// `interrupted_listings` and `vanished_listings` count directories.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ScanTotals {
@@ -124,6 +126,13 @@ pub struct ScanTotals {
     /// Those of `listing_failures` that stopped after delivering some children
     /// ([`super::ListingOutcome::Interrupted`]).
     pub interrupted_listings: u64,
+    /// Subdirectories that were gone by the time their own listing began (`NotFound`; never the
+    /// traversal root, whose absence is a listing failure). Each was already accounted for as its
+    /// parent's child — emitted, or vanished when its own observation found it gone after the
+    /// listing had already decided to descend — so it is not counted again in the child equation;
+    /// its listing closes [`super::ListingOutcome::Complete`] and empty, with
+    /// [`super::DirectoryListed::vanished`] set, and is no listing failure (P7 §8, Q12).
+    pub vanished_listings: u64,
     /// See [`BlockCounts::pruned_dirs`].
     pub pruned_dirs: u64,
     /// See [`BlockCounts::truncated_dirs`].
@@ -149,6 +158,7 @@ impl ScanTotals {
             internal_hidden: 0,
             listing_failures: 0,
             interrupted_listings: 0,
+            vanished_listings: 0,
             pruned_dirs: 0,
             truncated_dirs: 0,
             bytes: 0,

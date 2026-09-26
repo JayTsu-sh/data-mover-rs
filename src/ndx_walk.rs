@@ -56,6 +56,7 @@ use crate::model::{
     BackendKind, EntryKind, FailureClass, MetadataObservation, MetadataObservations,
     MetadataProvenance, ObservedEntry, StoragePath,
 };
+use crate::storage::listing::is_vanished;
 use crate::storage::{
     Capability, CapabilityUnavailable, CollectLimits, ListRequest, Namespace, PreflightPolicy,
     SourceDescriptor, Storage, StorageRoleFailure, collect_listing,
@@ -215,10 +216,12 @@ async fn read_dir(
         Err(failure) => return listing_failure(dir_path, &failure, cancel),
     };
     let mut result = build_read_result(root, dir_path, &descriptors, ctx);
-    // A child the backend could not describe is reported without hiding its siblings.
+    // A child the backend could not describe is reported without hiding its siblings; one that
+    // vanished before it could be described no longer exists and is simply not listed.
     result.errors.extend(
         failures
             .iter()
+            .filter(|failure| !is_vanished(&target, failure))
             .map(|failure| format!("failed to describe an entry of '{dir_path}': {failure}")),
     );
     Ok(result)

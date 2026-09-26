@@ -88,6 +88,8 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | **按 versionId 的** DeleteObject 被 Object Lock 拒绝：AWS 403 `AccessDenied`，MinIO 400 `InvalidRequest`（"Object is WORM protected"，RELEASE.2023-03-20 实测），或 `ObjectLocked`（ADR-0006 C17，`role_protocol/versions.rs`） | 条目 `PermissionDenied` / Permanent —— 只关乎这个版本；删指针版本时降级为告警 + 删除标记（`upload_pointer::delete`），不算传输失败 |
 | **不带** versionId 的 DeleteObject 也被 Object Lock 拒绝（Ceph RGW / DXN：当前版本有 legal hold 时 403 `AccessDenied`，2026-09-25 实测；AWS / MinIO 加删除标记） | 条目 `PermissionDenied` / Permanent（映射不变）；删指针时（先按版本被拒之后）降级为告警、指针留在原处（`upload_pointer::Removal::Held`），不算传输失败 |
 | Complete 之后删自己的指针失败（任何类别） | 映射不变；`publish_final_upload` 只告警、照常报已发布（对象已提交，重试会多一个版本；遗留指针下次 prepare 清） |
+| 节流：429、503，或错误码 `SlowDown` / `ServiceUnavailable` / `Throttling*` / `TooManyRequests*` / `RequestLimitExceeded` / `RequestThrottled*` / `BandwidthLimitExceeded`（不论状态码；P7 C3） | 会话 **`Throttled`** / Transient（此前是 `Connectivity`）。范围保持会话级，传输侧行为不变（引擎不按类别分支；`definite_refusal` 不含它，仍走 reconcile）。**列举**在生产者内按页退避（`src/storage/throttle.rs`：首个约 125–250 ms、翻倍、单次 ≤15 s、单个列举累计 ≤约 2 分钟，带抖动，取消即停），预算耗尽才是**该列举**的条目 `Throttled` / Transient（目录 `Unreadable`）；遍历把任何 `Throttled` 会话失败收窄为那个列举 / 那个子项的失败，**节流不结束遍历**（P7 评审现存问题 1） |
+| 其余 5xx（500 / 502 / 504 …） | 会话 `Connectivity` / Transient（不变） |
 | DXN 重试一个仍在完成中的 Complete：500 `InternalError`（"This multipart completion is already in progress"） | 通用 5xx：会话 `Connectivity` / Transient —— 不是提交前的拒绝，`settle_completion` 查 `ListParts` |
 | DXN 完成后的 `ListParts`：404 `NoSuchKey`（MinIO 回 `NoSuchUpload`） | 条目 `NotFound` / Permanent（同上第一行）—— 与 `NoSuchUpload` 一样进入按版本结算（C17） |
 | 按 versionId 删除一个不存在的版本 | 成功（S3 / MinIO 回 204），不是错误 |
@@ -131,7 +133,7 @@ nfs-rs 错误产出 `FailureClass` + `Transience`，并记下服务端状态名�
 | `Io` PermissionDenied / NotFound | `PermissionDenied` / `NotFound` | Permanent |
 | `Io` ConnectionReset / TimedOut / WouldBlock | `Connectivity` | Transient |
 | 其他 `Io` / `Rpc` | `Connectivity` | Unknown |
-| `NFS4ERR_DELAY` | `Protocol` | Transient |
+| `NFS4ERR_DELAY` / `NFS3ERR_JUKEBOX`（服务端忙。`NFS4ERR_DELAY` 由 nfs-rs 与列举的 `list_role_entries` 先退避；`NFS3ERR_JUKEBOX` 两者都还不重试，立即浮出——待补） | **`Throttled`** | Transient |
 | 其他服务端状态（如 `NFS4ERR_BADOWNER`、`NFS4ERR_STALE`） | `Protocol` | Unknown |
 
 `Connectivity` 经 `role_failure` 升为会话失败（metadata 阶段报 `SessionLost`，后面的族不再应用）；
@@ -184,21 +186,38 @@ smb-rs 的 Display 只含 NTSTATUS / 传输原因 / UNC 路径，不含凭据。
 | `PermissionDenied` | `PermissionDenied(...)` |
 | 其他 | `IoError(...)` |
 
-### 列举：整个目录失败 vs 单个子项失败（role-based `Namespace` 的 `List`）
+### 列举：整个目录失败 vs 单个子项失败（role-based `Namespace` 的 `List`，P7 §8）
 
 契约：只有**关乎目录本身**的错误让整个列举失败；某个子项描述不出来时报成该子项的条目失败，兄弟照常交付，
 backend 把它放进 `ListingPage::failures`（`ChildFailure`），遍历把它报成 `Failure{scope: Child}`，计入块的 `counts.failed_children`，
 目录的 `outcome` 仍是 `Complete`（P7 C2）；整个列举失败才是 `Failure{scope: Listing}` + `outcome: Unreadable`。
-Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修复。S3 对拼不出的名字（空段、`.` / `..`）
-同样逐项报，但单个对象的 size 缺失 / 为负、key 越出前缀仍是**会话**失败（`src/s3/role_protocol/listing.rs`、
-`src/storage/backends/s3/listing.rs` 的 `place`），属同类问题，待修。
+Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修复；S3 的 size 缺失 / 为负、键越出前缀于 P7 C3 修复
+（此前是**会话**失败）。
+
+**不是失败的两种**（P7 C3）：
+- **消失**：列举的子项失败 class 为 `NotFound` 且路径不是目录本身（唯一谓词 `listing::is_vanished`；
+  `ChildFailure::vanished` 构造）= 列举返回了、描述时已不存在（Local `readdir` 后 `lstat` 得 ENOENT）。遍历计入
+  `vanished`、不发项。观察时（元数据角色、`read_link`）的 `NotFound` 先 `stat` 确认子项本身不在才算消失，子项还在则
+  是 `Conflict` / Transient 的子项失败（xattr 在列举与读取之间被删之类不能让活文件“消失”）。父列出后自己列举时
+  `NotFound` 的子目录是空的 `Complete` 块（`DirectoryListed.vanished`）+ `vanished_listings`。**遍历根** `NotFound`
+  仍是列举失败。`delete_tree` / `ndx_walk` 把消失的子项当作已不存在（不报、不标记目录不完整）。
+- **节流**：见上面 S3 表的节流行；超预算只是该列举的失败。
+
+**无名子项**：名字拼不出路径的子项，`ChildFailure { name: None, raw_name: Some(原始字节) }`，失败的路径是**目录**，
+诊断是原因 + `raw name "<转义字节>"`，`EntryFailureIdentity` 由后端 + 目录 + 原始名派生（`ChildFailure::unnamed`）。
+消费方规则：这样的失败让该目录已知的直接子项都不参与删除（`ScanFailure` 文档）。
 
 | 情况 | 范围 | FailureClass / Transience |
 |---|---|---|
-| 目录打不开 / 读不了、READDIRPLUS 流出错、HDFS `list_status` 失败、目录不存在 | 整个列举（报在目录上，块 `Failed`；`Connectivity` 照常升会话） | 按上面各 backend 的映射 |
+| 目录打不开 / 读不了、READDIRPLUS 流出错、HDFS `list_status` 失败、遍历根不存在 | 整个列举（报在目录上，块 `Unreadable`；`Connectivity` 照常升会话） | 按上面各 backend 的映射 |
+| 列举返回的子项在描述 / 观察时已不存在 | 不是失败：`vanished` | `NotFound`（只用于分类） |
+| Local 名字不是 UTF-8 / 拼出的路径超长 | 无名子项（`raw_name` = Unix 原始字节，Windows UTF-16LE） | `Unsupported` / Permanent |
+| NFS / CIFS 名字含 U+FFFD（nfs-rs、smb-rs 有损解码，原名已丢，按它拼出的路径指不到原条目；真含 U+FFFD 的名字无法区分，一并报） | 无名子项（NFS 无原始字节；CIFS `raw_name` = 解码后的 UTF-8） | `Unsupported` / Permanent |
 | NFS READDIRPLUS 某项没带属性（v3 `post_op_attr` 可省；v4 属性解不出也是这样）或没带文件句柄 | 子项（报在子项路径；名字拼不出 `StoragePath` 时报在目录上） | `Protocol` / Unknown |
 | CIFS 子项的身份字节超出模型上限（造不出 `SourceIdentity`） | 子项 | `Protocol` / Permanent |
 | HDFS 子项的 status 转换不了（时间超出 `i64` 纳秒等）、路径拼不出 `StoragePath` | 子项；不是本目录直接子项的（越出根、嵌套）或拼不出的报在目录路径上 | `Protocol` / Permanent |
+| S3 对象 size 缺失 / 为负（`role_protocol/listing.rs` 逐项解码为 `S3RejectedEntry`） | 子项（报在对象路径）；版本列举里这个 key 的全部版本都不列 | `Protocol` / Permanent |
+| S3 键 / 公共前缀越出存储根，或越出所列目录（服务端无视 prefix） | 无名子项（`raw_name` = 服务端给的键） | `Protocol` / Permanent |
 
 ## 改 error 时
 

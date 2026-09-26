@@ -8,7 +8,7 @@ use futures::StreamExt as _;
 use futures::stream;
 
 use super::metadata::CifsInlineMetadata;
-use super::namespace::{CifsNamespace, CifsNamespaceProtocol};
+use super::namespace::{CifsListedChild, CifsNamespace, CifsNamespaceProtocol};
 use super::source::{
     CifsReadCursor, CifsReadSource, CifsSourceFacts, CifsSourceProtocol, descriptor_from_facts,
     file_handle_bytes,
@@ -115,12 +115,9 @@ impl CifsNamespaceProtocol for MemoryCifs {
         Ok(())
     }
 
-    async fn list(
-        &self,
-        path: &StoragePath,
-    ) -> smb_domain::Result<Vec<(StoragePath, CifsInlineMetadata)>> {
+    async fn list(&self, path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>> {
         let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        Ok(vec![
+        let listed = vec![
             (
                 StoragePath::new(format!("{}/child.bin", path.as_str()))
                     .map_err(|_| smb_domain::Error::InvalidArgument("invalid path".into()))?,
@@ -157,7 +154,8 @@ impl CifsNamespaceProtocol for MemoryCifs {
                     reparse_point: false,
                 },
             ),
-        ])
+        ];
+        Ok(listed.into_iter().map(Ok).collect())
     }
 }
 

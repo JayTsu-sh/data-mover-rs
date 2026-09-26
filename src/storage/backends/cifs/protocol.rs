@@ -6,7 +6,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::{StreamExt as _, TryStreamExt as _};
 
 use super::metadata::{CifsInlineMetadata, CifsMetadataProtocol};
-use super::namespace::CifsNamespaceProtocol;
+use super::namespace::{CifsListedChild, CifsNamespaceProtocol, CifsUnspelled};
 use super::source::{CifsReadCursor, CifsSourceFacts, CifsSourceProtocol};
 use super::staged::{CifsStageFile, CifsStagedProtocol};
 use crate::model::{EntryKind, StoragePath};
@@ -227,10 +227,7 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
         close
     }
 
-    async fn list(
-        &self,
-        path: &StoragePath,
-    ) -> smb_domain::Result<Vec<(StoragePath, CifsInlineMetadata)>> {
+    async fn list(&self, path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>> {
         let share_path = self.share_path(path)?;
         let directory = self
             .share
@@ -243,11 +240,11 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
         let close = close_directory(directory).await;
         let entries = entries?;
         close?;
-        entries
+        Ok(entries
             .into_iter()
             .filter(|entry| !matches!(entry.name(), "." | ".."))
             .map(|entry| {
-                let child = child_path(path, entry.name())?;
+                let child = CifsUnspelled::spell(path, entry.name())?;
                 // Reparse points stay `File`: the facade cannot read link targets, and
                 // `Symlink` would route traversal into an unsupported `ReadLink`.
                 let kind = if entry.is_directory() {
@@ -278,7 +275,7 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
                     },
                 ))
             })
-            .collect()
+            .collect::<Vec<_>>())
     }
 }
 

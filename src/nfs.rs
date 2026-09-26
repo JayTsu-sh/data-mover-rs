@@ -31,7 +31,7 @@ use crate::storage::backends::nfs::common::{
 };
 use crate::storage::backends::nfs::namespace::{
     NfsListedChild, NfsNamespaceObservation, NfsNamespaceProtocol, NfsUndescribedChild,
-    inline_ownership, undescribed_child,
+    inline_ownership, lossily_decoded, undescribed_child, unnamed_child,
 };
 use crate::storage::backends::nfs::source::{
     NfsProtocolFailure, NfsReadCursor, NfsSourceObservation, NfsSourceProtocol,
@@ -621,6 +621,11 @@ fn role_observation(
     entry: &EntryEnum,
 ) -> std::result::Result<NfsNamespaceObservation, NfsUndescribedChild> {
     let child = entry.get_relative_path();
+    if let Some(name) = child.file_name().map(|name| name.to_string_lossy())
+        && lossily_decoded(&name)
+    {
+        return Err(unnamed_child(directory, &name));
+    }
     // An empty handle is what `post_op_fh3::FALSE` (v3) or a v4 entry whose attributes lack
     // `FATTR4_FILEHANDLE` leaves: no identity can be built from it.
     let file_handle = entry

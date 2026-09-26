@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use data_mover::dir_tree::NdxEvent;
-use data_mover::model::{EntryKind, ObservationPlan, StoragePath};
+use data_mover::model::{EntryKind, StoragePath};
 use data_mover::ndx_walk::{NdxWalkRequest, ndx_walk};
 use data_mover::storage::{
     BackendConfig, DeleteTreeCompletion, DeleteTreeOutcome, DeleteTreeRequest, LocalBackendConfig,
@@ -14,7 +14,7 @@ use data_mover::storage::{
 };
 use data_mover::traversal::{
     ListingOutcome, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome,
-    TraversalRequest, TraversalSource, TraversalVersions,
+    TraversalRequest, TraversalSource,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -76,17 +76,12 @@ async fn traversal_lists_the_whole_tree_through_the_namespace_role() -> Result {
     seed(temp.path())?;
     let storage = connect(temp.path()).await?;
     let source = StorageTraversalSource::new(&storage)?;
-    let mut session = source.traverse(TraversalRequest {
-        root: path("tree")?,
-        order: TraversalOrder::Admission,
-        max_inflight_operations: nonzero(4)?,
-        max_buffered_items: nonzero(4)?,
-        observation_plan: ObservationPlan::default(),
-        cancel: CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    });
+    let mut session = source.traverse(
+        TraversalRequest::new(path("tree")?)
+            .max_inflight_operations(nonzero(4)?)
+            .max_buffered_items(nonzero(4)?)
+            .cancel(CancellationToken::new()),
+    );
     let mut paths = Vec::new();
     while let Some(item) = session.next_item().await {
         match item {
@@ -227,17 +222,12 @@ async fn directories_are_listed_as_directories_not_files() -> Result {
     std::fs::create_dir(temp.path().join("only"))?;
     let storage = connect(temp.path()).await?;
     let source = StorageTraversalSource::new(&storage)?;
-    let mut session = source.traverse(TraversalRequest {
-        root: StoragePath::root(),
-        order: TraversalOrder::Admission,
-        max_inflight_operations: nonzero(1)?,
-        max_buffered_items: nonzero(1)?,
-        observation_plan: ObservationPlan::default(),
-        cancel: CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    });
+    let mut session = source.traverse(
+        TraversalRequest::new(StoragePath::root())
+            .max_inflight_operations(nonzero(1)?)
+            .max_buffered_items(nonzero(1)?)
+            .cancel(CancellationToken::new()),
+    );
     let Some(TraversalItem::Entry(entry)) = session.next_item().await else {
         return Err("expected one entry".into());
     };
@@ -264,17 +254,13 @@ async fn name_bytes_order_is_the_same_sequence_for_a_caller_outside_the_crate() 
     seed_for_ordering(temp.path())?;
     let storage = connect(temp.path()).await?;
     let source = StorageTraversalSource::new(&storage)?;
-    let mut session = source.traverse(TraversalRequest {
-        root: path("ordered")?,
-        order: TraversalOrder::NameBytes,
-        max_inflight_operations: nonzero(4)?,
-        max_buffered_items: nonzero(4)?,
-        observation_plan: ObservationPlan::default(),
-        cancel: CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    });
+    let mut session = source.traverse(
+        TraversalRequest::new(path("ordered")?)
+            .order(TraversalOrder::NameBytes)
+            .max_inflight_operations(nonzero(4)?)
+            .max_buffered_items(nonzero(4)?)
+            .cancel(CancellationToken::new()),
+    );
     let mut paths = Vec::new();
     let mut listed = Vec::new();
     while let Some(item) = session.next_item().await {

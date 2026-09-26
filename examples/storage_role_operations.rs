@@ -354,16 +354,17 @@ fn traversal_request(args: &Args, command: &Command) -> Result<TraversalRequest,
     let filter =
         DslTraversalFilter::parse(match_expression.as_deref(), exclude_expression.as_deref())?;
     let slots = NonZeroUsize::new(args.concurrency).ok_or("concurrency must be non-zero")?;
-    Ok(TraversalRequest {
-        root: StoragePath::new(path.clone())?,
-        order: TraversalOrder::from(*order),
-        max_inflight_operations: slots,
-        max_buffered_items: slots,
-        observation_plan: plan,
-        cancel: CancellationToken::new(),
-        filter: (!filter.is_empty()).then(|| Arc::new(filter) as Arc<_>),
-        max_depth: max_depth.and_then(NonZeroUsize::new),
-        versions: TraversalVersions::from(*versions),
+    let request = TraversalRequest::new(StoragePath::new(path.clone())?)
+        .order(TraversalOrder::from(*order))
+        .max_inflight_operations(slots)
+        .max_buffered_items(slots)
+        .observation_plan(plan)
+        .max_depth(max_depth.and_then(NonZeroUsize::new))
+        .versions(TraversalVersions::from(*versions));
+    Ok(if filter.is_empty() {
+        request
+    } else {
+        request.filter(Arc::new(filter))
     })
 }
 
@@ -393,8 +394,8 @@ fn block_counts(counts: &BlockCounts) -> String {
 fn totals(totals: &ScanTotals) -> String {
     format!(
         "totals balanced={} listed={} emitted={} filtered={} failed={} vanished={} hidden={} \
-         listing_failures={} interrupted={} pruned={} truncated={} bytes={} files={} dirs={} \
-         symlinks={} other={}",
+         listing_failures={} interrupted={} vanished_listings={} pruned={} truncated={} bytes={} \
+         files={} dirs={} symlinks={} other={}",
         totals.is_balanced(),
         totals.listed,
         totals.emitted,
@@ -404,6 +405,7 @@ fn totals(totals: &ScanTotals) -> String {
         totals.internal_hidden,
         totals.listing_failures,
         totals.interrupted_listings,
+        totals.vanished_listings,
         totals.pruned_dirs,
         totals.truncated_dirs,
         totals.bytes,

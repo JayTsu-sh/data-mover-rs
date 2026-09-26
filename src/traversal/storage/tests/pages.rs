@@ -157,18 +157,21 @@ impl TraversalFilter for ByTime {
 }
 
 fn mixed_request(order: TraversalOrder, window: usize, filtered: bool) -> TraversalRequest {
-    TraversalRequest {
-        root: StoragePath::root(),
-        order,
-        max_inflight_operations: NonZeroUsize::new(window)
-            .unwrap_or_else(|| unreachable!("callers pass a nonzero window")),
-        max_buffered_items: NonZeroUsize::new(2)
-            .unwrap_or_else(|| unreachable!("constant is nonzero")),
-        observation_plan: ObservationPlan::default().with_timestamps(ObservationMode::Required),
-        cancel: tokio_util::sync::CancellationToken::new(),
-        filter: filtered.then(|| Arc::new(ByTime) as Arc<dyn TraversalFilter>),
-        max_depth: None,
-        versions: TraversalVersions::Current,
+    let request = TraversalRequest::new(StoragePath::root())
+        .order(order)
+        .max_inflight_operations(
+            NonZeroUsize::new(window)
+                .unwrap_or_else(|| unreachable!("callers pass a nonzero window")),
+        )
+        .max_buffered_items(
+            NonZeroUsize::new(2).unwrap_or_else(|| unreachable!("constant is nonzero")),
+        )
+        .observation_plan(ObservationPlan::default().with_timestamps(ObservationMode::Required))
+        .cancel(tokio_util::sync::CancellationToken::new());
+    if filtered {
+        request.filter(Arc::new(ByTime))
+    } else {
+        request
     }
 }
 

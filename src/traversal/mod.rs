@@ -153,8 +153,23 @@ pub trait TraversalFilter: fmt::Debug + Send + Sync {
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision;
 }
 
-/// A bounded traversal request.
+/// A bounded traversal request, built with [`TraversalRequest::new`] and its setters:
+///
+/// ```
+/// # use std::num::NonZeroUsize;
+/// # use data_mover::model::StoragePath;
+/// # use data_mover::traversal::{TraversalOrder, TraversalRequest};
+/// let request = TraversalRequest::new(StoragePath::root())
+///     .order(TraversalOrder::NameBytes)
+///     .max_depth(NonZeroUsize::new(3))
+///     .max_inflight_operations(NonZeroUsize::MIN.saturating_add(63));
+/// assert_eq!(request.max_inflight_operations.get(), 64);
+/// ```
+///
+/// The fields stay readable; new ones arrive with defaults, so a request is never spelled as a
+/// struct literal outside this crate (`non_exhaustive`).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct TraversalRequest {
     pub root: StoragePath,
     pub order: TraversalOrder,
@@ -246,7 +261,87 @@ mod relative_tests {
     }
 }
 
+/// Operations in flight when the caller does not choose.
+const DEFAULT_MAX_INFLIGHT: NonZeroUsize = NonZeroUsize::MIN.saturating_add(63);
+/// Items buffered ahead of the consumer when the caller does not choose.
+const DEFAULT_MAX_BUFFERED: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1023);
+
 impl TraversalRequest {
+    /// A traversal of `root` with every other setting at its default: [`TraversalOrder`]'s
+    /// default order, 64 operations in flight, 1024 items buffered, the default observation plan,
+    /// a fresh cancellation token, no filter, no depth limit, current objects only.
+    #[must_use]
+    pub fn new(root: StoragePath) -> Self {
+        Self {
+            root,
+            order: TraversalOrder::default(),
+            max_inflight_operations: DEFAULT_MAX_INFLIGHT,
+            max_buffered_items: DEFAULT_MAX_BUFFERED,
+            observation_plan: ObservationPlan::default(),
+            cancel: CancellationToken::new(),
+            filter: None,
+            max_depth: None,
+            versions: TraversalVersions::default(),
+        }
+    }
+
+    /// The order entries are delivered in.
+    #[must_use]
+    pub const fn order(mut self, order: TraversalOrder) -> Self {
+        self.order = order;
+        self
+    }
+
+    /// Operations (observations, listings) in flight at once, and entries admitted but not yet
+    /// delivered.
+    #[must_use]
+    pub const fn max_inflight_operations(mut self, limit: NonZeroUsize) -> Self {
+        self.max_inflight_operations = limit;
+        self
+    }
+
+    /// Items the session buffers ahead of its consumer.
+    #[must_use]
+    pub const fn max_buffered_items(mut self, limit: NonZeroUsize) -> Self {
+        self.max_buffered_items = limit;
+        self
+    }
+
+    /// What is observed of each entry beyond what its listing carried.
+    #[must_use]
+    pub const fn observation_plan(mut self, plan: ObservationPlan) -> Self {
+        self.observation_plan = plan;
+        self
+    }
+
+    /// The token that cancels the traversal.
+    #[must_use]
+    pub fn cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// The admission and pruning policy; see [`TraversalFilter`].
+    #[must_use]
+    pub fn filter(mut self, filter: Arc<dyn TraversalFilter>) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    /// The deepest level listed (the root's children are depth 1); `None` is unlimited.
+    #[must_use]
+    pub const fn max_depth(mut self, max_depth: Option<NonZeroUsize>) -> Self {
+        self.max_depth = max_depth;
+        self
+    }
+
+    /// Current objects only, or every stored version.
+    #[must_use]
+    pub const fn versions(mut self, versions: TraversalVersions) -> Self {
+        self.versions = versions;
+        self
+    }
+
     /// Whether a directory at `depth` (direct children of the traversal root are 1) may be
     /// listed under `max_depth`.
     #[must_use]
@@ -289,7 +384,11 @@ pub enum TraversalOutcome {
 }
 
 /// A terminal outcome that cannot be represented as an entry item.
+///
+/// Throttling never ends a traversal (P7 §8): a listing that stays throttled past its backoff
+/// budget is that listing's failure, and a throttled observation is that child's.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum TraversalTerminalFailure {
     Session(BackendSessionFailure),
     Internal,

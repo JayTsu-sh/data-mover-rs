@@ -30,17 +30,11 @@ fn limit(value: usize) -> NonZeroUsize {
 }
 
 fn request(versions: TraversalVersions) -> TraversalRequest {
-    TraversalRequest {
-        root: StoragePath::root(),
-        order: TraversalOrder::Admission,
-        max_inflight_operations: limit(8),
-        max_buffered_items: limit(8),
-        observation_plan: ObservationPlan::default(),
-        cancel: CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions,
-    }
+    TraversalRequest::new(StoragePath::root())
+        .max_inflight_operations(limit(8))
+        .max_buffered_items(limit(8))
+        .cancel(CancellationToken::new())
+        .versions(versions)
 }
 
 async fn put(protocol: &MemoryS3, key: &str, body: &'static [u8]) -> TestResult {
@@ -553,5 +547,80 @@ async fn a_looping_listing_fails_only_its_directory() -> TestResult {
             "{versions:?}: {totals:?}"
         );
     }
+    Ok(())
+}
+
+/// What the role protocol maps a 503 `SlowDown` to (pinned by its own test; traversal may not
+/// import `crate::s3`).
+fn slow_down() -> S3ProtocolFailure {
+    S3ProtocolFailure::session(
+        FailureClass::Throttled,
+        Transience::Transient,
+        "S3 ListObjectsV2 request failed",
+    )
+}
+
+/// A throttled S3 page (503 `SlowDown`) is requested again within the listing's backoff budget
+/// and the traversal completes with every entry (P7 §8, Q11; P7 review issue 1: one `SlowDown`
+/// used to end the whole traversal). Fault injection: let the listing stop backing off on
+/// `Throttled`, or the traversal stop scoping it, and the traversal ends with it — red. Paused
+/// time: the production budget (about two minutes of backoff) passes instantly.
+#[tokio::test(start_paused = true)]
+async fn a_throttled_page_does_not_end_the_traversal() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    for key in ["a/x", "a/y", "b", "c"] {
+        put(&protocol, key, b"1").await?;
+    }
+    protocol.listing().page_size = 1;
+    protocol.listing().throttled = Some((4, slow_down()));
+    let (items, outcome) = traverse(&protocol, request(TraversalVersions::Current)).await?;
+    let totals = totals(&outcome);
+    assert_eq!((totals.emitted, totals.failed_children), (5, 0));
+    assert_eq!(totals.listing_failures, 0);
+    assert!(
+        items
+            .iter()
+            .all(|item| !matches!(item, TraversalItem::Failure(_))),
+        "{:?}",
+        rendered(&items)
+    );
+    Ok(())
+}
+
+/// Throttled past the budget, the listing fails — that directory `Unreadable`, `Throttled` /
+/// `Transient` — and the traversal still completes rather than ending with a session failure.
+#[tokio::test(start_paused = true)]
+async fn throttling_past_the_budget_fails_one_listing_not_the_traversal() -> TestResult {
+    let protocol = Arc::new(MemoryS3::default());
+    for key in ["a/x", "b"] {
+        put(&protocol, key, b"1").await?;
+    }
+    protocol.listing().throttled = Some((usize::MAX, slow_down()));
+    let listing_of_a = TraversalRequest::new(StoragePath::new("a")?)
+        .max_inflight_operations(limit(8))
+        .max_buffered_items(limit(8));
+    let (items, outcome) = traverse(&protocol, listing_of_a).await?;
+    let failures: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            TraversalItem::Failure(failure) => Some((
+                failure.scope,
+                failure.path.to_string(),
+                failure.failure.class(),
+                failure.failure.transience(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        failures,
+        [(
+            FailureScope::Listing,
+            "a".to_owned(),
+            FailureClass::Throttled,
+            Transience::Transient
+        )]
+    );
+    assert_eq!(totals(&outcome).listing_failures, 1);
     Ok(())
 }

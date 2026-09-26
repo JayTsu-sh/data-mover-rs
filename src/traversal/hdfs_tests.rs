@@ -6,9 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     FailureScope, ListingOutcome, StorageTraversalSource, TraversalItem, TraversalOrder,
-    TraversalRequest, TraversalSource, TraversalVersions,
+    TraversalRequest, TraversalSource,
 };
-use crate::model::{ObservationPlan, ObservedEntry, StoragePath};
+use crate::model::{ObservedEntry, StoragePath};
 use crate::storage::backends::hdfs::contract_tests::MemoryHdfs;
 use crate::storage::backends::hdfs::{connect, test_identity};
 
@@ -21,17 +21,12 @@ async fn hdfs_facts_survive_snapshot_without_backend_requery()
         .await;
     let storage = connect(protocol, test_identity("hdfs-traversal")?)?;
     let traversal = StorageTraversalSource::new(&storage)?;
-    let mut session = traversal.traverse(TraversalRequest {
-        root: StoragePath::root(),
-        order: TraversalOrder::Admission,
-        max_inflight_operations: NonZeroUsize::new(2).ok_or("invalid inflight")?,
-        max_buffered_items: NonZeroUsize::new(2).ok_or("invalid buffer")?,
-        observation_plan: ObservationPlan::default(),
-        cancel: CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    });
+    let mut session = traversal.traverse(
+        TraversalRequest::new(StoragePath::root())
+            .max_inflight_operations(NonZeroUsize::new(2).ok_or("invalid inflight")?)
+            .max_buffered_items(NonZeroUsize::new(2).ok_or("invalid buffer")?)
+            .cancel(CancellationToken::new()),
+    );
     let Some(TraversalItem::Entry(entry)) = session.next_item().await else {
         return Err("HDFS traversal did not return an entry".into());
     };
@@ -60,17 +55,13 @@ async fn an_undescribable_child_is_a_child_failure_in_a_complete_listing()
     protocol.make_undescribable("bad").await;
     let storage = connect(protocol, test_identity("hdfs-traversal")?)?;
     let traversal = StorageTraversalSource::new(&storage)?;
-    let mut session = traversal.traverse(TraversalRequest {
-        root: StoragePath::root(),
-        order: TraversalOrder::NameBytes,
-        max_inflight_operations: NonZeroUsize::new(2).ok_or("invalid inflight")?,
-        max_buffered_items: NonZeroUsize::new(8).ok_or("invalid buffer")?,
-        observation_plan: ObservationPlan::default(),
-        cancel: CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    });
+    let mut session = traversal.traverse(
+        TraversalRequest::new(StoragePath::root())
+            .order(TraversalOrder::NameBytes)
+            .max_inflight_operations(NonZeroUsize::new(2).ok_or("invalid inflight")?)
+            .max_buffered_items(NonZeroUsize::new(8).ok_or("invalid buffer")?)
+            .cancel(CancellationToken::new()),
+    );
     let mut entries = Vec::new();
     let mut failures = Vec::new();
     let mut listing = None;

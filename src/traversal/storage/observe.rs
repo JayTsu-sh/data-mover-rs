@@ -16,11 +16,11 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use super::{Deferred, Shared, entry_failure};
+use super::{Deferred, Shared, entry_failure, throttling_scoped_to};
 use crate::model::{
-    EntryKind, FailureClass, MAX_MODEL_FIELD_BYTES, MetadataObservation, MetadataObservations,
-    MetadataProvenance, ObservationMode, ObservationPlan, ObservedEntry, StoragePath,
-    SymlinkTarget,
+    EntryKind, EntryOperationFailure, FailureClass, MAX_MODEL_FIELD_BYTES, MetadataObservation,
+    MetadataObservations, MetadataProvenance, ObservationMode, ObservationPlan, ObservedEntry,
+    Operation, StoragePath, SymlinkTarget, Transience,
 };
 use crate::storage::{Metadata, Namespace, SourceDescriptor, StorageRoleFailure};
 use crate::traversal::TraversalTerminalFailure;
@@ -238,16 +238,91 @@ pub(super) async fn observe(
     descriptor: SourceDescriptor,
     plan: ObservationPlan,
 ) -> Result<ObservedEntry, StorageRoleFailure> {
-    let metadata = match metadata_without_io(metadata_role, plan, &descriptor) {
+    match observe_io(namespace, metadata_role, &descriptor, plan).await {
+        Ok((metadata, target)) => assemble(descriptor, metadata, target),
+        Err(failure) => Err(confirm_vanished(namespace, &descriptor.path, failure).await),
+    }
+}
+
+/// The metadata and link target of `descriptor` that need backend I/O.
+async fn observe_io(
+    namespace: &dyn Namespace,
+    metadata_role: &dyn Metadata,
+    descriptor: &SourceDescriptor,
+    plan: ObservationPlan,
+) -> Result<(MetadataObservations, Option<SymlinkTarget>), StorageRoleFailure> {
+    // A throttled request is this child's failure, never the traversal's end (P7 §8).
+    let scoped = |failure| throttling_scoped_to(&descriptor.path, Operation::Observe, failure);
+    let metadata = match metadata_without_io(metadata_role, plan, descriptor) {
         Some(metadata) => metadata?,
-        None => role_observations(metadata_role, &descriptor, plan).await?,
+        None => role_observations(metadata_role, descriptor, plan)
+            .await
+            .map_err(scoped)?,
     };
     let target = if descriptor.kind == EntryKind::Symlink {
-        Some(namespace.read_link(&descriptor.path).await?)
+        Some(
+            namespace
+                .read_link(&descriptor.path)
+                .await
+                .map_err(scoped)?,
+        )
     } else {
         None
     };
-    assemble(descriptor, metadata, target)
+    Ok((metadata, target))
+}
+
+/// A `NotFound` met while observing a child makes it *vanished* — no item, and a consumer may
+/// treat it as deleted (P7 Q12) — so it is believed only once the child itself is confirmed gone:
+/// a sub-read can report `NotFound` about something else (an extended attribute removed between
+/// listing and reading it, a version deleted from a key that is still there). When the child is
+/// still there, the observation is that child's failure (`Conflict` / `Transient`: it changed
+/// while observed), never a vanish. Costs one `stat`, only on this path.
+async fn confirm_vanished(
+    namespace: &dyn Namespace,
+    path: &StoragePath,
+    failure: StorageRoleFailure,
+) -> StorageRoleFailure {
+    let StorageRoleFailure::Entry(error) = &failure else {
+        return failure;
+    };
+    if error.class() != FailureClass::NotFound {
+        return failure;
+    }
+    // A throttled confirmation is no confirmation, and never the traversal's end (P7 §8).
+    let confirmed = namespace
+        .stat(path)
+        .await
+        .map_err(|failure| throttling_scoped_to(path, Operation::Observe, failure));
+    match confirmed {
+        Err(StorageRoleFailure::Entry(gone)) if gone.class() == FailureClass::NotFound => failure,
+        Err(session @ StorageRoleFailure::Session(_)) => session,
+        Ok(_) | Err(StorageRoleFailure::Entry(_)) => StorageRoleFailure::Entry(not_vanished(
+            path,
+            format!(
+                "{}; the entry itself was not confirmed gone, so it did not vanish",
+                error.diagnostic()
+            ),
+        )),
+    }
+}
+
+/// A child's failure saying it changed while observed but did not vanish. Falls back to a static
+/// diagnostic, never to the `NotFound` it replaces, which would read as a vanish.
+fn not_vanished(path: &StoragePath, diagnostic: String) -> EntryOperationFailure {
+    let failure = |diagnostic| {
+        EntryOperationFailure::new(
+            path.clone(),
+            Operation::Observe,
+            FailureClass::Conflict,
+            Transience::Transient,
+            diagnostic,
+        )
+    };
+    failure(diagnostic).unwrap_or_else(|_| {
+        failure("a part of the entry vanished while it was observed".to_owned())
+            .unwrap_or_else(|_| unreachable!("the static observation diagnostic is valid"))
+    })
 }
 
 /// One admitted child whose observation needs backend I/O.

@@ -7,7 +7,7 @@ use std::path::Path;
 
 use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
-use data_mover::model::{FailureClass, ObservationPlan, StoragePath};
+use data_mover::model::{FailureClass, StoragePath};
 use data_mover::ndx_walk::{NdxWalkRequest, ndx_walk};
 use data_mover::storage::{
     BackendConfig, DeleteTreeRequest, LocalBackendConfig, PreflightPolicy, Storage,
@@ -15,8 +15,7 @@ use data_mover::storage::{
 };
 use data_mover::storage_enum::{StorageEnum, create_storage};
 use data_mover::traversal::{
-    StorageTraversalSource, TraversalItem, TraversalOrder, TraversalRequest, TraversalSource as _,
-    TraversalVersions,
+    StorageTraversalSource, TraversalItem, TraversalRequest, TraversalSource as _,
 };
 use data_mover::{CreateStorageOptions, StorageEntryMessage, WalkOptions};
 use tokio_util::sync::CancellationToken;
@@ -145,17 +144,12 @@ async fn role_traversal_and_ndx_walk_hide_artifacts() -> TestResult {
     let root = fixture()?;
     let storage = roles(root.path()).await?;
     let slots = NonZeroUsize::new(2).ok_or("non-zero")?;
-    let mut session = StorageTraversalSource::new(&storage)?.traverse(TraversalRequest {
-        root: StoragePath::root(),
-        order: TraversalOrder::Admission,
-        max_inflight_operations: slots,
-        max_buffered_items: slots,
-        observation_plan: ObservationPlan::default(),
-        cancel: CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    });
+    let mut session = StorageTraversalSource::new(&storage)?.traverse(
+        TraversalRequest::new(StoragePath::root())
+            .max_inflight_operations(slots)
+            .max_buffered_items(slots)
+            .cancel(CancellationToken::new()),
+    );
     let mut traversed = Vec::new();
     while let Some(item) = session.next_item().await {
         if let TraversalItem::Entry(entry) = item {

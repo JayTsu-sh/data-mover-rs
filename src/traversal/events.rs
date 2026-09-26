@@ -63,7 +63,13 @@ pub enum FailureScope {
 ///
 /// A child failure whose `path` is the listed directory itself — the listing could not even name
 /// the child — cannot say which child it was, so none of that directory's previously known direct
-/// children take part in deletion (rule 3 applied to every child it could have been).
+/// children take part in deletion (rule 3 applied to every child it could have been). Its
+/// diagnostic carries the child's raw name, and its identity is derived from it.
+///
+/// Two things are **not** failures and produce no item (P7 §8): a child that was listed and was
+/// gone by the time it was described or observed ([`super::BlockCounts::vanished`]; it no longer
+/// exists, so it may be treated as deleted), and throttling, which a listing backs off from and
+/// which fails at most one listing or one child, never the traversal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ScanFailure {
@@ -151,6 +157,13 @@ pub struct DirectoryListed {
     pub outcome: ListingOutcome,
     /// What this directory's block held; see [`BlockCounts`].
     pub counts: BlockCounts,
+    /// The directory was gone when its own listing began (`NotFound`, never the traversal root):
+    /// the block is [`ListingOutcome::Complete`] and empty because nothing exists below it any
+    /// more, not because the directory is empty. Counted in
+    /// [`super::ScanTotals::vanished_listings`]. The converse does not hold: a directory reported
+    /// vanished as a child may still be listed with children, when it was recreated before its
+    /// own listing ran — a scan is not a snapshot.
+    pub vanished: bool,
 }
 
 impl DirectoryListed {
@@ -160,6 +173,7 @@ impl DirectoryListed {
             path,
             outcome,
             counts,
+            vanished: false,
         }
     }
 }

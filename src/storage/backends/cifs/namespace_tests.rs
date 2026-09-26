@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 
 use super::metadata::CifsInlineMetadata;
-use super::namespace::{CifsNamespace, CifsNamespaceProtocol};
+use super::namespace::{CifsListedChild, CifsNamespace, CifsNamespaceProtocol, CifsUnspelled};
 use super::protocol::{CifsRootError, RootProtocol, ensure_root, identity_bytes, root_prefixes};
 use super::source::CifsSourceFacts;
 use crate::model::{BackendIdentity, BackendKind, EntryKind, FailureClass, StoragePath};
@@ -66,10 +66,7 @@ impl CifsNamespaceProtocol for RecordingProtocol {
         })
     }
 
-    async fn list(
-        &self,
-        path: &StoragePath,
-    ) -> smb_domain::Result<Vec<(StoragePath, CifsInlineMetadata)>> {
+    async fn list(&self, path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>> {
         self.record(format!("list {}", path.as_str()))?;
         Ok(Vec::new())
     }
@@ -373,14 +370,15 @@ impl CifsNamespaceProtocol for ListingProtocol {
         })
     }
 
-    async fn list(
-        &self,
-        path: &StoragePath,
-    ) -> smb_domain::Result<Vec<(StoragePath, CifsInlineMetadata)>> {
+    async fn list(&self, path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>> {
         let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         self.entries
             .iter()
             .map(|(name, kind, readonly)| {
+                // As the SMB protocol reports a name smb-rs decoded lossily.
+                if name.contains(char::REPLACEMENT_CHARACTER) {
+                    return Ok(Err(CifsUnspelled { name: name.clone() }));
+                }
                 let child = StoragePath::new(format!("{}/{name}", path.as_str()))
                     .map_err(|_| smb_domain::Error::InvalidArgument("invalid path".into()))?;
                 let identity = if self.undescribable == Some(name.as_str()) {
@@ -388,7 +386,7 @@ impl CifsNamespaceProtocol for ListingProtocol {
                 } else {
                     Bytes::from_static(b"listed")
                 };
-                Ok((
+                Ok(Ok((
                     child,
                     CifsInlineMetadata {
                         facts: CifsSourceFacts {
@@ -404,7 +402,7 @@ impl CifsNamespaceProtocol for ListingProtocol {
                         readonly: *readonly,
                         reparse_point: false,
                     },
-                ))
+                )))
             })
             .collect()
     }
@@ -460,6 +458,7 @@ async fn an_undescribable_child_fails_alone() -> Result {
             ("bad.bin".to_owned(), EntryKind::File, Some(false)),
             ("after.dir".to_owned(), EntryKind::Directory, Some(false)),
             (".data-mover-x.part".to_owned(), EntryKind::File, None),
+            ("lossy\u{FFFD}.bin".to_owned(), EntryKind::File, None),
         ],
         undescribable: Some("bad.bin"),
     });
@@ -470,7 +469,17 @@ async fn an_undescribable_child_fails_alone() -> Result {
     let (entries, failures) = listed(&namespace, &path("dir")?).await?;
     let listed: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
     assert_eq!(listed, ["dir/before.bin", "dir/after.dir"]);
-    assert_eq!(failures.len(), 1);
+    assert_eq!(failures.len(), 2);
+    // A name no path can spell is a failure at the directory, carrying the name as sent (P7 C3):
+    // never a lossy path that names nothing, and never the whole directory's failure.
+    assert_eq!(failures[1].path().as_str(), "dir");
+    assert_eq!(failures[1].class(), FailureClass::Unsupported);
+    assert!(
+        failures[1].diagnostic().contains("lossy"),
+        "{}",
+        failures[1].diagnostic()
+    );
+    assert!(failures[1].identity().is_some());
     assert_eq!(failures[0].path().as_str(), "dir/bad.bin");
     assert_eq!(failures[0].class(), FailureClass::Protocol);
     assert!(failures[0].diagnostic().contains("could not describe"));
@@ -556,10 +565,7 @@ impl CifsNamespaceProtocol for TreeProtocol {
         ))
     }
 
-    async fn list(
-        &self,
-        path: &StoragePath,
-    ) -> smb_domain::Result<Vec<(StoragePath, CifsInlineMetadata)>> {
+    async fn list(&self, path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>> {
         let stamp = std::time::UNIX_EPOCH;
         self.children(path.as_str())
             .into_iter()
@@ -585,7 +591,8 @@ impl CifsNamespaceProtocol for TreeProtocol {
                     },
                 ))
             })
-            .collect()
+            .collect::<smb_domain::Result<Vec<_>>>()
+            .map(|listed| listed.into_iter().map(Ok).collect())
     }
 
     async fn create_directory(&self, _path: &StoragePath) -> smb_domain::Result<()> {

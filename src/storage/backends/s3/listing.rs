@@ -21,8 +21,8 @@ use super::history::{KeyHistory, oldest_first, warn_inferred};
 use super::paging::{ListingLimits, Paging};
 use super::source::{object_identity, path_scoped_bytes, role_failure};
 use super::{
-    S3ListedObject, S3ListedVersion, S3ObjectFacts, S3Protocol, S3ProtocolFailure, S3VersionMarker,
-    is_real_version_id,
+    S3ListedObject, S3ListedVersion, S3ObjectFacts, S3Protocol, S3ProtocolFailure, S3RejectedEntry,
+    S3VersionMarker, is_real_version_id,
 };
 use crate::model::{
     BackendIdentity, EntryKind, EntryOperationFailure, EntryVersion, FailureClass, HistoryOrder,
@@ -30,7 +30,10 @@ use crate::model::{
     TimestampMetadata, Transience,
 };
 use crate::storage::artifacts::is_artifact_path;
-use crate::storage::{ListingFacts, ListingPage, SourceDescriptor, StorageRoleFailure};
+use crate::storage::throttle::retry_throttled;
+use crate::storage::{
+    ChildFailure, ListingFacts, ListingPage, SourceDescriptor, StorageRoleFailure,
+};
 
 /// Identity bytes of a delete marker that names no real version (a suspended bucket's `"null"`).
 const NULL_MARKER_IDENTITY: &[u8] = b"\0s3-null-delete-marker";
@@ -61,31 +64,83 @@ pub(super) async fn list_current<P: S3Protocol + ?Sized>(
 ) -> Result<ListingPage, StorageRoleFailure> {
     let prefix = directory_prefix(directory)?;
     let mut paging = Paging::new(limits);
+    let mut throttle = limits.throttle.start();
     let mut token: Option<String> = None;
-    let (mut objects, mut prefixes) = (Vec::new(), Vec::new());
+    let (mut objects, mut prefixes, mut rejected) = (Vec::new(), Vec::new(), Vec::new());
     loop {
-        let page = protocol
-            .list_objects_page(&prefix, token.as_deref())
-            .await
-            .map_err(|e| role_failure(directory, Operation::Traverse, e))?;
-        let listed = page.objects.len() + page.prefixes.len();
+        let page = retry_throttled(&mut throttle, is_throttled, || {
+            protocol.list_objects_page(&prefix, token.as_deref())
+        })
+        .await
+        .map_err(|e| role_failure(directory, Operation::Traverse, past_budget(e)))?;
+        let listed = page.objects.len() + page.prefixes.len() + page.rejected.len();
         objects.extend(page.objects);
         prefixes.extend(page.prefixes);
+        rejected.extend(page.rejected);
         token = paging.advance(directory, listed, page.next)?;
         if token.is_none() {
             break;
         }
     }
-    refuse_absent(directory, objects.is_empty() && prefixes.is_empty())?;
+    let absent = objects.is_empty() && prefixes.is_empty() && rejected.is_empty();
+    refuse_absent(directory, absent)?;
     let mut keys = HashSet::new();
     // A server that repeats an object across a page boundary lists it once, as first listed.
     objects.retain(|object: &S3ListedObject| keys.insert(object.key.clone()));
-    let placed = place(directory, &prefix, objects, |object| &object.key)?;
+    let placed = place(&prefix, objects, |object| &object.key);
     let mut block = Block::new(identity, directory, &prefix);
+    block.outside(&placed.outside);
     block.own_marker(placed.own.iter().any(|object| object.size > 0));
+    let mut rolled = placed.rolled;
+    block.rejected(rejected, &mut rolled);
     let children = placed.children.into_iter().map(Child::Object);
-    block.build(merge(children, prefixes, placed.rolled));
+    block.build(merge(children, prefixes, rolled));
     Ok(block.finish())
+}
+
+/// Every page of a versions listing, gathered.
+#[derive(Default)]
+struct VersionPages {
+    versions: Vec<S3ListedVersion>,
+    markers: Vec<S3ListedVersion>,
+    prefixes: Vec<String>,
+    rejected: Vec<S3RejectedEntry>,
+}
+
+/// Pages through every version of `prefix`, backing off while throttled.
+async fn page_versions<P: S3Protocol + ?Sized>(
+    protocol: &P,
+    directory: &StoragePath,
+    prefix: &str,
+    limits: ListingLimits,
+) -> Result<VersionPages, StorageRoleFailure> {
+    let mut paging = Paging::new(limits);
+    let mut throttle = limits.throttle.start();
+    let mut marker: Option<S3VersionMarker> = None;
+    let mut all = VersionPages::default();
+    // Positions are per page; a later page's follow the earlier pages' (document order of the
+    // whole listing).
+    let mut listed_before = 0_u64;
+    loop {
+        let page = retry_throttled(&mut throttle, is_throttled, || {
+            protocol.list_versions_page(prefix, marker.as_ref())
+        })
+        .await
+        .map_err(|e| role_failure(directory, Operation::Traverse, past_budget(e)))?;
+        let entries = page.versions.len() + page.markers.len();
+        let listed = entries + page.prefixes.len() + page.rejected.len();
+        all.versions
+            .extend(listing_wide(page.versions, listed_before));
+        all.markers
+            .extend(listing_wide(page.markers, listed_before));
+        listed_before += entries as u64;
+        all.prefixes.extend(page.prefixes);
+        all.rejected.extend(page.rejected);
+        marker = paging.advance(directory, listed, page.next)?;
+        if marker.is_none() {
+            return Ok(all);
+        }
+    }
 }
 
 /// Lists every stored version and delete marker of the objects of `directory`, and its
@@ -97,41 +152,65 @@ pub(super) async fn list_all<P: S3Protocol + ?Sized>(
     limits: ListingLimits,
 ) -> Result<ListingPage, StorageRoleFailure> {
     let prefix = directory_prefix(directory)?;
-    let mut paging = Paging::new(limits);
-    let mut marker: Option<S3VersionMarker> = None;
-    let (mut versions, mut markers, mut prefixes) = (Vec::new(), Vec::new(), Vec::new());
-    // Positions are per page; a later page's follow the earlier pages' (document order of the
-    // whole listing).
-    let mut listed_before = 0_u64;
-    loop {
-        let page = protocol
-            .list_versions_page(&prefix, marker.as_ref())
-            .await
-            .map_err(|e| role_failure(directory, Operation::Traverse, e))?;
-        let entries = page.versions.len() + page.markers.len();
-        let listed = entries + page.prefixes.len();
-        versions.extend(listing_wide(page.versions, listed_before));
-        markers.extend(listing_wide(page.markers, listed_before));
-        listed_before += entries as u64;
-        prefixes.extend(page.prefixes);
-        marker = paging.advance(directory, listed, page.next)?;
-        if marker.is_none() {
-            break;
-        }
-    }
-    let absent = versions.is_empty() && markers.is_empty() && prefixes.is_empty();
+    let VersionPages {
+        mut versions,
+        mut markers,
+        prefixes,
+        rejected,
+    } = page_versions(protocol, directory, &prefix, limits).await?;
+    let absent =
+        versions.is_empty() && markers.is_empty() && prefixes.is_empty() && rejected.is_empty();
     refuse_absent(directory, absent)?;
-    let placed_versions = place(directory, &prefix, versions, |entry| &entry.key)?;
-    let placed_markers = place(directory, &prefix, markers, |entry| &entry.key)?;
+    // A key with an entry that could not be decoded has no whole history: it is that key's
+    // failure, and none of its entries is listed.
+    let broken: HashSet<String> = rejected.iter().filter_map(|r| r.key.clone()).collect();
+    versions.retain(|entry: &S3ListedVersion| !broken.contains(&entry.key));
+    markers.retain(|entry: &S3ListedVersion| !broken.contains(&entry.key));
+    let placed_versions = place(&prefix, versions, |entry| &entry.key);
+    let placed_markers = place(&prefix, markers, |entry| &entry.key);
     let mut block = Block::new(identity, directory, &prefix);
+    block.outside(&placed_versions.outside);
+    block.outside(&placed_markers.outside);
     block.own_marker(placed_versions.own.iter().any(|entry| entry.facts.size > 0));
     let histories = oldest_first(placed_versions.children, placed_markers.children);
     warn_inferred(directory.as_str(), &histories);
     let children = histories.into_iter().map(Child::History);
     let mut rolled = placed_versions.rolled;
     rolled.extend(placed_markers.rolled);
+    block.rejected(rejected, &mut rolled);
     block.build(merge(children, prefixes, rolled));
     Ok(block.finish())
+}
+
+/// Whether the service asked this listing to slow down; it backs off rather than fails.
+fn is_throttled(failure: &S3ProtocolFailure) -> bool {
+    matches!(
+        failure,
+        S3ProtocolFailure::Entry {
+            class: FailureClass::Throttled,
+            ..
+        } | S3ProtocolFailure::Session {
+            class: FailureClass::Throttled,
+            ..
+        }
+    )
+}
+
+/// A listing still throttled once its backoff budget is spent fails that listing alone: the
+/// service is busy, the session is fine, and the traversal goes on (P7 §8, Q11).
+fn past_budget(failure: S3ProtocolFailure) -> S3ProtocolFailure {
+    match failure {
+        S3ProtocolFailure::Session {
+            class: FailureClass::Throttled,
+            diagnostic,
+            ..
+        } => S3ProtocolFailure::entry(
+            FailureClass::Throttled,
+            Transience::Transient,
+            format!("{diagnostic}; still throttled after the listing's backoff budget"),
+        ),
+        other => other,
+    }
 }
 
 /// `entries` of one page with their positions moved after the `before` entries of earlier pages.
@@ -192,23 +271,21 @@ struct Placed<T> {
     own: Vec<T>,
     /// First-level prefixes of keys a store reported below a deeper `/`.
     rolled: Vec<String>,
+    /// Keys that are not under the directory at all: the server ignored the prefix.
+    outside: Vec<String>,
 }
 
-fn place<T>(
-    directory: &StoragePath,
-    prefix: &str,
-    entries: Vec<T>,
-    key: impl Fn(&T) -> &str,
-) -> Result<Placed<T>, StorageRoleFailure> {
+fn place<T>(prefix: &str, entries: Vec<T>, key: impl Fn(&T) -> &str) -> Placed<T> {
     let mut placed = Placed {
         children: Vec::with_capacity(entries.len()),
         own: Vec::new(),
         rolled: Vec::new(),
+        outside: Vec::new(),
     };
     for entry in entries {
         let Some(rest) = key(&entry).strip_prefix(prefix) else {
-            let failure = S3ProtocolFailure::protocol("S3 listing returned a key outside it");
-            return Err(role_failure(directory, Operation::Traverse, failure));
+            placed.outside.push(key(&entry).to_string());
+            continue;
         };
         if rest.is_empty() {
             placed.own.push(entry);
@@ -218,7 +295,7 @@ fn place<T>(
             placed.children.push(entry);
         }
     }
-    Ok(placed)
+    placed
 }
 
 /// Every child in S3 key order: entries and prefixes (the listing's and the rolled-up ones, each
@@ -247,6 +324,8 @@ struct Block<'a> {
     prefix: &'a str,
     entries: Vec<SourceDescriptor>,
     failures: Vec<EntryOperationFailure>,
+    /// Children no path of this tree can name, with their raw keys.
+    unnamed: Vec<ChildFailure>,
     /// Transfer artifacts hidden: one per key or prefix, whatever its versions.
     hidden: u32,
 }
@@ -263,7 +342,62 @@ impl<'a> Block<'a> {
             prefix,
             entries: Vec::new(),
             failures: Vec::new(),
+            unnamed: Vec::new(),
             hidden: 0,
+        }
+    }
+
+    /// A child that no path of this tree can name: a failure at the directory, with its raw key.
+    fn unnamed(&mut self, raw_key: &str, reason: &str) {
+        self.unnamed.push(ChildFailure::unnamed(
+            self.identity,
+            self.directory,
+            Bytes::copy_from_slice(raw_key.as_bytes()),
+            FailureClass::Protocol,
+            reason,
+        ));
+    }
+
+    /// Keys the server listed although they are not under this directory.
+    fn outside(&mut self, keys: &[String]) {
+        for key in keys {
+            self.unnamed(
+                key,
+                "the S3 listing returned a key outside the listed directory",
+            );
+        }
+    }
+
+    /// Entries the listing could not decode, each its own child's failure (once per key). One
+    /// below a deeper `/` (a store ignoring the delimiter) only rolls up its first-level prefix:
+    /// the listing of that subdirectory reports it.
+    fn rejected(&mut self, rejected: Vec<S3RejectedEntry>, rolled: &mut Vec<String>) {
+        let mut reported = HashSet::new();
+        for rejection in rejected {
+            let Some(key) = rejection.key.as_deref() else {
+                self.unnamed(&rejection.raw_key, rejection.reason);
+                continue;
+            };
+            let Some(rest) = key
+                .strip_prefix(self.prefix)
+                .filter(|rest| !rest.is_empty())
+            else {
+                self.unnamed(key, rejection.reason);
+                continue;
+            };
+            if let Some(end) = rest.find('/') {
+                rolled.push(format!("{}{}", self.prefix, &rest[..=end]));
+            } else if reported.insert(key.to_string()) {
+                match self.child_path(key, rest) {
+                    Ok(Some(path)) => self.failures.push(child_failure(
+                        &path,
+                        FailureClass::Protocol,
+                        rejection.reason,
+                    )),
+                    Ok(None) => {}
+                    Err(failure) => self.failures.push(failure),
+                }
+            }
         }
     }
 
@@ -293,7 +427,12 @@ impl<'a> Block<'a> {
     }
 
     fn finish(self) -> ListingPage {
-        ListingPage::from_descriptors(self.directory, self.entries, self.failures, self.hidden)
+        let mut page =
+            ListingPage::from_descriptors(self.directory, self.entries, self.failures, self.hidden);
+        for failure in self.unnamed {
+            page.push_failure(failure);
+        }
+        page
     }
 
     /// Whether the child `key` named `name` is listed: `Ok(None)` for a transfer artifact, a

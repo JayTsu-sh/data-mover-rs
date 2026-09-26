@@ -530,6 +530,11 @@ pub enum FailureClass {
     Corruption,
     /// A backend protocol failed.
     Protocol,
+    /// The service asked the client to slow down (S3 429 / 503 `SlowDown`, NFS `DELAY` /
+    /// `JUKEBOX`). Not a loss of the session and not a fault of the entry: the same request may
+    /// succeed after a backoff, so it is always [`Transience::Transient`]. A listing backs off
+    /// within a bounded budget before it reports one (P7 §8, Q11).
+    Throttled,
     /// The caller cancelled the operation.
     Cancelled,
     /// An invariant failed inside the implementation.

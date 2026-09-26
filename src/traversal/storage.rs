@@ -28,7 +28,7 @@ mod residency;
 
 use cursor::{Arrival, Cursor, Decisions, Step};
 use observe::{Feed, Job, Listed, Observations, Observed};
-use output::{BlockFacts, ChildDescent, Output, Settled};
+use output::{BlockFacts, ChildDescent, ChildItem, Output, Settled};
 #[cfg(test)]
 use residency::ResidencyPeak;
 
@@ -554,13 +554,20 @@ fn settle(
     let (sequence, result, deferred) = observed;
     let (item, below) = match result {
         Ok(entry) => settle_entry(runtime, entry, deferred),
+        // Gone since the listing: nothing to emit or descend into, and no failure (Q12).
+        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
+            (ChildItem::Vanished, None)
+        }
         Err(StorageRoleFailure::Entry(error)) => settle_failure(error, deferred),
         Err(StorageRoleFailure::Session(error)) => {
             return Err(TraversalTerminalFailure::Session(error));
         }
     };
-    let descent =
-        deferred.and_then(|deferred| deferred_descent(runtime.request, deferred, below.is_some()));
+    let descent = match item {
+        ChildItem::Vanished => None,
+        _ => deferred
+            .and_then(|deferred| deferred_descent(runtime.request, deferred, below.is_some())),
+    };
     if let Some(ticket) = deferred.and_then(|deferred| deferred.ticket) {
         decisions.insert(ticket, below);
     }
@@ -576,7 +583,7 @@ fn settle(
 fn settle_failure(
     error: EntryOperationFailure,
     deferred: Option<Deferred>,
-) -> (Option<TraversalItem>, Option<DirectoryWork>) {
+) -> (ChildItem, Option<DirectoryWork>) {
     let descend = deferred
         .filter(|deferred| deferred.ticket.is_some())
         .map(|deferred| DirectoryWork {
@@ -585,7 +592,7 @@ fn settle_failure(
             filter_children: true,
         });
     (
-        Some(TraversalItem::Failure(Box::new(ScanFailure::child(error)))),
+        ChildItem::Item(TraversalItem::Failure(Box::new(ScanFailure::child(error)))),
         descend,
     )
 }
@@ -607,9 +614,9 @@ fn settle_entry(
     runtime: &Runtime<'_>,
     entry: Box<ObservedEntry>,
     deferred: Option<Deferred>,
-) -> (Option<TraversalItem>, Option<DirectoryWork>) {
+) -> (ChildItem, Option<DirectoryWork>) {
     let Some(deferred) = deferred else {
-        return (Some(TraversalItem::Entry(entry)), None);
+        return (ChildItem::Item(TraversalItem::Entry(entry)), None);
     };
     let decision = runtime
         .policy
@@ -619,10 +626,12 @@ fn settle_entry(
         child_depth: deferred.depth.saturating_add(1),
         filter_children: decision.filter_children,
     });
-    (
-        decision.emit.then_some(TraversalItem::Entry(entry)),
-        descend,
-    )
+    let item = if decision.emit {
+        ChildItem::Item(TraversalItem::Entry(entry))
+    } else {
+        ChildItem::Filtered
+    };
+    (item, descend)
 }
 
 /// Queues a failure the listing itself produced: a child it could not describe, or the
@@ -632,7 +641,7 @@ fn queue_failure(state: &mut State, failure: ScanFailure) -> Result<(), Traversa
     state.output.settle(
         sequence,
         Settled::Child {
-            item: Some(TraversalItem::Failure(Box::new(failure))),
+            item: ChildItem::Item(TraversalItem::Failure(Box::new(failure))),
             descent: None,
         },
     );
@@ -650,6 +659,31 @@ fn queue_block_end(
         .output
         .settle(sequence, Settled::BlockEnd { path, facts });
     Ok(())
+}
+
+/// A throttled session failure scoped to the entry it was met at: throttling asks for fewer
+/// requests and never ends a traversal (P7 §8). Any other session failure is returned unchanged.
+fn throttling_scoped_to(
+    path: &StoragePath,
+    operation: Operation,
+    failure: StorageRoleFailure,
+) -> StorageRoleFailure {
+    match failure {
+        StorageRoleFailure::Session(session) if session.class() == FailureClass::Throttled => {
+            EntryOperationFailure::new(
+                path.clone(),
+                operation,
+                FailureClass::Throttled,
+                Transience::Transient,
+                session.diagnostic(),
+            )
+            .map_or(
+                StorageRoleFailure::Session(session),
+                StorageRoleFailure::Entry,
+            )
+        }
+        other => other,
+    }
 }
 
 fn entry_failure(path: &StoragePath, class: FailureClass) -> EntryOperationFailure {

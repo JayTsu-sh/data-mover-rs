@@ -122,12 +122,27 @@ pub(crate) struct S3ListedObject {
     pub last_modified: Option<StorageTimestamp>,
 }
 
+/// A listed element a page could not decode: an object without a valid size, or a key (or common
+/// prefix) outside the storage root. Reported as that one child's failure, beside its siblings;
+/// it never fails the page or the session (P7 §8).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct S3RejectedEntry {
+    /// The key relative to the storage root; `None` when the server sent no key, or one outside
+    /// the root.
+    pub key: Option<String>,
+    /// The key or prefix exactly as the server sent it (empty when it sent none).
+    pub raw_key: String,
+    pub reason: &'static str,
+}
+
 /// One page of a delimiter listing of current objects under one prefix.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct S3ObjectPage {
     pub objects: Vec<S3ListedObject>,
     /// Common prefixes, relative to the storage root, each ending in `/`.
     pub prefixes: Vec<String>,
+    /// Elements the page could not decode.
+    pub rejected: Vec<S3RejectedEntry>,
     /// The continuation token of the next page, passed back as is; `None` on the last page.
     pub next: Option<String>,
 }
@@ -165,6 +180,8 @@ pub(crate) struct S3VersionPage {
     pub markers: Vec<S3ListedVersion>,
     /// Common prefixes, relative to the storage root, each ending in `/`.
     pub prefixes: Vec<String>,
+    /// Versions, delete markers and prefixes the page could not decode.
+    pub rejected: Vec<S3RejectedEntry>,
     /// `None` on the last page.
     pub next: Option<S3VersionMarker>,
 }

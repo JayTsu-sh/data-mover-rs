@@ -55,9 +55,10 @@ pub(super) fn render(item: &TraversalItem) -> String {
             name(&failure.path)
         ),
         TraversalItem::DirectoryListed(listed) => format!(
-            "listed {} {:?} {}",
+            "listed {} {:?}{} {}",
             name(&listed.path),
             listed.outcome,
+            if listed.vanished { " gone" } else { "" },
             render_counts(&listed.counts)
         ),
         TraversalItem::Checkpoint(_) => "checkpoint".to_owned(),
@@ -165,6 +166,8 @@ pub(super) fn assert_well_formed(items: &[TraversalItem], outcome: &TraversalOut
     let TraversalOutcome::Completed(completion) = outcome else {
         panic!("not completed: {outcome:?}")
     };
+    // A vanished listing closes like an empty directory; its own tests count it.
+    summed.vanished_listings = completion.totals.vanished_listings;
     assert_eq!(completion.totals, summed, "totals are the blocks summed");
     assert!(completion.totals.is_balanced(), "{:?}", completion.totals);
 }

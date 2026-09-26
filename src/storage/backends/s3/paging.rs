@@ -9,6 +9,7 @@ use std::hash::Hash;
 
 use crate::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::StorageRoleFailure;
+use crate::storage::throttle::ThrottleBackoff;
 
 /// How far one directory's listing may page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17,6 +18,8 @@ pub(super) struct ListingLimits {
     pub(super) max_entries: usize,
     /// Pages in a row that list nothing yet claim more follow.
     pub(super) max_empty_pages: usize,
+    /// How long one listing backs off while the service throttles it (P7 §8, Q11).
+    pub(super) throttle: ThrottleBackoff,
 }
 
 impl ListingLimits {
@@ -25,6 +28,7 @@ impl ListingLimits {
     pub(super) const PRODUCTION: Self = Self {
         max_entries: 5_000_000,
         max_empty_pages: 16,
+        throttle: ThrottleBackoff::LISTING,
     };
 }
 
@@ -138,6 +142,7 @@ mod tests {
         let limits = ListingLimits {
             max_entries: 3,
             max_empty_pages: 16,
+            ..ListingLimits::PRODUCTION
         };
         let mut paging = Paging::new(limits);
         assert_eq!(paging.advance(&directory(), 3, Some(1)), Ok(Some(1)));
@@ -150,6 +155,7 @@ mod tests {
         let limits = ListingLimits {
             max_entries: 100,
             max_empty_pages: 2,
+            ..ListingLimits::PRODUCTION
         };
         let mut paging = Paging::new(limits);
         assert_eq!(paging.advance(&directory(), 0, Some(1)), Ok(Some(1)));

@@ -10,8 +10,7 @@ use futures::StreamExt as _;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use super::metadata::CifsInlineMetadata;
-use super::namespace::{CifsNamespace, CifsNamespaceProtocol};
+use super::namespace::{CifsListedChild, CifsNamespace, CifsNamespaceProtocol};
 use super::source::CifsSourceFacts;
 use crate::model::{BackendIdentity, BackendKind, StoragePath};
 use crate::storage::{ListRequest, Namespace};
@@ -37,10 +36,7 @@ impl CifsNamespaceProtocol for GatedProtocol {
         Err(smb_domain::Error::InvalidArgument("unused".into()))
     }
 
-    async fn list(
-        &self,
-        _path: &StoragePath,
-    ) -> smb_domain::Result<Vec<(StoragePath, CifsInlineMetadata)>> {
+    async fn list(&self, _path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>> {
         self.open_handles.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
         self.gate.notified().await;

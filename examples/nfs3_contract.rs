@@ -19,8 +19,7 @@ use data_mover::transfer::{
     TransferRequest, transfer,
 };
 use data_mover::traversal::{
-    StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest,
-    TraversalSource, TraversalVersions,
+    StorageTraversalSource, TraversalItem, TraversalOutcome, TraversalRequest, TraversalSource,
 };
 use futures::stream;
 use tokio_util::sync::CancellationToken;
@@ -299,21 +298,19 @@ async fn validate_traversal(source: &Storage, dialect: ContractDialect) -> Contr
         ContractDialect::Nfs3 => ObservationMode::Required,
         ContractDialect::Nfs40 | ContractDialect::Nfs41 => ObservationMode::BestEffort,
     };
-    let mut session = traversal.traverse(TraversalRequest {
-        root: StoragePath::root(),
-        order: TraversalOrder::Admission,
-        max_inflight_operations: nonzero(4)?,
-        max_buffered_items: nonzero(2)?,
-        observation_plan: ObservationPlan::default()
-            .with_acl(acl_mode)
-            .with_xattrs(ObservationMode::Required)
-            .with_ownership_mode(ObservationMode::InlineOnly)
-            .with_timestamps(ObservationMode::InlineOnly),
-        cancel: CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    });
+    let mut session = traversal.traverse(
+        TraversalRequest::new(StoragePath::root())
+            .max_inflight_operations(nonzero(4)?)
+            .max_buffered_items(nonzero(2)?)
+            .observation_plan(
+                ObservationPlan::default()
+                    .with_acl(acl_mode)
+                    .with_xattrs(ObservationMode::Required)
+                    .with_ownership_mode(ObservationMode::InlineOnly)
+                    .with_timestamps(ObservationMode::InlineOnly),
+            )
+            .cancel(CancellationToken::new()),
+    );
     let mut saw_fixture = false;
     let mut saw_link = false;
     while let Some(item) = session.next_item().await {

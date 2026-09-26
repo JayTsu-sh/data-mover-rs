@@ -1,6 +1,7 @@
 use super::{CompletedPart, ProvideErrorMetadata, S3Storage, build_copy_source};
 use bytes::Bytes;
 
+use crate::model::{FailureClass, Transience};
 use crate::storage::backends::s3::{
     S3NativeCopySource, S3ObjectPage, S3ProtocolFailure, S3Result, S3VersionFacts, S3VersionMarker,
     S3VersionPage, S3WriteFacts,
@@ -32,6 +33,8 @@ macro_rules! classify_sdk {
 mod listing;
 mod multipart;
 mod native;
+#[cfg(test)]
+mod throttling_tests;
 mod versions;
 
 fn decode_parts(
@@ -519,19 +522,45 @@ pub(super) fn s3_role_remote_failure(
             Transience::Permanent,
             diagnostic,
         ),
-        (Some(429 | 500..=599), _) | (_, Some("SlowDown" | "ServiceUnavailable")) => {
-            crate::storage::backends::s3::S3ProtocolFailure::session(
-                FailureClass::Connectivity,
-                Transience::Transient,
-                diagnostic,
-            )
-        }
+        // The service asks for fewer requests: back off, it is no lost session (P7 §8, Q11). The
+        // scope stays the session's so callers outside a listing keep their behaviour; a listing
+        // backs off within its budget, and the traversal never ends on one.
+        (Some(429 | 503), _) => throttled(diagnostic),
+        (_, Some(code)) if is_throttling_code(code) => throttled(diagnostic),
+        (Some(500..=599), _) => crate::storage::backends::s3::S3ProtocolFailure::session(
+            FailureClass::Connectivity,
+            Transience::Transient,
+            diagnostic,
+        ),
         _ => crate::storage::backends::s3::S3ProtocolFailure::session(
             FailureClass::Protocol,
             Transience::Unknown,
             diagnostic,
         ),
     }
+}
+
+/// Error codes S3 and S3-compatible stores (and the AWS SDK's own throttling list) use to ask for
+/// fewer requests, whatever HTTP status carried them.
+fn is_throttling_code(code: &str) -> bool {
+    matches!(
+        code,
+        "SlowDown"
+            | "ServiceUnavailable"
+            | "Throttling"
+            | "ThrottlingException"
+            | "ThrottledException"
+            | "RequestThrottled"
+            | "RequestThrottledException"
+            | "TooManyRequests"
+            | "TooManyRequestsException"
+            | "RequestLimitExceeded"
+            | "BandwidthLimitExceeded"
+    )
+}
+
+fn throttled(diagnostic: &'static str) -> S3ProtocolFailure {
+    S3ProtocolFailure::session(FailureClass::Throttled, Transience::Transient, diagnostic)
 }
 
 #[cfg(test)]

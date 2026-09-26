@@ -428,8 +428,23 @@ mod unix {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path.as_str(), "fine");
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].path().as_str(), "@local-unix-hex:ff");
+        // No stand-in path that names nothing (P7 C3): the failure is at the listed directory,
+        // and the raw name is in its diagnostic and in the page's `raw_name`.
+        assert_eq!(failures[0].path(), &StoragePath::root());
         assert_eq!(failures[0].class(), FailureClass::Unsupported);
+        assert!(
+            failures[0].diagnostic().contains("\\xff"),
+            "{}",
+            failures[0].diagnostic()
+        );
+        assert!(failures[0].identity().is_some());
+        let request = ListRequest::new(StoragePath::root(), CancellationToken::new());
+        let page = collect_listing(namespace.list(request), CollectLimits::UNBOUNDED)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(page.failures.len(), 1);
+        assert_eq!(page.failures[0].name, None);
+        assert_eq!(page.failures[0].raw_name.as_deref(), Some(&[0xff_u8][..]));
         Ok(())
     }
 

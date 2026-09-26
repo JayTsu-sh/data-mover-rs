@@ -115,19 +115,18 @@ async fn run_once(namespace: &Arc<PrebuiltNamespace>, plan: ObservationPlan) -> 
         Arc::clone(namespace) as Arc<dyn Namespace>,
         Arc::new(FakeMetadata),
     );
-    let mut session = source.traverse(TraversalRequest {
-        root: StoragePath::root(),
-        order: crate::traversal::TraversalOrder::Admission,
-        max_inflight_operations: NonZeroUsize::new(64)
-            .unwrap_or_else(|| unreachable!("constant is nonzero")),
-        max_buffered_items: NonZeroUsize::new(1024)
-            .unwrap_or_else(|| unreachable!("constant is nonzero")),
-        observation_plan: plan,
-        cancel: tokio_util::sync::CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    });
+    let mut session = source.traverse(
+        TraversalRequest::new(StoragePath::root())
+            .order(crate::traversal::TraversalOrder::Admission)
+            .max_inflight_operations(
+                NonZeroUsize::new(64).unwrap_or_else(|| unreachable!("constant is nonzero")),
+            )
+            .max_buffered_items(
+                NonZeroUsize::new(1024).unwrap_or_else(|| unreachable!("constant is nonzero")),
+            )
+            .observation_plan(plan)
+            .cancel(tokio_util::sync::CancellationToken::new()),
+    );
     let mut entries = 0_u64;
     while let Some(item) = session.next_item().await {
         if matches!(item, TraversalItem::Entry(_)) {

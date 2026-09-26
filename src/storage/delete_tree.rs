@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use super::listing::is_vanished;
 use super::{
     CapabilityUnavailable, CollectLimits, ListRequest, Namespace, PreflightPolicy,
     SourceDescriptor, Storage, StorageRoleFailure, collect_listing,
@@ -257,7 +258,9 @@ impl Driver {
         let request = ListRequest::new(directory.clone(), self.request.cancel.clone());
         let listed = collect_listing(self.namespace.list(request), CollectLimits::UNBOUNDED).await;
         match listed.map(|page| page.into_descriptors(directory)) {
-            Ok((entries, failures)) => {
+            Ok((entries, mut failures)) => {
+                // A child gone before the listing described it is already deleted.
+                failures.retain(|failure| !is_vanished(directory, failure));
                 if !failures.is_empty() {
                     self.mark_incomplete(directory);
                 }

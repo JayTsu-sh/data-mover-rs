@@ -207,7 +207,7 @@ mod tests {
         assert!(matches!(
             delete_version_failure(Some(503), None, generic(Some(503))),
             S3ProtocolFailure::Session {
-                class: FailureClass::Connectivity,
+                class: FailureClass::Throttled,
                 ..
             }
         ));

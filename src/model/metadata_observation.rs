@@ -712,6 +712,7 @@ const fn failure_tag(value: FailureClass) -> u8 {
         FailureClass::Protocol => 9,
         FailureClass::Cancelled => 10,
         FailureClass::Internal => 11,
+        FailureClass::Throttled => 12,
     }
 }
 const fn failure_from_tag(tag: u8) -> Option<FailureClass> {
@@ -728,6 +729,7 @@ const fn failure_from_tag(tag: u8) -> Option<FailureClass> {
         9 => Some(FailureClass::Protocol),
         10 => Some(FailureClass::Cancelled),
         11 => Some(FailureClass::Internal),
+        12 => Some(FailureClass::Throttled),
         _ => None,
     }
 }

@@ -619,6 +619,7 @@ fn limited(protocol: &Arc<MemoryS3>, max_entries: usize) -> S3Namespace<MemoryS3
     S3Namespace::new(protocol.clone(), identity()).with_limits(ListingLimits {
         max_entries,
         max_empty_pages: 3,
+        ..ListingLimits::PRODUCTION
     })
 }
 

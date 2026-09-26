@@ -180,19 +180,17 @@ impl Metadata for BlockingMetadata {
 async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
     let source =
         StorageTraversalSource::with_roles(Arc::new(FakeNamespace), Arc::new(FakeMetadata));
-    let mut session = source.traverse(TraversalRequest {
-        root: StoragePath::root(),
-        order: crate::traversal::TraversalOrder::Admission,
-        max_inflight_operations: NonZeroUsize::new(2)
-            .unwrap_or_else(|| unreachable!("constant is nonzero")),
-        max_buffered_items: NonZeroUsize::new(1)
-            .unwrap_or_else(|| unreachable!("constant is nonzero")),
-        observation_plan: ObservationPlan::default(),
-        cancel: tokio_util::sync::CancellationToken::new(),
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    });
+    let mut session = source.traverse(
+        TraversalRequest::new(StoragePath::root())
+            .order(crate::traversal::TraversalOrder::Admission)
+            .max_inflight_operations(
+                NonZeroUsize::new(2).unwrap_or_else(|| unreachable!("constant is nonzero")),
+            )
+            .max_buffered_items(
+                NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("constant is nonzero")),
+            )
+            .cancel(tokio_util::sync::CancellationToken::new()),
+    );
     let mut observed = Vec::new();
     while let Some(item) = session.next_item().await {
         if crate::traversal::is_marker(&item) {
@@ -230,20 +228,18 @@ async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
 /// Requests timestamps explicitly so the Metadata role is exercised; under the default
 /// (all-`Omit`) plan the traversal builds observations locally and never calls it.
 fn request(cancel: tokio_util::sync::CancellationToken) -> TraversalRequest {
-    TraversalRequest {
-        root: StoragePath::root(),
-        order: crate::traversal::TraversalOrder::Admission,
-        max_inflight_operations: NonZeroUsize::new(2)
-            .unwrap_or_else(|| unreachable!("constant is nonzero")),
-        max_buffered_items: NonZeroUsize::new(1)
-            .unwrap_or_else(|| unreachable!("constant is nonzero")),
-        observation_plan: ObservationPlan::default()
-            .with_timestamps(crate::model::ObservationMode::Required),
-        cancel,
-        filter: None,
-        max_depth: None,
-        versions: TraversalVersions::Current,
-    }
+    TraversalRequest::new(StoragePath::root())
+        .order(crate::traversal::TraversalOrder::Admission)
+        .max_inflight_operations(
+            NonZeroUsize::new(2).unwrap_or_else(|| unreachable!("constant is nonzero")),
+        )
+        .max_buffered_items(
+            NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("constant is nonzero")),
+        )
+        .observation_plan(
+            ObservationPlan::default().with_timestamps(crate::model::ObservationMode::Required),
+        )
+        .cancel(cancel)
 }
 
 #[tokio::test]
@@ -494,3 +490,4 @@ mod pages;
 mod prefetch;
 mod residency;
 mod slots;
+mod vanish;

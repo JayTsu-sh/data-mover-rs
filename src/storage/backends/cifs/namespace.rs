@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 use super::metadata::{CifsInlineMetadata, timestamp};
 use super::source::{
@@ -12,9 +13,10 @@ use crate::model::{
     SymlinkTarget, TimestampMetadata,
 };
 use crate::storage::artifacts::is_artifact_path;
+use crate::storage::listing::child_path;
 use crate::storage::{
-    ListRequest, ListingPage, ListingStream, Namespace, NamespaceCapabilities, SourceDescriptor,
-    StorageRoleFailure,
+    ChildFailure, ListRequest, ListingPage, ListingStream, Namespace, NamespaceCapabilities,
+    SourceDescriptor, StorageRoleFailure,
 };
 
 /// Protocol verbs behind the CIFS namespace role.
@@ -24,11 +26,10 @@ use crate::storage::{
 #[async_trait]
 pub(super) trait CifsNamespaceProtocol: Send + Sync {
     async fn stat(&self, path: &StoragePath) -> smb_domain::Result<CifsSourceFacts>;
-    /// Lists direct children with the timestamps the `QUERY_DIRECTORY` records already carry.
-    async fn list(
-        &self,
-        path: &StoragePath,
-    ) -> smb_domain::Result<Vec<(StoragePath, CifsInlineMetadata)>>;
+    /// Lists direct children with the timestamps the `QUERY_DIRECTORY` records already carry. A
+    /// child whose name no storage path can spell is listed as [`CifsUnspelled`], beside its
+    /// siblings: one such name must not fail the whole directory (P7 §8).
+    async fn list(&self, path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>>;
     /// Creates one directory; an existing entry surfaces as `STATUS_OBJECT_NAME_COLLISION`.
     async fn create_directory(&self, path: &StoragePath) -> smb_domain::Result<()>;
     /// Deletes one file or one empty directory.
@@ -36,6 +37,31 @@ pub(super) trait CifsNamespaceProtocol: Send + Sync {
     /// Renames one file or directory, replacing an existing destination like the NFS and
     /// HDFS roles (servers only replace what NTFS semantics allow).
     async fn rename_entry(&self, from: &StoragePath, to: &StoragePath) -> smb_domain::Result<()>;
+}
+
+/// One listed child: its path and what its `QUERY_DIRECTORY` record carries, or the name the
+/// server gave a child that no storage path can spell.
+pub(super) type CifsListedChild = Result<(StoragePath, CifsInlineMetadata), CifsUnspelled>;
+
+/// A listed child no storage path can spell: the joined path is too long, or smb-rs decoded the
+/// UTF-16 name lossily (it holds U+FFFD), so the name does not reach the entry it came from.
+#[derive(Debug)]
+pub(super) struct CifsUnspelled {
+    /// The name as smb-rs decoded it.
+    pub(super) name: String,
+}
+
+impl CifsUnspelled {
+    /// The path of child `name` of `directory`, or the name when no path spells it.
+    pub(super) fn spell(directory: &StoragePath, name: &str) -> Result<StoragePath, Self> {
+        // smb-rs decodes names lossily: one holding U+FFFD may not name its entry.
+        Some(name)
+            .filter(|name| !name.contains(char::REPLACEMENT_CHARACTER))
+            .and_then(|name| child_path(directory, name).ok())
+            .ok_or_else(|| Self {
+                name: name.to_owned(),
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -74,8 +100,23 @@ impl CifsNamespace {
         // itself was listed, so failing it whole would drop them.
         let mut entries = Vec::with_capacity(facts.len());
         let mut failures = Vec::new();
+        let mut unspelled = Vec::new();
         let mut hidden = 0_u32;
-        for (child, inline) in facts {
+        for listed in facts {
+            let (child, inline) = match listed {
+                Ok(listed) => listed,
+                Err(CifsUnspelled { name }) => {
+                    unspelled.push(ChildFailure::unnamed(
+                        &self.identity,
+                        path,
+                        Bytes::from(name.into_bytes()),
+                        FailureClass::Unsupported,
+                        "a CIFS name cannot be spelled as a storage path (its UTF-16 is not \
+                         valid, or the path is too long)",
+                    ));
+                    continue;
+                }
+            };
             if is_artifact_path(child.as_str()) {
                 tracing::trace!("[CIFS] listing skips transfer artifact {}", child.as_str());
                 hidden = hidden.saturating_add(1);
@@ -89,9 +130,11 @@ impl CifsNamespace {
                 Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
             }
         }
-        Ok(ListingPage::from_descriptors(
-            path, entries, failures, hidden,
-        ))
+        let mut page = ListingPage::from_descriptors(path, entries, failures, hidden);
+        for failure in unspelled {
+            page.push_failure(failure);
+        }
+        Ok(page)
     }
 
     /// One listed child with the timestamps and mode its `QUERY_DIRECTORY` record carries.
@@ -138,14 +181,15 @@ impl CifsNamespace {
             .list(path)
             .await
             .map_err(|error| blame(&error))?;
-        if !children
-            .iter()
-            .all(|(child, inline)| is_artifact_path(child.as_str()) && !inline.reparse_point)
-        {
+        if !children.iter().all(|listed| {
+            listed.as_ref().is_ok_and(|(child, inline)| {
+                is_artifact_path(child.as_str()) && !inline.reparse_point
+            })
+        }) {
             return Err(refused);
         }
         let Some(removals) = self
-            .artifact_removals(children)
+            .artifact_removals(children.into_iter().flatten().collect())
             .await
             .map_err(|error| blame(&error))?
         else {
@@ -184,13 +228,21 @@ impl CifsNamespace {
                 Err(error) if is_not_found(&error) => continue,
                 Err(error) => return Err(error),
             };
-            if listed.iter().any(|(_, inline)| inline.reparse_point) {
+            // A reparse point is never descended into, and a child no path can spell cannot be
+            // removed: either keeps the directory.
+            if listed.iter().any(|listed| {
+                listed
+                    .as_ref()
+                    .ok()
+                    .is_none_or(|(_, inline)| inline.reparse_point)
+            }) {
                 return Ok(None);
             }
             pending.push((path, kind, true));
             pending.extend(
                 listed
                     .into_iter()
+                    .flatten()
                     .map(|(child, inline)| (child, inline.facts.kind, false)),
             );
         }

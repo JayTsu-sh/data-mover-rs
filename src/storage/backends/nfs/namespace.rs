@@ -11,11 +11,11 @@ use crate::model::{
 };
 use crate::storage::artifacts::is_artifact_native;
 use crate::storage::listing::respelled;
-use crate::storage::{InlineOwnership, ListingFacts};
 use crate::storage::{
-    ListRequest, ListingPage, ListingStream, Namespace, NamespaceCapabilities, SourceDescriptor,
-    StorageRoleFailure,
+    ChildFailure, ListRequest, ListingPage, ListingStream, Namespace, NamespaceCapabilities,
+    SourceDescriptor, StorageRoleFailure,
 };
+use crate::storage::{InlineOwnership, ListingFacts};
 
 #[derive(Clone)]
 pub(crate) struct NfsNamespaceAdapter {
@@ -55,25 +55,54 @@ pub(crate) struct NfsUndescribedChild {
     pub(crate) failure: NfsProtocolFailure,
     /// What was wrong with it, for the diagnostic.
     pub(crate) reason: &'static str,
+    /// The name as nfs-rs decoded it, when no path can spell the child (see [`unnamed_child`]).
+    pub(crate) raw_name: Option<bytes::Bytes>,
 }
 
 /// One child of a listing: its observation, or why it could not be described.
 pub(crate) type NfsListedChild = Result<NfsNamespaceObservation, NfsUndescribedChild>;
 
 /// A child of `directory` the role listing could not describe, blamed on the child's own path
-/// when it can be spelled and on the directory otherwise.
+/// when it can be spelled and on the directory otherwise. A name nfs-rs decoded lossily (see
+/// [`lossily_decoded`]) cannot be trusted to spell the child, so it is blamed on the directory.
 pub(crate) fn undescribed_child(
     directory: &StoragePath,
     child: &Path,
     reason: &'static str,
 ) -> NfsUndescribedChild {
+    let spelled = child.to_string_lossy();
     NfsUndescribedChild {
-        path: StoragePath::new(child.to_string_lossy()).unwrap_or_else(|_| directory.clone()),
+        path: if lossily_decoded(&spelled) {
+            directory.clone()
+        } else {
+            StoragePath::new(spelled).unwrap_or_else(|_| directory.clone())
+        },
         // The server answered for the directory but not fully for this entry: a later look may
         // well succeed, so whether retrying helps is not known.
         failure: NfsProtocolFailure::new(FailureClass::Protocol, Transience::Unknown),
         reason,
+        raw_name: None,
     }
+}
+
+/// A child of `directory` whose name the server sent in bytes that are not UTF-8. nfs-rs hands
+/// every name over as a `String`, replacing invalid bytes with U+FFFD, so the raw name is lost and
+/// the replaced one names a different entry (or none): a path built from it must not be listed,
+/// or the traversal would descend into it, find nothing, and count its whole subtree as gone.
+/// A name that really contains U+FFFD is reported the same way; it cannot be told apart.
+pub(crate) fn unnamed_child(directory: &StoragePath, name: &str) -> NfsUndescribedChild {
+    NfsUndescribedChild {
+        path: directory.clone(),
+        failure: NfsProtocolFailure::new(FailureClass::Unsupported, Transience::Permanent),
+        reason: "an NFS name is not UTF-8 (the NFS client replaced the invalid bytes), so no path \
+                 can spell it",
+        raw_name: Some(bytes::Bytes::copy_from_slice(name.as_bytes())),
+    }
+}
+
+/// Whether a name nfs-rs decoded may have been replaced: it holds U+FFFD.
+pub(crate) fn lossily_decoded(name: &str) -> bool {
+    name.contains(char::REPLACEMENT_CHARACTER)
 }
 
 #[async_trait]
@@ -117,6 +146,7 @@ impl NfsNamespaceAdapter {
             .map_err(|error| role_failure(path, Operation::Namespace, error))?;
         let mut entries = Vec::with_capacity(children.len());
         let mut failures = Vec::new();
+        let mut unnamed = Vec::new();
         let mut hidden = 0_u32;
         for child in children {
             match child {
@@ -128,13 +158,27 @@ impl NfsNamespaceAdapter {
                         Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
                     }
                 }
+                Err(NfsUndescribedChild {
+                    raw_name: Some(raw),
+                    reason,
+                    failure,
+                    ..
+                }) => unnamed.push(ChildFailure::unnamed(
+                    &self.identity,
+                    path,
+                    raw,
+                    failure.class,
+                    reason,
+                )),
                 Err(child) if is_internal(&child.path) => hidden = hidden.saturating_add(1),
                 Err(child) => failures.push(undescribed(child)),
             }
         }
-        Ok(ListingPage::from_descriptors(
-            path, entries, failures, hidden,
-        ))
+        let mut page = ListingPage::from_descriptors(path, entries, failures, hidden);
+        for failure in unnamed {
+            page.push_failure(failure);
+        }
+        Ok(page)
     }
 }
 
@@ -145,6 +189,7 @@ fn undescribed(child: NfsUndescribedChild) -> EntryOperationFailure {
         path,
         failure,
         reason,
+        ..
     } = child;
     EntryOperationFailure::new(
         path,
@@ -310,6 +355,7 @@ mod tests {
             path: path(value),
             failure: NfsProtocolFailure::new(FailureClass::Protocol, Transience::Unknown),
             reason: "the server omitted its attributes",
+            raw_name: None,
         })
     }
 
@@ -397,6 +443,32 @@ mod tests {
         assert_eq!(failures[0].class(), FailureClass::Protocol);
         assert_eq!(failures[0].transience(), Transience::Unknown);
         assert!(failures[0].diagnostic().contains("omitted its attributes"));
+    }
+
+    /// A name nfs-rs decoded lossily is a child no path can spell: a failure at the directory,
+    /// with the name as decoded, never a child listed under a path that names nothing (P7 C3).
+    #[tokio::test]
+    async fn a_lossily_decoded_name_is_an_unnamed_failure() {
+        let namespace = adapter(Listing(Some(|| {
+            vec![
+                Ok(observed("d/a")),
+                Err(super::unnamed_child(&path("d"), "bad\u{FFFD}name")),
+            ]
+        })));
+        let page = list(&namespace, "d")
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(page.children.len(), 1);
+        assert_eq!(page.failures.len(), 1);
+        let unnamed = &page.failures[0];
+        assert_eq!(unnamed.name, None);
+        assert_eq!(
+            unnamed.raw_name.as_deref(),
+            Some("bad\u{FFFD}name".as_bytes())
+        );
+        assert_eq!(unnamed.failure.path(), &path("d"));
+        assert_eq!(unnamed.failure.class(), FailureClass::Unsupported);
+        assert!(unnamed.failure.identity().is_some());
     }
 
     /// A listing whose every child is described has no failures; a directory that cannot be

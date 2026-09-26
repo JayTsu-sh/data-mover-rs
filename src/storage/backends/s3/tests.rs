@@ -702,3 +702,6 @@ mod multipart;
 
 #[path = "namespace_tests.rs"]
 mod namespace;
+
+#[path = "listing_failure_tests.rs"]
+mod listing_failures;
