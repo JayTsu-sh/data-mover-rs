@@ -44,6 +44,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{InlineOwnership, ListingFacts, SourceDescriptor, StorageRoleFailure};
+pub use collect::{CollectLimits, collect_listing};
 pub use failure::{ChildFailure, is_vanished};
 pub use hint::DescentHint;
 pub use names::child_path;
@@ -672,52 +673,6 @@ impl fmt::Debug for PageSink {
     }
 }
 
-/// Bounds on what [`collect_listing`] holds in memory.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CollectLimits {
-    /// Most children and child failures one collected listing may hold; `None` is unbounded.
-    pub max_children: Option<NonZeroUsize>,
-}
-
-impl CollectLimits {
-    /// No bound: the whole directory is held, however large.
-    pub const UNBOUNDED: Self = Self { max_children: None };
-
-    /// At most `max_children` children and child failures.
-    #[must_use]
-    pub const fn at_most(max_children: NonZeroUsize) -> Self {
-        Self {
-            max_children: Some(max_children),
-        }
-    }
-}
-
-/// Reads a whole listing into one page: every child, every failure, the hidden count summed.
-///
-/// # Errors
-/// Returns the listing's own failure, or a `Capacity` entry failure at the listed directory once
-/// it holds more than `limits` allows; the stream is dropped then, which ends its producer.
-pub async fn collect_listing(
-    mut stream: ListingStream,
-    limits: CollectLimits,
-) -> Result<ListingPage, StorageRoleFailure> {
-    let mut whole = ListingPage::default();
-    while let Some(page) = stream.next().await {
-        whole.absorb(page?);
-        if let Some(max) = limits.max_children
-            && whole.children.len() + whole.failures.len() > max.get()
-        {
-            return Err(StorageRoleFailure::Entry(listing_failure(
-                stream.path(),
-                FailureClass::Capacity,
-                Transience::Permanent,
-                "the directory holds more children than this caller collects",
-            )));
-        }
-    }
-    Ok(whole)
-}
-
 /// The failure a listing ends with when its request was cancelled.
 #[must_use]
 pub(crate) fn cancelled(path: &StoragePath) -> StorageRoleFailure {
@@ -786,6 +741,7 @@ fn listing_failure(
     .unwrap_or_else(|_| unreachable!("the static listing diagnostic is valid"))
 }
 
+mod collect;
 mod failure;
 mod hint;
 mod names;
