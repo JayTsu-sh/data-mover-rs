@@ -4,7 +4,8 @@
 //! - `smb:<sub-path>` — that sub-path of the share named by `CIFS_REAL_SERVER` / `CIFS_REAL_SHARE` /
 //!   `CIFS_REAL_USER` / `CIFS_REAL_PASS` (the e2e-cifs `.env`);
 //! - `s3:<prefix>` — that prefix of the bucket named by `S3_HOST` / `S3_BUCKET` / `S3_AK` / `S3_SK` /
-//!   `S3_USE_HTTPS` / `S3_COMPAT` (the e2e-s3 `.env`, or its `dxn/` / `storagegrid/` siblings);
+//!   `S3_USE_HTTPS` / `S3_COMPAT` / `S3_TLS_VERIFY` / `S3_BUCKET_TYPE` (the e2e-s3 `.env`, or its
+//!   `dxn/` / `storagegrid/` / `ontap/` / `rustfs/` siblings);
 //! - `s3@<bucket>:<prefix>` — the same, in another bucket of that server;
 //! - `hdfs://…` — an HDFS location, with `LAB_HDFS_CONFIG_DIR` / `LAB_HDFS_KEYTAB` for the client;
 //! - anything else — a local directory, created if missing.
@@ -31,30 +32,49 @@ fn env_var(name: &str) -> Result<String> {
     env::var(name).map_err(|_| format!("{name} is not set (source the skill's .env)").into())
 }
 
-/// `s3[+sg|+dxn][+https]://AK:SK@bucket.host/prefix` — the crate takes the key and secret as
-/// written, undecoded. `S3_COMPAT=sg|dxn` selects the `StorageGRID` / DXN profile. The bucket is
+/// `s3[+https]://AK:SK@bucket.host/prefix[?options]` — the crate takes the key and secret as
+/// written, undecoded. `S3_USE_HTTPS=true` selects HTTPS; `S3_COMPAT=sg|dxn|hcp|ontap`,
+/// `S3_TLS_VERIFY=false` and `S3_BUCKET_TYPE=nas` become the URL's options (empty, `true` /
+/// `object` = the default), as `.claude/skills/_shared/s3_url.sh` builds them. The bucket is
 /// `S3_BUCKET` unless one is named.
 fn s3_url(bucket: Option<&str>, prefix: &str) -> Result<String> {
-    let compat = match env::var("S3_COMPAT").unwrap_or_default().as_str() {
-        "" | "standard" => "",
-        "sg" => "+sg",
-        "dxn" => "+dxn",
-        _ => return Err("S3_COMPAT must be standard, sg or dxn".into()),
-    };
-    let tls = if env::var("S3_USE_HTTPS").is_ok_and(|value| value == "true") {
-        "+https"
-    } else {
-        ""
-    };
-    let scheme = format!("s3{compat}{tls}");
+    let https = env::var("S3_USE_HTTPS").is_ok_and(|value| value == "true");
+    let query = s3_options()?;
     Ok(format!(
-        "{scheme}://{}:{}@{}.{}/{}",
+        "{}://{}:{}@{}.{}/{}{query}",
+        if https { "s3+https" } else { "s3" },
         env_var("S3_AK")?,
         env_var("S3_SK")?,
         bucket.map_or_else(|| env_var("S3_BUCKET"), |bucket| Ok(bucket.to_owned()))?,
         env_var("S3_HOST")?,
         prefix.trim_start_matches('/')
     ))
+}
+
+/// The query of the options the environment names (`""` for none).
+fn s3_options() -> Result<String> {
+    let var = |name: &str| env::var(name).unwrap_or_default();
+    let mut options = Vec::new();
+    match var("S3_COMPAT").as_str() {
+        "" => {}
+        compat @ ("sg" | "dxn" | "hcp" | "ontap") => options.push(format!("compat={compat}")),
+        _ => return Err("S3_COMPAT must be empty, sg, dxn, hcp or ontap".into()),
+    }
+    match var("S3_TLS_VERIFY").as_str() {
+        "" | "true" => {}
+        "false" => options.push("tls_verify=false".to_owned()),
+        _ => return Err("S3_TLS_VERIFY must be empty, true or false".into()),
+    }
+    match var("S3_BUCKET_TYPE").as_str() {
+        "" | "object" => {}
+        "nas" => options.push("bucket_type=nas".to_owned()),
+        _ => return Err("S3_BUCKET_TYPE must be empty, object or nas".into()),
+    }
+    Ok(if options.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", options.join("&"))
+    })
 }
 
 fn hdfs_client() -> data_mover::HdfsConfig {

@@ -14,7 +14,10 @@ S3_HOST=s3.amazonaws.com         # 或 minio.local 等
 S3_BUCKET=my-bucket
 S3_AK=ACCESS_KEY
 S3_SK=SECRET_KEY
-S3_USE_HTTPS=false               # true → s3+https://
+S3_USE_HTTPS=false               # true → s3+https://（默认校验证书）
+S3_COMPAT=                       # sg|dxn|hcp|ontap → ?compat=…（空 = 标准 S3）
+S3_TLS_VERIFY=                   # false → tls_verify=false（只配 S3_USE_HTTPS=true；自签证书，如 DXN 8182）
+S3_BUCKET_TYPE=                  # nas → bucket_type=nas（只配 S3_COMPAT=ontap；NAS profile 尚未实现，连接报 Unsupported）
 S3_PREFIX=test                   # bucket 内的子路径
 ```
 
@@ -22,7 +25,10 @@ S3_PREFIX=test                   # bucket 内的子路径
 
 1. cargo build --example s3_walkdir
 2. s3_walkdir 列 bucket — 应返回。`run.py` 把带凭据的 URL 经环境变量 `S3_LISTING_URL` 交给例子（不上命令行）；
-   认 `S3_ENV`（服务器的 `.env`）与 `S3_COMPAT`（`dxn` / `sg` → `s3+dxn://` / `s3+sg://`），调用方设的 `S3_BUCKET` 优先。
+   认 `S3_ENV`（服务器的 `.env`）与 `S3_COMPAT` / `S3_TLS_VERIFY` / `S3_BUCKET_TYPE`（→ `?compat=dxn&tls_verify=false` 等，
+   与 `examples/endpoint_support`、`.claude/skills/_shared/s3_url.sh` 同一规则），调用方设的 `S3_BUCKET` 优先。
+   DXN 的 HTTPS 端口：`S3_ENV=.claude/skills/e2e-s3/dxn/.env S3_HOST=10.131.7.201:8182 S3_USE_HTTPS=true S3_TLS_VERIFY=false`
+   （不加 `S3_TLS_VERIFY=false` 必须因证书不受信而失败）。
 3. **404 验证**：用 `s3_walkdir <bucket>/this-key-does-not-exist-{timestamp}` 触发 NoSuchKey，应映射为 `FileNotFound`，**不重试**。
 
 4. **写入策略矩阵**（role-based 目的端）：`bash .claude/skills/e2e-s3/scripts/staged_matrix.sh` ——

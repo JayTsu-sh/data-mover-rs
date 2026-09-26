@@ -54,7 +54,7 @@ validate_run_id "$run_id"
 : "${LAB_DXN_S3_ACCESS_KEY:?LAB_DXN_S3_ACCESS_KEY is required}"
 : "${LAB_DXN_S3_SECRET_KEY:?LAB_DXN_S3_SECRET_KEY is required}"
 prefix="ci/$run_id/dxn-s3-architecture"
-export LAB_DXN_S3_ARCHITECTURE_URL="s3+dxn://${LAB_DXN_S3_ACCESS_KEY}:${LAB_DXN_S3_SECRET_KEY}@${bucket}.${endpoint#http://}"
+export LAB_DXN_S3_ARCHITECTURE_URL="s3://${LAB_DXN_S3_ACCESS_KEY}:${LAB_DXN_S3_SECRET_KEY}@${bucket}.${endpoint#http://}?compat=dxn"
 export LAB_DXN_S3_ARCHITECTURE_KEY="$prefix/published.bin"
 
 cargo test --test s3_architecture_contract dxn_s3_architecture_roles_and_known_limits \

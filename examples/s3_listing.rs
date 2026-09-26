@@ -36,7 +36,7 @@ const URL_ENV: &str = "S3_LISTING_URL";
 
 #[derive(Debug, Parser)]
 struct Args {
-    /// `s3://AK:SK@bucket.host:port/prefix` (or any `s3+…://` profile); `S3_LISTING_URL` if absent.
+    /// `s3://AK:SK@bucket.host:port/prefix` (options such as `?compat=dxn` in the query); `S3_LISTING_URL` if absent.
     url: Option<String>,
     /// Walk from this directory below the storage root.
     #[arg(long)]

@@ -296,7 +296,7 @@ legacy S3 copy run does not certify this gate: the configured service must
 accept CreateMultipartUpload and the complete multipart lifecycle.
 
 `run-dxn-s3-contract.sh` is the independent `DM-DXN-CONTRACT` gate. It uses
-the `s3+dxn://` profile and requires `LAB_DXN_S3_ACCESS_KEY` plus
+the `?compat=dxn` profile and requires `LAB_DXN_S3_ACCESS_KEY` plus
 `LAB_DXN_S3_SECRET_KEY`; the endpoint and bucket default to the shared DXN lab
 but can be overridden with `LAB_DXN_S3_ENDPOINT` and `LAB_DXN_S3_BUCKET`.
 Credentials remain process-local. The gate covers multipart interruption,
@@ -312,9 +312,9 @@ The lab does not currently contain a real StorageGRID system. Request-level
 tests use a capturing Smithy connector to verify that standard S3 requests
 retain the SDK-generated `x-id` and StorageGRID requests remove it from the
 transmitted URI. They also verify that StorageGRID multi-object delete carries
-a body-matching, SigV4-signed `Content-MD5`. Dedicated `s3+sg://` smoke cases run against the
+a body-matching, SigV4-signed `Content-MD5`. Dedicated `?compat=sg` smoke cases run against the
 configured S3-compatible endpoints while the main S3 matrix continues using
-standard `s3://`. These checks validate scheme selection, copy, rename, and
+standard `s3://`. These checks validate profile selection, copy, rename, and
 non-regression behavior, but they are not a substitute for a smoke test on the
 target StorageGRID version.
 

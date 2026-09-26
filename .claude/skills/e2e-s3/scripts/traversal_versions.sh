@@ -45,7 +45,7 @@
 # Also: whether the server honours `delimiter` (raw request, printed).
 #
 # Env: S3_ENV (default .claude/skills/e2e-s3/.env; e.g. .claude/skills/e2e-s3/dxn/.env) with S3_HOST,
-# S3_AK, S3_SK (S3_COMPAT / S3_USE_HTTPS pick the URL scheme). BUCKET_PREFIX names the temporary
+# S3_AK, S3_SK (S3_USE_HTTPS / S3_COMPAT / S3_TLS_VERIFY shape the URL, .claude/skills/_shared/s3_url.sh). BUCKET_PREFIX names the temporary
 # bucket (default data-mover-c22 → <prefix>-<run>); S3_LOCATION, when set, is the CreateBucket
 # LocationConstraint (DXN). EXPECT_ORDER=server (default) | inferred. Exit status 0 only when every
 # check passed and the bucket (temporary) or the prefix (existing bucket) is gone.
@@ -54,6 +54,8 @@ ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$ROOT"
 S3_ENV=${S3_ENV:-.claude/skills/e2e-s3/.env}
 set -a; . "$S3_ENV"; set +a
+. .claude/skills/_shared/s3_url.sh
+s3_url check check >/dev/null || exit 2   # a bad S3_COMPAT / S3_TLS_VERIFY fails before any request
 RUN=${RUN:-$(date +%s)}
 [[ $RUN =~ ^[a-z0-9-]{1,30}$ ]] || { echo "RUN must match [a-z0-9-]{1,30}: $RUN" >&2; exit 1; }
 EXPECT_ORDER=${EXPECT_ORDER:-server}
@@ -231,9 +233,8 @@ fi
 
 # Raw, as examples/endpoint_support builds it: the URL parser splits the key pair at the first
 # ':' and the host at the last '@' and does not percent-decode. Only in this script's environment.
-case "${S3_COMPAT:-}" in sg) COMPAT=+sg ;; dxn) COMPAT=+dxn ;; *) COMPAT= ;; esac
-TLS=; [ "${S3_USE_HTTPS:-}" = true ] && TLS=+https
-export S3_LISTING_URL="s3$COMPAT$TLS://$S3_AK:$S3_SK@$VB.$S3_HOST/$P"
+S3_LISTING_URL=$(s3_url "$VB" "$P") || exit 2
+export S3_LISTING_URL
 BIN=target/debug/examples/storage_role_operations
 traverse() { # concurrency, args...
   "$BIN" --backend s3 --concurrency "$1" traverse "${@:2}" 2>"$WORK/stderr" \

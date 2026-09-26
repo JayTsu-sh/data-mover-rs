@@ -12,11 +12,29 @@ it has no `StorageEnum` variant and no URL form.
 | NFS v3 | `nfs://server:port/export/path:/prefix?uid=1000&gid=1000` |
 | S3 | `s3://access_key:secret_key@bucket.host:port/prefix` |
 | S3 (TLS) | `s3+https://access_key:secret_key@bucket.host/prefix` |
-| StorageGRID | `s3+sg://access_key:secret_key@bucket.host:port/prefix` |
-| StorageGRID (TLS) | `s3+sg+https://access_key:secret_key@bucket.host/prefix` |
-| DXN | `s3+dxn://access_key:secret_key@bucket.host:port/prefix` |
-| DXN (TLS) | `s3+dxn+https://access_key:secret_key@bucket.host/prefix` |
+| StorageGRID | `s3://access_key:secret_key@bucket.host:port/prefix?compat=sg` |
+| DXN | `s3://access_key:secret_key@bucket.host:port/prefix?compat=dxn` |
+| HCP | `s3://access_key:secret_key@namespace.tenant.host/prefix?compat=hcp` |
+| ONTAP S3 | `s3://access_key:secret_key@bucket.host/prefix?compat=ontap` |
 | SMB/CIFS | No URL. Use `connect_backend(BackendConfig::Cifs(CifsBackendConfig { .. }))` |
+
+S3 URL options (the query; leave one out for its default):
+
+| Option | Values | Default |
+|--------|--------|---------|
+| `compat` | `sg`, `dxn`, `hcp`, `ontap` | standard S3 |
+| `tls_verify` | `false` (only on `s3+https://`) | certificates verified |
+| `bucket_type` | `nas` (only with `compat=ontap`; not implemented yet, refused at connect) | object bucket |
+
+Writing a default (`compat=standard`, `tls_verify=true`, `bucket_type=object`), an unknown,
+repeated or empty option, `tls_verify` on `s3://` or `bucket_type=nas` without `compat=ontap`
+is a `UrlParseError`. The schemes `s3+http://`, `s3+sg[+https]://`, `s3+dxn[+https]://` and
+`s3+hcp://` were removed; their error names the new spelling. Options are not part of the
+endpoint identity.
+
+`s3+https://` verifies the server certificate against the system roots, which honour
+`SSL_CERT_FILE` / `SSL_CERT_DIR` (trust a private CA there). For a self-signed endpoint add
+`tls_verify=false`: the certificate is then not verified, and every connection logs a warning.
 
 ### S3 Timeout Environment Variables
 
@@ -153,21 +171,17 @@ Some StorageGRID versions reject the AWS SDK's informational `x-id` query
 parameter. Select StorageGRID compatibility per endpoint with its storage URL:
 
 ```text
-s3+sg://access_key:secret_key@bucket.host:port/prefix
-s3+sg+https://access_key:secret_key@bucket.host/prefix
+s3://access_key:secret_key@bucket.host:port/prefix?compat=sg
+s3+https://access_key:secret_key@bucket.host/prefix?compat=sg
 ```
 
-`s3+sg://` uses HTTP. `s3+sg+https://` uses HTTPS and, like the existing
-`s3+https://` scheme, skips certificate verification for trusted private
-deployments with self-signed certificates.
-
-For clients created from either StorageGRID scheme, data-mover removes the
+For clients created with `compat=sg`, data-mover removes the
 exact `x-id` query parameter immediately before SigV4 signing. Other query
-parameters and their encoded bytes are preserved. The scheme applies to both
+parameters and their encoded bytes are preserved. The option applies to both
 bucket listing and normal S3 data operations and does not change credentials,
 path-style addressing, or general checksum configuration.
 
-Standard `s3://`, `s3+http://`, and `s3+https://` clients never remove `x-id`,
+Clients without `compat=sg` never remove `x-id`,
 so standard S3 and StorageGRID endpoints can safely coexist in one process.
 There is no environment-variable override.
 
@@ -180,14 +194,13 @@ Every S3 implementation accepts `Content-MD5`.
 
 ### DXN compatibility
 
-Select DXN compatibility per endpoint with `s3+dxn://` for HTTP or
-`s3+dxn+https://` for HTTPS. Like every profile, DXN clients add the signed
+Select DXN compatibility per endpoint with `?compat=dxn` (on `s3://` or
+`s3+https://`). Like every profile, DXN clients add the signed
 `Content-MD5` to multi-object delete requests. Unlike StorageGRID compatibility,
 DXN compatibility does not remove the AWS SDK's `x-id` query parameter.
 
-The HTTPS form skips certificate
-verification and is intended only for trusted private deployments with
-self-signed certificates.
+DXN's HTTPS endpoint presents a self-signed certificate: trust its CA through
+`SSL_CERT_FILE`, or add `tls_verify=false` on a trusted network.
 
 #### Known DXN limitations
 

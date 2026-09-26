@@ -24,6 +24,7 @@
 | 改 CIFS (role-based backend / signing / staged) | `.claude/docs/storage-cifs.md` + `src/storage/backends/cifs/` |
 | 改 NFS v3/v4 retry 分类 | `.claude/docs/storage-nfs.md` + `.claude/docs/error-taxonomy.md` + `src/nfs.rs` |
 | 改 S3 multipart / 404 / credential | `.claude/docs/storage-s3.md` + `src/s3.rs` |
+| 改 S3 URL 参数（`compat=` / `tls_verify=false` / `bucket_type=nas`）/ TLS 校验 / 旧协议名报错 | `.claude/docs/storage-s3.md` "URL 形式" "TLS" + `src/s3/url_options.rs`（唯一解析器）+ `src/s3/url_options_tests.rs` + `tests/s3_tls_verify.rs` |
 | 改 Local rayon delete / Win ACL | `.claude/docs/storage-local.md` + `src/local.rs` + `src/acl.rs` |
 | **新增/修改 `StorageEnum` 操作** | `.claude/docs/storage-enum-dispatch.md` + `src/storage_enum.rs` (1334 行) |
 | 改 filter DSL (lexer / `should_skip` 三元组) | `.claude/docs/filter-dsl.md` + `src/filter.rs` (4849 行) + `src/filter_traversal.rs` (role-based 适配器) |

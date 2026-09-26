@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-from urllib.parse import quote
-
-
-
 
 def nfs_url(
     host: str,
@@ -37,16 +33,38 @@ def s3_url(
     prefix: str = "",
     port: int | None = None,
     use_https: bool = False,
+    compat: str = "",
+    tls_verify: bool = True,
+    bucket_type: str = "",
 ) -> str:
+    """`compat` (sg|dxn|hcp|ontap), `tls_verify=False` (HTTPS only) and `bucket_type` (nas, with
+    compat=ontap) become the URL's options; the defaults are left out, as the crate requires.
+
+    The crate takes the key pair as written (split at the last '@', not percent-decoded).
+    """
+    if compat not in ("", "sg", "dxn", "hcp", "ontap"):
+        raise ValueError(f"compat must be empty, sg, dxn, hcp or ontap: {compat}")
+    if bucket_type not in ("", "nas"):
+        raise ValueError(f"bucket_type must be empty or nas: {bucket_type}")
+    if bucket_type == "nas" and compat != "ontap":
+        raise ValueError("bucket_type=nas needs compat=ontap")
+    if not tls_verify and not use_https:
+        raise ValueError("tls_verify=False needs use_https=True")
     scheme = "s3+https" if use_https else "s3"
     auth = ""
     if access_key or secret_key:
-        auth = f"{quote(access_key)}:{quote(secret_key)}@"
+        auth = f"{access_key}:{secret_key}@"
     host_part = f"{bucket}.{host}"
     if port:
         host_part += f":{port}"
     path = f"/{prefix.lstrip('/')}" if prefix else "/"
-    return f"{scheme}://{auth}{host_part}{path}"
+    options = [f"compat={compat}"] if compat else []
+    if not tls_verify:
+        options.append("tls_verify=false")
+    if bucket_type:
+        options.append(f"bucket_type={bucket_type}")
+    query = f"?{'&'.join(options)}" if options else ""
+    return f"{scheme}://{auth}{host_part}{path}{query}"
 
 
 def local_url(path: str) -> str:

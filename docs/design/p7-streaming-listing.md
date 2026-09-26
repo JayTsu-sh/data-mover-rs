@@ -651,6 +651,15 @@ struct VersionRecord {
 - 历史重放（D5 / D11）：按记录旧→新，版本走 `TransferRequest::with_source_version`，删除标记走
   `transfer::write_delete_marker`（H1），先用 `transfer::destination_keeps_history` 判断目的端能否存历史，一个 key 严格串行；重放不去重，重跑前比对目的端历史。
 
+### 11.2b S3 URL 参数化（P1–P5）对 terrasync 的要求
+
+- 配置里的 S3 URL 要迁移：`s3+sg://` → `s3://…?compat=sg`，`s3+dxn://` → `s3://…?compat=dxn`，`s3+hcp://` → `s3://…?compat=hcp`，
+  `s3+http://` → `s3://`；旧 `s3+sg+https://` / `s3+dxn+https://` → `s3+https://…?compat=sg|dxn&tls_verify=false`。旧写法连接时报
+  `UrlParseError`，报错给出新写法。
+- `s3+https://` 现在**校验证书**：自签 / 私有 CA 端点要么把 CA 放进 `SSL_CERT_FILE` / `SSL_CERT_DIR`，要么 URL 加 `tls_verify=false`
+  （每连接告警）。未知参数不再被忽略（改前带桶 URL 的查询串被丢弃），拼 URL 的地方不能再往查询串里塞别的东西。
+- 参数不进端点身份，已落库的身份键、恢复绑定不受影响；terrasync 自己若把 URL 文本当键，需要按新写法重新规范化。
+
 ### 11.3 可选
 
 - 列举本身的同批重复（S3 跨页重复对象、NFS 变化中的目录在 cookie 边界重复一项）很少见，会多发一次 New；
@@ -884,6 +893,8 @@ C7b fix(nfs): v3 READDIRPLUS 列出、却不给属性的 `.snapshot`（ONTAP 卷
     一条 `info!`）；不是目录 → 按查到的属性当普通子项；查失败 → 该子项失败（查询自己的分类，`NOENT` 即消失），会话 / 节流 /
     目录句柄失效的失败按 READDIRPLUS 失败结束这次读取。带属性的 `.snapshot`（DXN 上真建的目录）、其他名字、v4 一律不变
 P1–P5  S3 URL 参数化（§14.2）—— F5 合入后，可与 C7 并行
+       —— 已完成（分支 p7-url，合入主线后提交号会变）：P1 `90c4168`、P2 `b7f18c3`、P3 `7c77c40`（+ refactor `119e838` 移出 tls.rs）、
+       P4 `e6125f7`、P5（调用方与文档）；真机见 §14.2 实施记录
 N0     NAS 桶实测（curl，§14.2）—— 立即
 N1–N7  `compat=ontap&bucket_type=nas` 的 NAS 桶 profile（§14.2）—— H1、C7 之后
 F5h fix(s3): 目录对象的单 PUT 改为流式（Content-Length = 源大小、UNSIGNED-PAYLOAD、边传边算 MD5 与回复 ETag 核对），不再整对象缓冲
@@ -1050,6 +1061,19 @@ F4、F6、空末页、CommonPrefix 计入 max-keys、不回显 Delimiter），�
 **顺序**：N0 实测立即（curl，a–l：UNSIGNED-PAYLOAD 200 MiB、PUT 中途被杀旧对象是否完好、短体、各处 ETag 是否一致、GET 响应头、5 GiB、零字节 `d/`
 两种顺序、NFS 写是否改 ETag、空目录是否为 CommonPrefix、1 GiB CopyObject、名字冲突、PUT 期间 GET）→ P1–P5 在 F5 合入后（可与 C7 并行）→
 N1–N7 在 H1、C7 之后。完整方案（file:line）见会话 scratchpad `s3-url-nas-plan.md`（会话结束即失效，要点以本节为准）。
+
+**P1–P5 实施记录（2026-09-26）**：解析器 `src/s3/url_options.rs`（表测 `url_options_tests.rs`），TLS 代码在 `src/s3/tls.rs`。
+- `bucket_type=nas` 解析进 `S3UrlOptions`，`S3Storage::new`（legacy 与 role 共用）在任何 I/O 之前报 `UnsupportedType`，N1 去掉这道闸；
+  端点身份照常可离线求出。
+- 证书校验失败在连接时（GetBucketVersioning 探测）报 `ConfigError`（不重试），写明 `SSL_CERT_FILE` / `tls_verify=false`；只认连接层错误。
+- 发现：改前的不校验客户端用 `ClientConfig::builder()`，依赖图同时开了 ring 与 aws-lc-rs，进程没装默认 provider 时一连接就 panic
+  （故障注入复现）；现显式用 ring。
+- HCP：原生拷贝亲和标签仍是 "standard"（与改前相同）；role 层 get_tags 带 `version=` 读固定版本（未在真机验证）；
+  `HCPRestClient::try_new` 改用 `HcpTransport`。
+- 真机（2026-09-27，e2e-s3 `run.py`，只列举）：MinIO `s3://`、ONTAP `?compat=ontap`（`data-mover-test` 与 `-ver`）、RustFS、
+  DXN `?compat=dxn`（8184）、DXN 8182 `s3+https://…?compat=dxn&tls_verify=false` 全部通过；DXN 8182 不带 `tls_verify=false` 在连接时报
+  `ConfigError`（`invalid peer certificate: UnknownIssuer`，带两条出路）；StorageGRID `?compat=sg` 通过；五个旧协议名都报出新写法、
+  不含凭据。ONTAP 两个 `compat=ontap` URL 之间 S3→S3 走 Native（写入的对象已清理）。HCP 无实验环境。
 
 **N0 实测结论（2026-09-26，ONTAP 9.19.1，`data-mover-nas`，a–l 全部测完并清理）与对上文的修订**：
 - **决定 4 成立：NAS PUT 原子**。在 10 MiB / 100 MiB / 150 MiB / 差 1 字节处杀客户端、半关、close、Content-MD5 或签名 sha256 不符（400

@@ -59,6 +59,8 @@ ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$ROOT"
 S3_ENV=${S3_ENV:-.claude/skills/e2e-s3/.env}
 set -a; . "$S3_ENV"; set +a
+. .claude/skills/_shared/s3_url.sh
+s3_url check check >/dev/null || exit 2   # a bad S3_COMPAT / S3_TLS_VERIFY fails before any request
 RUN=${RUN:-$(date +%s)}
 [[ $RUN =~ ^[a-z0-9-]{1,30}$ ]] || { echo "RUN must match [a-z0-9-]{1,30}: $RUN" >&2; exit 1; }
 BIG_MB=${BIG_MB:-200}
@@ -253,9 +255,8 @@ else
   WROTE=1
 fi
 
-case "${S3_COMPAT:-}" in sg) COMPAT=+sg ;; dxn) COMPAT=+dxn ;; *) COMPAT= ;; esac
-TLS=; [ "${S3_USE_HTTPS:-}" = true ] && TLS=+https
-export S3_LISTING_URL="s3$COMPAT$TLS://$S3_AK:$S3_SK@$VB.$S3_HOST/$P"
+S3_LISTING_URL=$(s3_url "$VB" "$P") || exit 2
+export S3_LISTING_URL
 export S3_BUCKET=$VB
 ROLE=target/debug/examples/storage_role_operations
 LEG=target/debug/examples/s3_listing
@@ -506,7 +507,7 @@ if [ "$VERSIONED" = 1 ]; then
       S3_LISTING_URL="$1" "$ROLE" --backend s3 --concurrency 4 traverse --versions all 2>/dev/null |
         grep -E "^File $2 version=" | sed -E 's/.* marker=([01]) size=(\S+).*/\1:\2/' | tr '\n' ' '
     }
-    DURL="s3$COMPAT$TLS://$S3_AK:$S3_SK@$DVB.$S3_HOST/$DQ"
+    DURL=$(s3_url "$DVB" "$DQ") || exit 2
     for key in m/ z/ dirobj/; do
       src=$(shape "$S3_LISTING_URL" "$key"); dst=$(shape "$DURL" "$key")
       echo "   $key source: $src"; echo "   $key destination: $dst"

@@ -71,7 +71,7 @@ storagegrid_url() {
   local role="$1"
   local standard_url
   standard_url="$(storage_url "$role" s3)"
-  printf 's3+sg%s' "${standard_url#s3}"
+  printf '%s?compat=sg' "$standard_url"
 }
 
 seed_source() {
@@ -285,8 +285,8 @@ for source_backend in "${backends[@]}"; do
 done
 
 # The lab has no real StorageGRID endpoint, so retain the standard s3:// matrix
-# above and add focused s3+sg:// smoke cases against the compatible test
-# service. Request-capture unit tests separately prove that only this scheme
+# above and add focused ?compat=sg smoke cases against the compatible test
+# service. Request-capture unit tests separately prove that only this profile
 # removes x-id before signing.
 sg_read_key="storagegrid-scheme-read.txt"
 sg_read_value="data-mover-$run_id-storagegrid-scheme-read"
@@ -418,7 +418,7 @@ if python3 "$(dirname "$0")/s3_helper.py" exists \
 fi
 echo "S3 small-object rename verified: $actual_hash"
 
-# Exercise the same CopyObject/DeleteObject rename path through s3+sg://.
+# Exercise the same CopyObject/DeleteObject rename path through ?compat=sg.
 sg_rename_source="storagegrid rename source.txt"
 sg_rename_destination="storagegrid rename destination.txt"
 sg_rename_value="data-mover-$run_id-storagegrid-scheme-rename"

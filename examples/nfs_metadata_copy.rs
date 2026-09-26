@@ -127,15 +127,35 @@ fn env_var(name: &str) -> Result<String> {
         .map_err(|_| format!("{name} is not set (source the e2e-cifs / e2e-s3 .env)").into())
 }
 
-/// `s3://AK:SK@bucket.host/prefix` — the crate takes the key and secret as written, undecoded.
+/// `s3[+https]://AK:SK@bucket.host/prefix[?options]` — the crate takes the key and secret as
+/// written, undecoded; `S3_COMPAT` / `S3_TLS_VERIFY` / `S3_BUCKET_TYPE` become options when set
+/// (checked by the crate).
 fn s3_url(prefix: &str) -> Result<String> {
     let scheme = if env::var("S3_USE_HTTPS").is_ok_and(|value| value == "true") {
         "s3+https"
     } else {
         "s3"
     };
+    let options: Vec<String> = [
+        ("S3_COMPAT", "compat"),
+        ("S3_TLS_VERIFY", "tls_verify"),
+        ("S3_BUCKET_TYPE", "bucket_type"),
+    ]
+    .into_iter()
+    .filter_map(|(variable, option)| {
+        env::var(variable)
+            .ok()
+            .filter(|value| !matches!(value.as_str(), "" | "true" | "object"))
+            .map(|value| format!("{option}={value}"))
+    })
+    .collect();
+    let query = if options.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", options.join("&"))
+    };
     Ok(format!(
-        "{scheme}://{}:{}@{}.{}/{}",
+        "{scheme}://{}:{}@{}.{}/{}{query}",
         env_var("S3_AK")?,
         env_var("S3_SK")?,
         env_var("S3_BUCKET")?,

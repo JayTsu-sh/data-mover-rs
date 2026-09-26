@@ -60,6 +60,9 @@ def main() -> int:
         print(f"[skill e2e-s3] S3_ENV must name a skill .env file: {env_file}", file=sys.stderr)
         return 2
     env = load_env((Path(PROJECT_ROOT) / env_file).parent) if env_file else load_env(SKILL_DIR)
+    # Every S3_* variable the caller sets wins over the file (the loader only overrides keys the
+    # file names): S3_HOST=…:8182 S3_USE_HTTPS=true S3_TLS_VERIFY=false on top of dxn/.env.
+    env.update({key: value for key, value in os.environ.items() if key.startswith("S3_")})
     require(env, "S3_HOST", "S3_BUCKET", "S3_AK", "S3_SK")
 
     host = env["S3_HOST"]
@@ -71,15 +74,28 @@ def main() -> int:
 
     run("build s3_walkdir", ["cargo", "build", "--example", "s3_walkdir"])
 
-    # S3_COMPAT=sg|dxn selects the crate's StorageGRID / DXN profile (s3+dxn://…).
-    compat = env.get("S3_COMPAT", "")
-    if compat not in ("", "sg", "dxn"):
-        print(f"[skill e2e-s3] S3_COMPAT must be empty, sg or dxn: {compat}", file=sys.stderr)
+    # S3_COMPAT=sg|dxn|hcp|ontap, S3_TLS_VERIFY=false (HTTPS, self-signed) and S3_BUCKET_TYPE=nas
+    # become the URL's options (?compat=dxn&tls_verify=false); empty = the default.
+    def option(name: str) -> str:
+        return env.get(name, "")
+
+    compat = option("S3_COMPAT")
+    if option("S3_TLS_VERIFY") not in ("", "true", "false"):
+        print("[skill e2e-s3] S3_TLS_VERIFY must be empty, true or false", file=sys.stderr)
+        return 2
+    tls_verify = option("S3_TLS_VERIFY") != "false"
+    bucket_type = "" if option("S3_BUCKET_TYPE") == "object" else option("S3_BUCKET_TYPE")
+    try:
+        s3_url(bucket, host, use_https=use_https, compat=compat, tls_verify=tls_verify, bucket_type=bucket_type)
+    except ValueError as error:
+        print(f"[skill e2e-s3] {error}", file=sys.stderr)
         return 2
 
     def url_of(sub: str) -> str:
-        url = s3_url(bucket, host, ak, sk, prefix=sub, use_https=use_https)
-        return url.replace("s3", f"s3+{compat}", 1) if compat else url
+        return s3_url(
+            bucket, host, ak, sk, prefix=sub, use_https=use_https,
+            compat=compat, tls_verify=tls_verify, bucket_type=bucket_type,
+        )
 
     url = url_of(prefix)
     # The URL (with its credentials) goes through the environment, never a command line; output is

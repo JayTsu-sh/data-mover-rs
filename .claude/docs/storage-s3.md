@@ -7,28 +7,43 @@
   `tls_verify=false` 才换成 `hyper-rustls` + 不校验证书的 verifier（显式 ring provider）。
 - IAM credential 链路：标准 AWS 行为 (env / config file / IMDS)。
 
-## URL 形式
+## URL 形式（P7 §14.2，唯一解析器 `src/s3/url_options.rs`）
 
 ```
-s3://[ak[:sk]@]bucket.host[:port]/[prefix]
-s3+https://[ak[:sk]@]bucket.host/[prefix]
-s3+sg://[ak[:sk]@]bucket.host[:port]/[prefix]
-s3+sg+https://[ak[:sk]@]bucket.host/[prefix]
+s3://ak:sk@bucket.host[:port][/prefix][?参数]          HTTP
+s3+https://ak:sk@bucket.host[:port][/prefix][?参数]    HTTPS，默认校验证书
+参数：compat=sg|dxn|hcp|ontap   tls_verify=false（只用于 s3+https://）   bucket_type=nas（只与 compat=ontap）
 ```
 
 示例：
 
 ```
-s3://AKIAXXX:secretXXX@my-bucket.s3.amazonaws.com/data/
-s3+https://AKIAXXX:secretXXX@my-bucket.minio.local/exports
-s3://my-bucket.s3.amazonaws.com/data/      # 用 IAM credential
+s3://AKIAXXX:secretXXX@my-bucket.minio.local:9000/data/
+s3+https://AKIAXXX:secretXXX@my-bucket.s3.example.com/exports
+s3://AK:SK@data-mover-test.10.131.7.236:10443/p?compat=sg
+s3+https://AK:SK@data-mover-test.10.131.7.201:8182/p?compat=dxn&tls_verify=false   # 自签证书
+s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
 ```
 
-scheme：
-- `s3://` — HTTP (默认 endpoint port 80)。
-- `s3+https://` — HTTPS (默认 port 443，自签证书允许)。
-- `s3+sg://` / `s3+sg+https://` — StorageGRID endpoint overlay；仍属于 S3 backend，
-  仅在签名前精确删除 `x-id`，不新增 validation profile。
+- 凭据在**最后一个** `@` 处切开（SK 可含 `/` `+` `=` `?`，不 percent-decode）；查询串从其后第一个 `?` 开始，值按
+  form_urlencoded 解码、区分大小写。
+- **缺省即默认**：标准 S3、校验证书、对象桶。写出默认值（`compat=standard`、`bucket_type=object`、`tls_verify=true`）、
+  未知 / 重复 / 空值参数、`tls_verify` 用在 `s3://` 上、`bucket_type=nas` 不带 `compat=ontap`、无桶端点 URL
+  （`list_buckets`）带 `bucket_type` —— 全部 `UrlParseError`（D4：URL 文本能判定的都算）。报错不回显 URL 与凭据。
+- **旧协议名已删除**，报错给出新写法：`s3+http://` → `s3://`；`s3+sg://` → `s3://…?compat=sg`；`s3+dxn://` →
+  `s3://…?compat=dxn`；`s3+hcp://` → `s3://…?compat=hcp`；`s3+sg+https://` / `s3+dxn+https://` →
+  `s3+https://…?compat=sg|dxn&tls_verify=false`（旧形式本来就不校验证书）。`detect_storage_type` 把任何
+  `s3+…://` 判为 S3，所以旧写法走到这条报错而不是被当成本地路径。
+- **参数不进端点身份**：`s3://host[:port]/bucket[/prefix]` 与改参数前相同，TransferIdentity / 恢复绑定不变。
+- `compat=sg` — StorageGRID：签名前精确删除 `x-id`；不走原生拷贝。
+- `compat=dxn` — DXN（Ceph RGW Octopus）：标签不支持；原生拷贝亲和标签 `dxn`。
+- `compat=hcp` — HCP：桶一律按开版本处理；标签读 HCP REST 的 `BPM` 注解（legacy 与 role 两条路都是；role 路径
+  带 `version=` 读固定版本 —— **未在真机验证**），写标签仍是 PutObjectTagging（未验证）。REST 基址
+  `{scheme}://{bucket}.{host}[:port]`，协议 / 端口 / `tls_verify` 跟随 S3 URL；`hcp-ns-auth` cookie 在 `s3://` 下明文。
+- `compat=ontap` — ONTAP：**不改任何线上请求**（对象桶的怪癖都已通用处理：F4、F6、空末页、CommonPrefix 计入
+  max-keys、不回显 Delimiter）；原生拷贝亲和标签 `ontap`（与同端点的标准 URL 之间走流式）；承载 `bucket_type=nas`。
+- `bucket_type=nas` — ONTAP NAS 桶 profile（N1–N7）。**尚未实现**：URL 能解析，连接（legacy 与 role）在任何 I/O 之前报
+  `UnsupportedType`。
 - 所有 profile（含标准 `s3://`）都为 multi-object delete 加 body-matching、SigV4-signed
   `Content-MD5`（`s3/delete_objects_md5.rs`，由 `s3.rs` 的 `configure_compatibility` 统一挂载）：SDK 默认只发
   `x-amz-checksum-crc32`，MinIO `RELEASE.2023-03-20`、Ceph RGW Octopus (DXN)、旧 StorageGRID 都回
@@ -58,12 +73,7 @@ match aws_sdk_s3::operation::get_object::GetObjectError::from(...) {
 
 ### IAM Credential 链路
 
-按优先级：
-1. URL 中的 `ak:sk@`。
-2. 环境变量 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`。
-3. `~/.aws/credentials` 配置文件。
-4. EC2 IMDS (实例元数据)。
-5. ECS 容器 credential。
+URL 必须带 `ak:sk@`（解析器没有凭据就报 `UrlParseError`）；不读环境变量、`~/.aws/credentials`、IMDS。
 
 ### TLS
 
@@ -812,7 +822,7 @@ data-mover 按上表失败。唯一的 data-mover 缺陷是 501 被当成可重�
 | MinIO RELEASE.2023-03-20 | 可以（含内容） | **拒绝**：400 `XMinioInvalidObjectName` | 正常记版本；最新是删除标记时 ListObjectsV2 仍列出无 ETag、0 字节的 `d/`（HEAD 404）→ 列举不当子项，父目录仍列前缀 `d/` | 合并连续删除标记 |
 | ONTAP 9.19.1 对象桶 | 可以 | 可以 | 正常 | 不合并删除标记 |
 | DXN（Ceph RGW Octopus） | 可以 | 可以 | 正常 | 合并连续删除标记；只有 null 版本的 key 重开版本后写新版本再 DELETE：删掉 null 版本并写标记 |
-| StorageGRID 11.5 | 可以 | 可以（`s3+sg` 不走 native） | 正常 | 已删除的 key 再 DELETE 每次新建标记 |
+| StorageGRID 11.5 | 可以 | 可以（`compat=sg` 不走 native） | 正常 | 已删除的 key 再 DELETE 每次新建标记 |
 | RustFS 1.0.0 | 可以 | **完成后存成 `d`**（去掉 `/`，HEAD `d/` 404），覆盖同名文件 `d` | **不记版本**：每次写都是 `null`，DELETE 直接删掉（`x-amz-delete-marker: false`） | 从 `d/` **源** 的 native UploadPartCopy（F5d 时测，目的键 `d/`）：版本桶里会话 Connectivity 失败、非版本桶里存成 `d`；目的键不以 `/` 结尾、源 > 64 MiB 的这条路线 D13 不管，未复测 |
 | ONTAP NAS 桶 | 零字节：200 但不留对象（只是目录）；有内容且先于子项：存成**文件 `d`**，之后子项 404；有内容且子项已在：409 | NAS 桶本来就只适合作源（见 test-environments） | 不支持版本 | 平铺列举无序 |
 
@@ -837,7 +847,7 @@ native（StorageGRID 为流式）都是一次请求（ETag 无 `-N`），同名�
 | ONTAP NAS 桶 PUT 回的 ETag ≠ 之后 HEAD 的 ETag | 存储性质：读回校验报 `Conflict`；NAS 桶只作列举源，见「ONTAP S3 NAS 桶实测行为」 |
 | DXN 版本化桶的 `CopyObject` 不回版本 | 桶开了版本且回复无版本 → 列版本认领（`native_final::settle_copy_version`） |
 | `bucket.host` 解析错误 (path-style vs virtual-hosted) | 检查 endpoint 是否支持 virtual-hosted |
-| URL 中的 `:` 在 secret 里被切错 | secret 必须 percent-encode |
+| URL 里的凭据被切错 | AK 按第一个 `:`、凭据按最后一个 `@` 切：AK 不能含 `:`，SK 不能含 `@`；**不要** percent-encode（按原样取，编码过的 SK 签名错） |
 | 把 MinIO 的 `NextKeyMarker`（`p/z[minio_cache:v2,return:]`）当 key 用 | 续页 token / marker 只原样回传（C20 / C22） |
 | 同一目录里对象 `a` 与前缀 `a/` 同名 | 按路径做键的消费方会撞；块内按 S3 列举序（对象 `a` 在 `a/` 之前，C22） |
 | 按 `LastModified` 排同一 key 的版本与删除标记 | 毫秒精度，并发写入同毫秒；用服务端文档顺序（`version_order.rs` + `history.rs`，Q29） |

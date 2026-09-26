@@ -19,11 +19,11 @@
 | NFS | openfs m1-source（`10.131.5.221` / node1 直连 `192.168.131.214`） | v3 | WSL（慢）/ node1 | 已有导出下的子目录（不建新导出） | URL 见 §3.3 |
 | SMB | openfs m1-source / m1-target | SMB | — | — | guest 登录目前失败（§3.3） |
 | S3 | MinIO（VM 102） | S3 | WSL | 桶 `data-mover-test`；临时版本桶 `data-mover-*`（用完删光） | `.claude/skills/e2e-s3/.env` |
-| S3 | ONTAP S3 对象桶（SVM `lizy`） | S3 | WSL | 桶 `data-mover-test`（无版本）、`data-mover-test-ver`（开版本） | `e2e-s3/ontap/.env`（`S3_BUCKET` 换桶） |
+| S3 | ONTAP S3 对象桶（SVM `lizy`） | S3 | WSL | 桶 `data-mover-test`（无版本）、`data-mover-test-ver`（开版本） | `e2e-s3/ontap/.env`（`S3_COMPAT=ontap`；`S3_BUCKET` 换桶） |
 | S3 | ONTAP S3 **NAS 桶** | S3（平铺列举**无序**） | WSL | 桶 `data-mover-nas` | `e2e-s3/ontap/.env` + `S3_BUCKET=data-mover-nas` |
 | S3 | RustFS 1.0.0（VM 105） | S3 | WSL（管理网 9001） | 桶 `data-mover-test`；临时 `data-mover-*` 桶 | `e2e-s3/rustfs/.env` |
-| S3 | DXN-1（Ceph RGW Octopus） | S3 | WSL | 桶 `data-mover-test`（**永不开版本**）；临时桶（长期批准） | `e2e-s3/dxn/.env` + `S3_LOCATION=magnascale:tos_placement` |
-| S3 | StorageGRID 11.5.0（独立租户 `data-mover-test`） | S3（明文 HTTP） | WSL | 桶 `data-mover-test`（无版本）、`data-mover-test-ver`（开版本）；租户内临时 `data-mover-*` 桶（用完删光） | `e2e-s3/storagegrid/.env`（`s3+sg://`，URL 参数化后 `?compat=sg`） |
+| S3 | DXN-1（Ceph RGW Octopus） | S3（8184 明文；8182 HTTPS 自签证书，要 `S3_USE_HTTPS=true S3_TLS_VERIFY=false`） | WSL | 桶 `data-mover-test`（**永不开版本**）；临时桶（长期批准） | `e2e-s3/dxn/.env`（`S3_COMPAT=dxn`）+ `S3_LOCATION=magnascale:tos_placement` |
+| S3 | StorageGRID 11.5.0（独立租户 `data-mover-test`） | S3（明文 HTTP） | WSL | 桶 `data-mover-test`（无版本）、`data-mover-test-ver`（开版本）；租户内临时 `data-mover-*` 桶（用完删光） | `e2e-s3/storagegrid/.env`（`S3_COMPAT=sg` → `?compat=sg`） |
 | HDFS | Kerberos 集群（NameNode VM 301） | HDFS | **runner VM 102（逐次批准）** | 运行根 `/tmp/data-mover-nightly/<run>/` | `LAB_HDFS_*`（`tests/lab/README.md`） |
 | 性能 | node1 + m1-source 53M 树 | NFSv3 | node1 | 只读遍历 | 见 §4 |
 | Local | WSL 本机 | — | WSL | 临时目录 | `make ci` / e2e-local |
