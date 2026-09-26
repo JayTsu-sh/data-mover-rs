@@ -46,7 +46,7 @@
 - **S3**（SVM `lizy` 的 object store server `s3lizy.com`，`http://10.128.61.200:80`，path-style），用户 `data-mover-test`（只在 `e2e-s3/ontap/.env`）：
   - `data-mover-test`（无版本，FlexGroup `fg_oss_1790405106`）、`data-mover-test-ver`（开版本，`fg_oss_1790405136`）：两个卷是建桶时 ONTAP 新建的
     （FAS2750_01_SSD_1 × 3 成员，thin 100 GB），后台重删 + 压缩。我们的用户**不能建桶**，脚本要用已有桶、跑完清空。
-  - `data-mover-nas`：NAS 桶，FlexVol `dm_s3_nas`（`/dm_s3_nas`，20 GB thin，unix 777，重删 + 压缩；S3 用户映射到 `pcuser`）。
+  - `data-mover-nas`：NAS 桶，FlexVol `dm_s3_nas`（`/dm_s3_nas`，20 GB thin，unix 777，重删 + 压缩；S3 用户映射到 `pcuser`）卷每小时 :05 打快照 `.snapshot/hourly.*`，GB 级测试对象要在下个快照前删掉，否则删除后空间要等快照轮转才回来）。
   - 该用户也能**读** `ontap-lisa-auto-bucket`（那个桶的原有策略放行）——**只写我们的三个桶**。
   - **NAS 桶限制**（2026-09-26 curl + staged 矩阵实测，详见 `storage-s3.md`「ONTAP S3 NAS 桶实测行为」）：
     - PUT 回复的 `ETag` 是 MD5，但 HEAD / GET / 列举 / 拷贝回复给的是**另一个不透明值**（不是 MD5，同内容每写一次都变）

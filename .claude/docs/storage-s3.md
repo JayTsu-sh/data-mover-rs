@@ -761,6 +761,23 @@ NAS 桶（multiprotocol，底下是 FlexVol `dm_s3_nas`）与同一 SVM 的对�
 支持，不是 data-mover 的缺陷；让 NAS 桶可写 / 可校验要做设计决定（能力探测或显式端点选项，P7 §14.1 D6 同类），未定前
 data-mover 按上表失败。唯一的 data-mover 缺陷是 501 被当成可重试的连接失败，已修。
 
+**补充实测（N0，2026-09-26，原始 socket SigV4 客户端 + curl + 10.131.9.10 上 NFSv3 root 挂载）**，供 NAS profile（P7 §14.2）使用：
+
+| 行为 | NAS 桶 |
+|---|---|
+| 单 PUT 原子性 | **原子**：中途杀客户端、半关 / close、差 1 字节断开、Content-MD5 / 签名 sha256 不符（400 BadDigest）都不改变旧对象；暂存不可见，约 25 s 释放空间 |
+| 扣住最后 1 字节 | 服务器静等 ≥ 900 s（上限未测出），补发后约 0.04 s 提交 |
+| `UNSIGNED-PAYLOAD` / chunked | 前者接受；`Transfer-Encoding: chunked` → 501，必须带 Content-Length |
+| 单 PUT 大小 | 5 GiB + 1 也接受；不预检大小与剩余空间（100 Continue） |
+| 不透明 ETag 的来源 | **只由 mtime（纳秒）与 size 算出**：NFS 写改 mtime → ETag 变；保留 mtime 的改写（`rsync -t` / `touch -d`）ETag 不变；不同文件 mtime + size 相同则 ETag 相同 |
+| 替换时进行中的 GET | 提交后 0.3–0.7 s 被断开，已收字节是旧内容的前缀、短于 Content-Length，从不混入新内容 |
+| Last-Modified | 精度到秒（列举 `.000Z`）；Range、多段 Range（multipart/byteranges）、416 正常 |
+| key 规范化 | **静默改写**：`..`、`.`、`//`、`%2E%2E`、`%2F` 被解析后存到另一个 key；`dir/..` → 409 |
+| 名字限制 | 段 > 255 字节 → **500 InternalError**；非法 UTF-8 → 403 AccessDenied；> 255 字节的 UTF-8 名在 NFS 上被改名（`:S400001`），两个 key 指向同一对象 |
+| 文件 / 目录冲突 | 有文件 `a` 时 PUT `a/x` → **404 NoSuchKey**；有 `a/x` 时 PUT `a` 或带内容的 `a/` → **409 NameCollision** |
+| `d/` | 0 字节建真目录（HEAD 404、仅分隔符列举可见）；带内容存成文件 `d` |
+| 同桶 CopyObject | 克隆：1 GiB 0.01 s，副本独立，目标 mtime = 拷贝时刻 |
+
 ## 已知陷阱
 
 | 陷阱 | 应对 |

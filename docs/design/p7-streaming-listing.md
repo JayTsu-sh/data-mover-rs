@@ -969,6 +969,31 @@ F4、F6、空末页、CommonPrefix 计入 max-keys、不回显 Delimiter），�
 两种顺序、NFS 写是否改 ETag、空目录是否为 CommonPrefix、1 GiB CopyObject、名字冲突、PUT 期间 GET）→ P1–P5 在 F5 合入后（可与 C7 并行）→
 N1–N7 在 H1、C7 之后。完整方案（file:line）见会话 scratchpad `s3-url-nas-plan.md`（会话结束即失效，要点以本节为准）。
 
+**N0 实测结论（2026-09-26，ONTAP 9.19.1，`data-mover-nas`，a–l 全部测完并清理）与对上文的修订**：
+- **决定 4 成立：NAS PUT 原子**。在 10 MiB / 100 MiB / 150 MiB / 差 1 字节处杀客户端、半关、close、Content-MD5 或签名 sha256 不符（400
+  BadDigest，收完 body 才拒）都不改变对象；暂存在 S3 与 NFS 上都不可见，失败后约 25 s 释放空间。扣住最后 1 字节：服务器至少静等 900 s
+  （上限未测出），补发后约 0.04 s 提交，回复 ETag = MD5。**实现要求**：放弃时直接关连接；客户端自带看门狗（服务器不会先断，NAT / 代理可能会）。
+- **决定 7：NFS 写会改 S3 ETag，但只经由 mtime（纳秒）与 size**。HEAD / GET / 列举 / 拷贝回复的 ETag = f(mtime, size)，与内容、inode、路径无关：
+  chmod 不变；改内容后把 mtime 恢复（`rsync -t`、`touch -d`、utimes）则 ETag、Last-Modified、size 全不变；两个不同文件 mtime 与 size 相同则 ETag
+  相同。所以“内容不同而 ETag 稳定 → Corruption（有歧义）”是真实会出现的情形，报错文字照上文保留歧义说明。SMB 未测，按同一 inode 属性推断相同。
+- **源端逐段读**：替换在读的中途提交时，服务器在提交后 0.3–0.7 s 断开进行中的 GET，已收字节是旧内容的干净前缀、短于 Content-Length（从未混入新内容）。
+  **body 短于 Content-Length / Content-Range 按“已改变”（Conflict）判**，不当可重试的断连；Last-Modified 只到秒，变化只能靠 ETag 看出。
+- **> 5 GiB 不是服务器限制**：5 GiB + 1 写入并回读正确；服务器不预检大小与剩余空间（Content-Length 5 TiB + 1 也回 100 Continue）。**保留**
+  “> 5 GiB 在 Preflight 拒绝”作为设计选择（卷满行为未测，单 PUT 失败即从零开始）；放宽另议。
+- chunked 编码 → 501，流式单 PUT 必须带 Content-Length（与上文一致）；UNSIGNED-PAYLOAD 接受（200 MiB、3 次、内容正确）。aws-chunked 签名未测。
+- **新增：NAS 目的端名字预检**（N 阶段加进 Preflight 与逐条目 prepare，I/O 之前逐条目 `Unsupported` / Permanent，不回退）：
+  - 服务端**静默规范化 key**：`a/../x` 存成 `x` 的上级、`a/./y` → `a/y`、`a//b` → `a/b`（`%2E%2E`、`%2F` 同样处理）→ 含空段、`.`、`..` 段的 key 拒绝，
+    否则会写到别的 key 甚至上级目录；
+  - 名字段 > 255 字节 → 服务器 500 InternalError（看起来可重试，实际不是）→ 预检拒绝；
+  - 非法 UTF-8 → 403 AccessDenied（data-mover 的 key 都是合法 UTF-8，只记录）；
+  - 文件 / 目录冲突：已有文件 `a` 时 PUT `a/x` → **404 NoSuchKey**，已有 `a/x` 时 PUT `a` 或带内容的 `a/` → **409 NameCollision** → 这两种回复在 NAS
+    profile 下映射为该条目的名字冲突（Permanent），不当“不存在”或可重试；
+  - 0 字节 `d/` 建出真目录（HEAD `d/` 404、平铺列举不可见、分隔符列举是 CommonPrefix）；带内容的 `d/` 存成文件 `d`（与 `directory_objects=false`
+    一致，F5 D6）。空目录只在带分隔符的列举里以 CommonPrefix 出现。
+- 同桶 CopyObject 是克隆（1 GiB 0.01 s，副本互相独立，回复 ETag = 目标 HEAD 的不透明值）：原生拷贝亲和值得保留；> 5 GiB CopyObject 未测，维持单次 ≤ 5 GiB。
+- 其余：Range（含 `-100`、多段 → multipart/byteranges）与 416 正常；列举的 LastModified 截到秒（`.000Z`）；256 字节以上的 UTF-8 名字在 NFS 上
+  被改名（`:S400001`），两个 key 指向同一对象；`dm_s3_nas` 每小时 :05 打快照，大对象测试须在下个快照前删除。测量脚本不含凭据，见 N0 报告。
+
 ## 15. 决定记录（2026-09-25 全部采纳）
 
 下面每一条都是已定结论。编号沿用讨论时的问题编号，便于对照过程稿。
