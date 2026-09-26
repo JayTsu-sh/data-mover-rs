@@ -8,12 +8,16 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // URL 从命令行传入（e2e-s3 skill 即此调用方式），不在源码里硬编码凭证
-    let url = env::args().nth(1).ok_or_else(|| {
-        StorageError::ConfigError(
-            "usage: s3_walkdir <s3://AK:SK@bucket.host:port/prefix>".to_string(),
-        )
-    })?;
+    // URL 从命令行或 S3_LISTING_URL 传入（e2e-s3 skill 用环境变量，凭证不上命令行），不在源码里硬编码凭证
+    let url = env::args()
+        .nth(1)
+        .or_else(|| env::var("S3_LISTING_URL").ok())
+        .ok_or_else(|| {
+            StorageError::ConfigError(
+                "usage: s3_walkdir <s3://AK:SK@bucket.host:port/prefix> (or set S3_LISTING_URL)"
+                    .to_string(),
+            )
+        })?;
     let storage = create_storage(&url, data_mover::CreateStorageOptions::default()).await?;
 
     let start = Instant::now();

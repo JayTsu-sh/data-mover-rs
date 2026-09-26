@@ -7,14 +7,22 @@
 # are counted (`direct: equal=yes key_uploads=0` is the expected verdict) — and the native rows,
 # which since C18 write the final key: `native: equal=yes stage_objects=0 key_uploads=0`.
 #
-# Env: .claude/skills/e2e-s3/.env (S3_HOST, S3_BUCKET, S3_AK, S3_SK); PREFIX overrides the key
-# prefix (default staged-<run>). Only keys under that prefix are written or deleted.
+# Env: S3_ENV (default .claude/skills/e2e-s3/.env; e.g. .claude/skills/e2e-s3/ontap/.env) with
+# S3_HOST, S3_BUCKET, S3_AK, S3_SK (S3_COMPAT picks the crate's profile). S3_BUCKET set by the caller
+# wins over the .env's (ONTAP's NAS bucket: S3_BUCKET=data-mover-nas); only a bucket of ours
+# (data-mover-*) is written. S3_MATRIX_PREFIX overrides the key prefix (default staged-<run>). Only
+# keys under that prefix are written or deleted.
 set -u
 ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$ROOT"
-set -a; . .claude/skills/e2e-s3/.env; set +a
-# `a-bucket` holds Milvus data on the lab MinIO; never write there.
-[ "${S3_BUCKET:-}" = a-bucket ] && { echo "refusing to write to bucket a-bucket" >&2; exit 1; }
+S3_ENV=${S3_ENV:-.claude/skills/e2e-s3/.env}
+CALLER_BUCKET=${S3_BUCKET:-}
+set -a; . "$S3_ENV"; set +a
+[ -n "$CALLER_BUCKET" ] && export S3_BUCKET=$CALLER_BUCKET
+# Every lab bucket we may write is named data-mover-* (test-environments.md); `a-bucket` (Milvus's
+# data on the lab MinIO), `ontap-lisa-auto-bucket` and `bigbucket` are someone else's.
+[[ ${S3_BUCKET:-} =~ ^data-mover-[a-z0-9.-]+$ ]] || { echo "refusing to write to bucket ${S3_BUCKET:-}: not one of ours" >&2; exit 1; }
+echo "server $S3_HOST bucket $S3_BUCKET ($S3_ENV)"
 RUN=${RUN:-$(date +%s)}
 # The run's prefix: its cleanup deletes every object and upload under it, so it must look like one
 # of ours (an inherited generic PREFIX must never be taken).
@@ -32,6 +40,7 @@ B="$SCHEME://$S3_HOST/$S3_BUCKET"
 # The credentials reach curl through a config on a file descriptor, never on its command line.
 esc() { local v=${1//\\/\\\\}; printf '%s' "${v//\"/\\\"}"; }
 s3c() { curl -s --aws-sigv4 "aws:amz:us-east-1:s3" -K <(printf 'user = "%s:%s"\n' "$(esc "$S3_AK")" "$(esc "$S3_SK")") "$@"; }
+enc() { python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$1"; }
 
 # `.data-mover-*` objects under the run's prefix: the `.upload` pointers of uploads on the final key
 # (ADR-0006 C15b). Native copies write the final key since C18: no `.data-mover-stage/` object.
@@ -151,12 +160,19 @@ for key in "${KEYS[@]}"; do
 done
 s3c "$B?uploads&prefix=$PREFIX/" | sed 's/<Upload>/\n<Upload>/g' | grep '^<Upload>' | while read -r u; do
   k=$(echo "$u" | grep -o '<Key>[^<]*' | sed 's/<Key>//'); id=$(echo "$u" | grep -o '<UploadId>[^<]*' | sed 's/<UploadId>//')
-  s3c -o /dev/null -X DELETE "$B/$k?uploadId=$id"; done
-while :; do
+  # Only the run's own keys, whatever the listing returned (a server ignoring `prefix`).
+  case "$k" in "$PREFIX/"*) s3c -o /dev/null -X DELETE "$B/$(enc "$k")?uploadId=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$id")" ;; esac
+done
+# Bounded, and only keys under the run's prefix (whatever the listing returned). ONTAP's NAS bucket
+# keeps the directory the run's keys made: it goes last.
+for _ in 1 2 3 4 5; do
   keys=$(s3c "$B?list-type=2&prefix=$PREFIX/" | grep -o '<Key>[^<]*</Key>' | sed 's/<[^>]*>//g')
   [ -z "$keys" ] && break
-  echo "$keys" | while read -r k; do s3c -o /dev/null -X DELETE "$B/$k"; done
+  echo "$keys" | while read -r k; do
+    case "$k" in "$PREFIX/"*) s3c -o /dev/null -X DELETE "$B/$(enc "$k")" ;; esac
+  done
 done
+s3c -o /dev/null -X DELETE "$B/$(enc "$PREFIX/")"
 open=0
 for key in "${KEYS[@]}"; do
   n=$(key_uploads "$key"); if [ "$n" = '?' ]; then open='?'; break; fi; open=$((open + n))

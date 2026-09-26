@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -30,25 +31,35 @@ def redact(text: str) -> str:
     return _USERINFO.sub(r"\1***@", text)
 
 
-def run(label: str, cmd: list[str], expected: int = 0, capture: bool = False) -> str:
-    print(f"\n[skill e2e-s3] $ {redact(' '.join(cmd))}")
+def run(
+    label: str, cmd: list[str], expected: int = 0, capture: bool = False, url: str | None = None
+) -> str:
+    """Runs `cmd`; `url` (credentials in its userinfo) reaches it as `S3_LISTING_URL`, never argv."""
+    print(f"\n[skill e2e-s3] $ {' '.join(cmd)}" + (f"  (S3_LISTING_URL={redact(url)})" if url else ""))
+    env = dict(os.environ, S3_LISTING_URL=url) if url else None
     if capture:
         result = subprocess.run(
             cmd, cwd=PROJECT_ROOT, capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
+            encoding="utf-8", errors="replace", env=env,
         )
         print(redact(result.stdout))
         if result.stderr:
             print("[stderr]", redact(result.stderr))
         assert_exit_code(label, result.returncode, expected)
         return result.stdout + result.stderr
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT)
+    result = subprocess.run(cmd, cwd=PROJECT_ROOT, env=env)
     assert_exit_code(label, result.returncode, expected)
     return ""
 
 
 def main() -> int:
-    env = load_env(SKILL_DIR)
+    # S3_ENV picks another server's .env (e.g. .claude/skills/e2e-s3/ontap/.env); a variable set by
+    # the caller (S3_BUCKET=data-mover-nas) still wins over the file. Only lists: nothing is written.
+    env_file = os.environ.get("S3_ENV")
+    if env_file and Path(env_file).name != ".env":
+        print(f"[skill e2e-s3] S3_ENV must name a skill .env file: {env_file}", file=sys.stderr)
+        return 2
+    env = load_env((Path(PROJECT_ROOT) / env_file).parent) if env_file else load_env(SKILL_DIR)
     require(env, "S3_HOST", "S3_BUCKET", "S3_AK", "S3_SK")
 
     host = env["S3_HOST"]
@@ -60,21 +71,34 @@ def main() -> int:
 
     run("build s3_walkdir", ["cargo", "build", "--example", "s3_walkdir"])
 
-    url = s3_url(bucket, host, ak, sk, prefix=prefix, use_https=use_https)
-    # Captured so it is redacted: cargo's `Running …` line echoes the URL with its credentials.
-    run("s3_walkdir bucket list", ["cargo", "run", "--example", "s3_walkdir", "--", url], capture=True)
+    # S3_COMPAT=sg|dxn selects the crate's StorageGRID / DXN profile (s3+dxn://…).
+    compat = env.get("S3_COMPAT", "")
+    if compat not in ("", "sg", "dxn"):
+        print(f"[skill e2e-s3] S3_COMPAT must be empty, sg or dxn: {compat}", file=sys.stderr)
+        return 2
+
+    def url_of(sub: str) -> str:
+        url = s3_url(bucket, host, ak, sk, prefix=sub, use_https=use_https)
+        return url.replace("s3", f"s3+{compat}", 1) if compat else url
+
+    url = url_of(prefix)
+    # The URL (with its credentials) goes through the environment, never a command line; output is
+    # still captured and redacted in case the example echoes it.
+    walkdir = ["cargo", "run", "-q", "--example", "s3_walkdir"]
+    run("s3_walkdir bucket list", walkdir, capture=True, url=url)
 
     # 不存在 prefix 验证：S3 ListObjectsV2 对不存在的 prefix 返回 200 + 空列表
     # （这是 S3 语义，不是 404）。断言：空结果 + 干净退出 + 无 retry/backoff。
     # 注意：404 → FileNotFound 的映射（commit 7eb3046）在 head_object/get_metadata
     # 路径，walkdir 例子覆盖不到，需要走 get_metadata 的入口另行验证。
     nonexistent = f"{prefix}/__skill_404_test_{int(time.time())}"
-    bad_url = s3_url(bucket, host, ak, sk, prefix=nonexistent, use_https=use_https)
+    bad_url = url_of(nonexistent)
     output = run(
         "s3_walkdir nonexistent prefix (expected empty list, no retry)",
-        ["cargo", "run", "--example", "s3_walkdir", "--", bad_url],
+        walkdir,
         expected=0,
         capture=True,
+        url=bad_url,
     )
     if "retry" in output.lower() or "backoff" in output.lower():
         print("[skill e2e-s3] FAIL: nonexistent prefix triggered retry/backoff (commit 7eb3046 regression)", file=sys.stderr)

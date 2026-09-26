@@ -21,12 +21,14 @@ S3_PREFIX=test                   # bucket 内的子路径
 ## 步骤
 
 1. cargo build --example s3_walkdir
-2. s3_walkdir 列 bucket — 应返回。
+2. s3_walkdir 列 bucket — 应返回。`run.py` 把带凭据的 URL 经环境变量 `S3_LISTING_URL` 交给例子（不上命令行）；
+   认 `S3_ENV`（服务器的 `.env`）与 `S3_COMPAT`（`dxn` / `sg` → `s3+dxn://` / `s3+sg://`），调用方设的 `S3_BUCKET` 优先。
 3. **404 验证**：用 `s3_walkdir <bucket>/this-key-does-not-exist-{timestamp}` 触发 NoSuchKey，应映射为 `FileNotFound`，**不重试**。
 
 4. **写入策略矩阵**（role-based 目的端）：`bash .claude/skills/e2e-s3/scripts/staged_matrix.sh` ——
    大小 0 / 1 KiB / 8 MiB / 8 MiB+1 / 20 MiB / 200 MiB × Checkpointed / AtomicReplace / Direct × 读回开关，原生 S3→S3，
-   取消与 SIGKILL 后续传。每行打印结果（含 `prepare` / `reused_bytes` / `native_bytes` / `native_requests`）、耗时和遗留：
+   取消与 SIGKILL 后续传；`S3_ENV=<服务器的 .env>` 选服务器，调用方设的 `S3_BUCKET` 优先于 `.env` 的（只写
+   `data-mover-*` 桶）。每行打印结果（含 `prepare` / `reused_bytes` / `native_bytes` / `native_requests`）、耗时和遗留：
    `artifacts=`（前缀下的 `.data-mover-*` 对象：`.upload` 指针；C18 起原生拷贝不再有 temp key）、
    `key_uploads=`（该用例精确 key 上未完成的上传）。续传段另打印 `left at the destination: pointers=… key_uploads=…`
    （切断后期望 1 / 1，续传完成后 0 / 0）。只写/删 `staged-<run>/`
@@ -79,8 +81,13 @@ S3_PREFIX=test                   # bucket 内的子路径
    服务器不让建锁桶就跳过锁行。`resume_matrix.sh` 同样认 `S3_ENV`。DXN 的其他差异见 storage-s3.md「DXN（Ceph RGW
    Octopus）实测行为」。
 
+   **已有桶**（ONTAP：我们的用户不能建桶）：`S3_VERSIONED_BUCKET=data-mover-test-ver` —— 桶名必须 `data-mover-*`、
+   版本必须 Enabled，否则拒跑；不建桶，所有用例写在唯一前缀 `dm-<run>/` 下，退出时删光该前缀下的全部版本、删除标记
+   与未完成上传（打印 `cleanup: <桶>/dm-<run>/ emptied (bucket kept)`），桶与其设置不动 —— 所以 Object Lock 行（要自己的
+   锁桶）与暂停版本行（要改桶设置）跳过。
+
    **RustFS（1.0.0，PVE VM 105）**：`S3_ENV=.claude/skills/e2e-s3/rustfs/.env`（`versioning_matrix.sh` /
-   `traversal_versions.sh` / `resume_matrix.sh` 认；`staged_matrix.sh` 只读默认 `.env`）。endpoint
+   `traversal_versions.sh` / `resume_matrix.sh` / `staged_matrix.sh` / `run.py` 都认）。endpoint
    `http://10.131.9.14:9001`：管理网上的 console 监听也服务完整 S3 API，业务网 `10.10.1.14:9000` 从 WSL 不通；
    `S3_COMPAT=` 空 = 普通 S3，不用 `S3_LOCATION`。用户 `data-mover-test` 的策略只放行 `data-mover-test` 与
    `data-mover-*`（默认 `BUCKET_PREFIX` 就能建删临时桶）；`bigbucket` 不是我们的（403）。2026-09-26 curl 实测：
@@ -112,7 +119,68 @@ S3_PREFIX=test                   # bucket 内的子路径
    跑 legacy `walkdir` / `walkdir_2`（先重新开版本：暂停版本的桶走 ListObjectsV2）：`k` 按写入的 id 列 v1、v2、标记、v3，
    `gone` 列版本再列 latest 标记（D4），`p/z` 跨页完整，无 artifact。
    退出时按 id 删光版本与标记、删桶，打印 `cleanup: … deleted` 与剩下的桶；只有全部通过且桶已删才退出 0（编译失败、桶不是本次建的也以非 0 退出，trap 保留原退出码）。
-   同样认 `S3_ENV` / `BUCKET_PREFIX`（默认 `data-mover-c22`）/ `S3_LOCATION`。
+   同样认 `S3_ENV` / `BUCKET_PREFIX`（默认 `data-mover-c22`）/ `S3_LOCATION`。另两种选桶方式（桶名都必须 `data-mover-*`，
+   都写在唯一前缀 `dm-<run>/` 下、退出时清空该前缀、不删桶、不改桶设置）：
+   - `S3_VERSIONED_BUCKET=<桶>`：已有的版本桶（版本必须 Enabled，否则拒跑）。没有暂停版本那一步，`n` 是普通的一个版本。
+   - `S3_UNVERSIONED_BUCKET=<桶>`：从没开过版本的桶（`GetBucketVersioning` 无 Status，或 501 —— ONTAP NAS 桶）。只跑
+     Current 与 legacy（ListObjectsV2）：每个 key 一次（`k` 4 B、`p/z` 3 B、没有 `gone`、没有 artifact、999 个 `p/a*`），
+     blocks 并发 1 / 4 / 32 一致；清理先删对象、再自深向浅删 NAS 桶为写过的 key 留下的目录。
+   历史顺序：`EXPECT_ORDER=inferred`（RustFS：每页删除标记全在版本之前，现存问题 11）时，有删除标记的 key（`k`、`gone`）的
+   每一行必须带 ` order=inferred`，其余 key 一行都不许带；默认 `server` 时哪一行都不许带 —— 解析同时接受可选的
+   ` order=…` 后缀，检查是精确的，不是容忍。
+
+## 真机矩阵（P7 S3：C6、F4、C10、C11、C11b、收尾清理每一步都要过）
+
+环境、写入范围与已知差异见 `.claude/docs/test-environments.md`；**每套都跑非多版本与多版本两种桶**。每条命令都包
+`timeout`（用户规则）；凭据只在各自的 `.env`（gitignored）里，脚本经 `curl -K <(…)` 传。在仓库根目录跑，`S=.claude/skills/e2e-s3`：
+
+```bash
+S=.claude/skills/e2e-s3
+# MinIO（默认 .env，桶 data-mover-test；多版本用临时桶 data-mover-c17-* / data-mover-c22-*；绝不写 a-bucket）
+timeout 600  python3 $S/scripts/run.py
+timeout 3600 bash $S/scripts/staged_matrix.sh
+S3_UNVERSIONED_BUCKET=data-mover-test timeout 1800 bash $S/scripts/traversal_versions.sh
+timeout 1800 bash $S/scripts/traversal_versions.sh
+timeout 5400 bash $S/scripts/versioning_matrix.sh
+
+# ONTAP 对象桶（不能建桶：非多版本 data-mover-test，多版本 data-mover-test-ver，都用已有桶模式；绝不写 ontap-lisa-auto-bucket）
+E=$S/ontap/.env
+S3_ENV=$E timeout 600  python3 $S/scripts/run.py
+S3_ENV=$E timeout 3600 bash $S/scripts/staged_matrix.sh
+S3_ENV=$E S3_UNVERSIONED_BUCKET=data-mover-test timeout 1800 bash $S/scripts/traversal_versions.sh
+S3_ENV=$E S3_VERSIONED_BUCKET=data-mover-test-ver timeout 1800 bash $S/scripts/traversal_versions.sh
+S3_ENV=$E S3_VERSIONED_BUCKET=data-mover-test-ver timeout 5400 bash $S/scripts/versioning_matrix.sh
+
+# ONTAP NAS 桶 data-mover-nas：只有非多版本（GetBucketVersioning 501、ListObjectVersions 不实现）；平铺列举无序
+S3_ENV=$E S3_BUCKET=data-mover-nas timeout 600  python3 $S/scripts/run.py
+S3_ENV=$E S3_BUCKET=data-mover-nas timeout 3600 bash $S/scripts/staged_matrix.sh
+S3_ENV=$E S3_UNVERSIONED_BUCKET=data-mover-nas timeout 1800 bash $S/scripts/traversal_versions.sh
+
+# RustFS（管理网 9001；非多版本 data-mover-test，多版本临时桶 data-mover-rustfs-*；绝不写 bigbucket）
+E=$S/rustfs/.env
+S3_ENV=$E timeout 600  python3 $S/scripts/run.py
+S3_ENV=$E timeout 3600 bash $S/scripts/staged_matrix.sh
+S3_ENV=$E S3_UNVERSIONED_BUCKET=data-mover-test timeout 1800 bash $S/scripts/traversal_versions.sh
+S3_ENV=$E EXPECT_ORDER=inferred BUCKET_PREFIX=data-mover-rustfs timeout 1800 bash $S/scripts/traversal_versions.sh
+S3_ENV=$E BUCKET_PREFIX=data-mover-rustfs timeout 5400 bash $S/scripts/versioning_matrix.sh
+
+# DXN（非多版本 data-mover-test —— 永不给它开版本；多版本临时桶 data-mover-dxn-*，建桶带 LocationConstraint，用户上限 5 个桶）
+E=$S/dxn/.env
+S3_ENV=$E timeout 600  python3 $S/scripts/run.py
+S3_ENV=$E timeout 3600 bash $S/scripts/staged_matrix.sh
+S3_ENV=$E S3_UNVERSIONED_BUCKET=data-mover-test timeout 1800 bash $S/scripts/traversal_versions.sh
+S3_ENV=$E BUCKET_PREFIX=data-mover-dxn S3_LOCATION=magnascale:tos_placement timeout 1800 bash $S/scripts/traversal_versions.sh
+S3_ENV=$E BUCKET_PREFIX=data-mover-dxn S3_LOCATION=magnascale:tos_placement timeout 5400 bash $S/scripts/versioning_matrix.sh
+```
+
+- 期望：`run.py` `all checks passed`；`staged_matrix.sh` 的 Direct 行 `equal=yes key_uploads=0`、原生行
+  `equal=yes stage_objects=0 key_uploads=0`、续传后 `pointers=0 key_uploads=0`、末行 `left: objects=0 key_uploads=0`；
+  `traversal_versions.sh` `RESULT: pass` 且 `cleanup: … deleted` / `… emptied (bucket kept)`；`versioning_matrix.sh`
+  每行 `result=ok`、`final versions=1 delete markers=0 artifact entries=0 version=latest: yes`（暂停版本行 `n/a`），
+  `cleanup: … deleted` / `… emptied`。
+- 不改任何桶的版本设置：`S3_UNVERSIONED_BUCKET` 遇到开过版本的桶拒跑；`S3_VERSIONED_BUCKET` 不暂停版本；临时桶只动自己建的。
+- 跑完核对各服务器剩下的桶：MinIO `a-bucket data-mover-test`、RustFS `bigbucket data-mover-test`、DXN `data-mover-test`
+  （traversal / versioning 的清理行会打印），ONTAP 三个桶里没有我们的前缀。
 
 ## 成功判据
 
