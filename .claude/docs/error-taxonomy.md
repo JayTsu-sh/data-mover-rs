@@ -89,7 +89,8 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | **不带** versionId 的 DeleteObject 也被 Object Lock 拒绝（Ceph RGW / DXN：当前版本有 legal hold 时 403 `AccessDenied`，2026-09-25 实测；AWS / MinIO 加删除标记） | 条目 `PermissionDenied` / Permanent（映射不变）；删指针时（先按版本被拒之后）降级为告警、指针留在原处（`upload_pointer::Removal::Held`），不算传输失败 |
 | Complete 之后删自己的指针失败（任何类别） | 映射不变；`publish_final_upload` 只告警、照常报已发布（对象已提交，重试会多一个版本；遗留指针下次 prepare 清） |
 | 节流：429、503，或错误码 `SlowDown` / `ServiceUnavailable` / `Throttling*` / `TooManyRequests*` / `RequestLimitExceeded` / `RequestThrottled*` / `BandwidthLimitExceeded`（不论状态码；P7 C3） | 会话 **`Throttled`** / Transient（此前是 `Connectivity`）。范围保持会话级，传输侧行为不变（引擎不按类别分支；`definite_refusal` 不含它，仍走 reconcile）。**列举**在生产者内按页退避（`src/storage/throttle.rs`：首个约 125–250 ms、翻倍、单次 ≤15 s、单个列举累计 ≤约 2 分钟，带抖动，取消即停），预算耗尽才是**该列举**的条目 `Throttled` / Transient（目录 `Unreadable`）；遍历把任何 `Throttled` 会话失败收窄为那个列举 / 那个子项的失败，**节流不结束遍历**（P7 评审现存问题 1） |
-| 其余 5xx（500 / 502 / 504 …） | 会话 `Connectivity` / Transient（不变） |
+| 501，或错误码 `NotImplemented`（任何状态）：存储不实现这个请求（ONTAP 9.19.1 NAS 桶的 `CreateMultipartUpload`、带 `If-Match` / `If-None-Match` 的 GET、对象桶与 NAS 桶之间的 `CopyObject`，2026-09-26 实测） | 条目 **`Unsupported`** / Permanent（此前落进通用 5xx，是会话 `Connectivity` / Transient，传输报成可重试的断连）。`definite_refusal` 含 `Unsupported` → PUT / CopyObject / Complete 被 501 拒算最终 key 未变、不对账；删指针版本被 501 拒 → 降级为普通删除 + 告警（`not_deletable_by_version`）；**列举**不再重发，报在该目录上（目录 `Unreadable`，遍历继续兄弟）—— 整个桶都不能列的存储因此逐目录报，不升会话（NAS 桶能列，没遇到过） |
+| 其余 5xx（500 / 502 / 504 …，501 除外） | 会话 `Connectivity` / Transient（不变） |
 | DXN 重试一个仍在完成中的 Complete：500 `InternalError`（"This multipart completion is already in progress"） | 通用 5xx：会话 `Connectivity` / Transient —— 不是提交前的拒绝，`settle_completion` 查 `ListParts` |
 | DXN 完成后的 `ListParts`：404 `NoSuchKey`（MinIO 回 `NoSuchUpload`） | 条目 `NotFound` / Permanent（同上第一行）—— 与 `NoSuchUpload` 一样进入按版本结算（C17） |
 | 按 versionId 删除一个不存在的版本 | 成功（S3 / MinIO 回 204），不是错误 |
@@ -219,7 +220,7 @@ Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修�
 | NFS READDIRPLUS 某项没带属性（v3 `post_op_attr` 可省；v4 属性解不出也是这样）或没带文件句柄 | 子项（报在子项路径；名字拼不出 `StoragePath` 时报在目录上） | `Protocol` / Unknown |
 | CIFS 子项的身份字节超出模型上限（造不出 `SourceIdentity`） | 子项 | `Protocol` / Permanent |
 | HDFS 子项的 status 转换不了（时间超出 `i64` 纳秒等）、路径拼不出 `StoragePath` | 子项；不是本目录直接子项的（越出根、嵌套）或拼不出的报在目录路径上 | `Protocol` / Permanent |
-| S3 列举（P7 C6，Current 与 All）的一页节流：同一 continuation token / marker 按有界退避重发（每个列举累计约 2 分钟）；其他瞬时失败（5xx、超时、连接断开）：同一 token 重发至多 3 次（250 ms / 1 s / 2 s，读到一页即续满），首页前后一样，不从头重列、不重复交出 | 续上则无失败；节流超预算 → 该列举 `Throttled` / Transient；瞬时失败重发用尽 → 保留原作用域（会话级的照常升会话）；首页之后失败的 Current 列举块 `Interrupted { delivered }` | 按 S3 映射 |
+| S3 列举（P7 C6，Current 与 All）的一页节流：同一 continuation token / marker 按有界退避重发（每个列举累计约 2 分钟）；其他瞬时失败（5xx 但不含 501、超时、连接断开）：同一 token 重发至多 3 次（250 ms / 1 s / 2 s，读到一页即续满），首页前后一样，不从头重列、不重复交出 | 续上则无失败；节流超预算 → 该列举 `Throttled` / Transient；瞬时失败重发用尽 → 保留原作用域（会话级的照常升会话）；首页之后失败的 Current 列举块 `Interrupted { delivered }` | 按 S3 映射 |
 | S3 当前对象列举（P7 C6）翻页 token 回绕 / 连续 16 空页 / 驻留的前缀名 + 报过的 key 超 500 万、续页 token 超 500 万（对象不计，重复前缀只记一次）：先交出已列到的页（触发的那一页不交出），再以该目录的失败结束（不结束整场） | 整个列举，块 `Interrupted { delivered }`（一项未交出则 `Unreadable`） | `Protocol` / Permanent；超上限 `Capacity` / Permanent |
 | S3 对象 size 缺失 / 为负（`role_protocol/listing.rs` 逐项解码为 `S3RejectedEntry`） | 子项（报在对象路径）；版本列举里这个 key 的全部版本都不列 | `Protocol` / Permanent |
 | S3 键 / 公共前缀越出存储根，或越出所列目录（服务端无视 prefix） | 无名子项（`raw_name` = 服务端给的键） | `Protocol` / Permanent |

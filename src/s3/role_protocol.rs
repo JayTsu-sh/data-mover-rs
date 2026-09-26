@@ -522,6 +522,12 @@ pub(super) fn s3_role_remote_failure(
             Transience::Permanent,
             diagnostic,
         ),
+        // The store does not implement the request (ONTAP NAS buckets: CreateMultipartUpload and
+        // a conditional GET answer 501 `NotImplemented`): a permanent limit of the store, not a
+        // lost connection that a retry could cure.
+        (Some(501), _) | (_, Some("NotImplemented")) => {
+            S3ProtocolFailure::entry(FailureClass::Unsupported, Transience::Permanent, diagnostic)
+        }
         // The service asks for fewer requests: back off, it is no lost session (P7 §8, Q11). The
         // scope stays the session's so callers outside a listing keep their behaviour; a listing
         // backs off within its budget, and the traversal never ends on one.
@@ -651,6 +657,29 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// 501 `NotImplemented` (ONTAP NAS buckets: `CreateMultipartUpload`, a GET with `If-Match`,
+    /// a copy between a NAS and an object bucket) is a permanent `Unsupported` of the entry, not
+    /// the transient `Connectivity` of the other 5xx.
+    #[test]
+    fn not_implemented_is_a_permanent_unsupported() {
+        use crate::model::{FailureClass, Transience};
+        for (status, code) in [
+            (Some(501), Some("NotImplemented")),
+            (Some(501), None),
+            (Some(400), Some("NotImplemented")),
+        ] {
+            assert_eq!(
+                s3_role_remote_failure(status, code, "create multipart upload"),
+                S3ProtocolFailure::entry(
+                    FailureClass::Unsupported,
+                    Transience::Permanent,
+                    "create multipart upload"
+                ),
+                "{status:?} {code:?}"
+            );
+        }
     }
 
     /// DXN (Ceph RGW) answers a retried `CompleteMultipartUpload` whose first attempt is still
