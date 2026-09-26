@@ -192,6 +192,17 @@ struct DirectoryWork {
     hint: Option<DescentHint>,
 }
 
+/// The traversal root's work: the root's children are depth 1, and the filter applies to them
+/// when there is one.
+fn root_work(request: &TraversalRequest) -> DirectoryWork {
+    DirectoryWork {
+        path: request.root.clone(),
+        child_depth: 1,
+        filter_children: request.filter.is_some(),
+        hint: None,
+    }
+}
+
 impl DirectoryWork {
     /// The same work carrying `hint`, unless it already carries one.
     fn with_hint(mut self, hint: Option<DescentHint>) -> Self {
@@ -302,10 +313,28 @@ struct Shared {
     parked_listing_limit: Option<usize>,
 }
 
+impl Shared {
+    fn new(
+        namespace: Arc<dyn Namespace>,
+        metadata: Arc<dyn Metadata>,
+        request: TraversalRequest,
+    ) -> Self {
+        let parked_listing_limit = namespace.parked_listing_limit().map(NonZeroUsize::get);
+        Self {
+            namespace,
+            metadata,
+            policy: Policy::new(&request),
+            request,
+            tickets: AtomicU64::new(0),
+            root_object_reported: AtomicBool::new(false),
+            parked_listing_limit,
+        }
+    }
+}
+
 struct Runtime<'a> {
     shared: &'a Arc<Shared>,
     request: &'a TraversalRequest,
-    policy: &'a Policy,
     items: &'a ItemSender,
 }
 
@@ -319,30 +348,12 @@ async fn run(
 ) {
     let mut state = State::new();
     let (sender, mut arrivals) = mpsc::unbounded_channel();
-    let mut cursor = Cursor::new(
-        DirectoryWork {
-            path: request.root.clone(),
-            child_depth: 1,
-            filter_children: request.filter.is_some(),
-            hint: None,
-        },
-        sender,
-    );
+    let mut cursor = Cursor::new(root_work(&request), sender);
     let mut observations = Observations::new();
-    let parked_listing_limit = namespace.parked_listing_limit().map(NonZeroUsize::get);
-    let shared = Arc::new(Shared {
-        namespace,
-        metadata,
-        policy: Policy::new(&request),
-        request,
-        tickets: AtomicU64::new(0),
-        root_object_reported: AtomicBool::new(false),
-        parked_listing_limit,
-    });
+    let shared = Arc::new(Shared::new(namespace, metadata, request));
     let runtime = Runtime {
         shared: &shared,
         request: &shared.request,
-        policy: &shared.policy,
         items: &items,
     };
     let result = drive(
@@ -578,17 +589,23 @@ fn entry_name(path: &StoragePath) -> &str {
         .unwrap_or_default()
 }
 
-/// Puts one observation into its output slot, and records the descend decision a deferred one
-/// makes.
-fn settle(
-    runtime: &Runtime<'_>,
-    decisions: &mut Decisions,
-    state: &mut State,
-    observed: Observed,
-) -> Result<(), TraversalTerminalFailure> {
-    let (sequence, result, deferred) = observed;
+/// What one child's settled observation comes to: the item its slot holds, where its subtree
+/// went when a deferred decision was made now, and the directory to list below it, if any.
+struct Resolved {
+    item: ChildItem,
+    descent: Option<ChildDescent>,
+    below: Option<DirectoryWork>,
+}
+
+/// Resolves one child's observation, applying a deferred decision now that it can be made. A
+/// session failure ends the traversal.
+fn resolve(
+    shared: &Shared,
+    result: Result<Box<ObservedEntry>, StorageRoleFailure>,
+    deferred: Option<Deferred>,
+) -> Result<Resolved, TraversalTerminalFailure> {
     let (item, below) = match result {
-        Ok(entry) => settle_entry(runtime, entry, deferred),
+        Ok(entry) => settle_entry(shared, entry, deferred),
         // Gone since the listing: nothing to emit or descend into, and no failure (Q12).
         Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
             (ChildItem::Vanished, None)
@@ -601,8 +618,29 @@ fn settle(
     let descent = match item {
         ChildItem::Vanished => None,
         _ => deferred
-            .and_then(|deferred| deferred_descent(runtime.request, deferred, below.is_some())),
+            .and_then(|deferred| deferred_descent(&shared.request, deferred, below.is_some())),
     };
+    Ok(Resolved {
+        item,
+        descent,
+        below,
+    })
+}
+
+/// Puts one observation into its output slot, and records the descend decision a deferred one
+/// makes.
+fn settle(
+    runtime: &Runtime<'_>,
+    decisions: &mut Decisions,
+    state: &mut State,
+    observed: Observed,
+) -> Result<(), TraversalTerminalFailure> {
+    let (sequence, result, deferred) = observed;
+    let Resolved {
+        item,
+        descent,
+        below,
+    } = resolve(runtime.shared, result, deferred)?;
     if let Some(ticket) = deferred.and_then(|deferred| deferred.ticket) {
         decisions.insert(ticket, below);
     }
@@ -647,16 +685,16 @@ fn entry_candidate<'a>(root: &StoragePath, entry: &'a ObservedEntry) -> Traversa
 
 /// Applies a deferred decision now that the observation (and therefore `modified`) is known.
 fn settle_entry(
-    runtime: &Runtime<'_>,
+    shared: &Shared,
     entry: Box<ObservedEntry>,
     deferred: Option<Deferred>,
 ) -> (ChildItem, Option<DirectoryWork>) {
     let Some(deferred) = deferred else {
         return (ChildItem::Item(TraversalItem::Entry(entry)), None);
     };
-    let decision = runtime
+    let decision = shared
         .policy
-        .decide(true, &entry_candidate(&runtime.request.root, &entry));
+        .decide(true, &entry_candidate(&shared.request.root, &entry));
     let descend = (decision.descend && deferred.ticket.is_some()).then(|| DirectoryWork {
         path: entry.path().clone(),
         child_depth: deferred.depth.saturating_add(1),

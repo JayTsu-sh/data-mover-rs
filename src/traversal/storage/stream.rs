@@ -217,7 +217,7 @@ async fn room(credit: &Semaphore, reporter: &Reporter) -> bool {
 
 /// A listing's failure as the driver takes it. Throttling never ends a traversal (P7 §8): a
 /// listing throttled past its budget is that listing's failure.
-fn failed(path: &StoragePath, failure: StorageRoleFailure) -> Arrival {
+pub(super) fn failed(path: &StoragePath, failure: StorageRoleFailure) -> Arrival {
     match throttling_scoped_to(path, Operation::Traverse, failure) {
         StorageRoleFailure::Entry(failure) => Arrival::Failed(failure),
         StorageRoleFailure::Session(failure) => {
@@ -258,7 +258,7 @@ impl Drop for Reporter {
 
 /// Turns one page into what the cursor admits: listing-level facts counted, every child's
 /// admission decision made now, and every child that needs no I/O observed now.
-fn prepare(shared: &Shared, work: &DirectoryWork, page: ListingPage) -> Page {
+pub(super) fn prepare(shared: &Shared, work: &DirectoryWork, page: ListingPage) -> Page {
     let internal_hidden = u64::from(page.internal_hidden);
     let (mut entries, mut failures) = page.into_hinted_descriptors(&work.path);
     if work.child_depth == 1 {

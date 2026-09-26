@@ -66,6 +66,16 @@ impl BlockFacts {
         self.truncated = self.truncated.saturating_add(page.truncated);
         self.vanished = self.vanished.saturating_add(page.vanished);
     }
+
+    /// Adds what these facts counted to `block`, whose own tallies are the children's slots.
+    pub(super) const fn count_into(&self, block: &mut BlockCounts) {
+        block.listed = block.listed.saturating_add(self.listed);
+        block.internal_hidden = block.internal_hidden.saturating_add(self.internal_hidden);
+        block.filtered = block.filtered.saturating_add(self.filtered);
+        block.pruned_dirs = block.pruned_dirs.saturating_add(self.pruned);
+        block.truncated_dirs = block.truncated_dirs.saturating_add(self.truncated);
+        block.vanished = block.vanished.saturating_add(self.vanished);
+    }
 }
 
 /// What one child's output slot holds.
@@ -182,41 +192,13 @@ impl Output {
         item: ChildItem,
         descent: Option<ChildDescent>,
     ) -> Option<TraversalItem> {
-        match descent {
-            Some(ChildDescent::Pruned) => {
-                self.block.pruned_dirs = self.block.pruned_dirs.saturating_add(1);
-            }
-            Some(ChildDescent::Truncated) => {
-                self.block.truncated_dirs = self.block.truncated_dirs.saturating_add(1);
-            }
-            Some(ChildDescent::Listed) | None => {}
-        }
-        let item = match item {
-            ChildItem::Item(item) => item,
-            ChildItem::Filtered => {
-                self.block.filtered = self.block.filtered.saturating_add(1);
-                return None;
-            }
-            ChildItem::Vanished => {
-                self.block.vanished = self.block.vanished.saturating_add(1);
-                return None;
-            }
-        };
-        match &item {
-            TraversalItem::Entry(entry) => self.block.count_emitted(entry),
-            // A listing failure is the directory's, not a child's: it decides the block's outcome
-            // and its block end counts it.
-            TraversalItem::Failure(failure) => match failure.listing_outcome() {
-                None => {
-                    self.block.failed_children = self.block.failed_children.saturating_add(1);
-                }
-                Some(outcome) => {
-                    self.listing.get_or_insert(outcome);
-                }
-            },
-            // Naming both rather than wildcarding makes the next variant added to
-            // `TraversalItem` a compile error at this tally.
-            TraversalItem::DirectoryListed(_) | TraversalItem::Checkpoint(_) => {}
+        let item = tally_child(&mut self.block, item, descent)?;
+        // A listing failure is the directory's, not a child's: it decides the block's outcome and
+        // its block end counts it.
+        if let TraversalItem::Failure(failure) = &item
+            && let Some(outcome) = failure.listing_outcome()
+        {
+            self.listing.get_or_insert(outcome);
         }
         Some(item)
     }
@@ -224,31 +206,72 @@ impl Output {
     /// Turns the block just delivered into its [`DirectoryListed`], and adds it to the totals.
     fn close_block(&mut self, path: StoragePath, facts: BlockFacts) -> TraversalItem {
         let mut counts = mem::take(&mut self.block);
-        counts.listed = facts.listed;
-        counts.internal_hidden = facts.internal_hidden;
-        counts.filtered = counts.filtered.saturating_add(facts.filtered);
-        counts.pruned_dirs = counts.pruned_dirs.saturating_add(facts.pruned);
-        counts.truncated_dirs = counts.truncated_dirs.saturating_add(facts.truncated);
-        counts.vanished = counts.vanished.saturating_add(facts.vanished);
+        facts.count_into(&mut counts);
         self.totals.absorb(&counts);
         if facts.vanished_listing {
             self.totals.vanished_listings = self.totals.vanished_listings.saturating_add(1);
         }
         let outcome = self.listing.take().unwrap_or(ListingOutcome::Complete);
-        match outcome {
-            ListingOutcome::Complete => {}
-            ListingOutcome::Interrupted => {
-                self.totals.listing_failures = self.totals.listing_failures.saturating_add(1);
-                self.totals.interrupted_listings =
-                    self.totals.interrupted_listings.saturating_add(1);
-            }
-            ListingOutcome::Unreadable => {
-                self.totals.listing_failures = self.totals.listing_failures.saturating_add(1);
-            }
-        }
+        count_listing(&mut self.totals, outcome);
         let mut listed = DirectoryListed::new(path, outcome, counts);
         listed.vanished = facts.vanished_listing;
         TraversalItem::DirectoryListed(Box::new(listed))
+    }
+}
+
+/// Tallies one child into `block` and returns the item to deliver, if any. A listing failure is
+/// returned untallied: it is its directory's, not a child's, and the caller counts it as such.
+pub(super) fn tally_child(
+    block: &mut BlockCounts,
+    item: ChildItem,
+    descent: Option<ChildDescent>,
+) -> Option<TraversalItem> {
+    match descent {
+        Some(ChildDescent::Pruned) => {
+            block.pruned_dirs = block.pruned_dirs.saturating_add(1);
+        }
+        Some(ChildDescent::Truncated) => {
+            block.truncated_dirs = block.truncated_dirs.saturating_add(1);
+        }
+        Some(ChildDescent::Listed) | None => {}
+    }
+    let item = match item {
+        ChildItem::Item(item) => item,
+        ChildItem::Filtered => {
+            block.filtered = block.filtered.saturating_add(1);
+            return None;
+        }
+        ChildItem::Vanished => {
+            block.vanished = block.vanished.saturating_add(1);
+            return None;
+        }
+    };
+    match &item {
+        TraversalItem::Entry(entry) => block.count_emitted(entry),
+        TraversalItem::Failure(failure) if failure.listing_outcome().is_none() => {
+            block.failed_children = block.failed_children.saturating_add(1);
+        }
+        // Naming both rather than wildcarding makes the next variant added to `TraversalItem` a
+        // compile error at this tally.
+        TraversalItem::Failure(_)
+        | TraversalItem::DirectoryListed(_)
+        | TraversalItem::Checkpoint(_) => {}
+    }
+    Some(item)
+}
+
+/// Counts how one directory's listing ended into `totals`, derived from the listing's own
+/// outcome so a failed listing can never be counted complete.
+pub(super) const fn count_listing(totals: &mut ScanTotals, outcome: ListingOutcome) {
+    match outcome {
+        ListingOutcome::Complete => {}
+        ListingOutcome::Interrupted => {
+            totals.listing_failures = totals.listing_failures.saturating_add(1);
+            totals.interrupted_listings = totals.interrupted_listings.saturating_add(1);
+        }
+        ListingOutcome::Unreadable => {
+            totals.listing_failures = totals.listing_failures.saturating_add(1);
+        }
     }
 }
 
