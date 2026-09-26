@@ -22,6 +22,7 @@ use crate::storage::Metadata as MetadataRole;
 use crate::storage::backends::local::namespace::LocalNamespace;
 use crate::storage::backends::local::observation::LocalObservationAdapter;
 use crate::storage::backends::local::test_traversal_storage;
+use crate::storage::listing::DEFAULT_PAGE_HINT;
 #[cfg(unix)]
 use crate::storage::listing::testing::listed;
 
@@ -685,5 +686,66 @@ async fn a_subdirectory_removed_before_its_listing_is_a_vanished_listing() -> io
             if failure.scope == FailureScope::Listing
                 && failure.failure.class() == FailureClass::NotFound
     )));
+    Ok(())
+}
+
+/// A directory read that fails after the first page (P7 C5, §8): the children read before it are
+/// emitted, then one listing failure carrying how many were delivered, and the block closes
+/// `Interrupted`. Fault injection: turn the failed read into a child failure (the stream reports
+/// no more entries after an error, so the listing would end "complete") and this goes red.
+#[tokio::test]
+async fn a_directory_read_failing_after_the_first_page_is_interrupted() -> io::Result<()> {
+    // The read fails in the second page of the traversal's listings.
+    const FAIL_AT: usize = DEFAULT_PAGE_HINT.get() + 26;
+    const FILES: usize = FAIL_AT + 50;
+    let root = tempfile::tempdir()?;
+    std::fs::create_dir(root.path().join("wide"))?;
+    for index in 0..FILES {
+        std::fs::write(root.path().join(format!("wide/f{index:05}")), b"")?;
+    }
+    let fixture = fixture(root.path())?;
+    fixture
+        .namespace
+        .failing_directory_reads(Arc::new(|native: &Path, read: usize| {
+            (native == Path::new("wide") && read == FAIL_AT)
+                .then(|| io::Error::other("injected EIO"))
+        }));
+    let mut session = fixture
+        .source
+        .traverse(request(CancellationToken::new(), 4, 64));
+    let items = drain(&mut session).await;
+    let completion = completed(session.finish().await.map_err(io::Error::other)?)?;
+
+    let wide = StoragePath::new("wide").map_err(io::Error::other)?;
+    let emitted_below = entry_paths(&items)
+        .iter()
+        .filter(|path| path.starts_with("wide/"))
+        .count();
+    assert_eq!(emitted_below, FAIL_AT);
+    let failure = items
+        .iter()
+        .position(|item| matches!(item, TraversalItem::Failure(failure) if failure.path == wide))
+        .ok_or_else(|| io::Error::other("missing listing failure"))?;
+    assert!(matches!(
+        &items[failure],
+        TraversalItem::Failure(failure)
+            if failure.scope == FailureScope::Listing
+                && failure.delivered == Some(FAIL_AT as u64)
+    ));
+    assert!(matches!(
+        items.get(failure + 1),
+        Some(TraversalItem::DirectoryListed(listed))
+            if listed.path == wide && listed.outcome == ListingOutcome::Interrupted
+    ));
+    let totals = completion.totals;
+    assert_eq!(
+        (
+            totals.interrupted_listings,
+            totals.emitted,
+            totals.failed_children
+        ),
+        (1, FAIL_AT as u64 + 1, 0)
+    );
+    assert!(totals.is_balanced());
     Ok(())
 }

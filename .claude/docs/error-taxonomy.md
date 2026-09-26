@@ -210,6 +210,7 @@ Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修�
 | 情况 | 范围 | FailureClass / Transience |
 |---|---|---|
 | 目录打不开 / 读不了、READDIRPLUS 流出错、HDFS `list_status` 失败、遍历根不存在 | 整个列举（报在目录上，块 `Unreadable`；`Connectivity` 照常升会话） | 按上面各 backend 的映射 |
+| 已交出若干子项之后读目录失败（Local `getdents` 出错，P7 C5：此前记成目录上的子项失败，且 rustix 出错后不再给条目，列举会被读成“完整”） | 整个列举，先交出已读到的子项，块 `Interrupted { delivered }`；一项都没交出则 `Unreadable` | 按 Local 映射（`EIO` 等 → `Protocol` / Unknown） |
 | 列举返回的子项在描述 / 观察时已不存在 | 不是失败：`vanished` | `NotFound`（只用于分类） |
 | Local 名字不是 UTF-8 / 拼出的路径超长 | 无名子项（`raw_name` = Unix 原始字节，Windows UTF-16LE） | `Unsupported` / Permanent |
 | NFS / CIFS 名字含 U+FFFD（nfs-rs、smb-rs 有损解码，原名已丢，按它拼出的路径指不到原条目；真含 U+FFFD 的名字无法区分，一并报） | 无名子项（NFS 无原始字节；CIFS `raw_name` = 解码后的 UTF-8） | `Unsupported` / Permanent |

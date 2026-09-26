@@ -431,4 +431,6 @@ fn observed(descriptor: &SourceDescriptor) -> Option<ObservedEntry> {
 }
 
 #[cfg(test)]
+mod local_tests;
+#[cfg(test)]
 mod tests;

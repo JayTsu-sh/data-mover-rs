@@ -19,11 +19,12 @@
 //! Single-directory callers (recursive delete, the NDX walk) collect a whole listing with
 //! [`collect_listing`].
 //!
-//! **Where each backend stands (P7 C1).** Every backend still reads the whole directory first and
-//! then hands it over in pages, so backpressure and cancellation only act between pages: a
-//! dropped or cancelled listing of a large directory is still read to its end in the background
+//! **Where each backend stands.** Local reads its directory page by page (P7 C5): a dropped or
+//! cancelled Local listing stops within a page. The other backends still read the whole directory
+//! first and then hand it over in pages, so backpressure and cancellation only act between pages:
+//! a dropped or cancelled listing of a large directory is still read to its end in the background
 //! (S3 excepted, which abandons its stateless requests at once). True paging comes per backend
-//! in C5–C9. A producer detached from a runtime that shuts down mid-listing is dropped with the
+//! in C6–C9. A producer detached from a runtime that shuts down mid-listing is dropped with the
 //! runtime, as every other detached task is.
 
 use std::fmt;

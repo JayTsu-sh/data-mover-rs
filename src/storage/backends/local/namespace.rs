@@ -17,18 +17,13 @@
 
 use std::ffi::OsStr;
 use std::io;
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt as _;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use cap_std::fs::{Dir, DirEntry, Metadata};
+use cap_std::fs::{Dir, Metadata};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK;
 
@@ -46,14 +41,13 @@ use crate::model::{
 use crate::storage::InlineOwnership;
 use crate::storage::artifacts::is_artifact_name;
 use crate::storage::durability::sync_directory;
-use crate::storage::listing::child_path;
 use crate::storage::{
-    CaseSensitivity, ChildFailure, ListRequest, ListingPage, ListingStream, NameNormalization,
-    NameSemantics, Namespace, NamespaceCapabilities, SourceDescriptor, StorageRoleFailure,
+    CaseSensitivity, ListRequest, ListingStream, NameNormalization, NameSemantics, Namespace,
+    NamespaceCapabilities, SourceDescriptor, StorageRoleFailure,
 };
-#[cfg(test)]
-pub(crate) use hooks::Hook;
 use hooks::Hooks;
+#[cfg(test)]
+pub(crate) use hooks::{Hook, ReadFailure};
 
 /// Namespace role for one Local root.
 #[derive(Clone)]
@@ -118,6 +112,12 @@ impl LocalNamespace {
     #[cfg(test)]
     pub(crate) fn before_read_link(&self, hook: Hook) {
         self.lock_hooks().reading_link = Some(hook);
+    }
+
+    /// Asks `hook` before each directory read whether that read fails instead ([`ReadFailure`]).
+    #[cfg(test)]
+    pub(crate) fn failing_directory_reads(&self, hook: ReadFailure) {
+        self.lock_hooks().reading_directory = Some(hook);
     }
 
     #[cfg(test)]
@@ -187,27 +187,6 @@ impl LocalNamespace {
         tokio::task::spawn_blocking(move || work(&root, &identity))
             .await
             .map_err(|_| entry_failure(path, operation, FailureClass::Internal))?
-    }
-
-    /// Reads one whole directory; [`Namespace::list`] hands it over page by page.
-    async fn list_whole(
-        &self,
-        directory: &StoragePath,
-        native: PathBuf,
-    ) -> Result<ListingPage, StorageRoleFailure> {
-        #[cfg(test)]
-        if let Some(failure) = self.injected_list_failure(directory) {
-            return Err(failure);
-        }
-        let path = directory.clone();
-        let hooks = self.hooks();
-        self.blocking(directory, Operation::Traverse, move |root, identity| {
-            hooks.before_list(&native);
-            let opened = open_directory(root, &native)
-                .map_err(|error| io_failure(&path, Operation::Traverse, &error))?;
-            list_blocking(&opened, identity, &path, &native, &hooks)
-        })
-        .await
     }
 
     async fn stat_entry(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
@@ -292,17 +271,15 @@ impl Namespace for LocalNamespace {
         self.stat_entry(path).await
     }
 
-    /// Reads the whole directory in one blocking call and hands it over in pages (P7 C1; true
-    /// paging comes with C5).
+    /// Streams the directory page by page, one blocking read per page ([`listing`], P7 C5).
     fn list(&self, request: ListRequest) -> ListingStream {
         let native = match checked(&request.path, Operation::Traverse, true) {
             Ok(native) => native,
             Err(failure) => return ListingStream::failed(request.path, failure),
         };
         let namespace = self.clone();
-        ListingStream::from_producer(request.path.clone(), move |sink| async move {
-            let listing = namespace.list_whole(&request.path, native).await;
-            sink.deliver(listing, &request).await;
+        ListingStream::from_producer(request.path.clone(), move |sink| {
+            namespace.produce_listing(request, native, sink)
         })
     }
 
@@ -350,142 +327,6 @@ const fn platform_names() -> NameSemantics {
     } else {
         NameSemantics::UNKNOWN
     }
-}
-
-/// Lists one already opened directory without following symlinks. Children are spelled as
-/// `directory`, `/` and their name, the listing contract, whatever normalisation `native` had.
-///
-/// A child that vanishes between the directory read and its stat is reported vanished
-/// ([`ChildFailure::vanished`]): the traversal counts it and emits nothing, since it no longer
-/// exists (P7 Q12). A name no path can spell is an unnamed child failure carrying its raw bytes.
-/// Any other per-child problem becomes that child's failure, next to the siblings that could be
-/// described.
-fn list_blocking(
-    opened: &Dir,
-    identity: &BackendIdentity,
-    directory: &StoragePath,
-    native: &Path,
-    hooks: &Hooks,
-) -> Result<ListingPage, StorageRoleFailure> {
-    let entries = opened
-        .entries()
-        .map_err(|error| io_failure(directory, Operation::Traverse, &error))?;
-    let mut described = Vec::new();
-    let mut failures = Vec::new();
-    let mut undescribed = Vec::new();
-    let mut hidden = 0_u32;
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            // The iterator cannot name the child it failed on, so the failure is attributed to
-            // the directory, beside the siblings that were read.
-            Err(error) => {
-                failures.push(entry_io_failure(directory, Operation::Traverse, &error)?);
-                continue;
-            }
-        };
-        let name = entry.file_name();
-        if is_artifact_name(&name) {
-            hidden = hidden.saturating_add(1);
-            continue;
-        }
-        hooks.before_describe(native, &name);
-        match describe_child(identity, directory, &name, &entry)? {
-            Ok(descriptor) => described.push(descriptor),
-            Err(failure) => undescribed.push(failure),
-        }
-    }
-    let mut page = ListingPage::from_descriptors(directory, described, failures, hidden);
-    for failure in undescribed {
-        page.push_failure(failure);
-    }
-    Ok(page)
-}
-
-/// One listed child: its descriptor, or why it cannot be described (the outer `Err` is a lost
-/// session).
-fn describe_child(
-    identity: &BackendIdentity,
-    directory: &StoragePath,
-    name: &OsStr,
-    entry: &DirEntry,
-) -> Result<Result<SourceDescriptor, ChildFailure>, StorageRoleFailure> {
-    let Some(path) = name
-        .to_str()
-        .and_then(|spelled| child_path(directory, spelled).ok())
-    else {
-        return Ok(Err(ChildFailure::unnamed(
-            identity,
-            directory,
-            raw_name(name),
-            FailureClass::Unsupported,
-            "a Local name cannot be spelled as a storage path (not UTF-8, or too long)",
-        )));
-    };
-    let metadata = match entry.metadata() {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let vanished = ChildFailure::vanished(directory, &path_name(&path));
-            return Ok(Err(vanished.unwrap_or_else(|_| internal(directory))));
-        }
-        Err(error) => {
-            return child_failure(directory, io_failure(&path, Operation::Traverse, &error));
-        }
-    };
-    match describe(identity, path, &metadata, Operation::Traverse) {
-        Ok(descriptor) => Ok(Ok(descriptor)),
-        Err(failure) => child_failure(directory, failure),
-    }
-}
-
-/// A per-child failure beside its siblings; a lost session stays the whole listing's.
-fn child_failure(
-    directory: &StoragePath,
-    failure: StorageRoleFailure,
-) -> Result<Result<SourceDescriptor, ChildFailure>, StorageRoleFailure> {
-    match failure {
-        StorageRoleFailure::Entry(failure) => {
-            Ok(Err(ChildFailure::from_failure(directory, failure)))
-        }
-        session @ StorageRoleFailure::Session(_) => Err(session),
-    }
-}
-
-/// The last segment of a path the listing itself spelled.
-fn path_name(path: &StoragePath) -> String {
-    path.as_str()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_owned()
-}
-
-fn internal(directory: &StoragePath) -> ChildFailure {
-    ChildFailure::from_failure(
-        directory,
-        entry_failure_value(
-            directory,
-            Operation::Traverse,
-            FailureClass::Internal,
-            Transience::Permanent,
-        ),
-    )
-}
-
-/// The native bytes of a name: as stored on Unix, UTF-16LE code units on Windows.
-#[cfg(unix)]
-fn raw_name(name: &OsStr) -> Bytes {
-    Bytes::copy_from_slice(name.as_bytes())
-}
-
-#[cfg(windows)]
-fn raw_name(name: &OsStr) -> Bytes {
-    name.encode_wide().flat_map(u16::to_le_bytes).collect()
-}
-
-#[cfg(all(not(unix), not(windows)))]
-fn raw_name(name: &OsStr) -> Bytes {
-    Bytes::copy_from_slice(name.to_string_lossy().as_bytes())
 }
 
 /// Builds the descriptor from the same facts [`super::observation`] reports, so a listed entry
@@ -700,18 +541,6 @@ const fn is_symlink_refusal(_error: &io::Error) -> bool {
     false
 }
 
-/// Like [`io_failure`], for a per-child failure that must stay beside its siblings.
-fn entry_io_failure(
-    path: &StoragePath,
-    operation: Operation,
-    error: &io::Error,
-) -> Result<EntryOperationFailure, StorageRoleFailure> {
-    match io_failure(path, operation, error) {
-        StorageRoleFailure::Entry(failure) => Ok(failure),
-        session @ StorageRoleFailure::Session(_) => Err(session),
-    }
-}
-
 /// `classify_io`, plus the kinds only namespace verbs meet.
 fn classify(kind: io::ErrorKind) -> (FailureClass, Transience) {
     match kind {
@@ -753,5 +582,8 @@ fn entry_failure_value(
 }
 
 mod hooks;
+mod listing;
+#[cfg(test)]
+mod streaming_tests;
 #[cfg(test)]
 mod tests;
