@@ -883,7 +883,8 @@ VERIFY
 - node1 + m1-source 53M 树（c=64，--quiet）：C0 前重测基线（含 MALLOC_ARENA_MAX=2、驻留探针、strace -c futex）、C0 后、
   Blocks 流式后、Unordered 后；与 legacy 交替四轮；条目数必须 53,368,420
 - FAS2750：e2e-cifs；cifs_namespace_contract；深链 + 宽树 c=1/4/32；停车句柄 30 分钟；CIFS 与 NFS 的 Blocks 下钻顺序逐行一致
-- **NFS 真机（用户 2026-09-26 定）**：ONTAP FAS2750 NFSv4.1（`e2e-nfs/.env`）+ **DXN-2（10.128.136.211）`/nfv3_v4` 下的 `data-mover-test/`，NFSv3 与 NFSv4.0 各一遍**
+- **NFS 真机（用户 2026-09-26 定）**：ONTAP FAS2750（lizy `/ontap_lisaauto_nfs`）**NFSv3、NFSv4.0、NFSv4.1 三种**（v4.x 从 WSL；v3 因 mount_rootonly + WSL NAT
+  只能在 10.131.9.10 上以 root、特权端口跑，二进制从 WSL 拷过去；不改 lizy 设置；注意 v3 遍历 5400 条、v4.x 5399 条，C7 查清）+ **DXN-2（10.128.136.211）`/nfv3_v4` 下的 `data-mover-test/`，NFSv3 与 NFSv4.0 各一遍**
   （`e2e-nfs/dxn-v3/.env`、`dxn-v40/.env`，只写该子目录）；m1 NFSv3 用于大树 / node1 性能。每个动 NFS 的步骤（C7、C10、C11、收尾清理）都要过
 - **S3 真机（用户 2026-09-26 定：本次重构的 S3 实际测试环境）**，每个动 S3 的步骤（C6、F4、C10、C11、C11b、收尾清理）都要在下列每一套上过；
   **ONTAP、RustFS、DXN 都要在多版本桶与非多版本桶上各验证一遍**（ONTAP：data-mover-test-ver / data-mover-test，另加 NAS 桶；RustFS、DXN：data-mover-test + 临时版本桶）：
