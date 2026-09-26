@@ -883,7 +883,7 @@ VERIFY
 - node1 + m1-source 53M 树（c=64，--quiet）：C0 前重测基线（含 MALLOC_ARENA_MAX=2、驻留探针、strace -c futex）、C0 后、
   Blocks 流式后、Unordered 后；与 legacy 交替四轮；条目数必须 53,368,420
 - FAS2750：e2e-cifs；cifs_namespace_contract；深链 + 宽树 c=1/4/32；停车句柄 30 分钟；CIFS 与 NFS 的 Blocks 下钻顺序逐行一致
-- **S3 真机三套（用户 2026-09-26 定：本次重构的 S3 实际测试环境）**，每个动 S3 的步骤（C6、F4、C10、C11、C11b、收尾清理）都要三套都过：
+- **S3 真机（用户 2026-09-26 定：本次重构的 S3 实际测试环境）**，每个动 S3 的步骤（C6、F4、C10、C11、C11b、收尾清理）都要三套都过：
   - MinIO（10.131.9.11:9000，`.claude/skills/e2e-s3/.env`，桶 data-mover-test + 临时版本桶）：100 万对象平铺前缀的首项延迟与 RSS；版本化桶（traversal_versions.sh）
   - ONTAP S3（FAS2750 ONTAP 9.19.1，SVM lizy，http://10.128.61.200:80，`ontap/.env`）：对象桶 data-mover-test / data-mover-test-ver，
     卷开后台重删 + 压缩；我们的用户不建桶 → 脚本用已有桶、跑完清空对象（不删桶）。已知：列举字节序；带 delimiter 的 ListObjectVersions
@@ -891,7 +891,9 @@ VERIFY
   - ONTAP S3 **NAS 桶** data-mover-nas（同一端点、同一用户，FlexVol dm_s3_nas 重删 + 压缩）：平铺列举无序（目录遍历序）、无版本 —— “无序 S3”的真机
   - RustFS 1.0.0（VM 105，管理网 http://10.131.9.14:9001 —— 控制台端口也提供 S3 API，`rustfs/.env`，专用用户只能动 data-mover-* 桶，数据可丢弃）：
     ListObjectVersions 按“先 marker 组后 version 组”输出（现存问题 11，历史标 Inferred）；条件 PUT 支持（412）；ListMultipartUploads 支持前缀
-  - DXN / StorageGRID 仍只在用户单独批准时用（临时桶）
+  - DXN（Ceph RGW Octopus，`dxn/.env`）：用户 2026-09-26 长期批准建临时桶（`BUCKET_PREFIX=data-mover-dxn`、`S3_LOCATION=magnascale:tos_placement`，用完删光，用户上限 5 个桶）；
+    已知差异见 `.claude/docs/storage-s3.md`「DXN」（UploadPartCopy 要 Content-Length: 0、CopyObject 不回版本、3 个网关各自打时间戳）
+  - StorageGRID 仍只在用户单独批准时用
 - 无序 S3：ONTAP NAS 桶（上面）+ 内存 fake 的打乱模式（Q22）
 - HDFS 真机（10.131.9.11 runner）每次需要用户批准（C8 已于 2026-09-26 批准并通过）
 ```
