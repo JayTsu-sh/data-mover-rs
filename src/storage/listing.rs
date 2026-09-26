@@ -5,11 +5,15 @@
 //! directory was listed to its end; an `Err` item ends it early, and nothing follows it.
 //!
 //! **Dropping the stream at any point leaks nothing on the server.** A backend produces its pages
-//! from one producer task per listing ([`ListingStream::from_producer`]) and hands them over a
+//! from one producer per listing ([`ListingStream::from_producer`]) and hands them over a
 //! channel of capacity one, so a full channel stops the producer from reading further (one page
-//! read ahead). When the consumer drops the stream, the producer's next [`PageSink::send`] fails
-//! and the producer leaves through its own clean-up path — a CIFS directory handle is closed
-//! there, never abandoned. The task is never aborted from outside, which is what makes that hold.
+//! read ahead). The producer runs in the consumer's own task until it hands over its first item
+//! with more still to do — most directories are one page, and a listing that small costs no task
+//! and no hand-off between tasks — and from then on as a detached task of its own, which reads
+//! ahead while the consumer works. When the consumer drops the stream, the producer is moved to
+//! a detached task if it was not in one yet, its next [`PageSink::send`] fails, and it leaves
+//! through its own clean-up path — a CIFS directory handle is closed there, never abandoned. A
+//! producer is never dropped or aborted part way, which is what makes that hold.
 //!
 //! **Pages carry names, not paths.** A child's full path is, by contract, the requested path, a
 //! `/`, and the child's name ([`child_path`]). A backend whose own spelling of a child differs
@@ -43,6 +47,7 @@
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -311,12 +316,14 @@ pub struct ListingStream {
 impl ListingStream {
     /// A listing of `path` whose pages `producer` sends through the [`PageSink`] it is given.
     ///
-    /// The producer runs as its own detached task, started when the stream is first polled (a
-    /// stream dropped unpolled never touches the server). It returns once the listing is
-    /// finished, has failed, or [`PageSink::send`] reports the stream dropped; on every one of
-    /// those exits it releases whatever it holds. A producer that stops without returning (a
-    /// panic) ends the stream with an `Internal` entry failure, never with a normal end that
-    /// would read as a complete listing.
+    /// The producer starts when the stream is first polled (a stream dropped unpolled never
+    /// touches the server), inside the consumer's task; once it hands over an item and is not
+    /// finished, or the stream is dropped while it runs, it continues as a detached task of its
+    /// own (see the [module docs](self)). It returns once the listing is finished, has failed, or
+    /// [`PageSink::send`] reports the stream dropped; on every one of those exits it releases
+    /// whatever it holds. A producer that stops without returning (a panic) ends the stream with
+    /// an `Internal` entry failure, never with a normal end that would read as a complete
+    /// listing.
     pub fn from_producer<F, Fut>(path: StoragePath, producer: F) -> Self
     where
         F: FnOnce(PageSink) -> Fut + Send + 'static,
@@ -389,6 +396,9 @@ fn ended_by_failure(
 
 type Start = Box<dyn FnOnce(PageSink) -> BoxFuture<'static, ()> + Send>;
 
+/// A started producer, wrapped so that its clean return marks the listing finished.
+type Producer = BoxFuture<'static, ()>;
+
 enum ProducerState {
     /// Not polled yet: nothing has been started.
     Idle(Option<Start>),
@@ -397,9 +407,14 @@ enum ProducerState {
     /// and as an abandoned producer (a panic) when it is not. An end that needs no channel slot
     /// is visible the moment the last page has been received, not only once the producer is
     /// scheduled again to send one — so a one-page listing's page and end arrive together.
+    ///
+    /// `producer` is the producer while it still runs in the consumer's task; `None` once it has
+    /// returned or moved to a task of its own on `runtime`.
     Running {
         receiver: mpsc::Receiver<Item>,
         finished: Arc<AtomicBool>,
+        producer: Option<Producer>,
+        runtime: Handle,
     },
     Finished,
 }
@@ -420,16 +435,39 @@ impl Produced {
         let finished = Arc::new(AtomicBool::new(false));
         let (done, last) = (Arc::clone(&finished), sender.clone());
         let producer = start(PageSink { sender });
-        // Detached, never aborted: dropping the stream ends the producer through its own close
-        // path. `finished` marks a listing the producer finished rather than abandoned; it is set
+        // `finished` marks a listing the producer finished rather than abandoned; it is set
         // while `last` still keeps the channel open, so the consumer cannot see it closed first.
-        drop(runtime.spawn(async move {
+        // A panic is caught here so that, polled in the consumer's task, it ends the listing as
+        // an abandoned one instead of unwinding through the consumer; `last` is dropped with it.
+        let producer = AssertUnwindSafe(async move {
             producer.await;
             done.store(true, Ordering::SeqCst);
             drop(last);
-        }));
-        self.state = ProducerState::Running { receiver, finished };
+        })
+        .catch_unwind()
+        .map(drop)
+        .boxed();
+        self.state = ProducerState::Running {
+            receiver,
+            finished,
+            producer: Some(producer),
+            runtime,
+        };
         None
+    }
+}
+
+impl Drop for Produced {
+    /// A producer still running in the consumer's task moves to a detached task of its own: it
+    /// finds the stream gone at its next send and leaves through its own clean-up path.
+    fn drop(&mut self) {
+        if let ProducerState::Running {
+            producer, runtime, ..
+        } = &mut self.state
+            && let Some(producer) = producer.take()
+        {
+            drop(runtime.spawn(producer));
+        }
     }
 }
 
@@ -448,11 +486,26 @@ impl Stream for Produced {
                         return Poll::Ready(Some(failure));
                     }
                 }
-                ProducerState::Running { receiver, finished } => {
+                ProducerState::Running {
+                    receiver,
+                    finished,
+                    producer,
+                    runtime,
+                } => {
+                    if let Some(running) = producer.as_mut()
+                        && running.as_mut().poll(context).is_ready()
+                    {
+                        *producer = None;
+                    }
                     let message = match receiver.poll_recv(context) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(message) => message,
                     };
+                    // The listing goes on past this item: let the producer read ahead in a task
+                    // of its own while the consumer works on it.
+                    if let Some(running) = producer.take() {
+                        drop(runtime.spawn(running));
+                    }
                     let item = match message {
                         Some(item) => item,
                         None if finished.load(Ordering::SeqCst) => {
