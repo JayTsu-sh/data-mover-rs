@@ -12,13 +12,9 @@
 - backend 使用 smb-rs domain facade：`Client → Session → Share → File / Directory`。
 - data-mover 不得重新依赖 smb-rs 的 connection、runtime、wire create/query/set 类型或协议 handle。
 - `smb_domain::protocol` 只允许用于 lossless ACL codec 等明确的协议值边界，普通 I/O 不使用。
-- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = 91e6cfb... }`
-  (smb-rs main 顶端 = PR #70 + #71 + #72 + #73。#70/#71 给出 metadata-timestamps、目录 rename、
-  `GuestPolicy`，并删掉约 2400 行从未接线的 lease-slot 缓存 / multichannel 残留 / 未用协议
-  helper (`runtime/port.rs` 的 `Legacy*` 别名改为 `Protocol*`)；#72 把 `QUERY_DIRECTORY` 本来
-  就返回的四个时间戳与只读 / reparse 属性暴露到 `DirectoryEntry`，不发新请求也不换 info
-  class)；#73 让协商始终直接发 SMB2 NEGOTIATE。不得改成浮动 branch。`[patch.crates-io] smb` 与
-  历史 API 提交 `c3ecf00` 已删除。
+- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = 37d9404... }`
+  (smb-rs main 顶端，#87 的 merge commit；smb 0.13.0)。升级历史与每次的真机矩阵见下方
+  "升级 smb-rs 依赖"。不得改成浮动 branch。`[patch.crates-io] smb` 与历史 API 提交 `c3ecf00` 已删除。
 
 ## 连接配置
 
@@ -219,10 +215,12 @@ result
 - **代价 (已知风险)**：NFS / S3 / HDFS 停车只留一个 cookie / token，重连后照常续；CIFS 停车留的是句柄，
   smb-rs 重连后不重开它 —— 一次重连会让当时打开着的至多 8 + 1 个列举 (已交出首页的) 变成 `Interrupted`，
   遍历内不重试，要靠上游对 `Interrupted` 目录重扫。
-- **目录打开的访问权**：smb-rs 的 `open_directory` 对非 share 根请求 `GENERIC_READ | GENERIC_WRITE | DELETE`
-  (share 根只读)。此前句柄只活几毫秒；C9 起一个预取的兄弟目录可以把它开到游标到达为止 (可能很久)，期间它
-  可能挡住别的客户端对这个目录或其祖先的改名 / 删除 (NTFS 语义)。只读账号列不了非根目录也是这个原因 (现存)。
-  要改需 smb-rs 提供只为列举的只读打开。
+- **目录打开的访问权**：自 smb-rs `37d9404` (#87，issue #85) 起 `DirectoryOpenOptions::open_existing()` 在任何
+  深度都只请求 `GENERIC_READ`；删除 / 改名目录要 `.delete(true)` (`protocol.rs` 的 `remove` / `rename_entry`
+  目录分支)，改时间戳要 `.write_attributes(true)` (data-mover 走 `open_metadata`，不用它)。列举停车的句柄因此
+  不再持写 / 删除权，只读账号能列非根目录。此前 (≤ `91e6cfb`) 非根目录一律 `GENERIC_READ | GENERIC_WRITE | DELETE`。
+  **文件仍未改**：`FileOpenOptions::open_existing()` 依旧请求读 + 写 + 删除，只读账号读源文件 (`protocol.rs:156`)
+  会 `ACCESS_DENIED` —— 已报 smb-rs #88。
 
 ### Staged destination 与恢复
 
@@ -330,7 +328,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 | 跨端完整性比对 | 同一对象完全一致；跨目录副本报出 Size + Modified + Content | **已实现** (`integrity::compare`) |
 | file id (2026-09-18，smb-rs #74 → main `10de18c`；连接期 `probe_identity_mode` 判定两路都有 → 会话启用) | `[identity] strength=StableWithinBackend (List) / StableWithinBackend (Stat)`：ONTAP 接受 `FileIdFullDirectoryInformation` 宽 class，**且回答 QFid create context**；`real_share_namespace_verbs_roundtrip` 里 rename 前后 `identity_key` 相等；policy 契约 (64 MiB Checkpointed / AtomicReplace) 在 2-RT describe/open 上通过 | **已实现**。rename 检测不再退回 Path 模式 |
 | NDX 分页遍历 (2026-09-18) | `storage_role_operations --backend cifs --root <scratch> ndx-walk --entries`：`seed --path sub` 后 2 页 DFS，NDX `0(sub) → gap 1 → 2,3,4 → gap -1`，每个条目 (含目录) `identity=StableWithinBackend`，时间戳为真值；`--max-depth 1` 只出根页且 `sub` 作为条目发出；`delete-tree --delete-root` 3 文件 + 1 目录零失败 | **已实现** (`storage::ndx_walk` + `create_directory_all` 建父目录) |
-| 逐页流式列举 (P7 C9 `936e20b`，2026-09-27) | 10.3 万条树 (3000 平铺 + 40 层深链 + 10 × 4500 + 5 万平铺) c=1/4/32 与 ee2e9ad 逐行相同 (含顺序)；5 万平铺首项 400 → 34–46 ms、RSS 65 → 21–25 MB；停车时会话恰 9 个打开句柄 (base 0)；NFSv3 / v4.1 看同一卷，Blocks 输出与 CIFS 逐行相同；打开的目录句柄停 30 分钟 (会话空闲或忙) 后照常读完。SVM `client_session_timeout` = 900 s 只回收**没有打开文件**的空闲会话 (约 15 分钟被 RST)，持有打开文件的会话不回收；smb-rs 在那次 RST 后重连时有后台任务 panic (`runtime/engine.rs:703` "async fn resumed after completion"，上游缺陷，不影响结果；已报 smb-rs #84)。10.131.9.10 网段会断连：会话在 6–10 分钟被断、重连后旧目录句柄 `InvalidState` —— CIFS 真机测 WSL 更稳 | **已实现**；停车句柄上限 8 (Q10)。smb-rs 对非根目录的 `open_existing` 要写 + 删除权限 (`runtime/port.rs:449`)：停车句柄长时间持有、只读账号列不了根以下 → 已报 smb-rs #85 |
+| 逐页流式列举 (P7 C9 `936e20b`，2026-09-27) | 10.3 万条树 (3000 平铺 + 40 层深链 + 10 × 4500 + 5 万平铺) c=1/4/32 与 ee2e9ad 逐行相同 (含顺序)；5 万平铺首项 400 → 34–46 ms、RSS 65 → 21–25 MB；停车时会话恰 9 个打开句柄 (base 0)；NFSv3 / v4.1 看同一卷，Blocks 输出与 CIFS 逐行相同；打开的目录句柄停 30 分钟 (会话空闲或忙) 后照常读完。SVM `client_session_timeout` = 900 s 只回收**没有打开文件**的空闲会话 (约 15 分钟被 RST)，持有打开文件的会话不回收；smb-rs 在那次 RST 后重连时有后台任务 panic (`runtime/engine.rs:703` "async fn resumed after completion"，不影响结果；smb-rs #84，`37d9404` 起已修 (#86)：读出错后不再二次 poll，generation 以真实传输错误退出)。10.131.9.10 网段会断连：会话在 6–10 分钟被断、重连后旧目录句柄 `InvalidState` —— CIFS 真机测 WSL 更稳 | **已实现**；停车句柄上限 8 (Q10)。smb-rs #85 (非根目录 `open_existing` 要写 + 删除权限) 在 `37d9404` 起已修 (#87)：列举句柄只读 |
 
 复现：`.claude/skills/e2e-cifs` (`CIFS_REAL_*`)。新能力的真机链路用
 `examples/storage_role_operations` 的 `seed → traverse → compare → delete-tree`。

@@ -186,7 +186,10 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
         if kind == EntryKind::Directory {
             let directory = self
                 .share
-                .open_directory(&path, smb_domain::DirectoryOpenOptions::open_existing())
+                .open_directory(
+                    &path,
+                    smb_domain::DirectoryOpenOptions::open_existing().delete(true),
+                )
                 .await?;
             let deleted = directory.delete().await;
             let close = close_directory(directory).await;
@@ -211,7 +214,10 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
         if kind == EntryKind::Directory {
             let directory = self
                 .share
-                .open_directory(&from, smb_domain::DirectoryOpenOptions::open_existing())
+                .open_directory(
+                    &from,
+                    smb_domain::DirectoryOpenOptions::open_existing().delete(true),
+                )
                 .await?;
             let renamed = directory.rename_replace(&to).await;
             let close = close_directory(directory).await;
