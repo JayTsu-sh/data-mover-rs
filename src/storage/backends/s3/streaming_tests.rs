@@ -22,6 +22,7 @@ use futures::StreamExt as _;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
+use super::memory_listing::Generated;
 use super::*;
 use crate::model::{EntryKind, FailureClass, Transience};
 use crate::storage::backends::s3::namespace::S3Namespace;
@@ -496,11 +497,11 @@ async fn a_looping_continuation_after_handed_over_pages_fails_only_the_directory
     Ok(())
 }
 
-/// The entry limit counts what the listing keeps: an unordered store names a subdirectory's
-/// prefix once per key under it, and a directory with one such subdirectory of many keys is not
-/// "too large". Past the limit in kept entries, it still fails (`Capacity`).
+/// The entry limit counts the subdirectory names the listing holds: an unordered store names a
+/// subdirectory's prefix once per key under it, and a directory with one such subdirectory of many
+/// keys is not "too large". Past the limit in held names, it still fails (`Capacity`).
 #[tokio::test]
-async fn the_entry_limit_counts_kept_entries_not_repeated_prefixes() -> TestResult {
+async fn the_entry_limit_counts_held_names_not_repeated_prefixes() -> TestResult {
     let protocol = bucket((0..12).map(|key| format!("d/s/k{key:02}"))).await?;
     {
         let mut knobs = protocol.listing();
@@ -516,6 +517,122 @@ async fn the_entry_limit_counts_kept_entries_not_repeated_prefixes() -> TestResu
         let result = timeout(PATIENCE, collect_listing(stream, CollectLimits::UNBOUNDED)).await?;
         match result {
             Ok(page) if fits => assert_eq!(names(&page), ["s"]),
+            Err(StorageRoleFailure::Entry(failure)) if !fits => {
+                assert_eq!(failure.class(), FailureClass::Capacity);
+            }
+            other => panic!("max {max_entries}: {other:?}"),
+        }
+    }
+    Ok(())
+}
+
+/// A flat prefix of more objects than the entry limit streams whole (P7 §12.4: ten million files
+/// in one prefix; user decision 2026-09-26): the objects are handed over page by page and never
+/// held, so only memory-bound state counts. 5 000 001 generated objects under the production
+/// limits: what this adds to the fast test below is that the production constant itself does not
+/// cut a flat prefix (about 12 s in a debug build).
+#[tokio::test]
+async fn a_flat_prefix_of_more_objects_than_the_entry_limit_streams_whole() -> TestResult {
+    const PAGE: usize = 10_000;
+    let objects = ListingLimits::PRODUCTION.max_entries + 1;
+    let protocol = Arc::new(MemoryS3::default());
+    {
+        let mut knobs = protocol.listing();
+        knobs.generated = Some(Generated {
+            prefixes: 0,
+            objects,
+        });
+        knobs.page_size = PAGE;
+    }
+    let namespace = S3Namespace::new(protocol.clone(), identity());
+    let hint = NonZeroUsize::new(PAGE).ok_or("the page hint is not zero")?;
+    let request = ListRequest::new(path("d"), CancellationToken::new()).with_page_hint(hint);
+    let mut stream = namespace.list(request);
+    let (mut listed, mut last) = (0_usize, String::new());
+    while let Some(page) = timeout(PATIENCE, stream.next()).await? {
+        let page = page.map_err(|failure| format!("{failure:?}"))?;
+        assert!(page.failures.is_empty(), "{:?}", page.failures);
+        listed += page.children.len();
+        if let Some(child) = page.children.last() {
+            last = child.name().to_string();
+        }
+    }
+    assert_eq!(listed, objects);
+    assert_eq!(last, format!("f{:08}", objects - 1));
+    assert_eq!(protocol.listing().calls.len(), objects.div_ceil(PAGE));
+    Ok(())
+}
+
+/// What a streaming listing holds is still bounded: its subdirectory names past the entry limit
+/// fail the directory (`Capacity`) after the pages already handed over, however few objects it
+/// lists — and objects past the limit alongside names within it do not.
+#[tokio::test]
+async fn the_subdirectory_names_a_listing_holds_are_bounded() -> TestResult {
+    let limited = |protocol: &Arc<MemoryS3>| {
+        S3Namespace::new(protocol.clone(), identity()).with_limits(ListingLimits {
+            max_entries: 10,
+            ..ListingLimits::PRODUCTION
+        })
+    };
+    for (prefixes, fits) in [(10, true), (11, false)] {
+        let protocol = Arc::new(MemoryS3::default());
+        {
+            let mut knobs = protocol.listing();
+            knobs.generated = Some(Generated {
+                prefixes,
+                objects: 100,
+            });
+            knobs.page_size = 5;
+        }
+        let namespace = limited(&protocol);
+        let mut stream = listing(&namespace, "d", CancellationToken::new())?;
+        let (mut listed, mut failure) = (0, None);
+        while let Some(page) = timeout(PATIENCE, stream.next()).await? {
+            match page {
+                Ok(page) => listed += page.children.len(),
+                Err(error) => failure = Some(error),
+            }
+        }
+        match failure {
+            None if fits => assert_eq!(listed, prefixes + 100),
+            Some(StorageRoleFailure::Entry(failure)) if !fits => {
+                assert_eq!(failure.class(), FailureClass::Capacity);
+                assert_eq!(failure.path(), &path("d"));
+                // The pages before the one that held the eleventh name were handed over.
+                assert_eq!(listed, 10);
+            }
+            other => panic!("{prefixes} subdirectories: {other:?} after {listed}"),
+        }
+    }
+    Ok(())
+}
+
+/// Keys reported undecodable are held too (each is reported once): past the limit they fail the
+/// directory like subdirectory names do.
+#[tokio::test]
+async fn reported_keys_count_towards_the_entry_limit() -> TestResult {
+    let rejected = |key: &str| S3RejectedEntry {
+        key: Some(key.to_string()),
+        raw_key: key.to_string(),
+        reason: "the S3 listing gave an object a missing or negative size",
+    };
+    for (max_entries, fits) in [(2, true), (1, false)] {
+        let protocol = bucket(["d/ok".to_owned()]).await?;
+        protocol.listing().rejected = vec![
+            ("d/".to_owned(), rejected("d/bad1")),
+            ("d/".to_owned(), rejected("d/bad2")),
+        ];
+        let namespace = S3Namespace::new(protocol.clone(), identity()).with_limits(ListingLimits {
+            max_entries,
+            ..ListingLimits::PRODUCTION
+        });
+        let stream = listing(&namespace, "d", CancellationToken::new())?;
+        let result = timeout(PATIENCE, collect_listing(stream, CollectLimits::UNBOUNDED)).await?;
+        match result {
+            Ok(page) if fits => {
+                assert_eq!(names(&page), ["ok"]);
+                assert_eq!(page.failures.len(), 2);
+            }
             Err(StorageRoleFailure::Entry(failure)) if !fits => {
                 assert_eq!(failure.class(), FailureClass::Capacity);
             }

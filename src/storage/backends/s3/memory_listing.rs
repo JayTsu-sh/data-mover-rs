@@ -17,6 +17,8 @@
 //!   reversed, twice, and again on the next page; [`ListingKnobs::repeat_last_object`] starts each
 //!   page with the previous page's last object; [`ListingKnobs::leading_empty_pages`] starts each
 //!   listing with empty pages that claim more follow.
+//! - [`ListingKnobs::generated`] lists a directory of millions of children without storing them:
+//!   each page is made from its position when it is asked for.
 
 use std::future::pending;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
@@ -104,6 +106,54 @@ pub(crate) struct ListingKnobs {
     pub(crate) stray: Vec<(String, S3ListedObject)>,
     /// The prefix of every listing page requested.
     pub(crate) calls: Vec<String>,
+    /// Every `ListObjectsV2` lists this generated directory instead of the stored objects. Page
+    /// size, delays, hangs and injected failures still apply; the order and repetition knobs
+    /// (`unordered`, `stray`, `rejected`, `leading_empty_pages`, `endless_empty`…) do not.
+    pub(crate) generated: Option<Generated>,
+}
+
+/// A directory of `prefixes` subdirectories (`s00000000/` …) then `objects` one-byte objects
+/// (`f00000000` …) under whatever prefix is listed, in key order, made page by page from the
+/// position its continuation (`gen:<position>`) names — nothing is stored, so a test can list
+/// millions of children in O(page) memory.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Generated {
+    pub(crate) prefixes: usize,
+    pub(crate) objects: usize,
+}
+
+impl Generated {
+    /// The MD5 of the one byte `x` every generated object holds.
+    const ETAG: &'static str = "\"9dd4e461268c8034f5c8564e155c67a6\"";
+
+    fn page(self, prefix: &str, token: Option<&str>, size: usize) -> S3Result<S3ObjectPage> {
+        let start = match token {
+            None => 0,
+            Some(token) => token
+                .strip_prefix("gen:")
+                .and_then(|position| position.parse::<usize>().ok())
+                .ok_or_else(|| S3ProtocolFailure::protocol("not a generated continuation"))?,
+        };
+        let total = self.prefixes.saturating_add(self.objects);
+        let end = start.saturating_add(size).min(total);
+        let mut page = S3ObjectPage {
+            next: (end < total).then(|| format!("gen:{end}")),
+            ..S3ObjectPage::default()
+        };
+        for position in start..end {
+            if position < self.prefixes {
+                page.prefixes.push(format!("{prefix}s{position:08}/"));
+            } else {
+                page.objects.push(S3ListedObject {
+                    key: format!("{prefix}f{:08}", position - self.prefixes),
+                    size: 1,
+                    etag: Self::ETAG.to_string(),
+                    last_modified: None,
+                });
+            }
+        }
+        Ok(page)
+    }
 }
 
 /// One element of a listing, in S3 order.
@@ -324,6 +374,9 @@ impl MemoryS3 {
             (knobs.unordered, knobs.leading_empty_pages)
         };
         let size = self.listing_call(prefix).await?;
+        if let Some(generated) = self.listing().generated {
+            return generated.page(prefix, token, size);
+        }
         let lead = lead_in(token, leading);
         if let Some(next) = self.endless_page().or_else(|| lead.clone().err()) {
             return Ok(S3ObjectPage {

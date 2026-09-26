@@ -18,11 +18,12 @@
 //! **Paging.** The continuation token is opaque and passed back as it came. A throttled or
 //! transiently failed page is requested again with the same token ([`PageRetry`]): the request is
 //! stateless, so a listing resumes where it was rather than restart or end (§5.2, §8). The bounds
-//! of [`Paging`] still hold: a token that comes back, a run of empty pages or too many entries
-//! (counted as kept: a repeated prefix does not count again) fail this directory's listing —
-//! after the pages already handed over, which a traversal then reports `Interrupted`. The page
-//! that trips a bound is not handed over (a page naming a token seen before is usually a page
-//! served before).
+//! of [`Paging`] still hold: a token that comes back, a run of empty pages, or more held entries
+//! than the limit — the subdirectory names and reported keys below, never the objects handed
+//! over, so a flat prefix of any size streams (§12.4) — fail this directory's listing, after the
+//! pages already handed over, which a traversal then reports `Interrupted`. The page that trips a
+//! bound is not handed over (a page naming a token seen before is usually a page served
+//! before).
 //!
 //! A hidden `.data-mover-*` object, or a key outside the directory, that a store repeats on pages
 //! further apart is counted, or reported, again: only prefixes are remembered for the whole
@@ -101,7 +102,9 @@ struct CurrentListing<'a, P: ?Sized> {
     seen: Seen,
 }
 
-/// What the listing remembers across pages so that it hands each child over once.
+/// What the listing remembers across pages so that it hands each child over once: with the
+/// continuations [`Paging`] follows, the only state that grows with the directory (bounded by
+/// [`ListingLimits::max_entries`] and [`ListingLimits::max_continuations`]).
 #[derive(Default)]
 struct Seen {
     /// Names (below the directory's prefix, with the trailing `/`) of the common prefixes handed
@@ -113,6 +116,14 @@ struct Seen {
     rejected: HashSet<String>,
     /// Whether a directory marker with content was reported.
     own_marker: bool,
+}
+
+impl Seen {
+    /// Entries held across pages: subdirectory names and reported keys. The previous page's keys
+    /// are one page, whatever the size of the directory.
+    fn held(&self) -> usize {
+        self.prefixes.len().saturating_add(self.rejected.len())
+    }
 }
 
 impl<'a, P: S3Protocol + ?Sized> CurrentListing<'a, P> {
@@ -157,14 +168,10 @@ impl<'a, P: S3Protocol + ?Sized> CurrentListing<'a, P> {
         self.listed_any |= listed > 0;
         let next = page.next.take();
         let described = self.describe(page);
-        let kept = described.children.len() + described.failures.len();
-        let hidden = usize::try_from(described.internal_hidden).unwrap_or(usize::MAX);
-        self.token = self.paging.advance_keeping(
-            self.directory,
-            listed,
-            kept.saturating_add(hidden),
-            next,
-        )?;
+        let held = self.seen.held();
+        self.token = self
+            .paging
+            .advance_holding(self.directory, listed, held, next)?;
         if self.token.is_none() {
             self.finished = true;
             refuse_absent(self.directory, !self.listed_any)?;

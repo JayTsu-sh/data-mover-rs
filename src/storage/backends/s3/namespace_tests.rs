@@ -623,17 +623,19 @@ fn limited(protocol: &Arc<MemoryS3>, max_entries: usize) -> S3Namespace<MemoryS3
     })
 }
 
-/// A directory that lists more entries than one listing may hold fails (`Capacity`) instead of
-/// being cut short; one at the limit lists whole.
+/// A directory whose listing would hold more entries than one listing may fails (`Capacity`)
+/// instead of being cut short; one at the limit lists whole. Every version is held (All counts
+/// objects, versions and prefixes); current objects stream, and only the subdirectory names count
+/// (P7 §12.4): `a`, `b` and `c/` hold one name.
 #[tokio::test]
 async fn a_directory_past_the_entry_limit_fails_whole() -> TestResult {
     let protocol = bucket(&[("a", b"1"), ("b", b"1"), ("c/d", b"1")]).await?;
     protocol.listing().page_size = 1;
-    for all in [false, true] {
-        let at_limit = limited(&protocol, 3);
+    for (all, held) in [(false, 1), (true, 3)] {
+        let at_limit = limited(&protocol, held);
         let listing = list_whole(&at_limit, &StoragePath::root(), all).await;
         assert_eq!(listing?.0.len(), 3);
-        let over = limited(&protocol, 2);
+        let over = limited(&protocol, held - 1);
         let listing = list_whole(&over, &StoragePath::root(), all).await;
         assert!(
             matches!(listing, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::Capacity),
