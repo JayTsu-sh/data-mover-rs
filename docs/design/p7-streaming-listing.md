@@ -900,12 +900,12 @@ P1–P5  S3 URL 参数化（§14.2）—— F5 合入后，可与 C7 并行
        P4 `db7fbb9`、P5 `4718183`（调用方与文档）；真机见 §14.2 实施记录
 N0     NAS 桶实测（curl，§14.2）—— 已完成：`2893508`
 N1–N7  `compat=ontap&bucket_type=nas` 的 NAS 桶 profile（§14.2）—— H1、C7 之后
-       —— 已完成：N1 `a674ee0`、N2 `5779039`、N3 `cadbaf5`、N4 `8b279dc`、N5 `e712910`、N6 `566e72b`、N7 `1f1c739`；
+       —— 已完成：N1 `927cc03`、N2 `9a9447d`、N3 `4c8750c`、N4 `9d97837`、N5 `3129902`、N6 `d51af50`、N7 `ce49448`；
        真机见 §14.2 实施记录
 F5h fix(s3): 目录对象的单 PUT 改为流式（Content-Length = 源大小、UNSIGNED-PAYLOAD、边传边算 MD5 与回复 ETag 核对），不再整对象缓冲
     在内存里（F5g 现状：流式来源的 `d/` 整个读进内存再 PUT，最坏每个在途传输 5 GiB）。复用 N 阶段的流式单 PUT 原语：该原语先做成
     通用 S3 能力（不绑 NAS profile），F5h 与 NAS profile 共用；五套 S3 真机逐一确认接受 UNSIGNED-PAYLOAD 的流式单 PUT
-    —— 已完成 `f87512b`（五套 S3 版本 / 非版本桶 `directory_objects.sh` 全过，见 §14.2 实施记录）
+    —— 已完成 `7260974`（五套 S3 版本 / 非版本桶 `directory_objects.sh` 全过，见 §14.2 实施记录）
 C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:4610-4691   —— 已完成：cdcc66d（搬移）、7da78ce
     + 子目录句柄作为下钻提示随工作项下传，列举不再写 GLOBAL_CACHE，无提示 / 失效回退 lookup_fh（§12.7 修法 A）
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
@@ -1109,8 +1109,8 @@ N1–N7 在 H1、C7 之后。完整方案（file:line）见会话 scratchpad `s3
 - 其余：Range（含 `-100`、多段 → multipart/byteranges）与 416 正常；列举的 LastModified 截到秒（`.000Z`）；256 字节以上的 UTF-8 名字在 NFS 上
   被改名（`:S400001`），两个 key 指向同一对象；`dm_s3_nas` 每小时 :05 打快照，大对象测试须在下个快照前删除。测量脚本不含凭据，见 N0 报告。
 
-**N1–N7、F5h 实施记录（2026-09-27）**（提交：N1 `a674ee0`、N2 `5779039`、N3 `cadbaf5`、N4 `8b279dc`、N5 `e712910`、
-N6 `566e72b`、N7 `1f1c739`、F5h `f87512b`；细节见 `.claude/docs/storage-s3.md` URL 段的 N1–N6 与「ONTAP S3 NAS 桶实测行为」）：
+**N1–N7、F5h 实施记录（2026-09-27）**（提交：N1 `927cc03`、N2 `9a9447d`、N3 `4c8750c`、N4 `9d97837`、N5 `3129902`、
+N6 `d51af50`、N7 `ce49448`、F5h `7260974`；细节见 `.claude/docs/storage-s3.md` URL 段的 N1–N6 与「ONTAP S3 NAS 桶实测行为」）：
 - 能力开关 `S3BucketCapabilities`（`storage/backends/s3/capabilities.rs`）：conditional_reads / multipart / resumable / max_object_bytes /
   file_backed_keys / md5_etags / versions / directory_objects / native_same_bucket_only，OBJECT 与 NAS 两行；`S3Protocol::bucket_capabilities()`
   由 `bucket_type` 决定（`compat` 只改请求）。
