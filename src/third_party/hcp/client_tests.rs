@@ -7,8 +7,15 @@ use reqwest::Client;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use super::{HCPRestClient, HcpTransport};
+use std::time::Duration;
+
+use super::{HCPRestClient, HcpTimeouts, HcpTransport};
 use crate::AssertTestValue;
+
+const TIMEOUTS: HcpTimeouts = HcpTimeouts {
+    connect: Duration::from_secs(5),
+    request: Duration::from_secs(5),
+};
 
 pub(crate) const ANNOTATION: &str = "<metaData><processInfo><bpdName>flow</bpdName>\
     <btNo>42</btNo></processInfo><data><uploader>alice</uploader></data></metaData>";
@@ -61,6 +68,7 @@ pub(crate) fn client(address: SocketAddr) -> HCPRestClient {
         ("AKHCP", "hcp/Secret+"),
         Client::builder()
             .no_proxy()
+            .timeout(TIMEOUTS.request)
             .resolve("ns.tenant.test", address),
     )
     .assert_value("HCP client")
@@ -74,13 +82,21 @@ fn the_rest_url_follows_the_s3_url() {
         HcpTransport::Https {
             verify_certificates: true,
         },
+        TIMEOUTS,
         "a",
         "s",
     )
     .assert_value("https client");
     assert_eq!(https.base_url(), "https://ns.tenant.hcp.example:8443");
-    let http = HCPRestClient::try_new("ns", "tenant.hcp.example", HcpTransport::Http, "a", "s")
-        .assert_value("http client");
+    let http = HCPRestClient::try_new(
+        "ns",
+        "tenant.hcp.example",
+        HcpTransport::Http,
+        TIMEOUTS,
+        "a",
+        "s",
+    )
+    .assert_value("http client");
     assert_eq!(http.base_url(), "http://ns.tenant.hcp.example");
 }
 

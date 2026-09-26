@@ -98,6 +98,12 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | 按 versionId 删除一个不存在的版本 | 成功（S3 / MinIO 回 204），不是错误 |
 | 按 versionId 的 DeleteObject 回 405（存储不支持按版本删） | 条目 `Unsupported` / Permanent —— **不是**带版本读的「删除标记」`NotFound`（清理会把它当成已删）；删指针时降级为普通删除 + 告警 |
 | describe 之后对象被替换（`read` / native bind / `observe_bound`） | 条目 `Conflict` / Permanent |
+| `compat=hcp` 读标签走 HCP REST `BPM` 注解（`role_protocol/hcp_tags.rs`，P7 P4）：404 / 204 / 空回复 | 无标签（不分“没有注解”与“没有对象 / 版本”） |
+| 同上：其他状态（HCP 不给错误码，只按状态分类；带 `version=` 的 400 除外） | 通用映射（403 → 条目 `PermissionDenied`，429 / 503 → 会话 `Throttled`，5xx → 会话 `Connectivity` …） |
+| 同上：带 `version=` 的 400（HCP 不认按版本读注解，未在真机验证） | 条目 `Unsupported` / Permanent |
+| 同上：连接失败 / 超时（S3 连接的超时同样用于 REST） | 会话 `Connectivity` / Transient |
+| 同上：注解不是预期的 XML、超过 1 MiB | 条目 `Protocol` / Permanent（legacy 记日志当无标签） |
+| 同上：key 含 `.` / `..` 段（HTTP 路径表达不了，会读到别的对象） | 条目 `InvalidInput` / Permanent，不发请求 |
 | 请求 `Id(v)` 而 HEAD 回来的不是版本 v（存储忽略 `?versionId=`） | 条目 `Unsupported` / Permanent |
 | 一个目录的列举翻页：续页 token / marker 绕回来过、连续空页超限（`paging.rs`，C22）；版本列举的截断页停在某 key 中间却没给 `NextVersionIdMarker`、且读不到文档序无法确定续点（F4，`version_order::UnknownResumePoint`） | **该目录**的条目 `Protocol` / Permanent（报在目录上，块 `Failed`，遍历继续兄弟；不结束会话 —— 之前 token 绕圈是会话失败，P7 评审现存问题 3） |
 | 一个列举驻留的条目超过 500 万（`paging.rs`；整个读完的列举按列到的条数，流式 Current 只数前缀名集合与报过的 key、续页 token 另限 500 万，交出的对象不计） | 该目录的条目 `Capacity` / Permanent（同上） |

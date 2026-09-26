@@ -37,7 +37,7 @@ use crate::qos::QosManager;
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::backends::s3::KeyHistory;
 use crate::storage_enum::{StorageEnum, path_to_s3_key};
-use crate::third_party::hcp::client::{HCPRestClient, HcpTransport};
+use crate::third_party::hcp::client::{HCPRestClient, HcpTimeouts, HcpTransport};
 use crate::transfer_concurrency::{
     TransferBackend, TransferConcurrency, resolve_transfer_concurrency,
 };
@@ -752,10 +752,20 @@ impl S3Storage {
             } else {
                 HcpTransport::Http
             };
+            let timeouts = s3_timeout_config();
+            let timeouts = HcpTimeouts {
+                connect: timeouts
+                    .connect_timeout()
+                    .unwrap_or(Duration::from_secs(DEFAULT_S3_CONNECT_TIMEOUT_SECS)),
+                request: timeouts
+                    .operation_timeout()
+                    .unwrap_or(Duration::from_secs(DEFAULT_S3_OPERATION_TIMEOUT_SECS)),
+            };
             Some(HCPRestClient::try_new(
                 &bucket_name,
                 &authority,
                 transport,
+                timeouts,
                 &access_key,
                 &secret_key,
             )?)

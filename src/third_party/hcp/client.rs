@@ -1,11 +1,21 @@
+use std::str;
 use std::sync::Arc;
+use std::time::Duration;
 
 use quick_xml::de::from_str;
 use reqwest::cookie::Jar;
-use reqwest::{Client, ClientBuilder};
+use reqwest::{Client, ClientBuilder, Url};
+
+use tracing::debug;
 
 use crate::Tag;
 use crate::error::{Result, StorageError};
+
+/// The outcome of one annotation read.
+type AnnotationResult = std::result::Result<Option<Vec<Tag>>, HcpAnnotationError>;
+
+/// The largest annotation body read (an annotation is a small XML document).
+const MAX_ANNOTATION_BYTES: usize = 1024 * 1024;
 
 /// How the HCP REST client reaches its namespace: as the namespace's S3 URL does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,6 +26,15 @@ pub enum HcpTransport {
     Https { verify_certificates: bool },
 }
 
+/// How long the HCP REST client waits: the S3 connection's own timeouts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HcpTimeouts {
+    /// Establishing a connection.
+    pub connect: Duration,
+    /// One whole request, reply body included.
+    pub request: Duration,
+}
+
 /// The HCP REST interface of one namespace, reached like the namespace's S3 URL: the same scheme,
 /// host and port (`{scheme}://{namespace}.{host}[:port]`), and certificates verified unless the
 /// URL says `tls_verify=false`.
@@ -24,6 +43,22 @@ pub struct HCPRestClient {
     client: Client,
     /// `{scheme}://{namespace}.{host}[:port]`.
     base_url: String,
+    /// The same, parsed.
+    base: Url,
+}
+
+/// Why an annotation could not be read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HcpAnnotationError {
+    /// No answer: the request or its body was lost.
+    Transport,
+    /// The namespace answered with this status (not 404, which is no annotation).
+    Status(u16),
+    /// The annotation is not the expected XML, or larger than any annotation.
+    Malformed,
+    /// The key has a `.` or `..` segment, which an HTTP path cannot name: the request would read
+    /// another object's annotation.
+    UnaddressableKey,
 }
 
 impl HCPRestClient {
@@ -37,6 +72,7 @@ impl HCPRestClient {
         bucket_name: &str,
         authority: &str,
         transport: HcpTransport,
+        timeouts: HcpTimeouts,
         access_key: &str,
         secret_access_key: &str,
     ) -> Result<Self> {
@@ -51,7 +87,10 @@ impl HCPRestClient {
             authority,
             transport,
             (access_key, secret_access_key),
-            Client::builder().tls_danger_accept_invalid_certs(accept_invalid_certs),
+            Client::builder()
+                .tls_danger_accept_invalid_certs(accept_invalid_certs)
+                .connect_timeout(timeouts.connect)
+                .timeout(timeouts.request),
         )
     }
 
@@ -67,7 +106,7 @@ impl HCPRestClient {
             HcpTransport::Https { .. } => "https",
         };
         let base_url = format!("{scheme}://{bucket_name}.{authority}");
-        let parsed_url = base_url.parse().map_err(|e| {
+        let parsed_url: Url = base_url.parse().map_err(|e| {
             StorageError::ConfigError(format!("Invalid HCP base URL '{base_url}': {e}"))
         })?;
         let cookie_jar = Jar::default();
@@ -81,13 +120,73 @@ impl HCPRestClient {
             .map_err(|e| {
                 StorageError::OperationError(format!("Failed to create HCP HTTP client: {e}"))
             })?;
-        Ok(HCPRestClient { client, base_url })
+        Ok(HCPRestClient {
+            client,
+            base_url,
+            base: parsed_url,
+        })
     }
 
     /// The `{scheme}://{namespace}.{host}[:port]` every request goes to.
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The tags of the `BPM` annotation of the object at `key` (of one version when `version` is
+    /// given); `None` when the object has no such annotation (404, or an empty reply). A 404 does
+    /// not tell a missing annotation from a missing object or version. The key's segments are
+    /// percent-encoded.
+    pub(crate) async fn annotation_tags(
+        &self,
+        key: &str,
+        version: Option<&str>,
+    ) -> AnnotationResult {
+        if key.split('/').any(|segment| matches!(segment, "." | "..")) {
+            return Err(HcpAnnotationError::UnaddressableKey);
+        }
+        let mut url = self.base.clone();
+        // An http(s) base always has path segments.
+        let Ok(mut segments) = url.path_segments_mut() else {
+            return Err(HcpAnnotationError::UnaddressableKey);
+        };
+        segments.pop_if_empty().push("rest").extend(key.split('/'));
+        drop(segments);
+        url.query_pairs_mut()
+            .append_pair("type", "custom-metadata")
+            .append_pair("annotation", "BPM");
+        if let Some(version) = version {
+            url.query_pairs_mut().append_pair("version", version);
+        }
+        let response = self.client.get(url).send().await.map_err(|error| {
+            // The error names the URL, never the cookie.
+            debug!("HCP REST annotation request failed: {error}");
+            HcpAnnotationError::Transport
+        })?;
+        match response.status().as_u16() {
+            404 | 204 => return Ok(None),
+            200..=299 => {}
+            status => return Err(HcpAnnotationError::Status(status)),
+        }
+        if response.content_length().is_some_and(|length| {
+            usize::try_from(length).map_or(true, |length| length > MAX_ANNOTATION_BYTES)
+        }) {
+            return Err(HcpAnnotationError::Malformed);
+        }
+        let body = response.bytes().await.map_err(|error| {
+            debug!("HCP REST annotation body lost: {error}");
+            HcpAnnotationError::Transport
+        })?;
+        if body.len() > MAX_ANNOTATION_BYTES {
+            return Err(HcpAnnotationError::Malformed);
+        }
+        if body.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        let text = str::from_utf8(&body).map_err(|_| HcpAnnotationError::Malformed)?;
+        MetaData::parse(text)
+            .map(Some)
+            .ok_or(HcpAnnotationError::Malformed)
     }
 
     ///
@@ -168,6 +267,11 @@ pub struct MetaData {
 impl MetaData {
     #[must_use]
     pub fn parse_tags(xml: &str) -> Vec<Tag> {
+        Self::parse(xml).unwrap_or_default()
+    }
+
+    /// The tags of an annotation, `None` when it is not the expected XML.
+    fn parse(xml: &str) -> Option<Vec<Tag>> {
         if let Ok(metadata) = from_str::<MetaData>(xml) {
             let mut tags = Vec::new();
 
@@ -244,13 +348,13 @@ impl MetaData {
                 });
             }
 
-            tags
+            Some(tags)
         } else {
-            Vec::new()
+            None
         }
     }
 }
 
 #[cfg(test)]
 #[path = "client_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -1,4 +1,4 @@
-use super::{CompletedPart, ProvideErrorMetadata, S3Storage, build_copy_source};
+use super::{CompletedPart, ProvideErrorMetadata, S3Compatibility, S3Storage, build_copy_source};
 use bytes::Bytes;
 
 use crate::model::{FailureClass, Transience};
@@ -31,6 +31,7 @@ macro_rules! classify_sdk {
 }
 
 mod delete_marker;
+mod hcp_tags;
 mod listing;
 mod multipart;
 mod native;
@@ -409,6 +410,9 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         key: &str,
         version_id: Option<&str>,
     ) -> crate::storage::backends::s3::S3Result<Vec<crate::model::ObjectTag>> {
+        if self.options.compat == S3Compatibility::Hcp {
+            return self.hcp_tags(key, version_id).await;
+        }
         let response = self
             .client
             .get_object_tagging()
@@ -429,6 +433,8 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .collect()
     }
 
+    /// Under `compat=hcp` tags are still written as S3 object tagging, not as the `BPM` annotation
+    /// `get_tags` reads; unverified on HCP.
     async fn put_tags(
         &self,
         key: &str,
