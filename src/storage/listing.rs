@@ -124,12 +124,13 @@ pub struct ListingPage {
     /// Children the listing returned but could not describe; each concerns that child alone. One
     /// whose class is `NotFound` vanished before it could be described ([`ChildFailure`]).
     pub failures: Vec<ChildFailure>,
-    /// Transfer artifacts (`.data-mover-*`) this page hid. They are not children.
+    /// Entries this page hid. They are not children: transfer artifacts (`.data-mover-*`), and
+    /// ONTAP's snapshot directory where `NFSv3` lists it without attributes (P7 C7b).
     pub internal_hidden: u32,
 }
 
 impl ListingPage {
-    /// A page of `children` and `failures`, with `internal_hidden` artifacts hidden.
+    /// A page of `children` and `failures`, with `internal_hidden` entries hidden.
     #[must_use]
     pub const fn new(
         children: Vec<ListedChild>,

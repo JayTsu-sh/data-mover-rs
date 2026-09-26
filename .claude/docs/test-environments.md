@@ -42,11 +42,12 @@
 - **NFS**：卷 `ontap_lisaauto_nfs`（junction `/ontap_lisaauto_nfs`，unix，export policy default）。v3 / v4.0 / v4.1 都开着。
   - `mount_rootonly` 开着：**WSL 经 NAT 改写源端口，v3 MOUNT 被拒**（`AUTH_TOOWEAK` / “could not parse response due to bad status”）→ v3 在
     10.131.9.10 上以 root、特权端口跑（URL 不带 `noresvport`）。**不要改 SVM 设置**。v4.x 从 WSL 用 `noresvport=true`。
-  - 同一导出 v3 比 v4.x 多一条：卷根的 `.snapshot`（2026-09-26 查清，P7 C7）。ONTAP 的 NFSv3 READDIRPLUS 列出它（未查 / 未改 SVM
-    设置），但不带描述所需的属性 / 句柄，所以 role 遍历把它报成一个 `Protocol` 子项失败（listed 5400 = 5399 + 1 失败，下钻不进去）；
-    NFSv4 的 READDIR 不列它。按名字 LOOKUP 两边都能进（目前列出来是空的）。除它之外 v3 / v4.1 的路径集合逐行相同。
-    legacy `walkdir` 用 GETATTR 补属性，把它当普通目录（3545 个目录）。对这类项补一次 LOOKUP 的修法已写好未提交：
-    补上之后 v3 会进入 `.snapshot`（卷上有快照时就是每个快照的整棵树），要不要进、要不要与 v4 一致地排除，待定。
+  - 卷根的 `.snapshot`（P7 C7 查清，C7b 修）：ONTAP 的 NFSv3 READDIRPLUS 列出它（未查 / 未改 SVM 设置），带句柄、**不带属性**；
+    NFSv4 的 READDIR 不列它。它与卷根 fsid 相同（快照各自的 fsid 才不同），从任何目录 LOOKUP 都是同一对象，名字被保留
+    （MKDIR `.snapshot` 回 `EXIST`），`~snapshot` 在 NFS 上 `NOENT`。C7b 起 role 遍历在 v3 上 LOOKUP 它、确认是目录后隐藏
+    （`hidden=1`，不下钻）：2026-09-26 整个导出 v3 / v4.0 / v4.1 都是 listed 5399、0 失败、路径集合逐行相同（此前 v3 是
+    listed 5400 = 5399 + 1 个 `Protocol` 子项失败）。legacy `walkdir` 不变：用 GETATTR 补属性，把它当普通目录（3545 个目录）。
+    有快照的卷（例如 `/dm_s3_nas`，只读探过）里快照子项 v3 READDIRPLUS 同样不带属性。
 - **S3**（SVM `lizy` 的 object store server `s3lizy.com`，`http://10.128.61.200:80`，path-style），用户 `data-mover-test`（只在 `e2e-s3/ontap/.env`）：
   - `data-mover-test`（无版本，FlexGroup `fg_oss_1790405106`）、`data-mover-test-ver`（开版本，`fg_oss_1790405136`）：两个卷是建桶时 ONTAP 新建的
     （FAS2750_01_SSD_1 × 3 成员，thin 100 GB），后台重删 + 压缩。我们的用户**不能建桶**，脚本要用已有桶、跑完清空。
@@ -89,6 +90,8 @@
 - **我们只写 `/nfv3_v4/data-mover-test/`**（用户 2026-09-26 批准，目录已建）。环境文件把导出写成 `/nfv3_v4:/data-mover-test`，
   URL 根就落在子目录里，`nfs_opt_dir` 之类的写操作不会越界。v3 与 v4.0 都从 WSL 用 `noresvport=true` 可挂。
 - 用法：`set -a; . .claude/skills/e2e-nfs/dxn-v3/.env; set +a; python3 .claude/skills/e2e-nfs/scripts/run.py`（进程环境覆盖 skill 的 `.env`），v4.0 换 `dxn-v40`。
+- 没有 `.snapshot`（v3 / v4.0 LOOKUP 都 `NOENT`）。能建名叫 `.snapshot` 的真目录，READDIRPLUS 给它完整属性与句柄，
+  role 遍历在 v3 / v4.0 上都照常列出并下钻（P7 C7b 真机验过，建在我们子目录下、验完删除）。
 
 ### 2.4 PVE 实验室（10.131.9.x，宿主 10.131.9.20）
 

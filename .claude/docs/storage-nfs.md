@@ -149,7 +149,29 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   READDIRPLUS 没带属性（v3 `post_op_attr` 可省；v4 的 fattr4 解不出时 nfs-rs 也给 None）、没带文件句柄（v3
   `post_op_fh3` FALSE、v4 属性里没有 `FATTR4_FILEHANDLE`）——
   报成该子项自己的 `Protocol` / Unknown 条目失败，兄弟照常，列举 `Partial`（之前整个目录失败；P7 评审现存问题 2）。
-  只有 LOOKUP 目录、READDIRPLUS 流本身出错才让整个列举失败。后续可考虑对缺属性 / 句柄的项补一次 LOOKUP。
+  只有 LOOKUP 目录、READDIRPLUS 流本身出错才让整个列举失败。唯一的例外是下一条的 `.snapshot`。
+- **ONTAP 的 `.snapshot`（P7 C7b，用户 2026-09-26 定，`role_listing.rs` 的 `snapshot_directory`）**：ONTAP 9.19.1 的
+  NFSv3 READDIRPLUS 在卷根列出 `.snapshot`，**带句柄、不带属性**；NFSv4 READDIR 不列它。真机实测：它与卷根 **fsid 相同**
+  （只有其中每个快照的 fsid 不同，v3 `0x<n>80231f3a`），从任何目录 LOOKUP 都是同一个对象（fileid = 卷根 + 3，mode 0777，
+  nlink = 2 + 快照数），名字被保留（任何目录里 MKDIR `.snapshot` 回 `EXIST`）；快照里的子项 v3 READDIRPLUS 也不带属性。
+  规则（**只限 NFSv3**，只看名字恰为 `.snapshot` 且 `post_op_attr` 缺失的项）：
+  - 在被列目录里 LOOKUP `.snapshot` 一次（回复没带属性再对返回的句柄 GETATTR）；
+  - 是目录 → **隐藏**：不列出、不算失败、不下钻；计入页的 `internal_hidden`（与 `.data-mover-*` 同一计数，不在 `listed`
+    里，`listed == emitted + filtered + failed + vanished` 照旧成立），并打一条 `info!`（只含导出内的相对路径）；
+  - 不是目录 → 用查到的属性与句柄（拷贝）当普通子项；
+  - 查失败 → 该子项失败，分类与状态取自 LOOKUP / GETATTR（`NOENT` 即 `NotFound` = 消失）；会话（`Connectivity`）、
+    服务端忙（`Throttled`）、LOOKUP 用的目录句柄失效（`STALE` / `BADHANDLE`）则按 READDIRPLUS 失败结束
+    这次读取（首页前从头重读 / 退避 / 重发，首页后 `Interrupted`）。
+  - 带属性的 `.snapshot`（例如 DXN 上真建的目录）、其他名字（含 CIFS 拼法 `~snapshot`，NFS 上两种版本都 `NOENT`）、
+    缺句柄但有属性的项、NFSv4 一律照旧。
+  - 结果：ONTAP 同一导出 v3 与 v4.x 列出同样的条目、零失败；每次列卷根多一次 LOOKUP（和一条 `info!`）。
+  - **残余风险**：某台服务器对一个**真实的**、名叫 `.snapshot` 的目录也不给属性（NFSv3 允许任何项省略；例如 Linux knfsd
+    对拼不出句柄的挂载点），它会被隐藏、不迁移 —— 只留 `info!` 与 `internal_hidden` 计数。ONTAP 上不会发生（名字保留），
+    DXN 给真目录带属性。
+  - legacy `walkdir` / `walkdir_2` **不变**（P7 收尾删除）：它用 GETATTR 补属性，把 `.snapshot` 当普通目录下钻（有快照时
+    会列出每个快照的整棵树）。
+  - `delete_tree`：卷根列举不再带一个 `.snapshot` 子项失败，所以对**非 backend 根**的 junction 卷根 `delete_root` 会发出
+    RMDIR，由 ONTAP 拒绝（之前因子项失败不发）。RMDIR 不递归，不会删掉什么。
 - role `List` 的描述符带 `inline_timestamps` + `inline_ownership`（P7 C0）：同一份 READDIRPLUS 属性，owner / group
   经同一个 `owner_id` 映射（映射不了 → `Unmapped`，与 GETATTR 路径一样报 `Unsupported`，`Required` 时同样拒绝）。
   v4 READDIR 与 GETATTR 请求同一个 `standard_getattr_bitmap`，v3 READDIRPLUS 带完整 fattr3，所以

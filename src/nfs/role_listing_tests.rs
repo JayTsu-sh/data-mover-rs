@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::io;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Mutex, PoisonError};
 
 use futures::stream;
 use nfs_rs::{Nfs3ErrorCode as V3, Nfs4ErrorCode as V4};
@@ -183,6 +184,7 @@ struct Collected {
     children: Vec<NfsListedChild>,
     held: usize,
     hand_overs: usize,
+    hidden: usize,
     stop_after: Option<usize>,
 }
 
@@ -192,6 +194,10 @@ impl NfsListingPages for Collected {
         self.children.push(child);
         self.held += 1;
         self.held >= 2
+    }
+
+    fn hide(&mut self) {
+        self.hidden += 1;
     }
 
     async fn hand_over(&mut self) -> bool {
@@ -218,7 +224,14 @@ async fn reading_a_directory_caches_no_handle() {
         Ok(entry("other", FType3::NF3DIR, b"fh-other")),
     ]);
     let mut pages = Collected::default();
-    let end = drain_readdirplus(&directory(), entries, &mut pages, false).await;
+    let end = drain_readdirplus(
+        &directory(),
+        entries,
+        &mut pages,
+        NFSVersion::NFSv3,
+        &NoLookup,
+    )
+    .await;
     assert!(matches!(end, Ok(NfsReadEnd::Complete)));
     assert_eq!(pages.children.len(), 3);
     assert_eq!(pages.hand_overs, 1);
@@ -249,7 +262,14 @@ async fn a_stopped_listing_takes_no_further_entry() {
         stop_after: Some(3),
         ..Collected::default()
     };
-    let end = drain_readdirplus(&directory(), Box::pin(entries), &mut pages, false).await;
+    let end = drain_readdirplus(
+        &directory(),
+        Box::pin(entries),
+        &mut pages,
+        NFSVersion::NFSv3,
+        &NoLookup,
+    )
+    .await;
     assert!(matches!(end, Ok(NfsReadEnd::Stopped)));
     assert_eq!(taken.load(Ordering::SeqCst), 3);
 }
@@ -266,7 +286,14 @@ async fn a_failure_mid_directory_ends_the_read_after_the_entries_before_it() {
         Ok(entry("d", FType3::NF3REG, b"fh-d")),
     ]);
     let mut pages = Collected::default();
-    let failure = drain_readdirplus(&directory(), entries, &mut pages, false).await;
+    let failure = drain_readdirplus(
+        &directory(),
+        entries,
+        &mut pages,
+        NFSVersion::NFSv3,
+        &NoLookup,
+    )
+    .await;
     assert!(matches!(
         failure,
         Err(NfsReadFailure {
@@ -275,6 +302,306 @@ async fn a_failure_mid_directory_ends_the_read_after_the_entries_before_it() {
         })
     ));
     assert_eq!(pages.children.len(), 3);
+}
+
+/// A [`ChildLookup`] no test expects to be asked.
+struct NoLookup;
+
+#[async_trait::async_trait]
+impl ChildLookup for NoLookup {
+    async fn lookup(&self, name: &str) -> nfs_rs::Result<nfs_rs::ObjRes> {
+        panic!("unexpected LOOKUP of {name}")
+    }
+
+    async fn getattr(&self, _: Bytes) -> nfs_rs::Result<nfs_rs::Attr> {
+        panic!("unexpected GETATTR")
+    }
+}
+
+type Found = fn() -> nfs_rs::Result<nfs_rs::ObjRes>;
+type Attributes = fn() -> nfs_rs::Result<nfs_rs::Attr>;
+
+/// A [`ChildLookup`] that answers a LOOKUP with `found` and a GETATTR with `attributes`,
+/// recording what it was asked.
+struct Answering {
+    found: Found,
+    attributes: Attributes,
+    asked: Mutex<Vec<String>>,
+}
+
+impl Answering {
+    fn new(found: Found, attributes: Attributes) -> Self {
+        Self {
+            found,
+            attributes,
+            asked: Mutex::default(),
+        }
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ChildLookup for Answering {
+    async fn lookup(&self, name: &str) -> nfs_rs::Result<nfs_rs::ObjRes> {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(format!("LOOKUP {name}"));
+        (self.found)()
+    }
+
+    async fn getattr(&self, handle: Bytes) -> nfs_rs::Result<nfs_rs::Attr> {
+        let handle = String::from_utf8_lossy(&handle).into_owned();
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(format!("GETATTR {handle}"));
+        (self.attributes)()
+    }
+}
+
+/// What `drain_readdirplus` hands over for `entries`, read over `version`: the children, and how
+/// many entries it hid.
+async fn drained(
+    version: NFSVersion,
+    entries: Vec<nfs_rs::ReaddirplusEntry>,
+    lookup: &dyn ChildLookup,
+) -> (Vec<NfsListedChild>, usize) {
+    let mut pages = Collected::default();
+    let entries = stream::iter(entries.into_iter().map(Ok));
+    let end = drain_readdirplus(&directory(), entries, &mut pages, version, lookup).await;
+    assert!(matches!(end, Ok(NfsReadEnd::Complete)));
+    (pages.children, pages.hidden)
+}
+
+/// The paths `children` describe, and those of the ones they could not describe.
+fn outcome(children: &[NfsListedChild]) -> (Vec<&str>, Vec<&str>) {
+    let observed = children.iter().filter_map(|child| child.as_ref().ok());
+    let failed = children.iter().filter_map(|child| child.as_ref().err());
+    (
+        observed.map(|entry| entry.path.as_str()).collect(),
+        failed.map(|child| child.path.as_str()).collect(),
+    )
+}
+
+/// ONTAP's `NFSv3` READDIRPLUS entry for a volume's snapshot directory: a handle, no attributes.
+fn ontap_snapshot() -> nfs_rs::ReaddirplusEntry {
+    nfs_rs::ReaddirplusEntry {
+        attr: None,
+        ..entry(".snapshot", FType3::NF3DIR, b"fh-snap")
+    }
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn found(type_: FType3, attr: bool) -> nfs_rs::Result<nfs_rs::ObjRes> {
+    Ok(nfs_rs::ObjRes {
+        fh: Bytes::from_static(b"fh-looked-up"),
+        attr: attr.then(|| attrs(type_)),
+    })
+}
+
+fn no_getattr() -> nfs_rs::Result<nfs_rs::Attr> {
+    panic!("unexpected GETATTR")
+}
+
+fn siblings_around(snapshot: nfs_rs::ReaddirplusEntry) -> Vec<nfs_rs::ReaddirplusEntry> {
+    vec![
+        entry("a", FType3::NF3REG, b"fh-a"),
+        snapshot,
+        entry("b", FType3::NF3DIR, b"fh-b"),
+    ]
+}
+
+/// An `NFSv3` `.snapshot` listed without attributes that one LOOKUP shows to be a directory —
+/// ONTAP's snapshot directory — is hidden (P7 C7b): not a child, not a failure, counted as
+/// hidden; its siblings are handed over. A LOOKUP reply without attributes is completed with a
+/// GETATTR of the handle it returned.
+#[tokio::test]
+async fn an_nfsv3_snapshot_directory_without_attributes_is_hidden() {
+    let with_attributes = Answering::new(|| found(FType3::NF3DIR, true), no_getattr);
+    let without = Answering::new(
+        || found(FType3::NF3DIR, false),
+        || Ok(attrs(FType3::NF3DIR)),
+    );
+    for (lookup, asked) in [
+        (&with_attributes, vec!["LOOKUP .snapshot"]),
+        (&without, vec!["LOOKUP .snapshot", "GETATTR fh-looked-up"]),
+    ] {
+        let (children, hidden) =
+            drained(NFSVersion::NFSv3, siblings_around(ontap_snapshot()), lookup).await;
+        assert_eq!(outcome(&children), (vec!["dir/a", "dir/b"], vec![]));
+        assert_eq!(hidden, 1);
+        assert_eq!(lookup.asked(), asked);
+    }
+}
+
+/// When looking it up fails for the child's sake, the `.snapshot` is a failure of that child with
+/// the lookup's own class and status — `NOENT` makes it `NotFound` (it vanished), a refused
+/// LOOKUP `PermissionDenied`, a stale handle the LOOKUP returned (the GETATTR's) `Protocol` —
+/// never silently dropped; its siblings are handed over.
+#[tokio::test]
+async fn a_snapshot_that_cannot_be_looked_up_fails_with_the_lookups_class() {
+    let cases = [
+        (
+            Answering::new(|| Err(NfsError::Nfs3(V3::NFS3ERR_NOENT)), no_getattr),
+            FailureClass::NotFound,
+        ),
+        (
+            Answering::new(|| Err(NfsError::Nfs3(V3::NFS3ERR_ACCES)), no_getattr),
+            FailureClass::PermissionDenied,
+        ),
+        (
+            Answering::new(
+                || found(FType3::NF3DIR, false),
+                || Err(NfsError::Nfs3(V3::NFS3ERR_STALE)),
+            ),
+            FailureClass::Protocol,
+        ),
+    ];
+    for (lookup, class) in cases {
+        let (children, hidden) = drained(
+            NFSVersion::NFSv3,
+            siblings_around(ontap_snapshot()),
+            &lookup,
+        )
+        .await;
+        assert_eq!(
+            outcome(&children),
+            (vec!["dir/a", "dir/b"], vec!["dir/.snapshot"])
+        );
+        assert_eq!(hidden, 0);
+        let failure = children[1].as_ref().err().map(|child| &child.failure);
+        assert_eq!(failure.map(|failure| failure.class), Some(class));
+        assert!(failure.is_some_and(|failure| failure.status.is_some()));
+    }
+}
+
+/// A failed look that says more about the read than about the child ends the read the way a
+/// READDIRPLUS failure would, after the siblings before it: a LOOKUP whose handle — the
+/// directory's — went stale is resolved again, a transport failure nfs-rs certifies safe to
+/// resend is resent, a busy server (here answering the GETATTR) is backed off.
+#[tokio::test]
+async fn a_lookup_failure_of_the_session_or_the_directory_ends_the_read() {
+    let cases = [
+        (
+            Answering::new(|| Err(NfsError::Nfs3(V3::NFS3ERR_STALE)), no_getattr),
+            NfsRestart::Relookup,
+            FailureClass::Protocol,
+        ),
+        (
+            Answering::new(
+                || Err(wrapped(nfs_rs::RecoveryAction::Retry, timeout())),
+                no_getattr,
+            ),
+            NfsRestart::Resend,
+            FailureClass::Connectivity,
+        ),
+        (
+            Answering::new(
+                || found(FType3::NF3DIR, false),
+                || Err(NfsError::Nfs3(V3::NFS3ERR_JUKEBOX)),
+            ),
+            NfsRestart::Backoff,
+            FailureClass::Throttled,
+        ),
+    ];
+    for (lookup, restart, class) in cases {
+        let mut pages = Collected::default();
+        let entries = stream::iter(siblings_around(ontap_snapshot()).into_iter().map(Ok));
+        let end = drain_readdirplus(
+            &directory(),
+            entries,
+            &mut pages,
+            NFSVersion::NFSv3,
+            &lookup,
+        )
+        .await;
+        assert!(
+            matches!(&end, Err(failure) if failure.restart == restart && failure.failure.class == class),
+            "{restart:?} {class:?}"
+        );
+        assert_eq!(outcome(&pages.children), (vec!["dir/a"], vec![]));
+        assert_eq!(pages.hidden, 0);
+    }
+}
+
+/// A `.snapshot` the LOOKUP shows is not a directory is an ordinary child, described by what
+/// the lookup returned (its attributes and its handle).
+#[tokio::test]
+async fn a_looked_up_snapshot_that_is_not_a_directory_is_an_ordinary_child() {
+    let lookup = Answering::new(|| found(FType3::NF3REG, true), no_getattr);
+    let (children, hidden) = drained(
+        NFSVersion::NFSv3,
+        siblings_around(ontap_snapshot()),
+        &lookup,
+    )
+    .await;
+    assert_eq!(
+        outcome(&children),
+        (vec!["dir/a", "dir/.snapshot", "dir/b"], vec![])
+    );
+    assert_eq!(hidden, 0);
+    let listed = children[1].as_ref().ok();
+    assert_eq!(listed.map(|child| child.kind), Some(EntryKind::File));
+    assert_eq!(
+        listed.map(|child| child.file_handle.as_ref()),
+        Some(b"fh-looked-up".as_slice())
+    );
+}
+
+/// Nothing else is looked up or hidden: a `.snapshot` READDIRPLUS describes (a real directory,
+/// as DXN lists one) is an ordinary child, one with attributes but no handle fails as before, and
+/// any other name without attributes — ONTAP's CIFS spelling `~snapshot` included — fails alone.
+/// Over `NFSv4` even a `.snapshot` without attributes fails alone.
+#[tokio::test]
+async fn only_an_nfsv3_snapshot_without_attributes_is_looked_up() {
+    let (described, hidden) = drained(
+        NFSVersion::NFSv3,
+        siblings_around(entry(".snapshot", FType3::NF3DIR, b"fh-real")),
+        &NoLookup,
+    )
+    .await;
+    assert_eq!(
+        outcome(&described),
+        (vec!["dir/a", "dir/.snapshot", "dir/b"], vec![])
+    );
+    assert!(matches!(&described[1], Ok(listed) if listed.kind == EntryKind::Directory));
+    assert_eq!(hidden, 0);
+    let undescribed = |name: &str| nfs_rs::ReaddirplusEntry {
+        attr: None,
+        ..entry(name, FType3::NF3DIR, b"fh")
+    };
+    let others = vec![
+        undescribed("other"),
+        undescribed("~snapshot"),
+        undescribed(".snapshot2"),
+        entry(".snapshot", FType3::NF3DIR, b""),
+    ];
+    let (failed, hidden) = drained(NFSVersion::NFSv3, others, &NoLookup).await;
+    assert_eq!(
+        outcome(&failed),
+        (
+            vec![],
+            vec![
+                "dir/other",
+                "dir/~snapshot",
+                "dir/.snapshot2",
+                "dir/.snapshot"
+            ]
+        )
+    );
+    assert_eq!(hidden, 0);
+    for version in [NFSVersion::NFSv4p0, NFSVersion::NFSv4p1] {
+        let (v4, hidden) = drained(version, vec![ontap_snapshot()], &NoLookup).await;
+        assert_eq!(outcome(&v4), (vec![], vec!["dir/.snapshot"]), "{version:?}");
+        assert_eq!(hidden, 0);
+    }
 }
 
 fn timeout() -> NfsError {

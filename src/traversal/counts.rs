@@ -7,10 +7,10 @@
 //! listed == emitted + filtered + failed_children + vanished
 //! ```
 //!
-//! Transfer artifacts (`internal_hidden`) are not children and are not in `listed`. Pruned and
-//! truncated subdirectories are orthogonal: a subdirectory can be emitted and not descended into.
-//! A listing that failed is not a child either; `listed` counts only what it returned before it
-//! failed.
+//! Hidden entries (`internal_hidden`: transfer artifacts, ONTAP's `NFSv3` snapshot directory) are
+//! not children and are not in `listed`. Pruned and truncated subdirectories are orthogonal: a
+//! subdirectory can be emitted and not descended into. A listing that failed is not a child
+//! either; `listed` counts only what it returned before it failed.
 
 use crate::model::{EntryKind, ObservedEntry};
 
@@ -32,7 +32,9 @@ pub struct BlockCounts {
     /// and no item is emitted for them (P7 §8, Q12): the entry no longer exists, which is what a
     /// listing taken a moment later would say too.
     pub vanished: u64,
-    /// Transfer artifacts (`.data-mover-*`) the listing hid. Not children.
+    /// Entries the listing hid. Not children: transfer artifacts (`.data-mover-*`), and ONTAP's
+    /// snapshot directory where `NFSv3` lists it without attributes (P7 C7b; `NFSv4` never lists
+    /// it).
     pub internal_hidden: u64,
     /// Subdirectories the filter did not descend into.
     pub pruned_dirs: u64,

@@ -156,6 +156,9 @@ pub(crate) trait NfsListingPages: Send {
     /// Takes the next child, in the order the server sent it. `true` once the page is full: the
     /// reader then calls [`Self::hand_over`] before it reads on.
     fn push(&mut self, child: NfsListedChild) -> bool;
+    /// Counts an entry the listing hid instead of taking it as a child (ONTAP's `NFSv3`
+    /// snapshot directory, P7 C7b), with the transfer artifacts in `internal_hidden`.
+    fn hide(&mut self);
     /// Hands the full page over, waiting while the consumer still holds the previous one.
     /// `false` once the listing is over (cancelled, or its consumer gone): the reader must stop.
     async fn hand_over(&mut self) -> bool;
@@ -175,7 +178,8 @@ pub(crate) trait NfsNamespaceProtocol: Send + Sync {
     /// from its start, handing every child to `pages` as the server sends it, and returns once
     /// the server says end of directory or `pages` says to stop. It checks
     /// [`NfsListingPages::stopping`] before every child, so a stopped listing sends no further
-    /// request, but it never abandons a request in flight (an NFSv4.1 session fences the slot
+    /// READDIRPLUS request (a child already taken may still cost the LOOKUP / GETATTR of an
+    /// `NFSv3` `.snapshot`, P7 C7b), but it never abandons a request in flight (an NFSv4.1 session fences the slot
     /// of a cancelled request). It holds no more than the reply it is working through, and
     /// caches nothing.
     async fn read_directory(
@@ -225,14 +229,18 @@ pub(super) fn undescribed(child: NfsUndescribedChild) -> EntryOperationFailure {
         reason,
         ..
     } = child;
+    let diagnostic = match failure.status.as_deref() {
+        Some(status) => format!("NFS listing could not describe the entry: {reason}: {status}"),
+        None => format!("NFS listing could not describe the entry: {reason}"),
+    };
     EntryOperationFailure::new(
         path,
         Operation::Traverse,
         failure.class,
         failure.transience,
-        format!("NFS listing could not describe the entry: {reason}"),
+        diagnostic,
     )
-    .unwrap_or_else(|_| unreachable!("static NFS listing diagnostic is valid"))
+    .unwrap_or_else(|_| unreachable!("the NFS listing diagnostic is non-blank"))
 }
 
 #[async_trait]

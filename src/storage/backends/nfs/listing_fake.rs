@@ -45,6 +45,9 @@ pub(crate) struct FakeNfs {
     gate: Option<Arc<Semaphore>>,
     /// Directories whose parent's listing hands out a handle that no longer names them.
     listed_stale: Vec<String>,
+    /// Names the read hides instead of handing over, as the `NFSv3` reader hides ONTAP's
+    /// snapshot directory (P7 C7b).
+    hidden_names: Vec<String>,
     /// `directory_handle` calls: one per path resolution, whatever LOOKUPs it would cost.
     pub(crate) lookups: AtomicUsize,
     /// READDIRPLUS requests sent.
@@ -91,6 +94,13 @@ impl FakeNfs {
     /// Makes every reply wait for one permit of `gate`.
     pub(crate) fn gated(mut self, gate: Arc<Semaphore>) -> Self {
         self.gate = Some(gate);
+        self
+    }
+
+    /// Makes every read hide a child named `name` (`NfsListingPages::hide`) instead of handing
+    /// it over.
+    pub(crate) fn hiding(mut self, name: &str) -> Self {
+        self.hidden_names.push(name.to_owned());
         self
     }
 
@@ -254,6 +264,10 @@ impl NfsNamespaceProtocol for FakeNfs {
                     return Ok(NfsReadEnd::Stopped);
                 }
                 self.read.fetch_add(1, Ordering::SeqCst);
+                if self.hidden_names.contains(name) {
+                    pages.hide();
+                    continue;
+                }
                 if pages.push(Ok(self.child(&directory, name, *kind))) && !pages.hand_over().await {
                     return Ok(NfsReadEnd::Stopped);
                 }

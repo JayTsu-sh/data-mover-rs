@@ -410,6 +410,29 @@ async fn an_empty_directory_is_one_empty_page() -> Result {
     Ok(())
 }
 
+/// An entry the reader hides (ONTAP's `NFSv3` snapshot directory, P7 C7b) is counted in the
+/// page's `internal_hidden`, neither handed over nor a failure.
+#[tokio::test]
+async fn a_hidden_entry_is_counted_not_listed() -> Result {
+    let (dir, file) = (EntryKind::Directory, EntryKind::File);
+    let children = [("a", file), (".snapshot", dir), ("b", file), ("c", file)]
+        .into_iter()
+        .map(|(name, kind)| (name.to_owned(), kind))
+        .collect();
+    let fake = Arc::new(
+        FakeNfs::new(REPLY)
+            .directory("d", children)
+            .hiding(".snapshot"),
+    );
+    let (pages, failure) = drain(listing(&fake, "d", CancellationToken::new())?).await;
+    assert!(failure.is_none());
+    assert_eq!(names(&pages), ["a", "b", "c"]);
+    assert!(pages.iter().all(|page| page.failures.is_empty()));
+    let hidden: u32 = pages.iter().map(|page| page.internal_hidden).sum();
+    assert_eq!(hidden, 1);
+    Ok(())
+}
+
 /// A transport failure nfs-rs certifies safe to resend: before the first page the directory is
 /// read anew after a pause, a few times, and what that does not cure keeps its connectivity scope
 /// (the session); after the first page it is this listing's failure alone — the session is still

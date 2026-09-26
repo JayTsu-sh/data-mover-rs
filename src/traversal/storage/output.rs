@@ -41,7 +41,7 @@ pub(super) enum ChildDescent {
 pub(super) struct BlockFacts {
     /// Children the listing returned, described or not.
     pub(super) listed: u64,
-    /// Transfer artifacts the listing hid.
+    /// Entries the listing hid (see `BlockCounts::internal_hidden`).
     pub(super) internal_hidden: u64,
     /// Children a decision made in the listing's task kept out of the output. These have no
     /// slot at all.

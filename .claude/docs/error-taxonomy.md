@@ -219,6 +219,7 @@ Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修�
 | Local 名字不是 UTF-8 / 拼出的路径超长 | 无名子项（`raw_name` = Unix 原始字节，Windows UTF-16LE） | `Unsupported` / Permanent |
 | NFS / CIFS 名字含 U+FFFD（nfs-rs、smb-rs 有损解码，原名已丢，按它拼出的路径指不到原条目；真含 U+FFFD 的名字无法区分，一并报） | 无名子项（NFS 无原始字节；CIFS `raw_name` = 解码后的 UTF-8） | `Unsupported` / Permanent |
 | NFS READDIRPLUS 某项没带属性（v3 `post_op_attr` 可省；v4 属性解不出也是这样）或没带文件句柄 | 子项（报在子项路径；名字拼不出 `StoragePath` 时报在目录上） | `Protocol` / Unknown |
+| NFSv3 READDIRPLUS 列出名为 `.snapshot`、没带属性的项（ONTAP 卷根，P7 C7b）：LOOKUP（+ GETATTR）确认是目录 → 隐藏（`internal_hidden`，不是失败）；不是目录 → 普通子项。LOOKUP / GETATTR 失败 → | 子项；会话 / 节流 / LOOKUP 用的目录句柄失效则按 READDIRPLUS 失败结束读取（同下一行） | LOOKUP / GETATTR 自己的分类与状态（`classify_error`；`NOENT` → `NotFound` = 消失） |
 | NFS 列举（P7 C7）READDIRPLUS 读目录失败。**首页交出之前**从目录开头重读、不重复交出：句柄不再指向目录（`STALE` / `BADHANDLE` / `FHEXPIRED`，或并发改名的 `NOENT`）→ 下钻提示失效则按路径解析一次，否则忘掉缓存的句柄再解析，至多 3 次；服务端忙（`DELAY` / `JUKEBOX` / `GRACE`）→ 列举的节流预算内退避；nfs-rs 认证可安全重发的传输失败（`RecoveryAction::Retry`，或裸的连接重置 / 超时）→ 250 ms / 1 s / 2 s 至多 3 次。**首页之后**不重试（READDIRPLUS 只能从 cookie 续，nfs-rs 不公开，Q18） | 续上则无失败；否则整个列举，先交出已读到的子项，块 `Interrupted { delivered }`（一项未交出则 `Unreadable`）。可安全重发的传输失败在首页之后只让该列举失败（nfs-rs 认证可在现有会话上重发，不必重挂）；首页之前重发用尽、或 nfs-rs 要求重新挂载（`Remount`）的照常升会话 | 按 NFS role 映射（C7 起 READDIRPLUS 的错误直接经 `classify_error`，保留状态名；此前一律 `Protocol` / Unknown） |
 | CIFS 子项的身份字节超出模型上限（造不出 `SourceIdentity`） | 子项 | `Protocol` / Permanent |
 | HDFS 子项的 status 转换不了（时间超出 `i64` 纳秒等）、路径拼不出 `StoragePath` | 子项；不是本目录直接子项的（越出根、嵌套）或拼不出的报在目录路径上 | `Protocol` / Permanent |

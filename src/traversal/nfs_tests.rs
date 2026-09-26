@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    FailureScope, ListingOutcome, StorageTraversalSource, TraversalItem, TraversalOutcome,
-    TraversalRequest, TraversalSource as _,
+    FailureScope, ListingOutcome, ScanTotals, StorageTraversalSource, TraversalItem,
+    TraversalOutcome, TraversalRequest, TraversalSource as _,
 };
 use crate::model::{
     EntryKind, FailureClass, MetadataObservations, ObservationPlan, StoragePath, Transience,
@@ -62,6 +62,13 @@ fn tree(fake: FakeNfs) -> FakeNfs {
 }
 
 async fn traverse(fake: &Arc<FakeNfs>, concurrency: usize) -> Result<Vec<TraversalItem>> {
+    Ok(traverse_with_totals(fake, concurrency).await?.0)
+}
+
+async fn traverse_with_totals(
+    fake: &Arc<FakeNfs>,
+    concurrency: usize,
+) -> Result<(Vec<TraversalItem>, ScanTotals)> {
     let source =
         StorageTraversalSource::with_roles(Arc::new(fake.namespace()), Arc::new(NoMetadata));
     let slots = NonZeroUsize::new(concurrency).ok_or("concurrency is not zero")?;
@@ -76,7 +83,7 @@ async fn traverse(fake: &Arc<FakeNfs>, concurrency: usize) -> Result<Vec<Travers
         items.push(item);
     }
     match session.finish().await? {
-        TraversalOutcome::Completed(_) => Ok(items),
+        TraversalOutcome::Completed(completion) => Ok((items, completion.totals)),
         TraversalOutcome::Cancelled => Err("the traversal was cancelled".into()),
     }
 }
@@ -109,6 +116,34 @@ async fn descending_reads_the_hinted_handles_without_resolving_paths() -> Result
             .collect();
         assert_eq!(reads, expected, "concurrency {concurrency}");
     }
+    Ok(())
+}
+
+/// A directory the listing hides (ONTAP's `NFSv3` snapshot directory, P7 C7b) is not listed,
+/// not a failure and not descended into; it is counted in `internal_hidden`, outside `listed`,
+/// so the totals still balance.
+#[tokio::test]
+async fn a_hidden_directory_is_counted_apart_and_not_descended_into() -> Result {
+    let (dir, file) = (EntryKind::Directory, EntryKind::File);
+    let fake = Arc::new(
+        FakeNfs::new(2)
+            .directory("", children(&[(".snapshot", dir), ("f", file)]))
+            .directory(".snapshot", children(&[("hourly", dir)]))
+            .hiding(".snapshot"),
+    );
+    let (items, totals) = traverse_with_totals(&fake, 4).await?;
+    assert_eq!(entries(&items), 1);
+    assert_eq!(
+        (totals.listed, totals.emitted, totals.failed_children),
+        (1, 1, 0)
+    );
+    assert_eq!(totals.internal_hidden, 1);
+    assert!(totals.is_balanced());
+    let reads: Vec<String> = locked(&fake.read_with)
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect();
+    assert_eq!(reads, [""], "only the root is read");
     Ok(())
 }
 

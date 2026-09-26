@@ -93,7 +93,7 @@ CIFS file id、Local dev+inode 放得下；更长的 NFS 句柄与 S3 路径 + E
 
 计数 (`src/traversal/counts.rs`)：每块 `BlockCounts`，全场 `ScanTotals` (在 `TraversalCompletion.totals`，
 只有 `Completed` 才有)。不变式 `listed == emitted + filtered + failed_children + vanished` (每块与全场都成立，
-`is_balanced()`)；`internal_hidden` (`.data-mover-*`) 不在 `listed` 里；pruned / truncated 与之正交；
+`is_balanced()`)；`internal_hidden` (`.data-mover-*`；NFSv3 上 ONTAP 的 `.snapshot`，P7 C7b) 不在 `listed` 里；pruned / truncated 与之正交；
 `files + directories + symlinks + other == emitted`，`bytes` 只加文件。
 
 **错误模型 (P7 C3，§8)**。三层：子项失败 (`Failure{scope: Child}`，流继续)、列举失败 (`Failure{scope: Listing}`，

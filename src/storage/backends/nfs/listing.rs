@@ -236,7 +236,8 @@ struct Pages<'a> {
     request: &'a ListRequest,
     sink: &'a PageSink,
     page: ListingPage,
-    /// Children and child failures in `page`; hidden artifacts do not count against the hint.
+    /// Children and child failures in `page`; hidden entries (artifacts, ONTAP's `NFSv3` snapshot
+    /// directory) do not count against the hint.
     held: usize,
     handed_over: usize,
 }
@@ -352,6 +353,10 @@ impl NfsListingPages for Pages<'_> {
     fn push(&mut self, child: NfsListedChild) -> bool {
         self.add(child);
         self.held >= self.request.page_hint.get()
+    }
+
+    fn hide(&mut self) {
+        self.page.internal_hidden = self.page.internal_hidden.saturating_add(1);
     }
 
     async fn hand_over(&mut self) -> bool {
