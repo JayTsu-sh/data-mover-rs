@@ -394,11 +394,13 @@ impl<'a> Pages<'a> {
                 self.page.internal_hidden = self.page.internal_hidden.saturating_add(1);
                 return;
             }
-            Ok(entry) => {
+            Ok(mut entry) => {
                 let hint = (entry.kind == EntryKind::Directory)
                     .then(|| descent_hint(self.namespace, &entry.file_handle))
                     .flatten();
-                let spelled = respelled(directory, entry.path.clone());
+                // Moved, not copied: the descriptor takes the path, the entry keeps the rest.
+                let path = mem::replace(&mut entry.path, StoragePath::root());
+                let spelled = respelled(directory, path);
                 match descriptor(&self.namespace.identity, spelled, &entry) {
                     Ok(described) => self.page.push_descriptor(directory, described, hint),
                     Err(failure) => self

@@ -8,13 +8,14 @@ use std::sync::{Mutex, PoisonError};
 use futures::stream;
 use nfs_rs::{Nfs3ErrorCode as V3, Nfs4ErrorCode as V4};
 
-use super::super::{CACHE_WRITES, FType3, GLOBAL_CACHE, Time, role_metadata};
+use super::super::{CACHE_WRITES, FType3, GLOBAL_CACHE, NASEntry, NfsEnrich, Time, role_metadata};
 use super::*;
 use crate::model::{FailureClass, Transience};
 
-fn listed(name: &str, attr: Option<nfs_rs::Attr>, handle: &'static [u8]) -> RoleListedEntry {
-    NFSStorage::role_listed_entry(
-        PathBuf::from("dir").join(name),
+fn listed(name: &str, attr: Option<nfs_rs::Attr>, handle: &'static [u8]) -> NfsListedChild {
+    listed_child(
+        &StoragePath::new("dir").unwrap_or_else(|error| panic!("{error}")),
+        Path::new("dir"),
         nfs_rs::ReaddirplusEntry {
             fileid: 1,
             file_name: name.to_owned(),
@@ -26,9 +27,9 @@ fn listed(name: &str, attr: Option<nfs_rs::Attr>, handle: &'static [u8]) -> Role
 }
 
 /// A child READDIRPLUS listed carries the ownership and timestamps the metadata role reads
-/// from a GETATTR of the same attributes — through `NASEntry::from_nfs_attrs` (set-id bits
-/// stripped for an owner it cannot map, owner strings mapped by `owner_id`) and
-/// `role_observation` — for files, directories and symlinks with set-id bits, and for the
+/// from a GETATTR of the same attributes — set-id bits stripped for an owner it cannot map,
+/// owner strings mapped by `owner_id` (`listed_child`) —
+/// for files, directories and symlinks with set-id bits, and for the
 /// owner forms `NFSv3`, ONTAP and an LDAP-backed server send.
 #[test]
 fn a_listed_childs_ownership_and_times_are_what_a_getattr_reports() {
@@ -68,8 +69,9 @@ fn a_listed_childs_ownership_and_times_are_what_a_getattr_reports() {
                 owner_group: group.to_owned(),
                 ..nfs_rs::Attr::default()
             };
-            let child = NFSStorage::role_listed_entry(
-                PathBuf::from("dir/x"),
+            let listed = listed_child(
+                &directory,
+                Path::new("dir"),
                 nfs_rs::ReaddirplusEntry {
                     fileid: 1,
                     file_name: "x".to_owned(),
@@ -77,9 +79,9 @@ fn a_listed_childs_ownership_and_times_are_what_a_getattr_reports() {
                     handle: Bytes::from_static(b"h"),
                 },
                 owners_are_strings,
-            );
-            let listed = role_child(&directory, &child)
-                .unwrap_or_else(|_| panic!("a child with attributes is described"));
+            )
+            .unwrap_or_else(|_| panic!("a child with attributes is described"));
+            assert_eq!(listed.path.as_str(), "dir/x");
             let getattr = role_metadata::metadata_inline(
                 Bytes::from_static(b"h"),
                 &attrs,
@@ -105,6 +107,22 @@ fn a_listed_childs_ownership_and_times_are_what_a_getattr_reports() {
                 getattr.symlink,
                 "{context}"
             );
+            // The listed mode is the one the legacy entry the listing used to build carried: set-id
+            // bits of an owner that does not map stripped (P7 C10 dropped that detour, not this).
+            let legacy = NASEntry::from_nfs_attrs(
+                "x".to_owned(),
+                PathBuf::from("dir/x"),
+                None,
+                &attrs,
+                Bytes::from_static(b"h"),
+                NfsEnrich::default(),
+                owners_are_strings,
+            );
+            assert_eq!(listed.mode, Some(legacy.mode), "{context}");
+            assert_eq!(
+                listed.size,
+                (listed.kind == EntryKind::File).then_some(legacy.size)
+            );
             checked += 1;
         }
     }
@@ -124,16 +142,12 @@ fn regular() -> nfs_rs::Attr {
 /// while the entries beside it are still observed.
 #[test]
 fn an_entry_without_attributes_or_handle_fails_alone() {
-    let directory = StoragePath::new("dir").unwrap_or_else(|error| panic!("{error}"));
-    let children: Vec<NfsListedChild> = [
+    let children: Vec<NfsListedChild> = vec![
         listed("before", Some(regular()), b"h1"),
         listed("no-attrs", None, b"h2"),
         listed("no-handle", Some(regular()), b""),
         listed("after", Some(regular()), b"h3"),
-    ]
-    .iter()
-    .map(|child| role_child(&directory, child))
-    .collect();
+    ];
     let observed: Vec<&str> = children
         .iter()
         .filter_map(|child| child.as_ref().ok())

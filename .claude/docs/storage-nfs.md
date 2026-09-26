@@ -165,7 +165,7 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
     - 真机（C7c）：ONTAP v3 / v4.0 / v4.1、DXN-2 v3 / v4.0 上 5 万文件目录与 base 逐行相同；`ss -K` 掐断连接时只有 v4.1 把
       `Retry` 交给列举（续读），v3 / v4.0 由 nfs-rs 自己重连重发；注入式故障（首页后截断回复再报 `ConnectionReset`）下五种都
       读完、0 重复。见 P7 设计 §14 C7c。
-- role `List`（`drain_readdirplus` → `role_listed_entry` / `role_observation`）里某项描述不出来 ——
+- role `List`（`drain_readdirplus` → `listed_child`：P7 C10 起直接从 READDIRPLUS 项描述子项，不再经 legacy `NASEntry` / `PathBuf` / 扩展名，属主 / 模式 / 时间语义不变）里某项描述不出来 ——
   READDIRPLUS 没带属性（v3 `post_op_attr` 可省；v4 的 fattr4 解不出时 nfs-rs 也给 None）、没带文件句柄（v3
   `post_op_fh3` FALSE、v4 属性里没有 `FATTR4_FILEHANDLE`）——
   报成该子项自己的 `Protocol` / Unknown 条目失败，兄弟照常，列举 `Partial`（之前整个目录失败；P7 评审现存问题 2）。

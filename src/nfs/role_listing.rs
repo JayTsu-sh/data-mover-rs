@@ -22,88 +22,94 @@ use nfs_rs::{
 use tracing::info;
 
 use super::{
-    EntryEnum, FType3, NASEntry, NFSStorage, NfsEnrich, Result, invalidate_path_cache,
-    is_nfs_noent, is_retryable_with_invalidation, nfs_timestamp, owners_are_strings,
+    FType3, NFSStorage, Result, invalidate_path_cache, is_nfs_noent,
+    is_retryable_with_invalidation, nfs_timestamp, owner_id, owners_are_strings, time_to_i64,
 };
-use crate::model::{EntryKind, FailureClass, StoragePath, TimestampMetadata};
+use crate::model::{
+    EntryKind, FailureClass, StoragePath, TimestampMetadata, without_unowned_set_id,
+};
 use crate::storage::backends::nfs::namespace::{
     NfsListedChild, NfsListingPages, NfsNamespaceObservation, NfsReadEnd, NfsReadFailure,
     NfsRestart, NfsUndescribedChild, inline_ownership, lossily_decoded, undescribed_child,
     unnamed_child,
 };
 use crate::storage::backends::nfs::protocol::classify_error;
+use crate::storage::listing::child_path;
 
-/// A READDIRPLUS entry the role listing could not turn into an [`EntryEnum`].
-pub(crate) struct RoleOmittedEntry {
-    relative_path: PathBuf,
-    reason: &'static str,
-}
-
-/// One READDIRPLUS entry of a role listing, in the order the server sent it.
-pub(crate) type RoleListedEntry = std::result::Result<EntryEnum, RoleOmittedEntry>;
-
-/// One entry of a role listing as the NFS namespace protocol reports it.
-pub(super) fn role_child(directory: &StoragePath, child: &RoleListedEntry) -> NfsListedChild {
-    match child {
-        Ok(entry) => role_observation(directory, entry),
-        Err(omitted) => Err(undescribed_child(
-            directory,
-            &omitted.relative_path,
-            omitted.reason,
-        )),
-    }
-}
-
-fn role_observation(
+/// One READDIRPLUS entry of a role listing, described straight from the reply: what the
+/// Namespace role lists, or why the entry cannot be described. READDIRPLUS may leave an entry's
+/// attributes out (`post_op_attr` is optional in v3): that entry cannot be described, its siblings
+/// still can.
+///
+/// The child's path is the listing contract's spelling ([`child_path`]) — the one the listing would
+/// otherwise respell a joined native path into — and nothing else is built per entry: no legacy
+/// `NASEntry`, no native path, no extension (P7 §12.6 O2; what they cost at fifty million
+/// entries is what kept the traversal's CPU above the legacy walker's). The ownership, mode and
+/// timestamps are exactly what `NASEntry::from_nfs_attrs` gave: set-id bits stripped for an owner
+/// that does not map to a number, owner strings mapped by `owner_id`.
+pub(super) fn listed_child(
     directory: &StoragePath,
-    entry: &EntryEnum,
-) -> std::result::Result<NfsNamespaceObservation, NfsUndescribedChild> {
-    let child = entry.get_relative_path();
-    if let Some(name) = child.file_name().map(|name| name.to_string_lossy())
-        && lossily_decoded(&name)
-    {
-        return Err(unnamed_child(directory, &name));
+    native: &Path,
+    entry: nfs_rs::ReaddirplusEntry,
+    owners_are_strings: bool,
+) -> NfsListedChild {
+    let nfs_rs::ReaddirplusEntry {
+        file_name,
+        attr,
+        handle,
+        ..
+    } = entry;
+    let undescribed = |reason| undescribed_child(directory, &native.join(&file_name), reason);
+    let Some(attrs) = attr else {
+        return Err(undescribed("the server omitted its attributes"));
+    };
+    if lossily_decoded(&file_name) {
+        return Err(unnamed_child(directory, &file_name));
     }
     // An empty handle is what `post_op_fh3::FALSE` (v3) or a v4 entry whose attributes lack
     // `FATTR4_FILEHANDLE` leaves: no identity can be built from it.
-    let file_handle = entry
-        .get_file_handle()
-        .filter(|handle| !handle.is_empty())
-        .cloned()
-        .ok_or_else(|| undescribed_child(directory, child, "the server returned no file handle"))?;
-    let kind = if entry.get_is_symlink() {
+    if handle.is_empty() {
+        return Err(undescribed("the server returned no file handle"));
+    }
+    let Ok(path) = child_path(directory, &file_name) else {
+        return Err(undescribed("its name cannot be spelled"));
+    };
+    Ok(observation(path, handle, &attrs, owners_are_strings))
+}
+
+/// What one READDIRPLUS entry's attributes say, as the Namespace role lists it.
+fn observation(
+    path: StoragePath,
+    file_handle: Bytes,
+    attrs: &nfs_rs::Attr,
+    owners_are_strings: bool,
+) -> NfsNamespaceObservation {
+    let is_dir = attrs.type_ == FType3::NF3DIR as u32;
+    let kind = if attrs.type_ == FType3::NF3LNK as u32 {
         EntryKind::Symlink
-    } else if entry.get_is_dir() {
+    } else if is_dir {
         EntryKind::Directory
     } else {
         EntryKind::File
     };
-    let path = StoragePath::new(child.to_string_lossy())
-        .map_err(|_| undescribed_child(directory, child, "its name cannot be spelled"))?;
-    let (timestamps, mode, ownership) = match entry {
-        EntryEnum::NAS(nas) => (
-            Some(TimestampMetadata {
-                accessed: nfs_timestamp(nas.atime),
-                modified: nfs_timestamp(nas.mtime),
-                created: nfs_timestamp(nas.ctime),
-            }),
-            Some(nas.mode),
-            // `nas.mode` has the set-id bits of an owner it could not map stripped
-            // (`without_unowned_set_id`), but only then is it not the raw attribute mode, and
-            // then the ownership is `Unmapped` and carries no mode at all.
-            Some(inline_ownership(nas.uid, nas.gid, nas.mode)),
-        ),
-        _ => (None, None, None),
-    };
-    Ok(NfsNamespaceObservation {
+    let uid = owner_id(&attrs.owner, attrs.uid, owners_are_strings);
+    let gid = owner_id(&attrs.owner_group, attrs.gid, owners_are_strings);
+    // The mode every legacy consumer applies: set-id bits of an owner that does not map stripped.
+    // Then the ownership is `Unmapped` and carries no mode at all.
+    let mode = without_unowned_set_id(attrs.file_mode, uid.is_some(), gid.is_some(), is_dir);
+    NfsNamespaceObservation {
         path,
         kind,
-        size: (kind == EntryKind::File).then(|| entry.get_size()),
+        size: (kind == EntryKind::File).then_some(attrs.filesize),
         file_handle,
-        timestamps,
-        mode,
-        ownership,
-    })
+        timestamps: Some(TimestampMetadata {
+            accessed: nfs_timestamp(time_to_i64(attrs.atime)),
+            modified: nfs_timestamp(time_to_i64(attrs.mtime)),
+            created: nfs_timestamp(time_to_i64(attrs.ctime)),
+        }),
+        mode: Some(mode),
+        ownership: Some(inline_ownership(uid, gid, mode)),
+    }
 }
 
 impl NFSStorage {
@@ -162,41 +168,6 @@ impl NFSStorage {
         let components = Self::collect_components(Path::new(path.as_str()))?;
         invalidate_path_cache(&components, &self.get_root_fh());
         Ok(())
-    }
-
-    /// One READDIRPLUS entry of a role listing. READDIRPLUS may leave an entry's attributes
-    /// out (`post_op_attr` is optional in v3): that entry cannot be described, its siblings still
-    /// can.
-    fn role_listed_entry(
-        child: PathBuf,
-        entry: nfs_rs::ReaddirplusEntry,
-        owners_are_strings: bool,
-    ) -> RoleListedEntry {
-        let Some(attrs) = entry.attr else {
-            return Err(RoleOmittedEntry {
-                relative_path: child,
-                reason: "the server omitted its attributes",
-            });
-        };
-        let extension = child
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_owned);
-        Ok(EntryEnum::NAS(NASEntry::from_nfs_attrs(
-            entry.file_name,
-            child,
-            extension,
-            &attrs,
-            entry.handle,
-            // The only consumer of this listing is `role_observation`, which reads the handle,
-            // the kind, the path, the timestamps, the mode, the numeric uid / gid and the size —
-            // never the ACL or the raw owner and group strings (the numeric ids are mapped from
-            // them before this). Filling those would clone two `String`s and an `Acl` per entry
-            // for nothing, which at fifty million entries is not nothing. Restore `from_attrs` here the moment
-            // that observation starts reporting them.
-            NfsEnrich::default(),
-            owners_are_strings,
-        )))
     }
 }
 
@@ -366,13 +337,7 @@ where
             continue;
         }
         let listed = match snapshot_directory(directory, entry, version, lookup).await {
-            Examined::Child(entry) => {
-                let child = native.join(&entry.file_name);
-                role_child(
-                    directory,
-                    &NFSStorage::role_listed_entry(child, entry, owners_are_strings),
-                )
-            }
+            Examined::Child(entry) => listed_child(directory, &native, entry, owners_are_strings),
             Examined::Hidden => {
                 pages.hide();
                 continue;

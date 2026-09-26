@@ -11,7 +11,7 @@ use crate::model::{
     OwnershipMode, SourceIdentity, SourceVersion, StoragePath, SymlinkTarget,
     SymlinkTargetEncoding, Transience,
 };
-use crate::storage::artifacts::is_artifact_native;
+use crate::storage::artifacts::{is_artifact_native, is_artifact_path};
 use crate::storage::{InlineOwnership, ListingFacts};
 use crate::storage::{
     ListRequest, ListingStream, Namespace, NamespaceCapabilities, SourceDescriptor,
@@ -380,8 +380,15 @@ pub(super) fn checked_allow_root(path: &StoragePath) -> Result<PathBuf, StorageR
     }
 }
 
+/// Whether `path` names a transfer artifact or lies inside one. On Unix a native path splits on
+/// `/` alone, so the `/`-separated check is the same one without parsing a native path — every
+/// listed child goes through it.
 pub(super) fn is_internal(path: &StoragePath) -> bool {
-    is_artifact_native(Path::new(path.as_str()))
+    if cfg!(unix) {
+        is_artifact_path(path.as_str())
+    } else {
+        is_artifact_native(Path::new(path.as_str()))
+    }
 }
 
 fn invalid(path: &StoragePath) -> StorageRoleFailure {
