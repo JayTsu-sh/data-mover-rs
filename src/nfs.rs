@@ -52,7 +52,7 @@ mod owner;
 mod role_listing;
 mod role_metadata;
 
-pub(crate) use owner::owner_id;
+pub(crate) use owner::{owner_id, owners_are_strings};
 
 type NfsWalkTask = (String, Bytes, usize, bool, Option<usize>);
 
@@ -3066,7 +3066,7 @@ impl NFSStorage {
     /// Whether this mount's owners arrive as strings (`NFSv4`) rather than numbers (`NFSv3`); see
     /// [`owner_id`].
     pub(crate) fn owners_are_strings(&self) -> bool {
-        !matches!(self.mount.version(), NFSVersion::NFSv3)
+        owners_are_strings(self.mount.version())
     }
 
     /// 返回当前已协商实例报告的 ACL 能力。

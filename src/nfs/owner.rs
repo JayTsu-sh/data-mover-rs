@@ -1,5 +1,13 @@
 //! The uid / gid behind an NFS owner, or none when the number would be made up.
 
+use nfs_rs::NFSVersion;
+
+/// Whether owners arrive as strings (`NFSv4`) rather than numbers (`NFSv3`) over `version`; see
+/// [`owner_id`].
+pub(crate) const fn owners_are_strings(version: NFSVersion) -> bool {
+    !matches!(version, NFSVersion::NFSv3)
+}
+
 /// The uid or gid nfs-rs parsed for one entry, or `None` when that number is not what the server
 /// said.
 ///
