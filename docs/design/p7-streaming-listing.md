@@ -889,7 +889,8 @@ VERIFY
     卷开后台重删 + 压缩；我们的用户不建桶 → 脚本用已有桶、跑完清空对象（不删桶）。已知：列举字节序；带 delimiter 的 ListObjectVersions
     可能缺 NextVersionIdMarker 丢版本（现存问题 10 / F4）；CommonPrefix 计入 max-keys；满页后跟空末页
   - ONTAP S3 **NAS 桶** data-mover-nas（同一端点、同一用户，FlexVol dm_s3_nas 重删 + 压缩）：平铺列举无序（目录遍历序）、无版本 —— “无序 S3”的真机
-  - RustFS 1.0.0（VM 105，管理网 http://10.131.9.14:9001 —— 控制台端口也提供 S3 API，`rustfs/.env`，数据可丢弃）
+  - RustFS 1.0.0（VM 105，管理网 http://10.131.9.14:9001 —— 控制台端口也提供 S3 API，`rustfs/.env`，专用用户只能动 data-mover-* 桶，数据可丢弃）：
+    ListObjectVersions 按“先 marker 组后 version 组”输出（现存问题 11，历史标 Inferred）；条件 PUT 支持（412）；ListMultipartUploads 支持前缀
   - DXN / StorageGRID 仍只在用户单独批准时用（临时桶）
 - 无序 S3：ONTAP NAS 桶（上面）+ 内存 fake 的打乱模式（Q22）
 - HDFS 真机（10.131.9.11 runner）每次需要用户批准（C8 已于 2026-09-26 批准并通过）
@@ -994,6 +995,7 @@ VERIFY
 | 8 | **版本与删除标记交错时按 LastModified 合并，并发写入时排错**：aws-sdk-s3 把 `<Version>` 与 `<DeleteMarker>` 解析成两个列表，丢了交错顺序（`src/s3/role_protocol/versions.rs:107, 123`）（§10.2、F2 / Q29） | **已修** `40c1ac9`（`fix(s3)!: 版本历史按服务端顺序组装`）：`src/s3/version_order.rs` 拦截原始响应体、按服务端位置倒序组装，校验不过的 key 标 `HistoryOrder::Inferred`；`history.rs` 的核心由 role-based 与 legacy `walkdir` / `walkdir_2` 共用。差别：role-based 在整个目录列举（跨页）上校验同 key 连续；**legacy `walkdir` 只在每批已释放的完整 key 内校验连续**。回归数据 `tests/data/s3/minio-concurrent-versions{,-paged}.xml` |
 | 9 | **legacy 版本列举假设 key 升序**：`src/s3/version_listing.rs` 的 `VersionPages::complete_keys` 把每页最大的 key 扣到下一页合并（C20），前提是 ListObjectVersions 按 key 升序返回。在无序存储上（ONTAP NAS 桶，Q22；NAS 桶不支持 ListObjectVersions，所以 ONTAP 上不会触发），同一个 key 的历史会被拆成几段、各自当成一个 key 发出（latest / `version_count` 错）；F2 的连续性校验在 legacy 里也只看每批 | 未修：legacy 在 P7 收尾整体删除；删除前若有调用方在无序存储上用 legacy 多版本列举，改为按整个目录物化分组（role-based 的做法）。role-based（C22 / C6）按目录物化分组，不受影响 |
 | 10 | **ONTAP `ListObjectVersions` 带 `delimiter=/` 会静默丢版本**（2026-09-26 实测，ONTAP 9.19.1）：截断页里有 CommonPrefix、且被收拢的 key 在列举前缀或该 CommonPrefix 之后紧跟多字节字符（如 `p/éb/x`、`p/x/中/y`）时，若页恰好停在后一个 key 的版本中间，服务端给 `NextKeyMarker=<key>` 却**不给** `NextVersionIdMarker`，下一页从该 key 之后开始，剩余版本被跳过（1000 个版本只回 998）。另：页停在 CommonPrefix 上时有时仍给 `NextVersionIdMarker`，下一页重复该前缀；恰好满页后跟一个空的末页；CommonPrefix 计入 max-keys。受影响：legacy `s3.rs` 两处 ListObjectVersions、role `s3/role_protocol/listing.rs` | 待修（F4）：截断页的最后一条的 key 等于 `NextKeyMarker` 而没有 `NextVersionIdMarker` 时，用最后一条（文档序）的 versionId 作 version-id-marker；CommonPrefix 跨页去重；容忍空末页。回归数据用 ONTAP 实测响应 |
+| 11 | **RustFS 1.0.0 的 `ListObjectVersions` 原始 XML 不交错**（2026-09-26 实测，VM 105）：每页先列全部 `<DeleteMarker>`、再列全部 `<Version>`（各组内 key 升序、同 key 新→旧），所以一个 key 的条目在文档里不连续、第一条也不一定是 IsLatest。F2 的逐 key 校验会判不合格 → 该 key 标 `HistoryOrder::Inferred`、按 `LastModified` 排（同毫秒可能排错）。分页（key-marker / version-id-marker，max-keys 1/2/3）不丢不重 | 行为正确（回退如设计）；RustFS 上历史顺序只能推断。可选改进：对“分组输出”的存储（每页 marker 组 + version 组、各自按 key 升序新→旧）把两组当两条有序序列按 key 归并，同 key 内仍需时间决定交错 → 与今天的回退等价，不改。e2e-s3 的 RustFS 行期望 `order=inferred` |
 
 ## 收尾：清理扫描相关旧代码
 
