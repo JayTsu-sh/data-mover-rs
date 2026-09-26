@@ -6,6 +6,7 @@
 //! unknown size, is `Unsupported` before any I/O.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::stream;
@@ -275,7 +276,7 @@ async fn a_directory_object_one_request_cannot_carry_is_refused_before_any_io() 
     let direct = destination
         .prepare_direct(prepare(Some(FIVE_GIB))?, CancellationToken::new())
         .await?;
-    assert!(single::of(&direct).is_some());
+    assert!(streaming::of(&direct).is_some(), "5 GiB is streamed (F5h)");
     Ok(())
 }
 
@@ -306,5 +307,104 @@ async fn a_leftover_multipart_stage_of_a_directory_object_is_cleaned_up() -> Tes
     destination.write(&stage, chunks(&data)).await?;
     publish(&destination, &stage, &data).await?;
     written_in_one_request(&protocol, &data, "after a leftover").await;
+    Ok(())
+}
+
+/// F5h: over the single-PUT threshold a directory object is one streamed `PutObject`, never held
+/// whole in memory — after `write` the server already holds all but its last byte and nothing is
+/// committed; publication commits it. Up to the threshold it is buffered as before.
+#[tokio::test]
+async fn a_directory_object_over_the_threshold_is_streamed() -> TestResult {
+    let (protocol, destination) = store().await;
+    let data = payload(3 * PART);
+    let size = data.len() as u64;
+    let stage = destination
+        .prepare_at_destination(request(Some(size), ResumeMode::Discover)?)
+        .await?;
+    assert!(streaming::of(&stage).is_some());
+    assert!(!stage.recovery_enabled());
+    destination.write(&stage, chunks(&data)).await?;
+    for _ in 0..500 {
+        if protocol.streaming().received == size - 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(protocol.streaming().received, size - 1);
+    assert!(!protocol.objects.lock().await.contains_key(FINAL));
+    publish(&destination, &stage, &data).await?;
+    written_in_one_request(&protocol, &data, "streamed").await;
+    assert_eq!(protocol.streaming().puts, 1);
+    let small = destination
+        .prepare_at_destination(request(Some(5), ResumeMode::Discover)?)
+        .await?;
+    assert!(single::of(&small).is_some());
+    Ok(())
+}
+
+/// The buffering limit of a directory object is the single-PUT threshold — exactly it is still
+/// buffered, one byte more is streamed — or, where every other object goes through a multipart
+/// upload (no threshold), its default 8 MiB. A leftover pointer is cleaned up on the buffered
+/// route as on the streamed one.
+#[tokio::test]
+async fn a_directory_object_is_buffered_up_to_the_threshold() -> TestResult {
+    let limit = DEFAULT_SINGLE_PUT_THRESHOLD;
+    for (threshold, size, streamed) in [
+        (Some(limit), limit, false),
+        (Some(limit), limit + 1, true),
+        (None, limit, false),
+        (None, limit + 1, true),
+    ] {
+        let (protocol, destination) = store().await;
+        let destination = destination.with_single_put_threshold(threshold);
+        plant_pointer(&protocol).await?;
+        let stage = destination
+            .prepare_at_destination(request(Some(size), ResumeMode::Discover)?)
+            .await?;
+        let label = format!("{threshold:?} {size}");
+        assert_eq!(streaming::of(&stage).is_some(), streamed, "{label}");
+        assert_eq!(single::of(&stage).is_some(), !streamed, "{label}");
+        assert!(
+            matches!(stage.prepare_fact(), PrepareFact::Restarted { .. }),
+            "{label}"
+        );
+        assert!(
+            !stored(&protocol).await.contains(&parent_pointer()),
+            "{label}"
+        );
+    }
+    Ok(())
+}
+
+/// A store that drops the connection while the last byte of a streamed directory object is held
+/// (its idle-body timeout shorter than the hold) ended the request with the body incomplete:
+/// publication reports the final key unchanged — on a bucket where nothing else could prove it —
+/// and nothing was stored.
+#[tokio::test]
+async fn a_connection_dropped_while_the_byte_is_held_changes_nothing() -> TestResult {
+    let (protocol, destination) = store().await;
+    protocol.streaming().drops_while_held = true;
+    let data = payload(3 * PART);
+    let stage = destination
+        .prepare_at_destination(request(Some(data.len() as u64), ResumeMode::Restart)?)
+        .await?;
+    destination.write(&stage, chunks(&data)).await?;
+    for _ in 0..500 {
+        if protocol.streaming().received + 1 == data.len() as u64 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let request = PublishRequest {
+        expected_size: data.len() as u64,
+        expected_blake3: None,
+        cancel: CancellationToken::new(),
+    };
+    let Err(failure) = destination.publish(&stage, request).await else {
+        return Err("a dropped upload was published".into());
+    };
+    assert!(!failure.final_destination_changed);
+    assert!(!protocol.objects.lock().await.contains_key(FINAL));
     Ok(())
 }

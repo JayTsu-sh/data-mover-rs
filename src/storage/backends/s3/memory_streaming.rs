@@ -33,6 +33,9 @@ pub(crate) struct StreamingKnobs {
     pub(crate) commits_then_fails: bool,
     /// The next request reads its whole body, stores nothing, and loses its reply.
     pub(crate) fails_after_body: bool,
+    /// The next request drops its connection once all but the last byte arrived (a store whose
+    /// idle-body timeout is shorter than the hold): nothing is stored.
+    pub(crate) drops_while_held: bool,
     /// The next request's reply carries this `ETag` instead of the body's MD5.
     pub(crate) etag: Option<String>,
     /// The next request is refused with this failure before any body byte is read.
@@ -95,7 +98,11 @@ impl MemoryS3 {
                 return Err(lost_reply());
             };
             body.extend_from_slice(&chunk);
-            self.streaming().received = body.len() as u64;
+            let mut knobs = self.streaming();
+            knobs.received = body.len() as u64;
+            if body.len() as u64 + 1 == len && mem::take(&mut knobs.drops_while_held) {
+                return Err(lost_reply());
+            }
         }
         if body.len() as u64 != len {
             return Err(S3ProtocolFailure::entry(

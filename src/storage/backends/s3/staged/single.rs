@@ -183,16 +183,17 @@ pub(super) fn of(stage: &PreparedStage) -> Option<&SingleStage> {
 }
 
 impl<P: S3Protocol> S3StagedDestination<P> {
-    /// The size of a source that goes as one `PutObject`, `None` for a multipart upload: a
-    /// directory object always (P7 D13; its `Unsupported` when one request cannot carry it), any
-    /// other key up to the single-PUT threshold. No I/O.
+    /// The size of a source that goes as one buffered `PutObject` (`None`: streamed or multipart):
+    /// a directory object up to the buffering limit (P7 D13 — its `Unsupported` when one request
+    /// cannot carry it — and F5h), any other key up to the single-PUT threshold. No I/O.
     pub(super) fn single_put_size(
         &self,
         path: &StoragePath,
         size: Option<u64>,
     ) -> Result<Option<u64>, StorageRoleFailure> {
         if let Some(size) = directory_object::single_request_size(path, size)? {
-            return Ok(Some(size));
+            // One request either way (P7 D13); above the threshold it is streamed (F5h).
+            return Ok((size <= self.buffered_directory_object_limit()).then_some(size));
         }
         Ok(match (size, self.single_put_threshold) {
             (Some(size), Some(limit)) if size <= limit => Some(size),
@@ -200,10 +201,25 @@ impl<P: S3Protocol> S3StagedDestination<P> {
         })
     }
 
-    /// The size of a source written as one streamed `PutObject` (P7 §14.2): over the single-PUT
-    /// threshold on a bucket without multipart uploads (its size is known: an unknown one was
-    /// refused by the bucket's limits). `None` for any other.
-    pub(super) fn streamed_size(&self, size: Option<u64>) -> Option<u64> {
+    /// The most bytes a directory object is buffered for: the single-PUT threshold, or its default
+    /// where every other object goes through a multipart upload. Above it the one request streams.
+    fn buffered_directory_object_limit(&self) -> u64 {
+        self.single_put_threshold
+            .unwrap_or(DEFAULT_SINGLE_PUT_THRESHOLD)
+    }
+
+    /// The size of a source written as one streamed `PutObject`: a directory object over the
+    /// buffering limit on any bucket (P7 F5h: one request, never buffered whole), and any object
+    /// over the single-PUT threshold on a bucket without multipart uploads (P7 §14.2; its size is
+    /// known: an unknown one was refused by the bucket's limits). `None` for any other.
+    pub(super) fn streamed_size(&self, path: &StoragePath, size: Option<u64>) -> Option<u64> {
+        if path.names_directory_object() {
+            // Checked by `single_put_size` first: known, and at most 5 GiB.
+            debug_assert!(
+                size.is_some_and(|size| size <= directory_object::MAX_DIRECTORY_OBJECT_BYTES)
+            );
+            return size.filter(|size| *size > self.buffered_directory_object_limit());
+        }
         if self.protocol.bucket_capabilities().multipart {
             return None;
         }

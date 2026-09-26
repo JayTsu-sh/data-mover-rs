@@ -868,6 +868,11 @@ NAS 桶（multiprotocol，底下是 FlexVol `dm_s3_nas`）与同一 SVM 的对�
 NAS 桶由 NAS profile（`directory_objects=false`）处理。F5g 真机（2026-09-26，`directory_objects.sh`）：MinIO、RustFS、ONTAP 对象桶、
 DXN、StorageGRID 的版本与非版本桶全部 pass —— 12 MiB `mid/` 本地→S3 三种 policy、200 MiB `big/` 流式（切断后不留东西、重跑 `Fresh`）与
 native（StorageGRID 为流式）都是一次请求（ETag 无 `-N`），同名真实文件 `mid` / `big` 不动。
+F5h（P7 §14 F5h）：超过单 PUT 阈值（默认 8 MiB；阈值未设时也按 8 MiB）的目录对象不再整个缓冲在内存里，改为一次**流式单 PUT**
+（N3 的通用原语 `put_object_streaming`：Content-Length、UNSIGNED-PAYLOAD、边传边算 MD5 与回复 ETag 核对、扣住最后 1 字节到
+publish、看门狗），任何能存目录对象的桶都是；≤ 阈值照旧缓冲单 PUT 带 Content-MD5；native 照旧一次 CopyObject；prepare 照旧按
+父目录里的旧指针清场。差别：SSE-KMS 桶上 > 阈值的 `d/` 报 `upload_digest = Unchecked(EtagNotMd5)`（F5g 的缓冲 PUT 带
+Content-MD5，是 `Matched`）；存储若在扣字节期间因 body 空闲断开连接，publish 报未变（请求已结束、body 不完整）。
 
 ## 已知陷阱
 

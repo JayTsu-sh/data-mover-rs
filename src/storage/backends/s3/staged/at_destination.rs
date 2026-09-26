@@ -134,11 +134,11 @@ impl<P: S3Protocol + 'static> PartsCheckpoint for PointerCheckpoint<'_, P> {
 }
 
 impl<P: S3Protocol + 'static> S3StagedDestination<P> {
-    /// Prepares by looking at the destination first. Up to T — and a directory object of any size
-    /// one request carries (P7 D13) — a single stage (after cleaning up a leftover pointer); above
-    /// T on a bucket without multipart uploads, one streamed `PutObject` ([`streaming`](super::streaming));
-    /// otherwise, or of unknown size, a multipart upload on the final key that resumes or starts
-    /// over as the decision table says.
+    /// Prepares by looking at the destination first. Up to T a single stage (after cleaning up a
+    /// leftover pointer); above T one streamed `PutObject` ([`streaming`](super::streaming), after
+    /// the same clean-up) for a directory object (one request up to 5 GiB, P7 D13 / F5h) and for
+    /// any object on a bucket without multipart uploads (§14.2); otherwise, or of unknown size, a
+    /// multipart upload on the final key that resumes or starts over as the decision table says.
     pub(super) async fn prepare_at_destination_stage(
         &self,
         request: DestinationPrepareRequest,
@@ -155,11 +155,14 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             stage.mark_at_destination(fact);
             return Ok(stage);
         }
-        if let Some(size) = self.streamed_size(size) {
-            // No multipart upload on this bucket (P7 §14.2): one streamed PutObject, nothing to
-            // resume or clean up.
+        if let Some(size) = self.streamed_size(&path, size) {
+            // One streamed PutObject (a directory object over the threshold, P7 F5h; any object on
+            // a bucket without multipart uploads, §14.2): nothing to resume, and what an earlier
+            // writer left is cleaned up as for a buffered one (nothing to look for where the bucket
+            // keeps no progress).
+            let fact = self.clear_leftover(&request, &pointer).await?;
             let mut stage = self.prepare_streaming(request.prepare, size, false).await?;
-            stage.mark_at_destination(PrepareFact::Fresh);
+            stage.mark_at_destination(fact);
             return Ok(stage);
         }
         let part_size = planned_part_size(size, &path)?;

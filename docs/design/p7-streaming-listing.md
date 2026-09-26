@@ -1017,7 +1017,8 @@ expert 目的端半边都查），不回退；S3 prepare 自己也在 I/O 前同
 回 `UnsupportedType`（legacy 遍历本来不交出这种键，这是给把它交给 legacy 写入的调用方的兜底）。F5d 的 MinIO
 `XMinioInvalidObjectName` 专门映射（`begin_failure`）因不可达而删除。prepare 仍按父目录里的指针名清掉 F5g 之前的写入者留下的指针与
 上传（`directory_object_artifact` 保留）。前置 refactor `870f385`：`unsupported_at_preflight` 从 `refuse_unholdable` 提出。
-代价（需知）：流式目录对象与所有单 PUT 一样先整个缓冲在内存再发，每个进行中的传输最多 5 GiB；native 不缓冲。Checkpointed 的
+代价（需知）：流式目录对象与所有单 PUT 一样先整个缓冲在内存再发，每个进行中的传输最多 5 GiB；native 不缓冲
+（**F5h 已消除**：超过单 PUT 阈值的目录对象改为一次流式 PutObject，见 §14 F5h 行）。Checkpointed 的
 结果报 `SkippedBelowCheckpointThreshold`（单块时 `SkippedSingleSourceChunk`）。
 测试：fake 加 RustFS 旋钮（完成的 multipart `x/` 存成 `x`），目的端旁放真实文件 `dir/obj`：0 B / 5 B / 24 MiB 流式（两种 resume
 模式）、Direct 5 B / 24 MiB、native 3 B / 20 MiB（单次拷贝上限调到 5 MiB）都是一次请求、multipart / part / part copy 计数 0、真实

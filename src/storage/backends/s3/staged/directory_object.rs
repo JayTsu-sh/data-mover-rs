@@ -8,8 +8,11 @@
 //! One request carries at most 5 GiB, and its size must be known before it is sent: a larger
 //! directory object, or one of unknown size, is that entry's `Unsupported` (permanent), refused
 //! before any I/O; there is no fallback. Such a stage is never resumed: a failure starts over.
-//! A streamed one is buffered whole before its `PutObject` (as every single-PUT stage is), so it
-//! holds up to 5 GiB of memory per transfer in flight; a native one buffers nothing.
+//! A streamed one up to the single-PUT threshold is buffered before its `PutObject` (as every
+//! single-PUT stage is); a larger one is one streamed `PutObject` (P7 F5h,
+//! [`streaming`](super::streaming)) — its last byte held until publication, no more than a chunk
+//! buffered — instead of being held whole in memory (up to 5 GiB per transfer, as F5g did). A
+//! native one buffers nothing.
 
 use super::super::source::classified_entry;
 use super::single::MAX_SINGLE_PUT_THRESHOLD;

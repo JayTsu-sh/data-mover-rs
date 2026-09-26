@@ -113,7 +113,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         // No `previous` for a Direct stage: its failures report the final key changed anyway.
         let mut stage = if let Some(size) = self.single_put_size(&path, request.source.size)? {
             self.prepare_single(request, size, None)
-        } else if let Some(size) = self.streamed_size(request.source.size) {
+        } else if let Some(size) = self.streamed_size(&path, request.source.size) {
             self.prepare_streaming(request, size, true).await?
         } else {
             self.direct_upload_stage(request)?

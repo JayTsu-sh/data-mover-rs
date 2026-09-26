@@ -12,6 +12,9 @@
 //!   the connection with the body incomplete. A byte held longer than [`HOLD_LIMIT`] is given up
 //!   the same way; publication then fails with the final key unchanged.
 //! - `Direct` commits inside `write`: the last byte goes once the input has ended cleanly.
+//! - A store that drops the connection while the byte is held (an idle-body timeout shorter than
+//!   the hold) ends the request with the body incomplete: publication reports the final key
+//!   unchanged.
 //! - A watchdog replaces the SDK's timeouts, which are off for this request: a chunk the request
 //!   does not take, or a reply that does not come, within the stall timeout (the connection's read
 //!   timeout) fails the transfer as a transient `Connectivity` — unless the request already ended
@@ -516,6 +519,11 @@ pub(super) async fn publish<P: S3Protocol>(
         return Err(unchanged(cancelled(path, Operation::Publish)));
     }
     let (mut inflight, md5, tags) = take_written(path, streaming, request.expected_size)?;
+    // A request that already ended never had its whole body (a store that dropped the idle
+    // connection, a refusal): nothing committed.
+    if let Some(failure) = inflight.ended_failure().await {
+        return Err(unchanged(role_failure(path, Operation::Publish, failure)));
+    }
     let released = inflight
         .release
         .take()
