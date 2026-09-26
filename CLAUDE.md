@@ -45,7 +45,7 @@
 | URL 红化 / 日志脱敏 | `src/url_redact.rs` |
 | 写 commit / PR | `.claude/docs/conventions.md` |
 | 升级 smb-rs 依赖 (改 `smb-domain` rev) | `.claude/docs/storage-cifs.md` "升级 smb-rs 依赖" + `.claude/rules/storage-driver-conventions.md` D9 |
-| 跑某 backend 验证 | `.claude/skills/e2e-{cifs,nfs,s3,local}/SKILL.md` |
+| 跑某 backend 验证 / 选真机环境 | `.claude/docs/test-environments.md`（全部真机环境、写入范围、从哪跑） + `.claude/skills/e2e-{cifs,nfs,s3,local}/SKILL.md` |
 | 跑「容器重启后续传」矩阵 (任一 backend) | `.claude/skills/_shared/resume_matrix.sh` (`DEST=<endpoint>`) + `examples/transfer_resume.rs`；背景见 `docs/adr/0006-destination-resident-recovery.md` |
 | 跑取消语义 / filter DSL 测试 | `.claude/skills/op-{cancel,filter-dsl}/SKILL.md` |
 | 跑全套 (无外部环境) | `.claude/skills/harness-run/SKILL.md` 或 `make ci` |
