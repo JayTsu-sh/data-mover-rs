@@ -22,7 +22,7 @@ use crate::model::{EntryOperationFailure, ObservedEntry, StoragePath};
 /// [`ScanFailure`]; only [`super::TraversalOutcome::Completed`] makes any of it final.
 ///
 /// Every variant is boxed, so an item is two words however much its payload grows: items are
-/// moved through the session's channel one per entry.
+/// moved through the session's channel in batches, and a batch of a page is a page of pointers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TraversalItem {

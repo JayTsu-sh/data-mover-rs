@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
 
+use super::channel::{self, ItemSender};
+
 use super::{
     ScanFailure, TraversalCandidate, TraversalCompletion, TraversalDecision, TraversalFilter,
     TraversalItem, TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
@@ -162,7 +164,7 @@ impl TraversalSource for StorageTraversalSource {
         if request.versions == TraversalVersions::All && !self.supports_versions() {
             return refuse_versions(&request);
         }
-        let (item_tx, item_rx) = mpsc::channel(request.max_buffered_items.get());
+        let (item_tx, item_rx) = channel::channel(request.max_buffered_items);
         let (completion_tx, completion_rx) = oneshot::channel();
         let cancel = request.cancel.clone();
         tokio::spawn(run(
@@ -304,14 +306,14 @@ struct Runtime<'a> {
     shared: &'a Arc<Shared>,
     request: &'a TraversalRequest,
     policy: &'a Policy,
-    items: &'a mpsc::Sender<TraversalItem>,
+    items: &'a ItemSender,
 }
 
 async fn run(
     namespace: Arc<dyn Namespace>,
     metadata: Arc<dyn Metadata>,
     request: TraversalRequest,
-    items: mpsc::Sender<TraversalItem>,
+    items: ItemSender,
     completion: oneshot::Sender<Result<TraversalOutcome, TraversalTerminalFailure>>,
     probe: Probe,
 ) {

@@ -154,26 +154,26 @@ impl Output {
             .saturating_add(u64::try_from(self.ready.len()).unwrap_or(u64::MAX))
     }
 
-    /// Emits every settled slot that is next in sequence.
+    /// Emits every settled slot that is next in sequence, as one batch.
     pub(super) async fn flush(
         &mut self,
         runtime: &Runtime<'_>,
     ) -> Result<(), TraversalTerminalFailure> {
+        let mut batch = Vec::with_capacity(self.ready.len());
         while let Some(settled) = self.ready.pop_front() {
             let item = match settled {
                 Settled::Child { item, descent } => self.settle_child(item, descent),
                 Settled::BlockEnd { path, facts } => Some(self.close_block(path, facts)),
             };
-            // Counted as passed before the send, so the ready queue keeps starting at `next`
-            // even when cancellation wins the send and ends the flush.
+            // Counted as passed as it joins the batch, so the ready queue keeps starting at
+            // `next` even when cancellation wins the send and ends the flush.
             self.next += 1;
-            if let Some(item) = item
-                && !emit(runtime, item).await?
-            {
-                return Ok(());
-            }
+            batch.extend(item);
         }
-        Ok(())
+        if batch.is_empty() {
+            return Ok(());
+        }
+        emit(runtime, batch).await
     }
 
     /// Tallies one child against the block it belongs to.
@@ -252,17 +252,18 @@ impl Output {
     }
 }
 
-/// Sends one item. `false` means cancellation won the race, which ends the flush.
+/// Sends one batch. Cancellation winning the race ends the flush; a batch larger than the bound
+/// goes over in pieces, so some of it may have been sent by then, which does not matter: the
+/// traversal is ending.
 async fn emit(
     runtime: &Runtime<'_>,
-    item: TraversalItem,
-) -> Result<bool, TraversalTerminalFailure> {
+    batch: Vec<TraversalItem>,
+) -> Result<(), TraversalTerminalFailure> {
     tokio::select! {
         biased;
-        () = runtime.request.cancel.cancelled() => Ok(false),
-        result = runtime.items.send(item) => {
-            result.map_err(|_| TraversalTerminalFailure::Internal)?;
-            Ok(true)
+        () = runtime.request.cancel.cancelled() => Ok(()),
+        result = runtime.items.send(batch) => {
+            result.map_err(|_| TraversalTerminalFailure::Internal)
         }
     }
 }

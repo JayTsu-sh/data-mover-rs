@@ -4,13 +4,14 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
     BackendSessionFailure, EntryKind, ObservationPlan, StoragePath, StorageTimestamp,
 };
 
+mod channel;
 mod counts;
 mod events;
 mod storage;
@@ -407,8 +408,11 @@ impl fmt::Display for TraversalTerminalFailure {
 impl std::error::Error for TraversalTerminalFailure {}
 
 /// Bounded item receiver paired with mandatory completion evidence.
+///
+/// Items travel from the traversal a batch at a time (P7 §12.5); [`Self::next_item`] hands them
+/// out one by one.
 pub struct TraversalSession {
-    items: mpsc::Receiver<TraversalItem>,
+    items: channel::ItemReceiver,
     completion: oneshot::Receiver<Result<TraversalOutcome, TraversalTerminalFailure>>,
     cancel: CancellationToken,
     exhausted: bool,
@@ -416,7 +420,7 @@ pub struct TraversalSession {
 
 /// Bounded producer paired with a [`TraversalSession`] for external traversal implementations.
 pub struct TraversalProducer {
-    items: mpsc::Sender<TraversalItem>,
+    items: channel::ItemSender,
     completion: Option<oneshot::Sender<Result<TraversalOutcome, TraversalTerminalFailure>>>,
 }
 
@@ -426,7 +430,7 @@ impl TraversalProducer {
     /// # Errors
     /// Returns the item when the consumer has already closed the session.
     pub async fn send(&self, item: TraversalItem) -> Result<(), TraversalItem> {
-        self.items.send(item).await.map_err(|error| error.0)
+        self.items.send_one(item).await
     }
 
     /// Closes the item stream and publishes its mandatory terminal evidence.
@@ -442,7 +446,7 @@ impl TraversalSession {
     /// Creates a bounded producer/session pair for a [`TraversalSource`] implementation.
     #[must_use]
     pub fn bounded(capacity: NonZeroUsize, cancel: CancellationToken) -> (TraversalProducer, Self) {
-        let (item_tx, item_rx) = mpsc::channel(capacity.get());
+        let (item_tx, item_rx) = channel::channel(capacity);
         let (completion_tx, completion_rx) = oneshot::channel();
         (
             TraversalProducer {
@@ -454,7 +458,7 @@ impl TraversalSession {
     }
 
     pub(crate) fn new(
-        items: mpsc::Receiver<TraversalItem>,
+        items: channel::ItemReceiver,
         completion: oneshot::Receiver<Result<TraversalOutcome, TraversalTerminalFailure>>,
         cancel: CancellationToken,
     ) -> Self {
@@ -472,7 +476,6 @@ impl TraversalSession {
             biased;
             () = self.cancel.cancelled() => {
                 self.items.close();
-                while self.items.try_recv().is_ok() {}
                 None
             }
             item = self.items.recv() => item,
