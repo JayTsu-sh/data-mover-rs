@@ -881,6 +881,9 @@ C7b fix(nfs): v3 READDIRPLUS 列出、却不给属性与句柄的 `.snapshot`（
 P1–P5  S3 URL 参数化（§14.2）—— F5 合入后，可与 C7 并行
 N0     NAS 桶实测（curl，§14.2）—— 立即
 N1–N7  `compat=ontap&bucket_type=nas` 的 NAS 桶 profile（§14.2）—— H1、C7 之后
+F5h fix(s3): 目录对象的单 PUT 改为流式（Content-Length = 源大小、UNSIGNED-PAYLOAD、边传边算 MD5 与回复 ETag 核对），不再整对象缓冲
+    在内存里（F5g 现状：流式来源的 `d/` 整个读进内存再 PUT，最坏每个在途传输 5 GiB）。复用 N 阶段的流式单 PUT 原语：该原语先做成
+    通用 S3 能力（不绑 NAS profile），F5h 与 NAS profile 共用；五套 S3 真机逐一确认接受 UNSIGNED-PAYLOAD 的流式单 PUT
 C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:4610-4691   —— 已完成：cdcc66d（搬移）、7da78ce
     + 子目录句柄作为下钻提示随工作项下传，列举不再写 GLOBAL_CACHE，无提示 / 失效回退 lookup_fh（§12.7 修法 A）
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
