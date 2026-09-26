@@ -42,8 +42,13 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
   `{scheme}://{bucket}.{host}[:port]`，协议 / 端口 / `tls_verify` 跟随 S3 URL；`hcp-ns-auth` cookie 在 `s3://` 下明文。
 - `compat=ontap` — ONTAP：**不改任何线上请求**（对象桶的怪癖都已通用处理：F4、F6、空末页、CommonPrefix 计入
   max-keys、不回显 Delimiter）；原生拷贝亲和标签 `ontap`（与同端点的标准 URL 之间走流式）；承载 `bucket_type=nas`。
-- `bucket_type=nas` — ONTAP NAS 桶 profile（N1–N7）。**尚未实现**：URL 能解析，连接（legacy 与 role）在任何 I/O 之前报
-  `UnsupportedType`。
+- `bucket_type=nas` — ONTAP NAS 桶 profile（P7 §14.2，N1–N7 实施中）。能力开关 `S3BucketCapabilities`
+  （`storage/backends/s3/capabilities.rs`，由 `s3/architecture.rs::bucket_capabilities` 按 `bucket_type` 定；`compat` 只改请求、
+  不改能力）。N1：连接不再拒绝（桶若回版本状态只告警）；作源端无条件读 —— 不发 `If-Match`，每段响应的 `ETag`、
+  `Content-Range` 总长、`Last-Modified` 必须等于描述时的，body 短于宣称长度按“已被替换”（`Conflict` / Permanent），读完
+  再 `HEAD` 一次（`role_protocol/unpinned.rs`、`source.rs::confirm_unchanged`）；无源端版本、namespace
+  `histories=false` / `directory_objects=false`；原生拷贝亲和 `ontap-nas` + 桶名（只与同一 NAS 桶配对）。
+  **legacy `StorageEnum` 不理会这个 profile**（决定 13，只写文档）：legacy 读不带条件、不核对，写 > 5 MiB 走分段遇 501。
 - 所有 profile（含标准 `s3://`）都为 multi-object delete 加 body-matching、SigV4-signed
   `Content-MD5`（`s3/delete_objects_md5.rs`，由 `s3.rs` 的 `configure_compatibility` 统一挂载）：SDK 默认只发
   `x-amz-checksum-crc32`，MinIO `RELEASE.2023-03-20`、Ceph RGW Octopus (DXN)、旧 StorageGRID 都回

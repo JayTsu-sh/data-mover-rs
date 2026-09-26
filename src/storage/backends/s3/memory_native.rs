@@ -45,7 +45,8 @@ impl MemoryS3 {
             .bytes_at(&source.key, source.version_id.as_deref())
             .await
             .map_err(|_| not_found())?;
-        if self.etag_for(&bytes) != source.etag || bytes.len() as u64 != source.size {
+        if self.object_etag(&source.key, &bytes) != source.etag || bytes.len() as u64 != source.size
+        {
             return Err(changed_source());
         }
         Ok(bytes)
@@ -63,9 +64,15 @@ impl MemoryS3 {
         let etag = self.etag_for(&bytes);
         let omit_version = *self.copy_omits_version.lock().await;
         let version = self
-            .store_written(to, bytes)
+            .store_written(to, bytes.clone())
             .await
             .filter(|_| !omit_version);
+        // A NAS bucket's copy reply carries the copy's own opaque `ETag`, as its HEAD does.
+        let etag = if self.is_nas() {
+            self.object_etag(to, &bytes)
+        } else {
+            etag
+        };
         *self.native_copies.lock().await += 1;
         if *self.copy_commits_then_fails.lock().await {
             return Err(lost_reply());

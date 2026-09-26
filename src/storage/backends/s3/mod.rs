@@ -1,5 +1,6 @@
 //! Standard S3 roles for the `ArchitectureReady` storage seam.
 
+mod capabilities;
 mod current;
 mod history;
 mod listing;
@@ -23,6 +24,7 @@ pub(crate) use protocol::{
     composite_etag, is_real_version_id,
 };
 
+pub(crate) use capabilities::S3BucketCapabilities;
 pub(crate) use history::{KeyHistory, ListedFacts, key_histories, warn_inferred};
 pub(crate) use metadata::S3TagSupport;
 pub(crate) use native::S3NativeContext;

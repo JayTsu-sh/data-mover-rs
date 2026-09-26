@@ -694,13 +694,6 @@ impl S3Storage {
             authority,
             options,
         } = parse_s3_url(url)?;
-        if options.bucket_type == S3BucketType::Nas {
-            return Err(StorageError::UnsupportedType(
-                "S3 bucket_type=nas (the ONTAP NAS bucket profile) is not implemented yet"
-                    .to_string(),
-            ));
-        }
-
         let region = "us-east-1"; // MinIO 默认区域
 
         // 凭据一个字符都不记（R8）：AK 与 SK 都不写，连 SK 的长度也不写。
@@ -776,6 +769,17 @@ impl S3Storage {
         // 检查桶是否启用了版本控制
         let versioning =
             Self::detect_bucket_versioning(&client, &bucket_name, &endpoint, options).await?;
+        if options.bucket_type == S3BucketType::Nas && versioning.is_some() {
+            // An ONTAP NAS bucket answers GetBucketVersioning with 501; one that reports a state
+            // (Enabled / Suspended) is an object bucket — one never versioned reports none and goes
+            // unnoticed. The URL's choice still holds (P7 §14.2, decision 11): the NAS profile only
+            // weakens the guarantees.
+            warn!(
+                "S3 bucket {bucket_name} is marked bucket_type=nas but reports a versioning state: \
+                 it is probably an object bucket; the NAS profile (weaker guarantees: unpinned \
+                 reads, no source versions) applies anyway"
+            );
+        }
         let is_bucket_versioned = versioning == Some(BucketVersioningStatus::Enabled);
         let versioning_suspended = versioning == Some(BucketVersioningStatus::Suspended);
 

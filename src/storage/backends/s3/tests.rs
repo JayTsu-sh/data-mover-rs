@@ -27,6 +27,8 @@ use crate::storage::{
     FinalDestination, MetadataMutation, PrepareRequest, PublishRequest, ReadRequest, VerifyRequest,
 };
 
+use memory_nas::NasRefused;
+
 pub(super) type UploadParts = HashMap<String, (String, Vec<(i32, Bytes)>)>;
 /// MD5s by (address, length) of a body, each with a clone that keeps the body allocated.
 type Md5Cache = HashMap<(usize, usize), (Bytes, [u8; 16])>;
@@ -115,6 +117,8 @@ pub(crate) struct MemoryS3 {
     bucket: std::sync::Mutex<memory_versions::VersionedBucket>,
     /// Paging and failures of delimiter listings (ADR-0006 C22): see [`memory_listing`].
     listing: std::sync::Mutex<memory_listing::ListingKnobs>,
+    /// The ONTAP NAS bucket mode (P7 §14.2): see [`memory_nas`].
+    nas: std::sync::Mutex<memory_nas::NasBucket>,
 }
 
 /// The `ETag` S3 reports for an object written by one `PutObject`: the quoted hex MD5 of its body.
@@ -217,6 +221,7 @@ impl MemoryS3 {
     }
 
     async fn store_written(&self, key: &str, bytes: Bytes) -> Option<String> {
+        self.nas_written(key, bytes.len());
         if let Some(id) = self.versioned_store(key, &bytes).await {
             return Some(id);
         }
@@ -327,7 +332,11 @@ impl S3Protocol for MemoryS3 {
     fn versioning_enabled(&self) -> bool {
         self.versioning_is_enabled()
     }
+    fn bucket_capabilities(&self) -> S3BucketCapabilities {
+        self.capabilities()
+    }
     async fn head(&self, key: &str) -> S3Result<S3ObjectFacts> {
+        self.nas_head_served();
         if let Some((failed_key, failure)) = &*self.head_failure.lock().await
             && failed_key == key
         {
@@ -346,7 +355,7 @@ impl S3Protocol for MemoryS3 {
         })?;
         Ok(S3ObjectFacts {
             size: bytes.len() as u64,
-            etag: self.etag_for(bytes),
+            etag: self.object_etag(key, bytes),
             version_id: self.version.lock().await.clone(),
             last_modified: *self.last_modified.lock().await,
         })
@@ -383,7 +392,9 @@ impl S3Protocol for MemoryS3 {
     ) -> S3Result<Bytes> {
         self.range_observations.lock().await.push(observed.clone());
         let bytes = self.bytes_at(key, observed.version_id.as_deref()).await?;
-        if observed.etag != self.etag_for(&bytes) {
+        // Pinned by `If-Match` on an object bucket; checked after the fact in NAS mode, as the
+        // real protocol checks the response `ETag`: either way another object is a `Conflict`.
+        if observed.etag != self.object_etag(key, &bytes) {
             return Err(S3ProtocolFailure::entry(
                 crate::model::FailureClass::Conflict,
                 crate::model::Transience::Permanent,
@@ -404,6 +415,7 @@ impl S3Protocol for MemoryS3 {
                 "range too large",
             )
         })?;
+        self.nas_range_served(key).await?;
         Ok(bytes.slice(start..end))
     }
     async fn put_object(
@@ -443,6 +455,7 @@ impl S3Protocol for MemoryS3 {
     }
     async fn begin_multipart(&self, key: &str) -> S3Result<String> {
         *self.multipart_begins.lock().await += 1;
+        self.nas_refusal(NasRefused::NotImplemented)?;
         let id = format!("upload-{}", self.next_id().await);
         self.uploads
             .lock()
@@ -556,6 +569,7 @@ impl S3Protocol for MemoryS3 {
             .ok_or_else(|| missing_upload("S3 AbortMultipartUpload request failed"))
     }
     async fn list_parts(&self, _key: &str, id: &str) -> S3Result<Vec<S3PartFacts>> {
+        self.nas_refusal(NasRefused::Denied)?;
         let id = bare_upload_id(id);
         let id = id.as_str();
         Ok(self
@@ -580,6 +594,7 @@ impl S3Protocol for MemoryS3 {
             .collect())
     }
     async fn list_uploads(&self, key: &str) -> S3Result<Vec<String>> {
+        self.nas_refusal(NasRefused::Denied)?;
         let mut ids: Vec<String> = self
             .uploads
             .lock()
@@ -606,6 +621,11 @@ impl S3Protocol for MemoryS3 {
             .await
     }
     async fn bucket_versioning(&self) -> S3Result<S3BucketVersioning> {
+        // A NAS bucket answers 501, which the real protocol reads as versioning off.
+        if self.is_nas() {
+            self.nas().versioning_requests += 1;
+            return Ok(S3BucketVersioning::Off);
+        }
         Ok(self.bucket_versioning_now())
     }
 
@@ -627,6 +647,7 @@ impl S3Protocol for MemoryS3 {
     }
     async fn list_versions(&self, key: &str) -> S3Result<Vec<S3VersionFacts>> {
         *self.version_lists.lock().await += 1;
+        self.nas_refusal(NasRefused::NotImplemented)?;
         self.versions_of(key).await
     }
     async fn list_objects_page(&self, prefix: &str, token: Option<&str>) -> S3Result<S3ObjectPage> {
@@ -637,6 +658,7 @@ impl S3Protocol for MemoryS3 {
         prefix: &str,
         marker: Option<&S3VersionMarker>,
     ) -> S3Result<S3VersionPage> {
+        self.nas_refusal(NasRefused::NotImplemented)?;
         self.list_versions_page_in_memory(prefix, marker).await
     }
     async fn get_tags(&self, key: &str, version_id: Option<&str>) -> S3Result<Vec<ObjectTag>> {
@@ -703,8 +725,12 @@ mod memory_native;
 #[path = "memory_listing.rs"]
 mod memory_listing;
 
+#[path = "memory_nas.rs"]
+mod memory_nas;
 #[path = "memory_versions.rs"]
 mod memory_versions;
+#[path = "nas_source_tests.rs"]
+mod nas_source_tests;
 pub(crate) use memory_versions::Versioning;
 
 #[path = "role_tests.rs"]

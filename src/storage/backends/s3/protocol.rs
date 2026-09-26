@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use md5::{Digest as _, Md5};
 
+use super::S3BucketCapabilities;
 use crate::model::{FailureClass, ObjectTag, StorageTimestamp, Transience};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,10 +272,19 @@ pub(crate) trait S3Protocol: Send + Sync {
     /// answered `Enabled`; HCP always). A write there whose reply names no version is settled
     /// through the key's versions (ADR-0006 C18: DXN's `CopyObject` sends no `x-amz-version-id`).
     fn versioning_enabled(&self) -> bool;
+    /// What the bucket can do, from the URL's profile (P7 §14.2); fixed for the connection.
+    fn bucket_capabilities(&self) -> S3BucketCapabilities;
     async fn head(&self, key: &str) -> S3Result<S3ObjectFacts>;
     /// HEAD one stored version. A delete marker, or a version the store does not have, is a
     /// `NotFound` entry failure — a per-entry outcome, never a session failure.
     async fn head_version(&self, key: &str, version_id: &str) -> S3Result<S3ObjectFacts>;
+    /// The bytes `range` of the object `observed` describes. Pinned by the store where the bucket
+    /// has conditional reads (`?versionId=` when `observed` names a version, `If-Match` on its
+    /// `ETag`: a replaced object answers 412, a permanent `Conflict`). Without them no condition is
+    /// sent and the response is checked instead: its `ETag` must be `observed.etag`, its
+    /// `Content-Range` total `observed.size`, its `Last-Modified` `observed.last_modified` when both
+    /// have one, and its body as long as it announced — any difference is a permanent `Conflict`
+    /// (an ONTAP NAS bucket cuts a GET short once a replacement commits, P7 §14.2 N0).
     async fn get_range(
         &self,
         key: &str,

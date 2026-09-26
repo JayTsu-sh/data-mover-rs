@@ -78,6 +78,11 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         &self,
         path: &StoragePath,
     ) -> Result<bool, StorageRoleFailure> {
+        // A bucket without versions (an ONTAP NAS bucket, P7 §14.2) keeps no records: nothing to
+        // ask.
+        if !self.protocol.bucket_capabilities().versions {
+            return Ok(false);
+        }
         let versioning = self
             .protocol
             .bucket_versioning()

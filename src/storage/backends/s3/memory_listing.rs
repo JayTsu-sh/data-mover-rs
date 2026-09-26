@@ -306,7 +306,7 @@ impl MemoryS3 {
             let bytes: Bytes = objects.get(&key).cloned().unwrap_or_default();
             elements.push(Element::Object(S3ListedObject {
                 size: bytes.len() as u64,
-                etag: self.etag_for(&bytes),
+                etag: self.object_etag(&key, &bytes),
                 key,
                 last_modified,
             }));

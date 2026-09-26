@@ -8,7 +8,10 @@ use crate::model::{
     SourceIdentity, SourceVersion, StoragePath, Transience,
 };
 use crate::storage::ListingFacts;
-use crate::storage::{ByteStream, ReadRequest, ReadSource, SourceDescriptor, StorageRoleFailure};
+use crate::storage::{
+    ByteStream, ReadRequest, ReadSource, SourceDescriptor, SourceQosBudget, StorageRoleFailure,
+};
+use tokio_util::sync::CancellationToken;
 
 use super::{S3ObjectFacts, S3Protocol, S3ProtocolFailure, is_real_version_id};
 
@@ -64,11 +67,27 @@ impl<P: S3Protocol + 'static> S3ReadSource<P> {
         version: &SourceVersion,
         operation: Operation,
     ) -> Result<S3ObjectFacts, StorageRoleFailure> {
-        match version.version_id() {
+        let versions = self.protocol.bucket_capabilities().versions;
+        let mut facts = match version.version_id() {
             None => self.protocol.head(path.as_str()).await,
+            Some(_) if !versions => {
+                return Err(classified_entry(
+                    path,
+                    operation,
+                    FailureClass::Unsupported,
+                    Transience::Permanent,
+                    "this S3 bucket keeps no versions to select (bucket_type=nas)",
+                ));
+            }
             Some(version) => self.protocol.head_version(path.as_str(), version).await,
         }
-        .map_err(|e| role_failure(path, operation, e))
+        .map_err(|e| role_failure(path, operation, e))?;
+        if !versions {
+            // A bucket without versions pins nothing by version, even one whose HEAD names one (a
+            // versioned object bucket marked `bucket_type=nas`): the `ETag` identifies the object.
+            facts.version_id = None;
+        }
+        Ok(facts)
     }
 }
 
@@ -135,8 +154,9 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
         self.describe_version(path, &SourceVersion::Current).await
     }
 
+    /// A bucket with stored versions (not an ONTAP NAS bucket, P7 §14.2).
     fn supports_source_versions(&self) -> bool {
-        true
+        self.protocol.bucket_capabilities().versions
     }
 
     /// Describes one version, pinning it for every later read: `Current` becomes the real version
@@ -229,57 +249,118 @@ impl<P: S3Protocol + 'static> ReadSource for S3ReadSource<P> {
         if requested.start > requested.end || requested.end > facts.size {
             return Err(entry(&request.path, Operation::Read, "invalid S3 range"));
         }
-        let protocol = self.protocol.clone();
-        let path = request.path;
-        let chunk_size = self.chunk_size.min(request.maximum_chunk_bytes as u64);
-        let cancel = request.cancel;
-        let qos = request.source_qos;
-        let state = (
-            protocol,
-            path,
-            requested.start,
-            requested.end,
-            chunk_size,
-            cancel,
-            qos,
+        // Without conditional reads nothing pins the ranges to the described object: each
+        // response is checked against it, and one more HEAD after the last range closes the window
+        // at the tail of the last response (P7 §14.2, decision 7).
+        let confirm = !self.protocol.bucket_capabilities().conditional_reads
+            && requested.start < requested.end;
+        let state = ReadState {
+            protocol: self.protocol.clone(),
+            path: request.path,
+            offset: requested.start,
+            limit: requested.end,
+            chunk_size: self.chunk_size.min(request.maximum_chunk_bytes as u64),
+            cancel: request.cancel,
+            qos: request.source_qos,
             facts,
-        );
-        Ok(Box::pin(futures::stream::try_unfold(
-            state,
-            |(protocol, path, offset, limit, chunk_size, cancel, qos, facts)| async move {
-                if offset == limit {
-                    return Ok(None);
-                }
-                if cancel.is_cancelled() {
-                    return Err(cancelled(&path, Operation::Read));
-                }
-                let requested = (offset + chunk_size).min(limit) - offset;
-                let granted = if let Some(budget) = &qos {
-                    budget
-                        .admit_read(requested, &cancel)
-                        .await
-                        .map_err(|_| cancelled(&path, Operation::Read))?
-                } else {
-                    requested
-                };
-                let end = offset + granted;
-                let bytes = protocol
-                    .get_range(path.as_str(), offset..end, &facts)
-                    .await
-                    .map_err(|e| role_failure(&path, Operation::Read, e))?;
-                if bytes.len() as u64 != end - offset {
-                    return Err(entry(&path, Operation::Read, "short S3 range response"));
-                }
-                if let Some(budget) = &qos {
-                    budget.record_read_bytes(bytes.len() as u64);
-                }
-                Ok(Some((
-                    bytes,
-                    (protocol, path, end, limit, chunk_size, cancel, qos, facts),
-                )))
-            },
-        )))
+            confirm,
+        };
+        Ok(Box::pin(futures::stream::try_unfold(state, |state| {
+            next_range(state)
+        })))
     }
+}
+
+/// Where a streamed read stands.
+struct ReadState<P> {
+    protocol: Arc<P>,
+    path: StoragePath,
+    offset: u64,
+    limit: u64,
+    chunk_size: u64,
+    cancel: CancellationToken,
+    qos: Option<SourceQosBudget>,
+    facts: S3ObjectFacts,
+    /// Confirm with a HEAD, once the last range is read, that the object is still the described
+    /// one (a bucket without conditional reads).
+    confirm: bool,
+}
+
+/// The next range of a streamed read, or its end.
+async fn next_range<P: S3Protocol>(
+    mut state: ReadState<P>,
+) -> Result<Option<(Bytes, ReadState<P>)>, StorageRoleFailure> {
+    let path = &state.path;
+    if state.offset == state.limit {
+        if state.confirm {
+            confirm_unchanged(&*state.protocol, path, &state.facts).await?;
+        }
+        return Ok(None);
+    }
+    if state.cancel.is_cancelled() {
+        return Err(cancelled(path, Operation::Read));
+    }
+    let requested = (state.offset + state.chunk_size).min(state.limit) - state.offset;
+    let granted = if let Some(budget) = &state.qos {
+        budget
+            .admit_read(requested, &state.cancel)
+            .await
+            .map_err(|_| cancelled(path, Operation::Read))?
+    } else {
+        requested
+    };
+    let end = state.offset + granted;
+    let bytes = state
+        .protocol
+        .get_range(path.as_str(), state.offset..end, &state.facts)
+        .await
+        .map_err(|e| role_failure(path, Operation::Read, e))?;
+    if bytes.len() as u64 != end - state.offset {
+        return Err(entry(path, Operation::Read, "short S3 range response"));
+    }
+    if let Some(budget) = &state.qos {
+        budget.record_read_bytes(bytes.len() as u64);
+    }
+    state.offset = end;
+    Ok(Some((bytes, state)))
+}
+
+/// After the last range of an unpinned read: the object must still be the one described — same
+/// `ETag`, size and (when both have one) `Last-Modified` — or the read is a permanent `Conflict`,
+/// as a 412 would have made it where reads are pinned.
+async fn confirm_unchanged<P: S3Protocol>(
+    protocol: &P,
+    path: &StoragePath,
+    described: &S3ObjectFacts,
+) -> Result<(), StorageRoleFailure> {
+    let changed = || {
+        classified_entry(
+            path,
+            Operation::Read,
+            FailureClass::Conflict,
+            Transience::Permanent,
+            "S3 source changed during read",
+        )
+    };
+    let current = match protocol.head(path.as_str()).await {
+        Ok(current) => current,
+        Err(S3ProtocolFailure::Entry {
+            class: FailureClass::NotFound,
+            ..
+        }) => return Err(changed()),
+        Err(failure) => return Err(role_failure(path, Operation::Read, failure)),
+    };
+    let modified = matches!(
+        (current.last_modified, described.last_modified),
+        (Some(now), Some(then)) if now != then
+    );
+    if current.etag.trim_matches('"') != described.etag.trim_matches('"')
+        || current.size != described.size
+        || modified
+    {
+        return Err(changed());
+    }
+    Ok(())
 }
 
 #[allow(clippy::expect_used)]

@@ -98,6 +98,7 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | 按 versionId 删除一个不存在的版本 | 成功（S3 / MinIO 回 204），不是错误 |
 | 按 versionId 的 DeleteObject 回 405（存储不支持按版本删） | 条目 `Unsupported` / Permanent —— **不是**带版本读的「删除标记」`NotFound`（清理会把它当成已删）；删指针时降级为普通删除 + 告警 |
 | describe 之后对象被替换（`read` / native bind / `observe_bound`） | 条目 `Conflict` / Permanent |
+| **无条件读的桶**（`bucket_type=nas`，ONTAP NAS 桶，P7 §14.2 N1；`role_protocol/unpinned.rs`）：范围 GET 的响应 `ETag` 不等于描述时的、`Content-Range` 总长不等于描述时的大小、`Last-Modified` 不同（两边都有时）、缺 `ETag`；body 短于宣称长度**或读 body 途中出错**；读完后的 `HEAD` 看到别的 `ETag` / 大小 / `Last-Modified`，或对象已不在（`source.rs::confirm_unchanged`） | 条目 `Conflict` / Permanent（同 412）。body 出错按“已被替换”判是 N0 的决定：替换提交后 0.3–0.7 s 服务器断开进行中的 GET，收到的是旧内容的干净前缀；**代价**：同样被切断的普通断连也报成 `Conflict`、不重试（诊断里带原始错误）。对象桶上读 body 出错仍是会话 `Connectivity` / Transient（不变） |
 | `compat=hcp` 读标签走 HCP REST `BPM` 注解（`role_protocol/hcp_tags.rs`，P7 P4）：404 / 204 / 空回复 | 无标签（不分“没有注解”与“没有对象 / 版本”） |
 | 同上：其他状态（HCP 不给错误码，只按状态分类；带 `version=` 的 400 除外） | 通用映射（403 → 条目 `PermissionDenied`，429 / 503 → 会话 `Throttled`，5xx → 会话 `Connectivity` …） |
 | 同上：带 `version=` 的 400（HCP 不认按版本读注解，未在真机验证） | 条目 `Unsupported` / Permanent |

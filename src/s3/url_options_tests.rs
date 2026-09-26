@@ -6,6 +6,7 @@ use super::url_options::{S3BucketType, S3Compatibility, S3UrlOptions, S3UrlTarge
 use super::{ParsedS3Url, S3Storage, endpoint_identity, parse_s3_endpoint_url, parse_s3_url};
 use crate::AssertTestValue;
 use crate::error::StorageError;
+use crate::storage::backends::s3::{S3BucketCapabilities, S3Protocol as _};
 
 const AK: &str = "AKIDOPTIONS7Q";
 const SK: &str = "sEcReT/opt+ions=Zq?x";
@@ -318,17 +319,21 @@ fn options_are_not_part_of_the_endpoint_identity() {
     ));
 }
 
-/// `bucket_type=nas` parses (so the NAS profile only adds behaviour), but connecting refuses it
-/// before any request until that profile exists.
+/// `bucket_type=nas` connects (P7 N1) and gives the roles an ONTAP NAS bucket's switches; the same
+/// endpoint under `compat=ontap` alone is an object bucket. Nothing listens on port 1: the
+/// connection's versioning probe fails and is only logged.
 #[tokio::test]
-async fn a_nas_bucket_is_refused_at_connect_until_its_profile_exists() {
+async fn a_nas_url_connects_with_the_nas_bucket_capabilities() {
     let nas = format!("s3://{AK}:{SK}@bucket.127.0.0.1:1/p?compat=ontap&bucket_type=nas");
-    let refused = S3Storage::new(&nas, None).await;
-    assert!(
-        matches!(refused, Err(StorageError::UnsupportedType(ref message)) if message.contains("bucket_type=nas")),
-        "{:?}",
-        refused.err()
-    );
+    let storage = S3Storage::new(&nas, None)
+        .await
+        .assert_value("a NAS URL connects");
+    assert_eq!(storage.bucket_capabilities(), S3BucketCapabilities::NAS);
+    let object = format!("s3://{AK}:{SK}@bucket.127.0.0.1:1/p?compat=ontap");
+    let storage = S3Storage::new(&object, None)
+        .await
+        .assert_value("an object URL connects");
+    assert_eq!(storage.bucket_capabilities(), S3BucketCapabilities::OBJECT);
 }
 
 /// The last `@` ends the credentials; a URL without a host is a URL error; `tls_verify` needs

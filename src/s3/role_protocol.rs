@@ -1,4 +1,5 @@
 use super::{CompletedPart, ProvideErrorMetadata, S3Compatibility, S3Storage, build_copy_source};
+use aws_smithy_types::byte_stream::AggregatedBytes;
 use bytes::Bytes;
 
 use crate::model::{FailureClass, Transience};
@@ -37,6 +38,9 @@ mod multipart;
 mod native;
 #[cfg(test)]
 mod throttling_tests;
+mod unpinned;
+#[cfg(test)]
+mod unpinned_wire_tests;
 mod versions;
 #[cfg(test)]
 mod write_facts_tests;
@@ -162,6 +166,10 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         self.is_bucket_versioned
     }
 
+    fn bucket_capabilities(&self) -> crate::storage::backends::s3::S3BucketCapabilities {
+        super::architecture::bucket_capabilities(self.options)
+    }
+
     async fn head(
         &self,
         key: &str,
@@ -186,6 +194,7 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         if range.start == range.end {
             return Ok(Bytes::new());
         }
+        let pinned = self.bucket_capabilities().conditional_reads;
         let response = self
             .client
             .get_object()
@@ -193,7 +202,7 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
             .key(self.build_full_key(key))
             .range(format!("bytes={}-{}", range.start, range.end - 1))
             .set_version_id(observed.version_id.clone())
-            .if_match(&observed.etag)
+            .set_if_match(pinned.then(|| observed.etag.clone()))
             .send()
             .await
             .map_err(|error| {
@@ -210,11 +219,14 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
                     failure
                 }
             })?;
+        if !pinned {
+            return unpinned::read(response, range.end - range.start, observed).await;
+        }
         response
             .body
             .collect()
             .await
-            .map(aws_smithy_types::byte_stream::AggregatedBytes::into_bytes)
+            .map(AggregatedBytes::into_bytes)
             .map_err(|error| s3_role_session(error.to_string()))
     }
 

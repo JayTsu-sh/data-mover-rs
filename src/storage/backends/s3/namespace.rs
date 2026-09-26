@@ -154,16 +154,18 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
         Err(failure(from, FailureClass::Unsupported, NO_MUTATIONS))
     }
 
-    /// `histories` is what [`Namespace::list_versions`] serves on any bucket until P7 C11b
-    /// narrows it to versioned buckets. Object stores keep content under keys ending in `/`
-    /// (`directory_objects`, P7 F5).
+    /// `histories` is what [`Namespace::list_versions`] serves on any bucket that keeps versions
+    /// until P7 C11b narrows it to versioned buckets. Object buckets keep content under keys
+    /// ending in `/` (`directory_objects`, P7 F5). An ONTAP NAS bucket keeps neither (P7 §14.2):
+    /// no versions, and a key ending in `/` holding content is stored as a file.
     fn capabilities(&self) -> NamespaceCapabilities {
+        let bucket = self.protocol.bucket_capabilities();
         NamespaceCapabilities {
-            histories: true,
+            histories: bucket.versions,
             mutations: Err(NO_MUTATIONS),
             symlinks: false,
             names: NameSemantics::EXACT,
-            directory_objects: true,
+            directory_objects: bucket.directory_objects,
         }
     }
 

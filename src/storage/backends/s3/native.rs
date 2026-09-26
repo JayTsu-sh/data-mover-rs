@@ -35,6 +35,26 @@ impl S3NativeContext {
         }
     }
 
+    /// A context that pairs only with storages of the same endpoint, label **and bucket**: a store
+    /// that copies only within one bucket (an ONTAP NAS bucket answers a `CopyObject` to or from
+    /// any other bucket with 501, P7 §14.2), so a copy between two buckets streams instead.
+    pub(crate) fn within_bucket(
+        endpoint: &str,
+        compatibility: &str,
+        bucket: String,
+        prefix: Option<String>,
+    ) -> Self {
+        Self {
+            affinity: NativeAffinity::derive(&[
+                endpoint.as_bytes(),
+                compatibility.as_bytes(),
+                bucket.as_bytes(),
+            ]),
+            bucket,
+            prefix,
+        }
+    }
+
     fn full_key(&self, path: &str) -> String {
         self.prefix.as_ref().map_or_else(
             || path.to_string(),
@@ -219,7 +239,7 @@ fn stage_failure(stage: &PreparedStage, diagnostic: &str) -> NativeStageFailure 
 
 #[cfg(test)]
 mod tests {
-    use super::{object_identity, validate_identity};
+    use super::{S3NativeContext, object_identity, validate_identity};
     use crate::model::{EntryKind, FailureClass, StoragePath, Transience};
     use crate::storage::backends::s3::S3ObjectFacts;
     use crate::storage::backends::s3::tests::identity;
@@ -255,5 +275,22 @@ mod tests {
         assert_eq!(failure.class(), FailureClass::Conflict);
         assert_eq!(failure.transience(), Transience::Permanent);
         Ok(())
+    }
+
+    /// A context kept within its bucket pairs only with the same bucket of the same endpoint and
+    /// label; an ordinary one pairs across buckets.
+    #[test]
+    fn a_bucket_scoped_context_pairs_only_within_its_bucket() {
+        let scoped = |bucket: &str| {
+            S3NativeContext::within_bucket("http://ontap", "ontap-nas", bucket.into(), None)
+                .affinity
+        };
+        let open = |bucket: &str| {
+            S3NativeContext::new("http://ontap", "ontap-nas", bucket.into(), None).affinity
+        };
+        assert_eq!(scoped("nas"), scoped("nas"));
+        assert_ne!(scoped("nas"), scoped("other-nas"));
+        assert_eq!(open("nas"), open("other-nas"));
+        assert_ne!(scoped("nas"), open("nas"));
     }
 }

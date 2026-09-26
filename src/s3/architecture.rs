@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use super::{S3Compatibility, S3Storage};
+use super::{S3BucketType, S3Compatibility, S3Storage, S3UrlOptions};
 use crate::model::BackendIdentity;
 use crate::storage::Storage;
 pub(super) use crate::storage::backends::s3::DEFAULT_SINGLE_PUT_THRESHOLD;
-use crate::storage::backends::s3::{S3NativeContext, S3TagSupport};
+use crate::storage::backends::s3::{S3BucketCapabilities, S3NativeContext, S3TagSupport};
 use crate::storage::endpoint::{self, EndpointError};
 
 /// The canonical endpoint of an S3 storage, from the same parts the backend addresses: its
@@ -33,13 +33,15 @@ pub(super) fn connect(
         storage.prefix.as_deref().unwrap_or_default(),
     )?;
     let compat = storage.options.compat;
-    let native = native_label(compat).map(|label| {
-        S3NativeContext::new(
-            &storage.endpoint,
-            label,
-            storage.bucket_name.clone(),
-            storage.prefix.clone(),
-        )
+    let capabilities = bucket_capabilities(storage.options);
+    let native = native_label(storage.options).map(|label| {
+        let bucket = storage.bucket_name.clone();
+        let prefix = storage.prefix.clone();
+        if capabilities.native_same_bucket_only {
+            S3NativeContext::within_bucket(&storage.endpoint, label, bucket, prefix)
+        } else {
+            S3NativeContext::new(&storage.endpoint, label, bucket, prefix)
+        }
     });
     crate::storage::backends::s3::connect_configured(
         Arc::new(storage.clone()),
@@ -56,31 +58,56 @@ pub(super) fn connect(
     )
 }
 
+/// What the bucket a URL names can do (P7 §14.2): only `bucket_type` changes it — `compat` changes
+/// requests, never capabilities.
+pub(super) const fn bucket_capabilities(options: S3UrlOptions) -> S3BucketCapabilities {
+    match options.bucket_type {
+        S3BucketType::Object => S3BucketCapabilities::OBJECT,
+        S3BucketType::Nas => S3BucketCapabilities::NAS,
+    }
+}
+
 /// The native-copy affinity label of a profile: two storages copy natively only on the same
 /// endpoint under the same label. `StorageGRID` never copies natively; HCP keeps the standard
 /// label (its `CopyObject` is standard S3); ONTAP has its own, so a copy between a `compat=ontap`
-/// URL and a standard URL of the same endpoint streams.
-fn native_label(compat: S3Compatibility) -> Option<&'static str> {
-    match compat {
-        S3Compatibility::Standard | S3Compatibility::Hcp => Some("standard"),
-        S3Compatibility::Dxn => Some("dxn"),
-        S3Compatibility::Ontap => Some("ontap"),
-        S3Compatibility::StorageGrid => None,
+/// URL and a standard URL of the same endpoint streams, and an ONTAP NAS bucket another one (with
+/// its bucket, see [`S3NativeContext::within_bucket`]), so it never pairs with an object bucket.
+fn native_label(options: S3UrlOptions) -> Option<&'static str> {
+    match (options.compat, options.bucket_type) {
+        (S3Compatibility::Ontap, S3BucketType::Nas) => Some("ontap-nas"),
+        (S3Compatibility::Standard | S3Compatibility::Hcp, _) => Some("standard"),
+        (S3Compatibility::Dxn, _) => Some("dxn"),
+        (S3Compatibility::Ontap, _) => Some("ontap"),
+        (S3Compatibility::StorageGrid, _) => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{S3Compatibility, native_label};
+    use super::{S3BucketType, S3Compatibility, S3UrlOptions, native_label};
+
+    fn options(compat: S3Compatibility, bucket_type: S3BucketType) -> S3UrlOptions {
+        S3UrlOptions {
+            compat,
+            bucket_type,
+            ..S3UrlOptions::default()
+        }
+    }
 
     /// Native copies pair only under one label: `compat=ontap` and a standard URL of the same
-    /// endpoint stream, HCP pairs with standard, `StorageGRID` never copies natively.
+    /// endpoint stream, HCP pairs with standard, `StorageGRID` never copies natively, and an
+    /// ONTAP NAS bucket has a label of its own.
     #[test]
     fn native_labels() {
-        assert_eq!(native_label(S3Compatibility::Standard), Some("standard"));
-        assert_eq!(native_label(S3Compatibility::Hcp), Some("standard"));
-        assert_eq!(native_label(S3Compatibility::Dxn), Some("dxn"));
-        assert_eq!(native_label(S3Compatibility::Ontap), Some("ontap"));
-        assert_eq!(native_label(S3Compatibility::StorageGrid), None);
+        let object = |compat| native_label(options(compat, S3BucketType::Object));
+        assert_eq!(object(S3Compatibility::Standard), Some("standard"));
+        assert_eq!(object(S3Compatibility::Hcp), Some("standard"));
+        assert_eq!(object(S3Compatibility::Dxn), Some("dxn"));
+        assert_eq!(object(S3Compatibility::Ontap), Some("ontap"));
+        assert_eq!(object(S3Compatibility::StorageGrid), None);
+        assert_eq!(
+            native_label(options(S3Compatibility::Ontap, S3BucketType::Nas)),
+            Some("ontap-nas")
+        );
     }
 }
