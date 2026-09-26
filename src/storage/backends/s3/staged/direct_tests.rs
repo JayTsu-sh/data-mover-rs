@@ -400,8 +400,8 @@ fn only_the_multipart_etag_form_is_compared() {
     assert!(!is_composite("\"abc-x1\""));
 }
 
-#[test]
-fn the_default_threshold_is_where_direct_switches_to_multipart() -> TestResult {
+#[tokio::test]
+async fn the_default_threshold_is_where_direct_switches_to_multipart() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let destination = destination(&protocol);
     for (size, single) in [
@@ -409,8 +409,9 @@ fn the_default_threshold_is_where_direct_switches_to_multipart() -> TestResult {
         (Some(DEFAULT_SINGLE_PUT_THRESHOLD + 1), false),
         (None, false),
     ] {
-        let stage =
-            destination.prepare_direct_stage(prepare_request(size)?, &CancellationToken::new())?;
+        let stage = destination
+            .prepare_direct_stage(prepare_request(size)?, &CancellationToken::new())
+            .await?;
         assert_eq!(single::of(&stage).is_some(), single, "{size:?}");
         assert_eq!(upload_of(&stage).is_some(), !single, "{size:?}");
     }

@@ -20,6 +20,7 @@ use super::super::{
     S3NativeCopySource, S3ObjectFacts, S3Protocol, S3ProtocolFailure, S3WriteFacts,
     is_real_version_id,
 };
+use super::settle::{Previous, Settling, settle_unknown_write};
 use super::{PART_SIZE, S3StagedDestination, directory_object, native_final};
 use crate::model::{FailureClass, ObjectTag, Operation, StoragePath, Transience};
 use crate::storage::{
@@ -74,6 +75,9 @@ pub(crate) fn single_put_threshold(
 /// One object on its way to a single `PutObject`.
 pub(super) struct SingleStage {
     expected_size: u64,
+    /// What prepare found at the final key, on a bucket whose `ETag`s cannot prove an object
+    /// ours ([`settle`](super::settle)).
+    previous: Option<Previous>,
     state: Mutex<SingleState>,
 }
 
@@ -186,8 +190,29 @@ impl<P: S3Protocol> S3StagedDestination<P> {
         })
     }
 
+    /// The size of a source written as one streamed `PutObject` (P7 §14.2): over the single-PUT
+    /// threshold on a bucket without multipart uploads (its size is known: an unknown one was
+    /// refused by the bucket's limits). `None` for any other.
+    pub(super) fn streamed_size(&self, size: Option<u64>) -> Option<u64> {
+        if self.protocol.bucket_capabilities().multipart {
+            return None;
+        }
+        match (size, self.single_put_threshold) {
+            (Some(size), Some(limit)) if size > limit => Some(size),
+            (Some(size), None) => Some(size),
+            _ => None,
+        }
+    }
+
     /// A fresh single stage: nothing is sent until publication, and nothing can be resumed.
-    pub(super) fn prepare_single(&self, request: PrepareRequest, size: u64) -> PreparedStage {
+    /// `previous` is what the final key held, where the bucket's `ETag`s cannot settle a lost
+    /// reply ([`Self::previous_object`]).
+    pub(super) fn prepare_single(
+        &self,
+        request: PrepareRequest,
+        size: u64,
+        previous: Option<Previous>,
+    ) -> PreparedStage {
         let token = Self::encode_token(request.final_destination.path().as_str(), SINGLE_MARKER);
         let mut stage = PreparedStage::new(
             self.identity.clone(),
@@ -199,6 +224,7 @@ impl<P: S3Protocol> S3StagedDestination<P> {
         );
         stage.backend_state = Some(Arc::new(SingleStage {
             expected_size: size,
+            previous,
             state: Mutex::new(SingleState::default()),
         }));
         stage.disable_recovery()
@@ -344,19 +370,7 @@ pub(super) async fn send<P: S3Protocol>(
         return native_final::send_copy(adapter, path, single, &source, expected_size).await;
     }
     let (body, tags) = single.content(path, expected_size)?;
-    let digest = Md5::digest(&body);
-    let quoted_md5 = format!("\"{digest:x}\"");
-    let facts = match adapter
-        .protocol
-        .put_object(path.as_str(), body, &BASE64_STANDARD.encode(digest))
-        .await
-    {
-        Ok(facts) => facts,
-        Err(failure) if definite_refusal(&failure) => {
-            return Err(unchanged(role_failure(path, Operation::Publish, failure)));
-        }
-        Err(failure) => reconcile(adapter, path, expected_size, &quoted_md5, failure).await?,
-    };
+    let facts = put(adapter, path, single, body, expected_size).await?;
     if let Some(tags) = tags {
         adapter
             .protocol
@@ -366,6 +380,40 @@ pub(super) async fn send<P: S3Protocol>(
     }
     single.record_published(facts.clone());
     Ok(facts)
+}
+
+/// One `PutObject` of `body` with `Content-MD5`; a failure that may have stored it is settled.
+async fn put<P: S3Protocol>(
+    adapter: &S3StagedDestination<P>,
+    path: &StoragePath,
+    single: &SingleStage,
+    body: Bytes,
+    expected_size: u64,
+) -> Result<S3WriteFacts, PublicationFailure> {
+    let digest = Md5::digest(&body);
+    let quoted_md5 = format!("\"{digest:x}\"");
+    let failure = match adapter
+        .protocol
+        .put_object(path.as_str(), body, &BASE64_STANDARD.encode(digest))
+        .await
+    {
+        Ok(facts) => return Ok(facts),
+        Err(failure) if definite_refusal(&failure) => {
+            return Err(unchanged(role_failure(path, Operation::Publish, failure)));
+        }
+        Err(failure) => failure,
+    };
+    let md5 = adapter
+        .protocol
+        .bucket_capabilities()
+        .md5_etags
+        .then_some(quoted_md5.as_str());
+    let settling = Settling {
+        size: expected_size,
+        previous: single.previous.as_ref(),
+        grace: adapter.settle_grace,
+    };
+    settle_unknown_write(&*adapter.protocol, path, &settling, md5, failure).await
 }
 
 /// A refusal the service answered before writing anything; every other failure (a lost or
@@ -383,23 +431,6 @@ pub(super) fn definite_refusal(failure: &S3ProtocolFailure) -> bool {
             | FailureClass::Conflict
             | FailureClass::Unsupported
     )
-}
-
-/// Settles a PUT whose reply was lost: the final object is ours when it has our size and our
-/// MD5 as its `ETag`.
-async fn reconcile<P: S3Protocol>(
-    adapter: &S3StagedDestination<P>,
-    path: &StoragePath,
-    expected_size: u64,
-    quoted_md5: &str,
-    put_failure: S3ProtocolFailure,
-) -> Result<S3WriteFacts, PublicationFailure> {
-    match adapter.protocol.head(path.as_str()).await {
-        Ok(facts) if facts.size == expected_size && same_etag(&facts.etag, quoted_md5) => {
-            Ok(S3WriteFacts::new(facts.etag, facts.version_id))
-        }
-        _ => Err(changed(role_failure(path, Operation::Publish, put_failure))),
-    }
 }
 
 /// Reads the published object back, pinned to what the PUT created (E1).

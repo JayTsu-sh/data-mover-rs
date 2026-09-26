@@ -1,12 +1,15 @@
 //! The S3 destination (ADR-0006): every stage writes the final key. Up to the single-PUT
 //! threshold an object is one `PutObject` (a native copy up to 64 MiB one `CopyObject`); a larger
 //! one is a multipart upload on the final key, resumable through the `.upload` pointer beside it;
-//! a `Direct` write completes inside `write`. A directory object (`p/d/`, P7 F5) is always one
+//! a `Direct` write completes inside `write`. On a bucket without multipart uploads (an ONTAP NAS
+//! bucket, P7 §14.2) an object over the threshold is one streamed `PutObject` holding its last
+//! byte until publication ([`streaming`]). A directory object (`p/d/`, P7 F5) is always one
 //! request, up to 5 GiB, never resumed ([`directory_object`], P7 D13). Nothing is recorded where
 //! data-mover runs, and no temp key is written (the `.data-mover-stage/` temp-key path was removed
 //! in C19).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -37,11 +40,13 @@ mod native_final;
 #[cfg(test)]
 mod native_final_tests;
 mod parts;
+mod settle;
 mod single;
 #[cfg(test)]
 mod single_tests;
 #[cfg(test)]
 mod sizing_tests;
+mod streaming;
 mod upload_discovery;
 mod upload_pointer;
 use super::{S3Protocol, S3ProtocolFailure};
@@ -90,6 +95,10 @@ pub(crate) struct S3StagedDestination<P> {
     checkpoint_interval: u64,
     /// How a native copy to the final key is split (ADR-0006 C18).
     native: NativeSizing,
+    /// How long a streamed `PutObject` holds its last byte for publication.
+    hold_limit: Duration,
+    /// How long settling a lost reply waits before trusting that the final key is unchanged.
+    settle_grace: Duration,
 }
 
 impl<P> S3StagedDestination<P> {
@@ -103,7 +112,18 @@ impl<P> S3StagedDestination<P> {
             // Named in full: the architecture guard refuses imports between backend modules.
             checkpoint_interval: crate::storage::backends::DEFAULT_CHECKPOINT_INTERVAL_BYTES,
             native: NativeSizing::default(),
+            hold_limit: streaming::HOLD_LIMIT,
+            settle_grace: settle::SETTLE_GRACE,
         }
+    }
+
+    /// A shorter hold limit for the last byte of a streamed `PutObject`, and settling grace, for
+    /// tests.
+    #[cfg(test)]
+    pub(crate) const fn with_hold_limit(mut self, limit: Duration, grace: Duration) -> Self {
+        self.hold_limit = limit;
+        self.settle_grace = grace;
+        self
     }
 
     /// Smaller native copy sizes, so engine tests need not copy 64 MiB objects.
@@ -252,7 +272,7 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         request: PrepareRequest,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<PreparedStage, StorageRoleFailure> {
-        self.prepare_direct_stage(request, &cancel)
+        self.prepare_direct_stage(request, &cancel).await
     }
 
     async fn write_single(
@@ -282,6 +302,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         if stage.direct {
             return self.write_direct(stage, input).await;
         }
+        if let Some(streamed) = streaming::of(stage) {
+            return streaming::write(self, stage, streamed, input).await;
+        }
         if let Some(single) = single::of(stage) {
             return single::write(stage, single, input).await;
         }
@@ -304,6 +327,11 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
                 durable_prefix: single.written_len(),
             });
         }
+        if let Some(streamed) = streaming::of(stage) {
+            return Ok(CheckpointObservation {
+                durable_prefix: streamed.written_len(),
+            });
+        }
         let upload = at_destination::of(stage).ok_or_else(|| foreign(stage, Operation::Prepare))?;
         self.observe_final_upload(stage, upload).await
     }
@@ -318,6 +346,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         }
         if let Some(single) = single::of(stage) {
             return single::verify(self, stage, single, &request).await;
+        }
+        if let Some(streamed) = streaming::of(stage) {
+            return streaming::verify(self, stage, streamed, &request).await;
         }
         let upload = at_destination::of(stage).ok_or_else(|| foreign(stage, Operation::Verify))?;
         self.verify_final_upload(stage, upload, &request).await
@@ -346,6 +377,18 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
             }
             return single::apply_metadata(stage, single, self.tags_supported, mutation, &cancel);
         }
+        if let Some(streamed) = streaming::of(stage) {
+            if self.metadata.is_none() {
+                return Err(metadata_unavailable(stage));
+            }
+            return streaming::apply_metadata(
+                stage,
+                streamed,
+                self.tags_supported,
+                mutation,
+                &cancel,
+            );
+        }
         let upload =
             at_destination::of(stage).ok_or_else(|| foreign(stage, Operation::Metadata))?;
         self.apply_final_upload_metadata(stage, upload, mutation, &cancel)
@@ -362,6 +405,9 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         if let Some(single) = single::of(stage) {
             return single::publish(self, stage, single, &request).await;
         }
+        if let Some(streamed) = streaming::of(stage) {
+            return streaming::publish(self, stage, streamed, &request).await;
+        }
         let upload = at_destination::of(stage).ok_or_else(|| PublicationFailure {
             error: foreign(stage, Operation::Publish),
             final_destination_changed: false,
@@ -376,6 +422,11 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         }
         if single::of(&stage).is_some() {
             // Nothing was sent before publication, and a published object is never deleted.
+            return Ok(());
+        }
+        if let Some(streamed) = streaming::of(&stage) {
+            // The request still holds its last byte: aborting it commits nothing.
+            streamed.abandon();
             return Ok(());
         }
         let upload =

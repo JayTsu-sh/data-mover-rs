@@ -174,7 +174,11 @@ async fn a_checkpointed_transfer_to_a_nas_bucket_reports_unsupported_by_destinat
         EffectiveRecovery::UnsupportedByDestination
     );
     assert_eq!(outcome.prepare, PrepareFact::Fresh);
-    assert_eq!(protocol.nas().heads, 0, "no pointer HEAD");
+    assert_eq!(
+        protocol.nas().heads,
+        1,
+        "one HEAD of the final key, none of a pointer"
+    );
     assert_eq!(*protocol.puts.lock().await, 1);
 
     protocol
@@ -235,5 +239,48 @@ async fn a_checkpointed_transfer_to_a_nas_bucket_reports_unsupported_by_destinat
     assert!(!session.recovery_enabled());
     assert_eq!(session.prepare_fact(), PrepareFact::Fresh);
     session.discard().await?;
+    Ok(())
+}
+
+/// Over the single-PUT threshold a NAS bucket gets one streamed `PutObject` under every policy —
+/// no multipart request — holding exactly the source's bytes; `Checkpointed` reports
+/// `UnsupportedByDestination`.
+#[tokio::test]
+async fn an_object_over_the_threshold_is_one_streamed_put() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let bytes: Vec<u8> = (0..=250_u8).cycle().take(8 * 1024 * 1024 + 1).collect();
+    fs::write(root.path().join("big"), &bytes)?;
+    for policy in [
+        TransferPolicy::Checkpointed,
+        TransferPolicy::AtomicReplace,
+        TransferPolicy::Direct,
+    ] {
+        let protocol = nas();
+        let (local, _) = test_source_storage(root.path(), "nas-streamed")?;
+        let outcome = transfer(
+            request(local, "big", bucket(&protocol)?, "dst/big")?
+                .with_transfer_policy(policy)
+                .with_read_back_verification(ReadBackVerification::Disabled),
+        )
+        .await?;
+        let expected = if policy == TransferPolicy::Checkpointed {
+            EffectiveRecovery::UnsupportedByDestination
+        } else {
+            EffectiveRecovery::Disabled
+        };
+        assert_eq!(outcome.recovery, expected, "{policy:?}");
+        assert_eq!(
+            protocol
+                .objects
+                .lock()
+                .await
+                .get("dst/big")
+                .map(Bytes::as_ref),
+            Some(bytes.as_slice()),
+            "{policy:?}"
+        );
+        assert_eq!(protocol.streaming().puts, 1, "{policy:?}");
+        assert_eq!(*protocol.multipart_begins.lock().await, 0, "{policy:?}");
+    }
     Ok(())
 }

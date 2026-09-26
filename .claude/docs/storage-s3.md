@@ -52,6 +52,16 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
   `EffectiveRecovery::UnsupportedByDestination`、prepare 按 Restart、不看指针不列 upload）；`final_refusal`（`staged/limits.rs`）
   在 Preflight、目的端任何请求之前拒 > 5 GiB 与含空段 / `.` / `..` 段、段 > 255 字节的 key（条目 `Unsupported` / Permanent），
   S3 的三个 prepare 再查一遍。
+  N3：8 MiB–5 GiB 一次**流式单 PUT**（通用原语 `S3Protocol::put_object_streaming`，`role_protocol/streaming_put.rs`：
+  `Content-Length` = 源大小、`UNSIGNED-PAYLOAD`、无 `Content-MD5`、强制 `WhenRequired` 校验和（不走 aws-chunked）、不重试、
+  关掉 SDK 的超时与卡顿保护；stage 在 `staged/streaming.rs`）。**扣住最后 1 字节到 publish**：write 送出其余字节，
+  publish 放出最后 1 字节并等回复 —— 之前任何失败 / 取消 / 丢弃 stage 都中止请求（关连接），最终 key 不变；扣住超过
+  300 s（`HOLD_LIMIT`）即放弃，publish 报未变。`Direct` 不扣字节、在 write 里提交。看门狗：通道里的一块在读超时
+  （`S3_READ_TIMEOUT`，默认 20 s）内没被取走、或最后 1 字节后回复没来 → `Connectivity` / Transient。边传边算 MD5
+  （`spawn_blocking`），回复 `ETag` 是 32 位 hex 且非 KMS / 客户密钥加密时必须等于它，否则 `Corruption` / Transient、
+  最终 key 已变。prepare 多一次 HEAD 记下最终 key 原状（`staged/settle.rs`，只在 `ETag` 不是 MD5 的桶上，≤ 8 MiB 的单 PUT
+  也用）：结果不明的失败再 HEAD，与原状相同（或仍不存在）报未变，否则已变。NAS 桶上 PUT 回 404 `NoSuchKey`（有文件 `a`
+  时写 `a/x`）或 409 `NameCollision`（有 `a/x` 时写 `a`）→ 该条目名字冲突 `Conflict` / Permanent（`put_refusal`）。
   **legacy `StorageEnum` 不理会这个 profile**（决定 13，只写文档）：legacy 读不带条件、不核对，写 > 5 MiB 走分段遇 501。
 - 所有 profile（含标准 `s3://`）都为 multi-object delete 加 body-matching、SigV4-signed
   `Content-MD5`（`s3/delete_objects_md5.rs`，由 `s3.rs` 的 `configure_compatibility` 统一挂载）：SDK 默认只发

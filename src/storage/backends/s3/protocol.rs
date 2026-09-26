@@ -1,8 +1,10 @@
 use std::ops::Range;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use md5::{Digest as _, Md5};
+use tokio::sync::mpsc;
 
 use super::S3BucketCapabilities;
 use crate::model::{FailureClass, ObjectTag, StorageTimestamp, Transience};
@@ -98,6 +100,15 @@ impl S3WriteFacts {
             reported_version,
         }
     }
+}
+
+/// What a streamed `PutObject` reported ([`S3Protocol::put_object_streaming`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct S3StreamedPut {
+    pub facts: S3WriteFacts,
+    /// Whether the reply's `ETag` can be the MD5 of the body: not under server-side encryption
+    /// with a KMS or customer key, whose `ETag`s are not MD5s.
+    pub etag_is_md5: bool,
 }
 
 /// One stored version, or delete marker, of a key as `ListObjectVersions` reports it.
@@ -299,6 +310,22 @@ pub(crate) trait S3Protocol: Send + Sync {
         body: Bytes,
         content_md5_base64: &str,
     ) -> S3Result<S3WriteFacts>;
+    /// How long a streamed upload may make no progress — a chunk not taken, a reply not given —
+    /// before it is abandoned: the connection's read timeout.
+    fn stall_timeout(&self) -> Duration;
+    /// One `PutObject` of exactly `len` bytes read from `chunks` as they come (P7 §14.2 N3):
+    /// `Content-Length: len`, the payload unsigned (`UNSIGNED-PAYLOAD`), no `Content-MD5`, no
+    /// retry, and no timeout of its own — the caller holds bytes back as long as it likes and
+    /// watches the progress itself. The object commits only once all `len` bytes arrived: a
+    /// sender dropped before that aborts the request (the connection closes) and nothing is
+    /// stored. On a bucket whose keys are file paths, a file / directory clash on the key's path
+    /// is that entry's permanent `Conflict`.
+    async fn put_object_streaming(
+        &self,
+        key: &str,
+        len: u64,
+        chunks: mpsc::Receiver<Bytes>,
+    ) -> S3Result<S3StreamedPut>;
     async fn begin_multipart(&self, key: &str) -> S3Result<String>;
     /// Uploads one part carrying `content_md5_base64`, so the server rejects a part corrupted in
     /// flight (`BadDigest`, a transient `Corruption` entry failure). Returns the part's `ETag`.

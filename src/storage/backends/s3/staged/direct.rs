@@ -1,7 +1,9 @@
 //! `Direct` writes to S3 (ADR-0006 C14c): the object appears at its final key inside `write`.
 //!
 //! A source of known size up to the single-PUT threshold T — or a directory object up to 5 GiB (P7
-//! D13) — is buffered and sent as one `PutObject` at the end of `write`. Anything larger, or of
+//! D13) — is buffered and sent as one `PutObject` at the end of `write`. On a bucket without
+//! multipart uploads (an ONTAP NAS bucket, P7 §14.2) a larger one is one streamed `PutObject`
+//! committing inside `write` ([`streaming`](super::streaming)). Anything else larger, or of
 //! unknown size, is a multipart upload on the final key that `write` begins, fills (every part
 //! with `Content-MD5`) and completes — checking the composite `ETag` when one can be computed —
 //! and aborts on any failure, so a failed `Direct` write leaves no upload behind. The upload is
@@ -19,6 +21,7 @@ use super::completion::completed_object;
 use super::parts::{PartTarget, UploadedParts};
 use super::{
     MAX_INFLIGHT_PARTS, S3StagedDestination, cleanup_result, limits, planned_part_size, single,
+    streaming,
 };
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::{
@@ -61,6 +64,9 @@ fn upload_of(stage: &PreparedStage) -> Option<&DirectUpload> {
 
 /// What the write that made the object reported, once it is written.
 fn written_facts(stage: &PreparedStage) -> Option<S3WriteFacts> {
+    if let Some(streamed) = streaming::of(stage) {
+        return streamed.published();
+    }
     match single::of(stage) {
         Some(single) => single.published(),
         None => upload_of(stage)?
@@ -77,57 +83,70 @@ fn not_written(path: &StoragePath, operation: Operation) -> StorageRoleFailure {
 
 impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     /// A `Direct` stage: a single stage for a known size up to T, and for a directory object one
-    /// request carries (P7 D13), otherwise a multipart one whose upload `write` begins. Neither
-    /// keeps recovery state.
-    pub(super) fn prepare_direct_stage(
+    /// request carries (P7 D13); on a bucket without multipart uploads, one streamed `PutObject`
+    /// committing inside `write` (P7 §14.2); otherwise a multipart one whose upload `write`
+    /// begins. None keeps recovery state.
+    pub(super) async fn prepare_direct_stage(
         &self,
         request: PrepareRequest,
         cancel: &CancellationToken,
     ) -> Result<PreparedStage, StorageRoleFailure> {
-        let path = request.final_destination.path();
+        let path = request.final_destination.path().clone();
         if cancel.is_cancelled() {
-            return Err(cancelled(path, Operation::Prepare));
+            return Err(cancelled(&path, Operation::Prepare));
         }
         limits::refuse(
             self.protocol.bucket_capabilities(),
-            path,
+            &path,
             request.source.size,
         )?;
-        if request.source.source_identity.backend() == &self.identity
-            && request.source.path == *path
+        if request.source.source_identity.backend() == &self.identity && request.source.path == path
         {
             return Err(classified_entry(
-                path,
+                &path,
                 Operation::Prepare,
                 FailureClass::Conflict,
                 Transience::Permanent,
                 "a Direct write cannot replace its own S3 source",
             ));
         }
-        let mut stage = if let Some(size) = self.single_put_size(path, request.source.size)? {
-            self.prepare_single(request, size)
+        // No `previous` for a Direct stage: its failures report the final key changed anyway.
+        let mut stage = if let Some(size) = self.single_put_size(&path, request.source.size)? {
+            self.prepare_single(request, size, None)
+        } else if let Some(size) = self.streamed_size(request.source.size) {
+            self.prepare_streaming(request, size, true).await?
         } else {
-            limits::refuse_multipart(self.protocol.bucket_capabilities(), path)?;
-            let part_size = planned_part_size(request.source.size, path)?;
-            let token = Self::encode_token(path.as_str(), DIRECT_MARKER);
-            let mut stage = PreparedStage::new(
-                self.identity.clone(),
-                request.final_destination,
-                token,
-                request.recovery_binding,
-                0,
-                None,
-            )
-            .disable_recovery();
-            stage.backend_state = Some(Arc::new(DirectUpload {
-                part_size,
-                expected_size: request.source.size,
-                state: Mutex::new(DirectState::default()),
-            }));
-            stage
+            self.direct_upload_stage(request)?
         };
         stage.direct = true;
         stage.durable_publication = false;
+        Ok(stage)
+    }
+
+    /// A multipart `Direct` stage: `write` begins, fills and completes the upload.
+    fn direct_upload_stage(
+        &self,
+        request: PrepareRequest,
+    ) -> Result<PreparedStage, StorageRoleFailure> {
+        let path = request.final_destination.path();
+        limits::refuse_multipart(self.protocol.bucket_capabilities(), path)?;
+        let part_size = planned_part_size(request.source.size, path)?;
+        let token = Self::encode_token(path.as_str(), DIRECT_MARKER);
+        let expected_size = request.source.size;
+        let mut stage = PreparedStage::new(
+            self.identity.clone(),
+            request.final_destination,
+            token,
+            request.recovery_binding,
+            0,
+            None,
+        )
+        .disable_recovery();
+        stage.backend_state = Some(Arc::new(DirectUpload {
+            part_size,
+            expected_size,
+            state: Mutex::new(DirectState::default()),
+        }));
         Ok(stage)
     }
 
@@ -138,6 +157,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         input: ByteStream,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
         let path = stage.final_destination.path();
+        if let Some(streamed) = streaming::of(stage) {
+            return streaming::write(self, stage, streamed, input).await;
+        }
         if let Some(single) = single::of(stage) {
             let written = single::write(stage, single, input).await?;
             single::send(self, path, single, single.expected_size())
@@ -342,6 +364,10 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         stage: &PreparedStage,
     ) -> Result<(), StorageRoleFailure> {
         let path = stage.final_destination.path();
+        if let Some(streamed) = streaming::of(stage) {
+            streamed.abandon();
+            return Ok(());
+        }
         let Some(upload) = upload_of(stage) else {
             return Ok(());
         };
@@ -359,6 +385,9 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
 
     /// The bytes the object holds once written.
     pub(super) fn direct_durable_bytes(stage: &PreparedStage) -> u64 {
+        if let Some(streamed) = streaming::of(stage) {
+            return streamed.published().map_or(0, |_| streamed.written_len());
+        }
         match single::of(stage) {
             Some(single) => single.durable_len(),
             None => upload_of(stage)

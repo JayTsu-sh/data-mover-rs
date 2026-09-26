@@ -98,6 +98,9 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | 按 versionId 删除一个不存在的版本 | 成功（S3 / MinIO 回 204），不是错误 |
 | 按 versionId 的 DeleteObject 回 405（存储不支持按版本删） | 条目 `Unsupported` / Permanent —— **不是**带版本读的「删除标记」`NotFound`（清理会把它当成已删）；删指针时降级为普通删除 + 告警 |
 | describe 之后对象被替换（`read` / native bind / `observe_bound`） | 条目 `Conflict` / Permanent |
+| 流式单 PUT（P7 §14.2 N3，`staged/streaming.rs`）：通道里的一块在读超时内没被服务器取走、或最后 1 字节送出后回复没来（看门狗，SDK 自己的超时对这个请求关掉） | 会话 `Connectivity` / Transient；写阶段（扣着最后 1 字节）失败 → 最终 key 未变；等回复超时 → HEAD 结算（NAS：与 prepare 时 HEAD 相同算未变）。扣住最后 1 字节超过 300 s → 放弃，publish 报 `Connectivity` / Transient、未变 |
+| 流式单 PUT 回复的 `ETag` 是 32 位 hex MD5 形状（且非 SSE-KMS / SSE-C）却不等于边传边算的 MD5 | 条目 `Corruption` / **Transient**，最终 key 已变（对象已提交；重传即可） |
+| `bucket_type=nas`：PutObject（缓冲或流式）回 404 `NoSuchKey`（路径上某段是文件）或 409 `NameCollision`（要写成文件的位置是目录） | 条目 **`Conflict`** / Permanent（名字冲突；不是 `NotFound`，也不重试）；对象桶上 404 仍是 `NotFound` |
 | 目的端写不了的名字或大小（`StagedDestination::final_refusal`；`bucket_type=nas`：> 5 GiB 或大小未知、key 含空段 / `.` / `..` 段（服务器会静默改写到别的 key）、段 > 255 字节（服务器回看似可重试的 500）；P7 §14.2 N2） | `Preflight`、目的端、条目 `Unsupported` / Permanent，目的端任何请求之前；直接调角色时 S3 prepare 报同样的条目失败（Operation `Prepare`） |
 | **无条件读的桶**（`bucket_type=nas`，ONTAP NAS 桶，P7 §14.2 N1；`role_protocol/unpinned.rs`）：范围 GET 的响应 `ETag` 不等于描述时的、`Content-Range` 总长不等于描述时的大小、`Last-Modified` 不同（两边都有时）、缺 `ETag`；body 短于宣称长度**或读 body 途中出错**；读完后的 `HEAD` 看到别的 `ETag` / 大小 / `Last-Modified`，或对象已不在（`source.rs::confirm_unchanged`） | 条目 `Conflict` / Permanent（同 412）。body 出错按“已被替换”判是 N0 的决定：替换提交后 0.3–0.7 s 服务器断开进行中的 GET，收到的是旧内容的干净前缀；**代价**：同样被切断的普通断连也报成 `Conflict`、不重试（诊断里带原始错误）。对象桶上读 body 出错仍是会话 `Connectivity` / Transient（不变） |
 | `compat=hcp` 读标签走 HCP REST `BPM` 注解（`role_protocol/hcp_tags.rs`，P7 P4）：404 / 204 / 空回复 | 无标签（不分“没有注解”与“没有对象 / 版本”） |

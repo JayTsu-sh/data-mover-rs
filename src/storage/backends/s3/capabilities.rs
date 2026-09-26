@@ -28,6 +28,12 @@ pub(crate) struct S3BucketCapabilities {
     /// an empty, `.` or `..` segment is resolved away — the object would land under another key
     /// (N0: `a/../x`, `a/./y`, `a//b` are silently rewritten; a longer segment answers 500).
     pub(crate) file_backed_keys: bool,
+    /// A stored object's `ETag` is the MD5 of its content when one `PutObject` wrote it, so a
+    /// write whose reply was lost is proven ours by a `HEAD`. Not on an ONTAP NAS bucket, whose
+    /// `ETag`s derive from the file's mtime and size (only the `PutObject` reply carries the MD5):
+    /// there a prepare looks at the final key once, and an uncertain write is unchanged only when
+    /// the key still answers that.
+    pub(crate) md5_etags: bool,
     /// Stored versions: a source can be read at a version and a key's history listed.
     pub(crate) versions: bool,
     /// Content under a key ending in `/` (P7 F5).
@@ -44,6 +50,7 @@ impl S3BucketCapabilities {
         resumable: true,
         max_object_bytes: None,
         file_backed_keys: false,
+        md5_etags: true,
         versions: true,
         directory_objects: true,
         native_same_bucket_only: false,
@@ -61,6 +68,7 @@ impl S3BucketCapabilities {
         resumable: false,
         max_object_bytes: Some(MAX_SINGLE_REQUEST_BYTES),
         file_backed_keys: true,
+        md5_etags: false,
         versions: false,
         directory_objects: false,
         native_same_bucket_only: true,

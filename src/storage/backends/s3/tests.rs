@@ -75,6 +75,8 @@ pub(crate) struct MemoryS3 {
     /// The next `put_object` is stored twice, as when the SDK re-sends a PUT whose first attempt
     /// committed but lost its reply: a versioned bucket keeps two identical versions.
     pub(crate) put_stored_twice: Mutex<bool>,
+    /// The next `put_object` stores nothing and loses its reply (a transient connectivity failure).
+    pub(crate) put_fails_without_commit: Mutex<bool>,
     /// `put_object` replies carry no version header (some stores, even with versioning suspended).
     pub(crate) put_omits_version: Mutex<bool>,
     /// The next `complete_multipart` stores its object, then loses the reply (a transient
@@ -119,6 +121,8 @@ pub(crate) struct MemoryS3 {
     listing: std::sync::Mutex<memory_listing::ListingKnobs>,
     /// The ONTAP NAS bucket mode (P7 §14.2): see [`memory_nas`].
     nas: std::sync::Mutex<memory_nas::NasBucket>,
+    /// Streamed `PutObject`s (P7 §14.2 N3): see [`memory_streaming`].
+    streaming: std::sync::Mutex<memory_streaming::StreamingKnobs>,
 }
 
 /// The `ETag` S3 reports for an object written by one `PutObject`: the quoted hex MD5 of its body.
@@ -431,6 +435,13 @@ impl S3Protocol for MemoryS3 {
                 "S3 PutObject request failed",
             ));
         }
+        if mem::take(&mut *self.put_fails_without_commit.lock().await) {
+            return Err(S3ProtocolFailure::session(
+                crate::model::FailureClass::Connectivity,
+                crate::model::Transience::Transient,
+                "put response lost",
+            ));
+        }
         let etag = etag_of(&body);
         self.multipart_etags
             .lock()
@@ -452,6 +463,17 @@ impl S3Protocol for MemoryS3 {
             ));
         }
         Ok(S3WriteFacts::new(etag, version))
+    }
+    fn stall_timeout(&self) -> Duration {
+        self.memory_stall_timeout()
+    }
+    async fn put_object_streaming(
+        &self,
+        key: &str,
+        len: u64,
+        chunks: tokio::sync::mpsc::Receiver<Bytes>,
+    ) -> S3Result<S3StreamedPut> {
+        self.memory_put_streaming(key, len, chunks).await
     }
     async fn begin_multipart(&self, key: &str) -> S3Result<String> {
         *self.multipart_begins.lock().await += 1;
@@ -727,6 +749,8 @@ mod memory_listing;
 
 #[path = "memory_nas.rs"]
 mod memory_nas;
+#[path = "memory_streaming.rs"]
+mod memory_streaming;
 #[path = "memory_versions.rs"]
 mod memory_versions;
 #[path = "nas_source_tests.rs"]

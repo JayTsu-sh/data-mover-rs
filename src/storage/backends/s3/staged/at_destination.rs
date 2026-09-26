@@ -136,8 +136,9 @@ impl<P: S3Protocol + 'static> PartsCheckpoint for PointerCheckpoint<'_, P> {
 impl<P: S3Protocol + 'static> S3StagedDestination<P> {
     /// Prepares by looking at the destination first. Up to T — and a directory object of any size
     /// one request carries (P7 D13) — a single stage (after cleaning up a leftover pointer); above
-    /// T, or of unknown size, a multipart upload on the final key that resumes or starts over as
-    /// the decision table says.
+    /// T on a bucket without multipart uploads, one streamed `PutObject` ([`streaming`](super::streaming));
+    /// otherwise, or of unknown size, a multipart upload on the final key that resumes or starts
+    /// over as the decision table says.
     pub(super) async fn prepare_at_destination_stage(
         &self,
         request: DestinationPrepareRequest,
@@ -149,8 +150,16 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         let pointer = pointer_path(&path)?;
         if let Some(size) = single {
             let fact = self.clear_leftover(&request, &pointer).await?;
-            let mut stage = self.prepare_single(request.prepare, size);
+            let previous = self.previous_object(&path).await?;
+            let mut stage = self.prepare_single(request.prepare, size, previous);
             stage.mark_at_destination(fact);
+            return Ok(stage);
+        }
+        if let Some(size) = self.streamed_size(size) {
+            // No multipart upload on this bucket (P7 §14.2): one streamed PutObject, nothing to
+            // resume or clean up.
+            let mut stage = self.prepare_streaming(request.prepare, size, false).await?;
+            stage.mark_at_destination(PrepareFact::Fresh);
             return Ok(stage);
         }
         let part_size = planned_part_size(size, &path)?;

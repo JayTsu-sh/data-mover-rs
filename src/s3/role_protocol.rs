@@ -1,4 +1,6 @@
 use super::{CompletedPart, ProvideErrorMetadata, S3Compatibility, S3Storage, build_copy_source};
+use std::time::Duration;
+
 use aws_smithy_types::byte_stream::AggregatedBytes;
 use bytes::Bytes;
 
@@ -36,6 +38,7 @@ mod hcp_tags;
 mod listing;
 mod multipart;
 mod native;
+mod streaming_put;
 #[cfg(test)]
 mod throttling_tests;
 mod unpinned;
@@ -236,21 +239,22 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         body: Bytes,
         content_md5_base64: &str,
     ) -> S3Result<S3WriteFacts> {
-        let response = self
-            .client
-            .put_object()
-            .bucket(&self.bucket_name)
-            .key(self.build_full_key(key))
-            .body(aws_sdk_s3::primitives::ByteStream::from(body))
-            .content_md5(content_md5_base64)
-            .send()
-            .await
-            .map_err(|error| classify_sdk!(error, "S3 PutObject request failed"))?;
-        // The object was written; only the response is malformed.
-        let etag = response
-            .e_tag()
-            .ok_or_else(|| S3ProtocolFailure::protocol("S3 PutObject response omitted ETag"))?;
-        Ok(self.write_facts(etag, response.version_id()))
+        streaming_put::put_object(self, key, body, content_md5_base64).await
+    }
+
+    fn stall_timeout(&self) -> Duration {
+        super::s3_timeout_config()
+            .read_timeout()
+            .unwrap_or(Duration::from_secs(super::DEFAULT_S3_READ_TIMEOUT_SECS))
+    }
+
+    async fn put_object_streaming(
+        &self,
+        key: &str,
+        len: u64,
+        chunks: tokio::sync::mpsc::Receiver<Bytes>,
+    ) -> S3Result<crate::storage::backends::s3::S3StreamedPut> {
+        streaming_put::put_object_streaming(self, key, len, chunks).await
     }
 
     async fn begin_multipart(&self, key: &str) -> crate::storage::backends::s3::S3Result<String> {

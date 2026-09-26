@@ -147,7 +147,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         })?;
         if one_request || size <= self.native.single_max {
             let fact = self.clear_leftover(&request, &pointer).await?;
-            let mut stage = self.prepare_single(request.prepare, size);
+            let mut stage = self.prepare_single(request.prepare, size, None);
             stage.mark_at_destination(fact);
             return Ok(stage);
         }
