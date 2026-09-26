@@ -45,6 +45,9 @@ pub(super) struct UploadState {
     pub(super) md5_etags: Option<bool>,
     /// The bytes the parts hold once `write` finished.
     pub(super) written: Option<u64>,
+    /// Whether this attempt filled the upload with server-side copies (`UploadPartCopy`) rather
+    /// than bytes it sent.
+    pub(super) native: bool,
     /// Tags to set once the object exists.
     pub(super) tags: Option<Vec<ObjectTag>>,
     /// What the completion reported.

@@ -436,7 +436,10 @@ process with no state of its own names the same transfer; `with_identity_overrid
 caller label. The expert destination session derives it from the `ObservedEntry` it receives; the
 expert source session takes none. Every execution receives a distinct attempt
 identity. A `TransferOutcome` includes both identities, selected data path, prepare fact,
-total and reused bytes, verification evidence, publication guarantee, per-family metadata
+total and reused bytes, verification evidence — including how the copy was checked
+(`TransferOutcome.verification`: the read-back method, `Pinned` or, where a store cannot pin a read,
+`EtagBracketed` with its reason, and whether the store confirmed the upload's MD5; P7 §14.2 N4) —
+publication guarantee, per-family metadata
 results, warnings, `final_destination_changed`, and source-deletion-safety. A
 `TransferFailure` includes stage, side, stable kind, operation retryability, checkpoint
 disposition, `final_destination_changed`, and `source_changed`, preserving protocol causes in

@@ -57,9 +57,10 @@ pub use roles::{
     ByteStream, CaseSensitivity, CheckpointObservation, DeleteMarkerOutcome, FinalDestination,
     Metadata, MetadataMutation, NameNormalization, NameSemantics, Namespace, NamespaceCapabilities,
     PositionedByteStream, PositionedChunk, PrepareRequest, PreparedStage, PublicationDisposition,
-    PublicationEvidence, PublicationFailure, PublishRequest, ReadRequest, ReadSource,
-    StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure, VerificationEvidence,
-    VerificationPoint, VerifyRequest, WriteEvidence,
+    PublicationEvidence, PublicationFailure, PublishRequest, ReadBackMethod, ReadRequest,
+    ReadSource, StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure,
+    UnpinnedReadReason, UploadDigest, UploadDigestGap, VerificationEvidence, VerificationPoint,
+    VerifyRequest, WriteEvidence,
 };
 
 pub use crate::runtime::read_budget::ReadBudget;

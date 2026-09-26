@@ -13,12 +13,14 @@ use crate::runtime::qos::SourceQosBudget;
 
 mod namespace;
 mod stage;
+mod verification;
 mod version;
 pub use namespace::{
     CaseSensitivity, NameNormalization, NameSemantics, Namespace, NamespaceCapabilities,
 };
 pub(crate) use stage::DeferredCheckpoint;
 pub use stage::PreparedStage;
+pub use verification::{ReadBackMethod, UnpinnedReadReason, UploadDigest, UploadDigestGap};
 use version::version_unsupported;
 
 use crate::model::{
@@ -498,6 +500,18 @@ pub trait StagedDestination: Send + Sync {
     /// When read-back verification of `stage` happens (see [`VerificationPoint`]).
     fn verification_point(&self, _stage: &PreparedStage) -> VerificationPoint {
         VerificationPoint::BeforePublish
+    }
+    /// How [`Self::verify`] reads `stage` back (P7 §14.2 N4). The default is
+    /// [`ReadBackMethod::Pinned`]: a destination that reads its private stage before
+    /// publication, or pins the object it wrote. A destination that cannot pin a read says so.
+    fn read_back_method(&self, _stage: &PreparedStage) -> ReadBackMethod {
+        ReadBackMethod::Pinned
+    }
+    /// Whether the store confirmed that `stage`'s published bytes are the bytes sent (P7 §14.2
+    /// N4). The default, for a destination without such a digest (a filesystem write), is
+    /// [`UploadDigest::Unchecked`]`(`[`UploadDigestGap::NotApplicable`]`)`.
+    fn upload_digest(&self, _stage: &PreparedStage) -> UploadDigest {
+        UploadDigest::Unchecked(UploadDigestGap::NotApplicable)
     }
     /// Whether the destination keeps every record of a key right now — a bucket whose versioning is
     /// `Enabled` — so a source history can be replayed onto it (P7 H1, D12). Asked of the store

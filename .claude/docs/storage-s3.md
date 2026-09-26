@@ -62,6 +62,13 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
   最终 key 已变。prepare 多一次 HEAD 记下最终 key 原状（`staged/settle.rs`，只在 `ETag` 不是 MD5 的桶上，≤ 8 MiB 的单 PUT
   也用）：结果不明的失败再 HEAD，与原状相同（或仍不存在）报未变，否则已变。NAS 桶上 PUT 回 404 `NoSuchKey`（有文件 `a`
   时写 `a/x`）或 409 `NameCollision`（有 `a/x` 时写 `a`）→ 该条目名字冲突 `Conflict` / Permanent（`put_refusal`）。
+  N4：**ETag 括号式读回**（`single.rs::verify_bracketed`，所有 stage 共用）：HEAD 定锚（`ETag` + 大小）、每段响应必须带锚
+  `ETag`（替换 → `Conflict` / Permanent）、BLAKE3 与源比 —— 内容或大小不同 → `Corruption` / **Transient**，诊断写明
+  “无条件读，写与读之间的替换无法排除”（N0：保留 mtime 的 NFS 改写不改 ETag，真会出现）。不与 PUT 回复比 ETag（NAS 上
+  回复是 MD5、HEAD 是不透明值）。结果记进 `TransferOutcome.verification`：`read_back` =
+  `EtagBracketed { ConditionalReadsUnsupported }`（对象桶 `Pinned`，读回关 `NotPerformed`），`upload_digest` = `Matched`
+  （缓冲 PUT / 分段都带 Content-MD5；流式单 PUT 回复 ETag = 自算 MD5）或 `Unchecked(EtagNotMd5 | NativeCopy | PriorAttempt)`；
+  不算失败。
   **legacy `StorageEnum` 不理会这个 profile**（决定 13，只写文档）：legacy 读不带条件、不核对，写 > 5 MiB 走分段遇 501。
 - 所有 profile（含标准 `s3://`）都为 multi-object delete 加 body-matching、SigV4-signed
   `Content-MD5`（`s3/delete_objects_md5.rs`，由 `s3.rs` 的 `configure_compatibility` 统一挂载）：SDK 默认只发

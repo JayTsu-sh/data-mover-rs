@@ -6,15 +6,18 @@ mod identity;
 mod model;
 
 pub use crate::model::SourceVersion;
-pub use crate::storage::{DeleteMarkerOutcome, PrepareFact, RestartReason};
+pub use crate::storage::{
+    DeleteMarkerOutcome, PrepareFact, ReadBackMethod, RestartReason, UnpinnedReadReason,
+    UploadDigest, UploadDigestGap,
+};
 pub use crate::storage::{SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError};
 pub use engine::{
     DIRECTORY_OBJECT_SKIP_REASON, DirectoryObjectAction, EffectiveRecovery,
     ExpertDestinationRequest, ExpertDestinationSession, ExpertDestinationTransferred,
     ExpertSourceEvidence, ExpertSourceOffer, ExpertSourcePayload, ExpertSourceRequest,
     ExpertSourceSession, TransferFailure, TransferOutcome, TransferPhase, TransferRoute,
-    TransferSide, destination_keeps_history, directory_object_action, transfer,
-    write_delete_marker,
+    TransferSide, TransferVerification, destination_keeps_history, directory_object_action,
+    transfer, write_delete_marker,
 };
 pub use identity::TransferIdentity;
 pub use model::{

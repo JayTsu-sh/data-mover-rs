@@ -776,6 +776,7 @@ impl ExpertDestinationTransferred {
             .await
             .map_err(|failure| failure.with_source_qos(evidence.source_qos))?;
         }
+        let verification = super::TransferVerification::of(&*self.destination, &self.stage, true);
         let PublicationEvidence {
             final_destination,
             disposition,
@@ -797,6 +798,7 @@ impl ExpertDestinationTransferred {
             route: super::TransferRoute::Streaming,
             recovery: self.effective_recovery,
             destination_version,
+            verification,
         })
     }
 }

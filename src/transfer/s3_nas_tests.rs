@@ -8,6 +8,7 @@ use std::fs;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::channel::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
@@ -15,14 +16,17 @@ use crate::model::{
 };
 use crate::storage::PrepareFact;
 use crate::storage::artifacts::{ArtifactKind, artifact_name};
-use crate::storage::backends::local::test_source_storage;
-use crate::storage::backends::s3::connect;
-use crate::storage::backends::s3::tests::{MemoryS3, endpoint_of, identity, native_context};
-use crate::storage::{Storage, StorageRoleFailure};
+use crate::storage::backends::local::{test_destination_storage, test_source_storage};
+use crate::storage::backends::s3::tests::{
+    MemoryS3, content_md5, endpoint_of, identity, native_context,
+};
+use crate::storage::backends::s3::{S3Protocol as _, connect, connect_native_at_destination};
+use crate::storage::{PreflightPolicy, Storage, StorageRoleFailure};
 use crate::transfer::{
-    EffectiveRecovery, ExpertDestinationRequest, ExpertDestinationSession, InflightLimits,
-    PayloadShapingPolicy, ReadBackVerification, TransferFailure, TransferPhase, TransferPolicy,
-    TransferRequest, TransferRoute, TransferSide, transfer,
+    EffectiveRecovery, ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest,
+    ExpertSourceSession, InflightLimits, PayloadShapingPolicy, ReadBackMethod,
+    ReadBackVerification, TransferFailure, TransferPhase, TransferPolicy, TransferRequest,
+    TransferRoute, TransferSide, UnpinnedReadReason, UploadDigest, UploadDigestGap, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -281,6 +285,183 @@ async fn an_object_over_the_threshold_is_one_streamed_put() -> TestResult {
         );
         assert_eq!(protocol.streaming().puts, 1, "{policy:?}");
         assert_eq!(*protocol.multipart_begins.lock().await, 0, "{policy:?}");
+    }
+    Ok(())
+}
+
+/// The outcome says how the copy was checked (N4): read back bracketed by `ETag` on a NAS bucket,
+/// pinned on an object bucket and on a filesystem, not at all when read-back is off; the upload's
+/// MD5 was confirmed by the S3 stores, and has no meaning for a filesystem.
+#[tokio::test]
+async fn the_outcome_says_how_the_copy_was_checked() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let big: Vec<u8> = (0..=250_u8).cycle().take(8 * 1024 * 1024 + 1).collect();
+    fs::write(root.path().join("big"), &big)?;
+    fs::write(root.path().join("small"), vec![5; 100 * 1024])?;
+    let bracketed = ReadBackMethod::EtagBracketed {
+        reason: UnpinnedReadReason::ConditionalReadsUnsupported,
+    };
+    let local_destination = tempfile::tempdir()?;
+    for (label, destination, read_back, expected) in [
+        (
+            "nas big",
+            bucket(&nas())?,
+            true,
+            (bracketed, UploadDigest::Matched),
+        ),
+        (
+            "nas small",
+            bucket(&nas())?,
+            true,
+            (bracketed, UploadDigest::Matched),
+        ),
+        (
+            "nas off",
+            bucket(&nas())?,
+            false,
+            (ReadBackMethod::NotPerformed, UploadDigest::Matched),
+        ),
+        (
+            "object",
+            bucket(&Arc::new(MemoryS3::default()))?,
+            true,
+            (ReadBackMethod::Pinned, UploadDigest::Matched),
+        ),
+        (
+            "local",
+            test_destination_storage(local_destination.path(), "nas-verification")?,
+            true,
+            (
+                ReadBackMethod::Pinned,
+                UploadDigest::Unchecked(UploadDigestGap::NotApplicable),
+            ),
+        ),
+    ] {
+        let (local, _) = test_source_storage(root.path(), "nas-verification-source")?;
+        let source = if label == "nas small" { "small" } else { "big" };
+        let outcome = transfer(
+            request(local, source, destination, "dst/file")?.with_read_back_verification(
+                if read_back {
+                    ReadBackVerification::Enabled
+                } else {
+                    ReadBackVerification::Disabled
+                },
+            ),
+        )
+        .await
+        .map_err(|failure| format!("{label}: {failure:?}"))?;
+        let verification = outcome.verification;
+        assert_eq!(
+            (verification.read_back_method, verification.upload_digest),
+            expected,
+            "{label}"
+        );
+    }
+    Ok(())
+}
+
+/// Both expert halves to a NAS bucket: `Checkpointed` reports `UnsupportedByDestination` and the
+/// read-back is bracketed.
+#[tokio::test]
+async fn an_expert_copy_to_a_nas_bucket_reports_what_it_could_do() -> TestResult {
+    let protocol = nas();
+    let storage = bucket(&protocol)?;
+    let body = Bytes::from(vec![3_u8; 100 * 1024]);
+    protocol
+        .put_object("src/file", body.clone(), &content_md5(&body))
+        .await
+        .map_err(|failure| format!("{failure:?}"))?;
+    let path = StoragePath::new("src/file")?;
+    let described = storage
+        .read_source(&PreflightPolicy::production())?
+        .describe(&path)
+        .await?;
+    let observation = ObservedEntry::new(
+        path,
+        EntryKind::File,
+        Some(body.len() as u64),
+        None,
+        described.source_identity,
+    )?;
+    let limits = InflightLimits::new(2, 1024, 2)?;
+    let source = ExpertSourceSession::open(ExpertSourceRequest::new(
+        storage.clone(),
+        observation.clone(),
+        limits,
+        CancellationToken::new(),
+    ))
+    .await?;
+    let session = ExpertDestinationSession::prepare(
+        ExpertDestinationRequest::new(
+            observation,
+            source.offer().maximum_chunk_bytes,
+            storage.clone(),
+            StoragePath::new("dst/expert")?,
+            limits,
+            CancellationToken::new(),
+        )
+        .with_transfer_policy(TransferPolicy::Checkpointed),
+    )
+    .await?;
+    let mut payload = source.stream_from(session.write_offset())?;
+    let (sender, receiver) = mpsc::unbounded();
+    let pump = async move {
+        while let Some(chunk) = payload.next_chunk().await? {
+            if sender.unbounded_send(Ok(chunk)).is_err() {
+                break;
+            }
+        }
+        drop(sender);
+        payload.finish().await
+    };
+    let (written, evidence) = futures::join!(session.write(Box::pin(receiver)), pump);
+    let outcome = written?.complete(evidence?).await?;
+    assert_eq!(
+        outcome.recovery,
+        EffectiveRecovery::UnsupportedByDestination
+    );
+    assert_eq!(
+        outcome.verification.read_back_method,
+        ReadBackMethod::EtagBracketed {
+            reason: UnpinnedReadReason::ConditionalReadsUnsupported,
+        }
+    );
+    assert_eq!(protocol.objects.lock().await.get("dst/expert"), Some(&body));
+    Ok(())
+}
+
+/// A server-side copy sent no bytes: its digest is `Unchecked(NativeCopy)`, whether one
+/// `CopyObject` or an upload filled with `UploadPartCopy`.
+#[tokio::test]
+async fn a_native_copy_confirms_no_upload_digest() -> TestResult {
+    for (label, size) in [("single", 1024 * 1024), ("parts", 12 * 1024 * 1024)] {
+        let protocol = Arc::new(MemoryS3::default());
+        protocol
+            .objects
+            .lock()
+            .await
+            .insert("src/file".into(), Bytes::from(vec![4; size]));
+        let connect = || {
+            connect_native_at_destination(
+                protocol.clone(),
+                endpoint_of(&protocol),
+                64 * 1024 * 1024,
+                (5 * 1024 * 1024, 5 * 1024 * 1024),
+            )
+        };
+        let outcome = transfer(
+            request(connect()?, "src/file", connect()?, "dst/file")?
+                .with_payload_shaping(PayloadShapingPolicy::AllowUnshapedNative)
+                .with_read_back_verification(ReadBackVerification::Disabled),
+        )
+        .await
+        .map_err(|failure| format!("{label}: {failure:?}"))?;
+        assert_eq!(outcome.route, TransferRoute::Native, "{label}");
+        assert_eq!(
+            outcome.verification.upload_digest,
+            UploadDigest::Unchecked(UploadDigestGap::NativeCopy),
+            "{label}"
+        );
     }
     Ok(())
 }

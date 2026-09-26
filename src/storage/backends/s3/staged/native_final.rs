@@ -197,6 +197,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             parts,
             bytes: copied.bytes,
         };
+        upload.lock().native = true;
         upload
             .record_written(path, sent, resumed, stage.write_offset + copied.bytes)
             .map_err(|error| copied.failure(error))?;

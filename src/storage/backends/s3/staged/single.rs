@@ -123,6 +123,11 @@ impl SingleStage {
         self.lock().native_source = Some(source);
     }
 
+    /// Whether this stage publishes a server-side copy rather than bytes it holds.
+    pub(super) fn is_native(&self) -> bool {
+        self.lock().native_source.is_some()
+    }
+
     /// The tags waiting for the object.
     pub(super) fn pending(&self) -> Option<Vec<ObjectTag>> {
         self.lock().tags.clone()
@@ -454,13 +459,17 @@ pub(super) async fn verify<P: S3Protocol>(
 
 /// Reads an object written at its final key back, pinned to what the write created: by its
 /// version when it has one, otherwise with `If-Match` on its `ETag`. A current object that is no
-/// longer ours is `Conflict`.
+/// longer ours is `Conflict`. On a bucket without conditional reads the read is bracketed
+/// instead ([`verify_bracketed`]).
 pub(super) async fn verify_written<P: S3Protocol>(
     adapter: &S3StagedDestination<P>,
     path: &StoragePath,
     written: S3WriteFacts,
     request: &VerifyRequest,
 ) -> Result<VerificationEvidence, StorageRoleFailure> {
+    if !adapter.protocol.bucket_capabilities().conditional_reads {
+        return verify_bracketed(adapter, path, request).await;
+    }
     let version = request
         .published
         .as_ref()
@@ -483,6 +492,61 @@ pub(super) async fn verify_written<P: S3Protocol>(
     }
     Ok(VerificationEvidence {
         verified_bytes: pinned.size,
+        blake3: actual,
+    })
+}
+
+/// Read-back where no read can be pinned (P7 §14.2 N4, decision 6; an ONTAP NAS bucket): a `HEAD`
+/// anchors the object's `ETag`, every range response must carry it (a replacement during the
+/// read is a permanent `Conflict`, from [`S3Protocol::get_range`]), and the content is compared
+/// with the source's. Nothing links the anchor to the write — the bucket's `ETag` is not the MD5
+/// the `PutObject` reply carried — so content that differs (or a size that does) is a transient
+/// `Corruption` that says a replacement between the write and the read cannot be ruled out.
+async fn verify_bracketed<P: S3Protocol>(
+    adapter: &S3StagedDestination<P>,
+    path: &StoragePath,
+    request: &VerifyRequest,
+) -> Result<VerificationEvidence, StorageRoleFailure> {
+    let anchor = match adapter.protocol.head(path.as_str()).await {
+        Ok(anchor) => anchor,
+        // Gone since publication: replaced, as a pinned read would report it.
+        Err(S3ProtocolFailure::Entry {
+            class: FailureClass::NotFound,
+            ..
+        }) => {
+            return Err(classified_entry(
+                path,
+                Operation::Verify,
+                FailureClass::Conflict,
+                Transience::Permanent,
+                "the final S3 object is gone since publication",
+            ));
+        }
+        Err(failure) => return Err(role_failure(path, Operation::Verify, failure)),
+    };
+    let differs = || {
+        classified_entry(
+            path,
+            Operation::Verify,
+            FailureClass::Corruption,
+            Transience::Transient,
+            "the S3 object read back differs from the source; without conditional reads a \
+             replacement between the write and this read cannot be ruled out",
+        )
+    };
+    if anchor.size != request.expected_size {
+        return Err(differs());
+    }
+    let anchor = S3ObjectFacts {
+        version_id: None,
+        ..anchor
+    };
+    let actual = read_pinned(adapter, path, &anchor, &request.cancel).await?;
+    if actual != request.expected_blake3 {
+        return Err(differs());
+    }
+    Ok(VerificationEvidence {
+        verified_bytes: anchor.size,
         blake3: actual,
     })
 }

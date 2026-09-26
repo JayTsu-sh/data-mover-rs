@@ -37,6 +37,8 @@ pub(crate) struct StreamingKnobs {
     pub(crate) etag: Option<String>,
     /// The next request is refused with this failure before any body byte is read.
     pub(crate) refuse: Option<S3ProtocolFailure>,
+    /// Replies say the object is encrypted with a KMS key: their `ETag` is no MD5.
+    pub(crate) encrypted: bool,
     /// The stall timeout the fake's connection reports (default 5 s).
     pub(crate) stall_timeout: Option<Duration>,
     /// Bytes the last request took from its body, and requests received.
@@ -111,12 +113,13 @@ impl MemoryS3 {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&<[u8; 16]>::from(Md5::digest(&body)));
         let version = self.store_written(key, body.clone()).await;
-        let (hangs, lost, etag) = {
+        let (hangs, lost, etag, encrypted) = {
             let mut knobs = self.streaming();
             (
                 mem::take(&mut knobs.reply_hangs),
                 mem::take(&mut knobs.commits_then_fails),
                 knobs.etag.take(),
+                knobs.encrypted,
             )
         };
         if hangs {
@@ -127,7 +130,7 @@ impl MemoryS3 {
         }
         Ok(S3StreamedPut {
             facts: S3WriteFacts::new(etag.unwrap_or_else(|| etag_of(&body)), version),
-            etag_is_md5: true,
+            etag_is_md5: !encrypted,
         })
     }
 }

@@ -41,8 +41,8 @@ use super::{S3StagedDestination, single};
 use crate::model::{FailureClass, ObjectTag, Operation, StoragePath, Transience};
 use crate::storage::{
     ByteStream, MetadataMutation, PrepareRequest, PreparedStage, PublicationDisposition,
-    PublicationEvidence, PublicationFailure, PublishRequest, StorageRoleFailure,
-    VerificationEvidence, VerifyRequest, WriteEvidence,
+    PublicationEvidence, PublicationFailure, PublishRequest, StorageRoleFailure, UploadDigest,
+    UploadDigestGap, VerificationEvidence, VerifyRequest, WriteEvidence,
 };
 
 /// How long the last byte may wait for publication before the upload is given up: well within
@@ -76,6 +76,8 @@ struct StreamingState {
     md5: Option<String>,
     tags: Option<Vec<ObjectTag>>,
     published: Option<S3WriteFacts>,
+    /// Whether the reply's `ETag` (or, settling a lost reply, the object's) matched our MD5.
+    digest_matched: bool,
 }
 
 /// A request in flight. Dropping it aborts the request and the holder of the last byte: the body
@@ -156,6 +158,15 @@ impl StreamingStage {
     /// What the request that made the object reported, once it is written.
     pub(super) fn published(&self) -> Option<S3WriteFacts> {
         self.lock().published.clone()
+    }
+
+    /// What the store confirmed of the bytes it received (P7 §14.2 N4).
+    pub(super) fn upload_digest(&self) -> UploadDigest {
+        if self.lock().digest_matched {
+            UploadDigest::Matched
+        } else {
+            UploadDigest::Unchecked(UploadDigestGap::EtagNotMd5)
+        }
     }
 
     /// Aborts a request still in flight: the final key keeps what it had.
@@ -418,14 +429,17 @@ async fn finish<P: S3Protocol>(
         }
         Err(failure) => {
             let md5_etags = adapter.protocol.bucket_capabilities().md5_etags;
-            return settle_unknown_write(
+            let settled = settle_unknown_write(
                 &*adapter.protocol,
                 path,
                 &streaming.settling(),
                 md5_etags.then_some(md5),
                 failure,
             )
-            .await;
+            .await?;
+            // Settled as ours only by our MD5 on the object.
+            streaming.lock().digest_matched = true;
+            return Ok(settled);
         }
     };
     if put.etag_is_md5 && is_md5_etag(&put.facts.etag) && !same_etag(&put.facts.etag, md5) {
@@ -437,6 +451,7 @@ async fn finish<P: S3Protocol>(
             "the S3 object's ETag is not the MD5 of the bytes sent: corrupted in flight",
         )));
     }
+    streaming.lock().digest_matched = put.etag_is_md5 && is_md5_etag(&put.facts.etag);
     Ok(put.facts)
 }
 

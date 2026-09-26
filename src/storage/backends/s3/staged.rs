@@ -18,8 +18,8 @@ use crate::model::{BackendIdentity, FailureClass, Operation, StoragePath, Transi
 use crate::storage::{
     ByteStream, CheckpointObservation, DestinationPrepareRequest, Metadata, MetadataMutation,
     PrepareRequest, PreparedStage, PublicationEvidence, PublicationFailure, PublishRequest,
-    StagedDestination, StorageRoleFailure, VerificationEvidence, VerificationPoint, VerifyRequest,
-    WriteEvidence,
+    ReadBackMethod, StagedDestination, StorageRoleFailure, UnpinnedReadReason, UploadDigest,
+    UploadDigestGap, VerificationEvidence, VerificationPoint, VerifyRequest, WriteEvidence,
 };
 
 use super::source::{classified_entry, entry, role_failure};
@@ -440,6 +440,43 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         VerificationPoint::AfterPublish
     }
 
+    /// Pinned by version or `If-Match`; bracketed by `ETag` on a bucket without conditional reads
+    /// (an ONTAP NAS bucket, P7 §14.2 N4).
+    fn read_back_method(&self, _stage: &PreparedStage) -> ReadBackMethod {
+        if self.protocol.bucket_capabilities().conditional_reads {
+            ReadBackMethod::Pinned
+        } else {
+            ReadBackMethod::EtagBracketed {
+                reason: UnpinnedReadReason::ConditionalReadsUnsupported,
+            }
+        }
+    }
+
+    /// `Matched` where the store checked a `Content-MD5` on every request that sent bytes (a
+    /// buffered `PutObject`, each part of a streamed multipart upload) or a streamed `PutObject`'s
+    /// reply `ETag` equalled our MD5; a server-side copy sent none; a resumed upload's bytes were
+    /// sent by an earlier attempt.
+    fn upload_digest(&self, stage: &PreparedStage) -> UploadDigest {
+        if let Some(streamed) = streaming::of(stage) {
+            return streamed.upload_digest();
+        }
+        if let Some(single) = single::of(stage) {
+            return if single.is_native() {
+                UploadDigest::Unchecked(UploadDigestGap::NativeCopy)
+            } else {
+                UploadDigest::Matched
+            };
+        }
+        match at_destination::of(stage) {
+            Some(upload) => {
+                let current = upload.lock();
+                final_upload_digest(current.native, current.md5_etags)
+            }
+            // A `Direct` multipart upload: every part carried its `Content-MD5`.
+            None => UploadDigest::Matched,
+        }
+    }
+
     /// `GetBucketVersioning` now: `Enabled` keeps every record (P7 H1).
     async fn keeps_history(&self) -> Result<bool, StorageRoleFailure> {
         self.versioning_enabled_now(&StoragePath::root()).await
@@ -453,6 +490,17 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<crate::storage::DeleteMarkerOutcome, StorageRoleFailure> {
         self.delete_marker(path, &cancel).await
+    }
+}
+
+/// What an upload on the final key confirmed: a native fill copied server-side; an attempt that
+/// sent no part (it resumed every one) reports none; otherwise every part this attempt sent
+/// carried a `Content-MD5` the store checked — whatever the part `ETag`s look like (SSE-KMS).
+fn final_upload_digest(native: bool, md5_etags: Option<bool>) -> UploadDigest {
+    match (native, md5_etags) {
+        (true, _) => UploadDigest::Unchecked(UploadDigestGap::NativeCopy),
+        (false, None) => UploadDigest::Unchecked(UploadDigestGap::PriorAttempt),
+        (false, Some(_)) => UploadDigest::Matched,
     }
 }
 
@@ -476,4 +524,32 @@ fn foreign(stage: &PreparedStage, operation: Operation) -> StorageRoleFailure {
         Transience::Permanent,
         "S3 stage was not prepared at the destination",
     )
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::{UploadDigest, UploadDigestGap, final_upload_digest};
+
+    /// A streamed upload is `Matched` even when its part `ETag`s are not MD5s (each part's
+    /// `Content-MD5` was checked); a native fill is `NativeCopy`; an attempt that sent nothing is
+    /// `PriorAttempt`.
+    #[test]
+    fn an_upload_on_the_final_key_reports_what_it_sent() {
+        assert_eq!(
+            final_upload_digest(false, Some(true)),
+            UploadDigest::Matched
+        );
+        assert_eq!(
+            final_upload_digest(false, Some(false)),
+            UploadDigest::Matched
+        );
+        assert_eq!(
+            final_upload_digest(true, Some(false)),
+            UploadDigest::Unchecked(UploadDigestGap::NativeCopy)
+        );
+        assert_eq!(
+            final_upload_digest(false, None),
+            UploadDigest::Unchecked(UploadDigestGap::PriorAttempt)
+        );
+    }
 }

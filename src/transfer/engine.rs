@@ -8,8 +8,9 @@ use crate::model::{FailureClass, StoragePath};
 use crate::runtime::inflight::SequentialRanges;
 use crate::storage::{
     CheckpointObservation, NativePair, PrepareFact, PreparedStage, PublicationDisposition,
-    PublicationEvidence, ReadRequest, ReadSource, SourceDescriptor, SourceQosBudget,
-    SourceQosStats, StagedDestination, StorageRoleFailure, VerificationPoint, WriteEvidence,
+    PublicationEvidence, ReadBackMethod, ReadRequest, ReadSource, SourceDescriptor,
+    SourceQosBudget, SourceQosStats, StagedDestination, StorageRoleFailure, UploadDigest,
+    VerificationPoint, WriteEvidence,
 };
 use failure::source_failure;
 use negotiation::{CopiedMetadataPlan, apply_copied_metadata, copied_metadata_plan};
@@ -160,6 +161,34 @@ pub struct TransferOutcome {
     pub recovery: EffectiveRecovery,
     /// The version the publication created, for a destination that versions its objects.
     pub destination_version: Option<String>,
+    /// How the copy was checked (P7 §14.2 N4): the read-back method used (`NotPerformed` when
+    /// read-back is disabled; `EtagBracketed` with its reason where reads cannot be pinned) and
+    /// whether the store confirmed the bytes it received. A weaker method is not a failure.
+    pub verification: TransferVerification,
+}
+
+/// How one transfer's copy was checked ([`TransferOutcome::verification`]).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransferVerification {
+    /// How read-back verification read the destination (`NotPerformed` when it was disabled).
+    pub read_back_method: ReadBackMethod,
+    /// Whether the store confirmed that the bytes it stored are the bytes sent.
+    pub upload_digest: UploadDigest,
+}
+
+impl TransferVerification {
+    /// What `destination` reports for `stage`, read back or not.
+    fn of(destination: &dyn StagedDestination, stage: &PreparedStage, read_back: bool) -> Self {
+        Self {
+            read_back_method: if read_back {
+                destination.read_back_method(stage)
+            } else {
+                ReadBackMethod::NotPerformed
+            },
+            upload_digest: destination.upload_digest(stage),
+        }
+    }
 }
 
 /// Transfers, optionally verifies by read-back, and publishes one request.
@@ -251,6 +280,11 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
         .await
         .map_err(|failure| failure.with_source_qos(source_qos))?;
     }
+    let verification = TransferVerification::of(
+        &*transferred.destination,
+        &transferred.stage,
+        read_back == ReadBackVerification::Enabled,
+    );
     let PublicationEvidence {
         final_destination,
         disposition,
@@ -271,6 +305,7 @@ pub async fn transfer(request: TransferRequest) -> Result<TransferOutcome, Trans
         route,
         recovery,
         destination_version,
+        verification,
     })
 }
 

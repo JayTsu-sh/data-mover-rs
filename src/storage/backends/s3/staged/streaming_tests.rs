@@ -286,3 +286,108 @@ async fn direct_commits_inside_write() -> TestResult {
     assert_eq!(published.version, None);
     Ok(())
 }
+
+/// Read back where reads cannot be pinned (N4): bracketed by the `HEAD`'s `ETag`. The published
+/// object verifies; one replaced during the read, or gone since publication, is a permanent
+/// `Conflict`; different content
+/// under the same `ETag` (a rewrite over NFS that keeps the mtime) is a transient `Corruption`
+/// saying a replacement cannot be ruled out.
+#[tokio::test]
+async fn a_nas_object_is_read_back_bracketed_by_its_etag() -> TestResult {
+    let other = Bytes::from(vec![7_u8; SIZE]);
+    for case in ["intact", "replaced", "rewritten", "deleted"] {
+        let (protocol, destination) = nas(None).await?;
+        let stage = prepare(&destination).await?;
+        let bytes = payload();
+        destination.write(&stage, chunks(&bytes)).await?;
+        let published = destination
+            .publish(&stage, publish_request())
+            .await
+            .map_err(|failure| failure.error)?;
+        match case {
+            "replaced" => {
+                protocol.nas().replace_after_ranges = Some(("dir/final".into(), 1, other.clone()));
+            }
+            "deleted" => {
+                protocol.objects.lock().await.remove("dir/final");
+            }
+            "rewritten" => {
+                protocol
+                    .nas_rewrite_keeping_mtime("dir/final", other.clone())
+                    .await;
+            }
+            _ => {}
+        }
+        let verified = destination
+            .verify(
+                &stage,
+                VerifyRequest {
+                    expected_size: SIZE as u64,
+                    expected_blake3: *blake3::hash(&bytes).as_bytes(),
+                    cancel: CancellationToken::new(),
+                    published: Some(published),
+                },
+            )
+            .await;
+        match (case, verified) {
+            ("intact", Ok(evidence)) => assert_eq!(evidence.verified_bytes, SIZE as u64),
+            ("replaced" | "deleted", Err(error)) => {
+                assert_eq!(
+                    class_of(&error),
+                    (FailureClass::Conflict, Transience::Permanent)
+                );
+            }
+            ("rewritten", Err(error)) => {
+                assert_eq!(
+                    class_of(&error),
+                    (FailureClass::Corruption, Transience::Transient)
+                );
+                let StorageRoleFailure::Entry(failure) = &error else {
+                    return Err(format!("not an entry failure: {error:?}").into());
+                };
+                assert!(
+                    failure.diagnostic().contains("cannot be ruled out"),
+                    "{failure:?}"
+                );
+            }
+            (case, verified) => return Err(format!("{case}: {verified:?}").into()),
+        }
+        assert!(
+            protocol
+                .range_observations
+                .lock()
+                .await
+                .iter()
+                .all(|read| read.version_id.is_none() && read.etag.starts_with("\"nas-")),
+            "{case}: every range is checked against the anchor"
+        );
+    }
+    Ok(())
+}
+
+/// The upload's digest is `Matched` when the reply's `ETag` is our MD5, and `Unchecked` when the
+/// reply says the object is encrypted with a KMS key (its `ETag` is no MD5, even a wrong one is
+/// not held against it).
+#[tokio::test]
+async fn the_upload_digest_says_whether_the_reply_confirmed_our_md5() -> TestResult {
+    for encrypted in [false, true] {
+        let (protocol, destination) = nas(None).await?;
+        protocol.streaming().encrypted = encrypted;
+        if encrypted {
+            protocol.streaming().etag = Some(etag_of(b"not our bytes"));
+        }
+        let stage = prepare(&destination).await?;
+        destination.write(&stage, chunks(&payload())).await?;
+        destination
+            .publish(&stage, publish_request())
+            .await
+            .map_err(|failure| failure.error)?;
+        let expected = if encrypted {
+            crate::storage::UploadDigest::Unchecked(crate::storage::UploadDigestGap::EtagNotMd5)
+        } else {
+            crate::storage::UploadDigest::Matched
+        };
+        assert_eq!(destination.upload_digest(&stage), expected);
+    }
+    Ok(())
+}
