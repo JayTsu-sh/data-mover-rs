@@ -73,7 +73,8 @@ pub(crate) struct S3UrlOptions {
     /// `s3+https://` (HTTPS) rather than `s3://` (HTTP).
     pub(crate) https: bool,
     pub(crate) compat: S3Compatibility,
-    /// Verify the server's certificate (HTTPS only).
+    /// Verify the server's certificate against the system roots, which honour `SSL_CERT_FILE` /
+    /// `SSL_CERT_DIR` (HTTPS only; `tls_verify=false` turns it off).
     pub(crate) tls_verify: bool,
     pub(crate) bucket_type: S3BucketType,
 }
@@ -216,8 +217,7 @@ fn parse_options(query: &str, https: bool, target: S3UrlTarget) -> Result<S3UrlO
     Ok(S3UrlOptions {
         https,
         compat,
-        // Every HTTPS scheme accepts any server certificate (self-signed / private-CA deployments).
-        tls_verify: given.tls_verify.unwrap_or(!https),
+        tls_verify: given.tls_verify.unwrap_or(true),
         bucket_type,
     })
 }

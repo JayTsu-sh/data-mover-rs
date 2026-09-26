@@ -3,7 +3,8 @@
 ## 底层依赖
 
 - **crate**：`aws-sdk-s3` (1.129.0，crates.io)。
-- HTTPS：`hyper-rustls` + `rustls`，**自定义 verifier 允许自签证书**。
+- HTTPS：SDK 默认客户端（`rustls` + 系统根证书，认 `SSL_CERT_FILE` / `SSL_CERT_DIR`）；只有 URL 写
+  `tls_verify=false` 才换成 `hyper-rustls` + 不校验证书的 verifier（显式 ring provider）。
 - IAM credential 链路：标准 AWS 行为 (env / config file / IMDS)。
 
 ## URL 形式
@@ -64,11 +65,18 @@ match aws_sdk_s3::operation::get_object::GetObjectError::from(...) {
 4. EC2 IMDS (实例元数据)。
 5. ECS 容器 credential。
 
-### 自定义 TLS Verifier
+### TLS
 
-- `s3+https://` 默认允许自签证书 (MinIO / Ceph / 自建 S3 网关常见)。
-- 不暴露给用户配置 — 是安全 trade-off，library 决定。
-- 修改前必须 PR 说明。
+- `s3+https://` **默认校验证书**（P3 起）：系统根证书，认 `SSL_CERT_FILE` / `SSL_CERT_DIR` —— 私有 CA 这样信任。
+- 自签端点（DXN 8182、自建 MinIO、ECS 等）：信任其 CA，或 URL 加 `tls_verify=false`（每个连接告警一次）。
+- 证书不受信时**连接就失败**：`S3Storage::new` 的 GetBucketVersioning 探测遇证书错误报 `ConfigError`（不重试），写明两条出路；
+  `check_connectivity` / `list_buckets` 同样。`compat=hcp` 不发这次探测，错误在第一个请求出现。
+- 不校验的客户端显式用 ring provider：依赖图同时打开了 rustls 的 ring 与 aws-lc-rs，`ClientConfig::builder()` 在
+  进程没装默认 provider 时 panic（P3 之前的 `s3+https://` 就是这样）。
+- 代理：校验证书的连接走 SDK 默认客户端，认 `HTTPS_PROXY` / `NO_PROXY`；`tls_verify=false` 的客户端不认代理（与改前相同）。
+- 调试构建里主机没有任何系统根证书时，SDK 的 `debug_assert!` 会在第一个校验连接 panic（release 只告警）：容器镜像要装 CA 包。
+- 测试：`tests/s3_tls_verify.rs`（本地 TLS 端点 + `tests/data/tls` 测试 CA；子进程设 `SSL_CERT_FILE`）。
+  `tests/data/tls/server-key.pem` 是测试夹具的私钥（只签本地测试证书），秘钥扫描需放行。
 
 ### 作为拷贝源端的元数据
 
@@ -821,7 +829,8 @@ native（StorageGRID 为流式）都是一次请求（ETag 无 `-N`），同名�
 | 404 被当 retry | 已修，必须 → `FileNotFound` |
 | Multipart 失败留垃圾 | 必须 abort |
 | MinIO 列出的 upload id 与签发的写法不同 | 比较 upload id 用 `upload_pointer::same_upload`，别逐字节比 |
-| 自签证书 ECS endpoint 失败 | 用 `s3+https://` (而不是 `https` 显式) |
+| 自签 / 私有 CA 端点连接失败（证书不受信） | 把 CA 放进 `SSL_CERT_FILE`，或 URL 加 `?tls_verify=false` |
+| 旧协议名 `s3+sg://` / `s3+dxn+https://` 等 | 已删除，改写成 `?compat=` 参数（报错里给出新写法） |
 | DXN 对无 body 的 `UploadPartCopy`、ONTAP 对无 body 的 `CopyObject` 回 411 | 所有拷贝请求显式 `Content-Length: 0`（`copy_request.rs`，legacy 与 role） |
 | 把 501 `NotImplemented` 当断连重试 | 条目 `Unsupported` / Permanent（`a65ae18`）；ONTAP NAS 桶大量回 501 |
 | RustFS 暂停版本桶里 PUT 不回 `x-amz-version-id: null` | 连接时 Suspended → 按 `"null"` 记（`S3Storage::write_facts`），指针按 id 删 |

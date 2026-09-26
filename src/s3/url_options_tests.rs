@@ -44,8 +44,7 @@ const fn with(https: bool, compat: S3Compatibility, bucket_type: S3BucketType) -
     S3UrlOptions {
         https,
         compat,
-        // Until certificates are verified by default, every s3+https:// URL skips them.
-        tls_verify: !https,
+        tls_verify: true,
         bucket_type,
     }
 }
@@ -77,12 +76,16 @@ fn accepted_spellings() {
         (
             "s3+https",
             "?tls_verify=false&compat=ontap&bucket_type=nas",
-            with(true, Ontap, Nas),
+            S3UrlOptions {
+                tls_verify: false,
+                ..with(true, Ontap, Nas)
+            },
         ),
     ];
     for (scheme, query, expected) in cases {
         assert_eq!(options(scheme, query), expected, "{scheme} {query}");
     }
+    assert!(!options("s3+https", "").skips_tls_verification());
     let explicit = options("s3+https", "?compat=dxn&tls_verify=false");
     assert!(explicit.skips_tls_verification() && !explicit.tls_verify);
 }

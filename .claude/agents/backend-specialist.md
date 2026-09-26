@@ -41,7 +41,7 @@ tools: [Read, Grep, Glob, Bash]
 - 404 → `FileNotFound` (commit `7eb3046`)
 - multipart upload 大文件，失败必须 abort
 - IAM credential 链路标准 AWS
-- hyper-rustls 自定义 verifier 允许自签证书 (s3+https)
+- `s3+https://` 默认校验证书（系统根，认 SSL_CERT_FILE）；`?tls_verify=false` 才用不校验的 hyper-rustls verifier
 
 ### Local (`src/local.rs`, 1134 行)
 

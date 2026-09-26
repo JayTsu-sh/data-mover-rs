@@ -81,7 +81,7 @@
 | governor | 0.10.4 | QoS 速率限制 |
 | moka | 0.12.15 | NFS 属性缓存 |
 | glob | 0.3.3 | filter glob 匹配 |
-| hyper-rustls + rustls | — | S3 HTTPS (允许自签证书) |
+| hyper-rustls + rustls | — | S3 HTTPS（默认校验证书；`tls_verify=false` 时不校验的客户端） |
 | thiserror | — | 错误派生 |
 | tracing | — | 日志 |
 | rayon | — | local.rs 并行 delete |

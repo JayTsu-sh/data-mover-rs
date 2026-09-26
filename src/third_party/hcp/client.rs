@@ -1,52 +1,93 @@
 use std::sync::Arc;
 
 use quick_xml::de::from_str;
-use reqwest::Client;
 use reqwest::cookie::Jar;
+use reqwest::{Client, ClientBuilder};
 
 use crate::Tag;
 use crate::error::{Result, StorageError};
 
+/// How the HCP REST client reaches its namespace: as the namespace's S3 URL does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HcpTransport {
+    /// `http://`: the `hcp-ns-auth` cookie crosses the network in clear text.
+    Http,
+    /// `https://`, the server certificate verified unless the S3 URL says `tls_verify=false`.
+    Https { verify_certificates: bool },
+}
+
+/// The HCP REST interface of one namespace, reached like the namespace's S3 URL: the same scheme,
+/// host and port (`{scheme}://{namespace}.{host}[:port]`), and certificates verified unless the
+/// URL says `tls_verify=false`.
 #[derive(Clone, Debug)]
 pub struct HCPRestClient {
     client: Client,
-    bucket_name: String,
-    host: String,
+    /// `{scheme}://{namespace}.{host}[:port]`.
+    base_url: String,
 }
 
 impl HCPRestClient {
+    /// A client for namespace `bucket_name` at `authority` (`host[:port]`); the `hcp-ns-auth`
+    /// cookie carries the key pair.
     ///
     /// # Errors
     ///
-    /// Returns an error when the requested storage operation cannot be completed.
+    /// Returns an error when the base URL is invalid or the HTTP client cannot be built.
     pub fn try_new(
-        bucket_name: String,
-        host: String,
+        bucket_name: &str,
+        authority: &str,
+        transport: HcpTransport,
         access_key: &str,
         secret_access_key: &str,
     ) -> Result<Self> {
-        let cookie_jar = Jar::default();
-        let base_url = format!("http://{bucket_name}.{host}");
+        let accept_invalid_certs = matches!(
+            transport,
+            HcpTransport::Https {
+                verify_certificates: false
+            }
+        );
+        Self::with_builder(
+            bucket_name,
+            authority,
+            transport,
+            (access_key, secret_access_key),
+            Client::builder().tls_danger_accept_invalid_certs(accept_invalid_certs),
+        )
+    }
+
+    fn with_builder(
+        bucket_name: &str,
+        authority: &str,
+        transport: HcpTransport,
+        (access_key, secret_access_key): (&str, &str),
+        builder: ClientBuilder,
+    ) -> Result<Self> {
+        let scheme = match transport {
+            HcpTransport::Http => "http",
+            HcpTransport::Https { .. } => "https",
+        };
+        let base_url = format!("{scheme}://{bucket_name}.{authority}");
         let parsed_url = base_url.parse().map_err(|e| {
             StorageError::ConfigError(format!("Invalid HCP base URL '{base_url}': {e}"))
         })?;
+        let cookie_jar = Jar::default();
         cookie_jar.add_cookie_str(
             &format!("hcp-ns-auth={access_key}:{secret_access_key}"),
             &parsed_url,
         );
-
-        let client = Client::builder()
+        let client = builder
             .cookie_provider(Arc::new(cookie_jar))
             .build()
             .map_err(|e| {
                 StorageError::OperationError(format!("Failed to create HCP HTTP client: {e}"))
             })?;
+        Ok(HCPRestClient { client, base_url })
+    }
 
-        Ok(HCPRestClient {
-            client,
-            bucket_name,
-            host,
-        })
+    /// The `{scheme}://{namespace}.{host}[:port]` every request goes to.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     ///
@@ -55,8 +96,8 @@ impl HCPRestClient {
     /// Returns an error when the requested storage operation cannot be completed.
     pub async fn get_tags(&self, path: &str) -> Result<Vec<Tag>> {
         let url = format!(
-            "http://{}.{}/rest{}?type=custom-metadata&annotation=BPM",
-            self.bucket_name, self.host, path
+            "{}/rest{path}?type=custom-metadata&annotation=BPM",
+            self.base_url
         );
 
         let request = self.client.get(&url);
@@ -209,3 +250,7 @@ impl MetaData {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod tests;

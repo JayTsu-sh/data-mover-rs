@@ -240,4 +240,5 @@ S3_ENV=$E BUCKET_PREFIX=data-mover-dxn S3_LOCATION=magnascale:tos_placement time
 - 版本化桶里留下 `.data-mover-*.upload` 版本或删除标记 → 指针没按版本删：看 `upload_pointer::delete` 拿到的版本
   （写入回的 `reported_version`、读回 HEAD 的版本、discovery 读到的版本）；`MemoryS3` 的
   `plain_deletes_of_final_keys()` 必须一直为空
-- 自签证书拒绝 → 用 s3+https 不是 https；检查 hyper-rustls verifier 配置
+- 证书不受信（自签 / 私有 CA）→ 把 CA 放进 `SSL_CERT_FILE`，或 `S3_TLS_VERIFY=false`（URL 加 `tls_verify=false`）
+- `the scheme s3+…:// was removed` → 旧协议名，按报错改写成 `?compat=` 参数

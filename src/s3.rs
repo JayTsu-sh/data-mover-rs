@@ -27,8 +27,9 @@ use aws_smithy_runtime_api::client::http::{
 use aws_smithy_runtime_api::client::orchestrator::{
     HttpRequest as SdkHttpRequest, HttpResponse as SdkHttpResponse,
 };
-use aws_smithy_runtime_api::client::result::ConnectorError;
+use aws_smithy_runtime_api::client::result::{ConnectorError, SdkError};
 use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::error::display::DisplayErrorContext;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_types::region::Region;
 use bytes::Bytes;
@@ -40,6 +41,7 @@ use hyper_util::client::legacy::connect::HttpConnector as HyperHttpConnector;
 use hyper_util::rt::TokioExecutor;
 use rustls::ClientConfig as RustlsClientConfig;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::ring::default_provider as ring_provider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde::{Deserialize, Serialize};
@@ -55,7 +57,7 @@ use crate::qos::QosManager;
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::backends::s3::KeyHistory;
 use crate::storage_enum::{StorageEnum, path_to_s3_key};
-use crate::third_party::hcp::client::HCPRestClient;
+use crate::third_party::hcp::client::{HCPRestClient, HcpTransport};
 use crate::transfer_concurrency::{
     TransferBackend, TransferConcurrency, resolve_transfer_concurrency,
 };
@@ -213,7 +215,8 @@ struct ParsedS3Url {
     bucket_name: String,
     endpoint: String,
     prefix: String,
-    host: String,
+    /// `host[:port]` of the endpoint.
+    authority: String,
     options: S3UrlOptions,
 }
 
@@ -258,13 +261,6 @@ fn parse_s3_url(url: &str) -> Result<ParsedS3Url> {
         )
     };
 
-    // 提取主机部分（不包含端口）
-    let host_only = host_and_port
-        .split(':')
-        .next()
-        .unwrap_or(&host_and_port)
-        .to_string();
-
     // 构建HTTP端点，根据URL的scheme决定使用http还是https
     let endpoint = format!("{http_scheme}://{host_and_port}");
 
@@ -284,12 +280,12 @@ fn parse_s3_url(url: &str) -> Result<ParsedS3Url> {
         bucket_name,
         endpoint,
         prefix,
-        host: host_only,
+        authority: host_and_port,
         options,
     })
 }
 
-/// TLS 证书验证跳过器（用于自签名/私有 CA 证书场景，通过 s3+https:// scheme 隐式启用）
+/// TLS 证书验证跳过器（自签名 / 私有 CA 证书的端点，只在 URL 写了 `tls_verify=false` 时使用）
 #[derive(Debug)]
 struct NoVerifier;
 
@@ -371,11 +367,14 @@ impl SdkHttpConnector for SkipVerifyConnector {
     }
 }
 
-/// 构建跳过 TLS 证书验证的 AWS SDK HTTP 客户端（s3+https:// scheme 时使用）
-fn build_skip_verify_http_client() -> SharedHttpClient {
-    // SECURITY NOTE: dangerous() 仅在用户使用 s3+https:// scheme 时调用，
-    // 跳过证书验证仅适用于受信任的私有环境（如 MinIO 自签名证书部署）
-    let tls_config = RustlsClientConfig::builder()
+/// 构建跳过 TLS 证书验证的 AWS SDK HTTP 客户端（`s3+https://…?tls_verify=false` 时使用）
+fn build_skip_verify_http_client() -> Result<SharedHttpClient> {
+    // SECURITY NOTE: dangerous() 仅在 URL 显式写了 tls_verify=false 时调用（默认校验证书，系统根证书，
+    // 认 SSL_CERT_FILE / SSL_CERT_DIR）。跳过证书验证仅适用于受信任的私有环境（自签名证书部署）。
+    // 显式指定 ring：本 crate 的依赖同时打开了 rustls 的 ring 与 aws-lc-rs，进程默认 provider 无法自动选定。
+    let tls_config = RustlsClientConfig::builder_with_provider(Arc::new(ring_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| StorageError::ConfigError(format!("TLS client configuration: {error}")))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
         .with_no_client_auth();
@@ -393,7 +392,34 @@ fn build_skip_verify_http_client() -> SharedHttpClient {
         inner: hyper_client,
     };
 
-    http_client_fn(move |_settings, _components| SharedHttpConnector::new(skip_connector.clone()))
+    Ok(http_client_fn(move |_settings, _components| {
+        SharedHttpConnector::new(skip_connector.clone())
+    }))
+}
+
+/// The error for a request whose connection failed on the server's certificate, saying how to
+/// trust it; `None` for any other failure (a service error never counts, whatever it says). A
+/// `ConfigError`: retrying cannot change the certificate.
+fn untrusted_certificate<E, R>(endpoint: &str, error: &SdkError<E, R>) -> Option<StorageError> {
+    let SdkError::DispatchFailure(failure) = error else {
+        return None;
+    };
+    let detail = DisplayErrorContext(failure.as_connector_error()?).to_string();
+    detail.contains("certificate").then(|| {
+        StorageError::ConfigError(format!(
+            "S3 endpoint {endpoint}: TLS certificate verification failed ({detail}); trust the \
+             endpoint's CA through SSL_CERT_FILE / SSL_CERT_DIR, or add tls_verify=false to the \
+             s3+https:// URL (the certificate is then not verified)"
+        ))
+    })
+}
+
+/// The one warning of a connection that does not verify the server certificate.
+fn warn_unverified(context: &str, endpoint: &str) {
+    warn!(
+        "S3 {context}: {endpoint} with tls_verify=false — the server certificate is not verified; \
+         use it only on a trusted network"
+    );
 }
 
 fn build_s3_config(sdk_config: &SdkConfig, compatibility: S3Compatibility) -> aws_sdk_s3::Config {
@@ -703,13 +729,16 @@ impl S3Storage {
         self.transfer_concurrency = concurrency;
         self
     }
+    /// The bucket's versioning status, `None` when the store cannot tell. The one request every
+    /// connection makes: a server certificate that is not trusted fails the connection here.
     async fn detect_bucket_versioning(
         client: &Client,
         bucket_name: &str,
-        compatibility: S3Compatibility,
-    ) -> Option<BucketVersioningStatus> {
-        if compatibility == S3Compatibility::Hcp {
-            return Some(BucketVersioningStatus::Enabled);
+        endpoint: &str,
+        options: S3UrlOptions,
+    ) -> Result<Option<BucketVersioningStatus>> {
+        if options.compat == S3Compatibility::Hcp {
+            return Ok(Some(BucketVersioningStatus::Enabled));
         }
         match client
             .get_bucket_versioning()
@@ -720,9 +749,14 @@ impl S3Storage {
             Ok(response) => {
                 let status = response.status().cloned();
                 debug!("bucket {bucket_name} versioning status: {status:?}");
-                status
+                Ok(status)
             }
             Err(error) => {
+                if options.https
+                    && let Some(untrusted) = untrusted_certificate(endpoint, &error)
+                {
+                    return Err(untrusted);
+                }
                 let code = error
                     .as_service_error()
                     .and_then(ProvideErrorMetadata::code);
@@ -734,7 +768,7 @@ impl S3Storage {
                 } else {
                     error!("failed to get versioning status for {bucket_name}: {error:?}");
                 }
-                None
+                Ok(None)
             }
         }
     }
@@ -763,24 +797,26 @@ impl S3Storage {
         let mut sdk_builder = SdkConfig::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(region.to_string()))
-            .endpoint_url(endpoint)
+            .endpoint_url(endpoint.clone())
             .credentials_provider(credentials_provider)
             .timeout_config(s3_timeout_config());
         if options.skips_tls_verification() {
-            warn!(
-                "S3 list_buckets: 使用 s3+https scheme，TLS 证书验证已跳过，仅用于受信任的私有环境"
-            );
-            sdk_builder = sdk_builder.http_client(build_skip_verify_http_client());
+            warn_unverified("list_buckets", &endpoint);
+            sdk_builder = sdk_builder.http_client(build_skip_verify_http_client()?);
         }
         let sdk_config = sdk_builder.build();
 
         let client = Client::from_conf(build_s3_config(&sdk_config, options.compat));
 
-        let response = client
-            .list_buckets()
-            .send()
-            .await
-            .map_err(|e| StorageError::S3Error(format!("Failed to list S3 buckets: {e:?}")))?;
+        let response = client.list_buckets().send().await.map_err(|e| {
+            options
+                .https
+                .then(|| untrusted_certificate(&endpoint, &e))
+                .flatten()
+                .unwrap_or_else(|| {
+                    StorageError::S3Error(format!("Failed to list S3 buckets: {e:?}"))
+                })
+        })?;
 
         let buckets = response
             .buckets()
@@ -810,7 +846,7 @@ impl S3Storage {
             bucket_name,
             endpoint,
             prefix,
-            host,
+            authority,
             options,
         } = parse_s3_url(url)?;
         if options.bucket_type == S3BucketType::Nas {
@@ -845,10 +881,8 @@ impl S3Storage {
             // 配置超时参数，避免连接挂起或不完整消息错误
             .timeout_config(s3_timeout_config());
         if options.skips_tls_verification() {
-            warn!(
-                "S3 Storage::new: 使用 s3+https scheme，TLS 证书验证已跳过，仅用于受信任的私有环境"
-            );
-            sdk_builder = sdk_builder.http_client(build_skip_verify_http_client());
+            warn_unverified("connection", &endpoint);
+            sdk_builder = sdk_builder.http_client(build_skip_verify_http_client()?);
         }
         let sdk_config = sdk_builder.build();
 
@@ -866,9 +900,17 @@ impl S3Storage {
 
         // 如果是HCP存储类型，创建HCP客户端
         let hcp_client = if options.compat == S3Compatibility::Hcp {
-            Some(crate::third_party::hcp::client::HCPRestClient::try_new(
-                bucket_name.clone(),
-                host,
+            let transport = if options.https {
+                HcpTransport::Https {
+                    verify_certificates: options.tls_verify,
+                }
+            } else {
+                HcpTransport::Http
+            };
+            Some(HCPRestClient::try_new(
+                &bucket_name,
+                &authority,
+                transport,
                 &access_key,
                 &secret_key,
             )?)
@@ -878,7 +920,7 @@ impl S3Storage {
 
         // 检查桶是否启用了版本控制
         let versioning =
-            Self::detect_bucket_versioning(&client, &bucket_name, options.compat).await;
+            Self::detect_bucket_versioning(&client, &bucket_name, &endpoint, options).await?;
         let is_bucket_versioned = versioning == Some(BucketVersioningStatus::Enabled);
         let versioning_suspended = versioning == Some(BucketVersioningStatus::Suspended);
 
@@ -913,7 +955,15 @@ impl S3Storage {
             .bucket(&self.bucket_name)
             .send()
             .await
-            .map_err(|e| StorageError::S3Error(format!("S3 connectivity check failed: {e}")))?;
+            .map_err(|e| {
+                self.options
+                    .https
+                    .then(|| untrusted_certificate(&self.endpoint, &e))
+                    .flatten()
+                    .unwrap_or_else(|| {
+                        StorageError::S3Error(format!("S3 connectivity check failed: {e}"))
+                    })
+            })?;
         Ok(())
     }
 
@@ -4754,7 +4804,7 @@ mod tests {
             bucket_name: bucket,
             endpoint,
             prefix,
-            host,
+            authority,
             options,
             ..
         } = parsed;
@@ -4763,7 +4813,7 @@ mod tests {
         assert_eq!(bucket, "bucket");
         assert_eq!(endpoint, "http://192.168.3.210:10444");
         assert_eq!(prefix, "");
-        assert_eq!(host, "192.168.3.210");
+        assert_eq!(authority, "192.168.3.210:10444");
         assert_eq!(options.compat, S3Compatibility::Standard);
     }
 
@@ -4776,7 +4826,7 @@ mod tests {
             bucket_name: bucket,
             endpoint,
             prefix,
-            host,
+            authority,
             options,
             ..
         } = parse_s3_url(url).assert_value("test value should be present");
@@ -4785,7 +4835,7 @@ mod tests {
         assert_eq!(bucket, "mybucket");
         assert_eq!(endpoint, "http://minio.example.com:9000");
         assert_eq!(prefix, "data/prefix/");
-        assert_eq!(host, "minio.example.com");
+        assert_eq!(authority, "minio.example.com:9000");
         assert_eq!(options.compat, S3Compatibility::Standard);
     }
 
@@ -4797,7 +4847,7 @@ mod tests {
             secret_key: sk,
             bucket_name: bucket,
             endpoint,
-            host,
+            authority,
             options,
             ..
         } = parse_s3_url(url).assert_value("test value should be present");
@@ -4805,7 +4855,7 @@ mod tests {
         assert_eq!(sk, "sk");
         assert_eq!(bucket, "bucket");
         assert_eq!(endpoint, "https://host.com:443");
-        assert_eq!(host, "host.com");
+        assert_eq!(authority, "host.com:443");
         assert_eq!(options.compat, S3Compatibility::Standard);
     }
 
@@ -4818,7 +4868,7 @@ mod tests {
             bucket_name: bucket,
             endpoint,
             prefix,
-            host,
+            authority,
             ..
         } = parse_s3_url(url).assert_value("test value should be present");
         assert_eq!(ak, "ak");
@@ -4826,7 +4876,7 @@ mod tests {
         assert_eq!(bucket, "bucket");
         assert_eq!(endpoint, "http://host.com:9000");
         assert_eq!(prefix, "");
-        assert_eq!(host, "host.com");
+        assert_eq!(authority, "host.com:9000");
     }
 
     #[test]
@@ -4857,14 +4907,17 @@ mod tests {
         assert_eq!(prefix, "prefix/");
     }
 
-    // --- tls_skip_verify 解析测试（HTTPS schemes 自动跳过 TLS 验证）---
+    // --- TLS 校验解析测试（s3+https 默认校验，tls_verify=false 才跳过）---
 
     #[test]
-    fn test_parse_s3_url_https_skips_tls() {
-        // s3+https scheme 自动启用跳过验证
+    fn test_parse_s3_url_https_verifies_unless_told_not_to() {
+        // s3+https 默认校验证书，只有 tls_verify=false 才跳过
         let url = "s3+https://ak:sk@bucket.host.com:443/prefix";
         let ParsedS3Url { options, .. } =
             parse_s3_url(url).assert_value("test value should be present");
+        assert!(options.tls_verify && !options.skips_tls_verification());
+        let ParsedS3Url { options, .. } = parse_s3_url(&format!("{url}?tls_verify=false"))
+            .assert_value("test value should be present");
         assert!(options.skips_tls_verification());
     }
 
@@ -4878,11 +4931,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_s3_endpoint_url_https_skips_tls() {
-        // s3+https scheme 自动启用跳过验证
+    fn test_parse_s3_endpoint_url_https_verifies_unless_told_not_to() {
         let url = "s3+https://ak:sk@host.com:9000";
-        let (_, _, endpoint, options) =
+        let (_, _, _, options) =
             parse_s3_endpoint_url(url).assert_value("test value should be present");
+        assert!(!options.skips_tls_verification());
+        let (_, _, endpoint, options) = parse_s3_endpoint_url(&format!("{url}?tls_verify=false"))
+            .assert_value("test value should be present");
         assert!(options.skips_tls_verification());
         assert!(endpoint.starts_with("https://"));
         assert_eq!(options.compat, S3Compatibility::Standard);

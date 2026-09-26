@@ -70,6 +70,7 @@
 | 其他 GetObject 错误 | `S3Error(...)` |
 | HeadObject 404 | `FileNotFound(key)` |
 | 网络错误 | `S3Error(...)` (走 delay_backoff) |
+| `s3+https://` 连接时证书校验失败（自签 / 私有 CA / 过期 / 主机名不符） | `ConfigError(...)`，报错写明 `SSL_CERT_FILE` / `tls_verify=false`；重试改变不了证书 |
 
 role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 
