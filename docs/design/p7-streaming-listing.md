@@ -580,7 +580,7 @@ struct VersionRecord {
 3. DXN 的 null 版本丢失是存储自身的缺陷：作为源，它的历史里本来就没有了；作为**目标**，往 DXN 写删除标记会删掉目标上已有的 null 版本。历史迁移到 DXN 时要在报告里说明，
    或者避免在目标上对曾有 null 版本的 key 写删除标记。写进 `.claude/docs/storage-s3.md` 的 DXN 差异。
 4. MinIO / DXN 会合并连续的删除标记，StorageGRID 不会；迁移到前两者时计入“目标合并了 N 个删除标记”。
-5. Q22（2026-09-26 调研 + 实测）：ONTAP 9.19.1 **对象桶**在各种列举形式、页大小、delimiter、start-after 下都是 UTF-8 字节序，开后台重删 + 压缩、扫描前 / 中 / 后都不变（11,101 个 key、三轮扫描）；有文档的无序是 **NAS 桶**（KB CONTAP-675913，按目录遍历序，`/` 排在 `*` `+` `.` 前）。实验环境：FAS2750 SVM lizy 的桶 data-mover-test / data-mover-test-ver（见 e2e-s3 的 ontap/.env）。NAS 桶需另建（未批准），在那之前用内存 fake 的“打乱顺序”模式覆盖。
+5. Q22（2026-09-26 调研 + 实测）：ONTAP 9.19.1 **对象桶**在各种列举形式、页大小、delimiter、start-after 下都是 UTF-8 字节序，开后台重删 + 压缩、扫描前 / 中 / 后都不变（11,101 个 key、三轮扫描）；有文档的无序是 **NAS 桶**（KB CONTAP-675913，按目录遍历序，`/` 排在 `*` `+` `.` 前）。实验环境：FAS2750 SVM lizy 的桶 data-mover-test / data-mover-test-ver（见 e2e-s3 的 ontap/.env）。**NAS 桶实测（用户建议，2026-09-26）**：在 lizy 上建 NAS 桶 data-mover-nas（FlexVol dm_s3_nas，重删 + 压缩），279 个特意挑选的 key：不带 delimiter 的平铺列举**不是字节序**，而是按路径逐段排序（`/` 最小，整棵 `a/` 子树排在 `a*b` `a+b` `a.b` 前）—— 目录遍历序，页大小 1000 / 50 / 7 下一致、无重复；带 delimiter 逐层列举每层有序、递归走完 279 个不漏；NAS 桶不支持 ListObjectVersions。它作为“无序 S3”的真机环境加入矩阵。
 
 ### 10.3 方案
 
@@ -888,9 +888,10 @@ VERIFY
   - ONTAP S3（FAS2750 ONTAP 9.19.1，SVM lizy，http://10.128.61.200:80，`ontap/.env`）：对象桶 data-mover-test / data-mover-test-ver，
     卷开后台重删 + 压缩；我们的用户不建桶 → 脚本用已有桶、跑完清空对象（不删桶）。已知：列举字节序；带 delimiter 的 ListObjectVersions
     可能缺 NextVersionIdMarker 丢版本（现存问题 10 / F4）；CommonPrefix 计入 max-keys；满页后跟空末页
+  - ONTAP S3 **NAS 桶** data-mover-nas（同一端点、同一用户，FlexVol dm_s3_nas 重删 + 压缩）：平铺列举无序（目录遍历序）、无版本 —— “无序 S3”的真机
   - RustFS 1.0.0（VM 105，管理网 http://10.131.9.14:9001 —— 控制台端口也提供 S3 API，`rustfs/.env`，数据可丢弃）
   - DXN / StorageGRID 仍只在用户单独批准时用（临时桶）
-- 无序 S3：内存 fake 的打乱模式（真实无序的是 ONTAP NAS 桶，未建；Q22）
+- 无序 S3：ONTAP NAS 桶（上面）+ 内存 fake 的打乱模式（Q22）
 - HDFS 真机（10.131.9.11 runner）每次需要用户批准（C8 已于 2026-09-26 批准并通过）
 ```
 
@@ -954,7 +955,7 @@ VERIFY
 
 | 编号 | 决定 / 结果 | 见 |
 |---|---|---|
-| Q22 | 无序 S3 的真实例子是 ONTAP **NAS 桶**（KB CONTAP-675913）；ONTAP 对象桶开重删 / 压缩仍有序（实测）。保持“不假设有序”；NAS 桶进矩阵需批准，先用 fake 打乱模式 | §5.3 |
+| Q22 | 无序 S3 的真实例子是 ONTAP **NAS 桶**（KB CONTAP-675913，实测平铺列举为目录遍历序）；ONTAP 对象桶开重删 / 压缩仍有序（实测）。保持“不假设有序”；NAS 桶 data-mover-nas 已进 S3 真机矩阵，另加 fake 打乱模式 | §5.3 |
 | Q30 | 已批准并完成：DXN 与 StorageGRID 实测见 10.2.1。新发现 DXN 的 null 版本丢失缺陷与多网关时间倒挂 | §10.2.1 |
 
 **目前没有待用户决定的问题。**
