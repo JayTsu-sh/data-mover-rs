@@ -4,13 +4,13 @@
 use std::ops::Range;
 
 use aws_sdk_s3::types::{MetadataDirective, TaggingDirective};
-use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
 use super::{
     CompletedPart, ProvideErrorMetadata, S3NativeCopySource, S3ProtocolFailure, S3Result,
     S3Storage, S3WriteFacts, build_copy_source, s3_role_remote_failure, s3_role_transport_failure,
 };
+use crate::s3::copy_request::state_empty_body;
 
 fn copy_source(source: &S3NativeCopySource) -> String {
     let mut value = build_copy_source(&source.bucket, &source.key);
@@ -19,15 +19,6 @@ fn copy_source(source: &S3NativeCopySource) -> String {
         value.push_str(&utf8_percent_encode(version, NON_ALPHANUMERIC).to_string());
     }
     value
-}
-
-/// States the empty body of an `UploadPartCopy`: `Content-Length: 0`. The SDK sends no length for
-/// a request without a body (hyper omits it), and Ceph RGW — DXN — handles `UploadPartCopy` as a
-/// part upload, which must state its length: without it the answer is `411 MissingContentLength`.
-/// RFC 9110 has a client send it on a `PUT` anyway; AWS and `MinIO` accept it. `CopyObject` is
-/// left as it is: RGW handles it apart and accepts it without a length.
-fn state_empty_body(request: &mut HttpRequest) {
-    request.headers_mut().insert("content-length", "0");
 }
 
 async fn copy_part(
@@ -75,6 +66,8 @@ pub(super) async fn copy_from(
         .copy_source_if_match(&source.etag)
         .metadata_directive(MetadataDirective::Replace)
         .tagging_directive(TaggingDirective::Replace)
+        .customize()
+        .mutate_request(state_empty_body)
         .send()
         .await
         .map_err(|error| classify_sdk!(error, "S3 native CopyObject request failed"))?;
@@ -231,8 +224,8 @@ mod tests {
 
     /// Both copies pin the source: `x-amz-copy-source-if-match` carries the bound `ETag`, and
     /// `x-amz-copy-source` names the bound version when there is one (none otherwise).
-    /// `CopyObject` replaces the source's metadata and tags with none (ADR-0006 C18), and
-    /// `UploadPartCopy` states its empty body (`Content-Length: 0`) for Ceph RGW / DXN.
+    /// `CopyObject` replaces the source's metadata and tags with none (ADR-0006 C18), and both
+    /// state their empty body (`Content-Length: 0`) for ONTAP and Ceph RGW / DXN.
     #[tokio::test]
     async fn copies_pin_the_source_and_copy_no_metadata() {
         for version in [None, Some("v 1")] {
@@ -273,10 +266,10 @@ mod tests {
                 header(&seen[1], "x-amz-copy-source-range"),
                 Some("bytes=0-9")
             );
-            // Ceph RGW (DXN) refuses an `UploadPartCopy` without a length (411); `CopyObject`
-            // is accepted as the SDK sends it.
+            // Ceph RGW (DXN) refuses an `UploadPartCopy` without a length, ONTAP a `CopyObject`
+            // without one (411): both state their empty body.
             assert_eq!(header(&seen[1], "content-length"), Some("0"));
-            assert_eq!(header(&seen[0], "content-length"), None);
+            assert_eq!(header(&seen[0], "content-length"), Some("0"));
         }
     }
 

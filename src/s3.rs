@@ -133,6 +133,7 @@ async fn unknown_resume_point(
 }
 
 mod architecture;
+mod copy_request;
 mod delete_objects_md5;
 mod dxn;
 mod multipart_rename;
@@ -1515,6 +1516,8 @@ impl S3Storage {
             .copy_source(copy_source)
             .bucket(dst_bucket)
             .key(dst_key)
+            .customize()
+            .mutate_request(copy_request::state_empty_body)
             .send()
             .await
             .map_err(|e| StorageError::S3Error(format!("CopyObject failed: {e:?}")))?;

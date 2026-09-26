@@ -1,6 +1,6 @@
 use super::{
     CompletedPart, Result, S3Storage, StorageError, Tag, build_copy_source, build_tagging_str,
-    error,
+    copy_request, error,
 };
 
 const COPY_PART_MIN: u64 = 5 * 1024 * 1024;
@@ -44,6 +44,8 @@ impl S3Storage {
                 .part_number(part_number)
                 .copy_source(copy_source)
                 .copy_source_range(format!("bytes={start}-{end}"))
+                .customize()
+                .mutate_request(copy_request::state_empty_body)
                 .send()
                 .await;
             let part = match response {
