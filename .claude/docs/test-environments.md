@@ -116,7 +116,7 @@
 - **我们的独立租户 `data-mover-test`**（2026-09-26 用户批准建，account id 76970436579964471308，配额 100 GB，S3 能力；租户 root 凭据在 lab 文件，
   S3 密钥只在 `.env`）：桶 `data-mover-test`（无版本）、`data-mover-test-ver`（开版本）；租户内可建临时 `data-mover-*` 桶，用完删光。
   其他 7 个租户（xuyh、shenxm、zy1、c1、ccma、zhangpeng、shenxm1）与旧 `storage-bucket1` 都是别人的，不碰。
-- 已知：**CreateBucket 必须带 `Content-Length: 0`**（否则 411）；ListMultipartUploads 带前缀可用；最新已是删除标记时再 DELETE 每次新建标记（不合并）；
+- 已知：**CreateBucket 必须带 `Content-Length: 0`**（否则 411）；ListMultipartUploads 带前缀可用；最新已是删除标记时再 DELETE 每次新建标记（不合并）；ListObjectVersions 拒绝空的 `version-id-marker`（400）；
   版本顺序实测（原始 XML 交错、同毫秒并列）见 P7 设计 §10.2.1。
 - 撤销：清空并删除两个桶（及残留临时桶）→ Grid Manager 删除租户 `data-mover-test`。
 

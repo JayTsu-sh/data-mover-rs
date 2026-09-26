@@ -588,8 +588,17 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - **子项顺序**：一起描述的子项（Current 的一个服务端页、All 的整个目录）按 S3 key 序，公共前缀带尾 `/` 比较
   （`a` < `a!` < `a-0` < `a.txt` < `a/`）；同名的对象 `a` 与目录 `a` 并存。遍历块内保持这个列举序（P7 C4 删了兄弟排序与
   `rank`）：同一 key 的版本连续、从旧到新；只有前缀 `a` 被下钻，下钻按子目录名字节序。
-- **异常 key**：目录自己的零字节标记对象 `p/` 跳过；有内容的 `p/`（All 模式下它**任何一个旧版本**有内容也算，
-  所以 Current 干净的目录在 All 下可能是 `Partial`）、空段 / `.` / `..` 段（`a//`、根下的 `/x`、`./x`、`a/./b`、
+- **目录对象**（P7 F5，键以 `/` 结尾，有没有内容都算）：目录 `p` 自己的键 `p/` 由 `p` 的列举作为**空名的文件子项**交出，
+  路径恰为 `p/`（name 对 filter 是 `p`、深度同 `p` 的子项、页内排在最前）；Current 只要存在就交出（零字节文件夹标记也是
+  零字节文件条目），每个列举只交一次；All 交出这个键的整段历史（有内容版本、零字节版本、删除标记，旧→新）。身份
+  `PathScoped(len‖"p/"‖ETag)` / `VersionScoped`，与文件 `p`、目录 `p` 都不冲突。存储根自己的键（URL 前缀本身）：
+  零字节 / 全零历史忽略，有内容 → 根上的 `Unsupported` 子项失败；扫描根 `p` 自己的 `p/` 同理（遍历处理）。`stat("p/")`
+  只 HEAD，不存在 → `NotFound`。MinIO 2023：版本桶里最新是删除标记的 `p/` 仍被 ListObjectsV2 列成无 ETag、0 字节的
+  Contents（HEAD 404）→ 不是子项。legacy `walkdir` / `walkdir_2` 不交出条目，对有内容的报 Scan 错误（F5a）。
+  目的端写 `p/d/`：单 PUT / multipart / native 都写这个键，`.upload` 指针在**父目录** `p/`，名字按 `d/` 算
+  （`p/.data-mover-<digest("d/")>.upload`，`artifacts::directory_object_artifact`），不放进 `d/` 里。
+  各存储差异见下「目录对象真机」。
+- **异常 key**：空段 / `.` / `..` 段（`a//`、根下的 `/x`、`./x`、`a/./b`、
   `a/..`）是逐子项失败（报在服务器拼写的路径上，列举 `Partial`），不会被并进别的路径 —— 目的端的路径处理会把
   `a/./b` 折成 `a/b`，两个对象写到同一个文件；`List("a/")` / `"a//b"` / `"a/."` 这类路径 `InvalidInput`。不理 delimiter 的存储
   平铺返回的深层 key 在客户端收拢成一级前缀（去重）。`.data-mover-*` 两种模式都隐藏（key 或任意一段前缀）。
@@ -777,6 +786,21 @@ data-mover 按上表失败。唯一的 data-mover 缺陷是 501 被当成可重�
 | 文件 / 目录冲突 | 有文件 `a` 时 PUT `a/x` → **404 NoSuchKey**；有 `a/x` 时 PUT `a` 或带内容的 `a/` → **409 NameCollision** |
 | `d/` | 0 字节建真目录（HEAD 404、仅分隔符列举可见）；带内容存成文件 `d` |
 | 同桶 CopyObject | 克隆：1 GiB 0.01 s，副本独立，目标 mtime = 拷贝时刻 |
+
+### 目录对象真机（P7 F5，2026-09-26，`directory_objects.sh`）
+
+| 存储 | 写 `d/`（单 PUT） | multipart 写 `d/` | 版本桶里的 `d/` | 其他 |
+|---|---|---|---|---|
+| MinIO RELEASE.2023-03-20 | 可以（含内容） | **拒绝**：400 `XMinioInvalidObjectName` → 条目 `Unsupported`（> 8 MiB 的 `d/` 写不了，native > 64 MiB 同样） | 正常记版本；最新是删除标记时 ListObjectsV2 仍列出无 ETag、0 字节的 `d/`（HEAD 404）→ 列举不当子项，父目录仍列前缀 `d/` | 合并连续删除标记 |
+| ONTAP 9.19.1 对象桶 | 可以 | 可以（指针在父目录，切断续传通过） | 正常 | 不合并删除标记 |
+| DXN（Ceph RGW Octopus） | 可以 | 可以 | 正常 | 合并连续删除标记；只有 null 版本的 key 重开版本后写新版本再 DELETE：删掉 null 版本并写标记 |
+| StorageGRID 11.5 | 可以 | 可以（`s3+sg` 不走 native） | 正常 | 已删除的 key 再 DELETE 每次新建标记 |
+| RustFS 1.0.0 | 可以 | **完成后存成 `d`**（去掉 `/`，HEAD `d/` 404）：读回报 `NotFound`，但写到了同名文件 `d` 上 | **不记版本**：每次写都是 `null`，DELETE 直接删掉（`x-amz-delete-marker: false`） | native UploadPartCopy 从 `d/` 源：版本桶里会话 Connectivity 失败，非版本桶里同样被存成 `d` |
+| ONTAP NAS 桶 | 零字节：200 但不留对象（只是目录）；有内容且先于子项：存成**文件 `d`**，之后子项 404；有内容且子项已在：409 | NAS 桶本来就只适合作源（见 test-environments） | 不支持版本 | 平铺列举无序 |
+
+写入目录对象的差异（MinIO 拒绝、RustFS 改名覆盖同名文件、NAS 桶先写变文件）：**用户 2026-09-26 定为目录对象只用单次请求写**
+（单 PUT / 单次 CopyObject，不走 multipart；> 5 GiB 在 I/O 之前逐条目 `Unsupported`），见 P7 §14.1 D13。NAS 桶由 NAS profile
+（`directory_objects=false`）处理。
 
 ## 已知陷阱
 

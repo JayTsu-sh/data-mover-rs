@@ -231,6 +231,9 @@ struct TraversalCompletion { totals: ScanTotals }   // 见第 7 节
 3. `scope == Child` 的条目本身不参与删除。
 4. 有 filter 或 `max_depth` 时，旧代条目也要用同一个 filter / 深度判定，被排除或截断的不参与删除（这些信息来自请求本身）。
 5. 大小写或 Unicode 规范化不敏感的目标上，“折叠后相等、字节不等”的一对名字报冲突，不删除（Q6）。
+6. **路径逐字节比较，绝不去掉末尾的 `/`**（F5）：S3 的目录对象 `p/d/`、文件 `p/d`、目录 `p/d` 是三个不同的条目（身份键、
+   快照、`TransferIdentity` 都不同）。规则 4 判定目录对象时用它自己的名字与深度：name = `d`（最后一个非空段），
+   深度 = `p/d` 子项的深度。把 `p/d/` 规范化成 `p/d` 的消费方会把两者合并，删除检测可能删错（§11 对 terrasync 的要求）。
 
 ## 5. 流式列举：Namespace 接口与各 backend
 
@@ -321,10 +324,10 @@ type ListingStream = Pin<Box<dyn Stream<Item = Result<ListingPage, StorageRoleFa
 |---|---|---|
 | **ListingPage** |  |  |
 | `children: Vec<ListedChild>` | 这一页里描述成功的子项 | 今天 `NamespaceResult::Entries / Listing.entries`，但那是整个目录 |
-| `failures: Vec<ChildFailure>` | 列举**返回了**、却描述不出来的子项：名字拼不成路径（空段、`.` / `..`、非 UTF-8）、缺属性、版本 id 非法、S3 键以 `/` 结尾而有内容…… | 遍历把它们发成 `Failure{scope: Child}`，计入 `failed_children`。今天 CIFS / NFS / HDFS 遇到这种子项会让整个目录失败 |
+| `failures: Vec<ChildFailure>` | 列举**返回了**、却描述不出来的子项：名字拼不成路径（空段、`.` / `..`、非 UTF-8）、缺属性、版本 id 非法、存储根自己的对象有内容…… | 遍历把它们发成 `Failure{scope: Child}`，计入 `failed_children`。今天 CIFS / NFS / HDFS 遇到这种子项会让整个目录失败 |
 | `internal_hidden: u32` | 这一页里被隐藏的 `.data-mover-*`（传输过程中的 stage / 指针 artifact）个数 | 它们不是子项，不进 `listed`，单独计入 `internal_hidden`（需求 4）。今天各 backend 直接丢弃、从不计数 |
 | **ListedChild**（今天的 `SourceDescriptor`，`src/storage/descriptor.rs`，把完整路径换成名字） |  |  |
-| `name` | 最后一段名字。完整路径 = 请求的 `path` + `/` + `name`，**由契约规定**。backend 自己的拼法与之不一致时，必须报 `ChildFailure`，不能交一个拼不回去的名字（这正是 `storage/tests/slots.rs` 钉住的护栏：下钻目标必须逐字等于列举给的拼写） | 遍历拼路径、Blocks 下钻排序 |
+| `name` | 最后一段名字。完整路径 = 请求的 `path` + `/` + `name`，**由契约规定**。backend 自己的拼法与之不一致时，必须报 `ChildFailure`，不能交一个拼不回去的名字（这正是 `storage/tests/slots.rs` 钉住的护栏：下钻目标必须逐字等于列举给的拼写）。**名字可以为空**（F5）：空名 = 被列目录自己的对象（S3 的键 `<path>/`），路径因此恰为 `<path>/`；只有 `ListedChild::directory_object` / `ListingPage::push_directory_object` 能产生，只能是 File，存储根上没有（`ListedChild::new` 仍拒空名） | 遍历拼路径、Blocks 下钻排序 |
 | `kind` | `File` / `Directory` / `Symlink` / `Special`。CIFS 的 reparse point 记为 `File`（读不了链接目标） | 决定是否下钻、是否 `read_link` |
 | `size: Option<u64>` | 文件大小；没有意义时为 `None`（S3 前缀、删除标记） | 统计字节、filter `size` 条件 |
 | `source_identity` | 稳定身份 = 哪个后端 + 强度 + 稳定字节。强度：`PathScoped`（只在路径不变时稳定，如 S3 ETag）、`StableWithinBackend`（在这个命名空间里稳定，如 NFS 文件句柄、CIFS file id）、`VersionScoped`（一个不可变版本，如 S3 version id） | 算出 32 字节 `EntryIdentityKey`（blake3）；terrasync 按它关联新旧两代（`OBSERVATION_IDENTITY_JOIN_CLAUSE`），用于识别改名 |
@@ -345,6 +348,7 @@ type ListingStream = Pin<Box<dyn Stream<Item = Result<ListingPage, StorageRoleFa
 | `histories: bool` | 这个命名空间的对象是否可能带历史（`ListedChild.history`） | 消费方决定是否准备处理历史 | 多版本 S3 桶 true，其余 false |
 | `mutations: Result<(), &'static str>` | 能否 `create_directory` / `delete`（/ `rename`）；不能时给出原因 | 递归删除、递归建目录在 I/O 前拒绝（今天 `handle.rs:190`） | S3 不能，其余能 |
 | `symlinks: bool` | 能否 `read_link` | 遍历决定 symlink 子项是否需要读目标 | Local、NFS true；其余 false |
+| `directory_objects: bool` | 能否存目录对象（键以 `/` 结尾的文件，F5） | 消费方拷贝前用 `transfer::directory_object_action` 判定；引擎在 Preflight 拒绝写到不能存的一端（`Storage::holds_directory_objects`） | S3 true，其余 false |
 | `names: NameSemantics { case: Sensitive \| Insensitive \| Unknown, normalization: None \| Nfc \| Nfd \| Unknown }` | 这个命名空间怎么判断“两个名字是同一个” | 消费方的删除安全规则（第 4.1 节第 5 条，Q6）：不敏感的目标上，“折叠后相等、字节不等”报冲突、不删除 | CIFS：连接时查询卷属性里的 `FILE_CASE_SENSITIVE_SEARCH`；NFS：v3 `PATHCONF` / v4 `case_insensitive` 属性；Local：按平台（Linux 敏感，Windows / macOS 默认不敏感）；S3、HDFS：敏感。查不到就是 `Unknown`，按不敏感处理（Q25） |
 
 #### 5.4.6 为什么每个 `ObservedEntry` 都带 `SourceIdentity` 和 blake3 身份键
@@ -444,6 +448,9 @@ struct BlockCounts { /* 同上的每目录版本，只在 Blocks 的 DirectoryLi
 
 - 即时与 deferred 两条过滤路径合并计入 `filtered`；deferred 且观察失败的目录计 `failed_children`，仍照常下钻（`storage.rs:528-541`）。
 - 列举级失败不是子项，不进不变式；`listed` 只数失败前真正返回的。
+- S3 目录对象 `p/d/`（F5）是 `p/d` 块里的 File：计入 `listed` / `emitted`（或 `filtered`）/ `files`，字节计入 `bytes`；
+  零字节的文件夹标记也一样（D8）—— console / s3a 建的空文件夹多的桶，files 与入库行数会明显上升。扫描根自己的零字节
+  对象不计数，有内容的计 1 个 `failed_children`（D4）。
 - Unordered 下每条目只是几次 `u64` 自增，无分配。
 - 分布统计（扩展名、大小区间、时间区间、深度、名字长度）是业务口径，放在 terrasync，从库里 SQL 聚合（第 11 节）。
 - 续扫后遍历侧计数是近似的（重扫的部分会重复计），Q15。
@@ -633,6 +640,15 @@ struct VersionRecord {
 | 示例 `batch_size = 100`（`utils/src/app_config.rs:443`） | 53M 条约 53 万次 INSERT | 调到 1 万–10 万 |
 | docker 镜像未固定版本（`docker/docker-compose.yml:5`） | 行为随版本漂移 | 固定版本 |
 
+### 11.2a 目录对象（F5）对 terrasync 的要求
+
+- `relative_path` 逐字节保存，**不去掉末尾 `/`**：`p/d/`（目录对象）与 `p/d`（文件或目录）是两行，身份键也不同；删除检测
+  按 §4.1 第 6 条比较。消费 F5 之前先查清 terrasync 自己的路径处理（拼接、`Path` 规范化、去重键）。
+- 目的端是文件系统时，每个条目先过 `transfer::directory_object_action`：零字节或最新记录是删除标记 → 无操作；有内容 →
+  跳过并记 `DIRECTORY_OBJECT_SKIP_REASON`（不算失败）。不要自己拼旁车文件名（任何名字都可能与真实的键冲突）。
+- 历史重放（D5 / D11）：按记录旧→新，版本走 `TransferRequest::with_source_version`，删除标记走
+  `transfer::write_delete_marker`（H1，紧随 F5 的下一个提交），一个 key 严格串行；重放不去重，重跑前比对目的端历史。
+
 ### 11.3 可选
 
 - 列举本身的同批重复（S3 跨页重复对象、NFS 变化中的目录在 cookie 边界重复一项）很少见，会多发一次 New；
@@ -806,6 +822,8 @@ CPU 的差距（1.51× 对 ≤ 1.4×）按 O2 → O3 在 Phase 6 处理。原始
 | 多版本（`mod.rs:65-86`，`ObservedEntry::version / source_version`，`storage/descriptor.rs` 的 `ListingFacts`，快照 v6） | 删除 `TraversalVersions` 与 `list_versions`；每版本一项改为每 key 一项（`ObservedEntry::history()`）；快照 v6 由 v7 取代 |
 | 行为 | 大目录中途的瞬时错误：今天（物化）从头重来会成功，P7 后首页之后不能从头重来 → 可能 `Interrupted`（NFS 需 nfs-rs 页接口才能续） |
 | 测试 / 例子 | `storage/tests/order.rs`、`tests/local_namespace_contract.rs` 的兄弟有序断言删改；`examples/storage_role_operations.rs` 的 `--order`；16 个测试 fake 改用 `ListingStream::from_pages` |
+| 目录对象（F5b–F5e） | `NamespaceCapabilities` 新公开字段 `directory_objects`（外部字面量要补）；`ListedChild` 可以是空名（= 目录自己的对象，路径 `<dir>/`）；S3 列举多出 `d/` 文件条目（含零字节文件夹标记，files / 行数上升），以前有内容的 `d/` 是 `Failure{Child}`；`type == "file"` 匹配到它们；写到不能存目录对象的一端在 Preflight 报 `Unsupported`；MinIO 的 `XMinioInvalidObjectName` 从会话 `Protocol` 改为条目 `Unsupported` |
+| legacy（F5a） | S3 `walkdir` / `walkdir_2` 对有内容的 `d/` 报 Scan 错误（之前静默跳过）：terrasync 在这类桶上会关闭删除检测 |
 
 ## 14. 实施计划
 
@@ -844,6 +862,7 @@ C5  feat(storage): Local 流式            - src/storage/backends/local/namespac
 C6  feat(storage): S3 流式（Current；前缀集合；All 物化；节流退避）
     - src/storage/backends/s3/{listing.rs:55-130, paging.rs, namespace.rs:109-146}
 F5  目录对象（键以 `/` 结尾的 S3 对象，现存问题 12；用户 2026-09-26 定：统一按文件、全部采纳建议）—— C7 之前，见 §14.1
+    —— 已完成：F5a `18bf9b1`、（refactor `093f316` 拆出 listing/child.rs）、F5b `52635eb`、F5c `fc019cc`、F5d `bac8ef0`、F5e `a228c75`、F5f（文档与 e2e 脚本）
     F5a fix(s3): legacy walkdir / walkdir_2 对有内容的 `d/` 报 Error，不再静默跳过（src/s3.rs 3596 / 3674 / 3925 / 4117 附近）
     F5b feat(storage)!: 列举契约允许“空名子项 = <dir>/”（ListedChild::directory_object、ListingPage::push_directory_object、
         into_parts 根守卫、NamespaceCapabilities.directory_objects、StoragePath::names_directory_object、entry_name 取最后非空段）
@@ -938,6 +957,28 @@ VERIFY
 | D10 | 新原语“目的端写删除标记”（仅 Enabled 桶，每次调用前检查版本状态） |
 | D11 | 历史重放由调用方（terrasync）编排，data-mover 提供原语与参考示例；重放不去重，重跑前调用方比对目的端历史 |
 | D12 | 目的桶未开版本：只拷最新状态并记原因“目的桶未开版本，历史未重建”，不算失败 |
+
+**实施结果（2026-09-26）**：F5a–F5f 已提交，H1 紧随其后（§14）；真机矩阵用含 H1 的树跑。与计划的差别：扫描根自己的对象由遍历在根列举里处理
+（`stream::prepare`，Blocks；C10 的 Unordered 必须复用它）；页内自己的对象排最前（键 `d/` 比它下面的键都小，页仍是
+S3 键序）；MinIO 版本桶里最新是删除标记的 `d/` 仍被 ListObjectsV2 列成无 ETag 的 0 字节 Contents（HEAD 404）→ 不当子项；
+MinIO 对 `d/` 的 CreateMultipartUpload 回 `XMinioInvalidObjectName` → 该条目 `Unsupported`（只对这个请求 + 以 `/` 结尾
+的键改映射）。`ndx_walk` 仍拒绝 S3，它的 `entry_name` 对 `p/d/` 会给空名：放开 S3 前要一起修。
+
+真机矩阵（`directory_objects.sh`，2026-09-26；多版本 = 临时版本桶或 `data-mover-test-ver`，非多版本 = `data-mover-test`）：
+
+| 存储 | 多版本 | 非多版本 | 差异 |
+|---|---|---|---|
+| MinIO RELEASE.2023-03-20 | pass | pass | 拒绝对 `d/` 发 multipart（400 `XMinioInvalidObjectName`，单 PUT 可以）→ > 8 MiB 的 `d/` 写不了（typed `Unsupported`）；删除后的 `d/` 在 V2 列举里留无 ETag 的幻影、父目录仍列前缀；（H1 重放，下一提交）合并连续删除标记，null 版本探测照常写标记 |
+| ONTAP 9.19.1 对象桶 | pass | pass | 一切按 S3；（H1）不合并连续删除标记 |
+| DXN（Ceph RGW Octopus） | pass | pass | UploadPartCopy 的 native 拷贝 `d/` 正常；（H1）合并连续删除标记；只有 null 版本的 key 重开版本、写新版本后再普通 DELETE：删掉 null 版本**并**写标记 |
+| StorageGRID 11.5 | pass | pass | `s3+sg` 的“native”走流式；ListObjectVersions 拒空 `version-id-marker`；（H1）已删除的 key 再 DELETE 每次新建标记（不合并） |
+| RustFS 1.0.0 | pass（脚本按探测到的差异断言） | pass（同左） | **对 `d/` 的 multipart 完成后存成 `d`（去掉 `/`，HEAD `d/` 404）**：我们的读回报 Verify `NotFound`（typed），但对象落在了同名文件 `d` 上 —— 会覆盖真实的文件 `d`；**版本桶里不给 `d/` 记版本**（每次写都是 `null`，DELETE 直接删掉）；native 从 `d/` 源 UploadPartCopy：版本桶里失败（会话 Connectivity，stage 与父目录指针留待续传），非版本桶里完成但同样存成 `d`；（H1）对未记版本的 `d/` 写删除标记不留记录 |
+| ONTAP NAS 桶 `data-mover-nas`（D6） | — | 只记录 | 零字节 `d/`：PUT 200 但不留对象（只是目录 `d`），子项前后写都一样；有内容 `d/` 先写：存成**文件** `d`，之后 `d/c` PUT 404；有内容 `d/` 后写（子项已在）：PUT 409 Conflict |
+
+D6 结论：零字节 `d/` 不会把目录变成文件（D6 的触发条件不成立）；**有内容的 `d/` 若先于子项写入，NAS 桶静默把它存成文件
+`d`**（我们的读回会报 `NotFound`，但文件 `d` 已在、之后子项全 404）。Blocks 下自己的对象在子项之前交出，按遍历顺序拷贝
+的消费方正好命中这种顺序。是否给端点加显式开关关掉 `directory_objects`、或对目录对象改用单 PUT（同时避开 MinIO 的拒绝与
+RustFS 的改名）**待用户决定**。
 
 风险要点：消费方若规范化尾 `/`，`p/d/` 与 `p/d` 会合并 → §4.1 写明路径逐字节比较、terrasync 要求同步；空名子项只经专用构造器；
 DeleteObject 在非 Enabled 桶上会删数据 → 每次调用前查；指针放父目录是 ADR-0006 新规则（`d` 与 `d/` 的 artifact 不冲突要有测试）。
@@ -1097,7 +1138,7 @@ N1–N7 在 H1、C7 之后。完整方案（file:line）见会话 scratchpad `s3
 | 9 | **legacy 版本列举假设 key 升序**：`src/s3/version_listing.rs` 的 `VersionPages::complete_keys` 把每页最大的 key 扣到下一页合并（C20），前提是 ListObjectVersions 按 key 升序返回。在无序存储上（ONTAP NAS 桶，Q22；NAS 桶不支持 ListObjectVersions，所以 ONTAP 上不会触发），同一个 key 的历史会被拆成几段、各自当成一个 key 发出（latest / `version_count` 错）；F2 的连续性校验在 legacy 里也只看每批 | 未修：legacy 在 P7 收尾整体删除；删除前若有调用方在无序存储上用 legacy 多版本列举，改为按整个目录物化分组（role-based 的做法）。role-based（C22 / C6）按目录物化分组，不受影响 |
 | 10 | **ONTAP `ListObjectVersions` 带 `delimiter=/` 会静默丢版本**（2026-09-26 实测，ONTAP 9.19.1）：截断页里有 CommonPrefix、且被收拢的 key 在列举前缀或该 CommonPrefix 之后紧跟多字节字符（如 `p/éb/x`、`p/x/中/y`）时，若页恰好停在后一个 key 的版本中间，服务端给 `NextKeyMarker=<key>` 却**不给** `NextVersionIdMarker`，下一页从该 key 之后开始，剩余版本被跳过（1000 个版本只回 998）。另：页停在 CommonPrefix 上时有时仍给 `NextVersionIdMarker`，下一页重复该前缀；恰好满页后跟一个空的末页；CommonPrefix 计入 max-keys。受影响：legacy `s3.rs` 两处 ListObjectVersions、role `s3/role_protocol/listing.rs` | **已修** `8d4b225`（F4）：截断页没有 `NextVersionIdMarker`、且 `NextKeyMarker` 那个 key 的条目恰是本页文档序的末尾一段时，用最后一条的 versionId 作 version-id-marker；续点不能确定（分组输出、读不到文档序且两种条目都在该 key 上）时不猜（role 该目录 `Protocol` 失败，legacy 先发完整的 key 再报错）；legacy 的 CommonPrefix 跨页去重（role 本来就去重）；空末页容忍。回归数据：ONTAP 实测响应 3 份（`tests/data/s3/ontap-versions-delimiter-*.xml`）；真机 `mkl/z` 1000 个版本 role / legacy 全列出 |
 | 11 | **RustFS 1.0.0 的 `ListObjectVersions` 原始 XML 不交错**（2026-09-26 实测，VM 105）：每页先列全部 `<DeleteMarker>`、再列全部 `<Version>`（各组内 key 升序、同 key 新→旧），所以一个 key 的条目在文档里不连续、第一条也不一定是 IsLatest。F2 的逐 key 校验会判不合格 → 该 key 标 `HistoryOrder::Inferred`、按 `LastModified` 排（同毫秒可能排错）。分页（key-marker / version-id-marker，max-keys 1/2/3）不丢不重 | 行为正确（回退如设计）；RustFS 上历史顺序只能推断。可选改进：对“分组输出”的存储（每页 marker 组 + version 组、各自按 key 升序新→旧）把两组当两条有序序列按 key 归并，同 key 内仍需时间决定交错 → 与今天的回退等价，不改。e2e-s3 的 RustFS 行期望 `order=inferred` |
-| 12 | **键以 `/` 结尾且有内容的 S3 对象**（“带内容的目录标记”）：MinIO、RustFS、ONTAP 对象桶、DXN 都允许（2026-09-26 实测，PUT 200）；ONTAP NAS 桶去掉末尾 `/` 存成普通文件。role 遍历把它报成该目录上的 `Failure{scope: Child}`（Unsupported），内容不列、不拷；**legacy walkdir（`src/s3.rs:3925`）静默跳过 —— 静默丢数据** | 用户要求（2026-09-26）：真实环境能有，就要处理，列举与拷贝都要。已定方案 F5 + H1（§14.1，统一按文件），待实施 |
+| 12 | **键以 `/` 结尾且有内容的 S3 对象**（“带内容的目录标记”）：MinIO、RustFS、ONTAP 对象桶、DXN 都允许（2026-09-26 实测，PUT 200）；ONTAP NAS 桶去掉末尾 `/` 存成普通文件。role 遍历把它报成该目录上的 `Failure{scope: Child}`（Unsupported），内容不列、不拷；**legacy walkdir（`src/s3.rs:3925`）静默跳过 —— 静默丢数据** | **已修**（F5a `18bf9b1` … F5f；历史重放在紧随其后的 H1；§14.1）：role 遍历把它（以及零字节文件夹标记）列成文件条目 `d/`，S3→S3 拷贝，文件系统目的端 typed 跳过 / 拒绝；legacy 报 Scan 错误。遗留：MinIO / RustFS / NAS 桶上的写入差异待用户决定（§14.1） |
 
 ## 收尾：清理扫描相关旧代码
 

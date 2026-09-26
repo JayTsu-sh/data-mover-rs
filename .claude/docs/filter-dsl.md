@@ -158,6 +158,18 @@ role-based 路径同理：`traversal` 模块不依赖 `crate::filter` (架构依
 backend (Local / NFS / CIFS / HDFS) 都走它。
 可运行入口见 `examples/storage_role_operations.rs`。
 
+## S3 目录对象（P7 F5）
+
+S3 的键 `p/d/`（目录 `p/d` 自己的对象，有没有内容都算）是 `p/d` 块里的一个 **File** 条目：filter 看到
+`type == "file"`、`name` = 目录名 `d`（最后一个非空段，不是空串）、`path` = `p/d/`（带尾 `/`，相对扫描根）、
+`size` / `modified` 来自列举，扩展名按 `d` 算（`x.tar/` 的扩展名是 `tar`）。所以：
+
+- `type == "file"` 会匹配到文件夹标记；`size > 0` 把有内容的目录对象与纯标记分开；`type == "dir"` 不匹配它。
+- `name == "d"` 同时命中目录 `p/d` 与它的对象 `p/d/`；`path` 的 glob（如 `p/d/*`）可能也命中 `p/d/` 本身
+  （`*` 可以匹配空串）—— 写路径条件时注意。
+- filter 剪掉 `p/d`（不下钻）时 `p/d/` 跟着不列；`p/d` 被隐藏但仍下钻时，`p/d/` 按它自己的条件判定。
+- 三元组本身没变（规则 F1 不触发）。
+
 ## 传输 artifact 不进三元组
 
 所有列举（legacy 与 role-based，全部后端）在调用 `should_skip` **之前**就丢掉相对根任一段以 `.data-mover-`

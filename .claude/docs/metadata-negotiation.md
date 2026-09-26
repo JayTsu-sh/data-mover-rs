@@ -94,6 +94,10 @@ owner/group/mode 记成**损失** `OwnershipModeDropped`（走 `OwnershipTarget:
 | S3（源端） | 没有（`NotApplicable`）；mtime 读 `Last-Modified`（秒） | 读不了 | 读不了 | 每文件一次绑定身份的 HEAD |
 | S3（目的端） | 存不了（跳过，`DestinationCannotStore`） | 存不了 | 存不了 | `stores_nothing()`，mtime 也 `NotStored` |
 
+目录对象（S3 键 `p/d/`，P7 F5）不是元数据问题而是能不能存的问题：只有 `NamespaceCapabilities::directory_objects`
+为真的目的端（S3）能存；文件系统目的端由 `transfer::directory_object_action` 判定无操作 / 跳过，引擎在 Preflight
+拒绝（`Unsupported`），元数据计划根本不会走到。
+
 ### 目的端没有 chown 特权（K5，Local）
 
 用户规则（2026-09-24）：**自己的文件不报损失，按文件比对 owner**。Local 目的端连接时读一次本进程的事实

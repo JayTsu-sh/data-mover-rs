@@ -203,6 +203,15 @@ formats a newer binary must still read, so each carries its version (`v1`, `01`)
 vector. The name uses the final name as spelled: on a case-insensitive destination another spelling
 of the same file finds nothing and restarts, and the old artifacts wait for the reserved-name cleanup.
 
+As built (P7 F5): an S3 directory object — a final key ending in `/`, `p/d/` — keeps its
+artifacts in its **parent** `p/`, named after `d/`: `p/.data-mover-<digest("d/")>.upload`
+(`artifacts::directory_object_artifact`, used by `upload_pointer::pointer_path`). The digest input keeps
+the `/`, so they never collide with the artifacts of the file `p/d` (`digest("d")`), and they are still
+derived from the final key alone. Not inside `d/`: that would make the prefix `p/d/` exist and sit in
+`d`'s own listing. A listing-based sweep of leftovers (backlog) must match a digest of `d/` found in `p/`
+against the prefix `p/d/`, not a sibling object. Filesystems hold no directory objects: the engine refuses
+such a final path at `Preflight` (`Unsupported`).
+
 As built (C7c, `src/storage/discovery.rs`): the table gains two rows and a fixed precedence — nothing
 → fresh; a requested restart → clean; a corrupt pointer; a pointer without a stage; a stage without a
 pointer; another transfer's pointer (`OtherTransfer`, checked before the binding, which hashes the
@@ -707,6 +716,11 @@ per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim re
 - Versioned buckets: pointers are deleted by their own versionId, no unversioned DELETE is ever sent
   to a final key, an ambiguous Complete is reconciled via `ListObjectVersions`, an Object Lock refusal
   to delete a pointer is a warning, and the outcome carries the destination versionId.
+- Directory objects (P7 F5): a final key ending in `/` is written like any key — single PUT (zero bytes
+  included), multipart with the `.upload` pointer in the parent (see "Destination artifacts"), native —
+  where the store accepts it. Measured 2026-09-26: MinIO RELEASE.2023-03-20 refuses a multipart upload
+  to such a key (400 `XMinioInvalidObjectName` → `Unsupported` entry failure), RustFS 1.0.0 completes it
+  under the key without its `/` (read-back `NotFound`; see `.claude/docs/storage-s3.md`).
 
 ### S3 traversal and versions
 

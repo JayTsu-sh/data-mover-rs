@@ -129,6 +129,23 @@ S3_PREFIX=test                   # bucket 内的子路径
    每一行必须带 ` order=inferred`，其余 key 一行都不许带；默认 `server` 时哪一行都不许带 —— 解析同时接受可选的
    ` order=…` 后缀，检查是精确的，不是容忍。
 
+9. **目录对象**（P7 F5）：`bash .claude/skills/e2e-s3/scripts/directory_objects.sh`。选桶方式同
+   `traversal_versions.sh`（默认建一个临时版本桶 `data-mover-f5-<run>`，退出删光；`S3_VERSIONED_BUCKET=` /
+   `S3_UNVERSIONED_BUCKET=` 用已有桶的 `dm-<run>/` 前缀；建桶总带 body 或 `Content-Length: 0`，StorageGRID 缺长度回 411）。
+   写 `dirobj/`（5 B）+ 子项、`lonely/`（6 B）、`emptydir/`（0 B）+ 子项、console 式空文件夹 `e/`、`plain.txt`、`big/`
+   （`BIG_MB`，默认 200 MiB、至少 150，经 multipart 写入；存储拒绝对 `x/` 发 multipart 时改用一次 PUT，并检查
+   data-mover 的 multipart 写入报 typed `Unsupported`；存储把完成的 `x/` 存到别的键上（RustFS）时检查读回报
+   Verify `NotFound` 并打印它存成了什么）；版本桶再写 `z/`（0 B、标记、0 B）与 `m/`（5 B、0 B、标记、3 B、标记）。
+   检查：当前遍历（`--sizes`）每个 key 一次、目录对象是 `File <d>/ size=<n>`、零字节的也在，计数平衡、无失败，
+   blocks 并发 1 / 4 / 32 一致；`--path dirobj` 报 `failure scope=Child dirobj/ Unsupported`、不交出，`--path emptydir`
+   什么都不报；All 下 `z/`、`m/` 的整段历史按序；legacy 两种 walk 只对有内容的（`dirobj/`、`lonely/`、`big/`、版本桶的
+   `m/`）报 `ERROR`；拷贝（同桶）`dirobj/` / `emptydir/` 流式、`dirobj/` native、`big/` 流式切断（指针在 `copy/`、
+   `copy/big/` 里无对象、1 个上传）后续传 Resumed 且逐字节相等、`big/` native；S3→Local 在 Preflight 报目的端
+   `Unsupported`、不写文件。`D6=1 S3_UNVERSIONED_BUCKET=data-mover-nas`：只记录 NAS 桶对零字节 / 有内容的 `d/`
+   在子项前后写入时存成什么（不对存储断言），末行 `RESULT: D6 recorded (no assertions)`。其余模式期望
+   `RESULT: pass` 与 `cleanup: … deleted` / `… emptied`（清理还核对未完成的上传，列不出就算失败）。临时桶只在
+   HEAD 为 404 时才建。
+
 ## 真机矩阵（P7 S3：C6、F4、C10、C11、C11b、收尾清理每一步都要过）
 
 环境、写入范围与已知差异见 `.claude/docs/test-environments.md`；**每套都跑非多版本与多版本两种桶**。每条命令都包
@@ -152,9 +169,10 @@ S3_ENV=$E S3_VERSIONED_BUCKET=data-mover-test-ver timeout 1800 bash $S/scripts/t
 S3_ENV=$E S3_VERSIONED_BUCKET=data-mover-test-ver timeout 5400 bash $S/scripts/versioning_matrix.sh
 
 # ONTAP NAS 桶 data-mover-nas：只有非多版本（GetBucketVersioning 501、ListObjectVersions 不实现）；平铺列举无序
+# 零字节 d/ 在 NAS 桶上不留对象（只是目录）→ EXPECT_DIR_MARKER=0
 S3_ENV=$E S3_BUCKET=data-mover-nas timeout 600  python3 $S/scripts/run.py
 S3_ENV=$E S3_BUCKET=data-mover-nas timeout 3600 bash $S/scripts/staged_matrix.sh
-S3_ENV=$E S3_UNVERSIONED_BUCKET=data-mover-nas timeout 1800 bash $S/scripts/traversal_versions.sh
+S3_ENV=$E S3_UNVERSIONED_BUCKET=data-mover-nas EXPECT_DIR_MARKER=0 timeout 1800 bash $S/scripts/traversal_versions.sh
 
 # RustFS（管理网 9001；非多版本 data-mover-test，多版本临时桶 data-mover-rustfs-*；绝不写 bigbucket）
 E=$S/rustfs/.env
@@ -173,6 +191,22 @@ S3_ENV=$E BUCKET_PREFIX=data-mover-dxn S3_LOCATION=magnascale:tos_placement time
 S3_ENV=$E BUCKET_PREFIX=data-mover-dxn S3_LOCATION=magnascale:tos_placement timeout 5400 bash $S/scripts/versioning_matrix.sh
 ```
 
+- 目录对象（P7 F5）每套都跑 `directory_objects.sh`（非版本 + 版本）：
+  ```bash
+  timeout 3500 bash $S/scripts/directory_objects.sh                                        # MinIO 临时版本桶
+  S3_UNVERSIONED_BUCKET=data-mover-test timeout 3500 bash $S/scripts/directory_objects.sh  # MinIO
+  S3_ENV=$S/ontap/.env S3_VERSIONED_BUCKET=data-mover-test-ver timeout 3500 bash $S/scripts/directory_objects.sh
+  S3_ENV=$S/ontap/.env S3_UNVERSIONED_BUCKET=data-mover-test timeout 3500 bash $S/scripts/directory_objects.sh
+  S3_ENV=$S/ontap/.env S3_UNVERSIONED_BUCKET=data-mover-nas D6=1 timeout 1800 bash $S/scripts/directory_objects.sh
+  S3_ENV=$S/rustfs/.env BUCKET_PREFIX=data-mover-rustfs timeout 3500 bash $S/scripts/directory_objects.sh
+  S3_ENV=$S/rustfs/.env S3_UNVERSIONED_BUCKET=data-mover-test timeout 3500 bash $S/scripts/directory_objects.sh
+  S3_ENV=$S/dxn/.env BUCKET_PREFIX=data-mover-dxn S3_LOCATION=magnascale:tos_placement timeout 3500 bash $S/scripts/directory_objects.sh
+  S3_ENV=$S/dxn/.env S3_UNVERSIONED_BUCKET=data-mover-test timeout 3500 bash $S/scripts/directory_objects.sh
+  S3_ENV=$S/storagegrid/.env S3_VERSIONED_BUCKET=data-mover-test-ver timeout 3500 bash $S/scripts/directory_objects.sh
+  S3_ENV=$S/storagegrid/.env S3_UNVERSIONED_BUCKET=data-mover-test timeout 3500 bash $S/scripts/directory_objects.sh
+  ```
+  各存储的差异（MinIO 拒绝对 `x/` 发 multipart、RustFS 把 multipart 的 `x/` 存成 `x` 且不给 `x/` 记版本等）见
+  `.claude/docs/storage-s3.md`「目录对象真机」。
 - 期望：`run.py` `all checks passed`；`staged_matrix.sh` 的 Direct 行 `equal=yes key_uploads=0`、原生行
   `equal=yes stage_objects=0 key_uploads=0`、续传后 `pointers=0 key_uploads=0`、末行 `left: objects=0 key_uploads=0`；
   `traversal_versions.sh` `RESULT: pass` 且 `cleanup: … deleted` / `… emptied (bucket kept)`；`versioning_matrix.sh`

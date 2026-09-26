@@ -81,6 +81,7 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | `InvalidPart` / `InvalidPartOrder`（Complete 的分段表与服务端持有的分段不符或乱序；ADR-0006 C15a） | 条目 `Conflict` / Permanent —— 同一分段表重发不会变 |
 | 412 `PreconditionFailed`（`copy-source-if-match` / `If-Match` 不符）、409；416 `InvalidRange`（`UploadPartCopy` / 读取的范围源里已没有：源缩短或被替换；ADR-0006 C18） | 条目 `Conflict` / Permanent —— 源变了，重发不会变 |
 | `EntityTooSmall`（非最后一段小于 5 MiB 最小分段；C15a） | 条目 `Corruption` / Permanent —— 分段本身错了 |
+| `XMinioInvalidObjectName`（MinIO 2023 拒绝对键以 `/` 结尾的目录对象发起 multipart，同一个键单 PUT 却可以；P7 F5） | 条目 `Unsupported` / Permanent —— 这个对象在这家存储上写不了，不是会话失败（之前落到兜底的会话 `Protocol`） |
 | **带 versionId 的** HEAD / GET 返回 405（该版本是删除标记）；`Current` 在版本化桶上也会钉成 versionId，所以普通读也属此类 | 条目 `NotFound` / Permanent |
 | **带 versionId 的** GET 返回 400 且错误码 `InvalidArgument`（versionId 格式错） | 条目 `InvalidInput` / Permanent |
 | 其余 400（`ExpiredToken`、region 错……；HEAD 没有错误码，其 400 一律在此） | 仍按通用映射（会话级）—— 这些关乎整个会话 |
@@ -225,6 +226,16 @@ Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修�
 | S3 当前对象列举（P7 C6）翻页 token 回绕 / 连续 16 空页 / 驻留的前缀名 + 报过的 key 超 500 万、续页 token 超 500 万（对象不计，重复前缀只记一次）：先交出已列到的页（触发的那一页不交出），再以该目录的失败结束（不结束整场） | 整个列举，块 `Interrupted { delivered }`（一项未交出则 `Unreadable`） | `Protocol` / Permanent；超上限 `Capacity` / Permanent |
 | S3 对象 size 缺失 / 为负（`role_protocol/listing.rs` 逐项解码为 `S3RejectedEntry`） | 子项（报在对象路径）；版本列举里这个 key 的全部版本都不列 | `Protocol` / Permanent |
 | S3 键 / 公共前缀越出存储根，或越出所列目录（服务端无视 prefix） | 无名子项（`raw_name` = 服务端给的键） | `Protocol` / Permanent |
+
+### 目录对象（P7 F5）
+
+| 情形 | 映射 |
+|---|---|
+| 传输的最终路径以 `/` 结尾、目的端不存目录对象（Local / NFS / CIFS / HDFS）；或源路径以 `/` 结尾、源端不存 | `transfer` / expert 两个半边都在 **Preflight** 报该路径上的条目 `Unsupported` / Permanent，任何 I/O 之前（以前 HDFS 在 Prepare 报 `InvalidInput`、CIFS 空段检查同样） |
+| 扫描根自己的目录对象有内容 | 该键（`<根>/`）上的 `Failure{Child}`，`Unsupported` / Permanent（零字节的忽略） |
+| S3 存储根自己的对象（URL 前缀本身）有内容 | 根路径 `""` 上的子项失败，`Unsupported` / Permanent（零字节的忽略） |
+| `stat` 以 `/` 结尾且对象不存在 | `NotFound`（算 vanished），不再是 `InvalidInput` |
+| MinIO 对 `d/` 的 CreateMultipartUpload：400 `XMinioInvalidObjectName` | 条目 `Unsupported` / Permanent（只对这个请求 + 以 `/` 结尾的键；见上 S3 表） |
 
 ## 改 error 时
 
