@@ -850,6 +850,9 @@ F5  目录对象（键以 `/` 结尾的 S3 对象，现存问题 12；用户 202
     F5f docs（§4.1 路径逐字节、不去尾 `/`；§5.4.4；§5.4.5；§7；§10.3/10.4；§13；filter-dsl.md；storage-s3.md；ADR-0006）
 H1  feat(s3): 目的端重放删除标记（StagedDestination::write_delete_marker + transfer::write_delete_marker；仅 Enabled 桶、每次调用前查
     GetBucketVersioning；结果 Written / Merged / NullVersionRemoved；examples/s3_history_replay.rs）—— F5 之后、C7 之前
+P1–P5  S3 URL 参数化（§14.2）—— F5 合入后，可与 C7 并行
+N0     NAS 桶实测（curl，§14.2）—— 立即
+N1–N7  `compat=ontap&bucket_type=nas` 的 NAS 桶 profile（§14.2）—— H1、C7 之后
 C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:4610-4691
     + 子目录句柄作为下钻提示随工作项下传，列举不再写 GLOBAL_CACHE，无提示 / 失效回退 lookup_fh（§12.7 修法 A）
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
@@ -937,6 +940,34 @@ VERIFY
 DeleteObject 在非 Enabled 桶上会删数据 → 每次调用前查；指针放父目录是 ADR-0006 新规则（`d` 与 `d/` 的 artifact 不冲突要有测试）。
 验收：`.claude/skills/e2e-s3/scripts/directory_objects.sh`（dirobj/、lonely/、emptydir/、全零历史 z/、混合历史 m/、console 空文件夹 e/），
 四套对象存储的多版本与非多版本桶 + NAS 桶对照；`examples/s3_history_replay.rs` 把混合历史重放进临时版本桶后逐条比对。
+
+### 14.2 S3 URL 参数化与 ONTAP NAS 桶 profile（2026-09-26，用户全部采纳 16 条建议）
+
+**URL 语法**（一个解析器 `src/s3/url_options.rs`，legacy 与 role 共用）：协议名只剩 `s3://`（http）与 `s3+https://`；查询参数
+`compat=sg|dxn|hcp|ontap`、`tls_verify=false`、`bucket_type=nas`，**缺省即默认**（写 `compat=standard` / `bucket_type=object` /
+`tls_verify=true` 报 UrlParseError，提示“缺省即默认”）；未知参数名、重复参数、空值、`tls_verify` 用在 `s3://` 上、`bucket_type=nas`
+不带 `compat=ontap` 都是 UrlParseError（D4 规则文字相应修订：URL 文本能判定的组合错误都算 UrlParseError）。删除 `s3+http://`、
+`s3+sg[+https]://`、`s3+dxn[+https]://`、`s3+hcp://`，报错给出新写法（旧 `+https` 形式的提示里带 `tls_verify=false`）。参数不进端点身份
+（TransferIdentity / 恢复绑定不变）。**TLS**：`s3+https://` 默认校验证书（系统根，认 SSL_CERT_FILE / SSL_CERT_DIR），`tls_verify=false` 显式关闭
+并每连接告警；自签端点（DXN 8182 等）必须加它；terrasync 配置要迁移。**HCP**：`StorageType::Hcp` 并入 `compat=hcp`；REST 的 scheme / 端口
+跟随 S3 URL；role 层 get_tags 改走 HCP REST（无实验环境，只能单测）。**`compat=ontap`**：不改任何线上请求（ONTAP 对象桶的怪癖都已通用处理：
+F4、F6、空末页、CommonPrefix 计入 max-keys、不回显 Delimiter），只承载 `bucket_type=nas`、原生拷贝亲和标签 "ontap" 与 403 提示。
+
+**NAS 桶 profile（`compat=ontap&bucket_type=nas`）**，能力开关 `S3BucketCapabilities`（不按厂商名分支）：
+- 目的端：≤ 8 MiB 照旧单 PUT；8 MiB–5 GiB **流式单 PUT**（Content-Length = 源大小、UNSIGNED-PAYLOAD、边传边算 MD5 与 PUT 回复 ETag 核对、
+  卡住看门狗）；**扣住最后 1 字节到 publish 才提交**（前提：N0 证明 NAS PUT 原子，否则所有流式失败都报“已改变”）；> 5 GiB 在 Preflight、
+  目的端 I/O 之前 Unsupported 拒绝，不回退。**无续传**：`resumable_at_destination()=false`，Checkpointed 报 `EffectiveRecovery::UnsupportedByDestination`
+  （该枚举加 `#[non_exhaustive]`）、从零开始。**prepare 多一次 HEAD** 记旧状态，结果不确定的失败再 HEAD：未变 / 已变 精确报出。
+- 校验：PUT 回复的 MD5 ETag 与自算 MD5 核对 + “ETag 括号式”读回（HEAD 定锚、每段响应 ETag 必须等于锚、BLAKE3 比对）：ETag 变 → Conflict，
+  内容不同而 ETag 稳定 → Corruption（报错写明有歧义）；结果记进新的 `TransferOutcome.verification`，不算失败。
+- 源端：无 If-Match；每段核对响应 ETag、Content-Range 总长、Last-Modified，**读完再 HEAD 一次**关掉最后一段的窗口；NFS / SMB 写是否改 S3 ETag 待 N0。
+- 原生拷贝只限同一 NAS 桶（亲和含桶名），单次 CopyObject ≤ 5 GiB；跨桶自动走流式。无版本、`directory_objects=false`（F5 D6）。
+- 连接时仍查 GetBucketVersioning，只告警；参数写在对象桶上照常工作（保证变弱），NAS 桶漏写参数则按今天的失败 + 精确提示（501 / 403 提示加参数）。
+- legacy StorageEnum 对 NAS 桶不改行为，只写文档。TLS 测试用本地自签 TLS 服务器（新增 dev-dependency tokio-rustls）+ DXN 8182 真机。
+
+**顺序**：N0 实测立即（curl，a–l：UNSIGNED-PAYLOAD 200 MiB、PUT 中途被杀旧对象是否完好、短体、各处 ETag 是否一致、GET 响应头、5 GiB、零字节 `d/`
+两种顺序、NFS 写是否改 ETag、空目录是否为 CommonPrefix、1 GiB CopyObject、名字冲突、PUT 期间 GET）→ P1–P5 在 F5 合入后（可与 C7 并行）→
+N1–N7 在 H1、C7 之后。完整方案（file:line）见会话 scratchpad `s3-url-nas-plan.md`（会话结束即失效，要点以本节为准）。
 
 ## 15. 决定记录（2026-09-25 全部采纳）
 
