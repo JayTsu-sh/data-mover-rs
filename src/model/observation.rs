@@ -422,6 +422,13 @@ impl ObservedEntry {
     pub const fn kind(&self) -> EntryKind {
         self.kind
     }
+    /// Whether this entry is a directory object (P7 F5): a file stored under a key ending in `/`,
+    /// such as `p/d/`, listed by its directory `p/d`. A filesystem cannot store content on a
+    /// directory.
+    #[must_use]
+    pub fn is_directory_object(&self) -> bool {
+        self.kind == EntryKind::File && self.path.names_directory_object()
+    }
     /// Returns the observed logical size when applicable.
     #[must_use]
     pub const fn size(&self) -> Option<u64> {

@@ -305,6 +305,7 @@ impl Namespace for LocalNamespace {
             mutations: Ok(()),
             symlinks: true,
             names: platform_names(),
+            directory_objects: false,
         }
     }
 }

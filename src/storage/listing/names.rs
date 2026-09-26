@@ -63,6 +63,9 @@ pub(super) fn child_name<'a>(directory: &StoragePath, path: &'a StoragePath) -> 
     is_segment(rest).then_some(rest)
 }
 
+/// Whether `name` is one path segment a child may be named. It does not apply to the directory's
+/// own object, whose name is empty by design and which only
+/// [`super::ListedChild::directory_object`] and [`super::ListingPage::push_directory_object`] make.
 pub(super) fn is_segment(name: &str) -> bool {
     !matches!(name, "" | "." | "..") && !name.contains(['/', '\0'])
 }

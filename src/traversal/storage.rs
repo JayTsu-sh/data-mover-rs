@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -292,6 +292,8 @@ struct Shared {
     policy: Policy,
     /// Keys for deferred descend slots, handed out by the listing tasks that place them.
     tickets: AtomicU64,
+    /// Whether the traversal root's own object was reported (once, whatever its versions).
+    root_object_reported: AtomicBool,
 }
 
 struct Runtime<'a> {
@@ -327,6 +329,7 @@ async fn run(
         policy: Policy::new(&request),
         request,
         tickets: AtomicU64::new(0),
+        root_object_reported: AtomicBool::new(false),
     });
     let runtime = Runtime {
         shared: &shared,
@@ -558,8 +561,13 @@ fn deferred_descent(
     })
 }
 
+/// The name the filter sees: the path's last non-empty segment, so a directory object `p/d/` is
+/// named `d` like its directory (P7 F5, D7).
 fn entry_name(path: &StoragePath) -> &str {
-    path.as_str().rsplit('/').next().unwrap_or_default()
+    path.as_str()
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or_default()
 }
 
 /// Puts one observation into its output slot, and records the descend decision a deferred one

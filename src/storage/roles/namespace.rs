@@ -99,15 +99,21 @@ pub struct NamespaceCapabilities {
     pub symlinks: bool,
     /// When two names are the same name.
     pub names: NameSemantics,
+    /// Whether the namespace holds directory objects (P7 F5): files stored under a key ending in
+    /// `/` (`p/d/`), beside the directory `p/d`. An object store does; a filesystem cannot store
+    /// content on a directory, so a consumer does not copy one there.
+    pub directory_objects: bool,
 }
 
 impl NamespaceCapabilities {
-    /// No histories, mutations supported, no symlinks, name semantics unknown.
+    /// No histories, mutations supported, no symlinks, name semantics unknown, no directory
+    /// objects.
     pub const BASIC: Self = Self {
         histories: false,
         mutations: Ok(()),
         symlinks: false,
         names: NameSemantics::UNKNOWN,
+        directory_objects: false,
     };
 }
 

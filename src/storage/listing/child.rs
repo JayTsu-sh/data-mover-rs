@@ -11,6 +11,9 @@ use crate::model::{
 use crate::storage::{InlineOwnership, ListingFacts, SourceDescriptor};
 
 /// One child of a listed directory: [`SourceDescriptor`] with its full path replaced by its name.
+///
+/// The name is empty for the directory's own object ([`Self::directory_object`], P7 F5), whose
+/// path is the directory's and a `/`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListedChild {
     pub(super) name: String,
@@ -66,6 +69,64 @@ impl ListedChild {
         })
     }
 
+    /// The listed directory's own object (P7 F5): the file an object store keeps under the key
+    /// `<directory>/`, a child with the empty name, so its path is exactly that key. Only a
+    /// listing of a directory other than the storage root can hand one over.
+    #[must_use]
+    pub fn directory_object(size: Option<u64>, source_identity: SourceIdentity) -> Self {
+        Self {
+            name: String::new(),
+            kind: EntryKind::File,
+            size,
+            source_identity,
+            backend_fact: None,
+            content_version: None,
+            inline_timestamps: None,
+            inline_mode: None,
+            inline_ownership: None,
+            version: SourceVersion::Current,
+            listing: ListingFacts::default(),
+            descent_hint: None,
+        }
+    }
+
+    /// `descriptor` with its path replaced by `name`.
+    pub(super) fn from_descriptor(name: String, descriptor: SourceDescriptor) -> Self {
+        let SourceDescriptor {
+            path: _,
+            kind,
+            size,
+            source_identity,
+            backend_fact,
+            content_version,
+            inline_timestamps,
+            inline_mode,
+            inline_ownership,
+            version,
+            listing,
+        } = descriptor;
+        Self {
+            name,
+            kind,
+            size,
+            source_identity,
+            backend_fact,
+            content_version,
+            inline_timestamps,
+            inline_mode,
+            inline_ownership,
+            version,
+            listing,
+            descent_hint: None,
+        }
+    }
+
+    /// Whether this child is the listed directory's own object (the empty name).
+    #[must_use]
+    pub fn is_directory_object(&self) -> bool {
+        self.name.is_empty()
+    }
+
     /// The same child carrying `hint` for the listing of it, when it is a directory a traversal
     /// descends into ([`DescentHint`]).
     #[must_use]
@@ -80,7 +141,7 @@ impl ListedChild {
         self.descent_hint.as_ref()
     }
 
-    /// The child's name: the last segment of its path.
+    /// The child's name: the last segment of its path; empty for the directory's own object.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -102,11 +163,18 @@ impl ListedChild {
     /// The descriptor of this child of `directory`, its path being [`child_path`].
     ///
     /// # Errors
-    /// Returns an error when the joined path exceeds the storage path limit.
+    /// Returns an error when the joined path exceeds the storage path limit, or for a directory
+    /// object of the storage root, which has no path of its own.
     pub fn into_descriptor(
         self,
         directory: &StoragePath,
     ) -> Result<SourceDescriptor, ModelValueError> {
+        if self.is_directory_object() && directory.as_str().is_empty() {
+            return Err(ModelValueError::new(
+                "listed_child_name",
+                "the storage root has no own object",
+            ));
+        }
         let path = child_path(directory, &self.name)?;
         Ok(self.at(path))
     }

@@ -121,6 +121,106 @@ fn descriptors_become_names_and_a_misspelled_child_fails_alone() {
     assert_eq!(failures.len(), 5);
 }
 
+/// P7 F5: the directory's own object is the child with the empty name, and joins back to exactly
+/// its key, `<directory>/` — never the directory `p/d` nor a file `p/d`.
+#[test]
+fn a_directory_object_joins_back_to_its_key() {
+    let directory = path("p/d");
+    let mut page = ListingPage::from_descriptors(&directory, vec![descriptor("p/d/x")], vec![], 0);
+    page.push_directory_object(&directory, descriptor("p/d/"));
+    assert_eq!(names(&page), ["x", ""]);
+    let own: Vec<bool> = page
+        .children
+        .iter()
+        .map(ListedChild::is_directory_object)
+        .collect();
+    assert_eq!(own, [false, true]);
+    let (descriptors, failures) = page.into_descriptors(&directory);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(descriptors, [descriptor("p/d/x"), descriptor("p/d/")]);
+    assert!(descriptors[1].path.names_directory_object());
+    assert!(!descriptors[0].path.names_directory_object());
+    assert!(!directory.names_directory_object());
+    let alone = ListedChild::directory_object(Some(5), identity("p/d/"));
+    assert_eq!(alone.name(), "");
+    assert_eq!(
+        alone
+            .into_descriptor(&directory)
+            .map(|descriptor| descriptor.path),
+        Ok(path("p/d/"))
+    );
+}
+
+/// Only the listed directory's own file can be handed over as its object: another key, another
+/// kind, or anything at the storage root (which has no own object) is a `Protocol` failure at the
+/// path it carried, never a child.
+#[test]
+fn a_directory_object_that_is_not_the_directorys_own_file_fails() {
+    let mut directory_kind = descriptor("p/d/");
+    directory_kind.kind = EntryKind::Directory;
+    for (directory, carried) in [
+        ("p/d", descriptor("p/d/x/")),
+        ("p/d", descriptor("p/e/")),
+        ("p/d", descriptor("p/d")),
+        ("p/d", directory_kind),
+        ("", descriptor("/")),
+    ] {
+        let mut page = ListingPage::default();
+        let at = carried.path.clone();
+        page.push_directory_object(&path(directory), carried);
+        assert!(page.children.is_empty(), "{at}");
+        let failed: Vec<(FailureClass, &str)> = page
+            .failures
+            .iter()
+            .map(|failure| (failure.failure.class(), failure.failure.path().as_str()))
+            .collect();
+        assert_eq!(failed, [(FailureClass::Protocol, at.as_str())]);
+    }
+}
+
+/// An empty name at the storage root would join to the root itself: a `Protocol` failure at the
+/// root, never an entry at path `""`.
+#[test]
+fn an_empty_name_at_the_storage_root_is_refused() {
+    let root = StoragePath::root();
+    let page = ListingPage::new(
+        vec![
+            child("a"),
+            ListedChild::directory_object(Some(1), identity("x")),
+        ],
+        Vec::new(),
+        0,
+    );
+    let (descriptors, failures) = page.into_descriptors(&root);
+    assert_eq!(descriptors, [descriptor("a")]);
+    let mut not_a_file = ListedChild::directory_object(None, identity("y"));
+    not_a_file.kind = EntryKind::Directory;
+    let (kept, refused) =
+        ListingPage::new(vec![not_a_file], Vec::new(), 0).into_descriptors(&path("p/d"));
+    assert!(kept.is_empty());
+    assert_eq!(refused.len(), 1, "a directory object is always a file");
+    let failed: Vec<(FailureClass, &str)> = failures
+        .iter()
+        .map(|failure| (failure.class(), failure.path().as_str()))
+        .collect();
+    assert_eq!(failed, [(FailureClass::Protocol, "")]);
+    assert!(
+        ListedChild::directory_object(Some(1), identity("x"))
+            .into_descriptor(&root)
+            .is_err()
+    );
+}
+
+/// The ordinary ways in stay strict: `ListedChild::new` refuses an empty name, and a descriptor
+/// spelled `<directory>/` through `from_descriptors` is a misspelled child, not an object.
+#[test]
+fn listed_child_new_still_refuses_an_empty_name() {
+    assert!(ListedChild::new("", EntryKind::File, Some(1), identity("x")).is_err());
+    let page = ListingPage::from_descriptors(&path("p/d"), vec![descriptor("p/d/")], vec![], 0);
+    assert!(page.children.is_empty());
+    assert_eq!(page.failures.len(), 1);
+}
+
 /// A server's normalised spelling of a child of the requested directory is respelled from the
 /// request; a path that is not such a child is left alone, so it is refused, not renamed.
 #[test]

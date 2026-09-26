@@ -346,6 +346,16 @@ impl StoragePath {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether this path is spelled like a directory object (P7 F5): it ends in `/`, as the key of
+    /// an object stored under `p/d/`. Such an entry is not the directory `p/d` nor the file `p/d`;
+    /// paths are compared byte for byte and the trailing `/` is never normalised away. A listing
+    /// only ever spells a directory object this way; a caller-supplied path spelled like one is
+    /// treated as one (a filesystem refuses it).
+    #[must_use]
+    pub fn names_directory_object(&self) -> bool {
+        self.0.ends_with('/')
+    }
 }
 
 impl fmt::Display for StoragePath {

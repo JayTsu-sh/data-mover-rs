@@ -16,6 +16,16 @@
 //! reports that child as a [`ChildFailure`] rather than hand out a name that does not join back
 //! to what it listed ([`ListingPage::from_descriptors`] enforces it).
 //!
+//! **One child may have an empty name: the directory's own object** (P7 F5, §5.4.4). An object
+//! store can hold content under the key `p/d/` itself; the listing of `p/d` hands it over as a
+//! file whose name is empty, so by the same rule its path is `p/d/` — exactly the key. Only
+//! [`ListedChild::directory_object`] and [`ListingPage::push_directory_object`] make such a child;
+//! [`ListedChild::new`] still refuses an empty name. The storage root has no own object (its path
+//! would be the root itself), and a directory object is always a file: an empty name at the root,
+//! or on anything but a file, is a `Protocol` failure, never a child. Paths are compared byte for
+//! byte and a trailing `/` is never normalised away, so `p/d/` and the file or directory `p/d` are
+//! different entries.
+//!
 //! Single-directory callers (recursive delete, the NDX walk) collect a whole listing with
 //! [`collect_listing`].
 //!
@@ -54,7 +64,8 @@ pub use names::child_path;
 pub(crate) use names::respelled;
 
 use crate::model::{
-    BackendSessionFailure, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
+    BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
+    Transience,
 };
 
 /// Children per page when the caller has no reason to choose: about one native page of the
@@ -163,6 +174,32 @@ impl ListingPage {
         page
     }
 
+    /// Adds `directory`'s own object (P7 F5): `descriptor` is the file stored under the key
+    /// `directory` + `/`, handed over as the child with the empty name. A descriptor at any other
+    /// path, one that is not a file, or any at the storage root (which has no own object) becomes
+    /// a `Protocol` failure at the path it carried instead.
+    pub fn push_directory_object(&mut self, directory: &StoragePath, descriptor: SourceDescriptor) {
+        let own = !directory.as_str().is_empty()
+            && descriptor.kind == EntryKind::File
+            && descriptor.path.as_str().strip_suffix('/') == Some(directory.as_str());
+        if !own {
+            self.failures.push(ChildFailure {
+                name: None,
+                raw_name: None,
+                failure: listing_failure(
+                    &descriptor.path,
+                    FailureClass::Protocol,
+                    Transience::Permanent,
+                    "the listing handed over a directory object that is not the listed \
+                     directory's own file",
+                ),
+            });
+            return;
+        }
+        self.children
+            .push(ListedChild::from_descriptor(String::new(), descriptor));
+    }
+
     /// Adds the listed child of `directory` that `descriptor` describes, carrying `hint` for the
     /// listing of it ([`DescentHint`]), or a failure at the path it carried when that path is not
     /// `directory`, `/` and one name.
@@ -188,33 +225,9 @@ impl ListingPage {
             return;
         };
         let name = name.to_owned();
-        let SourceDescriptor {
-            path: _,
-            kind,
-            size,
-            source_identity,
-            backend_fact,
-            content_version,
-            inline_timestamps,
-            inline_mode,
-            inline_ownership,
-            version,
-            listing,
-        } = descriptor;
-        self.children.push(ListedChild {
-            name,
-            kind,
-            size,
-            source_identity,
-            backend_fact,
-            content_version,
-            inline_timestamps,
-            inline_mode,
-            inline_ownership,
-            version,
-            listing,
-            descent_hint: hint,
-        });
+        let mut child = ListedChild::from_descriptor(name, descriptor);
+        child.descent_hint = hint;
+        self.children.push(child);
     }
 
     /// The children of `directory` with their full paths, and every failure of the page.
@@ -250,6 +263,10 @@ impl ListingPage {
         let mut children = Vec::with_capacity(self.children.len());
         for mut child in self.children {
             let hint = child.descent_hint.take();
+            if let Some(failure) = misplaced_object(directory, &child) {
+                failures.push(failure);
+                continue;
+            }
             match child_path(directory, &child.name) {
                 Ok(path) => children.push(keep(child.at(path), hint)),
                 Err(_) => failures.push(too_long(directory, &child.name)),
@@ -615,6 +632,27 @@ fn too_long(directory: &StoragePath, name: &str) -> EntryOperationFailure {
             "a listed child's path exceeds the storage path limit",
         )
     })
+}
+
+/// Why an empty-named child cannot be handed over: at the storage root its path would be the root
+/// itself, and a directory object is always a file (P7 F5). `None` for any other child.
+fn misplaced_object(directory: &StoragePath, child: &ListedChild) -> Option<EntryOperationFailure> {
+    if !child.is_directory_object() {
+        return None;
+    }
+    let diagnostic = if directory.as_str().is_empty() {
+        "the listing handed over an own object of the storage root, which has no path"
+    } else if child.kind == EntryKind::File {
+        return None;
+    } else {
+        "the listing handed over a directory object that is not a file"
+    };
+    Some(listing_failure(
+        directory,
+        FailureClass::Protocol,
+        Transience::Permanent,
+        diagnostic,
+    ))
 }
 
 fn abandoned(path: &StoragePath) -> StorageRoleFailure {

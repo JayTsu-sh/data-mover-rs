@@ -10,13 +10,22 @@ use crate::storage::{Namespace, SourceDescriptor, StorageRoleFailure};
 pub(crate) type Described = (Vec<SourceDescriptor>, Vec<EntryOperationFailure>);
 
 /// A fake's answer to a listing of `directory` — children spelled with full paths, as fakes
-/// build them — as the one-page stream a namespace returns.
+/// build them — as the one-page stream a namespace returns. A descriptor at `directory` + `/` is
+/// handed over as the directory's own object (P7 F5).
 pub(crate) fn answer(
     directory: &StoragePath,
     result: Result<Described, StorageRoleFailure>,
 ) -> ListingStream {
     let item = result.map(|(descriptors, failures)| {
-        ListingPage::from_descriptors(directory, descriptors, failures, 0)
+        let own_key = format!("{}/", directory.as_str());
+        let (own, children): (Vec<_>, Vec<_>) = descriptors
+            .into_iter()
+            .partition(|descriptor| descriptor.path.as_str() == own_key);
+        let mut page = ListingPage::from_descriptors(directory, children, failures, 0);
+        for descriptor in own {
+            page.push_directory_object(directory, descriptor);
+        }
+        page
     });
     ListingStream::from_pages(directory.clone(), [item])
 }

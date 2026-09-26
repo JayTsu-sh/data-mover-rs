@@ -152,6 +152,7 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
             mutations: Err(NO_MUTATIONS),
             symlinks: false,
             names: NameSemantics::EXACT,
+            directory_objects: false,
         }
     }
 
