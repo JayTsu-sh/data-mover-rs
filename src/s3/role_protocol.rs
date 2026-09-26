@@ -226,7 +226,10 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
                 }
             })?;
         if !pinned {
-            return unpinned::read(response, range.end - range.start, observed).await;
+            return unpinned::read(response, range.end - range.start, observed, || {
+                self.head_object(key, None)
+            })
+            .await;
         }
         response
             .body

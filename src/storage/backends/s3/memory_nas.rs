@@ -9,7 +9,8 @@
 //! - No conditional reads: a range read is checked after the fact, as the real protocol checks the
 //!   response — another `ETag` is a permanent `Conflict`. A replacement can be injected after the
 //!   n-th range read of a key ([`NasBucket::replace_after_ranges`]), and the next range read cut
-//!   short ([`NasBucket::cut_next_range`], the `Conflict` a short body is).
+//!   short ([`NasBucket::cut_next_range`]) by a lost connection or by a replacement committing;
+//!   either way one `HEAD` after it decides, as the real protocol's does ([`broken_body_failure`]).
 //! - `CreateMultipartUpload`, `ListObjectVersions` and `GetBucketVersioning` answer 501
 //!   (`Unsupported`); `ListMultipartUploads` and `ListParts` 403 (`PermissionDenied`).
 //! - Listings keep no order (the fake's `unordered` listing).
@@ -21,7 +22,19 @@ use bytes::Bytes;
 
 use super::MemoryS3;
 use crate::model::{FailureClass, Transience};
-use crate::storage::backends::s3::{S3BucketCapabilities, S3ProtocolFailure, S3Result};
+use crate::storage::backends::s3::{
+    S3BucketCapabilities, S3ObjectFacts, S3Protocol as _, S3ProtocolFailure, S3Result,
+    broken_body_failure,
+};
+
+/// How the next range read of a NAS bucket breaks off mid-body.
+#[derive(Clone, Debug)]
+pub(crate) enum BodyCut {
+    /// The connection dropped; the object is unchanged.
+    Dropped,
+    /// A replacement holding these bytes committed, and the server cut the read (N0).
+    Replaced(Bytes),
+}
 
 /// What the NAS mode keeps beside the fake's objects.
 #[derive(Default)]
@@ -33,8 +46,8 @@ pub(crate) struct NasBucket {
     /// After this many more range reads of the key, its object is replaced by these bytes (a
     /// writer over S3 or NFS).
     pub(crate) replace_after_ranges: Option<(String, u32, Bytes)>,
-    /// The next range read fails as a body the server cut short (a replacement committed).
-    pub(crate) cut_next_range: bool,
+    /// The next range read breaks off mid-body, as the [`BodyCut`] says.
+    pub(crate) cut_next_range: Option<BodyCut>,
     /// Range reads served (NAS mode), `HEAD`s answered (either mode), and `GetBucketVersioning`
     /// requests answered (NAS mode).
     pub(crate) ranges: u32,
@@ -136,22 +149,26 @@ impl MemoryS3 {
         })
     }
 
-    /// Counts a range read of `key` in NAS mode; a cut read fails, and a due replacement is
-    /// stored after this read was served.
-    pub(super) async fn nas_range_served(&self, key: &str) -> S3Result<()> {
-        let replacement = {
+    /// Counts a range read of `key` (described as `observed`) in NAS mode; a cut read fails as
+    /// the `HEAD` after it decides, and a due replacement is stored after this read was served.
+    pub(super) async fn nas_range_served(
+        &self,
+        key: &str,
+        observed: &S3ObjectFacts,
+    ) -> S3Result<()> {
+        let cut = {
             let mut nas = self.nas();
             if !nas.enabled {
                 return Ok(());
             }
             nas.ranges += 1;
-            if std::mem::take(&mut nas.cut_next_range) {
-                return Err(S3ProtocolFailure::entry(
-                    FailureClass::Conflict,
-                    Transience::Permanent,
-                    "the S3 object's body ended early: it was replaced during the read",
-                ));
-            }
+            nas.cut_next_range.take()
+        };
+        if let Some(cut) = cut {
+            return Err(self.cut_body(key, observed, cut).await);
+        }
+        let replacement = {
+            let mut nas = self.nas();
             match nas.replace_after_ranges.take() {
                 Some((target, 1, bytes)) if target == key => Some(bytes),
                 Some((target, left, bytes)) if target == key => {
@@ -169,6 +186,24 @@ impl MemoryS3 {
             self.objects.lock().await.insert(key.to_string(), bytes);
         }
         Ok(())
+    }
+
+    /// The failure of a range read of `key` that broke off as `cut` says.
+    async fn cut_body(
+        &self,
+        key: &str,
+        observed: &S3ObjectFacts,
+        cut: BodyCut,
+    ) -> S3ProtocolFailure {
+        let head = match cut {
+            BodyCut::Dropped => self.head(key).await,
+            BodyCut::Replaced(bytes) => {
+                self.nas_written(key, bytes.len());
+                self.objects.lock().await.insert(key.to_string(), bytes);
+                self.head(key).await
+            }
+        };
+        broken_body_failure(head, observed, "the fake NAS bucket cut the body short")
     }
 
     /// Counts a `HEAD` (in either mode).

@@ -419,7 +419,7 @@ impl S3Protocol for MemoryS3 {
                 "range too large",
             )
         })?;
-        self.nas_range_served(key).await?;
+        self.nas_range_served(key, observed).await?;
         Ok(bytes.slice(start..end))
     }
     async fn put_object(

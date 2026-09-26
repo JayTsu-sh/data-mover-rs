@@ -12,8 +12,8 @@ pub(crate) struct S3BucketCapabilities {
     /// A read can be pinned by the store to what was described: `If-Match` on the `ETag`, or
     /// `?versionId=`. Without it every ranged read is checked after the fact instead: the
     /// response's `ETag`, `Content-Range` total and `Last-Modified` must be the described ones, a
-    /// body shorter than announced means the object was replaced mid-read, and a source read ends
-    /// with one more `HEAD`.
+    /// body that broke off is a replacement or a lost connection as one `HEAD` after it finds, and
+    /// a source read ends with one more `HEAD`.
     pub(crate) conditional_reads: bool,
     /// Multipart uploads (`CreateMultipartUpload` …). Without them no multipart request is ever
     /// sent: an object is one `PutObject`, at most [`Self::max_object_bytes`].

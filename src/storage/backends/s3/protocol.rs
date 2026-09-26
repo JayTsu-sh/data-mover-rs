@@ -293,9 +293,12 @@ pub(crate) trait S3Protocol: Send + Sync {
     /// has conditional reads (`?versionId=` when `observed` names a version, `If-Match` on its
     /// `ETag`: a replaced object answers 412, a permanent `Conflict`). Without them no condition is
     /// sent and the response is checked instead: its `ETag` must be `observed.etag`, its
-    /// `Content-Range` total `observed.size`, its `Last-Modified` `observed.last_modified` when both
-    /// have one, and its body as long as it announced — any difference is a permanent `Conflict`
-    /// (an ONTAP NAS bucket cuts a GET short once a replacement commits, P7 §14.2 N0).
+    /// `Content-Range` total `observed.size` and its `Last-Modified` `observed.last_modified` when
+    /// both have one — any difference is a permanent `Conflict`. A body that then breaks off (short
+    /// of what it announced, or the connection reset) is followed by one `HEAD`: another object is
+    /// a permanent `Conflict` (an ONTAP NAS bucket cuts a GET short once a replacement commits, P7
+    /// §14.2 N0), the described one a transient lost connection, and a failed `HEAD` its own
+    /// failure ([`super::broken_body_failure`]).
     async fn get_range(
         &self,
         key: &str,

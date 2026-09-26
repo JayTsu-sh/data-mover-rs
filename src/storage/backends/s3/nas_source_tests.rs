@@ -1,9 +1,11 @@
 //! An ONTAP NAS bucket as a source (P7 §14.2, N1), over the in-memory bucket in NAS mode: no
-//! conditional reads, so each range response is checked against the described object and one
-//! `HEAD` after the last range closes the read; no versions; no directory objects.
+//! conditional reads, so each range response is checked against the described object, a body
+//! that broke off is classified by one `HEAD`, and one `HEAD` after the last range closes the
+//! read; no versions; no directory objects.
 
 use futures::StreamExt as _;
 
+use super::memory_nas::BodyCut;
 use super::*;
 use crate::model::{FailureClass, IdentityStrength, SourceVersion, Transience};
 use crate::storage::{ByteStream, StorageRoleFailure};
@@ -111,15 +113,90 @@ async fn a_replacement_during_or_after_the_ranges_is_a_conflict() -> TestResult 
     Ok(())
 }
 
-/// A body the server cut short (it does, once a replacement commits) is a permanent `Conflict`,
-/// not a lost connection to retry.
+/// A body that broke off is followed by one `HEAD` (coordinator decision 2026-09-27): the object
+/// replaced (the server cuts a read once a replacement commits, N0) is a permanent `Conflict`.
 #[tokio::test]
-async fn a_body_cut_short_is_a_conflict() -> TestResult {
+async fn a_body_cut_by_a_replacement_is_a_conflict() -> TestResult {
     let protocol = nas_with(b"0123456789").await?;
     let stream = open(&protocol).await?;
-    protocol.nas().cut_next_range = true;
+    let heads_before = protocol.nas().heads;
+    protocol.nas().cut_next_range = Some(BodyCut::Replaced(Bytes::from_static(b"ABCDEFGHIJ")));
     let read = drain(stream).await;
     assert!(is_read_conflict(&read), "{read:?}");
+    assert_eq!(
+        protocol.nas().heads - heads_before,
+        1,
+        "one HEAD after the cut"
+    );
+    // A new read (after a new describe) sees the replacement.
+    assert_eq!(drain(open(&protocol).await?).await?, b"ABCDEFGHIJ");
+    Ok(())
+}
+
+/// The object unchanged after the cut is a lost connection: transient, and the read retried from
+/// the start reads it whole.
+#[tokio::test]
+async fn a_body_cut_by_a_lost_connection_is_retried() -> TestResult {
+    let protocol = nas_with(b"0123456789").await?;
+    let stream = open(&protocol).await?;
+    let heads_before = protocol.nas().heads;
+    protocol.nas().cut_next_range = Some(BodyCut::Dropped);
+    let read = drain(stream).await;
+    assert!(
+        matches!(
+            &read,
+            Err(StorageRoleFailure::Session(failure))
+                if failure.class() == FailureClass::Connectivity
+                    && failure.transience() == Transience::Transient
+        ),
+        "{read:?}"
+    );
+    assert_eq!(
+        protocol.nas().heads - heads_before,
+        1,
+        "one HEAD after the cut"
+    );
+    assert_eq!(drain(open(&protocol).await?).await?, b"0123456789");
+    Ok(())
+}
+
+/// A `HEAD` after the cut that fails keeps its own class: the object gone is `NotFound`, a
+/// connection still down a transient `Connectivity`.
+#[tokio::test]
+async fn a_failed_head_after_a_cut_keeps_its_own_class() -> TestResult {
+    let cases = [
+        (
+            S3ProtocolFailure::entry(FailureClass::NotFound, Transience::Permanent, "not found"),
+            FailureClass::NotFound,
+            Transience::Permanent,
+        ),
+        (
+            S3ProtocolFailure::session(
+                FailureClass::Connectivity,
+                Transience::Transient,
+                "timed out",
+            ),
+            FailureClass::Connectivity,
+            Transience::Transient,
+        ),
+    ];
+    for (head, class, transience) in cases {
+        let protocol = nas_with(b"0123456789").await?;
+        let stream = open(&protocol).await?;
+        protocol.nas().cut_next_range = Some(BodyCut::Dropped);
+        *protocol.head_failure.lock().await = Some(("source".into(), head.clone()));
+        let read = drain(stream).await;
+        let classified = match &read {
+            Err(StorageRoleFailure::Entry(failure)) => {
+                Some((failure.class(), failure.transience()))
+            }
+            Err(StorageRoleFailure::Session(failure)) => {
+                Some((failure.class(), failure.transience()))
+            }
+            _ => None,
+        };
+        assert_eq!(classified, Some((class, transience)), "{head:?}: {read:?}");
+    }
     Ok(())
 }
 

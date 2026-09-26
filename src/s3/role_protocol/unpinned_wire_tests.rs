@@ -34,19 +34,59 @@ const GOOD: Answer = Answer {
     body: b"0123456789",
 };
 
-/// Records whether each request carried `If-Match`, and answers with its [`Answer`].
+/// What the server answers a `HEAD` with: the described object, another one, or an error status.
+#[derive(Clone, Copy, Debug)]
+enum HeadAnswer {
+    Described,
+    Replaced,
+    Status(u16),
+}
+
+/// Records whether each GET carried `If-Match` and how many `HEAD`s came, and answers a GET with
+/// its [`Answer`], a `HEAD` with its [`HeadAnswer`].
 #[derive(Clone, Debug)]
 struct RangeServer {
     if_match: Arc<Mutex<Vec<Option<String>>>>,
+    heads: Arc<Mutex<u32>>,
     answer: Answer,
+    head: HeadAnswer,
 }
 
 impl RangeServer {
     fn new(answer: Answer) -> Self {
+        Self::with_head(answer, HeadAnswer::Described)
+    }
+
+    fn with_head(answer: Answer, head: HeadAnswer) -> Self {
         Self {
             if_match: Arc::default(),
+            heads: Arc::default(),
             answer,
+            head,
         }
+    }
+
+    fn heads(&self) -> u32 {
+        *self.heads.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn head_response(&self) -> Result<HttpResponse, ConnectorError> {
+        *self.heads.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        let (status, etag) = match self.head {
+            HeadAnswer::Described => (200, "\"nas-1\""),
+            HeadAnswer::Replaced => (200, "\"nas-2\""),
+            HeadAnswer::Status(status) => (status, "\"nas-1\""),
+        };
+        StatusCode::try_from(status)
+            .map(|status| {
+                let mut response = HttpResponse::new(status, SdkBody::empty());
+                let headers = response.headers_mut();
+                headers.insert("etag", etag);
+                headers.insert("last-modified", GOOD.last_modified);
+                headers.insert("content-length", "100");
+                response
+            })
+            .map_err(|error| ConnectorError::other(Box::new(error), None))
     }
 
     fn if_match_sent(&self) -> Vec<Option<String>> {
@@ -59,6 +99,9 @@ impl RangeServer {
 
 impl HttpConnector for RangeServer {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        if request.method() == "HEAD" {
+            return HttpConnectorFuture::ready(self.head_response());
+        }
         self.if_match
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -124,8 +167,8 @@ async fn only_an_object_bucket_sends_if_match() {
     assert_eq!(server.if_match_sent(), vec![None]);
 }
 
-/// On a NAS bucket another `ETag`, another size in `Content-Range`, another `Last-Modified`, or a
-/// body shorter than announced is the object replaced during the read: a permanent `Conflict`.
+/// On a NAS bucket another `ETag`, another size in `Content-Range` or another `Last-Modified` is
+/// the object replaced during the read: a permanent `Conflict`, known without a `HEAD`.
 #[tokio::test]
 async fn a_nas_response_that_is_not_the_described_object_is_a_conflict() {
     for answer in [
@@ -141,13 +184,64 @@ async fn a_nas_response_that_is_not_the_described_object_is_a_conflict() {
             last_modified: "Sat, 26 Sep 2026 10:00:01 GMT",
             ..GOOD
         },
-        Answer {
-            body: b"01234",
-            ..GOOD
-        },
     ] {
         let server = RangeServer::new(answer.clone());
         let read = nas(&server).get_range("key", 0..10, &described()).await;
         assert!(is_conflict(&read), "{answer:?}: {read:?}");
+        assert_eq!(server.heads(), 0, "{answer:?}");
+    }
+}
+
+/// A NAS body shorter than its `Content-Length` is followed by one `HEAD`: the described object
+/// means the connection was lost (transient, retried); another object a replacement (a permanent
+/// `Conflict`); a failed `HEAD` keeps its own class.
+#[tokio::test]
+async fn a_short_nas_body_is_classified_by_one_head() {
+    let short = Answer {
+        body: b"01234",
+        ..GOOD
+    };
+    let cases = [
+        (
+            HeadAnswer::Described,
+            FailureClass::Connectivity,
+            Transience::Transient,
+        ),
+        (
+            HeadAnswer::Replaced,
+            FailureClass::Conflict,
+            Transience::Permanent,
+        ),
+        (
+            HeadAnswer::Status(404),
+            FailureClass::NotFound,
+            Transience::Permanent,
+        ),
+        (
+            HeadAnswer::Status(403),
+            FailureClass::PermissionDenied,
+            Transience::Permanent,
+        ),
+    ];
+    for (head, expected_class, expected_transience) in cases {
+        let server = RangeServer::with_head(short.clone(), head);
+        let read = nas(&server).get_range("key", 0..10, &described()).await;
+        let classified = match read {
+            Err(
+                S3ProtocolFailure::Entry {
+                    class, transience, ..
+                }
+                | S3ProtocolFailure::Session {
+                    class, transience, ..
+                },
+            ) => Some((class, transience)),
+            Ok(_) => None,
+        };
+        assert_eq!(
+            classified,
+            Some((expected_class, expected_transience)),
+            "{head:?}"
+        );
+        assert_eq!(server.heads(), 1, "{head:?}");
     }
 }

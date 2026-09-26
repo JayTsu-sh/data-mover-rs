@@ -1098,6 +1098,9 @@ legacy 的 HCP 标签分支、“HCP 桶一律开版本”的捷径、直接依�
   相同。所以“内容不同而 ETag 稳定 → Corruption（有歧义）”是真实会出现的情形，报错文字照上文保留歧义说明。SMB 未测，按同一 inode 属性推断相同。
 - **源端逐段读**：替换在读的中途提交时，服务器在提交后 0.3–0.7 s 断开进行中的 GET，已收字节是旧内容的干净前缀、短于 Content-Length（从未混入新内容）。
   **body 短于 Content-Length / Content-Range 按“已改变”（Conflict）判**，不当可重试的断连；Last-Modified 只到秒，变化只能靠 ETag 看出。
+  **修订（2026-09-27，协调决定）**：body 断掉（短于 Content-Length / Content-Range、读 body 时连接重置）后先 `HEAD` 一次：ETag（或大小、
+  两边都有时的 Last-Modified）与描述时不同 → `Conflict` / Permanent；相同 → 普通断连（会话 `Connectivity` / Transient，可重试）；`HEAD`
+  本身失败 → 按它自己的分类（`storage/backends/s3/broken_body.rs`，见下文「N1–N7、F5h 实施记录」之后的跟进）。
 - **> 5 GiB 不是服务器限制**：5 GiB + 1 写入并回读正确；服务器不预检大小与剩余空间（Content-Length 5 TiB + 1 也回 100 Continue）。**保留**
   “> 5 GiB 在 Preflight 拒绝”作为设计选择（卷满行为未测，单 PUT 失败即从零开始）；放宽另议。
 - chunked 编码 → 501，流式单 PUT 必须带 Content-Length（与上文一致）；UNSIGNED-PAYLOAD 接受（200 MiB、3 次、内容正确）。aws-chunked 签名未测。
@@ -1128,7 +1131,7 @@ N6 `d51af50`、N7 `ce49448`、F5h `7260974`；细节见 `.claude/docs/storage-s3
   body 在凑满声明长度前被放弃时报错而不是正常结束；扣字节最长 300 s（`HOLD_LIMIT`，低于实测的 900 s）；publish 前请求若已结束（存储因 body
   空闲断连、提前拒绝）报未变；结果不明的发布按 prepare HEAD 结算时隔 2 s 再 HEAD 一次才报未变（`SETTLE_GRACE`，存储已有完整 body，
   回复丢失后仍可能提交）；Direct 等输入结束才送最后 1 字节。
-- 与计划的差别：NAS 源端 body 读到一半出错也按 N0 决定报 `Conflict`（普通断连同样不重试，诊断带原始错误）—— 见“待定”；
+- 与计划的差别：NAS 源端 body 读到一半出错也按 N0 决定报 `Conflict`（普通断连同样不重试，诊断带原始错误）—— 见“待定”（2026-09-27 已收窄为先 `HEAD` 再分类，见「N 系列跟进」）；
   名字冲突映射认错误码（NoSuchKey / NameCollision），无错误码时才看 404 / 409；原生拷贝读回的锚必须等于拷贝回复（设过标签则是之后 HEAD）的 ETag；
   NAS 桶上 `keeps_history` 不发 GetBucketVersioning；Direct 不做 prepare HEAD（它的失败一律报已变）。
 - 故障注入：N1 14 项、N2 11 项（1 项防御性、不可达，存活）、N3 14 项（`disable_payload_signing` 一项存活：SDK 对不可重放的 body 本来就发
@@ -1154,8 +1157,19 @@ N6 `d51af50`、N7 `ce49448`、F5h `7260974`；细节见 `.claude/docs/storage-s3
     NAS 桶（`bucket_type=nas`，`EXPECT_DIR_MARKER=0`）全部 `RESULT: pass`；`nas_matrix.sh` 第四轮 `RESULT: pass`。跑完核对：各存储的桶与改前相同
     （MinIO 另有别人建的 `data-mover-c10-1790460684`，ONTAP `data-mover-test-ver` 下别人的 `dm-1790460935/`，都不是本批写的，未动），我们的前缀无残留。
     `versioning_matrix.sh` 未重跑（版本化桶的写入路径除结算函数的重构外未变，结算在 MD5 ETag 的桶上行为不变）。
-- 待定（需用户定）：NAS 源端读 body 途中出错一律报 `Conflict` / Permanent（N0 决定：服务器在替换提交后切断进行中的 GET）；普通网络断连因此
-  也不重试。可选的收窄：body 出错后先 HEAD，ETag 变了才 `Conflict`，没变按可重试的断连报。
+- ~~待定（需用户定）：NAS 源端读 body 途中出错一律报 `Conflict` / Permanent~~ —— 2026-09-27 协调决定采用收窄方案，已实现（见下条）。
+
+**N 系列跟进（2026-09-27）**：
+- NAS 源端 body 断掉后 `HEAD` 一次再分类（上面「待定」的收窄方案）：变了 → `Conflict` / Permanent；没变 → 会话 `Connectivity` / Transient；
+  `HEAD` 失败 → 保留其分类。判定是共用的纯函数 `broken_body_failure`（`storage/backends/s3/broken_body.rs`），真协议
+  （`role_protocol/unpinned.rs::read`）与 `MemoryS3` NAS 模式（`BodyCut::{Dropped, Replaced}`）都调它；`get_range` 的三个调用方（源端读、
+  括号式读回、`.upload` 指针读 —— NAS 桶不读指针，实际走不到）同样受益。body 断开后 `HEAD` 回 404 报条目 `NotFound`，
+  读完后的确认 `HEAD` 回 404 仍报 `Conflict`：都是条目 Permanent，按决定保留 `HEAD` 自己的类别。只多一个请求、只在 body 出错时发。
+- 故障注入：body 分类 12 项（换向、忽略大小 / Last-Modified、HEAD 失败改判 Conflict / 改范围、未变判成条目、诊断丢原因、真协议不发 HEAD、
+  真协议恢复旧行为、接受短 body、假桶不存替换、假桶不发 HEAD），全部让至少一个测试变红，改回后逐字节还原。
+- 真机（2026-09-27，从 10.131.9.10）：`nas_matrix.sh` 一轮 `RESULT: pass`（42 行；「NAS → 本地读的中途被 PUT 替换」仍报 `Conflict`，
+  现经 body 断开后的 HEAD 判定；同桶原生 1 KiB / 200 MiB 各一次 CopyObject、读回开）；跑完 `nas-<run>/` 下 0 个对象；MinIO `run.py`
+  `all checks passed`。
 
 
 ## 15. 决定记录（2026-09-25 全部采纳）

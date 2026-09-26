@@ -45,8 +45,13 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
 - `bucket_type=nas` — ONTAP NAS 桶 profile（P7 §14.2，N1–N7）。能力开关 `S3BucketCapabilities`
   （`storage/backends/s3/capabilities.rs`，由 `s3/architecture.rs::bucket_capabilities` 按 `bucket_type` 定；`compat` 只改请求、
   不改能力）。N1：连接不再拒绝（桶若回版本状态只告警）；作源端无条件读 —— 不发 `If-Match`，每段响应的 `ETag`、
-  `Content-Range` 总长、`Last-Modified` 必须等于描述时的，body 短于宣称长度按“已被替换”（`Conflict` / Permanent），读完
-  再 `HEAD` 一次（`role_protocol/unpinned.rs`、`source.rs::confirm_unchanged`）；无源端版本、namespace
+  `Content-Range` 总长、`Last-Modified` 必须等于描述时的（不等即 `Conflict` / Permanent）；body 读到一半断掉（短于
+  Content-Length / Content-Range、读 body 时连接被重置）后 `HEAD` 一次（2026-09-27 协调决定，`broken_body.rs`）：`ETag` / 大小 /
+  `Last-Modified` 变了 → `Conflict` / Permanent（被替换，N0：替换提交后服务器切断进行中的 GET），没变 → 会话 `Connectivity` /
+  Transient（普通断连，重试），`HEAD` 本身失败 → 按 `HEAD` 自己的分类；读完再 `HEAD` 一次（`role_protocol/unpinned.rs`、
+  `source.rs::confirm_unchanged`）。读回（N4）走同一个 `get_range`，规则相同（指针读也走它，但 NAS 桶不续传、
+  不读指针，走不到这里）；断开后的 `HEAD` 回 404 是条目 `NotFound`（读完后的确认 `HEAD` 回 404 报 `Conflict`：两者都是条目
+  Permanent，有意保留 `HEAD` 自己的类别）；无源端版本、namespace
   `histories=false` / `directory_objects=false`；原生拷贝亲和 `ontap-nas` + 桶名（只与同一 NAS 桶配对）。
   N2：目的端不续传（`resumable_at_destination() = false`、无自动间隔；Checkpointed 报
   `EffectiveRecovery::UnsupportedByDestination`、prepare 按 Restart、不看指针不列 upload）；`final_refusal`（`staged/limits.rs`）
