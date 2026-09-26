@@ -79,6 +79,24 @@ S3_PREFIX=test                   # bucket 内的子路径
    服务器不让建锁桶就跳过锁行。`resume_matrix.sh` 同样认 `S3_ENV`。DXN 的其他差异见 storage-s3.md「DXN（Ceph RGW
    Octopus）实测行为」。
 
+   **RustFS（1.0.0，PVE VM 105）**：`S3_ENV=.claude/skills/e2e-s3/rustfs/.env`（`versioning_matrix.sh` /
+   `traversal_versions.sh` / `resume_matrix.sh` 认；`staged_matrix.sh` 只读默认 `.env`）。endpoint
+   `http://10.131.9.14:9001`：管理网上的 console 监听也服务完整 S3 API，业务网 `10.10.1.14:9000` 从 WSL 不通；
+   `S3_COMPAT=` 空 = 普通 S3，不用 `S3_LOCATION`。用户 `data-mover-test` 的策略只放行 `data-mover-test` 与
+   `data-mover-*`（默认 `BUCKET_PREFIX` 就能建删临时桶）；`bigbucket` 不是我们的（403）。2026-09-26 curl 实测：
+   - **ListObjectVersions 原始 XML 按元素类型分组**：每页先是全部 `DeleteMarker`、再是全部 `Version`（组内 key 升序、
+     同 key 新→旧），不按 key 交错，所以非最新的标记会排在同 key 的最新版本前面。两组按 key + 新旧合并后才是 S3 逻辑序；
+     `key-marker` / `version-id-marker` 分页按逻辑序切（max-keys 1 / 2 / 3 不丢不重）。带 `delimiter` 会折叠 CommonPrefixes。
+   - 与 MinIO 2023 不同：条件写可用（`If-None-Match: *` / 错的 `If-Match` → 412 `PreconditionFailed`）；
+     ListMultipartUploads 按前缀列可用；DeleteObjects 不带 `Content-MD5` 也 200；legal hold 的 PUT 不要求 `Content-MD5`。
+   - multipart ETag = `md5(各段 md5)-N`（与 AWS 同）；非末段 < 5 MiB 在 Complete 报 400 `EntityTooSmall`；
+     UploadPartCopy 带 range、CopyObject `?versionId=` 可用。`GET ?partNumber=N` 回 206 但没有 `x-amz-mp-parts-count`。
+   - 未开版本 / 暂停版本的桶 PUT 不回 `x-amz-version-id` 头，ListObjectVersions 把对象列成 `null` 版本。
+     按 id HEAD 删除标记 → 405 + `x-amz-delete-marker: true`；最新是标记的 key HEAD → 404 + 标记头 + version id。
+   - Object Lock 建桶自动开版本；legal hold 下按 id 删版本 → 403 `AccessDenied`，不带 id 的 DELETE 照样写标记（同 AWS / MinIO）。
+   - IAM：`/rustfs/admin/v3/*` 收发明文 JSON（`add-canned-policy` / `add-user` / `set-user-or-group-policy`）；
+     `/minio/admin/v3/*` 回的是 madmin 加密体。
+
 7. **原生 S3→S3 切断续传**（C18）：MinIO 上服务端拷贝很快（读回关时 1 GiB ≈ 1.1 s），`--bandwidth` 不限原生拷贝，
    所以用 1 GiB 源、读回关、`--cancel-after-ms 300`（或 `timeout -s KILL 0.8`）切断：期望切断后 1 指针 + 1 upload，
    同参数再跑一次 `Resumed { … }`（取消时在途的段都拷完，SIGKILL 丢在途的段），`--compare` 相等，之后 0 / 0。
