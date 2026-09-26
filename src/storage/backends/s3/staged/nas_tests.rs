@@ -259,9 +259,10 @@ async fn a_lost_nas_copy_reply_is_settled_by_the_prepare_head() -> TestResult {
     Ok(())
 }
 
-/// Read back, a NAS copy must still carry the `ETag` its reply named (or, tagged, the one taken
-/// after tagging): replaced after the copy it is a `Conflict`; rewritten keeping the mtime (same
-/// `ETag`) it is a transient `Corruption`; untouched, or tagged, it verifies.
+/// Read back, a NAS copy must still carry the `ETag` its reply named — tags set after it do not
+/// move it (measured 2026-09-27), so publishing sends no `HEAD`, tagged or not: replaced after the
+/// copy it is a `Conflict`; rewritten keeping the mtime (same `ETag`) it is a transient
+/// `Corruption`; untouched, or tagged, it verifies.
 #[tokio::test]
 async fn a_nas_copy_is_read_back_against_its_reply() -> TestResult {
     for case in ["intact", "tagged", "replaced", "rewritten"] {
@@ -277,10 +278,16 @@ async fn a_nas_copy_is_read_back_against_its_reply() -> TestResult {
                 &CancellationToken::new(),
             )?;
         }
+        let heads_before = protocol.nas().heads;
         let published = destination
             .publish(&stage, publish_request())
             .await
             .map_err(|failure| failure.error)?;
+        assert_eq!(
+            protocol.nas().heads,
+            heads_before,
+            "{case}: no HEAD at publish"
+        );
         let other = Bytes::from_static(b"another");
         match case {
             "replaced" => {

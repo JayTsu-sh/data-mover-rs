@@ -101,7 +101,7 @@ role-based S3（`src/s3/role_protocol.rs` → `FailureClass`，ADR-0006 C6）：
 | describe 之后对象被替换（`read` / native bind / `observe_bound`） | 条目 `Conflict` / Permanent |
 | 流式单 PUT（P7 §14.2 N3，`staged/streaming.rs`）：通道里的一块在读超时内没被服务器取走、或最后 1 字节送出后回复没来（看门狗，SDK 自己的超时对这个请求关掉） | 会话 `Connectivity` / Transient；写阶段（扣着最后 1 字节）失败 → 最终 key 未变；等回复超时 → HEAD 结算（NAS：与 prepare 时 HEAD 相同算未变）。扣住最后 1 字节超过 300 s → 放弃，publish 报 `Connectivity` / Transient、未变 |
 | 流式单 PUT 回复的 `ETag` 是 32 位 hex MD5 形状（且非 SSE-KMS / SSE-C）却不等于边传边算的 MD5 | 条目 `Corruption` / **Transient**，最终 key 已变（对象已提交；重传即可） |
-| 无条件读的桶上读回（P7 §14.2 N4，ETag 括号式）：某段响应的 `ETag` 不等于 HEAD 锚，或定锚的 HEAD 发现对象已不在；原生拷贝（N5）的锚不等于拷贝回复里的 `ETag`（设过标签则是之后 HEAD 的） | 条目 `Conflict` / Permanent（读的过程中被替换）；验证在发布之后，最终 key 已变 |
+| 无条件读的桶上读回（P7 §14.2 N4，ETag 括号式）：某段响应的 `ETag` 不等于 HEAD 锚，或定锚的 HEAD 发现对象已不在；原生拷贝（N5）的锚不等于拷贝回复里的 `ETag`（设标签不改 ETag，2026-09-27 实测） | 条目 `Conflict` / Permanent（读的过程中被替换）；验证在发布之后，最终 key 已变 |
 | 同上：内容（BLAKE3）或 HEAD 的大小与源不同，而 `ETag` 稳定 | 条目 **`Corruption` / Transient**，诊断写明写与读之间的替换无法排除（N0：保留 mtime 的 NFS 改写不改 ETag）；对象桶上的同类不符仍是 `Protocol` / Unknown（“published checksum mismatch”，不变） |
 | `bucket_type=nas`：PutObject（缓冲或流式）回 404 `NoSuchKey`（路径上某段是文件）或 409 `NameCollision`（要写成文件的位置是目录） | 条目 **`Conflict`** / Permanent（名字冲突；不是 `NotFound`，也不重试）；对象桶上 404 仍是 `NotFound` |
 | 目的端写不了的名字或大小（`StagedDestination::final_refusal`；`bucket_type=nas`：> 5 GiB 或大小未知、key 含空段 / `.` / `..` 段（服务器会静默改写到别的 key）、段 > 255 字节（服务器回看似可重试的 500）；P7 §14.2 N2） | `Preflight`、目的端、条目 `Unsupported` / Permanent，目的端任何请求之前；直接调角色时 S3 prepare 报同样的条目失败（Operation `Prepare`） |

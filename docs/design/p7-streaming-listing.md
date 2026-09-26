@@ -1132,7 +1132,7 @@ N6 `d51af50`、N7 `ce49448`、F5h `7260974`；细节见 `.claude/docs/storage-s3
   空闲断连、提前拒绝）报未变；结果不明的发布按 prepare HEAD 结算时隔 2 s 再 HEAD 一次才报未变（`SETTLE_GRACE`，存储已有完整 body，
   回复丢失后仍可能提交）；Direct 等输入结束才送最后 1 字节。
 - 与计划的差别：NAS 源端 body 读到一半出错也按 N0 决定报 `Conflict`（普通断连同样不重试，诊断带原始错误）—— 见“待定”（2026-09-27 已收窄为先 `HEAD` 再分类，见「N 系列跟进」）；
-  名字冲突映射认错误码（NoSuchKey / NameCollision），无错误码时才看 404 / 409；原生拷贝读回的锚必须等于拷贝回复（设过标签则是之后 HEAD）的 ETag；
+  名字冲突映射认错误码（NoSuchKey / NameCollision），无错误码时才看 404 / 409；原生拷贝读回的锚必须等于拷贝回复（设过标签则是之后 HEAD —— 2026-09-27 实测设标签不改 ETag 后去掉了这次 HEAD，见「N 系列跟进」）的 ETag；
   NAS 桶上 `keeps_history` 不发 GetBucketVersioning；Direct 不做 prepare HEAD（它的失败一律报已变）。
 - 故障注入：N1 14 项、N2 11 项（1 项防御性、不可达，存活）、N3 14 项（`disable_payload_signing` 一项存活：SDK 对不可重放的 body 本来就发
   UNSIGNED-PAYLOAD，显式关签名是双保险）、N4 9 项、N5 4 项、N6 4 项、F5h 5 项，其余都让至少一个测试变红，改回后逐字节还原。
@@ -1165,8 +1165,16 @@ N6 `d51af50`、N7 `ce49448`、F5h `7260974`；细节见 `.claude/docs/storage-s3
   （`role_protocol/unpinned.rs::read`）与 `MemoryS3` NAS 模式（`BodyCut::{Dropped, Replaced}`）都调它；`get_range` 的三个调用方（源端读、
   括号式读回、`.upload` 指针读 —— NAS 桶不读指针，实际走不到）同样受益。body 断开后 `HEAD` 回 404 报条目 `NotFound`，
   读完后的确认 `HEAD` 回 404 仍报 `Conflict`：都是条目 Permanent，按决定保留 `HEAD` 自己的类别。只多一个请求、只在 body 出错时发。
+- NAS 桶上设标签不动 ETag（真机实测，ONTAP 9.19.1，`data-mover-nas`，curl）：1 KiB 对象 `PutObjectTagging` 三轮（每轮隔 2 s、值不同）
+  与 `DELETE ?tagging` 后 HEAD 的 `ETag` 与 `Last-Modified` 都不变（标签确实写入，`GET ?tagging` 读到新值）；`CopyObject` 带
+  `x-amz-metadata-directive: REPLACE` + `x-amz-meta-foo` + `x-amz-tagging-directive: REPLACE` + `x-amz-tagging`：回复 `ETag` = 之后 HEAD 的
+  `ETag`，元数据与标签都存上（HEAD 带 `x-amz-meta-foo`、`x-amz-tagging-count: 1`）；data-mover 发的 REPLACE 不带元数据 / 标签的拷贝同样
+  回复 = HEAD；两种拷贝之后再设标签，`ETag` 都不变。对照：自拷贝（`a → a`，REPLACE 换元数据）**会**换新 `ETag` 与 `Last-Modified`
+  （内容不变）—— 元数据改写在 NAS 桶上等于一次写，data-mover 不发这种请求。据此去掉 N5 原生拷贝设标签后的那次 HEAD
+  （`native_final.rs::send_copy`）：读回直接锚定拷贝回复；若将来某版本设标签改了 ETag，读回报 `Conflict`「replaced after the copy」
+  （报错偏严，不会漏报）。探测前缀 `nas-tagprobe-<ts>/` 跑完 0 个对象、目录已删。
 - 故障注入：body 分类 12 项（换向、忽略大小 / Last-Modified、HEAD 失败改判 Conflict / 改范围、未变判成条目、诊断丢原因、真协议不发 HEAD、
-  真协议恢复旧行为、接受短 body、假桶不存替换、假桶不发 HEAD），全部让至少一个测试变红，改回后逐字节还原。
+  真协议恢复旧行为、接受短 body、假桶不存替换、假桶不发 HEAD）与“设标签后又 HEAD”1 项，全部让至少一个测试变红，改回后逐字节还原。
 - 真机（2026-09-27，从 10.131.9.10）：`nas_matrix.sh` 一轮 `RESULT: pass`（42 行；「NAS → 本地读的中途被 PUT 替换」仍报 `Conflict`，
   现经 body 断开后的 HEAD 判定；同桶原生 1 KiB / 200 MiB 各一次 CopyObject、读回开）；跑完 `nas-<run>/` 下 0 个对象；MinIO `run.py`
   `all checks passed`。

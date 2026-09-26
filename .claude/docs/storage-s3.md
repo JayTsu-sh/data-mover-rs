@@ -77,8 +77,8 @@ s3://AK:SK@data-mover-test.10.128.61.200/p?compat=ontap
   N5：同一 NAS 桶内的原生拷贝一律**一次 `CopyObject`**（≤ 5 GiB，超过在 Preflight 拒；从不 `UploadPartCopy`，N0：同桶
   CopyObject 是克隆，1 GiB 0.01 s），`x-amz-copy-source-if-match` 照带（NAS 桶认存储的不透明 ETag）；prepare 同样多一次 HEAD，
   回复丢失按原状结算（副本的 ETag 由拷贝时刻的 mtime 派生，不能按源 ETag 认领）；读回的锚必须等于拷贝回复里的 ETag
-  （N0：拷贝回复的 ETag = 目标 HEAD 的不透明值），不等 → `Conflict`「replaced after the copy」。NAS 桶与对象桶之间、
-  两个 NAS 桶之间按 N1 的亲和走流式。
+  （N0：拷贝回复的 ETag = 目标 HEAD 的不透明值；之后设标签不改它，2026-09-27 实测，故设标签后不再 HEAD），
+  不等 → `Conflict`「replaced after the copy」。NAS 桶与对象桶之间、两个 NAS 桶之间按 N1 的亲和走流式。
   N6：URL 没写 `bucket_type=nas` 而桶其实是 NAS 桶时照旧失败，但诊断带提示「if this is an ONTAP NAS bucket, add
   ?compat=ontap&bucket_type=nas to the URL」（`role_protocol/hints.rs`）：条件 GET、`CreateMultipartUpload`、`CopyObject` /
   `UploadPartCopy` 回 501（`Unsupported`，任何 compat 都加，写了 `bucket_type=nas` 则不加）；`ListMultipartUploads` /
@@ -831,7 +831,7 @@ NAS 桶（multiprotocol，底下是 FlexVol `dm_s3_nas`）与同一 SVM 的对�
 | 单次 PUT > 8 MiB | 支持 | 支持（5 GiB + 1 也收） | 用不上（> 8 MiB 走分段） | 8 MiB–5 GiB 流式单 PUT；> 5 GiB Preflight 拒 |
 | 同桶 `CopyObject` | 要 `Content-Length`（411） | 同样要（F6 起带）；`x-amz-copy-source-if-match` 认存储的 ETag；克隆 | 读回开时源端条件 GET 501 | 一次 CopyObject ≤ 5 GiB，读回锚定拷贝回复（N5） |
 | 对象桶 ↔ NAS 桶的 `CopyObject` | — | **501**（两个方向） | 同端点同 `compat=ontap` 走原生 → `Unsupported` | 亲和含桶名，走流式（N1） |
-| `x-amz-meta-*`、`?tagging` | 支持 | 支持 | — | — |
+| `x-amz-meta-*`、`?tagging` | 支持 | 支持；**`PutObjectTagging` / `DELETE ?tagging` 不改 `ETag` 与 `Last-Modified`**；`CopyObject` REPLACE（带或不带 `x-amz-meta-*` / `x-amz-tagging`）回复 `ETag` = 之后 HEAD 的；自拷贝 REPLACE 换元数据则换新 `ETag` 与 `Last-Modified`（2026-09-27 实测） | — | 原生拷贝设标签后不再 HEAD，读回锚定拷贝回复（N5 跟进） |
 | `GetBucketVersioning` / `ListObjectVersions` | 支持 | 501（不支持版本） | 连接时当作未开版本 | 无版本：源端不给版本，遍历全部版本在 I/O 前拒 |
 | 删对象后的目录 | — | 目录留下；非空目录 `DELETE <dir>/` 403，空目录 204 | 清理按后序逐个 `DELETE <dir>/` | 同左 |
 

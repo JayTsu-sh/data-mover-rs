@@ -302,8 +302,9 @@ async fn copy_part<P: S3Protocol>(
 /// source's `ETag` count as copied (a copy of an object uploaded in parts gets a new `ETag` on
 /// some stores, and then reports the final key changed); on one whose are not (an ONTAP NAS
 /// bucket) only an unchanged key can be proven, against what prepare found
-/// ([`settle_unknown_write`]). There, tags set after the copy may touch the object, so its
-/// `ETag` is taken again afterwards: read-back checks the anchor against it.
+/// ([`settle_unknown_write`]). There the copy's reply `ETag` stays the object's through the tags
+/// set after it — `PutObjectTagging` moves neither the opaque `ETag` nor `Last-Modified` (measured
+/// on ONTAP 9.19.1, 2026-09-27) — so read-back anchors on the reply and no `HEAD` follows.
 pub(super) async fn send_copy<P: S3Protocol>(
     adapter: &S3StagedDestination<P>,
     path: &StoragePath,
@@ -340,21 +341,12 @@ pub(super) async fn send_copy<P: S3Protocol>(
             _ => return Err(changed(role_failure(path, Operation::Publish, failure))),
         },
     };
-    let mut facts = facts;
     if let Some(tags) = single.pending() {
         adapter
             .protocol
             .put_tags(path.as_str(), &tags)
             .await
             .map_err(|failure| changed(role_failure(path, Operation::Publish, failure)))?;
-        if !adapter.protocol.bucket_capabilities().md5_etags {
-            let tagged = adapter
-                .protocol
-                .head(path.as_str())
-                .await
-                .map_err(|failure| changed(role_failure(path, Operation::Publish, failure)))?;
-            facts = S3WriteFacts::new(tagged.etag, facts.version_id);
-        }
     }
     single.record_published(facts.clone());
     Ok(facts)
