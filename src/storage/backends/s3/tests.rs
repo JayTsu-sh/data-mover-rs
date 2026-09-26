@@ -597,6 +597,14 @@ impl S3Protocol for MemoryS3 {
         self.memory_upload_part_copy(source, (key, upload_id), number, range)
             .await
     }
+    async fn bucket_versioning(&self) -> S3Result<S3BucketVersioning> {
+        Ok(self.bucket_versioning_now())
+    }
+
+    async fn write_delete_marker(&self, key: &str) -> S3Result<S3DeleteReply> {
+        self.delete_marker_in_memory(key).await
+    }
+
     async fn delete_object(&self, key: &str) -> S3Result<()> {
         self.record_plain_delete(key);
         self.injected_delete_failure(key).await?;

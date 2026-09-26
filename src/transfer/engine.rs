@@ -25,6 +25,7 @@ use publication::{
 };
 
 mod at_destination;
+mod delete_marker;
 mod directory_object;
 mod expert;
 mod failure;
@@ -38,6 +39,7 @@ mod producer;
 mod publication;
 mod single;
 mod version;
+pub use delete_marker::{destination_keeps_history, write_delete_marker};
 pub use directory_object::{
     DIRECTORY_OBJECT_SKIP_REASON, DirectoryObjectAction, directory_object_action,
 };

@@ -471,6 +471,62 @@ pub trait StagedDestination: Send + Sync {
     fn verification_point(&self, _stage: &PreparedStage) -> VerificationPoint {
         VerificationPoint::BeforePublish
     }
+    /// Whether the destination keeps every record of a key right now — a bucket whose versioning is
+    /// `Enabled` — so a source history can be replayed onto it (P7 H1, D12). Asked of the store
+    /// now, not remembered. The default is `false`: a filesystem keeps one state per file.
+    async fn keeps_history(&self) -> Result<bool, StorageRoleFailure> {
+        Ok(false)
+    }
+    /// Writes a delete marker on `path` (P7 H1): replays a source history's delete marker onto a
+    /// destination that keeps histories — a versioned object store — as the key's newest record.
+    /// Refused (`Unsupported`) unless the destination keeps every record right now: anywhere else
+    /// the same request would remove data. Even then a store may remove data instead of covering
+    /// it; the outcome says so ([`DeleteMarkerOutcome::NullVersionRemoved`]). The default refuses
+    /// it: a filesystem has no delete markers.
+    async fn write_delete_marker(
+        &self,
+        path: &StoragePath,
+        _cancel: CancellationToken,
+    ) -> Result<DeleteMarkerOutcome, StorageRoleFailure> {
+        Err(StorageRoleFailure::Entry(
+            EntryOperationFailure::new(
+                path.clone(),
+                Operation::Publish,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "this destination keeps no delete markers",
+            )
+            .unwrap_or_else(|_| unreachable!("static diagnostic is valid")),
+        ))
+    }
+}
+
+/// What writing a delete marker on a destination did ([`StagedDestination::write_delete_marker`],
+/// P7 H1). Every outcome but [`Self::Written`] is a store's own behaviour a caller replaying a
+/// history reports — none is silent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DeleteMarkerOutcome {
+    /// A new delete marker, now the key's newest record.
+    Written {
+        /// The marker's version id.
+        version_id: String,
+    },
+    /// The key's newest record already was a delete marker and the store added none (`MinIO` and
+    /// Ceph RGW / DXN merge consecutive markers): that marker now stands for both.
+    Merged {
+        /// The existing marker's version id.
+        version_id: String,
+    },
+    /// The store removed a version of the key instead of only covering it with a marker (DXN
+    /// drops the `"null"` version of a key whose only record was that version): the key's history
+    /// lost it.
+    NullVersionRemoved {
+        /// The removed version's id (`"null"` on DXN; another id is reported as it is).
+        version_id: String,
+        /// The marker written, if the store also wrote one.
+        marker: Option<String>,
+    },
 }
 
 /// Metadata observation and application role. It never implicitly refetches omitted facts.

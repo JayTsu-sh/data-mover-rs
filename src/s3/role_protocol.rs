@@ -30,6 +30,7 @@ macro_rules! classify_sdk {
     };
 }
 
+mod delete_marker;
 mod listing;
 mod multipart;
 mod native;
@@ -361,6 +362,19 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
 
     async fn delete_version(&self, key: &str, version_id: &str) -> S3Result<()> {
         self.role_delete_version(key, version_id).await
+    }
+
+    async fn bucket_versioning(
+        &self,
+    ) -> S3Result<crate::storage::backends::s3::S3BucketVersioning> {
+        self.role_bucket_versioning().await
+    }
+
+    async fn write_delete_marker(
+        &self,
+        key: &str,
+    ) -> S3Result<crate::storage::backends::s3::S3DeleteReply> {
+        self.role_write_delete_marker(key).await
     }
 
     async fn list_versions(&self, key: &str) -> S3Result<Vec<S3VersionFacts>> {

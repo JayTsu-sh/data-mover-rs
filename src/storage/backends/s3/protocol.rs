@@ -241,6 +241,24 @@ pub(crate) struct S3NativeCopySource {
     pub size: u64,
 }
 
+/// A bucket's versioning as `GetBucketVersioning` answers it now (P7 H1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum S3BucketVersioning {
+    Enabled,
+    Suspended,
+    /// Never enabled, or a store without versioning.
+    Off,
+}
+
+/// What a `DeleteObject` without a version id replied (P7 H1).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct S3DeleteReply {
+    /// `x-amz-delete-marker: true`: the reply names a delete marker.
+    pub delete_marker: bool,
+    /// `x-amz-version-id`, as spelled (`"null"` included).
+    pub version_id: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct S3NativeCopyEvidence {
     pub bytes: u64,
@@ -321,6 +339,12 @@ pub(crate) trait S3Protocol: Send + Sync {
     /// protects is a permanent `PermissionDenied` entry failure (AWS answers 403 `AccessDenied`,
     /// `MinIO` 400 `InvalidRequest`).
     async fn delete_version(&self, key: &str, version_id: &str) -> S3Result<()>;
+    /// `GetBucketVersioning` asked now, not the state at connection (P7 H1: a delete marker is
+    /// written only while the bucket keeps every record).
+    async fn bucket_versioning(&self) -> S3Result<S3BucketVersioning>;
+    /// An unversioned `DeleteObject` of `key` sent on purpose to write a delete marker on a final
+    /// key (P7 H1, the only such request), with what the reply names.
+    async fn write_delete_marker(&self, key: &str) -> S3Result<S3DeleteReply>;
     /// Every stored version and delete marker of exactly `key` — not of keys that merely start
     /// with it — in no guaranteed order: `is_latest` marks the current entry. An unversioned
     /// bucket lists its object as version `"null"`.

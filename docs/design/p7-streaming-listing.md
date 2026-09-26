@@ -603,6 +603,8 @@ struct VersionRecord {
    - e2e：把 `probe.sh` / `probe_race.sh` 并入 e2e-s3，在 MinIO 上每次跑。
    - DXN（Ceph RGW Octopus）与 StorageGRID 11.5 上跑同一组：**已完成（10.2.1）**，脚本并入 e2e-s3 后三家都跑。
 6. **目的端**：写历史到 MinIO 时，连续的删除标记会被合并（10.3 最后一行）。这属于目标存储的限制，拷贝报告里记为“目标合并了 N 个删除标记”，不算失败。
+   重建用 H1 的原语 `transfer::write_delete_marker`（只在 `Enabled` 的桶上、每次调用前查）：结果 `Written` / `Merged`
+   （MinIO、DXN 合并连续标记）/ `NullVersionRemoved`（DXN 删 null 版本；RustFS 不给 `d/` 记版本，删除即删数据），都显式报出。
 
 ### 10.4 要处理的后果
 
@@ -611,7 +613,7 @@ struct VersionRecord {
 | 单 key 版本数没有上限（一个频繁覆盖的对象可以有上百万版本），一项可能极大 | 单 key 记录上限 10 万条；超过时**分段**：一个 key 发多项，每项带段号和 `complete: false`，最后一段 `complete: true`（Q8 已定） |
 | 无序存储上一个 key 的记录可能分散在任意页 | 按目录物化后组装（O(目录)，上限 500 万条记录，Q9）。有序存储本可以只攥住一个 key，但无法事先知道存储是否有序 |
 | 一项的观察可能要做很多次 I/O（每个版本单独读 tags / 元数据） | 只在观察计划要求时才做；每条记录的观察结果与失败各自独立，一条失败不让整项失败；一项内的 I/O 受同一个并发窗口约束 |
-| 拷贝 | 消费方按 `records` 顺序逐条处理：对象版本用 `record.source`（`SourceVersion::Id`，最新的 `"null"` 为 `Current`）交给 `TransferRequest::with_source_version`；删除标记在多版本目标上写删除标记 |
+| 拷贝 | 消费方按 `records` 顺序逐条处理：对象版本用 `record.source`（`SourceVersion::Id`，最新的 `"null"` 为 `Current`）交给 `TransferRequest::with_source_version`；删除标记用 `transfer::write_delete_marker`（H1，只在 `Enabled` 的目标桶上；未开 / 暂停版本的目标只拷最新状态并记原因“目的桶未开版本，历史未重建”，D12）。一个 key 严格串行，重放不去重（D11）；参考 `examples/s3_history_replay.rs` |
 | 身份与改名识别 | 项的 `source_identity` 是 key 级的 `PathScoped`；每条记录另有自己的 `VersionScoped` 身份，拷贝前按记录核对 |
 | 快照 | 带历史的条目用新快照版本（v7，取代 C22 的 v6 每版本条目）；不带历史的仍是 v5，逐字节不变 |
 | 计数 | `listed` / `emitted` 按 key 计；另加 `versions`（对象版本数）与 `delete_markers`；`bytes` 分为“当前版本字节”和“全部版本字节” |
@@ -647,7 +649,7 @@ struct VersionRecord {
 - 目的端是文件系统时，每个条目先过 `transfer::directory_object_action`：零字节或最新记录是删除标记 → 无操作；有内容 →
   跳过并记 `DIRECTORY_OBJECT_SKIP_REASON`（不算失败）。不要自己拼旁车文件名（任何名字都可能与真实的键冲突）。
 - 历史重放（D5 / D11）：按记录旧→新，版本走 `TransferRequest::with_source_version`，删除标记走
-  `transfer::write_delete_marker`（H1，紧随 F5 的下一个提交），一个 key 严格串行；重放不去重，重跑前比对目的端历史。
+  `transfer::write_delete_marker`（H1），先用 `transfer::destination_keeps_history` 判断目的端能否存历史，一个 key 严格串行；重放不去重，重跑前比对目的端历史。
 
 ### 11.3 可选
 
@@ -862,7 +864,7 @@ C5  feat(storage): Local 流式            - src/storage/backends/local/namespac
 C6  feat(storage): S3 流式（Current；前缀集合；All 物化；节流退避）
     - src/storage/backends/s3/{listing.rs:55-130, paging.rs, namespace.rs:109-146}
 F5  目录对象（键以 `/` 结尾的 S3 对象，现存问题 12；用户 2026-09-26 定：统一按文件、全部采纳建议）—— C7 之前，见 §14.1
-    —— 已完成：F5a `18bf9b1`、（refactor `093f316` 拆出 listing/child.rs）、F5b `52635eb`、F5c `fc019cc`、F5d `bac8ef0`、F5e `a228c75`、F5f（文档与 e2e 脚本）
+    —— 已完成：F5a `18bf9b1`、（refactor `093f316` 拆出 listing/child.rs）、F5b `52635eb`、F5c `fc019cc`、F5d `bac8ef0`、F5e `a228c75`、F5f `b718c09`
     F5a fix(s3): legacy walkdir / walkdir_2 对有内容的 `d/` 报 Error，不再静默跳过（src/s3.rs 3596 / 3674 / 3925 / 4117 附近）
     F5b feat(storage)!: 列举契约允许“空名子项 = <dir>/”（ListedChild::directory_object、ListingPage::push_directory_object、
         into_parts 根守卫、NamespaceCapabilities.directory_objects、StoragePath::names_directory_object、entry_name 取最后非空段）
@@ -870,7 +872,7 @@ F5  目录对象（键以 `/` 结尾的 S3 对象，现存问题 12；用户 202
     F5d feat(s3): 目的端写 `d/`（单 PUT / multipart + 指针在父目录 `p/.data-mover-<digest("d/")>.upload` / native / direct）
     F5e feat(transfer): directory_object_action 辅助（Copy / NothingToDo / Skip(reason)）+ 引擎守卫（目的端无 directory_objects → Preflight Unsupported）
     F5f docs（§4.1 路径逐字节、不去尾 `/`；§5.4.4；§5.4.5；§7；§10.3/10.4；§13；filter-dsl.md；storage-s3.md；ADR-0006）
-H1  feat(s3): 目的端重放删除标记（StagedDestination::write_delete_marker + transfer::write_delete_marker；仅 Enabled 桶、每次调用前查
+H1  （已完成，本系列最后一个提交）feat(s3): 目的端重放删除标记（StagedDestination::write_delete_marker + transfer::write_delete_marker；仅 Enabled 桶、每次调用前查
     GetBucketVersioning；结果 Written / Merged / NullVersionRemoved；examples/s3_history_replay.rs）—— F5 之后、C7 之前
 P1–P5  S3 URL 参数化（§14.2）—— F5 合入后，可与 C7 并行
 N0     NAS 桶实测（curl，§14.2）—— 立即
@@ -958,7 +960,7 @@ VERIFY
 | D11 | 历史重放由调用方（terrasync）编排，data-mover 提供原语与参考示例；重放不去重，重跑前调用方比对目的端历史 |
 | D12 | 目的桶未开版本：只拷最新状态并记原因“目的桶未开版本，历史未重建”，不算失败 |
 
-**实施结果（2026-09-26）**：F5a–F5f 已提交，H1 紧随其后（§14）；真机矩阵用含 H1 的树跑。与计划的差别：扫描根自己的对象由遍历在根列举里处理
+**实施结果（2026-09-26）**：F5a–F5f 与 H1 都已提交（§14）；真机矩阵用含 H1 的树跑。与计划的差别：扫描根自己的对象由遍历在根列举里处理
 （`stream::prepare`，Blocks；C10 的 Unordered 必须复用它）；页内自己的对象排最前（键 `d/` 比它下面的键都小，页仍是
 S3 键序）；MinIO 版本桶里最新是删除标记的 `d/` 仍被 ListObjectsV2 列成无 ETag 的 0 字节 Contents（HEAD 404）→ 不当子项；
 MinIO 对 `d/` 的 CreateMultipartUpload 回 `XMinioInvalidObjectName` → 该条目 `Unsupported`（只对这个请求 + 以 `/` 结尾
@@ -968,7 +970,7 @@ MinIO 对 `d/` 的 CreateMultipartUpload 回 `XMinioInvalidObjectName` → 该�
 
 | 存储 | 多版本 | 非多版本 | 差异 |
 |---|---|---|---|
-| MinIO RELEASE.2023-03-20 | pass | pass | 拒绝对 `d/` 发 multipart（400 `XMinioInvalidObjectName`，单 PUT 可以）→ > 8 MiB 的 `d/` 写不了（typed `Unsupported`）；删除后的 `d/` 在 V2 列举里留无 ETag 的幻影、父目录仍列前缀；（H1 重放，下一提交）合并连续删除标记，null 版本探测照常写标记 |
+| MinIO RELEASE.2023-03-20 | pass | pass | 拒绝对 `d/` 发 multipart（400 `XMinioInvalidObjectName`，单 PUT 可以）→ > 8 MiB 的 `d/` 写不了（typed `Unsupported`）；删除后的 `d/` 在 V2 列举里留无 ETag 的幻影、父目录仍列前缀；（H1 重放）合并连续删除标记，null 版本探测照常写标记 |
 | ONTAP 9.19.1 对象桶 | pass | pass | 一切按 S3；（H1）不合并连续删除标记 |
 | DXN（Ceph RGW Octopus） | pass | pass | UploadPartCopy 的 native 拷贝 `d/` 正常；（H1）合并连续删除标记；只有 null 版本的 key 重开版本、写新版本后再普通 DELETE：删掉 null 版本**并**写标记 |
 | StorageGRID 11.5 | pass | pass | `s3+sg` 的“native”走流式；ListObjectVersions 拒空 `version-id-marker`；（H1）已删除的 key 再 DELETE 每次新建标记（不合并） |
@@ -1138,7 +1140,7 @@ N1–N7 在 H1、C7 之后。完整方案（file:line）见会话 scratchpad `s3
 | 9 | **legacy 版本列举假设 key 升序**：`src/s3/version_listing.rs` 的 `VersionPages::complete_keys` 把每页最大的 key 扣到下一页合并（C20），前提是 ListObjectVersions 按 key 升序返回。在无序存储上（ONTAP NAS 桶，Q22；NAS 桶不支持 ListObjectVersions，所以 ONTAP 上不会触发），同一个 key 的历史会被拆成几段、各自当成一个 key 发出（latest / `version_count` 错）；F2 的连续性校验在 legacy 里也只看每批 | 未修：legacy 在 P7 收尾整体删除；删除前若有调用方在无序存储上用 legacy 多版本列举，改为按整个目录物化分组（role-based 的做法）。role-based（C22 / C6）按目录物化分组，不受影响 |
 | 10 | **ONTAP `ListObjectVersions` 带 `delimiter=/` 会静默丢版本**（2026-09-26 实测，ONTAP 9.19.1）：截断页里有 CommonPrefix、且被收拢的 key 在列举前缀或该 CommonPrefix 之后紧跟多字节字符（如 `p/éb/x`、`p/x/中/y`）时，若页恰好停在后一个 key 的版本中间，服务端给 `NextKeyMarker=<key>` 却**不给** `NextVersionIdMarker`，下一页从该 key 之后开始，剩余版本被跳过（1000 个版本只回 998）。另：页停在 CommonPrefix 上时有时仍给 `NextVersionIdMarker`，下一页重复该前缀；恰好满页后跟一个空的末页；CommonPrefix 计入 max-keys。受影响：legacy `s3.rs` 两处 ListObjectVersions、role `s3/role_protocol/listing.rs` | **已修** `8d4b225`（F4）：截断页没有 `NextVersionIdMarker`、且 `NextKeyMarker` 那个 key 的条目恰是本页文档序的末尾一段时，用最后一条的 versionId 作 version-id-marker；续点不能确定（分组输出、读不到文档序且两种条目都在该 key 上）时不猜（role 该目录 `Protocol` 失败，legacy 先发完整的 key 再报错）；legacy 的 CommonPrefix 跨页去重（role 本来就去重）；空末页容忍。回归数据：ONTAP 实测响应 3 份（`tests/data/s3/ontap-versions-delimiter-*.xml`）；真机 `mkl/z` 1000 个版本 role / legacy 全列出 |
 | 11 | **RustFS 1.0.0 的 `ListObjectVersions` 原始 XML 不交错**（2026-09-26 实测，VM 105）：每页先列全部 `<DeleteMarker>`、再列全部 `<Version>`（各组内 key 升序、同 key 新→旧），所以一个 key 的条目在文档里不连续、第一条也不一定是 IsLatest。F2 的逐 key 校验会判不合格 → 该 key 标 `HistoryOrder::Inferred`、按 `LastModified` 排（同毫秒可能排错）。分页（key-marker / version-id-marker，max-keys 1/2/3）不丢不重 | 行为正确（回退如设计）；RustFS 上历史顺序只能推断。可选改进：对“分组输出”的存储（每页 marker 组 + version 组、各自按 key 升序新→旧）把两组当两条有序序列按 key 归并，同 key 内仍需时间决定交错 → 与今天的回退等价，不改。e2e-s3 的 RustFS 行期望 `order=inferred` |
-| 12 | **键以 `/` 结尾且有内容的 S3 对象**（“带内容的目录标记”）：MinIO、RustFS、ONTAP 对象桶、DXN 都允许（2026-09-26 实测，PUT 200）；ONTAP NAS 桶去掉末尾 `/` 存成普通文件。role 遍历把它报成该目录上的 `Failure{scope: Child}`（Unsupported），内容不列、不拷；**legacy walkdir（`src/s3.rs:3925`）静默跳过 —— 静默丢数据** | **已修**（F5a `18bf9b1` … F5f；历史重放在紧随其后的 H1；§14.1）：role 遍历把它（以及零字节文件夹标记）列成文件条目 `d/`，S3→S3 拷贝，文件系统目的端 typed 跳过 / 拒绝；legacy 报 Scan 错误。遗留：MinIO / RustFS / NAS 桶上的写入差异待用户决定（§14.1） |
+| 12 | **键以 `/` 结尾且有内容的 S3 对象**（“带内容的目录标记”）：MinIO、RustFS、ONTAP 对象桶、DXN 都允许（2026-09-26 实测，PUT 200）；ONTAP NAS 桶去掉末尾 `/` 存成普通文件。role 遍历把它报成该目录上的 `Failure{scope: Child}`（Unsupported），内容不列、不拷；**legacy walkdir（`src/s3.rs:3925`）静默跳过 —— 静默丢数据** | **已修**（F5a `18bf9b1` … F5f `b718c09`，历史重放 H1；§14.1）：role 遍历把它（以及零字节文件夹标记）列成文件条目 `d/`，S3→S3 拷贝，文件系统目的端 typed 跳过 / 拒绝；legacy 报 Scan 错误。遗留：MinIO / RustFS / NAS 桶上的写入差异待用户决定（§14.1） |
 
 ## 收尾：清理扫描相关旧代码
 

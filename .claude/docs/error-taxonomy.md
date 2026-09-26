@@ -236,6 +236,7 @@ Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修�
 | S3 存储根自己的对象（URL 前缀本身）有内容 | 根路径 `""` 上的子项失败，`Unsupported` / Permanent（零字节的忽略） |
 | `stat` 以 `/` 结尾且对象不存在 | `NotFound`（算 vanished），不再是 `InvalidInput` |
 | MinIO 对 `d/` 的 CreateMultipartUpload：400 `XMinioInvalidObjectName` | 条目 `Unsupported` / Permanent（只对这个请求 + 以 `/` 结尾的键；见上 S3 表） |
+| H1 删除标记（`transfer::write_delete_marker`）：目的桶版本此刻不是 `Enabled`，或目的端不存删除标记 | Publish 的条目 `Unsupported` / Permanent；与同一文件的传输抢租约 → Prepare 的 `Conflict` / Transient；根或 artifact 路径 → `InvalidInput`；发出前取消 → `Cancelled`；**DeleteObject 发出之后**（它自己超时 / 5xx，或读不到删除后的记录）→ 该键的条目、类别照旧、`Transience::Unknown`（结局未知，重放前比对目的端历史）；删除前后该键都没有新标记、最新也不是标记 → `Protocol` / Permanent（RustFS 对未记版本的 `d/`） |
 
 ## 改 error 时
 

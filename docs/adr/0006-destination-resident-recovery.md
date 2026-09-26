@@ -721,6 +721,15 @@ per-key guard; Local keeps its flock claim and HDFS its lease. NFS/CIFS claim re
   where the store accepts it. Measured 2026-09-26: MinIO RELEASE.2023-03-20 refuses a multipart upload
   to such a key (400 `XMinioInvalidObjectName` → `Unsupported` entry failure), RustFS 1.0.0 completes it
   under the key without its `/` (read-back `NotFound`; see `.claude/docs/storage-s3.md`).
+- Delete markers (P7 H1): a transfer never writes one. Replaying a source history's delete marker is
+  `transfer::write_delete_marker` (`StagedDestination::write_delete_marker`; every other destination
+  refuses it): it holds the same per-destination lease as a transfer of that key, checks
+  `GetBucketVersioning` right before every call and refuses anything but `Enabled` (a plain DeleteObject
+  on an unversioned or suspended bucket removes data; a suspend landing between the check and the
+  delete is a documented race), sends one unversioned DeleteObject and reads the outcome from the key's
+  records before and after: `Written`, `Merged` (the newest record already was a marker: MinIO, DXN),
+  `NullVersionRemoved` (DXN drops a `"null"` version; RustFS keeps no versions of `d/` keys). The caller
+  orchestrates the replay oldest to newest, one key at a time, and it is not deduplicated.
 
 ### S3 traversal and versions
 

@@ -5,6 +5,7 @@
 //!   `CIFS_REAL_USER` / `CIFS_REAL_PASS` (the e2e-cifs `.env`);
 //! - `s3:<prefix>` — that prefix of the bucket named by `S3_HOST` / `S3_BUCKET` / `S3_AK` / `S3_SK` /
 //!   `S3_USE_HTTPS` / `S3_COMPAT` (the e2e-s3 `.env`, or its `dxn/` / `storagegrid/` siblings);
+//! - `s3@<bucket>:<prefix>` — the same, in another bucket of that server;
 //! - `hdfs://…` — an HDFS location, with `LAB_HDFS_CONFIG_DIR` / `LAB_HDFS_KEYTAB` for the client;
 //! - anything else — a local directory, created if missing.
 
@@ -31,8 +32,9 @@ fn env_var(name: &str) -> Result<String> {
 }
 
 /// `s3[+sg|+dxn][+https]://AK:SK@bucket.host/prefix` — the crate takes the key and secret as
-/// written, undecoded. `S3_COMPAT=sg|dxn` selects the `StorageGRID` / DXN profile.
-fn s3_url(prefix: &str) -> Result<String> {
+/// written, undecoded. `S3_COMPAT=sg|dxn` selects the `StorageGRID` / DXN profile. The bucket is
+/// `S3_BUCKET` unless one is named.
+fn s3_url(bucket: Option<&str>, prefix: &str) -> Result<String> {
     let compat = match env::var("S3_COMPAT").unwrap_or_default().as_str() {
         "" | "standard" => "",
         "sg" => "+sg",
@@ -49,7 +51,7 @@ fn s3_url(prefix: &str) -> Result<String> {
         "{scheme}://{}:{}@{}.{}/{}",
         env_var("S3_AK")?,
         env_var("S3_SK")?,
-        env_var("S3_BUCKET")?,
+        bucket.map_or_else(|| env_var("S3_BUCKET"), |bucket| Ok(bucket.to_owned()))?,
         env_var("S3_HOST")?,
         prefix.trim_start_matches('/')
     ))
@@ -91,7 +93,14 @@ pub async fn connect(endpoint: &str) -> Result<Storage> {
         return Err("give `s3:<prefix>` with the e2e-s3 .env, not an s3:// URL".into());
     } else if let Some(prefix) = endpoint.strip_prefix("s3:") {
         BackendConfig::S3(S3BackendConfig {
-            url: s3_url(prefix)?,
+            url: s3_url(None, prefix)?,
+            block_size: None,
+            single_put_threshold: None,
+        })
+    } else if let Some(rest) = endpoint.strip_prefix("s3@") {
+        let (bucket, prefix) = rest.split_once(':').ok_or("give `s3@<bucket>:<prefix>`")?;
+        BackendConfig::S3(S3BackendConfig {
+            url: s3_url(Some(bucket), prefix)?,
             block_size: None,
             single_put_threshold: None,
         })
@@ -204,7 +213,7 @@ async fn names(endpoint: &str, dir: &str) -> Result<Vec<String>> {
             .filter_map(|status| status.path.rsplit('/').next().map(str::to_owned))
             .collect());
     }
-    if endpoint.starts_with("s3:") {
+    if endpoint.starts_with("s3:") || endpoint.starts_with("s3@") {
         return Err("list S3 artifacts with the bucket listing".into());
     }
     Ok(fs::read_dir(Path::new(endpoint).join(dir))?

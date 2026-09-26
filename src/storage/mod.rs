@@ -54,8 +54,8 @@ pub use listing::{
 };
 pub(crate) use roles::DeferredCheckpoint;
 pub use roles::{
-    ByteStream, CaseSensitivity, CheckpointObservation, FinalDestination, Metadata,
-    MetadataMutation, NameNormalization, NameSemantics, Namespace, NamespaceCapabilities,
+    ByteStream, CaseSensitivity, CheckpointObservation, DeleteMarkerOutcome, FinalDestination,
+    Metadata, MetadataMutation, NameNormalization, NameSemantics, Namespace, NamespaceCapabilities,
     PositionedByteStream, PositionedChunk, PrepareRequest, PreparedStage, PublicationDisposition,
     PublicationEvidence, PublicationFailure, PublishRequest, ReadRequest, ReadSource,
     StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure, VerificationEvidence,

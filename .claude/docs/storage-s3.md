@@ -530,8 +530,14 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   per-destination guard 在 prepare 拒绝第二个（`Conflict` / Transient，「another transfer in this process is writing
   this destination file」）；跨进程靠调用约定（一个 key 一个写者）。
 - 不去重：已完成的版本再跑一次就再加一个版本；带 `final_destination_changed` 的失败可能已经生成了一个版本。
-- 删除标记没有内容：`Id(标记)` 的带版本 HEAD 回 405 → 条目 `NotFound`。data-mover 从不往最终 key 写删除标记；
-  要在目的端重放（在相邻两个版本之间对目的 key 发一次普通 DeleteObject）由调用方决定。
+- 删除标记没有内容：`Id(标记)` 的带版本 HEAD 回 405 → 条目 `NotFound`。拷贝从不往最终 key 写删除标记；要在目的端
+  重放历史里的删除标记，调用方在相邻两个版本之间调 `transfer::write_delete_marker`（P7 H1）：只在 `GetBucketVersioning`
+  此刻为 `Enabled` 的桶上发一次普通 DeleteObject（每次调用前都查；未开 / 暂停版本的桶上它会删数据 → `Unsupported`），
+  持有与该文件传输相同的进程内租约，结果按删除前后该键的记录判定：`Written{id}`、`Merged{id}`（MinIO、DXN 在最新
+  已是标记时不再加）、`NullVersionRemoved{id, marker}`（DXN 删掉 `"null"` 版本；RustFS 删掉未记版本的目录对象），
+  都显式报出。删除之后读不到结果时结局未知（`Transience::Unknown`），重放前先比对目的端历史。调用方先用
+  `transfer::destination_keeps_history`（此刻是否 `Enabled`）决定重放整段历史还是只拷最新状态（D12）；编排（旧→新、
+  一个 key 严格串行、不去重）归调用方，参考 `examples/s3_history_replay.rs`。
 - 目的桶暂停 / 未开版本：每次拷贝覆盖唯一的 `"null"` 版本，只剩最后拷的那个，`destination_version` 为 `None`。
 - 不保留：目的端版本是新 versionId、`LastModified` 是写入时间；`transfer` 不带源版本的标签、用户元数据、
   content type、Object Lock retention / legal hold、存储类别、加密设置（S3 目的端 `stores_nothing()`，见

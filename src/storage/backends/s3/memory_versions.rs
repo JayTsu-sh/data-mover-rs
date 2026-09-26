@@ -11,6 +11,10 @@
 //!   as on AWS and `MinIO`, unless [`MemoryS3::lock_refuses_delete_markers`] (Ceph RGW / DXN
 //!   refuses it too while the current version is held).
 //! - `list_versions` reports a key's entries newest first.
+//! - `write_delete_marker` (P7 H1) answers as S3 does: a new marker and its id, or, with
+//!   [`MemoryS3::merge_delete_markers`], the existing marker when the newest record already is one
+//!   (`MinIO`, Ceph RGW / DXN); with [`MemoryS3::drop_null_versions_on_delete`] it removes the key's
+//!   `"null"` version instead of covering it (DXN). Unversioned, it removes the object.
 //!
 //! With versioning off (the default) the fake behaves as before, and lists an existing object as
 //! version `"null"`.
@@ -23,7 +27,9 @@ use bytes::Bytes;
 use super::{MemoryS3, not_found};
 use crate::model::{FailureClass, Transience};
 use crate::storage::artifacts::is_artifact_path;
-use crate::storage::backends::s3::{S3ObjectFacts, S3ProtocolFailure, S3Result, S3VersionFacts};
+use crate::storage::backends::s3::{
+    S3BucketVersioning, S3DeleteReply, S3ObjectFacts, S3ProtocolFailure, S3Result, S3VersionFacts,
+};
 
 /// What [`MemoryS3::forget_version`] did.
 enum Forgotten {
@@ -60,6 +66,10 @@ pub(crate) struct VersionedBucket {
     plain_deletes: Vec<String>,
     /// (key, version) of every `delete_version` that removed an entry.
     version_deletes: Vec<(String, String)>,
+    /// A delete-marker write adds none when the newest record already is a marker (`MinIO`, DXN).
+    merges_markers: bool,
+    /// A delete-marker write removes the key's `"null"` version instead of covering it (DXN).
+    drops_null_version: bool,
     next: u64,
 }
 
@@ -123,6 +133,78 @@ impl MemoryS3 {
     /// (`PermissionDenied`), as Ceph RGW (DXN) does; AWS and `MinIO` add the delete marker.
     pub(crate) fn lock_refuses_delete_markers(&self) {
         self.bucket().locks_refuse_markers = true;
+    }
+
+    /// From now on a delete-marker write on a key whose newest record already is a marker adds
+    /// none and names that marker (`MinIO`, Ceph RGW / DXN).
+    pub(crate) fn merge_delete_markers(&self) {
+        self.bucket().merges_markers = true;
+    }
+
+    /// From now on a delete-marker write on a key holding a `"null"` version removes that version
+    /// (adding no marker when it was the newest record), as DXN does.
+    pub(crate) fn drop_null_versions_on_delete(&self) {
+        self.bucket().drops_null_version = true;
+    }
+
+    /// The bucket's versioning as `GetBucketVersioning` would answer now.
+    pub(super) fn bucket_versioning_now(&self) -> S3BucketVersioning {
+        match self.versioning() {
+            Versioning::Enabled => S3BucketVersioning::Enabled,
+            Versioning::Suspended => S3BucketVersioning::Suspended,
+            Versioning::Off => S3BucketVersioning::Off,
+        }
+    }
+
+    /// A `DeleteObject` without a version id sent to write a delete marker (P7 H1), with the
+    /// store behaviours the knobs select.
+    pub(super) async fn delete_marker_in_memory(&self, key: &str) -> S3Result<S3DeleteReply> {
+        if self.versioning() == Versioning::Off {
+            self.objects.lock().await.remove(key);
+            return Ok(S3DeleteReply::default());
+        }
+        let (merges, drops_null, newest, holds_null) = {
+            let bucket = self.bucket();
+            let holds_null = bucket
+                .order
+                .get(key)
+                .is_some_and(|ids| ids.iter().any(|id| id == "null"));
+            (
+                bucket.merges_markers,
+                bucket.drops_null_version,
+                bucket.newest(key),
+                holds_null,
+            )
+        };
+        let newest_is_marker = match &newest {
+            Some(id) => self
+                .versions
+                .lock()
+                .await
+                .get(&(key.to_string(), id.clone()))
+                .is_some_and(Option::is_none),
+            None => false,
+        };
+        if merges && newest_is_marker {
+            return Ok(S3DeleteReply {
+                delete_marker: true,
+                version_id: newest,
+            });
+        }
+        if drops_null && holds_null {
+            self.delete_one_version(key, "null").await?;
+            if newest.as_deref() == Some("null") {
+                return Ok(S3DeleteReply {
+                    delete_marker: false,
+                    version_id: Some("null".to_string()),
+                });
+            }
+        }
+        self.versioned_delete(key).await?;
+        Ok(S3DeleteReply {
+            delete_marker: true,
+            version_id: self.bucket().newest(key),
+        })
     }
 
     /// Places a legal hold on version `id` of `key` only.

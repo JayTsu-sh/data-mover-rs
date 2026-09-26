@@ -22,6 +22,7 @@ use super::source::{classified_entry, entry, role_failure};
 
 mod at_destination;
 mod completion;
+mod delete_marker;
 mod direct;
 #[cfg(test)]
 mod directory_object_tests;
@@ -361,6 +362,21 @@ impl<P: S3Protocol + 'static> StagedDestination for S3StagedDestination<P> {
     /// write, an upload on the final key — so it is read back only after publication.
     fn verification_point(&self, _stage: &PreparedStage) -> VerificationPoint {
         VerificationPoint::AfterPublish
+    }
+
+    /// `GetBucketVersioning` now: `Enabled` keeps every record (P7 H1).
+    async fn keeps_history(&self) -> Result<bool, StorageRoleFailure> {
+        self.versioning_enabled_now(&StoragePath::root()).await
+    }
+
+    /// A delete marker on the final key, only while the bucket's versioning is `Enabled` (P7 H1,
+    /// [`delete_marker`]).
+    async fn write_delete_marker(
+        &self,
+        path: &StoragePath,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::storage::DeleteMarkerOutcome, StorageRoleFailure> {
+        self.delete_marker(path, &cancel).await
     }
 }
 

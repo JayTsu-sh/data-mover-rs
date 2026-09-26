@@ -33,6 +33,13 @@
 #   dirobj/ fails at Preflight on the destination and writes no file (transfer_resume itself creates
 #   the parent directory, as a caller does).
 #
+# Versioned buckets also replay (P7 H1, examples/s3_history_replay.rs) the histories of m/, z/ and
+# dirobj/ oldest to newest into a versioned destination — a second temporary bucket <bucket>-r in
+# temporary mode, replay/ under the run's prefix otherwise — and compare each key's records by kind and
+# size in order; print what a second marker in a row gives (merged / written) and DXN's null-version
+# probe (temporary destination only); and check that an unversioned bucket (UNVERSIONED_BUCKET, default
+# data-mover-test) and the suspended temporary destination skip every marker, never write one.
+#
 # D6=1 (the ONTAP NAS bucket, S3_UNVERSIONED_BUCKET=data-mover-nas): instead of the checks above,
 # writes zero-byte and content `d/` keys before and after their children and prints what the
 # server keeps (HEAD of each key, the parent's delimiter listing, the role traversal). Nothing about
@@ -158,7 +165,20 @@ for d in sorted(dirs, key=lambda d: -d.count("/")): print(d)' | while read -r d;
     s3c -o /dev/null -X DELETE "$H/$VB/$(enc "$P" /)"
   done
 }
+cleanup_replay() { # the temporary replay destination: every version and marker, then the bucket
+  [ -n "${REPLAY_CREATED:-}" ] || return
+  local saved=$VB saved_p=$P; VB=$DB; P=
+  for _ in 1 2 3; do
+    entries "" | while IFS=$'\t' read -r k v _ _; do
+      [ "$k" != "$FAILED_LISTING" ] && s3c -o /dev/null -X DELETE "$H/$VB/$(enc "$k" /)?versionId=$(enc "$v")"
+    done
+  done
+  s3c -o /dev/null -X DELETE "$H/$VB"
+  if bucket_gone "$VB"; then echo "cleanup: $VB deleted"; else echo "cleanup: $VB STILL PRESENT"; FAILED=1; fi
+  VB=$saved; P=$saved_p
+}
 cleanup() {
+  cleanup_replay
   if [ "$MODE" = temporary ]; then
     [ "$CREATED" = 1 ] || { rm -rf "$WORK" "$LOCAL"; return; }
     abort_uploads; empty_versioned
@@ -171,7 +191,9 @@ cleanup() {
     local left
     if [ "$VERSIONED" = 1 ]; then empty_versioned; left=$(entries)
     else empty_unversioned; left=$(keys "${P%/}"); fi
-    left=$(printf '%s\n%s' "$left" "$(uploads | grep -v '^$')" | awk 'NF')
+    # A store that cannot list uploads at all (the ONTAP NAS bucket's policy) was seen so at the
+    # start: only then is the upload check skipped.
+    [ "${UPLOADS_LISTABLE:-1}" = 1 ] && left=$(printf '%s\n%s' "$left" "$(uploads | grep -v '^$')" | awk 'NF')
     if grep -qxF "$FAILED_LISTING" <<<"$left"; then echo "cleanup: $VB/$P NOT CHECKED (listing failed)"; FAILED=1
     elif [ -z "$left" ]; then echo "cleanup: $VB/$P emptied (bucket kept)"
     else echo "cleanup: $VB/$P STILL HOLDS: $(tr '\n' ' ' <<<"$left")"; FAILED=1; fi
@@ -200,7 +222,7 @@ versioning() {
   s3c -o /dev/null -w "versioning $1: %{http_code}\n" -X PUT "$H/$VB?versioning" --data-binary @"$WORK/v.xml"
 }
 
-build=$(cargo build -q --example storage_role_operations --example s3_listing --example transfer_resume 2>&1) || { echo "$build" >&2; exit 1; }
+build=$(cargo build -q --example storage_role_operations --example s3_listing --example transfer_resume --example s3_history_replay 2>&1) || { echo "$build" >&2; exit 1; }
 if [ "$MODE" = temporary ]; then
   BODY=(-H 'Content-Length: 0')
   [ -n "${S3_LOCATION:-}" ] && BODY=(--data-binary "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>$S3_LOCATION</LocationConstraint></CreateBucketConfiguration>")
@@ -220,6 +242,8 @@ else
   [ "$MODE" = versioned ] && [ "$status" != Enabled ] && { echo "refusing $VB: needs versioning Enabled" >&2; exit 1; }
   [ "$MODE" = unversioned ] && [ -n "$status" ] && { echo "refusing $VB: needs a bucket that never had versioning" >&2; exit 1; }
   if [ "$VERSIONED" = 1 ]; then held=$(entries); else held=$(keys "${P%/}"); fi
+  UPLOADS_LISTABLE=1
+  grep -qxF "$FAILED_LISTING" <<<"$(uploads)" && { UPLOADS_LISTABLE=0; echo "the store lists no multipart uploads here: the clean-up cannot check them"; }
   [ -z "$held" ] || { echo "prefix $VB/$P is not empty, or its listing failed; stopping" >&2; exit 1; }
   WROTE=1
 fi
@@ -461,4 +485,67 @@ check "S3→Local failure" "$(jq -r .failure <<<"$LAST" | grep -c 'Prepare faile
 check "S3→Local wrote no file" "$(find "$LOCAL/dst" -type f 2>/dev/null | wc -l)" 0
 
 
+if [ "$VERSIONED" = 1 ]; then
+  echo "== history replay (P7 H1)"
+  HR=target/debug/examples/s3_history_replay
+  # The destination: a second temporary bucket (temporary mode), else the same bucket under replay/.
+  if [ "$MODE" = temporary ]; then
+    DB=$VB-r
+    bucket_gone "$DB" && code=$(s3c -o "$WORK/create2.out" -w '%{http_code}' -X PUT "$H/$DB" "${BODY[@]}") || code=exists
+    echo "create $DB: $code"
+    if [ "$code" = 200 ]; then
+      REPLAY_CREATED=1
+      # DXN's null-version quirk: a key whose only record is the null version, versioning then
+      # enabled and a version written, and a delete marker replayed onto it.
+      s3c -o /dev/null -X PUT "$H/$DB/nullkey" --data-binary 'null!'
+      VB_SAVED=$VB; VB=$DB; versioning Enabled; VB=$VB_SAVED
+      s3c -o /dev/null -X PUT "$H/$DB/nullkey" --data-binary 'second'
+      echo "   null-version probe: $("$HR" --source "s3:$P" --destination "s3@$DB:" --path nullkey --delete-marker 2>&1 | tail -1)"
+      DEST="s3@$DB:"; DQ=; DVB=$DB
+    else
+      cat "$WORK/create2.out" >&2; FAILED=1; DEST=; DVB=
+    fi
+  else
+    DEST="s3@$VB:${P}replay/"; DQ=${P}replay/; DVB=$VB
+  fi
+  if [ -n "$DEST" ]; then
+    "$HR" --source "s3:$P" --destination "$DEST" --path m/ --path z/ --path dirobj/ --client-shaped >"$WORK/replay" 2>"$WORK/replay.err"
+    sed 's/^/   /' "$WORK/replay"
+    [ "$DIR_VERSIONED" = 1 ] && want_records=9 || want_records=2
+    check "replay: records, none failed" "$(grep -oE 'records=[0-9]+ .* failed=[0-9]+' "$WORK/replay" | sed -E 's/records=([0-9]+) .* failed=/\1 /')" "$want_records 0"
+    # Compare each key's records at the source and the destination by kind and size, in order,
+    # as the role traversal of every version orders them (the server's order, or inferred).
+    shape() { # storage URL root, key
+      S3_LISTING_URL="$1" "$ROLE" --backend s3 --concurrency 4 traverse --versions all 2>/dev/null |
+        grep -E "^File $2 version=" | sed -E 's/.* marker=([01]) size=(\S+).*/\1:\2/' | tr '\n' ' '
+    }
+    DURL="s3$COMPAT$TLS://$S3_AK:$S3_SK@$DVB.$S3_HOST/$DQ"
+    for key in m/ z/ dirobj/; do
+      src=$(shape "$S3_LISTING_URL" "$key"); dst=$(shape "$DURL" "$key")
+      echo "   $key source: $src"; echo "   $key destination: $dst"
+      # A store that keeps no versions of d/ keys (RustFS) deleted m/ for good: nothing on either side.
+      [ "$DIR_VERSIONED" = 0 ] && [ -z "$src" ] && want_shape= || want_shape=${src:-<no source records>}
+      check "replay $key: same kinds and sizes in order" "$dst" "$want_shape"
+    done
+    echo "   second marker in a row on m/: $("$HR" --source "s3:$P" --destination "$DEST" --path m/ --delete-marker 2>&1 | tail -1)"
+    echo "   raw destination m/: $(VB=$DVB entries "${DQ}m/" | awk -F'\t' -v k="${DQ}m/" '$1 == k {print $3":"$4}' | tr '\n' ' ')"
+    # An unversioned bucket (data-mover-test) gets the latest state only (D12); on the temporary
+    # destination, once suspended, a marker is refused.
+    UB=${UNVERSIONED_BUCKET:-data-mover-test}
+    "$HR" --source "s3:$P" --destination "s3@$UB:${P}refusal/" --path m/ --client-shaped >"$WORK/refusal" 2>&1
+    sed 's/^/   unversioned: /' "$WORK/refusal"
+    # D12: the latest state only — m/'s newest record is a delete marker, so nothing is written.
+    [ "$DIR_VERSIONED" = 1 ] && want_skipped=1 || want_skipped=0
+    check "unversioned destination: history not rebuilt" "$(grep -c 'history not rebuilt' "$WORK/refusal") $(grep -c -- '-> skipped' "$WORK/refusal") $(grep -cE -- '-> (written|copied)' "$WORK/refusal")" "1 $want_skipped 0"
+    check "unversioned destination: m/ not written" "$(VB=$UB keys "${P}refusal/" | grep -c .)" 0
+    for k in $(VB=$UB keys "${P}refusal/"); do ours "$k" && s3c -o /dev/null -X DELETE "$H/$UB/$(enc "$k" /)"; done
+    s3c -o /dev/null -X DELETE "$H/$UB/$(enc "${P}refusal/m/" /)"; s3c -o /dev/null -X DELETE "$H/$UB/$(enc "${P}refusal/" /)"
+    if [ "$MODE" = temporary ] && [ -n "${REPLAY_CREATED:-}" ]; then
+      VB_SAVED=$VB; VB=$DB; versioning Suspended; VB=$VB_SAVED
+      out=$("$HR" --source "s3:$P" --destination "$DEST" --path m/ --delete-marker 2>&1 | tail -1)
+      echo "   suspended: $out"
+      check "suspended destination: marker skipped" "$(grep -c -- '-> skipped' <<<"$out")" 1
+    fi
+  fi
+fi
 [ "$FAILED" = 0 ] && echo "RESULT: pass" || echo "RESULT: FAIL"

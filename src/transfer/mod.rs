@@ -6,14 +6,15 @@ mod identity;
 mod model;
 
 pub use crate::model::SourceVersion;
-pub use crate::storage::{PrepareFact, RestartReason};
+pub use crate::storage::{DeleteMarkerOutcome, PrepareFact, RestartReason};
 pub use crate::storage::{SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError};
 pub use engine::{
     DIRECTORY_OBJECT_SKIP_REASON, DirectoryObjectAction, EffectiveRecovery,
     ExpertDestinationRequest, ExpertDestinationSession, ExpertDestinationTransferred,
     ExpertSourceEvidence, ExpertSourceOffer, ExpertSourcePayload, ExpertSourceRequest,
     ExpertSourceSession, TransferFailure, TransferOutcome, TransferPhase, TransferRoute,
-    TransferSide, directory_object_action, transfer,
+    TransferSide, destination_keeps_history, directory_object_action, transfer,
+    write_delete_marker,
 };
 pub use identity::TransferIdentity;
 pub use model::{
@@ -23,6 +24,8 @@ pub use model::{
 
 #[cfg(test)]
 mod at_destination_tests;
+#[cfg(test)]
+mod delete_marker_tests;
 #[cfg(test)]
 mod directory_object_tests;
 #[cfg(test)]
