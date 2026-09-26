@@ -331,8 +331,10 @@ separate from the observation window, and at most twice that many started listin
 admission point, each stopped once it has handed over its first page. The traversal holds a few
 pages of each open listing however large its directory, so its memory is bounded by those pages
 plus the subdirectories still to descend into, never by the width of a directory; until each
-backend streams its listing for real (Local since P7 C5, S3's current objects since C6, NFS since C7, HDFS since C8, CIFS in C9), the backend's
-own producer still reads the whole directory before the first page. A listing that fails after
+backend streams its listing for real (Local since P7 C5, S3's current objects since C6, NFS since C7, HDFS since C8, CIFS since C9;
+S3's every-version listing in C11b), the backend's own producer still reads the whole directory before the first page. A CIFS
+listing parked on its first pages holds an open directory handle, so prefetch keeps at most eight CIFS listings started ahead
+and unfinished (`Namespace::parked_listing_limit`). A listing that fails after
 returning children is `Interrupted`, its failure carrying how many it returned (`delivered`).
 A session failure reported by a prefetched listing ends the traversal as soon as it arrives,
 including before entries admitted ahead of it have been delivered. Listings and observations may finish out of order, but

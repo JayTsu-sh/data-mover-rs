@@ -207,7 +207,7 @@ for entry in read_dir(dir):
 预读 (from_producer：channel 1 页 + 生产者手里 1 页)。偷看到的结束 (`End` / 失败) 不需要 credit：
 生产者正常返回不再占 channel 槽发 `End` 消息，而是先置 `finished` 标志再丢掉最后一个 sender，
 所以单页小目录的页一收到、结束就可见，页与结束一起到，驱动一次唤醒 (偷看没看到的结束要等游标取走前一页)。任务中途 panic 由 `Reporter` 的 Drop 报 `Internal`。
-**Local 自 C5 起逐页读目录**（每页一次 `spawn_blocking`，`ReadDir` 带进带出）；**HDFS 自 C8 起逐页列举**（`list_status_iter` 按页取，列举前不再 `get_file_info`，取消 / drop 立即放弃进行中的请求；中途可重试失败从最后读到的名字之后续读）；**S3 当前对象自 C6 起逐页列举**（`ListObjectsV2` 每个服务端页一到就按 `page_hint` 交出，不假设 key 有序：公共前缀用集合去重、续页只用不透明 token、节流 / 瞬时失败用同一 token 重发；多版本 All 仍按目录收齐，C11b 改）；**NFS 自 C7 起逐页列举**（READDIRPLUS 的回复逐条取、按 `page_hint` 攒页交出，一次只多读一个回复；取消 / drop 在下一个请求之前停，不放弃在途请求；首页之前可整目录从头重读，之后失败 → `Interrupted`）；CIFS 在 C9 之前生产者仍整目录读完再按页交出，所以真机上"几页"的界目前在 CIFS 之外的 backend 上成立。
+**Local 自 C5 起逐页读目录**（每页一次 `spawn_blocking`，`ReadDir` 带进带出）；**HDFS 自 C8 起逐页列举**（`list_status_iter` 按页取，列举前不再 `get_file_info`，取消 / drop 立即放弃进行中的请求；中途可重试失败从最后读到的名字之后续读）；**S3 当前对象自 C6 起逐页列举**（`ListObjectsV2` 每个服务端页一到就按 `page_hint` 交出，不假设 key 有序：公共前缀用集合去重、续页只用不透明 token、节流 / 瞬时失败用同一 token 重发；多版本 All 仍按目录收齐，C11b 改）；**NFS 自 C7 起逐页列举**（READDIRPLUS 的回复逐条取、按 `page_hint` 攒页交出，一次只多读一个回复；取消 / drop 在下一个请求之前停，不放弃在途请求；首页之前可整目录从头重读，之后失败 → `Interrupted`）；**CIFS 自 C9 起逐页列举**（生产者持有目录句柄，`QUERY_DIRECTORY` 记录逐条取、按 `page_hint` 攒页交出；停车时句柄一直开着，所以预取受 `parked_listing_limit` = 8 约束；取消 / drop 在取下一条之前停、让在途记录到达，然后关句柄，最后一页在关句柄之后交出；首页之前句柄失效（smb-rs 重连后的 `InvalidState` / `StaleObject`、`STATUS_FILE_CLOSED` / `STATUS_INVALID_HANDLE`）重开目录从头读，至多 3 次；之后失败 → `Interrupted`）。
 
 驱动循环 (`storage.rs` 的 `drive`)：
 
@@ -271,8 +271,10 @@ loop {
 预取的含义是"首页到齐"：预取的列举交出首页 (外加至多一页原始的偷看页) 后停住，游标到了才继续读。
 **祖先帧的列举在下钻前已读尽**，栈上没有横跨子树的打开游标；只有"已预取、游标还没走到"的目录会停在
 半路 (≤ 2P 个)。backend 逐页之后 (C5–C9)：NFS / S3 / HDFS 停车什么都不占，Local 占一个 fd，
-**CIFS 占一个真实句柄** (停车句柄上限 8 与 ONTAP 空闲回收实测归 C9)；Local (C5，停车占一个 fd) 与
-HDFS (C8，服务端什么都不占；客户端 hdfs-native 迭代器里至多留一批 ≤ 1000 个 status) 已是如此，其余 backend 今天生产者整目录读完，句柄在停车前已关、整目录在生产者里。
+**CIFS 占一个真实句柄**：`Namespace::parked_listing_limit()` 对 CIFS 回答 8 (Q10)，游标对"已起、未读完"
+的预取列举 (等页的 + 停车的) 数不超过它，游标正要的那个不计、总是起 —— 所以任何时刻打开的 CIFS
+列举句柄 ≤ 8 + 1，且不会因上限卡住遍历 (C9)。HDFS (C8) 服务端什么都不占；客户端 hdfs-native 迭代器里
+至多留一批 ≤ 1000 个 status。S3 多版本 (C11b 前) 生产者整目录收齐。
 驻留探针 (`storage/residency.rs`) 有 `pages_buffered`、`parked_listings`。
 
 ### 三、`NameBytes` 兄弟排序 (P7 C4 已删除)

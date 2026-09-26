@@ -182,6 +182,11 @@ CIFS 只有 role-based 实现，不经过 `StorageError`；映射表在
 `InvalidArgument` → InvalidInput；`UnsupportedOperation` → Unsupported；`Cancelled` → Cancelled；
 `ConnectionStopped` / `SessionInvalidated` / `RuntimeTerminated` / `TransportError` → session 级 Connectivity。
 legacy 的"`OBJECT_NAME_COLLISION` 当成功"已随 #150 删除：role 返回 `Conflict`，由调用方决定是否幂等。
+**role 列举 (P7 C9)** 不改分类，只决定重不重来：smb-rs 重连后不重开目录句柄，旧句柄上的请求报
+`InvalidState` ("stale share generation"，恢复期内的 #79 也是它) 或 `StaleObject`，服务端回
+`STATUS_FILE_CLOSED` / `STATUS_INVALID_HANDLE` —— 四者都落在 `Protocol` / Unknown。首页交出之前按
+"句柄失效"重开目录从头读 (50 ms / 250 ms / 1 s，至多 3 次)；之后已读到的先交出，列举以原分类结束，遍历记
+`Interrupted`；连接类仍升会话。读完之后关句柄失败只记 warn。
 `classify` 产出的 diagnostic 是 `CIFS {Operation} failed: {smb 错误 Display}` (去掉 NUL)：
 smb-rs 的 Display 只含 NTSTATUS / 传输原因 / UNC 路径，不含凭据。之前是固定文案
 "CIFS entry operation failed"，`Protocol` 兜底一旦命中就无从定位 (2026-09-18 的中途丢流

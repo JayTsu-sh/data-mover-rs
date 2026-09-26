@@ -240,6 +240,12 @@ impl Cursor {
     /// `2 × budget` listings started ahead of the cursor, waiting or stopped after a page, may
     /// wait for it. Counting the stopped ones against the first budget would let early-prefetched
     /// shallow siblings keep the deeper listings the cursor needs first from starting.
+    ///
+    /// A namespace whose parked listings hold a server resource (CIFS: a directory handle) adds a
+    /// third: at most its `parked_listing_limit` listings started ahead and not yet ended, waiting
+    /// or stopped. Every parked listing is one of them, so it bounds the parked ones strictly
+    /// without guessing which will park; the one the cursor needs is not counted and always
+    /// starts, so the limit cannot stall the traversal.
     pub(super) fn start_listings(&mut self, runtime: &Runtime<'_>) {
         if let Some(frame) = self.stack.last()
             && frame.listing.is_none()
@@ -261,9 +267,17 @@ impl Cursor {
             .filter(|listing| listing.awaiting())
             .count()
             + usize::from(top_awaiting);
-        let room = budget
+        let mut room = budget
             .saturating_sub(awaiting)
             .min(budget.saturating_mul(2).saturating_sub(self.started.len()));
+        if let Some(limit) = runtime.shared.parked_listing_limit {
+            let unended = self
+                .started
+                .values()
+                .filter(|listing| listing.ended.is_none())
+                .count();
+            room = room.min(limit.saturating_sub(unended));
+        }
         for work in self.prefetch_candidates(room, budget.saturating_mul(4)) {
             self.spawn(runtime, work);
         }

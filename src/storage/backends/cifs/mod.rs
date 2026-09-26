@@ -4,7 +4,7 @@ mod at_destination;
 mod directory;
 mod listing;
 #[cfg(test)]
-mod listing_fake;
+pub(crate) mod listing_fake;
 mod metadata;
 mod namespace;
 mod positioned_writer;

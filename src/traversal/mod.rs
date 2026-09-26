@@ -20,6 +20,8 @@ pub use events::{
 };
 pub use storage::StorageTraversalSource;
 #[cfg(test)]
+mod cifs_tests;
+#[cfg(test)]
 mod hdfs_tests;
 #[cfg(test)]
 mod local_tests;

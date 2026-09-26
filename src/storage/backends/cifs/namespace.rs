@@ -1,24 +1,24 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::stream::BoxStream;
 
-use super::listing::read_whole;
+use super::listing::{produce, read_whole};
 use super::metadata::{CifsInlineMetadata, timestamp};
 use super::source::{
-    CifsSourceFacts, classify, descriptor_from_facts, entry_failure, entry_failure_with_transience,
-    is_directory_not_empty, is_not_found, smb_attributes_to_mode,
+    CifsSourceFacts, classify, descriptor_from_facts, entry_failure, is_directory_not_empty,
+    is_not_found, smb_attributes_to_mode,
 };
 use crate::model::{
-    BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
-    SymlinkTarget, TimestampMetadata,
+    BackendIdentity, EntryKind, FailureClass, Operation, StoragePath, SymlinkTarget,
+    TimestampMetadata,
 };
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::listing::child_path;
 use crate::storage::{
-    ChildFailure, ListRequest, ListingPage, ListingStream, Namespace, NamespaceCapabilities,
-    SourceDescriptor, StorageRoleFailure,
+    ListRequest, ListingStream, Namespace, NamespaceCapabilities, SourceDescriptor,
+    StorageRoleFailure,
 };
 
 /// Protocol verbs behind the CIFS namespace role.
@@ -29,7 +29,7 @@ use crate::storage::{
 pub(super) trait CifsNamespaceProtocol: Send + Sync {
     async fn stat(&self, path: &StoragePath) -> smb_domain::Result<CifsSourceFacts>;
     /// Opens `path` as a directory to read its children. The caller holds the handle for as long
-    /// as it reads and must [`CifsDirectory::close`] it on every exit.
+    /// as it reads and must [`CifsDirectory::close`] it on every exit (P7 C9).
     async fn open_directory(
         &self,
         path: &StoragePath,
@@ -87,10 +87,14 @@ impl CifsUnspelled {
     }
 }
 
+/// Most listings a consumer may keep started and not read to their end at once (P7 §6.2, Q10):
+/// each holds an open directory handle on the server while it waits.
+const PARKED_LISTING_LIMIT: NonZeroUsize = NonZeroUsize::MIN.saturating_add(7);
+
 #[derive(Clone)]
 pub(super) struct CifsNamespace {
-    protocol: Arc<dyn CifsNamespaceProtocol>,
-    identity: BackendIdentity,
+    pub(super) protocol: Arc<dyn CifsNamespaceProtocol>,
+    pub(super) identity: BackendIdentity,
 }
 
 impl CifsNamespace {
@@ -110,56 +114,8 @@ impl CifsNamespace {
         descriptor_from_facts(&self.identity, path, &facts, Operation::Observe)
     }
 
-    /// Reads one whole directory; the handle is opened, read and closed inside this one call, so
-    /// nothing stays open between pages (true paging comes with C9).
-    async fn list_whole(&self, path: &StoragePath) -> Result<ListingPage, StorageRoleFailure> {
-        let facts = read_whole(self.protocol.as_ref(), path)
-            .await
-            .map_err(|error| classify(path, Operation::Traverse, &error))?;
-        // Transfer artifacts never appear in a listing (ADR-0006 C3b). A child that cannot be
-        // described is reported on its own, beside the siblings that could be: the directory
-        // itself was listed, so failing it whole would drop them.
-        let mut entries = Vec::with_capacity(facts.len());
-        let mut failures = Vec::new();
-        let mut unspelled = Vec::new();
-        let mut hidden = 0_u32;
-        for listed in facts {
-            let (child, inline) = match listed {
-                Ok(listed) => listed,
-                Err(CifsUnspelled { name }) => {
-                    unspelled.push(ChildFailure::unnamed(
-                        &self.identity,
-                        path,
-                        Bytes::from(name.into_bytes()),
-                        FailureClass::Unsupported,
-                        "a CIFS name cannot be spelled as a storage path (its UTF-16 is not \
-                         valid, or the path is too long)",
-                    ));
-                    continue;
-                }
-            };
-            if is_artifact_path(child.as_str()) {
-                tracing::trace!("[CIFS] listing skips transfer artifact {}", child.as_str());
-                hidden = hidden.saturating_add(1);
-                continue;
-            }
-            match self.describe_listed(&child, &inline) {
-                Ok(descriptor) => entries.push(descriptor),
-                Err(StorageRoleFailure::Entry(failure)) => {
-                    failures.push(undescribed(&child, &failure));
-                }
-                Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
-            }
-        }
-        let mut page = ListingPage::from_descriptors(path, entries, failures, hidden);
-        for failure in unspelled {
-            page.push_failure(failure);
-        }
-        Ok(page)
-    }
-
     /// One listed child with the timestamps and mode its `QUERY_DIRECTORY` record carries.
-    fn describe_listed(
+    pub(super) fn describe_listed(
         &self,
         child: &StoragePath,
         inline: &CifsInlineMetadata,
@@ -269,20 +225,6 @@ impl CifsNamespace {
     }
 }
 
-/// A listed child's failure, saying that the listing could not describe it.
-fn undescribed(child: &StoragePath, failure: &EntryOperationFailure) -> EntryOperationFailure {
-    match entry_failure_with_transience(
-        child,
-        Operation::Traverse,
-        failure.class(),
-        failure.transience(),
-        "CIFS listing could not describe the entry",
-    ) {
-        StorageRoleFailure::Entry(failure) => failure,
-        StorageRoleFailure::Session(_) => unreachable!("an entry failure is built"),
-    }
-}
-
 /// Transfer artifacts are not addressable through the namespace (ADR-0006 C3b), as on Local and
 /// NFS: listings hide them, so no verb may reach them either.
 fn refuse_artifacts(paths: &[&StoragePath]) -> Result<(), StorageRoleFailure> {
@@ -303,16 +245,15 @@ impl Namespace for CifsNamespace {
         self.stat_entry(path).await
     }
 
-    /// The producer task owns the listing to its end, so a dropped stream never abandons an open
-    /// directory handle: the protocol call inside it always runs to its close.
+    /// Streams the directory page by page (P7 C9): the producer task holds the directory handle
+    /// while it reads and closes it on every exit, so a dropped stream never abandons one.
     fn list(&self, request: ListRequest) -> ListingStream {
         if let Err(failure) = refuse_artifacts(&[&request.path]) {
             return ListingStream::failed(request.path, failure);
         }
         let namespace = self.clone();
-        ListingStream::from_producer(request.path.clone(), move |sink| async move {
-            let listing = namespace.list_whole(&request.path).await;
-            sink.deliver(listing, &request).await;
+        ListingStream::from_producer(request.path.clone(), move |sink| {
+            produce(namespace, request, sink)
         })
     }
 
@@ -353,5 +294,10 @@ impl Namespace for CifsNamespace {
             symlinks: false,
             ..NamespaceCapabilities::BASIC
         }
+    }
+
+    /// A listing waiting for its consumer holds its directory handle open on the server.
+    fn parked_listing_limit(&self) -> Option<NonZeroUsize> {
+        Some(PARKED_LISTING_LIMIT)
     }
 }

@@ -11,9 +11,9 @@
 //! cursor is admitting, [`PAGES_AHEAD`] prepared pages handed over and not yet taken, and at most
 //! one raw page a peek took off the stream (see [`read`]). A listing the cursor has not reached
 //! stops there. The backend's stream reads ahead on its own (one page in its channel and one in
-//! the producer's hands, P7 §5.1) — Local (C5), S3's current objects (C6), NFS (C7) and HDFS (C8)
-//! stream for real; until the others do (CIFS in C9, S3's versions in C11b) their producers still
-//! read the whole directory before the first page. The task never collects a listing whole.
+//! the producer's hands, P7 §5.1) — Local (C5), S3's current objects (C6), NFS (C7), HDFS (C8) and
+//! CIFS (C9) stream for real; until S3's versions do (C11b) that producer still reads the whole
+//! directory before the first page. The task never collects a listing whole.
 //!
 //! **Never aborted.** The task is detached. It ends when the listing ends, or when the driver is
 //! gone (the traversal ended): then it drops the stream, and the backend's producer leaves through

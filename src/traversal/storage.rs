@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 #[cfg(test)]
@@ -294,6 +295,9 @@ struct Shared {
     tickets: AtomicU64,
     /// Whether the traversal root's own object was reported (once, whatever its versions).
     root_object_reported: AtomicBool,
+    /// Most listings started ahead of the cursor and not yet ended, when a parked listing holds a
+    /// server resource ([`Namespace::parked_listing_limit`]).
+    parked_listing_limit: Option<usize>,
 }
 
 struct Runtime<'a> {
@@ -323,6 +327,7 @@ async fn run(
         sender,
     );
     let mut observations = Observations::new();
+    let parked_listing_limit = namespace.parked_listing_limit().map(NonZeroUsize::get);
     let shared = Arc::new(Shared {
         namespace,
         metadata,
@@ -330,6 +335,7 @@ async fn run(
         request,
         tickets: AtomicU64::new(0),
         root_object_reported: AtomicBool::new(false),
+        parked_listing_limit,
     });
     let runtime = Runtime {
         shared: &shared,

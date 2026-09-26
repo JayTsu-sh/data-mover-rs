@@ -1,5 +1,7 @@
 //! The namespace role: typed verbs over one storage's tree (P7 §5.1, §5.4.1, §5.4.5).
 
+use std::num::NonZeroUsize;
+
 use async_trait::async_trait;
 
 use super::StorageRoleFailure;
@@ -70,6 +72,19 @@ pub trait Namespace: Send + Sync {
     /// refuses what it cannot do before any.
     fn capabilities(&self) -> NamespaceCapabilities {
         NamespaceCapabilities::BASIC
+    }
+
+    /// Most listings a consumer should keep *parked* at once — started, and not read to their
+    /// end — when a listing waiting for its consumer holds a resource on the server (P7 §6.2,
+    /// Q10). `None`, the default, when a parked listing holds nothing there (NFS, S3, HDFS: their
+    /// position is a cookie or token, or nothing) or only a local one (Local: one file
+    /// descriptor).
+    ///
+    /// A consumer that reads listings ahead of need (the traversal's prefetch) starts no more of
+    /// them than this while that many are unfinished; the listing it needs next always starts.
+    /// CIFS answers 8: each such listing holds an open directory handle.
+    fn parked_listing_limit(&self) -> Option<NonZeroUsize> {
+        None
     }
 
     /// Lists one directory with every stored version and delete marker of each child object,

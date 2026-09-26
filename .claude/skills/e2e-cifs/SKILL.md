@@ -21,6 +21,7 @@ CIFS_REAL_PASS=password
 CIFS_POLICY_TEST_BYTES=4096,67108864    # 可选，逗号分隔文件大小
 CIFS_PROBE_NFS_URL=nfs://nas01/share:/?uid=0&gid=0&noresvport=true   # 可选，probe 用它建 symlink fixture
 CIFS_REAL_GUEST_POLICY=allow-unsigned   # 可选，对匿名/guest share 跑契约 (配合未知用户 + 空密码)
+CIFS_PARKED_IDLE_SECS=2                 # 可选，停车列举测试的空闲秒数 (P7 C9 实测用 1800)
 ```
 
 匿名 share 用法：`CIFS_REAL_SHARE=dm_anon_share CIFS_REAL_USER= CIFS_REAL_PASS= CIFS_REAL_GUEST_POLICY=allow-unsigned`
@@ -43,6 +44,8 @@ CIFS_REAL_GUEST_POLICY=allow-unsigned   # 可选，对匿名/guest share 跑契�
 3. `cargo test --release --test cifs_namespace_contract -- --ignored --nocapture`
    - Namespace role：CreateDirectory / Stat / List / Rename (replace 语义) / Delete，
      以及 directory rename 与 ReadLink 的 typed `Unsupported`
+   - 停车列举 (P7 C9)：1500 个子项的目录按 16 条一页列举，取首页后停 `CIFS_PARKED_IDLE_SECS` 秒
+     (默认 2；测 ONTAP 空闲回收时给 1800) 再读完，每个子项恰好一次，会话照常可用
 4. `cargo test --release --test cifs_capability_probe -- --ignored --nocapture`
    - 只打印 `[probe]` 证据：匿名/guest 登录、签名策略、根目录列举、时钟偏差、ACL 查询
 

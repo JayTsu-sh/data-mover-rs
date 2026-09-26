@@ -140,11 +140,11 @@ legacy `CifsStorage` 的能力在 role-based backend 里的去向 —— 有对�
   `inline_mode` 只服务于 NDX 输出的直接后果。
   根治要给 smb-rs 的 `RuntimeMetadata` / `ResourceMetadata` 加属性位 —— 底层 stat 本来就在查
   `FileBasicInformation`，数据已在响应里、零额外往返，适合和 file id 合成同一个上游 PR。
-- **列举里单个子项描述不出来时只让它自己失败**：`namespace.rs list` 把 `descriptor_from_facts` 的条目失败
+- **列举里单个子项描述不出来时只让它自己失败**：`listing.rs` (`Pages::push`) 把 `descriptor_from_facts` 的条目失败
   收进 `ListingPage::failures`（报在子项路径，`Protocol` / Permanent），兄弟照常，遍历报
-  `Partial`；之前一个坏子项让整个目录失败（P7 评审现存问题 2）。`protocol.rs list` 里子项名拼不成
-  `StoragePath`（只有含 NUL 或超 16 MiB 才会）仍让整个目录失败 —— SMB 名字不可能如此，没有为它改协议 trait。
-- **列举里的 reparse point 一律当普通文件**。`protocol.rs list` 明确不把它映射成 `Symlink`
+  `Partial`；之前一个坏子项让整个目录失败（P7 评审现存问题 2）。`directory.rs` 里子项名拼不成
+  `StoragePath`（smb-rs 有损解码出 U+FFFD，或拼上父路径超长）报成该子项的无名失败（`CifsUnspelled`，P7 C3），兄弟照常。
+- **列举里的 reparse point 一律当普通文件**。`directory.rs` 明确不把它映射成 `Symlink`
   (facade 读不了 link target，`Symlink` 会把遍历送进不支持的 `ReadLink`)，所以
   `NASEntry.is_symlink` 恒 `false`，filter 表达式里的 `type == "symlink"` 在 CIFS 上恒不匹配。
   FAS2750 实测见下文"真实环境证据"的符号链接行：unix 卷上的 symlink 在 SMB 列举里本来就不带
@@ -183,6 +183,46 @@ let result = async { h.query_info().await }.await;
 close_resource(&h).await;  // 总是 close
 result
 ```
+
+### 列举：逐页流式、生产者持有句柄 (P7 C9)
+
+代码：`listing.rs` (生产者 `produce`、整目录 `read_whole`)、`directory.rs` (smb-rs `Directory` 包装，
+`QUERY_DIRECTORY` 记录 → `CifsListedChild`)、`namespace.rs` (`CifsDirectory` 接缝、`parked_listing_limit`)。
+
+- **协议接缝**：`CifsNamespaceProtocol::open_directory(path) -> Box<dyn CifsDirectory>`；`CifsDirectory`
+  = `entries()` (逐条记录的流，每个打开的目录只调一次) + `close()`。取代原来整目录返回 `Vec` 的 `list`。
+  `delete` 的 artifact 清扫仍整目录读 (`read_whole`，读错误优先于关句柄错误，与原来一致)。
+- **生产者**：每个列举一个任务，打开目录、逐条取记录、按 `page_hint` 攒页交出 (隐藏的 `.data-mover-*`
+  不占名额、计入 `internal_hidden`)。**每个出口都关句柄**：读到尾、消费方走了 / 取消 (取下一条之前检查，
+  在途那条记录 —— 以及带来它的请求 —— 让它到达)、读失败；`entries` 流在关句柄之前 drop，最后一页在关句柄
+  **之后**交出。生产者从不被外部 abort (§16 M1)。
+- **停车占句柄**：消费方没取走上一页时生产者停在交页处，目录句柄一直开着。所以 `Namespace::parked_listing_limit()`
+  对 CIFS 回答 **8** (Q10)：遍历预取的“已起、未读完”列举 (等页的 + 停车的) 不超过 8 个，游标正要的那个不计、
+  总是起 —— 任何时刻打开的列举句柄 ≤ 8 + 1，且上限不会卡住遍历 (`src/traversal/storage/cursor.rs`
+  `start_listings`)。遍历之外，一个列举最多领先消费方约 3 页 (通道一页 + 生产者手里一页)，遍历的列举任务
+  还会多偷看一页：所以超过约 4 页 (`page_hint` 1024 时约 4096 条) 的目录一定带着句柄停车，更小的目录多半在
+  游标到达之前就已读到尾、关了句柄 (看偷看赶没赶上)。
+- **drop 不再读到流尾**：smb-rs 的流在消费方取空缓冲的那一刻就发下一条 `QUERY_DIRECTORY`，domain 层看不到
+  请求边界，所以早停时 drop 流可能放弃一个已发出的请求；smb-rs #75/#76 (钉住的 `91e6cfb` 已含) 保证 drop 先
+  cancel 再唤醒、迟到的回复 (`STATUS_FILE_CLOSED` 等) 不致命，然后 CLOSE。“已知陷阱”里“列举必须读到流尾”
+  这条因此只剩连接期身份探测 (`probe_listing`) 仍遵守。真机验证见“真实环境证据”的 C9 行。
+- **失败**：smb-rs **不重开目录句柄** (目录打开不是 durable)：重连后同一句柄上的下一个请求报
+  `InvalidState("Resource belongs to a stale share generation")`，重连时在途的报 `StaleObject`，恢复期内
+  的请求也是 `InvalidState` (smb-rs #79)；服务端自己回 `STATUS_FILE_CLOSED` / `STATUS_INVALID_HANDLE`。
+  **首页交出之前**这几种都按“句柄失效”重开目录、从头读 (等 50 ms / 250 ms / 1 s，至多 3 次，不重复交出)；
+  **首页之后**不重试 (枚举位置换不到新句柄上)：已读到的先交出，再以 `classify` 的原分类结束 —— 上面几种
+  都是 `Protocol` / Unknown 条目失败，遍历记 `Interrupted { delivered }`；连接类失败照常升会话。第一条失败
+  的记录就结束这次读 (smb-rs 的流在错误之后还会再发请求)。CIFS 没有映射到 `Throttled` 的状态，不退避。
+  读到尾之后关句柄失败只记 warn，不让列举失败 (每个子项都已读到、交出；此前整目录失败)。
+- **没有下钻提示**：SMB CREATE 按 share 相对路径一次往返打开任何深度的目录，facade 也没有按 file id 打开，
+  列举没有能交给子目录、省掉请求的东西。
+- **代价 (已知风险)**：NFS / S3 / HDFS 停车只留一个 cookie / token，重连后照常续；CIFS 停车留的是句柄，
+  smb-rs 重连后不重开它 —— 一次重连会让当时打开着的至多 8 + 1 个列举 (已交出首页的) 变成 `Interrupted`，
+  遍历内不重试，要靠上游对 `Interrupted` 目录重扫。
+- **目录打开的访问权**：smb-rs 的 `open_directory` 对非 share 根请求 `GENERIC_READ | GENERIC_WRITE | DELETE`
+  (share 根只读)。此前句柄只活几毫秒；C9 起一个预取的兄弟目录可以把它开到游标到达为止 (可能很久)，期间它
+  可能挡住别的客户端对这个目录或其祖先的改名 / 删除 (NTFS 语义)。只读账号列不了非根目录也是这个原因 (现存)。
+  要改需 smb-rs 提供只为列举的只读打开。
 
 ### Staged destination 与恢复
 
@@ -381,7 +421,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 | 长 session 句柄耗尽 | 检查所有 close 路径走 `close_resource` |
 | 符号链接 | facade 不暴露 reparse point；`ReadLink` 返回 typed `Unsupported` (实测见"真实环境证据") |
 | 目录 rename 目标已存在 | NTFS 语义下不能替换非空目录，服务器返回 COLLISION/ACCESS_DENIED → `Conflict`/`PermissionDenied` |
-| **中途丢弃 `entries()` 流** (取到首项就 return) | 曾让紧随其后的第一个操作报 `Invalid state: only the Connection dependency may wait in this recovery stage`，或整个进程挂住。真机复现 + generation 退出事件定位到根因是 **`Wire("invalid-status")`**：消费端取空缓冲的瞬间 fetch_loop 就发下一条 QUERY_DIRECTORY，drop 流触发 CANCEL，服务器在 CLOSE 之后用 `STATUS_FILE_CLOSED` (0xC0000128) 回它，这个状态不在 smb-msg `Status` 枚举里，`Header::status()` 失败被 engine 判为致命 → generation 退出 → 恢复期。**已修 (smb-rs #76，钉 `8b10f35`)**：未建模 NTSTATUS 不再致命，draining 操作的迟到响应不受状态合约约束；流 Drop 先 cancel 再唤醒、fetch_loop 醒来先查 token；恢复等待无 deadline 时用 `total_timeout` 兜底，`recover()` 所有失败分支都释放等待者；generation 退出 / 恢复起止有 tracing 事件。data-mover 的 `list` / `probe_listing` 仍读到流尾再 close —— 少一次无人接收的往返，不依赖上游行为。**仍开着的**：恢复期内 Session/Tree 依赖的操作是立刻报 `DependencyNotConnection` (到我们这里是 `Protocol`/Unknown)，而不是等毫秒级的恢复完成，与 smb-rs 自己的不变量文档相悖，见 [smb-rs #79](https://github.com/JayTsu-sh/smb-rs/issues/79)；在此之前上游把它当可重试处理 |
+| **中途丢弃 `entries()` 流** (取到首项就 return) | 曾让紧随其后的第一个操作报 `Invalid state: only the Connection dependency may wait in this recovery stage`，或整个进程挂住。真机复现 + generation 退出事件定位到根因是 **`Wire("invalid-status")`**：消费端取空缓冲的瞬间 fetch_loop 就发下一条 QUERY_DIRECTORY，drop 流触发 CANCEL，服务器在 CLOSE 之后用 `STATUS_FILE_CLOSED` (0xC0000128) 回它，这个状态不在 smb-msg `Status` 枚举里，`Header::status()` 失败被 engine 判为致命 → generation 退出 → 恢复期。**已修 (smb-rs #76，钉 `8b10f35`)**：未建模 NTSTATUS 不再致命，draining 操作的迟到响应不受状态合约约束；流 Drop 先 cancel 再唤醒、fetch_loop 醒来先查 token；恢复等待无 deadline 时用 `total_timeout` 兜底，`recover()` 所有失败分支都释放等待者；generation 退出 / 恢复起止有 tracing 事件。`probe_listing` 仍读到流尾再 close —— 少一次无人接收的往返。**P7 C9 起 role 列举早停 (消费方走了 / 取消) 时直接 drop 流再 CLOSE**，依赖 #76 (逐页流式没法读到尾)，见"列举：逐页流式"。**仍开着的**：恢复期内 Session/Tree 依赖的操作是立刻报 `DependencyNotConnection` (到我们这里是 `Protocol`/Unknown)，而不是等毫秒级的恢复完成，与 smb-rs 自己的不变量文档相悖，见 [smb-rs #79](https://github.com/JayTsu-sh/smb-rs/issues/79)；在此之前上游把它当可重试处理 |
 
 ## 测试
 

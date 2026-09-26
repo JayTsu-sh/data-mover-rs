@@ -32,7 +32,14 @@ def main() -> int:
     require(env, *REQUIRED)
 
     child_env = dict(os.environ)
-    for key in (*REQUIRED, "CIFS_REAL_SECOND_SERVER", "CIFS_POLICY_TEST_BYTES", "CIFS_PROBE_NFS_URL", "CIFS_REAL_GUEST_POLICY"):
+    for key in (
+        *REQUIRED,
+        "CIFS_REAL_SECOND_SERVER",
+        "CIFS_POLICY_TEST_BYTES",
+        "CIFS_PROBE_NFS_URL",
+        "CIFS_REAL_GUEST_POLICY",
+        "CIFS_PARKED_IDLE_SECS",
+    ):
         if key in env:
             child_env[key] = env[key]
     child_env.setdefault("CIFS_REAL_SECOND_SERVER", child_env["CIFS_REAL_SERVER"])

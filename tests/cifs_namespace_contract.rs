@@ -37,6 +37,104 @@ async fn real_share_namespace_verbs_roundtrip() -> Result {
     cleanup
 }
 
+/// A listing parked on its open directory handle — its consumer holds a page while the rest of the
+/// directory waits on the server — still reads to its end after `CIFS_PARKED_IDLE_SECS` idle
+/// (default 2; P7 C9 measures 1800), naming every child once, and the session serves the next
+/// request. The directory is wider than one `QUERY_DIRECTORY` answer, so resuming needs the
+/// server to honour the parked handle. Then twenty listings of it are dropped after their first
+/// page, each followed by a request on the same session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an explicitly configured writable CIFS share"]
+async fn real_share_parked_listing_resumes_after_idle() -> Result {
+    common::init_tracing();
+    let server = std::env::var("CIFS_REAL_SERVER")?;
+    let share_name = std::env::var("CIFS_REAL_SHARE")?;
+    let idle = std::env::var("CIFS_PARKED_IDLE_SECS")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map_or(Ok(2), |value| value.parse::<u64>())?;
+    let client = smb_client();
+    let share = client
+        .connect_share(
+            &smb_domain::ShareTarget::new(&server, &share_name)?,
+            smb_domain::Credentials::ntlm(raw_username()?, std::env::var("CIFS_REAL_PASS")?),
+        )
+        .await?;
+    let storage = connect_remote(&server, &share_name).await?;
+    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let dir = format!("dm-cifs-parked-{}", uuid::Uuid::new_v4().simple());
+    let result = exercise_parked(namespace.as_ref(), &share, &dir, idle).await;
+    let cleanup = cleanup(namespace.as_ref(), &dir).await;
+    let _ = client.close().await;
+    result?;
+    cleanup
+}
+
+/// Children of the parked directory: more than one `QUERY_DIRECTORY` answer holds.
+const PARKED_CHILDREN: usize = 1500;
+
+async fn exercise_parked(
+    namespace: &dyn Namespace,
+    share: &smb_domain::Share,
+    dir: &str,
+    idle: u64,
+) -> Result {
+    namespace.create_directory(&path(dir)?).await?;
+    let names: Vec<String> = (0..PARKED_CHILDREN)
+        .map(|index| format!("q{index:04}.bin"))
+        .collect();
+    for name in &names {
+        create_empty_file(share, &format!("{dir}/{name}")).await?;
+    }
+    let hint = NonZeroUsize::new(16).ok_or("zero page size")?;
+    let request = ListRequest::new(path(dir)?, CancellationToken::new()).with_page_hint(hint);
+    let mut stream = namespace.list(request);
+    let mut listed: Vec<String> = Vec::with_capacity(PARKED_CHILDREN);
+    let first = stream.next().await.ok_or("the listing ended at once")??;
+    listed.extend(first.children.iter().map(|child| child.name().to_owned()));
+    eprintln!("[parked] first page of {}; idle {idle} s", listed.len());
+    tokio::time::sleep(std::time::Duration::from_secs(idle)).await;
+    let resumed = std::time::Instant::now();
+    while let Some(page) = stream.next().await {
+        let page = page.map_err(|failure| format!("the parked listing failed: {failure:?}"))?;
+        if !page.failures.is_empty() {
+            return Err(format!("children failed: {:?}", page.failures).into());
+        }
+        listed.extend(page.children.iter().map(|child| child.name().to_owned()));
+    }
+    eprintln!(
+        "[parked] resumed: {} children in {} ms",
+        listed.len(),
+        resumed.elapsed().as_millis()
+    );
+    listed.sort_unstable();
+    if listed != names {
+        return Err(format!(
+            "{} children listed, not each of {} once",
+            listed.len(),
+            names.len()
+        )
+        .into());
+    }
+    // Dropped part way, with the handle open and the next `QUERY_DIRECTORY` possibly in flight:
+    // the producer closes the handle, and the session serves the next request every time.
+    for _ in 0..20 {
+        let request = ListRequest::new(path(dir)?, CancellationToken::new()).with_page_hint(hint);
+        let mut stream = namespace.list(request);
+        let first = stream.next().await.ok_or("the listing ended at once")??;
+        if first.children.len() != 16 {
+            return Err(format!("a first page of {} children", first.children.len()).into());
+        }
+        drop(stream);
+        namespace.stat(&path(dir)?).await?;
+    }
+    for name in &names {
+        namespace.delete(&path(&format!("{dir}/{name}"))?).await?;
+    }
+    namespace.delete(&path(dir)?).await?;
+    Ok(())
+}
+
 async fn exercise(namespace: &dyn Namespace, share: &smb_domain::Share, dir: &str) -> Result {
     let a = format!("{dir}/a.bin");
     let b = format!("{dir}/b.bin");
