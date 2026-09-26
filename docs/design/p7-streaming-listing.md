@@ -757,6 +757,35 @@ struct VersionRecord {
 
 **剖析手段**：node1 装不了 perf，用 `strace -c` 数系统调用；另加一个 feature 门控的内部计数器（每阶段耗时：列举、组装、交接、发出），以及单条组装的微基准。每一步优化都要在 node1 上复测并记录，达标即停。
 
+### 12.7 实测（2026-09-26，node1，200G 链路，c=64，交替各两轮）与内存根因
+
+| 版本 | wall | CPU | RSS | futex / 条 |
+|---|---|---|---|---|
+| legacy | 973 s | 237 s | 14 MB | 0.28 |
+| role（C0 前，40c1ac9） | 1024 s（1.05×） | 685 s（2.90×） | 165 MB | 2.38 |
+| role（C0 后，03d5c28） | 1052 s（1.08×） | 357 s（1.51×） | 175 MB | 0.46 |
+| C0 + `MALLOC_ARENA_MAX=2` | 1071 s | 462 s | 122 MB | — |
+
+C0 达到了自己的目标（每条 futex 2.38 → 0.46，CPU 约 12.8 → 6.7 µs / 条，legacy 约 4.4 µs）；Blocks 门 wall、futex 过，
+**CPU（1.51×）与 RSS（175 MB）未过**。每目录 RPC 与 legacy 相同（约 1 次 sendto）。
+
+**内存根因（诊断构建确认）**：不是遍历，也不是分配器 arena，而是 NFS 的全局“路径 → 文件句柄”缓存
+`GLOBAL_CACHE`（`src/nfs.rs`，moka，容量 50 万，闲置过期按距根深度 2 h / 10 min / 10 s）。8a1348b 起
+`list_role_entries_once` 把 READDIRPLUS 回来的每个子目录句柄都写进去，3.37M 个目录全部过一遍；legacy 从不写。
+整树上缓存稳定在约 13.5 万项、活堆约 92 MB（约 625 B / 目录），另有 3.37M 项创建又过期造成的碎片约 99 MB；
+RSS 从不封顶（21 → 192 MB）。子树 `d000`（16.8 万目录）即达 114–124 MB，与并发、arena 数无关。
+上限压到 4096 项时 RSS 平在约 43 MB，但多 11% 的字节（补 LOOKUP）、wall +16%、CPU +36%，只证明原因，不是解法。
+其余候选（游标栈、预取列举、重排缓冲、条目通道）都有界且与树规模无关。
+另：`lookup_fh` 与 `create_dir_all` 把零拷贝解码出的 `obj.fh` 原样存进缓存，每项钉住整个约 250–300 B 的 RPC 回复
+（列举路径已 `Bytes::copy_from_slice`），迁移的目的端同样会涨 —— 作为独立修复 **F3** 先做。
+
+**定的修法（A）**：子目录句柄随工作项下传，不经缓存。列举给每个子目录带一个 backend 私有的、拷贝出来的下钻提示
+（NFS 是 ≤ 64 B 的文件句柄，绝不引用 READDIRPLUS 页），`ListRequest` 增加可选的同类提示；有提示就直接 READDIRPLUS，
+没有或已失效（`NFS3ERR_STALE` / `BADHANDLE`）才回退 `lookup_fh(path)`；列举不再写 `GLOBAL_CACHE`（变更路径仍可用它）。
+内存变为“待处理目录数 × 约 64 B”，与 legacy 同形。落在 C7（NFS 侧）与 C4 / C10（调度器携带提示）。
+预计 Blocks ≤ 100 MB 容易达到；Unordered ≤ 30 MB 还可能要 O2 / O4（启动约 20 MB，其中 12 MB 是二进制映射）。
+CPU 的差距（1.51× 对 ≤ 1.4×）按 O2 → O3 在 Phase 6 处理。原始数据：node1 `/root/dm/p7-base/logs`、`/root/dm/p7-rss/`。
+
 ## 13. 破坏性变更清单
 
 | 项 | 变化 |
@@ -812,6 +841,7 @@ C5  feat(storage): Local 流式            - src/storage/backends/local/namespac
 C6  feat(storage): S3 流式（Current；前缀集合；All 物化；节流退避）
     - src/storage/backends/s3/{listing.rs:55-130, paging.rs, namespace.rs:109-146}
 C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:4610-4691
+    + 子目录句柄作为下钻提示随工作项下传，列举不再写 GLOBAL_CACHE，无提示 / 失效回退 lookup_fh（§12.7 修法 A）
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
 C9  feat(storage): CIFS 流式（生产者持有句柄；停车句柄上限） - src/storage/backends/cifs/{protocol.rs:230-280, namespace.rs:59-94}
 C10 feat(traversal): Unordered 调度器（worker LIFO + 窃最浅 + 全局计数，内部通道按页），设为默认
