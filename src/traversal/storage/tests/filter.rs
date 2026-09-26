@@ -270,7 +270,7 @@ async fn max_depth_lists_only_admitted_levels() {
     assert_eq!(
         paths,
         [
-            "keep", "drop", "top", "keep/a", "keep/b", "drop/x", "drop/y"
+            "keep", "drop", "top", "drop/x", "drop/y", "keep/a", "keep/b"
         ]
     );
     // The root is listed first; its two subdirectories may be listed in either order.
@@ -488,7 +488,8 @@ async fn candidate_paths_are_relative_to_the_traversal_root() {
 }
 
 /// Output is depth-first by blocks: one directory's children together, in listing order, then
-/// each descended subdirectory's block in turn.
+/// each descended subdirectory's block in turn, by name (`drop` before `keep`, although `keep`
+/// was listed first).
 #[tokio::test]
 async fn output_is_depth_first_in_listing_order_blocks() {
     let namespace = Arc::new(TreeNamespace::new());
@@ -502,7 +503,7 @@ async fn output_is_depth_first_in_listing_order_blocks() {
     assert_eq!(
         paths,
         [
-            "keep", "drop", "top", "keep/a", "keep/b", "keep/b/c", "drop/x", "drop/y", "drop/y/z"
+            "keep", "drop", "top", "drop/x", "drop/y", "drop/y/z", "keep/a", "keep/b", "keep/b/c"
         ]
     );
 }

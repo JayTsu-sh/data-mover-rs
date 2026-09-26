@@ -182,7 +182,7 @@ async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
         StorageTraversalSource::with_roles(Arc::new(FakeNamespace), Arc::new(FakeMetadata));
     let mut session = source.traverse(
         TraversalRequest::new(StoragePath::root())
-            .order(crate::traversal::TraversalOrder::Admission)
+            .order(crate::traversal::TraversalOrder::Blocks)
             .max_inflight_operations(
                 NonZeroUsize::new(2).unwrap_or_else(|| unreachable!("constant is nonzero")),
             )
@@ -229,7 +229,7 @@ async fn recursively_traverses_roles_with_stable_order_and_symlink_target() {
 /// (all-`Omit`) plan the traversal builds observations locally and never calls it.
 fn request(cancel: tokio_util::sync::CancellationToken) -> TraversalRequest {
     TraversalRequest::new(StoragePath::root())
-        .order(crate::traversal::TraversalOrder::Admission)
+        .order(crate::traversal::TraversalOrder::Blocks)
         .max_inflight_operations(
             NonZeroUsize::new(2).unwrap_or_else(|| unreachable!("constant is nonzero")),
         )
@@ -490,4 +490,6 @@ mod pages;
 mod prefetch;
 mod residency;
 mod slots;
+mod streaming;
+mod streaming_bounds;
 mod vanish;

@@ -375,12 +375,11 @@ async fn a_modified_filter_uses_the_listing_times() -> TestResult {
     Ok(())
 }
 
-/// Sorted by name, a name can repeat: the object `a` with forty versions and the prefix `a/`.
-/// The versions keep their order (oldest first) and the object precedes the directory, although
-/// the listing put the directory after `a-39`. Forty ties are well past the length below which an
-/// unstable sort happens to keep them.
+/// A name can repeat: the object `a` with forty versions and the prefix `a/`. A block is in
+/// listing order (P7 C4, no sibling sort), so the key's versions stay contiguous and oldest first
+/// as the listing gave them, and the prefix `a` stays where S3's key order put it, after `a-39`.
 #[tokio::test]
-async fn name_order_keeps_repeated_names_in_a_defined_order() -> TestResult {
+async fn a_repeated_name_keeps_the_listing_order() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     protocol.set_versioning(Versioning::Enabled);
     for _ in 0..40 {
@@ -391,16 +390,16 @@ async fn name_order_keeps_repeated_names_in_a_defined_order() -> TestResult {
         put(&protocol, &format!("a-{index:02}"), b"1").await?;
     }
     put(&protocol, "a/x", b"1").await?;
-    let mut sorted = request(TraversalVersions::All);
-    sorted.order = TraversalOrder::NameBytes;
-    sorted.max_depth = Some(limit(1));
-    let (items, _) = traverse(&protocol, sorted).await?;
+    let mut blocks = request(TraversalVersions::All);
+    blocks.order = TraversalOrder::Blocks;
+    blocks.max_depth = Some(limit(1));
+    let (items, _) = traverse(&protocol, blocks).await?;
     let mut expected: Vec<String> = (1..=40)
         .map(|n| format!("a File v{n:04}{}", if n == 40 { " L" } else { "" }))
         .collect();
-    expected.push("a Directory".into());
     expected.push("a! File v0041 L".into());
     expected.extend((0..40).map(|index| format!("a-{index:02} File v{:04} L", 42 + index)));
+    expected.push("a Directory".into());
     let got: Vec<String> = items
         .iter()
         .filter(|item| matches!(item, TraversalItem::Entry(_)))

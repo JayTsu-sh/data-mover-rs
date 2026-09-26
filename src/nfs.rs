@@ -4647,10 +4647,10 @@ impl NFSStorage {
     /// failing for as long as the cache entry lived (two hours for a shallow path).
     ///
     /// Entries keep the order the server sent them in. The traversal contract deliberately does
-    /// not constrain sibling order, and a caller that needs one asks for `TraversalOrder`, which
-    /// sorts in the cursor. Sorting here bought nothing: it cost an `O(n log n)` pass per
-    /// directory, and it was the reason this backend looked ordered while the CIFS and Local
-    /// namespaces, which do not sort, did not.
+    /// not constrain sibling order (`TraversalOrder::Blocks` keeps a block in listing order and
+    /// sorts only the descent, in the cursor). Sorting here bought nothing: it cost an
+    /// `O(n log n)` pass per directory, and it was the reason this backend looked ordered while
+    /// the CIFS and Local namespaces, which do not sort, did not.
     pub(crate) async fn list_role_entries(
         &self,
         relative_path: &Path,

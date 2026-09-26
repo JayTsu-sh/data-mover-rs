@@ -318,15 +318,22 @@ await the session completion and receive `Ok(TraversalCompletion)` before commit
 generation or enabling deletion. Paging and backend concurrency are hidden in the traversal
 implementation.
 
-The default `Admission` order is depth-first by blocks: all children of one listed directory,
-in the order the backend listed them, then the block of each subdirectory descended into, in the
-same order, recursively. A directory's children therefore always follow the directory, and one
-listing's children are contiguous. Directory listings are prefetched concurrently ahead of the
-admission point (deepest first): at most `min(max_inflight_operations, 64)` listings are in
-flight, separate from the observation window, and at most twice that many listings, in flight
-and finished together, wait for the admission point. Memory is therefore bounded by
-depth × fan-out for the pending path plus those listings (each a whole directory), never by the
-width of a tree level.
+The `Blocks` order (P7 C4; the only order until `Unordered` arrives) is depth-first by blocks:
+all children of one listed directory, in the order the backend listed them, then the directory's
+`DirectoryListed`, then the block of each subdirectory, descended into in the raw UTF-8 byte order
+of their names, recursively. A directory's children therefore always follow the directory, one
+listing's children are contiguous, and the order directories are visited in is the same on every
+backend; only the order inside a block is the backend's. A block is consumed page by page as its
+listing streams, and it closes — and its subdirectories are sorted and descended into — only once
+the listing has ended. Directory listings are prefetched concurrently ahead of the admission point
+(deepest first): at most `min(max_inflight_operations, 64)` listings wait for a page at once,
+separate from the observation window, and at most twice that many started listings wait for the
+admission point, each stopped once it has handed over its first page. The traversal holds a few
+pages of each open listing however large its directory, so its memory is bounded by those pages
+plus the subdirectories still to descend into, never by the width of a directory; until each
+backend streams its listing for real (P7 C5–C9), the backend's own producer still reads the
+whole directory before the first page. A listing that fails after returning children
+is `Interrupted`, its failure carrying how many it returned (`delivered`).
 A session failure reported by a prefetched listing ends the traversal as soon as it arrives,
 including before entries admitted ahead of it have been delivered. Listings and observations may finish out of order, but
 cannot change delivery order: sequence numbers are assigned only in admission order. Both the
@@ -344,12 +351,12 @@ concurrent writes share; a key whose listing fails the order checks is ordered b
 I/O with an `Unsupported` session failure (`StorageTraversalSource::supports_versions()` asks
 first); it never returns current entries in place of versions. Both modes hide `.data-mover-*`
 names. On S3 a name can repeat in one directory — the object `a` beside the prefix `a/`, and in
-`All` one child per version — so `NameBytes` orders ties: the object before the directory (S3's own
-key order), versions oldest first; the merge key is `(parent, name, kind, version position)`. The
+`All` one child per version — and a block keeps them in listing order, a key's versions
+contiguous, oldest first; only the prefix is descended into. The
 optional metadata of a version entry is observed bound to that version, and a prefix or a delete
-marker asks the metadata role nothing. S3 listings (per directory, all pages collected before the
-block is built) cost at least one request per directory and hold a whole directory in memory, as
-every backend's listing does until streaming listings (traversal plan P7). S3 has no directories:
+marker asks the metadata role nothing. S3 listings cost at least one request per directory; the
+S3 backend still reads a whole directory before handing over its first page, until its own
+streaming listing (traversal plan P7 C6). S3 has no directories:
 a traversal rooted at a prefix under which nothing is stored fails the root's listing (`NotFound`)
 rather than completing as an empty, exhaustive source.
 

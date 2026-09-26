@@ -158,10 +158,11 @@ async fn every_listed_child_is_counted_once() {
             "entry locked",
             "failure child bad",
             "listed <root> Complete listed=8 emitted=5 filtered=1 failed=2 hidden=2 pruned=1",
-            "entry hide/x",
-            "listed hide Complete listed=2 emitted=1 filtered=1",
+            // Descended in name order, not listing order: `deep` < `hide` < `locked`.
             "entry deep/sub",
             "listed deep Complete listed=1 emitted=1 truncated=1",
+            "entry hide/x",
+            "listed hide Complete listed=2 emitted=1 filtered=1",
             "failure listing locked",
             "listed locked Unreadable listed=0 emitted=0",
         ]

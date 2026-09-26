@@ -201,11 +201,11 @@ async fn every_item(
 /// The same tree, once with every timestamp in the listing (files and directories observed in
 /// the listing's task, symlinks still reading their target) and once with none (every child
 /// observed through the metadata role), must give the same items, entry for entry and marker
-/// for marker, in both orders, under a filter that defers on `modified` and without one, and
-/// whatever the admission window.
+/// for marker, under a filter that defers on `modified` and without one, and whatever the
+/// admission window.
 #[tokio::test]
 async fn children_observed_in_the_listing_task_are_indistinguishable_from_role_observed_ones() {
-    for order in [TraversalOrder::Admission, TraversalOrder::NameBytes] {
+    for order in [TraversalOrder::Blocks] {
         for filtered in [false, true] {
             for window in [1, 3, 64] {
                 let request = mixed_request(order, window, filtered);
@@ -223,7 +223,7 @@ async fn children_observed_in_the_listing_task_are_indistinguishable_from_role_o
 /// Under the default plan nothing but listings reaches the backend, and no child costs a task.
 #[tokio::test]
 async fn children_needing_no_io_start_no_observation_task() {
-    let mut request = mixed_request(TraversalOrder::Admission, 8, false);
+    let mut request = mixed_request(TraversalOrder::Blocks, 8, false);
     request.observation_plan = ObservationPlan::default();
     let (source, observers) = StorageTraversalSource::with_roles_counting(
         // No symlinks in this tree: a symlink's target is always a read.
@@ -248,7 +248,7 @@ async fn children_needing_no_io_start_no_observation_task() {
 #[tokio::test]
 async fn children_needing_io_cost_one_task_per_block() {
     let (items, outcome, observers) =
-        every_item(false, mixed_request(TraversalOrder::Admission, 64, false)).await;
+        every_item(false, mixed_request(TraversalOrder::Blocks, 64, false)).await;
     let TraversalOutcome::Completed(completion) = outcome else {
         panic!("{outcome:?}")
     };
@@ -284,7 +284,7 @@ async fn finished_observation_tasks_do_not_accumulate() {
         }),
         Arc::new(TimesMetadata::default()),
     );
-    let mut request = mixed_request(TraversalOrder::Admission, 64, false);
+    let mut request = mixed_request(TraversalOrder::Blocks, 64, false);
     request.observation_plan = ObservationPlan::default();
     let mut session = source.traverse(request);
     let mut links = 0;
@@ -359,7 +359,7 @@ async fn a_filter_needing_modified_decides_at_once_when_the_listing_carries_it()
             }),
             Arc::clone(&metadata) as Arc<dyn Metadata>,
         );
-        let mut session = source.traverse(mixed_request(TraversalOrder::Admission, 8, true));
+        let mut session = source.traverse(mixed_request(TraversalOrder::Blocks, 8, true));
         while session.next_item().await.is_some() {}
         assert!(matches!(
             session.finish().await,
@@ -386,7 +386,7 @@ async fn an_observation_failing_in_the_listing_task_still_lists_the_directory_in
         Arc::new(OversizedFact),
         Arc::new(TimesMetadata::default()),
     );
-    let mut request = mixed_request(TraversalOrder::Admission, 4, true);
+    let mut request = mixed_request(TraversalOrder::Blocks, 4, true);
     request.filter = Some(Arc::new(EveryModified));
     let mut session = source.traverse(request);
     let (mut listed, mut failures, mut entries) = (Vec::new(), Vec::new(), Vec::new());

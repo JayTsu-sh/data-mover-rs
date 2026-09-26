@@ -4,7 +4,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinSet;
 
 use super::{
     ScanFailure, TraversalCandidate, TraversalCompletion, TraversalDecision, TraversalFilter,
@@ -16,8 +15,8 @@ use crate::model::{
     ObservationPlan, ObservedEntry, Operation, StoragePath, Transience,
 };
 use crate::storage::{
-    CapabilityUnavailable, Metadata, Namespace, PreflightPolicy, SourceDescriptor, Storage,
-    StorageRoleFailure,
+    CapabilityUnavailable, DescentHint, Metadata, Namespace, PreflightPolicy, SourceDescriptor,
+    Storage, StorageRoleFailure,
 };
 
 mod cursor;
@@ -25,12 +24,14 @@ mod observe;
 mod output;
 #[cfg(test)]
 mod residency;
+mod stream;
 
-use cursor::{Arrival, Cursor, Decisions, Step};
+use cursor::{Cursor, Decisions, Step};
 use observe::{Feed, Job, Listed, Observations, Observed};
 use output::{BlockFacts, ChildDescent, ChildItem, Output, Settled};
 #[cfg(test)]
 use residency::ResidencyPeak;
+use stream::Arrivals;
 
 /// The driver's handle on the residency probe.
 ///
@@ -183,6 +184,19 @@ struct DirectoryWork {
     child_depth: usize,
     /// Whether the filter is still consulted for children (legacy `check_children`).
     filter_children: bool,
+    /// What the listing that returned this directory handed back with it, passed on to the
+    /// directory's own listing (P7 §12.7). `None` for the root.
+    hint: Option<DescentHint>,
+}
+
+impl DirectoryWork {
+    /// The same work carrying `hint`, unless it already carries one.
+    fn with_hint(mut self, hint: Option<DescentHint>) -> Self {
+        if self.hint.is_none() {
+            self.hint = hint;
+        }
+        self
+    }
 }
 
 /// Facts a deferred decision needs once the observation has settled. Deferral only happens
@@ -197,8 +211,6 @@ struct Deferred {
     /// request may descend into at all ([`awaits_slot`]).
     ticket: Option<u64>,
 }
-
-type ListingTask = JoinSet<(StoragePath, Arrival)>;
 
 /// Output sequencing: every admitted entry and every queued listing failure owns one sequence
 /// number, assigned in output order by the cursor. Allocation lives here; releasing the slots
@@ -298,13 +310,17 @@ async fn run(
     probe: Probe,
 ) {
     let mut state = State::new();
-    let mut cursor = Cursor::new(DirectoryWork {
-        path: request.root.clone(),
-        child_depth: 1,
-        filter_children: request.filter.is_some(),
-    });
+    let (sender, mut arrivals) = mpsc::unbounded_channel();
+    let mut cursor = Cursor::new(
+        DirectoryWork {
+            path: request.root.clone(),
+            child_depth: 1,
+            filter_children: request.filter.is_some(),
+            hint: None,
+        },
+        sender,
+    );
     let mut observations = Observations::new();
-    let mut listings = JoinSet::new();
     let shared = Arc::new(Shared {
         namespace,
         metadata,
@@ -321,7 +337,7 @@ async fn run(
     let result = drive(
         &runtime,
         &mut cursor,
-        &mut listings,
+        &mut arrivals,
         &mut observations,
         &mut state,
         &probe,
@@ -334,10 +350,12 @@ async fn run(
     // closes), and dropping the future there leaks it. Detached operations run to completion in
     // the background and close what they opened; their results are simply discarded, and both
     // sets are bounded by the request's budgets. Dropping the cursor drops every block's feed,
-    // which is what lets each observation task end once it has drained.
+    // which is what lets each observation task end once it has drained; dropping the arrivals
+    // tells every listing's task the traversal is gone, and each drops its stream, which ends
+    // the backend's producer through its own close path.
     observations.detach();
-    listings.detach_all();
     drop(cursor);
+    drop(arrivals);
     drop(items);
     let request = &shared.request;
     let terminal = if request.cancel.is_cancelled() {
@@ -354,7 +372,7 @@ async fn run(
 async fn drive(
     runtime: &Runtime<'_>,
     cursor: &mut Cursor,
-    listings: &mut ListingTask,
+    arrivals: &mut Arrivals,
     observations: &mut Observations,
     state: &mut State,
     probe: &Probe,
@@ -366,12 +384,12 @@ async fn drive(
         if runtime.request.cancel.is_cancelled() {
             return Ok(());
         }
-        // Takes every listing that finished meanwhile, not only the one the cursor may be
-        // waiting for: a prefetched directory's subdirectories are only known, and prefetched in
-        // turn, once its block has been taken from its task.
-        while let Some(joined) = listings.try_join_next() {
-            let (path, arrival) = joined.map_err(|_| TraversalTerminalFailure::Internal)?;
-            cursor.listed(&path, arrival)?;
+        // Takes every page that arrived meanwhile, not only one the cursor may be waiting for:
+        // a prefetched directory's subdirectories are only known, and prefetched in turn, once
+        // its pages have been taken from its task. Bounded: each listing hands over at most one
+        // page per page the cursor took, and one end.
+        while let Ok((id, arrival)) = arrivals.try_recv() {
+            cursor.listed(id, arrival)?;
         }
         // A listing ends `Cancelled` only once the token fired (the request carries it), so
         // checking again here keeps such a listing from being admitted as a failure (R10).
@@ -379,7 +397,7 @@ async fn drive(
             return Ok(());
         }
         let step = cursor.advance(runtime, observations, state)?;
-        cursor.start_listings(runtime, listings);
+        cursor.start_listings(runtime);
         // After `start_listings`, so the listings it just began count towards the peak; before
         // `flush`, so the sample is taken while the block is still held rather than after the
         // reorder buffer has drained it.
@@ -393,27 +411,27 @@ async fn drive(
             // Nothing in flight means every admitted entry has settled, so the flush above
             // emitted them all and the window is open again.
             Step::WindowFull if observations.is_idle() => {}
-            _ => wait(runtime, cursor, listings, observations, state).await?,
+            _ => wait(runtime, cursor, arrivals, observations, state).await?,
         }
     }
 }
 
-/// Waits for one listing or some observations to finish, or for cancellation. Observations that
-/// arrived together are settled together, so a burst costs the driver one pass.
+/// Waits for a listing's next page or end, or some observations to finish, or for
+/// cancellation. Observations that arrived together are settled together, so a burst costs the
+/// driver one pass.
 async fn wait(
     runtime: &Runtime<'_>,
     cursor: &mut Cursor,
-    listings: &mut ListingTask,
+    arrivals: &mut Arrivals,
     observations: &mut Observations,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
+    let listening = cursor.has_live_listings();
     tokio::select! {
         biased;
         () = runtime.request.cancel.cancelled() => Ok(()),
-        Some(joined) = listings.join_next(), if !listings.is_empty() => {
-            let (path, arrival) = joined.map_err(|_| TraversalTerminalFailure::Internal)?;
-            cursor.listed(&path, arrival)
-        }
+        // The cursor keeps a sender, so the channel never closes while it waits.
+        Some((id, arrival)) = arrivals.recv(), if listening => cursor.listed(id, arrival),
         observed = observations.next(), if !observations.is_idle() => {
             settle(runtime, cursor.decisions(), state, observed?)?;
             while let Some(observed) = observations.ready() {
@@ -430,7 +448,7 @@ async fn wait(
 ///
 /// `None` means the filter needs `modified` and still applies below `parent`, so the decision
 /// is made from the child's observation instead: at once in the listing's task when that needed
-/// no I/O, otherwise once it settles. Made once per child, when the listing arrives, so that a
+/// no I/O, otherwise once it settles. Made once per child, when its page arrives, so that a
 /// prefetched directory's subdirectories are known before the cursor reaches it.
 fn immediate_decision(
     shared: &Shared,
@@ -459,12 +477,12 @@ fn immediate_decision(
 fn admit(
     runtime: &Runtime<'_>,
     feed: &mut Option<Feed>,
-    child: cursor::Child,
+    child: stream::Child,
     decisions: &mut Decisions,
     observations: &mut Observations,
     state: &mut State,
 ) -> Result<(), TraversalTerminalFailure> {
-    let cursor::Child { listed, deferred } = child;
+    let stream::Child { listed, deferred } = child;
     let sequence = state.allocate()?;
     match listed {
         Listed::Observed(result) => settle(runtime, decisions, state, (sequence, result, deferred)),
@@ -516,6 +534,7 @@ fn descend_outcome(
         path: path.clone(),
         child_depth: depth.saturating_add(1),
         filter_children: decision.filter_children,
+        hint: None,
     })
 }
 
@@ -590,6 +609,7 @@ fn settle_failure(
             path: error.path().clone(),
             child_depth: deferred.depth.saturating_add(1),
             filter_children: true,
+            hint: None,
         });
     (
         ChildItem::Item(TraversalItem::Failure(Box::new(ScanFailure::child(error)))),
@@ -625,6 +645,7 @@ fn settle_entry(
         path: entry.path().clone(),
         child_depth: deferred.depth.saturating_add(1),
         filter_children: decision.filter_children,
+        hint: None,
     });
     let item = if decision.emit {
         ChildItem::Item(TraversalItem::Entry(entry))

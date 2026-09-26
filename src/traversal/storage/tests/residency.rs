@@ -127,7 +127,7 @@ impl TraversalFilter for KeepAll {
 
 fn probed_request(root: &str, window: usize) -> TraversalRequest {
     TraversalRequest::new(path(root))
-        .order(crate::traversal::TraversalOrder::Admission)
+        .order(crate::traversal::TraversalOrder::Blocks)
         .max_inflight_operations(
             NonZeroUsize::new(window)
                 .unwrap_or_else(|| unreachable!("callers pass a nonzero window")),
@@ -158,6 +158,8 @@ async fn peak_of(
 const FAN_OUT: usize = 2_000;
 
 /// Files live in the block and never in the descend set, so bounding the block bounds them.
+/// This fixture hands its directory over as one page, so that page is resident whole; how many
+/// pages of a paged listing are held at once is pinned in `streaming.rs`.
 #[tokio::test]
 async fn files_are_held_as_block_children_only() {
     let peak = peak_of(
@@ -169,8 +171,8 @@ async fn files_are_held_as_block_children_only() {
         probed_request("wide", 4),
     )
     .await;
-    // Scales with the number of entries, not with the window: the whole listing is resident
-    // bar the handful already admitted when the sample was taken.
+    // Scales with the page, not with the window: the one page is resident bar the handful
+    // already admitted when the sample was taken.
     assert!(peak.block_children > FAN_OUT / 2, "{peak:?}");
     assert_eq!(peak.descend_slots, 0, "{peak:?}");
 }
@@ -191,14 +193,14 @@ async fn subdirectories_are_held_as_descend_slots() {
     assert_eq!(peak.descend_slots, FAN_OUT, "{peak:?}");
 }
 
-/// The sample covers the whole stack, not its top: every frame on the path from the root keeps
-/// its own remaining children, so a chain holds one block per level at once.
-/// Depth is not a multiplier on what is pending: a block is admitted in full before the cursor
-/// descends, so only the top frame ever has children waiting and only it has a slot left to
-/// consume. Ancestor frames keep their queue's *room* though, which is why capacity is counted
-/// apart — a chain of wide levels holds one widest-block allocation per level until it unwinds.
+/// The sample covers the whole stack, not its top. Depth is not a multiplier on what is pending:
+/// a block is admitted in full, and its listing has ended, before the cursor descends, so only
+/// the top frame ever has children waiting and only it has a slot left to consume. Nor on the
+/// room held: a closed block releases its queue's allocation, so the room is what the top frame
+/// and the prefetched listings hold (at most `2P` of them), whatever the depth. Before P7 C4 an
+/// ancestor kept its widest block's room until it unwound.
 #[tokio::test]
-async fn depth_multiplies_retained_room_but_not_pending_children() {
+async fn depth_multiplies_neither_pending_children_nor_retained_room() {
     let (depth, fan_out) = (32, 8);
     let peak = peak_of(
         Arc::new(DeepNamespace { depth, fan_out }),
@@ -215,9 +217,11 @@ async fn depth_multiplies_retained_room_but_not_pending_children() {
         peak.descend_slots <= depth,
         "slots grew faster than the depth: {peak:?}"
     );
+    // The top frame's page and up to `2P` prefetched pages, `P` being the window of 4 — well
+    // below one page per level of the 32.
     assert!(
-        peak.block_capacity > 4 * (fan_out + 1),
-        "ancestor frames released their room: {peak:?}"
+        peak.block_capacity <= (2 * 4 + 1) * (fan_out + 1),
+        "ancestor frames kept their room: {peak:?}"
     );
 }
 

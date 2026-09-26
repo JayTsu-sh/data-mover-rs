@@ -514,11 +514,9 @@ impl<'a> Block<'a> {
         let Some(path) = self.child_path(key, name)? else {
             return Ok(());
         };
-        for (rank, entry) in history.entries.iter().enumerate() {
-            let rank = u32::try_from(rank).unwrap_or(u32::MAX);
+        for entry in &history.entries {
             let listed = Listed {
                 entry,
-                rank,
                 order: history.order,
             };
             let descriptor = version_descriptor(self.identity, path.clone(), &listed)?;
@@ -612,11 +610,10 @@ pub(super) fn file_descriptor(
     Ok(descriptor)
 }
 
-/// One entry of a key's history: `rank` its place oldest first, `order` where that came from.
+/// One entry of a key's history, and where the history's order came from.
 #[derive(Clone, Copy)]
 struct Listed<'a> {
     entry: &'a S3ListedVersion,
-    rank: u32,
     order: HistoryOrder,
 }
 
@@ -625,7 +622,7 @@ fn version_descriptor(
     path: StoragePath,
     listed: &Listed<'_>,
 ) -> Result<SourceDescriptor, EntryOperationFailure> {
-    let Listed { entry, rank, order } = *listed;
+    let Listed { entry, order } = *listed;
     let facts = &entry.facts;
     let version = EntryVersion::from_listing(
         &facts.version_id,
@@ -653,7 +650,6 @@ fn version_descriptor(
     descriptor.listing = ListingFacts {
         listing_only: facts.delete_marker,
         version: Some(Box::new(version)),
-        rank,
     };
     Ok(descriptor)
 }

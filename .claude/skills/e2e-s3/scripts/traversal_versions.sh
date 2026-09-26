@@ -13,7 +13,7 @@
 #
 # Checks: All lists k as 2, 3, marker, 4 with only the last latest, gone as a version and a latest
 # marker, p/z as 1, 2, 3, n as version=null latest=1, no artifact; Current lists k (4 B) without
-# gone; --order name-bytes gives the same lines at concurrency 1, 4 and 32.
+# gone; --order blocks gives the same lines at concurrency 1, 4 and 32.
 #
 # Also: whether the server honours `delimiter` on ListObjectVersions (raw request, printed), and the
 # legacy walkdir / walkdir_2 (examples/s3_listing, versioning re-enabled first: a suspended bucket
@@ -123,12 +123,12 @@ traverse() { # concurrency, args...
 }
 traverse 8 --versions all >"$WORK/all" || FAILED=1
 traverse 8 --versions current >"$WORK/current" || FAILED=1
-for c in 1 4 32; do traverse "$c" --versions all --order name-bytes >"$WORK/sorted-$c" || FAILED=1; done
+for c in 1 4 32; do traverse "$c" --versions all --order blocks >"$WORK/blocks-$c" || FAILED=1; done
 echo "-- all (without p/a*)"; grep -v ' p/a' "$WORK/all"
 echo "-- current (without p/a*)"; grep -v ' p/a' "$WORK/current"
-cmp -s "$WORK/sorted-1" "$WORK/sorted-4" && cmp -s "$WORK/sorted-1" "$WORK/sorted-32" \
-  && echo "name-bytes: identical at concurrency 1, 4, 32 ($(wc -l <"$WORK/sorted-1") lines)" \
-  || { echo "name-bytes: output differs between concurrency levels"; FAILED=1; }
+cmp -s "$WORK/blocks-1" "$WORK/blocks-4" && cmp -s "$WORK/blocks-1" "$WORK/blocks-32" \
+  && echo "blocks: identical at concurrency 1, 4, 32 ($(wc -l <"$WORK/blocks-1") lines)" \
+  || { echo "blocks: output differs between concurrency levels"; FAILED=1; }
 python3 - "$WORK/all" "$WORK/current" <<'PY' || FAILED=1
 import re, sys
 def rows(path, name):

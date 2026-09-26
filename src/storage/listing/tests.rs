@@ -329,6 +329,41 @@ async fn a_producer_that_panics_ends_the_stream_with_an_internal_failure() {
     );
 }
 
+/// A producer's clean return needs no channel slot of its own: once a one-page listing's page has
+/// been received, its end is already there — a consumer looking without waiting sees it, so a
+/// traversal takes the page and the end in one wake-up. (An `End` message would still be waiting
+/// for the slot the page just freed.) A producer that panics after the same page is still an
+/// `Internal` failure, never an end.
+#[tokio::test]
+async fn a_finished_producers_end_is_there_with_its_last_page() {
+    let mut stream = ListingStream::from_producer(path("d"), |sink| async move {
+        let _ = sink
+            .send(ListingPage::new(vec![child("a")], Vec::new(), 0))
+            .await;
+    });
+    assert!(matches!(stream.next().await, Some(Ok(_))));
+    assert!(
+        matches!(stream.next().now_or_never(), Some(None)),
+        "the end was not there with the last page"
+    );
+
+    let mut broken = ListingStream::from_producer(path("d"), |sink| async move {
+        let _ = sink
+            .send(ListingPage::new(vec![child("a")], Vec::new(), 0))
+            .await;
+        panic!("producer failure injected by the test");
+    });
+    assert!(matches!(broken.next().await, Some(Ok(_))));
+    assert!(
+        matches!(
+            broken.next().now_or_never(),
+            Some(Some(Err(StorageRoleFailure::Entry(ref failure))))
+                if failure.class() == FailureClass::Internal
+        ),
+        "a producer that panicked read as a finished listing"
+    );
+}
+
 /// A stateless listing abandons the request in flight at cancellation, and when its stream is
 /// dropped.
 #[tokio::test]

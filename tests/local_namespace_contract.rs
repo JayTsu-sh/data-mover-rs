@@ -236,64 +236,84 @@ async fn directories_are_listed_as_directories_not_files() -> Result {
     Ok(())
 }
 
-/// The ordered contract as a caller outside the crate sees it: the sequence is asserted without
-/// sorting it first, and each directory's event has to be readable from here at all.
+/// The block contract as a caller outside the crate sees it (`TraversalOrder::Blocks`, P7 §3),
+/// asserted on the unsorted sequence, each directory's event readable from here:
 ///
-/// The three claims this pins, all on one tree:
-///
-/// * `B.txt` comes before `a`, because `0x42 < 0x61`. Every case-insensitive order puts `a`
-///   first, so this is the assertion that says "raw bytes, not a collation".
-/// * `a` (a directory), `a.txt` (a file) and `a/x.txt` arrive in that order. Both `a` and
-///   `a.txt` are the root's children, so both precede everything under `a`: blocks do not
-///   interleave. The key to compare by is therefore `(parent, name)` — comparing whole paths
-///   one component at a time would have put `a/x.txt` second.
-/// * The same tree read twice gives the same sequence, whatever the filesystem's own order is.
+/// * Every directory's children arrive together, before its `DirectoryListed`, in whatever order
+///   the filesystem listed them — so each block is compared as a set.
+/// * Subdirectories are descended into by raw name bytes: `Zoo` before `a` before `bar`, because
+///   `0x5A < 0x61`. Every case-insensitive order puts `a` first, so this is the assertion that
+///   says "raw bytes, not a collation".
+/// * `a` (a directory) and `a.txt` (a file) are both in the root's block, so both precede
+///   `a/x.txt`: blocks do not interleave, and the key to compare by is `(parent, name)`.
+/// * The same tree read twice visits its directories in the same order.
 #[tokio::test]
-async fn name_bytes_order_is_the_same_sequence_for_a_caller_outside_the_crate() -> Result {
+async fn blocks_are_contiguous_and_descended_by_name_for_a_caller_outside_the_crate() -> Result {
     let temp = tempfile::tempdir()?;
     seed_for_ordering(temp.path())?;
     let storage = connect(temp.path()).await?;
     let source = StorageTraversalSource::new(&storage)?;
-    let mut session = source.traverse(
-        TraversalRequest::new(path("ordered")?)
-            .order(TraversalOrder::NameBytes)
-            .max_inflight_operations(nonzero(4)?)
-            .max_buffered_items(nonzero(4)?)
-            .cancel(CancellationToken::new()),
-    );
-    let mut paths = Vec::new();
-    let mut listed = Vec::new();
-    while let Some(item) = session.next_item().await {
-        match item {
-            TraversalItem::Entry(entry) => paths.push(entry.path().as_str().to_owned()),
-            TraversalItem::DirectoryListed(directory) => {
-                assert_eq!(
-                    directory.outcome,
-                    ListingOutcome::Complete,
-                    "{}",
-                    directory.path
-                );
-                assert!(directory.counts.is_balanced(), "{directory:?}");
-                listed.push(directory.path.as_str().to_owned());
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let mut session = source.traverse(
+            TraversalRequest::new(path("ordered")?)
+                .order(TraversalOrder::Blocks)
+                .max_inflight_operations(nonzero(4)?)
+                .max_buffered_items(nonzero(4)?)
+                .cancel(CancellationToken::new()),
+        );
+        let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
+        let mut block = Vec::new();
+        while let Some(item) = session.next_item().await {
+            match item {
+                TraversalItem::Entry(entry) => block.push(entry.path().as_str().to_owned()),
+                TraversalItem::DirectoryListed(directory) => {
+                    assert_eq!(
+                        directory.outcome,
+                        ListingOutcome::Complete,
+                        "{}",
+                        directory.path
+                    );
+                    assert!(directory.counts.is_balanced(), "{directory:?}");
+                    block.sort();
+                    blocks.push((
+                        directory.path.as_str().to_owned(),
+                        std::mem::take(&mut block),
+                    ));
+                }
+                other => return Err(format!("unexpected failure item: {other:?}").into()),
             }
-            other => return Err(format!("unexpected failure item: {other:?}").into()),
         }
+        assert!(block.is_empty(), "entries after the last block: {block:?}");
+        runs.push(blocks);
     }
+    let block = |directory: &str, entries: &[&str]| {
+        (
+            directory.to_owned(),
+            entries
+                .iter()
+                .map(|entry| (*entry).to_owned())
+                .collect::<Vec<_>>(),
+        )
+    };
     assert_eq!(
-        paths,
+        runs[0],
         [
-            "ordered/B.txt",
-            "ordered/Zoo",
-            "ordered/a",
-            "ordered/a.txt",
-            "ordered/bar",
-            "ordered/a/x.txt",
-            "ordered/bar/y.txt",
+            block(
+                "ordered",
+                &[
+                    "ordered/B.txt",
+                    "ordered/Zoo",
+                    "ordered/a",
+                    "ordered/a.txt",
+                    "ordered/bar",
+                ],
+            ),
+            block("ordered/Zoo", &[]),
+            block("ordered/a", &["ordered/a/x.txt"]),
+            block("ordered/bar", &["ordered/bar/y.txt"]),
         ]
     );
-    assert_eq!(
-        listed,
-        ["ordered", "ordered/Zoo", "ordered/a", "ordered/bar"]
-    );
+    assert_eq!(runs[0], runs[1]);
     Ok(())
 }

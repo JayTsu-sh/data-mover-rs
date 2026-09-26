@@ -26,45 +26,40 @@ mod local_tests;
 #[cfg(test)]
 mod s3_tests;
 
-/// Traversal output order. Concurrent completion never changes admission order.
+/// How a traversal orders what it delivers (P7 §3). Concurrent completion never changes it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum TraversalOrder {
-    /// Each directory's children arrive in the order its backend listed them, so two backends
-    /// can deliver the same tree in two different orders.
+    /// Depth-first by *blocks*. A block is every direct child of one listed directory, delivered
+    /// contiguously **in the order the backend listed them** — not sorted — followed by the
+    /// directory's [`TraversalItem::DirectoryListed`] (an empty directory has one too). Once a
+    /// block is closed, the directory's subdirectories are descended into in the **raw UTF-8 byte
+    /// order of their names**, each contributing its own block, recursively.
+    ///
+    /// What this makes deterministic is the order *directories* are visited in: the same on
+    /// every backend, so two traversals of the same tree on two backends advance directory by
+    /// directory in step, and how far one can drift ahead of the other is bounded. Within a block
+    /// the order is the backend's own and may differ between backends and between runs; a
+    /// consumer comparing two sides matches one directory's children by name (a hash map of one
+    /// block), and concludes that a child is missing on one side only once **both** sides have
+    /// delivered that directory's `DirectoryListed`.
+    ///
+    /// Blocks never interleave: every child of a directory precedes every grandchild. So `a` (a
+    /// directory holding `a/x`) and `a.txt` both arrive before `a/x`; the order is not a
+    /// depth-first preorder over paths, and a consumer keys by `(parent directory, name)`, never
+    /// by comparing whole paths.
+    ///
+    /// The descent order is over raw UTF-8 bytes and is **no server's collation**: a
+    /// case-insensitive share would sort `README` next to `readme`, this does not (`B` < `a`).
+    /// On S3 a name can repeat within one directory — an object `a` and the prefix `a/` are both
+    /// the child `a` — which only the prefix is descended into.
+    ///
+    /// A block is read a page at a time: its first entries are delivered once its first page is
+    /// listed, and what the traversal holds of one directory is a few pages, however large the
+    /// directory. Only the subdirectories still to descend into are remembered whole (one slot
+    /// each), because the descent is sorted once the listing has ended.
     #[default]
-    Admission,
-    /// Each directory's children arrive sorted by the bytes of their final path component, and
-    /// its subdirectories are descended into in that same order. Together with the block order
-    /// every traversal already keeps, that makes the stream a total order the same tree produces
-    /// on any backend, which is what two independently running traversals need to be compared by
-    /// a streaming two-pointer merge that holds nothing: a run of paths present on one side only
-    /// is a run of copies, or of deletions. The descent half of the guarantee is also what bounds
-    /// how far the two sides can drift, because it is what lets a consumer tell which side is
-    /// behind and stop reading from the other.
-    ///
-    /// **The key to compare by is `(parent directory, name)`, not the whole path.** Blocks do not
-    /// interleave: every child of one directory arrives before any grandchild, and directories
-    /// are visited in sorted depth-first order. So `a` (a directory holding `a/x`) and `a.txt`
-    /// arrive as `a`, `a.txt`, …, `a/x` — both are the root's children, so both precede anything
-    /// under `a`. Comparing whole paths one component at a time would put `a/x` second and
-    /// silently misalign the merge, which reads as "present at the destination, absent at the
-    /// source" and licenses a delete. Whole-path comparison agrees inside a single directory, so
-    /// a small tree can pass while the rule is already broken.
-    ///
-    /// The order is over raw UTF-8 bytes and is **no server's collation**: a case-insensitive
-    /// share sorts `README.md` next to `readme.md`, this does not, and such a destination cannot
-    /// hold both at once. Children the listing itself could not describe have no name to sort by
-    /// and stay ahead of the block, outside the order: the guarantee covers described children,
-    /// and two backends that fail to name the same two children may still put those two failures
-    /// in two different sequences. A merge that walks the stream literally has to skip them.
-    ///
-    /// **On S3 a name can repeat within one directory**: an object `a` and the prefix `a/` are
-    /// both the child `a`, and a traversal of every version ([`TraversalVersions::All`]) emits one
-    /// child per version of a key. Ties are ordered — the object before the directory (S3's own
-    /// key order, `a` < `a/`), and one key's versions oldest first — so the stream is still a
-    /// total order, and the full merge key is `(parent directory, name, kind, version position)`.
-    NameBytes,
+    Blocks,
 }
 
 /// Which entries a traversal emits for the objects of a versioned store (ADR-0006 C22).
@@ -160,7 +155,7 @@ pub trait TraversalFilter: fmt::Debug + Send + Sync {
 /// # use data_mover::model::StoragePath;
 /// # use data_mover::traversal::{TraversalOrder, TraversalRequest};
 /// let request = TraversalRequest::new(StoragePath::root())
-///     .order(TraversalOrder::NameBytes)
+///     .order(TraversalOrder::Blocks)
 ///     .max_depth(NonZeroUsize::new(3))
 ///     .max_inflight_operations(NonZeroUsize::MIN.saturating_add(63));
 /// assert_eq!(request.max_inflight_operations.get(), 64);

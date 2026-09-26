@@ -89,7 +89,7 @@ S3_PREFIX=test                   # bucket 内的子路径
    `d/e`、`sub/deep/f`、`p/a000..a998` 加三次 `p/z`（跨第一页 1000 条），再暂停版本写两次 `n`；用
    `storage_role_operations --backend s3 traverse --versions all|current`（`S3_LISTING_URL` 只在脚本环境里）列举并断言：
    All 的 `k` = 2 B、3 B、标记、4 B 只有最后一个 latest，`gone` = 版本 + latest 标记，`p/z` = 1、2、3 B，`n` =
-   `version=null latest=1`；Current 只有 `k`（4 B）没有 `gone`；无 artifact；`--order name-bytes` 并发 1 / 4 / 32 输出
+   `version=null latest=1`；Current 只有 `k`（4 B）没有 `gone`；无 artifact；`--order blocks` 并发 1 / 4 / 32 输出
    相同。另外直接发一次带 `delimiter` 的 ListObjectVersions（打印服务器是否按 delimiter 折叠），并用 `examples/s3_listing`
    跑 legacy `walkdir` / `walkdir_2`（先重新开版本：暂停版本的桶走 ListObjectsV2）：`k` 按写入的 id 列 v1、v2、标记、v3，
    `gone` 列版本再列 latest 标记（D4），`p/z` 跨页完整，无 artifact。

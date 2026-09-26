@@ -25,8 +25,8 @@ use crate::traversal::{
 
 /// Where one child's own subtree went.
 ///
-/// A decision made when the listing arrived is tallied by the listing's task and carried on the
-/// block's facts, because a child the filter hides never gets an output slot at all and would
+/// A decision made when the child's page arrived is tallied by the listing's task and carried on
+/// the block's facts, because a child the filter hides never gets an output slot at all and would
 /// otherwise be invisible here. A deferred decision is not known until the child's observation
 /// settles, so its slot carries the outcome and the tally happens as the slot is emitted instead.
 #[derive(Clone, Copy)]
@@ -54,6 +54,18 @@ pub(super) struct BlockFacts {
     pub(super) vanished: u64,
     /// The directory itself was gone when its listing began: its block is empty and complete.
     pub(super) vanished_listing: bool,
+}
+
+impl BlockFacts {
+    /// Adds one more page's facts to the block's.
+    pub(super) const fn absorb(&mut self, page: &Self) {
+        self.listed = self.listed.saturating_add(page.listed);
+        self.internal_hidden = self.internal_hidden.saturating_add(page.internal_hidden);
+        self.filtered = self.filtered.saturating_add(page.filtered);
+        self.pruned = self.pruned.saturating_add(page.pruned);
+        self.truncated = self.truncated.saturating_add(page.truncated);
+        self.vanished = self.vanished.saturating_add(page.vanished);
+    }
 }
 
 /// What one child's output slot holds.

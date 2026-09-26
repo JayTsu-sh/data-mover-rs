@@ -20,8 +20,9 @@ use crate::storage::{
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-/// One listed child: path, kind, and for a version (id or `null`, latest, marker, rank).
-type Row = (String, EntryKind, Option<(String, bool, bool, u32)>);
+/// One listed child: path, kind, and for a version (id or `null`, latest, marker). A key's
+/// versions are asserted in sequence, so their order (oldest first) is pinned by position.
+type Row = (String, EntryKind, Option<(String, bool, bool)>);
 
 fn path(value: &str) -> StoragePath {
     StoragePath::new(value).unwrap_or_else(|error| panic!("{error}"))
@@ -55,7 +56,6 @@ fn row(descriptor: &SourceDescriptor) -> Row {
             version.id().unwrap_or("null").to_string(),
             version.is_latest(),
             version.is_delete_marker(),
-            descriptor.listing.rank,
         )
     });
     (descriptor.path.to_string(), descriptor.kind, version)
@@ -95,11 +95,11 @@ fn dir(name: &str) -> Row {
     (name.to_string(), EntryKind::Directory, None)
 }
 
-fn version(name: &str, id: &str, latest: bool, marker: bool, rank: u32) -> Row {
+fn version(name: &str, id: &str, latest: bool, marker: bool) -> Row {
     (
         name.to_string(),
         EntryKind::File,
-        Some((id.to_string(), latest, marker, rank)),
+        Some((id.to_string(), latest, marker)),
     )
 }
 
@@ -229,15 +229,15 @@ async fn versioned_history() -> TestResult<Arc<MemoryS3>> {
 
 fn expected_history() -> Vec<Row> {
     vec![
-        version("gone", "v0005", false, false, 0),
-        version("gone", "v0006", true, true, 1),
-        version("k", "v0001", false, false, 0),
-        version("k", "v0002", false, false, 1),
-        version("k", "v0003", false, true, 2),
-        version("k", "v0004", true, false, 3),
-        version("z", "v0007", false, false, 0),
-        version("z", "v0008", false, false, 1),
-        version("z", "v0009", true, false, 2),
+        version("gone", "v0005", false, false),
+        version("gone", "v0006", true, true),
+        version("k", "v0001", false, false),
+        version("k", "v0002", false, false),
+        version("k", "v0003", false, true),
+        version("k", "v0004", true, false),
+        version("z", "v0007", false, false),
+        version("z", "v0008", false, false),
+        version("z", "v0009", true, false),
     ]
 }
 
@@ -339,7 +339,7 @@ async fn listed_versions_select_themselves_for_a_copy() -> TestResult {
 async fn the_null_version_selects_itself_for_a_copy() -> TestResult {
     let unversioned = bucket(&[("n", b"1")]).await?;
     let (rows, _) = listed(namespace(&unversioned)?.as_ref(), "", true).await?;
-    assert_eq!(rows, [version("n", "null", true, false, 0)]);
+    assert_eq!(rows, [version("n", "null", true, false)]);
 
     let suspended = Arc::new(MemoryS3::default());
     suspended.set_versioning(Versioning::Enabled);
@@ -606,8 +606,8 @@ async fn a_flat_version_listing_rolls_up_versions_and_markers() -> TestResult {
         assert_eq!(
             rows,
             [
-                version("d/x", "v0001", false, false, 0),
-                version("d/x", "v0002", true, false, 1),
+                version("d/x", "v0001", false, false),
+                version("d/x", "v0002", true, false),
                 dir("d/y"),
             ]
         );

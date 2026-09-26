@@ -12,7 +12,7 @@
 //! cargo run --example storage_role_operations -- traverse --backend local --root /tmp/tree \
 //!     --match 'name == "*.log"' --max-depth 2
 //! S3_LISTING_URL=s3://AK:SK@bucket.host:9000/prefix cargo run --example \
-//!     storage_role_operations -- --backend s3 traverse --versions all --order name-bytes
+//!     storage_role_operations -- --backend s3 traverse --versions all --order blocks
 //! cargo run --example storage_role_operations -- ndx-walk --backend cifs --path scratch \
 //!     --entries
 //! cargo run --example storage_role_operations -- delete-tree --backend cifs --path scratch/old
@@ -75,14 +75,13 @@ struct Args {
     command: Command,
 }
 
-/// How a traversal orders each directory's children and the descent into them.
+/// How a traversal orders what it delivers.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum OrderArg {
-    /// Whatever order the backend listed in, which differs between backends.
-    Admission,
-    /// Sorted by the bytes of the final path component, descent included, so the same tree
-    /// gives the same sequence on every backend.
-    NameBytes,
+    /// Each directory's children together in the order the backend listed them, then its
+    /// subdirectories descended into by name bytes, so the same tree visits its directories in
+    /// the same order on every backend.
+    Blocks,
 }
 
 /// Which entries a traversal emits for a versioned store.
@@ -106,8 +105,7 @@ impl From<VersionsArg> for TraversalVersions {
 impl From<OrderArg> for TraversalOrder {
     fn from(value: OrderArg) -> Self {
         match value {
-            OrderArg::Admission => Self::Admission,
-            OrderArg::NameBytes => Self::NameBytes,
+            OrderArg::Blocks => Self::Blocks,
         }
     }
 }
@@ -122,8 +120,8 @@ enum Command {
         exclude_expression: Option<String>,
         #[arg(long)]
         max_depth: Option<usize>,
-        /// Sibling and descent order.
-        #[arg(long, value_enum, default_value_t = OrderArg::Admission)]
+        /// Block and descent order.
+        #[arg(long, value_enum, default_value_t = OrderArg::Blocks)]
         order: OrderArg,
         /// Current objects only, or every stored version (S3).
         #[arg(long, value_enum, default_value_t = VersionsArg::Current)]

@@ -2,8 +2,8 @@
 //! consulting the metadata role only when the listing did not already supply what the plan asks.
 //!
 //! Most children need no I/O at all — nothing beyond what the listing carried was asked for —
-//! and those are observed by [`observe_listed`] inside the listing's own task, a whole block at
-//! a time, so the driver is woken once per listing rather than once per child. The rest (a
+//! and those are observed by [`observe_listed`] inside the listing's own task, a page at a time,
+//! so the driver is woken once per page rather than once per child. The rest (a
 //! symlink's target, metadata the listing did not carry) go to [`Observations`]: one task per
 //! block that has any, fed its children as the cursor admits them and running them concurrently.
 //! The admission window already bounds how many are admitted and not yet emitted, so it bounds

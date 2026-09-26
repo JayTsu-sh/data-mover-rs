@@ -49,8 +49,8 @@ pub use factory::{
 };
 pub use handle::Storage;
 pub use listing::{
-    ChildFailure, CollectLimits, ListRequest, ListedChild, ListingPage, ListingStream, PageSink,
-    collect_listing,
+    ChildFailure, CollectLimits, DescentHint, ListRequest, ListedChild, ListingPage, ListingStream,
+    PageSink, collect_listing,
 };
 pub(crate) use roles::DeferredCheckpoint;
 pub use roles::{

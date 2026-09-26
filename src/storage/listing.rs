@@ -30,6 +30,8 @@ use std::fmt;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -41,6 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{InlineOwnership, ListingFacts, SourceDescriptor, StorageRoleFailure};
 pub use failure::{ChildFailure, is_vanished};
+pub use hint::DescentHint;
 pub use names::child_path;
 pub(crate) use names::respelled;
 use names::{child_name, is_segment};
@@ -65,17 +68,29 @@ pub struct ListRequest {
     pub cancel: CancellationToken,
     /// Most children one page may hold. A backend may return fewer, never more.
     pub page_hint: NonZeroUsize,
+    /// What the listing that returned this directory handed back with it ([`DescentHint`]), for
+    /// the backend to use instead of resolving `path` again. `None` for a root, or when that
+    /// listing gave none; a backend lists `path` either way.
+    pub descent_hint: Option<DescentHint>,
 }
 
 impl ListRequest {
-    /// A request for `path` with [`DEFAULT_PAGE_HINT`].
+    /// A request for `path` with [`DEFAULT_PAGE_HINT`] and no descent hint.
     #[must_use]
     pub const fn new(path: StoragePath, cancel: CancellationToken) -> Self {
         Self {
             path,
             cancel,
             page_hint: DEFAULT_PAGE_HINT,
+            descent_hint: None,
         }
+    }
+
+    /// The same request carrying `hint`, from the listing that returned this directory.
+    #[must_use]
+    pub fn with_descent_hint(mut self, hint: Option<DescentHint>) -> Self {
+        self.descent_hint = hint;
+        self
     }
 
     /// The same request with another page size bound.
@@ -188,6 +203,7 @@ impl ListingPage {
             inline_ownership,
             version,
             listing,
+            descent_hint: None,
         });
     }
 
@@ -200,19 +216,36 @@ impl ListingPage {
         self,
         directory: &StoragePath,
     ) -> (Vec<SourceDescriptor>, Vec<EntryOperationFailure>) {
+        self.into_parts(directory, |descriptor, _| descriptor)
+    }
+
+    /// [`Self::into_descriptors`], keeping each child's [`DescentHint`] beside its descriptor.
+    #[must_use]
+    pub(crate) fn into_hinted_descriptors(self, directory: &StoragePath) -> HintedDescriptors {
+        self.into_parts(directory, |descriptor, hint| (descriptor, hint))
+    }
+
+    /// Every child of `directory` as `keep` makes it of its descriptor and descent hint, and every
+    /// failure of the page.
+    fn into_parts<T>(
+        self,
+        directory: &StoragePath,
+        keep: impl Fn(SourceDescriptor, Option<DescentHint>) -> T,
+    ) -> (Vec<T>, Vec<EntryOperationFailure>) {
         let mut failures: Vec<EntryOperationFailure> = self
             .failures
             .into_iter()
             .map(|failure| failure.failure)
             .collect();
-        let mut descriptors = Vec::with_capacity(self.children.len());
-        for child in self.children {
+        let mut children = Vec::with_capacity(self.children.len());
+        for mut child in self.children {
+            let hint = child.descent_hint.take();
             match child_path(directory, &child.name) {
-                Ok(path) => descriptors.push(child.at(path)),
+                Ok(path) => children.push(keep(child.at(path), hint)),
                 Err(_) => failures.push(too_long(directory, &child.name)),
             }
         }
-        (descriptors, failures)
+        (children, failures)
     }
 
     /// Adds a child `self` could not describe.
@@ -232,6 +265,13 @@ impl ListingPage {
     }
 }
 
+/// A page's children as descriptors, each with the descent hint its listing gave it, and every
+/// failure of the page.
+pub(crate) type HintedDescriptors = (
+    Vec<(SourceDescriptor, Option<DescentHint>)>,
+    Vec<EntryOperationFailure>,
+);
+
 /// One child of a listed directory: [`SourceDescriptor`] with its full path replaced by its name.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListedChild {
@@ -249,6 +289,8 @@ pub struct ListedChild {
     pub(crate) inline_ownership: Option<InlineOwnership>,
     pub(crate) version: SourceVersion,
     pub(crate) listing: ListingFacts,
+    /// See [`DescentHint`]; meaningful only on a directory.
+    descent_hint: Option<DescentHint>,
 }
 
 impl ListedChild {
@@ -282,7 +324,22 @@ impl ListedChild {
             inline_ownership: None,
             version: SourceVersion::Current,
             listing: ListingFacts::default(),
+            descent_hint: None,
         })
+    }
+
+    /// The same child carrying `hint` for the listing of it, when it is a directory a traversal
+    /// descends into ([`DescentHint`]).
+    #[must_use]
+    pub fn with_descent_hint(mut self, hint: DescentHint) -> Self {
+        self.descent_hint = Some(hint);
+        self
+    }
+
+    /// The hint for listing this child, if its listing gave one.
+    #[must_use]
+    pub const fn descent_hint(&self) -> Option<&DescentHint> {
+        self.descent_hint.as_ref()
     }
 
     /// The child's name: the last segment of its path.
@@ -335,12 +392,6 @@ impl ListedChild {
 }
 
 type Item = Result<ListingPage, StorageRoleFailure>;
-
-/// What a producer hands the stream: an item, or the end of a listing it finished.
-enum Message {
-    Item(Item),
-    End,
-}
 
 /// A directory listing, page by page. See the [module docs](self) for its contract.
 pub struct ListingStream {
@@ -432,7 +483,15 @@ type Start = Box<dyn FnOnce(PageSink) -> BoxFuture<'static, ()> + Send>;
 enum ProducerState {
     /// Not polled yet: nothing has been started.
     Idle(Option<Start>),
-    Running(mpsc::Receiver<Message>),
+    /// Items arrive on `receiver`. The producer's clean return is `finished`, set before the
+    /// channel's last sender goes, so a closed channel reads as the listing's end when it is set
+    /// and as an abandoned producer (a panic) when it is not. An end that needs no channel slot
+    /// is visible the moment the last page has been received, not only once the producer is
+    /// scheduled again to send one — so a one-page listing's page and end arrive together.
+    Running {
+        receiver: mpsc::Receiver<Item>,
+        finished: Arc<AtomicBool>,
+    },
     Finished,
 }
 
@@ -449,15 +508,18 @@ impl Produced {
             return Some(Err(no_runtime()));
         };
         let (sender, receiver) = mpsc::channel(1);
-        let end = sender.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let (done, last) = (Arc::clone(&finished), sender.clone());
         let producer = start(PageSink { sender });
         // Detached, never aborted: dropping the stream ends the producer through its own close
-        // path. `End` marks a listing the producer finished rather than abandoned.
+        // path. `finished` marks a listing the producer finished rather than abandoned; it is set
+        // while `last` still keeps the channel open, so the consumer cannot see it closed first.
         drop(runtime.spawn(async move {
             producer.await;
-            let _ = end.send(Message::End).await;
+            done.store(true, Ordering::SeqCst);
+            drop(last);
         }));
-        self.state = ProducerState::Running(receiver);
+        self.state = ProducerState::Running { receiver, finished };
         None
     }
 }
@@ -477,14 +539,14 @@ impl Stream for Produced {
                         return Poll::Ready(Some(failure));
                     }
                 }
-                ProducerState::Running(receiver) => {
+                ProducerState::Running { receiver, finished } => {
                     let message = match receiver.poll_recv(context) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(message) => message,
                     };
                     let item = match message {
-                        Some(Message::Item(item)) => item,
-                        Some(Message::End) => {
+                        Some(item) => item,
+                        None if finished.load(Ordering::SeqCst) => {
                             self.state = ProducerState::Finished;
                             return Poll::Ready(None);
                         }
@@ -516,7 +578,7 @@ impl std::error::Error for ListingClosed {}
 
 /// The producer side of [`ListingStream::from_producer`].
 pub struct PageSink {
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::Sender<Item>,
 }
 
 impl PageSink {
@@ -526,15 +588,12 @@ impl PageSink {
     /// Returns [`ListingClosed`] when the consumer dropped the stream (or took a failure and
     /// stopped); the producer must release what it holds and return.
     pub async fn send(&self, page: ListingPage) -> Result<(), ListingClosed> {
-        self.sender
-            .send(Message::Item(Ok(page)))
-            .await
-            .map_err(|_| ListingClosed)
+        self.sender.send(Ok(page)).await.map_err(|_| ListingClosed)
     }
 
     /// Ends the listing with `failure`. Nothing the producer sends afterwards is delivered.
     pub async fn fail(&self, failure: StorageRoleFailure) {
-        let _ = self.sender.send(Message::Item(Err(failure))).await;
+        let _ = self.sender.send(Err(failure)).await;
     }
 
     /// Resolves once the consumer has dropped the stream, so a stateless producer can abandon
@@ -726,6 +785,7 @@ fn listing_failure(
 }
 
 mod failure;
+mod hint;
 mod names;
 #[cfg(test)]
 pub(crate) mod testing;

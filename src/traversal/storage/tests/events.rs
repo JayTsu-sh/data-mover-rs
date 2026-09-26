@@ -279,16 +279,18 @@ async fn a_directory_is_reported_after_its_children() {
             "entry drop",
             "entry top",
             "listed <root> Complete listed=3 emitted=3",
-            "entry keep/a",
-            "entry keep/b",
-            "listed keep Complete listed=2 emitted=2",
-            "entry keep/b/c",
-            "listed keep/b Complete listed=1 emitted=1",
+            // The root's block keeps the listing's order; its subdirectories are descended
+            // into by name, so `drop` before `keep`.
             "entry drop/x",
             "entry drop/y",
             "listed drop Complete listed=2 emitted=2",
             "entry drop/y/z",
             "listed drop/y Complete listed=1 emitted=1",
+            "entry keep/a",
+            "entry keep/b",
+            "listed keep Complete listed=2 emitted=2",
+            "entry keep/b/c",
+            "listed keep/b Complete listed=1 emitted=1",
         ]
     );
     let TraversalOutcome::Completed(completion) = outcome else {
@@ -375,12 +377,12 @@ async fn a_directory_max_depth_stops_at_is_emitted_without_a_directory_event() {
             "entry drop",
             "entry top",
             "listed <root> Complete listed=3 emitted=3",
-            "entry keep/a",
-            "entry keep/b",
-            "listed keep Complete listed=2 emitted=2 truncated=1",
             "entry drop/x",
             "entry drop/y",
             "listed drop Complete listed=2 emitted=2 truncated=1",
+            "entry keep/a",
+            "entry keep/b",
+            "listed keep Complete listed=2 emitted=2 truncated=1",
         ]
     );
 }

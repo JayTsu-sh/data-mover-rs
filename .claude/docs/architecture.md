@@ -51,14 +51,15 @@ Storage (roles)
 `src/dir_tree.rs` 的 `run_dfs_driver`(那部分本来就后端无关)，这里只负责列举取数、按名排序、
 以及把 `SourceDescriptor` 反拼成 `NdxEvent` 载荷要的 `EntryEnum::NAS`。
 
-`StorageTraversalSource` 的调度 (`src/traversal/storage.rs` + `storage/{cursor,observe}.rs`)：
-准入游标按"块"走深度优先 —— 一个目录的子项按列举顺序连续输出，再依次下钻各子目录；序号只由
-游标分配，重排缓冲按序号输出，所以列举/观察乱序完成不影响顺序。列举预读额度
-`min(max_inflight_operations, 64)` 只计**在途**，在途 + 已列出待消费合计另限 2 倍额度 (否则早期预读的
-浅层兄弟会占住额度，饿死深层)；与观察窗口分开；游标马上需要的列举不计额度 (防饿死)。
+`StorageTraversalSource` 的调度 (`src/traversal/storage.rs` + `storage/{cursor,stream,observe}.rs`)：
+准入游标按"块"走深度优先 (`TraversalOrder::Blocks`) —— 一个目录的子项按列举顺序逐页连续输出，
+列举结束后按子目录名字节序依次下钻；序号只由游标分配，重排缓冲按序号输出，所以列举/观察乱序完成
+不影响顺序。列举预读额度 `min(max_inflight_operations, 64)` 只计**等页**的列举，游标未到的已起列举
+(等页 + 停在首页后的) 合计另限 2 倍额度 (否则早期预读的浅层兄弟会占住额度，饿死深层)；与观察窗口分开；
+游标马上需要的列举不计额度 (防饿死)。
 deferred filter 已决定下钻的 `Pending` 槽位也会预读。列举结果**在列举自己的任务里**就对每个子项做
 filter 决定 (deferred 的除外)，所以已预读、游标还没走到的目录，其子目录也能继续预读；候选按
-输出顺序深度优先展开 (`cursor.rs` 的 `Search`)。驱动每轮先 `try_join_next` 收下所有已完成的列举，
+输出顺序深度优先展开 (`cursor.rs` 的 `Search`)。驱动每轮先 `try_recv` 收下所有已到的页与结束，
 不只是游标正等的那个 —— 否则已预读目录的子目录不会被展开预读。
 **按页观察 (P7 C0)**：不需要 I/O 的子项 (非 symlink，且列举已带齐观察计划要的元数据) 也在列举任务里
 组装成 `ObservedEntry`，驱动一块只被唤醒一次、准入时直接落槽；filter 隐藏的子项在那里只计数、不进块。
@@ -156,9 +157,10 @@ marker **占准入窗口**的名额，不绕过它，所以不会让 `admitted()
 
 ## 遍历的三套处理逻辑
 
-> **现状**：legacy work-stealing 与 admission cursor 并存，P6 删前者。
-> **终局**：只剩 admission cursor，两种模式 (`Admission` / `NameBytes`)。
-> 本节标了 **[计划]** 的内容属于 P7 (流式列举) / P8 (排序与槽位可溢写)，尚未实现。
+> **现状**：legacy work-stealing 与 admission cursor 并存，P6 删前者。admission cursor 自 P7 C4
+> 起只有 `TraversalOrder::Blocks` 一种 (块内列举序、块读完后按子目录名字节序下钻)，逐页消费列举；
+> `Admission` / `NameBytes` 两种模式与兄弟排序已删除。P7 C10 再加 `Unordered` 调度器并设为默认。
+> 本节标了 **[计划]** 的内容属于 P7 后续步骤 / P8 (槽位可溢写)，尚未实现。
 
 ### 一、legacy work-stealing (现状，P6 删)
 
@@ -196,104 +198,97 @@ for entry in read_dir(dir):
 **目录 / 子树边界在概念上不存在** —— 任务一拆边界信息当场销毁，这正是消费者拿不到权威
 "这个目录的子集已完整"信号的根因。
 
-### 二、admission cursor —— `Admission` 模式
+### 二、admission cursor —— `Blocks` 模式 (P7 C4 起逐页)
+
+每个列举一个 detach 的任务 (`storage/stream.rs`)：**先等 credit** → `stream.next()` 取一页 →
+在任务里 prepare (即时 filter 决定、无 I/O 观察、下钻槽位) → 不等待地偷看下一项 → 经共享 channel
+交给驱动。credit 初始 1，游标每取走一页加 1。所以遍历对一个列举最多持有：游标正在准入的一页 +
+交出未取的 1 页 (已 prepare) + 偷看取下的至多 1 页 (原始)，**与目录多大无关**；backend 流自己另有
+预读 (from_producer：channel 1 页 + 生产者手里 1 页)。偷看到的结束 (`End` / 失败) 不需要 credit：
+生产者正常返回不再占 channel 槽发 `End` 消息，而是先置 `finished` 标志再丢掉最后一个 sender，
+所以单页小目录的页一收到、结束就可见，页与结束一起到，驱动一次唤醒 (偷看没看到的结束要等游标取走前一页)。任务中途 panic 由 `Reporter` 的 Drop 报 `Internal`。
+**C5–C9 之前各 backend 的生产者仍整目录读完再按页交出**，所以真机上"几页"的界目前只在遍历这一侧成立。
 
 驱动循环 (`storage.rs` 的 `drive`)：
 
 ```
 loop {
     if cancelled: return
+    while arrivals.try_recv() → cursor.listed(id, arrival)   // 页 / End / Failed / Terminal
     step = cursor.advance(...)        // 尽可能多地准入
     cursor.start_listings(...)        // 起"游标马上需要的" + 预取
     state.output.flush()              // 按序号严格释放到 mpsc
     match step {
         Done       && 无在途观察 → return
         WindowFull && 无在途观察 → 继续    // flush 刚腾空窗口，必然能前进
-        _ → select! { 取消 | 一个列举完成 | 一个观察完成 }
+        _ → select! { 取消 | 一个列举的下一页或结束 | 一个观察完成 }
     }
 }
 ```
 
-结束时 `tasks.detach_all(); listings.detach_all()` —— **不 abort**：CIFS 列举在两个 await
-之间持有目录句柄，drop 掉 future 就泄漏。
+结束时观察任务 detach，丢掉 arrivals 接收端 —— **不 abort**：列举任务发现通道关闭后 drop 流，
+backend 生产者走自己的收尾路径关句柄 (CIFS 目录句柄)。
 
 `advance()` 单步：
 
 ```
 loop {
     frame = stack.last() else return Done
-
-    ① 还没拿到列举 → take_top_listing()
-         到了   → 装上；列举级 failures 先按序发出
-         失败   → 排 Failure{scope: Listing}，facts.outcome = Unreadable，装一个空块   ← 失败与成功共用同一条收尾路径
-         没到   → return WaitListing
-
-    ② 块里还有子项 → 窗口满? WindowFull
-                    admit(child)   // 分配序号、spawn 观察、记 slots、更新 facts
-
-    ③ 块空且 !closed → 窗口满? WindowFull
-                      queue_block_end()   // DirectoryListed(D) 在这里拿到序号
-                      closed = true
-
-    ④ 消费一个 slot (next_after_block)：
-         Pop     → stack.pop()             (P7 C2 起没有 SubtreeComplete marker)
-         Descend → stack.push(Frame::new(work))
-         Skip    → {}
-         Wait    → return WaitObservation
+    ⓪ closed → 消费一个 slot (next_after_block)：
+         Pop → stack.pop()；Descend → stack.push(Frame::new(work))；Skip；Wait → WaitObservation
+    ① 还没拿到列举 → take_top_listing()；未起 → return WaitListing (start_listings 会起它)
+    ② 当前页还有子项 → 窗口满? WindowFull；admit(child)
+    ③ 列举还有已到的页 → 取下一页 (credit +1)，该页描述不出的子项先按序排 Failure{Child}
+    ④ 列举未结束 → return WaitListing
+    ⑤ 列举已结束、块全部准入 → 窗口满? WindowFull
+         Failed 且 NotFound 且非根且一个都没返回 → vanished，空块 Complete
+         Failed 其他 → Failure{scope: Listing, delivered = 本块 listed}  (0 → Unreadable，>0 → Interrupted)
+         queue_block_end()   // DirectoryListed(D) 在这里拿到序号
+         closed = true；释放当前页队列的 room
 }
 ```
+
+**下钻排序**：槽位按到页顺序累积 (`Descend(work)` 或 deferred 的 `Pending{ticket, path, hint}`)，
+列举结束 (`End` 或失败) 时按子目录名 (最后一段) 的原始 UTF-8 字节排序一次 (`sort_unstable_by`，不为千万子目录再分配半长缓冲；
+同名只可能是列举重复返回同一目录，谁先都列同一路径)，O(d log d)，只排子目录。
+中途失败的列举已返回的子目录照常下钻。块内子项**不排序**。
+
+**下钻提示** (§12.7)：列举可给目录子项带一个 backend 私有、拷贝出来的 `DescentHint`
+(`ListedChild::with_descent_hint`)，经 `Descend` 槽位的 `DirectoryWork.hint` / `Pending` 槽位的
+`hint` 带到该子目录自己的 `ListRequest.descent_hint`。C4 只建通道，没有 backend 填它 (C7 填 NFS 句柄)。
 
 **序号只在 cursor 里按这个顺序分配**；列举与观察可以任意次序完成，时间只决定*何时*能走下一步，
 不决定*谁拿到哪个序号*。重排缓冲严格按序号释放 —— 这是确定性的全部来源。
 
 预取 (`start_listings`)：栈顶需要的那个**一定起**，哪怕超预算 (否则远处的预取会饿死当前阻塞点)；
-其余按输出顺序 (栈顶往下、深的优先) 选候选，在途 ≤ P = `min(max_inflight, 64)`，
-在途 + 已完成 ≤ 2P；扫描上限 4P；已到达的候选被**展开**成它自己的子目录，所以预取能穿透多层。
+其余按输出顺序 (栈顶往下、深的优先) 选候选，等页的列举 ≤ P = `min(max_inflight, 64)`，
+游标未到的已起列举 (等页的 + 停在首页之后的) ≤ 2P；扫描上限 4P；已起的候选被**展开**成它已返回的
+子目录，所以预取能穿透多层 (块未关时按列举序展开，只影响先读谁，不影响输出)。
 
-**[计划] P7 把块变成流式**：`Frame.children` 从全量 `VecDeque<Child>` 变成打开的游标 + 一页；
-`Listing.arrived` 从全量 `Prepared` 变成游标句柄 + 首页；filter 决定从"到达时对全部子项做一遍"
-变成"逐页做"；预取的含义从"把整份 listing 取回来扣住"变成"开着游标、一页在途、不排到就不继续读"，
-背压交给协议层。代价是栈上每帧持有一个打开的游标横跨整棵子树：NFS / S3 是无状态 cookie (几乎免费)，
-**CIFS 是真实句柄，ONTAP 会超时回收** —— 这是终局里最脆的一环，需要游标失效后的重建策略。
+预取的含义是"首页到齐"：预取的列举交出首页 (外加至多一页原始的偷看页) 后停住，游标到了才继续读。
+**祖先帧的列举在下钻前已读尽**，栈上没有横跨子树的打开游标；只有"已预取、游标还没走到"的目录会停在
+半路 (≤ 2P 个)。backend 逐页之后 (C5–C9)：NFS / S3 / HDFS 停车什么都不占，Local 占一个 fd，
+**CIFS 占一个真实句柄** (停车句柄上限 8 与 ONTAP 空闲回收实测归 C9)；今天生产者整目录读完，句柄在
+停车前已关、整目录在生产者里。
+驻留探针 (`storage/residency.rs`) 有 `pages_buffered`、`parked_listings`。
 
-### 三、admission cursor —— `NameBytes` 模式
+### 三、`NameBytes` 兄弟排序 (P7 C4 已删除)
 
-驱动循环、序号分配、窗口、marker 顺序**全部不变**，只有"块从哪来"不同。
+P4 的 `NameBytes` 把整块按名字排序后发出，块必须物化 (千万条约 4.5 GB)、首项要等整个目录列完。
+P7 定为**只排下钻**：块内保持列举序，两侧逐目录对比时消费方按名字哈希匹配一个块 (内存 O(单目录))，
+并且要等两侧都到了该目录的 `DirectoryListed` 才能判定"一侧缺失"(design §3.1)。仍然成立的：
 
-1. **当前块必须物化** —— 流式与排序在单目录内互斥，要排就得看完整块。这是物理约束，不是实现取舍。
-2. **排序在列举任务里做**，不在驱动任务上：`prepare` 跑在驱动任务上，千万条的 O(n log n) 会让
-   驱动长时间不到 await 点，取消响应变钝。
-3. **`sort_unstable_by`**，键是最后一段的 UTF-8 字节 (`entry_name(&x.path)`)。不是口味问题：
-   稳定排序要为 `Vec<SourceDescriptor>` 额外分配 n/2 个元素，千万条就是 +GB 级峰值。
-   代价是同名子项相对次序未指定 (同目录同名是 backend 缺陷)。
-4. **[计划] P8 超阈值外部归并排序**：分批排序写 run，k 路归并回读；驱动侧拿到的是"一个有序块"，
-   无论背后是 `Vec` 还是归并迭代器。临时文件清理挂在取消路径上。
-5. **下钻序自动有序**：`descend` / `slots` 按排序后的顺序建立 (`prepare` 按 `entries` 顺序 →
-   `admit` 同序 `push_back` → `next_after_block` 队首取)，所以排一次，块内序与下钻序同时有序。
-6. **事件**：列举级 failures 排在块首、**在序之外** (它们可能没有合法名字)；观察失败的
-   `Failure{scope: Child}` 有真路径，留在自己的排序位上；事件多重集与每块 `BlockCounts`、全场
-   `ScanTotals` 在两种模式下**必须完全相同**。(`ChildOrder` 在 P7 C2 删除，兄弟排序本身在 C4 删除。)
-7. **消费者比较的键是 `(父目录, 名字)`，不是整条路径。** 块不交错 —— 一个目录的全部子项都排在
-   任何孙子之前，目录本身按排序后的深度优先访问。所以 `a/`(含 `a/x`) 与 `a.txt` 给出
-   `a, a.txt, …, a/x`：两者都是根的子项，都排在 `a` 之下的任何东西之前。**这不是"有序 DFS
-   前序"** —— 真正的前序要求 `a, a/x, a.txt`，那需要即时下钻，而块序恰恰不允许。拿整条路径
-   逐段比较会把 `a/x` 排到第二位、静默错位，读出来就是"目标端有而源端无"→ **删数据**；而它在
-   单个目录内与正确规则恰好一致，所以小样本全对。
-   (2026-09-21 更正：本节初稿把它写成"有序 DFS 前序"并给了 `a, a/x, a.txt` 的例子，是错的 ——
-   真机跑 `examples/storage_role_operations traverse --order name-bytes` 才发现。)
-
-**真机证据 (FAS2750，2026-09-21)**：同一棵树 (目录 `Zoo`/`a`/`B`/`bar` + `a/a1`、`a/a2`) 同时
-播到 CIFS `ontap_lisaauto_cifs` 与 NFS `ontap_lisaauto_nfs` (v4.1)，`--order name-bytes` 两侧
-**逐行相同**；`--order admission` 两侧不同 (CIFS `Zoo, a, B, bar` / NFS `B, Zoo, a, bar`)。
-字节序 `B`(0x42) < `Zoo`(0x5A) < `a`(0x61) < `bar`(0x62)，而大小写不敏感排序会给
-`a, B, bar, Zoo` —— 所以这同时证明字节序压过了 NTFS/ONTAP 的 `$UpCase` collation。
-
-> **陷阱**：ONTAP 的 NFS READDIR 在这棵树上**恰好就返回字节序**。只测 NFS 会得出"根本不用排序"
-> 的结论，而同一棵树在 CIFS 上并非如此。不要用单个 backend 的原生顺序推断是否需要排序。
+- **消费者的键是 `(父目录, 名字)`，不是整条路径。** 块不交错 —— 一个目录的全部子项都在任何孙子之前，
+  所以 `a/`(含 `a/x`) 与 `a.txt` 都在 `a/x` 之前。这不是深度优先前序；拿整条路径逐段比较会静默错位，
+  读出来就是"目标端有而源端无"→ **删数据**。
+- **下钻序是原始字节序，不是任何服务端 collation**。2026-09-21 FAS2750 实测：同一棵树 (`Zoo`/`a`/`B`/`bar`)
+  在 CIFS 与 NFSv4.1 上原生列举序不同 (CIFS `Zoo, a, B, bar` / NFS `B, Zoo, a, bar`)，字节序
+  `B < Zoo < a < bar` 在两侧一致。
+- **陷阱**：ONTAP 的 NFS READDIR 在这棵树上恰好返回字节序，只测 NFS 会以为"不用排"。
 
 ### 四、单目录海量子目录：低内存模式
 
-`Frame.slots` 与 `Prepared.descend` 各为一个将要下钻的子目录留一条记录。根因是**物理的**：
+`Listing.slots` (cursor.rs) 为每个将要下钻的子目录留一条记录。根因是**物理的**：
 任何要回到某目录 1000 万个子目录的遍历，都必须记住 1000 万个返回点，否则就得重新列举
 (而目录可能已变，一致性也没了)。legacy 的无界任务队列是同一件事。
 
@@ -434,24 +429,24 @@ CIFS 上三条路，都不便宜：
 优先级是 **基线 → A → B**，且 A 与 B 不是等价备选：**A 唯一的代价是要盘，换来契约与句柄
 双全**；B 省掉磁盘，代价是时序退化**加上**句柄长持有。
 
-**`NameBytes` 下只有基线与逃生门 A。** 排序本来就要物化整块，逃生门 B 在语义上不成立 —— 没看完整块
-就不知道谁排第一。所以有序模式下海量子目录只能靠溢写；无盘时该目录**必须拒绝而不是静默降级**
-(静默降级 = 无序却声称有序 = 目标端删数据)。
+**`Blocks` 下逃生门 B 同样不成立**：下钻按名字排序，没看完整个列举就不知道先下哪个子目录。
+所以海量子目录只能靠基线与溢写；无盘时该目录**必须拒绝而不是静默降级**。(P7 C10 的 `Unordered`
+没有这个限制：子目录一发现就入栈。)
 
 
 ### 五、三者对比
 
-| | legacy work-stealing | 终局 `Admission` | 终局 `NameBytes` |
-|---|---|---|---|
-| 输出顺序 | 不确定 | 确定 (backend 列举序) | 块序 + 块内/下钻按名字节序 |
-| 子树完成语义 | **结构上做不到** | 有，精确计数 | 同左 |
-| 当前块 | 流式 | 流式 | 必须物化 |
-| 内存 | 待处理队列**无界** | 配置决定 | 配置决定 + 排序缓冲 (超阈值溢写) |
-| 背压 | 只在条目通道 | 贯通到协议翻页 | 同左 |
-| 不规则树负载均衡 | **更好** (窃最浅) | 无窃取 | 无窃取 |
-| 头阻塞 | **没有** | 有 | 有 |
+| | legacy work-stealing | `Blocks` (P7 C4) |
+|---|---|---|
+| 输出顺序 | 不确定 | 块序：块内列举序，下钻按名字节序 (跨 backend 一致) |
+| 目录完成语义 | **结构上做不到** | 每目录 `DirectoryListed{outcome, counts}` |
+| 当前块 | 流式 | 逐页流式 (几页，与目录大小无关) |
+| 内存 | 待处理队列**无界** | O(打开的列举 × 页) + O(待下钻子目录) |
+| 背压 | 只在条目通道 | 贯通到协议翻页 |
+| 不规则树负载均衡 | **更好** (窃最浅) | 无窃取 |
+| 头阻塞 | **没有** | 有 |
 
-一句话：**`Admission` 用「输出的头阻塞」换「输出的确定性 + 子树完成语义」，work-stealing 反之。**
+一句话：**`Blocks` 用「输出的头阻塞」换「逐目录确定的边界 + 计数」，work-stealing 反之。**
 两者并非竞争架构 —— work-stealing 是**调度策略**，admission 是**输出契约**，前者可以成为后者
 预取窗口内部的实现细节。P6 删 legacy 前值得先评估"窃最浅"这个启发式是否值得吸收。
 

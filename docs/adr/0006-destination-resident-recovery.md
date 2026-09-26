@@ -716,7 +716,8 @@ with versionId, latest flag and delete-marker flag, oldest to newest per key). B
 `.data-mover-*` names.
 As built (C22, traversal plan P5): the role-based S3 traversal is the generic depth-first
 `StorageTraversalSource` over a new S3 `Namespace` role, not a dedicated flat source. The P3/P4
-contract delivers every child of a directory before any grandchild (block order, `NameBytes`); a
+contract delivers every child of a directory before any grandchild (block order, `NameBytes` —
+superseded by P7 C4: `Blocks` keeps a block in listing order and sorts only the descent); a
 flat `ListObjectsV2` returns the root's last child only after the whole `a/…` subtree, so a flat
 source would have to hold everything under the root. The namespace lists one prefix at a time with
 delimiter `/` (`List`; `Stat` is a HEAD, then a one-page prefix probe); every page of a directory
@@ -763,7 +764,7 @@ fourth entry. Clock skew between a store's nodes cannot reorder a server-ordered
 while latest, `Id("null")` once newer versions exist; a marker selects nothing, has no size, and is
 never looked up (neither is a prefix); optional metadata of every listed version, the latest
 `"null"` one included, is observed bound to it (`observe_copy_bound_version`, its own tags). `NameBytes` ties are ordered (object before directory,
-versions oldest first). Snapshots of version entries are v6 (v5 plus the version record); every
+versions oldest first; superseded by P7 C4, which removed the sibling sort: a block keeps S3's listing order). Snapshots of version entries are v6 (v5 plus the version record); every
 other entry stays v5, byte for byte. Identities: `Current` entries are `PathScoped(path, ETag)`
 (`ListObjectsV2` carries no versionId; the `ETag` alone as first built, see the C6 follow-up), version
 entries `VersionScoped(id)` as a versioned describe gives them, so `Current` and `All` snapshots of

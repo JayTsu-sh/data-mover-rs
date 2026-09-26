@@ -543,8 +543,8 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 ### role-based 遍历与版本模式（ADR-0006 C22）
 
 - **形态**：S3 出借 `Namespace`（`src/storage/backends/s3/namespace.rs`），由通用的深度优先
-  `StorageTraversalSource` 驱动；不做扁平 `TraversalSource` —— P3/P4 的块顺序（目录的全部子项先于任何孙项）
-  与 `NameBytes` 下，扁平 `ListObjectsV2` 要把根下的全部 key 攒在内存里才能交出根的块。
+  `StorageTraversalSource` 驱动；不做扁平 `TraversalSource` —— 块顺序（目录的全部子项先于任何孙项，
+  `TraversalOrder::Blocks`）下，扁平 `ListObjectsV2` 要把根下的全部 key 攒在内存里才能交出根的块。
 - **一个目录 = 一个前缀**：`List(p)` = `ListObjectsV2(prefix = "p/", delimiter = "/")`；All 模式
   `list_versions(p)` = `ListObjectVersions` 同参数。**一个目录的所有页收齐再建块**（`listing.rs`），所以跨页的
   key 天然是整的，不需要 C20 的“留下一页最大 key”；续页 token / marker **原样回传**，只拿来判“绕回来了”（本目录
@@ -561,7 +561,8 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - **不存在的前缀**：非根路径下一条都没列到（没有对象、版本、标记、前缀，也没有自己的 `p/` 标记）→ `NotFound`
   条目失败；遍历根拼错时根的列举是 `Failed`、summary 不 exhaustive，不会被当成“源端为空”。存储根永远存在。
 - **子项顺序**：S3 key 序，公共前缀带尾 `/` 比较（`a` < `a!` < `a-0` < `a.txt` < `a/`）；同名的对象 `a` 与目录
-  `a` 并存。`NameBytes` 排序键是 `(名字, 是否目录, rank)`：对象先于目录、同一 key 的版本从旧到新。
+  `a` 并存。遍历块内保持这个列举序（P7 C4 删了兄弟排序与 `rank`）：同一 key 的版本连续、从旧到新；
+  只有前缀 `a` 被下钻，下钻按子目录名字节序。
 - **异常 key**：目录自己的零字节标记对象 `p/` 跳过；有内容的 `p/`（All 模式下它**任何一个旧版本**有内容也算，
   所以 Current 干净的目录在 All 下可能是 `Partial`）、空段 / `.` / `..` 段（`a//`、根下的 `/x`、`./x`、`a/./b`、
   `a/..`）是逐子项失败（报在服务器拼写的路径上，列举 `Partial`），不会被并进别的路径 —— 目的端的路径处理会把
@@ -588,7 +589,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - **拒绝**：非 S3 源请求 `All` → 会话在任何 I/O 前以 `Session(Unsupported)` 结束、零条目（不会退化成当前对象）。
   S3 的变更动词 `Unsupported`；`delete_tree` / `create_directory_all` / `ndx_walk` 在 I/O 前拒绝 S3（同以前）。
 - **例子与真机**：`S3_LISTING_URL=… cargo run --example storage_role_operations -- --backend s3 traverse
-  --versions all [--order name-bytes]`（每条版本打印 `version= latest= marker= size=`）；
+  --versions all [--order blocks]`（每条版本打印 `version= latest= marker= size=`）；
   `.claude/skills/e2e-s3/scripts/traversal_versions.sh`（临时桶，见 SKILL 第 8 步）。MinIO VM 102 2026-09-25 通过：
   `k` = 2 B、3 B、标记、4 B，`gone` = 版本 + latest 标记，999 个 key 后的 `p/z` 跨页仍 1、2、3 B，暂停版本写的 `n` =
   `version=null latest=1`，无 artifact；All 1015 条、Current 1008 条；`name-bytes` 并发 1/4/32 输出相同；桶已删。
@@ -689,7 +690,7 @@ SKILL.md）上跑出来的差异，以及各自的处理：
 | `bucket.host` 解析错误 (path-style vs virtual-hosted) | 检查 endpoint 是否支持 virtual-hosted |
 | URL 中的 `:` 在 secret 里被切错 | secret 必须 percent-encode |
 | 把 MinIO 的 `NextKeyMarker`（`p/z[minio_cache:v2,return:]`）当 key 用 | 续页 token / marker 只原样回传（C20 / C22） |
-| 同一目录里对象 `a` 与前缀 `a/` 同名 | 按路径做键的消费方会撞；`NameBytes` 下对象在前（C22） |
+| 同一目录里对象 `a` 与前缀 `a/` 同名 | 按路径做键的消费方会撞；块内按 S3 列举序（对象 `a` 在 `a/` 之前，C22） |
 | 按 `LastModified` 排同一 key 的版本与删除标记 | 毫秒精度，并发写入同毫秒；用服务端文档顺序（`version_order.rs` + `history.rs`，Q29） |
 | `PathScoped` 身份只放内容事实（ETag） | 同内容不同 key 撞身份键；稳定字节必须含路径（Q28） |
 | Region 推断 | endpoint host 推断，必要时显式设 `AWS_REGION` |

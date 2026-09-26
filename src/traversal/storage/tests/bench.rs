@@ -117,7 +117,7 @@ async fn run_once(namespace: &Arc<PrebuiltNamespace>, plan: ObservationPlan) -> 
     );
     let mut session = source.traverse(
         TraversalRequest::new(StoragePath::root())
-            .order(crate::traversal::TraversalOrder::Admission)
+            .order(crate::traversal::TraversalOrder::Blocks)
             .max_inflight_operations(
                 NonZeroUsize::new(64).unwrap_or_else(|| unreachable!("constant is nonzero")),
             )

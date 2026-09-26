@@ -25,9 +25,6 @@ pub(crate) enum InlineOwnership {
 pub(crate) struct ListingFacts {
     /// The listed version, from a listing of every version; carried onto the observed entry.
     pub(crate) version: Option<Box<EntryVersion>>,
-    /// Position among the children that share this child's name and kind, in listing order: a
-    /// key's versions oldest first. Orders them when a traversal sorts children by name.
-    pub(crate) rank: u32,
     /// Nothing behind the child can be observed: an S3 common prefix or a delete marker. The
     /// traversal takes what the listing gave and asks the metadata role nothing.
     pub(crate) listing_only: bool,

@@ -57,7 +57,7 @@ async fn an_undescribable_child_is_a_child_failure_in_a_complete_listing()
     let traversal = StorageTraversalSource::new(&storage)?;
     let mut session = traversal.traverse(
         TraversalRequest::new(StoragePath::root())
-            .order(TraversalOrder::NameBytes)
+            .order(TraversalOrder::Blocks)
             .max_inflight_operations(NonZeroUsize::new(2).ok_or("invalid inflight")?)
             .max_buffered_items(NonZeroUsize::new(8).ok_or("invalid buffer")?)
             .cancel(CancellationToken::new()),
@@ -78,6 +78,8 @@ async fn an_undescribable_child_is_a_child_failure_in_a_complete_listing()
         }
     }
     session.finish().await?;
+    // A block is in the order HDFS listed it, which the in-memory store does not fix.
+    entries.sort();
     assert_eq!(entries, ["a", "c"]);
     assert_eq!(failures, [(FailureScope::Child, "bad".to_owned())]);
     let Some((outcome, counts)) = listing else {

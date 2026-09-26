@@ -17,12 +17,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// One sample of what the cursor holds.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct Residency {
-    /// Listed children waiting to be admitted, across every frame and every arrived listing the
-    /// cursor has not taken yet. Grows with the number of entries; this is what paging bounds.
+    /// Listed children waiting to be admitted in the frames: the page being admitted and the
+    /// pages of the block's listing that arrived behind it. Bounded by a few pages however wide
+    /// the directory is, because a listing is read a page at a time (P7 C4).
     ///
-    /// Only the top frame ever has any: a block is admitted in full before the cursor descends,
-    /// so every ancestor's queue is already empty. The stack does **not** hold one pending block
-    /// per level.
+    /// Only the top frame ever has any: a block is admitted in full, and its listing has ended,
+    /// before the cursor descends, so every ancestor's queue is already empty. The stack does
+    /// **not** hold one pending block per level.
     ///
     /// Counts the frames alone. What prefetch is holding is [`Self::prefetched_children`], kept
     /// apart because the two move for different reasons: one with how wide a directory is, the
@@ -46,8 +47,15 @@ pub(super) struct Residency {
     pub(super) deferred_decisions: usize,
     /// Listings started and not yet arrived.
     pub(super) listings_inflight: usize,
-    /// Listings arrived and not yet taken by the cursor.
+    /// Listings started ahead of the cursor that are not waiting for a page — stopped after one,
+    /// or ended — and not yet taken by the cursor.
     pub(super) listings_arrived: usize,
+    /// Pages handed over by listings' tasks and not yet taken by the cursor, in frames and in
+    /// prefetched listings together (§6.3 `pages_buffered`).
+    pub(super) pages_buffered: usize,
+    /// Prefetched listings stopped part way: a page arrived, the listing has not ended, and the
+    /// cursor has not reached them (§6.3 `parked_listings`). A CIFS one holds a directory handle.
+    pub(super) parked_listings: usize,
     /// Bytes of path text held by everything counted above.
     pub(super) path_bytes: usize,
 }
@@ -66,6 +74,8 @@ pub(super) struct ResidencyPeak {
     deferred_decisions: AtomicUsize,
     listings_inflight: AtomicUsize,
     listings_arrived: AtomicUsize,
+    pages_buffered: AtomicUsize,
+    parked_listings: AtomicUsize,
     path_bytes: AtomicUsize,
 }
 
@@ -80,6 +90,8 @@ impl ResidencyPeak {
             (&self.deferred_decisions, sample.deferred_decisions),
             (&self.listings_inflight, sample.listings_inflight),
             (&self.listings_arrived, sample.listings_arrived),
+            (&self.pages_buffered, sample.pages_buffered),
+            (&self.parked_listings, sample.parked_listings),
             (&self.path_bytes, sample.path_bytes),
         ] {
             slot.fetch_max(value, Ordering::Relaxed);
@@ -96,6 +108,8 @@ impl ResidencyPeak {
             deferred_decisions: self.deferred_decisions.load(Ordering::Relaxed),
             listings_inflight: self.listings_inflight.load(Ordering::Relaxed),
             listings_arrived: self.listings_arrived.load(Ordering::Relaxed),
+            pages_buffered: self.pages_buffered.load(Ordering::Relaxed),
+            parked_listings: self.parked_listings.load(Ordering::Relaxed),
             path_bytes: self.path_bytes.load(Ordering::Relaxed),
         }
     }

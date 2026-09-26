@@ -8,9 +8,12 @@ use crate::model::{EntryOperationFailure, ObservedEntry, StoragePath};
 
 /// One traversal item. Failures do not terminate the session.
 ///
-/// A listed directory `D` produces its block — one item per admitted child, children the listing
-/// could not describe first — then [`TraversalItem::DirectoryListed`] for `D`, and then, for every
-/// subdirectory `D` descends into, that same sequence recursively. Only a directory that was
+/// A listed directory `D` produces its block — one item per admitted child, in listing order, page
+/// by page, each page's children the listing could not describe ahead of that page's others, and
+/// last `D`'s own [`FailureScope::Listing`] failure if its listing stopped — then
+/// [`TraversalItem::DirectoryListed`] for `D`, and then, for every subdirectory `D` descends into,
+/// in the byte order of their names, that same sequence recursively
+/// ([`super::TraversalOrder::Blocks`]). Only a directory that was
 /// actually listed gets a `DirectoryListed`: a directory `max_depth` stops at is emitted as an
 /// entry and never listed, and a directory the filter hides but still descends into has its
 /// `DirectoryListed` and no [`TraversalItem::Entry`] of its own.
@@ -79,8 +82,11 @@ pub struct ScanFailure {
     pub scope: FailureScope,
     /// Class, transience and diagnostic.
     pub failure: EntryOperationFailure,
-    /// For [`FailureScope::Listing`]: how many of the directory's children were delivered
-    /// before the listing failed (`0`: not one page was read). `None` for a child failure.
+    /// For [`FailureScope::Listing`]: how many children the listing returned before it failed —
+    /// emitted, filtered, failed or vanished alike, the block's [`BlockCounts::listed`] — all of
+    /// them ahead of this failure in the block. `0`: it returned none, and the listing is
+    /// [`ListingOutcome::Unreadable`]; more, and it is [`ListingOutcome::Interrupted`]. `None`
+    /// for a child failure.
     pub delivered: Option<u64>,
 }
 
@@ -130,8 +136,9 @@ pub enum ListingOutcome {
     /// The listing ran to its end. Children that failed individually are counted in
     /// [`BlockCounts::failed_children`]; they do not make a listing incomplete.
     Complete,
-    /// The listing stopped after delivering some children. A [`FailureScope::Listing`] failure
-    /// for the directory precedes this event.
+    /// The listing stopped after returning some children, which were delivered (and whose
+    /// subdirectories are still descended into). A [`FailureScope::Listing`] failure for the
+    /// directory, carrying how many, precedes this event.
     Interrupted,
     /// Not one child could be listed. A [`FailureScope::Listing`] failure for the directory
     /// precedes this event.
