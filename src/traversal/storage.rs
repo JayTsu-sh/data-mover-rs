@@ -95,7 +95,7 @@ impl StorageTraversalSource {
     }
 
     #[cfg(test)]
-    fn with_roles(namespace: Arc<dyn Namespace>, metadata: Arc<dyn Metadata>) -> Self {
+    pub(crate) fn with_roles(namespace: Arc<dyn Namespace>, metadata: Arc<dyn Metadata>) -> Self {
         Self {
             namespace,
             metadata,

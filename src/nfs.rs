@@ -30,7 +30,8 @@ use crate::storage::backends::nfs::common::{
     NfsRetryPolicy,
 };
 use crate::storage::backends::nfs::namespace::{
-    NfsListedChild, NfsNamespaceObservation, NfsNamespaceProtocol, inline_ownership,
+    NfsListingPages, NfsNamespaceObservation, NfsNamespaceProtocol, NfsReadEnd, NfsReadFailure,
+    inline_ownership,
 };
 use crate::storage::backends::nfs::source::{
     NfsProtocolFailure, NfsReadCursor, NfsSourceObservation, NfsSourceProtocol,
@@ -52,7 +53,6 @@ mod role_listing;
 mod role_metadata;
 
 pub(crate) use owner::owner_id;
-use role_listing::role_child;
 
 type NfsWalkTask = (String, Bytes, usize, bool, Option<usize>);
 
@@ -242,6 +242,13 @@ impl moka::Expiry<(PathBuf, Bytes), Bytes> for DepthAwareExpiry {
     ) -> Option<Duration> {
         Some(Self::tti_for_depth(Self::path_depth(&key.0)))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Handles this thread put into [`GLOBAL_CACHE`], so a test can tell that a code path running
+    /// on it cached none.
+    static CACHE_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 static GLOBAL_CACHE: LazyLock<Cache<(PathBuf, Bytes), Bytes>> = LazyLock::new(|| {
@@ -631,17 +638,31 @@ impl NfsNamespaceProtocol for NFSStorage {
         })
     }
 
-    async fn list(
+    async fn directory_handle(
         &self,
         path: &crate::model::StoragePath,
-    ) -> std::result::Result<Vec<NfsListedChild>, NfsProtocolFailure> {
-        Ok(self
-            .list_role_entries(&PathBuf::from(path.as_str()))
+    ) -> std::result::Result<Bytes, NfsProtocolFailure> {
+        self.role_directory_handle(path)
             .await
-            .map_err(classify_role_error)?
-            .iter()
-            .map(|child| role_child(path, child))
-            .collect())
+            .map_err(classify_role_error)
+    }
+
+    async fn read_directory(
+        &self,
+        path: &crate::model::StoragePath,
+        handle: Bytes,
+        pages: &mut dyn NfsListingPages,
+    ) -> std::result::Result<NfsReadEnd, NfsReadFailure> {
+        self.read_role_directory(path, handle, pages).await
+    }
+
+    async fn forget_directory(
+        &self,
+        path: &crate::model::StoragePath,
+    ) -> std::result::Result<(), NfsProtocolFailure> {
+        self.forget_role_directory(path)
+            .await
+            .map_err(classify_role_error)
     }
 
     async fn read_link(
@@ -2412,6 +2433,8 @@ impl NFSStorage {
             cache_key,
             file_handle.len()
         );
+        #[cfg(test)]
+        CACHE_WRITES.with(|writes| writes.set(writes.get() + 1));
         GLOBAL_CACHE.insert(cache_key, Bytes::copy_from_slice(file_handle));
     }
 

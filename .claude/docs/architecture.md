@@ -207,7 +207,7 @@ for entry in read_dir(dir):
 预读 (from_producer：channel 1 页 + 生产者手里 1 页)。偷看到的结束 (`End` / 失败) 不需要 credit：
 生产者正常返回不再占 channel 槽发 `End` 消息，而是先置 `finished` 标志再丢掉最后一个 sender，
 所以单页小目录的页一收到、结束就可见，页与结束一起到，驱动一次唤醒 (偷看没看到的结束要等游标取走前一页)。任务中途 panic 由 `Reporter` 的 Drop 报 `Internal`。
-**Local 自 C5 起逐页读目录**（每页一次 `spawn_blocking`，`ReadDir` 带进带出）；**HDFS 自 C8 起逐页列举**（`list_status_iter` 按页取，列举前不再 `get_file_info`，取消 / drop 立即放弃进行中的请求；中途可重试失败从最后读到的名字之后续读）；**S3 当前对象自 C6 起逐页列举**（`ListObjectsV2` 每个服务端页一到就按 `page_hint` 交出，不假设 key 有序：公共前缀用集合去重、续页只用不透明 token、节流 / 瞬时失败用同一 token 重发；多版本 All 仍按目录收齐，C11b 改）；NFS / CIFS 在 C7 / C9 之前生产者仍整目录读完再按页交出，所以真机上"几页"的界目前只在遍历这一侧与 Local / S3 当前对象 / HDFS 上成立。
+**Local 自 C5 起逐页读目录**（每页一次 `spawn_blocking`，`ReadDir` 带进带出）；**HDFS 自 C8 起逐页列举**（`list_status_iter` 按页取，列举前不再 `get_file_info`，取消 / drop 立即放弃进行中的请求；中途可重试失败从最后读到的名字之后续读）；**S3 当前对象自 C6 起逐页列举**（`ListObjectsV2` 每个服务端页一到就按 `page_hint` 交出，不假设 key 有序：公共前缀用集合去重、续页只用不透明 token、节流 / 瞬时失败用同一 token 重发；多版本 All 仍按目录收齐，C11b 改）；**NFS 自 C7 起逐页列举**（READDIRPLUS 的回复逐条取、按 `page_hint` 攒页交出，一次只多读一个回复；取消 / drop 在下一个请求之前停，不放弃在途请求；首页之前可整目录从头重读，之后失败 → `Interrupted`）；CIFS 在 C9 之前生产者仍整目录读完再按页交出，所以真机上"几页"的界目前在 CIFS 之外的 backend 上成立。
 
 驱动循环 (`storage.rs` 的 `drive`)：
 
@@ -255,7 +255,10 @@ loop {
 
 **下钻提示** (§12.7)：列举可给目录子项带一个 backend 私有、拷贝出来的 `DescentHint`
 (`ListedChild::with_descent_hint`)，经 `Descend` 槽位的 `DirectoryWork.hint` / `Pending` 槽位的
-`hint` 带到该子目录自己的 `ListRequest.descent_hint`。C4 只建通道，没有 backend 填它 (C7 填 NFS 句柄)。
+`hint` 带到该子目录自己的 `ListRequest.descent_hint`。C4 建通道；**C7 起 NFS 填它**：子目录的文件句柄拷贝一份
+(绝不是 READDIRPLUS 回复的切片)，子目录的列举直接拿它发 READDIRPLUS，不再每目录 LOOKUP，也不再把句柄写进
+`GLOBAL_CACHE`；没有提示 (遍历根) 或提示失效 (`STALE` / `BADHANDLE` / `FHEXPIRED`) 才按路径 `lookup_fh`。
+内存从"整棵树的目录数 × 约 625 B 的缓存项"变成"待处理目录数 × 句柄长度"。Local / HDFS / S3 不需要提示，不填。
 
 **序号只在 cursor 里按这个顺序分配**；列举与观察可以任意次序完成，时间只决定*何时*能走下一步，
 不决定*谁拿到哪个序号*。重排缓冲严格按序号释放 —— 这是确定性的全部来源。

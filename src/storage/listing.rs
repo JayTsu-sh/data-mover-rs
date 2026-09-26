@@ -19,13 +19,14 @@
 //! Single-directory callers (recursive delete, the NDX walk) collect a whole listing with
 //! [`collect_listing`].
 //!
-//! **Where each backend stands.** Local (P7 C5), S3's current objects (C6) and HDFS (C8) read
-//! their directories page by page: a dropped or cancelled listing stops within a page (S3 and HDFS
-//! abandon their stateless request in flight at once). S3's listing of every version is still
-//! gathered whole per directory (§5.3; it too abandons its requests at once). NFS and CIFS still
-//! read the whole directory first and then hand it over in pages, so backpressure and cancellation
-//! only act between pages: a dropped or cancelled listing of a large directory is still read to
-//! its end in the background. True paging comes for them in C7 and C9. A
+//! **Where each backend stands.** Local (P7 C5), S3's current objects (C6), NFS (C7) and HDFS
+//! (C8) read their directories page by page: a dropped or cancelled listing stops within a page
+//! (S3 and HDFS abandon their stateless request in flight at once; NFS lets the READDIRPLUS in
+//! flight finish and sends no other). S3's listing of every version is still gathered whole per
+//! directory (§5.3; it too abandons its requests at once). CIFS still reads the whole directory
+//! first and then hands it over in pages, so backpressure and cancellation only act between
+//! pages: a dropped or cancelled listing of a large directory is still read to its end in the
+//! background. True paging comes for it in C9. A
 //! producer detached from a runtime that shuts down mid-listing is dropped with the runtime, as
 //! every other detached task is.
 
@@ -158,14 +159,20 @@ impl ListingPage {
             internal_hidden,
         };
         for descriptor in descriptors {
-            page.push_descriptor(directory, descriptor);
+            page.push_descriptor(directory, descriptor, None);
         }
         page
     }
 
-    /// Adds the listed child of `directory` that `descriptor` describes, or a failure at the path
-    /// it carried when that path is not `directory`, `/` and one name.
-    fn push_descriptor(&mut self, directory: &StoragePath, descriptor: SourceDescriptor) {
+    /// Adds the listed child of `directory` that `descriptor` describes, carrying `hint` for the
+    /// listing of it ([`DescentHint`]), or a failure at the path it carried when that path is not
+    /// `directory`, `/` and one name.
+    pub(crate) fn push_descriptor(
+        &mut self,
+        directory: &StoragePath,
+        descriptor: SourceDescriptor,
+        hint: Option<DescentHint>,
+    ) {
         let Some(name) = child_name(directory, &descriptor.path) else {
             self.failures.push(ChildFailure {
                 name: None,
@@ -207,7 +214,7 @@ impl ListingPage {
             inline_ownership,
             version,
             listing,
-            descent_hint: None,
+            descent_hint: hint,
         });
     }
 
@@ -612,9 +619,10 @@ impl PageSink {
         self.sender.is_closed()
     }
 
-    /// Hands over a listing a backend read whole, in pages of at most `request.page_hint`
-    /// children; the first page carries the failures and the hidden-artifact count. Stops at
-    /// cancellation with a `Cancelled` failure, and as soon as the consumer is gone.
+    /// Hands over a listing a backend read whole (CIFS until C9, S3 versions until C11b), in pages
+    /// of at most `request.page_hint` children; the first page carries the failures and the
+    /// hidden-artifact count. Stops at cancellation with a `Cancelled` failure, and as soon as the
+    /// consumer is gone.
     pub(crate) async fn deliver(&self, listing: Item, request: &ListRequest) {
         match listing {
             Ok(page) => {

@@ -20,9 +20,10 @@ pub(crate) struct NfsDialectError;
 pub(crate) fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
     if let Some(outcome) = error.operation_outcome() {
         let (class, transience) = match outcome.recovery {
-            // The transport/session cannot currently serve requests. A retry is certified safe by
-            // nfs-rs; a remount explicitly replaces that session. `role_failure` promotes both
-            // Connectivity failures to session scope.
+            // The request got no authoritative answer. `Retry`: nfs-rs certifies sending it
+            // again safe on the session it has; `Remount`: the session must be replaced.
+            // `role_failure` promotes both Connectivity failures to session scope (the role
+            // listing keeps a `Retry` after its first page to that listing, P7 C7).
             nfs_rs::RecoveryAction::Retry | nfs_rs::RecoveryAction::Remount => {
                 (FailureClass::Connectivity, Transience::Transient)
             }
@@ -71,9 +72,13 @@ pub(crate) fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
             (FailureClass::Connectivity, Transience::Unknown)
         }
         // The server asks the client to come back later: throttling, not a protocol fault
-        // (P7 §8). nfs-rs and the role listing back off on `NFS4ERR_DELAY` before this surfaces;
-        // `NFS3ERR_JUKEBOX` is not retried by either yet, so it surfaces at once.
-        nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_DELAY)
+        // (P7 §8). `NFS4ERR_GRACE` is the same request while a restarted server recovers its
+        // state. nfs-rs backs off on `NFS4ERR_DELAY` / `NFS4ERR_GRACE` itself and returns the bare
+        // status once it gives up; the role listing backs off on all three before its first page
+        // (P7 C7). Elsewhere `NFS3ERR_JUKEBOX` is not retried yet, so it surfaces at once.
+        nfs_rs::NfsError::Nfs4(
+            nfs_rs::Nfs4ErrorCode::NFS4ERR_DELAY | nfs_rs::Nfs4ErrorCode::NFS4ERR_GRACE,
+        )
         | nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_JUKEBOX) => {
             (FailureClass::Throttled, Transience::Transient)
         }
@@ -129,6 +134,17 @@ mod tests {
                 nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_JUKEBOX),
                 FailureClass::Throttled,
                 Transience::Transient,
+            ),
+            // A restarted server recovering its state: come back later, as for DELAY.
+            (
+                nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_GRACE),
+                FailureClass::Throttled,
+                Transience::Transient,
+            ),
+            (
+                nfs_rs::NfsError::Rpc("malformed reply".to_owned()),
+                FailureClass::Connectivity,
+                Transience::Unknown,
             ),
             // A refused chown: the metadata role's SETATTR reaches this arm unwrapped.
             (

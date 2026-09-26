@@ -2,32 +2,40 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
-use super::source::{NfsProtocolFailure, entry_failure, role_failure};
+use super::source::{NfsProtocolFailure, role_failure};
 use crate::model::{
     BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength, Operation,
     OwnershipMode, SourceIdentity, SourceVersion, StoragePath, SymlinkTarget,
     SymlinkTargetEncoding, Transience,
 };
 use crate::storage::artifacts::is_artifact_native;
-use crate::storage::listing::respelled;
-use crate::storage::{
-    ChildFailure, ListRequest, ListingPage, ListingStream, Namespace, NamespaceCapabilities,
-    SourceDescriptor, StorageRoleFailure,
-};
 use crate::storage::{InlineOwnership, ListingFacts};
+use crate::storage::{
+    ListRequest, ListingStream, Namespace, NamespaceCapabilities, SourceDescriptor,
+    StorageRoleFailure,
+};
 
 #[derive(Clone)]
 pub(crate) struct NfsNamespaceAdapter {
-    protocol: Arc<dyn NfsNamespaceProtocol>,
-    identity: BackendIdentity,
+    pub(super) protocol: Arc<dyn NfsNamespaceProtocol>,
+    pub(super) identity: BackendIdentity,
+    /// Leads every descent hint this namespace makes, so it reads only its own
+    /// (`listing::hinted_handle`): 8 bytes of the endpoint identity's digest. It keeps a hint from
+    /// another endpoint from being read by mistake; it is no proof — hints are plain bytes a
+    /// caller can make, and two endpoints given the same identity share a tag.
+    pub(super) hint_tag: [u8; HINT_TAG_LEN],
 }
+
+/// The length of [`NfsNamespaceAdapter::hint_tag`].
+pub(super) const HINT_TAG_LEN: usize = 8;
 
 pub(crate) struct NfsNamespaceObservation {
     pub(crate) path: StoragePath,
     pub(crate) kind: EntryKind,
     pub(crate) size: Option<u64>,
-    pub(crate) file_handle: bytes::Bytes,
+    pub(crate) file_handle: Bytes,
     /// Timestamps the enumerating operation already returned. `readdirplus` and `LOOKUP` both
     /// carry the full attribute set, so neither path costs an extra round trip; `created` holds
     /// the POSIX change time, as the NFS metadata role also reports it (`NFSv3` has no birth time).
@@ -56,7 +64,7 @@ pub(crate) struct NfsUndescribedChild {
     /// What was wrong with it, for the diagnostic.
     pub(crate) reason: &'static str,
     /// The name as nfs-rs decoded it, when no path can spell the child (see [`unnamed_child`]).
-    pub(crate) raw_name: Option<bytes::Bytes>,
+    pub(crate) raw_name: Option<Bytes>,
 }
 
 /// One child of a listing: its observation, or why it could not be described.
@@ -96,7 +104,7 @@ pub(crate) fn unnamed_child(directory: &StoragePath, name: &str) -> NfsUndescrib
         failure: NfsProtocolFailure::new(FailureClass::Unsupported, Transience::Permanent),
         reason: "an NFS name is not UTF-8 (the NFS client replaced the invalid bytes), so no path \
                  can spell it",
-        raw_name: Some(bytes::Bytes::copy_from_slice(name.as_bytes())),
+        raw_name: Some(Bytes::copy_from_slice(name.as_bytes())),
     }
 }
 
@@ -105,14 +113,81 @@ pub(crate) fn lossily_decoded(name: &str) -> bool {
     name.contains(char::REPLACEMENT_CHARACTER)
 }
 
+/// How a READDIRPLUS read of a directory ended without a failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NfsReadEnd {
+    /// The server said end of directory.
+    Complete,
+    /// [`NfsListingPages`] asked to stop: the listing was cancelled, or its consumer is gone.
+    Stopped,
+}
+
+/// What reading the directory again from its start could do about a failed READDIRPLUS read,
+/// while no page of it has been handed over yet (P7 §5.2: after the first page it can only be
+/// continued from its cookie, which nfs-rs does not expose, Q18).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NfsRestart {
+    /// Nothing: the failure stands.
+    Never,
+    /// The handle may no longer name the directory (`NFS3ERR_STALE` / `BADHANDLE`,
+    /// `NFS4ERR_STALE` / `BADHANDLE` / `FHEXPIRED`, or a `NOENT` from a concurrent rename):
+    /// resolve the path again, then read anew.
+    Relookup,
+    /// The server asked to be asked again later (`NFS4ERR_DELAY`, `NFS3ERR_JUKEBOX`,
+    /// `NFS4ERR_GRACE`): back off, then read anew.
+    Backoff,
+    /// The request got no answer and nfs-rs certifies sending it again safe on the session it has
+    /// (`RecoveryAction::Retry`; or a bare connection reset or timeout) — unlike `Remount`, no
+    /// new session is needed. Pause briefly, then read anew; once a page is out, only this
+    /// listing fails.
+    Resend,
+}
+
+/// A failed READDIRPLUS read of one directory.
+#[derive(Clone)]
+pub(crate) struct NfsReadFailure {
+    pub(crate) failure: NfsProtocolFailure,
+    pub(crate) restart: NfsRestart,
+}
+
+/// Where a READDIRPLUS read hands the children of the directory it reads.
+#[async_trait]
+pub(crate) trait NfsListingPages: Send {
+    /// Takes the next child, in the order the server sent it. `true` once the page is full: the
+    /// reader then calls [`Self::hand_over`] before it reads on.
+    fn push(&mut self, child: NfsListedChild) -> bool;
+    /// Hands the full page over, waiting while the consumer still holds the previous one.
+    /// `false` once the listing is over (cancelled, or its consumer gone): the reader must stop.
+    async fn hand_over(&mut self) -> bool;
+    /// Whether the listing is over, so the reader must not ask the server for more.
+    fn stopping(&self) -> bool;
+}
+
 #[async_trait]
 pub(crate) trait NfsNamespaceProtocol: Send + Sync {
     async fn stat(&self, path: &StoragePath)
     -> Result<NfsNamespaceObservation, NfsProtocolFailure>;
-    /// The children of `path`, each observed or the reason it could not be; a failure of the
-    /// directory itself (lookup, the READDIRPLUS stream) fails the whole call.
-    async fn list(&self, path: &StoragePath) -> Result<Vec<NfsListedChild>, NfsProtocolFailure>;
-    async fn read_link(&self, path: &StoragePath) -> Result<bytes::Bytes, NfsProtocolFailure>;
+    /// The handle of the directory `path` names, resolved from the root through the directory
+    /// handle cache (a LOOKUP for each component it does not hold). A listing asks for it only
+    /// when it has no descent hint, or its hint no longer names the directory.
+    async fn directory_handle(&self, path: &StoragePath) -> Result<Bytes, NfsProtocolFailure>;
+    /// Reads the directory whose handle is `handle` and whose path is `path` with READDIRPLUS,
+    /// from its start, handing every child to `pages` as the server sends it, and returns once
+    /// the server says end of directory or `pages` says to stop. It checks
+    /// [`NfsListingPages::stopping`] before every child, so a stopped listing sends no further
+    /// request, but it never abandons a request in flight (an NFSv4.1 session fences the slot
+    /// of a cancelled request). It holds no more than the reply it is working through, and
+    /// caches nothing.
+    async fn read_directory(
+        &self,
+        path: &StoragePath,
+        handle: Bytes,
+        pages: &mut dyn NfsListingPages,
+    ) -> Result<NfsReadEnd, NfsReadFailure>;
+    /// Forgets what is cached about reaching `path` (and refreshes the root handle when it has
+    /// gone stale), after the handle [`Self::directory_handle`] gave for it proved stale.
+    async fn forget_directory(&self, path: &StoragePath) -> Result<(), NfsProtocolFailure>;
+    async fn read_link(&self, path: &StoragePath) -> Result<Bytes, NfsProtocolFailure>;
     async fn create_directory(&self, path: &StoragePath) -> Result<(), NfsProtocolFailure>;
     async fn delete(&self, path: &StoragePath, kind: EntryKind) -> Result<(), NfsProtocolFailure>;
     async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), NfsProtocolFailure>;
@@ -120,7 +195,14 @@ pub(crate) trait NfsNamespaceProtocol: Send + Sync {
 
 impl NfsNamespaceAdapter {
     pub(crate) fn new(protocol: Arc<dyn NfsNamespaceProtocol>, identity: BackendIdentity) -> Self {
-        Self { protocol, identity }
+        let digest = blake3::hash(identity.stable_id().as_bytes());
+        let mut hint_tag = [0_u8; HINT_TAG_LEN];
+        hint_tag.copy_from_slice(&digest.as_bytes()[..HINT_TAG_LEN]);
+        Self {
+            protocol,
+            identity,
+            hint_tag,
+        }
     }
 
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
@@ -130,61 +212,13 @@ impl NfsNamespaceAdapter {
             .stat(path)
             .await
             .map_err(|error| role_failure(path, Operation::Namespace, error))?;
-        descriptor(&self.identity, path.clone(), &entry)
-    }
-
-    /// Lists one whole directory. A child that cannot be described is reported on its own,
-    /// beside the siblings that could be: the directory itself was listed, so failing it whole
-    /// would drop them. Children come back joined with `Path::join`, which folds a trailing `/`
-    /// of the request (`d/` gives `d/x`); each is spelled again as the request and its name.
-    async fn list_whole(&self, path: &StoragePath) -> Result<ListingPage, StorageRoleFailure> {
-        checked_allow_root(path)?;
-        let children = self
-            .protocol
-            .list(path)
-            .await
-            .map_err(|error| role_failure(path, Operation::Namespace, error))?;
-        let mut entries = Vec::with_capacity(children.len());
-        let mut failures = Vec::new();
-        let mut unnamed = Vec::new();
-        let mut hidden = 0_u32;
-        for child in children {
-            match child {
-                Ok(entry) if is_internal(&entry.path) => hidden = hidden.saturating_add(1),
-                Ok(entry) => {
-                    match descriptor(&self.identity, respelled(path, entry.path.clone()), &entry) {
-                        Ok(descriptor) => entries.push(descriptor),
-                        Err(StorageRoleFailure::Entry(failure)) => failures.push(failure),
-                        Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
-                    }
-                }
-                Err(NfsUndescribedChild {
-                    raw_name: Some(raw),
-                    reason,
-                    failure,
-                    ..
-                }) => unnamed.push(ChildFailure::unnamed(
-                    &self.identity,
-                    path,
-                    raw,
-                    failure.class,
-                    reason,
-                )),
-                Err(child) if is_internal(&child.path) => hidden = hidden.saturating_add(1),
-                Err(child) => failures.push(undescribed(child)),
-            }
-        }
-        let mut page = ListingPage::from_descriptors(path, entries, failures, hidden);
-        for failure in unnamed {
-            page.push_failure(failure);
-        }
-        Ok(page)
+        descriptor(&self.identity, path.clone(), &entry).map_err(StorageRoleFailure::Entry)
     }
 }
 
 /// The entry failure of a child the listing could not describe. Always entry-scoped: whatever
 /// was wrong concerns that child, never the session.
-fn undescribed(child: NfsUndescribedChild) -> EntryOperationFailure {
+pub(super) fn undescribed(child: NfsUndescribedChild) -> EntryOperationFailure {
     let NfsUndescribedChild {
         path,
         failure,
@@ -207,13 +241,12 @@ impl Namespace for NfsNamespaceAdapter {
         self.describe(path).await
     }
 
-    /// Reads the whole directory, then hands it over in pages (true paging comes with C7). The
-    /// listing runs to its end even when the stream is dropped: nothing is abandoned mid-RPC.
+    /// Streams the directory page by page with READDIRPLUS, starting from the request's descent
+    /// hint when it has one (P7 C7, see [`super::listing`]).
     fn list(&self, request: ListRequest) -> ListingStream {
         let namespace = self.clone();
-        ListingStream::from_producer(request.path.clone(), move |sink| async move {
-            let listing = namespace.list_whole(&request.path).await;
-            sink.deliver(listing, &request).await;
+        ListingStream::from_producer(request.path.clone(), move |sink| {
+            super::listing::produce(namespace, request, sink)
         })
     }
 
@@ -264,17 +297,20 @@ impl Namespace for NfsNamespaceAdapter {
     }
 }
 
-fn descriptor(
+/// The descriptor of `entry` at `path`, or a failure at `path` when the handle is too large to
+/// be an identity.
+pub(super) fn descriptor(
     identity: &BackendIdentity,
     path: StoragePath,
     entry: &NfsNamespaceObservation,
-) -> Result<SourceDescriptor, StorageRoleFailure> {
-    let source_identity = SourceIdentity::new(
+) -> Result<SourceDescriptor, EntryOperationFailure> {
+    let Ok(source_identity) = SourceIdentity::new(
         identity.clone(),
         IdentityStrength::StableWithinBackend,
         &entry.file_handle,
-    )
-    .map_err(|_| invalid(&path))?;
+    ) else {
+        return Err(invalid_entry(&path));
+    };
     Ok(SourceDescriptor {
         path,
         kind: entry.kind,
@@ -297,7 +333,7 @@ fn checked(path: &StoragePath) -> Result<PathBuf, StorageRoleFailure> {
     checked_allow_root(path)
 }
 
-fn checked_allow_root(path: &StoragePath) -> Result<PathBuf, StorageRoleFailure> {
+pub(super) fn checked_allow_root(path: &StoragePath) -> Result<PathBuf, StorageRoleFailure> {
     let native = PathBuf::from(path.as_str());
     if native.is_absolute()
         || is_internal(path)
@@ -314,17 +350,23 @@ fn checked_allow_root(path: &StoragePath) -> Result<PathBuf, StorageRoleFailure>
     }
 }
 
-fn is_internal(path: &StoragePath) -> bool {
+pub(super) fn is_internal(path: &StoragePath) -> bool {
     is_artifact_native(Path::new(path.as_str()))
 }
 
 fn invalid(path: &StoragePath) -> StorageRoleFailure {
-    entry_failure(
-        path,
+    StorageRoleFailure::Entry(invalid_entry(path))
+}
+
+fn invalid_entry(path: &StoragePath) -> EntryOperationFailure {
+    EntryOperationFailure::new(
+        path.clone(),
         Operation::Namespace,
         FailureClass::InvalidInput,
         Transience::Permanent,
+        "NFS role failed",
     )
+    .unwrap_or_else(|_| unreachable!("static diagnostic is valid"))
 }
 
 #[cfg(test)]
@@ -332,7 +374,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::storage::{CollectLimits, ListedChild, collect_listing};
+    use crate::storage::{CollectLimits, ListedChild, ListingPage, collect_listing};
 
     fn path(value: &str) -> StoragePath {
         StoragePath::new(value).unwrap_or_else(|error| panic!("{error}"))
@@ -343,7 +385,7 @@ mod tests {
             path: path(value),
             kind: EntryKind::File,
             size: Some(1),
-            file_handle: bytes::Bytes::from(value.to_owned()),
+            file_handle: Bytes::from(value.to_owned()),
             timestamps: None,
             mode: None,
             ownership: None,
@@ -359,7 +401,8 @@ mod tests {
         })
     }
 
-    /// A listing fake: `List` answers the children it was built with, or fails the directory.
+    /// A listing fake: a read of the directory hands over the children it was built with; with
+    /// none, the directory cannot be resolved.
     struct Listing(Option<fn() -> Vec<NfsListedChild>>);
 
     #[async_trait]
@@ -370,18 +413,31 @@ mod tests {
         ) -> Result<NfsNamespaceObservation, NfsProtocolFailure> {
             Err(NfsProtocolFailure::protocol())
         }
-        async fn list(
-            &self,
-            _path: &StoragePath,
-        ) -> Result<Vec<NfsListedChild>, NfsProtocolFailure> {
+        async fn directory_handle(&self, _path: &StoragePath) -> Result<Bytes, NfsProtocolFailure> {
             self.0
-                .map(|children| children())
+                .map(|_| Bytes::from_static(b"fh"))
                 .ok_or(NfsProtocolFailure::new(
                     FailureClass::PermissionDenied,
                     Transience::Permanent,
                 ))
         }
-        async fn read_link(&self, _path: &StoragePath) -> Result<bytes::Bytes, NfsProtocolFailure> {
+        async fn read_directory(
+            &self,
+            _path: &StoragePath,
+            _handle: Bytes,
+            pages: &mut dyn NfsListingPages,
+        ) -> Result<NfsReadEnd, NfsReadFailure> {
+            for child in self.0.map(|children| children()).unwrap_or_default() {
+                if pages.push(child) && !pages.hand_over().await {
+                    return Ok(NfsReadEnd::Stopped);
+                }
+            }
+            Ok(NfsReadEnd::Complete)
+        }
+        async fn forget_directory(&self, _path: &StoragePath) -> Result<(), NfsProtocolFailure> {
+            Ok(())
+        }
+        async fn read_link(&self, _path: &StoragePath) -> Result<Bytes, NfsProtocolFailure> {
             Err(NfsProtocolFailure::protocol())
         }
         async fn create_directory(&self, _path: &StoragePath) -> Result<(), NfsProtocolFailure> {

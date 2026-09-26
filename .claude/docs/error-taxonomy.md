@@ -134,7 +134,7 @@ nfs-rs 错误产出 `FailureClass` + `Transience`，并记下服务端状态名�
 | `Io` PermissionDenied / NotFound | `PermissionDenied` / `NotFound` | Permanent |
 | `Io` ConnectionReset / TimedOut / WouldBlock | `Connectivity` | Transient |
 | 其他 `Io` / `Rpc` | `Connectivity` | Unknown |
-| `NFS4ERR_DELAY` / `NFS3ERR_JUKEBOX`（服务端忙。`NFS4ERR_DELAY` 由 nfs-rs 与列举的 `list_role_entries` 先退避；`NFS3ERR_JUKEBOX` 两者都还不重试，立即浮出——待补） | **`Throttled`** | Transient |
+| `NFS4ERR_DELAY` / `NFS3ERR_JUKEBOX` / `NFS4ERR_GRACE`（`GRACE` 自 P7 C7 起，此前是 `Protocol` / Unknown）（服务端忙 / 重启后的恢复期。`NFS4ERR_DELAY`、`NFS4ERR_GRACE` 由 nfs-rs 先退避，用尽后返回原状态；role 列举首页之前两者都按列举的节流预算退避后整目录重读（P7 C7），首页之后是该列举的失败；其他 role 路径的 `NFS3ERR_JUKEBOX` 仍立即浮出——待补） | **`Throttled`** | Transient |
 | 其他服务端状态（如 `NFS4ERR_BADOWNER`、`NFS4ERR_STALE`） | `Protocol` | Unknown |
 
 `Connectivity` 经 `role_failure` 升为会话失败（metadata 阶段报 `SessionLost`，后面的族不再应用）；
@@ -218,6 +218,7 @@ Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修�
 | Local 名字不是 UTF-8 / 拼出的路径超长 | 无名子项（`raw_name` = Unix 原始字节，Windows UTF-16LE） | `Unsupported` / Permanent |
 | NFS / CIFS 名字含 U+FFFD（nfs-rs、smb-rs 有损解码，原名已丢，按它拼出的路径指不到原条目；真含 U+FFFD 的名字无法区分，一并报） | 无名子项（NFS 无原始字节；CIFS `raw_name` = 解码后的 UTF-8） | `Unsupported` / Permanent |
 | NFS READDIRPLUS 某项没带属性（v3 `post_op_attr` 可省；v4 属性解不出也是这样）或没带文件句柄 | 子项（报在子项路径；名字拼不出 `StoragePath` 时报在目录上） | `Protocol` / Unknown |
+| NFS 列举（P7 C7）READDIRPLUS 读目录失败。**首页交出之前**从目录开头重读、不重复交出：句柄不再指向目录（`STALE` / `BADHANDLE` / `FHEXPIRED`，或并发改名的 `NOENT`）→ 下钻提示失效则按路径解析一次，否则忘掉缓存的句柄再解析，至多 3 次；服务端忙（`DELAY` / `JUKEBOX` / `GRACE`）→ 列举的节流预算内退避；nfs-rs 认证可安全重发的传输失败（`RecoveryAction::Retry`，或裸的连接重置 / 超时）→ 250 ms / 1 s / 2 s 至多 3 次。**首页之后**不重试（READDIRPLUS 只能从 cookie 续，nfs-rs 不公开，Q18） | 续上则无失败；否则整个列举，先交出已读到的子项，块 `Interrupted { delivered }`（一项未交出则 `Unreadable`）。可安全重发的传输失败在首页之后只让该列举失败（nfs-rs 认证可在现有会话上重发，不必重挂）；首页之前重发用尽、或 nfs-rs 要求重新挂载（`Remount`）的照常升会话 | 按 NFS role 映射（C7 起 READDIRPLUS 的错误直接经 `classify_error`，保留状态名；此前一律 `Protocol` / Unknown） |
 | CIFS 子项的身份字节超出模型上限（造不出 `SourceIdentity`） | 子项 | `Protocol` / Permanent |
 | HDFS 子项的 status 转换不了（时间超出 `i64` 纳秒等）、路径拼不出 `StoragePath` | 子项；不是本目录直接子项的（越出根、嵌套）或拼不出的报在目录路径上 | `Protocol` / Permanent |
 | S3 列举（P7 C6，Current 与 All）的一页节流：同一 continuation token / marker 按有界退避重发（每个列举累计约 2 分钟）；其他瞬时失败（5xx 但不含 501、超时、连接断开）：同一 token 重发至多 3 次（250 ms / 1 s / 2 s，读到一页即续满），首页前后一样，不从头重列、不重复交出 | 续上则无失败；节流超预算 → 该列举 `Throttled` / Transient；瞬时失败重发用尽 → 保留原作用域（会话级的照常升会话）；首页之后失败的 Current 列举块 `Interrupted { delivered }` | 按 S3 映射 |

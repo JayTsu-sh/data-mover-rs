@@ -132,7 +132,20 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 
 - legacy `walkdir` / `walkdir_2` 与 role namespace `List` 都隐藏 `.data-mover-*`（相对根的任一段，先于过滤
   与 GETATTR）；role namespace 拒绝寻址它们。
-- role `List`（`list_role_entries` → `role_listed_entry` / `role_observation`）里某项描述不出来 ——
+- role `List` 自 P7 C7 起**逐页流式**（`storage/backends/nfs/listing.rs` 的生产者 + `src/nfs/role_listing.rs` 的
+  READDIRPLUS 读取）：nfs-rs 的 `readdirplus` 流逐条取，按 `page_hint` 攒页交出，一次最多多读一个回复；
+  消费方 drop 或取消 → 下一条之前停，**不放弃在途的 READDIRPLUS**（NFSv4.1 被取消的请求会把 session slot 围起来）。
+  - **下钻提示**：每个子目录带一份**拷贝**出来的文件句柄（`DescentHint`，从不引用回复缓冲），遍历下钻时带回来，
+    子目录直接用它发 READDIRPLUS，不再每目录 LOOKUP。没有提示（遍历根、`ndx_walk` / `delete_tree` 这类不带提示的
+    调用方）或提示失效（`STALE` / `BADHANDLE` / `FHEXPIRED`）才按路径 `lookup_fh`（它照旧读写 `GLOBAL_CACHE`）。
+  - **列举不再写 `GLOBAL_CACHE`**：C7 之前每列一个目录就把所有子目录句柄写进去，m1-source 整树上缓存常驻约
+    13.5 万项 / 92 MB、另有过期碎片约 99 MB（P7 §12.7 内存根因）。变更路径（`create_dir_all`、`lookup_fh`、
+    rmdir / rename 的失效）照旧用它。
+  - **重试**：首页交出之前可从目录开头重读（不会重复交出）—— 句柄失效 → 解析路径（提示失效时一次，之后忘掉缓存再解析
+    至多 3 次）；`DELAY` / `JUKEBOX` / `GRACE`（`GRACE` C7 起分类为 `Throttled`）→ 列举的节流预算内退避；nfs-rs 认证可安全重发的传输失败 → 250 ms / 1 s / 2 s。
+    首页之后不重试（READDIRPLUS 只能从 cookie 续，nfs-rs 0.8.4 不公开页接口，Q18）：已读到的先交出，再以失败结束，
+    遍历记 `Interrupted`；可安全重发的传输失败此时只让该列举失败。错误直接经 `classify_error`，保留服务端状态名。
+- role `List`（`drain_readdirplus` → `role_listed_entry` / `role_observation`）里某项描述不出来 ——
   READDIRPLUS 没带属性（v3 `post_op_attr` 可省；v4 的 fattr4 解不出时 nfs-rs 也给 None）、没带文件句柄（v3
   `post_op_fh3` FALSE、v4 属性里没有 `FATTR4_FILEHANDLE`）——
   报成该子项自己的 `Protocol` / Unknown 条目失败，兄弟照常，列举 `Partial`（之前整个目录失败；P7 评审现存问题 2）。
