@@ -1,6 +1,7 @@
 //! The `.upload` pointer object of a multipart upload on the final key (ADR-0006 C15b).
 //!
-//! The pointer is `.data-mover-<d>.upload` beside the final key: a `DMDPTR01` pointer without a
+//! The pointer is `.data-mover-<d>.upload` beside the final key (for a directory object `p/d/`, in
+//! its parent `p/`, named after `d/`: P7 F5): a `DMDPTR01` pointer without a
 //! durable prefix — the service's `ListParts` is the durable record, and a pointer rewritten at
 //! every checkpoint would leave a version behind each time in a versioned bucket — whose extension
 //! names the upload:
@@ -31,7 +32,9 @@ use super::super::{S3Protocol, S3ProtocolFailure, is_real_version_id};
 use super::{MIN_MULTIPART_PART_SIZE, cleanup_result};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
 use crate::storage::StorageRoleFailure;
-use crate::storage::artifacts::{ArtifactKind, is_artifact_path, sibling_artifact};
+use crate::storage::artifacts::{
+    ArtifactKind, directory_object_artifact, is_artifact_path, sibling_artifact,
+};
 use crate::storage::pointer::DestinationPointer;
 
 /// The tag every S3 upload pointer's extension starts with.
@@ -117,8 +120,10 @@ fn failure(path: &StoragePath, operation: Operation, class: FailureClass) -> Sto
     )
 }
 
-/// The pointer beside a final key. A key that names no object (empty, or ending in `/`) or lies
-/// inside a transfer artifact is refused.
+/// The pointer beside a final key: in the same parent, named after the key's last segment. A
+/// directory object `…/name/` (P7 F5) keeps its pointer in its parent too, named after `name/`
+/// ([`directory_object_artifact`]), never inside `name/`. A key that names no object (empty, or
+/// with an empty last segment) or lies inside a transfer artifact is refused.
 pub(super) fn pointer_path(final_path: &StoragePath) -> Result<StoragePath, StorageRoleFailure> {
     if is_artifact_path(final_path.as_str()) {
         return Err(failure(
@@ -127,8 +132,12 @@ pub(super) fn pointer_path(final_path: &StoragePath) -> Result<StoragePath, Stor
             FailureClass::InvalidInput,
         ));
     }
-    sibling_artifact(final_path, ArtifactKind::Upload)
-        .ok_or_else(|| failure(final_path, Operation::Prepare, FailureClass::InvalidInput))
+    let pointer = if final_path.names_directory_object() {
+        directory_object_artifact(final_path, ArtifactKind::Upload)
+    } else {
+        sibling_artifact(final_path, ArtifactKind::Upload)
+    };
+    pointer.ok_or_else(|| failure(final_path, Operation::Prepare, FailureClass::InvalidInput))
 }
 
 fn is_not_found(failure: &S3ProtocolFailure) -> bool {

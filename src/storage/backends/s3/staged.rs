@@ -1,6 +1,7 @@
 //! The S3 destination (ADR-0006): every stage writes the final key. Up to the single-PUT
 //! threshold an object is one `PutObject` (a native copy up to 64 MiB one `CopyObject`); a larger
-//! one is a multipart upload on the final key, resumable through the `.upload` pointer beside it;
+//! one is a multipart upload on the final key, resumable through the `.upload` pointer beside it
+//! (a directory object's, `p/d/`, in its parent: P7 F5);
 //! a `Direct` write completes inside `write`. Nothing is recorded where data-mover runs, and no
 //! temp key is written (the `.data-mover-stage/` temp-key path was removed in C19).
 
@@ -22,6 +23,8 @@ use super::source::{classified_entry, entry, role_failure};
 mod at_destination;
 mod completion;
 mod direct;
+#[cfg(test)]
+mod directory_object_tests;
 mod final_upload;
 mod native;
 mod native_final;

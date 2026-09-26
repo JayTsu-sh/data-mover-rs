@@ -63,7 +63,8 @@ const TEMPORARY_SUFFIX: &str = ".tmp";
 
 /// The digest naming every artifact of one final file: the first 16 bytes of
 /// `blake3("data-mover/artifact-name/v1\0" ‖ u64le(len) ‖ final name)`, as lowercase hex. Only the
-/// file's own name goes in — artifacts sit beside it in the same parent — so no process state, and no
+/// file's own name goes in — artifacts sit beside it in the same parent (a directory object's,
+/// named after `d/`, in its parent: [`directory_object_artifact`]) — so no process state, and no
 /// random part, is needed to find them again.
 pub(crate) fn final_name_digest(final_name: &str) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -91,7 +92,8 @@ pub(crate) fn artifact_temporary_name(final_name: &str, kind: ArtifactKind) -> S
 }
 
 /// The `kind` artifact beside `final_path`, in the same parent; `None` when the path names no file
-/// (the root, or a key ending in `/`).
+/// (the root, or a key ending in `/`: an object store's directory object, whose artifacts
+/// [`directory_object_artifact`] names; a filesystem has none).
 ///
 /// `/` is the only separator here. A backend whose native paths also treat `\` as one (CIFS,
 /// Windows Local) must refuse or split such final paths itself, or the artifacts would land outside
@@ -110,7 +112,36 @@ pub(crate) fn sibling_artifact(
     StoragePath::new(sibling).ok()
 }
 
-/// A deterministic artifact name, taken apart.
+/// The `kind` artifact of a directory object `…/name/` (an object store's key ending in `/`, P7
+/// F5): in the object's parent, `…/.data-mover-<digest("name/")>.<kind>`, or at the root for a
+/// root-level `name/`. Not inside `name/`, where it would make that prefix exist and sit in the
+/// directory's own listing. The digest input keeps the `/`, so it is never an artifact of the file
+/// `…/name` (`digest("name")`), and still derives from the final key alone (stateless runtime).
+/// `None` for a path that does not end in `/`, or whose last segment before it is empty (`""`,
+/// `/`, `a//`).
+pub(crate) fn directory_object_artifact(
+    final_path: &StoragePath,
+    kind: ArtifactKind,
+) -> Option<StoragePath> {
+    let key = final_path.as_str().strip_suffix('/')?;
+    let (parent, name) = match key.rsplit_once('/') {
+        Some((parent, name)) => (Some(parent), name),
+        None => (None, key),
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let artifact = artifact_name(&format!("{name}/"), kind);
+    let path = match parent {
+        Some(parent) => format!("{parent}/{artifact}"),
+        None => artifact,
+    };
+    StoragePath::new(path).ok()
+}
+
+/// A deterministic artifact name, taken apart. A listing-based sweep must match a digest of `d/`
+/// found in `p/` against the prefix `p/d/` (a directory object's artifacts, P7 F5), not against a
+/// sibling object, or it would take a live pointer for an orphan.
 #[cfg_attr(
     not(test),
     expect(
@@ -172,6 +203,35 @@ mod tests {
         assert!(is_artifact_native(Path::new(".data-mover-a.part")));
         assert!(!is_artifact_native(Path::new("dir/x.data-mover-y/z")));
         assert!(!is_artifact_native(Path::new("")));
+    }
+
+    /// P7 F5: the artifacts of a directory object `p/d/` sit in the parent `p`, named after `d/`,
+    /// and never collide with those of the file `p/d`, at any depth.
+    #[test]
+    fn artifacts_of_d_and_d_slash_never_collide() {
+        let path = |value: &str| StoragePath::new(value).unwrap_or_else(|error| panic!("{error}"));
+        for kind in ArtifactKind::ALL {
+            for (file, object, parent) in [("p/d", "p/d/", "p/"), ("d", "d/", "")] {
+                let of_file = sibling_artifact(&path(file), kind);
+                let of_object = directory_object_artifact(&path(object), kind);
+                let expected = format!("{parent}{}", artifact_name("d/", kind));
+                assert_eq!(
+                    of_object.as_ref().map(StoragePath::as_str),
+                    Some(&*expected)
+                );
+                assert!(of_file.is_some());
+                assert_ne!(of_file, of_object, "{kind:?} {file}");
+                assert!(is_artifact_path(&expected));
+            }
+            assert_eq!(sibling_artifact(&path("p/d/"), kind), None);
+            for none in ["", "/", "a//", "p/d"] {
+                assert_eq!(
+                    directory_object_artifact(&path(none), kind),
+                    None,
+                    "{none:?}"
+                );
+            }
+        }
     }
 
     #[test]
