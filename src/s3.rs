@@ -137,6 +137,7 @@ mod copy_request;
 #[cfg(test)]
 mod credential_log_tests;
 mod delete_objects_md5;
+mod directory_objects;
 mod dxn;
 mod multipart_rename;
 mod storagegrid;
@@ -3623,13 +3624,17 @@ impl S3Storage {
                 let Some(key) = object.key() else {
                     continue;
                 };
-                if prefix == key || self.is_artifact_key(key) {
+                let size = directory_objects::listed_bytes(object.size());
+                if prefix == key {
+                    if size > 0 {
+                        let path = self.calculate_relative_path(key);
+                        directory_objects::report(runtime.tx, path, size).await;
+                    }
                     continue;
                 }
-                let size = object
-                    .size()
-                    .and_then(|value| u64::try_from(value).ok())
-                    .unwrap_or(0);
+                if self.is_artifact_key(key) {
+                    continue;
+                }
                 let extension = PathBuf::from(key)
                     .extension()
                     .map(|value| value.to_string_lossy().to_string());
@@ -3663,6 +3668,7 @@ impl S3Storage {
         let mut version_id_marker = None;
         let mut pages = VersionPages::default();
         let mut walked = HashSet::new();
+        let mut own_object_reported = false;
         loop {
             let mut request = self
                 .client
@@ -3698,6 +3704,14 @@ impl S3Storage {
                     runtime,
                 )
                 .await?;
+            }
+            if !own_object_reported
+                && let Some(bytes) =
+                    directory_objects::own_versions_with_content(response.versions(), prefix)
+            {
+                own_object_reported = true;
+                let path = self.calculate_relative_path(prefix);
+                directory_objects::report(runtime.tx, path, bytes).await;
             }
             key_marker = response.next_key_marker().map(str::to_string);
             let resume = listed.next_version_id_marker();
@@ -3959,15 +3973,20 @@ impl S3Storage {
                 let Some(key) = object.key() else {
                     continue;
                 };
-                if key == prefix_key || key.ends_with('/') || self.is_artifact_key(key) {
+                let relative_path = self.calculate_relative_path(key);
+                let size = directory_objects::listed_bytes(object.size());
+                if key.ends_with('/') {
+                    // The directory's own object (only it can end in `/` under a delimiter): not
+                    // listed, but reported when it holds content (P7 F5a).
+                    if size > 0 || key != prefix_key {
+                        errors.push(directory_objects::not_listed(relative_path, size));
+                    }
                     continue;
                 }
-                let relative_path = self.calculate_relative_path(key);
+                if key == prefix_key || self.is_artifact_key(key) {
+                    continue;
+                }
                 let (file_name, extension) = Self::get_file_info(relative_path);
-                let size = object
-                    .size()
-                    .and_then(|value| u64::try_from(value).ok())
-                    .unwrap_or(0);
                 let modified = datatime_to_i64(object.last_modified());
                 if Self::read_file_is_filtered(
                     ctx,
@@ -4156,7 +4175,17 @@ impl S3Storage {
 
                 // 处理每个 object 的版本
                 for history in oldest_first_by_key(entries) {
-                    if history.key == prefix_key || self.is_artifact_key(&history.key) {
+                    if history.key == prefix_key {
+                        // The directory's own object: reported when a version holds content.
+                        if let Some(bytes) =
+                            directory_objects::history_with_content(&history.entries)
+                        {
+                            let path = self.calculate_relative_path(&history.key);
+                            errors.push(directory_objects::not_listed(path, bytes));
+                        }
+                        continue;
+                    }
+                    if self.is_artifact_key(&history.key) {
                         continue;
                     }
                     self.append_object_versions(history, ctx, &mut files).await;
