@@ -7,8 +7,9 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream;
 
+use super::listing_fake::MemoryDirectory;
 use super::metadata::CifsInlineMetadata;
-use super::namespace::{CifsListedChild, CifsNamespace, CifsNamespaceProtocol};
+use super::namespace::{CifsDirectory, CifsNamespace, CifsNamespaceProtocol};
 use super::source::{
     CifsReadCursor, CifsReadSource, CifsSourceFacts, CifsSourceProtocol, descriptor_from_facts,
     file_handle_bytes,
@@ -115,7 +116,10 @@ impl CifsNamespaceProtocol for MemoryCifs {
         Ok(())
     }
 
-    async fn list(&self, path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>> {
+    async fn open_directory(
+        &self,
+        path: &StoragePath,
+    ) -> smb_domain::Result<Box<dyn CifsDirectory>> {
         let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let listed = vec![
             (
@@ -155,7 +159,7 @@ impl CifsNamespaceProtocol for MemoryCifs {
                 },
             ),
         ];
-        Ok(listed.into_iter().map(Ok).collect())
+        Ok(MemoryDirectory::boxed(listed.into_iter().map(Ok).collect()))
     }
 }
 

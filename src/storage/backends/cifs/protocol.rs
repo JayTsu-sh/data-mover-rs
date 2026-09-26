@@ -3,10 +3,11 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::StreamExt as _;
 
+use super::directory::DomainDirectory;
 use super::metadata::{CifsInlineMetadata, CifsMetadataProtocol};
-use super::namespace::{CifsListedChild, CifsNamespaceProtocol, CifsUnspelled};
+use super::namespace::{CifsDirectory, CifsNamespaceProtocol};
 use super::source::{CifsReadCursor, CifsSourceFacts, CifsSourceProtocol};
 use super::staged::{CifsStageFile, CifsStagedProtocol};
 use crate::model::{EntryKind, StoragePath};
@@ -227,7 +228,10 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
         close
     }
 
-    async fn list(&self, path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>> {
+    async fn open_directory(
+        &self,
+        path: &StoragePath,
+    ) -> smb_domain::Result<Box<dyn CifsDirectory>> {
         let share_path = self.share_path(path)?;
         let directory = self
             .share
@@ -236,46 +240,11 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
                 smb_domain::DirectoryOpenOptions::open_existing(),
             )
             .await?;
-        let entries = directory.entries("*").try_collect::<Vec<_>>().await;
-        let close = close_directory(directory).await;
-        let entries = entries?;
-        close?;
-        Ok(entries
-            .into_iter()
-            .filter(|entry| !matches!(entry.name(), "." | ".."))
-            .map(|entry| {
-                let child = CifsUnspelled::spell(path, entry.name())?;
-                // Reparse points stay `File`: the facade cannot read link targets, and
-                // `Symlink` would route traversal into an unsupported `ReadLink`.
-                let kind = if entry.is_directory() {
-                    EntryKind::Directory
-                } else {
-                    EntryKind::File
-                };
-                Ok((
-                    child,
-                    CifsInlineMetadata {
-                        facts: CifsSourceFacts {
-                            kind,
-                            size: entry.len(),
-                            identity: identity_bytes(
-                                kind,
-                                entry.len(),
-                                entry.written(),
-                                entry.changed(),
-                            ),
-                            file_id: self.file_id(entry.file_id()),
-                            maximum_read_chunk: u32::MAX,
-                        },
-                        accessed: entry.accessed(),
-                        modified: entry.written(),
-                        created: entry.created(),
-                        readonly: Some(entry.is_readonly()),
-                        reparse_point: entry.is_reparse_point(),
-                    },
-                ))
-            })
-            .collect::<Vec<_>>())
+        Ok(Box::new(DomainDirectory::new(
+            directory,
+            path.clone(),
+            self.use_file_ids,
+        )))
     }
 }
 
@@ -622,7 +591,7 @@ async fn close_file(file: smb_domain::File) -> smb_domain::Result<()> {
     require_confirmed_close(file.close().await?)
 }
 
-async fn close_directory(directory: smb_domain::Directory) -> smb_domain::Result<()> {
+pub(super) async fn close_directory(directory: smb_domain::Directory) -> smb_domain::Result<()> {
     require_confirmed_close(directory.close().await?)
 }
 

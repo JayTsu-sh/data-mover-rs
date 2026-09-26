@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::BoxStream;
 
+use super::listing::read_whole;
 use super::metadata::{CifsInlineMetadata, timestamp};
 use super::source::{
     CifsSourceFacts, classify, descriptor_from_facts, entry_failure, entry_failure_with_transience,
@@ -26,10 +28,12 @@ use crate::storage::{
 #[async_trait]
 pub(super) trait CifsNamespaceProtocol: Send + Sync {
     async fn stat(&self, path: &StoragePath) -> smb_domain::Result<CifsSourceFacts>;
-    /// Lists direct children with the timestamps the `QUERY_DIRECTORY` records already carry. A
-    /// child whose name no storage path can spell is listed as [`CifsUnspelled`], beside its
-    /// siblings: one such name must not fail the whole directory (P7 §8).
-    async fn list(&self, path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>>;
+    /// Opens `path` as a directory to read its children. The caller holds the handle for as long
+    /// as it reads and must [`CifsDirectory::close`] it on every exit.
+    async fn open_directory(
+        &self,
+        path: &StoragePath,
+    ) -> smb_domain::Result<Box<dyn CifsDirectory>>;
     /// Creates one directory; an existing entry surfaces as `STATUS_OBJECT_NAME_COLLISION`.
     async fn create_directory(&self, path: &StoragePath) -> smb_domain::Result<()>;
     /// Deletes one file or one empty directory.
@@ -37,6 +41,25 @@ pub(super) trait CifsNamespaceProtocol: Send + Sync {
     /// Renames one file or directory, replacing an existing destination like the NFS and
     /// HDFS roles (servers only replace what NTFS semantics allow).
     async fn rename_entry(&self, from: &StoragePath, to: &StoragePath) -> smb_domain::Result<()>;
+}
+
+/// One open directory handle, read child by child.
+#[async_trait]
+pub(super) trait CifsDirectory: Send + Sync {
+    /// The directory's direct children (never `.` or `..`) with the timestamps the
+    /// `QUERY_DIRECTORY` records already carry, in the order the server returns them. A child whose
+    /// name no storage path can spell is listed as [`CifsUnspelled`], beside its siblings: one such
+    /// name must not fail the whole directory (P7 §8).
+    ///
+    /// Called once per open directory: a second call starts the scan over (and, while the first
+    /// stream lives, two scans interleave on one handle); read again by opening again. The first
+    /// `Err` ends a read — the stream would send another request after it. It sends a
+    /// `QUERY_DIRECTORY` whenever it has handed out the last record of the one before, so dropping
+    /// it part way may abandon a request already sent; smb-rs cancels that request and tolerates
+    /// its late answer (smb-rs #75, #76).
+    fn entries(&self) -> BoxStream<'_, smb_domain::Result<CifsListedChild>>;
+    /// Closes the handle; an unconfirmed close is an error.
+    async fn close(self: Box<Self>) -> smb_domain::Result<()>;
 }
 
 /// One listed child: its path and what its `QUERY_DIRECTORY` record carries, or the name the
@@ -87,12 +110,10 @@ impl CifsNamespace {
         descriptor_from_facts(&self.identity, path, &facts, Operation::Observe)
     }
 
-    /// Reads one whole directory; the protocol opens, reads and closes the directory handle
-    /// inside this one call, so nothing stays open between pages (true paging comes with C9).
+    /// Reads one whole directory; the handle is opened, read and closed inside this one call, so
+    /// nothing stays open between pages (true paging comes with C9).
     async fn list_whole(&self, path: &StoragePath) -> Result<ListingPage, StorageRoleFailure> {
-        let facts = self
-            .protocol
-            .list(path)
+        let facts = read_whole(self.protocol.as_ref(), path)
             .await
             .map_err(|error| classify(path, Operation::Traverse, &error))?;
         // Transfer artifacts never appear in a listing (ADR-0006 C3b). A child that cannot be
@@ -176,9 +197,7 @@ impl CifsNamespace {
             return Err(refused);
         }
         let blame = |error: &smb_domain::Error| classify(path, Operation::Namespace, error);
-        let children = self
-            .protocol
-            .list(path)
+        let children = read_whole(self.protocol.as_ref(), path)
             .await
             .map_err(|error| blame(&error))?;
         if !children.iter().all(|listed| {
@@ -223,7 +242,7 @@ impl CifsNamespace {
                 removals.push(path);
                 continue;
             }
-            let listed = match self.protocol.list(&path).await {
+            let listed = match read_whole(self.protocol.as_ref(), &path).await {
                 Ok(listed) => listed,
                 Err(error) if is_not_found(&error) => continue,
                 Err(error) => return Err(error),

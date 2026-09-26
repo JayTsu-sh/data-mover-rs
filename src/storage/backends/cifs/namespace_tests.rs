@@ -3,8 +3,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use bytes::Bytes;
 
+use super::listing_fake::MemoryDirectory;
 use super::metadata::CifsInlineMetadata;
-use super::namespace::{CifsListedChild, CifsNamespace, CifsNamespaceProtocol, CifsUnspelled};
+use super::namespace::{
+    CifsDirectory, CifsListedChild, CifsNamespace, CifsNamespaceProtocol, CifsUnspelled,
+};
 use super::protocol::{CifsRootError, RootProtocol, ensure_root, identity_bytes, root_prefixes};
 use super::source::CifsSourceFacts;
 use crate::model::{BackendIdentity, BackendKind, EntryKind, FailureClass, StoragePath};
@@ -66,9 +69,12 @@ impl CifsNamespaceProtocol for RecordingProtocol {
         })
     }
 
-    async fn list(&self, path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>> {
+    async fn open_directory(
+        &self,
+        path: &StoragePath,
+    ) -> smb_domain::Result<Box<dyn CifsDirectory>> {
         self.record(format!("list {}", path.as_str()))?;
-        Ok(Vec::new())
+        Ok(MemoryDirectory::boxed(Vec::new()))
     }
 
     async fn create_directory(&self, path: &StoragePath) -> smb_domain::Result<()> {
@@ -370,7 +376,10 @@ impl CifsNamespaceProtocol for ListingProtocol {
         })
     }
 
-    async fn list(&self, path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>> {
+    async fn open_directory(
+        &self,
+        path: &StoragePath,
+    ) -> smb_domain::Result<Box<dyn CifsDirectory>> {
         let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         self.entries
             .iter()
@@ -404,7 +413,8 @@ impl CifsNamespaceProtocol for ListingProtocol {
                     },
                 )))
             })
-            .collect()
+            .collect::<smb_domain::Result<Vec<CifsListedChild>>>()
+            .map(MemoryDirectory::boxed)
     }
 
     async fn create_directory(&self, _path: &StoragePath) -> smb_domain::Result<()> {
@@ -565,7 +575,10 @@ impl CifsNamespaceProtocol for TreeProtocol {
         ))
     }
 
-    async fn list(&self, path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>> {
+    async fn open_directory(
+        &self,
+        path: &StoragePath,
+    ) -> smb_domain::Result<Box<dyn CifsDirectory>> {
         let stamp = std::time::UNIX_EPOCH;
         self.children(path.as_str())
             .into_iter()
@@ -592,7 +605,7 @@ impl CifsNamespaceProtocol for TreeProtocol {
                 ))
             })
             .collect::<smb_domain::Result<Vec<_>>>()
-            .map(|listed| listed.into_iter().map(Ok).collect())
+            .map(|listed| MemoryDirectory::boxed(listed.into_iter().map(Ok).collect()))
     }
 
     async fn create_directory(&self, _path: &StoragePath) -> smb_domain::Result<()> {

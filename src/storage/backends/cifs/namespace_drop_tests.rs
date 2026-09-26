@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
+use futures::stream::{self, BoxStream};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use super::namespace::{CifsListedChild, CifsNamespace, CifsNamespaceProtocol};
+use super::namespace::{CifsDirectory, CifsListedChild, CifsNamespace, CifsNamespaceProtocol};
 use super::source::CifsSourceFacts;
 use crate::model::{BackendIdentity, BackendKind, StoragePath};
 use crate::storage::{ListRequest, Namespace};
@@ -21,13 +22,40 @@ fn path(value: &str) -> Result<StoragePath> {
     Ok(StoragePath::new(value)?)
 }
 
-/// A listing protocol that opens a (fake) directory handle, waits at a gate while it is open, and
-/// closes it before answering — the shape of `SmbDomainProtocol::list`.
+/// A listing protocol whose (fake) directory handle waits at a gate for its first record: the
+/// consumer drops the listing while a `QUERY_DIRECTORY` is in flight on an open handle.
 #[derive(Default)]
 struct GatedProtocol {
+    state: Arc<Gated>,
+}
+
+#[derive(Default)]
+struct Gated {
     open_handles: AtomicUsize,
     entered: Notify,
     gate: Notify,
+}
+
+struct GatedDirectory {
+    state: Arc<Gated>,
+}
+
+#[async_trait]
+impl CifsDirectory for GatedDirectory {
+    fn entries(&self) -> BoxStream<'_, smb_domain::Result<CifsListedChild>> {
+        stream::once(async move {
+            self.state.entered.notify_one();
+            self.state.gate.notified().await;
+        })
+        .filter_map(|()| async { None })
+        .boxed()
+    }
+
+    async fn close(self: Box<Self>) -> smb_domain::Result<()> {
+        // The close: skipped only if the listing's producer is dropped half way.
+        self.state.open_handles.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -36,13 +64,14 @@ impl CifsNamespaceProtocol for GatedProtocol {
         Err(smb_domain::Error::InvalidArgument("unused".into()))
     }
 
-    async fn list(&self, _path: &StoragePath) -> smb_domain::Result<Vec<CifsListedChild>> {
-        self.open_handles.fetch_add(1, Ordering::SeqCst);
-        self.entered.notify_one();
-        self.gate.notified().await;
-        // The close: skipped only if the listing future is dropped half way.
-        self.open_handles.fetch_sub(1, Ordering::SeqCst);
-        Ok(Vec::new())
+    async fn open_directory(
+        &self,
+        _path: &StoragePath,
+    ) -> smb_domain::Result<Box<dyn CifsDirectory>> {
+        self.state.open_handles.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(GatedDirectory {
+            state: Arc::clone(&self.state),
+        }))
     }
 
     async fn create_directory(&self, _path: &StoragePath) -> smb_domain::Result<()> {
@@ -59,8 +88,8 @@ impl CifsNamespaceProtocol for GatedProtocol {
 }
 
 /// Fault injection for the no-leak contract (P7 §5.1): the consumer drops the listing while the
-/// directory handle is open. The producer must still run the protocol call to its close and
-/// then end; a stream that aborted its producer on drop would leave the handle open (and the
+/// directory handle is open and a record is in flight. The producer must let that record arrive,
+/// close the handle and then end; a stream that aborted its producer on drop would leave the handle open (and the
 /// protocol referenced) and fail here.
 #[tokio::test]
 async fn dropping_a_listing_mid_request_still_closes_the_directory_handle() -> Result {
@@ -71,17 +100,17 @@ async fn dropping_a_listing_mid_request_still_closes_the_directory_handle() -> R
     );
     let request = ListRequest::new(path("dir")?, CancellationToken::new());
     let mut stream = namespace.list(request);
-    let entered = protocol.entered.notified();
+    let state = Arc::clone(&protocol.state);
+    let entered = state.entered.notified();
     assert!(futures::poll!(stream.next()).is_pending());
     tokio::time::timeout(Duration::from_secs(5), entered).await?;
-    assert_eq!(protocol.open_handles.load(Ordering::SeqCst), 1);
+    assert_eq!(state.open_handles.load(Ordering::SeqCst), 1);
 
     drop(stream);
     drop(namespace);
-    protocol.gate.notify_one();
+    state.gate.notify_one();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while protocol.open_handles.load(Ordering::SeqCst) != 0 || Arc::strong_count(&protocol) != 1
-        {
+        while state.open_handles.load(Ordering::SeqCst) != 0 || Arc::strong_count(&protocol) != 1 {
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
     })
@@ -89,7 +118,7 @@ async fn dropping_a_listing_mid_request_still_closes_the_directory_handle() -> R
     .map_err(|_| {
         format!(
             "handle left open ({}) or producer still alive ({} references)",
-            protocol.open_handles.load(Ordering::SeqCst),
+            state.open_handles.load(Ordering::SeqCst),
             Arc::strong_count(&protocol)
         )
     })?;
