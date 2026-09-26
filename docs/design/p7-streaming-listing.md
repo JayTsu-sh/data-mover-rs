@@ -893,8 +893,8 @@ C7b fix(nfs): v3 READDIRPLUS 列出、却不给属性的 `.snapshot`（ONTAP 卷
     一条 `info!`）；不是目录 → 按查到的属性当普通子项；查失败 → 该子项失败（查询自己的分类，`NOENT` 即消失），会话 / 节流 /
     目录句柄失效的失败按 READDIRPLUS 失败结束这次读取。带属性的 `.snapshot`（DXN 上真建的目录）、其他名字、v4 一律不变
 P1–P5  S3 URL 参数化（§14.2）—— F5 合入后，可与 C7 并行
-       —— 已完成（分支 p7-url，合入主线后提交号会变）：P1 `90c4168`、P2 `b7f18c3`、P3 `7c77c40`（+ refactor `119e838` 移出 tls.rs）、
-       P4 `e6125f7`、P5（调用方与文档）；真机见 §14.2 实施记录
+       —— 已完成：P1 `2fe52f1`、P2 `71fb411`、P3 `52710c7`（+ refactor `cc65fec` 移出 tls.rs）、
+       P4 `db7fbb9`、P5 `4718183`（调用方与文档）；真机见 §14.2 实施记录
 N0     NAS 桶实测（curl，§14.2）—— 立即
 N1–N7  `compat=ontap&bucket_type=nas` 的 NAS 桶 profile（§14.2）—— H1、C7 之后
 F5h fix(s3): 目录对象的单 PUT 改为流式（Content-Length = 源大小、UNSIGNED-PAYLOAD、边传边算 MD5 与回复 ETag 核对），不再整对象缓冲
