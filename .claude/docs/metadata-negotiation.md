@@ -96,7 +96,8 @@ owner/group/mode 记成**损失** `OwnershipModeDropped`（走 `OwnershipTarget:
 
 目录对象（S3 键 `p/d/`，P7 F5）不是元数据问题而是能不能存的问题：只有 `NamespaceCapabilities::directory_objects`
 为真的目的端（S3）能存；文件系统目的端由 `transfer::directory_object_action` 判定无操作 / 跳过，引擎在 Preflight
-拒绝（`Unsupported`），元数据计划根本不会走到。
+拒绝（`Unsupported`），元数据计划根本不会走到。S3 目的端上 > 5 GiB 或大小未知的目录对象同样由它（传目的端 `Storage`）
+事先答跳过（`DIRECTORY_OBJECT_TOO_LARGE_REASON`，D13）。
 
 ### 目的端没有 chown 特权（K5，Local）
 

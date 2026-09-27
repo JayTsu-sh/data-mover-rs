@@ -25,10 +25,11 @@ use crate::storage::{
     NamespaceCapabilities, PreflightPolicy, SourceDescriptor, Storage, StorageRoleFailure,
 };
 use crate::transfer::{
-    DIRECTORY_OBJECT_SKIP_REASON, DirectoryObjectAction, ExpertDestinationRequest,
-    ExpertDestinationSession, ExpertSourceRequest, ExpertSourceSession, InflightLimits,
-    PayloadShapingPolicy, TransferFailure, TransferPhase, TransferPolicy, TransferRequest,
-    TransferRoute, TransferSide, directory_object_action, transfer,
+    DIRECTORY_OBJECT_SKIP_REASON, DIRECTORY_OBJECT_TOO_LARGE_REASON, DirectoryObjectAction,
+    DirectoryObjectDestination, ExpertDestinationRequest, ExpertDestinationSession,
+    ExpertSourceRequest, ExpertSourceSession, InflightLimits, PayloadShapingPolicy,
+    TransferFailure, TransferPhase, TransferPolicy, TransferRequest, TransferRoute, TransferSide,
+    directory_object_action, transfer,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -64,6 +65,15 @@ fn request(
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     ))
+}
+
+/// The diagnostic of a failed transfer's entry failure.
+fn diagnostic(failure: &TransferFailure) -> Option<String> {
+    let role = Error::source(failure).and_then(|cause| cause.downcast_ref::<StorageRoleFailure>());
+    match role {
+        Some(StorageRoleFailure::Entry(entry)) => Some(entry.diagnostic().to_string()),
+        _ => None,
+    }
 }
 
 /// (phase, side, class) of a failed transfer.
@@ -256,6 +266,11 @@ async fn directory_object_action_decides_per_destination() -> TestResult {
     let mut decided = Vec::new();
     for (directory, all) in [("d", false), ("e", false), ("m", true)] {
         for entry in entries(&storage, directory, all).await? {
+            // The bucket's `Storage` knows its 5 GiB limit too: none of these is near it.
+            assert_eq!(
+                directory_object_action(&entry, &storage),
+                directory_object_action(&entry, &object_store)
+            );
             decided.push((
                 entry.path().to_string(),
                 entry.version().is_some_and(EntryVersion::is_latest),
@@ -283,8 +298,67 @@ async fn directory_object_action_decides_per_destination() -> TestResult {
 
 /// 12 MiB: over the 8 MiB single-PUT threshold.
 const OVER_THRESHOLD: usize = 12 * 1024 * 1024;
+/// What one `PutObject` or `CopyObject` carries: 5 GiB.
+const ONE_REQUEST: u64 = 5 * 1024 * 1024 * 1024;
 /// One more byte than one `PutObject` or `CopyObject` carries.
-const OVER_ONE_REQUEST: u64 = 5 * 1024 * 1024 * 1024 + 1;
+const OVER_ONE_REQUEST: u64 = ONE_REQUEST + 1;
+
+fn observed(path: &str, size: Option<u64>) -> TestResult<ObservedEntry> {
+    let identity = SourceIdentity::new(identity(), IdentityStrength::PathScoped, path.as_bytes())?;
+    Ok(ObservedEntry::new(
+        StoragePath::new(path)?,
+        EntryKind::File,
+        size,
+        None,
+        identity,
+    )?)
+}
+
+/// D13 up front: to a bucket (given its `Storage`), a directory object one request cannot carry —
+/// over 5 GiB, or of unknown size — is skipped with the reason the engine's `Preflight` refusal
+/// gives; 5 GiB exactly and any other key are copied. The namespace's capabilities alone know no
+/// limit; to a filesystem the answers are unchanged.
+#[tokio::test]
+async fn directory_object_action_answers_too_large_up_front() -> TestResult {
+    let storage = bucket(&Arc::new(MemoryS3::default()))?;
+    let capabilities = storage
+        .namespace(&PreflightPolicy::production())?
+        .capabilities();
+    let root = tempfile::tempdir()?;
+    let local = test_destination_storage(root.path(), "directory-object-action")?;
+    assert_eq!(
+        DirectoryObjectDestination::from(&storage),
+        DirectoryObjectDestination::new(true, Some(ONE_REQUEST))
+    );
+    assert_eq!(
+        DirectoryObjectDestination::from(&local),
+        DirectoryObjectDestination::new(false, None)
+    );
+    let copy = DirectoryObjectAction::Copy;
+    let nothing = DirectoryObjectAction::NothingToDo;
+    let too_large = DirectoryObjectAction::Skip(DIRECTORY_OBJECT_TOO_LARGE_REASON);
+    let skip = DirectoryObjectAction::Skip(DIRECTORY_OBJECT_SKIP_REASON);
+    // A store that holds no directory objects but reports a limit (an ONTAP NAS bucket's S3
+    // destination): it cannot hold the object at all, whatever its size.
+    let nas = DirectoryObjectDestination::new(false, Some(ONE_REQUEST));
+    for (path, size, to_bucket, to_filesystem) in [
+        ("d/", Some(0), copy, nothing),
+        ("d/", Some(ONE_REQUEST), copy, skip),
+        ("d/", Some(OVER_ONE_REQUEST), too_large, skip),
+        ("d/", None, too_large, nothing),
+        ("d", Some(OVER_ONE_REQUEST), copy, copy),
+    ] {
+        let entry = observed(path, size)?;
+        let decided = (
+            directory_object_action(&entry, &storage),
+            directory_object_action(&entry, &local),
+            directory_object_action(&entry, &capabilities),
+        );
+        assert_eq!(decided, (to_bucket, to_filesystem, copy), "{path} {size:?}");
+        assert_eq!(directory_object_action(&entry, nas), to_filesystem);
+    }
+    Ok(())
+}
 
 /// A store that completes a multipart upload to `x/` as `x` (`RustFS` 1.0.0), holding the real
 /// file `dst/d` beside the directory object `dst/d/` a copy writes.
@@ -382,6 +456,11 @@ async fn a_directory_object_one_request_cannot_carry_is_refused_at_preflight() -
         refusal(&failure),
         refused_at_preflight(TransferSide::Destination)
     );
+    // The reason a consumer learns up front from `directory_object_action`.
+    assert_eq!(
+        diagnostic(&failure).as_deref(),
+        Some(DIRECTORY_OBJECT_TOO_LARGE_REASON)
+    );
     let mut keys: Vec<String> = protocol.objects.lock().await.keys().cloned().collect();
     keys.sort();
     assert_eq!(keys, [pointer.as_str()]);
@@ -395,6 +474,10 @@ async fn a_directory_object_one_request_cannot_carry_is_refused_at_preflight() -
         None,
         SourceIdentity::new(identity(), IdentityStrength::PathScoped, b"big")?,
     )?;
+    assert_eq!(
+        directory_object_action(&observation, &bucket(&protocol)?),
+        DirectoryObjectAction::Skip(DIRECTORY_OBJECT_TOO_LARGE_REASON)
+    );
     let prepared = ExpertDestinationSession::prepare(ExpertDestinationRequest::new(
         observation,
         1024,
@@ -410,6 +493,10 @@ async fn a_directory_object_one_request_cannot_carry_is_refused_at_preflight() -
     assert_eq!(
         refusal(&failure),
         refused_at_preflight(TransferSide::Destination)
+    );
+    assert_eq!(
+        diagnostic(&failure).as_deref(),
+        Some(DIRECTORY_OBJECT_TOO_LARGE_REASON)
     );
     assert!(protocol.objects.lock().await.contains_key(&pointer));
     assert_eq!(*protocol.puts.lock().await, 1);

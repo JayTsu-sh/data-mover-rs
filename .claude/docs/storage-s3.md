@@ -662,7 +662,9 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   目的端写 `p/d/`（P7 D13，F5g）：**只用单次请求**，不看单 PUT 阈值与 native 单次拷贝上限 —— 流式 / `Direct` 一次
   `PutObject`（整对象先缓冲在内存），native 一次 `CopyObject`；从不走 multipart / `UploadPartCopy`，不写指针、不续传
   （失败从零开始；Checkpointed 的结果因此报 `SkippedBelowCheckpointThreshold` / `SkippedSingleSourceChunk`；流式的整个缓冲在内存，每个最多 5 GiB）。> 5 GiB 或源大小未知 → 该条目 `Unsupported` / Permanent，在 **Preflight**、目的端任何 I/O 之前
-  （`StagedDestination::directory_object_limit` = 5 GiB；S3 prepare 自己也在 I/O 前同样拒），不回退。role 协议与 legacy
+  （`StagedDestination::directory_object_limit` = 5 GiB；S3 prepare 自己也在 I/O 前同样拒），不回退。消费方可事先知道：
+  `transfer::directory_object_action(&entry, &目的端 Storage)` 对这种条目答 `Skip(DIRECTORY_OBJECT_TOO_LARGE_REASON)`
+  （与 Preflight 的诊断同一常量；只传 `NamespaceCapabilities` 时不知道上限，答 `Copy`）。role 协议与 legacy
   写入对以 `/` 结尾的键从不发 `CreateMultipartUpload`（发出前就拒）。prepare 仍按父目录里的指针名
   （`p/.data-mover-<digest("d/")>.upload`，`artifacts::directory_object_artifact`）清掉 F5g 之前的写入者留下的指针与上传。
   各存储差异见下「目录对象真机」。

@@ -649,8 +649,11 @@ struct VersionRecord {
 
 - `relative_path` 逐字节保存，**不去掉末尾 `/`**：`p/d/`（目录对象）与 `p/d`（文件或目录）是两行，身份键也不同；删除检测
   按 §4.1 第 6 条比较。消费 F5 之前先查清 terrasync 自己的路径处理（拼接、`Path` 规范化、去重键）。
-- 目的端是文件系统时，每个条目先过 `transfer::directory_object_action`：零字节或最新记录是删除标记 → 无操作；有内容 →
-  跳过并记 `DIRECTORY_OBJECT_SKIP_REASON`（不算失败）。不要自己拼旁车文件名（任何名字都可能与真实的键冲突）。
+- 每个条目先过 `transfer::directory_object_action(&entry, &destination_storage)`（传目的端 `Storage`；只传
+  `NamespaceCapabilities` 时不知道单次请求上限）。目的端是文件系统：零字节或最新记录是删除标记 → 无操作；有内容 →
+  跳过并记 `DIRECTORY_OBJECT_SKIP_REASON`（不算失败）。目的端是 S3（D13）：> 5 GiB 或大小未知的目录对象 → 跳过并记
+  `DIRECTORY_OBJECT_TOO_LARGE_REASON`（与引擎 Preflight 拒绝的诊断相同，不算失败），不必等传输失败才知道。不要自己拼
+  旁车文件名（任何名字都可能与真实的键冲突）。
 - 历史重放（D5 / D11）：按记录旧→新，版本走 `TransferRequest::with_source_version`，删除标记走
   `transfer::write_delete_marker`（H1），先用 `transfer::destination_keeps_history` 判断目的端能否存历史，一个 key 严格串行；重放不去重，重跑前比对目的端历史。
 
@@ -1025,7 +1028,7 @@ VERIFY
 | D10 | 新原语“目的端写删除标记”（仅 Enabled 桶，每次调用前检查版本状态） |
 | D11 | 历史重放由调用方（terrasync）编排，data-mover 提供原语与参考示例；重放不去重，重跑前调用方比对目的端历史 |
 | D12 | 目的桶未开版本：只拷最新状态并记原因“目的桶未开版本，历史未重建”，不算失败 |
-| D13 | （用户 2026-09-26 补定）目录对象**只用单次请求写**：单 PUT 或单次 CopyObject，不走 multipart / UploadPartCopy；> 5 GiB 在 Preflight、I/O 之前逐条目 `Unsupported`，不回退。一并避开 MinIO 拒绝 multipart `d/` 与 RustFS 把 multipart `d/` 存成 `d`（覆盖同名文件）；无续传，失败从零开始 |
+| D13 | （用户 2026-09-26 补定）目录对象**只用单次请求写**：单 PUT 或单次 CopyObject，不走 multipart / UploadPartCopy；> 5 GiB 在 Preflight、I/O 之前逐条目 `Unsupported`，不回退。一并避开 MinIO 拒绝 multipart `d/` 与 RustFS 把 multipart `d/` 存成 `d`（覆盖同名文件）；无续传，失败从零开始。消费方可事先用 `directory_object_action(&entry, &目的端 Storage)` 得到 `Skip(DIRECTORY_OBJECT_TOO_LARGE_REASON)`（P7 收尾补，见下“F5 收尾”） |
 
 **实施结果（2026-09-26）**：F5a–F5f 与 H1 都已提交（§14）；真机矩阵用含 H1 的树跑。与计划的差别：扫描根自己的对象由遍历在根列举里处理
 （`stream::prepare`，Blocks；C10 的 Unordered 必须复用它）；页内自己的对象排最前（键 `d/` 比它下面的键都小，页仍是
@@ -1069,6 +1072,16 @@ expert 目的端同；线上：role 与 legacy 各入口对 `p/d/` 零请求。�
 非版本桶）全部 `RESULT: pass`，清理后无 `dm-` 残留、无临时桶：12 MiB `mid/` 本地→S3 三种 policy、200 MiB `big/` 流式（切断后
 不留对象 / 指针 / 上传、重跑 `Fresh`）与 native（StorageGRID 为流式）都是一次请求（ETag 无 `-N`）、逐字节相等，同名真实文件
 `mid` / `big` 在 **RustFS** 与其余各家都不动；MinIO 上 > 8 MiB 的 `d/` 现在写得进去。
+
+**F5 收尾：`directory_object_action` 事先回答“太大”（2026-09-27）**：F5e 的辅助只看 `NamespaceCapabilities`，对 S3
+目的端一律 `Copy`，消费方要等 D13 的 Preflight `Unsupported` 才知道 > 5 GiB 的目录对象写不了。现在第二个参数是
+`impl Into<DirectoryObjectDestination>`（`holds` = `NamespaceCapabilities::directory_objects`，`limit` =
+`StagedDestination::directory_object_limit()`）：传目的端 `Storage` 时两者都有（无 I/O），能存目录对象的目的端上超过上限或
+大小未知的目录对象答 `Skip(DIRECTORY_OBJECT_TOO_LARGE_REASON)`，删除标记仍 `Copy`（重放，不写字节），5 GiB 整 `Copy`；
+只传 `&NamespaceCapabilities`（旧写法，照常编译）时不知道上限，答案与以前相同；取不到 staged destination 的 `Storage` 也当
+没有上限（这样的传输本来就在 Preflight 失败）。辅助与引擎 `refuse_unwritable` 用同一条规则（`over_limit`：有上限且大小未知或
+超过）与同一诊断（`DIRECTORY_OBJECT_TOO_LARGE_REASON`），所以列举到的大小与描述源时相同的条目，辅助答 `Copy` 就不会因为大小
+在 Preflight 被拒。文件系统目的端、以及不存目录对象却报上限的目的端（NAS 桶）的答案不变。
 
 D6 结论（N1 起按此实现：NAS profile 的 `directory_objects=false`，`d/` 在 Preflight 拒）：零字节 `d/` 不会把目录变成文件（D6 的触发条件不成立）；**有内容的 `d/` 若先于子项写入，NAS 桶静默把它存成文件
 `d`**（我们的读回会报 `NotFound`，但文件 `d` 已在、之后子项全 404）。Blocks 下自己的对象在子项之前交出，按遍历顺序拷贝
