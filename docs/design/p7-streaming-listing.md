@@ -937,8 +937,11 @@ C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:46
 C7d perf(nfs): READDIR / READDIRPLUS 的回复大小按服务器公布的上限定（用户 2026-09-27 同意）—— C10 合入之后
     - 现状：nfs-rs 默认 `readdir-buffer=8192,8192`（dircount / maxcount 各 8 KB），data-mover 从未设置；每个回复只装 40–60 条（C7c
       在 ONTAP、DXN-2 实测），1 万项的目录要 170–250 次往返；legacy 同样受限
-    - 做法：连接时取服务器上限 —— v3 `Mount::fsinfo()` 的 `dtpref`（没有则 `rtmax`）；v4.1 会话 `max_response_size`（nfs-rs 已与
-      `maxread` 取小）；v4.0 `maxread` —— 再夹一个自己的上限（如 1 MiB，防离谱值撑大单页内存）；URL 显式 `readdir-buffer` 优先
+    - 做法（用户 2026-09-27 定）：**只按服务器公布的上限，URL 里不写也不接受 `readdir-buffer`，不另设内存上限**（常见值 64 KB–1 MB：
+      ONTAP 随 `tcp-max-xfer-size`，默认多为 64 KB、最大 1 MB；Linux nfsd `rtmax` 多为 1 MB 而 `dtpref` 只报一页；v4.1 会话约 1 MB）。
+      `maxcount` 取读上限 —— v3 `Mount::fsinfo()` 的 `rtmax`，v4.1 会话 `max_response_size`（nfs-rs 已与 `maxread` 取小），v4.0 `maxread`；
+      `dircount` 参考 `dtpref`、实测定（避开 Linux `dtpref` 过小）；分页接口按次传入，不经 URL。回复大小 = min(上限, 目录实际内容)，
+      小目录不多占内存；最坏 K 个 worker 同时读宽目录 ≈ K × 上限的临时缓冲，实测时看宽树 RSS
     - 实测：ONTAP（`tcp-max-xfer-size` 默认下的 dtpref / rtmax）、DXN-2 v3 / v4.0；8K / 32K / 64K / 256K / 1M 几档与自动协商对比每回复
       条数、5 万项宽目录的 wall、首项延迟、RSS；node1 m1-source 全树复测（每目录约 35 项，预计收益小）；不改 ONTAP 设置
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
