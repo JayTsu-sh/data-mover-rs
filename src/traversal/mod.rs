@@ -39,6 +39,8 @@ mod s3_directory_object_tests;
 #[cfg(test)]
 mod s3_history_tests;
 #[cfg(test)]
+mod s3_segment_tests;
+#[cfg(test)]
 mod s3_tests;
 
 /// How a traversal orders what it delivers (P7 §3).

@@ -392,7 +392,6 @@ impl ObservedEntry {
     /// same entry — path, identity key, every entry-level field — with segments numbered from 0,
     /// only the last complete. An entry without a history, or with one of at most `cap` records,
     /// is itself.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn into_segments(mut self, cap: usize) -> Vec<Self> {
         let Some(history) = self.history.take() else {
             return vec![self];

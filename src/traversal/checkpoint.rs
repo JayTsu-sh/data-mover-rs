@@ -111,7 +111,7 @@ pub enum ResumeRefusal {
     /// no older version is read; scan again from the start).
     UnsupportedVersion(u8),
     /// A checkpoint of a different traversal: another storage, root, order, filter, depth limit
-    /// or version mode.
+    /// or histories listed (a bucket whose versioning changed between the two runs).
     Mismatch,
     /// The request's filter gives no [`resume_key`](super::TraversalFilter::resume_key), so a
     /// checkpoint could not tell whether it was taken under the same filter.

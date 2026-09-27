@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::mem;
 
 use super::blocks::Runtime;
-use crate::model::StoragePath;
+use crate::model::{ObservedEntry, StoragePath};
 use crate::traversal::{
     BlockCounts, DirectoryListed, ListingOutcome, ScanFailure, ScanTotals, TraversalItem,
     TraversalTerminalFailure,
@@ -204,7 +204,9 @@ impl Output {
         let mut batch = Vec::with_capacity(self.ready.len());
         while let Some(settled) = self.ready.pop_front() {
             let items = match settled {
-                Settled::Child { item, descent } => self.settle_child(item, descent),
+                Settled::Child { item, descent } => {
+                    self.settle_child(item, descent, runtime.shared.history_segment)
+                }
                 Settled::BlockEnd { path, facts } => Tallied::One(self.close_block(path, facts)),
             };
             // Counted as passed as it joins the batch, so the ready queue keeps starting at
@@ -225,8 +227,14 @@ impl Output {
         Ok(())
     }
 
-    /// Tallies one child against the block it belongs to.
-    fn settle_child(&mut self, item: ChildItem, descent: Option<ChildDescent>) -> Tallied {
+    /// Tallies one child against the block it belongs to; a key's history longer than `segment`
+    /// records comes out as its segments, all in this flush.
+    fn settle_child(
+        &mut self,
+        item: ChildItem,
+        descent: Option<ChildDescent>,
+        segment: usize,
+    ) -> Tallied {
         // A listing failure is the directory's, not a child's: it decides the block's outcome and
         // its block end counts it.
         if let ChildItem::Item(TraversalItem::Failure(failure)) = &item
@@ -234,7 +242,7 @@ impl Output {
         {
             self.listing.get_or_insert(outcome);
         }
-        tally_child(&mut self.block, item, descent)
+        tally_child(&mut self.block, item, descent, segment)
     }
 
     /// Turns the block just delivered into its [`DirectoryListed`], and adds it to the totals.
@@ -254,10 +262,12 @@ impl Output {
 }
 
 /// What one child's tally hands the session, in order: nothing (a child the filter kept out, or
-/// one that vanished), or its item.
+/// one that vanished), its item, or the segments of a key's history longer than one entry
+/// carries (P7 Q8) — which the caller delivers together, in one batch.
 pub(super) enum Tallied {
     Nothing,
     One(TraversalItem),
+    Segments(Vec<TraversalItem>),
 }
 
 impl Tallied {
@@ -266,16 +276,22 @@ impl Tallied {
         match self {
             Self::Nothing => {}
             Self::One(item) => batch.push(item),
+            Self::Segments(items) => batch.extend(items),
         }
     }
 }
 
 /// Tallies one child into `block` and returns what to deliver for it. A listing failure is
 /// returned untallied: it is its directory's, not a child's, and the caller counts it as such.
+///
+/// A key whose history holds more than `segment` records (P7 Q8) is counted once, whole, then
+/// delivered as its segments: the same entry with a part of the history each, numbered from 0,
+/// only the last complete. They are returned together, so they reach the session in one batch.
 pub(super) fn tally_child(
     block: &mut BlockCounts,
     item: ChildItem,
     descent: Option<ChildDescent>,
+    segment: usize,
 ) -> Tallied {
     match descent {
         Some(ChildDescent::Pruned) => {
@@ -297,9 +313,12 @@ pub(super) fn tally_child(
             return Tallied::Nothing;
         }
     };
-    match &item {
-        TraversalItem::Entry(entry) => block.count_emitted(entry),
-        TraversalItem::Failure(failure) if failure.listing_outcome().is_none() => {
+    match item {
+        TraversalItem::Entry(entry) => {
+            block.count_emitted(&entry);
+            return segmented(entry, segment);
+        }
+        TraversalItem::Failure(ref failure) if failure.listing_outcome().is_none() => {
             block.failed_children = block.failed_children.saturating_add(1);
         }
         // Naming both rather than wildcarding makes the next variant added to `TraversalItem` a
@@ -309,6 +328,24 @@ pub(super) fn tally_child(
         | TraversalItem::Checkpoint(_) => {}
     }
     Tallied::One(item)
+}
+
+/// `entry` as delivered: itself, or, when its history holds more than `segment` records, its
+/// segments (P7 Q8).
+fn segmented(entry: Box<ObservedEntry>, segment: usize) -> Tallied {
+    if entry
+        .history()
+        .is_none_or(|history| history.records().len() <= segment)
+    {
+        return Tallied::One(TraversalItem::Entry(entry));
+    }
+    Tallied::Segments(
+        entry
+            .into_segments(segment)
+            .into_iter()
+            .map(|segment| TraversalItem::Entry(Box::new(segment)))
+            .collect(),
+    )
 }
 
 /// Counts how one directory's listing ended into `totals`, derived from the listing's own

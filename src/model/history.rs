@@ -323,7 +323,6 @@ impl ObjectHistory {
 
     /// This history in segments of at most `cap` records (at least one), numbered from this one's,
     /// only the last complete when this one is. `cap` 0 counts as 1.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn split(self, cap: usize) -> Vec<Self> {
         let cap = cap.max(1);
         let Self {

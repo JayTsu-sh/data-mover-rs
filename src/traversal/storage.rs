@@ -15,8 +15,8 @@ use super::{
     relative_to,
 };
 use crate::model::{
-    BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, ObservationMode,
-    ObservationPlan, ObservedEntry, Operation, StoragePath, Transience,
+    BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, MAX_HISTORY_RECORDS,
+    ObservationMode, ObservationPlan, ObservedEntry, Operation, StoragePath, Transience,
 };
 use crate::storage::{
     CapabilityUnavailable, DescentHint, Metadata, Namespace, PreflightPolicy, SourceDescriptor,
@@ -104,6 +104,9 @@ pub struct StorageTraversalSource {
     metadata: Arc<dyn Metadata>,
     /// Which storage this is, for the checkpoints a resumable traversal binds to it.
     identity: BackendIdentity,
+    /// The most records one entry's history carries before it is delivered in segments:
+    /// [`MAX_HISTORY_RECORDS`], smaller only in tests.
+    history_segment: usize,
     probe: Probe,
 }
 
@@ -118,6 +121,7 @@ impl StorageTraversalSource {
             namespace: storage.namespace(&policy)?,
             metadata: storage.metadata(&policy)?,
             identity: storage.identity().clone(),
+            history_segment: MAX_HISTORY_RECORDS,
             probe: Probe::default(),
         })
     }
@@ -128,8 +132,17 @@ impl StorageTraversalSource {
             namespace,
             metadata,
             identity: crate::storage::backends::local::test_identity("traversal-test"),
+            history_segment: MAX_HISTORY_RECORDS,
             probe: Probe::default(),
         }
+    }
+
+    /// This source, delivering a history longer than `records` records in segments of that many
+    /// (P7 Q8) instead of [`MAX_HISTORY_RECORDS`], so tests segment small histories.
+    #[cfg(test)]
+    pub(crate) const fn history_segment(mut self, records: usize) -> Self {
+        self.history_segment = records;
+        self
     }
 
     /// This source, reading `clock` instead of the system's when checkpoints are on.
@@ -195,7 +208,9 @@ impl TraversalSource for StorageTraversalSource {
         let (namespace, metadata) = (Arc::clone(&self.namespace), Arc::clone(&self.metadata));
         let probe = self.probe.clone();
         let order = request.order;
-        let shared = Arc::new(Shared::new(namespace, metadata, request, resume));
+        let mut shared = Shared::new(namespace, metadata, request, resume);
+        shared.history_segment = self.history_segment.max(1);
+        let shared = Arc::new(shared);
         match order {
             TraversalOrder::Unordered => {
                 tokio::spawn(unordered::run(shared, item_tx, completion_tx, probe));
@@ -308,6 +323,8 @@ struct Shared {
     /// Checkpoints and where to resume from, when the request asks for either; `None` costs
     /// nothing (P7 §9.1).
     resume: Option<Resume>,
+    /// The most records one delivered entry's history carries (P7 Q8).
+    history_segment: usize,
 }
 
 impl Shared {
@@ -327,6 +344,7 @@ impl Shared {
             root_object_reported: AtomicBool::new(false),
             parked_listing_limit,
             resume,
+            history_segment: MAX_HISTORY_RECORDS,
         }
     }
 }
