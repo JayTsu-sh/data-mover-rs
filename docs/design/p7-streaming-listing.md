@@ -271,7 +271,7 @@ type ListingStream = Pin<Box<dyn Stream<Item = Result<ListingPage, StorageRoleFa
 | Local | 每页一次 `spawn_blocking`，把 `ReadDir` 带进带出；停车时不占 blocking 线程 | readdir 错误基本不是瞬时的 → `Interrupted`（已交付过）/ `Unreadable`（没交付）；已读到的先交付。**已实现** `277f1f8`：20 万文件平铺目录首项 400 ms → 6 ms、RSS 217 → 22 MB |
 | NFS | 生产者任务消费 `readdirplus` 流，按 `page_hint` 攒页 | **首页交出之前**可以整目录从头重试（legacy 就是这条规则，`nfs.rs:3364-3366`）；之后只能从 cookie 续（需要 nfs-rs 公开页接口，Q18），否则 `Interrupted`。**已实现** `7da78ce`：首页前句柄失效 → 解析路径（至多 3 次）、`DELAY` / `JUKEBOX` / `GRACE` → 列举节流预算内退避、nfs-rs 认证可重发的传输失败 → 250 ms / 1 s / 2 s，都从头重读、不重复交出；首页后不重试（C7c 起改为同样重试、从 cookie 续，见下）；重试用尽时已读到的先交出再失败（可重发的传输失败只让该列举失败）；drop / 取消在下一条之前停、不放弃在途请求。C7b：v3 列出的缺属性 `.snapshot` 经一次 LOOKUP 确认是目录后隐藏（计入 `internal_hidden`，ONTAP 卷根，与 v4 一致），见 §14 C7b。**C7c**（nfs-rs 0.8.5 `readdirplus_page`，调用方持 cookie + verifier）：首页之后的失败按首页前同样的分类 / 预算重试，但从最后一个完整取完的回复之后的 cookie 续读（句柄解析后变了 → cookie 在别的句柄上无意义，从目录开头读）；列举记住已取子项的 `(fileid, 名字)` 带密钥 64 位摘要（上限 2^18 项，约 4.5 MiB / 列举；超过则首页后不再续、照旧 `Interrupted`），续读后服务器重发的（被截断回复的前半、或不认 cookie 从头重发的整目录）跳过，不重复交出；同一次读取里 cookie 重复 → 该列举 `Protocol` / Permanent（§8）；cookie 被拒（`BAD_COOKIE` / `NOT_SAME`）或续读的 cookie 被答以“空的目录末尾”（ONTAP、DXN-2 答不认识的 cookie 就是这样）→ 从目录开头重读并跳过已取的（至多 3 次）；每取到新子项重试预算续满。**已实现** `26a27f6`，见 §14 C7c。5 万文件平铺目录首项 ONTAP v3 1.2 s → 0.05 s、v4.0 / v4.1 2.2 s → 0.07 s、DXN-2 v3 6 s → 0.14 s、v4.0 10 s → 0.2 s；RSS 69–75 → 17–20 MB（release）；五种环境与 legacy 基线逐行相同 |
 | CIFS | 生产者任务持有目录句柄（`CifsDirectory`），逐条取 `QUERY_DIRECTORY` 记录按 `page_hint` 攒页；所有出口都 close，最后一页在关句柄之后交出；停车时句柄开着 → `Namespace::parked_listing_limit()` = 8，Blocks 游标让“已起、未读完”的预取列举不超过它（游标正要的那个总是起） | 首页交出之前句柄失效（smb-rs 重连后旧句柄上的 `InvalidState`、重连时在途的 `StaleObject`、`STATUS_FILE_CLOSED` / `STATUS_INVALID_HANDLE`）→ 重开目录从头读（50 ms / 250 ms / 1 s，至多 3 次，不重复交出）；之后句柄失效无法续 → 已读到的先交出，`Interrupted`（原分类，连接类升会话）。取消 / drop 在取下一条之前停、让在途记录到达；smb-rs 流已预发的下一条 `QUERY_DIRECTORY` 随流 drop 取消（#75/#76）。没有下钻提示（CREATE 按路径一次往返）。**已实现** `936e20b`（接缝 `70f85d1`）：5 万文件平铺目录首项 400 → 34–46 ms、RSS 65 → 21–25 MB（release）；10.3 万条整树 c=1/4/32 与 base 逐行相同（含顺序），RSS 84–118 → 30–44 MB；停车时 ONTAP 上恰 9 个打开的目录句柄（base 0）；与 NFSv3 / v4.1 同一棵树 Blocks 输出逐行相同；停车 30 分钟后照常读完（Q10） |
-| S3 | 未开过版本控制的桶：ListObjectsV2，每页转一页；多版本桶：ListObjectVersions，按目录组装每个 key 的历史（见 5.3、第 10 节） | 同一 token 重发（无状态，安全）；节流退避。**已实现** `f2cacdc`（Current 流式；All 仍按目录物化，C11b）：不假设 key 有序（只用不透明 token，前缀名集合去重，对象只与上一页比对，列完才判 `NotFound`）；节流按 C3 预算、其他瞬时失败同一 token 再发至多 3 次（读到一页即续满），首页前后一样；500 万上限不再限流式 Current 的对象数，只管驻留的前缀名集合与不可解码 key（续页 token 另限 500 万）；物化的 All 仍按条数计（用户 2026-09-26 定，**已修** `ffd37ca`；5,000,001 个对象的平铺前缀在生产上限下流完）。2 万对象平铺前缀首项 MinIO 3.5 s → 0.4 s、ONTAP 1.2 s → 0.13–0.25 s，RSS 68 → 54 / 66 → 50 MB（debug）；MinIO / ONTAP（含 NAS 桶）/ RustFS / DXN 的多版本与非多版本桶均已跑 |
+| S3 | 未开过版本控制的桶：ListObjectsV2，每页转一页；多版本桶：ListObjectVersions，按目录组装每个 key 的历史（见 5.3、第 10 节） | 同一 token 重发（无状态，安全）；节流退避。**已实现** `f2cacdc`（Current 流式；版本化桶按目录物化后每 key 一项、按 `page_hint` 逐页构造子项，C11b）：不假设 key 有序（只用不透明 token，前缀名集合去重，对象只与上一页比对，列完才判 `NotFound`）；节流按 C3 预算、其他瞬时失败同一 token 再发至多 3 次（读到一页即续满），首页前后一样；500 万上限不再限流式 Current 的对象数，只管驻留的前缀名集合与不可解码 key（续页 token 另限 500 万）；物化的历史列举仍按条数计（用户 2026-09-26 定，**已修** `ffd37ca`；5,000,001 个对象的平铺前缀在生产上限下流完）。2 万对象平铺前缀首项 MinIO 3.5 s → 0.4 s、ONTAP 1.2 s → 0.13–0.25 s，RSS 68 → 54 / 66 → 50 MB（debug）；MinIO / ONTAP（含 NAS 桶）/ RustFS / DXN 的多版本与非多版本桶均已跑 |
 | HDFS | `list_status_iter`（hdfs-native `client.rs:734`）；去掉列举前的 `get_metadata` | 续读：hdfs-native 不公开 startAfter，可重试失败（I/O、单批 > 5 s）后重开列举、跳过到最后读到的名字之后（按 NameNode 的有符号字节序；只在失败时多读），首页前后都可续、不重复发子项；其他失败或预算用完 → `Interrupted`。**已实现** `9c8185f`；有符号字节序、列举文件回自身、缺目录 `FileNotFound` 三点待真机（runner 需用户批准） |
 
 ### 5.3 S3：不假设有序
@@ -536,8 +536,9 @@ struct Checkpoint(Bytes);   // 不透明、带版本；绑定 root / order / fil
   例外：Unordered 前沿超过上限时连最终检查点也不发，上一个检查点仍是续扫点。续扫那次的 `ScanTotals` 只计那次交出的（含重复部分），
   不是整棵树（Q15）。
 - **指纹**：blake3（derive_key）覆盖格式版本、backend 种类与 `stable_id`（只哈希、不写进检查点）、root、order、`max_depth`、
-  `versions`、过滤器键；不含并发、缓冲、观察计划、检查点间隔。
-- **格式 v1**：`DMTC` | 版本 | 顺序 | 指纹 32 字节 | 条数 | 每条（与上一条共享的字节数、其余字节、`child_depth`、标志）|
+  过滤器键，以及 namespace 是否列历史（C11b 起取代 `versions`：桶的版本控制在两次运行之间变了 → `Mismatch`）；不含并发、缓冲、
+  观察计划、检查点间隔。
+- **格式 v1（C11b 起 v2：指纹改绑 histories）**：`DMTC` | 版本 | 顺序 | 指纹 32 字节 | 条数 | 每条（与上一条共享的字节数、其余字节、`child_depth`、标志）|
   前面全部的 blake3 前 16 字节；golden 测试逐字节钉住，任何改动都升版本（C11b 删 `TraversalVersions` 时必须升），旧版本
   `UnsupportedVersion`，不兼容读（同快照的规矩）。解码时校验每条都在 root 之内（按路径分量），Blocks 的条目是从 root 起的一条链。
   上限 2^20 条 / 64 MiB（编码与解码后展开的路径总量都算，防止几十 MB 的伪造输入展开成 TB）：超了这一个检查点不发（`warn!`），
@@ -567,26 +568,39 @@ struct Checkpoint(Bytes);   // 不透明、带版本；绑定 root / order / fil
 ### 10.1 形状
 
 ```
-struct ObjectHistory {
-    records: Vec<VersionRecord>,     // 服务端列举顺序反转：最旧在前，最新的一条在最后
+struct ObjectHistory {                  // src/model/history.rs（C11b 实现）
+    records: Vec<VersionRecord>,     // 服务端列举顺序反转：最旧在前，最新的一条在最后（本段内）
     order: HistoryOrder,             // Server（取自原始 XML 的位置）| Inferred（存储不守规矩，按时间推断）
-    complete: bool,                  // false = 这个 key 的记录超过上限，只装了一部分（Q8）
+    segment: u32,                    // 段号，从 0 开始（Q8：一个 key 超过 MAX_HISTORY_RECORDS = 10 万条时分段）
+    complete: bool,                  // 只有这个 key 的最后一段为 true
+    largest: Option<u64>,            // 整个 key 最大的一个版本（不只本段），每段都带：R3 按整个 key 判定
 }
 struct VersionRecord {
-    version: VersionId,              // 真实 id，或 "null"（未开版本控制时写入 / 暂停期间写入）
-    latest: bool,
-    kind: Object { size, etag, last_modified } | DeleteMarker { last_modified },
-    identity: SourceIdentity,        // VersionScoped(id)；"null" 为 PathScoped(ETag)
-    source: Option<SourceVersion>,   // 拷这一版用的选择器；删除标记为 None
-    metadata: MetadataObservations,  // 按观察计划、绑定这一版观察；失败只记在这一条上
+    version_id: Option<String>,      // 真实 id；None = "null"（未开版本控制时写入 / 暂停期间写入）
+    latest: bool,                    // 列举里的 IsLatest，原样保留
+    kind: Object { size, etag, modified } | DeleteMarker { modified },
+    identity: SourceIdentity,        // VersionScoped(id)；"null" 为 PathScoped(路径‖ETag)；"null" 标记 PathScoped(路径‖NULL_MARKER)
+    metadata: Option<Box<MetadataObservations>>,  // 按观察计划、绑定这一版观察；None = 列举之外什么都没观察；失败只记在这一条上
 }
+// VersionRecord::source()：拷这一版用的选择器（真实 id → Id(id)；latest 的 "null" → Current；
+// 非 latest 的 "null" → Id("null")；删除标记 → None）。ObjectHistory::current()：complete 段上最后一条是对象时返回它。
 ```
 
-- **一个 key 一项**：`ObservedEntry` 的路径就是这个 key，`history()` 给出全部记录。目录（前缀）没有历史。
+- **一个 key 一项**：`ObservedEntry` 的路径就是这个 key，`history()` 给出全部记录（或其中一段）。目录（前缀）没有历史。
+  条目层字段取**当前对象**：size / `ETag`（content version）/ 时间与身份都与 `ListObjectsV2` 给同一对象的逐字节相同
+  （`PathScoped(路径‖ETag)`，所以一个桶开不开版本、身份键都不变，expert 半边的核对也照常）；最新一条是删除标记（当前已删）
+  时 size 为 `None`、时间是标记的、身份 `PathScoped(路径‖"\0s3-deleted-key\0"‖标记 id 或 "null")`、列举之外无可观察。
+  条目层元数据是当前版本的观察；观察失败时时间退回列举给的（C11b 评审）。
 - **列出全部**：没有参数；多版本桶上一律列出每个版本和每个删除标记。最新一条是删除标记的 key（“当前已删”）**也出现**，由消费方看 `history.current()`（最新一条是对象时返回它，否则 `None`）判断现状。
 - **顺序以服务端为准**，不按 LastModified 排。依据见 10.2 的实测，方案见 10.3。
 - **桶怎么判定“多版本”**：连接时 `GetBucketVersioning`。`Enabled` 或 `Suspended`（暂停后旧历史仍在）→ ListObjectVersions；从未开启 → ListObjectsV2，
   `history = None`。查询被拒时一律用 ListObjectVersions（对未开版本的桶它返回每个 key 一条 `"null"`，结果正确，只是慢一些）（Q26）。
+  **Q-A（用户 2026-09-27）**：501 / `NotImplemented` / `UnsupportedOperation`（存储没有版本功能）→ ListObjectsV2；瞬时失败（无响应、超时、
+  429、5xx、`RequestTimeout` / `SlowDown` 等，SDK 重试之后）→ role connect 失败，`BackendSessionFailure` Connect / `Connectivity` /
+  `Transient`（`BackendConnectError::session_failure()` 带给 `connect_backend` 的调用方；诊断里有 HTTP 状态或“no response”），
+  不猜 —— 否则同一个未开版本的桶会因一次瞬时失败每项多一条 `"null"`，terrasync 前后两代去重键对不上；构造请求就失败（不是
+  瞬时的）按拒绝处理，列举时会以它自己的失败再报。NAS profile 一律 ListObjectsV2（也不因 Unreachable 拒连）。legacy
+  `S3Storage::new` 照旧宽容地连接成功。判定在连接时做一次（`S3Namespace` 取 `lists_histories()` 的快照），整个连接不变。
 
 ### 10.2 实测：MinIO 的版本顺序（2026-09-25）
 
@@ -658,13 +672,15 @@ struct VersionRecord {
 
 | 后果 | 处理 |
 |---|---|
-| 单 key 版本数没有上限（一个频繁覆盖的对象可以有上百万版本），一项可能极大 | 单 key 记录上限 10 万条；超过时**分段**：一个 key 发多项，每项带段号和 `complete: false`，最后一段 `complete: true`（Q8 已定） |
+| 单 key 版本数没有上限（一个频繁覆盖的对象可以有上百万版本），一项可能极大 | 单 key 记录上限 10 万条；超过时**分段**：一个 key 发多项，每项带段号和 `complete: false`，最后一段 `complete: true`（Q8 已定）。**C11b 实现**：分段在输出这一环（`tally_child`），列举、filter、观察、计数都按 key 做一次；各段同一个条目（同一身份键、同样的条目层字段），在同一个 batch 里发出（Unordered `send_whole`，Blocks 单一发送方），所以会话里连续、有序。续扫（C11）：Blocks 取消时 flush 被截断则 `delivered` 不前进，续扫整块重列、各段从第 0 段重发；Unordered 正在列的目录在前沿里、整个重列。契约：**一个 key 的历史收到 `complete=true` 那一段才算完整；续扫后从第 0 段重发** |
 | 无序存储上一个 key 的记录可能分散在任意页 | 按目录物化后组装（O(目录)，上限 500 万条记录，Q9）。有序存储本可以只攥住一个 key，但无法事先知道存储是否有序 |
-| 一项的观察可能要做很多次 I/O（每个版本单独读 tags / 元数据） | 只在观察计划要求时才做；每条记录的观察结果与失败各自独立，一条失败不让整项失败；一项内的 I/O 受同一个并发窗口约束 |
+| 一项的观察可能要做很多次 I/O（每个版本单独读 tags / 元数据） | 只在观察计划要求时才做；每条记录的观察结果与失败各自独立，一条失败不让整项失败；一项内的 I/O 受同一个并发窗口约束。**C11b 实现（R2）**：一项内逐条串行（占遍历的同一个观察名额），绑定各自版本（`observe_copy_bound_version`，`VersionRecord::source()` 选版本），失败记在那条记录上（`MetadataObservation::Failed`，`Required` 也一样，NotFound 也不算 vanish），删除标记不观察，会话级失败照常结束遍历、节流按条目限定，取消即停（不交出）|
 | 拷贝 | 消费方按 `records` 顺序逐条处理：对象版本用 `record.source`（`SourceVersion::Id`，最新的 `"null"` 为 `Current`）交给 `TransferRequest::with_source_version`；删除标记用 `transfer::write_delete_marker`（H1，只在 `Enabled` 的目标桶上；未开 / 暂停版本的目标只拷最新状态并记原因“目的桶未开版本，历史未重建”，D12）。一个 key 严格串行，重放不去重（D11）；参考 `examples/s3_history_replay.rs` |
 | 身份与改名识别 | 项的 `source_identity` 是 key 级的 `PathScoped`；每条记录另有自己的 `VersionScoped` 身份，拷贝前按记录核对 |
 | 快照 | **用户 2026-09-27 定：条目快照不考虑版本兼容**。C11b 只保留一种当前格式（版本字节升为 7，带历史的条目带完整 ObjectHistory 段，不带历史的条目同一格式），删除 v4 / v5 / v6 的编码与解码分支；旧快照解码报 `UnsupportedVersion`，调用方按首次扫描处理。守则：① 保留 `DMES` 魔数与版本字节；② **格式任何变化都把版本字节加 1**（哪怕只加一个字段），并有 golden 字节测试（当前格式的编码与存下的字节不符即失败），防止同一版本号下新旧字节混存而被静默读错；③ 这是开发期规则，正式发布前重新决定（至少解码 N-1，或给 terrasync 迁移 / 重扫说明），写进 ADR-0008。目的端恢复指针 / binding 格式（ADR-0006）不在此列：它们关系在途传输能否续传，开发期也可以不兼容，但每次变更的 commit 要写明“升级前排空在途传输” |
-| 计数 | `listed` / `emitted` 按 key 计；另加 `versions`（对象版本数）与 `delete_markers`；`bytes` 分为“当前版本字节”和“全部版本字节” |
+| 计数 | `listed` / `emitted` 按 key 计；另加 `versions`（对象版本数）与 `delete_markers`；`bytes` 分为“当前版本字节”和“全部版本字节”。**C11b 实现**：`BlockCounts` / `ScanTotals` 加 `versions`、`delete_markers`、`all_versions_bytes`（没有历史的文件记它自己的大小，所以存储没有历史时它等于 `bytes`）；`bytes` = 当前版本字节（当前已删的 key 为 0）；分段之前对整段历史计一次，listed / emitted / filtered / files 按 key，不按段 |
+| 目录对象的历史（R3） | `directory_object_action`：目的端能存目录对象时，任何一版超过单次请求上限就整个 key `Skip(TOO_LARGE)`（按 `ObjectHistory::largest_version`，每段都带整个 key 的最大值，所以各段答案相同 —— 重放中途停下会在目的端历史里留缺口，D11）；目的端是文件系统时看当前版本（没有或 0 字节 → `NothingToDo`，有内容 → `Skip`）；非最后一段 `NothingToDo`（由最后一段决定） |
+| 已知限制（C11b） | ① 版本化桶上单目录超过 500 万条记录现在报 `Capacity`（Q9），今天的 Current 流式在版本化桶上没有这个上限 —— 对版本化桶是一次能力倒退，要放开等真实需求。② 只有 `s3:ListBucket`、却被拒 `GetBucketVersioning` **和** `ListBucketVersions` 的主体（常见的最小权限策略）：按 Q26 列历史，每个目录的列举都会权限失败；C11b 之前默认的 Current 遍历对它可用（评审指出，待定是否加回退，见 §14 C11b 行）。③ 物化期间整个目录的原始记录驻留内存，Blocks 预取最多 2 × min(c, 64) 个列举（与之前 All 相同） |
 | terrasync 落库 | 把一项展开成每版本一行，沿用今天 base 表的排序键 `(relative_path, version_id, identity_key)`（`clickhouse.rs:569`）与去重（Q27 已定） |
 
 ## 11. 与 terrasync 写库的配合（ClickHouse）
@@ -710,6 +726,22 @@ struct VersionRecord {
 - `s3+https://` 现在**校验证书**：自签 / 私有 CA 端点要么把 CA 放进 `SSL_CERT_FILE` / `SSL_CERT_DIR`，要么 URL 加 `tls_verify=false`
   （每连接告警）。未知参数不再被忽略（改前带桶 URL 的查询串被丢弃），拼 URL 的地方不能再往查询串里塞别的东西。
 - 参数不进端点身份，已落库的身份键、恢复绑定不受影响；terrasync 自己若把 URL 文本当键，需要按新写法重新规范化。
+
+### 11.2c 多版本（C11b）对 terrasync 的要求
+
+- **每个 key 一项**：版本化桶上一个 key 是一个条目，带它的历史（`ObservedEntry::history()`）；当前已删的 key 也在
+  （`history.current()` 为 `None`）。落库时把一项展开成每版本一行（Q27），沿用 `(relative_path, version_id, identity_key)`。
+  按条目发起 `TransferRequest` 的调用方先看 `source_version()`（没有当前对象为 `None`），否则会在已删的 key 上 describe 到
+  `NotFound`。
+- **快照按 (路径, 段号) 存一份**，不要每个版本行各存一份：一段 10 万条记录的快照约 15 MB。
+- **分段**：一个 key 超过 10 万条记录时发多项（同一路径、同一身份键，段号从 0，只有最后一段 `complete=true`）。消费方
+  **只有收到 `complete=true` 那一段才把这个 key 的历史当完整**；取消 / 续扫后各段**从第 0 段重发**（已落库的段会再来一次，
+  按上面的去重键吸收）。
+- **快照格式 v7**（开发期规则：只读当前格式）：所有 backend 的 v4 / v5 / v6 快照都解码为 `UnsupportedVersion`，下一次增量扫描
+  按首次扫描处理（全量重扫一次，不只 S3）。C11 的检查点 v1 同样失效（`UnsupportedVersion(1)`），从头扫。
+- **连接**：role connect 在 `GetBucketVersioning` 瞬时失败时报 `Connectivity` / `Transient`（`session_failure()`）：重试连接，
+  不要当配置错误。
+- **计数**：`bytes` 现在是当前版本字节；全部版本的字节是 `all_versions_bytes`，另有 `versions` / `delete_markers`。
 
 ### 11.3 可选
 
@@ -991,7 +1023,7 @@ ONTAP v3 / v4.1、DXN-2 v3、Local，结果相同。
 | `FailureClass` | 新增 `Throttled` |
 | 扫描的观察参数 | `TraversalRequest.observation_plan: ObservationPlan` → `should_scan: 额外项集合`（`Acl / Xattrs / Tags / SymlinkTarget`，无档位）；`ObservedEntry` 的时间与 uid/gid/mode 变为普通 `Option` 字段；symlink 目标不再无条件读取 |
 | S3 身份 | `PathScoped` 身份含路径（F1），已有代的 S3 条目身份键一次性全部变化 |
-| 多版本（`mod.rs:65-86`，`ObservedEntry::version / source_version`，`storage/descriptor.rs` 的 `ListingFacts`，快照 v6） | 删除 `TraversalVersions` 与 `list_versions`；每版本一项改为每 key 一项（`ObservedEntry::history()`）；快照 v6 由 v7 取代 |
+| 多版本（`mod.rs:65-86`，`ObservedEntry::version / source_version`，`storage/descriptor.rs` 的 `ListingFacts`，快照 v6） | 删除 `TraversalVersions` 与 `list_versions`、`EntryVersion`；每版本一项改为每 key 一项（`ObservedEntry::history()` → `ObjectHistory` / `VersionRecord`，超过 10 万条分段），当前已删的 key 也列出；是否列历史由连接时的 `GetBucketVersioning` 决定（从未开过版本的桶不再列 `"null"` 版本，除非拒答；瞬时失败 role connect 失败）；快照只读 v7（所有 backend 的 v4–v6 `UnsupportedVersion`）；检查点 v2（v1 `UnsupportedVersion`）；`bytes` 改为当前版本字节，新增 `versions` / `delete_markers` / `all_versions_bytes`；`BackendConnectError::session_failure()`（C11b） |
 | 行为 | 大目录中途的瞬时错误：今天（物化）从头重来会成功，P7 后首页之后不能从头重来 → 可能 `Interrupted`（NFS 需 nfs-rs 页接口才能续） |
 | 测试 / 例子 | `storage/tests/order.rs`、`tests/local_namespace_contract.rs` 的兄弟有序断言删改；`examples/storage_role_operations/` 的 `--order`；16 个测试 fake 改用 `ListingStream::from_pages` |
 | 目录对象（F5b–F5e） | `NamespaceCapabilities` 新公开字段 `directory_objects`（外部字面量要补）；`ListedChild` 可以是空名（= 目录自己的对象，路径 `<dir>/`）；S3 列举多出 `d/` 文件条目（含零字节文件夹标记，files / 行数上升），以前有内容的 `d/` 是 `Failure{Child}`；`type == "file"` 匹配到它们；写到不能存目录对象的一端在 Preflight 报 `Unsupported`；MinIO 的 `XMinioInvalidObjectName` 从会话 `Protocol` 改为条目 `Unsupported` |
@@ -1171,7 +1203,27 @@ C11 feat(traversal): Resumable（Checkpoint 项每约 1 分钟 + 取消时补发
 C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 v7），删除 TraversalVersions / list_versions
     - 用户 2026-09-27 定（Q-A）：连接时 GetBucketVersioning 瞬时失败（超时 / 5xx / 网络，SDK 重试后）→ role connect 报 Connectivity / Transient，
       不猜；明确拒绝（403）→ 列历史（Q26）；501 / 不支持版本 → ListObjectsV2；快照只留一种格式、不兼容旧版本（用户 2026-09-27）
+    —— 已完成：`bda95d3`（refactor：版本列举搬到 histories.rs）、`5a20a77`（refactor：tally_child 返回 Tallied）、`f309f7a`（Q26 + Q-A：
+    连接时判定，`S3VersioningAtConnect`，瞬时失败 role connect `Connectivity` / `Transient`）、`7ec3a51`（每 key 一项、`ObjectHistory`、
+    快照 v7 + golden 字节、删 `TraversalVersions` / `list_versions` / `EntryVersion`、记录级观察 R2、R3、检查点 v2）、`648b132`（分段 Q8）、
+    `e2511a2`（计数）、`fdea3ed`（e2e-s3 / 续扫脚本）。要点见 §10.1 / §10.4 / §11.2c。与计划的差别：① `ObjectHistory` 多一个
+    `largest`（整个 key 的最大版本，每段都带、进快照），否则分段后各段的 R3 答案可能不同（评审）；② `S3Namespace` 在连接时取一次
+    `lists_histories()`（整个连接不变）；③ 构造请求失败（不是瞬时的）按拒绝处理，`Unreachable` 带 HTTP 状态进诊断；
+    ④ `BackendConnectError::session_failure()` 把 Q-A 的类型化失败带给 `connect_backend` 的调用方；⑤ 当前版本观察失败时条目时间
+    退回列举的；⑥ `Tallied::push_into` 代替迭代器（热路径）。故障注入 17 项全部变红：按 bucket.versions 判定、Refused 不列历史、
+    Unreachable 照常连接、按段计数、分段拆到不同 batch、段号 / complete 错、codec 改字段序不升版本、解码仍收 6、历史按
+    LastModified、指纹漏 histories、Blocks 取消后 delivered 仍前进、记录观察失败让整项失败、记录观察绑到当前版本、丢掉已删的 key、
+    条目身份用 VersionScoped、根自身对象只看条目 size、expert 接受已删的 key（第 18 项 merge 漏字段由解构在编译期兜底）。
+    真机（2026-09-27，全部 `RESULT: pass`，清理后无 `dm-` 残留、无临时桶）：traversal_versions（每个 key 一项、`gone` 当前已删也列出、
+    `p/z` 三条记录跨页、`--current` 无 Record）MinIO 临时版本桶 + data-mover-test、ONTAP data-mover-test-ver + data-mover-test、
+    ONTAP NAS data-mover-nas（ListObjectsV2、无历史）、RustFS 临时版本桶（`EXPECT_ORDER=inferred`）+ data-mover-test、DXN 临时版本桶
+    （`S3_LOCATION`）+ data-mover-test、StorageGRID data-mover-test-ver + data-mover-test；directory_objects（含 H1 重放）同样六套
+    （NAS 除外）；nas_matrix；versioning_matrix（`SKIP_RESUME=1`）MinIO / ONTAP；ONTAP F4 键集（`p/éb/x`、`mkl/z` 1000 个版本）→
+    一项 1000 条记录、服务端顺序（与原始 XML 倒序逐条相同）；traversal_resume（取消与 SIGKILL × 两种方式）MinIO 临时版本桶与 ONTAP
+    data-mover-test-ver：625 个 key × 2 个版本 + 4 个当前已删的 key（1912 行，含每条 Record）0 丢失。RSS_PLACEHOLDER
 C12 docs: docs/architecture/storage-transfer-architecture.md §5/§6；.claude/docs/{architecture,error-taxonomy,storage-*}.md；ADR-0008
+    （含 C11b 定下的**写入快照格式开发期规则**：一种当前格式、版本字节 + golden 字节测试、任何改动都升版本、旧格式
+    `UnsupportedVersion`；正式发布前重新决定 —— 至少解码 N-1，或给 terrasync 迁移 / 重扫说明）
 （terrasync 侧，另起：不丢批、分钟级退避、检查点落库顺序、消费者退出即失败、统计以库为准、全量扫描 generation 闸门、
   身份键只对 StableWithinBackend 关联、多版本每项展开成每版本一行）
 （可选）chore(deps): nfs-rs 公开 READDIRPLUS 页接口并升级（Q18）—— 已完成：nfs-rs 0.8.5 `17bb6fb`，用法见 C7c
