@@ -235,7 +235,7 @@ async fn delete_file(share: &smb_domain::Share, path: &str) -> Result {
     let file = share
         .open_file(
             &smb_domain::SharePath::new(path)?,
-            smb_domain::FileOpenOptions::open_existing(),
+            smb_domain::FileOpenOptions::open_existing().delete(true),
         )
         .await?;
     let deleted = file.delete().await;

@@ -151,6 +151,8 @@ impl CifsSourceProtocol for SmbDomainProtocol {
         path: &StoragePath,
     ) -> smb_domain::Result<(Box<dyn CifsReadCursor>, CifsSourceFacts)> {
         let share_path = self.share_path(path)?;
+        // Read access only (smb-rs #88): a source exposed read-only, or a file the principal may
+        // read but not write, must still copy out.
         let file = self
             .share
             .open_file(&share_path, smb_domain::FileOpenOptions::open_existing())
@@ -198,7 +200,10 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
         } else {
             let file = self
                 .share
-                .open_file(&path, smb_domain::FileOpenOptions::open_existing())
+                .open_file(
+                    &path,
+                    smb_domain::FileOpenOptions::open_existing().delete(true),
+                )
                 .await?;
             let deleted = file.delete().await;
             let close = close_file(file).await;
@@ -226,7 +231,10 @@ impl CifsNamespaceProtocol for SmbDomainProtocol {
         }
         let file = self
             .share
-            .open_file(&from, smb_domain::FileOpenOptions::open_existing())
+            .open_file(
+                &from,
+                smb_domain::FileOpenOptions::open_existing().delete(true),
+            )
             .await?;
         let renamed = file.rename_replace(&to).await;
         let close = close_file(file).await;
@@ -411,9 +419,15 @@ impl CifsStagedProtocol for SmbDomainProtocol {
 
     async fn open(&self, path: &StoragePath) -> smb_domain::Result<Box<dyn CifsStageFile>> {
         let path = self.share_path(path)?;
+        // Every stage and pointer write and flush goes through this handle, and so do the reads
+        // that share it (verify hash, reconcile hash, pointer reads): it needs `.write(true)`.
+        // Rename and delete open their own handle with `.delete(true)`.
         let file = self
             .share
-            .open_file(&path, smb_domain::FileOpenOptions::open_existing())
+            .open_file(
+                &path,
+                smb_domain::FileOpenOptions::open_existing().write(true),
+            )
             .await?;
         Ok(Box::new(DomainStageFile { file }))
     }
@@ -458,7 +472,10 @@ impl CifsStagedProtocol for SmbDomainProtocol {
         let to = self.share_path(to)?;
         let file = self
             .share
-            .open_file(&from, smb_domain::FileOpenOptions::open_existing())
+            .open_file(
+                &from,
+                smb_domain::FileOpenOptions::open_existing().delete(true),
+            )
             .await?;
         let rename = if replace {
             file.rename_replace(&to).await
@@ -474,7 +491,10 @@ impl CifsStagedProtocol for SmbDomainProtocol {
         let path = self.share_path(path)?;
         let file = self
             .share
-            .open_file(&path, smb_domain::FileOpenOptions::open_existing())
+            .open_file(
+                &path,
+                smb_domain::FileOpenOptions::open_existing().delete(true),
+            )
             .await?;
         let delete = file.delete().await;
         let close = close_file(file).await;

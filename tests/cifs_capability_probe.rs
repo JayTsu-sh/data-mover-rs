@@ -202,7 +202,7 @@ async fn probe_acl(share: &smb_domain::Share) -> Result {
     let file = share
         .open_file(
             &smb_domain::SharePath::new(&name)?,
-            smb_domain::FileOpenOptions::open_existing(),
+            smb_domain::FileOpenOptions::open_existing().delete(true),
         )
         .await?;
     let _ = file.delete().await;

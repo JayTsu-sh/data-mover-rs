@@ -63,7 +63,8 @@
 - **异步**：tokio (full)。**错误**：thiserror。**日志**：tracing。
 - **依赖管理**：默认全 crates.io，无 `[patch.crates-io]` (与 terrasync-rs 不同)。升级 `smb-domain` / `nfs-rs` / `aws-sdk-s3` 是真实风险。
   经项目授权的 git 固定：`smb-domain` (package `smb`) 固定 JayTsu-sh/smb-rs 已验证提交
-  `37d9404` (smb-rs main 顶端，2026-09-27：#87 目录 `open_existing()` 只读、删除 / 改名目录要
+  `2649a0b` (smb-rs main 顶端，2026-09-27：#89 文件 `open_existing()` 只读，写 / flush 要 `.write(true)`、
+  删除 / 改名要 `.delete(true)`；其前 `37d9404` #87 目录 `open_existing()` 只读、删除 / 改名目录要
   `.delete(true)`，#86 连接被 RST 后读循环不再二次 poll 而 panic；其前 `91e6cfb` #83 预备阶段取消修复、
   #82 runtime / 签名批处理 / 真机 CIFS 验收，domain ACL 只保留 account 类 ACE —— 有意为之；再前 #78 drop 连接即结束恢复、#76 丢流 /
   未建模 NTSTATUS 不再致命、#74 64 位 file id、#72 列举元数据、#73 始终直接 SMB2 协商)，`hdfs-native` 固定上游 kimahriman/hdfs-native master 提交 `695fc47` (2026-09-23 从 JayTsu-sh fork `373739f` 切回；fork 的 hsync / recover_lease 已并入上游)。不得使用浮动 branch。smb-rs 历史 API 依赖已随 legacy `CifsStorage` 删除 (#150)。

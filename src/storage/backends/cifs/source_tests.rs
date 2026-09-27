@@ -836,7 +836,7 @@ async fn delete_real_path_if_present(
     let file = match share
         .open_file(
             &real_share_path(root, path)?,
-            smb_domain::FileOpenOptions::open_existing(),
+            smb_domain::FileOpenOptions::open_existing().delete(true),
         )
         .await
     {

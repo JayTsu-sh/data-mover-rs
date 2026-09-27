@@ -12,8 +12,8 @@
 - backend 使用 smb-rs domain facade：`Client → Session → Share → File / Directory`。
 - data-mover 不得重新依赖 smb-rs 的 connection、runtime、wire create/query/set 类型或协议 handle。
 - `smb_domain::protocol` 只允许用于 lossless ACL codec 等明确的协议值边界，普通 I/O 不使用。
-- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = 37d9404... }`
-  (smb-rs main 顶端，#87 的 merge commit；smb 0.13.0)。升级历史与每次的真机矩阵见下方
+- 依赖只有一份：`smb-domain = { package = "smb", git = JayTsu-sh/smb-rs, rev = 2649a0b... }`
+  (smb-rs main 顶端，#89 的 merge commit；smb 0.14.0)。升级历史与每次的真机矩阵见下方
   "升级 smb-rs 依赖"。不得改成浮动 branch。`[patch.crates-io] smb` 与历史 API 提交 `c3ecf00` 已删除。
 
 ## 连接配置
@@ -219,8 +219,16 @@ result
   深度都只请求 `GENERIC_READ`；删除 / 改名目录要 `.delete(true)` (`protocol.rs` 的 `remove` / `rename_entry`
   目录分支)，改时间戳要 `.write_attributes(true)` (data-mover 走 `open_metadata`，不用它)。列举停车的句柄因此
   不再持写 / 删除权，只读账号能列非根目录。此前 (≤ `91e6cfb`) 非根目录一律 `GENERIC_READ | GENERIC_WRITE | DELETE`。
-  **文件仍未改**：`FileOpenOptions::open_existing()` 依旧请求读 + 写 + 删除，只读账号读源文件 (`protocol.rs:156`)
-  会 `ACCESS_DENIED` —— 已报 smb-rs #88。
+- **文件打开的访问权**：自 smb-rs `2649a0b` (#89，issue #88) 起 `FileOpenOptions::open_existing()` 只请求
+  `GENERIC_READ`；写 / flush 要 `.write(true)`，删除 / 改名要 `.delete(true)`，改时间戳要 `.write_attributes(true)`
+  (`create_new()` / `overwrite()` 不变，创建者照旧读 + 写 + 删除)。`protocol.rs` 各处按所需申请：源端读
+  (`CifsSourceProtocol::open`) 与 stage 大小查询只读；staged `open` (所有 stage / 指针文件的写与 flush，以及
+  共用它的读：校验哈希、reconcile 哈希、指针读) `.write(true)`；Namespace 与 staged 的文件删除 / 改名
+  `.delete(true)`。源端读句柄因此不再持写 / 删除权 —— 只读账号 / 只读 share 能拷出源文件，也不再与只共享读的
+  其他客户端冲突。此前 (≤ `37d9404`) 一律读 + 写 + 删除。
+  注意：ONTAP 的 UNIX 安全风格卷上，账号对文件没有写权限 (mode 位) 时服务端**并不**在 CREATE 时拒绝写 + 删除
+  访问 (最大访问权里没有写，写被 smb-rs 本地拒绝；删除却会成功 —— 2026-09-27 实测，root 属主 0755 目录里
+  他人 0644 文件被 lisauser 经旧默认句柄删掉)；CREATE 时就拒的是 share ACL (`read`) 与 NTFS ACL。
 
 ### Staged destination 与恢复
 
@@ -310,7 +318,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 
 | 项 | 实测 | 决定 |
 |---|---|---|
-| 匿名 / guest (legacy `anon`) | 2026-09-16 实测：设 `guest-unix-user=pcuser` 并建 share `dm_anon_share` (Everyone full_control) 后，未知用户 + 空密码被接受为 guest，`AllowUnsigned` 下 Namespace 契约全绿；`Deny` 下按预期拒绝。**2026-09-21 复测失败，原因在服务端而非代码**：SVM `lizy` 发现的域控数为 **0** (`vserver cifs domain discovered-servers` 空)，而 guest 映射发生在"确认该用户在域里无效"之后 —— DC 联系不上就走不到那一步，任何未知用户的 SESSION_SETUP 等约 2 秒后被回以 `0xC0000466 STATUS_SERVER_UNAVAILABLE` (字面义即"域控不可用")。其余测试不受影响，因为测试账号 `LIZYAD\lisauser` 是**本地**用户 (RID 1008)，本地校验不经过 DC。(该状态码此前未建模，表现为 `OutcomeUnknown` + 连接被杀；已由 smb-rs PR #81 修正，probe 行随之从 `rejected (Operation outcome is unknown ...)` 变为 `rejected (Unexpected message status: Server Unavailable (0xc0000466).)`) | **已实现** (`guest_policy`)。DC 恢复后这一档应自动可用 |
+| 匿名 / guest (legacy `anon`) | 2026-09-16 实测：设 `guest-unix-user=pcuser` 并建 share `dm_anon_share` (Everyone full_control) 后，未知用户 + 空密码被接受为 guest，`AllowUnsigned` 下 Namespace 契约全绿；`Deny` 下按预期拒绝。**2026-09-21 复测失败，原因在服务端而非代码**：SVM `lizy` 发现的域控数为 **0** (`vserver cifs domain discovered-servers` 空)，而 guest 映射发生在"确认该用户在域里无效"之后 —— DC 联系不上就走不到那一步，任何未知用户的 SESSION_SETUP 等约 2 秒后被回以 `0xC0000466 STATUS_SERVER_UNAVAILABLE` (字面义即"域控不可用")。其余测试不受影响，因为测试账号 `LIZYAD\lisauser` 是**本地**用户 (RID 1008)，本地校验不经过 DC。(该状态码此前未建模，表现为 `OutcomeUnknown` + 连接被杀；已由 smb-rs PR #81 修正，probe 行随之从 `rejected (Operation outcome is unknown ...)` 变为 `rejected (Unexpected message status: Server Unavailable (0xc0000466).)`) **2026-09-27 恢复**：SVM 重新发现域控 (`discovered-servers` 有 `status ok` 记录)，匿名 Namespace 契约在 `2649a0b` 上 ×2 全绿 (guest 会话、`AllowUnsigned`)；probe 的 `guest account, empty password` 行仍是 `0xc0000072` (`STATUS_ACCOUNT_DISABLED`，本地 Guest 账号停用)，与匿名 (未知用户) 路径无关 | **已实现** (`guest_policy`) |
 | SMB1 多协议探测 (legacy `smb2_only`) | 协商结果是 SMB 3.1.1 (`protocol=smb3`, `ntlmv2`)，但**方言只反映协商结果，不代表没先发过 SMB1 帧**。实际上 `ConnectionConfig::smb2_only_negotiate` 是 `#[derive(Default)]` 上的 `bool`，默认 `false`，facade 此前每次建连都先发 legacy SMB1 多协议 NEGOTIATE | **已修** (smb-rs #73)：facade 固定 `smb2_only_negotiate = true`，始终直接 SMB2，且不提供开关。旧记录写成「不实现」是误判 —— 不是没实现，是默认行为从 legacy 的「跳过」悄悄变成了「发送」 |
 | Multichannel | 服务端 `multichannel=false`；dual LIF 靠两个地址 | **不实现** (需要时先改 smb-rs facade) |
 | 签名 | 服务端不强制 (`smb_signing=false`)；`WhenRequired` / `Required` 都能连 | 保持 `CifsSigningPolicy` |
@@ -340,6 +348,18 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 
 ## 升级 smb-rs 依赖
 
+> 2026-09-27：`37d9404` → main 顶端 **`2649a0b`**（#89，issue #88）：`FileOpenOptions::open_existing()` 只请求
+> `GENERIC_READ`，写 / flush 要 `.write(true)`、删除 / 改名要 `.delete(true)`、改时间戳要 `.write_attributes(true)`；
+> 破坏性变更，smb 0.13.0 → 0.14.0，只编得过、不报错的地方靠运行时暴露，所以 `protocol.rs` 调用点与 rev 同一提交。
+> `domain/`、`runtime/port.rs` 变更 → 第 4 步完整矩阵两轮：policy contract ×2（含 64 MiB、双 LIF、读回校验、目录
+> mtime）、namespace ×2、probe ×2，全过；`resume_matrix.sh`（`DEST=smb:`，200 MiB，cancel + SIGKILL）×2 均
+> `Resumed { ~64 MiB }` 且 BLAKE3 一致 —— 这是 stage 文件重开 `.write(true)` 的路径。**匿名 share 一档首次在新
+> pin 上跑**（SVM `lizy` 已能发现域控）：`CIFS_REAL_SHARE=dm_anon_share`、空用户名 / 密码、
+> `CIFS_REAL_GUEST_POLICY=allow-unsigned` 下 namespace ×2 全过（含停车列举）。旧 pin `37d9404` 上同一档 4 次
+> 3 过：第一次的 `real_share_namespace_verbs_roundtrip` 因 connect 时身份探测退回 `PathScoped` 而失败
+> （断言要求 `StableWithinBackend`），之后未再复现；原因未定位（那次没开 `RUST_LOG`）。
+> 2026-09-27（早）：`91e6cfb` → `37d9404`（#86 读循环出错后不再二次 poll，#87 目录 `open_existing()` 只读）。
+>
 > 2026-09-23：`ced48ff` → main 顶端 **`91e6cfb`**（#82 `c81c75a` runtime / CMAC 签名批处理 / crypto
 > executor / session setup / dialects / domain security，#83 预备阶段取消修复）。协议层变更，第 4 步完整
 > 矩阵在 `91e6cfb` 上跑了两轮：policy contract ×2、namespace ×2、probe ×2，全过；匿名 share 一档未跑

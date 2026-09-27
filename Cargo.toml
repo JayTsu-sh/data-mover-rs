@@ -43,7 +43,7 @@ hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive", "rc"] }
-smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "37d9404ca6edd045a40ae779cbf5a9d9f3d5cb1c" }
+smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "2649a0bbd615c23d64faca0053e969288694e034" }
 soft-canonicalize = "0.5.5"
 thiserror = "2.0.18"
 tokio = { version = "1.51.1", features = ["full"] }
