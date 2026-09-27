@@ -896,6 +896,10 @@ C7b fix(nfs): v3 READDIRPLUS 列出、却不给属性的 `.snapshot`（ONTAP 卷
     一条 `info!`）；不是目录 → 按查到的属性当普通子项；查失败 → 该子项失败（查询自己的分类，`NOENT` 即消失），会话 / 节流 /
     目录句柄失效的失败按 READDIRPLUS 失败结束这次读取。带属性的 `.snapshot`（DXN 上真建的目录）、其他名字、v4 一律不变
 C7c feat(storage): NFS 列举首页之后可按 cookie 续读（Q18；nfs-rs 0.8.5 `Mount::readdirplus_page`）—— 已完成：`26a27f6`（前置 `17bb6fb` 升级 nfs-rs）
+    - 协调者 2026-09-27 认可与原计划的三处差别：cookie 被拒（或回空末页）→ 带去重从头重读（≤ 3 次）而非 `Interrupted`；
+      cookie 回环只在一次读取内检测；`NFS3ERR_NOT_SYNC` 不当坏 cookie。**待办**：去重摘要（每条目一次 SipHash、每列举 ≤ 2^18 条
+      ≈ 4.5 MiB）在 node1 m1-source 53M 树上实测 CPU / RSS（对照 §12.6 目标，随下次 node1 性能轮一起测）；首页之前也按 cookie 续读
+      （现在首页前仍是 C7 的整目录重来、不补预算，频繁断连时可能到不了首页）作为后续项
     - 接缝：`read_directory` 带起点 cookie；`NfsListingPages::first_sight(fileid, 名字)`（读者看一项之前问，已取的跳过，
       含 v3 `.snapshot` 的 LOOKUP）、`reached(next)`（整个回复取完、目录未完时报位置；同一次读取里重复 → `NfsReadEnd::Repeated`）；
       `NfsRestart::FromStart`（`is_bad_directory_cookie`：`NFS3ERR_BAD_COOKIE` / `NFS4ERR_BAD_COOKIE` / `NFS4ERR_NOT_SAME`；
