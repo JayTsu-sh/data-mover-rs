@@ -2,9 +2,10 @@
 //! shorter than its `Content-Length` / `Content-Range`, or the connection reset mid-body — is
 //! told apart by one `HEAD` sent after it (coordinator decision 2026-09-27):
 //!
-//! - another `ETag`, size or (when both have one) `Last-Modified` than described: the object was
-//!   replaced — N0 saw ONTAP cut in-flight GETs 0.3–0.7 s after a replacement commits — a
-//!   permanent `Conflict`, the class a 412 gets where reads are pinned;
+//! - another object than described ([`object_change`]: another `ETag`, size or — when both have
+//!   one — `Last-Modified`): the object was replaced — N0 saw ONTAP cut in-flight GETs 0.3–0.7 s
+//!   after a replacement commits — a permanent `Conflict`, the class a 412 gets where reads are
+//!   pinned;
 //! - the described object: an ordinary lost connection, as transient as a pinned read's broken
 //!   body, so the read is retried;
 //! - the `HEAD` failed: its own failure, which says more about the object or the connection now
@@ -12,19 +13,7 @@
 
 use crate::model::{FailureClass, Transience};
 
-use super::{S3ObjectFacts, S3ProtocolFailure, S3Result};
-
-/// Whether `current` (a `HEAD`) is the object `described`: the same `ETag` (quotes ignored) and
-/// size, and the same `Last-Modified` when both have one.
-fn is_described_object(current: &S3ObjectFacts, described: &S3ObjectFacts) -> bool {
-    let modified = matches!(
-        (current.last_modified, described.last_modified),
-        (Some(now), Some(then)) if now != then
-    );
-    current.etag.trim_matches('"') == described.etag.trim_matches('"')
-        && current.size == described.size
-        && !modified
-}
+use super::{S3ObjectFacts, S3ProtocolFailure, S3Result, S3SeenObject, object_change};
 
 /// The failure of an unpinned ranged read of `described` whose body broke off (`cause` says how),
 /// given what the `HEAD` sent after it answered.
@@ -34,14 +23,16 @@ pub(crate) fn broken_body_failure(
     cause: &str,
 ) -> S3ProtocolFailure {
     match head {
-        Ok(current) if is_described_object(&current, described) => S3ProtocolFailure::session(
-            FailureClass::Connectivity,
-            Transience::Transient,
-            format!(
-                "the S3 object's body broke off ({cause}); a HEAD found it unchanged: the \
-                 connection was lost"
-            ),
-        ),
+        Ok(current) if object_change(&S3SeenObject::of(&current), described).is_none() => {
+            S3ProtocolFailure::session(
+                FailureClass::Connectivity,
+                Transience::Transient,
+                format!(
+                    "the S3 object's body broke off ({cause}); a HEAD found it unchanged: the \
+                     connection was lost"
+                ),
+            )
+        }
         Ok(_) => S3ProtocolFailure::entry(
             FailureClass::Conflict,
             Transience::Permanent,

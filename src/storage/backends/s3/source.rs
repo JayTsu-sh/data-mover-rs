@@ -13,7 +13,9 @@ use crate::storage::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{S3ObjectFacts, S3Protocol, S3ProtocolFailure, is_real_version_id};
+use super::{
+    S3ObjectFacts, S3Protocol, S3ProtocolFailure, S3SeenObject, is_real_version_id, object_change,
+};
 
 pub(crate) struct S3ReadSource<P> {
     protocol: Arc<P>,
@@ -325,9 +327,9 @@ async fn next_range<P: S3Protocol>(
     Ok(Some((bytes, state)))
 }
 
-/// After the last range of an unpinned read: the object must still be the one described — same
-/// `ETag`, size and (when both have one) `Last-Modified` — or the read is a permanent `Conflict`,
-/// as a 412 would have made it where reads are pinned.
+/// After the last range of an unpinned read: the object must still be the one described
+/// ([`object_change`]: same `ETag`, size and, when both have one, `Last-Modified`) or the read is a
+/// permanent `Conflict`, as a 412 would have made it where reads are pinned.
 async fn confirm_unchanged<P: S3Protocol>(
     protocol: &P,
     path: &StoragePath,
@@ -350,17 +352,10 @@ async fn confirm_unchanged<P: S3Protocol>(
         }) => return Err(changed()),
         Err(failure) => return Err(role_failure(path, Operation::Read, failure)),
     };
-    let modified = matches!(
-        (current.last_modified, described.last_modified),
-        (Some(now), Some(then)) if now != then
-    );
-    if current.etag.trim_matches('"') != described.etag.trim_matches('"')
-        || current.size != described.size
-        || modified
-    {
-        return Err(changed());
+    match object_change(&S3SeenObject::of(&current), described) {
+        Some(_) => Err(changed()),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 #[allow(clippy::expect_used)]

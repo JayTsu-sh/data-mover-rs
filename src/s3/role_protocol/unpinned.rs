@@ -3,10 +3,10 @@
 //! what was described instead, and a header that differs means the object was replaced (a
 //! permanent `Conflict`, the class a 412 gets where reads are pinned):
 //!
-//! - its `ETag` must be the described one (on a NAS bucket it is derived from the file's mtime and
-//!   size, so every S3 or NFS write changes it — one that restores the mtime does not, N0);
-//! - its `Content-Range` total must be the described size;
-//! - its `Last-Modified` must be the described one when both have one (whole seconds);
+//! - its `ETag`, `Content-Range` total and `Last-Modified` must show the described object, by the
+//!   rule every NAS read shares ([`object_change`]). On a NAS bucket the `ETag` is derived from
+//!   the file's mtime and size, so every S3 or NFS write changes it — one that restores the mtime
+//!   does not (N0);
 //! - its body must be as long as announced. A NAS bucket cuts a GET 0.3–0.7 s after a replacement
 //!   commits, having sent a clean prefix of the old content (N0), but a network drop breaks a body
 //!   off too: one `HEAD` after a broken body tells the two apart ([`broken_body_failure`]).
@@ -19,7 +19,8 @@ use bytes::Bytes;
 
 use crate::model::{FailureClass, StorageTimestamp, Transience};
 use crate::storage::backends::s3::{
-    S3ObjectFacts, S3ProtocolFailure, S3Result, broken_body_failure,
+    S3ObjectChange, S3ObjectFacts, S3ProtocolFailure, S3Result, S3SeenObject, broken_body_failure,
+    object_change,
 };
 use crate::time_util::http_last_modified;
 
@@ -58,11 +59,6 @@ where
     }
 }
 
-/// Whether two `ETag`s are the same, ignoring surrounding quotes.
-fn same_etag(left: &str, right: &str) -> bool {
-    left.trim_matches('"') == right.trim_matches('"')
-}
-
 /// The total of a `Content-Range: bytes <first>-<last>/<total>` header; `None` for any other
 /// shape, or an unknown total (`*`).
 fn content_range_total(header: &str) -> Option<u64> {
@@ -79,31 +75,24 @@ struct UnpinnedResponse<'a> {
 
 /// Checks the response headers against the described object, before its body is read.
 fn check_headers(response: &UnpinnedResponse<'_>, observed: &S3ObjectFacts) -> S3Result<()> {
-    if !response
-        .etag
-        .is_some_and(|etag| same_etag(etag, &observed.etag))
-    {
-        return Err(replaced(
-            "the S3 object's ETag changed during the read: it was replaced",
-        ));
-    }
-    if response
-        .content_range
-        .and_then(content_range_total)
-        .is_some_and(|total| total != observed.size)
-    {
-        return Err(replaced(
-            "the S3 object's size changed during the read: it was replaced",
-        ));
-    }
-    if let (Some(read), Some(described)) = (response.last_modified, observed.last_modified)
-        && read != described
-    {
-        return Err(replaced(
-            "the S3 object's Last-Modified changed during the read: it was replaced",
-        ));
-    }
-    Ok(())
+    let seen = S3SeenObject {
+        etag: response.etag,
+        size: response.content_range.and_then(content_range_total),
+        last_modified: response.last_modified,
+    };
+    let diagnostic = match object_change(&seen, observed) {
+        None => return Ok(()),
+        Some(S3ObjectChange::ETag) => {
+            "the S3 object's ETag changed during the read: it was replaced"
+        }
+        Some(S3ObjectChange::Size) => {
+            "the S3 object's size changed during the read: it was replaced"
+        }
+        Some(S3ObjectChange::LastModified) => {
+            "the S3 object's Last-Modified changed during the read: it was replaced"
+        }
+    };
+    Err(replaced(diagnostic))
 }
 
 /// The body of an unpinned read, which must be `expected` bytes; otherwise how it broke off: cut
