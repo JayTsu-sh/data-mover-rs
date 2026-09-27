@@ -41,11 +41,17 @@ pub(crate) fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
     let (class, transience) = match &error {
         nfs_rs::NfsError::Unsupported(_) => (FailureClass::Unsupported, Transience::Permanent),
         value if value.is_not_found() => (FailureClass::NotFound, Transience::Permanent),
+        // A read-only export refuses every mutation the same way whatever the entry's mode: the
+        // taxonomy has no read-only class, and the refusal is as permanent as `ACCES`.
         nfs_rs::NfsError::Nfs3(
-            nfs_rs::Nfs3ErrorCode::NFS3ERR_ACCES | nfs_rs::Nfs3ErrorCode::NFS3ERR_PERM,
+            nfs_rs::Nfs3ErrorCode::NFS3ERR_ACCES
+            | nfs_rs::Nfs3ErrorCode::NFS3ERR_PERM
+            | nfs_rs::Nfs3ErrorCode::NFS3ERR_ROFS,
         )
         | nfs_rs::NfsError::Nfs4(
-            nfs_rs::Nfs4ErrorCode::NFS4ERR_ACCESS | nfs_rs::Nfs4ErrorCode::NFS4ERR_PERM,
+            nfs_rs::Nfs4ErrorCode::NFS4ERR_ACCESS
+            | nfs_rs::Nfs4ErrorCode::NFS4ERR_PERM
+            | nfs_rs::Nfs4ErrorCode::NFS4ERR_ROFS,
         ) => (FailureClass::PermissionDenied, Transience::Permanent),
         nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_NOSPC)
         | nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_NOSPC) => {
@@ -121,6 +127,28 @@ mod tests {
             ),
             (
                 nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_ACCESS),
+                FailureClass::PermissionDenied,
+                Transience::Permanent,
+            ),
+            // A refused MKDIR: the role's one-level create reaches these unwrapped.
+            (
+                nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_ACCES),
+                FailureClass::PermissionDenied,
+                Transience::Permanent,
+            ),
+            (
+                nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_PERM),
+                FailureClass::PermissionDenied,
+                Transience::Permanent,
+            ),
+            // A read-only export (no read-only class in the taxonomy).
+            (
+                nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_ROFS),
+                FailureClass::PermissionDenied,
+                Transience::Permanent,
+            ),
+            (
+                nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_ROFS),
                 FailureClass::PermissionDenied,
                 Transience::Permanent,
             ),

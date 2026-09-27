@@ -139,7 +139,7 @@ nfs-rs 错误产出 `FailureClass` + `Transience`，并记下服务端状态名�
 | `OperationOutcome` DoNotRetry | `Protocol` | Permanent |
 | `Unsupported` | `Unsupported` | Permanent |
 | NOENT 类（`is_not_found`） | `NotFound` | Permanent |
-| `NFS3ERR_ACCES` / `NFS3ERR_PERM` / `NFS4ERR_ACCESS` / `NFS4ERR_PERM` | `PermissionDenied` | Permanent |
+| `NFS3ERR_ACCES` / `NFS3ERR_PERM` / `NFS4ERR_ACCESS` / `NFS4ERR_PERM`；`NFS3ERR_ROFS` / `NFS4ERR_ROFS`（只读文件系统 / 导出，例如 ONTAP `.snapshot`；分类里没有"只读"类，拒绝与 `ACCES` 一样永久；ROFS 此前是 `Protocol` / Unknown） | `PermissionDenied` | Permanent |
 | `NFS3ERR_NOSPC` / `NFS4ERR_NOSPC` | `Capacity` | Permanent |
 | `InvalidInput` | `InvalidInput` | Permanent |
 | `Io` PermissionDenied / NotFound | `PermissionDenied` / `NotFound` | Permanent |
