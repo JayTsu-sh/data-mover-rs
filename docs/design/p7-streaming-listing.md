@@ -1075,6 +1075,7 @@ C7d perf(nfs): READDIR / READDIRPLUS 的回复大小按服务器公布的上限�
       列为待决
     - 附带（nfs-rs）：v3 READDIR / READDIRPLUS 原来沿 XDR 链表递归解码，1 MiB（约 6,000 项）的回复在 debug 构建里栈溢出（nfs-rs 的
       真机测试撞到），0.8.6 改为逐项解码；8 KiB 时不会发生
+    - **首项延迟（用户 2026-09-27 定：维持现状）**：DXN-2 上 1 MiB 回复让大目录首个子项约 0.12 → 0.35 s；不做“首次请求用小尺寸”的变通（需再发 nfs-rs 版本）
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
 C9  feat(storage): CIFS 流式（生产者持有句柄；停车句柄上限） - src/storage/backends/cifs/{protocol.rs:230-280, namespace.rs:59-94}
     —— 已完成：70f85d1（接缝 open_directory + CifsDirectory，不改行为）、936e20b
