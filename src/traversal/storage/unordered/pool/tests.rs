@@ -1,5 +1,6 @@
 //! The pool on its own: the frontier invariant at every move (checked by the pool itself under
-//! test), shallowest-first stealing, and termination under many concurrent workers.
+//! test, at every gap between critical sections), shallowest-first stealing, and termination
+//! under many concurrent workers.
 
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -127,7 +128,11 @@ async fn many_workers_take_every_directory_once_and_drain() {
         .sum();
     for round in 0..20 {
         let workers = [1, 3, 8, 16][round % 4];
-        let pool = Arc::new(Pool::new(workers, work("")));
+        let mut pool = Pool::new(workers, work(""));
+        // Every other round without the frontier check, which locks every slot between two
+        // moves: those rounds keep the interleavings of `take` / `push` a real traversal has.
+        pool.checked = round % 2 == 0;
+        let pool = Arc::new(pool);
         let halt = CancellationToken::new();
         let taken = Arc::new(AtomicU64::new(0));
         let mut tasks = Vec::new();
@@ -166,4 +171,14 @@ async fn many_workers_take_every_directory_once_and_drain() {
         assert!(pool.drained());
         assert!(pool.frontier().is_empty());
     }
+}
+
+/// The check is not vacuous: a pop that registers its directory in a second critical section
+/// (P7 §14 "先出栈后登记") leaves it out of the frontier at the gap, and that fails at once, with
+/// no concurrent snapshot needed to land in the gap.
+#[test]
+#[should_panic(expected = "left the frontier while unfinished: [\"\"]")]
+fn a_pop_registered_in_a_second_critical_section_is_caught() {
+    let pool = Pool::new(1, work(""));
+    let _ = pool.pop_split(0);
 }

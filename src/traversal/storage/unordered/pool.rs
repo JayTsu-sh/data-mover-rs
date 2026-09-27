@@ -15,6 +15,10 @@
 //! `active`. So a snapshot taken with every slot locked — what a resumable traversal records
 //! (P7 §9.2) — never misses a subtree, and never needs the workers to pause.
 //!
+//! Under test every slot lock goes through `checked::SlotGuard`: each time a thread lets
+//! go of its last slot lock, the frontier must hold every directory pushed and not finished, so
+//! a move split over two critical sections fails at the gap between them, deterministically.
+//!
 //! **Done.** `outstanding` counts directories pushed and not finished. A directory adds its
 //! subdirectories before they become visible to anyone, and subtracts itself only after that, so
 //! the count reaches zero exactly once, when nothing is left anywhere: the worker that takes it
@@ -28,15 +32,28 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::Mutex;
+#[cfg(not(test))]
+use parking_lot::MutexGuard;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::super::DirectoryWork;
 use crate::traversal::TraversalTerminalFailure;
 
+#[cfg(test)]
+mod checked;
+
+#[cfg(test)]
+use checked::{SlotGuard, Unfinished};
+
 /// No directory on the stack.
 const EMPTY: usize = usize::MAX;
+
+/// A locked slot: the mutex guard itself, or, under test, a guard that checks the frontier once
+/// its thread holds no slot lock any more.
+#[cfg(not(test))]
+type SlotGuard<'a> = MutexGuard<'a, SlotState>;
 
 /// One worker's stack and the directory it is listing.
 #[derive(Default)]
@@ -80,18 +97,25 @@ pub(super) struct Pool {
     rotor: AtomicUsize,
     /// The first failure that ends the traversal.
     failure: Mutex<Option<TraversalTerminalFailure>>,
-    /// Checks the frontier invariant at every move (tests only).
+    /// Checks the frontier invariant every time a thread lets go of its last slot lock (tests
+    /// only).
     #[cfg(test)]
     pub(super) checked: bool,
+    /// Every directory pushed and not finished: what the frontier must hold (tests only).
+    #[cfg(test)]
+    unfinished: Unfinished,
 }
 
 impl Pool {
     /// A pool of `workers` slots, the first holding `root`.
     pub(super) fn new(workers: usize, root: DirectoryWork) -> Self {
         let slots: Box<[Slot]> = (0..workers.max(1)).map(|_| Slot::new()).collect();
+        let root = Arc::new(root);
+        #[cfg(test)]
+        let unfinished = Unfinished::of(&root);
         if let Some(first) = slots.first() {
             let mut state = first.state.lock();
-            state.stack.push_back(Arc::new(root));
+            state.stack.push_back(root);
             first.publish(&state);
         }
         Self {
@@ -103,7 +127,17 @@ impl Pool {
             failure: Mutex::new(None),
             #[cfg(test)]
             checked: true,
+            #[cfg(test)]
+            unfinished,
         }
+    }
+
+    /// Locks slot `index`.
+    fn lock(&self, index: usize) -> Option<SlotGuard<'_>> {
+        let state = self.slots.get(index)?.state.lock();
+        #[cfg(test)]
+        let state = SlotGuard::new(self, state);
+        Some(state)
     }
 
     pub(super) fn workers(&self) -> usize {
@@ -148,14 +182,10 @@ impl Pool {
     /// Worker `me`'s newest directory, made its `active` one under the same lock.
     fn pop_own(&self, me: usize) -> Option<Arc<DirectoryWork>> {
         let slot = self.slots.get(me)?;
-        let work = {
-            let mut state = slot.state.lock();
-            let work = state.stack.pop_back()?;
-            state.active = Some(Arc::clone(&work));
-            slot.publish(&state);
-            work
-        };
-        self.check_moved(&work);
+        let mut state = self.lock(me)?;
+        let work = state.stack.pop_back()?;
+        state.active = Some(Arc::clone(&work));
+        slot.publish(&state);
         Some(work)
     }
 
@@ -177,7 +207,6 @@ impl Pool {
             }
             drop(theirs);
             drop(mine);
-            self.check_moved(&work);
             if left > 0 && self.idle.load(Ordering::SeqCst) > 0 {
                 self.wake.notify_one();
             }
@@ -207,18 +236,13 @@ impl Pool {
     }
 
     /// Locks `me`'s and `victim`'s slots, the lower index first; returns them as (mine, theirs).
-    fn lock_pair(
-        &self,
-        me: usize,
-        victim: usize,
-    ) -> Option<(MutexGuard<'_, SlotState>, MutexGuard<'_, SlotState>)> {
-        let (own, other) = (self.slots.get(me)?, self.slots.get(victim)?);
+    fn lock_pair(&self, me: usize, victim: usize) -> Option<(SlotGuard<'_>, SlotGuard<'_>)> {
         Some(if me < victim {
-            let mine = own.state.lock();
-            (mine, other.state.lock())
+            let mine = self.lock(me)?;
+            (mine, self.lock(victim)?)
         } else {
-            let theirs = other.state.lock();
-            (own.state.lock(), theirs)
+            let theirs = self.lock(victim)?;
+            (self.lock(me)?, theirs)
         })
     }
 
@@ -229,14 +253,17 @@ impl Pool {
             return;
         }
         self.outstanding.fetch_add(works.len(), Ordering::SeqCst);
-        if let Some(slot) = self.slots.get(me) {
-            let mut state = slot.state.lock();
+        if let (Some(slot), Some(mut state)) = (self.slots.get(me), self.lock(me)) {
             #[cfg(test)]
             assert!(
                 !self.checked || state.active.is_some(),
                 "children pushed by a worker whose directory is not registered"
             );
+            #[cfg(test)]
+            let first = state.stack.len();
             state.stack.extend(works.into_iter().map(Arc::new));
+            #[cfg(test)]
+            self.unfinished.insert(state.stack.range(first..));
             slot.publish(&state);
         }
         // Pairs with the fence in `take`.
@@ -249,8 +276,11 @@ impl Pool {
     /// Worker `me` finished its `active` directory: its listing ended and every subdirectory it
     /// found is pushed. Returns whether that was the last directory anywhere.
     pub(super) fn finish(&self, me: usize) -> bool {
-        if let Some(slot) = self.slots.get(me) {
-            slot.state.lock().active = None;
+        if let Some(mut state) = self.lock(me) {
+            let done = state.active.take();
+            #[cfg(test)]
+            self.unfinished.remove(done.as_ref());
+            drop(done);
         }
         self.outstanding.fetch_sub(1, Ordering::AcqRel) == 1
     }
@@ -282,22 +312,6 @@ impl Pool {
             .cloned()
             .collect()
     }
-
-    /// A directory that just left a stack must still be in the frontier.
-    #[cfg(test)]
-    fn check_moved(&self, work: &Arc<DirectoryWork>) {
-        if self.checked {
-            assert!(
-                self.frontier().iter().any(|held| Arc::ptr_eq(held, work)),
-                "{} left a stack without being registered",
-                work.path
-            );
-        }
-    }
-
-    #[cfg(not(test))]
-    #[allow(clippy::unused_self)]
-    const fn check_moved(&self, _work: &Arc<DirectoryWork>) {}
 }
 
 #[cfg(test)]
