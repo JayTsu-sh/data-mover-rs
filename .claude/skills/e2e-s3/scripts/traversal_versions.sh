@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ADR-0006 C22 / P7: the role-based S3 traversal in both version modes against a real server
-# (examples/storage_role_operations.rs `traverse --versions current|all`), and the legacy walkdir /
+# (examples/storage_role_operations/traverse.rs `traverse --versions current|all`), and the legacy walkdir /
 # walkdir_2 (examples/s3_listing.rs). Three ways to pick the bucket:
 #
 # - Default: creates ONE temporary bucket on the .env's server, <BUCKET_PREFIX>-<run> (versioning

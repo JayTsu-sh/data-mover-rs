@@ -919,7 +919,7 @@ c = 8 / 64、Blocks c = 8 与 `d222738` 的 Blocks c = 8 / 64 条目集合摘要
 | S3 身份 | `PathScoped` 身份含路径（F1），已有代的 S3 条目身份键一次性全部变化 |
 | 多版本（`mod.rs:65-86`，`ObservedEntry::version / source_version`，`storage/descriptor.rs` 的 `ListingFacts`，快照 v6） | 删除 `TraversalVersions` 与 `list_versions`；每版本一项改为每 key 一项（`ObservedEntry::history()`）；快照 v6 由 v7 取代 |
 | 行为 | 大目录中途的瞬时错误：今天（物化）从头重来会成功，P7 后首页之后不能从头重来 → 可能 `Interrupted`（NFS 需 nfs-rs 页接口才能续） |
-| 测试 / 例子 | `storage/tests/order.rs`、`tests/local_namespace_contract.rs` 的兄弟有序断言删改；`examples/storage_role_operations.rs` 的 `--order`；16 个测试 fake 改用 `ListingStream::from_pages` |
+| 测试 / 例子 | `storage/tests/order.rs`、`tests/local_namespace_contract.rs` 的兄弟有序断言删改；`examples/storage_role_operations/` 的 `--order`；16 个测试 fake 改用 `ListingStream::from_pages` |
 | 目录对象（F5b–F5e） | `NamespaceCapabilities` 新公开字段 `directory_objects`（外部字面量要补）；`ListedChild` 可以是空名（= 目录自己的对象，路径 `<dir>/`）；S3 列举多出 `d/` 文件条目（含零字节文件夹标记，files / 行数上升），以前有内容的 `d/` 是 `Failure{Child}`；`type == "file"` 匹配到它们；写到不能存目录对象的一端在 Preflight 报 `Unsupported`；MinIO 的 `XMinioInvalidObjectName` 从会话 `Protocol` 改为条目 `Unsupported` |
 | legacy（F5a） | S3 `walkdir` / `walkdir_2` 对有内容的 `d/` 报 Scan 错误（之前静默跳过）：terrasync 在这类桶上会关闭删除检测 |
 

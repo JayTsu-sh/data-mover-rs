@@ -156,7 +156,7 @@ role-based 路径同理：`traversal` 模块不依赖 `crate::filter` (架构依
 
 只有一个遍历实现接这个接缝：`traversal::StorageTraversalSource`，出借 Namespace 角色的
 backend (Local / NFS / CIFS / HDFS) 都走它。
-可运行入口见 `examples/storage_role_operations.rs`。
+可运行入口见 `examples/storage_role_operations/`。
 
 ## S3 目录对象（P7 F5）
 
