@@ -13,12 +13,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::s3_tests::{put, request};
 use super::{
-    Checkpoint, Resumable, ResumeRefusal, StorageTraversalSource, TraversalItem, TraversalOrder,
-    TraversalOutcome, TraversalRequest, TraversalSource, TraversalTerminalFailure,
+    Checkpoint, Resumable, ResumeRefusal, ScanTotals, StorageTraversalSource, TraversalCandidate,
+    TraversalDecision, TraversalFilter, TraversalItem, TraversalOrder, TraversalOutcome,
+    TraversalRequest, TraversalSource, TraversalTerminalFailure,
 };
-use crate::model::{ObjectHistory, ObservedEntry};
+use crate::model::{EntryKind, ObjectHistory, ObservedEntry};
 use crate::storage::backends::s3::tests::{MemoryS3, Versioning, identity};
-use crate::storage::backends::s3::{S3VersioningAtConnect, connect};
+use crate::storage::backends::s3::{S3Protocol as _, S3VersioningAtConnect, connect};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 type Outcome = Result<TraversalOutcome, TraversalTerminalFailure>;
@@ -333,5 +334,121 @@ async fn a_checkpoint_does_not_resume_across_a_versioning_change() -> TestResult
         ),
         "{outcome:?}"
     );
+    Ok(())
+}
+
+/// Admits everything but `d/big`.
+#[derive(Debug)]
+struct HideBig;
+
+impl TraversalFilter for HideBig {
+    fn needs_modified(&self) -> bool {
+        false
+    }
+
+    fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
+        TraversalDecision {
+            emit: candidate.path != "d/big",
+            descend: candidate.kind == EntryKind::Directory,
+            filter_children: true,
+        }
+    }
+}
+
+/// Counts are per key (P7 §10.4), whatever the segments: `d/big` is one listed, emitted file; its
+/// records are counted apart, once — seven versions, their bytes, the current version's bytes. A
+/// file without a history counts its size in both byte totals. Blocks' per-directory counts sum to
+/// what Unordered counts. A key the filter hides delivers no segment and is one `filtered`.
+#[tokio::test]
+async fn counts_are_per_key_and_records_are_counted_once() -> TestResult {
+    let protocol = bucket(2).await?;
+    let mut blocks_sum = ScanTotals::default();
+    for order in ORDERS {
+        let (items, outcome) = run(&source(&protocol, 3)?, request().order(order), None).await?;
+        let Ok(TraversalOutcome::Completed(completion)) = outcome else {
+            panic!("{outcome:?}")
+        };
+        let totals = completion.totals;
+        assert!(totals.is_balanced(), "{totals:?}");
+        // d, o0, o1; d/a, d/big, d/z; 60 keys.
+        assert_eq!((totals.listed, totals.emitted), (66, 66), "{order:?}");
+        assert_eq!((totals.files, totals.directories), (63, 3));
+        assert_eq!((totals.versions, totals.delete_markers), (62 + 7, 0));
+        assert_eq!(totals.bytes, 62 + 2);
+        assert_eq!(totals.all_versions_bytes, 62 + 7 * 2);
+        if order == TraversalOrder::Blocks {
+            for item in &items {
+                if let TraversalItem::DirectoryListed(listed) = item {
+                    blocks_sum.absorb(&listed.counts);
+                }
+            }
+            assert_eq!(
+                (
+                    blocks_sum.listed,
+                    blocks_sum.versions,
+                    blocks_sum.all_versions_bytes
+                ),
+                (totals.listed, totals.versions, totals.all_versions_bytes)
+            );
+        }
+    }
+    let hidden = request().filter(Arc::new(HideBig));
+    let (items, outcome) = run(&source(&protocol, 3)?, hidden, None).await?;
+    assert!(
+        !entries(&items)
+            .iter()
+            .any(|entry| entry.path().as_str() == "d/big")
+    );
+    let Ok(TraversalOutcome::Completed(completion)) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(
+        (completion.totals.filtered, completion.totals.versions),
+        (1, 62)
+    );
+    // Without histories: no records, and both byte totals the same.
+    protocol.answer_at_connect(S3VersioningAtConnect::Never);
+    let (_, outcome) = run(&source(&protocol, 3)?, request(), None).await?;
+    let Ok(TraversalOutcome::Completed(completion)) = outcome else {
+        panic!("{outcome:?}")
+    };
+    let totals = completion.totals;
+    assert_eq!((totals.versions, totals.delete_markers), (0, 0));
+    assert_eq!(totals.bytes, totals.all_versions_bytes);
+    Ok(())
+}
+
+/// A key deleted now whose history is segmented: every segment says it has no current object, the
+/// key counts no bytes of its own, and its markers are counted once.
+#[tokio::test]
+async fn a_deleted_key_with_a_long_history_has_no_current_object_in_any_segment() -> TestResult {
+    let protocol = bucket(0).await?;
+    for _ in 0..3 {
+        protocol
+            .delete_object("d/big")
+            .await
+            .map_err(|failure| format!("{failure:?}"))?;
+        put(&protocol, "d/big", b"333").await?;
+    }
+    protocol
+        .delete_object("d/big")
+        .await
+        .map_err(|failure| format!("{failure:?}"))?;
+    let (items, outcome) = run(&source(&protocol, 3)?, request(), None).await?;
+    let big: Vec<&ObservedEntry> = entries(&items)
+        .into_iter()
+        .filter(|entry| entry.path().as_str() == "d/big")
+        .collect();
+    // 7 + 3 versions, 4 markers: 14 records, five segments.
+    assert_eq!(big.len(), 5);
+    assert!(big.iter().all(|entry| entry.source_version().is_none()));
+    assert!(big.iter().all(|entry| entry.size().is_none()));
+    let Ok(TraversalOutcome::Completed(completion)) = outcome else {
+        panic!("{outcome:?}")
+    };
+    let totals = completion.totals;
+    assert_eq!((totals.versions, totals.delete_markers), (2 + 10, 4));
+    assert_eq!(totals.bytes, 2, "d/a and d/z; d/big is deleted now");
+    assert_eq!(totals.all_versions_bytes, 2 + 7 * 2 + 3 * 3);
     Ok(())
 }

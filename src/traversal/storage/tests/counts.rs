@@ -177,6 +177,8 @@ async fn every_listed_child_is_counted_once() {
         pruned_dirs: 1,
         truncated_dirs: 1,
         bytes: 6,
+        // No histories: every file's bytes are its only version's.
+        all_versions_bytes: 6,
         files: 2,
         directories: 4,
         symlinks: 1,

@@ -11,8 +11,17 @@
 //! not children and are not in `listed`. Pruned and truncated subdirectories are orthogonal: a
 //! subdirectory can be emitted and not descended into. A listing that failed is not a child
 //! either; `listed` counts only what it returned before it failed.
+//!
+//! **A key with its history** (a versioned bucket, P7 §10.4) is one child: every count above is
+//! per key, however many segments its history is delivered in (a filtered key is one `filtered`,
+//! an emitted one one `emitted` and one `files`). Its records are counted apart, once, before the
+//! history is segmented: `versions` (stored versions), `delete_markers`, and `all_versions_bytes`
+//! (every stored version's bytes). `bytes` is the current version's bytes — nothing for a key
+//! deleted now. A file without a history counts its size in both `bytes` and
+//! `all_versions_bytes`, so on a storage without histories the two are equal and `versions` and
+//! `delete_markers` are 0.
 
-use crate::model::{EntryKind, ObservedEntry};
+use crate::model::{EntryKind, ObjectHistory, ObservedEntry};
 
 /// What one listed directory's block held. Carried by [`super::DirectoryListed`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -40,13 +49,21 @@ pub struct BlockCounts {
     pub pruned_dirs: u64,
     /// Subdirectories `max_depth` stopped at, whatever the filter said about descending.
     pub truncated_dirs: u64,
-    /// Sum of the sizes of the emitted files. Other kinds' sizes are not content.
+    /// Sum of the sizes of the emitted files — of a key with its history, its current version's.
+    /// Other kinds' sizes are not content.
     pub bytes: u64,
     /// Emitted entries by kind; together they are `emitted`.
     pub files: u64,
     pub directories: u64,
     pub symlinks: u64,
     pub other: u64,
+    /// Stored versions in the histories of the emitted keys (P7 §10.4); 0 without histories.
+    pub versions: u64,
+    /// Delete markers in the histories of the emitted keys; 0 without histories.
+    pub delete_markers: u64,
+    /// Bytes of every stored version of the emitted keys, and of every emitted file without a
+    /// history (so `bytes` where nothing has one).
+    pub all_versions_bytes: u64,
 }
 
 impl BlockCounts {
@@ -66,6 +83,9 @@ impl BlockCounts {
             directories: 0,
             symlinks: 0,
             other: 0,
+            versions: 0,
+            delete_markers: 0,
+            all_versions_bytes: 0,
         }
     }
 
@@ -87,12 +107,17 @@ impl BlockCounts {
         )
     }
 
-    /// Counts one emitted entry.
+    /// Counts one emitted entry — a key with its whole history, before it is segmented.
     pub(crate) fn count_emitted(&mut self, entry: &ObservedEntry) {
         self.emitted = self.emitted.saturating_add(1);
         let tally = match entry.kind() {
             EntryKind::File => {
-                self.bytes = self.bytes.saturating_add(entry.size().unwrap_or(0));
+                let size = entry.size().unwrap_or(0);
+                self.bytes = self.bytes.saturating_add(size);
+                match entry.history() {
+                    Some(history) => self.count_history(history),
+                    None => self.all_versions_bytes = self.all_versions_bytes.saturating_add(size),
+                }
                 &mut self.files
             }
             EntryKind::Directory => &mut self.directories,
@@ -100,6 +125,19 @@ impl BlockCounts {
             EntryKind::Special(_) => &mut self.other,
         };
         *tally = tally.saturating_add(1);
+    }
+
+    /// Counts the records of one key's history: its versions and their bytes, its delete markers.
+    fn count_history(&mut self, history: &ObjectHistory) {
+        for record in history.records() {
+            if record.is_delete_marker() {
+                self.delete_markers = self.delete_markers.saturating_add(1);
+            } else {
+                self.versions = self.versions.saturating_add(1);
+                let size = record.size().unwrap_or(0);
+                self.all_versions_bytes = self.all_versions_bytes.saturating_add(size);
+            }
+        }
     }
 }
 
@@ -146,6 +184,12 @@ pub struct ScanTotals {
     pub directories: u64,
     pub symlinks: u64,
     pub other: u64,
+    /// See [`BlockCounts::versions`].
+    pub versions: u64,
+    /// See [`BlockCounts::delete_markers`].
+    pub delete_markers: u64,
+    /// See [`BlockCounts::all_versions_bytes`].
+    pub all_versions_bytes: u64,
 }
 
 impl ScanTotals {
@@ -168,6 +212,9 @@ impl ScanTotals {
             directories: 0,
             symlinks: 0,
             other: 0,
+            versions: 0,
+            delete_markers: 0,
+            all_versions_bytes: 0,
         }
     }
 
@@ -208,6 +255,9 @@ impl ScanTotals {
             directories,
             symlinks,
             other: others,
+            versions,
+            delete_markers,
+            all_versions_bytes,
         } = *other;
         self.listed = self.listed.saturating_add(listed);
         self.emitted = self.emitted.saturating_add(emitted);
@@ -227,23 +277,48 @@ impl ScanTotals {
         self.directories = self.directories.saturating_add(directories);
         self.symlinks = self.symlinks.saturating_add(symlinks);
         self.other = self.other.saturating_add(others);
+        self.versions = self.versions.saturating_add(versions);
+        self.delete_markers = self.delete_markers.saturating_add(delete_markers);
+        self.all_versions_bytes = self.all_versions_bytes.saturating_add(all_versions_bytes);
     }
 
-    /// Adds one directory's block.
+    /// Adds one directory's block. Destructured, so a field added later cannot be left out of the
+    /// sum without a compile error.
     pub(crate) const fn absorb(&mut self, block: &BlockCounts) {
-        self.listed = self.listed.saturating_add(block.listed);
-        self.emitted = self.emitted.saturating_add(block.emitted);
-        self.filtered = self.filtered.saturating_add(block.filtered);
-        self.failed_children = self.failed_children.saturating_add(block.failed_children);
-        self.vanished = self.vanished.saturating_add(block.vanished);
-        self.internal_hidden = self.internal_hidden.saturating_add(block.internal_hidden);
-        self.pruned_dirs = self.pruned_dirs.saturating_add(block.pruned_dirs);
-        self.truncated_dirs = self.truncated_dirs.saturating_add(block.truncated_dirs);
-        self.bytes = self.bytes.saturating_add(block.bytes);
-        self.files = self.files.saturating_add(block.files);
-        self.directories = self.directories.saturating_add(block.directories);
-        self.symlinks = self.symlinks.saturating_add(block.symlinks);
-        self.other = self.other.saturating_add(block.other);
+        let BlockCounts {
+            listed,
+            emitted,
+            filtered,
+            failed_children,
+            vanished,
+            internal_hidden,
+            pruned_dirs,
+            truncated_dirs,
+            bytes,
+            files,
+            directories,
+            symlinks,
+            other,
+            versions,
+            delete_markers,
+            all_versions_bytes,
+        } = *block;
+        self.listed = self.listed.saturating_add(listed);
+        self.emitted = self.emitted.saturating_add(emitted);
+        self.filtered = self.filtered.saturating_add(filtered);
+        self.failed_children = self.failed_children.saturating_add(failed_children);
+        self.vanished = self.vanished.saturating_add(vanished);
+        self.internal_hidden = self.internal_hidden.saturating_add(internal_hidden);
+        self.pruned_dirs = self.pruned_dirs.saturating_add(pruned_dirs);
+        self.truncated_dirs = self.truncated_dirs.saturating_add(truncated_dirs);
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.files = self.files.saturating_add(files);
+        self.directories = self.directories.saturating_add(directories);
+        self.symlinks = self.symlinks.saturating_add(symlinks);
+        self.other = self.other.saturating_add(other);
+        self.versions = self.versions.saturating_add(versions);
+        self.delete_markers = self.delete_markers.saturating_add(delete_markers);
+        self.all_versions_bytes = self.all_versions_bytes.saturating_add(all_versions_bytes);
     }
 }
 

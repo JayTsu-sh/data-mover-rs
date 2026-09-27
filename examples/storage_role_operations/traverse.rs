@@ -274,7 +274,8 @@ fn traversal_request(args: &Args, command: &Command) -> Result<TraversalRequest,
 fn block_counts(counts: &BlockCounts) -> String {
     format!(
         "balanced={} listed={} emitted={} filtered={} failed={} vanished={} hidden={} pruned={} \
-         truncated={} bytes={} files={} dirs={} symlinks={} other={}",
+         truncated={} bytes={} files={} dirs={} symlinks={} other={} versions={} delete_markers={} \
+         all_versions_bytes={}",
         counts.is_balanced(),
         counts.listed,
         counts.emitted,
@@ -288,7 +289,10 @@ fn block_counts(counts: &BlockCounts) -> String {
         counts.files,
         counts.directories,
         counts.symlinks,
-        counts.other
+        counts.other,
+        counts.versions,
+        counts.delete_markers,
+        counts.all_versions_bytes
     )
 }
 
@@ -297,7 +301,7 @@ fn totals(totals: &ScanTotals) -> String {
     format!(
         "totals balanced={} listed={} emitted={} filtered={} failed={} vanished={} hidden={} \
          listing_failures={} interrupted={} vanished_listings={} pruned={} truncated={} bytes={} \
-         files={} dirs={} symlinks={} other={}",
+         files={} dirs={} symlinks={} other={} versions={} delete_markers={} all_versions_bytes={}",
         totals.is_balanced(),
         totals.listed,
         totals.emitted,
@@ -314,7 +318,10 @@ fn totals(totals: &ScanTotals) -> String {
         totals.files,
         totals.directories,
         totals.symlinks,
-        totals.other
+        totals.other,
+        totals.versions,
+        totals.delete_markers,
+        totals.all_versions_bytes
     )
 }
 

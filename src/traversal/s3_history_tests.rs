@@ -61,6 +61,12 @@ async fn each_key_is_one_entry_with_its_history() -> TestResult {
     );
     let totals = totals(&outcome);
     assert_eq!((totals.listed, totals.emitted, totals.files), (2, 2, 2));
+    // Per key; the records apart: `k` v1, v2, v3 and a marker, `gone` a version and a marker.
+    assert_eq!((totals.versions, totals.delete_markers), (4, 2));
+    assert_eq!(
+        (totals.bytes, totals.all_versions_bytes),
+        (3, 2 + 2 + 3 + 1)
+    );
     let blocks = by_path(&entries(&items));
     let (gone, k) = (blocks["gone"], blocks["k"]);
     assert_eq!((gone.size(), gone.source_version()), (None, None));

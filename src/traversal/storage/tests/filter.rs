@@ -198,6 +198,7 @@ async fn immediate_filter_prunes_without_observing_and_hides_directories() {
         files: 3,
         directories: 1,
         bytes: 9,
+        all_versions_bytes: 9,
         ..crate::traversal::ScanTotals::default()
     };
     assert_eq!(

@@ -116,6 +116,7 @@ async fn directory_objects_are_entries_counted_as_files() {
             files: 5,
             directories: 2,
             bytes: 14,
+            all_versions_bytes: 14,
             ..ScanTotals::default()
         }
     );
