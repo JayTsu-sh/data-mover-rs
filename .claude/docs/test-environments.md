@@ -12,7 +12,7 @@
 
 | 类型 | 环境 | 协议 / 版本 | 从哪跑 | 我们的写入范围 | 选择方式 |
 |---|---|---|---|---|---|
-| CIFS | ONTAP FAS2750 SVM `lizy` | SMB 3.x（签名） | WSL | share `ontap_lisaauto_cifs` 下的测试目录；匿名测试 share `dm_anon_share` | `.claude/skills/e2e-cifs/.env` |
+| CIFS | ONTAP FAS2750 SVM `lizy` | SMB 3.x（签名） | WSL | share `ontap_lisaauto_cifs` 下的测试目录；匿名测试 share `dm_anon_share`；只读 share `dm_ro_share`（只读，不写） | `.claude/skills/e2e-cifs/.env` |
 | NFS | ONTAP FAS2750 SVM `lizy` `/ontap_lisaauto_nfs` | **v3** | **10.131.9.10（root）** | 导出下的测试子目录 | `e2e-nfs/.env` 的主机 / 导出，URL 不带 `noresvport` |
 | NFS | 同上 | **v4.0、v4.1** | WSL | 同上 | `e2e-nfs/.env`（`NFS_OPTIONS` 里 `version=4.0` / `4.1`） |
 | NFS | DXN-2 `10.128.136.211:/nfv3_v4` | **v3、v4.0** | WSL | 只 `data-mover-test/` 子目录 | `e2e-nfs/dxn-v3/.env`、`e2e-nfs/dxn-v40/.env` |
@@ -37,6 +37,10 @@
 
 - LIF：`10.128.61.200`（node 01）、`10.128.61.201`（node 02）；管理 REST `https://10.128.61.20`（admin）。SVM `lizy`。
 - **CIFS**：share `ontap_lisaauto_cifs`，本地用户 `lisauser`；匿名测试 share `dm_anon_share`（SVM 的 `guest-unix-user=pcuser` 自 2026-09-16 起保留）。
+  **只读测试 share `dm_ro_share`**（2026-09-27 用户批准建）：路径 `/ontap_lisaauto_cifs/dm-ro-share`（目录 777、属主 root —— 只读完全由
+  share ACL 决定），share ACL 只有 `lisauser` = `read`。里面的只读夹具经可写 share 写入 `ontap_lisaauto_cifs/dm-ro-share/`。用于证明
+  只读账号能列举根以下、能读源文件（smb-rs #85 / #88），并确认写被拒。撤销：删除 share `dm_ro_share`（REST
+  `DELETE /api/protocols/cifs/shares/{svm uuid}/dm_ro_share`），再经可写 share 删掉目录 `dm-ro-share`。
   QUERY_DIRECTORY 支持 `FileIdFullDirectoryInformation`，CREATE 回 `QFid` → 身份 `StableWithinBackend`。任何 CIFS 改动必须在这里过 e2e-cifs。
   符号链接夹具只能经 NFS 建（REST files API 不收 symlink）。
 - **NFS**：卷 `ontap_lisaauto_nfs`（junction `/ontap_lisaauto_nfs`，unix，export policy default）。v3 / v4.0 / v4.1 都开着。
