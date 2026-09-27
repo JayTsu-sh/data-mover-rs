@@ -1076,6 +1076,12 @@ C7d perf(nfs): READDIR / READDIRPLUS 的回复大小按服务器公布的上限�
     - 附带（nfs-rs）：v3 READDIR / READDIRPLUS 原来沿 XDR 链表递归解码，1 MiB（约 6,000 项）的回复在 debug 构建里栈溢出（nfs-rs 的
       真机测试撞到），0.8.6 改为逐项解码；8 KiB 时不会发生
     - **首项延迟（用户 2026-09-27 定：维持现状）**：DXN-2 上 1 MiB 回复让大目录首个子项约 0.12 → 0.35 s；不做“首次请求用小尺寸”的变通（需再发 nfs-rs 版本）
+    - NFS 收尾（2026-09-27）：`619dd63` role 分类补上 NOTEMPTY / EXIST / ISDIR / NOTDIR（→ Conflict）、FILE_OPEN（→ Conflict / Transient）、
+      XDEV（→ Unsupported）、INVAL / NAMETOOLONG / BADNAME（→ InvalidInput）、DQUOT（→ Capacity）（此前 Protocol / Unknown）；`2025194` role rename 自己解析父目录、自己分类 RENAME（被拒 →
+      PermissionDenied / Permanent）；`a953ce8` 建缺失父目录失败报在被拒的那一层；`66a9dbe` `Namespace::create_directory` trait 文档写明
+      NFS 重建消失的已缓存父目录。真机 nfs_mkdir_contract（含 rename 被拒、rename 进被拒的缺失父目录）ONTAP v3 / v4.0 / v4.1、DXN-2 v3 /
+      v4.0 全过，e2e-nfs 一次全过。nfs-rs（未发布）：JayTsu-sh/nfs-rs #127（合并 `84b0828`）—— 回复截断在 XDR 填充里是解码错误不再 panic
+      （fastxdr 1.0.2 生成的头，issue #126），v3 / v4.0 无 maxread 的挂载级目录回复大小测试
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
 C9  feat(storage): CIFS 流式（生产者持有句柄；停车句柄上限） - src/storage/backends/cifs/{protocol.rs:230-280, namespace.rs:59-94}
     —— 已完成：70f85d1（接缝 open_directory + CifsDirectory，不改行为）、936e20b

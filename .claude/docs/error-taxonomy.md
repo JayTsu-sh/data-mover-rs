@@ -177,7 +177,7 @@ legacy 递归 `create_dir_all`，而是 `role_create_all`：从句柄缓存里�
 `Throttled` → 报探测的失败；否则报原来的拒绝）。于是写一个文件、其缺失的父目录在不可写的目录下 → Prepare 的条目
 `PermissionDenied` / Permanent（此前 `Protocol` / Unknown，上游会重试），**报在被拒的那一层**（NFS 收尾起；此前报在
 要写的文件上）：失败的路径是那一层，操作仍是原操作（Prepare / Publish / Namespace…），诊断写明为哪个条目建，如
-``NFS role failed creating a missing parent directory of `a/ro/missing/sub/f` (Prepare): "NFS3ERR_ACCES" (NFS3ERR_ACCES)``
+``NFS role failed creating a missing parent directory of `a/ro/missing/sub/f` (Prepare): NFS3ERR_ACCES (access denied)``
 （`NfsProtocolFailure::at_level`，`create_levels` 打上失败层，嵌套重建时保留嵌套调用报出的那层（更靠上的祖先）；
 `Namespace::rename` 的诊断写目的路径）。与该层无关的失败（`Cancelled` / `Connectivity` / `Authentication` / `Throttled`）
 不打层，报在原条目上；会话级失败不受影响。目的端 prepare 的 `transient_collision` 不再把它当撞名：打了层的 `NotFound` /
