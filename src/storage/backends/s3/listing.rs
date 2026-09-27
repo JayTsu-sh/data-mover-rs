@@ -1,6 +1,6 @@
 //! One S3 "directory" — the objects and common prefixes under `<path>/` — as the namespace role
-//! lists it (ADR-0006 C22), delimiter `/`: how a page of the listing becomes children, and the
-//! listing of every version, which is still read whole.
+//! lists it (ADR-0006 C22), delimiter `/`: how a page of the listing becomes children. The listing
+//! of every version, which is still read whole, is [`super::histories`].
 //!
 //! - Current objects stream (P7 C6, [`super::current`]): each server page is described as it
 //!   arrives, by the same [`Block`] as here.
@@ -31,25 +31,15 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 
-use super::history::{KeyHistory, oldest_first, warn_inferred};
-use super::paging::{ListingLimits, PageRetry, Paging};
-use super::source::{object_identity, path_scoped_bytes, role_failure};
-use super::{
-    S3ListedObject, S3ListedVersion, S3ObjectFacts, S3Protocol, S3RejectedEntry, S3VersionMarker,
-    is_real_version_id,
-};
+use super::history::KeyHistory;
+use super::source::object_identity;
+use super::{S3ListedObject, S3ListedVersion, S3ObjectFacts, S3RejectedEntry};
 use crate::model::{
-    BackendIdentity, EntryKind, EntryOperationFailure, EntryVersion, FailureClass, HistoryOrder,
-    IdentityStrength, Operation, SourceIdentity, SourceVersion, StoragePath, StorageTimestamp,
-    TimestampMetadata, Transience,
+    BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, IdentityStrength, Operation,
+    SourceIdentity, StoragePath, StorageTimestamp, TimestampMetadata, Transience,
 };
 use crate::storage::artifacts::is_artifact_path;
-use crate::storage::{
-    ChildFailure, ListingFacts, ListingPage, SourceDescriptor, StorageRoleFailure,
-};
-
-/// Identity bytes of a delete marker that names no real version (a suspended bucket's `"null"`).
-const NULL_MARKER_IDENTITY: &[u8] = b"\0s3-null-delete-marker";
+use crate::storage::{ChildFailure, ListingPage, SourceDescriptor, StorageRoleFailure};
 
 /// One child of the directory before it becomes descriptors, keyed by its S3 key.
 pub(super) enum Child {
@@ -66,106 +56,6 @@ impl Child {
             Self::Object(object) => &object.key,
         }
     }
-}
-
-/// Every page of a versions listing, gathered.
-#[derive(Default)]
-struct VersionPages {
-    versions: Vec<S3ListedVersion>,
-    markers: Vec<S3ListedVersion>,
-    prefixes: Vec<String>,
-    rejected: Vec<S3RejectedEntry>,
-}
-
-/// Pages through every version of `prefix`, backing off while throttled and sending a page that
-/// failed transiently again with the same marker.
-async fn page_versions<P: S3Protocol + ?Sized>(
-    protocol: &P,
-    directory: &StoragePath,
-    prefix: &str,
-    limits: ListingLimits,
-) -> Result<VersionPages, StorageRoleFailure> {
-    let mut paging = Paging::new(limits);
-    let mut retry = PageRetry::new(limits);
-    let mut marker: Option<S3VersionMarker> = None;
-    let mut all = VersionPages::default();
-    // Positions are per page; a later page's follow the earlier pages' (document order of the
-    // whole listing).
-    let mut listed_before = 0_u64;
-    loop {
-        let page = retry
-            .fetch(|| protocol.list_versions_page(prefix, marker.as_ref()))
-            .await
-            .map_err(|e| role_failure(directory, Operation::Traverse, e))?;
-        let entries = page.versions.len() + page.markers.len();
-        let listed = entries + page.prefixes.len() + page.rejected.len();
-        all.versions
-            .extend(listing_wide(page.versions, listed_before));
-        all.markers
-            .extend(listing_wide(page.markers, listed_before));
-        listed_before += entries as u64;
-        all.prefixes.extend(page.prefixes);
-        all.rejected.extend(page.rejected);
-        marker = paging.advance(directory, listed, page.next)?;
-        if marker.is_none() {
-            return Ok(all);
-        }
-    }
-}
-
-/// Lists every stored version and delete marker of the objects of `directory`, and its
-/// subdirectories.
-pub(super) async fn list_all<P: S3Protocol + ?Sized>(
-    protocol: &P,
-    identity: &BackendIdentity,
-    directory: &StoragePath,
-    limits: ListingLimits,
-) -> Result<ListingPage, StorageRoleFailure> {
-    let prefix = directory_prefix(directory)?;
-    let VersionPages {
-        mut versions,
-        mut markers,
-        prefixes,
-        rejected,
-    } = page_versions(protocol, directory, &prefix, limits).await?;
-    let absent =
-        versions.is_empty() && markers.is_empty() && prefixes.is_empty() && rejected.is_empty();
-    refuse_absent(directory, absent)?;
-    // A key with an entry that could not be decoded has no whole history: it is that key's
-    // failure, and none of its entries is listed.
-    let broken: HashSet<String> = rejected.iter().filter_map(|r| r.key.clone()).collect();
-    versions.retain(|entry: &S3ListedVersion| !broken.contains(&entry.key));
-    markers.retain(|entry: &S3ListedVersion| !broken.contains(&entry.key));
-    let placed_versions = place(&prefix, versions, |entry| &entry.key);
-    let placed_markers = place(&prefix, markers, |entry| &entry.key);
-    let mut block = Block::new(identity, directory, &prefix);
-    block.outside(&placed_versions.outside);
-    block.outside(&placed_markers.outside);
-    // The directory's own key has one history, whatever it holds (P7 F5, D5).
-    let own = oldest_first(placed_versions.own, placed_markers.own);
-    warn_inferred(directory.as_str(), &own);
-    for history in &own {
-        block.own_history(history);
-    }
-    let histories = oldest_first(placed_versions.children, placed_markers.children);
-    warn_inferred(directory.as_str(), &histories);
-    let children = histories.into_iter().map(Child::History);
-    let mut rolled = placed_versions.rolled;
-    rolled.extend(placed_markers.rolled);
-    block.rejected(rejected, &mut rolled, &mut HashSet::new());
-    block.build(merge(children, prefixes, rolled));
-    Ok(block.finish())
-}
-
-/// `entries` of one page with their positions moved after the `before` entries of earlier pages.
-fn listing_wide(
-    entries: Vec<S3ListedVersion>,
-    before: u64,
-) -> impl Iterator<Item = S3ListedVersion> {
-    entries.into_iter().map(move |mut entry| {
-        entry.position = entry.position.map(|position| before + position);
-        entry
-    })
 }
 
 /// S3 has no directories: a prefix under which nothing at all is stored does not exist. The
@@ -266,14 +156,14 @@ pub(super) fn merge(
 /// Described children of one directory — the whole directory, or one page of it — and the
 /// children that could not be described.
 pub(super) struct Block<'a> {
-    identity: &'a BackendIdentity,
+    pub(super) identity: &'a BackendIdentity,
     /// The directory listed, which a failure without a path of its own is reported against.
-    directory: &'a StoragePath,
-    prefix: &'a str,
-    entries: Vec<SourceDescriptor>,
+    pub(super) directory: &'a StoragePath,
+    pub(super) prefix: &'a str,
+    pub(super) entries: Vec<SourceDescriptor>,
     /// The directory's own object `<path>/`: its current object, or every record of its history.
-    own: Vec<SourceDescriptor>,
-    failures: Vec<EntryOperationFailure>,
+    pub(super) own: Vec<SourceDescriptor>,
+    pub(super) failures: Vec<EntryOperationFailure>,
     /// Children no path of this tree can name, with their raw keys.
     unnamed: Vec<ChildFailure>,
     /// Transfer artifacts hidden: one per key or prefix, whatever its versions.
@@ -383,39 +273,10 @@ impl<'a> Block<'a> {
         }
     }
 
-    /// The whole history of the directory's own key `<path>/` (P7 F5, D5): every version, zero-byte
-    /// ones included, and every delete marker, oldest first. At the storage root it has no path:
-    /// ignored when no version holds content, a failure when one does.
-    pub(super) fn own_history(&mut self, history: &KeyHistory<S3ListedVersion>) {
-        if self.directory.as_str().is_empty() {
-            let content = history.entries.iter().any(|entry| entry.facts.size > 0);
-            self.root_object(content);
-            return;
-        }
-        let described = self.path_of(self.prefix).and_then(|path| {
-            history
-                .entries
-                .iter()
-                .map(|entry| {
-                    let listed = Listed {
-                        entry,
-                        order: history.order,
-                    };
-                    version_descriptor(self.identity, path.clone(), &listed)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        });
-        // Whole or not at all, as any other key's history (`history_child`).
-        match described {
-            Ok(records) => self.own.extend(records),
-            Err(failure) => self.failures.push(failure),
-        }
-    }
-
     /// The storage root's own object (the URL prefix's key itself): no path of this tree spells
     /// it, so one holding content is reported at the root rather than dropped; a zero-byte folder
     /// marker stands for nothing the root does not already.
-    fn root_object(&mut self, content: bool) {
+    pub(super) fn root_object(&mut self, content: bool) {
         if content {
             self.failures.push(child_failure(
                 self.directory,
@@ -460,7 +321,7 @@ impl<'a> Block<'a> {
 
     /// Whether the child `key` named `name` is listed: `Ok(None)` for a transfer artifact, a
     /// failure (reported at `key`) for a name no path of this tree can spell.
-    fn child_path(
+    pub(super) fn child_path(
         &mut self,
         key: &str,
         name: &str,
@@ -528,27 +389,7 @@ impl<'a> Block<'a> {
         Ok(())
     }
 
-    fn history_child(
-        &mut self,
-        history: &KeyHistory<S3ListedVersion>,
-    ) -> Result<(), EntryOperationFailure> {
-        let key = history.key.as_str();
-        let name = key.get(self.prefix.len()..).unwrap_or_default();
-        let Some(path) = self.child_path(key, name)? else {
-            return Ok(());
-        };
-        for entry in &history.entries {
-            let listed = Listed {
-                entry,
-                order: history.order,
-            };
-            let descriptor = version_descriptor(self.identity, path.clone(), &listed)?;
-            self.entries.push(descriptor);
-        }
-        Ok(())
-    }
-
-    fn path_of(&self, key: &str) -> Result<StoragePath, EntryOperationFailure> {
+    pub(super) fn path_of(&self, key: &str) -> Result<StoragePath, EntryOperationFailure> {
         StoragePath::new(key).map_err(|_| {
             child_failure(
                 self.directory,
@@ -559,7 +400,7 @@ impl<'a> Block<'a> {
     }
 }
 
-fn child_failure(
+pub(super) fn child_failure(
     path: &StoragePath,
     class: FailureClass,
     diagnostic: &str,
@@ -624,82 +465,6 @@ pub(super) fn file_descriptor(
     descriptor.content_version =
         (!facts.etag.is_empty()).then(|| Bytes::copy_from_slice(facts.etag.as_bytes()));
     if let Some(modified) = facts.last_modified {
-        descriptor = descriptor.with_inline_timestamps(TimestampMetadata {
-            accessed: None,
-            modified: Some(modified),
-            created: None,
-        });
-    }
-    Ok(descriptor)
-}
-
-/// One entry of a key's history, and where the history's order came from.
-#[derive(Clone, Copy)]
-struct Listed<'a> {
-    entry: &'a S3ListedVersion,
-    order: HistoryOrder,
-}
-
-fn version_descriptor(
-    identity: &BackendIdentity,
-    path: StoragePath,
-    listed: &Listed<'_>,
-) -> Result<SourceDescriptor, EntryOperationFailure> {
-    let Listed { entry, order } = *listed;
-    let facts = &entry.facts;
-    let version = EntryVersion::from_listing(
-        &facts.version_id,
-        facts.is_latest,
-        facts.delete_marker,
-        order,
-    )
-    .map_err(|_| child_failure(&path, FailureClass::Protocol, "invalid S3 version id"))?;
-    let mut descriptor = if facts.delete_marker {
-        marker_descriptor(identity, path, &facts.version_id, entry.last_modified)?
-    } else {
-        let object = object_facts(
-            facts.size,
-            &facts.etag,
-            Some(&facts.version_id),
-            entry.last_modified,
-        );
-        file_descriptor(identity, path, &object)?
-    };
-    // A delete marker selects its own id, so a read that ever reached it would fail (405) rather
-    // than read the current object; it is listing-only and never read.
-    descriptor.version = version
-        .source_version()
-        .unwrap_or_else(|| SourceVersion::Id(facts.version_id.clone()));
-    descriptor.listing = ListingFacts {
-        listing_only: facts.delete_marker,
-        version: Some(Box::new(version)),
-    };
-    Ok(descriptor)
-}
-
-/// A delete marker: a file-kind entry without size or content, identified by its version.
-fn marker_descriptor(
-    identity: &BackendIdentity,
-    path: StoragePath,
-    version_id: &str,
-    last_modified: Option<StorageTimestamp>,
-) -> Result<SourceDescriptor, EntryOperationFailure> {
-    let (strength, bytes) = if is_real_version_id(version_id) {
-        (
-            IdentityStrength::VersionScoped,
-            version_id.as_bytes().to_vec(),
-        )
-    } else {
-        // Path-scoped identities include the path: every key's `"null"` marker is its own.
-        (
-            IdentityStrength::PathScoped,
-            path_scoped_bytes(&path, NULL_MARKER_IDENTITY),
-        )
-    };
-    let source_identity = SourceIdentity::new(identity.clone(), strength, bytes)
-        .map_err(|_| child_failure(&path, FailureClass::Protocol, "invalid S3 marker identity"))?;
-    let mut descriptor = SourceDescriptor::new(path, EntryKind::File, None, source_identity);
-    if let Some(modified) = last_modified {
         descriptor = descriptor.with_inline_timestamps(TimestampMetadata {
             accessed: None,
             modified: Some(modified),

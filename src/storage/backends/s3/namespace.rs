@@ -8,7 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::current::produce_current;
-use super::listing::{directory_descriptor, directory_prefix, file_descriptor, list_all};
+use super::histories::list_all;
+use super::listing::{directory_descriptor, directory_prefix, file_descriptor};
 use super::paging::{ListingLimits, Paging};
 use super::source::role_failure;
 use super::{S3Protocol, S3ProtocolFailure};

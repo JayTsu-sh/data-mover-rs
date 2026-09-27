@@ -3,6 +3,7 @@
 mod broken_body;
 mod capabilities;
 mod current;
+mod histories;
 mod history;
 mod listing;
 mod metadata;
