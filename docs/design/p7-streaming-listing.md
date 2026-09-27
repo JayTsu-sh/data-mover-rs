@@ -934,6 +934,13 @@ F5h fix(s3): 目录对象的单 PUT 改为流式（Content-Length = 源大小、
     —— 已完成 `7260974`（五套 S3 版本 / 非版本桶 `directory_objects.sh` 全过，见 §14.2 实施记录）
 C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:4610-4691   —— 已完成：cdcc66d（搬移）、7da78ce
     + 子目录句柄作为下钻提示随工作项下传，列举不再写 GLOBAL_CACHE，无提示 / 失效回退 lookup_fh（§12.7 修法 A）
+C7d perf(nfs): READDIR / READDIRPLUS 的回复大小按服务器公布的上限定（用户 2026-09-27 同意）—— C10 合入之后
+    - 现状：nfs-rs 默认 `readdir-buffer=8192,8192`（dircount / maxcount 各 8 KB），data-mover 从未设置；每个回复只装 40–60 条（C7c
+      在 ONTAP、DXN-2 实测），1 万项的目录要 170–250 次往返；legacy 同样受限
+    - 做法：连接时取服务器上限 —— v3 `Mount::fsinfo()` 的 `dtpref`（没有则 `rtmax`）；v4.1 会话 `max_response_size`（nfs-rs 已与
+      `maxread` 取小）；v4.0 `maxread` —— 再夹一个自己的上限（如 1 MiB，防离谱值撑大单页内存）；URL 显式 `readdir-buffer` 优先
+    - 实测：ONTAP（`tcp-max-xfer-size` 默认下的 dtpref / rtmax）、DXN-2 v3 / v4.0；8K / 32K / 64K / 256K / 1M 几档与自动协商对比每回复
+      条数、5 万项宽目录的 wall、首项延迟、RSS；node1 m1-source 全树复测（每目录约 35 项，预计收益小）；不改 ONTAP 设置
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
 C9  feat(storage): CIFS 流式（生产者持有句柄；停车句柄上限） - src/storage/backends/cifs/{protocol.rs:230-280, namespace.rs:59-94}
     —— 已完成：70f85d1（接缝 open_directory + CifsDirectory，不改行为）、936e20b
