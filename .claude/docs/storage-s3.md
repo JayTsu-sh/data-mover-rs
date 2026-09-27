@@ -791,7 +791,7 @@ ONTAP 9.19.1 的 `ListObjectVersions`（`delimiter=/`）在截断页里有 Commo
   空 `NextVersionIdMarker`）上查三处列举；变异：role 发 `Some("")`、legacy `walkdir_2` 总带 version marker、不滤空的
   `NextVersionIdMarker` → 各自变红。e2e-s3 脚本自己的 ListObjectVersions（`traversal_versions.sh` / `versioning_matrix.sh` /
   `directory_objects.sh`）同样只在有 key-marker 时带、且只带非空的 version-id-marker；截断页没有 `NextKeyMarker` 时列举按失败结束
-  （不再从首页无限重列）。
+  （不再从首页无限重列）（`3080f4a`）。
 - 真机（2026-09-26，ONTAP `data-mover-test-ver`，唯一前缀，跑完删光）：`mkl/z` 1000 个版本 role `traverse --versions all`、
   legacy `walkdir`、`walkdir_2` 都列出 1000 个，四组数据（mkl / mks / mkp / rnd，1187 条）与不带 delimiter 的列举逐条相等、
   无重复，每个目录一次。守卫对别的存储不改结果：`traversal_versions.sh` 在 MinIO、RustFS（`EXPECT_ORDER=inferred`，k / gone

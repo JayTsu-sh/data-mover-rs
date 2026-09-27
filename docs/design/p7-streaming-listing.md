@@ -935,6 +935,14 @@ F5h fix(s3): 目录对象的单 PUT 改为流式（Content-Length = 源大小、
     在内存里（F5g 现状：流式来源的 `d/` 整个读进内存再 PUT，最坏每个在途传输 5 GiB）。复用 N 阶段的流式单 PUT 原语：该原语先做成
     通用 S3 能力（不绑 NAS profile），F5h 与 NAS profile 共用；五套 S3 真机逐一确认接受 UNSIGNED-PAYLOAD 的流式单 PUT
     —— 已完成 `7260974`（五套 S3 版本 / 非版本桶 `directory_objects.sh` 全过，见 §14.2 实施记录）
+S3 收尾（P7 遗留三项，2026-09-27）—— 已完成：
+    - `3080f4a` fix(skills): e2e-s3 脚本（traversal_versions / versioning_matrix / directory_objects）的 ListObjectVersions
+      不再发空的 version-id-marker（StorageGRID 11.5 回 400，C10 冒烟因此跑不了 data-mover-test-ver）；crate 本身不发，
+      补线上守卫测试；StorageGRID 两只桶 + MinIO 的 traversal_versions.sh 全过
+    - `a699bd4` refactor(s3): NAS 桶“还是描述时那个对象”的三处判定（unpinned 响应头、断 body 后 HEAD、读完后 HEAD）
+      收为 `same_object::object_change`；nas_matrix.sh 全过
+    - `4dabfe0` feat(transfer): `directory_object_action` 传目的端 `Storage` 时事先答 `Skip(DIRECTORY_OBJECT_TOO_LARGE_REASON)`
+      （与 D13 的 Preflight 拒绝同一规则、同一诊断），见 §14.1“F5 收尾”
 C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:4610-4691   —— 已完成：cdcc66d（搬移）、7da78ce
     + 子目录句柄作为下钻提示随工作项下传，列举不再写 GLOBAL_CACHE，无提示 / 失效回退 lookup_fh（§12.7 修法 A）
 C7d perf(nfs): READDIR / READDIRPLUS 的回复大小按服务器公布的上限定（用户 2026-09-27 同意）—— C10 合入之后
@@ -1073,7 +1081,7 @@ expert 目的端同；线上：role 与 legacy 各入口对 `p/d/` 零请求。�
 不留对象 / 指针 / 上传、重跑 `Fresh`）与 native（StorageGRID 为流式）都是一次请求（ETag 无 `-N`）、逐字节相等，同名真实文件
 `mid` / `big` 在 **RustFS** 与其余各家都不动；MinIO 上 > 8 MiB 的 `d/` 现在写得进去。
 
-**F5 收尾：`directory_object_action` 事先回答“太大”（2026-09-27）**：F5e 的辅助只看 `NamespaceCapabilities`，对 S3
+**F5 收尾：`directory_object_action` 事先回答“太大”（2026-09-27，`4dabfe0`）**：F5e 的辅助只看 `NamespaceCapabilities`，对 S3
 目的端一律 `Copy`，消费方要等 D13 的 Preflight `Unsupported` 才知道 > 5 GiB 的目录对象写不了。现在第二个参数是
 `impl Into<DirectoryObjectDestination>`（`holds` = `NamespaceCapabilities::directory_objects`，`limit` =
 `StagedDestination::directory_object_limit()`）：传目的端 `Storage` 时两者都有（无 I/O），能存目录对象的目的端上超过上限或
