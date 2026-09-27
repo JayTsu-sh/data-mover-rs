@@ -46,7 +46,19 @@ pub trait Namespace: Send + Sync {
 
     /// Creates one directory level. An existing entry is an `Entry` failure of class `Conflict`
     /// (a backend whose protocol creates idempotently may answer success instead), which the
-    /// caller decides about.
+    /// caller decides about. The parent is expected to exist: creating missing parents is
+    /// [`crate::storage::create_directory_all`]'s job.
+    ///
+    /// **NFS exception: a vanished cached parent is recreated.** The NFS adapter answers a level
+    /// it holds in its process-wide directory-handle cache without asking the server. When
+    /// another client deleted that directory afterwards, the next level's `create_directory`
+    /// finds its parent's handle stale and the parent gone; it then recreates every missing
+    /// level of the parent within the same call and creates its own level, as the legacy
+    /// recursive helper rebuilt the path — so there one call may create more than one level.
+    /// A parent the server never had (not reached through a stale cached handle) stays
+    /// `NotFound` and is not created; a failure while recreating is reported at the level that
+    /// failed. The NFS adapter also replaces a non-directory it finds at the level itself (see
+    /// the NFS exception in [`crate::storage::create_directory_all`]'s module docs).
     async fn create_directory(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
         Err(unsupported(path, Operation::Namespace, NO_MUTATIONS))
     }

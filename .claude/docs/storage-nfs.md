@@ -243,7 +243,8 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 - 一层：句柄缓存里已有该目录 → 成功、零 RPC（与 legacy 最深缓存层一样；外部删掉了缓存过的目录时，下一层 MKDIR
   会 `STALE` → 忘掉缓存再解析父目录 → `NotFound` → **同一次调用里重建父目录一次**（`role_create_all`，逐层）再建
   这一层，于是一次 `create_directory_all` 就把路径重建出来，与 legacy 一样；重建后仍不存在 → `NotFound` / Transient。
-  一开始就解析不到的父目录照旧 `NotFound` / Permanent，不重建）。
+  一开始就解析不到的父目录照旧 `NotFound` / Permanent，不重建）。这是 `Namespace::create_directory`“只建一层”的
+  NFS 例外，已写进 trait 文档（`src/storage/roles/namespace.rs`）：那时一次调用可能建不止一层。
   否则 LOOKUP 父目录（经缓存；`role_lookup_fh` 按 role 分类：`ACCES` / `PERM` / `ROFS` → `PermissionDenied`，`NOENT` →
   `NotFound`，断连 → `Connectivity`，保留状态名）后 MKDIR：
   - `EXIST` → LOOKUP 该名字（无属性则 GETATTR）：目录 → 成功；**非目录（文件 / 符号链接）→ 删掉再 MKDIR**
