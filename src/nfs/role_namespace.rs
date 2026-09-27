@@ -20,10 +20,18 @@
 //!   made of it.
 //!
 //! At most [`MAX_STALE_RETRIES`] retries in all; exhausting them reports the last cause, and a
-//! non-directory is never removed without a retry left to create the directory. A parent that
-//! is gone once its stale cached handle was forgotten — deleted after this process cached it,
-//! so `create_directory_all` passed it without an RPC — is `NotFound` / Transient: the cache is
-//! clean and the next attempt recreates it.
+//! non-directory is never removed without a retry left to create the directory.
+//!
+//! The parent is resolved with the role's classification (`role_lookup_fh`,
+//! `src/nfs/role_create.rs`): a refused LOOKUP (`ACCES` / `PERM`) is `PermissionDenied` /
+//! Permanent, `NOENT` is `NotFound`, a lost session is `Connectivity` — not the `Protocol` /
+//! Unknown the legacy string wrapping made of them.
+//!
+//! A parent that is gone once its stale cached handle was forgotten was deleted after this
+//! process cached it, so `create_directory_all` passed it without an RPC. It is rebuilt once
+//! within the same call (every missing level of it, `role_create_all`) and the level tried
+//! again, as the legacy helper rebuilt the whole path from the root; gone again after that, it
+//! is `NotFound` / Transient.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -33,6 +41,7 @@ use bytes::Bytes;
 use nfs_rs::NfsError;
 use tracing::warn;
 
+use super::role_create::transient_if_gone;
 use super::{
     FType3, GLOBAL_CACHE, MAX_STALE_RETRIES, NFSStorage, classify_role_error,
     invalidate_path_cache, is_retryable_with_invalidation,
@@ -52,6 +61,14 @@ impl NFSStorage {
     ) -> Result<(), NfsProtocolFailure> {
         let components =
             Self::collect_components(Path::new(path.as_str())).map_err(classify_role_error)?;
+        self.role_create_level(&components).await
+    }
+
+    /// Creates the one directory `components` name; see [`Self::role_create_directory`].
+    pub(super) async fn role_create_level(
+        &self,
+        components: &[String],
+    ) -> Result<(), NfsProtocolFailure> {
         let Some((name, parents)) = components.split_last() else {
             // The backend root always exists.
             return Ok(());
@@ -68,7 +85,7 @@ impl NFSStorage {
             parent: parents.iter().collect(),
             name,
             cache_path,
-            components: &components,
+            components,
         };
         create_level(&level).await
     }
@@ -92,6 +109,8 @@ trait LevelCalls: Sync {
     async fn forget(&self) -> Result<(), NfsProtocolFailure>;
     /// Caches the level's directory handle.
     fn remember(&self, handle: &Bytes);
+    /// Creates every missing level of the parent: it was deleted after this process cached it.
+    async fn rebuild_parent(&self) -> Result<(), NfsProtocolFailure>;
 }
 
 /// What one attempt ended with.
@@ -107,20 +126,9 @@ enum Attempt {
 async fn create_level(calls: &dyn LevelCalls) -> Result<(), NfsProtocolFailure> {
     let mut retries = 0;
     let mut forgotten = false;
+    let mut rebuilt = false;
     loop {
-        let parent = calls.parent().await.map_err(|failure| {
-            if forgotten && failure.class == FailureClass::NotFound {
-                // The parent's cached handle went stale and the parent is gone: it was deleted
-                // after this process cached it, so `create_directory_all` passed it without an
-                // RPC. The cache is clean now and a new attempt recreates it: not permanent.
-                NfsProtocolFailure {
-                    transience: Transience::Transient,
-                    ..failure
-                }
-            } else {
-                failure
-            }
-        })?;
+        let parent = parent_of(calls, forgotten, &mut rebuilt).await?;
         let retries_left = retries < MAX_STALE_RETRIES;
         let attempt = match calls.mkdir(parent.clone()).await {
             Ok(handle) => {
@@ -142,6 +150,30 @@ async fn create_level(calls: &dyn LevelCalls) -> Result<(), NfsProtocolFailure> 
             forgotten = true;
         }
     }
+}
+
+/// The parent's handle. Once a stale handle was forgotten (`forgotten`), a parent that is gone
+/// was deleted after this process cached it, so `create_directory_all` passed it without an RPC:
+/// it is rebuilt once (`rebuilt`) and resolved again. Gone after that, it is `NotFound` /
+/// Transient — the cache is clean and a new attempt recreates it — not permanent.
+async fn parent_of(
+    calls: &dyn LevelCalls,
+    forgotten: bool,
+    rebuilt: &mut bool,
+) -> Result<Bytes, NfsProtocolFailure> {
+    let gone = |failure: &NfsProtocolFailure| forgotten && failure.class == FailureClass::NotFound;
+    let failure = match calls.parent().await {
+        Err(failure) if gone(&failure) && !*rebuilt => {
+            *rebuilt = true;
+            calls.rebuild_parent().await?;
+            match calls.parent().await {
+                Ok(parent) => return Ok(parent),
+                Err(failure) => failure,
+            }
+        }
+        other => return other.map_err(|failure| transient_if_gone(failure, forgotten)),
+    };
+    Err(transient_if_gone(failure, forgotten))
 }
 
 /// MKDIR answered `EXIST`: success when the name is a directory; otherwise the non-directory is
@@ -202,10 +234,9 @@ impl LevelCalls for MountLevel<'_> {
 
     async fn parent(&self) -> Result<Bytes, NfsProtocolFailure> {
         self.storage
-            .lookup_fh(&self.parent)
+            .role_lookup_fh(&self.parent)
             .await
             .map(|object| object.fh)
-            .map_err(classify_role_error)
     }
 
     async fn mkdir(&self, parent: Bytes) -> Result<Bytes, NfsError> {
@@ -245,6 +276,13 @@ impl LevelCalls for MountLevel<'_> {
             (self.cache_path.clone(), self.storage.get_root_fh()),
             handle,
         );
+    }
+
+    async fn rebuild_parent(&self) -> Result<(), NfsProtocolFailure> {
+        let parents = self.components.len().saturating_sub(1);
+        self.storage
+            .role_create_all(&self.components[..parents])
+            .await
     }
 }
 

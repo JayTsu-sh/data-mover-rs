@@ -113,6 +113,11 @@ impl LevelCalls for Script {
     fn remember(&self, _handle: &Bytes) {
         self.record("remember");
     }
+
+    async fn rebuild_parent(&self) -> Result<(), NfsProtocolFailure> {
+        self.record("rebuild");
+        Ok(())
+    }
 }
 
 fn exist() -> Result<(), NfsError> {
@@ -266,52 +271,112 @@ async fn a_stale_parent_handle_is_forgotten_and_the_level_retried() {
     }
 }
 
-/// A parent deleted after this process cached it: gone once its stale handle is forgotten, so
-/// not permanent — the next attempt, with a clean cache, recreates it.
-#[tokio::test]
-async fn a_parent_gone_after_its_stale_handle_was_forgotten_is_transient() {
-    struct Deleted(Script);
-    #[async_trait]
-    impl LevelCalls for Deleted {
-        fn path(&self) -> &Path {
-            self.0.path()
-        }
-        async fn parent(&self) -> Result<Bytes, NfsProtocolFailure> {
-            let forgotten = self.0.count("forget") > 0;
-            self.0.parent().await?;
-            if forgotten {
-                return Err(NfsProtocolFailure::new(
-                    FailureClass::NotFound,
-                    Transience::Permanent,
-                ));
-            }
-            Ok(Bytes::from_static(b"parent"))
-        }
-        async fn mkdir(&self, parent: Bytes) -> Result<Bytes, NfsError> {
-            self.0.mkdir(parent).await
-        }
-        async fn lookup(&self, parent: Bytes) -> Result<(Bytes, bool), NfsError> {
-            LevelCalls::lookup(&self.0, parent).await
-        }
-        async fn remove(&self, parent: Bytes) -> Result<(), NfsError> {
-            LevelCalls::remove(&self.0, parent).await
-        }
-        async fn forget(&self) -> Result<(), NfsProtocolFailure> {
-            self.0.forget().await
-        }
-        fn remember(&self, handle: &Bytes) {
-            self.0.remember(handle);
+/// A parent deleted after this process cached it: `create_directory_all` passed it without an
+/// RPC, its stale handle is forgotten and it is gone. The level rebuilds it once and goes on, so
+/// one call recreates the path as the legacy helper did.
+struct Deleted {
+    script: Script,
+    /// Whether the parent is back once rebuilt.
+    rebuilt_parent_exists: bool,
+    rebuild: fn() -> Result<(), NfsProtocolFailure>,
+}
+
+impl Deleted {
+    fn new(rebuilt_parent_exists: bool) -> Self {
+        Self {
+            script: Script::new(&[stale, || Ok(())]),
+            rebuilt_parent_exists,
+            rebuild: || Ok(()),
         }
     }
+}
 
-    let script = Deleted(Script::new(&[stale]));
-    let failure = match create_level(&script).await {
+#[async_trait]
+impl LevelCalls for Deleted {
+    fn path(&self) -> &Path {
+        self.script.path()
+    }
+    async fn parent(&self) -> Result<Bytes, NfsProtocolFailure> {
+        let forgotten = self.script.count("forget") > 0;
+        let rebuilt = self.script.count("rebuild") > 0;
+        self.script.parent().await?;
+        if forgotten && !(rebuilt && self.rebuilt_parent_exists) {
+            return Err(NfsProtocolFailure::new(
+                FailureClass::NotFound,
+                Transience::Permanent,
+            ));
+        }
+        Ok(Bytes::from_static(b"parent"))
+    }
+    async fn mkdir(&self, parent: Bytes) -> Result<Bytes, NfsError> {
+        self.script.mkdir(parent).await
+    }
+    async fn lookup(&self, parent: Bytes) -> Result<(Bytes, bool), NfsError> {
+        LevelCalls::lookup(&self.script, parent).await
+    }
+    async fn remove(&self, parent: Bytes) -> Result<(), NfsError> {
+        LevelCalls::remove(&self.script, parent).await
+    }
+    async fn forget(&self) -> Result<(), NfsProtocolFailure> {
+        self.script.forget().await
+    }
+    fn remember(&self, handle: &Bytes) {
+        self.script.remember(handle);
+    }
+    async fn rebuild_parent(&self) -> Result<(), NfsProtocolFailure> {
+        self.script.record("rebuild");
+        (self.rebuild)()
+    }
+}
+
+#[tokio::test]
+async fn a_parent_deleted_after_it_was_cached_is_rebuilt_within_the_call() {
+    let deleted = Deleted::new(true);
+    assert!(create_level(&deleted).await.is_ok());
+    assert_eq!(
+        deleted.script.calls(),
+        [
+            "parent", "mkdir", "forget", "parent", "rebuild", "parent", "mkdir", "remember"
+        ]
+    );
+}
+
+/// Gone again once rebuilt (deleted again meanwhile): not permanent, and rebuilt only once.
+#[tokio::test]
+async fn a_parent_gone_again_after_its_rebuild_is_transient() {
+    let deleted = Deleted::new(false);
+    let failure = match create_level(&deleted).await {
         Ok(()) => panic!("expected a failure"),
         Err(failure) => failure,
     };
     assert_eq!(failure.class, FailureClass::NotFound);
     assert_eq!(failure.transience, Transience::Transient);
-    assert_eq!(script.0.calls(), ["parent", "mkdir", "forget", "parent"]);
+    assert_eq!(
+        deleted.script.calls(),
+        ["parent", "mkdir", "forget", "parent", "rebuild", "parent"]
+    );
+}
+
+/// A rebuild that is refused reports the refusal, as creating those levels would.
+#[tokio::test]
+async fn a_refused_rebuild_reports_its_own_failure() {
+    let mut deleted = Deleted::new(true);
+    deleted.rebuild = || {
+        Err(NfsProtocolFailure::new(
+            FailureClass::PermissionDenied,
+            Transience::Permanent,
+        ))
+    };
+    let failure = match create_level(&deleted).await {
+        Ok(()) => panic!("expected a failure"),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.class, FailureClass::PermissionDenied);
+    assert_eq!(failure.transience, Transience::Permanent);
+    assert_eq!(
+        deleted.script.calls(),
+        ["parent", "mkdir", "forget", "parent", "rebuild"]
+    );
 }
 
 #[tokio::test]
@@ -348,7 +413,8 @@ async fn a_parent_that_cannot_be_resolved_stops_before_mkdir() {
     script.parent = Some(|| NfsProtocolFailure::new(FailureClass::NotFound, Transience::Permanent));
     let failure = failure_of(&script).await;
     assert_eq!(failure.class, FailureClass::NotFound);
-    // Nothing was forgotten: a parent missing from the start is permanent.
+    // Nothing was forgotten: a parent missing from the start is permanent, and not rebuilt (the
+    // level's parent must exist).
     assert_eq!(failure.transience, Transience::Permanent);
     assert_eq!(script.calls(), ["parent"]);
 }

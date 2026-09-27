@@ -154,10 +154,21 @@ nfs-rs 错误产出 `FailureClass` + `Transience`，并记下服务端状态名�
 namespace 角色的 `CreateDirectory`（MKDIR，只建一层，`src/nfs/role_namespace.rs`）也直接走这张表：此前它转发给 legacy
 递归 `create_dir_all`，MKDIR 被拒经字符串包装成 `NfsError`，在 role 层是 `Protocol` / Unknown（可重试）且没有状态名；
 现在 `ACCES` / `PERM` / `ROFS` 是条目 `PermissionDenied` / Permanent（诊断如 `NFS role failed: NFS3ERR_ACCES (access denied)`）。
-MKDIR 前解析父目录的 LOOKUP 仍走 legacy `classify_role_error`（`NOENT` → `NotFound`，其余 `Protocol` / Unknown）。
+MKDIR 前解析父目录的 LOOKUP 也按这张表（`role_lookup_fh`，`src/nfs/role_create.rs`；stale / 忙的重试与 legacy
+`lookup_fh` 相同）：`ACCES` / `PERM` / `ROFS` → `PermissionDenied` / Permanent，`NOENT` → `NotFound`，断连 → `Connectivity`，
+保留状态名（此前经 legacy `classify_role_error`，`NOENT` 以外一律 `Protocol` / Unknown）。
 `EXIST` 不是失败：LOOKUP 该名字，是目录即成功；不是目录则删掉再建（rsync 语义，重试用尽 → `Conflict` / Unknown）。
-父目录缓存的句柄 `STALE`、忘掉缓存后父目录已不存在（外部删掉了本进程缓存过的目录）→ `NotFound` / **Transient**
-（缓存已清，重试会重建）；一开始就不存在的父目录是 `NotFound` / Permanent。
+父目录缓存的句柄 `STALE`、忘掉缓存后父目录已不存在（外部删掉了本进程缓存过的目录）→ **同一次调用里重建父目录一次**
+（逐层，下面的规则）再建这一层；重建后仍不存在 → `NotFound` / Transient；重建被拒报重建的失败。一开始就不存在的父目录
+是 `NotFound` / Permanent（不重建）。
+
+role 的写路径（staged 的 `create_empty_open` 即独占 CREATE、`Staged` / `Namespace` 的 `rename`）建缺失的父目录也不再用
+legacy 递归 `create_dir_all`，而是 `role_create_all`：从句柄缓存里最深的一层往下逐层调上面的一层 MKDIR，并套用下节
+“被拒但已是目录”的规则（被拒 → LOOKUP 该层：是目录 → 继续；探测 `Cancelled` / `Connectivity` / `Authentication` /
+`Throttled` → 报探测的失败；否则报原来的拒绝）。于是写一个文件、其缺失的父目录在不可写的目录下 → 该文件 Prepare 的条目
+`PermissionDenied` / Permanent（此前 `Protocol` / Unknown，上游会重试）。独占 CREATE 自己被拒也直接经 `classify_error`
+（`ACCES` / `ROFS` → `PermissionDenied`，保留状态名）；父目录缓存句柄 `STALE` 且父目录已被外部删掉 → 同一次调用里
+重建一次。legacy 调用方（`StorageEnum`、legacy `create_file` / `rename`）不变。
 
 元数据角色的 SETATTR（mode / owner / 时间）也走这张表（K3b，`setattr_role`）；此前经 legacy 字符串包装，
 被拒一律是 `Protocol` / Unknown、没有状态名、也从不升为会话失败。SETATTR 之前的 LOOKUP 与 stale 重试里的

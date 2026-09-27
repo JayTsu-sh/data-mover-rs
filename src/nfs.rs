@@ -52,6 +52,7 @@ use crate::{
 };
 
 mod owner;
+mod role_create;
 mod role_listing;
 mod role_metadata;
 mod role_namespace;
@@ -380,6 +381,20 @@ async fn backoff_server_busy(op: &str, target: &(dyn std::fmt::Debug + Send + Sy
         sleep_ms
     );
     tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+}
+
+/// Why [`NFSStorage::lookup_fh`] failed, before the legacy string wrapping: a failure before any
+/// LOOKUP answered (bad path, root refresh), or the error of the LOOKUP of `dirname` once the
+/// stale / busy retries were spent.
+enum LookupFailure {
+    Storage(StorageError),
+    Component { dirname: String, error: NfsError },
+}
+
+impl From<StorageError> for LookupFailure {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
 }
 
 /// 检测调用方可通过"清除路径缓存 + 刷新 `root_fh` + 重试"恢复的错误。
@@ -718,9 +733,7 @@ impl NfsNamespaceProtocol for NFSStorage {
         from: &crate::model::StoragePath,
         to: &crate::model::StoragePath,
     ) -> std::result::Result<(), NfsProtocolFailure> {
-        self.rename(Path::new(from.as_str()), Path::new(to.as_str()))
-            .await
-            .map_err(classify_role_error)
+        self.role_rename(from, to).await
     }
 }
 
@@ -1061,15 +1074,11 @@ impl NfsStagedProtocol for NFSStorage {
         path: &crate::model::StoragePath,
     ) -> std::result::Result<Box<dyn NfsStageFile>, NfsProtocolFailure> {
         let native = Path::new(path.as_str());
-        let handle = match self.create_file_exclusive(native, Some(0o600)).await {
-            Ok(Some(handle)) => handle,
-            Ok(None) => {
-                return Err(NfsProtocolFailure::new(
-                    crate::model::FailureClass::Conflict,
-                    crate::model::Transience::Permanent,
-                ));
-            }
-            Err(error) => return Err(classify_role_error(error)),
+        let Some(handle) = self.role_create_file_exclusive(native, Some(0o600)).await? else {
+            return Err(NfsProtocolFailure::new(
+                crate::model::FailureClass::Conflict,
+                crate::model::Transience::Permanent,
+            ));
         };
         Ok(Box::new(NfsRoleStageFile::new(self.clone(), handle)))
     }
@@ -1120,9 +1129,7 @@ impl NfsStagedProtocol for NFSStorage {
         from: &crate::model::StoragePath,
         to: &crate::model::StoragePath,
     ) -> std::result::Result<(), NfsProtocolFailure> {
-        NFSStorage::rename(self, Path::new(from.as_str()), Path::new(to.as_str()))
-            .await
-            .map_err(classify_role_error)
+        self.role_rename(from, to).await
     }
 
     async fn delete(
@@ -1793,10 +1800,31 @@ impl NFSStorage {
     ///
     /// Returns an error when the requested storage operation cannot be completed.
     pub async fn lookup_fh(&self, relative_path: &Path) -> Result<nfs_rs::ObjRes> {
-        self.lookup_fh_inner(relative_path, 0).await
+        self.lookup_fh_inner(relative_path, 0)
+            .await
+            .map_err(|failure| match failure {
+                LookupFailure::Storage(error) => error,
+                // NOENT once the retries are spent: the component really is absent.
+                // Delete callers may treat it as idempotent success.
+                LookupFailure::Component { dirname, error } if is_nfs_noent(&error) => {
+                    StorageError::DirectoryNotFound(format!(
+                        "Directory '{dirname}' not found: {error}"
+                    ))
+                }
+                LookupFailure::Component { dirname, error } => {
+                    StorageError::NfsError(format!("Failed to lookup directory {dirname}: {error}"))
+                }
+            })
     }
 
-    async fn lookup_fh_inner(&self, relative_path: &Path, retries: u8) -> Result<nfs_rs::ObjRes> {
+    /// [`Self::lookup_fh`] keeping the error of the LOOKUP that failed, so the role can classify
+    /// it itself (`role_lookup_fh`, `src/nfs/role_create.rs`) instead of from the legacy string
+    /// wrapping.
+    async fn lookup_fh_inner(
+        &self,
+        relative_path: &Path,
+        retries: u8,
+    ) -> std::result::Result<nfs_rs::ObjRes, LookupFailure> {
         trace!("Looking up path: {:?}", relative_path);
 
         let components = Self::collect_components(relative_path)?;
@@ -1886,16 +1914,10 @@ impl NFSStorage {
                         backoff_server_busy("lookup_fh", &relative_path, retries).await;
                         return Box::pin(self.lookup_fh_inner(relative_path, retries + 1)).await;
                     }
-                    // NOENT 重试耗尽：路径组件确实不存在，返回 DirectoryNotFound。
-                    // 删除调用方可根据自身语义决定是否将其视为幂等成功。
-                    if is_nfs_noent(&e) {
-                        return Err(StorageError::DirectoryNotFound(format!(
-                            "Directory '{dirname}' not found: {e}"
-                        )));
-                    }
-                    return Err(StorageError::NfsError(format!(
-                        "Failed to lookup directory {dirname}: {e}"
-                    )));
+                    return Err(LookupFailure::Component {
+                        dirname: dirname.clone(),
+                        error: e,
+                    });
                 }
             }
         }
@@ -2125,63 +2147,6 @@ impl NFSStorage {
                     }
                     return Err(StorageError::NfsError(format!(
                         "[create] Failed to create file: {}, {e}",
-                        relative_path.display()
-                    )));
-                }
-            }
-        }
-        unreachable!("retry loop always returns")
-    }
-
-    /// Creates a provably new zero-length file without a prior existence probe.
-    ///
-    /// `Ok(None)` is the typed exclusive-create collision. Unlike [`Self::create_file`], this
-    /// never opens an existing file, so a successful CREATE already proves that a follow-up
-    /// truncate would be redundant.
-    async fn create_file_exclusive(
-        &self,
-        relative_path: &Path,
-        mode: Option<u32>,
-    ) -> Result<Option<NFSFileHandle>> {
-        let filename = relative_path
-            .file_name()
-            .ok_or_else(|| StorageError::InvalidPath("Invalid destination path".to_string()))?
-            .to_string_lossy()
-            .to_string();
-
-        if let Some(parent) = relative_path.parent() {
-            self.create_dir_all(parent).await?;
-        }
-
-        for attempt in 0..=MAX_STALE_RETRIES {
-            let parent_fh = if let Some(parent) = relative_path.parent() {
-                self.lookup_fh(parent).await?.fh
-            } else {
-                self.rpc_root_fh()
-            };
-            match self.mount.create(parent_fh, &filename, mode).await {
-                Ok(object) => {
-                    return Ok(Some(NFSFileHandle::new(
-                        object.fh,
-                        relative_path.to_path_buf(),
-                    )));
-                }
-                Err(error) if error.is_exist() => return Ok(None),
-                Err(error)
-                    if is_retryable_with_invalidation(&error) && attempt < MAX_STALE_RETRIES =>
-                {
-                    let stale_generation = self.refresh_generation.load(Ordering::Acquire);
-                    self.maybe_refresh_root_fh(stale_generation).await?;
-                    let root_fh = self.get_root_fh();
-                    let components = Self::collect_components(relative_path)?;
-                    invalidate_path_cache(&components, &root_fh);
-                }
-                Err(error) if is_server_busy(&error) && attempt < MAX_STALE_RETRIES => {
-                    backoff_server_busy("create_file_exclusive", &relative_path, attempt).await;
-                }
-                Err(error) => {
-                    return Err(StorageError::NfsError(format!(
-                        "[create exclusive] Failed to create file {}: {error}",
                         relative_path.display()
                     )));
                 }
@@ -2808,6 +2773,12 @@ impl NFSStorage {
     ///
     /// Returns an error when the requested storage operation cannot be completed.
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.rename_with(from, to, true).await
+    }
+
+    /// [`Self::rename`]; `create_parent`: create `to`'s missing parent levels with the legacy
+    /// `create_dir_all` first. The role creates them itself (`role_rename`).
+    async fn rename_with(&self, from: &Path, to: &Path, create_parent: bool) -> Result<()> {
         trace!("Rename {:?} to {:?}", from, to);
 
         // 提取文件名（循环外，不依赖缓存）
@@ -2823,7 +2794,7 @@ impl NFSStorage {
             .to_string();
 
         // 确保目标目录存在（只需一次，重试时只需刷新 fh）
-        if let Some(parent) = to.parent() {
+        if create_parent && let Some(parent) = to.parent() {
             self.create_dir_all(parent).await?;
         }
 

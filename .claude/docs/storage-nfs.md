@@ -208,25 +208,38 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   删掉重建则是 NFS 独有的迁移语义，见下）；递归由 backend 无关的
   `storage::create_directory_all` 逐层驱动，所以它"被拒但已是目录的层算已存在"的规则也管到 NFS 的中间层。
   此前它转发给 legacy 递归 `NFSStorage::create_dir_all`，中间层在一次调用里建完，规则够不到；legacy 调用方
-  （`StorageEnum` / 写路径建父目录）仍用 legacy 递归版，**行为不变**。
+  （`StorageEnum`、legacy `create_file` / `rename`）仍用 legacy 递归版，**行为不变**。
+- **role 写路径建父目录**（`src/nfs/role_create.rs`，2026-09-27）：staged 的 `create_empty_open`（独占 CREATE，
+  stage / 指针临时名）与 `Staged` / `Namespace` 的 `rename` 先 `role_create_all(父目录)`：从句柄缓存里最深的一层往下
+  逐层调一层 MKDIR，被拒（条目 `PermissionDenied`）的层 LOOKUP 一次，是目录则继续，探测 `Cancelled` / `Connectivity` /
+  `Authentication` / `Throttled` 报探测的失败，否则报原来的拒绝 —— 与 `storage::create_directory_all` 同一规则。
+  整条父路径都在缓存里 → 零 RPC。独占 CREATE 的回答直接 `classify_error`（`ACCES` / `ROFS` → `PermissionDenied` /
+  Permanent，保留状态名）；`STALE` → 忘掉缓存再解析父目录，父目录已被外部删掉（`NotFound`）→ 同一次调用里
+  `role_create_all` 重建一次再 CREATE。rename 本身仍是 legacy 的（`rename_with(.., false)`，只是不再建父目录），其失败仍经
+  `classify_role_error`。
 - 一层：句柄缓存里已有该目录 → 成功、零 RPC（与 legacy 最深缓存层一样；外部删掉了缓存过的目录时，下一层 MKDIR
-  会 `STALE` → 忘掉缓存再解析父目录 → `NotFound` / **Transient**（报在下一层；缓存已清，调用方重试会重建；legacy
-  是同一次调用里整条路径从根重来）。一开始就解析不到的父目录照旧 `NotFound` / Permanent）。
-  否则 LOOKUP 父目录（经缓存）后 MKDIR：
+  会 `STALE` → 忘掉缓存再解析父目录 → `NotFound` → **同一次调用里重建父目录一次**（`role_create_all`，逐层）再建
+  这一层，于是一次 `create_directory_all` 就把路径重建出来，与 legacy 一样；重建后仍不存在 → `NotFound` / Transient。
+  一开始就解析不到的父目录照旧 `NotFound` / Permanent，不重建）。
+  否则 LOOKUP 父目录（经缓存；`role_lookup_fh` 按 role 分类：`ACCES` / `PERM` / `ROFS` → `PermissionDenied`，`NOENT` →
+  `NotFound`，断连 → `Connectivity`，保留状态名）后 MKDIR：
   - `EXIST` → LOOKUP 该名字（无属性则 GETATTR）：目录 → 成功；**非目录（文件 / 符号链接）→ 删掉再 MKDIR**
     —— legacy 的 rsync 式迁移语义，保留，`warn!` 记录；REMOVE 的 `NOENT` 当作兄弟任务已删。
   - `STALE` / `BADHANDLE` / `NOENT`（并发改名 / 删除）→ 刷新根句柄、忘掉路径缓存、重试。
   - 其余直接 `classify_error`（保留状态名）：`ACCES` / `PERM` / `ROFS` → 条目 `PermissionDenied` / Permanent。
   - 至多 `MAX_STALE_RETRIES`（3）次重试，用尽报最后的原因（一直被非目录挡住 → `Conflict` / Unknown，最后那个
     非目录不删 —— 没有重试可用来建目录时不做破坏性的一步）。
-  - 残余：MKDIR 前解析父目录的 LOOKUP 仍经 legacy `lookup_fh` + `classify_role_error`（`ACCES` 等是 `Protocol` /
-    Unknown，断连不升会话）；v3 MKDIR 回复可以不带句柄（ONTAP / DXN 都带），nfs-rs 此时报 `Rpc` → 会话失败。
+  - 残余：v3 MKDIR 回复可以不带句柄（ONTAP / DXN 都带），nfs-rs 此时报 `Rpc` → 会话失败。
 - 真机（`tests/nfs_mkdir_contract.rs`，e2e-nfs 步骤 4b）：uid 4242 在 `dm-mkdir-*/ro`（0555）下的 `ro/w`（0777）里
   `create_directory_all("…/ro/w/new")` 成功，`"…/ro/new"` → `PermissionDenied` / Permanent 报在 `…/ro/new`。
   已存在目录、父目录不可写时：**DXN-2 v3 / v4.0 回 `ACCES`**（先查权限；旧代码在这里整条失败，报在第一层、
   `Protocol` / Unknown），**ONTAP v3 / v4.0 / v4.1 回 `EXIST`**（先查重名；旧代码能过已存在的层，但新层被拒是
   `Protocol` / Unknown）。ONTAP 的 `.snapshot`（任何目录都能到，只读）：MKDIR `.snapshot` 本身回 `EXIST`，
   其下新建回 `NFS3ERR_ROFS` / `NFS4ERR_ROFS` → `PermissionDenied`。没有真正的只读导出（不新建导出）。
+  2026-09-27 起还验：以 uid 4242 写 `…/ro/missing/sub/f`（staged prepare，父目录缺失且落在不可写的 `ro` 下）→
+  `PermissionDenied` / Permanent（旧代码 `Protocol` / Unknown）；本身份建过（已缓存）、再由 URL 身份删掉的目录，一次
+  `create_directory_all` 其下路径即重建（旧代码 `NotFound` / Transient），往其中写文件也成功（旧代码同样成功：discovery
+  的 LOOKUP 先清掉了过期缓存）。ONTAP v3 / v4.0 / v4.1、DXN-2 v3 / v4.0 全过。
 
 ## 目的端恢复（ADR-0006 C10，`src/storage/backends/nfs/at_destination.rs`）
 
@@ -256,8 +269,8 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 - `examples/nfs_walkdir.rs` — 遍历 export。
 - `examples/nfs_export.rs` — 查询 export 元信息。
 - `examples/nfs_opt_dir.rs` — 创建优化目录结构。
-- `tests/nfs_mkdir_contract.rs`（`#[ignore]`，`NFS_REAL_URL`）— 不可写的已存在层上 `create_directory_all`，
-  可选 `NFS_REAL_RO_PATH` 只读文件系统。
+- `tests/nfs_mkdir_contract.rs`（`#[ignore]`，`NFS_REAL_URL`）— 不可写的已存在层上 `create_directory_all`、
+  父目录缺失且被拒的写、外部删掉的已缓存目录一次重建，可选 `NFS_REAL_RO_PATH` 只读文件系统。
 - skill：`.claude/skills/e2e-nfs/` (需要 `.env`)。
 
 ## 改 NFS 时
