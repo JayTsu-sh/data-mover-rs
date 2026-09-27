@@ -78,7 +78,9 @@ FAILED_LISTING='!listing-failed'
 entries() {
   local km="" vm="" out
   while :; do
-    out=$(s3c "$H/$1?versions&prefix=$(enc "$2")&key-marker=$(enc "$km")&version-id-marker=$(enc "$vm")")
+    # StorageGRID refuses an empty version-id-marker (400): the first page asks no marker, a
+    # later one the key marker and, only when the server named one, the version marker.
+    out=$(s3c "$H/$1?versions&prefix=$(enc "$2")${km:+&key-marker=$(enc "$km")${vm:+&version-id-marker=$(enc "$vm")}}")
     # On stdin: a 1 000-entry page is too long for one argument ("argument list too long"), and
     # the cleanup would then leave the bucket behind.
     python3 -c 'import sys, xml.etree.ElementTree as ET
@@ -92,6 +94,8 @@ for tag, marker in (("Version", False), ("DeleteMarker", True)):
     grep -q '<IsTruncated>true' <<<"$out" || break
     km=$(grep -o '<NextKeyMarker>[^<]*' <<<"$out" | sed 's/<NextKeyMarker>//')
     vm=$(grep -o '<NextVersionIdMarker>[^<]*' <<<"$out" | sed 's/<NextVersionIdMarker>//')
+    # A truncated page without a key marker would ask the first page again, forever.
+    [ -n "$km" ] || { echo "$FAILED_LISTING"; break; }
   done
 }
 # key<TAB>uploadId of the uploads open in bucket $1 under prefix $2 (MinIO: exact key only).

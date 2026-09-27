@@ -112,6 +112,8 @@ fn pages(fixture: &str) -> Vec<(Asked, Bytes)> {
 struct MarkerReplay {
     pages: Arc<Vec<(Asked, Bytes)>>,
     asked: Arc<Mutex<Vec<Asked>>>,
+    /// Each request's query string as sent: whether a marker was there at all.
+    queries: Arc<Mutex<Vec<String>>>,
 }
 
 impl MarkerReplay {
@@ -119,11 +121,19 @@ impl MarkerReplay {
         Self {
             pages: Arc::new(pages(fixture)),
             asked: Arc::default(),
+            queries: Arc::default(),
         }
     }
 
     fn asked(&self) -> Vec<Asked> {
         self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn queries(&self) -> Vec<String> {
+        self.queries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -143,6 +153,10 @@ fn empty_listing(prefix: &str) -> Bytes {
 impl HttpConnector for MarkerReplay {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         let query = request.uri().split_once('?').map_or("", |(_, query)| query);
+        self.queries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(query.to_string());
         let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
             .collect();
@@ -418,6 +432,92 @@ async fn an_unknown_resume_point_is_reported_not_guessed() -> TestResult {
     Ok(())
 }
 
+/// Pages shaped as `StorageGRID` 11.5 answers (written by hand, not captured): the first truncated
+/// at the common prefix `<ROOT>s/x/` with an empty `<NextVersionIdMarker>` element — the next page
+/// is asked with the key marker alone — then the last page.
+const EMPTY_VERSION_MARKER: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult \
+    xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>test-bucket</Name><Prefix>f4-1790409358/s/</Prefix>\
+    <KeyMarker></KeyMarker><VersionIdMarker></VersionIdMarker><NextKeyMarker>f4-1790409358/s/x/</NextKeyMarker>\
+    <NextVersionIdMarker></NextVersionIdMarker><MaxKeys>2</MaxKeys><Delimiter>/</Delimiter>\
+    <IsTruncated>true</IsTruncated>\
+    <Version><Key>f4-1790409358/s/a</Key><VersionId>a1</VersionId><IsLatest>true</IsLatest>\
+    <LastModified>2026-09-26T00:00:01.000Z</LastModified><ETag>\"e\"</ETag><Size>1</Size></Version>\
+    <CommonPrefixes><Prefix>f4-1790409358/s/x/</Prefix></CommonPrefixes>\
+    </ListVersionsResult><!--PAGE-END--><?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult \
+    xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>test-bucket</Name><Prefix>f4-1790409358/s/</Prefix>\
+    <KeyMarker>f4-1790409358/s/x/</KeyMarker><VersionIdMarker></VersionIdMarker><MaxKeys>2</MaxKeys>\
+    <Delimiter>/</Delimiter><IsTruncated>false</IsTruncated>\
+    <Version><Key>f4-1790409358/s/z</Key><VersionId>z1</VersionId><IsLatest>true</IsLatest>\
+    <LastModified>2026-09-26T00:00:03.000Z</LastModified><ETag>\"e\"</ETag><Size>1</Size></Version>\
+    </ListVersionsResult>";
+
+/// Every `name=value` of a raw query string, undecoded.
+fn query_params(query: &str) -> HashMap<&str, &str> {
+    (query.split('&'))
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+        .collect()
+}
+
+/// `StorageGRID` answers an empty `version-id-marker` with 400 (`InvalidArgument`): no walk sends
+/// one, nor one without a key marker; the first page asks no marker at all.
+#[tokio::test]
+async fn no_listing_sends_an_empty_or_unpaired_version_marker() -> TestResult {
+    let fixtures = FIXTURES.into_iter().chain([(EMPTY_VERSION_MARKER, "s")]);
+    for (fixture, dir) in fixtures {
+        let (role, paged_replay, walk) = (
+            MarkerReplay::new(fixture),
+            MarkerReplay::new(fixture),
+            MarkerReplay::new(fixture),
+        );
+        role_all(&role, dir).await?;
+        paged(&paged_replay, &format!("{ROOT}{dir}/")).await?;
+        walked(&walk, &format!("{ROOT}{dir}")).await?;
+        for replay in [&role, &paged_replay, &walk] {
+            let queries = replay.queries();
+            let first = queries.first().map(|query| query_params(query));
+            assert!(
+                first.is_some_and(|first| !first.contains_key("key-marker")
+                    && !first.contains_key("version-id-marker")),
+                "{dir}: {queries:?}"
+            );
+            assert!(queries.len() > 1, "{dir}: {queries:?}");
+            for query in &queries {
+                let params = query_params(query);
+                if let Some(id) = params.get("version-id-marker") {
+                    assert!(!id.is_empty(), "{dir}: empty version marker in {query}");
+                    let key = params.get("key-marker");
+                    assert!(key.is_some_and(|key| !key.is_empty()), "{dir}: {query}");
+                }
+            }
+        }
+    }
+    // Every walk reads both pages of that listing.
+    let both = [
+        (format!("{ROOT}s/a"), "a1".to_string()),
+        (format!("{ROOT}s/z"), "z1".to_string()),
+    ];
+    let (files, directories) = role_all(&MarkerReplay::new(EMPTY_VERSION_MARKER), "s").await?;
+    assert_eq!(
+        (files, directories),
+        (both.to_vec(), vec![format!("{ROOT}s/x/")])
+    );
+    let read = paged(
+        &MarkerReplay::new(EMPTY_VERSION_MARKER),
+        &format!("{ROOT}s/"),
+    )
+    .await?;
+    assert!(read.errors.is_empty(), "{:?}", read.errors);
+    assert_eq!(named_files(&read), both);
+    let (files, _, errors) = walked(
+        &MarkerReplay::new(EMPTY_VERSION_MARKER),
+        &format!("{ROOT}s"),
+    )
+    .await?;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(files, both);
+    Ok(())
+}
+
 fn version(key: &str, id: &str) -> ObjectVersion {
     ObjectVersion::builder().key(key).version_id(id).build()
 }
@@ -493,6 +593,9 @@ fn the_version_marker_is_the_servers_or_the_last_entrys_on_the_marked_key() {
     // marker alone resumes after it.
     let at_prefix = page(vec![version("a", "a1")], vec![], "x/", None, None);
     assert_eq!(at_prefix.next_version_id_marker(), Ok(None));
+    // An empty marker the server sent (StorageGRID) is none: never asked back as empty.
+    let empty = page(vec![version("a", "a1")], vec![], "x/", Some(""), None);
+    assert_eq!(empty.next_version_id_marker(), Ok(None));
     // A MinIO key marker is a token, never a key: the guard stays off.
     let minio = page(
         vec![version("k", "k1")],

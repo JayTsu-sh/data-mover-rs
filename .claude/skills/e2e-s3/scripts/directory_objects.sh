@@ -98,8 +98,9 @@ check() { # name, got, want
 entries() {
   local km="" vm="" out
   while :; do
-    # StorageGRID refuses an empty version-id-marker (400): send the markers only once set.
-    out=$(s3c "$H/$VB?versions&prefix=$(enc "${1:-$P}")${km:+&key-marker=$(enc "$km")}${vm:+&version-id-marker=$(enc "$vm")}")
+    # StorageGRID refuses an empty version-id-marker (400): the first page asks no marker, a
+    # later one the key marker and, only when the server named one, the version marker.
+    out=$(s3c "$H/$VB?versions&prefix=$(enc "${1:-$P}")${km:+&key-marker=$(enc "$km")${vm:+&version-id-marker=$(enc "$vm")}}")
     python3 -c 'import sys, xml.etree.ElementTree as ET
 try: root = ET.fromstring(sys.stdin.read())
 except ET.ParseError: root = None
@@ -112,6 +113,8 @@ for e in root:
     grep -q '<IsTruncated>true' <<<"$out" || break
     km=$(grep -o '<NextKeyMarker>[^<]*' <<<"$out" | sed 's/<NextKeyMarker>//')
     vm=$(grep -o '<NextVersionIdMarker>[^<]*' <<<"$out" | sed 's/<NextVersionIdMarker>//')
+    # A truncated page without a key marker would ask the first page again, forever.
+    [ -n "$km" ] || { echo "$FAILED_LISTING"; break; }
   done
 }
 # Every key under $1 (default: the run's prefix), ListObjectsV2 without delimiter.

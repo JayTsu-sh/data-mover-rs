@@ -782,6 +782,14 @@ ONTAP 9.19.1 的 `ListObjectVersions`（`delimiter=/`）在截断页里有 Commo
   请求回空的完整页），经真实 SDK + 拦截器跑 role All、legacy `walkdir_2`、legacy `walkdir`（并数每个子前缀被列了几次）；
   另有 RustFS 形状的合成页（标记组在前）验证三处都不猜、legacy 仍发出完整的 key。变异：去掉守卫 → 6 个全红；去掉“末尾一段”
   检查 → 2 红；去掉 legacy 前缀去重 → 2 红；去掉 role `merge` 去重 → 1 红。
+- StorageGRID 11.5 对任何空的 `version-id-marker` 回 400 `InvalidArgument`（“A version-id marker cannot be empty”；空的
+  `key-marker` 无妨）。三处列举都不发空的、也不发不带 key-marker 的 version-id-marker：首页不带任何 marker，服务端给的空
+  `<NextVersionIdMarker>` 当没给（再走上面的守卫）。`MarkerReplay` 另记原始查询串，
+  `no_listing_sends_an_empty_or_unpaired_version_marker` 在三份 ONTAP 数据与一份 StorageGRID 形状的手写两页（首页停在公共前缀、
+  空 `NextVersionIdMarker`）上查三处列举；变异：role 发 `Some("")`、legacy `walkdir_2` 总带 version marker、不滤空的
+  `NextVersionIdMarker` → 各自变红。e2e-s3 脚本自己的 ListObjectVersions（`traversal_versions.sh` / `versioning_matrix.sh` /
+  `directory_objects.sh`）同样只在有 key-marker 时带、且只带非空的 version-id-marker；截断页没有 `NextKeyMarker` 时列举按失败结束
+  （不再从首页无限重列）。
 - 真机（2026-09-26，ONTAP `data-mover-test-ver`，唯一前缀，跑完删光）：`mkl/z` 1000 个版本 role `traverse --versions all`、
   legacy `walkdir`、`walkdir_2` 都列出 1000 个，四组数据（mkl / mks / mkp / rnd，1187 条）与不带 delimiter 的列举逐条相等、
   无重复，每个目录一次。守卫对别的存储不改结果：`traversal_versions.sh` 在 MinIO、RustFS（`EXPECT_ORDER=inferred`，k / gone
