@@ -2,7 +2,7 @@
 
 ## 底层依赖
 
-- **crate**：`nfs-rs` (0.2.0，crates.io)。
+- **crate**：`nfs-rs` (0.8.6，crates.io)。
 - 支持 NFSv3 和 NFSv4 (自动协商 / 升级)。
 - 属性缓存用 `moka` (0.12.15)，减少冗余 GETATTR RPC。
 
@@ -31,8 +31,23 @@ nfs://nas01/exports/home:/prefix?uid=1000&gid=1000
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `uid` | 1000 | 操作时使用的 Unix uid (RPC AUTH_SYS) |
-| `gid` | 1000 | 操作时使用的 Unix gid |
+| `uid` | 0（URL 没写时 `parse_nfs_url` 补 `uid=0`） | 操作时使用的 Unix uid (RPC AUTH_SYS) |
+| `gid` | 0（同上） | 操作时使用的 Unix gid |
+
+其余查询参数原样转给 nfs-rs，**`readdir-buffer` 除外**：URL 里出现它（参数名按 nfs-rs 的方式百分号解码后比较，
+`#` 之后的片段不看）→ `ConfigError`（P7 C7d，用户 2026-09-27 定：只按服务器公布的上限，不接受也不转发，不另设内存上限）。
+直接调 `nfs_rs::parse_url_and_mount` 的几个 example / 契约工具不经这里，不受此限。
+
+## 目录回复大小（P7 C7d，nfs-rs 0.8.6）
+
+READDIR / READDIRPLUS 的 `maxcount` 是挂载时服务器公布的读上限（与 READ 同一个：v3 FSINFO `rtmax`，v4.0 `maxread`，
+v4.1 `maxread` 再与会话最大回复取小；都不超过 nfs-rs 的 4 MiB 载荷上限），`dircount = maxcount`（只约束名字 / cookie /
+fileid，是回复的子集；不用 `dtpref` —— Linux knfsd 那里只报一页）。v4.0 服务器不公布 `maxread` 时仍是 8 KiB。
+data-mover 什么都不设。实测（2026-09-27）：ONTAP 9 各版本公布 1 MiB，但目录回复自己封顶在 32 KiB（= v3 `dtpref`）
+—— v3 每回复 41 → 175 项、v4.x 23 → 95 项；DXN-2 公布 1 MiB 且照给 —— v3 45 → ~5,600 项、v4.0 39 → 5,000 项，一个回复
+约 1 MiB，首页晚到（毫秒级 → 约 0.3 s，冷缓存 v4.0 到数秒）。回复大小 = min(上限, 目录实际内容)，所以小目录不多占内存；
+列举同一时刻最多持有一个回复（`read_role_directory` 取完一个才请求下一个），最坏 ≈ 同时在读宽目录的 worker 数 × 回复大小。
+legacy `walkdir` / `walkdir_2` 走同一个 mount，也用新大小。
 
 ## Retry Taxonomy (核心)
 

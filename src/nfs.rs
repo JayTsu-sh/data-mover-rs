@@ -22,6 +22,7 @@ use nfs_rs::{
 use path_clean::PathClean;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
+use url::form_urlencoded;
 
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
@@ -381,6 +382,27 @@ async fn backoff_server_busy(op: &str, target: &(dyn std::fmt::Debug + Send + Sy
         sleep_ms
     );
     tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+}
+
+/// The NFS URL parameter nfs-rs sizes directory replies with. data-mover neither sets it nor
+/// forwards it (P7 C7d, user decision 2026-09-27): nfs-rs ≥ 0.8.6 sizes READDIR / READDIRPLUS
+/// replies from the server's published read limit, and a URL may not override that.
+const READDIR_BUFFER_PARAMETER: &str = "readdir-buffer";
+
+/// Refuses an NFS URL query that sets `readdir-buffer` (a `ConfigError`: the URL parsed, the
+/// parameter is not one data-mover accepts), rather than forwarding it to nfs-rs. Names are
+/// percent-decoded as nfs-rs decodes them (`Url::query_pairs`), so an encoded spelling cannot
+/// slip through; a fragment (`#…`), which nfs-rs never reads, is not looked at.
+fn reject_readdir_buffer(query: &str) -> Result<()> {
+    let query = query.split_once('#').map_or(query, |(query, _)| query);
+    let names_it =
+        form_urlencoded::parse(query.as_bytes()).any(|(name, _)| name == READDIR_BUFFER_PARAMETER);
+    if names_it {
+        return Err(StorageError::ConfigError(format!(
+            "NFS URL parameter {READDIR_BUFFER_PARAMETER} is not accepted: directory replies are sized from the server's published read limit"
+        )));
+    }
+    Ok(())
 }
 
 /// Why [`NFSStorage::lookup_fh`] failed, before the legacy string wrapping: a failure before any
@@ -1515,6 +1537,7 @@ impl NFSStorage {
         let (path_part, query_part) = raw_path_part
             .split_once('?')
             .unwrap_or((&raw_path_part, ""));
+        reject_readdir_buffer(query_part)?;
 
         // root_dir 去掉前后 '/'，使其成为相对路径前缀（空串表示挂载根）
         let (nfs_path, root_dir) = path_part.split_once(':').map_or_else(
@@ -4890,6 +4913,26 @@ mod tests {
             NFSStorage::parse_nfs_url("nfs://server").assert_value("test value should be present");
         assert_eq!(nfs_url, "nfs://server/?uid=0&gid=0");
         assert_eq!(root_dir, "");
+
+        // readdir-buffer 不接受也不转发（P7 C7d）：回复大小按服务器公布的上限定
+        for url in [
+            "nfs://server/path?readdir-buffer=8192,8192",
+            "nfs://server/path:root?uid=0&readdir-buffer=65536",
+            "nfs://server/path?readdir-buffer",
+            "nfs://server/path?readdir%2Dbuffer=4096,4096",
+            "nfs://server/path?%72eaddir-buffer=4096",
+        ] {
+            assert!(
+                matches!(
+                    NFSStorage::parse_nfs_url(url),
+                    Err(StorageError::ConfigError(message)) if message.contains("readdir-buffer")
+                ),
+                "{url}"
+            );
+        }
+        // 只认（解码后的）参数名本身；片段 nfs-rs 不读
+        assert!(NFSStorage::parse_nfs_url("nfs://server/path?x-readdir-buffer=1").is_ok());
+        assert!(NFSStorage::parse_nfs_url("nfs://server/path?uid=0#x&readdir-buffer=1").is_ok());
 
         // 测试带前导斜杠的 root_dir
         let (nfs_url, root_dir) = NFSStorage::parse_nfs_url("nfs://server/path:/prefix/dir")

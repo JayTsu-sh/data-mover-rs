@@ -14,7 +14,7 @@
 | `lib.rs` | 542 | 公开 API + 模块导出 + `EntryEnum` / `Result` / `canonicalize_path` / `detect_storage_type` |
 | **`storage_enum.rs`** | **1334** | **enum-based dispatch 层**，`StorageEnum::{Local, NFS, S3, HDFS}` 用 match 分派 30+ 操作 (CIFS 不在其中) |
 | `cifs.rs` | 36 | 仅 `create_cifs_role_storage` factory bridge；CIFS 实现在 `storage/backends/cifs/` (smb-domain) |
-| `nfs.rs` | 3100 | NFS v3/v4 backend (nfs-rs 0.2.0) |
+| `nfs.rs` | 3100 | NFS v3/v4 backend (nfs-rs 0.8.6) |
 | `s3.rs` | 3350 | S3 backend (aws-sdk-s3 1.129.0) |
 | `local.rs` | 1134 | 本地文件系统 backend (std::fs + rayon) |
 | **`filter.rs`** | **4849** | **filter DSL 引擎**：lexer + `should_skip` 三元组决策树 |
@@ -73,7 +73,7 @@
 |---|---|---|
 | tokio | 1.51.1 (full) | 异步 runtime |
 | smb-domain (package `smb`) | git JayTsu-sh/smb-rs `2649a0b` (main，PR #89) | CIFS/SMB 协议栈 (domain facade) |
-| nfs-rs | 0.8.5 | NFS v3/v4 客户端 |
+| nfs-rs | 0.8.6 | NFS v3/v4 客户端 |
 | hdfs-native | git kimahriman/hdfs-native `695fc47` (上游 master) | HDFS 客户端 (hsync / recover_lease) |
 | aws-sdk-s3 | 1.129.0 | S3 SDK |
 | binrw | 0.15 | CIFS FileTime / 目录条目二进制解析 |
