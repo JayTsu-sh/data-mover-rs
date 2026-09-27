@@ -239,7 +239,7 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   否则 LOOKUP 父目录（经缓存；`role_lookup_fh` 按 role 分类：`ACCES` / `PERM` / `ROFS` → `PermissionDenied`，`NOENT` →
   `NotFound`，断连 → `Connectivity`，保留状态名）后 MKDIR：
   - `EXIST` → LOOKUP 该名字（无属性则 GETATTR）：目录 → 成功；**非目录（文件 / 符号链接）→ 删掉再 MKDIR**
-    —— legacy 的 rsync 式迁移语义，保留，`warn!` 记录；REMOVE 的 `NOENT` 当作兄弟任务已删。
+    —— legacy 的 rsync 式迁移语义，保留，`warn!` 记录；REMOVE 的 `NOENT` 当作兄弟任务已删，`ISDIR` / `NOTEMPTY` 当作兄弟任务已删并建好了目录（再 MKDIR → `EXIST` → 目录）。
   - `STALE` / `BADHANDLE` / `NOENT`（并发改名 / 删除）→ 刷新根句柄、忘掉路径缓存、重试。
   - 其余直接 `classify_error`（保留状态名）：`ACCES` / `PERM` / `ROFS` → 条目 `PermissionDenied` / Permanent。
   - 至多 `MAX_STALE_RETRIES`（3）次重试，用尽报最后的原因（一直被非目录挡住 → `Conflict` / Unknown，最后那个

@@ -140,13 +140,21 @@ nfs-rs 错误产出 `FailureClass` + `Transience`，并记下服务端状态名�
 | `Unsupported` | `Unsupported` | Permanent |
 | NOENT 类（`is_not_found`） | `NotFound` | Permanent |
 | `NFS3ERR_ACCES` / `NFS3ERR_PERM` / `NFS4ERR_ACCESS` / `NFS4ERR_PERM`；`NFS3ERR_ROFS` / `NFS4ERR_ROFS`（只读文件系统 / 导出，例如 ONTAP `.snapshot`；分类里没有"只读"类，拒绝与 `ACCES` 一样永久；ROFS 此前是 `Protocol` / Unknown） | `PermissionDenied` | Permanent |
-| `NFS3ERR_NOSPC` / `NFS4ERR_NOSPC` | `Capacity` | Permanent |
+| `NFS3ERR_NOSPC` / `NFS4ERR_NOSPC`；`NFS3ERR_DQUOT` / `NFS4ERR_DQUOT`（配额） | `Capacity` | Permanent |
+| `NOTEMPTY` / `EXIST` / `ISDIR` / `NOTDIR`（v3 / v4 同名；rename 要替换的目录非空、名字已在、目录与文件位置不符。MKDIR / CREATE 的 `EXIST` 在分类前各自处理，见下） | `Conflict` | Permanent |
+| `NFS4ERR_FILE_OPEN`（别的客户端开着这个文件，同 CIFS `STATUS_SHARING_VIOLATION`） | `Conflict` | Transient |
+| `NFS3ERR_XDEV` / `NFS4ERR_XDEV`（跨文件系统 rename，永远不行） | `Unsupported` | Permanent |
+| `INVAL` / `NAMETOOLONG`（v3 / v4）、`NFS4ERR_BADNAME`（rename 进自己的子树是 `INVAL`） | `InvalidInput` | Permanent |
 | `InvalidInput` | `InvalidInput` | Permanent |
 | `Io` PermissionDenied / NotFound | `PermissionDenied` / `NotFound` | Permanent |
 | `Io` ConnectionReset / TimedOut / WouldBlock | `Connectivity` | Transient |
 | 其他 `Io` / `Rpc` | `Connectivity` | Unknown |
 | `NFS4ERR_DELAY` / `NFS3ERR_JUKEBOX` / `NFS4ERR_GRACE`（`GRACE` 自 P7 C7 起，此前是 `Protocol` / Unknown）（服务端忙 / 重启后的恢复期。`NFS4ERR_DELAY`、`NFS4ERR_GRACE` 由 nfs-rs 先退避，用尽后返回原状态；role 列举首页之前两者都按列举的节流预算退避后整目录重读（P7 C7），首页之后同样退避、从 cookie 续读（C7c），预算用尽是该列举的失败；其他 role 路径的 `NFS3ERR_JUKEBOX` 仍立即浮出——待补） | **`Throttled`** | Transient |
 | 其他服务端状态（如 `NFS4ERR_BADOWNER`、`NFS4ERR_STALE`） | `Protocol` | Unknown |
+
+上面 `Conflict` / `Unsupported` / `InvalidInput` / `DQUOT` 这几行自 2026-09-27（NFS 收尾）起；此前落在最后一行 `Protocol` / Unknown。
+目的端 prepare 的独占 CREATE 撞名（`Conflict`，没有状态名）仍改成 `Conflict` / Transient（别的写者的，重试即解，
+`at_destination.rs::transient_collision`）；服务端给了状态名的 `Conflict`（如父路径上是文件 → `NOTDIR`）不改，永久。
 
 `Connectivity` 经 `role_failure` 升为会话失败（metadata 阶段报 `SessionLost`，后面的族不再应用）；
 经 `entry_scoped` 的调用方（可选元数据的 Required 读取）不升级。
@@ -157,7 +165,8 @@ namespace 角色的 `CreateDirectory`（MKDIR，只建一层，`src/nfs/role_nam
 MKDIR 前解析父目录的 LOOKUP 也按这张表（`role_lookup_fh`，`src/nfs/role_create.rs`；stale / 忙的重试与 legacy
 `lookup_fh` 相同）：`ACCES` / `PERM` / `ROFS` → `PermissionDenied` / Permanent，`NOENT` → `NotFound`，断连 → `Connectivity`，
 保留状态名（此前经 legacy `classify_role_error`，`NOENT` 以外一律 `Protocol` / Unknown）。
-`EXIST` 不是失败：LOOKUP 该名字，是目录即成功；不是目录则删掉再建（rsync 语义，重试用尽 → `Conflict` / Unknown）。
+`EXIST` 不是失败：LOOKUP 该名字，是目录即成功；不是目录则删掉再建（rsync 语义，重试用尽 → `Conflict` / Unknown；REMOVE 回
+`NOENT`，或回 `ISDIR` / `NOTEMPTY` —— 并发任务已删掉它并建好了目录 —— 都当作已删，下一次 MKDIR 见分晓）。
 父目录缓存的句柄 `STALE`、忘掉缓存后父目录已不存在（外部删掉了本进程缓存过的目录）→ **同一次调用里重建父目录一次**
 （逐层，下面的规则）再建这一层；重建后仍不存在 → `NotFound` / Transient；重建被拒报重建的失败。一开始就不存在的父目录
 是 `NotFound` / Permanent（不重建）。

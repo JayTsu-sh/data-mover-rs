@@ -38,6 +38,9 @@ pub(crate) fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
         };
         return with_server_status(NfsProtocolFailure::new(class, transience), &error);
     }
+    if let Some((class, transience)) = refused_by_state(&error) {
+        return with_server_status(NfsProtocolFailure::new(class, transience), &error);
+    }
     let (class, transience) = match &error {
         nfs_rs::NfsError::Unsupported(_) => (FailureClass::Unsupported, Transience::Permanent),
         value if value.is_not_found() => (FailureClass::NotFound, Transience::Permanent),
@@ -91,6 +94,53 @@ pub(crate) fn classify_error(error: nfs_rs::NfsError) -> NfsProtocolFailure {
         _ => (FailureClass::Protocol, Transience::Unknown),
     };
     with_server_status(NfsProtocolFailure::new(class, transience), &error)
+}
+
+/// Server statuses that refuse a request for the state it meets or the name it carries — the
+/// same request cannot succeed until that changes (2026-09-27; before, `Protocol` / Unknown).
+fn refused_by_state(error: &nfs_rs::NfsError) -> Option<(FailureClass, Transience)> {
+    let classified = match error {
+        // Existing state in the way: a non-empty directory a rename would replace, a name that
+        // exists where it must not, a directory where a file must be or the reverse. The same
+        // request cannot succeed until someone changes that state.
+        nfs_rs::NfsError::Nfs3(
+            nfs_rs::Nfs3ErrorCode::NFS3ERR_NOTEMPTY
+            | nfs_rs::Nfs3ErrorCode::NFS3ERR_EXIST
+            | nfs_rs::Nfs3ErrorCode::NFS3ERR_ISDIR
+            | nfs_rs::Nfs3ErrorCode::NFS3ERR_NOTDIR,
+        )
+        | nfs_rs::NfsError::Nfs4(
+            nfs_rs::Nfs4ErrorCode::NFS4ERR_NOTEMPTY
+            | nfs_rs::Nfs4ErrorCode::NFS4ERR_EXIST
+            | nfs_rs::Nfs4ErrorCode::NFS4ERR_ISDIR
+            | nfs_rs::Nfs4ErrorCode::NFS4ERR_NOTDIR,
+        ) => (FailureClass::Conflict, Transience::Permanent),
+        // An NFSv4 rename or remove of a file another client holds open (like CIFS
+        // `STATUS_SHARING_VIOLATION`): the holder will let go.
+        nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_FILE_OPEN) => {
+            (FailureClass::Conflict, Transience::Transient)
+        }
+        // A rename across file systems (an export spanning volumes, a snapshot): never possible.
+        nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_XDEV)
+        | nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_XDEV) => {
+            (FailureClass::Unsupported, Transience::Permanent)
+        }
+        // A name or argument the server refuses (a rename into its own subtree is `INVAL`).
+        nfs_rs::NfsError::Nfs3(
+            nfs_rs::Nfs3ErrorCode::NFS3ERR_INVAL | nfs_rs::Nfs3ErrorCode::NFS3ERR_NAMETOOLONG,
+        )
+        | nfs_rs::NfsError::Nfs4(
+            nfs_rs::Nfs4ErrorCode::NFS4ERR_INVAL
+            | nfs_rs::Nfs4ErrorCode::NFS4ERR_NAMETOOLONG
+            | nfs_rs::Nfs4ErrorCode::NFS4ERR_BADNAME,
+        ) => (FailureClass::InvalidInput, Transience::Permanent),
+        nfs_rs::NfsError::Nfs3(nfs_rs::Nfs3ErrorCode::NFS3ERR_DQUOT)
+        | nfs_rs::NfsError::Nfs4(nfs_rs::Nfs4ErrorCode::NFS4ERR_DQUOT) => {
+            (FailureClass::Capacity, Transience::Permanent)
+        }
+        _ => return None,
+    };
+    Some(classified)
 }
 
 /// Names the NFS status the server answered with, looking through the recovery wrapper nfs-rs
@@ -206,6 +256,98 @@ mod tests {
             let failure = classify_error(error);
             assert_eq!(failure.class, class);
             assert_eq!(failure.transience, transience);
+        }
+    }
+
+    /// A refused RENAME and the like: state in the way, another file system, a bad name, a
+    /// quota — permanent (`FILE_OPEN` aside), naming the status; before, `Protocol` / Unknown.
+    #[test]
+    fn refusals_for_the_state_met_are_classified() {
+        let v3 = nfs_rs::NfsError::Nfs3;
+        let v4 = nfs_rs::NfsError::Nfs4;
+        let permanent = |class| (class, Transience::Permanent);
+        for (error, expected) in [
+            (
+                v3(nfs_rs::Nfs3ErrorCode::NFS3ERR_NOTEMPTY),
+                permanent(FailureClass::Conflict),
+            ),
+            (
+                v4(nfs_rs::Nfs4ErrorCode::NFS4ERR_NOTEMPTY),
+                permanent(FailureClass::Conflict),
+            ),
+            (
+                v3(nfs_rs::Nfs3ErrorCode::NFS3ERR_EXIST),
+                permanent(FailureClass::Conflict),
+            ),
+            (
+                v4(nfs_rs::Nfs4ErrorCode::NFS4ERR_EXIST),
+                permanent(FailureClass::Conflict),
+            ),
+            (
+                v3(nfs_rs::Nfs3ErrorCode::NFS3ERR_ISDIR),
+                permanent(FailureClass::Conflict),
+            ),
+            (
+                v4(nfs_rs::Nfs4ErrorCode::NFS4ERR_ISDIR),
+                permanent(FailureClass::Conflict),
+            ),
+            (
+                v3(nfs_rs::Nfs3ErrorCode::NFS3ERR_NOTDIR),
+                permanent(FailureClass::Conflict),
+            ),
+            (
+                v4(nfs_rs::Nfs4ErrorCode::NFS4ERR_NOTDIR),
+                permanent(FailureClass::Conflict),
+            ),
+            (
+                v4(nfs_rs::Nfs4ErrorCode::NFS4ERR_FILE_OPEN),
+                (FailureClass::Conflict, Transience::Transient),
+            ),
+            (
+                v3(nfs_rs::Nfs3ErrorCode::NFS3ERR_XDEV),
+                permanent(FailureClass::Unsupported),
+            ),
+            (
+                v4(nfs_rs::Nfs4ErrorCode::NFS4ERR_XDEV),
+                permanent(FailureClass::Unsupported),
+            ),
+            (
+                v3(nfs_rs::Nfs3ErrorCode::NFS3ERR_INVAL),
+                permanent(FailureClass::InvalidInput),
+            ),
+            (
+                v4(nfs_rs::Nfs4ErrorCode::NFS4ERR_INVAL),
+                permanent(FailureClass::InvalidInput),
+            ),
+            (
+                v3(nfs_rs::Nfs3ErrorCode::NFS3ERR_NAMETOOLONG),
+                permanent(FailureClass::InvalidInput),
+            ),
+            (
+                v4(nfs_rs::Nfs4ErrorCode::NFS4ERR_NAMETOOLONG),
+                permanent(FailureClass::InvalidInput),
+            ),
+            (
+                v4(nfs_rs::Nfs4ErrorCode::NFS4ERR_BADNAME),
+                permanent(FailureClass::InvalidInput),
+            ),
+            (
+                v3(nfs_rs::Nfs3ErrorCode::NFS3ERR_DQUOT),
+                permanent(FailureClass::Capacity),
+            ),
+            (
+                v4(nfs_rs::Nfs4ErrorCode::NFS4ERR_DQUOT),
+                permanent(FailureClass::Capacity),
+            ),
+        ] {
+            let failure = classify_error(error);
+            assert_eq!((failure.class, failure.transience), expected);
+            assert!(
+                failure
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status.contains("ERR_"))
+            );
         }
     }
 

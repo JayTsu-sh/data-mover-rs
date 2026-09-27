@@ -170,6 +170,30 @@ async fn a_non_directory_in_the_way_is_replaced_by_the_directory() {
     }
 }
 
+/// Two tasks create the same level over a file in the way: the other one removed the file and
+/// made the directory between our LOOKUP and our REMOVE, which the server refuses as a directory
+/// (`ISDIR`; `NOTEMPTY` on `NFSv4`). The next MKDIR finds the directory — not a permanent
+/// `Conflict`.
+#[tokio::test]
+async fn a_directory_made_by_a_concurrent_task_before_our_removal_is_success() {
+    for refused in [
+        (|| Err(NfsError::Nfs3(V3::NFS3ERR_ISDIR))) as Answer<()>,
+        || Err(NfsError::Nfs3(V3::NFS3ERR_NOTEMPTY)),
+        || Err(NfsError::Nfs4(V4::NFS4ERR_NOTEMPTY)),
+    ] {
+        let script = Script::new(&[exist])
+            .lookup(&[|| Ok(false), || Ok(true)])
+            .remove(&[refused]);
+        assert!(create_level(&script).await.is_ok());
+        assert_eq!(
+            script.calls(),
+            [
+                "parent", "mkdir", "lookup", "remove", "parent", "mkdir", "lookup", "remember"
+            ]
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_refused_removal_is_reported_as_the_refusal() {
     let script = Script::new(&[exist])

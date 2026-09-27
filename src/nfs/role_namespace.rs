@@ -197,14 +197,30 @@ async fn settle_existing(
                 calls.path()
             );
             match calls.remove(parent).await {
-                // A concurrent task may have removed it first.
-                Err(error) if !error.is_not_found() => Err(classify_error(error)),
+                // A concurrent task may have removed it first — and made the directory there
+                // since, which REMOVE refuses as a directory: the next MKDIR finds it.
+                Err(error) if !error.is_not_found() && !directory_now(&error) => {
+                    Err(classify_error(error))
+                }
                 _ => Ok(Attempt::Again { cause: in_the_way }),
             }
         }
         // Gone again between MKDIR and LOOKUP, or the parent's handle went stale.
         Err(error) => stale_or_failed(error),
     }
+}
+
+/// Whether REMOVE was refused because a directory now stands at the name (`NFS3ERR_ISDIR`; a
+/// non-empty one on `NFSv4`, whose REMOVE also removes empty directories).
+fn directory_now(error: &NfsError) -> bool {
+    matches!(
+        error,
+        NfsError::Nfs3(
+            nfs_rs::Nfs3ErrorCode::NFS3ERR_ISDIR | nfs_rs::Nfs3ErrorCode::NFS3ERR_NOTEMPTY
+        ) | NfsError::Nfs4(
+            nfs_rs::Nfs4ErrorCode::NFS4ERR_ISDIR | nfs_rs::Nfs4ErrorCode::NFS4ERR_NOTEMPTY
+        )
+    )
 }
 
 fn stale_or_failed(error: NfsError) -> Result<Attempt, NfsProtocolFailure> {
