@@ -29,6 +29,26 @@ pub struct DslTraversalFilter {
     match_expressions: Option<FilterExpression>,
     exclude_expressions: Option<FilterExpression>,
     needs_modified: bool,
+    /// What a resumable traversal binds its checkpoints to: see [`resume_key`].
+    resume_key: [u8; 32],
+}
+
+/// A key of both parsed expressions: equal keys decide alike. Taken from their derived `Debug`
+/// form, which spells out the whole parsed tree (every condition, operator, value and glob) and
+/// keeps a relative time such as `modified < 7d` relative. A new version of the DSL may spell a tree
+/// differently; a checkpoint then refuses to resume, which is the safe direction.
+///
+/// A relative time is evaluated against the moment of each decision, so a traversal resumed a day
+/// later keeps the same key under a window a day later.
+fn resume_key(
+    match_expressions: Option<&FilterExpression>,
+    exclude_expressions: Option<&FilterExpression>,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("data-mover DSL traversal filter");
+    hasher.update(format!("{match_expressions:?}").as_bytes());
+    hasher.update(&[0]);
+    hasher.update(format!("{exclude_expressions:?}").as_bytes());
+    *hasher.finalize().as_bytes()
 }
 
 impl DslTraversalFilter {
@@ -43,6 +63,7 @@ impl DslTraversalFilter {
             .flatten()
             .any(|expression| expression.referenced_fields().modified);
         Self {
+            resume_key: resume_key(match_expressions.as_ref(), exclude_expressions.as_ref()),
             match_expressions,
             exclude_expressions,
             needs_modified,
@@ -99,6 +120,10 @@ fn extension(name: &str) -> &str {
 impl TraversalFilter for DslTraversalFilter {
     fn needs_modified(&self) -> bool {
         self.needs_modified
+    }
+
+    fn resume_key(&self) -> Option<Vec<u8>> {
+        Some(self.resume_key.to_vec())
     }
 
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision {
@@ -303,5 +328,21 @@ mod tests {
             decide(&filter, "d", EntryKind::Directory, None, None),
             (false, true, true)
         );
+    }
+
+    /// The resume key: the same expressions parsed twice give the same key, any other expression
+    /// (or the same one as the other kind) another; a relative time stays relative, so parsing it
+    /// later gives the same key.
+    #[test]
+    fn the_resume_key_is_the_parsed_expressions() {
+        let key = |filter: &DslTraversalFilter| filter.resume_key().unwrap_or_default();
+        let logs = key(&filter(Some("name == \"*.log\""), None));
+        assert_eq!(logs, key(&filter(Some("name == \"*.log\""), None)));
+        assert_ne!(logs, key(&filter(Some("name == \"*.txt\""), None)));
+        assert_ne!(logs, key(&filter(None, Some("name == \"*.log\""))));
+        assert_ne!(logs, key(&filter(None, None)));
+        let recent = key(&filter(Some("modified < 7d"), None));
+        assert_eq!(recent, key(&filter(Some("modified < 7d"), None)));
+        assert_ne!(recent, key(&filter(Some("modified < 8d"), None)));
     }
 }

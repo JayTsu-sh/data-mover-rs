@@ -21,7 +21,7 @@
 //! ```
 use std::fmt::Write as _;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::pin;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -159,6 +159,24 @@ enum Command {
         /// output shows the role really was asked (`Unsupported` could come from either).
         #[arg(long)]
         acl: bool,
+        /// Emit a checkpoint about every this many seconds (P7 §9; 0 = at every chance), and one
+        /// more as the last item when cancelled. Cancelling then drains what was produced.
+        #[arg(long)]
+        checkpoint_every: Option<f64>,
+        /// Write each checkpoint to this file, replacing it atomically, after flushing every entry
+        /// printed before it — so the file is never ahead of what was printed.
+        #[arg(long)]
+        checkpoint_out: Option<PathBuf>,
+        /// Resume from the checkpoint in this file (written by `--checkpoint-out` of a traversal
+        /// with the same backend, root, path, order, filter, depth and versions).
+        #[arg(long)]
+        resume_from: Option<PathBuf>,
+        /// Cancel once this many entries have been printed, then drain.
+        #[arg(long)]
+        cancel_after_entries: Option<u64>,
+        /// Cancel after this many seconds, then drain.
+        #[arg(long)]
+        cancel_after_secs: Option<f64>,
     },
     /// Stream an NDX-paged depth-first traversal, printing one line per page.
     NdxWalk {

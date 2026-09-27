@@ -85,11 +85,12 @@ fn key(work: &Arc<DirectoryWork>) -> usize {
 }
 
 impl Unfinished {
-    pub(super) fn of(root: &Arc<DirectoryWork>) -> Self {
-        Self(Mutex::new(HashMap::from([(
-            key(root),
-            root.path.as_str().to_owned(),
-        )])))
+    pub(super) fn of<'a>(seeds: impl Iterator<Item = &'a Arc<DirectoryWork>>) -> Self {
+        Self(Mutex::new(
+            seeds
+                .map(|seed| (key(seed), seed.path.as_str().to_owned()))
+                .collect(),
+        ))
     }
 
     /// Records directories just pushed, inside the push's critical section.

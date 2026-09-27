@@ -36,8 +36,10 @@ pub enum TraversalItem {
     Failure(Box<ScanFailure>),
     /// Every direct child of one listed directory has been delivered.
     DirectoryListed(Box<DirectoryListed>),
-    /// A position a later traversal can resume from. Only a resumable traversal emits it (P7
-    /// §9, not yet implemented): no traversal emits one today.
+    /// A position a later traversal can resume from ([`super::TraversalRequest::resume_from`]).
+    /// Only a traversal with checkpoints on ([`super::Resumable::On`]) emits it: about once per
+    /// interval, and as its last item when it ends early (unless its position was too large to
+    /// record). Persist it once everything received before it is committed.
     Checkpoint(Box<Checkpoint>),
 }
 
@@ -189,8 +191,15 @@ impl DirectoryListed {
     }
 }
 
-/// An opaque resume position (P7 §9). Its format is versioned and bound to the request that
-/// produced it; nothing emits one yet.
+/// An opaque resume position (P7 §9): the directories a traversal still had to list when it was
+/// taken, not the entries it had seen, so it stays small (see the traversal's resumable docs for
+/// its size). Its format is versioned — a checkpoint of another version is refused, never misread
+/// — and bound to the request that produced it: resuming a different request is refused before
+/// any I/O.
+///
+/// Not exact (§9.2): resuming may deliver again some of what was delivered after the checkpoint,
+/// never skip what was not delivered before it. Deliver-again duplicates carry the same paths and
+/// identities; a consumer that writes by key absorbs them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Checkpoint(Bytes);
 

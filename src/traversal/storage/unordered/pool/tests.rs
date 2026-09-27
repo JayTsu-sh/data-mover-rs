@@ -35,7 +35,7 @@ fn paths(works: &[Arc<DirectoryWork>]) -> Vec<String> {
 /// pops and steals; a finished one leaves it.
 #[tokio::test]
 async fn the_frontier_holds_every_unfinished_directory_through_pops_and_steals() {
-    let pool = Pool::new(2, work(""));
+    let pool = Pool::new(2, vec![work("")]);
     let halt = CancellationToken::new();
     let root = pool.take(0, &halt).await.unwrap_or_else(|| panic!("root"));
     assert_eq!(root.path.as_str(), "");
@@ -65,7 +65,7 @@ async fn the_frontier_holds_every_unfinished_directory_through_pops_and_steals()
 /// A thief takes the shallowest directory any other worker holds, not the first it finds.
 #[tokio::test]
 async fn a_thief_takes_the_shallowest_directory_held() {
-    let pool = Pool::new(3, work(""));
+    let pool = Pool::new(3, vec![work("")]);
     let halt = CancellationToken::new();
     let _root = pool.take(0, &halt).await;
     pool.push(0, vec![work("a/b/c")]);
@@ -80,7 +80,7 @@ async fn a_thief_takes_the_shallowest_directory_held() {
 /// An idle worker wakes for a push, and every worker returns `None` once the pool halts.
 #[tokio::test]
 async fn an_idle_worker_wakes_for_a_push_and_for_the_halt() {
-    let pool = Arc::new(Pool::new(3, work("")));
+    let pool = Arc::new(Pool::new(3, vec![work("")]));
     let halt = CancellationToken::new();
     let _root = pool.take(0, &halt).await;
     let waiting = {
@@ -128,7 +128,7 @@ async fn many_workers_take_every_directory_once_and_drain() {
         .sum();
     for round in 0..20 {
         let workers = [1, 3, 8, 16][round % 4];
-        let mut pool = Pool::new(workers, work(""));
+        let mut pool = Pool::new(workers, vec![work("")]);
         // Every other round without the frontier check, which locks every slot between two
         // moves: those rounds keep the interleavings of `take` / `push` a real traversal has.
         pool.checked = round % 2 == 0;
@@ -179,6 +179,6 @@ async fn many_workers_take_every_directory_once_and_drain() {
 #[test]
 #[should_panic(expected = "left the frontier while unfinished: [\"\"]")]
 fn a_pop_registered_in_a_second_critical_section_is_caught() {
-    let pool = Pool::new(1, work(""));
+    let pool = Pool::new(1, vec![work("")]);
     let _ = pool.pop_split(0);
 }

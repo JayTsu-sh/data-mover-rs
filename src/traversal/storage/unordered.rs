@@ -22,6 +22,12 @@
 //!   directory finishes, on the first terminal failure, or when the request is cancelled; a
 //!   listing then drops its stream (the backend's producer leaves through its own close path)
 //!   and an observation task finishes what it started. Nothing is ever aborted.
+//! - **Checkpoints** (P7 §9, with checkpoints on): a worker that finds one due after a page or a
+//!   finished directory takes the pool's frontier with every slot locked and sends it. A
+//!   directory missing from that snapshot had finished, so everything it produced was already in
+//!   the session ahead of the checkpoint; one in it is listed again, whole, on resume. A traversal
+//!   that did not complete sends one more once every worker has stopped, as its last item.
+//!   Resuming seeds the pool with the checkpoint's frontier instead of the root.
 //!
 //! [`TraversalOrder::Unordered`]: crate::traversal::TraversalOrder::Unordered
 //! [`Namespace::parked_listing_limit`]: crate::storage::Namespace::parked_listing_limit
@@ -32,10 +38,12 @@ use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::{Probe, Shared, root_work};
+use super::resume::{Resume, SNAPSHOT_CAP, frontier_entries, work_of};
+use super::{DirectoryWork, Probe, Shared, root_work};
 use crate::traversal::channel::ItemSender;
 use crate::traversal::{
-    BlockCounts, ScanTotals, TraversalCompletion, TraversalOutcome, TraversalTerminalFailure,
+    BlockCounts, ScanTotals, TraversalCompletion, TraversalItem, TraversalOutcome,
+    TraversalTerminalFailure,
 };
 
 mod page_io;
@@ -70,11 +78,21 @@ pub(super) async fn run(
     probe: Probe,
 ) {
     let halt = shared.request.cancel.child_token();
-    let pool = Arc::new(Pool::new(worker_count(&shared), root_work(&shared.request)));
+    let pool = Arc::new(Pool::new(worker_count(&shared), seeds(&shared)));
+    if pool.drained() {
+        // Resumed from a checkpoint with nothing left to list.
+        halt.cancel();
+    }
     // Nothing samples the probe here yet: the residency counters are the Blocks cursor's.
     let _ = probe;
     let workers = spawn_workers(&shared, &pool, &items, &halt);
-    // The workers' senders are the session's only ones: it sees its end once they are all gone.
+    // Otherwise the workers' senders are the session's only ones: it sees its end once they are
+    // all gone.
+    let last = shared
+        .resume
+        .as_ref()
+        .filter(|resume| resume.emits())
+        .map(|resume| (resume, items.clone()));
     drop(items);
     let (totals, broken) = join(workers, &halt).await;
     let terminal = if shared.request.cancel.is_cancelled() {
@@ -88,7 +106,40 @@ pub(super) async fn run(
             totals,
         )))
     };
+    if let Some((resume, sender)) = last
+        && !matches!(terminal, Ok(TraversalOutcome::Completed(_)))
+        && let Some(item) = checkpoint(resume, &pool)
+    {
+        // Not racing cancellation: a resumable session drains, and a consumer that dropped it
+        // makes this fail at once. Every worker has stopped, so the frontier is final.
+        let _ = sender.send_whole(vec![item]).await;
+    }
     let _ = completion.send(terminal);
+}
+
+/// Where the workers start: the traversal root, or the frontier a resumed traversal's checkpoint
+/// recorded, shallowest first.
+fn seeds(shared: &Shared) -> Vec<DirectoryWork> {
+    let Some(frontier) = shared
+        .resume
+        .as_ref()
+        .and_then(|resume| resume.start.as_ref())
+    else {
+        return vec![root_work(&shared.request)];
+    };
+    let mut seeds: Vec<DirectoryWork> = frontier.iter().map(work_of).collect();
+    seeds.sort_by_key(|work| work.child_depth);
+    seeds
+}
+
+/// A checkpoint of the pool's frontier now, or `None` (with a warning) when it is too large to
+/// record: an earlier checkpoint stays valid.
+fn checkpoint(resume: &Resume, pool: &Pool) -> Option<TraversalItem> {
+    let Some(frontier) = pool.snapshot(SNAPSHOT_CAP) else {
+        tracing::warn!("traversal checkpoint skipped: too many directories are waiting");
+        return None;
+    };
+    resume.checkpoint(&frontier_entries(frontier.iter().map(AsRef::as_ref)))
 }
 
 /// Starts one task per slot of `pool`, each with its own sender of `items`.

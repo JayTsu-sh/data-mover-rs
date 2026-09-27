@@ -12,9 +12,11 @@ use crate::model::{
 };
 
 mod channel;
+mod checkpoint;
 mod counts;
 mod events;
 mod storage;
+pub use checkpoint::{Resumable, ResumeRefusal};
 pub use counts::{BlockCounts, ScanTotals};
 pub use events::{
     Checkpoint, DirectoryListed, FailureScope, ListingOutcome, ScanFailure, TraversalItem,
@@ -24,6 +26,8 @@ pub use storage::StorageTraversalSource;
 mod cifs_tests;
 #[cfg(test)]
 mod hdfs_tests;
+#[cfg(test)]
+mod local_resume_tests;
 #[cfg(test)]
 mod local_tests;
 #[cfg(test)]
@@ -175,6 +179,15 @@ pub trait TraversalFilter: fmt::Debug + Send + Sync {
     /// entries that are never delivered if the traversal ends early; implementations must not
     /// depend on call order or keep state between calls that affects decisions.
     fn decide(&self, candidate: &TraversalCandidate<'_>) -> TraversalDecision;
+
+    /// A stable key of everything that affects [`Self::decide`], or `None` (the default) when the
+    /// filter has none. A resumable traversal (P7 §9) binds its checkpoints to it: a traversal
+    /// with a filter that returns `None` can neither checkpoint nor resume
+    /// ([`ResumeRefusal::FilterNotResumable`]), because a checkpoint taken under one filter must
+    /// not be resumed under another. Two filters with the same key must decide alike.
+    fn resume_key(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// A bounded traversal request, built with [`TraversalRequest::new`] and its setters:
@@ -209,6 +222,11 @@ pub struct TraversalRequest {
     pub max_depth: Option<NonZeroUsize>,
     /// Current objects only, or every stored version (see [`TraversalVersions`]).
     pub versions: TraversalVersions,
+    /// Whether the traversal emits [`TraversalItem::Checkpoint`]s (P7 §9). Off by default.
+    pub resumable: Resumable,
+    /// Where to resume from: a checkpoint a traversal of the same request emitted. `None` scans
+    /// from the start.
+    pub resume_from: Option<Checkpoint>,
 }
 
 /// Re-expresses a backend-relative path in the traversal root's frame of reference.
@@ -232,6 +250,12 @@ pub(crate) fn relative_to<'a>(root: &StoragePath, path: &'a StoragePath) -> &'a 
     below(root, path.as_str())
         .or_else(|| below(root, value))
         .unwrap_or(value)
+}
+
+/// Whether `path` is `root` itself or lies below it on a component boundary, spelled as a listing
+/// of `root` spells it.
+pub(crate) fn within(root: &StoragePath, path: &StoragePath) -> bool {
+    root.as_str().is_empty() || below(root.as_str(), path.as_str()).is_some()
 }
 
 /// What follows `root` in `value`, when `value` is `root` itself or lies below it on a component
@@ -293,7 +317,8 @@ const DEFAULT_MAX_BUFFERED: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1023
 impl TraversalRequest {
     /// A traversal of `root` with every other setting at its default: [`TraversalOrder`]'s
     /// default order, 64 operations in flight, 1024 items buffered, the default observation plan,
-    /// a fresh cancellation token, no filter, no depth limit, current objects only.
+    /// a fresh cancellation token, no filter, no depth limit, current objects only, no
+    /// checkpoints, from the start.
     #[must_use]
     pub fn new(root: StoragePath) -> Self {
         Self {
@@ -306,6 +331,8 @@ impl TraversalRequest {
             filter: None,
             max_depth: None,
             versions: TraversalVersions::default(),
+            resumable: Resumable::Off,
+            resume_from: None,
         }
     }
 
@@ -368,6 +395,24 @@ impl TraversalRequest {
         self
     }
 
+    /// Whether the traversal emits checkpoints; see [`Resumable`].
+    #[must_use]
+    pub const fn resumable(mut self, resumable: Resumable) -> Self {
+        self.resumable = resumable;
+        self
+    }
+
+    /// Resumes from `checkpoint`, which a traversal of the same storage, root, order, filter,
+    /// depth limit and version mode emitted; anything else is refused before any I/O
+    /// ([`TraversalTerminalFailure::Resume`]). What was delivered after the checkpoint may be
+    /// delivered again; nothing that was not delivered before it is skipped (P7 §9.2) — the tree
+    /// changing between the two runs aside, as it may during one.
+    #[must_use]
+    pub fn resume_from(mut self, checkpoint: Checkpoint) -> Self {
+        self.resume_from = Some(checkpoint);
+        self
+    }
+
     /// Whether a directory at `depth` (direct children of the traversal root are 1) may be
     /// listed under `max_depth`.
     #[must_use]
@@ -418,6 +463,9 @@ pub enum TraversalOutcome {
 pub enum TraversalTerminalFailure {
     Session(BackendSessionFailure),
     Internal,
+    /// The request cannot resume from its checkpoint, or cannot be resumable at all; returned
+    /// before any I/O.
+    Resume(ResumeRefusal),
 }
 
 impl fmt::Display for TraversalTerminalFailure {
@@ -425,6 +473,7 @@ impl fmt::Display for TraversalTerminalFailure {
         match self {
             Self::Session(error) => error.fmt(formatter),
             Self::Internal => formatter.write_str("traversal runtime failed"),
+            Self::Resume(refusal) => write!(formatter, "cannot resume the traversal: {refusal}"),
         }
     }
 }
@@ -439,6 +488,8 @@ pub struct TraversalSession {
     items: channel::ItemReceiver,
     completion: oneshot::Receiver<Result<TraversalOutcome, TraversalTerminalFailure>>,
     cancel: CancellationToken,
+    /// Cancellation drains rather than drops (a resumable traversal, [`Resumable::On`]).
+    drain_on_cancel: bool,
     exhausted: bool,
 }
 
@@ -477,7 +528,7 @@ impl TraversalSession {
                 items: item_tx,
                 completion: Some(completion_tx),
             },
-            Self::new(item_rx, completion_rx, cancel),
+            Self::new(item_rx, completion_rx, cancel, false),
         )
     }
 
@@ -485,17 +536,30 @@ impl TraversalSession {
         items: channel::ItemReceiver,
         completion: oneshot::Receiver<Result<TraversalOutcome, TraversalTerminalFailure>>,
         cancel: CancellationToken,
+        drain_on_cancel: bool,
     ) -> Self {
         Self {
             items,
             completion,
             cancel,
+            drain_on_cancel,
             exhausted: false,
         }
     }
 
     /// Receives the next ordered item with consumer-driven backpressure.
+    ///
+    /// Once the traversal is cancelled this returns `None` at once, dropping whatever was
+    /// buffered — unless the traversal emits checkpoints ([`Resumable::On`]): then it keeps
+    /// returning what the traversal had produced, its final [`TraversalItem::Checkpoint`] last
+    /// (see [`Resumable::On`] for when there is none), and then `None`, so that everything before
+    /// the checkpoint reached the consumer.
     pub async fn next_item(&mut self) -> Option<TraversalItem> {
+        if self.drain_on_cancel {
+            let item = self.items.recv().await;
+            self.exhausted |= item.is_none();
+            return item;
+        }
         let item = tokio::select! {
             biased;
             () = self.cancel.cancelled() => {

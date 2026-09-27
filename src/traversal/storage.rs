@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use tokio::sync::oneshot;
 
@@ -14,8 +15,8 @@ use super::{
     TraversalVersions, relative_to,
 };
 use crate::model::{
-    BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, ObservationMode,
-    ObservationPlan, ObservedEntry, Operation, StoragePath, Transience,
+    BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass,
+    ObservationMode, ObservationPlan, ObservedEntry, Operation, StoragePath, Transience,
 };
 use crate::storage::{
     CapabilityUnavailable, DescentHint, Metadata, Namespace, PreflightPolicy, SourceDescriptor,
@@ -28,6 +29,7 @@ mod observe;
 mod output;
 #[cfg(test)]
 mod residency;
+mod resume;
 mod stream;
 mod unordered;
 
@@ -36,6 +38,9 @@ use observe::Observations;
 use output::{ChildDescent, ChildItem};
 #[cfg(test)]
 use residency::ResidencyPeak;
+#[cfg(test)]
+pub(crate) use resume::ManualClock;
+use resume::{Clock, Resume};
 
 /// The driver's handle on the residency probe.
 ///
@@ -51,6 +56,22 @@ struct Probe {
     /// Observation tasks the traversal started, for the tests that count hand-offs.
     #[cfg(test)]
     observers: Option<Arc<ObserverCounts>>,
+    /// The clock a resumable traversal reads instead of the system's.
+    #[cfg(test)]
+    clock: Option<Arc<ManualClock>>,
+}
+
+impl Probe {
+    /// The clock a traversal with checkpoints on reads: the system's, or a test's. A method (the
+    /// probe is what tests configure a source with) whose receiver only tests read.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn clock(&self) -> Clock {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return Clock::Manual(Arc::clone(clock));
+        }
+        Clock::System(Instant::now())
+    }
 }
 
 #[cfg(test)]
@@ -81,6 +102,8 @@ struct ObserverCounts {
 pub struct StorageTraversalSource {
     namespace: Arc<dyn Namespace>,
     metadata: Arc<dyn Metadata>,
+    /// Which storage this is, for the checkpoints a resumable traversal binds to it.
+    identity: BackendIdentity,
     probe: Probe,
 }
 
@@ -94,6 +117,7 @@ impl StorageTraversalSource {
         Ok(Self {
             namespace: storage.namespace(&policy)?,
             metadata: storage.metadata(&policy)?,
+            identity: storage.identity().clone(),
             probe: Probe::default(),
         })
     }
@@ -103,8 +127,23 @@ impl StorageTraversalSource {
         Self {
             namespace,
             metadata,
+            identity: crate::storage::backends::local::test_identity("traversal-test"),
             probe: Probe::default(),
         }
+    }
+
+    /// This source, reading `clock` instead of the system's when checkpoints are on.
+    #[cfg(test)]
+    pub(crate) fn clocked(mut self, clock: &Arc<ManualClock>) -> Self {
+        self.probe.clock = Some(Arc::clone(clock));
+        self
+    }
+
+    /// This source, as another storage with the same roles: its checkpoints are another's.
+    #[cfg(test)]
+    pub(crate) fn identified(mut self, identity: BackendIdentity) -> Self {
+        self.identity = identity;
+        self
     }
 
     /// Same as [`Self::with_roles`], plus the handle the driver records residency into.
@@ -141,13 +180,19 @@ impl StorageTraversalSource {
     }
 }
 
-/// A session that ends at once, before any I/O, with an `Unsupported` session failure: the
-/// request asked for every version of a source that keeps none. Returning its current entries
-/// instead would let a history migration believe it saw every version.
-fn refuse_versions(request: &TraversalRequest) -> TraversalSession {
+/// A session that ends at once, before any I/O, with `failure`.
+fn refuse(request: &TraversalRequest, failure: TraversalTerminalFailure) -> TraversalSession {
     let (producer, session) =
         TraversalSession::bounded(request.max_buffered_items, request.cancel.clone());
-    let failure = match BackendSessionFailure::new(
+    producer.finish(Err(failure));
+    session
+}
+
+/// The request asked for every version of a source that keeps none: an `Unsupported` session
+/// failure. Returning its current entries instead would let a history migration believe it saw
+/// every version.
+fn versions_unsupported() -> TraversalTerminalFailure {
+    match BackendSessionFailure::new(
         Operation::Traverse,
         FailureClass::Unsupported,
         Transience::Permanent,
@@ -155,38 +200,35 @@ fn refuse_versions(request: &TraversalRequest) -> TraversalSession {
     ) {
         Ok(failure) => TraversalTerminalFailure::Session(failure),
         Err(_) => TraversalTerminalFailure::Internal,
-    };
-    producer.finish(Err(failure));
-    session
+    }
 }
 
 impl TraversalSource for StorageTraversalSource {
     fn traverse(&self, request: TraversalRequest) -> TraversalSession {
         if request.versions == TraversalVersions::All && !self.supports_versions() {
-            return refuse_versions(&request);
+            return refuse(&request, versions_unsupported());
         }
+        let resume = match Resume::prepare(&request, &self.identity, || self.probe.clock()) {
+            Ok(resume) => resume,
+            Err(refusal) => return refuse(&request, TraversalTerminalFailure::Resume(refusal)),
+        };
+        let drain_on_cancel = resume.as_ref().is_some_and(Resume::emits);
         let (item_tx, item_rx) = channel::channel(request.max_buffered_items);
         let (completion_tx, completion_rx) = oneshot::channel();
         let cancel = request.cancel.clone();
         let (namespace, metadata) = (Arc::clone(&self.namespace), Arc::clone(&self.metadata));
         let probe = self.probe.clone();
-        match request.order {
+        let order = request.order;
+        let shared = Arc::new(Shared::new(namespace, metadata, request, resume));
+        match order {
             TraversalOrder::Unordered => {
-                let shared = Arc::new(Shared::new(namespace, metadata, request));
                 tokio::spawn(unordered::run(shared, item_tx, completion_tx, probe));
             }
             TraversalOrder::Blocks => {
-                tokio::spawn(blocks::run(
-                    namespace,
-                    metadata,
-                    request,
-                    item_tx,
-                    completion_tx,
-                    probe,
-                ));
+                tokio::spawn(blocks::run(shared, item_tx, completion_tx, probe));
             }
         }
-        TraversalSession::new(item_rx, completion_rx, cancel)
+        TraversalSession::new(item_rx, completion_rx, cancel, drain_on_cancel)
     }
 }
 
@@ -287,6 +329,9 @@ struct Shared {
     /// Most listings started ahead of the cursor and not yet ended, when a parked listing holds a
     /// server resource ([`Namespace::parked_listing_limit`]).
     parked_listing_limit: Option<usize>,
+    /// Checkpoints and where to resume from, when the request asks for either; `None` costs
+    /// nothing (P7 §9.1).
+    resume: Option<Resume>,
 }
 
 impl Shared {
@@ -294,6 +339,7 @@ impl Shared {
         namespace: Arc<dyn Namespace>,
         metadata: Arc<dyn Metadata>,
         request: TraversalRequest,
+        resume: Option<Resume>,
     ) -> Self {
         let parked_listing_limit = namespace.parked_listing_limit().map(NonZeroUsize::get);
         Self {
@@ -304,6 +350,7 @@ impl Shared {
             tickets: AtomicU64::new(0),
             root_object_reported: AtomicBool::new(false),
             parked_listing_limit,
+            resume,
         }
     }
 }

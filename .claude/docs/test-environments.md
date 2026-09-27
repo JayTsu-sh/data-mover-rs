@@ -152,6 +152,13 @@
 - m1-source：均匀 20 叉 5 层，3,368,421 目录 / 53,368,420 条，性能基线见 memory `m1-source-nfs-lab` 与 P7 设计 §12.7。
 - SMB `smb://10.131.5.221/m1-source`：guest 空密码 legacy 与 role-based 都登不上（客户端问题，待查）。
 
+## 3.4 扫描续扫矩阵（P7 C11）
+
+`.claude/skills/_shared/traversal_resume.sh`：同一次遍历先完整跑一遍，再“取消 → 从最终检查点续扫”循环到完成
+（`MODE=kill` 为 SIGKILL + 周期检查点，模拟崩溃），比对并集与完整运行的条目集合，报重复条数与检查点大小。
+环境变量同各 backend 的例子（`NFS_REAL_URL` / `CIFS_REAL_*` / `S3_LISTING_URL`）；只读遍历，不写。HDFS 走
+`tests/hdfs_architecture_contract.rs` 的 `architecture_traversal_resumes_after_cancel`（runner VM 102，运行根内播种、测后删除）。
+
 ## 4. 通用规则
 
 - 每个测试命令都包 `timeout`（用户规则）。

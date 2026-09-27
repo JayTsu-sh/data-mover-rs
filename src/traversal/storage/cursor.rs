@@ -39,6 +39,7 @@ use super::observe::{Feed, Observations};
 use super::output::BlockFacts;
 #[cfg(test)]
 use super::residency::Residency;
+use super::resume::positions::{Level, Positions};
 use super::stream::{self, Arrival, ArrivalSender, Batch, Child, ListingId, Slot};
 use crate::model::{EntryOperationFailure, FailureClass, StoragePath};
 use crate::storage::DescentHint;
@@ -138,6 +139,8 @@ struct Frame {
     feed: Option<Feed>,
     /// Whether the block's end has been queued.
     closed: bool,
+    /// Where this directory is on the path from the root, when positions are recorded.
+    level: Option<Arc<Level>>,
 }
 
 impl Frame {
@@ -148,6 +151,19 @@ impl Frame {
             children: VecDeque::new(),
             feed: None,
             closed: false,
+            level: None,
+        }
+    }
+
+    /// An ancestor a resumed traversal listed again: its block was delivered before, and `slots`
+    /// are the subdirectories it still descends into, in descent order.
+    fn closed_with(id: ListingId, work: DirectoryWork, slots: Vec<DirectoryWork>) -> Self {
+        let mut listing = Listing::new(Arc::new(Semaphore::new(0)));
+        listing.slots = slots.into_iter().map(Slot::Descend).collect();
+        Self {
+            listing: Some((id, listing)),
+            closed: true,
+            ..Self::new(work)
         }
     }
 
@@ -170,6 +186,8 @@ pub(super) struct Cursor {
     next_id: ListingId,
     /// Listings whose task has not ended.
     live: usize,
+    /// Where a resumed traversal would start, by output sequence; only with checkpoints on.
+    positions: Option<Positions>,
 }
 
 /// What to do with the top frame once its block has closed.
@@ -181,16 +199,87 @@ enum Next {
 }
 
 impl Cursor {
-    pub(super) fn new(root: DirectoryWork, sender: ArrivalSender) -> Self {
+    /// A cursor at the traversal root. `record`: checkpoints are on, so positions are recorded,
+    /// the root's first, at sequence 0.
+    pub(super) fn new(root: DirectoryWork, sender: ArrivalSender, record: bool) -> Self {
+        let mut cursor = Self::empty(sender);
+        let mut frame = Frame::new(root);
+        if record {
+            let level = Level::enter(None, &frame.work);
+            let mut positions = Positions::default();
+            positions.record(0, Some(Arc::clone(&level)));
+            frame.level = Some(level);
+            cursor.positions = Some(positions);
+        }
+        cursor.stack.push(frame);
+        cursor
+    }
+
+    /// A cursor at a resumed Blocks position: `ancestors` listed again (each with its level on the
+    /// chain, and the subdirectories it still descends into), then `top`, whose block comes next.
+    /// `positions` is the resumed position, recorded at sequence 0.
+    pub(super) fn resumed(
+        sender: ArrivalSender,
+        ancestors: Vec<(DirectoryWork, Vec<DirectoryWork>, Option<Arc<Level>>)>,
+        top: Option<(DirectoryWork, Option<Arc<Level>>)>,
+        positions: Option<Positions>,
+    ) -> Self {
+        let mut cursor = Self::empty(sender);
+        for (work, slots, level) in ancestors {
+            let id = cursor.take_id();
+            let mut frame = Frame::closed_with(id, work, slots);
+            frame.level = level;
+            cursor.stack.push(frame);
+        }
+        if let Some((work, level)) = top {
+            let mut frame = Frame::new(work);
+            frame.level = level;
+            cursor.stack.push(frame);
+        }
+        cursor.positions = positions;
+        cursor
+    }
+
+    fn empty(sender: ArrivalSender) -> Self {
         Self {
-            stack: vec![Frame::new(root)],
+            stack: Vec::new(),
             decisions: HashMap::new(),
             started: HashMap::new(),
             by_path: HashMap::new(),
             sender,
             next_id: 0,
             live: 0,
+            positions: None,
         }
+    }
+
+    const fn take_id(&mut self) -> ListingId {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        id
+    }
+
+    /// The recorded positions, when checkpoints are on.
+    pub(super) const fn positions_mut(&mut self) -> Option<&mut Positions> {
+        self.positions.as_mut()
+    }
+
+    /// The recorded positions, once the traversal is over.
+    pub(super) fn into_positions(self) -> Option<Positions> {
+        self.positions
+    }
+
+    /// Enters `work`: its frame goes on the stack and, with checkpoints on, the position from
+    /// which everything the cursor admits from now on would be admitted again is recorded.
+    fn enter(&mut self, work: DirectoryWork, state: &State) {
+        let mut frame = Frame::new(work);
+        let parent = self.stack.last().and_then(|frame| frame.level.clone());
+        if let Some(positions) = self.positions.as_mut() {
+            let level = Level::enter(parent.as_ref(), &frame.work);
+            positions.record(state.next_sequence(), Some(Arc::clone(&level)));
+            frame.level = Some(level);
+        }
+        self.stack.push(frame);
     }
 
     /// Whether any listing's task may still hand something over.
@@ -285,8 +374,7 @@ impl Cursor {
     }
 
     fn spawn(&mut self, runtime: &Runtime<'_>, work: DirectoryWork) {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
+        let id = self.take_id();
         let path = work.path.clone();
         let credit = stream::spawn(runtime.shared, id, work, &self.sender);
         self.by_path.insert(path, id);
@@ -336,6 +424,10 @@ impl Cursor {
         loop {
             let below_root = self.stack.len() > 1;
             let Some(frame) = self.stack.last_mut() else {
+                // Nothing is left to do from the end on.
+                if let Some(positions) = self.positions.as_mut() {
+                    positions.record(state.next_sequence(), None);
+                }
                 return Ok(Step::Done);
             };
             if frame.closed {
@@ -343,7 +435,7 @@ impl Cursor {
                     Next::Pop => {
                         self.stack.pop();
                     }
-                    Next::Descend(work) => self.stack.push(Frame::new(work)),
+                    Next::Descend(work) => self.enter(work, state),
                     Next::Skip => {}
                     Next::Wait => return Ok(Step::WaitObservation),
                 }

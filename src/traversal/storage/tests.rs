@@ -491,6 +491,8 @@ mod order;
 mod pages;
 mod prefetch;
 mod residency;
+mod resume;
+mod resume_blocks;
 mod slots;
 mod streaming;
 mod streaming_bounds;

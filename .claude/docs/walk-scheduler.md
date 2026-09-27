@@ -103,9 +103,22 @@ impl<T> AsyncReceiver<T> {
 | 终止 | `active_tasks` + `active_producers` 两个计数都为 0 | 一个 `outstanding`：子目录入栈前 `fetch_add`，父目录全部子目录入栈后才 `fetch_sub`；减到 0 的 worker 取消 `halt` |
 | 唤醒 | 每次 push `notify_waiters()` (不存 permit，会丢) + 100 µs 超时兜底 | 只在有空闲 worker 时 `notify_one()`；空闲登记与压栈两侧 SeqCst fence，不会丢；窃取后受害者有剩余则级联再唤醒一个；没有超时轮询 |
 | 窃取 | 依次锁邻居，偷 FIFO 头 | 读各槽位发布的 `front_depth` 挑最浅的，只锁它与自己 (按下标序)，出栈与登记 `active` 同一临界区 |
-| 前沿 | 无 | 每个未完成目录任何时刻都在某槽位的栈上或 `active` 里 (C11 检查点的前提；`#[cfg(test)]` 下每次出栈 / 窃取都断言) |
+| 前沿 | 无 | 每个未完成目录任何时刻都在某槽位的栈上或 `active` 里 (C11 检查点的前提；测试构建下每把槽位锁都经 `pool/checked.rs` 的 `SlotGuard`，线程放开最后一把时锁全部槽位核对，出栈 / 窃取拆成两个临界区必然失败) |
 | 输出 | 每条目一次 channel send | 每页一批 (`traversal/channel.rs`)，按条计的背压；目录的 Entry 所在批交出后才压它的子目录 |
 | 列举中的资源 | — | worker 等消费方时列举一直开着：K ≤ `parked_listing_limit` (CIFS 8) |
 
 故障注入 (P7 C10，全部变红)：`fetch_sub` 提前、窃取先出栈后登记、自己出栈后才登记、K 不受停车上限约束、
 先压栈后交批 等，见设计 §14 C10 行。
+
+## 续扫检查点 (P7 C11)
+
+`TraversalRequest::resumable(Resumable::On { every })` 时 (`src/traversal/checkpoint.rs` 编解码与指纹，
+`src/traversal/storage/resume.rs` + `resume/{positions,relist,blocks}.rs`)：
+
+- **Unordered**：worker 每页压栈后、每个目录 finish 后看一次是否到期 (一个 CAS 认领一个周期)，到期就
+  `Pool::snapshot` —— 按下标序锁住全部槽位拷出栈 + `active`，不暂停 worker —— 去掉祖先也在前沿里的目录后编码发出。
+  取消 / 失败时 join 全部 worker 后取最终前沿，作为会话最后一项。续扫时前沿作为种子放进 0 号槽位。
+- **Blocks**：游标每进入一个目录记 (块开始的序号, 位置链)；检查点取序号 ≤ `Output::delivered` 的最新一条。
+  续扫先把链上祖先重列一遍 (不发出，只留名字大于下一环的子目录)，再照常驱动。
+- Off 时 `Shared::resume` 为 `None`：不读时钟、不记位置、不取快照，每页 / 每轮一次 `Option` 判断。
+- 设计与不变式见 P7 设计 §9.3。

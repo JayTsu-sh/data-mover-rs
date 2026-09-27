@@ -12,9 +12,8 @@ use super::cursor::{Cursor, Decisions, Step};
 use super::observe::{Feed, Job, Listed, Observations, Observed};
 use super::output::{BlockFacts, ChildItem, Output, Settled};
 use super::stream::{self, Arrivals};
-use super::{Probe, Resolved, Shared, resolve, root_work};
+use super::{Probe, Resolved, Shared, resolve, resume};
 use crate::model::StoragePath;
-use crate::storage::{Metadata, Namespace};
 use crate::traversal::channel::ItemSender;
 use crate::traversal::{
     ScanFailure, TraversalCompletion, TraversalItem, TraversalOutcome, TraversalRequest,
@@ -26,7 +25,7 @@ use crate::traversal::{
 /// in that order is [`Output`]'s job.
 pub(super) struct State {
     next_sequence: u64,
-    output: Output,
+    pub(super) output: Output,
 }
 
 impl State {
@@ -47,6 +46,11 @@ impl State {
         usize::try_from(self.next_sequence.saturating_sub(self.output.next())).unwrap_or(usize::MAX)
     }
 
+    /// The sequence the next slot will get.
+    pub(super) const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
     pub(super) fn allocate(&mut self) -> Result<u64, TraversalTerminalFailure> {
         let sequence = self.next_sequence;
         self.next_sequence = sequence
@@ -63,32 +67,46 @@ pub(super) struct Runtime<'a> {
 }
 
 pub(super) async fn run(
-    namespace: Arc<dyn Namespace>,
-    metadata: Arc<dyn Metadata>,
-    request: TraversalRequest,
+    shared: Arc<Shared>,
     items: ItemSender,
     completion: oneshot::Sender<Result<TraversalOutcome, TraversalTerminalFailure>>,
     probe: Probe,
 ) {
+    let terminal = traverse(&shared, &items, &probe).await;
+    drop(items);
+    let _ = completion.send(terminal);
+}
+
+/// Drives the traversal to its end and returns its outcome; a traversal with checkpoints on that
+/// did not complete sends its final checkpoint first.
+async fn traverse(
+    shared: &Arc<Shared>,
+    items: &ItemSender,
+    probe: &Probe,
+) -> Result<TraversalOutcome, TraversalTerminalFailure> {
     let mut state = State::new();
     let (sender, mut arrivals) = mpsc::unbounded_channel();
-    let mut cursor = Cursor::new(root_work(&request), sender);
     let mut observations = Observations::new();
-    let shared = Arc::new(Shared::new(namespace, metadata, request));
     let runtime = Runtime {
-        shared: &shared,
+        shared,
         request: &shared.request,
-        items: &items,
+        items,
     };
-    let result = drive(
-        &runtime,
-        &mut cursor,
-        &mut arrivals,
-        &mut observations,
-        &mut state,
-        &probe,
-    )
-    .await;
+    let mut cursor = resume::blocks::start(&runtime, &mut state, sender).await;
+    let result = match cursor.as_mut() {
+        Ok(cursor) => {
+            drive(
+                &runtime,
+                cursor,
+                &mut arrivals,
+                &mut observations,
+                &mut state,
+                probe,
+            )
+            .await
+        }
+        Err(failure) => Err(failure.clone()),
+    };
     #[cfg(test)]
     probe.record_observers(&observations);
     // Never abort a backend operation: it may hold an open handle between two awaits (a CIFS
@@ -100,17 +118,26 @@ pub(super) async fn run(
     // tells every listing's task the traversal is gone, and each drops its stream, which ends
     // the backend's producer through its own close path.
     observations.detach();
-    drop(cursor);
+    let positions = cursor.ok().and_then(Cursor::into_positions);
     drop(arrivals);
-    drop(items);
-    let request = &shared.request;
-    let terminal = if request.cancel.is_cancelled() {
-        Ok(TraversalOutcome::Cancelled)
-    } else {
-        result
-            .map(|()| TraversalOutcome::Completed(TraversalCompletion::new(state.output.totals())))
-    };
-    let _ = completion.send(terminal);
+    let terminal = outcome(&runtime, result, &state);
+    if !matches!(terminal, Ok(TraversalOutcome::Completed(_))) {
+        let delivered = state.output.delivered();
+        resume::blocks::final_checkpoint(&runtime, positions.as_ref(), delivered).await;
+    }
+    terminal
+}
+
+/// How the traversal ended: cancelled, failed, or completed with what it counted.
+fn outcome(
+    runtime: &Runtime<'_>,
+    result: Result<(), TraversalTerminalFailure>,
+    state: &State,
+) -> Result<TraversalOutcome, TraversalTerminalFailure> {
+    if runtime.request.cancel.is_cancelled() {
+        return Ok(TraversalOutcome::Cancelled);
+    }
+    result.map(|()| TraversalOutcome::Completed(TraversalCompletion::new(state.output.totals())))
 }
 
 /// Advances the cursor as far as it can, emits what is ready, then waits for whatever the
@@ -152,6 +179,7 @@ async fn drive(
             peak.record(cursor.residency());
         }
         state.output.flush(runtime).await?;
+        resume::blocks::checkpoint_if_due(runtime, cursor, &state.output).await;
         match step {
             Step::Done if observations.is_idle() => return Ok(()),
             // Nothing in flight means every admitted entry has settled, so the flush above

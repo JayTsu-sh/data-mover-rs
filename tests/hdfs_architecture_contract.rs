@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::time::Duration;
 
 use bytes::Bytes;
 use data_mover::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
@@ -11,7 +13,8 @@ use data_mover::storage::{
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
-    StorageTraversalSource, TraversalItem, TraversalRequest, TraversalSource as _,
+    Checkpoint, Resumable, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome,
+    TraversalRequest, TraversalSource as _,
 };
 use data_mover::{
     DataChunk, HDFSStorage, HdfsConfig, HdfsKerberosCredentials, HdfsLocation, TransferConcurrency,
@@ -333,4 +336,144 @@ async fn publish_recovered(
         .await
         .map(|_| ())
         .map_err(|failure| failure.error)
+}
+
+/// P7 C11 on the lab cluster, in both orders: a traversal cancelled again and again, each time
+/// resumed from its final checkpoint, delivers together exactly what one uninterrupted traversal
+/// does; so does resuming from checkpoints taken part way, as after a crash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the nightly lab HDFS cluster"]
+async fn architecture_traversal_resumes_after_cancel() -> TestResult {
+    let hdfs = create_hdfs_storage(
+        &lab_location("traversal-resume")?,
+        &lab_config(),
+        None,
+        true,
+    )
+    .await?;
+    let checked = async {
+        seed_resume_tree(&hdfs).await?;
+        let roles = hdfs.architecture_storage()?;
+        let source = StorageTraversalSource::new(&roles)?;
+        for order in [TraversalOrder::Unordered, TraversalOrder::Blocks] {
+            resume_chain(&source, order).await?;
+            resume_from_part_way(&source, order).await?;
+        }
+        TestResult::Ok(())
+    }
+    .await;
+    hdfs.delete_storage_root().await?;
+    checked
+}
+
+/// 18 directories of 8 files, a 10-level chain and a directory of 60 files.
+async fn seed_resume_tree(hdfs: &HDFSStorage) -> TestResult {
+    for top in 0..6 {
+        for sub in 0..3 {
+            let dir = format!("a{top}/s{sub}");
+            hdfs.create_dir_all(Path::new(&dir), 0o755).await?;
+            for file in 0..8 {
+                create_file(hdfs, &format!("{dir}/f{file}"), Bytes::from_static(b"x")).await?;
+            }
+        }
+    }
+    hdfs.create_dir_all(Path::new(&format!("chain{}", "/c".repeat(10))), 0o755)
+        .await?;
+    hdfs.create_dir_all(Path::new("wide"), 0o755).await?;
+    for file in 0..60 {
+        create_file(hdfs, &format!("wide/w{file:02}"), Bytes::new()).await?;
+    }
+    Ok(())
+}
+
+/// Every entry path a traversal delivered, its checkpoints in order, and how it ended.
+type Traversed = (Vec<String>, Vec<(usize, Checkpoint)>, TraversalOutcome);
+
+async fn traverse_resumable(
+    source: &StorageTraversalSource,
+    request: TraversalRequest,
+    cancel_after: Option<usize>,
+) -> TestResult<Traversed> {
+    let cancel = request.cancel.clone();
+    let mut session = source.traverse(request);
+    let (mut entries, mut checkpoints) = (Vec::new(), Vec::new());
+    while let Some(item) = session.next_item().await {
+        match item {
+            TraversalItem::Entry(entry) => entries.push(entry.path().as_str().to_owned()),
+            TraversalItem::Checkpoint(checkpoint) => checkpoints.push((entries.len(), *checkpoint)),
+            _ => {}
+        }
+        if cancel_after == Some(entries.len()) {
+            cancel.cancel();
+        }
+    }
+    Ok((entries, checkpoints, session.finish().await?))
+}
+
+fn traversal_request(order: TraversalOrder) -> TestResult<TraversalRequest> {
+    let slots = NonZeroUsize::new(8).ok_or("zero")?;
+    Ok(TraversalRequest::new(StoragePath::root())
+        .order(order)
+        .max_inflight_operations(slots)
+        .max_buffered_items(slots))
+}
+
+async fn resume_chain(source: &StorageTraversalSource, order: TraversalOrder) -> TestResult {
+    let (full, _, _) = traverse_resumable(source, traversal_request(order)?, None).await?;
+    let full: BTreeSet<String> = full.into_iter().collect();
+    let (mut delivered, mut from, mut rounds) = (Vec::new(), None::<Checkpoint>, 0);
+    loop {
+        rounds += 1;
+        assert!(rounds < 100, "{order:?}: no progress");
+        let mut request = traversal_request(order)?.resumable(Resumable::on());
+        if let Some(checkpoint) = from.take() {
+            request = request.resume_from(checkpoint);
+        }
+        let (entries, checkpoints, outcome) = traverse_resumable(source, request, Some(90)).await?;
+        delivered.extend(entries);
+        if matches!(outcome, TraversalOutcome::Completed(_)) {
+            break;
+        }
+        from = Some(checkpoints.last().ok_or("no final checkpoint")?.1.clone());
+    }
+    let union: BTreeSet<String> = delivered.iter().cloned().collect();
+    assert_eq!(union, full, "{order:?}");
+    println!(
+        "RESULT chain {order:?}: rounds={rounds} full={} delivered={} duplicates={}",
+        full.len(),
+        delivered.len(),
+        delivered.len() - full.len()
+    );
+    Ok(())
+}
+
+async fn resume_from_part_way(
+    source: &StorageTraversalSource,
+    order: TraversalOrder,
+) -> TestResult {
+    let every = Resumable::On {
+        every: Duration::ZERO,
+    };
+    let (full, checkpoints, _) =
+        traverse_resumable(source, traversal_request(order)?.resumable(every), None).await?;
+    let all: BTreeSet<String> = full.iter().cloned().collect();
+    let step = (checkpoints.len() / 8).max(1);
+    let mut largest = 0;
+    for (at, checkpoint) in checkpoints.iter().step_by(step) {
+        largest = largest.max(checkpoint.as_bytes().len());
+        let request = traversal_request(order)?.resume_from(checkpoint.clone());
+        let (resumed, _, outcome) = traverse_resumable(source, request, None).await?;
+        assert!(matches!(outcome, TraversalOutcome::Completed(_)));
+        let union: BTreeSet<String> = full[..*at].iter().chain(&resumed).cloned().collect();
+        assert_eq!(
+            union, all,
+            "{order:?} from the checkpoint after {at} entries"
+        );
+    }
+    println!(
+        "RESULT part-way {order:?}: checkpoints={} resumed-from={} largest={largest} bytes",
+        checkpoints.len(),
+        checkpoints.len().div_ceil(step)
+    );
+    Ok(())
 }

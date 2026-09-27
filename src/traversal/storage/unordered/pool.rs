@@ -107,20 +107,22 @@ pub(super) struct Pool {
 }
 
 impl Pool {
-    /// A pool of `workers` slots, the first holding `root`.
-    pub(super) fn new(workers: usize, root: DirectoryWork) -> Self {
+    /// A pool of `workers` slots, the first holding `seeds` — the traversal root, or a resumed
+    /// traversal's frontier, shallowest first so thieves take the largest subtrees.
+    pub(super) fn new(workers: usize, seeds: Vec<DirectoryWork>) -> Self {
         let slots: Box<[Slot]> = (0..workers.max(1)).map(|_| Slot::new()).collect();
-        let root = Arc::new(root);
+        let count = seeds.len();
+        let seeds: VecDeque<Arc<DirectoryWork>> = seeds.into_iter().map(Arc::new).collect();
         #[cfg(test)]
-        let unfinished = Unfinished::of(&root);
+        let unfinished = Unfinished::of(seeds.iter());
         if let Some(first) = slots.first() {
             let mut state = first.state.lock();
-            state.stack.push_back(root);
+            state.stack = seeds;
             first.publish(&state);
         }
         Self {
             slots,
-            outstanding: AtomicUsize::new(1),
+            outstanding: AtomicUsize::new(count),
             idle: AtomicUsize::new(0),
             wake: Notify::new(),
             rotor: AtomicUsize::new(0),
@@ -299,18 +301,32 @@ impl Pool {
         self.failure.lock().clone()
     }
 
-    /// Every directory not yet finished, as held by the slots with every slot locked at once, in
-    /// index order (the order a steal takes two of them in): stacks and active directories. What
-    /// a resumable traversal's checkpoint records (P7 §9.2); a directory moving between two slots
-    /// may appear twice, never not at all.
+    /// Every directory not yet finished, as held by the slots with every slot locked at once (in
+    /// index order, the order a steal takes two of them in): what a resumable traversal's
+    /// checkpoint records (P7 §9.2). `None`, before anything is copied, when more than `cap` are
+    /// held. The workers are held up only while the slots are copied, never paused.
+    pub(super) fn snapshot(&self, cap: usize) -> Option<Vec<Arc<DirectoryWork>>> {
+        let guards: Vec<_> = self.slots.iter().map(|slot| slot.state.lock()).collect();
+        let held: usize = guards
+            .iter()
+            .map(|state| state.stack.len() + usize::from(state.active.is_some()))
+            .sum();
+        if held > cap {
+            return None;
+        }
+        Some(
+            guards
+                .iter()
+                .flat_map(|state| state.stack.iter().chain(state.active.iter()))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// Every directory not yet finished; see [`Self::snapshot`].
     #[cfg(test)]
     pub(super) fn frontier(&self) -> Vec<Arc<DirectoryWork>> {
-        let guards: Vec<_> = self.slots.iter().map(|slot| slot.state.lock()).collect();
-        guards
-            .iter()
-            .flat_map(|state| state.stack.iter().chain(state.active.iter()))
-            .cloned()
-            .collect()
+        self.snapshot(usize::MAX).unwrap_or_default()
     }
 }
 

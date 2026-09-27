@@ -19,7 +19,7 @@ use std::mem;
 use super::blocks::Runtime;
 use crate::model::StoragePath;
 use crate::traversal::{
-    BlockCounts, DirectoryListed, ListingOutcome, ScanTotals, TraversalItem,
+    BlockCounts, DirectoryListed, ListingOutcome, ScanFailure, ScanTotals, TraversalItem,
     TraversalTerminalFailure,
 };
 
@@ -119,6 +119,15 @@ pub(super) struct Output {
     /// listing failure can never close a block reported `Complete` (deletion-safety rule 2).
     listing: Option<ListingOutcome>,
     totals: ScanTotals,
+    /// Every slot below this was handed to the session: what a checkpoint may build on (P7 §9.2).
+    /// Unlike `next`, it moves only once a whole flush was sent, and stops for good once one was
+    /// cut short, since part of what `next` passed never reached the consumer.
+    delivered: u64,
+    /// A flush was cut short: `delivered` moves no more.
+    cut: bool,
+    /// The last item delivered closed a block (or nothing was delivered yet): a checkpoint sent
+    /// now lands between two blocks, never inside one or inside one object's versions.
+    between_blocks: bool,
 }
 
 impl Output {
@@ -130,7 +139,30 @@ impl Output {
             block: BlockCounts::new(),
             listing: None,
             totals: ScanTotals::new(),
+            delivered: 0,
+            cut: false,
+            between_blocks: true,
         }
+    }
+
+    /// Whether the last item delivered closed a block.
+    pub(super) const fn between_blocks(&self) -> bool {
+        self.between_blocks
+    }
+
+    /// Every slot below this one reached the session.
+    pub(super) const fn delivered(&self) -> u64 {
+        self.delivered
+    }
+
+    /// Counts what listing a resumed traversal's ancestors again found wrong: one listing failure
+    /// each (delivered on their own, never inside a block, so no block takes their outcome), and
+    /// the ones found gone.
+    pub(super) fn count_resumed(&mut self, failures: &[ScanFailure], vanished: u64) {
+        for outcome in failures.iter().filter_map(ScanFailure::listing_outcome) {
+            count_listing(&mut self.totals, outcome);
+        }
+        self.totals.vanished_listings = self.totals.vanished_listings.saturating_add(vanished);
     }
 
     /// The sequence still to be emitted. Everything below it has left the buffer.
@@ -180,10 +212,17 @@ impl Output {
             self.next += 1;
             batch.extend(item);
         }
-        if batch.is_empty() {
+        let Some(last) = batch.last() else {
             return Ok(());
+        };
+        let closes = matches!(last, TraversalItem::DirectoryListed(_));
+        if !emit(runtime, batch).await? {
+            self.cut = true;
+        } else if !self.cut {
+            self.delivered = self.next;
+            self.between_blocks = closes;
         }
-        emit(runtime, batch).await
+        Ok(())
     }
 
     /// Tallies one child against the block it belongs to.
@@ -275,18 +314,18 @@ pub(super) const fn count_listing(totals: &mut ScanTotals, outcome: ListingOutco
     }
 }
 
-/// Sends one batch. Cancellation winning the race ends the flush; a batch larger than the bound
-/// goes over in pieces, so some of it may have been sent by then, which does not matter: the
-/// traversal is ending.
+/// Sends one batch; `false` when cancellation won the race. A batch larger than the bound goes
+/// over in pieces, so some of it may have been sent by then: the traversal is ending, and what a
+/// checkpoint builds on stops short of this batch.
 async fn emit(
     runtime: &Runtime<'_>,
     batch: Vec<TraversalItem>,
-) -> Result<(), TraversalTerminalFailure> {
+) -> Result<bool, TraversalTerminalFailure> {
     tokio::select! {
         biased;
-        () = runtime.request.cancel.cancelled() => Ok(()),
+        () = runtime.request.cancel.cancelled() => Ok(false),
         result = runtime.items.send(batch) => {
-            result.map_err(|_| TraversalTerminalFailure::Internal)
+            result.map(|()| true).map_err(|_| TraversalTerminalFailure::Internal)
         }
     }
 }

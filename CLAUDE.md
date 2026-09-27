@@ -29,7 +29,7 @@
 | **新增/修改 `StorageEnum` 操作** | `.claude/docs/storage-enum-dispatch.md` + `src/storage_enum.rs` (1334 行) |
 | 改 filter DSL (lexer / `should_skip` 三元组) | `.claude/docs/filter-dsl.md` + `src/filter.rs` (4849 行) + `src/filter_traversal.rs` (role-based 适配器) |
 | 改 walk 调度 / work-stealing | `.claude/docs/walk-scheduler.md` + `src/walk_scheduler.rs` + `src/async_receiver.rs` |
-| 改 role-based 遍历 (filter / max_depth / inline 观察) | `src/traversal/{mod,storage}.rs` (唯一实现，`local_tests.rs` / `local_unordered_tests.rs` 用真文件系统测它) + 默认的 Unordered 调度器 `src/traversal/storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs` + 块序驱动 / 游标 / 逐页列举任务 `src/traversal/storage/{blocks,cursor,stream}.rs` + 按批的会话通道 `src/traversal/channel.rs` + 事件 / 计数 `src/traversal/{events,counts}.rs` + `src/filter_traversal.rs` + `examples/storage_role_operations/{main,traverse}.rs` |
+| 改 role-based 遍历 (filter / max_depth / inline 观察) | `src/traversal/{mod,storage}.rs` (唯一实现，`local_tests.rs` / `local_unordered_tests.rs` 用真文件系统测它) + 默认的 Unordered 调度器 `src/traversal/storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs` + 块序驱动 / 游标 / 逐页列举任务 `src/traversal/storage/{blocks,cursor,stream}.rs` + 按批的会话通道 `src/traversal/channel.rs` + 续扫检查点 `src/traversal/checkpoint.rs` (编解码 / 指纹) 与 `src/traversal/storage/resume.rs` + `resume/{positions,relist,blocks}.rs` (`local_resume_tests.rs` 真文件系统) + 事件 / 计数 `src/traversal/{events,counts}.rs` + `src/filter_traversal.rs` + `examples/storage_role_operations/{main,traverse}.rs` |
 | 改 S3 遍历 / 版本模式 (`TraversalVersions`) | `src/storage/backends/s3/{namespace,listing,history}.rs` + `src/traversal/s3_tests.rs` + `.claude/docs/storage-s3.md` "role-based 遍历与版本模式" + `.claude/skills/e2e-s3/scripts/traversal_versions.sh` |
 | 改 Local namespace 角色 (逐段不跟随 symlink) | `.claude/docs/storage-local.md` "Namespace 角色" + `src/storage/backends/local/namespace.rs` |
 | 改递归删除 | `src/storage/delete_tree.rs` (走 `Namespace` 角色，backend 无关) |
@@ -47,6 +47,7 @@
 | 写 commit / PR | `.claude/docs/conventions.md` |
 | 升级 smb-rs 依赖 (改 `smb-domain` rev) | `.claude/docs/storage-cifs.md` "升级 smb-rs 依赖" + `.claude/rules/storage-driver-conventions.md` D9 |
 | 跑某 backend 验证 / 选真机环境 | `.claude/docs/test-environments.md`（全部真机环境、写入范围、从哪跑） + `.claude/skills/e2e-{cifs,nfs,s3,local}/SKILL.md` |
+| 跑「扫描取消后续扫」矩阵 (任一 backend，P7 C11) | `.claude/skills/_shared/traversal_resume.sh` (`BIN= BACKEND= OUT=`) + `examples/storage_role_operations/` 的 `--checkpoint-every / --checkpoint-out / --resume-from / --cancel-after-*`；HDFS 用 `tests/hdfs_architecture_contract.rs` 的 `architecture_traversal_resumes_after_cancel` |
 | 跑「容器重启后续传」矩阵 (任一 backend) | `.claude/skills/_shared/resume_matrix.sh` (`DEST=<endpoint>`) + `examples/transfer_resume.rs`；背景见 `docs/adr/0006-destination-resident-recovery.md` |
 | 跑取消语义 / filter DSL 测试 | `.claude/skills/op-{cancel,filter-dsl}/SKILL.md` |
 | 跑全套 (无外部环境) | `.claude/skills/harness-run/SKILL.md` 或 `make ci` |

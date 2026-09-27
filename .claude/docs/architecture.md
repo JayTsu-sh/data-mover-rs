@@ -52,7 +52,7 @@ Storage (roles)
 以及把 `SourceDescriptor` 反拼成 `NdxEvent` 载荷要的 `EntryEnum::NAS`。
 
 `StorageTraversalSource` 有两种调度，由 `TraversalRequest.order` 选 (P7 §3)：**`Unordered` (默认，P7 C10)**
-见下文「遍历的三套处理逻辑」第一节之后的 Unordered 小节 (`storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs`)；
+见下文「遍历的三套处理逻辑」第一节之后的 Unordered 小节 (`storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs`)，续扫检查点见「一·六」；
 **`Blocks`** 的调度 (`src/traversal/storage/{blocks,cursor,stream,observe}.rs`，公共件在 `src/traversal/storage.rs`)：
 准入游标按"块"走深度优先 (`TraversalOrder::Blocks`) —— 一个目录的子项按列举顺序逐页连续输出，
 列举结束后按子目录名字节序依次下钻；序号只由游标分配，重排缓冲按序号输出，所以列举/观察乱序完成
@@ -232,6 +232,16 @@ legacy work-stealing 的调度形状 (§6.1)，放在 role 的列举 / 观察 / 
 - **会话通道按批** (`traversal/channel.rs`)：`mpsc::unbounded` 传 `Vec<TraversalItem>` + 按条计的信号量
   (`max_buffered_items` 个许可，批用完才还)。Blocks 的 flush 也是一次一批 (`send`，超过上限按上限切，单一发送方
   顺序不变)；Unordered 用 `send_whole` (超过上限就等整个上限空出来再整批发)。
+
+### 一·六、续扫检查点 (P7 C11，两种调度都有，默认关)
+
+`TraversalRequest::resumable(Resumable::On { every })` 时流里约每 `every` 一个 `TraversalItem::Checkpoint`，
+取消 / 会话失败时最后一项也是检查点 (此时取消不丢已产出的项，会话排空到检查点)；`resume_from(Checkpoint)`
+续扫，指纹 (storage、root、order、filter 键、`max_depth`、versions) 不符在任何 I/O 之前拒绝
+(`TraversalTerminalFailure::Resume`)。检查点记的是**还要列的目录**，不是见过的条目：Unordered 取 `Pool::snapshot`
+的前沿；Blocks 取序号 ≤ `Output::delivered` 的最新位置链，续扫时重列链上祖先 (不发出) 定出剩下的子目录。
+不求精确：前沿里的目录整块重列 (有重复、不丢)。编解码 `src/traversal/checkpoint.rs` (`DMTC` v1，golden 钉住)，
+调度侧 `src/traversal/storage/resume.rs` + `resume/{positions,relist,blocks}.rs`；设计 P7 §9.3。
 
 ### 二、admission cursor —— `Blocks` 模式 (P7 C4 起逐页)
 

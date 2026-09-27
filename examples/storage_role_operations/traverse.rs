@@ -1,9 +1,19 @@
 //! `traverse`: a filtered, depth-limited role-based traversal, printed one line per item (or
-//! counted, with `--quiet`).
+//! counted, with `--quiet`); with `--checkpoint-every` it checkpoints, `--resume-from` resumes,
+//! and `--cancel-after-*` cancels part way, so a script can check that a cancelled traversal and
+//! its resumption together deliver what one uninterrupted traversal does (P7 §9).
 
 use std::fmt::Write as _;
+use std::fs::{self, File};
+use std::io::{self, Write as _};
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 use data_mover::DslTraversalFilter;
 use data_mover::model::{
@@ -11,11 +21,21 @@ use data_mover::model::{
 };
 use data_mover::storage::Storage;
 use data_mover::traversal::{
-    BlockCounts, ScanTotals, StorageTraversalSource, TraversalItem, TraversalOrder,
-    TraversalOutcome, TraversalRequest, TraversalSource as _, TraversalVersions,
+    BlockCounts, Checkpoint, DirectoryListed, Resumable, ScanTotals, StorageTraversalSource,
+    TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest, TraversalSession,
+    TraversalSource as _, TraversalVersions,
 };
 
 use super::{Args, Command, Error};
+
+/// What a traversal delivered, for the summary line.
+#[derive(Default)]
+struct Tally {
+    entries: u64,
+    failures: u64,
+    checkpoints: u64,
+    snapshots: u64,
+}
 
 pub(super) async fn traverse(
     storage: &Storage,
@@ -23,8 +43,87 @@ pub(super) async fn traverse(
     command: &Command,
 ) -> Result<(), Error> {
     let Command::Traverse {
+        snapshot_bytes,
+        cancel_after_secs,
+        ..
+    } = command
+    else {
+        unreachable!("dispatched by the caller")
+    };
+    let request = traversal_request(args, command)?;
+    let cancel = request.cancel.clone();
+    if let Some(seconds) = cancel_after_secs {
+        let (cancel, after) = (cancel.clone(), Duration::try_from_secs_f64(*seconds)?);
+        tokio::spawn(async move {
+            sleep(after).await;
+            cancel.cancel();
+        });
+    }
+    let mut session = StorageTraversalSource::new(storage)?.traverse(request);
+    let tally = consume(&mut session, command, &cancel).await?;
+    let outcome = session.finish().await?;
+    summarize(storage, &tally, &outcome, *snapshot_bytes);
+    Ok(())
+}
+
+/// Takes every item of `session`, printing and counting it; cancels once
+/// `--cancel-after-entries` entries arrived, and keeps draining.
+async fn consume(
+    session: &mut TraversalSession,
+    command: &Command,
+    cancel: &CancellationToken,
+) -> Result<Tally, Error> {
+    let Command::Traverse {
         quiet,
         snapshot_bytes,
+        checkpoint_out,
+        cancel_after_entries,
+        ..
+    } = command
+    else {
+        unreachable!("dispatched by the caller")
+    };
+    let mut tally = Tally::default();
+    while let Some(item) = session.next_item().await {
+        match &item {
+            TraversalItem::Entry(entry) => {
+                tally.entries += 1;
+                if *snapshot_bytes {
+                    tally.snapshots += entry.encode_snapshot().as_bytes().len() as u64;
+                }
+                if !*quiet {
+                    print_entry(entry, command);
+                }
+                if *cancel_after_entries == Some(tally.entries) {
+                    cancel.cancel();
+                }
+            }
+            TraversalItem::Failure(failure) => {
+                tally.failures += 1;
+                eprintln!(
+                    "failure scope={:?} {} {:?}",
+                    failure.scope,
+                    failure.path,
+                    failure.failure.class()
+                );
+            }
+            TraversalItem::DirectoryListed(listed) if !*quiet => print_listed(listed),
+            TraversalItem::Checkpoint(checkpoint) => {
+                tally.checkpoints += 1;
+                if let Some(path) = checkpoint_out {
+                    save(path, checkpoint)?;
+                }
+            }
+            // `TraversalItem` is `#[non_exhaustive]`: a later item kind must not break this.
+            _ => {}
+        }
+    }
+    Ok(tally)
+}
+
+/// One line per entry, with what the flags ask for.
+fn print_entry(entry: &ObservedEntry, command: &Command) {
+    let Command::Traverse {
         sizes,
         identity,
         ownership,
@@ -34,78 +133,75 @@ pub(super) async fn traverse(
     else {
         unreachable!("dispatched by the caller")
     };
-    let mut session =
-        StorageTraversalSource::new(storage)?.traverse(traversal_request(args, command)?);
-    let (mut entries, mut failures, mut snapshots) = (0_u64, 0_u64, 0_u64);
-    while let Some(item) = session.next_item().await {
-        match &item {
-            TraversalItem::Entry(entry) => {
-                entries += 1;
-                if *snapshot_bytes {
-                    snapshots += entry.encode_snapshot().as_bytes().len() as u64;
-                }
-                if !*quiet {
-                    let identity = if *identity {
-                        identity_of(entry)
-                    } else {
-                        String::new()
-                    };
-                    let mut owner = if *ownership {
-                        ownership_of(entry)
-                    } else {
-                        String::new()
-                    };
-                    if *acl {
-                        owner.push_str(&acl_of(entry));
-                    }
-                    let size = if *sizes && entry.version().is_none() {
-                        entry
-                            .size()
-                            .map_or_else(|| " size=-".to_owned(), |size| format!(" size={size}"))
-                    } else {
-                        String::new()
-                    };
-                    println!(
-                        "{:?} {}{size}{}{identity}{owner}",
-                        entry.kind(),
-                        entry.path(),
-                        version_of(entry)
-                    );
-                }
-            }
-            TraversalItem::Failure(failure) => {
-                failures += 1;
-                eprintln!(
-                    "failure scope={:?} {} {:?}",
-                    failure.scope,
-                    failure.path,
-                    failure.failure.class()
-                );
-            }
-            TraversalItem::DirectoryListed(listed) if !*quiet => {
-                println!(
-                    "listed {} {:?} {}",
-                    listed.path,
-                    listed.outcome,
-                    block_counts(&listed.counts)
-                );
-            }
-            // `TraversalItem` is `#[non_exhaustive]`: a later item kind must not break this.
-            _ => {}
-        }
+    let identity = if *identity {
+        identity_of(entry)
+    } else {
+        String::new()
+    };
+    let mut owner = if *ownership {
+        ownership_of(entry)
+    } else {
+        String::new()
+    };
+    if *acl {
+        owner.push_str(&acl_of(entry));
     }
-    let outcome = session.finish().await?;
-    println!("entries={entries} failures={failures} outcome={outcome:?}");
-    if let TraversalOutcome::Completed(completion) = &outcome {
+    let size = if *sizes && entry.version().is_none() {
+        entry
+            .size()
+            .map_or_else(|| " size=-".to_owned(), |size| format!(" size={size}"))
+    } else {
+        String::new()
+    };
+    println!(
+        "{:?} {}{size}{}{identity}{owner}",
+        entry.kind(),
+        entry.path(),
+        version_of(entry)
+    );
+}
+
+fn print_listed(listed: &DirectoryListed) {
+    println!(
+        "listed {} {:?} {}",
+        listed.path,
+        listed.outcome,
+        block_counts(&listed.counts)
+    );
+}
+
+/// Replaces `path` with `checkpoint`. First the line `checkpoint bytes=<n>` goes out, after every
+/// entry printed before it: a script that dies at any point holds a file no newer than the last
+/// such line, so the entries printed before that line and a traversal resumed from the file
+/// together cover the tree (P7 §9.2) — the check `_shared/traversal_resume.sh` makes.
+fn save(path: &Path, checkpoint: &Checkpoint) -> Result<(), Error> {
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "checkpoint bytes={}", checkpoint.as_bytes().len())?;
+    stdout.flush()?;
+    drop(stdout);
+    let staged = path.with_extension("tmp");
+    let mut file = File::create(&staged)?;
+    file.write_all(checkpoint.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&staged, path)?;
+    Ok(())
+}
+
+fn summarize(storage: &Storage, tally: &Tally, outcome: &TraversalOutcome, snapshot_bytes: bool) {
+    println!(
+        "entries={} failures={} checkpoints={} outcome={outcome:?}",
+        tally.entries, tally.failures, tally.checkpoints
+    );
+    if let TraversalOutcome::Completed(completion) = outcome {
         println!("{}", totals(&completion.totals));
     }
-    if *snapshot_bytes {
+    if snapshot_bytes {
         println!(
-            "snapshot_bytes={snapshots} endpoint_bytes={}",
+            "snapshot_bytes={} endpoint_bytes={}",
+            tally.snapshots,
             storage.identity().stable_id().len()
         );
     }
-    Ok(())
 }
 
 fn traversal_request(args: &Args, command: &Command) -> Result<TraversalRequest, Error> {
@@ -118,6 +214,8 @@ fn traversal_request(args: &Args, command: &Command) -> Result<TraversalRequest,
         path,
         ownership,
         acl,
+        checkpoint_every,
+        resume_from,
         ..
     } = command
     else {
@@ -140,6 +238,16 @@ fn traversal_request(args: &Args, command: &Command) -> Result<TraversalRequest,
         .observation_plan(plan)
         .max_depth(max_depth.and_then(NonZeroUsize::new))
         .versions(TraversalVersions::from(*versions));
+    let request = match checkpoint_every {
+        Some(seconds) => request.resumable(Resumable::On {
+            every: Duration::try_from_secs_f64(*seconds)?,
+        }),
+        None => request,
+    };
+    let request = match resume_from {
+        Some(path) => request.resume_from(Checkpoint::from_bytes(Bytes::from(fs::read(path)?))),
+        None => request,
+    };
     Ok(if filter.is_empty() {
         request
     } else {

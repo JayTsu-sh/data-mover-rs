@@ -87,6 +87,8 @@ impl Worker {
                     if self.pool.finish(self.me) {
                         // Nothing is left anywhere: every worker can stop.
                         self.halt.cancel();
+                    } else {
+                        self.checkpoint_if_due().await;
                     }
                 }
                 Ok(Ended::Halted) => break,
@@ -188,7 +190,27 @@ impl Worker {
         }
         // Only now: the entries of these directories are in the session.
         self.pool.push(self.me, below);
+        self.checkpoint_if_due().await;
         Ok(true)
+    }
+
+    /// Sends a checkpoint when one is due and this worker claims it. Off, this is one branch.
+    /// Halted meanwhile, the checkpoint is dropped: the traversal's final one covers it.
+    async fn checkpoint_if_due(&self) {
+        let Some(resume) = self.shared.resume.as_ref() else {
+            return;
+        };
+        if !resume.claim_due() {
+            return;
+        }
+        let Some(item) = super::checkpoint(resume, &self.pool) else {
+            return;
+        };
+        tokio::select! {
+            biased;
+            () = self.stop.cancelled() => {}
+            _ = self.items.send_whole(vec![item]) => {}
+        }
     }
 
     /// Resolves every child's observation into `batch`, and the subdirectories a deferred decision
