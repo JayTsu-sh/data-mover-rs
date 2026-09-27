@@ -22,6 +22,7 @@ CIFS_POLICY_TEST_BYTES=4096,67108864    # 可选，逗号分隔文件大小
 CIFS_PROBE_NFS_URL=nfs://nas01/share:/?uid=0&gid=0&noresvport=true   # 可选，probe 用它建 symlink fixture
 CIFS_REAL_GUEST_POLICY=allow-unsigned   # 可选，对匿名/guest share 跑契约 (配合未知用户 + 空密码)
 CIFS_PARKED_IDLE_SECS=2                 # 可选，停车列举测试的空闲秒数 (P7 C9 实测用 1800)
+CIFS_REAL_RO_SHARE=dm_ro_share          # 可选，只读 share (账号在 share ACL 上只有 read)；设了才跑步骤 5
 ```
 
 匿名 share 用法：`CIFS_REAL_SHARE=dm_anon_share CIFS_REAL_USER= CIFS_REAL_PASS= CIFS_REAL_GUEST_POLICY=allow-unsigned`
@@ -48,16 +49,23 @@ CIFS_PARKED_IDLE_SECS=2                 # 可选，停车列举测试的空闲�
      (默认 2；测 ONTAP 空闲回收时给 1800) 再读完，每个子项恰好一次，会话照常可用
 4. `cargo test --release --test cifs_capability_probe -- --ignored --nocapture`
    - 只打印 `[probe]` 证据：匿名/guest 登录、签名策略、根目录列举、时钟偏差、ACL 查询
+5. (设了 `CIFS_REAL_RO_SHARE` 才跑) `cargo test --release --test cifs_readonly_contract -- --ignored --nocapture`
+   - 只读 share 上遍历出恰好那 7 个夹具条目 (4 文件 + 3 目录)、0 失败；每个文件经传输引擎拷到本地临时目录，
+     读回摘要与落盘字节都等于记录的 BLAKE3 (smb-rs issue #85 / #88：目录 / 文件 `open_existing()` 只读的回归)
+   - mkdir / 删文件 / 删目录 / 改名文件 / 改名目录 / 上传一律 `PermissionDenied` (上传在 Prepare 阶段、目的端被拒，
+     不留 stage、不动最终路径)，之后可见的树不变
+   - 只用具名 NTLM 账号 (不走 `CIFS_REAL_GUEST_POLICY`)
+   - 夹具只经可写 share 写入 (清单与摘要见 `.claude/docs/test-environments.md` 的 `dm_ro_share`)，测试从不写它
 
 ## 成功判据
 
 - example 编译通过
-- policy + namespace contract 全部通过 (退出码 0)，测试自行清理 fixture
+- policy + namespace (+ readonly) contract 全部通过 (退出码 0)，测试自行清理 fixture (只读夹具常驻不清理)
 - probe 退出码 0，`[probe]` 行作为能力取舍的证据记录到 `.claude/docs/storage-cifs.md`
 
 ## 打开协议日志
 
-三个 `cifs_*` 测试都调用 `tests/common/init_tracing()`，按 `RUST_LOG` 开关，不设时零开销：
+各 `cifs_*` 测试都调用 `tests/common/init_tracing()`，按 `RUST_LOG` 开关，不设时零开销：
 
 ```bash
 RUST_LOG=smb=debug cargo test --release --test cifs_namespace_contract -- --ignored --nocapture

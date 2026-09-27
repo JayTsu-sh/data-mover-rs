@@ -39,6 +39,7 @@ def main() -> int:
         "CIFS_PROBE_NFS_URL",
         "CIFS_REAL_GUEST_POLICY",
         "CIFS_PARKED_IDLE_SECS",
+        "CIFS_REAL_RO_SHARE",
     ):
         if key in env:
             child_env[key] = env[key]
@@ -50,7 +51,13 @@ def main() -> int:
         ["cargo", "build", "--release", "--example", "cifs_mount_comparison"],
         child_env,
     )
-    for test in ("cifs_policy_contract", "cifs_namespace_contract", "cifs_capability_probe"):
+    tests = ["cifs_policy_contract", "cifs_namespace_contract", "cifs_capability_probe"]
+    # 只读 share 契约只在 .env 指定了只读 share 时跑 (夹具需事先经可写 share 写入)。
+    if child_env.get("CIFS_REAL_RO_SHARE"):
+        tests.append("cifs_readonly_contract")
+    else:
+        print("\n[skill e2e-cifs] CIFS_REAL_RO_SHARE unset: skipping cifs_readonly_contract")
+    for test in tests:
         run(
             test,
             ["cargo", "test", "--release", "--test", test, "--", "--ignored", "--nocapture"],
@@ -58,7 +65,7 @@ def main() -> int:
         )
 
     print(
-        "\n[skill e2e-cifs] passed: policy + namespace contracts on real share; "
+        "\n[skill e2e-cifs] passed: policy + namespace (+ read-only) contracts on real share; "
         "see [probe] lines above for capability evidence"
     )
     return 0

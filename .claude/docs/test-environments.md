@@ -43,6 +43,18 @@
   `DELETE /api/protocols/cifs/shares/{svm uuid}/dm_ro_share`），再经可写 share 删掉目录 `dm-ro-share`。
   QUERY_DIRECTORY 支持 `FileIdFullDirectoryInformation`，CREATE 回 `QFid` → 身份 `StableWithinBackend`。任何 CIFS 改动必须在这里过 e2e-cifs。
   符号链接夹具只能经 NFS 建（REST files API 不收 symlink）。
+  **`dm_ro_share` 常驻夹具**（2026-09-27 经可写 share 用 `transfer_resume --destination smb:dm-ro-share` 写入，**不要改动**；
+  `tests/cifs_readonly_contract.rs` 的 `FILES` 表逐字节比对，e2e-cifs 设 `CIFS_REAL_RO_SHARE=dm_ro_share` 时跑）：
+
+  | 路径 | 字节 | BLAKE3 | SHA-256 |
+  |---|---|---|---|
+  | `a.txt` | 38 | `8c2dbc5b9c45c77296fd2bc6ded6791b70e54b86d89c7806cb15b4fcb14b490d` | `c38f15512d489c400fd0a0d7260207672eaccb2be01e776aba32d0fe87841d09` |
+  | `sub/b.bin`（随机） | 1048576 | `ac4ff1a39bc52058c8d24756a28778c3a3e532fd5e6b4f0dfc50806007bc8129` | `21da5395be5bb9fe8dfbb642612a0434ee12c363d0ce64f5c57d6d30a1158adb` |
+  | `sub/deeper/c.txt` | 61 | `fb3d16b4220e60df62c79646cedf88e3b087d22934c3b02e57e095fb183904dc` | `a022bc83682237da9beea7cec3da79273ec32c507c27081dc276896357c0c6a8` |
+  | `sub/deeper/deepest/d.bin`（随机，9 MiB + 12345，跨多个读块） | 9449529 | `e36e3405ed4abd6e53ea880c019871ca4d9ba4e21c7e3a9d45cd19f969bf45c3` | `4cd8c077b2b9006087a1297f6564ca372b44e0b63e9ef0e986131c1236ca6d3c` |
+
+  外加目录 `sub`、`sub/deeper`、`sub/deeper/deepest`，共 7 个条目。夹具丢了或被改：本地造同样内容做不到 (随机字节)，
+  需重新生成、经可写 share 写入，并同步更新上表与 `FILES` 表。
 - **NFS**：卷 `ontap_lisaauto_nfs`（junction `/ontap_lisaauto_nfs`，unix，export policy default）。v3 / v4.0 / v4.1 都开着。
   - `mount_rootonly` 开着：**WSL 经 NAT 改写源端口，v3 MOUNT 被拒**（`AUTH_TOOWEAK` / “could not parse response due to bad status”）→ v3 在
     10.131.9.10 上以 root、特权端口跑（URL 不带 `noresvport`）。**不要改 SVM 设置**。v4.x 从 WSL 用 `noresvport=true`。
