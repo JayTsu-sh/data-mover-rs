@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::mem;
 
-use super::Runtime;
+use super::blocks::Runtime;
 use crate::model::StoragePath;
 use crate::traversal::{
     BlockCounts, DirectoryListed, ListingOutcome, ScanTotals, TraversalItem,

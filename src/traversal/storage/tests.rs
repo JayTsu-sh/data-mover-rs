@@ -11,6 +11,7 @@ use crate::model::{
 use crate::storage::ListingFacts;
 use crate::storage::listing::testing::{answer, entries};
 use crate::storage::{ListRequest, ListingPage, ListingStream, MetadataMutation};
+use crate::traversal::{TraversalCompletion, TraversalOutcome};
 
 struct FakeNamespace;
 struct FakeMetadata;

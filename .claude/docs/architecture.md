@@ -53,7 +53,7 @@ Storage (roles)
 
 `StorageTraversalSource` 有两种调度，由 `TraversalRequest.order` 选 (P7 §3)：**`Unordered` (默认，P7 C10)**
 见下文「遍历的三套处理逻辑」第一节之后的 Unordered 小节 (`storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs`)；
-**`Blocks`** 的调度 (`src/traversal/storage.rs` + `storage/{cursor,stream,observe}.rs`)：
+**`Blocks`** 的调度 (`src/traversal/storage/{blocks,cursor,stream,observe}.rs`，公共件在 `src/traversal/storage.rs`)：
 准入游标按"块"走深度优先 (`TraversalOrder::Blocks`) —— 一个目录的子项按列举顺序逐页连续输出，
 列举结束后按子目录名字节序依次下钻；序号只由游标分配，重排缓冲按序号输出，所以列举/观察乱序完成
 不影响顺序。列举预读额度 `min(max_inflight_operations, 64)` 只计**等页**的列举，游标未到的已起列举
@@ -244,7 +244,7 @@ legacy work-stealing 的调度形状 (§6.1)，放在 role 的列举 / 观察 / 
 所以单页小目录的页一收到、结束就可见，页与结束一起到，驱动一次唤醒 (偷看没看到的结束要等游标取走前一页)。任务中途 panic 由 `Reporter` 的 Drop 报 `Internal`。
 **Local 自 C5 起逐页读目录**（每页一次 `spawn_blocking`，`ReadDir` 带进带出）；**HDFS 自 C8 起逐页列举**（`list_status_iter` 按页取，列举前不再 `get_file_info`，取消 / drop 立即放弃进行中的请求；中途可重试失败从最后读到的名字之后续读）；**S3 当前对象自 C6 起逐页列举**（`ListObjectsV2` 每个服务端页一到就按 `page_hint` 交出，不假设 key 有序：公共前缀用集合去重、续页只用不透明 token、节流 / 瞬时失败用同一 token 重发；多版本 All 仍按目录收齐，C11b 改）；**NFS 自 C7 起逐页列举**（READDIRPLUS 的回复逐条取、按 `page_hint` 攒页交出，一次只多读一个回复；取消 / drop 在下一个请求之前停，不放弃在途请求；首页之前可整目录从头重读，之后失败 → `Interrupted`）；**CIFS 自 C9 起逐页列举**（生产者持有目录句柄，`QUERY_DIRECTORY` 记录逐条取、按 `page_hint` 攒页交出；停车时句柄一直开着，所以预取受 `parked_listing_limit` = 8 约束；取消 / drop 在取下一条之前停、让在途记录到达，然后关句柄，最后一页在关句柄之后交出；首页之前句柄失效（smb-rs 重连后的 `InvalidState` / `StaleObject`、`STATUS_FILE_CLOSED` / `STATUS_INVALID_HANDLE`）重开目录从头读，至多 3 次；之后失败 → `Interrupted`）。
 
-驱动循环 (`storage.rs` 的 `drive`)：
+驱动循环 (`storage/blocks.rs` 的 `drive`)：
 
 ```
 loop {

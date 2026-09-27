@@ -33,12 +33,13 @@ use std::sync::Arc;
 
 use tokio::sync::Semaphore;
 
+use super::DirectoryWork;
+use super::blocks::{Runtime, State, admit, queue_block_end, queue_failure};
 use super::observe::{Feed, Observations};
 use super::output::BlockFacts;
 #[cfg(test)]
 use super::residency::Residency;
 use super::stream::{self, Arrival, ArrivalSender, Batch, Child, ListingId, Slot};
-use super::{DirectoryWork, Runtime, State, admit, queue_block_end, queue_failure};
 use crate::model::{EntryOperationFailure, FailureClass, StoragePath};
 use crate::storage::DescentHint;
 use crate::traversal::{ScanFailure, TraversalTerminalFailure};
