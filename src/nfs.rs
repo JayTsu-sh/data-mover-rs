@@ -54,6 +54,7 @@ use crate::{
 mod owner;
 mod role_listing;
 mod role_metadata;
+mod role_namespace;
 
 pub(crate) use owner::{owner_id, owners_are_strings};
 
@@ -688,14 +689,13 @@ impl NfsNamespaceProtocol for NFSStorage {
         }
     }
 
+    /// One level, never recursive (`src/nfs/role_namespace.rs`); the legacy recursive
+    /// `create_dir_all` stays for legacy callers.
     async fn create_directory(
         &self,
         path: &crate::model::StoragePath,
     ) -> std::result::Result<(), NfsProtocolFailure> {
-        self.create_dir_all(Path::new(path.as_str()))
-            .await
-            .map(|_| ())
-            .map_err(classify_role_error)
+        self.role_create_directory(path).await
     }
 
     async fn delete(

@@ -18,7 +18,7 @@ type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 enum ExistingBehaviour {
     /// CIFS: `STATUS_OBJECT_NAME_COLLISION`.
     Conflict,
-    /// NFS: `create_directory` is itself recursive and idempotent.
+    /// NFS: an existing directory answers success.
     Completed,
 }
 

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 import sys
@@ -19,19 +20,29 @@ from protocol_constants import PROJECT_ROOT  # noqa: E402
 from url_builder import nfs_url  # noqa: E402
 
 
-def run(label: str, cmd: list[str], expected: int = 0, capture: bool = False) -> tuple[int, str]:
+def run(
+    label: str,
+    cmd: list[str],
+    expected: int = 0,
+    capture: bool = False,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[int, str]:
     print(f"\n[skill e2e-nfs] $ {shlex.join(cmd)}")
+    child_env = {**os.environ, **(extra_env or {})}
+    # Only what this run asks for: a value left in the calling shell must not leak in.
+    if extra_env is not None and "NFS_REAL_RO_PATH" not in extra_env:
+        child_env.pop("NFS_REAL_RO_PATH", None)
     if capture:
         result = subprocess.run(
             cmd, cwd=PROJECT_ROOT, capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
+            encoding="utf-8", errors="replace", env=child_env,
         )
         print(result.stdout)
         if result.stderr:
             print("[stderr]", result.stderr)
         assert_exit_code(label, result.returncode, expected)
         return result.returncode, result.stdout + result.stderr
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT)
+    result = subprocess.run(cmd, cwd=PROJECT_ROOT, env=child_env)
     assert_exit_code(label, result.returncode, expected)
     return result.returncode, ""
 
@@ -62,6 +73,20 @@ def main() -> int:
     run("nfs_export", ["cargo", "run", "--example", "nfs_export", "--", url])
     # Creates and removes only its own `dm-e2e-opt-dir-<nanos>` below the export.
     run("nfs_opt_dir", ["cargo", "run", "--example", "nfs_opt_dir", "--", url])
+    # create_directory_all through levels the caller may not write (tests/nfs_mkdir_contract.rs):
+    # creates and removes only its own `dm-mkdir-<nanos>` below the export; NFS_UID must be able to
+    # chmod what it creates, and uids 4242 / 4243 must not be it. NFS_RO_PATH (optional) is an
+    # existing directory on a read-only file system, `{scratch}` = the test's directory (ONTAP:
+    # `{scratch}/.snapshot`); it is never written.
+    mkdir_env = {"NFS_REAL_URL": url}
+    ro_path = env.get("NFS_RO_PATH", "").strip()
+    if ro_path:
+        mkdir_env["NFS_REAL_RO_PATH"] = ro_path
+    run(
+        "nfs_mkdir_contract",
+        ["cargo", "test", "--test", "nfs_mkdir_contract", "--", "--ignored", "--nocapture"],
+        extra_env=mkdir_env,
+    )
 
     # 拒绝访问：NFS_DENY_DIR 相对 export，NFS_UID/NFS_GID 必须无权读它（非 root，或服务器 squash root）。
     # 遍历应报权限错误并以非 0 退出。「权限错误不重试」由 src/nfs.rs 的

@@ -8,20 +8,23 @@
 //!
 //! - **Already-existing levels are success.** Backends disagree on how they report one: CIFS
 //!   answers `STATUS_OBJECT_NAME_COLLISION` (`Conflict`), while the NFS adapter's
-//!   `create_directory` is itself recursive and idempotent and simply answers success.
+//!   `create_directory` looks the name up after `EXIST` and answers success for a directory.
 //!   Both are treated as "this level exists now", and so is a refusal once a `stat` shows a
-//!   directory (below).
+//!   directory (below). Every backend's `create_directory` creates one level (NFS since it
+//!   stopped forwarding to the recursive legacy `NFSStorage::create_dir_all`, which legacy
+//!   callers keep), so this helper drives every level on every backend.
 //! - **Only the leaf is verified on conflict.** A conflict costs one extra `stat` at the leaf
 //!   to prove the existing entry is a directory rather than a file. Intermediate levels skip
 //!   that check on CIFS and HDFS, where a file in the way makes the level below it fail, so
 //!   the mistake cannot pass silently — only the leaf could.
 //!
-//!   **NFS is the exception, and it is not this helper's doing.** Its `create_directory`
-//!   forwards to `nfs::create_dir_all`, which deletes a non-directory blocking a component and
-//!   retries, by deliberate rsync-style migration semantics (`src/nfs.rs`, logged at `warn`).
-//!   So on NFS a file at any level — leaf included — is removed rather than reported, and the
-//!   leaf `stat` then sees the directory that replaced it. Verifying intermediate levels here
-//!   would not change that: the delete happens inside the one call this helper makes.
+//!   **NFS is the exception, and it is not this helper's doing.** Its one-level
+//!   `create_directory` (`src/nfs/role_namespace.rs`) removes a non-directory it finds at the
+//!   level after `EXIST` and creates the directory in its place — the legacy helper's
+//!   deliberate rsync-style migration semantics, kept and logged at `warn`. So on NFS a file at
+//!   any level — leaf included — is replaced rather than reported, and the call succeeds
+//!   without a conflict to verify. Verifying intermediate levels here would not change that:
+//!   the delete happens inside the backend's call.
 //! - **A refused level that already exists as a directory is success.** Servers may check
 //!   access before the name: ONTAP answers `CREATE` of an existing directory on a share the
 //!   account may only read with `ACCESS_DENIED`, not `COLLISION`. An entry-scoped
@@ -29,9 +32,10 @@
 //!   counts as "this level exists" only when the entry is a directory; a missing level, a
 //!   file, or a `stat` that fails for that entry keeps the original `PermissionDenied`. So a
 //!   read-only root above a writable directory no longer refuses the levels below it. A
-//!   session-scoped refusal is never probed. NFS recurses inside its one `create_directory`
-//!   call, so this rule cannot reach its intermediate levels; `NFSStorage::create_dir_all` does
-//!   not apply it yet.
+//!   session-scoped refusal is never probed. NFS servers differ the same way (2026-09-27, an
+//!   existing directory in a parent the caller may not write): DXN-2 answers `MKDIR` with
+//!   `ACCES` on v3 and v4.0, ONTAP with `EXIST` on v3, v4.0 and v4.1; a read-only file system
+//!   answers `ROFS`, also `PermissionDenied`.
 //! - **A probe that fails beyond its entry reports itself.** When either `stat` above (the
 //!   leaf conflict check or the refused-level check) ends `Cancelled`, with a session failure
 //!   (a `Session` failure, or an entry failure of class `Connectivity` or `Authentication`), or
@@ -41,7 +45,8 @@
 //! - **No cross-call cache in this layer.** The legacy `DirExistsCache` lived in the backend
 //!   because there was no role layer; which destination directories a session already created
 //!   is caller state, so it belongs to the caller. Backends may still cache below the role:
-//!   the NFS adapter keeps a process-wide directory-handle cache.
+//!   the NFS adapter keeps a process-wide directory-handle cache, and a level it holds a
+//!   handle for answers success without an RPC.
 //! - **The backend root always exists.** An empty path is a no-op, never a request: the HDFS
 //!   namespace refuses a root-targeted `CreateDirectory` outright.
 

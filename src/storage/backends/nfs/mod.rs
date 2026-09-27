@@ -3,6 +3,8 @@
 mod acl;
 mod at_destination;
 pub(crate) mod common;
+#[cfg(test)]
+mod create_dir_tests;
 mod listing;
 #[cfg(test)]
 pub(crate) mod listing_fake;

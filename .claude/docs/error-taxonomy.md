@@ -151,6 +151,14 @@ nfs-rs 错误产出 `FailureClass` + `Transience`，并记下服务端状态名�
 `Connectivity` 经 `role_failure` 升为会话失败（metadata 阶段报 `SessionLost`，后面的族不再应用）；
 经 `entry_scoped` 的调用方（可选元数据的 Required 读取）不升级。
 
+namespace 角色的 `CreateDirectory`（MKDIR，只建一层，`src/nfs/role_namespace.rs`）也直接走这张表：此前它转发给 legacy
+递归 `create_dir_all`，MKDIR 被拒经字符串包装成 `NfsError`，在 role 层是 `Protocol` / Unknown（可重试）且没有状态名；
+现在 `ACCES` / `PERM` / `ROFS` 是条目 `PermissionDenied` / Permanent（诊断如 `NFS role failed: NFS3ERR_ACCES (access denied)`）。
+MKDIR 前解析父目录的 LOOKUP 仍走 legacy `classify_role_error`（`NOENT` → `NotFound`，其余 `Protocol` / Unknown）。
+`EXIST` 不是失败：LOOKUP 该名字，是目录即成功；不是目录则删掉再建（rsync 语义，重试用尽 → `Conflict` / Unknown）。
+父目录缓存的句柄 `STALE`、忘掉缓存后父目录已不存在（外部删掉了本进程缓存过的目录）→ `NotFound` / **Transient**
+（缓存已清，重试会重建）；一开始就不存在的父目录是 `NotFound` / Permanent。
+
 元数据角色的 SETATTR（mode / owner / 时间）也走这张表（K3b，`setattr_role`）；此前经 legacy 字符串包装，
 被拒一律是 `Protocol` / Unknown、没有状态名、也从不升为会话失败。SETATTR 之前的 LOOKUP 与 stale 重试里的
 re-lookup 仍走 legacy `classify_role_error`，失败时没有状态。
@@ -269,9 +277,12 @@ Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修�
 | 同上 | `Cancelled`、会话失败（`Session`，或条目级 `Connectivity` / `Authentication`）、`Throttled` | **探测自己的失败**（操作、作用域、类别、Transience 都是探测的）：取消是信号（R10），断连 / 忙与条目无关，不冒充永久拒绝 |
 | 其他（会话级失败、其他类别） | 不探测 | 原样 |
 
+NFS 真机（2026-09-27，已存在的目录、父目录调用者不可写）：DXN-2 v3 / v4.0 对 MKDIR 先查权限回 `ACCES`（→ 探测 → 目录 → 继续），
+ONTAP v3 / v4.0 / v4.1 先查重名回 `EXIST`；ONTAP `.snapshot` 下新建回 `ROFS`（→ `PermissionDenied`）。
+
 ## 改 error 时
 
-1. **不要随便加新变体**。当前 24 个覆盖 95% 场景。
+1. **不要随便加新变体**。当前 29 个覆盖 95% 场景。
 2. 加变体必须 PR 说明：为什么不能用现有变体表示。
 3. 改映射规则 (例如把 `S3 5xx` 改 retry → deny_list) 必须同步：
    - 本 doc 表格。

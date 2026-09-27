@@ -64,6 +64,8 @@
     （`hidden=1`，不下钻）：2026-09-26 整个导出 v3 / v4.0 / v4.1 都是 listed 5399、0 失败、路径集合逐行相同（此前 v3 是
     listed 5400 = 5399 + 1 个 `Protocol` 子项失败）。legacy `walkdir` 不变：用 GETATTR 补属性，把它当普通目录（3545 个目录）。
     有快照的卷（例如 `/dm_s3_nas`，只读探过）里快照子项 v3 READDIRPLUS 同样不带属性。
+    `.snapshot` 是只读文件系统：在它下面 MKDIR 回 `NFS3ERR_ROFS` / `NFS4ERR_ROFS`（2026-09-27），`e2e-nfs` 的
+    `NFS_RO_PATH={scratch}/.snapshot` 拿它当只读导出的替身（只尝试建目录、必被拒）；没有真正的只读 NFS 导出。
 - **S3**（SVM `lizy` 的 object store server `s3lizy.com`，`http://10.128.61.200:80`，path-style），用户 `data-mover-test`（只在 `e2e-s3/ontap/.env`）：
   - `data-mover-test`（无版本，FlexGroup `fg_oss_1790405106`）、`data-mover-test-ver`（开版本，`fg_oss_1790405136`）：两个卷是建桶时 ONTAP 新建的
     （FAS2750_01_SSD_1 × 3 成员，thin 100 GB），后台重删 + 压缩。我们的用户**不能建桶**，脚本要用已有桶、跑完清空。
