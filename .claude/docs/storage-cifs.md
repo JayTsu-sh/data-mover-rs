@@ -149,7 +149,10 @@ legacy `CifsStorage` 的能力在 role-based backend 里的去向 —— 有对�
   由 staged `Checkpointed` / `AtomicReplace` 替代。
 - 递归建目录 (legacy `create_dir_all`) 现在是 backend 无关的 `storage::create_directory_all`：
   逐层 `CreateDirectory`，`Ok` 与 `Conflict` 都算"这层已存在"，只在叶子层冲突时多花一次 `Stat`
-  确认不是文件。legacy 的 `DirExistsCache` 不补 —— 跨调用缓存是调用方的会话状态。
+  确认不是文件。ONTAP 对 CREATE 先查 share ACL 再查重名，已存在的目录在只读处回 `ACCESS_DENIED`
+  而不是 `COLLISION`：所以任何一层 (中间层或叶子) 的 entry 级 `PermissionDenied` 都多花一次 `Stat`，
+  是目录才算"这层已存在"；不存在 / 是文件 / `Stat` 失败则报原来的 `PermissionDenied` (不报探测结果)。
+  legacy 的 `DirExistsCache` 不补 —— 跨调用缓存是调用方的会话状态。
 - `update_metadata` 的 2-RT compound (legacy `evict_lease` + `compound_set_basic_info`) 没有
   对应物，现在是 open + set + close 三个往返，facade 不暴露 wire compound
   (`domain/batch.rs` 的 `Batch::execute` 是顺序 await，不是 SMB2 复合请求)。**正确性没问题**：

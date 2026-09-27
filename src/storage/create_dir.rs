@@ -9,7 +9,8 @@
 //! - **Already-existing levels are success.** Backends disagree on how they report one: CIFS
 //!   answers `STATUS_OBJECT_NAME_COLLISION` (`Conflict`), while the NFS adapter's
 //!   `create_directory` is itself recursive and idempotent and simply answers success.
-//!   Both are treated as "this level exists now".
+//!   Both are treated as "this level exists now", and so is a refusal once a `stat` shows a
+//!   directory (below).
 //! - **Only the leaf is verified on conflict.** A conflict costs one extra `stat` at the leaf
 //!   to prove the existing entry is a directory rather than a file. Intermediate levels skip
 //!   that check on CIFS and HDFS, where a file in the way makes the level below it fail, so
@@ -21,6 +22,15 @@
 //!   So on NFS a file at any level — leaf included — is removed rather than reported, and the
 //!   leaf `stat` then sees the directory that replaced it. Verifying intermediate levels here
 //!   would not change that: the delete happens inside the one call this helper makes.
+//! - **A refused level that already exists as a directory is success.** Servers may check
+//!   access before the name: ONTAP answers `CREATE` of an existing directory on a share the
+//!   account may only read with `ACCESS_DENIED`, not `COLLISION`. An entry-scoped
+//!   `PermissionDenied` therefore costs one `stat` of that level — intermediate or leaf — and
+//!   counts as "this level exists" only when the entry is a directory; a missing level, a
+//!   file, or a failing `stat` keeps the original `PermissionDenied`. So a read-only root above
+//!   a writable directory no longer refuses the levels below it. A session-scoped refusal is
+//!   never probed. NFS recurses inside its one `create_directory` call, so this rule cannot reach
+//!   its intermediate levels; `NFSStorage::create_dir_all` does not apply it yet.
 //! - **No cross-call cache in this layer.** The legacy `DirExistsCache` lived in the backend
 //!   because there was no role layer; which destination directories a session already created
 //!   is caller state, so it belongs to the caller. Backends may still cache below the role:
@@ -77,7 +87,8 @@ impl From<StorageRoleFailure> for CreateDirectoryAllFailure {
 
 /// Creates every missing component of `path` through `storage`'s namespace role.
 ///
-/// Succeeds when the directory already exists.
+/// Succeeds when the directory already exists, including when the server refuses to create a
+/// level that is already a directory (access checked before the name).
 ///
 /// # Errors
 /// Returns [`CreateDirectoryAllFailure::Capability`] when the storage lends no namespace role, or
@@ -118,21 +129,36 @@ async fn create_level(
     level: StoragePath,
     is_leaf: bool,
 ) -> Result<(), CreateDirectoryAllFailure> {
-    let conflict = match namespace.create_directory(&level).await {
+    let failure = match namespace.create_directory(&level).await {
         Ok(()) => return Ok(()),
-        Err(failure) if class_of(&failure) == FailureClass::Conflict => failure,
-        Err(failure) => return Err(failure.into()),
+        Err(failure) => failure,
     };
-    if !is_leaf {
+    let needs_proof = if class_of(&failure) == FailureClass::Conflict {
+        // The leaf is the only level whose conflict could hide a file where the backend reports
+        // one at all; see the NFS exception in the module docs.
+        is_leaf
+    } else if is_entry_permission_denied(&failure) {
+        // The server may check the ACL before the name: only a directory already there turns
+        // the refusal into "this level exists", at every level.
+        true
+    } else {
+        return Err(failure.into());
+    };
+    if !needs_proof {
         return Ok(());
     }
-    // The leaf is the only level whose conflict could hide a file where the backend reports
-    // one at all; see the NFS exception in the module docs.
     match namespace.stat(&level).await {
         Ok(entry) if entry.kind == EntryKind::Directory => Ok(()),
-        // Report the original conflict rather than the probe's outcome: the caller asked to
-        // create a directory, and what stopped it was the entry already there.
-        _ => Err(conflict.into()),
+        // Report the original failure rather than the probe's outcome: the caller asked to
+        // create a directory, and what stopped it was the entry already there or the refusal.
+        _ => Err(failure.into()),
+    }
+}
+
+fn is_entry_permission_denied(failure: &StorageRoleFailure) -> bool {
+    match failure {
+        StorageRoleFailure::Entry(error) => error.class() == FailureClass::PermissionDenied,
+        StorageRoleFailure::Session(_) => false,
     }
 }
 

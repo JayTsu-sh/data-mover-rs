@@ -4,7 +4,8 @@
 //! the fixture tree below already in it (seeded through a writable share onto the same
 //! directory). A source only ever reads, so the whole tree must traverse and copy out, and every
 //! write, delete, rename or mkdir must be refused as `PermissionDenied` — by the server, not by
-//! luck. Before smb-rs `37d9404` (PR #87, issue #85) every directory below the root was opened with
+//! luck — while `create_directory_all` of levels that already exist succeeds without a write.
+//! Before smb-rs `37d9404` (PR #87, issue #85) every directory below the root was opened with
 //! write and delete access and the listing failed; before `2649a0b` (PR #89, issue #88) every
 //! existing file was, and the source read failed.
 //!
@@ -19,8 +20,9 @@ use std::path::Path;
 
 use data_mover::model::{EntryKind, FailureClass, StoragePath};
 use data_mover::storage::{
-    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, LocalBackendConfig,
-    Namespace, PreflightPolicy, Storage, StorageRoleFailure, connect_backend, create_directory_all,
+    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy,
+    CreateDirectoryAllFailure, LocalBackendConfig, Namespace, PreflightPolicy, Storage,
+    StorageRoleFailure, connect_backend, create_directory_all,
 };
 use data_mover::transfer::{
     InflightLimits, ReadBackVerification, TransferFailure, TransferIdentity, TransferOutcome,
@@ -75,6 +77,7 @@ async fn real_readonly_share_traverses_reads_and_refuses_writes() -> Result {
         copy_out_and_verify(&storage, &local, scratch.path(), path, size, digest).await?;
     }
     refuse_writes(&storage, &local, scratch.path(), &id).await?;
+    create_directory_all_passes_existing_levels(&storage).await?;
     // Nothing a refused call did may have changed the tree.
     assert_fixture_tree(&storage).await
 }
@@ -193,6 +196,38 @@ async fn refuse_writes(storage: &Storage, local: &Storage, scratch: &Path, id: &
         "rename a directory",
     )?;
     refuse_upload(namespace.as_ref(), storage, local, scratch, &refused).await
+}
+
+/// ONTAP checks the share ACL before the name, so `CREATE` of a directory that exists is
+/// `PermissionDenied` here, not a collision. `create_directory_all` must still accept levels
+/// that are already directories — a read-only root above a writable directory would otherwise
+/// refuse everything below it — and still refuse the first level that is missing, naming it.
+async fn create_directory_all_passes_existing_levels(storage: &Storage) -> Result {
+    for existing in ["sub/deeper", "sub/deeper/deepest"] {
+        create_directory_all(storage, &path(existing)?)
+            .await
+            .map_err(|error| format!("create_directory_all({existing}): {error:?}"))?;
+        eprintln!("[readonly] create_directory_all {existing}: exists, accepted");
+    }
+    for (missing, refused) in [
+        ("sub/new", "sub/new"),
+        ("sub/deeper/new/x", "sub/deeper/new"),
+    ] {
+        let failure = match create_directory_all(storage, &path(missing)?).await {
+            Err(CreateDirectoryAllFailure::Role(StorageRoleFailure::Entry(failure))) => failure,
+            outcome => {
+                return Err(format!("create_directory_all({missing}): {outcome:?}").into());
+            }
+        };
+        eprintln!(
+            "[readonly] create_directory_all {missing} refused: {:?} at {}",
+            failure.class(),
+            failure.path()
+        );
+        assert_eq!(failure.class(), FailureClass::PermissionDenied, "{missing}");
+        assert_eq!(failure.path().as_str(), refused, "{missing}");
+    }
+    Ok(())
 }
 
 /// A transfer onto the read-only share fails while preparing the destination, as

@@ -54,6 +54,9 @@ CIFS_REAL_RO_SHARE=dm_ro_share          # 可选，只读 share (账号在 share
      读回摘要与落盘字节都等于记录的 BLAKE3 (smb-rs issue #85 / #88：目录 / 文件 `open_existing()` 只读的回归)
    - mkdir / 删文件 / 删目录 / 改名文件 / 改名目录 / 上传一律 `PermissionDenied` (上传在 Prepare 阶段、目的端被拒，
      不留 stage、不动最终路径)，之后可见的树不变
+   - `create_directory_all` 对已存在的层 (`sub/deeper`、`sub/deeper/deepest`) 成功且不写 —— ONTAP 对已存在目录的
+     CREATE 回 `ACCESS_DENIED` 而不是 `COLLISION`，靠一次 `Stat` 证明是目录；`sub/new`、`sub/deeper/new/x` 仍
+     `PermissionDenied`，且报在第一个不存在的层 (`sub/new` / `sub/deeper/new`)
    - 只用具名 NTLM 账号 (不走 `CIFS_REAL_GUEST_POLICY`)
    - 夹具只经可写 share 写入 (清单与摘要见 `.claude/docs/test-environments.md` 的 `dm_ro_share`)，测试从不写它
 
