@@ -171,6 +171,7 @@ pub(super) mod tests {
             transfer_concurrency: super::super::super::DEFAULT_TRANSFER_CONCURRENCY,
             is_bucket_versioned: false,
             versioning_suspended: false,
+            versioning_at_connect: super::super::super::S3VersioningAtConnect::Never,
         }
     }
 

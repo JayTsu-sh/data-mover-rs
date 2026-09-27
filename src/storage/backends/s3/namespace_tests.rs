@@ -408,7 +408,7 @@ async fn mutations_are_refused_before_any_io() -> TestResult {
         &CapabilityAvailability::Supported
     );
     let namespace = storage.namespace(&validation_policy())?;
-    assert!(namespace.capabilities().histories);
+    assert!(!namespace.capabilities().histories, "never versioned");
     assert!(namespace.capabilities().mutations.is_err());
     for request in [
         Verb::CreateDirectory(path("n")),

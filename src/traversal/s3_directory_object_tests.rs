@@ -21,7 +21,9 @@ use crate::model::{
     StoragePath, Transience,
 };
 use crate::storage::backends::s3::tests::{MemoryS3, Versioning, content_md5, identity};
-use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure, connect};
+use crate::storage::backends::s3::{
+    S3Protocol as _, S3ProtocolFailure, S3VersioningAtConnect, connect,
+};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -134,6 +136,10 @@ async fn directory_objects_are_entries_counted_as_files() -> TestResult {
     for order in ORDERS {
         let protocol = tree().await?;
         for versions in [TraversalVersions::Current, TraversalVersions::All] {
+            if versions == TraversalVersions::All {
+                // Never versioned: only a refusal to say lists histories (P7 Q26).
+                protocol.answer_at_connect(S3VersioningAtConnect::Refused);
+            }
             let (items, outcome) = traverse(&protocol, request("", versions, order)?).await?;
             let mut listed = rows(&items);
             listed.sort();
@@ -226,6 +232,9 @@ async fn directory_object_entries_survive_a_snapshot() -> TestResult {
         put(&protocol, "p/d/", b"same").await?;
         put(&protocol, "p/d/x", b"1").await?;
         for versions in [TraversalVersions::Current, TraversalVersions::All] {
+            if versions == TraversalVersions::All {
+                protocol.answer_at_connect(S3VersioningAtConnect::Refused);
+            }
             let (items, _) = traverse(&protocol, request("", versions, order)?).await?;
             let found = entries(&items);
             let named: Vec<&ObservedEntry> = found

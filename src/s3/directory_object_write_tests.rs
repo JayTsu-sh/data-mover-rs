@@ -19,7 +19,7 @@ use aws_types::region::Region;
 use super::{DEFAULT_BLOCK_SIZE, DEFAULT_TRANSFER_CONCURRENCY, S3Storage, S3UrlOptions};
 use crate::error::StorageError;
 use crate::model::{FailureClass, Transience};
-use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure};
+use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure, S3VersioningAtConnect};
 
 /// Counts the requests that reach the wire and answers each as `CreateMultipartUpload` would.
 #[derive(Clone, Debug, Default)]
@@ -67,6 +67,7 @@ fn storage(wire: &Wire) -> S3Storage {
         transfer_concurrency: DEFAULT_TRANSFER_CONCURRENCY,
         is_bucket_versioned: false,
         versioning_suspended: false,
+        versioning_at_connect: S3VersioningAtConnect::Never,
     }
 }
 

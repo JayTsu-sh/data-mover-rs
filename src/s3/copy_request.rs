@@ -31,6 +31,7 @@ mod tests {
 
     use super::super::{DEFAULT_BLOCK_SIZE, DEFAULT_TRANSFER_CONCURRENCY, S3Storage, S3UrlOptions};
     use crate::AssertTestValue;
+    use crate::storage::backends::s3::S3VersioningAtConnect;
 
     /// Each request as (method, uri, `Content-Length`, has `x-amz-copy-source`).
     type Seen = Arc<Mutex<Vec<(String, String, Option<String>, bool)>>>;
@@ -101,6 +102,7 @@ mod tests {
             transfer_concurrency: DEFAULT_TRANSFER_CONCURRENCY,
             is_bucket_versioned: false,
             versioning_suspended: false,
+            versioning_at_connect: S3VersioningAtConnect::Never,
         }
     }
 

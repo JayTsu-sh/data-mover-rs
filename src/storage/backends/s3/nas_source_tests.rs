@@ -252,8 +252,10 @@ async fn a_nas_bucket_keeps_no_versions_and_no_directory_objects() -> TestResult
         described.source_identity.strength(),
         IdentityStrength::PathScoped
     );
-    // An object bucket keeps all three.
-    let object = connect(Arc::new(MemoryS3::default()), identity(), None)?;
+    // An object bucket keeps all three (histories: once it is versioned).
+    let versioned = Arc::new(MemoryS3::default());
+    versioned.set_versioning(Versioning::Enabled);
+    let object = connect(versioned, identity(), None)?;
     assert!(
         object
             .read_source(&validation_policy())?

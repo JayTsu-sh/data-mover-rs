@@ -15,10 +15,7 @@ use aws_credential_types::Credentials;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::DateTime;
-use aws_sdk_s3::types::{
-    BucketVersioningStatus, CommonPrefix, CompletedPart, Delete, DeleteMarkerEntry,
-    ObjectIdentifier,
-};
+use aws_sdk_s3::types::{CommonPrefix, CompletedPart, Delete, DeleteMarkerEntry, ObjectIdentifier};
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_types::region::Region;
 use bytes::Bytes;
@@ -35,7 +32,7 @@ use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, shou
 use crate::model::HistoryOrder;
 use crate::qos::QosManager;
 use crate::storage::artifacts::is_artifact_path;
-use crate::storage::backends::s3::KeyHistory;
+use crate::storage::backends::s3::{KeyHistory, S3VersioningAtConnect};
 use crate::storage_enum::{StorageEnum, path_to_s3_key};
 use crate::transfer_concurrency::{
     TransferBackend, TransferConcurrency, resolve_transfer_concurrency,
@@ -134,6 +131,7 @@ mod version_listing;
 mod version_order;
 #[cfg(test)]
 mod versioned_walk_tests;
+mod versioning_answer;
 
 /// S3 桶信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,6 +479,10 @@ pub struct S3Storage {
     /// snapshot, like `is_bucket_versioned`: changing the bucket's versioning while connected is
     /// outside the contract.
     versioning_suspended: bool,
+    /// What `GetBucketVersioning` answered at connection, whether the role-based listing gives
+    /// each key its history (P7 Q-A). Legacy connects whatever it answered; the role connection
+    /// refuses a bucket it got no answer about.
+    versioning_at_connect: S3VersioningAtConnect,
 }
 
 const S3_CONNECT_TIMEOUT_ENV: &str = "S3_CONNECT_TIMEOUT";
@@ -569,14 +571,15 @@ impl S3Storage {
         self.transfer_concurrency = concurrency;
         self
     }
-    /// The bucket's versioning status, `None` when the store cannot tell. The one request every
-    /// connection makes: a server certificate that is not trusted fails the connection here.
+    /// What the bucket's versioning status was (P7 Q-A: never `Err` for a refusal or a lost
+    /// answer, which only the role connection refuses). The one request every connection makes:
+    /// a server certificate that is not trusted fails the connection here.
     async fn detect_bucket_versioning(
         client: &Client,
         bucket_name: &str,
         endpoint: &str,
         options: S3UrlOptions,
-    ) -> Result<Option<BucketVersioningStatus>> {
+    ) -> Result<S3VersioningAtConnect> {
         match client
             .get_bucket_versioning()
             .bucket(bucket_name)
@@ -584,9 +587,9 @@ impl S3Storage {
             .await
         {
             Ok(response) => {
-                let status = response.status().cloned();
+                let status = response.status();
                 debug!("bucket {bucket_name} versioning status: {status:?}");
-                Ok(status)
+                Ok(versioning_answer::answered(status))
             }
             Err(error) => {
                 if options.https
@@ -600,12 +603,28 @@ impl S3Storage {
                 let status = error
                     .raw_response()
                     .map(|response| response.status().as_u16());
-                if versioning_is_unsupported(code, status) {
-                    info!("S3 bucket {bucket_name} does not support versioning");
-                } else {
-                    error!("failed to get versioning status for {bucket_name}: {error:?}");
+                let lost = matches!(
+                    error,
+                    aws_sdk_s3::error::SdkError::TimeoutError(_)
+                        | aws_sdk_s3::error::SdkError::DispatchFailure(_)
+                        | aws_sdk_s3::error::SdkError::ResponseError(_)
+                );
+                let answer = versioning_answer::failed(code, status, lost);
+                match answer {
+                    S3VersioningAtConnect::NoVersioning => {
+                        info!("S3 bucket {bucket_name} does not support versioning");
+                    }
+                    S3VersioningAtConnect::Refused => {
+                        warn!("S3 bucket {bucket_name} refused GetBucketVersioning: {error:?}");
+                    }
+                    S3VersioningAtConnect::Unreachable { .. } => {
+                        error!("failed to get versioning status for {bucket_name}: {error:?}");
+                    }
+                    S3VersioningAtConnect::Enabled
+                    | S3VersioningAtConnect::Suspended
+                    | S3VersioningAtConnect::Never => {}
                 }
-                Ok(None)
+                Ok(answer)
             }
         }
     }
@@ -730,7 +749,11 @@ impl S3Storage {
         // 检查桶是否启用了版本控制
         let versioning =
             Self::detect_bucket_versioning(&client, &bucket_name, &endpoint, options).await?;
-        if options.bucket_type == S3BucketType::Nas && versioning.is_some() {
+        let reports_state = matches!(
+            versioning,
+            S3VersioningAtConnect::Enabled | S3VersioningAtConnect::Suspended
+        );
+        if options.bucket_type == S3BucketType::Nas && reports_state {
             // An ONTAP NAS bucket answers GetBucketVersioning with 501; one that reports a state
             // (Enabled / Suspended) is an object bucket — one never versioned reports none and goes
             // unnoticed. The URL's choice still holds (P7 §14.2, decision 11): the NAS profile only
@@ -741,8 +764,8 @@ impl S3Storage {
                  reads, no source versions) applies anyway"
             );
         }
-        let is_bucket_versioned = versioning == Some(BucketVersioningStatus::Enabled);
-        let versioning_suspended = versioning == Some(BucketVersioningStatus::Suspended);
+        let is_bucket_versioned = versioning == S3VersioningAtConnect::Enabled;
+        let versioning_suspended = versioning == S3VersioningAtConnect::Suspended;
 
         Ok(Self {
             options,
@@ -760,6 +783,7 @@ impl S3Storage {
             )?,
             is_bucket_versioned,
             versioning_suspended,
+            versioning_at_connect: versioning,
         })
     }
 
@@ -4773,6 +4797,7 @@ mod tests {
             transfer_concurrency: DEFAULT_TRANSFER_CONCURRENCY,
             is_bucket_versioned: false,
             versioning_suspended: false,
+            versioning_at_connect: S3VersioningAtConnect::Never,
         }
     }
 

@@ -29,14 +29,19 @@ pub(super) struct S3Namespace<P> {
     protocol: Arc<P>,
     identity: BackendIdentity,
     limits: ListingLimits,
+    /// Whether listings give each key its history: taken once, when the namespace is connected
+    /// ([`S3Protocol::lists_histories`], P7 Q-A), so it holds for the connection.
+    histories: bool,
 }
 
 impl<P: S3Protocol + 'static> S3Namespace<P> {
-    pub(super) const fn new(protocol: Arc<P>, identity: BackendIdentity) -> Self {
+    pub(super) fn new(protocol: Arc<P>, identity: BackendIdentity) -> Self {
+        let histories = protocol.lists_histories();
         Self {
             protocol,
             identity,
             limits: ListingLimits::PRODUCTION,
+            histories,
         }
     }
 
@@ -155,14 +160,14 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
         Err(failure(from, FailureClass::Unsupported, NO_MUTATIONS))
     }
 
-    /// `histories` is what [`Namespace::list_versions`] serves on any bucket that keeps versions
-    /// until P7 C11b narrows it to versioned buckets. Object buckets keep content under keys
-    /// ending in `/` (`directory_objects`, P7 F5). An ONTAP NAS bucket keeps neither (P7 §14.2):
-    /// no versions, and a key ending in `/` holding content is stored as a file.
+    /// `histories`: what the bucket answered when it was connected ([`S3Protocol::lists_histories`],
+    /// P7 Q26 / Q-A: versioned, or would not say). Object buckets keep content under keys ending in `/` (`directory_objects`,
+    /// P7 F5). An ONTAP NAS bucket keeps neither (P7 §14.2): no versions, and a key ending in `/`
+    /// holding content is stored as a file.
     fn capabilities(&self) -> NamespaceCapabilities {
         let bucket = self.protocol.bucket_capabilities();
         NamespaceCapabilities {
-            histories: bucket.versions,
+            histories: self.histories,
             mutations: Err(NO_MUTATIONS),
             symlinks: false,
             names: NameSemantics::EXACT,

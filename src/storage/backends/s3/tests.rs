@@ -336,6 +336,9 @@ impl S3Protocol for MemoryS3 {
     fn versioning_enabled(&self) -> bool {
         self.versioning_is_enabled()
     }
+    fn versioning_at_connect(&self) -> S3VersioningAtConnect {
+        self.versioning_answer_at_connect()
+    }
     fn bucket_capabilities(&self) -> S3BucketCapabilities {
         self.capabilities()
     }
@@ -746,6 +749,9 @@ mod memory_native;
 
 #[path = "memory_listing.rs"]
 mod memory_listing;
+
+#[path = "connect_versioning_tests.rs"]
+mod connect_versioning_tests;
 
 #[path = "memory_nas.rs"]
 mod memory_nas;

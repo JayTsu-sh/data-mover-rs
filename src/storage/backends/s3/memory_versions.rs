@@ -18,6 +18,10 @@
 //!
 //! With versioning off (the default) the fake behaves as before, and lists an existing object as
 //! version `"null"`.
+//!
+//! What `GetBucketVersioning` answered at connection (P7 Q-A) follows the mode by default —
+//! enabled, suspended, never — or is what [`MemoryS3::answer_at_connect`] set: a refusal, a store
+//! without versioning, or no answer at all.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{MutexGuard, PoisonError};
@@ -29,6 +33,7 @@ use crate::model::{FailureClass, Transience};
 use crate::storage::artifacts::is_artifact_path;
 use crate::storage::backends::s3::{
     S3BucketVersioning, S3DeleteReply, S3ObjectFacts, S3ProtocolFailure, S3Result, S3VersionFacts,
+    S3VersioningAtConnect,
 };
 
 /// What [`MemoryS3::forget_version`] did.
@@ -70,6 +75,8 @@ pub(crate) struct VersionedBucket {
     merges_markers: bool,
     /// A delete-marker write removes the key's `"null"` version instead of covering it (DXN).
     drops_null_version: bool,
+    /// What `GetBucketVersioning` answered at connection, when not what the mode says.
+    answer_at_connect: Option<S3VersioningAtConnect>,
     next: u64,
 }
 
@@ -145,6 +152,24 @@ impl MemoryS3 {
     /// (adding no marker when it was the newest record), as DXN does.
     pub(crate) fn drop_null_versions_on_delete(&self) {
         self.bucket().drops_null_version = true;
+    }
+
+    /// From now on the answer `GetBucketVersioning` gave at connection is `answer`, whatever the
+    /// mode (P7 Q-A): `Refused`, `NoVersioning`, `Unreachable`, or a state the mode is not. A
+    /// namespace takes the answer when it is connected: set it before connecting.
+    pub(crate) fn answer_at_connect(&self, answer: S3VersioningAtConnect) {
+        self.bucket().answer_at_connect = Some(answer);
+    }
+
+    /// What `GetBucketVersioning` answered at connection: what [`Self::answer_at_connect`] set, or
+    /// what the mode says.
+    pub(super) fn versioning_answer_at_connect(&self) -> S3VersioningAtConnect {
+        let bucket = self.bucket();
+        bucket.answer_at_connect.unwrap_or(match bucket.mode {
+            Versioning::Enabled => S3VersioningAtConnect::Enabled,
+            Versioning::Suspended => S3VersioningAtConnect::Suspended,
+            Versioning::Off => S3VersioningAtConnect::Never,
+        })
     }
 
     /// The bucket's versioning as `GetBucketVersioning` would answer now.

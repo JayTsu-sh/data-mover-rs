@@ -169,6 +169,10 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         self.is_bucket_versioned
     }
 
+    fn versioning_at_connect(&self) -> crate::storage::backends::s3::S3VersioningAtConnect {
+        self.versioning_at_connect
+    }
+
     fn bucket_capabilities(&self) -> crate::storage::backends::s3::S3BucketCapabilities {
         super::architecture::bucket_capabilities(self.options)
     }

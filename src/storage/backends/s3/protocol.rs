@@ -253,6 +253,36 @@ pub(crate) struct S3NativeCopySource {
     pub size: u64,
 }
 
+/// What `GetBucketVersioning` answered when the bucket was connected (P7 §10.1, Q26, Q-A): it
+/// decides, once per connection, whether a listing gives each key its history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum S3VersioningAtConnect {
+    /// `Enabled`.
+    Enabled,
+    /// `Suspended`: the histories written while it was enabled stay.
+    Suspended,
+    /// Never enabled: the answer names no status.
+    Never,
+    /// The store has no versioning at all (501, `NotImplemented`, `UnsupportedOperation`).
+    NoVersioning,
+    /// The server refused to say (403, or another explicit refusal), answered with a status this
+    /// build does not know, or the request could not be built (it then fails again when the
+    /// bucket is listed, with that request's own failure).
+    Refused,
+    /// No answer after the SDK's retries: a timeout, a lost connection (`status` `None`),
+    /// throttling or a server error (`status` the HTTP status).
+    Unreachable { status: Option<u16> },
+}
+
+impl S3VersioningAtConnect {
+    /// Whether the bucket's listings give each key its history: `Enabled`, `Suspended`, and a
+    /// refusal to say (Q26: `ListObjectVersions` answers an unversioned bucket with one `"null"`
+    /// record per key — correct, only slower).
+    pub(crate) const fn keeps_histories(self) -> bool {
+        matches!(self, Self::Enabled | Self::Suspended | Self::Refused)
+    }
+}
+
 /// A bucket's versioning as `GetBucketVersioning` answers it now (P7 H1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum S3BucketVersioning {
@@ -283,6 +313,15 @@ pub(crate) trait S3Protocol: Send + Sync {
     /// answered `Enabled`). A write there whose reply names no version is settled
     /// through the key's versions (ADR-0006 C18: DXN's `CopyObject` sends no `x-amz-version-id`).
     fn versioning_enabled(&self) -> bool;
+    /// What `GetBucketVersioning` answered when the bucket was connected (P7 Q-A); fixed for the
+    /// connection.
+    fn versioning_at_connect(&self) -> S3VersioningAtConnect;
+    /// Whether a listing gives each key its whole history (P7 §10.1, Q26): the bucket's profile
+    /// keeps versions (never an ONTAP NAS bucket) and the answer at connection says it keeps
+    /// histories ([`S3VersioningAtConnect::keeps_histories`]). Fixed for the connection.
+    fn lists_histories(&self) -> bool {
+        self.bucket_capabilities().versions && self.versioning_at_connect().keeps_histories()
+    }
     /// What the bucket can do, from the URL's profile (P7 §14.2); fixed for the connection.
     fn bucket_capabilities(&self) -> S3BucketCapabilities;
     async fn head(&self, key: &str) -> S3Result<S3ObjectFacts>;

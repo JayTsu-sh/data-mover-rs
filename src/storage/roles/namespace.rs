@@ -119,7 +119,9 @@ const NO_MUTATIONS: &str = "namespace mutations are unsupported by this namespac
 /// What a namespace can do, and how it compares names (P7 §5.4.5).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NamespaceCapabilities {
-    /// Whether [`Namespace::list_versions`] lists stored versions (a versioned object store).
+    /// Whether the namespace keeps every stored version of an object, so that
+    /// [`Namespace::list_versions`] lists them: decided when the storage was connected (an S3
+    /// bucket that was versioned then, or would not say).
     pub histories: bool,
     /// Whether `create_directory`, `delete` and `rename` are supported; the reason when they are
     /// not. Recursive delete and recursive create refuse a namespace without them before any I/O.

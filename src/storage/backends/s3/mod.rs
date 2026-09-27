@@ -17,14 +17,16 @@ mod staged;
 
 use std::sync::Arc;
 
-use crate::model::{BackendIdentity, BackendKind};
+use crate::model::{
+    BackendIdentity, BackendKind, BackendSessionFailure, FailureClass, Operation, Transience,
+};
 use crate::storage::{BackendCapabilities, CapabilityAvailability, Namespace, Storage};
 
 pub(crate) use protocol::{
     S3BucketVersioning, S3DeleteReply, S3ListedObject, S3ListedVersion, S3NativeCopyEvidence,
     S3NativeCopySource, S3ObjectFacts, S3ObjectPage, S3PartFacts, S3Protocol, S3ProtocolFailure,
     S3RejectedEntry, S3Result, S3StreamedPut, S3VersionFacts, S3VersionMarker, S3VersionPage,
-    S3WriteFacts, composite_etag, is_real_version_id,
+    S3VersioningAtConnect, S3WriteFacts, composite_etag, is_real_version_id,
 };
 
 pub(crate) use broken_body::broken_body_failure;
@@ -153,6 +155,7 @@ where
     if identity.kind() != BackendKind::S3 {
         return Err("S3 roles require an S3 backend identity".into());
     }
+    refuse_unknown_versioning(protocol.as_ref())?;
     let source = Arc::new(source::S3ReadSource::new(
         protocol.clone(),
         identity.clone(),
@@ -196,6 +199,35 @@ where
         native,
     )
     .map_err(Into::into)
+}
+
+/// A bucket whose profile keeps versions but whose `GetBucketVersioning` got no answer at
+/// connection (P7 Q-A): whether its listings carry histories is unknown, and guessing would make
+/// two scans of one bucket disagree (a `"null"` record per key, or none). A transient
+/// `Connectivity` session failure, so the caller connects again; a refusal to answer is no such
+/// failure (it lists histories, Q26), and a NAS bucket never lists them.
+fn refuse_unknown_versioning<P: S3Protocol + ?Sized>(
+    protocol: &P,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let S3VersioningAtConnect::Unreachable { status } = protocol.versioning_at_connect() else {
+        return Ok(());
+    };
+    if !protocol.bucket_capabilities().versions {
+        return Ok(());
+    }
+    let answer = status.map_or_else(
+        || "no response (timeout or lost connection)".to_owned(),
+        |status| format!("HTTP {status}"),
+    );
+    Err(Box::new(BackendSessionFailure::new(
+        Operation::Connect,
+        FailureClass::Connectivity,
+        Transience::Transient,
+        format!(
+            "GetBucketVersioning got no answer when the bucket was connected ({answer}): whether \
+             its listings carry every version is unknown; connect again"
+        ),
+    )?))
 }
 
 #[cfg(test)]

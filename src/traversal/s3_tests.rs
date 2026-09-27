@@ -21,7 +21,9 @@ use crate::model::{
     SourceVersion, StoragePath, StorageTimestamp, TimePrecision, Transience,
 };
 use crate::storage::backends::s3::tests::{MemoryS3, Versioning, content_md5, identity};
-use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure, connect};
+use crate::storage::backends::s3::{
+    S3Protocol as _, S3ProtocolFailure, S3VersioningAtConnect, connect,
+};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -305,6 +307,8 @@ async fn pruned_and_truncated_prefixes_are_never_listed() -> TestResult {
     assert_eq!(protocol.listing().calls, ["", "keep/", "keep/deep/"]);
 
     protocol.listing().calls.clear();
+    // Never versioned: only a refusal to say lists histories (P7 Q26).
+    protocol.answer_at_connect(S3VersioningAtConnect::Refused);
     let mut shallow = request(TraversalVersions::All);
     shallow.max_depth = Some(limit(1));
     let (items, _) = traverse(&protocol, shallow).await?;

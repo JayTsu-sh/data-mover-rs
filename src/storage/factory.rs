@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use crate::hdfs::HdfsConfig;
-use crate::model::{BackendIdentity, BackendKind};
+use crate::model::{BackendIdentity, BackendKind, BackendSessionFailure};
 use crate::storage::backends::s3::single_put_threshold;
 use crate::storage::{Storage, endpoint};
 use crate::url_redact::redact_storage_url;
@@ -133,6 +133,7 @@ pub enum BackendConfig {
 pub struct BackendConnectError {
     kind: BackendKind,
     message: String,
+    session: Option<BackendSessionFailure>,
 }
 
 impl BackendConnectError {
@@ -140,12 +141,36 @@ impl BackendConnectError {
         Self {
             kind,
             message: error.to_string(),
+            session: None,
+        }
+    }
+
+    /// A connection refused by the roles: typed when they say why (a `BackendSessionFailure`,
+    /// e.g. S3's unanswered `GetBucketVersioning`, P7 Q-A), with its diagnostic in the message.
+    fn from_roles(kind: BackendKind, error: &(dyn std::error::Error + 'static)) -> Self {
+        let session = error.downcast_ref::<BackendSessionFailure>().cloned();
+        let message = session.as_ref().map_or_else(
+            || error.to_string(),
+            |session| format!("{session}: {}", session.diagnostic()),
+        );
+        Self {
+            kind,
+            message,
+            session,
         }
     }
 
     #[must_use]
     pub const fn kind(&self) -> BackendKind {
         self.kind
+    }
+
+    /// The typed failure behind this error, when the connection's roles reported one: its class
+    /// and transience say whether connecting again may help (S3: an unanswered
+    /// `GetBucketVersioning` is `Connectivity` / `Transient`).
+    #[must_use]
+    pub const fn session_failure(&self) -> Option<&BackendSessionFailure> {
+        self.session.as_ref()
     }
 }
 
@@ -256,7 +281,7 @@ pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendCo
                 .map_err(|error| BackendConnectError::new(BackendKind::S3, error))?;
             storage
                 .architecture_storage_with_single_put_threshold(threshold)
-                .map_err(|error| BackendConnectError::new(BackendKind::S3, error))
+                .map_err(|error| BackendConnectError::from_roles(BackendKind::S3, error.as_ref()))
         }
         BackendConfig::Hdfs(config) => {
             let storage = crate::hdfs::create_hdfs_storage(
