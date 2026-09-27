@@ -24,8 +24,8 @@
 #   zero-byte ones included; balanced totals, no failure; --order blocks identical at c=1/4/32.
 # - Traversal roots: --path dirobj reports `failure scope=Child dirobj/ Unsupported` and does not
 #   emit dirobj/; --path emptydir reports and emits nothing of emptydir/.
-# - All (versioned): dirobj/ one 5 B version; z/ 0 B, marker, 0 B; m/ 5 B, 0 B, marker, 3 B,
-#   marker (latest last).
+# - Histories (versioned): each own object one entry; dirobj/ one 5 B version; z/ 0 B, marker, 0 B;
+#   m/ 5 B, 0 B, marker, 3 B, marker (latest last), listed although deleted now.
 # - Legacy walkdir / walkdir_2: an ERROR naming each own object that holds content (dirobj/,
 #   lonely/, big/, and m/ in a versioned bucket), none for the zero-byte ones.
 # - Copies (transfer_resume, same bucket): dirobj/ and emptydir/ streamed (single PUT), dirobj/
@@ -307,7 +307,7 @@ print("   %s/ lists: objects=%s prefixes=%s" % (sys.argv[2], [(e.findtext(ns + "
     fi
     observe "$d/ ($bytes B) written $order: PUT $d/=$code1 PUT $d/c=$code2" "$d"
   done
-  traverse "$WORK/nas" --versions current --sizes
+  traverse "$WORK/nas" --current --sizes
   echo "-- role traversal of the NAS prefix:"; sed 's/^/   /' "$WORK/nas"; sed 's/^/   stderr: /' "$WORK/nas.err"
   echo "RESULT: D6 recorded (no assertions)"
   exit 0
@@ -358,7 +358,7 @@ check "seed big/ ($BIG_MB MiB, one PUT to a d/ key)" "$(jq -r .result <<<"$out" 
 [ "$(jq -r .result <<<"$out" 2>/dev/null)" = ok ] || { echo "   $out"; tail -3 "$WORK/seed.err" | sed 's/^/   /'; }
 
 echo "== role traversal, current objects"
-traverse "$WORK/cur" --versions current --sizes
+traverse "$WORK/cur" --current --sizes
 sed 's/^/   /' "$WORK/cur"; sed 's/^/   stderr: /' "$WORK/cur.err"
 if [ "$VERSIONED" = 1 ]; then
   # m/'s newest record is a delete marker: what the store's current listing says about it.
@@ -379,29 +379,33 @@ File emptydir/child size=1
 File lonely/ size=6
 File plain.txt size=1"
 [ "$VERSIONED" = 1 ] && expected_current=$(printf '%s\nDirectory z size=-\nFile z/ size=0' "$expected_current" | sort)
-# MinIO still lists the prefix m/ of the deleted directory object m/ (a store quirk, reported):
-# the directory m is then an empty block, never an entry m/.
-echo "   store lists the prefix of the deleted directory object m/: $(grep -c '^Directory m size=-$' "$WORK/cur")"
+# The directory m of the deleted directory object m/: a versioned bucket is listed with histories
+# (P7 C11b), where m/ still has records, so its prefix m is listed (--current then prints no m/);
+# on a store that keeps no versions of m/ it is gone. Either way never an entry m/ here.
+echo "   directory m listed beside the deleted directory object m/: $(grep -c '^Directory m size=-$' "$WORK/cur")"
 check "current entries" "$(grep -E '^(File|Directory) ' "$WORK/cur" | grep -v '^Directory m size=-$' | sort)" "$(sort <<<"$expected_current")"
 check "current totals balanced, no failure" "$(grep -c '^totals balanced=true' "$WORK/cur") $(grep -c '^failure' "$WORK/cur.err")" "1 0"
 check "current outcome" "$(grep -o 'outcome=Completed[^ ]*' "$WORK/cur" | head -1)" "outcome=Completed(TraversalCompletion"
 for c in 1 4 32; do
-  "$ROLE" --backend s3 --concurrency "$c" traverse --versions current --order blocks --sizes >"$WORK/blocks-$c" 2>/dev/null || FAILED=1
+  "$ROLE" --backend s3 --concurrency "$c" traverse --current --order blocks --sizes >"$WORK/blocks-$c" 2>/dev/null || FAILED=1
 done
 check "blocks identical at c=1/4/32" "$([ -s "$WORK/blocks-1" ] && cmp -s "$WORK/blocks-1" "$WORK/blocks-4" && cmp -s "$WORK/blocks-1" "$WORK/blocks-32" && echo yes)" yes
 
 echo "== traversal roots"
-traverse "$WORK/root-dirobj" --versions current --path dirobj --sizes
+traverse "$WORK/root-dirobj" --current --path dirobj --sizes
 check "root dirobj: own object reported" "$(grep -c '^failure scope=Child dirobj/ Unsupported' "$WORK/root-dirobj.err")" 1
 check "root dirobj: entries" "$(grep -E '^(File|Directory) ' "$WORK/root-dirobj" | tr '\n' ';')" "File dirobj/child size=1;"
-traverse "$WORK/root-empty" --versions current --path emptydir --sizes
+traverse "$WORK/root-empty" --current --path emptydir --sizes
 check "root emptydir: nothing of emptydir/" "$(grep -c 'emptydir/ ' "$WORK/root-empty" "$WORK/root-empty.err" | awk -F: '{s+=$2} END {print s}') $(grep -E '^(File|Directory) ' "$WORK/root-empty" | tr '\n' ';')" "0 File emptydir/child size=1;"
 
 if [ "$VERSIONED" = 1 ]; then
-  echo "== role traversal, every version"
-  traverse "$WORK/all" --versions all
+  echo "== role traversal, each key with its history"
+  traverse "$WORK/all"
   grep -E ' (dirobj|z|m|e)/ ' "$WORK/all" | sed 's/^/   /'
-  hist() { grep -E "^File $1 version=" "$WORK/all" | sed -E 's/.* latest=([01]) marker=([01]) size=(\S+).*/\1\2\3/' | tr '\n' ' '; }
+  hist() { grep -E "^Record $1 " "$WORK/all" | sed -E 's/.* latest=([01]) marker=([01]) size=(\S+).*/\1\2\3/' | tr '\n' ' '; }
+  # Each key ending in '/' is one entry of its directory, whatever its history (m/ deleted now too).
+  for k in dirobj/ e/ z/; do check "one entry $k" "$(grep -cE "^File $k " "$WORK/all")" 1; done
+  [ "$DIR_VERSIONED" = 1 ] && check "one entry m/ (deleted now)" "$(grep -cE '^File m/ ' "$WORK/all")" 1
   check "all dirobj/ (5 B)" "$(hist dirobj/)" "105 "
   check "all e/ (0 B)" "$(hist e/)" "100 "
   if [ "$DIR_VERSIONED" = 1 ]; then
@@ -505,10 +509,10 @@ if [ "$VERSIONED" = 1 ]; then
     [ "$DIR_VERSIONED" = 1 ] && want_records=9 || want_records=2
     check "replay: records, none failed" "$(grep -oE 'records=[0-9]+ .* failed=[0-9]+' "$WORK/replay" | sed -E 's/records=([0-9]+) .* failed=/\1 /')" "$want_records 0"
     # Compare each key's records at the source and the destination by kind and size, in order,
-    # as the role traversal of every version orders them (the server's order, or inferred).
+    # as the role traversal of a versioned bucket orders them (the server's order, or inferred).
     shape() { # storage URL root, key
-      S3_LISTING_URL="$1" "$ROLE" --backend s3 --concurrency 4 traverse --versions all 2>/dev/null |
-        grep -E "^File $2 version=" | sed -E 's/.* marker=([01]) size=(\S+).*/\1:\2/' | tr '\n' ' '
+      S3_LISTING_URL="$1" "$ROLE" --backend s3 --concurrency 4 traverse 2>/dev/null |
+        grep -E "^Record $2 " | sed -E 's/.* marker=([01]) size=(\S+).*/\1:\2/' | tr '\n' ' '
     }
     DURL=$(s3_url "$DVB" "$DQ") || exit 2
     for key in m/ z/ dirobj/; do

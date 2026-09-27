@@ -7,7 +7,7 @@
 #   BIN=<storage_role_operations binary> BACKEND=local|nfs|cifs|s3 OUT=<empty dir> \
 #     [ROOT=<backend root>] [TPATH=<sub-path>] [ORDER=unordered|blocks] [CONC=8] \
 #     [MODE=cancel|kill] [CANCEL_AFTER=<entries>] [KILL_AFTER=<seconds>] [EVERY=<seconds>] \
-#     [MAX_ROUNDS=50] [EXTRA="--versions all"] traversal_resume.sh
+#     [MAX_ROUNDS=50] [EXTRA="<more traverse flags>"] traversal_resume.sh
 #
 # MODE=cancel (default): each run is cancelled after CANCEL_AFTER entries, drains, and ends with its
 #   final checkpoint; the next run resumes from it.
@@ -15,6 +15,9 @@
 #   only the entries printed before the last `checkpoint` line count, the next run resumes from the
 #   last checkpoint file — a crash, not a pause.
 # The backend's environment (NFS_REAL_URL, CIFS_REAL_*, S3_LISTING_URL) must already be exported.
+# A versioned S3 bucket's keys come with their histories (P7 C11b): each record is its own `Record`
+# line and is compared too, so the union must hold every record of every key (a key's history is
+# delivered again from its first segment after a resume).
 # Every run is bounded by `timeout`. Exit 0 only when the union equals the uninterrupted run.
 set -u
 : "${BIN:?}" "${BACKEND:?}" "${OUT:?}"
@@ -23,7 +26,7 @@ MODE=${MODE:-cancel}; CANCEL_AFTER=${CANCEL_AFTER:-1000}; KILL_AFTER=${KILL_AFTE
 EVERY=${EVERY:-1}; MAX_ROUNDS=${MAX_ROUNDS:-50}; read -r -a extra <<< "${EXTRA:-}"
 mkdir -p "$OUT"
 common=(--backend "$BACKEND" --root "$ROOT" --concurrency "$CONC" traverse --order "$ORDER" --path "$TPATH" "${extra[@]}")
-entries() { grep -E '^(File|Directory|Symlink|Special) ' "$@"; }
+entries() { grep -E '^(File|Directory|Symlink|Special|Record) ' "$@"; }
 
 timeout 3600 "$BIN" "${common[@]}" > "$OUT/full.out" 2> "$OUT/full.err"
 grep -q 'outcome=Completed' "$OUT/full.out" || { echo "RESULT FAIL full run did not complete"; tail -3 "$OUT/full.err"; exit 1; }
@@ -63,6 +66,8 @@ runs = {f: open(f).read() for f in glob.glob(f"{out}/r*.out")}
 sizes = [int(m.group(1)) for text in runs.values() for m in re.finditer(r'^checkpoint bytes=(\d+)', text, re.M)]
 # Checkpoints a cancelled round emitted besides its final one: at least one means it resumed past a periodic one.
 periodic = [len(re.findall(r'^checkpoint bytes=', t, re.M)) - 1 for t in runs.values() if 'outcome=Completed' not in t]
+# Every line of the full run is unique: a `Record` line carries <segment>.<n>, and the entry lines of
+# one key's segments differ in `history=`. Changing either print format must keep that.
 ok = fs == gs and len(full) == len(fs)
 print(f"RESULT {'PASS' if ok else 'FAIL'} rounds={rounds} full={len(full)} delivered={len(got)} "
       f"duplicates={len(got) - len(gs)} lost={len(fs - gs)} invented={len(gs - fs)} "

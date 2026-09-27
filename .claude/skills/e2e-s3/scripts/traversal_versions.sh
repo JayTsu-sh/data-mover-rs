@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# ADR-0006 C22 / P7: the role-based S3 traversal in both version modes against a real server
-# (examples/storage_role_operations/traverse.rs `traverse --versions current|all`), and the legacy walkdir /
-# walkdir_2 (examples/s3_listing.rs). Three ways to pick the bucket:
+# ADR-0006 C22 / P7 C11b: the role-based S3 traversal against a real server
+# (examples/storage_role_operations/traverse.rs): on a versioned bucket each key is ONE entry with
+# its history (`File <key> history=<segment>/<complete> records=<n>[ order=inferred]`, then one
+# `Record <key> <segment>.<n> version=<id|null> latest=<0|1> marker=<0|1> size=<n|->` line per
+# version and delete marker), and `--current` prints the current objects only; plus the legacy
+# walkdir / walkdir_2 (examples/s3_listing.rs). Three ways to pick the bucket:
 #
 # - Default: creates ONE temporary bucket on the .env's server, <BUCKET_PREFIX>-<run> (versioning
 #   enabled), and on exit deletes it completely: every version and delete marker by id, every open
@@ -24,12 +27,15 @@
 # the first 1 000-entry page of ListObjectVersions; then (temporary bucket only), with versioning
 # suspended, n written twice (one "null" version).
 #
-# The zero-byte d/ is a directory object (P7 F5, D8): one zero-byte file entry d/ of d (Current), one
-# version of size 0 (All); the legacy walks still skip it (only a d/ holding content is reported).
+# The zero-byte d/ is a directory object (P7 F5, D8): one zero-byte file entry d/ of d (--current),
+# one record of size 0 (histories); the legacy walks still skip it (only a d/ holding content is
+# reported).
 #
-# Checks (versioned): All lists k as 2, 3, marker, 4 with only the last latest, gone as a version
-# and a latest marker, p/z as 1, 2, 3, n as version=null latest=1, no artifact; Current lists k
-# (4 B) without gone; --order blocks gives the same lines at concurrency 1, 4 and 32. Legacy
+# Checks (versioned): k and gone are ONE entry each; k's records are 2, 3, marker, 4 with only the
+# last latest; gone (deleted now, still listed) a version and a latest marker; p/z one entry of
+# three records 1, 2, 3 across the first 1 000-entry page; n version=null latest=1; no artifact;
+# --current lists k (4 B) without gone and no Record line; --order blocks gives the same lines at
+# concurrency 1, 4 and 32; Unordered the same entries and records, each key once. Legacy
 # walkdir / walkdir_2 (versioning re-enabled first: a suspended bucket is walked by ListObjectsV2):
 # k as v1, v2, marker, v3 (ids as written), gone as its version then a latest marker (D4), p/z
 # whole across the page, no artifact. Unversioned: Current and the legacy walks list each key once
@@ -38,9 +44,9 @@
 # EXPECT_DIR_MARKER (default 1): how many current entries the zero-byte d/ gives (P7 F5); 0 for a
 # store that keeps no such object.
 #
-# History order: every version row of a key with a delete marker (k, gone) must carry
-# ` order=inferred` exactly when EXPECT_ORDER=inferred (RustFS 1.0.0 lists each page's delete
-# markers before its versions, P7 existing issue 11); every other row never does.
+# History order: the entry of a key with a delete marker (k, gone) must carry ` order=inferred`
+# exactly when EXPECT_ORDER=inferred (RustFS 1.0.0 lists each page's delete markers before its
+# versions, P7 existing issue 11); every other entry never does.
 #
 # Also: whether the server honours `delimiter` (raw request, printed).
 #
@@ -244,42 +250,51 @@ traverse() { # concurrency, args...
   "$BIN" --backend s3 --concurrency "$1" traverse "${@:2}" 2>"$WORK/stderr" \
     || { echo "traverse $* failed:" >&2; cat "$WORK/stderr" >&2; return 1; }
 }
-# The checks below count directory events, which only Blocks delivers: pin it.
+# The checks below count directory events, which only Blocks delivers: pin it. A versioned bucket
+# lists each key with its history by itself; an unversioned one its current objects.
 if [ "$VERSIONED" = 1 ]; then
-  traverse 8 --versions all --order blocks >"$WORK/all" || FAILED=1
-  BLOCKS=all
+  traverse 8 --order blocks >"$WORK/all" || FAILED=1
 else
   : >"$WORK/all"
-  BLOCKS=current
 fi
-traverse 8 --versions current --order blocks >"$WORK/current" || FAILED=1
-for c in 1 4 32; do traverse "$c" --versions "$BLOCKS" --order blocks >"$WORK/blocks-$c" || FAILED=1; done
-# Unordered (the default) delivers the same entries, each key's versions together and in the same
-# order: compare per key, and the whole set.
-for c in 1 32; do traverse "$c" --versions "$BLOCKS" >"$WORK/unordered-$c" || FAILED=1; done
-role_entries() { grep -E '^(File|Directory|Symlink) ' "$1" | sort; }
-key_runs() { grep -E '^File ' "$1" | awk '{print $2}' | uniq | sort; }
+traverse 8 --current --order blocks >"$WORK/current" || FAILED=1
+for c in 1 4 32; do traverse "$c" --order blocks >"$WORK/blocks-$c" || FAILED=1; done
+# Unordered (the default) delivers the same entries and records, each key once: compare the whole
+# set, and that no key comes twice.
+for c in 1 32; do traverse "$c" >"$WORK/unordered-$c" || FAILED=1; done
+role_entries() { grep -E '^(File|Directory|Symlink|Record) ' "$1" | sort; }
+# Each key once: this fixture's histories are far below the 100 000 records a key is segmented at.
+twice() { grep -E '^File ' "$1" | awk '{print $2}' | sort | uniq -d | wc -l; }
 for c in 1 32; do
   if cmp -s <(role_entries "$WORK/blocks-1") <(role_entries "$WORK/unordered-$c") \
-    && cmp -s <(key_runs "$WORK/blocks-1") <(key_runs "$WORK/unordered-$c") \
+    && [ "$(twice "$WORK/unordered-$c")" = 0 ] && [ "$(twice "$WORK/blocks-1")" = 0 ] \
     && ! grep -q '^listed ' "$WORK/unordered-$c"; then
-    echo "unordered c=$c: same entries as blocks, each key's versions together, no directory events"
+    echo "unordered c=$c: same entries and records as blocks, each key once, no directory events"
   else
     echo "unordered c=$c: differs from blocks"; FAILED=1
   fi
 done
-[ "$VERSIONED" = 1 ] && { echo "-- all (without p/a*)"; grep -v ' p/a' "$WORK/all"; }
+[ "$VERSIONED" = 1 ] && { echo "-- histories (without p/a*)"; grep -v ' p/a' "$WORK/all"; }
 echo "-- current (without p/a*)"; grep -v ' p/a' "$WORK/current"
 cmp -s "$WORK/blocks-1" "$WORK/blocks-4" && cmp -s "$WORK/blocks-1" "$WORK/blocks-32" \
-  && echo "blocks ($BLOCKS): identical at concurrency 1, 4, 32 ($(wc -l <"$WORK/blocks-1") lines)" \
-  || { echo "blocks ($BLOCKS): output differs between concurrency levels"; FAILED=1; }
+  && echo "blocks: identical at concurrency 1, 4, 32 ($(wc -l <"$WORK/blocks-1") lines)" \
+  || { echo "blocks: output differs between concurrency levels"; FAILED=1; }
 python3 - "$WORK/all" "$WORK/current" "$MODE" "$EXPECT_ORDER" "${EXPECT_DIR_MARKER:-1}" <<'PY' || FAILED=1
 import re, sys
 all_, cur, mode, expect, dir_marker = sys.argv[1:6]
 def rows(path, name):
+    # Entry lines of `name`: (segment, complete, records, order), all None without a history.
     out = []
     for line in open(path):
-        m = re.match(r"File (\S+)(?: version=(\S+) latest=(\d) marker=(\d) size=(\S+)(?: order=(\S+))?)?$", line.strip())
+        m = re.match(r"File (\S+)(?: history=(\d+)/(\d) records=(\d+)(?: order=(\S+))?)?$", line.strip())
+        if m and m.group(1) == name:
+            out.append(m.groups()[1:])
+    return out
+def records(path, name):
+    # Record lines of `name`, in order: (version, latest, marker, size).
+    out = []
+    for line in open(path):
+        m = re.match(r"Record (\S+) \d+\.\d+ version=(\S+) latest=(\d) marker=(\d) size=(\S+)$", line.strip())
         if m and m.group(1) == name:
             out.append(m.groups()[1:])
     return out
@@ -289,7 +304,9 @@ checks = {
     "current k": (len(rows(cur, "k")), 1),
     "current gone": (len(rows(cur, "gone")), 0),
     "current p/z": (len(rows(cur, "p/z")), 1),
-    "current p/a count": (count(cur, lambda l: " p/a" in l), 999),
+    "current p/a count": (count(cur, lambda l: l.startswith("File p/a")), 999),
+    "current no records": (count(cur, lambda l: l.startswith("Record ")), 0),
+    "current no history": (count(cur, lambda l: " history=" in l), 0),
     "current d/e": (len(rows(cur, "d/e")), 1),
     "current sub/deep/f": (len(rows(cur, "sub/deep/f")), 1),
     "current n": (len(rows(cur, "n")), 1),
@@ -301,14 +318,17 @@ if mode != "unversioned":
     # versions (RustFS) cannot order by the listing; every other key's order is the server's.
     def orders(name):
         want = expect if name in ("k", "gone") else "server"
-        return ([r[4] or "server" for r in rows(all_, name)], [want] * len(rows(all_, name)))
+        return ([r[3] or "server" for r in rows(all_, name)], [want] * len(rows(all_, name)))
     checks.update({
-        "all k": ([(r[1], r[2], r[3]) for r in rows(all_, "k")], [("0", "0", "2"), ("0", "0", "3"), ("0", "1", "-"), ("1", "0", "4")]),
-        "all gone": ([(r[1], r[2]) for r in rows(all_, "gone")], [("0", "0"), ("1", "1")]),
-        "all p/z": ([(r[1], r[3]) for r in rows(all_, "p/z")], [("0", "1"), ("0", "2"), ("1", "3")]),
-        "all p/a count": (count(all_, lambda l: " p/a" in l), 999),
+        "one entry each": ([len(rows(all_, n)) for n in ("k", "gone", "p/z", "n")], [1, 1, 1, 1]),
+        "complete, one segment": ([rows(all_, n)[0][:2] for n in ("k", "gone", "p/z") if rows(all_, n)], [("0", "1")] * 3),
+        "all k": ([(r[1], r[2], r[3]) for r in records(all_, "k")], [("0", "0", "2"), ("0", "0", "3"), ("0", "1", "-"), ("1", "0", "4")]),
+        "all k records=": ([r[2] for r in rows(all_, "k")], ["4"]),
+        "all gone": ([(r[1], r[2]) for r in records(all_, "gone")], [("0", "0"), ("1", "1")]),
+        "all p/z": ([(r[1], r[3]) for r in records(all_, "p/z")], [("0", "1"), ("0", "2"), ("1", "3")]),
+        "all p/a count": (count(all_, lambda l: l.startswith("File p/a")), 999),
         "all d/e": (len(rows(all_, "d/e")), 1),
-        "all d/ marker": ([r[3] for r in rows(all_, "d/")], ["0"]),
+        "all d/ marker": ([r[3] for r in records(all_, "d/")], ["0"]),
         "all sub/deep/f": (len(rows(all_, "sub/deep/f")), 1),
         "listed dirs": (count(all_, lambda l: l.startswith("listed ")), 5),
         "listings complete": (count(all_, lambda l: l.startswith("listed ") and " Complete balanced=true " in l), 5),
@@ -318,9 +338,9 @@ if mode != "unversioned":
         "order n": orders("n"),
     })
     if mode == "temporary":
-        checks["all n"] = ([(r[0], r[1]) for r in rows(all_, "n")], [("null", "1")])
+        checks["all n"] = ([(r[0], r[1]) for r in records(all_, "n")], [("null", "1")])
     else:
-        checks["all n"] = ([(r[1], r[2]) for r in rows(all_, "n")], [("1", "0")])
+        checks["all n"] = ([(r[1], r[2]) for r in records(all_, "n")], [("1", "0")])
 files = (all_, cur) if mode != "unversioned" else (cur,)
 checks.update({
     "no artifacts": (sum(".data-mover" in l for f in files for l in open(f)), 0),

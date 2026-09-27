@@ -115,13 +115,15 @@ S3_PREFIX=test                   # bucket 内的子路径
    同参数再跑一次 `Resumed { … }`（取消时在途的段都拷完，SIGKILL 丢在途的段），`--compare` 相等，之后 0 / 0。
    源先用本地 → `s3:<prefix>` 上传，再 `--source s3:<prefix> --destination s3:<prefix>`（同 endpoint 才走原生）。
 
-8. **role-based 遍历的版本模式**（ADR-0006 C22）：`bash .claude/skills/e2e-s3/scripts/traversal_versions.sh`。新建**一个**
+8. **role-based 遍历：版本化桶每个 key 一项**（ADR-0006 C22，P7 C11b）：`bash .claude/skills/e2e-s3/scripts/traversal_versions.sh`。新建**一个**
    临时版本化桶 `data-mover-c22-<run>`，写 `k`（v1、v2、删除、v3）、`gone`（写后删）、两个 artifact、零字节 `d/` 与
    `d/e`、`sub/deep/f`、`p/a000..a998` 加三次 `p/z`（跨第一页 1000 条），再暂停版本写两次 `n`；用
-   `storage_role_operations --backend s3 traverse --versions all|current`（`S3_LISTING_URL` 只在脚本环境里）列举并断言：
-   All 的 `k` = 2 B、3 B、标记、4 B 只有最后一个 latest，`gone` = 版本 + latest 标记，`p/z` = 1、2、3 B，`n` =
-   `version=null latest=1`；Current 只有 `k`（4 B）没有 `gone`；无 artifact；`--order blocks` 并发 1 / 4 / 32 输出
-   相同。另外直接发一次带 `delimiter` 的 ListObjectVersions（打印服务器是否按 delimiter 折叠），并用 `examples/s3_listing`
+   `storage_role_operations --backend s3 traverse [--current]`（`S3_LISTING_URL` 只在脚本环境里；版本化桶自动每个 key
+   一项带历史：条目行 `history=<段号>/<complete> records=<n>`，每条记录一行 `Record <key> <段>.<序号> version= latest=
+   marker= size=`）列举并断言：`k`、`gone` 各一项；`k` 的记录 = 2 B、3 B、标记、4 B 只有最后一个 latest，`gone` = 版本 +
+   latest 标记（当前已删也列出），`p/z` 一项三条记录 1、2、3 B，`n` = `version=null latest=1`；`--current` 只有 `k`
+   （4 B）没有 `gone`、没有 `Record` 行；无 artifact；`--order blocks` 并发 1 / 4 / 32 输出相同，Unordered 条目与记录
+   同一集合、每个 key 一次。另外直接发一次带 `delimiter` 的 ListObjectVersions（打印服务器是否按 delimiter 折叠），并用 `examples/s3_listing`
    跑 legacy `walkdir` / `walkdir_2`（先重新开版本：暂停版本的桶走 ListObjectsV2）：`k` 按写入的 id 列 v1、v2、标记、v3，
    `gone` 列版本再列 latest 标记（D4），`p/z` 跨页完整，无 artifact。
    退出时按 id 删光版本与标记、删桶，打印 `cleanup: … deleted` 与剩下的桶；只有全部通过且桶已删才退出 0（编译失败、桶不是本次建的也以非 0 退出，trap 保留原退出码）。
@@ -132,7 +134,7 @@ S3_PREFIX=test                   # bucket 内的子路径
      Current 与 legacy（ListObjectsV2）：每个 key 一次（`k` 4 B、`p/z` 3 B、没有 `gone`、没有 artifact、999 个 `p/a*`），
      blocks 并发 1 / 4 / 32 一致；清理先删对象、再自深向浅删 NAS 桶为写过的 key 留下的目录。
    历史顺序：`EXPECT_ORDER=inferred`（RustFS：每页删除标记全在版本之前，现存问题 11）时，有删除标记的 key（`k`、`gone`）的
-   每一行必须带 ` order=inferred`，其余 key 一行都不许带；默认 `server` 时哪一行都不许带 —— 解析同时接受可选的
+   条目行必须带 ` order=inferred`，其余 key 一行都不许带；默认 `server` 时哪一行都不许带 —— 解析同时接受可选的
    ` order=…` 后缀，检查是精确的，不是容忍。
 
 9. **目录对象**（P7 F5）：`bash .claude/skills/e2e-s3/scripts/directory_objects.sh`。选桶方式同
