@@ -992,7 +992,7 @@ VERIFY
     已知差异见 `.claude/docs/storage-s3.md`「DXN」（UploadPartCopy 要 Content-Length: 0、CopyObject 不回版本、3 个网关各自打时间戳）
   - StorageGRID 11.5.0（独立租户 `data-mover-test`，用户 2026-09-26 批准并给出管理凭据）：桶 `data-mover-test` / `data-mover-test-ver`，租户内可建临时桶；CreateBucket 要 `Content-Length: 0`
 - 无序 S3：ONTAP NAS 桶（上面）+ 内存 fake 的打乱模式（Q22）
-- HDFS 真机（10.131.9.11 runner）每次需要用户批准（C8 已于 2026-09-26 批准并通过）
+- HDFS 真机（10.131.9.11 runner）：2026-09-27 起用户取消逐次批准，每个动 HDFS 的步骤（C10 起）都直接跑（C8 已于 2026-09-26 通过）
 ```
 
 ### 14.1 F5 目录对象：决定与要点（2026-09-26）

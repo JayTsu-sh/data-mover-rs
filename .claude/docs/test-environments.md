@@ -24,7 +24,7 @@
 | S3 | RustFS 1.0.0（VM 105） | S3 | WSL（管理网 9001） | 桶 `data-mover-test`；临时 `data-mover-*` 桶 | `e2e-s3/rustfs/.env` |
 | S3 | DXN-1（Ceph RGW Octopus） | S3（8184 明文；8182 HTTPS 自签证书，要 `S3_USE_HTTPS=true S3_TLS_VERIFY=false`） | WSL | 桶 `data-mover-test`（**永不开版本**）；临时桶（长期批准） | `e2e-s3/dxn/.env`（`S3_COMPAT=dxn`）+ `S3_LOCATION=magnascale:tos_placement` |
 | S3 | StorageGRID 11.5.0（独立租户 `data-mover-test`） | S3（明文 HTTP） | WSL | 桶 `data-mover-test`（无版本）、`data-mover-test-ver`（开版本）；租户内临时 `data-mover-*` 桶（用完删光） | `e2e-s3/storagegrid/.env`（`S3_COMPAT=sg` → `?compat=sg`） |
-| HDFS | Kerberos 集群（NameNode VM 301） | HDFS | **runner VM 102（逐次批准）** | 运行根 `/tmp/data-mover-nightly/<run>/` | `LAB_HDFS_*`（`tests/lab/README.md`） |
+| HDFS | Kerberos 集群（NameNode VM 301） | HDFS | **runner VM 102**（无需逐次批准，2026-09-27 起） | 运行根 `/tmp/data-mover-nightly/<run>/` | `LAB_HDFS_*`（`tests/lab/README.md`） |
 | 性能 | node1 + m1-source 53M 树 | NFSv3 | node1 | 只读遍历 | 见 §4 |
 | Local | WSL 本机 | — | WSL | 临时目录 | `make ci` / e2e-local |
 
@@ -121,7 +121,7 @@
 - **HDFS**（Kerberos，`HDFS.LOCAL`）：NameNode 10.131.9.30（VM 301），DataNode 10.131.9.31/32，namenode2 10.131.9.33（VM 304）。keytab 与主机名映射
   只在 **runner = VM 102**：快照 tarball → MinIO 临时 key → VM 里下载 → `su - github-runner` 用 setsid nohup 构建运行 → 清理。
   环境：`LAB_HDFS_CONFIG_DIR=/var/lib/data-mover-lab/hadoop`、keytab `/var/lib/data-mover-lab/terrasync-runner.keytab`
-  （`hdfs/terrasync-runner@HDFS.LOCAL`）、`KRB5_CONFIG=/var/lib/data-mover-lab/krb5.conf`。**每次使用都要用户批准。**
+  （`hdfs/terrasync-runner@HDFS.LOCAL`）、`KRB5_CONFIG=/var/lib/data-mover-lab/krb5.conf`。（2026-09-27 起用户取消逐次批准：动 HDFS 直接跑真机验证即可，仍只写运行根并清理。）
   已知：NameNode 按**有符号字节序**排名字；列举文件回文件自身；缺目录 `FileNotFound`。
 
 ### 2.5 StorageGRID 11.5.0
@@ -141,7 +141,7 @@
 | WSL（本机） | 默认；`make ci`、绝大多数 e2e | 经 NAT 出去：ONTAP NFSv3 不行；访问 GitHub 约 690 KB/s |
 | 10.131.9.10（VM 101，ubuntu-24c） | ONTAP NFSv3；能到 RustFS 业务网 10.10.1.x | root；glibc 2.39，**WSL 编的二进制直接跑**；工作目录 `/root/dm-test/`（用完清理）；自带 rustc 1.95 旧，别在上面编 |
 | node1（10.131.5.223） | 大树 / 性能（m1-source 53M） | RHEL9、glibc 2.34、32 核、200G 口 `ens1f0np0` = 192.168.131.126/24（2026-09-26 恢复）；**已无 gcc**，WSL 编 + glibc234 shim；上不了 GitHub；有他人登录，跑重负载前确认 |
-| runner VM 102（10.131.9.11） | HDFS 真机（逐次批准） | 与 MinIO 同一 VM；只经 PVE `qm guest exec` 进入 |
+| runner VM 102（10.131.9.11） | HDFS 真机（无需逐次批准） | 与 MinIO 同一 VM；只经 PVE `qm guest exec` 进入 |
 | PVE 宿主 10.131.9.20 | 管 VM、临时文件中转 | 别在宿主上跑负载 |
 
 ### 3.3 openfs（m1-source / m1-target）
