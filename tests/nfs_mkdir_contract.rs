@@ -1,4 +1,5 @@
-//! Optional real NFS contract: `create_directory_all` through levels the caller may not write.
+//! Optional real NFS contract: `create_directory_all`, writes and renames through levels the
+//! caller may not write.
 //!
 //! `NFS_REAL_URL` names an NFS URL whose identity (normally `uid=0&gid=0`) may create and chmod
 //! below its root. The test works only in its own `dm-mkdir-<nanos>` directory there:
@@ -6,6 +7,7 @@
 //! ```text
 //! dm-mkdir-<nanos>/          0755, owned by the URL's identity
 //!     ro/                    0555
+//!         keep/              0755
 //!         w/                 0777
 //! ```
 //!
@@ -17,7 +19,12 @@
 //! - `create_directory_all("…/ro/new")` fails `PermissionDenied` / Permanent at `…/ro/new`, and
 //!   nothing is created;
 //! - writing a file below a missing path in `ro` (`prepare_at_destination("…/ro/missing/sub/f")`,
-//!   the role write path creating its parents) fails `PermissionDenied` / Permanent too;
+//!   the role write path creating its parents) fails `PermissionDenied` / Permanent too, reported
+//!   at `…/ro/missing`, the level that was refused;
+//! - renaming `…/ro/keep` (in the unwritable `ro`) fails `PermissionDenied` / Permanent at
+//!   `…/ro/keep`, and renaming a directory of `…/ro/w` into a missing parent in `ro`
+//!   (`…/ro/gone/moved`) fails `PermissionDenied` / Permanent at `…/ro/gone`; neither moves
+//!   anything;
 //! - a directory this caller created (so its handle is cached) and the URL's identity then
 //!   deleted is rebuilt by one call: `create_directory_all` of a path below it, and a file
 //!   written into it.
@@ -83,6 +90,7 @@ async fn exercise(url: &str, owner: &Storage, scratch: &str) -> Result {
     let ro = format!("{scratch}/ro");
     let writable = format!("{ro}/w");
     create_directory_all(owner, &path(&writable)?).await?;
+    create_directory_all(owner, &path(&format!("{ro}/keep"))?).await?;
     let legacy = NFSStorage::new(url, None).await?;
     chmod(&legacy, &writable, 0o777).await?;
     chmod(&legacy, &ro, 0o555).await?;
@@ -129,6 +137,7 @@ async fn exercise(url: &str, owner: &Storage, scratch: &str) -> Result {
     }
     let source = fixture().await?;
     write_below_refused_level(&caller, &source, &ro).await?;
+    renames_refused_at_their_level(&caller, &ro, &writable).await?;
     rebuild_deleted_cached_directories(owner, &caller, &source, &writable).await?;
     read_only_file_system(&caller, scratch).await
 }
@@ -198,12 +207,84 @@ async fn write_below_refused_level(
         failure.transience(),
         failure.diagnostic()
     );
+    let level = format!("{ro}/missing");
     if failure.class() != FailureClass::PermissionDenied
         || failure.transience() != Transience::Permanent
+        || failure.path().as_str() != level
     {
-        return Err(format!("writing {target}: expected PermissionDenied / Permanent").into());
+        return Err(
+            format!("writing {target}: expected PermissionDenied / Permanent at {level}").into(),
+        );
     }
     Ok(())
+}
+
+/// The role rename classifies the server's refusal itself (the legacy rename made it `Protocol` /
+/// Unknown, retryable), and a refused missing parent of the destination is reported at that
+/// parent. Nothing is moved.
+async fn renames_refused_at_their_level(caller: &Storage, ro: &str, writable: &str) -> Result {
+    let namespace = caller.namespace(&PreflightPolicy::production())?;
+    let keep = format!("{ro}/keep");
+    let renamed = format!("{ro}/kept");
+    let answer = namespace.rename(&path(&keep)?, &path(&renamed)?).await;
+    expect_refused_at(answer, &format!("rename {keep} -> {renamed}"), &keep)?;
+
+    let moving = format!("{writable}/moving");
+    create_directory_all(caller, &path(&moving)?).await?;
+    let gone = format!("{ro}/gone");
+    let target = format!("{gone}/moved");
+    let answer = namespace.rename(&path(&moving)?, &path(&target)?).await;
+    let diagnostic = expect_refused_at(answer, &format!("rename {moving} -> {target}"), &gone)?;
+    if !diagnostic.contains(&format!("`{target}`")) {
+        return Err(format!("the refusal at {gone} must name {target}: {diagnostic}").into());
+    }
+
+    for (name, present) in [
+        (keep, true),
+        (renamed, false),
+        (moving, true),
+        (gone, false),
+    ] {
+        let found = match namespace.stat(&path(&name)?).await {
+            Ok(_) => true,
+            Err(StorageRoleFailure::Entry(failure))
+                if failure.class() == FailureClass::NotFound =>
+            {
+                false
+            }
+            Err(failure) => return Err(format!("stat {name}: {failure}").into()),
+        };
+        if found != present {
+            return Err(format!("after the refused renames {name} exists: {found}").into());
+        }
+    }
+    Ok(())
+}
+
+/// A refused answer: `PermissionDenied` / Permanent at `level`; its diagnostic.
+fn expect_refused_at(
+    answer: std::result::Result<(), StorageRoleFailure>,
+    what: &str,
+    level: &str,
+) -> Result<String> {
+    let failure = match answer {
+        Err(StorageRoleFailure::Entry(failure)) => failure,
+        outcome => return Err(format!("{what}: {outcome:?}").into()),
+    };
+    eprintln!(
+        "[nfs-mkdir] {what} refused: {:?} / {:?} at {}: {}",
+        failure.class(),
+        failure.transience(),
+        failure.path(),
+        failure.diagnostic()
+    );
+    if failure.class() != FailureClass::PermissionDenied
+        || failure.transience() != Transience::Permanent
+        || failure.path().as_str() != level
+    {
+        return Err(format!("{what}: expected PermissionDenied / Permanent at {level}").into());
+    }
+    Ok(failure.diagnostic().to_owned())
 }
 
 /// A directory the caller created (its handle cached) that the URL's identity then deletes: one

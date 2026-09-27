@@ -35,6 +35,11 @@ pub(crate) struct NfsProtocolFailure {
     /// (permission denied)`: the diagnostic names it, so a refused owner can be told from a
     /// refused permission without a packet capture.
     pub(crate) status: Option<Arc<str>>,
+    /// The directory level that failed, when it is not the entry the operation names: a missing
+    /// parent the write, rename or directory creation had to create first
+    /// (`NFSStorage::role_create_all`). The failure is reported at that level, and the
+    /// diagnostic names the operation's own entry.
+    pub(crate) level: Option<StoragePath>,
 }
 
 impl NfsProtocolFailure {
@@ -44,7 +49,16 @@ impl NfsProtocolFailure {
             class,
             transience,
             status: None,
+            level: None,
         }
+    }
+
+    /// Reports the failure at the missing parent `level` that failed, unless a deeper call
+    /// already named the level that failed.
+    #[must_use]
+    pub(crate) fn at_level(mut self, level: StoragePath) -> Self {
+        self.level.get_or_insert(level);
+        self
     }
 
     pub(crate) const fn protocol() -> Self {
@@ -455,17 +469,31 @@ pub(super) fn entry_scoped(
         class,
         transience,
         status,
+        level,
     } = error;
-    StorageRoleFailure::Entry(
-        EntryOperationFailure::new(
-            path.clone(),
-            operation,
-            class,
-            transience,
-            diagnostic("role", status.as_deref()),
-        )
-        .unwrap_or_else(|_| unreachable!("{DIAGNOSTIC_IS_VALID}")),
-    )
+    let plain = diagnostic("role", status.as_deref());
+    let (at, diagnostic) = match level {
+        Some(level) if level != *path => {
+            let context = parent_context(path, operation, status.as_deref());
+            (level, context)
+        }
+        _ => (path.clone(), plain.clone()),
+    };
+    let failure = EntryOperationFailure::new(at.clone(), operation, class, transience, diagnostic)
+        .or_else(|_| EntryOperationFailure::new(at, operation, class, transience, plain));
+    StorageRoleFailure::Entry(failure.unwrap_or_else(|_| unreachable!("{DIAGNOSTIC_IS_VALID}")))
+}
+
+/// The diagnostic of a failure at a missing parent level: which entry's operation needed it.
+fn parent_context(path: &StoragePath, operation: Operation, status: Option<&str>) -> String {
+    let context = format!(
+        "NFS role failed creating a missing parent directory of `{}` ({operation:?})",
+        path.as_str()
+    );
+    match status {
+        Some(status) => format!("{context}: {status}"),
+        None => context,
+    }
 }
 
 const DIAGNOSTIC_IS_VALID: &str =

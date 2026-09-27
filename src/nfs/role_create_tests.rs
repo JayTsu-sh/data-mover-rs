@@ -12,7 +12,7 @@ use nfs_rs::{Nfs3ErrorCode as V3, Nfs4ErrorCode as V4, NfsError};
 use super::super::{LookupFailure, MAX_STALE_RETRIES};
 use super::{FileCalls, Levels, create_exclusive, create_levels, lookup_failure};
 use crate::error::StorageError;
-use crate::model::{FailureClass, Transience};
+use crate::model::{FailureClass, StoragePath, Transience};
 use crate::storage::backends::nfs::source::NfsProtocolFailure;
 
 fn failure(class: FailureClass, transience: Transience) -> NfsProtocolFailure {
@@ -77,6 +77,65 @@ impl Levels for Path3 {
         record(&self.calls, format!("probe {depth}"));
         self.probe[depth - 1].clone()
     }
+
+    fn level(&self, depth: usize) -> Option<StoragePath> {
+        StoragePath::new(["a", "b", "c"][..depth].join("/")).ok()
+    }
+}
+
+fn level_of(failure: Option<&NfsProtocolFailure>) -> Option<&str> {
+    failure
+        .and_then(|failure| failure.level.as_ref())
+        .map(StoragePath::as_str)
+}
+
+/// A level that fails is where the failure is reported — not the entry whose write or rename
+/// needed it — whether the refusal stands or another class stopped it.
+#[tokio::test]
+async fn a_failure_is_reported_at_the_level_that_failed() {
+    let mut refused = Path3::new(0);
+    refused.create[1] = Err(denied());
+    refused.probe[1] = Ok(false);
+    let mut other = Path3::new(0);
+    other.create[0] = Err(failure(FailureClass::Capacity, Transience::Permanent));
+    for (path, level) in [(refused, "a/b"), (other, "a")] {
+        let reported = create_levels(&path).await.err();
+        assert_eq!(level_of(reported.as_ref()), Some(level));
+    }
+}
+
+/// A failure that says nothing about the level — a cancelled probe (R10), a lost session, a busy
+/// server — is not reported as a failure to create that directory.
+#[tokio::test]
+async fn a_failure_beyond_the_level_is_not_tagged_with_it() {
+    for class in [
+        FailureClass::Cancelled,
+        FailureClass::Connectivity,
+        FailureClass::Authentication,
+        FailureClass::Throttled,
+    ] {
+        let mut probe = Path3::new(1);
+        probe.create[2] = Err(denied());
+        probe.probe[2] = Err(failure(class, Transience::Transient));
+        let mut direct = Path3::new(0);
+        direct.create[0] = Err(failure(class, Transience::Transient));
+        for path in [probe, direct] {
+            let reported = create_levels(&path).await.err();
+            assert_eq!(reported.as_ref().map(|failure| failure.class), Some(class));
+            assert_eq!(level_of(reported.as_ref()), None);
+        }
+    }
+}
+
+/// A level whose own creation had to rebuild a vanished parent reports the level the nested
+/// rebuild named (an ancestor), not its own.
+#[tokio::test]
+async fn a_deeper_level_named_by_a_nested_creation_is_kept() {
+    let mut path = Path3::new(0);
+    let inner = StoragePath::new("a").unwrap_or_else(|error| panic!("{error}"));
+    path.create[1] = Err(failure(FailureClass::Capacity, Transience::Permanent).at_level(inner));
+    let reported = create_levels(&path).await.err();
+    assert_eq!(level_of(reported.as_ref()), Some("a"));
 }
 
 #[tokio::test]

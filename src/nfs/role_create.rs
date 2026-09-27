@@ -32,7 +32,7 @@ use super::{
     FType3, LookupFailure, MAX_STALE_RETRIES, NFSFileHandle, NFSStorage, backoff_server_busy,
     classify_role_error, invalidate_path_cache, is_retryable_with_invalidation, is_server_busy,
 };
-use crate::model::{FailureClass, Transience};
+use crate::model::{FailureClass, StoragePath, Transience};
 use crate::storage::backends::nfs::protocol::classify_error;
 use crate::storage::backends::nfs::source::NfsProtocolFailure;
 
@@ -127,27 +127,44 @@ trait Levels: Sync {
     async fn create(&self, depth: usize) -> Result<(), NfsProtocolFailure>;
     /// Whether the level of the first `depth` components is a directory.
     async fn is_directory(&self, depth: usize) -> Result<bool, NfsProtocolFailure>;
+    /// The path of the level of the first `depth` components, where its failure is reported:
+    /// the components joined with `/`, so for a path spelled with empty or `.` segments the
+    /// level is named in the normalized spelling (`d//a/f`'s parent level is `d/a`).
+    fn level(&self, depth: usize) -> Option<StoragePath>;
 }
 
+/// Creates the missing levels; a failure is reported at the level that failed
+/// ([`NfsProtocolFailure::at_level`]), not at the entry whose write or rename needed them. A
+/// failure that says nothing about the level ([`outlives_the_level`]: a cancellation, a lost
+/// session, a busy server) is not tagged.
 async fn create_levels(levels: &dyn Levels) -> Result<(), NfsProtocolFailure> {
     for depth in levels.cached() + 1..=levels.depth() {
-        let Err(refused) = levels.create(depth).await else {
-            continue;
-        };
-        if refused.class != FailureClass::PermissionDenied {
-            return Err(refused);
-        }
-        // The server may check access before the name: only a directory already there turns
-        // the refusal into "this level exists".
-        match levels.is_directory(depth).await {
-            Ok(true) => {}
-            // A cancelled probe, a lost session or a busy server says nothing about the level:
-            // reporting the refusal would make it look permanent.
-            Err(probe) if outlives_the_level(&probe) => return Err(probe),
-            _ => return Err(refused),
+        if let Err(failure) = create_one(levels, depth).await {
+            return Err(match levels.level(depth) {
+                Some(level) if !outlives_the_level(&failure) => failure.at_level(level),
+                _ => failure,
+            });
         }
     }
     Ok(())
+}
+
+async fn create_one(levels: &dyn Levels, depth: usize) -> Result<(), NfsProtocolFailure> {
+    let Err(refused) = levels.create(depth).await else {
+        return Ok(());
+    };
+    if refused.class != FailureClass::PermissionDenied {
+        return Err(refused);
+    }
+    // The server may check access before the name: only a directory already there turns the
+    // refusal into "this level exists".
+    match levels.is_directory(depth).await {
+        Ok(true) => Ok(()),
+        // A cancelled probe, a lost session or a busy server says nothing about the level:
+        // reporting the refusal would make it look permanent.
+        Err(probe) if outlives_the_level(&probe) => Err(probe),
+        _ => Err(refused),
+    }
 }
 
 /// `storage::create_directory_all`'s rule for a probe that fails beyond its entry.
@@ -198,6 +215,10 @@ impl Levels for MountLevels<'_> {
             }
         };
         Ok(file_type == FType3::NF3DIR as u32)
+    }
+
+    fn level(&self, depth: usize) -> Option<StoragePath> {
+        StoragePath::new(self.components[..depth].join("/")).ok()
     }
 }
 

@@ -174,8 +174,15 @@ MKDIR 前解析父目录的 LOOKUP 也按这张表（`role_lookup_fh`，`src/nfs
 role 的写路径（staged 的 `create_empty_open` 即独占 CREATE、`Staged` / `Namespace` 的 `rename`）建缺失的父目录也不再用
 legacy 递归 `create_dir_all`，而是 `role_create_all`：从句柄缓存里最深的一层往下逐层调上面的一层 MKDIR，并套用下节
 “被拒但已是目录”的规则（被拒 → LOOKUP 该层：是目录 → 继续；探测 `Cancelled` / `Connectivity` / `Authentication` /
-`Throttled` → 报探测的失败；否则报原来的拒绝）。于是写一个文件、其缺失的父目录在不可写的目录下 → 该文件 Prepare 的条目
-`PermissionDenied` / Permanent（此前 `Protocol` / Unknown，上游会重试）。独占 CREATE 自己被拒也直接经 `classify_error`
+`Throttled` → 报探测的失败；否则报原来的拒绝）。于是写一个文件、其缺失的父目录在不可写的目录下 → Prepare 的条目
+`PermissionDenied` / Permanent（此前 `Protocol` / Unknown，上游会重试），**报在被拒的那一层**（NFS 收尾起；此前报在
+要写的文件上）：失败的路径是那一层，操作仍是原操作（Prepare / Publish / Namespace…），诊断写明为哪个条目建，如
+``NFS role failed creating a missing parent directory of `a/ro/missing/sub/f` (Prepare): "NFS3ERR_ACCES" (NFS3ERR_ACCES)``
+（`NfsProtocolFailure::at_level`，`create_levels` 打上失败层，嵌套重建时保留嵌套调用报出的那层（更靠上的祖先）；
+`Namespace::rename` 的诊断写目的路径）。与该层无关的失败（`Cancelled` / `Connectivity` / `Authentication` / `Throttled`）
+不打层，报在原条目上；会话级失败不受影响。目的端 prepare 的 `transient_collision` 不再把它当撞名：打了层的 `NotFound` /
+`Conflict` 保持原类别与 transience（`NotFound` 经 `transient_if_gone` 已是 Transient；`in_the_way` 是 `Conflict` / Unknown），
+此前被改成 `Conflict` / Transient。只有 NFS 这样报；CIFS / HDFS / Local 的写路径建父目录失败仍报在原条目上。独占 CREATE 自己被拒也直接经 `classify_error`
 （`ACCES` / `ROFS` → `PermissionDenied`，保留状态名）；父目录缓存句柄 `STALE` 且父目录已被外部删掉 → 同一次调用里
 重建一次。legacy 调用方（`StorageEnum`、legacy `create_file` / `rename`）不变。
 

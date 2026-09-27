@@ -298,6 +298,48 @@ fn connectivity_is_session_scoped_not_entry_scoped() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// A failure at a missing parent level the operation had to create is reported at that level;
+/// the diagnostic names the operation's own entry and the server's status. A level that is the
+/// entry itself, or a lost session, is reported as before.
+#[test]
+fn a_failed_missing_parent_is_reported_at_its_level() -> Result<(), Box<dyn std::error::Error>> {
+    let entry = StoragePath::new("ro/missing/sub/f")?;
+    let refused = NfsProtocolFailure::new(FailureClass::PermissionDenied, Transience::Permanent)
+        .with_status("NFS3ERR_ACCES");
+    let at_level = refused.clone().at_level(StoragePath::new("ro/missing")?);
+    let StorageRoleFailure::Entry(failure) =
+        role_failure(&entry, crate::model::Operation::Prepare, at_level)
+    else {
+        panic!("a refused level is entry-scoped");
+    };
+    assert_eq!(failure.path().as_str(), "ro/missing");
+    assert_eq!(failure.operation(), crate::model::Operation::Prepare);
+    assert_eq!(failure.class(), FailureClass::PermissionDenied);
+    assert_eq!(failure.transience(), Transience::Permanent);
+    assert_eq!(
+        failure.diagnostic(),
+        "NFS role failed creating a missing parent directory of `ro/missing/sub/f` (Prepare): \
+         \"NFS3ERR_ACCES\" (NFS3ERR_ACCES)"
+    );
+
+    let itself = refused.at_level(entry.clone());
+    let StorageRoleFailure::Entry(failure) =
+        role_failure(&entry, crate::model::Operation::Prepare, itself)
+    else {
+        panic!("a refused entry is entry-scoped");
+    };
+    assert_eq!(failure.path(), &entry);
+    assert!(failure.diagnostic().starts_with("NFS role failed: "));
+
+    let lost = NfsProtocolFailure::new(FailureClass::Connectivity, Transience::Transient)
+        .at_level(StoragePath::new("ro")?);
+    assert!(matches!(
+        role_failure(&entry, crate::model::Operation::Prepare, lost),
+        StorageRoleFailure::Session(_)
+    ));
+    Ok(())
+}
+
 struct DelayedPrefixCursor;
 #[async_trait]
 impl NfsReadCursor for DelayedPrefixCursor {

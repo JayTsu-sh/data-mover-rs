@@ -392,3 +392,39 @@ async fn a_lost_publication_reply_still_removes_the_pointer() -> TestResult {
     assert_eq!(artifacts_left(&protocol), Vec::<String>::new());
     Ok(())
 }
+
+/// Only the exclusive-create collision at the name (a `Conflict` without a server status) and a
+/// name gone under the prepare become the transient collision; a `Conflict` the server named, or
+/// any failure at a missing parent level the CREATE had to create, keeps its own class,
+/// transience and level.
+#[test]
+fn only_a_collision_at_the_name_is_transient() -> TestResult {
+    let collision = transient_collision(NfsProtocolFailure::new(
+        FailureClass::Conflict,
+        Transience::Permanent,
+    ));
+    assert_eq!(
+        (collision.class, collision.transience),
+        (FailureClass::Conflict, Transience::Transient)
+    );
+    let named = transient_collision(
+        NfsProtocolFailure::new(FailureClass::Conflict, Transience::Permanent)
+            .with_status("NFS3ERR_NOTDIR"),
+    );
+    assert_eq!(named.transience, Transience::Permanent);
+    for class in [FailureClass::NotFound, FailureClass::Conflict] {
+        let at_level = transient_collision(
+            NfsProtocolFailure::new(class, Transience::Unknown)
+                .at_level(StoragePath::new("d/missing")?),
+        );
+        assert_eq!(
+            (at_level.class, at_level.transience),
+            (class, Transience::Unknown)
+        );
+        assert_eq!(
+            at_level.level.as_ref().map(StoragePath::as_str),
+            Some("d/missing")
+        );
+    }
+    Ok(())
+}

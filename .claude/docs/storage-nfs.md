@@ -234,6 +234,12 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   （`role_lookup_fh`）后发 RENAME，回答直接 `classify_error`：`ACCES` / `PERM` / `ROFS` → `PermissionDenied` / Permanent，
   `XDEV` → `Unsupported`，`NOTEMPTY` / `EXIST` / `ISDIR` / `NOTDIR` → `Conflict`（此前经 legacy 字符串包装一律 `Protocol` /
   Unknown，可重试）；`STALE` / `BADHANDLE` / `NOENT` 忘掉缓存重试至多 3 次；成功后忘掉两边名字以下的句柄缓存。
+- **建父目录的失败报在失败的那一层**（NFS 收尾）：`role_create_all` 里某层失败（被拒、探测失败、其他类别），
+  `NfsProtocolFailure::at_level` 记下那一层，`role_failure` / `entry_scoped` 把条目失败的路径改成那一层，操作不变，诊断写
+  为哪个条目建（``creating a missing parent directory of `<条目>` (<操作>): <状态>``；`Namespace::rename` 写目的路径）。
+  嵌套（一层 MKDIR 里重建消失的已缓存父目录）保留嵌套调用报出的那层（更靠上的祖先）；与该层无关的失败（`Cancelled` /
+  `Connectivity` / `Authentication` / `Throttled`）不打层；层路径是规范化的拼法（写 `d//a/f` 时父目录层报成 `d/a`）；目的端 prepare 的
+  `transient_collision` 不把它当撞名。此前一律报在要写 / 改名的条目上。
 - 一层：句柄缓存里已有该目录 → 成功、零 RPC（与 legacy 最深缓存层一样；外部删掉了缓存过的目录时，下一层 MKDIR
   会 `STALE` → 忘掉缓存再解析父目录 → `NotFound` → **同一次调用里重建父目录一次**（`role_create_all`，逐层）再建
   这一层，于是一次 `create_directory_all` 就把路径重建出来，与 legacy 一样；重建后仍不存在 → `NotFound` / Transient。

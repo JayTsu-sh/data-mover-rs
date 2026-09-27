@@ -281,10 +281,12 @@ async fn create(
 /// Discovery left nothing at the name, so something there now is another writer's (or a lost
 /// CREATE reply): a retry settles it. Only the exclusive-create collision is that (a `Conflict`
 /// without a server status); a `Conflict` the server named — `NOTDIR`, a file where a parent
-/// directory must be — stands.
+/// directory must be — stands, as does a failure at a missing parent level the CREATE had to
+/// create first (reported at that level, [`NfsProtocolFailure::at_level`]).
 fn transient_collision(error: NfsProtocolFailure) -> NfsProtocolFailure {
     let collision = error.class == FailureClass::Conflict && error.status.is_none();
-    if collision || error.class == FailureClass::NotFound {
+    let at_the_name = error.level.is_none();
+    if at_the_name && (collision || error.class == FailureClass::NotFound) {
         NfsProtocolFailure::new(FailureClass::Conflict, Transience::Transient)
     } else {
         error

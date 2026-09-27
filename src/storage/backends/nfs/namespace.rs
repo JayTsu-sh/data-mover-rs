@@ -311,10 +311,12 @@ impl Namespace for NfsNamespaceAdapter {
     async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), StorageRoleFailure> {
         checked(from)?;
         checked(to)?;
-        self.protocol
-            .rename(from, to)
-            .await
-            .map_err(|error| role_failure(from, Operation::Namespace, error))
+        self.protocol.rename(from, to).await.map_err(|error| {
+            // A missing parent of the destination failed (reported at that level): the
+            // destination is the entry that needed it.
+            let entry = if error.level.is_some() { to } else { from };
+            role_failure(entry, Operation::Namespace, error)
+        })
     }
 
     /// Name semantics stay unknown until `PATHCONF` (v3) or the `case_insensitive` attribute (v4)
@@ -488,12 +490,16 @@ mod tests {
         ) -> Result<(), NfsProtocolFailure> {
             Err(NfsProtocolFailure::protocol())
         }
+        /// A destination whose missing parent `d/missing` is refused.
         async fn rename(
             &self,
             _from: &StoragePath,
             _to: &StoragePath,
         ) -> Result<(), NfsProtocolFailure> {
-            Err(NfsProtocolFailure::protocol())
+            Err(
+                NfsProtocolFailure::new(FailureClass::PermissionDenied, Transience::Permanent)
+                    .at_level(path("d/missing")),
+            )
         }
     }
 
@@ -596,6 +602,27 @@ mod tests {
             .map(|entry| entry.path.as_str())
             .collect();
         assert_eq!(paths, ["d//a"]);
+    }
+
+    /// A rename whose destination needed a missing parent that was refused fails at that parent,
+    /// and the diagnostic names the destination that needed it.
+    #[tokio::test]
+    async fn a_refused_destination_parent_is_reported_at_its_level() {
+        let namespace = adapter(Listing(None));
+        let refused = namespace
+            .rename(&path("w/x"), &path("d/missing/x"))
+            .await
+            .err();
+        let Some(StorageRoleFailure::Entry(failure)) = refused else {
+            panic!("expected an entry failure: {refused:?}");
+        };
+        assert_eq!(failure.path(), &path("d/missing"));
+        assert_eq!(failure.class(), FailureClass::PermissionDenied);
+        assert!(
+            failure.diagnostic().contains("`d/missing/x`"),
+            "{}",
+            failure.diagnostic()
+        );
     }
 
     #[test]
