@@ -1036,6 +1036,9 @@ C7d perf(nfs): READDIR / READDIRPLUS 的回复大小按服务器公布的上限�
       `maxcount` 取读上限 —— v3 `Mount::fsinfo()` 的 `rtmax`，v4.1 会话 `max_response_size`（nfs-rs 已与 `maxread` 取小），v4.0 `maxread`；
       `dircount` 参考 `dtpref`、实测定（避开 Linux `dtpref` 过小）；分页接口按次传入，不经 URL。回复大小 = min(上限, 目录实际内容)，
       小目录不多占内存；最坏 K 个 worker 同时读宽目录 ≈ K × 上限的临时缓冲，实测时看宽树 RSS
+    - **实现方式（用户 2026-09-27 定）**：不给分页接口加大小入参；改 nfs-rs —— 挂载 URL 没写 `readdir-buffer` 时，挂载的默认
+      dircount / maxcount 取建立连接时得到的服务器上限（接口不变，Rust / Python 都自动受益），发布 nfs-rs 0.8.6（用户批准），
+      data-mover 只升级依赖
     - 实测：ONTAP（`tcp-max-xfer-size` 默认下的 dtpref / rtmax）、DXN-2 v3 / v4.0；8K / 32K / 64K / 256K / 1M 几档与自动协商对比每回复
       条数、5 万项宽目录的 wall、首项延迟、RSS；node1 m1-source 全树复测（每目录约 35 项，预计收益小）；不改 ONTAP 设置
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
