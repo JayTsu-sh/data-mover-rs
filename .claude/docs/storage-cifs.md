@@ -194,14 +194,16 @@ result
 - **协议接缝**：`CifsNamespaceProtocol::open_directory(path) -> Box<dyn CifsDirectory>`；`CifsDirectory`
   = `entries()` (逐条记录的流，每个打开的目录只调一次) + `close()`。取代原来整目录返回 `Vec` 的 `list`。
   `delete` 的 artifact 清扫仍整目录读 (`read_whole`，读错误优先于关句柄错误，与原来一致)。
-- **生产者**：每个列举一个任务，打开目录、逐条取记录、按 `page_hint` 攒页交出 (隐藏的 `.data-mover-*`
+- **生产者**：每个列举一个生产者 (P7 C10 起先在消费方自己的任务里推进，交出第一项之后还没读完、或流被 drop 时
+  才转成 detach 的任务 —— 单页的小目录不另起任务；从不 drop / abort 半途的生产者)，打开目录、逐条取记录、按 `page_hint` 攒页交出 (隐藏的 `.data-mover-*`
   不占名额、计入 `internal_hidden`)。**每个出口都关句柄**：读到尾、消费方走了 / 取消 (取下一条之前检查，
   在途那条记录 —— 以及带来它的请求 —— 让它到达)、读失败；`entries` 流在关句柄之前 drop，最后一页在关句柄
   **之后**交出。生产者从不被外部 abort (§16 M1)。
 - **停车占句柄**：消费方没取走上一页时生产者停在交页处，目录句柄一直开着。所以 `Namespace::parked_listing_limit()`
   对 CIFS 回答 **8** (Q10)：遍历预取的“已起、未读完”列举 (等页的 + 停车的) 不超过 8 个，游标正要的那个不计、
   总是起 —— 任何时刻打开的列举句柄 ≤ 8 + 1，且上限不会卡住遍历 (`src/traversal/storage/cursor.rs`
-  `start_listings`)。遍历之外，一个列举最多领先消费方约 3 页 (通道一页 + 生产者手里一页)，遍历的列举任务
+  `start_listings`)。`Unordered` 遍历 (P7 C10，默认) 的 worker 等消费方时手里的列举一直开着，所以 worker 数
+  K 取 `min(c, 64, 8)`：打开的列举句柄 ≤ 8。遍历之外，一个列举最多领先消费方约 3 页 (通道一页 + 生产者手里一页)，遍历的列举任务
   还会多偷看一页：所以超过约 4 页 (`page_hint` 1024 时约 4096 条) 的目录一定带着句柄停车，更小的目录多半在
   游标到达之前就已读到尾、关了句柄 (看偷看赶没赶上)。
 - **drop 不再读到流尾**：smb-rs 的流在消费方取空缓冲的那一刻就发下一条 `QUERY_DIRECTORY`，domain 层看不到

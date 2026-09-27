@@ -23,7 +23,7 @@
 9. 断点续扫（9.1 接口与检查点时机）
 10. 多版本对象：每个 key 一项（10.2 版本顺序实测）
 11. 与 terrasync 写库的配合（ClickHouse）
-12. 性能（12.5 按页并发、12.6 性能目标与 O1–O6）
+12. 性能（12.5 按页并发、12.6 性能目标与 O1–O6、12.8 C10 的性能门实测）
 13. 破坏性变更清单
 14. 实施计划（PLAN / CHANGE / CREATE / RISK / VERIFY）
 15. 决定记录（全部采纳）
@@ -257,7 +257,8 @@ type ListingStream = Pin<Box<dyn Stream<Item = Result<ListingPage, StorageRoleFa
 ```
 
 - **契约**：任何时刻 drop 流都不得泄漏服务端资源。
-- **机制**：每个列举一个生产者任务 + 容量 1 的 channel（`ListingStream::from_producer`，新文件 `src/storage/listing.rs`）。channel 满即停止翻页（背压到协议层，预读一页）。
+- **机制**：每个列举一个生产者 + 容量 1 的 channel（`ListingStream::from_producer`，新文件 `src/storage/listing.rs`）。channel 满即停止翻页（背压到协议层，预读一页）。
+  C10 起生产者先在消费方自己的任务里推进，交出第一项后仍未结束（或流被 drop）才转成 detach 的任务：单页目录不另起任务、没有任务间交接（§12.6 O1）。
   接收端消失 → 生产者的 `send` 失败 → 走自己的 `close_resource` 路径退出。CIFS 句柄在结构上不会泄漏，与 P2 “detach 不 abort” 一致。
   今天的 `listings_are_abortable()`（`roles.rs:552`）因此删除。
 - **页里只带名字**：目录路径只在请求里出现一次，不再给每个子项拼完整路径（同一个父前缀存 N 遍）。`ObservedEntry` 构造时才拼（直到 P9）。
@@ -418,6 +419,12 @@ type ListingStream = Pin<Box<dyn Stream<Item = Result<ListingPage, StorageRoleFa
 - 没有序号、没有目录事件、没有计数树；只有全局原子计数。
 - 内存：O(在飞列举 × 页) + O(待处理目录)。LIFO 下待处理 ≈ 深度 × 扇出 × worker，与 legacy 的任务队列同量级。
 - 保证：目录的 `Entry` 先于它的任何子项（发现子目录时先发它的 Entry 再入栈）。
+- **C10 的实现**（`src/traversal/storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs`）：K = min(c, 64)，namespace 有
+  `parked_listing_limit` 时再取 min（CIFS 8：worker 等消费方时列举一直开着，K 即打开句柄的上界）。出栈 / 窃取与登记 `active`
+  在同一临界区（窃取按下标序锁两个槽位），任何时刻每个未完成目录都在某槽位里 —— §9.2 的一致性条件，C11 的前沿快照按下标序锁全部
+  槽位即可。`outstanding` 子目录入栈前加、父目录全部子目录入栈后减，减到 0 的 worker 取消 halt。页用 Blocks 同一段
+  `stream::prepare`（含扫描根守卫，§14.1），一页一批整批交给会话（`channel.rs` 的 `send_whole`）之后才压子目录。每个 key 的
+  全部版本连续：页末同一 key 的一段留到下一页批首。与 Blocks 对同一棵树条目、失败、`ScanTotals` 逐字段相同。
 
 ### 6.2 Blocks
 
@@ -820,7 +827,81 @@ RSS 从不封顶（21 → 192 MB）。子树 `d000`（16.8 万目录）即达 11
 失效还包括 `NFS4ERR_STALE` / `FHEXPIRED`；`ndx_walk` / `delete_tree` 暂不带提示（每目录一次 LOOKUP，仍经 `lookup_fh` 缓存）。
 node1 整树的 RSS 复测归 Phase 6 的性能门。
 预计 Blocks ≤ 100 MB 容易达到；Unordered ≤ 30 MB 还可能要 O2 / O4（启动约 20 MB，其中 12 MB 是二进制映射）。
-CPU 的差距（1.51× 对 ≤ 1.4×）按 O2 → O3 在 Phase 6 处理。原始数据：node1 `/root/dm/p7-base/logs`、`/root/dm/p7-rss/`。
+CPU 的差距（1.51× 对 ≤ 1.4×）按 O2 → O3 在 Phase 6 处理（C10 已处理：O1 的延伸 + O2 即达标，见 §12.8）。原始数据：node1 `/root/dm/p7-base/logs`、`/root/dm/p7-rss/`。
+
+
+### 12.8 C10 实测：Phase 6 性能门（2026-09-27，node1，200G 链路，c=64，`--quiet`，与 legacy 交替四轮）
+
+二进制：legacy = `/root/dm/p7-base/legacy`（`examples/nfs_walkdir`），role = C10 的 release `storage_role_operations`
+（10.131.9.10 上编译 + glibc 2.34 shim，node1 `/root/dm-c10/`）；`--order unordered` / `--order blocks` 同一个二进制。
+futex / 条：`strace -f -c` 跑子树 `d019/d000`（126,735 条，先热一遍）。原始数据：node1 `/root/dm-c10/logs/`。
+
+| 顺序 | 轮 | wall 均值 | CPU (user+sys) 均值 | RSS 峰值 | futex / 条 | 条目数 / 失败 |
+|---|---|---|---|---|---|---|
+| legacy | 4 | 996 s | 254 s（234–266） | 16.5 MB | 0.290 | 53,368,420 / 0 |
+| Unordered | 4 | 995 s | 264 s（257–273） | 18.5 MB | 0.296 | 53,368,420 / 0 |
+| Blocks | 4 | 1075 s | 296 s（272–309） | 30.5 MB | 0.337 | 53,368,420 / 0 |
+
+比值（对 legacy 均值）：Unordered wall 0.999×、CPU 1.04×；Blocks wall 1.079×、CPU 1.17×。
+
+| 轮次 | legacy wall / CPU | Unordered wall / CPU | Blocks wall / CPU |
+|---|---|---|---|
+| r1 | 995 / 266 | 992 / 273 | 1027 / 309 |
+| r2 | 995 / 234 | 994 / 265 | 1096 / 303 |
+| r3 | 996 / 248 | 995 / 257 | 1021 / 299 |
+| r4 | 998 / 266 | 998 / 262 | 1156 / 272 |
+
+对照 12.6 的目标：
+
+| 指标 | Unordered（目标） | Blocks（目标） |
+|---|---|---|
+| wall | **1.00×**（≤ 1.05×） | **1.08×**（≤ 1.15×） |
+| CPU | **1.04×**（≤ 1.15×） | **1.17×**（≤ 1.4×） |
+| RSS | **18.5 MB**（≤ 30 MB） | **30.5 MB**（≤ 100 MB，且 C7 起不随树规模增长） |
+| futex / 条 | **0.296**（≤ 0.4；legacy 0.290） | **0.337**（≤ 0.5） |
+
+全部达标。legacy 自己的 CPU 在四轮间就差 14%（234–266 s），所以单轮比值不可靠，只看交替四轮的均值。
+
+**走到这里用了哪些优化（12.6 的路线）**：
+- C10 的第一个原型（O1 = C0 的按页组装之上，没有别的优化）：Unordered wall 1.00×、CPU **1.34×**（318 s 对 237 s），Blocks
+  wall 1.09×、CPU 1.34×。10.131.9.10 上经 1GbE 对 m1-source 子树做 perf（`perf record -F 999 -e cpu-clock:u`，legacy 对照，
+  用户态 CPU 17.3 s 对 24.8 s）找到两块：
+  1. **每个目录一个生产者任务**（O1 的延伸，`511cee5`）：3,368,421 个目录、平均 15.8 条，每个目录一次 spawn、一个 channel、
+     生产者 ↔ 消费方几次跨线程唤醒（tokio 的 steal / 经 epoll 的 unpark 在剖面里一大截；legacy 的 worker 直接在自己的任务里发
+     READDIRPLUS）。改为生产者先在消费方的任务里推进，交出第一项后仍未结束（宽目录）或流被 drop 时才转成 detach 的任务：
+     单页目录不另起任务，宽目录照旧后台预读一页；任何时候不 drop / abort 半途的生产者。
+  2. **每条目多出的约 5 次字符串分配**（O2，`0517c68`、`ad2dfec`）：NFS 的 role 列举先造 legacy `NASEntry`（名字、`PathBuf`
+     拼接、扩展名）、再 `to_string_lossy` 拷一份路径、`respelled` 前再 clone、`is_internal` 解析 `std::path`，列举契约的名字
+     `to_owned`，遍历里再 `child_path` 拼一次。改为直接从 READDIRPLUS 项描述、路径移交不拷贝、名字沿用路径的分配、拼完整路径就地
+     拼进名字的分配。
+  两项之后第一轮 Unordered CPU 241 s（同场 legacy 271 s，前一场 237 s）、sys 从 76 s 降到 56–62 s（跨线程唤醒少了）。**O3（身份键推迟计算）、O4（分配器）、
+  O5、O6 都不需要**：blake3 在剖面里约 0.5 s / 2.7M 条（约 2%），留在构造时计算（5.4.6 的建议不变）。
+- Blocks 同样受益（它也用同一个列举生产者与 NFS 描述）：CPU 1.51×（C0）→ 1.17×，RSS 175 MB（C0）→ 30.5 MB（C7 的下钻提示）。
+
+**rebase 到 `d222738`（含 C7c 的 cookie 续读与 `(fileid, 名字)` 去重摘要）之后复测**（2026-09-27，同样的 node1 / m1-source / c=64 / `--quiet`，
+交替两轮；二进制 = rebase 后的 C10，node1 `/root/dm-c10/c10-rebased`）：
+
+| 顺序 | wall（两轮） | CPU user+sys（两轮） | RSS 峰值 | futex / 条（d019/d000） | 条目数 / 失败 |
+|---|---|---|---|---|---|
+| legacy | 996 / 996 s | 246 / 261 s（均 254） | 16.2 MB | 0.292 | 53,368,420 / 0 |
+| Unordered | 996 / 996 s（1.00×） | 277 / 235 s（均 256，**1.01×**） | 17.5 MB | 0.306 | 53,368,420 / 0 |
+| Blocks | 1108 / 1135 s（**1.13×**） | 319 / 327 s（均 323，**1.27×**） | 26.5 MB | 0.335 | 53,368,420 / 0 |
+
+§12.6 的目标都仍达标（Blocks wall 1.13× 离 1.15× 最近）。单轮 CPU 在 node1 上波动很大（Unordered 235–277 s），为了把 C7c 去重摘要的
+代价单独拿出来，在 10.131.9.10 上经 1GbE 对子树 `d019`（2,694,735 条）做了交替四轮 A/B：rebase 前后的两个二进制除 C7c（与同批上游改动）
+外相同 —— Unordered CPU 25.40 → 24.94 s，Blocks 30.36 → 30.25 s，RSS 相同；**差别 < 2%，在噪声内**。node1 上 Blocks 两轮比
+§12.8 上面四轮的均值高约 9%，A/B 不支持这是 C7c 造成的，归 node1 / NFS 服务器的轮间波动。原始数据：node1 `/root/dm-c10/logs/q*`。
+
+**C10 的真机（遍历 smoke，Unordered c = 8 / 64、Blocks 与 base `10ccb8f` 的 Blocks 比条目集合与计数）**：Local；ONTAP FAS2750
+NFSv3（10.131.9.10，root）/ v4.0 / v4.1 整个导出 5399 条（v4.0 那次别人的 `nfs-rs-readdir-page-*` 目录正在被写，比对时排除它）；
+DXN-2 NFSv3 / v4.0（播种 1511 条，测后删除）；CIFS FAS2750（播种 18,326 条，c = 1 / 4 / 32，e2e-cifs 全过；停车句柄：10 × 4500 的
+子树 stdout 堵住时 Unordered c=4 恒 4、c=32 恒 8，Blocks 恒 8，结束 0）；S3 `traversal_versions.sh`：MinIO 临时版本桶与
+data-mover-test、ONTAP 对象桶两种与 NAS 桶、RustFS 临时版本桶与 data-mover-test、DXN 临时版本桶与 data-mover-test、StorageGRID
+data-mover-test 全部 pass（Unordered 与 Blocks 条目相同、每 key 版本连续、无目录事件）；StorageGRID 版本桶那次脚本在写入之前的
+前缀预检列举就失败（与 C10 无关，未写任何东西）。rebase 到 `d222738` 后复跑：ONTAP NFSv3 / v4.0 / v4.1（5399 条）、DXN-2 v3 / v4.0
+（播种 1500 条，测后删除）与 `d222738` 的 Blocks 条目集合、计数逐行相同；e2e-cifs 全过。HDFS（Kerberos 实验集群，runner VM 102，
+运行根 `/tmp/data-mover-nightly/c10-20260927103741/`，测后删除）：播种 1524 条（44 个目录，含 12 层深链、1300 文件平铺），Unordered
+c = 8 / 64、Blocks c = 8 与 `d222738` 的 Blocks c = 8 / 64 条目集合摘要相同、计数相同、0 失败，Unordered 无目录事件。
 
 ## 13. 破坏性变更清单
 
@@ -900,8 +981,10 @@ C7b fix(nfs): v3 READDIRPLUS 列出、却不给属性的 `.snapshot`（ONTAP 卷
     目录句柄失效的失败按 READDIRPLUS 失败结束这次读取。带属性的 `.snapshot`（DXN 上真建的目录）、其他名字、v4 一律不变
 C7c feat(storage): NFS 列举首页之后可按 cookie 续读（Q18；nfs-rs 0.8.5 `Mount::readdirplus_page`）—— 已完成：`26a27f6`（前置 `17bb6fb` 升级 nfs-rs）
     - 协调者 2026-09-27 认可与原计划的三处差别：cookie 被拒（或回空末页）→ 带去重从头重读（≤ 3 次）而非 `Interrupted`；
-      cookie 回环只在一次读取内检测；`NFS3ERR_NOT_SYNC` 不当坏 cookie。**待办**：去重摘要（每条目一次 SipHash、每列举 ≤ 2^18 条
-      ≈ 4.5 MiB）在 node1 m1-source 53M 树上实测 CPU / RSS（对照 §12.6 目标，随下次 node1 性能轮一起测）；首页之前也按 cookie 续读
+      cookie 回环只在一次读取内检测；`NFS3ERR_NOT_SYNC` 不当坏 cookie。去重摘要（每条目一次 SipHash、每列举 ≤ 2^18 条
+      ≈ 4.5 MiB）**已实测**（2026-09-27，C10 rebase 到 `d222738` 之后，§12.8 末）：node1 m1-source 53M 树两轮，§12.6 的目标全部仍达标
+      （Unordered CPU 1.01×、RSS 17.5 MB；Blocks CPU 1.27×、RSS 26.5 MB）；同一二进制除 C7c 外不变的 A/B（10.131.9.10 经 1GbE，
+      子树 d019 2,694,735 条，交替四轮）CPU 差 < 2%、在噪声内，RSS 不变 —— 不需要改。**待办**：首页之前也按 cookie 续读
       （现在首页前仍是 C7 的整目录重来、不补预算，频繁断连时可能到不了首页）作为后续项
     - 接缝：`read_directory` 带起点 cookie；`NfsListingPages::first_sight(fileid, 名字)`（读者看一项之前问，已取的跳过，
       含 v3 `.snapshot` 的 LOOKUP）、`reached(next)`（整个回复取完、目录未完时报位置；同一次读取里重复 → `NfsReadEnd::Repeated`）；
@@ -959,6 +1042,8 @@ C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namesp
 C9  feat(storage): CIFS 流式（生产者持有句柄；停车句柄上限） - src/storage/backends/cifs/{protocol.rs:230-280, namespace.rs:59-94}
     —— 已完成：70f85d1（接缝 open_directory + CifsDirectory，不改行为）、936e20b
 C10 feat(traversal): Unordered 调度器（worker LIFO + 窃最浅 + 全局计数，内部通道按页），设为默认
+    —— 已完成：268258c（会话通道按批）、e0fb2c2（refactor：页准备与计数共用）、511cee5（perf：生产者先在消费方任务里推进）、
+    0517c68（perf：名字 / 路径分配复用）、ad2dfec（perf(nfs)：直接从 READDIRPLUS 项描述）、6711e58；Phase 6 性能门见 §12.8
 C11 feat(traversal): Resumable（Checkpoint 项每约 1 分钟 + 取消时补发、resume_from、指纹），两种方式
 C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 v7），删除 TraversalVersions / list_versions；快照只留一种格式、不兼容旧版本（用户 2026-09-27）
 C12 docs: docs/architecture/storage-transfer-architecture.md §5/§6；.claude/docs/{architecture,error-taxonomy,storage-*}.md；ADR-0008
@@ -969,11 +1054,15 @@ C12 docs: docs/architecture/storage-transfer-architecture.md §5/§6；.claude/d
 CREATE
 ======
 - src/storage/listing.rs: ListingStream::from_producer / from_pages / collect_listing
-- src/traversal/unordered.rs（+ unordered/ 子模块）: Unordered 调度器
+- src/traversal/unordered.rs（+ unordered/ 子模块）: Unordered 调度器 —— C10 实际放在 `src/traversal/storage/unordered.rs` +
+  `storage/unordered/{pool,worker,page_io}.rs`（要用 storage 模块的私有件：`Shared`、`stream::prepare`、`resolve`）；会话按批的通道是
+  新文件 `src/traversal/channel.rs`
 - src/traversal/checkpoint.rs: Checkpoint 编解码、指纹
 - src/traversal/storage/tests/streaming.rs: 多页 fake（Notify 逐页放行）——逐页准入、块序、驻留与 N 无关、半途失败、首页前重试
 - src/traversal/storage/tests/counts.rs: 不变式（即时 / deferred 两遍结果相同）
-- src/traversal/unordered_tests.rs: G2、失败清单、计数、检查点前沿不漏
+- src/traversal/unordered_tests.rs: G2、失败清单、计数、检查点前沿不漏 —— C10 实际为 `src/traversal/storage/tests/unordered.rs`
+  （与 Blocks 逐项对比、终止、取消、走开）、`storage/unordered/pool/tests.rs`（前沿、窃最浅、唤醒、并发排空）、
+  `src/traversal/local_unordered_tests.rs`（真文件系统）；前沿不漏由 `#[cfg(test)]` 下每次出栈 / 窃取的断言保证
 - src/storage/backends/s3/streaming_tests.rs: 打乱页内 / 页间顺序、对象与前缀跨页重复、同 key 版本分散在不相邻页、token 循环
 - tests/local_streaming_contract.rs: 真文件系统 20 万平铺文件，首项延迟与驻留
 

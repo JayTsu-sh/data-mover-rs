@@ -1,8 +1,9 @@
 # Walk Scheduler (work-stealing)
 
-> 本页只讲 **legacy** `StorageEnum::walkdir` 的 work-stealing 调度。role-based 遍历
-> (`traversal::StorageTraversalSource`) 用的是另一套：深度优先块顺序 + 列举预读，见
-> `.claude/docs/architecture.md` 与 `src/traversal/storage/cursor.rs`。
+> 本页主要讲 **legacy** `StorageEnum::walkdir` 的 work-stealing 调度。role-based 遍历
+> (`traversal::StorageTraversalSource`) 有两种：默认的 `Unordered` (P7 C10，同样是 worker 栈 + 窃最浅，
+> 与 legacy 的差别见文末「role 的 Unordered 调度器」) 与 `Blocks` (深度优先块顺序 + 列举预读，
+> `src/traversal/storage/cursor.rs`)。两者见 `.claude/docs/architecture.md`「遍历的三套处理逻辑」。
 
 ## 文件
 
@@ -91,3 +92,20 @@ impl<T> AsyncReceiver<T> {
 2. 用 `loom` (未引入) 验证 atomic 顺序 — 当前依赖代码 review。
 3. 改完跑 `make test` (含 `tests/test_copy_file_cancel.rs` 间接覆盖 walk)。
 4. 改完压测 4 个 backend 的 walkdir 性能。
+
+## role 的 Unordered 调度器 (P7 C10) 与 legacy 的差别
+
+`src/traversal/storage/unordered/pool.rs`。形状相同 (每 worker 一个 LIFO 栈、空了窃别人栈底最浅的)，
+下面几处是有意改的：
+
+| | legacy `WorkerContext` | `Unordered` 的 `Pool` |
+|---|---|---|
+| 终止 | `active_tasks` + `active_producers` 两个计数都为 0 | 一个 `outstanding`：子目录入栈前 `fetch_add`，父目录全部子目录入栈后才 `fetch_sub`；减到 0 的 worker 取消 `halt` |
+| 唤醒 | 每次 push `notify_waiters()` (不存 permit，会丢) + 100 µs 超时兜底 | 只在有空闲 worker 时 `notify_one()`；空闲登记与压栈两侧 SeqCst fence，不会丢；窃取后受害者有剩余则级联再唤醒一个；没有超时轮询 |
+| 窃取 | 依次锁邻居，偷 FIFO 头 | 读各槽位发布的 `front_depth` 挑最浅的，只锁它与自己 (按下标序)，出栈与登记 `active` 同一临界区 |
+| 前沿 | 无 | 每个未完成目录任何时刻都在某槽位的栈上或 `active` 里 (C11 检查点的前提；`#[cfg(test)]` 下每次出栈 / 窃取都断言) |
+| 输出 | 每条目一次 channel send | 每页一批 (`traversal/channel.rs`)，按条计的背压；目录的 Entry 所在批交出后才压它的子目录 |
+| 列举中的资源 | — | worker 等消费方时列举一直开着：K ≤ `parked_listing_limit` (CIFS 8) |
+
+故障注入 (P7 C10，全部变红)：`fetch_sub` 提前、窃取先出栈后登记、自己出栈后才登记、K 不受停车上限约束、
+先压栈后交批 等，见设计 §14 C10 行。

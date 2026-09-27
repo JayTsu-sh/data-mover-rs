@@ -40,7 +40,7 @@ Backend 实现 (nfs.rs / s3.rs / local.rs / hdfs.rs)
 ```
 Storage (roles)
     │
-    ├──→ traversal::StorageTraversalSource   Namespace::List + Metadata → TraversalItem 流 (深度优先块顺序 + 列举预读)
+    ├──→ traversal::StorageTraversalSource   Namespace::List + Metadata → TraversalItem 流 (默认 Unordered：worker 栈 + 窃最浅；Blocks：深度优先块顺序 + 列举预读)
     ├──→ ndx_walk (crate 根)                 Namespace::List → dir_tree::run_dfs_driver → NdxEvent
     ├──→ storage::delete_tree                Namespace::{List,Delete} → DeleteTreeItem 流
     ├──→ storage::create_directory_all       Namespace::{CreateDirectory,Stat} 逐层创建
@@ -51,7 +51,9 @@ Storage (roles)
 `src/dir_tree.rs` 的 `run_dfs_driver`(那部分本来就后端无关)，这里只负责列举取数、按名排序、
 以及把 `SourceDescriptor` 反拼成 `NdxEvent` 载荷要的 `EntryEnum::NAS`。
 
-`StorageTraversalSource` 的调度 (`src/traversal/storage.rs` + `storage/{cursor,stream,observe}.rs`)：
+`StorageTraversalSource` 有两种调度，由 `TraversalRequest.order` 选 (P7 §3)：**`Unordered` (默认，P7 C10)**
+见下文「遍历的三套处理逻辑」第一节之后的 Unordered 小节 (`storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs`)；
+**`Blocks`** 的调度 (`src/traversal/storage.rs` + `storage/{cursor,stream,observe}.rs`)：
 准入游标按"块"走深度优先 (`TraversalOrder::Blocks`) —— 一个目录的子项按列举顺序逐页连续输出，
 列举结束后按子目录名字节序依次下钻；序号只由游标分配，重排缓冲按序号输出，所以列举/观察乱序完成
 不影响顺序。列举预读额度 `min(max_inflight_operations, 64)` 只计**等页**的列举，游标未到的已起列举
@@ -157,9 +159,10 @@ marker **占准入窗口**的名额，不绕过它，所以不会让 `admitted()
 
 ## 遍历的三套处理逻辑
 
-> **现状**：legacy work-stealing 与 admission cursor 并存，P6 删前者。admission cursor 自 P7 C4
-> 起只有 `TraversalOrder::Blocks` 一种 (块内列举序、块读完后按子目录名字节序下钻)，逐页消费列举；
-> `Admission` / `NameBytes` 两种模式与兄弟排序已删除。P7 C10 再加 `Unordered` 调度器并设为默认。
+> **现状**：legacy work-stealing 与两种 role 调度并存，P6 删前者。role 遍历自 P7 C10 起有
+> `TraversalOrder::Unordered` (默认，worker 栈 + 窃最浅，见「一·五」) 与 `TraversalOrder::Blocks`
+> (admission cursor：块内列举序、块读完后按子目录名字节序下钻)，都逐页消费列举；
+> `Admission` / `NameBytes` 两种模式与兄弟排序已删除。
 > 本节标了 **[计划]** 的内容属于 P7 后续步骤 / P8 (槽位可溢写)，尚未实现。
 
 ### 一、legacy work-stealing (现状，P6 删)
@@ -197,6 +200,38 @@ for entry in read_dir(dir):
 特征：条目边读边发**从不累积**；目录任务**无界累积**；顺序完全由调度决定、不可复现；
 **目录 / 子树边界在概念上不存在** —— 任务一拆边界信息当场销毁，这正是消费者拿不到权威
 "这个目录的子集已完整"信号的根因。
+
+### 一·五、`Unordered` 调度器 (P7 C10，默认)
+
+legacy work-stealing 的调度形状 (§6.1)，放在 role 的列举 / 观察 / 计数 / 错误模型之上：
+
+- **K 个 worker** = `min(max_inflight_operations, 64)`；namespace 的 `parked_listing_limit()` 有值时 (CIFS 8)
+  再取 min —— worker 等消费方时手里的列举一直开着，所以每个打开的列举都可能停车，K 就是打开句柄数的上界。
+- **栈** (`unordered/pool.rs`)：每个 worker 一个 `VecDeque<Arc<DirectoryWork>>` + `active` (正在列的目录)，
+  `parking_lot::Mutex`。自己的栈 LIFO 弹最新 (深度优先，待处理集合小)；空了按各槽位发布的 `front_depth`
+  (无锁读) 挑**最浅**的受害者，按下标序同时锁两个槽位，出受害者栈头与登记为自己的 `active` 在同一临界区
+  —— 任何时刻每个未完成目录都在某个槽位里 (栈上或 active)，C11 的前沿快照按下标序锁全部槽位即得一致视图，
+  不需要暂停 worker。窃取后受害者还有剩余且有空闲 worker → 再唤醒一个 (级联)。
+- **终止**：全局 `outstanding` = 已压栈未完成的目录数。子目录先 `fetch_add` 再入栈，父目录在列举结束、
+  全部子目录入栈之后才 `fetch_sub`；减到 0 的那个 worker 取消 `halt` (请求令牌的子令牌)，所有等待都选它。
+  空闲 worker 睡在 `Notify` 上，登记 `idle` 与压栈两侧各一个 SeqCst fence (Dekker)，压栈只在有空闲 worker 时
+  `notify_one`，忙时每目录零唤醒。会话失败 / worker panic / 取消同样取消 `halt`。每个 worker 等的是自己的
+  `halt.child_token()` (也传给列举请求)，64 个 worker 与它们的列举生产者不挤同一个等待表。
+- **一个目录** (`unordered/worker.rs`)：worker 直接读 `ListingStream` (没有中间的列举任务)，每页先
+  `now_or_never` 偷看 (单页目录的结束随页一起到)；页用与 Blocks 相同的 `stream::prepare` 准备 (扫描根自己的
+  对象守卫、消失、即时决定、无 I/O 观察、下钻槽位)；要 I/O 的子项每页一个 detach 任务
+  (`unordered/page_io.rs`，`FuturesUnordered`，全局 `max_inflight_operations` 个观察许可，不 abort)；按列举序
+  组成一批 (页里描述不出的在前)，**整批交给会话之后**才把子目录压栈 —— 所以目录的 Entry 一定先于它下面的
+  任何项。列举失败：非根、`NotFound`、一个都没返回 → `vanished_listings`；否则 `Failure{scope: Listing,
+  delivered}` 跟在已交出的子项之后。`halt` 触发后结束的列举不报失败 (R10)。
+- **没有** 序号、重排缓冲、`DirectoryListed`、每目录计数；每个 worker 本地累加 `BlockCounts` + 列举计数，
+  结束时相加进 `ScanTotals`。与 Blocks 同一棵树：条目集合、失败集合、`ScanTotals` 逐字段相同
+  (`storage/tests/unordered.rs` 的 `same_as_blocks` 在多种 fake 上钉住)。
+- **每个 key 的全部版本在一起** (`TraversalVersions::All`)：页末同一 key 的一段版本留到下一页的批首
+  (`trailing_run`)；会话通道 `send_whole` 整批一条消息，别的 worker 插不进一批中间。
+- **会话通道按批** (`traversal/channel.rs`)：`mpsc::unbounded` 传 `Vec<TraversalItem>` + 按条计的信号量
+  (`max_buffered_items` 个许可，批用完才还)。Blocks 的 flush 也是一次一批 (`send`，超过上限按上限切，单一发送方
+  顺序不变)；Unordered 用 `send_whole` (超过上限就等整个上限空出来再整批发)。
 
 ### 二、admission cursor —— `Blocks` 模式 (P7 C4 起逐页)
 
@@ -435,25 +470,25 @@ CIFS 上三条路，都不便宜：
 双全**；B 省掉磁盘，代价是时序退化**加上**句柄长持有。
 
 **`Blocks` 下逃生门 B 同样不成立**：下钻按名字排序，没看完整个列举就不知道先下哪个子目录。
-所以海量子目录只能靠基线与溢写；无盘时该目录**必须拒绝而不是静默降级**。(P7 C10 的 `Unordered`
-没有这个限制：子目录一发现就入栈。)
+所以海量子目录只能靠基线与溢写；无盘时该目录**必须拒绝而不是静默降级**。(`Unordered` 没有这个限制：
+子目录一发现就入栈，栈上只有 `DirectoryWork`，与 legacy 的任务队列同量级。)
 
 
 ### 五、三者对比
 
-| | legacy work-stealing | `Blocks` (P7 C4) |
-|---|---|---|
-| 输出顺序 | 不确定 | 块序：块内列举序，下钻按名字节序 (跨 backend 一致) |
-| 目录完成语义 | **结构上做不到** | 每目录 `DirectoryListed{outcome, counts}` |
-| 当前块 | 流式 | 逐页流式 (几页，与目录大小无关) |
-| 内存 | 待处理队列**无界** | O(打开的列举 × 页) + O(待下钻子目录) |
-| 背压 | 只在条目通道 | 贯通到协议翻页 |
-| 不规则树负载均衡 | **更好** (窃最浅) | 无窃取 |
-| 头阻塞 | **没有** | 有 |
+| | legacy work-stealing | `Unordered` (P7 C10，默认) | `Blocks` (P7 C4) |
+|---|---|---|---|
+| 输出顺序 | 不确定 | 不确定；目录的 Entry 先于其下一切，一个目录的项保持列举序 | 块序：块内列举序，下钻按名字节序 (跨 backend 一致) |
+| 目录完成语义 | **结构上做不到** | 没有逐目录事件；会话 `Completed` + `Failure{Listing}` 清单 | 每目录 `DirectoryListed{outcome, counts}` |
+| 计数 | 无 | `ScanTotals` (与 Blocks 逐字段相同) | `ScanTotals` + 每块 `BlockCounts` |
+| 当前块 | 流式 | 逐页流式 | 逐页流式 (几页，与目录大小无关) |
+| 内存 | 待处理队列**无界** | O(K × 页) + O(栈上的待列目录) | O(打开的列举 × 页) + O(待下钻子目录) |
+| 背压 | 只在条目通道 | 贯通到协议翻页 | 贯通到协议翻页 |
+| 不规则树负载均衡 | **更好** (窃最浅) | 窃最浅 | 无窃取 |
+| 头阻塞 | **没有** | 没有 | 有 |
 
-一句话：**`Blocks` 用「输出的头阻塞」换「逐目录确定的边界 + 计数」，work-stealing 反之。**
-两者并非竞争架构 —— work-stealing 是**调度策略**，admission 是**输出契约**，前者可以成为后者
-预取窗口内部的实现细节。P6 删 legacy 前值得先评估"窃最浅"这个启发式是否值得吸收。
+一句话：**`Blocks` 用「输出的头阻塞」换「逐目录确定的边界 + 计数」；`Unordered` 是 work-stealing 的调度
+加上 role 遍历的契约 (typed 失败、完整性、精确总数)。** 实测 (node1 53M 树) 见 P7 设计 §12.7。
 
 ## Pipeline 与背压
 
