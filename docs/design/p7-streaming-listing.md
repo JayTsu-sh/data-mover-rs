@@ -1168,7 +1168,9 @@ C11 feat(traversal): Resumable（Checkpoint 项每约 1 分钟 + 取消时补发
     出栈 / 窃取先出栈后登记、快照漏 active、会话取消仍丢弃、最终检查点与取消竞速（两种方式）、指纹漏 root、Off 发检查点、
     Blocks 用 `next` 代替 `delivered`、取最新记录、祖先失败丢失、重列保留 ≥ 下一环、忽略版本字节、最终检查点受周期门控、
     检查点落在块内、解码不设上限
-C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 v7），删除 TraversalVersions / list_versions；快照只留一种格式、不兼容旧版本（用户 2026-09-27）
+C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 v7），删除 TraversalVersions / list_versions
+    - 用户 2026-09-27 定（Q-A）：连接时 GetBucketVersioning 瞬时失败（超时 / 5xx / 网络，SDK 重试后）→ role connect 报 Connectivity / Transient，
+      不猜；明确拒绝（403）→ 列历史（Q26）；501 / 不支持版本 → ListObjectsV2；快照只留一种格式、不兼容旧版本（用户 2026-09-27）
 C12 docs: docs/architecture/storage-transfer-architecture.md §5/§6；.claude/docs/{architecture,error-taxonomy,storage-*}.md；ADR-0008
 （terrasync 侧，另起：不丢批、分钟级退避、检查点落库顺序、消费者退出即失败、统计以库为准、全量扫描 generation 闸门、
   身份键只对 StableWithinBackend 关联、多版本每项展开成每版本一行）
