@@ -22,6 +22,9 @@ enum ExistingBehaviour {
     Completed,
 }
 
+/// How every `stat` of a [`FakeNamespace`] fails, given the probed path.
+type StatFailure = fn(&StoragePath) -> StorageRoleFailure;
+
 struct FakeNamespace {
     /// Paths that already exist as directories.
     directories: Mutex<HashSet<String>>,
@@ -32,8 +35,8 @@ struct FakeNamespace {
     /// Paths whose `CreateDirectory` is refused as `PermissionDenied` before the server looks
     /// at the name, as ONTAP does on a share the account may only read.
     denied: HashSet<String>,
-    /// Every `stat` fails (session scope).
-    stat_fails: bool,
+    /// Every `stat` fails with this failure.
+    stat_failure: Option<StatFailure>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -45,7 +48,7 @@ impl FakeNamespace {
             existing,
             session_failure_at: None,
             denied: HashSet::new(),
-            stat_fails: false,
+            stat_failure: None,
             calls: Mutex::new(Vec::new()),
         })
     }
@@ -70,7 +73,7 @@ impl FakeNamespace {
             existing,
             session_failure_at: None,
             denied: HashSet::new(),
-            stat_fails: false,
+            stat_failure: None,
             calls: Mutex::new(Vec::new()),
         })
     }
@@ -82,7 +85,7 @@ impl FakeNamespace {
             existing: ExistingBehaviour::Conflict,
             session_failure_at: Some(path.to_owned()),
             denied: HashSet::new(),
-            stat_fails: false,
+            stat_failure: None,
             calls: Mutex::new(Vec::new()),
         })
     }
@@ -93,7 +96,7 @@ impl FakeNamespace {
         directories: &[&str],
         files: &[&str],
         denied: &[&str],
-        stat_fails: bool,
+        stat_failure: Option<StatFailure>,
     ) -> Arc<Self> {
         let owned = |paths: &[&str]| paths.iter().map(|path| (*path).to_owned()).collect();
         Arc::new(Self {
@@ -102,7 +105,7 @@ impl FakeNamespace {
             existing: ExistingBehaviour::Conflict,
             session_failure_at: None,
             denied: owned(denied),
-            stat_fails,
+            stat_failure,
             calls: Mutex::new(Vec::new()),
         })
     }
@@ -138,12 +141,20 @@ impl FakeNamespace {
 }
 
 fn entry_failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure {
+    transient_or_not(path, class, Transience::Permanent)
+}
+
+fn transient_or_not(
+    path: &StoragePath,
+    class: FailureClass,
+    transience: Transience,
+) -> StorageRoleFailure {
     StorageRoleFailure::Entry(
         EntryOperationFailure::new(
             path.clone(),
             Operation::Namespace,
             class,
-            Transience::Permanent,
+            transience,
             "create_dir test namespace",
         )
         .unwrap_or_else(|error| panic!("{error}")),
@@ -151,10 +162,14 @@ fn entry_failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure 
 }
 
 fn session_failure() -> StorageRoleFailure {
+    session_failure_of(FailureClass::Connectivity)
+}
+
+fn session_failure_of(class: FailureClass) -> StorageRoleFailure {
     StorageRoleFailure::Session(
         crate::model::BackendSessionFailure::new(
             Operation::Namespace,
-            FailureClass::Connectivity,
+            class,
             Transience::Transient,
             "create_dir test session",
         )
@@ -215,8 +230,8 @@ impl Namespace for FakeNamespace {
         path: &StoragePath,
     ) -> std::result::Result<SourceDescriptor, StorageRoleFailure> {
         self.record(format!("stat {}", path.as_str()));
-        if self.stat_fails {
-            return Err(session_failure());
+        if let Some(failure) = self.stat_failure {
+            return Err(failure(path));
         }
         let kind = if self.files.contains(path.as_str()) {
             EntryKind::File
@@ -427,7 +442,7 @@ async fn denied_outcome(namespace: &FakeNamespace, target: &str) -> Result<Entry
 async fn an_existing_intermediate_level_refused_as_denied_is_proved_and_passed() -> Result {
     // ONTAP on a read-only root: `CREATE` of the existing `a` is `ACCESS_DENIED`, not a
     // collision; `a` itself is writable.
-    let namespace = FakeNamespace::denying(&["a"], &[], &["a"], false);
+    let namespace = FakeNamespace::denying(&["a"], &[], &["a"], None);
     create_directory_all_with_namespace(namespace.as_ref(), &path("a/b")?).await?;
     assert_eq!(namespace.calls(), vec!["mkdir a", "stat a", "mkdir a/b"]);
     Ok(())
@@ -435,7 +450,7 @@ async fn an_existing_intermediate_level_refused_as_denied_is_proved_and_passed()
 
 #[tokio::test]
 async fn an_existing_leaf_refused_as_denied_is_a_success() -> Result {
-    let namespace = FakeNamespace::denying(&["a", "a/b"], &[], &["a", "a/b"], false);
+    let namespace = FakeNamespace::denying(&["a", "a/b"], &[], &["a", "a/b"], None);
     create_directory_all_with_namespace(namespace.as_ref(), &path("a/b")?).await?;
     assert_eq!(
         namespace.calls(),
@@ -457,7 +472,7 @@ async fn a_missing_level_refused_as_denied_keeps_the_refusal() -> Result {
             &["mkdir a", "stat a", "mkdir a/new", "stat a/new"][..],
         ),
     ] {
-        let namespace = FakeNamespace::denying(directories, &[], denied, false);
+        let namespace = FakeNamespace::denying(directories, &[], denied, None);
         let failure = denied_outcome(&namespace, target).await?;
         assert_eq!(failure.class(), FailureClass::PermissionDenied, "{target}");
         assert_eq!(failure.path().as_str(), refused, "{target}");
@@ -478,7 +493,7 @@ async fn a_file_at_a_level_refused_as_denied_keeps_the_refusal() -> Result {
             &["mkdir a", "stat a", "mkdir a/b", "stat a/b"][..],
         ),
     ] {
-        let namespace = FakeNamespace::denying(directories, files, &["a", "a/b"], false);
+        let namespace = FakeNamespace::denying(directories, files, &["a", "a/b"], None);
         let failure = denied_outcome(&namespace, "a/b").await?;
         assert_eq!(failure.class(), FailureClass::PermissionDenied, "{files:?}");
         assert_eq!(failure.path().as_str(), refused, "{files:?}");
@@ -488,12 +503,75 @@ async fn a_file_at_a_level_refused_as_denied_keeps_the_refusal() -> Result {
 }
 
 #[tokio::test]
-async fn a_failing_probe_keeps_the_original_refusal() -> Result {
-    let namespace = FakeNamespace::denying(&["a"], &[], &["a"], true);
-    let failure = denied_outcome(&namespace, "a/b").await?;
-    assert_eq!(failure.class(), FailureClass::PermissionDenied);
-    assert_eq!(failure.path().as_str(), "a");
-    assert_eq!(namespace.calls(), vec!["mkdir a", "stat a"]);
+async fn a_probe_failing_for_the_entry_keeps_the_original_refusal() -> Result {
+    let probes: [StatFailure; 5] = [
+        |path| entry_failure(path, FailureClass::PermissionDenied),
+        |path| entry_failure(path, FailureClass::NotFound),
+        |path| entry_failure(path, FailureClass::Protocol),
+        |path| entry_failure(path, FailureClass::Internal),
+        // Transient but still about the entry (a CIFS sharing violation).
+        |path| transient_or_not(path, FailureClass::Conflict, Transience::Transient),
+    ];
+    for probe in probes {
+        let namespace = FakeNamespace::denying(&["a"], &[], &["a"], Some(probe));
+        let failure = denied_outcome(&namespace, "a/b").await?;
+        assert_eq!(failure.class(), FailureClass::PermissionDenied);
+        assert_eq!(failure.path().as_str(), "a");
+        assert_eq!(namespace.calls(), vec!["mkdir a", "stat a"]);
+    }
+    // The leaf conflict probe too: the file-or-directory question stays unanswered.
+    for probe in probes {
+        let namespace = FakeNamespace::denying(&[], &["a"], &[], Some(probe));
+        let failure = denied_outcome(&namespace, "a").await?;
+        assert_eq!(failure.class(), FailureClass::Conflict);
+        assert_eq!(failure.transience(), Transience::Permanent);
+    }
+    Ok(())
+}
+
+/// A probe failure that is not about the probed entry: cancellation (R10) or a session failure,
+/// reported either as a `Session` failure or at entry scope with a session class.
+const WIDER_PROBES: [(&str, StatFailure); 6] = [
+    ("session", |_| session_failure()),
+    ("session refusal", |_| {
+        session_failure_of(FailureClass::PermissionDenied)
+    }),
+    ("cancelled", |path| {
+        entry_failure(path, FailureClass::Cancelled)
+    }),
+    ("connectivity", |path| {
+        entry_failure(path, FailureClass::Connectivity)
+    }),
+    ("authentication", |path| {
+        entry_failure(path, FailureClass::Authentication)
+    }),
+    ("throttled", |path| {
+        entry_failure(path, FailureClass::Throttled)
+    }),
+];
+
+#[tokio::test]
+async fn a_cancelled_or_session_probe_reports_itself_not_the_refusal() -> Result {
+    for (name, probe) in WIDER_PROBES {
+        // The refused intermediate level `a`, then a conflict at the leaf `a` (a file there).
+        for (directories, files, denied, target) in [
+            (&["a"][..], &[][..], &["a"][..], "a/b"),
+            (&[][..], &["a"][..], &[][..], "a"),
+        ] {
+            let namespace = FakeNamespace::denying(directories, files, denied, Some(probe));
+            let outcome =
+                create_directory_all_with_namespace(namespace.as_ref(), &path(target)?).await;
+            let Err(CreateDirectoryAllFailure::Role(failure)) = outcome else {
+                return Err(format!("{name} {target}: expected a failure, got {outcome:?}").into());
+            };
+            assert_eq!(failure, probe(&path("a")?), "{name} {target}");
+            assert_eq!(
+                namespace.calls(),
+                vec!["mkdir a", "stat a"],
+                "{name} {target}"
+            );
+        }
+    }
     Ok(())
 }
 

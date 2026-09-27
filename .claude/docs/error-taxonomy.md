@@ -256,6 +256,19 @@ Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修�
 | 以 `/` 结尾的键（含存储前缀拼上后以 `/` 结尾的）上的 multipart | 永不发出：role 协议 `begin_multipart` / `complete_multipart` 回条目 `Unsupported` / Permanent；legacy `create_multipart_upload` / `multipart_begin` / multipart rename / 可续传路径（接管已开的上传之前）/ `complete_multipart_upload` 回 `UnsupportedType`。都在任何请求之前（之前 MinIO 回 400 `XMinioInvalidObjectName`，RustFS 1.0.0 把完成的上传存成去掉 `/` 的键、覆盖同名文件） |
 | H1 删除标记（`transfer::write_delete_marker`）：目的桶版本此刻不是 `Enabled`，或目的端不存删除标记 | Publish 的条目 `Unsupported` / Permanent；与同一文件的传输抢租约 → Prepare 的 `Conflict` / Transient；根或 artifact 路径 → `InvalidInput`；发出前取消 → `Cancelled`；**DeleteObject 发出之后**（它自己超时 / 5xx，或读不到删除后的记录）→ 该键的条目、类别照旧、`Transience::Unknown`（结局未知，重放前比对目的端历史）；删除前后该键都没有新标记、最新也不是标记 → `Protocol` / Permanent（RustFS 对未记版本的 `d/`） |
 
+### 递归建目录（`storage::create_directory_all`，backend 无关）
+
+逐层 `Namespace::create_directory`；某层的失败按下表决定报什么。探测 = 对该层的一次 `Stat`。
+
+| 该层 `CreateDirectory` 的结果 | 探测 | 报告 |
+|---|---|---|
+| `Ok` | 不探测 | 成功 |
+| 条目 `Conflict`，中间层 | 不探测 | 成功（下一层自会失败） |
+| 条目 `Conflict`，叶子；或条目 `PermissionDenied`，任一层（服务端先查权限再查重名，c7582a0） | 是目录 | 成功 |
+| 同上 | 不存在 / 不是目录 / 因这个条目失败（`NotFound`、`PermissionDenied`、`Protocol`、`Internal` 等） | 原来的 `Conflict` / `PermissionDenied`（报在该层） |
+| 同上 | `Cancelled`、会话失败（`Session`，或条目级 `Connectivity` / `Authentication`）、`Throttled` | **探测自己的失败**（操作、作用域、类别、Transience 都是探测的）：取消是信号（R10），断连 / 忙与条目无关，不冒充永久拒绝 |
+| 其他（会话级失败、其他类别） | 不探测 | 原样 |
+
 ## 改 error 时
 
 1. **不要随便加新变体**。当前 24 个覆盖 95% 场景。

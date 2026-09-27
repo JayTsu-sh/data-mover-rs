@@ -27,10 +27,17 @@
 //!   account may only read with `ACCESS_DENIED`, not `COLLISION`. An entry-scoped
 //!   `PermissionDenied` therefore costs one `stat` of that level — intermediate or leaf — and
 //!   counts as "this level exists" only when the entry is a directory; a missing level, a
-//!   file, or a failing `stat` keeps the original `PermissionDenied`. So a read-only root above
-//!   a writable directory no longer refuses the levels below it. A session-scoped refusal is
-//!   never probed. NFS recurses inside its one `create_directory` call, so this rule cannot reach
-//!   its intermediate levels; `NFSStorage::create_dir_all` does not apply it yet.
+//!   file, or a `stat` that fails for that entry keeps the original `PermissionDenied`. So a
+//!   read-only root above a writable directory no longer refuses the levels below it. A
+//!   session-scoped refusal is never probed. NFS recurses inside its one `create_directory`
+//!   call, so this rule cannot reach its intermediate levels; `NFSStorage::create_dir_all` does
+//!   not apply it yet.
+//! - **A probe that fails beyond its entry reports itself.** When either `stat` above (the
+//!   leaf conflict check or the refused-level check) ends `Cancelled`, with a session failure
+//!   (a `Session` failure, or an entry failure of class `Connectivity` or `Authentication`), or
+//!   `Throttled`, that failure is returned instead of the original one. Cancellation is an
+//!   upstream signal, not a refusal (R10); a lost session or a busy server says nothing about
+//!   the entry and must not read as a permanent per-entry `PermissionDenied` or `Conflict`.
 //! - **No cross-call cache in this layer.** The legacy `DirExistsCache` lived in the backend
 //!   because there was no role layer; which destination directories a session already created
 //!   is caller state, so it belongs to the caller. Backends may still cache below the role:
@@ -93,7 +100,9 @@ impl From<StorageRoleFailure> for CreateDirectoryAllFailure {
 /// # Errors
 /// Returns [`CreateDirectoryAllFailure::Capability`] when the storage lends no namespace role, or
 /// one that cannot create anything (S3), before any backend I/O, and [`CreateDirectoryAllFailure::Role`] when a level cannot be
-/// created or the leaf turns out to be a non-directory.
+/// created or the leaf turns out to be a non-directory. When the `stat` that checks a level
+/// fails with `Cancelled`, `Connectivity`, `Authentication` or `Throttled`, or at session scope,
+/// that failure is returned (its operation is the `stat`'s) rather than the level's own.
 pub async fn create_directory_all(
     storage: &Storage,
     path: &StoragePath,
@@ -149,9 +158,30 @@ async fn create_level(
     }
     match namespace.stat(&level).await {
         Ok(entry) if entry.kind == EntryKind::Directory => Ok(()),
-        // Report the original failure rather than the probe's outcome: the caller asked to
-        // create a directory, and what stopped it was the entry already there or the refusal.
+        // A cancelled, session-wide or throttled probe says nothing about the entry, and turning
+        // it into the entry's refusal would make an upstream signal (R10), a lost session or a
+        // busy server look like a permanent per-entry failure: report the probe's own failure.
+        Err(probe) if outlives_the_entry(&probe) => Err(probe.into()),
+        // Otherwise report the original failure rather than the probe's outcome: the caller
+        // asked to create a directory, and what stopped it was the entry already there or the
+        // refusal.
         _ => Err(failure.into()),
+    }
+}
+
+/// Whether a failed probe is about something other than the probed entry: a cancellation, a
+/// failure of the session (connectivity, authentication) whichever scope the backend reported
+/// it in, or throttling (neither the entry's fault nor the session's, and always transient).
+fn outlives_the_entry(probe: &StorageRoleFailure) -> bool {
+    match probe {
+        StorageRoleFailure::Session(_) => true,
+        StorageRoleFailure::Entry(error) => matches!(
+            error.class(),
+            FailureClass::Cancelled
+                | FailureClass::Connectivity
+                | FailureClass::Authentication
+                | FailureClass::Throttled
+        ),
     }
 }
 

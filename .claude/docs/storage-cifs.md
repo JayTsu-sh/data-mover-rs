@@ -151,7 +151,10 @@ legacy `CifsStorage` 的能力在 role-based backend 里的去向 —— 有对�
   逐层 `CreateDirectory`，`Ok` 与 `Conflict` 都算"这层已存在"，只在叶子层冲突时多花一次 `Stat`
   确认不是文件。ONTAP 对 CREATE 先查 share ACL 再查重名，已存在的目录在只读处回 `ACCESS_DENIED`
   而不是 `COLLISION`：所以任何一层 (中间层或叶子) 的 entry 级 `PermissionDenied` 都多花一次 `Stat`，
-  是目录才算"这层已存在"；不存在 / 是文件 / `Stat` 失败则报原来的 `PermissionDenied` (不报探测结果)。
+  是目录才算"这层已存在"；不存在 / 是文件 / `Stat` 因这个条目失败则报原来的 `PermissionDenied`
+  (不报探测结果)。探测本身 `Cancelled`、败在会话上 (`Session` 失败，或 entry 级的 `Connectivity` /
+  `Authentication`) 或被节流 (`Throttled`) 时报探测的失败 —— 取消是信号不是拒绝 (R10)，断连 / 服务端忙
+  与这个条目无关，不能冒充永久拒绝；叶子层冲突的那次 `Stat` 同理。
   legacy 的 `DirExistsCache` 不补 —— 跨调用缓存是调用方的会话状态。
 - `update_metadata` 的 2-RT compound (legacy `evict_lease` + `compound_set_basic_info`) 没有
   对应物，现在是 open + set + close 三个往返，facade 不暴露 wire compound
