@@ -16,8 +16,8 @@
 //!   exclusively, classifying the server's answer itself (`classify_error`, keeping its status). A
 //!   parent that is gone once its stale cached handle was forgotten — deleted after this process
 //!   cached it, so the level creation passed it without an RPC — is rebuilt once within the call.
-//! - [`NFSStorage::role_rename`] creates the missing levels of the destination's parent the same
-//!   way before it renames (the rename itself is the legacy one's, minus its `create_dir_all`).
+//! - [`NFSStorage::role_rename`] (`src/nfs/role_rename.rs`) creates the missing levels of the
+//!   destination's parent the same way before it renames.
 //! - [`NFSStorage::role_lookup_fh`] resolves a path through the handle cache as the legacy
 //!   `lookup_fh` does (same stale / busy retries) but classifies the LOOKUP that failed itself.
 
@@ -32,7 +32,7 @@ use super::{
     FType3, LookupFailure, MAX_STALE_RETRIES, NFSFileHandle, NFSStorage, backoff_server_busy,
     classify_role_error, invalidate_path_cache, is_retryable_with_invalidation, is_server_busy,
 };
-use crate::model::{FailureClass, StoragePath, Transience};
+use crate::model::{FailureClass, Transience};
 use crate::storage::backends::nfs::protocol::classify_error;
 use crate::storage::backends::nfs::source::NfsProtocolFailure;
 
@@ -88,23 +88,6 @@ impl NFSStorage {
         };
         let created = create_exclusive(&calls).await?;
         Ok(created.map(|handle| NFSFileHandle::new(handle, path.to_path_buf())))
-    }
-
-    /// Renames `from` to `to` after creating every missing level of `to`'s parent as the role
-    /// does ([`Self::role_create_all`]).
-    pub(super) async fn role_rename(
-        &self,
-        from: &StoragePath,
-        to: &StoragePath,
-    ) -> Result<(), NfsProtocolFailure> {
-        let to = Path::new(to.as_str());
-        let components = Self::collect_components(to).map_err(classify_role_error)?;
-        if let Some((_, parents)) = components.split_last() {
-            self.role_create_all(parents).await?;
-        }
-        self.rename_with(Path::new(from.as_str()), to, false)
-            .await
-            .map_err(classify_role_error)
     }
 }
 

@@ -179,6 +179,12 @@ legacy 递归 `create_dir_all`，而是 `role_create_all`：从句柄缓存里�
 （`ACCES` / `ROFS` → `PermissionDenied`，保留状态名）；父目录缓存句柄 `STALE` 且父目录已被外部删掉 → 同一次调用里
 重建一次。legacy 调用方（`StorageEnum`、legacy `create_file` / `rename`）不变。
 
+role 的 rename（`Namespace::rename`、staged 的发布 / 指针 rename，`src/nfs/role_rename.rs`，NFS 收尾）自己解析两个父目录
+（`role_lookup_fh`，按上表）、发 RENAME 并直接 `classify_error`：此前它走 legacy rename，LOOKUP 与 RENAME 的错误都经字符串
+包装，在 role 层一律 `Protocol` / Unknown（可重试）。现在被拒（`ACCES` / `PERM` / `ROFS`）是条目 `PermissionDenied` /
+Permanent，`XDEV` → `Unsupported`，`NOTEMPTY` / `EXIST` / `ISDIR` / `NOTDIR` → `Conflict`，保留状态名；`STALE` /
+`BADHANDLE` / `NOENT`（并发改名）忘掉缓存重试至多 3 次，用尽按最后的回答分类（`NOENT` → `NotFound` / Permanent）。
+
 元数据角色的 SETATTR（mode / owner / 时间）也走这张表（K3b，`setattr_role`）；此前经 legacy 字符串包装，
 被拒一律是 `Protocol` / Unknown、没有状态名、也从不升为会话失败。SETATTR 之前的 LOOKUP 与 stale 重试里的
 re-lookup 仍走 legacy `classify_role_error`，失败时没有状态。

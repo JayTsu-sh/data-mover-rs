@@ -57,6 +57,7 @@ mod role_create;
 mod role_listing;
 mod role_metadata;
 mod role_namespace;
+mod role_rename;
 
 pub(crate) use owner::{owner_id, owners_are_strings};
 
@@ -2796,12 +2797,6 @@ impl NFSStorage {
     ///
     /// Returns an error when the requested storage operation cannot be completed.
     pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-        self.rename_with(from, to, true).await
-    }
-
-    /// [`Self::rename`]; `create_parent`: create `to`'s missing parent levels with the legacy
-    /// `create_dir_all` first. The role creates them itself (`role_rename`).
-    async fn rename_with(&self, from: &Path, to: &Path, create_parent: bool) -> Result<()> {
         trace!("Rename {:?} to {:?}", from, to);
 
         // 提取文件名（循环外，不依赖缓存）
@@ -2817,7 +2812,7 @@ impl NFSStorage {
             .to_string();
 
         // 确保目标目录存在（只需一次，重试时只需刷新 fh）
-        if create_parent && let Some(parent) = to.parent() {
+        if let Some(parent) = to.parent() {
             self.create_dir_all(parent).await?;
         }
 
