@@ -203,14 +203,14 @@ impl Output {
     ) -> Result<(), TraversalTerminalFailure> {
         let mut batch = Vec::with_capacity(self.ready.len());
         while let Some(settled) = self.ready.pop_front() {
-            let item = match settled {
+            let items = match settled {
                 Settled::Child { item, descent } => self.settle_child(item, descent),
-                Settled::BlockEnd { path, facts } => Some(self.close_block(path, facts)),
+                Settled::BlockEnd { path, facts } => Tallied::One(self.close_block(path, facts)),
             };
             // Counted as passed as it joins the batch, so the ready queue keeps starting at
             // `next` even when cancellation wins the send and ends the flush.
             self.next += 1;
-            batch.extend(item);
+            items.push_into(&mut batch);
         }
         let Some(last) = batch.last() else {
             return Ok(());
@@ -226,20 +226,15 @@ impl Output {
     }
 
     /// Tallies one child against the block it belongs to.
-    fn settle_child(
-        &mut self,
-        item: ChildItem,
-        descent: Option<ChildDescent>,
-    ) -> Option<TraversalItem> {
-        let item = tally_child(&mut self.block, item, descent)?;
+    fn settle_child(&mut self, item: ChildItem, descent: Option<ChildDescent>) -> Tallied {
         // A listing failure is the directory's, not a child's: it decides the block's outcome and
         // its block end counts it.
-        if let TraversalItem::Failure(failure) = &item
+        if let ChildItem::Item(TraversalItem::Failure(failure)) = &item
             && let Some(outcome) = failure.listing_outcome()
         {
             self.listing.get_or_insert(outcome);
         }
-        Some(item)
+        tally_child(&mut self.block, item, descent)
     }
 
     /// Turns the block just delivered into its [`DirectoryListed`], and adds it to the totals.
@@ -258,13 +253,30 @@ impl Output {
     }
 }
 
-/// Tallies one child into `block` and returns the item to deliver, if any. A listing failure is
+/// What one child's tally hands the session, in order: nothing (a child the filter kept out, or
+/// one that vanished), or its item.
+pub(super) enum Tallied {
+    Nothing,
+    One(TraversalItem),
+}
+
+impl Tallied {
+    /// Appends what to deliver to `batch`: a push, no iterator on the path every entry takes.
+    pub(super) fn push_into(self, batch: &mut Vec<TraversalItem>) {
+        match self {
+            Self::Nothing => {}
+            Self::One(item) => batch.push(item),
+        }
+    }
+}
+
+/// Tallies one child into `block` and returns what to deliver for it. A listing failure is
 /// returned untallied: it is its directory's, not a child's, and the caller counts it as such.
 pub(super) fn tally_child(
     block: &mut BlockCounts,
     item: ChildItem,
     descent: Option<ChildDescent>,
-) -> Option<TraversalItem> {
+) -> Tallied {
     match descent {
         Some(ChildDescent::Pruned) => {
             block.pruned_dirs = block.pruned_dirs.saturating_add(1);
@@ -278,11 +290,11 @@ pub(super) fn tally_child(
         ChildItem::Item(item) => item,
         ChildItem::Filtered => {
             block.filtered = block.filtered.saturating_add(1);
-            return None;
+            return Tallied::Nothing;
         }
         ChildItem::Vanished => {
             block.vanished = block.vanished.saturating_add(1);
-            return None;
+            return Tallied::Nothing;
         }
     };
     match &item {
@@ -296,7 +308,7 @@ pub(super) fn tally_child(
         | TraversalItem::DirectoryListed(_)
         | TraversalItem::Checkpoint(_) => {}
     }
-    Some(item)
+    Tallied::One(item)
 }
 
 /// Counts how one directory's listing ended into `totals`, derived from the listing's own

@@ -178,7 +178,7 @@ impl Worker {
             let item = ChildItem::Item(TraversalItem::Failure(Box::new(ScanFailure::child(
                 failure,
             ))));
-            batch.extend(tally_child(&mut self.block, item, None));
+            tally_child(&mut self.block, item, None).push_into(&mut batch);
         }
         batch.extend(carry);
         self.settle(settled, hints, &mut batch, &mut below)?;
@@ -234,7 +234,7 @@ impl Worker {
                     .and_then(|ticket| take_hint(&mut hints, ticket));
                 below.push(descend.with_hint(hint));
             }
-            batch.extend(tally_child(&mut self.block, item, descent));
+            tally_child(&mut self.block, item, descent).push_into(batch);
         }
         Ok(())
     }
