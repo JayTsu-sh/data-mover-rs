@@ -293,7 +293,7 @@ impl<'a> Block<'a> {
             let result = match child {
                 Child::Prefix(key) => self.prefix_child(&key),
                 Child::Object(object) => self.object_child(&object),
-                Child::History(history) => self.history_child(&history),
+                Child::History(history) => self.history_child(history),
             };
             if let Err(failure) = result {
                 self.failures.push(failure);

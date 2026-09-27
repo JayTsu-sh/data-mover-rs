@@ -20,7 +20,7 @@ use crate::storage::{DescentHint, ListRequest, ListingPage};
 use crate::traversal::storage::observe::{Listed, observe};
 use crate::traversal::storage::stream::{self, Arrival, Child, Page, Slot};
 use crate::traversal::storage::{DirectoryWork, Resolved, Shared, resolve};
-use crate::traversal::{ScanFailure, TraversalTerminalFailure, TraversalVersions};
+use crate::traversal::{ScanFailure, TraversalTerminalFailure};
 
 /// What listing one ancestor again found.
 #[derive(Default)]
@@ -45,11 +45,7 @@ pub(crate) async fn remaining(
 ) -> Result<Relisted, TraversalTerminalFailure> {
     let request = ListRequest::new(work.path.clone(), shared.request.cancel.clone())
         .with_descent_hint(work.hint.clone());
-    let namespace = shared.namespace.as_ref();
-    let mut stream = match shared.request.versions {
-        TraversalVersions::Current => namespace.list(request),
-        TraversalVersions::All => namespace.list_versions(request),
-    };
+    let mut stream = shared.namespace.list(request);
     let mut relisted = Relisted::default();
     let mut listed: u64 = 0;
     while let Some(item) = stream.next().await {
@@ -162,6 +158,7 @@ async fn decide_pending(
                 shared.metadata.as_ref(),
                 *descriptor,
                 plan,
+                &shared.request.cancel,
             )
             .await
             .map(Box::new)

@@ -83,7 +83,7 @@ fn the_current_format_is_pinned_byte_for_byte() {
         hex(unordered.as_bytes()),
         concat!(
             "444d5443",
-            "01",
+            "02",
             "00",
             "abababababababababababababababababababababababababababababababab",
             "02000000",
@@ -97,7 +97,7 @@ fn the_current_format_is_pinned_byte_for_byte() {
             "62",
             "02000000",
             "01",
-            "f1c4df531dfbfd5fbbcba5fb20ab8293"
+            "a2d2f95514c95534c473ac21ba9269a8"
         )
     );
     let blocks = encoded(
@@ -112,7 +112,7 @@ fn the_current_format_is_pinned_byte_for_byte() {
         hex(blocks.as_bytes()),
         concat!(
             "444d5443",
-            "01",
+            "02",
             "01",
             "abababababababababababababababababababababababababababababababab",
             "03000000",
@@ -131,7 +131,7 @@ fn the_current_format_is_pinned_byte_for_byte() {
             "2f79",
             "03000000",
             "00",
-            "6043ba8035f072c5a7ea92624ebbd9df"
+            "54d1ed2a928f029e664f63fec0c09e09"
         )
     );
 }
@@ -381,7 +381,7 @@ fn the_fingerprint_binds_what_decides_the_listing_and_nothing_else() {
     let local = local::test_identity("store");
     let base = TraversalRequest::new(path("r")).filter(named("logs"));
     let print = |identity: &BackendIdentity, request: &TraversalRequest| {
-        fingerprint(identity, request).unwrap_or_else(|error| panic!("{error}"))
+        fingerprint(identity, request, false).unwrap_or_else(|error| panic!("{error}"))
     };
     let expected = print(&local, &base);
     let depth = NonZeroUsize::new(3);
@@ -407,8 +407,8 @@ fn the_fingerprint_binds_what_decides_the_listing_and_nothing_else() {
         ),
         ("depth", print(&local, &base.clone().max_depth(depth))),
         (
-            "versions",
-            print(&local, &base.clone().versions(TraversalVersions::All)),
+            "histories",
+            fingerprint(&local, &base, true).unwrap_or_else(|error| panic!("{error}")),
         ),
         (
             "filter",
@@ -437,7 +437,7 @@ fn the_fingerprint_binds_what_decides_the_listing_and_nothing_else() {
 fn a_filter_without_a_resume_key_cannot_be_resumable() {
     let request = TraversalRequest::new(StoragePath::root()).filter(Arc::new(Keyless));
     assert_eq!(
-        fingerprint(&local::test_identity("store"), &request),
+        fingerprint(&local::test_identity("store"), &request, false),
         Err(ResumeRefusal::FilterNotResumable)
     );
 }

@@ -1,7 +1,8 @@
 //! The expert halves fed an observation the way the S3 traversal makes it (ADR-0006 C22): from a
-//! delimiter listing, not a describe. A listing of current objects has no version id, so on a
-//! versioned bucket the observation (`PathScoped(path, ETag)`) and the describe (`VersionScoped(id)`)
-//! differ in identity while naming the same object.
+//! delimiter listing, not a describe. A listing has no version id for the current object — of
+//! current objects, or a key's entry with its history (P7 §10), whose entry-level facts are the
+//! current object's — so on a versioned bucket the observation (`PathScoped(path, ETag)`) and the
+//! describe (`VersionScoped(id)`) differ in identity while naming the same object.
 
 use std::error::Error;
 use std::sync::Arc;
@@ -10,10 +11,10 @@ use bytes::Bytes;
 use futures::channel::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{EntryVersion, IdentityStrength, ObservedEntry, StoragePath};
+use crate::model::{IdentityStrength, ObservedEntry, StoragePath};
 use crate::storage::backends::s3::tests::{MemoryS3, Versioning, content_md5, identity};
-use crate::storage::backends::s3::{S3Protocol as _, connect};
-use crate::storage::listing::testing::{listed as listed_current, listed_versions};
+use crate::storage::backends::s3::{S3Protocol as _, S3VersioningAtConnect, connect};
+use crate::storage::listing::testing::listed as listed_current;
 use crate::storage::{PreflightPolicy, SourceDescriptor, Storage};
 use crate::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest, ExpertSourceSession,
@@ -41,7 +42,7 @@ async fn versioned() -> TestResult<Arc<MemoryS3>> {
 }
 
 /// The observation the traversal emits for a listed child: its path, kind, size, time and the
-/// listing's identity, with the listed version when there is one.
+/// listing's identity, with the key's history when there is one.
 fn observation(descriptor: &SourceDescriptor) -> TestResult<ObservedEntry> {
     Ok(ObservedEntry::new(
         descriptor.path.clone(),
@@ -50,17 +51,20 @@ fn observation(descriptor: &SourceDescriptor) -> TestResult<ObservedEntry> {
         None,
         descriptor.source_identity.clone(),
     )?
-    .with_version(descriptor.listing.version.clone()))
+    .with_history(descriptor.listing.history.clone()))
 }
 
-/// Every listed `source` entry, current objects only or every version.
-async fn listed(storage: &Storage, all: bool) -> TestResult<Vec<ObservedEntry>> {
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
-    let (entries, _) = if all {
-        listed_versions(&*namespace, &StoragePath::root()).await?
+/// Every listed `source` entry: of the current objects, or with its history (`histories`) — what
+/// the bucket answered when it was connected decides, so the listing connects anew.
+async fn listed(protocol: &Arc<MemoryS3>, histories: bool) -> TestResult<Vec<ObservedEntry>> {
+    protocol.answer_at_connect(if histories {
+        S3VersioningAtConnect::Enabled
     } else {
-        listed_current(&*namespace, &StoragePath::root()).await?
-    };
+        S3VersioningAtConnect::Never
+    });
+    let storage = connect(protocol.clone(), identity(), None)?;
+    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let (entries, _) = listed_current(&*namespace, &StoragePath::root()).await?;
     entries
         .iter()
         .filter(|entry| entry.path.as_str() == "source")
@@ -121,21 +125,26 @@ async fn open_error(storage: &Storage, observation: ObservedEntry) -> String {
     }
 }
 
-/// A current object listed from a versioned bucket is identified by its `ETag`, the describe by
-/// its version; the unchanged object is still copied, and its current bytes arrive.
+/// A current object listed from a versioned bucket — by current objects, or as a key with its
+/// history — is identified by its `ETag`, the describe by its version; the unchanged object is
+/// still copied, and its current bytes arrive.
 #[tokio::test]
 async fn a_listed_current_object_of_a_versioned_bucket_is_copied() -> TestResult {
     let protocol = versioned().await?;
     let storage = connect(protocol.clone(), identity(), None)?;
-    let observed = listed(&storage, false).await?;
-    assert_eq!(observed.len(), 1);
-    assert_eq!(
-        observed[0].source_identity().strength(),
-        IdentityStrength::PathScoped
-    );
-    copy(&storage, observed[0].clone(), "copied").await?;
-    let copied = protocol.objects.lock().await.get("copied").cloned();
-    assert_eq!(copied.as_deref(), Some(&b"second!"[..]));
+    for histories in [false, true] {
+        let observed = listed(&protocol, histories).await?;
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].history().is_some(), histories);
+        assert_eq!(
+            observed[0].source_identity().strength(),
+            IdentityStrength::PathScoped
+        );
+        let target = format!("copied-{histories}");
+        copy(&storage, observed[0].clone(), &target).await?;
+        let copied = protocol.objects.lock().await.get(&target).cloned();
+        assert_eq!(copied.as_deref(), Some(&b"second!"[..]), "{histories}");
+    }
     Ok(())
 }
 
@@ -146,7 +155,7 @@ async fn a_listed_current_object_of_a_versioned_bucket_is_copied() -> TestResult
 async fn an_object_changed_after_listing_is_refused() -> TestResult {
     let protocol = versioned().await?;
     let storage = connect(protocol.clone(), identity(), None)?;
-    let observed = listed(&storage, false).await?.remove(0);
+    let observed = listed(&protocol, true).await?.remove(0);
     put(&protocol, "source", b"changed").await?;
     let error = open_error(&storage, observed.clone()).await;
     assert!(error.contains("source differs"), "{error}");
@@ -155,24 +164,26 @@ async fn an_object_changed_after_listing_is_refused() -> TestResult {
     Ok(())
 }
 
-/// From a listing of every version, the latest version is the current object and is copied; an
-/// older one and a delete marker are refused with the reason, not as a changed source.
+/// A key with its history is an expert source only for its current object: a segment of the
+/// history that is not its last, or a key deleted now, is refused with the reason, not as a
+/// changed source.
 #[tokio::test]
-async fn only_the_latest_listed_version_is_an_expert_source() -> TestResult {
+async fn only_a_key_with_a_current_object_is_an_expert_source() -> TestResult {
     let protocol = versioned().await?;
     let storage = connect(protocol.clone(), identity(), None)?;
-    let versions = listed(&storage, true).await?;
-    assert_eq!(versions.len(), 2);
-    let error = open_error(&storage, versions[0].clone()).await;
-    assert!(error.contains("older version"), "{error}");
-    copy(&storage, versions[1].clone(), "latest").await?;
+    let key = listed(&protocol, true).await?.remove(0);
+    let segments = key.clone().into_segments(1);
+    assert_eq!(segments.len(), 2);
+    let error = open_error(&storage, segments[0].clone()).await;
+    assert!(error.contains("not its last"), "{error}");
+    copy(&storage, segments[1].clone(), "last-segment").await?;
     protocol
         .delete_object("source")
         .await
         .map_err(|e| format!("{e:?}"))?;
-    let marker = listed(&storage, true).await?.remove(2);
-    assert!(marker.version().is_some_and(EntryVersion::is_delete_marker));
-    let error = open_error(&storage, marker).await;
-    assert!(error.contains("delete marker"), "{error}");
+    let deleted = listed(&protocol, true).await?.remove(0);
+    assert!(deleted.history().is_some_and(|h| h.current().is_none()));
+    let error = open_error(&storage, deleted).await;
+    assert!(error.contains("deleted now"), "{error}");
     Ok(())
 }

@@ -65,6 +65,8 @@ pub(crate) struct MemoryS3 {
     pub(crate) versions: Mutex<HashMap<(String, String), Option<Bytes>>>,
     /// The version id each tag read asked for.
     pub(crate) tag_versions: Mutex<Vec<Option<String>>>,
+    /// A tag read of this version id fails with this failure (every time, until cleared).
+    pub(crate) tag_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
     /// Behave like a store that ignores `?versionId=` and answers with the current object.
     pub(crate) ignores_version_id: Mutex<bool>,
     /// The next `put_object` fails with `BadDigest`, as if its body was corrupted in flight.
@@ -692,6 +694,11 @@ impl S3Protocol for MemoryS3 {
             .lock()
             .await
             .push(version_id.map(str::to_string));
+        if let Some((failing, failure)) = &*self.tag_failure.lock().await
+            && version_id == Some(failing.as_str())
+        {
+            return Err(failure.clone());
+        }
         Ok(self.tags.lock().await.get(key).cloned().unwrap_or_default())
     }
     async fn put_tags(&self, key: &str, tags: &[ObjectTag]) -> S3Result<()> {

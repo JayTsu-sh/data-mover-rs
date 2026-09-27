@@ -49,17 +49,6 @@ pub(crate) async fn listed(
         .map(|page| page.into_descriptors(directory))
 }
 
-/// [`listed`] for every stored version ([`Namespace::list_versions`]).
-pub(crate) async fn listed_versions(
-    namespace: &(impl Namespace + ?Sized),
-    directory: &StoragePath,
-) -> Result<Described, StorageRoleFailure> {
-    let request = ListRequest::new(directory.clone(), CancellationToken::new());
-    collect_listing(namespace.list_versions(request), CollectLimits::UNBOUNDED)
-        .await
-        .map(|page| page.into_descriptors(directory))
-}
-
 /// One namespace verb with its arguments, so a test can check a table of verbs the same way.
 #[derive(Clone, Debug)]
 pub(crate) enum Verb {

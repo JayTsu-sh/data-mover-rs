@@ -12,12 +12,10 @@
 //! before the subdirectories it found are pushed, so no worker can list one of them before its
 //! entry is in the session.
 //!
-//! **Every version of one object together.** Listing every version, a page may end part way
-//! through one object's versions; the rest of that run is held back and handed over at the head
-//! of the next page's batch, behind that page's undescribable children (or with the listing's
-//! end). A batch reaches the session whole, so nothing else lands inside a run.
+//! **One key's segments together.** A key's history is one child of one page, and its segments
+//! (P7 Q8) are tallied into the same batch; a batch reaches the session whole, so nothing else
+//! lands between them.
 
-use std::mem;
 use std::sync::Arc;
 
 use futures::{FutureExt as _, StreamExt as _};
@@ -30,12 +28,11 @@ use super::super::stream::{self, Arrival, Batch, Child, Page, Slot};
 use super::super::{Deferred, DirectoryWork, Resolved, Shared, resolve};
 use super::page_io::{self, Job};
 use super::pool::Pool;
-use crate::model::{EntryKind, FailureClass, ObservedEntry};
+use crate::model::{FailureClass, ObservedEntry};
 use crate::storage::{DescentHint, ListRequest, ListingPage, ListingStream, StorageRoleFailure};
 use crate::traversal::channel::ItemSender;
 use crate::traversal::{
     BlockCounts, ScanFailure, ScanTotals, TraversalItem, TraversalTerminalFailure,
-    TraversalVersions,
 };
 
 /// How one directory's processing ended.
@@ -51,8 +48,6 @@ enum Ended {
 struct Listing {
     /// Children the listing returned so far, described or not: a failure's `delivered`.
     listed: u64,
-    /// Items held back to go at the head of the next batch (see the module docs).
-    carry: Vec<TraversalItem>,
 }
 
 /// An item of a listing stream.
@@ -110,11 +105,7 @@ impl Worker {
         // tears its listings down.
         let request = ListRequest::new(work.path.clone(), self.stop.clone())
             .with_descent_hint(work.hint.clone());
-        let namespace = self.shared.namespace.as_ref();
-        let mut stream = match self.shared.request.versions {
-            TraversalVersions::Current => namespace.list(request),
-            TraversalVersions::All => namespace.list_versions(request),
-        };
+        let mut stream = self.shared.namespace.list(request);
         let mut listing = Listing::default();
         loop {
             let Some(next) = self.next_item(&mut stream).await else {
@@ -170,21 +161,15 @@ impl Worker {
             return Ok(false);
         };
         let (mut below, hints) = split_slots(slots);
-        // The page's undescribable children first, then what the last page held back, then the
-        // rest in listing order: nothing lands inside a run of one object's versions.
-        let carry = mem::take(&mut listing.carry);
-        let mut batch = Vec::with_capacity(failures.len() + carry.len() + settled.len());
+        // The page's undescribable children first, then the rest in listing order.
+        let mut batch = Vec::with_capacity(failures.len() + settled.len());
         for failure in failures {
             let item = ChildItem::Item(TraversalItem::Failure(Box::new(ScanFailure::child(
                 failure,
             ))));
             tally_child(&mut self.block, item, None).push_into(&mut batch);
         }
-        batch.extend(carry);
         self.settle(settled, hints, &mut batch, &mut below)?;
-        if self.shared.request.versions == TraversalVersions::All {
-            listing.carry = trailing_run(&mut batch);
-        }
         if !self.send(batch).await? {
             return Ok(false);
         }
@@ -286,17 +271,17 @@ impl Worker {
             .map(Some)
     }
 
-    /// Ends the listing: hands over what was held back and, when it failed, its failure. A
-    /// subdirectory gone before its listing returned anything is a complete, empty listing and no
-    /// failure (Q12); the traversal root never is, so a mistyped root cannot read as an empty
-    /// source.
+    /// Ends the listing: hands over its failure, when it failed. A subdirectory gone before its
+    /// listing returned anything is a complete, empty listing and no failure (Q12); the traversal
+    /// root never is, so a mistyped root cannot read as an empty source.
     async fn end(
         &mut self,
         work: &DirectoryWork,
         listing: Listing,
         failure: Option<StorageRoleFailure>,
     ) -> Result<Ended, TraversalTerminalFailure> {
-        let Listing { listed, mut carry } = listing;
+        let Listing { listed } = listing;
+        let mut last = Vec::new();
         if let Some(failure) = failure {
             match stream::failed(&work.path, failure) {
                 Arrival::Failed(failure)
@@ -311,13 +296,13 @@ impl Worker {
                     if let Some(outcome) = failure.listing_outcome() {
                         count_listing(&mut self.totals, outcome);
                     }
-                    carry.push(TraversalItem::Failure(Box::new(failure)));
+                    last.push(TraversalItem::Failure(Box::new(failure)));
                 }
                 Arrival::Terminal(failure) => return Err(failure),
                 Arrival::Page(_) | Arrival::End => return Err(TraversalTerminalFailure::Internal),
             }
         }
-        Ok(if self.send(carry).await? {
+        Ok(if self.send(last).await? {
             Ended::Finished
         } else {
             Ended::Halted
@@ -371,25 +356,4 @@ fn take_hint(hints: &mut [(u64, Option<DescentHint>)], ticket: u64) -> Option<De
         .iter_mut()
         .find(|(known, _)| *known == ticket)
         .and_then(|(_, hint)| hint.take())
-}
-
-/// Splits off the batch's trailing run of one object's versions: entries, none a directory, all
-/// at the path of the last. A directory ends a run, so a directory's entry is never held back
-/// while the subdirectory it names is pushed.
-fn trailing_run(batch: &mut Vec<TraversalItem>) -> Vec<TraversalItem> {
-    let key = match batch.last() {
-        Some(TraversalItem::Entry(entry)) if entry.kind() != EntryKind::Directory => {
-            entry.path().clone()
-        }
-        _ => return Vec::new(),
-    };
-    let run = batch
-        .iter()
-        .rev()
-        .take_while(|item| {
-            matches!(item, TraversalItem::Entry(entry)
-                if entry.kind() != EntryKind::Directory && entry.path() == &key)
-        })
-        .count();
-    batch.split_off(batch.len() - run)
 }

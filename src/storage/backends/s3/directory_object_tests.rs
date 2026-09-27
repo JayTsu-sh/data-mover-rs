@@ -1,13 +1,13 @@
 //! Directory objects on the S3 namespace role (P7 F5): the key `<dir>/` itself, handed over by the
-//! listing of `<dir>` as the file child with the empty name — current objects and every version —
-//! and `stat` of such a key.
+//! listing of `<dir>` as the file child with the empty name — its current object, or, on a bucket
+//! that keeps histories, one child with its whole history — and `stat` of such a key.
 
 use super::*;
 use crate::model::{
     EntryKind, FailureClass, IdentityStrength, StorageTimestamp, TimePrecision, Transience,
 };
 use crate::storage::backends::s3::namespace::S3Namespace;
-use crate::storage::listing::testing::{Described, listed as listed_current, listed_versions};
+use crate::storage::listing::testing::{Described, listed as listed_current};
 use crate::storage::{Namespace, SourceDescriptor, StorageRoleFailure};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -46,22 +46,30 @@ async fn bucket(keys: &[(&str, &'static [u8])]) -> TestResult<Arc<MemoryS3>> {
     Ok(protocol)
 }
 
-/// `path kind size` of a child, with ` id[ L][ M]` for a version.
+/// `path kind size` of a child, with ` [id size[ L][ M], …]` for a key with its history.
 fn row(descriptor: &SourceDescriptor) -> String {
-    let version = descriptor
+    let history = descriptor
         .listing
-        .version
+        .history
         .as_deref()
-        .map_or(String::new(), |version| {
-            format!(
-                " {}{}{}",
-                version.id().unwrap_or("null"),
-                if version.is_latest() { " L" } else { "" },
-                if version.is_delete_marker() { " M" } else { "" }
-            )
+        .map_or(String::new(), |history| {
+            let records: Vec<String> = history
+                .records()
+                .iter()
+                .map(|record| {
+                    format!(
+                        "{} {:?}{}{}",
+                        record.version_id().unwrap_or("null"),
+                        record.size(),
+                        if record.is_latest() { " L" } else { "" },
+                        if record.is_delete_marker() { " M" } else { "" }
+                    )
+                })
+                .collect();
+            format!(" [{}]", records.join(", "))
         });
     format!(
-        "{} {:?} {:?}{version}",
+        "{} {:?} {:?}{history}",
         descriptor.path, descriptor.kind, descriptor.size
     )
 }
@@ -81,8 +89,19 @@ async fn current(namespace: &dyn Namespace, directory: &str) -> TestResult<Descr
     Ok(listed_current(namespace, &path(directory)).await?)
 }
 
-async fn all(namespace: &dyn Namespace, directory: &str) -> TestResult<Described> {
-    Ok(listed_versions(namespace, &path(directory)).await?)
+/// Lists `directory` as a bucket that keeps histories (`histories`) or not, whatever its
+/// versioning: what `protocol` answered when it was connected decides (P7 Q26).
+async fn listed_as(
+    protocol: &Arc<MemoryS3>,
+    directory: &str,
+    histories: bool,
+) -> TestResult<Described> {
+    protocol.answer_at_connect(if histories {
+        S3VersioningAtConnect::Refused
+    } else {
+        S3VersioningAtConnect::Never
+    });
+    current(namespace(protocol)?.as_ref(), directory).await
 }
 
 /// The object `d/` is a file child of `d` at exactly its key, with its bytes, `ETag` and time; its
@@ -155,20 +174,14 @@ async fn a_zero_byte_marker_is_a_zero_size_file_entry() -> TestResult {
 #[tokio::test]
 async fn a_zero_byte_root_marker_is_ignored_and_a_content_one_reported() -> TestResult {
     let marker = bucket(&[("", b""), ("a", b"1")]).await?;
-    let namespace_of_marker = namespace(&marker)?;
-    for listed in [
-        current(namespace_of_marker.as_ref(), "").await?,
-        all(namespace_of_marker.as_ref(), "").await?,
-    ] {
+    for histories in [false, true] {
+        let listed = listed_as(&marker, "", histories).await?;
         let paths: Vec<&str> = listed.0.iter().map(|d| d.path.as_str()).collect();
         assert_eq!((paths, rows(&listed).1), (vec!["a"], vec![]));
     }
     let content = bucket(&[("", b"x"), ("a", b"1")]).await?;
-    let namespace_of_content = namespace(&content)?;
-    for listed in [
-        current(namespace_of_content.as_ref(), "").await?,
-        all(namespace_of_content.as_ref(), "").await?,
-    ] {
+    for histories in [false, true] {
+        let listed = listed_as(&content, "", histories).await?;
         assert_eq!(listed.0.len(), 1, "{:?}", rows(&listed));
         assert_eq!(rows(&listed).1, [" Unsupported"]);
     }
@@ -257,8 +270,9 @@ async fn a_retried_page_does_not_repeat_the_directory_object() -> TestResult {
     Ok(())
 }
 
-/// D5: the own key's whole history — content versions, zero-byte versions and delete markers —
-/// in order, the latest last, beside its directory's other keys.
+/// D5: the own key is one child with its whole history — content versions, zero-byte versions
+/// and delete markers — in order, the latest last, beside its directory's other keys; its latest
+/// record being a marker, it has no size of its own.
 #[tokio::test]
 async fn a_mixed_history_keeps_zero_byte_versions_and_markers_in_order() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
@@ -273,24 +287,23 @@ async fn a_mixed_history_keeps_zero_byte_versions_and_markers_in_order() -> Test
     for page_size in [0, 1, 2] {
         protocol.listing().page_size = page_size;
         assert_eq!(
-            rows(&all(namespace.as_ref(), "m").await?),
+            rows(&current(namespace.as_ref(), "m").await?),
             (
                 vec![
-                    "m/ File Some(5) v0001".to_string(),
-                    "m/ File Some(0) v0002".to_string(),
-                    "m/ File None v0003 M".to_string(),
-                    "m/ File Some(3) v0004".to_string(),
-                    "m/ File None v0005 L M".to_string(),
-                    "m/x File Some(1) v0006 L".to_string(),
+                    "m/ File None [v0001 Some(5), v0002 Some(0), v0003 None M, v0004 Some(3), \
+                     v0005 None L M]"
+                        .to_string(),
+                    "m/x File Some(1) [v0006 Some(1) L]".to_string(),
                 ],
                 vec![]
             ),
             "page size {page_size}"
         );
     }
-    // The current listing: the own key's latest record is a marker, so it has no current object.
+    // Listed by current objects: the own key's latest record is a marker, so it has no current
+    // object.
     assert_eq!(
-        rows(&current(namespace.as_ref(), "m").await?).0,
+        rows(&listed_as(&protocol, "m", false).await?).0,
         ["m/x File Some(1)"]
     );
     Ok(())
@@ -306,13 +319,9 @@ async fn an_all_zero_history_is_listed_whole() -> TestResult {
     put(&protocol, "z/", b"").await?;
     let namespace = namespace(&protocol)?;
     assert_eq!(
-        rows(&all(namespace.as_ref(), "z").await?),
+        rows(&current(namespace.as_ref(), "z").await?),
         (
-            vec![
-                "z/ File Some(0) v0001".to_string(),
-                "z/ File None v0002 M".to_string(),
-                "z/ File Some(0) v0003 L".to_string(),
-            ],
+            vec!["z/ File Some(0) [v0001 Some(0), v0002 None M, v0003 Some(0) L]".to_string()],
             vec![]
         )
     );

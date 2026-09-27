@@ -9,8 +9,9 @@
 //! ```
 //!
 //! Endpoints as in `transfer_resume` (`s3:<prefix>` is `S3_BUCKET`, `s3@<bucket>:<prefix>` another
-//! bucket of the same server). The source's records come from the role-based traversal of every
-//! version (the key's parent, one level deep: a directory object `m/` is a file of `m`).
+//! bucket of the same server). The source's records are the history the role-based traversal of a
+//! versioned bucket gives each key (P7 §10: the key's parent, one level deep — a directory object
+//! `m/` is a file of `m`), segment after segment until the complete one.
 //!
 //! - A destination that keeps histories (`transfer::destination_keeps_history`: versioning
 //!   `Enabled` now) gets every record, strictly one after another: each object version is a
@@ -46,7 +47,7 @@ use std::process::exit;
 
 use clap::Parser;
 use data_mover::model::{
-    EntryVersion, FailureClass, HistoryOrder, ObservedEntry, SourceVersion, StoragePath,
+    FailureClass, HistoryOrder, ObservedEntry, SourceVersion, StoragePath, VersionRecord,
 };
 use data_mover::storage::{Storage, StorageRoleFailure};
 use data_mover::transfer::{
@@ -55,7 +56,6 @@ use data_mover::transfer::{
 };
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalRequest, TraversalSource as _,
-    TraversalVersions,
 };
 use endpoint_support::{Result, connect};
 use tokio_util::sync::CancellationToken;
@@ -106,27 +106,57 @@ fn listed_at(key: &str) -> (&str, usize) {
     (parent, depth)
 }
 
-/// Every record of `key` on `source`, oldest first, as the traversal of every version lists them.
-async fn records(source: &Storage, key: &str) -> Result<Vec<ObservedEntry>> {
+/// Whether `path` is `key` or a directory above it (whole path segments: a failure at `k` is not one
+/// at `k2`).
+fn at_or_above(key: &str, path: &str) -> bool {
+    key == path
+        || path.is_empty()
+        || key
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with('/') || path.ends_with('/'))
+}
+
+/// A key's whole history on `source`, oldest first, and where its order came from: the records of
+/// the key's entries, segment after segment (none when the key is not listed at all). A key without
+/// a history (the bucket keeps none), or whose segments do not end with a complete one, is an error.
+async fn records(source: &Storage, key: &str) -> Result<(Vec<VersionRecord>, HistoryOrder)> {
     let (parent, depth) = listed_at(key);
     let request = TraversalRequest::new(StoragePath::new(parent)?)
-        .versions(TraversalVersions::All)
         .max_depth(NonZeroUsize::new(depth))
         .cancel(CancellationToken::new());
     let mut session = StorageTraversalSource::new(source)?.traverse(request);
-    let mut found = Vec::new();
+    let mut segments: Vec<ObservedEntry> = Vec::new();
     while let Some(item) = session.next_item().await {
         match item {
-            TraversalItem::Entry(entry) if entry.path().as_str() == key => found.push(*entry),
+            TraversalItem::Entry(entry) if entry.path().as_str() == key => segments.push(*entry),
             // A failure at the key or at a directory above it: the history may be incomplete.
-            TraversalItem::Failure(failure) if key.starts_with(failure.path.as_str()) => {
+            TraversalItem::Failure(failure) if at_or_above(key, failure.path.as_str()) => {
                 return Err(format!("{key}: {:?}", failure.failure).into());
             }
             _ => {}
         }
     }
     session.finish().await?;
-    Ok(found)
+    let mut records = Vec::new();
+    let mut order = HistoryOrder::Server;
+    let mut complete = false;
+    for (expected, entry) in segments.iter().enumerate() {
+        let history = entry
+            .history()
+            .ok_or_else(|| format!("{key}: the source keeps no histories (not versioned)"))?;
+        if usize::try_from(history.segment()) != Ok(expected) || complete {
+            return Err(format!("{key}: history segments out of order").into());
+        }
+        order = history.order();
+        complete = history.is_complete();
+        records.extend(history.records().iter().cloned());
+    }
+    // A key the source holds no record of (a store that deleted it for good) has nothing to replay;
+    // segments that never reach the complete one are an error.
+    if !complete && !segments.is_empty() {
+        return Err(format!("{key}: no complete history listed").into());
+    }
+    Ok((records, order))
 }
 
 fn describe(failure: &TransferFailure) -> String {
@@ -146,10 +176,6 @@ fn unholdable(failure: &TransferFailure) -> bool {
         failure.source().and_then(|cause| cause.downcast_ref::<StorageRoleFailure>()),
         Some(StorageRoleFailure::Entry(entry)) if entry.class() == FailureClass::Unsupported
     )
-}
-
-fn is_marker(record: &ObservedEntry) -> bool {
-    record.version().is_some_and(EntryVersion::is_delete_marker)
 }
 
 /// Writes one marker. `refusal_fails`: in a history replay a refusal (the destination stopped
@@ -196,13 +222,14 @@ async fn replay_marker(
 }
 
 impl Replay {
-    async fn copy(&self, record: &ObservedEntry, tally: &mut Tally) -> Result<String> {
-        let version = record.source_version().unwrap_or(SourceVersion::Current);
+    async fn copy(&self, key: &str, record: &VersionRecord, tally: &mut Tally) -> Result<String> {
+        let version = record.source().unwrap_or(SourceVersion::Current);
+        let path = StoragePath::new(key)?;
         let mut request = TransferRequest::new(
             self.source.clone(),
-            record.path().clone(),
+            path.clone(),
             self.destination.clone(),
-            record.path().clone(),
+            path,
             InflightLimits::new(4, 64 * 1024 * 1024, 4)?,
             CancellationToken::new(),
         )
@@ -228,7 +255,7 @@ impl Replay {
     /// One key: every record oldest first onto a destination keeping histories, otherwise only
     /// the newest (D12). Stops at the first failed record.
     async fn key(&self, key: &str, keeps_history: bool, tally: &mut Tally) -> Result {
-        let mut listed = records(&self.source, key).await?;
+        let (mut listed, order) = records(&self.source, key).await?;
         if !keeps_history {
             println!(
                 "key {key}: history not rebuilt: the destination bucket keeps no versions (D12)"
@@ -237,7 +264,7 @@ impl Replay {
         }
         for (index, record) in listed.iter().enumerate() {
             let failed_before = tally.failed;
-            let outcome = match (is_marker(record), keeps_history) {
+            let outcome = match (record.is_delete_marker(), keeps_history) {
                 (true, true) => replay_marker(&self.destination, key, true, tally).await?,
                 (true, false) => {
                     tally.skipped += 1;
@@ -245,10 +272,10 @@ impl Replay {
                      versions: nothing written"
                         .to_owned()
                 }
-                (false, _) => self.copy(record, tally).await?,
+                (false, _) => self.copy(key, record, tally).await?,
             };
             tally.records += 1;
-            print_record(key, index + 1, record, &outcome);
+            print_record(key, index + 1, record, order, &outcome);
             if tally.failed > failed_before {
                 break;
             }
@@ -257,12 +284,17 @@ impl Replay {
     }
 }
 
-fn print_record(key: &str, number: usize, record: &ObservedEntry, outcome: &str) {
-    let version = record.version();
+fn print_record(
+    key: &str,
+    number: usize,
+    record: &VersionRecord,
+    order: HistoryOrder,
+    outcome: &str,
+) {
     println!(
         "record {key} {number} {} {} size={}{} -> {outcome}",
-        version.and_then(EntryVersion::id).unwrap_or("null"),
-        if is_marker(record) {
+        record.version_id().unwrap_or("null"),
+        if record.is_delete_marker() {
             "marker"
         } else {
             "version"
@@ -270,7 +302,7 @@ fn print_record(key: &str, number: usize, record: &ObservedEntry, outcome: &str)
         record
             .size()
             .map_or_else(|| "-".to_owned(), |size| size.to_string()),
-        if version.is_some_and(|version| version.order() == HistoryOrder::Inferred) {
+        if order == HistoryOrder::Inferred {
             " order=inferred"
         } else {
             ""

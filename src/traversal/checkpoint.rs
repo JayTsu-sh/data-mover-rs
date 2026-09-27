@@ -15,8 +15,9 @@
 //! delivered before the checkpoint item. A consumer persists the checkpoint only once everything
 //! it received before that item is committed, and resumes from the last one it persisted.
 //!
-//! **Format** (version 1; bumped on any change, and a checkpoint of another version is refused,
-//! never misread):
+//! **Format** (version 2; bumped on any change — to the bytes or to what the fingerprint binds —
+//! and a checkpoint of another version is refused, never misread; 2 since P7 C11b, whose
+//! fingerprint binds whether the storage lists histories instead of the removed version mode):
 //!
 //! ```text
 //! "DMTC" | version u8 | order u8 | fingerprint [32] | count u32 LE |
@@ -40,7 +41,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use super::{Checkpoint, TraversalOrder, TraversalRequest, TraversalVersions, within};
+use super::{Checkpoint, TraversalOrder, TraversalRequest, within};
 use crate::model::{BackendIdentity, StoragePath};
 
 /// Whether a traversal emits checkpoints (P7 §9.1). Off by default.
@@ -148,7 +149,7 @@ pub(crate) struct FrontierEntry {
 
 const MAGIC: [u8; 4] = *b"DMTC";
 /// The current format; see the module docs. Bump on any change.
-pub(crate) const VERSION: u8 = 1;
+pub(crate) const VERSION: u8 = 2;
 /// Bytes of the trailing checksum.
 const CHECKSUM: usize = 16;
 /// Magic, version, order, fingerprint, count.
@@ -162,12 +163,15 @@ const FILTER_CHILDREN: u8 = 1;
 /// The fingerprint a request's checkpoints carry: what decides which directories a traversal
 /// lists and what it delivers, and nothing that only tunes it (concurrency, buffering, the
 /// observation plan, the checkpoint interval). The storage identity is hashed, never stored.
+/// `histories` is whether the storage lists each key with its history now (P7 §10): a bucket
+/// whose versioning changed between two runs must not resume one with the other's entries.
 ///
 /// # Errors
 /// `FilterNotResumable` when the request's filter has no resume key.
 pub(crate) fn fingerprint(
     identity: &BackendIdentity,
     request: &TraversalRequest,
+    histories: bool,
 ) -> Result<[u8; 32], ResumeRefusal> {
     let filter = match &request.filter {
         None => None,
@@ -191,7 +195,7 @@ pub(crate) fn fingerprint(
         .max_depth
         .map_or(0, |depth| u64::try_from(depth.get()).unwrap_or(u64::MAX));
     field(&depth.to_le_bytes());
-    field(&[versions_tag(request.versions)]);
+    field(&[u8::from(histories)]);
     match &filter {
         None => field(&[0]),
         Some(key) => {
@@ -206,13 +210,6 @@ const fn order_tag(order: TraversalOrder) -> u8 {
     match order {
         TraversalOrder::Unordered => 0,
         TraversalOrder::Blocks => 1,
-    }
-}
-
-const fn versions_tag(versions: TraversalVersions) -> u8 {
-    match versions {
-        TraversalVersions::Current => 0,
-        TraversalVersions::All => 1,
     }
 }
 

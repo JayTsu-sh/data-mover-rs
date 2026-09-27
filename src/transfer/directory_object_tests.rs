@@ -11,8 +11,8 @@ use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{
-    EntryKind, EntryVersion, FailureClass, IdentityStrength, ObservedEntry, SourceIdentity,
-    StoragePath,
+    EntryKind, FailureClass, HistoryOrder, IdentityStrength, ObjectHistory, ObservedEntry,
+    RecordKind, SourceIdentity, StoragePath, VersionRecord,
 };
 use crate::storage::artifacts::{ArtifactKind, artifact_name};
 use crate::storage::backends::local::{test_destination_storage, test_source_storage};
@@ -20,7 +20,7 @@ use crate::storage::backends::s3::tests::{
     MemoryS3, Versioning, content_md5, endpoint_of, identity, native_context,
 };
 use crate::storage::backends::s3::{S3Protocol as _, connect};
-use crate::storage::listing::testing::{listed, listed_versions};
+use crate::storage::listing::testing::listed;
 use crate::storage::{
     NamespaceCapabilities, PreflightPolicy, SourceDescriptor, Storage, StorageRoleFailure,
 };
@@ -165,7 +165,7 @@ async fn expert_source_refuses_a_directory_object_on_a_filesystem() -> TestResul
     let (local, _) = test_source_storage(root.path(), "expert-directory-object-source")?;
     let protocol = Arc::new(MemoryS3::default());
     put(&protocol, "d/", b"hello").await?;
-    let observation = entries(&bucket(&protocol)?, "d", false)
+    let observation = entries(&bucket(&protocol)?, "d")
         .await?
         .into_iter()
         .find(ObservedEntry::is_directory_object)
@@ -193,7 +193,7 @@ async fn expert_destination_refuses_a_directory_object_on_a_filesystem() -> Test
     let protocol = Arc::new(MemoryS3::default());
     put(&protocol, "d/", b"hello").await?;
     let storage = bucket(&protocol)?;
-    let described = entries(&storage, "d", false).await?;
+    let described = entries(&storage, "d").await?;
     let observation = described
         .into_iter()
         .find(ObservedEntry::is_directory_object)
@@ -228,23 +228,20 @@ fn observation(descriptor: &SourceDescriptor) -> TestResult<ObservedEntry> {
         None,
         descriptor.source_identity.clone(),
     )?
-    .with_version(descriptor.listing.version.clone()))
+    .with_history(descriptor.listing.history.clone()))
 }
 
 /// Every listed child of `directory` as the traversal observes it.
-async fn entries(storage: &Storage, directory: &str, all: bool) -> TestResult<Vec<ObservedEntry>> {
+async fn entries(storage: &Storage, directory: &str) -> TestResult<Vec<ObservedEntry>> {
     let namespace = storage.namespace(&PreflightPolicy::production())?;
     let directory = StoragePath::new(directory)?;
-    let (descriptors, _) = if all {
-        listed_versions(&*namespace, &directory).await?
-    } else {
-        listed(&*namespace, &directory).await?
-    };
+    let (descriptors, _) = listed(&*namespace, &directory).await?;
     descriptors.iter().map(observation).collect()
 }
 
-/// D2: to a bucket every entry is `Copy`; to a filesystem a folder marker or a delete marker is
-/// nothing to do, content is skipped with the reason, and any other entry is `Copy`.
+/// D2: to a bucket every entry is `Copy`; to a filesystem a folder marker, or a key whose latest
+/// record is a delete marker, is nothing to do, content is skipped with the reason, and any other
+/// entry is `Copy`.
 #[tokio::test]
 async fn directory_object_action_decides_per_destination() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
@@ -264,8 +261,8 @@ async fn directory_object_action_decides_per_destination() -> TestResult {
         .capabilities();
     assert!(object_store.directory_objects && storage.holds_directory_objects());
     let mut decided = Vec::new();
-    for (directory, all) in [("d", false), ("e", false), ("m", true)] {
-        for entry in entries(&storage, directory, all).await? {
+    for directory in ["d", "e", "m"] {
+        for entry in entries(&storage, directory).await? {
             // The bucket's `Storage` knows its 5 GiB limit too: none of these is near it.
             assert_eq!(
                 directory_object_action(&entry, &storage),
@@ -273,7 +270,9 @@ async fn directory_object_action_decides_per_destination() -> TestResult {
             );
             decided.push((
                 entry.path().to_string(),
-                entry.version().is_some_and(EntryVersion::is_latest),
+                entry
+                    .history()
+                    .is_some_and(|history| history.current().is_none()),
                 directory_object_action(&entry, &filesystem),
                 directory_object_action(&entry, &object_store),
             ));
@@ -288,8 +287,7 @@ async fn directory_object_action_decides_per_destination() -> TestResult {
             ("d/".to_string(), false, skip, copy),
             ("d/x".to_string(), false, copy, copy),
             ("e/".to_string(), false, nothing, copy),
-            // The key `m/`: its content version (not the latest), then its latest delete marker.
-            ("m/".to_string(), false, skip, copy),
+            // The key `m/`: a content version, then its latest record, a delete marker.
             ("m/".to_string(), true, nothing, copy),
         ]
     );
@@ -357,7 +355,63 @@ async fn directory_object_action_answers_too_large_up_front() -> TestResult {
         assert_eq!(decided, (to_bucket, to_filesystem, copy), "{path} {size:?}");
         assert_eq!(directory_object_action(&entry, nas), to_filesystem);
     }
+    // A key with its history (R3): to a bucket it is replayed record by record, so one version
+    // too large skips the whole key; to a filesystem only its current version counts.
+    for (sizes, to_bucket, to_filesystem) in [
+        (vec![Some(OVER_ONE_REQUEST), Some(1)], too_large, skip),
+        (vec![Some(1), Some(OVER_ONE_REQUEST)], too_large, skip),
+        (vec![Some(OVER_ONE_REQUEST), None], too_large, nothing),
+        (vec![Some(5), Some(0)], copy, nothing),
+        (vec![Some(5), None], copy, nothing),
+        (vec![None, Some(3)], copy, skip),
+    ] {
+        let entry = with_history("d/", &sizes)?;
+        assert_eq!(
+            (
+                directory_object_action(&entry, &storage),
+                directory_object_action(&entry, &local)
+            ),
+            (to_bucket, to_filesystem),
+            "{sizes:?}"
+        );
+        // Segmented (P7 Q8), every segment of the key is decided alike to a bucket: a replay never
+        // writes the part before a version too large to write.
+        for segment in entry.clone().into_segments(1) {
+            assert_eq!(
+                directory_object_action(&segment, &storage),
+                to_bucket,
+                "{sizes:?}"
+            );
+        }
+    }
     Ok(())
+}
+
+/// `path` with a history of one record per size, oldest first: a version of that size, or a
+/// delete marker (`None`); the entry-level size is the current version's.
+fn with_history(path: &str, sizes: &[Option<u64>]) -> TestResult<ObservedEntry> {
+    let mut records = Vec::new();
+    for (index, size) in sizes.iter().enumerate() {
+        let id = format!("v{index}");
+        let kind = size.map_or(RecordKind::DeleteMarker { modified: None }, |size| {
+            RecordKind::Object {
+                size,
+                etag: "\"e\"".into(),
+                modified: None,
+            }
+        });
+        let identity = SourceIdentity::new(identity(), IdentityStrength::VersionScoped, &id)?;
+        records.push(VersionRecord::new(
+            Some(id),
+            index + 1 == sizes.len(),
+            kind,
+            identity,
+            None,
+        )?);
+    }
+    let history = ObjectHistory::whole(records, HistoryOrder::Server)?;
+    let size = history.current().and_then(VersionRecord::size);
+    Ok(observed(path, size)?.with_history(Some(Box::new(history))))
 }
 
 /// A store that completes a multipart upload to `x/` as `x` (`RustFS` 1.0.0), holding the real

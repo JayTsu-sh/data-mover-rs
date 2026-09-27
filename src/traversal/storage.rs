@@ -12,11 +12,11 @@ use super::channel;
 use super::{
     ScanFailure, TraversalCandidate, TraversalDecision, TraversalFilter, TraversalItem,
     TraversalOrder, TraversalRequest, TraversalSession, TraversalSource, TraversalTerminalFailure,
-    TraversalVersions, relative_to,
+    relative_to,
 };
 use crate::model::{
-    BackendIdentity, BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass,
-    ObservationMode, ObservationPlan, ObservedEntry, Operation, StoragePath, Transience,
+    BackendIdentity, EntryKind, EntryOperationFailure, FailureClass, ObservationMode,
+    ObservationPlan, ObservedEntry, Operation, StoragePath, Transience,
 };
 use crate::storage::{
     CapabilityUnavailable, DescentHint, Metadata, Namespace, PreflightPolicy, SourceDescriptor,
@@ -172,14 +172,6 @@ impl StorageTraversalSource {
     }
 }
 
-impl StorageTraversalSource {
-    /// Whether this source can list every stored version ([`TraversalVersions::All`]).
-    #[must_use]
-    pub fn supports_versions(&self) -> bool {
-        self.namespace.capabilities().histories
-    }
-}
-
 /// A session that ends at once, before any I/O, with `failure`.
 fn refuse(request: &TraversalRequest, failure: TraversalTerminalFailure) -> TraversalSession {
     let (producer, session) =
@@ -188,30 +180,14 @@ fn refuse(request: &TraversalRequest, failure: TraversalTerminalFailure) -> Trav
     session
 }
 
-/// The request asked for every version of a source that keeps none: an `Unsupported` session
-/// failure. Returning its current entries instead would let a history migration believe it saw
-/// every version.
-fn versions_unsupported() -> TraversalTerminalFailure {
-    match BackendSessionFailure::new(
-        Operation::Traverse,
-        FailureClass::Unsupported,
-        Transience::Permanent,
-        "this source keeps no versions to traverse",
-    ) {
-        Ok(failure) => TraversalTerminalFailure::Session(failure),
-        Err(_) => TraversalTerminalFailure::Internal,
-    }
-}
-
 impl TraversalSource for StorageTraversalSource {
     fn traverse(&self, request: TraversalRequest) -> TraversalSession {
-        if request.versions == TraversalVersions::All && !self.supports_versions() {
-            return refuse(&request, versions_unsupported());
-        }
-        let resume = match Resume::prepare(&request, &self.identity, || self.probe.clock()) {
-            Ok(resume) => resume,
-            Err(refusal) => return refuse(&request, TraversalTerminalFailure::Resume(refusal)),
-        };
+        let histories = self.namespace.capabilities().histories;
+        let resume =
+            match Resume::prepare(&request, &self.identity, histories, || self.probe.clock()) {
+                Ok(resume) => resume,
+                Err(refusal) => return refuse(&request, TraversalTerminalFailure::Resume(refusal)),
+            };
         let drain_on_cancel = resume.as_ref().is_some_and(Resume::emits);
         let (item_tx, item_rx) = channel::channel(request.max_buffered_items);
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -324,7 +300,7 @@ struct Shared {
     policy: Policy,
     /// Keys for deferred descend slots, handed out by the listing tasks that place them.
     tickets: AtomicU64,
-    /// Whether the traversal root's own object was reported (once, whatever its versions).
+    /// Whether the traversal root's own object was reported (once, whatever its history).
     root_object_reported: AtomicBool,
     /// Most listings started ahead of the cursor and not yet ended, when a parked listing holds a
     /// server resource ([`Namespace::parked_listing_limit`]).

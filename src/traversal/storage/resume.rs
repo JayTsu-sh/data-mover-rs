@@ -93,20 +93,23 @@ pub(super) struct Resume {
 
 impl Resume {
     /// What `request` asks for, checked before any I/O: `None` when it neither checkpoints nor
-    /// resumes. `clock` is called only when it checkpoints.
+    /// resumes. `histories`: whether the storage lists each key with its history now (its
+    /// namespace's capabilities), which the fingerprint binds. `clock` is called only when it
+    /// checkpoints.
     ///
     /// # Errors
     /// Why the request cannot resume from its checkpoint, or cannot be resumable at all.
     pub(super) fn prepare(
         request: &TraversalRequest,
         identity: &BackendIdentity,
+        histories: bool,
         clock: impl FnOnce() -> Clock,
     ) -> Result<Option<Self>, ResumeRefusal> {
         let every = request.resumable.every();
         if every.is_none() && request.resume_from.is_none() {
             return Ok(None);
         }
-        let fingerprint = checkpoint::fingerprint(identity, request)?;
+        let fingerprint = checkpoint::fingerprint(identity, request, histories)?;
         let start = request
             .resume_from
             .as_ref()

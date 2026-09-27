@@ -12,8 +12,7 @@
 //! - **Counts**: each worker tallies what it handled; the totals are their sum. Every child a
 //!   listing returned is counted exactly once, as in Blocks (§7).
 //! - **Bounds**: `K = min(max_inflight_operations, 64)` listings at once, each holding at most a
-//!   page in the worker (and, listing every version, the run of one object's versions carried to
-//!   the next page), one in the backend's channel and one in its producer; the session holds
+//!   page in the worker, one in the backend's channel and one in its producer; the session holds
 //!   `max_buffered_items`, or one batch when a batch alone is larger. A namespace whose
 //!   open listing holds a server resource ([`Namespace::parked_listing_limit`]; CIFS: a directory
 //!   handle) caps `K` at its limit: a worker keeps its listing open while it waits for the

@@ -37,8 +37,9 @@
 //! and CIFS (C9) read their directories page by page: a dropped or cancelled listing stops within
 //! a page (S3 and HDFS abandon their stateless request in flight at once; NFS lets the
 //! READDIRPLUS in flight finish and sends no other; CIFS lets the record in flight arrive, then
-//! closes its directory handle). S3's listing of every version is still gathered whole per
-//! directory (§5.3; it too abandons its requests at once). A CIFS listing waiting for its
+//! closes its directory handle). S3's listing of a versioned bucket gathers each directory's
+//! records whole before it hands over any child (§5.3, Q9; it too abandons its requests at once),
+//! then builds its children a page at a time. A CIFS listing waiting for its
 //! consumer holds an open directory handle, so a consumer keeps no more of them parked than
 //! [`Namespace::parked_listing_limit`](super::Namespace::parked_listing_limit) says. A
 //! producer detached from a runtime that shuts down mid-listing is dropped with the runtime, as
@@ -573,10 +574,10 @@ impl PageSink {
         self.sender.is_closed()
     }
 
-    /// Hands over a listing a backend read whole (S3 versions until C11b), in pages
-    /// of at most `request.page_hint` children; the first page carries the failures and the
-    /// hidden-artifact count. Stops at cancellation with a `Cancelled` failure, and as soon as the
-    /// consumer is gone.
+    /// Hands over a listing read whole, in pages of at most `request.page_hint` children; the
+    /// first page carries the failures and the hidden-artifact count. Stops at cancellation with a
+    /// `Cancelled` failure, and as soon as the consumer is gone. For test producers.
+    #[cfg(test)]
     pub(crate) async fn deliver(&self, listing: Item, request: &ListRequest) {
         match listing {
             Ok(page) => {
@@ -629,24 +630,6 @@ impl PageSink {
                 return Ok(());
             }
             page = ListingPage::new(next, Vec::new(), 0);
-        }
-    }
-}
-
-impl PageSink {
-    /// [`PageSink::deliver`] for a listing of stateless requests (S3): nothing stays open between
-    /// them, so cancellation, or the consumer dropping the stream, abandons the request in flight
-    /// at once instead of paging on in the background.
-    pub(crate) async fn deliver_abortable(
-        &self,
-        listing: impl Future<Output = Item>,
-        request: &ListRequest,
-    ) {
-        tokio::select! {
-            biased;
-            () = request.cancel.cancelled() => self.fail(cancelled(&request.path)).await,
-            () = self.closed() => {}
-            listing = listing => self.deliver(listing, request).await,
         }
     }
 }

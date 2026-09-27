@@ -1,6 +1,7 @@
-//! The S3 namespace role (ADR-0006 C22): `stat` and `list` (delimiter `/`, one prefix at a time),
-//! and the listing of every stored version that a traversal of all versions drives. S3 has no
-//! directories to create, delete or rename, so every mutating verb is refused, and
+//! The S3 namespace role (ADR-0006 C22): `stat` and `list` (delimiter `/`, one prefix at a time):
+//! current objects on a bucket that was never versioned, and one child per key with its whole
+//! history on one that was (P7 §10, [`S3Protocol::lists_histories`]). S3 has no directories to
+//! create, delete or rename, so every mutating verb is refused, and
 //! [`NamespaceCapabilities::mutations`] lets recursive delete and create refuse before any I/O.
 
 use std::sync::Arc;
@@ -8,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::current::produce_current;
-use super::histories::list_all;
+use super::histories::produce_histories;
 use super::listing::{directory_descriptor, directory_prefix, file_descriptor};
 use super::paging::{ListingLimits, Paging};
 use super::source::role_failure;
@@ -119,9 +120,11 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
         self.stat_entry(path).await
     }
 
-    /// Streams the current objects and subdirectories of the prefix, each server page handed
-    /// over as it arrives (P7 C6, [`produce_current`]). Pages are stateless requests, so
-    /// cancellation or a dropped stream abandons the listing at once.
+    /// The subdirectories of the prefix, and its objects: on a bucket that keeps histories
+    /// ([`S3Protocol::lists_histories`]) one child per key with its whole history, the directory
+    /// gathered whole first ([`produce_histories`], P7 §5.3, Q9); otherwise the current objects,
+    /// each server page handed over as it arrives ([`produce_current`], P7 C6). Pages are
+    /// stateless requests, so cancellation or a dropped stream abandons the listing at once.
     fn list(&self, request: ListRequest) -> ListingStream {
         if let Err(failure) = refuse_artifact(&request.path) {
             return ListingStream::failed(request.path, failure);
@@ -131,8 +134,14 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
             self.identity.clone(),
             self.limits,
         );
+        let histories = self.histories;
         ListingStream::from_producer(request.path.clone(), move |sink| async move {
-            produce_current(protocol.as_ref(), &identity, limits, &request, &sink).await;
+            let protocol = protocol.as_ref();
+            if histories {
+                produce_histories(protocol, &identity, limits, &request, &sink).await;
+            } else {
+                produce_current(protocol, &identity, limits, &request, &sink).await;
+            }
         })
     }
 
@@ -173,24 +182,6 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
             names: NameSemantics::EXACT,
             directory_objects: bucket.directory_objects,
         }
-    }
-
-    /// Every version of the prefix, gathered whole (P7 §5.3, Q9: on a store that does not keep
-    /// keys in order, a key's history is whole only once the directory is listed to its end),
-    /// then handed over in pages. Cancellation or a dropped stream abandons it at once.
-    fn list_versions(&self, request: ListRequest) -> ListingStream {
-        if let Err(failure) = refuse_artifact(&request.path) {
-            return ListingStream::failed(request.path, failure);
-        }
-        let (protocol, identity, limits) = (
-            Arc::clone(&self.protocol),
-            self.identity.clone(),
-            self.limits,
-        );
-        ListingStream::from_producer(request.path.clone(), move |sink| async move {
-            let listing = list_all(protocol.as_ref(), &identity, &request.path, limits);
-            sink.deliver_abortable(listing, &request).await;
-        })
     }
 }
 

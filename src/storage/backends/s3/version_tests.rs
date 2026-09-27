@@ -4,9 +4,9 @@
 use futures::StreamExt as _;
 
 use super::*;
-use crate::model::{EntryKind, FailureClass, IdentityStrength, SourceVersion};
+use crate::model::{EntryKind, FailureClass, IdentityStrength, ObjectHistory, SourceVersion};
 use crate::storage::backends::s3::source::path_scoped_bytes;
-use crate::storage::listing::testing::{listed as listed_current, listed_versions};
+use crate::storage::listing::testing::listed as listed_current;
 use crate::storage::{ReadSource, SourceDescriptor, StorageRoleFailure};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -204,23 +204,34 @@ async fn the_same_content_at_two_keys_has_two_identities() -> TestResult {
             .await
             .map_err(|e| format!("{e:?}"))?;
     }
-    let markers: Vec<SourceDescriptor> = listed_versions(&*namespace, &StoragePath::root())
+    // Suspended now: a connection made now lists histories (the answer is taken at connection).
+    let namespace = connect(protocol.clone(), identity(), None)?.namespace(&validation_policy())?;
+    let deleted: Vec<SourceDescriptor> = listed_current(&*namespace, &StoragePath::root())
         .await?
         .0
         .into_iter()
         .filter(|entry| {
             entry
                 .listing
-                .version
+                .history
                 .as_ref()
-                .is_some_and(|v| v.is_delete_marker())
+                .is_some_and(|history| history.current().is_none())
         })
         .collect();
-    assert_eq!(markers.len(), 2);
+    assert_eq!(deleted.len(), 2);
     assert_ne!(
-        markers[0].source_identity.identity_key(),
-        markers[1].source_identity.identity_key()
+        deleted[0].source_identity.identity_key(),
+        deleted[1].source_identity.identity_key()
     );
+    let markers: Vec<_> = deleted
+        .iter()
+        .filter_map(|entry| entry.listing.history.as_deref())
+        .flat_map(ObjectHistory::records)
+        .filter(|record| record.is_delete_marker())
+        .map(|record| record.identity().identity_key())
+        .collect();
+    assert_eq!(markers.len(), 2);
+    assert_ne!(markers[0], markers[1]);
     Ok(())
 }
 

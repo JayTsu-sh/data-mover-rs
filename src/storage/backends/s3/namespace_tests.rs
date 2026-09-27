@@ -1,5 +1,6 @@
-//! The S3 namespace role (ADR-0006 C22): delimiter listings of current objects and of every
-//! version, `stat`, and the verbs S3 cannot serve.
+//! The S3 namespace role (ADR-0006 C22): delimiter listings of current objects and, on a bucket
+//! that keeps histories, of one child per key with its history (P7 §10), `stat`, and the verbs S3
+//! cannot serve.
 
 use std::num::NonZeroUsize;
 
@@ -7,12 +8,10 @@ use tokio::time::timeout;
 
 use super::*;
 use crate::model::Transience;
-use crate::model::{EntryKind, EntryVersion, FailureClass, HistoryOrder, SourceVersion};
+use crate::model::{EntryKind, FailureClass, VersionRecord};
 use crate::storage::backends::s3::namespace::S3Namespace;
 use crate::storage::backends::s3::paging::ListingLimits;
-use crate::storage::listing::testing::{
-    Described, Perform as _, Verb, listed as listed_current, listed_versions,
-};
+use crate::storage::listing::testing::{Described, Perform as _, Verb, listed as listed_current};
 use crate::storage::{
     Capability, CapabilityAvailability, DeleteTreeRequest, Namespace, SourceDescriptor,
     StorageRoleFailure, create_directory_all, delete_tree,
@@ -20,9 +19,11 @@ use crate::storage::{
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-/// One listed child: path, kind, and for a version (id or `null`, latest, marker). A key's
-/// versions are asserted in sequence, so their order (oldest first) is pinned by position.
-type Row = (String, EntryKind, Option<(String, bool, bool)>);
+/// One record of a history: id or `null`, latest, marker.
+type Record = (String, bool, bool);
+
+/// One listed child: path, kind, and for a key with its history its records, oldest first.
+type Row = (String, EntryKind, Option<Vec<Record>>);
 
 fn path(value: &str) -> StoragePath {
     StoragePath::new(value).unwrap_or_else(|error| panic!("{error}"))
@@ -50,37 +51,45 @@ async fn bucket(keys: &[(&str, &'static [u8])]) -> TestResult<Arc<MemoryS3>> {
     Ok(protocol)
 }
 
-fn row(descriptor: &SourceDescriptor) -> Row {
-    let version = descriptor.listing.version.as_deref().map(|version| {
-        (
-            version.id().unwrap_or("null").to_string(),
-            version.is_latest(),
-            version.is_delete_marker(),
-        )
-    });
-    (descriptor.path.to_string(), descriptor.kind, version)
+fn record_row(record: &VersionRecord) -> Record {
+    (
+        record.version_id().unwrap_or("null").to_string(),
+        record.is_latest(),
+        record.is_delete_marker(),
+    )
 }
 
-/// Lists `directory` whole: every version when `all`, the current objects otherwise.
+fn row(descriptor: &SourceDescriptor) -> Row {
+    let history = descriptor
+        .listing
+        .history
+        .as_deref()
+        .map(|history| history.records().iter().map(record_row).collect());
+    (descriptor.path.to_string(), descriptor.kind, history)
+}
+
+/// Makes `protocol`'s answer at connection list histories or not, whatever its versioning: a
+/// never-versioned bucket that refused to say lists each object as its `"null"` history (Q26). A
+/// namespace takes the answer when it is connected: connect it after.
+fn lists_histories(protocol: &MemoryS3, histories: bool) {
+    protocol.answer_at_connect(if histories {
+        S3VersioningAtConnect::Refused
+    } else {
+        S3VersioningAtConnect::Never
+    });
+}
+
+/// Lists `directory` whole.
 async fn list_whole(
     namespace: &(impl Namespace + ?Sized),
     directory: &StoragePath,
-    all: bool,
 ) -> Result<Described, StorageRoleFailure> {
-    if all {
-        listed_versions(namespace, directory).await
-    } else {
-        listed_current(namespace, directory).await
-    }
+    listed_current(namespace, directory).await
 }
 
 /// Rows and failure paths of one listing.
-async fn listed(
-    namespace: &dyn Namespace,
-    directory: &str,
-    all: bool,
-) -> TestResult<(Vec<Row>, Vec<String>)> {
-    let (entries, failures) = list_whole(namespace, &path(directory), all).await?;
+async fn listed(namespace: &dyn Namespace, directory: &str) -> TestResult<(Vec<Row>, Vec<String>)> {
+    let (entries, failures) = list_whole(namespace, &path(directory)).await?;
     Ok((
         entries.iter().map(row).collect(),
         failures.iter().map(|f| f.path().to_string()).collect(),
@@ -95,11 +104,17 @@ fn dir(name: &str) -> Row {
     (name.to_string(), EntryKind::Directory, None)
 }
 
-fn version(name: &str, id: &str, latest: bool, marker: bool) -> Row {
+/// A key with its history: (id, latest, marker) per record, oldest first.
+fn key(name: &str, records: &[(&str, bool, bool)]) -> Row {
     (
         name.to_string(),
         EntryKind::File,
-        Some((id.to_string(), latest, marker)),
+        Some(
+            records
+                .iter()
+                .map(|(id, latest, marker)| ((*id).to_string(), *latest, *marker))
+                .collect(),
+        ),
     )
 }
 
@@ -121,7 +136,7 @@ async fn current_children_are_in_key_order_without_artifacts() -> TestResult {
     ])
     .await?;
     let namespace = namespace(&protocol)?;
-    let (rows, failures) = listed(namespace.as_ref(), "", false).await?;
+    let (rows, failures) = listed(namespace.as_ref(), "").await?;
     assert_eq!(
         rows,
         [
@@ -135,12 +150,9 @@ async fn current_children_are_in_key_order_without_artifacts() -> TestResult {
         ]
     );
     assert!(failures.is_empty());
+    assert_eq!(listed(namespace.as_ref(), "d").await?.0, [file("d/e")]);
     assert_eq!(
-        listed(namespace.as_ref(), "d", false).await?.0,
-        [file("d/e")]
-    );
-    assert_eq!(
-        listed(namespace.as_ref(), "b", false).await?,
+        listed(namespace.as_ref(), "b").await?,
         (vec![file("b/")], vec![])
     );
     Ok(())
@@ -160,12 +172,12 @@ async fn unspellable_keys_are_failures_not_silent_merges() -> TestResult {
     ])
     .await?;
     let namespace = namespace(&protocol)?;
-    let (rows, failures) = listed(namespace.as_ref(), "", false).await?;
+    let (rows, failures) = listed(namespace.as_ref(), "").await?;
     assert_eq!(rows, [dir("c"), dir("e")]);
     assert_eq!(failures, ["/"]);
-    let (rows, failures) = listed(namespace.as_ref(), "c", false).await?;
+    let (rows, failures) = listed(namespace.as_ref(), "c").await?;
     assert_eq!((rows, failures), (vec![file("c/"), file("c/f")], vec![]));
-    let (rows, failures) = listed(namespace.as_ref(), "e", false).await?;
+    let (rows, failures) = listed(namespace.as_ref(), "e").await?;
     assert_eq!(
         (rows, failures),
         (vec![file("e/y")], vec!["e//".to_string()])
@@ -198,177 +210,10 @@ async fn a_flat_listing_rolls_up_into_one_prefix_per_subdirectory() -> TestResul
             knobs.ignore_delimiter = true;
             knobs.page_size = page_size;
         }
-        let (rows, failures) = listed(namespace.as_ref(), "p", false).await?;
+        let (rows, failures) = listed(namespace.as_ref(), "p").await?;
         assert_eq!(rows, [dir("p/a"), file("p/b")], "page size {page_size}");
         assert!(failures.is_empty());
     }
-    Ok(())
-}
-
-/// The history of `k` (v1, v2, a delete marker, v3), the key `gone` (written, then deleted) and
-/// `z` with three versions, in a versioned bucket.
-async fn versioned_history() -> TestResult<Arc<MemoryS3>> {
-    let protocol = Arc::new(MemoryS3::default());
-    protocol.set_versioning(Versioning::Enabled);
-    put(&protocol, "k", b"v1").await?;
-    put(&protocol, "k", b"v2").await?;
-    protocol
-        .delete_object("k")
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    put(&protocol, "k", b"v3").await?;
-    put(&protocol, "gone", b"g").await?;
-    protocol
-        .delete_object("gone")
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    for body in [b"z1", b"z2", b"z3"] {
-        put(&protocol, "z", body).await?;
-    }
-    put(&protocol, ".data-mover-x", b"artifact").await?;
-    Ok(protocol)
-}
-
-fn expected_history() -> Vec<Row> {
-    vec![
-        version("gone", "v0005", false, false),
-        version("gone", "v0006", true, true),
-        version("k", "v0001", false, false),
-        version("k", "v0002", false, false),
-        version("k", "v0003", false, true),
-        version("k", "v0004", true, false),
-        version("z", "v0007", false, false),
-        version("z", "v0008", false, false),
-        version("z", "v0009", true, false),
-    ]
-}
-
-/// Every version and marker, each key oldest first with the latest last, whatever the page size
-/// and however the store spells its key marker; the current listing has v3 of `k` only and no
-/// `gone`.
-#[tokio::test]
-async fn every_version_is_listed_oldest_first_across_pages() -> TestResult {
-    let protocol = versioned_history().await?;
-    let namespace = namespace(&protocol)?;
-    for (page_size, minio) in [(0, false), (1, true), (2, true), (3, false), (4, true)] {
-        {
-            let mut knobs = protocol.listing();
-            knobs.page_size = page_size;
-            knobs.minio_markers = minio;
-        }
-        let (rows, failures) = listed(namespace.as_ref(), "", true).await?;
-        assert_eq!(rows, expected_history(), "page size {page_size}");
-        assert!(failures.is_empty());
-    }
-    let (rows, _) = listed(namespace.as_ref(), "", false).await?;
-    assert_eq!(rows, [file("k"), file("z")]);
-    Ok(())
-}
-
-/// Entries written in one instant keep the listing order reversed, the latest last.
-#[tokio::test]
-async fn one_instant_keeps_the_written_order() -> TestResult {
-    let protocol = versioned_history().await?;
-    protocol.listing().same_instant = true;
-    let (rows, _) = listed(namespace(&protocol)?.as_ref(), "", true).await?;
-    assert_eq!(rows, expected_history());
-    Ok(())
-}
-
-/// The order every listed version reports for its key's history.
-async fn history_orders(namespace: &dyn Namespace) -> TestResult<Vec<HistoryOrder>> {
-    let (entries, _) = listed_versions(namespace, &StoragePath::root()).await?;
-    Ok(entries
-        .iter()
-        .filter_map(|entry| entry.listing.version.as_deref().map(EntryVersion::order))
-        .collect())
-}
-
-/// A store listing in S3's order gives server-ordered histories, even when every entry was written
-/// in one instant and pages split the keys; a store that lists each key oldest first (a
-/// non-conforming listing) is not trusted — its histories are inferred from `LastModified` (here
-/// still right: every version has its own second) and marked so.
-#[tokio::test]
-async fn a_non_conforming_store_is_ordered_by_time_and_marked_inferred() -> TestResult {
-    let protocol = versioned_history().await?;
-    let namespace = namespace(&protocol)?;
-    {
-        let mut knobs = protocol.listing();
-        knobs.same_instant = true;
-        knobs.page_size = 2;
-    }
-    assert_eq!(
-        listed(namespace.as_ref(), "", true).await?.0,
-        expected_history()
-    );
-    let orders = history_orders(namespace.as_ref()).await?;
-    assert!(orders.iter().all(|order| *order == HistoryOrder::Server));
-    {
-        let mut knobs = protocol.listing();
-        knobs.same_instant = false;
-        knobs.page_size = 0;
-        knobs.oldest_first_versions = true;
-    }
-    assert_eq!(
-        listed(namespace.as_ref(), "", true).await?.0,
-        expected_history()
-    );
-    let orders = history_orders(namespace.as_ref()).await?;
-    assert_eq!(orders.len(), 9);
-    assert!(orders.iter().all(|order| *order == HistoryOrder::Inferred));
-    Ok(())
-}
-
-/// What each listed version selects for a copy: a real version its id; a delete marker nothing
-/// (it is listing-only, without a size).
-#[tokio::test]
-async fn listed_versions_select_themselves_for_a_copy() -> TestResult {
-    let protocol = versioned_history().await?;
-    let namespace = namespace(&protocol)?;
-    let (entries, _) = listed_versions(&*namespace, &StoragePath::root()).await?;
-    let k: Vec<&SourceDescriptor> = entries.iter().filter(|e| e.path == path("k")).collect();
-    assert_eq!(k[0].version, SourceVersion::Id("v0001".into()));
-    assert_eq!(k[0].size, Some(2));
-    assert!(!k[0].listing.listing_only);
-    assert!(k[2].listing.listing_only && k[2].size.is_none());
-    assert_eq!(k[3].version, SourceVersion::Id("v0004".into()));
-    Ok(())
-}
-
-/// The `"null"` version names no id: it selects `Current` while it is the latest, and
-/// `Id("null")` once a newer version exists (`Current` would copy that one).
-#[tokio::test]
-async fn the_null_version_selects_itself_for_a_copy() -> TestResult {
-    let unversioned = bucket(&[("n", b"1")]).await?;
-    let (rows, _) = listed(namespace(&unversioned)?.as_ref(), "", true).await?;
-    assert_eq!(rows, [version("n", "null", true, false)]);
-
-    let suspended = Arc::new(MemoryS3::default());
-    suspended.set_versioning(Versioning::Enabled);
-    put(&suspended, "s", b"real").await?;
-    suspended.set_versioning(Versioning::Suspended);
-    put(&suspended, "s", b"null").await?;
-    let (entries, _) = listed_versions(&*namespace(&suspended)?, &StoragePath::root()).await?;
-    let selected: Vec<(Option<&str>, &SourceVersion)> = entries
-        .iter()
-        .map(|e| {
-            (
-                e.listing.version.as_deref().and_then(|v| v.id()),
-                &e.version,
-            )
-        })
-        .collect();
-    assert_eq!(
-        selected,
-        [
-            (Some("v0001"), &SourceVersion::Id("v0001".into())),
-            (None, &SourceVersion::Current)
-        ]
-    );
-    suspended.set_versioning(Versioning::Enabled);
-    put(&suspended, "s", b"newer").await?;
-    let (entries, _) = listed_versions(&*namespace(&suspended)?, &StoragePath::root()).await?;
-    assert_eq!(entries[1].version, SourceVersion::Id("null".into()));
     Ok(())
 }
 
@@ -446,7 +291,6 @@ async fn mutations_are_refused_before_any_io() -> TestResult {
 #[tokio::test]
 async fn listing_failures_keep_their_scope() -> TestResult {
     let protocol = bucket(&[("d/e", b"1")]).await?;
-    let namespace = namespace(&protocol)?;
     for (failure, session) in [
         (
             S3ProtocolFailure::entry(
@@ -459,13 +303,17 @@ async fn listing_failures_keep_their_scope() -> TestResult {
         (S3ProtocolFailure::protocol("gone"), true),
     ] {
         protocol.listing().failure = Some(("d/".to_string(), failure));
-        let result = listed_current(&*namespace, &path("d")).await;
-        assert_eq!(
-            matches!(result, Err(StorageRoleFailure::Session(_))),
-            session
-        );
-        assert!(result.is_err());
-        assert!(listed_versions(&*namespace, &path("d")).await.is_err());
+        for histories in [false, true] {
+            lists_histories(&protocol, histories);
+            let namespace = namespace(&protocol)?;
+            let result = listed_current(&*namespace, &path("d")).await;
+            assert_eq!(
+                matches!(result, Err(StorageRoleFailure::Session(_))),
+                session,
+                "histories={histories}"
+            );
+            assert!(result.is_err());
+        }
     }
     Ok(())
 }
@@ -483,17 +331,19 @@ async fn dot_segments_are_failures_not_aliases() -> TestResult {
         ("a/..", b"1"),
     ])
     .await?;
-    let namespace = namespace(&protocol)?;
-    for all in [false, true] {
-        let (rows, failures) = listed(namespace.as_ref(), "", all).await?;
+    for histories in [false, true] {
+        lists_histories(&protocol, histories);
+        let namespace = namespace(&protocol)?;
+        let (rows, failures) = listed(namespace.as_ref(), "").await?;
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].0, "a");
         assert_eq!(failures, ["../", "./"]);
-        let (rows, failures) = listed(namespace.as_ref(), "a", all).await?;
+        let (rows, failures) = listed(namespace.as_ref(), "a").await?;
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].0, "a/b");
         assert_eq!(failures, ["a/.", "a/..", "a/./"]);
     }
+    let namespace = namespace(&protocol)?;
     for bad in ["a/.", "./a", "a/../b"] {
         let refused = listed_current(&*namespace, &path(bad)).await;
         assert!(
@@ -508,12 +358,17 @@ async fn dot_segments_are_failures_not_aliases() -> TestResult {
 /// (and so exhaustive) directory. The storage root always exists.
 #[tokio::test]
 async fn an_absent_prefix_is_not_found() -> TestResult {
-    let empty = namespace(&Arc::new(MemoryS3::default()))?;
-    assert_eq!(listed(empty.as_ref(), "", true).await?, (vec![], vec![]));
+    let empty = Arc::new(MemoryS3::default());
+    for histories in [false, true] {
+        lists_histories(&empty, histories);
+        let listing = listed(namespace(&empty)?.as_ref(), "").await?;
+        assert_eq!(listing, (vec![], vec![]));
+    }
     let protocol = bucket(&[("d/e", b"1")]).await?;
-    let namespace = namespace(&protocol)?;
-    for all in [false, true] {
-        let result = list_whole(&*namespace, &path("missing"), all).await;
+    for histories in [false, true] {
+        lists_histories(&protocol, histories);
+        let namespace = namespace(&protocol)?;
+        let result = list_whole(&*namespace, &path("missing")).await;
         assert!(
             matches!(result, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::NotFound),
             "{result:?}"
@@ -528,12 +383,13 @@ async fn an_absent_prefix_is_not_found() -> TestResult {
 #[tokio::test]
 async fn a_repeating_continuation_fails_the_directory() -> TestResult {
     let protocol = bucket(&[("a", b"1"), ("b", b"1")]).await?;
-    let namespace = namespace(&protocol)?;
     for cycle in [1, 2, 3] {
-        for all in [false, true] {
+        for histories in [false, true] {
+            lists_histories(&protocol, histories);
+            let namespace = namespace(&protocol)?;
             protocol.listing().cycle_tokens = cycle;
             let root = StoragePath::root();
-            let listing = list_whole(&*namespace, &root, all);
+            let listing = list_whole(&*namespace, &root);
             // Bounded, so a regression fails here instead of paging forever.
             let result = timeout(Duration::from_secs(5), listing).await?;
             assert!(
@@ -563,11 +419,12 @@ async fn a_restarting_minio_listing_fails_only_that_directory() -> TestResult {
         knobs.minio_markers = true;
         knobs.restart_prefix = Some("a/".to_string());
     }
-    let namespace = namespace(&protocol)?;
-    for all in [false, true] {
+    for histories in [false, true] {
+        lists_histories(&protocol, histories);
+        let namespace = namespace(&protocol)?;
         let list = |name: &'static str| {
             let namespace = &namespace;
-            async move { list_whole(&**namespace, &path(name), all).await }
+            async move { list_whole(&**namespace, &path(name)).await }
         };
         let looping = timeout(Duration::from_secs(5), list("a")).await?;
         assert!(
@@ -576,7 +433,7 @@ async fn a_restarting_minio_listing_fails_only_that_directory() -> TestResult {
                 Err(StorageRoleFailure::Entry(ref f))
                     if f.class() == FailureClass::Protocol && f.path() == &path("a")
             ),
-            "all={all}: {looping:?}"
+            "histories={histories}: {looping:?}"
         );
         let sibling = timeout(Duration::from_secs(5), list("b")).await??;
         assert_eq!(sibling.0.len(), 1);
@@ -602,14 +459,13 @@ async fn a_flat_version_listing_rolls_up_versions_and_markers() -> TestResult {
     let namespace = namespace(&protocol)?;
     for page_size in [1, 2, 1000] {
         protocol.listing().page_size = page_size;
-        let (rows, _) = listed(namespace.as_ref(), "", true).await?;
+        let (rows, _) = listed(namespace.as_ref(), "").await?;
         assert_eq!(rows, [dir("d"), dir("gone")], "page size {page_size}");
-        let (rows, _) = listed(namespace.as_ref(), "d", true).await?;
+        let (rows, _) = listed(namespace.as_ref(), "d").await?;
         assert_eq!(
             rows,
             [
-                version("d/x", "v0001", false, false),
-                version("d/x", "v0002", true, false),
+                key("d/x", &[("v0001", false, false), ("v0002", true, false)]),
                 dir("d/y"),
             ]
         );
@@ -625,20 +481,21 @@ fn limited(protocol: &Arc<MemoryS3>, max_entries: usize) -> S3Namespace<MemoryS3
     })
 }
 
-/// A directory whose listing would hold more entries than one listing may fails (`Capacity`)
-/// instead of being cut short; one at the limit lists whole. Every version is held (All counts
-/// objects, versions and prefixes); current objects stream, and only the subdirectory names count
-/// (P7 §12.4): `a`, `b` and `c/` hold one name.
+/// A directory whose listing would hold more entries than one listing may fails (`Capacity`, Q9)
+/// instead of being cut short; one at the limit lists whole. Every record of a history is held (a
+/// history listing counts versions, markers and prefixes); current objects stream, and only the
+/// subdirectory names count (P7 §12.4): `a`, `b` and `c/` hold one name.
 #[tokio::test]
 async fn a_directory_past_the_entry_limit_fails_whole() -> TestResult {
     let protocol = bucket(&[("a", b"1"), ("b", b"1"), ("c/d", b"1")]).await?;
     protocol.listing().page_size = 1;
-    for (all, held) in [(false, 1), (true, 3)] {
+    for (histories, held) in [(false, 1), (true, 3)] {
+        lists_histories(&protocol, histories);
         let at_limit = limited(&protocol, held);
-        let listing = list_whole(&at_limit, &StoragePath::root(), all).await;
+        let listing = list_whole(&at_limit, &StoragePath::root()).await;
         assert_eq!(listing?.0.len(), 3);
         let over = limited(&protocol, held - 1);
-        let listing = list_whole(&over, &StoragePath::root(), all).await;
+        let listing = list_whole(&over, &StoragePath::root()).await;
         assert!(
             matches!(listing, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::Capacity),
             "{listing:?}"
@@ -653,10 +510,11 @@ async fn a_directory_past_the_entry_limit_fails_whole() -> TestResult {
 async fn endless_empty_pages_fail_the_directory() -> TestResult {
     let protocol = bucket(&[("a", b"1")]).await?;
     protocol.listing().endless_empty = true;
-    let namespace = limited(&protocol, 1000);
-    for all in [false, true] {
+    for histories in [false, true] {
+        lists_histories(&protocol, histories);
+        let namespace = limited(&protocol, 1000);
         let root = StoragePath::root();
-        let listing = list_whole(&namespace, &root, all);
+        let listing = list_whole(&namespace, &root);
         let result = timeout(Duration::from_secs(5), listing).await?;
         assert!(
             matches!(result, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::Protocol),
@@ -680,3 +538,6 @@ async fn stat_pages_past_empty_pages() -> TestResult {
     );
     Ok(())
 }
+
+#[path = "namespace_history_tests.rs"]
+mod histories;

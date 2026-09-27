@@ -2,8 +2,9 @@
 //! to rebuild a source key's history on a versioned destination.
 //!
 //! The caller (a sync engine, or `examples/s3_history_replay.rs`) first asks
-//! [`destination_keeps_history`]. When it does, the caller walks the key's records oldest to
-//! newest, strictly one after another: each object version, zero-byte ones included, is a
+//! [`destination_keeps_history`]. When it does, the caller walks the key's records —
+//! `ObjectHistory::records()` of its entry, segment after segment — oldest to newest, strictly one
+//! after another: each object version, zero-byte ones included, is a
 //! [`transfer`](super::transfer) with `TransferRequest::with_source_version` to the final key;
 //! each delete marker is one [`write_delete_marker`]. The destination's records then come in the
 //! order they were written. A replay is not deduplicated: rerunning it adds the records again, so

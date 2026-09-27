@@ -126,7 +126,7 @@ pub(super) struct Output {
     /// A flush was cut short: `delivered` moves no more.
     cut: bool,
     /// The last item delivered closed a block (or nothing was delivered yet): a checkpoint sent
-    /// now lands between two blocks, never inside one or inside one object's versions.
+    /// now lands between two blocks, never inside one or between the segments of one key.
     between_blocks: bool,
 }
 

@@ -37,6 +37,8 @@ mod nfs_tests;
 #[cfg(test)]
 mod s3_directory_object_tests;
 #[cfg(test)]
+mod s3_history_tests;
+#[cfg(test)]
 mod s3_tests;
 
 /// How a traversal orders what it delivers (P7 §3).
@@ -51,8 +53,8 @@ pub enum TraversalOrder {
     ///
     /// Within one directory, its items keep the backend's listing order, the ones it could not
     /// describe ahead of the others of the same page, and its [`FailureScope::Listing`] failure,
-    /// if its listing stopped, comes after the children it delivered. Listing every version,
-    /// one object's versions stay together.
+    /// if its listing stopped, comes after the children it delivered. The segments of one key's
+    /// history (P7 Q8) come together and in order.
     ///
     /// There are no [`TraversalItem::DirectoryListed`] events and no per-directory counts: a
     /// listing that stopped is its [`FailureScope::Listing`] failure, and what the traversal
@@ -93,30 +95,6 @@ pub enum TraversalOrder {
     /// directory. Only the subdirectories still to descend into are remembered whole (one slot
     /// each), because the descent is sorted once the listing has ended.
     Blocks,
-}
-
-/// Which entries a traversal emits for the objects of a versioned store (ADR-0006 C22).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum TraversalVersions {
-    /// Current objects only. A key whose latest entry is a delete marker is absent, as it is
-    /// from the store's own current view. Every source supports it; entries carry no listed
-    /// version ([`ObservedEntry::version`](crate::model::ObservedEntry::version) is `None`).
-    #[default]
-    Current,
-    /// Every stored version and delete marker of every object, each object's entries contiguous,
-    /// oldest first and the latest last. Each entry carries its [`EntryVersion`] (version id,
-    /// latest flag, delete-marker flag), and
-    /// [`ObservedEntry::source_version`](crate::model::ObservedEntry::source_version) is the
-    /// selector that copies exactly that version with `TransferRequest::with_source_version`. A
-    /// delete marker has no size and nothing to copy.
-    ///
-    /// Only a source that keeps versions (S3) supports it. Any other source ends the traversal
-    /// before any I/O with an `Unsupported` session failure, never with its current entries in
-    /// place of the versions asked for. Both modes hide `.data-mover-*` names.
-    ///
-    /// [`EntryVersion`]: crate::model::EntryVersion
-    All,
 }
 
 /// Facts known about one directory child when the traversal decides whether to emit it,
@@ -220,8 +198,6 @@ pub struct TraversalRequest {
     /// Maximum depth to enumerate. Children of `root` are depth 1; a directory at depth `d`
     /// is listed only when `d < max_depth`. `None` means unlimited.
     pub max_depth: Option<NonZeroUsize>,
-    /// Current objects only, or every stored version (see [`TraversalVersions`]).
-    pub versions: TraversalVersions,
     /// Whether the traversal emits [`TraversalItem::Checkpoint`]s (P7 §9). Off by default.
     pub resumable: Resumable,
     /// Where to resume from: a checkpoint a traversal of the same request emitted. `None` scans
@@ -317,8 +293,13 @@ const DEFAULT_MAX_BUFFERED: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1023
 impl TraversalRequest {
     /// A traversal of `root` with every other setting at its default: [`TraversalOrder`]'s
     /// default order, 64 operations in flight, 1024 items buffered, the default observation plan,
-    /// a fresh cancellation token, no filter, no depth limit, current objects only, no
-    /// checkpoints, from the start.
+    /// a fresh cancellation token, no filter, no depth limit, no checkpoints, from the start.
+    ///
+    /// On a bucket that was versioned when it was connected, every key is one entry with its whole
+    /// history ([`ObservedEntry::history`](crate::model::ObservedEntry::history), P7 §10) — keys
+    /// deleted now included — and a history longer than
+    /// [`MAX_HISTORY_RECORDS`](crate::model::MAX_HISTORY_RECORDS) comes in several entries of the
+    /// same key, its segments, in order and together; there is nothing to choose.
     #[must_use]
     pub fn new(root: StoragePath) -> Self {
         Self {
@@ -330,7 +311,6 @@ impl TraversalRequest {
             cancel: CancellationToken::new(),
             filter: None,
             max_depth: None,
-            versions: TraversalVersions::default(),
             resumable: Resumable::Off,
             resume_from: None,
         }
@@ -388,13 +368,6 @@ impl TraversalRequest {
         self
     }
 
-    /// Current objects only, or every stored version.
-    #[must_use]
-    pub const fn versions(mut self, versions: TraversalVersions) -> Self {
-        self.versions = versions;
-        self
-    }
-
     /// Whether the traversal emits checkpoints; see [`Resumable`].
     #[must_use]
     pub const fn resumable(mut self, resumable: Resumable) -> Self {
@@ -402,8 +375,8 @@ impl TraversalRequest {
         self
     }
 
-    /// Resumes from `checkpoint`, which a traversal of the same storage, root, order, filter,
-    /// depth limit and version mode emitted; anything else is refused before any I/O
+    /// Resumes from `checkpoint`, which a traversal of the same storage, root, order, filter and
+    /// depth limit emitted — on a bucket that kept histories then as now; anything else is refused before any I/O
     /// ([`TraversalTerminalFailure::Resume`]). What was delivered after the checkpoint may be
     /// delivered again; nothing that was not delivered before it is skipped (P7 §9.2) — the tree
     /// changing between the two runs aside, as it may during one.

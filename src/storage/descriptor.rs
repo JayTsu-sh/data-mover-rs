@@ -4,7 +4,7 @@
 use bytes::Bytes;
 
 use crate::model::{
-    EntryKind, EntryVersion, OwnershipMode, SourceIdentity, SourceVersion, StoragePath,
+    EntryKind, ObjectHistory, OwnershipMode, SourceIdentity, SourceVersion, StoragePath,
     TimestampMetadata,
 };
 
@@ -20,13 +20,16 @@ pub(crate) enum InlineOwnership {
     Unmapped,
 }
 
-/// What a versioned listing adds to a child (ADR-0006 C22); the default for every other listing.
+/// What a listing adds to a child beyond its description (ADR-0006 C22, P7 §10); the default for
+/// most listings.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ListingFacts {
-    /// The listed version, from a listing of every version; carried onto the observed entry.
-    pub(crate) version: Option<Box<EntryVersion>>,
-    /// Nothing behind the child can be observed: an S3 common prefix or a delete marker. The
-    /// traversal takes what the listing gave and asks the metadata role nothing.
+    /// The key's whole history, from the listing of a versioned bucket; carried onto the observed
+    /// entry, each record observed on its own when the plan asks for more than the listing gave.
+    pub(crate) history: Option<Box<ObjectHistory>>,
+    /// Nothing behind the child itself can be observed: an S3 common prefix, or a key whose latest
+    /// record is a delete marker (the records of its history still can be). The traversal takes
+    /// what the listing gave for the entry and asks the metadata role nothing about it.
     pub(crate) listing_only: bool,
 }
 

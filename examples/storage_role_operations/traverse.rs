@@ -2,6 +2,11 @@
 //! counted, with `--quiet`); with `--checkpoint-every` it checkpoints, `--resume-from` resumes,
 //! and `--cancel-after-*` cancels part way, so a script can check that a cancelled traversal and
 //! its resumption together deliver what one uninterrupted traversal does (P7 §9).
+//!
+//! A key with its history (a versioned S3 bucket, P7 §10) is its entry line with
+//! ` history=<segment>/<complete 0|1> records=<n>[ order=inferred]`, then one line per record:
+//! `Record <path> <segment>.<n> version=<id|null> latest=<0|1> marker=<0|1> size=<bytes|->`
+//! (`n` from 1 within the segment). `--current` prints only the current objects instead.
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -17,13 +22,14 @@ use tokio_util::sync::CancellationToken;
 
 use data_mover::DslTraversalFilter;
 use data_mover::model::{
-    HistoryOrder, MetadataObservation, ObservationMode, ObservationPlan, ObservedEntry, StoragePath,
+    HistoryOrder, MetadataObservation, ObjectHistory, ObservationMode, ObservationPlan,
+    ObservedEntry, StoragePath,
 };
 use data_mover::storage::Storage;
 use data_mover::traversal::{
     BlockCounts, Checkpoint, DirectoryListed, Resumable, ScanTotals, StorageTraversalSource,
     TraversalItem, TraversalOrder, TraversalOutcome, TraversalRequest, TraversalSession,
-    TraversalSource as _, TraversalVersions,
+    TraversalSource as _,
 };
 
 use super::{Args, Command, Error};
@@ -121,18 +127,26 @@ async fn consume(
     Ok(tally)
 }
 
-/// One line per entry, with what the flags ask for.
+/// One line per entry, with what the flags ask for, then one per record of its history — or,
+/// with `--current`, the current object alone (nothing for a key deleted now, or a segment that
+/// is not the key's last).
 fn print_entry(entry: &ObservedEntry, command: &Command) {
     let Command::Traverse {
         sizes,
         identity,
         ownership,
         acl,
+        current,
         ..
     } = command
     else {
         unreachable!("dispatched by the caller")
     };
+    let history = entry.history();
+    if *current && history.is_some_and(|history| history.current().is_none()) {
+        return;
+    }
+    let history = history.filter(|_| !*current);
     let identity = if *identity {
         identity_of(entry)
     } else {
@@ -146,7 +160,7 @@ fn print_entry(entry: &ObservedEntry, command: &Command) {
     if *acl {
         owner.push_str(&acl_of(entry));
     }
-    let size = if *sizes && entry.version().is_none() {
+    let size = if *sizes {
         entry
             .size()
             .map_or_else(|| " size=-".to_owned(), |size| format!(" size={size}"))
@@ -157,8 +171,11 @@ fn print_entry(entry: &ObservedEntry, command: &Command) {
         "{:?} {}{size}{}{identity}{owner}",
         entry.kind(),
         entry.path(),
-        version_of(entry)
+        history.map_or_else(String::new, history_of)
     );
+    if let Some(history) = history {
+        print_records(entry, history);
+    }
 }
 
 fn print_listed(listed: &DirectoryListed) {
@@ -210,7 +227,6 @@ fn traversal_request(args: &Args, command: &Command) -> Result<TraversalRequest,
         exclude_expression,
         max_depth,
         order,
-        versions,
         path,
         ownership,
         acl,
@@ -236,8 +252,7 @@ fn traversal_request(args: &Args, command: &Command) -> Result<TraversalRequest,
         .max_inflight_operations(slots)
         .max_buffered_items(slots)
         .observation_plan(plan)
-        .max_depth(max_depth.and_then(NonZeroUsize::new))
-        .versions(TraversalVersions::from(*versions));
+        .max_depth(max_depth.and_then(NonZeroUsize::new));
     let request = match checkpoint_every {
         Some(seconds) => request.resumable(Resumable::On {
             every: Duration::try_from_secs_f64(*seconds)?,
@@ -303,26 +318,39 @@ fn totals(totals: &ScanTotals) -> String {
     )
 }
 
-/// ` version=<id|null> latest=<0|1> marker=<0|1> size=<n|->` for an entry of a traversal of
-/// every version, then ` order=inferred` when its key's history was ordered by `LastModified`
-/// rather than by the server's listing order; nothing otherwise.
-fn version_of(entry: &ObservedEntry) -> String {
-    entry.version().map_or_else(String::new, |version| {
-        format!(
-            " version={} latest={} marker={} size={}{}",
-            version.id().unwrap_or("null"),
-            u8::from(version.is_latest()),
-            u8::from(version.is_delete_marker()),
-            entry
+/// ` history=<segment>/<complete 0|1> records=<n>`, then ` order=inferred` when the key's history
+/// was ordered by `LastModified` rather than by the server's listing order.
+fn history_of(history: &ObjectHistory) -> String {
+    format!(
+        " history={}/{} records={}{}",
+        history.segment(),
+        u8::from(history.is_complete()),
+        history.records().len(),
+        if history.order() == HistoryOrder::Inferred {
+            " order=inferred"
+        } else {
+            ""
+        }
+    )
+}
+
+/// `Record <path> <segment>.<n> version=<id|null> latest=<0|1> marker=<0|1> size=<n|->`, one
+/// line per record of the segment, oldest first.
+fn print_records(entry: &ObservedEntry, history: &ObjectHistory) {
+    for (index, record) in history.records().iter().enumerate() {
+        println!(
+            "Record {} {}.{} version={} latest={} marker={} size={}",
+            entry.path(),
+            history.segment(),
+            index + 1,
+            record.version_id().unwrap_or("null"),
+            u8::from(record.is_latest()),
+            u8::from(record.is_delete_marker()),
+            record
                 .size()
                 .map_or_else(|| "-".to_string(), |size| size.to_string()),
-            if version.order() == HistoryOrder::Inferred {
-                " order=inferred"
-            } else {
-                ""
-            }
-        )
-    })
+        );
+    }
 }
 
 /// ` owner=<uid>:<gid>:<mode, octal>/<provenance>`, or the observation that stands in for it.

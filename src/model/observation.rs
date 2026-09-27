@@ -1,14 +1,14 @@
 use std::fmt;
 
 use super::{
-    BackendIdentity, BackendKind, EntryKind, EntryVersion, MAX_MODEL_FIELD_BYTES,
-    MetadataObservations, ModelValueError, SourceVersion, StoragePath, StorageTimestamp,
+    BackendIdentity, BackendKind, EntryKind, MAX_MODEL_FIELD_BYTES, MetadataObservations,
+    ModelValueError, ObjectHistory, SourceVersion, StoragePath, StorageTimestamp, VersionRecord,
 };
 
 #[path = "observation_codec.rs"]
 mod codec;
-#[cfg(test)]
-use codec::VERSION_WITH_BACKEND_ID;
+#[path = "history_codec.rs"]
+mod history_codec;
 use codec::backend_tag;
 pub(super) use codec::{Cursor, decode_time, encode_time, put_bytes};
 
@@ -288,9 +288,10 @@ pub struct ObservedEntry {
     source_identity: SourceIdentity,
     metadata: MetadataObservations,
     backend_fact: PrivateBackendEntryFacts,
-    /// The listed version this entry is, when it comes from a traversal of every version
-    /// (`TraversalVersions::All`); `None` for every other entry. Boxed: almost no entry has one.
-    version: Option<Box<EntryVersion>>,
+    /// The key's history, or one segment of it, when the entry is a key of a versioned bucket
+    /// (P7 §10); `None` for every other entry. Boxed: only a versioned bucket's entries have one,
+    /// and an entry without one pays a pointer for it.
+    history: Option<Box<ObjectHistory>>,
 }
 
 impl ObservedEntry {
@@ -324,7 +325,7 @@ impl ObservedEntry {
             source_identity,
             metadata: MetadataObservations::default(),
             backend_fact: PrivateBackendEntryFacts::None,
-            version: None,
+            history: None,
         })
     }
 
@@ -351,7 +352,7 @@ impl ObservedEntry {
             source_identity,
             metadata: MetadataObservations::default(),
             backend_fact: PrivateBackendEntryFacts::None,
-            version: None,
+            history: None,
         })
     }
 
@@ -382,9 +383,33 @@ impl ObservedEntry {
         self
     }
 
-    pub(crate) fn with_version(mut self, version: Option<Box<EntryVersion>>) -> Self {
-        self.version = version;
+    pub(crate) fn with_history(mut self, history: Option<Box<ObjectHistory>>) -> Self {
+        self.history = history;
         self
+    }
+
+    /// This entry once per segment of its history, each of at most `cap` records (P7 Q8): the
+    /// same entry — path, identity key, every entry-level field — with segments numbered from 0,
+    /// only the last complete. An entry without a history, or with one of at most `cap` records,
+    /// is itself.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_segments(mut self, cap: usize) -> Vec<Self> {
+        let Some(history) = self.history.take() else {
+            return vec![self];
+        };
+        if history.records().len() <= cap {
+            self.history = Some(history);
+            return vec![self];
+        }
+        history
+            .split(cap)
+            .into_iter()
+            .map(|segment| {
+                let mut entry = self.clone();
+                entry.history = Some(Box::new(segment));
+                entry
+            })
+            .collect()
     }
 
     /// Lends private facts only to crate-internal backend/native implementations.
@@ -450,33 +475,33 @@ impl ObservedEntry {
     pub const fn metadata(&self) -> &MetadataObservations {
         &self.metadata
     }
-    /// The listed version this entry is: present only on entries of a traversal of every version
-    /// (`TraversalVersions::All`), one per stored version and delete marker.
+    /// The key's history, when this entry is a key of a bucket that was versioned when it was
+    /// connected (P7 §10): every stored version and delete marker, oldest first — or one segment
+    /// of it, when the key has more than [`MAX_HISTORY_RECORDS`](super::MAX_HISTORY_RECORDS)
+    /// records. A key whose latest record is a delete marker is listed too:
+    /// [`ObjectHistory::current`] is `None` for it. `None` for every other entry.
     #[must_use]
-    pub fn version(&self) -> Option<&EntryVersion> {
-        self.version.as_deref()
+    pub fn history(&self) -> Option<&ObjectHistory> {
+        self.history.as_deref()
     }
-    /// The selector that copies exactly this entry with `TransferRequest::with_source_version`:
-    /// the entry's own version when it is one of several ([`EntryVersion::source_version`]), and
-    /// `Current` for any other entry (only a file entry can be copied). `None` for a delete
-    /// marker, which holds nothing to copy.
+    /// The selector that copies this entry's current state with
+    /// `TransferRequest::with_source_version`: `Current` for an entry without a history (only a
+    /// file entry can be copied), and the current object's own selector for a key with one
+    /// ([`VersionRecord::source`]). `None` for a key deleted now, or a segment that is not the
+    /// key's last: there is no current object to copy. Each record of a history selects itself
+    /// with [`VersionRecord::source`].
     #[must_use]
     pub fn source_version(&self) -> Option<SourceVersion> {
-        self.version
-            .as_deref()
-            .map_or(Some(SourceVersion::Current), EntryVersion::source_version)
+        match self.history.as_deref() {
+            None => Some(SourceVersion::Current),
+            Some(history) => history.current().and_then(VersionRecord::source),
+        }
     }
 
     /// Encodes a lossless, versioned snapshot owned by data-mover.
     #[must_use]
     pub fn encode_snapshot(&self) -> EntrySnapshot {
-        self.encode(false)
-    }
-
-    /// The pre-C4c (v4) layout, which stored the backend identity; kept to test that v4 decodes.
-    #[cfg(test)]
-    fn encode_snapshot_v4(&self) -> EntrySnapshot {
-        self.encode(true)
+        self.encode()
     }
 
     /// Reconstructs an observation from an unchanged snapshot taken on `backend`.
@@ -489,10 +514,9 @@ impl ObservedEntry {
     /// endpoint moved, or is spelled differently: IP versus hostname, another export alias), the
     /// caller treats it as having no previous generation, not as corruption.
     ///
-    /// Snapshots written before ADR-0006 C4c (format v4) carry their own identity and keep it: only
-    /// the backend kind is checked against `backend`, and the entry's key stays the old one (post-C4
-    /// keys differ anyway). Re-encoding such an entry writes a v5 snapshot under that old identity,
-    /// which no derived endpoint decodes — copy v4 bytes forward instead of re-encoding them.
+    /// Only the current format is read (P7 §10.4, a development-phase rule): a snapshot written in
+    /// any other — an older build's — is [`SnapshotDecodeError::UnsupportedVersion`], and the
+    /// caller treats the entry as never seen (its next scan is a first one).
     ///
     /// # Errors
     /// Returns a typed error for malformed, unsupported, inconsistent, or trailing encoding, or for
@@ -561,3 +585,7 @@ impl std::error::Error for SnapshotDecodeError {}
 #[cfg(test)]
 #[path = "observation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "snapshot_format_tests.rs"]
+mod snapshot_format_tests;

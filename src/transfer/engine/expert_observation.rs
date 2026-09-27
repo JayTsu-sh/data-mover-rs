@@ -10,7 +10,7 @@ pub(super) async fn describe(
     source: &dyn ReadSource,
     observation: &ObservedEntry,
 ) -> Result<SourceDescriptor, TransferFailure> {
-    refuse_listed_versions(observation)?;
+    refuse_without_current_object(observation)?;
     let descriptor = source.describe(observation.path()).await.map_err(|error| {
         TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
     })?;
@@ -18,19 +18,22 @@ pub(super) async fn describe(
     Ok(descriptor)
 }
 
-/// The expert halves copy the current version only. An observation of one listed version from a
-/// traversal of every version (`TraversalVersions::All`) is refused unless it is the current one:
-/// an older version is copied with `TransferRequest::with_source_version`, and a delete marker
-/// holds nothing to copy.
-fn refuse_listed_versions(observation: &ObservedEntry) -> Result<(), TransferFailure> {
-    let Some(version) = observation.version() else {
+/// The expert halves copy the current object only. An observation of a key with its history
+/// (P7 §10) is copied when the history names a current object — the entry-level facts are that
+/// object's, as a listing of current objects gives them — and refused otherwise: a key deleted now
+/// (its latest record is a delete marker) holds nothing to copy, and a segment that is not the
+/// key's last does not say what is current. An older version is copied with
+/// `TransferRequest::with_source_version`.
+fn refuse_without_current_object(observation: &ObservedEntry) -> Result<(), TransferFailure> {
+    let Some(history) = observation.history() else {
         return Ok(());
     };
-    let reason = if version.is_delete_marker() {
-        "the observation is a delete marker, which holds nothing to copy"
-    } else if !version.is_latest() {
-        "the observation is an older version; expert transfers copy the current version only \
-         (copy it with TransferRequest::with_source_version)"
+    let reason = if !history.is_complete() {
+        "the observation is a segment of a key's history that is not its last; expert transfers \
+         copy the current object only"
+    } else if history.current().is_none() {
+        "the observation is a key deleted now (its latest record is a delete marker), which holds \
+         nothing to copy"
     } else {
         return Ok(());
     };

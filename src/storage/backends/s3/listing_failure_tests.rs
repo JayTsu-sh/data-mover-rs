@@ -11,7 +11,7 @@ use crate::model::{FailureClass, Transience};
 use crate::storage::backends::s3::S3RejectedEntry;
 use crate::storage::backends::s3::namespace::S3Namespace;
 use crate::storage::backends::s3::paging::ListingLimits;
-use crate::storage::listing::testing::{listed, listed_versions};
+use crate::storage::listing::testing::listed;
 use crate::storage::throttle::ThrottleBackoff;
 use crate::storage::{CollectLimits, ListRequest, Namespace, StorageRoleFailure, collect_listing};
 
@@ -159,8 +159,10 @@ async fn an_undecodable_element_fails_that_child_alone() -> TestResult {
 async fn a_key_with_an_undecodable_version_fails_whole() -> TestResult {
     let protocol = bucket(&["d/k", "d/other"]).await?;
     protocol.listing().rejected = vec![("d/".into(), rejected(Some("d/k"), "d/k"))];
+    // Never versioned, but refusing to say: its keys are listed with their histories (Q26).
+    protocol.answer_at_connect(S3VersioningAtConnect::Refused);
     let namespace = S3Namespace::new(protocol.clone(), identity());
-    let (entries, failures) = listed_versions(&namespace, &path("d")).await?;
+    let (entries, failures) = listed(&namespace, &path("d")).await?;
     let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
     assert_eq!(paths, ["d/other"]);
     assert_eq!(failures.len(), 1);

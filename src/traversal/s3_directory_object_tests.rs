@@ -1,5 +1,5 @@
 //! Directory objects through the S3 traversal (P7 F5): the key `p/d/` is a file entry of the block
-//! of `p/d`, in both version modes; the traversal root's own object is reported (content) or
+//! of `p/d`, listed by current objects or with its history; the traversal root's own object is reported (content) or
 //! dropped (zero bytes), never emitted at the root's own relative path; and `p/d/`, the file
 //! `p/d` and the directory `p/d` never share an identity key or a snapshot (their transfer
 //! identities differ too: `transfer::identity_tests`). Every case runs in both traversal orders:
@@ -14,11 +14,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     FailureScope, ScanTotals, StorageTraversalSource, TraversalItem, TraversalOrder,
-    TraversalOutcome, TraversalRequest, TraversalSource, TraversalVersions,
+    TraversalOutcome, TraversalRequest, TraversalSource,
 };
 use crate::model::{
-    EntryKind, EntryVersion, FailureClass, ObservationMode, ObservationPlan, ObservedEntry,
-    StoragePath, Transience,
+    EntryKind, FailureClass, ObservationMode, ObservationPlan, ObservedEntry, StoragePath,
+    Transience,
 };
 use crate::storage::backends::s3::tests::{MemoryS3, Versioning, content_md5, identity};
 use crate::storage::backends::s3::{
@@ -29,18 +29,22 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 const ORDERS: [TraversalOrder; 2] = [TraversalOrder::Unordered, TraversalOrder::Blocks];
 
-fn request(
-    root: &str,
-    versions: TraversalVersions,
-    order: TraversalOrder,
-) -> TestResult<TraversalRequest> {
+fn request(root: &str, order: TraversalOrder) -> TestResult<TraversalRequest> {
     let limit = NonZeroUsize::new(8).ok_or("nonzero")?;
     Ok(TraversalRequest::new(StoragePath::new(root)?)
         .order(order)
         .max_inflight_operations(limit)
         .max_buffered_items(limit)
-        .cancel(CancellationToken::new())
-        .versions(versions))
+        .cancel(CancellationToken::new()))
+}
+
+/// What `protocol` answers at connection: histories listed (a refusal to say, Q26) or not.
+fn lists_histories(protocol: &MemoryS3, histories: bool) {
+    protocol.answer_at_connect(if histories {
+        S3VersioningAtConnect::Refused
+    } else {
+        S3VersioningAtConnect::Never
+    });
 }
 
 async fn put(protocol: &MemoryS3, key: &str, body: &'static [u8]) -> TestResult {
@@ -83,7 +87,7 @@ fn entries(items: &[TraversalItem]) -> Vec<&ObservedEntry> {
         .collect()
 }
 
-/// `path kind size`, with ` M` for a delete marker; `failure scope path class`.
+/// `path kind size`, with ` M` for a key deleted now; `failure scope path class`.
 fn rows(items: &[TraversalItem]) -> Vec<String> {
     items
         .iter()
@@ -93,7 +97,10 @@ fn rows(items: &[TraversalItem]) -> Vec<String> {
                 entry.path(),
                 entry.kind(),
                 entry.size(),
-                if entry.version().is_some_and(EntryVersion::is_delete_marker) {
+                if entry
+                    .history()
+                    .is_some_and(|history| history.current().is_none())
+                {
                     " M"
                 } else {
                     ""
@@ -135,12 +142,9 @@ async fn tree() -> TestResult<Arc<MemoryS3>> {
 async fn directory_objects_are_entries_counted_as_files() -> TestResult {
     for order in ORDERS {
         let protocol = tree().await?;
-        for versions in [TraversalVersions::Current, TraversalVersions::All] {
-            if versions == TraversalVersions::All {
-                // Never versioned: only a refusal to say lists histories (P7 Q26).
-                protocol.answer_at_connect(S3VersioningAtConnect::Refused);
-            }
-            let (items, outcome) = traverse(&protocol, request("", versions, order)?).await?;
+        for histories in [false, true] {
+            lists_histories(&protocol, histories);
+            let (items, outcome) = traverse(&protocol, request("", order)?).await?;
             let mut listed = rows(&items);
             listed.sort();
             assert_eq!(
@@ -154,7 +158,7 @@ async fn directory_objects_are_entries_counted_as_files() -> TestResult {
                     "p/f File Some(1)",
                     "top File Some(1)",
                 ],
-                "{order:?} {versions:?}"
+                "{order:?} {histories}"
             );
             let scan = totals(&outcome);
             assert_eq!((scan.listed, scan.emitted, scan.failed_children), (7, 7, 0));
@@ -171,8 +175,7 @@ async fn directory_objects_are_entries_counted_as_files() -> TestResult {
 async fn the_traversal_roots_own_object_is_reported_not_emitted() -> TestResult {
     for order in ORDERS {
         let protocol = tree().await?;
-        let (items, outcome) =
-            traverse(&protocol, request("p", TraversalVersions::Current, order)?).await?;
+        let (items, outcome) = traverse(&protocol, request("p", order)?).await?;
         let listed = rows(&items);
         assert_eq!(
             listed
@@ -187,11 +190,7 @@ async fn the_traversal_roots_own_object_is_reported_not_emitted() -> TestResult 
         );
         let scan = totals(&outcome);
         assert_eq!((scan.emitted, scan.failed_children), (4, 1));
-        let (items, outcome) = traverse(
-            &protocol,
-            request("p/d", TraversalVersions::Current, order)?,
-        )
-        .await?;
+        let (items, outcome) = traverse(&protocol, request("p/d", order)?).await?;
         assert_eq!(rows(&items), ["p/d/x File Some(1)"]);
         assert_eq!(totals(&outcome).listed, 1);
 
@@ -202,28 +201,36 @@ async fn the_traversal_roots_own_object_is_reported_not_emitted() -> TestResult 
         delete(&versioned, "m/").await?;
         put(&versioned, "m/", b"333").await?;
         put(&versioned, "m/x", b"1").await?;
-        let (items, outcome) =
-            traverse(&versioned, request("m", TraversalVersions::All, order)?).await?;
+        let (items, outcome) = traverse(&versioned, request("m", order)?).await?;
         assert_eq!(
             rows(&items),
             ["failure Child m/ Unsupported", "m/x File Some(1)"]
         );
         assert_eq!(totals(&outcome).failed_children, 1);
+        // Deleted now, the key holds content in an older version: reported all the same (D4).
+        put(&versioned, "n/", b"fives").await?;
+        delete(&versioned, "n/").await?;
+        put(&versioned, "n/x", b"1").await?;
+        let (items, _) = traverse(&versioned, request("n", order)?).await?;
+        assert_eq!(
+            rows(&items),
+            ["failure Child n/ Unsupported", "n/x File Some(1)"]
+        );
         // An all-zero history of the root's own key is dropped entirely.
         let zero = Arc::new(MemoryS3::default());
         zero.set_versioning(Versioning::Enabled);
         put(&zero, "z/", b"").await?;
         delete(&zero, "z/").await?;
         put(&zero, "z/x", b"1").await?;
-        let (items, _) = traverse(&zero, request("z", TraversalVersions::All, order)?).await?;
+        let (items, _) = traverse(&zero, request("z", order)?).await?;
         assert_eq!(rows(&items), ["z/x File Some(1)"]);
     }
     Ok(())
 }
 
 /// `p/d/`, the file `p/d` (same bytes) and the directory `p/d` coexist in S3 and stay three
-/// entries: distinct identity keys, and snapshots that decode back to each (v5 current, v6
-/// version).
+/// entries: distinct identity keys, and snapshots that decode back to each, with or without their
+/// histories.
 #[tokio::test]
 async fn directory_object_entries_survive_a_snapshot() -> TestResult {
     for order in ORDERS {
@@ -231,23 +238,21 @@ async fn directory_object_entries_survive_a_snapshot() -> TestResult {
         put(&protocol, "p/d", b"same").await?;
         put(&protocol, "p/d/", b"same").await?;
         put(&protocol, "p/d/x", b"1").await?;
-        for versions in [TraversalVersions::Current, TraversalVersions::All] {
-            if versions == TraversalVersions::All {
-                protocol.answer_at_connect(S3VersioningAtConnect::Refused);
-            }
-            let (items, _) = traverse(&protocol, request("", versions, order)?).await?;
+        for histories in [false, true] {
+            lists_histories(&protocol, histories);
+            let (items, _) = traverse(&protocol, request("", order)?).await?;
             let found = entries(&items);
             let named: Vec<&ObservedEntry> = found
                 .into_iter()
                 .filter(|entry| entry.path().as_str().starts_with("p/d"))
                 .filter(|entry| entry.path().as_str() != "p/d/x")
                 .collect();
-            assert_eq!(named.len(), 3, "{order:?} {versions:?}");
+            assert_eq!(named.len(), 3, "{order:?} {histories}");
             let keys: HashSet<_> = named.iter().map(|entry| entry.identity_key()).collect();
             assert_eq!(
                 keys.len(),
                 3,
-                "identity keys must differ: {order:?} {versions:?}"
+                "identity keys must differ: {order:?} {histories}"
             );
             let own = named
                 .iter()
@@ -256,8 +261,7 @@ async fn directory_object_entries_survive_a_snapshot() -> TestResult {
             assert_eq!(own.kind(), EntryKind::File);
             for entry in &named {
                 let snapshot = entry.encode_snapshot();
-                let version_byte = if entry.version().is_some() { 6 } else { 5 };
-                assert_eq!(snapshot.as_bytes()[4], version_byte);
+                assert_eq!(snapshot.as_bytes()[4], 7);
                 let rebuilt = ObservedEntry::decode_snapshot(snapshot.as_bytes(), &identity())?;
                 assert_eq!(&rebuilt, *entry);
             }
@@ -278,7 +282,7 @@ async fn a_vanished_directory_object_is_counted_vanished() -> TestResult {
             "d/".to_string(),
             S3ProtocolFailure::entry(FailureClass::NotFound, Transience::Permanent, "gone"),
         ));
-        let mut asked = request("", TraversalVersions::Current, order)?;
+        let mut asked = request("", order)?;
         asked.observation_plan =
             ObservationPlan::default().with_timestamps(ObservationMode::Required);
         let (items, outcome) = traverse(&protocol, asked).await?;

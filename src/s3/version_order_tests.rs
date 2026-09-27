@@ -23,12 +23,12 @@ use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 
 use super::*;
-use crate::model::{EntryVersion, HistoryOrder, StoragePath};
+use crate::model::{HistoryOrder, ObjectHistory, StoragePath, VersionRecord};
 use crate::s3::S3Storage;
 use crate::s3::tests::make_test_storage;
 use crate::s3::version_listing::{VersionOrDeleteMarker, VersionPages, oldest_first_by_key};
-use crate::storage::backends::s3::{S3Protocol, connect, tests::identity};
-use crate::storage::listing::testing::listed_versions;
+use crate::storage::backends::s3::{S3Protocol, S3VersioningAtConnect, connect, tests::identity};
+use crate::storage::listing::testing::listed;
 use crate::storage::{PreflightPolicy, SourceDescriptor};
 
 const FULL: &str = include_str!(concat!(
@@ -119,18 +119,28 @@ fn written_order() -> Vec<String> {
     ids
 }
 
-fn listed_ids(entries: &[SourceDescriptor]) -> Vec<String> {
+/// Every record of the listed keys' histories.
+fn records(entries: &[SourceDescriptor]) -> Vec<&VersionRecord> {
     entries
         .iter()
-        .filter_map(|entry| entry.listing.version.as_deref())
-        .map(|version| version.id().unwrap_or("null").to_string())
+        .filter_map(|entry| entry.listing.history.as_deref())
+        .flat_map(ObjectHistory::records)
         .collect()
 }
 
-async fn list_all(storage: S3Storage) -> TestResult<Vec<SourceDescriptor>> {
+fn listed_ids(entries: &[SourceDescriptor]) -> Vec<String> {
+    records(entries)
+        .into_iter()
+        .map(|record| record.version_id().unwrap_or("null").to_string())
+        .collect()
+}
+
+/// The role listing of a versioned bucket answered by `storage`.
+async fn list_all(mut storage: S3Storage) -> TestResult<Vec<SourceDescriptor>> {
+    storage.versioning_at_connect = S3VersioningAtConnect::Enabled;
     let roles = connect(Arc::new(storage), identity(), None)?;
     let namespace = roles.namespace(&PreflightPolicy::production())?;
-    let (entries, failures) = listed_versions(&*namespace, &StoragePath::root()).await?;
+    let (entries, failures) = listed(&*namespace, &StoragePath::root()).await?;
     assert!(failures.is_empty(), "{failures:?}");
     Ok(entries)
 }
@@ -178,29 +188,24 @@ async fn a_retried_request_reads_the_successful_attempts_order() -> TestResult {
     Ok(())
 }
 
-/// Role-based (C22 `All`): the concurrent-write history comes out in true write order, from the
-/// server's order; ordering the same entries by `LastModified` (the order before this fix) does
-/// not.
+/// Role-based (C11b: one child per key with its history): the concurrent-write history comes out
+/// in true write order, from the server's order; ordering the same entries by `LastModified` (the
+/// order before this fix) does not.
 #[tokio::test]
 async fn the_role_listing_orders_concurrent_writes_as_the_server_did() -> TestResult {
     let entries = list_all(replay_storage(vec![FULL.to_string()])).await?;
+    assert_eq!(entries.len(), 1, "one key, one child");
     assert_eq!(listed_ids(&entries), written_order());
     assert!(entries.iter().all(|entry| {
         entry
             .listing
-            .version
+            .history
             .as_deref()
-            .is_some_and(|version| version.order() == HistoryOrder::Server)
+            .is_some_and(|history| history.order() == HistoryOrder::Server)
     }));
-    let latest: Vec<bool> = entries
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .listing
-                .version
-                .as_deref()
-                .map(EntryVersion::is_latest)
-        })
+    let latest: Vec<bool> = records(&entries)
+        .into_iter()
+        .map(VersionRecord::is_latest)
         .collect();
     assert_eq!(latest.iter().filter(|latest| **latest).count(), 1);
     assert_eq!(latest.last(), Some(&true));

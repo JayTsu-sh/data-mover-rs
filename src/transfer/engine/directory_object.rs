@@ -23,8 +23,8 @@
 //!   else the destination cannot write: an ONTAP NAS bucket's size and key limits, P7 §14.2).
 
 use crate::model::{
-    EntryOperationFailure, EntryVersion, FailureClass, ObservedEntry, Operation, StoragePath,
-    Transience,
+    EntryOperationFailure, FailureClass, ObjectHistory, ObservedEntry, Operation, StoragePath,
+    Transience, VersionRecord,
 };
 use crate::storage::{
     NamespaceCapabilities, PreflightPolicy, StagedDestination, Storage, StorageRoleFailure,
@@ -106,15 +106,20 @@ pub enum DirectoryObjectAction {
 
 /// Decides one listed entry for `destination`: its [`Storage`] (the full answer), or its
 /// namespace's capabilities (no size limit known). Only directory objects are decided here; any
-/// other entry is [`DirectoryObjectAction::Copy`] (the ordinary rules apply). An entry of a
-/// traversal of every version is one record: a consumer copying the current state to a filesystem
-/// passes the key's latest record, and a latest delete marker means the key holds nothing now.
+/// other entry is [`DirectoryObjectAction::Copy`] (the ordinary rules apply).
 ///
 /// To a destination that holds directory objects, one it would refuse for size — more than its
-/// limit, or of unknown size — is `Skip(`[`DIRECTORY_OBJECT_TOO_LARGE_REASON`]`)`; a delete marker
-/// is `Copy` (it is replayed, not written). This is the engine's own size rule, with its
-/// diagnostic: an entry answered `Copy` whose described size is the listed one is not refused for
-/// size at `Preflight`. To one that holds none, an entry without a size counts as holding nothing.
+/// limit, or of unknown size — is `Skip(`[`DIRECTORY_OBJECT_TOO_LARGE_REASON`]`)`. This is the
+/// engine's own size rule, with its diagnostic: an entry answered `Copy` whose described size is
+/// the listed one is not refused for size at `Preflight`. A key with its history (P7 §10) is
+/// replayed record by record, so it is skipped whole when **any** of its versions is too large
+/// (a replay that stops part way would leave the destination's history with a gap, D11); its
+/// delete markers are replayed, not written, and never too large.
+///
+/// To one that holds none, only the current state can be copied: the entry — or, for a key with
+/// its history, its current version — holding content is `Skip(`[`DIRECTORY_OBJECT_SKIP_REASON`]`)`;
+/// one without a size, a zero-byte one, a key deleted now (its latest record is a delete marker)
+/// or a segment of a history that is not its last is [`DirectoryObjectAction::NothingToDo`].
 ///
 /// `destination` is taken by conversion: pass `&Storage` or `&NamespaceCapabilities` itself (a
 /// `&Arc<Storage>` needs `&*`).
@@ -127,19 +132,35 @@ pub fn directory_object_action(
         return DirectoryObjectAction::Copy;
     }
     let destination = destination.into();
-    let delete_marker = entry.version().is_some_and(EntryVersion::is_delete_marker);
     if destination.holds {
-        return if !delete_marker && over_limit(destination.limit, entry.size()) {
+        let too_large = match entry.history() {
+            Some(history) => any_version_over(destination.limit, history),
+            None => over_limit(destination.limit, entry.size()),
+        };
+        return if too_large {
             DirectoryObjectAction::Skip(DIRECTORY_OBJECT_TOO_LARGE_REASON)
         } else {
             DirectoryObjectAction::Copy
         };
     }
-    if delete_marker || entry.size().unwrap_or(0) == 0 {
+    let size = match entry.history() {
+        Some(history) => history.current().and_then(VersionRecord::size),
+        None => entry.size(),
+    };
+    if size.unwrap_or(0) == 0 {
         DirectoryObjectAction::NothingToDo
     } else {
         DirectoryObjectAction::Skip(DIRECTORY_OBJECT_SKIP_REASON)
     }
+}
+
+/// Whether any version of the key `history` belongs to — in any segment, so every segment of one
+/// key is decided alike — is more than one request carrying at most `limit` bytes can write;
+/// delete markers are never written.
+fn any_version_over(limit: Option<u64>, history: &ObjectHistory) -> bool {
+    history
+        .largest_version()
+        .is_some_and(|largest| over_limit(limit, Some(largest)))
 }
 
 /// Whether one request carrying at most `limit` bytes cannot write a directory object of `size`

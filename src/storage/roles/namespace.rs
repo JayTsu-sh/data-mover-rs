@@ -5,7 +5,6 @@ use std::num::NonZeroUsize;
 use async_trait::async_trait;
 
 use super::StorageRoleFailure;
-use super::version::version_unsupported;
 use crate::model::{
     EntryOperationFailure, FailureClass, Operation, StoragePath, SymlinkTarget, Transience,
 };
@@ -100,18 +99,6 @@ pub trait Namespace: Send + Sync {
     fn parked_listing_limit(&self) -> Option<NonZeroUsize> {
         None
     }
-
-    /// Lists one directory with every stored version and delete marker of each child object,
-    /// each object's entries oldest first with the latest last, and its subdirectories once each
-    /// (ADR-0006 C22). Every child carries its listed version. The stream has the same contract
-    /// as [`Namespace::list`].
-    ///
-    /// The default serves namespaces without versions: an `Unsupported` failure, never the
-    /// current entries instead.
-    fn list_versions(&self, request: ListRequest) -> ListingStream {
-        let failure = version_unsupported(&request.path, Operation::Traverse);
-        ListingStream::failed(request.path, failure)
-    }
 }
 
 const NO_MUTATIONS: &str = "namespace mutations are unsupported by this namespace";
@@ -119,9 +106,8 @@ const NO_MUTATIONS: &str = "namespace mutations are unsupported by this namespac
 /// What a namespace can do, and how it compares names (P7 §5.4.5).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NamespaceCapabilities {
-    /// Whether the namespace keeps every stored version of an object, so that
-    /// [`Namespace::list_versions`] lists them: decided when the storage was connected (an S3
-    /// bucket that was versioned then, or would not say).
+    /// Whether [`Namespace::list`] gives each key its history (P7 §10): decided when the storage
+    /// was connected (an S3 bucket that was versioned then, or would not say).
     pub histories: bool,
     /// Whether `create_directory`, `delete` and `rename` are supported; the reason when they are
     /// not. Recursive delete and recursive create refuse a namespace without them before any I/O.

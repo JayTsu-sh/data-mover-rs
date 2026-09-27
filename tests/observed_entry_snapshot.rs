@@ -115,12 +115,17 @@ fn decoder_rejects_unknown_truncated_tampered_and_trailing_data()
     let valid = observed.encode_snapshot().as_bytes().to_vec();
     let local = backend(BackendKind::Local)?;
 
-    let mut unknown_version = valid.clone();
-    unknown_version[4] = 99;
-    assert_eq!(
-        ObservedEntry::decode_snapshot(&unknown_version, &local),
-        Err(SnapshotDecodeError::UnsupportedVersion)
-    );
+    assert_eq!(valid[4], 7, "the current format");
+    // Only the current format is read (P7 C11b): older formats and newer ones alike are refused.
+    for version in [4, 5, 6, 8, 99] {
+        let mut other_version = valid.clone();
+        other_version[4] = version;
+        assert_eq!(
+            ObservedEntry::decode_snapshot(&other_version, &local),
+            Err(SnapshotDecodeError::UnsupportedVersion),
+            "version {version}"
+        );
+    }
     assert_eq!(
         ObservedEntry::decode_snapshot(&valid[..valid.len() - 1], &local),
         Err(SnapshotDecodeError::Truncated)

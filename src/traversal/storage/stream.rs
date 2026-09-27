@@ -12,8 +12,8 @@
 //! one raw page a peek took off the stream (see [`read`]). A listing the cursor has not reached
 //! stops there. The backend's stream reads ahead on its own (one page in its channel and one in
 //! the producer's hands, P7 §5.1) — Local (C5), S3's current objects (C6), NFS (C7), HDFS (C8) and
-//! CIFS (C9) stream for real; until S3's versions do (C11b) that producer still reads the whole
-//! directory before the first page. The task never collects a listing whole.
+//! CIFS (C9) stream for real; S3's histories are gathered whole per directory first (§5.3, Q9),
+//! then built a page at a time. The task never collects a listing whole.
 //!
 //! **Never aborted.** The task is detached. It ends when the listing ends, or when the driver is
 //! gone (the traversal ended): then it drops the stream, and the backend's producer leaves through
@@ -39,7 +39,7 @@ use crate::model::{
 };
 use crate::storage::listing::is_vanished;
 use crate::storage::{DescentHint, ListRequest, ListingPage, SourceDescriptor, StorageRoleFailure};
-use crate::traversal::{TraversalDecision, TraversalTerminalFailure, TraversalVersions};
+use crate::traversal::{TraversalDecision, TraversalTerminalFailure};
 
 /// Pages a listing may hand the driver before the cursor takes the first of them.
 const PAGES_AHEAD: usize = 1;
@@ -164,11 +164,7 @@ async fn read(
     // the traversal is ending then, so what it returns is never used.
     let request = ListRequest::new(work.path.clone(), shared.request.cancel.clone())
         .with_descent_hint(work.hint.clone());
-    let namespace = shared.namespace.as_ref();
-    let mut stream = match shared.request.versions {
-        TraversalVersions::Current => namespace.list(request),
-        TraversalVersions::All => namespace.list_versions(request),
-    };
+    let mut stream = shared.namespace.list(request);
     let mut peeked: Option<Option<Item>> = None;
     loop {
         let next = match peeked.take() {
@@ -292,8 +288,9 @@ pub(super) fn prepare(shared: &Shared, work: &DirectoryWork, page: ListingPage) 
 /// `p/d` hands over the object `p/d/` as a file, but its path relative to the root would be the
 /// root itself, so it is not part of the traversal: a traversal of the parent `p` includes it. A
 /// zero-byte one (a folder marker; every record of its history, delete markers included) is
-/// dropped, uncounted, as the root's directory already stands for it. One holding content is the
-/// traversal's `Child` failure at that key (`Unsupported`), reported once, never silently dropped.
+/// dropped, uncounted, as the root's directory already stands for it. One holding content — now,
+/// or in any version of its history — is the traversal's `Child` failure at that key
+/// (`Unsupported`), reported once, never silently dropped.
 fn root_object(
     shared: &Shared,
     entries: &mut Vec<(SourceDescriptor, Option<DescentHint>)>,
@@ -307,7 +304,7 @@ fn root_object(
     let mut content = None;
     entries.retain(|(descriptor, _)| {
         let own = descriptor.path.as_str().strip_suffix('/') == Some(root);
-        if own && descriptor.size.is_some_and(|size| size > 0) {
+        if own && holds_content(descriptor) {
             content = Some(descriptor.path.clone());
         }
         !own
@@ -326,6 +323,17 @@ fn root_object(
     )
     .unwrap_or_else(|_| unreachable!("the static traversal diagnostic is valid"));
     failures.push(failure);
+}
+
+/// Whether a listed object holds content: its size, or, with a history, any version's.
+fn holds_content(descriptor: &SourceDescriptor) -> bool {
+    match descriptor.listing.history.as_deref() {
+        Some(history) => history
+            .records()
+            .iter()
+            .any(|record| record.size().is_some_and(|size| size > 0)),
+        None => descriptor.size.is_some_and(|size| size > 0),
+    }
 }
 
 /// Decides and, when it needs no I/O, observes one child, and files it into the page.

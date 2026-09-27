@@ -108,7 +108,7 @@ async fn deliver_failures(
 
 /// After a flush: forgets positions no checkpoint will use, and sends one when it is due and the
 /// output is between two blocks — never inside a block, whose items are delivered contiguously,
-/// nor inside one object's versions. Off, this is one branch.
+/// nor between the segments of one key's history. Off, this is one branch.
 pub(crate) async fn checkpoint_if_due(runtime: &Runtime<'_>, cursor: &mut Cursor, output: &Output) {
     let (Some(resume), Some(positions)) = (runtime.shared.resume.as_ref(), cursor.positions_mut())
     else {

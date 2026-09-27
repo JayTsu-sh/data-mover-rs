@@ -1,24 +1,33 @@
 //! The entry snapshot codec: `ObservedEntry` to and from its opaque, versioned bytes.
+//!
+//! **One format** (P7 §10.4, a development-phase rule to be decided again before a release,
+//! ADR-0008): a snapshot starts with the magic `DMES` and a version byte, and only the current
+//! version is read — any other is `UnsupportedVersion`, never misread. **Any** change to the
+//! layout, even one added field, bumps [`VERSION`] and the golden bytes of
+//! `snapshot_format_tests`, so old and new bytes never share a version number.
+//!
+//! ```text
+//! "DMES" | version u8 | backend kind u8 | path | kind u8 | symlink target | size | modified |
+//! identity strength u8 | endpoint fingerprint [4] | identity bytes | 2 | metadata |
+//! backend facts | history section (history_codec) | identity key [32]
+//! ```
+//!
+//! The backend identity is not stored — every entry of one scan shares it, and the caller supplies
+//! it when decoding; the 4-byte endpoint fingerprint tells a wrong endpoint from a corrupted key.
 
+use super::history_codec;
 use super::{
-    BackendIdentity, BackendKind, EntryIdentityKey, EntryKind, EntrySnapshot, EntryVersion,
-    IdentityStrength, MAX_MODEL_FIELD_BYTES, ObservedEntry, PrivateBackendEntryFacts,
-    SnapshotDecodeError, SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget,
-    SymlinkTargetEncoding,
+    BackendIdentity, BackendKind, EntryIdentityKey, EntryKind, EntrySnapshot, IdentityStrength,
+    MAX_MODEL_FIELD_BYTES, ObservedEntry, PrivateBackendEntryFacts, SnapshotDecodeError,
+    SourceIdentity, StoragePath, StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding,
 };
 use crate::model::metadata_observation;
-use crate::model::{HistoryOrder, SpecialFileKind, TimePrecision};
+use crate::model::{SpecialFileKind, TimePrecision};
 
 const MAGIC: &[u8; 4] = b"DMES";
-/// v5 (ADR-0006 C4c): the backend identity is no longer stored — every entry of one scan shares it,
-/// and the caller supplies it when decoding; a 4-byte endpoint fingerprint tells a wrong endpoint
-/// from a corrupted key. v4 carried the identity per entry and still decodes.
-const VERSION: u8 = 5;
-pub(super) const VERSION_WITH_BACKEND_ID: u8 = 4;
-/// v6 (ADR-0006 C22): v5 plus the listed version of an entry from a versioned traversal (its
-/// version id, whether it is the latest, whether it is a delete marker), before the identity key.
-/// Only an entry that carries a version is written as v6; every other entry stays v5, byte for byte.
-const VERSION_WITH_ENTRY_VERSION: u8 = 6;
+/// The current format (P7 C11b: v6 and its per-version entries gave way to one entry per key with
+/// its history section). Bump on **any** change to the layout, and update the golden bytes.
+pub(super) const VERSION: u8 = 7;
 
 impl PrivateBackendEntryFacts {
     fn encode(&self, output: &mut Vec<u8>) {
@@ -36,14 +45,10 @@ impl PrivateBackendEntryFacts {
 }
 
 impl ObservedEntry {
-    pub(super) fn encode(&self, with_backend_id: bool) -> EntrySnapshot {
+    pub(super) fn encode(&self) -> EntrySnapshot {
         let mut output = Vec::new();
         output.extend_from_slice(MAGIC);
-        output.push(match (with_backend_id, &self.version) {
-            (true, _) => VERSION_WITH_BACKEND_ID,
-            (false, None) => VERSION,
-            (false, Some(_)) => VERSION_WITH_ENTRY_VERSION,
-        });
+        output.push(VERSION);
         output.push(backend_tag(self.backend_kind));
         put_bytes(&mut output, self.path.as_str().as_bytes());
         encode_kind(&mut output, self.kind);
@@ -61,21 +66,12 @@ impl ObservedEntry {
         encode_size(&mut output, self.size);
         encode_time(&mut output, self.modified);
         output.push(self.source_identity.strength.tag());
-        if with_backend_id {
-            put_bytes(
-                &mut output,
-                self.source_identity.backend.stable_id().as_bytes(),
-            );
-        } else {
-            output.extend_from_slice(&endpoint_fingerprint(&self.source_identity.backend));
-        }
+        output.extend_from_slice(&endpoint_fingerprint(&self.source_identity.backend));
         put_bytes(&mut output, self.source_identity.stable_bytes.as_slice());
         output.push(2);
         metadata_observation::encode(&self.metadata, &mut output);
         self.backend_fact.encode(&mut output);
-        if !with_backend_id && let Some(version) = &self.version {
-            encode_version(&mut output, version);
-        }
+        history_codec::encode(&mut output, self.history.as_deref());
         output.extend_from_slice(self.identity_key.as_bytes());
         EntrySnapshot(output)
     }
@@ -109,6 +105,11 @@ impl<'a> Cursor<'a> {
         value.copy_from_slice(self.take(4)?);
         Ok(u32::from_le_bytes(value))
     }
+    pub(in crate::model) fn u64(&mut self) -> Result<u64, SnapshotDecodeError> {
+        let mut value = [0; 8];
+        value.copy_from_slice(self.take(8)?);
+        Ok(u64::from_le_bytes(value))
+    }
     pub(in crate::model) fn bytes(&mut self) -> Result<&'a [u8], SnapshotDecodeError> {
         let len = self.u32()? as usize;
         if len > MAX_MODEL_FIELD_BYTES {
@@ -126,8 +127,7 @@ pub(super) fn decode_snapshot(
     if cursor.take(4)? != MAGIC {
         return Err(SnapshotDecodeError::InvalidMagic);
     }
-    let version = cursor.byte()?;
-    if ![VERSION, VERSION_WITH_BACKEND_ID, VERSION_WITH_ENTRY_VERSION].contains(&version) {
+    if cursor.byte()? != VERSION {
         return Err(SnapshotDecodeError::UnsupportedVersion);
     }
     let backend_kind = backend_from_tag(cursor.byte()?).ok_or(SnapshotDecodeError::Malformed)?;
@@ -137,16 +137,14 @@ pub(super) fn decode_snapshot(
     let symlink_target = decode_symlink_target(&mut cursor, kind)?;
     let size = decode_size(&mut cursor)?;
     let modified = decode_time(&mut cursor)?;
-    let source_identity = decode_source_identity(&mut cursor, version, backend_kind, backend)?;
+    let source_identity = decode_source_identity(&mut cursor, backend_kind, backend)?;
     let schema_version = cursor.byte()?;
     if schema_version != 2 {
         return Err(SnapshotDecodeError::Malformed);
     }
     let metadata = metadata_observation::decode(&mut cursor)?;
     let backend_fact = decode_facts(&mut cursor, backend_kind)?;
-    let entry_version = (version == VERSION_WITH_ENTRY_VERSION)
-        .then(|| decode_version(&mut cursor).map(Box::new))
-        .transpose()?;
+    let history = history_codec::decode(&mut cursor, backend)?;
     let identity_key = decode_identity_key(&mut cursor, bytes.len(), &source_identity)?;
     Ok(ObservedEntry {
         identity_key,
@@ -159,7 +157,7 @@ pub(super) fn decode_snapshot(
         source_identity,
         metadata,
         backend_fact,
-        version: entry_version,
+        history,
     })
 }
 
@@ -182,30 +180,19 @@ fn decode_identity_key(
     Ok(identity_key)
 }
 
-/// The source identity of a snapshot: strength, backend (the caller's for v5, checked by kind and
-/// endpoint fingerprint; the stored one for v4, checked by kind), and stable bytes.
+/// The source identity of a snapshot: strength, the caller's backend (checked by kind and endpoint
+/// fingerprint), and stable bytes.
 fn decode_source_identity(
     cursor: &mut Cursor<'_>,
-    version: u8,
     backend_kind: BackendKind,
     backend: &BackendIdentity,
 ) -> Result<SourceIdentity, SnapshotDecodeError> {
     let strength =
         IdentityStrength::from_tag(cursor.byte()?).ok_or(SnapshotDecodeError::Malformed)?;
-    if backend.kind() != backend_kind {
+    if backend.kind() != backend_kind || cursor.take(4)? != endpoint_fingerprint(backend) {
         return Err(SnapshotDecodeError::BackendMismatch);
     }
-    let backend = if version == VERSION_WITH_BACKEND_ID {
-        let backend_id =
-            std::str::from_utf8(cursor.bytes()?).map_err(|_| SnapshotDecodeError::Malformed)?;
-        BackendIdentity::new(backend_kind, backend_id)
-            .map_err(|_| SnapshotDecodeError::Malformed)?
-    } else if cursor.take(4)? == endpoint_fingerprint(backend) {
-        backend.clone()
-    } else {
-        return Err(SnapshotDecodeError::BackendMismatch);
-    };
-    SourceIdentity::new(backend, strength, cursor.bytes()?)
+    SourceIdentity::new(backend.clone(), strength, cursor.bytes()?)
         .map_err(|_| SnapshotDecodeError::Malformed)
 }
 
@@ -366,59 +353,4 @@ fn decode_facts(
         (5, BackendKind::Hdfs) => Ok(PrivateBackendEntryFacts::Hdfs(bytes)),
         _ => Err(SnapshotDecodeError::Malformed),
     }
-}
-
-/// Flags of the v6 version record. `VERSION_ORDER_SERVER` (the key's history is in the server's
-/// listing order, `HistoryOrder::Server`) was added after the first v6 snapshots, whose histories
-/// were merged by `LastModified`: they never set it and decode as `HistoryOrder::Inferred`, which
-/// is what they were. A build older than the flag refuses a snapshot that sets it (`Malformed`).
-const VERSION_LATEST: u8 = 1;
-const VERSION_DELETE_MARKER: u8 = 2;
-const VERSION_HAS_ID: u8 = 4;
-const VERSION_ORDER_SERVER: u8 = 8;
-
-fn encode_version(output: &mut Vec<u8>, version: &EntryVersion) {
-    let mut flags = 0;
-    if version.is_latest() {
-        flags |= VERSION_LATEST;
-    }
-    if version.is_delete_marker() {
-        flags |= VERSION_DELETE_MARKER;
-    }
-    if version.id().is_some() {
-        flags |= VERSION_HAS_ID;
-    }
-    if version.order() == HistoryOrder::Server {
-        flags |= VERSION_ORDER_SERVER;
-    }
-    output.push(flags);
-    if let Some(id) = version.id() {
-        put_bytes(output, id.as_bytes());
-    }
-}
-
-fn decode_version(cursor: &mut Cursor<'_>) -> Result<EntryVersion, SnapshotDecodeError> {
-    let flags = cursor.byte()?;
-    let known = VERSION_LATEST | VERSION_DELETE_MARKER | VERSION_HAS_ID | VERSION_ORDER_SERVER;
-    if flags & !known != 0 {
-        return Err(SnapshotDecodeError::Malformed);
-    }
-    let id = if flags & VERSION_HAS_ID == 0 {
-        None
-    } else {
-        let id =
-            std::str::from_utf8(cursor.bytes()?).map_err(|_| SnapshotDecodeError::Malformed)?;
-        Some(id.to_string())
-    };
-    EntryVersion::new(
-        id,
-        flags & VERSION_LATEST != 0,
-        flags & VERSION_DELETE_MARKER != 0,
-        if flags & VERSION_ORDER_SERVER == 0 {
-            HistoryOrder::Inferred
-        } else {
-            HistoryOrder::Server
-        },
-    )
-    .map_err(|_| SnapshotDecodeError::Malformed)
 }

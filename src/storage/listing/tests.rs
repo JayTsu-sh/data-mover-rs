@@ -6,8 +6,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Notify;
-
 use super::*;
 use crate::model::{BackendIdentity, BackendKind, EntryKind, IdentityStrength, SourceIdentity};
 
@@ -495,49 +493,4 @@ async fn a_finished_producers_end_is_there_with_its_last_page() {
         ),
         "a producer that panicked read as a finished listing"
     );
-}
-
-/// A stateless listing abandons the request in flight at cancellation, and when its stream is
-/// dropped.
-#[tokio::test]
-async fn an_abortable_listing_stops_at_cancellation_and_at_drop() {
-    let never = Arc::new(Notify::new());
-    let cancel = CancellationToken::new();
-    let request = ListRequest::new(path("d"), cancel.clone());
-    let pending = Arc::clone(&never);
-    let stream = ListingStream::from_producer(request.path.clone(), move |sink| async move {
-        let listing = async move {
-            pending.notified().await;
-            Ok(ListingPage::default())
-        };
-        sink.deliver_abortable(listing, &request).await;
-    });
-    cancel.cancel();
-    let collected = collect_listing(stream, CollectLimits::UNBOUNDED).await;
-    assert!(
-        matches!(collected, Err(StorageRoleFailure::Entry(ref failure))
-            if failure.class() == FailureClass::Cancelled),
-        "{collected:?}"
-    );
-
-    let finished = Arc::new(AtomicBool::new(false));
-    let done = Arc::clone(&finished);
-    let request = ListRequest::new(path("d"), CancellationToken::new());
-    let pending = Arc::clone(&never);
-    let mut stream = ListingStream::from_producer(request.path.clone(), move |sink| async move {
-        let listing = async move {
-            pending.notified().await;
-            Ok(ListingPage::default())
-        };
-        sink.deliver_abortable(listing, &request).await;
-        done.store(true, Ordering::SeqCst);
-    });
-    // Start the producer, then walk away while its request is in flight.
-    let polled = futures::poll!(stream.next());
-    assert!(polled.is_pending());
-    drop(stream);
-    eventually("the abortable producer returned", || {
-        finished.load(Ordering::SeqCst)
-    })
-    .await;
 }

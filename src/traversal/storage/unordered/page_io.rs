@@ -75,7 +75,7 @@ async fn run(
             if halt.is_cancelled() {
                 return None;
             }
-            let result = observe(namespace, metadata, *descriptor, plan).await;
+            let result = observe(namespace, metadata, *descriptor, plan, halt).await;
             drop(permit);
             Some((place, result.map(Box::new)))
         })

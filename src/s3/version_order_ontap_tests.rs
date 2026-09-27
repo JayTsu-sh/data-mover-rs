@@ -48,8 +48,8 @@ use crate::dir_tree::{DirHandle, ReadContext, ReadResult};
 use crate::model::{EntryKind, FailureClass, StoragePath, Transience};
 use crate::s3::S3Storage;
 use crate::s3::tests::make_test_storage;
-use crate::storage::backends::s3::{connect, tests::identity};
-use crate::storage::listing::testing::listed_versions;
+use crate::storage::backends::s3::{S3VersioningAtConnect, connect, tests::identity};
+use crate::storage::listing::testing::listed;
 use crate::storage::{PreflightPolicy, StorageRoleFailure};
 use crate::{StorageEntryMessage, WalkOptions};
 
@@ -198,6 +198,7 @@ fn storage(replay: &MarkerReplay) -> S3Storage {
     let mut storage = make_test_storage(None);
     storage.client = Client::from_conf(config);
     storage.is_bucket_versioned = true;
+    storage.versioning_at_connect = S3VersioningAtConnect::Enabled;
     storage
 }
 
@@ -245,8 +246,8 @@ fn unique<T: Ord + Clone + Debug>(listed: &[T], what: &str) -> BTreeSet<T> {
     set
 }
 
-/// The role listing of every version of `<ROOT><dir>` over `replay`: its files as (key, version
-/// id) and its subdirectories as prefixes.
+/// The role listing of `<ROOT><dir>` over `replay`, a versioned bucket: every record of its keys'
+/// histories as (key, version id) and its subdirectories as prefixes.
 async fn role_all(
     replay: &MarkerReplay,
     dir: &str,
@@ -257,15 +258,19 @@ async fn role_all(
         .namespace(&PreflightPolicy::production())
         .unwrap_or_else(|e| panic!("{e:?}"));
     let directory = StoragePath::new(format!("{ROOT}{dir}")).unwrap_or_else(|e| panic!("{e}"));
-    let (entries, failures) = listed_versions(&*namespace, &directory).await?;
+    let (entries, failures) = listed(&*namespace, &directory).await?;
     assert!(failures.is_empty(), "{failures:?}");
     let files = entries
         .iter()
         .filter(|entry| entry.kind == EntryKind::File)
-        .filter_map(|entry| {
-            let version = entry.listing.version.as_deref()?;
-            let id = version.id().unwrap_or("null").to_string();
-            Some((entry.path.as_str().to_string(), id))
+        .flat_map(|entry| {
+            let history = entry.listing.history.as_deref();
+            history.into_iter().flat_map(|history| {
+                history.records().iter().map(|record| {
+                    let id = record.version_id().unwrap_or("null").to_string();
+                    (entry.path.as_str().to_string(), id)
+                })
+            })
         })
         .collect();
     let directories = entries

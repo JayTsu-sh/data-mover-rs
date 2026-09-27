@@ -12,11 +12,13 @@ use tokio_util::sync::CancellationToken;
 use super::{
     FailureScope, ListingOutcome, StorageTraversalSource, TraversalCompletion, TraversalItem,
     TraversalOrder, TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
-    TraversalTerminalFailure, TraversalVersions,
+    TraversalTerminalFailure,
 };
 #[cfg(unix)]
 use crate::model::ObservationMode;
-use crate::model::{EntryKind, FailureClass, ObservationPlan, Operation, StoragePath};
+use crate::model::{
+    EntryKind, FailureClass, ObservationPlan, Operation, SourceVersion, StoragePath,
+};
 #[cfg(unix)]
 use crate::storage::Metadata as MetadataRole;
 use crate::storage::backends::local::namespace::LocalNamespace;
@@ -465,25 +467,36 @@ async fn traversal_omits_reserved_local_transfer_artifacts() -> io::Result<()> {
     Ok(())
 }
 
-/// A source without versions refuses a traversal of every version before any I/O, with a typed
-/// `Unsupported` session failure — never its current entries in place of the versions asked for.
+/// A source without versions lists no histories: every entry of a Local traversal has none, and
+/// it selects its current state for a copy.
 #[tokio::test]
-async fn a_source_without_versions_refuses_to_list_every_version() -> io::Result<()> {
+async fn a_source_without_versions_lists_no_histories() -> io::Result<()> {
     let temp = tempfile::tempdir()?;
     std::fs::write(temp.path().join("file"), b"x")?;
+    std::fs::create_dir(temp.path().join("dir"))?;
     let fixture = fixture(temp.path())?;
-    assert!(!fixture.source.supports_versions());
-    let mut all = request(CancellationToken::new(), 4, 4);
-    all.versions = TraversalVersions::All;
-    let mut session = fixture.source.traverse(all);
-    assert!(drain(&mut session).await.is_empty());
-    match session.finish().await {
-        Err(TraversalTerminalFailure::Session(failure)) => {
-            assert_eq!(failure.class(), FailureClass::Unsupported);
-            assert_eq!(failure.operation(), Operation::Traverse);
-        }
-        other => panic!("expected an Unsupported session failure, got {other:?}"),
-    }
+    let mut session = fixture
+        .source
+        .traverse(request(CancellationToken::new(), 4, 4));
+    let items = drain(&mut session).await;
+    let entries: Vec<_> = items
+        .iter()
+        .filter_map(|item| match item {
+            TraversalItem::Entry(entry) => Some(entry),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|entry| entry.history().is_none()));
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.source_version() == Some(SourceVersion::Current))
+    );
+    assert!(matches!(
+        session.finish().await,
+        Ok(TraversalOutcome::Completed(_))
+    ));
     Ok(())
 }
 

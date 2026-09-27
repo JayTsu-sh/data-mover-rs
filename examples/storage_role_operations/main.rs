@@ -3,16 +3,17 @@
 //! integrity.
 //!
 //! Every backend here lends the namespace role, so all subcommands work on Local, NFS and CIFS.
-//! S3 lends `Stat` / `List` only (ADR-0006 C22): `traverse` and `compare` work on it, `--versions
-//! all` lists every stored version and delete marker, and `seed` writes objects without creating
-//! directories; `ndx-walk`, `create-dir` and `delete-tree` refuse it before any I/O. Its URL
-//! (with the prefix as the root) comes from `S3_LISTING_URL`.
+//! S3 lends `Stat` / `List` only (ADR-0006 C22): `traverse` and `compare` work on it — on a
+//! versioned bucket each key is one entry with its history, a `Record` line per version and
+//! delete marker (`--current` prints the current objects only) — and `seed` writes objects
+//! without creating directories; `ndx-walk`, `create-dir` and `delete-tree` refuse it before any
+//! I/O. Its URL (with the prefix as the root) comes from `S3_LISTING_URL`.
 //!
 //! ```text
 //! cargo run --example storage_role_operations -- traverse --backend local --root /tmp/tree \
 //!     --match 'name == "*.log"' --max-depth 2
 //! S3_LISTING_URL=s3://AK:SK@bucket.host:9000/prefix cargo run --example \
-//!     storage_role_operations -- --backend s3 traverse --versions all --order blocks
+//!     storage_role_operations -- --backend s3 traverse --order blocks
 //! cargo run --example storage_role_operations -- ndx-walk --backend cifs --path scratch \
 //!     --entries
 //! cargo run --example storage_role_operations -- delete-tree --backend cifs --path scratch/old
@@ -38,7 +39,7 @@ use data_mover::storage::{
     connect_backend, create_directory_all, delete_tree,
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
-use data_mover::traversal::{TraversalOrder, TraversalVersions};
+use data_mover::traversal::TraversalOrder;
 use futures::stream::{self, StreamExt as _};
 use tokio_util::sync::CancellationToken;
 
@@ -86,24 +87,6 @@ enum OrderArg {
     Blocks,
 }
 
-/// Which entries a traversal emits for a versioned store.
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum VersionsArg {
-    /// Current objects only.
-    Current,
-    /// Every stored version and delete marker, oldest first per key (S3 only).
-    All,
-}
-
-impl From<VersionsArg> for TraversalVersions {
-    fn from(value: VersionsArg) -> Self {
-        match value {
-            VersionsArg::Current => Self::Current,
-            VersionsArg::All => Self::All,
-        }
-    }
-}
-
 impl From<OrderArg> for TraversalOrder {
     fn from(value: OrderArg) -> Self {
         match value {
@@ -126,9 +109,11 @@ enum Command {
         /// Unordered (the default), or blocks with directory events and a fixed descent order.
         #[arg(long, value_enum, default_value_t = OrderArg::Unordered)]
         order: OrderArg,
-        /// Current objects only, or every stored version (S3).
-        #[arg(long, value_enum, default_value_t = VersionsArg::Current)]
-        versions: VersionsArg,
+        /// Print the current objects only: of a key with its history (a versioned S3 bucket), the
+        /// entry when its latest record is a version — as a listing of current objects shows it,
+        /// no history, no `Record` lines — and nothing for a key deleted now.
+        #[arg(long)]
+        current: bool,
         /// Sub-path to start from, relative to the backend root.
         #[arg(long, default_value = "")]
         path: String,
@@ -140,8 +125,9 @@ enum Command {
         #[arg(long)]
         snapshot_bytes: bool,
         /// Also print each entry's size (` size=<bytes>`, `-` for none) after its path, so a
-        /// script sees a directory object's bytes (`File d/ size=5`) in the current listing too.
-        /// A version entry already prints its size with its version.
+        /// script sees a directory object's bytes (`File d/ size=5`). A key with its history
+        /// prints its current object's size (`-` when deleted); its `Record` lines carry each
+        /// record's.
         #[arg(long)]
         sizes: bool,
         /// Also print each entry's identity strength and the first 8 bytes of its identity key
@@ -168,7 +154,7 @@ enum Command {
         #[arg(long)]
         checkpoint_out: Option<PathBuf>,
         /// Resume from the checkpoint in this file (written by `--checkpoint-out` of a traversal
-        /// with the same backend, root, path, order, filter, depth and versions).
+        /// with the same backend, root, path, order, filter and depth).
         #[arg(long)]
         resume_from: Option<PathBuf>,
         /// Cancel once this many entries have been printed, then drain.

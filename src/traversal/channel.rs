@@ -15,7 +15,7 @@
 //!
 //! **A whole batch arrives whole.** It is one message, so no other sender's items land inside it:
 //! the consumer sees its items together and in order. The Unordered workers, many senders, rely
-//! on it to keep one object's versions together (see `unordered::worker`).
+//! on it to keep the segments of one key's history together (see `unordered::worker`).
 
 use std::mem;
 use std::num::NonZeroUsize;

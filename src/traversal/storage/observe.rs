@@ -8,6 +8,13 @@
 //! block that has any, fed its children as the cursor admits them and running them concurrently.
 //! The admission window already bounds how many are admitted and not yet emitted, so it bounds
 //! these too.
+//!
+//! **A key with its history** (P7 §10.4, R2): when the plan asks for more than the listing gave,
+//! each version of the history is observed on its own, bound to that version, one after another
+//! within the key's one observation (so a key takes one of the traversal's observation slots,
+//! however many versions it has); delete markers are not observed. A version whose observation
+//! fails keeps the failure on its own record (`MetadataObservation::Failed`, whatever the mode)
+//! and the key is still delivered; the entry's own metadata is its current version's.
 
 use std::sync::Arc;
 
@@ -15,29 +22,42 @@ use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use super::{Deferred, Shared, entry_failure, throttling_scoped_to};
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, MAX_MODEL_FIELD_BYTES, MetadataObservation,
-    MetadataObservations, MetadataProvenance, ObservationMode, ObservationPlan, ObservedEntry,
-    Operation, StoragePath, SymlinkTarget, Transience,
+    MetadataObservations, MetadataProvenance, ObjectHistory, ObservationMode, ObservationPlan,
+    ObservedEntry, Operation, StoragePath, SymlinkTarget, Transience, VersionRecord,
 };
 use crate::storage::{Metadata, Namespace, SourceDescriptor, StorageRoleFailure};
 use crate::traversal::TraversalTerminalFailure;
 
-/// Whether the metadata role must be consulted for `descriptor` under `plan`, or whether the
-/// listing already supplied everything the plan asks for.
-fn needs_metadata_role(plan: ObservationPlan, descriptor: &SourceDescriptor) -> bool {
-    let optional_requested = [
+/// Whether `plan` asks for any family no listing carries.
+fn optional_requested(plan: ObservationPlan) -> bool {
+    [
         plan.acl(),
         plan.xattrs(),
         plan.tags(),
         plan.ownership_mode(),
     ]
     .into_iter()
-    .any(|mode| mode != ObservationMode::Omit);
-    optional_requested
+    .any(|mode| mode != ObservationMode::Omit)
+}
+
+/// Whether the metadata role must be consulted for `descriptor` under `plan`, or whether the
+/// listing already supplied everything the plan asks for.
+fn needs_metadata_role(plan: ObservationPlan, descriptor: &SourceDescriptor) -> bool {
+    optional_requested(plan)
         || (plan.timestamps() != ObservationMode::Omit && descriptor.inline_timestamps.is_none())
+}
+
+/// Whether one record of a history must be observed under `plan`: a version, when the plan asks
+/// for more than its listing gave. A delete marker has nothing behind it.
+fn record_needs_role(plan: ObservationPlan, record: &VersionRecord) -> bool {
+    !record.is_delete_marker()
+        && (optional_requested(plan)
+            || (plan.timestamps() != ObservationMode::Omit && record.modified().is_none()))
 }
 
 fn inline_observations(
@@ -97,45 +117,130 @@ fn listed_observations(
 /// The metadata of `descriptor` when the listing alone answers it: a listing-only child, a plan
 /// that asks for nothing the listing did not carry, or one the metadata role can answer from the
 /// listing's own attributes ([`Metadata::observe_listed`]). `None` means the metadata role must
-/// be asked, which is I/O. A listed version is always asked: its observation is bound to it.
+/// be asked, which is I/O. A key with its history is asked only for the records that need it
+/// ([`record_needs_role`]), each bound to its version.
 fn metadata_without_io(
     metadata_role: &dyn Metadata,
     plan: ObservationPlan,
     descriptor: &SourceDescriptor,
 ) -> Option<Result<MetadataObservations, StorageRoleFailure>> {
-    if descriptor.listing.listing_only {
-        return Some(listed_observations(plan, descriptor));
+    if let Some(history) = descriptor.listing.history.as_deref() {
+        let records = history.records();
+        return (!records.iter().any(|record| record_needs_role(plan, record)))
+            .then(|| listing_answer(plan, descriptor));
     }
-    if !needs_metadata_role(plan, descriptor) {
-        return Some(inline_observations(plan, descriptor));
+    if descriptor.listing.listing_only || !needs_metadata_role(plan, descriptor) {
+        return Some(listing_answer(plan, descriptor));
     }
-    if descriptor.listing.version.is_none() {
-        return metadata_role.observe_listed(descriptor, plan);
-    }
-    None
+    metadata_role.observe_listed(descriptor, plan)
 }
 
-/// The metadata of `descriptor` from the metadata role, bound to the listed version when the
-/// child is one, so an old version is never described by the current object's tags and time.
-async fn role_observations(
-    metadata_role: &dyn Metadata,
-    descriptor: &SourceDescriptor,
+/// What the listing itself says of `descriptor`: nothing behind a listing-only child (a prefix, a
+/// key deleted now), the listed times of any other.
+fn listing_answer(
     plan: ObservationPlan,
+    descriptor: &SourceDescriptor,
 ) -> Result<MetadataObservations, StorageRoleFailure> {
-    if descriptor.listing.version.is_none() {
-        return metadata_role.observe(&descriptor.path, plan).await;
+    if descriptor.listing.listing_only {
+        listed_observations(plan, descriptor)
+    } else {
+        inline_observations(plan, descriptor)
     }
-    // A listed version — the latest `"null"` one included, whose selector is `Current` — is
-    // observed only while the store still holds exactly what was listed.
-    metadata_role
-        .observe_copy_bound_version(
-            &descriptor.path,
-            &descriptor.source_identity,
-            &descriptor.version,
-            plan,
-        )
-        .await
-        .map(|observed| observed.observations)
+}
+
+/// What a record whose observation failed carries: the failure, in every family the plan asked
+/// for.
+fn failed_observations(
+    plan: ObservationPlan,
+    path: &StoragePath,
+    class: FailureClass,
+    transience: Transience,
+) -> Result<MetadataObservations, StorageRoleFailure> {
+    fn failed<T>(
+        mode: ObservationMode,
+        class: FailureClass,
+        transience: Transience,
+    ) -> MetadataObservation<T> {
+        if mode == ObservationMode::Omit {
+            MetadataObservation::NotRequested
+        } else {
+            MetadataObservation::Failed { class, transience }
+        }
+    }
+    MetadataObservations::new(
+        failed(plan.acl(), class, transience),
+        failed(plan.xattrs(), class, transience),
+        failed(plan.tags(), class, transience),
+        failed(plan.ownership_mode(), class, transience),
+        failed(plan.timestamps(), class, transience),
+    )
+    .map_err(|_| StorageRoleFailure::Entry(entry_failure(path, FailureClass::Protocol)))
+}
+
+/// Observes each version of the key's history that the plan needs more of, bound to that version,
+/// one after another; a failure stays on its record, except a session failure, which ends the
+/// traversal. Cancelled part way, the key is abandoned (the traversal is ending and delivers
+/// nothing more). The entry's own metadata is its current version's, or what the listing said.
+async fn observe_history(
+    metadata_role: &dyn Metadata,
+    mut descriptor: SourceDescriptor,
+    mut history: Box<ObjectHistory>,
+    plan: ObservationPlan,
+    cancel: &CancellationToken,
+) -> Result<ObservedEntry, StorageRoleFailure> {
+    let path = &descriptor.path;
+    for record in history.records_mut() {
+        if !record_needs_role(plan, record) {
+            continue;
+        }
+        if cancel.is_cancelled() {
+            return Err(StorageRoleFailure::Entry(cancelled(path)));
+        }
+        let Some(version) = record.source() else {
+            continue;
+        };
+        let observed = metadata_role
+            .observe_copy_bound_version(path, record.identity(), &version, plan)
+            .await
+            .map_err(|failure| throttling_scoped_to(path, Operation::Observe, failure));
+        let metadata = match observed {
+            Ok(observed) => observed.observations,
+            Err(StorageRoleFailure::Entry(failure)) => {
+                failed_observations(plan, path, failure.class(), failure.transience())?
+            }
+            Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
+        };
+        record.set_metadata(metadata);
+    }
+    let mut metadata = match history.current().and_then(VersionRecord::metadata) {
+        Some(current) => current.clone(),
+        None => listing_answer(plan, &descriptor)?,
+    };
+    // The current version's time could not be observed: the key keeps the one its listing gave,
+    // as a key without a history would (its entry never goes without a time the listing had).
+    if metadata.timestamps.value().is_none()
+        && plan.timestamps() != ObservationMode::Omit
+        && let Some(value) = descriptor.inline_timestamps
+    {
+        metadata.timestamps = MetadataObservation::Value {
+            value,
+            provenance: MetadataProvenance::Inline,
+        };
+    }
+    descriptor.listing.history = Some(history);
+    assemble(descriptor, metadata, None)
+}
+
+/// The failure a key abandoned by cancellation settles with; never delivered.
+fn cancelled(path: &StoragePath) -> EntryOperationFailure {
+    EntryOperationFailure::new(
+        path.clone(),
+        Operation::Observe,
+        FailureClass::Cancelled,
+        Transience::Transient,
+        "the traversal was cancelled while the key's versions were observed",
+    )
+    .unwrap_or_else(|_| unreachable!("the static observation diagnostic is valid"))
 }
 
 /// A model check that the ones in [`assemble`] should already have ruled out. Not blamed on any
@@ -181,7 +286,7 @@ fn assemble(
     // Unreachable after the checks above; kept typed rather than asserted.
     .map_err(|_| internal())?
     .with_metadata(metadata)
-    .with_version(listing.version);
+    .with_history(listing.history);
     match backend_fact {
         Some(fact) => entry
             .with_backend_fact_bytes(fact.to_vec())
@@ -231,13 +336,18 @@ pub(super) fn observe_listed(
     }
 }
 
-/// Observes `descriptor`, asking the backend for whatever the listing did not carry.
+/// Observes `descriptor`, asking the backend for whatever the listing did not carry. `cancel` is
+/// the traversal's: a key's history stops being observed once it fires.
 pub(super) async fn observe(
     namespace: &dyn Namespace,
     metadata_role: &dyn Metadata,
-    descriptor: SourceDescriptor,
+    mut descriptor: SourceDescriptor,
     plan: ObservationPlan,
+    cancel: &CancellationToken,
 ) -> Result<ObservedEntry, StorageRoleFailure> {
+    if let Some(history) = descriptor.listing.history.take() {
+        return observe_history(metadata_role, descriptor, history, plan, cancel).await;
+    }
     match observe_io(namespace, metadata_role, &descriptor, plan).await {
         Ok((metadata, target)) => assemble(descriptor, metadata, target),
         Err(failure) => Err(confirm_vanished(namespace, &descriptor.path, failure).await),
@@ -255,7 +365,8 @@ async fn observe_io(
     let scoped = |failure| throttling_scoped_to(&descriptor.path, Operation::Observe, failure);
     let metadata = match metadata_without_io(metadata_role, plan, descriptor) {
         Some(metadata) => metadata?,
-        None => role_observations(metadata_role, descriptor, plan)
+        None => metadata_role
+            .observe(&descriptor.path, plan)
             .await
             .map_err(scoped)?,
     };
@@ -456,6 +567,7 @@ async fn observe_block(
     let plan = shared.policy.observation_plan;
     let namespace = shared.namespace.as_ref();
     let metadata = shared.metadata.as_ref();
+    let cancel = &shared.request.cancel;
     let mut inflight = FuturesUnordered::new();
     let mut open = true;
     loop {
@@ -465,7 +577,7 @@ async fn observe_block(
                 // holds no handle, so it is simply not started.
                 Some(_) if shared.request.cancel.is_cancelled() => {}
                 Some(Job { sequence, descriptor, deferred }) => inflight.push(async move {
-                    let result = observe(namespace, metadata, *descriptor, plan).await;
+                    let result = observe(namespace, metadata, *descriptor, plan, cancel).await;
                     (sequence, result.map(Box::new), deferred)
                 }),
                 None => open = false,

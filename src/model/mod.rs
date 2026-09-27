@@ -5,12 +5,12 @@ use std::str::FromStr;
 
 pub(crate) const MAX_MODEL_FIELD_BYTES: usize = 16 * 1024 * 1024;
 
-mod entry_version;
+mod history;
 mod metadata_observation;
 pub(crate) mod observation;
 mod ownership;
 mod source_version;
-pub use entry_version::{EntryVersion, HistoryOrder};
+pub use history::{HistoryOrder, MAX_HISTORY_RECORDS, ObjectHistory, RecordKind, VersionRecord};
 pub use metadata_observation::{
     AclEncoding, AclMetadata, ExtendedAttribute, MappedOwnership, MetadataObservation,
     MetadataObservations, MetadataProvenance, ObjectTag, ObservationMode, ObservationPlan,

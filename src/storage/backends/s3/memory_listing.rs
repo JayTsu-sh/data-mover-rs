@@ -55,6 +55,11 @@ pub(crate) struct ListingKnobs {
     /// A non-conforming store: each key's versions are listed oldest first (the latest last)
     /// instead of newest first.
     pub(crate) oldest_first_versions: bool,
+    /// A non-conforming store: each key's oldest record is listed after every other record of
+    /// the listing, so a key's records are not together (and, paged small, on pages apart).
+    pub(crate) split_keys: bool,
+    /// `ListObjectVersions` pages requested.
+    pub(crate) version_pages: usize,
     /// A broken server: every page is truncated and its continuation cycles through this many
     /// tokens (0: off).
     pub(crate) cycle_tokens: usize,
@@ -315,11 +320,16 @@ impl MemoryS3 {
     }
 
     async fn version_elements(&self, prefix: &str) -> S3Result<Vec<Element>> {
-        let (same_instant, oldest_first) = {
+        let (same_instant, oldest_first, split) = {
             let knobs = self.listing();
-            (knobs.same_instant, knobs.oldest_first_versions)
+            (
+                knobs.same_instant,
+                knobs.oldest_first_versions,
+                knobs.split_keys,
+            )
         };
         let mut elements = Vec::new();
+        let mut oldest = Vec::new();
         for key in self.keys_under(prefix, true).await {
             if let Some(common) = self.rolled_up(prefix, &key) {
                 if !matches!(elements.last(), Some(Element::Prefix(last)) if *last == common) {
@@ -349,8 +359,12 @@ impl MemoryS3 {
             if oldest_first {
                 listed.reverse();
             }
+            if split && listed.len() > 1 {
+                oldest.extend(listed.pop());
+            }
             elements.extend(listed);
         }
+        elements.extend(oldest);
         Ok(elements)
     }
 
@@ -454,6 +468,7 @@ impl MemoryS3 {
         prefix: &str,
         marker: Option<&S3VersionMarker>,
     ) -> S3Result<S3VersionPage> {
+        self.listing().version_pages += 1;
         let size = self.listing_call(prefix).await?;
         if let Some(key_marker) = self.endless_page() {
             return Ok(S3VersionPage {
