@@ -178,7 +178,8 @@ async fn a_listing_failing_after_its_first_page_is_interrupted() -> Result {
         after: 1050,
         failure: NfsReadFailure {
             failure: NfsProtocolFailure::new(FailureClass::Protocol, Transience::Unknown),
-            restart: NfsRestart::Relookup,
+            // One no retry cures: since P7 C7c a curable one continues from the cookie.
+            restart: NfsRestart::Never,
         },
         times: 1,
     });

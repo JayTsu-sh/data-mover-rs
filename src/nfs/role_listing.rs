@@ -1,5 +1,7 @@
 //! The NFS role listing (P7 C7): READDIRPLUS read one reply at a time and handed to the listing's
-//! pages as it arrives, each entry turned into what the Namespace role lists.
+//! pages as it arrives, each entry turned into what the Namespace role lists. Each reply is asked
+//! for from a cookie the listing holds (nfs-rs `Mount::readdirplus_page`, P7 C7c), so a listing
+//! can continue after a failure from the last reply it took whole.
 //!
 //! Nothing here caches a handle. Before C7 the listing put every listed subdirectory's handle into
 //! the process-wide handle cache so the descent could skip a LOOKUP; the descent now carries the
@@ -13,8 +15,10 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
-use nfs_rs::{Mount, NFSVersion, Nfs3ErrorCode, Nfs4ErrorCode, NfsError, RecoveryAction};
+use futures::{Stream, StreamExt, stream};
+use nfs_rs::{
+    DirectoryCookie, Mount, NFSVersion, Nfs3ErrorCode, Nfs4ErrorCode, NfsError, RecoveryAction,
+};
 use tracing::info;
 
 use super::{
@@ -108,22 +112,46 @@ impl NFSStorage {
         Ok(self.lookup_fh(Path::new(path.as_str())).await?.fh)
     }
 
-    /// Reads the directory `handle` with READDIRPLUS into `pages` (see
-    /// `NfsNamespaceProtocol::read_directory`). nfs-rs asks for the next reply only once the
-    /// entries of the last one have been taken, so the read runs no further ahead than `pages`.
+    /// Reads the directory `handle` with READDIRPLUS from `from` into `pages` (see
+    /// `NfsNamespaceProtocol::read_directory`), one reply at a time: the next is asked for only
+    /// once the entries of the last one have been taken, so the read runs no further ahead than
+    /// `pages`, and never while `pages` says to stop.
     pub(super) async fn read_role_directory(
         &self,
         path: &StoragePath,
         handle: Bytes,
+        from: DirectoryCookie,
         pages: &mut dyn NfsListingPages,
     ) -> std::result::Result<NfsReadEnd, NfsReadFailure> {
         let mount = Arc::clone(&self.mount);
+        let mount: &dyn Mount = mount.as_ref().as_ref();
         let lookup = MountChildLookup {
-            mount: mount.as_ref().as_ref(),
+            mount,
             directory: handle.clone(),
         };
-        let entries = mount.readdirplus(handle).await;
-        drain_readdirplus(path, entries, pages, self.version(), &lookup).await
+        let mut position = from;
+        loop {
+            if pages.stopping() {
+                return Ok(NfsReadEnd::Stopped);
+            }
+            let page = mount
+                .readdirplus_page(handle.clone(), position)
+                .await
+                .map_err(read_failure)?;
+            let entries = stream::iter(page.entries.into_iter().map(Ok));
+            let end = drain_readdirplus(path, entries, pages, self.version(), &lookup).await?;
+            if end == NfsReadEnd::Stopped {
+                return Ok(end);
+            }
+            // An empty last reply repeats the cookie it was asked with: look at the end first.
+            if page.eof {
+                return Ok(NfsReadEnd::Complete);
+            }
+            if !pages.reached(page.next) {
+                return Ok(NfsReadEnd::Repeated);
+            }
+            position = page.next;
+        }
     }
 
     /// Forgets the cached handles of `path` and its ancestors, refreshing the root handle first
@@ -309,10 +337,11 @@ fn lookup_failed(directory: &StoragePath, child: &Path, failed: LookupFailure) -
 }
 
 /// Hands every READDIRPLUS entry of `entries` (the directory `directory`, read over `version`)
-/// to `pages` in the order the server sent it, until the directory ends or `pages` says to stop.
-/// It asks `pages` before taking every entry, so a stopped listing sends no further READDIRPLUS
-/// request (an entry already taken may still cost the LOOKUP of [`snapshot_directory`], which
-/// `lookup` sends in `directory`).
+/// to `pages` in the order the server sent it, until `entries` ends (`Complete`) or `pages` says
+/// to stop. It asks `pages` before taking every entry, so a stopped listing sends no further
+/// READDIRPLUS request (an entry already taken may still cost the LOOKUP of
+/// [`snapshot_directory`], which `lookup` sends in `directory`), and skips an entry `pages` has
+/// already taken ([`NfsListingPages::first_sight`]) before looking at it.
 pub(super) async fn drain_readdirplus<S>(
     directory: &StoragePath,
     mut entries: S,
@@ -333,6 +362,9 @@ where
             return Ok(NfsReadEnd::Complete);
         };
         let entry = next.map_err(read_failure)?;
+        if !pages.first_sight(entry.fileid, &entry.file_name) {
+            continue;
+        }
         let listed = match snapshot_directory(directory, entry, version, lookup).await {
             Examined::Child(entry) => {
                 let child = native.join(&entry.file_name);
@@ -394,6 +426,8 @@ fn restart_for(error: &NfsError) -> NfsRestart {
 /// What reading anew could do about the server's status.
 fn restart_for_status(error: &NfsError) -> NfsRestart {
     match error {
+        // The cookie or its verifier was rejected: only a read from the start can go on.
+        error if error.is_bad_directory_cookie() => NfsRestart::FromStart,
         NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_FHEXPIRED) => NfsRestart::Relookup,
         NfsError::Nfs4(Nfs4ErrorCode::NFS4ERR_DELAY | Nfs4ErrorCode::NFS4ERR_GRACE)
         | NfsError::Nfs3(Nfs3ErrorCode::NFS3ERR_JUKEBOX) => NfsRestart::Backoff,

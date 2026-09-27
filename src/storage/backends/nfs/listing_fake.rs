@@ -3,7 +3,9 @@
 //!
 //! Handles are `fh:<path>` plus a generation. [`FakeNfs::replace`] gives a directory a new handle,
 //! so the one listings handed out before goes stale, as it does on a server when the directory is
-//! removed and made again. Not a protocol mock: it serves the protocol trait the NFS client
+//! removed and made again. The `n`-th child (from 0) has fileid `n + 1` and cookie `n + 1`; a read
+//! from cookie `c` starts at child `c`, unless the directory's [`Cookies`] say the server does
+//! something else with it. Not a protocol mock: it serves the protocol trait the NFS client
 //! implements, the seam the listing's producer is written against.
 
 use std::collections::HashMap;
@@ -12,7 +14,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use nfs_rs::DirectoryCookie;
 use tokio::sync::Semaphore;
+use tokio::task::yield_now;
 
 use super::namespace::{
     NfsListingPages, NfsNamespaceAdapter, NfsNamespaceObservation, NfsNamespaceProtocol,
@@ -34,6 +38,27 @@ pub(crate) struct Fault {
     pub(crate) times: usize,
 }
 
+/// What the server does with a cookie other than the directory's start.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum Cookies {
+    /// Continues after it.
+    #[default]
+    Honours,
+    /// Ignores it and sends the directory from its start, without saying so.
+    Restarts,
+    /// Rejects it, as ONTAP rejects a stale verifier (`NfsRestart::FromStart`).
+    Rejects,
+    /// Answers it with an empty end of directory, as ONTAP and DXN-2 answer a cookie they do
+    /// not know.
+    Forgets,
+    /// Continues after it, but from its second reply on hands back the cookie its first reply
+    /// ended at: the cookies loop.
+    Loops,
+}
+
+/// The verifier every reply carries.
+pub(crate) const VERIFIER: [u8; 8] = *b"fakeverf";
+
 /// See the [module docs](self).
 #[derive(Default)]
 pub(crate) struct FakeNfs {
@@ -48,6 +73,8 @@ pub(crate) struct FakeNfs {
     /// Names the read hides instead of handing over, as the `NFSv3` reader hides ONTAP's
     /// snapshot directory (P7 C7b).
     hidden_names: Vec<String>,
+    /// What the server does with a cookie, by directory (default [`Cookies::Honours`]).
+    cookies: HashMap<String, Cookies>,
     /// `directory_handle` calls: one per path resolution, whatever LOOKUPs it would cost.
     pub(crate) lookups: AtomicUsize,
     /// READDIRPLUS requests sent.
@@ -61,6 +88,8 @@ pub(crate) struct FakeNfs {
     pub(crate) reads_ended: AtomicUsize,
     /// The handle each read was given, by path.
     pub(crate) read_with: Mutex<Vec<(String, Bytes)>>,
+    /// The cookie each read started from, in order.
+    pub(crate) read_from: Mutex<Vec<u64>>,
 }
 
 pub(crate) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -101,6 +130,12 @@ impl FakeNfs {
     /// it over.
     pub(crate) fn hiding(mut self, name: &str) -> Self {
         self.hidden_names.push(name.to_owned());
+        self
+    }
+
+    /// Makes the server treat cookies in directory `path` as `cookies` says.
+    pub(crate) fn cookies(mut self, path: &str, cookies: Cookies) -> Self {
+        self.cookies.insert(path.to_owned(), cookies);
         self
     }
 
@@ -197,6 +232,19 @@ pub(crate) fn stale() -> NfsReadFailure {
     }
 }
 
+/// The cookie (and fileid) after the first `children` children.
+fn cookie_of(children: usize) -> u64 {
+    u64::try_from(children).unwrap_or(u64::MAX)
+}
+
+/// The failure of a read from a cookie the server rejects.
+pub(crate) fn bad_cookie() -> NfsReadFailure {
+    NfsReadFailure {
+        failure: NfsProtocolFailure::new(FailureClass::Protocol, Transience::Unknown),
+        restart: NfsRestart::FromStart,
+    }
+}
+
 /// Counts a read as ended however it ends, dropped included.
 struct Ended<'a>(&'a AtomicUsize);
 
@@ -231,11 +279,13 @@ impl NfsNamespaceProtocol for FakeNfs {
         &self,
         path: &StoragePath,
         handle: Bytes,
+        from: DirectoryCookie,
         pages: &mut dyn NfsListingPages,
     ) -> Result<NfsReadEnd, NfsReadFailure> {
         self.reads_started.fetch_add(1, Ordering::SeqCst);
         let _ended = Ended(&self.reads_ended);
         locked(&self.read_with).push((path.as_str().to_owned(), handle.clone()));
+        locked(&self.read_from).push(from.cookie);
         let directory = self.named_by(&handle).ok_or_else(stale)?;
         assert_eq!(
             directory,
@@ -243,8 +293,19 @@ impl NfsNamespaceProtocol for FakeNfs {
             "the handle names another directory"
         );
         let children = &self.directories[&directory];
+        let cookies = self.cookies.get(&directory).copied().unwrap_or_default();
+        let first = match cookies {
+            _ if from.cookie == 0 => 0,
+            Cookies::Honours | Cookies::Loops => usize::try_from(from.cookie).unwrap_or(usize::MAX),
+            Cookies::Restarts => 0,
+            Cookies::Rejects => return Err(bad_cookie()),
+            Cookies::Forgets => return Ok(NfsReadEnd::Complete),
+        };
         let fault = self.take_fault(&directory);
-        for (reply, chunk) in children.chunks(self.per_reply.max(1)).enumerate() {
+        let per_reply = self.per_reply.max(1);
+        let mut start = first.min(children.len());
+        loop {
+            let end = (start + per_reply).min(children.len());
             if pages.stopping() {
                 return Ok(NfsReadEnd::Stopped);
             }
@@ -253,10 +314,12 @@ impl NfsNamespaceProtocol for FakeNfs {
             {
                 permit.forget();
             }
+            // A reply is a round trip: never a tight loop that starves the other tasks.
+            yield_now().await;
             self.replies.fetch_add(1, Ordering::SeqCst);
-            for (offset, (name, kind)) in chunk.iter().enumerate() {
+            for (index, (name, kind)) in children.iter().enumerate().take(end).skip(start) {
                 if let Some(fault) = &fault
-                    && fault.after == reply * self.per_reply + offset
+                    && fault.after == index
                 {
                     return Err(fault.failure.clone());
                 }
@@ -264,6 +327,9 @@ impl NfsNamespaceProtocol for FakeNfs {
                     return Ok(NfsReadEnd::Stopped);
                 }
                 self.read.fetch_add(1, Ordering::SeqCst);
+                if !pages.first_sight(cookie_of(index + 1), name) {
+                    continue;
+                }
                 if self.hidden_names.contains(name) {
                     pages.hide();
                     continue;
@@ -272,6 +338,22 @@ impl NfsNamespaceProtocol for FakeNfs {
                     return Ok(NfsReadEnd::Stopped);
                 }
             }
+            if end == children.len() {
+                break;
+            }
+            let next = if cookies == Cookies::Loops && start > first {
+                (first + per_reply).min(children.len())
+            } else {
+                end
+            };
+            let cookie = DirectoryCookie {
+                cookie: cookie_of(next),
+                verifier: VERIFIER,
+            };
+            if !pages.reached(cookie) {
+                return Ok(NfsReadEnd::Repeated);
+            }
+            start = next;
         }
         match fault {
             Some(fault) if fault.after >= children.len() => Err(fault.failure),

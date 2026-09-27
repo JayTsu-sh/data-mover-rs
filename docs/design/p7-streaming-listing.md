@@ -88,7 +88,7 @@
 | backend | 今天 | 位置模型（跨页） | 值得注意的问题 |
 |---|---|---|---|
 | Local | `spawn_blocking` 读完整目录（`local/namespace.rs:140-153, 257-297`） | fd，无超时 | 列举级错误与子项错误都记在目录路径上（`:271-275`），分不清 |
-| NFS | 收完整个 `readdirplus` 流；出错整目录从头重试（`nfs.rs:4610-4691`） | cookie + verifier，无状态；但 nfs-rs 0.8.4 不公开页游标（`mount.rs:28` `pub(crate)`） | 一个子项缺属性 → 整目录失败（`nfs.rs:4657-4659`）；一个子项描述失败 → 整目录失败（`backends/nfs/namespace.rs:75-86`） |
+| NFS | 收完整个 `readdirplus` 流；出错整目录从头重试（`nfs.rs:4610-4691`） | cookie + verifier，无状态；但 nfs-rs 0.8.4 不公开页游标（`mount.rs:28` `pub(crate)`；0.8.5 起公开 `Mount::readdirplus_page`，C7c 已用上） | 一个子项缺属性 → 整目录失败（`nfs.rs:4657-4659`）；一个子项描述失败 → 整目录失败（`backends/nfs/namespace.rs:75-86`） |
 | CIFS | open → `entries("*").try_collect()` → close（`cifs/protocol.rs:230-246`）；**C9 `936e20b` 起逐页流式** | **真实目录句柄**（CREATE 出来的） | 一个子项失败 → 整目录失败（`cifs/namespace.rs:92`） |
 | S3 | 收齐所有页再建块，500 万上限（`s3/listing.rs:55-130`，`paging.rs:24-29`） | continuation token，无状态 | 对象去重用 O(N) HashSet（`listing.rs:79-81`）；token 重复 → 会话失败（`paging.rs:83-86`）；429/503/SlowDown → 会话失败（`src/s3/role_protocol.rs:518-523`） |
 | HDFS | `get_metadata` + `list_status` 全量（`src/hdfs/namespace.rs:271-288`） | startAfter，无状态 | 每目录多一次 RPC（`:275`）；一个子项失败 → 整目录失败（`backends/hdfs/namespace.rs:44-52`） |
@@ -268,7 +268,7 @@ type ListingStream = Pin<Box<dyn Stream<Item = Result<ListingPage, StorageRoleFa
 | backend | 流式做法 | 中途出错 |
 |---|---|---|
 | Local | 每页一次 `spawn_blocking`，把 `ReadDir` 带进带出；停车时不占 blocking 线程 | readdir 错误基本不是瞬时的 → `Interrupted`（已交付过）/ `Unreadable`（没交付）；已读到的先交付。**已实现** `277f1f8`：20 万文件平铺目录首项 400 ms → 6 ms、RSS 217 → 22 MB |
-| NFS | 生产者任务消费 `readdirplus` 流，按 `page_hint` 攒页 | **首页交出之前**可以整目录从头重试（legacy 就是这条规则，`nfs.rs:3364-3366`）；之后只能从 cookie 续（需要 nfs-rs 公开页接口，Q18），否则 `Interrupted`。**已实现** `7da78ce`：首页前句柄失效 → 解析路径（至多 3 次）、`DELAY` / `JUKEBOX` / `GRACE` → 列举节流预算内退避、nfs-rs 认证可重发的传输失败 → 250 ms / 1 s / 2 s，都从头重读、不重复交出；首页后不重试，已读到的先交出再失败（可重发的传输失败只让该列举失败）；drop / 取消在下一条之前停、不放弃在途请求。C7b：v3 列出的缺属性 `.snapshot` 经一次 LOOKUP 确认是目录后隐藏（计入 `internal_hidden`，ONTAP 卷根，与 v4 一致），见 §14 C7b。5 万文件平铺目录首项 ONTAP v3 1.2 s → 0.05 s、v4.0 / v4.1 2.2 s → 0.07 s、DXN-2 v3 6 s → 0.14 s、v4.0 10 s → 0.2 s；RSS 69–75 → 17–20 MB（release）；五种环境与 legacy 基线逐行相同 |
+| NFS | 生产者任务消费 `readdirplus` 流，按 `page_hint` 攒页 | **首页交出之前**可以整目录从头重试（legacy 就是这条规则，`nfs.rs:3364-3366`）；之后只能从 cookie 续（需要 nfs-rs 公开页接口，Q18），否则 `Interrupted`。**已实现** `7da78ce`：首页前句柄失效 → 解析路径（至多 3 次）、`DELAY` / `JUKEBOX` / `GRACE` → 列举节流预算内退避、nfs-rs 认证可重发的传输失败 → 250 ms / 1 s / 2 s，都从头重读、不重复交出；首页后不重试（C7c 起改为同样重试、从 cookie 续，见下）；重试用尽时已读到的先交出再失败（可重发的传输失败只让该列举失败）；drop / 取消在下一条之前停、不放弃在途请求。C7b：v3 列出的缺属性 `.snapshot` 经一次 LOOKUP 确认是目录后隐藏（计入 `internal_hidden`，ONTAP 卷根，与 v4 一致），见 §14 C7b。**C7c**（nfs-rs 0.8.5 `readdirplus_page`，调用方持 cookie + verifier）：首页之后的失败按首页前同样的分类 / 预算重试，但从最后一个完整取完的回复之后的 cookie 续读（句柄解析后变了 → cookie 在别的句柄上无意义，从目录开头读）；列举记住已取子项的 `(fileid, 名字)` 带密钥 64 位摘要（上限 2^18 项，约 4.5 MiB / 列举；超过则首页后不再续、照旧 `Interrupted`），续读后服务器重发的（被截断回复的前半、或不认 cookie 从头重发的整目录）跳过，不重复交出；同一次读取里 cookie 重复 → 该列举 `Protocol` / Permanent（§8）；cookie 被拒（`BAD_COOKIE` / `NOT_SAME`）或续读的 cookie 被答以“空的目录末尾”（ONTAP、DXN-2 答不认识的 cookie 就是这样）→ 从目录开头重读并跳过已取的（至多 3 次）；每取到新子项重试预算续满。见 §14 C7c。5 万文件平铺目录首项 ONTAP v3 1.2 s → 0.05 s、v4.0 / v4.1 2.2 s → 0.07 s、DXN-2 v3 6 s → 0.14 s、v4.0 10 s → 0.2 s；RSS 69–75 → 17–20 MB（release）；五种环境与 legacy 基线逐行相同 |
 | CIFS | 生产者任务持有目录句柄（`CifsDirectory`），逐条取 `QUERY_DIRECTORY` 记录按 `page_hint` 攒页；所有出口都 close，最后一页在关句柄之后交出；停车时句柄开着 → `Namespace::parked_listing_limit()` = 8，Blocks 游标让“已起、未读完”的预取列举不超过它（游标正要的那个总是起） | 首页交出之前句柄失效（smb-rs 重连后旧句柄上的 `InvalidState`、重连时在途的 `StaleObject`、`STATUS_FILE_CLOSED` / `STATUS_INVALID_HANDLE`）→ 重开目录从头读（50 ms / 250 ms / 1 s，至多 3 次，不重复交出）；之后句柄失效无法续 → 已读到的先交出，`Interrupted`（原分类，连接类升会话）。取消 / drop 在取下一条之前停、让在途记录到达；smb-rs 流已预发的下一条 `QUERY_DIRECTORY` 随流 drop 取消（#75/#76）。没有下钻提示（CREATE 按路径一次往返）。**已实现** `936e20b`（接缝 `70f85d1`）：5 万文件平铺目录首项 400 → 34–46 ms、RSS 65 → 21–25 MB（release）；10.3 万条整树 c=1/4/32 与 base 逐行相同（含顺序），RSS 84–118 → 30–44 MB；停车时 ONTAP 上恰 9 个打开的目录句柄（base 0）；与 NFSv3 / v4.1 同一棵树 Blocks 输出逐行相同；停车 30 分钟后照常读完（Q10） |
 | S3 | 未开过版本控制的桶：ListObjectsV2，每页转一页；多版本桶：ListObjectVersions，按目录组装每个 key 的历史（见 5.3、第 10 节） | 同一 token 重发（无状态，安全）；节流退避。**已实现** `f2cacdc`（Current 流式；All 仍按目录物化，C11b）：不假设 key 有序（只用不透明 token，前缀名集合去重，对象只与上一页比对，列完才判 `NotFound`）；节流按 C3 预算、其他瞬时失败同一 token 再发至多 3 次（读到一页即续满），首页前后一样；500 万上限不再限流式 Current 的对象数，只管驻留的前缀名集合与不可解码 key（续页 token 另限 500 万）；物化的 All 仍按条数计（用户 2026-09-26 定，**已修** `ffd37ca`；5,000,001 个对象的平铺前缀在生产上限下流完）。2 万对象平铺前缀首项 MinIO 3.5 s → 0.4 s、ONTAP 1.2 s → 0.13–0.25 s，RSS 68 → 54 / 66 → 50 MB（debug）；MinIO / ONTAP（含 NAS 桶）/ RustFS / DXN 的多版本与非多版本桶均已跑 |
 | HDFS | `list_status_iter`（hdfs-native `client.rs:734`）；去掉列举前的 `get_metadata` | 续读：hdfs-native 不公开 startAfter，可重试失败（I/O、单批 > 5 s）后重开列举、跳过到最后读到的名字之后（按 NameNode 的有符号字节序；只在失败时多读），首页前后都可续、不重复发子项；其他失败或预算用完 → `Interrupted`。**已实现** `9c8185f`；有符号字节序、列举文件回自身、缺目录 `FileNotFound` 三点待真机（runner 需用户批准） |
@@ -471,7 +471,7 @@ struct BlockCounts { /* 同上的每目录版本，只在 Blocks 的 DirectoryLi
 | 消失 | 列举后、观察前消失；父列出后子目录已不存在 | 计入 `vanished`，不发失败项，不破坏完整性（Q12）。遍历根不存在仍是列举失败 | `NotFound` | 今天是失败项 → 活跃目录上删除检测常被禁用 |
 | 列举 | 无权限 / 打不开 | `Unreadable` | `PermissionDenied` / Permanent | 已如此 |
 | 列举 | 第 k 页失败（已发出 N 个） | 先重试（首页前可从头，之后只能从位置续）；续不了 → `Interrupted { delivered: N }` | 按原因 | 不存在（整块物化） |
-| 列举 | cookie / token 循环、空页不前进 | 该列举 `Interrupted`，不结束整场 | `Protocol` / Permanent | S3 → 会话失败（`paging.rs:83-86`） |
+| 列举 | cookie / token 循环、空页不前进 | 该列举 `Interrupted`，不结束整场 | `Protocol` / Permanent（NFS 空页不前进由 nfs-rs 报 `Xdr`，与畸形回复分不开，是 `Protocol` / Unknown） | S3 → 会话失败（`paging.rs:83-86`）；NFS 自 C7c 起检查同一次读取内的 cookie 重复 |
 | 会话 | 连接重置、服务器宕、SMB session / Kerberos 票据过期 | 重连属于 backend 会话层；无状态位置在恢复后续页；CIFS 句柄失效 → 该列举 `Interrupted`；恢复不了 → 终止（Resumable 时带最后检查点） | `Connectivity` / Transient；`Authentication` / Permanent | 任何会话失败都结束遍历（`cursor.rs:476-478`） |
 | 会话 | S3 凭据过期（`ExpiredToken`） | 终止 | 会话 / Permanent | 已如此 |
 | 节流 | S3 429 / 503 / SlowDown；NFS JUKEBOX / DELAY | **退避，不是失败**：生产者内有界、带抖动、看取消令牌；预算耗尽才 `Interrupted`（Q11） | **新增 `FailureClass::Throttled`** / Transient | **S3 一次（SDK 重试后的）SlowDown 就结束整场遍历**（`role_protocol.rs:518-523`） |
@@ -665,7 +665,7 @@ struct VersionRecord {
 
 ### 11.3 可选
 
-- 列举本身的同批重复（S3 跨页重复对象、NFS 变化中的目录在 cookie 边界重复一项）很少见，会多发一次 New；
+- 列举本身的同批重复（S3 跨页重复对象、NFS 变化中的目录在 cookie 边界重复一项；NFS 续读后服务器重发的已由列举按 `(fileid, 名字)` 跳过，C7c）很少见，会多发一次 New；
   要消掉只需在检测 SQL 上加 `LIMIT 1 BY t.relative_path, t.version_id`（代码里已有这种写法，`clickhouse.rs:1216`）。
 - 提交前交叉校验：data-mover 报告的 `emitted` 与本轮写入行数对得上才提交。
 
@@ -895,6 +895,28 @@ C7b fix(nfs): v3 READDIRPLUS 列出、却不给属性的 `.snapshot`（ONTAP 卷
     → 在被列目录里 LOOKUP 一次（回复无属性再 GETATTR）；是目录 → 隐藏（不列、不算失败、不下钻；计入页的 `internal_hidden`、
     一条 `info!`）；不是目录 → 按查到的属性当普通子项；查失败 → 该子项失败（查询自己的分类，`NOENT` 即消失），会话 / 节流 /
     目录句柄失效的失败按 READDIRPLUS 失败结束这次读取。带属性的 `.snapshot`（DXN 上真建的目录）、其他名字、v4 一律不变
+C7c feat(storage): NFS 列举首页之后可按 cookie 续读（Q18；nfs-rs 0.8.5 `Mount::readdirplus_page`）—— 已完成（前置 `68ae002` 升级 nfs-rs）
+    - 接缝：`read_directory` 带起点 cookie；`NfsListingPages::first_sight(fileid, 名字)`（读者看一项之前问，已取的跳过，
+      含 v3 `.snapshot` 的 LOOKUP）、`reached(next)`（整个回复取完、目录未完时报位置；同一次读取里重复 → `NfsReadEnd::Repeated`）；
+      `NfsRestart::FromStart`（`is_bad_directory_cookie`：`NFS3ERR_BAD_COOKIE` / `NFS4ERR_BAD_COOKIE` / `NFS4ERR_NOT_SAME`；
+      `NFS3ERR_NOT_SYNC` 不是 READDIRPLUS 的状态，nfs-rs 也不算，不收）
+    - 读者：一页一页 `readdirplus_page`，页之间看 `stopping()`，不放弃在途请求（v4.1 slot）；EOF 先于 `reached` 判断
+    - 生产者：首页前照旧（从头、丢弃已攒、原预算）；首页后同一分类 / 预算重试，从最后一个完整回复之后的 cookie 续
+      （解析出的句柄变了 → 从头）；`(fileid, 名字)` 带密钥 64 位摘要去重（不用名字：nfs-rs 有损解码，两个名字可能同一串），
+      上限 2^18 项（约 4.5 MiB / 列举；超了首页后不再续）；cookie 循环只在一次读取内判（不认 cookie、从头重发整目录的服务器
+      靠去重读完，不当循环）；续读的 cookie 被答以空的目录末尾（ONTAP、DXN-2 答不认识的 cookie 的方式）或被拒 → 从头读并去重，
+      至多 3 次；每取到新子项续满重试预算（HDFS C8 同一规则）；重试用尽的结局与之前首页后相同（可重发的传输失败只让该列举
+      `Interrupted`，其余照原作用域）
+    - 与需求原文的差别（理由见提交说明）：cookie 被拒 / 空末页不直接 `Interrupted`，而是从头读 + 去重（结果与续读同样完整）；
+      cookie 重复按“一次读取之内”判
+    - 真机（2026-09-27，10.131.9.10，release）：ONTAP v3 / v4.0 / v4.1、DXN-2 v3 / v4.0 各一棵 5 万文件平铺目录 + 嵌套小树
+      （50,009 / 50,002 条）：与 base（`292a0e8`）逐行相同（含顺序）、0 重复；RSS 17.9–19.2 → 18.0–20.3 MB（+0.1–1.1 MB，
+      即 5 万项的摘要集合），耗时不变。故障：`ss -K` 在列举中途三次掐断 NFS 连接 —— v4.1 浮出 `Retry`、三次续读；v3 / v4.0
+      （两台服务器）由 nfs-rs 自己重连重发，列举看不到失败；五种都读完、与 base 相同、0 重复。另用不提交的测试构建（环境变量
+      开启：每次读取第 60 个回复起每 10 个回复取一半后注入 `ConnectionReset`）：每种 17–31 次首页后续读，被截断的回复从其 cookie
+      重发、前一半跳过，五种都读完、与 base 逐行相同（排序后）、0 重复、`interrupted=0`。附带观察：这些服务器上 nfs-rs 的
+      READDIRPLUS 回复只有约 40–60 项，1024 项的首页要 20 多个回复；首页之前仍是 C7 的规则（从头、不续满预算），注入过密
+      （每 7 个回复）时首页前重发用尽、照旧升会话
 P1–P5  S3 URL 参数化（§14.2）—— F5 合入后，可与 C7 并行
        —— 已完成：P1 `2fe52f1`、P2 `71fb411`、P3 `52710c7`（+ refactor `cc65fec` 移出 tls.rs）、
        P4 `db7fbb9`、P5 `4718183`（调用方与文档）；真机见 §14.2 实施记录
@@ -917,7 +939,7 @@ C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 
 C12 docs: docs/architecture/storage-transfer-architecture.md §5/§6；.claude/docs/{architecture,error-taxonomy,storage-*}.md；ADR-0008
 （terrasync 侧，另起：不丢批、分钟级退避、检查点落库顺序、消费者退出即失败、统计以库为准、全量扫描 generation 闸门、
   身份键只对 StableWithinBackend 关联、多版本每项展开成每版本一行）
-（可选）chore(deps): nfs-rs 公开 READDIRPLUS 页接口并升级（Q18）
+（可选）chore(deps): nfs-rs 公开 READDIRPLUS 页接口并升级（Q18）—— 已完成：nfs-rs 0.8.5 `68ae002`，用法见 C7c
 
 CREATE
 ======
@@ -1231,7 +1253,7 @@ N6 `d51af50`、N7 `ce49448`、F5h `7260974`；细节见 `.claude/docs/storage-s3
 
 | 编号 | 决定 | 见 |
 |---|---|---|
-| Q18 | 改 nfs-rs 上游公开 READDIRPLUS 页接口（cookie + verifier），单独的 `chore(deps)` commit | §5.2 |
+| Q18 | 改 nfs-rs 上游公开 READDIRPLUS 页接口（cookie + verifier），单独的 `chore(deps)` commit —— **已完成**：nfs-rs 0.8.5 `68ae002`，列举续读 C7c（§14） | §5.2 |
 | Q19 | 先做 C0，并在 node1 上补测 `8a1348b` 之后的 CPU / RSS 基线（含 `MALLOC_ARENA_MAX=2` 与驻留探针），再做破坏性重构 | §12 |
 | Q20 | 验收：Unordered 与 legacy 基本持平（wall ≤ 1.05×、CPU ≤ 1.15×、RSS ≤ 30 MB），Blocks 不能差太多（wall ≤ 1.15×、CPU ≤ 1.4×、RSS ≤ 100 MB）；达不到按 O1–O6 优化 | §12.6 |
 | Q21 | 写 ADR-0008：两种扫描方式、事件模型、续扫、每 key 历史 | §14 |
@@ -1258,7 +1280,7 @@ N6 `d51af50`、N7 `ce49448`、F5h `7260974`；细节见 `.claude/docs/storage-s3
 | `versions: Current \| All` 参数 | 用户定为不需要：多版本桶一律列出全部历史 |
 | 精确续扫（刀后恰好重发、epoch 列、续扫时 DELETE、有效性谓词、幂等写令牌） | 用户确认续扫不需要精确；重复由库去重吸收，只需保证进度不领先于落库 |
 | 临时表改 `ReplacingMergeTree` | 每批一张新临时表 + 并入 base 已吸收跨批重复 |
-| 续扫用协议位置（NFS cookie、S3 token、`StartAfter`） | 不能跨会话 / 进程可靠复用；`StartAfter` 依赖顺序 |
+| 续扫用协议位置（NFS cookie、S3 token、`StartAfter`） | 不能跨会话 / 进程可靠复用；`StartAfter` 依赖顺序（C7c 的 cookie 续读只在一个进程的一次列举之内，不进检查点） |
 | M1：每页一个 future、游标在驱动里停车 | CIFS 句柄在 detach 后无法 await close，会泄漏 |
 | Namespace 加带默认实现的 `list_pages`，保留 `execute(List)` | 为兼容而设；两条列举路径会漂移 |
 | 在遍历里做大小写折叠排序 | 折叠表各家不同（NTFS $UpCase、ONTAP、Samba），贵且易错 |

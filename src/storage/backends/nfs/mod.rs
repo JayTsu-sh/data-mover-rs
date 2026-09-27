@@ -6,6 +6,7 @@ pub(crate) mod common;
 mod listing;
 #[cfg(test)]
 pub(crate) mod listing_fake;
+mod listing_resume;
 #[allow(dead_code)]
 pub(crate) mod metadata;
 #[allow(dead_code)]

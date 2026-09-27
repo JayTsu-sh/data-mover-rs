@@ -16,16 +16,23 @@
 //! handle: before P7 C7 it put every listed subdirectory's handle into the process-wide handle
 //! cache, which held about 625 B per directory of a whole tree (§12.7).
 //!
-//! **Failures.** Until the first page is handed over, a failure the protocol says a fresh read
-//! could cure is retried from the directory's start, so no child is handed over twice: a handle
-//! that no longer holds is resolved again (at most [`MAX_RELOOKUPS`] times after the hint), a busy
-//! server is backed off within the listing's throttle budget, a transport failure nfs-rs certifies
-//! safe to resend is read anew after [`RESEND_DELAYS`]. What no retry cured keeps its scope (a
-//! connectivity failure ends the session). After the first page nothing is retried —
-//! READDIRPLUS could only be continued from its cookie, which nfs-rs does not expose (Q18) — so
-//! the children read so far are handed over and the listing ends with the failure, which the
-//! traversal records as `Interrupted`; a transport failure safe to resend is then this listing's
-//! alone: nfs-rs certified resending it on the session it has.
+//! **Failures.** A failure the protocol says a fresh read could cure is retried: a handle that no
+//! longer holds is resolved again (at most [`MAX_RELOOKUPS`] times after the hint), a busy server
+//! is backed off within the listing's throttle budget, a transport failure nfs-rs certifies safe
+//! to resend is read anew after [`RESEND_DELAYS`], a rejected cookie is read from the start (at
+//! most [`MAX_FROM_START`] times). Until the first page is handed over the retry reads the
+//! directory from its start and drops what the failed read had gathered, so no child is handed
+//! over twice. After it (P7 C7c, Q18) the retry continues from the cookie after the last reply
+//! taken whole, with the same handle (from the start with another: a cookie means nothing on
+//! another handle), and skips every entry the listing already took ([`super::listing_resume`]);
+//! a server whose cookies loop within one read ends the listing (`Protocol` / Permanent), and one
+//! that answers a continued cookie with an empty end of directory — as servers answer a cookie
+//! they do not know — has the directory read from its start. Every entry newly taken refills the
+//! retries. What no retry cured keeps its scope (a connectivity failure ends the session); after
+//! the first page the children read so far are handed over first and the traversal records
+//! `Interrupted`, and a transport failure safe to resend is then this listing's alone: nfs-rs
+//! certified resending it on the session it has. A listing that no longer remembers what it took
+//! ([`super::listing_resume::MAX_REMEMBERED`]) does not retry after its first page.
 
 use std::mem;
 use std::sync::Arc;
@@ -33,8 +40,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use nfs_rs::DirectoryCookie;
 use tokio::time::sleep;
+use tracing::info;
 
+use super::listing_resume::{Anomaly, Position, Taken};
 use super::namespace::{
     HINT_TAG_LEN, NfsListedChild, NfsListingPages, NfsNamespaceAdapter, NfsNamespaceProtocol,
     NfsReadEnd, NfsReadFailure, NfsRestart, NfsUndescribedChild, checked_allow_root, descriptor,
@@ -49,18 +59,23 @@ use crate::storage::{ChildFailure, DescentHint, ListRequest, ListingPage, Storag
 /// How a listing's failure is scoped: [`role_failure`] or [`entry_scoped`].
 type Scope = fn(&StoragePath, Operation, NfsProtocolFailure) -> StorageRoleFailure;
 
-/// How often a listing that has handed nothing over yet resolves its path again after the handle
-/// it read went stale — the retries `lookup_fh` callers have always had (`MAX_STALE_RETRIES`).
+/// How often a listing resolves its path again after the handle it read went stale, between two
+/// entries it newly takes — the retries `lookup_fh` callers have always had (`MAX_STALE_RETRIES`).
 pub(super) const MAX_RELOOKUPS: u8 = 3;
 
-/// The pauses before a listing that has handed nothing over yet reads its directory again after a
-/// transport failure nfs-rs certifies safe to resend — what the S3 listing waits before resending
-/// a page (P7 C6).
+/// The pauses before a listing reads its directory again after a transport failure nfs-rs
+/// certifies safe to resend, between two entries it newly takes — what the S3 listing waits before
+/// resending a page (P7 C6).
 pub(super) const RESEND_DELAYS: [Duration; 3] = [
     Duration::from_millis(250),
     Duration::from_secs(1),
     Duration::from_secs(2),
 ];
+
+/// How often a listing reads its directory from the start after the server rejected its cookie
+/// (or answered a continued one with an empty end of directory), between two entries it newly
+/// takes.
+pub(super) const MAX_FROM_START: u8 = 3;
 
 /// Produces the listing of `request.path` into `sink`.
 pub(super) async fn produce(namespace: NfsNamespaceAdapter, request: ListRequest, sink: PageSink) {
@@ -76,11 +91,7 @@ pub(super) async fn produce(namespace: NfsNamespaceAdapter, request: ListRequest
         .as_ref()
         .and_then(|hint| hinted_handle(&namespace, hint))
         .map(|handle| (handle, true));
-    let mut restarts = Restarts {
-        relookups: 0,
-        resends: 0,
-        backoff: ThrottleBackoff::LISTING.start(),
-    };
+    let mut restarts = Restarts::new();
     loop {
         if pages.stopping() {
             return pages.stop().await;
@@ -90,27 +101,35 @@ pub(super) async fn produce(namespace: NfsNamespaceAdapter, request: ListRequest
                 Ok(handle) => handle,
                 Err(failure) => return pages.fail(failure, role_failure).await,
             };
-        let read = protocol.read_directory(path, current.clone(), &mut pages);
+        let from = pages.position.begin(&current);
+        let read = protocol.read_directory(path, current.clone(), from, &mut pages);
         let failure = match read.await {
+            Ok(NfsReadEnd::Complete) if pages.position.ended_at_once() => {
+                anomaly(Anomaly::EmptyAfterCookie, NfsRestart::FromStart)
+            }
             Ok(NfsReadEnd::Complete) => return pages.finish().await,
             Ok(NfsReadEnd::Stopped) => return pages.stop().await,
+            Ok(NfsReadEnd::Repeated) => anomaly(Anomaly::RepeatedCookie, NfsRestart::Never),
             Err(failure) => failure,
         };
         match restarts
-            .after(failure, hinted, protocol.as_ref(), &pages)
+            .after(failure, hinted, protocol.as_ref(), &mut pages)
             .await
         {
-            // Nothing has been handed over: reading the directory again from its start repeats
-            // no child. What this attempt had read is dropped.
-            Next::Reread => {
-                pages.discard();
-                handle = Some((current, hinted));
-            }
-            Next::Resolve => pages.discard(),
+            Next::Reread => handle = Some((current, hinted)),
+            Next::Resolve => {}
             Next::Fail(failure) => return pages.fail(failure, role_failure).await,
             Next::Interrupt(failure) => return pages.fail(failure, entry_scoped).await,
             Next::Stop => return pages.stop().await,
         }
+    }
+}
+
+/// A read the listing does not trust: `Protocol` / Permanent (P7 §8), naming what was wrong.
+fn anomaly(what: Anomaly, restart: NfsRestart) -> NfsReadFailure {
+    NfsReadFailure {
+        failure: NfsProtocolFailure::protocol().with_status(what),
+        restart,
     }
 }
 
@@ -154,11 +173,12 @@ async fn known_or_resolved(
     }
 }
 
-/// What a listing does after a failed read.
+/// What a listing does after a failed read. [`Restarts::after`] has already set where the next
+/// read starts ([`Pages::position`]).
 enum Next {
-    /// Read the directory again from its start, with the same handle.
+    /// Read the directory again, with the same handle.
     Reread,
-    /// Resolve the directory's path, then read it again from its start.
+    /// Resolve the directory's path, then read it again.
     Resolve,
     /// End with this failure.
     Fail(NfsProtocolFailure),
@@ -173,25 +193,68 @@ enum Next {
 struct Restarts {
     relookups: u8,
     resends: usize,
+    from_start: u8,
     backoff: ThrottleBudget,
 }
 
 impl Restarts {
-    /// Whether to read the directory again after `failure`: only while no page has been handed
-    /// over, and only for what a fresh read can cure.
+    fn new() -> Self {
+        Self {
+            relookups: 0,
+            resends: 0,
+            from_start: 0,
+            backoff: ThrottleBackoff::LISTING.start(),
+        }
+    }
+
+    /// Whether to read the directory again after `failure`, and from where: only for what a
+    /// fresh read can cure, and after the first page only while the listing remembers what it
+    /// took. An entry newly taken since the last failure refills the retries (the throttle
+    /// budget only restarts its doubling: its total stays the listing's).
     async fn after(
         &mut self,
         failure: NfsReadFailure,
         hinted: bool,
         protocol: &dyn NfsNamespaceProtocol,
-        pages: &Pages<'_>,
+        pages: &mut Pages<'_>,
     ) -> Next {
-        if pages.handed_over > 0 {
-            return match failure.restart {
-                NfsRestart::Resend => Next::Interrupt(failure.failure),
-                _ => Next::Fail(failure.failure),
-            };
+        let continuing = pages.handed_over > 0;
+        if continuing && pages.taken.progressed() {
+            self.relookups = 0;
+            self.resends = 0;
+            self.from_start = 0;
+            self.backoff.succeeded();
         }
+        if continuing && !pages.taken.remembers() {
+            return exhausted(failure, pages);
+        }
+        let restart = failure.restart;
+        let next = self.retry(failure, hinted, protocol, pages).await;
+        if matches!(next, Next::Reread | Next::Resolve) {
+            if continuing {
+                info!(
+                    path = pages.request.path.as_str(),
+                    ?restart,
+                    handed_over = pages.handed_over,
+                    "NFS listing reads on after a failure past its first page"
+                );
+            } else {
+                // Nothing has been handed over: reading the directory again from its start
+                // repeats no child. What this attempt had read is dropped.
+                pages.restart();
+            }
+        }
+        next
+    }
+
+    /// [`Self::after`] for a failure the listing may retry.
+    async fn retry(
+        &mut self,
+        failure: NfsReadFailure,
+        hinted: bool,
+        protocol: &dyn NfsNamespaceProtocol,
+        pages: &mut Pages<'_>,
+    ) -> Next {
         match failure.restart {
             // The hint went stale: resolve the path, which costs what a listing without a hint
             // always costs.
@@ -204,28 +267,36 @@ impl Restarts {
                 }
             }
             NfsRestart::Backoff => match self.backoff.next_delay() {
-                Some(delay) => {
-                    if pages.wait(delay).await {
-                        Next::Reread
-                    } else {
-                        Next::Stop
-                    }
-                }
-                None => Next::Fail(failure.failure),
+                Some(delay) => pages.reread_after(delay).await,
+                None => exhausted(failure, pages),
             },
             NfsRestart::Resend => match RESEND_DELAYS.get(self.resends) {
                 Some(delay) => {
                     self.resends += 1;
-                    if pages.wait(*delay).await {
-                        Next::Reread
-                    } else {
-                        Next::Stop
-                    }
+                    pages.reread_after(*delay).await
                 }
-                None => Next::Fail(failure.failure),
+                None => exhausted(failure, pages),
             },
-            NfsRestart::Relookup | NfsRestart::Never => Next::Fail(failure.failure),
+            NfsRestart::FromStart if self.from_start < MAX_FROM_START => {
+                self.from_start += 1;
+                pages.position.rewind();
+                Next::Reread
+            }
+            NfsRestart::Relookup | NfsRestart::FromStart | NfsRestart::Never => {
+                exhausted(failure, pages)
+            }
         }
+    }
+}
+
+/// How a listing ends with `failure` when it does not read again: with it, its scope kept —
+/// except a transport failure safe to resend once a page is out, which is this listing's alone
+/// (nfs-rs certified resending it on the session it has).
+fn exhausted(failure: NfsReadFailure, pages: &Pages<'_>) -> Next {
+    if pages.handed_over > 0 && failure.restart == NfsRestart::Resend {
+        Next::Interrupt(failure.failure)
+    } else {
+        Next::Fail(failure.failure)
     }
 }
 
@@ -240,6 +311,10 @@ struct Pages<'a> {
     /// directory) do not count against the hint.
     held: usize,
     handed_over: usize,
+    /// Where the next read starts.
+    position: Position,
+    /// What the listing took, so a read that continues from a cookie hands nothing over twice.
+    taken: Taken,
 }
 
 impl<'a> Pages<'a> {
@@ -255,12 +330,18 @@ impl<'a> Pages<'a> {
             page: ListingPage::default(),
             held: 0,
             handed_over: 0,
+            position: Position::default(),
+            taken: Taken::new(),
         }
     }
 
-    fn discard(&mut self) {
+    /// Nothing was handed over: the next read starts from the directory's start, and what the
+    /// failed one gathered is dropped.
+    fn restart(&mut self) {
         self.page = ListingPage::default();
         self.held = 0;
+        self.position.rewind();
+        self.taken = Taken::new();
     }
 
     fn has_content(&self) -> bool {
@@ -295,13 +376,14 @@ impl<'a> Pages<'a> {
         }
     }
 
-    /// Sleeps `delay`, or less when the listing is cancelled or dropped meanwhile (`false`).
-    async fn wait(&self, delay: Duration) -> bool {
+    /// Sleeps `delay`, then reads again — or stops at once when the listing is cancelled or
+    /// dropped meanwhile.
+    async fn reread_after(&self, delay: Duration) -> Next {
         tokio::select! {
             biased;
-            () = self.request.cancel.cancelled() => false,
-            () = self.sink.closed() => false,
-            () = sleep(delay) => true,
+            () = self.request.cancel.cancelled() => Next::Stop,
+            () = self.sink.closed() => Next::Stop,
+            () = sleep(delay) => Next::Reread,
         }
     }
 
@@ -351,11 +433,13 @@ impl<'a> Pages<'a> {
 #[async_trait]
 impl NfsListingPages for Pages<'_> {
     fn push(&mut self, child: NfsListedChild) -> bool {
+        self.taken.take();
         self.add(child);
         self.held >= self.request.page_hint.get()
     }
 
     fn hide(&mut self) {
+        self.taken.take();
         self.page.internal_hidden = self.page.internal_hidden.saturating_add(1);
     }
 
@@ -375,6 +459,15 @@ impl NfsListingPages for Pages<'_> {
 
     fn stopping(&self) -> bool {
         self.request.cancel.is_cancelled() || self.sink.is_closed()
+    }
+
+    fn first_sight(&mut self, fileid: u64, name: &str) -> bool {
+        self.position.sent();
+        self.taken.first_sight(fileid, name)
+    }
+
+    fn reached(&mut self, next: DirectoryCookie) -> bool {
+        self.position.reach(next)
     }
 }
 

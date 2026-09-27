@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use nfs_rs::DirectoryCookie;
 
 use super::source::{NfsProtocolFailure, role_failure};
 use crate::model::{
@@ -120,11 +121,14 @@ pub(crate) enum NfsReadEnd {
     Complete,
     /// [`NfsListingPages`] asked to stop: the listing was cancelled, or its consumer is gone.
     Stopped,
+    /// The server handed back a directory cookie this read had already reached
+    /// ([`NfsListingPages::reached`]): reading on would loop (P7 §8).
+    Repeated,
 }
 
-/// What reading the directory again from its start could do about a failed READDIRPLUS read,
-/// while no page of it has been handed over yet (P7 §5.2: after the first page it can only be
-/// continued from its cookie, which nfs-rs does not expose, Q18).
+/// What reading the directory again could do about a failed READDIRPLUS read: from its start
+/// while no page of it has been handed over, from the last cookie it reached after that (P7 §5.2,
+/// Q18, C7c).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NfsRestart {
     /// Nothing: the failure stands.
@@ -138,9 +142,14 @@ pub(crate) enum NfsRestart {
     Backoff,
     /// The request got no answer and nfs-rs certifies sending it again safe on the session it has
     /// (`RecoveryAction::Retry`; or a bare connection reset or timeout) — unlike `Remount`, no
-    /// new session is needed. Pause briefly, then read anew; once a page is out, only this
-    /// listing fails.
+    /// new session is needed. Pause briefly, then read anew; when the pauses run out after a page
+    /// is out, only this listing fails.
     Resend,
+    /// The server rejected the directory cookie or its verifier (`NFS3ERR_BAD_COOKIE`,
+    /// `NFS4ERR_BAD_COOKIE`, `NFS4ERR_NOT_SAME`: nfs-rs `is_bad_directory_cookie`): only a read
+    /// from the directory's start can go on; once children are out, the listing skips those it
+    /// already took.
+    FromStart,
 }
 
 /// A failed READDIRPLUS read of one directory.
@@ -164,6 +173,16 @@ pub(crate) trait NfsListingPages: Send {
     async fn hand_over(&mut self) -> bool;
     /// Whether the listing is over, so the reader must not ask the server for more.
     fn stopping(&self) -> bool;
+    /// Whether to take the entry the server sent as `fileid` / `name`, asked before the reader
+    /// looks at it (the `NFSv3` `.snapshot` LOOKUP included): `false` for an entry this listing
+    /// already took — after it continued from a cookie the server may send part of a reply again,
+    /// or the whole directory — which the reader then skips. The entry counts as taken once it is
+    /// pushed or hidden.
+    fn first_sight(&mut self, fileid: u64, name: &str) -> bool;
+    /// Every entry of the server's reply up to `next` has been taken and the directory goes on:
+    /// a later read continues from `next`. `false` when this read already reached `next`, so the
+    /// server's cookies loop: the reader ends with [`NfsReadEnd::Repeated`].
+    fn reached(&mut self, next: DirectoryCookie) -> bool;
 }
 
 #[async_trait]
@@ -175,8 +194,10 @@ pub(crate) trait NfsNamespaceProtocol: Send + Sync {
     /// when it has no descent hint, or its hint no longer names the directory.
     async fn directory_handle(&self, path: &StoragePath) -> Result<Bytes, NfsProtocolFailure>;
     /// Reads the directory whose handle is `handle` and whose path is `path` with READDIRPLUS,
-    /// from its start, handing every child to `pages` as the server sends it, and returns once
-    /// the server says end of directory or `pages` says to stop. It checks
+    /// from the position `from` ([`DirectoryCookie::default`] is its start), handing every child
+    /// to `pages` as the server sends it and every position it passes to
+    /// [`NfsListingPages::reached`], and returns once the server says end of directory or
+    /// `pages` says to stop. It checks
     /// [`NfsListingPages::stopping`] before every child, so a stopped listing sends no further
     /// READDIRPLUS request (a child already taken may still cost the LOOKUP / GETATTR of an
     /// `NFSv3` `.snapshot`, P7 C7b), but it never abandons a request in flight (an NFSv4.1 session fences the slot
@@ -186,6 +207,7 @@ pub(crate) trait NfsNamespaceProtocol: Send + Sync {
         &self,
         path: &StoragePath,
         handle: Bytes,
+        from: DirectoryCookie,
         pages: &mut dyn NfsListingPages,
     ) -> Result<NfsReadEnd, NfsReadFailure>;
     /// Forgets what is cached about reaching `path` (and refreshes the root handle when it has
@@ -433,6 +455,7 @@ mod tests {
             &self,
             _path: &StoragePath,
             _handle: Bytes,
+            _from: DirectoryCookie,
             pages: &mut dyn NfsListingPages,
         ) -> Result<NfsReadEnd, NfsReadFailure> {
             for child in self.0.map(|children| children()).unwrap_or_default() {

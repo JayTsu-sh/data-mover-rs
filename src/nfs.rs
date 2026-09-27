@@ -15,7 +15,10 @@ use futures::stream::FuturesOrdered;
 use moka::sync::Cache;
 // nfs_rs 错误类型，用于直接匹配 error code
 use nfs_rs::NfsError;
-use nfs_rs::{Attr, ExportEntry, Mount, NFSVersion, OPEN_READ, OPEN_WRITE, Time, WriteOutcome};
+use nfs_rs::{
+    Attr, DirectoryCookie, ExportEntry, Mount, NFSVersion, OPEN_READ, OPEN_WRITE, Time,
+    WriteOutcome,
+};
 use path_clean::PathClean;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -651,9 +654,10 @@ impl NfsNamespaceProtocol for NFSStorage {
         &self,
         path: &crate::model::StoragePath,
         handle: Bytes,
+        from: DirectoryCookie,
         pages: &mut dyn NfsListingPages,
     ) -> std::result::Result<NfsReadEnd, NfsReadFailure> {
-        self.read_role_directory(path, handle, pages).await
+        self.read_role_directory(path, handle, from, pages).await
     }
 
     async fn forget_directory(

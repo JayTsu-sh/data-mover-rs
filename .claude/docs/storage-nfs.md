@@ -143,8 +143,28 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
     rmdir / rename 的失效）照旧用它。
   - **重试**：首页交出之前可从目录开头重读（不会重复交出）—— 句柄失效 → 解析路径（提示失效时一次，之后忘掉缓存再解析
     至多 3 次）；`DELAY` / `JUKEBOX` / `GRACE`（`GRACE` C7 起分类为 `Throttled`）→ 列举的节流预算内退避；nfs-rs 认证可安全重发的传输失败 → 250 ms / 1 s / 2 s。
-    首页之后不重试（READDIRPLUS 只能从 cookie 续，nfs-rs 0.8.4 不公开页接口，Q18）：已读到的先交出，再以失败结束，
-    遍历记 `Interrupted`；可安全重发的传输失败此时只让该列举失败。错误直接经 `classify_error`，保留服务端状态名。
+    错误直接经 `classify_error`，保留服务端状态名。
+  - **首页之后按 cookie 续读（P7 C7c，nfs-rs 0.8.5 `Mount::readdirplus_page`）**：读者一页一页地从列举持有的
+    `DirectoryCookie`（cookie + verifier）读，整个回复取完且目录未完才把 `next` 报给列举（`reached`）。首页之后的失败按上面
+    同样的分类 / 预算重试，从最后一个完整取完的回复之后续读；句柄解析后变了则从目录开头读（cookie 在别的句柄上无意义）。
+    - 去重：列举记住已取子项 `(fileid, 名字)` 的带密钥 64 位摘要（`listing_resume.rs`），读者看每一项之前先问
+      `first_sight`（在 `.snapshot` 的 LOOKUP 之前），已取的跳过；只有 push / hide 之后才算取过（看到一半读取失败的那项续读后
+      还会再看）。不用名字本身：nfs-rs 把非 UTF-8 名字有损解码，两个不同名字可能成同一串。上限 2^18 项（每列举约 4.5 MiB）；
+      超过就不再记，首页后的失败照 C7 结局（`Interrupted`）。
+    - cookie 循环：同一次读取里 `next` 重复 → `NfsReadEnd::Repeated` → 该列举 `Protocol` / Permanent（先交出已读到的）。
+      只在一次读取内判：不认 cookie、续读时从头重发整个目录的服务器（去重吸收）能读完。nfs-rs 自己拒绝“不前进的页”（`Xdr`，
+      `Protocol` / Unknown）。
+    - cookie 被拒（`is_bad_directory_cookie`：`NFS3ERR_BAD_COOKIE` / `NFS4ERR_BAD_COOKIE` / `NFS4ERR_NOT_SAME`，
+      `NfsRestart::FromStart`），或续读的 cookie 被答以空的目录末尾（ONTAP 与 DXN-2 答不认识的 cookie 就是这样；目录真在
+      回复边界结束时也会这样，代价是多读一遍）→ 从目录开头读、跳过已取的，至多 3 次。
+    - 真机事实（nfs-rs 0.8.5 CHANGELOG）：ONTAP（v3 / v4.0 / v4.1）拒绝乱写的 verifier（`BAD_COOKIE`）；DXN-2（v3 / v4.0）
+      接受乱写的 cookie 与 verifier —— 目录在两次读取之间变了时，续读可能静默漏掉或重复（重复由去重吸收；漏掉的属于
+      P7 Q12“变化中的目录”）。
+    - 每取到新子项，重试预算续满（节流预算只重置加倍，总量仍是该列举的）。重试用尽的结局与之前首页后相同：已读到的先交出，
+      遍历记 `Interrupted`；可安全重发的传输失败只让该列举失败。每次首页后的续读打一条 `info!`（相对路径、原因、已交出页数）。
+    - 真机（C7c）：ONTAP v3 / v4.0 / v4.1、DXN-2 v3 / v4.0 上 5 万文件目录与 base 逐行相同；`ss -K` 掐断连接时只有 v4.1 把
+      `Retry` 交给列举（续读），v3 / v4.0 由 nfs-rs 自己重连重发；注入式故障（首页后截断回复再报 `ConnectionReset`）下五种都
+      读完、0 重复。见 P7 设计 §14 C7c。
 - role `List`（`drain_readdirplus` → `role_listed_entry` / `role_observation`）里某项描述不出来 ——
   READDIRPLUS 没带属性（v3 `post_op_attr` 可省；v4 的 fattr4 解不出时 nfs-rs 也给 None）、没带文件句柄（v3
   `post_op_fh3` FALSE、v4 属性里没有 `FATTR4_FILEHANDLE`）——

@@ -1,9 +1,12 @@
-//! The NFS role listing streams and follows descent hints (P7 C7).
+//! The NFS role listing streams, follows descent hints (P7 C7) and continues a directory from its
+//! cookie after the first page (P7 C7c).
 //!
 //! Against [`FakeNfs`]: "read" counts children taken out of READDIRPLUS replies, "lookups" path
-//! resolutions. Fault injection (see the commit): a producer that reads the whole directory before
-//! its first page, keeps reading after its consumer is gone, restarts after its first page,
-//! ignores the hint, or does not fall back from a stale one turns these red.
+//! resolutions. Fault injection (see the commits): a producer that reads the whole directory
+//! before its first page, keeps reading after its consumer is gone, restarts after its first page,
+//! ignores the hint, or does not fall back from a stale one turns these red; so does one that does
+//! not continue after its first page, hands a child over again after continuing, follows cookies
+//! that loop, or continues from a cookie the server rejected.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -14,10 +17,10 @@ use futures::StreamExt as _;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use super::super::listing_fake::{FakeNfs, Fault, locked};
+use super::super::listing_fake::{Cookies, FakeNfs, Fault, locked};
 use super::super::namespace::{NfsReadFailure, NfsRestart};
 use super::super::source::NfsProtocolFailure;
-use super::{MAX_RELOOKUPS, descent_hint, hinted_handle};
+use super::{MAX_FROM_START, MAX_RELOOKUPS, descent_hint, hinted_handle};
 use crate::model::{EntryKind, FailureClass, StoragePath, Transience};
 use crate::storage::{
     CollectLimits, DescentHint, ListRequest, ListingPage, ListingStream, Namespace as _,
@@ -178,12 +181,13 @@ async fn cancelling_stops_reading_with_a_cancelled_signal() -> Result {
     Ok(())
 }
 
-/// A failure after the first page is not retried: the children read before it are handed over,
-/// then the failure, and nothing is read twice (the traversal records `Interrupted`).
+/// A failure after the first page that no retry can cure ends the listing: the children read
+/// before it are handed over, then the failure, and nothing is read twice (the traversal records
+/// `Interrupted`).
 #[tokio::test]
 async fn a_failure_after_the_first_page_ends_the_listing_after_what_was_read() -> Result {
     let fake = Arc::new(FakeNfs::new(REPLY).flat("d", FILES));
-    fake.fault(fault("d", 15, NfsRestart::Relookup, FailureClass::Protocol));
+    fake.fault(fault("d", 15, NfsRestart::Never, FailureClass::Protocol));
     let (pages, failure) = drain(listing(&fake, "d", CancellationToken::new())?).await;
     let sizes: Vec<usize> = pages.iter().map(|page| page.children.len()).collect();
     assert_eq!(sizes, [10, 5]);
@@ -464,19 +468,19 @@ async fn a_safe_transport_failure_is_resent_before_the_first_page_and_ends_only_
     );
 
     let later = Arc::new(FakeNfs::new(REPLY).flat("d", FILES));
-    later.fault(fault(
-        "d",
-        15,
-        NfsRestart::Resend,
-        FailureClass::Connectivity,
-    ));
+    let mut always = fault("d", 15, NfsRestart::Resend, FailureClass::Connectivity);
+    always.times = usize::MAX;
+    later.fault(always);
     let (pages, failure) = drain(listing(&later, "d", CancellationToken::new())?).await;
     assert_eq!(names(&pages).len(), 15);
     assert!(matches!(
         failure,
         Some(StorageRoleFailure::Entry(ref failure)) if failure.class() == FailureClass::Connectivity
     ));
-    assert_eq!(FakeNfs::count(&later.reads_started), 1);
+    assert_eq!(
+        FakeNfs::count(&later.reads_started),
+        super::RESEND_DELAYS.len() + 1
+    );
     Ok(())
 }
 
@@ -499,5 +503,181 @@ async fn rereading_after_a_pause_keeps_the_hinted_handle() -> Result {
     assert_eq!(listed.children.len(), 30);
     assert_eq!(FakeNfs::count(&fake.reads_started), 3);
     assert_eq!(FakeNfs::count(&fake.lookups), 0);
+    Ok(())
+}
+
+/// Every child name the listing handed over, sorted, and whether none came twice.
+fn listed_once(pages: &[ListingPage]) -> (Vec<String>, bool) {
+    let listed = names(pages);
+    let mut unique = listed.clone();
+    unique.sort();
+    unique.dedup();
+    let once = unique.len() == listed.len();
+    (unique, once)
+}
+
+/// All of `d`'s `FILES` children, sorted.
+fn all_files() -> Vec<String> {
+    (0..FILES).map(|index| format!("f{index:05}")).collect()
+}
+
+/// Drains the listing of `d` from `fake`, within a bound: a listing that loops fails the test
+/// instead of hanging it (the fake yields once per reply, so a loop does not starve the timer).
+async fn drained(fake: &Arc<FakeNfs>) -> Result<(Vec<ListingPage>, Option<StorageRoleFailure>)> {
+    let stream = listing(fake, "d", CancellationToken::new())?;
+    Ok(tokio::time::timeout(Duration::from_secs(30), drain(stream)).await?)
+}
+
+/// After the first page, a stale handle, a busy server and a transport failure safe to resend
+/// are retried as before it — but from the cookie after the last reply taken whole: the reply the
+/// failure cut short (children 50–59) comes again and is skipped, and every child is handed over
+/// exactly once.
+#[tokio::test(start_paused = true)]
+async fn after_the_first_page_a_read_continues_from_the_last_cookie() -> Result {
+    for (restart, class) in [
+        (NfsRestart::Relookup, FailureClass::Protocol),
+        (NfsRestart::Backoff, FailureClass::Throttled),
+        (NfsRestart::Resend, FailureClass::Connectivity),
+    ] {
+        let fake = Arc::new(FakeNfs::new(REPLY).flat("d", FILES));
+        fake.fault(fault("d", 60, restart, class));
+        let (pages, failure) = drained(&fake).await?;
+        assert!(failure.is_none(), "{restart:?}: {failure:?}");
+        assert_eq!(listed_once(&pages), (all_files(), true), "{restart:?}");
+        assert_eq!(locked(&fake.read_from).as_slice(), [0, 50], "{restart:?}");
+        assert_eq!(FakeNfs::count(&fake.read), FILES + 10, "{restart:?}");
+    }
+    Ok(())
+}
+
+/// A server that ignores the cookie and sends the directory from its start again: what the
+/// listing already took is skipped, the rest handed over once, and the listing completes.
+#[tokio::test(start_paused = true)]
+async fn a_server_that_restarts_on_a_cookie_hands_nothing_over_twice() -> Result {
+    let fake = Arc::new(
+        FakeNfs::new(REPLY)
+            .flat("d", FILES)
+            .cookies("d", Cookies::Restarts),
+    );
+    fake.fault(fault(
+        "d",
+        60,
+        NfsRestart::Resend,
+        FailureClass::Connectivity,
+    ));
+    let (pages, failure) = drained(&fake).await?;
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(listed_once(&pages), (all_files(), true));
+    assert_eq!(locked(&fake.read_from).as_slice(), [0, 50]);
+    assert_eq!(FakeNfs::count(&fake.read), FILES + 60);
+    Ok(())
+}
+
+/// A server that rejects the cookie (as ONTAP rejects a stale verifier), or answers it with an
+/// empty end of directory (as ONTAP and DXN-2 answer a cookie they do not know): the directory is
+/// read again from its start, what was taken skipped, and every child handed over once.
+#[tokio::test(start_paused = true)]
+async fn a_rejected_or_forgotten_cookie_reads_the_directory_from_its_start() -> Result {
+    for cookies in [Cookies::Rejects, Cookies::Forgets] {
+        let fake = Arc::new(FakeNfs::new(REPLY).flat("d", FILES).cookies("d", cookies));
+        fake.fault(fault(
+            "d",
+            60,
+            NfsRestart::Resend,
+            FailureClass::Connectivity,
+        ));
+        let (pages, failure) = drained(&fake).await?;
+        assert!(failure.is_none(), "{cookies:?}: {failure:?}");
+        assert_eq!(listed_once(&pages), (all_files(), true), "{cookies:?}");
+        assert_eq!(
+            locked(&fake.read_from).as_slice(),
+            [0, 50, 0],
+            "{cookies:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Reading from the start after a rejected cookie is bounded: a directory that keeps rejecting
+/// without handing over anything new ends after `MAX_FROM_START` such reads, after what was read.
+#[tokio::test]
+async fn reading_from_the_start_again_is_bounded() -> Result {
+    let fake = Arc::new(FakeNfs::new(REPLY).flat("d", FILES));
+    let mut always = fault("d", 60, NfsRestart::FromStart, FailureClass::Protocol);
+    always.times = usize::MAX;
+    fake.fault(always);
+    let (pages, failure) = drained(&fake).await?;
+    assert_eq!(listed_once(&pages).0.len(), 60);
+    assert!(listed_once(&pages).1);
+    assert!(matches!(
+        failure,
+        Some(StorageRoleFailure::Entry(ref failure)) if failure.class() == FailureClass::Protocol
+    ));
+    assert_eq!(
+        FakeNfs::count(&fake.reads_started),
+        usize::from(MAX_FROM_START) + 1
+    );
+    Ok(())
+}
+
+/// Cookies that loop within one read end the listing (`Protocol` / Permanent, P7 §8) after what
+/// was read, instead of reading forever.
+#[tokio::test]
+async fn looping_cookies_end_the_listing() -> Result {
+    let fake = Arc::new(
+        FakeNfs::new(REPLY)
+            .flat("d", FILES)
+            .cookies("d", Cookies::Loops),
+    );
+    let (pages, failure) = drained(&fake).await?;
+    assert_eq!(listed_once(&pages).0.len(), 2 * REPLY);
+    assert!(matches!(
+        failure,
+        Some(StorageRoleFailure::Entry(ref failure))
+            if failure.class() == FailureClass::Protocol
+                && failure.transience() == Transience::Permanent
+                && failure.path() == &path("d")
+    ));
+    assert_eq!(FakeNfs::count(&fake.reads_started), 1);
+    Ok(())
+}
+
+/// A cookie means nothing on another handle: when the directory's path resolves to a new handle
+/// after the first page, the directory is read from its start (what was taken skipped).
+#[tokio::test]
+async fn a_new_handle_after_the_first_page_reads_from_the_start() -> Result {
+    let fake = Arc::new(FakeNfs::new(REPLY).flat("d", FILES));
+    fake.fault(fault("d", 60, NfsRestart::Relookup, FailureClass::Protocol));
+    let mut stream = listing(&fake, "d", CancellationToken::new())?;
+    let first = next_page(&mut stream).await?;
+    assert!(settled(&fake).await < 60, "read up to the fault already");
+    fake.replace("d");
+    let (rest, failure) = drain(stream).await;
+    assert!(failure.is_none(), "{failure:?}");
+    let mut pages = vec![first];
+    pages.extend(rest);
+    assert_eq!(listed_once(&pages), (all_files(), true));
+    assert_eq!(locked(&fake.read_from).as_slice(), [0, 0]);
+    assert_eq!(FakeNfs::count(&fake.lookups), 2);
+    Ok(())
+}
+
+/// Every child newly handed over refills the retries: more transport failures in one listing
+/// than `RESEND_DELAYS` allows, each after progress, still complete it.
+#[tokio::test(start_paused = true)]
+async fn progress_refills_the_retries() -> Result {
+    let fake = Arc::new(FakeNfs::new(REPLY).flat("d", FILES));
+    for after in [60, 200, 400, 600, 800] {
+        fake.fault(fault(
+            "d",
+            after,
+            NfsRestart::Resend,
+            FailureClass::Connectivity,
+        ));
+    }
+    let (pages, failure) = drained(&fake).await?;
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(listed_once(&pages), (all_files(), true));
+    assert_eq!(FakeNfs::count(&fake.reads_started), 6);
     Ok(())
 }

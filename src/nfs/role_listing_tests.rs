@@ -178,7 +178,8 @@ fn directory() -> StoragePath {
     StoragePath::new("dir").unwrap_or_else(|error| panic!("{error}"))
 }
 
-/// Pages of two children; `stop_after` makes the listing stop once that many were pushed.
+/// Pages of two children; `stop_after` makes the listing stop once that many were pushed, and
+/// entries named in `taken` count as already taken.
 #[derive(Default)]
 struct Collected {
     children: Vec<NfsListedChild>,
@@ -186,6 +187,7 @@ struct Collected {
     hand_overs: usize,
     hidden: usize,
     stop_after: Option<usize>,
+    taken: Vec<&'static str>,
 }
 
 #[async_trait::async_trait]
@@ -210,6 +212,37 @@ impl NfsListingPages for Collected {
         self.stop_after
             .is_some_and(|limit| self.children.len() >= limit)
     }
+
+    fn first_sight(&mut self, _fileid: u64, name: &str) -> bool {
+        !self.taken.contains(&name)
+    }
+
+    fn reached(&mut self, _next: DirectoryCookie) -> bool {
+        true
+    }
+}
+
+/// An entry the listing already took (it continued from a cookie and the server sent it again)
+/// is skipped before it is looked at: not handed over, not hidden, and a `.snapshot` without
+/// attributes is not looked up again.
+#[tokio::test]
+async fn an_entry_already_taken_is_skipped_before_it_is_looked_at() {
+    let mut pages = Collected {
+        taken: vec!["a", ".snapshot"],
+        ..Collected::default()
+    };
+    let entries = stream::iter(siblings_around(ontap_snapshot()).into_iter().map(Ok));
+    let end = drain_readdirplus(
+        &directory(),
+        entries,
+        &mut pages,
+        NFSVersion::NFSv3,
+        &NoLookup,
+    )
+    .await;
+    assert!(matches!(end, Ok(NfsReadEnd::Complete)));
+    assert_eq!(outcome(&pages.children), (vec!["dir/b"], vec![]));
+    assert_eq!(pages.hidden, 0);
 }
 
 /// Reading a directory puts no handle into the process-wide cache — not the listed
@@ -672,11 +705,6 @@ fn read_failure_cases() -> Vec<(NfsError, NfsRestart, FailureClass)> {
             FailureClass::PermissionDenied,
         ),
         (
-            NfsError::Nfs3(V3::NFS3ERR_BAD_COOKIE),
-            NfsRestart::Never,
-            FailureClass::Protocol,
-        ),
-        (
             wrapped(nfs_rs::RecoveryAction::Retry, timeout()),
             NfsRestart::Resend,
             FailureClass::Connectivity,
@@ -710,13 +738,52 @@ fn read_failure_cases() -> Vec<(NfsError, NfsRestart, FailureClass)> {
     ]
 }
 
+/// The READDIRPLUS failures about the cookie (P7 C7c): a rejected one is read from the start.
+fn cookie_failure_cases() -> Vec<(NfsError, NfsRestart, FailureClass)> {
+    vec![
+        (
+            NfsError::Nfs3(V3::NFS3ERR_BAD_COOKIE),
+            NfsRestart::FromStart,
+            FailureClass::Protocol,
+        ),
+        (
+            NfsError::Nfs4(V4::NFS4ERR_BAD_COOKIE),
+            NfsRestart::FromStart,
+            FailureClass::Protocol,
+        ),
+        (
+            NfsError::Nfs4(V4::NFS4ERR_NOT_SAME),
+            NfsRestart::FromStart,
+            FailureClass::Protocol,
+        ),
+        // Not a READDIRPLUS status (RFC 1813 §3.3.17); nfs-rs does not count it as a rejected
+        // cookie either.
+        (
+            NfsError::Nfs3(V3::NFS3ERR_NOT_SYNC),
+            NfsRestart::Never,
+            FailureClass::Protocol,
+        ),
+        (
+            wrapped(
+                nfs_rs::RecoveryAction::DoNotRetry,
+                NfsError::Nfs3(V3::NFS3ERR_BAD_COOKIE),
+            ),
+            NfsRestart::FromStart,
+            FailureClass::Protocol,
+        ),
+    ]
+}
+
 /// A handle that no longer names the directory is resolved again, a busy server backed off, a
 /// transport failure nfs-rs certifies safe to resend resent (only then: one it wants remounted is
-/// not), anything else stands — looking through nfs-rs's recovery wrapper; the class is the one
+/// not), a rejected cookie read from the start, anything else stands — looking through nfs-rs's recovery wrapper; the class is the one
 /// every other NFS role failure gets.
 #[test]
 fn a_read_failure_says_what_reading_anew_could_do() {
-    for (error, restart, class) in read_failure_cases() {
+    for (error, restart, class) in read_failure_cases()
+        .into_iter()
+        .chain(cookie_failure_cases())
+    {
         let context = format!("{error:?}");
         let failure = read_failure(error);
         assert_eq!(failure.restart, restart, "{context}");
