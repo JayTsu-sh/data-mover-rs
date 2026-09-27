@@ -1028,19 +1028,53 @@ S3 收尾（P7 遗留三项，2026-09-27）—— 已完成：
       （与 D13 的 Preflight 拒绝同一规则、同一诊断），见 §14.1“F5 收尾”
 C7  feat(storage): NFS 流式（首页前可从头重试）      - src/nfs.rs:4610-4691   —— 已完成：cdcc66d（搬移）、7da78ce
     + 子目录句柄作为下钻提示随工作项下传，列举不再写 GLOBAL_CACHE，无提示 / 失效回退 lookup_fh（§12.7 修法 A）
-C7d perf(nfs): READDIR / READDIRPLUS 的回复大小按服务器公布的上限定（用户 2026-09-27 同意）—— C10 合入之后
-    - 现状：nfs-rs 默认 `readdir-buffer=8192,8192`（dircount / maxcount 各 8 KB），data-mover 从未设置；每个回复只装 40–60 条（C7c
-      在 ONTAP、DXN-2 实测），1 万项的目录要 170–250 次往返；legacy 同样受限
-    - 做法（用户 2026-09-27 定）：**只按服务器公布的上限，URL 里不写也不接受 `readdir-buffer`，不另设内存上限**（常见值 64 KB–1 MB：
-      ONTAP 随 `tcp-max-xfer-size`，默认多为 64 KB、最大 1 MB；Linux nfsd `rtmax` 多为 1 MB 而 `dtpref` 只报一页；v4.1 会话约 1 MB）。
-      `maxcount` 取读上限 —— v3 `Mount::fsinfo()` 的 `rtmax`，v4.1 会话 `max_response_size`（nfs-rs 已与 `maxread` 取小），v4.0 `maxread`；
-      `dircount` 参考 `dtpref`、实测定（避开 Linux `dtpref` 过小）；分页接口按次传入，不经 URL。回复大小 = min(上限, 目录实际内容)，
-      小目录不多占内存；最坏 K 个 worker 同时读宽目录 ≈ K × 上限的临时缓冲，实测时看宽树 RSS
-    - **实现方式（用户 2026-09-27 定）**：不给分页接口加大小入参；改 nfs-rs —— 挂载 URL 没写 `readdir-buffer` 时，挂载的默认
-      dircount / maxcount 取建立连接时得到的服务器上限（接口不变，Rust / Python 都自动受益），发布 nfs-rs 0.8.6（用户批准），
-      data-mover 只升级依赖
-    - 实测：ONTAP（`tcp-max-xfer-size` 默认下的 dtpref / rtmax）、DXN-2 v3 / v4.0；8K / 32K / 64K / 256K / 1M 几档与自动协商对比每回复
-      条数、5 万项宽目录的 wall、首项延迟、RSS；node1 m1-source 全树复测（每目录约 35 项，预计收益小）；不改 ONTAP 设置
+C7d perf(nfs): READDIR / READDIRPLUS 的回复大小按服务器公布的上限定（用户 2026-09-27 同意）—— 已完成：`9994a55`（chore(deps) nfs-rs 0.8.6）、
+    `cc61c26`（URL 不再接受 `readdir-buffer`）
+    - 原状：nfs-rs 默认 `readdir-buffer=8192,8192`（dircount / maxcount 各 8 KB），data-mover 从未设置；每个回复只装 23–45 条
+    - 做法（用户 2026-09-27 定：只按服务器公布的上限，URL 里不写也不接受 `readdir-buffer`，不另设内存上限；协调者随后定：不加按次传入
+      的接口，改 nfs-rs 的默认）：nfs-rs 0.8.6（JayTsu-sh/nfs-rs #124 / #125，tag 触发的发布流程发到 crates.io + PyPI）在 URL 没有
+      `readdir-buffer` 时，`maxcount` = 挂载时的读上限（与 READ 同一个：v3 FSINFO `rtmax`，v4.0 `maxread`，v4.1 `maxread` ∧ 会话最大
+      回复；不超过 4 MiB 载荷上限；v4.0 不公布 `maxread` 仍 8192），`dircount = maxcount`；页接口与流都用；目录回复的超时按同样大小的
+      READ 算；每项句柄是拷贝。data-mover 的 `parse_nfs_url` 拒绝 URL 里的 `readdir-buffer`（`ConfigError`，参数名按 nfs-rs 的方式
+      解码后比较）
+    - `dircount` 的取法（实测定）：`dircount` 只约束名字 / cookie / fileid，是回复的子集，取 `= maxcount` 就永远不先于 `maxcount`
+      截断。实测两种服务器都不让它起作用：maxcount 1 MiB 下 dircount 取 `dtpref`（ONTAP 32 KiB、DXN-2 16 KiB、v4 8 KiB）、
+      maxcount/8、maxcount，每回复条数完全相同。不取 `dtpref`：Linux knfsd 报一页，真按它截断的服务器每回复只剩几百个名字
+    - 公布值（2026-09-27）：ONTAP 9 v3 rtmax 1 MiB / dtpref 32 KiB，v4.0 maxread 1 MiB，v4.1 会话回复 1 MiB（rsize 1 MiB − 4 KiB）；
+      DXN-2 v3 rtmax 1 MiB / dtpref 16 KiB，v4.0 maxread 1 MiB。**ONTAP 目录回复自己封顶 32 KiB**（maxcount ≥ 32K 各档完全一样）
+    - nfs-rs 层（单个列举，5 万文件平铺目录，10.131.9.10，两轮）：
+
+      | 服务器 | 每回复条数 8K → 自动 | 列举 wall 8K → 自动 | 首页 8K → 自动 | 峰值 RSS 8K → 自动 |
+      |---|---|---|---|---|
+      | ONTAP v3 | 41 → 175 | 1.05 → 0.43 s | 1–2 → 2 ms | 6.0 → 6.0 MB |
+      | ONTAP v4.0 / v4.1 | 23 → 95 | 2.0–2.1 → 0.95–1.1 s | 1 → 2 ms | 6.1 → 6.4 MB |
+      | DXN-2 v3 | 45 → 5,556 | 4.8–5.6 → 2.4–3.6 s | 3–5 → 270–380 ms | 6.1 → 9.4 MB |
+      | DXN-2 v4.0 | 39 → 5,000 | 7.8–10.7 → 5.1–14 s（抖动大） | 4–900 → 350 ms–4.6 s（冷缓存） | 6.0 → 10 MB |
+
+      几档固定值（32K / 64K / 256K / 1M）：ONTAP 32K 起即封顶；DXN-2 v3 32K 184 条 3.3–3.5 s，64K 370 条，256K 1,471 条 2.7–2.8 s，
+      1M 同自动；v4.0 32K 157 条 5.3–6.9 s，256K 1,250 条 5.3–5.5 s，1M 3.7–4.9 s
+    - data-mover 层（`storage_role_operations traverse` Unordered c=64，release，两轮；8K 由不提交的测试钩子经 URL 强制）：
+
+      | 目录 | wall 8K → 自动 | 首个子项 8K → 自动 | 峰值 RSS 8K → 自动 |
+      |---|---|---|---|
+      | ONTAP v3 5 万平铺 | 1.09–1.10 → 0.50–0.52 s | 35 → 25 ms | 18.5–19.6 → 19.1–19.4 MB |
+      | ONTAP v4.0 / v4.1 5 万平铺 | 2.13–2.19 → 1.05–1.13 s | 47–50 → 25–26 ms | 17.1–18.5 → 17.3–18.1 MB |
+      | DXN-2 v3 5 万平铺 | 5.2–5.5 → 3.5–3.6 s | 111–133 → 333–388 ms | 18.7 → 31.2–31.5 MB |
+      | DXN-2 v4.0 5 万平铺 | 10.2–53.5 → 14.5–47.3 s（服务器抖动） | 0.5–1.4 → 0.4–4.6 s | 17.5–18.7 → 29.9–31.5 MB |
+      | DXN-2 v3 宽树 32 × 5,000 | 3.8–4.5 → 3.7–6.3 s | — | 37.5–41.6 → 33.5–41.3 MB |
+      | DXN-2 v4.0 宽树 32 × 5,000 | 10.1–14.0 → 8.9–11.6 s | — | 34.5–36.3 → 33.3–38.2 MB |
+
+      条目数、`totals balanced` 各档都相同。
+    - node1 m1-source 全树（每目录 35 项：20 个子目录 + 15 个文件，Unordered，c=64，交替四轮，0.8.5 构建 = `92151d2`，
+      0.8.6 构建 = `cc61c26` 的树）：53,368,420 条、0 失败，四轮都一样。wall 0.8.5 996.2 / 997.2 s → 0.8.6 995.5 / 996.4 s；CPU（user+sys）
+      257.2 / 255.6 → 274.1 / 223.8 s（node1 轮间波动，均值 256.4 → 249.0）；峰值 RSS 17.0 / 18.8 → 17.8 / 17.3 MB。每目录 35 项，8 KiB
+      回复在 v3 已能装下（约 45 项），所以不变，与预期一致。原始数据：node1 `/root/dm-c7d/logs/u08{5,6}-r{1,2}.*`
+    - §12.6（Unordered RSS ≤ 30 MB）：m1-source 全树**仍达标**（17.3–18.8 MB，wall / CPU 与 0.8.5 相同）。ONTAP 自己封顶 32 KiB，不受影响。服务器照给 1 MiB 时（DXN-2），一个
+      5,000 项以上的大目录单独就让峰值 +12 MB（18.7 → 31 MB，超过 30 MB）；32 个宽目录并发时 8K 与自动都在 33–42 MB（宽树的峰值
+      主要不是回复缓冲），所以“K 个 worker × 1 MiB”的最坏估计在实测里没有出现叠加。未另设内存上限（用户定）；是否需要对大目录限大小
+      列为待决
+    - 附带（nfs-rs）：v3 READDIR / READDIRPLUS 原来沿 XDR 链表递归解码，1 MiB（约 6,000 项）的回复在 debug 构建里栈溢出（nfs-rs 的
+      真机测试撞到），0.8.6 改为逐项解码；8 KiB 时不会发生
 C8  feat(storage): HDFS 流式 + 去掉列举前 get_metadata  - src/hdfs/namespace.rs:271-288
 C9  feat(storage): CIFS 流式（生产者持有句柄；停车句柄上限） - src/storage/backends/cifs/{protocol.rs:230-280, namespace.rs:59-94}
     —— 已完成：70f85d1（接缝 open_directory + CifsDirectory，不改行为）、936e20b
