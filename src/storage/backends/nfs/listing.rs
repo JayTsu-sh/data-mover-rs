@@ -20,9 +20,8 @@
 //! longer holds is resolved again (at most [`MAX_RELOOKUPS`] times after the hint), a busy server
 //! is backed off within the listing's throttle budget, a transport failure nfs-rs certifies safe
 //! to resend is read anew after [`RESEND_DELAYS`], a rejected cookie is read from the start (at
-//! most [`MAX_FROM_START`] times). Until the first page is handed over the retry reads the
-//! directory from its start and drops what the failed read had gathered, so no child is handed
-//! over twice. After it (P7 C7c, Q18) the retry continues from the cookie after the last reply
+//! most [`MAX_FROM_START`] times). Before and after the first page (P7 C7c, Q18), the retry
+//! retains what the failed read gathered and continues from the cookie after the last reply
 //! taken whole, with the same handle (from the start with another: a cookie means nothing on
 //! another handle), and skips every entry the listing already took ([`super::listing_resume`]);
 //! a server whose cookies loop within one read ends the listing (`Protocol` / Permanent), and one
@@ -32,7 +31,9 @@
 //! the first page the children read so far are handed over first and the traversal records
 //! `Interrupted`, and a transport failure safe to resend is then this listing's alone: nfs-rs
 //! certified resending it on the session it has. A listing that no longer remembers what it took
-//! ([`super::listing_resume::MAX_REMEMBERED`]) does not retry after its first page.
+//! ([`super::listing_resume::MAX_REMEMBERED`]) does not retry after its first page. Before it,
+//! the listing can discard the unpublished buffer and retry from the start; remembering stays
+//! disabled and replayed entries cannot refill the retries.
 
 use std::mem;
 use std::sync::Arc;
@@ -208,8 +209,8 @@ impl Restarts {
     }
 
     /// Whether to read the directory again after `failure`, and from where: only for what a
-    /// fresh read can cure, and after the first page only while the listing remembers what it
-    /// took. An entry newly taken since the last failure refills the retries (the throttle
+    /// fresh read can cure. While the listing remembers what it took, an entry newly taken
+    /// since the last failure refills the retries (the throttle
     /// budget only restarts its doubling: its total stays the listing's).
     async fn after(
         &mut self,
@@ -218,30 +219,28 @@ impl Restarts {
         protocol: &dyn NfsNamespaceProtocol,
         pages: &mut Pages<'_>,
     ) -> Next {
-        let continuing = pages.handed_over > 0;
-        if continuing && pages.taken.progressed() {
+        let remembers = pages.taken.remembers();
+        if remembers && pages.taken.progressed() {
             self.relookups = 0;
             self.resends = 0;
             self.from_start = 0;
             self.backoff.succeeded();
         }
-        if continuing && !pages.taken.remembers() {
+        if !remembers && pages.handed_over > 0 {
             return exhausted(failure, pages);
         }
         let restart = failure.restart;
         let next = self.retry(failure, hinted, protocol, pages).await;
         if matches!(next, Next::Reread | Next::Resolve) {
-            if continuing {
+            if remembers {
                 info!(
                     path = pages.request.path.as_str(),
                     ?restart,
                     handed_over = pages.handed_over,
-                    "NFS listing reads on after a failure past its first page"
+                    "NFS listing retains its progress after a failed read"
                 );
             } else {
-                // Nothing has been handed over: reading the directory again from its start
-                // repeats no child. What this attempt had read is dropped.
-                pages.restart();
+                pages.discard_unpublished();
             }
         }
         next
@@ -335,13 +334,14 @@ impl<'a> Pages<'a> {
         }
     }
 
-    /// Nothing was handed over: the next read starts from the directory's start, and what the
-    /// failed one gathered is dropped.
-    fn restart(&mut self) {
+    /// Remembering ran out before anything was handed over: discard this attempt and retry
+    /// from the start. Remembering stays disabled, so replay cannot keep refilling the budget.
+    fn discard_unpublished(&mut self) {
+        debug_assert_eq!(self.handed_over, 0);
+        debug_assert!(!self.taken.remembers());
         self.page = ListingPage::default();
         self.held = 0;
         self.position.rewind();
-        self.taken = Taken::new();
     }
 
     fn has_content(&self) -> bool {

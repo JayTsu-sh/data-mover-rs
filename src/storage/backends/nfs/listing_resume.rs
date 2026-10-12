@@ -10,7 +10,9 @@
 //! server that does not check cookies may — is skipped instead of handed over twice. The name
 //! alone would not do: nfs-rs decodes names lossily, so two different names can arrive as one.
 //! The digests are bounded ([`MAX_REMEMBERED`]); past that the listing can no longer continue
-//! from a cookie without risking duplicates, and a failure ends it as before C7c.
+//! from a cookie without risking duplicates. A failure then ends a listing that already handed
+//! a page over; before that it can discard the buffer and retry from the start with a fixed
+//! budget. Remembering never starts again for that listing.
 
 use std::collections::HashSet;
 use std::collections::hash_map::RandomState;

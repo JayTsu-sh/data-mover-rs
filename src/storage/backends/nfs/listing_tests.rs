@@ -1,5 +1,5 @@
 //! The NFS role listing streams, follows descent hints (P7 C7) and continues a directory from its
-//! cookie after the first page (P7 C7c).
+//! cookie before and after the first page (P7 C7c).
 //!
 //! Against [`FakeNfs`]: "read" counts children taken out of READDIRPLUS replies, "lookups" path
 //! resolutions. Fault injection (see the commits): a producer that reads the whole directory
@@ -201,8 +201,8 @@ async fn a_failure_after_the_first_page_ends_the_listing_after_what_was_read() -
     Ok(())
 }
 
-/// Before the first page, a stale handle is resolved again and the directory read anew; the
-/// children of the failed attempt are dropped, so none is handed over twice.
+/// Before the first page, a stale handle is resolved again; buffered children survive and are
+/// skipped when the incomplete first reply comes again, so none is handed over twice.
 #[tokio::test]
 async fn a_failure_before_the_first_page_restarts_the_directory_once_resolved_again() -> Result {
     let fake = Arc::new(FakeNfs::new(REPLY).flat("d", 30));
@@ -681,3 +681,6 @@ async fn progress_refills_the_retries() -> Result {
     assert_eq!(FakeNfs::count(&fake.reads_started), 6);
     Ok(())
 }
+
+#[path = "listing_first_page_tests.rs"]
+mod first_page;

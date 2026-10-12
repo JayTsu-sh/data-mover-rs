@@ -19,8 +19,8 @@ use tokio::sync::Semaphore;
 use tokio::task::yield_now;
 
 use super::namespace::{
-    NfsListingPages, NfsNamespaceAdapter, NfsNamespaceObservation, NfsNamespaceProtocol,
-    NfsReadEnd, NfsReadFailure, NfsRestart,
+    NfsListedChild, NfsListingPages, NfsNamespaceAdapter, NfsNamespaceObservation,
+    NfsNamespaceProtocol, NfsReadEnd, NfsReadFailure, NfsRestart, NfsUndescribedChild,
 };
 use super::source::NfsProtocolFailure;
 use crate::model::{
@@ -73,6 +73,10 @@ pub(crate) struct FakeNfs {
     /// Names the read hides instead of handing over, as the `NFSv3` reader hides ONTAP's
     /// snapshot directory (P7 C7b).
     hidden_names: Vec<String>,
+    /// Names whose READDIRPLUS attributes cannot be described: child failures, not read errors.
+    omitted_names: Vec<String>,
+    /// Fail after `first_sight` but before taking the entry, like a failed snapshot LOOKUP.
+    fault_after_sight: bool,
     /// What the server does with a cookie, by directory (default [`Cookies::Honours`]).
     cookies: HashMap<String, Cookies>,
     /// `directory_handle` calls: one per path resolution, whatever LOOKUPs it would cost.
@@ -130,6 +134,16 @@ impl FakeNfs {
     /// it over.
     pub(crate) fn hiding(mut self, name: &str) -> Self {
         self.hidden_names.push(name.to_owned());
+        self
+    }
+
+    pub(crate) fn omitting(mut self, name: &str) -> Self {
+        self.omitted_names.push(name.to_owned());
+        self
+    }
+
+    pub(crate) fn faulting_after_sight(mut self) -> Self {
+        self.fault_after_sight = true;
         self
     }
 
@@ -220,6 +234,20 @@ impl FakeNfs {
             }),
             mode: None,
             ownership: None,
+        }
+    }
+
+    fn listed_child(&self, directory: &str, name: &str, kind: EntryKind) -> NfsListedChild {
+        let child = self.child(directory, name, kind);
+        if self.omitted_names.iter().any(|omitted| omitted == name) {
+            Err(NfsUndescribedChild {
+                path: child.path,
+                failure: NfsProtocolFailure::protocol(),
+                reason: "the server omitted its attributes",
+                raw_name: None,
+            })
+        } else {
+            Ok(child)
         }
     }
 }
@@ -320,6 +348,7 @@ impl NfsNamespaceProtocol for FakeNfs {
             for (index, (name, kind)) in children.iter().enumerate().take(end).skip(start) {
                 if let Some(fault) = &fault
                     && fault.after == index
+                    && !self.fault_after_sight
                 {
                     return Err(fault.failure.clone());
                 }
@@ -330,11 +359,19 @@ impl NfsNamespaceProtocol for FakeNfs {
                 if !pages.first_sight(cookie_of(index + 1), name) {
                     continue;
                 }
+                if let Some(fault) = &fault
+                    && fault.after == index
+                    && self.fault_after_sight
+                {
+                    return Err(fault.failure.clone());
+                }
                 if self.hidden_names.contains(name) {
                     pages.hide();
                     continue;
                 }
-                if pages.push(Ok(self.child(&directory, name, *kind))) && !pages.hand_over().await {
+                if pages.push(self.listed_child(&directory, name, *kind))
+                    && !pages.hand_over().await
+                {
                     return Ok(NfsReadEnd::Stopped);
                 }
             }

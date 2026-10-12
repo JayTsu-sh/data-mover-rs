@@ -126,9 +126,9 @@ pub(crate) enum NfsReadEnd {
     Repeated,
 }
 
-/// What reading the directory again could do about a failed READDIRPLUS read: from its start
-/// while no page of it has been handed over, from the last cookie it reached after that (P7 §5.2,
-/// Q18, C7c).
+/// What reading the directory again could do about a failed READDIRPLUS read: from the last
+/// cookie it reached, before and after the first page, while its entries are remembered for
+/// deduplication (P7 §5.2, Q18, C7c).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NfsRestart {
     /// Nothing: the failure stands.
@@ -147,8 +147,8 @@ pub(crate) enum NfsRestart {
     Resend,
     /// The server rejected the directory cookie or its verifier (`NFS3ERR_BAD_COOKIE`,
     /// `NFS4ERR_BAD_COOKIE`, `NFS4ERR_NOT_SAME`: nfs-rs `is_bad_directory_cookie`): only a read
-    /// from the directory's start can go on; once children are out, the listing skips those it
-    /// already took.
+    /// from the directory's start can go on; the listing keeps its buffer and skips entries it
+    /// already took while it remembers them.
     FromStart,
 }
 
