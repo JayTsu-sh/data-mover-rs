@@ -9,8 +9,10 @@ only where they depend on a retired scanner.
 
 P7 §12.8 records the accepted node1 / m1-source 53,368,420-entry, concurrency-64 comparison: four
 alternating runs, legacy mean wall 996 s / CPU 254 s / peak RSS 16.5 MB, Unordered wall 0.999× /
-CPU 1.04×. The original legacy binary is `/root/dm/p7-base/legacy` on node1; run logs are under
-`/root/dm-c10/logs`. These historical measurements are not new runs on the current machine.
+CPU 1.04×. The historical report placed its binary at `/root/dm/p7-base/legacy` and logs under
+`/root/dm-c10/logs` on node1. An SSH check on 2026-10-12 found both paths absent, so the raw
+artifacts are no longer available there. The recorded measurements remain historical evidence,
+not new runs on the current machine.
 
 The complete pre-cleanup implementation is retained at `aafd463`; it contains the legacy
 `examples/nfs_walkdir.rs` and all scanner implementations. Build that revision in a separate

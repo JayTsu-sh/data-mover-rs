@@ -48,10 +48,11 @@ use crate::transfer_concurrency::{
 use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
 use crate::write_pipeline::{ChunkSink, CommitPolicy, write_pipeline_core};
 use crate::{
-    DataChunk, DeleteDirIterator, DeleteEvent, EntryEnum, ErrorEvent, MB, NASEntry, Result,
-    StorageEntryMessage, WalkDirAsyncIterator,
+    DataChunk, EntryEnum, ErrorEvent, MB, NASEntry, Result, StorageEntryMessage,
+    WalkDirAsyncIterator,
 };
 
+mod delete;
 mod owner;
 mod role_create;
 mod role_listing;
@@ -2469,141 +2470,6 @@ impl NFSStorage {
             }
         }
         unreachable!("retry loop always returns")
-    }
-
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the requested storage operation cannot be completed.
-    pub async fn delete_dir_all(&self, relative_path: Option<&Path>) -> Result<()> {
-        let iter = self.delete_dir_all_with_progress(relative_path, 4)?;
-        while iter.next().await.is_some() {}
-        Ok(())
-    }
-
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the requested storage operation cannot be completed.
-    pub fn delete_dir_all_with_progress(
-        &self,
-        relative_path: Option<&Path>,
-        concurrency: usize,
-    ) -> Result<DeleteDirIterator> {
-        let (tx, rx) = async_channel::bounded::<DeleteEvent>(1000);
-        let concurrency = concurrency.clamp(1, 64);
-        let storage = self.clone();
-
-        // 将 relative_path 转为 owned PathBuf 以便 move 进 async 块
-        let sub_path = relative_path.map(std::path::Path::to_path_buf);
-
-        tokio::spawn(async move {
-            // 1. 复用 walkdir 并行遍历（支持子目录）；连同传输 artifact 一起列出，否则目录删不掉
-            let walkdir_result = match storage
-                .walk_listing(
-                    sub_path.as_deref(),
-                    crate::WalkOptions {
-                        concurrency,
-                        ..Default::default()
-                    },
-                    false,
-                )
-                .await
-            {
-                Ok(iter) => iter,
-                Err(e) => {
-                    error!("Failed to start walkdir for delete: {:?}", e);
-                    return;
-                }
-            };
-
-            // 2. 流式消费：边遍历边删文件，目录仅收集路径
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-            let mut dir_paths: Vec<(PathBuf, usize)> = Vec::new();
-            let mut file_handles = Vec::new();
-
-            while let Some(result) = walkdir_result.next().await {
-                match result {
-                    StorageEntryMessage::Scanned(entry) => {
-                        if entry.get_is_dir() {
-                            let depth = entry.get_relative_path().components().count();
-                            dir_paths.push((entry.get_relative_path().to_path_buf(), depth));
-                        } else {
-                            let Ok(permit) = semaphore.clone().acquire_owned().await else {
-                                break;
-                            };
-                            let storage_c = storage.clone();
-                            let tx_c = tx.clone();
-                            let path = entry.get_relative_path().to_path_buf();
-                            file_handles.push(tokio::spawn(async move {
-                                let _permit = permit;
-                                if let Err(e) = storage_c.delete_file(&path).await {
-                                    error!("Failed to delete file {:?}: {:?}", path, e);
-                                } else {
-                                    let _ = tx_c
-                                        .send(DeleteEvent {
-                                            relative_path: path,
-                                            is_dir: false,
-                                            error: None,
-                                        })
-                                        .await;
-                                }
-                            }));
-                        }
-                    }
-                    StorageEntryMessage::Error {
-                        event,
-                        path,
-                        reason,
-                        ..
-                    } => {
-                        error!(
-                            "Walkdir error during delete [{}] {:?}: {}",
-                            event, path, reason
-                        );
-                    }
-                    _ => {}
-                }
-            }
-
-            // 等待所有文件删除完成
-            for h in file_handles {
-                let _ = h.await;
-            }
-
-            // 3. 目录按深度降序排序 → 逐个删除（子目录）
-            dir_paths.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-            for (path, _) in dir_paths {
-                if let Err(e) = storage.delete_dir(&path).await {
-                    error!("Failed to delete dir {:?}: {:?}", path, e);
-                } else {
-                    let _ = tx
-                        .send(DeleteEvent {
-                            relative_path: path,
-                            is_dir: true,
-                            error: None,
-                        })
-                        .await;
-                }
-            }
-            // 4. 删除根目录本身（walkdir 只返回其内容，不含根目录自身）
-            if let Some(root) = sub_path {
-                if let Err(e) = storage.delete_dir(&root).await {
-                    error!("Failed to delete root dir {:?}: {:?}", root, e);
-                } else {
-                    let _ = tx
-                        .send(DeleteEvent {
-                            relative_path: root,
-                            is_dir: true,
-                            error: None,
-                        })
-                        .await;
-                }
-            }
-            // tx drop → channel 关闭
-        });
-
-        Ok(DeleteDirIterator::new(rx))
     }
 
     /// 创建符号链接，同时写入 ownership 与时间戳。
