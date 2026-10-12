@@ -2,14 +2,18 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use async_channel::Sender;
 use bytes::Bytes;
-use nfs_rs::{DirectoryCookie, ReaddirplusEntry};
+use nfs_rs::{DirectoryCookie, ReaddirplusEntry, ReaddirplusPage};
 use tokio::task::JoinSet;
 
-use super::{FType3, NFSStorage};
+use super::{
+    FType3, MAX_STALE_RETRIES, NFSStorage, is_retryable_with_invalidation, is_server_busy,
+};
 use crate::error::StorageError;
+use crate::model::StoragePath;
 use crate::{DeleteDirIterator, DeleteEvent, Result};
 
 impl NFSStorage {
@@ -66,14 +70,18 @@ impl NFSStorage {
         let mut pending = vec![(path.to_path_buf(), handle)];
         let mut directories = Vec::new();
         let mut files = JoinSet::new();
-        while let Some((path, handle)) = pending.pop() {
-            self.delete_raw_children(&path, handle, concurrency, tx, &mut pending, &mut files)
-                .await?;
-            directories.push(path);
+        let scanned = async {
+            while let Some((path, handle)) = pending.pop() {
+                self.delete_raw_children(&path, handle, concurrency, tx, &mut pending, &mut files)
+                    .await?;
+                directories.push(path);
+            }
+            Ok(())
         }
-        while !files.is_empty() {
-            finish_file(&mut files).await?;
-        }
+        .await;
+        // NFSv4.1 RPC futures must finish even after another operation failed. Dropping a
+        // JoinSet here would abort REMOVE requests and could fence their session slots.
+        drain_files(&mut files, scanned).await?;
         // Parents are recorded before their children, so reversing is post-order.
         for path in directories.into_iter().rev() {
             if path.as_os_str().is_empty() {
@@ -88,7 +96,7 @@ impl NFSStorage {
     async fn delete_raw_children(
         &self,
         path: &Path,
-        handle: Bytes,
+        mut handle: Bytes,
         concurrency: usize,
         tx: &Sender<DeleteEvent>,
         pending: &mut Vec<(PathBuf, Bytes)>,
@@ -99,15 +107,8 @@ impl NFSStorage {
         reached.insert(position.cookie);
         loop {
             let page = self
-                .mount
-                .readdirplus_page(handle.clone(), position)
-                .await
-                .map_err(|error| {
-                    StorageError::NfsError(format!(
-                        "Failed to list {} for deletion: {error}",
-                        path.display()
-                    ))
-                })?;
+                .delete_directory_page(path, &mut handle, position)
+                .await?;
             for entry in page.entries {
                 if entry.file_name == "." || entry.file_name == ".." {
                     continue;
@@ -126,6 +127,39 @@ impl NFSStorage {
             }
             position = page.next;
         }
+    }
+
+    async fn delete_directory_page(
+        &self,
+        path: &Path,
+        handle: &mut Bytes,
+        position: DirectoryCookie,
+    ) -> Result<ReaddirplusPage> {
+        for attempt in 0..=MAX_STALE_RETRIES {
+            match self.mount.readdirplus_page(handle.clone(), position).await {
+                Ok(page) => return Ok(page),
+                Err(error)
+                    if position == DirectoryCookie::default()
+                        && attempt < MAX_STALE_RETRIES
+                        && (is_retryable_with_invalidation(&error) || is_server_busy(&error)) =>
+                {
+                    if is_retryable_with_invalidation(&error) {
+                        let relative = StoragePath::new(path.to_string_lossy().replace('\\', "/"))
+                            .map_err(|error| StorageError::InvalidPath(error.to_string()))?;
+                        self.forget_role_directory(&relative).await?;
+                        *handle = self.lookup_fh(path).await?.fh;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(error) => {
+                    return Err(StorageError::NfsError(format!(
+                        "Failed to list {} for deletion: {error}",
+                        path.display(),
+                    )));
+                }
+            }
+        }
+        unreachable!("bounded retry loop always returns")
     }
 
     async fn delete_raw_child(
@@ -169,6 +203,16 @@ impl NFSStorage {
     }
 }
 
+async fn drain_files(files: &mut JoinSet<Result<()>>, mut result: Result<()>) -> Result<()> {
+    while !files.is_empty() {
+        let completed = finish_file(files).await;
+        if result.is_ok() {
+            result = completed;
+        }
+    }
+    result
+}
+
 async fn finish_file(files: &mut JoinSet<Result<()>>) -> Result<()> {
     if let Some(result) = files.join_next().await {
         result.map_err(|error| {
@@ -182,4 +226,53 @@ async fn send_progress(tx: &Sender<DeleteEvent>, path: PathBuf, is_dir: bool) ->
     tx.send(DeleteEvent::success(path, is_dir))
         .await
         .map_err(|_| StorageError::OperationError("Deletion progress receiver closed".to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn failed_listing_waits_for_every_started_remove_and_keeps_first_error() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&finished);
+        let mut files = JoinSet::new();
+        files.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            signal.store(true, Ordering::SeqCst);
+            Err(StorageError::OperationError(
+                "later remove failure".to_owned(),
+            ))
+        });
+        let result = drain_files(
+            &mut files,
+            Err(StorageError::OperationError("listing failure".to_owned())),
+        )
+        .await;
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(files.is_empty());
+        assert!(result.is_err_and(|error| error.to_string().contains("listing failure")));
+    }
+
+    #[tokio::test]
+    async fn closed_progress_receiver_does_not_abort_other_removes() {
+        let (tx, rx) = async_channel::bounded(1);
+        drop(rx);
+        let finished = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&finished);
+        let mut files = JoinSet::new();
+        files.spawn(async move { send_progress(&tx, PathBuf::from("gone"), false).await });
+        files.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            signal.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(drain_files(&mut files, Ok(())).await.is_err());
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(files.is_empty());
+    }
 }
