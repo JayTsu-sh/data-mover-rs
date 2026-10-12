@@ -15,6 +15,7 @@ mod channel;
 mod checkpoint;
 mod counts;
 mod events;
+pub mod pairing;
 mod storage;
 pub use checkpoint::{Resumable, ResumeRefusal};
 pub use counts::{BlockCounts, ScanTotals};
