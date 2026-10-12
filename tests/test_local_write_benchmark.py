@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "tests" / "lab" / "run-local-write-benchmark.sh"
-BENCHMARK = ROOT / "examples" / "local_write_benchmark.rs"
+BENCHMARK = ROOT / "tests/lab/tools" / "local_write_benchmark.rs"
 
 
 class LocalWriteBenchmarkTest(unittest.TestCase):

@@ -515,3 +515,82 @@ async fn snapshot_rebuild_preserves_private_local_facts_without_requery() -> io:
     }
     Ok(())
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_acl_role_handles_files_directories_and_refuses_escape() -> io::Result<()> {
+    use crate::model::AclEncoding;
+    use crate::storage::Metadata as _;
+    let root = TestRoot::new()?;
+    std::fs::write(root.0.join("file"), b"unchanged")?;
+    std::fs::create_dir(root.0.join("directory"))?;
+    let adapter = adapter(&root.0).map_err(io::Error::other)?;
+    for name in ["file", "directory"] {
+        let path = StoragePath::new(name).map_err(io::Error::other)?;
+        let observed = adapter
+            .observe_with_plan(
+                path.clone(),
+                ObservationPlan::default().with_acl(ObservationMode::Required),
+            )
+            .await
+            .map_err(io::Error::other)?;
+        let MetadataObservation::Value { value, .. } = observed.metadata().acl() else {
+            return Err(io::Error::other("required Windows ACL was not observed"));
+        };
+        assert_eq!(value.encoding(), AclEncoding::WindowsSecurityDescriptor);
+        adapter
+            .apply(
+                &path,
+                MetadataMutation::Acl(value.clone()),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .map_err(io::Error::other)?;
+        assert!(
+            !adapter
+                .read_acl(&path)
+                .await?
+                .access()
+                .unwrap_or_default()
+                .is_empty()
+        );
+    }
+    let invalid = AclMetadata::new(AclEncoding::WindowsSecurityDescriptor, vec![0; 20])
+        .map_err(io::Error::other)?;
+    let path = StoragePath::new("file").map_err(io::Error::other)?;
+    let failure = adapter
+        .apply(
+            &path,
+            MetadataMutation::Acl(invalid.clone()),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| io::Error::other("malformed descriptor was accepted"))?;
+    assert!(
+        matches!(failure, StorageRoleFailure::Entry(error) if error.class() == FailureClass::InvalidInput)
+    );
+    let escape = StoragePath::new("../outside").map_err(io::Error::other)?;
+    assert_eq!(
+        adapter
+            .read_acl(&escape)
+            .await
+            .err()
+            .map(|error| error.kind()),
+        Some(io::ErrorKind::InvalidInput)
+    );
+    let failure = adapter
+        .apply(
+            &escape,
+            MetadataMutation::Acl(invalid),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| io::Error::other("escaping metadata path was accepted"))?;
+    assert!(
+        matches!(failure, StorageRoleFailure::Entry(error) if error.class() == FailureClass::InvalidInput)
+    );
+    assert_eq!(std::fs::read(root.0.join("file"))?, b"unchanged");
+    Ok(())
+}

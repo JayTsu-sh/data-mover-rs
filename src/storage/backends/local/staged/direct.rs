@@ -153,7 +153,7 @@ impl LocalStagedDestination {
             )));
         }
         let file = self
-            .open_stage_file_for(target, Operation::Publish)
+            .open_stage_file_for(target, Operation::Publish, false)
             .await
             .map_err(map)?;
         #[cfg(unix)]

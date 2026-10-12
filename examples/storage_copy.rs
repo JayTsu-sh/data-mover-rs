@@ -11,8 +11,10 @@ use num_traits::ToPrimitive as _;
 use tokio_util::sync::CancellationToken;
 
 #[allow(dead_code)]
+#[path = "support/copy.rs"]
 mod copy_support;
 #[allow(dead_code)]
+#[path = "support/endpoint.rs"]
 mod endpoint_support;
 use endpoint_support::{Result, connect_with_options};
 

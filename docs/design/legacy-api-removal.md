@@ -151,3 +151,51 @@ cases and cleanup were rerun with
 `f930f6dc1e8b3d33bb0aa37c630164de232449028c519b0e05d3e49f36be0f52`.
 Run-local logs are under `/tmp/dm-legacy-*`; they are not a committed artifact archive.
 These runs establish behavior and route selection, not a new throughput or memory benchmark.
+
+## Backend ownership consolidation (follow-up)
+
+Concrete NFS, S3 and HDFS clients now live under
+`src/storage/backends/<backend>/client.rs` and `client/`; CIFS connection and SDK
+assembly live in `storage/backends/cifs/connection.rs`. The factory dispatches to
+backend facades. The architecture guard rejects reintroduced root backend modules,
+while allowing a named set of shared leaf helpers within backend implementations.
+
+Callers import HDFS configuration and client construction, NFS export discovery,
+and S3 bucket discovery from `data_mover::storage`. Windows ACL utilities belong
+to Local and are exposed as `storage::windows_acl`; Local metadata roles use
+capability-opened handles for security-descriptor observation and application.
+
+Seven public usage examples remain in `examples/`. Lab contracts, benchmarks,
+fault injection and resume tools live in `tests/lab/tools/`, retaining explicit
+Cargo target names. Shared example setup is in `examples/support/`. The missing
+`storage_small_benchmark` target used by nightly has been restored with its v1
+measurement definitions, and the runner selects the executable reported by a
+successful current Cargo build.
+
+The live-server evidence above belongs to the preceding legacy-removal revision;
+it does not certify this follow-up revision.
+
+
+Follow-up local validation passed: the workspace suite (1,746 passed), the benchmark's
+three tests, 68 Python harness tests, all 18 architecture-guard cases (the one fixture
+captured before the ACL move was rerun after it), strict all-target Clippy, rustdoc
+with warnings denied, all example builds, and the Local end-to-end runner. New read,
+traverse and namespace examples were exercised on temporary directories; the benchmark
+copied 100 files with independent byte comparison, and wrong counts/missing reads failed.
+
+The final Windows GNU all-target compile passed. Native Windows execution was not
+available locally; CI now runs the Windows ACL unit, observation and staged-publication
+contracts on its Windows runner. The Linux suite does not execute these cfg-gated cases.
+
+CI and lab commands now use the relocated test names and reject selections that execute
+zero tests. Focused StorageGRID/DXN wire tests, HDFS poisoned-environment isolation, and
+S3 contiguous-prefix/leftover recovery tests passed after the gate changes. The restored
+multipart-rename regression uses the current private protocol and confines its fixtures;
+DXN fixture keys now derive from the lab runner's scoped key. DXN was not contacted.
+
+A fresh standard-S3 run of this follow-up passed the 20 MiB multipart rename regression,
+the public 72 MiB + 137-byte architecture contract (including reconnect, native copy and
+shaped fallback), namespace rename with content/metadata/tags preserved, and deletion of
+103 objects. Independent cleanup confirmed no current objects, historical versions,
+delete markers or incomplete uploads in the isolated test prefix. Run-local redacted logs
+are under `/tmp/dm-consolidate-live-058e61a8512a`; no server configuration changed.

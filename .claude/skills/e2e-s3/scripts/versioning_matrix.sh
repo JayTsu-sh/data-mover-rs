@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ADR-0006 C17 versioning matrix against a real server (examples/transfer_resume.rs). Creates two
+# ADR-0006 C17 versioning matrix against a real server (tests/lab/tools/transfer_resume.rs). Creates two
 # TEMPORARY buckets on the .env's server — data-mover-c17-<run> (versioning enabled) and
 # data-mover-c17-lock-<run> (created with Object Lock) — and on exit deletes both completely:
 # legal holds off, every version and delete marker by id, every open upload, then the bucket. It

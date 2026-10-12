@@ -19,9 +19,17 @@ ALLOWED = {
     "runtime": {"model"},
 }
 FILE_ALLOWED = {
-    # The composition point: legacy backends, plus the leaf credential redactor its Debug uses.
-    "storage/factory.rs": {"cifs", "hdfs", "nfs", "s3", "url_redact"},
+    # Factory Debug redacts credentials; backend construction stays behind backend facades.
+    "storage/factory.rs": {"url_redact"},
 }
+# Protocol clients share leaf error, time and concurrency helpers. These do not authorize
+# dependencies on orchestration or other backends. Root values are neutral constants/aliases;
+# test assertion traits exist only under cfg(test).
+BACKEND_LEAVES = {
+    "error", "time_util", "transfer_concurrency", "url_redact",
+    "Result", "KB", "MB", "AssertTestValue", "AssertTestError",
+}
+RETIRED_ROOT_MODULES = {"acl", "cifs", "hdfs", "nfs", "s3"}
 CRATE_REFERENCE = re.compile(r"\bcrate::\s*([A-Za-z_]\w*)")
 CRATE_GROUP = re.compile(r"\bcrate::\s*\{([^{}]*)\}", re.DOTALL)
 CRATE_ALIAS = re.compile(r"\buse\s+crate\s+as\s+([A-Za-z_]\w*)\s*;")
@@ -203,6 +211,13 @@ def validate(root: Path) -> list[str]:
     source = root / "src"
     errors = []
     lib_text = code_only((source / "lib.rs").read_text())
+    for module in sorted(RETIRED_ROOT_MODULES):
+        if (
+            re.search(rf"\bmod\s+{module}\s*;", lib_text)
+            or (source / f"{module}.rs").exists()
+            or (source / module).exists()
+        ):
+            errors.append(f"top-level {module} implementation must live in its owning backend")
     for module in sorted(PUBLIC_MODULES):
         declaration = re.compile(rf"\bpub\s+mod\s+{re.escape(module)}\s*;")
         if not declaration.search(lib_text) or not (source / module / "mod.rs").is_file():
@@ -218,6 +233,8 @@ def validate(root: Path) -> list[str]:
             relative_path = path.relative_to(source / module)
             module_depth = len(relative_path.parts) if path.name == "mod.rs" else len(relative_path.parts) + 1
             allowed = ALLOWED[module] | FILE_ALLOWED.get(source_relative, set())
+            if module == "storage" and relative_path.parts[:1] == ("backends",):
+                allowed |= BACKEND_LEAVES
             for dependency in dependency_roots(code, module_depth):
                 if dependency != module and dependency not in allowed:
                     errors.append(
@@ -245,7 +262,7 @@ def validate(root: Path) -> list[str]:
                 else len(backend_relative_path.parts) + 1
             )
             for dependency in dependency_roots(code, len(path.relative_to(source).parts)):
-                if dependency not in {"model", "storage"}:
+                if dependency not in {"model", "storage"} | BACKEND_LEAVES:
                     errors.append(
                         f"{relative(path, root)}: backend {backend} must not import {dependency}"
                     )

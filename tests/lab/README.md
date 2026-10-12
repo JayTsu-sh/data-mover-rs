@@ -162,7 +162,7 @@ downloaded baseline with `gh attestation verify performance-baseline.csv
 At this public batch seam, scan scheduling latency is the interval between
 successive entry delivery events. Copy scheduling latency is the time from
 admitting the fixed batch to the bounded, concurrency-one queue until each
-entry starts `StorageEnum::copy_file`; copy service time remains represented in
+entry starts `transfer`; copy service time remains represented in
 entries/s and end-to-end elapsed time rather than being mislabeled as queueing.
 Scheduling latency is deliberately null for the single-entry large-copy rows,
 where throughput and elapsed time are the applicable metrics.

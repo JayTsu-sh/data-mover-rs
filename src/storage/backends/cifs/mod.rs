@@ -1,6 +1,7 @@
 //! CIFS adapter facade.
 
 mod at_destination;
+mod connection;
 mod directory;
 mod listing;
 #[cfg(test)]
@@ -16,7 +17,8 @@ mod writer;
 
 use std::sync::Arc;
 
-pub(crate) use protocol::{ensure_root, probe_identity_mode};
+pub(crate) use connection::connect_backend;
+use protocol::{ensure_root, probe_identity_mode};
 
 use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};

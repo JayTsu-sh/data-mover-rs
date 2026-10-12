@@ -1,5 +1,7 @@
 //! Standard S3 roles for the `ArchitectureReady` storage seam.
 
+mod client;
+
 mod broken_body;
 mod capabilities;
 mod current;
@@ -39,6 +41,24 @@ pub(crate) use same_object::{S3ObjectChange, S3SeenObject, object_change};
 use staged::DEFAULT_SINGLE_PUT_THRESHOLD;
 pub(crate) use staged::single_put_threshold;
 
+pub(crate) use client::endpoint_identity;
+pub use client::{S3BucketInfo, list_buckets};
+
+pub(crate) async fn connect_backend(
+    config: crate::storage::S3BackendConfig,
+) -> Result<Storage, crate::storage::BackendConnectError> {
+    // Refuse an invalid threshold before any network I/O.
+    let threshold = single_put_threshold(config.single_put_threshold)
+        .map_err(|error| crate::storage::BackendConnectError::new(BackendKind::S3, error))?;
+    let storage = client::S3Storage::new(&config.url, config.block_size)
+        .await
+        .map_err(|error| crate::storage::BackendConnectError::new(BackendKind::S3, error))?;
+    storage
+        .architecture_storage_with_single_put_threshold(threshold)
+        .map_err(|error| {
+            crate::storage::BackendConnectError::from_roles(BackendKind::S3, error.as_ref())
+        })
+}
 #[cfg(test)]
 pub(crate) fn connect<P>(
     protocol: Arc<P>,

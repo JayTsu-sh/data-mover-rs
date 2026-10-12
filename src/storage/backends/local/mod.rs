@@ -21,6 +21,10 @@ pub(crate) mod source;
 #[allow(dead_code)]
 pub(crate) mod staged;
 
+/// Windows ACL inspection and explicit native operations.
+#[cfg(windows)]
+pub mod windows_acl;
+
 /// Connects the Local roles over `root`, which must exist. The identity is `file:///<realpath>`
 /// (ADR-0006) and every role is given that same canonical root (a role may canonicalize it again;
 /// a symlink swapped in between would be the only way for them to diverge).

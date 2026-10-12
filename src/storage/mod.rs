@@ -30,6 +30,14 @@ pub(crate) use native::{
 pub use crate::runtime::qos::{
     SourceQosBudget, SourceQosGroup, SourceQosPolicy, SourceQosStats, SourceQosValueError,
 };
+// Configuration and resource discovery are the intentional public backend-specific seam.
+pub use backends::hdfs::{
+    HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client,
+};
+#[cfg(windows)]
+pub use backends::local::windows_acl;
+pub use backends::nfs::list_exports;
+pub use backends::s3::{S3BucketInfo, list_buckets};
 pub use capability::{
     BackendCapabilities, Capability, CapabilityAvailability, CapabilityUnavailable,
     CapabilityValueError, PreflightPolicy, UnsupportedReason, ValidationGate,

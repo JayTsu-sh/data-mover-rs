@@ -153,7 +153,7 @@ S3_PREFIX=test                   # bucket 内的子路径
    在子项前后写入时存成什么（不对存储断言），末行 `RESULT: D6 recorded (no assertions)`。其余模式期望
    `RESULT: pass` 与 `cleanup: … deleted` / `… emptied`（清理还核对未完成的上传，列不出就算失败）。临时桶只在
    HEAD 为 404 时才建。
-   版本桶另跑**历史重放**（P7 H1，`examples/s3_history_replay.rs`）：把 `m/`、`z/`、`dirobj/` 的历史旧→新重放进临时
+   版本桶另跑**历史重放**（P7 H1，`tests/lab/tools/s3_history_replay.rs`）：把 `m/`、`z/`、`dirobj/` 的历史旧→新重放进临时
    版本桶（临时桶模式再建一个 `<桶>-r`；已有桶模式写在 `replay/` 前缀下），按种类与大小逐条比对源与目的；再打印对同一
    key 连写两个标记的结果（MinIO / DXN `merged`，ONTAP / StorageGRID `written`）、临时目的桶上 DXN 的 null 版本探测，并
    检查未开版本的桶（`data-mover-test`）与暂停版本的临时桶上删除标记一律 `skipped`、从不写入。

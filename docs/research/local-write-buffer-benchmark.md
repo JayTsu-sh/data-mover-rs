@@ -202,7 +202,7 @@ syscall 开销的影响；两段必须同时报告。
 
 ## 实测结果
 
-基准实现为 [`local_write_benchmark.rs`](../../examples/local_write_benchmark.rs)，矩阵 runner 为
+基准实现为 [`local_write_benchmark.rs`](../../tests/lab/tools/local_write_benchmark.rs)，矩阵 runner 为
 [`run-local-write-benchmark.sh`](../../tests/lab/run-local-write-benchmark.sh)。每个样本创建一个
 新文件；为排除源端分配/复制成本，所有并发 task clone 同一个 immutable `Bytes` payload。
 基准使用与生产相同的 `spawn_blocking + write_at` short-write 循环和 positional inflight，

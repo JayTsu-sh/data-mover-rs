@@ -9,7 +9,7 @@
 #     S3_TLS_VERIFY=false    → tls_verify=false (s3+https:// only; self-signed endpoints; empty or
 #                            true = verify)
 #     S3_BUCKET_TYPE=nas     → bucket_type=nas (only with S3_COMPAT=ontap; empty or object = object)
-# The same rule as .claude/skills/_shared/url_builder.py and examples/endpoint_support.
+# The same rule as .claude/skills/_shared/url_builder.py and examples/support/endpoint.rs.
 #
 # Prints the URL; fails (status 2) on a value the crate would refuse. Call it once before any
 # request to check the environment.

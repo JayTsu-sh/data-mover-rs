@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ACL / xattr copy-policy matrix against real shares (examples/nfs_metadata_copy.rs).
+# ACL / xattr copy-policy matrix against real shares (tests/lab/tools/nfs_metadata_copy.rs).
 # Every case asserts its own outcome; exits non-zero if any case fails. Cleans up after itself.
 #
 # Env (the skill's .env, plus the e2e-cifs .env for the CIFS rung):

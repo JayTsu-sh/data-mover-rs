@@ -17,25 +17,25 @@ tools: [Read, Grep, Glob, Bash]
 
 ### CIFS (`src/storage/backends/cifs/`, role-based only)
 
-- crate: `smb-domain` (package `smb`, JayTsu-sh/smb-rs 固定提交 `18ed91d`)，domain facade
+- crate: `smb-domain` (package `smb`, JayTsu-sh/smb-rs 固定提交，版本以 `Cargo.toml` / `Cargo.lock` 为准)，domain facade
   `Client → Session → Share → File / Directory`；不碰 wire / runtime 类型
 - 构造走 `storage::connect_backend(BackendConfig::Cifs)`，
-  `src/cifs.rs` 只剩 `create_cifs_role_storage` bridge
+  `src/storage/backends/cifs/connection.rs` 封装连接、策略、根身份探测和角色装配
 - 必懂：`protocol.rs` 的 `close_resource`、staged `Checkpointed` / `AtomicReplace`、
-  `CifsNamespace` 只实现 `List`、`Metadata` 只支持 Timestamps + ACL、签名策略 `CifsSigningPolicy`
+  `CifsNamespace` 的命名空间操作、`Metadata` 的 Timestamps + ACL、签名策略 `CifsSigningPolicy`
 - 时间：FileTime (100ns since 1601-01-01) → `time_util`
 - ACL codec：binrw 0.15 (`metadata.rs`)
 
-### NFS (`src/storage/backends/nfs/`, `src/nfs.rs`)
+### NFS (`src/storage/backends/nfs/`, `src/storage/backends/nfs/client.rs`)
 
-- crate: `nfs-rs` 0.2.0
+- crate: `nfs-rs`（版本以 `Cargo.lock` 为准）
 - v3/v4 自动协商
 - retry 分类：EACCES/EPERM → deny_list；EAGAIN/ECONNRESET → delay_backoff
 - moka 缓存 attr，改 attr 后必须 invalidate
 - mount 保活
 - listing 内联属性、目录句柄缓存和过期句柄恢复应保留，避免每项二次 lookup
 
-### S3 (`src/storage/backends/s3/`, `src/s3.rs`)
+### S3 (`src/storage/backends/s3/`, `src/storage/backends/s3/client.rs`)
 
 - crate: `aws-sdk-s3` 1.129.0
 - 404 → `FileNotFound` (commit `7eb3046`)
@@ -47,8 +47,7 @@ tools: [Read, Grep, Glob, Bash]
 
 - capability 目录句柄约束命名空间；阻塞 I/O 通过受控执行器运行
 - Unix: uid/gid/mode/ino 完整
-- Windows: ACL 走 `acl.rs` + windows crate (cfg)
-- rayon 必须在 spawn_blocking 内 spawn
+- Windows: ACL 走 `storage/backends/local/windows_acl.rs` + windows-sys (cfg)
 - rename 与跨存储移动是不同契约；移动必须完成验证和发布后再删除绑定源
 
 ## 输出契约

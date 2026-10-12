@@ -1,5 +1,6 @@
 use clap::Parser;
 #[allow(dead_code)]
+#[path = "support/endpoint.rs"]
 mod endpoint_support;
 use data_mover::model::StoragePath;
 use data_mover::storage::PreflightPolicy;

@@ -14,6 +14,9 @@ cleanup() {
   exit "$status"
 }
 trap 'cleanup $?' EXIT
-cargo test --test s3_architecture_contract standard_s3_architecture_roles_stage_publish_and_read_back -- --ignored --exact --test-threads=1
-cargo test --lib s3::role_protocol::tests::standard_s3_invalid_manifest_is_aborted_and_restartable -- --ignored --exact --test-threads=1
-cargo test --lib s3::role_protocol::tests::standard_s3_native_multipart_copy_uses_owned_upload -- --ignored --exact --test-threads=1
+# The public live contract includes reconnect, stale-upload cleanup and native multipart copy.
+python3 tests/run_cargo_test.py standard_s3_architecture_roles_stage_publish_and_read_back \
+  --test s3_architecture_contract --ignored --exact
+# C19 replaced old manifest rejection with contiguous-prefix recovery and destination pointers.
+python3 tests/run_cargo_test.py storage::backends::s3::staged::at_destination::tests::a_gap_resumes_from_the_contiguous_prefix --exact
+python3 tests/run_cargo_test.py storage::backends::s3::staged::at_destination::tests::leftovers_are_cleaned_up_and_the_upload_starts_over --exact

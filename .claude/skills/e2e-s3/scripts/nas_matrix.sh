@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The ONTAP NAS bucket profile (`?compat=ontap&bucket_type=nas`, P7 §14.2) against the real bucket
-# `data-mover-nas`, through examples/transfer_resume.rs. One line per case and a verdict
+# `data-mover-nas`, through tests/lab/tools/transfer_resume.rs. One line per case and a verdict
 # (`ok` / `FAIL: …`); the last line is `RESULT: pass` or `RESULT: fail (n)`.
 #
 #   S3_ENV=.claude/skills/e2e-s3/ontap/.env bash .claude/skills/e2e-s3/scripts/nas_matrix.sh

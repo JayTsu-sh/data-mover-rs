@@ -3,8 +3,10 @@
 
 import csv
 import json
+import os
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -16,6 +18,62 @@ NIGHTLY = ROOT / ".github" / "workflows" / "nightly.yml"
 
 
 class PerformanceBaselineTest(unittest.TestCase):
+    def test_small_benchmark_target_is_present_at_its_declared_lab_path(self):
+        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        target = next(
+            example for example in manifest.get("example", [])
+            if example["name"] == "storage_small_benchmark"
+        )
+        self.assertEqual(target["path"], "tests/lab/tools/storage_small_benchmark.rs")
+        self.assertTrue((ROOT / target["path"]).is_file())
+
+    def test_failed_build_cannot_run_or_measure_a_stale_small_benchmark(self):
+        with tempfile.TemporaryDirectory(prefix="performance runner ") as temporary:
+            project = Path(temporary)
+            lab = project / "tests" / "lab"
+            lab.mkdir(parents=True)
+            (lab / "run-performance-baseline.sh").write_text(RUNNER.read_text())
+            (lab / "common.sh").write_text('validate_run_id() { return 0; }\n')
+            large_marker = project / "large-was-run"
+            large = lab / "run-inflight-benchmark.sh"
+            large.write_text('#!/bin/sh\ntouch "$LARGE_MARKER"\nexit 99\n')
+            large.chmod(0o755)
+            stale = project / "stale small benchmark"
+            stale.write_text('#!/bin/sh\ntouch "$SMALL_MARKER"\nexit 99\n')
+            stale.chmod(0o755)
+            small_marker = project / "small-was-run"
+            binaries = project / "bin"
+            binaries.mkdir()
+            git = binaries / "git"
+            git.write_text('#!/bin/sh\nprintf "%s\\n" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n')
+            git.chmod(0o755)
+            cargo = binaries / "cargo"
+            # A compiler artifact from an unsuccessful build is never candidate evidence.
+            cargo.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$STALE_ARTIFACT"\nexit 44\n'
+            )
+            cargo.chmod(0o755)
+            env = os.environ.copy()
+            env.update({
+                "PATH": str(binaries) + os.pathsep + env["PATH"],
+                "PERF_HARDWARE_ID": "fixture-host",
+                "LARGE_MARKER": str(large_marker),
+                "SMALL_MARKER": str(small_marker),
+                "STALE_ARTIFACT": json.dumps({
+                    "reason": "compiler-artifact",
+                    "target": {"name": "storage_small_benchmark", "kind": ["example"]},
+                    "executable": str(stale),
+                }),
+            })
+            result = subprocess.run(
+                ["bash", "tests/lab/run-performance-baseline.sh", "nightly-perf-fixture"],
+                cwd=project, env=env, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 44, result.stderr)
+            self.assertFalse(large_marker.exists())
+            self.assertFalse(small_marker.exists())
+            self.assertFalse((project / "performance-baseline.csv").exists())
+
     def test_runner_fixes_conditions_and_exercises_public_scan_and_copy(self):
         runner = RUNNER.read_text()
         self.assertIn("PERF_HARDWARE_ID", runner)

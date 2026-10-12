@@ -59,6 +59,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Security_Authorization",
 ] }
 windows-sys = { version = "0.61.2", features = [
+    "Wdk_System_SystemServices",
     "Win32",
     "Win32_Security",
     "Win32_Security_Authorization",
@@ -95,3 +96,77 @@ expect_used = "deny"
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
+
+# Lab executables retain their cargo target names; source lives with the harnesses.
+
+[[example]]
+name = "storage_small_benchmark"
+path = "tests/lab/tools/storage_small_benchmark.rs"
+
+[[example]]
+name = "local_write_benchmark"
+path = "tests/lab/tools/local_write_benchmark.rs"
+
+[[example]]
+name = "storage_resume"
+path = "tests/lab/tools/storage_resume.rs"
+
+[[example]]
+name = "nfs_metadata_copy"
+path = "tests/lab/tools/nfs_metadata_copy.rs"
+
+[[example]]
+name = "hdfs_fault_mutation"
+path = "tests/lab/tools/hdfs_fault_mutation.rs"
+
+[[example]]
+name = "nfs_copy_comparison"
+path = "tests/lab/tools/nfs_copy_comparison.rs"
+
+[[example]]
+name = "local_copy_comparison"
+path = "tests/lab/tools/local_copy_comparison.rs"
+
+[[example]]
+name = "storage_delete_contract"
+path = "tests/lab/tools/storage_delete_contract.rs"
+
+[[example]]
+name = "nfs_opt_dir"
+path = "tests/lab/tools/nfs_opt_dir.rs"
+
+[[example]]
+name = "cifs_mount_comparison"
+path = "tests/lab/tools/cifs_mount_comparison.rs"
+
+[[example]]
+name = "nfs_mount_comparison"
+path = "tests/lab/tools/nfs_mount_comparison.rs"
+
+[[example]]
+name = "s3_history_replay"
+path = "tests/lab/tools/s3_history_replay.rs"
+
+[[example]]
+name = "transfer_resume"
+path = "tests/lab/tools/transfer_resume.rs"
+
+[[example]]
+name = "nfs3_contract"
+path = "tests/lab/tools/nfs3_contract.rs"
+
+[[example]]
+name = "hdfs_kerberos_copy"
+path = "tests/lab/tools/hdfs_kerberos_copy.rs"
+
+[[example]]
+name = "hdfs_ha_probe"
+path = "tests/lab/tools/hdfs_ha_probe.rs"
+
+[[example]]
+name = "storage_inspect"
+path = "tests/lab/tools/storage_inspect.rs"
+
+[[example]]
+name = "storage_role_operations"
+path = "tests/lab/tools/storage_role_operations/main.rs"

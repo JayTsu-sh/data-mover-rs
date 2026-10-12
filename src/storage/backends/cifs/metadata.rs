@@ -182,7 +182,7 @@ impl Metadata for CifsMetadata {
 }
 
 /// Keeps only explicit DACL entries plus the inheritance-protection bit, mirroring the
-/// Windows `acl::copy_acl` contract: inherited ACEs belong to the destination tree.
+/// Windows `storage::windows_acl::copy_acl` contract: inherited ACEs belong to the destination tree.
 fn explicit_dacl(mut descriptor: smb_domain::SecurityDescriptor) -> smb_domain::SecurityDescriptor {
     if let Some(dacl) = descriptor.dacl.as_mut() {
         dacl.ace.retain(|ace| !ace.ace_flags.inherited());

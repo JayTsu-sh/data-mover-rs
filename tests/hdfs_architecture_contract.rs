@@ -13,12 +13,12 @@ use data_mover::storage::{
     PreflightPolicy, PrepareFact, PrepareRequest, PublishRequest, ResumeMode, SourceDescriptor,
     Storage, StorageRoleFailure, VerifyRequest, connect_backend,
 };
+use data_mover::storage::{HdfsConfig, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client};
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
     Checkpoint, Resumable, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome,
     TraversalRequest, TraversalSource as _,
 };
-use data_mover::{HdfsConfig, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client};
 use hdfs_native::{Client, WriteOptions};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio_util::sync::CancellationToken;

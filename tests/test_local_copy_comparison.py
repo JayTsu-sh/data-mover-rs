@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "tests" / "lab" / "run-local-copy-comparison.sh"
-BENCHMARK = ROOT / "examples" / "local_copy_comparison.rs"
+BENCHMARK = ROOT / "tests/lab/tools" / "local_copy_comparison.rs"
 
 
 class LocalCopyComparisonTest(unittest.TestCase):

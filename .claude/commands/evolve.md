@@ -104,8 +104,8 @@ $ /evolve
 - L2-L7 仍在观察期
 
 ### 升级到 CI grep (新建议)
-- L4 (NFS EACCES → deny_list): 加 CI grep 检查 src/nfs.rs 是否把 EACCES 走 retry
-  verify: `grep -nE 'EACCES.*retry|retry.*EACCES' src/nfs.rs` 应空
+- L4 (NFS EACCES → deny_list): 加 CI grep 检查 src/storage/backends/nfs/client.rs 是否把 EACCES 走 retry
+  verify: `grep -nE 'EACCES.*retry|retry.*EACCES' src/storage/backends/nfs/client.rs` 应空
 
 ### 丢弃 (无)
 ### 合并 (无)

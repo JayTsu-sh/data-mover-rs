@@ -7,7 +7,7 @@
   `tls_verify=false` 才换成 `hyper-rustls` + 不校验证书的 verifier（显式 ring provider）。
 - IAM credential 链路：标准 AWS 行为 (env / config file / IMDS)。
 
-## URL 形式（P7 §14.2，唯一解析器 `src/s3/url_options.rs`）
+## URL 形式（P7 §14.2，唯一解析器 `src/storage/backends/s3/client/url_options.rs`）
 
 ```
 s3://ak:sk@bucket.host[:port][/prefix][?参数]          HTTP
@@ -183,12 +183,12 @@ HEAD 当前 → 404、HEAD 旧版本 → 200。传输中途上传新版本，钉
 `Unsupported`）：拷贝不读源端元数据，报告把每个要的族记成 `skipped()`（`DestinationCannotStore`）。对象的
 时间是写入时间。见 [metadata-negotiation.md](metadata-negotiation.md)「目的端什么都不存」。
 真机：VM 102 的 MinIO（`.claude/skills/e2e-s3/.env`，bucket `data-mover-test`），
-`examples/nfs_metadata_copy.rs` 的 `s3:<prefix>` 端点。**URL 里的 AK/SK 原样使用、不做百分号解码**
+`tests/lab/tools/nfs_metadata_copy.rs` 的 `s3:<prefix>` 端点。**URL 里的 AK/SK 原样使用、不做百分号解码**
 （e2e-s3 的 `url_builder.py` 会 quote，含特殊字符的 SK 会因此出错）。
 
 ### 目的端写入策略基线（C0，改造前，2026-09-24，VM 102 MinIO RELEASE.2023-03-20）
 
-`bash .claude/skills/e2e-s3/scripts/staged_matrix.sh`（驱动 `examples/transfer_resume.rs`，只写/删 `staged-<run>/`）。
+`bash .claude/skills/e2e-s3/scripts/staged_matrix.sh`（驱动 `tests/lab/tools/transfer_resume.rs`，只写/删 `staged-<run>/`）。
 C0 时所有策略都是「temp key 分段上传 → CopyObject 到 final → 删 temp」，1 KiB 也不例外（C14b 起 ≤ T 的对象
 改为一次 PutObject，见上）。
 
@@ -247,7 +247,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - `S3Protocol::upload_part` 每段带 `Content-MD5`（不符 → `BadDigest`，条目 `Corruption` / Transient）；
   `complete_multipart` 返回 `S3WriteFacts`（对象 `ETag` + 规范化后的 versionId）；`list_uploads(key)` 只返回
   **恰好这个 key** 上进行中的 upload id（按前缀列再过滤 `Key == key`：MinIO 只按精确 key 列，AWS / Ceph /
-  StorageGRID 按前缀列）。实现在 `src/s3/role_protocol/multipart.rs`。
+  StorageGRID 按前缀列）。实现在 `src/storage/backends/s3/client/role_protocol/multipart.rs`。
 - `composite_etag(part_etags)`（`protocol.rs`）：`"<各段二进制 MD5 拼接后的 MD5>-<段数>"`；任一段 `ETag`
   不是带引号的 32 位 hex MD5（SSE-KMS 等）→ `None`，不做检查。
 - `InvalidPart` / `InvalidPartOrder` → 条目 `Conflict` / Permanent；`EntityTooSmall` → 条目 `Corruption` / Permanent。
@@ -339,7 +339,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 
 ### 版本化桶（ADR-0006 C17）
 
-- 协议新增（`src/s3/role_protocol/versions.rs`）：`delete_version(key, id)` = 带 `versionId` 的 DeleteObject，
+- 协议新增（`src/storage/backends/s3/client/role_protocol/versions.rs`）：`delete_version(key, id)` = 带 `versionId` 的 DeleteObject，
   彻底删这个版本、不加删除标记；删不存在的版本回 204 算成功（MinIO 实测）；Object Lock 拒绝 → 条目
   `PermissionDenied` / Permanent（AWS 403 `AccessDenied`；MinIO 400 `InvalidRequest`「Object is WORM protected」，实测）；
   405（存储不支持按版本删）→ `Unsupported`，不是带版本读的「删除标记」`NotFound`。`list_versions(key)` =
@@ -432,7 +432,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 - **拷贝请求都带 `Content-Length: 0`**（所有 profile）：SDK 对没有 body 的请求不发长度（hyper 对空 body 不加）。Ceph RGW
   （DXN）把 `UploadPartCopy` 当分段上传处理、缺长度回 `411 MissingContentLength`（2026-09-25，`791f30d` 只给它加）；ONTAP
   9.19.1 对**`CopyObject`** 缺长度也回 411（对象桶与 NAS 桶，2026-09-26）—— ≤ 64 MiB 的原生拷贝在 ONTAP 上因此必败。
-  `994828c` 起四处拷贝请求一律带（`src/s3/copy_request.rs::state_empty_body`，`customize().mutate_request`）：role
+  `994828c` 起四处拷贝请求一律带（`src/storage/backends/s3/client/copy_request.rs::state_empty_body`，`customize().mutate_request`）：role
   `CopyObject` / `UploadPartCopy`（`role_protocol/native.rs`）与 legacy `CopyObject`（`s3.rs::copy_object`）/ `UploadPartCopy`
   （`multipart_rename.rs`）。curl 实测 MinIO、RustFS、DXN、ONTAP 都接受（RFC 9110：PUT 应带长度；AWS 未复测、
   StorageGRID 未测）。wire 测试 `role_protocol::native::tests::copies_pin_the_source_and_copy_no_metadata`（role 两种）与
@@ -529,7 +529,7 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
 
 role namespace 隐藏相对根任意一段以 `.data-mover-` 开头的对象；原始删除接口仍能清理 artifact。
 版本化桶每 key 一项，`ObjectHistory` 按记录顺序重放版本与删除标记；单 key 超过记录上限时消费有序分段。
-历史重放入口是 `examples/s3_history_replay.rs`。旧 scanner 的历史实验记录已移到
+历史重放入口是 `tests/lab/tools/s3_history_replay.rs`。旧 scanner 的历史实验记录已移到
 [历史证据](../../docs/design/p7-legacy-history.md)，API 迁移见 [清理清单](../../docs/design/p7-legacy-cleanup.md)。
 
 ### role-based 遍历与版本模式（ADR-0006 C22；P7 C11b：版本化桶每个 key 一项）
@@ -598,7 +598,7 @@ role namespace 隐藏相对根任意一段以 `.data-mover-` 开头的对象；�
   `a/./b` 折成 `a/b`，两个对象写到同一个文件；`List("a/")` / `"a//b"` / `"a/."` 这类路径 `InvalidInput`。不理 delimiter 的存储
   平铺返回的深层 key 在客户端收拢成一级前缀（去重）。`.data-mover-*` 两种模式都隐藏（key 或任意一段前缀）。
 - **是否列历史**（P7 Q26 / Q-A，C11b）：连接时 `GetBucketVersioning` 的回答（`S3VersioningAtConnect`，
-  `src/s3/versioning_answer.rs`）：`Enabled` / `Suspended` / 明确拒绝（403 等，未知 Status 同）→ 列历史；从未开启 /
+  `src/storage/backends/s3/client/versioning_answer.rs`）：`Enabled` / `Suspended` / 明确拒绝（403 等，未知 Status 同）→ 列历史；从未开启 /
   501·`NotImplemented`·`UnsupportedOperation` → `ListObjectsV2`；无响应 / 超时 / 408 / 429 / 5xx / `RequestTimeout`·`SlowDown` 等
   （SDK 重试之后）→ **role connect 失败** `BackendSessionFailure` Connect / `Connectivity` / `Transient`（诊断带 HTTP 状态；
   `connect_backend` 的 `BackendConnectError::session_failure()` 给出它），不猜；构造请求失败按拒绝处理。NAS profile 一律不列历史、
@@ -630,7 +630,7 @@ role namespace 隐藏相对根任意一段以 `.data-mover-` 开头的对象；�
   `VersionScoped(id)`，`ReadSource::observation_matches` 在 describe 到的路径与版本 ETag 拼出的身份等于列举的身份时认作同一对象，
   对象被替换则仍报 "source differs"；offer / evidence 带观察的身份键（目的端半程比对它），读仍钉在 describe 到的版本。
   带历史的条目只有 `current()` 有值时能走专家传输：已删的 key 报 "deleted now"、非最后一段报 "not its last"；旧版本用
-  `with_source_version` 拷（`examples/s3_history_replay.rs`）。
+  `with_source_version` 拷（`tests/lab/tools/s3_history_replay.rs`）。
 - **拒绝**：S3 的变更动词 `Unsupported`；`delete_tree` / `create_directory_all` 在 I/O 前拒绝 S3（同以前）。非 S3
   存储没有历史，条目不带 `history()`。
 - **例子与真机**：`S3_LISTING_URL=… cargo run --example storage_role_operations -- --backend s3 traverse [--order blocks]
@@ -640,7 +640,7 @@ role namespace 隐藏相对根任意一段以 `.data-mover-` 开头的对象；�
   实际扫描 cancel / SIGKILL 续跑与环境限制见设计文档 §14.3。
 ### 版本历史顺序与 ONTAP 分页
 
-`src/s3/version_order.rs` 的 `send_in_document_order` 保留 SDK 原始 XML 中 Version / DeleteMarker
+`src/storage/backends/s3/client/version_order.rs` 的 `send_in_document_order` 保留 SDK 原始 XML 中 Version / DeleteMarker
 的交错顺序，role 协议据此构造 `HistoryOrder::Server`。顺序无法验证时显式标为 `Inferred`；
 `LastModified` 不能恢复同毫秒并发写入的真实顺序。组装规则在 `storage/backends/s3/history.rs`。
 `version_order_tests.rs` 用真实 MinIO XML 回放并验证整页、22 页跨页和重试响应顺序。
@@ -770,13 +770,13 @@ Content-MD5，是 `Matched`）；存储若在扣字节期间因 body 空闲断�
 - skill：`.claude/skills/e2e-s3/` (需要 `.env` 含 endpoint/bucket/ak/sk)。
 - skill 检查不存在的 prefix 返回平衡空列表；HEAD 的 NoSuchKey 映射由 metadata 测试覆盖。
 - `DM-STORAGEGRID-REQUEST-CONTRACT`：
-  `cargo test s3::storagegrid::tests --locked`，在 capturing Smithy connector seam
+  `cargo test --lib storage::backends::s3::client::storagegrid::tests --locked`，在 capturing Smithy connector seam
   验证只有 StorageGRID 去 `x-id`、所有 profile 的 DeleteObjects 都带签名 MD5；PR 与 release workflow 均独立执行。
-- `examples/storage_role_operations/` — role 遍历与历史记录输出。
+- `tests/lab/tools/storage_role_operations/` — role 遍历与历史记录输出。
 
 ## 改 S3 时
 
-1. 读本 doc + 当前 `src/s3.rs`。
+1. 读本 doc + 当前 `src/storage/backends/s3/client.rs`。
 2. 改错误映射必须同步 [error-taxonomy.md](error-taxonomy.md)。
 3. 改 multipart 阈值 / 并发，跑性能测试 (skill 暂未含)。
 4. 调 `backend-specialist` agent 传 `s3`。

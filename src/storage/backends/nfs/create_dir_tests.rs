@@ -1,5 +1,5 @@
 //! `create_directory_all` driving the NFS namespace adapter level by level (the adapter's
-//! `create_directory` creates one level, `src/nfs/role_namespace.rs`), with the server refusals
+//! `create_directory` creates one level, `src/storage/backends/nfs/client/role_namespace.rs`), with the server refusals
 //! classified as the NFS role classifies them.
 
 use std::collections::HashSet;

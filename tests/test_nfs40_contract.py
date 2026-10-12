@@ -23,7 +23,7 @@ class Nfs40ContractTest(unittest.TestCase):
         self.assertIn('LAB_NFS40_EXPORT="${LAB_NFS40_EXPORT:-/jay_nfs}"', common)
 
     def test_contract_exercises_acl_operations_and_typed_unsupported(self):
-        contract = (ROOT / "examples/nfs3_contract.rs").read_text()
+        contract = (ROOT / "tests/lab/tools/nfs3_contract.rs").read_text()
         self.assertIn("MetadataObservation::Value", contract)
         self.assertIn("ObservationMode::Required", contract)
         self.assertIn("MetadataMutation::Acl", contract)
@@ -34,7 +34,7 @@ class Nfs40ContractTest(unittest.TestCase):
         self.assertIn("mount.setacl", contract)
 
     def test_contract_exercises_real_cancellation_and_restart_upload(self):
-        contract = (ROOT / "examples/nfs3_contract.rs").read_text()
+        contract = (ROOT / "tests/lab/tools/nfs3_contract.rs").read_text()
         self.assertIn("validate_cancel_and_restart", contract)
         self.assertIn("failure.discard_stage().await?", contract)
         self.assertIn("TransferPolicy::Checkpointed", contract)
@@ -42,7 +42,7 @@ class Nfs40ContractTest(unittest.TestCase):
         self.assertIn("cancel.cancel()", contract)
 
     def test_contract_replaces_a_real_v40_file_handle(self):
-        contract = (ROOT / "examples/nfs3_contract.rs").read_text()
+        contract = (ROOT / "tests/lab/tools/nfs3_contract.rs").read_text()
         self.assertIn("validate_nfs4_stale_retry", contract)
         self.assertIn("stale fixture did not replace the file identity", contract)
         self.assertIn("MetadataMutation::NumericOwnership", contract)

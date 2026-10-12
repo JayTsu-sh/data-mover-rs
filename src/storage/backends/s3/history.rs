@@ -3,7 +3,7 @@
 //! `ListObjectVersions` lists keys in ascending order and each key's versions and delete markers
 //! newest first, as one sequence of `<Version>` and `<DeleteMarker>` elements. The SDK parses the
 //! two element kinds into separate lists, so every listed entry carries its place in the server's
-//! document order (`position`, read from the raw response — `crate::s3::version_order`), and
+//! document order (`position`, read from the raw response — `crate::storage::backends::s3::client::version_order`), and
 //! [`key_histories`] rebuilds each key's history from one whole listing (every page, so no key is
 //! split):
 //!

@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     let target = env::args().nth(1).ok_or_else(|| {
         StorageError::ConfigError("usage: nfs_export <host | nfs://host/...?options>".to_string())
     })?;
-    let entries = data_mover::nfs::list_exports(&target).await?;
+    let entries = data_mover::storage::list_exports(&target).await?;
     for entry in entries {
         println!("{entry:?}");
     }

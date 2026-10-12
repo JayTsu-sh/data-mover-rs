@@ -205,12 +205,12 @@ fn network_endpoint_identities_are_derived_offline_without_credentials()
 fn hdfs_endpoint_identity_is_derived_offline() -> Result<(), Box<dyn std::error::Error>> {
     let direct = endpoint_identity(&BackendConfig::Hdfs(HdfsBackendConfig {
         location: "hdfs://dm@NameNode:8020/data/root".into(),
-        client: data_mover::HdfsConfig::default(),
+        client: data_mover::storage::HdfsConfig::default(),
         block_size: None,
         ensure_dir: false,
     }))?;
     assert_eq!(direct.stable_id(), "hdfs://namenode:8020/data/root");
-    let mut client = data_mover::HdfsConfig::default();
+    let mut client = data_mover::storage::HdfsConfig::default();
     client
         .overrides
         .insert("dfs.ha.namenodes.NS1".into(), "nn1,nn2".into());

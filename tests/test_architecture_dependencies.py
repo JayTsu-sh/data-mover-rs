@@ -85,7 +85,7 @@ class ArchitectureDependenciesTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(f"{module} must not import {dependency}", result.stderr)
 
-    def test_guard_limits_legacy_backend_dependencies_to_storage_factory(self):
+    def test_guard_rejects_top_level_backend_dependencies_in_storage(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = Path(temporary)
             shutil.copytree(ROOT / "src", fixture / "src")
@@ -95,6 +95,39 @@ class ArchitectureDependenciesTest(unittest.TestCase):
             result = self.run_validator(fixture)
         self.assertEqual(result.returncode, 2)
         self.assertIn("storage must not import nfs", result.stderr)
+
+    def test_factory_has_no_top_level_backend_exception(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            shutil.copytree(ROOT / "src", fixture / "src")
+            factory = fixture / "src" / "storage" / "factory.rs"
+            factory.write_text(factory.read_text() + "\nuse crate::nfs::NFSStorage;\n")
+            result = self.run_validator(fixture)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("storage must not import nfs", result.stderr)
+
+    def test_guard_rejects_reintroduced_top_level_implementations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            shutil.copytree(ROOT / "src", fixture / "src")
+            for module in {"acl", "cifs", "hdfs", "nfs", "s3"}:
+                (fixture / "src" / f"{module}.rs").write_text("// misplaced implementation\n")
+            result = self.run_validator(fixture)
+        self.assertEqual(result.returncode, 2)
+        for module in {"acl", "cifs", "hdfs", "nfs", "s3"}:
+            self.assertIn(f"top-level {module} implementation must live in its owning backend", result.stderr)
+
+    def test_backend_shared_leaves_do_not_allow_orchestration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            shutil.copytree(ROOT / "src", fixture / "src")
+            (fixture / "src" / "storage" / "backends" / "s3" / "bad.rs").write_text(
+                "use crate::error::StorageError;\nuse crate::transfer::TransferRequest;\n"
+            )
+            result = self.run_validator(fixture)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("backend s3 must not import transfer", result.stderr)
+        self.assertNotIn("must not import error", result.stderr)
 
     def test_guard_rejects_cross_backend_import(self):
         with tempfile.TemporaryDirectory() as temporary:

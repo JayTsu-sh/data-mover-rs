@@ -16,7 +16,7 @@
 **verify**:
 
 ```bash
-grep -nE '\.close\(\)' src/storage/backends/cifs/*.rs src/nfs.rs src/s3.rs | grep -v close_resource
+grep -nE '\.close\(\)' src/storage/backends/cifs/*.rs src/storage/backends/nfs/client.rs src/storage/backends/s3/client.rs | grep -v close_resource
 ```
 
 应空 (除了 helper 自身实现)。
@@ -30,7 +30,7 @@ grep -nE '\.close\(\)' src/storage/backends/cifs/*.rs src/nfs.rs src/s3.rs | gre
 
 ```bash
 # retry 行为应该集中在 retry helper，不散写
-grep -nE 'retry|backoff|sleep' src/{nfs,s3}.rs src/storage/backends/local/*.rs src/storage/backends/cifs/*.rs
+grep -nE 'retry|backoff|sleep' src/storage/backends/{nfs,s3}/client.rs src/storage/backends/local/*.rs src/storage/backends/cifs/*.rs
 ```
 
 **why**: 上游 sync 引擎根据错误变体决定重试，决策必须一致。
@@ -41,7 +41,7 @@ grep -nE 'retry|backoff|sleep' src/{nfs,s3}.rs src/storage/backends/local/*.rs s
 **verify**:
 
 ```bash
-grep -nE 'UrlParseError|ConfigError' src/{nfs,s3}.rs src/storage/backends/local/*.rs src/s3/url_options.rs
+grep -nE 'UrlParseError|ConfigError' src/storage/backends/{nfs,s3}/client.rs src/storage/backends/local/*.rs src/storage/backends/s3/client/url_options.rs
 ```
 
 **URL 文本自己就能判定的错误**都返回 `UrlParseError`：语法、协议名（含已删除的旧协议名，报错给出新写法）、
@@ -51,20 +51,13 @@ grep -nE 'UrlParseError|ConfigError' src/{nfs,s3}.rs src/storage/backends/local/
 
 **why**: 上游能精准区分"用户写错 URL" vs "配置缺字段"；同一段 URL 文本在任何环境下报同一个错。
 **how to apply**: `url::Url::parse(...)?` 失败、参数表校验失败 → `UrlParseError`；URL 本身合法、与其他配置
-矛盾 → `ConfigError`。S3 的参数表只在 `src/s3/url_options.rs` 一处。报错不回显 URL 与凭据（R8）。
+矛盾 → `ConfigError`。S3 的参数表只在 `src/storage/backends/s3/client/url_options.rs` 一处。报错不回显 URL 与凭据（R8）。
 
-## D5 · backend 内部不可反向依赖 `StorageEnum`
+## D5 · backend 不反向依赖通用编排
 
-**verify**:
-
-```bash
-grep -nE 'use crate::storage_enum::StorageEnum' src/{nfs,s3}.rs src/storage/backends/local/*.rs src/storage/backends/*/*.rs
-```
-
-应空。
-
-**why**: 模块边界清晰，避免循环依赖。enum 是组合层，不是 backend 实现细节。
-**how to apply**: backend 间数据传递走 `EntryEnum` / `NASEntry` / `S3Entry` 等通用类型，不通过 `StorageEnum`。
+**verify**: `make arch-guard`。
+**why**: 通用传输、遍历和运行时依赖角色契约；具体协议实现封装在 backend 内。
+**how to apply**: backend 间通过 `storage::model` 和角色契约协作，不引用 `transfer`、`traversal` 或其他 backend。
 
 ## D6 · 时间字段必须走 `time_util`
 
@@ -72,34 +65,18 @@ grep -nE 'use crate::storage_enum::StorageEnum' src/{nfs,s3}.rs src/storage/back
 **why**: SMB FileTime (1601 epoch, 100ns) / NFS Time (s + ns) / S3 DateTime (ms) / Unix (ns) 互转坑多。
 **how to apply**: backend 拿到协议时间结构直接传 time_util 的转换函数。
 
-## D7 · Backend 必须实现的最小操作集
+## D7 · 能力声明与角色行为一致
 
-所有 backend 提供 role 列举；保留的 legacy backend 操作签名与 `StorageEnum` 一致：
+通过 `Storage` 出借的角色提供读取、暂存写入、命名空间和元数据操作。
+操作支持情况由能力协商和角色契约表达；不支持的操作返回 typed `Unsupported`，不得静默成功。
+新增操作必须同时检查契约、适配器和相应行为测试。
 
-- role `Namespace::list` (逐页)，通过 `StorageTraversalSource` 遍历
-- `get_metadata`
-- `mkdir` / `mkdir_or_open`
-- `read_file` / `write_file`
-- `copy_file` / `copy_file_with_cancel`
-- `delete_file` / `delete_dir_all`
-- `rename`
-- `check_connectivity`
-- `probe_server_time`
+## D8 · 具体客户端留在 backend 内部
 
-不支持的操作 → 返回 `StorageError::UnsupportedType("operation X for backend Y")`，**不要静默 noop**。
-
-## D8 · 公开 backend 类型不直接暴露给用户
-
-**verify**:
-
-```bash
-grep -nE 'pub use crate::(nfs::NFSStorage|s3::S3Storage|local::LocalStorage)' src/lib.rs
-```
-
-应空 — 只 `pub use crate::storage_enum::StorageEnum`。
-
-**why**: 用户拿到具体 backend 类型会绕过 `StorageEnum` 抽象，导致代码与 backend 耦合。
-**how to apply**: 如果用户需要某 backend 特有功能，加到 `StorageEnum` 的方法 (匹配只对应 backend 有实际操作，其他 backend 返回 `UnsupportedType`)。
+**verify**: `make arch-guard`；检查 `storage/mod.rs` 的公开导出。
+**why**: 公开具体客户端会让调用方绕过角色契约并依赖 SDK。
+**how to apply**: `connect_backend` 接受类型化配置并返回角色连接；配置和发现工具统一从
+`storage` 导出。Windows ACL 工具从 `storage::windows_acl` 导出，实现在 Local backend。
 
 ## D9 · smb-rs 依赖只固定 main 上的提交，升级走完整矩阵
 

@@ -1240,3 +1240,71 @@ async fn positioned_sparse_completion_crosses_multiple_intervals_once() -> io::R
     ok(adapter.discard(stage).await);
     Ok(())
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_acl_batch_reopens_stage_and_survives_publication() -> io::Result<()> {
+    use crate::model::{AclEncoding, AclMetadata};
+    use crate::storage::backends::local::windows_acl;
+    let root = TestRoot::new().await?;
+    let source = root.0.join("acl-source");
+    std::fs::write(&source, b"source")?;
+    // Give the source's current access entries explicit status, so protecting the test ACL
+    // retains the runner's access rather than intentionally constructing a deny-everyone ACL.
+    let mut descriptor = windows_acl::get_acl_bytes(&source)?;
+    let offset =
+        u32::from_le_bytes(descriptor[16..20].try_into().map_err(io::Error::other)?) as usize;
+    assert_ne!(offset, 0);
+    let count = u16::from_le_bytes([descriptor[offset + 4], descriptor[offset + 5]]);
+    let mut position = offset + 8;
+    for _ in 0..count {
+        descriptor[position + 1] &= !0x10;
+        position += usize::from(u16::from_le_bytes([
+            descriptor[position + 2],
+            descriptor[position + 3],
+        ]));
+    }
+    for protected in [false, true] {
+        let mut control = u16::from_le_bytes([descriptor[2], descriptor[3]]);
+        if protected {
+            control |= 0x1000;
+        } else {
+            control &= !0x1000;
+        }
+        descriptor[2..4].copy_from_slice(&control.to_le_bytes());
+        let backend = identity(&format!("windows-acl-stage-{protected}"));
+        let adapter = ok(LocalStagedDestination::new(&root.0, backend.clone(), 1));
+        let name = format!("nested/final-{protected}");
+        let stage = ok(prepare_ephemeral_stage(&adapter, request(&backend, &name)).await);
+        ok(adapter.write(&stage, bytes(&[b"new-bytes"])).await);
+        let acl = AclMetadata::new(AclEncoding::WindowsSecurityDescriptor, descriptor.clone())
+            .map_err(io::Error::other)?;
+        ok(adapter
+            .apply_metadata_batch(
+                &stage,
+                vec![MetadataMutation::Acl(acl)],
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .map_err(|failure| format!("ACL metadata batch failed: {failure:?}")));
+        ok(adapter
+            .publish(
+                &stage,
+                PublishRequest {
+                    expected_size: 9,
+                    expected_blake3: Some(*blake3::hash(b"new-bytes").as_bytes()),
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                },
+            )
+            .await
+            .map_err(|failure| failure.error));
+        let final_path = root.0.join(name);
+        assert_eq!(std::fs::read(&final_path)?, b"new-bytes");
+        assert_eq!(
+            windows_acl::get_security_info(&final_path)?.inheritance_enabled,
+            !protected
+        );
+    }
+    assert!(staging_is_empty(&root.0)?);
+    Ok(())
+}

@@ -18,7 +18,7 @@
 //!   the mistake cannot pass silently — only the leaf could.
 //!
 //!   **NFS is the exception, and it is not this helper's doing.** Its one-level
-//!   `create_directory` (`src/nfs/role_namespace.rs`) removes a non-directory it finds at the
+//!   `create_directory` (`src/storage/backends/nfs/client/role_namespace.rs`) removes a non-directory it finds at the
 //!   level after `EXIST` and creates the directory in its place — the legacy helper's
 //!   deliberate rsync-style migration semantics, kept and logged at `warn`. So on NFS a file at
 //!   any level — leaf included — is replaced rather than reported, and the call succeeds

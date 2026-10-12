@@ -271,6 +271,6 @@ to a guest session that cannot be signed, so `Deny` (the default) refuses it. Wi
 `AllowUnsigned` an empty `username` sends a placeholder identity for the server's guest
 mapping. The legacy `smb://` URL and `smb2_only` option were removed together with the
 legacy `CifsStorage` path (#150).
-`examples/cifs_mount_comparison.rs` and `tests/cifs_policy_contract.rs` read
+`tests/lab/tools/cifs_mount_comparison.rs` and `tests/cifs_policy_contract.rs` read
 `CIFS_REAL_SERVER`, `CIFS_REAL_SECOND_SERVER`, `CIFS_REAL_SHARE`, `CIFS_REAL_USER`,
 and `CIFS_REAL_PASS`.

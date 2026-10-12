@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ADR-0006 C22 / P7 C11b: the role-based S3 traversal against a real server
-# (examples/storage_role_operations/traverse.rs): on a versioned bucket each key is ONE entry with
+# (tests/lab/tools/storage_role_operations/traverse.rs): on a versioned bucket each key is ONE entry with
 # its history (`File <key> history=<segment>/<complete> records=<n>[ order=inferred]`, then one
 # `Record <key> <segment>.<n> version=<id|null> latest=<0|1> marker=<0|1> size=<n|->` line per
 # version and delete marker), and `--current` prints the current objects only.
@@ -240,7 +240,7 @@ else
 fi
 [ "$VERSIONED" = 1 ] && echo "server entries: $(entries | wc -l)" || echo "server keys: $(keys | wc -l)"
 
-# Raw, as examples/endpoint_support builds it: the URL parser splits the key pair at the first
+# Raw, as examples/support/endpoint.rs builds it: the URL parser splits the key pair at the first
 # ':' and the host at the last '@' and does not percent-decode. Only in this script's environment.
 S3_LISTING_URL=$(s3_url "$VB" "$P") || exit 2
 export S3_LISTING_URL

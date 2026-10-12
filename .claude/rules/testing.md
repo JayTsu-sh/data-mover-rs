@@ -20,7 +20,7 @@
 
 ## T4 · 加 backend 操作必须加 example 或 test
 
-**verify**: 改 `StorageEnum` 公开操作的 PR 必须含 `examples/*.rs` 或 `tests/*.rs` 改动。reviewer agent 检查。
+**verify**: 修改公开 storage role 行为的 PR 必须包含对应的行为测试；公共用法放在 `examples/`，协议契约及实机工具放在 `tests/lab/`。reviewer agent 检查。
 **why**: 没人验证 = 长期回归。
 **how to apply**: Local 操作必须 integration test (无外部依赖)。网络 backend 操作至少 example (手动验证入口)。
 

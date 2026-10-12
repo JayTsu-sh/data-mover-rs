@@ -120,7 +120,9 @@ pub(super) async fn write(
     stage: &PreparedStage,
     mut input: PositionedByteStream,
 ) -> Result<WriteEvidence, StorageRoleFailure> {
-    let file = adapter.open_stage_file_for(stage, Operation::Write).await?;
+    let file = adapter
+        .open_stage_file_for(stage, Operation::Write, false)
+        .await?;
     let fresh = LocalStagedDestination::take_fresh_write(stage);
     if stage.direct {
         LocalStagedDestination::sync_written_file(

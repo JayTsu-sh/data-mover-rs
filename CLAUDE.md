@@ -22,14 +22,14 @@
 | 场景 | 先读这些 |
 |---|---|
 | 改 CIFS (role-based backend / signing / staged) | `.claude/docs/storage-cifs.md` + `src/storage/backends/cifs/` |
-| 改 NFS v3/v4 retry 分类 | `.claude/docs/storage-nfs.md` + `.claude/docs/error-taxonomy.md` + `src/nfs.rs` |
-| 改 S3 multipart / 404 / credential | `.claude/docs/storage-s3.md` + `src/s3.rs` |
-| 改 S3 URL 参数（`compat=` / `tls_verify=false` / `bucket_type=nas`）/ TLS 校验 / 旧协议名报错 | `.claude/docs/storage-s3.md` "URL 形式" "TLS" + `src/s3/url_options.rs`（唯一解析器）+ `src/s3/url_options_tests.rs` + `tests/s3_tls_verify.rs` |
-| 改 Local 操作 / ACL | `src/storage/backends/local/` + `src/acl.rs` |
+| 改 NFS v3/v4 retry 分类 | `.claude/docs/storage-nfs.md` + `.claude/docs/error-taxonomy.md` + `src/storage/backends/nfs/client.rs` |
+| 改 S3 multipart / 404 / credential | `.claude/docs/storage-s3.md` + `src/storage/backends/s3/client.rs` |
+| 改 S3 URL 参数（`compat=` / `tls_verify=false` / `bucket_type=nas`）/ TLS 校验 / 旧协议名报错 | `.claude/docs/storage-s3.md` "URL 形式" "TLS" + `src/storage/backends/s3/client/url_options.rs`（唯一解析器）+ `src/storage/backends/s3/client/url_options_tests.rs` + `tests/s3_tls_verify.rs` |
+| 改 Local 操作 / ACL | `src/storage/backends/local/` + `src/storage/backends/local/windows_acl.rs` |
 | **新增/修改 storage role 操作** | `docs/architecture/storage-transfer-architecture.md` + `src/storage/roles/` + 对应 backend |
 | 改 filter DSL (lexer / `should_skip` 三元组) | `.claude/docs/filter-dsl.md` + `src/filter.rs` (4849 行) + `src/filter_traversal.rs` (role-based 适配器) |
 | 改遍历调度 / work-stealing | `.claude/docs/walk-scheduler.md` + `src/traversal/storage/{unordered,blocks,cursor}.rs` |
-| 改 role-based 遍历 (filter / max_depth / inline 观察) | `src/traversal/{mod,storage}.rs` (唯一实现，`local_tests.rs` / `local_unordered_tests.rs` 用真文件系统测它) + 默认的 Unordered 调度器 `src/traversal/storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs` + 块序驱动 / 游标 / 逐页列举任务 `src/traversal/storage/{blocks,cursor,stream}.rs` + 按批的会话通道 `src/traversal/channel.rs` + 续扫检查点 `src/traversal/checkpoint.rs` (编解码 / 指纹) 与 `src/traversal/storage/resume.rs` + `resume/{positions,relist,blocks}.rs` (`local_resume_tests.rs` 真文件系统) + 事件 / 计数 `src/traversal/{events,counts}.rs` + `src/filter_traversal.rs` + `examples/storage_role_operations/{main,traverse}.rs` |
+| 改 role-based 遍历 (filter / max_depth / inline 观察) | `src/traversal/{mod,storage}.rs` (唯一实现，`local_tests.rs` / `local_unordered_tests.rs` 用真文件系统测它) + 默认的 Unordered 调度器 `src/traversal/storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs` + 块序驱动 / 游标 / 逐页列举任务 `src/traversal/storage/{blocks,cursor,stream}.rs` + 按批的会话通道 `src/traversal/channel.rs` + 续扫检查点 `src/traversal/checkpoint.rs` (编解码 / 指纹) 与 `src/traversal/storage/resume.rs` + `resume/{positions,relist,blocks}.rs` (`local_resume_tests.rs` 真文件系统) + 事件 / 计数 `src/traversal/{events,counts}.rs` + `src/filter_traversal.rs` + `tests/lab/tools/storage_role_operations/{main,traverse}.rs` |
 | 改 S3 遍历 / 版本化桶每 key 一项 (`ObjectHistory`) | `src/model/{history,history_codec}.rs` + `src/storage/backends/s3/{namespace,listing,histories,history}.rs` + `src/traversal/{s3_tests,s3_history_tests,s3_segment_tests}.rs` + `.claude/docs/storage-s3.md` "role-based 遍历与版本模式" + `.claude/skills/e2e-s3/scripts/traversal_versions.sh` |
 | 改 Local namespace 角色 (逐段不跟随 symlink) | `.claude/docs/storage-local.md` "Namespace 角色" + `src/storage/backends/local/namespace.rs` |
 | 改递归删除 | `src/storage/delete_tree.rs` (走 `Namespace` 角色，backend 无关) |
@@ -38,19 +38,19 @@
 | 改拷贝带哪些元数据 / ACL / xattr 开关 | `.claude/docs/metadata-negotiation.md` + `src/transfer/engine/negotiation.rs` + `src/metadata/compile.rs` (规划) + `src/metadata/mod.rs` (应用) |
 | 改 error 变体或 retry 映射 | `.claude/docs/error-taxonomy.md` + `src/error.rs` |
 | 改时间转换 (FileTime / NFS Time) | `src/time_util.rs` (单文件直读) |
-| 改 ACL / xattr | `src/acl.rs` + `.claude/docs/storage-{nfs,local}.md` |
+| 改 ACL / xattr | `src/storage/backends/local/windows_acl.rs` + `.claude/docs/storage-{nfs,local}.md` |
 | 改 QoS / 速率限制 | `src/qos.rs` (用 governor crate) |
-| 改 checksum / 完整性 | `src/checksum.rs` (用 blake3) |
+| 改 checksum / 完整性 | `src/integrity/` + `src/transfer/engine/` (BLAKE3 校验) |
 | 改 tar 打包 | `src/tar_pack.rs` |
 | URL 红化 / 日志脱敏 | `src/url_redact.rs` |
 | 写 commit / PR | `.claude/docs/conventions.md` |
 | 升级 smb-rs 依赖 (改 `smb-domain` rev) | `.claude/docs/storage-cifs.md` "升级 smb-rs 依赖" + `.claude/rules/storage-driver-conventions.md` D9 |
 | 跑某 backend 验证 / 选真机环境 | `.claude/docs/test-environments.md`（全部真机环境、写入范围、从哪跑） + `.claude/skills/e2e-{cifs,nfs,s3,local}/SKILL.md` |
-| 跑「扫描取消后续扫」矩阵 (任一 backend，P7 C11) | `.claude/skills/_shared/traversal_resume.sh` (`BIN= BACKEND= OUT=`) + `examples/storage_role_operations/` 的 `--checkpoint-every / --checkpoint-out / --resume-from / --cancel-after-*`；HDFS 用 `tests/hdfs_architecture_contract.rs` 的 `architecture_traversal_resumes_after_cancel` |
-| 跑「容器重启后续传」矩阵 (任一 backend) | `.claude/skills/_shared/resume_matrix.sh` (`DEST=<endpoint>`) + `examples/transfer_resume.rs`；背景见 `docs/adr/0006-destination-resident-recovery.md` |
+| 跑「扫描取消后续扫」矩阵 (任一 backend，P7 C11) | `.claude/skills/_shared/traversal_resume.sh` (`BIN= BACKEND= OUT=`) + `tests/lab/tools/storage_role_operations/` 的 `--checkpoint-every / --checkpoint-out / --resume-from / --cancel-after-*`；HDFS 用 `tests/hdfs_architecture_contract.rs` 的 `architecture_traversal_resumes_after_cancel` |
+| 跑「容器重启后续传」矩阵 (任一 backend) | `.claude/skills/_shared/resume_matrix.sh` (`DEST=<endpoint>`) + `tests/lab/tools/transfer_resume.rs`；背景见 `docs/adr/0006-destination-resident-recovery.md` |
 | 跑取消语义 / filter DSL 测试 | `.claude/skills/op-{cancel,filter-dsl}/SKILL.md` |
 | 跑全套 (无外部环境) | `.claude/skills/harness-run/SKILL.md` 或 `make ci` |
-| 大文件拆分候选 (filter 4849 / s3 3350 / nfs 3100) | 调 `architect` agent，filter 优先调 `filter-expert` |
+| 大文件拆分候选（先运行 `make audit-large`） | 调 `architect` agent，filter 优先调 `filter-expert` |
 | 改 role 契约时查漏 | 核对能力矩阵及角色行为测试 |
 | commit 前自检 | 调 `reviewer` agent |
 | 新增 skill / 升级 rule / 加 agent | `.claude/docs/claude-onboarding.md` |
@@ -69,15 +69,10 @@
   #82 runtime / 签名批处理 / 真机 CIFS 验收，domain ACL 只保留 account 类 ACE —— 有意为之；再前 #78 drop 连接即结束恢复、#76 丢流 /
   未建模 NTSTATUS 不再致命、#74 64 位 file id、#72 列举元数据、#73 始终直接 SMB2 协商)，`hdfs-native` 固定上游 kimahriman/hdfs-native master 提交 `695fc47` (2026-09-23 从 JayTsu-sh fork `373739f` 切回；fork 的 hsync / recover_lease 已并入上游)。不得使用浮动 branch。smb-rs 历史 API 依赖已随 legacy `CifsStorage` 删除 (#150)。
 
-## 文件大小现状 (backlog，不是新增红线)
+## 文件大小管理
 
-| 文件 | LOC | 状态 |
-|---|---|---|
-| filter.rs | 4849 | 拆分候选 #1 (DSL lexer 可独立) |
-| s3.rs | 3350 | 拆分候选 |
-| nfs.rs | 3100 | 拆分候选 |
-| storage_enum.rs | 1334 | dispatch 表，难拆 |
-| local.rs | 1134 | 边缘 |
+用 `make audit-large` 查看当前大小；不沿用已删除文件的行数表。后端客户端、
+协议适配和角色实现集中在各自的 `src/storage/backends/<backend>/` 内，按职责拆分。
 
 新写的代码遵守 `≤800 行 / 文件`、`≤50 行 / 函数`。已超的不强求当下拆，但**不要再继续堆大**。
 

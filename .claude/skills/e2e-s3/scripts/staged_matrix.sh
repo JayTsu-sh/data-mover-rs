@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Role-based S3 write-strategy matrix against a real server (examples/transfer_resume.rs).
+# Role-based S3 write-strategy matrix against a real server (tests/lab/tools/transfer_resume.rs).
 # Prints one line per case plus what it left behind (`.data-mover-*` objects, uploads open on the
 # case's key), then removes everything under its own prefix. Not an assertion suite: it records a
 # baseline to compare write strategies across commits — except the Direct rows, which since ADR-0006 C14c must

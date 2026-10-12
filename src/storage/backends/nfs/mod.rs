@@ -2,6 +2,7 @@
 
 mod acl;
 mod at_destination;
+mod client;
 pub(crate) mod common;
 #[cfg(test)]
 mod create_dir_tests;
@@ -23,6 +24,16 @@ use std::sync::Arc;
 
 use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
+
+pub use client::list_exports;
+
+pub(crate) async fn connect_backend(
+    config: crate::storage::NfsBackendConfig,
+) -> Result<Storage, crate::storage::BackendConnectError> {
+    client::create_nfs_role_storage(&config.url, config.block_size, config.ensure_dir)
+        .await
+        .map_err(|error| crate::storage::BackendConnectError::new(BackendKind::Nfs, error))
+}
 
 #[allow(dead_code)]
 pub(crate) fn connect<P>(

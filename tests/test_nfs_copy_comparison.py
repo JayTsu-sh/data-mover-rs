@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "tests" / "lab" / "run-nfs-copy-comparison.sh"
-BENCHMARK = ROOT / "examples" / "nfs_copy_comparison.rs"
+BENCHMARK = ROOT / "tests/lab/tools" / "nfs_copy_comparison.rs"
 
 
 class NfsCopyComparisonTest(unittest.TestCase):

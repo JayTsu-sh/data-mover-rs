@@ -4,7 +4,7 @@
 # backend behaves; the one thing it asserts is that no run writes under its fresh HOME.
 #
 # Usage: DEST=<endpoint> bash .claude/skills/_shared/resume_matrix.sh
-#   DEST   destination endpoint, as examples/transfer_resume.rs takes it: a local directory,
+#   DEST   destination endpoint, as tests/lab/tools/transfer_resume.rs takes it: a local directory,
 #          nfs://host/export[:root]?..., smb:<sub-path> (e2e-cifs .env), s3:<prefix> (e2e-s3 .env,
 #          prefix required), hdfs://... (LAB_HDFS_* env)
 #   SIZE   bytes of the source file (default 200 MiB); BW source bandwidth in bytes/s while the first

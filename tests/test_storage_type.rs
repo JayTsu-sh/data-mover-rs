@@ -28,7 +28,7 @@ async fn an_explicit_local_backend_connects_with_its_canonical_identity()
 fn malformed_hdfs_endpoint_is_rejected_before_connection() {
     let Err(error) = endpoint_identity(&BackendConfig::Hdfs(HdfsBackendConfig {
         location: "hdfs://".to_owned(),
-        client: data_mover::HdfsConfig::default(),
+        client: data_mover::storage::HdfsConfig::default(),
         block_size: None,
         ensure_dir: false,
     })) else {

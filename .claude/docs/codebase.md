@@ -2,91 +2,40 @@
 
 ## 项目身份
 
-- **类型**：Rust 库 (`[lib]`)，**无 binary，无 GUI**。
-- **用途**：多源数据迁移核心。从 terrasync-rs 拆分独立 (commit `4289a15`)。
-- **Edition**：2024。**MSRV**：跟 stable Rust。
-- **依赖管理**：全 crates.io，零 git patch (与 terrasync-rs 不同)。
+Rust 库，Edition 2024；具体依赖版本和固定 Git 提交以 `Cargo.toml` / `Cargo.lock` 为准。
+架构规范见 [storage-transfer-architecture.md](../../docs/architecture/storage-transfer-architecture.md)。
 
-## src/ 模块清单 (LOC 截至 2026-05-09)
+## 模块与依赖方向
 
-| 文件 | LOC | 角色 |
-|---|---|---|
-| `lib.rs` | 542 | 公开 API + 模块导出 + `EntryEnum` / `Result` / `canonicalize_path` / `detect_storage_type` |
-| **`storage_enum.rs`** | **1334** | **enum-based dispatch 层**，`StorageEnum::{Local, NFS, S3, HDFS}` 用 match 分派 30+ 操作 (CIFS 不在其中) |
-| `cifs.rs` | 36 | 仅 `create_cifs_role_storage` factory bridge；CIFS 实现在 `storage/backends/cifs/` (smb-domain) |
-| `nfs.rs` | 3100 | NFS v3/v4 backend (nfs-rs 0.8.6) |
-| `s3.rs` | 3350 | S3 backend (aws-sdk-s3 1.129.0) |
-| `local.rs` | 1134 | 本地文件系统 backend (std::fs + rayon) |
-| **`filter.rs`** | **4849** | **filter DSL 引擎**：lexer + `should_skip` 三元组决策树 |
-| `acl.rs` | 934 | Unix/Windows ACL 抽象 |
-| `qos.rs` | 660 | QoS / 速率限制 (governor crate) |
-| `tar_pack.rs` | 244 | tar 流式打包 |
-| `error.rs` | 164 | `StorageError` 24 变体 + thiserror |
-| `time_util.rs` | 128 | FileTime ↔ NFS Time ↔ Unix nanos 统一转换 |
-| `checksum.rs` | 70 | blake3 哈希 |
-| `url_redact.rs` | 66 | URL 日志脱敏 (隐藏 ak/sk/密码) |
-| `traversal/` | — | Unordered / Blocks 遍历与续扫 |
-| `delete_progress.rs` | — | 删除事件接收器 |
-
-## 公开 API 形状 (lib.rs)
-
-核心类型：
-- `Storage` + roles — 新遍历/传输接口；`StorageEnum` 保留旧传输与元数据操作。
-- `EntryEnum::{NAS(NASEntry), S3(S3Entry)}` — 统一元数据。NAS 适合 Local/NFS/CIFS，S3 单独一档。
-- `Result<T> = std::result::Result<T, StorageError>` — 全库统一错误。
-- `DeleteDirIterator` — 可克隆的共享删除事件接收器，`next(&self)`。
-
-核心函数：
-- `canonicalize_path(path) -> String` — 自动检测 + 规范化。
-- `detect_storage_type(path) -> StorageType` — URL scheme 4 路判别。
-- `create_storage(url, block_size, ensure_dir) -> Result<StorageEnum>` — 统一工厂。
-  `ensure_dir = true` 为目标端语义 (prefix 不存在自动创建)，`false` 为源端语义。
-
-## examples/ (手动验证入口)
-
-| 文件 | 作用 | 外部依赖 |
-|---|---|---|
-| `storage_role_operations/` | 遍历、递归建删、完整性 | 按 backend |
-| `local_opt_dir.rs` | 创建优化目录结构 | 无 |
-| `cifs_mount_comparison.rs` | role-based CIFS vs mounted Local 传输对比 (clap CLI) | SMB 服务器 (CIFS_REAL_*) |
-| `nfs_export.rs` | NFS export 信息查询 | NFS 服务器 |
-| `nfs_opt_dir.rs` | NFS 上创建目录 | NFS 服务器 |
-
-## tests/ (2 个，integration)
-
-| 文件 | 测什么 |
+| 目录 | 职责 |
 |---|---|
-| `test_copy_file_cancel.rs` | `StorageEnum::copy_file_with_cancel` 三场景 (token 预取消、mid-transfer、completion) |
-| `test_storage_type.rs` | `detect_storage_type` 7 路径 (Unix/Win/NFS/S3 basic/https/http/hcp/relative/empty) |
+| `src/model/` | 后端无关的数据与失败模型 |
+| `src/storage/roles/` | 读取、暂存写入、命名空间、元数据等角色契约 |
+| `src/storage/backends/{local,nfs,s3,cifs,hdfs}/` | 协议适配、具体客户端和连接装配 |
+| `src/storage/factory.rs` | 向 backend facade 分派类型化连接配置 |
+| `src/transfer/` | 基于角色的传输、校验、发布和恢复编排 |
+| `src/traversal/` | 遍历、排序和续扫 |
+| `src/filter.rs`、`src/filter_traversal.rs` | DSL 与遍历过滤适配 |
+| `src/integrity/` | 完整性检查 |
+| `src/runtime/` | 预算、阻塞执行和运行时资源边界 |
+| `src/error.rs`、`src/time_util.rs`、`src/url_redact.rs` | 共享基础工具 |
 
-**单元测试**：散落在 `src/*.rs` 内 `#[cfg(test)] mod tests`。
+`src/{nfs,s3,hdfs,cifs,acl}.rs` 已收拢到对应 backend；旧 `StorageEnum`、
+`create_storage` 和旧 entry 模型已移除。跨 backend 操作通过角色契约，不按后端种类分派。
+用 `make arch-guard` 检查依赖方向，用 `make audit-large` 获取当前顶层大文件清单。
 
-## 关键依赖 (Cargo.toml)
+## 公开入口
 
-| Crate | 版本 | 用途 |
-|---|---|---|
-| tokio | 1.51.1 (full) | 异步 runtime |
-| smb-domain (package `smb`) | git JayTsu-sh/smb-rs `2649a0b` (main，PR #89) | CIFS/SMB 协议栈 (domain facade) |
-| nfs-rs | 0.8.6 | NFS v3/v4 客户端 |
-| hdfs-native | git kimahriman/hdfs-native `695fc47` (上游 master) | HDFS 客户端 (hsync / recover_lease) |
-| aws-sdk-s3 | 1.129.0 | S3 SDK |
-| binrw | 0.15 | CIFS FileTime / 目录条目二进制解析 |
-| blake3 | 1.8.4 | 完整性校验 |
-| governor | 0.10.4 | QoS 速率限制 |
-| moka | 0.12.15 | NFS 属性缓存 |
-| glob | 0.3.3 | filter glob 匹配 |
-| hyper-rustls + rustls | — | S3 HTTPS（默认校验证书；`tls_verify=false` 时不校验的客户端） |
-| thiserror | — | 错误派生 |
-| tracing | — | 日志 |
-| rayon | — | local.rs 并行 delete |
-| tokio-util | 0.7 | CancellationToken 等 |
-| async-channel | 2 | 跨 worker 通信 |
+- `storage::connect_backend(BackendConfig)` 建立连接并返回 `Storage` 角色集合。
+- 配置类型和 NFS / S3 发现工具从 `storage` 导出。
+- HDFS 客户端构造辅助入口也从 `storage` 导出，协议实现仍在 HDFS backend。
+- Windows ACL 工具为 `storage::windows_acl`，角色路径使用能力目录内的文件句柄。
 
-## 没有的东西 (确认事实)
+## 示例与测试
 
-- 无 `Storage` trait，**用 enum dispatch**。
-- 无 binary crate (`[[bin]]` 段为空)。
-- 无 workspace (单 crate)。
-- 无 `[features]` 段 (无可选 feature)。
-- 无 `build.rs`。
-- 无外部 mock 框架 (mockall / wiremock)。**不允许 mock 网络后端**，用真实测试环境。
+`examples/README.md` 列出最小公开示例：读取、遍历、复制、命名空间、完整性检查、重命名和 export 发现。
+共享 CLI 解析放在 `examples/support/`。性能、故障注入、恢复矩阵和真实环境工具放在
+`tests/lab/tools/`；在 `Cargo.toml` 中显式注册 example target，因此原有 `cargo run --example` 命令仍可用。
+
+`tests/` 包含公开契约与集成测试，backend 内部测试覆盖协议适配行为；真实环境脚本位于
+`tests/lab/` 与 `.claude/skills/e2e-*/`。运行 `make ci` 检查本地门禁；网络验证需要对应环境。

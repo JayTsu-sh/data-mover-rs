@@ -2,8 +2,8 @@
 
 ## 底层依赖
 
-- **`std::fs`** + `tokio::fs` (异步) + `rayon` (并行删除)。
-- ACL 走 `src/acl.rs` (Unix/Windows 抽象)。
+- **`cap_std::fs`** 能力目录句柄 + `std::fs`；阻塞操作交给受控执行器。
+- Windows ACL 位于 `src/storage/backends/local/windows_acl.rs`；Unix ACL 经文件描述符读写 POSIX xattr。
 - 软链接支持 (`symlink_metadata` vs `metadata`)。
 
 ## URL 形式
@@ -17,17 +17,13 @@
 C:\Windows\path  (Windows)
 ```
 
-`detect_storage_type` 在 `lib.rs` 实现 7 路判别 (Unix/Win/NFS/S3 basic/https/http/hcp/relative/empty)，详见 `tests/test_storage_type.rs`。
+库调用方使用 `BackendConfig::Local`；示例中的路径 / URL 解析位于 `examples/support/endpoint.rs`。
 
 ## 关键行为
 
-### Rayon 并行删除
+### 递归删除
 
-`delete_dir_all_with_progress` 用 rayon 并行遍历删除。
-
-- 适合大目录 (>10K 文件) 加速。
-- **进度回调必须线程安全** (内部 Atomic 计数)。
-- 与 tokio 共存：rayon spawn 在 `spawn_blocking` 包装的线程池里。
+`storage::delete_tree` 通过 `Namespace` 角色编排删除，先删除叶子，再按深度删除目录；进度和失败由流中的结构化事件报告。
 
 ### Unix 元数据
 
@@ -44,15 +40,14 @@ C:\Windows\path  (Windows)
 
 ### Windows 元数据
 
-通过 `acl.rs` + `windows` crate (`#[cfg(windows)]`)：
-- ACL → SDDL 字符串。
-- File attributes (Hidden / System / ReadOnly)。
-- WinAceError → 走 `StorageError::WinAceError`。
+通过 `windows_acl.rs` + `windows-sys` (`#[cfg(windows)]`)：
+- 元数据角色使用 `AclMetadata::WindowsSecurityDescriptor`。
+- 观察和暂存写入在能力目录内打开句柄，再读取 / 设置安全描述符。
+- `storage::windows_acl` 保留独立的 ACL / SDDL 工具入口。
 
 ### Symlink
 
 - `symlink_metadata` 不跟随 symlink，`metadata` 跟随。
-- copy_file 默认跟随，可配置。
 - role traversal 暴露 `EntryKind::Symlink`。
 
 ### `block_size` (可选)
@@ -92,11 +87,10 @@ P1 复现过：`delete_tree` 的根是链接时会删光链接目标里的文件
   连内容，不跟随符号链接）再删目录；只要还有可见子项就照旧 `Conflict`，旁边的 artifact 一个不动
   (ADR-0006 C3b)。代价：同一目录里并发写入的 stage 会被一起删 —— 调用方契约本就是一个 key 一个写者，
   且调用方正在删这个目录。
-- `delete_dir_all` 是原始递归删除，也删除传输 artifact。
 - Windows：`Rename` 到已存在的目录会被拒 (报 `PermissionDenied`，不重映射)；只读文件 `Delete`
   失败；`cap-primitives` 打开目录不带 `FILE_SHARE_DELETE`，某个动词持有目录句柄期间，另一个
   任务对该目录的 rename/delete 会遇到共享冲突 (`Protocol`)。`delete_tree` 按深度倒序删目录，
-  不会撞上，但遍历与 `Rename` 并发时可能；本机无 Windows 工具链，Windows 编译靠 GitHub CI 的 `windows-latest` job 兜底。
+  不会撞上，但遍历与 `Rename` 并发时可能；Windows 运行时语义需要 Windows 主机验证。
 - 测试接缝：`#[cfg(test)] LocalNamespace::fail_list_call(n)` 让第 n 次 `List` 报
   `PermissionDenied`，替代原 `LocalTraversalSource` 的 `EnumerationProbe`。这是 backend 内部
   接缝，不是网络 mock (T3 不适用)。
@@ -118,25 +112,24 @@ P1 复现过：`delete_tree` 的根是链接时会删光链接目标里的文件
 
 | 陷阱 | 应对 |
 |---|---|
-| Rayon 阻塞 tokio runtime | 在 `spawn_blocking` 内 spawn rayon |
 | Windows 路径 `\` vs Unix `/` | URL parse 阶段统一为 `/` |
-| Windows ACL 没有等价 mode | 走 `acl.rs` 的 SDDL 表示 |
+| Windows ACL 没有等价 mode | 走 Windows security descriptor 表示 |
 | 跨设备 rename (EXDEV) | 应走 copy + delete fallback |
 | 软链接循环 | 遍历不下钻符号链接 |
 
 ## 测试
 
-- `examples/storage_role_operations/` — Local 遍历、创建与删除。
-- `examples/local_opt_dir.rs` — 优化目录结构。
-- `tests/test_copy_file_cancel.rs` — 取消语义 (用 /tmp 路径，无外部依赖)。
-- `tests/test_storage_type.rs` — URL 判别 (纯单元测试)。
+- `tests/lab/tools/storage_role_operations/` — Local 遍历、创建与删除。
+- `examples/storage_namespace.rs` — 优化目录结构。
+- `tests/test_copy_file_cancel.rs` — 角色传输的预取消和传输中取消契约。
+- `tests/test_storage_type.rs` — 公开后端配置契约。
 - `tests/local_namespace_contract.rs` — 公开 API 走 Local namespace：`create_directory_all` / `delete_tree` (含目录链接不删目标) / `StorageTraversalSource`。
 - skill：`.claude/skills/e2e-local/` — **无外部依赖，CI 跑这个**。
 
 ## 改 Local 时
 
-1. 读本 doc + `src/local.rs` + 必要时 `src/acl.rs`。
+1. 读本 doc + `src/storage/backends/local/` + 必要时 `src/storage/backends/local/windows_acl.rs`。
 2. Windows 相关改动必须 cfg 包裹。
-3. Rayon 调用必须在 spawn_blocking 内。
+3. 保留能力目录约束和阻塞执行器边界。
 4. 调 `backend-specialist` agent 传 `local`。
 5. 验证：`make e2e-local` (任何机器都能跑) + `make test`。

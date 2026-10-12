@@ -57,11 +57,9 @@ prefix="ci/$run_id/dxn-s3-architecture"
 export LAB_DXN_S3_ARCHITECTURE_URL="s3://${LAB_DXN_S3_ACCESS_KEY}:${LAB_DXN_S3_SECRET_KEY}@${bucket}.${endpoint#http://}?compat=dxn"
 export LAB_DXN_S3_ARCHITECTURE_KEY="$prefix/published.bin"
 
-cargo test --test s3_architecture_contract dxn_s3_architecture_roles_and_known_limits \
-  -- --ignored --exact --test-threads=1
-cargo test --lib s3::dxn::tests::multipart_rename_limit_preserves_source_when_lab_is_configured \
-  -- --exact --test-threads=1
-cargo test s3::storagegrid::tests::standard_s3_delete_objects_adds_signed_content_md5_without_stripping_x_id -- \
-  --exact --test-threads=1
-cargo test s3::storagegrid::tests::dxn_delete_objects_adds_signed_content_md5_without_stripping_x_id -- \
-  --exact --test-threads=1
+python3 tests/run_cargo_test.py dxn_s3_architecture_roles_and_known_limits \
+  --test s3_architecture_contract --ignored --exact
+python3 tests/run_cargo_test.py storage::backends::s3::client::dxn::tests::multipart_rename_limit_preserves_source_when_lab_is_configured \
+  --exact
+python3 tests/run_cargo_test.py storage::backends::s3::client::storagegrid::tests::standard_s3_delete_objects_adds_signed_content_md5_without_stripping_x_id --exact
+python3 tests/run_cargo_test.py storage::backends::s3::client::storagegrid::tests::dxn_delete_objects_adds_signed_content_md5_without_stripping_x_id --exact

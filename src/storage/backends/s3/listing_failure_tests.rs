@@ -45,8 +45,8 @@ fn backing_off(protocol: &Arc<MemoryS3>, budget: Duration) -> S3Namespace<Memory
     })
 }
 
-/// What the role protocol maps a 503 `SlowDown` to (`crate::s3::role_protocol`, whose own test
-/// pins that mapping; storage may not import `crate::s3`).
+/// What the role protocol maps a 503 `SlowDown` to (`crate::storage::backends::s3::client::role_protocol`, whose own test
+/// pins that mapping; role tests use only the protocol seam).
 fn slow_down() -> S3ProtocolFailure {
     S3ProtocolFailure::session(
         FailureClass::Throttled,

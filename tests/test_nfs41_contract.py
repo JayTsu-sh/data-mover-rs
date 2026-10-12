@@ -22,7 +22,7 @@ class Nfs41ContractTest(unittest.TestCase):
         self.assertIn("new_stale_inode", runner)
 
     def test_shared_contract_covers_stateful_failure_and_recovery_paths(self):
-        contract = (ROOT / "examples/nfs3_contract.rs").read_text()
+        contract = (ROOT / "tests/lab/tools/nfs3_contract.rs").read_text()
         self.assertIn("Nfs41", contract)
         self.assertIn("validate_cancel_and_restart", contract)
         self.assertIn("validate_recovery", contract)

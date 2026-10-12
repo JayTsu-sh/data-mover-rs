@@ -1,6 +1,6 @@
 ---
 name: e2e-cifs
-description: 验证 role-based CIFS / SMB backend — 编译 examples/cifs_mount_comparison 并在真实 share 上跑 tests/cifs_policy_contract (Checkpointed / AtomicReplace)。需要真 SMB 服务器和 .env (CIFS_REAL_*)。
+description: 验证 role-based CIFS / SMB backend — 编译 tests/lab/tools/cifs_mount_comparison.rs 并在真实 share 上跑 tests/cifs_policy_contract (Checkpointed / AtomicReplace)。需要真 SMB 服务器和 .env (CIFS_REAL_*)。
 ---
 
 # e2e-cifs

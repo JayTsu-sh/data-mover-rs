@@ -1,18 +1,12 @@
 //! Role-based storage, traversal, metadata and resumable transfer.
-#[cfg(windows)]
-pub mod acl;
-pub mod cifs;
 pub mod error;
 pub mod filter;
 mod filter_traversal;
-pub mod hdfs;
 pub mod integrity;
 pub mod metadata;
 pub mod model;
-pub mod nfs;
 pub mod qos;
 pub(crate) mod runtime;
-pub mod s3;
 pub mod storage;
 pub mod tar_pack;
 pub mod time_util;
@@ -25,11 +19,7 @@ pub use filter::{
     FilterExpression, FilterFieldDef, FilterOperatorDef, get_filter_field_definitions,
 };
 pub use filter_traversal::DslTraversalFilter;
-pub use hdfs::{
-    HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client,
-};
 pub use qos::QosManager;
-pub use s3::S3BucketInfo;
 pub use tar_pack::calculate_tar_size;
 pub use transfer_concurrency::TransferConcurrency;
 pub use url_redact::redact_storage_url;

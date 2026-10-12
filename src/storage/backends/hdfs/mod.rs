@@ -1,6 +1,7 @@
 //! HDFS adapter facade.
 
 mod at_destination;
+mod client;
 #[cfg(test)]
 pub(crate) mod contract_tests;
 mod metadata;
@@ -16,6 +17,27 @@ use std::sync::Arc;
 
 use crate::model::{BackendIdentity, BackendKind};
 use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
+
+pub(crate) use client::endpoint_identity;
+pub use client::{
+    HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client,
+};
+
+pub(crate) async fn connect_backend(
+    config: crate::storage::HdfsBackendConfig,
+) -> Result<Storage, crate::storage::BackendConnectError> {
+    let storage = client::create_hdfs_storage(
+        &config.location,
+        &config.client,
+        config.block_size,
+        config.ensure_dir,
+    )
+    .await
+    .map_err(|error| crate::storage::BackendConnectError::new(BackendKind::Hdfs, error))?;
+    storage
+        .architecture_storage()
+        .map_err(|error| crate::storage::BackendConnectError::new(BackendKind::Hdfs, error))
+}
 
 /// Connects an already validated HDFS client to the architecture-ready roles.
 pub(crate) fn connect<P>(

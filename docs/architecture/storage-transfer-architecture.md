@@ -100,9 +100,19 @@ runtime     -> model only; high-level modules may use runtime utilities
 backend dir -> model + its protocol dependency + storage role definitions
 ```
 
-During the in-crate legacy migration, `storage/factory.rs` is the sole composition boundary allowed
-to construct the NFS, CIFS, S3, and HDFS protocol owners before adapting them into storage roles.
-No other target-module file may import those legacy modules.
+All concrete clients and protocol owners live inside their corresponding backend directory.
+`storage/factory.rs` selects a backend facade; authentication, connection setup and role
+composition belong to that backend. There are no top-level `acl`, `cifs`, `hdfs`, `nfs` or `s3`
+implementation modules, and the dependency guard rejects their reintroduction.
+
+Backend implementations may share the leaf error, time, concurrency and URL-redaction helpers
+and neutral constants. This does not permit dependencies on transfer, traversal, metadata
+or runtime orchestration, or on another backend. Public configuration and discovery values
+are exported through `storage`; backend implementation modules remain crate-private.
+
+Windows local-file ACL operations belong to the Local backend, independently of the CIFS
+wire protocol. The explicit Windows ACL utilities serve operations beyond the common
+Metadata role; ordinary metadata reads and writes use the role and its confined handles.
 
 Forbidden dependencies:
 
@@ -766,7 +776,7 @@ identity. A backend performs only safe protocol retries; terrasync owns job retr
 | `storage_resume_compat`, `hdfs_legacy_resume`, `.terrasync-part` | Delete |
 | scattered metadata/copy ACL/xattr helpers | Replace with Metadata role; backend codecs private |
 | whole-file byte convenience and scattered hash helpers | Delete; retain integrity module contracts |
-| NFS export and S3 bucket discovery | Keep on concrete backend interfaces |
+| NFS export and S3 bucket discovery | Export narrow discovery helpers from `storage`; implementation stays in its backend |
 | verified StorageGRID/DXN/NFS/HDFS/CIFS quirks | Keep inside owning backend adapter |
 | tar job manifests/orchestration, DB/job retry/redo/requeue | Move to terrasync; retain bounded archive byte composition in `tar_pack` over storage roles |
 | per-backend `delete_dir_all_with_progress` | Replace with one `Namespace`-role recursive delete |

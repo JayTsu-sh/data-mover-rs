@@ -94,8 +94,8 @@ CRITICAL
 
 HIGH
 ====
-- src/storage_enum.rs:456: 加了 truncate_file 但 src/s3.rs 没实现，会导致 enum match 编译失败 (D1 dispatch 五处同步)。
-- src/nfs.rs:789: ENOSPC 映射成了 NfsError(...) 应该是 InsufficientSpace (error-taxonomy.md 表)。
+- src/transfer/engine.rs:<line>: 根据 BackendKind 分派传输行为，绕过角色契约；应由 backend 实现能力协商。
+- src/storage/backends/nfs/client.rs:789: ENOSPC 映射成了 NfsError(...) 应该是 InsufficientSpace (error-taxonomy.md 表)。
 
 MEDIUM
 ======

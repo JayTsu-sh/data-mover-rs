@@ -308,7 +308,22 @@ impl LocalObservationAdapter {
         .map_err(|_| io::Error::other("optional metadata task failed"))?
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    async fn read_acl(&self, path: &StoragePath) -> io::Result<AclMetadata> {
+        self.optional_probe()?;
+        let root = Arc::clone(&self.root);
+        let relative = checked_relative(path).map_err(role_to_io)?;
+        tokio::task::spawn_blocking(move || {
+            let file = super::windows_acl::open_at(&root, &relative, false)?;
+            let bytes = super::windows_acl::read_copy_handle(&file)?;
+            AclMetadata::new(crate::model::AclEncoding::WindowsSecurityDescriptor, bytes)
+                .map_err(io::Error::other)
+        })
+        .await
+        .map_err(|_| io::Error::other("optional metadata task failed"))?
+    }
+
+    #[cfg(not(any(unix, windows)))]
     async fn read_acl(&self, _path: &StoragePath) -> io::Result<AclMetadata> {
         self.optional_probe()?;
         Err(io::Error::from(io::ErrorKind::Unsupported))
@@ -375,7 +390,11 @@ impl MetadataRole for LocalObservationAdapter {
                     .with_timestamps(ObservationMode::InlineOnly),
             )
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            Some(ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly))
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             None
         }
@@ -447,7 +466,20 @@ impl MetadataRole for LocalObservationAdapter {
             if cancel.is_cancelled() {
                 return Err(io::Error::from(io::ErrorKind::Interrupted));
             }
+            #[cfg(not(windows))]
             let file = root.open(relative)?.into_std();
+            #[cfg(windows)]
+            let file = if matches!(&mutation, MetadataMutation::Acl(_)) {
+                super::windows_acl::open_at(&root, &relative, true)?
+            } else {
+                use cap_std::fs::OpenOptionsExt as _;
+                let mut options = cap_std::fs::OpenOptions::new();
+                options.access_mode(windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES);
+                options.custom_flags(
+                    windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+                );
+                root.open_with(relative, &options)?.into_std()
+            };
             super::staged::apply_local_metadata(&file, mutation)
         })
         .await

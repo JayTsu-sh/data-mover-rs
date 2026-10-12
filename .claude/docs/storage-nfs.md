@@ -9,7 +9,7 @@
 ## 读写块大小
 
 挂载后分别计算读写上限：读侧取客户端/默认上限与 rsize 的最小值，写侧取客户端/默认上限与 wsize 的最小值，两者不相互限制。客户端/默认上限继续保持现有 1 MiB 封顶规则，零值视为未指定。
-优化角色接口与 StorageEnum 写流水线均使用写侧上限；StorageEnum.block_size() 对 NFS 返回读侧的块大小提示。大于写上限的输入 Bytes 块仍零拷贝拆分并进入并发写队列。
+角色接口分别使用读写侧上限。大于写上限的输入 Bytes 块仍零拷贝拆分并进入并发写队列。
 
 ## URL 形式
 
@@ -80,12 +80,11 @@ nfs-rs 包在 `OperationOutcome` 里的状态也会取出来。传输 / 客户�
 **缺口**：仍走 legacy `StorageError` 再 `classify_role_error` 的路径（SETATTR 之前的 LOOKUP / re-lookup、
 xattr、namespace、staged 的多数操作）在转成字符串时丢了 nfs-rs 错误，没有状态。
 
-## Lookup metadata and raw deletion
+## 属性与删除
 
-`NASEntry::from_nfs_attrs` preserves ACL, nonempty owner/group strings, mode and identity directly
-from GETATTR. `src/nfs/delete.rs` performs artifact-inclusive raw deletion independently of traversal:
-initial directory reads retain bounded stale/busy retries, issued REMOVE RPCs drain before any failure
-is returned, and directory removal is post-order. Progress failures use `DeleteEvent.error`.
+列举通过内联属性向角色提供身份、mode 和 ownership，观察角色按请求补充元数据。
+`src/storage/backends/nfs/client/role_delete.rs` 负责 backend 内部的传输 artifact 清理；
+公开递归删除由 `storage::delete_tree` 编排，通过 `DeleteTreeItem::EntryFailure` 报告条目失败。
 
 ## Mount 保活
 
@@ -101,9 +100,9 @@ is returned, and directory removal is post-order. Progress failures use `DeleteE
 
 ## 公开导出
 
-- `create_nfs_storage(url, block_size, ensure_dir)` — 统一工厂。`ensure_dir = true` 时
-  prefix 目录不存在（NOENT）自动创建；其他 lookup 错误（网络/权限）如实上抛。
-  root 解析逻辑收敛在 `NFSStorage::attach_root`。
+- `storage::connect_backend(BackendConfig::Nfs(..))` 构造角色连接。
+- `storage::list_exports` 提供 export 发现；具体客户端留在 backend 内部。
+- `ensure_dir = true` 时补齐缺失的根路径；网络和权限错误如实报告。
 
 ## 已知陷阱
 
@@ -123,7 +122,7 @@ NFSv3 的 uid/gid 是数字；NFSv4.0/4.1 线上是 UTF-8 字符串（`owner` / 
 `parse_numeric_owner` 只认数字串、`N@domain` 与 `root`，其余名字**不报错地**给 65534。接了
 LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobody。
 
-我们这边的处理（`src/nfs/owner.rs` `owner_id`，用在 role 的 stat 与 `NASEntry`）：按**协商到的版本**
+我们这边的处理（`src/storage/backends/nfs/client/owner.rs` `owner_id`，用在角色 stat 与列举属性）：按**协商到的版本**
 判断 —— v3 的数值原样可信；v4 只有非空的数字串、`N@domain`、`root` / `root@…` 才信 nfs-rs 的数值，
 其余（包括服务端没发这个 RECOMMENDED 属性时 nfs-rs 留下的空串 + 0）给 `None`。之后：
 - 拷贝走 `observe_copy_bound` 的「只有 mode」路径：mode 照拷，owner/group 记为损失
@@ -152,7 +151,7 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 
 - role namespace `List` 隐藏 `.data-mover-*`（相对根的任一段，先于过滤
   与 GETATTR）；role namespace 拒绝寻址它们。
-- role `List` 自 P7 C7 起**逐页流式**（`storage/backends/nfs/listing.rs` 的生产者 + `src/nfs/role_listing.rs` 的
+- role `List` 自 P7 C7 起**逐页流式**（`storage/backends/nfs/listing.rs` 的生产者 + `src/storage/backends/nfs/client/role_listing.rs` 的
   READDIRPLUS 读取）：nfs-rs 的 `readdirplus` 流逐条取，按 `page_hint` 攒页交出，一次最多多读一个回复；
   消费方 drop 或取消 → 下一条之前停，**不放弃在途的 READDIRPLUS**（NFSv4.1 被取消的请求会把 session slot 围起来）。
   - **下钻提示**：每个子目录带一份**拷贝**出来的文件句柄（`DescentHint`，从不引用回复缓冲），遍历下钻时带回来，
@@ -222,20 +221,20 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   `metadata_tests.rs::a_listed_child_is_observed_exactly_as_a_getattr_would` 逐计划比对。
 - `delete_dir_all(_with_progress)` 使用专用原始删除模块，包含传输 artifact，并传播列举/删除错误。
 
-## Namespace 角色的建目录（`src/nfs/role_namespace.rs`，2026-09-27）
+## Namespace 角色的建目录（`src/storage/backends/nfs/client/role_namespace.rs`，2026-09-27）
 
 - `Namespace::create_directory` **只建一层**（与 CIFS / HDFS 一致；trait 契约允许已存在的目录答成功，挡路的非目录被
   删掉重建则是 NFS 独有的迁移语义，见下）；递归由 backend 无关的
   `storage::create_directory_all` 逐层驱动，所以它"被拒但已是目录的层算已存在"的规则也管到 NFS 的中间层。
   此前它转发给 legacy 递归 `NFSStorage::create_dir_all`，中间层在一次调用里建完，规则够不到；legacy 调用方
   （`StorageEnum`、legacy `create_file` / `rename`）仍用 legacy 递归版，**行为不变**。
-- **role 写路径建父目录**（`src/nfs/role_create.rs`，2026-09-27）：staged 的 `create_empty_open`（独占 CREATE，
+- **role 写路径建父目录**（`src/storage/backends/nfs/client/role_create.rs`，2026-09-27）：staged 的 `create_empty_open`（独占 CREATE，
   stage / 指针临时名）与 `Staged` / `Namespace` 的 `rename` 先 `role_create_all(父目录)`：从句柄缓存里最深的一层往下
   逐层调一层 MKDIR，被拒（条目 `PermissionDenied`）的层 LOOKUP 一次，是目录则继续，探测 `Cancelled` / `Connectivity` /
   `Authentication` / `Throttled` 报探测的失败，否则报原来的拒绝 —— 与 `storage::create_directory_all` 同一规则。
   整条父路径都在缓存里 → 零 RPC。独占 CREATE 的回答直接 `classify_error`（`ACCES` / `ROFS` → `PermissionDenied` /
   Permanent，保留状态名）；`STALE` → 忘掉缓存再解析父目录，父目录已被外部删掉（`NotFound`）→ 同一次调用里
-  `role_create_all` 重建一次再 CREATE。rename 本身（`src/nfs/role_rename.rs`，NFS 收尾）按 role 解析两个父目录
+  `role_create_all` 重建一次再 CREATE。rename 本身（`src/storage/backends/nfs/client/role_rename.rs`，NFS 收尾）按 role 解析两个父目录
   （`role_lookup_fh`）后发 RENAME，回答直接 `classify_error`：`ACCES` / `PERM` / `ROFS` → `PermissionDenied` / Permanent，
   `XDEV` → `Unsupported`，`NOTEMPTY` / `EXIST` / `ISDIR` / `NOTDIR` → `Conflict`（此前经 legacy 字符串包装一律 `Protocol` /
   Unknown，可重试）；`STALE` / `BADHANDLE` / `NOENT` 忘掉缓存重试至多 3 次；成功后忘掉两边名字以下的句柄缓存。
@@ -289,15 +288,15 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 - 续传遇 `PermissionDenied`（元数据已施加）→ 经元数据角色设回 0600 再打开。
 - `rmdir` / `rename` 成功后 `GLOBAL_CACHE` 会忘掉该路径及其下所有目录句柄（C10a），否则改名后重建的目录会被
   解析到旧目录里。
-- 真机：`examples/nfs3_contract.rs --dialect nfs41`（`validate_recovery` 覆盖续传与接管），`resume_matrix.sh`
+- 真机：`tests/lab/tools/nfs3_contract.rs --dialect nfs41`（`validate_recovery` 覆盖续传与接管），`resume_matrix.sh`
   `DEST=nfs://…`。ONTAP NFSv4.1 已验（2026-09-25）；NFSv3 真机待定（WSL 下 ONTAP v3 MOUNT 被拒，m1-target 的 v3
   导出路径未知）。
 
 ## 测试
 
-- `examples/storage_role_operations/` — `--backend nfs traverse` 遍历 export。
+- `tests/lab/tools/storage_role_operations/` — `--backend nfs traverse` 遍历 export。
 - `examples/nfs_export.rs` — 查询 export 元信息。
-- `examples/nfs_opt_dir.rs` — 创建优化目录结构。
+- `tests/lab/tools/nfs_opt_dir.rs` — 创建优化目录结构。
 - `tests/nfs_mkdir_contract.rs`（`#[ignore]`，`NFS_REAL_URL`）— 不可写的已存在层上 `create_directory_all`、
   父目录缺失且被拒的写、外部删掉的已缓存目录一次重建，可选 `NFS_REAL_RO_PATH` 只读文件系统。
 - skill：`.claude/skills/e2e-nfs/` (需要 `.env`)。

@@ -2,10 +2,8 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use crate::hdfs::HdfsConfig;
 use crate::model::{BackendIdentity, BackendKind, BackendSessionFailure};
-use crate::storage::backends::s3::single_put_threshold;
-use crate::storage::{Storage, endpoint};
+use crate::storage::{HdfsConfig, Storage, backends, endpoint};
 use crate::url_redact::redact_storage_url;
 
 #[derive(Clone, Debug)]
@@ -49,11 +47,6 @@ pub enum CifsGuestPolicy {
     /// Accept unsigned guest or anonymous sessions when the server does not require signing.
     AllowUnsigned,
 }
-
-/// Identity sent for an empty username under `CifsGuestPolicy::AllowUnsigned`; the NTLM
-/// layer rejects a truly empty identity, so guest mapping is reached through a name the
-/// server does not know.
-const ANONYMOUS_PLACEHOLDER_USER: &str = "anonymous";
 
 #[derive(Clone)]
 pub struct CifsBackendConfig {
@@ -137,7 +130,7 @@ pub struct BackendConnectError {
 }
 
 impl BackendConnectError {
-    fn new(kind: BackendKind, error: impl fmt::Display) -> Self {
+    pub(super) fn new(kind: BackendKind, error: impl fmt::Display) -> Self {
         Self {
             kind,
             message: error.to_string(),
@@ -147,7 +140,7 @@ impl BackendConnectError {
 
     /// A connection refused by the roles: typed when they say why (a `BackendSessionFailure`,
     /// e.g. S3's unanswered `GetBucketVersioning`, P7 Q-A), with its diagnostic in the message.
-    fn from_roles(kind: BackendKind, error: &(dyn std::error::Error + 'static)) -> Self {
+    pub(super) fn from_roles(kind: BackendKind, error: &(dyn std::error::Error + 'static)) -> Self {
         let session = error.downcast_ref::<BackendSessionFailure>().cloned();
         let message = session.as_ref().map_or_else(
             || error.to_string(),
@@ -210,10 +203,10 @@ pub fn endpoint_identity(config: &BackendConfig) -> Result<BackendIdentity, Back
             endpoint::smb(&config.server, &config.share, config.root.as_deref())
                 .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))
         }
-        BackendConfig::S3(config) => crate::s3::endpoint_identity(&config.url)
+        BackendConfig::S3(config) => backends::s3::endpoint_identity(&config.url)
             .map_err(|error| BackendConnectError::new(BackendKind::S3, error)),
         BackendConfig::Hdfs(config) => {
-            crate::hdfs::endpoint_identity(&config.location, &config.client)
+            backends::hdfs::endpoint_identity(&config.location, &config.client)
                 .map_err(|error| BackendConnectError::new(BackendKind::Hdfs, error))
         }
     }
@@ -228,73 +221,15 @@ pub fn endpoint_identity(config: &BackendConfig) -> Result<BackendIdentity, Back
 /// validation, or role construction fails.
 pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendConnectError> {
     match config {
-        BackendConfig::Local(config) => crate::storage::backends::local::connect_transfer(
+        BackendConfig::Local(config) => backends::local::connect_transfer(
             &config.root,
             config.read_concurrency,
             config.write_concurrency,
         )
         .map_err(|error| BackendConnectError::new(BackendKind::Local, error)),
-        BackendConfig::Nfs(config) => {
-            crate::nfs::create_nfs_role_storage(&config.url, config.block_size, config.ensure_dir)
-                .await
-                .map_err(|error| BackendConnectError::new(BackendKind::Nfs, error))
-        }
-        BackendConfig::Cifs(config) => {
-            // Derived before any network I/O, so a config that names no endpoint fails fast.
-            let identity = endpoint::smb(&config.server, &config.share, config.root.as_deref())
-                .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))?;
-            let signing = match config.signing_policy {
-                CifsSigningPolicy::Required => smb_domain::SigningPolicy::Required,
-                CifsSigningPolicy::WhenRequired => smb_domain::SigningPolicy::WhenRequired,
-            };
-            let guest = match config.guest_policy {
-                CifsGuestPolicy::Deny => smb_domain::GuestPolicy::Deny,
-                CifsGuestPolicy::AllowUnsigned => smb_domain::GuestPolicy::AllowUnsigned,
-            };
-            let username = if config.username.is_empty()
-                && config.guest_policy == CifsGuestPolicy::AllowUnsigned
-            {
-                ANONYMOUS_PLACEHOLDER_USER.to_owned()
-            } else {
-                config.username
-            };
-            let client = smb_domain::Client::with_policies(signing, guest);
-            let target = smb_domain::ShareTarget::new(&config.server, &config.share)
-                .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))?;
-            let share = client
-                .connect_share(
-                    &target,
-                    smb_domain::Credentials::ntlm(username, config.password),
-                )
-                .await
-                .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))?;
-            crate::cifs::create_cifs_role_storage(share, config.root, config.ensure_dir, identity)
-                .await
-                .map_err(|error| BackendConnectError::new(BackendKind::Cifs, error))
-        }
-        BackendConfig::S3(config) => {
-            // Checked before any network I/O, so an invalid threshold fails fast.
-            let threshold = single_put_threshold(config.single_put_threshold)
-                .map_err(|error| BackendConnectError::new(BackendKind::S3, error))?;
-            let storage = crate::s3::S3Storage::new(&config.url, config.block_size)
-                .await
-                .map_err(|error| BackendConnectError::new(BackendKind::S3, error))?;
-            storage
-                .architecture_storage_with_single_put_threshold(threshold)
-                .map_err(|error| BackendConnectError::from_roles(BackendKind::S3, error.as_ref()))
-        }
-        BackendConfig::Hdfs(config) => {
-            let storage = crate::hdfs::create_hdfs_storage(
-                &config.location,
-                &config.client,
-                config.block_size,
-                config.ensure_dir,
-            )
-            .await
-            .map_err(|error| BackendConnectError::new(BackendKind::Hdfs, error))?;
-            storage
-                .architecture_storage()
-                .map_err(|error| BackendConnectError::new(BackendKind::Hdfs, error))
-        }
+        BackendConfig::Nfs(config) => backends::nfs::connect_backend(config).await,
+        BackendConfig::Cifs(config) => backends::cifs::connect_backend(config).await,
+        BackendConfig::S3(config) => backends::s3::connect_backend(config).await,
+        BackendConfig::Hdfs(config) => backends::hdfs::connect_backend(config).await,
     }
 }

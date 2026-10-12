@@ -4,11 +4,10 @@
 
 - CIFS **只有** role-based 实现：`src/storage/backends/cifs/`，经
   `storage::connect_backend(BackendConfig::Cifs(CifsBackendConfig { .. }))` 构造。
-  `src/cifs.rs` 只剩 `create_cifs_role_storage` 这一个 factory bridge (解析 inflight 环境变量后
-  调 `backends::cifs::connect`)。
+  `src/storage/backends/cifs/connection.rs` 负责 SDK 连接、凭据与签名策略、根身份探测和角色装配；
+  `storage/factory.rs` 只向 backend facade 分派。
 - 历史 `CifsStorage` / `StorageEnum::CIFS` / `create_cifs_storage` 及其 `smb://` URL 解析已随
-  #150 删除；`create_storage("smb://...")` 返回 `UnsupportedType`。`StorageType::Cifs` 仅保留给
-  `detect_storage_type` 识别 scheme。
+  #150 删除；旧统一 `create_storage` 和 `StorageType` 入口也已删除。CIFS 使用类型化配置。
 - backend 使用 smb-rs domain facade：`Client → Session → Share → File / Directory`。
 - data-mover 不得重新依赖 smb-rs 的 connection、runtime、wire create/query/set 类型或协议 handle。
 - `smb_domain::protocol` 只允许用于 lossless ACL codec 等明确的协议值边界，普通 I/O 不使用。
@@ -335,7 +334,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 | 逐页流式列举 (P7 C9 `936e20b`，2026-09-27) | 10.3 万条树 (3000 平铺 + 40 层深链 + 10 × 4500 + 5 万平铺) c=1/4/32 与 ee2e9ad 逐行相同 (含顺序)；5 万平铺首项 400 → 34–46 ms、RSS 65 → 21–25 MB；停车时会话恰 9 个打开句柄 (base 0)；NFSv3 / v4.1 看同一卷，Blocks 输出与 CIFS 逐行相同；打开的目录句柄停 30 分钟 (会话空闲或忙) 后照常读完。SVM `client_session_timeout` = 900 s 只回收**没有打开文件**的空闲会话 (约 15 分钟被 RST)，持有打开文件的会话不回收；smb-rs 在那次 RST 后重连时有后台任务 panic (`runtime/engine.rs:703` "async fn resumed after completion"，不影响结果；smb-rs #84，`37d9404` 起已修 (#86)：读出错后不再二次 poll，generation 以真实传输错误退出)。10.131.9.10 网段会断连：会话在 6–10 分钟被断、重连后旧目录句柄 `InvalidState` —— CIFS 真机测 WSL 更稳 | **已实现**；停车句柄上限 8 (Q10)。smb-rs #85 (非根目录 `open_existing` 要写 + 删除权限) 在 `37d9404` 起已修 (#87)：列举句柄只读 |
 
 复现：`.claude/skills/e2e-cifs` (`CIFS_REAL_*`)。新能力的真机链路用
-`examples/storage_role_operations` 的 `seed → traverse → compare → delete-tree`。
+`tests/lab/tools/storage_role_operations` 的 `seed → traverse → compare → delete-tree`。
 注意 `CIFS_POLICY_TEST_BYTES` 里的 64 MiB **等于**默认 checkpoint 间隔，日志会是
 `SkippedBelowCheckpointThreshold`；要真正压到恢复路径需给一个更大的值 (实测 192 MiB 起
 `recovery=Checkpointed`)。symlink probe 需要 `CIFS_PROBE_NFS_URL`
@@ -419,7 +418,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
   取自列举记录的 `FILE_ATTRIBUTE_REPARSE_POINT`）就整体放弃、返回原 `Conflict`，绝不穿过链接。
 - 清扫中某个 artifact 已不在（写者刚发布）按成功处理，由最后的删目录决定结果；所有失败都记在调用方要删的
   那个路径上，不暴露隐藏路径。列举为空（期间已被清空）就直接再删一次。
-- `examples/endpoint_support` 的 artifact 计数因此改用原始 SMB 目录查询（`smb_names`），不能再走 role 列举。
+- `examples/support/endpoint.rs` 的 artifact 计数因此改用原始 SMB 目录查询（`smb_names`），不能再走 role 列举。
 - 未改：`validate_final` 只检查首段 `.data-mover-staging`，更深的 artifact 名作为最终路径不拒（C11 处理）。
 
 ## 已知陷阱
@@ -439,7 +438,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 
 ## 测试
 
-- `examples/cifs_mount_comparison.rs` — role-based 传输入口，`--transport client` 走 CIFS backend，
+- `tests/lab/tools/cifs_mount_comparison.rs` — role-based 传输入口，`--transport client` 走 CIFS backend，
   读 `CIFS_REAL_SERVER` / `CIFS_REAL_SECOND_SERVER` / `CIFS_REAL_SHARE` / `CIFS_REAL_USER` / `CIFS_REAL_PASS`。
 - `tests/cifs_policy_contract.rs` — 同一组 CIFS_REAL_* 环境变量下运行的真实双 LIF 策略测试 (`#[ignore]`)。
 - 无外部依赖的单测：`src/storage/backends/cifs/*_tests.rs` (in-memory protocol)。

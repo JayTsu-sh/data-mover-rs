@@ -17,7 +17,7 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt};
 use tokio::task::JoinSet;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::model::AclEncoding;
 use crate::model::{
     BackendIdentity, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
@@ -444,6 +444,7 @@ impl LocalStagedDestination {
         &self,
         stage: &PreparedStage,
         operation: Operation,
+        _acl_access: bool,
     ) -> Result<Arc<std::fs::File>, StorageRoleFailure> {
         stage.validate_owner(&self.identity).map_err(|_| {
             failure(
@@ -464,8 +465,10 @@ impl LocalStagedDestination {
             #[cfg(not(unix))]
             {
                 let mut cached = cached;
-                if let Some(file) = cached.take() {
-                    return Ok(file);
+                if !_acl_access {
+                    if let Some(file) = cached.take() {
+                        return Ok(file);
+                    }
                 }
             }
         }
@@ -474,6 +477,13 @@ impl LocalStagedDestination {
         let result = tokio::task::spawn_blocking(move || {
             let mut options = OpenOptions::new();
             options.read(true).write(true);
+            #[cfg(windows)]
+            if _acl_access {
+                use cap_std::fs::OpenOptionsExt as _;
+                use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+                use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+                options.access_mode(GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC);
+            }
             staging
                 .open_with(name, &options)
                 .map(cap_std::fs::File::into_std)
@@ -808,7 +818,20 @@ impl StagedDestination for LocalStagedDestination {
                 xattrs: crate::storage::CopiedValueTarget::Supported,
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            Some(crate::storage::CopiedMetadataTarget {
+                timestamps: crate::storage::CopiedTimestampTarget::Stored(
+                    crate::model::TimePrecision::HundredNanoseconds,
+                ),
+                ownership: crate::storage::CopiedOwnershipTarget::Unsupported,
+                acl: crate::storage::CopiedAclTarget::Encoding(
+                    AclEncoding::WindowsSecurityDescriptor,
+                ),
+                xattrs: crate::storage::CopiedValueTarget::Unsupported,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             None
         }
@@ -840,7 +863,9 @@ impl StagedDestination for LocalStagedDestination {
                 )
                 .await;
         }
-        let file = self.open_stage_file_for(stage, Operation::Write).await?;
+        let file = self
+            .open_stage_file_for(stage, Operation::Write, false)
+            .await?;
         let fresh = Self::take_fresh_write(stage);
         let probe = Arc::clone(&self.write_probe);
         let durable = stage.durable_publication;
@@ -898,7 +923,9 @@ impl StagedDestination for LocalStagedDestination {
         stage: &PreparedStage,
         mut input: ByteStream,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
-        let file = self.open_stage_file_for(stage, Operation::Write).await?;
+        let file = self
+            .open_stage_file_for(stage, Operation::Write, false)
+            .await?;
         let fresh = Self::take_fresh_write(stage);
         if stage.direct {
             let target = Arc::clone(&file);
@@ -998,7 +1025,10 @@ impl StagedDestination for LocalStagedDestination {
         let staging = self.stage_directory(stage, Operation::Verify).await?;
         let path = stage.final_destination.path().clone();
         let direct_file = if stage.direct {
-            Some(self.open_stage_file_for(stage, Operation::Verify).await?)
+            Some(
+                self.open_stage_file_for(stage, Operation::Verify, false)
+                    .await?,
+            )
         } else {
             None
         };
@@ -1046,7 +1076,13 @@ impl StagedDestination for LocalStagedDestination {
                 FailureClass::Unsupported,
             ));
         }
-        let file = self.open_stage_file_for(stage, Operation::Metadata).await?;
+        let file = self
+            .open_stage_file_for(
+                stage,
+                Operation::Metadata,
+                matches!(&mutation, MetadataMutation::Acl(_)),
+            )
+            .await?;
         let path = stage.final_destination.path().clone();
         let durable = stage.durable_publication;
         tokio::task::spawn_blocking(move || {
@@ -1072,7 +1108,13 @@ impl StagedDestination for LocalStagedDestination {
         }
         refuse_before_applying(stage, &mutations, &cancel)?;
         let file = self
-            .open_stage_file_for(stage, Operation::Metadata)
+            .open_stage_file_for(
+                stage,
+                Operation::Metadata,
+                mutations
+                    .iter()
+                    .any(|mutation| matches!(mutation, MetadataMutation::Acl(_))),
+            )
             .await
             .map_err(|error| {
                 StagedMetadataApplicationFailure::whole_batch(mutations.len(), 0, Some(error))
@@ -1269,7 +1311,18 @@ pub(super) fn local_metadata_supported(mutation: &MetadataMutation) -> bool {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(super) fn local_metadata_supported(mutation: &MetadataMutation) -> bool {
+    match mutation {
+        MetadataMutation::Acl(acl) => {
+            acl.encoding() == AclEncoding::WindowsSecurityDescriptor && acl.access().is_some()
+        }
+        MetadataMutation::Timestamps(value) => value.created.is_none(),
+        _ => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(super) fn local_metadata_supported(_mutation: &MetadataMutation) -> bool {
     false
 }
@@ -1327,7 +1380,7 @@ fn set_optional_xattr(file: &std::fs::File, name: &str, value: Option<&[u8]>) ->
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn local_file_time(value: crate::model::StorageTimestamp) -> io::Result<filetime::FileTime> {
     const NANOS_PER_SECOND: i64 = 1_000_000_000;
     let nanos = i64::try_from(value.unix_nanos())
@@ -1339,7 +1392,31 @@ fn local_file_time(value: crate::model::StorageTimestamp) -> io::Result<filetime
     ))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(super) fn apply_local_metadata(
+    file: &std::fs::File,
+    mutation: MetadataMutation,
+) -> io::Result<()> {
+    match mutation {
+        MetadataMutation::Acl(acl) if acl.encoding() == AclEncoding::WindowsSecurityDescriptor => {
+            super::windows_acl::apply_handle(
+                file,
+                acl.access()
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?,
+            )
+        }
+        MetadataMutation::Timestamps(value) if value.created.is_none() => {
+            filetime::set_file_handle_times(
+                file,
+                value.accessed.map(local_file_time).transpose()?,
+                value.modified.map(local_file_time).transpose()?,
+            )
+        }
+        _ => Err(io::Error::from(io::ErrorKind::Unsupported)),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(super) fn apply_local_metadata(
     _file: &std::fs::File,
     _mutation: MetadataMutation,

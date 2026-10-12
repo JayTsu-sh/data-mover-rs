@@ -449,7 +449,7 @@ echo "StorageGRID scheme rename verified: $actual_hash"
 # object bytes, user and system metadata, tags, special-character CopySource
 # encoding, and deletion of the source object.
 DM_S3_RENAME_TEST_URL="$(storage_url source s3)" \
-  cargo test --quiet --locked \
-    s3::tests::multipart_rename_preserves_content_and_metadata_when_lab_is_configured \
-    -- --exact
+  python3 tests/run_cargo_test.py \
+    storage::backends::s3::client::role_protocol::rename::tests::multipart_rename_preserves_content_and_metadata_on_lab \
+    --ignored --exact
 echo "S3 multipart rename verified"

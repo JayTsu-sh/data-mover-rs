@@ -4,6 +4,7 @@ use clap::{Parser, ValueEnum};
 use std::time::Duration;
 
 #[allow(dead_code)]
+#[path = "support/endpoint.rs"]
 mod endpoint_support;
 use data_mover::integrity::{
     IntegrityMode, IntegrityOptions, IntegrityRequest, MtimePrecision, compare,

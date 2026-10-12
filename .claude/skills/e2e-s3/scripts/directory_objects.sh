@@ -36,7 +36,7 @@
 #   (transfer_resume itself creates the parent directory, as a caller does). > 5 GiB is refused
 #   before any I/O: covered by unit tests, not uploaded here.
 #
-# Versioned buckets also replay (P7 H1, examples/s3_history_replay.rs) the histories of m/, z/ and
+# Versioned buckets also replay (P7 H1, tests/lab/tools/s3_history_replay.rs) the histories of m/, z/ and
 # dirobj/ oldest to newest into a versioned destination — a second temporary bucket <bucket>-r in
 # temporary mode, replay/ under the run's prefix otherwise — and compare each key's records by kind and
 # size in order; print what a second marker in a row gives (merged / written) and DXN's null-version

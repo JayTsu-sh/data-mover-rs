@@ -1,12 +1,13 @@
 //! HDFS contracts exercised through the storage roles. Raw hdfs-native calls seed and verify fixtures.
+use data_mover::DslTraversalFilter;
 use data_mover::model::{EntryKind, FailureClass, StoragePath};
 use data_mover::storage::{
     BackendConfig, HdfsBackendConfig, PreflightPolicy, Storage, StorageRoleFailure, connect_backend,
 };
+use data_mover::storage::{HdfsConfig, build_hdfs_client};
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalOutcome, TraversalRequest, TraversalSource,
 };
-use data_mover::{DslTraversalFilter, HdfsConfig, build_hdfs_client};
 use hdfs_native::file::{FileReader, FileWriter};
 use hdfs_native::{Client, ClientBuilder, WriteOptions};
 use std::num::NonZeroUsize;
@@ -28,14 +29,14 @@ fn valid_hdfs_lab_run_id(run_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn validated_hdfs_lab_root(location: &str) -> Result<data_mover::HdfsLocation, String> {
+fn validated_hdfs_lab_root(location: &str) -> Result<data_mover::storage::HdfsLocation, String> {
     validated_hdfs_lab_root_with_config(location, &HdfsConfig::default())
 }
 
 fn validated_hdfs_lab_root_with_config(
     location: &str,
     config: &HdfsConfig,
-) -> Result<data_mover::HdfsLocation, String> {
+) -> Result<data_mover::storage::HdfsLocation, String> {
     let authority_end = location
         .find("://")
         .and_then(|offset| {
@@ -47,7 +48,7 @@ fn validated_hdfs_lab_root_with_config(
     if location[authority_end..].contains("//") {
         return Err("HDFS lab root must not contain empty path components".to_string());
     }
-    let parsed = data_mover::HdfsLocation::parse_configured(location, config)
+    let parsed = data_mover::storage::HdfsLocation::parse_configured(location, config)
         .map_err(|error| error.to_string())?;
     let components = parsed
         .root()
@@ -70,18 +71,19 @@ fn validated_hdfs_lab_root_with_config(
     Ok(parsed)
 }
 
-fn hdfs_lab_root() -> Result<data_mover::HdfsLocation, Box<dyn std::error::Error>> {
+fn hdfs_lab_root() -> Result<data_mover::storage::HdfsLocation, Box<dyn std::error::Error>> {
     let location = std::env::var("LAB_HDFS_RUN_ROOT")?;
     validated_hdfs_lab_root_with_config(&location, &hdfs_lab_config()).map_err(Into::into)
 }
 
 fn hdfs_lab_config() -> HdfsConfig {
     let config_dir = std::env::var_os("LAB_HDFS_CONFIG_DIR").map(Into::into);
-    let kerberos_credentials =
-        std::env::var_os("LAB_HDFS_KEYTAB").map(|keytab| data_mover::HdfsKerberosCredentials {
+    let kerberos_credentials = std::env::var_os("LAB_HDFS_KEYTAB").map(|keytab| {
+        data_mover::storage::HdfsKerberosCredentials {
             keytab: Some(keytab.into()),
             ..Default::default()
-        });
+        }
+    });
     HdfsConfig {
         config_dir,
         kerberos_credentials,
@@ -143,7 +145,7 @@ fn hdfs_lab_local_path(case: &str) -> Result<std::path::PathBuf, Box<dyn std::er
 
 struct HdfsFixture {
     client: Client,
-    location: data_mover::HdfsLocation,
+    location: data_mover::storage::HdfsLocation,
 }
 impl HdfsFixture {
     fn path(&self, relative: &str) -> String {
@@ -296,7 +298,7 @@ async fn client_can_be_built_from_explicit_inputs_only() -> Result<(), Box<dyn s
 
 #[test]
 fn simple_location_contract_is_platform_independent() -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = data_mover::HdfsLocation::parse(
+    let parsed = data_mover::storage::HdfsLocation::parse(
         "hdfs://migration%20user@127.0.0.1:9000/warehouse/%E7%9B%AE%E5%BD%95/",
     )?;
     assert_eq!(parsed.user(), "migration user");
@@ -312,7 +314,7 @@ fn simple_location_contract_is_platform_independent() -> Result<(), Box<dyn std:
         ..Default::default()
     };
     assert!(
-        data_mover::HdfsLocation::parse_configured(
+        data_mover::storage::HdfsLocation::parse_configured(
             "hdfs://migration@127.0.0.1:9000/warehouse",
             &kerberos,
         )

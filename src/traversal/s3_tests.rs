@@ -329,7 +329,7 @@ async fn cancellation_stops_an_s3_listing_between_pages() -> TestResult {
 }
 
 /// What the role protocol maps a 503 `SlowDown` to (pinned by its own test; traversal may not
-/// import `crate::s3`).
+/// import the private S3 client).
 fn slow_down() -> S3ProtocolFailure {
     S3ProtocolFailure::session(
         FailureClass::Throttled,

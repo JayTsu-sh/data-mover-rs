@@ -19,9 +19,25 @@ inflight=8
 concurrency=1
 root="/tmp/data-mover-lab/$run_id/performance-baseline"
 large_csv="$(mktemp)"
-small_binary="$(cargo metadata --locked --no-deps --format-version 1 | \
-  python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/release/examples/storage_small_benchmark"
 trap 'rm -f "$large_csv"' EXIT
+
+# Build this revision and use Cargo's reported artifact, including configured cross-target
+# layouts. An older executable must never be relabelled as performance evidence for this SHA.
+small_binary="$(cargo build --release --locked --example storage_small_benchmark \
+  --message-format=json-render-diagnostics | python3 -c '
+import json, pathlib, sys
+executable = None
+for line in sys.stdin:
+    message = json.loads(line)
+    target = message.get("target", {})
+    if (message.get("reason") == "compiler-artifact"
+            and target.get("name") == "storage_small_benchmark"
+            and "example" in target.get("kind", [])):
+        executable = message.get("executable")
+if not executable or not pathlib.Path(executable).is_file():
+    sys.exit("Cargo did not report the built storage_small_benchmark executable")
+print(executable)
+')"
 
 tests/lab/run-inflight-benchmark.sh "$run_id" "$large_csv"
 
@@ -40,7 +56,6 @@ mkdir -p "$root/small-source" "$root/small-destination"
 for index in $(seq 0 99); do
   printf 'fixed-small-entry-%06d\n' "$index" > "$root/small-source/entry-$index.bin"
 done
-[[ -x "$small_binary" ]] || cargo build --release --locked --example storage_small_benchmark
 
 run_small() {
   local operation="$1"
