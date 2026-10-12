@@ -46,6 +46,7 @@ pub(crate) struct MemoryS3 {
     /// was still there.
     pub(crate) aborts: Mutex<u32>,
     pub(super) abort_failure: Mutex<Option<S3ProtocolFailure>>,
+    pub(crate) head_versions: Mutex<Vec<Option<String>>>,
     pub(crate) head_failure: Mutex<Option<(String, S3ProtocolFailure)>>,
     /// Deleting this key — by version or not — fails with this failure (every time, until
     /// cleared), deleting nothing.
@@ -345,6 +346,7 @@ impl S3Protocol for MemoryS3 {
         self.capabilities()
     }
     async fn head(&self, key: &str) -> S3Result<S3ObjectFacts> {
+        self.head_versions.lock().await.push(None);
         self.nas_head_served();
         if let Some((failed_key, failure)) = &*self.head_failure.lock().await
             && failed_key == key
@@ -370,6 +372,10 @@ impl S3Protocol for MemoryS3 {
         })
     }
     async fn head_version(&self, key: &str, version_id: &str) -> S3Result<S3ObjectFacts> {
+        self.head_versions
+            .lock()
+            .await
+            .push(Some(version_id.to_owned()));
         if *self.ignores_version_id.lock().await {
             return self.head(key).await;
         }

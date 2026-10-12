@@ -50,6 +50,8 @@ pub(crate) struct ListingKnobs {
     pub(crate) page_size: usize,
     pub(crate) minio_markers: bool,
     pub(crate) same_instant: bool,
+    /// Omit LastModified from version records to test inline-only observation.
+    pub(crate) omit_version_timestamps: bool,
     /// List every key under the prefix flat, as a store that ignores the delimiter does.
     pub(crate) ignore_delimiter: bool,
     /// A non-conforming store: each key's versions are listed oldest first (the latest last)
@@ -320,12 +322,13 @@ impl MemoryS3 {
     }
 
     async fn version_elements(&self, prefix: &str) -> S3Result<Vec<Element>> {
-        let (same_instant, oldest_first, split) = {
+        let (same_instant, oldest_first, split, omit_timestamps) = {
             let knobs = self.listing();
             (
                 knobs.same_instant,
                 knobs.oldest_first_versions,
                 knobs.split_keys,
+                knobs.omit_version_timestamps,
             )
         };
         let mut elements = Vec::new();
@@ -351,7 +354,11 @@ impl MemoryS3 {
                     Element::Version(S3ListedVersion {
                         key: key.clone(),
                         facts,
-                        last_modified: instant(i128::try_from(written).unwrap_or(i128::MAX)),
+                        last_modified: if omit_timestamps {
+                            None
+                        } else {
+                            instant(i128::try_from(written).unwrap_or(i128::MAX))
+                        },
                         position: None,
                     })
                 })

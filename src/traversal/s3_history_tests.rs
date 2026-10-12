@@ -13,8 +13,8 @@ use std::time::Duration;
 use super::s3_tests::{delete, entries, put, render, rendered, request, totals, traverse};
 use super::{FailureScope, TraversalItem, TraversalOrder, TraversalOutcome};
 use crate::model::{
-    FailureClass, HistoryOrder, MetadataObservation, ObjectHistory, ObservationMode,
-    ObservationPlan, ObservedEntry, SourceVersion, Transience, VersionRecord,
+    FailureClass, HistoryOrder, MetadataObservation, MetadataProvenance, ObjectHistory,
+    ObservationMode, ObservationPlan, ObservedEntry, SourceVersion, Transience, VersionRecord,
 };
 use crate::storage::backends::s3::tests::{MemoryS3, Versioning, identity};
 use crate::storage::backends::s3::{S3ProtocolFailure, S3VersioningAtConnect};
@@ -365,6 +365,54 @@ async fn unordered_delivers_each_key_once_with_its_whole_history() -> TestResult
             Some(VERSIONS),
             "round {round}"
         );
+    }
+    Ok(())
+}
+
+/// Inline-only metadata never turns a versioned scan into one HEAD per stored version. Listed
+/// timestamps stay inline; a store omitting them stays unknown instead of being queried.
+#[tokio::test]
+async fn inline_only_history_observation_uses_no_object_requests() -> TestResult {
+    let inline = ObservationMode::InlineOnly;
+    let plan = ObservationPlan::default()
+        .with_tags(inline)
+        .with_timestamps(inline);
+    for order in ORDERS {
+        for missing_time in [false, true] {
+            let protocol = history().await?;
+            protocol.listing().omit_version_timestamps = missing_time;
+            protocol.head_versions.lock().await.clear();
+            let (items, outcome) =
+                traverse(&protocol, request().order(order).observation_plan(plan)).await?;
+            assert!(matches!(outcome, TraversalOutcome::Completed(_)));
+            assert!(protocol.head_versions.lock().await.is_empty(), "{order:?}");
+            assert!(protocol.tag_versions.lock().await.is_empty(), "{order:?}");
+            assert_inline_history_metadata(&items, missing_time)?;
+        }
+    }
+    Ok(())
+}
+
+fn assert_inline_history_metadata(items: &[TraversalItem], missing_time: bool) -> TestResult {
+    let found = by_path(&entries(items));
+    let k = found["k"];
+    assert_eq!(k.metadata().tags(), &MetadataObservation::Unsupported);
+    for entry in found.values() {
+        for record in entry.history().ok_or("each key carries history")?.records() {
+            if record.is_delete_marker() {
+                assert!(record.metadata().is_none());
+                continue;
+            }
+            let metadata = record.metadata().ok_or("inline request is answered")?;
+            assert_eq!(metadata.tags(), &MetadataObservation::Unsupported);
+            if missing_time {
+                assert_eq!(metadata.timestamps(), &MetadataObservation::Unsupported);
+            } else {
+                assert!(matches!(metadata.timestamps(), MetadataObservation::Value {
+                    value, provenance: MetadataProvenance::Inline
+                } if value.modified == record.modified()));
+            }
+        }
     }
     Ok(())
 }

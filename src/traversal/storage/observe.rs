@@ -28,7 +28,8 @@ use super::{Deferred, Shared, entry_failure, throttling_scoped_to};
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, MAX_MODEL_FIELD_BYTES, MetadataObservation,
     MetadataObservations, MetadataProvenance, ObjectHistory, ObservationMode, ObservationPlan,
-    ObservedEntry, Operation, StoragePath, SymlinkTarget, Transience, VersionRecord,
+    ObservedEntry, Operation, StoragePath, SymlinkTarget, TimestampMetadata, Transience,
+    VersionRecord,
 };
 use crate::storage::{Metadata, Namespace, SourceDescriptor, StorageRoleFailure};
 use crate::traversal::TraversalTerminalFailure;
@@ -203,13 +204,26 @@ async fn observe_history(
             .observe_copy_bound_version(path, record.identity(), &version, plan)
             .await
             .map_err(|failure| throttling_scoped_to(path, Operation::Observe, failure));
-        let metadata = match observed {
+        let mut metadata = match observed {
             Ok(observed) => observed.observations,
             Err(StorageRoleFailure::Entry(failure)) => {
                 failed_observations(plan, path, failure.class(), failure.transience())?
             }
             Err(session @ StorageRoleFailure::Session(_)) => return Err(session),
         };
+        if plan.timestamps() != ObservationMode::Omit
+            && metadata.timestamps.value().is_none()
+            && let Some(modified) = record.modified()
+        {
+            metadata.timestamps = MetadataObservation::Value {
+                value: TimestampMetadata {
+                    accessed: None,
+                    modified: Some(modified),
+                    created: None,
+                },
+                provenance: MetadataProvenance::Inline,
+            };
+        }
         record.set_metadata(metadata);
     }
     let mut metadata = match history.current().and_then(VersionRecord::metadata) {

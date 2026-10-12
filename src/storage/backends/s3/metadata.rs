@@ -79,6 +79,24 @@ fn timestamps(
     }
 }
 
+/// An inline-only plan can report unsupported families without asking the object again.
+fn permits_additional_calls(plan: ObservationPlan) -> bool {
+    [
+        plan.acl(),
+        plan.xattrs(),
+        plan.tags(),
+        plan.ownership_mode(),
+        plan.timestamps(),
+    ]
+    .into_iter()
+    .any(|mode| {
+        matches!(
+            mode,
+            ObservationMode::BestEffort | ObservationMode::Required
+        )
+    })
+}
+
 impl<P: S3Protocol + 'static> S3Metadata<P> {
     async fn head(
         &self,
@@ -101,6 +119,9 @@ impl<P: S3Protocol + 'static> S3Metadata<P> {
         version: &SourceVersion,
         plan: ObservationPlan,
     ) -> Result<MetadataObservations, StorageRoleFailure> {
+        if !permits_additional_calls(plan) {
+            return self.observations(path, plan, None, version).await;
+        }
         let facts = self.head(path, version).await?;
         let observed = object_identity(&self.identity, path, &facts)
             .map_err(|e| entry(path, Operation::Metadata, e.to_string()))?;
