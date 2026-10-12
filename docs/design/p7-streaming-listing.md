@@ -1212,10 +1212,12 @@ C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 
     ④ `BackendConnectError::session_failure()` 把 Q-A 的类型化失败带给 `connect_backend` 的调用方；⑤ 当前版本观察失败时条目时间
     退回列举的；⑥ `Tallied::push_into` 代替迭代器（热路径）。2026-10-12 从 GitHub 的 `wip/p7-c11b` 恢复以上七个实现提交；
     `e2511a2` 已含 count_history 和“当前已删且分段”的回归测试，交接记录中“待补计数修复”已过时。
-    WIP 文档中的真机 / 故障注入通过声明没有可核查结果，故不作为验收证据。
-    待验收：当前提交的 make ci / 全特性 clippy、17 项故障注入、上述六套 S3 真机矩阵、MinIO 单 key 十万版本 RSS。
+    2026-10-12 找回原构建目录：501 个 src/tests/examples 与 Cargo 文件逐字节匹配 `fdea3ed`；历史 `ci.log`
+    记录 1788 passed / 8 ignored，`fi.log` 记录 17 项故障注入全部变红（JOB_EXIT=0）。这些是历史证据，不代表当前复跑。
+    待验收：当前提交的 make ci / 全特性 clippy、上述六套 S3 真机矩阵、MinIO 单 key 十万版本 RSS。
     保留桶 `data-mover-c11b-1790508092` 不属于测试清理范围（用户要求保留）。
 C12 docs: docs/architecture/storage-transfer-architecture.md §5/§6；.claude/docs/{architecture,error-taxonomy,storage-*}.md；ADR-0008
+    —— 文档已同步当前接口；ADR-0008 记录决策与验收边界，C11b 真机验收仍按上行跟踪。
     （含 C11b 定下的**写入快照格式开发期规则**：一种当前格式、版本字节 + golden 字节测试、任何改动都升版本、旧格式
     `UnsupportedVersion`；正式发布前重新决定 —— 至少解码 N-1，或给 terrasync 迁移 / 重扫说明）
 （terrasync 侧，另起：不丢批、分钟级退避、检查点落库顺序、消费者退出即失败、统计以库为准、全量扫描 generation 闸门、

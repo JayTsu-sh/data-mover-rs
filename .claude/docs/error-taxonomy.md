@@ -280,8 +280,11 @@ Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修�
 | NFS 列举（C7c）同一次读取内 cookie 重复（服务端 cookie 循环） | 整个列举，先交出已读到的子项，块 `Interrupted`（一项未交出则 `Unreadable`） | `Protocol` / Permanent（状态 `DIRECTORY_COOKIE_REPEATED`）；cookie 被拒 / 续读答空末页的从头读用尽时是原状态 / `EMPTY_AFTER_COOKIE`，`Protocol` |
 | CIFS 子项的身份字节超出模型上限（造不出 `SourceIdentity`） | 子项 | `Protocol` / Permanent |
 | HDFS 子项的 status 转换不了（时间超出 `i64` 纳秒等）、路径拼不出 `StoragePath` | 子项；不是本目录直接子项的（越出根、嵌套）或拼不出的报在目录路径上 | `Protocol` / Permanent |
-| S3 列举（P7 C6，Current 与 All）的一页节流：同一 continuation token / marker 按有界退避重发（每个列举累计约 2 分钟）；其他瞬时失败（5xx 但不含 501、超时、连接断开）：同一 token 重发至多 3 次（250 ms / 1 s / 2 s，读到一页即续满），首页前后一样，不从头重列、不重复交出 | 续上则无失败；节流超预算 → 该列举 `Throttled` / Transient；瞬时失败重发用尽 → 保留原作用域（会话级的照常升会话）；首页之后失败的 Current 列举块 `Interrupted { delivered }` | 按 S3 映射 |
+| S3 列举（P7 C6/C11b，当前对象与历史列举）的一页节流：同一 continuation token / marker 按有界退避重发（每个列举累计约 2 分钟）；其他瞬时失败（5xx 但不含 501、超时、连接断开）：同一 token 重发至多 3 次（250 ms / 1 s / 2 s，读到一页即续满），首页前后一样，不从头重列、不重复交出 | 续上则无失败；节流超预算 → 该列举 `Throttled` / Transient；瞬时失败重发用尽 → 保留原作用域（会话级的照常升会话）；首页之后失败的当前对象列举块 `Interrupted { delivered }` | 按 S3 映射 |
 | S3 当前对象列举（P7 C6）翻页 token 回绕 / 连续 16 空页 / 驻留的前缀名 + 报过的 key 超 500 万、续页 token 超 500 万（对象不计，重复前缀只记一次）：先交出已列到的页（触发的那一页不交出），再以该目录的失败结束（不结束整场） | 整个列举，块 `Interrupted { delivered }`（一项未交出则 `Unreadable`） | `Protocol` / Permanent；超上限 `Capacity` / Permanent |
+| S3 历史列举（P7 C11b）目录内物化记录超过 500 万 | 整个列举；尚未交出 key，`Unreadable`，兄弟目录继续 | `Capacity` / Permanent |
+| S3 连接时 `GetBucketVersioning` 的超时 / 网络 / 5xx（SDK 重试后，501 除外） | role 连接失败；`BackendConnectError::session_failure()` 保留分类 | `Connectivity` / Transient |
+| S3 历史中某条记录的 tags / 元数据观察失败（含 `Required`） | 仅该 `VersionRecord.metadata` 记 `Failed`；其余记录与 key 仍交付 | 原观察的 class / transience |
 | S3 对象 size 缺失 / 为负（`role_protocol/listing.rs` 逐项解码为 `S3RejectedEntry`） | 子项（报在对象路径）；版本列举里这个 key 的全部版本都不列 | `Protocol` / Permanent |
 | S3 键 / 公共前缀越出存储根，或越出所列目录（服务端无视 prefix） | 无名子项（`raw_name` = 服务端给的键） | `Protocol` / Permanent |
 

@@ -201,11 +201,20 @@ Owns coherent namespace semantics: stat/list, create/delete, rename, and support
 operations. Fine-grained semantics are typed; providing the role does not imply that every
 verb exists. An unavailable operation fails preflight before remote side effects.
 
-S3 lends `stat` and `list` only (ADR-0006 C22): `list` of a path is one delimiter listing of the
-prefix `<path>/`, so a common prefix is a directory; `Namespace::list_versions` lists every stored
-version and delete marker (`capabilities().histories`). Its mutating verbs are `Unsupported`, and it
-says so through `Namespace::capabilities().mutations`: recursive delete and recursive create refuse
-such a storage before any I/O. `ndx_walk` refuses S3 by kind: a prefix has no modification time.
+`Namespace::list(ListRequest)` returns a backpressured `ListingStream` of pages followed by
+mandatory `ListingEnd` evidence. Pages carry children and child failures; a listing error is
+separate from an individual child error. Local, NFS, CIFS, HDFS and unversioned S3 stream pages.
+S3 histories are gathered per directory before keys are delivered (at most five million records).
+Dropping a stream signals cancellation; producers finish in-flight operations and close handles.
+
+S3 lends `stat` and `list` only: `list` of a path is one delimiter listing of the prefix `<path>/`,
+so a common prefix is a directory. `capabilities().histories` is fixed at connection: enabled or
+suspended versioning, or a refused versioning query, selects `ListObjectVersions`; a bucket never
+versioned, an unsupported versioning API, or the NAS profile selects `ListObjectsV2`. A transient
+`GetBucketVersioning` failure refuses role connection with `Connectivity` / `Transient`.
+A history is a property of each key returned by `list`; there is no separate traversal mode or
+`Namespace::list_versions`. Mutating verbs are `Unsupported`, advertised through
+`capabilities().mutations`; recursive delete and create refuse before I/O.
 
 ### Metadata
 
@@ -245,6 +254,7 @@ pub struct ObservedEntry {
     modified: Option<StorageTimestamp>,
     source_identity: SourceIdentity,
     metadata: MetadataObservations,
+    history: Option<Box<ObjectHistory>>,
     backend_fact: PrivateBackendEntryFacts,
 }
 ```
@@ -259,12 +269,14 @@ crate-private same-backend native planner may consume private backend facts.
 is not a content hash. Backend facts are losslessly snapshot-encoded by data-mover through a
 versioned opaque codec. Terrasync stores the bytes and separate query columns, then returns
 the snapshot unchanged when reconstruction is required. Reconstruction never re-queries the
-backend, but it needs the endpoint the scan ran on: snapshots (schema v5, ADR-0006 C4c) do not
-store the backend identity, so `ObservedEntry::decode_snapshot(bytes, &identity)` takes it from
-the caller (`Storage::identity()`, or `storage::endpoint_identity(&config)` offline).
+backend, but it needs the endpoint the scan ran on: `ObservedEntry::decode_snapshot(bytes,
+&identity)` takes it from `Storage::identity()` or `storage::endpoint_identity(&config)` offline.
 `SnapshotDecodeError::BackendMismatch` for a whole generation means the endpoint moved or is
-spelled differently — treat it as no previous generation, not corruption. v4 snapshots keep
-their own identity; copy them forward as bytes rather than re-encoding them.
+spelled differently; treat it as no previous generation. The only entry format is **DMES v7**,
+including entries without history. Other versions return `UnsupportedVersion` and require a fresh
+scan. Every format change increments the version byte and updates golden-byte fixtures. This is
+a development policy; before release, choose N-1 decoding or a documented migration/rescan path
+([ADR-0008](../adr/0008-streaming-traversal-and-object-history.md)).
 
 ### Optional observations
 
@@ -294,75 +306,77 @@ the traversal observes the entry before deciding and, if the plan omitted timest
 that already returns timestamps satisfies a timestamps-only plan without a second call.
 All states, provenance, empty values, and failures are retained in the opaque entry snapshot.
 
-An entry from a traversal of every version (`TraversalVersions::All`, S3 only) also carries its
-listed version: `ObservedEntry::version()` (`EntryVersion`: version id, `None` for `"null"`;
-latest; delete marker) and `ObservedEntry::source_version()`, the `SourceVersion` that copies
-exactly that version (`Id(id)`; `Current` for the latest `"null"` version; `Id("null")` for an
-older one; `None` for a delete marker). Such an entry is snapshot-encoded as v6 (v5 plus the version
-record before the identity key); every entry without a version is still written as v5, byte for
-byte, so existing generations do not change. v4, v5 and v6 all decode.
+### Object history
+
+A versioned S3 key is one `ObservedEntry`, including a key whose latest record is a delete marker.
+`history()` contains `VersionRecord`s, oldest first in server order. The original response's
+interleaved versions and markers supply that order; invalid ordering falls back to timestamps and
+sets `HistoryOrder::Inferred`. `current()` is absent when the latest record is a delete marker or
+this is not the final segment. The key's size, content version and optional metadata describe its
+current object, and its source identity is `PathScoped`; records retain their own identities.
+
+Each record's `source()` selects `Id(id)`, `Current` for the latest null version, `Id("null")` for
+an older null version, or nothing for a marker. Optional metadata is bound to each record and
+observed serially within the traversal's concurrency window. A record's metadata failure stays
+on that record, including under `Required`, instead of dropping the key's history.
+
+A history longer than 100,000 records is emitted as consecutive entries with zero-based segment
+numbers; only the last segment has `is_complete() == true`. Filters and counts operate once per
+key before segmentation. Consumers retain a history only after receiving all its segments through
+the complete segment. Cancellation may cut delivery short; resume replays from segment zero.
+`largest_version()` describes the whole key on every segment, so directory-object preflight is
+consistent across segments. Snapshots encode the entire segment once per `(path, segment)`,
+not once for every record expanded into a database row.
 
 ### Traversal contract
 
-There is one bounded, cancellable, backpressured item stream paired with mandatory completion
-evidence:
+A `TraversalSession` supplies `TraversalItem::Entry`, `Failure(ScanFailure)`, `DirectoryListed`
+and `Checkpoint`, with separate mandatory completion evidence. EOF is insufficient: await
+`TraversalOutcome::Completed` before committing a complete generation. Cancellation is a distinct
+outcome; a backend session failure terminates traversal. In-flight operations finish and release
+their resources rather than being aborted.
 
-```rust
-Stream<Item = Result<ObservedEntry, EntryOperationFailure>>
-```
+`Unordered` is the default. Workers use local depth-first stacks and steal shallow pending work.
+A directory's entry precedes everything below it; different directories may interleave, while a
+key's history segments remain consecutive and ordered. There are no `DirectoryListed` events.
+Concurrency is bounded by `min(max_inflight_operations, 64)`, or eight for CIFS open listings.
 
-An entry-operation failure is an item and includes entry identity/path and operation. A
-backend-session failure terminates the stream. Cancellation is a distinct terminal outcome, not
-an entry or backend error. EOF alone never proves that enumeration was complete: callers must
-await the session completion and receive `Ok(TraversalCompletion)` before committing a complete
-generation or enabling deletion. Paging and backend concurrency are hidden in the traversal
-implementation.
+`Blocks` emits all children of a directory in backend listing order, its `DirectoryListed`, then
+recursively visits its subdirectories in raw UTF-8 name order. Children arrive page by page;
+only pending subdirectories need to be retained for descent sorting. Bounded prefetch and
+observation windows preserve this ordering under asynchronous completion. S3 history listings
+are the exception to page-bounded backend memory: the directory's raw history is materialized
+before emitting keys. Current-object S3 listings assume no ordering and deduplicate prefixes.
+An empty S3 prefix root fails `NotFound` instead of proving an empty exhaustive source.
 
-The `Blocks` order (P7 C4; the only order until `Unordered` arrives) is depth-first by blocks:
-all children of one listed directory, in the order the backend listed them, then the directory's
-`DirectoryListed`, then the block of each subdirectory, descended into in the raw UTF-8 byte order
-of their names, recursively. A directory's children therefore always follow the directory, one
-listing's children are contiguous, and the order directories are visited in is the same on every
-backend; only the order inside a block is the backend's. A block is consumed page by page as its
-listing streams, and it closes — and its subdirectories are sorted and descended into — only once
-the listing has ended. Directory listings are prefetched concurrently ahead of the admission point
-(deepest first): at most `min(max_inflight_operations, 64)` listings wait for a page at once,
-separate from the observation window, and at most twice that many started listings wait for the
-admission point, each stopped once it has handed over its first page. The traversal holds a few
-pages of each open listing however large its directory, so its memory is bounded by those pages
-plus the subdirectories still to descend into, never by the width of a directory; until each
-backend streams its listing for real (Local since P7 C5, S3's current objects since C6, NFS since C7, HDFS since C8, CIFS since C9;
-S3's every-version listing in C11b), the backend's own producer still reads the whole directory before the first page. A CIFS
-listing parked on its first pages holds an open directory handle, so prefetch keeps at most eight CIFS listings started ahead
-and unfinished (`Namespace::parked_listing_limit`). A listing that fails after
-returning children is `Interrupted`, its failure carrying how many it returned (`delivered`).
-A session failure reported by a prefetched listing ends the traversal as soon as it arrives,
-including before entries admitted ahead of it have been delivered. Listings and observations may finish out of order, but
-cannot change delivery order: sequence numbers are assigned only in admission order. Both the
-admission window and item channel are bounded, so a slow consumer backpressures enumeration
-without allowing the reorder buffer to grow without limit. Backend operations already started
-are never aborted on cancellation or termination; they run to completion in the background so
-any handle they opened is closed.
+A child failure excludes that entry from deletion; an unnamed child failure excludes every known
+direct child of that directory. A listing failure excludes the whole known subtree. A listing that
+fails before handing over children is `Unreadable`, otherwise `Interrupted`; siblings continue.
+Only `Completed` permits deletion detection, with these exclusions plus the same filter/depth
+bound as the scan. A vanished child produces no item and increments `vanished`. Throttling retries
+within its budget, then fails at most the affected listing or child.
 
-`TraversalRequest::versions` selects what a versioned store contributes (ADR-0006 C22):
-`Current` (default) emits current objects only — a key whose newest entry is a delete marker is
-absent — and `All` emits every stored version and delete marker, each key's entries contiguous,
-oldest first, the latest last, in the server's listing order (never `LastModified`, which
-concurrent writes share; a key whose listing fails the order checks is ordered by time and reports
-`EntryVersion::order() == HistoryOrder::Inferred`). A source that keeps no versions ends an `All` traversal before any
-I/O with an `Unsupported` session failure (`StorageTraversalSource::supports_versions()` asks
-first); it never returns current entries in place of versions. Both modes hide `.data-mover-*`
-names. On S3 a name can repeat in one directory — the object `a` beside the prefix `a/`, and in
-`All` one child per version — and a block keeps them in listing order, a key's versions
-contiguous, oldest first; only the prefix is descended into. The
-optional metadata of a version entry is observed bound to that version, and a prefix or a delete
-marker asks the metadata role nothing. S3 listings cost at least one request per directory. The
-listing of current objects streams (traversal plan P7 C6): each `ListObjectsV2` page is handed
-over as it arrives, assuming no key order (a store may return keys unsorted and a common prefix
-on several pages; each subdirectory is handed over once, and an object may be handed over
-twice); the listing of every version is still gathered whole per directory. S3 has no directories:
-a traversal rooted at a prefix under which nothing is stored fails the root's listing (`NotFound`)
-rather than completing as an empty, exhaustive source.
+`BlockCounts` (Blocks only) and `ScanTotals` satisfy
+`listed == emitted + filtered + failed_children + vanished` and
+`files + directories + symlinks + other == emitted`. Hidden transfer artifacts and NFS `.snapshot`
+are outside `listed`; pruned/truncated directories are orthogonal. History keys count once:
+`versions` counts stored versions, `delete_markers` counts markers, `bytes` counts current content,
+and `all_versions_bytes` counts all stored versions (or the file's size without history).
+
+### Scan checkpoints
+
+`Resumable::On` emits checkpoints around its configured interval and on early termination;
+`resume_from` restarts from a checkpoint only when its fingerprint matches the backend, root,
+filter, observation plan, depth, order and connected history capability. Checkpoint format v2
+rejects old versions. The fingerprint uses the caller's filter digest; it is not inferred from a
+trait object. The checkpoint is deliberately conservative: replay is allowed, omission is not.
+Blocks advances only beyond delivered blocks; Unordered records queued and active directories.
+An oversized frontier disables checkpoint emission rather than recording incomplete progress.
+
+Consumers first persist every preceding entry/failure, then the checkpoint. A restarted consumer
+uses idempotent writes and deduplicates replayed keys/segments; persisting a checkpoint ahead of
+its entries can lose data. The frontier retains failure exclusions needed after resume. Scan
+checkpoints are separate from destination-resident transfer recovery (ADR-0006).
 
 Terrasync projects this same stream in three ways:
 
@@ -845,28 +859,11 @@ publication and resumed from a local recovery identity, was removed in C19; the 
 History migration is a caller procedure built on `SourceVersion`, not a data-mover operation. To
 copy one object's versions into a versioned destination bucket:
 
-1. **Enumerate** the versions with the role-based traversal (ADR-0006 C22):
-   `StorageTraversalSource` over the S3 storage with `TraversalRequest::versions =
-   TraversalVersions::All`. Every stored version and delete marker is an `ObservedEntry` whose
-   `version()` gives the version id (`None` for `"null"`), the latest flag and the delete-marker
-   flag, one key's entries contiguous and oldest first, a key whose newest entry is a delete marker
-   included; `source_version()` is the selector to copy it with (`None` for a marker). The legacy
-   listing below also works, with the limits it describes. With the legacy listing
-   (`StorageEnum::walkdir` or `walkdir_2` on
-   an S3 source whose bucket has versioning `Enabled`): Every entry is an `EntryEnum::S3` with
-   `get_version_id()`, `get_is_latest()` and `get_is_delete_marker()`; each key's entries arrive
-   oldest first in the server's listing order (inferred from time, with
-   `get_version_order_inferred()` true, when that order fails its checks), also when
-   `ListObjectVersions` paging splits the key (C20), but `walkdir` may
-   interleave other keys between them, so group by `get_relative_path()`. `walkdir` lists delete
-   markers too, `walkdir_2` versions only. A key whose newest entry is a delete marker is listed
-   as well (user decision D4, a follow-up after C22; before, it was not listed at all): `walkdir`
-   sends all its versions and markers oldest first, the marker last with `get_is_latest()` and
-   `get_is_delete_marker()` true; `walkdir_2` sends its versions with none latest, since the key
-   has no current object (a key holding only markers gives no entry); a consumer that copies every
-   latest entry must also test `get_is_delete_marker()`. `walkdir` judges markers by `name` /
-   `path` / `extension` filters (never by `size`: they have none). A bucket with versioning
-   suspended is listed with `ListObjectsV2` (current objects, no version ids), unchanged.
+1. **Enumerate** with `StorageTraversalSource`. Versioned buckets automatically yield each key's
+   `history()`, including keys currently deleted. Gather its ordered segments through
+   `is_complete()`, then process `records()` oldest first. `VersionRecord::source()` chooses the
+   exact object version; a delete marker has no source selector. Prefer this path over the legacy
+   listing, which remains only until the P7 cleanup and has weaker ordering guarantees.
 2. **Copy** each version with
    `TransferRequest::new(..).with_source_version(SourceVersion::Id(version_id))`, oldest to newest,
    **one at a time per key**, each only after the previous one succeeded. Streamed and native

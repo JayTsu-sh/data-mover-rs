@@ -81,7 +81,7 @@ CIFS file id、Local dev+inode 放得下；更长的 NFS 句柄与 S3 路径 + E
 才退出。
 
 **事件与计数 (P7 C2)**。`TraversalItem` 是 `Entry` / `Failure(ScanFailure)` / `DirectoryListed` /
-`Checkpoint` (C11 才发)。`ScanFailure.scope` 分 `Child` (这一个子项：列举描述不出，或观察失败) 与
+`Checkpoint` (`Resumable::On` 时发)。`ScanFailure.scope` 分 `Child` (这一个子项：列举描述不出，或观察失败) 与
 `Listing` (这个目录的列举不完整；`delivered` = 失败前已发出的子项数，C4 之前整目录收齐才发，恒为 0)。
 游标在块被完全准入时排一个 marker 槽位，输出侧把它变成 `DirectoryListed { path, outcome, counts }`：
 一个被列举的目录 D 的输出是 D 的块 → `DirectoryListed(D)` → 各子目录递归同样的序列 (空目录也发)。
@@ -96,7 +96,9 @@ CIFS file id、Local dev+inode 放得下；更长的 NFS 句柄与 S3 路径 + E
 计数 (`src/traversal/counts.rs`)：每块 `BlockCounts`，全场 `ScanTotals` (在 `TraversalCompletion.totals`，
 只有 `Completed` 才有)。不变式 `listed == emitted + filtered + failed_children + vanished` (每块与全场都成立，
 `is_balanced()`)；`internal_hidden` (`.data-mover-*`；NFSv3 上 ONTAP 的 `.snapshot`，P7 C7b) 不在 `listed` 里；pruned / truncated 与之正交；
-`files + directories + symlinks + other == emitted`，`bytes` 只加文件。
+`files + directories + symlinks + other == emitted`。带历史的 key 在分段前只计一次；`bytes` 是当前版本字节，
+`versions` / `delete_markers` 数历史记录，`all_versions_bytes` 数所有对象版本的字节。无历史时后者等于 `bytes`。
+当前快照与消费方契约见 [ADR-0008](../../docs/adr/0008-streaming-traversal-and-object-history.md)。
 
 **错误模型 (P7 C3，§8)**。三层：子项失败 (`Failure{scope: Child}`，流继续)、列举失败 (`Failure{scope: Listing}`，
 该目录不完整、兄弟继续)、会话终止 (`TraversalTerminalFailure::Session`，现为 `non_exhaustive`)。两种**不是失败**：

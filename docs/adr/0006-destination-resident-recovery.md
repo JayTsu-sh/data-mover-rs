@@ -4,6 +4,12 @@ Status: accepted 2026-09-24; implementation in progress (commit sequence C1–C2
 Supersedes the recovery-store parts of [ADR-0001](0001-local-transfer-execution-and-recovery.md)
 and of the architecture document's §10 (the store was removed in C21).
 
+
+The traversal and entry-snapshot parts of C22 below are historical. P7 supersedes them with
+[ADR-0008](0008-streaming-traversal-and-object-history.md): automatic per-key object histories,
+DMES v7 only, and scan checkpoints. Destination recovery pointer/binding formats remain governed
+by this ADR; they are independent of entry snapshots.
+
 ## Context
 
 - data-mover runs in non-persistent containers. The engine's recovery store
