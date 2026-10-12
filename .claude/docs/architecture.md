@@ -136,7 +136,8 @@ marker **占准入窗口**的名额，不绕过它，所以不会让 `admitted()
 1. 五个 backend 都出借 `Namespace`（P7 C1 起是类型化动词 `stat` / `list` / `read_link` /
    `create_directory` / `delete` / `rename` / `capabilities`；`list(ListRequest) -> ListingStream` 是唯一
    列举入口，页里带名字，`src/storage/listing.rs`）。S3 只有 `stat` / `list`（ADR-0006 C22，按 `<path>/` 前缀
-   delimiter 列举，另有 `Namespace::list_versions` 供 `TraversalVersions::All`，C11b 删），变更动词 `Unsupported`；
+   delimiter 列举；连接时判定为版本化的桶上 `list` 每个 key 一个子项、带整段历史 `ObjectHistory`，P7 C11b 起；
+   `list_versions` / `TraversalVersions` 已删），变更动词 `Unsupported`；
    `delete_tree` / `create_directory_all` 经 `Storage::mutable_namespace`（看
    `Namespace::capabilities().mutations`）、`ndx_walk` 按 kind 在任何 I/O 之前返回 `CapabilityUnavailable`。
    Local 的 namespace 在 `src/storage/backends/local/namespace.rs`，与观察角色共用同一个
@@ -227,8 +228,8 @@ legacy work-stealing 的调度形状 (§6.1)，放在 role 的列举 / 观察 / 
 - **没有** 序号、重排缓冲、`DirectoryListed`、每目录计数；每个 worker 本地累加 `BlockCounts` + 列举计数，
   结束时相加进 `ScanTotals`。与 Blocks 同一棵树：条目集合、失败集合、`ScanTotals` 逐字段相同
   (`storage/tests/unordered.rs` 的 `same_as_blocks` 在多种 fake 上钉住)。
-- **每个 key 的全部版本在一起** (`TraversalVersions::All`)：页末同一 key 的一段版本留到下一页的批首
-  (`trailing_run`)；会话通道 `send_whole` 整批一条消息，别的 worker 插不进一批中间。
+- **一个 key 的各段在一起** (P7 C11b，Q8)：版本化桶上一个 key 一项；历史超过 10 万条时 `tally_child` 把它切成多段放进
+  同一批，会话通道 `send_whole` 整批一条消息，别的 worker 插不进一批中间（C10 的 `trailing_run` / carry 已删）。
 - **会话通道按批** (`traversal/channel.rs`)：`mpsc::unbounded` 传 `Vec<TraversalItem>` + 按条计的信号量
   (`max_buffered_items` 个许可，批用完才还)。Blocks 的 flush 也是一次一批 (`send`，超过上限按上限切，单一发送方
   顺序不变)；Unordered 用 `send_whole` (超过上限就等整个上限空出来再整批发)。

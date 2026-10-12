@@ -609,13 +609,13 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   `versioning_matrix.sh`（`data-mover-c17{,-lock}-1790313057`，已删）结果与 C18 相同：按 id 拷 v1、v2（流式与原生）
   各得 2 个版本、新→旧 v2、v1、内容与源相同；按 id 中断续传 `Resumed { 16777216 }`、1 个版本。
 
-### role-based 遍历与版本模式（ADR-0006 C22）
+### role-based 遍历与版本模式（ADR-0006 C22；P7 C11b：版本化桶每个 key 一项）
 
 - **形态**：S3 出借 `Namespace`（`src/storage/backends/s3/namespace.rs`），由通用的深度优先
   `StorageTraversalSource` 驱动；不做扁平 `TraversalSource` —— 块顺序（目录的全部子项先于任何孙项，
   `TraversalOrder::Blocks`）下，扁平 `ListObjectsV2` 要把根下的全部 key 攒在内存里才能交出根的块。
-- **一个目录 = 一个前缀**：`List(p)` = `ListObjectsV2(prefix = "p/", delimiter = "/")`；All 模式
-  `list_versions(p)` = `ListObjectVersions` 同参数。续页 token / marker **原样回传**，只拿来判“绕回来了”（本目录
+- **一个目录 = 一个前缀**：`List(p)` = `ListObjectsV2(prefix = "p/", delimiter = "/")`；连接时判定为版本化的桶
+  （下「历史」）= `ListObjectVersions` 同参数。续页 token / marker **原样回传**，只拿来判“绕回来了”（本目录
   跟过的所有 token 记在一个集合里，任何一个再出现 → **该目录**的 `Protocol` / Permanent 条目失败，遍历继续兄弟，
   防止 A、B、A… 死循环；之前是会话级失败、一个目录就结束整场遍历，P7 评审现存问题 3 修复），从不当 key
   比较或去前缀，也不用 `StartAfter`。
@@ -632,29 +632,31 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   - 翻页上限（下一条）只数**驻留**的：前缀名集合（重复的前缀只记一次）与报过的不可解码 key（续页 token 另有同样的上限）；交出的对象不驻留、不计
     —— 平铺前缀多大都能流完（§12.4 的 1000 万文件平铺目录；用户 2026-09-26 定：上限管内存，不管平铺前缀的大小）。
     上限 / token 回绕 / 连续空页在首页之后触发时，先交出的页照常发出、触发的那一页不交出，遍历记 `Interrupted { delivered }`。
-  - **重试**（`paging.rs` 的 `PageRetry`，Current 与 All 都用）：请求无状态，同一 token / marker 重发就是同一页，首页前后
+  - **重试**（`paging.rs` 的 `PageRetry`，Current 与历史都用）：请求无状态，同一 token / marker 重发就是同一页，首页前后
     一样：节流（429 / 503 / `SlowDown`…）按 `throttle.rs` 有界退避（每个列举累计约 2 分钟，超了是该列举的 `Throttled` /
     Transient）；其他瞬时失败（5xx 但不含 501、超时、连接断开，已在 SDK 内重试过）再发至多 3 次（250 ms / 1 s / 2 s，读到一页即
     续满），用尽则按原失败的作用域报（会话级的照常升会话）。不从头重列、不重复交出。
-- **All 仍按目录收齐**（`listing.rs` 的 `list_all`，§5.3 / Q9）：无序存储上一个 key 的版本可能在任意页，只有列完整个
-  目录才知道历史完整；跨页的 key 天然是整的，不需要 C20 的“留下一页最大 key”（那个做法假设 key 升序）。每 key 一项在 C11b。
-- **翻页上限**（`paging.rs`）：一个列举最多**驻留** 500 万条 —— 整个读完的列举（All 的版本 + 标记 + 前缀）按列到的条数计
+- **历史按目录收齐**（`histories.rs` 的 `produce_histories`，§5.3 / Q9）：无序存储上一个 key 的版本可能在任意页，只有列完
+  整个目录才知道历史完整；跨页的 key 天然是整的，不需要 C20 的“留下一页最大 key”（那个做法假设 key 升序）。收齐之后每次只把
+  `page_hint` 个 key 构造成子项交出（第一页带目录自己的键与失败），不一次性构造整个目录的描述。
+- **翻页上限**（`paging.rs`）：一个列举最多**驻留** 500 万条 —— 整个读完的列举（历史的版本 + 标记 + 前缀）按列到的条数计
   （`Paging::advance`）；流式 Current 只数驻留的前缀名集合与报过的不可解码 key（`advance_holding`），另有续页 token 上限
   500 万（每页一个，服务端换着新 token 无尽翻页也会停；每页 1000 个对象时是 50 亿个对象），交出的对象不计，平铺前缀
   多大都能流完（`MemoryS3` 的 `generated` 旋钮：5,000,001 个对象、生产上限，流完）→ 超了该目录 `Capacity` 失败；连续 16 页空页却还说有下一页 → 该目录 `Protocol` 失败；都不会悄悄截断。`IsTruncated` 缺失但有 token
-  → 继续翻（同 legacy）；没有 VersionId 的条目当 `"null"`；All 里跨页重复的版本只留第一次。`Stat` 的前缀探测也按
+  → 继续翻（同 legacy）；没有 VersionId 的条目当 `"null"`；历史列举里跨页重复的版本只留第一次。`Stat` 的前缀探测也按
   同样上限翻过空页，不把“第一页空但有下一页”当成不存在。
 - **取消即停**：S3 的列举不持有句柄：`ListRequest.cancel` 取消或流被 drop 时进行中的请求（连同退避 / 重发的睡眠）
-  直接丢弃，不在后台继续翻页（Current 在 `produce_current` 里 `select!`，All 用 `PageSink::deliver_abortable`）；
+  直接丢弃，不在后台继续翻页（Current 在 `produce_current`、历史在 `produce_histories` 里 `select!`）；
   CIFS 这类持有目录句柄的列举仍跑完再关句柄（P7 C1 删了 `listings_are_abortable()`）。
 - **不存在的前缀**：非根路径**列完**仍一条都没列到（没有对象、版本、标记、前缀，也没有自己的 `p/` 标记）→ `NotFound`
   条目失败，之前不交出任何页（前面的空页不算数）；遍历根拼错时根的列举是 `Unreadable`，不会被当成“源端为空”。存储根永远存在。
-- **子项顺序**：一起描述的子项（Current 的一个服务端页、All 的整个目录）按 S3 key 序，公共前缀带尾 `/` 比较
+- **子项顺序**：一起描述的子项（Current 的一个服务端页、历史的整个目录）按 S3 key 序，公共前缀带尾 `/` 比较
   （`a` < `a!` < `a-0` < `a.txt` < `a/`）；同名的对象 `a` 与目录 `a` 并存。遍历块内保持这个列举序（P7 C4 删了兄弟排序与
-  `rank`）：同一 key 的版本连续、从旧到新；只有前缀 `a` 被下钻，下钻按子目录名字节序。
+  `rank`）：一个 key 一项；只有前缀 `a` 被下钻，下钻按子目录名字节序。
 - **目录对象**（P7 F5，键以 `/` 结尾，有没有内容都算）：目录 `p` 自己的键 `p/` 由 `p` 的列举作为**空名的文件子项**交出，
   路径恰为 `p/`（name 对 filter 是 `p`、深度同 `p` 的子项、页内排在最前）；Current 只要存在就交出（零字节文件夹标记也是
-  零字节文件条目），每个列举只交一次；All 交出这个键的整段历史（有内容版本、零字节版本、删除标记，旧→新）。身份
+  零字节文件条目），每个列举只交一次；版本化桶上它是一项、带整段历史（有内容版本、零字节版本、删除标记，旧→新；最新是
+  标记也列出）。身份
   `PathScoped(len‖"p/"‖ETag)` / `VersionScoped`，与文件 `p`、目录 `p` 都不冲突。存储根自己的键（URL 前缀本身）：
   零字节 / 全零历史忽略，有内容 → 根上的 `Unsupported` 子项失败；扫描根 `p` 自己的 `p/` 同理（遍历处理）。`stat("p/")`
   只 HEAD，不存在 → `NotFound`。MinIO 2023：版本桶里最新是删除标记的 `p/` 仍被 ListObjectsV2 列成无 ETag、0 字节的
@@ -672,31 +674,44 @@ MinIO 2023 不支持条件创建，对新 key 也回 404 NoSuchKey → 映射成
   `a/..`）是逐子项失败（报在服务器拼写的路径上，列举 `Partial`），不会被并进别的路径 —— 目的端的路径处理会把
   `a/./b` 折成 `a/b`，两个对象写到同一个文件；`List("a/")` / `"a//b"` / `"a/."` 这类路径 `InvalidInput`。不理 delimiter 的存储
   平铺返回的深层 key 在客户端收拢成一级前缀（去重）。`.data-mover-*` 两种模式都隐藏（key 或任意一段前缀）。
-- **Current**：只有当前对象（最新是删除标记的 key 不出现）；身份 `PathScoped(路径, ETag)`（`ListObjectsV2` 不带
-  versionId；Q28 之前只有 ETag）；时间 = 列举的 `LastModified`（毫秒精度，HEAD 只有秒），`modified` 过滤器不发 HEAD；目录无时间。
-- **All**：每个版本与删除标记各一条，同一 key 连续、从旧到新、latest 最后（`history.rs`）：按**服务端文档顺序**倒过来
-  （见下「版本历史顺序」，Q29 之前是按 `LastModified` 交错两条序列，并发写入时排错）；校验不过的 key 按时间推断，
-  `EntryVersion::order() == HistoryOrder::Inferred`（例子打印 ` order=inferred`）。删除标记是 `File`、`size` 为 `None`：DSL 的 `size`
-  条件对它是 `LazyMatch`（放行），要排除标记按 `version().is_delete_marker()` 在调用方过滤。这是**有意的规则**
-  （用户决定 2026-09-25）：`size` 条件不滤删除标记，所以按大小筛的历史迁移仍带上大文件的删除记录 —— 标记不带数据，
-  目的端该 key 上没有对象时，重放一个从没拷过的 key 的删除不改任何数据（有对象时重放会把它藏到新标记后面，是否重放
-  由调用方判断）；表达式里的其他条件（`name` / `path` …）照常作用于标记。
-  `ObservedEntry::version()` = `EntryVersion { id（"null" → None）, latest, 删除标记, order }`；`source_version()`：真版本
-  `Id(id)`、latest 的 `"null"` → `Current`、非 latest 的 `"null"` → `Id("null")`、删除标记 → `None`（标记无 size，
-  也不 HEAD）。身份 `VersionScoped(id)`（与带版本 describe 一致）。可选元数据按该版本取（`observe_copy_bound_version`，
-  标签用它的 versionId）；前缀与删除标记不问元数据角色。快照：带版本的条目 v6，其余仍是 v5 原字节。
-- **专家传输（terrasync）**：源端半程用 describe 复核观察；版本化桶上 Current 观察是 `PathScoped(路径, ETag)`、describe 钉住
+- **是否列历史**（P7 Q26 / Q-A，C11b）：连接时 `GetBucketVersioning` 的回答（`S3VersioningAtConnect`，
+  `src/s3/versioning_answer.rs`）：`Enabled` / `Suspended` / 明确拒绝（403 等，未知 Status 同）→ 列历史；从未开启 /
+  501·`NotImplemented`·`UnsupportedOperation` → `ListObjectsV2`；无响应 / 超时 / 429 / 5xx / `RequestTimeout`·`SlowDown` 等
+  （SDK 重试之后）→ **role connect 失败** `BackendSessionFailure` Connect / `Connectivity` / `Transient`（诊断带 HTTP 状态；
+  `connect_backend` 的 `BackendConnectError::session_failure()` 给出它），不猜；构造请求失败按拒绝处理。NAS profile 一律不列历史、
+  也不因无响应拒连。legacy `S3Storage::new` 照旧连接成功（`is_bucket_versioned` / `versioning_suspended` 语义不变）。
+  `S3Namespace` 在连接时取一次 `S3Protocol::lists_histories()`，整个连接不变，`capabilities().histories` 与之相同。
+  **与 legacy 的差别**：瞬时失败时 role 连不上而 legacy 连得上；只有 `s3:ListBucket`、被拒 `GetBucketVersioning` 与
+  `ListBucketVersions` 的主体在 role 遍历上每个目录都会权限失败（按 Q26 列历史；待定是否加回退）。
+- **Current**（未开版本的桶）：只有当前对象；身份 `PathScoped(路径, ETag)`（`ListObjectsV2` 不带 versionId；Q28 之前只有
+  ETag）；时间 = 列举的 `LastModified`（毫秒精度，HEAD 只有秒），`modified` 过滤器不发 HEAD；目录无时间。
+- **历史**（版本化桶，C11b）：**每个 key 一项**，`ObservedEntry::history()` = `ObjectHistory`：记录旧→新、latest 最后，按
+  **服务端文档顺序**倒过来（见下「版本历史顺序」）；校验不过的 key 按时间推断，`order() == HistoryOrder::Inferred`（例子打印
+  ` order=inferred`）。当前已删的 key（最新是删除标记）**也列出**，`history.current()` 为 `None`。
+  - 条目层字段 = **当前对象**：size、`ETag`、时间、身份 `PathScoped(路径‖ETag)` 与 `ListObjectsV2` 给同一对象的逐字节相同
+    （桶开关版本身份键不变；expert 源半边照常核对）；已删的 key：size `None`（DSL `size` 条件照旧 `LazyMatch` 放行，用户
+    2026-09-25 定）、时间 = 标记的（`modified` 条件按标记时间判断）、身份 `PathScoped(路径‖"\0s3-deleted-key\0"‖标记 id)`、
+    列举之外无可观察。`source_version()` = 当前对象的选择器（真版本 `Id(id)`、latest 的 `"null"` → `Current`），已删为 `None`。
+  - `VersionRecord`：`version_id()`（`"null"` → `None`）、`is_latest()`、`kind()`（对象 size / ETag / 时间，或删除标记）、
+    `identity()`（`VersionScoped(id)`；`"null"` 为 `PathScoped(路径‖ETag)`，与 `describe_version` 一致）、`source()`（非 latest 的
+    `"null"` → `Id("null")`，标记 → `None`）、`metadata()`。
+  - 可选元数据（计划要列举之外的）逐条串行观察、绑定各自版本（`observe_copy_bound_version`，标签用它的 versionId），占遍历的
+    同一个观察名额；一条失败只记在那条上（`MetadataObservation::Failed`，`Required` 也一样），整项照常交出；删除标记不观察；
+    条目层元数据取当前版本的（观察失败时时间退回列举的）。版本很多、计划要 tags 时每个 key 要做 N 次 HEAD / GetObjectTagging。
+  - **分段**（Q8）：一个 key 超过 10 万条记录时发多项（段号从 0，只有最后一段 `complete`），连续、有序；只有最后一段有
+    `current()`；续扫后从第 0 段重发。计数按 key：`versions` / `delete_markers` / `all_versions_bytes` 另计，`bytes` 为当前版本字节。
+  - 快照 v7 带历史段（`src/model/history_codec.rs`）；旧格式一律 `UnsupportedVersion`。
+- **专家传输（terrasync）**：源端半程用 describe 复核观察；版本化桶上列举的观察是 `PathScoped(路径, ETag)`、describe 钉住
   `VersionScoped(id)`，`ReadSource::observation_matches` 在 describe 到的路径与版本 ETag 拼出的身份等于列举的身份时认作同一对象，
   对象被替换则仍报 "source differs"；offer / evidence 带观察的身份键（目的端半程比对它），读仍钉在 describe 到的版本。
-  All 模式里只有 latest 版本能走专家传输：旧版本报 "older version"（用 `with_source_version` 拷），删除标记报
-  "delete marker"。
-- **拒绝**：非 S3 源请求 `All` → 会话在任何 I/O 前以 `Session(Unsupported)` 结束、零条目（不会退化成当前对象）。
-  S3 的变更动词 `Unsupported`；`delete_tree` / `create_directory_all` / `ndx_walk` 在 I/O 前拒绝 S3（同以前）。
-- **例子与真机**：`S3_LISTING_URL=… cargo run --example storage_role_operations -- --backend s3 traverse
-  --versions all [--order blocks]`（每条版本打印 `version= latest= marker= size=`）；
-  `.claude/skills/e2e-s3/scripts/traversal_versions.sh`（临时桶，见 SKILL 第 8 步）。MinIO VM 102 2026-09-25 通过：
-  `k` = 2 B、3 B、标记、4 B，`gone` = 版本 + latest 标记，999 个 key 后的 `p/z` 跨页仍 1、2、3 B，暂停版本写的 `n` =
-  `version=null latest=1`，无 artifact；All 1015 条、Current 1008 条；`name-bytes` 并发 1/4/32 输出相同；桶已删。
+  带历史的条目只有 `current()` 有值时能走专家传输：已删的 key 报 "deleted now"、非最后一段报 "not its last"；旧版本用
+  `with_source_version` 拷（`examples/s3_history_replay.rs`）。
+- **拒绝**：S3 的变更动词 `Unsupported`；`delete_tree` / `create_directory_all` / `ndx_walk` 在 I/O 前拒绝 S3（同以前）。非 S3
+  存储没有历史，条目不带 `history()`。
+- **例子与真机**：`S3_LISTING_URL=… cargo run --example storage_role_operations -- --backend s3 traverse [--order blocks]
+  [--current]`（版本化桶：条目行 `history=<段>/<complete> records=<n>[ order=inferred]`，每条记录一行
+  `Record <key> <段>.<序号> version= latest= marker= size=`；`--current` 只打印当前对象）；
+  `.claude/skills/e2e-s3/scripts/traversal_versions.sh`（见 SKILL 第 8 步）。C11b 真机结果见设计文档 §14 的 C11b 行。
 - legacy `walkdir` / `walkdir_2` 不受 C22 影响；C20 所述「最新为标记的 key 不列」的限制已由 D4 follow-up 去掉（见上
   「历史版本迁移」第 1 步）。
 
@@ -720,7 +735,7 @@ SDK 却把两种元素解析成两个列表，交错顺序丢了；`LastModified
   全对上才给位置（`DocumentOrder`），否则整页没有位置。其余字段仍取 SDK 的解析。每页多一次响应体拷贝（≤ 1000 条，
   约几百 KB）。role 协议（`role_protocol/listing.rs`）与 legacy 两处 `ListObjectVersions`（`walkdir` 的
   `process_versioned_prefix`、`walkdir_2` 的 `read_dir_sorted`）都走它；`role_list_versions`（单 key、只看 `IsLatest`）不用。
-- `S3ListedVersion.position` = 页内文档位置；`listing.rs::list_all` 与 legacy `VersionPages::positioned` 把后页的位置接在
+- `S3ListedVersion.position` = 页内文档位置；`histories.rs::page_versions` 与 legacy `VersionPages::positioned` 把后页的位置接在
   前页之后（整个目录列举一条序列）。
 - `backends/s3/history.rs::key_histories`（两条路径共用）逐 key：**全部有位置、在整个列举里连续（跨页也算；legacy 只在每批已完整的 key 内查，被页末扣留的 key 隔开或释放后再出现的 key 查不出）、恰一条
   `IsLatest` 且排最前** → 按位置倒序（旧→新），`HistoryOrder::Server`，完全不用时间；否则 `HistoryOrder::Inferred`，
@@ -730,8 +745,7 @@ SDK 却把两种元素解析成两个列表，交错顺序丢了；`LastModified
   每次列举打一条 `warn`（`history::warn_inferred`），不会悄悄退化。跨页重复列出的同一条（同 key、versionId、种类）只留
   第一次。校验只看得到进来的条目：先被滤掉的（artifact、目录自己的标记、收拢进前缀的深层 key）或没有位置的条目夹在某
   key 中间时发现不了它被拆开 —— 只影响本来就不合规的存储。
-- 标记：role-based `EntryVersion::order()`（快照 v6 flag bit 8 = `Server`；没有这一位的老 v6 快照读成 `Inferred` —— 它们
-  确实是按时间合并的；老版本读到这一位报 `Malformed`），
+- 标记：role-based `ObjectHistory::order()`（快照 v7 历史段 flag bit 1 = `Server`；C11b 之前的 v6 快照不再读），
   例子 `storage_role_operations` 打印 ` order=inferred`；legacy `S3Entry.version_order_inferred`（serde 默认 false）/
   `EntryEnum::get_version_order_inferred()`，例子 `s3_listing` 打印 ` order=inferred`。只在推断时打印，服务端顺序时
   输出与以前逐字节相同（`traversal_versions.sh` 的正则不变）。
@@ -749,7 +763,7 @@ SDK 却把两种元素解析成两个列表，交错顺序丢了；`LastModified
   （盲信顺序）→ 4 个红；legacy 位置不跨页累计 → 2 个红。
 - 真机（MinIO VM 102，2026-09-25，临时桶 `data-mover-fix-1790348583`，跑完删光，服务器只剩 `a-bucket` /
   `data-mover-test`；临时脚本，扩展自 architect 的 `probe_race.sh`，未入库）：`race`（并发 3 轮，44 条 / 8 标记，11 条同毫秒）、`d/race`
-  （前缀下并发 1 轮，15 条 / 3 标记）、`seq`（顺序写 20 次 PUT / DELETE，6 标记）。role `traverse --versions all` 与
+  （前缀下并发 1 轮，15 条 / 3 标记）、`seq`（顺序写 20 次 PUT / DELETE，6 标记）。role `traverse --versions all`（C11b 起为版本化桶上的默认 `traverse`）与
   legacy `walkdir` 三个 key 都**逐条等于服务端原始 XML 倒序**、全部 `Server`；`walkdir_2` 等于其中的版本；`seq` 等于
   写入时记录的 versionId 顺序。修复前的按时间合并在 `race` 第 5 条、`d/race` 第 4 条起就与服务端顺序不同。并发写入
   没有客户端可见的“真实顺序”（客户端完成时间受响应延迟影响，21 对相差 ≥ 50 ms 的完成时间与列举相反，但服务端
