@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -104,17 +105,16 @@ def main() -> int:
         deny_url = nfs_url(
             host, export, sub_path=deny_dir.strip("/"), port=port, uid=uid, gid=gid, options=options
         )
-        _, output = run(
+        code, output = run(
             "role traversal DENY (expected permission error)",
             traverse,
             extra_env={"NFS_REAL_URL": deny_url},
             expected=None,
             capture=True,
         )
-        lowered = output.lower()
-        # NFS3ERR_ACCES / NFS4ERR_ACCESS / "permission denied"
-        if not any(word in lowered for word in ("acces", "permission")):
-            print("[skill e2e-nfs] FAIL: deny path did not report a permission error", file=sys.stderr)
+        # Reject build failures and crashes; accept only the role or NFS server's typed denial.
+        if code not in (0, 1) or not re.search(r"\b(?:PermissionDenied|NFS3ERR_ACCES|NFS4ERR_ACCESS)\b", output):
+            print("[skill e2e-nfs] FAIL: deny path did not report a typed NFS permission error", file=sys.stderr)
             return 1
         print("[skill e2e-nfs] PASS: deny path reports a permission error")
 

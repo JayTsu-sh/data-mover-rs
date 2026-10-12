@@ -52,6 +52,17 @@ def run(
     return ""
 
 
+def clean_totals(output: str) -> bool:
+    """The CLI can exit zero with a typed listing failure; check its final evidence."""
+    totals = next((line for line in output.splitlines() if line.startswith("totals ")), "")
+    fields = dict(part.split("=", 1) for part in totals.split()[1:])
+    expected = {"balanced": "true", "failed": "0", "listing_failures": "0", "interrupted": "0"}
+    if any(fields.get(key) != value for key, value in expected.items()):
+        print("[skill e2e-s3] FAIL: traversal did not complete with balanced, failure-free totals", file=sys.stderr)
+        return False
+    return True
+
+
 def main() -> int:
     # S3_ENV picks another server's .env (e.g. .claude/skills/e2e-s3/ontap/.env); a variable set by
     # the caller (S3_BUCKET=data-mover-nas) still wins over the file. Only lists: nothing is written.
@@ -102,10 +113,7 @@ def main() -> int:
     # still captured and redacted in case the example echoes it.
     traverse = ["cargo", "run", "-q", "--example", "storage_role_operations", "--", "--backend", "s3", "traverse", "--quiet"]
     output = run("role traversal bucket list", traverse, capture=True, url=url)
-    totals = next((line for line in output.splitlines() if line.startswith("totals ")), "")
-    fields = dict(part.split("=", 1) for part in totals.split()[1:])
-    if any(fields.get(key) != value for key, value in {"balanced": "true", "failed": "0", "listing_failures": "0", "interrupted": "0"}.items()):
-        print("[skill e2e-s3] FAIL: traversal did not complete with balanced, failure-free totals", file=sys.stderr)
+    if not clean_totals(output):
         return 1
 
     # 不存在 prefix 验证：S3 ListObjectsV2 对不存在的 prefix 返回 200 + 空列表
@@ -121,6 +129,8 @@ def main() -> int:
         capture=True,
         url=bad_url,
     )
+    if not clean_totals(output):
+        return 1
     if "retry" in output.lower() or "backoff" in output.lower():
         print("[skill e2e-s3] FAIL: nonexistent prefix triggered retry/backoff (commit 7eb3046 regression)", file=sys.stderr)
         return 1

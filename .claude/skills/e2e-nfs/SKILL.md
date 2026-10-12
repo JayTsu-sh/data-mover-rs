@@ -62,7 +62,7 @@ role `traverse` / `nfs_export` 只读。
 ## 成功判据
 
 - 1-4b 退出码 = 0；遍历 totals 必须 balanced=true、failed=0、listing_failures=0、interrupted=0
-- 5 输出含权限错误（`NFS3ERR_ACCES` / `NFS4ERR_ACCESS` / permission）
+- 5 退出码 0 或 1，输出含 typed 权限错误（`PermissionDenied` / `NFS3ERR_ACCES` / `NFS4ERR_ACCESS`）
 - 6 末行 `RESULT pass=N fail=0`，退出码 0
 
 ## 失败如何排查
