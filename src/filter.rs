@@ -156,21 +156,6 @@ pub fn should_skip(
     (false, is_dir, true)
 }
 
-/// 检查目录名是否匹配 `match_expressions` 中的 `DirDate` 条件
-///
-/// 仅在 packaged 模式下由 walkdir 调用。如果 `match_expressions` 为 None 或不包含
-/// `DirDate` 条件，返回 false。
-#[must_use]
-pub fn dir_matches_date_filter(
-    match_expressions: Option<&FilterExpression>,
-    dir_name: &str,
-) -> bool {
-    match match_expressions {
-        Some(expr) => expr.has_matching_dir_date(dir_name),
-        None => false,
-    }
-}
-
 /// 解析过滤表达式的辅助函数
 ///
 /// # Errors
@@ -1384,45 +1369,6 @@ impl FilterExpression {
             FilterASTNode::And(left, right) | FilterASTNode::Or(left, right) => {
                 Self::collect_referenced_fields(left, fields);
                 Self::collect_referenced_fields(right, fields);
-            }
-        }
-    }
-
-    /// 检查目录名是否匹配 `match_expressions` 中的 `DirDate` 条件
-    ///
-    /// 仅在 packaged 模式下由 walkdir 调用，用于判断一级目录是否应发射 Packaged 消息。
-    /// 递归遍历 AST，找到所有 `DirDate` 节点，提取目录名中的日期并比较。
-    ///
-    /// 返回 true 表示目录名中的日期满足至少一个 `DirDate` 条件。
-    #[must_use]
-    pub fn has_matching_dir_date(&self, dir_name: &str) -> bool {
-        let Some(dir_epoch) = extract_date_from_dir_name(dir_name) else {
-            return false;
-        };
-        Self::check_dir_date_in_node(&self.root, dir_epoch)
-    }
-
-    /// 递归检查 AST 节点中的 `DirDate` 条件是否匹配给定的 `dir_epoch`
-    fn check_dir_date_in_node(node: &FilterASTNode, dir_epoch: i64) -> bool {
-        match node {
-            FilterASTNode::Condition(FilterCondition::DirDate { operator, epoch }) => {
-                match operator {
-                    CompareOp::Eq => dir_epoch / 86400 == epoch / 86400,
-                    CompareOp::Ne => dir_epoch / 86400 != epoch / 86400,
-                    CompareOp::Lt => dir_epoch < *epoch,
-                    CompareOp::Gt => dir_epoch > *epoch,
-                    CompareOp::Le => dir_epoch <= *epoch,
-                    CompareOp::Ge => dir_epoch >= *epoch,
-                }
-            }
-            FilterASTNode::Condition(_) => false, // 非 DirDate 条件，忽略
-            FilterASTNode::And(left, right) => {
-                Self::check_dir_date_in_node(left, dir_epoch)
-                    && Self::check_dir_date_in_node(right, dir_epoch)
-            }
-            FilterASTNode::Or(left, right) => {
-                Self::check_dir_date_in_node(left, dir_epoch)
-                    || Self::check_dir_date_in_node(right, dir_epoch)
             }
         }
     }

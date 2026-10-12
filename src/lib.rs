@@ -52,8 +52,7 @@ pub(crate) mod write_pipeline;
 
 pub use checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 pub use filter::{
-    FilterExpression, FilterFieldDef, FilterOperatorDef, dir_matches_date_filter,
-    get_filter_field_definitions,
+    FilterExpression, FilterFieldDef, FilterOperatorDef, get_filter_field_definitions,
 };
 pub use hdfs::{
     HDFSStorage, HdfsConfig, HdfsEndpointKind, HdfsKerberosCredentials, HdfsLocation,
