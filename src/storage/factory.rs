@@ -221,12 +221,7 @@ pub fn endpoint_identity(config: &BackendConfig) -> Result<BackendIdentity, Back
 /// validation, or role construction fails.
 pub async fn connect_backend(config: BackendConfig) -> Result<Storage, BackendConnectError> {
     match config {
-        BackendConfig::Local(config) => backends::local::connect_transfer(
-            &config.root,
-            config.read_concurrency,
-            config.write_concurrency,
-        )
-        .map_err(|error| BackendConnectError::new(BackendKind::Local, error)),
+        BackendConfig::Local(config) => backends::local::connect_backend(config),
         BackendConfig::Nfs(config) => backends::nfs::connect_backend(config).await,
         BackendConfig::Cifs(config) => backends::cifs::connect_backend(config).await,
         BackendConfig::S3(config) => backends::s3::connect_backend(config).await,

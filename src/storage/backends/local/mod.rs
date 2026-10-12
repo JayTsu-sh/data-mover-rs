@@ -1,14 +1,16 @@
 //! Local-filesystem adapter facade.
 
 use std::io;
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 
-use crate::storage::{BackendCapabilities, CapabilityAvailability, Storage};
+use crate::model::BackendKind;
+use crate::storage::{
+    BackendCapabilities, BackendConnectError, CapabilityAvailability, LocalBackendConfig, Storage,
+};
 
 pub(crate) mod namespace;
 
@@ -25,20 +27,20 @@ pub(crate) mod staged;
 #[cfg(windows)]
 pub mod windows_acl;
 
-/// Connects the Local roles over `root`, which must exist. The identity is `file:///<realpath>`
+/// Connects the Local roles over `config.root`, which must exist. The identity is `file:///<realpath>`
 /// (ADR-0006) and every role is given that same canonical root (a role may canonicalize it again;
 /// a symlink swapped in between would be the only way for them to diverge).
-pub(crate) fn connect_transfer(
-    root: &Path,
-    read_concurrency: NonZeroUsize,
-    write_concurrency: NonZeroUsize,
-) -> Result<Storage, Box<dyn std::error::Error>> {
-    let root = std::fs::canonicalize(root)?;
+pub(crate) fn connect_backend(config: LocalBackendConfig) -> Result<Storage, BackendConnectError> {
+    connect_roles(config).map_err(|error| BackendConnectError::new(BackendKind::Local, error))
+}
+
+fn connect_roles(config: LocalBackendConfig) -> Result<Storage, Box<dyn std::error::Error>> {
+    let root = std::fs::canonicalize(config.root)?;
     let identity = crate::storage::endpoint::local(&root)?;
     let source = Arc::new(source::LocalReadSource::new(
         &root,
         identity.clone(),
-        read_concurrency.get(),
+        config.read_concurrency.get(),
     )?);
     let sandbox = open_root(&root)?;
     let metadata = Arc::new(observation::LocalObservationAdapter::from_root(
@@ -52,7 +54,7 @@ pub(crate) fn connect_transfer(
     let staged = Arc::new(staged::LocalStagedDestination::new(
         root,
         identity.clone(),
-        write_concurrency.get(),
+        config.write_concurrency.get(),
     )?);
     Ok(Storage::connected(
         identity,

@@ -2,8 +2,8 @@ use std::{error::Error, num::NonZeroUsize};
 
 use crate::model::{BackendIdentity, BackendKind};
 use crate::probes::{check_connectivity, probe_server_time};
-use crate::storage::backends::local::connect_transfer;
-use crate::storage::{PreflightPolicy, Storage};
+use crate::storage::backends::local::connect_backend;
+use crate::storage::{LocalBackendConfig, PreflightPolicy, Storage};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -11,7 +11,11 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 async fn local_connectivity_performs_io_and_clock_probe_creates_nothing() -> TestResult {
     let root = tempfile::tempdir()?;
     let slots = NonZeroUsize::new(1).ok_or("nonzero")?;
-    let storage = connect_transfer(root.path(), slots, slots)?;
+    let storage = connect_backend(LocalBackendConfig {
+        root: root.path().to_path_buf(),
+        read_concurrency: slots,
+        write_concurrency: slots,
+    })?;
     check_connectivity(&storage).await?;
     assert_eq!(probe_server_time(&storage).await?, None);
     assert_eq!(std::fs::read_dir(root.path())?.count(), 0);
@@ -22,7 +26,11 @@ async fn local_connectivity_performs_io_and_clock_probe_creates_nothing() -> Tes
 async fn remote_clock_composition_writes_observes_and_removes_its_probe() -> TestResult {
     let root = tempfile::tempdir()?;
     let slots = NonZeroUsize::new(1).ok_or("nonzero")?;
-    let local = connect_transfer(root.path(), slots, slots)?;
+    let local = connect_backend(LocalBackendConfig {
+        root: root.path().to_path_buf(),
+        read_concurrency: slots,
+        write_concurrency: slots,
+    })?;
     let policy = PreflightPolicy::production();
     // A remote-kind facade over real local roles exercises the shared composition without a
     // network fixture. Local's public clock shortcut is tested independently above.

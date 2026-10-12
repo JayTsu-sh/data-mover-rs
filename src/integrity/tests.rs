@@ -6,7 +6,7 @@ use super::{
     same_instant,
 };
 use crate::model::{BackendIdentity, BackendKind, StoragePath, StorageTimestamp, TimePrecision};
-use crate::storage::Storage;
+use crate::storage::{LocalBackendConfig, Storage};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -15,7 +15,13 @@ const FIXED_MTIME: filetime::FileTime = filetime::FileTime::from_unix_time(1_700
 
 fn storage(root: &Path) -> Result<Storage> {
     let depth = NonZeroUsize::new(2).ok_or("constant is nonzero")?;
-    crate::storage::backends::local::connect_transfer(root, depth, depth)
+    Ok(crate::storage::backends::local::connect_backend(
+        LocalBackendConfig {
+            root: root.to_path_buf(),
+            read_concurrency: depth,
+            write_concurrency: depth,
+        },
+    )?)
 }
 
 fn write(root: &Path, name: &str, payload: &[u8]) -> Result {

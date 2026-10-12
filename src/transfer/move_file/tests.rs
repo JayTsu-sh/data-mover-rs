@@ -4,9 +4,10 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
-use crate::storage::backends::local::connect_transfer;
+use crate::storage::backends::local::connect_backend;
 use crate::storage::{
-    ListRequest, ListingStream, Namespace, PreflightPolicy, Storage, StorageRoleFailure,
+    ListRequest, ListingStream, LocalBackendConfig, Namespace, PreflightPolicy, Storage,
+    StorageRoleFailure,
 };
 use crate::transfer::{
     InflightLimits, MoveError, ReadBackVerification, SourceVersion, TransferRequest, move_file,
@@ -16,7 +17,11 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 fn connect(root: &Path) -> TestResult<Storage> {
     let slots = NonZeroUsize::new(2).ok_or("nonzero")?;
-    connect_transfer(root, slots, slots)
+    Ok(connect_backend(LocalBackendConfig {
+        root: root.to_path_buf(),
+        read_concurrency: slots,
+        write_concurrency: slots,
+    })?)
 }
 
 fn request(source: Storage, destination: Storage) -> TestResult<TransferRequest> {
