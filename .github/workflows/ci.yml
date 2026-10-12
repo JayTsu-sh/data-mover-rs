@@ -73,6 +73,9 @@ jobs:
           python3 tests/validate_architecture_dependencies.py .
           python3 -m unittest tests/test_architecture_dependencies.py
 
+      - name: Cargo example artifact selection contract
+        run: make harness-contract
+
       - name: DM-MATRIX-SCHEMA
         run: |
           python3 tests/validate_architecture_matrix.py \

@@ -1,6 +1,6 @@
 .PHONY: help build test clippy clippy-strict fmt fmt-fix check ci doc clean examples \
         e2e-local e2e-cifs e2e-nfs e2e-s3 e2e-network e2e-all \
-        coverage audit-large audit-dispatch arch-guard arch-guard-selftest verify
+        coverage audit-large audit-dispatch arch-guard arch-guard-selftest harness-contract verify
 
 help:
 	@echo "data-mover-rs Makefile (Claude harness 稳定命令面)"
@@ -29,9 +29,10 @@ help:
 	@echo "  audit-dispatch 审 StorageEnum 分派完整性"
 	@echo "  arch-guard     模块依赖方向守卫 (~4s，GitHub CI 同款)"
 	@echo "  arch-guard-selftest 守卫脚本自身单测 (~90s，改守卫时必跑)"
+	@echo "  harness-contract Cargo example artifact selection (one tiny fixture build)"
 	@echo ""
 	@echo "组合："
-	@echo "  ci             fmt + arch-guard + clippy + test + examples + e2e-local"
+	@echo "  ci             fmt + arch-guard + harness-contract + clippy + test + examples + e2e-local"
 	@echo "  verify         ci + audit-large + audit-dispatch + arch-guard-selftest (commit 前自检)"
 
 build:
@@ -93,7 +94,10 @@ arch-guard:
 arch-guard-selftest:
 	python3 -m unittest tests/test_architecture_dependencies.py
 
-ci: fmt arch-guard clippy test examples e2e-local
+harness-contract:
+	python3 -m unittest tests/test_cargo_examples.py
+
+ci: fmt arch-guard harness-contract clippy test examples e2e-local
 
 verify: ci audit-large audit-dispatch arch-guard-selftest
 
