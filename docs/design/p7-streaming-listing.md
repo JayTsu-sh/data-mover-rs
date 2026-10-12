@@ -1,6 +1,6 @@
 # 扫描（遍历）P7 设计：流式列举、两种扫描方式、事件、计数、错误与续扫
 
-> **状态：设计定稿，C11b / C12 与 legacy 清理已完成**（2026-10-12）。CI、可用环境实测、MinIO 十万版本与扫描续跑已通过；DXN-2、StorageGRID、HDFS 的本轮环境限制见 §14.3。第 15 节保留 2026-09-25 的决定记录，ADR-0008 已完成。
+> **状态：P7 实现与验收已完成**（2026-10-12）。C11b / C12、legacy 清理、C7c 首页前续读与 Q4 配对辅助均已完成；CI、可用环境实测、MinIO 十万版本与扫描续跑通过。DXN-2、StorageGRID 的环境限制保留在 §14.3；最终 CI、NFS 与修复后的 HDFS 验收见 §14.4。第 15 节保留 2026-09-25 的决定记录，ADR-0008 已完成。
 >
 > - 本文件**取代**此前的评审稿（Q1–Q30 问题清单、“待拍板”）。评审稿保留在 git 历史里，最后一个评审稿 commit 是 `fef8f2a`。
 > - 权威 HTML 副本在 `root@10.131.9.10:/root/p7-design/p7-streaming-listing-design.html`（本文件据其 sha256 前缀 `4e16e7c4` 的版本转写）；
@@ -61,6 +61,9 @@
 
 ## 2. 现状与实测
 
+> 本节是 **P7 实施前的历史基线**；其中“现状 / 今天 / 未修”和旧接口、性能数字描述当时的代码，
+> 不代表当前实现。保留这些记录用于对照；当前完成情况与验收边界见 §14.3 / §14.4。
+
 ### 2.1 今天的遍历怎么工作
 
 - **一种调度**：准入游标（`src/traversal/storage/cursor.rs`），块序 DFS。一个目录的全部直接子项连续输出（`cursor.rs:1-18`）；块完全准入后才下钻（`cursor.rs:297-303`）；
@@ -118,6 +121,17 @@ enum TraversalOrder {
 两侧按目录同步推进时漂移可界。块内全排则要整块物化（1000 万文件约 4.5 GB）并且首项要等整个目录列完。
 
 代价：块内文件无序，两进程逐文件对比时，消费方按名字做哈希匹配（内存 O(单目录)），并且要等两侧都到了该目录的 `DirectoryListed` 才能判定“一侧缺失”。
+
+**Q4 已实现**（`46a8a4c`）：`traversal::pair_directory_blocks` 接收两侧各一个以 `DirectoryListed` 关闭的块，
+通过 `BlockPairingOptions` 显式映射两侧存储目录到同一个逻辑目录。辅助函数按原始名字哈希配对，不要求块内排序、不做 I/O；
+结果借用原始观察，保留同名不同类型、目录自己的尾斜杠对象及每个 key 的全部历史分段。重复的同名同类型条目标为冲突，
+不覆盖；历史段必须从 0 连续到末段，路径、边界和计数不一致则拒绝输入。
+
+`OnlyLeft` / `OnlyRight` 只表示这两个完整且名字语义精确的块中的缺失；不完整列举、过滤、未命名子项失败和不确定 / 非精确
+名字语义阻止块内缺失判断，具名子项失败阻止该名字的判断。`Matched` 仅表示双方观察到了对应类型，不表示内容相同。
+删除前仍须等两场会话都 `Completed`、排除祖先列举失败的子树，并对旧记录应用相同过滤与深度；被剪枝或截断的子目录不能
+证明其后代缺失。调用方负责对断点重放去重，以及按目标端真实规则处理大小写 / 规范化冲突。本轮验收见 §14.4。
+
 
 ### 3.2 扫描入口与参数（对照 legacy `walkdir`）
 
@@ -269,10 +283,10 @@ type ListingStream = Pin<Box<dyn Stream<Item = Result<ListingPage, StorageRoleFa
 | backend | 流式做法 | 中途出错 |
 |---|---|---|
 | Local | 每页一次 `spawn_blocking`，把 `ReadDir` 带进带出；停车时不占 blocking 线程 | readdir 错误基本不是瞬时的 → `Interrupted`（已交付过）/ `Unreadable`（没交付）；已读到的先交付。**已实现** `277f1f8`：20 万文件平铺目录首项 400 ms → 6 ms、RSS 217 → 22 MB |
-| NFS | 生产者任务消费 `readdirplus` 流，按 `page_hint` 攒页 | **首页交出之前**可以整目录从头重试（legacy 就是这条规则，`nfs.rs:3364-3366`）；之后只能从 cookie 续（需要 nfs-rs 公开页接口，Q18），否则 `Interrupted`。**已实现** `7da78ce`：首页前句柄失效 → 解析路径（至多 3 次）、`DELAY` / `JUKEBOX` / `GRACE` → 列举节流预算内退避、nfs-rs 认证可重发的传输失败 → 250 ms / 1 s / 2 s，都从头重读、不重复交出；首页后不重试（C7c 起改为同样重试、从 cookie 续，见下）；重试用尽时已读到的先交出再失败（可重发的传输失败只让该列举失败）；drop / 取消在下一条之前停、不放弃在途请求。C7b：v3 列出的缺属性 `.snapshot` 经一次 LOOKUP 确认是目录后隐藏（计入 `internal_hidden`，ONTAP 卷根，与 v4 一致），见 §14 C7b。**C7c**（nfs-rs 0.8.5 `readdirplus_page`，调用方持 cookie + verifier）：首页之后的失败按首页前同样的分类 / 预算重试，但从最后一个完整取完的回复之后的 cookie 续读（句柄解析后变了 → cookie 在别的句柄上无意义，从目录开头读）；列举记住已取子项的 `(fileid, 名字)` 带密钥 64 位摘要（上限 2^18 项，约 4.5 MiB / 列举；超过则首页后不再续、照旧 `Interrupted`），续读后服务器重发的（被截断回复的前半、或不认 cookie 从头重发的整目录）跳过，不重复交出；同一次读取里 cookie 重复 → 该列举 `Protocol` / Permanent（§8）；cookie 被拒（`BAD_COOKIE` / `NOT_SAME`）或续读的 cookie 被答以“空的目录末尾”（ONTAP、DXN-2 答不认识的 cookie 就是这样）→ 从目录开头重读并跳过已取的（至多 3 次）；每取到新子项重试预算续满。**已实现** `26a27f6`，见 §14 C7c。5 万文件平铺目录首项 ONTAP v3 1.2 s → 0.05 s、v4.0 / v4.1 2.2 s → 0.07 s、DXN-2 v3 6 s → 0.14 s、v4.0 10 s → 0.2 s；RSS 69–75 → 17–20 MB（release）；五种环境与 legacy 基线逐行相同 |
+| NFS | 生产者任务逐个读取 READDIRPLUS 回复，按 `page_hint` 攒页 | **首页前后都按 cookie 续读**（C7c `26a27f6`，首页前由 `c0ff649` 补齐）：保留已攒页，从最后完整回复后的 cookie + verifier 继续；句柄变更或 cookie 被拒 / 续读答空末页则从头读，按已接收项 `(fileid, 名字)` 去重。句柄重查、可安全重发的传输失败与从头重读各至多 3 次无进展重试；新接收项才续满预算，节流总时长不重置。去重上限 2^18 项（约 4.5 MiB）：超过后已有页交出则不再续；尚未发布时可丢缓冲有界从头重试，不再开启去重或补预算。cookie 在一次读取内回环 → `Protocol` / Permanent。重试用尽先交出已读子项；安全 Resend 只在已有页交出时收窄为列举失败，之前仍是会话失败。drop / 取消不放弃在途请求。C7b 的缺属性 `.snapshot` 经 LOOKUP 确认为目录后隐藏。历史真机与性能见 §14 C7 / C7c、§12.8；本轮验收见 §14.4 |
 | CIFS | 生产者任务持有目录句柄（`CifsDirectory`），逐条取 `QUERY_DIRECTORY` 记录按 `page_hint` 攒页；所有出口都 close，最后一页在关句柄之后交出；停车时句柄开着 → `Namespace::parked_listing_limit()` = 8，Blocks 游标让“已起、未读完”的预取列举不超过它（游标正要的那个总是起） | 首页交出之前句柄失效（smb-rs 重连后旧句柄上的 `InvalidState`、重连时在途的 `StaleObject`、`STATUS_FILE_CLOSED` / `STATUS_INVALID_HANDLE`）→ 重开目录从头读（50 ms / 250 ms / 1 s，至多 3 次，不重复交出）；之后句柄失效无法续 → 已读到的先交出，`Interrupted`（原分类，连接类升会话）。取消 / drop 在取下一条之前停、让在途记录到达；smb-rs 流已预发的下一条 `QUERY_DIRECTORY` 随流 drop 取消（#75/#76）。没有下钻提示（CREATE 按路径一次往返）。**已实现** `936e20b`（接缝 `70f85d1`）：5 万文件平铺目录首项 400 → 34–46 ms、RSS 65 → 21–25 MB（release）；10.3 万条整树 c=1/4/32 与 base 逐行相同（含顺序），RSS 84–118 → 30–44 MB；停车时 ONTAP 上恰 9 个打开的目录句柄（base 0）；与 NFSv3 / v4.1 同一棵树 Blocks 输出逐行相同；停车 30 分钟后照常读完（Q10） |
 | S3 | 未开过版本控制的桶：ListObjectsV2，每页转一页；多版本桶：ListObjectVersions，按目录组装每个 key 的历史（见 5.3、第 10 节） | 同一 token 重发（无状态，安全）；节流退避。**已实现** `f2cacdc`（Current 流式；版本化桶按目录物化后每 key 一项、按 `page_hint` 逐页构造子项，C11b）：不假设 key 有序（只用不透明 token，前缀名集合去重，对象只与上一页比对，列完才判 `NotFound`）；节流按 C3 预算、其他瞬时失败同一 token 再发至多 3 次（读到一页即续满），首页前后一样；500 万上限不再限流式 Current 的对象数，只管驻留的前缀名集合与不可解码 key（续页 token 另限 500 万）；物化的历史列举仍按条数计（用户 2026-09-26 定，**已修** `ffd37ca`；5,000,001 个对象的平铺前缀在生产上限下流完）。2 万对象平铺前缀首项 MinIO 3.5 s → 0.4 s、ONTAP 1.2 s → 0.13–0.25 s，RSS 68 → 54 / 66 → 50 MB（debug）；MinIO / ONTAP（含 NAS 桶）/ RustFS / DXN 的多版本与非多版本桶均已跑 |
-| HDFS | `list_status_iter`（hdfs-native `client.rs:734`）；去掉列举前的 `get_metadata` | 续读：hdfs-native 不公开 startAfter，可重试失败（I/O、单批 > 5 s）后重开列举、跳过到最后读到的名字之后（按 NameNode 的有符号字节序；只在失败时多读），首页前后都可续、不重复发子项；其他失败或预算用完 → `Interrupted`。**已实现** `9c8185f`；有符号字节序、列举文件回自身、缺目录 `FileNotFound` 三点待真机（runner 需用户批准） |
+| HDFS | `list_status_iter`（hdfs-native `client.rs:734`）；去掉列举前的 `get_metadata` | 续读：hdfs-native 不公开 startAfter，可重试失败（I/O、单批 > 5 s）后重开列举、跳过到最后读到的名字之后（按 NameNode 的有符号字节序；只在失败时多读），首页前后都可续、不重复发子项；其他失败或预算用完 → `Interrupted`。**已实现** `9c8185f`；有符号字节序、列举文件回自身、缺目录 `FileNotFound` 已在 2026-09-26 的 C8 真机验收确认（§14）；本轮修复与真机验收见 §14.4 |
 
 ### 5.3 S3：不假设有序
 
@@ -1090,16 +1104,16 @@ C7c feat(storage): NFS 列举首页之后可按 cookie 续读（Q18；nfs-rs 0.8
       cookie 回环只在一次读取内检测；`NFS3ERR_NOT_SYNC` 不当坏 cookie。去重摘要（每条目一次 SipHash、每列举 ≤ 2^18 条
       ≈ 4.5 MiB）**已实测**（2026-09-27，C10 rebase 到 `d222738` 之后，§12.8 末）：node1 m1-source 53M 树两轮，§12.6 的目标全部仍达标
       （Unordered CPU 1.01×、RSS 17.5 MB；Blocks CPU 1.27×、RSS 26.5 MB）；同一二进制除 C7c 外不变的 A/B（10.131.9.10 经 1GbE，
-      子树 d019 2,694,735 条，交替四轮）CPU 差 < 2%、在噪声内，RSS 不变 —— 不需要改。**待办**：首页之前也按 cookie 续读
-      （现在首页前仍是 C7 的整目录重来、不补预算，频繁断连时可能到不了首页）作为后续项
+      子树 d019 2,694,735 条，交替四轮）CPU 差 < 2%、在噪声内，RSS 不变 —— 不需要改。**后续项已实现** `c0ff649`：首页之前也保留已攒页、cookie 与去重状态；
+      新接收条目补满预算，频繁断连不再丢弃已有进展。去重耗尽且尚未发布时，退回不补预算的有界整目录重读；本轮验收见 §14.4
     - 接缝：`read_directory` 带起点 cookie；`NfsListingPages::first_sight(fileid, 名字)`（读者看一项之前问，已取的跳过，
       含 v3 `.snapshot` 的 LOOKUP）、`reached(next)`（整个回复取完、目录未完时报位置；同一次读取里重复 → `NfsReadEnd::Repeated`）；
       `NfsRestart::FromStart`（`is_bad_directory_cookie`：`NFS3ERR_BAD_COOKIE` / `NFS4ERR_BAD_COOKIE` / `NFS4ERR_NOT_SAME`；
       `NFS3ERR_NOT_SYNC` 不是 READDIRPLUS 的状态，nfs-rs 也不算，不收）
     - 读者：一页一页 `readdirplus_page`，页之间看 `stopping()`，不放弃在途请求（v4.1 slot）；EOF 先于 `reached` 判断
-    - 生产者：首页前照旧（从头、丢弃已攒、原预算）；首页后同一分类 / 预算重试，从最后一个完整回复之后的 cookie 续
+    - 生产者：原 `26a27f6` 只在首页后续读；`c0ff649` 起首页前后都按同一分类 / 预算重试，保留已攒页，从最后完整回复后的 cookie 续
       （解析出的句柄变了 → 从头）；`(fileid, 名字)` 带密钥 64 位摘要去重（不用名字：nfs-rs 有损解码，两个名字可能同一串），
-      上限 2^18 项（约 4.5 MiB / 列举；超了首页后不再续）；cookie 循环只在一次读取内判（不认 cookie、从头重发整目录的服务器
+      上限 2^18 项（约 4.5 MiB / 列举；超了首页后不再续，首页前仅可丢未发布缓冲有界从头重读，永久关闭去重且不再补预算）；cookie 循环只在一次读取内判（不认 cookie、从头重发整目录的服务器
       靠去重读完，不当循环）；续读的 cookie 被答以空的目录末尾（ONTAP、DXN-2 答不认识的 cookie 的方式）或被拒 → 从头读并去重，
       至多 3 次；每取到新子项续满重试预算（HDFS C8 同一规则）；重试用尽的结局与之前首页后相同（可重发的传输失败只让该列举
       `Interrupted`，其余照原作用域）
@@ -1217,6 +1231,8 @@ C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 
     本轮修正：`29975eb`（HTTP 408 与响应丢失）、`aafd463`（历史 InlineOnly 不额外 HEAD，保留列举时间）、
     `757c6c9`（SDK 将 HTTP 2xx 解码失败包装为 ServiceError 时仍按 Q-A 拒连）；当前验收结果统一记在 §14.3。
     保留桶 `data-mover-c11b-1790508092` 不属于测试清理范围（用户要求保留）。
+Q4  feat(traversal): Blocks 已关闭目录块的配对辅助 —— 已实现 `46a8a4c`，接口与安全边界见 §3.1；本轮验收见 §14.4
+    - src/traversal/pairing.rs、pairing/{input,tests}.rs；src/traversal/mod.rs 导出
 C12 docs: docs/architecture/storage-transfer-architecture.md §5/§6；.claude/docs/{architecture,error-taxonomy,storage-*}.md；ADR-0008
     —— 已完成：文档同步当前接口；ADR-0008 记录决策与验收边界，C11b 真机验收见 §14.3。
     （含 C11b 定下的**写入快照格式开发期规则**：一种当前格式、版本字节 + golden 字节测试、任何改动都升版本、旧格式
@@ -1245,12 +1261,12 @@ RISK
 - HIGH: CIFS 句柄。生产者任务每个出口都必须 close_resource；ONTAP 停车句柄空闲回收阈值未知 → FAS2750 专测（停车 30 分钟再取）。
 - HIGH: 半途失败。首页之后从头重试会重复发出子项 → “首页已交出”闸门 + 注入测试（第 2 页失败）。
 - HIGH: Unordered 检查点漏登记 → 续扫后整棵子树丢失。窃取与出栈的登记顺序要有注入测试（故意先出栈后登记 → 必须变红）。
-- HIGH: S3 节流今天结束整场遍历；C3/C6 改列举路径的映射时不能改写路径（error-taxonomy 同步）。
+- HIGH（已处理）: S3 列举节流由 C3/C6 按页有界退避并限定列举作用域；未改变传输路径（error-taxonomy 已同步）。
 - MEDIUM: 预取视野从“整份到齐”变成“首页到齐”，FAS2750 上复跑 1f13247 那组深链 + 宽树对比 wall。
 - MEDIUM: 删 SubtreeComplete / 兄弟排序后，现有 events / order 测试大改；防止“改测试迁就实现”——每个删掉的断言要在新测试里有对应的新契约断言。
 - MEDIUM: S3 All 物化上限默认 500 万，超限报 Capacity，不能静默降级。
 - LOW: nfs-rs 升级是依赖风险，本计划不依赖它。
-- LOW: 178 MB 的来源未明，可能与遍历结构无关（malloc arena）。
+- LOW（已处理）: 178 MB 来源已定位到 NFS 列举回填全局句柄缓存，C7 / C10 已修并通过性能门（§12.7 / §12.8）。
 
 VERIFY
 ======
@@ -1503,7 +1519,8 @@ N6 `d51af50`、N7 `ce49448`、F5h `7260974`；细节见 `.claude/docs/storage-s3
 ### 14.3 C11b / C12 与 legacy 清理收尾（2026-10-12）
 
 **收尾已完成**：CI、下表可用环境的实测、MinIO 单 key 十万版本与扫描 cancel / SIGKILL 续跑均通过。
-DXN-2 依用户决定作为环境受限项结束；StorageGRID 当前不可达、HDFS 缺实验配置，均未冒充通过。
+DXN-2 依用户决定作为环境受限项结束；StorageGRID 当前不可达。此阶段执行主机未加载 HDFS 实验配置，
+HDFS 未运行；后续已找到 runner 的配置、修复 HA 并通过真机验收（§14.4），HDFS 不再列为环境受限。
 
 最终生产代码验收基准为 `757c6c9`；`17dc58b` 只补充了扫描续跑脚本的整目录重放说明。各真机用例的实际源码修订见下表，
 不把较早修订的实测写成最终修订复跑。清理移除了 NDX、`walkdir` / `walkdir_2`、旧 scan 消息与迭代器、HDFS 递归扫描以及
@@ -1543,7 +1560,7 @@ S3 旧版本扫描；调用方统一使用 role traversal。破坏性接口清�
 | ONTAP NFSv4.0 / v4.1，`757c6c9` | 通过 | 各用例全部通过；遍历 5,602 项，计数平衡、无失败 / 列举失败；export / option / mkdir 契约通过 |
 | ONTAP NFSv3 | 通过 | 旧 profile 的 `noresvport=true` 与服务端 `mount_rootonly=enabled` 冲突；在当前 root Ubuntu 构建机改用 `version=3&noresvport=false` 后，完整 runner 遍历 5,602 项、计数平衡且零失败，export / 嵌套 mkdir-delete / mkdir 契约全过，临时目录已清理；源 LIF 与目标 LIF 各只读 depth-1 遍历均 9 项零失败。无需修改服务或代码 |
 | DXN-2 NFSv3 / v4.0 | 环境受限，用户确认按此完成代码验收 | 原生 NFS 与既有 v3 / v4 导出已配置；底层 ThinkFS 故障（全部 MDS down、无 active IOA）阻塞可用性，当前没有 2049 监听 / mountd 注册。未验证本轮 NFS 用例；未改配置、未启停服务、未进行 NFS 写入。用户确认文件系统故障并要求停止该环境全部远端操作，已停止 |
-| HDFS | 未运行 | 当前运行环境没有 HDFS 实验配置 / 环境变量，候选 RPC 端口拒绝连接；无 HDFS 写入，不能据此判断产品行为 |
+| HDFS | 此阶段未运行 | 此阶段执行主机未加载实验配置，候选 RPC 端口拒绝连接；未进行产品测试写入。后续已找到 VM 102 的 Kerberos / HA 配置并完成环境修复，7 项产品用例与隔离根清理均通过，见 §14.4 |
 
 **扫描检查点续跑**（独立于传输 `resume_matrix.sh`）：
 
@@ -1591,6 +1608,58 @@ failed / listing-failure / interruption / vanished / truncated 均为 0。并发
 CI 日志：`/tmp/dm-c11b-757c6c9-make-ci.log`。
 这些是当前验证机上的证据位置，不保证作为仓库文件长期保留。
 
+### 14.4 C7c / Q4 补项与 HDFS 后续验收（2026-10-12）
+
+**最终代码验收基准**：`2486d34`。C7c 首页前续读实现在 `c0ff649`，Q4 闭合目录块配对实现在 `46a8a4c`，
+后续 `cf29771` 修正公开类型导入，`2486d34` 让测试复用既有身份工厂；最后两项未改变生产行为。
+`cf29771` 的 Q4 定向测试 12/12 通过，包括真实 Local 双会话闭合块配对；NFS 列举定向测试 36/36 通过。
+最终 `2486d34` 的 `make ci` exit 0：格式、架构依赖与 Cargo 产物选择回归、全特性严格 clippy、workspace 测试
+（库 1,751 passed / 8 ignored，其余 integration / doctest 全过）、examples 和本地端到端（20 + 4 项）全部通过。
+日志：`/tmp/dm-p7-2486d34-make-ci.log`。这包含 C7c 新增的 12 项首页前故障测试与 Q4 的 12 项配对测试。
+
+**C7c 实测通过**：使用 `5fd59a8`（父提交 `c0ff649`）的独立 checkout 与 target，未修改源码 / 脚本，
+ONTAP v3 / v4.0 / v4.1 的完整 runner 均 exit 0。每套遍历 5,602 项，计数平衡、失败 / 列举失败 / 中断均 0；
+export、嵌套 mkdir-delete、权限分类、缓存删除后重建和 `.snapshot` 只读契约均通过，生成的专用目录已清理。
+v3 使用 `version=3&noresvport=false`，v4.0 / v4.1 使用各自版本与 `noresvport=true`。原始验证与二进制哈希见
+`/tmp/dm-p7-final-nfs-validation.md`；该报告记录的是 `5fd59a8` 的真机验证，不冒充后续 Q4 合入提交的重跑。
+DXN-2 仍遵照用户要求停止远端操作，不把其历史通过记录当成本轮验证。
+
+**HDFS 环境已恢复，真机验收通过**：已在 runner VM 102 找到实验 Kerberos / keytab / HA 配置，因此 §14.3 的
+“未加载配置”只描述当时执行主机的状态。实际阻碍与用户授权的修复如下：
+
+- 两个 NameNode 自身名字优先解析为 `127.0.1.1`，RPC 绑定 loopback。备份并修复两台 `/etc/hosts` 后，各重启
+  NameNode 一次，RPC 恢复到管理地址 `10.131.9.30:9000` / `10.131.9.33:9000`；NN1 ZKFC 按需重启一次。
+- 两个 DataNode 上的自身别名也优先解析为 loopback，使 ZooKeeper 的 3888 peer listener 绑错地址、没有 quorum。
+  追加授权后，只删除两台的自身 loopback 别名，保留 `10.10.1.31` / `.32` 数据网映射，并补 NN2 管理地址映射；
+  三个 ZooKeeper 按 NN1 → DN1 → DN2 逐台重启，恢复 quorum。
+- 随后的 QJM Kerberos 错配是 hosts 同 IP 行里短名排在 FQDN 前：实际服务端主体为 `hdfs/FQDN@REALM`，客户端
+  按反向解析预期 `hdfs/短名@REALM`。四台 HDFS 节点仅将三条 JournalNode IP 行上的既有 FQDN alias 移到首位，
+  没有改 IP 或新增主体。每次修改都保留备份并核验 hash、正向与 canonical 解析；NameNode 随后自然恢复，无需追加重启。
+
+验收前后，两个 NameNode 的 systemd 服务均为 active/running，PID 不变、`NRestarts=39` 不再增长；
+这是**进程状态**。认证 HAAdmin 返回的是 nn1 active / nn2 standby，确认只有一个 HA active。
+两个管理网 RPC 可达；ZooKeeper 为一 leader、二 follower，各节点 `imok`，peer listener 已绑定正确非 loopback 地址。
+没有修改 keytab 或 Hadoop 配置，没有清理 / 重建数据或日志目录，也没有格式化或强制选主。
+
+runner VM 102 使用从 `2486d34` 构建并核对 SHA-256 的两个测试二进制，以 `github-runner`、既有实验配置 / keytab
+和独立 `nightly-` 根执行以下七项。每个精确过滤器都实际运行 1 项、0 失败并 exit 0，不把零测试匹配计为通过：
+
+| 测试套件 | 结果 | 覆盖 |
+|---|---|---|
+| `hdfs_architecture_contract` | 4/4 | role 遍历 / 流式读写 / 校验 / 覆盖；重连后恢复已持久前缀；取消后的扫描续跑；有界乱序 writer 重排 |
+| `hdfs_native_contract` | 3/3 | 文件与目录映射；只列一层目录；带深度限制的递归流式扫描 |
+
+第一次将 writer 用例误投 native 二进制时选中 0 项，已排除；改用 architecture 二进制后该项真正通过。
+`nightly_lab_cleanup_confined_run_root` 通过，最后一次只读根状态探测返回 `FileNotFound`，确认隔离根不存在。
+该探测因“根应存在”的断言而非零退出，是预期的缺失证据，不冒充测试通过；修正 writer 用例后又执行了清理与只读确认。
+
+最终报告：`/tmp/dm-p7-final-validation.md`；逐项原始日志在
+`/tmp/dm-p7-hdfs-acceptance-2486d34-nightly-luna-20261012-82f39c1711/`。
+architecture 二进制 SHA-256：`c0583253d61c19b50b9da9e2618adc3cdad7a9e8bd5746fd0bb96a6bebfe34b3`；
+native 二进制 SHA-256：`67a5af0e4b710ec21279f51c334a51fa09e5585b19276f9b98b761b628915ee4`。
+hosts 备份与 apply 记录保留在各实验节点 `/root/dm-p7-*`，未放入仓库。上述临时报告路径不保证长期保留。
+HDFS 已解除环境限制；DXN-2 / StorageGRID 仍按 §14.3 保留边界，不为本轮收尾重新访问。
+
 ## 15. 决定记录（2026-09-25 全部采纳）
 
 下面每一条都是已定结论。编号沿用讨论时的问题编号，便于对照过程稿。
@@ -1602,7 +1671,7 @@ CI 日志：`/tmp/dm-c11b-757c6c9-make-ci.log`。
 | Q1 | 默认扫描方式为 `Unordered` | §3 |
 | Q2 | 删除 `SubtreeComplete`（两种方式都删）；`DirectoryListed` 只在 Blocks 发，空目录也发 | §4 |
 | Q3 | 两种方式都在 `TraversalCompletion` 给总数；Blocks 的 `DirectoryListed` 另带本块计数；Unordered 没有每目录计数 | §7 |
-| Q4 | data-mover 提供 Blocks 两进程逐目录配对的辅助（封装“两侧都到 `DirectoryListed` 才判定缺失”） | §3.1 |
+| Q4 | **已实现** `46a8a4c`：`traversal::pair_directory_blocks` 对两侧已关闭的目录块做哈希配对；显式目录映射，保留历史段与类型冲突，失败 / 过滤 / 名字语义不明时不推断缺失。会话完成与祖先失败等删除闸门仍由调用方执行 | §3.1 |
 | Q5 | Blocks 下钻键 = 子目录名的原始 UTF-8 字节，不做大小写折叠、不做 Unicode 规范化 | §3 |
 | Q6 | 名字语义由 `NamespaceCapabilities.names` 公开；不敏感的目标上“折叠后相等、字节不等”报冲突，不删除 | §4.1、§5.4.5 |
 | Q23 | `rename` 保留在 Namespace | §5.4.1 |
@@ -1676,15 +1745,15 @@ CI 日志：`/tmp/dm-c11b-757c6c9-make-ci.log`。
 
 ## 附：设计过程中发现的现存问题（今天的代码，与 P7 是否实施无关）
 
-沿用评审稿的编号（commit message 与 Q28 / Q29 引用的就是这些编号）。状态截至 `40c1ac9`。
+沿用评审稿的编号（commit message 与 Q28 / Q29 引用的就是这些编号）；问题描述保留当时背景，状态更新至 P7 收尾。
 
 | # | 问题 | 状态 |
 |---|---|---|
-| 1 | **一次 S3 SlowDown / 503 就可能结束整场遍历**：限流被归为会话失败（`src/s3/role_protocol.rs:518-523`），且没有配置重试策略 | 未修；由 C3 / C6 解决（`FailureClass::Throttled`、生产者内有界退避，见 §8、Q11） |
+| 1 | **一次 S3 SlowDown / 503 就可能结束整场遍历**：限流被归为会话失败（`src/s3/role_protocol.rs:518-523`），且没有配置重试策略 | **已修** C3 / C6：`FailureClass::Throttled`，列举生产者按页有界退避；预算用尽只让该列举失败，遍历继续兄弟（§8、Q11） |
 | 2 | **CIFS、NFS、HDFS 因一个坏子项让整个目录列举失败**：`collect::<Result<Vec<_>>>()?`（`cifs/namespace.rs:92`、`nfs/namespace.rs:83-85`，NFS 缺属性时 `nfs.rs:4657-4659`，HDFS 同类），违反“逐子项失败逐子项报”的契约 | **已修** `b6aff40`（`fix(storage): 列举里一个描述不出的子项只让它自己失败`）：三者都改为逐子项 `EntryOperationFailure` + `NamespaceResult::Listing`，遍历报 `Partial` |
 | 3 | **S3 翻页出现重复 token 被当成会话失败**（`paging.rs`），它只是一个目录的问题 | **已修** `1a68f41`（`fix(s3): 翻页 token 绕圈只让该目录失败`）：改为该目录的 `Protocol` / Permanent 条目失败，块 `Failed`，遍历继续兄弟 |
 | 4 | **legacy 版本列举假设服务端按 key 升序**（`src/s3/version_listing.rs`，C20）：靠扣住每页最大的 key 拼一个 key 的完整历史，在无序 S3 上会把一个 key 的历史拆成多组、`version_count` 与 latest 标记出错 | 已随收尾删除；role-based 按目录物化（§5.3、Q9） |
-| 5 | **role-based 遍历在 NFS 上常驻 178 MB，来源未查清**：m1-source 每目录约 35 项，帧里的东西应只有几 MB | 未查；C0 前用驻留探针与 `MALLOC_ARENA_MAX=2` 对照（Q19、§12.2） |
+| 5 | **role-based 遍历在 NFS 上常驻 178 MB，来源未查清**：m1-source 每目录约 35 项，帧里的东西应只有几 MB | **已查明并修复**：列举把所有子目录句柄写入 `GLOBAL_CACHE`，缓存驻留和碎片导致增长（§12.7）；C7 下钻提示取代列举回填缓存，C10 性能门通过（§12.8） |
 | 6 | **terrasync 写 ClickHouse 的路径在异常时会丢数据**（10.131.9.10，`8edd400`）：全量扫描写失败只重试约 0.7 s 就丢掉整批且任务报成功；数据库消费者退出后广播给它的数据被静默丢弃；统计按广播逐条累加、与是否入库无关；全量扫描直接写 base、崩溃即留下半场数据 | 在 terrasync 里改，本设计只列要求（§11、Q16、Q17） |
 | 7 | **S3 当前对象的 `PathScoped` 身份里没有路径**（稳定字节只有 ETag）：内容相同、路径不同的对象共用一个身份键，terrasync 按身份键 `INNER JOIN` 会交叉配对成 N×N 行（§5.4.7、F1 / Q28） | **已修** `4fa5aa5`（`fix(s3)!: PathScoped 身份包含路径`）：S3 当前对象、`"null"` 版本与 `"null"` 删除标记的稳定字节改为 u32 大端路径长度 + 路径 + ETag；契约写进 `IdentityStrength::PathScoped` 文档。破坏性：S3 `PathScoped` 身份键一次性全变。terrasync 侧“只对 `StableWithinBackend` 按身份键关联”仍待在 terrasync 里做 |
 | 8 | **版本与删除标记交错时按 LastModified 合并，并发写入时排错**：aws-sdk-s3 把 `<Version>` 与 `<DeleteMarker>` 解析成两个列表，丢了交错顺序（`src/s3/role_protocol/versions.rs:107, 123`）（§10.2、F2 / Q29） | **已修** `40c1ac9`（`fix(s3)!: 版本历史按服务端顺序组装`）：`src/s3/version_order.rs` 拦截原始响应体、按服务端位置倒序组装，校验不过的 key 标 `HistoryOrder::Inferred`；`history.rs` 的核心由 role-based 与 legacy `walkdir` / `walkdir_2` 共用。差别：role-based 在整个目录列举（跨页）上校验同 key 连续；**legacy `walkdir` 只在每批已释放的完整 key 内校验连续**。回归数据 `tests/data/s3/minio-concurrent-versions{,-paged}.xml` |

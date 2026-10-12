@@ -133,6 +133,15 @@
   环境：`LAB_HDFS_CONFIG_DIR=/var/lib/data-mover-lab/hadoop`、keytab `/var/lib/data-mover-lab/terrasync-runner.keytab`
   （`hdfs/terrasync-runner@HDFS.LOCAL`）、`KRB5_CONFIG=/var/lib/data-mover-lab/krb5.conf`。（2026-09-27 起用户取消逐次批准：动 HDFS 直接跑真机验证即可，仍只写运行根并清理。）
   已知：NameNode 按**有符号字节序**排名字；列举文件回文件自身；缺目录 `FileNotFound`。
+  - 2026-10-12 已修复实验室 hosts / HA 故障：NN 自身名字不能优先落到 `127.0.1.1`，否则 RPC 只绑 loopback；
+    DN1 / DN2 的自身名字保留 `10.10.1.31` / `.32` 数据网映射，ZooKeeper peer listener 也依赖正确解析。
+  - **Kerberos canonical 名必须是 FQDN**：四个 HDFS 节点的 JournalNode 地址 `10.131.9.30`、`10.10.1.31`、
+    `10.10.1.32` 对应 hosts 行均须 FQDN 在短名前；短名优先会使客户端预期 `hdfs/短名@REALM`，与服务端
+    `hdfs/FQDN@REALM` 不符。修复只重排既有 aliases，不更改 keytab、Hadoop 配置或数据目录。
+    本轮 `2486d34` 的 4 项 architecture + 3 项 native P7 真机用例通过，隔离根清理后只读确认为 `FileNotFound`。
+    两 NN 的 systemd active/running 仅表示进程正常；认证 HA 状态为 nn1 active / nn2 standby，ZK 一 leader、二 follower。
+    逐项恢复与验收见 P7 §14.4；不能只凭 2181 可连接就认定 ZooKeeper quorum 正常。
+
 
 ### 2.5 StorageGRID 11.5.0
 

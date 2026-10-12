@@ -1,12 +1,16 @@
 # ADR-0008: Streaming traversal, scan checkpoints, and per-key object history
 
-Status: accepted; C11b, C12 and legacy scan removal complete (2026-10-12). CI, available live
-matrices, MinIO 100,000-version validation and scan cancel/SIGKILL resume passed. DXN-2,
-StorageGRID and HDFS environment limitations are recorded in P7 §14.3.
+Status: accepted; P7 implementation and acceptance complete (2026-10-12), including C11b, C12,
+legacy scan removal, C7c first-page recovery and Q4 block pairing. CI, available live matrices,
+MinIO 100,000-version validation and scan cancel/SIGKILL resume passed. DXN-2 and StorageGRID
+environment limitations remain recorded in P7 §14.3. Final C7c/Q4 acceptance and HDFS recovery
+are recorded in P7 §14.4: healthy active/standby operation was restored, all seven scoped HDFS
+product tests passed, and the isolated test root was removed. HDFS is no longer an environment
+limitation.
 
 Supersedes the traversal and entry-snapshot portions of ADR-0006 C22. The detailed decisions,
 measurements and acceptance status are in [P7](../design/p7-streaming-listing.md). This ADR records
-the contract; P7 §14.3 records which real-environment gates passed or remain unavailable.
+the contract; P7 §14.3–14.4 record which real-environment gates passed or remain unavailable.
 
 ## Context
 
@@ -40,6 +44,11 @@ key remain consecutive and ordered. It emits no `DirectoryListed` events.
 then visits subdirectories in raw UTF-8 name order. Block contents are not sorted. Only pending
 subdirectories are retained for descent; prefetch and observation windows are bounded.
 
+`pair_directory_blocks` pairs two closed blocks by raw child name with explicit directory mappings.
+It borrows observations and history segments, preserves duplicate/type conflicts, and suppresses
+absence when listing failures, filters, child failures or name semantics leave it uncertain. This
+local result does not replace the session and ancestor-failure deletion gates below.
+
 Both orders apply the same filter, depth, observation and counting contracts. Hidden artifacts
 are excluded from `listed`. Every returned child satisfies:
 
@@ -70,8 +79,8 @@ that precedes it. Replay is allowed; advancing beyond uncommitted output is forb
 
 Blocks checkpoints follow delivered blocks. Unordered checkpoints retain queued and active
 directories. Resume re-lists the necessary directories and preserves failure exclusions. Backend,
-root, filter, observation plan, depth, order and the connected history capability form the
-fingerprint. A mismatch refuses resume. Oversized frontiers suppress checkpoint emission rather
+root, filter, depth, order and the connected history capability form the fingerprint. The
+observation plan, concurrency, buffering and checkpoint interval do not change the fingerprint. A mismatch refuses resume. Oversized frontiers suppress checkpoint emission rather
 than dropping pending work. Checkpoint format v2 rejects earlier versions.
 
 These scan checkpoints are independent of destination-resident transfer recovery (ADR-0006).

@@ -188,14 +188,18 @@ worker 栈与窃取调度，统一使用 role 列举 / 观察 / 计数 / 错误�
   (`max_buffered_items` 个许可，批用完才还)。Blocks 的 flush 也是一次一批 (`send`，超过上限按上限切，单一发送方
   顺序不变)；Unordered 用 `send_whole` (超过上限就等整个上限空出来再整批发)。
 
+`traversal::pair_directory_blocks`（`traversal/pairing.rs`，P7 Q4）按原始名字哈希配对两侧已到 `DirectoryListed` 的块，
+显式映射两侧目录到逻辑目录，借用观察与历史段，保留同名不同类型和重复冲突。不完整块、过滤、失败或名字语义不精确时
+不推断缺失；调用方仍须等双方会话 `Completed`、排除祖先失败子树并对旧记录应用相同过滤 / 深度，才可用于删除判断。
+
 ### 一·六、续扫检查点 (P7 C11，两种调度都有，默认关)
 
 `TraversalRequest::resumable(Resumable::On { every })` 时流里约每 `every` 一个 `TraversalItem::Checkpoint`，
 取消 / 会话失败时最后一项也是检查点 (此时取消不丢已产出的项，会话排空到检查点)；`resume_from(Checkpoint)`
-续扫，指纹 (storage、root、order、filter 键、`max_depth`、versions) 不符在任何 I/O 之前拒绝
+续扫，指纹 (storage、root、order、filter 键、`max_depth`、连接是否列历史) 不符在任何 I/O 之前拒绝
 (`TraversalTerminalFailure::Resume`)。检查点记的是**还要列的目录**，不是见过的条目：Unordered 取 `Pool::snapshot`
 的前沿；Blocks 取序号 ≤ `Output::delivered` 的最新位置链，续扫时重列链上祖先 (不发出) 定出剩下的子目录。
-不求精确：前沿里的目录整块重列 (有重复、不丢)。编解码 `src/traversal/checkpoint.rs` (`DMTC` v1，golden 钉住)，
+不求精确：前沿里的目录整块重列 (有重复、不丢)。编解码 `src/traversal/checkpoint.rs` (`DMTC` v2，golden 钉住；旧版本拒绝)，
 调度侧 `src/traversal/storage/resume.rs` + `resume/{positions,relist,blocks}.rs`；设计 P7 §9.3。
 
 ### 二、admission cursor —— `Blocks` 模式 (P7 C4 起逐页)
@@ -207,7 +211,7 @@ worker 栈与窃取调度，统一使用 role 列举 / 观察 / 计数 / 错误�
 预读 (from_producer：channel 1 页 + 生产者手里 1 页)。偷看到的结束 (`End` / 失败) 不需要 credit：
 生产者正常返回不再占 channel 槽发 `End` 消息，而是先置 `finished` 标志再丢掉最后一个 sender，
 所以单页小目录的页一收到、结束就可见，页与结束一起到，驱动一次唤醒 (偷看没看到的结束要等游标取走前一页)。任务中途 panic 由 `Reporter` 的 Drop 报 `Internal`。
-**Local 自 C5 起逐页读目录**（每页一次 `spawn_blocking`，`ReadDir` 带进带出）；**HDFS 自 C8 起逐页列举**（`list_status_iter` 按页取，列举前不再 `get_file_info`，取消 / drop 立即放弃进行中的请求；中途可重试失败从最后读到的名字之后续读）；**S3 当前对象自 C6 起逐页列举**（`ListObjectsV2` 每个服务端页一到就按 `page_hint` 交出，不假设 key 有序：公共前缀用集合去重、续页只用不透明 token、节流 / 瞬时失败用同一 token 重发；多版本 All 仍按目录收齐，C11b 改）；**NFS 自 C7 起逐页列举**（READDIRPLUS 的回复逐条取、按 `page_hint` 攒页交出，一次只多读一个回复；取消 / drop 在下一个请求之前停，不放弃在途请求；首页之前可整目录从头重读，之后失败 → `Interrupted`）；**CIFS 自 C9 起逐页列举**（生产者持有目录句柄，`QUERY_DIRECTORY` 记录逐条取、按 `page_hint` 攒页交出；停车时句柄一直开着，所以预取受 `parked_listing_limit` = 8 约束；取消 / drop 在取下一条之前停、让在途记录到达，然后关句柄，最后一页在关句柄之后交出；首页之前句柄失效（smb-rs 重连后的 `InvalidState` / `StaleObject`、`STATUS_FILE_CLOSED` / `STATUS_INVALID_HANDLE`）重开目录从头读，至多 3 次；之后失败 → `Interrupted`）。
+**Local 自 C5 起逐页读目录**（每页一次 `spawn_blocking`，`ReadDir` 带进带出）；**HDFS 自 C8 起逐页列举**（`list_status_iter` 按页取，列举前不再 `get_file_info`，取消 / drop 立即放弃进行中的请求；中途可重试失败从最后读到的名字之后续读）；**S3 当前对象自 C6 起逐页列举**（`ListObjectsV2` 每个服务端页一到就按 `page_hint` 交出，不假设 key 有序：公共前缀用集合去重、续页只用不透明 token、节流 / 瞬时失败用同一 token 重发；版本化桶按目录收齐，C11b 起每个 key 一项历史）；**NFS 自 C7 起逐页列举**（READDIRPLUS 的回复逐条取、按 `page_hint` 攒页交出，一次只多读一个回复；取消 / drop 在下一个请求之前停，不放弃在途请求；首页前后都保留缓冲、从最后完整回复的 cookie 续读并去重（C7c，首页前由 `c0ff649` 补齐）；新接收条目补满预算；去重超过上限后已发布页则不再续，未发布可丢缓冲有界从头重试且不再补预算；重试用尽或不可重试才结束列举）；**CIFS 自 C9 起逐页列举**（生产者持有目录句柄，`QUERY_DIRECTORY` 记录逐条取、按 `page_hint` 攒页交出；停车时句柄一直开着，所以预取受 `parked_listing_limit` = 8 约束；取消 / drop 在取下一条之前停、让在途记录到达，然后关句柄，最后一页在关句柄之后交出；首页之前句柄失效（smb-rs 重连后的 `InvalidState` / `StaleObject`、`STATUS_FILE_CLOSED` / `STATUS_INVALID_HANDLE`）重开目录从头读，至多 3 次；之后失败 → `Interrupted`）。
 
 驱动循环 (`storage/blocks.rs` 的 `drive`)：
 
