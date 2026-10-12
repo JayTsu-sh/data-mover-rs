@@ -2113,7 +2113,7 @@ async fn nightly_lab_streams_recursive_scan_with_depth_limit()
     while let Some(item) = session.next_item().await {
         match item {
             TraversalItem::Entry(entry) => {
-                paths.push(std::path::PathBuf::from(entry.path().as_str()))
+                paths.push(std::path::PathBuf::from(entry.path().as_str()));
             }
             other => return Err(format!("unexpected traversal item: {other:?}").into()),
         }
@@ -2141,7 +2141,7 @@ async fn nightly_lab_streams_recursive_scan_with_depth_limit()
     while let Some(item) = session.next_item().await {
         match item {
             TraversalItem::Entry(entry) => {
-                filtered.push(std::path::PathBuf::from(entry.path().as_str()))
+                filtered.push(std::path::PathBuf::from(entry.path().as_str()));
             }
             other => return Err(format!("unexpected traversal item: {other:?}").into()),
         }
