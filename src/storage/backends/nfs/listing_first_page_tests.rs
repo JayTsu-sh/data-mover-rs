@@ -221,7 +221,7 @@ async fn an_unpublished_listing_can_fall_back_after_remembrance_runs_out() -> Re
     Ok(())
 }
 
-/// Once fallback discards remembrance, a replay of fewer than MAX_REMEMBERED entries must not
+/// Once fallback discards remembrance, a replay of fewer than `MAX_REMEMBERED` entries must not
 /// re-enable it and gain fresh retry budgets. Only the last unpublished attempt counts.
 #[tokio::test(start_paused = true)]
 async fn fallback_never_reenables_remembrance_or_refills_retries() -> Result {
