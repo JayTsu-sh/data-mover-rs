@@ -26,7 +26,9 @@ impl HttpConnector for BrokenVersioningResponse {
         assert!(request.uri().contains("versioning"));
         HttpConnectorFuture::new(async {
             let status = StatusCode::try_from(200_u16).unwrap_or_else(|e| panic!("{e}"));
-            let body = SdkBody::from("<VersioningConfiguration><Status>Enabled");
+            // The SDK tolerates a truncated closing tag after Status. A different root
+            // is rejected by the operation deserializer and reliably exercises ResponseError.
+            let body = SdkBody::from("<UnexpectedResponse/>");
             Ok(HttpResponse::new(status, body))
         })
     }
