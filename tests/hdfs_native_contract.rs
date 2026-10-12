@@ -2,14 +2,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use data_mover::hdfs::HdfsScanEvent;
+use data_mover::DslTraversalFilter;
+use data_mover::model::StoragePath;
+use data_mover::traversal::{
+    StorageTraversalSource, TraversalItem, TraversalOutcome, TraversalRequest, TraversalSource,
+};
 use data_mover::{
     BackendConfig, CopyOptions, CreateStorageOptions, HdfsConfig, IntegrityCheck,
-    IntegrityCheckMode, MismatchDataField, ResumeContext, StorageEntryMessage, StorageEnum,
-    StreamHandle, TransferConcurrency, WalkOptions, build_hdfs_client, create_storage,
+    IntegrityCheckMode, MismatchDataField, ResumeContext, StorageEnum, StreamHandle,
+    TransferConcurrency, build_hdfs_client, create_storage,
 };
 use hdfs_native::file::{FileReader, FileWriter};
 use hdfs_native::{Client, ClientBuilder, WriteOptions};
+use std::num::NonZeroUsize;
 #[path = "hdfs_native_contract/policy_runtime.rs"]
 mod policy_runtime;
 #[cfg(unix)]
@@ -2099,16 +2104,24 @@ async fn nightly_lab_streams_recursive_scan_with_depth_limit()
     )
     .await?;
 
-    let receiver = hdfs.scan_recursive(None, Some(2), 3)?;
+    let roles = hdfs.architecture_storage()?;
+    let request = TraversalRequest::new(StoragePath::root())
+        .max_depth(NonZeroUsize::new(2))
+        .max_inflight_operations(NonZeroUsize::new(3).ok_or("nonzero")?);
+    let mut session = StorageTraversalSource::new(&roles)?.traverse(request.clone());
     let mut paths = Vec::new();
-    while let Some(event) = receiver.next().await {
-        match event {
-            HdfsScanEvent::Entry(entry) => paths.push(entry.relative_path),
-            HdfsScanEvent::Error { path, error } => {
-                return Err(format!("scan failed at {}: {error}", path.display()).into());
+    while let Some(item) = session.next_item().await {
+        match item {
+            TraversalItem::Entry(entry) => {
+                paths.push(std::path::PathBuf::from(entry.path().as_str()))
             }
+            other => return Err(format!("unexpected traversal item: {other:?}").into()),
         }
     }
+    assert!(matches!(
+        session.finish().await?,
+        TraversalOutcome::Completed(_)
+    ));
     paths.sort();
     assert_eq!(
         paths,
@@ -2121,32 +2134,22 @@ async fn nightly_lab_streams_recursive_scan_with_depth_limit()
         ]
     );
 
-    let common = StorageEnum::HDFS(hdfs.clone());
-    let receiver = common
-        .walkdir(
-            None,
-            WalkOptions {
-                depth: Some(2),
-                match_expressions: Some(data_mover::filter::parse_filter_expression(
-                    "extension == \"txt\"",
-                )?),
-                concurrency: 3,
-                ..Default::default()
-            },
-        )
-        .await?;
+    let mut session = StorageTraversalSource::new(&roles)?.traverse(request.filter(Arc::new(
+        DslTraversalFilter::parse(Some("extension == \"txt\""), None)?,
+    )));
     let mut filtered = Vec::new();
-    while let Some(message) = receiver.next().await {
-        match message {
-            StorageEntryMessage::Scanned(entry) => {
-                filtered.push(entry.get_relative_path().to_path_buf());
+    while let Some(item) = session.next_item().await {
+        match item {
+            TraversalItem::Entry(entry) => {
+                filtered.push(std::path::PathBuf::from(entry.path().as_str()))
             }
-            StorageEntryMessage::Error { path, reason, .. } => {
-                return Err(format!("common walk failed at {}: {reason}", path.display()).into());
-            }
-            other => return Err(format!("unexpected common walk event: {other:?}").into()),
+            other => return Err(format!("unexpected traversal item: {other:?}").into()),
         }
     }
+    assert!(matches!(
+        session.finish().await?,
+        TraversalOutcome::Completed(_)
+    ));
     filtered.sort();
     assert_eq!(
         filtered,

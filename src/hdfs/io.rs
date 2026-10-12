@@ -631,58 +631,6 @@ impl HDFSStorage {
         Ok(next_offset)
     }
 
-    async fn run_recursive_scan(
-        self,
-        root: PathBuf,
-        max_depth: Option<usize>,
-        concurrency: usize,
-        sender: async_channel::Sender<HdfsScanEvent>,
-    ) {
-        let mut pending = VecDeque::from([(root, 0_usize)]);
-        let mut active = futures::stream::FuturesUnordered::new();
-        loop {
-            while active.len() < concurrency {
-                let Some((directory, depth)) = pending.pop_front() else {
-                    break;
-                };
-                let storage = self.clone();
-                active.push(async move {
-                    let result = storage.list_visible(&directory).await;
-                    (directory, depth, result)
-                });
-            }
-            let Some((directory, depth, result)) = active.next().await else {
-                break;
-            };
-            match result {
-                Ok(entries) => {
-                    for entry in entries {
-                        let descend = entry.is_dir
-                            && max_depth.is_none_or(|limit| depth.saturating_add(1) < limit);
-                        let child_path = entry.relative_path.clone();
-                        if sender.send(HdfsScanEvent::Entry(entry)).await.is_err() {
-                            return;
-                        }
-                        if descend {
-                            pending.push_back((child_path, depth.saturating_add(1)));
-                        }
-                    }
-                }
-                Err(error) => {
-                    if sender
-                        .send(HdfsScanEvent::Error {
-                            path: directory,
-                            error,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            }
-        }
-    }
 }
 
 async fn open_append_after_lease_recovery(

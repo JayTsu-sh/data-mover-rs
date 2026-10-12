@@ -1,11 +1,10 @@
 //! ADR-0006 C3b on a real Local tree: every listing hides `.data-mover-*` transfer artifacts —
-//! legacy `walkdir` and role traversal — and every directory delete still
+//! role traversal — and every directory delete still
 //! removes them.
 
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use data_mover::filter::parse_filter_expression;
 use data_mover::model::{FailureClass, StoragePath};
 use data_mover::storage::{
     BackendConfig, DeleteTreeRequest, LocalBackendConfig, PreflightPolicy, Storage,
@@ -15,7 +14,8 @@ use data_mover::storage_enum::{StorageEnum, create_storage};
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalRequest, TraversalSource as _,
 };
-use data_mover::{CreateStorageOptions, StorageEntryMessage, WalkOptions};
+use data_mover::{CreateStorageOptions, DslTraversalFilter};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -56,62 +56,36 @@ async fn roles(root: &Path) -> TestResult<Storage> {
     .await?)
 }
 
-async fn walkdir_paths(storage: &StorageEnum, options: WalkOptions) -> TestResult<Vec<String>> {
-    let iter = storage.walkdir(None, options).await?;
-    let mut paths = Vec::new();
-    while let Some(message) = iter.next().await {
-        if let StorageEntryMessage::Scanned(entry) = message {
-            paths.push(
-                entry
-                    .get_relative_path()
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            );
-        }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-#[tokio::test]
-async fn legacy_walkdir_hides_artifacts_even_under_a_descending_match() -> TestResult {
-    let root = fixture()?;
-    let storage = legacy(root.path()).await?;
-    assert_eq!(
-        walkdir_paths(&storage, WalkOptions::default()).await?,
-        VISIBLE
-    );
-    // A match skips directories but keeps descending into them: the artifact check must come first,
-    // or `sub/.data-mover-stage/x/y` would be reported.
-    let matching = WalkOptions {
-        match_expressions: Some(parse_filter_expression(
-            "name == \"y\" or name == \"b.txt\"",
-        )?),
-        ..WalkOptions::default()
-    };
-    assert_eq!(walkdir_paths(&storage, matching).await?, ["sub/b.txt"]);
-    Ok(())
-}
-
 #[tokio::test]
 async fn role_traversal_hides_artifacts() -> TestResult {
     let root = fixture()?;
     let storage = roles(root.path()).await?;
     let slots = NonZeroUsize::new(2).ok_or("non-zero")?;
-    let mut session = StorageTraversalSource::new(&storage)?.traverse(
-        TraversalRequest::new(StoragePath::root())
+    for expression in [None, Some("name == \"y\" or name == \"b.txt\"")] {
+        let request = TraversalRequest::new(StoragePath::root())
             .max_inflight_operations(slots)
             .max_buffered_items(slots)
-            .cancel(CancellationToken::new()),
-    );
-    let mut traversed = Vec::new();
-    while let Some(item) = session.next_item().await {
-        if let TraversalItem::Entry(entry) = item {
-            traversed.push(entry.path().as_str().to_owned());
+            .filter(Arc::new(DslTraversalFilter::parse(expression, None)?));
+        let mut session = StorageTraversalSource::new(&storage)?.traverse(request);
+        let mut traversed = Vec::new();
+        while let Some(item) = session.next_item().await {
+            match item {
+                TraversalItem::Entry(entry) => traversed.push(entry.path().as_str().to_owned()),
+                other => return Err(format!("unexpected traversal item: {other:?}").into()),
+            }
         }
+        assert!(matches!(
+            session.finish().await?,
+            data_mover::traversal::TraversalOutcome::Completed(_)
+        ));
+        traversed.sort();
+        let expected = if expression.is_some() {
+            vec!["sub/b.txt"]
+        } else {
+            VISIBLE.to_vec()
+        };
+        assert_eq!(traversed, expected);
     }
-    traversed.sort();
-    assert_eq!(traversed, VISIBLE);
 
     Ok(())
 }

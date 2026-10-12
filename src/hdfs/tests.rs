@@ -1084,72 +1084,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recursive_scanner_validates_concurrency_and_root() {
-        let Ok((client, location)) =
-            build_hdfs_client("hdfs://user@127.0.0.1:9000/root", &HdfsConfig::default())
-        else {
-            panic!("explicit client construction failed");
-        };
-        let storage = super::HDFSStorage {
-            client,
-            location,
-            block_size: super::DEFAULT_BLOCK_SIZE,
-            transfer_concurrency: crate::TransferConcurrency::defaults(4, 1),
-        };
-        assert!(storage.scan_recursive(None, None, 0).is_err());
-        assert!(
-            storage
-                .scan_recursive(None, None, crate::TransferConcurrency::MAX + 1)
-                .is_err()
-        );
-        assert!(
-            storage
-                .scan_recursive(Some(Path::new("../outside")), None, 1)
-                .is_err()
-        );
-        assert!(
-            storage
-                .walkdir(
-                    None,
-                    crate::storage_enum::WalkOptions {
-                        packaged: true,
-                        ..Default::default()
-                    },
-                )
-                .is_err()
-        );
-    }
 
-    #[test]
-    fn hdfs_filter_adapter_uses_truthful_entry_fields() {
-        let entry = crate::HDFSEntry {
-            name: "报告.txt".to_string(),
-            relative_path: std::path::PathBuf::from("目录/报告.txt"),
-            is_dir: false,
-            size: 42,
-            mtime: 1_700_000_000_000_000_000,
-            atime: 0,
-            mode: 0o640,
-            owner: "alice".to_string(),
-            group: "users".to_string(),
-            replication: Some(3),
-            block_size: Some(128 * crate::MB),
-            extension: Some("txt".to_string()),
-        };
-        let Ok(include) = crate::filter::parse_filter_expression("extension == \"txt\"") else {
-            panic!("valid include filter was rejected");
-        };
-        let Ok(exclude) = crate::filter::parse_filter_expression("path == \"目录/**\"") else {
-            panic!("valid exclude filter was rejected");
-        };
-        assert!(!super::hdfs_entry_is_filtered(&entry, Some(&include), None));
-        assert!(super::hdfs_entry_is_filtered(
-            &entry,
-            Some(&include),
-            Some(&exclude)
-        ));
-    }
 
     #[test]
     fn positional_read_planning_truncates_at_eof_without_overflow() {

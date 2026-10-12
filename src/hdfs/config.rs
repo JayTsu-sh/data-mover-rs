@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::fmt;
 use std::fs;
 use std::future::Future;
@@ -22,7 +21,6 @@ use url::{Host, Url};
 use crate::HDFSEntry;
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::{HdfsErrorKind, StorageError};
-use crate::filter::{FilterInput, should_skip};
 use crate::storage::artifacts::is_artifact_native;
 
 const DEFAULT_BLOCK_SIZE: u64 = 128 * crate::MB;
@@ -31,7 +29,6 @@ const MAX_TRANSFER_CHUNK_SIZE: u64 = 2 * crate::MB;
 fn transfer_chunk_size(block_size: u64) -> u64 {
     block_size.clamp(1, MAX_TRANSFER_CHUNK_SIZE)
 }
-const SCAN_CHANNEL_CAPACITY: usize = 256;
 const HDFS_ADAPTER_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_millis(250),
     Duration::from_millis(500),
@@ -133,12 +130,6 @@ fn adapter_deadline_error() -> HdfsError {
     ))
 }
 
-/// Private HDFS scan event consumed by the later common-walk adapter.
-#[derive(Debug)]
-pub enum HdfsScanEvent {
-    Entry(HDFSEntry),
-    Error { path: PathBuf, error: StorageError },
-}
 
 /// Cloneable positional-read handle. `FileReader::read_range` uses `&self` and
 /// does not mutate its cursor, so cloned handles can read independent chunks.

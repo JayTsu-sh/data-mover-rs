@@ -1,10 +1,3 @@
-fn hdfs_entry_is_filtered(
-    entry: &HDFSEntry,
-    match_expression: Option<&crate::FilterExpression>,
-    exclude_expression: Option<&crate::FilterExpression>,
-) -> bool {
-    hdfs_filter_decision(entry, match_expression, exclude_expression).0
-}
 fn plan_read_range(
     file_length: u64,
     offset: u64,
@@ -72,26 +65,6 @@ fn validate_sequential_end(
     Ok(())
 }
 
-fn hdfs_filter_decision(
-    entry: &HDFSEntry,
-    match_expression: Option<&crate::FilterExpression>,
-    exclude_expression: Option<&crate::FilterExpression>,
-) -> (bool, bool, bool) {
-    let path = entry.relative_path.to_string_lossy();
-    let file_type = if entry.is_dir { "dir" } else { "file" };
-    should_skip(
-        match_expression,
-        exclude_expression,
-        FilterInput {
-            file_name: Some(&entry.name),
-            file_path: Some(&path),
-            file_type: Some(file_type),
-            modified_epoch: Some(entry.mtime / 1_000_000_000),
-            size: Some(entry.size),
-            extension: entry.extension.as_deref().or(Some("")),
-        },
-    )
-}
 
 fn strip_root<'a>(path: &'a str, root: &str) -> Result<&'a str, StorageError> {
     if root == "/" {

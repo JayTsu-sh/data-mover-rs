@@ -12,9 +12,7 @@
 //!   listing passes the checks for the key: every entry has a position, the key's entries are
 //!   contiguous among the entries passed in, and exactly one entry is the latest and it is listed
 //!   first. The role-based listing passes the whole directory listing (every page), so a key
-//!   split anywhere in it is caught; legacy `walkdir` / `walkdir_2` pass one batch of complete
-//!   keys at a time (`crate::s3::version_listing`), so a key split by the page's held-back last
-//!   key, or listed again after it was released, is not.
+//!   split anywhere in it is caught.
 //! - **Inferred** ([`HistoryOrder::Inferred`]), in two cases, the latest entry last in both:
 //!   - some entry of the key has no position (the response's document order could not be read,
 //!     the store may still list correctly): each list — versions, delete markers — keeps its own

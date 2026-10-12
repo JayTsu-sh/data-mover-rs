@@ -2,7 +2,7 @@
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -26,9 +26,7 @@ use url::form_urlencoded;
 
 use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::StorageError;
-use crate::filter::{FilterExpression, FilterInput, dir_matches_date_filter, should_skip};
 use crate::qos::QosManager;
-use crate::storage::artifacts::is_artifact_path;
 use crate::storage::backends::nfs::common::{
     NfsFactsError, NfsFactsProvider, NfsFailureCode, NfsInstanceFacts, NfsRetryAction,
     NfsRetryPolicy,
@@ -45,12 +43,8 @@ use crate::storage_enum::StorageEnum;
 use crate::transfer_concurrency::{
     TransferBackend, TransferConcurrency, resolve_transfer_concurrency,
 };
-use crate::walk_scheduler::{create_worker_contexts, run_worker_loop};
 use crate::write_pipeline::{ChunkSink, CommitPolicy, write_pipeline_core};
-use crate::{
-    DataChunk, EntryEnum, ErrorEvent, MB, NASEntry, Result, StorageEntryMessage,
-    WalkDirAsyncIterator,
-};
+use crate::{DataChunk, EntryEnum, MB, NASEntry, Result};
 
 mod delete;
 mod owner;
@@ -61,21 +55,6 @@ mod role_namespace;
 mod role_rename;
 
 pub(crate) use owner::{owner_id, owners_are_strings};
-
-type NfsWalkTask = (String, Bytes, usize, bool, Option<usize>);
-
-struct NfsWalkRuntime<'a> {
-    tx: &'a async_channel::Sender<StorageEntryMessage>,
-    scheduler: &'a crate::walk_scheduler::WorkerContext<NfsWalkTask>,
-    match_expr: &'a Arc<Option<FilterExpression>>,
-    exclude_expr: &'a Arc<Option<FilterExpression>>,
-    max_depth: usize,
-    total_file_count: &'a Arc<AtomicUsize>,
-    packaged: bool,
-    package_depth: usize,
-    /// Hide transfer artifacts (ADR-0006 C3b); only directory delete walks them.
-    hide_artifacts: bool,
-}
 
 /// 将 `nfs_rs::Time` 转换为纳秒时间戳
 fn time_to_i64(time: Time) -> i64 {
@@ -95,71 +74,16 @@ fn i64_to_time(timestamp: i64) -> Result<Time> {
     })
 }
 
-/// `NFSv4` 可选富化字段。
-///
-/// 不同站点对 ACL/owner/xattrs 的填充程度不同：
-/// - `lookup` 仅有 attrs 中携带的 ACL/owner，没有 xattrs；
-/// - `iterative_walkdir` 同时填充 ACL/owner 与从服务器读到的 xattrs；
-/// - `walkdir_2` 跳过的与可见的目录项都不填充。
-///
-/// 用此结构显式表达每站点的差异，避免在构造器签名中堆 `Option`。
-pub(crate) struct NfsEnrich {
-    pub acl: Option<nfs_rs::Acl>,
-    pub owner: Option<String>,
-    pub owner_group: Option<String>,
-    pub xattrs: Option<Vec<(String, Vec<u8>)>>,
-}
-
-impl Default for NfsEnrich {
-    /// 全部不填充。供 `walkdir_2` 系列站点使用。
-    fn default() -> Self {
-        Self {
-            acl: None,
-            owner: None,
-            owner_group: None,
-            xattrs: None,
-        }
-    }
-}
-
-impl NfsEnrich {
-    /// 从 `attr` 抽取 `ACL/owner/owner_group（空字符串视为` None），xattrs 留 None。
-    /// 供 `lookup` / `iterative_walkdir` 使用；后者再链 `with_xattrs`。
-    pub fn from_attrs(attr: &nfs_rs::Attr) -> Self {
-        Self {
-            acl: attr.acl.clone(),
-            owner: if attr.owner.is_empty() {
-                None
-            } else {
-                Some(attr.owner.clone())
-            },
-            owner_group: if attr.owner_group.is_empty() {
-                None
-            } else {
-                Some(attr.owner_group.clone())
-            },
-            xattrs: None,
-        }
-    }
-
-    pub fn with_xattrs(mut self, xattrs: Option<Vec<(String, Vec<u8>)>>) -> Self {
-        self.xattrs = xattrs;
-        self
-    }
-}
-
 impl NASEntry {
     /// 从 NFS `Attr` 构建 `NASEntry`。
     ///
-    /// `file_handle` 由调用方提供（lookup 站点用 `obj.fh`，walkdir 用 `entry.handle.clone()`）。
-    /// 可选的 ACL/owner/xattrs 通过 [`NfsEnrich`] 显式注入。
+    /// `file_handle` comes from LOOKUP. ACL and owner strings retain the GETATTR values.
     pub(crate) fn from_nfs_attrs(
         name: String,
         relative_path: PathBuf,
         extension: Option<String>,
         attrs: &nfs_rs::Attr,
         file_handle: Bytes,
-        enrich: NfsEnrich,
         owners_are_strings: bool,
     ) -> Self {
         let is_dir = attrs.type_ == FType3::NF3DIR as u32;
@@ -188,10 +112,10 @@ impl NASEntry {
             uid,
             gid,
             ino: Some(attrs.fsid),
-            acl: enrich.acl,
-            owner: enrich.owner,
-            owner_group: enrich.owner_group,
-            xattrs: enrich.xattrs,
+            acl: attrs.acl.clone(),
+            owner: (!attrs.owner.is_empty()).then(|| attrs.owner.clone()),
+            owner_group: (!attrs.owner_group.is_empty()).then(|| attrs.owner_group.clone()),
+            xattrs: None,
         }
     }
 }
@@ -574,16 +498,6 @@ impl NfsSourceProtocol for NFSStorage {
             identity,
         ))
     }
-}
-
-/// Whether a root-relative path is a transfer artifact, which no listing reports (ADR-0006 C3b);
-/// checked before any filter or GETATTR.
-fn hides_artifact(relative: &str) -> bool {
-    let artifact = is_artifact_path(relative);
-    if artifact {
-        trace!("[NFS] listing skips transfer artifact {relative}");
-    }
-    artifact
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1220,42 +1134,6 @@ fn join_nfs_paths(base: &str, suffix: &str) -> String {
             base.trim_end_matches('/'),
             suffix.trim_start_matches('/')
         )
-    }
-}
-
-/// 构建相对于 root 的路径（使用 '/' 拼接，避免平台差异）
-///
-/// 在 walkdir 遍历时，`dir_path` 从 root 开始传入。第一层 `dir_path` == root，
-/// 递归层 `dir_path` 已经是剥离 root 后的相对路径。此函数负责剥离 root 前缀
-/// 并拼接 entry 文件名，返回相对于 root 的路径。
-fn build_relative_path_impl(root: &str, dir_path: &str, entry_file_name: &str) -> String {
-    if dir_path == root {
-        // 第一层：dir_path 恰好等于 root → 直接返回文件名
-        entry_file_name.to_string()
-    } else if dir_path.is_empty() {
-        // root 为空且 dir_path 为空 → 直接返回文件名
-        entry_file_name.to_string()
-    } else if !root.is_empty() {
-        // root 非空：尝试剥离 "root/" 前缀（仅第一层子目录可能触发）
-        if let Some(rest) = dir_path.strip_prefix(root) {
-            // dir_path 以 root 开头，检查后面是否紧跟 '/'
-            if let Some(stripped) = rest.strip_prefix('/') {
-                if stripped.is_empty() {
-                    entry_file_name.to_string()
-                } else {
-                    format!("{stripped}/{entry_file_name}")
-                }
-            } else {
-                // root 是 dir_path 的子串但不在目录边界（如 root="ab", dir="abc"）
-                format!("{dir_path}/{entry_file_name}")
-            }
-        } else {
-            // dir_path 不包含 root 前缀（递归层的常见路径）
-            format!("{dir_path}/{entry_file_name}")
-        }
-    } else {
-        // root 为空，直接拼接
-        format!("{dir_path}/{entry_file_name}")
     }
 }
 
@@ -2786,7 +2664,6 @@ impl NFSStorage {
             extension,
             &attrs,
             obj.fh,
-            NfsEnrich::from_attrs(&attrs),
             self.owners_are_strings(),
         ));
 
@@ -3029,555 +2906,6 @@ impl NFSStorage {
         })
     }
 
-    /// Walks the tree below `sub_path`. Transfer artifacts (`.data-mover-*` in any path segment,
-    /// ADR-0006) are never reported.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the requested storage operation cannot be completed.
-    pub async fn walkdir(
-        &self,
-        sub_path: Option<&Path>,
-        options: crate::WalkOptions,
-    ) -> Result<WalkDirAsyncIterator> {
-        self.walk_listing(sub_path, options, true).await
-    }
-
-    /// `walkdir`, reporting transfer artifacts only when `hide_artifacts` is false: directory
-    /// delete must see them to remove them.
-    async fn walk_listing(
-        &self,
-        sub_path: Option<&Path>,
-        options: crate::WalkOptions,
-        hide_artifacts: bool,
-    ) -> Result<WalkDirAsyncIterator> {
-        // 解析起始目录：sub_path 为 None 时从根开始，否则从子目录开始
-        let (start_fh, start_root) = match sub_path {
-            Some(p) if !p.as_os_str().is_empty() => {
-                let obj = self.lookup_fh(p).await?;
-                // Windows 兼容：NFS root 始终用 /
-                let sub_path_str = p.to_string_lossy().replace('\\', "/");
-                let sub_root = Self::join_paths(&self.root, &sub_path_str);
-                (obj.fh, sub_root)
-            }
-            _ => (self.rpc_root_fh(), (*self.root).clone()),
-        };
-
-        // 创建通道
-        let (tx, rx) = async_channel::bounded(1000);
-
-        // 创建全局文件计数器
-        let total_file_count = Arc::new(AtomicUsize::new(0));
-
-        let total_file_count_clone = total_file_count.clone();
-
-        let storage = self.clone();
-
-        // 克隆sender，因为它将在异步任务中使用
-        let tx_clone = tx.clone();
-
-        // 创建异步任务来执行目录遍历
-        tokio::spawn(async move {
-            if let Err(err) = storage
-                .iterative_walkdir(
-                    &start_root,
-                    start_fh,
-                    tx_clone.clone(),
-                    options,
-                    hide_artifacts,
-                    total_file_count_clone,
-                )
-                .await
-            {
-                error!("Error during directory traversal: {}", err);
-                let _ = tx_clone
-                    .send(StorageEntryMessage::Error {
-                        event: ErrorEvent::Scan,
-                        path: std::path::PathBuf::new(),
-                        entry: None,
-                        reason: format!("{err}"),
-                    })
-                    .await;
-            }
-        });
-
-        Ok(WalkDirAsyncIterator::new(rx))
-    }
-
-    /// 迭代式目录遍历函数，使用工作窃取队列实现高效并发
-    async fn iterative_walkdir(
-        &self,
-        root_path: &str,
-        root_fh: Bytes,
-        tx: async_channel::Sender<StorageEntryMessage>,
-        options: crate::WalkOptions,
-        hide_artifacts: bool,
-        total_file_count: Arc<AtomicUsize>,
-    ) -> Result<()> {
-        let crate::WalkOptions {
-            depth,
-            match_expressions,
-            exclude_expressions,
-            concurrency,
-            packaged,
-            package_depth,
-            ..
-        } = options;
-        let max_depth = depth.unwrap_or(0);
-        let contexts = create_worker_contexts(
-            concurrency,
-            (root_path.to_string(), root_fh, 0usize, true, None::<usize>),
-        )
-        .await;
-        let match_expr = Arc::new(match_expressions);
-        let exclude_expr = Arc::new(exclude_expressions);
-
-        info!("Creating {} producer tasks", contexts.len());
-
-        let mut handles = Vec::with_capacity(contexts.len());
-        for ctx in contexts {
-            let self_clone = self.clone();
-            let tx_clone = tx.clone();
-            let match_expr_clone = Arc::clone(&match_expr);
-            let exclude_expr_clone = Arc::clone(&exclude_expr);
-            let total_file_count_clone = Arc::clone(&total_file_count);
-
-            handles.push(tokio::spawn(async move {
-                run_worker_loop(
-                    &ctx,
-                    |(dir_path, dir_fh, current_depth, skip_filter, package_remaining)| {
-                        self_clone.process_dir(
-                            dir_path,
-                            dir_fh,
-                            current_depth,
-                            skip_filter,
-                            package_remaining,
-                            NfsWalkRuntime {
-                                tx: &tx_clone,
-                                scheduler: &ctx,
-                                match_expr: &match_expr_clone,
-                                exclude_expr: &exclude_expr_clone,
-                                max_depth,
-                                total_file_count: &total_file_count_clone,
-                                packaged,
-                                package_depth,
-                                hide_artifacts,
-                            },
-                        )
-                    },
-                    |task| task.0.clone(),
-                )
-                .await;
-            }));
-        }
-
-        for handle in handles {
-            let _ = handle.await;
-        }
-
-        Ok(())
-    }
-
-    /// 处理单个目录，读取条目并过滤，发送符合条件的StorageEntry
-    async fn process_dir(
-        &self,
-        dir_path: String,
-        dir_fh: Bytes,
-        current_depth: usize,
-        skip_filter: bool,
-        package_remaining: Option<usize>,
-        runtime: NfsWalkRuntime<'_>,
-    ) -> Result<()> {
-        let producer_id = runtime.scheduler.worker_id;
-        let tx = runtime.tx;
-        // Stream READDIRPLUS entries into the existing processing path instead
-        // of buffering a full directory. Retryable errors are retried only
-        // before any entry is processed; after that point, replaying the
-        // directory could duplicate downstream rows/counts or child-dir tasks.
-        let mut retries: u8 = 0;
-        let mut processed_any = false;
-        loop {
-            let mount_clone = self.mount.clone();
-            let mut dir_stream = mount_clone.readdirplus(dir_fh.clone()).await;
-            let mut transient_err: Option<NfsError> = None;
-            while let Some(entry_result) = dir_stream.next().await {
-                match entry_result {
-                    Ok(entry) => {
-                        processed_any = true;
-                        if !self
-                            .process_readdir_entry(
-                                &dir_path,
-                                entry,
-                                current_depth,
-                                skip_filter,
-                                package_remaining,
-                                &runtime,
-                            )
-                            .await?
-                        {
-                            return Ok(());
-                        }
-                    }
-                    Err(e)
-                        if !processed_any
-                            && retries < MAX_STALE_RETRIES
-                            && (is_retryable_with_invalidation(&e) || is_server_busy(&e)) =>
-                    {
-                        transient_err = Some(e);
-                        break;
-                    }
-                    Err(e) => {
-                        error!(
-                            "[Producer {}] Failed to read entry in directory {}: {:?}",
-                            producer_id, dir_path, e
-                        );
-                        let _ = tx
-                            .send(StorageEntryMessage::Error {
-                                event: ErrorEvent::Scan,
-                                path: PathBuf::from(&dir_path),
-                                entry: None,
-                                reason: format!("Failed to read directory entry: {e}"),
-                            })
-                            .await;
-                        return Ok(());
-                    }
-                }
-            }
-            drop(dir_stream);
-            let Some(e) = transient_err else {
-                break;
-            };
-            retries += 1;
-            warn!(
-                "[Producer {}] readdirplus on {} hit transient error before processing entries (retry {}/{}): {}",
-                producer_id, dir_path, retries, MAX_STALE_RETRIES, e
-            );
-            if is_retryable_with_invalidation(&e) {
-                let stale_gen = self.refresh_generation.load(Ordering::Acquire);
-                let _ = self.maybe_refresh_root_fh(stale_gen).await;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-
-        Ok(())
-    }
-
-    /// Process one streamed READDIRPLUS entry.
-    ///
-    /// Returns `Ok(false)` when the downstream output channel is closed and the
-    /// caller should stop reading the directory.
-    async fn readdir_entry_attrs(
-        &self,
-        relative_path: &str,
-        inline: Option<Attr>,
-        runtime: &NfsWalkRuntime<'_>,
-    ) -> Option<Attr> {
-        // Transfer artifacts are skipped here, before any GETATTR (ADR-0006 C3b).
-        if runtime.hide_artifacts && hides_artifact(relative_path) {
-            return None;
-        }
-        if inline.is_some() {
-            return inline;
-        }
-        warn!("Missing inline attrs for {relative_path}, trying fallback GETATTR");
-        match self.mount.getattr_path(relative_path).await {
-            Ok(attrs) => Some(attrs),
-            Err(error) => {
-                let producer_id = runtime.scheduler.worker_id;
-                error!("[Producer {producer_id}] fallback GETATTR failed: {error}");
-                let _ = runtime
-                    .tx
-                    .send(StorageEntryMessage::Error {
-                        event: ErrorEvent::Scan,
-                        path: PathBuf::from(relative_path),
-                        entry: None,
-                        reason: format!(
-                            "[Producer {producer_id}] Missing file attributes: {relative_path}"
-                        ),
-                    })
-                    .await;
-                None
-            }
-        }
-    }
-
-    async fn read_entry_xattrs(
-        &self,
-        relative_path: &str,
-        producer_id: usize,
-    ) -> Option<Vec<(String, Vec<u8>)>> {
-        if !self.supports_xattr() {
-            return None;
-        }
-        let path = Path::new(relative_path);
-        let names = match self.list_xattr(path).await {
-            Ok(names) => names,
-            Err(error) => {
-                trace!("[Producer {producer_id}] listxattr for {relative_path} failed: {error}");
-                return None;
-            }
-        };
-        let mut pairs = Vec::with_capacity(names.len());
-        for name in names {
-            match self.get_xattr(path, &name).await {
-                Ok(value) => pairs.push((name, value.to_vec())),
-                Err(error) => warn!(
-                    "[Producer {producer_id}] Failed to read xattr '{name}' for {relative_path}: {error}"
-                ),
-            }
-        }
-        (!pairs.is_empty()).then_some(pairs)
-    }
-
-    fn walk_entry_filter(
-        runtime: &NfsWalkRuntime<'_>,
-        skip_filter: bool,
-        file_name: &str,
-        relative_path: &str,
-        extension: Option<&str>,
-        attrs: &Attr,
-    ) -> (bool, bool, bool) {
-        if !skip_filter {
-            return (false, true, false);
-        }
-        let file_type = if attrs.type_ == FType3::NF3LNK as u32 {
-            "symlink"
-        } else if attrs.type_ == FType3::NF3DIR as u32 {
-            "dir"
-        } else {
-            "file"
-        };
-        should_skip(
-            runtime.match_expr.as_ref().as_ref(),
-            runtime.exclude_expr.as_ref().as_ref(),
-            FilterInput {
-                file_name: Some(file_name),
-                file_path: Some(relative_path),
-                file_type: Some(file_type),
-                modified_epoch: Some(i64::from(attrs.mtime.seconds)),
-                size: Some(attrs.filesize),
-                extension: extension.or(Some("")),
-            },
-        )
-    }
-
-    async fn send_walk_entry(
-        runtime: &NfsWalkRuntime<'_>,
-        entry: EntryEnum,
-        packaged: bool,
-    ) -> bool {
-        let message = if packaged {
-            StorageEntryMessage::Packaged(Arc::new(entry))
-        } else {
-            StorageEntryMessage::Scanned(Arc::new(entry))
-        };
-        if runtime.tx.send(message).await.is_err() {
-            error!(
-                "[Producer {}] Output channel closed, stopping processing",
-                runtime.scheduler.worker_id
-            );
-            return false;
-        }
-        runtime.total_file_count.fetch_add(1, Ordering::Relaxed);
-        true
-    }
-
-    async fn track_package_depth(
-        runtime: &NfsWalkRuntime<'_>,
-        remaining: Option<usize>,
-        is_dir: bool,
-        relative_path: &str,
-        handle: &Bytes,
-        current_depth: usize,
-    ) -> Option<bool> {
-        let Some(remaining) = remaining else {
-            return Some(false);
-        };
-        if !is_dir {
-            return None;
-        }
-        if remaining <= 1 {
-            return Some(true);
-        }
-        runtime
-            .scheduler
-            .push_task((
-                relative_path.to_string(),
-                handle.clone(),
-                current_depth + 1,
-                false,
-                Some(remaining - 1),
-            ))
-            .await;
-        None
-    }
-
-    async fn packaged_entry_decision(
-        runtime: &NfsWalkRuntime<'_>,
-        send_packaged: bool,
-        is_dir: bool,
-        name: &str,
-        relative_path: &str,
-        handle: &Bytes,
-        depths: (usize, usize),
-    ) -> Option<bool> {
-        if send_packaged
-            || !runtime.packaged
-            || !is_dir
-            || !dir_matches_date_filter(runtime.match_expr.as_ref().as_ref(), name)
-        {
-            return Some(send_packaged);
-        }
-        let (current_depth, entry_depth) = depths;
-        if runtime.max_depth > 0 && entry_depth + runtime.package_depth > runtime.max_depth {
-            return None;
-        }
-        if runtime.package_depth == 0 {
-            return Some(true);
-        }
-        runtime
-            .scheduler
-            .push_task((
-                relative_path.to_string(),
-                handle.clone(),
-                current_depth + 1,
-                false,
-                Some(runtime.package_depth),
-            ))
-            .await;
-        None
-    }
-
-    async fn process_readdir_entry(
-        &self,
-        dir_path: &str,
-        entry: nfs_rs::ReaddirplusEntry,
-        current_depth: usize,
-        skip_filter: bool,
-        package_remaining: Option<usize>,
-        runtime: &NfsWalkRuntime<'_>,
-    ) -> Result<bool> {
-        let producer_id = runtime.scheduler.worker_id;
-        let ctx = runtime.scheduler;
-        let max_depth = runtime.max_depth;
-        // 构建完整路径（使用 '/' 拼接，避免平台差异）
-        let relative_path = self.build_relative_path(dir_path, &entry.file_name);
-
-        // 提取扩展名（在 file_name 被 move 前提取）
-        let extension = entry
-            .file_name
-            .rsplit_once('.')
-            .map(|(_, ext)| ext.to_string());
-
-        // 提取文件名（完整文件名）
-        let file_name = &entry.file_name;
-
-        let Some(attrs) = self
-            .readdir_entry_attrs(&relative_path, entry.attr, runtime)
-            .await
-        else {
-            return Ok(true);
-        };
-
-        let file_type = attrs.type_;
-        let is_dir = file_type == FType3::NF3DIR as u32;
-        let (skip_entry, continue_scan, need_submatch) = Self::walk_entry_filter(
-            runtime,
-            skip_filter,
-            file_name,
-            &relative_path,
-            extension.as_deref(),
-            &attrs,
-        );
-
-        // 计算条目的实际深度：目录深度+1
-        let entry_depth = current_depth + 1;
-        let Some(send_packaged) = Self::track_package_depth(
-            runtime,
-            package_remaining,
-            is_dir,
-            &relative_path,
-            &entry.handle,
-            current_depth,
-        )
-        .await
-        else {
-            return Ok(true);
-        };
-
-        if !send_packaged && skip_entry {
-            if continue_scan && is_dir && (current_depth < max_depth || max_depth == 0) {
-                ctx.push_task((
-                    relative_path.clone(),
-                    entry.handle.clone(),
-                    current_depth + 1,
-                    need_submatch,
-                    None,
-                ))
-                .await;
-            }
-            return Ok(true);
-        }
-
-        // 创建StorageEntry
-        // Read xattrs if supported (before consuming entry.file_name)
-        let xattrs = self.read_entry_xattrs(&relative_path, producer_id).await;
-
-        let storage_entry = EntryEnum::NAS(NASEntry::from_nfs_attrs(
-            entry.file_name,
-            PathBuf::from(&relative_path),
-            extension.clone(),
-            &attrs,
-            entry.handle.clone(),
-            NfsEnrich::from_attrs(&attrs).with_xattrs(xattrs),
-            self.owners_are_strings(),
-        ));
-
-        let Some(send_packaged) = Self::packaged_entry_decision(
-            runtime,
-            send_packaged,
-            is_dir,
-            storage_entry.get_name(),
-            &relative_path,
-            &entry.handle,
-            (current_depth, entry_depth),
-        )
-        .await
-        else {
-            return Ok(true);
-        };
-
-        // 统一的 Packaged 发送
-        if send_packaged {
-            if !Self::send_walk_entry(runtime, storage_entry, true).await {
-                return Ok(false);
-            }
-            return Ok(true);
-        }
-
-        // 如果是目录且未达到最大深度，将其添加到任务队列
-        if is_dir && (current_depth < max_depth || max_depth == 0) {
-            ctx.push_task((
-                relative_path.clone(),
-                entry.handle.clone(),
-                current_depth + 1,
-                need_submatch,
-                None,
-            ))
-            .await;
-        }
-
-        // 检查深度限制：只有当条目深度在允许范围内时才发送
-        // 0表示无限深度
-        if (max_depth == 0 || entry_depth <= max_depth)
-            && !Self::send_walk_entry(runtime, storage_entry, false).await
-        {
-            return Ok(false);
-        }
-
-        Ok(true)
-    }
-
     /// 整读：按 effective `block_size` 分段循环读满 `count` 字节。
     ///
     /// 单次 READ RPC 服务器最多返回协商的 rsize，`count` 直接透传会被静默
@@ -3777,11 +3105,6 @@ impl NFSStorage {
     /// 安全地拼接两个路径部分，避免重复的 '/'
     fn join_paths(base: &str, suffix: &str) -> String {
         join_nfs_paths(base, suffix)
-    }
-
-    /// 构建完整路径（使用 '/' 拼接，避免平台差异）
-    fn build_relative_path(&self, dir_path: &str, entry_file_name: &str) -> String {
-        build_relative_path_impl(&self.root, dir_path, entry_file_name)
     }
 
     pub(crate) async fn read_data(
@@ -4550,62 +3873,6 @@ mod tests {
     }
 
     // --- build_relative_path_impl 测试 ---
-
-    #[test]
-    fn test_build_relative_path_at_root() {
-        // dir_path == root → 返回纯文件名
-        let result = build_relative_path_impl("data/prefix", "data/prefix", "file.txt");
-        assert_eq!(result, "file.txt");
-    }
-
-    #[test]
-    fn test_build_relative_path_under_root() {
-        // dir_path 在 root 下 → 剥离前缀后拼接文件名
-        let result = build_relative_path_impl("data", "data/subdir", "file.txt");
-        assert_eq!(result, "subdir/file.txt");
-    }
-
-    #[test]
-    fn test_build_relative_path_deep_under_root() {
-        // 深层嵌套
-        let result = build_relative_path_impl("data", "data/a/b", "file.txt");
-        assert_eq!(result, "a/b/file.txt");
-    }
-
-    #[test]
-    fn test_build_relative_path_empty_root_with_dir() {
-        // root="" 且 dir_path 非空 → 直接拼接
-        let result = build_relative_path_impl("", "subdir", "file.txt");
-        assert_eq!(result, "subdir/file.txt");
-    }
-
-    #[test]
-    fn test_build_relative_path_empty_root_empty_dir() {
-        // root="" 且 dir_path="" → 返回纯文件名
-        let result = build_relative_path_impl("", "", "file.txt");
-        assert_eq!(result, "file.txt");
-    }
-
-    #[test]
-    fn test_build_relative_path_no_root_match() {
-        // dir_path 不匹配 root（递归层常见路径）
-        let result = build_relative_path_impl("data", "subdir", "file.txt");
-        assert_eq!(result, "subdir/file.txt");
-    }
-
-    #[test]
-    fn test_build_relative_path_partial_root_match() {
-        // root="ab", dir="abc" → 不应误剥离（目录边界检查）
-        let result = build_relative_path_impl("ab", "abc", "file.txt");
-        assert_eq!(result, "abc/file.txt");
-    }
-
-    #[test]
-    fn test_build_relative_path_root_with_trailing_slash_in_dir() {
-        // dir_path = "root/" 的边界情况（strip_prefix root 后剩 "/"）
-        let result = build_relative_path_impl("data", "data/", "file.txt");
-        assert_eq!(result, "file.txt");
-    }
 
     // --- join_nfs_paths 测试 ---
 

@@ -5,34 +5,8 @@ use std::sync::atomic::AtomicU64;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::filter::FilterExpression;
 use crate::hdfs::HdfsConfig;
 use crate::qos::QosManager;
-
-#[derive(Debug, Clone)]
-pub struct WalkOptions {
-    pub depth: Option<usize>,
-    pub match_expressions: Option<FilterExpression>,
-    pub exclude_expressions: Option<FilterExpression>,
-    pub concurrency: usize,
-    pub include_tags: bool,
-    pub packaged: bool,
-    pub package_depth: usize,
-}
-
-impl Default for WalkOptions {
-    fn default() -> Self {
-        Self {
-            depth: None,
-            match_expressions: None,
-            exclude_expressions: None,
-            concurrency: 1,
-            include_tags: false,
-            packaged: false,
-            package_depth: 0,
-        }
-    }
-}
 
 #[derive(Clone, Default)]
 pub struct CopyOptions {

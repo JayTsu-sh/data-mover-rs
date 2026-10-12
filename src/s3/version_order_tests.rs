@@ -26,7 +26,6 @@ use super::*;
 use crate::model::{HistoryOrder, ObjectHistory, StoragePath, VersionRecord};
 use crate::s3::S3Storage;
 use crate::s3::tests::make_test_storage;
-use crate::s3::version_listing::{VersionOrDeleteMarker, VersionPages, oldest_first_by_key};
 use crate::storage::backends::s3::{S3Protocol, S3VersioningAtConnect, connect, tests::identity};
 use crate::storage::listing::testing::listed;
 use crate::storage::{PreflightPolicy, SourceDescriptor};
@@ -210,29 +209,6 @@ async fn the_role_listing_orders_concurrent_writes_as_the_server_did() -> TestRe
     assert_eq!(latest.iter().filter(|latest| **latest).count(), 1);
     assert_eq!(latest.last(), Some(&true));
 
-    // Without the document order: a time merge, marked inferred, and wrong on this listing.
-    let client = replay_client(vec![FULL.to_string()]);
-    let output = client.list_object_versions().bucket("b").send().await?;
-    let page = VersionsInOrder {
-        output,
-        order: None,
-    };
-    let mut pages = VersionPages::default();
-    let entries = pages.positioned(&page, |_| true);
-    let entries = pages.complete_keys(entries, false);
-    let histories = oldest_first_by_key(entries);
-    assert_eq!(histories.len(), 1);
-    assert_eq!(histories[0].order, HistoryOrder::Inferred);
-    let by_time: Vec<String> = histories[0]
-        .entries
-        .iter()
-        .map(|entry| match entry {
-            VersionOrDeleteMarker::Version(v) => v.version_id(),
-            VersionOrDeleteMarker::DeleteMarker(m) => m.version_id(),
-        })
-        .map(|id| id.unwrap_or_default().to_string())
-        .collect();
-    assert_ne!(by_time, written_order());
     Ok(())
 }
 

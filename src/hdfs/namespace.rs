@@ -314,8 +314,8 @@ impl HDFSStorage {
         Ok(self.children_from_listing(statuses, &directory.relative_path))
     }
 
-    /// [`Self::list_directory`] without transfer artifacts (ADR-0006 C3b): what `walkdir` and
-    /// `walkdir_2` report. The raw listing stays available for callers that must see them.
+    /// [`Self::list_directory`] without transfer artifacts (ADR-0006 C3b).
+    /// The raw listing stays available for callers that must see them.
     pub(crate) async fn list_visible(
         &self,
         relative_path: &std::path::Path,
@@ -373,86 +373,7 @@ impl HDFSStorage {
             .collect()
     }
 
-    /// Start a bounded recursive HDFS scan without applying common walk
-    /// filtering or message semantics. Transfer artifacts are never reported
-    /// (a namespace rule, ADR-0006 C3b, not a walk filter).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the starting path escapes the configured root or
-    /// concurrency is outside the validated `1..=16` range. Runtime listing
-    /// failures are emitted as [`HdfsScanEvent::Error`].
-    pub fn scan_recursive(
-        &self,
-        sub_path: Option<&std::path::Path>,
-        max_depth: Option<usize>,
-        concurrency: usize,
-    ) -> Result<crate::AsyncReceiver<HdfsScanEvent>, StorageError> {
-        if !(1..=crate::TransferConcurrency::MAX).contains(&concurrency) {
-            return Err(config_error(&format!(
-                "HDFS scan concurrency must be between 1 and {}, got {concurrency}",
-                crate::TransferConcurrency::MAX
-            )));
-        }
-        let root = sub_path.unwrap_or_else(|| std::path::Path::new(""));
-        self.resolve_path(root)?;
-        let (sender, receiver) = async_channel::bounded(SCAN_CHANNEL_CAPACITY);
-        let storage = self.clone();
-        let root = root.to_path_buf();
-        tokio::spawn(async move {
-            storage
-                .run_recursive_scan(root, max_depth, concurrency, sender)
-                .await;
-        });
-        Ok(crate::AsyncReceiver::new(receiver))
-    }
 
-    /// Adapt the HDFS scanner to the common walk stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid scan options, an escaping subpath, or HDFS
-    /// packaging, which is not implemented.
-    pub fn walkdir(
-        &self,
-        sub_path: Option<&std::path::Path>,
-        options: crate::storage_enum::WalkOptions,
-    ) -> Result<crate::WalkDirAsyncIterator, StorageError> {
-        if options.packaged {
-            return Err(StorageError::UnsupportedType(
-                "HDFS packaged walkdir is not implemented".to_string(),
-            ));
-        }
-        let max_depth = options.depth.filter(|depth| *depth != 0);
-        let raw = self.scan_recursive(sub_path, max_depth, options.concurrency)?;
-        let (sender, receiver) = async_channel::bounded(SCAN_CHANNEL_CAPACITY);
-        tokio::spawn(async move {
-            while let Some(event) = raw.next().await {
-                let message = match event {
-                    HdfsScanEvent::Entry(entry) => {
-                        if hdfs_entry_is_filtered(
-                            &entry,
-                            options.match_expressions.as_ref(),
-                            options.exclude_expressions.as_ref(),
-                        ) {
-                            continue;
-                        }
-                        crate::StorageEntryMessage::Scanned(Arc::new(crate::EntryEnum::HDFS(entry)))
-                    }
-                    HdfsScanEvent::Error { path, error } => crate::StorageEntryMessage::Error {
-                        event: crate::ErrorEvent::Scan,
-                        path,
-                        entry: None,
-                        reason: error.to_string(),
-                    },
-                };
-                if sender.send(message).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(crate::AsyncReceiver::new(receiver))
-    }
 
     /// Recursively create a directory below the configured HDFS root.
     ///

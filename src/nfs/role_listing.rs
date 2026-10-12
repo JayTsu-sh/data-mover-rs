@@ -226,8 +226,7 @@ enum Examined {
 ///   server's or the directory handle's ([`lookup_failed`]).
 ///
 /// Every other entry goes on untouched: one with attributes (a real `.snapshot` a server
-/// describes, as DXN does), any other name, any entry over `NFSv4`. Legacy `walkdir` fills the
-/// attributes in with a GETATTR and descends into it.
+/// describes, as DXN does), any other name, any entry over `NFSv4`.
 async fn snapshot_directory(
     directory: &StoragePath,
     entry: nfs_rs::ReaddirplusEntry,

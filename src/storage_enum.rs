@@ -14,12 +14,12 @@ use crate::pipeline_primitives::WriteProgress;
 use crate::qos::QosManager;
 use crate::s3::S3Storage;
 pub use crate::storage_options::{
-    BackendConfig, CopyOptions, CreateStorageOptions, TarPackOptions, WalkOptions,
+    BackendConfig, CopyOptions, CreateStorageOptions, TarPackOptions,
 };
 pub use crate::stream_handle::StreamHandle;
 use crate::{
     CommitCallback, DataChunk, DeleteDirIterator, EntryEnum, Result, ResumeContext,
-    TransferConcurrency, WalkDirAsyncIterator,
+    TransferConcurrency,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -291,26 +291,6 @@ impl StorageEnum {
                 .get_metadata(relative_path)
                 .await
                 .map(EntryEnum::HDFS),
-        }
-    }
-
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the requested storage operation cannot be completed.
-    pub async fn walkdir(
-        &self,
-        sub_path: Option<&Path>,
-        options: WalkOptions,
-    ) -> Result<WalkDirAsyncIterator> {
-        match self {
-            StorageEnum::Local(s) => s.walkdir(sub_path, options),
-            StorageEnum::NFS(s) => s.walkdir(sub_path, options).await,
-            StorageEnum::S3(s) => {
-                let key = sub_path.map(|p| path_to_s3_key(p));
-                s.walkdir(key.as_deref(), options)
-            }
-            StorageEnum::HDFS(storage) => storage.walkdir(sub_path, options),
         }
     }
 
@@ -792,7 +772,7 @@ impl StorageEnum {
     /// # 参数
     /// - `from`: 源端存储
     /// - `to`: 目标端存储
-    /// - `entries`: 需要打包的条目列表（阶段 1 walkdir 收集的结果）
+    /// - `entries`: 需要打包的条目列表（调用方列举收集的结果）
     /// - `tar_path`: 目标 .tar 文件的相对路径
     /// - `tar_size`: `calculate_tar_size()` 计算的总大小（S3 用于 singlepart/multipart 决策）
     /// - `tar_mtime`: tar 文件的 mtime（通常取源端目录的 mtime）

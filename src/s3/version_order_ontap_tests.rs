@@ -50,7 +50,6 @@ use crate::s3::tests::make_test_storage;
 use crate::storage::backends::s3::{S3VersioningAtConnect, connect, tests::identity};
 use crate::storage::listing::testing::listed;
 use crate::storage::{PreflightPolicy, StorageRoleFailure};
-use crate::{StorageEntryMessage, WalkOptions};
 
 const SMALL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -296,50 +295,6 @@ async fn the_role_listing_lists_every_version_and_each_prefix_once() -> TestResu
     Ok(())
 }
 
-/// Every message of a legacy `walkdir` of `sub` over `replay`: files as (key, version id),
-/// directories as prefixes, and error reasons.
-async fn walked(
-    replay: &MarkerReplay,
-    sub: &str,
-) -> TestResult<(Vec<(String, String)>, Vec<String>, Vec<String>)> {
-    let walk = storage(replay).walkdir(Some(sub), WalkOptions::default())?;
-    let (mut files, mut dirs, mut errors) = (Vec::new(), Vec::new(), Vec::new());
-    while let Some(message) = walk.next().await {
-        match message {
-            StorageEntryMessage::Scanned(entry) if entry.get_is_dir() => {
-                dirs.push(format!("{}/", entry.get_relative_path().to_string_lossy()));
-            }
-            StorageEntryMessage::Scanned(entry) => files.push((
-                entry.get_relative_path().to_string_lossy().to_string(),
-                entry.get_version_id().unwrap_or_default().to_string(),
-            )),
-            StorageEntryMessage::Error { reason, .. } => errors.push(reason),
-            _ => {}
-        }
-    }
-    Ok((files, dirs, errors))
-}
-
-/// Legacy `walkdir`: every version and delete marker once, each subdirectory sent once and listed
-/// once (a repeated prefix used to walk its whole subtree again).
-#[tokio::test]
-async fn the_legacy_walk_lists_every_version_and_walks_each_prefix_once() -> TestResult {
-    for (fixture, dir) in FIXTURES {
-        let replay = MarkerReplay::new(fixture);
-        let (files, dirs, errors) = walked(&replay, &format!("{ROOT}{dir}")).await?;
-        assert!(errors.is_empty(), "{errors:?}");
-        let truth = Truth::of(fixture);
-        assert_eq!(unique(&files, "version"), truth.entries, "{dir}");
-        assert_eq!(unique(&dirs, "directory"), truth.prefixes, "{dir}");
-        let subtree_listings: Vec<String> = (replay.asked().into_iter())
-            .map(|(prefix, _, _)| prefix)
-            .filter(|prefix| truth.prefixes.contains(prefix))
-            .collect();
-        assert_eq!(unique(&subtree_listings, "subtree"), truth.prefixes);
-    }
-    Ok(())
-}
-
 /// A page shaped as `RustFS` lists (every delete marker, then every version), truncated inside
 /// `<ROOT>g/k` without a version marker: the key's entries are not the page's final run, so where it
 /// continues is unknown.
@@ -358,8 +313,7 @@ const GROUPED: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsRe
     </ListVersionsResult>";
 
 /// An unknown resume point is never guessed: the role listing fails the directory (`Protocol`,
-/// permanent); the legacy walks list the page's complete keys, drop the key it ended in and
-/// report the error.
+/// permanent).
 #[tokio::test]
 async fn an_unknown_resume_point_is_reported_not_guessed() -> TestResult {
     let replay = MarkerReplay::new(GROUPED);
@@ -370,11 +324,6 @@ async fn an_unknown_resume_point_is_reported_not_guessed() -> TestResult {
     assert_eq!(failure.transience(), Transience::Permanent);
     assert_eq!(failure.path().as_str(), format!("{ROOT}g"));
 
-    let complete = [(format!("{ROOT}g/a"), "a1".to_string())];
-
-    let (files, _, errors) = walked(&MarkerReplay::new(GROUPED), &format!("{ROOT}g")).await?;
-    assert_eq!(errors, [UnknownResumePoint::DIAGNOSTIC]);
-    assert_eq!(files, complete);
     Ok(())
 }
 
@@ -410,15 +359,9 @@ fn query_params(query: &str) -> HashMap<&str, &str> {
 async fn no_listing_sends_an_empty_or_unpaired_version_marker() -> TestResult {
     let fixtures = FIXTURES.into_iter().chain([(EMPTY_VERSION_MARKER, "s")]);
     for (fixture, dir) in fixtures {
-        let (role, paged_replay, walk) = (
-            MarkerReplay::new(fixture),
-            MarkerReplay::new(fixture),
-            MarkerReplay::new(fixture),
-        );
+        let role = MarkerReplay::new(fixture);
         role_all(&role, dir).await?;
-        paged(&paged_replay, &format!("{ROOT}{dir}/")).await?;
-        walked(&walk, &format!("{ROOT}{dir}")).await?;
-        for replay in [&role, &paged_replay, &walk] {
+        for replay in [&role] {
             let queries = replay.queries();
             let first = queries.first().map(|query| query_params(query));
             assert!(
@@ -447,13 +390,6 @@ async fn no_listing_sends_an_empty_or_unpaired_version_marker() -> TestResult {
         (files, directories),
         (both.to_vec(), vec![format!("{ROOT}s/x/")])
     );
-    let (files, _, errors) = walked(
-        &MarkerReplay::new(EMPTY_VERSION_MARKER),
-        &format!("{ROOT}s"),
-    )
-    .await?;
-    assert!(errors.is_empty(), "{errors:?}");
-    assert_eq!(files, both);
     Ok(())
 }
 

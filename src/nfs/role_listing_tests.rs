@@ -8,7 +8,7 @@ use std::sync::{Mutex, PoisonError};
 use futures::stream;
 use nfs_rs::{Nfs3ErrorCode as V3, Nfs4ErrorCode as V4};
 
-use super::super::{CACHE_WRITES, FType3, GLOBAL_CACHE, NASEntry, NfsEnrich, Time, role_metadata};
+use super::super::{CACHE_WRITES, FType3, GLOBAL_CACHE, NASEntry, Time, role_metadata};
 use super::*;
 use crate::model::{FailureClass, Transience};
 
@@ -115,7 +115,6 @@ fn a_listed_childs_ownership_and_times_are_what_a_getattr_reports() {
                 None,
                 &attrs,
                 Bytes::from_static(b"h"),
-                NfsEnrich::default(),
                 owners_are_strings,
             );
             assert_eq!(listed.mode, Some(legacy.mode), "{context}");

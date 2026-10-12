@@ -1,13 +1,12 @@
 use num_traits::ToPrimitive;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use soft_canonicalize::soft_canonicalize;
-pub mod async_receiver;
+mod delete_progress;
 pub mod integrity;
 pub mod metadata;
 pub mod model;
@@ -15,7 +14,7 @@ pub(crate) mod runtime;
 pub mod storage;
 pub mod transfer;
 pub mod traversal;
-pub use async_receiver::AsyncReceiver;
+pub use delete_progress::DeleteDirIterator;
 
 #[cfg(windows)]
 pub mod acl;
@@ -49,7 +48,6 @@ pub mod tar_pack;
 pub mod time_util;
 mod transfer_concurrency;
 pub mod url_redact;
-pub(crate) mod walk_scheduler;
 pub(crate) mod write_pipeline;
 
 pub use checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
@@ -72,9 +70,7 @@ pub use nfs::NFSStorage;
 pub use qos::QosManager;
 pub use s3::{MultipartUpload, S3BucketInfo, S3CompletedPart, S3Storage};
 pub use storage_enum::{StorageEnum, StorageType, create_storage, detect_storage_type};
-pub use storage_options::{
-    BackendConfig, CopyOptions, CreateStorageOptions, TarPackOptions, WalkOptions,
-};
+pub use storage_options::{BackendConfig, CopyOptions, CreateStorageOptions, TarPackOptions};
 pub use stream_handle::StreamHandle;
 pub use tar_pack::calculate_tar_size;
 pub use transfer_concurrency::TransferConcurrency;
@@ -106,9 +102,6 @@ impl DeleteEvent {
         }
     }
 }
-
-/// 删除进度迭代器，通过 channel 接收删除事件
-pub type DeleteDirIterator = AsyncReceiver<DeleteEvent>;
 
 pub type Result<T> = std::result::Result<T, error::StorageError>;
 
@@ -425,45 +418,6 @@ pub struct HDFSEntry {
     pub extension: Option<String>,
 }
 
-/// 失败事件类型，用于区分不同场景下的错误
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ErrorEvent {
-    /// 扫描阶段失败（元数据获取、目录遍历、路径处理等）
-    Scan,
-    /// 文件内容复制失败（含 mkdir、目录结构建立）
-    Copy,
-    /// ACL/权限复制失败
-    CopyAcl,
-    /// xattr 复制失败
-    CopyXattr,
-    /// 删除操作失败
-    Delete,
-    /// 重命名操作失败
-    Rename,
-    /// 软链接操作失败（创建/删除 symlink）
-    SymlinkOp,
-    /// 打包失败
-    Pack,
-    /// 独立完整性检查失败
-    IntegrityCheck,
-}
-
-impl fmt::Display for ErrorEvent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ErrorEvent::Scan => write!(f, "scan"),
-            ErrorEvent::Copy => write!(f, "copy"),
-            ErrorEvent::CopyAcl => write!(f, "copy_acl"),
-            ErrorEvent::CopyXattr => write!(f, "copy_xattr"),
-            ErrorEvent::Delete => write!(f, "delete"),
-            ErrorEvent::Rename => write!(f, "rename"),
-            ErrorEvent::SymlinkOp => write!(f, "symlink_op"),
-            ErrorEvent::Pack => write!(f, "pack"),
-            ErrorEvent::IntegrityCheck => write!(f, "integrity_check"),
-        }
-    }
-}
-
 /// 变更的维度：用于区分内容变更、元数据变更、或两者同时变更
 ///
 /// - `DataOnly`：size 或 mtime 不同（内容变了），属性 mode/uid/gid 未变 → 需 `copy_file` + `set_metadata`
@@ -507,46 +461,6 @@ impl std::fmt::Display for ChangeKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_state_str())
     }
-}
-
-/// 文件操作消息枚举，用于在扫描/同步过程中传递文件状态变化
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum StorageEntryMessage {
-    /// 文件被扫描到
-    Scanned(Arc<EntryEnum>),
-    /// 新增文件
-    New(Arc<EntryEnum>),
-    /// 文件已变更（kind 区分 data/metadata/both）
-    Changed {
-        entry: Arc<EntryEnum>,
-        kind: ChangeKind,
-    },
-    /// 文件已删除
-    Deleted(Arc<EntryEnum>),
-    /// 文件被重命名，(from, to)
-    Renamed((Arc<EntryEnum>, Arc<EntryEnum>)),
-    /// 文件完整性检查完成
-    IntegrityChecked(Arc<EntryEnum>),
-    /// 目录需要打包为 tar（仅在 --packaged 模式下由 walkdir 发射）
-    Packaged(Arc<EntryEnum>),
-    /// 打包完成后的 manifest 数据，由 sync worker 广播，DatabaseConsumer 消费写入数据库
-    TarManifest {
-        /// `.tar` 文件的 `relative_path`
-        tar_path: String,
-        /// tar 内包含的所有条目
-        entries: Vec<Arc<EntryEnum>>,
-    },
-    /// 扫描/同步过程中遇到的 per-entry 错误
-    Error {
-        /// 出错的事件类型
-        event: ErrorEvent,
-        /// 出错的文件或目录路径
-        path: PathBuf,
-        /// 条目上下文；早期扫描错误尚未构造完整条目时为 `None`。
-        entry: Option<Arc<EntryEnum>>,
-        /// 错误原因
-        reason: String,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -699,9 +613,6 @@ impl fmt::Display for S3Entry {
         write!(f, "}}")
     }
 }
-
-// 定义异步迭代器类型别名
-pub type WalkDirAsyncIterator = AsyncReceiver<StorageEntryMessage>;
 
 /// 计算两个时间点之间的天数差
 ///

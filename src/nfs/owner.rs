@@ -84,7 +84,6 @@ mod tests {
             None,
             &attrs,
             bytes::Bytes::new(),
-            super::super::NfsEnrich::default(),
             true,
         );
         assert_eq!(entry.uid, None);
