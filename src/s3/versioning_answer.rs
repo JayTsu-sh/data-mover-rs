@@ -36,6 +36,12 @@ pub(super) fn answered(status: Option<&BucketVersioningStatus>) -> S3VersioningA
 /// answer, and a request that could not be built at all (it fails again, with its own failure,
 /// when the bucket is listed; calling it transient would have a caller connect in a loop).
 pub(super) fn failed(code: Option<&str>, status: Option<u16>, lost: bool) -> S3VersioningAtConnect {
+    // The SDK wraps XML decode failures in GetBucketVersioningError::Unhandled,
+    // surfaced as ServiceError even for HTTP 200. Success status plus an error
+    // is an unusable answer, not a server refusal or proof of unsupported versioning.
+    if matches!(status, Some(200..=299)) {
+        return S3VersioningAtConnect::Unreachable { status };
+    }
     if versioning_is_unsupported(code, status) {
         return S3VersioningAtConnect::NoVersioning;
     }
@@ -81,6 +87,8 @@ mod tests {
             (None, Some(400), false, Refused),
             (None, Some(408), false, lost(Some(408))),
             (None, Some(200), true, lost(Some(200))),
+            (None, Some(200), false, lost(Some(200))),
+            (None, Some(204), false, lost(Some(204))),
             // A request that could not be built fails again when listed; not transient.
             (None, None, false, Refused),
             (None, None, true, lost(None)),
