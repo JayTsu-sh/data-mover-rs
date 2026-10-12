@@ -33,7 +33,6 @@
 | 改 S3 遍历 / 版本化桶每 key 一项 (`ObjectHistory`) | `src/model/{history,history_codec}.rs` + `src/storage/backends/s3/{namespace,listing,histories,history}.rs` + `src/traversal/{s3_tests,s3_history_tests,s3_segment_tests}.rs` + `.claude/docs/storage-s3.md` "role-based 遍历与版本模式" + `.claude/skills/e2e-s3/scripts/traversal_versions.sh` |
 | 改 Local namespace 角色 (逐段不跟随 symlink) | `.claude/docs/storage-local.md` "Namespace 角色" + `src/storage/backends/local/namespace.rs` |
 | 改递归删除 | `src/storage/delete_tree.rs` (走 `Namespace` 角色，backend 无关) |
-| 改 NDX 分页遍历 (legacy walkdir_2 的中立替身) | `src/ndx_walk.rs` (crate 根，与 `filter_traversal` 同层) + `src/dir_tree.rs` (`run_dfs_driver` 不要动) |
 | 改递归建目录 | `src/storage/create_dir.rs` (走 `Namespace` 角色，backend 无关) |
 | 改跨端完整性比对 | `src/integrity/mod.rs` (走 `ReadSource` + `Metadata` 角色) |
 | 改拷贝带哪些元数据 / ACL / xattr 开关 | `.claude/docs/metadata-negotiation.md` + `src/transfer/engine/negotiation.rs` + `src/metadata/compile.rs` (规划) + `src/metadata/mod.rs` (应用) |

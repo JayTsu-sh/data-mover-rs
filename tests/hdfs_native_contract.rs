@@ -2,8 +2,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use data_mover::dir_tree::NdxEvent;
-use data_mover::dir_tree::{DirHandle, ReadContext};
 use data_mover::hdfs::HdfsScanEvent;
 use data_mover::{
     BackendConfig, CopyOptions, CreateStorageOptions, HdfsConfig, IntegrityCheck,
@@ -1364,77 +1362,6 @@ async fn append_hdfs_tail(
     Ok(())
 }
 
-async fn assert_sorted_root_reader(
-    storage: &data_mover::HDFSStorage,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let context = ReadContext {
-        match_expr: std::sync::Arc::new(None),
-        exclude_expr: std::sync::Arc::new(None),
-        current_depth: 0,
-        max_depth: 0,
-        apply_filter: true,
-        include_tags: false,
-        is_versioned: false,
-    };
-    let result = storage
-        .read_dir_sorted("", &DirHandle::Hdfs(std::path::PathBuf::new()), &context)
-        .await?;
-    assert_eq!(result.files.len(), 1);
-    assert_eq!(result.files[0].get_name(), "root.txt");
-    assert_eq!(result.subdirs.len(), 2);
-    assert_eq!(result.subdirs[0].entry.get_name(), "并列");
-    assert_eq!(result.subdirs[1].entry.get_name(), "甲");
-    Ok(())
-}
-
-async fn collect_walkdir2_snapshot(
-    storage: &StorageEnum,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let receiver = storage.walkdir_2(None, None, None, None, 3, false).await?;
-    let mut snapshot = Vec::new();
-    let mut done = 0;
-    while let Some(event) = receiver.next().await {
-        match event {
-            NdxEvent::Page(page) => {
-                let files = page
-                    .files
-                    .iter()
-                    .map(|entry| {
-                        format!(
-                            "{}:{}",
-                            entry.ndx,
-                            entry.entry.get_relative_path().display()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let subdirs = page
-                    .subdirs
-                    .iter()
-                    .map(|entry| {
-                        format!(
-                            "{}:{}",
-                            entry.ndx,
-                            entry.entry.get_relative_path().display()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                snapshot.push(format!(
-                    "{}|{}|{}|{}|{}",
-                    page.dir_path, page.ndx_start, files, subdirs, page.gap_ndx
-                ));
-            }
-            NdxEvent::Error { path, reason } => {
-                return Err(format!("walkdir_2 failed at {path}: {reason}").into());
-            }
-            NdxEvent::Done => done += 1,
-        }
-    }
-    assert_eq!(done, 1);
-    Ok(snapshot)
-}
-
 fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
 fn assert_send<T: Send>() {}
 
@@ -2171,7 +2098,6 @@ async fn nightly_lab_streams_recursive_scan_with_depth_limit()
         &["root.txt", "甲/a.txt", "甲/乙/b.txt", "甲/乙/丙/c.txt"],
     )
     .await?;
-    assert_sorted_root_reader(&hdfs).await?;
 
     let receiver = hdfs.scan_recursive(None, Some(2), 3)?;
     let mut paths = Vec::new();
@@ -2229,10 +2155,6 @@ async fn nightly_lab_streams_recursive_scan_with_depth_limit()
             std::path::PathBuf::from("甲/a.txt"),
         ]
     );
-    let first = collect_walkdir2_snapshot(&common).await?;
-    let second = collect_walkdir2_snapshot(&common).await?;
-    assert_eq!(first, second);
-    assert_eq!(first.len(), 4);
 
     assert!(hdfs.client().delete(hdfs.location().root(), true).await?);
     Ok(())

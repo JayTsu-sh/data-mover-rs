@@ -93,54 +93,6 @@ fn hdfs_filter_decision(
     )
 }
 
-fn hdfs_read_result(
-    dir_path: &str,
-    entries: Vec<HDFSEntry>,
-    ctx: &crate::dir_tree::ReadContext,
-) -> crate::dir_tree::ReadResult {
-    let mut files = Vec::new();
-    let mut subdirs = Vec::new();
-    for entry in entries {
-        let (skip, continue_scan, need_filter) = if ctx.apply_filter {
-            hdfs_filter_decision(
-                &entry,
-                ctx.match_expr.as_ref().as_ref(),
-                ctx.exclude_expr.as_ref().as_ref(),
-            )
-        } else {
-            (false, true, false)
-        };
-        let can_descend = entry.is_dir
-            && (ctx.max_depth == 0 || ctx.current_depth.saturating_add(1) < ctx.max_depth);
-        let entry = Arc::new(crate::EntryEnum::HDFS(entry));
-        if skip {
-            if can_descend && continue_scan {
-                subdirs.push(crate::dir_tree::SubdirEntry {
-                    entry,
-                    visible: false,
-                    need_filter,
-                });
-            }
-        } else if can_descend {
-            subdirs.push(crate::dir_tree::SubdirEntry {
-                entry,
-                visible: true,
-                need_filter,
-            });
-        } else {
-            files.push(entry);
-        }
-    }
-    files.sort_by(|left, right| left.get_name().cmp(right.get_name()));
-    subdirs.sort_by(|left, right| left.entry.get_name().cmp(right.entry.get_name()));
-    crate::dir_tree::ReadResult {
-        dir_path: dir_path.to_string(),
-        files,
-        subdirs,
-        errors: Vec::new(),
-    }
-}
-
 fn strip_root<'a>(path: &'a str, root: &str) -> Result<&'a str, StorageError> {
     if root == "/" {
         return path

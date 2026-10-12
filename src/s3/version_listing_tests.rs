@@ -3,9 +3,7 @@ use std::fmt::Write as _;
 use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::{DeleteMarkerEntry, ObjectVersion};
 
-use super::{
-    ListedEntry, VersionOrDeleteMarker, VersionPages, oldest_first_by_key, versions_with_latest,
-};
+use super::{ListedEntry, VersionOrDeleteMarker, VersionPages, oldest_first_by_key};
 use crate::model::HistoryOrder;
 use crate::s3::version_order::{DocumentOrder, VersionsInOrder};
 use crate::storage::backends::s3::KeyHistory;
@@ -246,49 +244,6 @@ fn a_shuffled_listing_falls_back_to_time() {
     let k = history(&grouped, "k");
     assert_eq!(k.order, HistoryOrder::Inferred);
     assert_eq!(ids(&k.entries), ["v1", "v2", "marker:m", "v3"]);
-}
-
-fn latest_flags(entries: Vec<VersionOrDeleteMarker>) -> Vec<(String, bool)> {
-    versions_with_latest(entries)
-        .into_iter()
-        .map(|(version, latest)| (version.version_id().unwrap_or_default().to_string(), latest))
-        .collect()
-}
-
-#[test]
-fn versions_only_mark_the_newest_latest_unless_a_marker_is_newer() {
-    let listed = |v2_latest: bool, newest_marker: Option<VersionOrDeleteMarker>| {
-        let mut entries = Vec::new();
-        entries.extend(newest_marker.clone().filter(|_| !v2_latest));
-        entries.push(version("k", "v2", 20, v2_latest));
-        entries.extend(newest_marker.filter(|_| v2_latest));
-        entries.push(version("k", "v1", 10, false));
-        oldest_first_by_key(at(0, entries))
-            .into_iter()
-            .next()
-            .map(|history| history.entries)
-            .unwrap_or_default()
-    };
-    // A marker between the versions: v2 is still the key's latest entry.
-    assert_eq!(
-        latest_flags(listed(true, Some(marker("k", "m", 15, false)))),
-        [("v1".to_string(), false), ("v2".to_string(), true)]
-    );
-    // The newest entry is a marker (D4): both versions are listed, neither latest.
-    assert_eq!(
-        latest_flags(listed(false, Some(marker("k", "m", 30, true)))),
-        [("v1".to_string(), false), ("v2".to_string(), false)]
-    );
-    // Only markers: no version to list.
-    let only = oldest_first_by_key(at(0, vec![marker("k", "m", 30, true)]));
-    assert!(
-        latest_flags(
-            only.into_iter()
-                .flat_map(|history| history.entries)
-                .collect()
-        )
-        .is_empty()
-    );
 }
 
 /// One response page: `entries` as `(kind, key, id, latest)` in document order, parsed both ways.

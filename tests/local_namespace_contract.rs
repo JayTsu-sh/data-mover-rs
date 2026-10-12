@@ -5,9 +5,7 @@
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use data_mover::dir_tree::NdxEvent;
 use data_mover::model::{EntryKind, StoragePath};
-use data_mover::ndx_walk::{NdxWalkRequest, ndx_walk};
 use data_mover::storage::{
     BackendConfig, DeleteTreeCompletion, DeleteTreeOutcome, DeleteTreeRequest, LocalBackendConfig,
     Storage, connect_backend, create_directory_all, delete_tree,
@@ -115,36 +113,26 @@ async fn traversal_lists_the_whole_tree_through_the_namespace_role() -> Result {
 }
 
 #[tokio::test]
-async fn ndx_walk_pages_local_entries_with_their_modification_times() -> Result {
+async fn traversal_retains_local_modification_times() -> Result {
     let temp = tempfile::tempdir()?;
     seed(temp.path())?;
     let storage = connect(temp.path()).await?;
-    let walk = ndx_walk(
-        &storage,
-        NdxWalkRequest {
-            root: path("tree")?,
-            max_depth: None,
-            match_expressions: None,
-            exclude_expressions: None,
-            concurrency: nonzero(2)?,
-            cancel: CancellationToken::new(),
-        },
-    )?;
+    let mut session = StorageTraversalSource::new(&storage)?
+        .traverse(TraversalRequest::new(path("tree")?).max_inflight_operations(nonzero(2)?));
     let mut entries = 0;
-    while let Some(event) = walk.next().await {
-        match event {
-            NdxEvent::Page(page) => {
-                for entry in page.files.iter().chain(page.subdirs.iter()) {
-                    assert!(entry.entry.modified().is_some());
-                    entries += 1;
-                }
+    while let Some(item) = session.next_item().await {
+        match item {
+            TraversalItem::Entry(entry) => {
+                assert!(entry.modified().is_some());
+                entries += 1;
             }
-            NdxEvent::Error { path, reason } => {
-                return Err(format!("unexpected error at {path}: {reason}").into());
-            }
-            NdxEvent::Done => break,
+            other => return Err(format!("unexpected traversal item: {other:?}").into()),
         }
     }
+    assert!(matches!(
+        session.finish().await?,
+        TraversalOutcome::Completed(_)
+    ));
     assert_eq!(entries, 5);
     Ok(())
 }

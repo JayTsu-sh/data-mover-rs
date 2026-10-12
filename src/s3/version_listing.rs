@@ -11,8 +11,7 @@
 //! `storage::backends::s3::history`, which the role-based traversal uses too.
 //!
 //! A key whose newest entry is a delete marker is listed too (ADR-0006 D4): `walkdir` sends every
-//! version and marker, the marker last and latest; `walkdir_2`, which lists versions only, sends
-//! its versions with none latest ([`versions_with_latest`]).
+//! version and marker, the marker last and latest.
 //!
 //! The key a page ended in is its greatest key, not `NextKeyMarker`: `MinIO` answers that with a
 //! continuation token of its own (`p/z[minio_cache:v2,return:]` for the key `p/z`, measured on
@@ -193,26 +192,6 @@ pub(super) fn oldest_first_by_key(
                 .collect(),
         })
         .collect()
-}
-
-/// The versions of one key's entries (oldest first, as [`oldest_first_by_key`] gives them), each
-/// with whether it is the key's latest entry: the newest version is, unless a delete marker was
-/// written after it — then none is, and the key has no current object.
-pub(super) fn versions_with_latest(
-    entries: Vec<VersionOrDeleteMarker>,
-) -> Vec<(ObjectVersion, bool)> {
-    let deleted = matches!(entries.last(), Some(VersionOrDeleteMarker::DeleteMarker(_)));
-    let mut versions: Vec<_> = entries
-        .into_iter()
-        .filter_map(|entry| match entry {
-            VersionOrDeleteMarker::Version(version) => Some((version, false)),
-            VersionOrDeleteMarker::DeleteMarker(_) => None,
-        })
-        .collect();
-    if !deleted && let Some(newest) = versions.last_mut() {
-        newest.1 = true;
-    }
-    versions
 }
 
 #[cfg(test)]

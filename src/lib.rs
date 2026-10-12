@@ -21,7 +21,6 @@ pub use async_receiver::AsyncReceiver;
 pub mod acl;
 pub mod checksum;
 pub mod cifs;
-pub mod dir_tree;
 pub mod error;
 pub use error::{HdfsErrorKind, HdfsOperationError};
 pub mod filter;
@@ -34,7 +33,6 @@ mod hdfs_transfer_integrity;
 mod hdfs_transfer_mapping;
 pub mod integrity_check;
 pub mod local;
-pub mod ndx_walk;
 pub mod nfs;
 mod pipeline_primitives;
 pub mod qos;
@@ -163,9 +161,6 @@ impl<T> AssertTestValue for Option<T> {
         }
     }
 }
-
-/// `walkdir_2` 输出的异步迭代器类型
-pub type WalkDirAsyncIterator2 = AsyncReceiver<dir_tree::NdxEvent>;
 
 /// 常量定义
 pub const KB: u64 = 1024;

@@ -10,9 +10,8 @@ use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::{DeleteMarkerEntry, ObjectVersion};
 
 use super::tests::make_test_storage;
-use super::version_listing::{ListedEntry, VersionOrDeleteMarker, oldest_first_by_key};
+use super::version_listing::{ListedEntry, VersionOrDeleteMarker};
 use super::{S3Storage, VersionedScan};
-use crate::dir_tree::ReadContext;
 use crate::filter::{FilterExpression, parse_filter_expression};
 use crate::{EntryEnum, StorageEntryMessage};
 
@@ -166,40 +165,5 @@ async fn walkdir_filters_markers_by_path_but_not_by_size() -> TestResult {
     assert_eq!(rows(&sent, "gone"), [row("gm", true, true, 3)]);
     assert_eq!(rows(&sent, "k"), [row("km", false, true, 3)]);
     assert!(rows(&sent, "live").is_empty());
-    Ok(())
-}
-
-/// `walkdir_2`: versions only; a deleted key's versions are listed with none latest.
-#[tokio::test]
-async fn walkdir_2_lists_a_deleted_keys_versions_with_none_latest() -> TestResult {
-    let storage = make_test_storage(None);
-    let ctx = ReadContext {
-        match_expr: Arc::new(None),
-        exclude_expr: Arc::new(None),
-        current_depth: 0,
-        max_depth: 0,
-        apply_filter: true,
-        include_tags: false,
-        is_versioned: true,
-    };
-    let mut files = Vec::new();
-    for history in oldest_first_by_key(page()) {
-        storage
-            .append_object_versions(history, &ctx, &mut files)
-            .await;
-    }
-    assert_eq!(
-        rows(&files, "gone"),
-        [row("g1", false, false, 2), row("g2", false, false, 2)]
-    );
-    assert_eq!(
-        rows(&files, "k"),
-        [row("k1", false, false, 2), row("k2", true, false, 2)]
-    );
-    assert_eq!(
-        rows(&files, "live"),
-        [row("l1", false, false, 2), row("l2", true, false, 2)]
-    );
-    assert_eq!(files.len(), 6);
     Ok(())
 }

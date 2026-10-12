@@ -245,48 +245,6 @@ async fn a_key_straddling_every_page_keeps_the_servers_order() -> TestResult {
     Ok(())
 }
 
-/// Legacy `walkdir_2` (`read_dir_sorted`): the key's versions in write order (markers are not
-/// listed), the newest not latest because a delete marker is newer.
-#[tokio::test]
-async fn the_legacy_listing_orders_concurrent_writes_as_the_server_did() -> TestResult {
-    let storage = replay_storage(pages());
-    let ctx = crate::dir_tree::ReadContext {
-        match_expr: Arc::new(None),
-        exclude_expr: Arc::new(None),
-        current_depth: 0,
-        max_depth: 0,
-        apply_filter: true,
-        include_tags: false,
-        is_versioned: true,
-    };
-    let handle = crate::dir_tree::DirHandle::S3Prefix(String::new());
-    let read = storage.read_dir_sorted("", &handle, &ctx).await?;
-    assert!(read.errors.is_empty(), "{:?}", read.errors);
-    let versions: Vec<String> = read
-        .files
-        .iter()
-        .map(|file| file.get_version_id().unwrap_or_default().to_string())
-        .collect();
-    let markers = FULL
-        .split("<DeleteMarker>")
-        .skip(1)
-        .filter_map(|rest| rest.split("<VersionId>").nth(1))
-        .filter_map(|rest| rest.split_once("</VersionId>"))
-        .map(|(id, _)| id.to_string())
-        .collect::<Vec<_>>();
-    let expected: Vec<String> = written_order()
-        .into_iter()
-        .filter(|id| !markers.contains(id))
-        .collect();
-    assert_eq!(versions, expected);
-    assert!(read.files.iter().all(|file| !file.get_is_latest()));
-    assert!(read.files.iter().all(|file| match file.as_ref() {
-        crate::EntryEnum::S3(entry) => !entry.version_order_inferred,
-        _ => false,
-    }));
-    Ok(())
-}
-
 /// The protocol page of the role listing carries the positions too.
 #[tokio::test]
 async fn a_role_protocol_page_carries_positions() -> TestResult {

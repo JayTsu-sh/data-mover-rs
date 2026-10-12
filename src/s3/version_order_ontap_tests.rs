@@ -44,7 +44,6 @@ use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 
 use super::*;
-use crate::dir_tree::{DirHandle, ReadContext, ReadResult};
 use crate::model::{EntryKind, FailureClass, StoragePath, Transience};
 use crate::s3::S3Storage;
 use crate::s3::tests::make_test_storage;
@@ -234,10 +233,6 @@ impl Truth {
         }
         truth
     }
-
-    fn versions(&self) -> BTreeSet<(String, String)> {
-        self.entries.difference(&self.markers).cloned().collect()
-    }
 }
 
 fn unique<T: Ord + Clone + Debug>(listed: &[T], what: &str) -> BTreeSet<T> {
@@ -298,57 +293,6 @@ async fn the_role_listing_lists_every_version_and_each_prefix_once() -> TestResu
     let asked = replay.asked();
     assert!(asked.iter().all(|(_, key, id)| key != &z || !id.is_empty()));
     assert_eq!(asked.len(), 4, "{asked:?}");
-    Ok(())
-}
-
-fn read_context() -> ReadContext {
-    ReadContext {
-        match_expr: Arc::new(None),
-        exclude_expr: Arc::new(None),
-        current_depth: 0,
-        max_depth: 0,
-        apply_filter: true,
-        include_tags: false,
-        is_versioned: true,
-    }
-}
-
-/// Legacy `walkdir_2` (`read_dir_sorted`) of `<prefix>` over `replay`.
-async fn paged(replay: &MarkerReplay, prefix: &str) -> TestResult<ReadResult> {
-    let handle = DirHandle::S3Prefix(prefix.to_string());
-    Ok(storage(replay)
-        .read_dir_sorted(prefix, &handle, &read_context())
-        .await?)
-}
-
-fn named_files(read: &ReadResult) -> Vec<(String, String)> {
-    read.files
-        .iter()
-        .map(|file| {
-            (
-                file.get_relative_path().to_string_lossy().to_string(),
-                file.get_version_id().unwrap_or_default().to_string(),
-            )
-        })
-        .collect()
-}
-
-/// Legacy `walkdir_2` (`read_dir_sorted`): every version (it lists no delete markers), each
-/// subdirectory once.
-#[tokio::test]
-async fn the_legacy_paged_listing_lists_every_version_and_each_prefix_once() -> TestResult {
-    for (fixture, dir) in FIXTURES {
-        let read = paged(&MarkerReplay::new(fixture), &format!("{ROOT}{dir}/")).await?;
-        assert!(read.errors.is_empty(), "{:?}", read.errors);
-        let subdirs: Vec<String> = read
-            .subdirs
-            .iter()
-            .map(|sub| format!("{}/", sub.entry.get_relative_path().to_string_lossy()))
-            .collect();
-        let truth = Truth::of(fixture);
-        assert_eq!(unique(&named_files(&read), "version"), truth.versions());
-        assert_eq!(unique(&subdirs, "directory"), truth.prefixes, "{dir}");
-    }
     Ok(())
 }
 
@@ -427,9 +371,6 @@ async fn an_unknown_resume_point_is_reported_not_guessed() -> TestResult {
     assert_eq!(failure.path().as_str(), format!("{ROOT}g"));
 
     let complete = [(format!("{ROOT}g/a"), "a1".to_string())];
-    let read = paged(&MarkerReplay::new(GROUPED), &format!("{ROOT}g/")).await?;
-    assert_eq!(read.errors, [UnknownResumePoint::DIAGNOSTIC]);
-    assert_eq!(named_files(&read), complete);
 
     let (files, _, errors) = walked(&MarkerReplay::new(GROUPED), &format!("{ROOT}g")).await?;
     assert_eq!(errors, [UnknownResumePoint::DIAGNOSTIC]);
@@ -506,13 +447,6 @@ async fn no_listing_sends_an_empty_or_unpaired_version_marker() -> TestResult {
         (files, directories),
         (both.to_vec(), vec![format!("{ROOT}s/x/")])
     );
-    let read = paged(
-        &MarkerReplay::new(EMPTY_VERSION_MARKER),
-        &format!("{ROOT}s/"),
-    )
-    .await?;
-    assert!(read.errors.is_empty(), "{:?}", read.errors);
-    assert_eq!(named_files(&read), both);
     let (files, _, errors) = walked(
         &MarkerReplay::new(EMPTY_VERSION_MARKER),
         &format!("{ROOT}s"),

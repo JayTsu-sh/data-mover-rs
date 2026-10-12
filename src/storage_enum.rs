@@ -7,7 +7,6 @@ use tokio::sync::mpsc;
 
 use crate::checksum::HashCalculator;
 use crate::error::StorageError;
-use crate::filter::FilterExpression;
 use crate::hdfs::HDFSStorage;
 use crate::local::LocalStorage;
 use crate::nfs::NFSStorage;
@@ -20,7 +19,7 @@ pub use crate::storage_options::{
 pub use crate::stream_handle::StreamHandle;
 use crate::{
     CommitCallback, DataChunk, DeleteDirIterator, EntryEnum, Result, ResumeContext,
-    TransferConcurrency, WalkDirAsyncIterator, WalkDirAsyncIterator2,
+    TransferConcurrency, WalkDirAsyncIterator,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -312,59 +311,6 @@ impl StorageEnum {
                 s.walkdir(key.as_deref(), options)
             }
             StorageEnum::HDFS(storage) => storage.walkdir(sub_path, options),
-        }
-    }
-
-    /// `walkdir_2`: 目录分页遍历，DFS 顺序分配 NDX，页级输出
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the requested storage operation cannot be completed.
-    pub async fn walkdir_2(
-        &self,
-        sub_path: Option<&Path>,
-        depth: Option<usize>,
-        match_expressions: Option<FilterExpression>,
-        exclude_expressions: Option<FilterExpression>,
-        concurrency: usize,
-        include_tags: bool,
-    ) -> Result<WalkDirAsyncIterator2> {
-        match self {
-            StorageEnum::Local(s) => s.walkdir_2(
-                sub_path,
-                depth,
-                match_expressions,
-                exclude_expressions,
-                concurrency,
-            ),
-            StorageEnum::NFS(s) => {
-                s.walkdir_2(
-                    sub_path,
-                    depth,
-                    match_expressions,
-                    exclude_expressions,
-                    concurrency,
-                )
-                .await
-            }
-            StorageEnum::S3(s) => {
-                let key = sub_path.map(|p| path_to_s3_key(p));
-                s.walkdir_2(
-                    key.as_deref(),
-                    depth,
-                    match_expressions,
-                    exclude_expressions,
-                    concurrency,
-                    include_tags,
-                )
-            }
-            StorageEnum::HDFS(storage) => storage.walkdir_2(
-                sub_path,
-                depth,
-                match_expressions,
-                exclude_expressions,
-                concurrency,
-            ),
         }
     }
 

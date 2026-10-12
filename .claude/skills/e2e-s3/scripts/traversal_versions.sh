@@ -3,8 +3,8 @@
 # (examples/storage_role_operations/traverse.rs): on a versioned bucket each key is ONE entry with
 # its history (`File <key> history=<segment>/<complete> records=<n>[ order=inferred]`, then one
 # `Record <key> <segment>.<n> version=<id|null> latest=<0|1> marker=<0|1> size=<n|->` line per
-# version and delete marker), and `--current` prints the current objects only; plus the legacy
-# walkdir / walkdir_2 (examples/s3_listing.rs). Three ways to pick the bucket:
+# version and delete marker), and `--current` prints the current objects only.
+# Three ways to pick the bucket:
 #
 # - Default: creates ONE temporary bucket on the .env's server, <BUCKET_PREFIX>-<run> (versioning
 #   enabled), and on exit deletes it completely: every version and delete marker by id, every open
@@ -28,18 +28,15 @@
 # suspended, n written twice (one "null" version).
 #
 # The zero-byte d/ is a directory object (P7 F5, D8): one zero-byte file entry d/ of d (--current),
-# one record of size 0 (histories); the legacy walks still skip it (only a d/ holding content is
-# reported).
+# one record of size 0 (histories).
 #
 # Checks (versioned): k and gone are ONE entry each; k's records are 2, 3, marker, 4 with only the
 # last latest; gone (deleted now, still listed) a version and a latest marker; p/z one entry of
 # three records 1, 2, 3 across the first 1 000-entry page; n version=null latest=1; no artifact;
 # --current lists k (4 B) without gone and no Record line; --order blocks gives the same lines at
-# concurrency 1, 4 and 32; Unordered the same entries and records, each key once. Legacy
-# walkdir / walkdir_2 (versioning re-enabled first: a suspended bucket is walked by ListObjectsV2):
-# k as v1, v2, marker, v3 (ids as written), gone as its version then a latest marker (D4), p/z
-# whole across the page, no artifact. Unversioned: Current and the legacy walks list each key once
-# (k 4 B, p/z 3 B, no gone, no artifact, 999 p/a*); blocks identical at 1, 4, 32.
+# concurrency 1, 4 and 32; Unordered the same entries and records, each key once.
+# Unversioned: each key once (k 4 B, p/z 3 B, no gone, no artifact, 999 p/a*);
+# blocks identical at 1, 4, 32.
 #
 # EXPECT_DIR_MARKER (default 1): how many current entries the zero-byte d/ gives (P7 F5); 0 for a
 # store that keeps no such object.
@@ -201,7 +198,7 @@ versioning() {
   s3c -o /dev/null -w "versioning $1: %{http_code}\n" -X PUT "$H/$VB?versioning" --data-binary @"$WORK/v.xml"
 }
 
-build=$(cargo build -q --example storage_role_operations --example s3_listing 2>&1) || { echo "$build" >&2; exit 1; }
+build=$(cargo build -q --example storage_role_operations 2>&1) || { echo "$build" >&2; exit 1; }
 if [ "$MODE" = temporary ]; then
   LOCATION=()
   [ -n "${S3_LOCATION:-}" ] && LOCATION=(--data-binary "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>$S3_LOCATION</LocationConstraint></CreateBucketConfiguration>")
@@ -372,70 +369,4 @@ print("%-24s entries=%d distinct keys=%s keys with a /=%d CommonPrefixes=%s trun
     root.findtext(ns + "IsTruncated"), "honoured" if prefixes and not deep else "IGNORED"))' "$q" "$P"
 done
 
-echo "-- legacy walkdir / walkdir_2"
-# A suspended bucket is walked by ListObjectsV2: the temporary one is re-enabled first.
-[ "$MODE" = temporary ] && versioning Enabled
-LEG=target/debug/examples/s3_listing
-"$LEG" >"$WORK/walk" 2>"$WORK/walk.err" || { echo "walkdir failed:"; tail -5 "$WORK/walk.err"; FAILED=1; }
-"$LEG" --walkdir-2 >"$WORK/walk2" 2>"$WORK/walk2.err" || { echo "walkdir_2 failed:"; tail -5 "$WORK/walk2.err"; FAILED=1; }
-echo "walkdir (without p/a*):"; grep -v ' p/a' "$WORK/walk" | sed 's/^/   /'
-echo "walkdir_2 (without p/a*):"; grep -v ' p/a' "$WORK/walk2" | sed 's/^/   /'
-python3 - "$WORK/walk" "$WORK/walk2" "$WORK/ids" "$MODE" "$EXPECT_ORDER" <<'PY2' || FAILED=1
-import re, sys
-mode, expect = sys.argv[4], sys.argv[5]
-def rows(path, kind):
-    out, orders = {}, {}
-    for line in open(path):
-        m = re.match(kind + r" (\S+) (\S+) latest=(\d) marker=(\d) count=(\S+)(?: order=(\S+))?$", line.strip())
-        if m:
-            out.setdefault(m.group(1), []).append(m.groups()[1:5])
-            orders.setdefault(m.group(1), []).append(m.group(6) or "server")
-    return out, orders
-w, wo = rows(sys.argv[1], "ENTRY")
-w2, w2o = rows(sys.argv[2], "FILE")
-checks = {
-    "walkdir p/a count": (sum(1 for p in w if p.startswith("p/a")), 999),
-    "walkdir_2 p/a count": (sum(1 for p in w2 if p.startswith("p/a")), 999),
-    "legacy no artifacts": (sum(".data-mover" in l for f in sys.argv[1:3] for l in open(f)), 0),
-    "legacy no errors": (sum(l.startswith(("ERROR", "TIMEOUT")) for f in sys.argv[1:3] for l in open(f)), 0),
-}
-if mode == "unversioned":
-    checks.update({
-        "legacy order": (sorted({o for rows in (wo, w2o) for v in rows.values() for o in v}), ["server"]),
-        "walkdir keys once": ({k: len(v) for k, v in w.items() if k in ("k", "gone", "p/z", "n", "d/e", "sub/deep/f")},
-                              {"k": 1, "p/z": 1, "n": 1, "d/e": 1, "sub/deep/f": 1}),
-        "walkdir_2 keys once": ({k: len(v) for k, v in w2.items() if k in ("k", "gone", "p/z", "n", "d/e", "sub/deep/f")},
-                                {"k": 1, "p/z": 1, "n": 1, "d/e": 1, "sub/deep/f": 1}),
-    })
-else:
-    ids = {}
-    for line in open(sys.argv[3]):
-        k, _, v = line.rstrip("\n").partition("\t")
-        ids.setdefault(k, []).append(v)
-    k, g, z = ids["k"], ids["gone"], ids["p/z"]
-    def order(o, name):
-        want = expect if name in ("k", "gone") else "server"
-        return (o.get(name), [want] * len(o.get(name, [])))
-    checks.update({
-        "walkdir k": (w.get("k"), [(k[0], "0", "0", "4"), (k[1], "0", "0", "4"), (k[2], "0", "1", "4"), (k[3], "1", "0", "4")]),
-        "walkdir gone (D4)": (w.get("gone"), [(g[0], "0", "0", "2"), (g[1], "1", "1", "2")]),
-        "walkdir p/z": (w.get("p/z"), [(z[0], "0", "0", "3"), (z[1], "0", "0", "3"), (z[2], "1", "0", "3")]),
-        "walkdir n": ([r[1:] for r in w.get("n", [])], [("1", "0", "1")]),
-        "walkdir_2 k": (w2.get("k"), [(k[0], "0", "0", "3"), (k[1], "0", "0", "3"), (k[3], "1", "0", "3")]),
-        "walkdir_2 gone (D4)": (w2.get("gone"), [(g[0], "0", "0", "1")]),
-        "walkdir_2 p/z": (w2.get("p/z"), [(z[0], "0", "0", "3"), (z[1], "0", "0", "3"), (z[2], "1", "0", "3")]),
-        "walkdir order k": order(wo, "k"),
-        "walkdir order gone": order(wo, "gone"),
-        "walkdir order p/z": order(wo, "p/z"),
-        "walkdir_2 order k": order(w2o, "k"),
-        "walkdir_2 order gone": order(w2o, "gone"),
-        "walkdir_2 order p/z": order(w2o, "p/z"),
-    })
-bad = 0
-for name, (got, want) in checks.items():
-    ok = got == want
-    bad += not ok
-    print("%-20s %s%s" % (name, "ok" if ok else "FAIL", "" if ok else " got=%r want=%r" % (got, want)))
-sys.exit(1 if bad else 0)
-PY2
 [ "$FAILED" = 0 ] && echo "RESULT: pass" || echo "RESULT: FAIL"

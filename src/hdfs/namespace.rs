@@ -231,9 +231,7 @@ impl HDFSStorage {
             self.client
                 .set_times(&path, mtime, atime)
                 .await
-                .map_err(|error| {
-                    hdfs_operation_error("set times", Some(relative_path), &error)
-                })?;
+                .map_err(|error| hdfs_operation_error("set times", Some(relative_path), &error))?;
         }
         if let Some(mode) = mode {
             self.set_permission(relative_path, mode & 0o7777).await?;
@@ -454,86 +452,6 @@ impl HDFSStorage {
             }
         });
         Ok(crate::AsyncReceiver::new(receiver))
-    }
-
-    /// Read and sort one HDFS directory for the shared `walkdir_2` DFS driver.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a non-HDFS handle or when the directory cannot be
-    /// listed safely inside the configured root.
-    pub async fn read_dir_sorted(
-        &self,
-        dir_path: &str,
-        handle: &crate::dir_tree::DirHandle,
-        ctx: &crate::dir_tree::ReadContext,
-    ) -> Result<crate::dir_tree::ReadResult, StorageError> {
-        let crate::dir_tree::DirHandle::Hdfs(relative_path) = handle else {
-            return Err(StorageError::MismatchedType);
-        };
-        let entries = self.list_visible(relative_path).await?;
-        Ok(hdfs_read_result(dir_path, entries, ctx))
-    }
-
-    /// Run HDFS directory paging through the shared deterministic DFS driver.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the subpath escapes the configured root or reader
-    /// concurrency is outside the validated `1..=16` range.
-    pub fn walkdir_2(
-        &self,
-        sub_path: Option<&std::path::Path>,
-        depth: Option<usize>,
-        match_expressions: Option<crate::FilterExpression>,
-        exclude_expressions: Option<crate::FilterExpression>,
-        concurrency: usize,
-    ) -> Result<crate::WalkDirAsyncIterator2, StorageError> {
-        use crate::dir_tree::{DirHandle, ReadContext, ReadRequest, run_dfs_driver};
-
-        if !(1..=crate::TransferConcurrency::MAX).contains(&concurrency) {
-            return Err(config_error(&format!(
-                "HDFS walkdir_2 concurrency must be between 1 and {}, got {concurrency}",
-                crate::TransferConcurrency::MAX
-            )));
-        }
-        let start_path = sub_path.unwrap_or_else(|| std::path::Path::new(""));
-        self.resolve_path(start_path)?;
-        let start_path = start_path.to_path_buf();
-        let (request_sender, request_receiver) =
-            async_channel::bounded::<ReadRequest>(concurrency * 2);
-        let (output_sender, output_receiver) = async_channel::bounded(64);
-
-        for _ in 0..concurrency {
-            let storage = self.clone();
-            let receiver = request_receiver.clone();
-            tokio::spawn(async move {
-                while let Ok(request) = receiver.recv().await {
-                    let result = storage
-                        .read_dir_sorted(&request.dir_path, &request.handle, &request.ctx)
-                        .await;
-                    let _ = request.reply.send(result);
-                }
-            });
-        }
-
-        let context = ReadContext {
-            match_expr: Arc::new(match_expressions),
-            exclude_expr: Arc::new(exclude_expressions),
-            current_depth: 0,
-            max_depth: depth.unwrap_or(0),
-            apply_filter: true,
-            include_tags: false,
-            is_versioned: false,
-        };
-        tokio::spawn(run_dfs_driver(
-            request_sender,
-            output_sender,
-            PathBuf::new(),
-            DirHandle::Hdfs(start_path),
-            context,
-        ));
-        Ok(crate::AsyncReceiver::new(output_receiver))
     }
 
     /// Recursively create a directory below the configured HDFS root.

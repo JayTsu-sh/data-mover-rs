@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # P7 F5: S3 "directory objects" — keys ending in '/' (with or without content) — against a real
-# server: the role-based traversal lists each as a file entry of its own directory, the legacy
-# walks report the ones with content, S3→S3 copies recreate them by ONE request whatever their size
+# server: the role-based traversal lists each as a file entry of its own directory, and
+# S3→S3 copies recreate them by ONE request whatever their size
 # (P7 D13: one PUT, or one CopyObject natively; never multipart, never resumed), and S3→Local
 # refuses them at Preflight.
 #
@@ -26,8 +26,6 @@
 #   emit dirobj/; --path emptydir reports and emits nothing of emptydir/.
 # - Histories (versioned): each own object one entry; dirobj/ one 5 B version; z/ 0 B, marker, 0 B;
 #   m/ 5 B, 0 B, marker, 3 B, marker (latest last), listed although deleted now.
-# - Legacy walkdir / walkdir_2: an ERROR naming each own object that holds content (dirobj/,
-#   lonely/, big/, and m/ in a versioned bucket), none for the zero-byte ones.
 # - Copies (transfer_resume, same bucket): dirobj/ and emptydir/ streamed (single PUT), dirobj/
 #   native; D13 — every write of a directory object is one request (its ETag has no -<parts>), a
 #   real file at the same key without the '/' (copy/mid, copy/big, native/big) is never touched
@@ -232,7 +230,7 @@ versioning() {
   s3c -o /dev/null -w "versioning $1: %{http_code}\n" -X PUT "$H/$VB?versioning" --data-binary @"$WORK/v.xml"
 }
 
-build=$(cargo build -q --example storage_role_operations --example s3_listing --example transfer_resume --example s3_history_replay 2>&1) || { echo "$build" >&2; exit 1; }
+build=$(cargo build -q --example storage_role_operations --example transfer_resume --example s3_history_replay 2>&1) || { echo "$build" >&2; exit 1; }
 if [ "$MODE" = temporary ]; then
   BODY=(-H 'Content-Length: 0')
   [ -n "${S3_LOCATION:-}" ] && BODY=(--data-binary "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>$S3_LOCATION</LocationConstraint></CreateBucketConfiguration>")
@@ -262,7 +260,6 @@ S3_LISTING_URL=$(s3_url "$VB" "$P") || exit 2
 export S3_LISTING_URL
 export S3_BUCKET=$VB
 ROLE=target/debug/examples/storage_role_operations
-LEG=target/debug/examples/s3_listing
 TR=target/debug/examples/transfer_resume
 traverse() { # stdout file, args...
   "$ROLE" --backend s3 --concurrency 8 traverse "${@:2}" >"$1" 2>"$1.err" \
@@ -417,16 +414,6 @@ if [ "$VERSIONED" = 1 ]; then
   fi
   check "all totals balanced, no failure" "$(grep -c '^totals balanced=true' "$WORK/all") $(grep -c '^failure' "$WORK/all.err")" "1 0"
 fi
-
-echo "== legacy walkdir / walkdir_2"
-"$LEG" >"$WORK/walk" 2>"$WORK/walk.err"; "$LEG" --walkdir-2 >"$WORK/walk2" 2>"$WORK/walk2.err"
-reported() { grep '^ERROR' "$1" | grep -oE 'S3 directory object \S+ holds [0-9]+ bytes' | awk '{print $4"="$6}' | sort | tr '\n' ' '; }
-want="big/=$BIG dirobj/=5 lonely/=6 "
-[ "$DIR_VERSIONED" = 1 ] && want="big/=$BIG dirobj/=5 lonely/=6 m/=5 "
-check "walkdir reports own objects with content" "$(reported "$WORK/walk")" "$want"
-check "walkdir_2 reports own objects with content" "$(reported "$WORK/walk2")" "$want"
-check "legacy: no entry at a key ending in /" "$(grep -cE '^(ENTRY|FILE) \S+/ ' "$WORK/walk" "$WORK/walk2" | awk -F: '{s+=$2} END {print s}')" 0
-check "legacy: other errors" "$(grep '^ERROR' "$WORK/walk" "$WORK/walk2" | grep -vc 'S3 directory object')" 0
 
 echo "== copies"
 copy() { # label, want result, transfer_resume args...

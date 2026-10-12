@@ -26,13 +26,10 @@ use std::path::{Path, PathBuf};
 use std::pin::pin;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use data_mover::dir_tree::{NdxEntry, NdxEvent};
-use data_mover::filter::parse_filter_expression;
 use data_mover::integrity::{
     IntegrityMode, IntegrityOptions, IntegrityRequest, compare as compare_objects,
 };
-use data_mover::model::{BackendKind, ObservedEntry, StoragePath, StorageTimestamp};
-use data_mover::ndx_walk::{NdxWalkRequest, ndx_walk};
+use data_mover::model::{BackendKind, StoragePath};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, DeleteTreeItem,
     DeleteTreeRequest, LocalBackendConfig, NfsBackendConfig, S3BackendConfig, Storage,
@@ -164,21 +161,6 @@ enum Command {
         #[arg(long)]
         cancel_after_secs: Option<f64>,
     },
-    /// Stream an NDX-paged depth-first traversal, printing one line per page.
-    NdxWalk {
-        #[arg(long = "match")]
-        match_expression: Option<String>,
-        #[arg(long = "exclude")]
-        exclude_expression: Option<String>,
-        #[arg(long)]
-        max_depth: Option<usize>,
-        /// Sub-path to start from, relative to the backend root.
-        #[arg(long, default_value = "")]
-        path: String,
-        /// Also print every entry with its NDX and mode.
-        #[arg(long)]
-        entries: bool,
-    },
     /// Write a small fixture tree under the root, so the other subcommands have something
     /// to work on. Each file is transferred from a local temporary directory, `--concurrency`
     /// transfers at a time.
@@ -259,78 +241,6 @@ async fn connect(backend: Backend, root: &str, depth: usize) -> Result<Storage, 
         }
     };
     Ok(connect_backend(config).await?)
-}
-
-async fn ndx_walk_pages(storage: &Storage, args: &Args, command: &Command) -> Result<(), Error> {
-    let Command::NdxWalk {
-        match_expression,
-        exclude_expression,
-        max_depth,
-        path,
-        entries: print_entries,
-    } = command
-    else {
-        unreachable!("dispatched by the caller")
-    };
-    let walk = ndx_walk(
-        storage,
-        NdxWalkRequest {
-            root: StoragePath::new(path.clone())?,
-            max_depth: max_depth.and_then(NonZeroUsize::new),
-            match_expressions: match_expression
-                .as_deref()
-                .map(parse_filter_expression)
-                .transpose()?,
-            exclude_expressions: exclude_expression
-                .as_deref()
-                .map(parse_filter_expression)
-                .transpose()?,
-            concurrency: NonZeroUsize::new(args.concurrency)
-                .ok_or("concurrency must be non-zero")?,
-            cancel: CancellationToken::new(),
-        },
-    )?;
-    let (mut pages, mut counted, mut failures) = (0_u64, 0_u64, 0_u64);
-    while let Some(event) = walk.next().await {
-        match event {
-            NdxEvent::Page(page) => {
-                pages += 1;
-                counted += page.files.len() as u64 + page.subdirs.len() as u64;
-                println!(
-                    "page dir='{}' ndx_start={} files={} subdirs={} gap={}",
-                    page.dir_path,
-                    page.ndx_start,
-                    page.files.len(),
-                    page.subdirs.len(),
-                    page.gap_ndx
-                );
-                if *print_entries {
-                    for entry in page.files.iter().chain(page.subdirs.iter()) {
-                        print_ndx_entry(entry);
-                    }
-                }
-            }
-            NdxEvent::Error { path, reason } => {
-                failures += 1;
-                eprintln!("page error {path}: {reason}");
-            }
-            NdxEvent::Done => break,
-        }
-    }
-    println!("pages={pages} entries={counted} errors={failures}");
-    Ok(())
-}
-
-fn print_ndx_entry(entry: &NdxEntry<ObservedEntry>) {
-    println!(
-        "  ndx={} {} kind={:?} size={:?} modified={:?} identity={:?}",
-        entry.ndx,
-        entry.entry.path(),
-        entry.entry.kind(),
-        entry.entry.size(),
-        entry.entry.modified().map(StorageTimestamp::unix_nanos),
-        entry.entry.source_identity().strength()
-    );
 }
 
 async fn seed(storage: &Storage, args: &Args, command: &Command) -> Result<(), Error> {
@@ -537,7 +447,6 @@ async fn main() -> Result<(), Error> {
     match &args.command {
         Command::Seed { .. } => seed(&storage, &args, &args.command).await,
         Command::Traverse { .. } => traverse(&storage, &args, &args.command).await,
-        Command::NdxWalk { .. } => ndx_walk_pages(&storage, &args, &args.command).await,
         Command::CreateDir { .. } => make_directory(&storage, &args.command).await,
         Command::DeleteTree { .. } => remove_tree(&storage, &args, &args.command).await,
         Command::Compare { .. } => compare(storage, &args, &args.command).await,

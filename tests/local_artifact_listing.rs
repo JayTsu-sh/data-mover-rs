@@ -1,14 +1,12 @@
 //! ADR-0006 C3b on a real Local tree: every listing hides `.data-mover-*` transfer artifacts —
-//! legacy `walkdir` / `walkdir_2`, role traversal and `ndx_walk` — and every directory delete still
+//! legacy `walkdir` and role traversal — and every directory delete still
 //! removes them.
 
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use data_mover::dir_tree::NdxEvent;
 use data_mover::filter::parse_filter_expression;
 use data_mover::model::{FailureClass, StoragePath};
-use data_mover::ndx_walk::{NdxWalkRequest, ndx_walk};
 use data_mover::storage::{
     BackendConfig, DeleteTreeRequest, LocalBackendConfig, PreflightPolicy, Storage,
     StorageRoleFailure, connect_backend, delete_tree,
@@ -95,52 +93,8 @@ async fn legacy_walkdir_hides_artifacts_even_under_a_descending_match() -> TestR
     Ok(())
 }
 
-async fn walkdir_2_numbering(root: &Path) -> TestResult<Vec<(String, i32)>> {
-    let walk = legacy(root)
-        .await?
-        .walkdir_2(None, None, None, None, 2, false)
-        .await?;
-    let mut numbered = Vec::new();
-    while let Some(event) = walk.next().await {
-        match event {
-            NdxEvent::Page(page) => {
-                for entry in page.files.iter().chain(page.subdirs.iter()) {
-                    let path = entry
-                        .entry
-                        .get_relative_path()
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    numbered.push((path, entry.ndx));
-                }
-            }
-            NdxEvent::Error { path, reason } => return Err(format!("{path}: {reason}").into()),
-            NdxEvent::Done => break,
-        }
-    }
-    numbered.sort();
-    Ok(numbered)
-}
-
-/// Hidden entries spend no NDX number: the tree numbers exactly as the same tree without them.
 #[tokio::test]
-async fn legacy_walkdir_2_hides_artifacts_and_numbers_as_without_them() -> TestResult {
-    let root = fixture()?;
-    let clean = tempfile::tempdir()?;
-    std::fs::create_dir(clean.path().join("sub"))?;
-    std::fs::write(clean.path().join("a.txt"), b"x")?;
-    std::fs::write(clean.path().join("sub/b.txt"), b"x")?;
-    let numbered = walkdir_2_numbering(root.path()).await?;
-    let paths = numbered
-        .iter()
-        .map(|(path, _)| path.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(paths, VISIBLE);
-    assert_eq!(numbered, walkdir_2_numbering(clean.path()).await?);
-    Ok(())
-}
-
-#[tokio::test]
-async fn role_traversal_and_ndx_walk_hide_artifacts() -> TestResult {
+async fn role_traversal_hides_artifacts() -> TestResult {
     let root = fixture()?;
     let storage = roles(root.path()).await?;
     let slots = NonZeroUsize::new(2).ok_or("non-zero")?;
@@ -159,32 +113,6 @@ async fn role_traversal_and_ndx_walk_hide_artifacts() -> TestResult {
     traversed.sort();
     assert_eq!(traversed, VISIBLE);
 
-    let walk = ndx_walk(
-        &storage,
-        NdxWalkRequest {
-            root: StoragePath::root(),
-            max_depth: None,
-            match_expressions: None,
-            exclude_expressions: None,
-            concurrency: slots,
-            cancel: CancellationToken::new(),
-        },
-    )?;
-    let mut walked = Vec::new();
-    while let Some(event) = walk.next().await {
-        match event {
-            NdxEvent::Page(page) => walked.extend(
-                page.files
-                    .iter()
-                    .chain(page.subdirs.iter())
-                    .map(|entry| entry.entry.path().as_str().to_owned()),
-            ),
-            NdxEvent::Error { path, reason } => return Err(format!("{path}: {reason}").into()),
-            NdxEvent::Done => break,
-        }
-    }
-    walked.sort();
-    assert_eq!(walked, VISIBLE);
     Ok(())
 }
 

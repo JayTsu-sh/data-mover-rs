@@ -123,15 +123,13 @@ S3_PREFIX=test                   # bucket 内的子路径
    marker= size=`）列举并断言：`k`、`gone` 各一项；`k` 的记录 = 2 B、3 B、标记、4 B 只有最后一个 latest，`gone` = 版本 +
    latest 标记（当前已删也列出），`p/z` 一项三条记录 1、2、3 B，`n` = `version=null latest=1`；`--current` 只有 `k`
    （4 B）没有 `gone`、没有 `Record` 行；无 artifact；`--order blocks` 并发 1 / 4 / 32 输出相同，Unordered 条目与记录
-   同一集合、每个 key 一次。另外直接发一次带 `delimiter` 的 ListObjectVersions（打印服务器是否按 delimiter 折叠），并用 `examples/s3_listing`
-   跑 legacy `walkdir` / `walkdir_2`（先重新开版本：暂停版本的桶走 ListObjectsV2）：`k` 按写入的 id 列 v1、v2、标记、v3，
-   `gone` 列版本再列 latest 标记（D4），`p/z` 跨页完整，无 artifact。
+   同一集合、每个 key 一次。另外直接发一次带 `delimiter` 的 ListObjectVersions，打印服务器是否按 delimiter 折叠。
    退出时按 id 删光版本与标记、删桶，打印 `cleanup: … deleted` 与剩下的桶；只有全部通过且桶已删才退出 0（编译失败、桶不是本次建的也以非 0 退出，trap 保留原退出码）。
    同样认 `S3_ENV` / `BUCKET_PREFIX`（默认 `data-mover-c22`）/ `S3_LOCATION`。另两种选桶方式（桶名都必须 `data-mover-*`，
    都写在唯一前缀 `dm-<run>/` 下、退出时清空该前缀、不删桶、不改桶设置）：
    - `S3_VERSIONED_BUCKET=<桶>`：已有的版本桶（版本必须 Enabled，否则拒跑）。没有暂停版本那一步，`n` 是普通的一个版本。
    - `S3_UNVERSIONED_BUCKET=<桶>`：从没开过版本的桶（`GetBucketVersioning` 无 Status，或 501 —— ONTAP NAS 桶）。只跑
-     Current 与 legacy（ListObjectsV2）：每个 key 一次（`k` 4 B、`p/z` 3 B、没有 `gone`、没有 artifact、999 个 `p/a*`），
+     当前对象（ListObjectsV2）：每个 key 一次（`k` 4 B、`p/z` 3 B、没有 `gone`、没有 artifact、999 个 `p/a*`），
      blocks 并发 1 / 4 / 32 一致；清理先删对象、再自深向浅删 NAS 桶为写过的 key 留下的目录。
    历史顺序：`EXPECT_ORDER=inferred`（RustFS：每页删除标记全在版本之前，现存问题 11）时，有删除标记的 key（`k`、`gone`）的
    条目行必须带 ` order=inferred`，其余 key 一行都不许带；默认 `server` 时哪一行都不许带 —— 解析同时接受可选的
