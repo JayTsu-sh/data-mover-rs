@@ -14,6 +14,10 @@
 # MODE=kill: each run is killed (SIGKILL) after KILL_AFTER seconds, checkpointing every EVERY seconds;
 #   only the entries printed before the last `checkpoint` line count, the next run resumes from the
 #   last checkpoint file — a crash, not a pause.
+# Checkpoints resume whole directories, not positions inside them (P7 §9.3). Repeated interruption
+# must leave enough time/entries for a directory to finish: use multiple narrow directories, set
+# CANCEL_AFTER above the widest directory, or increase KILL_AFTER. Repeatedly stopping inside one
+# wide directory can replay the same entries forever without violating the checkpoint contract.
 # The backend's environment (NFS_REAL_URL, CIFS_REAL_*, S3_LISTING_URL) must already be exported.
 # A versioned S3 bucket's keys come with their histories (P7 C11b): each record is its own `Record`
 # line and is compared too, so the union must hold every record of every key (a key's history is
@@ -37,7 +41,11 @@ rm -f "$OUT/ck" "$OUT/delivered"
 round=0
 while :; do
   round=$((round + 1))
-  [ "$round" -gt "$MAX_ROUNDS" ] && { echo "RESULT FAIL no completion after $MAX_ROUNDS rounds"; exit 1; }
+  if [ "$round" -gt "$MAX_ROUNDS" ]; then
+    echo "RESULT FAIL no completion after $MAX_ROUNDS rounds"
+    echo "Checkpoints replay unfinished directories (P7 §9.3): use a narrower fixture or increase CANCEL_AFTER=$CANCEL_AFTER / KILL_AFTER=$KILL_AFTER so a directory can finish."
+    exit 1
+  fi
   args=(--checkpoint-every "$EVERY" --checkpoint-out "$OUT/ck")
   [ -f "$OUT/ck" ] && args+=(--resume-from "$OUT/ck")
   if [ "$MODE" = kill ]; then
