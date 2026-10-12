@@ -28,7 +28,7 @@ async fn nas_with(content: &'static [u8]) -> TestResult<Arc<MemoryS3>> {
 /// Opens a read of all of `source`, `CHUNK` bytes per range, bound to what `describe` found.
 async fn open(protocol: &Arc<MemoryS3>) -> TestResult<ByteStream> {
     let storage = connect(protocol.clone(), identity(), None)?;
-    let source = storage.read_source(&validation_policy())?;
+    let source = storage.read_source()?;
     let path = StoragePath::new("source")?;
     let described = source.describe(&path).await?;
     Ok(source
@@ -220,7 +220,7 @@ async fn a_rewrite_that_keeps_the_mtime_is_not_seen() -> TestResult {
 async fn a_nas_bucket_keeps_no_versions_and_no_directory_objects() -> TestResult {
     let protocol = nas_with(b"x").await?;
     let storage = connect(protocol.clone(), identity(), None)?;
-    let source = storage.read_source(&validation_policy())?;
+    let source = storage.read_source()?;
     assert!(!source.supports_source_versions());
     let described = source.describe(&StoragePath::new("source")?).await?;
     assert_eq!(
@@ -228,11 +228,11 @@ async fn a_nas_bucket_keeps_no_versions_and_no_directory_objects() -> TestResult
         IdentityStrength::PathScoped
     );
     assert_eq!(described.version, SourceVersion::Current);
-    let capabilities = storage.namespace(&validation_policy())?.capabilities();
+    let capabilities = storage.namespace()?.capabilities();
     assert!(!capabilities.histories);
     assert!(!capabilities.directory_objects);
     assert!(!storage.holds_directory_objects());
-    let destination = storage.staged_destination(&validation_policy())?;
+    let destination = storage.staged_destination()?;
     assert!(!destination.keeps_history().await?);
     assert_eq!(protocol.nas().versioning_requests, 0, "nothing to ask");
     // A version is never selected, and one a HEAD names (a versioned object bucket marked as a
@@ -256,17 +256,8 @@ async fn a_nas_bucket_keeps_no_versions_and_no_directory_objects() -> TestResult
     let versioned = Arc::new(MemoryS3::default());
     versioned.set_versioning(Versioning::Enabled);
     let object = connect(versioned, identity(), None)?;
-    assert!(
-        object
-            .read_source(&validation_policy())?
-            .supports_source_versions()
-    );
-    assert!(
-        object
-            .namespace(&validation_policy())?
-            .capabilities()
-            .histories
-    );
+    assert!(object.read_source()?.supports_source_versions());
+    assert!(object.namespace()?.capabilities().histories);
     assert!(object.holds_directory_objects());
     Ok(())
 }

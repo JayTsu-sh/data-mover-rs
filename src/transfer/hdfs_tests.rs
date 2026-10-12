@@ -13,8 +13,8 @@ use crate::storage::backends::hdfs::contract_tests::MemoryHdfs;
 use crate::storage::backends::hdfs::protocol::cancelled;
 use crate::storage::backends::hdfs::{connect, test_identity};
 use crate::storage::{
-    DestinationPrepareRequest, FinalDestination, MetadataMutation, PreflightPolicy, PrepareFact,
-    PrepareRequest, PublishRequest, SourceDescriptor, StagedDestination, Storage,
+    DestinationPrepareRequest, FinalDestination, MetadataMutation, PrepareFact, PrepareRequest,
+    PublishRequest, SourceDescriptor, StagedDestination, Storage,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -46,13 +46,10 @@ async fn staged_roles(
 ) -> TestResult<(Arc<dyn StagedDestination>, SourceDescriptor)> {
     let storage = connect(Arc::clone(protocol), test_identity(label)?)?;
     let descriptor = storage
-        .read_source(&PreflightPolicy::production())?
+        .read_source()?
         .describe(&StoragePath::new("source")?)
         .await?;
-    Ok((
-        storage.staged_destination(&PreflightPolicy::production())?,
-        descriptor,
-    ))
+    Ok((storage.staged_destination()?, descriptor))
 }
 
 /// A recoverable prepare of `final` that resumes what it finds there.
@@ -307,7 +304,7 @@ async fn hdfs_metadata_observation_is_plan_scoped() -> TestResult {
         .insert("source", Bytes::from_static(b"metadata"))
         .await;
     let storage = connect(protocol.clone(), test_identity("metadata")?)?;
-    let metadata = storage.metadata(&PreflightPolicy::production())?;
+    let metadata = storage.metadata()?;
     let omitted = metadata
         .observe(&StoragePath::new("source")?, ObservationPlan::default())
         .await?;

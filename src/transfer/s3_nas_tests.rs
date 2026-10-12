@@ -21,7 +21,7 @@ use crate::storage::backends::s3::tests::{
     MemoryS3, content_md5, endpoint_of, identity, native_context,
 };
 use crate::storage::backends::s3::{S3Protocol as _, connect, connect_native_at_destination};
-use crate::storage::{PreflightPolicy, Storage, StorageRoleFailure};
+use crate::storage::{Storage, StorageRoleFailure};
 use crate::transfer::{
     EffectiveRecovery, ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest,
     ExpertSourceSession, InflightLimits, PayloadShapingPolicy, ReadBackMethod,
@@ -372,10 +372,7 @@ async fn an_expert_copy_to_a_nas_bucket_reports_what_it_could_do() -> TestResult
         .await
         .map_err(|failure| format!("{failure:?}"))?;
     let path = StoragePath::new("src/file")?;
-    let described = storage
-        .read_source(&PreflightPolicy::production())?
-        .describe(&path)
-        .await?;
+    let described = storage.read_source()?.describe(&path).await?;
     let observation = ObservedEntry::new(
         path,
         EntryKind::File,

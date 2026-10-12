@@ -10,8 +10,8 @@ use bytes::Bytes;
 use data_mover::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
 use data_mover::storage::{
     BackendConfig, ByteStream, DestinationPrepareRequest, FinalDestination, HdfsBackendConfig,
-    PreflightPolicy, PrepareFact, PrepareRequest, PublishRequest, ResumeMode, SourceDescriptor,
-    Storage, StorageRoleFailure, VerifyRequest, connect_backend,
+    PrepareFact, PrepareRequest, PublishRequest, ResumeMode, SourceDescriptor, Storage,
+    StorageRoleFailure, VerifyRequest, connect_backend,
 };
 use data_mover::storage::{HdfsConfig, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client};
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
@@ -88,7 +88,7 @@ async fn read_file(client: &Client, root: &HdfsLocation, path: &str) -> TestResu
 
 async fn cleanup(storage: &Storage) -> TestResult {
     storage
-        .namespace(&PreflightPolicy::production())?
+        .namespace()?
         .delete_subtree(&StoragePath::root(), true)
         .await?;
     Ok(())
@@ -235,7 +235,7 @@ async fn architecture_stage_recovers_durable_prefix_after_reconnect() -> TestRes
     drop(backend);
     let reconnected = connect_hdfs(&location).await?;
     let roles = reconnected.clone();
-    let staged = roles.staged_destination(&PreflightPolicy::production())?;
+    let staged = roles.staged_destination()?;
     let resumed = staged
         .prepare_at_destination(resume_request(&descriptor)?)
         .await?;
@@ -280,10 +280,10 @@ async fn architecture_stage_recovers_durable_prefix_after_reconnect() -> TestRes
 
 async fn interrupt_stage(backend: &Storage, payload: &Bytes) -> TestResult<SourceDescriptor> {
     let descriptor = backend
-        .read_source(&PreflightPolicy::production())?
+        .read_source()?
         .describe(&StoragePath::new("source.bin")?)
         .await?;
-    let staged = backend.staged_destination(&PreflightPolicy::production())?;
+    let staged = backend.staged_destination()?;
     let stage = staged
         .prepare_at_destination(resume_request(&descriptor)?.with_resume(ResumeMode::Restart))
         .await?;

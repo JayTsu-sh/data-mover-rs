@@ -21,8 +21,8 @@ use crate::model::{
     StoragePath, StorageTimestamp,
 };
 use crate::storage::{
-    CapabilityUnavailable, CopiedTimestampTarget, Metadata, PreflightPolicy, ReadRequest,
-    ReadSource, SourceDescriptor, Storage, StorageRoleFailure,
+    CapabilityUnavailable, CopiedTimestampTarget, Metadata, ReadRequest, ReadSource,
+    SourceDescriptor, Storage, StorageRoleFailure,
 };
 
 /// Which side of a comparison a fact or failure came from.
@@ -191,10 +191,9 @@ impl Endpoint {
         storage: &Storage,
         path: StoragePath,
     ) -> Result<Self, CapabilityUnavailable> {
-        let policy = PreflightPolicy::production();
         let mtime_copied = side == IntegritySide::Source
             || storage
-                .staged_destination(&policy)
+                .staged_destination()
                 .ok()
                 .and_then(|destination| destination.copied_metadata_target())
                 .is_none_or(|target| {
@@ -202,8 +201,8 @@ impl Endpoint {
                 });
         Ok(Self {
             side,
-            read_source: storage.read_source(&policy)?,
-            metadata: storage.metadata(&policy)?,
+            read_source: storage.read_source()?,
+            metadata: storage.metadata()?,
             path,
             mtime_copied,
         })

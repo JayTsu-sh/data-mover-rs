@@ -45,11 +45,11 @@ use bytes::Bytes;
 
 use super::*;
 use crate::model::{EntryKind, FailureClass, StoragePath, Transience};
+use crate::storage::StorageRoleFailure;
 use crate::storage::backends::s3::client::S3Storage;
 use crate::storage::backends::s3::client::tests::make_test_storage;
 use crate::storage::backends::s3::{S3VersioningAtConnect, connect, tests::identity};
 use crate::storage::listing::testing::listed;
-use crate::storage::{PreflightPolicy, StorageRoleFailure};
 
 const SMALL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -248,9 +248,7 @@ async fn role_all(
 ) -> Result<(Vec<(String, String)>, Vec<String>), StorageRoleFailure> {
     let roles =
         connect(Arc::new(storage(replay)), identity(), None).unwrap_or_else(|e| panic!("{e:?}"));
-    let namespace = roles
-        .namespace(&PreflightPolicy::production())
-        .unwrap_or_else(|e| panic!("{e:?}"));
+    let namespace = roles.namespace().unwrap_or_else(|e| panic!("{e:?}"));
     let directory = StoragePath::new(format!("{ROOT}{dir}")).unwrap_or_else(|e| panic!("{e}"));
     let (entries, failures) = listed(&*namespace, &directory).await?;
     assert!(failures.is_empty(), "{failures:?}");

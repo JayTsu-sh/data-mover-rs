@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use data_mover::model::StoragePath;
 use data_mover::storage::build_hdfs_client;
-use data_mover::storage::{BackendConfig, HdfsBackendConfig, PreflightPolicy, connect_backend};
+use data_mover::storage::{BackendConfig, HdfsBackendConfig, connect_backend};
 use data_mover::storage::{HdfsConfig, HdfsKerberosCredentials};
 use data_mover::transfer::{TransferRequest, transfer};
 use tokio_util::sync::CancellationToken;
@@ -89,14 +89,8 @@ async fn main() -> Result<()> {
     .await?;
     let bytes = copy_support::verify(&source, &destination, &path).await?;
     let (_, hash) = copy_support::hash(&source, &path).await?;
-    destination
-        .namespace(&PreflightPolicy::production())?
-        .delete(&path)
-        .await?;
-    source
-        .namespace(&PreflightPolicy::production())?
-        .delete(&path)
-        .await?;
+    destination.namespace()?.delete(&path).await?;
+    source.namespace()?.delete(&path).await?;
     println!("two-client Kerberos HDFS copy passed: {bytes} bytes, hash {hash}");
     Ok(())
 }

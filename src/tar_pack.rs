@@ -9,8 +9,8 @@ use crate::model::{
     SourceIdentity, SourceVersion, StoragePath, Transience, without_unowned_set_id,
 };
 use crate::storage::{
-    ByteStream, PreflightPolicy, ReadRequest, ReadSource, SourceQosBudget, SourceQosGroup,
-    SourceQosStats, Storage, StorageRoleFailure,
+    ByteStream, ReadRequest, ReadSource, SourceQosBudget, SourceQosGroup, SourceQosStats, Storage,
+    StorageRoleFailure,
 };
 use crate::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, InflightLimits,
@@ -73,7 +73,7 @@ pub async fn pack(request: TarRequest) -> Result<TransferOutcome, TarFailure> {
     let maximum = request.inflight.negotiated_chunk_ceiling();
     let source = request
         .source
-        .read_source(&PreflightPolicy::production())
+        .read_source()
         .map_err(|error| invalid(&error.to_string()))?;
     let destination = ExpertDestinationSession::prepare(
         ExpertDestinationRequest::new(

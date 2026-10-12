@@ -5,7 +5,7 @@ use clap::{Parser, ValueEnum};
 use data_mover::model::StoragePath;
 use data_mover::storage::HdfsConfig;
 use data_mover::storage::build_hdfs_client;
-use data_mover::storage::{BackendConfig, HdfsBackendConfig, PreflightPolicy, connect_backend};
+use data_mover::storage::{BackendConfig, HdfsBackendConfig, connect_backend};
 #[allow(dead_code)]
 #[path = "../../../examples/support/copy.rs"]
 mod copy_support;
@@ -115,16 +115,10 @@ async fn main() -> Result<()> {
                     "metadata-loop requires ready-file".to_string(),
                 )
             })?;
-            storage
-                .namespace(&PreflightPolicy::production())?
-                .stat(&path)
-                .await?;
+            storage.namespace()?.stat(&path).await?;
             tokio::fs::write(ready, b"ready\n").await?;
             for _ in 0..300 {
-                let entry = storage
-                    .namespace(&PreflightPolicy::production())?
-                    .stat(&path)
-                    .await?;
+                let entry = storage.namespace()?.stat(&path).await?;
                 if entry.size != Some(FIXTURE_SIZE) {
                     return Err(data_mover::error::StorageError::OperationError(
                         "HA fixture size changed during failover".to_string(),

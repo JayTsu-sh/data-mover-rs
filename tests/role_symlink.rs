@@ -5,8 +5,7 @@ use data_mover::model::{
     TimePrecision,
 };
 use data_mover::storage::{
-    BackendConfig, CreateSymlinkRequest, LocalBackendConfig, PreflightPolicy, StorageRoleFailure,
-    connect_backend,
+    BackendConfig, CreateSymlinkRequest, LocalBackendConfig, StorageRoleFailure, connect_backend,
 };
 use std::num::NonZeroUsize;
 use std::os::unix::ffi::OsStrExt as _;
@@ -26,7 +25,7 @@ async fn create_link_preserves_target_and_link_times_without_touching_target() -
         write_concurrency: slots,
     }))
     .await?;
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     let time = StorageTimestamp::new(1_700_000_000_123_456_789, TimePrecision::Nanoseconds)?;
     let request = CreateSymlinkRequest {
         path: StoragePath::new("link")?,
@@ -67,7 +66,7 @@ async fn create_link_refuses_symlink_parents_and_escaping_destinations() -> Resu
         write_concurrency: slots,
     }))
     .await?;
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     for (path, target) in [
         ("escape/link", "target"),
         ("../link", "target"),
@@ -107,7 +106,7 @@ async fn create_link_preserves_opaque_absolute_parent_and_non_utf8_targets() -> 
         write_concurrency: slots,
     }))
     .await?;
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     let targets = [
         b"../outside".to_vec(),
         outside.path().as_os_str().as_bytes().to_vec(),

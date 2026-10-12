@@ -101,9 +101,9 @@ fn certified_standard_s3_roles_are_available_in_production()
         identity(),
         Some(native_context()),
     )?;
-    assert!(storage.read_source(&validation_policy()).is_ok());
-    assert!(storage.staged_destination(&validation_policy()).is_ok());
-    assert!(storage.metadata(&validation_policy()).is_ok());
+    assert!(storage.read_source().is_ok());
+    assert!(storage.staged_destination().is_ok());
+    assert!(storage.metadata().is_ok());
     assert!(matches!(
         storage
             .capabilities()
@@ -126,7 +126,7 @@ async fn every_range_is_bound_and_overwrites_cannot_mix_content()
             .await
             .insert("source".into(), Bytes::from_static(b"abcdef"));
         let storage = connect(protocol.clone(), identity(), None)?;
-        let source = storage.read_source(&validation_policy())?;
+        let source = storage.read_source()?;
         let path = StoragePath::new("source")?;
         let before = source.describe(&path).await?;
         let mut stream = source
@@ -177,8 +177,8 @@ async fn range_stream_multipart_verify_publish_and_readback()
         .insert("source".into(), Bytes::from_static(b"0123456789"));
     // The multipart path itself: an object this small would otherwise be one PUT.
     let storage = connect_multipart_only(protocol.clone(), identity(), Some(native_context()))?;
-    let policy = validation_policy();
-    let source = storage.read_source(&policy)?;
+
+    let source = storage.read_source()?;
     let descriptor = source.describe(&StoragePath::new("source")?).await?;
     let mut read = source
         .read(ReadRequest {
@@ -201,7 +201,7 @@ async fn range_stream_multipart_verify_publish_and_readback()
         Bytes::from_static(b"234567")
     );
 
-    let destination = storage.staged_destination(&policy)?;
+    let destination = storage.staged_destination()?;
     let payload = Bytes::from_static(b"streamed multipart payload");
     // An upload on the final key completes only the source's size.
     let mut descriptor = descriptor;
@@ -220,7 +220,7 @@ async fn range_stream_multipart_verify_publish_and_readback()
 async fn tags_are_lazy_and_round_trip() -> Result<(), Box<dyn std::error::Error>> {
     let protocol = Arc::new(MemoryS3::default());
     let storage = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let metadata = storage.metadata(&validation_policy())?;
+    let metadata = storage.metadata()?;
     let path = StoragePath::new("tagged")?;
     let omitted = metadata.observe(&path, ObservationPlan::default()).await?;
     assert!(matches!(omitted.tags(), MetadataObservation::NotRequested));
@@ -254,7 +254,7 @@ async fn unsupported_profile_tags_never_call_the_service() -> Result<(), Box<dyn
         Some(native_context()),
         S3TagSupport::Unsupported,
     )?;
-    let metadata = storage.metadata(&validation_policy())?;
+    let metadata = storage.metadata()?;
     let path = StoragePath::new("untagged")?;
     let observed = metadata
         .observe(
@@ -284,7 +284,7 @@ async fn failed_input_preserves_checkpoint_until_explicit_discard()
 -> Result<(), Box<dyn std::error::Error>> {
     let protocol = Arc::new(MemoryS3::default());
     let storage = connect(protocol.clone(), identity(), Some(native_context()))?;
-    let destination = storage.staged_destination(&validation_policy())?;
+    let destination = storage.staged_destination()?;
     let stage = destination
         .prepare_at_destination(at_destination(
             "final",
@@ -322,7 +322,7 @@ async fn cancellation_remains_a_typed_entry_outcome() -> Result<(), Box<dyn std:
         .await
         .insert("source".into(), Bytes::from_static(b"payload"));
     let storage = connect(protocol, identity(), Some(native_context()))?;
-    let source = storage.read_source(&validation_policy())?;
+    let source = storage.read_source()?;
     let cancel = CancellationToken::new();
     cancel.cancel();
     let result = source
@@ -359,7 +359,7 @@ async fn overwrite_publication_does_not_head_the_existing_destination()
     let protocol = Arc::new(MemoryS3::default());
     // The completion of an upload: an object this small would otherwise be one PUT.
     let storage = connect_multipart_only(protocol.clone(), identity(), Some(native_context()))?;
-    let destination = storage.staged_destination(&validation_policy())?;
+    let destination = storage.staged_destination()?;
     let payload = Bytes::from_static(b"payload");
     let stage = written_to_final(&*destination, described(Some(7))?, &payload).await?;
     let previous = Bytes::from_static(b"previous");
@@ -417,7 +417,7 @@ async fn an_upload_is_resumed_from_the_destination_after_reconnect() -> TestResu
     let request = || at_destination("resumed", described(None)?, [6; 32], ResumeMode::Discover);
     let connected = || {
         connect(protocol.clone(), identity(), Some(native_context()))?
-            .staged_destination(&validation_policy())
+            .staged_destination()
             .map_err(Into::<Box<dyn std::error::Error>>::into)
     };
     let destination = connected()?;
@@ -476,8 +476,8 @@ fn temp_key_stage() -> TestResult<PreparedStage> {
 #[tokio::test]
 async fn a_temp_key_stage_is_refused() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
-    let destination = connect(protocol.clone(), identity(), Some(native_context()))?
-        .staged_destination(&validation_policy())?;
+    let destination =
+        connect(protocol.clone(), identity(), Some(native_context()))?.staged_destination()?;
     let conflict = Some(FailureClass::Conflict);
     let stage = temp_key_stage()?;
     let input = Box::pin(futures::stream::iter([Ok(Bytes::from_static(b"data"))]));

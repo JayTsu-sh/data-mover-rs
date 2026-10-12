@@ -67,7 +67,7 @@ async fn expert_observation(
     path: &str,
 ) -> Result<ObservedEntry, Box<dyn std::error::Error>> {
     let descriptor = storage
-        .read_source(&crate::storage::PreflightPolicy::production())?
+        .read_source()?
         .describe(&StoragePath::new(path)?)
         .await?;
     Ok(ObservedEntry::new(

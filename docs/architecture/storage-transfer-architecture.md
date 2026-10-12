@@ -156,9 +156,10 @@ impl Storage {
 Each lending method returns the connected backend role after checking its capability.
 Operation methods never recreate the five-backend matrix.
 
-Capability availability is instance-specific and typed: `Supported`,
-`Unsupported(reason)`, or `Uncertified(gate)`. Uncertified operations are disabled in
-production and may be enabled only by the named validation gate.
+Capability availability is instance-specific and typed: `Supported` or
+`Unsupported(reason)`. Role accessors check availability internally and return
+`CapabilityUnavailable` for unsupported roles; callers supply no preflight policy.
+Acceptance gates are release validation requirements, not runtime overrides.
 
 ## 5. Deep role interfaces
 
@@ -705,8 +706,8 @@ and xattr are reported unsupported until public dependency APIs are bound, rathe
 than triggering unconditional scan-time calls or claiming unevidenced support.
 
 All destinations support restart. Resume is advertised only for combinations with reliable
-source positioning and validated backend checkpoint truth. CIFS resume remains Uncertified
-until smb-rs passes the FAS2750 gate. Unknown staged ownership is report-only and never
+source positioning and validated backend checkpoint truth. Advertising CIFS resume support
+requires smb-rs to pass the FAS2750 gate. Unknown staged ownership is report-only and never
 deleted automatically.
 
 ## 11. Source-only transfer QoS

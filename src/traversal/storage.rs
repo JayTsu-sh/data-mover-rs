@@ -19,8 +19,8 @@ use crate::model::{
     ObservationMode, ObservationPlan, ObservedEntry, Operation, StoragePath, Transience,
 };
 use crate::storage::{
-    CapabilityUnavailable, DescentHint, Metadata, Namespace, PreflightPolicy, SourceDescriptor,
-    Storage, StorageRoleFailure,
+    CapabilityUnavailable, DescentHint, Metadata, Namespace, SourceDescriptor, Storage,
+    StorageRoleFailure,
 };
 
 mod blocks;
@@ -116,10 +116,9 @@ impl StorageTraversalSource {
     /// # Errors
     /// Returns the first unavailable role before starting backend I/O.
     pub fn new(storage: &Storage) -> Result<Self, CapabilityUnavailable> {
-        let policy = PreflightPolicy::production();
         Ok(Self {
-            namespace: storage.namespace(&policy)?,
-            metadata: storage.metadata(&policy)?,
+            namespace: storage.namespace()?,
+            metadata: storage.metadata()?,
             identity: storage.identity().clone(),
             history_segment: MAX_HISTORY_RECORDS,
             probe: Probe::default(),

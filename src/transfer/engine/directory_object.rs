@@ -26,9 +26,7 @@ use crate::model::{
     EntryOperationFailure, FailureClass, ObjectHistory, ObservedEntry, Operation, StoragePath,
     Transience, VersionRecord,
 };
-use crate::storage::{
-    NamespaceCapabilities, PreflightPolicy, StagedDestination, Storage, StorageRoleFailure,
-};
+use crate::storage::{NamespaceCapabilities, StagedDestination, Storage, StorageRoleFailure};
 
 use super::{TransferFailure, TransferPhase, TransferSide};
 
@@ -79,7 +77,7 @@ impl From<&NamespaceCapabilities> for DirectoryObjectDestination {
 impl From<&Storage> for DirectoryObjectDestination {
     fn from(storage: &Storage) -> Self {
         let limit = storage
-            .staged_destination(&PreflightPolicy::production())
+            .staged_destination()
             .ok()
             .and_then(|destination| destination.directory_object_limit());
         Self::new(storage.holds_directory_objects(), limit)

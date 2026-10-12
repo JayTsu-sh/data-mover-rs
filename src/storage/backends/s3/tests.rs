@@ -1,5 +1,5 @@
 //! The in-crate S3 used by every S3 role test: an in-memory bucket with multipart uploads, tags
-//! and injectable failures, plus the identity / policy helpers the tests share.
+//! and injectable failures, plus the identity helpers the tests share.
 
 #![allow(clippy::expect_used)]
 
@@ -744,10 +744,6 @@ pub(crate) fn endpoint_of(protocol: &Arc<MemoryS3>) -> BackendIdentity {
 
 pub(crate) fn identity() -> BackendIdentity {
     BackendIdentity::new(BackendKind::S3, "memory-bucket").expect("valid identity")
-}
-
-pub(super) fn validation_policy() -> crate::storage::PreflightPolicy {
-    crate::storage::PreflightPolicy::production()
 }
 
 pub(crate) fn native_context() -> S3NativeContext {

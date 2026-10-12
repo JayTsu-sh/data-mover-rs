@@ -20,7 +20,7 @@ use super::at_destination::acquire_for;
 use super::directory_object::refuse_unholdable;
 use super::{TransferFailure, TransferPhase, TransferSide};
 use crate::model::StoragePath;
-use crate::storage::{DeleteMarkerOutcome, PreflightPolicy, StagedDestination, Storage};
+use crate::storage::{DeleteMarkerOutcome, StagedDestination, Storage};
 
 /// Writes a delete marker on `final_path` of `destination`, holding the same per-destination
 /// lease a transfer of that file holds, so one key has one writer in this process.
@@ -68,12 +68,10 @@ pub async fn destination_keeps_history(destination: &Storage) -> Result<bool, Tr
 }
 
 fn staged(destination: &Storage) -> Result<Arc<dyn StagedDestination>, TransferFailure> {
-    destination
-        .staged_destination(&PreflightPolicy::production())
-        .map_err(|_| {
-            TransferFailure::capability(
-                TransferSide::Destination,
-                "destination capability unavailable",
-            )
-        })
+    destination.staged_destination().map_err(|_| {
+        TransferFailure::capability(
+            TransferSide::Destination,
+            "destination capability unavailable",
+        )
+    })
 }

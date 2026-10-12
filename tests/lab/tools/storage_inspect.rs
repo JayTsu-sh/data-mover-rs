@@ -5,7 +5,7 @@ use clap::Parser;
 #[path = "../../../examples/support/endpoint.rs"]
 mod endpoint_support;
 use data_mover::model::{EntryKind, StoragePath};
-use data_mover::storage::{PreflightPolicy, ReadRequest, SourceDescriptor, Storage};
+use data_mover::storage::{ReadRequest, SourceDescriptor, Storage};
 use endpoint_support::Result;
 use futures::StreamExt as _;
 
@@ -41,7 +41,7 @@ async fn compute_hash(
     delay_ms: u64,
 ) -> Result<String> {
     let size = entry.size.ok_or("inspection size is unknown")?;
-    let source = storage.read_source(&PreflightPolicy::production())?;
+    let source = storage.read_source()?;
     let mut stream = source
         .read(ReadRequest {
             path: entry.path.clone(),
@@ -92,18 +92,12 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let storage = endpoint_support::connect(&args.storage).await?;
     let path = StoragePath::new(args.path.clone())?;
-    let entry = storage
-        .read_source(&PreflightPolicy::production())?
-        .describe(&path)
-        .await?;
+    let entry = storage.read_source()?.describe(&path).await?;
     if entry.kind != EntryKind::File {
         return Err("inspection target is not a regular file".into());
     }
     if args.print_mode {
-        let facts = storage
-            .metadata(&PreflightPolicy::production())?
-            .permissions(&entry)
-            .await?;
+        let facts = storage.metadata()?.permissions(&entry).await?;
         println!(
             "{:o}",
             facts

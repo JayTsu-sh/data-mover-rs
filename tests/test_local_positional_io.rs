@@ -1,7 +1,7 @@
 //! Local positional-I/O coverage through the public role and transfer APIs.
 
 use data_mover::model::{SourceVersion, StoragePath};
-use data_mover::storage::{PreflightPolicy, ReadRequest};
+use data_mover::storage::ReadRequest;
 use data_mover::transfer::{InflightLimits, TransferRequest, transfer};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -63,7 +63,7 @@ async fn local_read_role_returns_complete_positioned_coverage()
     let expected = offset_pattern(SIZE);
     tokio::fs::write(root.path().join("blob.bin"), &expected).await?;
     let storage = common::connect_local(root.path(), 8).await?;
-    let source = storage.read_source(&PreflightPolicy::production())?;
+    let source = storage.read_source()?;
     assert!(source.supports_positioned_read());
     let mut stream = source
         .read_positioned(ReadRequest {

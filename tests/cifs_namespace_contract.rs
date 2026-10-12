@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use data_mover::model::{EntryKind, FailureClass, IdentityStrength, StoragePath};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, CollectLimits,
-    ListRequest, ListedChild, ListingPage, Namespace, PreflightPolicy, SourceDescriptor, Storage,
+    ListRequest, ListedChild, ListingPage, Namespace, SourceDescriptor, Storage,
     StorageRoleFailure, collect_listing, connect_backend,
 };
 use futures::StreamExt as _;
@@ -28,7 +28,7 @@ async fn real_share_namespace_verbs_roundtrip() -> Result {
         )
         .await?;
     let storage = connect_remote(&server, &share_name).await?;
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     let dir = format!("dm-cifs-ns-{}", uuid::Uuid::new_v4().simple());
     let result = exercise(namespace.as_ref(), &share, &dir).await;
     let cleanup = cleanup(namespace.as_ref(), &dir).await;
@@ -61,7 +61,7 @@ async fn real_share_parked_listing_resumes_after_idle() -> Result {
         )
         .await?;
     let storage = connect_remote(&server, &share_name).await?;
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     let dir = format!("dm-cifs-parked-{}", uuid::Uuid::new_v4().simple());
     let result = exercise_parked(namespace.as_ref(), &share, &dir, idle).await;
     let cleanup = cleanup(namespace.as_ref(), &dir).await;

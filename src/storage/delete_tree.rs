@@ -28,8 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::listing::{CollectLimits, collect_listing, is_vanished};
 use super::{
-    CapabilityUnavailable, ListRequest, ListingStream, Namespace, PreflightPolicy, Storage,
-    StorageRoleFailure,
+    CapabilityUnavailable, ListRequest, ListingStream, Namespace, Storage, StorageRoleFailure,
 };
 use crate::model::{
     BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
@@ -136,8 +135,7 @@ pub fn delete_tree(
     storage: &Storage,
     request: DeleteTreeRequest,
 ) -> Result<DeleteTreeSession, CapabilityUnavailable> {
-    let namespace =
-        storage.mutable_namespace(&PreflightPolicy::production(), |caps| caps.delete)?;
+    let namespace = storage.mutable_namespace(|caps| caps.delete)?;
     Ok(delete_tree_with_namespace(namespace, request))
 }
 

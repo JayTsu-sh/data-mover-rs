@@ -3,7 +3,7 @@ use clap::Parser;
 #[path = "support/endpoint.rs"]
 mod endpoint_support;
 use data_mover::model::StoragePath;
-use data_mover::storage::PreflightPolicy;
+
 use endpoint_support::Result;
 
 #[derive(Debug, Parser)]
@@ -26,7 +26,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let storage = endpoint_support::connect(&args.storage).await?;
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     let from = StoragePath::new(args.from.clone())?;
     let to = StoragePath::new(args.to.clone())?;
     let source = namespace.stat(&from).await?;

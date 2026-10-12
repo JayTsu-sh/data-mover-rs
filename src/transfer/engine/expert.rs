@@ -15,10 +15,10 @@ use crate::metadata::MetadataPlan;
 use crate::model::observation::PrivateBackendEntryFacts;
 use crate::model::{EntryIdentityKey, EntryKind, ObservedEntry, SourceVersion, StoragePath};
 use crate::storage::{
-    CheckpointObservation, FinalDestination, PreflightPolicy, PrepareFact, PrepareRequest,
-    PublicationEvidence, PublishRequest, ReadSource, SourceDescriptor, SourceQosBudget,
-    SourceQosGroup, SourceQosStats, StagedDestination, Storage, VerificationPoint, VerifyRequest,
-    WriteEvidence, WriteProgressObserver,
+    CheckpointObservation, FinalDestination, PrepareFact, PrepareRequest, PublicationEvidence,
+    PublishRequest, ReadSource, SourceDescriptor, SourceQosBudget, SourceQosGroup, SourceQosStats,
+    StagedDestination, Storage, VerificationPoint, VerifyRequest, WriteEvidence,
+    WriteProgressObserver,
 };
 use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy};
 
@@ -92,12 +92,9 @@ impl ExpertSourceSession {
     /// # Errors
     /// Returns a typed preflight/describe failure if the source changed or is unavailable.
     pub async fn open(request: ExpertSourceRequest) -> Result<Self, TransferFailure> {
-        let source = request
-            .source
-            .read_source(&PreflightPolicy::production())
-            .map_err(|_| {
-                TransferFailure::capability(TransferSide::Source, "source capability unavailable")
-            })?;
+        let source = request.source.read_source().map_err(|_| {
+            TransferFailure::capability(TransferSide::Source, "source capability unavailable")
+        })?;
         // Before any I/O, as the ordinary entry: a directory object only on a source holding them.
         refuse_unholdable(
             request.observation.path(),
@@ -397,15 +394,12 @@ impl ExpertDestinationSession {
             .inflight
             .negotiated_chunk_ceiling()
             .min(request.source_maximum_chunk_bytes);
-        let destination = request
-            .destination
-            .staged_destination(&PreflightPolicy::production())
-            .map_err(|_| {
-                TransferFailure::capability(
-                    TransferSide::Destination,
-                    "destination capability unavailable",
-                )
-            })?;
+        let destination = request.destination.staged_destination().map_err(|_| {
+            TransferFailure::capability(
+                TransferSide::Destination,
+                "destination capability unavailable",
+            )
+        })?;
         // Before any destination I/O: what this destination cannot write, by name and size (a
         // directory object one request cannot carry, P7 D13; an ONTAP NAS bucket's limits, §14.2).
         refuse_unwritable(&request.final_path, source.size, &*destination)?;

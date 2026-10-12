@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::model::{FailureClass, ObservedEntry, StoragePath, Transience};
 use crate::storage::backends::s3::tests::{MemoryS3, identity};
 use crate::storage::backends::s3::{S3Protocol as _, S3ProtocolFailure, connect_at_destination};
-use crate::storage::{PreflightPolicy, PrepareFact, Storage};
+use crate::storage::{PrepareFact, Storage};
 use crate::transfer::{
     EffectiveRecovery, ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest,
     ExpertSourceSession, InflightLimits, TransferOutcome, TransferPolicy, TransferRequest,
@@ -231,7 +231,7 @@ async fn open_uploads(protocol: &MemoryS3, final_key: &str) -> TestResult<usize>
 /// What the expert source half is offered: the source object as `source` describes it.
 async fn observed(source: &Storage) -> TestResult<ObservedEntry> {
     let described = source
-        .read_source(&PreflightPolicy::production())?
+        .read_source()?
         .describe(&StoragePath::new("source")?)
         .await?;
     Ok(ObservedEntry::new(

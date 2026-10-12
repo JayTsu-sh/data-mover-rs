@@ -40,7 +40,7 @@ pub use backends::nfs::list_exports;
 pub use backends::s3::{S3BucketInfo, list_buckets};
 pub use capability::{
     BackendCapabilities, Capability, CapabilityAvailability, CapabilityUnavailable,
-    CapabilityValueError, PreflightPolicy, UnsupportedReason, ValidationGate,
+    CapabilityValueError, UnsupportedReason,
 };
 pub use copied_metadata::{
     CopiedAclTarget, CopiedMetadataObservation, CopiedMetadataTarget, CopiedOwnershipTarget,

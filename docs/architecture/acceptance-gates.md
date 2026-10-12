@@ -214,7 +214,8 @@ credentials: CI secret only
 ```
 
 System libsmbclient is not acceptable evidence for smb-rs/data-mover capability. CIFS and
-CIFS resume remain Uncertified until all named gates pass.
+CIFS resume may enter the formal support list only after all named gates pass.
+These are release validation requirements; runtime capability checks have no validation override.
 
 ### Standard-compatible S3
 
@@ -397,7 +398,7 @@ In-process transport tests supplement but never replace real two-process QUIC ev
 - every `gate_key` produces all three matrix gate families;
 - every Required capability and cell maps to a gate;
 - Unsupported and NotApplicable facts have a reason/semantic negative contract;
-- Uncertified facts name a gate and cannot enter the formal support list;
+- capabilities awaiting acceptance name a gate and cannot enter the formal support list;
 - the legacy-disposition table covers every inventory cluster;
 - no public interface exposes terrasync products or private backend facts;
 - no file contains an unresolved placeholder, blank status, or ambiguous support claim;

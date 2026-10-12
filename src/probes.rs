@@ -15,9 +15,7 @@ use crate::transfer::{
     TransferFailure, TransferPhase, TransferPolicy, TransferSide, TransferValueError,
 };
 
-use crate::storage::{
-    CapabilityUnavailable, PreflightPolicy, SourceQosStats, Storage, StorageRoleFailure,
-};
+use crate::storage::{CapabilityUnavailable, SourceQosStats, Storage, StorageRoleFailure};
 
 #[cfg(test)]
 mod tests;
@@ -75,9 +73,7 @@ impl Error for ProbeFailure {}
 /// # Errors
 /// Returns an unavailable namespace capability or the actual connectivity failure.
 pub async fn check_connectivity(storage: &Storage) -> Result<(), ProbeFailure> {
-    let namespace = storage
-        .namespace(&PreflightPolicy::production())
-        .map_err(ProbeError::Capability)?;
+    let namespace = storage.namespace().map_err(ProbeError::Capability)?;
     namespace
         .check_connectivity()
         .await
@@ -99,13 +95,13 @@ pub async fn probe_server_time(
     if storage.kind() == BackendKind::Local {
         return Ok(None);
     }
-    let policy = PreflightPolicy::production();
-    let namespace = storage.namespace(&policy).map_err(ProbeError::Capability)?;
+
+    let namespace = storage.namespace().map_err(ProbeError::Capability)?;
     namespace
         .capabilities()
         .delete
         .map_err(ProbeError::DeleteUnsupported)?;
-    let metadata = storage.metadata(&policy).map_err(ProbeError::Capability)?;
+    let metadata = storage.metadata().map_err(ProbeError::Capability)?;
     // `.data-mover-*` is reserved for destination-owned transfer artifacts and cannot be
     // reached through the public namespace role.
     let path =

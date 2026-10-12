@@ -21,9 +21,7 @@ use crate::storage::backends::s3::tests::{
 };
 use crate::storage::backends::s3::{S3Protocol as _, connect};
 use crate::storage::listing::testing::listed;
-use crate::storage::{
-    NamespaceCapabilities, PreflightPolicy, SourceDescriptor, Storage, StorageRoleFailure,
-};
+use crate::storage::{NamespaceCapabilities, SourceDescriptor, Storage, StorageRoleFailure};
 use crate::transfer::{
     DIRECTORY_OBJECT_SKIP_REASON, DIRECTORY_OBJECT_TOO_LARGE_REASON, DirectoryObjectAction,
     DirectoryObjectDestination, ExpertDestinationRequest, ExpertDestinationSession,
@@ -233,7 +231,7 @@ fn observation(descriptor: &SourceDescriptor) -> TestResult<ObservedEntry> {
 
 /// Every listed child of `directory` as the traversal observes it.
 async fn entries(storage: &Storage, directory: &str) -> TestResult<Vec<ObservedEntry>> {
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     let directory = StoragePath::new(directory)?;
     let (descriptors, _) = listed(&*namespace, &directory).await?;
     descriptors.iter().map(observation).collect()
@@ -256,9 +254,7 @@ async fn directory_object_action_decides_per_destination() -> TestResult {
         .map_err(|e| format!("{e:?}"))?;
     let storage = bucket(&protocol)?;
     let filesystem = NamespaceCapabilities::BASIC;
-    let object_store = storage
-        .namespace(&PreflightPolicy::production())?
-        .capabilities();
+    let object_store = storage.namespace()?.capabilities();
     assert!(object_store.directory_objects && storage.holds_directory_objects());
     let mut decided = Vec::new();
     for directory in ["d", "e", "m"] {
@@ -319,9 +315,7 @@ fn observed(path: &str, size: Option<u64>) -> TestResult<ObservedEntry> {
 #[tokio::test]
 async fn directory_object_action_answers_too_large_up_front() -> TestResult {
     let storage = bucket(&Arc::new(MemoryS3::default()))?;
-    let capabilities = storage
-        .namespace(&PreflightPolicy::production())?
-        .capabilities();
+    let capabilities = storage.namespace()?.capabilities();
     let root = tempfile::tempdir()?;
     let local = test_destination_storage(root.path(), "directory-object-action")?;
     assert_eq!(

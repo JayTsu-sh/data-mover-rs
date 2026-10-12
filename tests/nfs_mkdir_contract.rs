@@ -53,8 +53,8 @@ use data_mover::model::{EntryKind, FailureClass, StoragePath, Transience};
 use data_mover::storage::{
     BackendConfig, CreateDirectoryAllFailure, DeleteTreeOutcome, DeleteTreeRequest,
     DestinationPrepareRequest, FinalDestination, LocalBackendConfig, MetadataMutation,
-    NfsBackendConfig, PreflightPolicy, PrepareRequest, SourceDescriptor, Storage,
-    StorageRoleFailure, connect_backend, create_directory_all, delete_tree,
+    NfsBackendConfig, PrepareRequest, SourceDescriptor, Storage, StorageRoleFailure,
+    connect_backend, create_directory_all, delete_tree,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -70,7 +70,7 @@ async fn real_nfs_create_directory_all_passes_existing_levels_it_may_not_write()
     let owner = connect(&url).await?;
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let scratch = format!("dm-mkdir-{nanos}");
-    let namespace = owner.namespace(&PreflightPolicy::production())?;
+    let namespace = owner.namespace()?;
     // Never adopt an existing directory: everything this test deletes, it created.
     if namespace.stat(&path(&scratch)?).await.is_ok() {
         return Err(format!("{scratch} already exists").into());
@@ -104,7 +104,7 @@ async fn exercise(url: &str, owner: &Storage, scratch: &str) -> Result {
     // handle the other cached.
     let probe_id = id + 1;
     let probe = connect(&with_identity(url, probe_id)).await?;
-    let probe = probe.namespace(&PreflightPolicy::production())?;
+    let probe = probe.namespace()?;
     for existing in [scratch, ro.as_str()] {
         let answer = probe.create_directory(&path(existing)?).await;
         eprintln!(
@@ -114,7 +114,7 @@ async fn exercise(url: &str, owner: &Storage, scratch: &str) -> Result {
     }
 
     let caller = connect(&with_identity(url, id)).await?;
-    let namespace = caller.namespace(&PreflightPolicy::production())?;
+    let namespace = caller.namespace()?;
 
     let new_below_writable = format!("{writable}/new");
     create_directory_all(&caller, &path(&new_below_writable)?)
@@ -160,10 +160,7 @@ async fn describe_local(root: &Path) -> Result<SourceDescriptor> {
         write_concurrency: nonzero(2)?,
     }))
     .await?;
-    Ok(local
-        .read_source(&PreflightPolicy::production())?
-        .describe(&path("f")?)
-        .await?)
+    Ok(local.read_source()?.describe(&path("f")?).await?)
 }
 
 fn prepare_request(source: &SourceDescriptor, target: &str) -> Result<DestinationPrepareRequest> {
@@ -187,7 +184,7 @@ async fn write_below_refused_level(
     ro: &str,
 ) -> Result {
     let target = format!("{ro}/missing/sub/f");
-    let staged = caller.staged_destination(&PreflightPolicy::production())?;
+    let staged = caller.staged_destination()?;
     let failure = match staged
         .prepare_at_destination(prepare_request(source, &target)?)
         .await
@@ -221,7 +218,7 @@ async fn write_below_refused_level(
 /// Unknown, retryable), and a refused missing parent of the destination is reported at that
 /// parent. Nothing is moved.
 async fn renames_refused_at_their_level(caller: &Storage, ro: &str, writable: &str) -> Result {
-    let namespace = caller.namespace(&PreflightPolicy::production())?;
+    let namespace = caller.namespace()?;
     let keep = format!("{ro}/keep");
     let renamed = format!("{ro}/kept");
     let answer = namespace.rename(&path(&keep)?, &path(&renamed)?).await;
@@ -300,7 +297,7 @@ async fn rebuild_deleted_cached_directories(
     create_directory_all(caller, &path(&below)?)
         .await
         .map_err(|error| format!("create_directory_all({below}) after deletion: {error:?}"))?;
-    let namespace = caller.namespace(&PreflightPolicy::production())?;
+    let namespace = caller.namespace()?;
     if namespace.stat(&path(&below)?).await?.kind != EntryKind::Directory {
         return Err(format!("{below} is not a directory").into());
     }
@@ -312,7 +309,7 @@ async fn rebuild_deleted_cached_directories(
     create_directory_all(caller, &path(&cached)?).await?;
     delete_as_owner(owner, &cached).await?;
     let target = format!("{cached}/f");
-    let staged = caller.staged_destination(&PreflightPolicy::production())?;
+    let staged = caller.staged_destination()?;
     let stage = staged
         .prepare_at_destination(prepare_request(source, &target)?)
         .await
@@ -353,7 +350,7 @@ async fn read_only_file_system(storage: &Storage, scratch: &str) -> Result {
         return Err(format!("NFS_REAL_RO_PATH must start with {{scratch}}/: {existing}").into());
     }
     let existing = existing.replace("{scratch}", scratch);
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     let found = namespace.stat(&path(&existing)?).await?;
     if found.kind != EntryKind::Directory {
         return Err(format!("{existing} is a {:?}, not a directory", found.kind).into());
@@ -410,7 +407,7 @@ fn answer_of(answer: std::result::Result<(), StorageRoleFailure>) -> String {
 async fn chmod(storage: &Storage, value: &str, mode: u32) -> Result {
     let path = path(value)?;
     storage
-        .metadata(&PreflightPolicy::production())?
+        .metadata()?
         .apply(
             &path,
             MetadataMutation::Mode(mode),

@@ -2,7 +2,7 @@
 use data_mover::model::StoragePath;
 use data_mover::storage::{
     BackendConfig, DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest, LocalBackendConfig,
-    PreflightPolicy, connect_backend, create_directory_all, delete_tree,
+    connect_backend, create_directory_all, delete_tree,
 };
 use std::num::NonZeroUsize;
 use tokio_util::sync::CancellationToken;
@@ -19,13 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let path = StoragePath::new("dir1/dir2/dir3")?;
     create_directory_all(&storage, &path).await?;
-    println!(
-        "{:?}",
-        storage
-            .namespace(&PreflightPolicy::production())?
-            .stat(&path)
-            .await?
-    );
+    println!("{:?}", storage.namespace()?.stat(&path).await?);
     let mut session = delete_tree(
         &storage,
         DeleteTreeRequest {

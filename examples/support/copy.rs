@@ -7,7 +7,7 @@ use data_mover::model::{
     BackendKind, MetadataObservation, ObservationMode, ObservationPlan, ObservedEntry, StoragePath,
 };
 use data_mover::storage::ReadRequest;
-use data_mover::storage::{PreflightPolicy, Storage, create_directory_all};
+use data_mover::storage::{Storage, create_directory_all};
 use data_mover::transfer::InflightLimits;
 use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
@@ -55,12 +55,9 @@ pub async fn verify(source: &Storage, destination: &Storage, path: &StoragePath)
 
 /// Records public source identity, size and modification time for the example's state guard.
 pub async fn observe(source: &Storage, path: &StoragePath) -> Result<ObservedEntry> {
-    let descriptor = source
-        .read_source(&PreflightPolicy::production())?
-        .describe(path)
-        .await?;
+    let descriptor = source.read_source()?.describe(path).await?;
     let observations = source
-        .metadata(&PreflightPolicy::production())?
+        .metadata()?
         .observe_bound(
             path,
             &descriptor.source_identity,
@@ -84,7 +81,7 @@ pub async fn observe(source: &Storage, path: &StoragePath) -> Result<ObservedEnt
 }
 
 pub async fn hash(source: &Storage, path: &StoragePath) -> Result<(u64, String)> {
-    let reader = source.read_source(&PreflightPolicy::production())?;
+    let reader = source.read_source()?;
     let descriptor = reader.describe(path).await?;
     let expected = descriptor.size.ok_or("source size is unknown")?;
     let mut stream = reader

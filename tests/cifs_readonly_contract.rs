@@ -21,8 +21,8 @@ use std::path::Path;
 use data_mover::model::{EntryKind, FailureClass, StoragePath};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy,
-    CreateDirectoryAllFailure, LocalBackendConfig, Namespace, PreflightPolicy, Storage,
-    StorageRoleFailure, connect_backend, create_directory_all,
+    CreateDirectoryAllFailure, LocalBackendConfig, Namespace, Storage, StorageRoleFailure,
+    connect_backend, create_directory_all,
 };
 use data_mover::transfer::{
     InflightLimits, ReadBackVerification, TransferFailure, TransferIdentity, TransferOutcome,
@@ -168,7 +168,7 @@ async fn copy_out_and_verify(
 
 /// Every mutation of the read-only share is refused as `PermissionDenied`.
 async fn refuse_writes(storage: &Storage, local: &Storage, scratch: &Path, id: &str) -> Result {
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     let refused = format!("dm-ro-refused-{id}");
     // Keep the mkdir first: on a share that is in fact writable it succeeds, the test fails here,
     // and the fixtures are never offered to the delete and rename calls below.

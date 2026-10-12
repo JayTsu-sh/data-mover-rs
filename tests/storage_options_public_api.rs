@@ -2,7 +2,7 @@
 
 use std::num::NonZeroUsize;
 
-use data_mover::storage::{BackendConfig, LocalBackendConfig, PreflightPolicy};
+use data_mover::storage::{BackendConfig, LocalBackendConfig};
 use data_mover::transfer::{InflightLimits, TransferPolicy};
 
 #[test]
@@ -14,7 +14,7 @@ fn public_role_and_transfer_modules_expose_the_supported_local_path()
         write_concurrency: NonZeroUsize::new(7).ok_or("non-zero write limit")?,
     });
     assert!(matches!(config, BackendConfig::Local(_)));
-    let _preflight = PreflightPolicy::production();
+
     let _limits = InflightLimits::new(2, 128 * 1024, 2)?;
     assert_eq!(TransferPolicy::default(), TransferPolicy::Checkpointed);
     Ok(())

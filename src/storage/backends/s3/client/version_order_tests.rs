@@ -24,11 +24,11 @@ use bytes::Bytes;
 
 use super::*;
 use crate::model::{HistoryOrder, ObjectHistory, StoragePath, VersionRecord};
+use crate::storage::SourceDescriptor;
 use crate::storage::backends::s3::client::S3Storage;
 use crate::storage::backends::s3::client::tests::make_test_storage;
 use crate::storage::backends::s3::{S3Protocol, S3VersioningAtConnect, connect, tests::identity};
 use crate::storage::listing::testing::listed;
-use crate::storage::{PreflightPolicy, SourceDescriptor};
 
 const FULL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -138,7 +138,7 @@ fn listed_ids(entries: &[SourceDescriptor]) -> Vec<String> {
 async fn list_all(mut storage: S3Storage) -> TestResult<Vec<SourceDescriptor>> {
     storage.versioning_at_connect = S3VersioningAtConnect::Enabled;
     let roles = connect(Arc::new(storage), identity(), None)?;
-    let namespace = roles.namespace(&PreflightPolicy::production())?;
+    let namespace = roles.namespace()?;
     let (entries, failures) = listed(&*namespace, &StoragePath::root()).await?;
     assert!(failures.is_empty(), "{failures:?}");
     Ok(entries)

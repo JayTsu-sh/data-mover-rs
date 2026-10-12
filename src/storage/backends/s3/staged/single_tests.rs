@@ -444,7 +444,7 @@ async fn without_a_threshold_every_object_is_multipart() -> TestResult {
 async fn staged_tags_are_set_on_the_published_object() -> TestResult {
     let protocol = Arc::new(MemoryS3::default());
     let storage = crate::storage::backends::s3::connect(protocol.clone(), identity(), None)?;
-    let destination = storage.staged_destination(&crate::storage::PreflightPolicy::production())?;
+    let destination = storage.staged_destination()?;
     let payload = Bytes::from_static(b"tagged");
     let stage = destination
         .prepare_at_destination(restart(payload.len() as u64)?)

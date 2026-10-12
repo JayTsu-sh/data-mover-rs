@@ -6,8 +6,7 @@ use std::num::NonZeroUsize;
 
 use data_mover::model::{FailureClass, ObservationPlan, SourceVersion, StoragePath};
 use data_mover::storage::{
-    BackendConfig, LocalBackendConfig, PreflightPolicy, ReadRequest, Storage, StorageRoleFailure,
-    connect_backend,
+    BackendConfig, LocalBackendConfig, ReadRequest, Storage, StorageRoleFailure, connect_backend,
 };
 use data_mover::transfer::{
     InflightLimits, TransferPhase, TransferRequest, TransferSide, transfer,
@@ -36,7 +35,7 @@ async fn a_source_without_versions_refuses_a_named_version_everywhere() -> TestR
     let storage = local(root.path()).await?;
     let path = StoragePath::new("file")?;
     let named = SourceVersion::Id("v1".into());
-    let source = storage.read_source(&PreflightPolicy::production())?;
+    let source = storage.read_source()?;
     assert!(!source.supports_source_versions());
 
     let described = source.describe_version(&path, &named).await;
@@ -62,7 +61,7 @@ async fn a_source_without_versions_refuses_a_named_version_everywhere() -> TestR
     assert!(unsupported(&read), "a named version was read");
 
     let observed = storage
-        .metadata(&PreflightPolicy::production())?
+        .metadata()?
         .observe_copy_bound_version(
             &path,
             &current.source_identity,

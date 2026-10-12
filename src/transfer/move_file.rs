@@ -3,9 +3,7 @@
 use std::{error::Error, fmt};
 
 use crate::model::{EntryKind, SourceVersion};
-use crate::storage::{
-    CapabilityUnavailable, PreflightPolicy, SourceDescriptor, StorageRoleFailure,
-};
+use crate::storage::{CapabilityUnavailable, SourceDescriptor, StorageRoleFailure};
 
 use super::{ReadBackVerification, TransferFailure, TransferOutcome, TransferRequest, transfer};
 
@@ -78,18 +76,15 @@ impl From<MoveError> for MoveFailure {
 /// published copy in [`MoveFailure::published`], so callers need not copy it again.
 pub async fn move_file(mut request: TransferRequest) -> Result<TransferOutcome, MoveFailure> {
     validate(&request)?;
-    let policy = PreflightPolicy::production();
-    let namespace = request
-        .source
-        .namespace(&policy)
-        .map_err(MoveError::Capability)?;
+
+    let namespace = request.source.namespace().map_err(MoveError::Capability)?;
     namespace
         .capabilities()
         .delete
         .map_err(MoveError::InvalidRequest)?;
     let source = request
         .source
-        .read_source(&policy)
+        .read_source()
         .map_err(MoveError::Capability)?;
     let before = source
         .describe(&request.source_path)

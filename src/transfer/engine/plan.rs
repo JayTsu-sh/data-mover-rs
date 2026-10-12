@@ -10,8 +10,7 @@ use super::{
 };
 use crate::model::{EntryKind, StoragePath};
 use crate::storage::{
-    NativePair, PreflightPolicy, PreparedStage, ReadSource, SourceDescriptor, SourceQosBudget,
-    StagedDestination,
+    NativePair, PreparedStage, ReadSource, SourceDescriptor, SourceQosBudget, StagedDestination,
 };
 use crate::transfer::identity::{BindingSource, binding_hash};
 use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy, TransferRequest};
@@ -174,19 +173,15 @@ pub(super) struct TransferRoles {
 pub(super) fn lend_transfer_roles(
     request: &TransferRequest,
 ) -> Result<TransferRoles, TransferFailure> {
-    let policy = PreflightPolicy::production();
-    let source = request.source.read_source(&policy).map_err(|_| {
+    let source = request.source.read_source().map_err(|_| {
         TransferFailure::capability(TransferSide::Source, "source capability unavailable")
     })?;
-    let destination = request
-        .destination
-        .staged_destination(&policy)
-        .map_err(|_| {
-            TransferFailure::capability(
-                TransferSide::Destination,
-                "destination capability unavailable",
-            )
-        })?;
+    let destination = request.destination.staged_destination().map_err(|_| {
+        TransferFailure::capability(
+            TransferSide::Destination,
+            "destination capability unavailable",
+        )
+    })?;
     // A directory object (a path ending in '/', P7 F5) only on a side that holds them.
     refuse_unholdable(
         &request.final_path,

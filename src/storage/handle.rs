@@ -5,7 +5,7 @@ use crate::model::{BackendIdentity, BackendKind};
 
 use super::{
     BackendCapabilities, Capability, CapabilityUnavailable, Metadata, Namespace, NativeEndpoint,
-    NativePair, PreflightPolicy, ReadSource, StagedDestination,
+    NativePair, ReadSource, StagedDestination,
 };
 
 #[derive(Clone, Default)]
@@ -133,12 +133,8 @@ impl Storage {
     ///
     /// # Errors
     /// Returns a typed preflight refusal before the role can perform backend I/O.
-    pub fn read_source(
-        &self,
-        policy: &PreflightPolicy,
-    ) -> Result<Arc<dyn ReadSource>, CapabilityUnavailable> {
-        self.capabilities
-            .preflight(Capability::ReadSource, policy)?;
+    pub fn read_source(&self) -> Result<Arc<dyn ReadSource>, CapabilityUnavailable> {
+        self.capabilities.preflight(Capability::ReadSource)?;
         let role = &self.backend.roles().read_source;
         role.as_ref()
             .map(Arc::clone)
@@ -149,12 +145,8 @@ impl Storage {
     ///
     /// # Errors
     /// Returns a typed preflight refusal before the role can perform backend I/O.
-    pub fn staged_destination(
-        &self,
-        policy: &PreflightPolicy,
-    ) -> Result<Arc<dyn StagedDestination>, CapabilityUnavailable> {
-        self.capabilities
-            .preflight(Capability::StagedDestination, policy)?;
+    pub fn staged_destination(&self) -> Result<Arc<dyn StagedDestination>, CapabilityUnavailable> {
+        self.capabilities.preflight(Capability::StagedDestination)?;
         let role = &self.backend.roles().staged_destination;
         role.as_ref()
             .map(Arc::clone)
@@ -165,11 +157,8 @@ impl Storage {
     ///
     /// # Errors
     /// Returns a typed preflight refusal before the role can perform backend I/O.
-    pub fn namespace(
-        &self,
-        policy: &PreflightPolicy,
-    ) -> Result<Arc<dyn Namespace>, CapabilityUnavailable> {
-        self.capabilities.preflight(Capability::Namespace, policy)?;
+    pub fn namespace(&self) -> Result<Arc<dyn Namespace>, CapabilityUnavailable> {
+        self.capabilities.preflight(Capability::Namespace)?;
         let role = &self.backend.roles().namespace;
         role.as_ref()
             .map(Arc::clone)
@@ -181,7 +170,7 @@ impl Storage {
     /// that lends no namespace holds none. No I/O.
     #[must_use]
     pub fn holds_directory_objects(&self) -> bool {
-        self.namespace(&PreflightPolicy::production())
+        self.namespace()
             .is_ok_and(|namespace| namespace.capabilities().directory_objects)
     }
 
@@ -191,10 +180,9 @@ impl Storage {
     /// Returns a typed preflight refusal before the role can perform backend I/O.
     pub(crate) fn mutable_namespace(
         &self,
-        policy: &PreflightPolicy,
         capability: impl FnOnce(super::NamespaceCapabilities) -> Result<(), &'static str>,
     ) -> Result<Arc<dyn Namespace>, CapabilityUnavailable> {
-        let namespace = self.namespace(policy)?;
+        let namespace = self.namespace()?;
         match capability(namespace.capabilities()) {
             Err(reason) => Err(CapabilityUnavailable::unsupported(
                 Capability::Namespace,
@@ -208,11 +196,8 @@ impl Storage {
     ///
     /// # Errors
     /// Returns a typed preflight refusal before the role can perform backend I/O.
-    pub fn metadata(
-        &self,
-        policy: &PreflightPolicy,
-    ) -> Result<Arc<dyn Metadata>, CapabilityUnavailable> {
-        self.capabilities.preflight(Capability::Metadata, policy)?;
+    pub fn metadata(&self) -> Result<Arc<dyn Metadata>, CapabilityUnavailable> {
+        self.capabilities.preflight(Capability::Metadata)?;
         let role = &self.backend.roles().metadata;
         role.as_ref()
             .map(Arc::clone)
@@ -281,12 +266,10 @@ mod tests {
                 None,
             )?;
             assert_eq!(storage.kind(), kind);
-            assert!(storage.read_source(&PreflightPolicy::production()).is_ok());
-            assert!(
-                storage
-                    .staged_destination(&PreflightPolicy::production())
-                    .is_err()
-            );
+            assert!(storage.read_source().is_ok());
+            assert!(storage.staged_destination().is_err());
+            assert!(storage.namespace().is_err());
+            assert!(storage.metadata().is_err());
         }
         Ok(())
     }

@@ -409,11 +409,11 @@ async fn real_share_exercises_domain_roles_without_wire_api()
         std::num::NonZeroUsize::new(8).ok_or("zero write depth")?,
         use_file_ids,
     )?;
-    let policy = crate::storage::PreflightPolicy::production();
-    let namespace = storage.namespace(&policy)?;
+
+    let namespace = storage.namespace()?;
     let (entries, _) = listed(namespace.as_ref(), &StoragePath::root()).await?;
     if let Some(file) = entries.iter().find(|entry| entry.kind == EntryKind::File) {
-        let source = storage.read_source(&policy)?;
+        let source = storage.read_source()?;
         let described = source.describe(&file.path).await?;
         let end = described.size.unwrap_or_default().min(4096);
         let mut stream = source
@@ -435,7 +435,7 @@ async fn real_share_exercises_domain_roles_without_wire_api()
         }
         assert_eq!(observed, end);
     }
-    let metadata = storage.metadata(&policy)?;
+    let metadata = storage.metadata()?;
     let _ = metadata
         .observe(
             &StoragePath::root(),
@@ -444,7 +444,7 @@ async fn real_share_exercises_domain_roles_without_wire_api()
         )
         .await?;
     if std::env::var("CIFS_EXPECT_READ_ONLY").as_deref() == Ok("true") {
-        let destination = storage.staged_destination(&policy)?;
+        let destination = storage.staged_destination()?;
         let source_identity = crate::model::SourceIdentity::new(
             storage.identity().clone(),
             crate::model::IdentityStrength::PathScoped,
@@ -483,11 +483,11 @@ async fn real_share_recovers_durable_prefix_across_lifs() -> Result<(), Box<dyn 
     let fixture = RecoveryFixture::new(&config.identity)?;
     let first = config.connect(&config.first_server).await?;
     let second = config.connect(&config.second_server).await?;
-    let policy = crate::storage::PreflightPolicy::production();
-    let recovery = write_durable_prefix(&first.storage, &policy, &fixture).await;
+
+    let recovery = write_durable_prefix(&first.storage, &fixture).await;
     first.close().await;
     let result = match recovery {
-        Ok(()) => run_recovered_half(&second.storage, &policy, &fixture).await,
+        Ok(()) => run_recovered_half(&second.storage, &fixture).await,
         Err(error) => Err(error),
     };
     let cleanup = cleanup_real_fixture(&second.share, config.root.as_deref(), &fixture).await;
@@ -608,10 +608,9 @@ fn real_source_descriptor(
 
 async fn write_durable_prefix(
     storage: &crate::storage::Storage,
-    policy: &crate::storage::PreflightPolicy,
     fixture: &RecoveryFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let destination = storage.staged_destination(policy)?;
+    let destination = storage.staged_destination()?;
     let stage = destination
         .prepare_at_destination(fixture.prepare())
         .await?;
@@ -633,10 +632,9 @@ async fn write_durable_prefix(
 
 async fn run_recovered_half(
     storage: &crate::storage::Storage,
-    policy: &crate::storage::PreflightPolicy,
     fixture: &RecoveryFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let destination = storage.staged_destination(policy)?;
+    let destination = storage.staged_destination()?;
     let stage = destination
         .prepare_at_destination(fixture.prepare().with_resume(ResumeMode::Discover))
         .await?;
@@ -656,18 +654,17 @@ async fn run_recovered_half(
         )
         .await?;
     verify_and_publish(destination.as_ref(), &stage, fixture).await?;
-    assert_real_payload(storage, policy, &fixture.final_path, &fixture.payload).await?;
-    round_trip_acl(storage, policy, &fixture.final_path).await?;
-    assert_real_failure_isolation(storage, policy, fixture).await
+    assert_real_payload(storage, &fixture.final_path, &fixture.payload).await?;
+    round_trip_acl(storage, &fixture.final_path).await?;
+    assert_real_failure_isolation(storage, fixture).await
 }
 
 async fn assert_real_payload(
     storage: &crate::storage::Storage,
-    policy: &crate::storage::PreflightPolicy,
     path: &StoragePath,
     expected: &Bytes,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let source = storage.read_source(policy)?;
+    let source = storage.read_source()?;
     let descriptor = source.describe(path).await?;
     let mut stream = source
         .read(ReadRequest {
@@ -723,10 +720,9 @@ async fn verify_and_publish(
 
 async fn assert_real_failure_isolation(
     storage: &crate::storage::Storage,
-    policy: &crate::storage::PreflightPolicy,
     fixture: &RecoveryFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let source = storage.read_source(policy)?;
+    let source = storage.read_source()?;
     let missing = source
         .describe(&StoragePath::new("data-mover-missing-entry")?)
         .await;
@@ -755,15 +751,14 @@ async fn assert_real_failure_isolation(
         Err(crate::storage::StorageRoleFailure::Entry(error))
             if error.class() == crate::model::FailureClass::Cancelled
     ));
-    assert_real_payload(storage, policy, &fixture.final_path, &fixture.payload).await
+    assert_real_payload(storage, &fixture.final_path, &fixture.payload).await
 }
 
 async fn round_trip_acl(
     storage: &crate::storage::Storage,
-    policy: &crate::storage::PreflightPolicy,
     path: &StoragePath,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let metadata = storage.metadata(policy)?;
+    let metadata = storage.metadata()?;
     let observed = match metadata
         .observe(
             path,

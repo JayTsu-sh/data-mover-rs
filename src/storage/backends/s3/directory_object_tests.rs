@@ -18,7 +18,7 @@ fn path(value: &str) -> StoragePath {
 
 fn namespace(protocol: &Arc<MemoryS3>) -> TestResult<Arc<dyn Namespace>> {
     let storage = connect(protocol.clone(), identity(), None)?;
-    Ok(storage.namespace(&validation_policy())?)
+    Ok(storage.namespace()?)
 }
 
 async fn put(protocol: &MemoryS3, key: &str, body: &'static [u8]) -> TestResult {

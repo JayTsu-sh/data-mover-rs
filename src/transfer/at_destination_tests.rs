@@ -578,17 +578,14 @@ async fn expert_run(
     destination: &Arc<MemoryDestination>,
 ) -> TestResult<Result<crate::transfer::TransferOutcome, crate::transfer::TransferFailure>> {
     use crate::model::ObservedEntry;
-    use crate::storage::PreflightPolicy;
+
     use crate::transfer::{
         ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest,
         ExpertSourceSession,
     };
     let (source, _) = test_source_storage(source_root, "at-destination-source")?;
     let path = StoragePath::new("source.bin")?;
-    let described = source
-        .read_source(&PreflightPolicy::production())?
-        .describe(&path)
-        .await?;
+    let described = source.read_source()?.describe(&path).await?;
     let observation = ObservedEntry::new(
         described.path,
         described.kind,

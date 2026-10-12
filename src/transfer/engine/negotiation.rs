@@ -14,8 +14,7 @@ use crate::metadata::{
 use crate::model::{MetadataObservation, MetadataObservations, ObservationMode, ObservationPlan};
 use crate::storage::{
     CopiedAclTarget, CopiedMetadataTarget, CopiedOwnershipTarget, CopiedTimestampTarget,
-    CopiedValueTarget, Metadata, PreflightPolicy, SourceDescriptor, StagedDestination,
-    StorageRoleFailure,
+    CopiedValueTarget, Metadata, SourceDescriptor, StagedDestination, StorageRoleFailure,
 };
 use crate::transfer::{CopiedMetadataRequest, TransferRequest};
 
@@ -129,15 +128,9 @@ struct MetadataRoles {
 /// metadata and without a report — today only a non-unix Local, the one role without a copy
 /// baseline or a destination target.
 fn metadata_roles(request: &TransferRequest) -> Option<MetadataRoles> {
-    let source = request
-        .source
-        .metadata(&PreflightPolicy::production())
-        .ok()?;
+    let source = request.source.metadata().ok()?;
     let baseline = source.copied_metadata_observation_plan()?;
-    let destination = request
-        .destination
-        .staged_destination(&PreflightPolicy::production())
-        .ok()?;
+    let destination = request.destination.staged_destination().ok()?;
     let target = destination.copied_metadata_target()?;
     Some(MetadataRoles {
         source,

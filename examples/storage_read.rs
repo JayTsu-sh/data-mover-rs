@@ -1,7 +1,7 @@
 //! Reads bounded chunks from a described source and verifies the complete byte count.
 use clap::Parser;
 use data_mover::model::{EntryKind, StoragePath};
-use data_mover::storage::{PreflightPolicy, ReadRequest};
+use data_mover::storage::ReadRequest;
 use futures::StreamExt as _;
 use tokio_util::sync::CancellationToken;
 
@@ -24,7 +24,7 @@ struct Args {
 async fn main() -> Result {
     let args = Args::parse();
     let storage = endpoint_support::connect_with_options(&args.storage, false, None).await?;
-    let source = storage.read_source(&PreflightPolicy::production())?;
+    let source = storage.read_source()?;
     let path = StoragePath::new(args.path)?;
     let described = source.describe(&path).await?;
     if described.kind != EntryKind::File {

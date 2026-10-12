@@ -51,7 +51,7 @@
 
 use std::fmt;
 
-use super::{CapabilityUnavailable, Namespace, PreflightPolicy, Storage, StorageRoleFailure};
+use super::{CapabilityUnavailable, Namespace, Storage, StorageRoleFailure};
 use crate::model::{
     EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath, Transience,
 };
@@ -111,8 +111,7 @@ pub async fn create_directory_all(
     storage: &Storage,
     path: &StoragePath,
 ) -> Result<(), CreateDirectoryAllFailure> {
-    let namespace =
-        storage.mutable_namespace(&PreflightPolicy::production(), |caps| caps.create_directory)?;
+    let namespace = storage.mutable_namespace(|caps| caps.create_directory)?;
     create_directory_all_with_namespace(namespace.as_ref(), path).await
 }
 

@@ -26,8 +26,7 @@ use data_mover::metadata::{ApplicationOutcome, MetadataApplicationReport, Metada
 use data_mover::model::{FailureClass, StoragePath};
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, LocalBackendConfig,
-    NfsBackendConfig, PreflightPolicy, S3BackendConfig, Storage, StorageRoleFailure,
-    connect_backend,
+    NfsBackendConfig, S3BackendConfig, Storage, StorageRoleFailure, connect_backend,
 };
 use data_mover::transfer::{
     CopiedMetadataRequest, InflightLimits, TransferIdentity, TransferOutcome, TransferRequest,
@@ -226,7 +225,7 @@ fn request(
 /// would otherwise replace it with filler.
 async fn seed(source: &Storage, path: &str, bytes: usize) -> Result {
     let described = source
-        .read_source(&PreflightPolicy::production())?
+        .read_source()?
         .describe(&StoragePath::new(path)?)
         .await;
     match described {

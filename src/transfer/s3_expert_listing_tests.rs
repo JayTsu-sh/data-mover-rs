@@ -15,7 +15,7 @@ use crate::model::{IdentityStrength, ObservedEntry, StoragePath};
 use crate::storage::backends::s3::tests::{MemoryS3, Versioning, content_md5, identity};
 use crate::storage::backends::s3::{S3Protocol as _, S3VersioningAtConnect, connect};
 use crate::storage::listing::testing::listed as listed_current;
-use crate::storage::{PreflightPolicy, SourceDescriptor, Storage};
+use crate::storage::{SourceDescriptor, Storage};
 use crate::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest, ExpertSourceSession,
     InflightLimits, TransferOutcome,
@@ -63,7 +63,7 @@ async fn listed(protocol: &Arc<MemoryS3>, histories: bool) -> TestResult<Vec<Obs
         S3VersioningAtConnect::Never
     });
     let storage = connect(protocol.clone(), identity(), None)?;
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     let (entries, _) = listed_current(&*namespace, &StoragePath::root()).await?;
     entries
         .iter()

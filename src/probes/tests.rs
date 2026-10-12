@@ -3,7 +3,7 @@ use std::{error::Error, num::NonZeroUsize};
 use crate::model::{BackendIdentity, BackendKind};
 use crate::probes::{check_connectivity, probe_server_time};
 use crate::storage::backends::local::connect_backend;
-use crate::storage::{LocalBackendConfig, PreflightPolicy, Storage};
+use crate::storage::{LocalBackendConfig, Storage};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -31,16 +31,16 @@ async fn remote_clock_composition_writes_observes_and_removes_its_probe() -> Tes
         read_concurrency: slots,
         write_concurrency: slots,
     })?;
-    let policy = PreflightPolicy::production();
+
     // A remote-kind facade over real local roles exercises the shared composition without a
     // network fixture. Local's public clock shortcut is tested independently above.
     let remote = Storage::connected(
         BackendIdentity::new(BackendKind::Hdfs, "clock-test")?,
         local.capabilities().clone(),
-        Some(local.read_source(&policy)?),
-        Some(local.staged_destination(&policy)?),
-        Some(local.namespace(&policy)?),
-        Some(local.metadata(&policy)?),
+        Some(local.read_source()?),
+        Some(local.staged_destination()?),
+        Some(local.namespace()?),
+        Some(local.metadata()?),
         None,
     )?;
     let before = std::time::SystemTime::now();

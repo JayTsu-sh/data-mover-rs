@@ -2,7 +2,7 @@
 use data_mover::DslTraversalFilter;
 use data_mover::model::{EntryKind, FailureClass, StoragePath};
 use data_mover::storage::{
-    BackendConfig, HdfsBackendConfig, PreflightPolicy, Storage, StorageRoleFailure, connect_backend,
+    BackendConfig, HdfsBackendConfig, Storage, StorageRoleFailure, connect_backend,
 };
 use data_mover::storage::{HdfsConfig, build_hdfs_client};
 use data_mover::traversal::{
@@ -474,11 +474,7 @@ async fn nightly_lab_validates_factory_root_lifecycle() -> TestResult {
     assert!(connect_backend(config(false)).await.is_err());
     let storage = connect_backend(config(true)).await?;
     assert_eq!(
-        storage
-            .namespace(&PreflightPolicy::production())?
-            .stat(&StoragePath::root())
-            .await?
-            .kind,
+        storage.namespace()?.stat(&StoragePath::root()).await?.kind,
         EntryKind::Directory
     );
     raw.delete(parsed.root(), true).await?;
@@ -497,7 +493,7 @@ async fn nightly_lab_lists_exactly_one_directory() -> TestResult {
     }
     create_hdfs_file(&raw, "混合/file.txt", bytes::Bytes::from_static(b"content")).await?;
     create_hdfs_file(&raw, "混合/nested/deep.txt", bytes::Bytes::new()).await?;
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     assert!(
         create_directory_all(&storage, &StoragePath::new("混合/file.txt")?)
             .await
@@ -548,7 +544,7 @@ async fn nightly_lab_namespace_rename_delete_and_artifacts() -> TestResult {
         bytes::Bytes::from_static(b"artifact"),
     )
     .await?;
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     assert!(namespace.delete(&StoragePath::new("tree")?).await.is_err());
     namespace
         .rename(
@@ -619,7 +615,7 @@ async fn nightly_lab_reads_positional_ranges_and_common_stream() -> TestResult {
             .collect::<Vec<_>>(),
     );
     create_hdfs_file(&raw, "file", data.clone()).await?;
-    let source = storage.read_source(&PreflightPolicy::production())?;
+    let source = storage.read_source()?;
     let descriptor = source.describe(&StoragePath::new("file")?).await?;
     for (offset, length) in [(0, 7), (1024 * 1024 - 3, 19), (0, data.len() as u64)] {
         let stream = source
@@ -787,7 +783,7 @@ async fn nightly_lab_mutates_hdfs_native_metadata_safely() -> TestResult {
     let (raw, storage) = fixture("metadata").await?;
     create_hdfs_file(&raw, "file", bytes::Bytes::from_static(b"content")).await?;
     let path = StoragePath::new("file")?;
-    let metadata = storage.metadata(&PreflightPolicy::production())?;
+    let metadata = storage.metadata()?;
     metadata
         .apply(
             &path,
@@ -816,10 +812,7 @@ async fn nightly_lab_mutates_hdfs_native_metadata_safely() -> TestResult {
     assert_eq!(status.permission, 0o640);
     assert_eq!(status.modification_time, 1_700_000_000_123);
     assert_eq!(status.access_time, 1_600_000_000_456);
-    let described = storage
-        .read_source(&PreflightPolicy::production())?
-        .describe(&path)
-        .await?;
+    let described = storage.read_source()?.describe(&path).await?;
     let permissions = metadata.permissions(&described).await?;
     assert_eq!(
         permissions.owner,
@@ -870,7 +863,7 @@ async fn nightly_lab_confines_independent_roots_and_cleanup() -> TestResult {
     assert_ne!(left.identity(), right.identity());
     // StoragePath preserves backend path spelling. The connected namespace must reject
     // traversal before reading or mutating the sentinel below the independent sibling root.
-    let namespace = left.namespace(&PreflightPolicy::production())?;
+    let namespace = left.namespace()?;
     let escape = StoragePath::new("../confine-right/sentinel")?;
     let sentinel = StoragePath::new("sentinel")?;
     let attempts = [
@@ -925,7 +918,7 @@ async fn nightly_lab_namespace_native_subtree_delete_requires_root_opt_in() -> T
         bytes::Bytes::from_static(b"remove me"),
     )
     .await?;
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     let root = StoragePath::root();
 
     let ordinary_delete = namespace.delete(&root).await;

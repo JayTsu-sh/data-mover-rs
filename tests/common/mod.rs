@@ -9,8 +9,7 @@ use std::path::Path;
 
 use data_mover::model::{EntryKind, ObservedEntry, StoragePath};
 use data_mover::storage::{
-    BackendConfig, BackendConnectError, LocalBackendConfig, PreflightPolicy, Storage,
-    connect_backend,
+    BackendConfig, BackendConnectError, LocalBackendConfig, Storage, connect_backend,
 };
 
 /// Connects a LOCAL endpoint through the role factory with symmetric read/write concurrency.
@@ -33,7 +32,7 @@ pub(crate) async fn observe_file(
     path: &str,
 ) -> Result<ObservedEntry, Box<dyn std::error::Error + Send + Sync>> {
     let path = StoragePath::new(path)?;
-    let source = storage.read_source(&PreflightPolicy::production())?;
+    let source = storage.read_source()?;
     let descriptor = source.describe(&path).await?;
     if descriptor.kind != EntryKind::File {
         return Err(format!("{} is not a file", descriptor.path.as_str()).into());

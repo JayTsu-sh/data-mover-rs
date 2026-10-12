@@ -2,8 +2,8 @@ use super::*;
 
 use data_mover::model::StoragePath;
 use data_mover::storage::{
-    DestinationPrepareRequest, FinalDestination, PreflightPolicy, PrepareFact, PrepareRequest,
-    ResumeMode, SourceDescriptor, Storage, connect_backend,
+    DestinationPrepareRequest, FinalDestination, PrepareFact, PrepareRequest, ResumeMode,
+    SourceDescriptor, Storage, connect_backend,
 };
 use data_mover::transfer::{
     InflightLimits, TransferIdentity, TransferPolicy, TransferRequest, transfer,
@@ -65,10 +65,10 @@ async fn interrupt_stage(
     content: &bytes::Bytes,
 ) -> TestResult<SourceDescriptor> {
     let descriptor = storage
-        .read_source(&PreflightPolicy::production())?
+        .read_source()?
         .describe(&StoragePath::new("source")?)
         .await?;
-    let destination = storage.staged_destination(&PreflightPolicy::production())?;
+    let destination = storage.staged_destination()?;
     // A stage an earlier failed run left in this root is cleaned up, not resumed.
     let stage = destination
         .prepare_at_destination(resume_request(&descriptor)?.with_resume(ResumeMode::Restart))
@@ -107,7 +107,7 @@ async fn nightly_lab_recovers_closed_hdfs_prefix() -> TestResult {
 
     // A fresh connection finds the stage beside the final file and resumes it.
     let (raw, storage) = fixture("policy-runtime-recovery").await?;
-    let destination = storage.staged_destination(&PreflightPolicy::production())?;
+    let destination = storage.staged_destination()?;
     let resumed = destination
         .prepare_at_destination(resume_request(&descriptor)?)
         .await?;

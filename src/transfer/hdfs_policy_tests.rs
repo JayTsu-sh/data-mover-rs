@@ -8,9 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::model::{SourceVersion, StoragePath};
 use crate::storage::backends::hdfs::{connect, contract_tests::MemoryHdfs, test_identity};
-use crate::storage::{
-    InflightConfig, InflightRuntime, PreflightPolicy, PrepareFact, ReadBudget, ReadRequest,
-};
+use crate::storage::{InflightConfig, InflightRuntime, PrepareFact, ReadBudget, ReadRequest};
 use crate::transfer::{
     InflightLimits, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest,
     transfer,
@@ -292,7 +290,7 @@ async fn source_prefetch_obeys_chunks_bytes_and_operations() -> Result {
         protocol.configure_io(2, 8);
         protocol.insert("source", Bytes::from_static(b"abcd")).await;
         let storage = connect(protocol.clone(), test_identity("bounded")?)?;
-        let source = storage.read_source(&PreflightPolicy::production())?;
+        let source = storage.read_source()?;
         let cancel = CancellationToken::new();
         let (runtime, mut ordered) = InflightRuntime::channel(
             InflightConfig::new(chunks, bytes, operations)?,
@@ -426,11 +424,8 @@ async fn hdfs_source_metadata_is_bound_and_does_not_fabricate_numeric_ownership(
     protocol.insert("source", Bytes::from_static(b"old")).await;
     let storage = connect(protocol.clone(), test_identity("bound-metadata")?)?;
     let path = StoragePath::new("source")?;
-    let descriptor = storage
-        .read_source(&PreflightPolicy::production())?
-        .describe(&path)
-        .await?;
-    let metadata = storage.metadata(&PreflightPolicy::production())?;
+    let descriptor = storage.read_source()?.describe(&path).await?;
+    let metadata = storage.metadata()?;
     let plan = metadata
         .copied_metadata_observation_plan()
         .ok_or("copy plan missing")?;

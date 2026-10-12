@@ -6,8 +6,7 @@ use tokio_util::sync::CancellationToken;
 use crate::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
 use crate::storage::backends::local::connect_backend;
 use crate::storage::{
-    ListRequest, ListingStream, LocalBackendConfig, Namespace, PreflightPolicy, Storage,
-    StorageRoleFailure,
+    ListRequest, ListingStream, LocalBackendConfig, Namespace, Storage, StorageRoleFailure,
 };
 use crate::transfer::{
     InflightLimits, MoveError, ReadBackVerification, SourceVersion, TransferRequest, move_file,
@@ -126,14 +125,14 @@ async fn delete_failure_returns_published_copy_and_preserves_source() -> TestRes
     let to = tempfile::tempdir()?;
     std::fs::write(from.path().join("source"), b"copied")?;
     let storage = connect(from.path())?;
-    let policy = PreflightPolicy::production();
+
     let source = Storage::connected(
         storage.identity().clone(),
         storage.capabilities().clone(),
-        Some(storage.read_source(&policy)?),
-        Some(storage.staged_destination(&policy)?),
+        Some(storage.read_source()?),
+        Some(storage.staged_destination()?),
         Some(Arc::new(DenyDelete)),
-        Some(storage.metadata(&policy)?),
+        Some(storage.metadata()?),
         None,
     )?;
     let Err(failure) = move_file(request(source, connect(to.path())?)?).await else {

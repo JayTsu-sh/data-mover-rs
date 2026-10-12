@@ -12,7 +12,7 @@ use data_mover::model::{
 };
 use data_mover::storage::{
     BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, NfsBackendConfig,
-    PreflightPolicy, Storage, StorageRoleFailure, connect_backend,
+    Storage, StorageRoleFailure, connect_backend,
 };
 use futures::TryStreamExt as _;
 
@@ -257,7 +257,7 @@ impl NfsSymlinkFixture {
             TimePrecision::Nanoseconds,
         )?;
         storage
-            .namespace(&PreflightPolicy::production())?
+            .namespace()?
             .create_symlink(data_mover::storage::CreateSymlinkRequest {
                 path: StoragePath::new(&name)?,
                 target: SymlinkTarget::new(
@@ -275,7 +275,7 @@ impl NfsSymlinkFixture {
     }
 
     async fn remove(self) {
-        if let Ok(namespace) = self.storage.namespace(&PreflightPolicy::production()) {
+        if let Ok(namespace) = self.storage.namespace() {
             let _ = namespace
                 .delete(
                     &StoragePath::new(&self.name)
@@ -344,7 +344,7 @@ async fn probe_symlink_named(share: &smb_domain::Share, target: &Endpoint, name:
         password: target.pass.clone(),
     }))
     .await?;
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     let stat = namespace.stat(&StoragePath::new(&name)?).await;
     println!("[probe] symlink {name}: role stat -> {}", describe(&stat));
     Ok(())
@@ -370,7 +370,7 @@ async fn probe_namespace_role(target: &Endpoint) -> Result {
         password: target.pass.clone(),
     }))
     .await?;
-    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let namespace = storage.namespace()?;
     let dir = StoragePath::new(format!(
         "dm-cifs-probe-dir-{}",
         uuid::Uuid::new_v4().simple()

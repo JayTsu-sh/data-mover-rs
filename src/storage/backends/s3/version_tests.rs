@@ -15,7 +15,7 @@ const KEY: &str = "object";
 
 fn source(protocol: &Arc<MemoryS3>) -> TestResult<Arc<dyn ReadSource>> {
     let storage = connect(protocol.clone(), identity(), None)?;
-    Ok(storage.read_source(&validation_policy())?)
+    Ok(storage.read_source()?)
 }
 
 async fn read_all(source: &dyn ReadSource, descriptor: &SourceDescriptor) -> TestResult<Vec<u8>> {
@@ -177,7 +177,7 @@ async fn the_same_content_at_two_keys_has_two_identities() -> TestResult {
             .map_err(|e| format!("{e:?}"))?;
     }
     let storage = connect(protocol.clone(), identity(), None)?;
-    let source = storage.read_source(&validation_policy())?;
+    let source = storage.read_source()?;
     let mut keys = std::collections::HashSet::new();
     for key in ["a", "b", "d/a"] {
         let described = source.describe(&StoragePath::new(key)?).await?;
@@ -190,7 +190,7 @@ async fn the_same_content_at_two_keys_has_two_identities() -> TestResult {
             "{key}"
         );
     }
-    let namespace = storage.namespace(&validation_policy())?;
+    let namespace = storage.namespace()?;
     let (entries, _) = listed_current(&*namespace, &StoragePath::root()).await?;
     for listed in entries.iter().filter(|entry| entry.kind == EntryKind::File) {
         let described = source.describe(&listed.path).await?;
@@ -205,7 +205,7 @@ async fn the_same_content_at_two_keys_has_two_identities() -> TestResult {
             .map_err(|e| format!("{e:?}"))?;
     }
     // Suspended now: a connection made now lists histories (the answer is taken at connection).
-    let namespace = connect(protocol.clone(), identity(), None)?.namespace(&validation_policy())?;
+    let namespace = connect(protocol.clone(), identity(), None)?.namespace()?;
     let deleted: Vec<SourceDescriptor> = listed_current(&*namespace, &StoragePath::root())
         .await?
         .0
@@ -250,8 +250,8 @@ async fn a_listed_identity_never_matches_another_keys_describe() -> TestResult {
             .map_err(|e| format!("{e:?}"))?;
     }
     let storage = connect(protocol.clone(), identity(), None)?;
-    let source = storage.read_source(&validation_policy())?;
-    let namespace = storage.namespace(&validation_policy())?;
+    let source = storage.read_source()?;
+    let namespace = storage.namespace()?;
     let (entries, _) = listed_current(&*namespace, &StoragePath::root()).await?;
     let listed_a = entries
         .iter()

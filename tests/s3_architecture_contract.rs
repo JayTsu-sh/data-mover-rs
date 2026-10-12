@@ -4,9 +4,9 @@ use data_mover::model::{
     StoragePath,
 };
 use data_mover::storage::{
-    BackendConfig, DestinationPrepareRequest, FinalDestination, MetadataMutation, PreflightPolicy,
-    PrepareFact, PrepareRequest, PublishRequest, ReadRequest, RestartReason, ResumeMode,
-    S3BackendConfig, SourceDescriptor, Storage, VerifyRequest, connect_backend,
+    BackendConfig, DestinationPrepareRequest, FinalDestination, MetadataMutation, PrepareFact,
+    PrepareRequest, PublishRequest, ReadRequest, RestartReason, ResumeMode, S3BackendConfig,
+    SourceDescriptor, Storage, VerifyRequest, connect_backend,
 };
 use data_mover::transfer::{
     InflightLimits, PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferIdentity,
@@ -139,8 +139,8 @@ async fn verify_stale_upload_restart(
     let restart_path = StoragePath::new(format!("{}.restart", path.as_str()))?;
     let source = source_descriptor(identity, size)?;
     let request = |binding, resume| prepare_request(&restart_path, &source, binding, resume);
-    let policy = PreflightPolicy::production();
-    let destination = connected(url).await?.staged_destination(&policy)?;
+
+    let destination = connected(url).await?.staged_destination()?;
     // Whatever a crashed earlier run left on the key goes first.
     let earlier = destination
         .prepare_at_destination(request([9; 32], ResumeMode::Restart))
@@ -151,7 +151,7 @@ async fn verify_stale_upload_restart(
         .await?;
     assert_eq!(stale.prepare_fact(), PrepareFact::Fresh);
     drop(stale);
-    let destination = connected(url).await?.staged_destination(&policy)?;
+    let destination = connected(url).await?.staged_destination()?;
     let changed = destination
         .prepare_at_destination(request([10; 32], ResumeMode::Discover))
         .await?;
@@ -190,9 +190,9 @@ async fn stage_with_reconnect(
     payload: &Bytes,
 ) -> TestResult<(Storage, data_mover::storage::PreparedStage)> {
     eprintln!("S3 contract stage: prepare an upload on the final key");
-    let policy = PreflightPolicy::production();
+
     let storage = connected(url).await?;
-    let destination = storage.staged_destination(&policy)?;
+    let destination = storage.staged_destination()?;
     let source = source_descriptor(identity, payload.len())?;
     let request = || prepare_request(path, &source, [3; 32], ResumeMode::Discover);
     let stage = destination.prepare_at_destination(request()).await?;
@@ -205,7 +205,7 @@ async fn stage_with_reconnect(
     );
     drop(stage);
     let storage = connected(url).await?;
-    let destination = storage.staged_destination(&policy)?;
+    let destination = storage.staged_destination()?;
     eprintln!("S3 contract stage: resume the upload after reconnect");
     let resumed = destination.prepare_at_destination(request()).await?;
     // A failed input waits for the parts in flight: all four are listed.
@@ -265,8 +265,7 @@ async fn verify_publish_and_metadata(
     payload: &Bytes,
     supports_tags: bool,
 ) -> TestResult {
-    let policy = PreflightPolicy::production();
-    let destination = storage.staged_destination(&policy)?;
+    let destination = storage.staged_destination()?;
     let digest = *blake3::hash(payload).as_bytes();
     // An upload on the final key is read back after publication (`VerificationPoint::AfterPublish`).
     let published = destination
@@ -292,7 +291,7 @@ async fn verify_publish_and_metadata(
         )
         .await?;
     let tag = data_mover::model::ObjectTag::new("contract", "standard-s3")?;
-    let metadata = storage.metadata(&policy)?;
+    let metadata = storage.metadata()?;
     if !supports_tags {
         let observed = metadata
             .observe(
@@ -341,7 +340,7 @@ async fn verify_range_and_cancellation(
     path: &StoragePath,
     payload: &Bytes,
 ) -> TestResult {
-    let reader = storage.read_source(&PreflightPolicy::production())?;
+    let reader = storage.read_source()?;
     let observed = reader.describe(path).await?;
     let mut stream = reader
         .read(ReadRequest {

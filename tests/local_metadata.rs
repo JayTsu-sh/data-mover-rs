@@ -7,7 +7,7 @@ use data_mover::model::{
     Operation, StoragePath, StorageTimestamp, TimePrecision, TimestampMetadata,
 };
 use data_mover::storage::Storage;
-use data_mover::storage::{MetadataMutation, Namespace, PreflightPolicy};
+use data_mover::storage::{MetadataMutation, Namespace};
 
 mod common;
 
@@ -48,7 +48,7 @@ async fn local(root: &Path) -> Result<Storage, Box<dyn std::error::Error>> {
 fn namespace(
     storage: &Storage,
 ) -> Result<std::sync::Arc<dyn Namespace>, Box<dyn std::error::Error>> {
-    Ok(storage.namespace(&PreflightPolicy::production())?)
+    Ok(storage.namespace()?)
 }
 
 async fn observe_timestamps(
@@ -56,7 +56,7 @@ async fn observe_timestamps(
     path: &StoragePath,
 ) -> Result<MetadataObservations, Box<dyn std::error::Error>> {
     Ok(storage
-        .metadata(&PreflightPolicy::production())?
+        .metadata()?
         .observe(
             path,
             ObservationPlan::default().with_timestamps(ObservationMode::Required),
@@ -106,7 +106,7 @@ async fn local_timestamp_mutations_preserve_the_omitted_side()
         filetime::FileTime::from_unix_time(1_620_000_000, 456_000_000),
     )?;
     let storage = local(root.path()).await?;
-    let metadata = storage.metadata(&PreflightPolicy::production())?;
+    let metadata = storage.metadata()?;
     let initial = observe_timestamps(&storage, &path).await?;
     let initial_timestamps = match initial.timestamps() {
         MetadataObservation::Value { value, .. } => value,

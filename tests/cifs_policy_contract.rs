@@ -253,9 +253,9 @@ fn confirmed(outcome: smb_domain::CloseOutcome) -> Result {
 
 async fn assert_mtime(storage: &Storage, path: &str) -> Result {
     use data_mover::model::{MetadataObservation, ObservationMode, ObservationPlan};
-    use data_mover::storage::PreflightPolicy;
+
     let metadata = storage
-        .metadata(&PreflightPolicy::production())?
+        .metadata()?
         .observe(
             &StoragePath::new(path)?,
             ObservationPlan::default().with_timestamps(ObservationMode::Required),
@@ -310,11 +310,11 @@ async fn verify_directory_metadata(
     directory: &smb_domain::Directory,
 ) -> Result {
     use data_mover::model::{StorageTimestamp, TimePrecision, TimestampMetadata};
-    use data_mover::storage::{MetadataMutation, PreflightPolicy};
+    use data_mover::storage::MetadataMutation;
     let before = directory.metadata().await?;
     let storage = connect_remote(server, share).await?;
     storage
-        .metadata(&PreflightPolicy::production())?
+        .metadata()?
         .apply(
             &StoragePath::new(path)?,
             MetadataMutation::Timestamps(TimestampMetadata {

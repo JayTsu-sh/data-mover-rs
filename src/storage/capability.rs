@@ -23,35 +23,6 @@ fn required(value: impl Into<String>) -> Result<String, CapabilityValueError> {
     }
 }
 
-/// A durable acceptance-gate name.
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub struct ValidationGate(String);
-
-impl ValidationGate {
-    /// Creates a named validation gate.
-    ///
-    /// # Errors
-    /// Returns an error for blank or NUL-containing names.
-    pub fn new(value: impl Into<String>) -> Result<Self, CapabilityValueError> {
-        required(value).map(Self)
-    }
-
-    /// Returns the gate name.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for ValidationGate {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("ValidationGate")
-            .field(&self.0)
-            .finish()
-    }
-}
-
 /// A backend-provided explanation for an unsupported role.
 #[derive(Clone, Eq, PartialEq)]
 pub struct UnsupportedReason(String);
@@ -83,7 +54,6 @@ impl fmt::Debug for UnsupportedReason {
 pub enum CapabilityAvailability {
     Supported,
     Unsupported(UnsupportedReason),
-    Uncertified(ValidationGate),
 }
 
 /// The four public storage roles.
@@ -133,20 +103,10 @@ impl BackendCapabilities {
     /// Validates role availability before callers can cause backend side effects.
     ///
     /// # Errors
-    /// Returns the instance capability fact when the role is unsupported or the required
-    /// validation gate is not active.
-    pub fn preflight(
-        &self,
-        capability: Capability,
-        policy: &PreflightPolicy,
-    ) -> Result<(), CapabilityUnavailable> {
+    /// Returns the instance capability fact when the role is unsupported.
+    pub fn preflight(&self, capability: Capability) -> Result<(), CapabilityUnavailable> {
         let availability = self.availability(capability);
-        let allowed = match availability {
-            CapabilityAvailability::Supported => true,
-            CapabilityAvailability::Unsupported(_) => false,
-            CapabilityAvailability::Uncertified(required) => policy.gate.as_ref() == Some(required),
-        };
-        if allowed {
+        if matches!(availability, CapabilityAvailability::Supported) {
             Ok(())
         } else {
             Err(CapabilityUnavailable {
@@ -154,58 +114,6 @@ impl BackendCapabilities {
                 availability: availability.clone(),
             })
         }
-    }
-}
-
-/// Preflight authority. Production has no validation override.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PreflightPolicy {
-    gate: Option<ValidationGate>,
-}
-
-impl PreflightPolicy {
-    #[must_use]
-    pub const fn production() -> Self {
-        Self { gate: None }
-    }
-    #[must_use]
-    #[allow(dead_code)]
-    pub(crate) const fn validation(gate: ValidationGate) -> Self {
-        Self { gate: Some(gate) }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn internal_validation_authority_requires_exact_gate() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let required = ValidationGate::new("DM-CIFS-CONTRACT")?;
-        let capabilities = BackendCapabilities::new(
-            CapabilityAvailability::Supported,
-            CapabilityAvailability::Uncertified(required.clone()),
-            CapabilityAvailability::Supported,
-            CapabilityAvailability::Supported,
-        );
-        assert!(
-            capabilities
-                .preflight(
-                    Capability::StagedDestination,
-                    &PreflightPolicy::production()
-                )
-                .is_err()
-        );
-        assert!(
-            capabilities
-                .preflight(
-                    Capability::StagedDestination,
-                    &PreflightPolicy::validation(required)
-                )
-                .is_ok()
-        );
-        Ok(())
     }
 }
 

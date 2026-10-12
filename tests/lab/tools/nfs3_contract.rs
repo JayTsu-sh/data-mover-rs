@@ -11,8 +11,8 @@ use data_mover::model::{
 };
 use data_mover::storage::{
     BackendConfig, ByteStream, DestinationPrepareRequest, FinalDestination, MetadataMutation,
-    NfsBackendConfig, PreflightPolicy, PrepareFact, PrepareRequest, PublishRequest, ResumeMode,
-    Storage, StorageRoleFailure, VerifyRequest, connect_backend,
+    NfsBackendConfig, PrepareFact, PrepareRequest, PublishRequest, ResumeMode, Storage,
+    StorageRoleFailure, VerifyRequest, connect_backend,
 };
 use data_mover::transfer::{
     InflightLimits, SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferPolicy,
@@ -66,7 +66,7 @@ async fn validate_stale_retry(
     let (Some(ready), Some(go)) = (ready, go) else {
         return Ok(());
     };
-    let metadata = source.metadata(&PreflightPolicy::production())?;
+    let metadata = source.metadata()?;
     let stale_path = path("stale/fixture.bin")?;
     metadata
         .observe(
@@ -218,7 +218,7 @@ async fn validate_nfs4_stale_retry(
     root: &str,
     require_identity_change: bool,
 ) -> ContractResult {
-    let metadata = source.metadata(&PreflightPolicy::production())?;
+    let metadata = source.metadata()?;
     let stale = path("stale/fixture.bin")?;
     metadata
         .observe(
@@ -369,7 +369,7 @@ async fn validate_acl(
     if dialect == ContractDialect::Nfs3 {
         return Ok(());
     }
-    let metadata = source.metadata(&PreflightPolicy::production())?;
+    let metadata = source.metadata()?;
     let fixture = path("fixture.bin")?;
     let observed = metadata
         .observe(
@@ -481,9 +481,8 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
 /// that wrote them; a new connection resumes from the pointer's durable prefix, and a second one
 /// that resumes the same stage takes it over, so the first can no longer publish.
 async fn validate_recovery(source: &Storage, destination: Storage, url: &str) -> ContractResult {
-    let policy = PreflightPolicy::production();
     let descriptor = source
-        .read_source(&policy)?
+        .read_source()?
         .describe(&path("fixture.bin")?)
         .await?;
     let request = || -> Result<DestinationPrepareRequest, Box<dyn Error>> {
@@ -498,7 +497,7 @@ async fn validate_recovery(source: &Storage, destination: Storage, url: &str) ->
         .with_resume(ResumeMode::Discover)
         .with_recoverable(true))
     };
-    let destination_role = destination.staged_destination(&policy)?;
+    let destination_role = destination.staged_destination()?;
     let stage = destination_role.prepare_at_destination(request()?).await?;
     assert_eq!(stage.prepare_fact(), PrepareFact::Fresh);
     let payload = b"nfs3 durable recovery contract";
@@ -509,11 +508,11 @@ async fn validate_recovery(source: &Storage, destination: Storage, url: &str) ->
     drop(destination);
 
     let first = connect_destination(url).await?;
-    let first_role = first.staged_destination(&policy)?;
+    let first_role = first.staged_destination()?;
     let held = first_role.prepare_at_destination(request()?).await?;
     assert_eq!(held.prepare_fact(), PrepareFact::Resumed { bytes: 11 });
     let second = connect_destination(url).await?;
-    let second_role = second.staged_destination(&policy)?;
+    let second_role = second.staged_destination()?;
     let recovered = second_role.prepare_at_destination(request()?).await?;
     assert_eq!(recovered.prepare_fact(), PrepareFact::Resumed { bytes: 11 });
 

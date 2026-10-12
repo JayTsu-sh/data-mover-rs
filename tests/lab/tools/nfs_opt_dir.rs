@@ -14,9 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use data_mover::error::StorageError;
 use data_mover::model::{EntryKind, FailureClass, StoragePath};
 use data_mover::storage::{
-    BackendConfig, DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest, NfsBackendConfig,
-    PreflightPolicy, Storage, StorageRoleFailure, connect_backend, create_directory_all,
-    delete_tree,
+    BackendConfig, DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest, NfsBackendConfig, Storage,
+    StorageRoleFailure, connect_backend, create_directory_all, delete_tree,
 };
 use tokio_util::sync::CancellationToken;
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -36,11 +35,7 @@ async fn main() -> Result<()> {
     let scratch = format!("dm-e2e-opt-dir-{nanos}");
     // Only a definite NotFound permits this run to adopt the fresh scratch path.
     let path = StoragePath::new(&scratch)?;
-    match storage
-        .namespace(&PreflightPolicy::production())?
-        .stat(&path)
-        .await
-    {
+    match storage.namespace()?.stat(&path).await {
         Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {}
         Err(error) => return Err(error.into()),
         Ok(_) => return Err(format!("{scratch} already exists").into()),
@@ -73,10 +68,7 @@ async fn create_twice(url: &str, storage: &Storage, scratch: &str) -> Result<()>
     let rooted = connect(&sub_root_url(url, scratch)).await?;
     let path = StoragePath::new(NESTED)?;
     create_directory_all(&rooted, &path).await?;
-    let entry = rooted
-        .namespace(&PreflightPolicy::production())?
-        .stat(&path)
-        .await?;
+    let entry = rooted.namespace()?.stat(&path).await?;
     if entry.kind != EntryKind::Directory {
         return Err(format!("{nested} is not a directory").into());
     }

@@ -6,9 +6,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use data_mover::model::{ObservedEntry, SourceVersion, StoragePath};
-use data_mover::storage::{
-    BackendConfig, LocalBackendConfig, PreflightPolicy, Storage, connect_backend,
-};
+use data_mover::storage::{BackendConfig, LocalBackendConfig, Storage, connect_backend};
 use data_mover::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, InflightLimits, TransferIdentity,
     TransferPhase, TransferPolicy, TransferRequest, transfer,
@@ -116,7 +114,7 @@ async fn the_outcome_reports_the_derived_identity_or_the_override() -> TestResul
 
 async fn observe(storage: &Storage, path: &str) -> TestResult<ObservedEntry> {
     let descriptor = storage
-        .read_source(&PreflightPolicy::production())?
+        .read_source()?
         .describe(&StoragePath::new(path)?)
         .await?;
     Ok(ObservedEntry::new(

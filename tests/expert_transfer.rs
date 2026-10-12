@@ -1,9 +1,7 @@
 use std::num::NonZeroUsize;
 
 use data_mover::model::{ObservedEntry, StoragePath};
-use data_mover::storage::{
-    BackendConfig, LocalBackendConfig, PreflightPolicy, Storage, connect_backend,
-};
+use data_mover::storage::{BackendConfig, LocalBackendConfig, Storage, connect_backend};
 use data_mover::transfer::{
     ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceRequest, ExpertSourceSession,
     InflightLimits, TransferIdentity, TransferPolicy,
@@ -22,7 +20,7 @@ async fn local_storage(root: &std::path::Path) -> TestResult<Storage> {
 }
 
 async fn observe(storage: &Storage, path: &str) -> TestResult<ObservedEntry> {
-    let source = storage.read_source(&PreflightPolicy::production())?;
+    let source = storage.read_source()?;
     let descriptor = source.describe(&StoragePath::new(path)?).await?;
     Ok(ObservedEntry::new(
         descriptor.path,

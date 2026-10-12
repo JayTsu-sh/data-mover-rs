@@ -31,7 +31,7 @@ fn path(value: &str) -> StoragePath {
 
 fn namespace(protocol: &Arc<MemoryS3>) -> TestResult<Arc<dyn Namespace>> {
     let storage = connect(protocol.clone(), identity(), None)?;
-    Ok(storage.namespace(&validation_policy())?)
+    Ok(storage.namespace()?)
 }
 
 async fn put(protocol: &MemoryS3, key: &str, body: &'static [u8]) -> TestResult {
@@ -247,7 +247,7 @@ async fn stat_tells_objects_prefixes_and_absence_apart() -> TestResult {
 async fn namespace_mutations_are_checked_per_verb() -> TestResult {
     let protocol = bucket(&[("d/e", b"1")]).await?;
     let storage = connect(protocol.clone(), identity(), None)?;
-    let namespace = storage.namespace(&validation_policy())?;
+    let namespace = storage.namespace()?;
     let capabilities = namespace.capabilities();
     assert!(capabilities.create_directory.is_err());
     assert!(capabilities.delete.is_ok());
