@@ -1,10 +1,12 @@
 # ADR-0008: Streaming traversal, scan checkpoints, and per-key object history
 
-Status: accepted design; implemented through P7 C11b, validation in progress (2026-10-12).
+Status: accepted; C11b, C12 and legacy scan removal complete (2026-10-12). CI, available live
+matrices, MinIO 100,000-version validation and scan cancel/SIGKILL resume passed. DXN-2,
+StorageGRID and HDFS environment limitations are recorded in P7 §14.3.
 
 Supersedes the traversal and entry-snapshot portions of ADR-0006 C22. The detailed decisions,
 measurements and acceptance status are in [P7](../design/p7-streaming-listing.md). This ADR records
-the contract; it does not certify pending real-environment tests or legacy-code cleanup.
+the contract; P7 §14.3 records which real-environment gates passed or remain unavailable.
 
 ## Context
 
@@ -83,7 +85,11 @@ S3 connects with one fixed history capability derived from `GetBucketVersioning`
 | Enabled or Suspended | `ListObjectVersions` |
 | Explicit refusal, including 403 | `ListObjectVersions` |
 | Never versioned, unsupported versioning API, or NAS profile | `ListObjectsV2` |
-| Transient network/timeout/5xx after SDK retries (except 501) | Refuse role connection: `Connectivity` / `Transient` |
+| Transient network/timeout/408/429/5xx after SDK retries (except 501), or an undecodable HTTP 2xx answer | Refuse role connection: `Connectivity` / `Transient` |
+
+An HTTP success status alone is not a versioning answer. The SDK can wrap an invalid successful
+response in `ServiceError`; it still refuses connection rather than selecting a listing mode.
+Successfully decoded `Enabled` and empty versioning configurations retain their normal behavior.
 
 Every history key is an `ObservedEntry`, including a currently deleted key. `ObjectHistory`
 records run oldest first in the server's original interleaved response order. Failed ordering

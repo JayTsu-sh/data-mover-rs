@@ -58,6 +58,10 @@
 - **NFS**：卷 `ontap_lisaauto_nfs`（junction `/ontap_lisaauto_nfs`，unix，export policy default）。v3 / v4.0 / v4.1 都开着。
   - `mount_rootonly` 开着：**WSL 经 NAT 改写源端口，v3 MOUNT 被拒**（`AUTH_TOOWEAK` / “could not parse response due to bad status”）→ v3 在
     10.131.9.10 上以 root、特权端口跑（URL 不带 `noresvport`）。**不要改 SVM 设置**。v4.x 从 WSL 用 `noresvport=true`。
+    2026-10-12 复跑发现旧 profile 显式 `noresvport=true`，在 root Ubuntu 构建机也会使用临时端口而被拒；
+    改为 `version=3&noresvport=false` 后完整 runner 5,602 项、零失败，目录契约与清理均通过，源 / 目标 LIF
+    各只读 depth-1 也均 9 项零失败。nfs-rs 0.8.6 不写 `noresvport` 时默认 `false`；复用 profile 时务必核对，
+    不能仅凭服务可达或当前用户为 root 推断已经使用保留端口。此次未改服务或代码。
   - 卷根的 `.snapshot`（P7 C7 查清，C7b 修）：ONTAP 的 NFSv3 READDIRPLUS 列出它（未查 / 未改 SVM 设置），带句柄、**不带属性**；
     NFSv4 的 READDIR 不列它。它与卷根 fsid 相同（快照各自的 fsid 才不同），从任何目录 LOOKUP 都是同一对象，名字被保留
     （MKDIR `.snapshot` 回 `EXIST`），`~snapshot` 在 NFS 上 `NOENT`。C7b 起 role 遍历在 v3 上 LOOKUP 它、确认是目录后隐藏
@@ -99,6 +103,10 @@
 
 ### 2.3 DXN-2（NAS，10.128.136.211）
 
+- **2026-10-12 当前状态：环境受限，停止远端操作**。用户确认底层 ThinkFS 文件系统故障，并要求先完成代码验收、
+  不再尝试该环境。原生 `nfs-tfs.service` 与 v3 / v4 导出已经配置，不能根据通用 Linux exports 或 Kubernetes
+  清单判断设备没有 NFS。当前全部 MDS down、无 active IOA，NFS 没有 2049 监听 / mountd 注册；本轮 NFS 矩阵未验证。
+  调查未修改任何配置，也未启动、停止或重启服务。下列可挂载与用例结果属于此前的历史记录；恢复测试需另行安排。
 - NFS 导出 `/nfv3`（只 v3）、`/nfv3_v4`（v3 + v4.0）、`/share1`、`/along_nfs`，都是别人的；另开着 SMB（445）与 Web（80/443）。
 - **我们只写 `/nfv3_v4/data-mover-test/`**（用户 2026-09-26 批准，目录已建）。环境文件把导出写成 `/nfv3_v4:/data-mover-test`，
   URL 根就落在子目录里，`nfs_opt_dir` 之类的写操作不会越界。v3 与 v4.0 都从 WSL 用 `noresvport=true` 可挂。

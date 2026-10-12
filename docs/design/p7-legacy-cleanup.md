@@ -45,6 +45,12 @@ integration/example and clippy checks; meaningful behavior assertions stay on th
 interfaces rather than testing retired NDX numbering. Real-environment gates remain the matrices
 in P7 §14, including NFS deletion artifacts and S3 directory-object writes.
 
+The complete `make ci` gate passed at `757c6c9`, including strict all-feature clippy, workspace
+tests, doctests, examples, local end-to-end checks and the Cargo artifact-selection regression.
+Cleanup is complete. Current live acceptance, including MinIO 100,000-version validation and
+actual scan cancel/SIGKILL resume, is recorded in P7 §14.3. DXN-2, StorageGRID and HDFS remained
+environment-limited; historical passes are not substituted for unavailable current runs.
+
 ## Breaking API migration
 
 The removals intentionally break scan consumers; the crate does not keep forwarding wrappers.

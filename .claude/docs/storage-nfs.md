@@ -34,6 +34,12 @@ nfs://nas01/exports/home:/prefix?uid=1000&gid=1000
 | `uid` | 0（URL 没写时 `parse_nfs_url` 补 `uid=0`） | 操作时使用的 Unix uid (RPC AUTH_SYS) |
 | `gid` | 0（同上） | 操作时使用的 Unix gid |
 
+NFSv3 服务端启用 `mount_rootonly` 时，MOUNT 要求客户端使用保留源端口。nfs-rs 0.8.6 的
+`noresvport` 默认是 `false`；在可绑定保留端口的 root 主机上可显式使用 `version=3&noresvport=false`。
+`noresvport=true` 使用临时源端口，即使客户端以 root 运行也会与该服务端策略冲突；NAT 改写源端口也可能导致拒绝。
+遇到 `AUTH_TOOWEAK` 或 MOUNT 的 bad-status 解码错误时，应先核对 profile 的该选项、实际运行主机和服务端策略。
+2026-10-12 ONTAP 真机仅修正这一客户端选项后完整 NFSv3 runner 通过，无需改服务或代码。
+
 其余查询参数原样转给 nfs-rs，**`readdir-buffer` 除外**：URL 里出现它（参数名按 nfs-rs 的方式百分号解码后比较，
 `#` 之后的片段不看）→ `ConfigError`（P7 C7d，用户 2026-09-27 定：只按服务器公布的上限，不接受也不转发，不另设内存上限）。
 直接调 `nfs_rs::parse_url_and_mount` 的几个 example / 契约工具不经这里，不受此限。

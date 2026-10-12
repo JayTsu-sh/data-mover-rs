@@ -1,6 +1,6 @@
 # 扫描（遍历）P7 设计：流式列举、两种扫描方式、事件、计数、错误与续扫
 
-> **状态：定稿**（2026-09-25，用户同意了全部建议，第 15 节的问题已全部转为决定）。实现按第 14 节的计划进行，ADR-0008 在 C12 写。
+> **状态：设计定稿，C11b / C12 与 legacy 清理已完成**（2026-10-12）。CI、可用环境实测、MinIO 十万版本与扫描续跑已通过；DXN-2、StorageGRID、HDFS 的本轮环境限制见 §14.3。第 15 节保留 2026-09-25 的决定记录，ADR-0008 已完成。
 >
 > - 本文件**取代**此前的评审稿（Q1–Q30 问题清单、“待拍板”）。评审稿保留在 git 历史里，最后一个评审稿 commit 是 `fef8f2a`。
 > - 权威 HTML 副本在 `root@10.131.9.10:/root/p7-design/p7-streaming-listing-design.html`（本文件据其 sha256 前缀 `4e16e7c4` 的版本转写）；
@@ -1203,7 +1203,7 @@ C11 feat(traversal): Resumable（Checkpoint 项每约 1 分钟 + 取消时补发
 C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 v7），删除 TraversalVersions / list_versions
     - 用户 2026-09-27 定（Q-A）：连接时 GetBucketVersioning 瞬时失败（超时 / 5xx / 网络，SDK 重试后）→ role connect 报 Connectivity / Transient，
       不猜；明确拒绝（403）→ 列历史（Q26）；501 / 不支持版本 → ListObjectsV2；快照只留一种格式、不兼容旧版本（用户 2026-09-27）
-    —— 实现已恢复，验收未完成：`bda95d3`（refactor：版本列举搬到 histories.rs）、`5a20a77`（refactor：tally_child 返回 Tallied）、`f309f7a`（Q26 + Q-A：
+    —— 已完成，CI、实测与环境限制见 §14.3：`bda95d3`（refactor：版本列举搬到 histories.rs）、`5a20a77`（refactor：tally_child 返回 Tallied）、`f309f7a`（Q26 + Q-A：
     连接时判定，`S3VersioningAtConnect`，瞬时失败 role connect `Connectivity` / `Transient`）、`7ec3a51`（每 key 一项、`ObjectHistory`、
     快照 v7 + golden 字节、删 `TraversalVersions` / `list_versions` / `EntryVersion`、记录级观察 R2、R3、检查点 v2）、`648b132`（分段 Q8）、
     `e2511a2`（计数）、`fdea3ed`（e2e-s3 / 续扫脚本）。要点见 §10.1 / §10.4 / §11.2c。与计划的差别：① `ObjectHistory` 多一个
@@ -1214,10 +1214,11 @@ C11b feat(s3)!: 多版本改为每 key 一项（ObjectHistory、分段、快照 
     `e2511a2` 已含 count_history 和“当前已删且分段”的回归测试，交接记录中“待补计数修复”已过时。
     2026-10-12 找回原构建目录：501 个 src/tests/examples 与 Cargo 文件逐字节匹配 `fdea3ed`；历史 `ci.log`
     记录 1788 passed / 8 ignored，`fi.log` 记录 17 项故障注入全部变红（JOB_EXIT=0）。这些是历史证据，不代表当前复跑。
-    待验收：当前提交的 make ci / 全特性 clippy、上述六套 S3 真机矩阵、MinIO 单 key 十万版本 RSS。
+    本轮修正：`29975eb`（HTTP 408 与响应丢失）、`aafd463`（历史 InlineOnly 不额外 HEAD，保留列举时间）、
+    `757c6c9`（SDK 将 HTTP 2xx 解码失败包装为 ServiceError 时仍按 Q-A 拒连）；当前验收结果统一记在 §14.3。
     保留桶 `data-mover-c11b-1790508092` 不属于测试清理范围（用户要求保留）。
 C12 docs: docs/architecture/storage-transfer-architecture.md §5/§6；.claude/docs/{architecture,error-taxonomy,storage-*}.md；ADR-0008
-    —— 文档已同步当前接口；ADR-0008 记录决策与验收边界，C11b 真机验收仍按上行跟踪。
+    —— 已完成：文档同步当前接口；ADR-0008 记录决策与验收边界，C11b 真机验收见 §14.3。
     （含 C11b 定下的**写入快照格式开发期规则**：一种当前格式、版本字节 + golden 字节测试、任何改动都升版本、旧格式
     `UnsupportedVersion`；正式发布前重新决定 —— 至少解码 N-1，或给 terrasync 迁移 / 重扫说明）
 （terrasync 侧，另起：不丢批、分钟级退避、检查点落库顺序、消费者退出即失败、统计以库为准、全量扫描 generation 闸门、
@@ -1498,6 +1499,97 @@ N6 `d51af50`、N7 `ce49448`、F5h `7260974`；细节见 `.claude/docs/storage-s3
   现经 body 断开后的 HEAD 判定；同桶原生 1 KiB / 200 MiB 各一次 CopyObject、读回开）；跑完 `nas-<run>/` 下 0 个对象；MinIO `run.py`
   `all checks passed`。
 
+
+### 14.3 C11b / C12 与 legacy 清理收尾（2026-10-12）
+
+**收尾已完成**：CI、下表可用环境的实测、MinIO 单 key 十万版本与扫描 cancel / SIGKILL 续跑均通过。
+DXN-2 依用户决定作为环境受限项结束；StorageGRID 当前不可达、HDFS 缺实验配置，均未冒充通过。
+
+最终生产代码验收基准为 `757c6c9`；`17dc58b` 只补充了扫描续跑脚本的整目录重放说明。各真机用例的实际源码修订见下表，
+不把较早修订的实测写成最终修订复跑。清理移除了 NDX、`walkdir` / `walkdir_2`、旧 scan 消息与迭代器、HDFS 递归扫描以及
+S3 旧版本扫描；调用方统一使用 role traversal。破坏性接口清单、删除提交与可恢复的性能基准见
+[legacy 清理记录](p7-legacy-cleanup.md)。NFS 递归删除改用独立的原始目录遍历，包含隐藏传输产物；失败前排空已发出的
+文件删除 RPC，首页可有界重试，已处理部分目录不从头重放。
+
+`make ci` 在 `757c6c9` 完整通过：格式、架构边界、Cargo 产物选择回归（2 项）、全特性严格 clippy 零警告、workspace
+测试（库测试 1,727 passed / 8 ignored，其余 integration 与 doctest 通过）、examples，以及本地端到端测试（20 + 4 项）。
+版本查询定向测试 4/4 通过，用 SDK HTTP 响应回放覆盖正常 Enabled、空配置、
+403 拒绝、501 不支持与 HTTP 200 错误 XML 根；最后一种确认为 SDK `ServiceError`，role 连接仍报
+`Connectivity` / `Transient`，不会误选历史列举。
+
+本轮修复了真机脚本误用旧二进制的问题：所有受影响的 shell 脚本从 Cargo JSON 的 `compiler-artifact.executable` 取
+刚构建的 example 路径（`5a582de`），覆盖非默认 `CARGO_TARGET_DIR`、带空格的路径与配置的目标 triple；找不到产物或
+构建失败即停止。回归用放在旧路径的毒化程序防止退回 `target/debug/examples`，并接入本地和托管 CI（`eaa61f6`）。
+
+**S3 实测**（2026-10-12）：
+
+| 环境 | 已通过用例与源码修订 | 边界 |
+|---|---|---|
+| MinIO | `traversal_versions.sh`、`directory_objects.sh`、十万版本测量：`235537e`；`versioning_matrix.sh`：`eaa61f6`；传输 `resume_matrix.sh`：`757c6c9` | 传输 cancel / SIGKILL 都从新 HOME 成功续传，BLAKE3 一致；扫描 cancel / SIGKILL 也通过，见下文 |
+| ONTAP 对象桶 | `traversal_versions.sh`、`directory_objects.sh`：`235537e`；`versioning_matrix.sh`：`eaa61f6`；传输 `resume_matrix.sh`：`757c6c9` | 传输 cancel / SIGKILL 都从新 HOME 成功续传，BLAKE3 一致；扫描续跑另列 |
+| ONTAP NAS 桶 | 非版本 `traversal_versions.sh`：`235537e`；`nas_matrix.sh`：`757c6c9` | 全部 21 行大小 / 策略 / 读回组合，以及 1 GiB / native、preflight / conflict、cancel / rerun、源与跨桶路线通过 |
+| RustFS | `traversal_versions.sh`：`235537e`；`directory_objects.sh`：`757c6c9` | 临时桶及历史重放桶已删除 |
+| DXN | `traversal_versions.sh`：`235537e`；`directory_objects.sh`：`757c6c9` | 后者使用必需的 `S3_LOCATION`；首次漏配在写入前退出，不算用例结果；临时桶及历史重放桶已删除 |
+| StorageGRID | 未验证 | 预检在桶 / 前缀操作前报 `No route to host`；用户确认地址不变、当前不可测，未继续重试 |
+
+`versioning_matrix.sh` 两套的中断复制均按预期取消后成功续传，其余场景均 `result=ok`。以上成功用例的临时桶或专用前缀
+已验证清理，保留桶 `data-mover-c11b-1790508092` 未触碰。没有用传输续传结果代替扫描续跑结果。
+
+**NAS 协议与 HDFS**：
+
+| 环境 | 结果 | 证据与限制 |
+|---|---|---|
+| CIFS，`757c6c9` | 通过 | policy 2/2、namespace 2/2、capability 1/1、只读 1/1；生成的专用文件已清理 |
+| ONTAP NFSv4.0 / v4.1，`757c6c9` | 通过 | 各用例全部通过；遍历 5,602 项，计数平衡、无失败 / 列举失败；export / option / mkdir 契约通过 |
+| ONTAP NFSv3 | 通过 | 旧 profile 的 `noresvport=true` 与服务端 `mount_rootonly=enabled` 冲突；在当前 root Ubuntu 构建机改用 `version=3&noresvport=false` 后，完整 runner 遍历 5,602 项、计数平衡且零失败，export / 嵌套 mkdir-delete / mkdir 契约全过，临时目录已清理；源 LIF 与目标 LIF 各只读 depth-1 遍历均 9 项零失败。无需修改服务或代码 |
+| DXN-2 NFSv3 / v4.0 | 环境受限，用户确认按此完成代码验收 | 原生 NFS 与既有 v3 / v4 导出已配置；底层 ThinkFS 故障（全部 MDS down、无 active IOA）阻塞可用性，当前没有 2049 监听 / mountd 注册。未验证本轮 NFS 用例；未改配置、未启停服务、未进行 NFS 写入。用户确认文件系统故障并要求停止该环境全部远端操作，已停止 |
+| HDFS | 未运行 | 当前运行环境没有 HDFS 实验配置 / 环境变量，候选 RPC 端口拒绝连接；无 HDFS 写入，不能据此判断产品行为 |
+
+**扫描检查点续跑**（独立于传输 `resume_matrix.sh`）：
+
+| 环境 / 中断方式 | 结果 | 观察 |
+|---|---|---|
+| MinIO cancel | 通过 | `Blocks`、十个目录各 300 文件、`CANCEL_AFTER=500`：10 轮完成；完整基准 3,010 项，交付 4,820 项，重复 1,810 项，丢失 / 凭空新增均 0；前缀已清空 |
+| ONTAP cancel | 通过 | 实际取消后从检查点续跑通过；专用前缀已清空 |
+| ONTAP SIGKILL | 通过 | 二十个目录各 500 文件，`KILL_AFTER=0.15`、`EVERY=0.01`、`Blocks`：4 轮完成；基准 / 交付均 10,020 项，重复 / 丢失 / 凭空新增均 0；10 个检查点、最大 90 bytes，至少一个周期检查点先于中断 |
+| MinIO SIGKILL | 通过 | 十万版本测试及清理完成后独立运行：二十个目录各 500 文件，`EVERY=0.01`、`KILL_AFTER=0.30`、`Blocks`、并发 8；实际 SIGKILL 后两轮完成，基准 / 交付均 10,020 项，重复 / 丢失 / 凭空新增均 0；8 个检查点、最大 90 bytes，中断前 5 个周期检查点；10,000 个 fixture key 已删除，前缀确认空 |
+
+平铺 3,000 文件、每轮交付约 500 项就取消的早期用例在 50 轮内没有完成。这与 §9.3 / §12.9 的整目录重放契约一致：
+活动目录必须在一轮内列完才能推进，故该 fixture 不能用于证明受支持的续跑进展；改为上述窄目录后通过。另一次临时 helper
+把本地日志路径传成扫描 ROOT，在真正扫描前失败，该无效用例不计结果，1,001 个准备对象已删除。
+MinIO 的时间控制组也不计为通过：`KILL_AFTER=0.15` 在 50 轮内没有完成，`0.50` / `0.75` 均一轮就完成、没有实际
+中断续跑；三个临时前缀都已清理并确认空。最终通过证据是表中的 `0.30` 运行。
+
+ONTAP SIGKILL 用例和较大 MinIO fixture 曾在自动清理时遇到暂时的新连接失败，**原因未明，未证实服务离线**。
+后续专用清理工具分别确认精确前缀，删除 ONTAP 剩余 1,915 个 key，并确认两个前缀最终均为空；不把自动清理失败留作残留数据。
+
+**MinIO 单 key 十万版本：通过**。16 个持久连接 worker 发出 100,000 次 PUT，全部成功、得到 100,000 个唯一版本 ID，
+无上传错误，准备耗时 6,556.607 s。新旧两个二进制的 Blocks / Unordered 四次遍历均 `Completed`、计数平衡，
+failed / listing-failure / interruption / vanished / truncated 均为 0。并发为 8，单次实测如下：
+
+| 二进制 | 顺序 | 峰值 RSS（KB） | wall（s） |
+|---|---|---:|---:|
+| 新，`235537e` | Blocks | 138,408 | 76.18 |
+| 旧，对照 artifact | Blocks | 177,064 | 77.75 |
+| 新，`235537e` | Unordered | 137,488 | 76.94 |
+| 旧，对照 artifact | Unordered | 183,824 | 78.17 |
+
+完整历史断言通过：`big/k` 恰好一项、`history=0/1`，含 100,000 条记录、100,000 个唯一非 null 版本 ID，
+恰好一个 latest、没有该 key 的删除标记，每条记录大小为 1。加上八条辅助 fixture 记录，完整输出共 100,008 条记录，
+遍历总数为 100,006 个版本与 2 个删除标记。Current 投影的新旧输出相同：六个条目、四个存活 key
+（`big/k`、`mixed/k`、`mixed/plain`、`top`），不输出 record 行。
+
+版本与删除标记显式分批删除均无逐条错误；最终版本列举为空、删桶成功，随后桶 HEAD 为 404，清理完成。此前被 TERM
+终止并清理的另一次十万版本准备不算通过；此处记录的是后来完整成功的一轮。
+
+新二进制来自 `235537e57d4adccf99bdb789ea160c2378472547`，SHA-256 为
+`cc236f8e33cd3c6208bc4c9d9f1db7f89b31ead2f583560bbb60e3ed7932980c`；旧 artifact 的 SHA-256 为
+`1b009291348becff303b3018bae4fa5739282689153c13d3b3d78549a04f2aab`。旧二进制的精确编译标志与构建来源无法证明，
+因此这些数值仅表示本轮各一次的 RSS / wall 实测，不构成受控性能基准或普遍性能结论，也不代替 §12 的历史验收。
+
+本轮原始验证汇总：`/tmp/dm-c11b-final-validation.md`；十万版本报告：`/tmp/dm-c11b-final-scale.md`；
+CI 日志：`/tmp/dm-c11b-757c6c9-make-ci.log`。
+这些是当前验证机上的证据位置，不保证作为仓库文件长期保留。
 
 ## 15. 决定记录（2026-09-25 全部采纳）
 

@@ -211,7 +211,8 @@ S3 lends `stat` and `list` only: `list` of a path is one delimiter listing of th
 so a common prefix is a directory. `capabilities().histories` is fixed at connection: enabled or
 suspended versioning, or a refused versioning query, selects `ListObjectVersions`; a bucket never
 versioned, an unsupported versioning API, or the NAS profile selects `ListObjectsV2`. A transient
-`GetBucketVersioning` failure refuses role connection with `Connectivity` / `Transient`.
+`GetBucketVersioning` failure refuses role connection with `Connectivity` / `Transient`, as does
+an HTTP 2xx response that the SDK cannot decode into a versioning answer.
 A history is a property of each key returned by `list`; there is no separate traversal mode or
 `Namespace::list_versions`. Mutating verbs are `Unsupported`, advertised through
 `capabilities().mutations`; recursive delete and create refuse before I/O.

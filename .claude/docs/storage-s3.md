@@ -599,10 +599,12 @@ role namespace 隐藏相对根任意一段以 `.data-mover-` 开头的对象；�
   平铺返回的深层 key 在客户端收拢成一级前缀（去重）。`.data-mover-*` 两种模式都隐藏（key 或任意一段前缀）。
 - **是否列历史**（P7 Q26 / Q-A，C11b）：连接时 `GetBucketVersioning` 的回答（`S3VersioningAtConnect`，
   `src/s3/versioning_answer.rs`）：`Enabled` / `Suspended` / 明确拒绝（403 等，未知 Status 同）→ 列历史；从未开启 /
-  501·`NotImplemented`·`UnsupportedOperation` → `ListObjectsV2`；无响应 / 超时 / 429 / 5xx / `RequestTimeout`·`SlowDown` 等
+  501·`NotImplemented`·`UnsupportedOperation` → `ListObjectsV2`；无响应 / 超时 / 408 / 429 / 5xx / `RequestTimeout`·`SlowDown` 等
   （SDK 重试之后）→ **role connect 失败** `BackendSessionFailure` Connect / `Connectivity` / `Transient`（诊断带 HTTP 状态；
   `connect_backend` 的 `BackendConnectError::session_failure()` 给出它），不猜；构造请求失败按拒绝处理。NAS profile 一律不列历史、
   也不因无响应拒连。legacy `S3Storage::new` 照旧连接成功（`is_bucket_versioned` / `versioning_suspended` 语义不变）。
+  HTTP 2xx 但 SDK 解码失败也算没有回答，即使 SDK 包成 `ServiceError`，仍按上述 `Connectivity` / `Transient` 拒连；
+  正常解码的 Enabled 与空配置不受影响（`757c6c9`，SDK 响应回放回归）。
   `S3Namespace` 在连接时取一次 `S3Protocol::lists_histories()`，整个连接不变，`capabilities().histories` 与之相同。
   **与 legacy 的差别**：瞬时失败时 role 连不上而 legacy 连得上；只有 `s3:ListBucket`、被拒 `GetBucketVersioning` 与
   `ListBucketVersions` 的主体在 role 遍历上每个目录都会权限失败（按 Q26 列历史；待定是否加回退）。
@@ -634,7 +636,8 @@ role namespace 隐藏相对根任意一段以 `.data-mover-` 开头的对象；�
 - **例子与真机**：`S3_LISTING_URL=… cargo run --example storage_role_operations -- --backend s3 traverse [--order blocks]
   [--current]`（版本化桶：条目行 `history=<段>/<complete> records=<n>[ order=inferred]`，每条记录一行
   `Record <key> <段>.<序号> version= latest= marker= size=`；`--current` 只打印当前对象）；
-  `.claude/skills/e2e-s3/scripts/traversal_versions.sh`（见 SKILL 第 8 步）。C11b 真机结果见设计文档 §14 的 C11b 行。
+  `.claude/skills/e2e-s3/scripts/traversal_versions.sh`（见 SKILL 第 8 步）。C11b / C12 已完成，真机矩阵、十万版本测量、
+  实际扫描 cancel / SIGKILL 续跑与环境限制见设计文档 §14.3。
 ### 版本历史顺序与 ONTAP 分页
 
 `src/s3/version_order.rs` 的 `send_in_document_order` 保留 SDK 原始 XML 中 Version / DeleteMarker
