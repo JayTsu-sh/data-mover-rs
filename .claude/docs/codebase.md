@@ -20,24 +20,21 @@
 | **`filter.rs`** | **4849** | **filter DSL 引擎**：lexer + `should_skip` 三元组决策树 |
 | `acl.rs` | 934 | Unix/Windows ACL 抽象 |
 | `qos.rs` | 660 | QoS / 速率限制 (governor crate) |
-| `dir_tree.rs` | 460 | walkdir_2 用的目录树事件类型 (`NdxEvent`) |
 | `tar_pack.rs` | 244 | tar 流式打包 |
 | `error.rs` | 164 | `StorageError` 24 变体 + thiserror |
-| `walk_scheduler.rs` | 147 | work-stealing 调度器 (`WorkerContext<T>`) |
 | `time_util.rs` | 128 | FileTime ↔ NFS Time ↔ Unix nanos 统一转换 |
 | `checksum.rs` | 70 | blake3 哈希 |
 | `url_redact.rs` | 66 | URL 日志脱敏 (隐藏 ak/sk/密码) |
-| `async_receiver.rs` | 31 | mpsc 接收端 wrapper (`AsyncReceiver<T>`) |
-| **总计** | **~19,460** | |
+| `traversal/` | — | Unordered / Blocks 遍历与续扫 |
+| `delete_progress.rs` | — | 删除事件接收器 |
 
 ## 公开 API 形状 (lib.rs)
 
 核心类型：
-- `StorageEnum` — backend 联合枚举。**所有外部调用通过它**，不直接持有具体 backend。
+- `Storage` + roles — 新遍历/传输接口；`StorageEnum` 保留旧传输与元数据操作。
 - `EntryEnum::{NAS(NASEntry), S3(S3Entry)}` — 统一元数据。NAS 适合 Local/NFS/CIFS，S3 单独一档。
 - `Result<T> = std::result::Result<T, StorageError>` — 全库统一错误。
-- `DeleteDirIterator = AsyncReceiver<DeleteEvent>` — 删除流。
-- `WalkDirAsyncIterator2 = AsyncReceiver<dir_tree::NdxEvent>` — 二阶遍历流。
+- `DeleteDirIterator` — 可克隆的共享删除事件接收器，`next(&self)`。
 
 核心函数：
 - `canonicalize_path(path) -> String` — 自动检测 + 规范化。
@@ -45,18 +42,15 @@
 - `create_storage(url, block_size, ensure_dir) -> Result<StorageEnum>` — 统一工厂。
   `ensure_dir = true` 为目标端语义 (prefix 不存在自动创建)，`false` 为源端语义。
 
-## examples/ (9 个，手动验证入口)
+## examples/ (手动验证入口)
 
 | 文件 | 作用 | 外部依赖 |
 |---|---|---|
-| `local_walkdir.rs` | 本地递归扫描 + md5 | 无 |
-| `local_walkdir_2.rs` | walkdir_2 API 演示 | 无 |
+| `storage_role_operations/` | 遍历、递归建删、完整性 | 按 backend |
 | `local_opt_dir.rs` | 创建优化目录结构 | 无 |
 | `cifs_mount_comparison.rs` | role-based CIFS vs mounted Local 传输对比 (clap CLI) | SMB 服务器 (CIFS_REAL_*) |
-| `nfs_walkdir.rs` | NFS mount 遍历 | NFS 服务器 |
 | `nfs_export.rs` | NFS export 信息查询 | NFS 服务器 |
 | `nfs_opt_dir.rs` | NFS 上创建目录 | NFS 服务器 |
-| `s3_walkdir.rs` | S3 bucket 列表 | S3 endpoint |
 
 ## tests/ (2 个，integration)
 

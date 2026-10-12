@@ -23,7 +23,7 @@ from url_builder import nfs_url  # noqa: E402
 def run(
     label: str,
     cmd: list[str],
-    expected: int = 0,
+    expected: int | None = 0,
     capture: bool = False,
     extra_env: dict[str, str] | None = None,
 ) -> tuple[int, str]:
@@ -40,10 +40,12 @@ def run(
         print(result.stdout)
         if result.stderr:
             print("[stderr]", result.stderr)
-        assert_exit_code(label, result.returncode, expected)
+        if expected is not None:
+            assert_exit_code(label, result.returncode, expected)
         return result.returncode, result.stdout + result.stderr
     result = subprocess.run(cmd, cwd=PROJECT_ROOT, env=child_env)
-    assert_exit_code(label, result.returncode, expected)
+    if expected is not None:
+        assert_exit_code(label, result.returncode, expected)
     return result.returncode, ""
 
 
@@ -63,13 +65,19 @@ def main() -> int:
     # Walk only this sub-directory when set, rather than the whole export.
     walk_path = env.get("NFS_WALK_PATH", "").strip().strip("/")
 
-    run("build nfs_walkdir", ["cargo", "build", "--example", "nfs_walkdir"])
+    run("build storage_role_operations", ["cargo", "build", "--example", "storage_role_operations"])
     run("build nfs_export", ["cargo", "build", "--example", "nfs_export"])
     run("build nfs_opt_dir", ["cargo", "build", "--example", "nfs_opt_dir"])
 
     url = nfs_url(host, export, port=port, uid=uid, gid=gid, options=options)
     walk_url = nfs_url(host, export, sub_path=walk_path, port=port, uid=uid, gid=gid, options=options)
-    run("nfs_walkdir", ["cargo", "run", "--example", "nfs_walkdir", "--", "--url", walk_url])
+    traverse = ["cargo", "run", "--example", "storage_role_operations", "--", "--backend", "nfs", "traverse", "--quiet"]
+    _, output = run("role traversal", traverse, capture=True, extra_env={"NFS_REAL_URL": walk_url})
+    totals = next((line for line in output.splitlines() if line.startswith("totals ")), "")
+    fields = dict(part.split("=", 1) for part in totals.split()[1:])
+    if any(fields.get(key) != value for key, value in {"balanced": "true", "failed": "0", "listing_failures": "0", "interrupted": "0"}.items()):
+        print("[skill e2e-nfs] FAIL: traversal did not complete with balanced, failure-free totals", file=sys.stderr)
+        return 1
     run("nfs_export", ["cargo", "run", "--example", "nfs_export", "--", url])
     # Creates and removes only its own `dm-e2e-opt-dir-<nanos>` below the export.
     run("nfs_opt_dir", ["cargo", "run", "--example", "nfs_opt_dir", "--", url])
@@ -89,7 +97,7 @@ def main() -> int:
     )
 
     # 拒绝访问：NFS_DENY_DIR 相对 export，NFS_UID/NFS_GID 必须无权读它（非 root，或服务器 squash root）。
-    # 遍历应报权限错误并以非 0 退出。「权限错误不重试」由 src/nfs.rs 的
+    # 遍历应报权限错误（role CLI 的条目/列举失败可能仍以 0 退出）。「权限错误不重试」由 src/nfs.rs 的
     # test_is_retryable_with_invalidation_excludes_unrelated 单测覆盖：这个 example 不打 retry 日志，
     # 这里无从观察。
     if deny_dir:
@@ -97,9 +105,10 @@ def main() -> int:
             host, export, sub_path=deny_dir.strip("/"), port=port, uid=uid, gid=gid, options=options
         )
         _, output = run(
-            "nfs_walkdir DENY (expected permission error)",
-            ["cargo", "run", "--example", "nfs_walkdir", "--", "--url", deny_url],
-            expected=1,
+            "role traversal DENY (expected permission error)",
+            traverse,
+            extra_env={"NFS_REAL_URL": deny_url},
+            expected=None,
             capture=True,
         )
         lowered = output.lower()

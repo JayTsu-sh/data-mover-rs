@@ -44,3 +44,32 @@ C11b baseline and bug-fix validation are tracked in P7 §14. Cleanup revisions r
 integration/example and clippy checks; meaningful behavior assertions stay on the replacement
 interfaces rather than testing retired NDX numbering. Real-environment gates remain the matrices
 in P7 §14, including NFS deletion artifacts and S3 directory-object writes.
+
+## Breaking API migration
+
+The removals intentionally break scan consumers; the crate does not keep forwarding wrappers.
+
+| Removed public surface | Consumer migration |
+|---|---|
+| `StorageEnum::{walkdir,walkdir_2}` and backend-specific methods, `HDFSStorage::scan_recursive` | Connect a role `Storage`, then `StorageTraversalSource::new(&storage)?.traverse(request)` |
+| `WalkOptions` (crate root, `storage_options`, `storage_enum`) | `TraversalRequest`: filter adapter, depth, observation plan, concurrency and ordering |
+| `WalkDirAsyncIterator`, `WalkDirAsyncIterator2`, `StorageEntryMessage`, `ErrorEvent`, `HdfsScanEvent` | `TraversalSession::next_item()` and `finish()`; inspect `TraversalItem::Failure` and completion totals |
+| `dir_matches_date_filter`, `FilterExpression::has_matching_dir_date` | Use generic `DirDate` DSL matching through `DslTraversalFilter`; scanner packaging is retired |
+| Public modules `ndx_walk`, `dir_tree`, `async_receiver`; `AsyncReceiver<T>` | `TraversalOrder::Blocks` for directory boundaries; session identifiers/numbering belong to consumers |
+| Scan examples and `ndx-walk` CLI command | `storage_role_operations --backend <backend> traverse [--order blocks]` |
+
+`DeleteDirIterator` remains exported at the crate root, now a concrete deletion-only receiver.
+It retains `new(async_channel::Receiver<DeleteEvent>)`, `next(&self)`, `Clone`, `Send` and `Sync`;
+clones consume events from the same channel. `DeleteEvent.error` reports background failures.
+NFS raw deletion lists artifacts, drains issued RPCs before reporting failure, and retries transient
+initial directory reads without replaying a partially processed directory. It never calls its own
+role deletion wrapper recursively. Lookup still preserves ACL and owner fields from NFS attributes.
+
+Traversal no longer implicitly enriches all metadata. Request timestamps with
+`ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly)` when the listing's
+modified time is needed. S3 versioned buckets emit one key with its `ObjectHistory`; consume its
+ordered records/segments rather than treating each version as another path entry.
+
+Removal commits: `c43bb59` (NDX, last-containing parent `aafd463`), `61ce28a` (remaining
+walkers, last-containing parent `b5dec4c`). Source and the historical performance measurements
+remain available for comparison; the raw historical node1 binary/log paths did not survive.

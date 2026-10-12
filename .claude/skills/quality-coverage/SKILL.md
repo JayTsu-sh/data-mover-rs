@@ -29,4 +29,4 @@ rustup component add llvm-tools-preview
 
 - 测试覆盖率受限于"不能 mock 网络 backend"约束，4 个 backend 中只有 Local 能纯单测。
 - filter / time_util / error / url_redact / checksum 这些纯逻辑模块覆盖率应高。
-- backend 的 walkdir / copy 流复杂，单测覆盖率天然低。
+- backend 的 traversal / copy 流复杂，单测覆盖率天然低。

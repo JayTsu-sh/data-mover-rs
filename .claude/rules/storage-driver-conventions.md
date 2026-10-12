@@ -79,10 +79,9 @@ grep -nE 'use crate::storage_enum::StorageEnum' src/{nfs,s3,local}.rs src/storag
 
 ## D7 · Backend 必须实现的最小操作集
 
-任何 backend 必须实现 (signature 与 `StorageEnum` 一致)：
+所有 backend 提供 role 列举；保留的 legacy backend 操作签名与 `StorageEnum` 一致：
 
-- `walkdir` (流式)
-- `walkdir_2` (流式，含 `NdxEvent`)
+- role `Namespace::list` (逐页)，通过 `StorageTraversalSource` 遍历
 - `get_metadata`
 - `mkdir` / `mkdir_or_open`
 - `read_file` / `write_file`

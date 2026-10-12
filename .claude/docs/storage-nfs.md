@@ -47,7 +47,6 @@ data-mover 什么都不设。实测（2026-09-27）：ONTAP 9 各版本公布 1 
 —— v3 每回复 41 → 175 项、v4.x 23 → 95 项；DXN-2 公布 1 MiB 且照给 —— v3 45 → ~5,600 项、v4.0 39 → 5,000 项，一个回复
 约 1 MiB，首页晚到（毫秒级 → 约 0.3 s，冷缓存 v4.0 到数秒）。回复大小 = min(上限, 目录实际内容)，所以小目录不多占内存；
 列举同一时刻最多持有一个回复（`read_role_directory` 取完一个才请求下一个），最坏 ≈ 同时在读宽目录的 worker 数 × 回复大小。
-legacy `walkdir` / `walkdir_2` 走同一个 mount，也用新大小。
 
 ## Retry Taxonomy (核心)
 
@@ -75,12 +74,12 @@ nfs-rs 包在 `OperationOutcome` 里的状态也会取出来。传输 / 客户�
 **缺口**：仍走 legacy `StorageError` 再 `classify_role_error` 的路径（SETATTR 之前的 LOOKUP / re-lookup、
 xattr、namespace、staged 的多数操作）在转成字符串时丢了 nfs-rs 错误，没有状态。
 
-## NfsEnrich
+## Lookup metadata and raw deletion
 
-- 结构在 `lookup` vs `walkdir_2` 中行为不同 (按站点配置)。
-- `lookup` — 单条目的 ACL/owner/xattrs 完整 enrich。
-- `walkdir_2` — 批量条目可能裁剪 enrich 字段以提速。
-- 改这里前先看现有逻辑的两个分支。
+`NASEntry::from_nfs_attrs` preserves ACL, nonempty owner/group strings, mode and identity directly
+from GETATTR. `src/nfs/delete.rs` performs artifact-inclusive raw deletion independently of traversal:
+initial directory reads retain bounded stale/busy retries, issued REMOVE RPCs drain before any failure
+is returned, and directory removal is post-order. Progress failures use `DeleteEvent.error`.
 
 ## Mount 保活
 
@@ -145,13 +144,13 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 
 ## 传输 artifact 与列举 (ADR-0006 C3b)
 
-- legacy `walkdir` / `walkdir_2` 与 role namespace `List` 都隐藏 `.data-mover-*`（相对根的任一段，先于过滤
+- role namespace `List` 隐藏 `.data-mover-*`（相对根的任一段，先于过滤
   与 GETATTR）；role namespace 拒绝寻址它们。
 - role `List` 自 P7 C7 起**逐页流式**（`storage/backends/nfs/listing.rs` 的生产者 + `src/nfs/role_listing.rs` 的
   READDIRPLUS 读取）：nfs-rs 的 `readdirplus` 流逐条取，按 `page_hint` 攒页交出，一次最多多读一个回复；
   消费方 drop 或取消 → 下一条之前停，**不放弃在途的 READDIRPLUS**（NFSv4.1 被取消的请求会把 session slot 围起来）。
   - **下钻提示**：每个子目录带一份**拷贝**出来的文件句柄（`DescentHint`，从不引用回复缓冲），遍历下钻时带回来，
-    子目录直接用它发 READDIRPLUS，不再每目录 LOOKUP。没有提示（遍历根、`ndx_walk` / `delete_tree` 这类不带提示的
+    子目录直接用它发 READDIRPLUS，不再每目录 LOOKUP。没有提示（遍历根、`delete_tree` 这类不带提示的
     调用方）或提示失效（`STALE` / `BADHANDLE` / `FHEXPIRED`）才按路径 `lookup_fh`（它照旧读写 `GLOBAL_CACHE`）。
   - **列举不再写 `GLOBAL_CACHE`**：C7 之前每列一个目录就把所有子目录句柄写进去，m1-source 整树上缓存常驻约
     13.5 万项 / 92 MB、另有过期碎片约 99 MB（P7 §12.7 内存根因）。变更路径（`create_dir_all`、`lookup_fh`、
@@ -203,8 +202,6 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   - **残余风险**：某台服务器对一个**真实的**、名叫 `.snapshot` 的目录也不给属性（NFSv3 允许任何项省略；例如 Linux knfsd
     对拼不出句柄的挂载点），它会被隐藏、不迁移 —— 只留 `info!` 与 `internal_hidden` 计数。ONTAP 上不会发生（名字保留），
     DXN 给真目录带属性。
-  - legacy `walkdir` / `walkdir_2` **不变**（P7 收尾删除）：它用 GETATTR 补属性，把 `.snapshot` 当普通目录下钻（有快照时
-    会列出每个快照的整棵树）。
   - `delete_tree`：卷根列举不再带一个 `.snapshot` 子项失败，所以对**非 backend 根**的 junction 卷根 `delete_root` 会发出
     RMDIR，由 ONTAP 拒绝（之前因子项失败不发）。RMDIR 不递归，不会删掉什么。
 - role `List` 的描述符带 `inline_timestamps` + `inline_ownership`（P7 C0）：同一份 READDIRPLUS 属性，owner / group
@@ -213,9 +210,7 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
   `NfsMetadataAdapter::observe_listed` 对只要 ownership / timestamps（ACL / xattr 为 Omit / InlineOnly 或 mount
   不支持）的计划直接用列举属性作答，遍历不再每条目一次 GETATTR；两条路径共用 `observations()`，
   `metadata_tests.rs::a_listed_child_is_observed_exactly_as_a_getattr_would` 逐计划比对。
-- legacy `delete_dir_all(_with_progress)` 内部走 `walk_listing(.., hide_artifacts=false)`：不这样的话
-  含 artifact 的目录 `rmdir` 会失败，而事件只记日志、`error: None`，静默删不干净。role `Delete(dir)`
-  走的就是它，所以 NFS 的 `delete_tree` 不需要额外清扫。
+- `delete_dir_all(_with_progress)` 使用专用原始删除模块，包含传输 artifact，并传播列举/删除错误。
 
 ## Namespace 角色的建目录（`src/nfs/role_namespace.rs`，2026-09-27）
 
@@ -290,7 +285,7 @@ LDAP/NIS 的 SVM 会让普通用户都走名字形式，拷过去就全是 nobod
 
 ## 测试
 
-- `examples/nfs_walkdir.rs` — 遍历 export。
+- `examples/storage_role_operations/` — `--backend nfs traverse` 遍历 export。
 - `examples/nfs_export.rs` — 查询 export 元信息。
 - `examples/nfs_opt_dir.rs` — 创建优化目录结构。
 - `tests/nfs_mkdir_contract.rs`（`#[ignore]`，`NFS_REAL_URL`）— 不可写的已存在层上 `create_directory_all`、

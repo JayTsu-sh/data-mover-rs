@@ -62,7 +62,7 @@
     NFSv4 的 READDIR 不列它。它与卷根 fsid 相同（快照各自的 fsid 才不同），从任何目录 LOOKUP 都是同一对象，名字被保留
     （MKDIR `.snapshot` 回 `EXIST`），`~snapshot` 在 NFS 上 `NOENT`。C7b 起 role 遍历在 v3 上 LOOKUP 它、确认是目录后隐藏
     （`hidden=1`，不下钻）：2026-09-26 整个导出 v3 / v4.0 / v4.1 都是 listed 5399、0 失败、路径集合逐行相同（此前 v3 是
-    listed 5400 = 5399 + 1 个 `Protocol` 子项失败）。legacy `walkdir` 不变：用 GETATTR 补属性，把它当普通目录（3545 个目录）。
+    listed 5400 = 5399 + 1 个 `Protocol` 子项失败）。历史旧扫描器比较见 P7 设计记录。
     有快照的卷（例如 `/dm_s3_nas`，只读探过）里快照子项 v3 READDIRPLUS 同样不带属性。
     `.snapshot` 是只读文件系统：在它下面 MKDIR 回 `NFS3ERR_ROFS` / `NFS4ERR_ROFS`（2026-09-27），`e2e-nfs` 的
     `NFS_RO_PATH={scratch}/.snapshot` 拿它当只读导出的替身（只尝试建目录、必被拒）；没有真正的只读 NFS 导出。

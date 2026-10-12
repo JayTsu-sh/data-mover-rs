@@ -8,7 +8,7 @@ help:
 	@echo "构建/检查："
 	@echo "  build          cargo build --all-targets"
 	@echo "  check          cargo check --all-targets"
-	@echo "  examples       cargo build --examples (9 个)"
+	@echo "  examples       cargo build --examples"
 	@echo "  doc            cargo doc --no-deps"
 	@echo ""
 	@echo "质量："

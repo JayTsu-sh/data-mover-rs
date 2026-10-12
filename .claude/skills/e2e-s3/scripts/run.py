@@ -72,7 +72,7 @@ def main() -> int:
     use_https = env.get("S3_USE_HTTPS", "false").lower() == "true"
     prefix = env.get("S3_PREFIX", "test")
 
-    run("build s3_walkdir", ["cargo", "build", "--example", "s3_walkdir"])
+    run("build storage_role_operations", ["cargo", "build", "--example", "storage_role_operations"])
 
     # S3_COMPAT=sg|dxn|ontap, S3_TLS_VERIFY=false (HTTPS, self-signed) and S3_BUCKET_TYPE=nas
     # become the URL's options (?compat=dxn&tls_verify=false); empty = the default.
@@ -100,18 +100,23 @@ def main() -> int:
     url = url_of(prefix)
     # The URL (with its credentials) goes through the environment, never a command line; output is
     # still captured and redacted in case the example echoes it.
-    walkdir = ["cargo", "run", "-q", "--example", "s3_walkdir"]
-    run("s3_walkdir bucket list", walkdir, capture=True, url=url)
+    traverse = ["cargo", "run", "-q", "--example", "storage_role_operations", "--", "--backend", "s3", "traverse", "--quiet"]
+    output = run("role traversal bucket list", traverse, capture=True, url=url)
+    totals = next((line for line in output.splitlines() if line.startswith("totals ")), "")
+    fields = dict(part.split("=", 1) for part in totals.split()[1:])
+    if any(fields.get(key) != value for key, value in {"balanced": "true", "failed": "0", "listing_failures": "0", "interrupted": "0"}.items()):
+        print("[skill e2e-s3] FAIL: traversal did not complete with balanced, failure-free totals", file=sys.stderr)
+        return 1
 
     # 不存在 prefix 验证：S3 ListObjectsV2 对不存在的 prefix 返回 200 + 空列表
     # （这是 S3 语义，不是 404）。断言：空结果 + 干净退出 + 无 retry/backoff。
     # 注意：404 → FileNotFound 的映射（commit 7eb3046）在 head_object/get_metadata
-    # 路径，walkdir 例子覆盖不到，需要走 get_metadata 的入口另行验证。
+    # 路径，traversal 例子覆盖不到，需要走 get_metadata 的入口另行验证。
     nonexistent = f"{prefix}/__skill_404_test_{int(time.time())}"
     bad_url = url_of(nonexistent)
     output = run(
-        "s3_walkdir nonexistent prefix (expected empty list, no retry)",
-        walkdir,
+        "role traversal nonexistent prefix (expected empty list, no retry)",
+        traverse,
         expected=0,
         capture=True,
         url=bad_url,
@@ -119,7 +124,7 @@ def main() -> int:
     if "retry" in output.lower() or "backoff" in output.lower():
         print("[skill e2e-s3] FAIL: nonexistent prefix triggered retry/backoff (commit 7eb3046 regression)", file=sys.stderr)
         return 1
-    if "total entries: 0" not in output.lower():
+    if not re.search(r"totals balanced=true listed=0 emitted=0 ", output):
         print("[skill e2e-s3] FAIL: nonexistent prefix did not list as empty", file=sys.stderr)
         return 1
     print("[skill e2e-s3] PASS: nonexistent prefix → empty list (no retry)")

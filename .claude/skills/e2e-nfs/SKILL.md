@@ -1,6 +1,6 @@
 ---
 name: e2e-nfs
-description: 验证 NFS backend — 跑 examples/nfs_walkdir + nfs_export + nfs_opt_dir。可选验证拒绝访问的目录报权限错误；「不重试」由单测覆盖。
+description: 验证 NFS backend — 跑 role traversal + nfs_export + nfs_opt_dir。可选验证拒绝访问的目录报权限错误；「不重试」由单测覆盖。
 ---
 
 # e2e-nfs
@@ -35,19 +35,19 @@ nfs-rs 默认 NFSv3；服务器开了 `mount_rootonly` 又经 NAT（WSL2）访�
 `dir1/dir2/dir3`，再经以该目录为根的第二个连接建一次（新根句柄、句柄缓存为空，每级都真的对已存在目录发
 `mkdir`），最后只删这个目录，要求每个删除事件都成功、且含这个目录本身。`tests/nfs_mkdir_contract.rs` 只在 URL
 根下自建 `dm-mkdir-<纳秒>`（已存在则拒绝），结束时（失败也）删掉它；`NFS_RO_PATH` 只尝试建目录、必被拒。
-`nfs_walkdir` / `nfs_export` 只读。
+role `traverse` / `nfs_export` 只读。
 
 ## 步骤
 
-1. cargo build --example {nfs_walkdir, nfs_export, nfs_opt_dir}
-2. nfs_walkdir `--url` 遍历 export（或 `NFS_WALK_PATH`）— 应正常返回。
+1. cargo build --example {storage_role_operations, nfs_export, nfs_opt_dir}
+2. `NFS_REAL_URL=<url> storage_role_operations --backend nfs traverse --quiet` 遍历 export（或 `NFS_WALK_PATH`）— 应正常返回。
 3. nfs_export 以同一 URL（带选项）查询 export 列表 — 应返回 export 列表。
 4. nfs_opt_dir 在自己的临时目录里建再删嵌套目录 — 应成功 (含已存在目录)。
 4b. `cargo test --test nfs_mkdir_contract -- --ignored`（`NFS_REAL_URL` = 上面的 URL）：以 `NFS_UID` 建
    `dm-mkdir-*/ro`（0555）/ `ro/w`（0777），再以 uid 4242 `create_directory_all("…/ro/w/new")` 应成功（已存在但不可写的
    层不挡路：DXN-2 对它们回 `ACCES`，ONTAP 回 `EXIST`），`"…/ro/new"` 应 `PermissionDenied` / Permanent 报在该层；
    uid 4243 打印服务端对"已存在目录、父不可写"的 MKDIR 回答。`NFS_UID` 须能 chmod 自己建的目录，4242 / 4243 不能是它。
-5. **拒绝访问**（可选，需 `NFS_DENY_DIR`）：遍历该目录 — 应报权限错误并以非 0 退出。`NFS_UID` 必须真的
+5. **拒绝访问**（可选，需 `NFS_DENY_DIR`）：遍历该目录 — 应报权限错误（role CLI 的列举失败可用退出码 0 携带）。`NFS_UID` 必须真的
    读不了它：`NFS_UID=0` 且服务器不 squash root 时这一步会失败。「权限错误不重试」由 `src/nfs.rs` 的
    `test_is_retryable_with_invalidation_excludes_unrelated` 单测覆盖，本步不观察重试日志。
 
@@ -61,8 +61,8 @@ nfs-rs 默认 NFSv3；服务器开了 `mount_rootonly` 又经 NAT（WSL2）访�
 
 ## 成功判据
 
-- 1-4b 退出码 = 0（`nfs_walkdir` 遍历中有任何错误即非 0）
-- 5 退出码 = 1，输出含权限错误（`NFS3ERR_ACCES` / `NFS4ERR_ACCESS` / permission）
+- 1-4b 退出码 = 0；遍历 totals 必须 balanced=true、failed=0、listing_failures=0、interrupted=0
+- 5 输出含权限错误（`NFS3ERR_ACCES` / `NFS4ERR_ACCESS` / permission）
 - 6 末行 `RESULT pass=N fail=0`，退出码 0
 
 ## 失败如何排查

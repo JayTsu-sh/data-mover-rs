@@ -28,7 +28,7 @@
 | 改 Local rayon delete / Win ACL | `.claude/docs/storage-local.md` + `src/local.rs` + `src/acl.rs` |
 | **新增/修改 `StorageEnum` 操作** | `.claude/docs/storage-enum-dispatch.md` + `src/storage_enum.rs` (1334 行) |
 | 改 filter DSL (lexer / `should_skip` 三元组) | `.claude/docs/filter-dsl.md` + `src/filter.rs` (4849 行) + `src/filter_traversal.rs` (role-based 适配器) |
-| 改 walk 调度 / work-stealing | `.claude/docs/walk-scheduler.md` + `src/walk_scheduler.rs` + `src/async_receiver.rs` |
+| 改遍历调度 / work-stealing | `.claude/docs/walk-scheduler.md` + `src/traversal/storage/{unordered,blocks,cursor}.rs` |
 | 改 role-based 遍历 (filter / max_depth / inline 观察) | `src/traversal/{mod,storage}.rs` (唯一实现，`local_tests.rs` / `local_unordered_tests.rs` 用真文件系统测它) + 默认的 Unordered 调度器 `src/traversal/storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs` + 块序驱动 / 游标 / 逐页列举任务 `src/traversal/storage/{blocks,cursor,stream}.rs` + 按批的会话通道 `src/traversal/channel.rs` + 续扫检查点 `src/traversal/checkpoint.rs` (编解码 / 指纹) 与 `src/traversal/storage/resume.rs` + `resume/{positions,relist,blocks}.rs` (`local_resume_tests.rs` 真文件系统) + 事件 / 计数 `src/traversal/{events,counts}.rs` + `src/filter_traversal.rs` + `examples/storage_role_operations/{main,traverse}.rs` |
 | 改 S3 遍历 / 版本化桶每 key 一项 (`ObjectHistory`) | `src/model/{history,history_codec}.rs` + `src/storage/backends/s3/{namespace,listing,histories,history}.rs` + `src/traversal/{s3_tests,s3_history_tests,s3_segment_tests}.rs` + `.claude/docs/storage-s3.md` "role-based 遍历与版本模式" + `.claude/skills/e2e-s3/scripts/traversal_versions.sh` |
 | 改 Local namespace 角色 (逐段不跟随 symlink) | `.claude/docs/storage-local.md` "Namespace 角色" + `src/storage/backends/local/namespace.rs` |

@@ -9,7 +9,7 @@
 **how to apply**: PR 描述必须列：
 - 新的三元组语义。
 - 变化前后的组合表对比。
-- 谁会受影响 (walkdir / walkdir_2 / 哪个 backend)。
+- 谁会受影响 (Unordered / Blocks / 哪个 backend)。
 
 ## F2 · 新增 lexer token 必须加单测
 

@@ -51,16 +51,9 @@ legacy `CifsStorage` 的能力在 role-based backend 里的去向 —— 有对�
   (与 NFS / HDFS 的 `ensure_dir` 对齐)。`true` 时连接阶段补齐缺失层级：根存在只花一次 open，
   缺失才逐级探测 + `create_new`，COLLISION 视为竞争成功，某层是文件则连接失败。
   `false` 不探测根，行为与之前一致。
-- 遍历有两条线并存。**条目流**由通用 `traversal::StorageTraversalSource` 驱动，filter DSL
-  剪枝与 `max_depth` 经 `TraversalRequest.filter` / `.max_depth` 注入 (适配器
-  `crate::DslTraversalFilter`)；除 `Entry` / `Failure` (`scope` 分 `Child` / `Listing`) 外还产出目录事件
-  (`DirectoryListed { path, outcome, counts }`，见 architecture.md §6)，消费方 match 时必须带通配臂
-  —— `TraversalItem` 是 `#[non_exhaustive]`。**NDX 分页**由 crate 根的 `ndx_walk` 驱动 (legacy `walkdir_2`
-  的中立替身)：走 `Namespace::List` 取数，复用 `dir_tree::run_dfs_driver` 的 DFS 栈 / 预读
-  窗口 / NDX 与 gap 编号，产出 `NdxEvent`。两条线的 filter 适配不同 —— 前者是
-  `TraversalDecision`，后者是 legacy `should_skip` 三元组 (`ReadContext.apply_filter` /
-  `SubdirEntry.visible` / `need_filter`)。这是有意并存：其余四个 backend 的 walkdir_2 也还在
-  legacy 那条线上。work-stealing 仍归上层编排。
+- 遍历统一由 `traversal::StorageTraversalSource` 驱动；filter 经 `DslTraversalFilter` 注入，
+  `TraversalRequest.order` 选默认 Unordered 或逐目录 Blocks。`TraversalItem` 是非穷尽枚举，
+  消费方必须处理 Failure、Blocks 的 DirectoryListed，并保留通配臂。
 - **source identity 用 64 位 SMB file id，`StableWithinBackend`** —— 与 NFS 的 file handle
   同一角色，也是 terrasync `clickhouse.rs` 里 `file_handle` 列 / `JoinStrategy::FileHandle`
   的输入 (2026-09-18 起，smb-rs PR #74)。消费端经 `ObservedEntry::source_identity()` →
@@ -125,15 +118,11 @@ legacy `CifsStorage` 的能力在 role-based backend 里的去向 —— 有对�
   `mapped_unix_user=lisauser`)，客户端无法观察/应用。
 - **`FILE_ATTRIBUTE_READONLY` → 近似 mode，只在列举路径**。`QUERY_DIRECTORY` 记录带只读位，
   `namespace.rs list` 把它经 `smb_attributes_to_mode` (dir → 0o755/0o555，file → 0o644/0o444，
-  照搬 legacy) 挂到中立的 `SourceDescriptor::inline_mode` 上，`ndx_walk` 再填进
-  `NASEntry.mode`。stat 路径显式留 `None` 而不是伪造：`smb_domain::ResourceMetadata`
+  照搬历史逻辑) 挂到中立的 `SourceDescriptor::inline_mode` 上。stat 路径显式留 `None` 而不是伪造：`smb_domain::ResourceMetadata`
   (domain/mod.rs:845) 只有四个时间戳和长度，没有任何属性位，填 `false` 会让 stat 谎报"不是只读"。
   这个值是**展示级**的，不进 `MetadataObservations.ownership_mode` (那仍是 `NotApplicable`)：
   塞进去会让 transfer engine 以为可以 apply，目标端会被写错权限。apply 侧不做 (legacy 也没做)。
-  **注意两条遍历线报的 mode 不一样**：`ndx_walk` 的 `NASEntry.mode` 有这个近似值，而
-  `traversal::StorageTraversalSource` 产出的 `ObservedEntry` 根本不带 mode
-  (`ownership_mode` 是 `NotApplicable`)。同一个条目、两条线、两种答案 —— 这是
-  `inline_mode` 只服务于 NDX 输出的直接后果。
+  `ObservedEntry` 的 `ownership_mode` 是 `NotApplicable`，不会把展示近似值用于权限复制。
   根治要给 smb-rs 的 `RuntimeMetadata` / `ResourceMetadata` 加属性位 —— 底层 stat 本来就在查
   `FileBasicInformation`，数据已在响应里、零额外往返，适合和 file id 合成同一个上游 PR。
 - **列举里单个子项描述不出来时只让它自己失败**：`listing.rs` (`Pages::push`) 把 `descriptor_from_facts` 的条目失败
@@ -343,9 +332,7 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 | filter / max_depth 剪枝 | `max_depth=1` 只列举一层；`path == "sub/**"` 只收子目录内容 (sub 本身 PartialMatch 隐藏但下潜)；`exclude name == ...` 在两层同名文件上都生效 | **已实现** (`TraversalRequest.filter` / `.max_depth`) |
 | 跨端完整性比对 | 同一对象完全一致；跨目录副本报出 Size + Modified + Content | **已实现** (`integrity::compare`) |
 | file id (2026-09-18，smb-rs #74 → main `10de18c`；连接期 `probe_identity_mode` 判定两路都有 → 会话启用) | `[identity] strength=StableWithinBackend (List) / StableWithinBackend (Stat)`：ONTAP 接受 `FileIdFullDirectoryInformation` 宽 class，**且回答 QFid create context**；`real_share_namespace_verbs_roundtrip` 里 rename 前后 `identity_key` 相等；policy 契约 (64 MiB Checkpointed / AtomicReplace) 在 2-RT describe/open 上通过 | **已实现**。rename 检测不再退回 Path 模式 |
-| NDX 分页遍历 (2026-09-18) | `storage_role_operations --backend cifs --root <scratch> ndx-walk --entries`：`seed --path sub` 后 2 页 DFS，NDX `0(sub) → gap 1 → 2,3,4 → gap -1`，每个条目 (含目录) `identity=StableWithinBackend`，时间戳为真值；`--max-depth 1` 只出根页且 `sub` 作为条目发出；`delete-tree --delete-root` 3 文件 + 1 目录零失败 | **已实现** (`storage::ndx_walk` + `create_directory_all` 建父目录) |
 | 逐页流式列举 (P7 C9 `936e20b`，2026-09-27) | 10.3 万条树 (3000 平铺 + 40 层深链 + 10 × 4500 + 5 万平铺) c=1/4/32 与 ee2e9ad 逐行相同 (含顺序)；5 万平铺首项 400 → 34–46 ms、RSS 65 → 21–25 MB；停车时会话恰 9 个打开句柄 (base 0)；NFSv3 / v4.1 看同一卷，Blocks 输出与 CIFS 逐行相同；打开的目录句柄停 30 分钟 (会话空闲或忙) 后照常读完。SVM `client_session_timeout` = 900 s 只回收**没有打开文件**的空闲会话 (约 15 分钟被 RST)，持有打开文件的会话不回收；smb-rs 在那次 RST 后重连时有后台任务 panic (`runtime/engine.rs:703` "async fn resumed after completion"，不影响结果；smb-rs #84，`37d9404` 起已修 (#86)：读出错后不再二次 poll，generation 以真实传输错误退出)。10.131.9.10 网段会断连：会话在 6–10 分钟被断、重连后旧目录句柄 `InvalidState` —— CIFS 真机测 WSL 更稳 | **已实现**；停车句柄上限 8 (Q10)。smb-rs #85 (非根目录 `open_existing` 要写 + 删除权限) 在 `37d9404` 起已修 (#87)：列举句柄只读 |
-| 只读 share 作源 (2026-09-27，share `dm_ro_share`：`lisauser` 在 share ACL 上只有 `read`，目录 777 —— 只读只来自 share ACL；夹具 4 文件 + 3 目录，见 test-environments.md) | 同一组 example (`storage_role_operations traverse` / `ndx-walk`，`transfer_resume` 把每个文件拷到本地) 按三个 pin 各跑一遍：**`91e6cfb`** (dev `3f2bd75`)：根页 2 项正常，`sub` 列举 `PermissionDenied` (`scope=Listing`，NDX `page error sub`)，4 个文件读全部 `Transfer failed on Source … Read failed (PermissionDenied)`，`Access Denied (0xc0000022)`；**`37d9404`** (dev `fde8516`)：遍历 7 项 0 失败、NDX 4 页 0 错，文件读仍全部同样失败；**`2649a0b`** (dev `d4383d0`)：遍历 7 项 0 失败、NDX 4 页 0 错，4 个文件都拷出，本地 BLAKE3 / SHA-256 与写入时一致 (9 MiB 那个 `SkippedBelowCheckpointThreshold`，多块读)。写一律被拒且分类正确：`create-dir` → `PermissionDenied`；上传 (Checkpointed) → `Prepare failed on Destination … (PermissionDenied, Permanent)`、`0xc0000022`、`final_destination_changed=false`；`delete-tree` → 文件 `PermissionDenied`、目录 `Conflict` ("descendants were not deleted")；Namespace 删 / 改名文件与目录都 `PermissionDenied`；之后树不变。`--policy direct` 在 preflight 就被拒 (CIFS 不支持 Direct，与只读无关)。服务端对 CREATE 先查 share ACL 再查重名，所以已存在的目录回 `ACCESS_DENIED` 而不是 `COLLISION`：`d4383d0` 的 `create_directory_all("sub/deeper/x")` 报在已存在的祖先 `sub` 上 (`PermissionDenied`)，"根只读、子目录可写"的 ACL 布局下会误拒；**`c7582a0` 已修** —— 被拒的层 `Stat` 为目录即算已存在，`create_directory_all` `sub/deeper`、`sub/deeper/deepest` 成功且不写，`sub/new` / `sub/deeper/new/x` 仍 `PermissionDenied` 且报在第一个不存在的层 (`sub/new` / `sub/deeper/new`)；旧二进制同一组四个都报在 `sub`；经可写孪生路径 `ontap_lisaauto_cifs/dm-ro-share/` 遍历前后都恰为 7 项夹具 | **已实现**：`tests/cifs_readonly_contract.rs` (e2e-cifs，`CIFS_REAL_RO_SHARE`) 守住 —— 遍历恰为夹具树、逐文件拷出比对 BLAKE3、6 种写被拒为 `PermissionDenied`、`create_directory_all` 过已存在的层 (`c7582a0` 起)；`2649a0b` 上 ×2 通过 (`c7582a0` 加断言后再 ×2 通过)，同一测试拿旧 pin 编译则失败 (`91e6cfb`：遍历 `sub` 列举失败；`37d9404`：读 `a.txt` `PermissionDenied`) |
 
 复现：`.claude/skills/e2e-cifs` (`CIFS_REAL_*`)。新能力的真机链路用
 `examples/storage_role_operations` 的 `seed → traverse → compare → delete-tree`。
@@ -388,7 +375,6 @@ CIFS 服务器 `LIZYAD`，卷 security style **unix**，LIF 10.128.61.200 / .201
 > 2026-09-18 (二)：smb-rs **PR #76** (issue #75，中途丢流 / 未建模 NTSTATUS 致命退出、恢复等待
 > 无界) 合入 main，顶端 `8b10f35`。变更面 `runtime/engine.rs`、`runtime/recovery_driver.rs`、
 > `resource/directory.rs`、`smb-msg/header.rs` → 协议层，第 4 步完整矩阵在 `8b10f35` 上跑过
-> (namespace ×2、policy ×2、匿名 share ×1、probe ×1、8 轮 seed→ndx-walk→delete-tree)。
 >
 > 2026-09-18 (一)：file id / CREATE 快照经 smb-rs **PR #74** 以 merge commit 合入 main，
 > 顶端 `10de18c` (树与分支 head `7585e30` 相同)。第 3、4 步在 `7585e30` 上跑过

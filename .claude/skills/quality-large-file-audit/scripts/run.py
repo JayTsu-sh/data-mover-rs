@@ -28,14 +28,11 @@ BASELINE = {
     "acl.rs": 985,
     "qos.rs": 672,
     "lib.rs": 565,
-    "dir_tree.rs": 474,
     "tar_pack.rs": 286,
     "error.rs": 166,
-    "walk_scheduler.rs": 157,
     "time_util.rs": 130,
     "checksum.rs": 71,
     "url_redact.rs": 66,
-    "async_receiver.rs": 33,
     "write_pipeline.rs": 226,
 }
 NEW_FILE_LIMIT = 1000

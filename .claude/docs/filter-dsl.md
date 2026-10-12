@@ -57,7 +57,7 @@
 下游判断"能不能安全删除目的端多余条目"按 `ScanFailure` 文档上的删除安全规则 (P7 §4.1)：有 filter
 或 `max_depth` 时，旧代条目用同一个 filter / 深度判定，被排除或截断的不参与删除。
 
-`FilterInput` 各字段的取值口径（与 legacy walkdir 对齐）：
+`FilterInput` 各字段的取值口径：
 
 | 字段 | 取值 |
 |---|---|
@@ -133,30 +133,11 @@ enum ModifiedValue {
 
 修改这个函数前先看现有 4-5 种命名模式的处理。
 
-## 与 walkdir 的关系
+## 与遍历的关系
 
-```
-walkdir 流水线
-  │
-  ├──> enumerate next entry
-  │       │
-  │       ▼
-  │   filter.should_skip(entry)
-  │       │
-  │       ├──> (skip=t, scan=f, children=*) → 剪枝整个分支
-  │       ├──> (skip=t, scan=t, children=t) → 跳过但继续
-  │       ├──> (skip=f, ..., children=t) → 收集 + 子项过滤
-  │       └──> (skip=f, ..., children=f) → 收集 + 子项全收
-```
-
-walk_scheduler 不感知 filter — filter 是 walkdir 实现层调的，走 enum dispatch 后由各 backend 注入。
-
-role-based 路径同理：`traversal` 模块不依赖 `crate::filter` (架构依赖校验禁止)，
-只认 `TraversalFilter` trait；DSL 适配器在 crate 根的 `src/filter_traversal.rs`。
-
-只有一个遍历实现接这个接缝：`traversal::StorageTraversalSource`，出借 Namespace 角色的
-backend (Local / NFS / CIFS / HDFS) 都走它。
-可运行入口见 `examples/storage_role_operations/`。
+`DslTraversalFilter` 把 DSL 三元组适配为 `TraversalDecision`；backend 只描述条目。
+列举可回答的判断按页执行；需要 modified 的条件等时间戳观察完成后再决定。
+过滤隐藏条目仍计入 totals；是否下钻、是否继续对子项过滤由同一 decision 决定。
 
 ## S3 目录对象（P7 F5）
 

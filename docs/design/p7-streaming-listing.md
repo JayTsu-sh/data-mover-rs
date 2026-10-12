@@ -1591,12 +1591,12 @@ N6 `d51af50`、N7 `ce49448`、F5h `7260974`；细节见 `.claude/docs/storage-s3
 | 1 | **一次 S3 SlowDown / 503 就可能结束整场遍历**：限流被归为会话失败（`src/s3/role_protocol.rs:518-523`），且没有配置重试策略 | 未修；由 C3 / C6 解决（`FailureClass::Throttled`、生产者内有界退避，见 §8、Q11） |
 | 2 | **CIFS、NFS、HDFS 因一个坏子项让整个目录列举失败**：`collect::<Result<Vec<_>>>()?`（`cifs/namespace.rs:92`、`nfs/namespace.rs:83-85`，NFS 缺属性时 `nfs.rs:4657-4659`，HDFS 同类），违反“逐子项失败逐子项报”的契约 | **已修** `b6aff40`（`fix(storage): 列举里一个描述不出的子项只让它自己失败`）：三者都改为逐子项 `EntryOperationFailure` + `NamespaceResult::Listing`，遍历报 `Partial` |
 | 3 | **S3 翻页出现重复 token 被当成会话失败**（`paging.rs`），它只是一个目录的问题 | **已修** `1a68f41`（`fix(s3): 翻页 token 绕圈只让该目录失败`）：改为该目录的 `Protocol` / Permanent 条目失败，块 `Failed`，遍历继续兄弟 |
-| 4 | **legacy 版本列举假设服务端按 key 升序**（`src/s3/version_listing.rs`，C20）：靠扣住每页最大的 key 拼一个 key 的完整历史，在无序 S3 上会把一个 key 的历史拆成多组、`version_count` 与 latest 标记出错 | 未修；legacy 版本列举在收尾清理中删除（见下节），role-based 按目录物化（§5.3、Q9） |
+| 4 | **legacy 版本列举假设服务端按 key 升序**（`src/s3/version_listing.rs`，C20）：靠扣住每页最大的 key 拼一个 key 的完整历史，在无序 S3 上会把一个 key 的历史拆成多组、`version_count` 与 latest 标记出错 | 已随收尾删除；role-based 按目录物化（§5.3、Q9） |
 | 5 | **role-based 遍历在 NFS 上常驻 178 MB，来源未查清**：m1-source 每目录约 35 项，帧里的东西应只有几 MB | 未查；C0 前用驻留探针与 `MALLOC_ARENA_MAX=2` 对照（Q19、§12.2） |
 | 6 | **terrasync 写 ClickHouse 的路径在异常时会丢数据**（10.131.9.10，`8edd400`）：全量扫描写失败只重试约 0.7 s 就丢掉整批且任务报成功；数据库消费者退出后广播给它的数据被静默丢弃；统计按广播逐条累加、与是否入库无关；全量扫描直接写 base、崩溃即留下半场数据 | 在 terrasync 里改，本设计只列要求（§11、Q16、Q17） |
 | 7 | **S3 当前对象的 `PathScoped` 身份里没有路径**（稳定字节只有 ETag）：内容相同、路径不同的对象共用一个身份键，terrasync 按身份键 `INNER JOIN` 会交叉配对成 N×N 行（§5.4.7、F1 / Q28） | **已修** `4fa5aa5`（`fix(s3)!: PathScoped 身份包含路径`）：S3 当前对象、`"null"` 版本与 `"null"` 删除标记的稳定字节改为 u32 大端路径长度 + 路径 + ETag；契约写进 `IdentityStrength::PathScoped` 文档。破坏性：S3 `PathScoped` 身份键一次性全变。terrasync 侧“只对 `StableWithinBackend` 按身份键关联”仍待在 terrasync 里做 |
 | 8 | **版本与删除标记交错时按 LastModified 合并，并发写入时排错**：aws-sdk-s3 把 `<Version>` 与 `<DeleteMarker>` 解析成两个列表，丢了交错顺序（`src/s3/role_protocol/versions.rs:107, 123`）（§10.2、F2 / Q29） | **已修** `40c1ac9`（`fix(s3)!: 版本历史按服务端顺序组装`）：`src/s3/version_order.rs` 拦截原始响应体、按服务端位置倒序组装，校验不过的 key 标 `HistoryOrder::Inferred`；`history.rs` 的核心由 role-based 与 legacy `walkdir` / `walkdir_2` 共用。差别：role-based 在整个目录列举（跨页）上校验同 key 连续；**legacy `walkdir` 只在每批已释放的完整 key 内校验连续**。回归数据 `tests/data/s3/minio-concurrent-versions{,-paged}.xml` |
-| 9 | **legacy 版本列举假设 key 升序**：`src/s3/version_listing.rs` 的 `VersionPages::complete_keys` 把每页最大的 key 扣到下一页合并（C20），前提是 ListObjectVersions 按 key 升序返回。在无序存储上（ONTAP NAS 桶，Q22；NAS 桶不支持 ListObjectVersions，所以 ONTAP 上不会触发），同一个 key 的历史会被拆成几段、各自当成一个 key 发出（latest / `version_count` 错）；F2 的连续性校验在 legacy 里也只看每批 | 未修：legacy 在 P7 收尾整体删除；删除前若有调用方在无序存储上用 legacy 多版本列举，改为按整个目录物化分组（role-based 的做法）。role-based（C22 / C6）按目录物化分组，不受影响 |
+| 9 | **legacy 版本列举假设 key 升序**：`src/s3/version_listing.rs` 的 `VersionPages::complete_keys` 把每页最大的 key 扣到下一页合并（C20），前提是 ListObjectVersions 按 key 升序返回。在无序存储上（ONTAP NAS 桶，Q22；NAS 桶不支持 ListObjectVersions，所以 ONTAP 上不会触发），同一个 key 的历史会被拆成几段、各自当成一个 key 发出（latest / `version_count` 错）；F2 的连续性校验在 legacy 里也只看每批 | 已随 P7 收尾整体删除；调用方迁到 role-based 的整个目录物化分组。role-based（C22 / C6）按目录物化分组，不受影响 |
 | 10 | **ONTAP `ListObjectVersions` 带 `delimiter=/` 会静默丢版本**（2026-09-26 实测，ONTAP 9.19.1）：截断页里有 CommonPrefix、且被收拢的 key 在列举前缀或该 CommonPrefix 之后紧跟多字节字符（如 `p/éb/x`、`p/x/中/y`）时，若页恰好停在后一个 key 的版本中间，服务端给 `NextKeyMarker=<key>` 却**不给** `NextVersionIdMarker`，下一页从该 key 之后开始，剩余版本被跳过（1000 个版本只回 998）。另：页停在 CommonPrefix 上时有时仍给 `NextVersionIdMarker`，下一页重复该前缀；恰好满页后跟一个空的末页；CommonPrefix 计入 max-keys。受影响：legacy `s3.rs` 两处 ListObjectVersions、role `s3/role_protocol/listing.rs` | **已修** `8d4b225`（F4）：截断页没有 `NextVersionIdMarker`、且 `NextKeyMarker` 那个 key 的条目恰是本页文档序的末尾一段时，用最后一条的 versionId 作 version-id-marker；续点不能确定（分组输出、读不到文档序且两种条目都在该 key 上）时不猜（role 该目录 `Protocol` 失败，legacy 先发完整的 key 再报错）；legacy 的 CommonPrefix 跨页去重（role 本来就去重）；空末页容忍。回归数据：ONTAP 实测响应 3 份（`tests/data/s3/ontap-versions-delimiter-*.xml`）；真机 `mkl/z` 1000 个版本 role / legacy 全列出 |
 | 11 | **RustFS 1.0.0 的 `ListObjectVersions` 原始 XML 不交错**（2026-09-26 实测，VM 105）：每页先列全部 `<DeleteMarker>`、再列全部 `<Version>`（各组内 key 升序、同 key 新→旧），所以一个 key 的条目在文档里不连续、第一条也不一定是 IsLatest。F2 的逐 key 校验会判不合格 → 该 key 标 `HistoryOrder::Inferred`、按 `LastModified` 排（同毫秒可能排错）。分页（key-marker / version-id-marker，max-keys 1/2/3）不丢不重 | 行为正确（回退如设计）；RustFS 上历史顺序只能推断。可选改进：对“分组输出”的存储（每页 marker 组 + version 组、各自按 key 升序新→旧）把两组当两条有序序列按 key 归并，同 key 内仍需时间决定交错 → 与今天的回退等价，不改。e2e-s3 的 RustFS 行期望 `order=inferred` |
 | 12 | **键以 `/` 结尾且有内容的 S3 对象**（“带内容的目录标记”）：MinIO、RustFS、ONTAP 对象桶、DXN 都允许（2026-09-26 实测，PUT 200）；ONTAP NAS 桶去掉末尾 `/` 存成普通文件。role 遍历把它报成该目录上的 `Failure{scope: Child}`（Unsupported），内容不列、不拷；**legacy walkdir（`src/s3.rs:3925`）静默跳过 —— 静默丢数据** | **已修**（F5a `ec3ee53` … F5f `43d0381`，历史重放 H1；§14.1）：role 遍历把它（以及零字节文件夹标记）列成文件条目 `d/`，S3→S3 拷贝，文件系统目的端 typed 跳过 / 拒绝；legacy 报 Scan 错误。MinIO / RustFS 上 > 8 MiB 的写入差异已由 D13 消除（F5g `2352a6b`，只用单次请求写）；遗留：NAS 桶 → N 阶段 profile |
@@ -1605,7 +1605,13 @@ N6 `d51af50`、N7 `ce49448`、F5h `7260974`；细节见 `.claude/docs/storage-s3
 
 **用户要求（2026-09-25）**：“最后本项目中和扫描相关的都要按照方案进行清理。”
 
-C12 完成后做，作为 P7 的最后一步：
+实现与迁移清单：[p7-legacy-cleanup.md](p7-legacy-cleanup.md)。2026-10-12 已分块删除旧 scanner，
+保留的行为测试迁到 role 遍历；NFS 原始删除单独保留 artifact 覆盖与 RPC 排空。
+当前代码/真机验收仍按 §14 跟踪，删除代码不等于验收已经通过。
+历史 node1 二进制与日志路径经 SSH 检查已不存在；§12.8 记录的四次基线仍作为历史证据，
+完整删除前源码在 `aafd463`，后续对照从该版本编译。
+
+原定收尾要求（已据此实施代码清理）：
 
 1. **盘点**全部与扫描相关的旧代码，逐项标注“删除”或“迁到新接口”，至少包括：
    - legacy `StorageEnum` 的 `walkdir` / `walkdir_2` 及各 backend（Local / NFS / S3 / HDFS）的实现；

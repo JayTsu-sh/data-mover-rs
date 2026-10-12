@@ -37,4 +37,4 @@ description: 验证 Local backend — 跑 role-based 两种遍历 + local_opt_di
 
 ## 改 Local 时调用此 skill
 
-修改 `src/local.rs` / `src/acl.rs` / `src/walk_scheduler.rs` 后必跑。
+修改 `src/local.rs` / `src/acl.rs` / `src/traversal/storage/` 后必跑。

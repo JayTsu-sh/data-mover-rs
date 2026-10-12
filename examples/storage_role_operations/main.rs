@@ -1,23 +1,22 @@
 //! Role-based entry point for the operations that have no `StorageEnum` equivalent:
-//! filtered / depth-limited traversal, NDX paging, recursive delete, and cross-endpoint
+//! filtered / depth-limited traversal, directory blocks, recursive delete, and cross-endpoint
 //! integrity.
 //!
 //! Every backend here lends the namespace role, so all subcommands work on Local, NFS and CIFS.
 //! S3 lends `Stat` / `List` only (ADR-0006 C22): `traverse` and `compare` work on it — on a
 //! versioned bucket each key is one entry with its history, a `Record` line per version and
 //! delete marker (`--current` prints the current objects only) — and `seed` writes objects
-//! without creating directories; `ndx-walk`, `create-dir` and `delete-tree` refuse it before any
+//! without creating directories; `create-dir` and `delete-tree` refuse it before any
 //! I/O. Its URL (with the prefix as the root) comes from `S3_LISTING_URL`.
 //!
 //! ```text
-//! cargo run --example storage_role_operations -- traverse --backend local --root /tmp/tree \
+//! cargo run --example storage_role_operations -- --backend local --root /tmp/tree traverse \
 //!     --match 'name == "*.log"' --max-depth 2
 //! S3_LISTING_URL=s3://AK:SK@bucket.host:9000/prefix cargo run --example \
 //!     storage_role_operations -- --backend s3 traverse --order blocks
-//! cargo run --example storage_role_operations -- ndx-walk --backend cifs --path scratch \
-//!     --entries
-//! cargo run --example storage_role_operations -- delete-tree --backend cifs --path scratch/old
-//! cargo run --example storage_role_operations -- compare --backend local --root /tmp/a \
+//! cargo run --example storage_role_operations -- --backend cifs traverse --path scratch --order blocks
+//! cargo run --example storage_role_operations -- --backend cifs delete-tree --path scratch/old
+//! cargo run --example storage_role_operations -- --backend local --root /tmp/a compare \
 //!     --other-root /tmp/b --path object.bin --content
 //! ```
 use std::fmt::Write as _;

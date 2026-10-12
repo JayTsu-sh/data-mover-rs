@@ -40,7 +40,7 @@ impl StorageEnum {
 - 加新方法签名。
 - 写 `match self { ... }` 分派 4 个分支。
 - 如果操作可取消，加 `cancel_token: &CancellationToken` 参数。
-- 如果操作返回流，用 `AsyncReceiver<T>` 而非 `Stream`。
+- 删除进度沿用 `DeleteDirIterator::next(&self)`；遍历消费 `TraversalSession` 并检查 `finish()`。
 
 ### 2. 4 个 backend 文件各自实现
 

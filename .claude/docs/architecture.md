@@ -19,7 +19,7 @@ create_storage(url, block_size, ensure_dir)
 (CIFS 不在 StorageEnum 里：只有 role-based `storage::connect_backend` 路径)
     │
     ▼
-StorageEnum 提供 30+ 操作 (walkdir, walkdir_2, copy_file, copy_file_with_cancel,
+StorageEnum 提供 传输/元数据操作 (copy_file, copy_file_with_cancel,
     delete_dir_all, get_metadata, mkdir, write_file, read_file, rename, ...)
     │
     ▼  每个操作内部 match self { ... } 分派到具体 backend
@@ -41,18 +41,13 @@ Backend 实现 (nfs.rs / s3.rs / local.rs / hdfs.rs)
 Storage (roles)
     │
     ├──→ traversal::StorageTraversalSource   Namespace::List + Metadata → TraversalItem 流 (默认 Unordered：worker 栈 + 窃最浅；Blocks：深度优先块顺序 + 列举预读)
-    ├──→ ndx_walk (crate 根)                 Namespace::List → dir_tree::run_dfs_driver → NdxEvent
     ├──→ storage::delete_tree                Namespace::{List,Delete} → DeleteTreeItem 流
     ├──→ storage::create_directory_all       Namespace::{CreateDirectory,Stat} 逐层创建
     └──→ integrity::compare                  ReadSource + Metadata
 ```
 
-`ndx_walk` 是 legacy `walkdir_2` 的中立替身：DFS 栈、预读窗口、NDX / gap 编号仍归
-`src/dir_tree.rs` 的 `run_dfs_driver`(那部分本来就后端无关)，这里只负责列举取数、按名排序、
-以及把 `SourceDescriptor` 反拼成 `NdxEvent` 载荷要的 `EntryEnum::NAS`。
-
 `StorageTraversalSource` 有两种调度，由 `TraversalRequest.order` 选 (P7 §3)：**`Unordered` (默认，P7 C10)**
-见下文「遍历的三套处理逻辑」第一节之后的 Unordered 小节 (`storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs`)，续扫检查点见「一·六」；
+见下文「遍历的两种调度」第一节之后的 Unordered 小节 (`storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs`)，续扫检查点见「一·六」；
 **`Blocks`** 的调度 (`src/traversal/storage/{blocks,cursor,stream,observe}.rs`，公共件在 `src/traversal/storage.rs`)：
 准入游标按"块"走深度优先 (`TraversalOrder::Blocks`) —— 一个目录的子项按列举顺序逐页连续输出，
 列举结束后按子目录名字节序依次下钻；序号只由游标分配，重排缓冲按序号输出，所以列举/观察乱序完成
@@ -141,17 +136,13 @@ marker **占准入窗口**的名额，不绕过它，所以不会让 `admitted()
    delimiter 列举；连接时判定为版本化的桶上 `list` 每个 key 一个子项、带整段历史 `ObjectHistory`，P7 C11b 起；
    `list_versions` / `TraversalVersions` 已删），变更动词 `Unsupported`；
    `delete_tree` / `create_directory_all` 经 `Storage::mutable_namespace`（看
-   `Namespace::capabilities().mutations`）、`ndx_walk` 按 kind 在任何 I/O 之前返回 `CapabilityUnavailable`。
+   `Namespace::capabilities().mutations`）在任何 I/O 之前返回 `CapabilityUnavailable`。
    Local 的 namespace 在 `src/storage/backends/local/namespace.rs`，与观察角色共用同一个
    `cap_std::Dir` 沙箱；路径逐段用 `open_dir_nofollow` 解析，**任何一段**是 symlink 都拒绝，
    最后一段在父目录句柄里操作 (描述/删除的是链接本身)。
-2. `ndx_walk` 还要求列举自带修改时间 (`SourceDescriptor::inline_timestamps`)，缺了就把
-   该目录报成错误而不是产出 epoch —— 填 epoch 会让增量同步认为所有条目都变了。目前
-   CIFS (`QUERY_DIRECTORY`)、NFS (`readdirplus`)、HDFS (listing) 和 Local (unix 逐子项
-   `fstatat`，Windows 直接取目录读回的属性) 都挂了，四个都可用。
-3. 列举里个别子项无法描述 (例如文件名拼不成 `StoragePath`、NFS READDIRPLUS 某项没带属性或
+2. 列举里个别子项无法描述 (例如文件名拼不成 `StoragePath`、NFS READDIRPLUS 某项没带属性或
    句柄、HDFS 某项 status 转换不了) 时，backend 把它放进 `ListingPage::failures`（`ChildFailure`），
-   三个消费方经 `collect_listing` + `ListingPage::into_descriptors` 统一处理：失败逐项上报，
+   收集型消费方经 `collect_listing` + `ListingPage::into_descriptors` 统一处理：失败逐项上报，
    兄弟条目照常。Local / CIFS / NFS / HDFS 都只让关乎目录本身的错误 (打不开、读目录失败) 整个失败；
    S3 的名字拼不出同样逐项报，但单个对象的 size / key 异常仍是会话失败 (待修)。分类见
    [error-taxonomy.md](error-taxonomy.md)「列举」。
@@ -160,53 +151,14 @@ marker **占准入窗口**的名额，不绕过它，所以不会让 `admitted()
 
 代价：**新增/修改一个 StorageEnum 操作 = 五处同步**。详见 [storage-enum-dispatch.md](storage-enum-dispatch.md)。
 
-## 遍历的三套处理逻辑
+## 遍历的两种调度
 
-> **现状**：legacy work-stealing 与两种 role 调度并存，P6 删前者。role 遍历自 P7 C10 起有
-> `TraversalOrder::Unordered` (默认，worker 栈 + 窃最浅，见「一·五」) 与 `TraversalOrder::Blocks`
-> (admission cursor：块内列举序、块读完后按子目录名字节序下钻)，都逐页消费列举；
-> `Admission` / `NameBytes` 两种模式与兄弟排序已删除。
-> 本节标了 **[计划]** 的内容属于 P7 后续步骤 / P8 (槽位可溢写)，尚未实现。
-
-### 一、legacy work-stealing (现状，P6 删)
-
-任务 `T` = **一个待列举的目录**，不含任何条目：Local `(PathBuf, depth, need_submatch,
-package_remaining)`，NFS `(String, Bytes, depth, bool)`。
-
-worker 主循环 (`run_worker_loop`)：
-
-```
-loop {
-    task = pop_task()
-        ├─ 自栈 pop_back()        LIFO，保 cache 局部性
-        └─ 空 → 依次锁 N-1 个邻居 pop_front()   FIFO，偷最旧 = 最浅 = 期望最大的子树
-    if task:
-        active_producers += 1;  process_dir(task);  active_producers -= 1; active_tasks -= 1
-    else if active_tasks == 0 && active_producers == 0:
-        break          // 两个都要查：任务空但 producer 还活着就可能再 push
-    else:
-        timeout(100μs, notify.notified())    // 丢唤醒的兜底，见下
-}
-```
-
-每目录处理 (`local.rs` 的 `process_dir`)：
-
-```
-for entry in read_dir(dir):
-    metadata = stat(entry)
-    if filter 判定跳过: continue
-    channel.send(EntryEnum::NAS(...))        // async_channel::bounded(1000) → 有背压
-    if is_dir && depth < max_depth:
-        push_task((full_path, depth+1, ...)) // 无界 VecDeque → 无背压
-```
-
-特征：条目边读边发**从不累积**；目录任务**无界累积**；顺序完全由调度决定、不可复现；
-**目录 / 子树边界在概念上不存在** —— 任务一拆边界信息当场销毁，这正是消费者拿不到权威
-"这个目录的子集已完整"信号的根因。
+`TraversalOrder::Unordered` 默认无全局顺序，`Blocks` 提供逐目录边界；都逐页消费列举。
+本节标 **[计划]** 的低内存方案属于 P8/P9，尚未实现。
 
 ### 一·五、`Unordered` 调度器 (P7 C10，默认)
 
-legacy work-stealing 的调度形状 (§6.1)，放在 role 的列举 / 观察 / 计数 / 错误模型之上：
+worker 栈与窃取调度，统一使用 role 列举 / 观察 / 计数 / 错误模型：
 
 - **K 个 worker** = `min(max_inflight_operations, 64)`；namespace 的 `parked_listing_limit()` 有值时 (CIFS 8)
   再取 min —— worker 等消费方时手里的列举一直开着，所以每个打开的列举都可能停车，K 就是打开句柄数的上界。
@@ -487,21 +439,17 @@ CIFS 上三条路，都不便宜：
 子目录一发现就入栈，栈上只有 `DirectoryWork`，与 legacy 的任务队列同量级。)
 
 
-### 五、三者对比
+### 两种调度的取舍
 
-| | legacy work-stealing | `Unordered` (P7 C10，默认) | `Blocks` (P7 C4) |
-|---|---|---|---|
-| 输出顺序 | 不确定 | 不确定；目录的 Entry 先于其下一切，一个目录的项保持列举序 | 块序：块内列举序，下钻按名字节序 (跨 backend 一致) |
-| 目录完成语义 | **结构上做不到** | 没有逐目录事件；会话 `Completed` + `Failure{Listing}` 清单 | 每目录 `DirectoryListed{outcome, counts}` |
-| 计数 | 无 | `ScanTotals` (与 Blocks 逐字段相同) | `ScanTotals` + 每块 `BlockCounts` |
-| 当前块 | 流式 | 逐页流式 | 逐页流式 (几页，与目录大小无关) |
-| 内存 | 待处理队列**无界** | O(K × 页) + O(栈上的待列目录) | O(打开的列举 × 页) + O(待下钻子目录) |
-| 背压 | 只在条目通道 | 贯通到协议翻页 | 贯通到协议翻页 |
-| 不规则树负载均衡 | **更好** (窃最浅) | 窃最浅 | 无窃取 |
-| 头阻塞 | **没有** | 没有 | 有 |
+| | `Unordered` (默认) | `Blocks` |
+|---|---|---|
+| 输出 | 目录 Entry 先于子树；跨目录无全局顺序 | 块内列举序；按子目录名字节序下钻 |
+| 完成 | 会话 outcome + Listing failures | 另有每目录 DirectoryListed 与 BlockCounts |
+| 计数 | ScanTotals | 相同 ScanTotals + 块计数 |
+| 调度 | worker 栈 + 窃最浅，无头阻塞 | admission cursor，有头阻塞 |
+| 背压 | 贯通协议翻页 | 贯通协议翻页 |
 
-一句话：**`Blocks` 用「输出的头阻塞」换「逐目录确定的边界 + 计数」；`Unordered` 是 work-stealing 的调度
-加上 role 遍历的契约 (typed 失败、完整性、精确总数)。** 实测 (node1 53M 树) 见 P7 设计 §12.7。
+历史性能比较见 P7 §12.8，旧 scanner 的删除范围见 [迁移清单](../../docs/design/p7-legacy-cleanup.md)。
 
 ## Pipeline 与背压
 
@@ -518,27 +466,10 @@ const TAR_PIPELINE_CAPACITY: usize = 16;   // tar 打包流水线
 
 调这两个值前先想清楚：调大 → 内存占用上升；调小 → 远端慢时上游 walk 卡顿。
 
-## 并发模型：work-stealing
+## 并发模型
 
-> 这是 **legacy** `StorageEnum::walkdir` 的调度，P6 删。role-based 遍历用 admission cursor，
-> 两者的完整处理逻辑与对比见上面 [遍历的三套处理逻辑](#遍历的三套处理逻辑)。
-
-所有 backend 的 walkdir 共享 `walk_scheduler.rs` 的 `WorkerContext<T>`：
-
-- 每 worker 持有一个 LIFO 自栈 + 邻居 FIFO 引用。
-- `pop_task()` — 先弹自己栈 (LIFO，保留局部性)，再 FIFO 窃邻居最旧任务 (减少冲突)。
-- `push_task()` — 递增 `active_tasks` + `notify.notify_waiters()`。
-- `is_done()` — `active_tasks == 0 && active_producers == 0`。
-
-**已知缺陷 (2026-09-21)**：`notify_waiters()` **不存 permit**，对当时没在等的 worker 就是丢
-唤醒。`wait_for_task()` 里那个 100μs 超时就是为此兜底 (注释写着"防止通知丢失")，代价是空闲时
-每 worker 每秒醒 1 万次、每次依次锁 N-1 个 tokio `Mutex`。正解是 `notify_one()` (一次 push 一个
-任务、唤醒一个 worker，1:1)，然后超时可以去掉。同一个成因刚在 smb-rs 上被证实并修复
-(PR #80，目录列举的分页握手丢唤醒)。因为这套要在 P6 删除，是否现在修由维护者决定。
-
-`AsyncReceiver<T>` 是 mpsc 接收端的薄 wrapper，单方法 `next() -> Option<T>`，给 walkdir/walkdir_2/delete 流用。
-
-详见 [walk-scheduler.md](walk-scheduler.md)。
+遍历调度入口与取消约束见 [walk-scheduler.md](walk-scheduler.md)。删除进度由
+`DeleteDirIterator` 接收，克隆共享事件，`next(&self)` 在通道关闭时返回 None。
 
 ## 异步运行时
 
@@ -576,7 +507,7 @@ S99 教训：裸 `.close()` 在 error path 漏释放 → 资源泄漏。helper �
 
 - Unix：uid/gid/mode/ino 走 `local.rs` + `nfs.rs` 直接读。
 - Windows：通过 `acl.rs` + windows crate (cfg)。
-- NFS：`NfsEnrich` 结构在 lookup vs walkdir_2 行为有差异 (按站点配置)。
+- NFS：lookup 直接保留属性中的 ACL / owner / owner_group；列举观察按 ObservationPlan 决定。
 
 ## 日志脱敏
 
@@ -596,10 +527,9 @@ lib.rs                  ← 公开 API 出口
   │     ├── s3.rs   ─── aws-sdk-s3 + hyper-rustls
   │     └── local.rs ── std::fs + rayon + acl.rs
   │
-  ├── filter.rs         ← walkdir 流水线在 enumerate 后调
-  ├── walk_scheduler.rs ← 4 backend walkdir 共享底座
-  ├── async_receiver.rs ← mpsc wrapper
-  ├── dir_tree.rs       ← walkdir_2 事件类型
+  ├── filter.rs         ← DslTraversalFilter 适配到通用遍历
+  ├── traversal/        ← Unordered / Blocks 调度与续扫
+  ├── delete_progress.rs ← 删除事件接收器
   ├── tar_pack.rs       ← copy_dir 用
   ├── checksum.rs       ← copy_file 完整性校验
   ├── qos.rs            ← copy 流速率限制

@@ -1,6 +1,6 @@
 ---
 name: e2e-s3
-description: 验证 S3 backend — 跑 examples/s3_walkdir，特别验证 404 → FileNotFound (commit 7eb3046) 和 multipart upload。
+description: 验证 S3 backend — 跑 role traversal，特别验证 404 → FileNotFound (commit 7eb3046) 和 multipart upload。
 ---
 
 # e2e-s3
@@ -23,13 +23,13 @@ S3_PREFIX=test                   # bucket 内的子路径
 
 ## 步骤
 
-1. cargo build --example s3_walkdir
-2. s3_walkdir 列 bucket — 应返回。`run.py` 把带凭据的 URL 经环境变量 `S3_LISTING_URL` 交给例子（不上命令行）；
+1. cargo build --example storage_role_operations
+2. `storage_role_operations --backend s3 traverse --quiet` 列 bucket — 应返回。`run.py` 把带凭据的 URL 经环境变量 `S3_LISTING_URL` 交给例子（不上命令行）；
    认 `S3_ENV`（服务器的 `.env`）与 `S3_COMPAT` / `S3_TLS_VERIFY` / `S3_BUCKET_TYPE`（→ `?compat=dxn&tls_verify=false` 等，
    与 `examples/endpoint_support`、`.claude/skills/_shared/s3_url.sh` 同一规则），调用方设的 `S3_BUCKET` 优先。
    DXN 的 HTTPS 端口：`S3_ENV=.claude/skills/e2e-s3/dxn/.env S3_HOST=10.131.7.201:8182 S3_USE_HTTPS=true S3_TLS_VERIFY=false`
    （不加 `S3_TLS_VERIFY=false` 必须因证书不受信而失败）。
-3. **404 验证**：用 `s3_walkdir <bucket>/this-key-does-not-exist-{timestamp}` 触发 NoSuchKey，应映射为 `FileNotFound`，**不重试**。
+3. **空 prefix 验证**：把 `S3_LISTING_URL` 指向唯一不存在的 prefix，role traversal 返回空且 totals 平衡，不重试。List 的空结果不是 404；NoSuchKey 映射由 HEAD / get_metadata 测试覆盖。
 
 4. **写入策略矩阵**（role-based 目的端）：`bash .claude/skills/e2e-s3/scripts/staged_matrix.sh` ——
    大小 0 / 1 KiB / 8 MiB / 8 MiB+1 / 20 MiB / 200 MiB × Checkpointed / AtomicReplace / Direct × 读回开关，原生 S3→S3，
@@ -237,7 +237,7 @@ S3_ENV=$E BUCKET_PREFIX=data-mover-dxn S3_LOCATION=magnascale:tos_placement time
 
 ## 成功判据
 
-- s3_walkdir 列 bucket 退出码 = 0
+- `storage_role_operations --backend s3 traverse --quiet` 列 bucket 退出码 = 0
 - 不存在的 key 返回 FileNotFound，日志中无 retry/backoff
 
 ## 失败如何排查

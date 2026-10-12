@@ -258,7 +258,7 @@ Local 早已如此；CIFS / NFS / HDFS 于 P7 评审发现的现存问题 2 修�
   `vanished`、不发项。观察时（元数据角色、`read_link`）的 `NotFound` 先 `stat` 确认子项本身不在才算消失，子项还在则
   是 `Conflict` / Transient 的子项失败（xattr 在列举与读取之间被删之类不能让活文件“消失”）。父列出后自己列举时
   `NotFound` 的子目录是空的 `Complete` 块（`DirectoryListed.vanished`）+ `vanished_listings`。**遍历根** `NotFound`
-  仍是列举失败。`delete_tree` / `ndx_walk` 把消失的子项当作已不存在（不报、不标记目录不完整）。
+  仍是列举失败。`delete_tree` 把消失的子项当作已不存在（不报、不标记目录不完整）。
 - **节流**：见上面 S3 表的节流行；超预算只是该列举的失败。
 
 **无名子项**：名字拼不出路径的子项，`ChildFailure { name: None, raw_name: Some(原始字节) }`，失败的路径是**目录**，

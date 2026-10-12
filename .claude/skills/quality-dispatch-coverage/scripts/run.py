@@ -17,6 +17,8 @@ from protocol_constants import PROJECT_ROOT  # noqa: E402
 
 # CIFS 不在 StorageEnum 里 (只有 role-based 实现)，所以不参与 dispatch 覆盖检查。
 BACKEND_FILES = ["nfs.rs", "s3.rs", "local.rs"]
+# Public methods moved into inherent implementation modules still count for the backend.
+BACKEND_IMPL_MODULES = {"nfs.rs": ["nfs/delete.rs"]}
 FN_RE = re.compile(r"^\s*pub\s+(?:async\s+)?fn\s+(\w+)\s*[<(]", re.MULTILINE)
 
 
@@ -60,6 +62,8 @@ def main() -> int:
             print(f"[skill dispatch-coverage] FAIL: {bp} missing", file=sys.stderr)
             return 1
         backend_fns[b] = extract_pub_fns(bp)
+        for module in BACKEND_IMPL_MODULES.get(b, []):
+            backend_fns[b].update(extract_pub_fns(src / module))
 
     new_holes: list[str] = []
     known_holes: list[str] = []

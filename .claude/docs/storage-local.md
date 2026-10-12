@@ -53,7 +53,7 @@ C:\Windows\path  (Windows)
 
 - `symlink_metadata` 不跟随 symlink，`metadata` 跟随。
 - copy_file 默认跟随，可配置。
-- walkdir 暴露 `is_symlink` 字段。
+- role traversal 暴露 `EntryKind::Symlink`。
 
 ### `block_size` (可选)
 
@@ -75,7 +75,7 @@ P1 复现过：`delete_tree` 的根是链接时会删光链接目标里的文件
 
 | 动词 | 行为 |
 |---|---|
-| `List` | **逐页流式** (P7 C5，`namespace/listing.rs`)：打开目录后 `entries()`，每页一次 `spawn_blocking`，把打开的 `ReadDir` 带进带出，读至多 `page_hint` 个子项 (描述成功 + 子项失败；隐藏的 artifact 不占名额) 就交出；两页之间只占一个目录 fd、不占 blocking 线程。每页之前与等待交出时看取消令牌，取消时先关 fd 再报 `Cancelled` 信号；消费方 drop 流后下一次交出失败即退出、关 fd，**不读到底**。读目录本身出错 (`getdents`) 结束列举：先交出已读到的子项，再报列举失败 (遍历记 `Interrupted { delivered }`，一项未交出则 `Unreadable`；`NotConnected` / `BrokenPipe` 仍升会话)；不可续读 (rustix 出错后不再给条目)。下钻不带提示，子目录按名字从根逐段重新打开。逐子项 `DirEntry::metadata()` (fstatat，不跟随)：描述符的身份、backend fact、content version、时间戳与观察角色同源；unix 上 `inline_mode = mode & 0o7777`，另带 `inline_ownership`（uid / gid / 完整 mode，与观察角色同源的 lstat；`observe_listed` 据此回答只要 ownership / timestamps 的计划，遍历不再每条目再 lstat 一次，P7 C0）。过滤 `.data-mover-*` 传输临时文件（计入页的 `internal_hidden`）。子项路径按契约拼成“请求的目录 + `/` + 名字”，不做规范化（`./d` 列出 `./d/x`，P7 C1）。子项拼不成 `StoragePath` (非 UTF-8、超长) → 无名子项失败 (`ChildFailure::unnamed`，带原始字节)；读目录到 lstat 之间消失的子项报 `ChildFailure::vanished` (遍历计入 `vanished`、不发项，P7 Q12)。`delete_tree` / `ndx_walk` 整目录收集：读目录中途出错时整个列举失败 (此前记成目录上的子项失败、已读到的子项照常处理) |
+| `List` | **逐页流式** (P7 C5，`namespace/listing.rs`)：打开目录后 `entries()`，每页一次 `spawn_blocking`，把打开的 `ReadDir` 带进带出，读至多 `page_hint` 个子项 (描述成功 + 子项失败；隐藏的 artifact 不占名额) 就交出；两页之间只占一个目录 fd、不占 blocking 线程。每页之前与等待交出时看取消令牌，取消时先关 fd 再报 `Cancelled` 信号；消费方 drop 流后下一次交出失败即退出、关 fd，**不读到底**。读目录本身出错 (`getdents`) 结束列举：先交出已读到的子项，再报列举失败 (遍历记 `Interrupted { delivered }`，一项未交出则 `Unreadable`；`NotConnected` / `BrokenPipe` 仍升会话)；不可续读 (rustix 出错后不再给条目)。下钻不带提示，子目录按名字从根逐段重新打开。逐子项 `DirEntry::metadata()` (fstatat，不跟随)：描述符的身份、backend fact、content version、时间戳与观察角色同源；unix 上 `inline_mode = mode & 0o7777`，另带 `inline_ownership`（uid / gid / 完整 mode，与观察角色同源的 lstat；`observe_listed` 据此回答只要 ownership / timestamps 的计划，遍历不再每条目再 lstat 一次，P7 C0）。过滤 `.data-mover-*` 传输临时文件（计入页的 `internal_hidden`）。子项路径按契约拼成“请求的目录 + `/` + 名字”，不做规范化（`./d` 列出 `./d/x`，P7 C1）。子项拼不成 `StoragePath` (非 UTF-8、超长) → 无名子项失败 (`ChildFailure::unnamed`，带原始字节)；读目录到 lstat 之间消失的子项报 `ChildFailure::vanished` (遍历计入 `vanished`、不发项，P7 Q12)。`delete_tree` 整目录收集：读目录中途出错时整个列举失败 (此前记成目录上的子项失败、已读到的子项照常处理) |
 | `Stat` | 父目录句柄里 `symlink_metadata`；根用 `dir_metadata` |
 | `ReadLink` | `read_link_contents` (原样返回链接文本；`read_link` 会把绝对目标当越界拒绝) |
 | `CreateDirectory` | 只建一级；已存在 → `Conflict`，父缺失 → `NotFound`；之后同步父目录 |
@@ -92,8 +92,7 @@ P1 复现过：`delete_tree` 的根是链接时会删光链接目标里的文件
   连内容，不跟随符号链接）再删目录；只要还有可见子项就照旧 `Conflict`，旁边的 artifact 一个不动
   (ADR-0006 C3b)。代价：同一目录里并发写入的 stage 会被一起删 —— 调用方契约本就是一个 key 一个写者，
   且调用方正在删这个目录。
-- legacy `walkdir` / `walkdir_2` 同样隐藏 `.data-mover-*`（按相对根的路径，先于过滤与 stat；NDX 编号与
-  没有它们时相同）；legacy `delete_dir_all` 是原始递归删除，照删。
+- `delete_dir_all` 是原始递归删除，也删除传输 artifact。
 - Windows：`Rename` 到已存在的目录会被拒 (报 `PermissionDenied`，不重映射)；只读文件 `Delete`
   失败；`cap-primitives` 打开目录不带 `FILE_SHARE_DELETE`，某个动词持有目录句柄期间，另一个
   任务对该目录的 rename/delete 会遇到共享冲突 (`Protocol`)。`delete_tree` 按深度倒序删目录，
@@ -123,16 +122,15 @@ P1 复现过：`delete_tree` 的根是链接时会删光链接目标里的文件
 | Windows 路径 `\` vs Unix `/` | URL parse 阶段统一为 `/` |
 | Windows ACL 没有等价 mode | 走 `acl.rs` 的 SDDL 表示 |
 | 跨设备 rename (EXDEV) | 应走 copy + delete fallback |
-| 软链接循环 | walkdir 检测 inode 重复 |
+| 软链接循环 | 遍历不下钻符号链接 |
 
 ## 测试
 
-- `examples/local_walkdir.rs` — 递归 + md5。
-- `examples/local_walkdir_2.rs` — walkdir_2 API 演示。
+- `examples/storage_role_operations/` — Local 遍历、创建与删除。
 - `examples/local_opt_dir.rs` — 优化目录结构。
 - `tests/test_copy_file_cancel.rs` — 取消语义 (用 /tmp 路径，无外部依赖)。
 - `tests/test_storage_type.rs` — URL 判别 (纯单元测试)。
-- `tests/local_namespace_contract.rs` — 公开 API 走 Local namespace：`create_directory_all` / `delete_tree` (含目录链接不删目标) / `ndx_walk` / `StorageTraversalSource`。
+- `tests/local_namespace_contract.rs` — 公开 API 走 Local namespace：`create_directory_all` / `delete_tree` (含目录链接不删目标) / `StorageTraversalSource`。
 - skill：`.claude/skills/e2e-local/` — **无外部依赖，CI 跑这个**。
 
 ## 改 Local 时
