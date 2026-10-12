@@ -21,7 +21,7 @@ use std::fmt;
 
 use super::{DirectoryListed, TraversalItem};
 use crate::model::{ObservedEntry, StoragePath};
-use crate::storage::roles::NameSemantics;
+use crate::storage::NameSemantics;
 
 mod input;
 #[cfg(test)]
