@@ -314,25 +314,6 @@ impl HDFSStorage {
         Ok(self.children_from_listing(statuses, &directory.relative_path))
     }
 
-    /// [`Self::list_directory`] without transfer artifacts (ADR-0006 C3b).
-    /// The raw listing stays available for callers that must see them.
-    pub(crate) async fn list_visible(
-        &self,
-        relative_path: &std::path::Path,
-    ) -> Result<Vec<HDFSEntry>, StorageError> {
-        let mut entries = self.list_directory(relative_path).await?;
-        entries.retain(|entry| {
-            let artifact = is_artifact_native(&entry.relative_path);
-            if artifact {
-                tracing::trace!(
-                    "[HDFS] listing skips transfer artifact {}",
-                    entry.relative_path.display()
-                );
-            }
-            !artifact
-        });
-        Ok(entries)
-    }
 
     #[cfg(test)]
     fn entries_from_listing(

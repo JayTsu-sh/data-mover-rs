@@ -1122,21 +1122,6 @@ fn strip_root_prefix(root: &str, relative_path: &Path) -> PathBuf {
     }
 }
 
-/// 安全地拼接两个 NFS 路径部分，避免重复的 '/'
-fn join_nfs_paths(base: &str, suffix: &str) -> String {
-    if base.is_empty() {
-        suffix.to_string()
-    } else if suffix.is_empty() {
-        base.to_string()
-    } else {
-        format!(
-            "{}/{}",
-            base.trim_end_matches('/'),
-            suffix.trim_start_matches('/')
-        )
-    }
-}
-
 /// A zero limit is unspecified. Preserve the existing default/client cap in each direction.
 fn negotiated_chunk_sizes(client: Option<u64>, rsize: u64, wsize: u64) -> (u64, u64) {
     let client_ceiling = client
@@ -3102,11 +3087,6 @@ impl NFSStorage {
         strip_root_prefix(&self.root, relative_path)
     }
 
-    /// 安全地拼接两个路径部分，避免重复的 '/'
-    fn join_paths(base: &str, suffix: &str) -> String {
-        join_nfs_paths(base, suffix)
-    }
-
     pub(crate) async fn read_data(
         &self,
         tx: mpsc::Sender<DataChunk>,
@@ -3870,41 +3850,6 @@ mod tests {
         // 路径恰好等于 root
         let result = strip_root_prefix("prefix", Path::new("prefix"));
         assert_eq!(result, PathBuf::from(""));
-    }
-
-    // --- build_relative_path_impl 测试 ---
-
-    // --- join_nfs_paths 测试 ---
-
-    #[test]
-    fn test_join_nfs_paths_basic() {
-        assert_eq!(join_nfs_paths("base", "suffix"), "base/suffix");
-    }
-
-    #[test]
-    fn test_join_nfs_paths_empty_base() {
-        assert_eq!(join_nfs_paths("", "suffix"), "suffix");
-    }
-
-    #[test]
-    fn test_join_nfs_paths_empty_suffix() {
-        assert_eq!(join_nfs_paths("base", ""), "base");
-    }
-
-    #[test]
-    fn test_join_nfs_paths_both_empty() {
-        assert_eq!(join_nfs_paths("", ""), "");
-    }
-
-    #[test]
-    fn test_join_nfs_paths_trailing_leading_slashes() {
-        // 避免重复 '/'
-        assert_eq!(join_nfs_paths("base/", "/suffix"), "base/suffix");
-    }
-
-    #[test]
-    fn test_join_nfs_paths_multiple_slashes() {
-        assert_eq!(join_nfs_paths("base///", "///suffix"), "base/suffix");
     }
 
     // --- is_stale_handle 测试（仅 STALE/BADHANDLE，不再包含 NOENT）---

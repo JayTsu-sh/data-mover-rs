@@ -9,7 +9,7 @@ use std::os::windows::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::UNIX_EPOCH;
 
 // 外部crate

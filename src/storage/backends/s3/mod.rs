@@ -31,7 +31,6 @@ pub(crate) use protocol::{
 
 pub(crate) use broken_body::broken_body_failure;
 pub(crate) use capabilities::S3BucketCapabilities;
-pub(crate) use history::{KeyHistory, ListedFacts, key_histories, warn_inferred};
 pub(crate) use metadata::S3TagSupport;
 pub(crate) use native::S3NativeContext;
 pub(crate) use same_object::{S3ObjectChange, S3SeenObject, object_change};

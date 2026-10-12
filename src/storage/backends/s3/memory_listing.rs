@@ -50,7 +50,7 @@ pub(crate) struct ListingKnobs {
     pub(crate) page_size: usize,
     pub(crate) minio_markers: bool,
     pub(crate) same_instant: bool,
-    /// Omit LastModified from version records to test inline-only observation.
+    /// Omit `LastModified` from version records to test inline-only observation.
     pub(crate) omit_version_timestamps: bool,
     /// List every key under the prefix flat, as a store that ignores the delimiter does.
     pub(crate) ignore_delimiter: bool,
