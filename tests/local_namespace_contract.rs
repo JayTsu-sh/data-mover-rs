@@ -1,11 +1,11 @@
 //! Public-API contract for the Local namespace role: recursive create, recursive delete,
-//! NDX paging and the generic traversal all run against a real filesystem, with no external
+//! directory blocks and the generic traversal all run against a real filesystem, with no external
 //! dependency.
 
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use data_mover::model::{EntryKind, StoragePath};
+use data_mover::model::{EntryKind, ObservationMode, ObservationPlan, StoragePath};
 use data_mover::storage::{
     BackendConfig, DeleteTreeCompletion, DeleteTreeOutcome, DeleteTreeRequest, LocalBackendConfig,
     Storage, connect_backend, create_directory_all, delete_tree,
@@ -117,8 +117,13 @@ async fn traversal_retains_local_modification_times() -> Result {
     let temp = tempfile::tempdir()?;
     seed(temp.path())?;
     let storage = connect(temp.path()).await?;
-    let mut session = StorageTraversalSource::new(&storage)?
-        .traverse(TraversalRequest::new(path("tree")?).max_inflight_operations(nonzero(2)?));
+    let mut session = StorageTraversalSource::new(&storage)?.traverse(
+        TraversalRequest::new(path("tree")?)
+            .max_inflight_operations(nonzero(2)?)
+            .observation_plan(
+                ObservationPlan::default().with_timestamps(ObservationMode::InlineOnly),
+            ),
+    );
     let mut entries = 0;
     while let Some(item) = session.next_item().await {
         match item {
