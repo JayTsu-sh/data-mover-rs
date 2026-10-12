@@ -19,6 +19,8 @@ class CargoExampleArtifacts(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="cargo artifact contract ") as directory:
             project = Path(directory)
             (project / "examples").mkdir()
+            (project / "src").mkdir()
+            (project / "src/lib.rs").write_text("", encoding="utf-8")
             (project / "Cargo.toml").write_text(
                 '[package]\nname = "artifact-contract"\nversion = "0.0.0"\nedition = "2021"\n',
                 encoding="utf-8",
