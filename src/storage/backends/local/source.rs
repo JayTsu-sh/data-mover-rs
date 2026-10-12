@@ -191,7 +191,12 @@ impl ReadSource for LocalReadSource {
     async fn describe(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         let (observed, version) = self
             .observer
-            .observe_versioned(path.clone(), crate::model::ObservationPlan::default())
+            .observe_versioned(
+                path.clone(),
+                crate::model::ObservationPlan::default()
+                    .with_timestamps(crate::model::ObservationMode::InlineOnly)
+                    .with_ownership_mode(crate::model::ObservationMode::InlineOnly),
+            )
             .await?;
         Ok(SourceDescriptor {
             path: path.clone(),
@@ -200,9 +205,18 @@ impl ReadSource for LocalReadSource {
             source_identity: observed.source_identity().clone(),
             backend_fact: None,
             content_version: Some(version),
-            inline_timestamps: None,
-            inline_mode: None,
-            inline_ownership: None,
+            inline_timestamps: observed.metadata().timestamps().value().copied(),
+            inline_mode: observed
+                .metadata()
+                .ownership_mode()
+                .value()
+                .map(|facts| facts.mode),
+            inline_ownership: observed
+                .metadata()
+                .ownership_mode()
+                .value()
+                .copied()
+                .map(crate::storage::InlineOwnership::Known),
             version: SourceVersion::Current,
             listing: ListingFacts::default(),
         })

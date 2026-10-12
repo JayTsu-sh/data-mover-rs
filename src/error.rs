@@ -1,8 +1,6 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
-use crate::integrity_check::{MismatchDataField, MismatchMetaField};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HdfsErrorKind {
     AlreadyExists,
@@ -180,14 +178,6 @@ pub enum StorageError {
     /// 向目标存储写入文件数据失败
     #[error("Write error: {0}")]
     WriteError(String),
-
-    /// 文件内容或条目类型不匹配
-    #[error("Content mismatch: {0:?}")]
-    MismatchData(Vec<MismatchDataField>),
-
-    /// POSIX 元数据不匹配
-    #[error("Metadata mismatch: {0:?}")]
-    MismatchMeta(Vec<MismatchMetaField>),
 }
 
 /// 存储操作的结果类型别名

@@ -11,7 +11,7 @@ BENCHMARK = ROOT / "examples" / "local_copy_comparison.rs"
 
 
 class LocalCopyComparisonTest(unittest.TestCase):
-    def test_runner_compares_both_public_paths_at_required_sizes(self):
+    def test_runner_can_compare_historical_binary_at_required_sizes(self):
         runner = RUNNER.read_text()
 
         self.assertIn("local_copy_comparison", runner)
@@ -33,15 +33,15 @@ class LocalCopyComparisonTest(unittest.TestCase):
         self.assertIn("fixed overhead", runner)
         self.assertIn('sync -d "$destination/$label.bin"', runner)
 
-    def test_benchmark_uses_the_legacy_and_optimized_public_seams(self):
+    def test_benchmark_uses_only_the_role_transfer_seam(self):
         benchmark = BENCHMARK.read_text()
 
-        self.assertIn("StorageEnum::copy_file", benchmark)
-        self.assertIn("LegacyDurable", benchmark)
-        self.assertIn("sync_data", benchmark)
+        self.assertNotIn("StorageEnum", benchmark)
+        self.assertNotIn("LegacyDurable", benchmark)
+        self.assertIn("LOCAL_COPY_PERF_BASELINE_BIN", RUNNER.read_text())
         self.assertIn("connect_backend", benchmark)
         self.assertIn("transfer(request)", benchmark)
-        self.assertIn("enable_integrity_check: !args.no_read_back", benchmark)
+        self.assertIn("with_read_back_verification(ReadBackVerification::Disabled)", benchmark)
 
 
 if __name__ == "__main__":

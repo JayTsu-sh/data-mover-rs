@@ -77,7 +77,13 @@ pub(super) async fn write(
                 break;
             };
             offset = end;
-            writes.push(file.write_all_at(start, chunk));
+            writes.push(async move {
+                let result = file.write_all_at(start, chunk).await;
+                if result.is_ok() {
+                    stage.confirmed_write(start, count as u64);
+                }
+                result
+            });
             continue;
         }
         tokio::select! {
@@ -106,6 +112,7 @@ pub(super) async fn write(
     }
     if stage.recovery_enabled() {
         write_pointer(adapter, stage, offset, false).await?;
+        stage.checkpoint_recorded(offset);
     }
     Ok(offset)
 }
@@ -122,5 +129,6 @@ pub(super) async fn save(
     // The pointer is the whole recovery record: nothing registers where data-mover runs.
     write_pointer(adapter, stage, offset, false).await?;
     stage.recovery_enabled.store(true, Ordering::Release);
+    stage.checkpoint_recorded(offset);
     Ok(())
 }

@@ -13,7 +13,7 @@ use super::{
 };
 use crate::s3::copy_request::state_empty_body;
 
-fn copy_source(source: &S3NativeCopySource) -> String {
+pub(super) fn copy_source(source: &S3NativeCopySource) -> String {
     let mut value = build_copy_source(&source.bucket, &source.key);
     if let Some(version) = &source.version_id {
         value.push_str("?versionId=");
@@ -167,8 +167,6 @@ pub(super) mod tests {
             bucket_name: "destination".into(),
             prefix: None,
             client: aws_sdk_s3::Client::from_conf(config),
-            block_size: super::super::super::DEFAULT_BLOCK_SIZE,
-            transfer_concurrency: super::super::super::DEFAULT_TRANSFER_CONCURRENCY,
             is_bucket_versioned: false,
             versioning_suspended: false,
             versioning_at_connect: super::super::super::S3VersioningAtConnect::Never,

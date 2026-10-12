@@ -10,6 +10,16 @@ max_regression_percent="${NFS_COPY_PERF_MAX_REGRESSION_PERCENT:-}"
 recovery="${NFS_COPY_PERF_RECOVERY:-checkpointed}"
 read_inflight="${NFS_COPY_PERF_READ_INFLIGHT:-8}"
 write_inflight="${NFS_COPY_PERF_WRITE_INFLIGHT:-8}"
+# Optional immutable historical executable; the current library has one transfer path.
+baseline_binary="${NFS_COPY_PERF_BASELINE_BIN:-}"
+if [[ -n "$baseline_binary" && ! -x "$baseline_binary" ]]; then
+  echo "NFS_COPY_PERF_BASELINE_BIN must name an executable historical benchmark" >&2
+  exit 2
+fi
+if [[ -n "$max_regression_percent" && -z "$baseline_binary" ]]; then
+  echo "a regression limit requires NFS_COPY_PERF_BASELINE_BIN" >&2
+  exit 2
+fi
 validate_run_id "$run_id"
 [[ "$repeats" =~ ^[1-9][0-9]*$ ]] || {
   echo "NFS_COPY_PERF_REPEATS must be a positive integer" >&2
@@ -90,13 +100,15 @@ printf '%s\n' \
 
 run_case() {
   local implementation="$1" label="$2" size="$3" repeat="$4"
+  local executable="$binary"
+  if [[ "$implementation" != optimized ]]; then executable="$baseline_binary"; fi
   local destination_url metrics log elapsed_ns elapsed_ms throughput user system rss cpu
   destination_url="nfs://$LAB_DEST_DATA$LAB_NFS41_EXPORT:/ci/$run_id/destination/$implementation-$label-$repeat?version=4.1&noresvport=true"
   metrics="$(mktemp)"
   log="$(mktemp)"
 
   if ! /usr/bin/time -o "$metrics" -f '%U,%S,%M,%P' \
-    "$binary" copy --implementation "$implementation" \
+    "$executable" copy --implementation "$implementation" \
       --source "$source_url" --destination "$destination_url" --path "$label.bin" \
       --chunk-bytes "$chunk_bytes" --read-inflight "$read_inflight" \
       --write-inflight "$write_inflight" --transfer-policy "$recovery" > "$log" 2>&1; then
@@ -126,10 +138,13 @@ run_case() {
 
 for index in "${!sizes[@]}"; do
   for ((repeat = 1; repeat <= repeats; repeat++)); do
-    if (( repeat % 2 == 1 )); then
-      implementations=(legacy optimized)
-    else
-      implementations=(optimized legacy)
+    implementations=(optimized)
+    if [[ -n "$baseline_binary" ]]; then
+      if (( repeat % 2 == 1 )); then
+        implementations=(legacy optimized)
+      else
+        implementations=(optimized legacy)
+      fi
     fi
     for implementation in "${implementations[@]}"; do
       run_case "$implementation" "${labels[$index]}" "${sizes[$index]}" "$repeat"
@@ -147,6 +162,16 @@ with open(sys.argv[1], newline="") as source:
 payloads = sys.argv[2].split(",")
 maximum_regression = float(sys.argv[3]) if sys.argv[3] else None
 regressions = []
+
+if not any(row["implementation"] == "legacy" for row in rows):
+    print("payload,optimized_median_ms (no historical baseline supplied)")
+    for payload in payloads:
+        samples = [float(row["elapsed_ms"]) for row in rows
+                   if row["payload"] == payload and row["implementation"] == "optimized"]
+        if not samples:
+            raise SystemExit(f"missing optimized samples for {payload}")
+        print(f"{payload},{statistics.median(samples):.3f}")
+    raise SystemExit(0)
 
 print("payload,legacy_median_ms,optimized_median_ms,optimized_vs_legacy")
 for payload in payloads:

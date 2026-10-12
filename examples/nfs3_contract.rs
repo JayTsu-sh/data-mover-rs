@@ -10,9 +10,9 @@ use data_mover::model::{
     StoragePath, Transience,
 };
 use data_mover::storage::{
-    ByteStream, DestinationPrepareRequest, FinalDestination, MetadataMutation, PreflightPolicy,
-    PrepareFact, PrepareRequest, PublishRequest, ResumeMode, Storage, StorageRoleFailure,
-    VerifyRequest,
+    BackendConfig, ByteStream, DestinationPrepareRequest, FinalDestination, MetadataMutation,
+    NfsBackendConfig, PreflightPolicy, PrepareFact, PrepareRequest, PublishRequest, ResumeMode,
+    Storage, StorageRoleFailure, VerifyRequest, connect_backend,
 };
 use data_mover::transfer::{
     InflightLimits, SourceQosGroup, SourceQosPolicy, TransferIdentity, TransferPolicy,
@@ -266,8 +266,17 @@ async fn validate_nfs4_stale_retry(
     Ok(())
 }
 
+async fn connect_nfs(url: &str, ensure_dir: bool) -> ContractResult<Storage> {
+    Ok(connect_backend(BackendConfig::Nfs(NfsBackendConfig {
+        url: url.to_owned(),
+        block_size: Some(64 * 1024),
+        ensure_dir,
+    }))
+    .await?)
+}
+
 async fn connect_destination(url: &str) -> ContractResult<Storage> {
-    Ok(data_mover::nfs::create_nfs_role_storage(url, Some(64 * 1024), true).await?)
+    connect_nfs(url, true).await
 }
 
 fn validate_fixture_metadata(
@@ -557,10 +566,8 @@ async fn main() -> ContractResult {
         seed_nfs4_fixture(mount, root, args.expect_setacl_unsupported).await?;
     }
     eprintln!("contract stage: connect production role handles");
-    let source =
-        data_mover::nfs::create_nfs_role_storage(&args.source, Some(64 * 1024), false).await?;
-    let destination =
-        data_mover::nfs::create_nfs_role_storage(&args.destination, Some(64 * 1024), true).await?;
+    let source = connect_nfs(&args.source, false).await?;
+    let destination = connect_nfs(&args.destination, true).await?;
     validate_stale_retry(
         &source,
         args.stale_ready_file.as_deref(),

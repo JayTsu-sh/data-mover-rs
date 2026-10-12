@@ -2,8 +2,7 @@
 //!
 //! The role verb creates exactly one level, as on CIFS and HDFS, so
 //! `storage::create_directory_all` drives every level itself and its rule for a refused level
-//! that already exists reaches NFS intermediate levels too. The legacy recursive
-//! `NFSStorage::create_dir_all` is unchanged for legacy callers.
+//! that already exists reaches NFS intermediate levels too.
 //!
 //! One level:
 //! - a directory this process already created or looked up (the handle cache) is success

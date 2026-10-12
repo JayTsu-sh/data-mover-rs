@@ -1,209 +1,425 @@
-// 标准库
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+//! Bounded tar composition over the source and destination roles.
+//!
+//! Every file is read through its identity-bound source stream. The archive is written through
+//! the expert destination lifecycle, so publication and read-back verification use the same
+//! optimized backend implementations as ordinary transfers. No complete file is buffered.
 
-// 外部crate
+use crate::model::{
+    EntryKind, EntryOperationFailure, FailureClass, IdentityStrength, ObservedEntry, Operation,
+    SourceIdentity, SourceVersion, StoragePath, Transience, without_unowned_set_id,
+};
+use crate::storage::{
+    ByteStream, PreflightPolicy, ReadRequest, ReadSource, SourceQosBudget, SourceQosGroup,
+    SourceQosStats, Storage, StorageRoleFailure,
+};
+use crate::transfer::{
+    ExpertDestinationRequest, ExpertDestinationSession, ExpertSourceEvidence, InflightLimits,
+    TransferFailure, TransferOutcome, TransferPolicy,
+};
 use bytes::{Bytes, BytesMut};
-use tokio::sync::mpsc;
-use tracing::warn;
+use futures::StreamExt as _;
+use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
-// 内部模块
-use crate::error::StorageError;
-use crate::model::without_unowned_set_id;
-use crate::storage_copy_pipeline::HASH_CHANNEL_CAPACITY;
-use crate::storage_enum::{StorageEnum, path_to_s3_key};
-use crate::{DataChunk, EntryEnum, Result, TarPackOptions};
+#[derive(Debug, thiserror::Error)]
+pub enum TarFailure {
+    #[error("invalid archive: {0}")]
+    Invalid(String),
+    #[error(transparent)]
+    Storage(#[from] StorageRoleFailure),
+    /// Retains the destination's cleanup authority when transfer fails.
+    #[error(transparent)]
+    Transfer(Box<TransferFailure>),
+}
 
-/// TAR 打包 pipeline 的 channel 容量（多文件顺序读，适当放大缓冲）
-const TAR_PIPELINE_CAPACITY: usize = 16;
+/// Archive inputs. Entry paths are also their names in the archive.
+/// Request ownership and timestamps during traversal to preserve them in the tar headers.
+#[derive(Clone)]
+pub struct TarRequest {
+    pub source: Storage,
+    pub destination: Storage,
+    pub entries: Vec<ObservedEntry>,
+    pub final_path: StoragePath,
+    pub inflight: InflightLimits,
+    pub cancel: CancellationToken,
+    pub source_qos: Option<SourceQosGroup>,
+}
 
-pub(crate) async fn pack_files_to_tar(
-    from: &StorageEnum,
-    to: &StorageEnum,
-    entries: &[Arc<EntryEnum>],
-    tar_path: &Path,
-    tar_size: u64,
-    tar_mtime: i64,
-    options: TarPackOptions,
-) -> Result<()> {
-    let TarPackOptions { qos, bytes_counter } = options;
-    let base_path = tar_path.with_extension("");
-    let (tx, rx) = mpsc::channel::<DataChunk>(TAR_PIPELINE_CAPACITY);
-    let to_c = to.clone();
-    let tar_path_buf = tar_path.to_path_buf();
-    let bytes_counter_w = bytes_counter.clone();
-    let write_task = tokio::spawn(async move {
-        write_tar_stream(
-            &to_c,
-            rx,
-            &tar_path_buf,
-            tar_size,
-            tar_mtime,
-            bytes_counter_w,
+/// Checked archive size, including headers, padding and the two end blocks.
+///
+/// # Errors
+/// Refuses unsupported entries, unknown file sizes and arithmetic overflow.
+pub fn calculate_tar_size(entries: &[ObservedEntry]) -> Result<u64, TarFailure> {
+    entries.iter().try_fold(1024_u64, |total, entry| {
+        let size = entry_size(entry)?;
+        let headers = u64::try_from(build_header_for_entry(entry)?.len())
+            .map_err(|_| invalid("archive header overflow"))?;
+        total
+            .checked_add(headers)
+            .and_then(|value| value.checked_add(size))
+            .and_then(|value| value.checked_add((512 - size % 512) % 512))
+            .ok_or_else(|| invalid("archive size overflow"))
+    })
+}
+
+/// Streams an archive and atomically replaces its destination using the shared transfer engine.
+///
+/// # Errors
+/// Returns invalid input, a source error, or a destination failure retaining cleanup authority.
+pub async fn pack(request: TarRequest) -> Result<TransferOutcome, TarFailure> {
+    let size = calculate_tar_size(&request.entries)?;
+    let observed = archive_observation(&request, size)?;
+    let identity_key = observed.identity_key();
+    let maximum = request.inflight.negotiated_chunk_ceiling();
+    let source = request
+        .source
+        .read_source(&PreflightPolicy::production())
+        .map_err(|error| invalid(&error.to_string()))?;
+    let destination = ExpertDestinationSession::prepare(
+        ExpertDestinationRequest::new(
+            observed,
+            maximum,
+            request.destination,
+            request.final_path.clone(),
+            request.inflight,
+            request.cancel.clone(),
         )
-        .await
+        .with_transfer_policy(TransferPolicy::AtomicReplace),
+    )
+    .await
+    .map_err(transfer_failure)?;
+    let budget = request
+        .source_qos
+        .as_ref()
+        .map(SourceQosGroup::transfer_budget);
+    let evidence = Arc::new(Mutex::new((blake3::Hasher::new(), 0_u64)));
+    let tally = Arc::clone(&evidence);
+    let state = ArchiveStream {
+        source,
+        output: None,
+        entries: request.entries.into_iter(),
+        pending: None,
+        reading: None,
+        remaining: 0,
+        padding: None,
+        eof: false,
+        maximum,
+        inflight: request.inflight,
+        cancel: request.cancel,
+        budget: budget.clone(),
+        path: request.final_path,
+    };
+    let stream = futures::stream::try_unfold(state, next_piece).map(move |piece| {
+        if let Ok(bytes) = &piece {
+            let mut tally = tally
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tally.0.update(bytes);
+            tally.1 += bytes.len() as u64;
+        }
+        piece
     });
-
-    let mut offset = 0u64;
-    for entry in entries {
-        let header_bytes = build_tar_header(from, entry, &base_path).await;
-        tx.send(DataChunk {
-            offset,
-            data: header_bytes,
+    let transferred = destination
+        .write(Box::pin(stream))
+        .await
+        .map_err(transfer_failure)?;
+    let (digest, actual) = {
+        let tally = evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (*tally.0.finalize().as_bytes(), tally.1)
+    };
+    // Destination write also checks the complete expected length before returning.
+    debug_assert_eq!(actual, size);
+    if let Some(budget) = &budget {
+        budget.set_logical_bytes(size);
+    }
+    transferred
+        .complete(ExpertSourceEvidence {
+            source_size: size,
+            blake3: digest,
+            identity_key,
+            source_qos: budget.as_ref().map_or(
+                SourceQosStats {
+                    logical_bytes: size,
+                    ..Default::default()
+                },
+                SourceQosBudget::stats,
+            ),
         })
         .await
-        .map_err(|_| {
-            StorageError::OperationError("tar write channel closed during header send".to_string())
-        })?;
-        offset += 512;
+        .map_err(transfer_failure)
+}
 
-        if entry.get_is_regular_file() {
-            let file_size = entry.get_size();
-            if file_size > 0 {
-                let (sub_tx, mut sub_rx) = mpsc::channel(HASH_CHANNEL_CAPACITY);
-                let from_c = from.clone();
-                let entry_c = entry.clone();
-                let qos_c = qos.clone();
-                let read_task = tokio::spawn(async move {
-                    Box::pin(crate::storage_read_pipeline::read_data_from(
-                        &from_c, &entry_c, sub_tx, file_size, false, qos_c,
-                    ))
-                    .await
-                });
-
-                while let Some(chunk) = sub_rx.recv().await {
-                    let chunk_len = chunk.data.len() as u64;
-                    tx.send(DataChunk {
-                        offset,
-                        data: chunk.data,
-                    })
-                    .await
-                    .map_err(|_| {
-                        StorageError::OperationError(
-                            "tar write channel closed during file transfer".to_string(),
-                        )
-                    })?;
-                    offset += chunk_len;
-                }
-
-                read_task.await.map_err(|error| {
-                    StorageError::OperationError(format!("read task panicked: {error:?}"))
-                })??;
-
-                if let Some(padding) = tar_padding(file_size) {
-                    let padding_len = padding.len() as u64;
-                    tx.send(DataChunk {
-                        offset,
-                        data: padding,
-                    })
-                    .await
-                    .map_err(|_| {
-                        StorageError::OperationError(
-                            "tar write channel closed during padding send".to_string(),
-                        )
-                    })?;
-                    offset += padding_len;
-                }
-            }
-        }
+fn archive_observation(request: &TarRequest, size: u64) -> Result<ObservedEntry, TarFailure> {
+    let mut manifest = blake3::Hasher::new();
+    manifest.update(b"data-mover/tar/v1\0");
+    manifest.update(request.final_path.as_str().as_bytes());
+    manifest.update(b"\0");
+    for entry in &request.entries {
+        manifest.update(entry.identity_key().as_bytes());
+        manifest.update(&build_header_for_entry(entry)?);
     }
-
-    finish_tar_stream(tx, offset, write_task).await
+    let identity = SourceIdentity::new(
+        request.source.identity().clone(),
+        IdentityStrength::PathScoped,
+        manifest.finalize().as_bytes(),
+    )
+    .map_err(|error| invalid(&error.to_string()))?;
+    let observed = ObservedEntry::new(
+        request.final_path.clone(),
+        EntryKind::File,
+        Some(size),
+        None,
+        identity,
+    )
+    .map_err(|error| invalid(&error.to_string()))?;
+    Ok(observed)
 }
 
-async fn finish_tar_stream(
-    tx: mpsc::Sender<DataChunk>,
-    offset: u64,
-    write_task: tokio::task::JoinHandle<Result<u64>>,
-) -> Result<()> {
-    tx.send(DataChunk {
-        offset,
-        data: tar_eof_marker(),
-    })
-    .await
-    .map_err(|_| {
-        StorageError::OperationError("tar write channel closed during EOF send".to_string())
-    })?;
-    drop(tx);
-    write_task.await.map_err(|error| {
-        StorageError::OperationError(format!("tar write task panicked: {error:?}"))
-    })??;
-    Ok(())
+struct ArchiveStream {
+    output: Option<Bytes>,
+    source: Arc<dyn ReadSource>,
+    entries: std::vec::IntoIter<ObservedEntry>,
+    pending: Option<ObservedEntry>,
+    reading: Option<ByteStream>,
+    remaining: u64,
+    padding: Option<Bytes>,
+    eof: bool,
+    maximum: usize,
+    inflight: InflightLimits,
+    cancel: CancellationToken,
+    budget: Option<SourceQosBudget>,
+    path: StoragePath,
 }
 
-async fn build_tar_header(storage: &StorageEnum, entry: &EntryEnum, base_path: &Path) -> Bytes {
-    let link_target = if entry.get_is_symlink() {
-        storage.read_symlink(entry).await.map_or_else(
-            |error| {
-                warn!(
-                    "Failed to read symlink target for {:?}: {}",
-                    entry.get_relative_path(),
-                    error
-                );
-                String::new()
-            },
-            |target| target.to_string_lossy().to_string(),
-        )
-    } else {
-        String::new()
+async fn next_piece(
+    mut state: ArchiveStream,
+) -> Result<Option<(Bytes, ArchiveStream)>, StorageRoleFailure> {
+    let next = match state.output.take() {
+        Some(bytes) => Some((bytes, state)),
+        None => next_raw(state).await?,
     };
-    let internal_path = entry
-        .get_relative_path()
-        .strip_prefix(base_path)
-        .unwrap_or(entry.get_relative_path())
-        .iter()
-        .map(|component| component.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
-    build_header_for_entry(entry, &internal_path, &link_target)
+    let Some((mut bytes, mut state)) = next else {
+        return Ok(None);
+    };
+    if bytes.len() > state.maximum {
+        let head = bytes.split_to(state.maximum);
+        state.output = Some(bytes);
+        bytes = head;
+    }
+    Ok(Some((bytes, state)))
 }
 
-async fn write_tar_stream(
-    storage: &StorageEnum,
-    rx: mpsc::Receiver<DataChunk>,
-    tar_path: &Path,
-    tar_size: u64,
-    tar_mtime: i64,
-    bytes_counter: Option<Arc<AtomicU64>>,
-) -> Result<u64> {
-    match storage {
-        StorageEnum::Local(local) => {
-            local
-                .write_data(rx, tar_path, None, None, None, bytes_counter)
-                .await
+async fn next_raw(
+    mut state: ArchiveStream,
+) -> Result<Option<(Bytes, ArchiveStream)>, StorageRoleFailure> {
+    loop {
+        if state.cancel.is_cancelled() {
+            return Err(stream_failure(&state.path, FailureClass::Cancelled));
         }
-        StorageEnum::NFS(nfs) => {
-            nfs.write_data(rx, tar_path, None, None, None, bytes_counter)
-                .await
+        if let Some(reading) = &mut state.reading {
+            if let Some(chunk) = reading.next().await {
+                let bytes = chunk?;
+                state.remaining = state
+                    .remaining
+                    .checked_sub(bytes.len() as u64)
+                    .ok_or_else(|| stream_failure(&state.path, FailureClass::Corruption))?;
+                if bytes.is_empty() {
+                    continue;
+                }
+                return Ok(Some((bytes, state)));
+            }
+            if state.remaining != 0 {
+                return Err(stream_failure(&state.path, FailureClass::Corruption));
+            }
+            state.reading = None;
         }
-        StorageEnum::S3(s3) => {
-            let tar_key = path_to_s3_key(tar_path);
-            s3.write_data(rx, &tar_key, tar_size, tar_mtime, None, bytes_counter)
-                .await
+        if let Some(padding) = state.padding.take() {
+            return Ok(Some((padding, state)));
         }
-        StorageEnum::HDFS(hdfs) => {
-            hdfs.write_data(rx, tar_path, tar_size, 0o644, None, bytes_counter)
-                .await
+        if let Some(entry) = state.pending.take() {
+            let size = entry
+                .size()
+                .ok_or_else(|| stream_failure(entry.path(), FailureClass::InvalidInput))?;
+            state.remaining = size;
+            state.padding = tar_padding(size);
+            state.reading = Some(
+                state
+                    .source
+                    .read(ReadRequest {
+                        path: entry.path().clone(),
+                        range: Some(0..size),
+                        expected_source: Some(entry.source_identity().clone()),
+                        maximum_chunk_bytes: state.maximum,
+                        read_inflight: state.inflight.operations.min(state.inflight.chunks),
+                        read_budget: None,
+                        cancel: state.cancel.clone(),
+                        source_qos: state.budget.clone(),
+                        version: SourceVersion::Current,
+                    })
+                    .await?,
+            );
+            continue;
         }
+        if let Some(entry) = state.entries.next() {
+            let header = build_header_for_entry(&entry)
+                .map_err(|_| stream_failure(entry.path(), FailureClass::InvalidInput))?;
+            if entry.kind() == EntryKind::File {
+                state.pending = Some(entry);
+            }
+            return Ok(Some((header, state)));
+        }
+        if !state.eof {
+            state.eof = true;
+            return Ok(Some((tar_eof_marker(), state)));
+        }
+        return Ok(None);
     }
 }
 
-/// 构建 512 字节的 ustar header
-///
-/// ustar 格式布局（512 bytes total）：
-/// - 0..100:   name (null-terminated)
-/// - 100..108: mode (octal, null-terminated)
-/// - 108..116: uid (octal, null-terminated)
-/// - 116..124: gid (octal, null-terminated)
-/// - 124..136: size (octal, null-terminated)
-/// - 136..148: mtime (octal, null-terminated)
-/// - 148..156: checksum (octal + space + null)
-/// - 156:      `type_flag` ('0'=file, '5'=dir, '2'=symlink)
-/// - 157..257: `link_name`
-/// - 257..263: "ustar\0"
-/// - 263..265: "00"
-/// - 265..512: 填零
+fn stream_failure(path: &StoragePath, class: FailureClass) -> StorageRoleFailure {
+    StorageRoleFailure::Entry(
+        EntryOperationFailure::new(
+            path.clone(),
+            Operation::Read,
+            class,
+            Transience::Permanent,
+            "archive source stream failed",
+        )
+        .unwrap_or_else(|_| unreachable!("static diagnostic")),
+    )
+}
+fn invalid(message: &str) -> TarFailure {
+    TarFailure::Invalid(message.to_owned())
+}
+fn transfer_failure(failure: TransferFailure) -> TarFailure {
+    TarFailure::Transfer(Box::new(failure))
+}
+
+fn entry_size(entry: &ObservedEntry) -> Result<u64, TarFailure> {
+    match entry.kind() {
+        EntryKind::File => entry.size().ok_or_else(|| invalid("file size is unknown")),
+        EntryKind::Directory | EntryKind::Symlink => Ok(0),
+        EntryKind::Special(_) => Err(invalid("unsupported archive entry kind")),
+    }
+}
+
+fn build_header_for_entry(entry: &ObservedEntry) -> Result<Bytes, TarFailure> {
+    let size = entry_size(entry)?;
+    let path = if entry.kind() == EntryKind::Directory {
+        format!("{}/", entry.path().as_str().trim_end_matches('/'))
+    } else {
+        entry.path().as_str().to_owned()
+    };
+    if path.is_empty() || path.starts_with('/') || path.split('/').any(|part| part == "..") {
+        return Err(invalid("archive path must be relative and confined"));
+    }
+    if entry.kind() == EntryKind::Symlink && entry.symlink_target().is_none() {
+        return Err(invalid("archive symlink target was not observed"));
+    }
+    let target = entry
+        .symlink_target()
+        .map(crate::model::SymlinkTarget::as_bytes)
+        .unwrap_or_default();
+    if path.contains('\0') || target.contains(&0) {
+        return Err(invalid("archive names contain NUL"));
+    }
+    let owner = entry.metadata().ownership_mode().value();
+    let (mode, uid, gid) = header_ownership(
+        owner.map_or(0, |owner| owner.mode),
+        owner.map(|owner| owner.uid),
+        owner.map(|owner| owner.gid),
+        entry.kind() == EntryKind::Directory,
+    );
+    let mtime = entry
+        .modified()
+        .map(|time| i64::try_from(time.unix_nanos()))
+        .transpose()
+        .map_err(|_| invalid("timestamp exceeds archive range"))?
+        .unwrap_or(0);
+    let mut extended = Vec::new();
+    if target.len() > 100 && std::str::from_utf8(target).is_err() {
+        pax_record(&mut extended, "hdrcharset", b"BINARY");
+    }
+    if path.len() > 100 {
+        pax_record(&mut extended, "path", path.as_bytes());
+    }
+    if target.len() > 100 {
+        pax_record(&mut extended, "linkpath", target);
+    }
+    if size > 0o77_777_777_777 {
+        pax_record(&mut extended, "size", size.to_string().as_bytes());
+    }
+    if uid > 0o7_777_777 {
+        pax_record(&mut extended, "uid", uid.to_string().as_bytes());
+    }
+    if gid > 0o7_777_777 {
+        pax_record(&mut extended, "gid", gid.to_string().as_bytes());
+    }
+    if mtime < 0 || mtime % 1_000_000_000 != 0 {
+        let magnitude = mtime.unsigned_abs();
+        pax_record(
+            &mut extended,
+            "mtime",
+            format!(
+                "{}{}.{:09}",
+                if mtime < 0 { "-" } else { "" },
+                magnitude / 1_000_000_000,
+                magnitude % 1_000_000_000
+            )
+            .as_bytes(),
+        );
+    }
+    let mut output = Vec::new();
+    if !extended.is_empty() {
+        let extended_size =
+            u64::try_from(extended.len()).map_err(|_| invalid("archive header overflow"))?;
+        output.extend_from_slice(&build_ustar_header(&UstarHeader {
+            path: "PaxHeaders/entry",
+            size: extended_size,
+            mtime: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            type_flag: b'x',
+            link_name: b"",
+        }));
+        output.extend_from_slice(&extended);
+        output.resize(output.len() + (512 - extended.len() % 512) % 512, 0);
+    }
+    output.extend_from_slice(&build_ustar_header(&UstarHeader {
+        path: if path.len() <= 100 { &path } else { "PaxEntry" },
+        size: if size <= 0o77_777_777_777 { size } else { 0 },
+        mtime,
+        mode,
+        uid,
+        gid,
+        type_flag: match entry.kind() {
+            EntryKind::Directory => b'5',
+            EntryKind::Symlink => b'2',
+            _ => b'0',
+        },
+        link_name: if target.len() <= 100 { target } else { b"" },
+    }));
+    Ok(Bytes::from(output))
+}
+
+fn pax_record(output: &mut Vec<u8>, key: &str, value: &[u8]) {
+    let mut body = format!(" {key}=").into_bytes();
+    body.extend_from_slice(value);
+    body.push(b'\n');
+    let mut length = body.len() + 1;
+    loop {
+        let next = body.len() + length.to_string().len();
+        if next == length {
+            break;
+        }
+        length = next;
+    }
+    output.extend_from_slice(length.to_string().as_bytes());
+    output.extend_from_slice(&body);
+}
 struct UstarHeader<'a> {
     path: &'a str,
     size: u64,
@@ -212,7 +428,7 @@ struct UstarHeader<'a> {
     uid: u32,
     gid: u32,
     type_flag: u8,
-    link_name: &'a str,
+    link_name: &'a [u8],
 }
 
 fn build_ustar_header(metadata: &UstarHeader<'_>) -> [u8; 512] {
@@ -255,7 +471,7 @@ fn build_ustar_header(metadata: &UstarHeader<'_>) -> [u8; 512] {
     header[156] = type_flag;
 
     // link_name (157..257)
-    write_bytes(&mut header[157..257], link_name.as_bytes());
+    write_bytes(&mut header[157..257], link_name);
 
     // magic "ustar\0" (257..263)
     header[257..263].copy_from_slice(b"ustar\0");
@@ -291,28 +507,6 @@ fn write_bytes(field: &mut [u8], data: &[u8]) {
     field[..len].copy_from_slice(&data[..len]);
 }
 
-/// 计算 tar 文件的总大小
-///
-/// 每个条目 = 512 字节 header + 文件数据（对齐到 512 字节）
-/// 结尾 = 两个 512 字节全零块（EOF marker）
-pub fn calculate_tar_size(entries: &[Arc<EntryEnum>]) -> u64 {
-    let mut size = 0u64;
-    for entry in entries {
-        size += 512; // ustar header
-        if entry.get_is_regular_file() {
-            let file_size = entry.get_size();
-            size += file_size;
-            // padding to 512-byte boundary
-            let remainder = file_size % 512;
-            if remainder != 0 {
-                size += 512 - remainder;
-            }
-        }
-    }
-    size += 1024; // EOF marker (two 512B zero blocks)
-    size
-}
-
 /// Nobody, the id a tar records for an owner the source could not name.
 const TAR_UNKNOWN_ID: u32 = 65534;
 
@@ -331,50 +525,6 @@ fn header_ownership(
         uid.unwrap_or(TAR_UNKNOWN_ID),
         gid.unwrap_or(TAR_UNKNOWN_ID),
     )
-}
-
-/// 从 `EntryEnum` 构建 ustar header 的 Bytes
-///
-/// 自动判断条目类型（目录/symlink/普通文件）并设置对应的 `type_flag` 和 size。
-/// `tar_internal_path` 是条目在 tar 内的相对路径。
-pub(crate) fn build_header_for_entry(
-    entry: &EntryEnum,
-    tar_internal_path: &str,
-    link_target: &str,
-) -> Bytes {
-    let (type_flag, size) = if entry.get_is_dir() {
-        (b'5', 0u64)
-    } else if entry.get_is_symlink() {
-        (b'2', 0u64)
-    } else {
-        (b'0', entry.get_size())
-    };
-
-    // 目录路径需要以 '/' 结尾
-    let path = if entry.get_is_dir() && !tar_internal_path.ends_with('/') {
-        format!("{tar_internal_path}/")
-    } else {
-        tar_internal_path.to_string()
-    };
-
-    let (mode, uid, gid) = header_ownership(
-        entry.get_mode().unwrap_or(0),
-        entry.get_uid(),
-        entry.get_gid(),
-        entry.get_is_dir(),
-    );
-    let header = build_ustar_header(&UstarHeader {
-        path: &path,
-        size,
-        mtime: entry.get_mtime(),
-        mode,
-        uid,
-        gid,
-        type_flag,
-        link_name: link_target,
-    });
-
-    Bytes::copy_from_slice(&header)
 }
 
 /// 生成 512 字节对齐的 padding
@@ -435,7 +585,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             type_flag: b'0',
-            link_name: "",
+            link_name: b"",
         });
 
         // magic
@@ -461,7 +611,7 @@ mod tests {
             uid: 0,
             gid: 0,
             type_flag: b'5',
-            link_name: "",
+            link_name: b"",
         });
         assert_eq!(header[156], b'5');
         // size should be zero for directories
@@ -485,7 +635,7 @@ mod tests {
             uid: 0,
             gid: 0,
             type_flag: b'0',
-            link_name: "",
+            link_name: b"",
         });
 
         // 验证 checksum：将 checksum 字段视为空格，求所有字节的和
@@ -502,8 +652,11 @@ mod tests {
 
     #[test]
     fn test_calculate_tar_size_empty() {
-        let entries: Vec<Arc<EntryEnum>> = vec![];
-        assert_eq!(calculate_tar_size(&entries), 1024); // only EOF marker
+        let entries: Vec<ObservedEntry> = vec![];
+        assert_eq!(
+            calculate_tar_size(&entries).assert_value("archive size"),
+            1024
+        ); // only EOF marker
     }
 
     #[test]

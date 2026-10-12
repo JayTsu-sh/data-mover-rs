@@ -4,6 +4,8 @@
 mod engine;
 mod identity;
 mod model;
+mod move_file;
+pub use move_file::{MoveError, MoveFailure, move_file};
 
 pub use crate::model::SourceVersion;
 pub use crate::storage::{
@@ -56,3 +58,5 @@ mod s3_versioning_tests;
 mod source_version_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_progress_tests;

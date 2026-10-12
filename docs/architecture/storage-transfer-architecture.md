@@ -18,7 +18,7 @@ The target architecture shall:
 
 1. expose five explicit backend kinds: `Local`, `Nfs`, `Cifs`, `S3`, and `Hdfs`;
 2. keep backend-specific behavior inside the owning backend adapter;
-3. keep `StorageEnum` thin and free of operation-by-operation dispatch;
+3. keep `Storage` thin and free of operation-by-operation dispatch;
 4. make streaming through bounded inflight buffers the universal copy baseline;
 5. preserve `FinalDestination` until verified publication;
 6. resume only backend-observed reusable work and restart otherwise;
@@ -69,17 +69,20 @@ that a local lease provided.
 
 ## 3. Target module tree and dependency rules
 
-The target remains one crate with six public deep modules and one crate-private runtime:
+The target remains one crate with six public core modules, role-composing utilities,
+and one crate-private runtime:
 
 ```text
 src/
 ├── model/                 # neutral values, identities, observations, errors
-├── storage/               # StorageEnum, role interfaces, backend directories
+├── storage/               # Storage identity, role interfaces, backend directories
 │   └── backends/{local,nfs,cifs,s3,hdfs}/
 ├── traversal/             # one observation-stream interface
 ├── metadata/              # observation values, conversion, loss reports
 ├── transfer/              # request, state machine, outcomes, recovery policy
 ├── integrity/             # BLAKE3 evidence and independent byte-stream validation
+├── probes.rs              # explicit connectivity and temporary server-clock probes
+├── tar_pack.rs            # bounded archive composition over roles and transfer
 └── runtime/               # crate-private inflight, task, QoS, and native planning
 ```
 
@@ -92,6 +95,7 @@ traversal   -> model + storage roles
 metadata    -> model + storage Metadata role
 integrity   -> model + storage read roles
 transfer    -> model + storage roles + metadata + integrity
+probes/tar  -> model + storage roles + transfer
 runtime     -> model only; high-level modules may use runtime utilities
 backend dir -> model + its protocol dependency + storage role definitions
 ```
@@ -106,7 +110,7 @@ Forbidden dependencies:
 - public modules importing terrasync types;
 - transfer or traversal matching on backend kind to select behavior;
 - runtime importing storage, traversal, metadata, transfer, or integrity;
-- `StorageEnum` containing generic operation implementations;
+- `Storage` containing generic operation implementations;
 - public exposure of protocol handles, multipart parts, inflight chunks, or native planners.
 
 Each backend directory exposes a facade; its protocol codecs, handles, retry rules,
@@ -122,13 +126,13 @@ pub enum BackendKind { Local, Nfs, Cifs, S3, Hdfs }
 ```
 
 Callers provide a typed `BackendConfig`; backend kind is never inferred from an arbitrary
-path. Construction returns a connected `Storage`/`StorageEnum` instance whose only public
+path. Construction returns a connected `Storage` instance whose only public
 responsibilities are identity, diagnostics, clone lifecycle, capability description, and
 role lending. The identity is the backend's canonical endpoint, derived by data-mover from its
 config (ADR-0006, `src/storage/endpoint.rs`); callers never supply it.
 
 ```rust
-impl StorageEnum {
+impl Storage {
     pub fn kind(&self) -> BackendKind;
     pub fn identity(&self) -> &BackendIdentity;
     pub fn capabilities(&self) -> &BackendCapabilities;
@@ -139,8 +143,8 @@ impl StorageEnum {
 }
 ```
 
-Each lending method contains exactly one exhaustive backend match. Operation methods never
-recreate the five-backend matrix.
+Each lending method returns the connected backend role after checking its capability.
+Operation methods never recreate the five-backend matrix.
 
 Capability availability is instance-specific and typed: `Supported`,
 `Unsupported(reason)`, or `Uncertified(gate)`. Uncertified operations are disabled in
@@ -751,7 +755,7 @@ identity. A backend performs only safe protocol retries; terrasync owns job retr
 | Historical surface | Disposition |
 |---|---|
 | `StorageType`, path type detection | Replace with `BackendKind` and typed config |
-| operation-heavy `StorageEnum` | Replace with thin identity/role-lending seam |
+| operation-heavy `StorageEnum` | Delete; use `Storage` as the thin identity/role-lending seam |
 | `EntryEnum`, `NASEntry`, `S3Entry`, `HDFSEntry` | Replace with `ObservedEntry` and private typed facts |
 | `walkdir`, `walkdir_2`, both iterators, `AsyncReceiver` | Replace with one observation stream |
 | NDX/pages/tree events | Move to terrasync |
@@ -764,7 +768,7 @@ identity. A backend performs only safe protocol retries; terrasync owns job retr
 | whole-file byte convenience and scattered hash helpers | Delete; retain integrity module contracts |
 | NFS export and S3 bucket discovery | Keep on concrete backend interfaces |
 | verified StorageGRID/DXN/NFS/HDFS/CIFS quirks | Keep inside owning backend adapter |
-| tar manifests/orchestration, DB/job retry/redo/requeue | Move to terrasync |
+| tar job manifests/orchestration, DB/job retry/redo/requeue | Move to terrasync; retain bounded archive byte composition in `tar_pack` over storage roles |
 | per-backend `delete_dir_all_with_progress` | Replace with one `Namespace`-role recursive delete |
 | per-backend integrity comparison over the storage enum | Replace with the `integrity` module over `ReadSource` + `Metadata` |
 

@@ -15,8 +15,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use data_mover::error::StorageError;
-use data_mover::s3::S3Storage;
+use data_mover::probes::check_connectivity;
 use data_mover::storage::{BackendConfig, S3BackendConfig, connect_backend};
 use rustls::ServerConfig;
 use rustls::crypto::ring::default_provider;
@@ -135,22 +134,8 @@ async fn an_untrusted_certificate_is_refused_by_default() -> TestResult {
         return run_isolated("an_untrusted_certificate_is_refused_by_default", None);
     }
     let port = tls_endpoint().await?;
-    let refused = S3Storage::new(&url(port, ""), None).await;
-    let Err(StorageError::ConfigError(message)) = refused else {
-        return Err(format!("expected ConfigError, got {:?}", refused.err()).into());
-    };
-    assert_untrusted(&message);
-    let listing = S3Storage::list_buckets(&format!(
-        "s3+https://AKIDTLSTEST:tls/Secret+Key@127.0.0.1:{port}"
-    ))
-    .await;
-    let Err(StorageError::ConfigError(message)) = listing else {
-        return Err(format!("expected ConfigError, got {listing:?}").into());
-    };
-    assert_untrusted(&message);
-
     let role = connect_backend(BackendConfig::S3(S3BackendConfig {
-        url: url(port, "?compat=dxn"),
+        url: url(port, ""),
         block_size: None,
         single_put_threshold: None,
     }))
@@ -167,14 +152,13 @@ async fn tls_verify_false_accepts_any_certificate() -> TestResult {
         return run_isolated("tls_verify_false_accepts_any_certificate", None);
     }
     let port = tls_endpoint().await?;
-    let storage = S3Storage::new(&url(port, "?tls_verify=false"), None).await?;
-    storage.check_connectivity().await?;
-    connect_backend(BackendConfig::S3(S3BackendConfig {
-        url: url(port, "?compat=dxn&tls_verify=false"),
+    let storage = connect_backend(BackendConfig::S3(S3BackendConfig {
+        url: url(port, "?tls_verify=false"),
         block_size: None,
         single_put_threshold: None,
     }))
     .await?;
+    check_connectivity(&storage).await?;
     Ok(())
 }
 
@@ -198,7 +182,12 @@ async fn trusted_through_ssl_cert_file_child() -> TestResult {
         return Ok(());
     }
     let port = tls_endpoint().await?;
-    let storage = S3Storage::new(&url(port, ""), None).await?;
-    storage.check_connectivity().await?;
+    let storage = connect_backend(BackendConfig::S3(S3BackendConfig {
+        url: url(port, ""),
+        block_size: None,
+        single_put_threshold: None,
+    }))
+    .await?;
+    check_connectivity(&storage).await?;
     Ok(())
 }

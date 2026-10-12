@@ -1,8 +1,9 @@
-use std::path::Path;
-
 use clap::Parser;
-use data_mover::error::StorageError;
-use data_mover::{Result, create_storage};
+#[allow(dead_code)]
+mod endpoint_support;
+use data_mover::model::{FailureClass, StoragePath};
+use data_mover::storage::{PreflightPolicy, StorageRoleFailure};
+use endpoint_support::Result;
 
 #[derive(Debug, Parser)]
 #[command(about = "Verify that deleting an absent file returns FileNotFound")]
@@ -19,23 +20,19 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let storage =
-        create_storage(&args.storage, data_mover::CreateStorageOptions::default()).await?;
-    let entry = storage.get_metadata(Path::new(&args.path)).await?;
-
-    storage.delete_file(&entry).await?;
-    match storage.delete_file(&entry).await {
-        Err(StorageError::FileNotFound(path)) if path == args.path => {
+    let storage = endpoint_support::connect(&args.storage).await?;
+    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let path = StoragePath::new(args.path.clone())?;
+    namespace.delete(&path).await?;
+    match namespace.delete(&path).await {
+        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {
             println!("verified second delete returns FileNotFound: {}", args.path);
             Ok(())
         }
-        Err(error) => Err(StorageError::OperationError(format!(
-            "second delete returned unexpected error for {}: {error}",
+        other => Err(format!(
+            "second delete returned unexpected result for {}: {other:?}",
             args.path
-        ))),
-        Ok(()) => Err(StorageError::OperationError(format!(
-            "second delete unexpectedly succeeded for {}",
-            args.path
-        ))),
+        )
+        .into()),
     }
 }

@@ -16,7 +16,7 @@
 | commit 前自检 | `reviewer` | CRITICAL/HIGH/MEDIUM/LOW + VERDICT |
 | 改某 backend (cifs/nfs/s3/local) | `backend-specialist` | BACKEND / DIAGNOSIS / FIX / IMPACT |
 | 改 filter.rs | `filter-expert` | EXPRESSION-PATH / TUPLE-IMPACT / EDGE-CASE / TEST-NEEDED |
-| 改 StorageEnum 操作 | `dispatch-checker` | OPERATION / TOUCHED / MISSED / VERIFY |
+| 改 storage role 契约 | `architect` | 契约 / 能力 / 适配器 / 验证 |
 
 ## 何时调哪个 skill
 
@@ -31,7 +31,6 @@
 | "查 clippy / 准备 PR" | `quality-clippy` |
 | "查覆盖率" | `quality-coverage` |
 | "审大文件" | `quality-large-file-audit` |
-| "查 StorageEnum 分派完整性" | `quality-dispatch-coverage` |
 | "跑全套验证" | `harness-run` |
 
 ## 何时调哪个 slash command

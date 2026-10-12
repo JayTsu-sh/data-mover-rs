@@ -3,7 +3,6 @@ use std::sync::Arc;
 use super::{S3BucketType, S3Compatibility, S3Storage, S3UrlOptions};
 use crate::model::BackendIdentity;
 use crate::storage::Storage;
-pub(super) use crate::storage::backends::s3::DEFAULT_SINGLE_PUT_THRESHOLD;
 use crate::storage::backends::s3::{S3BucketCapabilities, S3NativeContext, S3TagSupport};
 use crate::storage::endpoint::{self, EndpointError};
 

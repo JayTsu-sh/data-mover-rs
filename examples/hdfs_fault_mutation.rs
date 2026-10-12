@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
-use data_mover::{BackendConfig, CreateStorageOptions, StorageEnum, create_storage};
+use data_mover::hdfs::build_hdfs_client;
 
 mod hdfs_support;
 
@@ -50,29 +50,13 @@ async fn checkpoint(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let storage = create_storage(
-        &args.storage,
-        CreateStorageOptions {
-            ensure_dir: true,
-            backend: BackendConfig::Hdfs(hdfs_support::config()),
-            ..Default::default()
-        },
-    )
-    .await?;
-    let StorageEnum::HDFS(hdfs) = storage else {
-        return Err(data_mover::error::StorageError::ConfigError(
-            "fault mutation probe requires HDFS".to_string(),
-        )
-        .into());
-    };
-    let relative = Path::new(&args.path);
-    let resolved = hdfs.resolve_path(relative)?;
+    let (client, location) = build_hdfs_client(&args.storage, &hdfs_support::config())?;
+    let resolved = hdfs_support::resolve(&location, Path::new(&args.path))?;
     let payload = Bytes::from(vec![0x5a; 4 * 1024 * 1024 + 17]);
 
     match args.phase {
         Phase::Seed => {
-            let mut writer = hdfs
-                .client()
+            let mut writer = client
                 .create(
                     &resolved,
                     hdfs_native::WriteOptions::default()
@@ -85,8 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Phase::Create => {
             checkpoint(&args).await?;
-            let mut writer = hdfs
-                .client()
+            let mut writer = client
                 .create(
                     &resolved,
                     hdfs_native::WriteOptions::default()
@@ -97,8 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Box::pin(writer.close()).await?;
         }
         Phase::Close => {
-            let mut writer = hdfs
-                .client()
+            let mut writer = client
                 .create(
                     &resolved,
                     hdfs_native::WriteOptions::default()
@@ -111,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Box::pin(writer.close()).await?;
         }
         Phase::Append => {
-            let mut writer = hdfs.client().append(&resolved).await?;
+            let mut writer = client.append(&resolved).await?;
             checkpoint(&args).await?;
             Box::pin(writer.write_bytes(payload)).await?;
             Box::pin(writer.close()).await?;
@@ -123,11 +105,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             })?;
             checkpoint(&args).await?;
-            hdfs.rename(relative, Path::new(destination)).await?;
+            let destination = hdfs_support::resolve(&location, Path::new(destination))?;
+            if let Some(parent) = Path::new(&destination).parent().and_then(Path::to_str) {
+                client.mkdirs(parent, 0o755, true).await?;
+            }
+            client.rename(&resolved, &destination, true).await?;
         }
         Phase::Metadata => {
             checkpoint(&args).await?;
-            hdfs.set_permission(relative, 0o601).await?;
+            client.set_permission(&resolved, 0o601).await?;
         }
     }
     Ok(())

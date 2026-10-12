@@ -1,5 +1,9 @@
 # Architecture
 
+> 本文保留旧实现的历史背景。当前操作接口和依赖规则以
+> [Storage and Transfer Architecture](../../docs/architecture/storage-transfer-architecture.md) 为准；
+> `StorageEnum` 和旧管线已删除，历史代码片段不可作为实现模板。
+
 ## 数据流总览
 
 ```

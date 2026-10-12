@@ -1,10 +1,8 @@
 //! What the NFS role's write paths create before they write: every missing level of a directory
 //! path, and a new file in it.
 //!
-//! The legacy helpers (`NFSStorage::create_dir_all`, the recursive creation inside the legacy
-//! `create_file` / `rename`) stay for legacy callers. The role does not use them: they wrapped
-//! every nfs-rs error into a string, so a refused MKDIR or CREATE reached the role as `Protocol` /
-//! Unknown (retryable), and an existing level answered with access denied failed the whole path.
+//! These role primitives preserve native error classification and the optimized handle cache.
+//! A refused MKDIR or CREATE keeps its server status; existing directories are reused.
 //!
 //! - [`NFSStorage::role_create_all`] creates the levels one by one with the one-level role verb
 //!   (`src/nfs/role_namespace.rs`), starting below the deepest level the handle cache holds, and

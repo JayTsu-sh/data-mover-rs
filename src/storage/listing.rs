@@ -18,7 +18,7 @@
 //! **Pages carry names, not paths.** A child's full path is, by contract, the requested path, a
 //! `/`, and the child's name ([`child_path`]). A backend whose own spelling of a child differs
 //! reports that child as a [`ChildFailure`] rather than hand out a name that does not join back
-//! to what it listed ([`ListingPage::from_descriptors`] enforces it).
+//! to what it listed; the page constructor enforces that contract.
 //!
 //! **One child may have an empty name: the directory's own object** (P7 F5, §5.4.4). An object
 //! store can hold content under the key `p/d/` itself; the listing of `p/d` hands it over as a

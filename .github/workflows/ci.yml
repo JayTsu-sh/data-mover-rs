@@ -121,6 +121,3 @@ jobs:
 
       - name: audit large files
         run: python3 .claude/skills/quality-large-file-audit/scripts/run.py
-
-      - name: audit dispatch coverage
-        run: python3 .claude/skills/quality-dispatch-coverage/scripts/run.py

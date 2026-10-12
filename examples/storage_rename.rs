@@ -1,7 +1,9 @@
-use std::path::Path;
-
 use clap::Parser;
-use data_mover::{Result, create_storage};
+#[allow(dead_code)]
+mod endpoint_support;
+use data_mover::model::StoragePath;
+use data_mover::storage::PreflightPolicy;
+use endpoint_support::Result;
 
 #[derive(Debug, Parser)]
 #[command(about = "Rename one entry within a data-mover storage URL")]
@@ -22,26 +24,25 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let storage =
-        create_storage(&args.storage, data_mover::CreateStorageOptions::default()).await?;
-    let source = storage.get_metadata(Path::new(&args.from)).await?;
-    let expected_size = source.get_size();
-
-    storage
-        .rename(Path::new(&args.from), Path::new(&args.to))
-        .await?;
-
-    let destination = storage.get_metadata(Path::new(&args.to)).await?;
-    if destination.get_size() != expected_size {
-        return Err(data_mover::error::StorageError::OperationError(format!(
-            "destination size mismatch: expected {expected_size}, got {}",
-            destination.get_size()
-        )));
+    let storage = endpoint_support::connect(&args.storage).await?;
+    let namespace = storage.namespace(&PreflightPolicy::production())?;
+    let from = StoragePath::new(args.from.clone())?;
+    let to = StoragePath::new(args.to.clone())?;
+    let source = namespace.stat(&from).await?;
+    namespace.rename(&from, &to).await?;
+    let destination = namespace.stat(&to).await?;
+    if destination.size != source.size {
+        return Err(format!(
+            "destination size mismatch: expected {:?}, got {:?}",
+            source.size, destination.size
+        )
+        .into());
     }
-
     println!(
-        "renamed and verified {expected_size} bytes: {} -> {}",
-        args.from, args.to
+        "renamed and verified {} bytes: {} -> {}",
+        source.size.unwrap_or(0),
+        args.from,
+        args.to
     );
     Ok(())
 }

@@ -13,6 +13,56 @@ struct CancellingProtocol {
     owner_unmapped: bool,
 }
 
+fn xattr_removal_adapter(supported: bool) -> (NfsMetadataAdapter, Arc<CancellingProtocol>) {
+    let protocol = Arc::new(CancellingProtocol {
+        cancel: tokio_util::sync::CancellationToken::new(),
+        sets: AtomicUsize::new(0),
+        xattrs_supported: supported,
+        owner_unmapped: false,
+    });
+    let identity = crate::model::BackendIdentity::new(crate::model::BackendKind::Nfs, "xattr")
+        .unwrap_or_else(|error| panic!("{error}"));
+    (
+        NfsMetadataAdapter::new(protocol.clone(), identity),
+        protocol,
+    )
+}
+
+#[tokio::test]
+async fn remove_xattr_preserves_protocol_success_and_refusal_classes() {
+    let (adapter, protocol) = xattr_removal_adapter(true);
+    let path = StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
+    adapter
+        .remove_xattr(&path, b"user.existing")
+        .await
+        .unwrap_or_else(|error| panic!("{error}"));
+    for (name, class) in [
+        (&b"user.denied"[..], FailureClass::PermissionDenied),
+        (&b"user.missing"[..], FailureClass::NotFound),
+    ] {
+        assert!(matches!(adapter.remove_xattr(&path, name).await,
+            Err(StorageRoleFailure::Entry(error)) if error.class() == class));
+    }
+    assert_eq!(protocol.sets.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn remove_xattr_rejects_unsupported_or_invalid_names_before_io() {
+    let path = StoragePath::new("file").unwrap_or_else(|error| panic!("{error}"));
+    let (adapter, protocol) = xattr_removal_adapter(false);
+    assert!(
+        matches!(adapter.remove_xattr(&path, b"user.existing").await,
+        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Unsupported)
+    );
+    assert_eq!(protocol.sets.load(Ordering::SeqCst), 0);
+    let (adapter, protocol) = xattr_removal_adapter(true);
+    for name in [&b""[..], &b"user.\0bad"[..], &[0xff][..]] {
+        assert!(matches!(adapter.remove_xattr(&path, name).await,
+            Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::InvalidInput));
+    }
+    assert_eq!(protocol.sets.load(Ordering::SeqCst), 0);
+}
+
 #[async_trait]
 impl NfsMetadataProtocol for CancellingProtocol {
     async fn stat(&self, _path: &StoragePath) -> Result<NfsMetadataInline, NfsProtocolFailure> {
@@ -58,6 +108,24 @@ impl NfsMetadataProtocol for CancellingProtocol {
         self.sets.fetch_add(1, Ordering::SeqCst);
         self.cancel.cancel();
         Ok(())
+    }
+    async fn remove_xattr(
+        &self,
+        _path: &StoragePath,
+        name: &str,
+    ) -> Result<(), NfsProtocolFailure> {
+        self.sets.fetch_add(1, Ordering::SeqCst);
+        match name {
+            "user.existing" => Ok(()),
+            "user.denied" => Err(NfsProtocolFailure::new(
+                FailureClass::PermissionDenied,
+                Transience::Permanent,
+            )),
+            _ => Err(NfsProtocolFailure::new(
+                FailureClass::NotFound,
+                Transience::Permanent,
+            )),
+        }
     }
     async fn set_numeric_ownership(
         &self,

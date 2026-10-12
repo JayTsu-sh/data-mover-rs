@@ -4,22 +4,12 @@ pub(crate) struct UndescribedHdfsChild {
     /// The child's path relative to the root, when the listing named an immediate child of the
     /// listed directory; `None` blames the directory itself.
     pub(crate) relative_path: Option<PathBuf>,
-    pub(crate) error: StorageError,
-}
-
-/// The legacy listing contract: every child, or the first child that could not be described.
-fn first_failure(
-    children: Vec<Result<HDFSEntry, UndescribedHdfsChild>>,
-) -> Result<Vec<HDFSEntry>, StorageError> {
-    children
-        .into_iter()
-        .map(|child| child.map_err(|undescribed| undescribed.error))
-        .collect()
+    pub(crate) _error: StorageError,
 }
 
 /// Concrete HDFS client ownership and root-isolation shell.
 #[derive(Clone, Debug)]
-pub struct HDFSStorage {
+pub(crate) struct HDFSStorage {
     client: Client,
     location: HdfsLocation,
     block_size: u64,
@@ -40,36 +30,9 @@ impl HDFSStorage {
         crate::storage::backends::hdfs::connect(Arc::new(self.clone()), identity)
     }
 
-    pub(crate) fn transfer_namespace(&self) -> String {
-        format!("{}{}", self.location.endpoint(), self.location.root())
-    }
-    #[must_use]
-    pub const fn client(&self) -> &Client {
-        &self.client
-    }
-
-    #[must_use]
-    pub const fn location(&self) -> &HdfsLocation {
-        &self.location
-    }
-
-    #[must_use]
-    pub const fn block_size(&self) -> u64 {
-        self.block_size
-    }
-
     #[must_use]
     pub const fn transfer_concurrency(&self) -> crate::TransferConcurrency {
         self.transfer_concurrency
-    }
-
-    #[must_use]
-    pub const fn with_transfer_concurrency(
-        mut self,
-        concurrency: crate::TransferConcurrency,
-    ) -> Self {
-        self.transfer_concurrency = concurrency;
-        self
     }
 
     /// Resolve a relative adapter path below the configured HDFS root.
@@ -111,27 +74,28 @@ impl HDFSStorage {
     ///
     /// Returns an error if the status is outside the configured root or its
     /// millisecond timestamps cannot be represented as nanoseconds.
-    pub fn entry_from_status(
+    pub fn facts_from_status(
         &self,
         status: hdfs_native::client::FileStatus,
-    ) -> Result<HDFSEntry, StorageError> {
+    ) -> Result<RoleHdfsEntryFacts, StorageError> {
         let relative = strip_root(&status.path, self.location.root())?;
-        let relative_path = PathBuf::from(relative);
-        let name = relative_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
-        let extension = relative_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_string);
-        Ok(HDFSEntry {
-            name,
-            relative_path,
-            is_dir: status.isdir,
-            size: u64::try_from(status.length)
-                .map_err(|_| config_error("HDFS file size does not fit u64"))?,
+        let path =
+            RoleStoragePath::new(relative).map_err(|_| config_error("invalid HDFS status path"))?;
+        Ok(RoleHdfsEntryFacts {
+            path,
+            kind: if status.isdir {
+                RoleEntryKind::Directory
+            } else {
+                RoleEntryKind::File
+            },
+            size: if status.isdir {
+                None
+            } else {
+                Some(
+                    u64::try_from(status.length)
+                        .map_err(|_| config_error("HDFS file size does not fit u64"))?,
+                )
+            },
             mtime: millis_to_nanos(status.modification_time)?,
             atime: millis_to_nanos(status.access_time)?,
             mode: u32::from(status.permission),
@@ -139,7 +103,6 @@ impl HDFSStorage {
             group: status.group,
             replication: status.replication,
             block_size: status.blocksize,
-            extension,
         })
     }
 
@@ -148,17 +111,17 @@ impl HDFSStorage {
     /// # Errors
     ///
     /// Returns an error when the path escapes the configured root, does not
-    /// exist, or the upstream status cannot be represented by `HDFSEntry`.
+    /// exist, or the upstream status cannot be represented by `RoleHdfsEntryFacts`.
     pub async fn get_metadata(
         &self,
         relative_path: &std::path::Path,
-    ) -> Result<HDFSEntry, StorageError> {
+    ) -> Result<RoleHdfsEntryFacts, StorageError> {
         let path = self.resolve_path(relative_path)?;
         let status = retry_hdfs_read("get metadata", Some(relative_path), None, || {
             self.client.get_file_info(&path)
         })
         .await?;
-        self.entry_from_status(status)
+        self.facts_from_status(status)
     }
 
     /// Set Unix permission bits on a file or directory below this storage root.
@@ -180,30 +143,6 @@ impl HDFSStorage {
             .set_permission(&path, mode)
             .await
             .map_err(|error| hdfs_operation_error("set permission", Some(relative_path), &error))
-    }
-
-    /// Set modification time while preserving the current HDFS access time.
-    ///
-    /// The public timestamp uses the crate's nanosecond convention. HDFS stores
-    /// millisecond timestamps, so sub-millisecond precision is truncated.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a negative timestamp, the storage root, an escaping
-    /// path, metadata lookup failure, or an upstream mutation failure.
-    pub async fn set_mtime(
-        &self,
-        relative_path: &std::path::Path,
-        mtime: i64,
-    ) -> Result<(), StorageError> {
-        let mtime = nanos_to_millis(mtime)?;
-        let path = self.resolve_mutation_path(relative_path)?;
-        let current = self.get_metadata(relative_path).await?;
-        let atime = nanos_to_millis(current.atime)?;
-        self.client
-            .set_times(&path, mtime, atime)
-            .await
-            .map_err(|error| hdfs_operation_error("set times", Some(relative_path), &error))
     }
 
     /// Selectively update HDFS timestamps and permission bits.
@@ -278,52 +217,6 @@ impl HDFSStorage {
         self.resolve_path(relative_path)
     }
 
-    /// List exactly the immediate children of one directory below this root, transfer artifacts
-    /// (`.data-mover-*`, ADR-0006) included: walks hide them, raw callers must see them.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the path is missing, is not a directory, escapes
-    /// the configured root, or upstream returns a non-immediate child.
-    pub async fn list_directory(
-        &self,
-        relative_path: &std::path::Path,
-    ) -> Result<Vec<HDFSEntry>, StorageError> {
-        first_failure(self.list_directory_children(relative_path).await?)
-    }
-
-    /// [`Self::list_directory`] that keeps going past a child it cannot describe: each child is
-    /// its entry or why it could not be described, in listing order. Only a failure that concerns
-    /// the directory itself (missing, not a directory, the listing RPC) fails the whole call.
-    pub(crate) async fn list_directory_children(
-        &self,
-        relative_path: &std::path::Path,
-    ) -> Result<Vec<Result<HDFSEntry, UndescribedHdfsChild>>, StorageError> {
-        let directory = self.get_metadata(relative_path).await?;
-        if !directory.is_dir {
-            return Err(StorageError::InvalidPath(format!(
-                "HDFS listing target is not a directory: {}",
-                relative_path.display()
-            )));
-        }
-        let path = self.resolve_path(relative_path)?;
-        let statuses = retry_hdfs_read("list directory", Some(relative_path), None, || {
-            self.client.list_status(&path, false)
-        })
-        .await?;
-        Ok(self.children_from_listing(statuses, &directory.relative_path))
-    }
-
-
-    #[cfg(test)]
-    fn entries_from_listing(
-        &self,
-        statuses: Vec<hdfs_native::client::FileStatus>,
-        directory: &std::path::Path,
-    ) -> Result<Vec<HDFSEntry>, StorageError> {
-        first_failure(self.children_from_listing(statuses, directory))
-    }
-
     /// Converts one listing child by child. A child is blamed under its own path when that path
     /// is an immediate child of `directory`; otherwise (outside the root, or not immediate) the
     /// failure has no path of its own in this directory and is blamed on the directory.
@@ -331,7 +224,7 @@ impl HDFSStorage {
         &self,
         statuses: Vec<hdfs_native::client::FileStatus>,
         directory: &std::path::Path,
-    ) -> Vec<Result<HDFSEntry, UndescribedHdfsChild>> {
+    ) -> Vec<Result<RoleHdfsEntryFacts, UndescribedHdfsChild>> {
         statuses
             .into_iter()
             .map(|status| {
@@ -341,10 +234,10 @@ impl HDFSStorage {
                     .filter(|path| path.parent() == Some(directory));
                 let undescribed = |error| UndescribedHdfsChild {
                     relative_path: own_path.clone(),
-                    error,
+                    _error: error,
                 };
-                let entry = self.entry_from_status(status).map_err(undescribed)?;
-                if entry.relative_path.parent() != Some(directory) {
+                let entry = self.facts_from_status(status).map_err(undescribed)?;
+                if Path::new(entry.path.as_str()).parent() != Some(directory) {
                     return Err(undescribed(config_error(
                         "HDFS directory listing returned a non-immediate child",
                     )));
@@ -353,8 +246,6 @@ impl HDFSStorage {
             })
             .collect()
     }
-
-
 
     /// Recursively create a directory below the configured HDFS root.
     ///

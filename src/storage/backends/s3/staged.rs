@@ -51,9 +51,11 @@ mod upload_discovery;
 mod upload_pointer;
 use super::{S3Protocol, S3ProtocolFailure};
 use native_final::NativeSizing;
-pub(crate) use single::{DEFAULT_SINGLE_PUT_THRESHOLD, single_put_threshold};
+pub(crate) use single::single_put_threshold;
 #[cfg(test)]
-pub(crate) use single::{MAX_SINGLE_PUT_THRESHOLD, MIN_SINGLE_PUT_THRESHOLD};
+pub(crate) use single::{
+    DEFAULT_SINGLE_PUT_THRESHOLD, MAX_SINGLE_PUT_THRESHOLD, MIN_SINGLE_PUT_THRESHOLD,
+};
 
 const PART_SIZE: usize = 8 * 1024 * 1024;
 const MIN_MULTIPART_PART_SIZE: u64 = 5 * 1024 * 1024;

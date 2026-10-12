@@ -203,8 +203,8 @@ profiles:
       directory: unsupported
       symlink: unsupported
       hardlink_topology: not_applicable
-      rename: {state: required, guarantee: copy_then_delete_not_atomic}
-      delete: required
+      rename: {state: required, guarantee: copy_then_delete_not_atomic, mechanism: conditional_copyobject_or_multipart_copy, preserves: [user_metadata, content_headers, tags]}
+      delete: {state: required, mechanism: paged_current_listing_and_deleteobjects_batches, batch_keys: 100, history: retained}
       acl: unsupported
       xattr: not_applicable
       tags: required
@@ -237,7 +237,7 @@ profiles:
       symlink: unsupported
       hardlink_topology: not_applicable
       rename: {state: unsupported, reason: dxn_verified_semantic_limit}
-      delete: required  # signed Content-MD5 is base S3 behaviour for every profile
+      delete: {state: required, mechanism: paged_current_listing_and_deleteobjects_batches, batch_keys: 100, history: retained}  # signed Content-MD5 for every profile
       acl: unsupported
       xattr: not_applicable
       tags: {state: unsupported, reason: dxn_verified_semantic_limit}
@@ -270,7 +270,7 @@ profiles:
       symlink: unsupported
       hardlink_topology: unsupported
       rename: required
-      delete: required
+      delete: {state: required, mechanism: native_recursive_subtree_or_streamed_per_entry_progress, storage_root: explicit_opt_in}
       acl: {state: required, current_adapter: unsupported_pending_public_protocol_binding}
       xattr: {state: required, current_adapter: unsupported_pending_dependency_api}
       tags: not_applicable

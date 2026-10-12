@@ -2,7 +2,7 @@
 //! by the `Direct` upload on the final key and the checkpointed upload on the final key (ADR-0006
 //! C15b), which also asks to be told when its first checkpoint is reached.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -17,10 +17,11 @@ use super::super::source::{entry, role_failure};
 use super::super::{S3Protocol, S3ProtocolFailure};
 use super::{S3StagedDestination, single};
 use crate::model::{FailureClass, Operation, StoragePath, Transience};
-use crate::storage::{ByteStream, StorageRoleFailure};
+use crate::storage::{ByteStream, PreparedStage, StorageRoleFailure};
 
 /// The upload the parts go to.
 pub(super) struct PartTarget<'a> {
+    pub(super) stage: Option<&'a PreparedStage>,
     pub(super) path: &'a StoragePath,
     pub(super) key: &'a str,
     pub(super) upload_id: &'a str,
@@ -121,6 +122,8 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         part: Bytes,
     ) -> impl Future<Output = (Result<SentPart, S3ProtocolFailure>, u64)> + use<P> {
         let length = part.len() as u64;
+        let observer = target.stage.and_then(|stage| stage.write_observer.clone());
+        let offset = u64::try_from(number.saturating_sub(1)).unwrap_or(0) * target.part_size as u64;
         let sent = upload(
             self.protocol.clone(),
             target.key.to_string(),
@@ -128,12 +131,24 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             number,
             part,
         );
-        async move { (sent.await, length) }
+        async move {
+            let result = sent.await;
+            if result.is_ok()
+                && let Some(observer) = observer
+            {
+                observer.confirmed(offset, length);
+            }
+            (result, length)
+        }
     }
 }
 
 /// The parts sent so far, and the checkpoint still to reach.
 struct Progress<'a> {
+    stage: Option<&'a PreparedStage>,
+    next_part: i32,
+    durable_prefix: u64,
+    completed: HashMap<i32, u64>,
     path: &'a StoragePath,
     sent: UploadedParts,
     acknowledged: u64,
@@ -143,6 +158,12 @@ struct Progress<'a> {
 impl<'a> Progress<'a> {
     fn new(target: &PartTarget<'a>, parts: Vec<(i32, String)>) -> Self {
         Self {
+            stage: target.stage,
+            next_part: i32::try_from(parts.len())
+                .unwrap_or(i32::MAX)
+                .saturating_add(1),
+            durable_prefix: parts.len() as u64 * target.part_size as u64,
+            completed: HashMap::new(),
             path: target.path,
             sent: UploadedParts {
                 parts,
@@ -160,6 +181,7 @@ impl<'a> Progress<'a> {
         (part, length): (Result<SentPart, S3ProtocolFailure>, u64),
     ) -> Result<(), StorageRoleFailure> {
         let part = part.map_err(|error| role_failure(self.path, Operation::Write, error))?;
+        let number = part.0;
         self.sent.record(part);
         self.acknowledged += length;
         if let Some((at, checkpoint)) = self.checkpoint
@@ -168,7 +190,22 @@ impl<'a> Progress<'a> {
             self.checkpoint = None;
             checkpoint.reached().await?;
         }
+        self.notify_checkpoint(number, length);
         Ok(())
+    }
+
+    fn notify_checkpoint(&mut self, number: i32, length: u64) {
+        let Some(stage) = self.stage.filter(|stage| stage.write_observer.is_some()) else {
+            return;
+        };
+        self.completed.insert(number, length);
+        while let Some(length) = self.completed.remove(&self.next_part) {
+            self.durable_prefix += length;
+            self.next_part += 1;
+        }
+        if stage.recovery_enabled() && self.durable_prefix > 0 {
+            stage.checkpoint_recorded(self.durable_prefix);
+        }
     }
 }
 

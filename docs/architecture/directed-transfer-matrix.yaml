@@ -18,6 +18,9 @@ defaults:
   evidence_layers: [data_mover, terrasync_single_process, terrasync_two_process_quic]
   hardlink_topology: not_applicable
 
+# Namespace directory mapping below concerns directory creation during transfer. S3 current-key
+# deletion and server-side file rename are separate per-verb capabilities in the backend matrix;
+# they do not imply directory creation or atomic move.
 # Every ordered profile pair is explicit. `gate_key` is consumed by the three parameterized
 # matrix gates defined in acceptance-gates.md. Metadata describes source observation to target
 # application; it is separate from ordinary byte-transfer success.

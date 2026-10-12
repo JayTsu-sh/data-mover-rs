@@ -535,7 +535,7 @@ impl QosManager {
 
     /// 获取带宽限流（异步等待直到令牌可用）
     ///
-    /// 每个 `DataChunk` 在读取前调用，bytes 为 chunk 大小
+    /// 每次读取前调用，bytes 为本次读取的字节数
     pub async fn acquire_bandwidth(&self, bytes: u64) {
         let mut remaining = bytes;
         while remaining > 0 {

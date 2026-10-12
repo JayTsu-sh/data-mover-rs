@@ -2,19 +2,17 @@
 //! role traversal — and every directory delete still
 //! removes them.
 
-use std::num::NonZeroUsize;
-use std::path::Path;
-
+use data_mover::DslTraversalFilter;
 use data_mover::model::{FailureClass, StoragePath};
 use data_mover::storage::{
     BackendConfig, DeleteTreeRequest, LocalBackendConfig, PreflightPolicy, Storage,
     StorageRoleFailure, connect_backend, delete_tree,
 };
-use data_mover::storage_enum::{StorageEnum, create_storage};
 use data_mover::traversal::{
     StorageTraversalSource, TraversalItem, TraversalRequest, TraversalSource as _,
 };
-use data_mover::{CreateStorageOptions, DslTraversalFilter};
+use std::num::NonZeroUsize;
+use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -40,10 +38,6 @@ fn fixture() -> TestResult<tempfile::TempDir> {
         std::fs::write(base.join(file), b"x")?;
     }
     Ok(root)
-}
-
-async fn legacy(root: &Path) -> TestResult<StorageEnum> {
-    Ok(create_storage(&root.to_string_lossy(), CreateStorageOptions::default()).await?)
 }
 
 async fn roles(root: &Path) -> TestResult<Storage> {
@@ -92,13 +86,6 @@ async fn role_traversal_hides_artifacts() -> TestResult {
 
 #[tokio::test]
 async fn directory_deletes_still_remove_the_artifacts_in_them() -> TestResult {
-    let legacy_root = fixture()?;
-    let events = legacy(legacy_root.path())
-        .await?
-        .delete_dir_all_with_progress(Some(Path::new("sub")), 2)?;
-    while events.next().await.is_some() {}
-    assert!(!legacy_root.path().join("sub").exists());
-
     let role_root = fixture()?;
     let storage = roles(role_root.path()).await?;
     let slots = NonZeroUsize::new(2).ok_or("non-zero")?;

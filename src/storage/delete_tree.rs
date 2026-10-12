@@ -1,7 +1,7 @@
 //! Recursive deletion over the [`Namespace`] role with bounded progress items.
 //!
 //! Replaces the legacy per-backend `delete_dir_all_with_progress`: the tree is listed
-//! breadth-first, non-directory entries are deleted concurrently as they are discovered, and
+//! breadth-first, non-directory entries are deleted concurrently after each directory is listed, and
 //! directories are removed deepest-first once their contents are gone. Every backend that lends
 //! a namespace role gets this behaviour without protocol-specific code.
 //!
@@ -11,6 +11,8 @@
 //!   close response can leave the entry already gone.
 //! - A directory whose descendants could not all be deleted is not sent to the backend (it would
 //!   only answer `Conflict`); it is reported once as an entry failure instead.
+//! - A failed directory read keeps that directory's children. S3 opts into bounded page-by-page
+//!   deletion instead: earlier page deletions remain successful if a later listing page fails.
 //! - Cancellation stops new work but awaits the deletes already in flight, so no backend handle
 //!   is abandoned mid-operation.
 
@@ -19,14 +21,15 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use futures::StreamExt as _;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::listing::is_vanished;
+use super::listing::{CollectLimits, collect_listing, is_vanished};
 use super::{
-    CapabilityUnavailable, CollectLimits, ListRequest, Namespace, PreflightPolicy,
-    SourceDescriptor, Storage, StorageRoleFailure, collect_listing,
+    CapabilityUnavailable, ListRequest, ListingStream, Namespace, PreflightPolicy, Storage,
+    StorageRoleFailure,
 };
 use crate::model::{
     BackendSessionFailure, EntryKind, EntryOperationFailure, FailureClass, Operation, StoragePath,
@@ -128,12 +131,13 @@ impl DeleteTreeSession {
 ///
 /// # Errors
 /// Returns the capability failure when the storage lends no namespace role under production
-/// preflight policy, or one that cannot delete anything (S3), before any backend I/O.
+/// preflight policy, or one that cannot delete entries, before any backend I/O.
 pub fn delete_tree(
     storage: &Storage,
     request: DeleteTreeRequest,
 ) -> Result<DeleteTreeSession, CapabilityUnavailable> {
-    let namespace = storage.mutable_namespace(&PreflightPolicy::production())?;
+    let namespace =
+        storage.mutable_namespace(&PreflightPolicy::production(), |caps| caps.delete)?;
     Ok(delete_tree_with_namespace(namespace, request))
 }
 
@@ -153,7 +157,8 @@ pub(crate) fn delete_tree_with_namespace(
     }
 }
 
-type DeleteTasks = JoinSet<(StoragePath, EntryKind, Result<(), StorageRoleFailure>)>;
+type DeleteResult = (StoragePath, EntryKind, Result<(), StorageRoleFailure>);
+type DeleteTasks = JoinSet<Vec<DeleteResult>>;
 
 struct Driver {
     namespace: Arc<dyn Namespace>,
@@ -228,59 +233,79 @@ impl Driver {
             if self.request.cancel.is_cancelled() || self.cancelled {
                 return Ok(());
             }
-            let Some(entries) = self.list_directory(&directory).await? else {
-                continue;
-            };
-            for entry in entries {
-                if entry.kind == EntryKind::Directory {
-                    self.directories
-                        .entry(depth + 1)
-                        .or_default()
-                        .push(entry.path.clone());
-                    queue.push_back((entry.path, depth + 1));
-                } else {
-                    self.spawn_delete(entry.path, entry.kind).await?;
+            let request = ListRequest::new(directory.clone(), self.request.cancel.clone());
+            let mut listing = self.namespace.list_for_delete(request);
+            if !self.namespace.allows_paged_delete() {
+                let whole = collect_listing(listing, CollectLimits::UNBOUNDED).await;
+                listing = ListingStream::from_pages(directory.clone(), [whole]);
+            }
+            let batch_size = self.namespace.delete_batch_size().get();
+            let mut batch = Vec::with_capacity(batch_size);
+            while let Some(page) = listing.next().await {
+                let page = match page {
+                    Ok(page) => page,
+                    Err(error) => {
+                        self.handle_listing_failure(&directory, error).await?;
+                        break;
+                    }
+                };
+                let (entries, failures) = page.into_descriptors(&directory);
+                for failure in failures {
+                    if !is_vanished(&directory, &failure) {
+                        // Undescribable children can carry a synthetic path outside their
+                        // parent. The directory being listed is still incomplete.
+                        self.mark_incomplete(&directory);
+                        self.report_failure(failure).await?;
+                    }
+                }
+                for entry in entries {
+                    if self.request.cancel.is_cancelled() || self.cancelled {
+                        return Ok(());
+                    }
+                    if entry.kind == EntryKind::Directory {
+                        self.directories
+                            .entry(depth + 1)
+                            .or_default()
+                            .push(entry.path.clone());
+                        queue.push_back((entry.path, depth + 1));
+                    } else {
+                        batch.push((entry.path, entry.kind));
+                        if batch.len() == batch_size {
+                            self.spawn_delete_batch(std::mem::take(&mut batch)).await?;
+                        }
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                self.spawn_delete_batch(batch).await?;
+            }
+            if self.request.cancel.is_cancelled() || self.cancelled {
+                return Ok(());
+            }
+            if !self.incomplete.contains(directory.as_str()) {
+                let cleanup = self.namespace.cleanup_transfer_artifacts(&directory).await;
+                if let Err(error) = cleanup {
+                    self.handle_listing_failure(&directory, error).await?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Lists one directory, reporting every entry-scoped failure.
-    ///
-    /// Returns `None` when the directory itself could not be listed. A child the backend could
-    /// not describe is reported and marks the directory incomplete, so it is never attempted:
-    /// it cannot be empty. A cancelled listing is a signal, not a failure: the run stops.
-    async fn list_directory(
+    async fn handle_listing_failure(
         &mut self,
         directory: &StoragePath,
-    ) -> Result<Option<Vec<SourceDescriptor>>, DeleteTreeTerminalFailure> {
-        let request = ListRequest::new(directory.clone(), self.request.cancel.clone());
-        let listed = collect_listing(self.namespace.list(request), CollectLimits::UNBOUNDED).await;
-        match listed.map(|page| page.into_descriptors(directory)) {
-            Ok((entries, mut failures)) => {
-                // A child gone before the listing described it is already deleted.
-                failures.retain(|failure| !is_vanished(directory, failure));
-                if !failures.is_empty() {
-                    self.mark_incomplete(directory);
-                }
-                for failure in failures {
-                    self.report_failure(failure).await?;
-                }
-                Ok(Some(entries))
-            }
-            Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::Cancelled => {
+        error: StorageRoleFailure,
+    ) -> Result<(), DeleteTreeTerminalFailure> {
+        self.mark_incomplete(directory);
+        match error {
+            StorageRoleFailure::Entry(error) if error.class() == FailureClass::Cancelled => {
                 self.cancelled = true;
                 self.mark_incomplete(directory);
-                Ok(None)
+                Ok(())
             }
-            Err(StorageRoleFailure::Entry(error)) => {
-                self.report_failure(error).await?;
-                Ok(None)
-            }
-            Err(StorageRoleFailure::Session(error)) => {
-                Err(DeleteTreeTerminalFailure::Session(error))
-            }
+            StorageRoleFailure::Entry(error) => self.report_failure(error).await,
+            StorageRoleFailure::Session(error) => Err(DeleteTreeTerminalFailure::Session(error)),
         }
     }
 
@@ -295,21 +320,60 @@ impl Driver {
         let namespace = Arc::clone(&self.namespace);
         self.tasks.spawn(async move {
             let result = namespace.delete(&path).await;
-            (path, kind, result)
+            vec![(path, kind, result)]
+        });
+        Ok(())
+    }
+
+    async fn spawn_delete_batch(
+        &mut self,
+        entries: Vec<(StoragePath, EntryKind)>,
+    ) -> Result<(), DeleteTreeTerminalFailure> {
+        while self.tasks.len() >= self.request.max_inflight_operations.get() {
+            self.settle_one().await?;
+        }
+        if self.request.cancel.is_cancelled() || self.cancelled {
+            return Ok(());
+        }
+        let namespace = Arc::clone(&self.namespace);
+        self.tasks.spawn(async move {
+            let paths: Vec<_> = entries.iter().map(|(path, _)| path.clone()).collect();
+            let results = namespace.delete_batch(&paths).await;
+            // A protocol violating the positional result contract is a terminal runtime error.
+            assert_eq!(
+                results.len(),
+                entries.len(),
+                "delete batch result count mismatch"
+            );
+            entries
+                .into_iter()
+                .zip(results)
+                .map(|((path, kind), result)| (path, kind, result))
+                .collect()
         });
         Ok(())
     }
 
     async fn drain(&mut self) -> Result<(), DeleteTreeTerminalFailure> {
+        let mut failure = None;
         while !self.tasks.is_empty() {
-            self.settle_one().await?;
+            if let Err(error) = self.settle_one().await
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     async fn settle_one(&mut self) -> Result<(), DeleteTreeTerminalFailure> {
         match self.tasks.join_next().await {
-            Some(Ok((path, kind, result))) => self.report_delete(path, kind, result).await,
+            Some(Ok(results)) => {
+                for (path, kind, result) in results {
+                    self.report_delete(path, kind, result).await?;
+                }
+                Ok(())
+            }
             Some(Err(_)) | None => Err(DeleteTreeTerminalFailure::Internal),
         }
     }

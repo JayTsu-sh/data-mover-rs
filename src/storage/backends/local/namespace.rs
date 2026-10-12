@@ -287,8 +287,51 @@ impl Namespace for LocalNamespace {
         self.read_link_entry(path).await
     }
 
+    async fn create_symlink(
+        &self,
+        request: crate::storage::CreateSymlinkRequest,
+    ) -> Result<(), StorageRoleFailure> {
+        symlink::create(self, request).await
+    }
+
     async fn create_directory(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
         self.create_directory_entry(path).await
+    }
+
+    async fn cleanup_transfer_artifacts(
+        &self,
+        path: &StoragePath,
+    ) -> Result<(), StorageRoleFailure> {
+        let native = checked(path, Operation::Namespace, true)?;
+        let target = path.clone();
+        self.blocking(path, Operation::Namespace, move |root, _| {
+            let directory = open_directory(root, &native)
+                .map_err(|e| io_failure(&target, Operation::Namespace, &e))?;
+            let work = || -> io::Result<()> {
+                let mut artifacts = Vec::new();
+                for entry in directory.entries()? {
+                    let entry = entry?;
+                    if is_artifact_name(&entry.file_name()) {
+                        artifacts.push((entry.file_name(), entry.file_type()?));
+                    }
+                }
+                for (name, kind) in artifacts {
+                    let result = if kind.is_dir() {
+                        directory.remove_dir_all(&name)
+                    } else {
+                        remove_link_or_file(&directory, &name)
+                    };
+                    if let Err(e) = result
+                        && e.kind() != io::ErrorKind::NotFound
+                    {
+                        return Err(e);
+                    }
+                }
+                sync_directory(&directory)
+            };
+            work().map_err(|e| io_failure(&target, Operation::Namespace, &e))
+        })
+        .await
     }
 
     async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
@@ -302,7 +345,9 @@ impl Namespace for LocalNamespace {
     fn capabilities(&self) -> NamespaceCapabilities {
         NamespaceCapabilities {
             histories: false,
-            mutations: Ok(()),
+            create_directory: Ok(()),
+            delete: Ok(()),
+            rename: Ok(()),
             symlinks: true,
             names: platform_names(),
             directory_objects: false,
@@ -586,5 +631,6 @@ mod hooks;
 mod listing;
 #[cfg(test)]
 mod streaming_tests;
+mod symlink;
 #[cfg(test)]
 mod tests;

@@ -5,16 +5,15 @@ use bytes::Bytes as RoleBytes;
 use crate::error::HdfsErrorKind as RoleHdfsErrorKind;
 use crate::model::{
     EntryKind as RoleEntryKind, EntryOperationFailure as RoleEntryFailure,
-    FailureClass as RoleFailureClass, Operation as RoleOperation,
-    StoragePath as RoleStoragePath, Transience as RoleTransience,
-};
-use crate::storage::backends::hdfs::protocol::{
-    HdfsEntryFacts as RoleHdfsEntryFacts, HdfsListedChild as RoleHdfsListedChild,
-    HdfsProtocol as RoleHdfsProtocol,
-    HdfsWriteSession as RoleHdfsWriteSession,
-    entry_failure as role_entry_failure, session_failure as role_session_failure,
+    FailureClass as RoleFailureClass, Operation as RoleOperation, StoragePath as RoleStoragePath,
+    Transience as RoleTransience,
 };
 use crate::storage::StorageRoleFailure as RoleFailure;
+use crate::storage::backends::hdfs::protocol::{
+    HdfsEntryFacts as RoleHdfsEntryFacts, HdfsListedChild as RoleHdfsListedChild,
+    HdfsProtocol as RoleHdfsProtocol, HdfsWriteSession as RoleHdfsWriteSession,
+    entry_failure as role_entry_failure, session_failure as role_session_failure,
+};
 
 #[async_trait::async_trait]
 impl RoleHdfsProtocol for HDFSStorage {
@@ -42,7 +41,7 @@ impl RoleHdfsProtocol for HDFSStorage {
             .get_metadata(Path::new(path.as_str()))
             .await
             .map_err(|error| hdfs_role_error(path, RoleOperation::Observe, error))?;
-        Ok(hdfs_role_facts(path.clone(), entry))
+        Ok(entry)
     }
 
     async fn open_listing(&self, path: &RoleStoragePath) -> Box<dyn RoleHdfsListing> {
@@ -73,7 +72,7 @@ impl RoleHdfsProtocol for HDFSStorage {
     async fn delete(&self, path: &RoleStoragePath, kind: RoleEntryKind) -> Result<(), RoleFailure> {
         let result = match kind {
             RoleEntryKind::File => self.delete_file(Path::new(path.as_str())).await,
-            RoleEntryKind::Directory => self.delete_dir_all(Path::new(path.as_str())).await,
+            RoleEntryKind::Directory => self.delete_resolved(Path::new(path.as_str()), false).await,
             _ => {
                 return Err(hdfs_role_entry(
                     path,
@@ -87,6 +86,63 @@ impl RoleHdfsProtocol for HDFSStorage {
             Ok(()) | Err(StorageError::FileNotFound(_)) => Ok(()),
             Err(error) => Err(hdfs_role_error(path, RoleOperation::Namespace, error)),
         }
+    }
+
+    async fn cleanup_transfer_artifacts(
+        &self,
+        path: &RoleStoragePath,
+        require_empty: bool,
+    ) -> Result<(), RoleFailure> {
+        let mut listing = self.role_listing(path);
+        let mut artifacts = Vec::new();
+        while let Some(children) = listing
+            .next_page(std::num::NonZeroUsize::new(1000).unwrap_or(std::num::NonZeroUsize::MIN))
+            .await?
+        {
+            for child in children {
+                let child = child.map_err(RoleFailure::Entry)?;
+                if crate::storage::artifacts::is_artifact_path(child.path.as_str()) {
+                    artifacts.push(child);
+                } else if require_empty {
+                    return Err(hdfs_role_entry(
+                        path,
+                        RoleOperation::Namespace,
+                        RoleFailureClass::Conflict,
+                        RoleTransience::Permanent,
+                    ));
+                }
+            }
+        }
+        for artifact in artifacts {
+            self.delete_resolved(
+                Path::new(artifact.path.as_str()),
+                artifact.kind == RoleEntryKind::Directory,
+            )
+            .await
+            .map_err(|e| hdfs_role_error(path, RoleOperation::Namespace, e))?;
+        }
+        Ok(())
+    }
+
+    async fn delete_subtree(
+        &self,
+        path: &RoleStoragePath,
+        allow_storage_root: bool,
+    ) -> Result<(), RoleFailure> {
+        if path == &RoleStoragePath::root() && !allow_storage_root {
+            return Err(hdfs_role_entry(
+                path,
+                RoleOperation::Namespace,
+                RoleFailureClass::InvalidInput,
+                RoleTransience::Permanent,
+            ));
+        }
+        let result = if path == &RoleStoragePath::root() {
+            self.delete_resolved(Path::new(""), true).await
+        } else {
+            self.delete_dir_all(Path::new(path.as_str())).await
+        };
+        result.map_err(|e| hdfs_role_error(path, RoleOperation::Namespace, e))
     }
 
     async fn rename(
@@ -182,7 +238,7 @@ impl RoleHdfsProtocol for HDFSStorage {
                 .get_metadata(native)
                 .await
                 .map_err(|error| hdfs_role_error(path, RoleOperation::Write, error))?;
-            if metadata.is_dir || metadata.size != start_offset {
+            if metadata.kind == RoleEntryKind::Directory || metadata.size != Some(start_offset) {
                 return Err(hdfs_role_entry(
                     path,
                     RoleOperation::Write,
@@ -200,10 +256,7 @@ impl RoleHdfsProtocol for HDFSStorage {
         }))
     }
 
-    async fn stabilize_recovered_stage(
-        &self,
-        path: &RoleStoragePath,
-    ) -> Result<u64, RoleFailure> {
+    async fn stabilize_recovered_stage(&self, path: &RoleStoragePath) -> Result<u64, RoleFailure> {
         let native = Path::new(path.as_str());
         let resolved = self
             .resolve_path(native)
@@ -215,7 +268,7 @@ impl RoleHdfsProtocol for HDFSStorage {
             .get_metadata(native)
             .await
             .map_err(|error| hdfs_role_error(path, RoleOperation::Prepare, error))?;
-        if metadata.is_dir {
+        if metadata.kind == RoleEntryKind::Directory {
             return Err(hdfs_role_entry(
                 path,
                 RoleOperation::Prepare,
@@ -223,7 +276,7 @@ impl RoleHdfsProtocol for HDFSStorage {
                 RoleTransience::Permanent,
             ));
         }
-        Ok(metadata.size)
+        metadata.size.ok_or_else(|| invalid_stage_chunk(path))
     }
 
     async fn set_mapped_ownership(
@@ -321,7 +374,7 @@ async fn validate_empty_stage(
         .get_metadata(native)
         .await
         .map_err(|error| hdfs_role_error(path, RoleOperation::Prepare, error))?;
-    if metadata.is_dir || metadata.size != 0 {
+    if metadata.kind == RoleEntryKind::Directory || metadata.size != Some(0) {
         return Err(hdfs_role_entry(
             path,
             RoleOperation::Prepare,
@@ -346,13 +399,10 @@ fn invalid_stage_chunk(path: &RoleStoragePath) -> RoleFailure {
 /// client cannot represent, so it is `Protocol` / `Permanent`, never the session's problem.
 fn hdfs_role_child(
     directory: &RoleStoragePath,
-    child: Result<crate::HDFSEntry, UndescribedHdfsChild>,
+    child: Result<RoleHdfsEntryFacts, UndescribedHdfsChild>,
 ) -> RoleHdfsListedChild {
     let blamed = match child {
-        Ok(entry) => match RoleStoragePath::new(entry.relative_path.to_string_lossy()) {
-            Ok(entry_path) => return Ok(hdfs_role_facts(entry_path, entry)),
-            Err(_) => directory.clone(),
-        },
+        Ok(entry) => return Ok(entry),
         Err(undescribed) => undescribed
             .relative_path
             .and_then(|path| RoleStoragePath::new(path.to_string_lossy()).ok())
@@ -366,25 +416,6 @@ fn hdfs_role_child(
         "HDFS listing could not describe the entry",
     )
     .unwrap_or_else(|_| unreachable!("static HDFS listing diagnostic is valid")))
-}
-
-fn hdfs_role_facts(path: RoleStoragePath, entry: crate::HDFSEntry) -> RoleHdfsEntryFacts {
-    RoleHdfsEntryFacts {
-        path,
-        kind: if entry.is_dir {
-            RoleEntryKind::Directory
-        } else {
-            RoleEntryKind::File
-        },
-        size: (!entry.is_dir).then_some(entry.size),
-        atime: entry.atime,
-        mtime: entry.mtime,
-        mode: entry.mode,
-        owner: entry.owner,
-        group: entry.group,
-        replication: entry.replication,
-        block_size: entry.block_size,
-    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -461,7 +492,7 @@ fn hdfs_role_classify(error: &StorageError) -> (RoleFailureClass, RoleTransience
 }
 
 struct RoleReadCursor {
-    file: HDFSFileHandle,
+    file: HdfsReadHandle,
     path: RoleStoragePath,
 }
 

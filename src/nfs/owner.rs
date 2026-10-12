@@ -64,30 +64,4 @@ mod tests {
         assert_eq!(owner_id("", 65534, false), Some(65534));
         assert_eq!(owner_id("", 0, false), Some(0));
     }
-
-    /// The legacy listing entry: an owner nfs-rs could not map is `None`, not 65534, and the mode
-    /// every legacy consumer applies without a chown loses the set-id bit that owner came with.
-    #[test]
-    fn a_legacy_entry_does_not_keep_set_id_bits_for_an_owner_it_lacks() {
-        let attrs = nfs_rs::Attr {
-            type_: super::super::FType3::NF3REG as u32,
-            file_mode: 0o104_755,
-            uid: 65534,
-            gid: 100,
-            owner: "alice@example.com".to_owned(),
-            owner_group: "100".to_owned(),
-            ..nfs_rs::Attr::default()
-        };
-        let entry = crate::NASEntry::from_nfs_attrs(
-            "tool".to_owned(),
-            std::path::PathBuf::from("tool"),
-            None,
-            &attrs,
-            bytes::Bytes::new(),
-            true,
-        );
-        assert_eq!(entry.uid, None);
-        assert_eq!(entry.gid, Some(100));
-        assert_eq!(entry.mode, 0o100_755);
-    }
 }

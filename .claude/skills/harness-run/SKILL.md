@@ -21,7 +21,6 @@ description: 跑 data-mover-rs 全套 skill 矩阵。默认无外部环境 (e2e-
 - quality-clippy
 - quality-coverage
 - quality-large-file-audit
-- quality-dispatch-coverage
 
 外部环境组 (需 --include-network)：
 - e2e-cifs
@@ -52,7 +51,6 @@ data-mover-rs harness-run report
 | quality-clippy              | PASS   | 23.4s    |
 | quality-coverage            | SKIP   | -        |
 | quality-large-file-audit    | PASS   | 0.2s     |
-| quality-dispatch-coverage   | PASS   | 0.1s     |
 
 VERDICT: PASS (7/7, 1 skipped)
 ```

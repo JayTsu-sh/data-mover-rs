@@ -49,13 +49,12 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use data_mover::NFSStorage;
 use data_mover::model::{EntryKind, FailureClass, StoragePath, Transience};
 use data_mover::storage::{
     BackendConfig, CreateDirectoryAllFailure, DeleteTreeOutcome, DeleteTreeRequest,
-    DestinationPrepareRequest, FinalDestination, LocalBackendConfig, NfsBackendConfig,
-    PreflightPolicy, PrepareRequest, SourceDescriptor, Storage, StorageRoleFailure,
-    connect_backend, create_directory_all, delete_tree,
+    DestinationPrepareRequest, FinalDestination, LocalBackendConfig, MetadataMutation,
+    NfsBackendConfig, PreflightPolicy, PrepareRequest, SourceDescriptor, Storage,
+    StorageRoleFailure, connect_backend, create_directory_all, delete_tree,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -77,7 +76,7 @@ async fn real_nfs_create_directory_all_passes_existing_levels_it_may_not_write()
         return Err(format!("{scratch} already exists").into());
     }
     let outcome = exercise(&url, &owner, &scratch).await;
-    let removed = remove(&url, &owner, &scratch).await;
+    let removed = remove(&owner, &scratch).await;
     outcome?;
     removed?;
     eprintln!("[nfs-mkdir] removed {scratch}");
@@ -91,10 +90,9 @@ async fn exercise(url: &str, owner: &Storage, scratch: &str) -> Result {
     let writable = format!("{ro}/w");
     create_directory_all(owner, &path(&writable)?).await?;
     create_directory_all(owner, &path(&format!("{ro}/keep"))?).await?;
-    let legacy = NFSStorage::new(url, None).await?;
-    chmod(&legacy, &writable, 0o777).await?;
-    chmod(&legacy, &ro, 0o555).await?;
-    chmod(&legacy, scratch, 0o755).await?;
+    chmod(owner, &writable, 0o777).await?;
+    chmod(owner, &ro, 0o555).await?;
+    chmod(owner, scratch, 0o755).await?;
 
     let id = std::env::var("NFS_REAL_UNPRIVILEGED_ID")
         .ok()
@@ -409,19 +407,23 @@ fn answer_of(answer: std::result::Result<(), StorageRoleFailure>) -> String {
     }
 }
 
-async fn chmod(storage: &NFSStorage, path: &str, mode: u32) -> Result {
+async fn chmod(storage: &Storage, value: &str, mode: u32) -> Result {
+    let path = path(value)?;
     storage
-        .update_metadata(Path::new(path), None, None, None, None, Some(mode))
+        .metadata(&PreflightPolicy::production())?
+        .apply(
+            &path,
+            MetadataMutation::Mode(mode),
+            CancellationToken::new(),
+        )
         .await?;
     Ok(())
 }
 
 /// Removes the test's directory as the URL's identity, after giving `ro` its write bit back
 /// (a squashed root may need it).
-async fn remove(url: &str, owner: &Storage, scratch: &str) -> Result {
-    if let Ok(legacy) = NFSStorage::new(url, None).await {
-        let _ = chmod(&legacy, &format!("{scratch}/ro"), 0o755).await;
-    }
+async fn remove(owner: &Storage, scratch: &str) -> Result {
+    let _ = chmod(owner, &format!("{scratch}/ro"), 0o755).await;
     delete_as_owner(owner, scratch).await
 }
 

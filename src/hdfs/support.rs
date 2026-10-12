@@ -14,58 +14,6 @@ fn plan_read_range(
     Ok(Some((offset, length)))
 }
 
-fn validate_write_chunk(
-    pending: &BTreeMap<u64, bytes::Bytes>,
-    next_offset: u64,
-    expected_size: u64,
-    chunk: &crate::DataChunk,
-) -> Result<(), StorageError> {
-    let length = u64::try_from(chunk.data.len())
-        .map_err(|_| config_error("HDFS write chunk length does not fit u64"))?;
-    let end = chunk
-        .offset
-        .checked_add(length)
-        .ok_or_else(|| config_error("HDFS write chunk range overflow"))?;
-    if chunk.offset < next_offset || end > expected_size {
-        return Err(StorageError::OperationError(format!(
-            "invalid HDFS write range [{}, {end}) at committed offset {next_offset}",
-            chunk.offset
-        )));
-    }
-    if let Some((&previous_offset, previous)) = pending.range(..=chunk.offset).next_back() {
-        let previous_end =
-            previous_offset.saturating_add(u64::try_from(previous.len()).unwrap_or(u64::MAX));
-        if previous_end > chunk.offset {
-            return Err(StorageError::OperationError(
-                "overlapping or duplicate HDFS write chunk".to_string(),
-            ));
-        }
-    }
-    if let Some((&following_offset, _)) = pending.range(chunk.offset..).next()
-        && end > following_offset
-    {
-        return Err(StorageError::OperationError(
-            "overlapping HDFS write chunk".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_sequential_end(
-    next_offset: u64,
-    expected_size: u64,
-    has_pending: bool,
-    require_final_size: bool,
-) -> Result<(), StorageError> {
-    if has_pending || (require_final_size && next_offset != expected_size) {
-        return Err(StorageError::OperationError(format!(
-            "HDFS write ended at {next_offset} bytes, expected {expected_size}"
-        )));
-    }
-    Ok(())
-}
-
-
 fn strip_root<'a>(path: &'a str, root: &str) -> Result<&'a str, StorageError> {
     if root == "/" {
         return path
@@ -99,7 +47,7 @@ fn nanos_to_millis(value: i64) -> Result<u64, StorageError> {
 ///
 /// Returns an error when client construction, root lookup, or root creation
 /// fails, or when the configured root is an existing file.
-pub async fn create_hdfs_storage(
+pub(crate) async fn create_hdfs_storage(
     location: &str,
     config: &HdfsConfig,
     block_size: Option<u64>,

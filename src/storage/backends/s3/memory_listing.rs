@@ -118,6 +118,8 @@ pub(crate) struct ListingKnobs {
     /// Objects the first page of this prefix lists besides its own, keyed as given (a server
     /// that ignores the prefix lists keys outside it).
     pub(crate) stray: Vec<(String, S3ListedObject)>,
+    /// Common prefixes injected outside the requested directory, to exercise refusal before deletion.
+    pub(crate) stray_prefixes: Vec<(String, String)>,
     /// The prefix of every listing page requested.
     pub(crate) calls: Vec<String>,
     /// Every `ListObjectsV2` lists this generated directory instead of the stored objects. Page
@@ -436,6 +438,9 @@ impl MemoryS3 {
                 .rejected
                 .extend(injected(&mut knobs.rejected, prefix));
             listed.objects.extend(injected(&mut knobs.stray, prefix));
+            listed
+                .prefixes
+                .extend(injected(&mut knobs.stray_prefixes, prefix));
         }
         self.misbehave(&mut listed, token.is_none());
         Ok(listed)

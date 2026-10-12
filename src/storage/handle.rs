@@ -185,18 +185,17 @@ impl Storage {
             .is_ok_and(|namespace| namespace.capabilities().directory_objects)
     }
 
-    /// Lends the namespace role for an operation that changes the namespace, refusing one whose
-    /// mutating verbs are all unsupported (S3: [`super::NamespaceCapabilities::mutations`]) before any
-    /// I/O, as if it lent no namespace at all.
+    /// Lends the namespace after checking the requested mutation before any I/O.
     ///
     /// # Errors
     /// Returns a typed preflight refusal before the role can perform backend I/O.
     pub(crate) fn mutable_namespace(
         &self,
         policy: &PreflightPolicy,
+        capability: impl FnOnce(super::NamespaceCapabilities) -> Result<(), &'static str>,
     ) -> Result<Arc<dyn Namespace>, CapabilityUnavailable> {
         let namespace = self.namespace(policy)?;
-        match namespace.capabilities().mutations {
+        match capability(namespace.capabilities()) {
             Err(reason) => Err(CapabilityUnavailable::unsupported(
                 Capability::Namespace,
                 reason,

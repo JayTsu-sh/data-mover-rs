@@ -33,11 +33,13 @@ macro_rules! classify_sdk {
     };
 }
 
+mod delete_batch;
 mod delete_marker;
 mod hints;
 mod listing;
 mod multipart;
 mod native;
+pub(super) mod rename;
 mod streaming_put;
 #[cfg(test)]
 mod throttling_tests;
@@ -175,6 +177,16 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
 
     fn bucket_capabilities(&self) -> crate::storage::backends::s3::S3BucketCapabilities {
         super::architecture::bucket_capabilities(self.options)
+    }
+
+    async fn head_bucket(&self) -> S3Result<()> {
+        self.client
+            .head_bucket()
+            .bucket(&self.bucket_name)
+            .send()
+            .await
+            .map_err(|e| classify_sdk!(e, "S3 connectivity HeadBucket failed"))?;
+        Ok(())
     }
 
     async fn head(
@@ -395,6 +407,22 @@ impl crate::storage::backends::s3::S3Protocol for S3Storage {
         range: std::ops::Range<u64>,
     ) -> S3Result<String> {
         native::upload_part_copy(self, source, key, upload_id, part_number, range).await
+    }
+
+    async fn delete_objects(&self, keys: &[String]) -> Vec<S3Result<()>> {
+        delete_batch::delete(self, keys).await
+    }
+
+    fn namespace_rename_support(&self) -> Result<(), &'static str> {
+        if self.options.compat == super::S3Compatibility::Dxn {
+            Err("DXN namespace rename is not supported by the verified profile")
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn rename_object(&self, from: &str, to: &str) -> S3Result<()> {
+        rename::rename(self, from, to).await
     }
 
     async fn delete_object(&self, key: &str) -> crate::storage::backends::s3::S3Result<()> {

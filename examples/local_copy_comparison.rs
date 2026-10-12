@@ -1,5 +1,5 @@
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
@@ -9,18 +9,11 @@ use data_mover::transfer::{
     InflightLimits, ReadBackVerification, TransferIdentity, TransferPolicy, TransferRequest,
     transfer,
 };
-use data_mover::{
-    CopyOptions, CreateStorageOptions, StorageEnum, TransferConcurrency, create_storage,
-};
 use futures::{StreamExt, TryStreamExt, stream};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Implementation {
-    /// The pre-architecture `LocalStorage` path routed through `StorageEnum`.
-    Legacy,
-    /// The legacy public path plus an explicit final data sync (small copies already sync).
-    LegacyDurable,
     /// The role-based Local backend routed through the unified transfer lifecycle.
     Optimized,
 }
@@ -33,9 +26,9 @@ enum TransferMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(about = "Compare legacy and role-based Local-to-Local copy implementations")]
+#[command(about = "Measure role-based Local-to-Local transfer policies")]
 struct Args {
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value_t = Implementation::Optimized)]
     implementation: Implementation,
     #[arg(long)]
     source: PathBuf,
@@ -67,67 +60,6 @@ struct Args {
 
 fn non_zero(value: usize, field: &'static str) -> Result<NonZeroUsize, Box<dyn std::error::Error>> {
     NonZeroUsize::new(value).ok_or_else(|| format!("{field} must be greater than zero").into())
-}
-
-async fn legacy_copy(
-    args: &Args,
-    durable: bool,
-) -> Result<(u64, u128), Box<dyn std::error::Error>> {
-    let chunk_bytes = u64::try_from(args.chunk_bytes)?;
-    let source = create_storage(
-        &args.source.to_string_lossy(),
-        CreateStorageOptions::new(Some(chunk_bytes), false),
-    )
-    .await?
-    .with_transfer_concurrency(TransferConcurrency::new(
-        args.read_inflight,
-        args.write_inflight,
-    )?);
-    let destination = create_storage(
-        &args.destination.to_string_lossy(),
-        CreateStorageOptions::new(Some(chunk_bytes), true),
-    )
-    .await?
-    .with_transfer_concurrency(TransferConcurrency::new(
-        args.read_inflight,
-        args.write_inflight,
-    )?);
-
-    let started = Instant::now();
-    let bytes = stream::iter(0..args.file_count)
-        .map(|index| {
-            let source = &source;
-            let destination = &destination;
-            async move {
-                let path = copy_path(args, index);
-                let entry = source.get_metadata(Path::new(&path)).await?;
-                let bytes = entry.get_size();
-                StorageEnum::copy_file(
-                    source,
-                    destination,
-                    &entry,
-                    CopyOptions {
-                        enable_integrity_check: !args.no_read_back,
-                        is_source_reserved: true,
-                        ..Default::default()
-                    },
-                )
-                .await?;
-                if durable {
-                    tokio::fs::OpenOptions::new()
-                        .read(true)
-                        .open(args.destination.join(&path))
-                        .await?
-                        .sync_data()
-                        .await?;
-                }
-                Ok::<u64, Box<dyn std::error::Error>>(bytes)
-            }
-        })
-        .buffer_unordered(args.file_concurrency)
-        .try_fold(0_u64, |total, bytes| async move { Ok(total + bytes) })
-        .await?;
-    Ok((bytes, started.elapsed().as_nanos()))
 }
 
 async fn optimized_copy(args: &Args) -> Result<(u64, u128), Box<dyn std::error::Error>> {
@@ -213,8 +145,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     tokio::fs::create_dir_all(&args.destination).await?;
     let (bytes, elapsed_ns) = match args.implementation {
-        Implementation::Legacy => legacy_copy(&args, false).await?,
-        Implementation::LegacyDurable => legacy_copy(&args, true).await?,
         Implementation::Optimized => optimized_copy(&args).await?,
     };
     println!("bytes={bytes}\telapsed_ns={elapsed_ns}");

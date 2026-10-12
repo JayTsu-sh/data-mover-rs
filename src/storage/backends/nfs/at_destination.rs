@@ -379,6 +379,7 @@ pub(super) async fn write_pointer(
         }
     }
     fence.written.store(true, Ordering::Release);
+    stage.checkpoint_recorded(prefix);
     Ok(())
 }
 

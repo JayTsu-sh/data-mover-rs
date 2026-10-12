@@ -187,6 +187,15 @@ pub(crate) trait NfsListingPages: Send {
 
 #[async_trait]
 pub(crate) trait NfsNamespaceProtocol: Send + Sync {
+    async fn create_symlink(
+        &self,
+        _request: &crate::storage::CreateSymlinkRequest,
+    ) -> Result<(), NfsProtocolFailure> {
+        Err(NfsProtocolFailure::new(
+            FailureClass::Unsupported,
+            Transience::Permanent,
+        ))
+    }
     async fn stat(&self, path: &StoragePath)
     -> Result<NfsNamespaceObservation, NfsProtocolFailure>;
     /// The handle of the directory `path` names, resolved from the root through the directory
@@ -215,6 +224,12 @@ pub(crate) trait NfsNamespaceProtocol: Send + Sync {
     async fn forget_directory(&self, path: &StoragePath) -> Result<(), NfsProtocolFailure>;
     async fn read_link(&self, path: &StoragePath) -> Result<Bytes, NfsProtocolFailure>;
     async fn create_directory(&self, path: &StoragePath) -> Result<(), NfsProtocolFailure>;
+    async fn cleanup_transfer_artifacts(
+        &self,
+        _path: &StoragePath,
+    ) -> Result<(), NfsProtocolFailure> {
+        Ok(())
+    }
     async fn delete(&self, path: &StoragePath, kind: EntryKind) -> Result<(), NfsProtocolFailure>;
     async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), NfsProtocolFailure>;
 }
@@ -267,6 +282,16 @@ pub(super) fn undescribed(child: NfsUndescribedChild) -> EntryOperationFailure {
 
 #[async_trait]
 impl Namespace for NfsNamespaceAdapter {
+    async fn create_symlink(
+        &self,
+        request: crate::storage::CreateSymlinkRequest,
+    ) -> Result<(), StorageRoleFailure> {
+        checked(&request.path)?;
+        self.protocol
+            .create_symlink(&request)
+            .await
+            .map_err(|error| role_failure(&request.path, Operation::Namespace, error))
+    }
     async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         self.describe(path).await
     }
@@ -297,6 +322,17 @@ impl Namespace for NfsNamespaceAdapter {
             .create_directory(path)
             .await
             .map_err(|error| role_failure(path, Operation::Namespace, error))
+    }
+
+    async fn cleanup_transfer_artifacts(
+        &self,
+        path: &StoragePath,
+    ) -> Result<(), StorageRoleFailure> {
+        checked_allow_root(path)?;
+        self.protocol
+            .cleanup_transfer_artifacts(path)
+            .await
+            .map_err(|e| role_failure(path, Operation::Namespace, e))
     }
 
     async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
@@ -410,10 +446,14 @@ fn invalid_entry(path: &StoragePath) -> EntryOperationFailure {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::storage::{CollectLimits, ListedChild, ListingPage, collect_listing};
+    use crate::storage::{
+        CollectLimits, CreateSymlinkRequest, ListedChild, ListingPage, collect_listing,
+    };
 
     fn path(value: &str) -> StoragePath {
         StoragePath::new(value).unwrap_or_else(|error| panic!("{error}"))
@@ -503,6 +543,69 @@ mod tests {
         }
     }
 
+    /// Captures a symlink request at the role boundary, where its path, opaque target and
+    /// optional attributes must reach the NFS protocol together.
+    struct SymlinkProtocol {
+        request: Mutex<Option<CreateSymlinkRequest>>,
+        failure: Option<NfsProtocolFailure>,
+    }
+
+    #[async_trait]
+    impl NfsNamespaceProtocol for SymlinkProtocol {
+        async fn create_symlink(
+            &self,
+            request: &CreateSymlinkRequest,
+        ) -> Result<(), NfsProtocolFailure> {
+            *self
+                .request
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.clone());
+            self.failure.clone().map_or(Ok(()), Err)
+        }
+
+        async fn stat(
+            &self,
+            _path: &StoragePath,
+        ) -> Result<NfsNamespaceObservation, NfsProtocolFailure> {
+            Err(NfsProtocolFailure::protocol())
+        }
+        async fn directory_handle(&self, _path: &StoragePath) -> Result<Bytes, NfsProtocolFailure> {
+            Err(NfsProtocolFailure::protocol())
+        }
+        async fn read_directory(
+            &self,
+            _path: &StoragePath,
+            _handle: Bytes,
+            _from: DirectoryCookie,
+            _pages: &mut dyn NfsListingPages,
+        ) -> Result<NfsReadEnd, NfsReadFailure> {
+            unreachable!("symlink tests do not list directories")
+        }
+        async fn forget_directory(&self, _path: &StoragePath) -> Result<(), NfsProtocolFailure> {
+            Err(NfsProtocolFailure::protocol())
+        }
+        async fn read_link(&self, _path: &StoragePath) -> Result<Bytes, NfsProtocolFailure> {
+            Err(NfsProtocolFailure::protocol())
+        }
+        async fn create_directory(&self, _path: &StoragePath) -> Result<(), NfsProtocolFailure> {
+            Err(NfsProtocolFailure::protocol())
+        }
+        async fn delete(
+            &self,
+            _path: &StoragePath,
+            _kind: EntryKind,
+        ) -> Result<(), NfsProtocolFailure> {
+            Err(NfsProtocolFailure::protocol())
+        }
+        async fn rename(
+            &self,
+            _from: &StoragePath,
+            _to: &StoragePath,
+        ) -> Result<(), NfsProtocolFailure> {
+            Err(NfsProtocolFailure::protocol())
+        }
+    }
+
     async fn list(
         namespace: &NfsNamespaceAdapter,
         directory: &str,
@@ -515,6 +618,92 @@ mod tests {
         let identity = BackendIdentity::new(crate::model::BackendKind::Nfs, "nfs-listing-test")
             .unwrap_or_else(|error| panic!("{error}"));
         NfsNamespaceAdapter::new(Arc::new(listing), identity)
+    }
+
+    fn symlink_adapter(
+        failure: Option<NfsProtocolFailure>,
+    ) -> (NfsNamespaceAdapter, Arc<SymlinkProtocol>) {
+        let protocol = Arc::new(SymlinkProtocol {
+            request: Mutex::new(None),
+            failure,
+        });
+        let identity = BackendIdentity::new(crate::model::BackendKind::Nfs, "nfs-symlink-test")
+            .unwrap_or_else(|error| panic!("{error}"));
+        (
+            NfsNamespaceAdapter::new(protocol.clone(), identity),
+            protocol,
+        )
+    }
+
+    /// The NFS namespace forwards link target bytes and requested link metadata unchanged in a
+    /// single protocol request; a relative parent segment in the target is opaque payload.
+    #[tokio::test]
+    async fn create_symlink_forwards_target_and_attributes() {
+        use crate::model::{StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding, TimePrecision};
+
+        let (namespace, protocol) = symlink_adapter(None);
+        let request = CreateSymlinkRequest {
+            path: path("d/link"),
+            target: SymlinkTarget::new(SymlinkTargetEncoding::UnixBytes, b"../target".to_vec())
+                .unwrap_or_else(|error| panic!("{error}")),
+            uid: Some(101),
+            gid: Some(202),
+            accessed: Some(
+                StorageTimestamp::new(-1, TimePrecision::Nanoseconds)
+                    .unwrap_or_else(|error| panic!("{error}")),
+            ),
+            modified: Some(
+                StorageTimestamp::new(1_700_000_000_123_456_789, TimePrecision::Nanoseconds)
+                    .unwrap_or_else(|error| panic!("{error}")),
+            ),
+        };
+
+        namespace
+            .create_symlink(request.clone())
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let captured = protocol
+            .request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| panic!("the protocol did not receive the link request"));
+        assert_eq!(captured.path, request.path);
+        assert_eq!(captured.target, request.target);
+        assert_eq!(captured.uid, request.uid);
+        assert_eq!(captured.gid, request.gid);
+        assert_eq!(captured.accessed, request.accessed);
+        assert_eq!(captured.modified, request.modified);
+    }
+
+    /// An NFS protocol failure remains an entry-scoped namespace failure at the link path.
+    #[tokio::test]
+    async fn create_symlink_maps_typed_protocol_failure_to_entry() {
+        let failure = NfsProtocolFailure::new(FailureClass::Protocol, Transience::Transient)
+            .with_status("NFS3ERR_STALE");
+        let (namespace, _) = symlink_adapter(Some(failure));
+        let request = CreateSymlinkRequest {
+            path: path("d/link"),
+            target: crate::model::SymlinkTarget::new(
+                crate::model::SymlinkTargetEncoding::UnixBytes,
+                b"target".to_vec(),
+            )
+            .unwrap_or_else(|error| panic!("{error}")),
+            uid: None,
+            gid: None,
+            accessed: None,
+            modified: None,
+        };
+
+        assert!(matches!(
+            namespace.create_symlink(request).await,
+            Err(StorageRoleFailure::Entry(ref failure))
+                if failure.path() == &path("d/link")
+                    && failure.operation() == Operation::Namespace
+                    && failure.class() == FailureClass::Protocol
+                    && failure.transience() == Transience::Transient
+                    && failure.diagnostic().contains("NFS3ERR_STALE")
+        ));
     }
 
     /// A child the listing could not describe is an entry failure at its own path, beside the

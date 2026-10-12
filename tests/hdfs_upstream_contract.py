@@ -14,13 +14,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCK_SOURCE = re.compile(
-    r"^git\+https://github\.com/JayTsu-sh/hdfs-native"
-    r"\?rev=373739fc0fb69f3f3cd2a32db58170d8cf83a514"
-    r"#([0-9a-f]{40})$"
+    r"^git\+https://github\.com/kimahriman/hdfs-native"
+    r"\?rev=695fc47e9f88804e39bba1d30bf128e66da9b8d6"
+    r"#(695fc47e9f88804e39bba1d30bf128e66da9b8d6)$"
 )
 EXPECTED_DEPENDENCY = {
-    "git": "https://github.com/JayTsu-sh/hdfs-native",
-    "rev": "373739fc0fb69f3f3cd2a32db58170d8cf83a514",
+    "git": "https://github.com/kimahriman/hdfs-native",
+    "rev": "695fc47e9f88804e39bba1d30bf128e66da9b8d6",
 }
 
 
@@ -32,7 +32,7 @@ def resolved_commit(lock_data: bytes) -> str:
     source = packages[0].get("source", "")
     match = LOCK_SOURCE.fullmatch(source)
     if match is None:
-        raise ValueError(f"unexpected hdfs-native lock source: {source!r}")
+        raise ValueError("unexpected hdfs-native lock source or resolved commit")
     return match.group(1)
 
 

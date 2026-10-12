@@ -1,10 +1,17 @@
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use data_mover::{
-    BackendConfig, CopyOptions, CreateStorageOptions, HdfsConfig, HdfsKerberosCredentials, Result,
-    StorageEnum, create_storage,
-};
+use data_mover::hdfs::build_hdfs_client;
+use data_mover::model::StoragePath;
+use data_mover::storage::{BackendConfig, HdfsBackendConfig, PreflightPolicy, connect_backend};
+use data_mover::transfer::{TransferRequest, transfer};
+use data_mover::{HdfsConfig, HdfsKerberosCredentials};
+use tokio_util::sync::CancellationToken;
+#[allow(dead_code)]
+mod copy_support;
+#[allow(dead_code)]
+mod hdfs_support;
+use copy_support::Result;
 
 #[derive(Debug, Parser)]
 #[command(about = "Exercise two client-scoped Kerberos HDFS backends in one process")]
@@ -25,15 +32,11 @@ struct Args {
     path: PathBuf,
 }
 
-fn options(config_dir: PathBuf, keytab: PathBuf) -> CreateStorageOptions {
-    CreateStorageOptions {
-        ensure_dir: true,
-        backend: BackendConfig::Hdfs(HdfsConfig {
-            config_dir: Some(config_dir),
-            kerberos_credentials: Some(HdfsKerberosCredentials {
-                keytab: Some(keytab),
-                ..Default::default()
-            }),
+fn config(config_dir: PathBuf, keytab: PathBuf) -> HdfsConfig {
+    HdfsConfig {
+        config_dir: Some(config_dir),
+        kerberos_credentials: Some(HdfsKerberosCredentials {
+            keytab: Some(keytab),
             ..Default::default()
         }),
         ..Default::default()
@@ -43,77 +46,55 @@ fn options(config_dir: PathBuf, keytab: PathBuf) -> CreateStorageOptions {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let source = create_storage(
-        &args.source,
-        options(args.source_config_dir, args.source_keytab),
-    )
+    let source_config = config(args.source_config_dir, args.source_keytab);
+    let (client, location) = build_hdfs_client(&args.source, &source_config)?;
+    let source = connect_backend(BackendConfig::Hdfs(HdfsBackendConfig {
+        location: args.source,
+        client: source_config,
+        block_size: None,
+        ensure_dir: true,
+    }))
     .await?;
-    let destination = create_storage(
-        &args.destination,
-        options(args.destination_config_dir, args.destination_keytab),
-    )
+    let destination = connect_backend(BackendConfig::Hdfs(HdfsBackendConfig {
+        location: args.destination,
+        client: config(args.destination_config_dir, args.destination_keytab),
+        block_size: None,
+        ensure_dir: true,
+    }))
     .await?;
-    let StorageEnum::HDFS(source_hdfs) = &source else {
-        return Err(data_mover::error::StorageError::MismatchedType);
-    };
-    let source_path = source_hdfs.resolve_path(&args.path)?;
+    let source_path = hdfs_support::resolve(&location, Path::new(&args.path))?;
     let payload = bytes::Bytes::from_static(b"two client-scoped Kerberos HDFS backends");
-    let mut writer = source_hdfs
-        .client()
+    let mut writer = client
         .create(
             &source_path,
             hdfs_native::WriteOptions::default()
                 .overwrite(true)
                 .create_parent(true),
         )
-        .await
-        .map_err(|error| {
-            data_mover::error::StorageError::OperationError(format!(
-                "failed to seed Kerberos HDFS source: {error}"
-            ))
-        })?;
-    Box::pin(writer.write_bytes(payload.clone()))
-        .await
-        .map_err(|error| {
-            data_mover::error::StorageError::OperationError(format!(
-                "failed to write Kerberos HDFS source: {error}"
-            ))
-        })?;
-    Box::pin(writer.close()).await.map_err(|error| {
-        data_mover::error::StorageError::OperationError(format!(
-            "failed to close Kerberos HDFS source: {error}"
-        ))
-    })?;
-
-    let entry = source.get_metadata(&args.path).await?;
-    StorageEnum::copy_file(
-        &source,
-        &destination,
-        &entry,
-        CopyOptions {
-            enable_integrity_check: true,
-            is_source_reserved: true,
-            ..Default::default()
-        },
-    )
+        .await?;
+    Box::pin(writer.write_bytes(payload)).await?;
+    Box::pin(writer.close()).await?;
+    let path = StoragePath::new(args.path.to_str().ok_or("path must be UTF-8")?)?;
+    copy_support::create_parent(&destination, &path).await?;
+    transfer(TransferRequest::new(
+        source.clone(),
+        path.clone(),
+        destination.clone(),
+        path.clone(),
+        copy_support::limits(2 << 20)?,
+        CancellationToken::new(),
+    ))
     .await?;
-    let copied = destination.get_metadata(&args.path).await?;
-    let source_hash = source
-        .compute_hash(Path::new(&args.path), entry.get_size())
+    let bytes = copy_support::verify(&source, &destination, &path).await?;
+    let (_, hash) = copy_support::hash(&source, &path).await?;
+    destination
+        .namespace(&PreflightPolicy::production())?
+        .delete(&path)
         .await?;
-    let destination_hash = destination
-        .compute_hash(Path::new(&args.path), copied.get_size())
+    source
+        .namespace(&PreflightPolicy::production())?
+        .delete(&path)
         .await?;
-    if entry.get_size() != copied.get_size() || source_hash != destination_hash {
-        return Err(data_mover::error::StorageError::OperationError(
-            "Kerberos HDFS copy verification failed".to_string(),
-        ));
-    }
-    destination.delete_file(&copied).await?;
-    source.delete_file(&entry).await?;
-    println!(
-        "two-client Kerberos HDFS copy passed: {} bytes, hash {source_hash}",
-        entry.get_size()
-    );
+    println!("two-client Kerberos HDFS copy passed: {bytes} bytes, hash {hash}");
     Ok(())
 }

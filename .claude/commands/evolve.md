@@ -28,7 +28,7 @@ description: 评审 .claude/memory/corrections.jsonl，建议升级到 learned-r
    - 合并：两条 corrections 描述同一规则的不同表达。
 
 4. **data-mover-rs 特化判据**：
-   - 涉及 `StorageEnum` 操作同步 → 优先升级 (高 ROI 防回归)。
+   - 涉及 storage role 契约和能力同步 → 优先升级 (高 ROI 防回归)。
    - 涉及 backend 特定陷阱 → 写到 `.claude/docs/storage-<backend>.md`。
    - 涉及 retry 决策 → 写到 `.claude/docs/error-taxonomy.md`。
    - 涉及 filter DSL 三元组 → 写到 `.claude/docs/filter-dsl.md`。

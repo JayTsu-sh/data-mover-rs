@@ -11,6 +11,18 @@ use crate::model::{
 use crate::storage::SourceDescriptor;
 use crate::storage::listing::{ListRequest, ListingStream};
 
+/// Creates a link itself; the target is stored verbatim, never traversed during creation.
+/// Parents must exist. Ownership and times may be sent with creation in one protocol operation.
+#[derive(Clone, Debug)]
+pub struct CreateSymlinkRequest {
+    pub path: StoragePath,
+    pub target: SymlinkTarget,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub accessed: Option<crate::model::StorageTimestamp>,
+    pub modified: Option<crate::model::StorageTimestamp>,
+}
+
 /// Coherent namespace role: one method per verb.
 ///
 /// Every failure is a [`StorageRoleFailure`]: `Entry` concerns only the path at hand and the
@@ -20,6 +32,12 @@ use crate::storage::listing::{ListRequest, ListingStream};
 /// silent no-op; every backend implements each one it supports.
 #[async_trait]
 pub trait Namespace: Send + Sync {
+    /// Performs a fresh connectivity operation. Object stores override this with a bucket
+    /// request because their root descriptor is synthetic.
+    async fn check_connectivity(&self) -> Result<(), StorageRoleFailure> {
+        self.stat(&StoragePath::root()).await.map(|_| ())
+    }
+
     /// Describes one entry itself, without following a symlink in its last segment (a link is
     /// described as the link). A missing entry is an `Entry` failure of class `NotFound`.
     async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
@@ -40,6 +58,19 @@ pub trait Namespace: Send + Sync {
             path,
             Operation::Observe,
             "symbolic links are unsupported",
+        ))
+    }
+
+    /// Creates a new symbolic link, refusing an existing destination. Metadata is applied to
+    /// the link itself. A failure applying metadata may leave the created link in place.
+    async fn create_symlink(
+        &self,
+        request: CreateSymlinkRequest,
+    ) -> Result<(), StorageRoleFailure> {
+        Err(unsupported(
+            &request.path,
+            Operation::Namespace,
+            "creating symbolic links is unsupported",
         ))
     }
 
@@ -69,8 +100,66 @@ pub trait Namespace: Send + Sync {
         Err(unsupported(path, Operation::Namespace, NO_MUTATIONS))
     }
 
+    /// Deletes listed non-directory entries. Results correspond one-for-one, in input order;
+    /// failure of one entry never hides successful siblings. Backends may issue one bulk RPC.
+    async fn delete_batch(&self, paths: &[StoragePath]) -> Vec<Result<(), StorageRoleFailure>> {
+        let mut results = Vec::with_capacity(paths.len());
+        for path in paths {
+            results.push(self.delete(path).await);
+        }
+        results
+    }
+
+    /// Maximum useful number of entries in one [`Self::delete_batch`] call.
+    fn delete_batch_size(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN
+    }
+
+    /// Lists the current children to remove, without loading historical object versions.
+    /// Deletion of a versioned key leaves its history intact.
+    fn list_for_delete(&self, request: ListRequest) -> ListingStream {
+        self.list(request)
+    }
+
+    /// Whether recursive deletion may delete children before their directory listing finishes.
+    /// The default keeps all children when a directory read fails midway. Object stores may
+    /// opt into bounded page-by-page deletion; a later listing failure then keeps the directory
+    /// and reports the failure alongside earlier successful deletions.
+    fn allows_paged_delete(&self) -> bool {
+        false
+    }
+
+    /// Removes transfer artifacts directly inside a directory, including their private subtrees.
+    /// Ordinary children and the directory itself are retained. Recursive deletion invokes this
+    /// also for a retained storage root, whose hidden artifacts are absent from public listings.
+    async fn cleanup_transfer_artifacts(
+        &self,
+        _path: &StoragePath,
+    ) -> Result<(), StorageRoleFailure> {
+        Ok(())
+    }
+
+    /// Deletes an entire subtree using the backend's native recursive operation, without
+    /// enumerating progress. Also removes transfer artifacts inside it. This can delete the
+    /// configured storage root only when `allow_storage_root` is explicitly true.
+    /// Backends without a native recursive primitive return `Unsupported`; use
+    /// [`crate::storage::delete_tree`] for portable progress-reporting deletion.
+    async fn delete_subtree(
+        &self,
+        path: &StoragePath,
+        _allow_storage_root: bool,
+    ) -> Result<(), StorageRoleFailure> {
+        Err(unsupported(
+            path,
+            Operation::Namespace,
+            "native subtree deletion is unsupported",
+        ))
+    }
+
     /// Renames one file or directory, replacing an existing destination as far as the protocol
-    /// allows.
+    /// allows. S3 copies the current object server-side, preserves metadata and tags, then
+    /// deletes its current source key; this is not atomic and keeps stored versions. Callers
+    /// must exclude concurrent writers to the source. A failed source deletion leaves both keys.
     async fn rename(
         &self,
         from: &StoragePath,
@@ -109,9 +198,12 @@ pub struct NamespaceCapabilities {
     /// Whether [`Namespace::list`] gives each key its history (P7 §10): decided when the storage
     /// was connected (an S3 bucket that was versioned then, or would not say).
     pub histories: bool,
-    /// Whether `create_directory`, `delete` and `rename` are supported; the reason when they are
-    /// not. Recursive delete and recursive create refuse a namespace without them before any I/O.
-    pub mutations: Result<(), &'static str>,
+    /// Whether creating a directory is supported.
+    pub create_directory: Result<(), &'static str>,
+    /// Whether deleting an entry is supported. Versioned object stores retain object history.
+    pub delete: Result<(), &'static str>,
+    /// Whether renaming a file is supported. Object stores use server-side copy then delete.
+    pub rename: Result<(), &'static str>,
     /// Whether [`Namespace::read_link`] can read link targets.
     pub symlinks: bool,
     /// When two names are the same name.
@@ -127,7 +219,9 @@ impl NamespaceCapabilities {
     /// objects.
     pub const BASIC: Self = Self {
         histories: false,
-        mutations: Ok(()),
+        create_directory: Ok(()),
+        delete: Ok(()),
+        rename: Ok(()),
         symlinks: false,
         names: NameSemantics::UNKNOWN,
         directory_objects: false,

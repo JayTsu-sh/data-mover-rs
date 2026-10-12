@@ -46,6 +46,9 @@ impl NfsSourceProtocol for FakeProtocol {
     ) -> Result<NfsSourceObservation, NfsProtocolFailure> {
         self.described.fetch_add(1, Ordering::SeqCst);
         Ok(NfsSourceObservation {
+            timestamps: None,
+            ownership: None,
+            mode: None,
             kind: EntryKind::File,
             size: Some(self.payload.len() as u64),
             file_handle: self.handle.clone(),

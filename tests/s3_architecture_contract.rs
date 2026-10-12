@@ -4,9 +4,9 @@ use data_mover::model::{
     StoragePath,
 };
 use data_mover::storage::{
-    DestinationPrepareRequest, FinalDestination, MetadataMutation, PreflightPolicy, PrepareFact,
-    PrepareRequest, PublishRequest, ReadRequest, RestartReason, ResumeMode, SourceDescriptor,
-    Storage, VerifyRequest,
+    BackendConfig, DestinationPrepareRequest, FinalDestination, MetadataMutation, PreflightPolicy,
+    PrepareFact, PrepareRequest, PublishRequest, ReadRequest, RestartReason, ResumeMode,
+    S3BackendConfig, SourceDescriptor, Storage, VerifyRequest, connect_backend,
 };
 use data_mover::transfer::{
     InflightLimits, PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, TransferIdentity,
@@ -23,9 +23,12 @@ const PAYLOAD_SIZE: usize = PART_SIZE * 9 + 137;
 const TRANSFER_IDENTITY: [u8; 32] = [8; 32];
 
 async fn connected(url: &str) -> TestResult<Storage> {
-    data_mover::s3::S3Storage::new(url, None)
-        .await?
-        .architecture_storage()
+    Ok(connect_backend(BackendConfig::S3(S3BackendConfig {
+        url: url.to_owned(),
+        block_size: None,
+        single_put_threshold: None,
+    }))
+    .await?)
 }
 
 #[tokio::test]
@@ -67,7 +70,13 @@ async fn verify_native_and_shaped_fallback(
     let native = transfer(request.with_source_qos(qos)).await?;
     assert_eq!(native.blake3, Some(*blake3::hash(payload).as_bytes()));
     assert_eq!(native.source_qos.native_bytes, payload.len() as u64);
-    assert_eq!(native.source_qos.native_requests, 1);
+    // C18 copies objects above 64 MiB with 64 MiB UploadPartCopy parts. This counter
+    // counts payload requests, so the 72 MiB + 137-byte fixture needs two, not one CopyObject.
+    let native_parts = payload.len().div_ceil(64 * 1024 * 1024);
+    assert_eq!(
+        native.source_qos.native_requests,
+        u64::try_from(native_parts)?
+    );
     assert!(!native.source_qos.native_payload_shaped);
 
     let shaped_path = StoragePath::new(format!("{}.shaped", source.as_str()))?;

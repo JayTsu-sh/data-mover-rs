@@ -252,6 +252,7 @@ impl<'a> Writer<'a> {
                     Some(self.invalid())
                 } else {
                     self.persisted = self.completed.prefix;
+                    self.stage.confirmed_write(offset, written);
                     None
                 }
             }

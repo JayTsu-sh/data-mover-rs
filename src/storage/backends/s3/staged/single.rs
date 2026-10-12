@@ -376,6 +376,7 @@ pub(super) async fn publish<P: S3Protocol>(
         return Err(unchanged(cancelled(path, Operation::Publish)));
     }
     let facts = send(adapter, path, single, request.expected_size).await?;
+    stage.confirmed_write(0, request.expected_size);
     Ok(PublicationEvidence {
         final_destination: path.clone(),
         disposition: PublicationDisposition::Published,

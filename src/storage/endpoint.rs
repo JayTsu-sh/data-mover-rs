@@ -15,7 +15,7 @@
 //!
 //! The functions are pure: callers pass the parts their own parsers produced. The NFS URL is the
 //! exception — its splitting rules are simple and repeated here, because `storage` may not depend
-//! on the legacy `nfs` module.
+//! on the NFS protocol owner.
 
 use std::borrow::Cow;
 use std::error::Error;

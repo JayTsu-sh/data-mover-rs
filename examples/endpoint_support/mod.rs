@@ -99,36 +99,51 @@ fn hdfs_client() -> data_mover::HdfsConfig {
 
 /// Connects one endpoint; its identity is the endpoint data-mover derives (ADR-0006).
 pub async fn connect(endpoint: &str) -> Result<Storage> {
+    connect_with_options(endpoint, true, None).await
+}
+
+/// Connects a source without creating it, or a destination with an optional I/O block ceiling.
+pub async fn connect_with_options(
+    endpoint: &str,
+    ensure_dir: bool,
+    block_size: Option<u64>,
+) -> Result<Storage> {
     let config = if endpoint.starts_with("nfs://") {
         BackendConfig::Nfs(NfsBackendConfig {
             url: endpoint.to_owned(),
-            block_size: None,
-            ensure_dir: true,
+            block_size,
+            ensure_dir,
         })
     } else if let Some(root) = endpoint.strip_prefix("smb:") {
         BackendConfig::Cifs(CifsBackendConfig {
             server: env_var("CIFS_REAL_SERVER")?,
             share: env_var("CIFS_REAL_SHARE")?,
             root: (!root.is_empty()).then(|| root.to_owned()),
-            ensure_dir: true,
+            ensure_dir,
             username: env_var("CIFS_REAL_USER")?,
             password: env_var("CIFS_REAL_PASS")?,
             signing_policy: CifsSigningPolicy::default(),
             guest_policy: CifsGuestPolicy::default(),
         })
-    } else if endpoint.starts_with("s3://") {
-        return Err("give `s3:<prefix>` with the e2e-s3 .env, not an s3:// URL".into());
+    } else if endpoint.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("s3") || scheme.to_ascii_lowercase().starts_with("s3+")
+    }) {
+        BackendConfig::S3(S3BackendConfig {
+            url: endpoint.to_owned(),
+            block_size,
+            single_put_threshold: None,
+        })
     } else if let Some(prefix) = endpoint.strip_prefix("s3:") {
         BackendConfig::S3(S3BackendConfig {
             url: s3_url(None, prefix)?,
-            block_size: None,
+            block_size,
             single_put_threshold: None,
         })
     } else if let Some(rest) = endpoint.strip_prefix("s3@") {
         let (bucket, prefix) = rest.split_once(':').ok_or("give `s3@<bucket>:<prefix>`")?;
         BackendConfig::S3(S3BackendConfig {
             url: s3_url(Some(bucket), prefix)?,
-            block_size: None,
+            block_size,
             single_put_threshold: None,
         })
     } else if endpoint.starts_with("hdfs://") {
@@ -136,10 +151,12 @@ pub async fn connect(endpoint: &str) -> Result<Storage> {
             location: endpoint.to_owned(),
             client: hdfs_client(),
             block_size: None,
-            ensure_dir: true,
+            ensure_dir,
         })
     } else {
-        fs::create_dir_all(endpoint)?;
+        if ensure_dir {
+            fs::create_dir_all(endpoint)?;
+        }
         let slots = NonZeroUsize::new(4).ok_or("non-zero")?;
         BackendConfig::Local(LocalBackendConfig {
             root: endpoint.into(),
@@ -227,14 +244,13 @@ async fn names(endpoint: &str, dir: &str) -> Result<Vec<String>> {
         return smb_names(root, dir).await;
     }
     if endpoint.starts_with("hdfs://") {
-        let storage =
-            data_mover::hdfs::create_hdfs_storage(endpoint, &hdfs_client(), None, false).await?;
+        let (client, location) = data_mover::hdfs::build_hdfs_client(endpoint, &hdfs_client())?;
         let path = format!(
             "{}/{}",
-            storage.location().root().trim_end_matches('/'),
+            location.root().trim_end_matches('/'),
             dir.trim_matches('/')
         );
-        let statuses = storage.client().list_status(&path, false).await?;
+        let statuses = client.list_status(&path, false).await?;
         return Ok(statuses
             .iter()
             .filter_map(|status| status.path.rsplit('/').next().map(str::to_owned))

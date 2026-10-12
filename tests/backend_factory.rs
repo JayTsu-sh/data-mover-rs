@@ -199,7 +199,7 @@ fn network_endpoint_identities_are_derived_offline_without_credentials()
     Ok(())
 }
 
-/// HDFS is parsed offline exactly as `create_hdfs_storage` parses it: the user is dropped, a direct
+/// HDFS is parsed offline exactly as the typed backend factory parses it: the user is dropped, a direct
 /// `NameNode` keeps its port, and a `NameService` keeps the case of its configuration key.
 #[test]
 fn hdfs_endpoint_identity_is_derived_offline() -> Result<(), Box<dyn std::error::Error>> {

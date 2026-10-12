@@ -10,7 +10,7 @@
 |---|---|
 | 新人/新 session 起手 | [codebase.md](codebase.md) |
 | 整体数据流 / 并发模型 | [architecture.md](architecture.md) |
-| **新增/修改 `StorageEnum` 操作** | [storage-enum-dispatch.md](storage-enum-dispatch.md) |
+| **新增/修改 storage role 操作** | [架构契约](../../docs/architecture/storage-transfer-architecture.md) |
 | 改 CIFS | [storage-cifs.md](storage-cifs.md) |
 | 改 NFS | [storage-nfs.md](storage-nfs.md) |
 | 改 S3 | [storage-s3.md](storage-s3.md) |

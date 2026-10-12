@@ -18,7 +18,7 @@ use crate::storage::{
     CheckpointObservation, FinalDestination, PreflightPolicy, PrepareFact, PrepareRequest,
     PublicationEvidence, PublishRequest, ReadSource, SourceDescriptor, SourceQosBudget,
     SourceQosGroup, SourceQosStats, StagedDestination, Storage, VerificationPoint, VerifyRequest,
-    WriteEvidence,
+    WriteEvidence, WriteProgressObserver,
 };
 use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy};
 
@@ -281,6 +281,7 @@ pub struct ExpertDestinationRequest {
     cancel: tokio_util::sync::CancellationToken,
     transfer_policy: TransferPolicy,
     metadata_plan: Option<MetadataPlan>,
+    write_observer: Option<WriteProgressObserver>,
 }
 
 impl ExpertDestinationRequest {
@@ -314,6 +315,7 @@ impl ExpertDestinationRequest {
             cancel,
             transfer_policy: TransferPolicy::default(),
             metadata_plan: None,
+            write_observer: None,
         }
     }
 
@@ -334,6 +336,15 @@ impl ExpertDestinationRequest {
     #[must_use]
     pub fn with_metadata_plan(mut self, plan: MetadataPlan) -> Self {
         self.metadata_plan = Some(plan);
+        self
+    }
+
+    /// Observes successful destination writes and recorded recovery prefixes. Buffered S3
+    /// single-PUT content is confirmed only during publication, when the service accepts it.
+    /// Notifications never authorize resume; a reconnect still discovers destination state.
+    #[must_use]
+    pub fn with_write_observer(mut self, observer: WriteProgressObserver) -> Self {
+        self.write_observer = Some(observer);
         self
     }
 }
@@ -421,6 +432,10 @@ impl ExpertDestinationSession {
             effective_recovery => effective_recovery,
         };
         stage.durable_publication = request.transfer_policy == TransferPolicy::Checkpointed;
+        stage.write_observer = request.write_observer;
+        if stage.write_offset > 0 && stage.recovery_enabled() {
+            stage.checkpoint_recorded(stage.write_offset);
+        }
         Ok(Self {
             identity: request.identity,
             destination,
@@ -516,6 +531,9 @@ impl ExpertDestinationSession {
                 "completed bytes differ from source size",
             )
             .with_stage(self.destination, self.stage));
+        }
+        if self.stage.recovery_enabled() {
+            self.stage.checkpoint_recorded(checkpoint.durable_prefix);
         }
         Ok(ExpertDestinationTransferred {
             identity: self.identity,

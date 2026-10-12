@@ -4,7 +4,6 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-async-channel = "2"
 arc-swap = "1.9.1"
 async-trait = "0.1"
 aws-config = "1.8.15"
@@ -37,14 +36,11 @@ nfs-rs = "0.8.6"
 num-traits = "0.2.19"
 path-clean = "1.0.1"
 quick-xml = { version = "0.39.2", features = ["serialize"] }
-rayon = "1"
-remove_dir_all = { version = "1.0.0", features = ["parallel"] }
 hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive", "rc"] }
 smb-domain = { package = "smb", git = "https://github.com/JayTsu-sh/smb-rs.git", rev = "2649a0bbd615c23d64faca0053e969288694e034" }
-soft-canonicalize = "0.5.5"
 thiserror = "2.0.18"
 tokio = { version = "1.51.1", features = ["full"] }
 tokio-util = "0.7"

@@ -155,11 +155,34 @@ impl Namespace for HdfsNamespace {
         self.protocol.create_directory(path).await
     }
 
+    async fn cleanup_transfer_artifacts(
+        &self,
+        path: &StoragePath,
+    ) -> Result<(), StorageRoleFailure> {
+        refuse_artifacts(&[path])?;
+        self.protocol.cleanup_transfer_artifacts(path, false).await
+    }
+
     async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
         refuse_artifacts(&[path])?;
         refuse_root(path)?;
         let kind = self.stat_entry(path).await?.kind;
+        if kind == crate::model::EntryKind::Directory {
+            self.protocol.cleanup_transfer_artifacts(path, true).await?;
+        }
         self.protocol.delete(path, kind).await
+    }
+
+    async fn delete_subtree(
+        &self,
+        path: &StoragePath,
+        allow_storage_root: bool,
+    ) -> Result<(), StorageRoleFailure> {
+        refuse_artifacts(&[path])?;
+        if !allow_storage_root {
+            refuse_root(path)?;
+        }
+        self.protocol.delete_subtree(path, allow_storage_root).await
     }
 
     async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), StorageRoleFailure> {

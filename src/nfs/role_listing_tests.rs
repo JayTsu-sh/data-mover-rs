@@ -8,7 +8,7 @@ use std::sync::{Mutex, PoisonError};
 use futures::stream;
 use nfs_rs::{Nfs3ErrorCode as V3, Nfs4ErrorCode as V4};
 
-use super::super::{CACHE_WRITES, FType3, GLOBAL_CACHE, NASEntry, Time, role_metadata};
+use super::super::{CACHE_WRITES, FType3, GLOBAL_CACHE, Time, role_metadata};
 use super::*;
 use crate::model::{FailureClass, Transience};
 
@@ -107,20 +107,19 @@ fn a_listed_childs_ownership_and_times_are_what_a_getattr_reports() {
                 getattr.symlink,
                 "{context}"
             );
-            // The listed mode is the one the legacy entry the listing used to build carried: set-id
-            // bits of an owner that does not map stripped (P7 C10 dropped that detour, not this).
-            let legacy = NASEntry::from_nfs_attrs(
-                "x".to_owned(),
-                PathBuf::from("dir/x"),
-                None,
-                &attrs,
-                Bytes::from_static(b"h"),
-                owners_are_strings,
-            );
-            assert_eq!(listed.mode, Some(legacy.mode), "{context}");
+            // A listed mode carries only set-id bits whose corresponding owner is known; a
+            // directory keeps setgid because it only controls group inheritance.
+            let mut expected_mode = mode;
+            if getattr.uid.is_none() {
+                expected_mode &= !0o4000;
+            }
+            if getattr.gid.is_none() && type_ != FType3::NF3DIR {
+                expected_mode &= !0o2000;
+            }
+            assert_eq!(listed.mode, Some(expected_mode), "{context}");
             assert_eq!(
                 listed.size,
-                (listed.kind == EntryKind::File).then_some(legacy.size)
+                (listed.kind == EntryKind::File).then_some(attrs.filesize)
             );
             checked += 1;
         }

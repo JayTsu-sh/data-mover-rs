@@ -204,6 +204,7 @@ fn timestamps_compare_at_the_coarser_observed_precision() -> Result {
 struct TimelessBackend {
     identity: crate::model::BackendIdentity,
     payload: bytes::Bytes,
+    timestamp: Option<StorageTimestamp>,
 }
 
 #[async_trait::async_trait]
@@ -213,7 +214,7 @@ impl crate::storage::ReadSource for TimelessBackend {
         path: &StoragePath,
     ) -> std::result::Result<crate::storage::SourceDescriptor, crate::storage::StorageRoleFailure>
     {
-        Ok(crate::storage::SourceDescriptor::new(
+        let descriptor = crate::storage::SourceDescriptor::new(
             path.clone(),
             crate::model::EntryKind::File,
             Some(self.payload.len() as u64),
@@ -223,7 +224,15 @@ impl crate::storage::ReadSource for TimelessBackend {
                 path.as_str().as_bytes(),
             )
             .unwrap_or_else(|error| panic!("{error}")),
-        ))
+        );
+        Ok(match self.timestamp {
+            Some(modified) => descriptor.with_inline_timestamps(crate::model::TimestampMetadata {
+                accessed: None,
+                modified: Some(modified),
+                created: None,
+            }),
+            None => descriptor,
+        })
     }
 
     async fn read(
@@ -243,6 +252,10 @@ impl crate::storage::Metadata for TimelessBackend {
         plan: crate::model::ObservationPlan,
     ) -> std::result::Result<crate::model::MetadataObservations, crate::storage::StorageRoleFailure>
     {
+        assert!(
+            self.timestamp.is_none(),
+            "inline timestamps must avoid metadata I/O"
+        );
         let timestamps = if plan.timestamps() == crate::model::ObservationMode::Omit {
             crate::model::MetadataObservation::NotRequested
         } else {
@@ -269,10 +282,19 @@ impl crate::storage::Metadata for TimelessBackend {
 }
 
 fn timeless_storage(name: &str, payload: &'static [u8]) -> Result<Storage> {
+    described_storage(name, payload, None)
+}
+
+fn described_storage(
+    name: &str,
+    payload: &'static [u8],
+    timestamp: Option<StorageTimestamp>,
+) -> Result<Storage> {
     let identity = BackendIdentity::new(BackendKind::S3, name)?;
     let backend = std::sync::Arc::new(TimelessBackend {
         identity: identity.clone(),
         payload: bytes::Bytes::from_static(payload),
+        timestamp,
     });
     let supported = crate::storage::CapabilityAvailability::Supported;
     let unsupported = crate::storage::CapabilityAvailability::Unsupported(
@@ -364,5 +386,64 @@ async fn an_object_stores_upload_time_so_its_mtime_is_not_compared() -> Result {
     };
     let report = compare(request).await?;
     assert!(report.matches(), "unexpected {:?}", report.differences());
+    Ok(())
+}
+
+#[tokio::test]
+async fn timestamp_precision_and_tolerance_use_inline_facts_without_metadata_io() -> Result {
+    let request = IntegrityRequest {
+        source: described_storage(
+            "precise",
+            b"x",
+            Some(StorageTimestamp::new(
+                1_000_000_042,
+                TimePrecision::Nanoseconds,
+            )?),
+        )?,
+        source_path: StoragePath::new("object")?,
+        destination: described_storage(
+            "coarse",
+            b"x",
+            Some(StorageTimestamp::new(
+                1_000_000_000,
+                TimePrecision::Seconds,
+            )?),
+        )?,
+        destination_path: StoragePath::new("object")?,
+        options: IntegrityOptions::default(),
+        cancel: tokio_util::sync::CancellationToken::new(),
+    };
+    assert!(compare(request.clone()).await?.matches());
+    let mut exact = request;
+    exact.options.mtime_precision = super::MtimePrecision::Exact;
+    assert!(matches!(
+        compare(exact.clone()).await?.differences(),
+        [IntegrityDifference::Modified { .. }]
+    ));
+    exact.options.mtime_tolerance = std::time::Duration::from_nanos(42);
+    assert!(compare(exact).await?.matches());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn permission_comparison_detects_a_mode_difference_with_equal_bytes_and_times() -> Result {
+    use std::os::unix::fs::PermissionsExt as _;
+    let fixture = Fixture::new(Some(b"payload"), Some(b"payload"))?;
+    std::fs::set_permissions(
+        fixture.source_root.path().join("object.bin"),
+        std::fs::Permissions::from_mode(0o640),
+    )?;
+    std::fs::set_permissions(
+        fixture.destination_root.path().join("object.bin"),
+        std::fs::Permissions::from_mode(0o600),
+    )?;
+    let mut request = fixture.request(IntegrityMode::Content)?;
+    assert!(compare(request.clone()).await?.matches());
+    request.options.permissions = true;
+    let report = compare(request).await?;
+    assert!(
+        matches!(report.differences(), [IntegrityDifference::Permissions { source, destination }] if source.mode == Some(0o640) && destination.mode == Some(0o600))
+    );
     Ok(())
 }

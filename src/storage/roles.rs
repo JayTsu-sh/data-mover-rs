@@ -16,7 +16,8 @@ mod stage;
 mod verification;
 mod version;
 pub use namespace::{
-    CaseSensitivity, NameNormalization, NameSemantics, Namespace, NamespaceCapabilities,
+    CaseSensitivity, CreateSymlinkRequest, NameNormalization, NameSemantics, Namespace,
+    NamespaceCapabilities,
 };
 pub(crate) use stage::DeferredCheckpoint;
 pub use stage::PreparedStage;
@@ -574,6 +575,62 @@ pub enum DeleteMarkerOutcome {
 /// Metadata observation and application role. It never implicitly refetches omitted facts.
 #[async_trait]
 pub trait Metadata: Send + Sync {
+    /// Removes one named extended attribute. This is distinct from applying `Xattrs`, which
+    /// only sets the supplied values. Unsupported backends refuse before I/O; NFS requires a
+    /// nonempty UTF-8 name and reports the server's missing-attribute or permission refusal.
+    async fn remove_xattr(
+        &self,
+        path: &StoragePath,
+        _name: &[u8],
+    ) -> Result<(), StorageRoleFailure> {
+        Err(StorageRoleFailure::Entry(
+            EntryOperationFailure::new(
+                path.clone(),
+                Operation::Metadata,
+                FailureClass::Unsupported,
+                Transience::Permanent,
+                "removing extended attributes is unsupported",
+            )
+            .unwrap_or_else(|_| unreachable!("static metadata diagnostic")),
+        ))
+    }
+
+    /// Permission facts bound to a description. Reuses inline facts when available; named
+    /// principal backends override this instead of fabricating numeric owner identifiers.
+    async fn permissions(
+        &self,
+        descriptor: &SourceDescriptor,
+    ) -> Result<super::PermissionFacts, StorageRoleFailure> {
+        let plan = ObservationPlan::default()
+            .with_ownership_mode(crate::model::ObservationMode::BestEffort);
+        let observations = match self.observe_listed(descriptor, plan) {
+            Some(observed) => observed?,
+            None => {
+                self.observe_bound(&descriptor.path, &descriptor.source_identity, plan)
+                    .await?
+            }
+        };
+        Ok(match observations.ownership_mode() {
+            crate::model::MetadataObservation::Failed { class, transience } => {
+                return Err(StorageRoleFailure::Entry(
+                    EntryOperationFailure::new(
+                        descriptor.path.clone(),
+                        Operation::Observe,
+                        *class,
+                        *transience,
+                        "permission observation failed",
+                    )
+                    .unwrap_or_else(|_| unreachable!("static diagnostic")),
+                ));
+            }
+            crate::model::MetadataObservation::Value { value, .. } => super::PermissionFacts {
+                owner: Some(super::PrincipalIdentity::Numeric(value.uid)),
+                group: Some(super::PrincipalIdentity::Numeric(value.gid)),
+                mode: Some(value.mode & 0o7777),
+            },
+            _ => super::PermissionFacts::default(),
+        })
+    }
     /// Source observations requested by the ordinary transfer entry for baseline metadata copy.
     fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
         None

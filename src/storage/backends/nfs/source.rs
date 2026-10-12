@@ -25,6 +25,9 @@ pub(crate) struct NfsSourceObservation {
     pub(crate) size: Option<u64>,
     pub(crate) file_handle: Bytes,
     pub(crate) content_version: Bytes,
+    pub(crate) timestamps: Option<crate::model::TimestampMetadata>,
+    pub(crate) ownership: Option<crate::storage::InlineOwnership>,
+    pub(crate) mode: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -126,9 +129,9 @@ impl NfsReadSourceAdapter {
             source_identity,
             backend_fact: None,
             content_version: Some(observed.content_version),
-            inline_timestamps: None,
-            inline_mode: None,
-            inline_ownership: None,
+            inline_timestamps: observed.timestamps,
+            inline_mode: observed.mode,
+            inline_ownership: observed.ownership,
             version: SourceVersion::Current,
             listing: ListingFacts::default(),
         })

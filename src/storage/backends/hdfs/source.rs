@@ -342,6 +342,36 @@ fn put_text(output: &mut BytesMut, value: &str) {
     output.extend_from_slice(value.as_bytes());
 }
 
+pub(super) fn permissions(
+    descriptor: &SourceDescriptor,
+) -> Option<crate::storage::PermissionFacts> {
+    fn principal(facts: &mut &[u8]) -> Option<crate::storage::PrincipalIdentity> {
+        use bytes::Buf as _;
+        if facts.len() < 4 {
+            return None;
+        }
+        let len = usize::try_from(facts.get_u32()).ok()?;
+        let name = std::str::from_utf8(facts.get(..len)?).ok()?.to_owned();
+        facts.advance(len);
+        Some(crate::storage::PrincipalIdentity::Named(name))
+    }
+    use bytes::Buf as _;
+    let mut facts = descriptor
+        .backend_fact
+        .as_deref()?
+        .strip_prefix(b"data-mover:hdfs-entry-facts:v1\0")?;
+    if facts.len() < 20 {
+        return None;
+    }
+    let mode = facts.get_u32() & 0o7777;
+    facts.advance(16);
+    Some(crate::storage::PermissionFacts {
+        owner: Some(principal(&mut facts)?),
+        group: Some(principal(&mut facts)?),
+        mode: Some(mode),
+    })
+}
+
 fn failure(path: &StoragePath, operation: Operation, class: FailureClass) -> StorageRoleFailure {
     entry_failure(path, operation, class, Transience::Permanent)
 }
@@ -363,6 +393,29 @@ mod tests {
             replication: Some(3),
             block_size: Some(128 * 1024 * 1024),
         }
+    }
+
+    #[test]
+    fn inline_permission_facts_preserve_named_principals_and_reject_truncation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let backend = BackendIdentity::new(crate::model::BackendKind::Hdfs, "cluster")?;
+        let mut described = descriptor(&backend, StoragePath::new("file")?, &sample(4, 10))?;
+        let expected = crate::storage::PermissionFacts {
+            owner: Some(crate::storage::PrincipalIdentity::Named("alice".into())),
+            group: Some(crate::storage::PrincipalIdentity::Named("users".into())),
+            mode: Some(0o640),
+        };
+        assert_eq!(permissions(&described), Some(expected));
+        let original = described.backend_fact.take().ok_or("missing facts")?;
+        // All required fields must be present; trailing replication/block-size are unrelated.
+        for end in 0..original.len() - 12 {
+            described.backend_fact = Some(original.slice(..end));
+            assert!(
+                permissions(&described).is_none(),
+                "accepted truncated facts at {end}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

@@ -14,8 +14,12 @@ mod factory;
 mod handle;
 pub mod listing;
 mod native;
+mod permissions;
+pub use permissions::{PermissionFacts, PrincipalIdentity};
 pub(crate) mod pointer;
 mod roles;
+mod write_progress;
+pub use write_progress::{WriteProgress, WriteProgressObserver};
 pub(crate) mod throttle;
 
 pub(crate) use native::{
@@ -54,13 +58,13 @@ pub use listing::{
 };
 pub(crate) use roles::DeferredCheckpoint;
 pub use roles::{
-    ByteStream, CaseSensitivity, CheckpointObservation, DeleteMarkerOutcome, FinalDestination,
-    Metadata, MetadataMutation, NameNormalization, NameSemantics, Namespace, NamespaceCapabilities,
-    PositionedByteStream, PositionedChunk, PrepareRequest, PreparedStage, PublicationDisposition,
-    PublicationEvidence, PublicationFailure, PublishRequest, ReadBackMethod, ReadRequest,
-    ReadSource, StagedDestination, StagedMetadataApplicationFailure, StorageRoleFailure,
-    UnpinnedReadReason, UploadDigest, UploadDigestGap, VerificationEvidence, VerificationPoint,
-    VerifyRequest, WriteEvidence,
+    ByteStream, CaseSensitivity, CheckpointObservation, CreateSymlinkRequest, DeleteMarkerOutcome,
+    FinalDestination, Metadata, MetadataMutation, NameNormalization, NameSemantics, Namespace,
+    NamespaceCapabilities, PositionedByteStream, PositionedChunk, PrepareRequest, PreparedStage,
+    PublicationDisposition, PublicationEvidence, PublicationFailure, PublishRequest,
+    ReadBackMethod, ReadRequest, ReadSource, StagedDestination, StagedMetadataApplicationFailure,
+    StorageRoleFailure, UnpinnedReadReason, UploadDigest, UploadDigestGap, VerificationEvidence,
+    VerificationPoint, VerifyRequest, WriteEvidence,
 };
 
 pub use crate::runtime::read_budget::ReadBudget;

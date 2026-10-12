@@ -6,10 +6,13 @@ mod common;
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use data_mover::model::{FailureClass, StoragePath};
+use data_mover::model::{
+    FailureClass, StoragePath, StorageTimestamp, SymlinkTarget, SymlinkTargetEncoding,
+    TimePrecision,
+};
 use data_mover::storage::{
-    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, PreflightPolicy,
-    StorageRoleFailure, connect_backend,
+    BackendConfig, CifsBackendConfig, CifsGuestPolicy, CifsSigningPolicy, NfsBackendConfig,
+    PreflightPolicy, Storage, StorageRoleFailure, connect_backend,
 };
 use futures::TryStreamExt as _;
 
@@ -232,7 +235,7 @@ async fn probe_symlink(share: &smb_domain::Share, target: &Endpoint) -> Result {
 /// Creates a UNIX symlink on the same volume through the crate's user-space NFS client
 /// when `CIFS_PROBE_NFS_URL` points at the CIFS share's export.
 struct NfsSymlinkFixture {
-    storage: data_mover::NFSStorage,
+    storage: Storage,
     name: String,
 }
 
@@ -241,29 +244,45 @@ impl NfsSymlinkFixture {
         let Ok(url) = std::env::var("CIFS_PROBE_NFS_URL") else {
             return Ok(None);
         };
-        let storage = data_mover::NFSStorage::new(&url, None).await?;
+        let storage = connect_backend(BackendConfig::Nfs(NfsBackendConfig {
+            url,
+            block_size: None,
+            ensure_dir: false,
+        }))
+        .await?;
         let id = uuid::Uuid::new_v4().simple();
         let name = format!("dm-probe-symlink-{id}");
-        let now = data_mover::time_util::now_nanos();
+        let now = StorageTimestamp::new(
+            i128::from(data_mover::time_util::now_nanos()),
+            TimePrecision::Nanoseconds,
+        )?;
         storage
-            .create_symlink(
-                std::path::Path::new(&name),
-                std::path::Path::new("dm-probe-symlink-target"),
-                now,
-                now,
-                None,
-                None,
-            )
+            .namespace(&PreflightPolicy::production())?
+            .create_symlink(data_mover::storage::CreateSymlinkRequest {
+                path: StoragePath::new(&name)?,
+                target: SymlinkTarget::new(
+                    SymlinkTargetEncoding::UnixBytes,
+                    b"dm-probe-symlink-target".to_vec(),
+                )?,
+                uid: None,
+                gid: None,
+                accessed: Some(now),
+                modified: Some(now),
+            })
             .await?;
         println!("[probe] symlink {name}: created over NFS -> dm-probe-symlink-target");
         Ok(Some(Self { storage, name }))
     }
 
     async fn remove(self) {
-        let _ = self
-            .storage
-            .delete_file(std::path::Path::new(&self.name))
-            .await;
+        if let Ok(namespace) = self.storage.namespace(&PreflightPolicy::production()) {
+            let _ = namespace
+                .delete(
+                    &StoragePath::new(&self.name)
+                        .unwrap_or_else(|_| panic!("the generated symlink path was valid")),
+                )
+                .await;
+        }
     }
 }
 

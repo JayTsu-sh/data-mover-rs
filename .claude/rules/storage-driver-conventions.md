@@ -1,20 +1,15 @@
 # Storage Driver Conventions
 
-针对 legacy `StorageEnum` backend 文件 (nfs/s3/local/hdfs) 与 role-based `src/storage/backends/*` 的硬规则。
-CIFS 只有 role-based 实现 (`src/storage/backends/cifs/`)，不在 `StorageEnum` 里。
+针对 `src/storage/backends/*` 及其协议适配器的硬规则。
 
-## D1 · 改 `StorageEnum` 操作 = 5 处同步
+## D1 · role 契约与能力一致
 
-**verify**: 调 `dispatch-checker` agent；或 grep：
+**verify**: 核对 `src/storage/roles/`、对应适配器的能力声明和行为测试，运行
+`make arch-guard`。协议不支持的操作返回 typed Unsupported，不能伪装成功。
 
-```bash
-# 列出 storage_enum.rs 中的所有 match 分支 vs 4 个 backend 实现
-grep -nE 'StorageEnum::(Local|NFS|S3|HDFS)' src/storage_enum.rs | wc -l
-# 应该 4 的倍数 (每个操作有 4 分支)
-```
-
-**why**: enum-based dispatch 没有编译器强制 trait 完整性 (除非全 match exhaustive)。漏改一个 backend → 行为分裂。
-**how to apply**: 改 `StorageEnum` 公开操作时按 [storage-enum-dispatch.md](../docs/storage-enum-dispatch.md) 五步走。
+**why**: 各后端有不同能力，通用传输和遍历通过角色接口协作。
+**how to apply**: 遵循 [架构契约](../../docs/architecture/storage-transfer-architecture.md)，
+保持通用操作不依赖 backend 分派，并保留优化路径的行为断言。
 
 ## D2 · 资源句柄走 `close_resource` helper
 
@@ -35,7 +30,7 @@ grep -nE '\.close\(\)' src/storage/backends/cifs/*.rs src/nfs.rs src/s3.rs | gre
 
 ```bash
 # retry 行为应该集中在 retry helper，不散写
-grep -nE 'retry|backoff|sleep' src/{nfs,s3,local}.rs src/storage/backends/cifs/*.rs
+grep -nE 'retry|backoff|sleep' src/{nfs,s3}.rs src/storage/backends/local/*.rs src/storage/backends/cifs/*.rs
 ```
 
 **why**: 上游 sync 引擎根据错误变体决定重试，决策必须一致。
@@ -46,7 +41,7 @@ grep -nE 'retry|backoff|sleep' src/{nfs,s3,local}.rs src/storage/backends/cifs/*
 **verify**:
 
 ```bash
-grep -nE 'UrlParseError|ConfigError' src/{nfs,s3,local}.rs src/s3/url_options.rs
+grep -nE 'UrlParseError|ConfigError' src/{nfs,s3}.rs src/storage/backends/local/*.rs src/s3/url_options.rs
 ```
 
 **URL 文本自己就能判定的错误**都返回 `UrlParseError`：语法、协议名（含已删除的旧协议名，报错给出新写法）、
@@ -63,7 +58,7 @@ grep -nE 'UrlParseError|ConfigError' src/{nfs,s3,local}.rs src/s3/url_options.rs
 **verify**:
 
 ```bash
-grep -nE 'use crate::storage_enum::StorageEnum' src/{nfs,s3,local}.rs src/storage/backends/*/*.rs
+grep -nE 'use crate::storage_enum::StorageEnum' src/{nfs,s3}.rs src/storage/backends/local/*.rs src/storage/backends/*/*.rs
 ```
 
 应空。

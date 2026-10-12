@@ -11,10 +11,10 @@ use crate::model::Transience;
 use crate::model::{EntryKind, FailureClass, VersionRecord};
 use crate::storage::backends::s3::namespace::S3Namespace;
 use crate::storage::backends::s3::paging::ListingLimits;
-use crate::storage::listing::testing::{Described, Perform as _, Verb, listed as listed_current};
+use crate::storage::listing::testing::{Described, listed as listed_current};
 use crate::storage::{
-    Capability, CapabilityAvailability, DeleteTreeRequest, Namespace, SourceDescriptor,
-    StorageRoleFailure, create_directory_all, delete_tree,
+    DeleteTreeRequest, Namespace, SourceDescriptor, StorageRoleFailure, create_directory_all,
+    delete_tree,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -242,47 +242,38 @@ async fn stat_tells_objects_prefixes_and_absence_apart() -> TestResult {
     Ok(())
 }
 
-/// S3 lends the namespace now, but not its mutating verbs: those are `Unsupported`, and recursive
-/// delete and create refuse the storage before any listing, as they did when it lent none.
+/// Current keys can be deleted; virtual directory creation is rejected before I/O.
 #[tokio::test]
-async fn mutations_are_refused_before_any_io() -> TestResult {
+async fn namespace_mutations_are_checked_per_verb() -> TestResult {
     let protocol = bucket(&[("d/e", b"1")]).await?;
     let storage = connect(protocol.clone(), identity(), None)?;
-    assert_eq!(
-        storage.capabilities().availability(Capability::Namespace),
-        &CapabilityAvailability::Supported
-    );
     let namespace = storage.namespace(&validation_policy())?;
-    assert!(!namespace.capabilities().histories, "never versioned");
-    assert!(namespace.capabilities().mutations.is_err());
-    for request in [
-        Verb::CreateDirectory(path("n")),
-        Verb::Delete(path("d/e")),
-        Verb::Rename {
-            from: path("d/e"),
-            to: path("f"),
-        },
-        Verb::ReadLink(path("d/e")),
-    ] {
-        let refused = namespace.perform(request).await;
-        assert!(
-            matches!(refused, Err(StorageRoleFailure::Entry(ref f)) if f.class() == FailureClass::Unsupported),
-            "{refused:?}"
-        );
-    }
-    let one = NonZeroUsize::MIN;
-    let delete = DeleteTreeRequest {
-        root: path("d"),
-        delete_root: true,
-        max_inflight_operations: one,
-        max_buffered_items: one,
-        cancel: CancellationToken::new(),
-    };
-    assert!(delete_tree(&storage, delete).is_err());
+    let capabilities = namespace.capabilities();
+    assert!(capabilities.create_directory.is_err());
+    assert!(capabilities.delete.is_ok());
+    assert!(capabilities.rename.is_ok());
     assert!(create_directory_all(&storage, &path("n/m")).await.is_err());
-
     assert!(protocol.listing().calls.is_empty());
-    assert!(protocol.objects.lock().await.contains_key("d/e"));
+    assert!(matches!(namespace.delete(&path("d")).await,
+        Err(StorageRoleFailure::Entry(e)) if e.class() == FailureClass::Conflict));
+    let one = NonZeroUsize::MIN;
+    let mut deletion = delete_tree(
+        &storage,
+        DeleteTreeRequest {
+            root: path("d"),
+            delete_root: true,
+            max_inflight_operations: one,
+            max_buffered_items: one,
+            cancel: CancellationToken::new(),
+        },
+    )?;
+    while deletion.next_item().await.is_some() {}
+    let outcome = deletion.finish().await?;
+    assert!(
+        matches!(outcome, crate::storage::DeleteTreeOutcome::Completed(ref done)
+        if done.entry_failures == 0)
+    );
+    assert!(!protocol.objects.lock().await.contains_key("d/e"));
     Ok(())
 }
 
@@ -541,3 +532,185 @@ async fn stat_pages_past_empty_pages() -> TestResult {
 
 #[path = "namespace_history_tests.rs"]
 mod histories;
+
+/// Tree deletion removes the current key and never purges older object versions or markers.
+#[tokio::test]
+async fn tree_deletion_keeps_version_history() -> TestResult {
+    let protocol = bucket(&[]).await?;
+    protocol
+        .put_version("d/e", "v1", Bytes::from_static(b"old"))
+        .await;
+    protocol
+        .put_version("d/e", "v2", Bytes::from_static(b"new"))
+        .await;
+    lists_histories(&protocol, true);
+    let storage = connect(protocol.clone(), identity(), None)?;
+    let mut deletion = delete_tree(
+        &storage,
+        DeleteTreeRequest {
+            root: path("d"),
+            delete_root: true,
+            max_inflight_operations: NonZeroUsize::MIN,
+            max_buffered_items: NonZeroUsize::MIN,
+            cancel: CancellationToken::new(),
+        },
+    )?;
+    while deletion.next_item().await.is_some() {}
+    assert!(
+        matches!(deletion.finish().await?, crate::storage::DeleteTreeOutcome::Completed(done)
+        if done.entry_failures == 0)
+    );
+    assert!(
+        protocol
+            .versions
+            .lock()
+            .await
+            .contains_key(&("d/e".into(), "v1".into()))
+    );
+    assert!(
+        protocol
+            .versions
+            .lock()
+            .await
+            .contains_key(&("d/e".into(), "v2".into()))
+    );
+    assert!(protocol.version_deletes().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn deleting_virtual_directories_removes_markers_and_artifacts_but_keeps_visible_children()
+-> TestResult {
+    let artifact = crate::storage::artifacts::artifact_name(
+        "file",
+        crate::storage::artifacts::ArtifactKind::Pointer,
+    );
+    for marker in [false, true] {
+        let protocol = bucket(&[]).await?;
+        put(&protocol, &format!("d/{artifact}"), b"pointer").await?;
+        if marker {
+            put(&protocol, "d/", b"").await?;
+        }
+        let namespace = namespace(&protocol)?;
+        put(&protocol, "d/visible", b"keep").await?;
+        assert!(matches!(namespace.delete(&path("d")).await,
+            Err(StorageRoleFailure::Entry(e)) if e.class() == FailureClass::Conflict));
+        assert!(
+            protocol
+                .objects
+                .lock()
+                .await
+                .contains_key(&format!("d/{artifact}"))
+        );
+        namespace.delete(&path("d/visible")).await?;
+        namespace.delete(&path("d")).await?;
+        assert!(protocol.objects.lock().await.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn recursive_delete_cleans_artifacts_even_when_storage_root_is_retained() -> TestResult {
+    let protocol = bucket(&[]).await?;
+    let artifact = crate::storage::artifacts::artifact_name(
+        "file",
+        crate::storage::artifacts::ArtifactKind::Pointer,
+    );
+    put(&protocol, &artifact, b"pointer").await?;
+    put(&protocol, &format!("{artifact}/private-child"), b"private").await?;
+    let storage = connect(protocol.clone(), identity(), None)?;
+    let mut deletion = delete_tree(
+        &storage,
+        DeleteTreeRequest {
+            root: StoragePath::root(),
+            delete_root: false,
+            max_inflight_operations: NonZeroUsize::MIN,
+            max_buffered_items: NonZeroUsize::MIN,
+            cancel: CancellationToken::new(),
+        },
+    )?;
+    while deletion.next_item().await.is_some() {}
+    assert!(
+        matches!(deletion.finish().await?, crate::storage::DeleteTreeOutcome::Completed(done)
+        if done.entry_failures == 0)
+    );
+    assert!(protocol.objects.lock().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_refuses_outside_keys_and_prefixes_before_deleting_any_artifact() -> TestResult {
+    let artifact = crate::storage::artifacts::artifact_name(
+        "file",
+        crate::storage::artifacts::ArtifactKind::Pointer,
+    );
+    for require_empty in [false, true] {
+        for common_prefix in [false, true] {
+            let protocol = bucket(&[]).await?;
+            let own = format!("victim/{artifact}");
+            let outside = format!("other/{artifact}");
+            put(&protocol, &own, b"own").await?;
+            put(&protocol, &outside, b"outside").await?;
+            if common_prefix {
+                protocol
+                    .listing()
+                    .stray_prefixes
+                    .push(("victim/".into(), format!("{outside}/")));
+            } else {
+                protocol.listing().stray.push((
+                    "victim/".into(),
+                    S3ListedObject {
+                        key: outside.clone(),
+                        size: 7,
+                        etag: "etag".into(),
+                        last_modified: None,
+                    },
+                ));
+            }
+            assert!(
+                super::namespace_cleanup::cleanup(
+                    protocol.as_ref(),
+                    &path("victim"),
+                    ListingLimits::PRODUCTION,
+                    require_empty,
+                )
+                .await
+                .is_err()
+            );
+            let objects = protocol.objects.lock().await;
+            assert!(objects.contains_key(&own));
+            assert!(objects.contains_key(&outside));
+            assert_eq!(objects.len(), 2);
+            assert_eq!(protocol.listing().calls, ["victim/"]);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn deleting_virtual_directory_preserves_its_nonempty_directory_object() -> TestResult {
+    let protocol = bucket(&[("d/", b"content")]).await?;
+    let namespace = namespace(&protocol)?;
+    assert!(matches!(namespace.delete(&path("d")).await,
+        Err(StorageRoleFailure::Entry(e)) if e.class() == FailureClass::Conflict));
+    assert_eq!(
+        protocol.objects.lock().await.get("d/"),
+        Some(&Bytes::from_static(b"content"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rename_refuses_either_storage_root_before_calling_protocol() -> TestResult {
+    let protocol = bucket(&[("file", b"content")]).await?;
+    let namespace = namespace(&protocol)?;
+    for (from, to) in [("", "file"), ("file", ""), ("", "")] {
+        // This protocol's rename returns Unsupported if reached. The namespace must refuse
+        // InvalidInput first, without reading or mutating any key.
+        assert!(matches!(namespace.rename(&path(from), &path(to)).await,
+            Err(StorageRoleFailure::Entry(e)) if e.class() == FailureClass::InvalidInput));
+    }
+    assert!(protocol.head_versions.lock().await.is_empty());
+    assert_eq!(protocol.objects.lock().await.len(), 1);
+    Ok(())
+}

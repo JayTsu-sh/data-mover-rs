@@ -1,6 +1,6 @@
 .PHONY: help build test clippy clippy-strict fmt fmt-fix check ci doc clean examples \
         e2e-local e2e-cifs e2e-nfs e2e-s3 e2e-network e2e-all \
-        coverage audit-large audit-dispatch arch-guard arch-guard-selftest harness-contract verify
+        coverage audit-large arch-guard arch-guard-selftest harness-contract verify
 
 help:
 	@echo "data-mover-rs Makefile (Claude harness 稳定命令面)"
@@ -26,14 +26,13 @@ help:
 	@echo "  e2e-network    跑全部网络 backend (cifs+nfs+s3)"
 	@echo "  e2e-all        跑全部 e2e (含 local)"
 	@echo "  audit-large    审大文件 (列 >800 行的 src/*.rs)"
-	@echo "  audit-dispatch 审 StorageEnum 分派完整性"
 	@echo "  arch-guard     模块依赖方向守卫 (~4s，GitHub CI 同款)"
 	@echo "  arch-guard-selftest 守卫脚本自身单测 (~90s，改守卫时必跑)"
 	@echo "  harness-contract Cargo example artifact selection (one tiny fixture build)"
 	@echo ""
 	@echo "组合："
 	@echo "  ci             fmt + arch-guard + harness-contract + clippy + test + examples + e2e-local"
-	@echo "  verify         ci + audit-large + audit-dispatch + arch-guard-selftest (commit 前自检)"
+	@echo "  verify         ci + audit-large + arch-guard-selftest (commit 前自检)"
 
 build:
 	cargo build --all-targets
@@ -84,9 +83,6 @@ e2e-all: e2e-local e2e-network
 audit-large:
 	python3 .claude/skills/quality-large-file-audit/scripts/run.py
 
-audit-dispatch:
-	python3 .claude/skills/quality-dispatch-coverage/scripts/run.py
-
 arch-guard:
 	python3 tests/validate_architecture_dependencies.py .
 
@@ -99,7 +95,7 @@ harness-contract:
 
 ci: fmt arch-guard harness-contract clippy test examples e2e-local
 
-verify: ci audit-large audit-dispatch arch-guard-selftest
+verify: ci audit-large arch-guard-selftest
 
 clean:
 	cargo clean

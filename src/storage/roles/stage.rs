@@ -29,6 +29,7 @@ pub struct PreparedStage {
     pub(crate) at_destination: bool,
     /// An exclusivity lease held for as long as the stage lives (the engine's per-key guard).
     pub(crate) exclusive: Option<Box<dyn std::any::Any + Send + Sync>>,
+    pub(crate) write_observer: Option<crate::storage::WriteProgressObserver>,
 }
 
 #[allow(dead_code)]
@@ -60,6 +61,7 @@ impl PreparedStage {
             prepare_fact: PrepareFact::Fresh,
             at_destination: false,
             exclusive: None,
+            write_observer: None,
         }
     }
 
@@ -68,6 +70,18 @@ impl PreparedStage {
     #[must_use]
     pub const fn prepare_fact(&self) -> PrepareFact {
         self.prepare_fact
+    }
+
+    pub(crate) fn confirmed_write(&self, offset: u64, bytes: u64) {
+        if let Some(observer) = &self.write_observer {
+            observer.confirmed(offset, bytes);
+        }
+    }
+
+    pub(crate) fn checkpoint_recorded(&self, durable_prefix: u64) {
+        if let Some(observer) = &self.write_observer {
+            observer.checkpoint(durable_prefix);
+        }
     }
 
     /// Marks a stage prepared at the destination, with what its prepare found.
@@ -129,6 +143,7 @@ impl fmt::Debug for PreparedStage {
             .field("prepare_fact", &self.prepare_fact)
             .field("at_destination", &self.at_destination)
             .field("exclusive", &self.exclusive.is_some())
+            .field("write_observer", &self.write_observer.is_some())
             .finish()
     }
 }

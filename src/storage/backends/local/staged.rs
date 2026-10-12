@@ -327,7 +327,9 @@ impl LocalStagedDestination {
         stage: &PreparedStage,
         durable_prefix: u64,
     ) -> Result<(), StorageRoleFailure> {
-        checkpoint::persist(self, stage, durable_prefix).await
+        checkpoint::persist(self, stage, durable_prefix).await?;
+        stage.checkpoint_recorded(durable_prefix);
+        Ok(())
     }
 
     async fn reobserve_checkpoint(&self, stage: &PreparedStage) -> Result<u64, StorageRoleFailure> {
@@ -574,10 +576,7 @@ impl LocalStagedDestination {
                     );
                 };
                 issued = next_offset;
-                let write_file = Arc::clone(file);
-                let probe = Arc::clone(&self.write_probe);
-                writes
-                    .spawn_blocking(move || Self::write_piece(&write_file, &probe, offset, &piece));
+                self.spawn_write_piece(stage, file, writes, offset, piece);
                 piece_start = piece_end;
                 if writes.len() >= self.write_concurrency {
                     match Self::settle_one(writes, stage.final_destination.path()).await {
@@ -611,6 +610,26 @@ impl LocalStagedDestination {
             }
         }
         (issued, persisted, None, false)
+    }
+
+    fn spawn_write_piece(
+        &self,
+        stage: &PreparedStage,
+        file: &Arc<std::fs::File>,
+        writes: &mut JoinSet<Result<u64, io::Error>>,
+        offset: u64,
+        piece: Bytes,
+    ) {
+        let file = Arc::clone(file);
+        let probe = Arc::clone(&self.write_probe);
+        let observer = stage.write_observer.clone();
+        writes.spawn_blocking(move || {
+            let written = Self::write_piece(&file, &probe, offset, &piece)?;
+            if let Some(observer) = observer {
+                observer.confirmed(offset, written);
+            }
+            Ok(written)
+        });
     }
 
     async fn drain_checkpoint_window(

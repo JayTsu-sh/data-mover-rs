@@ -1,5 +1,4 @@
-//! Reading a whole listing into memory, for single-directory callers (recursive delete, the NDX
-//! walk) and tests.
+//! Reading a whole listing into memory, for single-directory callers (the NDX walk) and tests.
 
 use std::num::NonZeroUsize;
 

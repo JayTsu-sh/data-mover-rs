@@ -1,8 +1,8 @@
 //! The S3 namespace role (ADR-0006 C22): `stat` and `list` (delimiter `/`, one prefix at a time):
 //! current objects on a bucket that was never versioned, and one child per key with its whole
-//! history on one that was (P7 §10, [`S3Protocol::lists_histories`]). S3 has no directories to
-//! create, delete or rename, so every mutating verb is refused, and
-//! [`NamespaceCapabilities::mutations`] lets recursive delete and create refuse before any I/O.
+//! history on one that was (P7 §10, [`S3Protocol::lists_histories`]). Deletion removes the current
+//! object (retaining version history); rename copies server-side before deleting the source.
+//! Directories are virtual prefixes, so directory creation is unsupported.
 
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ use crate::storage::{
     StorageRoleFailure,
 };
 
-const NO_MUTATIONS: &str = "S3 has no directories; namespace mutations are unsupported";
+const NO_DIRECTORIES: &str = "S3 prefixes are virtual; creating a directory is unsupported";
 
 pub(super) struct S3Namespace<P> {
     protocol: Arc<P>,
@@ -115,6 +115,13 @@ impl<P: S3Protocol + 'static> S3Namespace<P> {
 
 #[async_trait]
 impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
+    async fn check_connectivity(&self) -> Result<(), StorageRoleFailure> {
+        self.protocol
+            .head_bucket()
+            .await
+            .map_err(|e| role_failure(&StoragePath::root(), Operation::Observe, e))
+    }
+
     async fn stat(&self, path: &StoragePath) -> Result<SourceDescriptor, StorageRoleFailure> {
         refuse_artifact(path)?;
         self.stat_entry(path).await
@@ -154,19 +161,106 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
     }
 
     async fn create_directory(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
-        Err(failure(path, FailureClass::Unsupported, NO_MUTATIONS))
+        Err(failure(path, FailureClass::Unsupported, NO_DIRECTORIES))
     }
 
     async fn delete(&self, path: &StoragePath) -> Result<(), StorageRoleFailure> {
-        Err(failure(path, FailureClass::Unsupported, NO_MUTATIONS))
+        refuse_artifact(path)?;
+        if path == &StoragePath::root() {
+            return Err(failure(
+                path,
+                FailureClass::InvalidInput,
+                "cannot delete the storage root as one entry",
+            ));
+        }
+        match self.protocol.head(path.as_str()).await {
+            Ok(_) => self
+                .protocol
+                .delete_object(path.as_str())
+                .await
+                .map_err(|e| role_failure(path, Operation::Namespace, e)),
+            Err(S3ProtocolFailure::Entry {
+                class: FailureClass::NotFound,
+                ..
+            }) => {
+                super::namespace_cleanup::cleanup(self.protocol.as_ref(), path, self.limits, true)
+                    .await
+            }
+            Err(e) => Err(role_failure(path, Operation::Namespace, e)),
+        }
     }
 
-    async fn rename(
+    async fn cleanup_transfer_artifacts(
         &self,
-        from: &StoragePath,
-        _to: &StoragePath,
+        path: &StoragePath,
     ) -> Result<(), StorageRoleFailure> {
-        Err(failure(from, FailureClass::Unsupported, NO_MUTATIONS))
+        refuse_artifact(path)?;
+        super::namespace_cleanup::cleanup(self.protocol.as_ref(), path, self.limits, false).await
+    }
+
+    fn delete_batch_size(&self) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(100).unwrap_or(std::num::NonZeroUsize::MIN)
+    }
+
+    async fn delete_batch(&self, paths: &[StoragePath]) -> Vec<Result<(), StorageRoleFailure>> {
+        // The caller obtained these non-directory keys from list_for_delete, so no HEAD is needed.
+        if paths
+            .iter()
+            .any(|path| path == &StoragePath::root() || is_artifact_path(path.as_str()))
+        {
+            let mut results = Vec::with_capacity(paths.len());
+            for path in paths {
+                results.push(self.delete(path).await);
+            }
+            return results;
+        }
+        let keys: Vec<_> = paths.iter().map(|path| path.as_str().to_owned()).collect();
+        self.protocol
+            .delete_objects(&keys)
+            .await
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| {
+                result.map_err(|e| role_failure(&paths[index], Operation::Namespace, e))
+            })
+            .collect()
+    }
+
+    fn list_for_delete(&self, request: ListRequest) -> ListingStream {
+        if let Err(failure) = refuse_artifact(&request.path) {
+            return ListingStream::failed(request.path, failure);
+        }
+        let (protocol, identity, limits) = (
+            Arc::clone(&self.protocol),
+            self.identity.clone(),
+            self.limits,
+        );
+        ListingStream::from_producer(request.path.clone(), move |sink| async move {
+            produce_current(protocol.as_ref(), &identity, limits, &request, &sink).await;
+        })
+    }
+
+    fn allows_paged_delete(&self) -> bool {
+        true
+    }
+
+    async fn rename(&self, from: &StoragePath, to: &StoragePath) -> Result<(), StorageRoleFailure> {
+        refuse_artifact(from)?;
+        refuse_artifact(to)?;
+        if from.as_str().is_empty() || to.as_str().is_empty() {
+            return Err(failure(
+                from,
+                FailureClass::InvalidInput,
+                "the S3 storage root cannot be renamed or replaced",
+            ));
+        }
+        if let Err(reason) = self.protocol.namespace_rename_support() {
+            return Err(failure(from, FailureClass::Unsupported, reason));
+        }
+        self.protocol
+            .rename_object(from.as_str(), to.as_str())
+            .await
+            .map_err(|e| role_failure(from, Operation::Namespace, e))
     }
 
     /// `histories`: what the bucket answered when it was connected ([`S3Protocol::lists_histories`],
@@ -177,7 +271,9 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
         let bucket = self.protocol.bucket_capabilities();
         NamespaceCapabilities {
             histories: self.histories,
-            mutations: Err(NO_MUTATIONS),
+            create_directory: Err(NO_DIRECTORIES),
+            delete: Ok(()),
+            rename: self.protocol.namespace_rename_support(),
             symlinks: false,
             names: NameSemantics::EXACT,
             directory_objects: bucket.directory_objects,

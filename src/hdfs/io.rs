@@ -5,12 +5,12 @@ impl HDFSStorage {
     ///
     /// Returns an error for an escaping path, missing file, directory, or
     /// upstream open failure.
-    pub async fn open_file(
+    async fn open_file(
         &self,
         relative_path: &std::path::Path,
-    ) -> Result<HDFSFileHandle, StorageError> {
+    ) -> Result<HdfsReadHandle, StorageError> {
         let metadata = self.get_metadata(relative_path).await?;
-        if metadata.is_dir {
+        if metadata.kind == RoleEntryKind::Directory {
             return Err(StorageError::InvalidPath(format!(
                 "HDFS read target is a directory: {}",
                 relative_path.display()
@@ -23,7 +23,7 @@ impl HDFSStorage {
         .await?;
         let length = u64::try_from(reader.file_length())
             .map_err(|_| config_error("HDFS file length does not fit u64"))?;
-        Ok(HDFSFileHandle {
+        Ok(HdfsReadHandle {
             reader: Arc::new(reader),
             length,
             relative_path: relative_path.to_path_buf(),
@@ -36,9 +36,9 @@ impl HDFSStorage {
     ///
     /// Returns an error when the platform cannot represent the planned range or
     /// the upstream positional read fails.
-    pub async fn read_at(
+    async fn read_at(
         &self,
-        file: &HDFSFileHandle,
+        file: &HdfsReadHandle,
         offset: u64,
         count: u64,
     ) -> Result<bytes::Bytes, StorageError> {
@@ -61,386 +61,6 @@ impl HDFSStorage {
         .await
     }
 
-    pub(crate) async fn read_file(
-        &self,
-        relative_path: &std::path::Path,
-        size: u64,
-    ) -> Result<bytes::Bytes, StorageError> {
-        let file = self.open_file(relative_path).await?;
-        self.read_at(&file, 0, size).await
-    }
-
-    pub(crate) async fn read_data(
-        &self,
-        sender: tokio::sync::mpsc::Sender<crate::DataChunk>,
-        relative_path: &std::path::Path,
-        size: u64,
-        enable_integrity_check: bool,
-        qos: Option<crate::QosManager>,
-    ) -> Result<Option<HashCalculator>, StorageError> {
-        if size == 0 {
-            return Ok(None);
-        }
-        let file = self.open_file(relative_path).await?;
-        let end = size.min(file.length);
-        let chunk_size = transfer_chunk_size(self.block_size);
-        let mut next_offset = 0_u64;
-        let mut inflight = FuturesOrdered::new();
-        let mut hasher = create_hash_calculator(enable_integrity_check);
-        loop {
-            while inflight.len() < self.transfer_concurrency.read() && next_offset < end {
-                let requested = chunk_size.min(end - next_offset);
-                let count = if let Some(qos) = qos.as_ref() {
-                    let granted = qos.acquire_bandwidth_grant(requested).await;
-                    qos.acquire_iops().await;
-                    granted
-                } else {
-                    requested
-                };
-                let storage = self.clone();
-                let file = file.clone();
-                let offset = next_offset;
-                inflight.push_back(
-                    async move { (offset, storage.read_at(&file, offset, count).await) },
-                );
-                next_offset += count;
-            }
-            let Some((offset, data)) = inflight.next().await else {
-                break;
-            };
-            let data = data?;
-            if let Some(hasher) = hasher.as_mut() {
-                hasher.update(&data);
-            }
-            if sender
-                .send(crate::DataChunk { offset, data })
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-        Ok(hasher)
-    }
-
-    pub(crate) async fn read_data_intervals(
-        &self,
-        sender: tokio::sync::mpsc::Sender<crate::DataChunk>,
-        relative_path: &std::path::Path,
-        intervals: &[(u64, u64)],
-        qos: Option<crate::QosManager>,
-    ) -> Result<(), StorageError> {
-        let file = self.open_file(relative_path).await?;
-        let chunk_size = transfer_chunk_size(self.block_size);
-        for &(start, end) in intervals {
-            if start > end {
-                return Err(config_error("HDFS read interval start exceeds end"));
-            }
-            let mut offset = start;
-            while offset < end.min(file.length) {
-                let requested = chunk_size.min(end - offset);
-                let count = if let Some(qos) = qos.as_ref() {
-                    let granted = qos.acquire_bandwidth_grant(requested).await;
-                    qos.acquire_iops().await;
-                    granted
-                } else {
-                    requested
-                };
-                let data = self.read_at(&file, offset, count).await?;
-                if data.is_empty() {
-                    break;
-                }
-                let read = u64::try_from(data.len())
-                    .map_err(|_| config_error("HDFS chunk length does not fit u64"))?;
-                if sender
-                    .send(crate::DataChunk { offset, data })
-                    .await
-                    .is_err()
-                {
-                    return Ok(());
-                }
-                offset = offset
-                    .checked_add(read)
-                    .ok_or_else(|| config_error("HDFS read offset overflow"))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Write a fresh file through one strictly sequential upstream writer.
-    pub(crate) async fn write_data(
-        &self,
-        mut receiver: tokio::sync::mpsc::Receiver<crate::DataChunk>,
-        relative_path: &std::path::Path,
-        expected_size: u64,
-        mode: u32,
-        replication: Option<u32>,
-        bytes_counter: Option<Arc<AtomicU64>>,
-    ) -> Result<u64, StorageError> {
-        if let Some(parent) = relative_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            self.create_dir_all(parent, 0o755).await?;
-        }
-        let path = self.resolve_path(relative_path)?;
-        let options = hdfs_native::WriteOptions::default()
-            .block_size(self.block_size)
-            .permission(mode & 0o7777)
-            .overwrite(true);
-        let options = replication.map_or(options.clone(), |value| options.replication(value));
-        let mut writer =
-            self.client.create(&path, options).await.map_err(|error| {
-                hdfs_operation_error("create file", Some(relative_path), &error)
-            })?;
-        let result = self
-            .consume_sequential_chunks(
-                &mut writer,
-                &mut receiver,
-                SequentialWriteContext {
-                    relative_path,
-                    start_offset: 0,
-                    expected_size,
-                    require_final_size: true,
-                    bytes_counter: bytes_counter.as_ref(),
-                },
-            )
-            .await;
-        if result.is_err() {
-            receiver.close();
-            let _ = self.client.delete(&path, false).await;
-        }
-        result
-    }
-
-    /// Append a contiguous streamed tail to an existing regular file.
-    ///
-    /// `start_offset` must equal the current file length and every received
-    /// chunk must form one contiguous tail ending at `expected_final_size`.
-    /// This is sequential append, not positional write support.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid paths, missing files, directories, a stale
-    /// prefix length, malformed chunks, append/write failures, or close failure.
-    pub async fn append_stream(
-        &self,
-        receiver: tokio::sync::mpsc::Receiver<crate::DataChunk>,
-        relative_path: &std::path::Path,
-        start_offset: u64,
-        expected_final_size: u64,
-    ) -> Result<u64, StorageError> {
-        self.append_stream_with_progress(
-            receiver,
-            HdfsAppendTarget::Raw {
-                path: relative_path,
-                prefix_len: start_offset,
-            },
-            AppendCompletion::Complete(expected_final_size),
-            None,
-            None,
-        )
-        .await
-    }
-
-    pub(crate) async fn append_stream_with_progress(
-        &self,
-        mut receiver: tokio::sync::mpsc::Receiver<crate::DataChunk>,
-        target: HdfsAppendTarget<'_>,
-        completion: AppendCompletion,
-        bytes_counter: Option<&Arc<AtomicU64>>,
-        on_committed: Option<&crate::CommitCallback>,
-    ) -> Result<u64, StorageError> {
-        let relative_path = target.path();
-        let start_offset = target.prefix_len();
-        let (expected_final_size, require_final_size) = match completion {
-            AppendCompletion::Complete(size) => (size, true),
-            AppendCompletion::PartialUpTo(size) => (size, false),
-        };
-        if expected_final_size < start_offset {
-            return Err(config_error(
-                "HDFS append final size cannot precede its starting offset",
-            ));
-        }
-        let metadata = self.get_metadata(relative_path).await?;
-        if metadata.is_dir {
-            return Err(StorageError::InvalidPath(format!(
-                "HDFS append target is a directory: {}",
-                relative_path.display()
-            )));
-        }
-        target.validate_current_prefix(metadata.size)?;
-        if start_offset == expected_final_size {
-            receiver.close();
-            return Ok(start_offset);
-        }
-        let path = self.resolve_path(relative_path)?;
-        let mut writer = open_append_after_lease_recovery(&self.client, &path, relative_path).await?;
-        let write_result = self
-            .consume_sequential_chunks(
-            &mut writer,
-            &mut receiver,
-            SequentialWriteContext {
-                relative_path,
-                start_offset,
-                expected_size: expected_final_size,
-                require_final_size,
-                bytes_counter,
-            },
-        )
-        .await;
-        let written_end = match write_result {
-            Ok(written_end) => written_end,
-            Err(error) => {
-                return settle_append_progress(start_offset, Err(error), None, on_committed);
-            }
-        };
-        let persisted_size = self.get_metadata(relative_path).await?.size;
-        settle_append_progress(
-            start_offset,
-            Ok(written_end),
-            Some(persisted_size),
-            on_committed,
-        )
-    }
-
-    /// Append one contiguous session to a validated prepared transfer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for stale state, malformed chunks, native append/write/
-    /// close failures, or unconfirmed persisted length.
-    pub async fn append_prepared_tail(
-        &self,
-        receiver: tokio::sync::mpsc::Receiver<crate::DataChunk>,
-        state: &HdfsPreparedTransfer,
-        bytes_counter: Option<&Arc<AtomicU64>>,
-        on_committed: Option<&crate::CommitCallback>,
-    ) -> Result<u64, StorageError> {
-        self.append_stream_with_progress(
-            receiver,
-            HdfsAppendTarget::Prepared(state),
-            AppendCompletion::PartialUpTo(state.expected_size()),
-            bytes_counter,
-            on_committed,
-        )
-        .await
-    }
-
-    /// Atomically publish one completed HDFS resume temporary file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error unless the temporary path is a regular file with the
-    /// exact expected length, or when native same-root rename fails.
-    pub async fn commit_tail_resume(
-        &self,
-        part_path: &std::path::Path,
-        final_path: &std::path::Path,
-        expected_size: u64,
-    ) -> Result<(), StorageError> {
-        self.validate_tail_commit_ready(part_path, expected_size)
-            .await?;
-        self.rename(part_path, final_path).await
-    }
-
-    /// Publish a validated prepared transfer at its bound final path.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a mismatched bound path, incomplete partial file,
-    /// directory state, or native rename failure.
-    pub async fn commit_prepared_tail(
-        &self,
-        state: &HdfsPreparedTransfer,
-        final_path: &std::path::Path,
-    ) -> Result<(), StorageError> {
-        state.validate_final_path(final_path)?;
-        self.commit_tail_resume(state.part_path(), final_path, state.expected_size())
-            .await
-    }
-
-    /// Publish a validated prepared transfer only when the final path is absent.
-    ///
-    /// The native non-overwrite rename makes the absence check atomic with
-    /// publication. A conflicting final leaves the prepared partial intact.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for mismatched state, an incomplete partial, or a
-    /// native rename failure including an existing destination.
-    pub async fn commit_prepared_tail_if_absent(
-        &self,
-        state: &HdfsPreparedTransfer,
-        final_path: &std::path::Path,
-    ) -> Result<(), StorageError> {
-        state.validate_final_path(final_path)?;
-        self.validate_tail_commit_ready(state.part_path(), state.expected_size())
-            .await?;
-        self.rename_with_overwrite(state.part_path(), final_path, false)
-            .await
-    }
-
-    async fn validate_tail_commit_ready(
-        &self,
-        part_path: &std::path::Path,
-        expected_size: u64,
-    ) -> Result<(), StorageError> {
-        let metadata = self.get_metadata(part_path).await?;
-        if metadata.is_dir || metadata.size != expected_size {
-            return Err(StorageError::OperationError(format!(
-                "HDFS resume temporary file is not commit-ready: size={}, expected={expected_size}: {}",
-                metadata.size,
-                part_path.display()
-            )));
-        }
-        Ok(())
-    }
-
-    /// Stream a fresh HDFS file from bounded chunks using one sequential writer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid ranges, gaps beyond the configured reorder
-    /// window, size mismatch, path escape, or upstream create/write/close failure.
-    pub async fn write_stream(
-        &self,
-        receiver: tokio::sync::mpsc::Receiver<crate::DataChunk>,
-        relative_path: &std::path::Path,
-        expected_size: u64,
-        mode: u32,
-        replication: Option<u32>,
-    ) -> Result<u64, StorageError> {
-        self.write_data(
-            receiver,
-            relative_path,
-            expected_size,
-            mode,
-            replication,
-            None,
-        )
-        .await
-    }
-
-    pub(crate) async fn write_file(
-        &self,
-        relative_path: &std::path::Path,
-        data: bytes::Bytes,
-        mode: u32,
-        replication: Option<u32>,
-    ) -> Result<(), StorageError> {
-        let size = u64::try_from(data.len())
-            .map_err(|_| config_error("HDFS write data length does not fit u64"))?;
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        sender
-            .send(crate::DataChunk { offset: 0, data })
-            .await
-            .map_err(|_| StorageError::OperationError("HDFS write channel closed".to_string()))?;
-        drop(sender);
-        self.write_data(receiver, relative_path, size, mode, replication, None)
-            .await
-            .map(|_| ())
-    }
-
     /// Delete one regular file below the configured root.
     ///
     /// # Errors
@@ -449,7 +69,7 @@ impl HDFSStorage {
     /// failures, or an upstream `false` result.
     pub async fn delete_file(&self, relative_path: &std::path::Path) -> Result<(), StorageError> {
         let metadata = self.get_metadata(relative_path).await?;
-        if metadata.is_dir {
+        if metadata.kind == RoleEntryKind::Directory {
             return Err(StorageError::InvalidPath(format!(
                 "HDFS file delete target is a directory: {}",
                 relative_path.display()
@@ -474,39 +94,13 @@ impl HDFSStorage {
             ));
         }
         let metadata = self.get_metadata(relative_path).await?;
-        if !metadata.is_dir {
+        if metadata.kind != RoleEntryKind::Directory {
             return Err(StorageError::InvalidPath(format!(
                 "HDFS directory delete target is a file: {}",
                 relative_path.display()
             )));
         }
         self.delete_resolved(relative_path, true).await
-    }
-
-    /// Explicit HDFS-specific storage-root cleanup for isolated lifecycle code.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the root is missing or HDFS rejects deletion.
-    pub async fn delete_storage_root(&self) -> Result<(), StorageError> {
-        self.delete_resolved(std::path::Path::new(""), true).await
-    }
-
-    /// Atomically rename a file or directory below the configured root.
-    ///
-    /// Missing destination parents are created with mode `0o755`. Existing
-    /// destinations are replaced using native HDFS overwrite semantics.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for either root, path escape, a missing source, a
-    /// directory moved below itself, or an upstream rename failure.
-    pub async fn rename(
-        &self,
-        from: &std::path::Path,
-        to: &std::path::Path,
-    ) -> Result<(), StorageError> {
-        self.rename_with_overwrite(from, to, true).await
     }
 
     pub(crate) async fn rename_with_overwrite(
@@ -526,7 +120,7 @@ impl HDFSStorage {
         if from == to {
             return Ok(());
         }
-        if source.is_dir && to.starts_with(from) {
+        if source.kind == RoleEntryKind::Directory && to.starts_with(from) {
             return Err(StorageError::InvalidPath(format!(
                 "HDFS cannot rename a directory into its own subtree: {} -> {}",
                 from.display(),
@@ -559,78 +153,6 @@ impl HDFSStorage {
             .then_some(())
             .ok_or_else(|| StorageError::FileNotFound(relative_path.display().to_string()))
     }
-
-    async fn consume_sequential_chunks(
-        &self,
-        writer: &mut hdfs_native::file::FileWriter,
-        receiver: &mut tokio::sync::mpsc::Receiver<crate::DataChunk>,
-        context: SequentialWriteContext<'_>,
-    ) -> Result<u64, StorageError> {
-        let result = self
-            .consume_sequential_chunk_data(writer, receiver, context)
-            .await;
-        if result.is_err() {
-            receiver.close();
-        }
-        let close_result = Box::pin(writer.close()).await.map_err(|error| {
-            hdfs_operation_error("close writer", Some(context.relative_path), &error)
-        });
-        match (result, close_result) {
-            (Ok(offset), Ok(())) => Ok(offset),
-            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-            (Err(operation), Err(close)) => Err(StorageError::OperationError(format!(
-                "HDFS write failed: {operation}; additionally failed to close writer: {close}"
-            ))),
-        }
-    }
-
-    async fn consume_sequential_chunk_data(
-        &self,
-        writer: &mut hdfs_native::file::FileWriter,
-        receiver: &mut tokio::sync::mpsc::Receiver<crate::DataChunk>,
-        context: SequentialWriteContext<'_>,
-    ) -> Result<u64, StorageError> {
-        let window = self.transfer_concurrency.write();
-        let mut pending = BTreeMap::<u64, bytes::Bytes>::new();
-        let mut next_offset = context.start_offset;
-        while let Some(chunk) = receiver.recv().await {
-            validate_write_chunk(&pending, next_offset, context.expected_size, &chunk)?;
-            if !chunk.data.is_empty() {
-                pending.insert(chunk.offset, chunk.data);
-            }
-            while let Some(data) = pending.remove(&next_offset) {
-                let length = u64::try_from(data.len())
-                    .map_err(|_| config_error("HDFS write chunk length does not fit u64"))?;
-                let written = Box::pin(writer.write_bytes(data)).await.map_err(|error| {
-                    hdfs_operation_error("write data", Some(context.relative_path), &error)
-                })?;
-                if u64::try_from(written).ok() != Some(length) {
-                    return Err(StorageError::OperationError(format!(
-                        "HDFS short write: expected {length} bytes, wrote {written}"
-                    )));
-                }
-                next_offset = next_offset
-                    .checked_add(length)
-                    .ok_or_else(|| config_error("HDFS write offset overflow"))?;
-                if let Some(counter) = context.bytes_counter {
-                    counter.fetch_add(length, Ordering::Relaxed);
-                }
-            }
-            if pending.len() > window {
-                return Err(StorageError::OperationError(format!(
-                    "HDFS write gap at offset {next_offset} exceeded reorder window {window}"
-                )));
-            }
-        }
-        validate_sequential_end(
-            next_offset,
-            context.expected_size,
-            !pending.is_empty(),
-            context.require_final_size,
-        )?;
-        Ok(next_offset)
-    }
-
 }
 
 async fn open_append_after_lease_recovery(
@@ -644,9 +166,7 @@ async fn open_append_after_lease_recovery(
         match client.append(path).await {
             Ok(writer) => return Ok(writer),
             Err(error) => {
-                if let Some(delay) =
-                    append_open_retry_delay(&error, attempt, started.elapsed())
-                {
+                if let Some(delay) = append_open_retry_delay(&error, attempt, started.elapsed()) {
                     sleep(delay).await;
                     attempt = attempt.saturating_add(1);
                     continue;
@@ -725,8 +245,7 @@ fn is_recovery_in_progress_error(error: &HdfsError) -> bool {
 
 fn lease_recovery_poll_delay(elapsed: Duration) -> Option<Duration> {
     let remaining = HDFS_LEASE_RECOVERY_TIMEOUT.checked_sub(elapsed)?;
-    (HDFS_LEASE_RECOVERY_POLL_INTERVAL < remaining)
-        .then_some(HDFS_LEASE_RECOVERY_POLL_INTERVAL)
+    (HDFS_LEASE_RECOVERY_POLL_INTERVAL < remaining).then_some(HDFS_LEASE_RECOVERY_POLL_INTERVAL)
 }
 
 fn is_append_lease_recovery_error(error: &HdfsError) -> bool {
@@ -738,11 +257,7 @@ fn is_append_lease_recovery_error(error: &HdfsError) -> bool {
     }
 }
 
-fn append_open_retry_delay(
-    error: &HdfsError,
-    attempt: u32,
-    elapsed: Duration,
-) -> Option<Duration> {
+fn append_open_retry_delay(error: &HdfsError, attempt: u32, elapsed: Duration) -> Option<Duration> {
     if !is_append_lease_recovery_error(error) {
         return None;
     }
@@ -752,43 +267,4 @@ fn append_open_retry_delay(
     };
     let remaining = HDFS_LEASE_RECOVERY_TIMEOUT.checked_sub(elapsed)?;
     (delay < remaining).then_some(delay)
-}
-
-fn confirmed_append_range(
-    start_offset: u64,
-    written_end: u64,
-    persisted_size: u64,
-) -> Result<Option<(u64, u64)>, StorageError> {
-    if persisted_size != written_end {
-        return Err(StorageError::OperationError(format!(
-            "HDFS append persisted length {persisted_size} does not match written end {written_end}"
-        )));
-    }
-    let length = written_end.checked_sub(start_offset).ok_or_else(|| {
-        StorageError::OperationError(
-            "HDFS append written end cannot precede its starting offset".to_string(),
-        )
-    })?;
-    Ok((length > 0).then_some((start_offset, length)))
-}
-
-fn settle_append_progress(
-    start_offset: u64,
-    write_result: Result<u64, StorageError>,
-    persisted_size: Option<u64>,
-    on_committed: Option<&crate::CommitCallback>,
-) -> Result<u64, StorageError> {
-    let written_end = write_result?;
-    let persisted_size = persisted_size.ok_or_else(|| {
-        StorageError::OperationError(
-            "HDFS append completed without persisted length confirmation".to_string(),
-        )
-    })?;
-    if let Some((offset, length)) =
-        confirmed_append_range(start_offset, written_end, persisted_size)?
-        && let Some(callback) = on_committed
-    {
-        callback(offset, length);
-    }
-    Ok(written_end)
 }

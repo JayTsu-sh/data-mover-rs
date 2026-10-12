@@ -1,31 +1,21 @@
-use data_mover::storage_enum::{
-    BackendConfig as ModuleBackendConfig, CopyOptions as ModuleCopyOptions,
-    CreateStorageOptions as ModuleCreateStorageOptions, TarPackOptions as ModuleTarPackOptions,
-};
-use data_mover::storage_options::CopyOptions as OptionsModuleCopyOptions;
-use data_mover::{BackendConfig, CopyOptions, CreateStorageOptions, TarPackOptions};
+//! Compile-time coverage for the role-based public configuration and transfer API.
+
+use std::num::NonZeroUsize;
+
+use data_mover::storage::{BackendConfig, LocalBackendConfig, PreflightPolicy};
+use data_mover::transfer::{InflightLimits, TransferPolicy};
 
 #[test]
-fn storage_options_keep_root_and_storage_enum_paths_compatible() {
-    let root_copy: CopyOptions = ModuleCopyOptions::default();
-    assert!(root_copy.qos.is_none());
-    assert!(!root_copy.enable_integrity_check);
-    assert!(!root_copy.is_source_reserved);
-    assert!(root_copy.bytes_counter.is_none());
-    assert!(root_copy.cancel.is_none());
-    let _: CopyOptions = OptionsModuleCopyOptions::default();
-
-    let root_tar: TarPackOptions = ModuleTarPackOptions::default();
-    assert!(root_tar.qos.is_none());
-    assert!(root_tar.bytes_counter.is_none());
-
-    let root_backend: BackendConfig = ModuleBackendConfig::default();
-    assert_eq!(root_backend, BackendConfig::Default);
-
-    let root_create = CreateStorageOptions::new(Some(4096), true);
-    let module_create = ModuleCreateStorageOptions::new(Some(4096), true);
-    assert_eq!(root_create, module_create);
-    assert_eq!(root_create.block_size, Some(4096));
-    assert!(root_create.ensure_dir);
-    assert_eq!(root_create.backend, BackendConfig::Default);
+fn public_role_and_transfer_modules_expose_the_supported_local_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = BackendConfig::Local(LocalBackendConfig {
+        root: std::env::temp_dir(),
+        read_concurrency: NonZeroUsize::new(2).ok_or("non-zero read limit")?,
+        write_concurrency: NonZeroUsize::new(7).ok_or("non-zero write limit")?,
+    });
+    assert!(matches!(config, BackendConfig::Local(_)));
+    let _preflight = PreflightPolicy::production();
+    let _limits = InflightLimits::new(2, 128 * 1024, 2)?;
+    assert_eq!(TransferPolicy::default(), TransferPolicy::Checkpointed);
+    Ok(())
 }

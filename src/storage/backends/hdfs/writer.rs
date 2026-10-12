@@ -94,6 +94,7 @@ async fn consume(
         if written != count {
             return Err(invalid(stage));
         }
+        stage.confirmed_write(offset, count as u64);
         offset = offset
             .checked_add(count as u64)
             .ok_or_else(|| invalid(stage))?;
@@ -135,6 +136,7 @@ async fn record_durable_prefix(
     }
     write_pointer(adapter, stage, expected_prefix, false).await?;
     stage.recovery_enabled.store(true, Ordering::Release);
+    stage.checkpoint_recorded(expected_prefix);
     Ok(())
 }
 

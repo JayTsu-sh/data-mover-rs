@@ -1,7 +1,7 @@
 # data-mover-rs
 
-多源数据迁移核心库。legacy `StorageEnum` 覆盖 Local / NFS / S3 / HDFS；CIFS 只有 role-based 实现
-(`src/storage/backends/cifs/`，经 `storage::connect_backend` 构造)。+ filter DSL + work-stealing 并发遍历。
+多源数据迁移核心库。Local / NFS / S3 / HDFS / CIFS 统一经 `storage::connect_backend`
+构造 `Storage`，通过 typed roles 提供操作。另含 filter DSL 和 work-stealing 并发遍历。
 从 terrasync-rs 拆分独立 (commit `4289a15`)，仅库 (无 binary，无 GUI)。
 
 > 这是 Claude Code 的项目入口。先读这页路由，再按场景按需展开 `.claude/docs/`。
@@ -11,7 +11,7 @@
 
 - **Grep first**。不预设接口形状，看代码再改。
 - **Smallest change**。bug fix 与 refactor 分两个 commit。
-- **enum-based dispatch 同步规则**：改一个 backend 操作 = `src/storage_enum.rs` + 该 backend.rs + 可能 `src/lib.rs` 导出 + `examples/` + `tests/` 五处同步。漏一处就是潜在编译错或行为分裂。
+- **role 契约同步**：修改操作时核对角色接口、各后端能力声明、错误分类及行为测试，通用流程保持 backend 无关。
 - **`.unwrap()` / `.expect()` 编译期 deny** (Cargo.toml `[lints.clippy]` 已强制)，仅 `#[cfg(test)]` 和测试 helper 例外。
 - **资源句柄走 `close_resource` helper** (`src/storage/backends/cifs/protocol.rs` 已有)，不要裸 `.close()`。S99 教训。
 - **`Cancelled` ≠ `Error`**，是 `CancellationToken` 信号，上游可重入队 (commit `7eb3046` split retry taxonomy)。
@@ -25,8 +25,8 @@
 | 改 NFS v3/v4 retry 分类 | `.claude/docs/storage-nfs.md` + `.claude/docs/error-taxonomy.md` + `src/nfs.rs` |
 | 改 S3 multipart / 404 / credential | `.claude/docs/storage-s3.md` + `src/s3.rs` |
 | 改 S3 URL 参数（`compat=` / `tls_verify=false` / `bucket_type=nas`）/ TLS 校验 / 旧协议名报错 | `.claude/docs/storage-s3.md` "URL 形式" "TLS" + `src/s3/url_options.rs`（唯一解析器）+ `src/s3/url_options_tests.rs` + `tests/s3_tls_verify.rs` |
-| 改 Local rayon delete / Win ACL | `.claude/docs/storage-local.md` + `src/local.rs` + `src/acl.rs` |
-| **新增/修改 `StorageEnum` 操作** | `.claude/docs/storage-enum-dispatch.md` + `src/storage_enum.rs` (1334 行) |
+| 改 Local 操作 / ACL | `src/storage/backends/local/` + `src/acl.rs` |
+| **新增/修改 storage role 操作** | `docs/architecture/storage-transfer-architecture.md` + `src/storage/roles/` + 对应 backend |
 | 改 filter DSL (lexer / `should_skip` 三元组) | `.claude/docs/filter-dsl.md` + `src/filter.rs` (4849 行) + `src/filter_traversal.rs` (role-based 适配器) |
 | 改遍历调度 / work-stealing | `.claude/docs/walk-scheduler.md` + `src/traversal/storage/{unordered,blocks,cursor}.rs` |
 | 改 role-based 遍历 (filter / max_depth / inline 观察) | `src/traversal/{mod,storage}.rs` (唯一实现，`local_tests.rs` / `local_unordered_tests.rs` 用真文件系统测它) + 默认的 Unordered 调度器 `src/traversal/storage/unordered.rs` + `unordered/{pool,worker,page_io}.rs` + 块序驱动 / 游标 / 逐页列举任务 `src/traversal/storage/{blocks,cursor,stream}.rs` + 按批的会话通道 `src/traversal/channel.rs` + 续扫检查点 `src/traversal/checkpoint.rs` (编解码 / 指纹) 与 `src/traversal/storage/resume.rs` + `resume/{positions,relist,blocks}.rs` (`local_resume_tests.rs` 真文件系统) + 事件 / 计数 `src/traversal/{events,counts}.rs` + `src/filter_traversal.rs` + `examples/storage_role_operations/{main,traverse}.rs` |
@@ -51,7 +51,7 @@
 | 跑取消语义 / filter DSL 测试 | `.claude/skills/op-{cancel,filter-dsl}/SKILL.md` |
 | 跑全套 (无外部环境) | `.claude/skills/harness-run/SKILL.md` 或 `make ci` |
 | 大文件拆分候选 (filter 4849 / s3 3350 / nfs 3100) | 调 `architect` agent，filter 优先调 `filter-expert` |
-| 改 `StorageEnum` 操作时查漏 | 调 `dispatch-checker` agent |
+| 改 role 契约时查漏 | 核对能力矩阵及角色行为测试 |
 | commit 前自检 | 调 `reviewer` agent |
 | 新增 skill / 升级 rule / 加 agent | `.claude/docs/claude-onboarding.md` |
 
@@ -103,6 +103,6 @@ Cargo.toml `[lints.clippy]` 或 CI grep 检查
 2. 按场景读 1-2 个 `.claude/docs/`。
 3. 跨多文件改动前调 `architect` agent。
 4. 改某 backend 调 `backend-specialist` agent (传 backend 名)。
-5. 改 `StorageEnum` 操作调 `dispatch-checker` agent。
+5. 改 role 契约核对能力矩阵及角色行为测试。
 6. 改 filter.rs 调 `filter-expert` agent。
 7. commit 前调 `reviewer` agent，跑 `make ci`。

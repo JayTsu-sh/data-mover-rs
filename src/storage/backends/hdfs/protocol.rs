@@ -104,6 +104,25 @@ pub(crate) trait HdfsProtocol: Send + Sync {
     ) -> Result<Bytes, StorageRoleFailure>;
     async fn create_directory(&self, path: &StoragePath) -> Result<(), StorageRoleFailure>;
     async fn delete(&self, path: &StoragePath, kind: EntryKind) -> Result<(), StorageRoleFailure>;
+    async fn cleanup_transfer_artifacts(
+        &self,
+        _path: &StoragePath,
+        _require_empty: bool,
+    ) -> Result<(), StorageRoleFailure> {
+        Ok(())
+    }
+    async fn delete_subtree(
+        &self,
+        path: &StoragePath,
+        _allow_storage_root: bool,
+    ) -> Result<(), StorageRoleFailure> {
+        Err(entry_failure(
+            path,
+            Operation::Namespace,
+            FailureClass::Unsupported,
+            Transience::Permanent,
+        ))
+    }
     async fn rename(
         &self,
         from: &StoragePath,

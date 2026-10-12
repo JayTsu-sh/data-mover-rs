@@ -172,6 +172,28 @@ impl NfsMetadataProtocol for NFSStorage {
         .map_err(classify_role_error)
     }
 
+    async fn remove_xattr(
+        &self,
+        path: &crate::model::StoragePath,
+        name: &str,
+    ) -> Result<(), NfsProtocolFailure> {
+        let native = Path::new(path.as_str());
+        for attempt in 0..=MAX_STALE_RETRIES {
+            let object = self.role_lookup_fh(native).await?;
+            let generation = self.refresh_generation.load(Ordering::Acquire);
+            match self.mount.removexattr(object.fh, name).await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if is_retryable_with_invalidation(&error) && attempt < MAX_STALE_RETRIES =>
+                {
+                    self.invalidate_acl_lookup(native, generation).await?;
+                }
+                Err(error) => return Err(classify_error(error)),
+            }
+        }
+        unreachable!("bounded xattr retry loop always returns")
+    }
+
     async fn set_numeric_ownership(
         &self,
         path: &crate::model::StoragePath,

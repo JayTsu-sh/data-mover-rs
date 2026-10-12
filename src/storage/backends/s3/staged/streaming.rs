@@ -539,6 +539,7 @@ pub(super) async fn publish<P: S3Protocol>(
         )));
     }
     let facts = finish(adapter, path, streaming, inflight, &md5).await?;
+    stage.confirmed_write(0, request.expected_size);
     if let Some(tags) = tags {
         adapter
             .protocol

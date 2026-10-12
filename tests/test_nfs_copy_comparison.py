@@ -37,13 +37,13 @@ class NfsCopyComparisonTest(unittest.TestCase):
         self.assertIn('DATA_MOVER_NFS_READ_INFLIGHT="$read_inflight"', runner)
         self.assertIn('DATA_MOVER_NFS_WRITE_INFLIGHT="$write_inflight"', runner)
 
-    def test_benchmark_uses_both_public_copy_seams_without_durability_shim(self):
+    def test_benchmark_uses_role_copy_and_an_external_historical_baseline(self):
         benchmark = BENCHMARK.read_text()
 
-        self.assertIn("StorageEnum::copy_file", benchmark)
+        self.assertNotIn("StorageEnum", benchmark)
+        self.assertIn("NFS_COPY_PERF_BASELINE_BIN", RUNNER.read_text())
         self.assertIn("connect_backend", benchmark)
         self.assertIn("transfer(request)", benchmark)
-        self.assertIn("enable_integrity_check: true", benchmark)
         self.assertNotIn("sync_data", benchmark)
         self.assertNotIn("LegacyDurable", benchmark)
 

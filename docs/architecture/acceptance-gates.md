@@ -76,6 +76,18 @@ database names, and a unique run ID, followed by cleanup in an unconditional fin
 PR fault tests use deterministic adapters at the same public/expert seams as real backends.
 They inject every lifecycle failure without testing private protocol representations.
 
+Namespace mutation requirements are per verb: S3 directory creation remains unsupported,
+while current-key deletion and standard S3 file rename have role implementations. Recursive
+S3 deletion streams current `ListObjectsV2` pages into batches of at most 100 `DeleteObjects`
+keys, reports each partial failure, and retains version history. Hidden transfer artifacts and
+folder markers are cleaned with their containing directory; ordinary children prevent a
+single-directory deletion. Keeping the configured root still cleans its transfer artifacts.
+HDFS offers explicit native subtree deletion, with a separate opt-in for deleting the configured
+storage root; portable recursive deletion continues to report individual entries.
+
+The namespace regression gate covers these distinctions, source preservation after failed
+S3 copy, metadata/tag preservation for both S3 rename forms, and bounded bulk-delete requests.
+
 ## 4. Parameterized directed matrix gates
 
 For each `gate_key` in `directed-transfer-matrix.yaml`, the following three independent

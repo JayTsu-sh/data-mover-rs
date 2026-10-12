@@ -1,39 +1,171 @@
-use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
-use data_mover::{EntryEnum, Result, StorageEnum, create_storage};
+use data_mover::model::StoragePath;
+use data_mover::qos::parse_bandwidth_string;
+use data_mover::transfer::{
+    PayloadShapingPolicy, SourceQosGroup, SourceQosPolicy, SourceQosStats, TransferRequest,
+    move_file, transfer,
+};
+use num_traits::ToPrimitive as _;
+use tokio_util::sync::CancellationToken;
 
-mod hdfs_support;
+#[allow(dead_code)]
+mod copy_support;
+#[allow(dead_code)]
+mod endpoint_support;
+use endpoint_support::{Result, connect_with_options};
 
-fn creation_options(location: &str, ensure_dir: bool) -> data_mover::CreateStorageOptions {
-    data_mover::CreateStorageOptions {
-        ensure_dir,
-        backend: if location.starts_with("hdfs://") {
-            data_mover::BackendConfig::Hdfs(hdfs_support::config())
-        } else {
-            data_mover::BackendConfig::Default
-        },
-        ..Default::default()
-    }
+#[derive(Debug, Parser)]
+#[command(about = "Copy one file between two data-mover storage URLs")]
+struct Args {
+    /// Source storage URL.
+    #[arg(long)]
+    source: String,
+
+    /// Destination storage URL.
+    #[arg(long)]
+    destination: String,
+
+    /// Path relative to both storage roots.
+    #[arg(long)]
+    path: String,
+
+    /// Requested transfer chunk size. Backends may negotiate a lower safe value.
+    #[arg(long, default_value_t = 2 * 1024 * 1024)]
+    chunk_bytes: u64,
+
+    /// Delete the source only after destination publish, metadata and integrity succeed.
+    #[arg(long)]
+    delete_source: bool,
+
+    /// Source-side sustained bandwidth limit, for example `8MiB/s`.
+    #[arg(long)]
+    qos_bandwidth: Option<String>,
+
+    /// Hard source-side peak bandwidth; requires `--qos-bandwidth`.
+    #[arg(long, requires = "qos_bandwidth")]
+    qos_hard_bandwidth: Option<String>,
+
+    /// Duration that a full soft-credit bucket may sustain the hard peak.
+    #[arg(long, requires = "qos_hard_bandwidth")]
+    qos_peak_duration_ms: Option<u64>,
+
+    /// Hard source-read burst/request cap in bytes; requires `--qos-bandwidth`.
+    #[arg(long, requires = "qos_bandwidth")]
+    qos_burst_bytes: Option<u64>,
+
+    /// Hard source-side protocol operation limit in operations per second.
+    #[arg(long)]
+    qos_iops: Option<u32>,
+
+    /// Hard source-side peak IOPS; requires the sustained `--qos-iops` rate.
+    #[arg(long, requires = "qos_iops")]
+    qos_hard_iops: Option<u32>,
+
+    /// Duration that a full soft-IOPS credit bucket may sustain the hard peak.
+    #[arg(long, requires = "qos_hard_iops")]
+    qos_iops_peak_duration_ms: Option<u64>,
 }
 
-fn mtimes_match(source: &EntryEnum, destination: &EntryEnum) -> bool {
-    if matches!(destination, EntryEnum::S3(_)) {
-        true
-    } else if matches!(source, EntryEnum::HDFS(_)) || matches!(destination, EntryEnum::HDFS(_)) {
-        source.get_mtime().div_euclid(1_000_000) == destination.get_mtime().div_euclid(1_000_000)
-    } else {
-        source.get_mtime() == destination.get_mtime()
+fn qos_from_args(args: &Args) -> Result<Option<SourceQosGroup>> {
+    if args.qos_bandwidth.is_none() && args.qos_iops.is_none() {
+        return Ok(None);
     }
+    let bandwidth = args
+        .qos_bandwidth
+        .as_deref()
+        .map(|soft| {
+            let soft_rate = parse_bandwidth_string(soft)?;
+            let hard_rate =
+                parse_bandwidth_string(args.qos_hard_bandwidth.as_deref().unwrap_or(soft))?;
+            let peak = if args.qos_hard_bandwidth.is_some() {
+                Duration::from_millis(args.qos_peak_duration_ms.unwrap_or(500))
+            } else {
+                Duration::ZERO
+            };
+            Ok::<_, data_mover::error::StorageError>((soft_rate, hard_rate, peak))
+        })
+        .transpose()?;
+    let iops = args.qos_iops.map(|soft| {
+        (
+            soft,
+            args.qos_hard_iops.unwrap_or(soft),
+            if args.qos_hard_iops.is_some() {
+                Duration::from_millis(args.qos_iops_peak_duration_ms.unwrap_or(500))
+            } else {
+                Duration::ZERO
+            },
+        )
+    });
+    Ok(Some(SourceQosGroup::new(SourceQosPolicy::new(
+        bandwidth,
+        args.qos_burst_bytes.unwrap_or(args.chunk_bytes),
+        iops,
+    )?)))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    let limits = copy_support::limits(args.chunk_bytes)?;
+    let source = connect_with_options(&args.source, false, Some(args.chunk_bytes)).await?;
+    let destination = connect_with_options(&args.destination, true, Some(args.chunk_bytes)).await?;
+    let path = StoragePath::new(&args.path)?;
+    copy_support::create_parent(&destination, &path).await?;
+    let qos = qos_from_args(&args)?;
+    let report_qos = qos.is_some();
+    let mut request = TransferRequest::new(
+        source.clone(),
+        path.clone(),
+        destination.clone(),
+        path.clone(),
+        limits,
+        CancellationToken::new(),
+    );
+    if let Some(qos) = qos {
+        request = request
+            .with_source_qos(qos)
+            .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
+    }
+    let started = Instant::now();
+    let outcome = if args.delete_source {
+        move_file(request).await?
+    } else {
+        transfer(request).await?
+    };
+    let elapsed = started.elapsed().as_secs_f64();
+    let bytes = if args.delete_source {
+        // move_file read back the copy and applied metadata before guarded source removal.
+        outcome.transferred_bytes
+    } else {
+        copy_support::verify(&source, &destination, &path).await?
+    };
+    println!(
+        "copied and verified {bytes} bytes and applicable metadata: {}",
+        args.path
+    );
+    if report_qos {
+        report_stats(outcome.source_qos, elapsed);
+    }
+    Ok(())
+}
+
+fn report_stats(stats: SourceQosStats, elapsed: f64) {
+    let bytes = stats.client_streamed_shaped_bytes;
+    let operations = stats.source_read_operations;
+    println!(
+        "qos_stats\ttotal_bytes={bytes}\ttotal_iops={operations}\telapsed_seconds={elapsed:.6}\tactual_mibps={:.6}\tactual_iops={:.6}",
+        bytes.to_f64().unwrap_or(0.0) / elapsed / 1_048_576.0,
+        operations.to_f64().unwrap_or(0.0) / elapsed
+    );
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
+    use super::Args;
     use clap::Parser;
-
-    use super::{Args, creation_options, mtimes_match};
-
     #[test]
     fn qos_cli_accepts_explicit_bandwidth_burst_and_iops() {
         let args = Args::try_parse_from([
@@ -108,274 +240,4 @@ mod tests {
 
         assert!(error.to_string().contains("--qos-bandwidth"));
     }
-
-    fn hdfs(mtime: i64) -> data_mover::EntryEnum {
-        data_mover::EntryEnum::HDFS(data_mover::HDFSEntry {
-            name: "file".to_string(),
-            relative_path: "file".into(),
-            extension: None,
-            size: 1,
-            mtime,
-            atime: 0,
-            mode: 0o640,
-            owner: "owner".to_string(),
-            group: "group".to_string(),
-            replication: Some(1),
-            block_size: Some(1),
-            is_dir: false,
-        })
-    }
-
-    #[test]
-    fn hdfs_mtime_comparison_uses_millisecond_precision() {
-        assert!(mtimes_match(
-            &hdfs(1_700_000_000_123_999_999),
-            &hdfs(1_700_000_000_123_000_000)
-        ));
-        assert!(!mtimes_match(
-            &hdfs(1_700_000_000_124_000_000),
-            &hdfs(1_700_000_000_123_000_000)
-        ));
-    }
-
-    #[test]
-    fn s3_destination_mtime_comparison_is_skipped() {
-        let s3 = data_mover::EntryEnum::S3(data_mover::S3Entry {
-            name: "file".to_string(),
-            relative_path: "file".to_string(),
-            extension: None,
-            size: 1,
-            mtime: 1_000_000,
-            tags: None,
-            version_id: None,
-            is_latest: true,
-            is_delete_marker: false,
-            version_count: None,
-            is_dir: false,
-            version_order_inferred: false,
-        });
-
-        assert!(mtimes_match(&hdfs(2_000_000), &s3));
-        assert!(!mtimes_match(&s3, &hdfs(2_000_000)));
-    }
-
-    #[test]
-    fn hdfs_urls_select_explicit_backend_configuration() {
-        assert!(matches!(
-            creation_options("hdfs://user@host:9000/root", true).backend,
-            data_mover::BackendConfig::Hdfs(_)
-        ));
-        assert!(matches!(
-            creation_options("/tmp/local", false).backend,
-            data_mover::BackendConfig::Default
-        ));
-    }
-}
-
-#[derive(Debug, Parser)]
-#[command(about = "Copy one file between two data-mover storage URLs")]
-struct Args {
-    /// Source storage URL.
-    #[arg(long)]
-    source: String,
-
-    /// Destination storage URL.
-    #[arg(long)]
-    destination: String,
-
-    /// Path relative to both storage roots.
-    #[arg(long)]
-    path: String,
-
-    /// Requested transfer chunk size. Backends may negotiate a lower safe value.
-    #[arg(long, default_value_t = 2 * 1024 * 1024)]
-    chunk_bytes: u64,
-
-    /// Delete the source only after destination publish, metadata and integrity succeed.
-    #[arg(long)]
-    delete_source: bool,
-
-    /// Source-side sustained bandwidth limit, for example `8MiB/s`.
-    #[arg(long)]
-    qos_bandwidth: Option<String>,
-
-    /// Hard source-side peak bandwidth; requires `--qos-bandwidth`.
-    #[arg(long, requires = "qos_bandwidth")]
-    qos_hard_bandwidth: Option<String>,
-
-    /// Duration that a full soft-credit bucket may sustain the hard peak.
-    #[arg(long, requires = "qos_hard_bandwidth")]
-    qos_peak_duration_ms: Option<u64>,
-
-    /// Hard source-read burst/request cap in bytes; requires `--qos-bandwidth`.
-    #[arg(long, requires = "qos_bandwidth")]
-    qos_burst_bytes: Option<u64>,
-
-    /// Hard source-side protocol operation limit in operations per second.
-    #[arg(long)]
-    qos_iops: Option<u32>,
-
-    /// Hard source-side peak IOPS; requires the sustained `--qos-iops` rate.
-    #[arg(long, requires = "qos_iops")]
-    qos_hard_iops: Option<u32>,
-
-    /// Duration that a full soft-IOPS credit bucket may sustain the hard peak.
-    #[arg(long, requires = "qos_hard_iops")]
-    qos_iops_peak_duration_ms: Option<u64>,
-}
-
-fn qos_from_args(args: &Args) -> Result<Option<data_mover::QosManager>> {
-    if let (Some(soft_iops), Some(hard_iops)) = (args.qos_iops, args.qos_hard_iops) {
-        let iops_peak =
-            std::time::Duration::from_millis(args.qos_iops_peak_duration_ms.unwrap_or(500));
-        if let Some(soft_bandwidth) = &args.qos_bandwidth {
-            let hard_bandwidth = args.qos_hard_bandwidth.as_deref().unwrap_or(soft_bandwidth);
-            let bandwidth_peak = if args.qos_hard_bandwidth.is_some() {
-                std::time::Duration::from_millis(args.qos_peak_duration_ms.unwrap_or(500))
-            } else {
-                std::time::Duration::ZERO
-            };
-            return Ok(Some(data_mover::QosManager::try_new_with_full_limits(
-                soft_bandwidth,
-                hard_bandwidth,
-                bandwidth_peak,
-                args.qos_burst_bytes.unwrap_or(u64::MAX),
-                Some(soft_iops),
-                Some(hard_iops),
-                iops_peak,
-            )?));
-        }
-        return Ok(Some(data_mover::QosManager::try_new_with_iops_limits(
-            soft_iops, hard_iops, iops_peak,
-        )?));
-    }
-    match (
-        &args.qos_bandwidth,
-        &args.qos_hard_bandwidth,
-        args.qos_burst_bytes,
-        args.qos_iops,
-    ) {
-        (Some(soft), Some(hard), max_io_bytes, iops) => {
-            Ok(Some(data_mover::QosManager::try_new_with_limits(
-                soft,
-                hard,
-                std::time::Duration::from_millis(args.qos_peak_duration_ms.unwrap_or(500)),
-                max_io_bytes.unwrap_or(u64::MAX),
-                iops,
-            )?))
-        }
-        (Some(bandwidth), None, Some(burst_bytes), iops) => Ok(Some(
-            data_mover::QosManager::try_new_with_burst(bandwidth, burst_bytes, iops)?,
-        )),
-        (bandwidth, None, None, iops) if bandwidth.is_some() || iops.is_some() => Ok(Some(
-            data_mover::QosManager::try_new(bandwidth.as_deref(), 1.0, iops)?,
-        )),
-        _ => Ok(None),
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    let qos = qos_from_args(&args)?;
-    let mut source_options = creation_options(&args.source, false);
-    if !args.source.starts_with("hdfs://") {
-        source_options.block_size = Some(args.chunk_bytes);
-    }
-    let mut destination_options = creation_options(&args.destination, true);
-    if !args.destination.starts_with("hdfs://") {
-        destination_options.block_size = Some(args.chunk_bytes);
-    }
-    let source = create_storage(&args.source, source_options).await?;
-    let destination = create_storage(&args.destination, destination_options).await?;
-    let entry = source.get_metadata(Path::new(&args.path)).await?;
-
-    StorageEnum::copy_file(
-        &source,
-        &destination,
-        &entry,
-        data_mover::CopyOptions {
-            qos: qos.clone(),
-            enable_integrity_check: true,
-            is_source_reserved: !args.delete_source,
-            ..Default::default()
-        },
-    )
-    .await?;
-
-    let copied = destination.get_metadata(Path::new(&args.path)).await?;
-    if copied.get_size() != entry.get_size() {
-        return Err(data_mover::error::StorageError::OperationError(format!(
-            "destination size mismatch: expected {}, got {}",
-            entry.get_size(),
-            copied.get_size()
-        )));
-    }
-    if matches!(
-        (&entry, &copied),
-        (
-            EntryEnum::NAS(_) | EntryEnum::S3(_) | EntryEnum::HDFS(_),
-            EntryEnum::NAS(_) | EntryEnum::HDFS(_)
-        )
-    ) && !mtimes_match(&entry, &copied)
-    {
-        return Err(data_mover::error::StorageError::OperationError(format!(
-            "destination mtime mismatch: expected {}, got {}",
-            entry.get_mtime(),
-            copied.get_mtime()
-        )));
-    }
-    if matches!(
-        (&entry, &copied),
-        (
-            EntryEnum::NAS(_) | EntryEnum::HDFS(_),
-            EntryEnum::NAS(_) | EntryEnum::HDFS(_)
-        )
-    ) {
-        if copied.get_mode().map(|mode| mode & 0o7777) != entry.get_mode().map(|mode| mode & 0o7777)
-        {
-            return Err(data_mover::error::StorageError::OperationError(format!(
-                "destination mode mismatch: expected {:?}, got {:?}",
-                entry.get_mode().map(|mode| mode & 0o7777),
-                copied.get_mode().map(|mode| mode & 0o7777)
-            )));
-        }
-        if matches!((&entry, &copied), (EntryEnum::NAS(_), EntryEnum::NAS(_)))
-            && (copied.get_uid() != entry.get_uid() || copied.get_gid() != entry.get_gid())
-        {
-            return Err(data_mover::error::StorageError::OperationError(format!(
-                "destination ownership mismatch: expected {:?}:{:?}, got {:?}:{:?}",
-                entry.get_uid(),
-                entry.get_gid(),
-                copied.get_uid(),
-                copied.get_gid()
-            )));
-        }
-    }
-    if let (EntryEnum::HDFS(source), EntryEnum::HDFS(destination)) = (&entry, &copied)
-        && (source.owner != destination.owner || source.group != destination.group)
-    {
-        return Err(data_mover::error::StorageError::OperationError(format!(
-            "destination HDFS ownership mismatch: expected {}:{}, got {}:{}",
-            source.owner, source.group, destination.owner, destination.group
-        )));
-    }
-
-    println!(
-        "copied and verified {} bytes and applicable metadata: {}",
-        entry.get_size(),
-        args.path
-    );
-    if let Some(qos) = qos {
-        let stats = qos.stats();
-        println!(
-            "qos_stats\ttotal_bytes={}\ttotal_iops={}\telapsed_seconds={:.6}\tactual_mibps={:.6}\tactual_iops={:.6}",
-            stats.total_bytes.load(Ordering::Relaxed),
-            stats.total_iops.load(Ordering::Relaxed),
-            stats.start_time.elapsed().as_secs_f64(),
-            stats.actual_bandwidth_mibps(),
-            stats.actual_iops(),
-        );
-    }
-    Ok(())
 }

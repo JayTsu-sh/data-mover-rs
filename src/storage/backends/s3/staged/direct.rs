@@ -225,6 +225,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
         input: ByteStream,
     ) -> Result<WriteEvidence, StorageRoleFailure> {
         let target = PartTarget {
+            stage: None,
             path,
             key: path.as_str(),
             upload_id,

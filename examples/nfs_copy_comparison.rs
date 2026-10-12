@@ -1,20 +1,18 @@
-use std::path::Path;
+use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use data_mover::model::StoragePath;
-use data_mover::storage::{BackendConfig, NfsBackendConfig, connect_backend};
+use data_mover::storage::{
+    BackendConfig, DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest, NfsBackendConfig,
+    connect_backend, delete_tree,
+};
 use data_mover::transfer::TransferPolicy;
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
-use data_mover::{
-    CopyOptions, CreateStorageOptions, StorageEnum, TransferConcurrency, create_storage,
-};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Implementation {
-    /// The pre-architecture NFS path routed through `StorageEnum`.
-    Legacy,
     /// The role-based NFS backend routed through the unified transfer lifecycle.
     Optimized,
 }
@@ -26,7 +24,7 @@ enum TransferMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(about = "Compare legacy and role-based NFS-to-NFS copy implementations")]
+#[command(about = "Measure role-based NFS-to-NFS transfer policies")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -35,7 +33,7 @@ struct Args {
 #[derive(Debug, Subcommand)]
 enum Command {
     Copy {
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, default_value_t = Implementation::Optimized)]
         implementation: Implementation,
         #[arg(long)]
         source: String,
@@ -67,47 +65,6 @@ struct CopyArgs {
     read_inflight: usize,
     write_inflight: usize,
     transfer_policy: TransferMode,
-}
-
-fn legacy_options(
-    args: &CopyArgs,
-    ensure_dir: bool,
-) -> Result<CreateStorageOptions, Box<dyn std::error::Error>> {
-    Ok(CreateStorageOptions::new(
-        Some(u64::try_from(args.chunk_bytes)?),
-        ensure_dir,
-    ))
-}
-
-async fn legacy_copy(args: &CopyArgs) -> Result<(u64, u128), Box<dyn std::error::Error>> {
-    let source = create_storage(&args.source, legacy_options(args, false)?)
-        .await?
-        .with_transfer_concurrency(TransferConcurrency::new(
-            args.read_inflight,
-            args.write_inflight,
-        )?);
-    let destination = create_storage(&args.destination, legacy_options(args, true)?)
-        .await?
-        .with_transfer_concurrency(TransferConcurrency::new(
-            args.read_inflight,
-            args.write_inflight,
-        )?);
-
-    let started = Instant::now();
-    let entry = source.get_metadata(Path::new(&args.path)).await?;
-    let bytes = entry.get_size();
-    StorageEnum::copy_file(
-        &source,
-        &destination,
-        &entry,
-        CopyOptions {
-            enable_integrity_check: true,
-            is_source_reserved: true,
-            ..Default::default()
-        },
-    )
-    .await?;
-    Ok((bytes, started.elapsed().as_nanos()))
 }
 
 async fn optimized_copy(args: &CopyArgs) -> Result<(u64, u128), Box<dyn std::error::Error>> {
@@ -153,11 +110,32 @@ async fn optimized_copy(args: &CopyArgs) -> Result<(u64, u128), Box<dyn std::err
 }
 
 async fn cleanup(url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let storage = create_storage(url, CreateStorageOptions::new(None, true)).await?;
-    let StorageEnum::NFS(storage) = storage else {
-        return Err("cleanup URL did not create an NFS storage".into());
-    };
-    storage.delete_dir_all(None).await?;
+    let storage = connect_backend(BackendConfig::Nfs(NfsBackendConfig {
+        url: url.to_owned(),
+        block_size: None,
+        ensure_dir: false,
+    }))
+    .await?;
+    let slots = NonZeroUsize::new(4).ok_or("nonzero")?;
+    let mut session = delete_tree(
+        &storage,
+        DeleteTreeRequest {
+            root: StoragePath::root(),
+            delete_root: false,
+            max_inflight_operations: slots,
+            max_buffered_items: slots,
+            cancel: CancellationToken::new(),
+        },
+    )?;
+    let mut failures = 0;
+    while let Some(item) = session.next_item().await {
+        if matches!(item, DeleteTreeItem::EntryFailure(_)) {
+            failures += 1;
+        }
+    }
+    if !matches!(session.finish().await?, DeleteTreeOutcome::Completed(_)) || failures != 0 {
+        return Err("cleanup did not complete without failures".into());
+    }
     Ok(())
 }
 
@@ -187,7 +165,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 transfer_policy,
             };
             let (bytes, elapsed_ns) = match implementation {
-                Implementation::Legacy => legacy_copy(&args).await?,
                 Implementation::Optimized => optimized_copy(&args).await?,
             };
             println!("bytes={bytes}\telapsed_ns={elapsed_ns}");

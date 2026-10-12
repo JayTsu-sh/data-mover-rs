@@ -27,6 +27,13 @@ impl HdfsMetadata {
 
 #[async_trait]
 impl Metadata for HdfsMetadata {
+    async fn permissions(
+        &self,
+        described: &crate::storage::SourceDescriptor,
+    ) -> Result<crate::storage::PermissionFacts, StorageRoleFailure> {
+        super::source::permissions(described)
+            .ok_or_else(|| failure(&described.path, FailureClass::Protocol))
+    }
     fn copied_metadata_observation_plan(&self) -> Option<ObservationPlan> {
         Some(ObservationPlan::default().with_timestamps(ObservationMode::Required))
     }

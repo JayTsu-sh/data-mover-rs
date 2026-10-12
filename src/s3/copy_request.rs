@@ -4,7 +4,7 @@
 //! servers refuse that with `411 MissingContentLength`: ONTAP 9.19.1 on `CopyObject`, Ceph RGW
 //! (DXN) on `UploadPartCopy`. RFC 9110 has a client send `Content-Length: 0` on a `PUT` without
 //! a body anyway; `MinIO`, `RustFS`, DXN and ONTAP accept it on both requests (curl, 2026-09-26;
-//! AWS was not retested, `StorageGRID` not tested), so every profile — legacy and role-based —
+//! AWS was not retested, `StorageGRID` not tested), so every profile
 //! sends it on every copy request.
 
 use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
@@ -29,14 +29,14 @@ mod tests {
     use aws_smithy_types::body::SdkBody;
     use aws_types::region::Region;
 
-    use super::super::{DEFAULT_BLOCK_SIZE, DEFAULT_TRANSFER_CONCURRENCY, S3Storage, S3UrlOptions};
+    use super::super::{S3Storage, S3UrlOptions};
     use crate::AssertTestValue;
     use crate::storage::backends::s3::S3VersioningAtConnect;
 
     /// Each request as (method, uri, `Content-Length`, has `x-amz-copy-source`).
     type Seen = Arc<Mutex<Vec<(String, String, Option<String>, bool)>>>;
 
-    /// Answers the requests of a legacy copy (`HEAD`, `CreateMultipartUpload`, `UploadPartCopy`,
+    /// Answers the requests of a namespace rename (`HEAD`, `CreateMultipartUpload`, `UploadPartCopy`,
     /// `CompleteMultipartUpload`, `CopyObject`) and records each one.
     #[derive(Clone, Debug, Default)]
     struct Recorder {
@@ -58,6 +58,7 @@ mod tests {
                 ));
             let body = match (method.as_str(), uri.contains("uploadId")) {
                 ("HEAD", _) => "",
+                ("GET", _) => "<Tagging><TagSet/></Tagging>",
                 ("POST", false) => {
                     "<InitiateMultipartUploadResult><UploadId>u</UploadId></InitiateMultipartUploadResult>"
                 }
@@ -72,6 +73,7 @@ mod tests {
                     let mut response = HttpResponse::new(status, SdkBody::from(body));
                     if method == "HEAD" {
                         response.headers_mut().insert("content-length", "6291456");
+                        response.headers_mut().insert("etag", "\"source\"");
                     }
                     response
                 })
@@ -98,29 +100,35 @@ mod tests {
             bucket_name: "bucket".into(),
             prefix: None,
             client: aws_sdk_s3::Client::from_conf(config),
-            block_size: DEFAULT_BLOCK_SIZE,
-            transfer_concurrency: DEFAULT_TRANSFER_CONCURRENCY,
             is_bucket_versioned: false,
             versioning_suspended: false,
             versioning_at_connect: S3VersioningAtConnect::Never,
         }
     }
 
-    /// The legacy `CopyObject` (rename, `storage_copy_pipeline`) and every legacy
-    /// `UploadPartCopy` (multipart rename) state `Content-Length: 0`: ONTAP answers a
-    /// `CopyObject` without it, and DXN an `UploadPartCopy` without it, with 411.
+    /// Namespace rename preserves the empty-body protocol workaround on both copy forms.
     #[tokio::test]
-    async fn legacy_copies_state_their_empty_body() {
+    async fn namespace_copies_state_their_empty_body() {
         let recorder = Recorder::default();
         let storage = storage(recorder.clone());
-        storage
-            .copy_object("bucket", "from", "bucket", "to")
-            .await
-            .assert_value("legacy CopyObject");
-        storage
-            .multipart_copy_object("from", "to", 6 * 1024 * 1024, 5 * 1024 * 1024, None)
-            .await
-            .assert_value("legacy multipart copy");
+        super::super::role_protocol::rename::rename_with_limits(
+            &storage,
+            "from",
+            "to",
+            8 * 1024 * 1024,
+            5 * 1024 * 1024,
+        )
+        .await
+        .assert_value("single-copy rename");
+        super::super::role_protocol::rename::rename_with_limits(
+            &storage,
+            "from",
+            "to",
+            5 * 1024 * 1024,
+            5 * 1024 * 1024,
+        )
+        .await
+        .assert_value("multipart rename");
         let seen = recorder
             .seen
             .lock()

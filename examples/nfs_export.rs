@@ -9,15 +9,15 @@
 
 use std::env;
 
+use data_mover::Result;
 use data_mover::error::StorageError;
-use data_mover::{NFSStorage, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let target = env::args().nth(1).ok_or_else(|| {
         StorageError::ConfigError("usage: nfs_export <host | nfs://host/...?options>".to_string())
     })?;
-    let entries = NFSStorage::list_exports(&target).await?;
+    let entries = data_mover::nfs::list_exports(&target).await?;
     for entry in entries {
         println!("{entry:?}");
     }

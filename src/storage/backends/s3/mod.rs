@@ -8,6 +8,7 @@ mod history;
 mod listing;
 mod metadata;
 mod namespace;
+mod namespace_cleanup;
 mod native;
 mod paging;
 mod protocol;
@@ -34,7 +35,8 @@ pub(crate) use capabilities::S3BucketCapabilities;
 pub(crate) use metadata::S3TagSupport;
 pub(crate) use native::S3NativeContext;
 pub(crate) use same_object::{S3ObjectChange, S3SeenObject, object_change};
-pub(crate) use staged::DEFAULT_SINGLE_PUT_THRESHOLD;
+#[cfg(test)]
+use staged::DEFAULT_SINGLE_PUT_THRESHOLD;
 pub(crate) use staged::single_put_threshold;
 
 #[cfg(test)]

@@ -8,6 +8,16 @@ repeats="${LOCAL_COPY_PERF_REPEATS:-3}"
 selected_payloads="${LOCAL_COPY_PERF_PAYLOADS:-4KiB,4MiB,40MiB,1GiB}"
 max_regression_percent="${LOCAL_COPY_PERF_MAX_REGRESSION_PERCENT:-}"
 max_fixed_overhead_ms="${LOCAL_COPY_PERF_MAX_FIXED_OVERHEAD_MS:-5}"
+# Optional immutable historical executable; the current library has one transfer path.
+baseline_binary="${LOCAL_COPY_PERF_BASELINE_BIN:-}"
+if [[ -n "$baseline_binary" && ! -x "$baseline_binary" ]]; then
+  echo "LOCAL_COPY_PERF_BASELINE_BIN must name an executable historical benchmark" >&2
+  exit 2
+fi
+if [[ -n "$max_regression_percent" && -z "$baseline_binary" ]]; then
+  echo "a regression limit requires LOCAL_COPY_PERF_BASELINE_BIN" >&2
+  exit 2
+fi
 validate_run_id "$run_id"
 [[ "$repeats" =~ ^[1-9][0-9]*$ ]] || {
   echo "LOCAL_COPY_PERF_REPEATS must be a positive integer" >&2
@@ -77,6 +87,8 @@ printf '%s\n' \
 
 run_case() {
   local implementation="$1" label="$2" size="$3" repeat="$4"
+  local executable="$binary"
+  if [[ "$implementation" != optimized ]]; then executable="$baseline_binary"; fi
   local destination="$destination_root/$implementation-$label-$repeat"
   local metrics log elapsed_ns elapsed_ms throughput user system rss cpu
   metrics="$(mktemp)"
@@ -84,7 +96,7 @@ run_case() {
   mkdir -p "$destination"
 
   if ! /usr/bin/time -o "$metrics" -f '%U,%S,%M,%P' \
-    "$binary" --implementation "$implementation" \
+    "$executable" --implementation "$implementation" \
       --source "$source_root" --destination "$destination" --path "$label.bin" \
       --chunk-bytes "$chunk_bytes" --read-inflight "$read_inflight" \
       --write-inflight "$write_inflight" > "$log" 2>&1; then
@@ -126,11 +138,14 @@ run_case() {
 
 for index in "${!sizes[@]}"; do
   for ((repeat = 1; repeat <= repeats; repeat++)); do
-    case $((repeat % 3)) in
-      1) implementations=(legacy legacy-durable optimized) ;;
-      2) implementations=(legacy-durable optimized legacy) ;;
-      0) implementations=(optimized legacy legacy-durable) ;;
-    esac
+    implementations=(optimized)
+    if [[ -n "$baseline_binary" ]]; then
+      case $((repeat % 3)) in
+        1) implementations=(legacy legacy-durable optimized) ;;
+        2) implementations=(legacy-durable optimized legacy) ;;
+        0) implementations=(optimized legacy legacy-durable) ;;
+      esac
+    fi
     for implementation in "${implementations[@]}"; do
       run_case "$implementation" "${labels[$index]}" "${sizes[$index]}" "$repeat"
     done
@@ -149,6 +164,16 @@ payloads = sys.argv[2].split(",")
 maximum_regression = float(sys.argv[3]) if sys.argv[3] else None
 maximum_fixed_overhead = float(sys.argv[4])
 regressions = []
+
+if not any(row["implementation"] == "legacy" for row in rows):
+    print("payload,optimized_median_ms (no historical baseline supplied)")
+    for payload in payloads:
+        samples = [float(row["elapsed_ms"]) for row in rows
+                   if row["payload"] == payload and row["implementation"] == "optimized"]
+        if not samples:
+            raise SystemExit(f"missing optimized samples for {payload}")
+        print(f"{payload},{statistics.median(samples):.3f}")
+    raise SystemExit(0)
 
 print(
     "payload,legacy_median_ms,legacy_durable_median_ms,optimized_median_ms,"

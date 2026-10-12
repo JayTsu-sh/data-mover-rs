@@ -1,8 +1,11 @@
 # data-mover-rs
 
 Storage abstraction layer supporting Local, NFS, S3, HDFS, and SMB/CIFS backends.
-SMB/CIFS is available only through the role-based `storage::connect_backend` API;
-it has no `StorageEnum` variant and no URL form.
+All backends use `storage::connect_backend` and typed storage roles.
+SMB/CIFS uses explicit configuration and has no URL form.
+
+For replacements for the removed legacy APIs, see the
+[migration inventory](docs/design/legacy-api-removal.md).
 
 ## Storage URL Formats
 
@@ -67,9 +70,8 @@ Use `DATA_MOVER_<BACKEND>_READ_INFLIGHT` or
 `DATA_MOVER_<BACKEND>_WRITE_INFLIGHT` for a backend-specific override, where
 `<BACKEND>` is `LOCAL`, `NFS`, `CIFS`, or `S3`. Each direction is resolved
 independently: backend-specific direction, global direction, shared
-`DATA_MOVER_INFLIGHT`, then protocol default. The Rust API can override the resolved pair with
-`TransferConcurrency` and `StorageEnum::with_transfer_concurrency` (or the
-corresponding concrete-adapter builder).
+`DATA_MOVER_INFLIGHT`, then protocol default. Use `TransferConcurrency::from_env`
+to resolve the pair, then apply it to backend configuration and transfer `InflightLimits`.
 
 The upper bound is intentional: lab measurements across the complete Local,
 NFSv3, NFSv4.1, and S3 copy matrix showed that increasing inflight from 8 to 16

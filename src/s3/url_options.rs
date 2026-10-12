@@ -1,7 +1,6 @@
 //! The one reader of an S3 URL's credentials, scheme and options, shared by every path that takes
-//! an S3 URL: the legacy `StorageEnum` (`S3Storage::new`), the role-based
-//! `storage::connect_backend`, `storage::endpoint_identity` (before connecting) and the bucket-less
-//! endpoint URL of `S3Storage::list_buckets`.
+//! an S3 URL: `storage::connect_backend`, `storage::endpoint_identity` (before connecting) and the bucket-less
+//! endpoint URL of `crate::s3::list_buckets`.
 //!
 //! ```text
 //! s3://AK:SK@bucket.host[:port][/prefix][?options]         HTTP

@@ -4,6 +4,52 @@
 //! half is dead code in that binary by construction.
 #![allow(dead_code)]
 
+use std::num::NonZeroUsize;
+use std::path::Path;
+
+use data_mover::model::{EntryKind, ObservedEntry, StoragePath};
+use data_mover::storage::{
+    BackendConfig, BackendConnectError, LocalBackendConfig, PreflightPolicy, Storage,
+    connect_backend,
+};
+
+/// Connects a LOCAL endpoint through the role factory with symmetric read/write concurrency.
+pub(crate) async fn connect_local(
+    root: &Path,
+    concurrency: usize,
+) -> Result<Storage, BackendConnectError> {
+    let concurrency = NonZeroUsize::new(concurrency).unwrap_or(NonZeroUsize::MIN);
+    connect_backend(BackendConfig::Local(LocalBackendConfig {
+        root: root.to_path_buf(),
+        read_concurrency: concurrency,
+        write_concurrency: concurrency,
+    }))
+    .await
+}
+
+/// Describes one file and builds the neutral observation required by expert sessions.
+pub(crate) async fn observe_file(
+    storage: &Storage,
+    path: &str,
+) -> Result<ObservedEntry, Box<dyn std::error::Error + Send + Sync>> {
+    let path = StoragePath::new(path)?;
+    let source = storage.read_source(&PreflightPolicy::production())?;
+    let descriptor = source.describe(&path).await?;
+    if descriptor.kind != EntryKind::File {
+        return Err(format!("{} is not a file", descriptor.path.as_str()).into());
+    }
+    let modified = descriptor
+        .inline_timestamps()
+        .and_then(|timestamps| timestamps.modified);
+    Ok(ObservedEntry::new(
+        descriptor.path,
+        descriptor.kind,
+        descriptor.size,
+        modified,
+        descriptor.source_identity,
+    )?)
+}
+
 /// Turns on protocol tracing for a real-server test when `RUST_LOG` asks for it.
 ///
 /// These tests talk to a live server, so the only record of what the wire actually carried is

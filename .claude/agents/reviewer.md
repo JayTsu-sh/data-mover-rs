@@ -28,7 +28,7 @@ tools: [Read, Grep, Glob, Bash]
 
 ### 一致性 (HIGH)
 
-- [ ] 改 `StorageEnum` 操作 → 5 处同步 (D1)
+- [ ] 修改 role 操作 → 契约、后端能力声明及对应行为测试保持一致
 - [ ] 改 retry 决策 → `.claude/docs/error-taxonomy.md` 同步更新
 - [ ] 改 filter `should_skip` → `.claude/docs/filter-dsl.md` 同步 (F1)
 - [ ] 时间转换走 `time_util.rs`，没散写 (R9)

@@ -324,6 +324,14 @@ pub(crate) trait S3Protocol: Send + Sync {
     }
     /// What the bucket can do, from the URL's profile (P7 §14.2); fixed for the connection.
     fn bucket_capabilities(&self) -> S3BucketCapabilities;
+    /// Checks bucket access independently of whether the configured prefix contains objects.
+    async fn head_bucket(&self) -> S3Result<()> {
+        Err(S3ProtocolFailure::entry(
+            FailureClass::Unsupported,
+            Transience::Permanent,
+            "bucket connectivity probe is unsupported by this protocol",
+        ))
+    }
     async fn head(&self, key: &str) -> S3Result<S3ObjectFacts>;
     /// HEAD one stored version. A delete marker, or a version the store does not have, is a
     /// `NotFound` entry failure — a per-entry outcome, never a session failure.
@@ -411,8 +419,30 @@ pub(crate) trait S3Protocol: Send + Sync {
         range: Range<u64>,
     ) -> S3Result<String>;
     /// An unversioned `DeleteObject`: in a versioned bucket it adds a delete marker and keeps every
-    /// version. Never sent to a final key (ADR-0006 C17); only the `.upload` pointer is deleted so.
+    /// version. Transfer recovery uses it only for pointers; namespace deletion also uses it for
+    /// final keys explicitly selected by the caller.
     async fn delete_object(&self, key: &str) -> S3Result<()>;
+    /// Deletes at most 100 current keys; result order matches input. History remains intact.
+    async fn delete_objects(&self, keys: &[String]) -> Vec<S3Result<()>> {
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.delete_object(key).await);
+        }
+        results
+    }
+    fn namespace_rename_support(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
+    /// Renames one current object using server-side copy, preserving its metadata and tags.
+    /// A failed copy preserves the source; source deletion failure leaves both keys.
+    async fn rename_object(&self, _from: &str, _to: &str) -> S3Result<()> {
+        Err(S3ProtocolFailure::entry(
+            FailureClass::Unsupported,
+            Transience::Permanent,
+            "object rename is unsupported by this protocol",
+        ))
+    }
+
     /// Deletes one stored version (or delete marker) of `key` for good, adding no delete marker.
     /// A version the store does not hold is not an error (S3 answers 204). A version Object Lock
     /// protects is a permanent `PermissionDenied` entry failure (AWS answers 403 `AccessDenied`,
@@ -422,7 +452,7 @@ pub(crate) trait S3Protocol: Send + Sync {
     /// written only while the bucket keeps every record).
     async fn bucket_versioning(&self) -> S3Result<S3BucketVersioning>;
     /// An unversioned `DeleteObject` of `key` sent on purpose to write a delete marker on a final
-    /// key (P7 H1, the only such request), with what the reply names.
+    /// key (P7 H1), with what the reply names.
     async fn write_delete_marker(&self, key: &str) -> S3Result<S3DeleteReply>;
     /// Every stored version and delete marker of exactly `key` — not of keys that merely start
     /// with it — in no guaranteed order: `is_latest` marks the current entry. An unversioned

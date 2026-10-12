@@ -11,3 +11,22 @@ pub fn config() -> data_mover::HdfsConfig {
         ..Default::default()
     }
 }
+
+/// Joins a probe's relative path beneath its explicitly configured native HDFS root.
+pub fn resolve(
+    location: &data_mover::hdfs::HdfsLocation,
+    relative: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let value = relative.to_str().ok_or("HDFS path must be UTF-8")?;
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        return Err("HDFS probe path must remain below its configured root".into());
+    }
+    Ok(format!(
+        "{}/{}",
+        location.root().trim_end_matches('/'),
+        value
+    ))
+}

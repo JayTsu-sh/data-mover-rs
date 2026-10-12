@@ -1,8 +1,7 @@
 //! The NFS role's rename (`Namespace::rename`, `Staged` publish / pointer rename).
 //!
-//! The legacy `NFSStorage::rename` stays for legacy callers. The role does not use it: it wrapped
-//! every nfs-rs error into a string, so a refused RENAME or parent LOOKUP (`ACCES` / `PERM` /
-//! `ROFS`, `XDEV`, `NOTEMPTY`, `EXIST`…) reached the role as `Protocol` / Unknown (retryable).
+//! Each RPC keeps the server error classification, including permission, cross-device and
+//! non-empty-directory failures.
 //!
 //! - The missing levels of the destination's parent are created first
 //!   ([`NFSStorage::role_create_all`], `src/nfs/role_create.rs`).

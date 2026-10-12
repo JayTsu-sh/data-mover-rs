@@ -10,9 +10,8 @@
 //!   answers `STATUS_OBJECT_NAME_COLLISION` (`Conflict`), while the NFS adapter's
 //!   `create_directory` looks the name up after `EXIST` and answers success for a directory.
 //!   Both are treated as "this level exists now", and so is a refusal once a `stat` shows a
-//!   directory (below). Every backend's `create_directory` creates one level (NFS since it
-//!   stopped forwarding to the recursive legacy `NFSStorage::create_dir_all`, which legacy
-//!   callers keep), so this helper drives every level on every backend.
+//!   directory (below). Every backend's `create_directory` creates one level, so this helper
+//!   drives every level on every backend.
 //! - **Only the leaf is verified on conflict.** A conflict costs one extra `stat` at the leaf
 //!   to prove the existing entry is a directory rather than a file. Intermediate levels skip
 //!   that check on CIFS and HDFS, where a file in the way makes the level below it fail, so
@@ -112,7 +111,8 @@ pub async fn create_directory_all(
     storage: &Storage,
     path: &StoragePath,
 ) -> Result<(), CreateDirectoryAllFailure> {
-    let namespace = storage.mutable_namespace(&PreflightPolicy::production())?;
+    let namespace =
+        storage.mutable_namespace(&PreflightPolicy::production(), |caps| caps.create_directory)?;
     create_directory_all_with_namespace(namespace.as_ref(), path).await
 }
 

@@ -1,30 +1,29 @@
+//! Optional HDFS contracts exercised through the storage roles and transfer engine.
+//! Raw HDFS protocol calls seed/read fixtures only; focused backend contracts live in
+//! `hdfs_native_contract`.
 use std::collections::BTreeSet;
 use std::env;
 use std::num::NonZeroUsize;
-use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use data_mover::model::{EntryOperationFailure, FailureClass, Operation, StoragePath, Transience};
 use data_mover::storage::{
-    ByteStream, DestinationPrepareRequest, FinalDestination, PreflightPolicy, PrepareFact,
-    PrepareRequest, PreparedStage, PublishRequest, ResumeMode, SourceDescriptor, StagedDestination,
-    Storage, StorageRoleFailure, VerifyRequest,
+    BackendConfig, ByteStream, DestinationPrepareRequest, FinalDestination, HdfsBackendConfig,
+    PreflightPolicy, PrepareFact, PrepareRequest, PublishRequest, ResumeMode, SourceDescriptor,
+    Storage, StorageRoleFailure, VerifyRequest, connect_backend,
 };
 use data_mover::transfer::{InflightLimits, TransferIdentity, TransferRequest, transfer};
 use data_mover::traversal::{
     Checkpoint, Resumable, StorageTraversalSource, TraversalItem, TraversalOrder, TraversalOutcome,
     TraversalRequest, TraversalSource as _,
 };
-use data_mover::{
-    DataChunk, HDFSStorage, HdfsConfig, HdfsKerberosCredentials, HdfsLocation, TransferConcurrency,
-    create_hdfs_storage,
-};
-use hdfs_native::WriteOptions;
+use data_mover::{HdfsConfig, HdfsKerberosCredentials, HdfsLocation, build_hdfs_client};
+use hdfs_native::{Client, WriteOptions};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+mod common;
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn lab_config() -> HdfsConfig {
@@ -47,26 +46,61 @@ fn lab_location(case: &str) -> TestResult<String> {
         .strip_prefix("hdfs://")
         .ok_or("invalid endpoint")?;
     let user = utf8_percent_encode(root.user(), NON_ALPHANUMERIC);
-    Ok(format!("hdfs://{user}@{endpoint}{}/{case}", root.root()))
+    let run = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    Ok(format!(
+        "hdfs://{user}@{endpoint}{}/{case}-{run}",
+        root.root()
+    ))
 }
 
-async fn create_file(storage: &HDFSStorage, path: &str, data: Bytes) -> TestResult {
-    let path = storage.resolve_path(Path::new(path))?;
-    let mut writer = storage
-        .client()
-        .create(&path, WriteOptions::default().overwrite(true))
+async fn connect_hdfs(location: &str) -> TestResult<Storage> {
+    Ok(connect_backend(BackendConfig::Hdfs(HdfsBackendConfig {
+        location: location.to_owned(),
+        client: lab_config(),
+        block_size: None,
+        ensure_dir: true,
+    }))
+    .await?)
+}
+
+fn raw_client(location: &str) -> TestResult<(Client, HdfsLocation)> {
+    Ok(build_hdfs_client(location, &lab_config())?)
+}
+
+async fn create_file(client: &Client, root: &HdfsLocation, path: &str, data: Bytes) -> TestResult {
+    let full_path = format!("{}/{path}", root.root().trim_end_matches('/'));
+    let mut writer = client
+        .create(
+            &full_path,
+            WriteOptions::default().overwrite(true).create_parent(true),
+        )
         .await?;
     Box::pin(writer.write_bytes(data)).await?;
     Box::pin(writer.close()).await?;
     Ok(())
 }
 
+async fn read_file(client: &Client, root: &HdfsLocation, path: &str) -> TestResult<Bytes> {
+    let full_path = format!("/{}/{}", root.root().trim_matches('/'), path);
+    let size = client.get_file_info(&full_path).await?.length;
+    Ok(client.read(&full_path).await?.read_range(0, size).await?)
+}
+
+async fn cleanup(storage: &Storage) -> TestResult {
+    storage
+        .namespace(&PreflightPolicy::production())?
+        .delete_subtree(&StoragePath::root(), true)
+        .await?;
+    Ok(())
+}
+
 async fn observes_nested_source(storage: &Storage) -> TestResult<bool> {
     let traversal = StorageTraversalSource::new(storage)?;
+    let slots = NonZeroUsize::new(2).ok_or("invalid inflight")?;
     let mut session = traversal.traverse(
         TraversalRequest::new(StoragePath::root())
-            .max_inflight_operations(NonZeroUsize::new(2).ok_or("invalid inflight")?)
-            .max_buffered_items(NonZeroUsize::new(2).ok_or("invalid buffer")?)
+            .max_inflight_operations(slots)
+            .max_buffered_items(slots)
             .cancel(CancellationToken::new()),
     );
     let mut observed = false;
@@ -79,17 +113,35 @@ async fn observes_nested_source(storage: &Storage) -> TestResult<bool> {
     Ok(observed)
 }
 
-async fn transfer_and_assert(
-    source: Storage,
-    destination: Storage,
-    destination_backend: &HDFSStorage,
-    payload: &Bytes,
-) -> TestResult {
+#[tokio::test]
+#[ignore = "requires the nightly lab HDFS cluster"]
+async fn architecture_roles_traverse_stream_verify_and_overwrite() -> TestResult {
+    let source_location = lab_location("architecture-source")?;
+    let destination_location = lab_location("architecture-destination")?;
+    let source = connect_hdfs(&source_location).await?;
+    let destination = connect_hdfs(&destination_location).await?;
+    let (source_client, source_root) = raw_client(&source_location)?;
+    let (destination_client, destination_root) = raw_client(&destination_location)?;
+    let payload = Bytes::from(vec![0x5a; 1024 * 1024 + 31]);
+    create_file(
+        &source_client,
+        &source_root,
+        "nested/source.bin",
+        payload.clone(),
+    )
+    .await?;
+    create_file(
+        &destination_client,
+        &destination_root,
+        "published/final.bin",
+        Bytes::from_static(b"old"),
+    )
+    .await?;
     let outcome = transfer(
         TransferRequest::new(
-            source,
+            source.clone(),
             StoragePath::new("nested/source.bin")?,
-            destination,
+            destination.clone(),
             StoragePath::new("published/final.bin")?,
             InflightLimits::new(2, 128 * 1024, 2)?,
             CancellationToken::new(),
@@ -97,16 +149,52 @@ async fn transfer_and_assert(
         .with_identity_override(TransferIdentity::from_label("hdfs-architecture-contract")?),
     )
     .await?;
-    assert_eq!(outcome.blake3, Some(*blake3::hash(payload).as_bytes()));
-    let published = destination_backend
-        .open_file(Path::new("published/final.bin"))
-        .await?;
+    assert_eq!(outcome.blake3, Some(*blake3::hash(&payload).as_bytes()));
+    assert!(observes_nested_source(&source).await?);
     assert_eq!(
-        destination_backend
-            .read_at(&published, 0, payload.len() as u64)
-            .await?,
-        *payload
+        read_file(
+            &destination_client,
+            &destination_root,
+            "published/final.bin"
+        )
+        .await?,
+        payload
     );
+    cleanup(&source).await?;
+    cleanup(&destination).await?;
+    Ok(())
+}
+
+/// The old public chunk callback allowed arbitrary offsets. The replacement contract exercises
+/// exact multi-block content through bounded role transfer at the native writer boundary; the
+/// staged HDFS writer's out-of-order completion logic is covered by its focused unit tests.
+#[tokio::test]
+#[ignore = "requires the nightly lab HDFS cluster"]
+async fn native_writer_crosses_block_boundary_through_bounded_transfer() -> TestResult {
+    let source_location = lab_location("architecture-writer-source")?;
+    let destination_location = lab_location("architecture-writer-destination")?;
+    let source = connect_hdfs(&source_location).await?;
+    let destination = connect_hdfs(&destination_location).await?;
+    let (source_client, source_root) = raw_client(&source_location)?;
+    let (destination_client, destination_root) = raw_client(&destination_location)?;
+    let payload = Bytes::from(vec![0x3c; 3 * 1024 * 1024 + 257]);
+    create_file(&source_client, &source_root, "source.bin", payload.clone()).await?;
+    let outcome = transfer(TransferRequest::new(
+        source.clone(),
+        StoragePath::new("source.bin")?,
+        destination.clone(),
+        StoragePath::new("reordered.bin")?,
+        InflightLimits::new(2, 1024 * 1024, 3)?,
+        CancellationToken::new(),
+    ))
+    .await?;
+    assert_eq!(outcome.blake3, Some(*blake3::hash(&payload).as_bytes()));
+    assert_eq!(
+        read_file(&destination_client, &destination_root, "reordered.bin").await?,
+        payload
+    );
+    cleanup(&source).await?;
+    cleanup(&destination).await?;
     Ok(())
 }
 
@@ -124,100 +212,6 @@ fn interrupted_input(prefix: Bytes) -> TestResult<ByteStream> {
     ])))
 }
 
-#[tokio::test]
-#[ignore = "requires the nightly lab HDFS cluster"]
-async fn architecture_roles_traverse_stream_verify_and_overwrite() -> TestResult {
-    let source = create_hdfs_storage(
-        &lab_location("architecture-source")?,
-        &lab_config(),
-        None,
-        true,
-    )
-    .await?;
-    let destination = create_hdfs_storage(
-        &lab_location("architecture-destination")?,
-        &lab_config(),
-        None,
-        true,
-    )
-    .await?;
-    let payload = Bytes::from(vec![0x5a; 1024 * 1024 + 31]);
-    create_file(&source, "nested/source.bin", payload.clone()).await?;
-    let source_roles = source.architecture_storage()?;
-    let destination_roles = destination.architecture_storage()?;
-    assert!(observes_nested_source(&source_roles).await?);
-    destination
-        .create_dir_all(Path::new("published"), 0o755)
-        .await?;
-    create_file(
-        &destination,
-        "published/final.bin",
-        Bytes::from_static(b"old"),
-    )
-    .await?;
-    transfer_and_assert(source_roles, destination_roles, &destination, &payload).await?;
-    source.delete_storage_root().await?;
-    destination.delete_storage_root().await?;
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires the nightly lab HDFS cluster"]
-async fn native_writer_reorders_bounded_out_of_order_chunks() -> TestResult {
-    let storage = create_hdfs_storage(
-        &lab_location("architecture-reorder")?,
-        &lab_config(),
-        None,
-        true,
-    )
-    .await?
-    .with_transfer_concurrency(TransferConcurrency::new(2, 3)?);
-    let payload = Bytes::from(vec![0x3c; 3 * 1024 * 1024]);
-    let (sender, receiver) = mpsc::channel(3);
-    for (offset, range) in [
-        (1024 * 1024, 1024 * 1024..2 * 1024 * 1024),
-        (0, 0..1024 * 1024),
-        (2 * 1024 * 1024, 2 * 1024 * 1024..3 * 1024 * 1024),
-    ] {
-        sender
-            .send(DataChunk {
-                offset,
-                data: payload.slice(range),
-            })
-            .await?;
-    }
-    drop(sender);
-    storage
-        .write_stream(
-            receiver,
-            Path::new("reordered.bin"),
-            payload.len() as u64,
-            0o640,
-            None,
-        )
-        .await?;
-    let file = storage.open_file(Path::new("reordered.bin")).await?;
-    assert_eq!(
-        storage.read_at(&file, 0, payload.len() as u64).await?,
-        payload
-    );
-    storage.delete_storage_root().await?;
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires the nightly lab HDFS cluster"]
-async fn architecture_stage_recovers_durable_prefix_after_reconnect() -> TestResult {
-    let location = lab_location("architecture-recovery")?;
-    let backend = create_hdfs_storage(&location, &lab_config(), None, true).await?;
-    let payload = Bytes::from(vec![0x6d; 2 * 1024 * 1024]);
-    create_file(&backend, "source.bin", payload.clone()).await?;
-    let descriptor = interrupt_stage(&backend, &payload).await?;
-    drop(backend);
-    resume_tail_and_publish(&location, payload, descriptor).await
-}
-
-/// The at-destination prepare of `final.bin` both connections make: same binding, same transfer.
 fn resume_request(descriptor: &SourceDescriptor) -> TestResult<DestinationPrepareRequest> {
     Ok(DestinationPrepareRequest::new(
         PrepareRequest {
@@ -229,43 +223,18 @@ fn resume_request(descriptor: &SourceDescriptor) -> TestResult<DestinationPrepar
     ))
 }
 
-/// Prepares `final.bin` at the destination, writes the first MiB, fails the input and drops the
-/// stage: what a killed process leaves behind — the stage and its pointer, beside the final file.
-async fn interrupt_stage(backend: &HDFSStorage, payload: &Bytes) -> TestResult<SourceDescriptor> {
-    let storage = backend.architecture_storage()?;
-    let descriptor = storage
-        .read_source(&PreflightPolicy::production())?
-        .describe(&StoragePath::new("source.bin")?)
-        .await?;
-    let staged = storage.staged_destination(&PreflightPolicy::production())?;
-    // A stage an earlier failed run left in this root is cleaned up, not resumed.
-    let stage = staged
-        .prepare_at_destination(resume_request(&descriptor)?.with_resume(ResumeMode::Restart))
-        .await?;
-    assert!(!matches!(stage.prepare_fact(), PrepareFact::Resumed { .. }));
-    assert!(
-        staged
-            .write(&stage, interrupted_input(payload.slice(..1024 * 1024))?)
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        staged.observe_checkpoint(&stage).await?.durable_prefix,
-        1024 * 1024
-    );
-    drop(stage);
-    Ok(descriptor)
-}
-
-/// A fresh connection finds the stage by its deterministic name, resumes it after the first MiB,
-/// writes the tail and publishes; nothing of the stage is left.
-async fn resume_tail_and_publish(
-    location: &str,
-    payload: Bytes,
-    descriptor: SourceDescriptor,
-) -> TestResult {
-    let reconnected = create_hdfs_storage(location, &lab_config(), None, true).await?;
-    let roles = reconnected.architecture_storage()?;
+#[tokio::test]
+#[ignore = "requires the nightly lab HDFS cluster"]
+async fn architecture_stage_recovers_durable_prefix_after_reconnect() -> TestResult {
+    let location = lab_location("architecture-recovery")?;
+    let backend = connect_hdfs(&location).await?;
+    let (client, root) = raw_client(&location)?;
+    let payload = Bytes::from(vec![0x6d; 2 * 1024 * 1024]);
+    create_file(&client, &root, "source.bin", payload.clone()).await?;
+    let descriptor = interrupt_stage(&backend, &payload).await?;
+    drop(backend);
+    let reconnected = connect_hdfs(&location).await?;
+    let roles = reconnected.clone();
     let staged = roles.staged_destination(&PreflightPolicy::production())?;
     let resumed = staged
         .prepare_at_destination(resume_request(&descriptor)?)
@@ -292,69 +261,73 @@ async fn resume_tail_and_publish(
             },
         )
         .await?;
-    publish_recovered(staged.as_ref(), &resumed, payload.len() as u64, digest).await?;
-    let published = reconnected.open_file(Path::new("final.bin")).await?;
-    assert_eq!(
-        reconnected
-            .read_at(&published, 0, payload.len() as u64)
-            .await?,
-        payload
-    );
-    assert_no_artifacts(&reconnected).await?;
-    reconnected.delete_storage_root().await?;
-    Ok(())
-}
-
-/// The raw listing of the storage root shows no transfer artifact.
-async fn assert_no_artifacts(storage: &HDFSStorage) -> TestResult {
-    let leftovers = storage
-        .list_directory(Path::new(""))
-        .await?
-        .into_iter()
-        .filter(|entry| entry.name.starts_with(".data-mover-"))
-        .map(|entry| entry.name)
-        .collect::<Vec<_>>();
-    assert!(leftovers.is_empty(), "artifacts left: {leftovers:?}");
-    Ok(())
-}
-
-async fn publish_recovered(
-    staged: &dyn StagedDestination,
-    recovered: &PreparedStage,
-    expected_size: u64,
-    expected_blake3: [u8; 32],
-) -> Result<(), StorageRoleFailure> {
     staged
         .publish(
-            recovered,
+            &resumed,
             PublishRequest {
-                expected_size,
-                expected_blake3: Some(expected_blake3),
+                expected_size: payload.len() as u64,
+                expected_blake3: Some(digest),
                 cancel: CancellationToken::new(),
             },
         )
         .await
-        .map(|_| ())
-        .map_err(|failure| failure.error)
+        .map_err(|failure| failure.error)?;
+    assert_eq!(read_file(&client, &root, "final.bin").await?, payload);
+    assert_no_artifacts(&reconnected).await?;
+    cleanup(&reconnected).await?;
+    Ok(())
 }
 
-/// P7 C11 on the lab cluster, in both orders: a traversal cancelled again and again, each time
-/// resumed from its final checkpoint, delivers together exactly what one uninterrupted traversal
-/// does; so does resuming from checkpoints taken part way, as after a crash.
+async fn interrupt_stage(backend: &Storage, payload: &Bytes) -> TestResult<SourceDescriptor> {
+    let descriptor = backend
+        .read_source(&PreflightPolicy::production())?
+        .describe(&StoragePath::new("source.bin")?)
+        .await?;
+    let staged = backend.staged_destination(&PreflightPolicy::production())?;
+    let stage = staged
+        .prepare_at_destination(resume_request(&descriptor)?.with_resume(ResumeMode::Restart))
+        .await?;
+    assert!(!matches!(stage.prepare_fact(), PrepareFact::Resumed { .. }));
+    assert!(
+        staged
+            .write(&stage, interrupted_input(payload.slice(..1024 * 1024))?)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        staged.observe_checkpoint(&stage).await?.durable_prefix,
+        1024 * 1024
+    );
+    drop(stage);
+    Ok(descriptor)
+}
+
+async fn assert_no_artifacts(storage: &Storage) -> TestResult {
+    let traversal = StorageTraversalSource::new(storage)?;
+    let mut session = traversal
+        .traverse(TraversalRequest::new(StoragePath::root()).cancel(CancellationToken::new()));
+    while let Some(item) = session.next_item().await {
+        if let TraversalItem::Entry(entry) = item {
+            assert!(
+                !entry.path().as_str().starts_with(".data-mover-"),
+                "artifact left: {}",
+                entry.path()
+            );
+        }
+    }
+    session.finish().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the nightly lab HDFS cluster"]
 async fn architecture_traversal_resumes_after_cancel() -> TestResult {
-    let hdfs = create_hdfs_storage(
-        &lab_location("traversal-resume")?,
-        &lab_config(),
-        None,
-        true,
-    )
-    .await?;
+    let location = lab_location("traversal-resume")?;
+    let hdfs = connect_hdfs(&location).await?;
+    let (client, root) = raw_client(&location)?;
     let checked = async {
-        seed_resume_tree(&hdfs).await?;
-        let roles = hdfs.architecture_storage()?;
-        let source = StorageTraversalSource::new(&roles)?;
+        seed_resume_tree(&client, &root).await?;
+        let source = StorageTraversalSource::new(&hdfs)?;
         for order in [TraversalOrder::Unordered, TraversalOrder::Blocks] {
             resume_chain(&source, order).await?;
             resume_from_part_way(&source, order).await?;
@@ -362,31 +335,39 @@ async fn architecture_traversal_resumes_after_cancel() -> TestResult {
         TestResult::Ok(())
     }
     .await;
-    hdfs.delete_storage_root().await?;
-    checked
+    let cleanup_result = cleanup(&hdfs).await;
+    checked?;
+    cleanup_result?;
+    Ok(())
 }
 
-/// 18 directories of 8 files, a 10-level chain and a directory of 60 files.
-async fn seed_resume_tree(hdfs: &HDFSStorage) -> TestResult {
+async fn seed_resume_tree(client: &Client, root: &HdfsLocation) -> TestResult {
     for top in 0..6 {
         for sub in 0..3 {
-            let dir = format!("a{top}/s{sub}");
-            hdfs.create_dir_all(Path::new(&dir), 0o755).await?;
             for file in 0..8 {
-                create_file(hdfs, &format!("{dir}/f{file}"), Bytes::from_static(b"x")).await?;
+                create_file(
+                    client,
+                    root,
+                    &format!("a{top}/s{sub}/f{file}"),
+                    Bytes::from_static(b"x"),
+                )
+                .await?;
             }
         }
     }
-    hdfs.create_dir_all(Path::new(&format!("chain{}", "/c".repeat(10))), 0o755)
-        .await?;
-    hdfs.create_dir_all(Path::new("wide"), 0o755).await?;
+    create_file(
+        client,
+        root,
+        &format!("chain{}/leaf", "/c".repeat(10)),
+        Bytes::new(),
+    )
+    .await?;
     for file in 0..60 {
-        create_file(hdfs, &format!("wide/w{file:02}"), Bytes::new()).await?;
+        create_file(client, root, &format!("wide/w{file:02}"), Bytes::new()).await?;
     }
     Ok(())
 }
 
-/// Every entry path a traversal delivered, its checkpoints in order, and how it ended.
 type Traversed = (Vec<String>, Vec<(usize, Checkpoint)>, TraversalOutcome);
 
 async fn traverse_resumable(
@@ -438,12 +419,6 @@ async fn resume_chain(source: &StorageTraversalSource, order: TraversalOrder) ->
     }
     let union: BTreeSet<String> = delivered.iter().cloned().collect();
     assert_eq!(union, full, "{order:?}");
-    println!(
-        "RESULT chain {order:?}: rounds={rounds} full={} delivered={} duplicates={}",
-        full.len(),
-        delivered.len(),
-        delivered.len() - full.len()
-    );
     Ok(())
 }
 
@@ -458,9 +433,7 @@ async fn resume_from_part_way(
         traverse_resumable(source, traversal_request(order)?.resumable(every), None).await?;
     let all: BTreeSet<String> = full.iter().cloned().collect();
     let step = (checkpoints.len() / 8).max(1);
-    let mut largest = 0;
     for (at, checkpoint) in checkpoints.iter().step_by(step) {
-        largest = largest.max(checkpoint.as_bytes().len());
         let request = traversal_request(order)?.resume_from(checkpoint.clone());
         let (resumed, _, outcome) = traverse_resumable(source, request, None).await?;
         assert!(matches!(outcome, TraversalOutcome::Completed(_)));
@@ -470,10 +443,5 @@ async fn resume_from_part_way(
             "{order:?} from the checkpoint after {at} entries"
         );
     }
-    println!(
-        "RESULT part-way {order:?}: checkpoints={} resumed-from={} largest={largest} bytes",
-        checkpoints.len(),
-        checkpoints.len().div_ceil(step)
-    );
     Ok(())
 }

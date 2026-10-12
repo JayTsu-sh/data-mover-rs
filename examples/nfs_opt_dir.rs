@@ -8,11 +8,18 @@
 //! removes exactly that directory at the end: nothing else under the export is touched.
 
 use std::env;
-use std::path::Path;
+use std::num::NonZeroUsize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use data_mover::error::StorageError;
-use data_mover::{NFSStorage, Result};
+use data_mover::model::{EntryKind, FailureClass, StoragePath};
+use data_mover::storage::{
+    BackendConfig, DeleteTreeItem, DeleteTreeOutcome, DeleteTreeRequest, NfsBackendConfig,
+    PreflightPolicy, Storage, StorageRoleFailure, connect_backend, create_directory_all,
+    delete_tree,
+};
+use tokio_util::sync::CancellationToken;
+type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const NESTED: &str = "dir1/dir2/dir3";
 
@@ -21,19 +28,24 @@ async fn main() -> Result<()> {
     let url = env::args().nth(1).ok_or_else(|| {
         StorageError::ConfigError("usage: nfs_opt_dir <nfs://host/export[:/sub]?...>".to_string())
     })?;
-    let storage = NFSStorage::new(&url, None).await?;
+    let storage = connect(&url).await?;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| StorageError::OperationError(error.to_string()))?
         .as_nanos();
     let scratch = format!("dm-e2e-opt-dir-{nanos}");
-    // Never adopt an existing directory: everything this example deletes, it created.
-    if storage.get_metadata(Path::new(&scratch)).await.is_ok() {
-        return Err(StorageError::OperationError(format!(
-            "{scratch} already exists"
-        )));
+    // Only a definite NotFound permits this run to adopt the fresh scratch path.
+    let path = StoragePath::new(&scratch)?;
+    match storage
+        .namespace(&PreflightPolicy::production())?
+        .stat(&path)
+        .await
+    {
+        Err(StorageRoleFailure::Entry(error)) if error.class() == FailureClass::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => return Err(format!("{scratch} already exists").into()),
     }
-    storage.create_dir_all(Path::new(&scratch)).await?;
+    create_directory_all(&storage, &path).await?;
 
     let checked = create_twice(&url, &storage, &scratch).await;
     let removed = remove(&storage, &scratch).await;
@@ -46,39 +58,65 @@ async fn main() -> Result<()> {
 /// Creates `NESTED` below the scratch directory, then creates it again through a second connection
 /// rooted at the scratch directory. The second connection has its own root handle and so an empty
 /// handle cache: every level goes to the server as `mkdir` of an existing directory.
-async fn create_twice(url: &str, storage: &NFSStorage, scratch: &str) -> Result<()> {
-    let nested = Path::new(scratch).join(NESTED);
-    storage.create_dir_all(&nested).await?;
-    let rooted = NFSStorage::new(&sub_root_url(url, scratch), None).await?;
-    rooted.create_dir_all(Path::new(NESTED)).await?;
-    let entry = rooted.get_metadata(Path::new(NESTED)).await?;
-    if !entry.get_is_dir() {
-        return Err(StorageError::OperationError(format!(
-            "{} is not a directory",
-            nested.display()
-        )));
+async fn connect(url: &str) -> Result<Storage> {
+    Ok(connect_backend(BackendConfig::Nfs(NfsBackendConfig {
+        url: url.to_owned(),
+        block_size: None,
+        ensure_dir: false,
+    }))
+    .await?)
+}
+
+async fn create_twice(url: &str, storage: &Storage, scratch: &str) -> Result<()> {
+    let nested = StoragePath::new(format!("{scratch}/{NESTED}"))?;
+    create_directory_all(storage, &nested).await?;
+    let rooted = connect(&sub_root_url(url, scratch)).await?;
+    let path = StoragePath::new(NESTED)?;
+    create_directory_all(&rooted, &path).await?;
+    let entry = rooted
+        .namespace(&PreflightPolicy::production())?
+        .stat(&path)
+        .await?;
+    if entry.kind != EntryKind::Directory {
+        return Err(format!("{nested} is not a directory").into());
     }
-    println!("created {} (twice)", nested.display());
+    println!("created {nested} (twice)");
     Ok(())
 }
 
-/// Deletes the scratch directory and requires every event to succeed, including the one for the
-/// scratch directory itself: `delete_dir_all` alone reports no failure.
-async fn remove(storage: &NFSStorage, scratch: &str) -> Result<()> {
-    let events = storage.delete_dir_all_with_progress(Some(Path::new(scratch)), 4)?;
+/// Requires successful per-entry events, the scratch root deletion and positive completion.
+async fn remove(storage: &Storage, scratch: &str) -> Result<()> {
+    let slots = NonZeroUsize::new(4).ok_or("nonzero")?;
+    let root = StoragePath::new(scratch)?;
+    let mut session = delete_tree(
+        storage,
+        DeleteTreeRequest {
+            root: root.clone(),
+            delete_root: true,
+            max_inflight_operations: slots,
+            max_buffered_items: slots,
+            cancel: CancellationToken::new(),
+        },
+    )?;
     let mut root_removed = false;
     let mut failures = Vec::new();
-    while let Some(event) = events.next().await {
-        if let Some(error) = event.error {
-            failures.push(format!("{}: {error}", event.relative_path.display()));
-        } else if event.is_dir && event.relative_path == Path::new(scratch) {
-            root_removed = true;
+    while let Some(event) = session.next_item().await {
+        match event {
+            DeleteTreeItem::Deleted { path, kind }
+                if path == root && kind == EntryKind::Directory =>
+            {
+                root_removed = true;
+            }
+            DeleteTreeItem::EntryFailure(error) => failures.push(format!("{error:?}")),
+            DeleteTreeItem::Deleted { .. } => {}
         }
     }
-    if !failures.is_empty() || !root_removed {
-        return Err(StorageError::OperationError(format!(
+    let complete = matches!(session.finish().await?, DeleteTreeOutcome::Completed(_));
+    if !complete || !failures.is_empty() || !root_removed {
+        return Err(format!(
             "removing {scratch} failed (root removed: {root_removed}): {failures:?}"
-        )));
+        )
+        .into());
     }
     Ok(())
 }

@@ -2,7 +2,13 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
-use data_mover::{HdfsConfig, Result, StorageEnum};
+use data_mover::HdfsConfig;
+use data_mover::hdfs::build_hdfs_client;
+use data_mover::model::StoragePath;
+use data_mover::storage::{BackendConfig, HdfsBackendConfig, PreflightPolicy, connect_backend};
+#[allow(dead_code)]
+mod copy_support;
+use copy_support::Result;
 
 mod hdfs_support;
 
@@ -38,20 +44,21 @@ fn config(args: &Args) -> HdfsConfig {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let storage = data_mover::create_hdfs_storage(
-        &args.storage,
-        &config(&args),
-        None,
-        matches!(args.action, Action::Seed),
-    )
+    let config = config(&args);
+    let (client, location) = build_hdfs_client(&args.storage, &config)?;
+    let storage = connect_backend(BackendConfig::Hdfs(HdfsBackendConfig {
+        location: args.storage.clone(),
+        client: config,
+        block_size: None,
+        ensure_dir: matches!(args.action, Action::Seed),
+    }))
     .await?;
-    let relative = Path::new("fixture.bin");
+    let path = StoragePath::new("fixture.bin")?;
 
     match args.action {
         Action::Seed => {
-            let resolved = storage.resolve_path(relative)?;
-            let mut writer = storage
-                .client()
+            let resolved = hdfs_support::resolve(&location, Path::new("fixture.bin"))?;
+            let mut writer = client
                 .create(
                     &resolved,
                     hdfs_native::WriteOptions::default()
@@ -97,10 +104,7 @@ async fn main() -> Result<()> {
             })?;
         }
         Action::Inspect => {
-            let storage = StorageEnum::HDFS(storage);
-            let entry = storage.get_metadata(relative).await?;
-            let size = entry.get_size();
-            let hash = storage.compute_hash(relative, size).await?;
+            let (size, hash) = copy_support::hash(&storage, &path).await?;
             println!("{size}\t{hash}");
         }
         Action::MetadataLoop => {
@@ -109,19 +113,31 @@ async fn main() -> Result<()> {
                     "metadata-loop requires ready-file".to_string(),
                 )
             })?;
-            storage.get_metadata(relative).await?;
+            storage
+                .namespace(&PreflightPolicy::production())?
+                .stat(&path)
+                .await?;
             tokio::fs::write(ready, b"ready\n").await?;
             for _ in 0..300 {
-                let entry = storage.get_metadata(relative).await?;
-                if entry.size != FIXTURE_SIZE {
+                let entry = storage
+                    .namespace(&PreflightPolicy::production())?
+                    .stat(&path)
+                    .await?;
+                if entry.size != Some(FIXTURE_SIZE) {
                     return Err(data_mover::error::StorageError::OperationError(
                         "HA fixture size changed during failover".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         }
-        Action::Cleanup => storage.delete_storage_root().await?,
+        Action::Cleanup => {
+            if location.root() == "/" {
+                return Err("refusing to remove HDFS filesystem root".into());
+            }
+            client.delete(location.root(), true).await?;
+        }
     }
     Ok(())
 }

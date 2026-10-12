@@ -56,6 +56,16 @@ pub(crate) trait NfsMetadataProtocol: Send + Sync {
         path: &StoragePath,
         value: OwnershipMode,
     ) -> Result<(), NfsProtocolFailure>;
+    async fn remove_xattr(
+        &self,
+        _path: &StoragePath,
+        _name: &str,
+    ) -> Result<(), NfsProtocolFailure> {
+        Err(NfsProtocolFailure::new(
+            crate::model::FailureClass::Unsupported,
+            crate::model::Transience::Permanent,
+        ))
+    }
     /// Change permission bits without synthesizing or rewriting numeric ownership.
     async fn set_mode(&self, path: &StoragePath, mode: u32) -> Result<(), NfsProtocolFailure> {
         let _ = (path, mode);
@@ -239,6 +249,35 @@ fn listed_optional<T>(
 
 #[async_trait]
 impl Metadata for NfsMetadataAdapter {
+    async fn remove_xattr(
+        &self,
+        path: &StoragePath,
+        name: &[u8],
+    ) -> Result<(), StorageRoleFailure> {
+        if !self.protocol.supports_xattrs() {
+            return Err(unsupported(path));
+        }
+        let invalid = || {
+            super::source::entry_failure(
+                path,
+                crate::model::Operation::Metadata,
+                crate::model::FailureClass::InvalidInput,
+                crate::model::Transience::Permanent,
+            )
+        };
+        if name.is_empty() || name.contains(&0) || name.len() > crate::model::MAX_MODEL_FIELD_BYTES
+        {
+            return Err(invalid());
+        }
+        let name = std::str::from_utf8(name).map_err(|_| invalid())?;
+        self.protocol
+            .remove_xattr(path, name)
+            .await
+            .map_err(|failure| {
+                super::source::role_failure(path, crate::model::Operation::Metadata, failure)
+            })
+    }
+
     /// READDIRPLUS carries the same attributes a GETATTR would return (`NFSv4` asks for the same
     /// bitmap in both), so ownership and timestamps of a listed child need no second round
     /// trip; only an ACL or xattrs the plan really wants do.

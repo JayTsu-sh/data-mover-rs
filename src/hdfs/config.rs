@@ -1,15 +1,12 @@
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use futures::stream::FuturesOrdered;
 use hdfs_native::file::FileWriter;
 use hdfs_native::{Client, ClientBuilder, HdfsError};
 use percent_encoding::percent_decode_str;
@@ -18,16 +15,10 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
-use crate::HDFSEntry;
-use crate::checksum::{ConsistencyCheck, HashCalculator, create_hash_calculator};
 use crate::error::{HdfsErrorKind, StorageError};
 
 const DEFAULT_BLOCK_SIZE: u64 = 128 * crate::MB;
-const MAX_TRANSFER_CHUNK_SIZE: u64 = 2 * crate::MB;
 
-fn transfer_chunk_size(block_size: u64) -> u64 {
-    block_size.clamp(1, MAX_TRANSFER_CHUNK_SIZE)
-}
 const HDFS_ADAPTER_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_millis(250),
     Duration::from_millis(500),
@@ -36,19 +27,6 @@ const HDFS_ADAPTER_RETRY_DELAYS: [Duration; 4] = [
 ];
 const HDFS_ADAPTER_MAX_ATTEMPTS: usize = HDFS_ADAPTER_RETRY_DELAYS.len() + 1;
 const HDFS_ADAPTER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Clone, Copy)]
-struct SequentialWriteContext<'a> {
-    relative_path: &'a Path,
-    start_offset: u64,
-    expected_size: u64,
-    require_final_size: bool,
-    bytes_counter: Option<&'a Arc<AtomicU64>>,
-}
-pub(crate) enum AppendCompletion {
-    Complete(u64),
-    PartialUpTo(u64),
-}
 
 async fn retry_hdfs_read<T, F, Fut>(
     operation: &'static str,
@@ -129,11 +107,10 @@ fn adapter_deadline_error() -> HdfsError {
     ))
 }
 
-
 /// Cloneable positional-read handle. `FileReader::read_range` uses `&self` and
 /// does not mutate its cursor, so cloned handles can read independent chunks.
 #[derive(Clone)]
-pub struct HDFSFileHandle {
+struct HdfsReadHandle {
     reader: Arc<hdfs_native::file::FileReader>,
     length: u64,
     relative_path: PathBuf,

@@ -46,10 +46,23 @@ pub enum IntegrityMode {
     Content,
 }
 
-/// Comparison tuning. The defaults check metadata only and demand exact timestamps.
+/// Resolution used when comparing observed modification times.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MtimePrecision {
+    /// Compare the exact observed nanoseconds, with the configured tolerance.
+    Exact,
+    /// Compare at the coarser resolution reported by the two backends.
+    #[default]
+    Coarsest,
+}
+
+/// Comparison tuning. Defaults check metadata at the coarser reported time resolution.
 #[derive(Clone, Copy, Debug)]
 pub struct IntegrityOptions {
     pub mode: IntegrityMode,
+    pub mtime_precision: MtimePrecision,
+    /// Also compare permission bits and comparable owner/group identities.
+    pub permissions: bool,
     /// Absolute timestamp difference still treated as equal, on top of the automatic
     /// comparison at the coarser of the two observed precisions.
     pub mtime_tolerance: Duration,
@@ -62,6 +75,8 @@ impl Default for IntegrityOptions {
     fn default() -> Self {
         Self {
             mode: IntegrityMode::default(),
+            mtime_precision: MtimePrecision::default(),
+            permissions: false,
             mtime_tolerance: Duration::ZERO,
             maximum_chunk_bytes: NonZeroUsize::new(1 << 20)
                 .unwrap_or_else(|| unreachable!("constant is nonzero")),
@@ -85,6 +100,10 @@ pub struct IntegrityRequest {
 /// One way in which the two objects disagree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IntegrityDifference {
+    Permissions {
+        source: crate::storage::PermissionFacts,
+        destination: crate::storage::PermissionFacts,
+    },
     /// The object does not exist on the named side.
     Missing { side: IntegritySide },
     Kind {
@@ -206,9 +225,15 @@ impl Endpoint {
         }
     }
 
-    async fn modified(&self) -> Result<ObservedMtime, IntegrityFailure> {
+    async fn modified(
+        &self,
+        described: &SourceDescriptor,
+    ) -> Result<ObservedMtime, IntegrityFailure> {
         if !self.mtime_copied {
             return Ok(ObservedMtime::Unobservable);
+        }
+        if let Some(timestamps) = described.inline_timestamps() {
+            return Ok(ObservedMtime::Observed(timestamps.modified));
         }
         let plan = ObservationPlan::default().with_timestamps(ObservationMode::BestEffort);
         let observed = self
@@ -308,10 +333,21 @@ pub async fn compare(request: IntegrityRequest) -> Result<IntegrityReport, Integ
         return Ok(report);
     };
     compare_facts(source_entry, destination_entry, &mut report.differences);
+    if request.options.permissions {
+        compare_permissions(
+            &source,
+            &destination,
+            source_entry,
+            destination_entry,
+            &mut report.differences,
+        )
+        .await?;
+    }
     compare_modified(
         &source,
         &destination,
-        request.options.mtime_tolerance,
+        (source_entry, destination_entry),
+        request.options,
         &mut report.differences,
     )
     .await?;
@@ -386,20 +422,80 @@ fn compare_facts(
     }
 }
 
+async fn compare_permissions(
+    source: &Endpoint,
+    destination: &Endpoint,
+    source_entry: &SourceDescriptor,
+    destination_entry: &SourceDescriptor,
+    differences: &mut Vec<IntegrityDifference>,
+) -> Result<(), IntegrityFailure> {
+    use crate::storage::PrincipalIdentity::{Named, Numeric};
+    let (source_facts, destination_facts) = reconcile(futures::join!(
+        async {
+            source
+                .metadata
+                .permissions(source_entry)
+                .await
+                .map_err(|error| source.attribute(error))
+        },
+        async {
+            destination
+                .metadata
+                .permissions(destination_entry)
+                .await
+                .map_err(|error| destination.attribute(error))
+        },
+    ))?;
+    let differs = |a: &Option<crate::storage::PrincipalIdentity>,
+                   b: &Option<crate::storage::PrincipalIdentity>| {
+        matches!((a, b), (Some(Numeric(a)), Some(Numeric(b))) if a != b)
+            || matches!((a, b), (Some(Named(a)), Some(Named(b))) if a != b)
+    };
+    let mode_differs = source_entry.kind != EntryKind::Symlink
+        && destination_entry.kind != EntryKind::Symlink
+        && matches!((source_facts.mode, destination_facts.mode), (Some(a), Some(b)) if a != b);
+    if mode_differs
+        || differs(&source_facts.owner, &destination_facts.owner)
+        || differs(&source_facts.group, &destination_facts.group)
+    {
+        differences.push(IntegrityDifference::Permissions {
+            source: source_facts,
+            destination: destination_facts,
+        });
+    }
+    Ok(())
+}
+
 async fn compare_modified(
     source: &Endpoint,
     destination: &Endpoint,
-    tolerance: Duration,
+    entries: (&SourceDescriptor, &SourceDescriptor),
+    options: IntegrityOptions,
     differences: &mut Vec<IntegrityDifference>,
 ) -> Result<(), IntegrityFailure> {
-    let (source_time, destination_time) =
-        reconcile(futures::join!(source.modified(), destination.modified()))?;
+    let (source_time, destination_time) = reconcile(futures::join!(
+        source.modified(entries.0),
+        destination.modified(entries.1)
+    ))?;
     let (ObservedMtime::Observed(source_time), ObservedMtime::Observed(destination_time)) =
         (source_time, destination_time)
     else {
         return Ok(());
     };
-    if !same_instant(source_time, destination_time, tolerance) {
+    let equal = match options.mtime_precision {
+        MtimePrecision::Coarsest => {
+            same_instant(source_time, destination_time, options.mtime_tolerance)
+        }
+        MtimePrecision::Exact => match (source_time, destination_time) {
+            (Some(source), Some(destination)) => {
+                source.unix_nanos().abs_diff(destination.unix_nanos())
+                    <= options.mtime_tolerance.as_nanos()
+            }
+            (None, None) => true,
+            _ => false,
+        },
+    };
+    if !equal {
         differences.push(IntegrityDifference::Modified {
             source: source_time,
             destination: destination_time,

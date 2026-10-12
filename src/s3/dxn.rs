@@ -30,7 +30,6 @@ impl Intercept for DxnCompatibilityInterceptor {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
 
     use crate::AssertTestValue;
 
@@ -93,16 +92,15 @@ mod tests {
             .assert_value("connect to DXN rename test storage");
         seed(&storage).await;
         assert!(
-            storage
-                .rename_with_limits(
-                    Path::new(SOURCE),
-                    Path::new(DESTINATION),
-                    Some(SIZE as u64),
-                    8 * 1024 * 1024,
-                    5 * 1024 * 1024,
-                )
-                .await
-                .is_err()
+            super::super::role_protocol::rename::rename_with_limits(
+                &storage,
+                SOURCE,
+                DESTINATION,
+                8 * 1024 * 1024,
+                5 * 1024 * 1024,
+            )
+            .await
+            .is_err()
         );
         assert_source_only(&storage).await;
     }

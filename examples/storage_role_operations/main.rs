@@ -1,4 +1,4 @@
-//! Role-based entry point for the operations that have no `StorageEnum` equivalent:
+//! Role-based entry point for traversal, directory operations and comparison:
 //! filtered / depth-limited traversal, directory blocks, recursive delete, and cross-endpoint
 //! integrity.
 //!

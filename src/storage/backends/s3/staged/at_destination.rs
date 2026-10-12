@@ -416,6 +416,7 @@ impl<P: S3Protocol + 'static> S3StagedDestination<P> {
             .filter(|_| !stage.recovery_enabled())
             .map(|checkpoint| (checkpoint.interval_bytes, &hook as &dyn PartsCheckpoint));
         let target = PartTarget {
+            stage: Some(stage),
             path,
             key: path.as_str(),
             upload_id: &upload.upload_id,
