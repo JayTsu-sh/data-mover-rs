@@ -10,6 +10,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$ROOT"
+source .claude/skills/_shared/cargo_examples.sh
 for env in .claude/skills/e2e-nfs/.env .claude/skills/e2e-cifs/.env; do
   [ -f "$env" ] && { set -a; source "$env"; set +a; }
 done
@@ -18,9 +19,9 @@ RUN=${RUN:-$(date +%s)}
 V41="${NFS_META_V41_EXPORT%%\?*}:/dm-meta-$RUN?${NFS_META_V41_EXPORT#*\?}"
 V41_ROOT="${NFS_META_V41_EXPORT%%\?*}:/?${NFS_META_V41_EXPORT#*\?}"
 CIFS="cifs:dm-meta-$RUN"
-BIN=target/debug/examples/nfs_metadata_copy
-cargo build -q --example nfs_metadata_copy --example storage_role_operations 2>&1 \
-  | grep -v -e binrw -e future-incompat -e '^note'
+cargo_build_examples nfs_metadata_copy storage_role_operations || exit $?
+BIN=$(cargo_example_binary nfs_metadata_copy) || exit 1
+ROLE=$(cargo_example_binary storage_role_operations) || exit 1
 pass=0; fail=0
 case_() { # name, expected exit (0|1), grep marker, args...
   local name=$1 want=$2 marker=$3; shift 3
@@ -68,10 +69,10 @@ case_ "guard: verify without mark is rejected" 1 "mark-acl" \
   --source "$V41" --source-path src-principal --destination "$V41" --destination-path x --expect copied --verify-acl
 
 # Cleanup: the run directory on each share. Case outcomes above do not depend on it.
-NFS_REAL_URL="$V41_ROOT" target/debug/examples/storage_role_operations --backend nfs \
+NFS_REAL_URL="$V41_ROOT" "$ROLE" --backend nfs \
   delete-tree --path "dm-meta-$RUN" --delete-root >/dev/null 2>&1 || echo "WARN NFS cleanup of dm-meta-$RUN failed"
 if [ -n "${CIFS_REAL_SERVER:-}" ]; then
-  target/debug/examples/storage_role_operations --backend cifs \
+  "$ROLE" --backend cifs \
     delete-tree --path "dm-meta-$RUN" --delete-root >/dev/null 2>&1 || echo "WARN CIFS cleanup of dm-meta-$RUN failed"
 fi
 echo "RESULT pass=$pass fail=$fail run=$RUN"

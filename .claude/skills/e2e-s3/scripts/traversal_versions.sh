@@ -55,6 +55,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$ROOT"
+source .claude/skills/_shared/cargo_examples.sh
 S3_ENV=${S3_ENV:-.claude/skills/e2e-s3/.env}
 set -a; . "$S3_ENV"; set +a
 . .claude/skills/_shared/s3_url.sh
@@ -198,7 +199,8 @@ versioning() {
   s3c -o /dev/null -w "versioning $1: %{http_code}\n" -X PUT "$H/$VB?versioning" --data-binary @"$WORK/v.xml"
 }
 
-build=$(cargo build -q --example storage_role_operations 2>&1) || { echo "$build" >&2; exit 1; }
+cargo_build_examples storage_role_operations || exit $?
+BIN=$(cargo_example_binary storage_role_operations) || exit 1
 if [ "$MODE" = temporary ]; then
   LOCATION=()
   [ -n "${S3_LOCATION:-}" ] && LOCATION=(--data-binary "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>$S3_LOCATION</LocationConstraint></CreateBucketConfiguration>")
@@ -242,7 +244,6 @@ fi
 # ':' and the host at the last '@' and does not percent-decode. Only in this script's environment.
 S3_LISTING_URL=$(s3_url "$VB" "$P") || exit 2
 export S3_LISTING_URL
-BIN=target/debug/examples/storage_role_operations
 traverse() { # concurrency, args...
   "$BIN" --backend s3 --concurrency "$1" traverse "${@:2}" 2>"$WORK/stderr" \
     || { echo "traverse $* failed:" >&2; cat "$WORK/stderr" >&2; return 1; }

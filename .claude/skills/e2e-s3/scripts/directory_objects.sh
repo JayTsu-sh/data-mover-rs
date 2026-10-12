@@ -55,6 +55,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$ROOT"
+source .claude/skills/_shared/cargo_examples.sh
 S3_ENV=${S3_ENV:-.claude/skills/e2e-s3/.env}
 set -a; . "$S3_ENV"; set +a
 . .claude/skills/_shared/s3_url.sh
@@ -230,7 +231,10 @@ versioning() {
   s3c -o /dev/null -w "versioning $1: %{http_code}\n" -X PUT "$H/$VB?versioning" --data-binary @"$WORK/v.xml"
 }
 
-build=$(cargo build -q --example storage_role_operations --example transfer_resume --example s3_history_replay 2>&1) || { echo "$build" >&2; exit 1; }
+cargo_build_examples storage_role_operations transfer_resume s3_history_replay || exit $?
+ROLE=$(cargo_example_binary storage_role_operations) || exit 1
+TR=$(cargo_example_binary transfer_resume) || exit 1
+HR=$(cargo_example_binary s3_history_replay) || exit 1
 if [ "$MODE" = temporary ]; then
   BODY=(-H 'Content-Length: 0')
   [ -n "${S3_LOCATION:-}" ] && BODY=(--data-binary "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>$S3_LOCATION</LocationConstraint></CreateBucketConfiguration>")
@@ -259,8 +263,6 @@ fi
 S3_LISTING_URL=$(s3_url "$VB" "$P") || exit 2
 export S3_LISTING_URL
 export S3_BUCKET=$VB
-ROLE=target/debug/examples/storage_role_operations
-TR=target/debug/examples/transfer_resume
 traverse() { # stdout file, args...
   "$ROLE" --backend s3 --concurrency 8 traverse "${@:2}" >"$1" 2>"$1.err" \
     || { echo "traverse ${*:2} failed:" >&2; cat "$1.err" >&2; FAILED=1; }
@@ -469,7 +471,6 @@ check "S3→Local wrote no file" "$(find "$LOCAL/dst" -type f 2>/dev/null | wc -
 
 if [ "$VERSIONED" = 1 ]; then
   echo "== history replay (P7 H1)"
-  HR=target/debug/examples/s3_history_replay
   # The destination: a second temporary bucket (temporary mode), else the same bucket under replay/.
   if [ "$MODE" = temporary ]; then
     DB=$VB-r

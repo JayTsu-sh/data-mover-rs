@@ -17,6 +17,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$ROOT"
+source .claude/skills/_shared/cargo_examples.sh
 S3_ENV=${S3_ENV:-.claude/skills/e2e-s3/ontap/.env}
 set -a; . "$S3_ENV"; set +a
 export S3_BUCKET=data-mover-nas S3_COMPAT=ontap S3_BUCKET_TYPE=nas
@@ -29,8 +30,8 @@ PREFIX=nas-$RUN
 NAS_BIG=${NAS_BIG:-1073741824}
 WORK=/tmp/data-mover-nas-$RUN
 mkdir -p "$WORK/src" "$WORK/out"
-BIN=${CARGO_TARGET_DIR:-target}/debug/examples/transfer_resume
-build=$(cargo build -q --example transfer_resume 2>&1) || { echo "$build" >&2; exit 1; }
+cargo_build_examples transfer_resume || exit $?
+BIN=$(cargo_example_binary transfer_resume) || exit 1
 SCHEME=http; [ "${S3_USE_HTTPS:-}" = true ] && SCHEME=https
 B="$SCHEME://$S3_HOST/$S3_BUCKET"
 OB="$SCHEME://$S3_HOST/$OBJECT_BUCKET"

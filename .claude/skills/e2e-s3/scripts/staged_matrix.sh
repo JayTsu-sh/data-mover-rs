@@ -15,6 +15,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 cd "$ROOT"
+source .claude/skills/_shared/cargo_examples.sh
 S3_ENV=${S3_ENV:-.claude/skills/e2e-s3/.env}
 CALLER_BUCKET=${S3_BUCKET:-}
 set -a; . "$S3_ENV"; set +a
@@ -33,8 +34,8 @@ case "$PREFIX" in
 esac
 WORK=/tmp/data-mover-s3-staged-$RUN
 mkdir -p "$WORK/src"
-BIN=target/debug/examples/transfer_resume
-build=$(cargo build -q --example transfer_resume 2>&1) || { echo "$build" >&2; exit 1; }
+cargo_build_examples transfer_resume || exit $?
+BIN=$(cargo_example_binary transfer_resume) || exit 1
 SCHEME=http; [ "${S3_USE_HTTPS:-}" = true ] && SCHEME=https
 B="$SCHEME://$S3_HOST/$S3_BUCKET"
 # The credentials reach curl through a config on a file descriptor, never on its command line.

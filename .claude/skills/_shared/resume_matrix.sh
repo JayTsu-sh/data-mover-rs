@@ -32,6 +32,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "$ROOT"
+source .claude/skills/_shared/cargo_examples.sh
 # S3_ENV picks the S3 server's .env (e.g. .claude/skills/e2e-s3/dxn/.env); default the e2e-s3 one.
 for env in "${S3_ENV:-.claude/skills/e2e-s3/.env}" .claude/skills/e2e-cifs/.env; do
   [ -f "$env" ] && { set -a; . "$env"; set +a; }
@@ -42,7 +43,6 @@ UNLIMITED=10737418240
 RUN=${RUN:-$(date +%s)}
 DIR=resume-$RUN
 WORK=/tmp/data-mover-resume-$RUN
-BIN=target/debug/examples/transfer_resume
 if [[ "$DEST" == s3:* ]]; then
   [ -n "${S3_BUCKET_OVERRIDE:-}" ] && S3_BUCKET=$S3_BUCKET_OVERRIDE
   PREFIX=${DEST#s3:}; PREFIX=${PREFIX#/}; PREFIX=${PREFIX%/}
@@ -60,7 +60,8 @@ if [[ "$DEST" == s3:* ]]; then
 else
   TARGET=(--destination "$DEST"); path_of() { echo "$DIR/$1"; }
 fi
-build=$(cargo build -q --example transfer_resume 2>&1) || { echo "$build" >&2; exit 1; }
+cargo_build_examples transfer_resume || exit $?
+BIN=$(cargo_example_binary transfer_resume) || exit 1
 mkdir -p "$WORK/src"
 
 # Everything a fresh container would still have: the binary, PATH, and the backend credentials.
