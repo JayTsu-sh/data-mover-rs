@@ -30,7 +30,7 @@ pub(super) fn answered(status: Option<&BucketVersioningStatus>) -> S3VersioningA
 }
 
 /// A failed `GetBucketVersioning`, by its error code, HTTP status and whether the request went
-/// out and got no response at all (`lost`: a timeout, a dispatch failure, an unreadable response):
+/// out but yielded no usable answer (`lost`: a timeout, dispatch failure, or unreadable response):
 /// no versioning at all (501, `NotImplemented`, `UnsupportedOperation`); no answer (lost, throttling,
 /// a server error or a code that asks to retry); otherwise a refusal to say — 403 and every other
 /// answer, and a request that could not be built at all (it fails again, with its own failure,
@@ -40,12 +40,11 @@ pub(super) fn failed(code: Option<&str>, status: Option<u16>, lost: bool) -> S3V
         return S3VersioningAtConnect::NoVersioning;
     }
     let unreachable = S3VersioningAtConnect::Unreachable { status };
-    if code.is_some_and(|code| TRANSIENT_CODES.contains(&code)) {
+    if lost || code.is_some_and(|code| TRANSIENT_CODES.contains(&code)) {
         return unreachable;
     }
     match status {
-        Some(429 | 500..=599) => unreachable,
-        None if lost => unreachable,
+        Some(408 | 429 | 500..=599) => unreachable,
         None | Some(_) => S3VersioningAtConnect::Refused,
     }
 }
@@ -80,7 +79,8 @@ mod tests {
             (Some("AccessDenied"), Some(403), false, Refused),
             (Some("NoSuchBucket"), Some(404), false, Refused),
             (None, Some(400), false, Refused),
-            (None, Some(408), false, Refused),
+            (None, Some(408), false, lost(Some(408))),
+            (None, Some(200), true, lost(Some(200))),
             // A request that could not be built fails again when listed; not transient.
             (None, None, false, Refused),
             (None, None, true, lost(None)),
@@ -99,3 +99,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "versioning_response_tests.rs"]
+mod response_tests;
