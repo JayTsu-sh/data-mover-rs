@@ -6,11 +6,10 @@ use std::ptr;
 
 use super::*;
 use crate::model::{
-    BackendIdentity, BackendKind, EntryKind, EntryOperationFailure, FailureClass, HistoryOrder,
-    IdentityStrength, ObjectHistory, Operation, RecordKind, SourceIdentity, Transience,
-    VersionRecord,
+    EntryKind, EntryOperationFailure, FailureClass, HistoryOrder, IdentityStrength, ObjectHistory,
+    Operation, RecordKind, SourceIdentity, Transience, VersionRecord,
 };
-use crate::storage::backends::local::test_traversal_storage;
+use crate::storage::backends::local::{test_identity, test_traversal_storage};
 use crate::traversal::{
     BlockCounts, Checkpoint, ListingOutcome, ScanFailure, StorageTraversalSource, TraversalOrder,
     TraversalOutcome, TraversalRequest, TraversalSession, TraversalSource,
@@ -22,7 +21,7 @@ fn path(value: &str) -> StoragePath {
 
 fn identity(value: &str) -> SourceIdentity {
     SourceIdentity::new(
-        BackendIdentity::new(BackendKind::S3, "pairing-test").unwrap(),
+        test_identity("pairing-test"),
         IdentityStrength::PathScoped,
         value,
     )
