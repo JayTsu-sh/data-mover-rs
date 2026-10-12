@@ -5,10 +5,13 @@
 //! the test CA `tests/data/tls/ca.pem`, which no system trusts. The fixtures were made with
 //! `openssl req -x509` (CA, P-256, 100 years) and `openssl x509 -req` (server, serverAuth); the CA's
 //! key was discarded.
+//! Each check runs in a child without proxy settings: the SDK honours proxy environment
+//! variables, but a proxy cannot reach this process's loopback TLS endpoint.
 
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -27,10 +30,44 @@ use tokio_rustls::TlsAcceptor;
 const CA: &[u8] = include_bytes!("data/tls/ca.pem");
 const SERVER_CERT: &[u8] = include_bytes!("data/tls/server.pem");
 const SERVER_KEY: &[u8] = include_bytes!("data/tls/server-key.pem");
-/// Set in the child process that trusts the test CA through `SSL_CERT_FILE`.
+/// Set in a child process with isolated proxy and certificate settings.
 const CHILD: &str = "DATA_MOVER_TLS_TEST_CHILD";
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+/// Isolates the SDK's process-wide proxy/root configuration without mutating the test process's
+/// environment while its other tests run. Only the private-CA check receives `SSL_CERT_FILE`.
+fn run_isolated(test: &str, ca: Option<&Path>) -> TestResult {
+    let mut command = Command::new(env::current_exe()?);
+    command
+        .args(["--exact", test, "--include-ignored", "--nocapture"])
+        .env(CHILD, "1")
+        .env_remove("SSL_CERT_FILE")
+        .env_remove("SSL_CERT_DIR");
+    for variable in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ] {
+        command.env_remove(variable);
+    }
+    if let Some(ca) = ca {
+        command.env("SSL_CERT_FILE", ca);
+    }
+    let output = command.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
 
 /// A local HTTPS endpoint answering every request as an unversioned bucket would.
 async fn tls_endpoint() -> TestResult<u16> {
@@ -94,8 +131,8 @@ fn assert_untrusted(message: &str) {
 
 #[tokio::test]
 async fn an_untrusted_certificate_is_refused_by_default() -> TestResult {
-    if env::var_os(CHILD).is_some() {
-        return Ok(());
+    if env::var_os(CHILD).is_none() {
+        return run_isolated("an_untrusted_certificate_is_refused_by_default", None);
     }
     let port = tls_endpoint().await?;
     let refused = S3Storage::new(&url(port, ""), None).await;
@@ -126,6 +163,9 @@ async fn an_untrusted_certificate_is_refused_by_default() -> TestResult {
 
 #[tokio::test]
 async fn tls_verify_false_accepts_any_certificate() -> TestResult {
+    if env::var_os(CHILD).is_none() {
+        return run_isolated("tls_verify_false_accepts_any_certificate", None);
+    }
     let port = tls_endpoint().await?;
     let storage = S3Storage::new(&url(port, "?tls_verify=false"), None).await?;
     storage.check_connectivity().await?;
@@ -148,24 +188,7 @@ fn a_ca_named_by_ssl_cert_file_is_trusted() -> TestResult {
     // The binary may run away from the source tree: the CA goes to a file of its own.
     let ca = NamedTempFile::new()?;
     fs::write(ca.path(), CA)?;
-    let output = Command::new(env::current_exe()?)
-        .args([
-            "--exact",
-            "trusted_through_ssl_cert_file_child",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env(CHILD, "1")
-        .env("SSL_CERT_FILE", ca.path())
-        .env_remove("SSL_CERT_DIR")
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success() && stdout.contains("1 passed"),
-        "{stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(())
+    run_isolated("trusted_through_ssl_cert_file_child", Some(ca.path()))
 }
 
 #[tokio::test]
