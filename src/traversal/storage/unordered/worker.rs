@@ -167,7 +167,7 @@ impl Worker {
             let item = ChildItem::Item(TraversalItem::Failure(Box::new(ScanFailure::child(
                 failure,
             ))));
-            let segment = self.shared.history_segment;
+            let segment = self.shared.probe.history_segment();
             tally_child(&mut self.block, item, None, segment).push_into(&mut batch);
         }
         self.settle(settled, hints, &mut batch, &mut below)?;
@@ -220,7 +220,7 @@ impl Worker {
                     .and_then(|ticket| take_hint(&mut hints, ticket));
                 below.push(descend.with_hint(hint));
             }
-            let segment = self.shared.history_segment;
+            let segment = self.shared.probe.history_segment();
             tally_child(&mut self.block, item, descent, segment).push_into(batch);
         }
         Ok(())

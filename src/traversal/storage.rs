@@ -42,7 +42,7 @@ use residency::ResidencyPeak;
 pub(crate) use resume::ManualClock;
 use resume::{Clock, Resume};
 
-/// The driver's handle on the residency probe.
+/// Test probes and overrides shared by the traversal driver and its output.
 ///
 /// A field rather than a `#[cfg(test)]` parameter so the one call site stays single: outside
 /// tests this is a zero-sized type, cloning it is free, and [`cursor::Cursor::residency`] does not
@@ -59,9 +59,22 @@ struct Probe {
     /// The clock a resumable traversal reads instead of the system's.
     #[cfg(test)]
     clock: Option<Arc<ManualClock>>,
+    /// A smaller output segment limit so tests can exercise histories with few records.
+    #[cfg(test)]
+    history_segment: Option<usize>,
 }
 
 impl Probe {
+    /// Production output always uses the fixed limit; only tests can override it.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn history_segment(&self) -> usize {
+        #[cfg(test)]
+        if let Some(records) = self.history_segment {
+            return records.max(1);
+        }
+        MAX_HISTORY_RECORDS
+    }
+
     /// The clock a traversal with checkpoints on reads: the system's, or a test's. A method (the
     /// probe is what tests configure a source with) whose receiver only tests read.
     #[cfg_attr(not(test), allow(clippy::unused_self))]
@@ -104,9 +117,6 @@ pub struct StorageTraversalSource {
     metadata: Arc<dyn Metadata>,
     /// Which storage this is, for the checkpoints a resumable traversal binds to it.
     identity: BackendIdentity,
-    /// The most records one entry's history carries before it is delivered in segments:
-    /// [`MAX_HISTORY_RECORDS`], smaller only in tests.
-    history_segment: usize,
     probe: Probe,
 }
 
@@ -120,7 +130,6 @@ impl StorageTraversalSource {
             namespace: storage.namespace()?,
             metadata: storage.metadata()?,
             identity: storage.identity().clone(),
-            history_segment: MAX_HISTORY_RECORDS,
             probe: Probe::default(),
         })
     }
@@ -131,7 +140,6 @@ impl StorageTraversalSource {
             namespace,
             metadata,
             identity: crate::storage::backends::local::test_identity("traversal-test"),
-            history_segment: MAX_HISTORY_RECORDS,
             probe: Probe::default(),
         }
     }
@@ -140,7 +148,7 @@ impl StorageTraversalSource {
     /// (P7 Q8) instead of [`MAX_HISTORY_RECORDS`], so tests segment small histories.
     #[cfg(test)]
     pub(crate) const fn history_segment(mut self, records: usize) -> Self {
-        self.history_segment = records;
+        self.probe.history_segment = Some(records);
         self
     }
 
@@ -208,9 +216,13 @@ impl TraversalSource for StorageTraversalSource {
         let (namespace, metadata) = (Arc::clone(&self.namespace), Arc::clone(&self.metadata));
         let probe = self.probe.clone();
         let order = request.order;
-        let mut shared = Shared::new(namespace, metadata, request, resume);
-        shared.history_segment = self.history_segment.max(1);
-        let shared = Arc::new(shared);
+        let shared = Arc::new(Shared::new(
+            namespace,
+            metadata,
+            request,
+            resume,
+            probe.clone(),
+        ));
         match order {
             TraversalOrder::Unordered => {
                 tokio::spawn(unordered::run(shared, item_tx, completion_tx, probe));
@@ -323,8 +335,7 @@ struct Shared {
     /// Checkpoints and where to resume from, when the request asks for either; `None` costs
     /// nothing (P7 §9.1).
     resume: Option<Resume>,
-    /// The most records one delivered entry's history carries (P7 Q8).
-    history_segment: usize,
+    probe: Probe,
 }
 
 impl Shared {
@@ -333,6 +344,7 @@ impl Shared {
         metadata: Arc<dyn Metadata>,
         request: TraversalRequest,
         resume: Option<Resume>,
+        probe: Probe,
     ) -> Self {
         let parked_listing_limit = namespace.parked_listing_limit().map(NonZeroUsize::get);
         Self {
@@ -344,7 +356,7 @@ impl Shared {
             root_object_reported: AtomicBool::new(false),
             parked_listing_limit,
             resume,
-            history_segment: MAX_HISTORY_RECORDS,
+            probe,
         }
     }
 }

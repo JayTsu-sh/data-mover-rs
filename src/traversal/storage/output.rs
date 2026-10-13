@@ -205,7 +205,7 @@ impl Output {
         while let Some(settled) = self.ready.pop_front() {
             let items = match settled {
                 Settled::Child { item, descent } => {
-                    self.settle_child(item, descent, runtime.shared.history_segment)
+                    self.settle_child(item, descent, runtime.shared.probe.history_segment())
                 }
                 Settled::BlockEnd { path, facts } => Tallied::One(self.close_block(path, facts)),
             };
