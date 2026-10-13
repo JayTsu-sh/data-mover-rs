@@ -194,12 +194,13 @@ fn refuse(request: &TraversalRequest, failure: TraversalTerminalFailure) -> Trav
 
 impl TraversalSource for StorageTraversalSource {
     fn traverse(&self, request: TraversalRequest) -> TraversalSession {
-        let histories = self.namespace.capabilities().histories;
-        let resume =
-            match Resume::prepare(&request, &self.identity, histories, || self.probe.clock()) {
-                Ok(resume) => resume,
-                Err(refusal) => return refuse(&request, TraversalTerminalFailure::Resume(refusal)),
-            };
+        let listing_resume_key = self.namespace.listing_resume_key();
+        let resume = match Resume::prepare(&request, &self.identity, listing_resume_key, || {
+            self.probe.clock()
+        }) {
+            Ok(resume) => resume,
+            Err(refusal) => return refuse(&request, TraversalTerminalFailure::Resume(refusal)),
+        };
         let drain_on_cancel = resume.as_ref().is_some_and(Resume::emits);
         let (item_tx, item_rx) = channel::channel(request.max_buffered_items);
         let (completion_tx, completion_rx) = oneshot::channel();

@@ -24,8 +24,7 @@ fn listed(items: &[TraversalItem]) -> Vec<String> {
 /// The position a checkpoint of `request` names.
 fn position(request: &TraversalRequest, checkpoint: &Checkpoint) -> Vec<FrontierEntry> {
     let identity = crate::storage::backends::local::test_identity("traversal-test");
-    let print =
-        fingerprint(&identity, request, false).unwrap_or_else(|refusal| panic!("{refusal}"));
+    let print = fingerprint(&identity, request, &[0]).unwrap_or_else(|refusal| panic!("{refusal}"));
     open(checkpoint, &print, request.order, &request.root)
         .unwrap_or_else(|refusal| panic!("{refusal}"))
 }

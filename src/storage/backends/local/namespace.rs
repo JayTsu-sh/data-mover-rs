@@ -344,7 +344,6 @@ impl Namespace for LocalNamespace {
 
     fn capabilities(&self) -> NamespaceCapabilities {
         NamespaceCapabilities {
-            histories: false,
             create_directory: Ok(()),
             delete: Ok(()),
             rename: Ok(()),

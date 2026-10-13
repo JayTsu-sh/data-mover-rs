@@ -381,7 +381,7 @@ fn the_fingerprint_binds_what_decides_the_listing_and_nothing_else() {
     let local = local::test_identity("store");
     let base = TraversalRequest::new(path("r")).filter(named("logs"));
     let print = |identity: &BackendIdentity, request: &TraversalRequest| {
-        fingerprint(identity, request, false).unwrap_or_else(|error| panic!("{error}"))
+        fingerprint(identity, request, &[0]).unwrap_or_else(|error| panic!("{error}"))
     };
     let expected = print(&local, &base);
     let depth = NonZeroUsize::new(3);
@@ -407,8 +407,9 @@ fn the_fingerprint_binds_what_decides_the_listing_and_nothing_else() {
         ),
         ("depth", print(&local, &base.clone().max_depth(depth))),
         (
-            "histories",
-            fingerprint(&local, &base, true).unwrap_or_else(|error| panic!("{error}")),
+            "listing semantics",
+            fingerprint(&local, &base, b"another-listing-mode")
+                .unwrap_or_else(|error| panic!("{error}")),
         ),
         (
             "filter",
@@ -437,7 +438,7 @@ fn the_fingerprint_binds_what_decides_the_listing_and_nothing_else() {
 fn a_filter_without_a_resume_key_cannot_be_resumable() {
     let request = TraversalRequest::new(StoragePath::root()).filter(Arc::new(Keyless));
     assert_eq!(
-        fingerprint(&local::test_identity("store"), &request, false),
+        fingerprint(&local::test_identity("store"), &request, &[0]),
         Err(ResumeRefusal::FilterNotResumable)
     );
 }

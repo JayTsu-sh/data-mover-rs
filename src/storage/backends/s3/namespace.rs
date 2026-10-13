@@ -263,14 +263,18 @@ impl<P: S3Protocol + 'static> Namespace for S3Namespace<P> {
             .map_err(|e| role_failure(from, Operation::Namespace, e))
     }
 
-    /// `histories`: what the bucket answered when it was connected ([`S3Protocol::lists_histories`],
-    /// P7 Q26 / Q-A: versioned, or would not say). Object buckets keep content under keys ending in `/` (`directory_objects`,
+    fn listing_resume_key(&self) -> &[u8] {
+        // Preserve the checkpoint fingerprint's existing encoding while keeping the meaning
+        // private to S3. Suspended buckets and refused versioning probes also list histories.
+        if self.histories { &[1] } else { &[0] }
+    }
+
+    /// Object buckets keep content under keys ending in `/` (`directory_objects`,
     /// P7 F5). An ONTAP NAS bucket keeps neither (P7 §14.2): no versions, and a key ending in `/`
     /// holding content is stored as a file.
     fn capabilities(&self) -> NamespaceCapabilities {
         let bucket = self.protocol.bucket_capabilities();
         NamespaceCapabilities {
-            histories: self.histories,
             create_directory: Err(NO_DIRECTORIES),
             delete: Ok(()),
             rename: self.protocol.namespace_rename_support(),

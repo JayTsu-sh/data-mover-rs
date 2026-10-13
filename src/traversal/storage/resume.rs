@@ -93,8 +93,8 @@ pub(super) struct Resume {
 
 impl Resume {
     /// What `request` asks for, checked before any I/O: `None` when it neither checkpoints nor
-    /// resumes. `histories`: whether the storage lists each key with its history now (its
-    /// namespace's capabilities), which the fingerprint binds. `clock` is called only when it
+    /// resumes. `listing_resume_key`: the namespace's opaque
+    /// listing semantics identifier, which the fingerprint binds. `clock` is called only when it
     /// checkpoints.
     ///
     /// # Errors
@@ -102,14 +102,14 @@ impl Resume {
     pub(super) fn prepare(
         request: &TraversalRequest,
         identity: &BackendIdentity,
-        histories: bool,
+        listing_resume_key: &[u8],
         clock: impl FnOnce() -> Clock,
     ) -> Result<Option<Self>, ResumeRefusal> {
         let every = request.resumable.every();
         if every.is_none() && request.resume_from.is_none() {
             return Ok(None);
         }
-        let fingerprint = checkpoint::fingerprint(identity, request, histories)?;
+        let fingerprint = checkpoint::fingerprint(identity, request, listing_resume_key)?;
         let start = request
             .resume_from
             .as_ref()

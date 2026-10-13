@@ -17,7 +17,7 @@
 //!
 //! **Format** (version 2; bumped on any change — to the bytes or to what the fingerprint binds —
 //! and a checkpoint of another version is refused, never misread; 2 since P7 C11b, whose
-//! fingerprint binds whether the storage lists histories instead of the removed version mode):
+//! fingerprint binds listing semantics through an opaque backend key; its byte encoding is unchanged):
 //!
 //! ```text
 //! "DMTC" | version u8 | order u8 | fingerprint [32] | count u32 LE |
@@ -111,7 +111,7 @@ pub enum ResumeRefusal {
     /// no older version is read; scan again from the start).
     UnsupportedVersion(u8),
     /// A checkpoint of a different traversal: another storage, root, order, filter, depth limit
-    /// or histories listed (a bucket whose versioning changed between the two runs).
+    /// or backend listing semantics.
     Mismatch,
     /// The request's filter gives no [`resume_key`](super::TraversalFilter::resume_key), so a
     /// checkpoint could not tell whether it was taken under the same filter.
@@ -163,15 +163,15 @@ const FILTER_CHILDREN: u8 = 1;
 /// The fingerprint a request's checkpoints carry: what decides which directories a traversal
 /// lists and what it delivers, and nothing that only tunes it (concurrency, buffering, the
 /// observation plan, the checkpoint interval). The storage identity is hashed, never stored.
-/// `histories` is whether the storage lists each key with its history now (P7 §10): a bucket
-/// whose versioning changed between two runs must not resume one with the other's entries.
+/// `listing_resume_key` binds the namespace's opaque listing semantics so incompatible
+/// backend configurations cannot reuse each other's checkpoints.
 ///
 /// # Errors
 /// `FilterNotResumable` when the request's filter has no resume key.
 pub(crate) fn fingerprint(
     identity: &BackendIdentity,
     request: &TraversalRequest,
-    histories: bool,
+    listing_resume_key: &[u8],
 ) -> Result<[u8; 32], ResumeRefusal> {
     let filter = match &request.filter {
         None => None,
@@ -195,7 +195,7 @@ pub(crate) fn fingerprint(
         .max_depth
         .map_or(0, |depth| u64::try_from(depth.get()).unwrap_or(u64::MAX));
     field(&depth.to_le_bytes());
-    field(&[u8::from(histories)]);
+    field(listing_resume_key);
     match &filter {
         None => field(&[0]),
         Some(key) => {

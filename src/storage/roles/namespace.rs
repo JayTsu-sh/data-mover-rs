@@ -52,6 +52,16 @@ pub trait Namespace: Send + Sync {
     /// [`crate::storage::listing`] for the stream's contract.
     fn list(&self, request: ListRequest) -> ListingStream;
 
+    /// Opaque identifier for the listing semantics used to validate traversal checkpoints.
+    /// Consumers must compare/hash the bytes without interpreting them. Implementations must
+    /// keep the key stable across connections with equivalent listing semantics, and change it
+    /// when backend configuration makes an old listing checkpoint incompatible. This is not a
+    /// cursor or a snapshot identifier; ordinary changes to directory contents do not change it.
+    /// The default is for backends with no configurable listing semantics. This method does no I/O.
+    fn listing_resume_key(&self) -> &[u8] {
+        &[0]
+    }
+
     /// Reads the text a symlink itself stores, without resolving or following it.
     async fn read_link(&self, path: &StoragePath) -> Result<SymlinkTarget, StorageRoleFailure> {
         Err(unsupported(
@@ -195,9 +205,6 @@ const NO_MUTATIONS: &str = "namespace mutations are unsupported by this namespac
 /// What a namespace can do, and how it compares names (P7 §5.4.5).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NamespaceCapabilities {
-    /// Whether [`Namespace::list`] gives each key its history (P7 §10): decided when the storage
-    /// was connected (an S3 bucket that was versioned then, or would not say).
-    pub histories: bool,
     /// Whether creating a directory is supported.
     pub create_directory: Result<(), &'static str>,
     /// Whether deleting an entry is supported. Versioned object stores retain object history.
@@ -215,10 +222,9 @@ pub struct NamespaceCapabilities {
 }
 
 impl NamespaceCapabilities {
-    /// No histories, mutations supported, no symlinks, name semantics unknown, no directory
+    /// Mutations supported, no symlinks, name semantics unknown, no directory
     /// objects.
     pub const BASIC: Self = Self {
-        histories: false,
         create_directory: Ok(()),
         delete: Ok(()),
         rename: Ok(()),

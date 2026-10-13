@@ -88,7 +88,7 @@ fn a_position_is_used_only_once_everything_before_it_is_delivered() {
 }
 
 fn resume(request: &TraversalRequest, clock: &Arc<ManualClock>) -> Resume {
-    Resume::prepare(request, &identity(), false, || {
+    Resume::prepare(request, &identity(), &[0], || {
         Clock::Manual(Arc::clone(clock))
     })
     .unwrap_or_else(|refusal| panic!("{refusal}"))
@@ -122,7 +122,7 @@ fn one_caller_claims_each_period() {
 #[test]
 fn off_prepares_nothing_and_reads_no_clock() {
     let request = TraversalRequest::new(StoragePath::root());
-    let prepared = Resume::prepare(&request, &identity(), false, || {
+    let prepared = Resume::prepare(&request, &identity(), &[0], || {
         panic!("Off asked for a clock")
     });
     assert!(matches!(prepared, Ok(None)));
@@ -137,7 +137,7 @@ fn off_prepares_nothing_and_reads_no_clock() {
         panic!("a checkpoint within the limits")
     };
     let request = TraversalRequest::new(StoragePath::root()).resume_from(*saved);
-    let prepared = Resume::prepare(&request, &identity(), false, || {
+    let prepared = Resume::prepare(&request, &identity(), &[0], || {
         panic!("Off asked for a clock")
     })
     .unwrap_or_else(|refusal| panic!("{refusal}"))

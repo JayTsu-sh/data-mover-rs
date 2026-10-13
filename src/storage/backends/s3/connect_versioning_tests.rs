@@ -19,7 +19,7 @@ fn answered(answer: Option<S3VersioningAtConnect>, versioning: Versioning) -> Ar
 
 fn histories(protocol: &Arc<MemoryS3>) -> TestResult<bool> {
     let storage = connect(protocol.clone(), identity(), None)?;
-    Ok(storage.namespace()?.capabilities().histories)
+    Ok(storage.namespace()?.listing_resume_key() == [1])
 }
 
 #[test]

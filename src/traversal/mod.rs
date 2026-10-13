@@ -379,7 +379,7 @@ impl TraversalRequest {
     }
 
     /// Resumes from `checkpoint`, which a traversal of the same storage, root, order, filter and
-    /// depth limit emitted — on a bucket that kept histories then as now; anything else is refused before any I/O
+    /// depth limit emitted, with compatible backend listing semantics; anything else is refused before any I/O
     /// ([`TraversalTerminalFailure::Resume`]). What was delivered after the checkpoint may be
     /// delivered again; nothing that was not delivered before it is skipped (P7 §9.2) — the tree
     /// changing between the two runs aside, as it may during one.
