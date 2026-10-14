@@ -326,10 +326,14 @@ impl Cursor {
     /// candidate whose listing already started is expanded into the subdirectories it has
     /// returned so far.
     ///
-    /// Two separate limits apply. At most `budget` listings wait for a page, and at most
-    /// `2 × budget` listings started ahead of the cursor, waiting or stopped after a page, may
-    /// wait for it. Counting the stopped ones against the first budget would let early-prefetched
-    /// shallow siblings keep the deeper listings the cursor needs first from starting.
+    /// Three separate limits apply. At most `budget` listings wait for a page, at most
+    /// [`LISTING_UNENDED_MULTIPLIER`] times `budget` started listings remain unfinished, and at
+    /// most [`LISTING_RETENTION_MULTIPLIER`] times `budget` listings in total may be retained
+    /// ahead of the cursor. Counting stopped or completed listings against the first budget would
+    /// let early-prefetched shallow siblings keep the deeper listings the cursor needs first from
+    /// starting. The separate unfinished limit keeps multi-page listings at the old resource and
+    /// memory bound while completed, bounded results can wait farther ahead without idling the
+    /// request budget.
     ///
     /// A namespace whose parked listings hold a server resource (CIFS: a directory handle) adds a
     /// third: at most its `parked_listing_limit` listings started ahead and not yet ended, waiting
@@ -357,15 +361,24 @@ impl Cursor {
             .filter(|listing| listing.awaiting())
             .count()
             + usize::from(top_awaiting);
+        let unended = self
+            .started
+            .values()
+            .filter(|listing| listing.ended.is_none())
+            .count();
         let mut room = budget
             .saturating_sub(awaiting)
-            .min(budget.saturating_mul(2).saturating_sub(self.started.len()));
+            .min(
+                budget
+                    .saturating_mul(LISTING_RETENTION_MULTIPLIER)
+                    .saturating_sub(self.started.len()),
+            )
+            .min(
+                budget
+                    .saturating_mul(LISTING_UNENDED_MULTIPLIER)
+                    .saturating_sub(unended),
+            );
         if let Some(limit) = runtime.shared.parked_listing_limit {
-            let unended = self
-                .started
-                .values()
-                .filter(|listing| listing.ended.is_none())
-                .count();
             room = room.min(limit.saturating_sub(unended));
         }
         for work in self.prefetch_candidates(room, budget.saturating_mul(4)) {
@@ -648,6 +661,17 @@ impl Search<'_> {
 
 /// Upper bound on listings started ahead of the cursor, whatever the request allows.
 const LISTING_PREFETCH_CAP: usize = 64;
+
+/// Unfinished listings retained ahead of the cursor per listing request slot. These may still
+/// hold a raw page, a local descriptor, or backend-side materialization, so this preserves the
+/// previous resource and memory bound while completed listings get a separate allowance.
+const LISTING_UNENDED_MULTIPLIER: usize = 2;
+
+/// Started listings retained ahead of the cursor per listing request slot. A completed listing
+/// no longer consumes a request slot, but its result remains resident until deterministic DFS
+/// reaches it. Four lets the request budget stay busy across uneven completion order while the
+/// page and memory bounds remain proportional to the caller's budget.
+const LISTING_RETENTION_MULTIPLIER: usize = 4;
 
 /// Listings allowed to wait for a page at once. Separate from the observation window: with the
 /// default plan observations never reach the backend, and when they do, a shared budget would let

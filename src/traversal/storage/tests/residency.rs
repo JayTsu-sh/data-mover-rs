@@ -197,7 +197,7 @@ async fn subdirectories_are_held_as_descend_slots() {
 /// a block is admitted in full, and its listing has ended, before the cursor descends, so only
 /// the top frame ever has children waiting and only it has a slot left to consume. Nor on the
 /// room held: a closed block releases its queue's allocation, so the room is what the top frame
-/// and the prefetched listings hold (at most `2P` of them), whatever the depth. Before P7 C4 an
+/// and the prefetched listings hold (at most `4P` of them), whatever the depth. Before P7 C4 an
 /// ancestor kept its widest block's room until it unwound.
 #[tokio::test]
 async fn depth_multiplies_neither_pending_children_nor_retained_room() {
@@ -217,16 +217,17 @@ async fn depth_multiplies_neither_pending_children_nor_retained_room() {
         peak.descend_slots <= depth,
         "slots grew faster than the depth: {peak:?}"
     );
-    // The top frame's page and up to `2P` prefetched pages, `P` being the window of 4 — well
+    // The top frame's page and up to `4P` prefetched pages, `P` being the window of 4 — well
     // below one page per level of the 32.
     assert!(
-        peak.block_capacity <= (2 * 4 + 1) * (fan_out + 1),
+        peak.block_capacity <= (4 * 4 + 1) * (fan_out + 1),
         "ancestor frames kept their room: {peak:?}"
     );
 }
 
-/// Prefetch keeps its two budgets: at most `P` listings in flight, and at most `2P` started but
-/// not yet taken. Without this the probe could miss the arrived-but-untaken set entirely.
+/// Prefetch keeps its request and completed-result budgets: at most `P` listings in flight, and
+/// at most `4P` arrived but not yet taken. The unfinished `2P` bound is exercised by the parked
+/// listing test. Without this probe could miss the arrived-but-untaken set entirely.
 #[tokio::test]
 async fn prefetched_listings_stay_within_their_budgets() {
     let window = 4;
@@ -240,7 +241,7 @@ async fn prefetched_listings_stay_within_their_budgets() {
     )
     .await;
     assert!(peak.listings_inflight <= window, "{peak:?}");
-    assert!(peak.listings_arrived <= 2 * window, "{peak:?}");
+    assert!(peak.listings_arrived <= 4 * window, "{peak:?}");
     assert!(
         peak.listings_inflight + peak.listings_arrived > 1,
         "prefetch never got going, so the budgets are untested: {peak:?}"
@@ -325,7 +326,7 @@ async fn path_bytes_carries_the_parent_prefix_once_per_child() {
 }
 
 /// Listings that arrived before the cursor asked for them are resident too, and there can be
-/// `2P` of them. Counting only the frames understates the peak by everything prefetch is
+/// `4P` of them. Counting only the frames understates the peak by everything prefetch is
 /// holding — here by an order of magnitude — which would make a paging change look effective
 /// while the prefetch set still grew with the tree.
 #[tokio::test]

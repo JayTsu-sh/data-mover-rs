@@ -300,6 +300,37 @@ fn fan_tree(top: usize, sub: usize) -> Vec<(String, Vec<(String, EntryKind)>)> {
     tree
 }
 
+/// A complete directory tree whose non-leaf directories each have `width` child directories.
+fn balanced_tree(width: usize, depth: usize) -> Vec<(String, Vec<(String, EntryKind)>)> {
+    fn add(
+        tree: &mut Vec<(String, Vec<(String, EntryKind)>)>,
+        parent: String,
+        width: usize,
+        depth: usize,
+    ) {
+        let prefix = if parent.is_empty() {
+            String::new()
+        } else {
+            format!("{parent}/")
+        };
+        let children = if depth > 0 {
+            (0..width)
+                .map(|index| (format!("{prefix}d{index:02}"), EntryKind::Directory))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        tree.push((parent, children.clone()));
+        for (child, _) in children {
+            add(tree, child, width, depth - 1);
+        }
+    }
+
+    let mut tree = Vec::new();
+    add(&mut tree, String::new(), width, depth);
+    tree
+}
+
 /// Runs a traversal of `tree` with 10 ms listings and reports (paths, peak, virtual elapsed).
 async fn timed(
     tree: &[(String, Vec<(String, EntryKind)>)],
@@ -366,5 +397,20 @@ async fn subdirectories_of_prefetched_directories_are_prefetched_too() {
     assert!(
         nested_time.as_millis() * 10 <= flat_time.as_millis() * 15,
         "nested {nested_time:?} vs flat {flat_time:?}"
+    );
+}
+
+/// Completed listings held ahead of the cursor must leave enough retained room for the listing
+/// request budget to stay busy. Otherwise short, differently placed branches occupy the retained
+/// set while fewer than `P` backend requests are active.
+#[tokio::test(start_paused = true)]
+async fn completed_prefetch_results_do_not_idle_the_listing_budget() {
+    let tree = balanced_tree(4, 4);
+    let (paths, peak, elapsed) = timed(&tree, latency_request(8)).await;
+    assert_eq!(paths.len(), 4 + 16 + 64 + 256);
+    assert_eq!(peak, 8);
+    assert!(
+        elapsed <= std::time::Duration::from_millis(450),
+        "listing budget idled: {elapsed:?}"
     );
 }
