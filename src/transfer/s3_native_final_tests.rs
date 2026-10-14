@@ -65,10 +65,10 @@ fn request_with(
         storage(protocol)?,
         StoragePath::new(source)?,
         storage(protocol)?,
-        StoragePath::new(final_key)?,
         InflightLimits::new(4, 4 * MIB, 4)?,
         cancel,
     )
+    .with_final_path(StoragePath::new(final_key)?)
     .with_transfer_policy(policy))
 }
 
@@ -444,10 +444,10 @@ async fn native_part_copies_stay_within_the_operation_bound() -> TestResult {
             storage(&protocol)?,
             StoragePath::new("source")?,
             storage(&protocol)?,
-            StoragePath::new("bounded")?,
             InflightLimits::new(4, 4 * MIB, operations)?,
             CancellationToken::new(),
-        );
+        )
+        .with_final_path(StoragePath::new("bounded")?);
         let outcome = transfer(request).await?;
         assert_eq!(outcome.route, TransferRoute::Native);
         assert_eq!(*protocol.part_copies.lock().await, 10);

@@ -24,7 +24,6 @@ async fn pre_cancelled_transfer_preserves_an_existing_final()
             common::connect_local(source_root.path(), 4).await?,
             StoragePath::new("blob.bin")?,
             common::connect_local(destination_root.path(), 4).await?,
-            StoragePath::new("blob.bin")?,
             InflightLimits::new(2, 64 * 1024, 2)?,
             cancel,
         )
@@ -68,7 +67,6 @@ async fn cancellation_stops_a_shaped_transfer_before_the_entire_payload()
         common::connect_local(source_root.path(), 4).await?,
         StoragePath::new("blob.bin")?,
         common::connect_local(destination_root.path(), 4).await?,
-        StoragePath::new("blob.bin")?,
         InflightLimits::new(4, 256 * 1024, 4)?,
         cancel.clone(),
     )

@@ -28,10 +28,10 @@ fn request(source: Storage, destination: Storage) -> TestResult<TransferRequest>
         source,
         StoragePath::new("source")?,
         destination,
-        StoragePath::new("final")?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
+    .with_final_path(StoragePath::new("final")?)
     .with_identity_override(TransferIdentity::from_label("hdfs-role-contract")?))
 }
 

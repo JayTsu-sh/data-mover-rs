@@ -20,7 +20,7 @@ use crate::transfer::TransferIdentity;
 /// Takes the per-file lease for this request's final file, or fails with a transient conflict
 /// while another transfer in this process writes it.
 pub(super) fn acquire(request: &TransferRequest) -> Result<DestinationLease, TransferFailure> {
-    acquire_for(request.destination.identity(), &request.final_path)
+    acquire_for(request.destination.identity(), request.final_path())
 }
 
 /// [`acquire`] for a final file of an endpoint.
@@ -84,7 +84,7 @@ pub(super) async fn prepare(
         cancel: request.cancel.clone(),
     };
     let prepare = PrepareRequest {
-        final_destination: FinalDestination::new(request.final_path.clone()),
+        final_destination: FinalDestination::new(request.final_path().clone()),
         source: descriptor.clone(),
         recovery_binding,
     };

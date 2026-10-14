@@ -29,7 +29,6 @@ async fn full_role_transfer_has_no_tail_loss_under_repetition()
             source.clone(),
             path.clone(),
             destination.clone(),
-            path.clone(),
             InflightLimits::new(8, 8 * BLOCK, 8)?,
             CancellationToken::new(),
         );

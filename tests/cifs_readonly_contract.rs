@@ -276,10 +276,10 @@ async fn copy(
             source.clone(),
             StoragePath::new(from)?,
             destination.clone(),
-            StoragePath::new(to)?,
             InflightLimits::new(8, 16 * 1024 * 1024, 8)?,
             CancellationToken::new(),
         )
+        .with_final_path(StoragePath::new(to)?)
         .with_identity_override(TransferIdentity::from_label(format!("ro-{from}-{to}"))?)
         .with_read_back_verification(ReadBackVerification::Enabled),
     )

@@ -108,10 +108,10 @@ async fn copy(
             source.clone(),
             StoragePath::new(from)?,
             destination.clone(),
-            StoragePath::new(to)?,
             InflightLimits::new(8, 16 * 1024 * 1024, 8)?,
             tokio_util::sync::CancellationToken::new(),
         )
+        .with_final_path(StoragePath::new(to)?)
         .with_identity_override(TransferIdentity::from_label(format!("{from}-{to}"))?)
         .with_transfer_policy(policy)
         .with_read_back_verification(read_back),

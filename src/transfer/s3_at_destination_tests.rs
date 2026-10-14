@@ -40,10 +40,10 @@ fn checkpointed_every(
         storage()?,
         StoragePath::new("source")?,
         storage()?,
-        StoragePath::new(final_key)?,
         InflightLimits::new(4, 4 * MIB, 4)?,
         CancellationToken::new(),
     )
+    .with_final_path(StoragePath::new(final_key)?)
     .with_transfer_policy(TransferPolicy::Checkpointed))
 }
 

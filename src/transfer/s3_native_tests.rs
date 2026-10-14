@@ -22,10 +22,10 @@ fn request(
         source,
         StoragePath::new("source")?,
         destination,
-        StoragePath::new("final")?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
+    .with_final_path(StoragePath::new("final")?)
     .with_identity_override(TransferIdentity::from_label("native-s3")?))
 }
 
@@ -326,10 +326,10 @@ async fn cancellation_before_planning_performs_no_native_or_final_mutation() -> 
         request.source,
         StoragePath::new("source")?,
         request.destination,
-        StoragePath::new("final")?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         cancel,
     )
+    .with_final_path(StoragePath::new("final")?)
     .with_identity_override(TransferIdentity::from_label("cancel-native")?);
 
     assert!(transfer(request).await.is_err());
@@ -401,10 +401,10 @@ async fn a_native_copy_up_to_64_mib_is_one_copy_to_the_final_key() -> TestResult
             source.clone(),
             StoragePath::new("source")?,
             destination.clone(),
-            StoragePath::new("final")?,
             InflightLimits::new(2, 4 << 20, 2)?,
             CancellationToken::new(),
         )
+        .with_final_path(StoragePath::new("final")?)
         .with_transfer_policy(policy);
         let outcome = transfer(request).await?;
         assert_eq!(outcome.route, TransferRoute::Native, "{policy:?}");

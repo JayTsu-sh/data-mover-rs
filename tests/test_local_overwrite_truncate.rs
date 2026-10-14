@@ -32,7 +32,6 @@ async fn copy(source: &Storage, destination: &Storage) -> Result<(), Box<dyn std
             source.clone(),
             path.clone(),
             destination.clone(),
-            path,
             InflightLimits::new(8, 8 * 1024 * 1024, 8)?,
             CancellationToken::new(),
         )

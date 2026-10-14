@@ -152,7 +152,7 @@ pub(super) fn recovery_binding(
     recovery_binding_for(
         &request.identity(),
         &request.destination,
-        &request.final_path,
+        request.final_path(),
         descriptor,
     )
 }
@@ -195,7 +195,7 @@ pub(super) fn lend_transfer_roles(
     })?;
     // A directory object (a path ending in '/', P7 F5) only on a side that holds them.
     refuse_unholdable(
-        &request.final_path,
+        request.final_path(),
         &request.destination,
         TransferSide::Destination,
     )?;

@@ -37,10 +37,10 @@ async fn request(
         local(source).await?,
         StoragePath::new("in.bin")?,
         local(destination).await?,
-        StoragePath::new(final_path)?,
         limits()?,
         CancellationToken::new(),
-    ))
+    )
+    .with_final_path(StoragePath::new(final_path)?))
 }
 
 fn roots() -> TestResult<(tempfile::TempDir, tempfile::TempDir)> {
@@ -211,5 +211,57 @@ async fn a_concurrent_transfer_of_the_same_pair_is_refused() -> TestResult {
     held.discard().await?;
     assert_eq!(artifact_suffixes(destination.path())?, Vec::<String>::new());
     assert!(!destination.path().join("out.bin").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_and_explicit_paths_share_identity_while_remapping_changes_it() -> TestResult {
+    let (source, destination) = roots()?;
+    let default = TransferRequest::new(
+        local(source.path()).await?,
+        StoragePath::new("in.bin")?,
+        local(destination.path()).await?,
+        limits()?,
+        CancellationToken::new(),
+    );
+    let explicit = default.clone().with_final_path(StoragePath::new("in.bin")?);
+    assert_eq!(default.final_path(), default.source_path());
+    assert_eq!(default.identity(), explicit.identity());
+    assert_eq!(
+        default.identity(),
+        TransferIdentity::derive(
+            local(source.path()).await?.identity(),
+            &StoragePath::new("in.bin")?,
+            &SourceVersion::Current,
+            local(destination.path()).await?.identity(),
+            &StoragePath::new("in.bin")?,
+        )
+    );
+
+    let remapped = default
+        .clone()
+        .with_final_path(StoragePath::new("renamed.bin")?);
+    assert_ne!(default.identity(), remapped.identity());
+    assert_eq!(remapped.source_path(), &StoragePath::new("in.bin")?);
+    let expected = remapped.identity();
+    assert_eq!(transfer(remapped).await?.identity, expected);
+    assert_eq!(
+        std::fs::read(destination.path().join("renamed.bin"))?,
+        b"payload"
+    );
+    assert!(!destination.path().join("in.bin").exists());
+
+    let label = TransferIdentity::from_label("explicit-root-copy")?;
+    for request in [
+        default
+            .clone()
+            .with_identity_override(label)
+            .with_final_path(StoragePath::new("other.bin")?),
+        default
+            .with_final_path(StoragePath::new("other.bin")?)
+            .with_identity_override(label),
+    ] {
+        assert_eq!(request.identity(), label);
+    }
     Ok(())
 }

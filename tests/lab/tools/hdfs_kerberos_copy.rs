@@ -82,7 +82,6 @@ async fn main() -> Result<()> {
         source.clone(),
         path.clone(),
         destination.clone(),
-        path.clone(),
         copy_support::limits(2 << 20)?,
         CancellationToken::new(),
     ))

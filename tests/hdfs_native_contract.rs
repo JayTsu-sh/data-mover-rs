@@ -655,10 +655,10 @@ async fn verified_copy(
             source.clone(),
             StoragePath::new(from)?,
             destination.clone(),
-            StoragePath::new(to)?,
             InflightLimits::new(2, 2 * 1024 * 1024, 2)?,
             CancellationToken::new(),
         )
+        .with_final_path(StoragePath::new(to)?)
         .with_transfer_policy(policy)
         .with_read_back_verification(ReadBackVerification::Enabled),
     )

@@ -25,10 +25,10 @@ fn direct_request(protocol: &Arc<MemoryS3>) -> TestResult<TransferRequest> {
         storage()?,
         StoragePath::new("source")?,
         storage()?,
-        StoragePath::new("direct-final")?,
         InflightLimits::new(4, 4 * MIB, 4)?,
         CancellationToken::new(),
     )
+    .with_final_path(StoragePath::new("direct-final")?)
     .with_transfer_policy(TransferPolicy::Direct))
 }
 

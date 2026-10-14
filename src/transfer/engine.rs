@@ -374,7 +374,7 @@ async fn run_until_transferred_inner(
     } = lend_transfer_roles(&request)?;
     let descriptor = describe_source(&request, &*source, source_qos.as_ref()).await?;
     // Before any destination I/O, now that the size is known (P7 D13, §14.2).
-    directory_object::refuse_unwritable(&request.final_path, descriptor.size, &*destination)?;
+    directory_object::refuse_unwritable(request.final_path(), descriptor.size, &*destination)?;
     let copied_metadata_plan = copied_metadata_plan(&request, &descriptor).await?;
     let recovery_binding = recovery_binding(&request, &descriptor);
     at_destination::run_until_transferred(
@@ -471,10 +471,10 @@ mod plan_tests {
             source,
             StoragePath::new("source.bin")?,
             destination,
-            StoragePath::new("final.bin")?,
             InflightLimits::new(2, 2 * 64 * 1024, 2)?,
             tokio_util::sync::CancellationToken::new(),
         )
+        .with_final_path(StoragePath::new("final.bin")?)
         .with_transfer_policy(TransferPolicy::Checkpointed);
 
         let transferred = run_until_transferred(request.clone()).await?;

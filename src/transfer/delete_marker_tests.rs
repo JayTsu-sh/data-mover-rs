@@ -63,10 +63,10 @@ async fn a_delete_marker_holds_the_destination_guard() -> TestResult {
         bucket(&protocol)?,
         StoragePath::new("src")?,
         bucket(&protocol)?,
-        StoragePath::new("dst/k")?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
+    .with_final_path(StoragePath::new("dst/k")?)
     .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped);
     let transferred = run_until_transferred(request).await?;
     let Err(busy) = marker(&bucket(&protocol)?, "dst/k").await else {
@@ -159,7 +159,6 @@ async fn a_mixed_history_is_replayed_in_order() -> TestResult {
                 bucket(&source)?,
                 StoragePath::new("m/")?,
                 bucket(&destination)?,
-                StoragePath::new("m/")?,
                 InflightLimits::new(2, 64 * 1024, 2)?,
                 CancellationToken::new(),
             )

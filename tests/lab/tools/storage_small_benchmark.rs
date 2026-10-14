@@ -145,7 +145,6 @@ async fn copy(source: &Storage, destination: &Storage, chunk_bytes: u64) -> Resu
                 source.clone(),
                 path.clone(),
                 destination.clone(),
-                path,
                 limits,
                 CancellationToken::new(),
             )

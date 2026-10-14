@@ -403,10 +403,10 @@ async fn validate_streaming_copy(source: &Storage, destination: &Storage) -> Con
             source.clone(),
             path("fixture.bin")?,
             destination.clone(),
-            path("copied.bin")?,
             InflightLimits::new(4, 256 * 1024, 4)?,
             CancellationToken::new(),
         )
+        .with_final_path(path("copied.bin")?)
         .with_identity_override(TransferIdentity::from_label("nfs3-contract-stream-copy")?)
         .with_source_qos(SourceQosGroup::new(SourceQosPolicy::new(
             Some((1024 * 1024, 1024 * 1024, Duration::ZERO)),
@@ -430,10 +430,10 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
         source.clone(),
         path("cancellation.bin")?,
         destination.clone(),
-        path("restarted.bin")?,
         InflightLimits::new(1, 64 * 1024, 1)?,
         cancel.clone(),
     )
+    .with_final_path(path("restarted.bin")?)
     .with_identity_override(TransferIdentity::from_label("nfs-contract-cancel")?)
     .with_source_qos(SourceQosGroup::new(SourceQosPolicy::new(
         Some((64 * 1024, 64 * 1024, Duration::ZERO)),
@@ -459,10 +459,10 @@ async fn validate_cancel_and_restart(source: &Storage, destination: &Storage) ->
             source.clone(),
             path("cancellation.bin")?,
             destination.clone(),
-            path("restarted.bin")?,
             InflightLimits::new(4, 256 * 1024, 4)?,
             CancellationToken::new(),
         )
+        .with_final_path(path("restarted.bin")?)
         .with_identity_override(TransferIdentity::from_label("nfs-contract-restart")?)
         .with_transfer_policy(TransferPolicy::Checkpointed),
     )

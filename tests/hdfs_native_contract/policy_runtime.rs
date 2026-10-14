@@ -28,10 +28,10 @@ async fn nightly_lab_transfer_policies_and_chunk_boundaries() -> TestResult {
                 storage.clone(),
                 StoragePath::new("source")?,
                 storage.clone(),
-                StoragePath::new("final")?,
                 InflightLimits::new(8, 16 * 1024 * 1024, 8)?,
                 tokio_util::sync::CancellationToken::new(),
             )
+            .with_final_path(StoragePath::new("final")?)
             .with_identity_override(TransferIdentity::from_label(format!(
                 "lab-hdfs-{policy:?}-{size}"
             ))?)
@@ -202,10 +202,10 @@ async fn nightly_lab_local_source_metadata_to_hdfs_policies() -> TestResult {
                 source.clone(),
                 StoragePath::new("source")?,
                 destination.clone(),
-                StoragePath::new(final_path.clone())?,
                 InflightLimits::new(2, 128, 2)?,
                 tokio_util::sync::CancellationToken::new(),
             )
+            .with_final_path(StoragePath::new(final_path.clone())?)
             .with_identity_override(TransferIdentity::from_label(format!(
                 "hdfs-lab-local-metadata-{policy:?}"
             ))?)

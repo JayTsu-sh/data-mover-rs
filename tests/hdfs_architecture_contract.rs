@@ -142,10 +142,10 @@ async fn architecture_roles_traverse_stream_verify_and_overwrite() -> TestResult
             source.clone(),
             StoragePath::new("nested/source.bin")?,
             destination.clone(),
-            StoragePath::new("published/final.bin")?,
             InflightLimits::new(2, 128 * 1024, 2)?,
             CancellationToken::new(),
         )
+        .with_final_path(StoragePath::new("published/final.bin")?)
         .with_identity_override(TransferIdentity::from_label("hdfs-architecture-contract")?),
     )
     .await?;
@@ -179,14 +179,16 @@ async fn native_writer_crosses_block_boundary_through_bounded_transfer() -> Test
     let (destination_client, destination_root) = raw_client(&destination_location)?;
     let payload = Bytes::from(vec![0x3c; 3 * 1024 * 1024 + 257]);
     create_file(&source_client, &source_root, "source.bin", payload.clone()).await?;
-    let outcome = transfer(TransferRequest::new(
-        source.clone(),
-        StoragePath::new("source.bin")?,
-        destination.clone(),
-        StoragePath::new("reordered.bin")?,
-        InflightLimits::new(2, 1024 * 1024, 3)?,
-        CancellationToken::new(),
-    ))
+    let outcome = transfer(
+        TransferRequest::new(
+            source.clone(),
+            StoragePath::new("source.bin")?,
+            destination.clone(),
+            InflightLimits::new(2, 1024 * 1024, 3)?,
+            CancellationToken::new(),
+        )
+        .with_final_path(StoragePath::new("reordered.bin")?),
+    )
     .await?;
     assert_eq!(outcome.blake3, Some(*blake3::hash(&payload).as_bytes()));
     assert_eq!(

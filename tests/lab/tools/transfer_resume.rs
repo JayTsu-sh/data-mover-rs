@@ -187,10 +187,10 @@ fn request(
         source,
         StoragePath::new(source_path)?,
         destination,
-        StoragePath::new(destination_path)?,
         InflightLimits::new(8, 64 << 20, 8)?,
         cancel,
     )
+    .with_final_path(StoragePath::new(destination_path)?)
     .with_transfer_policy(match args.policy {
         Policy::Checkpointed => TransferPolicy::Checkpointed,
         Policy::Atomic => TransferPolicy::AtomicReplace,

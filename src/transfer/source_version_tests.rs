@@ -47,10 +47,10 @@ fn request(protocol: &Arc<MemoryS3>) -> TestResult<TransferRequest> {
         source,
         StoragePath::new("source")?,
         destination,
-        StoragePath::new("final")?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
-    ))
+    )
+    .with_final_path(StoragePath::new("final")?))
 }
 
 /// A named version is copied as it is — streamed or by native copy — although it is not current.

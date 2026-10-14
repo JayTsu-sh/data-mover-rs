@@ -56,10 +56,10 @@ fn request(
         source,
         StoragePath::new(source_path)?,
         destination,
-        StoragePath::new(final_path)?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
-    ))
+    )
+    .with_final_path(StoragePath::new(final_path)?))
 }
 
 /// (phase, side, class) of a failed transfer.

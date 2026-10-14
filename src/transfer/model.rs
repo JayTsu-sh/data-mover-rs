@@ -111,7 +111,7 @@ pub struct TransferRequest {
     input: SourceInput,
     pub(crate) source: Storage,
     pub(crate) destination: Storage,
-    pub(crate) final_path: StoragePath,
+    final_path_override: Option<StoragePath>,
     pub(crate) inflight: InflightLimits,
     pub(crate) cancel: CancellationToken,
     pub(crate) transfer_policy: TransferPolicy,
@@ -192,7 +192,9 @@ impl CopiedMetadataRequest {
 }
 
 impl TransferRequest {
-    /// Creates one transfer attempt from connected storage backends.
+    /// Creates one transfer attempt preserving the source path relative to each storage's root.
+    /// Each backend applies its own configured root/prefix. Use [`Self::with_final_path`] only
+    /// when the destination needs a different relative path.
     ///
     /// Its [`TransferIdentity`] is derived from the two endpoints and paths, so any process
     /// building the same request — with no state of its own — names the same transfer.
@@ -201,19 +203,18 @@ impl TransferRequest {
         source: Storage,
         source_path: StoragePath,
         destination: Storage,
-        final_path: StoragePath,
         inflight: InflightLimits,
         cancel: CancellationToken,
     ) -> Self {
         Self {
             identity_override: None,
+            final_path_override: None,
             input: SourceInput::Path {
                 path: source_path,
                 version: SourceVersion::Current,
             },
             source,
             destination,
-            final_path,
             inflight,
             cancel,
             transfer_policy: TransferPolicy::default(),
@@ -224,7 +225,9 @@ impl TransferRequest {
         }
     }
 
-    /// Copies the file advertised by an observation, revalidating it before destination writes.
+    /// Copies the file advertised by an observation to the same relative path at the destination,
+    /// revalidating it before destination writes. Each backend applies its own root/prefix;
+    /// [`Self::with_final_path`] optionally overrides the destination-relative path.
     /// A history selects the observed current object's version, even if a newer version is
     /// written later. Without a history, the current object must still match the observation.
     /// This copies one object, not every version of a history. Validation checks the backend's
@@ -238,7 +241,6 @@ impl TransferRequest {
         source: Storage,
         observation: ObservedEntry,
         destination: Storage,
-        final_path: StoragePath,
         inflight: InflightLimits,
         cancel: CancellationToken,
     ) -> Result<Self, TransferValueError> {
@@ -257,7 +259,6 @@ impl TransferRequest {
             source,
             observation.path().clone(),
             destination,
-            final_path,
             inflight,
             cancel,
         );
@@ -305,6 +306,24 @@ impl TransferRequest {
         }
     }
 
+    /// The destination-relative path, defaulting to the source-relative path. The destination
+    /// backend applies its own configured root/prefix when accessing this path.
+    #[must_use]
+    pub fn final_path(&self) -> &StoragePath {
+        self.final_path_override
+            .as_ref()
+            .unwrap_or_else(|| self.source_path())
+    }
+
+    /// Overrides the destination-relative path for renaming or directory mapping. Ordinary
+    /// root-to-root copies need no override. The effective path participates in transfer identity
+    /// derivation; a caller-supplied identity override remains unchanged.
+    #[must_use]
+    pub fn with_final_path(mut self, path: StoragePath) -> Self {
+        self.final_path_override = Some(path);
+        self
+    }
+
     /// The source version this request copies.
     #[must_use]
     pub const fn source_version(&self) -> &SourceVersion {
@@ -329,7 +348,7 @@ impl TransferRequest {
                 self.source_path(),
                 self.source_version(),
                 self.destination.identity(),
-                &self.final_path,
+                self.final_path(),
             )
         })
     }

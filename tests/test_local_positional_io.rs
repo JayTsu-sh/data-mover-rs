@@ -38,7 +38,6 @@ async fn local_transfer_beyond_write_queue_reopens_with_identical_digest()
         source,
         path.clone(),
         destination,
-        path.clone(),
         InflightLimits::new(4, 4 * 64 * 1024, 8)?,
         CancellationToken::new(),
     ))

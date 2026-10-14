@@ -60,10 +60,10 @@ fn request(
         storage()?,
         StoragePath::new("source")?,
         storage()?,
-        StoragePath::new(final_key)?,
         InflightLimits::new(4, 4 * MIB, 4)?,
         CancellationToken::new(),
     )
+    .with_final_path(StoragePath::new(final_key)?)
     .with_transfer_policy(policy))
 }
 
@@ -162,10 +162,10 @@ fn native(protocol: &Arc<MemoryS3>, final_key: &str) -> TestResult<TransferReque
         storage()?,
         StoragePath::new("source")?,
         storage()?,
-        StoragePath::new(final_key)?,
         InflightLimits::new(4, 4 * MIB, 4)?,
         CancellationToken::new(),
-    ))
+    )
+    .with_final_path(StoragePath::new(final_key)?))
 }
 
 /// A native S3→S3 copy goes to the final key (ADR-0006 C18) — one `CopyObject`, or an upload

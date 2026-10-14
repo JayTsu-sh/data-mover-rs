@@ -82,7 +82,6 @@ async fn intact_small_and_multi_chunk_transfers_still_match_the_source()
             common::connect_local(source_root.path(), 4).await?,
             path.clone(),
             common::connect_local(destination_root.path(), 4).await?,
-            path.clone(),
             InflightLimits::new(2, 128 * 1024, 2)?,
             CancellationToken::new(),
         ))

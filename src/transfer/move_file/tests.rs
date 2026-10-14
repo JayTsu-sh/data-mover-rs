@@ -28,10 +28,10 @@ fn request(source: Storage, destination: Storage) -> TestResult<TransferRequest>
         source,
         StoragePath::new("source")?,
         destination,
-        StoragePath::new("final")?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
-    ))
+    )
+    .with_final_path(StoragePath::new("final")?))
 }
 
 #[tokio::test]
@@ -61,8 +61,9 @@ async fn preflight_refusal_and_cancel_keep_source_and_destination_untouched() ->
     let root = tempfile::tempdir()?;
     std::fs::write(root.path().join("source"), b"keep")?;
     let storage = connect(root.path())?;
-    let mut same = request(storage.clone(), storage.clone())?;
-    same.final_path = same.source_path().clone();
+    let same = request(storage.clone(), storage.clone())?;
+    let source_path = same.source_path().clone();
+    let same = same.with_final_path(source_path);
     assert!(matches!(move_file(same).await, Err(error) if error.published.is_none()));
     let historical = request(storage.clone(), storage.clone())?
         .with_source_version(SourceVersion::Id("old".into()));

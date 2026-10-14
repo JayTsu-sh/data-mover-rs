@@ -38,10 +38,10 @@ fn request(
         source.clone(),
         observed,
         destination.clone(),
-        StoragePath::new("final")?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
-    )?)
+    )?
+    .with_final_path(StoragePath::new("final")?))
 }
 
 async fn bucket(histories: bool) -> TestResult<(Arc<MemoryS3>, Storage, ObservedEntry)> {
@@ -88,10 +88,10 @@ async fn observed_version_is_pinned_for_streaming_and_native_copy() -> TestResul
             storage.clone(),
             StoragePath::new("source")?,
             storage.clone(),
-            StoragePath::new("final")?,
             InflightLimits::new(2, 64 * 1024, 2)?,
             CancellationToken::new(),
         )
+        .with_final_path(StoragePath::new("final")?)
         .with_source_version(SourceVersion::Id("v2".into()))
         .identity();
         assert_eq!(request.identity(), expected_identity);

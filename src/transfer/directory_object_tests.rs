@@ -59,10 +59,10 @@ fn request(
         source,
         StoragePath::new(source_path)?,
         destination,
-        StoragePath::new(final_path)?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
-    ))
+    )
+    .with_final_path(StoragePath::new(final_path)?))
 }
 
 /// The diagnostic of a failed transfer's entry failure.

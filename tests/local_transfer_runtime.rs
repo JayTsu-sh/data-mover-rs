@@ -27,7 +27,6 @@ async fn request(source: &Path, destination: &Path) -> TestResult<TransferReques
         local(source).await?,
         StoragePath::new("file.bin")?,
         local(destination).await?,
-        StoragePath::new("file.bin")?,
         InflightLimits::new(8, 8 * 1024 * 1024, 8)?,
         CancellationToken::new(),
     ))
@@ -94,7 +93,6 @@ async fn precancelled_copy_preserves_existing_destination() -> TestResult {
             local(source.path()).await?,
             StoragePath::new("file.bin")?,
             local(destination.path()).await?,
-            StoragePath::new("file.bin")?,
             InflightLimits::new(1, 1024 * 1024, 128)?,
             cancel,
         )
@@ -145,10 +143,10 @@ async fn checkpointed_syncs_new_parent_directories() -> TestResult {
         local(source.path()).await?,
         StoragePath::new("file.bin")?,
         local(destination.path()).await?,
-        StoragePath::new("new/child/file.bin")?,
         InflightLimits::new(1, 1024 * 1024, 1)?,
         CancellationToken::new(),
     )
+    .with_final_path(StoragePath::new("new/child/file.bin")?)
     .with_identity_override(TransferIdentity::from_label("native-new-parent")?)
     .with_transfer_policy(TransferPolicy::Checkpointed);
     transfer(request).await?;

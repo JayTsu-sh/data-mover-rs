@@ -93,7 +93,6 @@ async fn optimized_copy(args: &Args) -> Result<(u64, u128), Box<dyn std::error::
                     source,
                     path.clone(),
                     destination,
-                    path,
                     InflightLimits::new(inflight, inflight_bytes, inflight)?,
                     CancellationToken::new(),
                 )

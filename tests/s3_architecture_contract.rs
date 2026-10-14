@@ -99,10 +99,10 @@ fn transfer_request(
         storage.clone(),
         source.clone(),
         storage.clone(),
-        final_path,
         InflightLimits::new(4, PART_SIZE, 4)?,
         CancellationToken::new(),
     )
+    .with_final_path(final_path)
     .with_identity_override(TransferIdentity::from_label(format!(
         "s3-contract-{identity}"
     ))?))

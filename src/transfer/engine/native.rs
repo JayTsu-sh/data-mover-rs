@@ -45,7 +45,7 @@ async fn prepare_native_stage(
         ResumeMode::Restart
     };
     let prepare = PrepareRequest {
-        final_destination: FinalDestination::new(request.final_path.clone()),
+        final_destination: FinalDestination::new(request.final_path().clone()),
         source: input.descriptor.clone(),
         recovery_binding: input.recovery_binding,
     };

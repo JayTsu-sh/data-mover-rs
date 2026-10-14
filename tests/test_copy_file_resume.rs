@@ -34,7 +34,6 @@ async fn repeated_role_transfers_derive_the_same_identity_and_publish_exact_cont
         source.clone(),
         path.clone(),
         destination.clone(),
-        path.clone(),
         limits,
         CancellationToken::new(),
     ))
@@ -43,7 +42,6 @@ async fn repeated_role_transfers_derive_the_same_identity_and_publish_exact_cont
         source,
         path.clone(),
         destination,
-        path.clone(),
         limits,
         CancellationToken::new(),
     ))

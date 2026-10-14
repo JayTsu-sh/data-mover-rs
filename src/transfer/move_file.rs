@@ -130,7 +130,7 @@ fn validate(request: &TransferRequest) -> Result<(), MoveError> {
         ));
     }
     if request.source.identity() == request.destination.identity()
-        && request.source_path() == &request.final_path
+        && request.source_path() == request.final_path()
     {
         return Err(MoveError::InvalidRequest(
             "move source and destination are identical",

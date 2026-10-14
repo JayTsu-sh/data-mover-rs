@@ -230,7 +230,6 @@ impl Replay {
             self.source.clone(),
             path.clone(),
             self.destination.clone(),
-            path,
             InflightLimits::new(4, 64 * 1024 * 1024, 4)?,
             CancellationToken::new(),
         )

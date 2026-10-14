@@ -91,7 +91,6 @@ async fn explicit_factory_handles_source_and_destination_without_pair_dispatch()
         source,
         path.clone(),
         destination,
-        path,
         InflightLimits::new(2, 128 * 1024, 2)?,
         CancellationToken::new(),
     )

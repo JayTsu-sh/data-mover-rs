@@ -132,7 +132,6 @@ async fn main() -> Result<(), Error> {
                     source,
                     path.clone(),
                     destination,
-                    path,
                     inflight,
                     CancellationToken::new(),
                 )

@@ -33,10 +33,10 @@ fn request(protocol: &Arc<MemoryS3>, final_path: &str) -> TestResult<TransferReq
         source,
         StoragePath::new("source")?,
         destination,
-        StoragePath::new(final_path)?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     )
+    .with_final_path(StoragePath::new(final_path)?)
     // The same fake on both ends would otherwise copy natively.
     .with_payload_shaping(PayloadShapingPolicy::RequireClientShaped))
 }

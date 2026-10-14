@@ -348,10 +348,10 @@ impl SeedFiles<'_> {
                 self.source.clone(),
                 StoragePath::new(name)?,
                 self.storage.clone(),
-                StoragePath::new(destination)?,
                 self.inflight,
                 CancellationToken::new(),
             )
+            .with_final_path(StoragePath::new(destination)?)
             .with_identity_override(TransferIdentity::from_label(format!(
                 "seed-{}-{index}",
                 std::process::id()

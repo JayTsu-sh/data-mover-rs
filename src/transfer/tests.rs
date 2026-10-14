@@ -481,10 +481,10 @@ async fn streaming_transfer_uses_one_source_stream_with_inflight_reads()
         source,
         StoragePath::new("source.bin")?,
         local_destination(destination_root.path())?,
-        StoragePath::new("final.bin")?,
         InflightLimits::new(4, CHUNK_BYTES, 4)?,
         tokio_util::sync::CancellationToken::new(),
     )
+    .with_final_path(StoragePath::new("final.bin")?)
     .with_identity_override(TransferIdentity::from_label("source-range-inflight")?)
     .with_transfer_policy(TransferPolicy::AtomicReplace);
 
@@ -1019,10 +1019,10 @@ async fn local_transfer_reaches_durable_unpublished_state() -> Result<(), Box<dy
             source,
             StoragePath::new("source.bin")?,
             destination,
-            StoragePath::new("final.bin")?,
             InflightLimits::new(2, 64 * 1024, 2)?,
             tokio_util::sync::CancellationToken::new(),
         )
+        .with_final_path(StoragePath::new("final.bin")?)
         .with_identity_override(TransferIdentity::from_label("local-copy")?),
         None,
     );
@@ -1052,10 +1052,10 @@ async fn cancellation_before_prepare_leaves_no_staged_or_final_mutation()
         local_source(source_root.path())?,
         StoragePath::new("source.bin")?,
         local_destination(destination_root.path())?,
-        StoragePath::new("final.bin")?,
         InflightLimits::new(2, 64 * 1024, 2)?,
         cancel,
     )
+    .with_final_path(StoragePath::new("final.bin")?)
     .with_identity_override(TransferIdentity::from_label("cancelled-copy")?);
 
     let Err(error) = run_until_transferred(request).await else {
@@ -1082,10 +1082,10 @@ async fn preflight_refusal_happens_before_destination_mutation()
         local_source(source_root.path())?,
         StoragePath::new("source.bin")?,
         destination,
-        StoragePath::new("final.bin")?,
         InflightLimits::new(1, 4096, 1)?,
         tokio_util::sync::CancellationToken::new(),
     )
+    .with_final_path(StoragePath::new("final.bin")?)
     .with_identity_override(TransferIdentity::from_label("preflight-copy")?);
 
     let Err(error) = run_until_transferred(request).await else {
@@ -1247,11 +1247,11 @@ fn derived_transfer_request(
         source,
         StoragePath::new("source.bin")?,
         destination,
-        StoragePath::new("final.bin")?,
         // Two 64 KiB reads may be resident together, so the byte budget covers both chunks.
         InflightLimits::new(2, 2 * 64 * 1024, 2)?,
         cancel,
     )
+    .with_final_path(StoragePath::new("final.bin")?)
     .with_transfer_policy(TransferPolicy::AtomicReplace))
 }
 

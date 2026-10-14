@@ -368,10 +368,10 @@ fn request(
         source,
         StoragePath::new("source.bin")?,
         destination.storage()?,
-        StoragePath::new("out/final.bin")?,
         InflightLimits::new(2, 2 * 64 * 1024, 2)?,
         CancellationToken::new(),
     )
+    .with_final_path(StoragePath::new("out/final.bin")?)
     .with_transfer_policy(TransferPolicy::Checkpointed))
 }
 

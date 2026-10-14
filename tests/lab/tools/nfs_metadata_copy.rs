@@ -211,10 +211,10 @@ fn request(
         source.clone(),
         StoragePath::new(source_path)?,
         destination.clone(),
-        StoragePath::new(destination_path)?,
         InflightLimits::new(4, 4 << 20, 4)?,
         CancellationToken::new(),
     )
+    .with_final_path(StoragePath::new(destination_path)?)
     .with_identity_override(TransferIdentity::from_label(format!(
         "metadata-copy-{}",
         process::id()

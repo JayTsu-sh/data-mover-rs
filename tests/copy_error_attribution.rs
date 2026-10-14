@@ -24,7 +24,6 @@ async fn a_source_removed_after_observation_is_attributed_to_describe()
         source,
         path.clone(),
         destination,
-        path,
         InflightLimits::new(2, 64 * 1024, 2)?,
         CancellationToken::new(),
     ))
@@ -52,14 +51,16 @@ async fn an_unwritable_destination_is_attributed_to_destination_prepare()
     let source = common::connect_local(source_root.path(), 4).await?;
     let destination = common::connect_local(destination_root.path(), 4).await?;
 
-    let Err(failure) = transfer(TransferRequest::new(
-        source,
-        StoragePath::new("file")?,
-        destination,
-        StoragePath::new("blocker/child")?,
-        InflightLimits::new(2, 64 * 1024, 2)?,
-        CancellationToken::new(),
-    ))
+    let Err(failure) = transfer(
+        TransferRequest::new(
+            source,
+            StoragePath::new("file")?,
+            destination,
+            InflightLimits::new(2, 64 * 1024, 2)?,
+            CancellationToken::new(),
+        )
+        .with_final_path(StoragePath::new("blocker/child")?),
+    )
     .await
     else {
         panic!("a file unexpectedly became a parent directory");
