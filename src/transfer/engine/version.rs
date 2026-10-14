@@ -12,7 +12,7 @@ pub(super) fn preflight_source_version(
 ) -> Result<(), TransferFailure> {
     let refuse = |class, message| {
         let failure = EntryOperationFailure::new(
-            request.source_path.clone(),
+            request.source_path().clone(),
             Operation::Observe,
             class,
             Transience::Permanent,
@@ -27,13 +27,13 @@ pub(super) fn preflight_source_version(
             StorageRoleFailure::Entry(failure),
         ))
     };
-    if request.source_version.validate().is_err() {
+    if request.source_version().validate().is_err() {
         return refuse(
             FailureClass::InvalidInput,
             "a source version id must be non-empty, bounded and free of NUL",
         );
     }
-    if request.source_version != SourceVersion::Current && !source.supports_source_versions() {
+    if request.source_version() != &SourceVersion::Current && !source.supports_source_versions() {
         return refuse(
             FailureClass::Unsupported,
             "this source has no versions to select",

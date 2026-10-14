@@ -87,7 +87,7 @@ pub async fn move_file(mut request: TransferRequest) -> Result<TransferOutcome, 
         .read_source()
         .map_err(MoveError::Capability)?;
     let before = source
-        .describe(&request.source_path)
+        .describe(request.source_path())
         .await
         .map_err(MoveError::Source)?;
     if before.kind != EntryKind::File {
@@ -102,14 +102,14 @@ pub async fn move_file(mut request: TransferRequest) -> Result<TransferOutcome, 
             return Err(MoveError::Cancelled);
         }
         let after = source
-            .describe(&request.source_path)
+            .describe(request.source_path())
             .await
             .map_err(MoveError::Source)?;
         if !same_source(&before, &after) {
             return Err(MoveError::SourceChanged);
         }
         namespace
-            .delete(&request.source_path)
+            .delete(request.source_path())
             .await
             .map_err(MoveError::Source)
     }
@@ -124,13 +124,13 @@ pub async fn move_file(mut request: TransferRequest) -> Result<TransferOutcome, 
 }
 
 fn validate(request: &TransferRequest) -> Result<(), MoveError> {
-    if request.source_version != SourceVersion::Current {
+    if request.source_version() != &SourceVersion::Current {
         return Err(MoveError::InvalidRequest(
             "move cannot delete a selected historical version",
         ));
     }
     if request.source.identity() == request.destination.identity()
-        && request.source_path == request.final_path
+        && request.source_path() == &request.final_path
     {
         return Err(MoveError::InvalidRequest(
             "move source and destination are identical",

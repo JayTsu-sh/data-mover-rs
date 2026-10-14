@@ -22,8 +22,7 @@ use crate::storage::{
 };
 use crate::transfer::{InflightLimits, TransferIdentity, TransferPolicy};
 
-#[path = "expert_observation.rs"]
-mod observation;
+use super::observation;
 
 /// Inputs owned by the source process for one expert transfer attempt.
 #[derive(Clone)]

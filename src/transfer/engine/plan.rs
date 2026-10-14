@@ -43,13 +43,24 @@ pub(super) async fn describe_source(
         ));
     }
     version::preflight_source_version(request, source)?;
+    if let Some(observed) = request.source_observation()
+        && observed.source_version().as_ref() != Some(request.source_version())
+    {
+        return Err(TransferFailure::orchestration(
+            TransferPhase::Preflight,
+            "selected source version differs from the observation",
+        ));
+    }
     // A versioned source pins the version it describes, `Current` included.
     let descriptor = source
-        .describe_version(&request.source_path, &request.source_version)
+        .describe_version(request.source_path(), request.source_version())
         .await
         .map_err(|error| {
             TransferFailure::role(TransferPhase::Describe, TransferSide::Source, error)
         })?;
+    if let Some(observed) = request.source_observation() {
+        super::observation::validate_observation(source, observed, &descriptor)?;
+    }
     if let (Some(budget), Some(size)) = (source_qos, descriptor.size) {
         budget.set_logical_bytes(size);
     }
@@ -139,7 +150,7 @@ pub(super) fn recovery_binding(
     descriptor: &SourceDescriptor,
 ) -> [u8; 32] {
     recovery_binding_for(
-        &request.identity,
+        &request.identity(),
         &request.destination,
         &request.final_path,
         descriptor,
@@ -188,7 +199,7 @@ pub(super) fn lend_transfer_roles(
         &request.destination,
         TransferSide::Destination,
     )?;
-    refuse_unholdable(&request.source_path, &request.source, TransferSide::Source)?;
+    refuse_unholdable(request.source_path(), &request.source, TransferSide::Source)?;
     if request.transfer_policy == TransferPolicy::Direct && !destination.supports_direct() {
         return Err(TransferFailure::capability(
             TransferSide::Destination,

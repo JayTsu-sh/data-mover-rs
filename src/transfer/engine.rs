@@ -33,6 +33,7 @@ mod failure;
 mod guard;
 mod native;
 mod negotiation;
+mod observation;
 mod payload;
 mod plan;
 mod positioned;

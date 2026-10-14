@@ -39,6 +39,8 @@ mod hdfs_policy_tests;
 #[cfg(test)]
 mod hdfs_tests;
 #[cfg(test)]
+mod observation_tests;
+#[cfg(test)]
 mod s3_at_destination_tests;
 #[cfg(test)]
 mod s3_direct_tests;

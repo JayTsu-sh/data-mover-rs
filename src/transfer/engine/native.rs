@@ -52,7 +52,7 @@ async fn prepare_native_stage(
     let mut stage = input
         .pair
         .prepare_native(
-            DestinationPrepareRequest::new(prepare, *request.identity.as_bytes())
+            DestinationPrepareRequest::new(prepare, *request.identity().as_bytes())
                 .with_resume(resume)
                 .with_recoverable(false),
         )
@@ -184,7 +184,7 @@ async fn finish_native(
     }
     let effective_recovery = recovery(&stage, input.plan, native.single_operation);
     Ok(Transferred {
-        identity: request.identity,
+        identity: request.identity(),
         destination: input.destination,
         stage,
         write: native.write,

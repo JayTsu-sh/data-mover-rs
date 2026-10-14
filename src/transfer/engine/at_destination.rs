@@ -73,7 +73,7 @@ pub(super) async fn prepare(
 ) -> Result<PreparedStage, TransferFailure> {
     let spec = Spec {
         policy: request.transfer_policy,
-        identity: request.identity,
+        identity: request.identity(),
         // Only a checkpointed transfer that keeps checkpoints may continue a stage; AtomicReplace
         // cleans up whatever it finds and starts from zero. Direct writes the final file in place
         // through `prepare_direct`; a destination that keeps artifacts cleans them there (Local
@@ -184,7 +184,7 @@ pub(super) async fn run_until_transferred(
     };
     let effective_recovery = final_recovery(&stage, plan);
     Ok(Transferred {
-        identity: request.identity,
+        identity: request.identity(),
         destination,
         stage,
         write: evidence.write,

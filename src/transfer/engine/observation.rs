@@ -1,5 +1,4 @@
-//! The source half's check that the object it is about to stream is the one the observation
-//! advertised.
+//! Shared checks that a transfer source still matches the advertised observation.
 
 use super::{TransferFailure, TransferPhase, TransferSide};
 use crate::model::{EntryKind, ObservedEntry};
@@ -43,12 +42,23 @@ fn refuse_without_current_object(observation: &ObservedEntry) -> Result<(), Tran
     ))
 }
 
-fn validate_observation(
+pub(super) fn validate_observation(
     source: &dyn ReadSource,
     observation: &ObservedEntry,
     descriptor: &SourceDescriptor,
 ) -> Result<(), TransferFailure> {
-    if observation.kind() != EntryKind::File
+    // Stable file identities survive in-place edits. Compare modification times as well when
+    // both operations supplied them; backends such as S3 match content through their identity.
+    let modified_changed = observation
+        .modified()
+        .zip(
+            descriptor
+                .inline_timestamps
+                .and_then(|times| times.modified),
+        )
+        .is_some_and(|(observed, described)| observed != described);
+    if modified_changed
+        || observation.kind() != EntryKind::File
         || descriptor.kind != EntryKind::File
         || observation.path() != &descriptor.path
         || observation.size() != descriptor.size

@@ -2,7 +2,7 @@ use std::fmt;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{SourceVersion, StoragePath};
+use crate::model::{EntryKind, ObservedEntry, SourceVersion, StoragePath};
 use crate::storage::{SourceQosGroup, Storage};
 
 use super::TransferIdentity;
@@ -107,12 +107,9 @@ impl InflightLimits {
 /// Immutable inputs for one transfer attempt.
 #[derive(Clone)]
 pub struct TransferRequest {
-    pub(crate) identity: TransferIdentity,
-    /// Whether `identity` is a caller override, which a source version must not re-derive.
-    identity_overridden: bool,
-    pub(crate) source_version: SourceVersion,
+    identity_override: Option<TransferIdentity>,
+    input: SourceInput,
     pub(crate) source: Storage,
-    pub(crate) source_path: StoragePath,
     pub(crate) destination: Storage,
     pub(crate) final_path: StoragePath,
     pub(crate) inflight: InflightLimits,
@@ -122,6 +119,20 @@ pub struct TransferRequest {
     pub(crate) payload_shaping: PayloadShapingPolicy,
     pub(crate) read_back: ReadBackVerification,
     pub(crate) copied_metadata: CopiedMetadataRequest,
+}
+
+/// One source selection, optionally constrained by an observation. An observed selection
+/// takes its path directly from the entry, so the two cannot disagree.
+#[derive(Clone)]
+enum SourceInput {
+    Path {
+        path: StoragePath,
+        version: SourceVersion,
+    },
+    Observed {
+        entry: Box<ObservedEntry>,
+        version: SourceVersion,
+    },
 }
 
 /// The optional metadata features a copy should carry, beyond the baseline — the "should" of a
@@ -194,19 +205,13 @@ impl TransferRequest {
         inflight: InflightLimits,
         cancel: CancellationToken,
     ) -> Self {
-        let identity = TransferIdentity::derive(
-            source.identity(),
-            &source_path,
-            &SourceVersion::Current,
-            destination.identity(),
-            &final_path,
-        );
         Self {
-            identity,
-            identity_overridden: false,
-            source_version: SourceVersion::Current,
+            identity_override: None,
+            input: SourceInput::Path {
+                path: source_path,
+                version: SourceVersion::Current,
+            },
             source,
-            source_path,
             destination,
             final_path,
             inflight,
@@ -219,45 +224,114 @@ impl TransferRequest {
         }
     }
 
+    /// Copies the file advertised by an observation, revalidating it before destination writes.
+    /// A history selects the observed current object's version, even if a newer version is
+    /// written later. Without a history, the current object must still match the observation.
+    /// This copies one object, not every version of a history. Validation checks the backend's
+    /// identity, size, and modification time when both observations provide it; it does not
+    /// turn an observation into a content snapshot.
+    ///
+    /// # Errors
+    /// Rejects an observation from another storage, a non-file entry, a deleted key, or a
+    /// history segment that does not identify the current object.
+    pub fn from_observation(
+        source: Storage,
+        observation: ObservedEntry,
+        destination: Storage,
+        final_path: StoragePath,
+        inflight: InflightLimits,
+        cancel: CancellationToken,
+    ) -> Result<Self, TransferValueError> {
+        if observation.source_identity().backend() != source.identity() {
+            return Err(TransferValueError(
+                "observation belongs to another source storage",
+            ));
+        }
+        if observation.kind() != EntryKind::File {
+            return Err(TransferValueError("an observed transfer requires a file"));
+        }
+        let version = observation.source_version().ok_or(TransferValueError(
+            "observation does not identify a current object",
+        ))?;
+        let mut request = Self::new(
+            source,
+            observation.path().clone(),
+            destination,
+            final_path,
+            inflight,
+            cancel,
+        );
+        request.input = SourceInput::Observed {
+            entry: Box::new(observation),
+            version,
+        };
+        Ok(request)
+    }
+
     /// Names the transfer with a caller-chosen identity instead of the derived one. The binding
     /// still covers both paths and the destination, but an interrupted transfer is only resumed
     /// by a request carrying the same override.
     #[must_use]
     pub const fn with_identity_override(mut self, identity: TransferIdentity) -> Self {
-        self.identity = identity;
-        self.identity_overridden = true;
+        self.identity_override = Some(identity);
         self
     }
 
     /// Copies one stored version of the source instead of the current one (`SourceVersion::Id`,
     /// S3 only: any other source fails at preflight, before the destination is touched). The
     /// selector is part of the derived identity, so each version is its own transfer; an identity
-    /// override stays as given, whichever of the two is called first.
+    /// override stays as given, whichever of the two is called first. For an observed request,
+    /// selecting a different version is refused at preflight: its observation cannot describe
+    /// another version. Use a path request to select an arbitrary historical version.
     #[must_use]
     pub fn with_source_version(mut self, version: SourceVersion) -> Self {
-        if !self.identity_overridden {
-            self.identity = TransferIdentity::derive(
-                self.source.identity(),
-                &self.source_path,
-                &version,
-                self.destination.identity(),
-                &self.final_path,
-            );
+        match &mut self.input {
+            SourceInput::Path {
+                version: selected, ..
+            }
+            | SourceInput::Observed {
+                version: selected, ..
+            } => *selected = version,
         }
-        self.source_version = version;
         self
+    }
+
+    /// The source path, taken from the observation when one was supplied.
+    #[must_use]
+    pub fn source_path(&self) -> &StoragePath {
+        match &self.input {
+            SourceInput::Path { path, .. } => path,
+            SourceInput::Observed { entry, .. } => entry.path(),
+        }
     }
 
     /// The source version this request copies.
     #[must_use]
     pub const fn source_version(&self) -> &SourceVersion {
-        &self.source_version
+        match &self.input {
+            SourceInput::Path { version, .. } | SourceInput::Observed { version, .. } => version,
+        }
     }
 
-    /// The identity this request transfers under: derived, or the override.
+    pub(crate) fn source_observation(&self) -> Option<&ObservedEntry> {
+        match &self.input {
+            SourceInput::Path { .. } => None,
+            SourceInput::Observed { entry, .. } => Some(entry),
+        }
+    }
+
+    /// The identity this request transfers under: derived from its current selection, or overridden.
     #[must_use]
-    pub const fn identity(&self) -> TransferIdentity {
-        self.identity
+    pub fn identity(&self) -> TransferIdentity {
+        self.identity_override.unwrap_or_else(|| {
+            TransferIdentity::derive(
+                self.source.identity(),
+                self.source_path(),
+                self.source_version(),
+                self.destination.identity(),
+                &self.final_path,
+            )
+        })
     }
 
     /// Asks the copy to carry optional metadata families. Left alone, a transfer carries the
