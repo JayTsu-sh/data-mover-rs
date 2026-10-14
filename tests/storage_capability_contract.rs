@@ -25,7 +25,12 @@ fn preflight_allows_supported_and_rejects_unsupported() -> Result<(), Box<dyn st
                     assert!(capabilities.preflight(capability).is_ok());
                 }
                 CapabilityAvailability::Unsupported(_) => {
-                    let error = capabilities.preflight(capability).unwrap_err();
+                    let Err(error) = capabilities.preflight(capability) else {
+                        return Err(format!(
+                            "unsupported capability {capability:?} passed preflight"
+                        )
+                        .into());
+                    };
                     assert_eq!(error.capability(), capability);
                     assert_eq!(error.availability(), &availability);
                 }
