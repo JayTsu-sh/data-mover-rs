@@ -352,9 +352,12 @@ fi
 # The ETag of an object one request wrote is its MD5 (or at least not a multipart -<parts> one): a
 # heuristic that holds on the stores listed in SKILL.md; the untouched real files below decide.
 one_request() { local e; e=$(s3c -I "$H/$VB/$(enc "$1" /)" | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: *//p'); [ -n "$e" ] && [[ $e != *-* ]] && echo yes || echo "no (ETag ${e:-none})"; }
-out=$("$TR" --source "$LOCAL/src" --source-path big --seed-bytes "$BIG" --destination "s3:$P" --destination-path big/ 2>"$WORK/seed.err")
-check "seed big/ ($BIG_MB MiB, one PUT to a d/ key)" "$(jq -r .result <<<"$out" 2>/dev/null) $(one_request "${P}big/")" "ok yes"
-[ "$(jq -r .result <<<"$out" 2>/dev/null)" = ok ] || { echo "   $out"; tail -3 "$WORK/seed.err" | sed 's/^/   /'; }
+# A local file cannot have a trailing slash. Seed the S3 directory object directly, then
+# exercise migration between S3 roots with the same relative object name.
+mkdir -p "$LOCAL/src"
+truncate -s "$BIG" "$LOCAL/src/big"
+code=$(s3c -o /dev/null -w '%{http_code}' -T "$LOCAL/src/big" "$H/$VB/$(enc "${P}big/" /)")
+check "seed big/ ($BIG_MB MiB, single PUT fixture)" "$code $(one_request "${P}big/")" "200 yes"
 
 echo "== role traversal, current objects"
 traverse "$WORK/cur" --current --sizes
@@ -443,10 +446,13 @@ compare "native dirobj/" dirobj/ native/ dirobj/
 REAL='a real file'
 put copy/mid "$REAL"; put copy/big "$REAL"; put native/big "$REAL"
 MID=$((12 * 1024 * 1024))
+truncate -s "$MID" "$LOCAL/src/mid"
+code=$(s3c -o /dev/null -w '%{http_code}' -T "$LOCAL/src/mid" "$H/$VB/$(enc "${P}mid/" /)")
+check "seed mid/ fixture" "$code" 200
 for policy in checkpointed atomic direct; do
-  copy "mid/ (12 MiB) Local→S3, $policy" ok --source "$LOCAL/src" --source-path mid --seed-bytes "$MID" --destination "s3:${P}copy/" --destination-path mid/ --policy "$policy"
+  copy "mid/ (12 MiB) streamed S3→S3, $policy" ok --source "s3:$P" --source-path mid/ --destination "s3:${P}copy/" --destination-path mid/ --policy "$policy" --client-shaped
   check "mid/ ($policy): one request" "$(one_request "${P}copy/mid/")" yes
-  out=$("$TR" --source "$LOCAL/src" --source-path mid --destination "s3:${P}copy/" --destination-path mid/ --compare 2>&1)
+  out=$("$TR" --source "s3:$P" --source-path mid/ --destination "s3:${P}copy/" --destination-path mid/ --compare 2>&1)
   check "mid/ ($policy) equal" "$(jq -r .content_equal <<<"$out" 2>/dev/null)" true
 done
 BIGARGS=(--source "s3:$P" --source-path big/ --destination "s3:${P}copy/" --destination-path big/ --client-shaped)

@@ -112,7 +112,8 @@ done
   for rb in on off; do
     for entry in "${SIZES[@]}"; do
       name=${entry%%:*}
-      case_ "$policy rb=$rb $name" "$policy-$rb-$name" --source "$WORK/src" --source-path "$name" \
+      ln "$WORK/src/$name" "$WORK/src/$policy-$rb-$name"
+      case_ "$policy rb=$rb $name" "$policy-$rb-$name" --source "$WORK/src" --source-path "$policy-$rb-$name" \
         --destination "s3:$PREFIX" --destination-path "$policy-$rb-$name" \
         --policy "$policy" --read-back "$rb" --identity "m-$RUN-$policy-$rb-$name"
       [ "$policy" = direct ] && direct_verdict "$policy-$rb-$name" "$WORK/src/$name"
@@ -122,33 +123,35 @@ done
 
 echo "-- native S3 -> S3"
 [ "$RESUME_ONLY" = 1 ] || for name in k1 m200; do
-  case_ "native $name" "native-$name" --source "s3:$PREFIX" --source-path "atomic-off-$name" \
-    --destination "s3:$PREFIX" --destination-path "native-$name" --policy checkpointed \
+  case_ "native $name" "native/atomic-off-$name" --source "s3:$PREFIX" --source-path "atomic-off-$name" \
+    --destination "s3:$PREFIX/native" --destination-path "atomic-off-$name" --policy checkpointed \
     --identity "n-$RUN-$name"
-  native_verdict "native-$name" "$WORK/src/$name"
+  native_verdict "native/atomic-off-$name" "$WORK/src/$name"
 done
 
 # The cut lands after the first 64 MiB checkpoint (the parts the service acknowledged, up to four
 # 8 MiB parts behind the reads): 12 s at 20 MiB/s, so the cancelled stage is recoverable. An earlier
 # SIGKILL resumes too (the pointer is written when the upload begins, ADR-0006 C16).
 echo "-- interrupt (cancel) then resume, checkpointed m200 at 20 MiB/s"
-case_ "cancel after 12 s" resume-cancel --source "$WORK/src" --source-path m200 --destination "s3:$PREFIX" \
+ln "$WORK/src/m200" "$WORK/src/resume-cancel"
+ln "$WORK/src/m200" "$WORK/src/resume-kill"
+case_ "cancel after 12 s" resume-cancel --source "$WORK/src" --source-path resume-cancel --destination "s3:$PREFIX" \
   --destination-path resume-cancel --policy checkpointed --identity "r-$RUN-cancel" \
   --bandwidth 20971520 --cancel-after-ms 12000
 left_at resume-cancel
-case_ "resume (same identity)" resume-cancel --source "$WORK/src" --source-path m200 --destination "s3:$PREFIX" \
+case_ "resume (same identity)" resume-cancel --source "$WORK/src" --source-path resume-cancel --destination "s3:$PREFIX" \
   --destination-path resume-cancel --policy checkpointed --identity "r-$RUN-cancel"
 left_at resume-cancel
 
 echo "-- interrupt (SIGKILL) then resume"
 remember_key resume-kill
-timeout -s KILL 12 "$BIN" --source "$WORK/src" --source-path m200 --destination "s3:$PREFIX" \
+timeout -s KILL 12 "$BIN" --source "$WORK/src" --source-path resume-kill --destination "s3:$PREFIX" \
   --destination-path resume-kill --policy checkpointed --identity "r-$RUN-kill" \
   --bandwidth 20971520 >/dev/null 2>&1
 printf '%-44s %s  | artifacts=%s key_uploads=%s\n' "killed after 12 s" "exit=$?" "$(artifacts)" \
   "$(key_uploads resume-kill)"
 left_at resume-kill
-case_ "resume (same identity)" resume-kill --source "$WORK/src" --source-path m200 --destination "s3:$PREFIX" \
+case_ "resume (same identity)" resume-kill --source "$WORK/src" --source-path resume-kill --destination "s3:$PREFIX" \
   --destination-path resume-kill --policy checkpointed --identity "r-$RUN-kill"
 left_at resume-kill
 

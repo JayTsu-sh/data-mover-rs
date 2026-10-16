@@ -150,7 +150,10 @@ for line in open(sys.argv[1], errors="replace"):
   { cat "$WORK/seed.out" >&2; exit 1; }
 echo "run=$RUN dest=$DEST size=$SIZE bw=$BW cut_ms=$CUT_MS"
 for mode in cancel kill; do
-  args=(--source "$WORK/src" --source-path src "${TARGET[@]}" --destination-path "$(path_of "$mode")"
+  relative=$(path_of "$mode")
+  mkdir -p "$WORK/fixtures/$(dirname "$relative")"
+  ln "$WORK/src/src" "$WORK/fixtures/$relative"
+  args=(--source "$WORK/fixtures" --source-path "$relative" "${TARGET[@]}" --destination-path "$relative"
         --policy checkpointed)
   fresh_env
   if [ $mode = cancel ]; then
@@ -191,7 +194,7 @@ except Exception: print("?")' "$second")
 try: out = json.loads(sys.argv[1])
 except Exception: out = {}
 print("[%s]   prepare=%s reused_bytes=%s" % (sys.argv[2], out.get("prepare", "?"), out.get("reused_bytes", "?")))' "$second" "$mode"
-  same=$("$BIN" --source "$WORK/src" --source-path src "${TARGET[@]}" --destination-path "$(path_of "$mode")" \
+  same=$("$BIN" "${args[@]}" \
     --compare 2>&1 | tail -1 | python3 -c 'import json,sys
 try: print("yes" if json.load(sys.stdin)["content_equal"] else "NO")
 except Exception: print("? (no comparison)")')

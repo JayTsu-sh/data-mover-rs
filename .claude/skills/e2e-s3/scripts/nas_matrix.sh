@@ -61,14 +61,22 @@ cleanup() {
       case "$k" in "$PREFIX/"*) s3c -o /dev/null -X DELETE "$B/$k" ;; esac
     done
   done
-  for dir in "$PREFIX/d" "$PREFIX/clash" "$PREFIX/a" "$PREFIX"; do s3c -o /dev/null -X DELETE "$B/$dir/"; done
-  for key in from-nas on-object; do s3c -o /dev/null -X DELETE "$OB/$PREFIX/$key"; done
+  for dir in "$PREFIX/native" "$PREFIX/from-object" "$PREFIX/clash" "$PREFIX"; do s3c -o /dev/null -X DELETE "$B/$dir/"; done
+  for key in atomic-on-k1 on-object; do s3c -o /dev/null -X DELETE "$OB/$PREFIX/$key"; done
   s3c -o /dev/null -X DELETE "$OB/$PREFIX/"
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 echo "server $S3_HOST bucket $S3_BUCKET run=$RUN prefix=$PREFIX"
 for entry in z0:0 k1:1024 m8p1:8388609 m200:209715200; do seed "${entry%%:*}" "${entry#*:}"; done
+# Separate fixture roots allow replacement scenarios to keep the same relative path.
+mkdir -p "$WORK/old" "$WORK/new" "$WORK/clash"
+ln "$WORK/src/k1" "$WORK/old/held"
+ln "$WORK/src/m200" "$WORK/new/held"
+ln "$WORK/src/k1" "$WORK/src/clash"
+ln "$WORK/src/k1" "$WORK/clash/x"
+ln "$WORK/src/m8p1" "$WORK/src/on-object"
+ln "$WORK/src/m8p1" "$WORK/src/no-profile"
 
 echo "-- local -> NAS: sizes x policies x read-back"
 for entry in z0 k1 m8p1 m200; do
@@ -76,7 +84,8 @@ for entry in z0 k1 m8p1 m200; do
     for rb in on off; do
       [ "$entry" = m200 ] && [ "$rb" = off ] && [ "$policy" != atomic ] && continue
       key="$policy-$rb-$entry"
-      line=$(run --source "$WORK/src" --source-path "$entry" --destination "s3:$PREFIX" \
+      ln "$WORK/src/$entry" "$WORK/src/$key"
+      line=$(run --source "$WORK/src" --source-path "$key" --destination "s3:$PREFIX" \
         --destination-path "$key" --policy "$policy" --read-back "$rb" --identity "d-$RUN-$key")
       echo "$key: $line"
       why=
@@ -103,16 +112,16 @@ if [ "${SKIP_BIG:-0}" != 1 ]; then
   [ -z "$why" ] && ! same_as "$B/$PREFIX/big" "$WORK/src/big" && why="content differs"
   verdict big "$why"
   if [ "${SKIP_NATIVE:-0}" != 1 ]; then
-    line=$(run --source "s3:$PREFIX" --source-path big --destination "s3:$PREFIX" --destination-path big-copy \
+    line=$(run --source "s3:$PREFIX" --source-path big --destination "s3:$PREFIX/native" --destination-path big \
       --policy atomic --read-back on --identity "n-$RUN-big")
     echo "native big: $line"
     why=; [ "$(field "$line" native_requests)" = 1 ] || why="native_requests=$(field "$line" native_requests)"
-    same_as "$B/$PREFIX/big-copy" "$WORK/src/big" || why="$why content differs"
+    same_as "$B/$PREFIX/native/big" "$WORK/src/big" || why="$why content differs"
     verdict "native big" "$why"
   fi
   s3c -o /dev/null -X DELETE "$B/$PREFIX/big"
-  s3c -o /dev/null -X DELETE "$B/$PREFIX/big-copy"
-  why=; [ -z "$(etag "$B/$PREFIX/big")$(etag "$B/$PREFIX/big-copy")" ] || why="a large object is still there"
+  s3c -o /dev/null -X DELETE "$B/$PREFIX/native/big"
+  why=; [ -z "$(etag "$B/$PREFIX/big")$(etag "$B/$PREFIX/native/big")" ] || why="a large object is still there"
   verdict "large objects deleted" "$why"
 fi
 
@@ -126,46 +135,36 @@ why=; [ "$(field "$line" phase)" = Preflight ] || why="phase $(field "$line" pha
 verdict huge "$why"
 rm -f "$WORK/src/huge"
 
-echo "-- key names the bucket would rewrite: refused at Preflight"
-long=$(printf 'n%.0s' $(seq 1 256))
-for name in "a/../x" "a/./y" "a//b" "d/$long"; do
-  line=$(run --source "$WORK/src" --source-path k1 --destination "s3:$PREFIX" --destination-path "$name" \
-    --policy atomic --read-back off --identity "d-$RUN-name")
-  echo "${name:0:24}: $(field "$line" phase) $(field "$line" failure | cut -c1-160)"
-  why=; [ "$(field "$line" phase)" = Preflight ] || why="phase $(field "$line" phase)"
-  verdict name "$why"
-done
-[ -n "$(etag "$B/x")$(etag "$B/$PREFIX/x")$(etag "$B/$PREFIX/a/y")$(etag "$B/$PREFIX/a/b")" ] && {
-  echo "   => FAIL: a rewritten key exists"; FAILS=$((FAILS + 1)); }
+echo "SKIP synthetic destination rename/name-rewrite rows: ordinary migration preserves scanned paths"
 
 echo "-- file / directory clash: a name conflict (Conflict, not NotFound)"
-run --source "$WORK/src" --source-path k1 --destination "s3:$PREFIX" --destination-path clash \
+run --source "$WORK/src" --source-path clash --destination "s3:$PREFIX" --destination-path clash \
   --policy atomic --read-back off --identity "d-$RUN-clash" >/dev/null
-line=$(run --source "$WORK/src" --source-path k1 --destination "s3:$PREFIX" --destination-path clash/x \
+line=$(run --source "$WORK/clash" --source-path x --destination "s3:$PREFIX/clash" --destination-path x \
   --policy atomic --read-back off --identity "d-$RUN-clash-x")
 echo "clash/x: $(field "$line" failure | cut -c1-200)"
 why=; grep -q Conflict <<<"$(field "$line" failure)" || why="not a Conflict"
 verdict clash "$why"
 
 echo "-- interrupted before publication: the old object is intact, the rerun is Fresh"
-run --source "$WORK/src" --source-path k1 --destination "s3:$PREFIX" --destination-path held \
+run --source "$WORK/old" --source-path held --destination "s3:$PREFIX" --destination-path held \
   --policy atomic --read-back off --identity "d-$RUN-held-old" >/dev/null
 old=$(etag "$B/$PREFIX/held")
 [ -n "$old" ] || { echo "   => FAIL: no old object to keep"; FAILS=$((FAILS + 1)); }
-line=$(run --source "$WORK/src" --source-path m200 --destination "s3:$PREFIX" --destination-path held \
+line=$(run --source "$WORK/new" --source-path held --destination "s3:$PREFIX" --destination-path held \
   --policy checkpointed --read-back off --identity "d-$RUN-held" --bandwidth 20971520 --cancel-after-ms 4000)
 echo "cancel at 4 s: $line"
 why=; [ "$(field "$line" final_destination_changed)" = False ] || why="changed=$(field "$line" final_destination_changed)"
 [ "$(etag "$B/$PREFIX/held")" = "$old" ] || why="$why old object replaced"
 verdict cancel "$why"
-timeout -s KILL 4 "$BIN" --source "$WORK/src" --source-path m200 --destination "s3:$PREFIX" \
+timeout -s KILL 4 "$BIN" --source "$WORK/new" --source-path held --destination "s3:$PREFIX" \
   --destination-path held --policy checkpointed --read-back off --identity "d-$RUN-held" \
   --bandwidth 20971520 >/dev/null 2>&1
 echo "SIGKILL at 4 s: exit=$?"
 sleep 2
 why=; [ "$(etag "$B/$PREFIX/held")" = "$old" ] || why="old object replaced"
 verdict kill "$why"
-line=$(run --source "$WORK/src" --source-path m200 --destination "s3:$PREFIX" --destination-path held \
+line=$(run --source "$WORK/new" --source-path held --destination "s3:$PREFIX" --destination-path held \
   --policy checkpointed --read-back on --identity "d-$RUN-held")
 echo "rerun: $line"
 why=; [ "$(field "$line" prepare)" = Fresh ] || why="prepare $(field "$line" prepare)"
@@ -175,14 +174,14 @@ verdict rerun "$why"
 
 echo "-- NAS as a source"
 line=$(run --source "s3:$PREFIX" --source-path atomic-on-m200 --destination "$WORK/out" \
-  --destination-path m200 --policy atomic --read-back on --identity "s-$RUN-m200")
+  --destination-path atomic-on-m200 --policy atomic --read-back on --identity "s-$RUN-m200")
 echo "NAS -> local m200: $line"
 why=; [ "$(field "$line" result)" = ok ] || why="not ok"
-cmp -s "$WORK/out/m200" "$WORK/src/m200" || why="$why content differs"
+cmp -s "$WORK/out/atomic-on-m200" "$WORK/src/m200" || why="$why content differs"
 verdict source "$why"
 ( sleep 3; s3c -o /dev/null -T "$WORK/src/k1" "$B/$PREFIX/atomic-off-m200" ) &
 line=$(run --source "s3:$PREFIX" --source-path atomic-off-m200 --destination "$WORK/out" \
-  --destination-path replaced --policy atomic --read-back off --identity "s-$RUN-replaced" --bandwidth 20971520)
+  --destination-path atomic-off-m200 --policy atomic --read-back off --identity "s-$RUN-replaced" --bandwidth 20971520)
 wait
 echo "replaced mid-read: $(field "$line" failure | cut -c1-200)"
 why=; grep -q Conflict <<<"$(field "$line" failure)" || why="not a Conflict"
@@ -191,32 +190,32 @@ verdict replaced "$why"
 if [ "${SKIP_NATIVE:-0}" != 1 ]; then
   echo "-- same-bucket native copy (one CopyObject); NAS <-> object bucket streams"
   for entry in k1 m200; do
-    line=$(run --source "s3:$PREFIX" --source-path "atomic-on-$entry" --destination "s3:$PREFIX" \
-      --destination-path "native-$entry" --policy checkpointed --read-back on --identity "n-$RUN-$entry")
+    line=$(run --source "s3:$PREFIX" --source-path "atomic-on-$entry" --destination "s3:$PREFIX/native" \
+      --destination-path "atomic-on-$entry" --policy checkpointed --read-back on --identity "n-$RUN-$entry")
     echo "native $entry: $line"
     why=; [ "$(field "$line" route)" = Native ] || why="route $(field "$line" route)"
     [ "$(field "$line" native_requests)" = 1 ] || why="$why native_requests=$(field "$line" native_requests)"
     [ "$(field "$line" recovery)" = UnsupportedByDestination ] || why="$why recovery"
-    same_as "$B/$PREFIX/native-$entry" "$WORK/src/$entry" || why="$why content differs"
+    same_as "$B/$PREFIX/native/atomic-on-$entry" "$WORK/src/$entry" || why="$why content differs"
     verdict "native $entry" "$why"
   done
   line=$(run --source "s3:$PREFIX" --source-path atomic-on-k1 --destination "s3@$OBJECT_BUCKET:$PREFIX" \
-    --destination-path from-nas --policy atomic --read-back on --identity "x-$RUN-1")
+    --destination-path atomic-on-k1 --policy atomic --read-back on --identity "x-$RUN-1")
   echo "NAS -> $OBJECT_BUCKET: $line"
   why=; [ "$(field "$line" route)" = Streaming ] || why="route $(field "$line" route)"
-  same_as "$OB/$PREFIX/from-nas" "$WORK/src/k1" || why="$why content differs"
+  same_as "$OB/$PREFIX/atomic-on-k1" "$WORK/src/k1" || why="$why content differs"
   verdict "nas->object" "$why"
-  line=$(run --source "s3@$OBJECT_BUCKET:$PREFIX" --source-path from-nas --destination "s3:$PREFIX" \
-    --destination-path from-object --policy atomic --read-back on --identity "x-$RUN-2")
+  line=$(run --source "s3@$OBJECT_BUCKET:$PREFIX" --source-path atomic-on-k1 --destination "s3:$PREFIX/from-object" \
+    --destination-path atomic-on-k1 --policy atomic --read-back on --identity "x-$RUN-2")
   echo "$OBJECT_BUCKET -> NAS: $line"
   why=; [ "$(field "$line" route)" = Streaming ] || why="route $(field "$line" route)"
-  same_as "$B/$PREFIX/from-object" "$WORK/src/k1" || why="$why content differs"
+  same_as "$B/$PREFIX/from-object/atomic-on-k1" "$WORK/src/k1" || why="$why content differs"
   verdict "object->nas" "$why"
-  s3c -o /dev/null -X DELETE "$OB/$PREFIX/from-nas"
+  s3c -o /dev/null -X DELETE "$OB/$PREFIX/atomic-on-k1"
 fi
 
 echo "-- the parameter on an object bucket ($OBJECT_BUCKET): works, weaker guarantees"
-line=$(S3_BUCKET=$OBJECT_BUCKET run --source "$WORK/src" --source-path m8p1 --destination "s3:$PREFIX" \
+line=$(S3_BUCKET=$OBJECT_BUCKET run --source "$WORK/src" --source-path on-object --destination "s3:$PREFIX" \
   --destination-path on-object --policy checkpointed --read-back on --identity "o-$RUN-1")
 echo "nas profile on $OBJECT_BUCKET: $line"
 why=; [ "$(field "$line" result)" = ok ] || why="not ok"
@@ -226,7 +225,7 @@ verdict "profile on object bucket" "$why"
 s3c -o /dev/null -X DELETE "$OB/$PREFIX/on-object"
 
 echo "-- the parameter left out on the NAS bucket: today's failures, with the hint"
-line=$(S3_BUCKET_TYPE= run --source "$WORK/src" --source-path m8p1 --destination "s3:$PREFIX" \
+line=$(S3_BUCKET_TYPE= run --source "$WORK/src" --source-path no-profile --destination "s3:$PREFIX" \
   --destination-path no-profile --policy atomic --read-back off --identity "h-$RUN-1")
 echo "no profile, 8 MiB+1: $(field "$line" failure | cut -c1-120) | $(field "$line" diagnostic)"
 why=; grep -q 'bucket_type=nas' <<<"$(field "$line" diagnostic)" || why="no hint"
